@@ -601,6 +601,7 @@ struct GemmaGraphInputs {
     ggml_tensor * inp_embed     = nullptr;
     ggml_tensor * positions     = nullptr;  // [n_tokens] i32
     ggml_tensor * attn_mask     = nullptr;
+    ggml_tensor * swa_mask      = nullptr;  // sliding-window causal mask (batched prefill only)
     ggml_tensor * per_layer_inp = nullptr;  // PLE pre-computed embeddings
     int           n_tokens      = 0;
     int           kv_start      = 0;

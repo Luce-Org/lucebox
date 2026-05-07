@@ -729,8 +729,9 @@ GemmaGraphOutputs build_gemma4_graph(
         ggml_tensor * cache_v = (read_kv_idx >= 0) ? cache.attn_v[read_kv_idx] : nullptr;
 
         if (is_swa) {
+            ggml_tensor * effective_mask = in.swa_mask ? in.swa_mask : attn_mask;
             cur = build_swa_attn_block(ctx, gf, w, L, cur, in.positions,
-                                       cache_k, cache_v, attn_mask,
+                                       cache_k, cache_v, effective_mask,
                                        kv_start, n_tokens,
                                        cache.kv_k_type, cache.kv_v_type,
                                        write_kv, il);

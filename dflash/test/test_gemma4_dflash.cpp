@@ -3,8 +3,8 @@
 // Pipeline:
 //   1. Load target (Gemma4-31B or 26B-A4B GGUF) + draft (z-lab Gemma4-DFlash
 //      safetensors directory).
-//   2. Prefill: single-token autoregressive decode over prompt tokens,
-//      capture_layers=true so target_feat gets populated for every prompt pos.
+//   2. Prefill: chunked batched forward over prompt tokens (up to swa_window
+//      tokens per chunk), capture_layers=true so target_feat gets populated.
 //   3. Decode loop (until n_predict):
 //      a. [target-only path, always active]
 //         Run target forward for last committed token → logits → sample next.
@@ -170,6 +170,23 @@ static void build_causal_mask(std::vector<uint16_t> & out,
     }
 }
 
+// ─── SWA causal mask builder (for chunked batched prefill) ───────────────────
+
+static void build_swa_causal_mask(std::vector<uint16_t> & out,
+                                   int kv_len, int n_tokens, int kv_start,
+                                   int swa_window) {
+    const int kv_pad = align_up(kv_len, g_kq_stride_pad);
+    const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
+    out.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
+    for (int q = 0; q < n_tokens; q++) {
+        const int abs_q = kv_start + q;
+        const int lo = std::max(0, abs_q - swa_window + 1);
+        for (int k = lo; k <= abs_q && k < kv_len; k++) {
+            out[(size_t)q * kv_pad + k] = F16_ZERO;
+        }
+    }
+}
+
 // ─── Per-step graph state (rebuilt each forward pass since kv_len varies) ─
 
 struct StepGraph {
@@ -179,6 +196,7 @@ struct StepGraph {
     ggml_tensor    * inp_embed  = nullptr;
     ggml_tensor    * positions  = nullptr;
     ggml_tensor    * attn_mask  = nullptr;
+    ggml_tensor    * swa_mask   = nullptr;
     ggml_tensor    * logits     = nullptr;
 };
 
@@ -188,6 +206,7 @@ static void step_graph_free(StepGraph & sg) {
     sg.inp_embed = nullptr;
     sg.positions = nullptr;
     sg.attn_mask = nullptr;
+    sg.swa_mask  = nullptr;
     sg.logits    = nullptr;
 }
 
@@ -281,6 +300,13 @@ static bool build_gemma4_step(StepGraph & sg,
         sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
         ggml_set_name(sg.attn_mask, "attn_mask");
         ggml_set_input(sg.attn_mask);
+
+        if (n_tokens > 1) {
+            // SWA mask needed for sliding-window attention layers in batched prefill
+            sg.swa_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
+            ggml_set_name(sg.swa_mask, "swa_mask");
+            ggml_set_input(sg.swa_mask);
+        }
     }
 
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
@@ -289,6 +315,7 @@ static bool build_gemma4_step(StepGraph & sg,
     gi.inp_embed      = sg.inp_embed;
     gi.positions      = sg.positions;
     gi.attn_mask      = sg.attn_mask;
+    gi.swa_mask       = sg.swa_mask;
     gi.n_tokens       = n_tokens;
     gi.kv_start       = kv_start;
     gi.capture_layers = capture;
@@ -759,73 +786,111 @@ int main(int argc, char ** argv) {
 
         // ── Prefill ───────────────────────────────────────────────────────
         //
-        // We run each prompt token through the target one at a time.
-        // A batched prefill would be faster; this simpler loop is enough for
-        // correctness testing and matches the decode-loop pattern.
+        // Chunked batched prefill: process up to swa_window tokens per chunk.
+        // Each chunk dispatches a single GPU graph covering all tokens in the
+        // chunk, which is far cheaper than one dispatch per token.
         //
-        // For each prompt token t at position p:
-        //   1. Embed token t → inp_embed
-        //   2. Set positions[0] = p
-        //   3. Build forward graph (with causal mask for p > 0)
-        //   4. Compute graph → logits (discarded during prefill; only KV + target_feat matter)
+        // For a chunk [cs, cs+chunk_n):
+        //   1. Embed chunk tokens → inp_embed
+        //   2. Set positions[i] = cs + i
+        //   3. Build causal mask covering [0, cs+chunk_n) for the chunk rows
+        //   4. Build SWA mask for sliding-window layers (when cs > 0)
+        //   5. Compute graph → KV + target_feat (logits discarded except last)
 
         std::printf("[prefill] %zu tokens ...\n", prompt_ids.size());
         double prefill_t0 = now_ms();
         int last_logit_tok = -1;
 
-        for (int pi = 0; pi < (int)prompt_ids.size(); pi++) {
-            const int32_t tok = prompt_ids[pi];
-            const int     pos = pi;
-            const bool    need_mask = (pi > 0);
-            const int     kv_start  = pos;
+        {
+            const int n_prompt   = (int)prompt_ids.size();
+            const int swa_window = w.swa_window > 0 ? w.swa_window : 1024;
+            const int chunk_size = std::min(n_prompt, swa_window);
 
-            if (!build_gemma4_step(sg, w, cache, backend,
-                                   kv_start, /*n_tokens=*/1,
-                                   need_mask, /*capture=*/true)) {
-                std::fprintf(stderr, "prefill build failed at token %d\n", pi);
-                return 1;
+            for (int cs = 0; cs < n_prompt; cs += chunk_size) {
+                const int chunk_n   = std::min(chunk_size, n_prompt - cs);
+                const bool is_last  = (cs + chunk_n == n_prompt);
+                const bool need_mask = (cs + chunk_n > 1);
+
+                if (!build_gemma4_step(sg, w, cache, backend,
+                                       /*kv_start=*/cs, chunk_n,
+                                       need_mask, /*capture=*/true)) {
+                    std::fprintf(stderr, "prefill chunk build failed at offset %d\n", cs);
+                    return 1;
+                }
+
+                // Embed the chunk tokens
+                if (!embed_tokens_batch(w, prompt_ids.data() + cs, chunk_n,
+                                        sg.inp_embed, backend)) {
+                    return 1;
+                }
+
+                // Positions: [cs, cs+1, ..., cs+chunk_n-1]
+                {
+                    std::vector<int32_t> pos(chunk_n);
+                    for (int i = 0; i < chunk_n; i++) pos[i] = cs + i;
+                    ggml_backend_tensor_set(sg.positions, pos.data(), 0,
+                                            sizeof(int32_t) * chunk_n);
+                }
+
+                // Full causal mask for all full-attention layers
+                if (sg.attn_mask) {
+                    const int kv_len = cs + chunk_n;
+                    std::vector<uint16_t> mask_buf;
+                    build_causal_mask(mask_buf, kv_len, chunk_n, cs);
+                    ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
+                                            sizeof(uint16_t) * mask_buf.size());
+                }
+
+                // SWA mask for sliding-window attention layers.
+                // For the first chunk (cs == 0) all positions are within the
+                // window so the standard causal mask is correct. For subsequent
+                // chunks some early positions are outside the window.
+                if (sg.swa_mask) {
+                    const int kv_len = cs + chunk_n;
+                    std::vector<uint16_t> swa_buf;
+                    build_swa_causal_mask(swa_buf, kv_len, chunk_n, cs, swa_window);
+                    ggml_backend_tensor_set(sg.swa_mask, swa_buf.data(), 0,
+                                            sizeof(uint16_t) * swa_buf.size());
+                }
+
+                auto st = ggml_backend_graph_compute(backend, sg.gf);
+                if (st != GGML_STATUS_SUCCESS) {
+                    std::fprintf(stderr, "prefill compute failed at chunk offset %d\n", cs);
+                    return 1;
+                }
+
+                cache.cur_pos = cs + chunk_n;
+
+                // Sample the first decode token from the last chunk's logits
+                if (is_last) {
+                    const int vocab = w.n_vocab;
+                    std::vector<float> logits_cpu(vocab);
+                    // logits tensor shape: [vocab, chunk_n] — take the last token's row
+                    const size_t last_tok_offset = (size_t)(chunk_n - 1) * vocab;
+                    ggml_backend_tensor_get(sg.logits, logits_cpu.data(),
+                                            sizeof(float) * last_tok_offset,
+                                            sizeof(float) * vocab);
+                    last_logit_tok = sample_logits(logits_cpu.data(), vocab,
+                                                   sampler, prompt_ids, rng);
+                    cache.last_tok = last_logit_tok;
+                }
+
+                step_graph_free(sg);
             }
-
-            if (!embed_token(w, tok, sg.inp_embed, backend)) return 1;
-
-            // positions: single i32
-            int32_t pos_val = pos;
-            ggml_backend_tensor_set(sg.positions, &pos_val, 0, sizeof(int32_t));
-
-            // Causal mask for n_tokens=1 at position pos: attend all [0..pos].
-            if (sg.attn_mask) {
-                const int kv_len  = kv_start + 1;
-                std::vector<uint16_t> mask_buf;
-                build_causal_mask(mask_buf, kv_len, 1, kv_start);
-                ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
-                                        sizeof(uint16_t) * mask_buf.size());
-            }
-
-            auto st = ggml_backend_graph_compute(backend, sg.gf);
-            if (st != GGML_STATUS_SUCCESS) {
-                std::fprintf(stderr, "prefill compute failed at token %d\n", pi);
-                return 1;
-            }
-
-            cache.cur_pos = pos + 1;
-
-            // Read last token's logits for the generation seed
-            if (pi == (int)prompt_ids.size() - 1) {
-                const int vocab = w.n_vocab;
-                std::vector<float> logits_cpu(vocab);
-                ggml_backend_tensor_get(sg.logits, logits_cpu.data(), 0,
-                                        sizeof(float) * vocab);
-                last_logit_tok = sample_logits(logits_cpu.data(), vocab,
-                                               sampler, prompt_ids, rng);
-                cache.last_tok = last_logit_tok;
-            }
-
-            step_graph_free(sg);
         }
 
         double prefill_t1 = now_ms();
-        std::printf("[prefill] done in %.1f ms  (last sampled token: %d)\n",
-                    prefill_t1 - prefill_t0, last_logit_tok);
+        {
+            const int n_prompt   = (int)prompt_ids.size();
+            const int swa_window = w.swa_window > 0 ? w.swa_window : 1024;
+            const int chunk_size = std::min(n_prompt, swa_window);
+            const double prefill_ms = prefill_t1 - prefill_t0;
+            std::printf("[prefill] %d tokens in %.1f ms (%.1f tok/s) "
+                        "[chunked, chunk_size=%d]  (last sampled token: %d)\n",
+                        n_prompt, prefill_ms,
+                        prefill_ms > 0.0 ? (double)n_prompt / (prefill_ms / 1000.0) : 0.0,
+                        chunk_size, last_logit_tok);
+        }
 
         // ── Draft KV prefill: materialize draft KV for all prompt positions ─
         if (have_draft) {
