@@ -682,6 +682,11 @@ bool load_gemma4_draft_safetensors(const std::string & dir_path,
                                     ggml_backend_t backend,
                                     GemmaDraftWeights & out);
 
+// Load Gemma4 DFlash draft weights from a Q8_0-quantized GGUF file.
+bool load_gemma4_draft_gguf(const std::string & path,
+                             ggml_backend_t backend,
+                             GemmaDraftWeights & out);
+
 void free_gemma4_draft_weights(GemmaDraftWeights & w);
 
 // Allocate draft KV cache tensors on the given backend.

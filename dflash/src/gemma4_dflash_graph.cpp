@@ -537,6 +537,18 @@ static bool g_cuda_has_native_bf16() {
 #endif
 }
 
+static uint32_t get_u32_or(const gguf_context * g, const char * key, uint32_t fallback) {
+    int64_t id = gguf_find_key(g, key);
+    if (id < 0) return fallback;
+    return gguf_get_val_u32(g, id);
+}
+
+static float get_f32_or(const gguf_context * g, const char * key, float fallback) {
+    int64_t id = gguf_find_key(g, key);
+    if (id < 0) return fallback;
+    return gguf_get_val_f32(g, id);
+}
+
 } // anonymous namespace
 
 // ─── Public loader ────────────────────────────────────────────────────────
@@ -771,6 +783,228 @@ bool load_gemma4_draft_safetensors(const std::string & dir_path,
         "n_embd=%d n_ff=%d head_dim=%d target_hidden=%d vocab=%d\n",
         out.n_layer, out.n_head, out.n_head_kv,
         out.n_embd, out.n_ff, out.head_dim, out.target_hidden, out.n_vocab);
+    std::fflush(stderr);
+
+    return true;
+}
+
+bool load_gemma4_draft_gguf(const std::string & path,
+                            ggml_backend_t       backend,
+                            GemmaDraftWeights &  out)
+{
+    // ── 1. Parse metadata + create ggml_context with tensor descriptors ──
+    ggml_context * meta_ctx = nullptr;
+    gguf_init_params gip{};
+    gip.no_alloc = true;
+    gip.ctx      = &meta_ctx;
+    gguf_context * gctx = gguf_init_from_file(path.c_str(), gip);
+    if (!gctx) {
+        set_last_error("gguf_init_from_file failed: " + path);
+        return false;
+    }
+
+    // Validate arch
+    {
+        int64_t arch_id = gguf_find_key(gctx, "general.architecture");
+        if (arch_id < 0) {
+            set_last_error("gemma4 draft GGUF: missing general.architecture");
+            gguf_free(gctx);
+            return false;
+        }
+        const char * arch = gguf_get_val_str(gctx, arch_id);
+        if (std::string(arch) != "gemma4-dflash-draft") {
+            set_last_error(std::string("gemma4 draft GGUF: unexpected arch: ") + arch +
+                           " (expected gemma4-dflash-draft)");
+            gguf_free(gctx);
+            return false;
+        }
+    }
+
+    // Read dimensions from GGUF metadata
+    int64_t arch_id2 = gguf_find_key(gctx, "general.architecture");
+    const char * A   = gguf_get_val_str(gctx, arch_id2);
+    char key[256];
+
+    auto read_u32 = [&](const char * suffix, uint32_t fallback) -> uint32_t {
+        std::snprintf(key, sizeof(key), "%s.%s", A, suffix);
+        return get_u32_or(gctx, key, fallback);
+    };
+    auto read_f32 = [&](const char * suffix, float fallback) -> float {
+        std::snprintf(key, sizeof(key), "%s.%s", A, suffix);
+        return get_f32_or(gctx, key, fallback);
+    };
+
+    const uint32_t n_embd       = read_u32("embedding_length",        0);
+    const uint32_t n_layer      = read_u32("block_count",             0);
+    const uint32_t n_ff         = read_u32("feed_forward_length",     0);
+    const uint32_t n_head       = read_u32("attention.head_count",    0);
+    const uint32_t n_head_kv    = read_u32("attention.head_count_kv", 0);
+    const uint32_t head_dim     = read_u32("attention.key_length",    0);
+    const uint32_t block_sz     = read_u32("dflash.block_size",       0);
+    const uint32_t n_tgt_lay    = read_u32("dflash.n_target_layers",  0);
+    const uint32_t target_hid   = read_u32("dflash.target_hidden",    0);
+    const uint32_t mask_tok_id  = read_u32("dflash.mask_token_id",    GEMMA4_31B_DRAFT_MASK_TOKEN_ID);
+    const uint32_t sliding_win  = read_u32("dflash.sliding_window",   2048);
+    const float    logit_cap    = read_f32("dflash.logit_softcap",    GEMMA4_LOGIT_SOFTCAP);
+    const float    rope_theta   = read_f32("rope.freq_base",          GEMMA4_ROPE_THETA);
+
+    if (n_embd == 0 || n_layer == 0 || n_ff == 0 || n_head == 0 ||
+        n_head_kv == 0 || head_dim == 0) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "gemma4 draft GGUF: missing hparams: n_embd=%u n_layer=%u n_ff=%u "
+            "n_head=%u n_head_kv=%u head_dim=%u",
+            n_embd, n_layer, n_ff, n_head, n_head_kv, head_dim);
+        set_last_error(buf);
+        gguf_free(gctx);
+        return false;
+    }
+
+    // Validate block_size and n_target_layers match compiled constants
+    if (block_sz != (uint32_t)GEMMA4_DRAFT_BLOCK_SIZE ||
+        n_tgt_lay != (uint32_t)GEMMA4_DRAFT_N_TARGET_LAYERS) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "gemma4 draft GGUF: dflash.block_size=%u (expected %d), "
+            "dflash.n_target_layers=%u (expected %d)",
+            block_sz, GEMMA4_DRAFT_BLOCK_SIZE,
+            n_tgt_lay, GEMMA4_DRAFT_N_TARGET_LAYERS);
+        set_last_error(buf);
+        gguf_free(gctx);
+        return false;
+    }
+
+    // Sanity-check upper bounds
+    constexpr uint32_t MAX_LAYERS  = 1024;
+    constexpr uint32_t MAX_EMBD    = 1u << 17;
+    constexpr uint32_t MAX_FF      = 1u << 19;
+    constexpr uint32_t MAX_HEADS   = 1024;
+    constexpr uint32_t MAX_HEADDIM = 1024;
+    if (n_layer   > MAX_LAYERS  || n_embd    > MAX_EMBD  ||
+        n_ff      > MAX_FF      || n_head    > MAX_HEADS ||
+        n_head_kv > MAX_HEADS   || head_dim  > MAX_HEADDIM ||
+        n_head_kv > n_head      || (n_head % n_head_kv) != 0) {
+        char buf[320];
+        std::snprintf(buf, sizeof(buf),
+            "gemma4 draft GGUF: hparams out of range: n_embd=%u n_layer=%u n_ff=%u "
+            "n_head=%u n_head_kv=%u head_dim=%u",
+            n_embd, n_layer, n_ff, n_head, n_head_kv, head_dim);
+        set_last_error(buf);
+        gguf_free(gctx);
+        return false;
+    }
+
+    // ── 2. Populate GemmaDraftWeights scalars ────────────────────────────
+    out.ctx           = meta_ctx;
+    out.backend       = backend;
+    out.n_layer       = (int)n_layer;
+    out.n_head        = (int)n_head;
+    out.n_head_kv     = (int)n_head_kv;
+    out.head_dim      = (int)head_dim;
+    out.n_embd        = (int)n_embd;
+    out.n_ff          = (int)n_ff;
+    out.block_size    = (int)block_sz;
+    out.n_target_layers = (int)n_tgt_lay;
+    out.target_hidden = (int)target_hid;
+    out.mask_token_id = (int)mask_tok_id;
+    out.sliding_window = (int)sliding_win;
+    out.logit_softcap = logit_cap;
+    out.rope_theta    = rope_theta;
+
+    // layers [0..n_layer-2] are SWA, last layer is full attention
+    out.layer_is_swa.assign((size_t)n_layer, true);
+    out.layer_is_swa[(size_t)(n_layer - 1)] = false;
+
+    out.layers.assign((size_t)n_layer, GemmaDraftLayer{});
+
+    // tok_embd is injected at runtime from the target model (same as safetensors path)
+    out.tok_embd = nullptr;
+
+    // ── 3. Wire tensor pointers ──────────────────────────────────────────
+    auto g = [&](const char * name) -> ggml_tensor * {
+        return ggml_get_tensor(meta_ctx, name);
+    };
+
+    out.fc          = g("dflash.fc.weight");
+    out.hidden_norm = g("dflash.hidden_norm.weight");
+    out.out_norm    = g("output_norm.weight");
+
+    if (!out.fc || !out.hidden_norm || !out.out_norm) {
+        set_last_error("gemma4 draft GGUF: missing top-level tensors "
+                       "(dflash.fc.weight / dflash.hidden_norm.weight / output_norm.weight)");
+        gguf_free(gctx);
+        return false;
+    }
+
+    for (int il = 0; il < out.n_layer; il++) {
+        char name[128];
+        auto fnd = [&](const char * suffix) -> ggml_tensor * {
+            std::snprintf(name, sizeof(name), "blk.%d.%s", il, suffix);
+            return ggml_get_tensor(meta_ctx, name);
+        };
+        GemmaDraftLayer & L = out.layers[il];
+        L.attn_norm = fnd("attn_norm.weight");
+        L.ffn_norm  = fnd("ffn_norm.weight");
+        L.wq        = fnd("attn_q.weight");
+        L.wk        = fnd("attn_k.weight");
+        L.wv        = fnd("attn_v.weight");
+        L.wo        = fnd("attn_output.weight");
+        L.q_norm    = fnd("attn_q_norm.weight");
+        L.k_norm    = fnd("attn_k_norm.weight");
+        L.w_gate    = fnd("ffn_gate.weight");
+        L.w_up      = fnd("ffn_up.weight");
+        L.w_down    = fnd("ffn_down.weight");
+        if (!L.attn_norm || !L.ffn_norm || !L.wq || !L.wk || !L.wv || !L.wo ||
+            !L.q_norm || !L.k_norm || !L.w_gate || !L.w_up || !L.w_down) {
+            char b[128];
+            std::snprintf(b, sizeof(b),
+                "gemma4 draft GGUF: layer %d missing tensors", il);
+            set_last_error(b);
+            gguf_free(gctx);
+            return false;
+        }
+    }
+
+    // ── 4. Allocate backend buffer for all tensors ───────────────────────
+    out.buf = ggml_backend_alloc_ctx_tensors(meta_ctx, backend);
+    if (!out.buf) {
+        set_last_error("gemma4 draft GGUF: ggml_backend_alloc_ctx_tensors failed");
+        gguf_free(gctx);
+        return false;
+    }
+
+    // ── 5. mmap file and copy tensor bytes to backend ────────────────────
+    std::string err;
+    GMmap mm;
+    if (!mm.open_ro(path, err)) { set_last_error(err); gguf_free(gctx); return false; }
+    const size_t  data_start = gguf_get_data_offset(gctx);
+    const int64_t n_tensors  = gguf_get_n_tensors(gctx);
+
+    size_t total = 0;
+    for (int64_t tid = 0; tid < n_tensors; tid++) {
+        const char * tname = gguf_get_tensor_name(gctx, tid);
+        ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
+        if (!t) continue;
+        const size_t off = data_start + gguf_get_tensor_offset(gctx, tid);
+        const size_t sz  = gguf_get_tensor_size(gctx, tid);
+        if (off + sz > mm.len) {
+            set_last_error(std::string("gemma4 draft GGUF: tensor '") +
+                           tname + "' overflows file");
+            gguf_free(gctx);
+            return false;
+        }
+        ggml_backend_tensor_set(t, (const uint8_t *)mm.addr + off, 0, sz);
+        total += sz;
+    }
+
+    gguf_free(gctx);
+
+    std::fprintf(stderr,
+        "[gemma4 draft GGUF] loaded: n_layer=%d n_head=%d n_kv=%d "
+        "n_embd=%d n_ff=%d head_dim=%d target_hidden=%d  (%.2f GiB on GPU)\n",
+        out.n_layer, out.n_head, out.n_head_kv,
+        out.n_embd, out.n_ff, out.head_dim, out.target_hidden,
+        total / (1024.0 * 1024.0 * 1024.0));
     std::fflush(stderr);
 
     return true;

@@ -661,10 +661,18 @@ int main(int argc, char ** argv) {
 
     if (have_draft) {
         double t0 = now_ms();
-        if (!load_gemma4_draft_safetensors(draft_path, backend, dw)) {
-            std::fprintf(stderr, "load_gemma4_draft_safetensors: %s\n", dflash27b_last_error());
-            return 1;
+        // Auto-detect: if path ends with .gguf, use GGUF loader; else safetensors dir
+        bool ok = false;
+        const bool is_gguf = (draft_path.size() >= 5 &&
+                              draft_path.compare(draft_path.size() - 5, 5, ".gguf") == 0);
+        if (is_gguf) {
+            ok = load_gemma4_draft_gguf(draft_path, backend, dw);
+            if (!ok) std::fprintf(stderr, "load_gemma4_draft_gguf: %s\n", dflash27b_last_error());
+        } else {
+            ok = load_gemma4_draft_safetensors(draft_path, backend, dw);
+            if (!ok) std::fprintf(stderr, "load_gemma4_draft_safetensors: %s\n", dflash27b_last_error());
         }
+        if (!ok) return 1;
         double t1 = now_ms();
 
         // Upload tok_embd from target embedder to GPU (tied lm_head for draft).
