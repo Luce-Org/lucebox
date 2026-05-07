@@ -114,6 +114,9 @@ add_library(dflash27b STATIC
     src/qwen35_target_graph.cpp
     src/qwen3_dflash_graph.cpp
     src/qwen3_drafter.cpp
+    src/gemma4_target_loader.cpp
+    src/gemma4_target_graph.cpp
+    src/gemma4_dflash_graph.cpp
     src/qwen3_0p6b_loader.cpp
     src/qwen3_0p6b_graph.cpp
     src/flashprefill_q8.cpp
@@ -302,5 +305,53 @@ if(DFLASH27B_TESTS)
         if(OpenMP_CXX_FOUND)
             target_link_libraries(test_dflash PRIVATE OpenMP::OpenMP_CXX)
         endif()
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_gemma4_dflash.cpp")
+        add_executable(test_gemma4_dflash test/test_gemma4_dflash.cpp)
+        target_include_directories(test_gemma4_dflash PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(test_gemma4_dflash PRIVATE dflash27b ggml ggml-cuda)
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(test_gemma4_dflash PRIVATE CUDA::cudart)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_gemma4_target.cpp")
+        add_executable(smoke_load_gemma4_target test/smoke_load_gemma4_target.cpp)
+        target_include_directories(smoke_load_gemma4_target PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(smoke_load_gemma4_target PRIVATE dflash27b ggml ggml-cuda)
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(smoke_load_gemma4_target PRIVATE CUDA::cudart)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_gemma4_target_forward.cpp")
+        add_executable(smoke_gemma4_target_forward test/smoke_gemma4_target_forward.cpp)
+        target_include_directories(smoke_gemma4_target_forward PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(smoke_gemma4_target_forward PRIVATE dflash27b ggml ggml-cuda)
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(smoke_gemma4_target_forward PRIVATE CUDA::cudart)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_gemma4_draft.cpp")
+        add_executable(smoke_load_gemma4_draft test/smoke_load_gemma4_draft.cpp)
+        target_include_directories(smoke_load_gemma4_draft PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(smoke_load_gemma4_draft PRIVATE dflash27b ggml ggml-cuda)
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(smoke_load_gemma4_draft PRIVATE CUDA::cudart)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_gemma4_draft_forward.cpp")
+        add_executable(smoke_gemma4_draft_forward test/smoke_gemma4_draft_forward.cpp)
+        target_include_directories(smoke_gemma4_draft_forward PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(smoke_gemma4_draft_forward PRIVATE dflash27b ggml ggml-cuda)
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(smoke_gemma4_draft_forward PRIVATE CUDA::cudart)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_gemma4_kv_tq3.cpp")
+        add_executable(test_gemma4_kv_tq3 test/test_gemma4_kv_tq3.cpp)
+        target_include_directories(test_gemma4_kv_tq3 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(test_gemma4_kv_tq3 PRIVATE dflash27b ggml ggml-cuda)
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(test_gemma4_kv_tq3 PRIVATE CUDA::cudart)
     endif()
 endif()

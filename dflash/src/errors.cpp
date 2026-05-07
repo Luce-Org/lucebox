@@ -2,6 +2,7 @@
 // Consumed by tests and the test_dflash driver via dflash27b_last_error().
 
 #include "dflash27b.h"
+#include "gemma4.h"
 #include "internal.h"
 
 #include <mutex>
@@ -22,6 +23,11 @@ void set_last_error(std::string msg) {
 } // namespace dflash27b
 
 extern "C" const char * dflash27b_last_error(void) {
+    std::lock_guard<std::mutex> lk(dflash27b::g_err_mu);
+    return dflash27b::g_last_error.c_str();
+}
+
+extern "C" const char * gemma4_last_error(void) {
     std::lock_guard<std::mutex> lk(dflash27b::g_err_mu);
     return dflash27b::g_last_error.c_str();
 }
