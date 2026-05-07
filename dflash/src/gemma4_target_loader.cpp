@@ -382,15 +382,26 @@ bool load_gemma4_target_gguf(const std::string & path,
 
     // ── 5. Compute capture_layer_ids ─────────────────────────────────────────
     //
-    // Evenly spaced across n_layer.
-    // Formula: step = (n_layer - 2) / (N - 1),  ids[k] = 1 + k * step.
-    // For 31B (60 layers, N=6): step=11 → {1,12,23,34,45,56} ... but the
-    // spec says {1,12,23,35,46,57} so we use ceil-rounded spacing.
-    // We use the same integer formula as the Qwen loader.
+    // Use hardcoded values from the DFlash draft model config.json.
+    // Fallback to evenly-spaced formula for unknown layer counts.
     {
-        const int N    = GEMMA4_DRAFT_N_TARGET_LAYERS;
-        const int step = ((int)n_layer - 2) / (N - 1);
-        for (int k = 0; k < N; k++) out.capture_layer_ids[k] = 1 + k * step;
+        const int N = GEMMA4_DRAFT_N_TARGET_LAYERS;  // 6
+        if ((int)n_layer == 30) {
+            // Gemma4-26B-A4B — from z-lab/gemma-4-26B-A4B-it-DFlash config.json
+            const int ids[6] = {1, 6, 11, 17, 22, 27};
+            for (int k = 0; k < N; k++) out.capture_layer_ids[k] = ids[k];
+        } else if ((int)n_layer == 60) {
+            // Gemma4-31B — from z-lab/gemma-4-31B-it-DFlash config.json
+            const int ids[6] = {1, 12, 23, 35, 46, 57};
+            for (int k = 0; k < N; k++) out.capture_layer_ids[k] = ids[k];
+        } else {
+            // Fallback: evenly spaced
+            const int step = ((int)n_layer - 2) / (N - 1);
+            for (int k = 0; k < N; k++) out.capture_layer_ids[k] = 1 + k * step;
+        }
+        std::printf("[gemma4_loader] capture_layer_ids:");
+        for (int k = 0; k < N; k++) std::printf(" %d", out.capture_layer_ids[k]);
+        std::printf("\n");
     }
 
     // ── 6. Wire tensor pointers ───────────────────────────────────────────────
