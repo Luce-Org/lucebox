@@ -573,7 +573,10 @@ struct GemmaTargetCache {
     ggml_backend_buffer_t rollback_buf = nullptr;
     ggml_backend_t        backend      = nullptr;
 
-    int max_ctx  = 0;
+    int max_ctx      = 0;
+    int swa_ctx_alloc = 0;  // Actual KV-slot count for SWA layers (ring-buffer size).
+                             // Derived as min(max_ctx_alloc, swa_window_padded).
+                             // Full-attention layers always use max_ctx_alloc.
     int cur_pos  = 0;
     int last_tok = -1;
 

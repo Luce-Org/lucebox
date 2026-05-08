@@ -261,33 +261,57 @@ static ggml_tensor * build_swa_attn_block(
                              0.0f, 1.0f, 0.0f, 0.0f);
     }
 
-    // Write K/V into cache
+    // SWA ring-buffer: derive the ring size from the tensor's actual slot count.
+    // When swa_ctx_alloc < max_ctx (long contexts), writes use kv_start % ring_size
+    // so the tensor is never exceeded.
+    const int ring_size = cache_k ? (int)cache_k->ne[1] : (kv_start + n_tokens);
+
+    // Write K/V into cache using ring-buffer position
     if (write_kv && cache_k && cache_v && Kcur && Vcur) {
         ggml_tensor * Kcur_T = ggml_permute(ctx, Kcur, 0, 2, 1, 3);
         ggml_tensor * Vcur_T = ggml_permute(ctx, Vcur, 0, 2, 1, 3);
 
+        const int write_pos = kv_start % ring_size;
         ggml_tensor * k_slot = ggml_view_3d(ctx, cache_k,
             head_dim, n_tokens, n_head_kv,
             cache_k->nb[1], cache_k->nb[2],
-            cache_k->nb[1] * kv_start);
+            cache_k->nb[1] * write_pos);
         ggml_tensor * v_slot = ggml_view_3d(ctx, cache_v,
             head_dim, n_tokens, n_head_kv,
             cache_v->nb[1], cache_v->nb[2],
-            cache_v->nb[1] * kv_start);
+            cache_v->nb[1] * write_pos);
         ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_T, k_slot));
         ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
     }
 
-    // Determine window start for SWA
-    const int win_start = (w.swa_window > 0 && kv_start > w.swa_window)
+    // Determine window for SWA reads.
+    // With a ring buffer, map absolute win_start to ring-relative position.
+    // The ring holds swa_ctx_alloc slots; once kv_start >= ring_size we use
+    // modular arithmetic so reads stay within [0, ring_size).
+    const int abs_win_start = (w.swa_window > 0 && kv_start > w.swa_window)
                               ? (kv_start - w.swa_window) : 0;
+    // Ring-relative window start: same as write_pos for the oldest needed token.
+    const int ring_write_pos = kv_start % ring_size;
+    // Number of tokens in window (capped to ring size so view fits).
     const int kv_len  = kv_start + n_tokens;
-    const int win_len = kv_len - win_start;
+    const int win_len_abs = kv_len - abs_win_start;
+    const int win_len = std::min(win_len_abs, ring_size);
+    // Physical start in the ring: go back win_len-n_tokens from write position.
+    const int ring_win_start = ((ring_write_pos - (win_len - n_tokens)) % ring_size
+                                 + ring_size) % ring_size;
+    // Ensure view does not cross the ring boundary; clamp to ring_size if it would.
+    const int effective_win_len = (ring_win_start + win_len <= ring_size)
+                                  ? win_len : (ring_size - ring_win_start);
 
     const bool need_256_pad = (kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0
                                || head_dim >= 512);
     const int fattn_stride = need_256_pad ? 256 : 1;
-    const int win_len_padded = ((win_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
+    int win_len_padded = ((effective_win_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
+    // Clamp padded length to tensor boundary to avoid overflowing ring allocation.
+    const int max_view_len = ring_size - ring_win_start;
+    if (win_len_padded > max_view_len) {
+        win_len_padded = max_view_len;
+    }
 
     ggml_tensor * Qfa = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
     Qfa = ggml_cont(ctx, Qfa);
@@ -299,12 +323,11 @@ static ggml_tensor * build_swa_attn_block(
     ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
         head_dim, win_len_padded, n_head_kv,
         cache_k->nb[1], cache_k->nb[2],
-        cache_k->nb[1] * win_start);
+        cache_k->nb[1] * ring_win_start);
     ggml_tensor * Vfa = ggml_view_3d(ctx, cache_v,
         head_dim, win_len_padded, n_head_kv,
         cache_v->nb[1], cache_v->nb[2],
-        cache_v->nb[1] * win_start);
-
+        cache_v->nb[1] * ring_win_start);
     // Gemma4: attn_scale = 1.0 (self.scaling = 1.0, no 1/sqrt(head_dim))
     ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask,
                                              1.0f, 0.0f, 0.0f);
@@ -453,9 +476,25 @@ bool create_gemma4_cache(const GemmaTargetWeights & w,
     // TQ3_0 and head_dim>=512 (CUDA FA FATTN_KQ_STRIDE) require 256-alignment
     const bool need_256_align = (kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0
                                  || w.head_dim >= 512);
+    const int align_stride = need_256_align ? 256 : 1;
     const int max_ctx_alloc = need_256_align
         ? ((max_ctx + 255) / 256) * 256
         : max_ctx;
+
+    // SWA layers only need swa_window slots (ring-buffer). Allocate
+    // min(max_ctx_alloc, swa_window_padded) for SWA layers, saving ~50% VRAM
+    // at long contexts. swa_ctx_alloc must be strictly > swa_window so the
+    // decode window (win_len = swa_window + n_tokens) fits within one view.
+    // We pad swa_window to the same alignment stride and add one alignment
+    // block as headroom so contiguous views always work for n_tokens=1 decode.
+    const int swa_window_padded = (w.swa_window > 0)
+        ? ((w.swa_window + align_stride - 1) / align_stride) * align_stride
+        : max_ctx_alloc;
+    // Extra alignment block ensures win_len = swa_window+1 fits without wrap.
+    const int swa_ctx_alloc = (w.swa_window > 0)
+        ? std::min(max_ctx_alloc, swa_window_padded + align_stride)
+        : max_ctx_alloc;
+    out.swa_ctx_alloc = swa_ctx_alloc;
 
     // Build layer -> KV index mappings.
     // Gemma4 can share KV caches across layers. The weight loader sets wk=nullptr
@@ -518,10 +557,14 @@ bool create_gemma4_cache(const GemmaTargetWeights & w,
         const int layer_n_head_kv = (il < (int)w.head_kv_per_layer.size())
                                         ? w.head_kv_per_layer[il] : w.n_head_kv;
 
+        // SWA layers use a ring buffer of swa_ctx_alloc slots; full-attn layers
+        // need the full max_ctx_alloc to cover the entire context.
+        const int layer_ctx_alloc = is_swa_layer ? swa_ctx_alloc : max_ctx_alloc;
+
         ggml_tensor * K = ggml_new_tensor_3d(out.base_ctx, kv_k_type,
-                                             layer_head_dim, max_ctx_alloc, layer_n_head_kv);
+                                             layer_head_dim, layer_ctx_alloc, layer_n_head_kv);
         ggml_tensor * V = ggml_new_tensor_3d(out.base_ctx, kv_v_type,
-                                             layer_head_dim, max_ctx_alloc, layer_n_head_kv);
+                                             layer_head_dim, layer_ctx_alloc, layer_n_head_kv);
         char name[64];
         std::snprintf(name, sizeof(name), "gemma4_cache_k_%d", il);
         ggml_set_name(K, name);
@@ -548,6 +591,23 @@ bool create_gemma4_cache(const GemmaTargetWeights & w,
         out.base_ctx = nullptr;
         return false;
     }
+
+    // Count full-attn vs SWA KV-owning layers for VRAM savings log.
+    int n_full_kv = 0, n_swa_kv = 0;
+    for (int il = 0; il < w.n_layer; il++) {
+        if (out.layer_to_kv_idx[il] < 0) continue;
+        const bool is_swa = (il < (int)w.swa_layers.size()) && w.swa_layers[il];
+        if (is_swa) n_swa_kv++; else n_full_kv++;
+    }
+    const float full_slots = (float)n_full_kv  * max_ctx_alloc;
+    const float swa_slots  = (float)n_swa_kv   * swa_ctx_alloc;
+    const float old_slots  = (float)(n_full_kv + n_swa_kv) * max_ctx_alloc;
+    const float saved_pct  = old_slots > 0.0f
+        ? 100.0f * (1.0f - (full_slots + swa_slots) / old_slots)
+        : 0.0f;
+    std::fprintf(stderr,
+        "[cache] created max_ctx=%d (full_attn=%d, swa=%d), kv_layers=%d, saved %.1f%%\n",
+        max_ctx, max_ctx_alloc, swa_ctx_alloc, n_kv_slots, saved_pct);
 
     // Zero-initialize all tensors
     std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
@@ -576,6 +636,7 @@ void free_gemma4_cache(GemmaTargetCache & c) {
     c.target_feat     = nullptr;
     c.cur_pos         = 0;
     c.last_tok        = -1;
+    c.swa_ctx_alloc   = 0;
 }
 
 void reset_gemma4_cache(GemmaTargetCache & c) {
