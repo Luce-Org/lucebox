@@ -22,27 +22,26 @@
 #include "internal.h"
 #include "dflash_graph.h"
 #include "qwen3_drafter.h"
+#include "laguna_daemon.h"  // arch dispatch — laguna targets are served by
+                            // dflash27b::run_laguna_daemon() instead of the
+                            // qwen35 + DFlash + DDTree pipeline below.
+#include "sampler.h"        // shared CPU sampler chain (SamplerCfg /
+                            // sample_logits / parse_sampler_token) used by
+                            // both arches; behaviour stays identical.
 
 #include "ggml.h"
+#include "gguf.h"  // gguf_init_from_file / gguf_find_key for arch detect
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 
+
 #include <cuda_runtime.h>
 
-// Half-precision → f32 widen kernel launchers (src/f16_convert.cu). Used by
-// the DDtree rollback (ssm_intermediate slot → cache.ssm_state) and the
-// drafter prep path (target_feat → sg.target_hidden_cat). We store the
-// per-token intermediate cache in f16 and the target_feat buffer in bf16 to
-// halve their memory footprint.
-extern "C" void dflash27b_launch_f16_to_f32(const void * src,
-                                            void * dst,
-                                            size_t n_elems,
-                                            cudaStream_t stream);
-extern "C" void dflash27b_launch_bf16_to_f32(const void * src,
-                                             void * dst,
-                                             size_t n_elems,
-                                             cudaStream_t stream);
+// ggml-cuda dequantize: Q8_0/F16/BF16 → F32. Replaces the custom
+// f16_convert.cu kernels with ggml's built-in converter dispatch.
+using to_fp32_cuda_t = void (*)(const void *, float *, int64_t, cudaStream_t);
+to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 
 #include <algorithm>
 #include <chrono>
@@ -69,6 +68,7 @@ extern "C" void dflash27b_launch_bf16_to_f32(const void * src,
 #include <unistd.h>
 #endif
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -120,103 +120,12 @@ static int argmax_f32(const float * x, int n) {
     return best;
 }
 
-// Optional sampling. Greedy is the default. When SamplerCfg.temp > 0
-// the corresponding committed-token argmax sites instead run a small
-// CPU sampler chain (rep penalty -> top_k -> top_p -> temp -> draw).
-// The DDTree skeleton itself stays argmax to keep accept rate intact.
-struct SamplerCfg {
-    float    temp       = 0.0f;
-    float    top_p      = 1.0f;
-    int      top_k      = 0;
-    float    rep_pen    = 1.0f;
-    int      rep_window = 256;
-    uint64_t seed       = 0;
-};
-
-static int sample_logits(const float * logits_in,
-                         int vocab,
-                         const SamplerCfg & cfg,
-                         const std::vector<int32_t> & history,
-                         std::mt19937_64 & rng) {
-    std::vector<std::pair<float,int>> cand(vocab);
-    for (int i = 0; i < vocab; i++) cand[i] = {logits_in[i], i};
-
-    if (cfg.rep_pen > 1.0f && !history.empty()) {
-        const int win  = std::min((int)history.size(), cfg.rep_window);
-        const int from = (int)history.size() - win;
-        std::unordered_set<int> seen;
-        for (int i = from; i < (int)history.size(); i++) seen.insert(history[i]);
-        for (auto & c : cand) {
-            if (seen.count(c.second)) {
-                c.first = (c.first > 0.0f) ? c.first / cfg.rep_pen
-                                           : c.first * cfg.rep_pen;
-            }
-        }
-    }
-
-    if (cfg.top_k > 0 && cfg.top_k < vocab) {
-        std::partial_sort(cand.begin(), cand.begin() + cfg.top_k, cand.end(),
-                          [](auto & a, auto & b){ return a.first > b.first; });
-        cand.resize(cfg.top_k);
-    } else {
-        std::sort(cand.begin(), cand.end(),
-                  [](auto & a, auto & b){ return a.first > b.first; });
-    }
-
-    const float inv_t = 1.0f / std::max(1e-3f, cfg.temp);
-    float maxv = cand.front().first * inv_t;
-    double Z   = 0.0;
-    std::vector<float> probs(cand.size());
-    for (size_t i = 0; i < cand.size(); i++) {
-        probs[i] = std::exp(cand[i].first * inv_t - maxv);
-        Z       += probs[i];
-    }
-    for (auto & p : probs) p = (float)(p / Z);
-
-    if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
-        double cum = 0.0;
-        size_t cut = probs.size();
-        for (size_t i = 0; i < probs.size(); i++) {
-            cum += probs[i];
-            if (cum >= cfg.top_p) { cut = i + 1; break; }
-        }
-        probs.resize(cut); cand.resize(cut);
-        double zz = 0.0;
-        for (auto p : probs) zz += p;
-        for (auto & p : probs) p = (float)(p / zz);
-    }
-
-    std::uniform_real_distribution<double> u(0.0, 1.0);
-    double r   = u(rng);
-    double acc = 0.0;
-    for (size_t i = 0; i < probs.size(); i++) {
-        acc += probs[i];
-        if (r <= acc) return cand[i].second;
-    }
-    return cand.back().second;
-}
-
-static bool parse_sampler_token(std::string & line, SamplerCfg & out) {
-    auto pos = line.find(" samp=");
-    if (pos == std::string::npos) return false;
-    auto end = line.find(' ', pos + 1);
-    std::string tok = (end == std::string::npos)
-                          ? line.substr(pos + 6)
-                          : line.substr(pos + 6, end - (pos + 6));
-    line.erase(pos, (end == std::string::npos ? std::string::npos : end - pos));
-    float t = 0.0f, tp = 1.0f, rp = 1.0f;
-    int   tk = 0;
-    unsigned long long sd = 0;
-    int n = std::sscanf(tok.c_str(), "%f,%f,%d,%f,%llu",
-                        &t, &tp, &tk, &rp, &sd);
-    if (n < 1) return false;
-    out.temp    = t;
-    out.top_p   = tp;
-    out.top_k   = tk;
-    out.rep_pen = rp;
-    out.seed    = sd;
-    return true;
-}
+// CPU sampler chain (SamplerCfg / sample_logits / parse_sampler_token) lives
+// in src/sampler.{h,cpp} and is shared with src/laguna_daemon.cpp. Behaviour
+// is unchanged: greedy when cfg.temp <= 0, otherwise rep_penalty -> top_k ->
+// softmax(temp) -> top_p -> draw. The DDTree skeleton itself stays argmax to
+// keep the accept rate intact; sample_logits only runs at committed-token
+// sites when ` samp=` was on the request line.
 
 // ggml_flash_attn_ext expects kv_len aligned to KQ_MASK_PAD (32) on the
 // f16/Q* paths, and to FATTN_KQ_STRIDE (256) on the TurboQuant FA paths.
@@ -753,9 +662,10 @@ static bool draft_feature_mirror_sync_range(const TargetCache & cache,
             (const char *)cache.target_feat->data + (size_t)src_slot * src_stride;
         void * dst =
             (char *)mirror.target_feat->data + (size_t)dst_slot * dst_stride;
+        auto bf16_to_f32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
         if (mirror.device == mirror.target_device) {
             cudaSetDevice(mirror.device);
-            dflash27b_launch_bf16_to_f32(src, dst, elems, nullptr);
+            bf16_to_f32(src, (float *)dst, (int64_t)elems, nullptr);
         } else {
             DraftFeatureMirror & mutable_mirror =
                 const_cast<DraftFeatureMirror &>(mirror);
@@ -766,7 +676,7 @@ static bool draft_feature_mirror_sync_range(const TargetCache & cache,
                 return false;
             }
             cudaSetDevice(mirror.device);
-            dflash27b_launch_bf16_to_f32(mirror.bf16_staging, dst, elems, nullptr);
+            bf16_to_f32(mirror.bf16_staging, (float *)dst, (int64_t)elems, nullptr);
         }
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) return false;
@@ -917,7 +827,8 @@ static bool build_target_step(
     bool with_mask,
     bool capture,
     bool capture_delta_intermediate = false,
-    int fa_window = 0) {
+    int fa_window = 0,
+    bool last_token_logits_only = false) {
     step_graph_free(sg);
 
     ggml_init_params ip{};
@@ -961,6 +872,7 @@ static bool build_target_step(
     gi.capture_layers             = capture;
     gi.capture_delta_intermediate = capture_delta_intermediate;
     gi.fa_window                  = fa_window;
+    gi.last_token_logits_only     = last_token_logits_only;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
@@ -1393,6 +1305,7 @@ static bool compute_target_split_argmax(
         const TargetWeights & w,
         ggml_backend_t backend,
         ggml_tensor * act,
+        int token_offset,
         int n_tokens,
         int hidden,
         int vocab,
@@ -1406,7 +1319,8 @@ static bool compute_target_split_argmax(
     if (!sg.ctx) return false;
 
     ggml_tensor * act_view = ggml_view_2d(
-        sg.ctx, act, hidden, n_tokens, act->nb[1], 0);
+        sg.ctx, act, hidden, n_tokens, act->nb[1],
+        (size_t)token_offset * act->nb[1]);
     ggml_tensor * normed = ggml_rms_norm(sg.ctx, act_view, DFLASH27B_RMS_EPS);
     normed = ggml_mul(sg.ctx, normed, w.out_norm);
     ggml_tensor * logits = ggml_mul_mat(sg.ctx, w.output, normed);
@@ -1558,9 +1472,12 @@ static bool run_target_layer_split_forward(
     StepGraph final_sg;
     std::vector<int32_t> argmax_tokens;
     TargetLayerSplitShard & last_shard = shards.back();
+    const bool need_all_argmax = argmax_out != nullptr;
+    const int argmax_offset = need_all_argmax ? 0 : (n_tokens_total - 1);
+    const int argmax_count = need_all_argmax ? n_tokens_total : 1;
     const bool ok = compute_target_split_argmax(
         final_sg, last_shard.weights, last_shard.backend, act_in,
-        n_tokens_total, hidden, vocab, argmax_tokens);
+        argmax_offset, argmax_count, hidden, vocab, argmax_tokens);
     step_graph_destroy(final_sg);
     activation_pair_free(acts);
     if (!ok) return false;
@@ -2089,10 +2006,42 @@ int main(int argc, char ** argv) {
         g_fa_window = std::max(0, std::atoi(s));
     }
     const char * target_path = argv[1];
-    const char * draft_path  = argv[2];
-    const char * prompt_path = (argc >= 6 && argv[3][0] != '-') ? argv[3] : nullptr;
-    int          n_gen       = (argc >= 6 && argv[3][0] != '-') ? std::atoi(argv[4]) : 0;
-    const char * out_path    = (argc >= 6 && argv[3][0] != '-') ? argv[5] : nullptr;
+
+    // ---- Architecture detection ------------------------------------------
+    // Read general.architecture from the target GGUF before parsing argv
+    // shape so we can route laguna requests to run_laguna_daemon() and
+    // accept the no-draft argv layout server.py uses for that arch.
+    auto peek_gguf_arch = [&](const char * path) -> std::string {
+        gguf_init_params gip{};
+        gip.no_alloc = true;
+        gip.ctx = nullptr;
+        gguf_context * gctx = gguf_init_from_file(path, gip);
+        if (!gctx) return std::string();
+        std::string out;
+        const int64_t kid = gguf_find_key(gctx, "general.architecture");
+        if (kid >= 0) {
+            const char * v = gguf_get_val_str(gctx, kid);
+            if (v) out = v;
+        }
+        gguf_free(gctx);
+        return out;
+    };
+    const std::string detected_arch = peek_gguf_arch(target_path);
+    const bool is_laguna = (detected_arch == "laguna");
+
+    // When arch == laguna there is no DFlash draft model (Poolside hasn't
+    // released one); server.py omits --draft from the spawn cmd. Accept the
+    // shorter argv layout: argv[1] = target, argv[2..] = flags. Same fall-
+    // back applies if the user manually drops the draft (argv[2] starts with
+    // a dash) on any arch — keeps the binary friendly to ad-hoc invocation.
+    const bool no_draft_layout = is_laguna || (argc >= 3 && argv[2][0] == '-');
+    const char * draft_path  = no_draft_layout ? nullptr : argv[2];
+    const int    flags_start = no_draft_layout ? 2 : 3;
+    const bool   has_positional_args =
+        (!no_draft_layout) && (argc >= 6 && argv[3][0] != '-');
+    const char * prompt_path = has_positional_args ? argv[3] : nullptr;
+    int          n_gen       = has_positional_args ? std::atoi(argv[4]) : 0;
+    const char * out_path    = has_positional_args ? argv[5] : nullptr;
     // --seq-verify: run the target verify as q_len independent single-token
     // decodes instead of one batched forward with a causal mask. Isolates
     // the correctness-of-batched-verify hypothesis from z-lab issue #57.
@@ -2142,7 +2091,7 @@ int main(int argc, char ** argv) {
     }
     int   stream_fd     = -1;     // write each committed token to this fd (int32 LE) as they land
     bool  daemon_mode   = false;
-    for (int i = 3; i < argc; i++) {
+    for (int i = flags_start; i < argc; i++) {
         if      (std::strcmp(argv[i], "--daemon") == 0)        daemon_mode = true;
         else if (std::strcmp(argv[i], "--seq-verify") == 0)    seq_verify = true;
         else if (std::strcmp(argv[i], "--fast-rollback") == 0) fast_rollback = true;
@@ -2236,9 +2185,62 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (!daemon_mode && !test_window_mode && (!prompt_path || !out_path)) {
+    // The KV type may also have been chosen via -ctk/-ctv, which sets
+    // DFLASH27B_KV_K / DFLASH27B_KV_V during the argv loop above. Re-check
+    // for TQ3 here so g_kq_stride_pad matches the chunked-FA driver's
+    // align_up(kv_len, 256); otherwise the host-built mask is short and the
+    // kernel reads past its end.
+    auto kv_env_is_tq3 = [](const char * name) {
+        const char * s = std::getenv(name);
+        if (!s) return false;
+        std::string lc;
+        for (const char * p = s; *p; ++p) lc += (char)std::tolower((unsigned char)*p);
+        return lc.rfind("tq3", 0) == 0;
+    };
+    if (kv_env_is_tq3("DFLASH27B_KV_K") || kv_env_is_tq3("DFLASH27B_KV_V")) {
+        g_kq_stride_pad = 256;
+    }
+
+    if (!is_laguna && !daemon_mode && !test_window_mode && (!prompt_path || !out_path)) {
         std::fprintf(stderr, "Missing positional arguments for non-daemon mode.\n");
         return 2;
+    }
+
+    // ---- Arch dispatch: hand laguna targets to the dedicated daemon -----
+    // The qwen35 + DFlash + DDTree code path below assumes the target is a
+    // qwen35-shaped hybrid (attention + DeltaNet/SSM) and that a draft model
+    // exists. Laguna is a pure-attention MoE arch with no published draft,
+    // so dispatch to run_laguna_daemon() before any qwen35-specific init.
+    // The daemon protocol it speaks (bare prompt, samp= tail, generate cmd)
+    // matches what scripts/server.py emits, so the OpenAI HTTP path is
+    // byte-identical for the two arches — only the binary'́s internal
+    // forward kernels differ.
+    if (is_laguna) {
+        ggml_type kv = GGML_TYPE_Q8_0;
+        if (const char * kvs = std::getenv("DFLASH27B_KV_K")) {
+            std::string s = kvs;
+            if      (s == "q4_0") kv = GGML_TYPE_Q4_0;
+            else if (s == "q5_0") kv = GGML_TYPE_Q5_0;
+            else if (s == "q8_0") kv = GGML_TYPE_Q8_0;
+            else if (s == "f16")  kv = GGML_TYPE_F16;
+        }
+        const int max_ctx_eff = g_max_ctx_override > 0 ? g_max_ctx_override : 4096;
+        int chunk = 2048;
+        if (const char * ck = std::getenv("DFLASH27B_LAGUNA_CHUNK")) {
+            const int v = std::atoi(ck);
+            if (v > 0) chunk = v;
+        }
+        std::fprintf(stderr,
+            "[test_dflash] arch=laguna -> dispatching to run_laguna_daemon "
+            "(max_ctx=%d kv=%s chunk=%d stream_fd=%d). DFlash + DDTree disabled.\n",
+            max_ctx_eff, ggml_type_name(kv), chunk, stream_fd);
+        dflash27b::LagunaDaemonArgs largs;
+        largs.target_path = target_path;
+        largs.max_ctx     = max_ctx_eff;
+        largs.chunk       = chunk;
+        largs.kv_type     = kv;
+        largs.stream_fd   = stream_fd;
+        return dflash27b::run_laguna_daemon(largs);
     }
 
     // Helper: write a committed token to the stream fd immediately (int32 LE).
@@ -2744,8 +2746,12 @@ int main(int argc, char ** argv) {
                 // Park target + draft before allocating drafter context so
                 // the drafter's KV (~1.3 GB Q4_0) + scratch (~600 MB) have
                 // headroom on a 24 GB card. Restore after scoring.
-                bool restore_target = !target_parked;
-                bool restore_draft  = !draft_parked;
+                // On >=32 GB GPUs, DFLASH_COMPRESS_NO_PARK=1 skips parking
+                // so the scorer stays co-resident with target+draft.
+                const bool no_park = (std::getenv("DFLASH_COMPRESS_NO_PARK") &&
+                                      std::atoi(std::getenv("DFLASH_COMPRESS_NO_PARK")) != 0);
+                bool restore_target = !target_parked && !no_park;
+                bool restore_draft  = !draft_parked && !no_park;
                 if (restore_target) {
                     step_graph_destroy(proj_sg);
                     free_target_weights(w);
@@ -3199,6 +3205,9 @@ int main(int argc, char ** argv) {
     }
     // ── Token-segmented prefill (legacy) ────────────────────────────────
     if (!layer_prefill) {
+    // Prefill only needs last-token logits to seed decode. Skip computing
+    // the full [vocab, ubatch] lm_head matmul — saves ~233MB scratch at
+    // ubatch=384 and eliminates a large matmul per prefill step.
     int prefill_ubatch_env = (prompt_len_auto > 2048) ? 384 : 16;
     if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
         prefill_ubatch_env = std::max(1, std::atoi(s));
@@ -3212,6 +3221,26 @@ int main(int argc, char ** argv) {
     std::vector<float>    pf_logits_buf;
     const int prompt_len     = (int)prompt.size();
     const int prefill_start  = cache.cur_pos;   // 0 for fresh cache; >0 after snapshot restore
+
+    // Pre-reserve gallocr: build a max-size graph so gallocr allocates its
+    // buffer upfront, preventing reallocations as the mask grows during prefill.
+    // With fa_window, the mask is capped at ~fa_window+ubatch regardless of
+    // prompt length, so the reserve is always small.
+    if (prompt_len > PREFILL_UBATCH) {
+        // Use kv_start near the end so the mask reaches its maximum windowed size.
+        const int reserve_kv = std::max(prompt_len - PREFILL_UBATCH, PREFILL_UBATCH);
+        if (!build_target_step(sg, w, cache, backend,
+                                /*kv_start=*/reserve_kv,
+                                /*n_tokens=*/PREFILL_UBATCH,
+                                /*with_mask=*/true, /*capture=*/true,
+                                /*capture_delta_intermediate=*/false,
+                                /*fa_window=*/g_fa_window,
+                                /*last_token_logits_only=*/true)) {
+            std::fprintf(stderr, "prefill gallocr pre-reserve failed\n"); return 1;
+        }
+        // gallocr is now reserved at peak size; subsequent builds will reuse it.
+    }
+
     for (int start = prefill_start; start < prompt_len; start += PREFILL_UBATCH) {
         int n_tokens = std::min(PREFILL_UBATCH, prompt_len - start);
 
@@ -3248,7 +3277,10 @@ int main(int argc, char ** argv) {
         const bool pf_with_mask = (g_kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
         if (!build_target_step(sg, w, cache, backend,
                                 /*kv_start=*/start, /*n_tokens=*/n_tokens,
-                                /*with_mask=*/pf_with_mask, /*capture=*/true)) {
+                                /*with_mask=*/pf_with_mask, /*capture=*/true,
+                                /*capture_delta_intermediate=*/false,
+                                /*fa_window=*/g_fa_window,
+                                /*last_token_logits_only=*/true)) {
             std::fprintf(stderr, "prefill build @%d\n", start); return 1;
         }
 
@@ -3275,7 +3307,11 @@ int main(int argc, char ** argv) {
         // is active (which pads kv_len to 256 and needs -inf on the padding
         // positions even for a single query).
         if (pf_with_mask) {
-            build_causal_mask(pf_mask_buf, kv_len, n_tokens, /*kv_start=*/start);
+            const int pf_win_start = (g_fa_window > 0 && start > g_fa_window)
+                                         ? (start - g_fa_window) : 0;
+            const int pf_win_len = kv_len - pf_win_start;
+            build_causal_mask(pf_mask_buf, pf_win_len, n_tokens,
+                              /*kv_start=*/start, /*win_start=*/pf_win_start);
             ggml_backend_tensor_set(sg.attn_mask, pf_mask_buf.data(), 0,
                                     sizeof(uint16_t) * pf_mask_buf.size());
         }
@@ -3283,10 +3319,9 @@ int main(int argc, char ** argv) {
         auto st = ggml_backend_graph_compute(backend, sg.gf);
         if (st != GGML_STATUS_SUCCESS) { std::fprintf(stderr, "prefill compute @%d\n", start); return 1; }
 
-        // Only need the last position's logits to seed decode.
+        // Logits are [vocab, 1] (last_token_logits_only), read from offset 0.
         pf_logits_buf.assign(vocab, 0.0f);
-        const size_t last_row_off = (size_t)(n_tokens - 1) * vocab * sizeof(float);
-        ggml_backend_tensor_get(sg.logits, pf_logits_buf.data(), last_row_off,
+        ggml_backend_tensor_get(sg.logits, pf_logits_buf.data(), 0,
                                 sizeof(float) * vocab);
         last_tok = (g_sampler.temp > 0.0f)
             ? sample_logits(pf_logits_buf.data(), vocab, g_sampler, out_all, g_sampler_rng)
@@ -3450,16 +3485,17 @@ int main(int argc, char ** argv) {
             const int    post_n   = draft_ctx - pre_n;
 
             cudaSetDevice(draft_gpu);
-            dflash27b_launch_bf16_to_f32(
+            auto bf16_to_f32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+            bf16_to_f32(
                 (const char *)cache.target_feat->data + (size_t)slot0 * elt_feat * fc_in,
-                draft_sg.target_hidden_cat->data,
-                (size_t)pre_n * fc_in,
+                (float *)draft_sg.target_hidden_cat->data,
+                (int64_t)pre_n * fc_in,
                 nullptr);
             if (post_n > 0) {
-                dflash27b_launch_bf16_to_f32(
+                bf16_to_f32(
                     (const char *)cache.target_feat->data,
-                    (char *)draft_sg.target_hidden_cat->data + (size_t)pre_n * fc_in * sizeof(float),
-                    (size_t)post_n * fc_in,
+                    (float *)((char *)draft_sg.target_hidden_cat->data + (size_t)pre_n * fc_in * sizeof(float)),
+                    (int64_t)post_n * fc_in,
                     nullptr);
             }
         }
@@ -3804,10 +3840,9 @@ int main(int argc, char ** argv) {
                         return 1;
                     }
                     // SSM state rollback: source is cache.ssm_intermediate_states
-                    // (f16, [S_v, S_v, H_v, max_verify_tokens]) at slot
-                    // rollback_dfs. Destination is cache.ssm_state[il] (f32).
-                    // Use a tiny CUDA kernel (src/f16_convert.cu) to widen f16
-                    // → f32 in a single launch per layer.
+                    // ([S_v, S_v, H_v, max_verify_tokens]) at slot rollback_dfs.
+                    // Destination is cache.ssm_state[il] (f32). Use ggml's
+                    // built-in dequantize to widen Q8_0/F16 → f32.
                     const size_t ssm_elems =
                         (size_t)cache.ssm_state[il]->ne[0] *
                         (size_t)cache.ssm_state[il]->ne[1] *
@@ -3816,10 +3851,9 @@ int main(int argc, char ** argv) {
                         (size_t)rollback_dfs * cap.ssm_intermediate_states->nb[3];
                     const void * ssm_src =
                         (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
-                    dflash27b_launch_f16_to_f32(ssm_src,
-                                                cache.ssm_state[il]->data,
-                                                ssm_elems,
-                                                stream);
+                    ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type)(
+                        ssm_src, (float *)cache.ssm_state[il]->data,
+                        (int64_t)ssm_elems, stream);
                     cudaError_t ce = cudaSuccess;  // launch error checked in the conv block below
 
                     // Conv rollback: copy the K-1 most recent inputs along
@@ -4126,9 +4160,9 @@ int main(int argc, char ** argv) {
                     //
                     // cap.ssm_intermediate_states is the persistent cache buffer
                     // cache.ssm_intermediate[il], shape [S_v, S_v, H_v, q_len].
-                    // Stored in f16 (see create_target_cache) to halve memory;
-                    // cache.ssm_state[il] is f32. Use the widen kernel to
-                    // convert on copy, same as the DDtree rollback path.
+                    // Stored in Q8_0 (or F16 legacy) to reduce memory;
+                    // cache.ssm_state[il] is f32. Use ggml's built-in dequantize
+                    // to convert on copy, same as the DDtree rollback path.
                     const size_t ssm_elems =
                         (size_t)cache.ssm_state[il]->ne[0] *
                         (size_t)cache.ssm_state[il]->ne[1] *
@@ -4137,10 +4171,9 @@ int main(int argc, char ** argv) {
                         (size_t)rollback_idx * cap.ssm_intermediate_states->nb[3];
                     const void * ssm_src =
                         (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
-                    dflash27b_launch_f16_to_f32(ssm_src,
-                                                cache.ssm_state[il]->data,
-                                                ssm_elems,
-                                                stream);
+                    ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type)(
+                        ssm_src, (float *)cache.ssm_state[il]->data,
+                        (int64_t)ssm_elems, stream);
                     cudaError_t ce = cudaSuccess;
 
                     // ── Conv rollback: copy conv_input[commit_n..commit_n+K-2, :, :]

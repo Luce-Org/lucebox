@@ -59,6 +59,7 @@ class PrefillConfig:
     keep_ratio: float                                  # 0.015..0.125
     drafter_gguf: Optional[Path]                       # drafter weights (Qwen3-0.6B BF16 GGUF)
     drafter_tokenizer_id: str                          # HF repo ID for drafter vocab
+    skip_park: bool = False                            # skip park/unpark on >=32 GB GPUs
 
     @property
     def enabled(self) -> bool:
@@ -92,6 +93,11 @@ def add_cli_flags(ap) -> None:
     ap.add_argument("--prefill-drafter-tokenizer", default="Qwen/Qwen3-0.6B",
                     help="HF repo ID for the drafter tokenizer "
                          "(default Qwen/Qwen3-0.6B).")
+    ap.add_argument("--prefill-skip-park", action="store_true", default=False,
+                    help="Skip park/unpark/free-drafter on GPUs with enough VRAM "
+                         "to hold target + draft + scorer simultaneously (e.g. "
+                         "RTX 5090 32 GB). Keeps scorer resident for fast "
+                         "subsequent compressions.")
 
 
 def config_from_args(args) -> PrefillConfig:
@@ -109,6 +115,7 @@ def config_from_args(args) -> PrefillConfig:
         keep_ratio=args.prefill_keep_ratio,
         drafter_gguf=args.prefill_drafter,
         drafter_tokenizer_id=args.prefill_drafter_tokenizer,
+        skip_park=getattr(args, 'prefill_skip_park', False),
     )
 
 
@@ -121,11 +128,17 @@ def compress_text_via_daemon(
     drafter_tokenizer,
     cfg: PrefillConfig,
     prompt_text: str,
+    skip_park: bool = False,
 ) -> str:
     """Run the daemon's compress + memory dance, return the compressed text.
 
     Caller holds the daemon lock for the full duration. After this returns,
     the daemon has its target + draft restored and is ready for ``generate``.
+
+    When ``skip_park`` is True (e.g. on 32 GB+ GPUs where all three models
+    fit in VRAM simultaneously), the park/unpark/free-drafter steps are
+    skipped. The daemon's compress handler will keep the scorer loaded for
+    subsequent requests, avoiding the ~2s reload penalty per request.
     """
     # 1) drafter-tokenize the prompt
     drafter_ids = drafter_tokenizer(prompt_text, return_tensors=None,
@@ -140,9 +153,10 @@ def compress_text_via_daemon(
             for t in drafter_ids:
                 f.write(struct.pack("<i", int(t)))
 
-        # 3) park target + draft so drafter has VRAM headroom on a 24 GB card
-        _send_and_ack(daemon_stdin, r_pipe, "park target\n")
-        _send_and_ack(daemon_stdin, r_pipe, "park draft\n")
+        if not skip_park:
+            # 3) park target + draft so drafter has VRAM headroom on a 24 GB card
+            _send_and_ack(daemon_stdin, r_pipe, "park target\n")
+            _send_and_ack(daemon_stdin, r_pipe, "park draft\n")
 
         # 4) compress: drafter loads, FlashPrefill scoring, emit compressed ids, drafter held
         keep_x1000 = int(round(cfg.keep_ratio * 1000))
@@ -151,10 +165,11 @@ def compress_text_via_daemon(
         daemon_stdin.flush()
         compressed_ids = _drain_until_sentinel(r_pipe)
 
-        # 5) free drafter weights + BSA scratch, then restore target + draft
-        _send_and_ack(daemon_stdin, r_pipe, "free drafter\n")
-        _send_and_ack(daemon_stdin, r_pipe, "unpark target\n")
-        _send_and_ack(daemon_stdin, r_pipe, "unpark draft\n")
+        if not skip_park:
+            # 5) free drafter weights + BSA scratch, then restore target + draft
+            _send_and_ack(daemon_stdin, r_pipe, "free drafter\n")
+            _send_and_ack(daemon_stdin, r_pipe, "unpark target\n")
+            _send_and_ack(daemon_stdin, r_pipe, "unpark draft\n")
     finally:
         try: os.unlink(path)
         except Exception: pass

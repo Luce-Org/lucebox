@@ -88,7 +88,15 @@ bool create_target_cache_partial(const TargetWeights & w,
     dflash::resolve_kv_types(kv_k_type, kv_v_type);
     out.kv_k_type = kv_k_type;
     out.kv_v_type = kv_v_type;
-    const int max_ctx_alloc = (kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0)
+
+    // Graph-level FWHT K-rotation (TurboQuant-style outlier spreading with
+    // standard quant types that keep fast FA kernel paths on all arches).
+    // Skip for TQ3_0 K cache — that type already applies WHT during quantization.
+    out.kv_k_rotated = (kv_k_type != GGML_TYPE_TQ3_0);
+
+    const bool needs_256_stride =
+        kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0;
+    const int max_ctx_alloc = needs_256_stride
         ? ((max_ctx + 255) / 256) * 256
         : max_ctx;
 
@@ -181,7 +189,7 @@ bool create_target_cache_partial(const TargetWeights & w,
                                                        head_v_dim, head_v_dim, w.ssm_dt_rank);
                 ggml_tensor * Cn = ggml_new_tensor_2d(out.rollback_ctx, GGML_TYPE_F32,
                                                        w.ssm_d_conv - 1, conv_channels);
-                ggml_tensor * Si = ggml_new_tensor_4d(out.rollback_ctx, GGML_TYPE_F16,
+                ggml_tensor * Si = ggml_new_tensor_4d(out.rollback_ctx, GGML_TYPE_Q8_0,
                                                        head_v_dim, head_v_dim,
                                                        w.ssm_dt_rank, max_verify_tokens);
                 ggml_tensor * Ci = ggml_new_tensor_3d(out.rollback_ctx, GGML_TYPE_F32,
@@ -704,6 +712,7 @@ static ggml_tensor * build_full_attn_block(
     int n_tokens,
     ggml_type kv_k_type,
     ggml_type kv_v_type,
+    bool kv_k_rotated = false,
     int fa_window = 0
 ) {
     const int head_dim = w.n_embd_head_k;
@@ -767,6 +776,15 @@ static ggml_tensor * build_full_attn_block(
     ggml_tensor * Kcur_T = ggml_permute(ctx, Kcur, 0, 2, 1, 3);  // [head_dim, n_tokens, n_head_kv]
     ggml_tensor * Vcur_T = ggml_permute(ctx, Vcur, 0, 2, 1, 3);  // [head_dim, n_tokens, n_head_kv]
 
+    // Graph-level FWHT rotation: rotate K before writing to standard-type
+    // cache. This spreads outliers across dimensions (like TurboQuant) while
+    // keeping Q4_0/Q8_0 cache types that have fast FA kernels on all arches.
+    // turbo_wht handles strided (non-contiguous) input directly, so we skip
+    // the ggml_cont that permute would otherwise require.
+    if (kv_k_rotated) {
+        Kcur_T = ggml_turbo_wht(ctx, Kcur_T, 0);
+    }
+
     ggml_tensor * k_slot = ggml_view_3d(ctx, cache_k,
         head_dim, n_tokens, n_head_kv,
         cache_k->nb[1], cache_k->nb[2],
@@ -792,18 +810,15 @@ static ggml_tensor * build_full_attn_block(
     const int win_len_padded = ((win_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
 
     ggml_tensor * Qfa = ggml_permute(ctx, Q, 0, 2, 1, 3);
-    Qfa = ggml_cont(ctx, Qfa);
-
-    // For TQ3_0 KV cache, K/V are stored in FWHT-rotated space (the f32->TQ3_0
-    // quantize kernel applies tq3_rotate_forward before the centroid search,
-    // see ggml-cuda/cpy-utils.cuh quantize_f32_tq3_0_group).
-    // Rotation gates are independent for K and V:
-    //   * K=TQ3 needs Q rotated forward so softmax(Qfa . Kfa^T) = softmax(QK^T)
-    //   * V=TQ3 needs attn_out inverse-rotated to recover plain V space
-    const bool q_rotate   = (kv_k_type == GGML_TYPE_TQ3_0);
+    // When K is rotated (TQ3_0 or explicit FWHT), Q needs forward rotation too.
+    const bool q_rotate   = (kv_k_type == GGML_TYPE_TQ3_0) || kv_k_rotated;
     const bool out_rotate = (kv_v_type == GGML_TYPE_TQ3_0);
+    // turbo_wht handles strided input, so when rotating we skip the separate
+    // ggml_cont — the rotation kernel makes the output contiguous.
     if (q_rotate) {
         Qfa = ggml_turbo_wht(ctx, Qfa, 0);
+    } else {
+        Qfa = ggml_cont(ctx, Qfa);
     }
 
     // K and V from cache: a windowed view starting at win_start.
@@ -825,7 +840,6 @@ static ggml_tensor * build_full_attn_block(
 
     // Un-rotate the FA output from FWHT-rotated V space (only when V is TQ3).
     if (out_rotate) {
-        attn = ggml_cont(ctx, attn);
         attn = ggml_turbo_wht(ctx, attn, 1);
     }
 
@@ -993,7 +1007,12 @@ static ggml_tensor * build_delta_net_block(
     //    intermediate states DIRECTLY into the persistent cache buffer,
     //    eliminating the downstream ggml_cpy that would otherwise copy them.
     //    Saves ~5-10 ms per verify step (memory-bandwidth bound) on 27B.
-    ggml_tensor * persist_inter = (parent_ids && cap && cap->ssm_intermediate_states)
+    // tree_persist writes directly to the intermediate buffer. It only supports
+    // F32/F16 output; for Q8_0 intermediates, fall back to the legacy ggml_cpy
+    // path which handles F32→Q8_0 quantization automatically.
+    ggml_tensor * persist_inter = (parent_ids && cap && cap->ssm_intermediate_states
+                                   && (cap->ssm_intermediate_states->type == GGML_TYPE_F32
+                                       || cap->ssm_intermediate_states->type == GGML_TYPE_F16))
         ? cap->ssm_intermediate_states
         : nullptr;
 
@@ -1153,7 +1172,9 @@ static ggml_tensor * build_single_layer(
         cur = build_full_attn_block(ctx, gf, w, L, cur, positions,
                                     cache.attn_k[fa_idx], cache.attn_v[fa_idx],
                                     attn_mask, kv_start, n_tokens,
-                                    cache.kv_k_type, cache.kv_v_type, fa_window);
+                                    cache.kv_k_type, cache.kv_v_type,
+                                    cache.kv_k_rotated,
+                                    fa_window);
     } else {
         int dn_idx = 0;
         for (int il = 0; il < layer_idx; il++) {
@@ -1255,7 +1276,9 @@ QwenGraphOutputs build_qwen35_graph(
             cur = build_full_attn_block(ctx, gf, w, L, cur, in.positions,
                                         cache.attn_k[fa_idx], cache.attn_v[fa_idx],
                                         in.attn_mask, in.kv_start, n_tokens,
-                                        cache.kv_k_type, cache.kv_v_type, in.fa_window);
+                                        cache.kv_k_type, cache.kv_v_type,
+                                        cache.kv_k_rotated,
+                                        in.fa_window);
             fa_idx++;
         } else {
             DeltaNetCapture * cap_ptr = nullptr;
@@ -1338,7 +1361,13 @@ QwenGraphOutputs build_qwen35_graph(
     // 2. Final norm
     ggml_tensor * out = rms_norm_mul(ctx, inpL, w.out_norm, EPS);
 
-    // 3. LM head
+    // 3. LM head — optionally only for the last token (prefill optimization:
+    //    reduces logits from [vocab, n_tokens] to [vocab, 1], saving ~233MB
+    //    scratch at ubatch=384 and eliminating a large matmul).
+    if (in.last_token_logits_only && n_tokens > 1) {
+        out = ggml_view_2d(ctx, out, hidden, 1, out->nb[1],
+                           (size_t)(n_tokens - 1) * out->nb[1]);
+    }
     ggml_tensor * logits = ggml_mul_mat(ctx, w.output, out);
     ggml_set_name(logits, "logits");
 

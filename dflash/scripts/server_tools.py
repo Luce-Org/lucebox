@@ -399,6 +399,7 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
             drafter_tokenizer=drafter_tokenizer,
             cfg=prefill_cfg,
             prompt_text=last_user.content,
+            skip_park=prefill_cfg.skip_park,
         )
 
         new_msgs = []
@@ -922,6 +923,7 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
             drafter_tokenizer=drafter_tokenizer,
             cfg=prefill_cfg,
             prompt_text=long_text,
+            skip_park=prefill_cfg.skip_park,
         )
         new_msgs = list(msgs)
         new_msgs[last_user_idx] = {"role": "user", "content": compressed_text}

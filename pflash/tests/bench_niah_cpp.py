@@ -54,6 +54,12 @@ def main():
                          "DFLASH_FP_ALPHA env var when unset. Validate per "
                          "setup; e.g. alpha=0.85 fails 2/10 NIAH at 117K on "
                          "Qwen3.6-27B / RTX 5090.")
+    ap.add_argument("--no-thinking", action="store_true",
+                    help="Pass enable_thinking=False to the target chat "
+                         "template. Required for Qwen3.6: thinking mode "
+                         "consumes n_gen budget on a chain-of-thought "
+                         "rollout instead of answering, breaking NIAH "
+                         "validation.")
     args = ap.parse_args()
 
     # Resolve BSA + alpha so the daemon subprocess inherits a consistent env.
@@ -139,9 +145,11 @@ def main():
         # Decode compressed ids with DRAFTER tokenizer, re-encode with TARGET + chat template.
         comp_text = drafter_tok.decode(compressed_ids, skip_special_tokens=True)
         user_msg = comp_text + "\n\nAnswer the user question based on the above context."
+        chat_kwargs = {"tokenize": False, "add_generation_prompt": True}
+        if args.no_thinking:
+            chat_kwargs["enable_thinking"] = False
         chat = target_tok.apply_chat_template(
-            [{"role": "user", "content": user_msg}],
-            tokenize=False, add_generation_prompt=True)
+            [{"role": "user", "content": user_msg}], **chat_kwargs)
         target_ids = target_tok(chat, return_tensors="pt")["input_ids"][0].tolist()
 
         # Free drafter (1.2GB), restore target+spec_draft for target gen.

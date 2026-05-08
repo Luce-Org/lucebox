@@ -103,6 +103,10 @@ def main():
     ap.add_argument("--n", type=int, default=10)
     ap.add_argument("--ctx", type=_positive_int, default=8192)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--seed-base", type=int, default=42,
+                    help="Base seed for case generation (default 42). "
+                         "Vary this to produce different needle key/value "
+                         "pairs without changing --n.")
     # Default matches bench_niah_cpp.py's --drafter-tokenizer, since that is
     # the tokenizer the downstream NIAH bench uses to size case["prompt"]
     # for the drafter forward. Override for any other harness.
@@ -118,7 +122,7 @@ def main():
         with open(tmp_path, "w") as f:
             for i in range(args.n):
                 try:
-                    ex = gen_one(seed=42 + i, target_tokens=args.ctx, tokenizer=tok)
+                    ex = gen_one(seed=args.seed_base + i, target_tokens=args.ctx, tokenizer=tok)
                 except ValueError as e:
                     sys.exit(f"[error] case {i}: {e}")
                 assert ex["n_tokens"] <= args.ctx, (

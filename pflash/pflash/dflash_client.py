@@ -4,6 +4,7 @@ import logging
 import os
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 from typing import Optional
@@ -41,22 +42,41 @@ class DflashClient:
         }
         env = {**os.environ, **config.DFLASH_REQUIRED_ENV, **env_overrides}
         bin_dir = os.path.dirname(os.path.abspath(bin_path))
-        ld_extra = [bin_dir, os.path.join(bin_dir, "bin")]
-        env["LD_LIBRARY_PATH"] = ":".join(
-            ld_extra + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else []))
+        if sys.platform == "win32":
+            # Windows uses PATH for DLL search rather than LD_LIBRARY_PATH.
+            path_extra = [os.path.join(bin_dir, "bin"), bin_dir]
+            env["PATH"] = os.pathsep.join(
+                path_extra + ([env["PATH"]] if env.get("PATH") else []))
+        else:
+            ld_extra = [bin_dir, os.path.join(bin_dir, "bin")]
+            env["LD_LIBRARY_PATH"] = ":".join(
+                ld_extra + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else []))
         self.r_pipe, self.w_pipe = os.pipe()
+        # subprocess.Popen pass_fds is POSIX-only. On Windows, mark the pipe
+        # write-end inheritable, convert it to a Win32 HANDLE, and pass that
+        # handle value as --stream-fd; the child inherits via close_fds=False.
+        if sys.platform == "win32":
+            import msvcrt
+            os.set_inheritable(self.w_pipe, True)
+            stream_fd_val = int(msvcrt.get_osfhandle(self.w_pipe))
+        else:
+            stream_fd_val = self.w_pipe
         cmd = [bin_path, target_path, draft_path,
                "--daemon", "--fast-rollback", "--ddtree",
                f"--ddtree-budget={ddtree_budget}",
                f"--max-ctx={max_ctx}",
-               f"--stream-fd={self.w_pipe}"]
+               f"--stream-fd={stream_fd_val}"]
         if ddtree_temp is not None:
             cmd.append(f"--ddtree-temp={ddtree_temp}")
         if not chain_seed:
             cmd.append("--ddtree-no-chain-seed")
         log.info("spawning dflash daemon: %s", " ".join(cmd))
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                     pass_fds=(self.w_pipe,), env=env)
+        if sys.platform == "win32":
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                         close_fds=False, env=env)
+        else:
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                         pass_fds=(self.w_pipe,), env=env)
         os.close(self.w_pipe)
         self._wait_until_loaded(timeout=boot_timeout_s, vram_mib=boot_vram_mib)
         # Park draft by default; user calls unpark when needed

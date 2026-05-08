@@ -145,6 +145,163 @@ def _qwen_marker_ids(tokenizer):
     return im_end[0], im_start[0], system_t[0] if len(system_t) == 1 else None
 
 
+def _resolve_chat_markers(tokenizer):
+    """Return a marker spec for the prefix-cache boundary detector.
+
+    Supports two chat-template families used by the dflash daemon:
+
+      - Qwen3.x: single-token ``<|im_end|>`` / ``<|im_start|>`` markers,
+        ``system`` role keyword. Used by Qwen3.5/3.6-27B target.
+      - Laguna-XS.2 (Poolside): XML-style ``<system>`` / ``</system>`` /
+        ``<user>`` / ``</user>`` / ``<assistant>`` / ``</assistant>``
+        markers. Each tokenizes to a 4-6 token sequence under byte-level
+        BPE.
+
+    Returns a dict with token-sequence patterns:
+      family            : str
+      sys_role_prefix   : tuple[int]    pattern that opens the system role
+      end_msg_seqs      : list[tuple]   any of these closes a message
+      next_role_starts  : list[tuple]   any of these opens the next role
+    """
+    qe = tokenizer.encode("<|im_end|>", add_special_tokens=False)
+    qs = tokenizer.encode("<|im_start|>", add_special_tokens=False)
+    if len(qe) == 1 and len(qs) == 1:
+        sys_t = tokenizer.encode("system", add_special_tokens=False)
+        sys_seq = tuple(qs) + (tuple(sys_t) if len(sys_t) == 1 else ())
+        return {
+            "family": "qwen",
+            "sys_role_prefix": sys_seq,
+            "end_msg_seqs":   [tuple(qe)],
+            "next_role_starts": [tuple(qs)],
+        }
+
+    lstart_sys = tokenizer.encode("<system>",      add_special_tokens=False)
+    lend_sys   = tokenizer.encode("</system>",     add_special_tokens=False)
+    lstart_usr = tokenizer.encode("<user>",        add_special_tokens=False)
+    lend_usr   = tokenizer.encode("</user>",       add_special_tokens=False)
+    lstart_ast = tokenizer.encode("<assistant>",   add_special_tokens=False)
+    lend_ast   = tokenizer.encode("</assistant>",  add_special_tokens=False)
+    if all(x for x in (lstart_sys, lend_sys, lstart_usr, lend_usr,
+                        lstart_ast, lend_ast)):
+        return {
+            "family": "laguna",
+            "sys_role_prefix": tuple(lstart_sys),
+            "end_msg_seqs":   [tuple(lend_sys), tuple(lend_usr), tuple(lend_ast)],
+            "next_role_starts": [tuple(lstart_usr), tuple(lstart_ast),
+                                  tuple(lstart_sys)],
+        }
+
+    raise ValueError(
+        f"Could not resolve chat markers for this tokenizer: "
+        f"qwen im_end={qe} im_start={qs}; laguna seqs missing"
+    )
+
+
+def _seq_at(ids, idx, seq):
+    """Return True iff ids[idx:idx+len(seq)] == seq (and bounds OK)."""
+    if idx < 0 or idx + len(seq) > len(ids):
+        return False
+    for k, t in enumerate(seq):
+        if ids[idx + k] != t:
+            return False
+    return True
+
+
+def _find_first_seq(ids, seq, start=0):
+    """Index of first occurrence of `seq` in ids[start:], or -1."""
+    if not seq:
+        return -1
+    head = seq[0]
+    n = len(ids); m = len(seq)
+    i = start
+    while i + m <= n:
+        if ids[i] == head and _seq_at(ids, i, seq):
+            return i
+        i += 1
+    return -1
+
+
+def _find_first_seq_any(ids, seqs, start=0):
+    """Position of the earliest match among `seqs` in ids[start:], or (-1, None)."""
+    best_idx = -1
+    best_seq = None
+    for s in seqs:
+        idx = _find_first_seq(ids, s, start)
+        if idx >= 0 and (best_idx < 0 or idx < best_idx):
+            best_idx = idx
+            best_seq = s
+    return best_idx, best_seq
+
+
+def find_prefix_boundary_markers(ids, markers):
+    """Multi-token-sequence variant of find_prefix_boundary().
+
+    `markers` is the dict returned by _resolve_chat_markers. The boundary
+    is the index right after the FIRST next-role start sequence that
+    follows the system message: i.e., ids[:boundary] = system header.
+
+    Returns -1 if the system role isn'́t found.
+    """
+    sys_seq = markers["sys_role_prefix"]
+    end_seqs = markers["end_msg_seqs"]
+    next_seqs = markers["next_role_starts"]
+
+    sys_idx = _find_first_seq(ids, sys_seq)
+    if sys_idx < 0:
+        return -1
+    after_sys = sys_idx + len(sys_seq)
+
+    end_idx, end_seq = _find_first_seq_any(ids, end_seqs, after_sys)
+    if end_idx < 0:
+        return -1
+    after_end = end_idx + len(end_seq)
+
+    # Allow up to 4 separator tokens (whitespace) between message-end and
+    # the next role-start sequence.
+    for skip in range(0, 5):
+        probe = after_end + skip
+        for s in next_seqs:
+            if _seq_at(ids, probe, s):
+                return probe + len(s)
+    return -1
+
+
+def find_all_boundaries_markers(ids, markers):
+    """Multi-token-sequence variant of find_all_boundaries()."""
+    sys_seq = markers["sys_role_prefix"]
+    end_seqs = markers["end_msg_seqs"]
+    next_seqs = markers["next_role_starts"]
+
+    out = []
+    sys_idx = _find_first_seq(ids, sys_seq)
+    if sys_idx < 0:
+        return out
+
+    cursor = sys_idx + len(sys_seq)
+    while True:
+        end_idx, end_seq = _find_first_seq_any(ids, end_seqs, cursor)
+        if end_idx < 0:
+            break
+        after_end = end_idx + len(end_seq)
+        next_match = -1
+        next_len   = 0
+        for skip in range(0, 5):
+            probe = after_end + skip
+            for s in next_seqs:
+                if _seq_at(ids, probe, s):
+                    next_match = probe
+                    next_len   = len(s)
+                    break
+            if next_match >= 0:
+                break
+        if next_match < 0:
+            break
+        boundary = next_match + next_len
+        out.append(boundary)
+        cursor = boundary
+    return out
+
+
 def find_prefix_boundary(ids, im_end_id, im_start_id, system_token_id):
     """Return the index AFTER the FIRST end-of-system-message marker, or -1.
 
@@ -295,7 +452,18 @@ class PrefixCache:
 
         self.entries: OrderedDict[bytes, int] = OrderedDict()  # hash → slot_id
         self.next_slot = 0
-        self.im_end, self.im_start, self.system_t = _qwen_marker_ids(tokenizer)
+        try:
+            self.markers = _resolve_chat_markers(tokenizer)
+        except ValueError as e:
+            print(f"{log_prefix} disabling: {e}", flush=True)
+            self.disabled = True
+            self.cap     = 0
+            return
+        print(f"{log_prefix} chat markers: family={self.markers['family']} "
+              f"sys_seq={list(self.markers['sys_role_prefix'])[:6]}… "
+              f"end_seqs={[list(s)[:4] for s in self.markers['end_msg_seqs']]} "
+              f"next_seqs={[list(s)[:4] for s in self.markers['next_role_starts']]}",
+              flush=True)
         # Pending eviction: set by prepare_inline_snap when at cap; the old
         # entry is NOT removed until confirm_inline_snap succeeds.  This ensures
         # that if the request aborts before confirm runs, the old entry survives
@@ -310,11 +478,11 @@ class PrefixCache:
         """Return first boundary (system-prompt end), or -1. Legacy helper."""
         if self.disabled:
             return -1
-        return find_prefix_boundary(ids, self.im_end, self.im_start, self.system_t)
+        return find_prefix_boundary_markers(ids, self.markers)
 
     def _all_boundaries(self, ids: list[int]) -> list[int]:
         """Return all candidate cache cut-points in ascending order."""
-        return find_all_boundaries(ids, self.im_end, self.im_start, self.system_t)
+        return find_all_boundaries_markers(ids, self.markers)
 
     def lookup(self, prompt_ids: list[int]) -> tuple[int, int] | None:
         """Return ``(slot_id, prefix_len)`` for the LONGEST cached prefix, or ``None``.

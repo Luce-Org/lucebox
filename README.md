@@ -38,6 +38,17 @@ Three projects today, more coming. Each one is a self-contained release with its
 
 ---
 
+## Supported models
+
+All speedups measured on **RTX 3090 24 GB** vs vendored llama.cpp (`-fa 1`, matching KV quant).
+
+| Model | TTFT speedup | Decode speedup |
+|-------|:------------:|:--------------:|
+| Qwen 3.5-0.8B (Megakernel) | — | **~2×** vs F16 |
+| Qwen 3.5-27B Q4_K_M (DFlash + DDTree) | — | **3.43×** vs AR |
+| Qwen 3.6-27B Q4_K_M (DFlash + PFlash) | **10.4×** @ 128K | **~3×** vs AR |
+| Laguna-XS.2 33B-A3B Q4_K_M (DFlash + PFlash) | **5.4×** @ 128K | AR (draft pending) |
+
 ## 01 · Megakernel Qwen3.5 0.8B on RTX 3090
 
 **The first megakernel for hybrid DeltaNet/Attention LLMs.** All 24 layers of Qwen 3.5-0.8B in a single CUDA dispatch, 1.87 tok/J on a 2020 GPU, matching Apple's latest silicon at 2× the throughput.
