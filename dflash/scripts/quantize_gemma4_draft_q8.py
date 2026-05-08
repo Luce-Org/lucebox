@@ -212,6 +212,10 @@ def main():
     TARGET_LAYER_IDS = cfg["TARGET_LAYER_IDS"]
     MODEL_SIZE_TAG   = cfg["MODEL_SIZE_TAG"]
     N_TARGET_LAYERS  = len(TARGET_LAYER_IDS)
+    if N_TARGET_LAYERS == 0:
+        print("[error] target_layer_ids is empty; cannot compute TARGET_HIDDEN "
+              "(check config.json or _DEFAULTS)", file=sys.stderr)
+        sys.exit(1)
 
     print(f"[info] reading safetensors header from {args.safetensors}")
     header_size, header = load_safetensors_header(args.safetensors)

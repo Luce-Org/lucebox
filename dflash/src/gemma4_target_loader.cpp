@@ -601,10 +601,27 @@ bool load_gemma4_target_gguf(const std::string & path,
         return false;
     }
 
+    // Cleanup helper: release any GPU buffer and ggml context already assigned
+    // to `out` before returning false.  Must be called on every failure path
+    // after out.buf has been (or is about to be) allocated.
+    auto cleanup_out = [&]() {
+        if (out.buf) {
+            ggml_backend_buffer_free(out.buf);
+            out.buf = nullptr;
+        }
+        // out.ctx == meta_ctx; free it so the caller doesn't leak the graph.
+        if (out.ctx) {
+            ggml_free(out.ctx);
+            out.ctx = nullptr;
+        }
+        out = GemmaTargetWeights{};
+    };
+
     out.buf = ggml_backend_alloc_buffer(backend, total_gpu);
     if (!out.buf) {
         set_last_error("ggml_backend_alloc_buffer failed (gemma4 target)");
         gguf_free(gctx);
+        cleanup_out();
         return false;
     }
     ggml_backend_buffer_set_usage(out.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -614,6 +631,7 @@ bool load_gemma4_target_gguf(const std::string & path,
         if (ggml_backend_tensor_alloc(out.buf, s.tensor, base + s.buf_offset) != GGML_STATUS_SUCCESS) {
             set_last_error("ggml_backend_tensor_alloc failed (gemma4 target)");
             gguf_free(gctx);
+            cleanup_out();
             return false;
         }
     }
@@ -622,7 +640,12 @@ bool load_gemma4_target_gguf(const std::string & path,
 
     std::string err;
     Mmap mm;
-    if (!mm.open_ro(path, err)) { set_last_error(err); gguf_free(gctx); return false; }
+    if (!mm.open_ro(path, err)) {
+        set_last_error(err);
+        gguf_free(gctx);
+        cleanup_out();
+        return false;
+    }
 
     const size_t data_start = gguf_get_data_offset(gctx);
     size_t gpu_bytes_uploaded = 0;
@@ -639,6 +662,7 @@ bool load_gemma4_target_gguf(const std::string & path,
         if (off + sz > mm.len) {
             set_last_error(std::string("tensor '") + tname + "' overflows file");
             gguf_free(gctx);
+            cleanup_out();
             return false;
         }
         if (std::strcmp(tname, "token_embd.weight") == 0) {
@@ -655,6 +679,15 @@ bool load_gemma4_target_gguf(const std::string & path,
 
     if (tok_embd_off == 0 || tok_embd_type == GGML_TYPE_COUNT) {
         set_last_error("token_embd.weight not found or invalid type");
+        cleanup_out();
+        return false;
+    }
+
+    // Fix 2: validate tok_embd_sz divisibility before computing row stride.
+    if (n_vocab == 0 || tok_embd_sz % (size_t)n_vocab != 0) {
+        set_last_error("malformed GGUF: tok_embd_sz=" + std::to_string(tok_embd_sz) +
+                       " not divisible by n_vocab=" + std::to_string(n_vocab));
+        cleanup_out();
         return false;
     }
 

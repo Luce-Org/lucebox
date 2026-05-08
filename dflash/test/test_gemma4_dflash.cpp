@@ -903,9 +903,14 @@ int main(int argc, char ** argv) {
         while (std::getline(std::cin, line)) {
             // Per-request sampler (reset to CLI defaults each request).
             SamplerCfg req_sampler = sampler;
-            if (parse_sampler_token(line, req_sampler) && req_sampler.seed != 0) {
-                rng.seed(req_sampler.seed);
+            parse_sampler_token(line, req_sampler);
+            // Always reseed per request so requests are independent.
+            // seed==0 means "random": use std::random_device for a fresh seed.
+            uint64_t actual_seed = req_sampler.seed;
+            if (actual_seed == 0) {
+                actual_seed = std::random_device{}();
             }
+            rng.seed(actual_seed);
 
             // ── Unsupported commands: emit -1 sentinel and continue ────────
             auto starts_with = [](const std::string & s, const char * pre) {
@@ -1588,7 +1593,77 @@ int main(int argc, char ** argv) {
                 // draft_kv_cap. Use cache.draft_kv_pos (number of entries written into
                 // the draft KV cache) as kv_start, NOT the absolute committed position.
                 if (cache.draft_kv_pos + q_len > dkv_cap) {
-                    cache.draft_kv_pos = 0;
+                    // Sliding-window re-prefill: instead of wiping all draft KV context,
+                    // keep the most recent (dkv_cap - q_len) committed tokens by
+                    // re-projecting their target_feat into the beginning of the draft
+                    // KV cache.  This preserves the drafter's context continuity across
+                    // ring-buffer wrap points, which is the root cause of acceptance
+                    // collapsing from ~10/16 at 32K to ~1/16 at 64K.
+                    const int keep = dkv_cap - q_len;
+                    if (keep > 0 && committed >= keep) {
+                        // Absolute positions of the (keep) tokens we want to retain:
+                        // [committed - keep, committed).
+                        const int refill_start = committed - keep;
+
+                        // Reset draft_kv_pos to 0 so build_draft_kv_prefill_graph writes
+                        // to slot [0, keep) — the ASSERT inside the graph builder requires
+                        // draft_kv_pos + n_tokens <= ne[2].
+                        cache.draft_kv_pos = 0;
+
+                        DraftKVPrefillGraph rpkg;
+                        if (!build_draft_kv_prefill(rpkg, dw, cache, backend, keep)) {
+                            std::fprintf(stderr, "[spec] draft KV re-prefill build failed\n");
+                            return 1;
+                        }
+
+                        // Copy target_feat for [refill_start, refill_start+keep) from the
+                        // ring buffer (bf16) into rpkg.target_feat (f32).
+                        {
+                            const int    cap      = cache.target_feat_cap;
+                            const size_t feat_elt = ggml_element_size(cache.target_feat);
+                            const int    slot0    = refill_start % cap;
+                            const int    pre_n    = std::min(keep, cap - slot0);
+                            const int    post_n   = keep - pre_n;
+
+                            dflash27b_launch_bf16_to_f32(
+                                (const char *)cache.target_feat->data + (size_t)slot0 * feat_elt * target_feat_w,
+                                (float *)rpkg.target_feat->data,
+                                (size_t)pre_n * target_feat_w, nullptr);
+                            if (post_n > 0) {
+                                dflash27b_launch_bf16_to_f32(
+                                    (const char *)cache.target_feat->data,
+                                    (float *)rpkg.target_feat->data + (size_t)pre_n * target_feat_w,
+                                    (size_t)post_n * target_feat_w, nullptr);
+                            }
+                            cudaDeviceSynchronize();
+                        }
+
+                        // Absolute positions for RoPE — must match training.
+                        {
+                            std::vector<int32_t> rpos(keep);
+                            for (int i = 0; i < keep; i++) rpos[i] = refill_start + i;
+                            ggml_backend_tensor_set(rpkg.positions, rpos.data(), 0,
+                                                    sizeof(int32_t) * keep);
+                        }
+
+                        auto rst = ggml_backend_graph_compute(backend, rpkg.gf);
+                        if (rst != GGML_STATUS_SUCCESS) {
+                            std::fprintf(stderr, "[spec] draft KV re-prefill compute failed\n");
+                            draft_kv_prefill_destroy(rpkg);
+                            return 1;
+                        }
+                        cache.draft_kv_pos = keep;
+                        draft_kv_prefill_destroy(rpkg);
+
+                        std::fprintf(stderr,
+                            "[spec] draft KV sliding re-prefill: kept %d tokens "
+                            "(positions %d..%d), dkv_cap=%d\n",
+                            keep, refill_start, committed - 1, dkv_cap);
+                    } else {
+                        // Not enough committed history to re-prefill — hard reset.
+                        // This only happens at the very beginning of decode (committed < keep).
+                        cache.draft_kv_pos = 0;
+                    }
                 }
                 if (!build_draft_step(dsg, dw, cache, backend, q_len, cache.draft_kv_pos)) {
                     std::fprintf(stderr, "[spec] draft build failed\n");

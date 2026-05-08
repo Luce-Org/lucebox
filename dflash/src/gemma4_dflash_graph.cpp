@@ -176,6 +176,12 @@ ggml_tensor * build_gemma4_draft_graph(
     int                          n_tokens,
     int                          kv_start)
 {
+    // Validate KV cache write range before any graph nodes touch it.
+    if (kv_start < 0 || kv_start + n_tokens > cache.draft_kv_cap) {
+        GGML_ABORT("draft KV write out of bounds: kv_start=%d n_tokens=%d cap=%d",
+                   kv_start, n_tokens, cache.draft_kv_cap);
+    }
+
     const int n_head   = w.n_head;
     const int n_kv     = w.n_head_kv;
     const int head_dim = w.head_dim;

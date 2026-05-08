@@ -94,17 +94,24 @@ static bool test_sparse_matches_dense(ggml_backend_t backend, int S, int H, int 
     ggml_backend_tensor_get(sparse_out, sparse_data.data(), 0, out_bytes);
 
     float max_diff = 0.0f;
+    bool any_nonfinite = false;
     for (size_t i = 0; i < dense_data.size(); i++) {
+        if (!std::isfinite(sparse_data[i]) || !std::isfinite(dense_data[i])) {
+            any_nonfinite = true;
+            break;
+        }
         float diff = fabsf(dense_data[i] - sparse_data[i]);
         if (diff > max_diff) max_diff = diff;
     }
 
-    printf("[test] S=%d H=%d Hk=%d D=%d max_diff=%.6f %s\n",
-           S, H, Hk, D, max_diff, max_diff < 1.0f ? "PASS" : "FAIL");
+    printf("[test] S=%d H=%d Hk=%d D=%d max_diff=%.6f nonfinite=%s %s\n",
+           S, H, Hk, D, max_diff,
+           any_nonfinite ? "YES" : "no",
+           (max_diff < 1.0f && !any_nonfinite) ? "PASS" : "FAIL");
 
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
-    return max_diff < 1.0f;
+    return max_diff < 1.0f && !any_nonfinite;
 }
 
 // Sanity-check sparse attention at alpha < 1.0:

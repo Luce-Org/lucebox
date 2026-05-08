@@ -142,9 +142,14 @@ set_target_properties(dflash27b PROPERTIES CUDA_ARCHITECTURES "${_dflash27b_arch
 # Extract the minimum SM from the arch list so safetensors_draft.cpp can decide
 # at compile time whether to convert BF16 draft weights to FP16 (cuBLAS BF16
 # GEMM has no tensor core acceleration on SM < 80).
-list(GET _dflash27b_archs 0 _dflash27b_min_sm)
-# Strip any trailing 'a' suffix (e.g. "121a" → "121")
-string(REGEX REPLACE "[^0-9]" "" _dflash27b_min_sm "${_dflash27b_min_sm}")
+set(_dflash27b_min_sm 999)
+foreach(_a IN LISTS _dflash27b_archs)
+    # Strip any trailing non-numeric suffix (e.g. "121a" -> "121") before comparing.
+    string(REGEX REPLACE "[^0-9]" "" _a_num "${_a}")
+    if(_a_num LESS _dflash27b_min_sm)
+        set(_dflash27b_min_sm "${_a_num}")
+    endif()
+endforeach()
 target_compile_definitions(dflash27b PRIVATE DFLASH27B_MIN_SM=${_dflash27b_min_sm})
 
 # FlashPrefill custom CUDA kernels need BF16 WMMA (sm_80+).

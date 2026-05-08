@@ -59,7 +59,13 @@ def resolve_draft(root: Path) -> Path:
 
 
 def _read_gguf_architecture(gguf_path: Path) -> str:
-    """Return the 'general.architecture' string from a GGUF file, or '' on error."""
+    """Return the 'general.architecture' string from a GGUF file, or '' on error.
+
+    Logs a warning to stderr if the GGUF read fails, since that means the
+    server will silently pick the non-Gemma4 daemon path and use the wrong
+    argv shape. Caller should treat empty string as 'detection failed' and
+    decide accordingly.
+    """
     try:
         from gguf import GGUFReader  # type: ignore
         import numpy as np
@@ -71,7 +77,10 @@ def _read_gguf_architecture(gguf_path: Path) -> str:
         if not isinstance(p, np.ndarray):
             return ""
         return bytes(p).decode("utf-8", errors="replace").strip()
-    except Exception:
+    except Exception as e:
+        import sys
+        print(f"[server] WARNING: failed to read general.architecture from {gguf_path}: {e}",
+              file=sys.stderr)
         return ""
 
 
@@ -890,9 +899,16 @@ def main():
 
     if is_gemma4:
         # Gemma4 draft is a directory (safetensors dir), not a resolved file.
-        draft = args.draft if args.draft.is_dir() else args.draft.parent
+        if args.draft.is_dir():
+            draft = args.draft
+        elif args.draft.is_file():
+            # User passed a file path inside the draft directory; use its parent.
+            draft = args.draft.parent
+            print(f"[server] note: --draft {args.draft} is a file; using parent {draft}", file=sys.stderr)
+        else:
+            raise SystemExit(f"draft path not found or not a directory: {args.draft}")
         if not draft.is_dir():
-            raise SystemExit(f"draft directory not found at {args.draft}")
+            raise SystemExit(f"draft directory not found: {draft} (from {args.draft})")
     else:
         draft = resolve_draft(args.draft) if args.draft.is_dir() else args.draft
         if not draft.is_file():
