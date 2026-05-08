@@ -117,7 +117,6 @@ add_library(dflash27b STATIC
     src/gemma4_target_loader.cpp
     src/gemma4_target_graph.cpp
     src/gemma4_dflash_graph.cpp
-    src/gemma4_pflash_prefill.cpp
     src/qwen3_0p6b_loader.cpp
     src/qwen3_0p6b_graph.cpp
     src/flashprefill_q8.cpp
@@ -154,7 +153,8 @@ if(_dflash27b_min_sm GREATER_EQUAL 80)
     target_sources(dflash27b PRIVATE
         src/flashprefill_kernels.cu
         src/flashprefill_select.cpp
-        src/flashprefill.cpp)
+        src/flashprefill.cpp
+        src/pflash_ggml_adapter.cpp)
     target_compile_definitions(dflash27b PRIVATE DFLASH27B_HAVE_FLASHPREFILL=1)
 endif()
 
@@ -354,5 +354,14 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_gemma4_kv_tq3 PRIVATE dflash27b ggml ggml-cuda)
         find_package(CUDAToolkit REQUIRED)
         target_link_libraries(test_gemma4_kv_tq3 PRIVATE CUDA::cudart)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flash_attn_sparse.cpp")
+        add_executable(test_flash_attn_sparse test/test_flash_attn_sparse.cpp)
+        target_link_libraries(test_flash_attn_sparse PRIVATE dflash27b ggml ggml-cuda ggml-base)
+        target_include_directories(test_flash_attn_sparse PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
     endif()
 endif()

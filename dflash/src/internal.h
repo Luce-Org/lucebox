@@ -612,6 +612,15 @@ struct GemmaGraphInputs {
     bool          capture_layers = false;
     int           fa_window     = 0;
     ggml_tensor * parent_ids    = nullptr;
+    // pFlash: when true, full-attention layers use ggml_flash_attn_sparse
+    // instead of ggml_flash_attn_ext, keeping the single-graph-per-chunk
+    // architecture while enabling block-sparse attention during prefill.
+    bool          use_pflash    = false;
+    float         pflash_alpha  = 0.12f;
+    // When true, slice hidden to the last token before lm_head so the output
+    // tensor has shape [vocab, 1] instead of [vocab, n_tokens].
+    // Only safe for prefill chunks where we discard all but the last logit.
+    bool          last_token_logits_only = false;
 };
 
 struct GemmaGraphOutputs {
@@ -635,15 +644,6 @@ GemmaGraphOutputs build_gemma4_graph(ggml_context * ctx, ggml_cgraph * gf,
                                      GemmaTargetCache & cache,
                                      const GemmaGraphInputs & in);
 
-// Gemma4 pFlash prefill — layer-by-layer prefill using block-sparse attention
-// for full-attention layers and ggml FA for SWA layers.
-// On return: cache.cur_pos = n_prompt, cache.last_tok = argmax of last token.
-// Returns 0 on success, non-zero on failure (check dflash27b_last_error()).
-int gemma4_pflash_prefill(const GemmaTargetWeights & w,
-                          GemmaTargetCache & cache,
-                          ggml_backend_t backend,
-                          const int32_t * prompt_ids, int n_prompt,
-                          float pflash_alpha = 0.12f);
 
 // ─── Gemma4 Draft weights ─────────────────────────────────────────
 

@@ -339,6 +339,8 @@ static ggml_tensor * build_swa_attn_block(
 
 // Full (Global) Attention block.
 // Uses proportional RoPE via per-layer rope_freqs (freq_factors) and full context.
+// When use_pflash is true, uses ggml_flash_attn_sparse (block-sparse) instead of
+// ggml_flash_attn_ext for the attention computation.
 static ggml_tensor * build_full_attn_block(
     ggml_context *             ctx,
     ggml_cgraph *              gf,
@@ -355,7 +357,9 @@ static ggml_tensor * build_full_attn_block(
     ggml_type                  kv_v_type,
     bool                       write_kv,
     int                        fa_window,
-    int                        il)
+    int                        il,
+    bool                       use_pflash,
+    float                      pflash_alpha)
 {
     // Full-attention layers use the full head_dim
     const int head_dim  = w.head_dim;
@@ -448,8 +452,12 @@ static ggml_tensor * build_full_attn_block(
         cache_v->nb[1] * win_start);
 
     // Gemma4: attn_scale = 1.0 (self.scaling = 1.0, no 1/sqrt(head_dim))
-    ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask,
-                                             1.0f, 0.0f, 0.0f);
+    ggml_tensor * attn;
+    if (use_pflash) {
+        attn = ggml_flash_attn_sparse(ctx, Qfa, Kfa, Vfa, 1.0f, pflash_alpha);
+    } else {
+        attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask, 1.0f, 0.0f, 0.0f);
+    }
 
     attn = ggml_reshape_2d(ctx, attn, q_dim, n_tokens);
     attn = ggml_mul_mat(ctx, L.wo, attn);
@@ -744,7 +752,7 @@ GemmaGraphOutputs build_gemma4_graph(
     // when the caller did not supply one so that full-attention layers don't
     // hit BEST_FATTN_KERNEL_NONE → abort.
     ggml_tensor * attn_mask = in.attn_mask;
-    if (!attn_mask && w.head_dim >= 512) {
+    if (!attn_mask && w.head_dim >= 512 && !in.use_pflash) {
         const int kv_len        = kv_start + n_tokens;
         // Pad to 256 — required by FATTN_KQ_STRIDE for TQ3 / large head_dim.
         const int kv_len_padded = ((kv_len + 255) / 256) * 256;
@@ -787,7 +795,8 @@ GemmaGraphOutputs build_gemma4_graph(
                                         cache_k, cache_v, attn_mask,
                                         kv_start, n_tokens,
                                         cache.kv_k_type, cache.kv_v_type,
-                                        write_kv, in.fa_window, il);
+                                        write_kv, in.fa_window, il,
+                                        in.use_pflash, in.pflash_alpha);
         }
 
         // ── g) Output projection already done inside attn block ────────────────
@@ -912,6 +921,17 @@ GemmaGraphOutputs build_gemma4_graph(
 
     // ── Final norm ─────────────────────────────────────────────────────────────
     ggml_tensor * out = rms_norm_mul(ctx, inpL, w.out_norm, EPS);
+
+    // ── last_token_logits_only: slice to the final token before lm_head ────────
+    // During chunked prefill we only need the last token's logits to seed decode.
+    // Slicing here reduces lm_head compute from O(n_tokens) to O(1) and avoids
+    // allocating a [vocab, n_tokens] output tensor (saves ~1 GB for chunk_size=1024).
+    if (in.last_token_logits_only && n_tokens > 1) {
+        out = ggml_view_2d(ctx, out,
+            n_embd, 1,
+            ggml_row_size(out->type, n_embd),
+            ggml_row_size(out->type, n_embd) * (n_tokens - 1));
+    }
 
     // ── LM head ────────────────────────────────────────────────────────────────
     ggml_tensor * logits = ggml_mul_mat(ctx, w.output, out);

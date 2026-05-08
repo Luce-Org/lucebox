@@ -30,6 +30,7 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include <cuda_runtime_api.h>
+#include "../src/pflash_ggml_adapter.h"
 
 #ifdef _WIN32
 #define setenv(name, value, overwrite) _putenv_s(name, value)
@@ -43,6 +44,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <string>
 #include <unordered_set>
@@ -275,7 +277,10 @@ static bool build_gemma4_step(StepGraph & sg,
                               int kv_start,
                               int n_tokens,
                               bool with_mask,
-                              bool capture) {
+                              bool capture,
+                              bool use_pflash   = false,
+                              float pflash_alpha = 0.12f,
+                              bool last_token_logits_only = false) {
     step_graph_free(sg);
 
     ggml_init_params ip{};
@@ -297,9 +302,12 @@ static bool build_gemma4_step(StepGraph & sg,
         const int kv_len = kv_start + n_tokens;
         const int kv_pad = align_up(kv_len, g_kq_stride_pad);
         const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
-        sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
-        ggml_set_name(sg.attn_mask, "attn_mask");
-        ggml_set_input(sg.attn_mask);
+
+        if (!use_pflash) {
+            sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
+            ggml_set_name(sg.attn_mask, "attn_mask");
+            ggml_set_input(sg.attn_mask);
+        }
 
         if (n_tokens > 1) {
             // SWA mask needed for sliding-window attention layers in batched prefill
@@ -318,7 +326,10 @@ static bool build_gemma4_step(StepGraph & sg,
     gi.swa_mask       = sg.swa_mask;
     gi.n_tokens       = n_tokens;
     gi.kv_start       = kv_start;
-    gi.capture_layers = capture;
+    gi.capture_layers           = capture;
+    gi.use_pflash               = use_pflash;
+    gi.pflash_alpha             = pflash_alpha;
+    gi.last_token_logits_only   = last_token_logits_only;
 
     GemmaGraphOutputs go = build_gemma4_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
@@ -631,8 +642,18 @@ int main(int argc, char ** argv) {
     setenv("DFLASH27B_KV_K", kv_k_str.c_str(), 1);
     setenv("DFLASH27B_KV_V", kv_v_str.c_str(), 1);
 
-    // TurboQuant / TQ3 FA kernels require kv_len aligned to 256.
-    if (kv_k_str == "tq3_0" || kv_v_str == "tq3_0") {
+    // After argv parsing, the KV type may have been chosen via --kv-k tq3_0 / --kv-v tq3_0,
+    // which sets DFLASH27B_KV_K / DFLASH27B_KV_V env vars. Re-check for TQ3 here so
+    // g_kq_stride_pad matches the chunked-FA driver's align_up(kv_len, 256); otherwise the
+    // host-built mask is short and the kernel reads past its end.
+    auto kv_env_is_tq3 = [](const char * name) {
+        const char * s = std::getenv(name);
+        if (!s) return false;
+        std::string lc;
+        for (const char * p = s; *p; ++p) lc += (char)std::tolower((unsigned char)*p);
+        return lc.rfind("tq3", 0) == 0;
+    };
+    if (kv_env_is_tq3("DFLASH27B_KV_K") || kv_env_is_tq3("DFLASH27B_KV_V")) {
         g_kq_stride_pad = 256;
     }
 
@@ -660,6 +681,13 @@ int main(int argc, char ** argv) {
     if (!backend) {
         std::fprintf(stderr, "error: ggml_backend_cuda_init(%d) failed\n", gpu);
         return 1;
+    }
+
+    // Register the pFlash GGML custom kernel so ggml_flash_attn_sparse ops
+    // dispatched from build_gemma4_graph (full-attention layers, use_pflash=true)
+    // have a backend implementation available.
+    if (use_pflash) {
+        pflash_register_ggml_kernel();
     }
 
     // ── Load target weights ───────────────────────────────────────────────
@@ -843,17 +871,7 @@ int main(int argc, char ** argv) {
         {
             const int n_prompt   = (int)prompt_ids.size();
 
-            if (use_pflash && n_prompt >= 4096) {
-                int rc = gemma4_pflash_prefill(w, cache, backend,
-                                               prompt_ids.data(), n_prompt,
-                                               pflash_alpha);
-                if (rc != 0) {
-                    std::fprintf(stderr, "pflash prefill failed: %s\n",
-                                 dflash27b_last_error());
-                    return 1;
-                }
-                last_logit_tok = cache.last_tok;
-            } else {
+            {
                 const int swa_window = w.swa_window > 0 ? w.swa_window : 1024;
                 const int chunk_size = std::min(n_prompt, swa_window);
 
@@ -864,7 +882,9 @@ int main(int argc, char ** argv) {
 
                     if (!build_gemma4_step(sg, w, cache, backend,
                                            /*kv_start=*/cs, chunk_n,
-                                           need_mask, /*capture=*/true)) {
+                                           need_mask, /*capture=*/true,
+                                           use_pflash, pflash_alpha,
+                                           /*last_token_logits_only=*/true)) {
                         std::fprintf(stderr, "prefill chunk build failed at offset %d\n", cs);
                         return 1;
                     }
@@ -908,9 +928,10 @@ int main(int argc, char ** argv) {
                     if (is_last) {
                         const int vocab = w.n_vocab;
                         std::vector<float> logits_cpu(vocab);
-                        const size_t last_tok_offset = (size_t)(chunk_n - 1) * vocab;
+                        // last_token_logits_only=true → logits has shape [vocab, 1];
+                        // read from offset 0 instead of skipping (chunk_n-1)*vocab floats.
                         ggml_backend_tensor_get(sg.logits, logits_cpu.data(),
-                                                sizeof(float) * last_tok_offset,
+                                                0,
                                                 sizeof(float) * vocab);
                         last_logit_tok = sample_logits(logits_cpu.data(), vocab,
                                                        sampler, prompt_ids, rng);
@@ -926,20 +947,14 @@ int main(int argc, char ** argv) {
         {
             const int    n_prompt    = (int)prompt_ids.size();
             const double prefill_ms  = prefill_t1 - prefill_t0;
-            if (use_pflash && n_prompt >= 4096) {
-                std::printf("[prefill] %d tokens in %.1f ms (%.1f tok/s) "
-                            "[pflash]  (last sampled token: %d)\n",
-                            n_prompt, prefill_ms,
-                            prefill_ms > 0.0 ? (double)n_prompt / (prefill_ms / 1000.0) : 0.0,
-                            last_logit_tok);
-            } else {
+            {
                 const int swa_window = w.swa_window > 0 ? w.swa_window : 1024;
                 const int chunk_size = std::min(n_prompt, swa_window);
                 std::printf("[prefill] %d tokens in %.1f ms (%.1f tok/s) "
-                            "[chunked, chunk_size=%d]  (last sampled token: %d)\n",
+                            "[chunked%s, chunk_size=%d]  (last sampled token: %d)\n",
                             n_prompt, prefill_ms,
                             prefill_ms > 0.0 ? (double)n_prompt / (prefill_ms / 1000.0) : 0.0,
-                            chunk_size, last_logit_tok);
+                            use_pflash ? "+pflash" : "", chunk_size, last_logit_tok);
             }
         }
 
