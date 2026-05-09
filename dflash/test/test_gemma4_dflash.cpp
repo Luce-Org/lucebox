@@ -498,9 +498,12 @@ static bool embed_tokens_batch(const GemmaTargetWeights & w,
 
 // ─── EOS check ───────────────────────────────────────────────────────────
 
+static bool g_ignore_eos = false;
+
 #define IS_EOS_TOK(tok, w) \
-    (((w).eos_chat_id >= 0 && (tok) == (w).eos_chat_id) || \
-     ((w).eos_id      >= 0 && (tok) == (w).eos_id))
+    (!g_ignore_eos && \
+     (((w).eos_chat_id >= 0 && (tok) == (w).eos_chat_id) || \
+      ((w).eos_id      >= 0 && (tok) == (w).eos_id)))
 
 // ─── KV type resolution helper ───────────────────────────────────────────
 
@@ -647,6 +650,7 @@ int main(int argc, char ** argv) {
     SamplerCfg   sampler;
     bool         daemon_mode  = false;
     int          stream_fd    = -1;
+    int          draft_max    = 0;   // 0 = use model's block_size (default 16)
 
     for (int i = 1; i < argc; i++) {
         auto require_next = [&](const char * flag) -> const char * {
@@ -671,6 +675,7 @@ int main(int argc, char ** argv) {
         else if (std::strcmp(argv[i], "--kv-v")      == 0) kv_v_str      = require_next("--kv-v");
         else if (std::strcmp(argv[i], "--seed")      == 0) sampler.seed  = (uint64_t)std::atoll(require_next("--seed"));
         else if (std::strcmp(argv[i], "--temp")      == 0) sampler.temp  = (float)std::atof(require_next("--temp"));
+        else if (std::strcmp(argv[i], "--ignore-eos")== 0) g_ignore_eos  = true;
         else if (std::strcmp(argv[i], "--top-k")     == 0) sampler.top_k = std::atoi(require_next("--top-k"));
         else if (std::strcmp(argv[i], "--top-p")     == 0) sampler.top_p = (float)std::atof(require_next("--top-p"));
         else if (std::strcmp(argv[i], "--budget")    == 0) ddtree_budget = std::atoi(require_next("--budget"));
@@ -680,6 +685,7 @@ int main(int argc, char ** argv) {
         else if (std::strcmp(argv[i], "--daemon")       == 0) daemon_mode   = true;
         else if (std::strcmp(argv[i], "--pflash")       == 0) use_pflash    = true;
         else if (std::strcmp(argv[i], "--pflash-alpha") == 0) pflash_alpha  = (float)std::atof(require_next("--pflash-alpha"));
+        else if (std::strcmp(argv[i], "--draft-max")    == 0) draft_max     = std::atoi(require_next("--draft-max"));
         else if (std::strncmp(argv[i], "--stream-fd=", 12) == 0) {
             stream_fd = std::atoi(argv[i] + 12);
         }
@@ -1507,7 +1513,8 @@ int main(int argc, char ** argv) {
             // Stale KV at positions [committed+commit_n..committed+q_len-1]
             // will be overwritten by the next verify pass.
 
-            const int q_len        = dw.block_size;   // 16
+            const int q_len        = (draft_max > 0 && draft_max < dw.block_size)
+                                         ? draft_max : dw.block_size;
             const int mask_tok     = dw.mask_token_id; // 4
             const int target_feat_w = dw.n_target_layers * dw.target_hidden;
             const int vocab         = w.n_vocab;
