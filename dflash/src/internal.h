@@ -590,6 +590,12 @@ struct GemmaTargetCache {
     ggml_type kv_k_type = GGML_TYPE_Q8_0;
     ggml_type kv_v_type = GGML_TYPE_Q8_0;
 
+    // Per-layer override: if non-empty, use these instead of kv_k_type / kv_v_type.
+    // Used for asymmetric KV: TQ3_0 on SWA layers, Q8_0 on full-attn layers so
+    // those layers can ride the pflash block-sparse fast path (which excludes TQ3).
+    std::vector<ggml_type>   kv_k_type_per_layer;
+    std::vector<ggml_type>   kv_v_type_per_layer;
+
     std::vector<ggml_tensor *> attn_k;
     std::vector<ggml_tensor *> attn_v;
 

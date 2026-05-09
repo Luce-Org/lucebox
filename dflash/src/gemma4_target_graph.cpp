@@ -589,6 +589,56 @@ bool create_gemma4_cache(const GemmaTargetWeights & w,
         return false;
     }
 
+    // Per-layer KV types.
+    //
+    // The upstream FA dispatch (deps/llama.cpp/.../fattn.cu:441) routes
+    // TQ3 + (Q->ne[0] > 256 || Q->ne[1] > 1) to the slow CHUNKED kernel.
+    // On Dense Gemma4 31B with full-attn head_dim=512, every chunked
+    // prefill / draft-verify hits this trap.
+    //
+    // Narrow workaround (Codex pattern, mirrors vLLM's kv-cache-dtype-skip-layers):
+    // when the DFlash draft is wired up, force Q8_0 KV on the small subset of
+    // full-attn layers whose hidden states are CAPTURED for the draft (the
+    // "target_feat" ring at gemma4_target_graph.cpp:971 — drafter consumes
+    // these in build_gemma4_draft_graph). This unblocks the pflash sparse
+    // fast path for the layers the draft actually depends on, without
+    // touching the other 8/10 full-attn layers (avoids the MoE regression
+    // we saw when forcing ALL full-attn -> Q8).
+    out.kv_k_type_per_layer.assign(w.n_layer, kv_k_type);
+    out.kv_v_type_per_layer.assign(w.n_layer, kv_v_type);
+
+    const bool gate = (kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0)
+                    && (w.head_dim > 256)
+                    && (w.n_capture_layers > 0);  // draft is wired
+
+    if (gate) {
+        int n_overridden = 0;
+        for (int ci = 0; ci < w.n_capture_layers; ci++) {
+            const int captured_il = w.capture_layer_ids[ci];
+            if (captured_il < 0 || captured_il >= w.n_layer) continue;
+            const bool is_swa = (captured_il < (int)w.swa_layers.size())
+                                && w.swa_layers[captured_il];
+            if (is_swa) continue;  // SWA layers don't hit the trap
+            if (kv_k_type == GGML_TYPE_TQ3_0) {
+                out.kv_k_type_per_layer[captured_il] = GGML_TYPE_Q8_0;
+            }
+            if (kv_v_type == GGML_TYPE_TQ3_0) {
+                out.kv_v_type_per_layer[captured_il] = GGML_TYPE_Q8_0;
+            }
+            n_overridden++;
+        }
+        // Count total full-attn layers for the log message
+        int n_full_attn = 0;
+        for (int il = 0; il < w.n_layer; il++) {
+            const bool is_swa = (il < (int)w.swa_layers.size()) && w.swa_layers[il];
+            if (!is_swa && out.layer_to_kv_idx[il] >= 0) n_full_attn++;
+        }
+        std::fprintf(stderr,
+            "[cache] narrow asymmetric: forced Q8_0 on %d captured full-attn layer(s) "
+            "(remaining %d full-attn keep TQ3)\n",
+            n_overridden, n_full_attn - n_overridden);
+    }
+
     // (head_dim and n_head_kv are resolved per-layer in the allocation loop below)
 
     const int n_capture_layers = w.n_capture_layers;
@@ -625,9 +675,11 @@ bool create_gemma4_cache(const GemmaTargetWeights & w,
         // need the full max_ctx_alloc to cover the entire context.
         const int layer_ctx_alloc = is_swa_layer ? swa_ctx_alloc : max_ctx_alloc;
 
-        ggml_tensor * K = ggml_new_tensor_3d(out.base_ctx, kv_k_type,
+        const ggml_type layer_kv_k_type = out.kv_k_type_per_layer[il];
+        const ggml_type layer_kv_v_type = out.kv_v_type_per_layer[il];
+        ggml_tensor * K = ggml_new_tensor_3d(out.base_ctx, layer_kv_k_type,
                                              layer_head_dim, layer_ctx_alloc, layer_n_head_kv);
-        ggml_tensor * V = ggml_new_tensor_3d(out.base_ctx, kv_v_type,
+        ggml_tensor * V = ggml_new_tensor_3d(out.base_ctx, layer_kv_v_type,
                                              layer_head_dim, layer_ctx_alloc, layer_n_head_kv);
         char name[64];
         std::snprintf(name, sizeof(name), "gemma4_cache_k_%d", il);
@@ -669,9 +721,24 @@ bool create_gemma4_cache(const GemmaTargetWeights & w,
     const float saved_pct  = old_slots > 0.0f
         ? 100.0f * (1.0f - (full_slots + swa_slots) / old_slots)
         : 0.0f;
+    // Find a representative SWA layer index and a representative full-attn layer index
+    // for the diagnostic log (first of each kind that owns a KV slot).
+    int repr_swa_il = -1, repr_full_il = -1;
+    for (int il = 0; il < w.n_layer; il++) {
+        if (out.layer_to_kv_idx[il] < 0) continue;
+        const bool is_swa = (il < (int)w.swa_layers.size()) && w.swa_layers[il];
+        if (is_swa  && repr_swa_il  < 0) repr_swa_il  = il;
+        if (!is_swa && repr_full_il < 0) repr_full_il = il;
+        if (repr_swa_il >= 0 && repr_full_il >= 0) break;
+    }
+    const char * swa_k_name  = (repr_swa_il  >= 0)
+        ? ggml_type_name(out.kv_k_type_per_layer[repr_swa_il])  : "n/a";
+    const char * full_k_name = (repr_full_il >= 0)
+        ? ggml_type_name(out.kv_k_type_per_layer[repr_full_il]) : "n/a";
     std::fprintf(stderr,
         "[cache] created max_ctx=%d (full_attn=%d, swa=%d), kv_layers=%d, saved %.1f%%\n",
         max_ctx, max_ctx_alloc, swa_ctx_alloc, n_kv_slots, saved_pct);
+    std::fprintf(stderr, "[cache] kv types: SWA=%s, full=%s\n", swa_k_name, full_k_name);
 
     // Zero-initialize all tensors
     std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
@@ -839,18 +906,24 @@ GemmaGraphOutputs build_gemma4_graph(
         ggml_tensor * cache_k = (read_kv_idx >= 0) ? cache.attn_k[read_kv_idx] : nullptr;
         ggml_tensor * cache_v = (read_kv_idx >= 0) ? cache.attn_v[read_kv_idx] : nullptr;
 
+        // Resolve per-layer KV types (asymmetric: TQ3 on SWA, Q8 on full-attn).
+        const ggml_type layer_kv_k = !cache.kv_k_type_per_layer.empty()
+            ? cache.kv_k_type_per_layer[il] : cache.kv_k_type;
+        const ggml_type layer_kv_v = !cache.kv_v_type_per_layer.empty()
+            ? cache.kv_v_type_per_layer[il] : cache.kv_v_type;
+
         if (is_swa) {
             ggml_tensor * effective_mask = in.swa_mask ? in.swa_mask : attn_mask;
             cur = build_swa_attn_block(ctx, gf, w, L, cur, in.positions,
                                        cache_k, cache_v, effective_mask,
                                        kv_start, n_tokens,
-                                       cache.kv_k_type, cache.kv_v_type,
+                                       layer_kv_k, layer_kv_v,
                                        write_kv, il);
         } else {
             cur = build_full_attn_block(ctx, gf, w, L, cur, in.positions,
                                         cache_k, cache_v, attn_mask,
                                         kv_start, n_tokens,
-                                        cache.kv_k_type, cache.kv_v_type,
+                                        layer_kv_k, layer_kv_v,
                                         write_kv, in.fa_window, il,
                                         in.use_pflash, in.pflash_alpha);
         }
