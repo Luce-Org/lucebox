@@ -406,4 +406,12 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
     endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_mtp_loader.cpp")
+        add_executable(test_mtp_loader test/test_mtp_loader.cpp)
+        target_include_directories(test_mtp_loader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(test_mtp_loader PRIVATE dflash27b ggml ggml-cuda)
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(test_mtp_loader PRIVATE CUDA::cudart)
+    endif()
 endif()

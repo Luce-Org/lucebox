@@ -718,6 +718,68 @@ struct GemmaDraftWeights {
     int sliding_window   = 2048;
 };
 
+// ─── Gemma4 MTP (Multi-Token Prediction) assistant weights ───────────────────
+//
+// Loaded from a gemma4_assistant GGUF (e.g. gemma-4-31B-it-assistant.Q4_K_M.gguf).
+// These are the 4 cross-attention transformer blocks that run after the target
+// model's forward pass to predict the next speculative token.
+
+struct MtpLayerWeights {
+    // Q-only attention (no wk/wv — V is always read from the donor target KV cache;
+    // attention_k_eq_v=true means V stored as rms-normed non-rotated K, so MTP
+    // MUST read V from cache, not reuse K.  use_k_as_v=false hardcoded per
+    // atomicbot:gemma4-assistant.cpp:134).
+    ggml_tensor * attn_norm      = nullptr;   // [n_embd]
+    ggml_tensor * wq             = nullptr;   // [n_embd, n_head * head_dim]
+    ggml_tensor * attn_q_norm    = nullptr;   // [head_dim]
+    ggml_tensor * wo             = nullptr;   // [n_head * head_dim, n_embd]
+    ggml_tensor * attn_post_norm = nullptr;   // [n_embd]
+    ggml_tensor * ffn_norm       = nullptr;   // [n_embd]
+    ggml_tensor * ffn_up         = nullptr;   // [n_embd, n_ff]
+    ggml_tensor * ffn_gate       = nullptr;   // [n_embd, n_ff]
+    ggml_tensor * ffn_down       = nullptr;   // [n_ff, n_embd]
+    ggml_tensor * ffn_post_norm  = nullptr;   // [n_embd]
+    ggml_tensor * out_scale      = nullptr;   // [1] optional; nullptr if absent
+    // Donor target layer resolved per-MTP-layer: LAST target layer whose
+    // attention type (SWA vs full) matches this MTP layer's type.
+    int32_t       donor_target_layer = -1;
+    bool          is_swa             = false; // this MTP layer's attention type
+};
+
+struct MtpDrafterWeights {
+    // Pre/post projection (concat tok_emb + h_prev → n_embd, and back)
+    ggml_tensor * pre_projection  = nullptr;  // [2*n_embd_backbone, n_embd]
+    ggml_tensor * post_projection = nullptr;  // [n_embd, n_embd_backbone]
+    ggml_tensor * output_norm     = nullptr;  // [n_embd]
+    // Optional centroid head (Edge models only; nullptr for Dense 31B)
+    ggml_tensor * centroids       = nullptr;  // [n_embd, n_centroids]
+    ggml_tensor * token_ordering  = nullptr;  // [n_vocab] I32 invariant if present
+    // MTP transformer layers (always 4 per atomicbot spec)
+    std::vector<MtpLayerWeights> layers;
+    // Metadata
+    int32_t  n_embd                 = 0;  // MTP model's own hidden size (e.g. 1024 for compressed MTP)
+    int32_t  n_embd_backbone        = 0;  // target backbone hidden size (must match target's n_embd)
+    int32_t  n_centroids            = 0;
+    int32_t  centroid_top_k         = 0;
+    bool     use_ordered_embeddings = false;
+    bool     attention_k_eq_v       = false;
+    std::string requires_target_arch;
+    // Backend that owns the tensors
+    ggml_backend_t        backend = nullptr;
+    ggml_context        * ctx     = nullptr;
+    ggml_backend_buffer_t buffer  = nullptr;
+};
+
+// Load Gemma4 MTP assistant weights from a GGUF file.
+// The loader reads n_embd_backbone from GGUF metadata and resolves each MTP
+// layer's donor target KV layer assuming Dense 31B (60 target layers, alternating
+// SWA pattern: odd-indexed = SWA, even-indexed = full attention).
+bool load_gemma4_mtp_assistant(const std::string & gguf_path,
+                               ggml_backend_t backend,
+                               MtpDrafterWeights & out);
+
+void free_gemma4_mtp_assistant(MtpDrafterWeights & w);
+
 // Load Gemma4 DFlash draft weights from a directory containing safetensors shards.
 bool load_gemma4_draft_safetensors(const std::string & dir_path,
                                     ggml_backend_t backend,

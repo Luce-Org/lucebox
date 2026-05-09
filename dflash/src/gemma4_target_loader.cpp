@@ -721,6 +721,379 @@ bool load_gemma4_target_gguf(const std::string & path,
     return true;
 }
 
+// ─── load_gemma4_mtp_assistant ───────────────────────────────────────────────
+//
+// Loads a Gemma4 MTP assistant GGUF (gemma4_assistant architecture) into
+// MtpDrafterWeights.  The loader:
+//   1. Reads metadata: n_embd_backbone, attention_k_eq_v, n_centroids, etc.
+//   2. Reads per-MTP-layer SWA type from gemma4_assistant.attention.sliding_window_pattern.
+//   3. Resolves each MTP layer's donor_target_layer = LAST target layer whose
+//      SWA type matches that MTP layer's SWA type, assuming Dense 31B:
+//      60 target layers, alternating pattern (odd-indexed = SWA, even = full attn).
+//   4. Loads all tensors into a GPU backend buffer.
+//
+// Tensor names follow llama.cpp's gemma4-assistant.cpp conventions:
+//   mtp.pre_projection.weight   [2*n_bb, n_embd]
+//   mtp.post_projection.weight  [n_embd, n_bb]
+//   output_norm.weight          [n_embd]
+//   blk.{i}.attn_norm.weight    [n_embd]
+//   blk.{i}.attn_q.weight       [n_embd, n_head*head_dim]
+//   blk.{i}.attn_q_norm.weight  [head_dim]
+//   blk.{i}.attn_output.weight  [n_head*head_dim, n_embd]
+//   blk.{i}.post_attention_norm.weight [n_embd]
+//   blk.{i}.ffn_norm.weight     [n_embd]
+//   blk.{i}.ffn_gate.weight     [n_embd, n_ff]
+//   blk.{i}.ffn_up.weight       [n_embd, n_ff]
+//   blk.{i}.ffn_down.weight     [n_ff, n_embd]
+//   blk.{i}.post_ffw_norm.weight [n_embd]
+//   blk.{i}.layer_output_scale.weight [1]  (optional)
+//
+// Metadata keys (prefix = "gemma4_assistant"):
+//   gemma4_assistant.n_embd_backbone        u32
+//   gemma4_assistant.n_centroids            u32
+//   gemma4_assistant.centroid_top_k         u32
+//   gemma4_assistant.attention.k_eq_v       bool
+//   gemma4_assistant.use_ordered_embeddings bool
+//   gemma4_assistant.requires_target_arch   string
+
+bool load_gemma4_mtp_assistant(const std::string & gguf_path,
+                               ggml_backend_t       backend,
+                               MtpDrafterWeights  & out) {
+
+    // ── 1. Open GGUF and read metadata ────────────────────────────────────────
+
+    ggml_context * meta_ctx = nullptr;
+    gguf_init_params gip{};
+    gip.no_alloc = true;
+    gip.ctx      = &meta_ctx;
+    gguf_context * gctx = gguf_init_from_file(gguf_path.c_str(), gip);
+    if (!gctx) {
+        set_last_error("load_gemma4_mtp_assistant: gguf_init_from_file failed: " + gguf_path);
+        return false;
+    }
+
+    // Validate architecture string.
+    {
+        int64_t arch_id = gguf_find_key(gctx, "general.architecture");
+        if (arch_id < 0) {
+            set_last_error("load_gemma4_mtp_assistant: missing general.architecture");
+            gguf_free(gctx);
+            return false;
+        }
+        const char * arch = gguf_get_val_str(gctx, arch_id);
+        if (std::string(arch) != "gemma4_assistant") {
+            set_last_error(std::string("load_gemma4_mtp_assistant: unexpected arch: ") +
+                           arch + " (expected gemma4_assistant)");
+            gguf_free(gctx);
+            return false;
+        }
+    }
+
+    // Read MTP-specific metadata.
+    const uint32_t n_embd          = get_u32_or(gctx, "gemma4_assistant.embedding_length", 0);
+    const uint32_t n_embd_backbone = get_u32_or(gctx, "gemma4_assistant.n_embd_backbone", 0);
+    const uint32_t n_centroids     = get_u32_or(gctx, "gemma4_assistant.n_centroids",     0);
+    const uint32_t centroid_top_k  = get_u32_or(gctx, "gemma4_assistant.centroid_top_k",  0);
+    bool attention_k_eq_v       = false;
+    bool use_ordered_embeddings = false;
+    std::string requires_target_arch;
+    {
+        int64_t kid = gguf_find_key(gctx, "gemma4_assistant.attention.k_eq_v");
+        if (kid >= 0) attention_k_eq_v = gguf_get_val_bool(gctx, kid);
+    }
+    {
+        int64_t kid = gguf_find_key(gctx, "gemma4_assistant.use_ordered_embeddings");
+        if (kid >= 0) use_ordered_embeddings = gguf_get_val_bool(gctx, kid);
+    }
+    {
+        int64_t kid = gguf_find_key(gctx, "gemma4_assistant.requires_target_arch");
+        if (kid >= 0) requires_target_arch = gguf_get_val_str(gctx, kid);
+    }
+
+    // Validate n_embd_backbone.
+    if (n_embd_backbone == 0) {
+        set_last_error("load_gemma4_mtp_assistant: missing or zero gemma4_assistant.n_embd_backbone");
+        gguf_free(gctx);
+        return false;
+    }
+
+    // Validate requires_target_arch.
+    if (requires_target_arch != "gemma4") {
+        set_last_error(std::string("load_gemma4_mtp_assistant: requires_target_arch='") +
+                       requires_target_arch + "' expected 'gemma4'");
+        gguf_free(gctx);
+        return false;
+    }
+
+    // Read MTP model's own layer count and SWA pattern.
+    const uint32_t n_mtp_layer = get_u32_or(gctx, "gemma4_assistant.block_count", 4);
+
+    std::vector<bool> mtp_swa_layers(n_mtp_layer, false);
+    {
+        int64_t swa_arr_id = gguf_find_key(gctx, "gemma4_assistant.attention.sliding_window_pattern");
+        if (swa_arr_id >= 0) {
+            size_t arr_n = gguf_get_arr_n(gctx, swa_arr_id);
+            enum gguf_type arr_type = gguf_get_arr_type(gctx, swa_arr_id);
+            const void * arr_data   = gguf_get_arr_data(gctx, swa_arr_id);
+            for (size_t i = 0; i < arr_n && i < (size_t)n_mtp_layer; i++) {
+                if (arr_type == GGUF_TYPE_BOOL || arr_type == GGUF_TYPE_INT8 || arr_type == GGUF_TYPE_UINT8) {
+                    mtp_swa_layers[i] = (((const uint8_t *)arr_data)[i] != 0);
+                } else {
+                    mtp_swa_layers[i] = (((const int32_t *)arr_data)[i] != 0);
+                }
+            }
+        }
+        // If absent, default all MTP layers to non-SWA (full attention).
+    }
+
+    // ── 2. Resolve donor_target_layer per MTP layer ───────────────────────────
+    //
+    // Per atomicbot's gemma4-assistant.cpp:12-27 + 126:
+    //   For each MTP layer il, find the LAST target layer whose SWA type == mtp_swa_layers[il].
+    // We assume Dense 31B target: 60 layers, alternating (odd-indexed = SWA, even = full attn).
+    // This matches the fallback in load_gemma4_target_gguf when no swa pattern key is found.
+
+    const int target_n_layer = 60;  // Dense 31B
+    // Build target SWA pattern: odd = SWA, even = full.
+    std::vector<bool> target_swa(target_n_layer, false);
+    for (int il = 0; il < target_n_layer; il++) {
+        target_swa[il] = ((il % 2) == 1);
+    }
+
+    std::vector<int32_t> donor_per_mtp_layer(n_mtp_layer, -1);
+    for (uint32_t mil = 0; mil < n_mtp_layer; mil++) {
+        bool want_swa = mtp_swa_layers[mil];
+        int32_t best = -1;
+        for (int til = 0; til < target_n_layer; til++) {
+            if (target_swa[til] == want_swa) {
+                best = til;
+            }
+        }
+        donor_per_mtp_layer[mil] = best;
+    }
+
+    // ── 3. Wire tensor pointers ───────────────────────────────────────────────
+
+    auto g = [&](const char * name) -> ggml_tensor * {
+        return ggml_get_tensor(meta_ctx, name);
+    };
+
+    // Global tensors.
+    ggml_tensor * pre_proj   = g("mtp.pre_projection.weight");
+    ggml_tensor * post_proj  = g("mtp.post_projection.weight");
+    ggml_tensor * out_norm   = g("output_norm.weight");
+
+    if (!pre_proj || !post_proj || !out_norm) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "load_gemma4_mtp_assistant: missing global tensors "
+            "(pre_projection=%s post_projection=%s output_norm=%s)",
+            pre_proj  ? "ok" : "MISSING",
+            post_proj ? "ok" : "MISSING",
+            out_norm  ? "ok" : "MISSING");
+        set_last_error(buf);
+        gguf_free(gctx);
+        return false;
+    }
+
+    // Optional centroid tensors (Edge models only; Dense 31B has n_centroids == 0).
+    ggml_tensor * centroids_t      = nullptr;
+    ggml_tensor * token_ordering_t = nullptr;
+    if (use_ordered_embeddings && n_centroids > 0) {
+        centroids_t      = g("mtp.centroids.weight");
+        token_ordering_t = g("mtp.token_ordering.weight");
+        if (!centroids_t) {
+            set_last_error("load_gemma4_mtp_assistant: use_ordered_embeddings=true but mtp.centroids.weight missing");
+            gguf_free(gctx);
+            return false;
+        }
+        // token_ordering is optional per TENSOR_NOT_REQUIRED in atomicbot.
+    }
+
+    // Per-layer tensors.
+    std::vector<MtpLayerWeights> mtp_layers(n_mtp_layer);
+    for (uint32_t il = 0; il < n_mtp_layer; il++) {
+        char name[160];
+        auto fnd = [&](const char * suffix) -> ggml_tensor * {
+            std::snprintf(name, sizeof(name), "blk.%u.%s", il, suffix);
+            return ggml_get_tensor(meta_ctx, name);
+        };
+
+        MtpLayerWeights & L = mtp_layers[il];
+        L.is_swa             = mtp_swa_layers[il];
+        L.donor_target_layer = donor_per_mtp_layer[il];
+
+        L.attn_norm      = fnd("attn_norm.weight");
+        L.wq             = fnd("attn_q.weight");
+        L.attn_q_norm    = fnd("attn_q_norm.weight");
+        L.wo             = fnd("attn_output.weight");
+        L.attn_post_norm = fnd("post_attention_norm.weight");
+        L.ffn_norm       = fnd("ffn_norm.weight");
+        L.ffn_up         = fnd("ffn_up.weight");
+        L.ffn_gate       = fnd("ffn_gate.weight");
+        L.ffn_down       = fnd("ffn_down.weight");
+        L.ffn_post_norm  = fnd("post_ffw_norm.weight");
+        L.out_scale      = fnd("layer_output_scale.weight");  // optional
+
+        // Validate required tensors.
+        if (!L.attn_norm || !L.wq || !L.attn_q_norm || !L.wo || !L.attn_post_norm ||
+            !L.ffn_norm || !L.ffn_up || !L.ffn_gate || !L.ffn_down || !L.ffn_post_norm) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                "load_gemma4_mtp_assistant: layer %u missing required tensor "
+                "(attn_norm=%s wq=%s attn_q_norm=%s wo=%s attn_post_norm=%s "
+                "ffn_norm=%s ffn_up=%s ffn_gate=%s ffn_down=%s ffn_post_norm=%s)",
+                il,
+                L.attn_norm ? "ok" : "MISSING", L.wq ? "ok" : "MISSING",
+                L.attn_q_norm ? "ok" : "MISSING", L.wo ? "ok" : "MISSING",
+                L.attn_post_norm ? "ok" : "MISSING",
+                L.ffn_norm ? "ok" : "MISSING", L.ffn_up ? "ok" : "MISSING",
+                L.ffn_gate ? "ok" : "MISSING", L.ffn_down ? "ok" : "MISSING",
+                L.ffn_post_norm ? "ok" : "MISSING");
+            set_last_error(buf);
+            gguf_free(gctx);
+            return false;
+        }
+    }
+
+    // ── 4. Allocate GPU buffer ────────────────────────────────────────────────
+
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+
+    struct TensorSlot {
+        ggml_tensor * tensor      = nullptr;
+        size_t        file_offset = 0;
+        size_t        file_size   = 0;
+        size_t        buf_offset  = 0;
+    };
+
+    std::vector<TensorSlot> slots;
+    size_t total_gpu = 0;
+    const int64_t n_tensors = gguf_get_n_tensors(gctx);
+    for (int64_t tid = 0; tid < n_tensors; tid++) {
+        const char * tname = gguf_get_tensor_name(gctx, tid);
+        ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
+        if (!t) continue;
+        total_gpu = align_up(total_gpu, alignment);
+        TensorSlot s;
+        s.tensor      = t;
+        s.file_offset = gguf_get_data_offset(gctx) + gguf_get_tensor_offset(gctx, tid);
+        s.file_size   = gguf_get_tensor_size(gctx, tid);
+        s.buf_offset  = total_gpu;
+        total_gpu    += ggml_backend_buft_get_alloc_size(buft, t);
+        slots.push_back(s);
+    }
+
+    if (slots.empty()) {
+        set_last_error("load_gemma4_mtp_assistant: no tensors found in GGUF");
+        gguf_free(gctx);
+        return false;
+    }
+
+    auto cleanup_out = [&]() {
+        if (out.buffer) { ggml_backend_buffer_free(out.buffer); out.buffer = nullptr; }
+        if (out.ctx)    { ggml_free(out.ctx); out.ctx = nullptr; }
+        out = MtpDrafterWeights{};
+    };
+
+    out.buffer = ggml_backend_alloc_buffer(backend, total_gpu);
+    if (!out.buffer) {
+        set_last_error("load_gemma4_mtp_assistant: ggml_backend_alloc_buffer failed");
+        gguf_free(gctx);
+        cleanup_out();
+        return false;
+    }
+    ggml_backend_buffer_set_usage(out.buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    char * base = (char *)ggml_backend_buffer_get_base(out.buffer);
+    for (const TensorSlot & s : slots) {
+        if (ggml_backend_tensor_alloc(out.buffer, s.tensor, base + s.buf_offset) != GGML_STATUS_SUCCESS) {
+            set_last_error("load_gemma4_mtp_assistant: ggml_backend_tensor_alloc failed");
+            gguf_free(gctx);
+            cleanup_out();
+            return false;
+        }
+    }
+
+    // ── 5. mmap and upload tensors ────────────────────────────────────────────
+
+    std::string err;
+    Mmap mm;
+    if (!mm.open_ro(gguf_path, err)) {
+        set_last_error(err);
+        gguf_free(gctx);
+        cleanup_out();
+        return false;
+    }
+
+    const size_t data_start = gguf_get_data_offset(gctx);
+    for (int64_t tid = 0; tid < n_tensors; tid++) {
+        const char * tname = gguf_get_tensor_name(gctx, tid);
+        ggml_tensor * t    = ggml_get_tensor(meta_ctx, tname);
+        if (!t) continue;
+        const size_t off = data_start + gguf_get_tensor_offset(gctx, tid);
+        const size_t sz  = gguf_get_tensor_size(gctx, tid);
+        if (off + sz > mm.len) {
+            set_last_error(std::string("load_gemma4_mtp_assistant: tensor '") + tname + "' overflows file");
+            gguf_free(gctx);
+            cleanup_out();
+            return false;
+        }
+        ggml_backend_tensor_set(t, (const uint8_t *)mm.addr + off, 0, sz);
+    }
+
+    gguf_free(gctx);
+
+    // ── 6. Populate output struct ─────────────────────────────────────────────
+
+    out.ctx                 = meta_ctx;
+    out.backend             = backend;
+    out.pre_projection      = pre_proj;
+    out.post_projection     = post_proj;
+    out.output_norm         = out_norm;
+    out.centroids           = centroids_t;
+    out.token_ordering      = token_ordering_t;
+    out.layers              = std::move(mtp_layers);
+    out.n_embd              = (int32_t)n_embd;
+    out.n_embd_backbone     = (int32_t)n_embd_backbone;
+    out.n_centroids         = (int32_t)n_centroids;
+    out.centroid_top_k      = (int32_t)centroid_top_k;
+    out.use_ordered_embeddings = use_ordered_embeddings;
+    out.attention_k_eq_v    = attention_k_eq_v;
+    out.requires_target_arch = requires_target_arch;
+
+    std::printf("[mtp_loader] loaded: n_embd_backbone=%u n_mtp_layers=%u "
+                "attention_k_eq_v=%d n_centroids=%u requires_target_arch=%s "
+                "tensors=%zu GPU %.2f MiB\n",
+                n_embd_backbone, n_mtp_layer,
+                (int)attention_k_eq_v, n_centroids,
+                requires_target_arch.c_str(),
+                slots.size(),
+                (double)total_gpu / (1024.0 * 1024.0));
+
+    for (uint32_t mil = 0; mil < n_mtp_layer; mil++) {
+        std::printf("[mtp_loader]   layer[%u]: is_swa=%d donor_target_layer=%d\n",
+                    mil, (int)out.layers[mil].is_swa, out.layers[mil].donor_target_layer);
+    }
+
+    return true;
+}
+
+// ─── free_gemma4_mtp_assistant ────────────────────────────────────────────────
+
+void free_gemma4_mtp_assistant(MtpDrafterWeights & w) {
+    if (w.buffer) { ggml_backend_buffer_free(w.buffer); w.buffer = nullptr; }
+    if (w.ctx)    { ggml_free(w.ctx); w.ctx = nullptr; }
+    w.layers.clear();
+    w.pre_projection    = nullptr;
+    w.post_projection   = nullptr;
+    w.output_norm       = nullptr;
+    w.centroids         = nullptr;
+    w.token_ordering    = nullptr;
+    w = MtpDrafterWeights{};
+}
+
 // ─── free_gemma4_target_weights ──────────────────────────────────────────────
 
 void free_gemma4_target_weights(GemmaTargetWeights & w) {
