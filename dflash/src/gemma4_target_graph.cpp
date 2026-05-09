@@ -1044,6 +1044,29 @@ GemmaGraphOutputs build_gemma4_graph(
             }
         }
 
+        // ── m) MTP h_prev capture (last full-attention layer, last token) ─────────
+        if (cache.mtp_h_prev_enabled && cache.mtp_h_prev &&
+            il == cache.mtp_last_full_layer) {
+            // Capture the last token's hidden state (post-block, post-FFN).
+            // For decode n_tokens==1 this is trivially the whole cur tensor.
+            // For prefill we slice the last-token column.
+            const int n_embd = (int)cache.mtp_h_prev->ne[0];
+            ggml_tensor * h_last = cur;
+            if (n_tokens > 1) {
+                h_last = ggml_view_2d(ctx, cur,
+                    n_embd, 1,
+                    ggml_row_size(cur->type, n_embd),
+                    ggml_row_size(cur->type, n_embd) * (n_tokens - 1));
+            }
+            // Cast to f32 if needed (cur is typically f32 in this graph)
+            if (h_last->type != GGML_TYPE_F32) {
+                h_last = ggml_cast(ctx, h_last, GGML_TYPE_F32);
+            }
+            // Reshape to [n_embd, 1] to match mtp_h_prev shape
+            h_last = ggml_reshape_2d(ctx, h_last, n_embd, 1);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, h_last, cache.mtp_h_prev));
+        }
+
         // ── l) Advance residual stream ──────────────────────────────────────────
         inpL = cur;
     }

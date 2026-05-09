@@ -605,6 +605,16 @@ struct GemmaTargetCache {
     ggml_tensor * target_feat     = nullptr;
     int           target_feat_cap = 0;
 
+    // MTP h_prev: last committed token's post-block hidden state from the
+    // last full-attention layer.  Shape [n_embd_backbone, 1] f32.
+    // Allocated only when MTP is enabled (mtp_h_prev_enabled flag on cache).
+    // Written by the target graph at the end of every decode step.
+    ggml_tensor * mtp_h_prev         = nullptr;
+    bool          mtp_h_prev_enabled = false;
+    // Index of the last full-attention layer in the target (Dense 31B = 58).
+    // Computed once at cache init from w.swa_layers (highest il with swa==false).
+    int           mtp_last_full_layer = -1;
+
     // Draft KV cache (prefix-direct: projected target features → K/V per layer)
     ggml_context        * draft_kv_ctx = nullptr;
     ggml_backend_buffer_t draft_kv_buf = nullptr;
@@ -788,6 +798,14 @@ bool load_gemma4_mtp_assistant(const std::string & gguf_path,
 
 void free_gemma4_mtp_assistant(MtpDrafterWeights & w);
 
+// Re-resolve MTP donor layers using the actual target SWA pattern instead of the
+// hardcoded alternating assumption used during loading.  Call this after both the
+// target model and MTP assistant are loaded, passing the target's swa_layers vector.
+// Each MTP layer's donor_target_layer is updated to the LAST target layer whose
+// SWA type matches the MTP layer's SWA type per the provided pattern.
+void resolve_mtp_donor_layers(MtpDrafterWeights & mtp,
+                              const std::vector<bool> & target_swa_layers);
+
 // ─── Gemma4 MTP step graph ────────────────────────────────────────────────────
 //
 // Build a single MTP step graph that maps:
@@ -806,16 +824,17 @@ void free_gemma4_mtp_assistant(MtpDrafterWeights & w);
 // The caller passes it separately because the graph is rebuilt per-step in the
 // chained γ loop (attn_pos is constant across steps, pos advances per step).
 struct MtpStepGraph {
-    ggml_context * ctx        = nullptr;
-    ggml_cgraph  * gf         = nullptr;
+    ggml_context * ctx           = nullptr;
+    ggml_cgraph  * gf            = nullptr;
     // Inputs (caller sets via ggml_backend_tensor_set before each step)
-    ggml_tensor  * in_tok     = nullptr;
-    ggml_tensor  * in_h_prev  = nullptr;
-    ggml_tensor  * in_pos     = nullptr;
+    ggml_tensor  * in_tok        = nullptr;  // I32 [1] — the token id (unused in graph; kept for API compat)
+    ggml_tensor  * in_tok_embd   = nullptr;  // F32 [n_embd_backbone, 1] — pre-dequantised embedding
+    ggml_tensor  * in_h_prev     = nullptr;
+    ggml_tensor  * in_pos        = nullptr;
     // Outputs (caller reads via ggml_backend_tensor_get after compute)
-    ggml_tensor  * out_logits = nullptr;
-    ggml_tensor  * out_h_post = nullptr;
-    ggml_tensor  * out_argmax = nullptr;
+    ggml_tensor  * out_logits    = nullptr;
+    ggml_tensor  * out_h_post    = nullptr;
+    ggml_tensor  * out_argmax    = nullptr;
 };
 
 // Build the MTP step graph. attn_pos = cache.cur_pos at submit time.

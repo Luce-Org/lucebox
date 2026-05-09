@@ -625,6 +625,9 @@ static void print_usage(const char * prog) {
         prog);
 }
 
+// Draft method selection
+enum class DraftMethod { Auto, None, Dflash, Mtp };
+
 int main(int argc, char ** argv) {
     if (argc < 2) {
         print_usage(argv[0]);
@@ -634,6 +637,7 @@ int main(int argc, char ** argv) {
     // ── Parse CLI arguments ───────────────────────────────────────────────
     std::string  model_path;
     std::string  draft_path;
+    std::string  mtp_path;
     std::string  prompt_text  = "Hello, world!";
     std::string  token_ids_str;
     std::string  tokens_file;
@@ -651,6 +655,7 @@ int main(int argc, char ** argv) {
     bool         daemon_mode  = false;
     int          stream_fd    = -1;
     int          draft_max    = 0;   // 0 = use model's block_size (default 16)
+    DraftMethod  draft_method = DraftMethod::Auto;
 
     for (int i = 1; i < argc; i++) {
         auto require_next = [&](const char * flag) -> const char * {
@@ -686,6 +691,14 @@ int main(int argc, char ** argv) {
         else if (std::strcmp(argv[i], "--pflash")       == 0) use_pflash    = true;
         else if (std::strcmp(argv[i], "--pflash-alpha") == 0) pflash_alpha  = (float)std::atof(require_next("--pflash-alpha"));
         else if (std::strcmp(argv[i], "--draft-max")    == 0) draft_max     = std::atoi(require_next("--draft-max"));
+        else if (std::strcmp(argv[i], "--mtp") == 0) mtp_path = require_next("--mtp");
+        else if (std::strcmp(argv[i], "--draft-method") == 0) {
+            const char * m = require_next("--draft-method");
+            if      (std::strcmp(m, "none")   == 0) draft_method = DraftMethod::None;
+            else if (std::strcmp(m, "dflash") == 0) draft_method = DraftMethod::Dflash;
+            else if (std::strcmp(m, "mtp")    == 0) draft_method = DraftMethod::Mtp;
+            else { std::fprintf(stderr, "error: unknown --draft-method %s\n", m); return 1; }
+        }
         else if (std::strncmp(argv[i], "--stream-fd=", 12) == 0) {
             stream_fd = std::atoi(argv[i] + 12);
         }
@@ -709,6 +722,31 @@ int main(int argc, char ** argv) {
         print_usage(argv[0]);
         return 2;
     }
+
+    // ── Resolve Auto draft method ─────────────────────────────────────────
+    if (draft_method == DraftMethod::Auto) {
+        if (!draft_path.empty() && !mtp_path.empty()) {
+            std::fprintf(stderr, "error: both --draft and --mtp provided; use --draft-method to disambiguate\n");
+            return 1;
+        } else if (!mtp_path.empty()) {
+            draft_method = DraftMethod::Mtp;
+        } else if (!draft_path.empty()) {
+            draft_method = DraftMethod::Dflash;
+        } else {
+            draft_method = DraftMethod::None;
+        }
+    }
+    if (draft_method == DraftMethod::Mtp && mtp_path.empty()) {
+        std::fprintf(stderr, "error: --draft-method mtp requires --mtp <path>\n");
+        return 1;
+    }
+    if (draft_method == DraftMethod::Dflash && draft_path.empty()) {
+        std::fprintf(stderr, "error: --draft-method dflash requires --draft <path>\n");
+        return 1;
+    }
+
+    const bool have_draft = (draft_method == DraftMethod::Dflash);
+    const bool have_mtp   = (draft_method == DraftMethod::Mtp);
 
     // ── Load token IDs from file if --tokens-file was specified ──────────
     if (!tokens_file.empty()) {
@@ -792,8 +830,6 @@ int main(int argc, char ** argv) {
     }
 
     // ── Load draft weights (optional) ────────────────────────────────────
-    const bool have_draft = !draft_path.empty();
-
     // Draft state: declared in main scope so they persist across bench iterations
     // and are accessible in cleanup.
     GemmaDraftWeights    dw;
@@ -902,6 +938,83 @@ int main(int argc, char ** argv) {
             return 1;
         }
         std::printf("[draft] KV cache allocated: %d slots\n", cache.draft_kv_cap);
+    }
+
+    // ── MTP weights + step graph (optional) ──────────────────────────────
+    MtpDrafterWeights mtp_w;
+    MtpStepGraph      mtp_g;
+    // mtp_h_prev context/buffer: separate small allocation so base_ctx stays
+    // unmodified and free_gemma4_cache() doesn't double-free it.
+    ggml_context        * mtp_h_prev_ctx = nullptr;
+    ggml_backend_buffer_t mtp_h_prev_buf = nullptr;
+
+    if (have_mtp) {
+        double t0 = now_ms();
+        if (!load_gemma4_mtp_assistant(mtp_path, backend, mtp_w)) {
+            std::fprintf(stderr, "load_gemma4_mtp_assistant: %s\n", dflash27b_last_error());
+            return 1;
+        }
+        double t1 = now_ms();
+        std::printf("[mtp] loaded n_layers=%d n_embd=%d n_embd_backbone=%d  (%.1f ms)\n",
+                    (int)mtp_w.layers.size(), mtp_w.n_embd, mtp_w.n_embd_backbone, t1 - t0);
+
+        // Re-resolve donor target layers using the actual target SWA pattern.
+        // The loader uses a hardcoded alternating assumption; the real pattern
+        // from the GGUF may differ (e.g., layer 59 may be full-attention, not SWA).
+        resolve_mtp_donor_layers(mtp_w, w.swa_layers);
+
+        // Allocate mtp_h_prev tensor: [n_embd_backbone, 1] f32, GPU-resident,
+        // persistent across decode steps. Separate context so free_gemma4_cache
+        // doesn't free it.
+        {
+            ggml_init_params ep{};
+            ep.mem_size   = ggml_tensor_overhead() + 256;
+            ep.mem_buffer = nullptr;
+            ep.no_alloc   = true;
+            mtp_h_prev_ctx = ggml_init(ep);
+            if (!mtp_h_prev_ctx) {
+                std::fprintf(stderr, "[mtp] ggml_init for mtp_h_prev failed\n");
+                return 1;
+            }
+            cache.mtp_h_prev = ggml_new_tensor_2d(mtp_h_prev_ctx,
+                                                    GGML_TYPE_F32,
+                                                    mtp_w.n_embd_backbone, 1);
+            ggml_set_name(cache.mtp_h_prev, "mtp_h_prev");
+            mtp_h_prev_buf = ggml_backend_alloc_ctx_tensors(mtp_h_prev_ctx, backend);
+            if (!mtp_h_prev_buf) {
+                std::fprintf(stderr, "[mtp] alloc mtp_h_prev failed\n");
+                ggml_free(mtp_h_prev_ctx); mtp_h_prev_ctx = nullptr;
+                return 1;
+            }
+            // Zero-initialize
+            std::vector<float> zeros_f(mtp_w.n_embd_backbone, 0.0f);
+            ggml_backend_tensor_set(cache.mtp_h_prev, zeros_f.data(), 0,
+                                    sizeof(float) * mtp_w.n_embd_backbone);
+        }
+
+        // Determine last full-attention layer index from swa_layers
+        cache.mtp_last_full_layer = -1;
+        for (int il = w.n_layer - 1; il >= 0; il--) {
+            const bool is_swa = (il < (int)w.swa_layers.size()) && w.swa_layers[il];
+            if (!is_swa) {
+                cache.mtp_last_full_layer = il;
+                break;
+            }
+        }
+        if (cache.mtp_last_full_layer < 0) {
+            std::fprintf(stderr, "[mtp] error: no full-attention layer found in target\n");
+            return 1;
+        }
+        std::printf("[mtp] mtp_last_full_layer=%d\n", cache.mtp_last_full_layer);
+
+        cache.mtp_h_prev_enabled = true;
+
+        // Build the MTP step graph (attn_pos=0 initially; will be rebuilt per step)
+        if (!build_mtp_step_graph(mtp_w, cache, w, mtp_g, /*attn_pos=*/0)) {
+            std::fprintf(stderr, "build_mtp_step_graph: %s\n", dflash27b_last_error());
+            return 1;
+        }
+        std::printf("[mtp] step graph built ok\n");
     }
 
     // ── RNG ───────────────────────────────────────────────────────────────
@@ -1934,6 +2047,169 @@ int main(int argc, char ** argv) {
                 draft_step_free(dsg);
             }
 
+        } else if (have_mtp) {
+            // ── MTP SPECULATIVE DECODE LOOP (γ=1 v1) ─────────────────────
+            //
+            // Each iteration:
+            //   1. Run target forward for cur_tok at position `committed`,
+            //      capturing mtp_h_prev from the last full-attention layer.
+            //   2. Rebuild MTP step graph with current attn_pos = committed+1.
+            //   3. Feed (cur_tok, mtp_h_prev) into MTP graph → draft_tok.
+            //   4. Run target verify forward for draft_tok at position committed+1.
+            //   5. Accept draft_tok if target agrees; otherwise accept target's
+            //      token instead (standard single-draft acceptance).
+            //   γ=1: one MTP draft per step. Correctness gate before γ>1.
+
+            int mtp_steps    = 0;
+            int mtp_accepted = 0;
+
+            while ((int)generated.size() < n_predict) {
+
+                if (IS_EOS_TOK(cur_tok, w)) {
+                    std::printf("\n[mtp] EOS token %d at step %zu\n",
+                                cur_tok, generated.size());
+                    break;
+                }
+                if (committed >= ctx_size - 2) {
+                    std::printf("\n[mtp] context full at step %zu\n",
+                                generated.size());
+                    break;
+                }
+
+                // ── 1. Target forward for cur_tok (captures mtp_h_prev) ──
+                if (!build_gemma4_step(sg, w, cache, backend,
+                                       committed, /*n_tokens=*/1,
+                                       /*with_mask=*/true,
+                                       /*capture=*/false)) {
+                    std::fprintf(stderr, "[mtp] target build failed at step %zu\n",
+                                 generated.size());
+                    return 1;
+                }
+
+                if (sg.attn_mask && sg.attn_mask->buffer) {
+                    const int kv_len = committed + 1;
+                    std::vector<uint16_t> mask_buf;
+                    build_causal_mask(mask_buf, kv_len, 1, committed);
+                    ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
+                                            sizeof(uint16_t) * mask_buf.size());
+                }
+                if (!embed_token(w, cur_tok, sg.inp_embed, backend)) return 1;
+                {
+                    int32_t pos_val = committed;
+                    ggml_backend_tensor_set(sg.positions, &pos_val, 0, sizeof(int32_t));
+                }
+                {
+                    auto st = ggml_backend_graph_compute(backend, sg.gf);
+                    if (st != GGML_STATUS_SUCCESS) {
+                        std::fprintf(stderr, "[mtp] target compute failed\n");
+                        return 1;
+                    }
+                }
+                committed++;
+                cache.cur_pos = committed;
+
+                // Read target logits to get target's own prediction at position committed-1
+                const int vocab = w.n_vocab;
+                std::vector<float> logits_cpu(vocab);
+                ggml_backend_tensor_get(sg.logits, logits_cpu.data(), 0,
+                                        sizeof(float) * vocab);
+                const int32_t target_next = (int32_t)sample_logits(
+                    logits_cpu.data(), vocab, sampler, history, rng);
+
+                step_graph_free(sg);
+
+                // ── 2. Rebuild MTP step graph with attn_pos = committed ──
+                free_mtp_step_graph(mtp_g);
+                if (!build_mtp_step_graph(mtp_w, cache, w, mtp_g, committed)) {
+                    std::fprintf(stderr, "[mtp] build_mtp_step_graph failed: %s\n",
+                                 dflash27b_last_error());
+                    return 1;
+                }
+
+                // Allocate MTP graph (needs gallocr; build_mtp_step_graph creates
+                // the ggml context but not the backend buffers)
+                ggml_gallocr_t mtp_alloc = ggml_gallocr_new(
+                    ggml_backend_get_default_buffer_type(backend));
+                bool mtp_alloc_ok = ggml_gallocr_alloc_graph(mtp_alloc, mtp_g.gf);
+                if (!mtp_alloc_ok) {
+                    std::fprintf(stderr, "[mtp] gallocr_alloc_graph failed\n");
+                    ggml_gallocr_free(mtp_alloc);
+                    return 1;
+                }
+
+                // ── 3. Set MTP inputs and compute ────────────────────────
+                // in_tok_embd: pre-dequantised F32 embedding of cur_tok.
+                // embed_token dequantises via w.embedder.embed() on CPU, avoiding
+                // ggml_get_rows on a Q4_K source (unsupported in CUDA get_rows).
+                if (!embed_token(w, cur_tok, mtp_g.in_tok_embd, backend)) {
+                    std::fprintf(stderr, "[mtp] embed_token failed for tok=%d\n", cur_tok);
+                    ggml_gallocr_free(mtp_alloc);
+                    return 1;
+                }
+                // in_h_prev: captured by target graph into cache.mtp_h_prev
+                ggml_backend_tensor_copy(cache.mtp_h_prev, mtp_g.in_h_prev);
+                // in_pos: position of the draft token (= committed, 0-based)
+                {
+                    int32_t p = committed;
+                    ggml_backend_tensor_set(mtp_g.in_pos, &p, 0, sizeof(int32_t));
+                }
+
+                {
+                    auto st = ggml_backend_graph_compute(backend, mtp_g.gf);
+                    if (st != GGML_STATUS_SUCCESS) {
+                        std::fprintf(stderr, "[mtp] MTP compute failed\n");
+                        ggml_gallocr_free(mtp_alloc);
+                        return 1;
+                    }
+                }
+
+                // Read draft token from in-graph argmax
+                int32_t draft_tok = -1;
+                ggml_backend_tensor_get(mtp_g.out_argmax, &draft_tok, 0, sizeof(int32_t));
+
+                ggml_gallocr_free(mtp_alloc);
+
+                // Emit the current token (already committed by target step above)
+                generated.push_back(cur_tok);
+                history.push_back(cur_tok);
+                std::printf("%d ", cur_tok);
+                std::fflush(stdout);
+
+                if (first_token_ms < 0.0) {
+                    first_token_ms = now_ms() - decode_t0;
+                }
+
+                mtp_steps++;
+
+                // ── 4+5. Check if draft matches target's greedy token ───
+                if (draft_tok == target_next) {
+                    // MTP was right: accept draft token as next cur_tok
+                    mtp_accepted++;
+                    cur_tok = draft_tok;
+                } else {
+                    // MTP was wrong: use target's token
+                    cur_tok = target_next;
+                }
+                cache.last_tok = cur_tok;
+
+                if ((int)generated.size() % 8 == 0) {
+                    std::printf("[mtp-step %d] accept_rate=%.2f\n",
+                                mtp_steps,
+                                mtp_steps > 0 ? (float)mtp_accepted / mtp_steps : 0.0f);
+                }
+
+                if (IS_EOS_TOK(cur_tok, w)) {
+                    std::printf("\n[mtp] EOS token %d\n", cur_tok);
+                    break;
+                }
+            }
+
+            if (mtp_steps > 0) {
+                std::printf("\n[mtp] steps=%d accepted=%d accept_rate=%.2f\n",
+                            mtp_steps, mtp_accepted,
+                            (float)mtp_accepted / mtp_steps);
+            }
+
         } else {
             // ── TARGET-ONLY DECODE LOOP ───────────────────────────────────
             //
@@ -2073,6 +2349,18 @@ int main(int argc, char ** argv) {
         free_gemma4_draft_weights(dw);
         if (tok_embd_buf) ggml_backend_buffer_free(tok_embd_buf);
         if (tok_embd_ctx) ggml_free(tok_embd_ctx);
+    }
+    if (have_mtp) {
+        free_mtp_step_graph(mtp_g);
+        free_gemma4_mtp_assistant(mtp_w);
+        // mtp_h_prev lives in mtp_h_prev_buf/ctx (not base_ctx).
+        // Null out the pointer in cache before free_gemma4_cache to avoid
+        // dangling reference (cache struct is stack-allocated; the pointer
+        // would otherwise reference freed memory).
+        cache.mtp_h_prev         = nullptr;
+        cache.mtp_h_prev_enabled = false;
+        if (mtp_h_prev_buf) { ggml_backend_buffer_free(mtp_h_prev_buf); mtp_h_prev_buf = nullptr; }
+        if (mtp_h_prev_ctx) { ggml_free(mtp_h_prev_ctx); mtp_h_prev_ctx = nullptr; }
     }
     free_gemma4_cache(cache);
     free_gemma4_target_weights(w);

@@ -117,8 +117,10 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
     }
 
     // ── Allocate ggml context ─────────────────────────────────────────────────
-    // Conservative tensor overhead: 3 inputs + ~50 ops per layer + outputs.
-    const size_t n_tensors_est = (size_t)(3 + n_layer * 60 + 20);
+    // Conservative tensor overhead: 3 inputs + ~70 ops per layer + outputs.
+    // Extras vs original: Kview_f32 cast(1) + Vview_f32 cast(1) + kv_ref/vv_ref GQA(2) +
+    //   Qcur permute+cont(2) + Vt cont_4d+permute(2) = ~10 extra per layer.
+    const size_t n_tensors_est = (size_t)(3 + n_layer * 70 + 20);
     ggml_init_params ip{};
     ip.mem_size   = n_tensors_est * ggml_tensor_overhead() + 1024 * 1024;
     ip.mem_buffer = nullptr;
@@ -136,6 +138,14 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
     ggml_set_input(in_tok);
     ggml_set_name(in_tok, "mtp_in_tok");
 
+    // in_tok_embd: pre-dequantised token embedding supplied by caller.
+    // Caller must call target.embedder.embed(&tok, 1, buf) and tensor_set before compute.
+    // This avoids ggml_get_rows on a k-quant (Q4_K) source which the CUDA backend
+    // does not support in this llama.cpp revision.
+    ggml_tensor * in_tok_embd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_backbone, 1);
+    ggml_set_input(in_tok_embd);
+    ggml_set_name(in_tok_embd, "mtp_in_tok_embd");
+
     ggml_tensor * in_h_prev = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_backbone, 1);
     ggml_set_input(in_h_prev);
     ggml_set_name(in_h_prev, "mtp_in_h_prev");
@@ -147,9 +157,11 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
     ggml_set_name(in_pos, "mtp_in_pos");
 
     // ── 1. Token embedding from target (shared weight) ────────────────────────
-    // get_rows selects row in_tok from target.tok_embd (shape [n_vocab, n_embd_backbone])
-    // Result: [n_embd_backbone, 1]
-    ggml_tensor * tok_e = ggml_get_rows(ctx, target.tok_embd, in_tok);
+    // Embedding is passed in pre-dequantised by the caller via in_tok_embd.
+    // This bypasses ggml_get_rows on a potentially quantised target.tok_embd
+    // (CUDA backend in this revision only supports F16/F32/Q8_0 for get_rows;
+    // Q4_K targets would abort at compute time).
+    ggml_tensor * tok_e = in_tok_embd;
     ggml_set_name(tok_e, "mtp_tok_embd");
 
     // Gemma4 scales token embeddings by sqrt(n_embd_backbone) at input pipeline
@@ -205,13 +217,21 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
         // KV cache layout: [head_dim_kv, max_ctx, n_head_kv]
         const int64_t head_dim_kv = cache_k->ne[0];
         const int64_t n_head_kv   = cache_k->ne[2];
-
-        // Q dimensions: derive per-layer from wq and attn_q_norm shapes.
-        // wq: [n_embd, n_head_q * head_dim_q]  → q_out_dim = n_head_q * head_dim_q
-        // attn_q_norm: [head_dim_q]            → head_dim_q (per-head RMS norm weight)
-        const int64_t q_out_dim  = L.wq->ne[1];
-        const int64_t head_dim_q = L.attn_q_norm->ne[0];  // per-head Q dimension
-        const int64_t n_head_q   = q_out_dim / head_dim_q;
+        // Q dimensions: derive from wq output size and attn_q_norm shape.
+        // wq:         [n_embd, q_out_dim]  where q_out_dim = n_head_norm * head_dim_norm
+        // attn_q_norm:[head_dim_norm]       per-head norm weight from the MTP model's own hparams
+        //
+        // head_dim_norm may differ from head_dim_kv (the target KV cache head_dim).
+        // Dense 31B example: MTP trained with head_dim_norm=256, target K stored at 128.
+        // For flash_attn Q @ K^T to succeed, Q.ne[0] must equal K.ne[0].
+        // Fix: norm and RoPE run at head_dim_norm; before FA, reshape Q to [head_dim_kv, ...]
+        // so the dot-product dimension matches K.  q_out_dim is preserved throughout.
+        const int64_t q_out_dim    = L.wq->ne[1];
+        const int64_t head_dim_norm = L.attn_q_norm->ne[0];  // MTP model's per-head norm dim
+        const int64_t n_head_norm   = q_out_dim / head_dim_norm;
+        // FA head_dim must match target K; use head_dim_kv (from cache_k->ne[0]).
+        const int64_t head_dim_fa  = head_dim_kv;
+        const int64_t n_head_fa    = q_out_dim / head_dim_fa;
 
         // a) RMSNorm
         ggml_tensor * cur = mtp_rms_norm_mul(ctx, inpL, L.attn_norm);
@@ -220,23 +240,22 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
             ggml_set_name(cur, name);
         }
 
-        // b) Q projection: [n_embd, 1] → [n_head*head_dim, 1]
+        // b) Q projection: [n_embd, 1] → [q_out_dim, 1], reshape to [head_dim_norm, n_head_norm, 1]
         ggml_tensor * Qcur = ggml_mul_mat(ctx, L.wq, cur);
-        // Reshape to [head_dim, n_head, 1] for per-head ops
-        Qcur = ggml_reshape_3d(ctx, Qcur, head_dim_q, n_head_q, 1);
+        Qcur = ggml_reshape_3d(ctx, Qcur, head_dim_norm, n_head_norm, 1);
         {
             char name[64]; std::snprintf(name, sizeof(name), "mtp_Qcur_%d", il);
             ggml_set_name(Qcur, name);
         }
 
-        // c) Q-norm (per-head RMSNorm, attn_q_norm shape: [head_dim_q])
+        // c) Q-norm: per-head RMSNorm at head_dim_norm (attn_q_norm shape: [head_dim_norm])
         Qcur = mtp_rms_norm_mul(ctx, Qcur, L.attn_q_norm);
         {
             char name[64]; std::snprintf(name, sizeof(name), "mtp_Qcur_normed_%d", il);
             ggml_set_name(Qcur, name);
         }
 
-        // d) RoPE on Q
+        // d) RoPE on Q at head_dim_norm
         // Use the target's rope_theta (SWA layers) or the full-attn layer's rope_freqs.
         // For MTP cross-attention: SWA layers use rope_theta_swa, full layers use rope_theta
         // (with per-layer freq_factors from the donor layer).
@@ -252,7 +271,7 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
         }
         Qcur = ggml_rope_ext(ctx, Qcur, in_pos,
                               rope_freq_factors,
-                              (int)head_dim_q, GGML_ROPE_TYPE_NEOX,
+                              (int)head_dim_norm, GGML_ROPE_TYPE_NEOX,
                               /*n_ctx_orig=*/0,
                               rope_theta_val, /*freq_scale=*/1.0f,
                               /*ext_factor=*/0.0f, /*attn_factor=*/1.0f,
@@ -262,10 +281,16 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
             ggml_set_name(Qcur, name);
         }
 
-        // e) Cross-attention
-        // Q: [head_dim, n_head, 1] — permute to [head_dim, 1, n_head] for FA
-        ggml_tensor * Qfa = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
-        Qfa = ggml_cont(ctx, Qfa);
+        // e) Cross-attention (manual: Q@K^T → scale → softmax → @V)
+        // Sidesteps ggml_flash_attn_ext CUDA kernel shape restrictions for MTP.
+        //
+        // Make Qcur contiguous before reshape — ggml_rope_ext returns a non-contiguous
+        // view; ggml_reshape_3d requires a contiguous source.
+        Qcur = ggml_cont(ctx, Qcur);
+        // Reshape Q from [head_dim_norm, n_head_norm, 1] to [head_dim_fa, n_head_fa, 1]
+        // so Q.ne[0] == K.ne[0] == head_dim_kv.
+        // When head_dim_norm == head_dim_fa this is a no-op reshape.
+        Qcur = ggml_reshape_3d(ctx, Qcur, head_dim_fa, n_head_fa, 1);
 
         // K/V view: view [0, attn_pos) from the target KV cache.
         // cache_k: [head_dim_kv, max_ctx, n_head_kv]
@@ -276,36 +301,138 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
         // Pad to 1 minimum to avoid zero-size tensors when attn_pos==0.
         const int64_t kv_view_len = std::max(kv_seq_len, (int64_t)1);
 
-        ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
+        ggml_tensor * Kview = ggml_view_3d(ctx, cache_k,
             head_dim_kv, kv_view_len, n_head_kv,
             cache_k->nb[1], cache_k->nb[2],
             /*offset=*/0);
-        ggml_tensor * Vfa = ggml_view_3d(ctx, cache_v,
+        ggml_tensor * Vview = ggml_view_3d(ctx, cache_v,
             head_dim_kv, kv_view_len, n_head_kv,
             cache_v->nb[1], cache_v->nb[2],
             /*offset=*/0);
         {
-            char name[64]; std::snprintf(name, sizeof(name), "mtp_Kfa_%d", il);
-            ggml_set_name(Kfa, name);
-            std::snprintf(name, sizeof(name), "mtp_Vfa_%d", il);
-            ggml_set_name(Vfa, name);
+            char name[64]; std::snprintf(name, sizeof(name), "mtp_Kview_%d", il);
+            ggml_set_name(Kview, name);
+            std::snprintf(name, sizeof(name), "mtp_Vview_%d", il);
+            ggml_set_name(Vview, name);
         }
 
-        // Flash attention — no causal mask needed: all KV positions ≤ attn_pos
-        // are uniformly admitted since step position > attn_pos.
-        // Gemma4 attn_scale = 1.0 (matches target graph).
-        ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa,
-                                                  /*mask=*/nullptr,
-                                                  /*scale=*/target.attn_scale,
-                                                  /*max_bias=*/0.0f,
-                                                  /*logit_softcap=*/0.0f);
+        // Dequantize K/V views to a float type before GQA broadcast and matmuls.
+        // CUDA ggml_repeat requires src0 type F32 or F16 (binbcast.cu:376).
+        // Type selection (evaluated at graph-build time from Kview->type):
+        //   TQ3_0 → F16: ggml_cpy_tq3_0_f16_cuda supports this (cpy.cu:574).
+        //   Q8_0  → F32: ggml_cpy_q8_0_f32_cuda supports this (cpy.cu:550).
+        //   F16/F32: identity cast (both F32/F16 are accepted by repeat).
+        // TQ3_0→F32 and Q8_0→F16 are NOT supported in cpy.cu.
+        const ggml_type kv_fp_type = (Kview->type == GGML_TYPE_TQ3_0)
+            ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        ggml_tensor * Kview_fp = ggml_cast(ctx, Kview, kv_fp_type);
+        ggml_tensor * Vview_fp = ggml_cast(ctx, Vview, kv_fp_type);
+        {
+            char name[64]; std::snprintf(name, sizeof(name), "mtp_Kview_fp_%d", il);
+            ggml_set_name(Kview_fp, name);
+            std::snprintf(name, sizeof(name), "mtp_Vview_fp_%d", il);
+            ggml_set_name(Vview_fp, name);
+        }
+
+        // GQA broadcast: repeat K/V heads so n_kv_heads == n_head_fa.
+        // Use the same float type (F16 for TQ3_0, F32 for Q8_0/others).
+        ggml_tensor * Kma = Kview_fp;
+        ggml_tensor * Vma = Vview_fp;
+        if (n_head_kv != n_head_fa) {
+            ggml_tensor * kv_ref = ggml_new_tensor_3d(ctx, kv_fp_type,
+                head_dim_kv, kv_view_len, n_head_fa);
+            Kma = ggml_repeat(ctx, Kview_fp, kv_ref);
+            ggml_tensor * vv_ref = ggml_new_tensor_3d(ctx, kv_fp_type,
+                head_dim_kv, kv_view_len, n_head_fa);
+            Vma = ggml_repeat(ctx, Vview_fp, vv_ref);
+        }
+        {
+            char name[64]; std::snprintf(name, sizeof(name), "mtp_Kma_%d", il);
+            ggml_set_name(Kma, name);
+            std::snprintf(name, sizeof(name), "mtp_Vma_%d", il);
+            ggml_set_name(Vma, name);
+        }
+
+        // Manual cross-attention (no causal mask: all KV positions < attn_pos admitted).
+        //
+        // ggml mul_mat(A, B) broadcast rule:  B.ne[2] % A.ne[2] == 0.
+        // K (A) has ne[2]=n_head_fa; Q (B) must have ne[2]=n_head_fa too.
+        // Qcur is [head_dim_fa, n_head_fa, 1] — heads in ne[1], batch in ne[2].
+        // Permute to [head_dim_fa, 1, n_head_fa] so ne[2]=n_head_fa matches K.
+        //
+        // Standard ggml multi-head layout:
+        //   Q (after permute): [head_dim, n_tokens=1, n_heads]
+        //   K:                 [head_dim, kv_len,     n_heads]
+        //   V (after permute): [kv_len,   head_dim,   n_heads]
+        Qcur = ggml_cont(ctx, ggml_permute(ctx, Qcur, 0, 2, 1, 3));
+        // Qcur is now [head_dim_fa, 1, n_head_fa, 1]
+        {
+            char name[64]; std::snprintf(name, sizeof(name), "mtp_Qcur_perm_%d", il);
+            ggml_set_name(Qcur, name);
+        }
+
+        // Step 1: KQ = mul_mat(Kma, Qcur)
+        //   mul_mat(A, x): A.ne[0] must == x.ne[0]; output shape = [A.ne[1], x.ne[1], ...]
+        //   mul_mat(Kma[head_dim, ctx, n_h], Qcur[head_dim, 1, n_h])
+        //     → KQ [ctx, 1, n_h]
+        ggml_tensor * KQ = ggml_mul_mat(ctx, Kma, Qcur);
+        {
+            char name[64]; std::snprintf(name, sizeof(name), "mtp_KQ_%d", il);
+            ggml_set_name(KQ, name);
+        }
+
+        // Step 2: scale KQ by attn_scale
+        KQ = ggml_scale(ctx, KQ, target.attn_scale);
+        {
+            char name[64]; std::snprintf(name, sizeof(name), "mtp_KQ_scaled_%d", il);
+            ggml_set_name(KQ, name);
+        }
+
+        // Step 3: softmax over KV sequence dimension (axis 0 = ctx_len)
+        // KQ: [ctx, 1, n_h] — softmax over dim 0
+        ggml_tensor * KQ_soft = ggml_soft_max(ctx, KQ);
+        {
+            char name[64]; std::snprintf(name, sizeof(name), "mtp_KQ_softmax_%d", il);
+            ggml_set_name(KQ_soft, name);
+        }
+
+        // Step 4: weighted sum over V: KQV = mul_mat(V^T, KQ_soft)
+        //   We need V in [kv_len, head_dim, n_h] so mul_mat(Vt, KQ_soft) gives
+        //   [head_dim, 1, n_h].
+        //
+        // Problem: ggml_mul_mat requires !ggml_is_transposed(a), i.e. nb[0] <= nb[1].
+        // ggml_cont(ggml_permute(...)) copies the permuted strides (nb[0] > nb[1]),
+        // so the 'a' tensor is still flagged transposed.
+        //
+        // Vma is F16 (TQ3_0 path) or F32 (Q8_0 path). Use ggml_cont_4d to create a
+        // fresh tensor with standard contiguous strides in layout [kv_len, head_dim, n_h].
+        // ggml_cont_4d calls ggml_new_tensor_4d (fresh strides, nb[0]<nb[1]) so the
+        // result is NOT flagged transposed by ggml_is_transposed().
+        ggml_tensor * Vt = ggml_cont_4d(ctx,
+            ggml_permute(ctx, Vma, 1, 0, 2, 3),
+            kv_view_len, head_dim_kv, n_head_fa, 1);
+        {
+            char name[64]; std::snprintf(name, sizeof(name), "mtp_Vt_%d", il);
+            ggml_set_name(Vt, name);
+        }
+        //   mul_mat(Vt[kv_len, head_dim, n_h], KQ_soft[kv_len, 1, n_h])
+        //     → KQV [head_dim, 1, n_h]
+        ggml_tensor * KQV = ggml_mul_mat(ctx, Vt, KQ_soft);
+        {
+            char name[64]; std::snprintf(name, sizeof(name), "mtp_KQV_%d", il);
+            ggml_set_name(KQV, name);
+        }
+
+        // Flatten heads: [head_dim_fa, 1, n_head_fa] → [q_out_dim, 1]
+        ggml_tensor * attn = ggml_cont(ctx, KQV);
         {
             char name[64]; std::snprintf(name, sizeof(name), "mtp_attn_out_%d", il);
             ggml_set_name(attn, name);
         }
 
-        // Reshape: [head_dim*n_head, 1] then output projection
-        attn = ggml_reshape_2d(ctx, attn, head_dim_q * n_head_q, 1);
+        // Reshape: [q_out_dim, 1] then output projection
+        // head_dim_fa * n_head_fa == q_out_dim == head_dim_norm * n_head_norm
+        attn = ggml_reshape_2d(ctx, attn, q_out_dim, 1);
         cur = ggml_mul_mat(ctx, L.wo, attn);
         {
             char name[64]; std::snprintf(name, sizeof(name), "mtp_attn_proj_%d", il);
@@ -374,7 +501,23 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
     // ── 6. LM head ────────────────────────────────────────────────────────────
     ggml_tensor * logits = nullptr;
 
-    if (w.use_ordered_embeddings && w.centroids && w.n_centroids > 0) {
+    // Determine whether tok_embd supports ggml_get_rows on CUDA.
+    // This backend (custom llama.cpp fork) only supports F32/F16/BF16/Q4_0/Q4_1/
+    // Q5_0/Q5_1/Q8_0/TQ3_0 for get_rows; K-quant types (Q4_K, Q5_K, Q6_K) are not.
+    // When tok_embd is a K-quant, the centroid sparse path can't use get_rows;
+    // fall back to dense mul_mat for logit computation instead.
+    const bool tok_embd_get_rows_ok =
+        (w.tok_embd &&
+         (w.tok_embd->type == GGML_TYPE_F32  ||
+          w.tok_embd->type == GGML_TYPE_F16  ||
+          w.tok_embd->type == GGML_TYPE_BF16 ||
+          w.tok_embd->type == GGML_TYPE_Q4_0 ||
+          w.tok_embd->type == GGML_TYPE_Q4_1 ||
+          w.tok_embd->type == GGML_TYPE_Q5_0 ||
+          w.tok_embd->type == GGML_TYPE_Q5_1 ||
+          w.tok_embd->type == GGML_TYPE_Q8_0));
+
+    if (w.use_ordered_embeddings && w.centroids && w.n_centroids > 0 && tok_embd_get_rows_ok) {
         // Centroid-routed LM head (matches atomicbot lines 190-235).
         // All mul_mat ops use h_inner [n_embd, 1] (MTP's own hidden space, n_embd=1024).
         // The embedding source is the MTP model's own tok_embd [n_embd, n_vocab] (w.tok_embd),
@@ -437,6 +580,13 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
         logits = ggml_set_rows(ctx, scatter_dst, scatter_src, flat_ids);
         logits = ggml_reshape_2d(ctx, logits, n_vocab, 1);
         ggml_set_name(logits, "mtp_logits_full");
+    } else if (w.use_ordered_embeddings && w.tok_embd) {
+        // Dense fallback for ordered-embeddings models when tok_embd type does not
+        // support CUDA get_rows (e.g. K-quants in this llama.cpp fork).
+        // mul_mat supports Q4_K/Q5_K/Q6_K on CUDA; produces exact logits
+        // (not the centroid approximation) which is fine for greedy/low-temp decoding.
+        logits = ggml_mul_mat(ctx, w.tok_embd, h_inner);
+        ggml_set_name(logits, "mtp_logits_dense_fallback");
     } else {
         // Dense tied LM head: mul_mat(tok_embd, h_post) → [n_vocab, 1]
         // For non-ordered-embeddings models (n_embd == n_embd_backbone), use h_post
@@ -474,14 +624,15 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
     ggml_set_output(argmax);
 
     // ── Populate output struct ────────────────────────────────────────────────
-    out.ctx        = ctx;
-    out.gf         = gf;
-    out.in_tok     = in_tok;
-    out.in_h_prev  = in_h_prev;
-    out.in_pos     = in_pos;
-    out.out_logits = logits;
-    out.out_h_post = h_post;
-    out.out_argmax = argmax;
+    out.ctx          = ctx;
+    out.gf           = gf;
+    out.in_tok       = in_tok;
+    out.in_tok_embd  = in_tok_embd;
+    out.in_h_prev    = in_h_prev;
+    out.in_pos       = in_pos;
+    out.out_logits   = logits;
+    out.out_h_post   = h_post;
+    out.out_argmax   = argmax;
 
     return true;
 }
@@ -491,13 +642,14 @@ void free_mtp_step_graph(MtpStepGraph & g) {
         ggml_free(g.ctx);
         g.ctx = nullptr;
     }
-    g.gf         = nullptr;
-    g.in_tok     = nullptr;
-    g.in_h_prev  = nullptr;
-    g.in_pos     = nullptr;
-    g.out_logits = nullptr;
-    g.out_h_post = nullptr;
-    g.out_argmax = nullptr;
+    g.gf           = nullptr;
+    g.in_tok       = nullptr;
+    g.in_tok_embd  = nullptr;
+    g.in_h_prev    = nullptr;
+    g.in_pos       = nullptr;
+    g.out_logits   = nullptr;
+    g.out_h_post   = nullptr;
+    g.out_argmax   = nullptr;
 }
 
 } // namespace dflash27b

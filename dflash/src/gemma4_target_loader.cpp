@@ -1100,6 +1100,24 @@ void free_gemma4_mtp_assistant(MtpDrafterWeights & w) {
     w = MtpDrafterWeights{};
 }
 
+// ─── resolve_mtp_donor_layers ─────────────────────────────────────────────────
+
+void resolve_mtp_donor_layers(MtpDrafterWeights & mtp,
+                              const std::vector<bool> & target_swa_layers) {
+    const int n_target = (int)target_swa_layers.size();
+    for (auto & L : mtp.layers) {
+        // Find the LAST target layer whose SWA type matches this MTP layer.
+        bool want_swa = L.is_swa;
+        int32_t best = -1;
+        for (int til = 0; til < n_target; ++til) {
+            if ((int)target_swa_layers.size() > til && target_swa_layers[(size_t)til] == want_swa) {
+                best = til;
+            }
+        }
+        L.donor_target_layer = best;
+    }
+}
+
 // ─── free_gemma4_target_weights ──────────────────────────────────────────────
 
 void free_gemma4_target_weights(GemmaTargetWeights & w) {
