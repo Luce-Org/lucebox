@@ -866,20 +866,28 @@ int main(int argc, char ** argv) {
     }
     cudaSetDevice(gpu);
 
-    // Auto-disable CUDA VMM on small-VRAM GPUs (e.g. RTX 3090 24 GB) when the
-    // user has not set an explicit preference. The 32 GB VMM pool reservation
-    // fragments badly inside the last few hundred MB on a 24 GB card and
-    // causes prefill+verify cliffs (measured ~50% loss at ctx=64K). User can
-    // override with GGML_CUDA_NO_VMM=0.
+    // Detect <=24 GiB CUDA devices and emit a runtime warning if VMM is enabled.
+    // Note: GGML_CUDA_NO_VMM is compile-time only (CMake option that adds
+    // compile_definitions). Setting it via setenv() at runtime has no effect on
+    // ggml-cuda — it's not read via getenv. The real safeguard is to rebuild
+    // with `cmake -DGGML_CUDA_NO_VMM=ON ..`.
     {
-        cudaDeviceProp props;
-        if (cudaGetDeviceProperties(&props, gpu) == cudaSuccess) {
-            const size_t vram_gib = props.totalGlobalMem / (1024ull * 1024ull * 1024ull);
-            if (vram_gib <= 25 && std::getenv("GGML_CUDA_NO_VMM") == nullptr) {
-                ::setenv("GGML_CUDA_NO_VMM", "1", 1);
-                std::fprintf(stderr,
-                    "[auto] GGML_CUDA_NO_VMM=1 set (GPU has %zu GiB; override with GGML_CUDA_NO_VMM=0)\n",
-                    vram_gib);
+        int dev_count = 0;
+        if (cudaGetDeviceCount(&dev_count) == cudaSuccess) {
+            for (int i = 0; i < dev_count; ++i) {
+                cudaDeviceProp prop{};
+                if (cudaGetDeviceProperties(&prop, i) != cudaSuccess) continue;
+                const size_t gib = (size_t)(prop.totalGlobalMem / (1ull << 30));
+#ifndef GGML_CUDA_NO_VMM
+                if (gib <= 24) {
+                    std::fprintf(stderr,
+                        "[dflash] WARNING: detected CUDA device %d (%s) with %zu GiB VRAM.\n"
+                        "[dflash]          Long-context prefill on <=24 GiB cards is significantly\n"
+                        "[dflash]          slower with VMM enabled. Consider rebuilding with:\n"
+                        "[dflash]              cmake -DGGML_CUDA_NO_VMM=ON ..\n",
+                        i, prop.name, gib);
+                }
+#endif
             }
         }
     }

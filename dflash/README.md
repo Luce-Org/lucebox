@@ -328,6 +328,14 @@ DFLASH27B_KV_TQ3=1 DFLASH27B_PREFILL_UBATCH=16 \
 
 **Requirements:** NVIDIA sm_75+ GPU (2080 Ti, 3090, A10, A40, 4090) or Jetson AGX Thor sm_110, CUDA 12+ (CUDA 13+ required for Thor), 22+ GB VRAM, ~80 GB disk. On Turing (SM 7.5), BF16 draft weights are auto-converted to FP16 at load time for tensor core acceleration.
 
+### Small-VRAM cards (<=24 GiB)
+
+VMM-backed pools waste VRAM on cards under ~24 GiB. The 32 GB VMM pool reservation fragments badly on a 24 GB card and causes prefill+verify cliffs (measured ~50% throughput loss at ctx=64K). Build with:
+
+    cmake -DGGML_CUDA_NO_VMM=ON ..
+
+`GGML_CUDA_NO_VMM` is a **compile-time** CMake option — it cannot be set at runtime via environment variable. The dflash test binary prints a runtime warning if it detects <=24 GiB VRAM and the binary was built without this flag.
+
 ## How it works
 
 **Block-diffusion draft.** Each step, the draft sees `[last_target_token, MASK×15]` plus the last 5 captured target hidden states. It denoises the masks in a single forward, producing 16 candidate tokens conditioned on real target features. Structurally stronger than chain EAGLE: every position conditions on the same captured context, not its own noisy predictions.
