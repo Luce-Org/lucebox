@@ -22,30 +22,32 @@
 #include "internal.h"
 #include "dflash_graph.h"
 #include "qwen3_drafter.h"
-#include "laguna_daemon.h"  // arch dispatch — laguna targets are served by
-                            // dflash27b::run_laguna_daemon() instead of the
-                            // qwen35 + DFlash + DDTree pipeline below.
-#include "sampler.h"        // shared CPU sampler chain (SamplerCfg /
-                            // sample_logits / parse_sampler_token) used by
-                            // both arches; behaviour stays identical.
 
 #include "ggml.h"
-#include "gguf.h"  // gguf_init_from_file / gguf_find_key for arch detect
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 
-
 #include <cuda_runtime.h>
 
-// ggml-cuda dequantize: Q8_0/F16/BF16 → F32. Replaces the custom
-// f16_convert.cu kernels with ggml's built-in converter dispatch.
-using to_fp32_cuda_t = void (*)(const void *, float *, int64_t, cudaStream_t);
-to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
+// Half-precision → f32 widen kernel launchers (src/f16_convert.cu). Used by
+// the DDtree rollback (ssm_intermediate slot → cache.ssm_state) and the
+// drafter prep path (target_feat → sg.target_hidden_cat). We store the
+// per-token intermediate cache in f16 and the target_feat buffer in bf16 to
+// halve their memory footprint.
+extern "C" void dflash27b_launch_f16_to_f32(const void * src,
+                                            void * dst,
+                                            size_t n_elems,
+                                            cudaStream_t stream);
+extern "C" void dflash27b_launch_bf16_to_f32(const void * src,
+                                             void * dst,
+                                             size_t n_elems,
+                                             cudaStream_t stream);
 
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <condition_variable>
 #include <cmath>
 #include <cstdint>
 
@@ -58,7 +60,11 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 #if !defined(NOMINMAX)
 #define NOMINMAX
 #endif
+#if !defined(WIN32_LEAN_AND_MEAN)
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <io.h>
+#include <windows.h>
 #ifdef _WIN64
 #define ssize_t __int64
 #else
@@ -68,18 +74,20 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 #include <unistd.h>
 #endif
 
-#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <queue>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
-#include <random>
-#include <unordered_set>
 
 using namespace dflash27b;
 
@@ -93,6 +101,8 @@ using namespace dflash27b;
 #define IS_EOS_TOK(tok, w)                                         \
     ( ((w).eos_chat_id >= 0 && (tok) == (w).eos_chat_id)                  \
    || ((w).eos_id      >= 0 && (tok) == (w).eos_id     ) )
+
+static constexpr int PREFIX_CACHE_SLOTS = 8;
 
 // ─── Small utilities ──────────────────────────────────────────────
 
@@ -113,19 +123,196 @@ static bool write_int32_file(const std::string & path, const std::vector<int32_t
     return (bool)f;
 }
 
+#if defined(_WIN32)
+using StreamFd = uintptr_t;
+static constexpr StreamFd kInvalidStreamFd = static_cast<StreamFd>(-1);
+static StreamFd parse_stream_fd(const char * text) {
+    return static_cast<StreamFd>(_strtoui64(text, nullptr, 10));
+}
+#else
+using StreamFd = int;
+static constexpr StreamFd kInvalidStreamFd = -1;
+static StreamFd parse_stream_fd(const char * text) {
+    return std::atoi(text);
+}
+#endif
+
+static bool parse_int(const std::string & text, int & out) {
+    char * end = nullptr;
+    long value = std::strtol(text.c_str(), &end, 10);
+    if (end == text.c_str() || *end != '\0') return false;
+    out = static_cast<int>(value);
+    return true;
+}
+
+static bool parse_daemon_generate_command(const std::string & line,
+                                          std::string & prompt_path,
+                                          int & n_gen) {
+    const size_t tab = line.find('\t');
+    if (tab != std::string::npos) {
+        prompt_path = line.substr(0, tab);
+        return parse_int(line.substr(tab + 1), n_gen);
+    }
+
+    char ppath[1024];
+    int parsed_n_gen = 0;
+    if (std::sscanf(line.c_str(), "%1023s %d", ppath, &parsed_n_gen) != 2) {
+        return false;
+    }
+    prompt_path = ppath;
+    n_gen = parsed_n_gen;
+    return true;
+}
+
+static bool parse_daemon_compress_command(const std::string & line,
+                                          std::string & src_path,
+                                          int & keep_x1000,
+                                          std::string & drafter_path) {
+    constexpr const char * tab_prefix = "compress\t";
+    constexpr size_t tab_prefix_len = 9;
+    if (line.compare(0, tab_prefix_len, tab_prefix) == 0) {
+        const size_t first = line.find('\t', tab_prefix_len);
+        if (first == std::string::npos) return false;
+        const size_t second = line.find('\t', first + 1);
+        if (second == std::string::npos) return false;
+        src_path = line.substr(tab_prefix_len, first - tab_prefix_len);
+        if (!parse_int(line.substr(first + 1, second - first - 1), keep_x1000)) {
+            return false;
+        }
+        drafter_path = line.substr(second + 1);
+        return !src_path.empty() && !drafter_path.empty();
+    }
+
+    char ppath[1024];
+    char dpath[1024];
+    int parsed_keep = 0;
+    const int n = std::sscanf(line.c_str() + 9, "%1023s %d %1023s",
+                              ppath, &parsed_keep, dpath);
+    if (n != 3) return false;
+    src_path = ppath;
+    keep_x1000 = parsed_keep;
+    drafter_path = dpath;
+    return true;
+}
+
+static bool parse_daemon_continue_command(const std::string & line, int & n_gen) {
+    constexpr const char * cont_long = "CONTINUE";
+    constexpr const char * cont_short = "CONT";
+    size_t pos = std::string::npos;
+    if (line.rfind(cont_long, 0) == 0) {
+        pos = std::strlen(cont_long);
+    } else if (line.rfind(cont_short, 0) == 0) {
+        pos = std::strlen(cont_short);
+    } else {
+        return false;
+    }
+    if (pos >= line.size() || (line[pos] != ' ' && line[pos] != '\t' && line[pos] != '=')) {
+        return false;
+    }
+    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t' || line[pos] == '=')) pos++;
+    if (pos >= line.size()) return false;
+    return parse_int(line.substr(pos), n_gen);
+}
+
+static bool parse_daemon_start_command(const std::string & line,
+                                       std::string & prompt_path,
+                                       int & total_gen,
+                                       int & quantum) {
+    constexpr const char * start_kw = "START";
+    if (line.rfind(start_kw, 0) != 0) return false;
+    if (line.size() <= 5 || (line[5] != ' ' && line[5] != '\t')) return false;
+    char ppath[1024];
+    int parsed_total = 0;
+    int parsed_quantum = 0;
+    const int n = std::sscanf(line.c_str() + 5, "%1023s %d %d",
+                              ppath, &parsed_total, &parsed_quantum);
+    if (n != 3) return false;
+    prompt_path = ppath;
+    total_gen = parsed_total;
+    quantum = parsed_quantum;
+    return true;
+}
+
+static bool parse_daemon_slot_prefix(std::string & line, int & slot_id) {
+    slot_id = 0;
+    bool has_prefix = false;
+    size_t pos = 0;
+    if (line.rfind("SLOT", 0) == 0 || line.rfind("slot", 0) == 0) {
+        if (line.size() > 4 && (line[4] == ' ' || line[4] == '\t')) {
+            has_prefix = true;
+            pos = 5;
+        } else if (line.size() > 5 && line[4] == '=') {
+            has_prefix = true;
+            pos = 5;
+        }
+    }
+    if (!has_prefix) return true;
+
+    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) pos++;
+    if (pos >= line.size()) return false;
+
+    char * end = nullptr;
+    long parsed = std::strtol(line.c_str() + pos, &end, 10);
+    if (end == line.c_str() + pos || parsed < 0 || parsed > 1024) return false;
+    size_t end_pos = (size_t)(end - line.c_str());
+    if (end_pos >= line.size()) return false;
+    if (line[end_pos] != ' ' && line[end_pos] != '\t') return false;
+    while (end_pos < line.size() && (line[end_pos] == ' ' || line[end_pos] == '\t')) end_pos++;
+    if (end_pos >= line.size()) return false;
+    slot_id = (int)parsed;
+    line.erase(0, end_pos);
+    return true;
+}
+
+static bool parse_daemon_request_prefix(std::string & line, int & request_id) {
+    request_id = 0;
+    size_t prefix_len = 0;
+    if (line.rfind("REQ", 0) == 0) {
+        prefix_len = 3;
+    } else if (line.rfind("REQUEST", 0) == 0) {
+        prefix_len = 7;
+    } else {
+        return true;
+    }
+
+    size_t pos = prefix_len;
+    if (line.size() <= pos) return false;
+    if (line[pos] == '=') {
+        pos++;
+    } else if (line[pos] == ' ' || line[pos] == '\t') {
+        while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) pos++;
+    } else {
+        return true;
+    }
+    if (pos >= line.size()) return false;
+
+    char * end = nullptr;
+    long parsed = std::strtol(line.c_str() + pos, &end, 10);
+    if (end == line.c_str() + pos || parsed < 0 || parsed > 0x3fffffff) return false;
+
+    size_t end_pos = (size_t)(end - line.c_str());
+    while (end_pos < line.size() && (line[end_pos] == ' ' || line[end_pos] == '\t')) end_pos++;
+    if (end_pos >= line.size()) return false;
+    request_id = (int)parsed;
+    line.erase(0, end_pos);
+    return true;
+}
+
+static bool load_draft_auto(const std::string & path,
+                            ggml_backend_t backend,
+                            DraftWeights & out) {
+    if (path.size() >= 5 && path.substr(path.size() - 5) == ".gguf") {
+        return load_draft_gguf(path, backend, out);
+    }
+    return load_draft_safetensors(path, backend, out);
+}
+
 static int argmax_f32(const float * x, int n) {
     int best = 0;
     float bv = x[0];
     for (int i = 1; i < n; i++) if (x[i] > bv) { bv = x[i]; best = i; }
     return best;
 }
-
-// CPU sampler chain (SamplerCfg / sample_logits / parse_sampler_token) lives
-// in src/sampler.{h,cpp} and is shared with src/laguna_daemon.cpp. Behaviour
-// is unchanged: greedy when cfg.temp <= 0, otherwise rep_penalty -> top_k ->
-// softmax(temp) -> top_p -> draw. The DDTree skeleton itself stays argmax to
-// keep the accept rate intact; sample_logits only runs at committed-token
-// sites when ` samp=` was on the request line.
 
 // ggml_flash_attn_ext expects kv_len aligned to KQ_MASK_PAD (32) on the
 // f16/Q* paths, and to FATTN_KQ_STRIDE (256) on the TurboQuant FA paths.
@@ -189,8 +376,10 @@ static void extract_draft_topk(const float * logits,
     // pure best-first picks shallow bushy trees instead of going deep.
     const float inv_t = 1.0f / std::max(1e-3f, temperature);
 
-    // Parallelize across positions — each i is independent.
+    // Parallelize across positions when OpenMP is enabled — each i is independent.
+#ifdef _OPENMP
     #pragma omp parallel for schedule(static)
+#endif
     for (int i = 0; i < n_positions; i++) {
         const float * li = logits + (size_t)i * vocab;
         std::vector<Entry> heap;
@@ -428,8 +617,7 @@ static DDTree build_ddtree(const float * top_log_probs,
 // deepest accepted node, which didn't match any of that node's children).
 static std::vector<int> follow_verified_tree(const DDTree & tree,
                                              const int32_t * posterior,
-                                             int & out_next_token,
-                                             int * out_node_idx = nullptr) {
+                                             int & out_next_token) {
     std::vector<int> accepted;
     accepted.reserve(tree.n_nodes + 1);
     accepted.push_back(0);
@@ -445,7 +633,6 @@ static std::vector<int> follow_verified_tree(const DDTree & tree,
         next_token = posterior[current_index];
     }
     out_next_token = next_token;
-    if (out_node_idx) *out_node_idx = current_index;
     return accepted;
 }
 
@@ -514,6 +701,542 @@ struct DraftFeatureMirror {
     int device = 0;
     int target_device = 0;
     int cap = 0;
+};
+
+struct DaemonSlotState {
+    TargetCache cache;
+    PrefixSnapshot prefix_snapshots[PREFIX_CACHE_SLOTS];
+    StepGraph sg;
+    StepGraph draft_sg;
+    StepGraph proj_sg;
+    DraftFeatureMirror feature_mirror;
+    bool first_iter = true;
+};
+
+struct DaemonRequestState {
+    bool active = false;
+    int request_id = 0;
+    int slot_id = 0;
+    int remaining = 0;
+    int quantum = 0;
+    int emitted = 0;
+    int epoch = 0;
+};
+
+struct DaemonPendingQuantum {
+    int request_id = 0;
+    int slot_id = 0;
+    int epoch = 0;
+    int n_gen = 0;
+};
+
+struct DaemonSlotRuntimeRef {
+    int slot_id = 0;
+    TargetCache * cache = nullptr;
+    StepGraph * sg = nullptr;
+    StepGraph * draft_sg = nullptr;
+    StepGraph * proj_sg = nullptr;
+    DraftFeatureMirror * feature_mirror = nullptr;
+    bool * first_iter = nullptr;
+};
+
+struct DaemonBatchCandidate {
+    int request_id = 0;
+    int slot_id = 0;
+    int epoch = 0;
+    int n_gen = 0;
+    int remaining = 0;
+    DaemonSlotRuntimeRef runtime;
+};
+
+struct DaemonAlignedBucketSelection {
+    std::vector<DaemonBatchCandidate> batch;
+    int kv_start = -1;
+    int considered = 0;
+    int eligible = 0;
+    int ineligible = 0;
+    int buckets = 0;
+    int singleton_buckets = 0;
+    int front_kv_start = -1;
+    int front_bucket_size = 0;
+    int blocked_by_front_singleton = 0;
+    int last_selected_slot_id = -1;
+    bool tail_only = false;
+};
+
+static DaemonAlignedBucketSelection select_aligned_scheduler_bucket(
+    const std::vector<DaemonBatchCandidate> & candidates,
+    int max_batch,
+    bool tail_only) {
+    DaemonAlignedBucketSelection out{};
+    out.tail_only = tail_only;
+    out.considered = (int)candidates.size();
+    if (max_batch < 2 || candidates.empty()) return out;
+
+    std::unordered_map<int, std::vector<size_t>> by_pos;
+    std::vector<int> pos_order;
+    for (size_t i = 0; i < candidates.size(); i++) {
+        const DaemonBatchCandidate & candidate = candidates[i];
+        TargetCache * c = candidate.runtime.cache;
+        if (!c || c->cur_pos <= 0 || c->last_tok < 0
+            || candidate.remaining <= 0
+            || (tail_only && candidate.remaining != 1)) {
+            out.ineligible++;
+            continue;
+        }
+        out.eligible++;
+        const int pos = c->cur_pos;
+        auto it = by_pos.find(pos);
+        if (it == by_pos.end()) {
+            pos_order.push_back(pos);
+            it = by_pos.emplace(pos, std::vector<size_t>{}).first;
+        }
+        if (out.front_kv_start < 0) out.front_kv_start = pos;
+        it->second.push_back(i);
+    }
+
+    out.buckets = (int)pos_order.size();
+    for (int pos : pos_order) {
+        const int bucket_size = (int)by_pos[pos].size();
+        if (bucket_size == 1) out.singleton_buckets++;
+        if (pos == out.front_kv_start) out.front_bucket_size = bucket_size;
+    }
+
+    if (out.front_kv_start < 0) return out;
+    if (out.front_bucket_size < 2) {
+        out.blocked_by_front_singleton = out.front_bucket_size == 1 ? 1 : 0;
+        return out;
+    }
+
+    const std::vector<size_t> & selected = by_pos[out.front_kv_start];
+    const int n = std::min(max_batch, (int)selected.size());
+    if (n < 2) return out;
+    out.kv_start = out.front_kv_start;
+    out.batch.reserve((size_t)n);
+    for (int i = 0; i < n; i++) {
+        const DaemonBatchCandidate & candidate = candidates[selected[(size_t)i]];
+        out.batch.push_back(candidate);
+        out.last_selected_slot_id = candidate.slot_id;
+    }
+    return out;
+}
+
+static void print_aligned_bucket_log(const DaemonAlignedBucketSelection & selection,
+                                     int max_batch) {
+    const bool ready = (int)selection.batch.size() >= 2;
+    std::printf("[scheduler] aligned_bucket_%s count=%d kv_start=%d buckets=%d considered=%d eligible=%d ineligible=%d singleton_buckets=%d front_kv_start=%d front_bucket_size=%d blocked_by_front_singleton=%d max_batch=%d tail_only=%d",
+                ready ? "ready" : "miss",
+                (int)selection.batch.size(),
+                selection.kv_start,
+                selection.buckets,
+                selection.considered,
+                selection.eligible,
+                selection.ineligible,
+                selection.singleton_buckets,
+                selection.front_kv_start,
+                selection.front_bucket_size,
+                selection.blocked_by_front_singleton,
+                max_batch,
+                (int)selection.tail_only);
+    for (const DaemonBatchCandidate & candidate : selection.batch) {
+        std::printf(" req=%d:slot=%d:epoch=%d:n=%d:remaining=%d",
+                    candidate.request_id,
+                    candidate.slot_id,
+                    candidate.epoch,
+                    candidate.n_gen,
+                    candidate.remaining);
+    }
+    std::printf("\n");
+    std::fflush(stdout);
+}
+
+static size_t next_cursor_after_aligned_batch(
+    const DaemonAlignedBucketSelection & selection,
+    size_t n_slots,
+    size_t current_cursor) {
+    if (n_slots == 0 || selection.last_selected_slot_id < 0) {
+        return current_cursor;
+    }
+    return ((size_t)selection.last_selected_slot_id + 1) % n_slots;
+}
+
+static int run_scheduler_bucket_selftest() {
+    auto make_candidates = [](
+        const std::vector<int> & positions,
+        const std::vector<int> & last_tokens,
+        const std::vector<int> & remaining) {
+        std::vector<TargetCache> caches(positions.size());
+        std::vector<DaemonBatchCandidate> candidates;
+        candidates.reserve(positions.size());
+        for (size_t i = 0; i < positions.size(); i++) {
+            caches[i].cur_pos = positions[i];
+            caches[i].last_tok = last_tokens[i];
+            DaemonSlotRuntimeRef runtime{};
+            runtime.slot_id = (int)i;
+            runtime.cache = &caches[i];
+            candidates.push_back(DaemonBatchCandidate{
+                (int)i + 1,
+                (int)i,
+                1,
+                1,
+                remaining[i],
+                runtime});
+        }
+        return std::pair<std::vector<TargetCache>,
+                         std::vector<DaemonBatchCandidate>>(
+            std::move(caches), std::move(candidates));
+    };
+    auto require_true = [](bool ok, const char * label) {
+        if (!ok) std::fprintf(stderr, "[scheduler-test] failed: %s\n", label);
+        return ok;
+    };
+
+    {
+        auto data = make_candidates({17, 17, 10}, {1, 2, 3}, {4, 4, 4});
+        DaemonAlignedBucketSelection sel =
+            select_aligned_scheduler_bucket(data.second, 2, false);
+        if (!require_true(sel.batch.size() == 2
+                          && sel.kv_start == 17
+                          && sel.buckets == 2
+                          && sel.singleton_buckets == 1,
+                          "front aligned bucket selected")) return 1;
+    }
+    {
+        auto data = make_candidates({10, 17}, {1, 2}, {4, 4});
+        DaemonAlignedBucketSelection sel =
+            select_aligned_scheduler_bucket(data.second, 2, false);
+        if (!require_true(sel.batch.empty()
+                          && sel.blocked_by_front_singleton == 1,
+                          "singleton front falls back")) return 1;
+    }
+    {
+        auto data = make_candidates({20, 20, 20}, {1, 2, 3}, {2, 1, 1});
+        DaemonAlignedBucketSelection sel =
+            select_aligned_scheduler_bucket(data.second, 2, true);
+        if (!require_true(sel.batch.size() == 2
+                          && sel.eligible == 2
+                          && sel.ineligible == 1
+                          && sel.kv_start == 20,
+                          "tail_only filters remaining != 1")) return 1;
+    }
+    {
+        auto data = make_candidates({0, 18, 18}, {-1, 7, 8}, {1, 1, 1});
+        DaemonAlignedBucketSelection sel =
+            select_aligned_scheduler_bucket(data.second, 2, false);
+        if (!require_true(sel.batch.size() == 2
+                          && sel.eligible == 2
+                          && sel.ineligible == 1,
+                          "invalid cur_pos/last_tok filtered")) return 1;
+    }
+    {
+        auto data = make_candidates({10, 17, 17}, {1, 2, 3}, {4, 4, 4});
+        DaemonAlignedBucketSelection sel =
+            select_aligned_scheduler_bucket(data.second, 2, false);
+        if (!require_true(sel.batch.empty()
+                          && sel.front_kv_start == 10
+                          && sel.front_bucket_size == 1
+                          && sel.blocked_by_front_singleton == 1,
+                          "fairness blocks tail bucket behind singleton")) return 1;
+    }
+    {
+        auto data = make_candidates({17, 17, 17}, {1, 2, 3}, {4, 4, 4});
+        DaemonAlignedBucketSelection sel =
+            select_aligned_scheduler_bucket(data.second, 2, false);
+        size_t next = next_cursor_after_aligned_batch(sel, 3, 0);
+        if (!require_true(sel.batch.size() == 2
+                          && sel.last_selected_slot_id == 1
+                          && next == 2,
+                          "cursor advances after last selected slot")) return 1;
+    }
+
+    std::printf("[scheduler-test] aligned bucket selftest ok\n");
+    std::fflush(stdout);
+    return 0;
+}
+
+static bool cuda_copy_bytes_d2d(const void * src, void * dst, size_t bytes) {
+    if (bytes == 0) return true;
+    cudaError_t err = cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToDevice);
+    if (err != cudaSuccess) {
+        std::fprintf(stderr, "cudaMemcpy D2D failed: %s\n",
+                     cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+static bool copy_target_cache_to_batch_slot(const TargetCache & src,
+                                            TargetCache & dst,
+                                            int seq_idx) {
+    if (seq_idx < 0) return false;
+    if (src.attn_k.size() != dst.attn_k.size()
+        || src.attn_v.size() != dst.attn_v.size()
+        || src.ssm_state.size() != dst.ssm_state.size()
+        || src.conv_state.size() != dst.conv_state.size()) {
+        std::fprintf(stderr, "[scheduler] batch probe cache shape mismatch\n");
+        return false;
+    }
+
+    for (size_t i = 0; i < src.attn_k.size(); i++) {
+        ggml_tensor * sk = src.attn_k[i];
+        ggml_tensor * sv = src.attn_v[i];
+        ggml_tensor * dk = dst.attn_k[i];
+        ggml_tensor * dv = dst.attn_v[i];
+        if (!sk || !sv || !dk || !dv || dk->ne[3] <= seq_idx || dv->ne[3] <= seq_idx) {
+            std::fprintf(stderr, "[scheduler] batch probe invalid KV tensor\n");
+            return false;
+        }
+        const int n_kv = (int)sk->ne[2];
+        if (dk->ne[0] != sk->ne[0] || dk->ne[1] != sk->ne[1]
+            || dk->ne[2] != sk->ne[2] || dv->ne[0] != sv->ne[0]
+            || dv->ne[1] != sv->ne[1] || dv->ne[2] != sv->ne[2]) {
+            std::fprintf(stderr, "[scheduler] batch probe KV dims mismatch\n");
+            return false;
+        }
+        for (int h = 0; h < n_kv; h++) {
+            const size_t k_src_off = (size_t)h * sk->nb[2];
+            const size_t k_dst_off = (size_t)seq_idx * dk->nb[3] + (size_t)h * dk->nb[2];
+            const size_t v_src_off = (size_t)h * sv->nb[2];
+            const size_t v_dst_off = (size_t)seq_idx * dv->nb[3] + (size_t)h * dv->nb[2];
+            if (!cuda_copy_bytes_d2d((const char *)sk->data + k_src_off,
+                                     (char *)dk->data + k_dst_off,
+                                     (size_t)sk->nb[2])) return false;
+            if (!cuda_copy_bytes_d2d((const char *)sv->data + v_src_off,
+                                     (char *)dv->data + v_dst_off,
+                                     (size_t)sv->nb[2])) return false;
+        }
+    }
+
+    for (size_t i = 0; i < src.ssm_state.size(); i++) {
+        ggml_tensor * ss = src.ssm_state[i];
+        ggml_tensor * ds = dst.ssm_state[i];
+        ggml_tensor * sc = src.conv_state[i];
+        ggml_tensor * dc = dst.conv_state[i];
+        if (!ss || !ds || !sc || !dc || ds->ne[3] <= seq_idx || dc->ne[2] <= seq_idx) {
+            std::fprintf(stderr, "[scheduler] batch probe invalid DeltaNet tensor\n");
+            return false;
+        }
+        if (!cuda_copy_bytes_d2d(ss->data,
+                                 (char *)ds->data + (size_t)seq_idx * ds->nb[3],
+                                 ggml_nbytes(ss))) return false;
+        if (!cuda_copy_bytes_d2d(sc->data,
+                                 (char *)dc->data + (size_t)seq_idx * dc->nb[2],
+                                 ggml_nbytes(sc))) return false;
+    }
+    if (src.target_feat && dst.target_feat) {
+        if (dst.target_feat->ne[2] <= seq_idx
+            || src.target_feat->ne[0] != dst.target_feat->ne[0]
+            || src.target_feat->ne[1] != dst.target_feat->ne[1]
+            || ggml_nbytes(src.target_feat) > (size_t)dst.target_feat->nb[2]) {
+            std::fprintf(stderr, "[scheduler] batch probe target_feat dims mismatch\n");
+            return false;
+        }
+        if (!cuda_copy_bytes_d2d(
+                src.target_feat->data,
+                (char *)dst.target_feat->data + (size_t)seq_idx * dst.target_feat->nb[2],
+                ggml_nbytes(src.target_feat))) return false;
+    }
+    return true;
+}
+
+static bool copy_target_cache_to_single_cache(const TargetCache & src,
+                                              TargetCache & dst) {
+    if (src.max_ctx != dst.max_ctx
+        || src.kv_k_type != dst.kv_k_type
+        || src.kv_v_type != dst.kv_v_type
+        || src.attn_k.size() != dst.attn_k.size()
+        || src.attn_v.size() != dst.attn_v.size()
+        || src.ssm_state.size() != dst.ssm_state.size()
+        || src.conv_state.size() != dst.conv_state.size()) {
+        std::fprintf(stderr, "[scheduler] batch reference cache shape mismatch\n");
+        return false;
+    }
+
+    for (size_t i = 0; i < src.attn_k.size(); i++) {
+        ggml_tensor * sk = src.attn_k[i];
+        ggml_tensor * sv = src.attn_v[i];
+        ggml_tensor * dk = dst.attn_k[i];
+        ggml_tensor * dv = dst.attn_v[i];
+        if (!sk || !sv || !dk || !dv
+            || ggml_nbytes(sk) != ggml_nbytes(dk)
+            || ggml_nbytes(sv) != ggml_nbytes(dv)) {
+            std::fprintf(stderr, "[scheduler] batch reference invalid KV tensor\n");
+            return false;
+        }
+        if (!cuda_copy_bytes_d2d(sk->data, dk->data, ggml_nbytes(sk))) return false;
+        if (!cuda_copy_bytes_d2d(sv->data, dv->data, ggml_nbytes(sv))) return false;
+    }
+
+    for (size_t i = 0; i < src.ssm_state.size(); i++) {
+        ggml_tensor * ss = src.ssm_state[i];
+        ggml_tensor * sc = src.conv_state[i];
+        ggml_tensor * ds = dst.ssm_state[i];
+        ggml_tensor * dc = dst.conv_state[i];
+        if (!ss || !sc || !ds || !dc
+            || ggml_nbytes(ss) != ggml_nbytes(ds)
+            || ggml_nbytes(sc) != ggml_nbytes(dc)) {
+            std::fprintf(stderr, "[scheduler] batch reference invalid DeltaNet tensor\n");
+            return false;
+        }
+        if (!cuda_copy_bytes_d2d(ss->data, ds->data, ggml_nbytes(ss))) return false;
+        if (!cuda_copy_bytes_d2d(sc->data, dc->data, ggml_nbytes(sc))) return false;
+    }
+
+    dst.cur_pos  = src.cur_pos;
+    dst.last_tok = src.last_tok;
+    if (src.target_feat && dst.target_feat) {
+        if (ggml_nbytes(src.target_feat) != ggml_nbytes(dst.target_feat)) {
+            std::fprintf(stderr, "[scheduler] batch reference target_feat dims mismatch\n");
+            return false;
+        }
+        if (!cuda_copy_bytes_d2d(src.target_feat->data, dst.target_feat->data,
+                                 ggml_nbytes(src.target_feat))) return false;
+    }
+    return true;
+}
+
+static bool copy_batch_slot_to_target_cache(const TargetCache & src,
+                                            int seq_idx,
+                                            TargetCache & dst) {
+    if (seq_idx < 0
+        || src.max_ctx != dst.max_ctx
+        || src.kv_k_type != dst.kv_k_type
+        || src.kv_v_type != dst.kv_v_type
+        || src.attn_k.size() != dst.attn_k.size()
+        || src.attn_v.size() != dst.attn_v.size()
+        || src.ssm_state.size() != dst.ssm_state.size()
+        || src.conv_state.size() != dst.conv_state.size()) {
+        std::fprintf(stderr, "[scheduler] batch commit cache shape mismatch\n");
+        return false;
+    }
+
+    for (size_t i = 0; i < dst.attn_k.size(); i++) {
+        ggml_tensor * sk = src.attn_k[i];
+        ggml_tensor * sv = src.attn_v[i];
+        ggml_tensor * dk = dst.attn_k[i];
+        ggml_tensor * dv = dst.attn_v[i];
+        if (!sk || !sv || !dk || !dv
+            || sk->ne[3] <= seq_idx
+            || sk->ne[0] != dk->ne[0] || sk->ne[1] != dk->ne[1]
+            || sk->ne[2] != dk->ne[2]
+            || sv->ne[3] <= seq_idx
+            || sv->ne[0] != dv->ne[0] || sv->ne[1] != dv->ne[1]
+            || sv->ne[2] != dv->ne[2]) {
+            std::fprintf(stderr, "[scheduler] batch commit invalid KV tensor\n");
+            return false;
+        }
+        const int n_kv = (int)dk->ne[2];
+        for (int h = 0; h < n_kv; h++) {
+            const size_t k_src_off = (size_t)seq_idx * sk->nb[3] + (size_t)h * sk->nb[2];
+            const size_t k_dst_off = (size_t)h * dk->nb[2];
+            const size_t v_src_off = (size_t)seq_idx * sv->nb[3] + (size_t)h * sv->nb[2];
+            const size_t v_dst_off = (size_t)h * dv->nb[2];
+            if (!cuda_copy_bytes_d2d((const char *)sk->data + k_src_off,
+                                     (char *)dk->data + k_dst_off,
+                                     (size_t)dk->nb[2])) return false;
+            if (!cuda_copy_bytes_d2d((const char *)sv->data + v_src_off,
+                                     (char *)dv->data + v_dst_off,
+                                     (size_t)dv->nb[2])) return false;
+        }
+    }
+
+    for (size_t i = 0; i < dst.ssm_state.size(); i++) {
+        ggml_tensor * ss = src.ssm_state[i];
+        ggml_tensor * sc = src.conv_state[i];
+        ggml_tensor * ds = dst.ssm_state[i];
+        ggml_tensor * dc = dst.conv_state[i];
+        if (!ss || !sc || !ds || !dc
+            || ss->ne[3] <= seq_idx
+            || sc->ne[2] <= seq_idx
+            || ggml_nbytes(ds) > (size_t)ss->nb[3]
+            || ggml_nbytes(dc) > (size_t)sc->nb[2]) {
+            std::fprintf(stderr, "[scheduler] batch commit invalid DeltaNet tensor\n");
+            return false;
+        }
+        if (!cuda_copy_bytes_d2d((const char *)ss->data + (size_t)seq_idx * ss->nb[3],
+                                 ds->data,
+                                 ggml_nbytes(ds))) return false;
+        if (!cuda_copy_bytes_d2d((const char *)sc->data + (size_t)seq_idx * sc->nb[2],
+                                 dc->data,
+                                 ggml_nbytes(dc))) return false;
+    }
+    if (src.target_feat && dst.target_feat) {
+        if (src.target_feat->ne[2] <= seq_idx
+            || src.target_feat->ne[0] != dst.target_feat->ne[0]
+            || src.target_feat->ne[1] != dst.target_feat->ne[1]
+            || ggml_nbytes(dst.target_feat) > (size_t)src.target_feat->nb[2]) {
+            std::fprintf(stderr, "[scheduler] batch commit target_feat dims mismatch\n");
+            return false;
+        }
+        if (!cuda_copy_bytes_d2d(
+                (const char *)src.target_feat->data + (size_t)seq_idx * src.target_feat->nb[2],
+                dst.target_feat->data,
+                ggml_nbytes(dst.target_feat))) return false;
+    }
+    return true;
+}
+
+static void swap_daemon_slot_state(TargetCache & cache,
+                                   PrefixSnapshot (&prefix_snapshots)[PREFIX_CACHE_SLOTS],
+                                   StepGraph & sg,
+                                   StepGraph & draft_sg,
+                                   StepGraph & proj_sg,
+                                   DraftFeatureMirror & feature_mirror,
+                                   bool & first_iter,
+                                   DaemonSlotState & slot) {
+    using std::swap;
+    swap(cache, slot.cache);
+    for (int i = 0; i < PREFIX_CACHE_SLOTS; i++) {
+        swap(prefix_snapshots[i], slot.prefix_snapshots[i]);
+    }
+    swap(sg, slot.sg);
+    swap(draft_sg, slot.draft_sg);
+    swap(proj_sg, slot.proj_sg);
+    swap(feature_mirror, slot.feature_mirror);
+    swap(first_iter, slot.first_iter);
+}
+
+struct ActiveDaemonSlot {
+    TargetCache & cache;
+    PrefixSnapshot (&prefix_snapshots)[PREFIX_CACHE_SLOTS];
+    StepGraph & sg;
+    StepGraph & draft_sg;
+    StepGraph & proj_sg;
+    DraftFeatureMirror & feature_mirror;
+    bool & first_iter;
+    DaemonSlotState * slot = nullptr;
+
+    ActiveDaemonSlot(TargetCache & cache_,
+                     PrefixSnapshot (&prefix_snapshots_)[PREFIX_CACHE_SLOTS],
+                     StepGraph & sg_,
+                     StepGraph & draft_sg_,
+                     StepGraph & proj_sg_,
+                     DraftFeatureMirror & feature_mirror_,
+                     bool & first_iter_,
+                     DaemonSlotState * slot_)
+        : cache(cache_),
+          prefix_snapshots(prefix_snapshots_),
+          sg(sg_),
+          draft_sg(draft_sg_),
+          proj_sg(proj_sg_),
+          feature_mirror(feature_mirror_),
+          first_iter(first_iter_),
+          slot(slot_) {
+        if (slot) {
+            swap_daemon_slot_state(cache, prefix_snapshots, sg, draft_sg,
+                                   proj_sg, feature_mirror, first_iter, *slot);
+        }
+    }
+
+    ActiveDaemonSlot(const ActiveDaemonSlot &) = delete;
+    ActiveDaemonSlot & operator=(const ActiveDaemonSlot &) = delete;
+
+    ~ActiveDaemonSlot() {
+        if (slot) {
+            swap_daemon_slot_state(cache, prefix_snapshots, sg, draft_sg,
+                                   proj_sg, feature_mirror, first_iter, *slot);
+        }
+    }
 };
 
 static bool enable_peer_access_one_way(int device, int peer) {
@@ -664,10 +1387,9 @@ static bool draft_feature_mirror_sync_range(const TargetCache & cache,
             (const char *)cache.target_feat->data + (size_t)src_slot * src_stride;
         void * dst =
             (char *)mirror.target_feat->data + (size_t)dst_slot * dst_stride;
-        auto bf16_to_f32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
         if (mirror.device == mirror.target_device) {
             cudaSetDevice(mirror.device);
-            bf16_to_f32(src, (float *)dst, (int64_t)elems, nullptr);
+            dflash27b_launch_bf16_to_f32(src, dst, elems, nullptr);
         } else {
             DraftFeatureMirror & mutable_mirror =
                 const_cast<DraftFeatureMirror &>(mirror);
@@ -678,7 +1400,7 @@ static bool draft_feature_mirror_sync_range(const TargetCache & cache,
                 return false;
             }
             cudaSetDevice(mirror.device);
-            bf16_to_f32(mirror.bf16_staging, (float *)dst, (int64_t)elems, nullptr);
+            dflash27b_launch_bf16_to_f32(mirror.bf16_staging, dst, elems, nullptr);
         }
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) return false;
@@ -722,6 +1444,21 @@ static void step_graph_free(StepGraph & sg) {
 static void step_graph_destroy(StepGraph & sg) {
     if (sg.alloc) { ggml_gallocr_free(sg.alloc); sg.alloc = nullptr; }
     step_graph_free(sg);
+}
+
+static void scrub_daemon_slot_state(
+    TargetCache & cache,
+    StepGraph & sg,
+    StepGraph & draft_sg,
+    StepGraph & proj_sg,
+    DraftFeatureMirror & feature_mirror,
+    bool & first_iter) {
+    step_graph_free(sg);
+    step_graph_free(draft_sg);
+    step_graph_free(proj_sg);
+    draft_feature_mirror_free(feature_mirror);
+    reset_target_cache(cache);
+    first_iter = true;
 }
 
 // Build a single-layer forward graph for layer-segmented prefill.
@@ -829,8 +1566,7 @@ static bool build_target_step(
     bool with_mask,
     bool capture,
     bool capture_delta_intermediate = false,
-    int fa_window = 0,
-    bool last_token_logits_only = false) {
+    int fa_window = 0) {
     step_graph_free(sg);
 
     ggml_init_params ip{};
@@ -874,7 +1610,6 @@ static bool build_target_step(
     gi.capture_layers             = capture;
     gi.capture_delta_intermediate = capture_delta_intermediate;
     gi.fa_window                  = fa_window;
-    gi.last_token_logits_only     = last_token_logits_only;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
@@ -884,6 +1619,63 @@ static bool build_target_step(
 
     sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
     ggml_set_name(sg.argmax_tokens, "chain_verify_argmax");
+    ggml_set_output(sg.argmax_tokens);
+    ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
+
+    if (!sg.alloc) {
+        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+}
+
+static bool build_target_batch_probe_step(
+    StepGraph & sg,
+    const TargetWeights & w,
+    TargetCache & cache,
+    ggml_backend_t backend,
+    int kv_start,
+    int n_seqs,
+    bool capture_layers = false) {
+    step_graph_free(sg);
+    if (n_seqs <= 1) return false;
+
+    ggml_init_params ip{};
+    ip.mem_size   = 512 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    sg.ctx = ggml_init(ip);
+    if (!sg.ctx) return false;
+
+    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32,
+                                      hidden, /*n_tokens=*/1, n_seqs);
+    ggml_set_name(sg.inp_embed, "batch_probe_inp_embed");
+    ggml_set_input(sg.inp_embed);
+
+    sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4);
+    ggml_set_name(sg.positions, "batch_probe_positions");
+    ggml_set_input(sg.positions);
+
+    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+
+    QwenGraphInputs gi{};
+    gi.inp_embed                  = sg.inp_embed;
+    gi.positions                  = sg.positions;
+    gi.attn_mask                  = nullptr;
+    gi.n_tokens                   = 1;
+    gi.n_seqs                     = n_seqs;
+    gi.kv_start                   = kv_start;
+    gi.capture_layers             = capture_layers;
+    gi.capture_delta_intermediate = false;
+    gi.fa_window                  = 0;
+
+    QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
+    if (!go.logits) return false;
+    sg.logits = go.logits;
+    ggml_set_output(sg.logits);
+
+    sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
+    ggml_set_name(sg.argmax_tokens, "batch_probe_argmax");
     ggml_set_output(sg.argmax_tokens);
     ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
 
@@ -1019,6 +1811,12 @@ static bool build_draft_step(
     ggml_set_name(sg.positions_k, "positions_k");
     ggml_set_input(sg.positions_k);
 
+    if (draft_graph_needs_swa_mask(dw, ctx_len)) {
+        sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, ctx_len + q_len, q_len);
+        ggml_set_name(sg.attn_mask, "draft_swa_mask");
+        ggml_set_input(sg.attn_mask);
+    }
+
     sg.gf = ggml_new_graph_custom(sg.ctx, 4096, false);
 
     DraftGraphInputs gi{};
@@ -1027,6 +1825,7 @@ static bool build_draft_step(
     gi.target_hidden_cat = sg.target_hidden_cat;
     gi.positions_q       = sg.positions;
     gi.positions_k       = sg.positions_k;
+    gi.attn_mask         = sg.attn_mask;
     gi.lm_head           = tw ? tw->output : nullptr; // project through target.output when local
     DraftGraphOutputs go = build_draft_graph(sg.ctx, dw, gi);
     sg.hidden_states = go.hidden_states;
@@ -1075,10 +1874,7 @@ static bool build_lm_head_projection_step(
     sg.logits = ggml_mul_mat(sg.ctx, w.output, sg.hidden_input);
     ggml_set_name(sg.logits, "draft_projected_logits");
     ggml_set_output(sg.logits);
-    sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
-    ggml_set_name(sg.argmax_tokens, "draft_projected_argmax");
-    ggml_set_output(sg.argmax_tokens);
-    ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
+    ggml_build_forward_expand(sg.gf, sg.logits);
 
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -1997,13 +2793,13 @@ static int run_target_layer_split_harness(
 
 // ─── Main ─────────────────────────────────────────────────────────
 
-static SamplerCfg     g_sampler;
-static std::mt19937_64 g_sampler_rng{std::random_device{}()};
-
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--test-scheduler-buckets") == 0) {
+        return run_scheduler_bucket_selftest();
+    }
     if (argc < 3) {
         std::fprintf(stderr,
-            "usage: %s <target.gguf> <draft.safetensors> [<prompt_ids.bin> <n_gen> <out_ids.bin>] [--daemon] [-ctk <type>] [-ctv <type>] ...\n", argv[0]);
+            "usage: %s <target.gguf> <draft.safetensors|draft.gguf> [<prompt_ids.bin> <n_gen> <out_ids.bin>] [--daemon] [--synthetic-prompt-tokens N --n-gen N --out out.bin] [-ctk <type>] [-ctv <type>] [--target-gpu N] [--draft-gpu N] [--target-cache-slots N] [--stream-tagged] ...\n       %s --test-scheduler-buckets\n", argv[0], argv[0]);
         return 2;
     }
     // TurboQuant FA kernel requires kv_len aligned to FATTN_KQ_STRIDE=256.
@@ -2024,42 +2820,11 @@ int main(int argc, char ** argv) {
         g_draft_ctx_max = std::max(0, std::atoi(s));
     }
     const char * target_path = argv[1];
-
-    // ---- Architecture detection ------------------------------------------
-    // Read general.architecture from the target GGUF before parsing argv
-    // shape so we can route laguna requests to run_laguna_daemon() and
-    // accept the no-draft argv layout server.py uses for that arch.
-    auto peek_gguf_arch = [&](const char * path) -> std::string {
-        gguf_init_params gip{};
-        gip.no_alloc = true;
-        gip.ctx = nullptr;
-        gguf_context * gctx = gguf_init_from_file(path, gip);
-        if (!gctx) return std::string();
-        std::string out;
-        const int64_t kid = gguf_find_key(gctx, "general.architecture");
-        if (kid >= 0) {
-            const char * v = gguf_get_val_str(gctx, kid);
-            if (v) out = v;
-        }
-        gguf_free(gctx);
-        return out;
-    };
-    const std::string detected_arch = peek_gguf_arch(target_path);
-    const bool is_laguna = (detected_arch == "laguna");
-
-    // When arch == laguna there is no DFlash draft model (Poolside hasn't
-    // released one); server.py omits --draft from the spawn cmd. Accept the
-    // shorter argv layout: argv[1] = target, argv[2..] = flags. Same fall-
-    // back applies if the user manually drops the draft (argv[2] starts with
-    // a dash) on any arch — keeps the binary friendly to ad-hoc invocation.
-    const bool no_draft_layout = is_laguna || (argc >= 3 && argv[2][0] == '-');
-    const char * draft_path  = no_draft_layout ? nullptr : argv[2];
-    const int    flags_start = no_draft_layout ? 2 : 3;
-    const bool   has_positional_args =
-        (!no_draft_layout) && (argc >= 6 && argv[3][0] != '-');
-    const char * prompt_path = has_positional_args ? argv[3] : nullptr;
-    int          n_gen       = has_positional_args ? std::atoi(argv[4]) : 0;
-    const char * out_path    = has_positional_args ? argv[5] : nullptr;
+    const char * draft_path  = argv[2];
+    const char * prompt_path = (argc >= 6 && argv[3][0] != '-') ? argv[3] : nullptr;
+    int          n_gen       = (argc >= 6 && argv[3][0] != '-') ? std::atoi(argv[4]) : 0;
+    const char * out_path    = (argc >= 6 && argv[3][0] != '-') ? argv[5] : nullptr;
+    std::string out_path_storage;
     // --seq-verify: run the target verify as q_len independent single-token
     // decodes instead of one batched forward with a causal mask. Isolates
     // the correctness-of-batched-verify hypothesis from z-lab issue #57.
@@ -2083,33 +2848,21 @@ int main(int argc, char ** argv) {
     bool  profile_scaling = false;  // microbench: time target forward at varying N
     bool  test_window_mode = false;
     bool  draft_feature_mirror = false;
-    bool  target_split_load_draft = false;
-    bool  target_split_dflash = false;
+    int   target_cache_slots = 1;  // daemon-only: independent TargetCache states sharing weights
     int   target_gpu = 0;
     int   draft_gpu = 0;
-    std::vector<int> target_gpus;
-    std::vector<double> target_split_weights;
+    bool  stream_tagged = false;
+    int   synthetic_prompt_tokens = 0;
+    int   synthetic_prompt_token = 220;
     if (const char * s = std::getenv("DFLASH_TARGET_GPU")) {
         target_gpu = std::max(0, std::atoi(s));
     }
     if (const char * s = std::getenv("DFLASH_DRAFT_GPU")) {
         draft_gpu = std::max(0, std::atoi(s));
     }
-    if (const char * s = std::getenv("DFLASH_TARGET_GPUS")) {
-        if (!parse_int_list(s, target_gpus)) {
-            std::fprintf(stderr, "bad DFLASH_TARGET_GPUS=%s\n", s);
-            return 2;
-        }
-    }
-    if (const char * s = std::getenv("DFLASH_TARGET_LAYER_SPLIT")) {
-        if (!parse_float_list(s, target_split_weights)) {
-            std::fprintf(stderr, "bad DFLASH_TARGET_LAYER_SPLIT=%s\n", s);
-            return 2;
-        }
-    }
-    int   stream_fd     = -1;     // write each committed token to this fd (int32 LE) as they land
+    StreamFd stream_fd  = kInvalidStreamFd;  // write committed tokens as int32 LE
     bool  daemon_mode   = false;
-    for (int i = flags_start; i < argc; i++) {
+    for (int i = 3; i < argc; i++) {
         if      (std::strcmp(argv[i], "--daemon") == 0)        daemon_mode = true;
         else if (std::strcmp(argv[i], "--seq-verify") == 0)    seq_verify = true;
         else if (std::strcmp(argv[i], "--fast-rollback") == 0) fast_rollback = true;
@@ -2129,42 +2882,21 @@ int main(int argc, char ** argv) {
         else if (std::strcmp(argv[i], "--draft-feature-mirror") == 0) {
             draft_feature_mirror = true;
         }
-        else if (std::strcmp(argv[i], "--target-split-load-draft") == 0) {
-            target_split_load_draft = true;
+        else if (std::strncmp(argv[i], "--target-cache-slots=", 21) == 0) {
+            target_cache_slots = std::atoi(argv[i] + 21);
         }
-        else if (std::strcmp(argv[i], "--target-split-dflash") == 0) {
-            target_split_dflash = true;
-            target_split_load_draft = true;
+        else if (std::strncmp(argv[i], "--cache-slots=", 14) == 0) {
+            target_cache_slots = std::atoi(argv[i] + 14);
+        }
+        else if (std::strcmp(argv[i], "--target-cache-slots") == 0 ||
+                 std::strcmp(argv[i], "--cache-slots") == 0) {
+            if (i + 1 < argc) target_cache_slots = std::atoi(argv[++i]);
         }
         else if (std::strncmp(argv[i], "--target-gpu=", 13) == 0) {
             target_gpu = std::max(0, std::atoi(argv[i] + 13));
         }
         else if (std::strcmp(argv[i], "--target-gpu") == 0) {
             if (i + 1 < argc) target_gpu = std::max(0, std::atoi(argv[++i]));
-        }
-        else if (std::strncmp(argv[i], "--target-gpus=", 14) == 0) {
-            if (!parse_int_list(argv[i] + 14, target_gpus)) {
-                std::fprintf(stderr, "bad --target-gpus value\n");
-                return 2;
-            }
-        }
-        else if (std::strcmp(argv[i], "--target-gpus") == 0) {
-            if (i + 1 >= argc || !parse_int_list(argv[++i], target_gpus)) {
-                std::fprintf(stderr, "bad --target-gpus value\n");
-                return 2;
-            }
-        }
-        else if (std::strncmp(argv[i], "--target-layer-split=", 21) == 0) {
-            if (!parse_float_list(argv[i] + 21, target_split_weights)) {
-                std::fprintf(stderr, "bad --target-layer-split value\n");
-                return 2;
-            }
-        }
-        else if (std::strcmp(argv[i], "--target-layer-split") == 0) {
-            if (i + 1 >= argc || !parse_float_list(argv[++i], target_split_weights)) {
-                std::fprintf(stderr, "bad --target-layer-split value\n");
-                return 2;
-            }
         }
         else if (std::strncmp(argv[i], "--draft-gpu=", 12) == 0) {
             draft_gpu = std::max(0, std::atoi(argv[i] + 12));
@@ -2175,8 +2907,40 @@ int main(int argc, char ** argv) {
         else if (std::strcmp(argv[i], "--profile-scaling") == 0) {
             profile_scaling = true;
         }
+        else if (std::strncmp(argv[i], "--synthetic-prompt-tokens=", 26) == 0) {
+            synthetic_prompt_tokens = std::max(0, std::atoi(argv[i] + 26));
+        }
+        else if (std::strcmp(argv[i], "--synthetic-prompt-tokens") == 0) {
+            if (i + 1 < argc) synthetic_prompt_tokens = std::max(0, std::atoi(argv[++i]));
+        }
+        else if (std::strncmp(argv[i], "--synthetic-token=", 18) == 0) {
+            synthetic_prompt_token = std::max(0, std::atoi(argv[i] + 18));
+        }
+        else if (std::strcmp(argv[i], "--synthetic-token") == 0) {
+            if (i + 1 < argc) synthetic_prompt_token = std::max(0, std::atoi(argv[++i]));
+        }
+        else if (std::strncmp(argv[i], "--n-gen=", 8) == 0) {
+            n_gen = std::atoi(argv[i] + 8);
+        }
+        else if (std::strcmp(argv[i], "--n-gen") == 0) {
+            if (i + 1 < argc) n_gen = std::atoi(argv[++i]);
+        }
+        else if (std::strncmp(argv[i], "--out=", 6) == 0) {
+            out_path_storage = argv[i] + 6;
+            out_path = out_path_storage.c_str();
+        }
+        else if (std::strcmp(argv[i], "--out") == 0) {
+            if (i + 1 < argc) {
+                out_path_storage = argv[++i];
+                out_path = out_path_storage.c_str();
+            }
+        }
         else if (std::strncmp(argv[i], "--stream-fd=", 12) == 0) {
-            stream_fd = std::atoi(argv[i] + 12);
+            stream_fd = parse_stream_fd(argv[i] + 12);
+        }
+        else if (std::strcmp(argv[i], "--stream-tagged") == 0 ||
+                 std::strcmp(argv[i], "--tagged-stream") == 0) {
+            stream_tagged = true;
         }
         else if (std::strncmp(argv[i], "--max-ctx=", 10) == 0) {
             g_max_ctx_override = std::atoi(argv[i] + 10);
@@ -2208,78 +2972,51 @@ int main(int argc, char ** argv) {
             g_draft_ctx_max = std::max(0, std::atoi(argv[i] + 16));
         }
     }
+    target_cache_slots = std::max(1, std::min(target_cache_slots, 16));
 
-    // The KV type may also have been chosen via -ctk/-ctv, which sets
-    // DFLASH27B_KV_K / DFLASH27B_KV_V during the argv loop above. Re-check
-    // for TQ3 here so g_kq_stride_pad matches the chunked-FA driver's
-    // align_up(kv_len, 256); otherwise the host-built mask is short and the
-    // kernel reads past its end.
-    auto kv_env_is_tq3 = [](const char * name) {
-        const char * s = std::getenv(name);
-        if (!s) return false;
-        std::string lc;
-        for (const char * p = s; *p; ++p) lc += (char)std::tolower((unsigned char)*p);
-        return lc.rfind("tq3", 0) == 0;
-    };
-    if (kv_env_is_tq3("DFLASH27B_KV_K") || kv_env_is_tq3("DFLASH27B_KV_V")) {
-        g_kq_stride_pad = 256;
-    }
-
-    if (!is_laguna && !daemon_mode && !test_window_mode && (!prompt_path || !out_path)) {
+    if (!daemon_mode && !test_window_mode &&
+        (((!prompt_path && synthetic_prompt_tokens <= 0) || !out_path || n_gen <= 0))) {
         std::fprintf(stderr, "Missing positional arguments for non-daemon mode.\n");
         return 2;
     }
 
-    // ---- Arch dispatch: hand laguna targets to the dedicated daemon -----
-    // The qwen35 + DFlash + DDTree code path below assumes the target is a
-    // qwen35-shaped hybrid (attention + DeltaNet/SSM) and that a draft model
-    // exists. Laguna is a pure-attention MoE arch with no published draft,
-    // so dispatch to run_laguna_daemon() before any qwen35-specific init.
-    // The daemon protocol it speaks (bare prompt, samp= tail, generate cmd)
-    // matches what scripts/server.py emits, so the OpenAI HTTP path is
-    // byte-identical for the two arches — only the binary'́s internal
-    // forward kernels differ.
-    if (is_laguna) {
-        ggml_type kv = GGML_TYPE_Q8_0;
-        if (const char * kvs = std::getenv("DFLASH27B_KV_K")) {
-            std::string s = kvs;
-            if      (s == "q4_0") kv = GGML_TYPE_Q4_0;
-            else if (s == "q5_0") kv = GGML_TYPE_Q5_0;
-            else if (s == "q8_0") kv = GGML_TYPE_Q8_0;
-            else if (s == "f16")  kv = GGML_TYPE_F16;
-        }
-        const int max_ctx_eff = g_max_ctx_override > 0 ? g_max_ctx_override : 4096;
-        int chunk = 2048;
-        if (const char * ck = std::getenv("DFLASH27B_LAGUNA_CHUNK")) {
-            const int v = std::atoi(ck);
-            if (v > 0) chunk = v;
-        }
-        std::fprintf(stderr,
-            "[test_dflash] arch=laguna -> dispatching to run_laguna_daemon "
-            "(max_ctx=%d kv=%s chunk=%d stream_fd=%d). DFlash + DDTree disabled.\n",
-            max_ctx_eff, ggml_type_name(kv), chunk, stream_fd);
-        dflash27b::LagunaDaemonArgs largs;
-        largs.target_path = target_path;
-        largs.max_ctx     = max_ctx_eff;
-        largs.chunk       = chunk;
-        largs.kv_type     = kv;
-        largs.stream_fd   = stream_fd;
-        return dflash27b::run_laguna_daemon(largs);
-    }
+    int current_stream_request_id = 0;
+    auto stream_write_i32 = [&](const int32_t * data, size_t count) {
+        if (stream_fd == kInvalidStreamFd) return;
+#if defined(_WIN32)
+        DWORD written;
+        WriteFile(reinterpret_cast<HANDLE>(stream_fd), data,
+                  (DWORD)(sizeof(int32_t) * count), &written, nullptr);
+#else
+        ssize_t n = ::write(stream_fd, data, sizeof(int32_t) * count);
+        (void)n;
+#endif
+    };
 
-    // Helper: write a committed token to the stream fd immediately (int32 LE).
+    // Helper: write a committed token to the stream fd immediately.
+    // Default protocol is legacy int32 tokens. With --stream-tagged each token
+    // is framed as [-2, request_id, token] so future interleaving can demux.
     // Caller invokes after every out_all.push_back(tok) when stream_fd >= 0.
     // On Windows stream_fd holds a Win32 HANDLE value (passed via msvcrt.get_osfhandle).
     auto stream_emit = [&](int32_t tok) {
-        if (stream_fd < 0) return;
-        int32_t v = tok;
-#if defined(_WIN32)
-        DWORD written;
-        WriteFile((HANDLE)(intptr_t)stream_fd, &v, sizeof(v), &written, nullptr);
-#else
-        ssize_t n = ::write(stream_fd, &v, sizeof(v));
-        (void)n;
-#endif
+        if (stream_fd == kInvalidStreamFd) return;
+        if (stream_tagged) {
+            int32_t frame[3] = {-2, current_stream_request_id, tok};
+            stream_write_i32(frame, 3);
+        } else {
+            int32_t v = tok;
+            stream_write_i32(&v, 1);
+        }
+    };
+    auto stream_emit_for = [&](int request_id, int32_t tok) {
+        if (stream_fd == kInvalidStreamFd) return;
+        if (stream_tagged) {
+            int32_t frame[3] = {-2, request_id, tok};
+            stream_write_i32(frame, 3);
+        } else {
+            int32_t v = tok;
+            stream_write_i32(&v, 1);
+        }
     };
     if (fast_rollback && seq_verify && !ddtree_mode) {
         std::fprintf(stderr, "--fast-rollback and --seq-verify are mutually exclusive\n");
@@ -2288,44 +3025,28 @@ int main(int argc, char ** argv) {
     if (target_split_dflash) target_split_load_draft = true;
     if (target_gpus.empty()) target_gpus.push_back(target_gpu);
     if (target_gpus.size() == 1) target_gpu = target_gpus[0];
-    std::printf("[cfg] seq_verify=%d fast_rollback=%d ddtree=%d budget=%d temp=%.2f chain_seed=%d fa_window=%d draft_swa=%d draft_ctx_max=%d draft_feature_mirror=%d target_gpu=%d draft_gpu=%d\n",
+    std::printf("[cfg] seq_verify=%d fast_rollback=%d ddtree=%d budget=%d temp=%.2f chain_seed=%d fa_window=%d draft_swa=%d draft_ctx_max=%d draft_feature_mirror=%d target_cache_slots=%d stream_tagged=%d target_gpu=%d draft_gpu=%d\n",
                 (int)seq_verify, (int)fast_rollback, (int)ddtree_mode,
                 ddtree_budget, ddtree_temp, (int)ddtree_chain_seed, g_fa_window,
-                g_draft_swa_window, g_draft_ctx_max, (int)draft_feature_mirror, target_gpu, draft_gpu);
+                g_draft_swa_window, g_draft_ctx_max, (int)draft_feature_mirror,
+                daemon_mode ? target_cache_slots : 1,
+                (int)stream_tagged, target_gpu, draft_gpu);
+    auto env_enabled = [](const char * name) {
+        const char * value = std::getenv(name);
+        return value && std::atoi(value) != 0;
+    };
+    const bool step_debug = env_enabled("DFLASH27B_STEP_DEBUG");
+    const bool scheduler_copyback_validate =
+        env_enabled("DFLASH27B_SCHED_COPYBACK_VALIDATE");
+    const bool timing_debug = env_enabled("DFLASH27B_TIMING_DEBUG");
+    const bool output_tail = env_enabled("DFLASH27B_OUTPUT_TAIL");
 
     int cuda_device_count = 0;
     cudaGetDeviceCount(&cuda_device_count);
-    for (int gpu : target_gpus) {
-        if (gpu >= cuda_device_count) {
-            std::fprintf(stderr, "bad target gpu id %d device_count=%d\n",
-                         gpu, cuda_device_count);
-            return 2;
-        }
-    }
     if (target_gpu >= cuda_device_count || draft_gpu >= cuda_device_count) {
         std::fprintf(stderr, "bad gpu ids target=%d draft=%d device_count=%d\n",
                      target_gpu, draft_gpu, cuda_device_count);
         return 2;
-    }
-    if (target_gpus.size() > 1) {
-        if (daemon_mode || test_window_mode || profile_scaling) {
-            std::fprintf(stderr, "--target-gpus multi-GPU harness currently supports non-daemon generation only\n");
-            return 2;
-        }
-        if (target_split_dflash && fast_rollback) {
-            std::fprintf(stderr,
-                         "warning: --fast-rollback is not implemented for target layer-split DFlash; using replay rollback\n");
-        }
-        return run_target_layer_split_harness(target_path, draft_path, prompt_path, n_gen, out_path,
-                                             target_gpus, target_split_weights,
-                                             draft_gpu,
-                                             target_split_load_draft,
-                                             target_split_load_draft && !target_split_dflash,
-                                             target_split_dflash,
-                                             g_max_ctx_override > 0 ? g_max_ctx_override : 4096,
-                                             ddtree_mode
-                                                 ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, ddtree_budget + 1)
-                                                 : DFLASH27B_DRAFT_BLOCK_SIZE);
     }
 
     const bool split_gpus = target_gpu != draft_gpu;
@@ -2352,15 +3073,7 @@ int main(int argc, char ** argv) {
 
     DraftWeights dw;
     {
-        // Auto-detect draft format: .gguf → GGUF loader, else safetensors.
-        std::string dp(draft_path);
-        bool draft_ok = false;
-        if (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf") {
-            draft_ok = load_draft_gguf(draft_path, draft_backend, dw);
-        } else {
-            draft_ok = load_draft_safetensors(draft_path, draft_backend, dw);
-        }
-        if (!draft_ok) {
+        if (!load_draft_auto(draft_path, draft_backend, dw)) {
             std::fprintf(stderr, "draft load: %s\n", dflash27b_last_error());
             return 1;
         }
@@ -2657,17 +3370,46 @@ int main(int argc, char ** argv) {
     const int vocab  = DFLASH27B_TARGET_VOCAB;
     const int mask_tok = DFLASH27B_DRAFT_MASK_TOKEN_ID;
 
+    std::vector<std::unique_ptr<DaemonSlotState>> daemon_extra_slots;
+    if (daemon_mode && target_cache_slots > 1) {
+        daemon_extra_slots.reserve((size_t)target_cache_slots - 1);
+        for (int sid = 1; sid < target_cache_slots; sid++) {
+            auto slot = std::make_unique<DaemonSlotState>();
+            if (!create_target_cache(w, max_ctx, max_verify_tokens, target_backend,
+                                     slot->cache, /*prefill_only=*/true)) {
+                std::fprintf(stderr, "cache slot %d: %s\n", sid, dflash27b_last_error());
+                for (auto & allocated : daemon_extra_slots) {
+                    free_target_cache(allocated->cache);
+                }
+                free_target_cache(cache);
+                free_draft_weights(dw);
+                free_target_weights(w);
+                if (split_gpus) ggml_backend_free(draft_backend);
+                ggml_backend_free(target_backend);
+                return 1;
+            }
+            daemon_extra_slots.push_back(std::move(slot));
+        }
+        std::printf("[daemon] target_cache_slots=%d (shared weights, serialized protocol)\n",
+                    target_cache_slots);
+    }
+
     if (daemon_mode) {
         std::printf("[daemon] ready\n");
         std::fflush(stdout);
     }
 
-    constexpr int PREFIX_CACHE_SLOTS = 8;
     PrefixSnapshot prefix_snapshots[PREFIX_CACHE_SLOTS];   // default-constructed, ctx==nullptr
 
     StepGraph sg;
     StepGraph draft_sg;
     StepGraph proj_sg;
+    StepGraph daemon_batch_probe_sg;
+    TargetCache daemon_batch_probe_cache;
+    int daemon_batch_probe_capacity = 0;
+    StepGraph daemon_batch_ref_sg;
+    TargetCache daemon_batch_ref_cache;
+    bool daemon_batch_ref_cache_ready = false;
     DraftFeatureMirror feature_mirror;
     bool daemon_first_iter = true;
     bool target_parked = false;
@@ -2676,6 +3418,678 @@ int main(int argc, char ** argv) {
     dflash27b::DrafterContext drafter_ctx;
     bool drafter_loaded = false;
 
+    auto destroy_target_graphs_all_slots = [&]() {
+        step_graph_destroy(proj_sg);
+        step_graph_destroy(sg);
+        step_graph_destroy(daemon_batch_probe_sg);
+        step_graph_destroy(daemon_batch_ref_sg);
+        free_target_cache(daemon_batch_probe_cache);
+        daemon_batch_probe_capacity = 0;
+        free_target_cache(daemon_batch_ref_cache);
+        daemon_batch_ref_cache_ready = false;
+        for (auto & slot : daemon_extra_slots) {
+            step_graph_destroy(slot->proj_sg);
+            step_graph_destroy(slot->sg);
+        }
+    };
+    auto destroy_draft_graphs_all_slots = [&]() {
+        step_graph_destroy(draft_sg);
+        for (auto & slot : daemon_extra_slots) {
+            step_graph_destroy(slot->draft_sg);
+        }
+    };
+
+    std::vector<DaemonRequestState> daemon_requests((size_t)target_cache_slots);
+    std::deque<DaemonPendingQuantum> daemon_pending_quanta;
+    std::deque<std::string> daemon_input_lines;
+    std::mutex daemon_input_mu;
+    std::condition_variable daemon_input_cv;
+    bool daemon_input_eof = !daemon_mode;
+    size_t daemon_scheduler_cursor = 0;
+    bool daemon_scheduler_drain = false;
+    auto get_daemon_slot_runtime_ref = [&](int slot_id) -> DaemonSlotRuntimeRef {
+        DaemonSlotRuntimeRef ref{};
+        ref.slot_id = slot_id;
+        if (slot_id == 0) {
+            ref.cache = &cache;
+            ref.sg = &sg;
+            ref.draft_sg = &draft_sg;
+            ref.proj_sg = &proj_sg;
+            ref.feature_mirror = &feature_mirror;
+            ref.first_iter = &daemon_first_iter;
+            return ref;
+        }
+        if (slot_id > 0 && slot_id < target_cache_slots) {
+            DaemonSlotState * slot = daemon_extra_slots[(size_t)slot_id - 1].get();
+            ref.cache = &slot->cache;
+            ref.sg = &slot->sg;
+            ref.draft_sg = &slot->draft_sg;
+            ref.proj_sg = &slot->proj_sg;
+            ref.feature_mirror = &slot->feature_mirror;
+            ref.first_iter = &slot->first_iter;
+        }
+        return ref;
+    };
+    auto collect_scheduler_candidates = [&]() -> std::vector<DaemonBatchCandidate> {
+        std::vector<DaemonBatchCandidate> candidates;
+        if (daemon_requests.empty()) return candidates;
+        const size_t n_slots = daemon_requests.size();
+        candidates.reserve(n_slots);
+        for (size_t i = 0; i < n_slots; i++) {
+            const size_t idx = (daemon_scheduler_cursor + i) % n_slots;
+            const DaemonRequestState & req = daemon_requests[idx];
+            if (!req.active || req.remaining <= 0) continue;
+            DaemonSlotRuntimeRef runtime = get_daemon_slot_runtime_ref(req.slot_id);
+            if (!runtime.cache || !runtime.sg || !runtime.draft_sg) continue;
+            const int q = std::max(1, std::min(req.quantum, req.remaining));
+            candidates.push_back(DaemonBatchCandidate{
+                req.request_id, req.slot_id, req.epoch, q, req.remaining, runtime});
+        }
+        return candidates;
+    };
+    auto collect_scheduler_aligned_bucket = [&](int max_batch,
+                                                bool tail_only,
+                                                bool emit_log)
+        -> DaemonAlignedBucketSelection {
+        DaemonAlignedBucketSelection selection =
+            select_aligned_scheduler_bucket(collect_scheduler_candidates(),
+                                            max_batch,
+                                            tail_only);
+        if (emit_log) print_aligned_bucket_log(selection, max_batch);
+        return selection;
+    };
+    auto run_scheduler_batch_probe = [&](int max_batch) -> bool {
+        DaemonAlignedBucketSelection selection =
+            collect_scheduler_aligned_bucket(max_batch, /*tail_only=*/false,
+                                             /*emit_log=*/true);
+        std::vector<DaemonBatchCandidate> batch = selection.batch;
+        if ((int)batch.size() < 2) {
+            std::fprintf(stderr, "[scheduler] batch probe needs an aligned cur_pos bucket with at least 2 active requests\n");
+            return false;
+        }
+
+        const int batch_size = (int)batch.size();
+        const int kv_start = selection.kv_start;
+        if (kv_start <= 0) {
+            std::fprintf(stderr, "[scheduler] batch probe requires decoded slots\n");
+            return false;
+        }
+        for (const DaemonBatchCandidate & candidate : batch) {
+            TargetCache * c = candidate.runtime.cache;
+            if (!c || c->cur_pos != kv_start || c->last_tok < 0) {
+                std::fprintf(stderr,
+                             "[scheduler] batch probe requires same cur_pos and valid last_tok\n");
+                return false;
+            }
+        }
+
+        if (daemon_batch_probe_capacity < batch_size) {
+            step_graph_free(daemon_batch_probe_sg);
+            free_target_cache(daemon_batch_probe_cache);
+            if (!create_target_cache(w, max_ctx, max_verify_tokens, target_backend,
+                                     daemon_batch_probe_cache,
+                                     /*prefill_only=*/true, batch_size)) {
+                std::fprintf(stderr, "[scheduler] batch probe cache: %s\n",
+                             dflash27b_last_error());
+                daemon_batch_probe_capacity = 0;
+                return false;
+            }
+            daemon_batch_probe_capacity = batch_size;
+        }
+
+        reset_target_cache(daemon_batch_probe_cache);
+        for (int i = 0; i < batch_size; i++) {
+            if (!copy_target_cache_to_batch_slot(*batch[(size_t)i].runtime.cache,
+                                                 daemon_batch_probe_cache, i)) {
+                return false;
+            }
+        }
+
+        if (!build_target_batch_probe_step(daemon_batch_probe_sg, w,
+                                           daemon_batch_probe_cache,
+                                           target_backend, kv_start,
+                                           batch_size)) {
+            std::fprintf(stderr, "[scheduler] batch probe graph build failed: %s\n",
+                         dflash27b_last_error());
+            return false;
+        }
+
+        std::vector<int32_t> seed_tokens((size_t)batch_size);
+        for (int i = 0; i < batch_size; i++) {
+            seed_tokens[(size_t)i] = batch[(size_t)i].runtime.cache->last_tok;
+        }
+        std::vector<float> embed((size_t)hidden * batch_size);
+        if (!w.embedder.embed(seed_tokens.data(), batch_size, embed.data())) {
+            std::fprintf(stderr, "[scheduler] batch probe embed failed\n");
+            return false;
+        }
+        ggml_backend_tensor_set(daemon_batch_probe_sg.inp_embed, embed.data(), 0,
+                                sizeof(float) * embed.size());
+
+        const int32_t pos4[4] = {kv_start, kv_start, kv_start, 0};
+        ggml_backend_tensor_set(daemon_batch_probe_sg.positions, pos4, 0,
+                                sizeof(pos4));
+
+        auto t0 = std::chrono::steady_clock::now();
+        ggml_status st = ggml_backend_graph_compute(target_backend,
+                                                    daemon_batch_probe_sg.gf);
+        if (st != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "[scheduler] batch probe compute %d\n", (int)st);
+            return false;
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        std::vector<int32_t> argmax((size_t)batch_size);
+        ggml_backend_tensor_get(daemon_batch_probe_sg.argmax_tokens,
+                                argmax.data(), 0,
+                                sizeof(int32_t) * argmax.size());
+        const double ms =
+            std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        if (!daemon_batch_ref_cache_ready) {
+            free_target_cache(daemon_batch_ref_cache);
+            if (!create_target_cache(w, max_ctx, max_verify_tokens, target_backend,
+                                     daemon_batch_ref_cache,
+                                     /*prefill_only=*/true, /*n_seqs=*/1)) {
+                std::fprintf(stderr, "[scheduler] batch reference cache: %s\n",
+                             dflash27b_last_error());
+                daemon_batch_ref_cache_ready = false;
+                return false;
+            }
+            daemon_batch_ref_cache_ready = true;
+        }
+
+        std::vector<int32_t> ref_argmax((size_t)batch_size, -1);
+        std::vector<float> ref_embed((size_t)hidden);
+        int mismatches = 0;
+        for (int i = 0; i < batch_size; i++) {
+            const TargetCache & source = *batch[(size_t)i].runtime.cache;
+            if (!copy_target_cache_to_single_cache(source, daemon_batch_ref_cache)) {
+                return false;
+            }
+            if (!build_target_step(daemon_batch_ref_sg, w, daemon_batch_ref_cache,
+                                   target_backend, kv_start, /*n_tokens=*/1,
+                                   /*with_mask=*/false, /*capture=*/false,
+                                   /*capture_delta_intermediate=*/false,
+                                   /*fa_window=*/0)) {
+                std::fprintf(stderr,
+                             "[scheduler] batch reference graph build failed: %s\n",
+                             dflash27b_last_error());
+                return false;
+            }
+            const int32_t seed = batch[(size_t)i].runtime.cache->last_tok;
+            if (!w.embedder.embed(&seed, 1, ref_embed.data())) {
+                std::fprintf(stderr, "[scheduler] batch reference embed failed\n");
+                return false;
+            }
+            ggml_backend_tensor_set(daemon_batch_ref_sg.inp_embed,
+                                    ref_embed.data(), 0,
+                                    sizeof(float) * ref_embed.size());
+            ggml_backend_tensor_set(daemon_batch_ref_sg.positions, pos4, 0,
+                                    sizeof(pos4));
+            ggml_status ref_st = ggml_backend_graph_compute(
+                target_backend, daemon_batch_ref_sg.gf);
+            if (ref_st != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "[scheduler] batch reference compute %d\n",
+                             (int)ref_st);
+                return false;
+            }
+            ggml_backend_tensor_get(daemon_batch_ref_sg.argmax_tokens,
+                                    &ref_argmax[(size_t)i], 0,
+                                    sizeof(int32_t));
+            if (ref_argmax[(size_t)i] != argmax[(size_t)i]) {
+                mismatches++;
+            }
+        }
+
+        std::printf("[scheduler] batch_probe_ok count=%d kv_start=%d ms=%.2f",
+                    batch_size, kv_start, ms);
+        for (int i = 0; i < batch_size; i++) {
+            std::printf(" req=%d:slot=%d:tok=%d",
+                        batch[(size_t)i].request_id,
+                        batch[(size_t)i].slot_id,
+                        argmax[(size_t)i]);
+        }
+        std::printf("\n");
+        std::fflush(stdout);
+
+        if (mismatches > 0) {
+            std::printf("[scheduler] batch_probe_compare_fail count=%d mismatches=%d",
+                        batch_size, mismatches);
+            for (int i = 0; i < batch_size; i++) {
+                std::printf(" req=%d:slot=%d:batched=%d:single=%d",
+                            batch[(size_t)i].request_id,
+                            batch[(size_t)i].slot_id,
+                            argmax[(size_t)i],
+                            ref_argmax[(size_t)i]);
+            }
+            std::printf("\n");
+            std::fflush(stdout);
+            return false;
+        }
+
+        std::printf("[scheduler] batch_probe_compare_ok count=%d mismatches=0",
+                    batch_size);
+        for (int i = 0; i < batch_size; i++) {
+            std::printf(" req=%d:slot=%d:batched=%d:single=%d",
+                        batch[(size_t)i].request_id,
+                        batch[(size_t)i].slot_id,
+                        argmax[(size_t)i],
+                        ref_argmax[(size_t)i]);
+        }
+        std::printf("\n");
+        std::fflush(stdout);
+        return true;
+    };
+    auto run_scheduler_batch_target_step = [&](int max_batch,
+                                               bool tail_only,
+                                               bool quiet_unavailable = false) -> bool {
+        const char * log_prefix = tail_only ? "batch_tail" : "batch_step";
+        const char * label = tail_only ? "batch target tail" : "batch target step";
+        if (!stream_tagged) {
+            std::fprintf(stderr,
+                         "[scheduler] %s requires --stream-tagged\n", label);
+            return false;
+        }
+        DaemonAlignedBucketSelection selection =
+            collect_scheduler_aligned_bucket(max_batch, tail_only,
+                                             /*emit_log=*/true);
+        std::vector<DaemonBatchCandidate> batch = selection.batch;
+        if ((int)batch.size() < 2) {
+            if (!quiet_unavailable) {
+                std::fprintf(stderr,
+                             "[scheduler] %s needs an aligned cur_pos bucket with at least 2 active requests\n", label);
+            }
+            return false;
+        }
+
+        const int batch_size = (int)batch.size();
+        const int kv_start = selection.kv_start;
+        if (kv_start <= 0) {
+            if (!quiet_unavailable) {
+                std::fprintf(stderr, "[scheduler] %s requires decoded slots\n", label);
+            }
+            return false;
+        }
+        for (const DaemonBatchCandidate & candidate : batch) {
+            TargetCache * c = candidate.runtime.cache;
+            if (!c || c->cur_pos != kv_start || c->last_tok < 0
+                || candidate.remaining <= 0
+                || (tail_only && candidate.remaining != 1)) {
+                if (!quiet_unavailable) {
+                    std::fprintf(stderr,
+                                 "[scheduler] %s requires same cur_pos, valid last_tok%s\n",
+                                 label,
+                                 tail_only ? ", and remaining=1" : "");
+                }
+                return false;
+            }
+        }
+
+        if (daemon_batch_probe_capacity < batch_size) {
+            step_graph_free(daemon_batch_probe_sg);
+            free_target_cache(daemon_batch_probe_cache);
+            if (!create_target_cache(w, max_ctx, max_verify_tokens, target_backend,
+                                     daemon_batch_probe_cache,
+                                     /*prefill_only=*/true, batch_size)) {
+                std::fprintf(stderr, "[scheduler] %s cache: %s\n",
+                             label, dflash27b_last_error());
+                daemon_batch_probe_capacity = 0;
+                return false;
+            }
+            daemon_batch_probe_capacity = batch_size;
+        }
+
+        reset_target_cache(daemon_batch_probe_cache);
+        for (int i = 0; i < batch_size; i++) {
+            if (!copy_target_cache_to_batch_slot(*batch[(size_t)i].runtime.cache,
+                                                 daemon_batch_probe_cache, i)) {
+                return false;
+            }
+        }
+
+        if (!build_target_batch_probe_step(daemon_batch_probe_sg, w,
+                                           daemon_batch_probe_cache,
+                                           target_backend, kv_start,
+                                           batch_size,
+                                           /*capture_layers=*/true)) {
+            std::fprintf(stderr, "[scheduler] %s graph build failed: %s\n",
+                         label, dflash27b_last_error());
+            return false;
+        }
+
+        std::vector<int32_t> old_tokens((size_t)batch_size);
+        for (int i = 0; i < batch_size; i++) {
+            old_tokens[(size_t)i] = batch[(size_t)i].runtime.cache->last_tok;
+        }
+        std::vector<float> embed((size_t)hidden * batch_size);
+        if (!w.embedder.embed(old_tokens.data(), batch_size, embed.data())) {
+            std::fprintf(stderr, "[scheduler] %s embed failed\n", label);
+            return false;
+        }
+        ggml_backend_tensor_set(daemon_batch_probe_sg.inp_embed, embed.data(), 0,
+                                sizeof(float) * embed.size());
+
+        const int32_t pos4[4] = {kv_start, kv_start, kv_start, 0};
+        ggml_backend_tensor_set(daemon_batch_probe_sg.positions, pos4, 0,
+                                sizeof(pos4));
+
+        auto t0 = std::chrono::steady_clock::now();
+        ggml_status st = ggml_backend_graph_compute(target_backend,
+                                                    daemon_batch_probe_sg.gf);
+        if (st != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "[scheduler] %s compute %d\n", label, (int)st);
+            return false;
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        std::vector<int32_t> argmax((size_t)batch_size);
+        ggml_backend_tensor_get(daemon_batch_probe_sg.argmax_tokens,
+                                argmax.data(), 0,
+                                sizeof(int32_t) * argmax.size());
+        const double ms =
+            std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        if (!daemon_batch_ref_cache_ready) {
+            free_target_cache(daemon_batch_ref_cache);
+            if (!create_target_cache(w, max_ctx, max_verify_tokens, target_backend,
+                                     daemon_batch_ref_cache,
+                                     /*prefill_only=*/true, /*n_seqs=*/1)) {
+                std::fprintf(stderr, "[scheduler] %s reference cache: %s\n",
+                             label, dflash27b_last_error());
+                daemon_batch_ref_cache_ready = false;
+                return false;
+            }
+            daemon_batch_ref_cache_ready = true;
+        }
+
+        std::vector<int32_t> ref_argmax((size_t)batch_size, -1);
+        std::vector<float> ref_embed((size_t)hidden);
+        auto compute_reference_argmax = [&](TargetCache & ref_cache,
+                                            int step_pos,
+                                            int32_t seed,
+                                            const char * stage,
+                                            int32_t * out) -> bool {
+            if (!build_target_step(daemon_batch_ref_sg, w, ref_cache,
+                                   target_backend, step_pos, /*n_tokens=*/1,
+                                   /*with_mask=*/false, /*capture=*/false,
+                                   /*capture_delta_intermediate=*/false,
+                                   /*fa_window=*/0)) {
+                std::fprintf(stderr,
+                             "[scheduler] %s %s graph build failed: %s\n",
+                             label, stage, dflash27b_last_error());
+                return false;
+            }
+            if (!w.embedder.embed(&seed, 1, ref_embed.data())) {
+                std::fprintf(stderr, "[scheduler] %s %s embed failed\n",
+                             label, stage);
+                return false;
+            }
+            ggml_backend_tensor_set(daemon_batch_ref_sg.inp_embed,
+                                    ref_embed.data(), 0,
+                                    sizeof(float) * ref_embed.size());
+            const int32_t pos4[4] = {step_pos, step_pos, step_pos, 0};
+            ggml_backend_tensor_set(daemon_batch_ref_sg.positions, pos4, 0,
+                                    sizeof(pos4));
+            ggml_status ref_st = ggml_backend_graph_compute(
+                target_backend, daemon_batch_ref_sg.gf);
+            if (ref_st != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "[scheduler] %s %s compute %d\n",
+                             label, stage, (int)ref_st);
+                return false;
+            }
+            ggml_backend_tensor_get(daemon_batch_ref_sg.argmax_tokens,
+                                    out, 0, sizeof(int32_t));
+            return true;
+        };
+        int mismatches = 0;
+        for (int i = 0; i < batch_size; i++) {
+            const TargetCache & source = *batch[(size_t)i].runtime.cache;
+            if (!copy_target_cache_to_single_cache(source, daemon_batch_ref_cache)) {
+                return false;
+            }
+            if (!compute_reference_argmax(daemon_batch_ref_cache, kv_start,
+                                          old_tokens[(size_t)i], "reference",
+                                          &ref_argmax[(size_t)i])) {
+                return false;
+            }
+            if (ref_argmax[(size_t)i] != argmax[(size_t)i]) {
+                mismatches++;
+            }
+        }
+
+        if (mismatches > 0) {
+            std::printf("[scheduler] %s_compare_fail count=%d mismatches=%d",
+                        log_prefix, batch_size, mismatches);
+            for (int i = 0; i < batch_size; i++) {
+                std::printf(" req=%d:slot=%d:batched=%d:single=%d",
+                            batch[(size_t)i].request_id,
+                            batch[(size_t)i].slot_id,
+                            argmax[(size_t)i],
+                            ref_argmax[(size_t)i]);
+            }
+            std::printf("\n");
+            std::fflush(stdout);
+            return false;
+        }
+
+        for (int i = 0; i < batch_size; i++) {
+            if (!copy_batch_slot_to_target_cache(daemon_batch_probe_cache, i,
+                                                 *batch[(size_t)i].runtime.cache)) {
+                return false;
+            }
+        }
+        for (int i = 0; i < batch_size; i++) {
+            TargetCache * c = batch[(size_t)i].runtime.cache;
+            c->cur_pos  = kv_start + 1;
+            c->last_tok = argmax[(size_t)i];
+        }
+
+        if (scheduler_copyback_validate) {
+            std::vector<int32_t> copyback_ref_argmax((size_t)batch_size, -1);
+            std::vector<int32_t> copyback_resume_argmax((size_t)batch_size, -1);
+            int copyback_mismatches = 0;
+            for (int i = 0; i < batch_size; i++) {
+                if (!copy_batch_slot_to_target_cache(daemon_batch_probe_cache, i,
+                                                     daemon_batch_ref_cache)) {
+                    return false;
+                }
+                daemon_batch_ref_cache.cur_pos  = kv_start + 1;
+                daemon_batch_ref_cache.last_tok = argmax[(size_t)i];
+                if (!compute_reference_argmax(daemon_batch_ref_cache, kv_start + 1,
+                                              argmax[(size_t)i],
+                                              "copyback reference",
+                                              &copyback_ref_argmax[(size_t)i])) {
+                    return false;
+                }
+                if (!copy_target_cache_to_single_cache(
+                        *batch[(size_t)i].runtime.cache, daemon_batch_ref_cache)) {
+                    return false;
+                }
+                if (!compute_reference_argmax(
+                        daemon_batch_ref_cache,
+                        batch[(size_t)i].runtime.cache->cur_pos,
+                        batch[(size_t)i].runtime.cache->last_tok,
+                        "copyback resume",
+                        &copyback_resume_argmax[(size_t)i])) {
+                    return false;
+                }
+                if (copyback_ref_argmax[(size_t)i]
+                    != copyback_resume_argmax[(size_t)i]) {
+                    copyback_mismatches++;
+                }
+            }
+            if (copyback_mismatches > 0) {
+                std::printf("[scheduler] %s_copyback_compare_fail count=%d mismatches=%d",
+                            log_prefix, batch_size, copyback_mismatches);
+                for (int i = 0; i < batch_size; i++) {
+                    std::printf(" req=%d:slot=%d:committed=%d:ref=%d:resume=%d",
+                                batch[(size_t)i].request_id,
+                                batch[(size_t)i].slot_id,
+                                argmax[(size_t)i],
+                                copyback_ref_argmax[(size_t)i],
+                                copyback_resume_argmax[(size_t)i]);
+                }
+                std::printf("\n");
+                std::fflush(stdout);
+                return false;
+            }
+            std::printf("[scheduler] %s_copyback_compare_ok count=%d mismatches=0",
+                        log_prefix, batch_size);
+            for (int i = 0; i < batch_size; i++) {
+                std::printf(" req=%d:slot=%d:committed=%d:ref=%d:resume=%d",
+                            batch[(size_t)i].request_id,
+                            batch[(size_t)i].slot_id,
+                            argmax[(size_t)i],
+                            copyback_ref_argmax[(size_t)i],
+                            copyback_resume_argmax[(size_t)i]);
+            }
+            std::printf("\n");
+            std::fflush(stdout);
+        }
+
+        std::printf("[scheduler] %s_compare_ok count=%d mismatches=0",
+                    log_prefix, batch_size);
+        for (int i = 0; i < batch_size; i++) {
+            std::printf(" req=%d:slot=%d:batched=%d:single=%d",
+                        batch[(size_t)i].request_id,
+                        batch[(size_t)i].slot_id,
+                        argmax[(size_t)i],
+                        ref_argmax[(size_t)i]);
+        }
+        std::printf("\n");
+
+        std::printf("[scheduler] %s_commit count=%d kv_start=%d ms=%.2f",
+                    log_prefix, batch_size, kv_start, ms);
+        for (int i = 0; i < batch_size; i++) {
+            DaemonRequestState & req =
+                daemon_requests[(size_t)batch[(size_t)i].slot_id];
+            req.emitted += 1;
+            req.remaining = std::max(0, req.remaining - 1);
+            req.active = req.remaining > 0;
+            std::printf(" req=%d:slot=%d:remaining=%d:tok=%d:next=%d:emitted=%d",
+                        req.request_id, req.slot_id,
+                        req.remaining, old_tokens[(size_t)i],
+                        argmax[(size_t)i], req.emitted);
+        }
+        std::printf("\n");
+        std::fflush(stdout);
+        daemon_scheduler_cursor =
+            next_cursor_after_aligned_batch(selection,
+                                            daemon_requests.size(),
+                                            daemon_scheduler_cursor);
+
+        for (int i = 0; i < batch_size; i++) {
+            const DaemonRequestState & req =
+                daemon_requests[(size_t)batch[(size_t)i].slot_id];
+            stream_emit_for(req.request_id, old_tokens[(size_t)i]);
+            stream_emit_for(req.request_id, req.active ? -4 : -1);
+        }
+        return true;
+    };
+    auto enqueue_next_scheduler_quantum = [&]() -> bool {
+        if (daemon_requests.empty()) return false;
+        const size_t n_slots = daemon_requests.size();
+        for (size_t i = 0; i < n_slots; i++) {
+            const size_t idx = (daemon_scheduler_cursor + i) % n_slots;
+            const DaemonRequestState & req = daemon_requests[idx];
+            if (!req.active || req.remaining <= 0) continue;
+            const int q = std::max(1, std::min(req.quantum, req.remaining));
+            daemon_pending_quanta.push_back(
+                DaemonPendingQuantum{req.request_id, req.slot_id, req.epoch, q});
+            daemon_scheduler_cursor = (idx + 1) % n_slots;
+            return true;
+        }
+        return false;
+    };
+    auto has_daemon_input = [&]() -> bool {
+        std::lock_guard<std::mutex> lock(daemon_input_mu);
+        return !daemon_input_lines.empty();
+    };
+    auto pop_daemon_line = [&](std::string & line) -> bool {
+        {
+            std::lock_guard<std::mutex> lock(daemon_input_mu);
+            if (!daemon_input_lines.empty()) {
+                line = std::move(daemon_input_lines.front());
+                daemon_input_lines.pop_front();
+                return true;
+            }
+        }
+        while (!daemon_pending_quanta.empty()) {
+            DaemonPendingQuantum quantum = daemon_pending_quanta.front();
+            daemon_pending_quanta.pop_front();
+            if (quantum.slot_id < 0
+                || quantum.slot_id >= (int)daemon_requests.size()) {
+                continue;
+            }
+            const DaemonRequestState & req = daemon_requests[(size_t)quantum.slot_id];
+            if (!req.active
+                || req.request_id != quantum.request_id
+                || req.epoch != quantum.epoch
+                || req.remaining <= 0) {
+                std::printf("[scheduler] stale quantum dropped req=%d slot=%d epoch=%d\n",
+                            quantum.request_id, quantum.slot_id, quantum.epoch);
+                std::fflush(stdout);
+                continue;
+            }
+            const int q = std::max(1, std::min(quantum.n_gen, req.remaining));
+            line = "REQ " + std::to_string(quantum.request_id) +
+                   " SLOT " + std::to_string(quantum.slot_id) +
+                   " CONTINUE " + std::to_string(q);
+            return true;
+        }
+        std::unique_lock<std::mutex> lock(daemon_input_mu);
+        daemon_input_cv.wait(lock, [&]() {
+            return !daemon_input_lines.empty()
+                || !daemon_pending_quanta.empty()
+                || daemon_input_eof;
+        });
+        if (!daemon_input_lines.empty()) {
+            line = std::move(daemon_input_lines.front());
+            daemon_input_lines.pop_front();
+            return true;
+        }
+        while (!daemon_pending_quanta.empty()) {
+            DaemonPendingQuantum quantum = daemon_pending_quanta.front();
+            daemon_pending_quanta.pop_front();
+            if (quantum.slot_id < 0
+                || quantum.slot_id >= (int)daemon_requests.size()) {
+                continue;
+            }
+            const DaemonRequestState & req = daemon_requests[(size_t)quantum.slot_id];
+            if (!req.active
+                || req.request_id != quantum.request_id
+                || req.epoch != quantum.epoch
+                || req.remaining <= 0) {
+                std::printf("[scheduler] stale quantum dropped req=%d slot=%d epoch=%d\n",
+                            quantum.request_id, quantum.slot_id, quantum.epoch);
+                std::fflush(stdout);
+                continue;
+            }
+            const int q = std::max(1, std::min(quantum.n_gen, req.remaining));
+            line = "REQ " + std::to_string(quantum.request_id) +
+                   " SLOT " + std::to_string(quantum.slot_id) +
+                   " CONTINUE " + std::to_string(q);
+            return true;
+        }
+        return false;
+    };
+    if (daemon_mode) {
+        std::thread([&]() {
+            std::string input_line;
+            while (std::getline(std::cin, input_line)) {
+                {
+                    std::lock_guard<std::mutex> lock(daemon_input_mu);
+                    daemon_input_lines.push_back(std::move(input_line));
+                }
+                daemon_input_cv.notify_one();
+            }
+            {
+                std::lock_guard<std::mutex> lock(daemon_input_mu);
+                daemon_input_eof = true;
+            }
+            daemon_input_cv.notify_all();
+        }).detach();
+    }
+
     while (true) {
         std::string prompt_file_str;
         bool restore_from_slot        = false;
@@ -2683,17 +4097,70 @@ int main(int argc, char ** argv) {
         bool chain_restore_requested  = false;
         int  chain_thick_slot         = -1;
         std::vector<int> chain_thin_ids;
+        bool continue_decode_requested = false;
+        bool scheduler_start_requested = false;
+        bool scheduler_continue_requested = false;
+        int scheduler_total_gen = 0;
+        int scheduler_quantum = 0;
+        int active_cache_slot = 0;
         // Inline-snap: snapshot at boundary during prefill (single snap only;
         // multi-snap "snap=A:1,B:2" is not implemented — use separate SNAPSHOT).
         int  snap_pos  = -1;
         int  snap_slot = -1;
+        std::unique_ptr<ActiveDaemonSlot> active_daemon_slot;
+        auto activate_daemon_cache_slot = [&](int slot_id) -> bool {
+            if (slot_id < 0 || slot_id >= target_cache_slots) return false;
+            if (slot_id == active_cache_slot) return true;
+            active_daemon_slot.reset();
+            active_cache_slot = slot_id;
+            if (slot_id > 0) {
+                active_daemon_slot = std::make_unique<ActiveDaemonSlot>(
+                    cache, prefix_snapshots, sg, draft_sg, proj_sg, feature_mirror,
+                    daemon_first_iter, daemon_extra_slots[(size_t)slot_id - 1].get());
+            }
+            return true;
+        };
+        auto active_slot_has_scheduler_request = [&]() -> bool {
+            return active_cache_slot >= 0
+                && active_cache_slot < target_cache_slots
+                && daemon_requests[(size_t)active_cache_slot].active;
+        };
+        auto reject_active_scheduler_slot = [&](const char * command) -> bool {
+            if (!active_slot_has_scheduler_request()) return false;
+            const DaemonRequestState & req = daemon_requests[(size_t)active_cache_slot];
+            std::fprintf(stderr,
+                         "[scheduler] %s rejected on active slot %d req=%d\n",
+                         command, active_cache_slot, req.request_id);
+            stream_emit(-1);
+            return true;
+        };
 
         if (daemon_mode) {
             std::string line;
-            if (!std::getline(std::cin, line)) break;
-            g_sampler = SamplerCfg{};
-            if (parse_sampler_token(line, g_sampler) && g_sampler.seed != 0) {
-                g_sampler_rng.seed(g_sampler.seed);
+            if (!pop_daemon_line(line)) break;
+
+            current_stream_request_id = 0;
+            if (!parse_daemon_request_prefix(line, current_stream_request_id)) {
+                std::fprintf(stderr, "[daemon] invalid request id prefix\n");
+                stream_emit(-1);
+                continue;
+            }
+
+            const bool daemon_slot_prefix_present =
+                line.rfind("SLOT", 0) == 0 || line.rfind("slot", 0) == 0;
+            int daemon_cache_slot = 0;
+            if (!parse_daemon_slot_prefix(line, daemon_cache_slot)
+                || daemon_cache_slot < 0 || daemon_cache_slot >= target_cache_slots) {
+                std::fprintf(stderr, "[daemon] invalid target cache slot %d (slots=%d)\n",
+                             daemon_cache_slot, target_cache_slots);
+                stream_emit(-1);
+                continue;
+            }
+            if (!activate_daemon_cache_slot(daemon_cache_slot)) {
+                std::fprintf(stderr, "[daemon] invalid target cache slot %d (slots=%d)\n",
+                             daemon_cache_slot, target_cache_slots);
+                stream_emit(-1);
+                continue;
             }
 
             // ── Park/unpark commands (additive on top of latest daemon) ─────
@@ -2703,16 +4170,192 @@ int main(int argc, char ** argv) {
                 size_t n = std::strlen(pre);
                 return s.size() >= n && s.compare(0, n, pre) == 0;
             };
+            if (line == "LIST_TARGET_CACHE_SLOTS") {
+                std::printf("[daemon] target_cache_slots=%d\n", target_cache_slots);
+                std::fflush(stdout);
+                stream_emit(-1);
+                continue;
+            }
+            if (line == "LIST_REQUESTS") {
+                std::printf("[daemon] requests=");
+                bool first = true;
+                for (const auto & req : daemon_requests) {
+                    if (!req.active) continue;
+                    std::printf("%sreq=%d:slot=%d:remaining=%d:emitted=%d:q=%d:epoch=%d",
+                                first ? "" : ",",
+                                req.request_id, req.slot_id, req.remaining,
+                                req.emitted, req.quantum, req.epoch);
+                    first = false;
+                }
+                std::printf("\n");
+                std::fflush(stdout);
+                stream_emit(-1);
+                continue;
+            }
+            if (line == "CANCEL" || line.rfind("CANCEL ", 0) == 0) {
+                int cancel_request_id = current_stream_request_id;
+                if (line.rfind("CANCEL ", 0) == 0) {
+                    int parsed_cancel_id = 0;
+                    if (!parse_int(line.substr(7), parsed_cancel_id)) {
+                        std::fprintf(stderr, "[scheduler] CANCEL bad request id\n");
+                        stream_emit(-1);
+                        continue;
+                    }
+                    cancel_request_id = parsed_cancel_id;
+                }
+                if (cancel_request_id <= 0) {
+                    std::fprintf(stderr, "[scheduler] CANCEL requires REQ <id> or CANCEL <id>\n");
+                    stream_emit(-1);
+                    continue;
+                }
+                bool cancelled = false;
+                for (DaemonRequestState & req : daemon_requests) {
+                    if (!req.active || req.request_id != cancel_request_id) continue;
+                    req.active = false;
+                    req.remaining = 0;
+                    req.epoch += 1;
+                    cancelled = true;
+                    std::printf("[scheduler] cancel req=%d slot=%d emitted=%d epoch=%d\n",
+                                req.request_id, req.slot_id, req.emitted, req.epoch);
+                    break;
+                }
+                if (!cancelled) {
+                    std::printf("[scheduler] cancel miss req=%d\n", cancel_request_id);
+                }
+                std::fflush(stdout);
+                stream_emit(-1);
+                continue;
+            }
+            if (line == "SCHED_STEP") {
+                if (!enqueue_next_scheduler_quantum()) {
+                    std::printf("[scheduler] idle\n");
+                    std::fflush(stdout);
+                    stream_emit(-1);
+                }
+                continue;
+            }
+            if (line == "SCHED_BATCH_PEEK" || line.rfind("SCHED_BATCH_PEEK ", 0) == 0) {
+                int max_batch = target_cache_slots;
+                if (line.rfind("SCHED_BATCH_PEEK ", 0) == 0) {
+                    if (!parse_int(line.substr(17), max_batch) || max_batch <= 0) {
+                        std::fprintf(stderr, "[scheduler] SCHED_BATCH_PEEK needs max_batch > 0\n");
+                        stream_emit(-1);
+                        continue;
+                    }
+                }
+                DaemonAlignedBucketSelection selection =
+                    collect_scheduler_aligned_bucket(max_batch,
+                                                     /*tail_only=*/false,
+                                                     /*emit_log=*/true);
+                const std::vector<DaemonBatchCandidate> & batch = selection.batch;
+                std::printf("[scheduler] batch_ready count=%d",
+                            (int)batch.size());
+                for (const DaemonBatchCandidate & candidate : batch) {
+                    std::printf(" req=%d:slot=%d:epoch=%d:n=%d:remaining=%d",
+                                candidate.request_id, candidate.slot_id,
+                                candidate.epoch, candidate.n_gen,
+                                candidate.remaining);
+                }
+                std::printf("\n");
+                std::fflush(stdout);
+                stream_emit(-1);
+                continue;
+            }
+            if (line == "SCHED_BATCH_PROBE" || line.rfind("SCHED_BATCH_PROBE ", 0) == 0) {
+                int max_batch = target_cache_slots;
+                if (line.rfind("SCHED_BATCH_PROBE ", 0) == 0) {
+                    if (!parse_int(line.substr(18), max_batch) || max_batch <= 0) {
+                        std::fprintf(stderr, "[scheduler] SCHED_BATCH_PROBE needs max_batch > 0\n");
+                        stream_emit(-1);
+                        continue;
+                    }
+                }
+                if (!run_scheduler_batch_probe(max_batch)) {
+                    stream_emit(-1);
+                    continue;
+                }
+                stream_emit(-1);
+                continue;
+            }
+            if (line == "SCHED_BATCH_TARGET_TAIL" || line.rfind("SCHED_BATCH_TARGET_TAIL ", 0) == 0) {
+                int max_batch = target_cache_slots;
+                if (line.rfind("SCHED_BATCH_TARGET_TAIL ", 0) == 0) {
+                    if (!parse_int(line.substr(24), max_batch) || max_batch <= 0) {
+                        std::fprintf(stderr, "[scheduler] SCHED_BATCH_TARGET_TAIL needs max_batch > 0\n");
+                        stream_emit(-1);
+                        continue;
+                    }
+                }
+                if (!run_scheduler_batch_target_step(max_batch, /*tail_only=*/true)) {
+                    stream_emit(-1);
+                    continue;
+                }
+                continue;
+            }
+            if (line == "SCHED_BATCH_TARGET_STEP" || line.rfind("SCHED_BATCH_TARGET_STEP ", 0) == 0) {
+                int max_batch = target_cache_slots;
+                if (line.rfind("SCHED_BATCH_TARGET_STEP ", 0) == 0) {
+                    if (!parse_int(line.substr(24), max_batch) || max_batch <= 0) {
+                        std::fprintf(stderr, "[scheduler] SCHED_BATCH_TARGET_STEP needs max_batch > 0\n");
+                        stream_emit(-1);
+                        continue;
+                    }
+                }
+                if (!run_scheduler_batch_target_step(max_batch, /*tail_only=*/false)) {
+                    stream_emit(-1);
+                    continue;
+                }
+                continue;
+            }
+            if (line == "SCHED_BATCH_DRAIN" || line.rfind("SCHED_BATCH_DRAIN ", 0) == 0) {
+                int max_batch = target_cache_slots;
+                if (line.rfind("SCHED_BATCH_DRAIN ", 0) == 0) {
+                    if (!parse_int(line.substr(18), max_batch) || max_batch <= 0) {
+                        std::fprintf(stderr, "[scheduler] SCHED_BATCH_DRAIN needs max_batch > 0\n");
+                        stream_emit(-1);
+                        continue;
+                    }
+                }
+                daemon_scheduler_drain = true;
+                bool progressed = false;
+                while (!has_daemon_input()) {
+                    if (run_scheduler_batch_target_step(max_batch,
+                                                        /*tail_only=*/false,
+                                                        /*quiet_unavailable=*/true)) {
+                        progressed = true;
+                        continue;
+                    }
+                    if (!enqueue_next_scheduler_quantum()) {
+                        daemon_scheduler_drain = false;
+                        std::printf("[scheduler] drain complete\n");
+                        std::fflush(stdout);
+                        if (!progressed) stream_emit(-1);
+                    }
+                    break;
+                }
+                continue;
+            }
+            if (line == "SCHED_DRAIN") {
+                daemon_scheduler_drain = true;
+                if (!enqueue_next_scheduler_quantum()) {
+                    daemon_scheduler_drain = false;
+                    std::printf("[scheduler] idle\n");
+                    std::fflush(stdout);
+                    stream_emit(-1);
+                }
+                continue;
+            }
             if (starts_with(line, "park")) {
                 bool want_draft  = (line == "park" || line == "park all" || line == "park draft");
                 bool want_target = (line == "park" || line == "park all" || line == "park target");
                 if (want_draft && !draft_parked) {
+                    destroy_draft_graphs_all_slots();
                     free_draft_weights(dw);
                     draft_parked = true;
                     std::printf("[park] draft released\n"); std::fflush(stdout);
                 }
                 if (want_target && !target_parked) {
-                    step_graph_destroy(proj_sg);
+                    destroy_target_graphs_all_slots();
                     free_target_weights(w);
                     target_parked = true;
                     std::printf("[park] target released\n"); std::fflush(stdout);
@@ -2769,13 +4412,11 @@ int main(int argc, char ** argv) {
             // Output: stream of int32 compressed token IDs, terminated by -1.
             // Drafter coexists with target+draft via libllama in the same
             // ggml allocator — no park/unpark needed for compression itself.
-            if (starts_with(line, "compress ")) {
-                char ppath[1024];
+            if (starts_with(line, "compress ") || starts_with(line, "compress\t")) {
+                std::string ppath;
                 int  keep_x1000 = 0;
-                char drafter_path[1024];
-                int n = std::sscanf(line.c_str() + 9, "%1023s %d %1023s",
-                                    ppath, &keep_x1000, drafter_path);
-                if (n != 3) {
+                std::string drafter_path;
+                if (!parse_daemon_compress_command(line, ppath, keep_x1000, drafter_path)) {
                     std::fprintf(stderr,
                                  "[compress] bad args, need: <bin> <keep_x1000> <drafter_gguf>\n");
                     stream_emit(-1); continue;
@@ -2789,33 +4430,53 @@ int main(int argc, char ** argv) {
                 // Park target + draft before allocating drafter context so
                 // the drafter's KV (~1.3 GB Q4_0) + scratch (~600 MB) have
                 // headroom on a 24 GB card. Restore after scoring.
-                // On >=32 GB GPUs, DFLASH_COMPRESS_NO_PARK=1 skips parking
-                // so the scorer stays co-resident with target+draft.
-                const bool no_park = (std::getenv("DFLASH_COMPRESS_NO_PARK") &&
-                                      std::atoi(std::getenv("DFLASH_COMPRESS_NO_PARK")) != 0);
-                bool restore_target = !target_parked && !no_park;
-                bool restore_draft  = !draft_parked && !no_park;
+                bool restore_target = !target_parked;
+                bool restore_draft  = !draft_parked;
                 if (restore_target) {
-                    step_graph_destroy(proj_sg);
+                    destroy_target_graphs_all_slots();
                     free_target_weights(w);
                     target_parked = true;
                     std::printf("[compress] target parked\n"); std::fflush(stdout);
                 }
                 if (restore_draft) {
+                    destroy_draft_graphs_all_slots();
                     free_draft_weights(dw);
                     draft_parked = true;
                     std::printf("[compress] draft parked\n"); std::fflush(stdout);
                 }
+                auto restore_after_compress_failure = [&]() {
+                    if (restore_target && target_parked) {
+                        if (load_target_gguf(target_path, target_backend, w)) {
+                            target_parked = false;
+                            std::printf("[compress] target restored after failure\n");
+                            std::fflush(stdout);
+                        } else {
+                            std::fprintf(stderr, "[compress] target restore after failure: %s\n",
+                                         dflash27b_last_error());
+                        }
+                    }
+                    if (restore_draft && draft_parked) {
+                        if (load_draft_auto(draft_path, draft_backend, dw)) {
+                            draft_parked = false;
+                            std::printf("[compress] draft restored after failure\n");
+                            std::fflush(stdout);
+                        } else {
+                            std::fprintf(stderr, "[compress] draft restore after failure: %s\n",
+                                         dflash27b_last_error());
+                        }
+                    }
+                };
 
                 if (!drafter_loaded) {
-                    if (!dflash27b::load_drafter(drafter_path, /*gpu_layers=*/999, drafter_ctx)) {
+                    if (!dflash27b::load_drafter(drafter_path.c_str(), /*gpu_layers=*/999, drafter_ctx)) {
                         std::fprintf(stderr, "[compress] load_drafter failed: %s\n",
                                      dflash27b_last_error());
+                        restore_after_compress_failure();
                         stream_emit(-1); continue;
                     }
                     drafter_loaded = true;
                     std::printf("[drafter] loaded %s (n_layer=%d n_head=%d n_head_kv=%d)\n",
-                                drafter_path, drafter_ctx.weights.n_layer,
+                                drafter_path.c_str(), drafter_ctx.weights.n_layer,
                                 drafter_ctx.weights.n_head, drafter_ctx.weights.n_head_kv);
                     std::fflush(stdout);
                 }
@@ -2839,7 +4500,7 @@ int main(int argc, char ** argv) {
                     std::printf("[compress] target restored\n"); std::fflush(stdout);
                 }
                 if (restore_draft) {
-                    if (!load_draft_safetensors(draft_path, draft_backend, dw)) {
+                    if (!load_draft_auto(draft_path, draft_backend, dw)) {
                         std::fprintf(stderr, "[compress] draft restore: %s\n",
                                      dflash27b_last_error());
                         stream_emit(-1); continue;
@@ -2916,6 +4577,7 @@ int main(int argc, char ** argv) {
                 continue;
             }
             if (line.rfind("RESTORE_CHAIN ", 0) == 0) {
+                if (reject_active_scheduler_slot("RESTORE_CHAIN")) continue;
                 // Format: RESTORE_CHAIN <thick_slot> <thin_slot_list> <prompt_file> <n_gen>
                 // <thin_slot_list> is "0,1,2" or "-" for empty.
                 int  thick_slot_local = -2;
@@ -2987,6 +4649,7 @@ int main(int argc, char ** argv) {
                 chain_thin_ids           = std::move(thin_ids_local);
                 // Fall through into the existing cache-rebuild + prefill path.
             } else if (line.rfind("RESTORE ", 0) == 0) {
+                if (reject_active_scheduler_slot("RESTORE")) continue;
                 int slot = -1;
                 char ppath[1024];
                 if (std::sscanf(line.c_str() + 8, "%d %1023s %d", &slot, ppath, &n_gen) != 3
@@ -3010,10 +4673,83 @@ int main(int argc, char ** argv) {
                 }
                 // Fall through into the existing prefill path; the cache reset
                 // and restore happen after the cache rebuild block below.
+            } else if (parse_daemon_start_command(line, prompt_file_str,
+                                                  scheduler_total_gen,
+                                                  scheduler_quantum)) {
+                if (current_stream_request_id <= 0) {
+                    std::fprintf(stderr, "[scheduler] START requires REQ <id>\n");
+                    stream_emit(-1);
+                    continue;
+                }
+                if (scheduler_total_gen <= 0 || scheduler_quantum <= 0) {
+                    std::fprintf(stderr, "[scheduler] START needs total_gen and quantum > 0\n");
+                    stream_emit(-1);
+                    continue;
+                }
+                if (!daemon_slot_prefix_present) {
+                    int admitted_slot = -1;
+                    for (int sid = 0; sid < target_cache_slots; sid++) {
+                        if (!daemon_requests[(size_t)sid].active) {
+                            admitted_slot = sid;
+                            break;
+                        }
+                    }
+                    if (admitted_slot < 0) {
+                        std::fprintf(stderr, "[scheduler] no free target cache slots\n");
+                        stream_emit(-1);
+                        continue;
+                    }
+                    if (!activate_daemon_cache_slot(admitted_slot)) {
+                        std::fprintf(stderr, "[scheduler] failed to activate slot %d\n",
+                                     admitted_slot);
+                        stream_emit(-1);
+                        continue;
+                    }
+                    std::printf("[scheduler] admit req=%d slot=%d\n",
+                                current_stream_request_id, active_cache_slot);
+                    std::fflush(stdout);
+                }
+                if (daemon_requests[(size_t)active_cache_slot].active) {
+                    std::fprintf(stderr, "[scheduler] slot %d already has active request %d\n",
+                                 active_cache_slot,
+                                 daemon_requests[(size_t)active_cache_slot].request_id);
+                    stream_emit(-1);
+                    continue;
+                }
+                n_gen = std::min(scheduler_total_gen, scheduler_quantum);
+                prompt_path = prompt_file_str.c_str();
+                scheduler_start_requested = true;
+            } else if (parse_daemon_continue_command(line, n_gen)) {
+                continue_decode_requested = true;
+                if (cache.cur_pos <= 0 || cache.last_tok < 0) {
+                    std::fprintf(stderr,
+                                 "[daemon] CONTINUE requested before slot has active decode state\n");
+                    stream_emit(-1);
+                    continue;
+                }
+                if (n_gen <= 0) {
+                    std::fprintf(stderr, "[daemon] CONTINUE needs n_gen > 0\n");
+                    stream_emit(-1);
+                    continue;
+                }
+                const DaemonRequestState & req = daemon_requests[(size_t)active_cache_slot];
+                if (req.active) {
+                    if (current_stream_request_id <= 0
+                        || req.request_id != current_stream_request_id) {
+                        std::fprintf(stderr,
+                                     "[scheduler] stale CONTINUE rejected slot=%d expected_req=%d got_req=%d\n",
+                                     active_cache_slot, req.request_id,
+                                     current_stream_request_id);
+                        stream_emit(-1);
+                        continue;
+                    }
+                    scheduler_continue_requested = true;
+                }
             } else {
                 // Legacy: bare `<prompt_file> <n_gen>` line — full reset path.
-                char ppath[1024];
-                if (std::sscanf(line.c_str(), "%1023s %d", ppath, &n_gen) != 2) continue;
+                if (reject_active_scheduler_slot("legacy generate")) continue;
+                std::string ppath;
+                if (!parse_daemon_generate_command(line, ppath, n_gen)) continue;
                 prompt_file_str = ppath;
                 prompt_path = prompt_file_str.c_str();
                 // Parse optional inline-snap suffix: snap=<pos>:<slot_id>
@@ -3026,15 +4762,16 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            // Reset cache state between requests. On the first request the
-            // cache was promoted from prefill-only to full (with rollback
-            // tensors) by migrate_prefill_cache. On subsequent requests we
-            // just zero all state tensors in place — no GPU buffer free/alloc.
-            if (!daemon_first_iter) {
-                step_graph_free(sg);
-                reset_target_cache(cache);
+            // Reset all per-request slot state between fresh requests. Prefix
+            // snapshots intentionally survive until FREE_SNAPSHOT or shutdown:
+            // SNAPSHOT/RESTORE is an explicit cross-request API contract.
+            // The first request still takes the existing promote path from
+            // prefill-only to full cache allocation.
+            if (!continue_decode_requested && !daemon_first_iter) {
+                scrub_daemon_slot_state(cache, sg, draft_sg, proj_sg,
+                                        feature_mirror, daemon_first_iter);
             }
-            daemon_first_iter = false;
+            if (!continue_decode_requested) daemon_first_iter = false;
 
             // After cache is fresh, optionally restore from snapshot.
             if (restore_from_slot) {
@@ -3068,12 +4805,39 @@ int main(int argc, char ** argv) {
             }
         }
 
-        auto prompt = read_int32_file(prompt_path);
+        std::vector<int32_t> out_all;
+        int committed = 0;
+        int32_t last_tok = -1;
+
+        if (continue_decode_requested) {
+            committed = cache.cur_pos;
+            last_tok = cache.last_tok;
+            if (committed + n_gen + q_len > max_ctx) {
+                std::fprintf(stderr,
+                             "continue cur_pos (%d) + gen (%d) + block (%d) = %d exceeds max_ctx (%d)\n",
+                             committed, n_gen, q_len, committed + n_gen + q_len, max_ctx);
+                stream_emit(-1);
+                continue;
+            }
+            std::printf("[continue] cur_pos=%d last_tok=%d n_gen=%d\n",
+                        committed, last_tok, n_gen);
+        } else {
+        std::vector<int32_t> prompt;
+        if (synthetic_prompt_tokens > 0 && !prompt_path) {
+            prompt.assign((size_t)synthetic_prompt_tokens,
+                          (int32_t)synthetic_prompt_token);
+            std::printf("[prompt] synthetic %zu tokens token=%d\n",
+                        prompt.size(), synthetic_prompt_token);
+        } else {
+            prompt = read_int32_file(prompt_path);
+        }
         if (prompt.empty()) {
             std::fprintf(stderr, "empty prompt\n");
             if (daemon_mode) { stream_emit(-1); continue; } else return 1;
         }
-        std::printf("[prompt] %zu tokens\n", prompt.size());
+        if (synthetic_prompt_tokens <= 0 || prompt_path) {
+            std::printf("[prompt] %zu tokens\n", prompt.size());
+        }
 
         if ((int)prompt.size() + n_gen + q_len > max_ctx) {
             std::fprintf(stderr, "prompt (%zu) + gen (%d) + block (%d) = %d exceeds max_ctx (%d)\n",
@@ -3082,9 +4846,9 @@ int main(int argc, char ** argv) {
         }
 
         std::vector<float>   embed_buf(hidden);
-        std::vector<int32_t> out_all = prompt;
-        int committed = 0;
-        int32_t last_tok = -1;
+        out_all = prompt;
+        committed = 0;
+        last_tok = -1;
 
     // ── Prefill: two modes available ────────────────────────────────────
     // Layer-segmented: iterate layers (outer) × token chunks (inner).
@@ -3224,9 +4988,7 @@ int main(int argc, char ** argv) {
             std::vector<float> logits_buf(vocab, 0.0f);
             ggml_backend_tensor_get(lsg.logits, logits_buf.data(), 0,
                                     sizeof(float) * vocab);
-            last_tok = (g_sampler.temp > 0.0f)
-                ? sample_logits(logits_buf.data(), vocab, g_sampler, out_all, g_sampler_rng)
-                : argmax_f32(logits_buf.data(), vocab);
+            last_tok = argmax_f32(logits_buf.data(), vocab);
             step_graph_destroy(lsg);
         }
 
@@ -3253,9 +5015,6 @@ int main(int argc, char ** argv) {
     }
     // ── Token-segmented prefill (legacy) ────────────────────────────────
     if (!layer_prefill) {
-    // Prefill only needs last-token logits to seed decode. Skip computing
-    // the full [vocab, ubatch] lm_head matmul — saves ~233MB scratch at
-    // ubatch=384 and eliminates a large matmul per prefill step.
     int prefill_ubatch_env = (prompt_len_auto > 2048) ? 384 : 16;
     if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
         prefill_ubatch_env = std::max(1, std::atoi(s));
@@ -3269,26 +5028,6 @@ int main(int argc, char ** argv) {
     std::vector<float>    pf_logits_buf;
     const int prompt_len     = (int)prompt.size();
     const int prefill_start  = cache.cur_pos;   // 0 for fresh cache; >0 after snapshot restore
-
-    // Pre-reserve gallocr: build a max-size graph so gallocr allocates its
-    // buffer upfront, preventing reallocations as the mask grows during prefill.
-    // With fa_window, the mask is capped at ~fa_window+ubatch regardless of
-    // prompt length, so the reserve is always small.
-    if (prompt_len > PREFILL_UBATCH) {
-        // Use kv_start near the end so the mask reaches its maximum windowed size.
-        const int reserve_kv = std::max(prompt_len - PREFILL_UBATCH, PREFILL_UBATCH);
-        if (!build_target_step(sg, w, cache, backend,
-                                /*kv_start=*/reserve_kv,
-                                /*n_tokens=*/PREFILL_UBATCH,
-                                /*with_mask=*/true, /*capture=*/true,
-                                /*capture_delta_intermediate=*/false,
-                                /*fa_window=*/g_fa_window,
-                                /*last_token_logits_only=*/true)) {
-            std::fprintf(stderr, "prefill gallocr pre-reserve failed\n"); return 1;
-        }
-        // gallocr is now reserved at peak size; subsequent builds will reuse it.
-    }
-
     for (int start = prefill_start; start < prompt_len; start += PREFILL_UBATCH) {
         int n_tokens = std::min(PREFILL_UBATCH, prompt_len - start);
 
@@ -3325,10 +5064,7 @@ int main(int argc, char ** argv) {
         const bool pf_with_mask = (g_kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
         if (!build_target_step(sg, w, cache, backend,
                                 /*kv_start=*/start, /*n_tokens=*/n_tokens,
-                                /*with_mask=*/pf_with_mask, /*capture=*/true,
-                                /*capture_delta_intermediate=*/false,
-                                /*fa_window=*/g_fa_window,
-                                /*last_token_logits_only=*/true)) {
+                                /*with_mask=*/pf_with_mask, /*capture=*/true)) {
             std::fprintf(stderr, "prefill build @%d\n", start); return 1;
         }
 
@@ -3355,11 +5091,7 @@ int main(int argc, char ** argv) {
         // is active (which pads kv_len to 256 and needs -inf on the padding
         // positions even for a single query).
         if (pf_with_mask) {
-            const int pf_win_start = (g_fa_window > 0 && start > g_fa_window)
-                                         ? (start - g_fa_window) : 0;
-            const int pf_win_len = kv_len - pf_win_start;
-            build_causal_mask(pf_mask_buf, pf_win_len, n_tokens,
-                              /*kv_start=*/start, /*win_start=*/pf_win_start);
+            build_causal_mask(pf_mask_buf, kv_len, n_tokens, /*kv_start=*/start);
             ggml_backend_tensor_set(sg.attn_mask, pf_mask_buf.data(), 0,
                                     sizeof(uint16_t) * pf_mask_buf.size());
         }
@@ -3367,13 +5099,12 @@ int main(int argc, char ** argv) {
         auto st = ggml_backend_graph_compute(backend, sg.gf);
         if (st != GGML_STATUS_SUCCESS) { std::fprintf(stderr, "prefill compute @%d\n", start); return 1; }
 
-        // Logits are [vocab, 1] (last_token_logits_only), read from offset 0.
+        // Only need the last position's logits to seed decode.
         pf_logits_buf.assign(vocab, 0.0f);
-        ggml_backend_tensor_get(sg.logits, pf_logits_buf.data(), 0,
+        const size_t last_row_off = (size_t)(n_tokens - 1) * vocab * sizeof(float);
+        ggml_backend_tensor_get(sg.logits, pf_logits_buf.data(), last_row_off,
                                 sizeof(float) * vocab);
-        last_tok = (g_sampler.temp > 0.0f)
-            ? sample_logits(pf_logits_buf.data(), vocab, g_sampler, out_all, g_sampler_rng)
-            : argmax_f32(pf_logits_buf.data(), vocab);
+        last_tok = argmax_f32(pf_logits_buf.data(), vocab);
         committed = start + n_tokens;
 
         // Fire inline snapshot after compute, so cache boundary is exact.
@@ -3422,6 +5153,7 @@ int main(int argc, char ** argv) {
     std::printf("[migrate] %.2f ms\n",
                 std::chrono::duration<double, std::milli>(t_mig1 - t_mig0).count());
     } // end if (!layer_prefill)
+        } // end fresh prompt/prefill path
 
     if (draft_feature_mirror) {
         if (!feature_mirror.target_feat || feature_mirror.cap != cache.target_feat_cap) {
@@ -3444,6 +5176,7 @@ int main(int argc, char ** argv) {
 
     // ── DFlash decode loop
     int n_draft_steps = 0, n_accept_sum = 0, n_generated = 0;
+    bool hit_eos_decode = false;
     std::vector<float>   noise_embed_buf(hidden * q_len);
     std::vector<int32_t> noise_ids(q_len);
     std::vector<int32_t> draft_tok(q_len), target_tok(q_len);
@@ -3466,8 +5199,10 @@ int main(int argc, char ** argv) {
            tt_replay_build = 0, tt_replay_set = 0, tt_replay_compute = 0,
            tt_replay_logits = 0, tt_mirror_sync = 0;
     auto sync_us = [&](){
-        ggml_backend_synchronize(target_backend);
-        if (split_gpus) ggml_backend_synchronize(draft_backend);
+        if (timing_debug) {
+            ggml_backend_synchronize(target_backend);
+            if (split_gpus) ggml_backend_synchronize(draft_backend);
+        }
         return std::chrono::steady_clock::now();
     };
     auto sync_draft_feature_mirror = [&](int start_pos, int n_tokens) -> bool {
@@ -3534,17 +5269,16 @@ int main(int argc, char ** argv) {
             const int    post_n   = draft_ctx - pre_n;
 
             cudaSetDevice(draft_gpu);
-            auto bf16_to_f32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
-            bf16_to_f32(
+            dflash27b_launch_bf16_to_f32(
                 (const char *)cache.target_feat->data + (size_t)slot0 * elt_feat * fc_in,
-                (float *)draft_sg.target_hidden_cat->data,
-                (int64_t)pre_n * fc_in,
+                draft_sg.target_hidden_cat->data,
+                (size_t)pre_n * fc_in,
                 nullptr);
             if (post_n > 0) {
-                bf16_to_f32(
+                dflash27b_launch_bf16_to_f32(
                     (const char *)cache.target_feat->data,
-                    (float *)((char *)draft_sg.target_hidden_cat->data + (size_t)pre_n * fc_in * sizeof(float)),
-                    (int64_t)post_n * fc_in,
+                    (char *)draft_sg.target_hidden_cat->data + (size_t)pre_n * fc_in * sizeof(float),
+                    (size_t)post_n * fc_in,
                     nullptr);
             }
         }
@@ -3555,6 +5289,11 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < draft_ctx + q_len; i++) pos_k_buf[i] = i;
         ggml_backend_tensor_set(draft_sg.positions,   pos_q_buf.data(), 0, sizeof(int32_t) * q_len);
         ggml_backend_tensor_set(draft_sg.positions_k, pos_k_buf.data(), 0, sizeof(int32_t) * (draft_ctx + q_len));
+        if (draft_sg.attn_mask) {
+            build_draft_swa_mask(mask_buf, draft_ctx, q_len, dw.swa_window);
+            ggml_backend_tensor_set(draft_sg.attn_mask, mask_buf.data(), 0,
+                                    sizeof(uint16_t) * mask_buf.size());
+        }
         auto T_draft_set = sync_us();
         tt_draft_set += std::chrono::duration<double, std::micro>(T_draft_set - T_draft_copy).count();
 
@@ -3795,15 +5534,7 @@ int main(int argc, char ** argv) {
 
             // Walk tree: accepted DFS indices and next bonus token.
             int next_token = -1;
-            int bonus_node_idx = 0;
-            std::vector<int> accepted = follow_verified_tree(tree, posterior.data(), next_token, &bonus_node_idx);
-            if (g_sampler.temp > 0.0f) {
-                std::vector<float> bonus_logits(vocab);
-                ggml_backend_tensor_get(sg.logits, bonus_logits.data(),
-                                        (size_t)bonus_node_idx * sg.logits->nb[1],
-                                        (size_t)vocab * sizeof(float));
-                next_token = sample_logits(bonus_logits.data(), vocab, g_sampler, out_all, g_sampler_rng);
-            }
+            std::vector<int> accepted = follow_verified_tree(tree, posterior.data(), next_token);
             const int accept_depth = (int)accepted.size();  // includes root
 
             // Detect when the walk takes a sibling branch (accepted node
@@ -3828,8 +5559,10 @@ int main(int argc, char ** argv) {
             }
 
 
-            std::printf("[step %d] committed=%d last_tok=%d tree_N=%d accept=%d next=%d\n",
-                        n_draft_steps, committed, last_tok, N_actual, accept_depth, next_token);
+            if (step_debug) {
+                std::printf("[step %d] committed=%d last_tok=%d tree_N=%d accept=%d next=%d\n",
+                            n_draft_steps, committed, last_tok, N_actual, accept_depth, next_token);
+            }
 
             // Commit count: matches chain mode's accept_n semantics. The root
             // (= previous iter's last_tok) is "pending" — not yet in out_all —
@@ -3858,7 +5591,10 @@ int main(int argc, char ** argv) {
             auto T_accept = sync_us();
             tt_accept += std::chrono::duration<double, std::micro>(T_accept - T_verify_compute).count();
 
-            if (hit_eos) break;
+            if (hit_eos) {
+                hit_eos_decode = true;
+                break;
+            }
 
             // Rollback: per-layer DeltaNet SSM and conv state + KV compaction
             // for full-attention layers.
@@ -3889,9 +5625,10 @@ int main(int argc, char ** argv) {
                         return 1;
                     }
                     // SSM state rollback: source is cache.ssm_intermediate_states
-                    // ([S_v, S_v, H_v, max_verify_tokens]) at slot rollback_dfs.
-                    // Destination is cache.ssm_state[il] (f32). Use ggml's
-                    // built-in dequantize to widen Q8_0/F16 → f32.
+                    // (f16, [S_v, S_v, H_v, max_verify_tokens]) at slot
+                    // rollback_dfs. Destination is cache.ssm_state[il] (f32).
+                    // Use a tiny CUDA kernel (src/f16_convert.cu) to widen f16
+                    // → f32 in a single launch per layer.
                     const size_t ssm_elems =
                         (size_t)cache.ssm_state[il]->ne[0] *
                         (size_t)cache.ssm_state[il]->ne[1] *
@@ -3900,9 +5637,10 @@ int main(int argc, char ** argv) {
                         (size_t)rollback_dfs * cap.ssm_intermediate_states->nb[3];
                     const void * ssm_src =
                         (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
-                    ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type)(
-                        ssm_src, (float *)cache.ssm_state[il]->data,
-                        (int64_t)ssm_elems, stream);
+                    dflash27b_launch_f16_to_f32(ssm_src,
+                                                cache.ssm_state[il]->data,
+                                                ssm_elems,
+                                                stream);
                     cudaError_t ce = cudaSuccess;  // launch error checked in the conv block below
 
                     // Conv rollback: copy the K-1 most recent inputs along
@@ -4119,7 +5857,9 @@ int main(int argc, char ** argv) {
         auto T_verify_logits = sync_us();
         tt_verify_logits += std::chrono::duration<double, std::micro>(T_verify_logits - T_verify_compute).count();
 
-        std::printf("[step %d] committed=%d last_tok=%d\n", n_draft_steps, committed, last_tok);
+        if (step_debug) {
+            std::printf("[step %d] committed=%d last_tok=%d\n", n_draft_steps, committed, last_tok);
+        }
 
         // 5) Greedy longest-prefix accept with standard spec-decoding comparison.
         //
@@ -4155,8 +5895,10 @@ int main(int argc, char ** argv) {
             }
             commit_n = accept_n + (bonus_tok >= 0 ? 1 : 0);
         }
-        std::printf("[step %d] accept_n=%d bonus=%d commit_n=%d\n",
-                    n_draft_steps, accept_n, bonus_tok, commit_n);
+        if (step_debug) {
+            std::printf("[step %d] accept_n=%d bonus=%d commit_n=%d\n",
+                        n_draft_steps, accept_n, bonus_tok, commit_n);
+        }
 
         // Don't overshoot n_gen
         if (commit_n > need_commit_budget) {
@@ -4209,9 +5951,9 @@ int main(int argc, char ** argv) {
                     //
                     // cap.ssm_intermediate_states is the persistent cache buffer
                     // cache.ssm_intermediate[il], shape [S_v, S_v, H_v, q_len].
-                    // Stored in Q8_0 (or F16 legacy) to reduce memory;
-                    // cache.ssm_state[il] is f32. Use ggml's built-in dequantize
-                    // to convert on copy, same as the DDtree rollback path.
+                    // Stored in f16 (see create_target_cache) to halve memory;
+                    // cache.ssm_state[il] is f32. Use the widen kernel to
+                    // convert on copy, same as the DDtree rollback path.
                     const size_t ssm_elems =
                         (size_t)cache.ssm_state[il]->ne[0] *
                         (size_t)cache.ssm_state[il]->ne[1] *
@@ -4220,9 +5962,10 @@ int main(int argc, char ** argv) {
                         (size_t)rollback_idx * cap.ssm_intermediate_states->nb[3];
                     const void * ssm_src =
                         (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
-                    ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type)(
-                        ssm_src, (float *)cache.ssm_state[il]->data,
-                        (int64_t)ssm_elems, stream);
+                    dflash27b_launch_f16_to_f32(ssm_src,
+                                                cache.ssm_state[il]->data,
+                                                ssm_elems,
+                                                stream);
                     cudaError_t ce = cudaSuccess;
 
                     // ── Conv rollback: copy conv_input[commit_n..commit_n+K-2, :, :]
@@ -4276,7 +6019,10 @@ int main(int argc, char ** argv) {
                 out_all.push_back(draft_tok[i]); stream_emit(draft_tok[i]);
                 if (IS_EOS_TOK(draft_tok[i], w)) hit_eos = true;
             }
-            if (hit_eos) break;
+            if (hit_eos) {
+                hit_eos_decode = true;
+                break;
+            }
         } else {
             // ── Legacy replay path ──
             restore_ssm_state(cache);
@@ -4342,7 +6088,10 @@ int main(int argc, char ** argv) {
                 out_all.push_back(replay_tok[i]); stream_emit(replay_tok[i]);
                 if (IS_EOS_TOK(replay_tok[i], w)) hit_eos = true;
             }
-            if (hit_eos) break;
+            if (hit_eos) {
+                hit_eos_decode = true;
+                break;
+            }
         }
 
         if (!sync_draft_feature_mirror(committed, commit_n)) {
@@ -4360,32 +6109,34 @@ int main(int argc, char ** argv) {
     double gen_s = std::chrono::duration<double>(t_gen1 - t_gen0).count();
     double tps = n_generated / std::max(1e-9, gen_s);
 
-    auto avg_ms = [&](double us){ return us / std::max(1, n_draft_steps) / 1000.0; };
-    std::printf("\n[timing] per-step averages over %d steps (ms):\n", n_draft_steps);
-    std::printf("  draft_build    %.2f\n", avg_ms(tt_draft_build));
-    std::printf("  draft_copyfeat %.2f\n", avg_ms(tt_draft_copy_feat));
-    std::printf("  draft_set      %.2f\n", avg_ms(tt_draft_set));
-    std::printf("  draft_compute  %.2f\n", avg_ms(tt_draft_compute));
-    std::printf("  draft_bridge   %.2f\n", avg_ms(tt_draft_bridge));
-    std::printf("  draft_logits   %.2f\n", avg_ms(tt_draft_logits));
-    std::printf("  snapshot_ssm   %.2f\n", avg_ms(tt_snap));
-    std::printf("  verify_build   %.2f\n", avg_ms(tt_verify_build));
-    std::printf("  verify_set     %.2f\n", avg_ms(tt_verify_set));
-    std::printf("  verify_compute %.2f\n", avg_ms(tt_verify_compute));
-    std::printf("  verify_logits  %.2f\n", avg_ms(tt_verify_logits));
-    std::printf("  accept         %.2f\n", avg_ms(tt_accept));
-    std::printf("  restore_ssm    %.2f\n", avg_ms(tt_restore));
-    std::printf("  replay_build   %.2f\n", avg_ms(tt_replay_build));
-    std::printf("  replay_set     %.2f\n", avg_ms(tt_replay_set));
-    std::printf("  replay_compute %.2f\n", avg_ms(tt_replay_compute));
-    std::printf("  replay_logits  %.2f\n", avg_ms(tt_replay_logits));
-    std::printf("  mirror_sync    %.2f\n", avg_ms(tt_mirror_sync));
-    double sum_ms = avg_ms(tt_draft_build + tt_draft_copy_feat + tt_draft_set + tt_draft_compute + tt_draft_logits
-                           + tt_draft_bridge
-                           + tt_snap + tt_verify_build + tt_verify_set + tt_verify_compute + tt_verify_logits
-                           + tt_accept + tt_restore + tt_replay_build + tt_replay_set + tt_replay_compute + tt_replay_logits
-                           + tt_mirror_sync);
-    std::printf("  ----- sum     %.2f\n", sum_ms);
+    if (timing_debug) {
+        auto avg_ms = [&](double us){ return us / std::max(1, n_draft_steps) / 1000.0; };
+        std::printf("\n[timing] per-step averages over %d steps (ms):\n", n_draft_steps);
+        std::printf("  draft_build    %.2f\n", avg_ms(tt_draft_build));
+        std::printf("  draft_copyfeat %.2f\n", avg_ms(tt_draft_copy_feat));
+        std::printf("  draft_set      %.2f\n", avg_ms(tt_draft_set));
+        std::printf("  draft_compute  %.2f\n", avg_ms(tt_draft_compute));
+        std::printf("  draft_bridge   %.2f\n", avg_ms(tt_draft_bridge));
+        std::printf("  draft_logits   %.2f\n", avg_ms(tt_draft_logits));
+        std::printf("  snapshot_ssm   %.2f\n", avg_ms(tt_snap));
+        std::printf("  verify_build   %.2f\n", avg_ms(tt_verify_build));
+        std::printf("  verify_set     %.2f\n", avg_ms(tt_verify_set));
+        std::printf("  verify_compute %.2f\n", avg_ms(tt_verify_compute));
+        std::printf("  verify_logits  %.2f\n", avg_ms(tt_verify_logits));
+        std::printf("  accept         %.2f\n", avg_ms(tt_accept));
+        std::printf("  restore_ssm    %.2f\n", avg_ms(tt_restore));
+        std::printf("  replay_build   %.2f\n", avg_ms(tt_replay_build));
+        std::printf("  replay_set     %.2f\n", avg_ms(tt_replay_set));
+        std::printf("  replay_compute %.2f\n", avg_ms(tt_replay_compute));
+        std::printf("  replay_logits  %.2f\n", avg_ms(tt_replay_logits));
+        std::printf("  mirror_sync    %.2f\n", avg_ms(tt_mirror_sync));
+        double sum_ms = avg_ms(tt_draft_build + tt_draft_copy_feat + tt_draft_set + tt_draft_compute + tt_draft_logits
+                               + tt_draft_bridge
+                               + tt_snap + tt_verify_build + tt_verify_set + tt_verify_compute + tt_verify_logits
+                               + tt_accept + tt_restore + tt_replay_build + tt_replay_set + tt_replay_compute + tt_replay_logits
+                               + tt_mirror_sync);
+        std::printf("  ----- sum     %.2f\n", sum_ms);
+    }
 
     std::printf("\n[dflash] generated %d tokens in %.3f s  ->  %.2f tok/s\n",
                 n_generated, gen_s, tps);
@@ -4394,20 +6145,58 @@ int main(int argc, char ** argv) {
                 n_draft_steps, n_accept_sum, n_draft_steps * q_len,
                 (n_draft_steps > 0 ? 100.0 * n_accept_sum / (n_draft_steps * q_len) : 0.0),
                 (n_draft_steps > 0 ? (double)n_generated / n_draft_steps : 0.0));
-    std::printf("[dflash] output tail: ");
-    int tail_start = std::max(0, (int)out_all.size() - 20);
-    for (int i = tail_start; i < (int)out_all.size(); i++) std::printf("%d ", out_all[i]);
-    std::printf("\n");
+    if (output_tail) {
+        std::printf("[dflash] output tail: ");
+        int tail_start = std::max(0, (int)out_all.size() - 20);
+        for (int i = tail_start; i < (int)out_all.size(); i++) std::printf("%d ", out_all[i]);
+        std::printf("\n");
+    }
+    std::fflush(stdout);
 
     if (daemon_mode) {
+        bool scheduler_request_still_active = false;
+        if (scheduler_start_requested) {
+            DaemonRequestState & req = daemon_requests[(size_t)active_cache_slot];
+            req.active = !hit_eos_decode && n_generated < scheduler_total_gen;
+            req.request_id = current_stream_request_id;
+            req.slot_id = active_cache_slot;
+            req.remaining = std::max(0, scheduler_total_gen - n_generated);
+            req.quantum = scheduler_quantum;
+            req.emitted = n_generated;
+            req.epoch += 1;
+            scheduler_request_still_active = req.active;
+            std::printf("[scheduler] start req=%d slot=%d emitted=%d remaining=%d q=%d active=%d epoch=%d\n",
+                        req.request_id, req.slot_id, req.emitted, req.remaining,
+                        req.quantum, (int)req.active, req.epoch);
+            std::fflush(stdout);
+        } else if (scheduler_continue_requested) {
+            DaemonRequestState & req = daemon_requests[(size_t)active_cache_slot];
+            req.remaining = std::max(0, req.remaining - n_generated);
+            req.emitted += n_generated;
+            if (hit_eos_decode || req.remaining <= 0) req.active = false;
+            scheduler_request_still_active = req.active;
+            std::printf("[scheduler] step req=%d slot=%d emitted=%d remaining=%d active=%d epoch=%d\n",
+                        req.request_id, req.slot_id, req.emitted, req.remaining,
+                        (int)req.active, req.epoch);
+            std::fflush(stdout);
+        }
         // Update cache.cur_pos / cache.last_tok to reflect end-of-generation
         // state so a subsequent SNAPSHOT command captures the correct boundary.
         // Both fields are otherwise unused by the prefill/decode hot path
         // (kv_start is tracked separately, last_tok is a local) — they exist
         // for cross-request snapshot accounting.
-        cache.cur_pos  = (int)out_all.size();
+        cache.cur_pos  = committed;
         cache.last_tok = last_tok;
-        stream_emit(-1);
+        stream_emit(scheduler_request_still_active ? -4 : -1);
+        if (daemon_scheduler_drain && daemon_pending_quanta.empty()) {
+            if (!has_daemon_input()) {
+                if (!enqueue_next_scheduler_quantum()) {
+                    daemon_scheduler_drain = false;
+                    std::printf("[scheduler] drain complete\n");
+                    std::fflush(stdout);
+                }
+            }
+        }
     } else {
         if (out_path) write_int32_file(out_path, out_all);
         break;
@@ -4415,6 +6204,25 @@ int main(int argc, char ** argv) {
 
     } // end while(true)
 
+    for (auto & slot : daemon_extra_slots) {
+        draft_feature_mirror_free(slot->feature_mirror);
+        step_graph_destroy(slot->proj_sg);
+        step_graph_destroy(slot->draft_sg);
+        step_graph_destroy(slot->sg);
+        for (int i = 0; i < PREFIX_CACHE_SLOTS; i++) {
+            free_prefix_snapshot(slot->prefix_snapshots[i]);
+        }
+        free_target_cache(slot->cache);
+    }
+    daemon_extra_slots.clear();
+    if (drafter_loaded) {
+        dflash27b::free_drafter(drafter_ctx);
+        drafter_loaded = false;
+    }
+    step_graph_destroy(daemon_batch_probe_sg);
+    step_graph_destroy(daemon_batch_ref_sg);
+    free_target_cache(daemon_batch_probe_cache);
+    free_target_cache(daemon_batch_ref_cache);
     draft_feature_mirror_free(feature_mirror);
     step_graph_destroy(proj_sg);
     step_graph_destroy(draft_sg);
