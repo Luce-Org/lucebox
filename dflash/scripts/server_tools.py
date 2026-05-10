@@ -1316,6 +1316,9 @@ def main():
                     help="Pass --draft-feature-mirror to test_dflash (safe cross-GPU feature path)")
     ap.add_argument("--peer-access", action="store_true",
                     help="Pass --peer-access to test_dflash (prefer P2P memcpy when available)")
+    ap.add_argument("--daemon", action="store_true",
+                    help="No-op: accepted for parity with server.py / Compose; "
+                         "this process always runs test_dflash with --daemon.")
     add_cli_flags(ap)
     ap.add_argument("--prefix-cache-slots", type=int, default=4,
                     help="Number of prefix-cache snapshot slots (0 to disable)")
