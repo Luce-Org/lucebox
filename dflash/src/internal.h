@@ -660,7 +660,9 @@ void free_gemma4_target_weights(GemmaTargetWeights & w);
 // global kv type (e.g. MTP donor layers that need to avoid the TQ3_0/FWHT mismatch).
 bool create_gemma4_cache(const GemmaTargetWeights & w, int max_ctx,
                          ggml_backend_t backend, GemmaTargetCache & out,
-                         const std::vector<int> & extra_q8_layers = {});
+                         const std::vector<int> & extra_q8_layers = {},
+                         int target_feat_cap_hint = 0,
+                         bool enable_dflash_capture_overrides = false);
 void free_gemma4_cache(GemmaTargetCache & c);
 void reset_gemma4_cache(GemmaTargetCache & c);
 
@@ -888,7 +890,8 @@ void free_gemma4_draft_weights(GemmaDraftWeights & w);
 // Allocate draft KV cache tensors on the given backend.
 bool create_draft_kv_cache(const GemmaDraftWeights & dw,
                            ggml_backend_t backend,
-                           GemmaTargetCache & cache);
+                           GemmaTargetCache & cache,
+                           int cap_override = 0);
 void free_draft_kv_cache(GemmaTargetCache & cache);
 
 // Build graph that projects target features → draft KV cache (prefix-direct).

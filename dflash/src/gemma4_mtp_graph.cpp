@@ -350,7 +350,18 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
         // unaligned ne[1] reads past the valid window into stale cache cells. We
         // pad the view to 256 and exclude the tail with a -inf mask.
         // This matches gemma4_target_graph.cpp:352-355's `need_256_pad` policy.
-        const bool kv_cache_is_tq3 = (cache_k->type == GGML_TYPE_TQ3_0);
+        const bool kv_cache_is_tq3 =
+            (cache_k->type == GGML_TYPE_TQ3_0 || cache_v->type == GGML_TYPE_TQ3_0);
+        if (kv_wraps &&
+            (cache_k->type == GGML_TYPE_TQ3_0 || cache_v->type == GGML_TYPE_TQ3_0)) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                "build_mtp_step_graph: refusing wrapped TQ3 donor attention for MTP layer %d donor=%d; force donor KV to Q8_0",
+                il, donor_il);
+            set_last_error(buf);
+            ggml_free(ctx);
+            return false;
+        }
         const bool needs_kv_pad = (kv_cache_is_tq3 || head_dim_fa >= 512)
                                   && !kv_wraps && (kv_view_len % 256 != 0);
         const int64_t kv_view_len_padded = needs_kv_pad
@@ -398,20 +409,12 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
             ggml_set_name(Vview, name);
         }
 
-        // Detect if K/V is in TQ3_0 (FWHT-domain).
-        //
-        // The CUDA FA kernels (fattn-chunked.cu:228,394; fattn-vec.cuh:168)
-        // apply forward WHT to Q and inverse WHT to the attention output
-        // INTERNALLY iff they observe K->type == GGML_TYPE_TQ3_0 at FA entry.
-        // We therefore pass the native Kview/Vview straight into FA below;
-        // any cast to F16/F32 here would strip the type tag and FA would
-        // pick a non-WHT kernel, producing meaningless QK^T.
-        //
-        // SWA-wrap branch above already concat-forced K/V to F32, so for
-        // wrap+TQ3_0 caches kv_is_tq3 is false here and FA picks a regular
-        // F32 path; correctness on that branch needs a separate fix (avoid
-        // the wrap or do two FA passes with combined softmax).
-        const bool kv_is_tq3 = (Kview->type == GGML_TYPE_TQ3_0);
+        // Detect if K/V is in TQ3_0 (FWHT-domain). Graph-level FWHT keeps the
+        // FA backends on a single contract: pre-rotate Q for TQ3 K, inverse-
+        // rotate output for TQ3 V, and pass the native K/V views into FA.
+        const bool k_is_tq3 = (Kview->type == GGML_TYPE_TQ3_0);
+        const bool v_is_tq3 = (Vview->type == GGML_TYPE_TQ3_0);
+        const bool kv_is_tq3 = k_is_tq3 || v_is_tq3;
 
         // Cross-attention via ggml_flash_attn_ext.
         //
@@ -422,9 +425,8 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
         //   output: [head_dim, n_tokens=1, n_head_q]  (reshaped to [q_out_dim, 1])
         //
         // Benefits over manual matmul attention:
-        //   - Handles TQ3_0 (FWHT rotation) internally in VEC/chunked/MMA kernels.
         //   - Handles GQA directly without broadcasting K/V.
-        //   - No manual FWHT correction needed.
+        //   - Graph-level FWHT correction keeps TQ3 K/V in their native cache domain.
         //
         // For TQ3_0 + head_dim > 256 + n_tokens=1 (decode), the CUDA dispatch
         // requires a non-null mask to select the CHUNKED kernel path. We create
@@ -432,17 +434,21 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
         //
         // Permute Q from [head_dim_fa, n_head_fa, 1] → [head_dim_fa, 1, n_head_fa]
         // so it matches the FA expected layout.
+        // ggml_turbo_wht's CUDA kernel writes dst using src strides
+        // (turbo-wht.cu:20-21); non-contiguous input scatters writes and
+        // corrupts Q. Always make Q contiguous BEFORE rotating.
         ggml_tensor * Qfa = ggml_cont(ctx, ggml_permute(ctx, Qcur, 0, 2, 1, 3));
+        if (k_is_tq3) {
+            Qfa = ggml_turbo_wht(ctx, Qfa, 0);
+        }
         {
             char name[64]; std::snprintf(name, sizeof(name), "mtp_Qfa_%d", il);
             ggml_set_name(Qfa, name);
         }
 
         // K/V for FA: pass the original Kview/Vview (TQ3_0, Q8_0, or concat-F32)
-        // directly to ggml_flash_attn_ext. FA handles TQ3_0 FWHT internally
-        // (CHUNKED or VEC kernel applies Q-forward-WHT and output inverse-WHT).
-        // Passing TQ3_0 directly lets FA route to CHUNKED for head_dim=512,
-        // which doesn't require K->ne[1] % 256 == 0 alignment.
+        // directly to ggml_flash_attn_ext. Graph-level FWHT correction above/below
+        // accounts for TQ3_0 K/V without stripping the tensor type tag.
         // For the wrap case (kv_wraps=true), Kview is already F32 (from to_f32 + concat).
         ggml_tensor * Kfa = Kview;  // original type (TQ3_0, Q8_0, or concat-F32)
         ggml_tensor * Vfa = Vview;
@@ -507,6 +513,10 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
         // Gemma4 MTP: f_attention_scale = 1.0 (no pre-softmax scaling).
         ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, fa_mask,
                                                       1.0f, 0.0f, 0.0f);
+        if (v_is_tq3) {
+            attn_out = ggml_cont(ctx, attn_out);
+            attn_out = ggml_turbo_wht(ctx, attn_out, 1);
+        }
         {
             char name[64]; std::snprintf(name, sizeof(name), "mtp_fa_out_%d", il);
             ggml_set_name(attn_out, name);

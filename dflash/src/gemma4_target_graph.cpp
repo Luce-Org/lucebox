@@ -354,12 +354,17 @@ static ggml_tensor * build_swa_attn_block(
     const int fattn_stride = need_256_pad ? 256 : 1;
     const int win_len_padded = ((effective_win_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
 
-    ggml_tensor * Qfa = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
-    Qfa = ggml_cont(ctx, Qfa);
-
     const bool q_rotate   = (kv_k_type == GGML_TYPE_TQ3_0);
     const bool out_rotate = (kv_v_type == GGML_TYPE_TQ3_0);
-    (void)q_rotate; (void)out_rotate;  // rotation now fused into FA kernel
+    // TQ3 contract: caller pre-rotates Q forward, post-rotates FA output
+    // backward. ggml_turbo_wht's kernel writes dst using src strides
+    // (turbo-wht.cu:20-21), so non-contiguous input scatters writes and
+    // corrupts the result — wrap with ggml_cont before rotating, never after
+    // permute alone. (Regression-fix vs. c15f93a; see EVIDENCE.md TQ3 thread.)
+    ggml_tensor * Qfa = ggml_cont(ctx, ggml_permute(ctx, Qcur, 0, 2, 1, 3));
+    if (q_rotate) {
+        Qfa = ggml_turbo_wht(ctx, Qfa, 0);
+    }
 
     ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
         head_dim, win_len_padded, n_head_kv,
@@ -372,6 +377,11 @@ static ggml_tensor * build_swa_attn_block(
     // Gemma4: attn_scale = 1.0 (self.scaling = 1.0, no 1/sqrt(head_dim))
     ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask,
                                              1.0f, 0.0f, 0.0f);
+
+    if (out_rotate) {
+        attn = ggml_cont(ctx, attn);
+        attn = ggml_turbo_wht(ctx, attn, 1);
+    }
 
     attn = ggml_reshape_2d(ctx, attn, q_dim, n_tokens);
     attn = ggml_mul_mat(ctx, L.wo, attn);
@@ -476,12 +486,13 @@ static ggml_tensor * build_full_attn_block(
     const int fattn_stride = need_256_pad ? 256 : 1;
     const int win_len_padded = ((win_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
 
-    ggml_tensor * Qfa = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
-    Qfa = ggml_cont(ctx, Qfa);
-
     const bool q_rotate   = (kv_k_type == GGML_TYPE_TQ3_0);
     const bool out_rotate = (kv_v_type == GGML_TYPE_TQ3_0);
-    (void)q_rotate; (void)out_rotate;  // rotation now fused into FA kernel
+    // See SWA block above for the contiguity rationale (turbo-wht.cu:20-21).
+    ggml_tensor * Qfa = ggml_cont(ctx, ggml_permute(ctx, Qcur, 0, 2, 1, 3));
+    if (q_rotate) {
+        Qfa = ggml_turbo_wht(ctx, Qfa, 0);
+    }
 
     ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
         head_dim, win_len_padded, n_head_kv,
@@ -494,8 +505,8 @@ static ggml_tensor * build_full_attn_block(
 
     // pFlash sparse path supports F16, Q8_0, and Q4_0 K/V — the CUDA dispatch layer
     // dequantizes to F16 before the S<->H BF16 transpose for these types.
-    // TQ3_0 is excluded because it has WHT rotation fused into FA that the sparse
-    // path does not replicate; fall back to dense FA for TQ3_0 and other types.
+    // TQ3_0 is excluded because sparse FA does not consume rotated TQ3 K/V
+    // directly; fall back to dense FA for TQ3_0 and other types.
     auto pflash_supports = [](enum ggml_type t) {
         return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0;
     };
@@ -511,6 +522,11 @@ static ggml_tensor * build_full_attn_block(
         attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask, 1.0f, 0.0f, 0.0f);
     }
 
+    if (out_rotate) {
+        attn = ggml_cont(ctx, attn);
+        attn = ggml_turbo_wht(ctx, attn, 1);
+    }
+
     attn = ggml_reshape_2d(ctx, attn, q_dim, n_tokens);
     attn = ggml_mul_mat(ctx, L.wo, attn);
     return attn;
@@ -522,7 +538,9 @@ bool create_gemma4_cache(const GemmaTargetWeights & w,
                          int max_ctx,
                          ggml_backend_t backend,
                          GemmaTargetCache & out,
-                         const std::vector<int> & extra_q8_layers) {
+                         const std::vector<int> & extra_q8_layers,
+                         int target_feat_cap_hint,
+                         bool enable_dflash_capture_overrides) {
     out.backend = backend;
     out.max_ctx = max_ctx;
     out.cur_pos = 0;
@@ -610,7 +628,8 @@ bool create_gemma4_cache(const GemmaTargetWeights & w,
 
     const bool gate = (kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0)
                     && (w.head_dim > 256)
-                    && (w.n_capture_layers > 0);  // draft is wired
+                    && enable_dflash_capture_overrides
+                    && (w.n_capture_layers > 0);
 
     if (gate) {
         int n_overridden = 0;
@@ -712,7 +731,8 @@ bool create_gemma4_cache(const GemmaTargetWeights & w,
 
     // target_feat ring buffer: [n_capture_layers * n_embd, cap] bf16
     constexpr int TARGET_FEAT_CAP_DEFAULT = 4096;
-    out.target_feat_cap = std::min(max_ctx, TARGET_FEAT_CAP_DEFAULT);
+    const int target_feat_cap_req = std::max(TARGET_FEAT_CAP_DEFAULT, target_feat_cap_hint);
+    out.target_feat_cap = std::min(max_ctx, target_feat_cap_req);
     {
         const int fc_in = n_capture_layers * n_embd;
         out.target_feat = ggml_new_tensor_2d(out.base_ctx, GGML_TYPE_BF16,
@@ -812,9 +832,15 @@ void reset_gemma4_cache(GemmaTargetCache & c) {
 
 bool create_draft_kv_cache(const GemmaDraftWeights & dw,
                            ggml_backend_t backend,
-                           GemmaTargetCache & cache) {
+                           GemmaTargetCache & cache,
+                           int cap_override) {
     // Capacity: sliding window + one block + headroom
-    const int draft_kv_cap = dw.sliding_window + dw.block_size + 32;
+    const int default_cap = dw.sliding_window + dw.block_size + 32;
+    const int draft_kv_cap = cap_override > 0 ? cap_override : default_cap;
+    if (draft_kv_cap < dw.block_size + 1) {
+        set_last_error("create_draft_kv_cache: cap_override is smaller than block_size+1");
+        return false;
+    }
 
     const size_t n_tensors = (size_t)(2 * dw.n_layer);  // K + V per layer
     ggml_init_params ip{};
