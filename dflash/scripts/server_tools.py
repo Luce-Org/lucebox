@@ -20,6 +20,9 @@ Streaming behavior:
 Greedy decoding still applies (verify path is greedy-only). `temperature` and
 `top_p` are accepted but ignored, matching upstream.
 
+When ``tools`` is non-empty, ``enable_thinking`` is forced off in the chat template
+(Qwen3 thinking prefill otherwise dominates and the model rarely emits ``<tool_call>``).
+
 Run:
   pip install fastapi uvicorn transformers
   python3 scripts/server_tools.py --port 8000
@@ -60,6 +63,9 @@ DEFAULT_DRAFT_ROOT = ROOT / "models" / "draft"
 DEFAULT_BIN = ROOT / "build" / ("test_dflash" + (".exe" if sys.platform == "win32" else ""))
 DEFAULT_BUDGET = 22
 MODEL_NAME = "luce-dflash"
+
+# Passed through to apply_chat_template only (see server.py — avoid arbitrary kwargs).
+_ALLOWED_TEMPLATE_KWARGS = frozenset({"enable_thinking", "add_generation_prompt", "tools"})
 
 
 def _extra_daemon_has_target_sharding(extra: list[str] | None) -> bool:
@@ -525,9 +531,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
                     d["content"] = m.content
                 new_msgs.append(d)
 
-        kwargs = dict(tokenize=False, add_generation_prompt=True)
-        if req.chat_template_kwargs:
-            kwargs.update(req.chat_template_kwargs)
+        kwargs: dict = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": False,
+        }
+        kwargs.update(
+            {k: v for k, v in (req.chat_template_kwargs or {}).items()
+             if k in _ALLOWED_TEMPLATE_KWARGS},
+        )
         prompt = tokenizer.apply_chat_template(new_msgs, **kwargs)
         new_started_in_thinking = bool(re.search(r"<think>\s*$", prompt))
         ids = tokenizer.encode(prompt, add_special_tokens=False)
@@ -575,18 +587,28 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
 
         tools_arg = None
         if req.tools:
-            tools_arg = [t.model_dump()["function"] | {"type": t.type} for t in req.tools]
-            # The Qwen template accepts the raw OpenAI tools array structure.
+            # OpenAI-shaped tool defs (type + function{name,description,parameters}).
             tools_arg = [t.model_dump() for t in req.tools]
 
-        kwargs = dict(tokenize=False, add_generation_prompt=True)
+        # Mirror server.py: default enable_thinking=False. Qwen3's template default is
+        # often True, which pre-fills <think> and the model rambles in
+        # "reasoning" instead of emitting <tool_call> XML — looks like "ignores tools".
+        kwargs: dict = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": False,
+        }
+        kwargs.update(
+            {k: v for k, v in (req.chat_template_kwargs or {}).items()
+             if k in _ALLOWED_TEMPLATE_KWARGS},
+        )
         if tools_arg:
             kwargs["tools"] = tools_arg
+            # Thinking + tool XML is a bad combo for Qwen3.x; never let merged kwargs
+            # re-enable thinking while tools are mounted.
+            kwargs["enable_thinking"] = False
         if req.tool_choice is not None:
             kwargs["tool_choice"] = req.tool_choice
-        # Per-request chat template knobs (e.g. enable_thinking, preserve_thinking).
-        if req.chat_template_kwargs:
-            kwargs.update(req.chat_template_kwargs)
         prompt = tokenizer.apply_chat_template(msgs, **kwargs)
         # Did the template prefill `<think>\n` at the end? Then streaming should
         # start in reasoning mode.
@@ -749,13 +771,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int,
             i = first_stop_match(text, stops)
             if i != -1:
                 text = text[:i]
-        # Respect enable_thinking from chat_template_kwargs when deciding how
-        # to treat a `</think>`-less response (see parse_reasoning docstring).
-        thinking_enabled = True
-        if req.chat_template_kwargs:
-            thinking_enabled = req.chat_template_kwargs.get("enable_thinking", True)
         cleaned, tool_calls = parse_tool_calls(text, tools=req.tools)
-        cleaned, reasoning = parse_reasoning(cleaned, thinking_enabled=thinking_enabled)
+        # Match the assistant prompt boundary (see _tokenize_prompt): if the template
+        # did not open thinking there, missing `</think>` must not turn
+        # the whole completion into reasoning-only.
+        cleaned, reasoning = parse_reasoning(
+            cleaned, thinking_enabled=started_in_thinking)
 
         msg: dict = {"role": "assistant"}
         finish_reason = "stop"
