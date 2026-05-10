@@ -866,6 +866,24 @@ int main(int argc, char ** argv) {
     }
     cudaSetDevice(gpu);
 
+    // Auto-disable CUDA VMM on small-VRAM GPUs (e.g. RTX 3090 24 GB) when the
+    // user has not set an explicit preference. The 32 GB VMM pool reservation
+    // fragments badly inside the last few hundred MB on a 24 GB card and
+    // causes prefill+verify cliffs (measured ~50% loss at ctx=64K). User can
+    // override with GGML_CUDA_NO_VMM=0.
+    {
+        cudaDeviceProp props;
+        if (cudaGetDeviceProperties(&props, gpu) == cudaSuccess) {
+            const size_t vram_gib = props.totalGlobalMem / (1024ull * 1024ull * 1024ull);
+            if (vram_gib <= 25 && std::getenv("GGML_CUDA_NO_VMM") == nullptr) {
+                ::setenv("GGML_CUDA_NO_VMM", "1", 1);
+                std::fprintf(stderr,
+                    "[auto] GGML_CUDA_NO_VMM=1 set (GPU has %zu GiB; override with GGML_CUDA_NO_VMM=0)\n",
+                    vram_gib);
+            }
+        }
+    }
+
     std::printf("[cfg] model=%s draft=%s method=%s gpu=%d ctx=%d n_predict=%d kv_k=%s kv_v=%s "
                 "temp=%.2f top_k=%d top_p=%.2f budget=%d bench=%d fa_window=%d "
                 "draft_max=%d adaptive=%d draft_kv_cap_override=%d pflash=%d pflash_alpha=%.3f\n",
