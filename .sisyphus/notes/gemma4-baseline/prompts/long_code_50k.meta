@@ -1,6 +1,0 @@
-tokenizer: google/gemma-3-27b-it
-chat_template: yes (user: read+summarize this Python module; assistant turn open)
-source: HumanEval+ tasks concatenated as one Python module
-token_count: 50002
-first_20: [105, 2364, 107, 818, 2269, 563, 496, 17856, 9173, 7906, 1551, 1944, 14955, 5151, 607, 910, 5434, 236761, 8847, 1091]
-last_5: [106, 107, 105, 4368, 107]

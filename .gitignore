@@ -71,3 +71,6 @@ fix-plan.md
 .env.local
 *.pem
 *.key
+
+# Sisyphus working dossier (preserve outside repo)
+.sisyphus/

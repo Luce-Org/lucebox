@@ -1,6 +1,0 @@
-tokenizer: google/gemma-3-27b-it (vocab matches Gemma4 GGUF byte-for-byte)
-chat_template: yes (user turn = Shakespeare summarization request)
-source: /home/peppi/research/full_tiny_shakespeare.txt (first 172101 chars)
-token_count: 49903 (driver will prepend BOS -> 49904 prefill)
-first_20: [105, 2364, 107, 818, 2269, 563, 496, 38974, 529, 1816, 236761, 8847, 625, 13058, 236764, 1299, 49573, 506, 3262, 22888]
-last_5: [106, 107, 105, 4368, 107]

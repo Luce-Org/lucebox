@@ -1,8 +1,0 @@
-[dflash] WARNING: detected CUDA device 0 (NVIDIA GeForce RTX 3090) with 23 GiB VRAM.
-[dflash]          Long-context prefill on <=24 GiB cards is significantly
-[dflash]          slower with VMM enabled. Consider rebuilding with:
-[dflash]              cmake -DGGML_CUDA_NO_VMM=ON ..
-ggml_cuda_init: found 1 CUDA devices (Total VRAM: 24575 MiB):
-  Device 0: NVIDIA GeForce RTX 3090, compute capability 8.6, VMM: no, VRAM: 24575 MiB
-[cache] created max_ctx=131072 (full_attn=131072, swa=2048), kv_layers=60, saved 82.0%
-[cache] kv types: SWA=tq3_0, full=tq3_0

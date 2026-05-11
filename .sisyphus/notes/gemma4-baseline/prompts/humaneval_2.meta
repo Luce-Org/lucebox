@@ -1,6 +1,0 @@
-tokenizer: google/gemma-3-27b-it
-chat_template: yes (EvalPlus canonical instruction + opening code-fence)
-source: HumanEval/2 (truncate_number)
-token_count: 139
-first_20: [105, 2364, 107, 9366, 2847, 496, 1265, 236772, 66436, 17856, 8948, 600, 64744, 506, 2269, 2608, 528, 496, 127532, 3393]
-last_5: [236787, 107, 2717, 6719, 107]
