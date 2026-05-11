@@ -1,7 +1,7 @@
 [submodule "dflash/deps/llama.cpp"]
 	path = dflash/deps/llama.cpp
 	url = https://github.com/dusterbloom/llama-cpp-turboquant-cuda.git
-	branch = feature/tq3-kv-cache
+	branch = feature/tq3-kv-cache-clean
 [submodule "dflash/deps/Block-Sparse-Attention"]
 	path = dflash/deps/Block-Sparse-Attention
 	url = https://github.com/mit-han-lab/Block-Sparse-Attention.git
