@@ -1358,6 +1358,17 @@ QwenGraphOutputs build_qwen35_graph(
         inpL = cur;
     }
 
+    // Expose the final pre-norm hidden state so the native NextN/MTP block can
+    // consume it as `t_h_pre_norm`. Marked as graph output so its data persists
+    // after graph_compute. Caller threads it into build_qwen35_mtp_graph.
+    QwenGraphOutputs og = std::move(og_early);
+    if (in.expose_pre_norm_hidden) {
+        ggml_set_name(inpL, "target_pre_norm_hidden");
+        ggml_set_output(inpL);
+        ggml_build_forward_expand(gf, inpL);
+        og.pre_norm_hidden = inpL;
+    }
+
     // 2. Final norm
     ggml_tensor * out = rms_norm_mul(ctx, inpL, w.out_norm, EPS);
 
@@ -1373,7 +1384,6 @@ QwenGraphOutputs build_qwen35_graph(
 
     ggml_build_forward_expand(gf, logits);
 
-    QwenGraphOutputs og = std::move(og_early);
     og.logits = logits;
     return og;
 }
@@ -1394,6 +1404,198 @@ ggml_tensor * build_qwen35_layer(
 {
     return build_single_layer(ctx, gf, w, cache, layer_idx, inp, positions,
                               attn_mask, kv_start, n_tokens, capture, fa_window);
+}
+
+// ─── Native MTP / NextN cache and graph ───────────────────────────────
+
+bool create_target_mtp_cache(const TargetWeights & w,
+                             int max_ctx,
+                             ggml_backend_t backend,
+                             TargetMtpCache & out) {
+    if (w.mtp_layers.empty()) {
+        set_last_error("create_target_mtp_cache requires TargetWeights::mtp_layers");
+        return false;
+    }
+    if (max_ctx <= 0) {
+        set_last_error("create_target_mtp_cache requires max_ctx > 0");
+        return false;
+    }
+
+    out.backend = backend;
+    out.max_ctx = max_ctx;
+    out.cur_pos = 0;
+
+    ggml_type kv_k_type = GGML_TYPE_Q8_0;
+    ggml_type kv_v_type = GGML_TYPE_Q8_0;
+    dflash::resolve_kv_types(kv_k_type, kv_v_type);
+    out.kv_k_type = kv_k_type;
+    out.kv_v_type = kv_v_type;
+    const int max_ctx_alloc = (kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0)
+        ? ((max_ctx + 255) / 256) * 256
+        : max_ctx;
+
+    const int n_mtp = (int)w.mtp_layers.size();
+    out.attn_k.assign(n_mtp, nullptr);
+    out.attn_v.assign(n_mtp, nullptr);
+
+    ggml_init_params ip{};
+    ip.mem_size   = (size_t)(2 * n_mtp + 16) * ggml_tensor_overhead();
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    out.ctx = ggml_init(ip);
+    if (!out.ctx) {
+        set_last_error("mtp cache ggml_init failed");
+        return false;
+    }
+
+    for (int mi = 0; mi < n_mtp; mi++) {
+        ggml_tensor * K = ggml_new_tensor_3d(out.ctx, kv_k_type,
+                                             w.n_embd_head_k, max_ctx_alloc, w.n_head_kv);
+        ggml_tensor * V = ggml_new_tensor_3d(out.ctx, kv_v_type,
+                                             w.n_embd_head_k, max_ctx_alloc, w.n_head_kv);
+        char name[64];
+        std::snprintf(name, sizeof(name), "mtp_cache_k_%d", mi);
+        ggml_set_name(K, name);
+        std::snprintf(name, sizeof(name), "mtp_cache_v_%d", mi);
+        ggml_set_name(V, name);
+        out.attn_k[mi] = K;
+        out.attn_v[mi] = V;
+    }
+
+    out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
+    if (!out.buf) {
+        set_last_error("ggml_backend_alloc_ctx_tensors failed for mtp cache");
+        ggml_free(out.ctx);
+        out.ctx = nullptr;
+        out.attn_k.clear();
+        out.attn_v.clear();
+        return false;
+    }
+
+    reset_target_mtp_cache(out);
+    return true;
+}
+
+void free_target_mtp_cache(TargetMtpCache & c) {
+    if (c.buf) { ggml_backend_buffer_free(c.buf); c.buf = nullptr; }
+    if (c.ctx) { ggml_free(c.ctx); c.ctx = nullptr; }
+    c.attn_k.clear();
+    c.attn_v.clear();
+    c.max_ctx = 0;
+    c.cur_pos = 0;
+}
+
+void reset_target_mtp_cache(TargetMtpCache & c) {
+    c.cur_pos = 0;
+    std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
+    if (!c.ctx) return;
+    for (ggml_tensor * t = ggml_get_first_tensor(c.ctx); t != nullptr;
+         t = ggml_get_next_tensor(c.ctx, t)) {
+        size_t nb = ggml_nbytes(t);
+        size_t off = 0;
+        while (off < nb) {
+            size_t chunk = std::min(nb - off, zeros.size());
+            ggml_backend_tensor_set(t, zeros.data(), off, chunk);
+            off += chunk;
+        }
+    }
+}
+
+QwenMtpGraphOutputs build_qwen35_mtp_graph(
+    ggml_context *             ctx,
+    ggml_cgraph *              gf,
+    const TargetWeights &      w,
+    TargetMtpCache &           cache,
+    const QwenMtpGraphInputs & in) {
+
+    if (w.mtp_layers.empty()) {
+        set_last_error("build_qwen35_mtp_graph requires TargetWeights::mtp_layers");
+        return {};
+    }
+    if (in.mtp_layer_index < 0 || in.mtp_layer_index >= (int)w.mtp_layers.size()) {
+        set_last_error("build_qwen35_mtp_graph mtp_layer_index out of range");
+        return {};
+    }
+    if (!in.token_embed || !in.pre_norm_hidden || !in.positions) {
+        set_last_error("build_qwen35_mtp_graph missing required input tensor");
+        return {};
+    }
+    if ((int)cache.attn_k.size() <= in.mtp_layer_index ||
+        (int)cache.attn_v.size() <= in.mtp_layer_index ||
+        !cache.attn_k[in.mtp_layer_index] || !cache.attn_v[in.mtp_layer_index]) {
+        set_last_error("build_qwen35_mtp_graph missing MTP KV cache tensors");
+        return {};
+    }
+
+    const int n_tokens = std::max(1, in.n_tokens);
+    const TargetMtpLayer & M = w.mtp_layers[(size_t)in.mtp_layer_index];
+    const TargetLayer & L = M.block;
+
+    // Dense FFN only — MoE MTP requires the MoE TargetLayer fields landing
+    // first (see PR #120 "Qwen3.5 MoE support"). For non-MoE GGUFs this is
+    // the production path and matches the am17an reference layout.
+    const bool has_dense_ffn = L.w_gate && L.w_up && L.w_down;
+    if (!M.nextn.eh_proj || !M.nextn.enorm || !M.nextn.hnorm ||
+        !L.attn_norm || !L.attn_post_norm ||
+        !L.wq || !L.wk || !L.wv || !L.wo || !L.q_norm || !L.k_norm ||
+        !has_dense_ffn) {
+        set_last_error("build_qwen35_mtp_graph missing loaded MTP tensors "
+                       "(MoE MTP not supported in this PR — needs #120)");
+        return {};
+    }
+
+    // NextN concat path: [enorm(e); hnorm(h)] → eh_proj → transformer block.
+    ggml_tensor * e_norm = rms_norm_mul(ctx, in.token_embed, M.nextn.enorm, EPS);
+    ggml_tensor * h_norm = rms_norm_mul(ctx, in.pre_norm_hidden, M.nextn.hnorm, EPS);
+
+    ggml_tensor * concat = ggml_concat(ctx, e_norm, h_norm, 0);
+    ggml_set_name(concat, "mtp_concat_embedding_hidden");
+
+    ggml_tensor * cur = ggml_mul_mat(ctx, M.nextn.eh_proj, concat);
+    ggml_set_name(cur, "mtp_eh_proj");
+
+    ggml_tensor * inpSA = cur;
+    cur = rms_norm_mul(ctx, cur, L.attn_norm, EPS);
+    ggml_set_name(cur, "mtp_attn_norm");
+
+    cur = build_full_attn_block(ctx, gf, w, L, cur, in.positions,
+                                cache.attn_k[in.mtp_layer_index],
+                                cache.attn_v[in.mtp_layer_index],
+                                in.attn_mask, in.kv_start, n_tokens,
+                                cache.kv_k_type, cache.kv_v_type,
+                                /*kv_k_rotated=*/false, in.fa_window);
+    ggml_set_name(cur, "mtp_attn_out");
+
+    cur = ggml_add(ctx, cur, inpSA);
+
+    ggml_tensor * ffn_residual = cur;
+    cur = rms_norm_mul(ctx, cur, L.attn_post_norm, EPS);
+    ggml_set_name(cur, "mtp_post_attn_norm");
+    ggml_tensor * ffn = build_swiglu_ffn(ctx, cur, L);
+    if (!ffn) return {};
+    cur = ggml_add(ctx, ffn, ffn_residual);
+    ggml_set_name(cur, "mtp_hidden");
+    ggml_set_output(cur);
+
+    // Final norm + shared LM head. Falls back to the trunk's out_norm / output
+    // when the NextN block doesn't ship its own shared head tensors (am17an
+    // GGUFs do not always include shared_head_*).
+    ggml_tensor * head_norm_w = M.nextn.shared_head_norm ? M.nextn.shared_head_norm : w.out_norm;
+    ggml_tensor * head_w      = M.nextn.shared_head_head ? M.nextn.shared_head_head : w.output;
+    if (!head_norm_w || !head_w) {
+        set_last_error("build_qwen35_mtp_graph missing MTP/shared LM head tensors");
+        return {};
+    }
+
+    ggml_tensor * out_h = rms_norm_mul(ctx, cur, head_norm_w, EPS);
+    ggml_tensor * logits = ggml_mul_mat(ctx, head_w, out_h);
+    ggml_set_name(logits, "mtp_logits");
+    ggml_build_forward_expand(gf, logits);
+
+    QwenMtpGraphOutputs og{};
+    og.logits = logits;
+    og.hidden = cur;
+    return og;
 }
 
 } // namespace dflash27b

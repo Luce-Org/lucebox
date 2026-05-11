@@ -73,6 +73,34 @@ struct TargetLayer {
     ggml_tensor * ssm_out        = nullptr;  // output projection after delta-net
 };
 
+// Qwen3.5/3.6 NextN / MTP tail block tensors. These live in the tail
+// `nextn_predict_layers` of the GGUF (one such block in Qwen3.6-MTP).
+// Follow the tensor naming convention introduced by llama.cpp PR #22673:
+//   blk.<i>.nextn.eh_proj          [2*hidden, hidden]
+//   blk.<i>.nextn.embed_tokens     [hidden, vocab]   (optional)
+//   blk.<i>.nextn.enorm            [hidden]
+//   blk.<i>.nextn.hnorm            [hidden]
+//   blk.<i>.nextn.shared_head_head [hidden, vocab]   (optional, falls back to w.output)
+//   blk.<i>.nextn.shared_head_norm [hidden]          (optional, falls back to w.out_norm)
+struct TargetNextN {
+    ggml_tensor * eh_proj          = nullptr;
+    ggml_tensor * embed_tokens     = nullptr;
+    ggml_tensor * enorm            = nullptr;
+    ggml_tensor * hnorm            = nullptr;
+    ggml_tensor * shared_head_head = nullptr;
+    ggml_tensor * shared_head_norm = nullptr;
+};
+
+// One MTP / NextN layer in the GGUF tail. Holds the regular transformer
+// block tensors (full-attention only — no DeltaNet on MTP) plus the
+// NextN-specific projections above. The trunk decoder's pre-norm hidden
+// state is fed into this block to produce the MTP draft logits.
+struct TargetMtpLayer {
+    TargetLayer block;
+    TargetNextN nextn;
+    int         gguf_layer_index = -1;
+};
+
 // CPU-side embedder: keeps a mmap of the GGUF alive and knows how to
 // dequantize individual rows of the quantized tok_embd tensor on demand.
 // This matches llama.cpp's behavior of running embedding get_rows on CPU
@@ -108,7 +136,11 @@ struct TargetWeights {
     CpuEmbedder           embedder;
 
     ggml_tensor * tok_embd = nullptr;        // [hidden, vocab] (metadata only; data NOT on GPU)
-    std::vector<TargetLayer> layers;         // size = 64
+    bool tok_embd_gpu = false;               // true when token_embd bytes were uploaded for GPU get_rows.
+                                             // Required by MTP because the integrated decode path needs
+                                             // device-side token lookup to chain proposals within a graph.
+    std::vector<TargetLayer> layers;         // trunk layers only, excludes any nextn/MTP tail blocks
+    std::vector<TargetMtpLayer> mtp_layers;  // size = nextn_predict_layers (0 for non-MTP GGUFs)
     ggml_tensor * out_norm = nullptr;        // [hidden]
     ggml_tensor * output   = nullptr;        // [hidden, vocab]  (lm_head)
 
@@ -119,7 +151,9 @@ struct TargetWeights {
     int n_embd_head_v           = 256;  // value_length
     int n_head                  = 24;
     int n_head_kv               = 4;
-    int n_layer                 = 64;
+    int gguf_block_count        = 64;    // raw qwen35.block_count from the GGUF
+    int nextn_predict_layers    = 0;     // qwen35.nextn_predict_layers (0 = non-MTP GGUF)
+    int n_layer                 = 64;    // trunk layer count: gguf_block_count - nextn_predict_layers
     int n_embd                  = 5120;
     int n_ff                    = 17408;
     int ssm_d_conv              = 4;
@@ -413,6 +447,36 @@ bool migrate_prefill_cache(const TargetWeights & w,
                            ggml_backend_t backend,
                            TargetCache & cache);
 
+// ─── Native MTP / NextN cache ─────────────────────────────────────
+//
+// Qwen3.5/3.6 native multi-token prediction keeps a tiny KV cache for the
+// tail NextN block(s) only — the trunk decoder retains its own TargetCache
+// above. Matches the "kv_only_nextn" contract used by llama.cpp PR #22673
+// and llama-crucible's MTP cache layout.
+struct TargetMtpCache {
+    ggml_context *        ctx     = nullptr;
+    ggml_backend_buffer_t buf     = nullptr;
+    ggml_backend_t        backend = nullptr;
+
+    int max_ctx = 0;
+    int cur_pos = 0;
+
+    ggml_type kv_k_type = GGML_TYPE_Q8_0;
+    ggml_type kv_v_type = GGML_TYPE_Q8_0;
+
+    std::vector<ggml_tensor *> attn_k; // one per TargetWeights::mtp_layers entry
+    std::vector<ggml_tensor *> attn_v;
+};
+
+bool create_target_mtp_cache(const TargetWeights & w,
+                             int max_ctx,
+                             ggml_backend_t backend,
+                             TargetMtpCache & out);
+
+void free_target_mtp_cache(TargetMtpCache & c);
+
+void reset_target_mtp_cache(TargetMtpCache & c);
+
 // ─── Target forward graph ─────────────────────────────────────────
 
 // Per-delta-net-layer pointers exposed by the graph for spec-decode rollback.
@@ -443,6 +507,7 @@ struct QwenGraphInputs {
     int           kv_start;       // position where the new tokens begin
     bool          capture_layers; // if true, write captured layer features into cache.target_feat
     bool          capture_delta_intermediate = false; // if true, populate out_delta_captures
+    bool          expose_pre_norm_hidden = false;     // if true, keep final pre-norm hidden for MTP handoff
     int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
     bool          last_token_logits_only = false; // if true, only compute logits for last token (prefill optimization)
     ggml_tensor * parent_ids = nullptr; // [n_tokens] i32; tree mode when non-null
@@ -450,6 +515,11 @@ struct QwenGraphInputs {
 
 struct QwenGraphOutputs {
     ggml_tensor * logits;      // [vocab, n_tokens] f32
+    // Final hidden state before the target output norm. Populated when
+    // QwenGraphInputs::expose_pre_norm_hidden is true. Used as the
+    // `t_h_pre_norm` handoff into the native NextN/MTP block — matches the
+    // convention from llama-crucible MTP.
+    ggml_tensor * pre_norm_hidden = nullptr; // [hidden, n_tokens] f32
     // One entry per delta-net layer (48 for qwen35-27b). Only populated when
     // QwenGraphInputs::capture_delta_intermediate is true. Tensors are graph
     // views marked as ggml_set_output() so their data persists after
@@ -463,6 +533,38 @@ QwenGraphOutputs build_qwen35_graph(
     const TargetWeights &  w,
     TargetCache &          cache,
     const QwenGraphInputs & in);
+
+// ─── Native MTP / NextN forward graph ─────────────────────────────
+//
+// Single-layer NextN/MTP block. Consumes the trunk decoder's pre-norm hidden
+// state (`pre_norm_hidden`) plus the embedding of the current token, runs
+// the NextN concat → eh_proj → transformer-block → shared-head pipeline,
+// and returns the MTP draft logits + the post-block hidden state.
+//
+// Today this PR implements the dense-FFN path only; MoE MTP requires the
+// MoE TargetLayer fields landing first (see PR #120 "Qwen3.5 MoE support").
+struct QwenMtpGraphInputs {
+    ggml_tensor * token_embed;     // [hidden, n_tokens] f32; embedding of the current token(s)
+    ggml_tensor * pre_norm_hidden; // [hidden, n_tokens] f32 from trunk output
+    ggml_tensor * positions;       // [4 * n_tokens] i32
+    ggml_tensor * attn_mask;       // optional [kv_len, n_tokens_padded] f32
+    int           n_tokens = 1;
+    int           kv_start = 0;
+    int           mtp_layer_index = 0;
+    int           fa_window = 0;
+};
+
+struct QwenMtpGraphOutputs {
+    ggml_tensor * logits = nullptr; // [vocab, n_tokens] f32
+    ggml_tensor * hidden = nullptr; // [hidden, n_tokens] f32, post-MTP block
+};
+
+QwenMtpGraphOutputs build_qwen35_mtp_graph(
+    ggml_context *             ctx,
+    ggml_cgraph *              gf,
+    const TargetWeights &      w,
+    TargetMtpCache &           cache,
+    const QwenMtpGraphInputs & in);
 
 // Build a single-layer forward graph. Mirrors build_qwen35_graph but processes
 // only one layer, taking `inp` as the input activation and returning the output.

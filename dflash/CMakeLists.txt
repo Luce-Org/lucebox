@@ -126,6 +126,8 @@ add_library(dflash27b STATIC
     src/laguna_target_graph.cpp
     src/laguna_daemon.cpp
     src/sampler.cpp
+    # Native MTP / NextN helpers
+    src/f16_convert.cu
 )
 # FlashPrefill custom CUDA kernels need BF16 WMMA (sm_80+). On Turing (sm_75)
 # the drafter uses ggml's flash_attn_ext instead. Guard added after SM check.
@@ -334,6 +336,29 @@ if(DFLASH27B_TESTS)
         endif()
     endif()
 
+    # Native MTP / NextN: contract test + functional smokes. The contract test
+    # uses synthetic tensors and runs in CI; the smokes need a real MTP GGUF.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_mtp_graph_contract.cpp")
+        add_executable(test_mtp_graph_contract test/test_mtp_graph_contract.cpp)
+        target_include_directories(test_mtp_graph_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(test_mtp_graph_contract PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_mtp_graph.cpp")
+        add_executable(smoke_mtp_graph test/smoke_mtp_graph.cpp)
+        target_include_directories(smoke_mtp_graph PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(smoke_mtp_graph PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_target_mtp_handoff.cpp")
+        add_executable(smoke_target_mtp_handoff test/smoke_target_mtp_handoff.cpp)
+        target_include_directories(smoke_target_mtp_handoff PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(smoke_target_mtp_handoff PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_mtp_integrated_decode.cpp")
+        add_executable(smoke_mtp_integrated_decode test/smoke_mtp_integrated_decode.cpp)
+        target_include_directories(smoke_mtp_integrated_decode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(smoke_mtp_integrated_decode PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+
     # internal.h includes <cuda_runtime.h> when GGML_USE_CUDA is set; link
     # CUDA::cudart so the toolkit headers are on the compile line (same as
     # test_dflash historically had alone).
@@ -350,6 +375,10 @@ if(DFLASH27B_TESTS)
         smoke_target_forward
         test_generate
         test_dflash
+        test_mtp_graph_contract
+        smoke_mtp_graph
+        smoke_target_mtp_handoff
+        smoke_mtp_integrated_decode
     )
     foreach(_t IN LISTS _dflash_internal_h_cuda_tests)
         if(TARGET ${_t})

@@ -273,7 +273,7 @@ bool load_target_gguf_partial(const std::string & path,
     std::string err;
     const uint32_t n_embd = get_u32_or(gctx, "qwen35.embedding_length",    0);
     const uint32_t n_ff   = get_u32_or(gctx, "qwen35.feed_forward_length", 0);
-    const uint32_t n_layer= get_u32_or(gctx, "qwen35.block_count",         0);
+    const uint32_t n_block= get_u32_or(gctx, "qwen35.block_count",         0);
     const uint32_t n_head = get_u32_or(gctx, "qwen35.attention.head_count",0);
     const uint32_t n_headkv=get_u32_or(gctx, "qwen35.attention.head_count_kv",0);
     const uint32_t kl     = get_u32_or(gctx, "qwen35.attention.key_length",   0);
@@ -285,19 +285,46 @@ bool load_target_gguf_partial(const std::string & path,
     const uint32_t ssm_dt    = get_u32_or(gctx, "qwen35.ssm.time_step_rank",0);
     const uint32_t ssm_grp   = get_u32_or(gctx, "qwen35.ssm.group_count",  0);
 
-    if (n_embd == 0 || n_layer == 0 || n_head == 0 || n_headkv == 0 ||
+    // Native MTP / NextN: zero on non-MTP GGUFs, 1 on the am17an Qwen3.6-MTP
+    // GGUFs. We treat the last `nextn_predict_layers` blocks as the MTP tail
+    // and the remaining `block_count - nextn` as the trunk.
+    const uint32_t nextn_predict_layers = get_u32_or(gctx, "qwen35.nextn_predict_layers", 0);
+
+    if (n_embd == 0 || n_block == 0 || n_head == 0 || n_headkv == 0 ||
         kl == 0 || vl == 0 || n_ff == 0 || fai == 0 ||
         ssm_conv == 0 || ssm_inner == 0 || ssm_state == 0 ||
         ssm_dt == 0 || ssm_grp == 0) {
         char buf[512];
         std::snprintf(buf, sizeof(buf),
-            "missing or zero hparams: n_embd=%u n_layer=%u n_head=%u n_head_kv=%u "
+            "missing or zero hparams: n_embd=%u n_block=%u n_head=%u n_head_kv=%u "
             "kl=%u vl=%u n_ff=%u fai=%u ssm{conv=%u inner=%u state=%u dt=%u grp=%u}",
-            n_embd, n_layer, n_head, n_headkv, kl, vl, n_ff, fai,
+            n_embd, n_block, n_head, n_headkv, kl, vl, n_ff, fai,
             ssm_conv, ssm_inner, ssm_state, ssm_dt, ssm_grp);
         set_last_error(buf);
         gguf_free(gctx);
         return false;
+    }
+
+    if (nextn_predict_layers > n_block) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+            "nextn_predict_layers=%u exceeds block_count=%u",
+            nextn_predict_layers, n_block);
+        set_last_error(buf);
+        gguf_free(gctx); return false;
+    }
+    if (nextn_predict_layers > 1) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+            "nextn_predict_layers=%u not supported yet (loader supports 0 or 1)",
+            nextn_predict_layers);
+        set_last_error(buf);
+        gguf_free(gctx); return false;
+    }
+    const uint32_t n_layer = n_block - nextn_predict_layers;
+    if (n_layer == 0) {
+        set_last_error("no trunk layers left after subtracting nextn_predict_layers");
+        gguf_free(gctx); return false;
     }
 
     // Structural invariants required by the graph builder.
@@ -312,8 +339,10 @@ bool load_target_gguf_partial(const std::string & path,
         gguf_free(gctx); return false;
     }
     if (n_layer % fai != 0) {
-        char buf[128];
-        std::snprintf(buf, sizeof(buf), "block_count=%u not divisible by full_attention_interval=%u", n_layer, fai);
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+            "trunk layer count=%u (block_count=%u nextn=%u) not divisible by full_attention_interval=%u",
+            n_layer, n_block, nextn_predict_layers, fai);
         set_last_error(buf);
         gguf_free(gctx); return false;
     }
@@ -364,13 +393,15 @@ bool load_target_gguf_partial(const std::string & path,
 
     TargetLoadPlan plan = plan_in;
     if (plan.layer_begin < 0) plan.layer_begin = 0;
-    if (plan.layer_end < 0) plan.layer_end = (int)n_layer;
+    // Default end covers trunk + MTP/NextN tail so blk.<n_layer..n_block-1>.*
+    // tensors are uploaded when nextn_predict_layers > 0.
+    if (plan.layer_end < 0) plan.layer_end = (int)n_block;
     if (plan.layer_begin > plan.layer_end ||
-        plan.layer_end > (int)n_layer) {
+        plan.layer_end > (int)n_block) {
         char buf[160];
         std::snprintf(buf, sizeof(buf),
-            "invalid target load layer range [%d,%d) for n_layer=%u",
-            plan.layer_begin, plan.layer_end, n_layer);
+            "invalid target load layer range [%d,%d) for n_block=%u",
+            plan.layer_begin, plan.layer_end, n_block);
         set_last_error(buf);
         gguf_free(gctx);
         return false;
@@ -379,6 +410,8 @@ bool load_target_gguf_partial(const std::string & path,
     out.ctx     = meta_ctx;
     out.backend = backend;
     out.n_layer = (int)n_layer;
+    out.gguf_block_count = (int)n_block;
+    out.nextn_predict_layers = (int)nextn_predict_layers;
     out.n_embd  = (int)n_embd;
     out.n_ff    = (int)n_ff;
     out.n_head  = (int)n_head;
@@ -392,6 +425,7 @@ bool load_target_gguf_partial(const std::string & path,
     out.ssm_d_state= (int)ssm_state;
     out.ssm_dt_rank= (int)ssm_dt;
     out.ssm_n_group= (int)ssm_grp;
+    out.mtp_layers.assign((size_t)nextn_predict_layers, TargetMtpLayer{});
 
     // EOS token ids from GGUF tokenizer metadata (stored as UINT32 by the
     // GGUF spec; we use the u32 helper and cast). UINT32_MAX is the
@@ -491,6 +525,77 @@ bool load_target_gguf_partial(const std::string & path,
         }
     }
 
+    // ── 2b. Wire MTP / NextN tail blocks (Qwen3.6-MTP GGUFs) ─────────
+    // GGUF block index for MTP layer `mi` is (n_layer + mi). Each MTP block
+    // ships a regular full-attention transformer (no DeltaNet) plus the
+    // NextN-specific projections (eh_proj, enorm, hnorm, optional shared head).
+    for (int mi = 0; mi < (int)nextn_predict_layers; mi++) {
+        const int il = (int)n_layer + mi;
+        char name[128];
+        auto fnd = [&](const char * suffix) -> ggml_tensor * {
+            std::snprintf(name, sizeof(name), "blk.%d.%s", il, suffix);
+            return ggml_get_tensor(meta_ctx, name);
+        };
+        TargetMtpLayer & M = out.mtp_layers[(size_t)mi];
+        M.gguf_layer_index = il;
+        TargetLayer & L = M.block;
+
+        L.attn_norm      = fnd("attn_norm.weight");
+        L.attn_post_norm = fnd("post_attention_norm.weight");
+        L.w_gate         = fnd("ffn_gate.weight");
+        L.w_up           = fnd("ffn_up.weight");
+        L.w_down         = fnd("ffn_down.weight");
+        L.wq             = fnd("attn_q.weight");
+        L.wk             = fnd("attn_k.weight");
+        L.wv             = fnd("attn_v.weight");
+        L.wo             = fnd("attn_output.weight");
+        L.q_norm         = fnd("attn_q_norm.weight");
+        L.k_norm         = fnd("attn_k_norm.weight");
+
+        M.nextn.eh_proj          = fnd("nextn.eh_proj.weight");
+        M.nextn.embed_tokens     = fnd("nextn.embed_tokens.weight");
+        M.nextn.enorm            = fnd("nextn.enorm.weight");
+        M.nextn.hnorm            = fnd("nextn.hnorm.weight");
+        M.nextn.shared_head_head = fnd("nextn.shared_head_head.weight");
+        M.nextn.shared_head_norm = fnd("nextn.shared_head_norm.weight");
+
+        const bool has_attn = L.wq && L.wk && L.wv && L.wo && L.q_norm && L.k_norm;
+        if (!L.attn_norm || !L.attn_post_norm || !has_attn) {
+            char b[160];
+            std::snprintf(b, sizeof(b),
+                "mtp layer %d: missing full-attention tensors", il);
+            set_last_error(b);
+            gguf_free(gctx);
+            return false;
+        }
+        if (!L.w_gate || !L.w_up || !L.w_down) {
+            char b[160];
+            std::snprintf(b, sizeof(b),
+                "mtp layer %d: missing required FFN tensors", il);
+            set_last_error(b);
+            gguf_free(gctx);
+            return false;
+        }
+        if (!M.nextn.eh_proj || !M.nextn.enorm || !M.nextn.hnorm) {
+            char b[160];
+            std::snprintf(b, sizeof(b),
+                "mtp layer %d: missing required nextn tensors "
+                "(eh_proj/enorm/hnorm)", il);
+            set_last_error(b);
+            gguf_free(gctx);
+            return false;
+        }
+    }
+
+    // Plain target decode still embeds on CPU. Native MTP needs device-side
+    // token lookup to chain proposals inside one graph, so MTP-enabled
+    // checkpoints upload token_embd to the GPU as a regular weight.
+    bool upload_tok_embd = nextn_predict_layers > 0;
+    if (const char * s = std::getenv("DFLASH27B_UPLOAD_TOK_EMBD")) {
+        upload_tok_embd = std::atoi(s) != 0;
+    }
+    out.tok_embd_gpu = upload_tok_embd;
+
     // 3. Allocate CUDA buffer only for the selected target tensors.
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
     const size_t alignment = ggml_backend_buft_get_alignment(buft);
@@ -500,7 +605,11 @@ bool load_target_gguf_partial(const std::string & path,
     for (int64_t tid = 0; tid < n_tensors; tid++) {
         const char * tname = gguf_get_tensor_name(gctx, tid);
         ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
-        if (!t || !should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output)) {
+        if (!t) continue;
+        const bool is_tok_embd = (std::strcmp(tname, "token_embd.weight") == 0);
+        const bool selected_by_plan =
+            should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output);
+        if (!selected_by_plan && !(is_tok_embd && upload_tok_embd)) {
             continue;
         }
         alloc_total = align_up_size(alloc_total, alignment);
@@ -559,10 +668,15 @@ bool load_target_gguf_partial(const std::string & path,
             return false;
         }
         if (std::string(tname) == "token_embd.weight") {
-            // Remember offset + size for the CPU embedder; don't upload to GPU.
+            // Remember offset + size for the CPU embedder regardless of GPU
+            // upload — MTP still needs the CPU mmap for tokenizer-side lookups.
             tok_embd_off  = off;
             tok_embd_sz   = sz;
             tok_embd_type = gguf_get_tensor_type(gctx, tid);
+            if (!upload_tok_embd) continue;
+            // MTP path: also stream the bytes into the GPU-resident tensor.
+            ggml_backend_tensor_set(t, (const uint8_t *)mm.addr + off, 0, sz);
+            total += sz;
             continue;
         }
         if (!should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output)) {
@@ -597,12 +711,16 @@ bool load_target_gguf_partial(const std::string & path,
     mm.release();  // don't munmap on Mmap dtor — now owned by the embedder
 
     // Stash the total for callers that want to print it
-    char summary[192];
+    char summary[256];
     std::snprintf(summary, sizeof(summary),
-        "target loaded: layers [%d,%d) output=%d, %zu tensors on GPU %.2f GiB, tok_embd %.0f MiB CPU-only (%s)",
+        "target loaded: layers [%d,%d) output=%d, %zu tensors on GPU %.2f GiB, "
+        "tok_embd %.0f MiB %s (%s), trunk_layers=%d nextn=%d",
         plan.layer_begin, plan.layer_end, (int)plan.load_output, allocs.size(),
         total / (1024.0 * 1024.0 * 1024.0),
-        tok_embd_sz / (1024.0 * 1024.0), ggml_type_name(tok_embd_type));
+        tok_embd_sz / (1024.0 * 1024.0),
+        upload_tok_embd ? "GPU+CPU" : "CPU-only",
+        ggml_type_name(tok_embd_type),
+        out.n_layer, out.nextn_predict_layers);
     set_last_error(summary);
 
     return true;
@@ -613,7 +731,11 @@ void free_target_weights(TargetWeights & w) {
     if (w.ctx) { ggml_free(w.ctx);                w.ctx = nullptr; }
     // CpuEmbedder destructor handles the mmap automatically.
     w.layers.clear();
+    w.mtp_layers.clear();
+    w.nextn_predict_layers = 0;
+    w.gguf_block_count = 0;
     w.tok_embd = nullptr;
+    w.tok_embd_gpu = false;
     w.out_norm = nullptr;
     w.output   = nullptr;
 }
