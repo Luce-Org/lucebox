@@ -5,15 +5,20 @@ param(
     [string] $Distro = '',
     [string] $RepoPath = '/mnt/c/Users/adyba/src/lucebox-hub',
     [int] $WaitSeconds = 300,
-    [int] $ContextSize = 40960,
+    [int] $ContextSize = 65536,
     [int] $DraftContextSize = 2048,
     [int] $DraftNMax = 4,
+    [int] $DraftBlockSize = 4,
     [int] $BatchSize = 2048,
     [int] $UBatchSize = 512,
-    [string] $CacheTypeK = 'q8_0',
-    [string] $CacheTypeV = 'q8_0',
+    [string] $CacheTypeK = 'turbo4',
+    [string] $CacheTypeV = 'turbo4',
     [string] $DraftCacheTypeK = '',
     [string] $DraftCacheTypeV = '',
+    [ValidateSet('atomic', 'llama-cpp', 'llama_cpp', 'spec-draft')]
+    [string] $MtpStyle = 'atomic',
+    [string] $LlamaServer = '',
+    [string] $MtpModel = '',
     [string] $CacheRam = '0',
     [switch] $NoKvOffload,
     [int] $GpuClockMin = 2100,
@@ -65,14 +70,22 @@ function Get-LuceboxEnvPrefix {
         LUCEBOX_GEMMA4_CTX_SIZE = [string] $ContextSize
         LUCEBOX_GEMMA4_DRAFT_CTX_SIZE = [string] $DraftContextSize
         LUCEBOX_GEMMA4_DRAFT_N_MAX = [string] $DraftNMax
+        LUCEBOX_GEMMA4_DRAFT_BLOCK_SIZE = [string] $DraftBlockSize
         LUCEBOX_GEMMA4_BATCH_SIZE = [string] $BatchSize
         LUCEBOX_GEMMA4_UBATCH_SIZE = [string] $UBatchSize
         LUCEBOX_GEMMA4_CACHE_TYPE_K = $CacheTypeK
         LUCEBOX_GEMMA4_CACHE_TYPE_V = $CacheTypeV
         LUCEBOX_GEMMA4_DRAFT_CACHE_TYPE_K = $effectiveDraftCacheTypeK
         LUCEBOX_GEMMA4_DRAFT_CACHE_TYPE_V = $effectiveDraftCacheTypeV
+        LUCEBOX_GEMMA4_MTP_STYLE = $MtpStyle
         LUCEBOX_GEMMA4_CACHE_RAM = $CacheRam
         LUCEBOX_GEMMA4_NO_KV_OFFLOAD = if ($NoKvOffload) { '1' } else { '0' }
+    }
+    if ($LlamaServer -ne '') {
+        $pairs.LUCEBOX_LLAMA_SERVER = $LlamaServer
+    }
+    if ($MtpModel -ne '') {
+        $pairs.LUCEBOX_GEMMA4_MTP_MODEL = $MtpModel
     }
     ($pairs.GetEnumerator() | ForEach-Object {
         "$($_.Key)=$(ConvertTo-BashSingleQuoted ([string] $_.Value))"

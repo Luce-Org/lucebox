@@ -1,17 +1,22 @@
 # Gemma 4 31B on RTX 4090
 
-This Lucebox path serves `gemma-4-31B-it-abliterated-Q4_K_M.gguf` through the
-Gemma 4 MTP-enabled llama.cpp backend. The DFlash runtime in this repository is
-still the Qwen/Laguna research path; Gemma 4 uses libllama because it needs the
-Gemma 4 graph, tokenizer template, and MTP assistant support.
+This Lucebox path serves `gemma-4-31B-it-abliterated-Q4_K_M.gguf` through a
+Gemma 4 MTP + TurboQuant llama.cpp backend. The DFlash runtime in this
+repository is still the Qwen/Laguna research path; Gemma 4 uses libllama because
+it needs the Gemma 4 graph, tokenizer template, TurboQuant KV cache, and MTP
+assistant support.
 
 Default workstation paths:
 
 ```bash
 LUCEBOX_GEMMA4_MODEL=/mnt/c/Users/adyba/Downloads/gemma-4-31B-it-abliterated-Q4_K_M.gguf
-LUCEBOX_GEMMA4_MTP_MODEL=/home/tdamre/models/gemma-4-31B-it-assistant-mtp-f16.gguf
-LUCEBOX_LLAMA_SERVER=/home/tdamre/src/llama.cpp-mtp-pr22673/build-mtp-cuda124-speed-mmq/bin/llama-server
+LUCEBOX_GEMMA4_MTP_MODEL=/home/tdamre/models/gemma-4-31B-it-assistant-atomic-f16.gguf
+LUCEBOX_LLAMA_SERVER=/home/tdamre/src/atomic-llama-cpp-turboquant/build-cuda124/bin/llama-server
 ```
+
+The assistant GGUF above was reconverted from the cached
+`google/gemma-4-31B-it-assistant` snapshot with Atomic's converter so its
+metadata uses the `gemma4_assistant` architecture expected by `--mtp-head`.
 
 Start from Windows PowerShell:
 
@@ -32,17 +37,18 @@ Or from WSL:
 The server listens on `http://127.0.0.1:18191` by default and exposes
 OpenAI-compatible `/v1/chat/completions` plus llama.cpp `/completion`.
 The launcher sets `--reasoning off` so OpenAI chat replies populate
-`message.content` by default. It also pins `--spec-draft-n-max 4`, which is the
-measured stable MTP window for this 31B target on the RTX 4090. The default
-launcher profile uses:
+`message.content` by default. The default launcher profile uses Atomic's
+`--mtp-head` path with TurboQuant `turbo4` K/V and block-size-4 MTP:
 
 ```bash
-LUCEBOX_GEMMA4_CTX_SIZE=40960
+LUCEBOX_GEMMA4_MTP_STYLE=atomic
+LUCEBOX_GEMMA4_CTX_SIZE=65536
 LUCEBOX_GEMMA4_DRAFT_CTX_SIZE=2048
-LUCEBOX_GEMMA4_CACHE_TYPE_K=q8_0
-LUCEBOX_GEMMA4_CACHE_TYPE_V=q8_0
-LUCEBOX_GEMMA4_DRAFT_CACHE_TYPE_K=q8_0
-LUCEBOX_GEMMA4_DRAFT_CACHE_TYPE_V=q8_0
+LUCEBOX_GEMMA4_DRAFT_BLOCK_SIZE=4
+LUCEBOX_GEMMA4_CACHE_TYPE_K=turbo4
+LUCEBOX_GEMMA4_CACHE_TYPE_V=turbo4
+LUCEBOX_GEMMA4_DRAFT_CACHE_TYPE_K=turbo4
+LUCEBOX_GEMMA4_DRAFT_CACHE_TYPE_V=turbo4
 LUCEBOX_GEMMA4_CACHE_RAM=0
 LUCEBOX_GEMMA4_NO_KV_OFFLOAD=0
 ```
@@ -70,3 +76,8 @@ Current RTX 4090 measurements:
 - `65536` context, q8_0 K/V, MTP draft 1, `-b 512 -ub 128`: loaded and answered, but only reached `33.35 tok/s`.
 - Earlier `65536` attempts with the normal `-ub 512` path loaded q8_0 K/V but failed first generation with CUDA OOM in the MTP flash-attention path.
 - After a Docker/WSL/GPU runtime recovery on May 11, the previous `speed-faall` profile degraded to about `3.55 tok/s` at `40960` context even with clocks boosted. The `speed-mmq` build is the best current fallback at about `31.44 tok/s` with q8_0 K/V on GPU; `69632` with `--no-kv-offload` loaded and answered but only reached `19.73 tok/s`.
+- `65536` context, Atomic TurboQuant `turbo4` K/V, Gemma 4 assistant via `--mtp-head`, `--draft-block-size 3`: loaded and answered at `38.29 tok/s`; MTP accepted `82/88` draft tokens.
+- `65536` context, Atomic TurboQuant `turbo4` K/V, Gemma 4 assistant via `--mtp-head`, `--draft-block-size 4`: loaded and answered at `48.52 tok/s`; MTP accepted `93/102` draft tokens. This is the current best high-context TurboQuant + MTP result but still below the `60 tok/s` gate.
+- The Windows launcher default path for the same `65536`/`turbo4`/MTP block-size-4 recipe started successfully on `http://127.0.0.1:18191` and verified at `44.57 tok/s` with `93/102` MTP draft tokens accepted.
+- `65536` context, Atomic TurboQuant `turbo4` K/V, `--draft-block-size 6`: loaded and answered at `22.31 tok/s`; acceptance dropped to `78/234`.
+- `65536` context, Atomic TurboQuant `turbo3` K/V, `--draft-block-size 4`: loaded and answered at `26.57 tok/s`; MTP accepted `71/166` draft tokens.
