@@ -58,6 +58,8 @@ env/
 *.sqlite
 bench-out/
 profile-out/
+context-gemma4-*.json
+verify-gemma4-*.json
 
 # Model weights and caches (pull fresh from HF)
 weights/
