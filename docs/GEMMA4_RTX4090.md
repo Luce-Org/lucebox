@@ -14,6 +14,10 @@ LUCEBOX_GEMMA4_MTP_MODEL=/home/tdamre/models/AtomicChat-gemma-4-31B-it-assistant
 LUCEBOX_LLAMA_SERVER=/home/tdamre/src/atomic-llama-cpp-turboquant/build-cuda124/bin/llama-server
 ```
 
+The current validated Atomic TurboQuant checkout is
+`514e600c84f50a4ba31ca0e3ce6d5560f24c2524` on
+`feature/turboquant-kv-cache`.
+
 The assistant GGUF above was reconverted from the cached
 `google/gemma-4-31B-it-assistant` snapshot with Atomic's converter so its
 metadata uses the `gemma4_assistant` architecture expected by `--mtp-head`,
@@ -111,6 +115,7 @@ Current RTX 4090 measurements:
 - Keeping K at `turbo4` but changing V to `turbo2` also failed the floor (`46.14 tok/s` minimum and `54.87 tok/s` average). The CUDA turbo2-V path was slower and had worse MTP acceptance (`61/196`, `81/136`, and `70/166`) than the default turbo4-V profile.
 - Requantizing the local Q4_K_M GGUF to Atomic `TQ4_1S` produced `C:\Users\adyba\Downloads\gemma-4-31B-it-abliterated-TQ4_1S.gguf` (`18,563.83 MiB`, file type `TQ4_1S`), but it is not usable for the 70k profile on the RTX 4090: startup tried to allocate `30,783.28 MiB` of CUDA model buffer before KV cache and failed model loading.
 - A detached May 13 priority/polling check at `70080` context with Q4_K_S MTP, `--poll 100 --poll-batch 1 --prio 2 --prio-batch 2 --threads-http 1`, improved the three fixed chat-format prompts only to `61.41-63.12 tok/s`. These flags are now the launcher defaults because they reduce latency a little, but they still do not satisfy the strict `70 tok/s` every-run gate.
+- Fast-forwarding Atomic from `2e81dc5f6` to `514e600c8` and rebuilding improved the default `70080`/`turbo4`/Q4_K_S/block-size-4 profile, but not enough: the 3-run 128-token verifier reached `55.90 tok/s` minimum and `66.90 tok/s` average. The same rebuilt tree with AtomicChat's documented `turbo3`/block-size-3 profile was worse on chat-format prompts, with a `53.92 tok/s` low prompt.
 - `71680` context cold-prefill stability probe with a `70035`-token chat prompt completed successfully: prompt processing was `1292.04 tok/s`, decode was `23.51 tok/s`, and MTP accepted `19/31` draft tokens. This confirms the 70k prompt can answer on the Atomic TurboQuant path, but not at the requested decode floor.
 - `71680` context probe with a `65590`-token chat prompt also completed successfully: prompt processing was `1298.25 tok/s`, decode was `29.05 tok/s`, and MTP accepted `21/30` draft tokens.
 - `65536` context, Atomic TurboQuant `turbo4` K/V, `--draft-block-size 6`: loaded and answered at `22.31 tok/s`; acceptance dropped to `78/234`.
