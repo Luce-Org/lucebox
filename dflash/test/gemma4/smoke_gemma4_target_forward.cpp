@@ -88,10 +88,21 @@ int main(int argc, char ** argv) {
     ggml_set_name(attn_mask, "attn_mask");
     ggml_set_input(attn_mask);
 
+    // SWA mask sized to match the SWA layers' view of cache.swa_K.
+    // Without this, gemma4_target_graph falls back to attn_mask for SWA layers
+    // (gemma4_target_graph.cpp:972), which is sized for the full-attn view
+    // and lets FA read past the populated region — catastrophic with TQ3_0/Q4_0
+    // KV. Mirror the same wiring used by gemma4_runtime_helpers.cpp:131-137.
+    const int swa_kv_pad = ((cache.swa_ctx_alloc + 255) / 256) * 256;
+    ggml_tensor * swa_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, swa_kv_pad, n_tokens);
+    ggml_set_name(swa_mask, "swa_mask");
+    ggml_set_input(swa_mask);
+
     GemmaGraphInputs gi{};
     gi.inp_embed      = inp_embed;
     gi.positions      = positions;
     gi.attn_mask      = attn_mask;
+    gi.swa_mask       = swa_mask;
     gi.n_tokens       = n_tokens;
     gi.kv_start       = kv_start;
     gi.capture_layers = true;
@@ -124,6 +135,22 @@ int main(int argc, char ** argv) {
             }
         }
         ggml_backend_tensor_set(attn_mask, mask_data.data(), 0,
+                                sizeof(ggml_fp16_t) * mask_data.size());
+    }
+
+    // Fill SWA mask the same way (only k=kv_start..kv_start+q visible per query;
+    // rest -INF). Cache positions past current pos are zero-initialised garbage
+    // and must be masked out.
+    {
+        const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t ninf_h = ggml_fp32_to_fp16(-INFINITY);
+        std::vector<ggml_fp16_t> mask_data((size_t)swa_kv_pad * n_tokens, ninf_h);
+        for (int q = 0; q < n_tokens; q++) {
+            for (int k = 0; k <= kv_start + q; k++) {
+                mask_data[(size_t)q * swa_kv_pad + k] = zero_h;
+            }
+        }
+        ggml_backend_tensor_set(swa_mask, mask_data.data(), 0,
                                 sizeof(ggml_fp16_t) * mask_data.size());
     }
 
