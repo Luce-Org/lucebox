@@ -122,3 +122,15 @@ class ToolMemory:
             return call_id if isinstance(call_id, str) and call_id else None
         call_id = getattr(item, "id", None)
         return call_id if isinstance(call_id, str) and call_id else None
+
+    def stats(self) -> dict:
+        # Two successive reads under the GIL. A mutation between them can
+        # tear the entries/bytes pair; for /props introspection the report
+        # is allowed to be off by one entry, which is preferable to taking
+        # a lock the rest of this class doesn't carry.
+        return {
+            "max_entries": self.max_entries,
+            "max_bytes": self.max_bytes,
+            "current_entries": len(self.by_id),
+            "current_bytes": self.total_bytes,
+        }

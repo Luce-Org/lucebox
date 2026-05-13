@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import uuid
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -32,6 +33,7 @@ log = logging.getLogger("dflash.server")
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware          # FIX 1: add CORS
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel
 from starlette.concurrency import iterate_in_threadpool
 from transformers import AutoTokenizer
@@ -86,6 +88,137 @@ _QWEN35_ARCHES = {"qwen35", "qwen36"}
 _LAGUNA_ARCHES  = {"laguna"}
 
 _ALLOWED_TEMPLATE_KWARGS = frozenset({"enable_thinking", "tools", "add_generation_prompt"})
+
+
+# ─── /props introspection ──────────────────────────────────────────
+# Read-only GET /props endpoint returning a JSON snapshot of the live
+# Python-server state (model arch, KV/FA config, pflash mode, cache
+# occupancy, daemon liveness). Convention follows llama.cpp's /props.
+
+_PYPROJECT = Path(__file__).resolve().parent.parent / "pyproject.toml"
+
+
+def _resolve_server_version() -> str:
+    # Source: dflash/pyproject.toml [project] version. importlib.metadata
+    # is intentionally not used — that project sets [tool.uv] package=false,
+    # so the package is never installed and the metadata lookup would
+    # always raise PackageNotFoundError and silently fall through.
+    try:
+        with _PYPROJECT.open("rb") as f:
+            return tomllib.load(f)["project"]["version"]
+    except (OSError, KeyError):
+        # File missing or shape unexpected — common case before the
+        # workspace pyproject is committed. Silent fallback.
+        return "0.0.0+unknown"
+    except tomllib.TOMLDecodeError as exc:
+        # File present but malformed — that's a real config bug worth
+        # surfacing, not a silent fallback case.
+        log.warning("could not parse %s for server version: %s", _PYPROJECT, exc)
+        return "0.0.0+unknown"
+
+
+SERVER_VERSION = _resolve_server_version()
+
+PROPS_SCHEMA = 1
+# Bump only on breaking changes to /props output:
+#   - field renamed
+#   - field removed
+#   - existing field's semantics change (units, nullability, type)
+# Do NOT bump for additive changes (new fields, new sections).
+
+_API_ENDPOINTS: list[str] = [
+    "GET /health",
+    "GET /props",
+    "GET /v1/models",
+    "POST /v1/chat/completions",
+    "POST /v1/messages",
+    "POST /v1/responses",
+]
+# Keep in sync with the @app.{get,post} decorators in build_app().
+# Drift is caught by test_props_endpoints_match_app_routes.
+
+
+def _capabilities(arch: str) -> dict:
+    """Arch-gated capability booleans for /props.
+
+    Currently consumed only by /props. The Codex /v1/models variant has
+    its own hardcoded capability fields; wiring it through this helper
+    is a v2 follow-up (the Codex schema requires non-empty reasoning-
+    level fields, which would need validation against a real client
+    before gating them on arch="laguna").
+    """
+    qwen = arch in _QWEN35_ARCHES
+    return {
+        "reasoning_supported": qwen,
+        "speculative_supported": qwen,
+        "tools_supported": qwen,
+    }
+
+
+def _effective_kv_type(axis: str, arch: str) -> str:
+    """KV K or V type as the C++ daemon actually resolves it.
+
+    Mirrors dflash::resolve_kv_types() in src/kv_quant.cpp (qwen35) and the
+    laguna-specific path in test/test_dflash.cpp (laguna). Distinct from
+    _resolve_kv_k_type() — that function uses q8_0 as a stable hash salt for
+    the prefix cache; this one reports what the daemon allocated.
+    """
+    if arch in _LAGUNA_ARCHES:
+        # laguna reads only DFLASH27B_KV_K; legacy shorthand and KV_V ignored.
+        kv = "q8_0"
+        if os.environ.get("DFLASH27B_KV_K"):
+            kv = os.environ["DFLASH27B_KV_K"].lower()
+        return kv
+    # qwen35: default Q4_0; legacy KV_F16/_KV_Q4/_KV_TQ3 last-wins; per-axis
+    # KV_K/_KV_V override legacy.
+    kv = "q4_0"
+    if os.environ.get("DFLASH27B_KV_F16", "0") != "0":
+        kv = "f16"
+    if os.environ.get("DFLASH27B_KV_Q4", "0") != "0":
+        kv = "q4_0"
+    if os.environ.get("DFLASH27B_KV_TQ3", "0") != "0":
+        kv = "tq3_0"
+    axis_env = f"DFLASH27B_KV_{axis.upper()}"
+    if os.environ.get(axis_env):
+        kv = os.environ[axis_env].lower()
+    return kv
+
+
+def _parse_optional_float(env_name: str) -> float | None:
+    raw = os.environ.get(env_name)
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning("ignoring non-numeric %s=%r", env_name, raw)
+        return None
+
+
+def _pflash_props(cfg: "PrefillConfig | None") -> dict:
+    if cfg is None or not cfg.enabled:
+        return {
+            "enabled": False,
+            "mode": "off",
+            "threshold": None,
+            "keep_ratio": None,
+            "drafter_gguf": None,
+            "skip_park": None,
+            "bsa_enabled": None,
+            "bsa_alpha": None,
+            "lm_head_fix": None,
+        }
+    return {
+        "enabled": True,
+        "mode": cfg.mode,
+        "threshold": cfg.threshold,
+        "keep_ratio": cfg.keep_ratio,
+        "drafter_gguf": str(cfg.drafter_gguf) if cfg.drafter_gguf else None,
+        "skip_park": bool(cfg.skip_park),
+        "bsa_enabled": os.environ.get("DFLASH_FP_USE_BSA", "0") != "0",
+        "bsa_alpha": _parse_optional_float("DFLASH_FP_ALPHA"),
+        "lm_head_fix": os.environ.get("DFLASH27B_LM_HEAD_FIX", "0") != "0",
+    }
 
 
 def resolve_draft(root: Path) -> Path:
@@ -780,6 +913,76 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 "max_context_length": max_ctx,
             }],
         }
+
+    # ── /props introspection ───────────────────────────────────────
+    # Captures Python-server state only; daemon (C++ test_dflash) build
+    # identity is intentionally out of scope for v1.
+
+    @app.get("/props")
+    def props():
+        caps = _capabilities(arch)
+        # Cache reads are lockless: a mutation under daemon_lock can tear
+        # in_use vs lifetime_hits across stats(). Acceptable for /props.
+        prefix_stats = prefix_cache.stats()
+        full_stats = prefix_cache.full_stats()
+        tool_stats = tool_memory.stats()
+        tokenizer_id = getattr(tokenizer, "name_or_path", None)
+        if not isinstance(tokenizer_id, str):
+            tokenizer_id = None
+        body = {
+            "server": {
+                "name": "luce-dflash",
+                "version": SERVER_VERSION,
+                "props_schema": PROPS_SCHEMA,
+            },
+            "model": {
+                "id": MODEL_NAME,
+                "arch": arch,
+                "target_path": str(target),
+                "draft_path": str(draft) if draft is not None else None,
+                "tokenizer_id": tokenizer_id,
+            },
+            "runtime": {
+                "max_ctx": max_ctx,
+                "fa_window": _fa_window,
+                "kv_cache_k": _effective_kv_type("k", arch),
+                "kv_cache_v": _effective_kv_type("v", arch),
+                "lazy_draft": bool(lazy_draft),
+                # extra_daemon_args is only forwarded to the qwen35 daemon
+                # spawn (see cmd.extend above); the laguna path discards it,
+                # so report sharding off there regardless of what was passed.
+                "target_sharding": (
+                    arch not in _LAGUNA_ARCHES
+                    and _extra_daemon_has_target_sharding(extra_daemon_args)
+                ),
+            },
+            "reasoning": {
+                "supported": caps["reasoning_supported"],
+                "default_enabled": caps["reasoning_supported"],
+            },
+            "speculative": {
+                "enabled": caps["speculative_supported"],
+                "ddtree_budget": budget if caps["speculative_supported"] else None,
+            },
+            "sampling": {
+                "supports_temperature": True,
+                "supports_top_p": True,
+                "supports_top_k": True,
+                "supports_frequency_penalty": True,
+                "supports_seed": True,
+            },
+            "pflash": _pflash_props(prefill_cfg),
+            "prefix_cache": prefix_stats,
+            "full_cache": full_stats,
+            "tool_replay": tool_stats,
+            "daemon": {
+                "alive": daemon_proc.poll() is None,
+            },
+            "api": {
+                "endpoints": list(_API_ENDPOINTS),
+            },
+        }
+        return body
 
     def _ids_to_bin(ids: list[int]) -> Path:
         fd, path = tempfile.mkstemp(suffix=".bin")
