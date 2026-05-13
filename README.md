@@ -58,17 +58,18 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant).
 
 ```bash
 # 1. clone + enter
-git clone https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/megakernel
+git clone https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub
 
-# 2. install (Python 3.10+, CUDA 12+, PyTorch 2.0+). Weights stream from HF on first run.
-python -m venv .venv && source .venv/bin/activate   # required on Ubuntu 24+ system Python (PEP 668)
-pip install --upgrade pip
-pip install torch                          # install BEFORE the next step; setup.py imports torch at build time
-pip install -e . --no-build-isolation      # --no-build-isolation lets the build see the torch you just installed
+# 2. install via the workspace (Python 3.11, CUDA 12+, PyTorch 2.5+; torch
+#    is pulled from PyTorch's cu130 index automatically). Weights stream
+#    from HF on first run.
+uv sync --extra megakernel          # builds the CUDA extension (--no-build-isolation already wired)
 
 # 3. run the benchmark (prefill pp520 + decode tg128 vs llama.cpp BF16 + PyTorch HF)
-python final_bench.py
+uv run --directory megakernel python final_bench.py
 ```
+
+> Don't have `uv`? Install with `curl -LsSf https://astral.sh/uv/install.sh | sh` or see [astral.sh/uv](https://astral.sh/uv/). The legacy `python -m venv` + `pip install -e . --no-build-isolation` flow still works from inside `megakernel/`.
 
 | Method | Prefill pp520 | Decode tg128 | tok/J |
 |--------|:-------------:|:------------:|:-----:|
@@ -96,23 +97,27 @@ python final_bench.py
 
 ```bash
 # 1. clone with submodules (pulls the pinned Luce-Org/llama.cpp@luce-dflash fork)
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub
 
-# 2. build the C++/CUDA decoder (CUDA 12+, CMake 3.18+)
+# 2. install Python deps via the workspace (creates one shared .venv at the
+#    repo root; torch pulled from PyTorch's cu130 index).
+uv sync
+
+# 3. build the C++/CUDA decoder (CUDA 12+, CMake 3.18+)
 # Default compiles for 75/80/86/89 (+120 on CUDA 12.8+, +sm_121/DGX Spark on CUDA 12.9+, +sm_110/Thor on CUDA 13.0+) so the binary runs on every supported card.
 # 3090-only users can add -DCMAKE_CUDA_ARCHITECTURES=86 to skip the other archs and build faster (~3 min).
-cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target test_dflash -j
+cmake -B dflash/build -S dflash -DCMAKE_BUILD_TYPE=Release
+cmake --build dflash/build --target test_dflash -j
 
-# 3. fetch weights: ~16 GB Q4_K_M target + 3.46 GB bf16 draft
-hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
-hf download z-lab/Qwen3.6-27B-DFlash model.safetensors --local-dir models/draft/
+# 4. fetch weights: ~16 GB Q4_K_M target + 3.46 GB bf16 draft
+uv run hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir dflash/models/
+uv run hf download z-lab/Qwen3.6-27B-DFlash model.safetensors --local-dir dflash/models/draft/
 
-# 4a. one-shot streaming generate
-python3 scripts/run.py --prompt "def fibonacci(n):"
+# 5a. one-shot streaming generate
+uv run --directory dflash python scripts/run.py --prompt "def fibonacci(n):"
 
-# 4b. or reproduce the paper-style bench (HumanEval + GSM8K + Math500, ~15 min)
-python3 scripts/bench_llm.py
+# 5b. or reproduce the paper-style bench (HumanEval + GSM8K + Math500, ~15 min)
+uv run --directory dflash python scripts/bench_llm.py
 ```
 
 | Benchmark | AR (tok/s) | DFlash+DDTree (tok/s) | Speedup |

@@ -1,0 +1,35 @@
+[project]
+name = "lucebox-hub"
+version = "0.0.0"
+description = "Lucebox: open LLM inference, rewritten by hand for one specific chip at a time. Workspace root."
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Lucebox" }]
+
+dependencies = [
+    "lucebox-dflash",
+    "pflash",
+]
+
+[project.optional-dependencies]
+megakernel = ["qwen35-megakernel-bf16"]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false
+no-build-isolation-package = ["qwen35-megakernel-bf16"]
+
+[tool.uv.workspace]
+members = ["dflash", "megakernel", "pflash"]
+
+[tool.uv.sources]
+lucebox-dflash = { workspace = true }
+pflash = { workspace = true }
+qwen35-megakernel-bf16 = { workspace = true }
+torch = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

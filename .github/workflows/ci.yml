@@ -6,6 +6,30 @@ on:
   workflow_dispatch:
 
 jobs:
+  uv-workspace:
+    name: uv workspace (lock + sync + import smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.x"
+      - name: Verify lockfile is in sync with pyproject.toml
+        run: uv lock --check
+      - name: Install workspace from frozen lockfile
+        # Skip the torch CUDA index on the CI runner (~1 GB nvidia wheels,
+        # not exercised here). The dflash/pflash workspace members still
+        # resolve; megakernel needs nvcc and is exercised by the CUDA job.
+        run: uv sync --frozen --no-install-package torch
+      - name: Import smoke (server.py + workspace modules)
+        run: |
+          uv run --frozen --no-sync python -c "
+          import fastapi, uvicorn, transformers, jinja2, numpy, gguf, datasets, huggingface_hub
+          import sys; sys.path.insert(0, 'dflash/scripts')
+          import server  # noqa: F401
+          print('workspace OK')
+          "
+
   build:
     name: Build (CUDA 12.8)
     runs-on: ubuntu-latest

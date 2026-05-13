@@ -1,0 +1,24 @@
+[project]
+name = "qwen35-megakernel-bf16"
+version = "0.1.0"
+description = "Fused single-kernel forward pass for Qwen 3.5-0.8B hybrid DeltaNet/Attention on consumer NVIDIA GPUs."
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Lucebox" }]
+
+# Runtime deps for bench scripts / model.py. The CUDA extension itself
+# (qwen35_megakernel_bf16_C) is compiled by setup.py via
+# torch.utils.cpp_extension at install time.
+dependencies = [
+    "torch>=2.5",
+    "transformers>=4.50",
+]
+
+[build-system]
+# `torch` must be importable at build time because setup.py imports
+# torch.utils.cpp_extension to register the CUDAExtension. The workspace
+# root marks this package as `no-build-isolation` so the build sees the
+# torch already installed in the shared `.venv`.
+requires = ["setuptools>=68", "wheel", "torch"]
+build-backend = "setuptools.build_meta"

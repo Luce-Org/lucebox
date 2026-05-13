@@ -36,11 +36,20 @@ The script is idempotent and configures `nvcc` on PATH for both bash and zsh. Fo
 | git-lfs | any |
 | CUDA Toolkit | 12.0+ |
 | huggingface-cli | any |
+| uv | 0.5+ (Python deps) |
 
 After setup:
 
 ```bash
 git submodule update --init --recursive
+
+# Python deps (workspace at the repo root; one .venv shared by dflash, pflash,
+# and optionally megakernel). `uv` is the canonical installer; the legacy
+# per-subproject `python -m venv .venv && pip install …` flow still works.
+uv sync                       # dflash + pflash deps
+uv sync --extra megakernel    # also compile the megakernel CUDA extension
+
+# C++/CUDA decoder
 cmake -B dflash/build -S dflash -DCMAKE_BUILD_TYPE=Release
 cmake --build dflash/build --target test_dflash -j
 ```
