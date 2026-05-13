@@ -1,14 +1,17 @@
-// Gemma4 runtime helpers — chunked-prefill graph builder and token embedders.
+// Gemma4 runtime helpers — chunked-prefill graph builder, token embedders,
+// DFlash draft graph wrappers, and AdaptiveDraftMax controller.
 //
 // Ported from feature/gemma4-support dflash/test/gemma4/test_gemma4_dflash.cpp
-// (ranges 213-275, 342-425, 525-612 per the AR-port source digest).
+// (ranges 213-275, 280-450, 342-425, 525-612, 690-770 per the source digests).
 // Namespace adjusted to dflash27b; local sampler types and driver-only
 // scaffolding stripped.
 
 #include "gemma4_runtime_helpers.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 namespace dflash27b {
@@ -194,6 +197,200 @@ bool embed_tokens_batch(const GemmaTargetWeights & w,
     ggml_backend_tensor_set(inp_embed, emb.data(), 0, sizeof(float) * hidden * n);
     (void)backend;
     return true;
+}
+
+// ─── draft_kv_prefill_create ────────────────────────────────────────────────
+//
+// Builds and allocates a DraftKVPrefillGraph for n_tokens positions.
+// Wraps build_draft_kv_prefill_graph (internal.h:783).
+// Ported from test_gemma4_dflash.cpp Range E (static build_draft_kv_prefill).
+
+bool draft_kv_prefill_create(DraftKVPrefillGraph & pkg,
+                             const GemmaDraftWeights & dw,
+                             GemmaTargetCache & cache,
+                             ggml_backend_t backend,
+                             int n_tokens) {
+    // Free any previous state
+    if (pkg.alloc) { ggml_gallocr_free(pkg.alloc); pkg.alloc = nullptr; }
+    if (pkg.ctx)   { ggml_free(pkg.ctx);   pkg.ctx   = nullptr; }
+    pkg.gf          = nullptr;
+    pkg.target_feat = nullptr;
+    pkg.positions   = nullptr;
+
+    const int target_feat_w = dw.n_target_layers * dw.target_hidden;
+
+    ggml_init_params ip{};
+    ip.mem_size   = 256 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    pkg.ctx = ggml_init(ip);
+    if (!pkg.ctx) return false;
+
+    pkg.target_feat = ggml_new_tensor_2d(pkg.ctx, GGML_TYPE_F32, target_feat_w, n_tokens);
+    ggml_set_name(pkg.target_feat, "prefill_target_feat");
+    ggml_set_input(pkg.target_feat);
+
+    pkg.positions = ggml_new_tensor_1d(pkg.ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(pkg.positions, "prefill_positions");
+    ggml_set_input(pkg.positions);
+
+    pkg.gf = ggml_new_graph_custom(pkg.ctx, 4096, false);
+
+    build_draft_kv_prefill_graph(pkg.ctx, pkg.gf, dw, cache,
+                                 pkg.target_feat, pkg.positions, n_tokens);
+
+    if (!pkg.alloc) {
+        pkg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    if (!ggml_gallocr_alloc_graph(pkg.alloc, pkg.gf)) {
+        ggml_gallocr_free(pkg.alloc); pkg.alloc = nullptr;
+        ggml_free(pkg.ctx); pkg.ctx = nullptr;
+        pkg.gf = nullptr; pkg.target_feat = nullptr; pkg.positions = nullptr;
+        return false;
+    }
+    return true;
+}
+
+// ─── draft_kv_prefill_destroy ───────────────────────────────────────────────
+
+void draft_kv_prefill_destroy(DraftKVPrefillGraph & pkg) {
+    if (pkg.alloc) { ggml_gallocr_free(pkg.alloc); pkg.alloc = nullptr; }
+    if (pkg.ctx)   { ggml_free(pkg.ctx);   pkg.ctx   = nullptr; }
+    pkg.gf          = nullptr;
+    pkg.target_feat = nullptr;
+    pkg.positions   = nullptr;
+}
+
+// ─── draft_step_build ───────────────────────────────────────────────────────
+//
+// Builds and allocates a DraftStepGraph for q_len tokens at KV offset kv_start.
+// Wraps build_gemma4_draft_graph (internal.h:790).
+// Ported from test_gemma4_dflash.cpp Range E (static build_draft_step).
+
+bool draft_step_build(DraftStepGraph & dsg,
+                      const GemmaDraftWeights & dw,
+                      GemmaTargetCache & cache,
+                      ggml_backend_t backend,
+                      int q_len,
+                      int kv_start) {
+    // Free any previous state
+    if (dsg.alloc) { ggml_gallocr_free(dsg.alloc); dsg.alloc = nullptr; }
+    if (dsg.ctx)   { ggml_free(dsg.ctx);   dsg.ctx   = nullptr; }
+    dsg.gf          = nullptr;
+    dsg.draft_embed = nullptr;
+    dsg.positions   = nullptr;
+    dsg.attn_mask   = nullptr;
+    dsg.logits      = nullptr;
+
+    ggml_init_params ip{};
+    ip.mem_size   = 512 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    dsg.ctx = ggml_init(ip);
+    if (!dsg.ctx) return false;
+
+    const int kv_len  = kv_start + q_len;
+    const int kv_pad  = align_up(kv_len, g_kq_stride_pad);
+    const int q_pad   = align_up(q_len, KQ_MASK_PAD);
+
+    dsg.draft_embed = ggml_new_tensor_2d(dsg.ctx, GGML_TYPE_F32, dw.n_embd, q_len);
+    ggml_set_name(dsg.draft_embed, "draft_embed");
+    ggml_set_input(dsg.draft_embed);
+
+    dsg.positions = ggml_new_tensor_1d(dsg.ctx, GGML_TYPE_I32, q_len);
+    ggml_set_name(dsg.positions, "draft_positions");
+    ggml_set_input(dsg.positions);
+
+    dsg.attn_mask = ggml_new_tensor_2d(dsg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
+    ggml_set_name(dsg.attn_mask, "draft_attn_mask");
+    ggml_set_input(dsg.attn_mask);
+    ggml_set_output(dsg.attn_mask);
+
+    dsg.gf = ggml_new_graph_custom(dsg.ctx, 4096, false);
+
+    ggml_tensor * logits_out = build_gemma4_draft_graph(dsg.ctx, dsg.gf, dw, cache,
+                                                         dsg.draft_embed, dsg.positions,
+                                                         dsg.attn_mask, q_len, kv_start);
+    if (!logits_out) {
+        ggml_free(dsg.ctx); dsg.ctx = nullptr;
+        return false;
+    }
+    dsg.logits = logits_out;
+    ggml_set_output(dsg.logits);
+    ggml_build_forward_expand(dsg.gf, dsg.logits);
+
+    if (!dsg.alloc) {
+        dsg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    if (!ggml_gallocr_alloc_graph(dsg.alloc, dsg.gf)) {
+        ggml_gallocr_free(dsg.alloc); dsg.alloc = nullptr;
+        ggml_free(dsg.ctx); dsg.ctx = nullptr;
+        dsg.gf = nullptr; dsg.draft_embed = nullptr;
+        dsg.positions = nullptr; dsg.attn_mask = nullptr; dsg.logits = nullptr;
+        return false;
+    }
+    return true;
+}
+
+// ─── draft_step_free ────────────────────────────────────────────────────────
+
+void draft_step_free(DraftStepGraph & dsg) {
+    if (dsg.alloc) { ggml_gallocr_free(dsg.alloc); dsg.alloc = nullptr; }
+    if (dsg.ctx)   { ggml_free(dsg.ctx);   dsg.ctx   = nullptr; }
+    dsg.gf          = nullptr;
+    dsg.draft_embed = nullptr;
+    dsg.positions   = nullptr;
+    dsg.attn_mask   = nullptr;
+    dsg.logits      = nullptr;
+}
+
+// copy_target_feat_bf16_to_f32: Copy n_tokens columns from the bf16 ring buffer
+// src_bf16 (shape [target_feat_w, ring_cap]) starting at slot start_slot into
+// the f32 tensor dst_f32 (shape [target_feat_w, n_tokens]).
+//
+// Uses ggml_cpy with ggml_view_2d for type conversion on the GPU backend —
+// ring-wrap is handled with two graph copies (pre-wrap + post-wrap segments).
+// On-device, no host roundtrip.
+
+void copy_target_feat_bf16_to_f32(ggml_backend_t backend,
+                                   ggml_tensor * src_bf16,
+                                   ggml_tensor * dst_f32,
+                                   int start_slot,
+                                   int n_tokens,
+                                   int target_feat_w) {
+    const int cap    = (int)src_bf16->ne[1];
+    const int pre_n  = std::min(n_tokens, cap - start_slot);
+    const int post_n = n_tokens - pre_n;
+
+    ggml_init_params ip{};
+    ip.mem_size   = 256 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    ggml_context * tmp_ctx = ggml_init(ip);
+
+    ggml_cgraph * gf = ggml_new_graph(tmp_ctx);
+
+    // Pre-wrap segment: rows [start_slot .. start_slot+pre_n-1] → dst rows [0..pre_n-1]
+    {
+        ggml_tensor * s = ggml_view_2d(tmp_ctx, src_bf16, target_feat_w, pre_n,
+                                       src_bf16->nb[1],
+                                       (size_t)start_slot * src_bf16->nb[1]);
+        ggml_tensor * d = ggml_view_2d(tmp_ctx, dst_f32, target_feat_w, pre_n,
+                                       dst_f32->nb[1], 0);
+        ggml_build_forward_expand(gf, ggml_cpy(tmp_ctx, s, d));
+    }
+    // Post-wrap segment: rows [0..post_n-1] → dst rows [pre_n..pre_n+post_n-1]
+    if (post_n > 0) {
+        ggml_tensor * s = ggml_view_2d(tmp_ctx, src_bf16, target_feat_w, post_n,
+                                       src_bf16->nb[1], 0);
+        ggml_tensor * d = ggml_view_2d(tmp_ctx, dst_f32, target_feat_w, post_n,
+                                       dst_f32->nb[1],
+                                       (size_t)pre_n * dst_f32->nb[1]);
+        ggml_build_forward_expand(gf, ggml_cpy(tmp_ctx, s, d));
+    }
+
+    ggml_backend_graph_compute(backend, gf);
+    ggml_free(tmp_ctx);
 }
 
 }  // namespace dflash27b
