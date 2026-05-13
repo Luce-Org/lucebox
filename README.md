@@ -286,7 +286,7 @@ All experiments in this repo are built, tuned, and benchmarked on NVIDIA RTX 309
 - **Jetson AGX Thor** (sm_110): supported, CUDA 13+.
 - **Turing** (sm_75, RTX 2080): supported, CUDA 12+.
 
-PyTorch 2.0+. `dflash/` needs CMake 3.18+ and `--recurse-submodules` for the pinned `Luce-Org/llama.cpp@luce-dflash` fork (three tree-mode ggml ops); multi-arch build is automatic (see [Running on other GPUs](#running-on-other-gpus-4090-5090-dgx-spark--gb10-jetson-agx-thor)).
+PyTorch 2.5+. `dflash/` needs CMake 3.18+ and `--recurse-submodules` for the pinned `Luce-Org/llama.cpp@luce-dflash` fork (three tree-mode ggml ops); multi-arch build is automatic (see [Running on other GPUs](#running-on-other-gpus-4090-5090-dgx-spark--gb10-jetson-agx-thor)).
 
 **Megakernel porting note.** `megakernel/setup.py` auto-detects the GPU arch and SM count at build time via `torch.cuda.get_device_capability()`. The decode grid is persistent (one block per SM) and is clamped to the resident-block ceiling at runtime, so no manual tuning is needed. On SM < 80 (Turing), the kernel uses FP16 instead of BF16 via a compile-time `TARGET_SM` flag; on SM ≥ 80 (Ampere+), BF16 is used. Just `pip install -e . --no-build-isolation` and the right code path is selected automatically.
 
