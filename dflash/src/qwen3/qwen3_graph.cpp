@@ -7,8 +7,10 @@
 //
 // **Algorithmic note vs blog**:
 //   The blog stack is Liu Q-hook tail scoring + FlashPrefill block-sparse FA.
-//   The Liu Q-hook is implemented exactly (uses full K_curr post-RoPE for
-//   tail scoring → score signal is exact). The block-sparse FA is replaced
+//   The Liu Q-hook is implemented with a NoPE fix: by default (DFLASH_FP_NOPE_TAIL=1)
+//   the tail score uses pre-RoPE K/Q, removing the RoPE distance decay that
+//   buries early-position needle chunks and was causing NIAH failures.
+//   Set DFLASH_FP_NOPE_TAIL=0 to revert to post-RoPE scoring.  The block-sparse FA is replaced
 //   with a sliding-window approximation here because (a) ggml-cuda's
 //   `flash_attn_ext` already gives tensor-core speed inside the ubatch
 //   graph, and (b) our own block-sparse CUDA kernel needs a tensor-core
@@ -251,6 +253,12 @@ bool forward_qwen3_drafter_model(
     const float eps    = 1e-6f;
     const float scale  = 1.0f / std::sqrt((float)D);
     const float rope_b = w.rope_theta;
+    // Pre-RoPE tail scoring: removes RoPE distance decay from the score signal.
+    // Default ON; set DFLASH_FP_NOPE_TAIL=0 to disable (saves ~K_curr_v memory).
+    static const bool nope_tail = []() -> bool {
+        const char * e = std::getenv("DFLASH_FP_NOPE_TAIL");
+        return e == nullptr || std::string(e) != "0";
+    }();
 
     if (S < n_lookahead + 1) {
         set_last_error("forward_qwen3_drafter_model: S too small");
@@ -262,6 +270,9 @@ bool forward_qwen3_drafter_model(
     std::vector<PersBuf> K_curr_v((size_t)w.n_layer);
     std::vector<PersBuf> V_curr_v((size_t)w.n_layer);
     std::vector<PersBuf> Q_last_v((size_t)w.n_layer);
+    // NoPE: pre-RoPE K (full sequence) and Q tail; allocated only when nope_tail.
+    std::vector<PersBuf> K_norope_v(nope_tail ? (size_t)w.n_layer : 0);
+    std::vector<PersBuf> Q_norope_v(nope_tail ? (size_t)w.n_layer : 0);
     auto cleanup_all = [&]() {
         free_pers(hidden_buf);
         free_pers(pos_buf);
@@ -271,6 +282,8 @@ bool forward_qwen3_drafter_model(
         for (auto & p : K_curr_v) free_pers(p);
         for (auto & p : V_curr_v) free_pers(p);
         for (auto & p : Q_last_v) free_pers(p);
+        for (auto & p : K_norope_v) free_pers(p);
+        for (auto & p : Q_norope_v) free_pers(p);
     };
 
     {
@@ -305,6 +318,14 @@ bool forward_qwen3_drafter_model(
                 set_last_error("forward_qwen3: K_curr/V_curr/Q_last alloc failed at layer " + std::to_string(il));
                 cleanup_all();
                 return false;
+            }
+            if (nope_tail) {
+                if (!make_pers(w.backend, half_type, 3, d_kv, K_norope_v[il]) ||
+                    !make_pers(w.backend, GGML_TYPE_F32, 3, d_ql, Q_norope_v[il])) {
+                    set_last_error("forward_qwen3: K_norope/Q_norope alloc failed at layer " + std::to_string(il));
+                    cleanup_all();
+                    return false;
+                }
             }
         }
     }
@@ -417,6 +438,19 @@ bool forward_qwen3_drafter_model(
             Q = ggml_reshape_3d(gA, Q, D, H, cl);
             Q = ggml_rms_norm(gA, Q, eps);
             Q = ggml_mul(gA, Q, L.q_norm);
+            // NoPE: capture pre-RoPE Q tail so the tail scorer is not biased by distance.
+            if (nope_tail) {
+                const int tail_lo_nr = S - n_lookahead;
+                if (tail_lo_nr >= cs && tail_lo_nr < cs + cl) {
+                    const int local_lo_nr = tail_lo_nr - cs;
+                    ggml_tensor * Q_prenrope_tail = ggml_view_3d(
+                        gA, Q, D, H, n_lookahead,
+                        Q->nb[1], Q->nb[2],
+                        (size_t)local_lo_nr * Q->nb[2]);
+                    ggml_build_forward_expand(gfA,
+                        ggml_cpy(gA, Q_prenrope_tail, Q_norope_v[il].t));
+                }
+            }
             Q = ggml_rope_ext(gA, Q, pos_chunk, nullptr, D,
                               GGML_ROPE_TYPE_NEOX, 0,
                               rope_b, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
@@ -425,6 +459,14 @@ bool forward_qwen3_drafter_model(
             K = ggml_reshape_3d(gA, K, D, Hk, cl);
             K = ggml_rms_norm(gA, K, eps);
             K = ggml_mul(gA, K, L.k_norm);
+            // NoPE: save pre-RoPE K chunk alongside K_curr_v.
+            if (nope_tail) {
+                const size_t kn_esz = ggml_element_size(K_norope_v[il].t);
+                ggml_tensor * Kn_dst = ggml_view_3d(gA, K_norope_v[il].t, D, Hk, cl,
+                                                    kn_esz * D, kn_esz * D * Hk,
+                                                    (size_t)cs * kn_esz * D * Hk);
+                ggml_build_forward_expand(gfA, ggml_cpy(gA, K, Kn_dst));
+            }
             K = ggml_rope_ext(gA, K, pos_chunk, nullptr, D,
                               GGML_ROPE_TYPE_NEOX, 0,
                               rope_b, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
@@ -788,7 +830,8 @@ bool forward_qwen3_drafter_model(
         ggml_context * gctx = ggml_init(ip);
 
         ggml_tensor * K_f32 = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, D, Hk, S);
-        ggml_tensor * K_cast = ggml_cpy(gctx, K_curr_v[il].t, K_f32);
+        ggml_tensor * K_cast = ggml_cpy(gctx,
+            nope_tail ? K_norope_v[il].t : K_curr_v[il].t, K_f32);
         ggml_tensor * K_perm = ggml_cont(gctx,
             ggml_permute(gctx, K_cast, 0, 2, 1, 3));
         ggml_tensor * K_score = K_perm;
@@ -800,7 +843,9 @@ bool forward_qwen3_drafter_model(
             K_score = ggml_reshape_3d(gctx, K_rep, D, S, H);
         }
         ggml_tensor * Q_tail_perm = ggml_cont(gctx,
-            ggml_permute(gctx, Q_last_v[il].t, 0, 2, 1, 3));
+            ggml_permute(gctx,
+                nope_tail ? Q_norope_v[il].t : Q_last_v[il].t,
+                0, 2, 1, 3));
         ggml_tensor * attn_score = ggml_mul_mat(gctx, K_score, Q_tail_perm);
         ggml_tensor * probs = ggml_soft_max_ext(gctx, attn_score, mask_tail_buf.t,
                                                 scale, 0.0f);
