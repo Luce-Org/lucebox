@@ -80,10 +80,15 @@ MODEL_NAME = "luce-dflash"
 # server can drive. test_dflash dispatches by GGUF arch internally:
 #   qwen35 / qwen36  -> existing DFlash + DDTree pipeline
 #   laguna           -> dflash27b::run_laguna_daemon() (no spec-decode)
+#   gemma4           -> dflash27b::run_gemma4_daemon() (PR #13; decode
+#                       strategy selected at backend ctor time)
 # server.py just needs to omit --draft + the DFlash/DDTree flags when the
-# arch doesn't support speculative decoding yet.
+# arch doesn't support speculative decoding yet (qwen35 is the only one
+# wiring those CLI flags directly; gemma4 carries the draft method on the
+# backend, not the binary CLI).
 _QWEN35_ARCHES = {"qwen35", "qwen36"}
 _LAGUNA_ARCHES  = {"laguna"}
+_GEMMA4_ARCHES  = {"gemma4"}
 
 _ALLOWED_TEMPLATE_KWARGS = frozenset({"enable_thinking", "tools", "add_generation_prompt"})
 

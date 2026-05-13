@@ -225,6 +225,8 @@ add_library(dflash27b STATIC
     # Gemma4 backend (PR11b — concrete ModelBackend impl, depends on PR175 interface)
     src/gemma4/gemma4_runtime_helpers.cpp
     src/gemma4/gemma4_backend.cpp
+    # Gemma4 daemon entry (PR13 — depends on PR175 daemon_loop)
+    src/gemma4/gemma4_daemon.cpp
 )
 # BSA (Block-Sparse Attention) backs the speculative-prefill drafter scoring
 # path. Default ON so prefill is fast out of the box. Turn OFF if you don't
