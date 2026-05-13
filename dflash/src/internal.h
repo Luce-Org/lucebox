@@ -23,6 +23,7 @@
 #include "gguf.h"
 
 #include "dflash27b.h"
+#include "gemma4.h"
 
 namespace dflash27b {
 
@@ -506,6 +507,105 @@ ggml_tensor * build_qwen35_layer(
     int                   fa_window = 0,
     ggml_tensor *         q_tail_capture = nullptr,
     int                   q_tail_start = 0);
+
+
+// ============ Gemma4 Architecture ============
+
+struct GemmaTargetLayer {
+    // Attention (ALL layers are attention in Gemma4)
+    ggml_tensor * attn_norm      = nullptr;
+    ggml_tensor * wq             = nullptr;
+    ggml_tensor * wk             = nullptr;  // nullptr for KV-shared layers
+    ggml_tensor * wv             = nullptr;  // nullptr for KV-shared layers
+    ggml_tensor * wo             = nullptr;
+    ggml_tensor * q_norm         = nullptr;
+    ggml_tensor * k_norm         = nullptr;  // nullptr for KV-shared layers
+    ggml_tensor * attn_post_norm = nullptr;
+
+    // p-RoPE freq factors (full-attention layers only)
+    ggml_tensor * rope_freqs     = nullptr;
+
+    ggml_tensor * out_scale      = nullptr;
+
+    // FFN (SwiGLU)
+    ggml_tensor * ffn_norm       = nullptr;
+    ggml_tensor * w_gate         = nullptr;
+    ggml_tensor * w_up           = nullptr;
+    ggml_tensor * w_down         = nullptr;
+    ggml_tensor * ffn_post_norm  = nullptr;
+
+    // MoE (26B-A4B only)
+    ggml_tensor * ffn_gate_inp   = nullptr;
+    ggml_tensor * ffn_gate_inp_s = nullptr;
+    ggml_tensor * ffn_pre_norm_2 = nullptr;
+    ggml_tensor * ffn_gate_up_exps = nullptr;
+    ggml_tensor * ffn_down_exps  = nullptr;
+    ggml_tensor * ffn_down_exps_s = nullptr;
+    ggml_tensor * ffn_post_norm_1 = nullptr;
+    ggml_tensor * ffn_post_norm_2 = nullptr;
+
+    // Per-Layer Embedding (PLE)
+    ggml_tensor * ple_inp_gate   = nullptr;
+    ggml_tensor * ple_proj       = nullptr;
+    ggml_tensor * ple_post_norm  = nullptr;
+};
+
+struct GemmaTargetWeights {
+    ggml_context        * ctx     = nullptr;
+    ggml_backend_t        backend = nullptr;
+    ggml_backend_buffer_t buf     = nullptr;
+    CpuEmbedder           embedder;
+
+    ggml_tensor * tok_embd  = nullptr;
+    std::vector<GemmaTargetLayer> layers;
+    ggml_tensor * out_norm  = nullptr;
+    ggml_tensor * output    = nullptr;
+
+    // Per-Layer Embedding global tensors
+    ggml_tensor * per_layer_tok_embd   = nullptr;
+    ggml_tensor * per_layer_model_proj = nullptr;
+    ggml_tensor * per_layer_proj_norm  = nullptr;
+
+    // Architecture metadata (loaded from GGUF)
+    int n_embd           = 4096;
+    int n_head           = 32;
+    int n_head_kv        = 8;      // max n_head_kv across layers (used for cache alloc)
+    int head_dim         = 128;   // full-attention head dim
+    int head_dim_swa     = 128;   // SWA head dim (may differ from head_dim)
+    std::vector<int> head_kv_per_layer;  // per-layer n_head_kv (empty = use n_head_kv for all)
+    int n_layer          = 60;
+    int n_ff             = 16384;
+    int n_vocab          = 262144;
+    int n_embd_per_layer = 0;
+
+    int swa_window       = 1024;
+    std::vector<bool> swa_layers;
+
+    int n_kv_shared_layers = 0;
+    int n_layer_kv         = 0;
+
+    float rope_theta     = 1000000.0f;
+    float rope_theta_swa = 1000000.0f;
+
+    int n_expert         = 0;
+    int n_expert_used    = 0;
+    int n_ff_exp         = 0;
+
+    float logit_softcap  = 30.0f;
+    float attn_scale     = 1.0f;
+
+    int32_t bos_id       = -1;
+    int32_t eos_id       = -1;
+    int32_t eos_chat_id  = -1;
+
+    int n_capture_layers = GEMMA4_DRAFT_N_TARGET_LAYERS;
+    int capture_layer_ids[GEMMA4_DRAFT_N_TARGET_LAYERS] = {0};
+};
+
+// Gemma4 target loading
+bool load_gemma4_target_gguf(const std::string & path, ggml_backend_t backend,
+                             GemmaTargetWeights & out);
+void free_gemma4_target_weights(GemmaTargetWeights & w);
 
 } // namespace dflash27b
 

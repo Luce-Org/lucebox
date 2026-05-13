@@ -214,6 +214,8 @@ add_library(dflash27b STATIC
     src/laguna/laguna_target_graph.cpp
     src/laguna/laguna_daemon.cpp
     src/common/sampler.cpp
+    # Gemma4 target model loader (PR04)
+    src/gemma4_target_loader.cpp
 )
 # BSA (Block-Sparse Attention) backs the speculative-prefill drafter scoring
 # path. Default ON so prefill is fast out of the box. Turn OFF if you don't
@@ -438,6 +440,11 @@ if(DFLASH27B_TESTS)
         target_include_directories(smoke_load_target PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_load_target PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/gemma4/smoke_load_gemma4_target.cpp")
+        add_executable(smoke_load_gemma4_target test/gemma4/smoke_load_gemma4_target.cpp)
+        target_include_directories(smoke_load_gemma4_target PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(smoke_load_gemma4_target PRIVATE dflash27b ggml ggml-cuda)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_target_laguna.cpp")
         add_executable(smoke_load_target_laguna test/smoke_load_target_laguna.cpp)
         target_include_directories(smoke_load_target_laguna PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
@@ -513,6 +520,7 @@ if(DFLASH27B_TESTS)
         smoke_draft_graph
         test_vs_oracle
         smoke_load_target
+        smoke_load_gemma4_target
         smoke_load_target_laguna
         smoke_laguna_forward
         bench_laguna_ttft
