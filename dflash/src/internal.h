@@ -607,6 +607,78 @@ bool load_gemma4_target_gguf(const std::string & path, ggml_backend_t backend,
                              GemmaTargetWeights & out);
 void free_gemma4_target_weights(GemmaTargetWeights & w);
 
+// ─── Gemma4 target cache ─────────────────────────────────────────────────────
+struct GemmaTargetCache {
+    ggml_context        * base_ctx     = nullptr;
+    ggml_backend_buffer_t base_buf     = nullptr;
+    ggml_context        * rollback_ctx = nullptr;
+    ggml_backend_buffer_t rollback_buf = nullptr;
+    ggml_backend_t        backend      = nullptr;
+
+    int max_ctx       = 0;
+    int swa_ctx_alloc = 0;  // KV-slot count for SWA layers (ring-buffer size).
+    int cur_pos       = 0;
+    int last_tok      = -1;
+
+    ggml_type kv_k_type = GGML_TYPE_Q8_0;
+    ggml_type kv_v_type = GGML_TYPE_Q8_0;
+
+    std::vector<ggml_type> kv_k_type_per_layer;
+    std::vector<ggml_type> kv_v_type_per_layer;
+
+    std::vector<ggml_tensor *> attn_k;
+    std::vector<ggml_tensor *> attn_v;
+
+    std::vector<int> layer_to_kv_idx;
+    std::vector<int> layer_to_donor_kv;
+
+    ggml_tensor * target_feat     = nullptr;
+    int           target_feat_cap = 0;
+};
+
+struct GemmaGraphInputs {
+    ggml_tensor * inp_embed     = nullptr;
+    ggml_tensor * positions     = nullptr;
+    ggml_tensor * attn_mask     = nullptr;
+    ggml_tensor * swa_mask      = nullptr;
+    ggml_tensor * per_layer_inp = nullptr;
+    int           n_tokens      = 0;
+    int           kv_start      = 0;
+    bool          capture_layers = false;
+    int           fa_window     = 0;
+    ggml_tensor * parent_ids    = nullptr;
+    bool          last_token_logits_only = false;
+};
+
+struct GemmaGraphOutputs {
+    ggml_tensor * logits = nullptr;
+};
+
+// Gemma4 cache lifecycle
+bool create_gemma4_cache(const GemmaTargetWeights & w, int max_ctx,
+                         ggml_backend_t backend, GemmaTargetCache & out,
+                         int target_feat_cap_hint = 0);
+void free_gemma4_cache(GemmaTargetCache & c);
+void reset_gemma4_cache(GemmaTargetCache & c);
+
+// Gemma4 target graph
+GemmaGraphOutputs build_gemma4_graph(ggml_context * ctx, ggml_cgraph * gf,
+                                     const GemmaTargetWeights & w,
+                                     GemmaTargetCache & cache,
+                                     const GemmaGraphInputs & in);
+
+// SWA window geometry for a chunk at position kv_start with n_tokens query tokens.
+struct SwaView {
+    int abs_win_start;
+    int effective_win_len;
+    int ring_win_start;
+};
+
+SwaView compute_swa_view(int kv_start,
+                         int n_tokens,
+                         int swa_window,
+                         int swa_ctx_alloc /* ring size */);
+
 } // namespace dflash27b
 
 #if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
