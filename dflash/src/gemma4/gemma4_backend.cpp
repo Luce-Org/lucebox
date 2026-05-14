@@ -260,6 +260,55 @@ void Gemma4Backend::shutdown() {
     }
 }
 
+// ── internal: shared draft-KV-prefill helper ─────────────────────────────
+//
+// Four sites in decode_dflash (initial / warmup / sliding re-prefill /
+// commit) each issued the same build-fill-compute-destroy sequence on a
+// DraftKVPrefillGraph, varying only in (start_pos, n_tokens, log tag).
+// Each duplication was a chance to mis-tune one of the args (e.g. the
+// `start_pos % cache.target_feat_cap` ring index) and silently corrupt
+// the draft KV.
+//
+// Helper does NOT update cache.draft_kv_pos — each phase has its own
+// semantics for the post-update (initial = n, warmup = +1 capped,
+// re-prefill = keep, commit = +commit_n capped), so the caller stays in
+// charge of that.
+//
+// See dflash/docs/gemma4-pr-split/pr13-slop-audit.md (Finding S5).
+static bool run_draft_kv_prefill(GemmaTargetCache        & cache,
+                                 const GemmaDraftWeights & draft_w,
+                                 ggml_backend_t            backend,
+                                 int                       start_pos,
+                                 int                       n_tokens,
+                                 int                       target_feat_w,
+                                 const char              * tag) {
+    DraftKVPrefillGraph pkg;
+    if (!draft_kv_prefill_create(pkg, draft_w, cache, backend, n_tokens)) {
+        std::fprintf(stderr, "[gemma4] %s draft KV prefill build failed\n", tag);
+        return false;
+    }
+    copy_target_feat_bf16_to_f32(backend, cache.target_feat, pkg.target_feat,
+                                  start_pos % cache.target_feat_cap,
+                                  n_tokens, target_feat_w);
+    if (n_tokens == 1) {
+        int32_t p = start_pos;
+        ggml_backend_tensor_set(pkg.positions, &p, 0, sizeof(int32_t));
+    } else {
+        std::vector<int32_t> pos(n_tokens);
+        for (int i = 0; i < n_tokens; i++) pos[i] = start_pos + i;
+        ggml_backend_tensor_set(pkg.positions, pos.data(), 0,
+                                sizeof(int32_t) * n_tokens);
+    }
+    auto st = ggml_backend_graph_compute(backend, pkg.gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "[gemma4] %s draft KV prefill compute failed\n", tag);
+        draft_kv_prefill_destroy(pkg);
+        return false;
+    }
+    draft_kv_prefill_destroy(pkg);
+    return true;
+}
+
 // ── internal: shared mask-write helper ───────────────────────────────────
 //
 // Five decode paths (prefill, AR, DFlash warmup, DFlash verify, MTP target
@@ -543,31 +592,14 @@ bool Gemma4Backend::decode_dflash(int n_gen,
         const int draft_prefill_n    = std::min(n_prompt, dkv_cap);
         const int draft_prefill_skip = n_prompt - draft_prefill_n;
 
-        DraftKVPrefillGraph pkg;
-        if (!draft_kv_prefill_create(pkg, draft_w_, cache_, backend_, draft_prefill_n)) {
-            std::fprintf(stderr, "[gemma4] draft KV prefill build failed\n");
-            return false;
-        }
-
-        copy_target_feat_bf16_to_f32(backend_, cache_.target_feat, pkg.target_feat,
-                                      draft_prefill_skip % cache_.target_feat_cap,
-                                      draft_prefill_n, target_feat_w);
-
-        {
-            std::vector<int32_t> pos(draft_prefill_n);
-            for (int i = 0; i < draft_prefill_n; i++) pos[i] = draft_prefill_skip + i;
-            ggml_backend_tensor_set(pkg.positions, pos.data(), 0,
-                                    sizeof(int32_t) * draft_prefill_n);
-        }
-
-        auto st = ggml_backend_graph_compute(backend_, pkg.gf);
-        if (st != GGML_STATUS_SUCCESS) {
-            std::fprintf(stderr, "[gemma4] draft KV prefill compute failed\n");
-            draft_kv_prefill_destroy(pkg);
+        if (!run_draft_kv_prefill(cache_, draft_w_, backend_,
+                                   /*start_pos=*/ draft_prefill_skip,
+                                   /*n_tokens=*/  draft_prefill_n,
+                                   target_feat_w,
+                                   /*tag=*/       "initial")) {
             return false;
         }
         cache_.draft_kv_pos = draft_prefill_n;
-        draft_kv_prefill_destroy(pkg);
     }
 
     // ── Speculative decode loop ──────────────────────────────────────────────
@@ -661,26 +693,14 @@ bool Gemma4Backend::decode_dflash(int n_gen,
             // Draft KV prefill for this warmup position
             {
                 const int warmup_pos = committed - 1;
-                DraftKVPrefillGraph wpkg;
-                if (!draft_kv_prefill_create(wpkg, draft_w_, cache_, backend_, 1)) {
-                    std::fprintf(stderr, "[gemma4] warmup draft KV prefill build failed\n");
-                    return false;
-                }
-                copy_target_feat_bf16_to_f32(backend_, cache_.target_feat, wpkg.target_feat,
-                                              warmup_pos % cache_.target_feat_cap,
-                                              1, target_feat_w);
-                {
-                    int32_t p = warmup_pos;
-                    ggml_backend_tensor_set(wpkg.positions, &p, 0, sizeof(int32_t));
-                }
-                auto wst = ggml_backend_graph_compute(backend_, wpkg.gf);
-                if (wst != GGML_STATUS_SUCCESS) {
-                    std::fprintf(stderr, "[gemma4] warmup draft KV prefill compute failed\n");
-                    draft_kv_prefill_destroy(wpkg);
+                if (!run_draft_kv_prefill(cache_, draft_w_, backend_,
+                                           /*start_pos=*/ warmup_pos,
+                                           /*n_tokens=*/  1,
+                                           target_feat_w,
+                                           /*tag=*/       "warmup")) {
                     return false;
                 }
                 cache_.draft_kv_pos = std::min(dkv_cap, cache_.draft_kv_pos + 1);
-                draft_kv_prefill_destroy(wpkg);
             }
 
             // Sample next token from warmup logits (argmax for DFlash path)
@@ -716,28 +736,14 @@ bool Gemma4Backend::decode_dflash(int n_gen,
                 const int refill_start = committed - keep;
                 cache_.draft_kv_pos    = 0;
 
-                DraftKVPrefillGraph rpkg;
-                if (!draft_kv_prefill_create(rpkg, draft_w_, cache_, backend_, keep)) {
-                    std::fprintf(stderr, "[gemma4] draft KV re-prefill build failed\n");
-                    return false;
-                }
-                copy_target_feat_bf16_to_f32(backend_, cache_.target_feat, rpkg.target_feat,
-                                              refill_start % cache_.target_feat_cap,
-                                              keep, target_feat_w);
-                {
-                    std::vector<int32_t> rpos(keep);
-                    for (int i = 0; i < keep; i++) rpos[i] = refill_start + i;
-                    ggml_backend_tensor_set(rpkg.positions, rpos.data(), 0,
-                                            sizeof(int32_t) * keep);
-                }
-                auto rst = ggml_backend_graph_compute(backend_, rpkg.gf);
-                if (rst != GGML_STATUS_SUCCESS) {
-                    std::fprintf(stderr, "[gemma4] draft KV re-prefill compute failed\n");
-                    draft_kv_prefill_destroy(rpkg);
+                if (!run_draft_kv_prefill(cache_, draft_w_, backend_,
+                                           /*start_pos=*/ refill_start,
+                                           /*n_tokens=*/  keep,
+                                           target_feat_w,
+                                           /*tag=*/       "sliding re-prefill")) {
                     return false;
                 }
                 cache_.draft_kv_pos = keep;
-                draft_kv_prefill_destroy(rpkg);
 
                 std::fprintf(stderr,
                     "[gemma4] draft KV sliding re-prefill: kept %d tokens "
@@ -876,28 +882,14 @@ bool Gemma4Backend::decode_dflash(int n_gen,
 
         // ── 10. Draft KV prefill for committed positions, then advance state ──
         {
-            DraftKVPrefillGraph cpkg;
-            if (!draft_kv_prefill_create(cpkg, draft_w_, cache_, backend_, commit_n)) {
-                std::fprintf(stderr, "[gemma4] draft KV prefill build failed\n");
-                return false;
-            }
-            copy_target_feat_bf16_to_f32(backend_, cache_.target_feat, cpkg.target_feat,
-                                          committed % cache_.target_feat_cap,
-                                          commit_n, target_feat_w);
-            {
-                std::vector<int32_t> pos(commit_n);
-                for (int i = 0; i < commit_n; i++) pos[i] = committed + i;
-                ggml_backend_tensor_set(cpkg.positions, pos.data(), 0,
-                                        sizeof(int32_t) * commit_n);
-            }
-            auto cst = ggml_backend_graph_compute(backend_, cpkg.gf);
-            if (cst != GGML_STATUS_SUCCESS) {
-                std::fprintf(stderr, "[gemma4] draft KV prefill compute failed\n");
-                draft_kv_prefill_destroy(cpkg);
+            if (!run_draft_kv_prefill(cache_, draft_w_, backend_,
+                                       /*start_pos=*/ committed,
+                                       /*n_tokens=*/  commit_n,
+                                       target_feat_w,
+                                       /*tag=*/       "commit")) {
                 return false;
             }
             cache_.draft_kv_pos = std::min(dkv_cap, cache_.draft_kv_pos + commit_n);
-            draft_kv_prefill_destroy(cpkg);
         }
 
         // Gemma4 is pure attention — no SSM/conv rollback needed.
