@@ -693,18 +693,11 @@ bool create_gemma4_cache(const GemmaTargetWeights & w,
         max_ctx, max_ctx_alloc, swa_ctx_alloc, n_kv_slots, saved_pct);
     std::fprintf(stderr, "[cache] kv types: SWA=%s, full=%s\n", swa_k_name, full_k_name);
 
-    // Zero-initialize all tensors
-    std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
-    for (ggml_tensor * t = ggml_get_first_tensor(out.base_ctx); t != nullptr;
-         t = ggml_get_next_tensor(out.base_ctx, t)) {
-        size_t nb  = ggml_nbytes(t);
-        size_t off = 0;
-        while (off < nb) {
-            size_t chunk = std::min(nb - off, zeros.size());
-            ggml_backend_tensor_set(t, zeros.data(), off, chunk);
-            off += chunk;
-        }
-    }
+    // Zero the entire KV buffer in one DMA op. Replaces a per-tensor 1 MiB
+    // chunked memset that wasted seconds of bandwidth per request on
+    // multi-GB caches. Matches the llama.cpp convention in
+    // src/llama-kv-cache.cpp.
+    ggml_backend_buffer_clear(out.base_buf, 0);
 
     return true;
 }
@@ -725,18 +718,12 @@ void free_gemma4_cache(GemmaTargetCache & c) {
 void reset_gemma4_cache(GemmaTargetCache & c) {
     c.cur_pos      = 0;
     c.last_tok     = -1;
-    std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
-    if (!c.base_ctx) return;
-    for (ggml_tensor * t = ggml_get_first_tensor(c.base_ctx); t != nullptr;
-         t = ggml_get_next_tensor(c.base_ctx, t)) {
-        size_t nb  = ggml_nbytes(t);
-        size_t off = 0;
-        while (off < nb) {
-            size_t chunk = std::min(nb - off, zeros.size());
-            ggml_backend_tensor_set(t, zeros.data(), off, chunk);
-            off += chunk;
-        }
-    }
+    if (!c.base_buf) return;
+    // Zero the entire KV buffer in one DMA op. Replaces a per-tensor 1 MiB
+    // chunked memset that wasted seconds of bandwidth per request on
+    // multi-GB caches. Matches the llama.cpp convention in
+    // src/llama-kv-cache.cpp.
+    ggml_backend_buffer_clear(c.base_buf, 0);
 }
 
 // ─── Main graph builder ───────────────────────────────────────────────────────
