@@ -19,6 +19,28 @@
 
 namespace dflash27b {
 
+// ── End-of-context headroom (per decode phase) ───────────────────────────
+//
+// Each decode loop checks `committed >= max_ctx - HEADROOM` before
+// advancing. The headroom is the minimum number of cache slots an
+// iteration still needs to safely fit, and it differs by phase:
+//
+//   AR:     one new token per iteration. We stop with 2 slots free so the
+//           current step has room and one slot of margin for the EOS check
+//           sampling cycle.
+//   DFlash: q_len is already clamped to ctx_size-committed-1 just above
+//           the break, so 1 slot of margin is sufficient.
+//   MTP:    target + γ=1 draft → 2 tokens per accepted step. Need 2 slots
+//           for the verify+draft pair plus margin.
+//
+// Pre-2026-05-14 these were three different bare literals; named here so
+// any future change is a deliberate per-phase decision rather than a
+// drift-prone copy-paste. See dflash/docs/gemma4-pr-split/pr13-slop-audit.md
+// (Additional findings — magic numbers / ctx-size headroom).
+static constexpr int CTX_HEADROOM_AR     = 2;
+static constexpr int CTX_HEADROOM_DFLASH = 1;
+static constexpr int CTX_HEADROOM_MTP    = 2;
+
 // ── ctor / dtor ─────────────────────────────────────────────────────────
 
 Gemma4Backend::Gemma4Backend(const Gemma4BackendArgs & args)
@@ -485,7 +507,7 @@ bool Gemma4Backend::decode_autoregressive(int n_gen,
 
         const int committed = cache_.cur_pos;
 
-        if (committed >= args_.max_ctx - 2) {
+        if (committed >= args_.max_ctx - CTX_HEADROOM_AR) {
             break;
         }
 
@@ -649,7 +671,7 @@ bool Gemma4Backend::decode_dflash(int n_gen,
             (target_w_.eos_chat_id >= 0 && cur_tok == target_w_.eos_chat_id)) {
             break;
         }
-        if (committed >= ctx_size - 1) {
+        if (committed >= ctx_size - CTX_HEADROOM_DFLASH) {
             break;
         }
 
@@ -1002,7 +1024,7 @@ bool Gemma4Backend::decode_mtp(int n_gen,
             (target_w_.eos_chat_id >= 0 && cur_tok == target_w_.eos_chat_id)) {
             break;
         }
-        if (committed >= ctx_size - 2) {
+        if (committed >= ctx_size - CTX_HEADROOM_MTP) {
             break;
         }
 
@@ -1025,6 +1047,8 @@ bool Gemma4Backend::decode_mtp(int n_gen,
 
         set_step_masks(sg, cache_, /*kv_start*/ committed, /*n_tokens*/ 1, swa_window);
         if (!embed_token(target_w_, cur_tok, sg.inp_embed, backend_)) {
+            std::fprintf(stderr, "[gemma4] mtp target embed_token failed for tok=%d\n",
+                         cur_tok);
             step_graph_free(sg);
             ggml_gallocr_free(mtp_alloc);
             free_mtp_step_graph(mtp_g);
