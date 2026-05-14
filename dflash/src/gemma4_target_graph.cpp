@@ -35,6 +35,14 @@ namespace dflash27b {
 
 static constexpr float EPS = GEMMA4_RMS_EPS;
 
+// DFLASH_PFLASH_TQ3=1 opts the pFlash sparse-FA dispatch into TQ3_0 K/V at
+// runtime. Read once at the first graph build; everything else is just a
+// `bool` check. (Previously evaluated per-layer inside build_full_attn_block.)
+static const bool s_pflash_tq3 = []() {
+    const char * s = std::getenv("DFLASH_PFLASH_TQ3");
+    return s && (s[0] == '1' || s[0] == 't' || s[0] == 'T' || s[0] == 'y' || s[0] == 'Y');
+}();
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 static ggml_tensor * rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
@@ -512,10 +520,7 @@ static ggml_tensor * build_full_attn_block(
     // The TQ3 path is gated behind DFLASH_PFLASH_TQ3=1 for A/B rollout. Without
     // the gate, TQ3 falls back to the dense FA chunked SGEMM driver (which works
     // but is ~2.3x slower than BF16 MMA pflash on Dense 31B prefill).
-    static const bool s_pflash_tq3 = []() {
-        const char * s = std::getenv("DFLASH_PFLASH_TQ3");
-        return s && (s[0] == '1' || s[0] == 't' || s[0] == 'T' || s[0] == 'y' || s[0] == 'Y');
-    }();
+    // (Env read hoisted to file-scope s_pflash_tq3 above.)
     auto pflash_supports = [](enum ggml_type t) {
         if (t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0) return true;
         if (t == GGML_TYPE_TQ3_0 && s_pflash_tq3) return true;
