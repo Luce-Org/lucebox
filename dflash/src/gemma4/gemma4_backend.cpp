@@ -260,6 +260,47 @@ void Gemma4Backend::shutdown() {
     }
 }
 
+// ── internal: shared mask-write helper ───────────────────────────────────
+//
+// Five decode paths (prefill, AR, DFlash warmup, DFlash verify, MTP target
+// step) emitted the same attn_mask + swa_mask host build + tensor_set
+// sequence, differing only by (kv_start, n_tokens) and the swa_window
+// source. Each duplication was an opportunity to silently mis-tune one
+// site and break long-context decode.
+//
+// Helper consumes the StepGraph as-built, the cache (for the SWA view's
+// effective ring length), and the (kv_start, n_tokens, swa_window) triple.
+// Internally delegates to build_causal_mask / build_swa_causal_mask
+// (helpers.cpp) — those are unchanged.
+//
+// See dflash/docs/gemma4-pr-split/pr13-slop-audit.md (Finding S4).
+static void set_step_masks(StepGraph         & sg,
+                           GemmaTargetCache  & cache,
+                           int                 kv_start,
+                           int                 n_tokens,
+                           int                 swa_window) {
+    if (sg.attn_mask && sg.attn_mask->buffer) {
+        const int kv_len = kv_start + n_tokens;
+        std::vector<uint16_t> mask_buf;
+        build_causal_mask(mask_buf, kv_len, n_tokens, kv_start);
+        ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
+                                sizeof(uint16_t) * mask_buf.size());
+    }
+    if (sg.swa_mask && sg.swa_mask->buffer) {
+        const SwaView swa_view = compute_swa_view(kv_start, n_tokens,
+                                                   swa_window, cache.swa_ctx_alloc);
+        std::vector<uint16_t> swa_buf;
+        build_swa_causal_mask(swa_buf,
+                              /*kv_start*/ kv_start,
+                              /*n_tokens*/ n_tokens,
+                              /*swa_window*/ swa_window,
+                              /*ring_size*/ swa_view.effective_win_len,
+                              /*kv_end*/ kv_start + n_tokens);
+        ggml_backend_tensor_set(sg.swa_mask, swa_buf.data(), 0,
+                                sizeof(uint16_t) * swa_buf.size());
+    }
+}
+
 // ── internal: prefill ────────────────────────────────────────────────────
 //
 // Runs chunked prefill via build_gemma4_graph; returns last-token logits.
@@ -310,27 +351,7 @@ bool Gemma4Backend::prefill(const std::vector<int32_t> & prompt,
                                     sizeof(int32_t) * chunk_n);
         }
 
-        if (sg.attn_mask && sg.attn_mask->buffer) {
-            const int kv_len = cs + chunk_n;
-            std::vector<uint16_t> mask_buf;
-            build_causal_mask(mask_buf, kv_len, chunk_n, cs);
-            ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
-                                    sizeof(uint16_t) * mask_buf.size());
-        }
-
-        if (sg.swa_mask && sg.swa_mask->buffer) {
-            const SwaView swa_view = compute_swa_view(cs, chunk_n,
-                                                       swa_window, cache_.swa_ctx_alloc);
-            std::vector<uint16_t> swa_buf;
-            build_swa_causal_mask(swa_buf,
-                                  /*kv_start*/ cs,
-                                  /*n_tokens*/ chunk_n,
-                                  /*swa_window*/ swa_window,
-                                  /*ring_size*/ swa_view.effective_win_len,
-                                  /*kv_end*/ cs + chunk_n);
-            ggml_backend_tensor_set(sg.swa_mask, swa_buf.data(), 0,
-                                    sizeof(uint16_t) * swa_buf.size());
-        }
+        set_step_masks(sg, cache_, /*kv_start*/ cs, /*n_tokens*/ chunk_n, swa_window);
 
         auto st = ggml_backend_graph_compute(backend_, sg.gf);
         if (st != GGML_STATUS_SUCCESS) {
@@ -430,27 +451,9 @@ bool Gemma4Backend::decode_autoregressive(int n_gen,
             break;
         }
 
-        if (sg.attn_mask && sg.attn_mask->buffer) {
-            const int kv_len = committed + 1;
-            std::vector<uint16_t> mask_buf;
-            build_causal_mask(mask_buf, kv_len, 1, committed);
-            ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
-                                    sizeof(uint16_t) * mask_buf.size());
-        }
-
-        if (sg.swa_mask && sg.swa_mask->buffer) {
+        {
             const int swa_window = target_w_.swa_window > 0 ? target_w_.swa_window : 1024;
-            const SwaView swa_view = compute_swa_view(committed, 1,
-                                                       swa_window, cache_.swa_ctx_alloc);
-            std::vector<uint16_t> swa_buf;
-            build_swa_causal_mask(swa_buf,
-                                  /*kv_start*/ committed,
-                                  /*n_tokens*/ 1,
-                                  /*swa_window*/ swa_window,
-                                  /*ring_size*/ swa_view.effective_win_len,
-                                  /*kv_end*/ committed + 1);
-            ggml_backend_tensor_set(sg.swa_mask, swa_buf.data(), 0,
-                                    sizeof(uint16_t) * swa_buf.size());
+            set_step_masks(sg, cache_, /*kv_start*/ committed, /*n_tokens*/ 1, swa_window);
         }
 
         if (!embed_token(target_w_, cur_tok, sg.inp_embed, backend_)) {
@@ -625,23 +628,7 @@ bool Gemma4Backend::decode_dflash(int n_gen,
                 return false;
             }
 
-            if (sg.attn_mask && sg.attn_mask->buffer) {
-                const int kv_len = committed + 1;
-                std::vector<uint16_t> mask_buf;
-                build_causal_mask(mask_buf, kv_len, 1, committed);
-                ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
-                                        sizeof(uint16_t) * mask_buf.size());
-            }
-            if (sg.swa_mask && sg.swa_mask->buffer) {
-                const SwaView swa_view = compute_swa_view(committed, 1,
-                                                          swa_window, cache_.swa_ctx_alloc);
-                std::vector<uint16_t> swa_buf;
-                build_swa_causal_mask(swa_buf,
-                                      committed, 1, swa_window,
-                                      swa_view.effective_win_len, committed + 1);
-                ggml_backend_tensor_set(sg.swa_mask, swa_buf.data(), 0,
-                                        sizeof(uint16_t) * swa_buf.size());
-            }
+            set_step_masks(sg, cache_, /*kv_start*/ committed, /*n_tokens*/ 1, swa_window);
 
             if (!embed_token(target_w_, cur_tok, sg.inp_embed, backend_)) {
                 std::fprintf(stderr, "[gemma4] dflash warmup embed failed\n");
@@ -828,24 +815,7 @@ bool Gemma4Backend::decode_dflash(int n_gen,
                                         sizeof(int32_t) * q_len);
             }
 
-            if (sg.attn_mask && sg.attn_mask->buffer) {
-                const int kv_len = committed + q_len;
-                std::vector<uint16_t> mask_buf;
-                build_causal_mask(mask_buf, kv_len, q_len, committed);
-                ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
-                                        sizeof(uint16_t) * mask_buf.size());
-            }
-
-            if (sg.swa_mask && sg.swa_mask->buffer) {
-                const SwaView swa_view = compute_swa_view(committed, q_len,
-                                                           swa_window, cache_.swa_ctx_alloc);
-                std::vector<uint16_t> swa_buf;
-                build_swa_causal_mask(swa_buf,
-                                      committed, q_len, swa_window,
-                                      swa_view.effective_win_len, committed + q_len);
-                ggml_backend_tensor_set(sg.swa_mask, swa_buf.data(), 0,
-                                        sizeof(uint16_t) * swa_buf.size());
-            }
+            set_step_masks(sg, cache_, /*kv_start*/ committed, /*n_tokens*/ q_len, swa_window);
 
             auto st = ggml_backend_graph_compute(backend_, sg.gf);
             if (st != GGML_STATUS_SUCCESS) {
@@ -1032,26 +1002,7 @@ bool Gemma4Backend::decode_mtp(int n_gen,
             return false;
         }
 
-        if (sg.attn_mask && sg.attn_mask->buffer) {
-            const int kv_len = committed + 1;
-            std::vector<uint16_t> mask_buf;
-            build_causal_mask(mask_buf, kv_len, 1, committed);
-            ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
-                                    sizeof(uint16_t) * mask_buf.size());
-        }
-        if (sg.swa_mask && sg.swa_mask->buffer) {
-            const SwaView swa_view = compute_swa_view(committed, 1,
-                                                      swa_window, cache_.swa_ctx_alloc);
-            std::vector<uint16_t> swa_buf;
-            build_swa_causal_mask(swa_buf,
-                                  /*kv_start*/ committed,
-                                  /*n_tokens*/ 1,
-                                  /*swa_window*/ swa_window,
-                                  /*ring_size*/ swa_view.effective_win_len,
-                                  /*kv_end*/ committed + 1);
-            ggml_backend_tensor_set(sg.swa_mask, swa_buf.data(), 0,
-                                    sizeof(uint16_t) * swa_buf.size());
-        }
+        set_step_masks(sg, cache_, /*kv_start*/ committed, /*n_tokens*/ 1, swa_window);
         if (!embed_token(target_w_, cur_tok, sg.inp_embed, backend_)) {
             free_mtp_step_graph(mtp_g);
             return false;
