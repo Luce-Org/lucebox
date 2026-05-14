@@ -1040,6 +1040,10 @@ bool Gemma4Backend::decode_mtp(int n_gen,
                                /*fa_window=*/0)) {
             std::fprintf(stderr, "[gemma4] mtp target build failed at step %zu\n",
                          out_tokens.size());
+            // build_gemma4_step calls step_graph_free(sg) at entry and may
+            // have allocated sg.ctx before its own internal failure; free
+            // again here so partial state is reclaimed on the error path.
+            step_graph_free(sg);
             ggml_gallocr_free(mtp_alloc);
             free_mtp_step_graph(mtp_g);
             return false;
