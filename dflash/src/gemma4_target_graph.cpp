@@ -526,20 +526,35 @@ static ggml_tensor * build_full_attn_block(
         if (t == GGML_TYPE_TQ3_0 && s_pflash_tq3) return true;
         return false;
     };
-    // Gate pFlash to decode-only (n_tokens == 1) when TQ3_0 KV is active.
-    // Reason: ggml_flash_attn_sparse has no mask argument; if its TQ3 sparse
-    // path can't handle a shape it delegates to ggml_cuda_flash_attn_ext,
-    // which then calls ggml_cuda_get_best_fattn_kernel — and that function
-    // routes TQ3 to BEST_FATTN_KERNEL_CHUNKED only when `mask != nullptr`
-    // (fattn.cu:438-466). Without a mask the dispatcher returns
-    // BEST_FATTN_KERNEL_NONE and aborts at fattn.cu:572-576. For multi-token
-    // prefill / verify, fall through to the dense FA path below which passes
-    // attn_mask explicitly and lets CHUNKED handle TQ3 correctly.
+    // Gate pFlash sparse FA to decode-only (n_tokens == 1) on full-attention
+    // layers. ggml_flash_attn_sparse has no mask argument; if its internal
+    // kernel cannot handle the shape (head_dim=512 prefill on any KV type, or
+    // TQ3 KV at any non-VEC shape) it delegates to ggml_cuda_flash_attn_ext,
+    // which calls ggml_cuda_get_best_fattn_kernel. That function only routes
+    // through BEST_FATTN_KERNEL_CHUNKED when `mask != nullptr`
+    // (fattn.cu:438-466). Sparse FA's delegation passes mask=nullptr, so
+    // the dispatcher returns BEST_FATTN_KERNEL_NONE and aborts at fattn.cu:576.
+    //
+    // F5 v1 (commit a292818) gated this only when KV was TQ3_0, which fixed
+    // AR+TQ3+pflash. F5 v2 (this gate) extends to decode-only regardless of
+    // KV type, after MTP+TQ3+pflash surfaced the asymmetric-donor case:
+    // enable_mtp_h_prev plus resolve_mtp_donor_layers downgrades
+    // cache.mtp_last_full_layer's K/V from TQ3_0 to Q8_0 (asymmetric override
+    // — see create_gemma4_cache). That single donor layer's Kfa/Vfa.type is
+    // Q8_0, so the v1 `tq3_kv` predicate evaluated false; v1 then allowed
+    // pflash sparse FA on head_dim=512 + n_tokens>1, which aborts.
+    //
+    // Decode (n_tokens == 1) is safe for all supported KV types because
+    // sparse FA's TQ3 VEC fast path (Luce-Org PR #10) covers head_dim<=256
+    // and the dense fallback handles the rest. For prefill we keep
+    // fall-through to dense fa_ext (which passes attn_mask explicitly and
+    // lets CHUNKED handle every KV type correctly).
     const bool tq3_kv = (Kfa->type == GGML_TYPE_TQ3_0 || Vfa->type == GGML_TYPE_TQ3_0);
+    (void)tq3_kv;  // kept for future per-type gating if sparse FA grows kernels
     const bool can_pflash = use_pflash &&
                             pflash_supports(Kfa->type) &&
                             pflash_supports(Vfa->type) &&
-                            (!tq3_kv || n_tokens == 1);
+                            n_tokens == 1;
 
     // Gemma4: attn_scale = 1.0 (self.scaling = 1.0, no 1/sqrt(head_dim))
     ggml_tensor * attn;
