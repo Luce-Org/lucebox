@@ -414,7 +414,6 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
         // rotate output for TQ3 V, and pass the native K/V views into FA.
         const bool k_is_tq3 = (Kview->type == GGML_TYPE_TQ3_0);
         const bool v_is_tq3 = (Vview->type == GGML_TYPE_TQ3_0);
-        const bool kv_is_tq3 = k_is_tq3 || v_is_tq3;
 
         // Cross-attention via ggml_flash_attn_ext.
         //
@@ -510,8 +509,11 @@ bool build_mtp_step_graph(const MtpDrafterWeights  & w,
         }
 
         // FA output: [head_dim_fa, 1, n_head_fa]. Flatten to [q_out_dim, 1].
-        // Flatten heads: [head_dim_fa, 1, n_head_fa] → [q_out_dim, 1]
-        ggml_tensor * attn = ggml_cont(ctx, attn_out);
+        // Flatten heads: [head_dim_fa, 1, n_head_fa] → [q_out_dim, 1].
+        // ggml_flash_attn_ext returns a contiguous tensor by spec; only the
+        // v_is_tq3 branch above (turbo_wht in-place) can break contiguity, so
+        // restrict the cont kernel to that case.
+        ggml_tensor * attn = (v_is_tq3 ? ggml_cont(ctx, attn_out) : attn_out);
         {
             char name[64]; std::snprintf(name, sizeof(name), "mtp_attn_out_%d", il);
             ggml_set_name(attn, name);
