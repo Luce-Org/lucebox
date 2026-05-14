@@ -643,6 +643,15 @@ bool create_gemma4_cache(const GemmaTargetWeights & w,
     }
 
     // target_feat ring buffer: [n_capture_layers * n_embd, cap] bf16
+    //
+    // 4096 is a fixed floor (not derived from swa_window or max_ctx). The
+    // ring is sized so DFlash's draft KV re-prefill can cover the full
+    // sliding window (typically 1024 swa_window × 2-4 layers of lookback)
+    // with comfortable headroom. The actual cap is clamped to max_ctx and
+    // can be expanded by target_feat_cap_hint (a runtime knob from the
+    // caller, e.g. for long-prompt prefill that pre-populates more rows).
+    // If swa_window > 4096 at some point in the future, the floor will need
+    // raising; today's Gemma4 swa_window is 1024.
     constexpr int TARGET_FEAT_CAP_DEFAULT = 4096;
     const int target_feat_cap_req = std::max(TARGET_FEAT_CAP_DEFAULT, target_feat_cap_hint);
     out.target_feat_cap = std::min(max_ctx, target_feat_cap_req);
@@ -808,8 +817,6 @@ GemmaGraphOutputs build_gemma4_graph(
                                         layer_kv_k, layer_kv_v,
                                         write_kv, in.fa_window, il);
         }
-
-        // ── g) Output projection already done inside attn block ────────────────
 
         // ── h) Post-attention norm + residual ──────────────────────────────────
         if (L.attn_post_norm) {
