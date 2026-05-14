@@ -210,8 +210,11 @@ add_library(dflash27b STATIC
     src/qwen3/qwen3_daemon.cpp
     src/gemma4/gemma4_loader.cpp
     src/gemma4/gemma4_graph.cpp
+    src/gemma4/gemma4_runtime_helpers.cpp
     src/gemma4/gemma4_backend.cpp
     src/gemma4/gemma4_daemon.cpp
+    src/gemma4_dflash_graph.cpp
+    src/gemma4_mtp_graph.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
@@ -461,6 +464,41 @@ if(DFLASH27B_TESTS)
         add_executable(smoke_load_target test/smoke_load_target.cpp)
         target_include_directories(smoke_load_target PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_load_target PRIVATE dflash27b ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/gemma4/smoke_load_gemma4_target.cpp")
+        add_executable(smoke_load_gemma4_target test/gemma4/smoke_load_gemma4_target.cpp)
+        target_include_directories(smoke_load_gemma4_target PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(smoke_load_gemma4_target PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/gemma4/smoke_gemma4_target_forward.cpp")
+        add_executable(smoke_gemma4_target_forward test/gemma4/smoke_gemma4_target_forward.cpp)
+        target_include_directories(smoke_gemma4_target_forward PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(smoke_gemma4_target_forward PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/gemma4/test_gemma4_kv_tq3.cpp")
+        add_executable(test_gemma4_kv_tq3 test/gemma4/test_gemma4_kv_tq3.cpp)
+        target_include_directories(test_gemma4_kv_tq3 PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_gemma4_kv_tq3 PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/gemma4/smoke_load_gemma4_draft.cpp")
+        add_executable(smoke_load_gemma4_draft test/gemma4/smoke_load_gemma4_draft.cpp)
+        target_include_directories(smoke_load_gemma4_draft PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(smoke_load_gemma4_draft PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/gemma4/smoke_gemma4_draft_forward.cpp")
+        add_executable(smoke_gemma4_draft_forward test/gemma4/smoke_gemma4_draft_forward.cpp)
+        target_include_directories(smoke_gemma4_draft_forward PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(smoke_gemma4_draft_forward PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/gemma4/test_mtp_loader.cpp")
+        add_executable(test_mtp_loader test/gemma4/test_mtp_loader.cpp)
+        target_include_directories(test_mtp_loader PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_mtp_loader PRIVATE dflash27b ggml ggml-cuda)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/gemma4/test_mtp_graph_shapes.cpp")
+        add_executable(test_mtp_graph_shapes test/gemma4/test_mtp_graph_shapes.cpp)
+        target_include_directories(test_mtp_graph_shapes PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_mtp_graph_shapes PRIVATE dflash27b ggml ggml-cuda)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_target_laguna.cpp")
         add_executable(smoke_load_target_laguna test/smoke_load_target_laguna.cpp)

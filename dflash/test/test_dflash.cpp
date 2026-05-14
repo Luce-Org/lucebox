@@ -991,17 +991,41 @@ int main(int argc, char ** argv) {
 
     // ---- Arch dispatch: gemma4 targets to the dedicated daemon -----
     if (is_gemma4 && daemon_mode) {
-        const int max_ctx_eff = g_max_ctx_override > 0 ? g_max_ctx_override : 8192;
+        const int max_ctx_eff = g_max_ctx_override > 0 ? g_max_ctx_override : 16384;
+        int chunk = 2048;
+        if (const char * ck = std::getenv("DFLASH27B_GEMMA4_CHUNK")) {
+            const int v = std::atoi(ck);
+            if (v > 0) chunk = v;
+        }
+        dflash27b::Gemma4DaemonArgs gargs;
+        gargs.target_path = target_path;
+        // argv[2] (when present and not a flag) is the drafter/MTP path.
+        // DFLASH_GEMMA4_MTP=1 routes argv[2] to MTP; otherwise it's DFlash draft.
+        if (argc >= 3 && argv[2][0] != '-') {
+            const char * dp = argv[2];
+            if (std::getenv("DFLASH_GEMMA4_MTP")) {
+                gargs.mtp_path     = dp;
+                gargs.draft_method = dflash27b::Gemma4DraftMethod::kMtp;
+            } else {
+                gargs.draft_path   = dp;
+                gargs.draft_method = dflash27b::Gemma4DraftMethod::kDFlash;
+            }
+        }
+        gargs.max_ctx   = max_ctx_eff;
+        gargs.chunk     = chunk;
+        gargs.stream_fd = stream_fd;
+        if (std::getenv("DFLASH_SPARSE_FA_TQ3") || std::getenv("DFLASH_FP_USE_BSA")) {
+            gargs.use_sparse_fa = true;
+        }
+        if (const char * mg = std::getenv("DFLASH_MTP_GAMMA")) {
+            const int v = std::atoi(mg);
+            if (v > 0) gargs.mtp_gamma = v;
+        }
         std::fprintf(stderr,
             "[test_dflash] arch=gemma4 -> dispatching to run_gemma4_daemon "
-            "(max_ctx=%d stream_fd=%d)\n", max_ctx_eff, stream_fd);
-        dflash27b::Gemma4DaemonArgs g4args;
-        g4args.model_path     = target_path;
-        g4args.device.gpu     = target_gpu;
-        g4args.device.max_ctx = max_ctx_eff;
-        g4args.stream_fd      = stream_fd;
-        g4args.chunk          = 512;
-        return dflash27b::run_gemma4_daemon(g4args);
+            "(max_ctx=%d chunk=%d stream_fd=%d sparse_fa=%d draft_method=%d)\n",
+            max_ctx_eff, chunk, stream_fd, (int)gargs.use_sparse_fa, (int)gargs.draft_method);
+        return dflash27b::run_gemma4_daemon(gargs);
     }
 
     // Helper: write a committed token to the stream fd immediately (int32 LE).
