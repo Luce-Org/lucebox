@@ -79,22 +79,14 @@ struct HipChunkGraphB {
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
 
-    ggml_tensor * h_in     = nullptr;
-    ggml_tensor * attn_in  = nullptr;
-    ggml_tensor * h_after  = nullptr;
-    ggml_tensor * hf       = nullptr;
-    ggml_tensor * gate     = nullptr;
-    ggml_tensor * up       = nullptr;
-    ggml_tensor * gu       = nullptr;
-    ggml_tensor * ffn_out  = nullptr;
-    ggml_tensor * h_next   = nullptr;
+    ggml_tensor * h_in    = nullptr;   // input: hidden state slice (F32)
+    ggml_tensor * attn_in = nullptr;   // input: attention output slice (BF16)
+    ggml_tensor * h_after = nullptr;   // h_in + attn_proj residual (F32)
+    ggml_tensor * hf      = nullptr;   // FFN norm result written by custom kernel (F32)
+    ggml_tensor * h_next  = nullptr;   // output: updated hidden state (F32)
 
-    ggml_cgraph * gf_proj_add = nullptr;
-    ggml_cgraph * gf_gate     = nullptr;
-    ggml_cgraph * gf_up       = nullptr;
-    ggml_cgraph * gf_mul      = nullptr;
-    ggml_cgraph * gf_down     = nullptr;
-    ggml_cgraph * gf_add_out  = nullptr;
+    ggml_cgraph * gf_proj_add = nullptr;   // compute h_after = h_in + wo*attn_in
+    ggml_cgraph * gf_ffn      = nullptr;   // compute h_next = h_after + ffn(hf)
 };
 
 bool make_pers(ggml_backend_t backend, ggml_type type, int n_dim,
@@ -154,6 +146,8 @@ bool build_hip_chunk_graph_b(const Qwen3DrafterLayer & L,
 
     ggml_tensor * attn_proj = ggml_mul_mat(out.ctx, L.wo, out.attn_in);
     out.h_after = ggml_add(out.ctx, out.h_in, attn_proj);
+    // h_after is output of gf_proj_add AND input of gf_ffn (stops re-traversal).
+    ggml_set_input(out.h_after);
     ggml_set_output(out.h_after);
     out.gf_proj_add = ggml_new_graph_custom(out.ctx, 1024, false);
     ggml_build_forward_expand(out.gf_proj_add, out.h_after);
@@ -161,31 +155,16 @@ bool build_hip_chunk_graph_b(const Qwen3DrafterLayer & L,
     out.hf = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, hidden, chunk);
     ggml_set_input(out.hf);
 
-    out.gate = ggml_mul_mat(out.ctx, L.ffn_gate, out.hf);
-    out.gate = ggml_silu(out.ctx, out.gate);
-    ggml_set_output(out.gate);
-    out.gf_gate = ggml_new_graph_custom(out.ctx, 1024, false);
-    ggml_build_forward_expand(out.gf_gate, out.gate);
-
-    out.up = ggml_mul_mat(out.ctx, L.ffn_up, out.hf);
-    ggml_set_output(out.up);
-    out.gf_up = ggml_new_graph_custom(out.ctx, 1024, false);
-    ggml_build_forward_expand(out.gf_up, out.up);
-
-    out.gu = ggml_mul(out.ctx, out.gate, out.up);
-    ggml_set_output(out.gu);
-    out.gf_mul = ggml_new_graph_custom(out.ctx, 1024, false);
-    ggml_build_forward_expand(out.gf_mul, out.gu);
-
-    out.ffn_out = ggml_mul_mat(out.ctx, L.ffn_down, out.gu);
-    ggml_set_output(out.ffn_out);
-    out.gf_down = ggml_new_graph_custom(out.ctx, 1024, false);
-    ggml_build_forward_expand(out.gf_down, out.ffn_out);
-
-    out.h_next = ggml_add(out.ctx, out.h_after, out.ffn_out);
+    // gf_ffn: one combined graph for all FFN ops after the RMSNorm.
+    // h_after and hf are both inputs so no re-traversal into proj_add or norm.
+    ggml_tensor * gate    = ggml_silu(out.ctx, ggml_mul_mat(out.ctx, L.ffn_gate, out.hf));
+    ggml_tensor * up      = ggml_mul_mat(out.ctx, L.ffn_up, out.hf);
+    ggml_tensor * gu      = ggml_mul(out.ctx, gate, up);
+    ggml_tensor * ffn_out = ggml_mul_mat(out.ctx, L.ffn_down, gu);
+    out.h_next = ggml_add(out.ctx, out.h_after, ffn_out);
     ggml_set_output(out.h_next);
-    out.gf_add_out = ggml_new_graph_custom(out.ctx, 1024, false);
-    ggml_build_forward_expand(out.gf_add_out, out.h_next);
+    out.gf_ffn = ggml_new_graph_custom(out.ctx, 1024, false);
+    ggml_build_forward_expand(out.gf_ffn, out.h_next);
 
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
     if (!out.buf) {
@@ -202,7 +181,7 @@ void warm_hip_chunk_graph_b_once(ggml_backend_t backend, HipChunkGraphB & out) {
     }
 
     struct ggml_tensor * warm_tensors[] = {
-        out.h_in, out.attn_in, out.h_after, out.hf, out.gate, out.up, out.gu, out.ffn_out, out.h_next,
+        out.h_in, out.attn_in, out.h_after, out.hf, out.h_next,
     };
     for (ggml_tensor * t : warm_tensors) {
         cudaError_t e = cudaMemset(t->data, 0, ggml_nbytes(t));
@@ -212,11 +191,7 @@ void warm_hip_chunk_graph_b_once(ggml_backend_t backend, HipChunkGraphB & out) {
     }
 
     ggml_backend_graph_compute(backend, out.gf_proj_add);
-    ggml_backend_graph_compute(backend, out.gf_gate);
-    ggml_backend_graph_compute(backend, out.gf_up);
-    ggml_backend_graph_compute(backend, out.gf_mul);
-    ggml_backend_graph_compute(backend, out.gf_down);
-    ggml_backend_graph_compute(backend, out.gf_add_out);
+    ggml_backend_graph_compute(backend, out.gf_ffn);
     warmed = true;
 }
 #endif
@@ -293,11 +268,10 @@ bool forward_qwen3_drafter_model(
         int64_t d_ql[]  = {(int64_t)D, (int64_t)H,  (int64_t)n_lookahead};
         int64_t d_p[]   = {(int64_t)S};
         int64_t d_mt[]  = {(int64_t)S, (int64_t)n_lookahead};
-        // Use BF16 only for sm_80+ (native BF16 tensor cores). Volta/Turing
-        // use F16 with F16 WMMA kernels; other arches and HIP use F16 with
-        // ggml flash_attn_ext for the portable path.
+        // Use BF16 when rocWMMA or CUDA WMMA flashprefill kernels are compiled.
+        // HIP Phase 1 (q8 ggml fallback) and old CUDA arches stay with F16.
         const ggml_type half_type =
-#ifdef DFLASH27B_HAVE_SM80_FLASHPREFILL
+#if defined(DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL) || defined(DFLASH27B_HAVE_FLASHPREFILL)
             GGML_TYPE_BF16;
 #else
             GGML_TYPE_F16;
@@ -699,7 +673,7 @@ bool forward_qwen3_drafter_model(
             // RMSNorm. (Reading h_after before this compute would pick up
             // the previous chunk's value — stale FFN inputs.)
             auto tB0 = std::chrono::steady_clock::now();
-            double proj_s = 0, gate_s = 0, up_s = 0, mul_s = 0, down_s = 0, add_s = 0;
+            double proj_s = 0, ffn_s = 0;
             auto one = [&](ggml_cgraph * gf, double & acc) {
                 auto ts0 = std::chrono::steady_clock::now();
                 ggml_backend_graph_compute(w.backend, gf);
@@ -726,11 +700,7 @@ bool forward_qwen3_drafter_model(
             auto tB_norm1 = std::chrono::steady_clock::now();
             t_b_norm += std::chrono::duration<double>(tB_norm1 - tB_norm0).count();
 
-            one(gb.gf_gate, gate_s);
-            one(gb.gf_up, up_s);
-            one(gb.gf_mul, mul_s);
-            one(gb.gf_down, down_s);
-            one(gb.gf_add_out, add_s);
+            one(gb.gf_ffn, ffn_s);
             auto tB1 = std::chrono::steady_clock::now();
             t_compute_b += std::chrono::duration<double>(tB1 - tB0).count();
 
@@ -748,10 +718,10 @@ bool forward_qwen3_drafter_model(
             t_b_copy_out += std::chrono::duration<double>(tB_copy_out1 - tB_copy_out0).count();
             if (debug_first_layer) {
                 std::fprintf(stderr,
-                             "[qwen3-0.6b-fp dbg] layer0 chunk B compute-done compute=%.3fs copy-out=%.3fs [proj=%.3f norm_cpu=%.3f gate=%.3f up=%.3f mul=%.3f down=%.3f add=%.3f]\n",
+                             "[qwen3-0.6b-fp dbg] layer0 chunk B compute-done compute=%.3fs copy-out=%.3fs [proj=%.3f norm_cpu=%.3f ffn=%.3f]\n",
                              std::chrono::duration<double>(tB1 - tB0).count(),
                              std::chrono::duration<double>(tB_copy_out1 - tB_copy_out0).count(),
-                             proj_s, std::chrono::duration<double>(tB_norm1 - tB_norm0).count(), gate_s, up_s, mul_s, down_s, add_s);
+                             proj_s, std::chrono::duration<double>(tB_norm1 - tB_norm0).count(), ffn_s);
                 std::fflush(stderr);
             }
             if (debug_first_layer) {
