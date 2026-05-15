@@ -35,7 +35,7 @@ mkdir -p models models/draft
 uvx --from 'huggingface_hub[cli]' huggingface-cli download \
     unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
 uvx --from 'huggingface_hub[cli]' huggingface-cli download \
-    z-lab/Qwen3.6-27B-DFlash --local-dir models/draft/
+    Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q8_0.gguf --local-dir models/draft/
 
 # 2. Run the OpenAI-compatible server.
 docker run --rm --gpus all -p 8080:8080 \

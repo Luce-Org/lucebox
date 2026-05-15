@@ -7,7 +7,7 @@ set -euo pipefail
 #
 # Override any path or flag via environment variables:
 #   DFLASH_TARGET    path to target GGUF (default: dflash/models/*.gguf)
-#   DFLASH_DRAFT     path to draft dir or safetensors (default: dflash/models/draft/)
+#   DFLASH_DRAFT     path to draft dir, GGUF, or safetensors (default: dflash/models/draft/)
 #   DFLASH_BIN       path to test_dflash binary (default: dflash/build/test_dflash)
 #   DFLASH_PORT      server port (default: 8080)
 #   DFLASH_HOST      server host (default: 0.0.0.0)
@@ -271,7 +271,7 @@ if [ -z "$DFLASH_TARGET" ]; then
         printf '\nDownload one of the supported targets, e.g.:\n'
         printf '  mkdir -p %s/models %s/models/draft\n' "$DFLASH_DIR" "$DFLASH_DIR"
         printf '  huggingface-cli download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir %s/models\n' "$DFLASH_DIR"
-        printf '  huggingface-cli download z-lab/Qwen3.6-27B-DFlash --local-dir %s/models/draft\n' "$DFLASH_DIR"
+        printf '  huggingface-cli download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q8_0.gguf --local-dir %s/models/draft\n' "$DFLASH_DIR"
         printf '\nOr point DFLASH_TARGET at an existing .gguf file.\n' >&2
         exit 1
     fi
@@ -282,11 +282,16 @@ fi
 [ -f "$DFLASH_BIN" ]      || die "Binary not found at $DFLASH_BIN (build with: cmake --build dflash/build --target test_dflash -j)"
 [ -f "$DFLASH_TARGET" ]   || die "Target GGUF not found at $DFLASH_TARGET"
 
-# Draft resolution: accept dir (resolves model.safetensors) or direct file
+# Draft resolution: accept dir (server.py resolves GGUF/safetensors) or direct file
 DRAFT_ARG="$DFLASH_DRAFT"
 if [ -d "$DFLASH_DRAFT" ]; then
-    if ! ls "$DFLASH_DRAFT"/*.safetensors &>/dev/null; then
-        warn "No .safetensors in draft dir $DFLASH_DRAFT — starting without draft"
+    if ! find "$DFLASH_DRAFT" -maxdepth 4 -type f \( \
+            -name 'dflash-draft-*.gguf' -o \
+            -name '*.gguf' -o \
+            -name 'model.safetensors' -o \
+            -name '*.safetensors' \
+        \) -print -quit | grep -q .; then
+        warn "No DFlash draft GGUF/safetensors in draft dir $DFLASH_DRAFT — starting without draft"
         DRAFT_ARG=""
     fi
 elif [ -n "$DFLASH_DRAFT" ] && [ ! -f "$DFLASH_DRAFT" ]; then
