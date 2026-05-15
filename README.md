@@ -22,6 +22,89 @@
 
 ---
 
+## Quick start
+
+Two prebuilt Docker images cover every dflash-supported NVIDIA GPU. Default
+to `:cuda13`; pick `:cuda12` only if your host driver is pinned to the
+R535-series LTS branch. The only `:cuda13`-exclusive hardware is Jetson AGX
+Thor (sm_110).
+
+```bash
+# 1. Fetch a target + DFlash draft (~20 GB). Skip if you already have them.
+mkdir -p models models/draft
+uvx --from 'huggingface_hub[cli]' huggingface-cli download \
+    unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
+uvx --from 'huggingface_hub[cli]' huggingface-cli download \
+    z-lab/Qwen3.6-27B-DFlash --local-dir models/draft/
+
+# 2. Run the OpenAI-compatible server.
+docker run --rm --gpus all -p 8080:8080 \
+    -v "$PWD/models:/opt/lucebox-hub/dflash/models" \
+    ghcr.io/luce-org/lucebox-hub:cuda13
+
+# 3. Use it.
+curl http://localhost:8080/v1/models
+```
+
+> Don't have `uv`? Install with `curl -LsSf https://astral.sh/uv/install.sh | sh` or see [astral.sh/uv](https://astral.sh/uv/).
+
+The server auto-detects VRAM and picks `max_ctx` + KV quantization for you
+(~112K ctx with TQ3_0 KV on a 24 GB card, full 128K on 32+ GB).
+
+### Hardware coverage
+
+| GPU                              | sm   | cuda12 | cuda13 |
+|----------------------------------|------|:------:|:------:|
+| RTX 2080 Ti                      | 75   | ✓      | ✓      |
+| A100                             | 80   | ✓      | ✓      |
+| RTX 3090 / A40 / A10             | 86   | ✓      | ✓      |
+| RTX 4090 / L40                   | 89   | ✓      | ✓      |
+| H100                             | 90   | ✓      | ✓      |
+| Jetson AGX Thor                  | 110  |        | ✓      |
+| RTX 5090 / RTX 5090 Laptop       | 120  | ✓      | ✓      |
+| DGX Spark / GB10                 | 121  | ✓      | ✓      |
+
+Pre-Turing GPUs (Pascal sm_60/61, Volta sm_70) aren't supported — dflash's
+kernels assume sm_75+ with no fallback below.
+
+### Configuration
+
+Override defaults via `-e VAR=value` on `docker run`:
+
+| Env var                       | Default         | What it does
+|-------------------------------|-----------------|--------------
+| `DFLASH_PORT`                 | `8080`          | HTTP port
+| `DFLASH_MAX_CTX`              | autotuned       | Force a specific context length
+| `DFLASH_BUDGET`               | `22`            | DDTree tree budget (8 on AMD RDNA3)
+| `DFLASH_PREFIX_CACHE_SLOTS`   | `1`             | System-prompt prefix cache snapshots
+| `DFLASH_PREFILL_MODE`         | `off`           | `auto` / `always` for pFlash long-prompt speedups
+| `DFLASH_TARGET`               | auto-detected   | Override the target `.gguf` path
+| `DFLASH_DRAFT`                | `models/draft/` | Override the DFlash draft dir/file
+
+Full reference: [`start_server.sh`](start_server.sh).
+
+### Available tags
+
+| Tag                            | Notes
+|--------------------------------|-------
+| `:cuda13`                      | rolling latest cuda13 release (recommended)
+| `:cuda12`                      | rolling latest cuda12 release
+| `:vX.Y.Z-cuda{12,13}`          | pinned to a specific release
+| `:X.Y-cuda{12,13}`             | latest patch in a minor series
+| `:sha-<short>-cuda{12,13}`     | exact commit
+
+### Building from source
+
+Megakernel isn't in the Docker images yet (its CUDA extension links against
+a `torch.utils.cpp_extension` wheel at build time and has to be compiled in
+your venv). For megakernel benchmarks, dflash kernel development, or
+running dflash with a non-default arch list, see
+[`megakernel/README.md`](megakernel/README.md),
+[`dflash/README.md`](dflash/README.md), and
+[`pflash/README.md`](pflash/README.md).
+
+---
+
 ## Projects
 
 Each directory is a self-contained project with setup instructions and benchmark notes.
