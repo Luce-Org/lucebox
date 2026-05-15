@@ -277,6 +277,18 @@ if [ -z "$DFLASH_TARGET" ]; then
     fi
 fi
 
+# Qwen3.6 DFlash drafters use sliding-window attention in the draft. Some GGUFs
+# carry this metadata directly; keep the documented env override as the Docker
+# default so the image behaves like the benchmark path even for older drafts.
+case "$(basename "$DFLASH_TARGET")" in
+    *Qwen3.6*|*qwen3.6*)
+        if [ -z "${DFLASH27B_DRAFT_SWA:-}" ]; then
+            export DFLASH27B_DRAFT_SWA=2048
+            info "Autotune: DFLASH27B_DRAFT_SWA=2048 (Qwen3.6 draft SWA)"
+        fi
+        ;;
+esac
+
 # ── validation ───────────────────────────────────────────────────────────────
 
 [ -f "$DFLASH_BIN" ]      || die "Binary not found at $DFLASH_BIN (build with: cmake --build dflash/build --target test_dflash -j)"
