@@ -23,7 +23,8 @@ from pathlib import Path
 from statistics import mean
 from typing import Iterable
 
-from placement.backend_device import apply_backend_visible_devices, TestDflashLaunchArgs
+from placement.backend_device import apply_backend_visible_devices
+from placement.test_dflash_args import TestDflashLaunchArgs
 
 
 ROOT = Path(__file__).resolve().parent.parent

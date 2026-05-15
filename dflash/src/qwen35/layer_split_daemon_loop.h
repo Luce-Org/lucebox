@@ -13,7 +13,7 @@
 
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights
 #include "common/sampler.h"
-#include "qwen35/draft_feature_mirror.h"
+#include "dflash_feature_ring.h"
 #include "qwen35/layer_split_types.h"
 
 #include <string>

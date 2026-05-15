@@ -163,7 +163,7 @@ using dflash27b::step_graph_destroy;
 
 // ─── Peer access + DraftFeatureMirror — extracted to src/qwen35/ ──
 #include "peer_access.h"
-#include "draft_feature_mirror.h"
+#include "dflash_feature_ring.h"
 using dflash27b::g_peer_access_opt_in;
 using dflash27b::g_peer_pair_ok_cache;
 using dflash27b::enable_peer_access_one_way;
@@ -179,6 +179,7 @@ using dflash27b::draft_feature_mirror_sync_tail;
 
 // ─── Graph builders — extracted to src/qwen35/graph_builders.{h,cpp} ──
 #include "graph_builders.h"
+#include "dflash_draft_graph.h"
 using dflash27b::build_layer_step;
 using dflash27b::build_target_step;
 using dflash27b::build_target_step_tree;
@@ -227,7 +228,7 @@ static bool parse_float_list(const char * text, std::vector<double> & out) {
 }
 
 // ─── Draft IPC — extracted to src/qwen35/draft_ipc.{h,cpp} ──
-#include "draft_ipc.h"
+#include "dflash_draft_ipc.h"
 using dflash27b::DFlashDraftIpcClient;
 using dflash27b::copy_capture_slice_to_remote_draft;
 using dflash27b::stream_status;
@@ -241,7 +242,7 @@ using dflash27b::run_dflash_draft_ipc_daemon;
 using dflash27b::compute_layer_ranges;
 
 // ─── Feature copy helpers — extracted to src/qwen35/feature_copy.{h,cpp} ──
-#include "feature_copy.h"
+#include "dflash_capture.h"
 using dflash27b::target_capture_index;
 using dflash27b::copy_capture_slice_to_draft_ring;
 using dflash27b::copy_feature_ring_range_to_tensor;
@@ -253,8 +254,9 @@ using dflash27b::run_target_layer_split_forward;
 using dflash27b::free_target_layer_split_shards;
 
 
-// ─── Speculative decode — extracted to src/qwen35/spec_decode.{h,cpp} ────────
-#include "spec_decode.h"
+// ─── Speculative decode — generic loop in common/, qwen35 layer-split adapter.
+#include "qwen35_layer_split_dflash_target.h"
+#include "common/dflash_spec_decode.h"
 using dflash27b::is_eos_tok;
 
 // ─── Layer-split daemon — extracted to src/qwen35/layer_split_daemon.{h,cpp} ─
@@ -440,7 +442,9 @@ static int run_target_layer_split_harness(
                             draft_weights.swa_window);
             }
             if (!draft_feature_mirror_init(feature_ring, draft_backend,
-                                           draft_gpu, draft_gpu, cap)) {
+                                           draft_gpu, draft_gpu, cap,
+                                           draft_weights.n_target_layers,
+                                           draft_weights.n_embd)) {
                 std::fprintf(stderr, "target-split feature ring init failed on gpu=%d\n", draft_gpu);
                 draft_feature_mirror_free(feature_ring);
                 free_draft_weights(draft_weights);
@@ -538,7 +542,7 @@ static int run_target_layer_split_harness(
             const bool use_mirror_view =
                 draft_feature_mirror_can_view(feature_ring, (int)prompt.size(),
                                               draft_ctx, mirror_slot0);
-            if (!build_draft_step(draft_sg, draft_weights, nullptr, draft_backend,
+            if (!build_draft_step(draft_sg, draft_weights, /*lm_head=*/nullptr, draft_backend,
                                   draft_ctx, use_mirror_view ? &feature_ring : nullptr,
                                   (int)prompt.size())) {
                 std::fprintf(stderr, "target-split draft smoke build failed\n");
@@ -590,10 +594,13 @@ static int run_target_layer_split_harness(
     }
 
     if (run_dflash) {
-        const bool ok = run_target_layer_split_dflash_decode(
-            shards, draft_weights, draft_backend, draft_gpu, feature_ring,
+        Qwen35LayerSplitDFlashTarget target(
+            shards, &feature_ring, g_kq_stride_pad, g_fa_window,
+            use_remote_draft ? &remote_draft : nullptr);
+        const bool ok = run_dflash_spec_decode(
+            target, draft_weights, draft_backend, feature_ring,
             prompt, n_gen, last_tok, out_path,
-            g_kq_stride_pad, g_fa_window, g_draft_ctx_max, /*stream_fd=*/-1,
+            g_draft_ctx_max, /*stream_fd=*/-1,
             use_remote_draft ? &remote_draft : nullptr);
         draft_feature_mirror_free(feature_ring);
         free_draft_weights(draft_weights);
@@ -2305,14 +2312,17 @@ int main(int argc, char ** argv) {
         if (!feature_mirror.target_feat || feature_mirror.cap != cache.target_feat_cap) {
             if (!draft_feature_mirror_init(feature_mirror, draft_backend,
                                            draft_gpu, target_gpu,
-                                           cache.target_feat_cap)) {
+                                           cache.target_feat_cap,
+                                           DFLASH27B_DRAFT_N_TARGET_LAYERS,
+                                           DFLASH27B_TARGET_HIDDEN)) {
                 std::fprintf(stderr, "draft feature mirror init failed\n");
                 return 1;
             }
             std::printf("[draft-mirror] init cap=%d type=f32 device=%d target_device=%d\n",
                         feature_mirror.cap, draft_gpu, target_gpu);
         }
-        if (!draft_feature_mirror_sync_tail(cache, feature_mirror, committed)) {
+        if (!draft_feature_mirror_sync_tail(cache.target_feat, cache.target_feat_cap,
+                                            feature_mirror, committed)) {
             std::fprintf(stderr, "draft feature mirror initial sync failed\n");
             return 1;
         }
@@ -2353,7 +2363,8 @@ int main(int argc, char ** argv) {
             return true;
         }
         auto t0 = sync_us();
-        const bool ok = draft_feature_mirror_sync_range(cache, feature_mirror,
+        const bool ok = draft_feature_mirror_sync_range(cache.target_feat, cache.target_feat_cap,
+                                                        feature_mirror,
                                                         start_pos, n_tokens);
         auto t1 = sync_us();
         tt_mirror_sync += std::chrono::duration<double, std::micro>(t1 - t0).count();
@@ -2386,7 +2397,8 @@ int main(int argc, char ** argv) {
         const bool draft_hidden_bridge = split_gpus;
 
         // 2) Draft forward
-        if (!build_draft_step(draft_sg, dw, draft_hidden_bridge ? nullptr : &w,
+        if (!build_draft_step(draft_sg, dw,
+                              draft_hidden_bridge ? nullptr : w.output,
                               draft_backend, /*ctx_len=*/draft_ctx,
                               use_mirror_view ? &feature_mirror : nullptr,
                               committed)) {

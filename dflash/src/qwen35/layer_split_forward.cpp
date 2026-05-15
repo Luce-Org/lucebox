@@ -3,7 +3,8 @@
 #include "layer_split_forward.h"
 #include "internal.h"
 #include "graph_builders.h"
-#include "feature_copy.h"
+#include "dflash_feature_ring.h"
+#include "dflash_capture.h"
 #include "attn_masks.h"
 
 #include "ggml.h"
@@ -131,7 +132,8 @@ bool run_target_layer_split_forward(
         }
 
         const bool is_attn = (((il + 1) % embed_source.full_attention_interval) == 0);
-        const int capture_idx = target_capture_index(embed_source, il);
+        const int capture_idx = target_capture_index(embed_source.capture_layer_ids,
+                                                     embed_source.n_capture_layers, il);
         for (int start = 0; start < n_tokens_total; start += ubatch) {
             const int n = std::min(ubatch, n_tokens_total - start);
             const int kv_start = base_pos + start;

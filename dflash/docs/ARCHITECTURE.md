@@ -44,6 +44,13 @@ dflash/src/
 │   ├── device_placement.h  # Multi-GPU placement config
 │   ├── gguf_inspect.{h,cpp}# Read arch + layer count from GGUF
 │   ├── layer_split_utils.{h,cpp}  # compute_layer_ranges()
+│   ├── dflash_layer_split_runtime.h  # LayerSplitRuntimeConfig + ActivationPair
+│   ├── dflash_feature_ring.{h,cpp}   # DraftFeatureMirror + ring copy helpers
+│   ├── dflash_capture.{h,cpp}        # target_capture_index() helper
+│   ├── dflash_draft_ipc.{h,cpp}      # DFlash draft IPC client + remote copy
+│   ├── dflash_draft_ipc_daemon.cpp   # Generic DFlash draft IPC daemon body
+│   ├── dflash_draft_graph.{h,cpp}    # Universal build_draft_step (DFlash draft graph)
+│   ├── dflash_spec_decode.{h,cpp}    # Generic spec-decode loop over DFlashTarget
 │   ├── ddtree.{h,cpp}     # Dynamic Draft Tree algorithm
 │   ├── attn_masks.h        # Causal + tree attention mask builders
 │   ├── peer_access.{h,cpp} # CUDA peer-access utilities
@@ -55,12 +62,10 @@ dflash/src/
 ├── qwen35/                 # Qwen3.5 hybrid (attn + DeltaNet/SSM)
 │   ├── qwen35_backend.{h,cpp}     # Full backend with spec decode
 │   ├── qwen35_daemon.{h,cpp}      # Thin daemon entry point
-│   ├── qwen35_dflash_target.{h,cpp}  # DFlashTarget adapter
-│   ├── graph_builders.{h,cpp}     # Build ggml graphs for target/draft
-│   ├── spec_decode.{h,cpp}        # Speculative decode loop
-│   ├── draft_ipc.{h,cpp}          # Draft model IPC (feature copy)
-│   ├── draft_feature_mirror.{h,cpp}  # Cross-GPU feature transfer
-│   ├── feature_copy.{h,cpp}       # CUDA feature copy helpers
+│   ├── qwen35_dflash_target.{h,cpp}  # DFlashTarget adapter (single-GPU)
+│   ├── qwen35_layer_split_dflash_target.{h,cpp}  # DFlashTarget adapter (multi-GPU)
+│   ├── graph_builders.{h,cpp}     # Build ggml graphs for qwen35 target + lm_head
+│   ├── layer_split_types.h        # qwen35 TargetLayerSplitShard
 │   ├── layer_split_*.{h,cpp}      # Multi-GPU layer-split daemon
 │   └── ...
 │
@@ -222,14 +227,27 @@ decode, DDTree mode, multi-GPU layer-split, SSM state rollback, and prefix
 cache snapshots. Use this as a reference when implementing a new backend.
 
 Key components:
-- **Graph builders** (`graph_builders.{h,cpp}`): Build ggml compute graphs for
-  target forward, draft forward, and lm_head projection
-- **Spec decode** (`spec_decode.{h,cpp}`): The draft→verify→accept loop
-- **DFlashTarget adapter** (`qwen35_dflash_target.{h,cpp}`): Bridges qwen35
-  internals to the generic DFlashTarget interface
-- **Feature copy** (`feature_copy.{h,cpp}`, `draft_feature_mirror.{h,cpp}`):
-  Transfer intermediate activations from target to draft model (possibly
-  cross-GPU)
+- **Graph builders**: Per-target `graph_builders.{h,cpp}` build the
+  ggml compute graphs for target forward and lm_head projection. The
+  universal DFlash draft graph (`build_draft_step`) lives in
+  `common/dflash_draft_graph.{h,cpp}` and is shared across all targets.
+- **Spec decode** (`common/dflash_spec_decode.{h,cpp}`): The generic
+  draft→verify→accept loop, typed against `DFlashTarget`. Reusable by every
+  backend.
+- **DFlashTarget adapters** (`qwen35_dflash_target.{h,cpp}` for single-GPU,
+  `qwen35_layer_split_dflash_target.{h,cpp}` for multi-GPU layer split):
+  Bridge qwen35 internals (`TargetWeights`, `TargetCache`,
+  `TargetLayerSplitShard`) to the generic `DFlashTarget` interface so the
+  shared spec-decode loop can drive verification.
+- **Feature transfer + draft daemon** (`common/dflash_feature_ring.{h,cpp}`,
+  `common/dflash_capture.{h,cpp}`, `common/dflash_draft_ipc.{h,cpp}`,
+  `common/dflash_draft_ipc_daemon.cpp`):
+  Move captured target activations into the draft-side ring buffer
+  (`DraftFeatureMirror`) and ship them across processes/GPUs. The IPC
+  client, parent-side feature-slice helper, and the daemon body itself
+  all live in `common/` and are reusable by any DFlash target architecture
+  (the DFlash draft model is a single universal Qwen3-style network shared
+  across every target).
 
 ### Qwen3Backend, Gemma4Backend, LagunaBackend
 

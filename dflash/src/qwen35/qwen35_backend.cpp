@@ -1,7 +1,8 @@
 #include "qwen35_backend.h"
 #include "qwen35_dflash_target.h"
 #include "graph_builders.h"
-#include "feature_copy.h"
+#include "dflash_feature_ring.h"
+#include "dflash_capture.h"
 #include "peer_access.h"
 #include "attn_masks.h"
 #include "common/sampler.h"
@@ -91,7 +92,9 @@ bool Qwen35Backend::init() {
     if (cfg_.use_feature_mirror && split_gpus_) {
         const int mirror_cap = std::min(cfg_.draft_ctx_max, cfg_.device.max_ctx);
         if (!draft_feature_mirror_init(feature_mirror_, draft_backend_,
-                                       cfg_.draft_gpu, cfg_.device.gpu, mirror_cap)) {
+                                       cfg_.draft_gpu, cfg_.device.gpu, mirror_cap,
+                                       DFLASH27B_DRAFT_N_TARGET_LAYERS,
+                                       DFLASH27B_TARGET_HIDDEN)) {
             std::fprintf(stderr, "warning: feature mirror init failed, using direct copies\n");
         }
     }
@@ -465,7 +468,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
 
         // Sync feature mirror if active
         if (feature_mirror_.target_feat && !draft_parked_) {
-            draft_feature_mirror_sync_range(cache_, feature_mirror_, start, n_tokens);
+            draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
+                                            feature_mirror_, start, n_tokens);
         }
     }
 

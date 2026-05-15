@@ -4,7 +4,7 @@
 #include "layer_split_types.h"
 #include "layer_split_daemon.h"  // run_target_layer_split_request
 #include "layer_split_forward.h" // free_target_layer_split_shards
-#include "draft_feature_mirror.h"
+#include "dflash_feature_ring.h"
 #include "peer_access.h"
 #include "common/io_utils.h"
 #include "common/sampler.h"

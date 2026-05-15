@@ -28,7 +28,7 @@ public:
                        int kq_stride_pad,
                        int fa_window);
 
-    ~Qwen35DFlashTarget() override = default;
+    ~Qwen35DFlashTarget() override;
 
     // ── DFlashTarget interface ──────────────────────────────────────
 

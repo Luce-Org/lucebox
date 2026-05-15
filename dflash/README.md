@@ -275,17 +275,19 @@ tokens) is the path to bring code recall to the same ratio as prose.
 git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub
 cd lucebox-hub/dflash
 
-# Build (CUDA 12+, CMake 3.18+, sm_75+ GPU; CUDA 13+ required for Jetson AGX Thor sm_110)
+# Build (CUDA 12+, CMake 3.18+, sm_60+ GPU including Pascal; CUDA 13+ required for Jetson AGX Thor sm_110)
 # Pass -DCMAKE_CUDA_ARCHITECTURES matching your GPU. Common values:
-#   75 = 2080 Ti (auto-converts BF16 draft → FP16 at load)
-#   86 = RTX 3090 / A40
+#   60;61 = Pascal P100/P40 (scalar flashprefill fallback, no WMMA)
+#   70 = V100 (F16 WMMA kernels, BF16 draft → FP16 at load)
+#   75 = 2080 Ti (F16 WMMA kernels, auto-converts BF16 draft → FP16 at load)
+#   86 = RTX 3090 / A40 (native BF16 WMMA)
 #   89 = RTX 4090
 #   90 = H100
 #   120 = Blackwell / DGX Spark
 #   110 = Jetson AGX Thor (CUDA 13+)
-# Omitting the flag falls back to the CMake-set default ("75;86"), which
-# fails to compile pflash's BF16 WMMA kernels on the sm_75 pass — set the
-# flag explicitly to your real arch to avoid this.
+# Omitting the flag falls back to the CMake-set default ("60;61;62;70;75;86"),
+# which compiles Pascal (scalar), Volta/Turing (F16 WMMA), and Ampere+ (BF16 WMMA)
+# flashprefill paths.
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build --target test_dflash -j
 
@@ -321,7 +323,7 @@ DFLASH27B_KV_TQ3=1 DFLASH27B_PREFILL_UBATCH=16 \
   --fast-rollback --ddtree --ddtree-budget=16 --max-ctx=4096   # align_up(prompt + n_gen + 64, 256); raise up to 262144 for long prompts
 ```
 
-**Requirements:** NVIDIA sm_75+ GPU (2080 Ti, 3090, A10, A40, 4090) or Jetson AGX Thor sm_110, CUDA 12+ (CUDA 13+ required for Thor), 22+ GB VRAM, ~80 GB disk. On Turing (SM 7.5), BF16 draft weights are auto-converted to FP16 at load time for tensor core acceleration.
+**Requirements:** NVIDIA sm_60+ GPU (Pascal P40 24GB, V100 32GB, 2080 Ti, 3090, A10, A40, 4090) or Jetson AGX Thor sm_110, CUDA 12+ (CUDA 13+ required for Thor), 22+ GB VRAM, ~80 GB disk. Pascal GPUs use the scalar flashprefill fallback (no WMMA); P100 (12/16 GB) cannot fit the 27B target + draft under the 22 GB minimum. On Volta (SM 7.0) and Turing (SM 7.5), BF16 draft weights are auto-converted to FP16 at load time for tensor core acceleration.
 
 ## How it works
 
@@ -364,7 +366,7 @@ Current scope:
 - **Target family**: Qwen3.5/Qwen3.6 `qwen35` GGUF targets. Other architectures need their own graph builder.
 - **Draft formats**: DFlash GGUF drafts and z-lab-style safetensors drafts.
 - **Optional sampling**: `temperature`, `top_p`, `top_k`, `seed`, and `frequency_penalty` are honored on the OpenAI endpoint. The DDTree verify skeleton stays argmax (preserves accept rate); only the *committed* token at each verify step is drawn from a small CPU sampler chain (rep-pen → top-k → top-p → temp → multinomial). `temperature=0` (default) keeps the path bit-exact greedy. Full Leviathan-style rejection sampling on the tree is still a future addition.
-- **Backends**: CUDA is the primary path. HIP support exists for the documented AMD path. No Metal.
+- **Backends**: CUDA is the primary path. CUDA sm_60+ is supported: Pascal (sm_60-69) uses scalar F16 fallback, Volta/Turing (sm_70-75) use F16 WMMA kernels, and Ampere+ use native BF16 WMMA. HIP support exists for the documented AMD path. No Metal.
 - **Quantized target**: Q4_K_M fits the full stack on 24 GB. Higher target quantizations may improve acceptance if they fit.
 
 Correctness: `test_vs_oracle` validates the draft graph at cos sim 0.999812 vs the PyTorch reference. The target graph matches llama.cpp's `models/qwen35.cpp` semantically and produces bit-identical output to `test_generate` in autoregressive mode.

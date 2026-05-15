@@ -15,6 +15,13 @@
 namespace dflash27b {
 namespace flashprefill {
 
+// Kernel launcher declarations — architecture-specific.
+// sm_80+ BF16 WMMA launchers are in flashprefill_kernels.cu.
+// sm_70+ F16 WMMA launchers are in flashprefill_f16.cu.
+// Each arch-specific source owns its block-select launcher to avoid duplicate
+// CUDA host stubs in multi-arch builds.
+
+#ifdef DFLASH27B_HAVE_SM80_FLASHPREFILL
 extern "C" {
 void launch_compute_mean_vector_bf16(
     const void * K, void * mean_K,
@@ -83,7 +90,131 @@ void launch_sparse_flash_forward_bf16(
     int s_idx_b, int s_idx_m, int s_idx_n, int s_idx_h,
     int s_cnt_b, int s_cnt_m, int s_cnt_h,
     cudaStream_t stream);
+
+#ifdef DFLASH27B_HAVE_BSA
+int launch_bsa_sparse_flash_forward_bf16(
+    const void* Q, const void* K, const void* V, void* O,
+    const int32_t* indices, const int32_t* counts,
+    float scale,
+    int batch, int n_q_heads, int n_k_heads,
+    int seq_len, int head_dim, int block_size,
+    int s_idx_b, int s_idx_m, int s_idx_n, int s_idx_h,
+    int s_cnt_b, int s_cnt_m, int s_cnt_h,
+    cudaStream_t stream);
+#endif
 }
+#endif
+
+// sm_80+ block-select launcher.
+extern "C" {
+void launch_block_select(
+    const float * score,
+    int B, int M, int N, int H,
+    int attention_sink, int window, int last_n_full, float alpha,
+    int s_b, int s_m, int s_n, int s_h,
+    int idx_s_b, int idx_s_m, int idx_s_n, int idx_s_h,
+    int cnt_s_b, int cnt_s_m, int cnt_s_h,
+    int32_t * idx_out, int32_t * cnt_out,
+    cudaStream_t stream);
+}
+
+// F16 kernel launchers (Volta/Turing WMMA: sm_70+; Pascal scalar: sm_6x).
+// Volta/Turing uses WMMA tensor cores; Pascal uses scalar F16×F16→F32.
+#ifdef DFLASH27B_HAVE_VOLTA_FLASHPREFILL
+extern "C" {
+void launch_compute_mean_vector_f16(
+    const void * K, void * mean_K,
+    int batch, int seq_len, int n_kv_heads, int head_dim, int block_size,
+    int s_K_b, int s_K_n, int s_K_h, int s_K_d,
+    int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
+    cudaStream_t stream);
+
+void launch_compute_block_score_f16(
+    const void * Q, const void * mean_K, float sm_scale,
+    void * score, void * score_max,
+    int batch, int n_q_heads, int n_k_heads,
+    int seq_len, int head_dim, int block_size,
+    int s_Q_b, int s_Q_n, int s_Q_h, int s_Q_d,
+    int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
+    int s_S_b, int s_S_m, int s_S_n, int s_S_h,
+    int s_M_b, int s_M_m, int s_M_n, int s_M_h,
+    cudaStream_t stream);
+
+void launch_sparse_flash_forward_f16(
+    const void * Q, const void * K, const void * V, void * O,
+    const int32_t * block_index, const int32_t * counts,
+    float scale,
+    int batch, int n_q_heads, int n_k_heads,
+    int seq_len, int head_dim, int q_tile, int block_size,
+    int s_Q_b, int s_Q_n, int s_Q_h, int s_Q_d,
+    int s_K_b, int s_K_n, int s_K_h, int s_K_d,
+    int s_V_b, int s_V_n, int s_V_h, int s_V_d,
+    int s_O_b, int s_O_n, int s_O_h, int s_O_d,
+    int s_idx_b, int s_idx_m, int s_idx_n, int s_idx_h,
+    int s_cnt_b, int s_cnt_m, int s_cnt_h,
+    cudaStream_t stream);
+
+void launch_block_select_f16(
+    const float * score,
+    int B, int M, int N, int H,
+    int attention_sink, int window, int last_n_full, float alpha,
+    int s_b, int s_m, int s_n, int s_h,
+    int idx_s_b, int idx_s_m, int idx_s_n, int idx_s_h,
+    int cnt_s_b, int cnt_s_m, int cnt_s_h,
+    int32_t * idx_out, int32_t * cnt_out,
+    cudaStream_t stream);
+}
+#endif
+
+// Pascal scalar F16 kernel launchers (sm_6x, no tensor cores).
+// Same API as the F16 WMMA launchers but scalar math.
+// Suffix _pascal to avoid linker clash when both Volta and Pascal
+// variants are compiled into the same binary (multi-arch fatbin).
+#ifdef DFLASH27B_HAVE_PASCAL_FLASHPREFILL
+extern "C" {
+void launch_compute_mean_vector_f16_pascal(
+    const void * K, void * mean_K,
+    int batch, int seq_len, int n_kv_heads, int head_dim, int block_size,
+    int s_K_b, int s_K_n, int s_K_h, int s_K_d,
+    int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
+    cudaStream_t stream);
+
+void launch_compute_block_score_f16_pascal(
+    const void * Q, const void * mean_K, float sm_scale,
+    void * score, void * score_max,
+    int batch, int n_q_heads, int n_k_heads,
+    int seq_len, int head_dim, int block_size,
+    int s_Q_b, int s_Q_n, int s_Q_h, int s_Q_d,
+    int s_mK_b, int s_mK_m, int s_mK_h, int s_mK_d,
+    int s_S_b, int s_S_m, int s_S_n, int s_S_h,
+    int s_M_b, int s_M_m, int s_M_n, int s_M_h,
+    cudaStream_t stream);
+
+void launch_sparse_flash_forward_f16_pascal(
+    const void * Q, const void * K, const void * V, void * O,
+    const int32_t * block_index, const int32_t * counts,
+    float scale,
+    int batch, int n_q_heads, int n_k_heads,
+    int seq_len, int head_dim, int q_tile, int block_size,
+    int s_Q_b, int s_Q_n, int s_Q_h, int s_Q_d,
+    int s_K_b, int s_K_n, int s_K_h, int s_K_d,
+    int s_V_b, int s_V_n, int s_V_h, int s_V_d,
+    int s_O_b, int s_O_n, int s_O_h, int s_O_d,
+    int s_idx_b, int s_idx_m, int s_idx_n, int s_idx_h,
+    int s_cnt_b, int s_cnt_m, int s_cnt_h,
+    cudaStream_t stream);
+
+void launch_block_select_pascal(
+    const float * score,
+    int B, int M, int N, int H,
+    int attention_sink, int window, int last_n_full, float alpha,
+    int s_b, int s_m, int s_n, int s_h,
+    int idx_s_b, int idx_s_m, int idx_s_n, int idx_s_h,
+    int cnt_s_b, int cnt_s_m, int cnt_s_h,
+    int32_t * idx_out, int32_t * cnt_out,
+    cudaStream_t stream);
+}
+#endif
 
 void block_select_host(
     const float * score,
@@ -94,6 +225,9 @@ void block_select_host(
 namespace {
 inline int cdiv(int a, int b) { return (a + b - 1) / b; }
 }
+
+#ifdef DFLASH27B_HAVE_SM80_FLASHPREFILL
+// ── BF16 (sm_80+) dispatch: native BF16 WMMA kernels ──
 
 int flash_prefill_forward_bf16(
     const void * Q, const void * K, const void * V, void * O,
@@ -243,6 +377,251 @@ err:
     if (dCnt) cudaFree(dCnt);
     std::fprintf(stderr, "[flashprefill] cudaMalloc failed: %s\n", cudaGetErrorString(e));
     return -1;
+}
+
+#endif // DFLASH27B_HAVE_SM80_FLASHPREFILL
+
+#ifdef DFLASH27B_HAVE_VOLTA_FLASHPREFILL
+// ── F16 (half) dispatch: same algorithm, F16 WMMA kernels (sm_70) ──
+
+int flash_prefill_forward_f16_volta(
+    const void * Q, const void * K, const void * V, void * O,
+    int batch, int seq_len, int n_q_heads, int n_k_heads, int head_dim,
+    float scale,
+    const FlashPrefillConfig & cfg)
+{
+    const int B = batch;
+    const int S = seq_len;
+    const int H = n_q_heads;
+    const int Hk = n_k_heads;
+    const int D = head_dim;
+    const int BLOCK = cfg.block_size;
+    const int M = cdiv(S, BLOCK);
+    const int N = M;
+    const int Q_TILE = 64;
+
+    int s_Q_b = S * H * D, s_Q_n = H * D, s_Q_h = D, s_Q_d = 1;
+    int s_K_b = S * Hk * D, s_K_n = Hk * D, s_K_h = D, s_K_d = 1;
+    int s_mK_b = M * Hk * D, s_mK_m = Hk * D, s_mK_h = D, s_mK_d = 1;
+    int s_S_b = M * N * H, s_S_m = N * H, s_S_n = H, s_S_h = 1;
+    int s_idx_b = M * N * H, s_idx_m = N * H, s_idx_n = H, s_idx_h = 1;
+    int s_cnt_b = M * H, s_cnt_m = H, s_cnt_h = 1;
+
+    // F16 mean_K (2 bytes per element, same as bf16)
+    void * dmK = nullptr;
+    float * dS = nullptr, * dM = nullptr;
+    int32_t * dIdx = nullptr, * dCnt = nullptr;
+    cudaError_t e;
+    if ((e = cudaMalloc(&dmK,  (size_t)B * M * Hk * D * 2)) != cudaSuccess) goto err;
+    if ((e = cudaMalloc(&dS,   (size_t)B * M * N * H * sizeof(float))) != cudaSuccess) goto err;
+    if ((e = cudaMalloc(&dM,   (size_t)B * M * N * H * sizeof(float))) != cudaSuccess) goto err;
+    if ((e = cudaMalloc(&dIdx, (size_t)B * M * N * H * sizeof(int32_t))) != cudaSuccess) goto err;
+    if ((e = cudaMalloc(&dCnt, (size_t)B * M * H * sizeof(int32_t))) != cudaSuccess) goto err;
+
+    static const bool prof = (std::getenv("DFLASH_FP_PROFILE") != nullptr);
+    cudaEvent_t pE[5];
+    if (prof) for (int i=0;i<5;i++) cudaEventCreate(&pE[i]);
+    if (prof) cudaEventRecord(pE[0]);
+    // 1. mean_K
+    launch_compute_mean_vector_f16(
+        K, dmK, B, S, Hk, D, BLOCK,
+        s_K_b, s_K_n, s_K_h, s_K_d,
+        s_mK_b, s_mK_m, s_mK_h, s_mK_d, 0);
+
+    if (prof) cudaEventRecord(pE[1]);
+    // 2. block scores
+    launch_compute_block_score_f16(
+        Q, dmK, scale, dS, dM,
+        B, H, Hk, S, D, BLOCK,
+        s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+        s_mK_b, s_mK_m, s_mK_h, s_mK_d,
+        s_S_b, s_S_m, s_S_n, s_S_h,
+        s_S_b, s_S_m, s_S_n, s_S_h, 0);
+
+    if (prof) cudaEventRecord(pE[2]);
+    // 3. block_select on GPU.
+    launch_block_select_f16(
+        dS, B, M, N, H,
+        cfg.attention_sink, cfg.window, cfg.last_n_full, cfg.alpha,
+        s_S_b, s_S_m, s_S_n, s_S_h,
+        s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+        s_cnt_b, s_cnt_m, s_cnt_h,
+        dIdx, dCnt, 0);
+
+    if (prof) cudaEventRecord(pE[3]);
+    // 4. sparse flash forward (F16 WMMA)
+    launch_sparse_flash_forward_f16(
+        Q, K, V, O, dIdx, dCnt, scale,
+        B, H, Hk, S, D, Q_TILE, BLOCK,
+        s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+        s_K_b, s_K_n, s_K_h, s_K_d,
+        s_K_b, s_K_n, s_K_h, s_K_d,    // V uses K strides
+        s_Q_b, s_Q_n, s_Q_h, s_Q_d,    // O uses Q strides
+        s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+        s_cnt_b, s_cnt_m, s_cnt_h, 0);
+
+    if (prof) {
+        cudaEventRecord(pE[4]);
+        cudaEventSynchronize(pE[4]);
+        float t1, t2, t3, t4;
+        cudaEventElapsedTime(&t1, pE[0], pE[1]);
+        cudaEventElapsedTime(&t2, pE[1], pE[2]);
+        cudaEventElapsedTime(&t3, pE[2], pE[3]);
+        cudaEventElapsedTime(&t4, pE[3], pE[4]);
+        std::fprintf(stderr,
+            "[fp-prof-f16] S=%d H=%d Hk=%d  mean=%.2fms  score=%.2fms  select=%.2fms  forward=%.2fms\n",
+            S, n_q_heads, n_k_heads, t1, t2, t3, t4);
+        for (int i=0;i<5;i++) cudaEventDestroy(pE[i]);
+    }
+    cudaFree(dmK); cudaFree(dS); cudaFree(dM); cudaFree(dIdx); cudaFree(dCnt);
+    return 0;
+
+err:
+    if (dmK)  cudaFree(dmK);
+    if (dS)   cudaFree(dS);
+    if (dM)   cudaFree(dM);
+    if (dIdx) cudaFree(dIdx);
+    if (dCnt) cudaFree(dCnt);
+    std::fprintf(stderr, "[flashprefill-f16] cudaMalloc failed: %s\n", cudaGetErrorString(e));
+    return -1;
+}
+
+#endif // DFLASH27B_HAVE_VOLTA_FLASHPREFILL
+
+#ifdef DFLASH27B_HAVE_PASCAL_FLASHPREFILL
+// ── F16 (half) scalar dispatch: same algorithm, scalar F16 math (sm_6x) ──
+// No tensor cores on Pascal — all math is F16×F16→F32 scalar.
+
+int flash_prefill_forward_f16_pascal(
+    const void * Q, const void * K, const void * V, void * O,
+    int batch, int seq_len, int n_q_heads, int n_k_heads, int head_dim,
+    float scale,
+    const FlashPrefillConfig & cfg)
+{
+    const int B = batch;
+    const int S = seq_len;
+    const int H = n_q_heads;
+    const int Hk = n_k_heads;
+    const int D = head_dim;
+    const int BLOCK = cfg.block_size;
+    const int M = cdiv(S, BLOCK);
+    const int N = M;
+    const int Q_TILE = 64;
+
+    int s_Q_b = S * H * D, s_Q_n = H * D, s_Q_h = D, s_Q_d = 1;
+    int s_K_b = S * Hk * D, s_K_n = Hk * D, s_K_h = D, s_K_d = 1;
+    int s_mK_b = M * Hk * D, s_mK_m = Hk * D, s_mK_h = D, s_mK_d = 1;
+    int s_S_b = M * N * H, s_S_m = N * H, s_S_n = H, s_S_h = 1;
+    int s_idx_b = M * N * H, s_idx_m = N * H, s_idx_n = H, s_idx_h = 1;
+    int s_cnt_b = M * H, s_cnt_m = H, s_cnt_h = 1;
+
+    void * dmK = nullptr;
+    float * dS = nullptr, * dM = nullptr;
+    int32_t * dIdx = nullptr, * dCnt = nullptr;
+    cudaError_t e;
+    if ((e = cudaMalloc(&dmK,  (size_t)B * M * Hk * D * 2)) != cudaSuccess) goto err;
+    if ((e = cudaMalloc(&dS,   (size_t)B * M * N * H * sizeof(float))) != cudaSuccess) goto err;
+    if ((e = cudaMalloc(&dM,   (size_t)B * M * N * H * sizeof(float))) != cudaSuccess) goto err;
+    if ((e = cudaMalloc(&dIdx, (size_t)B * M * N * H * sizeof(int32_t))) != cudaSuccess) goto err;
+    if ((e = cudaMalloc(&dCnt, (size_t)B * M * H * sizeof(int32_t))) != cudaSuccess) goto err;
+
+    static const bool prof = (std::getenv("DFLASH_FP_PROFILE") != nullptr);
+    cudaEvent_t pE[5];
+    if (prof) for (int i=0;i<5;i++) cudaEventCreate(&pE[i]);
+    if (prof) cudaEventRecord(pE[0]);
+    // 1. mean_K
+    launch_compute_mean_vector_f16_pascal(
+        K, dmK, B, S, Hk, D, BLOCK,
+        s_K_b, s_K_n, s_K_h, s_K_d,
+        s_mK_b, s_mK_m, s_mK_h, s_mK_d, 0);
+
+    if (prof) cudaEventRecord(pE[1]);
+    // 2. block scores
+    launch_compute_block_score_f16_pascal(
+        Q, dmK, scale, dS, dM,
+        B, H, Hk, S, D, BLOCK,
+        s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+        s_mK_b, s_mK_m, s_mK_h, s_mK_d,
+        s_S_b, s_S_m, s_S_n, s_S_h,
+        s_S_b, s_S_m, s_S_n, s_S_h, 0);
+
+    if (prof) cudaEventRecord(pE[2]);
+    // 3. block_select on GPU (Pascal variant).
+    launch_block_select_pascal(
+        dS, B, M, N, H,
+        cfg.attention_sink, cfg.window, cfg.last_n_full, cfg.alpha,
+        s_S_b, s_S_m, s_S_n, s_S_h,
+        s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+        s_cnt_b, s_cnt_m, s_cnt_h,
+        dIdx, dCnt, 0);
+
+    if (prof) cudaEventRecord(pE[3]);
+    // 4. sparse flash forward (scalar F16, no tensor cores)
+    launch_sparse_flash_forward_f16_pascal(
+        Q, K, V, O, dIdx, dCnt, scale,
+        B, H, Hk, S, D, Q_TILE, BLOCK,
+        s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+        s_K_b, s_K_n, s_K_h, s_K_d,
+        s_K_b, s_K_n, s_K_h, s_K_d,
+        s_Q_b, s_Q_n, s_Q_h, s_Q_d,
+        s_idx_b, s_idx_m, s_idx_n, s_idx_h,
+        s_cnt_b, s_cnt_m, s_cnt_h, 0);
+
+    if (prof) {
+        cudaEventRecord(pE[4]);
+        cudaEventSynchronize(pE[4]);
+        float t1, t2, t3, t4;
+        cudaEventElapsedTime(&t1, pE[0], pE[1]);
+        cudaEventElapsedTime(&t2, pE[1], pE[2]);
+        cudaEventElapsedTime(&t3, pE[2], pE[3]);
+        cudaEventElapsedTime(&t4, pE[3], pE[4]);
+        std::fprintf(stderr,
+            "[fp-prof-f16-pascal] S=%d H=%d Hk=%d  mean=%.2fms  score=%.2fms  select=%.2fms  forward=%.2fms\n",
+            S, n_q_heads, n_k_heads, t1, t2, t3, t4);
+        for (int i=0;i<5;i++) cudaEventDestroy(pE[i]);
+    }
+    cudaFree(dmK); cudaFree(dS); cudaFree(dM); cudaFree(dIdx); cudaFree(dCnt);
+    return 0;
+
+err:
+    if (dmK)  cudaFree(dmK);
+    if (dS)   cudaFree(dS);
+    if (dM)   cudaFree(dM);
+    if (dIdx) cudaFree(dIdx);
+    if (dCnt) cudaFree(dCnt);
+    std::fprintf(stderr, "[flashprefill-pascal] cudaMalloc failed: %s\n", cudaGetErrorString(e));
+    return -1;
+}
+
+#endif // DFLASH27B_HAVE_PASCAL_FLASHPREFILL
+
+// ── Runtime dispatch: selects Volta WMMA or Pascal scalar based on GPU ──
+// Both variants may coexist in a multi-arch fatbin; pick at runtime.
+
+int flash_prefill_forward_f16(
+    const void * Q, const void * K, const void * V, void * O,
+    int batch, int seq_len, int n_q_heads, int n_k_heads, int head_dim,
+    float scale,
+    const FlashPrefillConfig & cfg)
+{
+    // Query the current device's compute capability to pick the kernel.
+    int device = 0;
+    cudaGetDevice(&device);
+    cudaDeviceProp prop{};
+    cudaGetDeviceProperties(&prop, device);
+    const int sm = prop.major * 10 + prop.minor;
+
+#if defined(DFLASH27B_HAVE_VOLTA_FLASHPREFILL) && defined(DFLASH27B_HAVE_PASCAL_FLASHPREFILL)
+    if (sm >= 70) return flash_prefill_forward_f16_volta(Q, K, V, O, batch, seq_len, n_q_heads, n_k_heads, head_dim, scale, cfg);
+    return flash_prefill_forward_f16_pascal(Q, K, V, O, batch, seq_len, n_q_heads, n_k_heads, head_dim, scale, cfg);
+#elif defined(DFLASH27B_HAVE_VOLTA_FLASHPREFILL)
+    return flash_prefill_forward_f16_volta(Q, K, V, O, batch, seq_len, n_q_heads, n_k_heads, head_dim, scale, cfg);
+#elif defined(DFLASH27B_HAVE_PASCAL_FLASHPREFILL)
+    return flash_prefill_forward_f16_pascal(Q, K, V, O, batch, seq_len, n_q_heads, n_k_heads, head_dim, scale, cfg);
+#else
+    std::fprintf(stderr, "[flashprefill] no F16 kernel available for sm_%d\n", sm);
+    return -1;
+#endif
 }
 
 } // namespace flashprefill

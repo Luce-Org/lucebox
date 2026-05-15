@@ -1,9 +1,12 @@
-// Graph-building functions for qwen35 target + draft forward passes.
+// Graph-building functions for the qwen35 target forward passes.
 //
 // These create ggml compute graphs for one step (prefill chunk, chain-mode
-// verify, tree-mode verify, draft, or LM-head projection). Each function
-// allocates tensor descriptors, wires the graph via build_qwen35_graph /
-// build_draft_graph, and reserves the gallocr buffer.
+// verify, tree-mode verify, or LM-head projection). Each function
+// allocates tensor descriptors, wires the graph via build_qwen35_graph,
+// and reserves the gallocr buffer.
+//
+// The generic DFlash draft-step graph builder lives in
+// common/dflash_draft_graph.h.
 //
 // The `kq_stride_pad` parameter replaces the old file-scope g_kq_stride_pad
 // global — callers pass it explicitly (default KQ_MASK_PAD, or 256 when TBQ
@@ -12,9 +15,8 @@
 #pragma once
 
 #include "step_graph.h"
-#include "draft_feature_mirror.h"
 #include "attn_masks.h"       // align_up, KQ_MASK_PAD
-#include "internal.h"         // TargetWeights, TargetCache, DraftWeights
+#include "internal.h"         // TargetWeights, TargetCache
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -63,16 +65,6 @@ bool build_target_step_tree(
     int n_tokens,
     int fa_window = 0,
     int kq_stride_pad = KQ_MASK_PAD);
-
-// Draft forward: speculative next-token prediction using target features.
-bool build_draft_step(
-    StepGraph & sg,
-    const DraftWeights & dw,
-    const TargetWeights * tw,   // optional target lm_head
-    ggml_backend_t backend,
-    int ctx_len,
-    const DraftFeatureMirror * mirror = nullptr,
-    int committed = 0);
 
 // LM-head projection: project draft hidden states through the target output matrix.
 bool build_lm_head_projection_step(

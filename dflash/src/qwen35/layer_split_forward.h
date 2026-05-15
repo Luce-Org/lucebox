@@ -7,8 +7,8 @@
 #pragma once
 
 #include "layer_split_types.h"
-#include "draft_ipc.h"
-#include "draft_feature_mirror.h"
+#include "dflash_draft_ipc.h"
+#include "dflash_feature_ring.h"
 #include "step_graph.h"
 
 #include "ggml.h"

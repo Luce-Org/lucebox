@@ -50,11 +50,27 @@ struct FlashPrefillConfig {
 //
 // Scratch memory (allocated/freed per call inside): ~M*M*H*4 * 3 + M*H*4
 // where M = ceil(seq_len/block_size). At S=140K, M≈1093, H=16: ~300 MB.
+//
+// Two implementations:
+//   flash_prefill_forward_bf16 — BF16 WMMA (sm_80+, __nv_bfloat16 m16n16k16)
+//   flash_prefill_forward_f16  — F16 WMMA (sm_70+, half m16n8k16, Volta/Turing)
+// Both share the same scratch allocation and block_select logic.
 int flash_prefill_forward_bf16(
     const void * Q, const void * K, const void * V, void * O,
     int batch, int seq_len, int n_q_heads, int n_k_heads, int head_dim,
     float scale,
     const FlashPrefillConfig & cfg);
+
+// Same as flash_prefill_forward_bf16 but operates on F16 (half) tensors.
+// Uses F16 WMMA (m16n8k16) and cooperative shared-memory loads.
+// Compiled when DFLASH27B_HAVE_VOLTA_FLASHPREFILL is defined.
+#ifdef DFLASH27B_HAVE_VOLTA_FLASHPREFILL
+int flash_prefill_forward_f16(
+    const void * Q, const void * K, const void * V, void * O,
+    int batch, int seq_len, int n_q_heads, int n_k_heads, int head_dim,
+    float scale,
+    const FlashPrefillConfig & cfg);
+#endif
 
 // ggml flash_attn_ext-based implementation for CUDA/HIP builds supported by
 // the selected ggml backend and GPU architecture.

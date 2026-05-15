@@ -181,7 +181,7 @@ DFlash speculative decoding for Qwen3.5/Qwen3.6 27B GGUF targets on a single GPU
 git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
 
 # 2. build the C++/CUDA decoder (CUDA 12+, CMake 3.18+)
-# Default compiles for 75/80/86/89 (+120 on CUDA 12.8+, +sm_121/DGX Spark on CUDA 12.9+, +sm_110/Thor on CUDA 13.0+) so the binary runs on every supported card.
+# Default compiles for Pascal/Volta/Turing/Ampere (60/61/62/70/75/86; +120 on CUDA 12.8+, +sm_121/DGX Spark on CUDA 12.9+, +sm_110/Thor on CUDA 13.0+) so the binary runs on every supported card.
 # 3090-only users can add -DCMAKE_CUDA_ARCHITECTURES=86 to skip the other archs and build faster (~3 min).
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target test_dflash -j
@@ -222,6 +222,8 @@ Supported out of the box; the build just needs the right CUDA toolkit. `dflash/C
 
 | GPU | Arch | Min CUDA | Status |
 |-----|:----:|:--------:|--------|
+| Tesla P40 Pascal | `sm_61` | 12.0 | supported with scalar F16 fallback; needs 24 GB for the 27B stack |
+| Tesla V100 Volta | `sm_70` | 12.0 | supported with F16 WMMA kernels |
 | RTX 3090 Ampere | `sm_86` | 12.0 | **reference, all numbers above** |
 | RTX 2080 Ti Turing | `sm_75` | 12.0 | supported, 53 tok/s DFlash verified (FP16 draft) |
 | RTX 4090 Ada | `sm_89` | 12.0 | should work, unverified, pass `-DCMAKE_CUDA_ARCHITECTURES=89` |

@@ -16,7 +16,7 @@
 #include "common/device_placement.h"
 #include "step_graph.h"
 #include "ddtree.h"
-#include "draft_feature_mirror.h"
+#include "dflash_feature_ring.h"
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights, PrefixSnapshot
 #include "qwen3/qwen3_drafter.h"  // DrafterContext, load_drafter, free_drafter, drafter_score_and_compress
 

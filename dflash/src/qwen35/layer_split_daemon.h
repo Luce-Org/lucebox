@@ -7,9 +7,8 @@
 
 #include "layer_split_types.h"
 #include "layer_split_forward.h"
-#include "spec_decode.h"
-#include "draft_ipc.h"
-#include "draft_feature_mirror.h"
+#include "dflash_draft_ipc.h"
+#include "dflash_feature_ring.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"

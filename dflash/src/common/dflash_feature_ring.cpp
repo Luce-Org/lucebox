@@ -1,11 +1,13 @@
-#include "draft_feature_mirror.h"
+// dflash_feature_ring.cpp — implementation for common DFlash feature ring.
+
+#include "dflash_feature_ring.h"
 #include "peer_access.h"
 
 #include "ggml.h"
 
 // ggml_get_to_fp32_cuda is not in any public header — it lives in
-// ggml-cuda/convert.cuh. Declare the typedef + extern here so that
-// draft_feature_mirror.cpp (and any future src/ consumer) can link against it.
+// ggml-cuda/convert.cuh. Declare the typedef + extern here so we can link
+// against it from this TU.
 using to_fp32_cuda_t = void (*)(const void *, float *, int64_t, cudaStream_t);
 extern "C++" to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 
@@ -68,7 +70,7 @@ bool draft_feature_mirror_init(DraftFeatureMirror & mirror,
                                int n_target_layers,
                                int hidden_size) {
     draft_feature_mirror_free(mirror);
-    if (cap <= 0) return false;
+    if (cap <= 0 || n_target_layers <= 0 || hidden_size <= 0) return false;
     mirror.device = device;
     mirror.target_device = target_device;
     mirror.n_target_layers = n_target_layers;
@@ -111,17 +113,17 @@ bool draft_feature_mirror_can_view(const DraftFeatureMirror & mirror,
     return slot0 + ctx_len <= mirror.cap;
 }
 
-bool draft_feature_mirror_sync_range(const TargetCache & cache,
+bool draft_feature_mirror_sync_range(const ggml_tensor * src_target_feat,
+                                     int src_cap,
                                      DraftFeatureMirror & mirror,
                                      int start_pos,
                                      int n_tokens) {
-    if (!cache.target_feat || !mirror.target_feat || mirror.cap <= 0) return false;
+    if (!src_target_feat || !mirror.target_feat || mirror.cap <= 0 || src_cap <= 0) return false;
     if (n_tokens <= 0) return true;
     if (n_tokens > mirror.cap) return false;
 
     const int fc_in = mirror.n_target_layers * mirror.hidden_size;
-    const int src_cap = cache.target_feat_cap;
-    const size_t src_stride = cache.target_feat->nb[1];
+    const size_t src_stride = src_target_feat->nb[1];
     const size_t dst_stride = mirror.target_feat->nb[1];
 
     int done = 0;
@@ -133,7 +135,7 @@ bool draft_feature_mirror_sync_range(const TargetCache & cache,
         const int run = std::min(n_tokens - done, std::min(src_run, dst_run));
         const size_t elems = (size_t)run * (size_t)fc_in;
         const void * src =
-            (const char *)cache.target_feat->data + (size_t)src_slot * src_stride;
+            (const char *)src_target_feat->data + (size_t)src_slot * src_stride;
         void * dst =
             (char *)mirror.target_feat->data + (size_t)dst_slot * dst_stride;
         auto bf16_to_f32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
@@ -157,12 +159,85 @@ bool draft_feature_mirror_sync_range(const TargetCache & cache,
     return cudaDeviceSynchronize() == cudaSuccess;
 }
 
-bool draft_feature_mirror_sync_tail(const TargetCache & cache,
+bool draft_feature_mirror_sync_tail(const ggml_tensor * src_target_feat,
+                                    int src_cap,
                                     DraftFeatureMirror & mirror,
                                     int committed) {
     if (!mirror.target_feat || committed <= 0) return true;
     const int n = std::min(committed, mirror.cap);
-    return draft_feature_mirror_sync_range(cache, mirror, committed - n, n);
+    return draft_feature_mirror_sync_range(src_target_feat, src_cap, mirror,
+                                           committed - n, n);
+}
+
+// ── Ring ↔ tensor copy helpers ──────────────────────────────────
+
+bool copy_capture_slice_to_draft_ring(
+    DraftFeatureMirror & feature_ring,
+    int capture_idx,
+    const ggml_tensor * act_out,
+    int src_device,
+    int chunk_start,
+    int start_pos,
+    int n_tokens) {
+    if (!feature_ring.target_feat || capture_idx < 0 || n_tokens <= 0 || start_pos < 0) return true;
+    if (feature_ring.cap <= 0) return false;
+    const int hidden = feature_ring.hidden_size;
+    const size_t dst_stride = feature_ring.target_feat->nb[1];
+    const size_t src_stride = act_out->nb[1];
+    const size_t row_bytes = (size_t)hidden * sizeof(float);
+    for (int i = 0; i < n_tokens; i++) {
+        const int slot = (start_pos + i) % feature_ring.cap;
+        const void * src = (const char *)act_out->data +
+            (size_t)(chunk_start + i) * src_stride;
+        void * dst = (char *)feature_ring.target_feat->data +
+            (size_t)slot * dst_stride +
+            (size_t)capture_idx * (size_t)hidden * sizeof(float);
+        if (!copy_peer_async(dst, feature_ring.device, src, src_device, row_bytes)) {
+            return false;
+        }
+    }
+    return cudaDeviceSynchronize() == cudaSuccess;
+}
+
+bool copy_feature_ring_range_to_tensor(
+    const DraftFeatureMirror & feature_ring,
+    ggml_tensor * dst,
+    int start_pos,
+    int n_tokens) {
+    if (!feature_ring.target_feat || !dst || feature_ring.cap <= 0) return false;
+    if (n_tokens <= 0 || n_tokens > feature_ring.cap) return false;
+
+    const int fc_in = feature_ring.n_target_layers * feature_ring.hidden_size;
+    const size_t row_bytes = (size_t)fc_in * sizeof(float);
+    const size_t src_stride = feature_ring.target_feat->nb[1];
+    const size_t dst_stride = dst->nb[1];
+    int done = 0;
+    while (done < n_tokens) {
+        const int slot = (start_pos + done) % feature_ring.cap;
+        const int run = std::min(n_tokens - done, feature_ring.cap - slot);
+        const char * src_base =
+            (const char *)feature_ring.target_feat->data + (size_t)slot * src_stride;
+        char * dst_base = (char *)dst->data + (size_t)done * dst_stride;
+        if (src_stride == row_bytes && dst_stride == row_bytes) {
+            if (!copy_peer_async(dst_base, feature_ring.device,
+                                 src_base, feature_ring.device,
+                                 row_bytes * (size_t)run)) {
+                return false;
+            }
+        } else {
+            for (int i = 0; i < run; i++) {
+                if (!copy_peer_async(dst_base + (size_t)i * dst_stride,
+                                     feature_ring.device,
+                                     src_base + (size_t)i * src_stride,
+                                     feature_ring.device,
+                                     row_bytes)) {
+                    return false;
+                }
+            }
+        }
+        done += run;
+    }
+    return cudaDeviceSynchronize() == cudaSuccess;
 }
 
 }  // namespace dflash27b

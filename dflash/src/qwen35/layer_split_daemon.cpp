@@ -4,6 +4,8 @@
 
 #include "internal.h"
 #include "io_utils.h"
+#include "qwen35_layer_split_dflash_target.h"
+#include "common/dflash_spec_decode.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -48,10 +50,13 @@ bool run_target_layer_split_request(
     }
 
     if (run_dflash && draft_weights && feature_ring && feature_ring->target_feat) {
-        const bool ok = run_target_layer_split_dflash_decode(
-            shards, *draft_weights, draft_backend, draft_gpu, *feature_ring,
-            prompt, n_gen, last_tok, out_path,
-            kq_stride_pad, fa_window, draft_ctx_max, stream_fd);
+        Qwen35LayerSplitDFlashTarget target(shards, feature_ring,
+                                            kq_stride_pad, fa_window,
+                                            /*remote_draft=*/nullptr);
+        const bool ok = run_dflash_spec_decode(
+            target, *draft_weights, draft_backend, *feature_ring,
+            prompt, n_gen, last_tok, out_path, draft_ctx_max, stream_fd,
+            /*remote_draft=*/nullptr);
         stream_emit_fd(stream_fd, -1);
         return ok;
     }

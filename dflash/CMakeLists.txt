@@ -98,13 +98,14 @@ option(DFLASH27B_HIP_SM80_EQUIV
 # (defaulting to gfx1151 / Strix Halo) and pass it through to the HIP
 # toolchain and ggml backend.
 if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-    # Turing (75) and Ampere (86) always; Blackwell consumer (120) and Thor
+    # Pascal (60/61/62), Volta (70), Turing (75) and Ampere (86) always;
+    # Blackwell consumer (120) and Thor
     # (110 on CUDA 13+) added when nvcc supports them. DGX Spark /
     # GB10 is compute capability 12.1 (121), added at CUDA 12.9+.
     if(DFLASH27B_USER_CUDA_ARCHITECTURES)
         set(_dflash27b_archs "${DFLASH27B_USER_CUDA_ARCHITECTURES}")
     else()
-        set(_dflash27b_archs "75;86")
+        set(_dflash27b_archs "60;61;62;70;75;86")
         if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8")
             list(APPEND _dflash27b_archs "120")
         endif()
@@ -221,15 +222,18 @@ add_library(dflash27b STATIC
     src/laguna/laguna_target_graph.cpp
     src/laguna/laguna_daemon.cpp
     src/laguna/laguna_backend.cpp
-    src/qwen35/draft_feature_mirror.cpp
+    src/common/dflash_feature_ring.cpp
+    src/common/dflash_capture.cpp
+    src/common/dflash_draft_ipc.cpp
+    src/common/dflash_draft_ipc_daemon.cpp
+    src/common/dflash_draft_graph.cpp
+    src/common/dflash_spec_decode.cpp
     src/qwen35/graph_builders.cpp
-    src/qwen35/feature_copy.cpp
-    src/qwen35/draft_ipc.cpp
     src/qwen35/layer_split_forward.cpp
     src/qwen35/layer_split_daemon.cpp
-    src/qwen35/spec_decode.cpp
     src/qwen35/qwen35_backend.cpp
     src/qwen35/qwen35_dflash_target.cpp
+    src/qwen35/qwen35_layer_split_dflash_target.cpp
     src/qwen35/layer_split_daemon_loop.cpp
     src/qwen35/qwen35_daemon.cpp
     src/common/sampler.cpp
@@ -272,10 +276,13 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
 endif()
 
 # FlashPrefill custom kernels.
-#   CUDA: BF16 WMMA needs sm_80+; on sm_75 we fall back to ggml flash_attn_ext.
-#   HIP Phase 1 (default): ggml q8 fallback, no custom kernels.
-#   HIP Phase 2 (DFLASH27B_HIP_SM80_EQUIV=ON): rocWMMA-native kernels for the
-#                                              1.7-2.7× compress speedup.
+#   - CUDA sm_80+: BF16 WMMA (m16n16k16) + cp.async — flashprefill_kernels.cu
+#   - CUDA sm_70–sm_79 (Volta/Turing): F16 WMMA (m16n8k16), cooperative loads — flashprefill_f16.cu
+#   - CUDA sm_60–sm_69 (Pascal): scalar F16, no tensor cores — flashprefill_scalar.cu
+#   - HIP Phase 1 (default): ggml q8 fallback, no custom kernels.
+#   - HIP Phase 2 (DFLASH27B_HIP_SM80_EQUIV=ON): rocWMMA-native kernels.
+# The dispatch in qwen3_graph.cpp checks buffer type at runtime:
+#   BF16 buffers → bf16 WMMA kernel; F16 buffers → f16 WMMA kernel; else → ggml FA.
 if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     if(DFLASH27B_HIP_SM80_EQUIV)
         find_path(DFLASH27B_ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp
@@ -304,13 +311,69 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     else()
         message(STATUS "dflash: HIP Phase 1 - ggml q8 fallback for flashprefill")
     endif()
-elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash27b_cuda_min_sm GREATER_EQUAL 80)
+elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     target_sources(dflash27b PRIVATE
-        src/flashprefill_kernels.cu
         src/flashprefill_select.cpp
-        src/flashprefill.cpp
-        src/pflash_ggml_adapter.cpp)
-    target_compile_definitions(dflash27b PRIVATE DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL=1)
+        src/flashprefill.cpp)
+    # Multi-arch: scan all resolved arches and compile every applicable
+    # flashprefill kernel variant.  This lets a single binary run on mixed
+    # GPUs (e.g. Volta sm_70 + Pascal sm_61) without "no kernel image" errors.
+    set(_dflash_has_sm80 OFF)
+    set(_dflash_has_sm70 OFF)
+    set(_dflash_has_sm60 OFF)
+    foreach(_arch IN LISTS _dflash27b_archs)
+        string(REGEX REPLACE "[^0-9]" "" _arch_num "${_arch}")
+        if(_arch_num GREATER_EQUAL 80)
+            set(_dflash_has_sm80 ON)
+        endif()
+        if(_arch_num GREATER_EQUAL 70 AND _arch_num LESS 80)
+            set(_dflash_has_sm70 ON)
+        endif()
+        if(_arch_num GREATER_EQUAL 60 AND _arch_num LESS 70)
+            set(_dflash_has_sm60 ON)
+        endif()
+    endforeach()
+    # Also honour the single-arch path (min_sm) so non-multi builds keep
+    # their existing behaviour when only one tier matches.
+    if(_dflash27b_cuda_min_sm GREATER_EQUAL 80)
+        set(_dflash_has_sm80 ON)
+    elseif(_dflash27b_cuda_min_sm GREATER_EQUAL 70)
+        set(_dflash_has_sm70 ON)
+    elseif(_dflash27b_cuda_min_sm GREATER_EQUAL 60)
+        set(_dflash_has_sm60 ON)
+    endif()
+
+    if(_dflash_has_sm80)
+        target_sources(dflash27b PRIVATE
+            src/flashprefill_kernels.cu
+            src/pflash_ggml_adapter.cpp)
+        target_compile_definitions(dflash27b PRIVATE
+            DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL=1
+            DFLASH27B_HAVE_SM80_FLASHPREFILL=1)
+        # BF16 WMMA kernels require sm_80+.  Restrict compilation to those
+        # arches so nvcc never instantiates m16n16k16 BF16 WMMA on Volta/Pascal.
+        set_source_files_properties(src/flashprefill_kernels.cu PROPERTIES
+            CUDA_ARCHITECTURES "80;86;90;100;110;120;121")
+    endif()
+    if(_dflash_has_sm70)
+        target_sources(dflash27b PRIVATE src/flashprefill_f16.cu)
+        target_compile_definitions(dflash27b PRIVATE
+            DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL=1
+            DFLASH27B_HAVE_VOLTA_FLASHPREFILL=1)
+        # F16 WMMA kernels require sm_70+.  Restrict compilation to Volta/Turing
+        # so nvcuda::wmma is never instantiated for Pascal (sm_60-69).
+        set_source_files_properties(src/flashprefill_f16.cu PROPERTIES
+            CUDA_ARCHITECTURES "70;75")
+    endif()
+    if(_dflash_has_sm60)
+        target_sources(dflash27b PRIVATE src/flashprefill_scalar.cu)
+        target_compile_definitions(dflash27b PRIVATE
+            DFLASH27B_HAVE_CUDA_SCALAR_FLASHPREFILL=1
+            DFLASH27B_HAVE_PASCAL_FLASHPREFILL=1)
+        # Scalar Pascal kernels only target sm_60-69.
+        set_source_files_properties(src/flashprefill_scalar.cu PROPERTIES
+            CUDA_ARCHITECTURES "60;61;62")
+    endif()
 endif()
 
 # BSA needs sm_80+ (FA-2 derived kernel uses BF16 tensor cores). Auto-disable
@@ -552,10 +615,10 @@ if(DFLASH27B_TESTS)
         endif()
     endforeach()
 
-    # Gated on the same condition as src/pflash_ggml_adapter.cpp (see line ~291):
-    # the adapter is only compiled into dflash27b on CUDA + sm>=80, so the test
-    # that calls pflash_register_ggml_kernel() can only link there too.
-    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash27b_cuda_min_sm GREATER_EQUAL 80
+    # Gated on the same condition as src/pflash_ggml_adapter.cpp above:
+    # the adapter is only compiled into dflash27b when the CUDA arch list
+    # includes an sm_80+ target, so this test can only link there too.
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash_has_sm80
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flash_attn_sparse.cpp")
         add_executable(test_flash_attn_sparse test/test_flash_attn_sparse.cpp)
         target_link_libraries(test_flash_attn_sparse PRIVATE dflash27b ggml ggml-cuda ggml-base)

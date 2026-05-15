@@ -1,1 +1,1 @@
-"""Script-side backend/device placement helpers."""
+"""Script-side placement helpers."""

@@ -24,6 +24,13 @@
 //   - K, V shape: [B, S, n_k_heads, D]   (n_q_heads = n_k_heads × group_size for GQA)
 //   - mean_k shape: [B, ceil(S/BLOCK), n_k_heads, D]
 //   - score shape: [B, M, N, n_q_heads]   (M = N = ceil(S/BLOCK))
+//
+// BF16 WMMA fragments are only defined for sm_80+.  In multi-arch fat binaries
+// (for example 75;86) nvcc still parses this translation unit for every target
+// architecture, so guard the device code and launchers the same way the
+// Volta/Pascal variants do.
+
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 
 #include <cstdint>
 #include <cstdlib>
@@ -1041,3 +1048,5 @@ extern "C" void launch_block_select(
 
 } // namespace flashprefill
 } // namespace dflash27b
+
+#endif // !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800

@@ -280,10 +280,11 @@ bool forward_qwen3_drafter_model(
         int64_t d_ql[]  = {(int64_t)D, (int64_t)H,  (int64_t)n_lookahead};
         int64_t d_p[]   = {(int64_t)S};
         int64_t d_mt[]  = {(int64_t)S, (int64_t)n_lookahead};
-        // Use BF16 only when the CUDA WMMA fastpath is compiled. Other CUDA
-        // arches and HIP use F16 with ggml flash_attn_ext for the portable path.
+        // Use BF16 only for sm_80+ (native BF16 tensor cores). Volta/Turing
+        // use F16 with F16 WMMA kernels; other arches and HIP use F16 with
+        // ggml flash_attn_ext for the portable path.
         const ggml_type half_type =
-#ifdef DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL
+#ifdef DFLASH27B_HAVE_SM80_FLASHPREFILL
             GGML_TYPE_BF16;
 #else
             GGML_TYPE_F16;
@@ -485,18 +486,25 @@ bool forward_qwen3_drafter_model(
         }
 
         // ── Attention dispatch ──
-        // Use the ggml FA path (flash_prefill_forward_q8) when the custom kernels
-        // are not compiled in (CUDA SM<80, or HIP Phase 1) or buffers are not BF16.
-        // Use the custom BF16 WMMA / rocWMMA path otherwise.
+        // Three paths:
+        //   1. BF16 WMMA (sm_80+, HIP Phase 2): flash_prefill_forward_bf16
+        //   2. F16 WMMA (Volta/Turing): flash_prefill_forward_f16
+        //   3. ggml flash_attn_ext: fallback for all other cases
         auto tF0 = std::chrono::steady_clock::now();
         const bool use_bf16_fp = (Q_buf.t->type == GGML_TYPE_BF16)
-#if defined(DFLASH27B_HAVE_FLASHPREFILL) || defined(DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL)
+#if defined(DFLASH27B_HAVE_FLASHPREFILL) || defined(DFLASH27B_HAVE_SM80_FLASHPREFILL)
+                                 && true;
+#else
+                                 && false;
+#endif
+        const bool use_f16_fp = (Q_buf.t->type == GGML_TYPE_F16)
+#if defined(DFLASH27B_HAVE_VOLTA_FLASHPREFILL) || defined(DFLASH27B_HAVE_PASCAL_FLASHPREFILL)
                                  && true;
 #else
                                  && false;
 #endif
         if (use_bf16_fp) {
-#if defined(DFLASH27B_HAVE_FLASHPREFILL) || defined(DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL)
+#if defined(DFLASH27B_HAVE_FLASHPREFILL) || defined(DFLASH27B_HAVE_SM80_FLASHPREFILL)
             int rc = flashprefill::flash_prefill_forward_bf16(
                 Q_buf.t->data,
                 K_curr_v[il].t->data,
@@ -510,6 +518,25 @@ bool forward_qwen3_drafter_model(
             cudaError_t e = cudaGetLastError();
             if (e != cudaSuccess) {
                 set_last_error(std::string("flash_prefill cuda error: ") + cudaGetErrorString(e));
+                ggml_gallocr_free(galloc); cleanup_all(); return false;
+            }
+            cudaDeviceSynchronize();
+#endif
+        } else if (use_f16_fp) {
+#if defined(DFLASH27B_HAVE_VOLTA_FLASHPREFILL) || defined(DFLASH27B_HAVE_PASCAL_FLASHPREFILL)
+            int rc = flashprefill::flash_prefill_forward_f16(
+                Q_buf.t->data,
+                K_curr_v[il].t->data,
+                V_curr_v[il].t->data,
+                attn_out_buf.t->data,
+                1, S, H, Hk, D, scale, fp_cfg);
+            if (rc != 0) {
+                set_last_error("flash_prefill_forward_f16 failed at layer " + std::to_string(il));
+                ggml_gallocr_free(galloc); cleanup_all(); return false;
+            }
+            cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess) {
+                set_last_error(std::string("flash_prefill-f16 cuda error: ") + cudaGetErrorString(e));
                 ggml_gallocr_free(galloc); cleanup_all(); return false;
             }
             cudaDeviceSynchronize();

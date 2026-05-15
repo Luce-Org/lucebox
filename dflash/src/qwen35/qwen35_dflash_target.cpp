@@ -2,8 +2,13 @@
 
 #include "qwen35_dflash_target.h"
 #include "graph_builders.h"
+#include "step_graph.h"
 
 namespace dflash27b {
+
+Qwen35DFlashTarget::~Qwen35DFlashTarget() {
+    step_graph_destroy(proj_sg_);
+}
 
 Qwen35DFlashTarget::Qwen35DFlashTarget(
         TargetWeights & w,
