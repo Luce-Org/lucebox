@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -801,8 +802,26 @@ bool Gemma4Backend::decode_dflash(int n_gen,
     // past the accepted prefix (stale KV is overwritten by the next verify pass).
 
     AdaptiveDraftMax adaptive;
-    // draft_max_adaptive knob not in args_ — default disabled (flag: no args field)
-    adaptive.init(/*on=*/false, args_.draft_max_block, draft_w_.block_size);
+    // Adaptive draft-block tuning. Heuristic: enable on MoE only.
+    //   - MoE (Gemma4-26B-A4B, n_layer=30): adaptive @ floor=8 yields
+    //     +1.66x over AR median on the 350W full-power bench (active
+    //     params are small; small batch with high accept dominates).
+    //   - Dense (Gemma4-31B, n_layer=61): adaptive regresses 30-60% on
+    //     hard-to-draft prompts at any floor — chain dm=16 fixed is the
+    //     stronger default because Dense weight reads amortize across the
+    //     full block anyway.
+    bool is_moe = (target_w_.n_layer <= 40);
+    // Bench/debug override: DFLASH_NO_ADAPTIVE=1 forces adaptive off so the
+    // same binary can produce both adapt-ON and adapt-OFF measurements in
+    // a single session.
+    if (const char * e = std::getenv("DFLASH_NO_ADAPTIVE")) {
+        if (e[0] && e[0] != '0') is_moe = false;
+    }
+    adaptive.init(/*on=*/is_moe, args_.draft_max_block, draft_w_.block_size);
+    if (is_moe) {
+        adaptive.min_q = std::min(8, draft_w_.block_size);
+        adaptive.current = std::max(adaptive.current, adaptive.min_q);
+    }
 
     const int mask_tok = draft_w_.mask_token_id;
     // The DFlash noise block fills positions [1..q_len-1] with mask_tok. If the
