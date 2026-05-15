@@ -15,7 +15,7 @@ from server import (
     normalize_stop, first_stop_match,
     PROPS_SCHEMA, SERVER_VERSION,
     _API_ENDPOINTS, _capabilities, _effective_kv_type,
-    _resolve_server_version,
+    _resolve_server_version, _runtime_backend,
 )
 
 
@@ -948,9 +948,10 @@ def test_responses_instructions_and_developer_merged(mock_os_read, mock_pipe,
 # ─── GET /props ────────────────────────────────────────────────────
 
 _PROPS_TOP_KEYS = {
-    "server", "model", "runtime", "reasoning", "speculative",
-    "sampling", "pflash", "prefix_cache", "full_cache", "tool_replay",
-    "daemon", "api",
+    "default_generation_settings", "model_alias", "model_path", "build_info",
+    "speculative_mode", "server", "model", "runtime", "reasoning",
+    "speculative", "sampling", "pflash", "prefix_cache", "full_cache",
+    "tool_replay", "daemon", "api",
 }
 
 
@@ -986,7 +987,42 @@ def test_props_endpoint_shape(client):
     assert body["server"]["props_schema"] == PROPS_SCHEMA
     assert body["server"]["version"] == SERVER_VERSION
     assert body["server"]["name"] == "luce-dflash"
-    assert body["model"]["id"] == MODEL_NAME
+    assert body["model_alias"] == MODEL_NAME
+    assert body["model_path"] == "target.gguf"
+    assert body["build_info"] == f"luce-dflash v{SERVER_VERSION} props_schema={PROPS_SCHEMA}"
+
+
+def test_props_llama_compat_fields(client):
+    body = client.get("/props").json()
+    assert body["default_generation_settings"] == {
+        "n_ctx": 131072,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "repeat_penalty": 1.0,
+    }
+    assert body["runtime"]["backend"]
+    assert body["speculative_mode"] == "dflash"
+    assert body["reasoning"] == {
+        "supported": True,
+        "default": None,
+        "supported_efforts": ["medium"],
+    }
+    assert body["sampling"] == {
+        "capabilities": {
+            "supports_temperature": True,
+            "supports_top_p": True,
+            "supports_top_k": True,
+            "supports_frequency_penalty": True,
+            "supports_seed": True,
+        },
+    }
+    assert "max_ctx" not in body["runtime"]
+    assert "id" not in body["model"]
+    assert "target_path" not in body["model"]
+    assert all(not key.startswith("supports_") for key in body["sampling"])
+    assert "default_enabled" not in body["reasoning"]
 
 
 def test_props_version_reads_pyproject():
@@ -1005,6 +1041,23 @@ def test_props_version_falls_back_when_pyproject_missing(tmp_path, monkeypatch):
     assert _resolve_server_version() == "0.0.0+unknown"
 
 
+def test_runtime_backend_prefers_env(monkeypatch):
+    monkeypatch.setenv("DFLASH_RUNTIME_BACKEND", "HIP")
+    assert _runtime_backend(Path("missing")) == "hip"
+
+
+def test_runtime_backend_reads_cmake_cache(tmp_path, monkeypatch):
+    monkeypatch.delenv("DFLASH_RUNTIME_BACKEND", raising=False)
+    monkeypatch.delenv("DFLASH27B_GPU_BACKEND", raising=False)
+    build_dir = tmp_path / "build"
+    build_dir.mkdir()
+    (build_dir / "CMakeCache.txt").write_text(
+        "DFLASH27B_GPU_BACKEND:STRING=hip\n",
+        encoding="utf-8",
+    )
+    assert _runtime_backend(build_dir / "test_dflash") == "hip"
+
+
 def test_props_arch_qwen35(client):
     body = client.get("/props").json()
     assert body["model"]["arch"] == "qwen35"
@@ -1019,9 +1072,14 @@ def test_props_arch_laguna(mock_tokenizer):
     body = TestClient(app).get("/props").json()
     assert body["model"]["arch"] == "laguna"
     assert body["model"]["draft_path"] is None
-    assert body["reasoning"]["supported"] is False
+    assert body["reasoning"] == {
+        "supported": False,
+        "default": None,
+        "supported_efforts": [],
+    }
     assert body["speculative"]["enabled"] is False
     assert body["speculative"]["ddtree_budget"] is None
+    assert body["speculative_mode"] == "off"
 
 
 def test_props_pflash_disabled(client):
@@ -1056,6 +1114,7 @@ def test_props_pflash_enabled(mock_tokenizer, monkeypatch):
     assert p["drafter_gguf"] == "/tmp/drafter.gguf"
     assert p["bsa_enabled"] is True
     assert p["bsa_alpha"] == pytest.approx(0.85)
+    assert body["speculative_mode"] == "pflash"
 
 
 def test_props_target_sharding_disables_caches(mock_tokenizer):

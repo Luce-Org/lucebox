@@ -195,6 +195,46 @@ def _parse_optional_float(env_name: str) -> float | None:
         return None
 
 
+def _runtime_backend(bin_path: Path) -> str:
+    """Best-effort compute backend tag for /props.
+
+    The Python server does not yet have a daemon build-info handshake, so read
+    the same CMake cache knob that selected the test_dflash backend. Operators
+    can override this for unusual deployments.
+    """
+    for env_name in ("DFLASH_RUNTIME_BACKEND", "DFLASH27B_GPU_BACKEND"):
+        raw = os.environ.get(env_name)
+        if raw:
+            return raw.lower()
+
+    candidates = []
+    try:
+        bin_dir = Path(bin_path).resolve().parent
+    except OSError:
+        bin_dir = Path(bin_path).parent
+    candidates.append(bin_dir / "CMakeCache.txt")
+    candidates.append(ROOT / "build" / "CMakeCache.txt")
+
+    seen: set[Path] = set()
+    for cache_path in candidates:
+        if cache_path in seen:
+            continue
+        seen.add(cache_path)
+        try:
+            text = cache_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        match = re.search(r"^DFLASH27B_GPU_BACKEND:[^=]*=(\w+)$", text, re.MULTILINE)
+        if match:
+            return match.group(1).lower()
+        if re.search(r"^GGML_HIP:[^=]*=ON$", text, re.MULTILINE):
+            return "hip"
+        if re.search(r"^GGML_CUDA:[^=]*=ON$", text, re.MULTILINE):
+            return "cuda"
+
+    return "cuda"
+
+
 def _pflash_props(cfg: "PrefillConfig | None") -> dict:
     if cfg is None or not cfg.enabled:
         return {
@@ -929,21 +969,45 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         tokenizer_id = getattr(tokenizer, "name_or_path", None)
         if not isinstance(tokenizer_id, str):
             tokenizer_id = None
+        server = {
+            "name": "luce-dflash",
+            "version": SERVER_VERSION,
+            "props_schema": PROPS_SCHEMA,
+        }
+        pflash_props = _pflash_props(prefill_cfg)
+        speculative_enabled = caps["speculative_supported"]
+        if pflash_props["enabled"]:
+            speculative_mode = "pflash"
+        elif speculative_enabled:
+            speculative_mode = "dflash"
+        else:
+            speculative_mode = "off"
+        reasoning_default = None
+        reasoning_efforts = ["medium"] if caps["reasoning_supported"] else []
         body = {
-            "server": {
-                "name": "luce-dflash",
-                "version": SERVER_VERSION,
-                "props_schema": PROPS_SCHEMA,
+            "default_generation_settings": {
+                "n_ctx": max_ctx,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "top_k": 0,
+                "min_p": 0.0,
+                "repeat_penalty": 1.0,
             },
+            "model_alias": MODEL_NAME,
+            "model_path": str(target),
+            "build_info": (
+                f"{server['name']} v{server['version']} "
+                f"props_schema={server['props_schema']}"
+            ),
+            "speculative_mode": speculative_mode,
+            "server": server,
             "model": {
-                "id": MODEL_NAME,
                 "arch": arch,
-                "target_path": str(target),
                 "draft_path": str(draft) if draft is not None else None,
                 "tokenizer_id": tokenizer_id,
             },
             "runtime": {
-                "max_ctx": max_ctx,
+                "backend": _runtime_backend(bin_path),
                 "fa_window": _fa_window,
                 "kv_cache_k": _effective_kv_type("k", arch),
                 "kv_cache_v": _effective_kv_type("v", arch),
@@ -958,20 +1022,23 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             },
             "reasoning": {
                 "supported": caps["reasoning_supported"],
-                "default_enabled": caps["reasoning_supported"],
+                "default": reasoning_default,
+                "supported_efforts": reasoning_efforts,
             },
             "speculative": {
-                "enabled": caps["speculative_supported"],
-                "ddtree_budget": budget if caps["speculative_supported"] else None,
+                "enabled": speculative_enabled,
+                "ddtree_budget": budget if speculative_enabled else None,
             },
             "sampling": {
-                "supports_temperature": True,
-                "supports_top_p": True,
-                "supports_top_k": True,
-                "supports_frequency_penalty": True,
-                "supports_seed": True,
+                "capabilities": {
+                    "supports_temperature": True,
+                    "supports_top_p": True,
+                    "supports_top_k": True,
+                    "supports_frequency_penalty": True,
+                    "supports_seed": True,
+                },
             },
-            "pflash": _pflash_props(prefill_cfg),
+            "pflash": pflash_props,
             "prefix_cache": prefix_stats,
             "full_cache": full_stats,
             "tool_replay": tool_stats,
