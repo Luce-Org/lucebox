@@ -51,6 +51,19 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant).
 | RTX 5090 | Qwen 3.6-27B Q4_K_M (DFlash + DDTree) | — | **4.84×** vs AR (205 tok/s) |
 | Ryzen AI MAX+ 395 (gfx1151) | Qwen 3.5-27B Q4_K_M (DFlash + PFlash, HIP) | **2.24×** @ 16K | **3.08×** vs llama.cpp HIP AR (37 tok/s) |
 
+## Client harnesses
+
+[`harness/`](harness/) contains RTX 3090 client launchers and regression tests
+for Lucebox server compatibility. Use it to run Lucebox inside Claude Code,
+Codex, OpenCode, Hermes, Pi, OpenClaw, or Open WebUI, or to check that a server
+change still works with those clients.
+
+```bash
+harness/clients/run_codex.sh
+harness/clients/run_claude_code.sh
+python3 harness/client_test_runner.py probe --url http://127.0.0.1:8000
+```
+
 ## 01 · Megakernel Qwen3.5 0.8B on RTX 3090
 
 Single-kernel CUDA inference for Qwen 3.5-0.8B on RTX 3090. All 24 layers run in one persistent dispatch.

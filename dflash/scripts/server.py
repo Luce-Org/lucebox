@@ -231,6 +231,16 @@ def parse_reasoning(
     return _strip_leading_think_closers(content), (reasoning.strip() or None)
 
 
+def _thinking_enabled(template_kwargs: dict | None) -> bool:
+    """Return whether Qwen think blocks are enabled for this rendered prompt."""
+    return bool((template_kwargs or {}).get("enable_thinking", False))
+
+
+def prompt_starts_in_thinking(prompt: str) -> bool:
+    """True when the chat template ended by opening a think block."""
+    return bool(re.search(r"<think>\s*$", prompt))
+
+
 def _find_tool_properties(tools, function_name):
     """Returns the parameters dict for a given function name, or {}."""
     for t in tools or []:
@@ -448,9 +458,65 @@ def _content_to_str(content: "str | list[dict] | None") -> str:
         return content
     parts = []
     for block in content:
-        if isinstance(block, dict) and block.get("type") == "text":
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") in ("text", "input_text", "output_text"):
             parts.append(block.get("text", ""))
+        elif block.get("type") == "tool_result":
+            value = block.get("content", "")
+            parts.append(_content_to_str(value) if isinstance(value, list) else str(value))
     return "".join(parts)
+
+
+def _normalize_anthropic_system(system_text: str | None) -> str | None:
+    if not system_text:
+        return None
+    if os.environ.get("DFLASH_ANTHROPIC_RAW_SYSTEM", "0") == "1":
+        return system_text
+    # Claude Code's default system prompt is written for Claude and can be tens
+    # of thousands of tokens once skills/reminders are expanded. Qwen handles
+    # the Anthropic Messages route much more reliably with a compact adapter
+    # prompt while still receiving the user's message and advertised tools.
+    if (
+        "x-anthropic-billing-header:" in system_text
+        or "Claude Agent SDK" in system_text
+        or "Claude Code" in system_text
+    ):
+        return (
+            "You are a concise coding assistant running behind an Anthropic "
+            "Messages compatible client. Answer the user's request directly. "
+            "Use the provided tools only when they are needed."
+        )
+    return system_text
+
+
+def _normalize_anthropic_user_text(text: str) -> str:
+    if os.environ.get("DFLASH_ANTHROPIC_RAW_USER", "0") == "1":
+        return text
+
+    def replace_reminder(match: re.Match[str]) -> str:
+        block = match.group(0)
+        # Claude Code may inject long skill-selection reminders for Claude's
+        # own skill runtime. They are not useful to Qwen and can dominate the
+        # prompt. Keep ordinary user/system-reminder context such as dates.
+        if "SKIP:" in block and ("- init:" in block or "- review:" in block):
+            return ""
+        return block
+
+    return re.sub(
+        r"<system-reminder>.*?</system-reminder>",
+        replace_reminder,
+        text,
+        flags=re.DOTALL,
+    )
+
+
+def _json_args_obj(args: str) -> dict:
+    try:
+        value = json.loads(args or "{}")
+        return value if isinstance(value, dict) else {"value": value}
+    except Exception:
+        return {"_raw": args}
 
 
 # ─── pydantic schemas ──────────────────────────────────────────────
@@ -478,6 +544,27 @@ class ChatMessage(BaseModel):
 class ToolDef(BaseModel):
     type: str = "function"
     function: dict  # {name, description, parameters: {...JSON schema...}}
+
+
+def _anthropic_tools_to_openai(tools: list[dict] | None) -> list[ToolDef] | None:
+    if not tools:
+        return None
+    out: list[ToolDef] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name")
+        if not name:
+            continue
+        out.append(ToolDef(type="function", function={
+            "name": name,
+            "description": tool.get("description", ""),
+            "parameters": tool.get("input_schema") or tool.get("parameters") or {
+                "type": "object",
+                "properties": {},
+            },
+        }))
+    return out or None
 
 
 # Default cap when the client omits ``max_tokens``. Override at start via
@@ -515,6 +602,8 @@ class AnthropicMessagesRequest(BaseModel):
     max_tokens: int
     messages: list[AnthropicMessage]
     system: str | list[dict] | None = None
+    tools: list[dict] | None = None
+    tool_choice: Any | None = None
     stream: bool = False
     temperature: float | None = None
     top_p: float | None = None
@@ -604,6 +693,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
               prefill_cache_slots: int = 4,
               prefill_cache_bytes: int = 0,
               arch: str = "qwen35",
+              verify_mode: str = "ddtree",
               extra_daemon_args: list[str] | None = None,
               lazy_draft: bool = False,
               verbose_daemon: bool = False) -> FastAPI:
@@ -667,9 +757,17 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         if draft is None:
             raise SystemExit("qwen35 arch requires --draft <draft.gguf|model.safetensors>")
         cmd = [bin_abs, str(target), str(draft), "--daemon",
-               "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
                f"--max-ctx={max_ctx}",
                f"--stream-fd={stream_fd_val}"]
+        if verify_mode == "ddtree":
+            cmd.append("--fast-rollback")
+            cmd.extend(["--ddtree", f"--ddtree-budget={budget}"])
+        elif verify_mode == "fast":
+            cmd.append("--fast-rollback")
+        elif verify_mode == "seq":
+            cmd.append("--seq-verify")
+        elif verify_mode != "replay":
+            raise SystemExit(f"unknown verify_mode={verify_mode}")
         if extra_daemon_args:
             cmd.extend(extra_daemon_args)
     if sys.platform == "win32":
@@ -1123,7 +1221,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 prefix_cache.confirm_inline_snap(*snap_prep, cur_ids)
             elif snap_prep:
                 prefix_cache.abort_inline_snap(snap_prep[0])
-                log.warning("inline snapshot ack missing — dropped slot reservation")
+                log.warning("inline snapshot ack missing - dropped slot reservation")
         else:
             # Abort: release the reservation without registering.
             if full_snap_prep is not None:
@@ -1550,20 +1648,95 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
     def _tokenize_anthropic(req: AnthropicMessagesRequest
                             ) -> tuple[Path, list[int], list[dict], bool]:
-        msgs = []
+        chat_messages: list[ChatMessage] = []
         system_text = _content_to_str(req.system) if req.system else None
+        system_text = _normalize_anthropic_system(system_text)
         if system_text:
-            msgs.append({"role": "system", "content": system_text})
+            chat_messages.append(ChatMessage(role="system", content=system_text))
         for m in req.messages:
-            msgs.append({"role": m.role, "content": _content_to_str(m.content)})
-        path, ids, prompt = _render_messages(msgs, req.chat_template_kwargs)
+            if isinstance(m.content, list):
+                text_parts: list[str] = []
+                tool_calls: list[ToolCall] = []
+                for block in m.content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "text":
+                        text_parts.append(_normalize_anthropic_user_text(block.get("text", "")))
+                    elif btype == "tool_use":
+                        tool_calls.append(ToolCall(
+                            id=block.get("id"),
+                            type="function",
+                            function=ToolCallFunction(
+                                name=block.get("name", ""),
+                                arguments=json.dumps(block.get("input") or {}),
+                            ),
+                        ))
+                    elif btype == "tool_result":
+                        if text_parts:
+                            chat_messages.append(ChatMessage(
+                                role=m.role, content="".join(text_parts)))
+                            text_parts = []
+                        value = block.get("content", "")
+                        chat_messages.append(ChatMessage(
+                            role="tool",
+                            tool_call_id=block.get("tool_use_id", ""),
+                            content=_content_to_str(value) if isinstance(value, list) else str(value),
+                        ))
+                if tool_calls:
+                    chat_messages.append(ChatMessage(
+                        role="assistant",
+                        content=("".join(text_parts) or None),
+                        tool_calls=tool_calls,
+                    ))
+                elif text_parts:
+                    chat_messages.append(ChatMessage(role=m.role, content="".join(text_parts)))
+            else:
+                chat_messages.append(ChatMessage(
+                    role=m.role,
+                    content=_normalize_anthropic_user_text(_content_to_str(m.content)),
+                ))
+
+        tools = _anthropic_tools_to_openai(req.tools)
+        chat_req = ChatRequest(
+            model=req.model or MODEL_NAME,
+            messages=chat_messages,
+            max_tokens=req.max_tokens,
+            temperature=req.temperature,
+            top_p=req.top_p,
+            seed=req.seed,
+            frequency_penalty=req.frequency_penalty,
+            stop=req.stop_sequences,
+            tools=tools,
+            tool_choice=req.tool_choice,
+            chat_template_kwargs=req.chat_template_kwargs or {"enable_thinking": True},
+        )
+        path, ids, msgs, _ = _tokenize_prompt(chat_req)
+        prompt = tokenizer.decode(ids, skip_special_tokens=False)
         think = _thinking_enabled(req.chat_template_kwargs) and prompt_starts_in_thinking(prompt)
         return path, ids, msgs, think
 
     @app.post("/v1/messages")
     async def anthropic_messages(req: AnthropicMessagesRequest):
+        # Keep local Anthropic-compatible decoding deterministic by default.
+        # The route can still honor client sampling with
+        # DFLASH_ANTHROPIC_ALLOW_SAMPLING=1.
+        if os.environ.get("DFLASH_ANTHROPIC_ALLOW_SAMPLING", "0") != "1":
+            req.temperature = 0.0
         prompt_bin, prompt_ids, raw_msgs, started_in_thinking = _tokenize_anthropic(req)
         msg_id = "msg_" + uuid.uuid4().hex[:24]
+        t0 = time.monotonic()
+        prompt_len = len(prompt_ids)
+        n_tools = len(req.tools) if req.tools else 0
+        log.info(
+            "messages %s  stream=%s  msgs=%d  tools=%d  "
+            "prompt_tokens=%d  max_tokens=%d  effective_max_tokens=%d  "
+            "temperature=%s  max_ctx=%d  model=%s",
+            msg_id, req.stream, len(req.messages), n_tools,
+            prompt_len, req.max_tokens, _max_tokens_for(req), req.temperature,
+            max_ctx,
+            req.model or MODEL_NAME,
+        )
 
         if req.stream:
             async def sse() -> AsyncIterator[str]:
@@ -1631,42 +1804,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         return
 
                     out_tokens = 0
-                    window, mode = "", ("reasoning" if started_in_thinking else "content")
-                    block_index = 0
-                    active_kind = "thinking" if mode == "reasoning" else "text"
-                    block = {"type": active_kind}
-                    if active_kind == "thinking":
-                        block["thinking"] = ""
-                    else:
-                        block["text"] = ""
-                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': block})}\n\n"
+                    tokens: list[int] = []
                     try:
                         async for tok_id in _astream_tokens(r_pipe, gen_len, timing):
                             out_tokens += 1
-                            outputs, window, mode = consume_stream_piece(
-                                window, mode, tokenizer.decode([tok_id]))
-                            for kind, text in outputs:
-                                target_kind = "thinking" if kind == "reasoning_content" else "text"
-                                if target_kind != active_kind:
-                                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
-                                    block_index += 1
-                                    active_kind = target_kind
-                                    new_block = {"type": active_kind, active_kind: ""}
-                                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': new_block})}\n\n"
-                                delta_type = "thinking_delta" if target_kind == "thinking" else "text_delta"
-                                delta_key = "thinking" if target_kind == "thinking" else "text"
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': delta_type, delta_key: text}})}\n\n"
-                        for kind, text in flush_stream_deltas(window, mode):
-                            target_kind = "thinking" if kind == "reasoning_content" else "text"
-                            if target_kind != active_kind:
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
-                                block_index += 1
-                                active_kind = target_kind
-                                new_block = {"type": active_kind, active_kind: ""}
-                                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': new_block})}\n\n"
-                            delta_type = "thinking_delta" if target_kind == "thinking" else "text_delta"
-                            delta_key = "thinking" if target_kind == "thinking" else "text"
-                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': delta_type, delta_key: text}})}\n\n"
+                            tokens.append(tok_id)
                     finally:
                         if timing.get("daemon_done"):
                             if full_hit is None:
@@ -1686,13 +1828,68 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         prompt_ids, cur_bin, cur_ids, inline_snap_ok)
                     _park_draft_if_lazy(timing)
 
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+                    text = tokenizer.decode(tokens, skip_special_tokens=True)
+                    cleaned, tool_calls = parse_tool_calls(
+                        text, tools=_anthropic_tools_to_openai(req.tools))
+                    _remember_tool_call_text(text, tool_calls)
+                    cleaned, reasoning = parse_reasoning(
+                        cleaned,
+                        thinking_enabled=_thinking_enabled(req.chat_template_kwargs),
+                        started_in_thinking=started_in_thinking,
+                    )
+
+                    block_index = 0
+                    emitted_block = False
+
+                    async def emit_text_block(kind: str, value: str):
+                        nonlocal block_index, emitted_block
+                        block = {"type": kind, kind: ""}
+                        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': block})}\n\n"
+                        delta_type = "thinking_delta" if kind == "thinking" else "text_delta"
+                        delta_key = "thinking" if kind == "thinking" else "text"
+                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': delta_type, delta_key: value}})}\n\n"
+                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+                        block_index += 1
+                        emitted_block = True
+
+                    if reasoning:
+                        async for event in emit_text_block("thinking", reasoning):
+                            yield event
+                    if cleaned:
+                        async for event in emit_text_block("text", cleaned):
+                            yield event
+                    for tc in tool_calls:
+                        args = tc["function"]["arguments"]
+                        block = {
+                            "type": "tool_use",
+                            "id": tc["id"],
+                            "name": tc["function"]["name"],
+                            "input": {},
+                        }
+                        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': block})}\n\n"
+                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'input_json_delta', 'partial_json': args}})}\n\n"
+                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+                        block_index += 1
+                        emitted_block = True
+                    if not emitted_block:
+                        async for event in emit_text_block("text", ""):
+                            yield event
+
                     msg_delta = {
                         "type": "message_delta",
-                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                        "delta": {"stop_reason": "tool_use" if tool_calls else "end_turn",
+                                  "stop_sequence": None},
                         "usage": {"output_tokens": out_tokens},
                     }
                     yield f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n"
+                    finish_reason = "tool_use" if tool_calls else "end_turn"
+                    elapsed = time.monotonic() - t0
+                    tok_s = out_tokens / elapsed if elapsed > 0 else 0.0
+                    log.info(
+                        "messages DONE %s  in=%d out=%d  %.1fs  %.1f tok/s  finish=%s  %s",
+                        msg_id, prompt_len, out_tokens, elapsed, tok_s,
+                        finish_reason, _timing_summary(timing, out_tokens),
+                    )
                     yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
             return StreamingResponse(sse(), media_type="text/event-stream")
@@ -1764,21 +1961,43 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             except Exception: pass
 
         text = tokenizer.decode(tokens, skip_special_tokens=True)
+        cleaned, tool_calls = parse_tool_calls(
+            text, tools=_anthropic_tools_to_openai(req.tools))
+        _remember_tool_call_text(text, tool_calls)
         cleaned, reasoning = parse_reasoning(
-            text,
+            cleaned,
             thinking_enabled=_thinking_enabled(req.chat_template_kwargs),
             started_in_thinking=started_in_thinking,
         )
-        content = [{"type": "text", "text": cleaned}]
+        content = []
         if reasoning:
             content.insert(0, {"type": "thinking", "thinking": reasoning})
+        if cleaned:
+            content.append({"type": "text", "text": cleaned})
+        for tc in tool_calls:
+            content.append({
+                "type": "tool_use",
+                "id": tc["id"],
+                "name": tc["function"]["name"],
+                "input": _json_args_obj(tc["function"]["arguments"]),
+            })
+        if not content:
+            content.append({"type": "text", "text": ""})
+        finish_reason = "tool_use" if tool_calls else "end_turn"
+        elapsed = time.monotonic() - t0
+        tok_s = len(tokens) / elapsed if elapsed > 0 else 0.0
+        log.info(
+            "messages DONE %s  in=%d out=%d  %.1fs  %.1f tok/s  finish=%s  %s",
+            msg_id, prompt_len, len(tokens), elapsed, tok_s, finish_reason,
+            _timing_summary(timing, len(tokens)),
+        )
         return JSONResponse({
             "id": msg_id,
             "type": "message",
             "role": "assistant",
             "model": req.model or MODEL_NAME,
             "content": content,
-            "stop_reason": "end_turn",
+            "stop_reason": finish_reason,
             "stop_sequence": None,
             "usage": {"input_tokens": prompt_len,
                       "output_tokens": len(tokens)},
@@ -2260,22 +2479,39 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         for tc in tool_calls:
                             tool_call_active = True
                             tc_item_id = tc["id"]
-                            # Emit function_call_arguments.delta for each tool call
+                            output_index = len(final_output) + 1
+                            in_progress_item = {
+                                "type": "function_call",
+                                "id": tc_item_id,
+                                "status": "in_progress",
+                                "call_id": tc_item_id,
+                                "name": tc["function"]["name"],
+                                "arguments": "",
+                            }
+                            yield _resp_sse("response.output_item.added", {
+                                "output_index": output_index,
+                                "item": in_progress_item,
+                            })
                             yield _resp_sse("response.function_call_arguments.delta", {
-                                "item_id": tc_item_id, "output_index": 0,
+                                "item_id": tc_item_id, "output_index": output_index,
                                 "delta": tc["function"]["arguments"]})
                             yield _resp_sse("response.function_call_arguments.done", {
-                                "item_id": tc_item_id, "output_index": 0,
+                                "item_id": tc_item_id, "output_index": output_index,
                                 "arguments": tc["function"]["arguments"],
                                 "name": tc["function"]["name"]})
-                            final_output.append({
+                            done_item = {
                                 "type": "function_call",
                                 "id": tc_item_id,
                                 "status": "completed",
                                 "call_id": tc_item_id,
                                 "name": tc["function"]["name"],
                                 "arguments": tc["function"]["arguments"],
+                            }
+                            yield _resp_sse("response.output_item.done", {
+                                "output_index": output_index,
+                                "item": done_item,
                             })
+                            final_output.append(done_item)
                     else:
                         accumulated_text += tool_buffer
                         yield _resp_sse("response.output_text.delta", {
@@ -2292,22 +2528,20 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     "part": {"type": "output_text", "text": accumulated_text,
                              "annotations": []}})
 
+                message_item = {
+                    "type": "message",
+                    "id": msg_item_id,
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": ([{"type": "output_text", "text": accumulated_text,
+                                  "annotations": []}] if accumulated_text else []),
+                }
                 if not tool_call_active:
-                    final_output.append({
-                        "type": "message",
-                        "id": msg_item_id,
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": accumulated_text,
-                                     "annotations": []}],
-                    })
+                    final_output.append(message_item)
 
                 yield _resp_sse("response.output_item.done", {
                     "output_index": 0,
-                    "item": final_output[0] if final_output else {
-                        "type": "message", "id": msg_item_id,
-                        "status": "completed", "role": "assistant",
-                        "content": []}})
+                    "item": message_item})
 
                 # response.completed
                 shell = _resp_shell(response_id, chat_req.model, created_at,
@@ -2359,6 +2593,10 @@ def main():
     ap.add_argument("--draft",  type=Path, default=DEFAULT_DRAFT_ROOT)
     ap.add_argument("--bin",    type=Path, default=DEFAULT_BIN)
     ap.add_argument("--budget", type=int,  default=DEFAULT_BUDGET)
+    ap.add_argument("--verify-mode", choices=["ddtree", "fast", "seq", "replay"],
+                    default="ddtree",
+                    help="Qwen daemon verify mode: ddtree (default), fast "
+                         "rollback, sequential verify, or replay rollback.")
     default_ctx = 16384
     ap.add_argument("--max-ctx", type=int, default=default_ctx,
                     help=f"Maximum context length (default: {default_ctx}; "
@@ -2485,6 +2723,7 @@ def main():
                     prefill_cache_slots=placement.prefill_cache_slots,
                     prefill_cache_bytes=args.prefill_cache_bytes,
                     arch=arch,
+                    verify_mode=args.verify_mode,
                     extra_daemon_args=placement.daemon_args or None,
                     lazy_draft=args.lazy_draft,
                     verbose_daemon=args.verbose_daemon)

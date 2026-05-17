@@ -1,0 +1,5 @@
+{"id":"exact-marker","description":"Basic deterministic marker generation.","prompt":"Reply with exactly: LUCEBOX_BENCH_OK","expect_contains":["LUCEBOX_BENCH_OK"]}
+{"id":"arithmetic","description":"Small arithmetic with terse answer.","prompt":"Compute 17 * 23. Reply with only the integer.","expect_contains":["391"]}
+{"id":"json-marker","description":"Structured output check.","messages":[{"role":"system","content":"Return only compact JSON. Do not use markdown."},{"role":"user","content":"Return JSON with status ok and marker LUCEBOX_JSON_OK."}],"expect_contains":["LUCEBOX_JSON_OK","status"]}
+{"id":"short-code","description":"Short code generation check.","prompt":"Write a Python function named add_pair(a, b) that returns the sum. End your answer with BENCH_DONE.","expect_contains":["def add_pair","BENCH_DONE"]}
+{"id":"needle-short","description":"Short context retrieval check.","prompt":"Context: build id alpha-839 is the only release candidate. Ignore build id beta-102 because it was cancelled. What is the release candidate build id? Reply with the id only.","expect_contains":["alpha-839"]}
