@@ -305,8 +305,8 @@ __global__ void sparse_flash_forward_kernel_f16(
                     int j = k_lo + row8;
                     half2 * dst = reinterpret_cast<half2*>(KV_sh + row8 * D_HEAD + d8 * 8);
                     if (j < seq_len) {
-                        const half2 * src = reinterpret_cast<const half2*>(Kp)
-                            + (size_t)j * s_K_n + (size_t)(d8 * 8);
+                        const half2 * src = reinterpret_cast<const half2*>(
+                            Kp + (size_t)j * s_K_n + (size_t)(d8 * 8));
                         dst[0] = src[0]; dst[1] = src[1];
                         dst[2] = src[2]; dst[3] = src[3];
                     } else {
@@ -474,8 +474,8 @@ __global__ void sparse_flash_forward_kernel_f16(
                     int j = k_lo + row8;
                     half2 * dst = reinterpret_cast<half2*>(KV_sh + row8 * D_HEAD + d8 * 8);
                     if (j < seq_len) {
-                        const half2 * src = reinterpret_cast<const half2*>(Vp)
-                            + (size_t)j * s_V_n + (size_t)(d8 * 8);
+                        const half2 * src = reinterpret_cast<const half2*>(
+                            Vp + (size_t)j * s_V_n + (size_t)(d8 * 8));
                         dst[0] = src[0]; dst[1] = src[1];
                         dst[2] = src[2]; dst[3] = src[3];
                     } else {
