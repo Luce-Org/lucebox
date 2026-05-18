@@ -9,7 +9,10 @@
 #include "common/sampler.h"
 #include "common/io_utils.h"
 #include "common/restore_delta.h"
+#include "common/mtp_chain_runner.h"
+#include "common/mtp_orchestrator.h"
 #include "qwen3/qwen3_drafter.h"
+#include "qwen36/qwen36_mtp.h"
 
 #include "ggml-cuda.h"
 
@@ -60,7 +63,7 @@ bool Qwen35Backend::init() {
     }
     std::printf("[target] %s\n", dflash27b_last_error());
 
-    // Load draft
+    // Load draft (skipped in MTP mode — mtp_gguf_path replaces the draft)
     if (cfg_.draft_path) {
         std::string dp(cfg_.draft_path);
         bool draft_ok = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
@@ -81,10 +84,23 @@ bool Qwen35Backend::init() {
         }
     }
 
-    // Create KV cache
-    const int max_verify_tokens = cfg_.ddtree_mode
-        ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
-        : dw_.block_size;
+    // Create KV cache.
+    // MTP mode: size for max(gamma+1, ddtree_budget+1) verify tokens so the
+    // speculative verify batch fits even without a DFlash draft block size.
+    // DFlash mode: existing logic uses dw_.block_size.
+    int max_verify_tokens = 0;
+    if (cfg_.mtp_gguf_path) {
+        const int mtp_gamma_eff = std::max(1, cfg_.mtp_gamma);
+        const int budget_eff    = cfg_.ddtree_mode ? cfg_.ddtree_budget : 0;
+        max_verify_tokens = std::max(mtp_gamma_eff + 1, budget_eff + 1);
+        // Ensure at least DFLASH27B_DRAFT_BLOCK_SIZE so internal buffers
+        // allocated by create_target_cache are sized conservatively.
+        max_verify_tokens = std::max(max_verify_tokens, DFLASH27B_DRAFT_BLOCK_SIZE);
+    } else {
+        max_verify_tokens = cfg_.ddtree_mode
+            ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
+            : dw_.block_size;
+    }
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
@@ -101,6 +117,13 @@ bool Qwen35Backend::init() {
                                        DFLASH27B_DRAFT_N_TARGET_LAYERS,
                                        DFLASH27B_TARGET_HIDDEN)) {
             std::fprintf(stderr, "warning: feature mirror init failed, spec decode will use AR fallback\n");
+        }
+    }
+
+    // Init MTP speculator when configured.
+    if (cfg_.mtp_gguf_path) {
+        if (!init_mtp_()) {
+            return false;
         }
     }
 
@@ -324,6 +347,18 @@ DFlashTarget * Qwen35Backend::dflash_target() {
     return dflash_target_.get();
 }
 
+// ── Test/bench integration hooks ────────────────────────────────────────
+
+bool Qwen35Backend::ensure_decode_cache(int max_verify_tokens) {
+    return migrate_prefill_cache(w_, cfg_.device.max_ctx,
+                                 max_verify_tokens,
+                                 target_backend_, cache_);
+}
+
+ggml_context * Qwen35Backend::tensor_context() const {
+    return w_.ctx;
+}
+
 // ── Shutdown ────────────────────────────────────────────────────────────
 
 void Qwen35Backend::shutdown() {
@@ -364,17 +399,19 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
     // position-addressed and will be overwritten during prefill.
     reset_recurrent_state(cache_);
 
-    // Prefill
-    auto t_prefill_start = std::chrono::steady_clock::now();
-    const int committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
-    if (committed < 0) {
-        result.error = "prefill";
-        return result;
+    // MTP path: delegate to common orchestrator. Cache was already sized in
+    // init_mtp_() — no per-request migrate (idempotent no-op).
+    if (supports_mtp()) {
+        return common::mtp::warm_and_decode(this, req, io);
     }
-    auto t_prefill_end = std::chrono::steady_clock::now();
-    result.prefill_s = std::chrono::duration<double>(t_prefill_end - t_prefill_start).count();
 
-    // Decode (speculative)
+    // DFlash / AR path
+    auto t_prefill_start = std::chrono::steady_clock::now();
+    int committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
+    if (committed < 0) { result.error = "prefill"; return result; }
+    result.prefill_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_prefill_start).count();
+
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
         if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io)) {
@@ -384,7 +421,6 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
         result.decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
-
     result.ok = true;
     return result;
 }
@@ -418,13 +454,30 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
     // only the delta at KV positions [snap_pos, snap_pos + delta.size()).
     int committed = snap_pos;
     const int prompt_len = (int)req.prompt.size();
+    std::vector<float> all_prefill_hidden;
+
     if (prompt_len > snap_pos) {
         auto t_prefill_start = std::chrono::steady_clock::now();
         std::vector<int32_t> delta = restore_prompt_delta(req.prompt, snap_pos);
-        committed = do_prefill(delta, out_io, req.snap_pos, req.snap_slot, /*kv_offset=*/snap_pos);
-        if (committed < 0) {
-            result.error = "prefill";
-            return result;
+
+        if (supports_mtp()) {
+            // MTP path: prefill delta via DFlashTarget::verify_batch so hidden
+            // states are captured for warm_mtp_for_prompt_.
+            committed = do_mtp_prefill_(delta, all_prefill_hidden, /*kv_offset=*/snap_pos);
+            if (committed < 0) {
+                result.error = "mtp_prefill";
+                return result;
+            }
+            if (!warm_mtp_for_prompt_(req.prompt, all_prefill_hidden, cache_.last_tok)) {
+                result.error = "mtp_warm";
+                return result;
+            }
+        } else {
+            committed = do_prefill(delta, out_io, req.snap_pos, req.snap_slot, /*kv_offset=*/snap_pos);
+            if (committed < 0) {
+                result.error = "prefill";
+                return result;
+            }
         }
         result.prefill_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_prefill_start).count();
@@ -438,7 +491,10 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
     // Decode
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
-        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io)) {
+        bool ok = supports_mtp()
+            ? do_mtp_decode_(committed, req.n_gen, result.tokens, io)
+            : do_spec_decode(committed, req.n_gen, result.tokens, out_io);
+        if (!ok) {
             result.error = "decode";
             return result;
         }
@@ -860,6 +916,288 @@ int Qwen35Backend::verify_chain(int committed, const int32_t * draft_tok, int q_
 int Qwen35Backend::verify_tree(int committed, const DDTree & tree) {
     (void)committed; (void)tree;
     return 0;
+}
+
+// ── MTP init helper ─────────────────────────────────────────────────────────
+//
+// Mirrors run_qwen36_mtp_harness lines 728-746: construct Qwen36MtpModule,
+// load weights from the fused GGUF sharing the backbone tensor context,
+// then attach to the DFlashTarget adapter.
+//
+// Called from init() when cfg_.mtp_gguf_path != nullptr.
+
+bool Qwen35Backend::init_mtp_() {
+    // Ensure the DFlashTarget adapter exists (lazy-built); the MTP module
+    // needs it for attach() and for reading last_hidden() during decode.
+    DFlashTarget * target = dflash_target();
+    if (!target) {
+        std::fprintf(stderr, "[mtp] dflash_target() unavailable\n");
+        return false;
+    }
+
+    mtp_module_ = std::make_unique<mtp::Qwen36MtpModule>();
+    std::string err;
+    // Use the two-arg init that shares the backbone ggml_context so MTP
+    // tensors are mapped from the same memory arena as the target weights.
+    if (!mtp_module_->init(cfg_.mtp_gguf_path, tensor_context(), target, err)) {
+        std::fprintf(stderr, "[mtp] init failed: %s\n", err.c_str());
+        mtp_module_.reset();
+        return false;
+    }
+
+    if (!mtp_module_->attach(target)) {
+        std::fprintf(stderr, "[mtp] attach(target) failed\n");
+        mtp_module_.reset();
+        return false;
+    }
+
+    // Single source of truth for γ: bind to module at attach time. Orchestrator
+    // + runner read module->effective_gamma() — no parallel storage. This is
+    // why the regression in PR #214's earlier orchestrator (which silently used
+    // module->max_gamma()) cannot happen by construction once this is in place.
+    mtp_module_->set_effective_gamma(cfg_.mtp_gamma);
+
+    // Pre-size the rollback cache once for the MTP gamma chosen at attach.
+    // Per momus audit of cubic#3257248868: hoisting out of generate() makes
+    // the OOM-on-first-request → nullptr ssm_intermediate → segfault path
+    // unreachable (max_ctx + γ are config-time constants; check return here
+    // where we can fail backend init cleanly).
+    const int gamma_eff = (cfg_.mtp_gamma > 0) ? cfg_.mtp_gamma : 3;
+    if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
+                               std::max(gamma_eff + 1, DFLASH27B_DRAFT_BLOCK_SIZE),
+                               target_backend_, cache_)) {
+        std::fprintf(stderr, "[mtp] migrate_prefill_cache failed (max_ctx=%d gamma=%d)\n",
+                     cfg_.device.max_ctx, gamma_eff);
+        mtp_module_.reset();
+        return false;
+    }
+
+    if (cfg_.mtp_draft_source && std::strcmp(cfg_.mtp_draft_source, "mtp_topk") == 0) {
+        mtp_module_->set_draft_topk(std::max(1, cfg_.mtp_draft_topk));
+    }
+
+    std::printf("[mtp] loaded gamma=%d source=%s\n",
+                cfg_.mtp_gamma,
+                cfg_.mtp_draft_source ? cfg_.mtp_draft_source : "chain");
+    std::fflush(stdout);
+    return true;
+}
+
+// ── MTP warm helper ──────────────────────────────────────────────────────────
+//
+// Mirrors run_qwen36_mtp_harness lines 783-792: seed the MTP module with the
+// backbone's final post-norm hidden after prefill, then warm the head KV cache
+// over all prefill positions.
+//
+// prompt             : full prompt token sequence (length N)
+// all_prefill_hidden : backbone post-norm hiddens [N * hidden_size], F32
+// prefill_next       : backbone argmax at end of prefill (t_{N})
+//
+// Returns false on failure; the caller (Phase 4's do_prefill hook or generate)
+// should treat this as an error.
+
+bool Qwen35Backend::warm_mtp_for_prompt_(const std::vector<int32_t> & prompt,
+                                          const std::vector<float>    & all_prefill_hidden,
+                                          int32_t                       prefill_next) {
+    if (!mtp_module_) return true;  // MTP not configured — no-op
+
+    DFlashTarget * target = dflash_target();
+
+    // Seed with the backbone's final hidden for the last prefill token.
+    if (target && target->last_hidden()) {
+        mtp_module_->set_initial_hidden(target->last_hidden(), target->hidden_size());
+    }
+
+    // Warm the head KV cache if we have the full-sequence hiddens.
+    if (!all_prefill_hidden.empty() && prefill_next >= 0) {
+        if (!mtp_module_->warm_head_kv(prompt.data(),
+                                        static_cast<int>(prompt.size()),
+                                        prefill_next,
+                                        all_prefill_hidden.data())) {
+            std::fprintf(stderr, "[mtp] warm_head_kv failed\n");
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// ── MTP prefill helper ───────────────────────────────────────────────────────
+//
+// Routes chunked prefill through DFlashTarget::verify_batch instead of the
+// raw build_target_step path in do_prefill.  This populates last_hidden_seq
+// on the Qwen35DFlashTarget so warm_mtp_for_prompt_ has per-position hidden
+// states for warm_head_kv.  kv_offset > 0 means we are resuming after a
+// snapshot restore (same semantics as do_prefill's kv_offset).
+//
+// Returns the committed KV position (== kv_offset + tokens.size()) or -1
+// on failure.
+
+int Qwen35Backend::do_mtp_prefill_(const std::vector<int32_t> & tokens,
+                                    std::vector<float>          & all_prefill_hidden_out,
+                                    int                           kv_offset) {
+    const int prompt_len = (int)tokens.size();
+    if (prompt_len == 0) return kv_offset;
+
+    DFlashTarget * target = dflash_target();
+    if (!target) {
+        std::fprintf(stderr, "[mtp_prefill] dflash_target unavailable\n");
+        return -1;
+    }
+
+    // Cast to the concrete type to enable hidden-sequence capture.  Safe
+    // because Qwen35Backend always constructs a Qwen35DFlashTarget via
+    // dflash_target().
+    auto * q35target = static_cast<Qwen35DFlashTarget *>(target);
+
+    // Ensure the rollback cache exists (needed for verify_batch's chain-capture
+    // plumbing and for do_mtp_decode_'s snapshot_kv/restore_kv calls).
+    const int gamma_eff = (cfg_.mtp_gamma > 0) ? cfg_.mtp_gamma : 3;
+    migrate_prefill_cache(w_, cfg_.device.max_ctx,
+                          std::max(gamma_eff + 1, DFLASH27B_DRAFT_BLOCK_SIZE),
+                          target_backend_, cache_);
+
+    // Enable full-sequence hidden capture so last_hidden_seq is populated
+    // after each verify_batch chunk.  Switch back to LAST_ROW_ONLY after
+    // prefill so decode-side chain verifies only pay one-row download cost.
+    q35target->enable_hidden_seq_capture(true);
+    q35target->set_hidden_capture_mode(Qwen35DFlashTarget::VerifyCaptureMode::FULL_SEQ);
+
+    const int hidden = target->hidden_size();
+    all_prefill_hidden_out.resize((size_t)prompt_len * hidden);
+
+    int prefill_ubatch = 512;
+    if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
+        prefill_ubatch = std::max(1, std::atoi(s));
+    }
+
+    int committed = kv_offset;
+    int32_t last_tok = -1;
+
+    for (int start = 0; start < prompt_len;) {
+        const int n = std::min(prefill_ubatch, prompt_len - start);
+        const int kv_pos = kv_offset + start;
+
+        std::vector<int32_t> chunk(tokens.begin() + start,
+                                   tokens.begin() + start + n);
+
+        // verify_batch handles: embed, positions, mask, compute, argmax,
+        // last_hidden, last_hidden_seq.  It also advances cache_.cur_pos.
+        if (!target->verify_batch(chunk, kv_pos, last_tok, nullptr)) {
+            std::fprintf(stderr, "[mtp_prefill] verify_batch failed at kv_pos=%d\n", kv_pos);
+            q35target->enable_hidden_seq_capture(false);
+            return -1;
+        }
+
+        // Collect per-chunk hidden states into all_prefill_hidden_out.
+        int n_chunk = 0;
+        const float * h_seq = target->last_hidden_seq(&n_chunk);
+        if (h_seq && n_chunk == n) {
+            std::memcpy(all_prefill_hidden_out.data() + (size_t)start * hidden,
+                        h_seq,
+                        sizeof(float) * (size_t)n * hidden);
+        } else {
+            std::fprintf(stderr,
+                "[mtp_prefill] hidden seq missing: expected %d tokens, got %d\n",
+                n, n_chunk);
+            // Non-fatal — warm_head_kv will be skipped with an empty hidden buffer.
+            all_prefill_hidden_out.clear();
+        }
+
+        committed = kv_pos + n;
+        start    += n;
+    }
+
+    // Record last token for do_mtp_decode_ (mirrors do_prefill's cache_.last_tok).
+    cache_.last_tok = last_tok;
+
+    // Switch to LAST_ROW_ONLY for decode phase — subsequent chain-runner
+    // verify_batch calls only need hidden_at_pos(base_pos - 1).
+    q35target->set_hidden_capture_mode(Qwen35DFlashTarget::VerifyCaptureMode::LAST_ROW_ONLY);
+
+    return committed;
+}
+
+// ── MTP decode helper ────────────────────────────────────────────────────────
+//
+// Drives MtpChainRunner after prefill.  Mirrors harness lines 826-841 (chain
+// path only — mtp_topk is Phase 4 out-of-scope).
+//
+// Emits tokens via io.emit per token (req.stream=true inside the runner), and
+// a terminal io.emit(-1) is issued by the runner.  The caller must NOT emit
+// additional -1 tokens.
+//
+// Returns false on failure; caller sets result.error = "decode".
+
+bool Qwen35Backend::do_mtp_decode_(int committed, int n_gen,
+                                    std::vector<int32_t> & out_tokens,
+                                    const DaemonIO & io) {
+    if (!mtp_module_) return false;
+    if (n_gen <= 0) {
+        io.emit(-1);
+        return true;
+    }
+
+    // The argmax produced at the end of prefill — this is the first generated
+    // token (matches harness line 806: generated.push_back(prefill_next)).
+    const int32_t prefill_next = cache_.last_tok;
+    if (prefill_next < 0) {
+        std::fprintf(stderr, "[mtp_decode] prefill_next invalid (%d)\n", prefill_next);
+        return false;
+    }
+
+    // Emit the prefill token immediately.
+    out_tokens.push_back(prefill_next);
+    io.emit(prefill_next);
+    if (IS_EOS_TOK(prefill_next, w_)) {
+        io.emit(-1);
+        return true;
+    }
+    if (n_gen == 1) {
+        io.emit(-1);
+        return true;
+    }
+
+    DFlashTarget * target = dflash_target();
+    if (!target) {
+        std::fprintf(stderr, "[mtp_decode] dflash_target unavailable\n");
+        return false;
+    }
+
+    const int gamma = (cfg_.mtp_gamma > 0) ? cfg_.mtp_gamma : 3;
+
+    // MtpChainRunner with stream=true: the runner calls io.emit() per accepted
+    // token and issues io.emit(-1) on completion.  No double-emit needed here.
+    GenerateRequest req_inner;
+    req_inner.n_gen     = n_gen - 1;   // prefill_next already consumed
+    req_inner.stream    = true;
+    req_inner.do_sample = false;
+    req_inner.sampler   = sampler_;
+
+    mtp::MtpChainRunner runner(*mtp_module_, *target, sampler_);
+    GenerateResult res = runner.run(req_inner, io, prefill_next, committed, gamma);
+
+    if (!res.ok) {
+        std::fprintf(stderr, "[mtp_decode] chain runner failed: %s\n", res.error.c_str());
+        return false;
+    }
+
+    // Append tokens the runner emitted (runner already streamed them via io.emit).
+    for (int32_t t : res.tokens) {
+        out_tokens.push_back(t);
+    }
+
+    // Log acceptance stats (mirrors harness stderr line 1109).
+    const auto & st = runner.stats();
+    if (st.total_iters > 0) {
+        std::fprintf(stderr,
+            "[mtp_decode] iters=%d proposed=%d accepted=%d emitted=%d accept_rate=%.2f\n",
+            st.total_iters, st.total_proposed, st.total_accepted, st.total_emitted,
+            st.total_proposed > 0
+                ? (double)st.total_accepted / (double)st.total_proposed : 0.0);
+    }
+
+    return true;
 }
 
 }  // namespace dflash27b

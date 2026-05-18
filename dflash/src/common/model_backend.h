@@ -23,6 +23,10 @@ namespace dflash27b {
 // Return true to continue generation, false to abort.
 using TokenCallback = std::function<bool(int32_t token)>;
 
+// Forward-declare MTP module so the optional mtp() accessor below
+// doesn't pull mtp_interface.h into every backend.
+namespace mtp { struct IMtpModule; }
+
 // ─── I/O handle passed to backend methods that need protocol output ─────
 struct DaemonIO {
     int stream_fd = -1;
@@ -145,6 +149,19 @@ struct ModelBackend {
     // Return the DFlashTarget adapter for this backend. Only valid when
     // supports_dflash_spec_decode() returns true. Default returns nullptr.
     virtual class DFlashTarget * dflash_target() { return nullptr; }
+
+    // ── MTP speculative decode support ───────────────────────────────
+    // Returns true if this backend has an MTP module bolted on (Gemma4's
+    // external drafter, Qwen3.6's native heads, or any future MTP impl).
+    // The MTP path is orthogonal to DFlash: both may be supported by the
+    // same backend (caller picks via request method).
+    virtual bool supports_mtp() const { return false; }
+
+    // Return the IMtpModule adapter for this backend. Only valid when
+    // supports_mtp() returns true. Default returns nullptr.
+    // Forward-declared to avoid a header dependency from model_backend.h
+    // on mtp_interface.h — backends include both as needed.
+    virtual mtp::IMtpModule * mtp() { return nullptr; }
 
     // ── Cleanup ──────────────────────────────────────────────────────
     // Release all resources (weights, cache, snapshots, drafter).

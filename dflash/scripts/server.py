@@ -734,7 +734,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
               verify_mode: str = "ddtree",
               extra_daemon_args: list[str] | None = None,
               lazy_draft: bool = False,
-              verbose_daemon: bool = False) -> FastAPI:
+              verbose_daemon: bool = False,
+              mtp_gguf: Path | None = None,
+              mtp_gamma: int = 3,
+              mtp_draft_source: str = "chain",
+              mtp_draft_topk: int = 1) -> FastAPI:
     import asyncio
     if _extra_daemon_has_target_sharding(extra_daemon_args):
         if prefix_cache_slots > 0 or prefill_cache_slots > 0:
@@ -791,6 +795,19 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         cmd = [bin_abs, str(target), "--daemon",
                f"--max-ctx={max_ctx}",
                f"--stream-fd={stream_fd_val}"]
+    elif mtp_gguf is not None:
+        # MTP mode: no --draft (MTP head lives inside target or mtp_gguf),
+        # no DFlash flags. Daemon dispatches to MTP code path via --mtp-gguf.
+        cmd = [bin_abs, str(target), "--daemon",
+               f"--max-ctx={max_ctx}",
+               f"--stream-fd={stream_fd_val}",
+               f"--mtp-gguf={mtp_gguf}",
+               f"--gamma={mtp_gamma}",
+               "--draft-source", mtp_draft_source]
+        if mtp_draft_source == "mtp_topk":
+            cmd.append(f"--draft-topk={mtp_draft_topk}")
+        if extra_daemon_args:
+            cmd.extend(extra_daemon_args)
     else:
         if draft is None:
             raise SystemExit("qwen35 arch requires --draft <draft.gguf|model.safetensors>")
@@ -2737,6 +2754,20 @@ def main():
                     help="Pass --draft-feature-mirror to test_dflash (safe cross-GPU feature path)")
     ap.add_argument("--peer-access", action="store_true",
                     help="Pass --peer-access to test_dflash (prefer P2P memcpy when available)")
+    # ── MTP (Multi-Token Prediction) speculator ──────────────────────────────
+    # When --mtp-gguf is set, the daemon runs MTP-head speculation instead of
+    # DFlash+DDTree. --draft is ignored (the MTP head is in the same GGUF as
+    # target, or a separate fused GGUF). Prefix-cache slots are auto-disabled
+    # in MTP mode because RESTORE does not snapshot MTP head KV yet.
+    ap.add_argument("--mtp-gguf", type=Path, default=None,
+                    help="Path to MTP-fused GGUF. When set, daemon runs MTP "
+                         "speculation; --draft and DFlash flags are ignored.")
+    ap.add_argument("--mtp-gamma", type=int, default=3,
+                    help="MTP chain depth (default 3; recommended D=3 per matrix bench)")
+    ap.add_argument("--mtp-draft-source", choices=["chain", "mtp_topk"], default="chain",
+                    help="MTP draft generation strategy (default chain)")
+    ap.add_argument("--mtp-draft-topk", type=int, default=1,
+                    help="Top-K for mtp_topk draft source (default 1, ignored for chain)")
     add_cli_flags(ap)
     args = ap.parse_args()
     prefill_cfg = config_from_args(args)
@@ -2782,6 +2813,17 @@ def main():
         # through the laguna daemon now, so --prefill-compression and
         # --prefix-cache-slots behave the same as on the qwen35 path.
         draft = None
+    elif args.mtp_gguf is not None:
+        # MTP mode: --draft is ignored; MTP head lives in the target (or in --mtp-gguf
+        # if separate). Force prefix/prefill cache off — RESTORE doesn't snapshot
+        # MTP head KV yet (planned for a follow-up PR).
+        if not args.mtp_gguf.is_file():
+            raise SystemExit(f"--mtp-gguf not found at {args.mtp_gguf}")
+        draft = None
+        if args.prefix_cache_slots > 0 or args.prefill_cache_slots > 0:
+            print("  [cfg] MTP mode: disabling prefix/prefill cache (MTP head KV snapshot not implemented)")
+            args.prefix_cache_slots = 0
+            args.prefill_cache_slots = 0
     else:
         draft = resolve_draft(args.draft) if args.draft.is_dir() else args.draft
         if not draft.is_file():
@@ -2813,7 +2855,11 @@ def main():
                     verify_mode=args.verify_mode,
                     extra_daemon_args=placement.daemon_args or None,
                     lazy_draft=args.lazy_draft,
-                    verbose_daemon=args.verbose_daemon)
+                    verbose_daemon=args.verbose_daemon,
+                    mtp_gguf=args.mtp_gguf,
+                    mtp_gamma=args.mtp_gamma,
+                    mtp_draft_source=args.mtp_draft_source,
+                    mtp_draft_topk=args.mtp_draft_topk)
 
     import uvicorn
     logging.basicConfig(

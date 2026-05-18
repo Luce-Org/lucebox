@@ -19,6 +19,7 @@
 #include "dflash_feature_ring.h"
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights, PrefixSnapshot
 #include "qwen3/qwen3_drafter.h"  // DrafterContext, load_drafter, free_drafter, drafter_score_and_compress
+#include "qwen36/qwen36_mtp.h"    // Qwen36MtpModule
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -26,6 +27,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <vector>
 
 namespace dflash27b {
 
@@ -54,6 +56,12 @@ struct Qwen35Config {
     float        ddtree_temp     = 1.0f;
     bool         ddtree_chain_seed = true;
     bool         use_feature_mirror = false;
+
+    // MTP (Multi-Token Prediction) speculator — mutually exclusive with draft
+    const char * mtp_gguf_path    = nullptr;   // path to fused MTP GGUF (or nullptr = DFlash)
+    int          mtp_gamma        = 0;         // max speculation depth
+    const char * mtp_draft_source = nullptr;   // "chain" | "mtp_topk" | nullptr -> "chain"
+    int          mtp_draft_topk   = 1;         // top-k for mtp_topk mode
 };
 
 // ── Backend class ───────────────────────────────────────────────────────
@@ -101,6 +109,16 @@ public:
     bool supports_dflash_spec_decode() const override { return true; }
     DFlashTarget * dflash_target() override;
 
+    // Test/bench integration hooks for native-head MTP. These keep the
+    // Qwen3.6 MTP harness on the backend-owned target/cache/context without
+    // exposing the frozen common interfaces.
+    bool ensure_decode_cache(int max_verify_tokens);
+    ggml_context * tensor_context() const;
+
+    // MTP speculator accessors (ModelBackend interface).
+    bool                   supports_mtp() const override { return mtp_module_ != nullptr; }
+    mtp::IMtpModule *      mtp()                override { return mtp_module_.get(); }
+
     void shutdown() override;
 
 private:
@@ -144,6 +162,9 @@ private:
     // ── DFlashTarget adapter (lazy-built) ────────────────────────────
     std::unique_ptr<DFlashTarget> dflash_target_;
 
+    // ── MTP speculator (optional, set when cfg_.mtp_gguf_path != nullptr) ──
+    std::unique_ptr<mtp::Qwen36MtpModule> mtp_module_;
+
     // ── Internal helpers ─────────────────────────────────────────────
     // Prefill a prompt and return the number of tokens committed to KV.
     // kv_offset > 0 resumes from a restored snapshot: tokens are placed at
@@ -168,6 +189,31 @@ private:
 
     // DDTree tree-mode verify.
     int verify_tree(int committed, const DDTree & tree);
+
+    // MTP init: load and attach the Qwen36MtpModule. Called from init() when
+    // cfg_.mtp_gguf_path is set. Returns false on failure.
+    bool init_mtp_();
+
+    // MTP warm: seed the head KV cache after prefill. Mirrors harness lines
+    // 783-792: set_initial_hidden + warm_head_kv. prefill_next is the argmax
+    // token produced by the last prefill chunk.
+    bool warm_mtp_for_prompt_(const std::vector<int32_t> & prompt,
+                              const std::vector<float>    & all_prefill_hidden,
+                              int32_t                       prefill_next);
+
+    // MTP prefill: chunked prefill via DFlashTarget::verify_batch, collecting
+    // all_prefill_hidden for each chunk so warm_mtp_for_prompt_ can seed the
+    // head KV cache. Returns committed KV position (>= 0) or -1 on error.
+    // kv_offset > 0 resumes from a snapshot (same semantics as do_prefill).
+    int do_mtp_prefill_(const std::vector<int32_t> & tokens,
+                        std::vector<float>          & all_prefill_hidden_out,
+                        int                           kv_offset = 0);
+
+    // MTP decode: drive MtpChainRunner after prefill. Emits tokens via io.emit
+    // (including the terminal -1). Returns false on error.
+    bool do_mtp_decode_(int committed, int n_gen,
+                        std::vector<int32_t> & out_tokens,
+                        const DaemonIO & io);
 };
 
 }  // namespace dflash27b
