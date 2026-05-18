@@ -10,6 +10,8 @@
 #include "model_backend.h"
 #include "mtp_interface.h"
 
+#include <functional>
+
 namespace dflash27b {
 
 class DFlashTarget;
@@ -34,12 +36,19 @@ namespace mtp {
 //   4. Stream tokens through io.emit() and append them to
 //      result.tokens. Emit the terminal -1 sentinel.
 //
+// `on_warm_done`, when non-null, fires exactly once after warm_head_kv
+// succeeds and before the chain runner starts. Backends use this to save a
+// prefix-cache snapshot capturing the post-warm state — the only correct
+// moment to do so, because chain decode mutates cache_.cur_pos beyond
+// prompt_len. Must be no-op when MTP is not native-heads (flavor check).
+//
 // Returns a GenerateResult populated with tokens / prefill_s / decode_s.
 // On any failure, .ok = false and .error describes the cause (matches
 // the daemon log's "err <message>" line).
 GenerateResult warm_and_decode(ModelBackend * backend,
                                 const GenerateRequest & req,
-                                const DaemonIO & io);
+                                const DaemonIO & io,
+                                std::function<void()> on_warm_done = {});
 
 }  // namespace mtp
 }  // namespace common

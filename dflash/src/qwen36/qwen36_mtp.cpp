@@ -74,6 +74,8 @@ inline double prof_ms_since(prof_clock::time_point t0) {
 
 namespace {
 
+constexpr size_t kMtpHeadKvSnapshotMaxBytes = 500ull * 1024ull * 1024ull;
+
 // RMSNorm: out[i] = x[i] / rms(x) * weight[i]
 // All operations in-place on a separate output buffer.
 static void rmsnorm_cpu(const float * x,
@@ -472,7 +474,9 @@ struct Qwen36MtpModule::State {
     // warm_head_kv() fills slots [1, n_prompt] post-prefill; each step_batch()
     // call writes its draft K/V at slot (base_pos + h) inside the cgraph.
     std::vector<HeadKvBuffer> head_kv;
-    int                       n_ctx = 0;   // allocated slots per head
+    std::vector<int>          head_kv_pos;
+    int                       n_ctx     = 0;   // allocated slots per head
+    int                       n_ctx_max = 0;   // requested ceiling for lazy-grow
 
     // GPU-side head_kv tensor lifetimes.
     ggml_context *            kv_ctx = nullptr;
@@ -504,6 +508,100 @@ struct Qwen36MtpModule::State {
     int                       draft_topk = 1;
 };
 
+// ── Lazy head_kv capacity growth ──────────────────────────────────────────
+//
+// At max_ctx=65536 the GPU head_kv tensors are ~256 MiB constant residency
+// even for tiny prompts. We instead allocate small at init (default 8192
+// slots) and grow on first warm_head_kv when the prompt's true size is
+// known. Growth invalidates the step-graph cache and the warm graph
+// (their tensor pointers are stale post-realloc); both rebuild lazily on
+// the next call. We never shrink — once a daemon serves a long prompt,
+// subsequent requests benefit from the warmed-up allocation.
+bool Qwen36MtpModule::ensure_head_kv_capacity_(int required_slots) {
+    if (required_slots <= state_->n_ctx) return true;
+    if (!state_->target) return false;
+    ggml_backend_t backend = state_->target->backend();
+    if (!backend) return true;  // CPU stub uses host vectors — no grow
+
+    if (required_slots > state_->n_ctx_max) {
+        std::fprintf(stderr,
+            "[qwen36_mtp] ensure_head_kv_capacity: required=%d > n_ctx_max=%d\n",
+            required_slots, state_->n_ctx_max);
+        return false;
+    }
+
+    // Round up to 1024-slot quantum, cap at n_ctx_max.
+    int new_ctx = std::min(((required_slots + 1023) / 1024) * 1024,
+                            state_->n_ctx_max);
+    if (new_ctx <= state_->n_ctx) return true;
+
+    // Tear down stale graphs first — their cached tensor pointers will be
+    // invalid after we free the backing buffer.
+    qwen36_mtp_warm_graph_free(state_->warm_sg);
+    state_->warm_sg = {};
+    for (auto & e : state_->step_sg_cache) {
+        e.first  = {};
+        e.second.reset();
+    }
+    if (state_->kv_buf) {
+        ggml_backend_buffer_free(state_->kv_buf);
+        state_->kv_buf = nullptr;
+    }
+    if (state_->kv_ctx) {
+        ggml_free(state_->kv_ctx);
+        state_->kv_ctx = nullptr;
+    }
+    for (auto & kv : state_->head_kv) {
+        kv.k_cache = nullptr;
+        kv.v_cache = nullptr;
+    }
+
+    const int n_head_kv = state_->weights.n_head_kv;
+    const int key_len   = state_->weights.n_key_length;
+    const int val_len   = state_->weights.n_value_length;
+    const int gamma_max = state_->weights.n_heads;
+    const int rb_tensors = 2 * gamma_max;
+
+    ggml_init_params kp{};
+    kp.mem_size   = (size_t)(rb_tensors + 16) * ggml_tensor_overhead();
+    kp.mem_buffer = nullptr;
+    kp.no_alloc   = true;
+    state_->kv_ctx = ggml_init(kp);
+    if (!state_->kv_ctx) return false;
+
+    for (int h = 0; h < gamma_max; h++) {
+        ggml_tensor * k_t = ggml_new_tensor_3d(state_->kv_ctx,
+            GGML_TYPE_F16, key_len, new_ctx, n_head_kv);
+        ggml_tensor * v_t = ggml_new_tensor_3d(state_->kv_ctx,
+            GGML_TYPE_F16, val_len, new_ctx, n_head_kv);
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "mtp_head_%d_k", h);
+        ggml_set_name(k_t, nm);
+        std::snprintf(nm, sizeof(nm), "mtp_head_%d_v", h);
+        ggml_set_name(v_t, nm);
+        state_->head_kv[h].k_cache = k_t;
+        state_->head_kv[h].v_cache = v_t;
+    }
+    state_->kv_buf = ggml_backend_alloc_ctx_tensors(state_->kv_ctx, backend);
+    if (!state_->kv_buf) {
+        ggml_free(state_->kv_ctx);
+        state_->kv_ctx = nullptr;
+        for (auto & kv : state_->head_kv) {
+            kv.k_cache = nullptr;
+            kv.v_cache = nullptr;
+        }
+        return false;
+    }
+    ggml_backend_buffer_clear(state_->kv_buf, 0);
+    state_->n_ctx = new_ctx;
+    for (auto & p : state_->head_kv_pos) p = 0;
+
+    std::fprintf(stderr,
+        "[qwen36_mtp] head_kv grew n_ctx=%d (max=%d)\n",
+        new_ctx, state_->n_ctx_max);
+    return true;
+}
+
 // ── Lifecycle ─────────────────────────────────────────────────────────────
 
 Qwen36MtpModule::Qwen36MtpModule() : state_(std::make_unique<State>()) {}
@@ -511,14 +609,15 @@ Qwen36MtpModule::~Qwen36MtpModule() { shutdown(); }
 
 bool Qwen36MtpModule::init(const std::string & gguf_path,
                            DFlashTarget * target,
-                           std::string & out_error) {
+                           std::string & out_error,
+                           int n_ctx_request) {
     shutdown();
     ggml_context * ctx = load_gguf_tensor_context(gguf_path, out_error);
     if (!ctx) {
         return false;
     }
     state_->owned_ctx = ctx;
-    if (!init(gguf_path, ctx, target, out_error)) {
+    if (!init(gguf_path, ctx, target, out_error, n_ctx_request)) {
         shutdown();
         return false;
     }
@@ -528,7 +627,8 @@ bool Qwen36MtpModule::init(const std::string & gguf_path,
 bool Qwen36MtpModule::init(const std::string & gguf_path,
                            ggml_context * ctx,
                            DFlashTarget * target,
-                           std::string & out_error) {
+                           std::string & out_error,
+                           int n_ctx_request) {
     if (!target) {
         out_error = "Qwen36MtpModule::init: target is null";
         return false;
@@ -586,19 +686,32 @@ bool Qwen36MtpModule::init(const std::string & gguf_path,
         const int n_head_kv = state_->weights.n_head_kv;
         const int key_len   = state_->weights.n_key_length;
         const int val_len   = state_->weights.n_value_length;
-        // Chain horizon = max prompt+decode positions the MTP head KV can hold.
-        // Was hardcoded to 8192; overflows on real agentic prompts (Claude Code
-        // sends 9-24K). Allow override via DFLASH27B_MTP_CTX so the daemon path
-        // can size this to match target max_ctx.
-        int n_ctx = 8192;
+        // Two knobs:
+        //   n_ctx_max — hard ceiling we'll ever grow to. Defaults to
+        //               n_ctx_request (= backbone max_ctx). The chain runner
+        //               can NEVER index past this.
+        //   n_ctx     — initial allocation. Defaults to min(8192, n_ctx_max)
+        //               so a daemon configured for --max-ctx 65536 doesn't
+        //               eat 256 MiB of VRAM up front when short prompts are
+        //               the norm. Env DFLASH27B_MTP_INITIAL_CTX overrides.
+        int n_ctx_max = 8192;
         if (const char * s = std::getenv("DFLASH27B_MTP_CTX")) {
             const int v = std::atoi(s);
-            if (v > 0) n_ctx = v;
+            if (v > 0) n_ctx_max = v;
         }
-        state_->n_ctx       = n_ctx;
+        if (n_ctx_request > 0) n_ctx_max = n_ctx_request;
+
+        int n_ctx = std::min(8192, n_ctx_max);
+        if (const char * s = std::getenv("DFLASH27B_MTP_INITIAL_CTX")) {
+            const int v = std::atoi(s);
+            if (v > 0) n_ctx = std::min(v, n_ctx_max);
+        }
+        state_->n_ctx     = n_ctx;
+        state_->n_ctx_max = n_ctx_max;
 
         if (n_head_kv > 0 && key_len > 0 && val_len > 0 && gamma_max > 0) {
             state_->head_kv.resize(gamma_max);
+            state_->head_kv_pos.assign(gamma_max, 0);
             // The CPU forward path (T1 stub tests, no backend) reads/writes
             // the host vectors; the GPU path reads/writes the backend tensors.
             // Allocate only the side we will actually use.
@@ -725,6 +838,7 @@ void Qwen36MtpModule::shutdown() {
     }
     // Per-head KV CPU mirrors are std::vector<float> — destructors free them.
     state_->head_kv.clear();
+    state_->head_kv_pos.clear();
     state_->n_ctx = 0;
 
     if (state_->mtp_buf) {
@@ -1052,6 +1166,9 @@ bool Qwen36MtpModule::step_batch(int32_t current_token,
             std::memcpy(kv.v.data() + v_slot_off, v_buf.data(),
                         sizeof(float) * (size_t)n_head_kv * val_len);
         }
+        if ((int)state_->head_kv_pos.size() > h) {
+            state_->head_kv_pos[h] = std::max(state_->head_kv_pos[h], draft_pos);
+        }
 
         // Range attention over slots [0, draft_pos] of head_kv[h] (causal).
         attn_out_buf.resize(n_head * val_len);
@@ -1246,8 +1363,10 @@ void Qwen36MtpModule::attach_weights_for_test(const Qwen36MtpWeights & w) {
     const int val_len   = w.n_value_length;
     state_->n_ctx       = n_ctx;
     state_->head_kv.clear();
+    state_->head_kv_pos.clear();
     if (n_head_kv > 0 && key_len > 0 && val_len > 0 && w.n_heads > 0) {
         state_->head_kv.resize(w.n_heads);
+        state_->head_kv_pos.assign(w.n_heads, 0);
         for (int h = 0; h < w.n_heads; h++) {
             state_->head_kv[h].k.assign(
                 (size_t)n_ctx * n_head_kv * key_len, 0.0f);
@@ -1263,6 +1382,191 @@ void Qwen36MtpModule::set_initial_hidden(const float * h_prev, int dim) {
     // store; the Shape B TRMBlock forward in PR 2d-bis reads it.
     state_->initial_hidden_ptr = h_prev;
     state_->initial_hidden_dim = dim;
+}
+
+// R2 thin snapshot — GPU path captures only [0..head_kv_pos+1] slots instead
+// of the full [key_len, n_ctx, n_head_kv] tensor. At max_ctx=65536 this drops
+// per-snapshot payload from ~256 MiB to ~(N+1) × n_head_kv × (key+val) × 2 B,
+// typically <20 MiB for a 4K-token cut. Layout per MTP head:
+//
+//   [int32 slots]            // = head_kv_pos[h] + 1 (slot 0 included)
+//   [int32 n_head_kv]        // shape header for restore-side validation
+//   [int32 key_len]
+//   [int32 val_len]
+//   [K block]                // n_head_kv × slots × key_len × F16, ordered
+//                            // by ggml dim-2 (the "head_kv group" axis)
+//   [V block]                // n_head_kv × slots × val_len × F16
+//
+// CPU-stub path (tests, kv.k_cache == nullptr) keeps the legacy full byte
+// copy so the existing test_prefix_cache_mtp round-trips byte-equal.
+namespace {
+
+constexpr size_t kThinSnapHeaderBytes = 4 * sizeof(int32_t);
+
+size_t thin_per_head_bytes(int slots, int n_head_kv, int key_len, int val_len) {
+    const size_t k = (size_t)n_head_kv * (size_t)slots * (size_t)key_len * sizeof(uint16_t);
+    const size_t v = (size_t)n_head_kv * (size_t)slots * (size_t)val_len * sizeof(uint16_t);
+    return kThinSnapHeaderBytes + k + v;
+}
+
+}  // namespace
+
+bool Qwen36MtpModule::snapshot_head_kv(std::vector<std::vector<uint8_t>> & out_buf,
+                                       std::vector<int> & out_pos) const {
+    out_buf.clear();
+    out_pos.clear();
+    if (!state_->loaded || state_->head_kv.empty() ||
+        state_->head_kv_pos.size() != state_->head_kv.size()) {
+        return false;
+    }
+
+    const int n_head_kv = state_->weights.n_head_kv;
+    const int key_len   = state_->weights.n_key_length;
+    const int val_len   = state_->weights.n_value_length;
+    const int n_ctx     = state_->n_ctx;
+
+    // R4 dtype guard.
+    for (const auto & kv : state_->head_kv) {
+        if (kv.k_cache && kv.k_cache->type != GGML_TYPE_F16) return false;
+        if (kv.v_cache && kv.v_cache->type != GGML_TYPE_F16) return false;
+    }
+
+    // Compute total payload up-front against the size cap.
+    size_t total = 0;
+    for (size_t h = 0; h < state_->head_kv.size(); ++h) {
+        const auto & kv = state_->head_kv[h];
+        if (kv.k_cache) {
+            const int slots = std::min(state_->head_kv_pos[h] + 1, n_ctx);
+            if (slots <= 0) return false;
+            total += thin_per_head_bytes(slots, n_head_kv, key_len, val_len);
+        } else {
+            const size_t k_bytes = kv.k.size() * sizeof(float);
+            const size_t v_bytes = kv.v.size() * sizeof(float);
+            if (k_bytes == 0 || v_bytes == 0) return false;
+            total += k_bytes + v_bytes;
+        }
+    }
+    if (total > kMtpHeadKvSnapshotMaxBytes) {
+        std::fprintf(stderr,
+            "[qwen36_mtp] snapshot_head_kv: refusing %.1f MiB snapshot\n",
+            (double)total / (1024.0 * 1024.0));
+        return false;
+    }
+
+    out_buf.resize(state_->head_kv.size());
+    out_pos = state_->head_kv_pos;
+
+    for (size_t h = 0; h < state_->head_kv.size(); ++h) {
+        const auto & kv = state_->head_kv[h];
+        auto & dst = out_buf[h];
+
+        if (kv.k_cache) {
+            // Thin GPU path.
+            const int slots = std::min(state_->head_kv_pos[h] + 1, n_ctx);
+            const size_t k_slice_bytes = (size_t)slots * key_len * sizeof(uint16_t);
+            const size_t v_slice_bytes = (size_t)slots * val_len * sizeof(uint16_t);
+            const size_t k_stride_g    = (size_t)key_len * n_ctx * sizeof(uint16_t);
+            const size_t v_stride_g    = (size_t)val_len * n_ctx * sizeof(uint16_t);
+
+            dst.resize(thin_per_head_bytes(slots, n_head_kv, key_len, val_len));
+            int32_t hdr[4] = { slots, n_head_kv, key_len, val_len };
+            std::memcpy(dst.data(), hdr, sizeof(hdr));
+
+            uint8_t * k_out = dst.data() + kThinSnapHeaderBytes;
+            uint8_t * v_out = k_out + (size_t)n_head_kv * k_slice_bytes;
+            for (int g = 0; g < n_head_kv; ++g) {
+                ggml_backend_tensor_get(kv.k_cache,
+                    k_out + (size_t)g * k_slice_bytes,
+                    (size_t)g * k_stride_g, k_slice_bytes);
+                ggml_backend_tensor_get(kv.v_cache,
+                    v_out + (size_t)g * v_slice_bytes,
+                    (size_t)g * v_stride_g, v_slice_bytes);
+            }
+        } else {
+            // CPU stub: legacy full F32 byte copy (kept stable for tests).
+            const size_t k_bytes = kv.k.size() * sizeof(float);
+            const size_t v_bytes = kv.v.size() * sizeof(float);
+            dst.resize(k_bytes + v_bytes);
+            std::memcpy(dst.data(), kv.k.data(), k_bytes);
+            std::memcpy(dst.data() + k_bytes, kv.v.data(), v_bytes);
+        }
+    }
+    return true;
+}
+
+bool Qwen36MtpModule::restore_head_kv(const std::vector<std::vector<uint8_t>> & buf,
+                                      const std::vector<int> & pos) {
+    if (!state_->loaded || buf.size() != state_->head_kv.size() ||
+        pos.size() != state_->head_kv.size()) {
+        return false;
+    }
+
+    const int n_head_kv = state_->weights.n_head_kv;
+    const int key_len   = state_->weights.n_key_length;
+    const int val_len   = state_->weights.n_value_length;
+    const int n_ctx     = state_->n_ctx;
+
+    // Validate every head before mutating any state — R5 spirit.
+    for (size_t h = 0; h < state_->head_kv.size(); ++h) {
+        auto & kv = state_->head_kv[h];
+        if (kv.k_cache) {
+            if (kv.k_cache->type != GGML_TYPE_F16) return false;
+            if (kv.v_cache->type != GGML_TYPE_F16) return false;
+            if (buf[h].size() < kThinSnapHeaderBytes) return false;
+            int32_t hdr[4];
+            std::memcpy(hdr, buf[h].data(), sizeof(hdr));
+            const int slots = hdr[0];
+            if (slots <= 0 || slots > n_ctx) return false;
+            if (hdr[1] != n_head_kv || hdr[2] != key_len || hdr[3] != val_len) {
+                return false;
+            }
+            if (buf[h].size() != thin_per_head_bytes(slots, n_head_kv, key_len, val_len)) {
+                return false;
+            }
+            if (pos[h] < 0 || pos[h] >= n_ctx) return false;
+        } else {
+            const size_t k_bytes = kv.k.size() * sizeof(float);
+            const size_t v_bytes = kv.v.size() * sizeof(float);
+            if (k_bytes == 0 || v_bytes == 0 ||
+                buf[h].size() != k_bytes + v_bytes ||
+                pos[h] < 0 || pos[h] >= n_ctx) {
+                return false;
+            }
+        }
+    }
+
+    for (size_t h = 0; h < state_->head_kv.size(); ++h) {
+        auto & kv = state_->head_kv[h];
+        const auto & src = buf[h];
+
+        if (kv.k_cache) {
+            int32_t hdr[4];
+            std::memcpy(hdr, src.data(), sizeof(hdr));
+            const int slots = hdr[0];
+            const size_t k_slice_bytes = (size_t)slots * key_len * sizeof(uint16_t);
+            const size_t v_slice_bytes = (size_t)slots * val_len * sizeof(uint16_t);
+            const size_t k_stride_g    = (size_t)key_len * n_ctx * sizeof(uint16_t);
+            const size_t v_stride_g    = (size_t)val_len * n_ctx * sizeof(uint16_t);
+
+            const uint8_t * k_in = src.data() + kThinSnapHeaderBytes;
+            const uint8_t * v_in = k_in + (size_t)n_head_kv * k_slice_bytes;
+            for (int g = 0; g < n_head_kv; ++g) {
+                ggml_backend_tensor_set(kv.k_cache,
+                    k_in + (size_t)g * k_slice_bytes,
+                    (size_t)g * k_stride_g, k_slice_bytes);
+                ggml_backend_tensor_set(kv.v_cache,
+                    v_in + (size_t)g * v_slice_bytes,
+                    (size_t)g * v_stride_g, v_slice_bytes);
+            }
+        } else {
+            const size_t k_bytes = kv.k.size() * sizeof(float);
+            const size_t v_bytes = kv.v.size() * sizeof(float);
+            std::memcpy(kv.k.data(), src.data(), k_bytes);
+            std::memcpy(kv.v.data(), src.data() + k_bytes, v_bytes);
+        }
+    }
+    state_->head_kv_pos = pos;
+    return true;
 }
 
 bool Qwen36MtpModule::warm_head_kv(const int32_t * prompt_tokens,
@@ -1286,7 +1590,26 @@ bool Qwen36MtpModule::warm_head_kv(const int32_t * prompt_tokens,
     const int rope_n_rot = std::min(64, key_len);
     const float rope_theta = 1e7f;
 
+    // Lazy grow: head_kv was allocated small at init; size it now to fit the
+    // actual prompt + a decode-horizon margin (env override). On steady-state
+    // agentic loops the same daemon serves prompts of similar size, so we
+    // pay the realloc once at startup. Failure here is a real OOM/limit hit.
+    int decode_margin = 1024;
+    if (const char * s = std::getenv("DFLASH27B_MTP_DECODE_MARGIN")) {
+        const int v = std::atoi(s);
+        if (v > 0) decode_margin = v;
+    }
+    // warm fills slots [1..n_prompt]; the chain runner writes slot n_prompt
+    // and beyond on subsequent iters. The +1 accommodates slot n_prompt.
+    if (!ensure_head_kv_capacity_(n_prompt + 1 + decode_margin)) {
+        std::fprintf(stderr,
+            "[qwen36_mtp] warm_head_kv: cannot ensure capacity for n_prompt=%d (max=%d)\n",
+            n_prompt, state_->n_ctx_max);
+        return false;
+    }
     if (n_prompt > state_->n_ctx) {
+        // Should not happen — ensure_head_kv_capacity_ either grew or returned
+        // false. Keep the guard as belt-and-braces in case of future refactor.
         std::fprintf(stderr,
             "[qwen36_mtp] warm_head_kv: n_prompt=%d exceeds head_kv capacity n_ctx=%d\n",
             n_prompt, state_->n_ctx);
@@ -1358,6 +1681,9 @@ bool Qwen36MtpModule::warm_head_kv(const int32_t * prompt_tokens,
             std::fprintf(stderr,
                 "[qwen36_mtp gpu-warm] graph_compute status=%d\n", (int)st);
             return false;
+        }
+        if ((int)state_->head_kv_pos.size() > h) {
+            state_->head_kv_pos[h] = n_prompt;
         }
         return true;
     }
@@ -1456,6 +1782,9 @@ bool Qwen36MtpModule::warm_head_kv(const int32_t * prompt_tokens,
         std::memcpy(kv.v.data() + v_slot_off, v_buf.data(),
                     sizeof(float) * (size_t)n_head_kv * val_len);
     }
+    if ((int)state_->head_kv_pos.size() > h) {
+        state_->head_kv_pos[h] = last_slot;
+    }
     // Prefill is done.  From this point on, every verify_batch is a decode
     // step whose ONLY hidden-sequence consumer is hidden_at_pos(base_pos-1)
     // (the chain's iter-0 h_prev seed).  Tell the target to download only
@@ -1467,6 +1796,122 @@ bool Qwen36MtpModule::warm_head_kv(const int32_t * prompt_tokens,
     if (auto * t = dynamic_cast<Qwen35DFlashTarget *>(state_->target)) {
         t->set_hidden_capture_mode(
             Qwen35DFlashTarget::VerifyCaptureMode::LAST_ROW_ONLY);
+    }
+    return true;
+}
+
+// Range-warm a contiguous slot window. Same graph as warm_head_kv but with
+// caller-controlled slot_start and slot-to-prompt mapping so partial-WARM
+// restore can fill slots [snap_pos..prompt_len] after a head_kv restore
+// covered [1..snap_pos]. Row i in `hiddens` is h_{start_slot+i-1}.
+bool Qwen36MtpModule::warm_head_kv_range(const int32_t * prompt_tokens,
+                                          int             n_prompt,
+                                          int             start_slot,
+                                          int             n_chunk,
+                                          int32_t         prefill_next,
+                                          const float *   hiddens) {
+    if (!state_->loaded || !state_->attached || !state_->target) {
+        std::fprintf(stderr,
+            "[qwen36_mtp] warm_head_kv_range: module not loaded/attached\n");
+        return false;
+    }
+    if (n_chunk <= 0 || start_slot < 1 || !prompt_tokens || !hiddens) {
+        return false;
+    }
+
+    const int n_embd     = state_->weights.n_embd;
+    const int n_heads    = state_->weights.n_heads;
+    const int n_head_kv  = state_->weights.n_head_kv;
+    const int key_len    = state_->weights.n_key_length;
+    const int val_len    = state_->weights.n_value_length;
+    const int rope_n_rot = std::min(64, key_len);
+    const float rope_theta = 1e7f;
+
+    int decode_margin = 1024;
+    if (const char * s = std::getenv("DFLASH27B_MTP_DECODE_MARGIN")) {
+        const int v = std::atoi(s);
+        if (v > 0) decode_margin = v;
+    }
+    const int end_slot = start_slot + n_chunk;
+    if (!ensure_head_kv_capacity_(end_slot + decode_margin)) {
+        std::fprintf(stderr,
+            "[qwen36_mtp] warm_head_kv_range: cannot ensure capacity for end_slot=%d (max=%d)\n",
+            end_slot, state_->n_ctx_max);
+        return false;
+    }
+    if (end_slot > state_->n_ctx) {
+        std::fprintf(stderr,
+            "[qwen36_mtp] warm_head_kv_range: end_slot=%d exceeds n_ctx=%d\n",
+            end_slot, state_->n_ctx);
+        return false;
+    }
+    if ((int)state_->head_kv.size() < n_heads) {
+        std::fprintf(stderr,
+            "[qwen36_mtp] warm_head_kv_range: head_kv not allocated (size=%zu, expected=%d)\n",
+            state_->head_kv.size(), n_heads);
+        return false;
+    }
+    if (!state_->kv_ctx || !state_->target->backend()) {
+        // CPU stub path is not used in production; range-warm only supports GPU.
+        return false;
+    }
+
+    const int h = 0;
+    const auto & head = state_->weights.heads[h];
+    int rope_sections[4] = { 11, 11, 10, 0 };
+    ggml_backend_t backend = state_->target->backend();
+
+    // Input mapping: slot p uses input t_p (= prompt[p] if p < n_prompt,
+    // else prefill_next). Row i corresponds to slot start_slot+i.
+    std::vector<int32_t> input_tok_seq(n_chunk);
+    for (int i = 0; i < n_chunk; i++) {
+        const int p = start_slot + i;
+        input_tok_seq[i] = (p < n_prompt) ? prompt_tokens[p] : prefill_next;
+    }
+    std::vector<float> embed_seq((size_t)n_chunk * n_embd);
+    if (!state_->target->embed_tokens(input_tok_seq.data(), n_chunk,
+                                       embed_seq.data())) {
+        std::fprintf(stderr, "[qwen36_mtp range-warm] embed_tokens failed\n");
+        return false;
+    }
+
+    std::vector<int32_t> pos_seq(4 * n_chunk);
+    for (int i = 0; i < n_chunk; i++) {
+        const int p = start_slot + i;
+        pos_seq[4 * i + 0] = p;
+        pos_seq[4 * i + 1] = p;
+        pos_seq[4 * i + 2] = p;
+        pos_seq[4 * i + 3] = 0;
+    }
+
+    if (!build_qwen36_mtp_warm_graph(state_->warm_sg, head,
+                                      state_->head_kv[h].k_cache,
+                                      state_->head_kv[h].v_cache,
+                                      backend,
+                                      n_embd, n_head_kv, key_len, val_len,
+                                      rope_n_rot, rope_sections,
+                                      rope_theta, 1e-6f,
+                                      start_slot, n_chunk)) {
+        return false;
+    }
+
+    ggml_backend_tensor_set(state_->warm_sg.inp_embed_seq, embed_seq.data(),
+        0, sizeof(float) * embed_seq.size());
+    ggml_backend_tensor_set(state_->warm_sg.inp_h_seq, hiddens,
+        0, sizeof(float) * (size_t)n_chunk * n_embd);
+    ggml_backend_tensor_set(state_->warm_sg.inp_pos, pos_seq.data(),
+        0, sizeof(int32_t) * pos_seq.size());
+
+    auto st = ggml_backend_graph_compute(backend, state_->warm_sg.gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr,
+            "[qwen36_mtp range-warm] graph_compute status=%d\n", (int)st);
+        return false;
+    }
+    if ((int)state_->head_kv_pos.size() > h) {
+        // Extend head_kv_pos to the last slot we wrote (do not regress on a
+        // shorter range; the chain runner's first read is at pos = base_pos).
+        state_->head_kv_pos[h] = std::max(state_->head_kv_pos[h], end_slot - 1);
     }
     return true;
 }
@@ -1658,6 +2103,9 @@ bool Qwen36MtpModule::step_batch_gpu_(int32_t current_token,
             std::fprintf(stderr, "[qwen36_mtp gpu] graph_compute status=%d\n", (int)st);
             out.clear();
             return false;
+        }
+        if ((int)state_->head_kv_pos.size() > h) {
+            state_->head_kv_pos[h] = std::max(state_->head_kv_pos[h], draft_pos);
         }
 
         StepOutput so;
@@ -1944,6 +2392,9 @@ bool Qwen36MtpModule::step_chain(int32_t current_token,
                 "[qwen36_mtp gpu chain] graph_compute status=%d iter=%d\n",
                 (int)st, it);
             return false;
+        }
+        if ((int)state_->head_kv_pos.size() > h) {
+            state_->head_kv_pos[h] = std::max(state_->head_kv_pos[h], draft_pos);
         }
 
         StepOutput so;

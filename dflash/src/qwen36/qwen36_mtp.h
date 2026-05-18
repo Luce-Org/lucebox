@@ -110,9 +110,16 @@ public:
 
     // One-shot construction: load weights then attach in a single call.
     // The returned module is ready for step_batch() once attach() succeeds.
+    //
+    // n_ctx_request: chain horizon for the head-KV cache. When > 0, the
+    // module sizes its per-head K/V tensors to hold this many slots — must
+    // be >= the backbone's max_ctx. When 0, falls back to the env override
+    // (DFLASH27B_MTP_CTX) and finally to the legacy 8192 default; this leg
+    // is retained for the test/stub paths that don't drive the daemon.
     bool init(const std::string & gguf_path,
               DFlashTarget * target,
-              std::string & out_error);
+              std::string & out_error,
+              int n_ctx_request = 0);
 
     // Integration construction: bind NextN tensors from the backbone GGUF
     // context. The context lifetime stays with the caller; this module owns
@@ -120,7 +127,8 @@ public:
     bool init(const std::string & gguf_path,
               ggml_context * ctx,
               DFlashTarget * target,
-              std::string & out_error);
+              std::string & out_error,
+              int n_ctx_request = 0);
 
     // ── IMtpModule ──────────────────────────────────────────────────
     int  max_gamma()       const override;
@@ -176,6 +184,13 @@ public:
                       int             n_prompt,
                       int32_t         prefill_next,
                       const float *   hiddens) override;
+    bool snapshot_head_kv(std::vector<std::vector<uint8_t>> & out_buf,
+                          std::vector<int> & out_pos) const override;
+    bool restore_head_kv(const std::vector<std::vector<uint8_t>> & buf,
+                         const std::vector<int> & pos) override;
+    bool warm_head_kv_range(const int32_t * prompt_tokens, int n_prompt,
+                            int start_slot, int n_chunk,
+                            int32_t prefill_next, const float * hiddens) override;
 
     // Read-only access for tests / introspection.
     const Qwen36MtpWeights & weights() const;
@@ -204,6 +219,13 @@ private:
     // fused_lm_head, topk_k).  Per-call slot routing (write idx, read
     // idxs, mask) is pushed as runtime tensor inputs by the caller.
     struct Qwen36MtpStepGraph * get_or_build_step_graph_(int head_idx);
+
+    // Grow the GPU head_kv tensors to hold `required_slots`, rounded up to
+    // a 1024-slot quantum and capped at the per-init n_ctx_max ceiling. A
+    // no-op when current capacity already suffices or when running the CPU
+    // stub. Safe to call only between requests — invalidates cached step
+    // graphs and zeroes head_kv_pos.
+    bool ensure_head_kv_capacity_(int required_slots);
 };
 
 }  // namespace mtp

@@ -209,6 +209,28 @@ struct INativeMtp : IMtpModule {
                               int32_t /*prefill_next*/, const float * /*hiddens*/) {
         return true;
     }
+
+    virtual bool snapshot_head_kv(std::vector<std::vector<uint8_t>> & /*out_buf*/,
+                                  std::vector<int> & /*out_pos*/) const {
+        return false;
+    }
+
+    virtual bool restore_head_kv(const std::vector<std::vector<uint8_t>> & /*buf*/,
+                                 const std::vector<int> & /*pos*/) {
+        return false;
+    }
+
+    // Range-warm a contiguous slot window [start_slot..start_slot+n_chunk).
+    // Used by partial-WARM restore: cached prefix supplies head_kv slots
+    // [1..snap_pos] via restore_head_kv; this fills [snap_pos..prompt_len]
+    // using the new request's delta hiddens + the snapshot's h_{snap_pos-1}.
+    // `hiddens` has n_chunk rows of hidden_size floats; row i is h_{start_slot+i-1}.
+    // `prefill_next` is the input for the trailing slot (where slot == n_prompt).
+    virtual bool warm_head_kv_range(const int32_t * /*prompt_tokens*/, int /*n_prompt*/,
+                                    int /*start_slot*/, int /*n_chunk*/,
+                                    int32_t /*prefill_next*/, const float * /*hiddens*/) {
+        return false;
+    }
 };
 
 }  // namespace mtp

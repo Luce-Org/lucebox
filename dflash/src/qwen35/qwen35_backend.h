@@ -165,6 +165,13 @@ private:
     // ── MTP speculator (optional, set when cfg_.mtp_gguf_path != nullptr) ──
     std::unique_ptr<mtp::Qwen36MtpModule> mtp_module_;
 
+    // R5: head_kv is only valid for snapshotting after warm_head_kv succeeds.
+    // Reset on every generate() entry; flipped true by warm_mtp_for_prompt_
+    // and by the orchestrator's post-warm callback. snapshot_save gates the
+    // mtp_head_kv capture on this — otherwise a zeroed head_kv would round-trip
+    // as a "valid" snapshot.
+    bool head_kv_warm_ = false;
+
     // ── Internal helpers ─────────────────────────────────────────────
     // Prefill a prompt and return the number of tokens committed to KV.
     // kv_offset > 0 resumes from a restored snapshot: tokens are placed at

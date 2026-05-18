@@ -1346,6 +1346,7 @@ bool snapshot_target_cache(const TargetWeights & w,
 
     snap.cur_pos         = cache.cur_pos;
     snap.last_tok        = cache.last_tok;
+    snap.prefill_next_tok = cache.last_tok;
     snap.kv_k_type       = cache.kv_k_type;
     snap.max_ctx         = cache.max_ctx;
     snap.target_feat_cap = cache.target_feat_cap;
@@ -1406,9 +1407,13 @@ void free_prefix_snapshot(PrefixSnapshot & snap) {
     snap.conv_state_snap.clear();
     snap.target_feat_snap = nullptr;
     snap.cur_pos         = 0;
+    snap.last_tok        = -1;
+    snap.prefill_next_tok = -1;
     snap.kv_k_type       = GGML_TYPE_COUNT;
     snap.max_ctx         = 0;
     snap.target_feat_cap = 0;
+    snap.mtp_head_kv.clear();
+    snap.mtp_head_pos.clear();
     snap.is_thin         = false;
     snap.kv_start        = 0;
     snap.kv_end          = 0;

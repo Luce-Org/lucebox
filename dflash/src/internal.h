@@ -353,6 +353,7 @@ void restore_ssm_state(TargetCache & c);
 struct PrefixSnapshot {
     int       cur_pos         = 0;
     int       last_tok        = -1;                // post-prefill argmax (decode seed)
+    int32_t   prefill_next_tok = -1;               // MTP head-KV compatibility check
     ggml_type kv_k_type       = GGML_TYPE_COUNT;   // for hash-key validation
     int       max_ctx         = 0;                 // for sanity check at restore
     int       target_feat_cap = 0;
@@ -366,6 +367,23 @@ struct PrefixSnapshot {
 
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
+
+    // Optional MTP native-head KV snapshot. Payloads are opaque to callers.
+    std::vector<std::vector<uint8_t>> mtp_head_kv;
+    std::vector<int>                  mtp_head_pos;
+
+    // Backbone post-norm hidden at position cur_pos-1, captured at snapshot
+    // time. Partial-WARM restore uses this as h_{snap_pos-1} to range-warm
+    // slot snap_pos (whose K/V depend on the prior position's hidden).
+    // Length == n_embd; empty when MTP is not attached.
+    std::vector<float> mtp_pre_warm_hidden;
+
+    // Shape contract captured at snapshot time. Restore rejects mismatches
+    // to prevent silent corruption when γ/n_head_kv/n_ctx change between
+    // save and restore.
+    int mtp_gamma_at_capture = -1;
+    int mtp_n_head_kv        = -1;
+    int mtp_n_ctx            = -1;
 
     // Phase B: thin-mode snapshots cover only a KV-position range.
     bool is_thin  = false;

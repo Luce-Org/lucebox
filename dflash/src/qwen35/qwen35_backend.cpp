@@ -11,6 +11,7 @@
 #include "common/restore_delta.h"
 #include "common/mtp_chain_runner.h"
 #include "common/mtp_orchestrator.h"
+#include "common/prefix_snap.h"
 #include "qwen3/qwen3_drafter.h"
 #include "qwen36/qwen36_mtp.h"
 
@@ -196,7 +197,36 @@ bool Qwen35Backend::snapshot_save(int slot) {
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
     snapshot_free(slot);
     PrefixSnapshot & snap = prefix_snapshots_[slot];
-    return snapshot_target_cache(w_, cache_, target_backend_, snap);
+    if (!snapshot_target_cache(w_, cache_, target_backend_, snap)) {
+        return false;
+    }
+    snap.prefill_next_tok = cache_.last_tok;
+    snap.mtp_pre_warm_hidden.clear();
+    // Only capture head_kv when warm_head_kv has populated it; otherwise the
+    // snapshot would round-trip zeroed K/V as if valid.
+    if (mtp_module_ && head_kv_warm_) {
+        if (!mtp_module_->snapshot_head_kv(snap.mtp_head_kv, snap.mtp_head_pos)) {
+            snap.mtp_head_kv.clear();
+            snap.mtp_head_pos.clear();
+        } else {
+            const auto & w = mtp_module_->weights();
+            snap.mtp_gamma_at_capture = mtp_module_->effective_gamma();
+            snap.mtp_n_head_kv        = w.n_head_kv;
+            snap.mtp_n_ctx            = cfg_.device.max_ctx;
+            // Capture h_{snap_pos-1} for partial-WARM range-warm on restore.
+            // After partial prefill, target->last_hidden() == h_{cur_pos-1}.
+            if (DFlashTarget * tgt = dflash_target()) {
+                if (const float * h = tgt->last_hidden()) {
+                    const int n_embd = tgt->hidden_size();
+                    snap.mtp_pre_warm_hidden.assign(h, h + n_embd);
+                }
+            }
+        }
+    } else {
+        snap.mtp_head_kv.clear();
+        snap.mtp_head_pos.clear();
+    }
+    return true;
 }
 
 void Qwen35Backend::snapshot_free(int slot) {
@@ -396,13 +426,22 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
 
     // Zero delta-net recurrent state (SSM + conv) so a fresh prompt doesn't
     // inherit stale hidden state from the previous request. KV cache is
-    // position-addressed and will be overwritten during prefill.
+    // position-addressed and will be overwritten during prefill. Cheaper
+    // than reset_target_cache; sufficient for both DFlash and MTP paths
+    // since both prefill from kv_offset=0 here.
     reset_recurrent_state(cache_);
+    head_kv_warm_ = false;  // R5: invalidate any prior warm state
 
     // MTP path: delegate to common orchestrator. Cache was already sized in
     // init_mtp_() — no per-request migrate (idempotent no-op).
     if (supports_mtp()) {
-        return common::mtp::warm_and_decode(this, req, io);
+        // Post-warm callback only flips the head_kv_warm_ flag (idempotent —
+        // may fire twice on a mid-prompt snap: once after partial warm, once
+        // after full warm). The snapshot itself + ack are taken by the
+        // orchestrator directly because only it sees the chunked prefill
+        // boundary and knows whether we're at mid-prompt or end-of-prompt.
+        auto on_warm_done = [this]() { head_kv_warm_ = true; };
+        return common::mtp::warm_and_decode(this, req, io, std::move(on_warm_done));
     }
 
     // DFlash / AR path
@@ -438,8 +477,13 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
         return result;
     }
 
-    // Restore snapshot
-    restore_target_cache(prefix_snapshots_[slot], cache_);
+    head_kv_warm_ = false;  // R5: any prior warm state is invalidated by restore
+    PrefixSnapshot & snap = prefix_snapshots_[slot];
+    if (!restore_target_cache(snap, cache_)) {
+        result.error = "restore";
+        io.emit(-1);
+        return result;
+    }
 
     // Now generate from restored state
     sampler_ = req.sampler;
@@ -447,7 +491,7 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
         sampler_rng_.seed(sampler_.seed);
     }
 
-    const int snap_pos = prefix_snapshots_[slot].cur_pos;
+    const int snap_pos = snap.cur_pos;
     cache_.cur_pos = snap_pos;
 
     // Daemon receives the FULL prompt; slice off the cached prefix and prefill
@@ -455,37 +499,123 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
     int committed = snap_pos;
     const int prompt_len = (int)req.prompt.size();
     std::vector<float> all_prefill_hidden;
+    bool mtp_head_kv_restored = false;
 
-    if (prompt_len > snap_pos) {
-        auto t_prefill_start = std::chrono::steady_clock::now();
-        std::vector<int32_t> delta = restore_prompt_delta(req.prompt, snap_pos);
+    // MTP WARM paths: perfect-WARM when prompt_len == snap_pos (no prefill),
+    // partial-WARM when prompt_len > snap_pos (delta prefill + range-warm).
+    // Both gate on the same tok/shape contract; failure falls through to the
+    // cold-restart fallback below.
+    if (supports_mtp() && mtp_module_ && prompt_len >= snap_pos &&
+        snap.prefill_next_tok >= 0 && !snap.mtp_head_kv.empty()) {
+        const auto & w = mtp_module_->weights();
+        const bool tok_match = (snap.prefill_next_tok == cache_.last_tok);
+        const bool shape_match =
+            snap.mtp_gamma_at_capture == mtp_module_->effective_gamma() &&
+            snap.mtp_n_head_kv        == w.n_head_kv &&
+            snap.mtp_n_ctx            == cfg_.device.max_ctx;
+        const bool hidden_ok = (prompt_len == snap_pos) ||
+            (int)snap.mtp_pre_warm_hidden.size() == w.n_embd;
 
-        if (supports_mtp()) {
-            // MTP path: prefill delta via DFlashTarget::verify_batch so hidden
-            // states are captured for warm_mtp_for_prompt_.
-            committed = do_mtp_prefill_(delta, all_prefill_hidden, /*kv_offset=*/snap_pos);
-            if (committed < 0) {
-                result.error = "mtp_prefill";
-                return result;
+        if (tok_match && shape_match && hidden_ok &&
+            mtp_module_->restore_head_kv(snap.mtp_head_kv, snap.mtp_head_pos)) {
+
+            auto t_prefill_start = std::chrono::steady_clock::now();
+            bool ok = true;
+
+            if (prompt_len > snap_pos) {
+                // Partial-WARM: prefill the delta to advance backbone state +
+                // capture per-position hiddens for the new tail.
+                std::vector<int32_t> delta(req.prompt.begin() + snap_pos,
+                                            req.prompt.end());
+                if (do_mtp_prefill_(delta, all_prefill_hidden,
+                                     /*kv_offset=*/snap_pos) < 0) {
+                    ok = false;
+                } else {
+                    // Range-warm slots [snap_pos..prompt_len]: row 0 uses
+                    // h_{snap_pos-1} (snapshot), rows 1..delta_len use
+                    // h_{snap_pos..prompt_len-1} from delta_hiddens.
+                    const int n_chunk = prompt_len - snap_pos + 1;
+                    std::vector<float> range_hiddens;
+                    range_hiddens.reserve((size_t)n_chunk * w.n_embd);
+                    range_hiddens.insert(range_hiddens.end(),
+                        snap.mtp_pre_warm_hidden.begin(),
+                        snap.mtp_pre_warm_hidden.end());
+                    range_hiddens.insert(range_hiddens.end(),
+                        all_prefill_hidden.begin(),
+                        all_prefill_hidden.end());
+                    if (!mtp_module_->warm_head_kv_range(
+                            req.prompt.data(), prompt_len,
+                            snap_pos, n_chunk,
+                            cache_.last_tok, range_hiddens.data())) {
+                        ok = false;
+                    }
+                }
             }
-            if (!warm_mtp_for_prompt_(req.prompt, all_prefill_hidden, cache_.last_tok)) {
-                result.error = "mtp_warm";
-                return result;
+
+            if (ok) {
+                mtp_head_kv_restored = true;
+                head_kv_warm_       = true;
+                committed           = prompt_len;
+                if (DFlashTarget * target = dflash_target()) {
+                    if (target->last_hidden()) {
+                        mtp_module_->set_initial_hidden(target->last_hidden(),
+                                                        target->hidden_size());
+                    }
+                }
+                result.prefill_s = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t_prefill_start).count();
+            } else {
+                std::fprintf(stderr,
+                    "[mtp] partial-WARM range-warm failed; falling back to cold restart\n");
             }
         } else {
-            committed = do_prefill(delta, out_io, req.snap_pos, req.snap_slot, /*kv_offset=*/snap_pos);
-            if (committed < 0) {
-                result.error = "prefill";
-                return result;
-            }
+            std::fprintf(stderr,
+                "[mtp] prefix head_kv restore skipped: tok_match=%d shape_match=%d hidden_ok=%d\n",
+                (int)tok_match, (int)shape_match, (int)hidden_ok);
         }
-        result.prefill_s = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - t_prefill_start).count();
-    } else if (prompt_len > 0 && prompt_len < snap_pos) {
+    }
+
+    if (prompt_len > 0 && prompt_len < snap_pos) {
         // Cached more than the request — should never happen in practice.
         result.error = "snapshot_longer_than_prompt";
         out_io.emit(-1);
         return result;
+    }
+
+    if (supports_mtp() && mtp_module_ && !mtp_head_kv_restored && prompt_len >= snap_pos) {
+        // Cold-restart fallback: covers BOTH (a) prompt_len == snap_pos with
+        // perfect-WARM head_kv restore having failed (shape mismatch, tok
+        // mismatch, or restore_head_kv error) AND (b) prompt_len > snap_pos
+        // partial-WARM where the snapshot has no cached-prefix hiddens for
+        // range-warm. In both cases we discard the backbone snapshot's KV,
+        // reset state, and run full cold prefill + warm. Costs the backbone-
+        // snapshot speedup but is byte-correct against the chain runner's
+        // [0..prompt_len) head_kv requirement.
+        auto t_prefill_start = std::chrono::steady_clock::now();
+        reset_target_cache(cache_);
+        head_kv_warm_ = false;  // R5: cold restart invalidates any restored head_kv
+        committed = do_mtp_prefill_(req.prompt, all_prefill_hidden, /*kv_offset=*/0);
+        if (committed < 0) {
+            result.error = "mtp_prefill";
+            return result;
+        }
+        if (!warm_mtp_for_prompt_(req.prompt, all_prefill_hidden, cache_.last_tok)) {
+            result.error = "mtp_warm";
+            return result;
+        }
+        result.prefill_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_prefill_start).count();
+    } else if (prompt_len > snap_pos) {
+        auto t_prefill_start = std::chrono::steady_clock::now();
+        std::vector<int32_t> delta(req.prompt.begin() + snap_pos, req.prompt.end());
+
+        committed = do_prefill(delta, io, req.snap_pos, req.snap_slot, /*kv_offset=*/snap_pos);
+        if (committed < 0) {
+            result.error = "prefill";
+            return result;
+        }
+        result.prefill_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_prefill_start).count();
     }
 
     // Decode
@@ -544,8 +674,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (snap_pos >= 0 && snap_slot >= 0 && snap_pos == kv_pos) {
             cache_.cur_pos = kv_pos;
             if (snapshot_save(snap_slot)) {
-                std::printf("[snap] inline slot=%d cur_pos=%d\n", snap_slot, kv_pos);
-                std::fflush(stdout);
+                common::emit_inline_snap_ack(snap_slot, kv_pos);
             }
             snap_pos = -1;
             snap_slot = -1;
@@ -616,8 +745,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
 
         if (snap_pos >= 0 && snap_slot >= 0 && committed == snap_pos) {
             if (snapshot_save(snap_slot)) {
-                std::printf("[snap] inline slot=%d cur_pos=%d\n", snap_slot, committed);
-                std::fflush(stdout);
+                common::emit_inline_snap_ack(snap_slot, committed);
             }
             snap_pos = -1;
             snap_slot = -1;
@@ -939,7 +1067,11 @@ bool Qwen35Backend::init_mtp_() {
     std::string err;
     // Use the two-arg init that shares the backbone ggml_context so MTP
     // tensors are mapped from the same memory arena as the target weights.
-    if (!mtp_module_->init(cfg_.mtp_gguf_path, tensor_context(), target, err)) {
+    // Pass backbone max_ctx so head_kv can hold any prompt the target can —
+    // without this the head_kv defaulted to 8192 and warm_head_kv failed on
+    // prompts > 8K tokens (Claude Code / Codex agentic flows routinely 10-50K).
+    if (!mtp_module_->init(cfg_.mtp_gguf_path, tensor_context(), target, err,
+                            /*n_ctx_request=*/cfg_.device.max_ctx)) {
         std::fprintf(stderr, "[mtp] init failed: %s\n", err.c_str());
         mtp_module_.reset();
         return false;
@@ -975,6 +1107,8 @@ bool Qwen35Backend::init_mtp_() {
     if (cfg_.mtp_draft_source && std::strcmp(cfg_.mtp_draft_source, "mtp_topk") == 0) {
         mtp_module_->set_draft_topk(std::max(1, cfg_.mtp_draft_topk));
     }
+
+    head_kv_warm_ = false;  // R5: fresh attach starts with cold head_kv
 
     std::printf("[mtp] loaded gamma=%d source=%s\n",
                 cfg_.mtp_gamma,
@@ -1017,6 +1151,7 @@ bool Qwen35Backend::warm_mtp_for_prompt_(const std::vector<int32_t> & prompt,
             std::fprintf(stderr, "[mtp] warm_head_kv failed\n");
             return false;
         }
+        head_kv_warm_ = true;  // R5: head_kv is now safe to snapshot
     }
 
     return true;

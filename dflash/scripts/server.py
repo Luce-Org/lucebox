@@ -2757,8 +2757,7 @@ def main():
     # ── MTP (Multi-Token Prediction) speculator ──────────────────────────────
     # When --mtp-gguf is set, the daemon runs MTP-head speculation instead of
     # DFlash+DDTree. --draft is ignored (the MTP head is in the same GGUF as
-    # target, or a separate fused GGUF). Prefix-cache slots are auto-disabled
-    # in MTP mode because RESTORE does not snapshot MTP head KV yet.
+    # target, or a separate fused GGUF).
     ap.add_argument("--mtp-gguf", type=Path, default=None,
                     help="Path to MTP-fused GGUF. When set, daemon runs MTP "
                          "speculation; --draft and DFlash flags are ignored.")
@@ -2815,15 +2814,11 @@ def main():
         draft = None
     elif args.mtp_gguf is not None:
         # MTP mode: --draft is ignored; MTP head lives in the target (or in --mtp-gguf
-        # if separate). Force prefix/prefill cache off — RESTORE doesn't snapshot
-        # MTP head KV yet (planned for a follow-up PR).
+        # if separate). Prefix/full cache may stay enabled; PrefixSnapshot
+        # now carries native-head KV alongside backbone KV.
         if not args.mtp_gguf.is_file():
             raise SystemExit(f"--mtp-gguf not found at {args.mtp_gguf}")
         draft = None
-        if args.prefix_cache_slots > 0 or args.prefill_cache_slots > 0:
-            print("  [cfg] MTP mode: disabling prefix/prefill cache (MTP head KV snapshot not implemented)")
-            args.prefix_cache_slots = 0
-            args.prefill_cache_slots = 0
     else:
         draft = resolve_draft(args.draft) if args.draft.is_dir() else args.draft
         if not draft.is_file():
