@@ -118,6 +118,13 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // Sync max_ctx: if --max-ctx was not provided, use the backend's default.
+    // This prevents the HTTP server from accepting prompts larger than the
+    // KV cache the backend actually allocates.
+    if (sconfig.max_ctx <= 0) {
+        sconfig.max_ctx = bargs.device.max_ctx;
+    }
+
     // Load tokenizer.
     std::fprintf(stderr, "[server] loading tokenizer from %s\n", bargs.model_path);
     Tokenizer tokenizer;
@@ -155,8 +162,8 @@ int main(int argc, char ** argv) {
     }
 
     // Start HTTP server.
-    std::fprintf(stderr, "[server] starting HTTP server on %s:%d\n",
-                 sconfig.host.c_str(), sconfig.port);
+    std::fprintf(stderr, "[server] starting HTTP server on %s:%d (max_ctx=%d, fa_window=%d)\n",
+                 sconfig.host.c_str(), sconfig.port, sconfig.max_ctx, bargs.fa_window);
     HttpServer server(*backend, tokenizer, sconfig);
     if (pflash_enabled) {
         server.set_drafter_tokenizer(&drafter_tokenizer);

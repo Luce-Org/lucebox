@@ -41,7 +41,7 @@ struct ServerConfig {
     std::string host        = "0.0.0.0";
     int         port        = 8080;
     int         max_tokens  = 4096;     // default max output tokens
-    int         max_ctx     = 131072;   // model context window
+    int         max_ctx     = 0;        // 0 = use backend's DevicePlacement default (8192)
     bool        enable_cors = true;
     std::string model_name  = "dflash";
     int         prefix_cache_cap = 4;   // prefix cache slots (0 disables)
