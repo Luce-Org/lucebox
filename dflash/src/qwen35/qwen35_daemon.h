@@ -34,6 +34,12 @@ struct Qwen35DaemonArgs {
     float        ddtree_temp       = 1.0f;
     bool         ddtree_chain_seed = true;
     bool         use_feature_mirror = false;
+
+    // MTP (Multi-Token Prediction) speculator — mutually exclusive with draft
+    const char * mtp_gguf_path    = nullptr;   // path to fused MTP GGUF (or nullptr = DFlash)
+    int          mtp_gamma        = 0;         // max speculation depth
+    const char * mtp_draft_source = nullptr;   // "chain" | "mtp_topk" | nullptr -> "chain"
+    int          mtp_draft_topk   = 1;         // top-k for mtp_topk mode
 };
 
 // Run the qwen35 daemon loop. Returns 0 on clean exit, 1 on init failure.

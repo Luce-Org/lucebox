@@ -499,11 +499,33 @@ struct QwenGraphInputs {
     bool          capture_delta_intermediate = false; // if true, populate out_delta_captures
     int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
     bool          last_token_logits_only = false; // if true, only compute logits for last token (prefill optimization)
+    bool          capture_all_norm_hidden = false; // if true, expose full [n_embd, n_tokens] post-norm hidden as a graph output (MTP warmup needs this; non-MTP callers should leave false to avoid pinning ~7.5MB at ubatch=384)
     ggml_tensor * parent_ids = nullptr; // [n_tokens] i32; tree mode when non-null
 };
 
 struct QwenGraphOutputs {
     ggml_tensor * logits;      // [vocab, n_tokens] f32
+    // Post-norm hidden for the last committed token, shape [n_embd], f32.
+    // This is the output of out_norm before the LM-head projection.  Set as
+    // ggml_set_output so it remains valid after graph_compute.  Used by the
+    // Qwen3.6 MTP module to seed h_prev_0 for the first NextN head.
+    ggml_tensor * last_norm_hidden = nullptr;   // [n_embd] f32
+    // Full post-norm hidden sequence, shape [n_embd, n_tokens] f32.
+    // Same tensor as last_norm_hidden's parent; set as ggml_set_output so
+    // the MTP warm_head_kv() can read per-position hiddens during prefill.
+    ggml_tensor * all_norm_hidden = nullptr;    // [n_embd, n_tokens] f32
+    // Pre-final-output-norm hidden state.  Mirrors llama.cpp PR #22673's
+    // `t_h_pre_norm` (exposed in src/models/qwen35.cpp before the final
+    // build_norm).  The Qwen3.6 MTP module seeds its NextN head with this
+    // tensor for the OUTER spec-chain step (h_prev_0): feeding the
+    // post-output-norm hidden double-normalises against the head's own
+    // hnorm and compounds the per-depth rejection rate.  Last column only;
+    // shape [n_embd] f32.  Populated when capture_all_norm_hidden=true
+    // (the MTP enables hidden-seq capture and wants both).
+    ggml_tensor * last_h_pre_norm = nullptr;    // [n_embd] f32
+    // Full pre-output-norm hidden sequence [n_embd, n_tokens] f32.  Same
+    // capture flag as all_norm_hidden.
+    ggml_tensor * all_h_pre_norm = nullptr;     // [n_embd, n_tokens] f32
     // One entry per delta-net layer (48 for qwen35-27b). Only populated when
     // QwenGraphInputs::capture_delta_intermediate is true. Tensors are graph
     // views marked as ggml_set_output() so their data persists after

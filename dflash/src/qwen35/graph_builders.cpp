@@ -92,7 +92,8 @@ bool build_target_step(
     bool capture_delta_intermediate,
     int fa_window,
     bool last_token_logits_only,
-    int kq_stride_pad) {
+    int kq_stride_pad,
+    bool capture_all_norm_hidden) {
     step_graph_free(sg);
 
     ggml_init_params ip{};
@@ -135,10 +136,15 @@ bool build_target_step(
     gi.capture_delta_intermediate = capture_delta_intermediate;
     gi.fa_window                  = fa_window;
     gi.last_token_logits_only     = last_token_logits_only;
+    gi.capture_all_norm_hidden    = capture_all_norm_hidden;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
     sg.logits = go.logits;
+    sg.last_norm_hidden = go.last_norm_hidden;
+    sg.all_norm_hidden  = go.all_norm_hidden;  // null unless capture_all_norm_hidden
+    sg.last_h_pre_norm  = go.last_h_pre_norm;  // null unless capture_all_norm_hidden
+    sg.all_h_pre_norm   = go.all_h_pre_norm;   // null unless capture_all_norm_hidden
     sg.delta_captures = std::move(go.delta_captures);
     ggml_set_output(sg.logits);
 

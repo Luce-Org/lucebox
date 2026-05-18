@@ -880,8 +880,27 @@ static ggml_tensor * build_delta_net_block(
             S_v * S_v * r_elt,
             S_v * S_v * H_v * r_elt,
             inter_offset);
+        // The persistent cache buffer is sized for max_verify_tokens slots
+        // along its last dim (e.g. 16); chain verify may feed fewer than that
+        // (e.g. g+1 tokens, where g = max_gamma).  ggml_cpy requires matching
+        // nelements, so slice the dst down to n_seq_tokens.  Caller (gate in
+        // qwen35_dflash_target.cpp::verify_batch) ensures n_seq_tokens <=
+        // cap->ssm_intermediate_states->ne[3] before enabling capture, so the
+        // view never overflows the destination buffer.
+        ggml_tensor * inter_dst = cap->ssm_intermediate_states;
+        if ((int64_t)n_seq_tokens != inter_dst->ne[3]) {
+            inter_dst = ggml_view_4d(ctx, cap->ssm_intermediate_states,
+                cap->ssm_intermediate_states->ne[0],
+                cap->ssm_intermediate_states->ne[1],
+                cap->ssm_intermediate_states->ne[2],
+                n_seq_tokens,
+                cap->ssm_intermediate_states->nb[1],
+                cap->ssm_intermediate_states->nb[2],
+                cap->ssm_intermediate_states->nb[3],
+                /*offset=*/0);
+        }
         ggml_build_forward_expand(gf,
-            ggml_cpy(ctx, inter_view, cap->ssm_intermediate_states));
+            ggml_cpy(ctx, inter_view, inter_dst));
     }
     } // end of block started at `{` before `const int64_t S_v = head_v_dim;`
 
@@ -1142,7 +1161,59 @@ QwenGraphOutputs build_qwen35_graph(
     }
 
     // 2. Final norm
+    //
+    // 2pre. Capture PRE-final-output-norm hidden (mirrors llama.cpp
+    //       PR #22673's `t_h_pre_norm` from src/models/qwen35.cpp:208-211).
+    //       The Qwen3.6 MTP head's hnorm normalises h_prev internally; if
+    //       we feed it the post-output-norm hidden it double-normalises,
+    //       compounding the per-depth rejection rate (see audit notes in
+    //       qwen36_mtp.cpp:1743 / qwen36_mtp_graph.cpp:329).  Only wired
+    //       as a graph output when capture_all_norm_hidden is set — that
+    //       flag is owned by the MTP module's adapter.
+    ggml_tensor * last_h_pre_norm = nullptr;
+    ggml_tensor * all_h_pre_norm  = nullptr;
+    if (in.capture_all_norm_hidden) {
+        ggml_tensor * inpL_2d = ggml_reshape_2d(ctx, inpL, hidden, n_tokens);
+        last_h_pre_norm = ggml_view_2d(ctx, inpL_2d, hidden, 1,
+                                        inpL_2d->nb[1],
+                                        (size_t)(n_tokens - 1) * inpL_2d->nb[1]);
+        ggml_set_name(last_h_pre_norm, "last_h_pre_norm");
+        ggml_set_output(last_h_pre_norm);
+        ggml_build_forward_expand(gf, last_h_pre_norm);
+
+        all_h_pre_norm = inpL_2d;
+        ggml_set_name(all_h_pre_norm, "all_h_pre_norm");
+        ggml_set_output(all_h_pre_norm);
+        ggml_build_forward_expand(gf, all_h_pre_norm);
+    }
+
     ggml_tensor * out = rms_norm_mul(ctx, inpL, w.out_norm, w.rms_eps);
+
+    // 2a. Expose the last token's post-norm hidden as a named graph output.
+    //     This is h_prev_0 for the Qwen3.6 MTP module (the backbone's final
+    //     hidden state for the last committed token).  We always view the last
+    //     column of `out` regardless of whether last_token_logits_only is set,
+    //     so the MTP module always receives exactly one [n_embd] slice.
+    //     Empirical check: pre-norm capture (inpL) makes draft accept rate
+    //     strictly worse on Qwen3.6-27B; post-norm is correct.
+    ggml_tensor * last_norm_hidden = ggml_view_2d(ctx, out, hidden, 1,
+                                                   out->nb[1],
+                                                   (size_t)(n_tokens - 1) * out->nb[1]);
+    ggml_set_name(last_norm_hidden, "last_norm_hidden");
+    ggml_set_output(last_norm_hidden);
+    ggml_build_forward_expand(gf, last_norm_hidden);
+
+    // Optionally expose the full [n_embd, n_tokens] post-norm hidden sequence
+    // (used by Qwen3.6 MTP warm_head_kv).  Default off: keeping this output
+    // pinned across compute would otherwise reserve ~7.5MB at ubatch=384 for
+    // the non-MTP target_gen path that throws the sequence away.
+    ggml_tensor * all_norm_hidden = nullptr;
+    if (in.capture_all_norm_hidden) {
+        all_norm_hidden = out;
+        ggml_set_name(all_norm_hidden, "all_norm_hidden");
+        ggml_set_output(all_norm_hidden);
+        ggml_build_forward_expand(gf, all_norm_hidden);
+    }
 
     // 3. LM head — optionally only for the last token (prefill optimization:
     //    reduces logits from [vocab, n_tokens] to [vocab, 1], saving ~233MB
@@ -1163,6 +1234,10 @@ QwenGraphOutputs build_qwen35_graph(
 
     QwenGraphOutputs og = std::move(og_early);
     og.logits = logits;
+    og.last_norm_hidden = last_norm_hidden;
+    og.all_norm_hidden = all_norm_hidden;
+    og.last_h_pre_norm = last_h_pre_norm;
+    og.all_h_pre_norm  = all_h_pre_norm;
     return og;
 }
 

@@ -53,7 +53,8 @@ bool build_target_step(
     bool capture_delta_intermediate = false,
     int fa_window = 0,
     bool last_token_logits_only = false,
-    int kq_stride_pad = KQ_MASK_PAD);
+    int kq_stride_pad = KQ_MASK_PAD,
+    bool capture_all_norm_hidden = false);
 
 // Full target forward: DDTree tree-verify mode.
 bool build_target_step_tree(
