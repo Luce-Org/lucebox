@@ -236,6 +236,11 @@ add_library(dflash27b STATIC
     src/qwen35/qwen35_layer_split_dflash_target.cpp
     src/qwen35/layer_split_daemon_loop.cpp
     src/qwen35/qwen35_daemon.cpp
+    src/qwen36/qwen36_mtp.cpp
+    src/qwen36/qwen36_mtp_graph.cpp
+    src/qwen36/qwen36_mtp_loader.cpp
+    src/common/mtp_chain_runner.cpp
+    src/common/mtp_orchestrator.cpp
     src/common/sampler.cpp
     src/common/daemon_loop.cpp
     src/common/gguf_inspect.cpp
@@ -490,6 +495,11 @@ if(DFLASH27B_TESTS)
         add_executable(test_kv_quant test/test_kv_quant.cpp)
         target_include_directories(test_kv_quant PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(test_kv_quant PRIVATE dflash27b)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_common_mtp_orchestrator.cpp")
+        add_executable(test_common_mtp_orchestrator test/test_common_mtp_orchestrator.cpp)
+        target_include_directories(test_common_mtp_orchestrator PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_common_mtp_orchestrator PRIVATE dflash27b)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_vs_reference.cpp")
         add_executable(test_draft_vs_reference test/test_draft_vs_reference.cpp)
