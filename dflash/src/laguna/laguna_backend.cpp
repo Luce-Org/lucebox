@@ -147,6 +147,8 @@ GenerateResult LagunaBackend::generate(const GenerateRequest & req,
                                         const DaemonIO & io) {
     const bool no_mask = (std::getenv("DFLASH_NO_MASK") != nullptr);
     GenerateResult result;
+    DaemonIO out_io = io.with_token_callback(req.on_token);
+    const bool should_emit = req.stream || (bool)out_io.on_token;
     const int N = (int)req.prompt.size();
 
     if (N + req.n_gen > args_.max_ctx) {
@@ -216,7 +218,10 @@ GenerateResult LagunaBackend::generate(const GenerateRequest & req,
         if (next_tok == w_.eos_id || next_tok == w_.eos_chat_id) break;
         result.tokens.push_back(next_tok);
         history.push_back(next_tok);
-        if (req.stream) io.emit(next_tok);
+        if (should_emit) {
+            out_io.emit(next_tok);
+            if (out_io.cancelled) break;
+        }
         if (!w_.embedder.embed(&next_tok, 1, embed_step.data())) { ok = false; break; }
         std::vector<float> step_logits;
         if (!laguna_step(backend_, w_, cache_, embed_step.data(), 1,
@@ -226,7 +231,7 @@ GenerateResult LagunaBackend::generate(const GenerateRequest & req,
     auto t_g1 = std::chrono::steady_clock::now();
     result.decode_s = std::chrono::duration<double>(t_g1 - t_g0).count();
 
-    if (req.stream) io.emit(-1);
+    if (should_emit) out_io.emit(-1);
     if (!ok) { result.error = "decode"; return result; }
 
     result.ok = true;
@@ -240,6 +245,7 @@ GenerateResult LagunaBackend::restore_and_generate(int slot,
                                                      const DaemonIO & io) {
     const bool no_mask = (std::getenv("DFLASH_NO_MASK") != nullptr);
     GenerateResult result;
+    DaemonIO out_io = io.with_token_callback(req.on_token);
 
     if (!laguna_snapshot_restore(snapshots_[slot], cache_)) {
         std::fprintf(stderr, "[snap] RESTORE slot=%d: %s\n",
@@ -305,7 +311,8 @@ GenerateResult LagunaBackend::restore_and_generate(int slot,
         if (next_tok == w_.eos_id || next_tok == w_.eos_chat_id) break;
         history.push_back(next_tok);
         result.tokens.push_back(next_tok);
-        io.emit(next_tok);
+        out_io.emit(next_tok);
+        if (out_io.cancelled) break;
         if (!w_.embedder.embed(&next_tok, 1, embed_step.data())) { ok = false; break; }
         std::vector<float> step_logits;
         if (!laguna_step(backend_, w_, cache_, embed_step.data(), 1,
@@ -315,7 +322,7 @@ GenerateResult LagunaBackend::restore_and_generate(int slot,
     auto t_g1 = std::chrono::steady_clock::now();
     result.decode_s = std::chrono::duration<double>(t_g1 - t_g0).count();
 
-    io.emit(-1);
+    out_io.emit(-1);
     if (!ok) { result.error = "decode"; return result; }
 
     result.ok = true;

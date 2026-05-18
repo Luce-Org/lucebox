@@ -147,6 +147,7 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
         io.emit(next);
         committed++;
         cache_.cur_pos = committed;
+        if (io.cancelled) break;
 
         // Check EOS
         if (next == w_.eos_id || next == w_.eos_chat_id) break;
@@ -160,6 +161,7 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
 GenerateResult Gemma4Backend::generate(const GenerateRequest & req,
                                         const DaemonIO & io) {
     GenerateResult result;
+    DaemonIO out_io = io.with_token_callback(req.on_token);
     sampler_ = req.sampler;
     if (req.do_sample && sampler_.seed != 0) {
         sampler_rng_.seed(sampler_.seed);
@@ -167,7 +169,7 @@ GenerateResult Gemma4Backend::generate(const GenerateRequest & req,
 
     cache_.cur_pos = 0;
 
-    const int committed = do_prefill(req.prompt, io);
+    const int committed = do_prefill(req.prompt, out_io);
     if (committed < 0) {
         result.error = "prefill";
         return result;
@@ -204,23 +206,28 @@ GenerateResult Gemma4Backend::generate(const GenerateRequest & req,
             }
         }
         result.tokens.push_back(first);
-        io.emit(first);
+        out_io.emit(first);
+        if (out_io.cancelled) {
+            out_io.emit(-1);
+            result.ok = true;
+            return result;
+        }
 
         if (first == w_.eos_id || first == w_.eos_chat_id) {
-            io.emit(-1);
+            out_io.emit(-1);
             result.ok = true;
             return result;
         }
 
         if (req.n_gen > 1) {
-            if (!do_decode(committed, req.n_gen - 1, result.tokens, io)) {
+            if (!do_decode(committed, req.n_gen - 1, result.tokens, out_io)) {
                 result.error = "decode";
                 return result;
             }
         }
     }
 
-    io.emit(-1);
+    out_io.emit(-1);
     result.ok = true;
     return result;
 }

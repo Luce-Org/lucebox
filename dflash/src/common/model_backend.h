@@ -19,15 +19,31 @@
 
 namespace dflash27b {
 
+// Token callback for streaming generation. Called once per committed token.
+// Return true to continue generation, false to abort.
+using TokenCallback = std::function<bool(int32_t token)>;
+
 // ─── I/O handle passed to backend methods that need protocol output ─────
 struct DaemonIO {
     int stream_fd = -1;
 
+    // Optional token callback. When set, emit() calls this for each token
+    // (excluding the -1 sentinel). If it returns false, the `cancelled`
+    // flag is set and the caller should abort generation.
+    TokenCallback on_token;
+    mutable bool cancelled = false;
+
     // Write a single int32 to the stream fd (token or -1 sentinel).
+    // Also invokes on_token if set. Sets cancelled=true if on_token
+    // returns false (client disconnected).
     void emit(int32_t v) const;
+
+    // Return an IO handle that also invokes `cb` for emitted tokens.
+    DaemonIO with_token_callback(const TokenCallback & cb) const;
 };
 
 // ─── Generate request/result ────────────────────────────────────────────
+
 struct GenerateRequest {
     std::vector<int32_t>       prompt;
     int                        n_gen       = 0;
@@ -37,6 +53,11 @@ struct GenerateRequest {
     // Optional inline-snap: snapshot at this position after prefill.
     int                        snap_pos    = -1;
     int                        snap_slot   = -1;
+    // Optional token callback for streaming. When set, backends call this
+    // for each committed token. If it returns false, generation aborts
+    // immediately. This is the primary mechanism for client-disconnect
+    // cancellation in the native HTTP server.
+    TokenCallback              on_token;
 };
 
 struct GenerateResult {
@@ -84,6 +105,23 @@ struct ModelBackend {
 
     // ── Compress (pflash) ────────────────────────────────────────────
     // Backend owns the DrafterContext lifecycle and park/unpark policy.
+
+    struct CompressRequest {
+        std::vector<int32_t> input_ids;      // drafter-tokenized prompt
+        float                keep_ratio;      // fraction to keep (0.0–1.0)
+        std::string          drafter_path;    // GGUF path (for lazy-load)
+        bool                 skip_park;       // true on ≥32GB GPUs
+    };
+
+    struct CompressResult {
+        bool                 ok = false;
+        std::vector<int32_t> compressed_ids;  // surviving token IDs
+    };
+
+    // Typed compress API (preferred for in-process callers).
+    virtual CompressResult compress(const CompressRequest & req);
+
+    // Legacy string-based compress (for daemon_loop stdin protocol).
     // `line` is the full "compress ..." command line.
     virtual bool handle_compress(const std::string & line,
                                   const DaemonIO & io) = 0;

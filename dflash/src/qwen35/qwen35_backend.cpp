@@ -353,6 +353,7 @@ void Qwen35Backend::shutdown() {
 GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
                                         const DaemonIO & io) {
     GenerateResult result;
+    DaemonIO out_io = io.with_token_callback(req.on_token);
     sampler_ = req.sampler;
     if (req.do_sample && sampler_.seed != 0) {
         sampler_rng_.seed(sampler_.seed);
@@ -365,7 +366,7 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
 
     // Prefill
     auto t_prefill_start = std::chrono::steady_clock::now();
-    const int committed = do_prefill(req.prompt, io, req.snap_pos, req.snap_slot);
+    const int committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
     if (committed < 0) {
         result.error = "prefill";
         return result;
@@ -376,7 +377,7 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
     // Decode (speculative)
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
-        if (!do_spec_decode(committed, req.n_gen, result.tokens, io)) {
+        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io)) {
             result.error = "decode";
             return result;
         }
@@ -394,9 +395,10 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
                                                     const GenerateRequest & req,
                                                     const DaemonIO & io) {
     GenerateResult result;
+    DaemonIO out_io = io.with_token_callback(req.on_token);
     if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) {
         result.error = "bad slot";
-        io.emit(-1);
+        out_io.emit(-1);
         return result;
     }
 
@@ -419,7 +421,7 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
     if (prompt_len > snap_pos) {
         auto t_prefill_start = std::chrono::steady_clock::now();
         std::vector<int32_t> delta = restore_prompt_delta(req.prompt, snap_pos);
-        committed = do_prefill(delta, io, req.snap_pos, req.snap_slot, /*kv_offset=*/snap_pos);
+        committed = do_prefill(delta, out_io, req.snap_pos, req.snap_slot, /*kv_offset=*/snap_pos);
         if (committed < 0) {
             result.error = "prefill";
             return result;
@@ -429,14 +431,14 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
     } else if (prompt_len > 0 && prompt_len < snap_pos) {
         // Cached more than the request — should never happen in practice.
         result.error = "snapshot_longer_than_prompt";
-        io.emit(-1);
+        out_io.emit(-1);
         return result;
     }
 
     // Decode
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
-        if (!do_spec_decode(committed, req.n_gen, result.tokens, io)) {
+        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io)) {
             result.error = "decode";
             return result;
         }
@@ -627,6 +629,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         io.emit(next_tok);
         committed++;
         cache_.cur_pos = committed;
+        if (io.cancelled) break;
 
         if (IS_EOS_TOK(next_tok, w_)) break;
     }
@@ -666,9 +669,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // AR fallback: emit first token, then loop.
         out_tokens.push_back(last_tok);
         io.emit(last_tok);
-        if (IS_EOS_TOK(last_tok, w_)) { io.emit(-1); return true; }
         committed++;
         cache_.cur_pos = committed;
+        if (io.cancelled || IS_EOS_TOK(last_tok, w_)) { io.emit(-1); return true; }
         bool ok = do_ar_decode(committed, n_gen - 1, out_tokens, io);
         io.emit(-1);
         return ok;
@@ -820,6 +823,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             out_tokens.push_back(replay_tok[i]);
             io.emit(replay_tok[i]);
             emitted++;
+            if (io.cancelled) break;
             if (IS_EOS_TOK(replay_tok[i], w_)) { hit_eos = true; break; }
         }
         committed   += emitted;
@@ -827,6 +831,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         n_generated += emitted;
         n_accept_sum += std::min(accept_n, emitted);
         n_draft_steps++;
+        if (io.cancelled) break;
         if (hit_eos) break;
     }
 
