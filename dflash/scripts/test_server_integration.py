@@ -511,10 +511,41 @@ class TestAnthropicAPI:
         assert r.status_code == 200
         assert r.json()["type"] == "message"
 
+    def test_messages_billing_header_stripped(self):
+        """Billing header blocks in system should be stripped, not sent to model."""
+        billing = "x-anthropic-billing-header: cc_version=2.1.37.0d9; cc_entrypoint=cli; cch=fa690;"
+        r = post_json("/v1/messages", {
+            "model": MODEL_NAME,
+            "system": [
+                {"type": "text", "text": billing},
+                {"type": "text", "text": "You always reply in uppercase."},
+            ],
+            "messages": [{"role": "user", "content": "Say hi"}],
+            "stream": False,
+            "max_tokens": 16,
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["type"] == "message"
+        assert data["role"] == "assistant"
+        # Model should produce output (system wasn't dropped entirely).
+        assert len(data["content"]) >= 1
+        assert len(data["content"][-1]["text"]) > 0
 
-# ═══════════════════════════════════════════════════════════════════
-# Error handling
-# ═══════════════════════════════════════════════════════════════════
+    def test_messages_billing_header_only_system(self):
+        """If system contains only the billing header, request still succeeds."""
+        billing = "x-anthropic-billing-header: cc_version=2.1.37.0d9; cc_entrypoint=cli; cch=fa690;"
+        r = post_json("/v1/messages", {
+            "model": MODEL_NAME,
+            "system": [{"type": "text", "text": billing}],
+            "messages": [{"role": "user", "content": "What is 2+2? Reply with just the number."}],
+            "stream": False,
+            "max_tokens": 16,
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["type"] == "message"
+        assert len(data["content"]) >= 1
 
 class TestErrors:
     def test_unknown_endpoint_returns_404(self):
