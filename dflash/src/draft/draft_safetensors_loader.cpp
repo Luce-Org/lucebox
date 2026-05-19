@@ -29,6 +29,7 @@
 
 #include "internal.h"
 
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -168,6 +169,124 @@ ggml_type st_dtype_to_ggml(const std::string & dt) {
     if (dt == "F16")  return GGML_TYPE_F16;
     if (dt == "F32")  return GGML_TYPE_F32;
     return GGML_TYPE_COUNT;  // sentinel "invalid"
+}
+
+const StEntry * find_st(const StMap & st, const std::string & name) {
+    auto it = st.find(name);
+    if (it == st.end()) {
+        set_last_error("safetensors: missing tensor '" + name + "'");
+        return nullptr;
+    }
+    return &it->second;
+}
+
+bool st_shape1(const StMap & st, const std::string & name, int64_t & d0) {
+    const StEntry * e = find_st(st, name);
+    if (!e) return false;
+    if (e->shape.size() != 1) {
+        set_last_error("safetensors: '" + name + "' ndim mismatch");
+        return false;
+    }
+    d0 = e->shape[0];
+    return true;
+}
+
+bool st_shape2(const StMap & st, const std::string & name, int64_t & d0, int64_t & d1) {
+    const StEntry * e = find_st(st, name);
+    if (!e) return false;
+    if (e->shape.size() != 2) {
+        set_last_error("safetensors: '" + name + "' ndim mismatch");
+        return false;
+    }
+    d0 = e->shape[0];
+    d1 = e->shape[1];
+    return true;
+}
+
+bool same_dim(const std::string & name, int64_t got, int64_t want) {
+    if (got == want) return true;
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "safetensors: '%s' dim=%lld expected %lld",
+                  name.c_str(), (long long)got, (long long)want);
+    set_last_error(buf);
+    return false;
+}
+
+bool positive_i32(const std::string & name, int64_t v, int & out) {
+    if (v > 0 && v <= INT32_MAX) {
+        out = (int)v;
+        return true;
+    }
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "safetensors: '%s' invalid dim %lld",
+                  name.c_str(), (long long)v);
+    set_last_error(buf);
+    return false;
+}
+
+bool infer_draft_dims_from_safetensors(const StMap & st, DraftWeights & out) {
+    int64_t hidden = 0;
+    if (!st_shape1(st, "hidden_norm.weight", hidden)) return false;
+    if (hidden <= 0) {
+        set_last_error("safetensors: hidden_norm.weight invalid dim");
+        return false;
+    }
+    int64_t out_norm_hidden = 0;
+    if (!st_shape1(st, "norm.weight", out_norm_hidden)) return false;
+    if (!same_dim("norm.weight", out_norm_hidden, hidden)) return false;
+
+    int64_t fc_out = 0;
+    int64_t fc_in = 0;
+    if (!st_shape2(st, "fc.weight", fc_out, fc_in)) return false;
+    if (!same_dim("fc.weight[0]", fc_out, hidden)) return false;
+    if (fc_in % hidden != 0) {
+        set_last_error("safetensors: fc.weight input dim is not a multiple of hidden size");
+        return false;
+    }
+
+    int64_t ffn_hidden = 0;
+    int64_t ffn_inter = 0;
+    if (!st_shape2(st, "layers.0.mlp.gate_proj.weight", ffn_inter, ffn_hidden)) return false;
+    if (!same_dim("layers.0.mlp.gate_proj.weight[1]", ffn_hidden, hidden)) return false;
+
+    int64_t q_dim = 0;
+    int64_t q_hidden = 0;
+    if (!st_shape2(st, "layers.0.self_attn.q_proj.weight", q_dim, q_hidden)) return false;
+    if (!same_dim("layers.0.self_attn.q_proj.weight[1]", q_hidden, hidden)) return false;
+
+    int64_t kv_dim = 0;
+    int64_t k_hidden = 0;
+    if (!st_shape2(st, "layers.0.self_attn.k_proj.weight", kv_dim, k_hidden)) return false;
+    if (!same_dim("layers.0.self_attn.k_proj.weight[1]", k_hidden, hidden)) return false;
+    int64_t v_dim = 0;
+    int64_t v_hidden = 0;
+    if (!st_shape2(st, "layers.0.self_attn.v_proj.weight", v_dim, v_hidden)) return false;
+    if (!same_dim("layers.0.self_attn.v_proj.weight[0]", v_dim, kv_dim)) return false;
+    if (!same_dim("layers.0.self_attn.v_proj.weight[1]", v_hidden, hidden)) return false;
+
+    int64_t head_dim = 0;
+    if (!st_shape1(st, "layers.0.self_attn.q_norm.weight", head_dim)) return false;
+    if (head_dim <= 0) {
+        set_last_error("safetensors: layers.0.self_attn.q_norm.weight invalid dim");
+        return false;
+    }
+    int64_t k_head_dim = 0;
+    if (!st_shape1(st, "layers.0.self_attn.k_norm.weight", k_head_dim)) return false;
+    if (!same_dim("layers.0.self_attn.k_norm.weight", k_head_dim, head_dim)) return false;
+    if (q_dim % head_dim != 0 || kv_dim % head_dim != 0) {
+        set_last_error("safetensors: attention projection dims are not divisible by head_dim");
+        return false;
+    }
+
+    if (!positive_i32("hidden_norm.weight", hidden, out.n_embd)) return false;
+    if (!positive_i32("layers.0.mlp.gate_proj.weight[0]", ffn_inter, out.n_ff)) return false;
+    if (!positive_i32("layers.0.self_attn.q_norm.weight", head_dim, out.head_dim)) return false;
+    if (!positive_i32("q_proj heads", q_dim / head_dim, out.n_head)) return false;
+    if (!positive_i32("kv_proj heads", kv_dim / head_dim, out.n_head_kv)) return false;
+    if (!positive_i32("fc target layers", fc_in / hidden, out.n_target_layers)) return false;
+    return true;
 }
 
 struct Mmap {
@@ -379,21 +498,30 @@ bool load_draft_safetensors(const std::string & path,
     out.backend = backend;
     out.n_layer   = n_layers;
 
-    // Draft model dims: prefer target model metadata, fall back to compiled defaults.
+    // Draft model dims come from the safetensors header. The draft is an
+    // independent transformer: Qwen3.6-27B target metadata reports
+    // head_dim=256/n_head_kv=4, while the DFlash draft tensors are
+    // head_dim=128/n_head_kv=8. The header already contains the authoritative
+    // tensor shapes, so infer from that instead of inheriting target dims.
+    if (!infer_draft_dims_from_safetensors(st, out)) return false;
     if (target) {
-        out.n_embd    = target->n_embd;
-        out.n_head    = target->n_head;
-        out.n_head_kv = target->n_head_kv;
-        out.head_dim  = target->n_embd_head_k;
-        out.n_ff      = target->n_ff;
         out.mask_token_id = target->mask_token_id;
-        out.n_target_layers = target->n_capture_layers;
-    } else {
-        out.n_head    = DFLASH27B_TARGET_N_HEADS;
-        out.n_head_kv = DFLASH27B_TARGET_N_KV_HEADS;
-        out.head_dim  = DFLASH27B_TARGET_HEAD_DIM;
-        out.n_embd    = DFLASH27B_TARGET_HIDDEN;
-        out.n_ff      = DFLASH27B_TARGET_INTERMEDIATE;
+        if (out.n_embd != target->n_embd) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                "draft hidden size %d does not match target hidden size %d",
+                out.n_embd, target->n_embd);
+            set_last_error(buf);
+            return false;
+        }
+        if (out.n_target_layers != target->n_capture_layers) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                "draft fc target layers %d does not match target capture layers %d",
+                out.n_target_layers, target->n_capture_layers);
+            set_last_error(buf);
+            return false;
+        }
     }
     out.layers.assign(n_layers, DraftLayer{});
 
