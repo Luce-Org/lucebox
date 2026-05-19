@@ -158,10 +158,15 @@ def compress_text_via_daemon(
             _send_and_ack(daemon_stdin, r_pipe, "park target\n")
             _send_and_ack(daemon_stdin, r_pipe, "park draft\n")
 
-        # 4) compress: drafter loads, FlashPrefill scoring, emit compressed ids, drafter held
+        # 4) compress: drafter loads, FlashPrefill scoring, emit compressed ids, drafter held.
+        # When skip_park=True we MUST also tell the C++ side via the "nopark" trailing
+        # token — otherwise handle_compress parks target/draft internally even though
+        # Python already decided not to, which invalidates MTP's bound tensor pointers
+        # on the unpark restore and crashes with ggml shape assertions.
         keep_x1000 = int(round(cfg.keep_ratio * 1000))
+        nopark_tok = " nopark" if skip_park else ""
         daemon_stdin.write(
-            f"compress {path} {keep_x1000} {cfg.drafter_gguf}\n".encode("utf-8"))
+            f"compress {path} {keep_x1000} {cfg.drafter_gguf}{nopark_tok}\n".encode("utf-8"))
         daemon_stdin.flush()
         compressed_ids = _drain_until_sentinel(r_pipe)
 
