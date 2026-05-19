@@ -14,6 +14,23 @@ harness/clients/run_codex.sh
 Each launcher starts `dflash/scripts/server.py`, runs the client, writes logs
 under `/workspace/lucebox-client-harness-runs`, then stops the server.
 
+Set `LUCEBOX_SERVER_BACKEND=cpp` to run the native C++ HTTP server instead.
+The launcher will start `dflash/build/dflash_server` by default, or the path in
+`DFLASH_SERVER_BIN`.
+
+```bash
+LUCEBOX_SERVER_BACKEND=cpp \
+DFLASH_SERVER_BIN=dflash/build/dflash_server \
+MAX_CTX=32768 MAX_TOKENS=512 \
+BUDGET=22 VERIFY_MODE=ddtree \
+harness/clients/run_codex.sh
+```
+
+The C++ server is expected to handle the same client protocol shapes covered by
+these launchers and probes: OpenAI Chat Completions, streaming chunks, tool
+metadata, OpenAI Responses for Codex, Anthropic Messages for Claude Code, and
+Open WebUI model metadata.
+
 ## Defaults
 
 The defaults below are the current RTX 3090 starting points for

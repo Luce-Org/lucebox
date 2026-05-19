@@ -26,6 +26,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <cstddef>
 
 namespace dflash27b {
 
@@ -141,6 +142,11 @@ private:
     // ── Sampler state ────────────────────────────────────────────────
     SamplerCfg      sampler_;
     std::mt19937_64 sampler_rng_{std::random_device{}()};
+
+    // Last prefill chunk metadata, used to sample the first generated token
+    // without deriving a chunk-local offset from absolute KV position.
+    std::size_t     prefill_last_logits_offset_ = 0;
+    bool            prefill_last_logits_valid_  = false;
 
     // ── DFlashTarget adapter (lazy-built) ────────────────────────────
     std::unique_ptr<DFlashTarget> dflash_target_;

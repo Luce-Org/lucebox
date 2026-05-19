@@ -47,6 +47,36 @@ Use the native C++ server instead of the Python server:
 LUCEBOX_SERVER_BACKEND=cpp harness/clients/run_codex.sh
 ```
 
+The native server binary defaults to `dflash/build/dflash_server`. Override the
+paths and profile the same way as the Python backend:
+
+```bash
+LUCEBOX_SERVER_BACKEND=cpp \
+DFLASH_SERVER_BIN=dflash/build/dflash_server \
+TARGET=dflash/models/Qwen3.6-27B-Q4_K_M.gguf \
+DRAFT=dflash/models/draft/dflash-draft-3.6-q8_0.gguf \
+MODEL_ID=luce-dflash \
+MAX_CTX=32768 MAX_TOKENS=512 \
+BUDGET=22 VERIFY_MODE=ddtree FA_WINDOW=2048 \
+harness/clients/run_codex.sh
+```
+
+To test an already-running native server:
+
+```bash
+dflash/build/dflash_server dflash/models/Qwen3.6-27B-Q4_K_M.gguf \
+  --draft dflash/models/draft/dflash-draft-3.6-q8_0.gguf \
+  --host 127.0.0.1 --port 18080 \
+  --max-ctx 32768 --max-tokens 512 \
+  --fa-window 2048 \
+  --ddtree --ddtree-budget 22 \
+  --model-name luce-dflash
+
+python3 harness/client_test_runner.py probe \
+  --url http://127.0.0.1:18080 \
+  --clients all
+```
+
 The per-client defaults live in [`clients/README.md`](clients/README.md).
 They are not all the same: a tool-heavy agent prompt and a chat/proxy prompt
 need different context limits on a 24 GB card.

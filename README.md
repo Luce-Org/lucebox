@@ -64,6 +64,16 @@ harness/clients/run_claude_code.sh
 python3 harness/client_test_runner.py probe --url http://127.0.0.1:8000
 ```
 
+The harness can also launch the native C++ HTTP server instead of the Python
+server wrapper:
+
+```bash
+LUCEBOX_SERVER_BACKEND=cpp \
+DFLASH_SERVER_BIN=dflash/build/dflash_server \
+MAX_CTX=32768 BUDGET=22 VERIFY_MODE=ddtree \
+harness/clients/run_codex.sh
+```
+
 ## 01 · Megakernel Qwen3.5 0.8B on RTX 3090
 
 Single-kernel CUDA inference for Qwen 3.5-0.8B on RTX 3090. All 24 layers run in one persistent dispatch.
@@ -120,6 +130,7 @@ uv sync
 cmake -B dflash/build -S dflash -DCMAKE_BUILD_TYPE=Release
 cmake --build dflash/build --target test_dflash -j
 cmake --build dflash/build --target test_generate -j
+cmake --build dflash/build --target dflash_server -j
 
 # 4. fetch weights: ~16 GB Q4_K_M target + 1.84 GB Lucebox Q8_0 GGUF DFlash draft
 uv run hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir dflash/models/

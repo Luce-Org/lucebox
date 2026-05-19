@@ -143,6 +143,45 @@ DFLASH_TARGET=models/Qwen3.6-27B-Q4_K_M.gguf python3 scripts/bench_he.py --n-gen
 
 The default draft path is discovered under `models/draft/`. Scripts prefer `dflash-draft-*.gguf`, then any `.gguf`, then `model.safetensors`. Explicit `.gguf` and safetensors drafts still work via `DFLASH_DRAFT` / `--draft`; qwen35-compatible targets remain swappable via `DFLASH_TARGET` / `--target`.
 
+## Native C++ HTTP server
+
+`dflash_server` serves the same client-facing local API surface used by the
+harnesses without the Python `scripts/server.py` wrapper. It supports `/health`,
+`/v1/models`, OpenAI Chat Completions including streaming and tool metadata,
+OpenAI Responses for Codex, Anthropic Messages for Claude Code, and Open WebUI
+model metadata.
+
+Build it with the rest of the CUDA runtime:
+
+```bash
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target dflash_server -j
+```
+
+Run it directly:
+
+```bash
+./build/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf \
+  --draft models/draft/dflash-draft-3.6-q8_0.gguf \
+  --host 127.0.0.1 --port 18080 \
+  --max-ctx 32768 --max-tokens 512 \
+  --fa-window 2048 \
+  --ddtree --ddtree-budget 22 \
+  --model-name luce-dflash
+```
+
+Then point OpenAI-compatible clients at `http://127.0.0.1:18080/v1`, or probe
+the server with:
+
+```bash
+python3 ../harness/client_test_runner.py probe \
+  --url http://127.0.0.1:18080 \
+  --clients all
+```
+
+On fragile external RTX links, use the same conservative NVIDIA profile as the
+RTX mixed-hardware notes before running long prompts.
+
 Reference measurements from the Qwen3.6 bring-up on RTX 3090:
 
 | Target | Draft | Bench | AL | Accept | Mean tok/s |

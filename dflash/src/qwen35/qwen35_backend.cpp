@@ -470,11 +470,13 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     (void)io;
 
     const int hidden = w_.n_embd;
+    const int vocab  = w_.n_vocab;
     int prefill_ubatch = 512;
     if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
         prefill_ubatch = std::max(1, std::atoi(s));
     }
     const int prompt_len = (int)tokens.size();
+    prefill_last_logits_valid_ = false;
 
     // Skip KV-cache migration when resuming from a snapshot — the cache was
     // already migrated when the snapshot was taken; re-running migrate would
@@ -561,10 +563,15 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
 
         int32_t last_tok = -1;
+        const bool is_final_chunk = (start + n_tokens >= prompt_len);
         const size_t argmax_off =
-            (start + n_tokens < prompt_len) ? 0 : sizeof(int32_t) * (size_t)(n_tokens - 1);
+            is_final_chunk ? sizeof(int32_t) * (size_t)(n_tokens - 1) : 0;
         ggml_backend_tensor_get(sg_.argmax_tokens, &last_tok, argmax_off, sizeof(int32_t));
         cache_.last_tok = last_tok;
+        if (is_final_chunk) {
+            prefill_last_logits_offset_ = (size_t)(n_tokens - 1) * (size_t)vocab * sizeof(float);
+            prefill_last_logits_valid_ = true;
+        }
 
         committed = kv_pos + n_tokens;
         cache_.cur_pos = committed;
@@ -590,46 +597,34 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     return committed;
 }
 
-bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
-                                    std::vector<int32_t> & out_tokens,
-                                    const DaemonIO & io) {
-    // TODO: Migrate the speculative decode loop from test_dflash.cpp.
-    // For now, fall back to simple autoregressive decode (no draft).
-
 bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                   std::vector<int32_t> & out_tokens,
                                   const DaemonIO & io) {
+    if (n_gen <= 0) return true;
+
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
     std::vector<float> logits_buf(vocab);
     std::vector<float> embed_buf_vec(hidden);
     float * embed_buf = embed_buf_vec.data();
 
-    // First token: sample from the prefill's last-position logits (already
-    // computed by do_prefill's final ggml_backend_graph_compute).
-    // The last chunk used last_token_logits_only=false, so sg_.logits holds
-    // logits for ALL positions in that chunk.  We need the LAST position.
+    // First token: consume the final prefill position.  Do not derive this
+    // offset from committed/KV position: restore paths can prefill a delta at
+    // nonzero KV offsets, and committed then no longer describes chunk size.
     {
-        const int PREFILL_UBATCH = 512;
-        int n_last_chunk = committed % PREFILL_UBATCH;
-        if (n_last_chunk == 0) n_last_chunk = PREFILL_UBATCH;
-        const size_t last_pos_offset = (size_t)(n_last_chunk - 1) * vocab * sizeof(float);
-        ggml_backend_tensor_get(sg_.logits, logits_buf.data(), last_pos_offset,
-                                sizeof(float) * vocab);
         int32_t first_tok;
         if (sampler_.temp > 0) {
+            if (!prefill_last_logits_valid_) return false;
+            ggml_backend_tensor_get(sg_.logits, logits_buf.data(), prefill_last_logits_offset_,
+                                    sizeof(float) * vocab);
             first_tok = sample_logits(logits_buf.data(), vocab, sampler_,
                                       out_tokens, sampler_rng_);
         } else {
-            first_tok = 0;
-            float best = logits_buf[0];
-            for (int j = 1; j < vocab; j++) {
-                if (logits_buf[j] > best) { best = logits_buf[j]; first_tok = j; }
-            }
+            first_tok = cache_.last_tok;
         }
         out_tokens.push_back(first_tok);
         io.emit(first_tok);
-        if (IS_EOS_TOK(first_tok, w_)) { io.emit(-1); return true; }
+        if (IS_EOS_TOK(first_tok, w_)) return true;
         committed++;
         cache_.cur_pos = committed;
     }
@@ -706,13 +701,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         && sampler_.temp == 0.0f;
 
     if (!can_spec) {
-        // AR fallback: emit first token, then loop.
-        out_tokens.push_back(last_tok);
-        io.emit(last_tok);
-        committed++;
-        cache_.cur_pos = committed;
-        if (io.cancelled || IS_EOS_TOK(last_tok, w_)) { io.emit(-1); return true; }
-        bool ok = do_ar_decode(committed, n_gen - 1, out_tokens, io);
+        // AR fallback consumes the final prefill position itself, then advances
+        // one token at a time.
+        bool ok = do_ar_decode(committed, n_gen, out_tokens, io);
         io.emit(-1);
         return ok;
     }
