@@ -23,7 +23,7 @@ namespace dflash27b {
 namespace flashprefill {
 
 // Defined in flashprefill_kernels.hip.cu.
-extern "C" void launch_transpose_kv_bf16(
+extern "C" int launch_transpose_kv_bf16(
     const void * src, void * dst,
     int B, int S, int H, int head_dim,
     hipStream_t stream);
@@ -86,8 +86,8 @@ extern "C" int launch_bsa_sparse_flash_forward_bf16(
         kv_buf_cap = kv_bytes;
     }
 
-    launch_transpose_kv_bf16(K, kv_buf_K, B, S, Hk, D, stream);
-    launch_transpose_kv_bf16(V, kv_buf_V, B, S, Hk, D, stream);
+    if (launch_transpose_kv_bf16(K, kv_buf_K, B, S, Hk, D, stream) != 0) return -1;
+    if (launch_transpose_kv_bf16(V, kv_buf_V, B, S, Hk, D, stream) != 0) return -1;
 
     // Strides for transposed [B, Hk, S, D] layout.
     const int s_Kt_b = Hk * S * D, s_Kt_h = S * D, s_Kt_n = D, s_Kt_d = 1;

@@ -294,6 +294,9 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
 elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     set_target_properties(dflash27b PROPERTIES HIP_ARCHITECTURES "${_dflash27b_archs}")
     target_compile_definitions(dflash27b PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+    # hip_compat shim is needed by ALL dflash27b sources (peer_access.cpp,
+    # dflash_feature_ring.cpp, flashprefill.cpp), not just the SM80_EQUIV path.
+    target_include_directories(dflash27b PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
 endif()
 
 # FlashPrefill custom kernels.
@@ -305,6 +308,9 @@ endif()
 # The dispatch in qwen3_graph.cpp checks buffer type at runtime:
 #   BF16 buffers → bf16 WMMA kernel; F16 buffers → f16 WMMA kernel; else → ggml FA.
 if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+    # rms_norm_hip.cu is needed by the HIP chunk-B graph path regardless of SM80_EQUIV.
+    target_sources(dflash27b PRIVATE src/rms_norm_hip.cu)
+    set_source_files_properties(src/rms_norm_hip.cu PROPERTIES LANGUAGE HIP)
     if(DFLASH27B_HIP_SM80_EQUIV)
         find_path(DFLASH27B_ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp
             HINTS "${_dflash27b_rocm_root}/include" /opt/rocm/include
@@ -399,10 +405,11 @@ endif()
 
 # BSA needs sm_80+ (FA-2 derived kernel uses BF16 tensor cores). Auto-disable
 # on legacy arches with a clear message instead of failing the link.
-if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND DFLASH27B_ENABLE_BSA)
+if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND DFLASH27B_ENABLE_BSA AND NOT DFLASH27B_HIP_SM80_EQUIV)
     message(WARNING
         "DFLASH27B_ENABLE_BSA=ON requested with DFLASH27B_GPU_BACKEND=hip; "
-        "disabling BSA because the bundled implementation is CUDA/CUTLASS-only.")
+        "disabling BSA because the bundled implementation is CUDA/CUTLASS-only. "
+        "Build with -DDFLASH27B_HIP_SM80_EQUIV=ON to enable the rocWMMA HIP BSA path.")
     set(DFLASH27B_ENABLE_BSA OFF)
 endif()
 if(DFLASH27B_ENABLE_BSA)

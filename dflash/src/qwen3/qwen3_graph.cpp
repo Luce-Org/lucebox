@@ -7,8 +7,10 @@
 //
 // **Algorithmic note vs blog**:
 //   The blog stack is Liu Q-hook tail scoring + FlashPrefill block-sparse FA.
-//   The Liu Q-hook is implemented exactly (uses full K_curr post-RoPE for
-//   tail scoring → score signal is exact). The block-sparse FA is replaced
+//   The Liu Q-hook is implemented with a NoPE fix: by default (DFLASH_FP_NOPE_TAIL=1)
+//   the tail score uses pre-RoPE K/Q, removing the RoPE distance decay that
+//   buries early-position needle chunks and was causing NIAH failures.
+//   Set DFLASH_FP_NOPE_TAIL=0 to revert to post-RoPE scoring.  The block-sparse FA is replaced
 //   with a sliding-window approximation here because (a) ggml-cuda's
 //   `flash_attn_ext` already gives tensor-core speed inside the ubatch
 //   graph, and (b) our own block-sparse CUDA kernel needs a tensor-core
@@ -77,22 +79,14 @@ struct HipChunkGraphB {
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
 
-    ggml_tensor * h_in     = nullptr;
-    ggml_tensor * attn_in  = nullptr;
-    ggml_tensor * h_after  = nullptr;
-    ggml_tensor * hf       = nullptr;
-    ggml_tensor * gate     = nullptr;
-    ggml_tensor * up       = nullptr;
-    ggml_tensor * gu       = nullptr;
-    ggml_tensor * ffn_out  = nullptr;
-    ggml_tensor * h_next   = nullptr;
+    ggml_tensor * h_in    = nullptr;   // input: hidden state slice (F32)
+    ggml_tensor * attn_in = nullptr;   // input: attention output slice (BF16)
+    ggml_tensor * h_after = nullptr;   // h_in + attn_proj residual (F32)
+    ggml_tensor * hf      = nullptr;   // FFN norm result written by custom kernel (F32)
+    ggml_tensor * h_next  = nullptr;   // output: updated hidden state (F32)
 
-    ggml_cgraph * gf_proj_add = nullptr;
-    ggml_cgraph * gf_gate     = nullptr;
-    ggml_cgraph * gf_up       = nullptr;
-    ggml_cgraph * gf_mul      = nullptr;
-    ggml_cgraph * gf_down     = nullptr;
-    ggml_cgraph * gf_add_out  = nullptr;
+    ggml_cgraph * gf_proj_add = nullptr;   // compute h_after = h_in + wo*attn_in
+    ggml_cgraph * gf_ffn      = nullptr;   // compute h_next = h_after + ffn(hf)
 };
 
 bool make_pers(ggml_backend_t backend, ggml_type type, int n_dim,
@@ -152,6 +146,8 @@ bool build_hip_chunk_graph_b(const Qwen3DrafterLayer & L,
 
     ggml_tensor * attn_proj = ggml_mul_mat(out.ctx, L.wo, out.attn_in);
     out.h_after = ggml_add(out.ctx, out.h_in, attn_proj);
+    // h_after is output of gf_proj_add AND input of gf_ffn (stops re-traversal).
+    ggml_set_input(out.h_after);
     ggml_set_output(out.h_after);
     out.gf_proj_add = ggml_new_graph_custom(out.ctx, 1024, false);
     ggml_build_forward_expand(out.gf_proj_add, out.h_after);
@@ -159,31 +155,16 @@ bool build_hip_chunk_graph_b(const Qwen3DrafterLayer & L,
     out.hf = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, hidden, chunk);
     ggml_set_input(out.hf);
 
-    out.gate = ggml_mul_mat(out.ctx, L.ffn_gate, out.hf);
-    out.gate = ggml_silu(out.ctx, out.gate);
-    ggml_set_output(out.gate);
-    out.gf_gate = ggml_new_graph_custom(out.ctx, 1024, false);
-    ggml_build_forward_expand(out.gf_gate, out.gate);
-
-    out.up = ggml_mul_mat(out.ctx, L.ffn_up, out.hf);
-    ggml_set_output(out.up);
-    out.gf_up = ggml_new_graph_custom(out.ctx, 1024, false);
-    ggml_build_forward_expand(out.gf_up, out.up);
-
-    out.gu = ggml_mul(out.ctx, out.gate, out.up);
-    ggml_set_output(out.gu);
-    out.gf_mul = ggml_new_graph_custom(out.ctx, 1024, false);
-    ggml_build_forward_expand(out.gf_mul, out.gu);
-
-    out.ffn_out = ggml_mul_mat(out.ctx, L.ffn_down, out.gu);
-    ggml_set_output(out.ffn_out);
-    out.gf_down = ggml_new_graph_custom(out.ctx, 1024, false);
-    ggml_build_forward_expand(out.gf_down, out.ffn_out);
-
-    out.h_next = ggml_add(out.ctx, out.h_after, out.ffn_out);
+    // gf_ffn: one combined graph for all FFN ops after the RMSNorm.
+    // h_after and hf are both inputs so no re-traversal into proj_add or norm.
+    ggml_tensor * gate    = ggml_silu(out.ctx, ggml_mul_mat(out.ctx, L.ffn_gate, out.hf));
+    ggml_tensor * up      = ggml_mul_mat(out.ctx, L.ffn_up, out.hf);
+    ggml_tensor * gu      = ggml_mul(out.ctx, gate, up);
+    ggml_tensor * ffn_out = ggml_mul_mat(out.ctx, L.ffn_down, gu);
+    out.h_next = ggml_add(out.ctx, out.h_after, ffn_out);
     ggml_set_output(out.h_next);
-    out.gf_add_out = ggml_new_graph_custom(out.ctx, 1024, false);
-    ggml_build_forward_expand(out.gf_add_out, out.h_next);
+    out.gf_ffn = ggml_new_graph_custom(out.ctx, 1024, false);
+    ggml_build_forward_expand(out.gf_ffn, out.h_next);
 
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
     if (!out.buf) {
@@ -200,7 +181,7 @@ void warm_hip_chunk_graph_b_once(ggml_backend_t backend, HipChunkGraphB & out) {
     }
 
     struct ggml_tensor * warm_tensors[] = {
-        out.h_in, out.attn_in, out.h_after, out.hf, out.gate, out.up, out.gu, out.ffn_out, out.h_next,
+        out.h_in, out.attn_in, out.h_after, out.hf, out.h_next,
     };
     for (ggml_tensor * t : warm_tensors) {
         cudaError_t e = cudaMemset(t->data, 0, ggml_nbytes(t));
@@ -210,11 +191,7 @@ void warm_hip_chunk_graph_b_once(ggml_backend_t backend, HipChunkGraphB & out) {
     }
 
     ggml_backend_graph_compute(backend, out.gf_proj_add);
-    ggml_backend_graph_compute(backend, out.gf_gate);
-    ggml_backend_graph_compute(backend, out.gf_up);
-    ggml_backend_graph_compute(backend, out.gf_mul);
-    ggml_backend_graph_compute(backend, out.gf_down);
-    ggml_backend_graph_compute(backend, out.gf_add_out);
+    ggml_backend_graph_compute(backend, out.gf_ffn);
     warmed = true;
 }
 #endif
@@ -231,6 +208,13 @@ inline uint16_t f32_to_f16(float f) {
 }
 
 } // namespace
+
+#if defined(DFLASH27B_BACKEND_HIP)
+extern "C" void launch_rms_norm_mul_w_f32(
+    const float * src, const float * w, float * dst,
+    int n_tokens, int hidden, float eps,
+    cudaStream_t stream);
+#endif
 
 bool forward_qwen3_drafter_model(
     const Qwen3DrafterWeights & w,
@@ -251,6 +235,12 @@ bool forward_qwen3_drafter_model(
     const float eps    = 1e-6f;
     const float scale  = 1.0f / std::sqrt((float)D);
     const float rope_b = w.rope_theta;
+    // Pre-RoPE tail scoring: removes RoPE distance decay from the score signal.
+    // Default ON; set DFLASH_FP_NOPE_TAIL=0 to disable (saves ~K_curr_v memory).
+    static const bool nope_tail = []() -> bool {
+        const char * e = std::getenv("DFLASH_FP_NOPE_TAIL");
+        return e == nullptr || std::string(e) != "0";
+    }();
 
     if (S < n_lookahead + 1) {
         set_last_error("forward_qwen3_drafter_model: S too small");
@@ -262,6 +252,9 @@ bool forward_qwen3_drafter_model(
     std::vector<PersBuf> K_curr_v((size_t)w.n_layer);
     std::vector<PersBuf> V_curr_v((size_t)w.n_layer);
     std::vector<PersBuf> Q_last_v((size_t)w.n_layer);
+    // NoPE: pre-RoPE K (full sequence) and Q tail; allocated only when nope_tail.
+    std::vector<PersBuf> K_norope_v(nope_tail ? (size_t)w.n_layer : 0);
+    std::vector<PersBuf> Q_norope_v(nope_tail ? (size_t)w.n_layer : 0);
     auto cleanup_all = [&]() {
         free_pers(hidden_buf);
         free_pers(pos_buf);
@@ -271,6 +264,8 @@ bool forward_qwen3_drafter_model(
         for (auto & p : K_curr_v) free_pers(p);
         for (auto & p : V_curr_v) free_pers(p);
         for (auto & p : Q_last_v) free_pers(p);
+        for (auto & p : K_norope_v) free_pers(p);
+        for (auto & p : Q_norope_v) free_pers(p);
     };
 
     {
@@ -280,11 +275,10 @@ bool forward_qwen3_drafter_model(
         int64_t d_ql[]  = {(int64_t)D, (int64_t)H,  (int64_t)n_lookahead};
         int64_t d_p[]   = {(int64_t)S};
         int64_t d_mt[]  = {(int64_t)S, (int64_t)n_lookahead};
-        // Use BF16 only for sm_80+ (native BF16 tensor cores). Volta/Turing
-        // use F16 with F16 WMMA kernels; other arches and HIP use F16 with
-        // ggml flash_attn_ext for the portable path.
+        // Use BF16 when rocWMMA or CUDA WMMA flashprefill kernels are compiled.
+        // HIP Phase 1 (q8 ggml fallback) and old CUDA arches stay with F16.
         const ggml_type half_type =
-#ifdef DFLASH27B_HAVE_SM80_FLASHPREFILL
+#if defined(DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL) || defined(DFLASH27B_HAVE_FLASHPREFILL)
             GGML_TYPE_BF16;
 #else
             GGML_TYPE_F16;
@@ -305,6 +299,14 @@ bool forward_qwen3_drafter_model(
                 set_last_error("forward_qwen3: K_curr/V_curr/Q_last alloc failed at layer " + std::to_string(il));
                 cleanup_all();
                 return false;
+            }
+            if (nope_tail) {
+                if (!make_pers(w.backend, half_type, 3, d_kv, K_norope_v[il]) ||
+                    !make_pers(w.backend, GGML_TYPE_F32, 3, d_ql, Q_norope_v[il])) {
+                    set_last_error("forward_qwen3: K_norope/Q_norope alloc failed at layer " + std::to_string(il));
+                    cleanup_all();
+                    return false;
+                }
             }
         }
     }
@@ -417,6 +419,19 @@ bool forward_qwen3_drafter_model(
             Q = ggml_reshape_3d(gA, Q, D, H, cl);
             Q = ggml_rms_norm(gA, Q, eps);
             Q = ggml_mul(gA, Q, L.q_norm);
+            // NoPE: capture pre-RoPE Q tail so the tail scorer is not biased by distance.
+            if (nope_tail) {
+                const int tail_lo_nr = S - n_lookahead;
+                if (tail_lo_nr >= cs && tail_lo_nr < cs + cl) {
+                    const int local_lo_nr = tail_lo_nr - cs;
+                    ggml_tensor * Q_prenrope_tail = ggml_view_3d(
+                        gA, Q, D, H, n_lookahead,
+                        Q->nb[1], Q->nb[2],
+                        (size_t)local_lo_nr * Q->nb[2]);
+                    ggml_build_forward_expand(gfA,
+                        ggml_cpy(gA, Q_prenrope_tail, Q_norope_v[il].t));
+                }
+            }
             Q = ggml_rope_ext(gA, Q, pos_chunk, nullptr, D,
                               GGML_ROPE_TYPE_NEOX, 0,
                               rope_b, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
@@ -425,6 +440,14 @@ bool forward_qwen3_drafter_model(
             K = ggml_reshape_3d(gA, K, D, Hk, cl);
             K = ggml_rms_norm(gA, K, eps);
             K = ggml_mul(gA, K, L.k_norm);
+            // NoPE: save pre-RoPE K chunk alongside K_curr_v.
+            if (nope_tail) {
+                const size_t kn_esz = ggml_element_size(K_norope_v[il].t);
+                ggml_tensor * Kn_dst = ggml_view_3d(gA, K_norope_v[il].t, D, Hk, cl,
+                                                    kn_esz * D, kn_esz * D * Hk,
+                                                    (size_t)cs * kn_esz * D * Hk);
+                ggml_build_forward_expand(gfA, ggml_cpy(gA, K, Kn_dst));
+            }
             K = ggml_rope_ext(gA, K, pos_chunk, nullptr, D,
                               GGML_ROPE_TYPE_NEOX, 0,
                               rope_b, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
@@ -572,10 +595,6 @@ bool forward_qwen3_drafter_model(
             set_last_error("graph B reusable build failed at layer " + std::to_string(il));
             ggml_gallocr_free(galloc); cleanup_all(); return false;
         }
-        std::vector<float> ffn_norm_cpu((size_t)hidden);
-        ggml_backend_tensor_get(L.ffn_norm, ffn_norm_cpu.data(), 0, ffn_norm_cpu.size() * sizeof(float));
-        std::vector<float> h_after_cpu((size_t)hidden * chunk_s_ff_v);
-        std::vector<float> hf_cpu((size_t)hidden * chunk_s_ff_v);
         auto tB_setup1 = std::chrono::steady_clock::now();
         t_b_setup += std::chrono::duration<double>(tB_setup1 - tB_setup0).count();
         if (debug_first_layer) {
@@ -657,7 +676,7 @@ bool forward_qwen3_drafter_model(
             // RMSNorm. (Reading h_after before this compute would pick up
             // the previous chunk's value — stale FFN inputs.)
             auto tB0 = std::chrono::steady_clock::now();
-            double proj_s = 0, gate_s = 0, up_s = 0, mul_s = 0, down_s = 0, add_s = 0;
+            double proj_s = 0, ffn_s = 0;
             auto one = [&](ggml_cgraph * gf, double & acc) {
                 auto ts0 = std::chrono::steady_clock::now();
                 ggml_backend_graph_compute(w.backend, gf);
@@ -667,28 +686,17 @@ bool forward_qwen3_drafter_model(
             one(gb.gf_proj_add, proj_s);
 
             auto tB_norm0 = std::chrono::steady_clock::now();
-            ggml_backend_tensor_get(gb.h_after, h_after_cpu.data(), 0, h_bytes);
-            for (int tok_idx = 0; tok_idx < cl; ++tok_idx) {
-                const size_t base = (size_t)tok_idx * hidden;
-                double sumsq = 0.0;
-                for (int i = 0; i < hidden; ++i) {
-                    const float v = h_after_cpu[base + i];
-                    sumsq += (double) v * (double) v;
-                }
-                const float inv = 1.0f / std::sqrt((float)(sumsq / hidden) + eps);
-                for (int i = 0; i < hidden; ++i) {
-                    hf_cpu[base + i] = h_after_cpu[base + i] * inv * ffn_norm_cpu[(size_t)i];
-                }
-            }
-            ggml_backend_tensor_set(gb.hf, hf_cpu.data(), 0, h_bytes);
+            launch_rms_norm_mul_w_f32(
+                (const float *)gb.h_after->data,
+                (const float *)L.ffn_norm->data,
+                (float *)gb.hf->data,
+                cl, hidden, eps,
+                /*stream=*/nullptr);
+            cudaDeviceSynchronize();
             auto tB_norm1 = std::chrono::steady_clock::now();
             t_b_norm += std::chrono::duration<double>(tB_norm1 - tB_norm0).count();
 
-            one(gb.gf_gate, gate_s);
-            one(gb.gf_up, up_s);
-            one(gb.gf_mul, mul_s);
-            one(gb.gf_down, down_s);
-            one(gb.gf_add_out, add_s);
+            one(gb.gf_ffn, ffn_s);
             auto tB1 = std::chrono::steady_clock::now();
             t_compute_b += std::chrono::duration<double>(tB1 - tB0).count();
 
@@ -706,10 +714,10 @@ bool forward_qwen3_drafter_model(
             t_b_copy_out += std::chrono::duration<double>(tB_copy_out1 - tB_copy_out0).count();
             if (debug_first_layer) {
                 std::fprintf(stderr,
-                             "[qwen3-0.6b-fp dbg] layer0 chunk B compute-done compute=%.3fs copy-out=%.3fs [proj=%.3f norm_cpu=%.3f gate=%.3f up=%.3f mul=%.3f down=%.3f add=%.3f]\n",
+                             "[qwen3-0.6b-fp dbg] layer0 chunk B compute-done compute=%.3fs copy-out=%.3fs [proj=%.3f norm_cpu=%.3f ffn=%.3f]\n",
                              std::chrono::duration<double>(tB1 - tB0).count(),
                              std::chrono::duration<double>(tB_copy_out1 - tB_copy_out0).count(),
-                             proj_s, std::chrono::duration<double>(tB_norm1 - tB_norm0).count(), gate_s, up_s, mul_s, down_s, add_s);
+                             proj_s, std::chrono::duration<double>(tB_norm1 - tB_norm0).count(), ffn_s);
                 std::fflush(stderr);
             }
             if (debug_first_layer) {
@@ -788,7 +796,8 @@ bool forward_qwen3_drafter_model(
         ggml_context * gctx = ggml_init(ip);
 
         ggml_tensor * K_f32 = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, D, Hk, S);
-        ggml_tensor * K_cast = ggml_cpy(gctx, K_curr_v[il].t, K_f32);
+        ggml_tensor * K_cast = ggml_cpy(gctx,
+            nope_tail ? K_norope_v[il].t : K_curr_v[il].t, K_f32);
         ggml_tensor * K_perm = ggml_cont(gctx,
             ggml_permute(gctx, K_cast, 0, 2, 1, 3));
         ggml_tensor * K_score = K_perm;
@@ -800,7 +809,9 @@ bool forward_qwen3_drafter_model(
             K_score = ggml_reshape_3d(gctx, K_rep, D, S, H);
         }
         ggml_tensor * Q_tail_perm = ggml_cont(gctx,
-            ggml_permute(gctx, Q_last_v[il].t, 0, 2, 1, 3));
+            ggml_permute(gctx,
+                nope_tail ? Q_norope_v[il].t : Q_last_v[il].t,
+                0, 2, 1, 3));
         ggml_tensor * attn_score = ggml_mul_mat(gctx, K_score, Q_tail_perm);
         ggml_tensor * probs = ggml_soft_max_ext(gctx, attn_score, mask_tail_buf.t,
                                                 scale, 0.0f);

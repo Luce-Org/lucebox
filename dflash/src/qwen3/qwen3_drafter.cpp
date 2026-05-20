@@ -505,9 +505,20 @@ static std::vector<int32_t> qwen35_score_and_compress(
     
     std::vector<uint8_t> selected((size_t)n_chunks, 0);
     int count = 0;
-    for (int c = 0; c < std::min(n_chunks, env_int("DFLASH_COMPRESS_HEAD_CHUNKS", 8)); ++c) { selected[(size_t)c] = 1; ++count; }
-    for (int c = std::max(0, n_chunks - env_int("DFLASH_COMPRESS_TAIL_CHUNKS", 24)); c < n_chunks; ++c) if (!selected[(size_t)c]) { selected[(size_t)c] = 1; ++count; }
-    
+    // Scale head/tail forced chunks so they don't crowd out top-K scoring.
+    {
+        const int h_raw = env_int("DFLASH_COMPRESS_HEAD_CHUNKS", 8);
+        const int t_raw = env_int("DFLASH_COMPRESS_TAIL_CHUNKS", 24);
+        int h_n = h_raw, t_n = t_raw;
+        if (h_n + t_n >= n_keep) {
+            const int budget = std::max(1, n_keep - 1);
+            h_n = std::max(0, h_raw * budget / (h_raw + t_raw));
+            t_n = std::max(0, budget - h_n);
+        }
+        for (int c = 0; c < std::min(n_chunks, h_n); ++c) { selected[(size_t)c] = 1; ++count; }
+        for (int c = std::max(0, n_chunks - t_n); c < n_chunks; ++c) if (!selected[(size_t)c]) { selected[(size_t)c] = 1; ++count; }
+    }
+
     const int query_tokens = env_int("DFLASH_COMPRESS_QUERY_TOKENS", 96);
     const int anchor_radius = env_int("DFLASH_COMPRESS_ANCHOR_RADIUS", 2);
     const int max_anchor_hits = env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", 8);
@@ -691,8 +702,15 @@ std::vector<int32_t> drafter_score_and_compress(
     // Retrieval tasks often repeat a rare key in the final query and in the
     // needle span. Exact scores alone can keep the query while dropping the
     // neighboring answer chunk, so force a small token-only anchor neighborhood.
-    const int head_chunks = env_int("DFLASH_COMPRESS_HEAD_CHUNKS", 8);
-    const int tail_chunks = env_int("DFLASH_COMPRESS_TAIL_CHUNKS", 24);
+    // Head/tail forced chunks scale with n_keep so top-K scoring always gets slots.
+    const int h_raw = env_int("DFLASH_COMPRESS_HEAD_CHUNKS", 8);
+    const int t_raw = env_int("DFLASH_COMPRESS_TAIL_CHUNKS", 24);
+    int head_chunks = h_raw, tail_chunks = t_raw;
+    if (head_chunks + tail_chunks >= n_keep) {
+        const int budget = std::max(1, n_keep - 1);
+        head_chunks = std::max(0, h_raw * budget / (h_raw + t_raw));
+        tail_chunks = std::max(0, budget - head_chunks);
+    }
     const int query_tokens = env_int("DFLASH_COMPRESS_QUERY_TOKENS", 96);
     const int anchor_radius = env_int("DFLASH_COMPRESS_ANCHOR_RADIUS", 2);
     const int max_anchor_hits = env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", 8);

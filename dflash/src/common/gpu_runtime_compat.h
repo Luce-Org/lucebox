@@ -32,6 +32,28 @@
 #define cudaStreamSynchronize hipStreamSynchronize
 #define cudaStream_t hipStream_t
 #define cudaSuccess hipSuccess
+#define cudaDeviceProp hipDeviceProp_t
+#define cudaDeviceReset hipDeviceReset
+#define cudaEvent_t hipEvent_t
+#define cudaEventCreate hipEventCreate
+#define cudaEventDestroy hipEventDestroy
+#define cudaEventElapsedTime hipEventElapsedTime
+#define cudaEventRecord hipEventRecord
+#define cudaEventSynchronize hipEventSynchronize
+#define cudaFreeAsync hipFreeAsync
+#define cudaGetDevice hipGetDevice
+#define cudaGetDeviceProperties hipGetDeviceProperties
+#define cudaMallocAsync hipMallocAsync
+#define cudaMallocHost hipHostMalloc
+#define cudaFreeHost hipHostFree
+#define cudaMemcpy hipMemcpy
+#define cudaMemcpyDefault hipMemcpyDefault
+#define cudaMemsetAsync hipMemsetAsync
+#define cudaStreamCreate hipStreamCreate
+#define cudaStreamDefault hipStreamDefault
+#define cudaStreamDestroy hipStreamDestroy
+#define cudaStreamNonBlocking hipStreamNonBlocking
+#define cudaErrorInvalidValue hipErrorInvalidValue
 
 #else
 

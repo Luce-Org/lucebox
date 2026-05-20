@@ -14,11 +14,7 @@ extern "C++" to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 #include <algorithm>
 #include <cstdio>
 
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
-#include <hip/hip_runtime.h>
-#else
-#include <cuda_runtime.h>
-#endif
+#include "gpu_runtime_compat.h"
 
 namespace dflash27b {
 

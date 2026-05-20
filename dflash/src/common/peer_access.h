@@ -13,11 +13,7 @@
 #include <cstdint>
 #include <unordered_map>
 
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
-#include <hip/hip_runtime.h>
-#else
-#include <cuda_runtime.h>
-#endif
+#include "gpu_runtime_compat.h"
 
 namespace dflash27b {
 

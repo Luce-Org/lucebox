@@ -38,12 +38,27 @@ __device__ __host__ inline hip_bfloat16 __float2bfloat16_rn(float x) {
 }
 #else
 // g++ / plain CXX path: bit-cast approach, no device attributes
+#include <cstdint>
 namespace __hip_bf16_compat_detail {
     // Truncating float→bf16: drop lower 16 mantissa bits.
-    inline uint16_t float_to_bf16_bits(float f) {
+    // Used by __float2bfloat16 (truncate-toward-zero semantics).
+    inline uint16_t float_to_bf16_bits_trunc(float f) {
         uint32_t u;
         std::memcpy(&u, &f, sizeof(u));
         return static_cast<uint16_t>(u >> 16);
+    }
+    // Round-to-nearest-even float→bf16.
+    // Adds the round bit (bit 15) plus a sticky bit to the lower 16 bits,
+    // then shifts. Handles NaN by preserving the mantissa (no quieting).
+    inline uint16_t float_to_bf16_bits_rne(float f) {
+        uint32_t u;
+        std::memcpy(&u, &f, sizeof(u));
+        // NaN: preserve payload, don't round.
+        if ((u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu))
+            return static_cast<uint16_t>(u >> 16);
+        // Add 0x7fff + lsb: rounds up when lower16 > 0x8000, ties to even when lower16 == 0x8000.
+        uint32_t lsb = (u >> 16) & 1u;
+        return static_cast<uint16_t>((u + 0x7fffu + lsb) >> 16);
     }
     inline float bf16_bits_to_float(uint16_t b) {
         uint32_t u = static_cast<uint32_t>(b) << 16;
@@ -55,12 +70,16 @@ namespace __hip_bf16_compat_detail {
 inline float __bfloat162float(hip_bfloat16 x) {
     return __hip_bf16_compat_detail::bf16_bits_to_float(x.data);
 }
+// Truncating variant — matches CUDA __float2bfloat16 (no-rn) semantics.
 inline hip_bfloat16 __float2bfloat16(float x) {
     hip_bfloat16 r;
-    r.data = __hip_bf16_compat_detail::float_to_bf16_bits(x);
+    r.data = __hip_bf16_compat_detail::float_to_bf16_bits_trunc(x);
     return r;
 }
+// Round-to-nearest-even variant — matches CUDA __float2bfloat16_rn semantics.
 inline hip_bfloat16 __float2bfloat16_rn(float x) {
-    return __float2bfloat16(x);
+    hip_bfloat16 r;
+    r.data = __hip_bf16_compat_detail::float_to_bf16_bits_rne(x);
+    return r;
 }
 #endif

@@ -1,5 +1,6 @@
 """Subprocess client for the patched dflash daemon (with park/unpark commands)."""
 from __future__ import annotations
+import ctypes
 import logging
 import os
 import struct
@@ -22,6 +23,24 @@ def _query_nvidia_vram_mib() -> Optional[int]:
         return int(out.decode().splitlines()[0])
     except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
         return None
+
+
+def _hip_free_mib() -> int:
+    """Free GPU memory in MiB via hipMemGetInfo.
+
+    Reliable on AMD unified-memory APUs (Strix Halo, Phoenix) where rocm-smi
+    only reports the small dedicated VRAM segment (~512 MB on gfx1151) rather
+    than the full shared-memory pool used by the GPU.  Returns 0 on any error
+    so callers can treat 0 as "not available".
+    """
+    try:
+        hip = ctypes.CDLL("libamdhip64.so")
+        free = ctypes.c_size_t(0)
+        total = ctypes.c_size_t(0)
+        hip.hipMemGetInfo(ctypes.byref(free), ctypes.byref(total))
+        return int(free.value // (1024 * 1024))
+    except Exception:
+        return 0
 
 
 class DflashClient:
@@ -81,6 +100,9 @@ class DflashClient:
         if not chain_seed:
             cmd.append("--ddtree-no-chain-seed")
         log.info("spawning dflash daemon: %s", " ".join(cmd))
+        # Capture free-memory baseline before spawning so _wait_until_loaded can
+        # measure the delta on AMD unified-memory APUs (hipMemGetInfo approach).
+        self._initial_hip_free_mib: int = _hip_free_mib()
         if sys.platform == "win32":
             self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                          close_fds=False, env=env)
@@ -92,27 +114,65 @@ class DflashClient:
         # Park draft by default; user calls unpark when needed
         self._send("park draft\n")
 
+    def _read_vram_used_mib(self) -> Optional[int]:
+        """GPU memory allocated since daemon spawn, in MiB.
+
+        Priority order:
+        1. hipMemGetInfo delta — works on AMD unified-memory APUs (Strix Halo,
+           Phoenix) where rocm-smi only reports the tiny dedicated segment.
+        2. rocm-smi — fallback for AMD discrete GPUs (reports total used VRAM).
+        3. nvidia-smi — NVIDIA GPUs.
+        Returns None when no backend is available.
+        """
+        # AMD UMA: hipMemGetInfo free-delta is the only reliable signal.
+        if self._initial_hip_free_mib > 0:
+            current = _hip_free_mib()
+            if current > 0:
+                delta = self._initial_hip_free_mib - current
+                if delta > 0:
+                    return delta
+        # AMD discrete: rocm-smi total used (not delta).
+        try:
+            out = subprocess.check_output(
+                ["rocm-smi", "--showmeminfo", "vram", "--noheader"],
+                stderr=subprocess.DEVNULL, timeout=5)
+            for line in out.decode().splitlines():
+                if "Used Memory" in line:
+                    return int(line.split()[-1]) // (1024 * 1024)
+        except (FileNotFoundError, subprocess.CalledProcessError,
+                subprocess.TimeoutExpired, (ValueError, StopIteration)):
+            pass
+        # NVIDIA.
+        return _query_nvidia_vram_mib()
+
     def _wait_until_loaded(self, timeout: float = 60.0, vram_mib: int = 18000):
+        """Block until the daemon has consumed at least vram_mib of GPU memory.
+
+        On AMD unified-memory APUs (Strix Halo) vram_mib is compared against the
+        hipMemGetInfo delta from spawn, so it should be set to the expected model
+        size rather than absolute used VRAM.  Pass boot_vram_mib=13000 for a 27B
+        Q4_K_M model on gfx1151.
+        """
         boot = time.time()
-        telemetry_works = True
         while time.time() - boot < timeout:
             time.sleep(1)
             if self.proc.poll() is not None:
                 raise RuntimeError(
-                    "dflash daemon exited before weights finished loading. Check the daemon's stderr.")
-            if telemetry_works:
-                vram = _query_nvidia_vram_mib()
-                if vram is None:
-                    telemetry_works = False  # No nvidia-smi (e.g. ROCm); fall through to time-based check
-                elif vram > vram_mib:
+                    "dflash daemon exited before weights finished loading. "
+                    "Check the daemon's stderr.")
+            used = self._read_vram_used_mib()
+            if used is None:
+                # No GPU telemetry available — wait a few seconds then assume OK.
+                if time.time() - boot >= min(timeout, 5.0):
+                    log.warning(
+                        "no GPU memory telemetry; assuming daemon loaded since "
+                        "the process is still alive")
                     return
-            if not telemetry_works and time.time() - boot >= min(timeout, 5.0):
-                log.warning(
-                    "no GPU memory telemetry; assuming daemon boot succeeded since the process is still alive")
+            elif used >= vram_mib:
                 return
         raise RuntimeError(
             f"dflash daemon failed to load target weights within {timeout:.0f}s "
-            f"(expected VRAM > {vram_mib} MiB). Check the daemon's stderr.")
+            f"(expected memory delta > {vram_mib} MiB). Check the daemon's stderr.")
 
     def _send(self, cmd: str):
         self.proc.stdin.write(cmd.encode())
