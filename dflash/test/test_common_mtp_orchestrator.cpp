@@ -639,6 +639,145 @@ static void t19_reset_chain_before_attach() {
     std::puts("T19 reset_chain_before_attach PASS");
 }
 
+// ─── T20 support types ────────────────────────────────────────────────────
+
+// ExternalDrafter stub: proposes two tokens (100, 101) per step chain and
+// fills next_hidden so the fix branch (set_capture_row / consume_captured_hidden)
+// is reachable. Records every call to the two methods under test.
+struct StubExternalDrafter : public dflash27b::mtp::IExternalDrafterMtp {
+    // IMtpModule tuneables
+    int max_gamma_value       = 2;
+    int effective_gamma_value = 2;
+    int hidden_size_value     = 8;
+
+    // Call counters — IMtpModule lifecycle
+    int reset_chain_calls        = 0;
+    int set_initial_hidden_calls = 0;
+    int attach_calls             = 0;
+
+    // Call counters — IExternalDrafterMtp
+    int  step_calls              = 0;
+    int  enable_capture_calls    = 0;
+    int  set_capture_row_calls   = 0;
+    int  set_capture_row_last_arg = -999;  // sentinel: "never called"
+    int  consume_calls           = 0;
+    bool consume_after_set_capture = false;  // ordering assertion
+
+    std::vector<int> donor_layers_value{0, 1};
+
+    // IMtpModule
+    int  max_gamma()       const override { return max_gamma_value; }
+    int  effective_gamma() const override { return effective_gamma_value; }
+    void set_effective_gamma(int g) override { effective_gamma_value = g; }
+    int  hidden_size()     const override { return hidden_size_value; }
+    bool attach(dflash27b::DFlashTarget *) override { ++attach_calls; return true; }
+    void reset_chain() override { ++reset_chain_calls; }
+    void shutdown()    override {}
+    void set_initial_hidden(const float *, int) override { ++set_initial_hidden_calls; }
+
+    // IExternalDrafterMtp
+    bool step(const dflash27b::mtp::StepInput & in,
+              dflash27b::mtp::StepOutput & out) override {
+        ++step_calls;
+        // Propose token 100+gamma_index so each step produces a distinct token.
+        out.draft_token = 100 + in.gamma_index;
+        // Non-empty next_hidden activates the fix branch in the runner.
+        out.next_hidden.assign(hidden_size_value, 0.5f);
+        return true;
+    }
+
+    const std::vector<int> & donor_layers() const override {
+        return donor_layers_value;
+    }
+
+    bool enable_target_hidden_capture(bool /*batch_mode*/,
+                                       int /*gamma_max*/) override {
+        ++enable_capture_calls;
+        return true;
+    }
+
+    void set_capture_row(int row) override {
+        ++set_capture_row_calls;
+        set_capture_row_last_arg = row;
+    }
+
+    bool consume_captured_hidden(float * out, int dim) override {
+        ++consume_calls;
+        // Order check: set_capture_row must have been called first.
+        consume_after_set_capture = (set_capture_row_calls > 0);
+        for (int i = 0; i < dim; ++i) out[i] = 1.0f;  // sentinel value
+        return true;
+    }
+};
+
+// Target that forces the runner to reach accept_n=1 out of gamma=2.
+// verify_batch is overridden so that:
+//   all_argmax[0] == drafts[0]  (accept first token)
+//   all_argmax[1] != drafts[1]  (reject second token — triggers partial-accept)
+// The drafts are always 100 (gamma_index=0) and 101 (gamma_index=1), so we
+// set all_argmax[0]=100 (matches) and all_argmax[1]=999 (diverges).
+struct ExternalPartialTarget : public SuccessStubTarget {
+    static constexpr int32_t kDivergeToken = 999;
+
+    bool verify_batch(const std::vector<int32_t> & tokens,
+                      int base_pos,
+                      int & last_tok,
+                      std::vector<int32_t> * all_argmax) override {
+        // Let SuccessStubTarget handle bookkeeping (verify_calls, hidden_seq).
+        SuccessStubTarget::verify_batch(tokens, base_pos, last_tok, all_argmax);
+        // Override all_argmax to produce the desired partial-accept pattern.
+        // candidate = [cur_tok, 100, 101]; drafts = [100, 101].
+        // all_argmax[0]=100 -> drafts[0]==100 matches (accept).
+        // all_argmax[1]=999 -> drafts[1]==101 != 999 (reject).
+        if (all_argmax && (int)all_argmax->size() >= 2) {
+            (*all_argmax)[0] = 100;          // accept draft[0]
+            (*all_argmax)[1] = kDivergeToken; // reject draft[1]
+        }
+        last_tok = kDivergeToken;
+        return true;
+    }
+};
+
+// ─── T20: ExternalDrafter partial-accept threads committed-boundary hidden ─
+//
+// Proves the 74f708a fix: on partial accept (accept_n < g_actual) the runner
+// calls set_capture_row(accept_n) then consume_captured_hidden(), in that
+// order, to thread the target-captured boundary hidden into running_hidden.
+// T7 used a NativeHeads stub (next_hidden always empty) so it never exercised
+// this branch. This test closes that gap.
+
+static void t20_external_drafter_partial_accept_threads_committed_row() {
+    StubExternalDrafter ext;
+    ExternalPartialTarget target;
+    // accept_n field on SuccessStubTarget is not used directly here (we
+    // override verify_batch above), but keep it consistent.
+    target.argmax_token = ExternalPartialTarget::kDivergeToken;
+    target.hidden_sz    = ext.hidden_size_value;
+
+    dflash27b::SamplerCfg sampler;
+    dflash27b::mtp::MtpChainRunner runner(ext, target, sampler);
+
+    dflash27b::GenerateRequest req;
+    req.n_gen  = 2;   // enough for one full chain iteration
+    req.stream = false;
+
+    dflash27b::DaemonIO io;
+    auto res = runner.run(req, io, /*last_prefill_token=*/10, /*committed_pos=*/4,
+                          /*gamma=*/2);
+
+    assert(res.ok && "runner returned error");
+
+    // The runner must have called set_capture_row with arg == accept_n (1).
+    assert(ext.set_capture_row_calls > 0          && "set_capture_row was not called");
+    assert(ext.set_capture_row_last_arg == 1       && "set_capture_row arg != accept_n=1");
+
+    // consume_captured_hidden must have been called after set_capture_row.
+    assert(ext.consume_calls > 0                   && "consume_captured_hidden was not called");
+    assert(ext.consume_after_set_capture           && "consume called BEFORE set_capture_row");
+
+    std::puts("T20 external_drafter_partial_accept_threads_committed_row PASS");
+}
+
 int main() {
     t1_null_backend();
     t2_backend_without_mtp();
@@ -662,6 +801,8 @@ int main() {
     t17_step_batch_not_attached();
     t18_shutdown_idempotent();
     t19_reset_chain_before_attach();
+    // Area D: ExternalDrafter partial-accept hidden threading (covers 74f708a fix)
+    t20_external_drafter_partial_accept_threads_committed_row();
     std::puts("ALL PASS");
     return 0;
 }
