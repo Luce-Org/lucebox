@@ -322,6 +322,14 @@ int main(int argc, char ** argv) {
         sconfig.max_ctx = bargs.device.max_ctx;
     }
 
+    // --draft and --mtp-gguf are mutually exclusive; MTP wins if both are set.
+    if (bargs.draft_path && bargs.mtp_gguf_path) {
+        std::fprintf(stderr,
+            "[server] WARNING: --draft and --mtp-gguf both set; ignoring --draft.\n"
+            "[server]          MTP speculation takes precedence over DFlash draft.\n");
+        bargs.draft_path = nullptr;
+    }
+
     // ── Apply environment defaults (mirrors server.py logic) ────────────
     // Explicit --cache-type-k/v override via env vars.
     if (!cache_type_k.empty()) {
@@ -339,6 +347,15 @@ int main(int argc, char ** argv) {
         setenv("DFLASH27B_KV_TQ3", "1", 0);  // don't overwrite user env
     }
 #endif
+
+    // Default MTP head_kv capacity to backbone max_ctx so prompts up to max_ctx
+    // never overflow the head_kv buffer (the old hardcoded 8192 caused a silent
+    // server crash when agentic prompts exceeded that length).
+    if (bargs.mtp_gguf_path && sconfig.max_ctx > 0) {
+        char ctx_str[32];
+        std::snprintf(ctx_str, sizeof(ctx_str), "%d", sconfig.max_ctx);
+        setenv("DFLASH27B_MTP_CTX", ctx_str, 0);  // don't overwrite user env
+    }
 
     // PFlash performance defaults: BSA kernel + sparse alpha + full attention window.
     bool pflash_enabled = (sconfig.pflash_mode != ServerConfig::PflashMode::OFF);
