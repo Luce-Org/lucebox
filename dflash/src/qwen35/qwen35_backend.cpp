@@ -1145,13 +1145,13 @@ bool Qwen35Backend::init_mtp_() {
         return false;
     }
 
-    if (cfg_.mtp_draft_source && std::strcmp(cfg_.mtp_draft_source, "mtp_topk") == 0) {
+    if (cfg_.mtp_use_topk) {
         mtp_module_->set_draft_topk(std::max(1, cfg_.mtp_draft_topk));
     }
 
     std::printf("[mtp] loaded gamma=%d source=%s\n",
                 cfg_.mtp_gamma,
-                cfg_.mtp_draft_source ? cfg_.mtp_draft_source : "chain");
+                cfg_.mtp_use_topk ? "mtp_topk" : "chain");
     std::fflush(stdout);
     return true;
 }

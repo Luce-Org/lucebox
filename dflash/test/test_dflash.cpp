@@ -650,16 +650,7 @@ static int run_target_layer_split_harness(
     return 0;
 }
 
-// draft_source values:
-//   "chain"     — existing MtpChainRunner path (MTP argmax chain, verify_batch
-//                 sequential verify). K=1, no DDTree.
-//   "mtp_topk"  — experiment C: configure set_draft_topk(K), call step_batch,
-//                 build DDTree from per-head top-K, then verify the DDTree's
-//                 top-1 chain through verify_batch (target chain verify is the
-//                 only verify surface available on DFlashTarget today; a true
-//                 tree-mask verify would require lifting test_dflash.cpp's
-//                 spec-decode loop out of the qwen35 graph builder — see the
-//                 BLOCKER note in qwen35-mtp experiment-C wiring docs).
+// use_topk: false = MtpChainRunner chain path (default), true = mtp_topk DDTree.
 static int run_qwen35_mtp_harness(const char * target_path,
                                   const char * mtp_gguf_path,
                                   const char * prompt_path,
@@ -669,7 +660,7 @@ static int run_qwen35_mtp_harness(const char * target_path,
                                   int prompt_id,
                                   int target_gpu,
                                   int max_ctx,
-                                  const char * draft_source,
+                                  bool use_topk,
                                   int draft_topk,
                                   int ddtree_budget,
                                   bool ddtree_chain_seed,
@@ -825,7 +816,7 @@ static int run_qwen35_mtp_harness(const char * target_path,
                 base_pos++;
                 if (target->is_eos(next)) break;
             }
-        } else if (!draft_source || std::strcmp(draft_source, "chain") == 0) {
+        } else if (!use_topk) {
             mtp_module->reset_chain();
             GenerateRequest req;
             req.n_gen = n_gen - 1;
@@ -843,7 +834,7 @@ static int run_qwen35_mtp_harness(const char * target_path,
             generated.insert(generated.end(), res.tokens.begin(), res.tokens.end());
             accepted = runner.stats().total_accepted;
             proposed = runner.stats().total_proposed;
-        } else if (std::strcmp(draft_source, "mtp_topk") == 0) {
+        } else if (use_topk) {
             // ── experiment C: MTP top-K → DDTree → chain-verify ─────────
             // 1. step_batch with K>1 populates StepOutput.topk_logprobs/ids
             //    on every emitted head (length K, sorted DESCENDING).
@@ -1093,9 +1084,6 @@ static int run_qwen35_mtp_harness(const char * target_path,
                 "mean_tree_size=%.2f mean_gamma=%.2f\n",
                 K, ddtree_budget, (int)ddtree_chain_seed,
                 n_steps, mean_tree_size, mean_gamma);
-        } else {
-            std::fprintf(stderr, "unknown --draft-source: %s (expected chain|mtp_topk)\n", draft_source);
-            return 2;
         }
     }
     auto t_decode1 = std::chrono::steady_clock::now();
@@ -1116,7 +1104,7 @@ static int run_qwen35_mtp_harness(const char * target_path,
     {
         const double accept_rate = proposed > 0
             ? (double)accepted / (double)proposed : 0.0;
-        const char * src = (draft_source && *draft_source) ? draft_source : "chain";
+        const char * src = use_topk ? "mtp_topk" : "chain";
         std::printf("RESULT_JSON {"
                     "\"draft_source\":\"%s\","
                     "\"gamma\":%d,"
@@ -1256,11 +1244,8 @@ int main(int argc, char ** argv) {
     int   mtp_gamma = 2;
     int   mtp_n_gen = 0;
     int   mtp_prompt_id = 0;
-    // Experiment-C draft source for the MTP harness. "chain" preserves
-    // the existing MtpChainRunner path; "mtp_topk" wires set_draft_topk +
-    // build_ddtree (see run_qwen35_mtp_harness for the BLOCKER on true
-    // tree-mask verify).
-    const char * mtp_draft_source = "chain";
+    // MTP draft strategy: false = chain (default), true = mtp_topk.
+    bool mtp_use_topk = false;
     int   mtp_draft_topk = 4;
     int   target_gpu = 0;
     int   draft_gpu = 0;
@@ -1333,10 +1318,10 @@ int main(int argc, char ** argv) {
             target_split_load_draft = true;
         }
         else if (std::strncmp(argv[i], "--draft-source=", 15) == 0) {
-            mtp_draft_source = argv[i] + 15;
+            mtp_use_topk = (std::strcmp(argv[i] + 15, "mtp_topk") == 0);
         }
         else if (std::strcmp(argv[i], "--draft-source") == 0) {
-            if (i + 1 < argc) mtp_draft_source = argv[++i];
+            if (i + 1 < argc) mtp_use_topk = (std::strcmp(argv[++i], "mtp_topk") == 0);
         }
         else if (std::strncmp(argv[i], "--draft-topk=", 13) == 0) {
             mtp_draft_topk = std::max(1, std::atoi(argv[i] + 13));
@@ -1659,9 +1644,10 @@ int main(int argc, char ** argv) {
             qargs.ddtree_temp       = ddtree_temp;
             qargs.ddtree_chain_seed = ddtree_chain_seed;
             qargs.use_feature_mirror = false;
+            qargs.mtp_source        = dflash27b::MtpSource::ExternalDrafter;
             qargs.mtp_gguf_path     = mtp_gguf_path;
             qargs.mtp_gamma         = mtp_gamma;
-            qargs.mtp_draft_source  = mtp_draft_source;
+            qargs.mtp_use_topk      = mtp_use_topk;
             qargs.mtp_draft_topk    = mtp_draft_topk;
             return dflash27b::run_qwen35_daemon(qargs);
         }
@@ -1673,7 +1659,7 @@ int main(int argc, char ** argv) {
                                       prompt_path, n_gen, out_path,
                                       mtp_gamma, mtp_prompt_id,
                                       target_gpu, max_ctx_eff,
-                                      mtp_draft_source,
+                                      mtp_use_topk,
                                       mtp_draft_topk,
                                       ddtree_budget,
                                       ddtree_chain_seed,

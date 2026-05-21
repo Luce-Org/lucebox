@@ -12,6 +12,7 @@
 #pragma once
 
 #include "common/model_backend.h"
+#include "common/backend_factory.h"
 #include "common/dflash_target.h"
 #include "placement/placement_config.h"
 #include "step_graph.h"
@@ -58,10 +59,13 @@ struct Qwen35Config {
     bool         ddtree_chain_seed = true;
     bool         use_feature_mirror = false;
 
-    // MTP (Multi-Token Prediction) speculator — mutually exclusive with draft
-    const char * mtp_gguf_path    = nullptr;   // path to fused MTP GGUF (or nullptr = DFlash)
+    // MTP (Multi-Token Prediction) speculator — mutually exclusive with draft.
+    // mtp_gguf_path != nullptr is the MTP-active sentinel (set by backend_factory
+    // based on MtpSource). For MtpSource::Native it is set to target_path;
+    // for MtpSource::ExternalDrafter it is the external GGUF path.
+    const char * mtp_gguf_path    = nullptr;   // path to GGUF containing MTP tensors
     int          mtp_gamma        = 0;         // max speculation depth
-    const char * mtp_draft_source = nullptr;   // "chain" | "mtp_topk" | nullptr -> "chain"
+    bool         mtp_use_topk     = false;     // false = chain (default), true = mtp_topk
     int          mtp_draft_topk   = 1;         // top-k for mtp_topk mode
 };
 
