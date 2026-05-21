@@ -1,0 +1,470 @@
+[
+  {
+    "condition": "baseline",
+    "ctx": 1024,
+    "case_results": [
+      {
+        "ttft_s": 5.006289732998994,
+        "text": "It looks like you've pasted a repetitive text block, possibly from a test file, a glitch, or a copy-paste error. The phrase *\"The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.\"* repeats multiple times, and there\u2019s a",
+        "found": false,
+        "error": null,
+        "drafter_fwd_s": 0.31,
+        "tail_score_s": 0.06
+      },
+      {
+        "ttft_s": 5.045657154001674,
+        "text": "and back again. The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. The grass is green. The sky is blue. The sun",
+        "found": false,
+        "error": null,
+        "drafter_fwd_s": 0.32,
+        "tail_score_s": 0.06
+      },
+      {
+        "ttft_s": 3.6477175370018813,
+        "text": "The special magic kowefada number is: 1596346.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 0.31,
+        "tail_score_s": 0.06
+      }
+    ],
+    "drafter_times_s": [
+      0.31,
+      0.32,
+      0.31
+    ],
+    "drafter_p50_s": 0.31,
+    "tail_score_p50_s": 0.06,
+    "ttft_p50_s": 5.006289732998994,
+    "niah_pass": 1,
+    "niah_total": 3
+  },
+  {
+    "condition": "baseline",
+    "ctx": 4096,
+    "case_results": [
+      {
+        "ttft_s": 4.282616045002214,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 0.77,
+        "tail_score_s": 0.13
+      },
+      {
+        "ttft_s": 1.4594670090009458,
+        "text": "",
+        "found": false,
+        "error": "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))",
+        "drafter_fwd_s": null,
+        "tail_score_s": null
+      },
+      {
+        "ttft_s": 2.0552207470027497,
+        "text": "",
+        "found": false,
+        "error": "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))",
+        "drafter_fwd_s": null,
+        "tail_score_s": null
+      }
+    ],
+    "drafter_times_s": [
+      0.77
+    ],
+    "drafter_p50_s": 0.77,
+    "tail_score_p50_s": 0.13,
+    "ttft_p50_s": 2.0552207470027497,
+    "niah_pass": 1,
+    "niah_total": 3
+  },
+  {
+    "condition": "baseline",
+    "ctx": 8192,
+    "case_results": [
+      {
+        "ttft_s": 5.013945448001323,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 1.34,
+        "tail_score_s": 0.22
+      },
+      {
+        "ttft_s": 5.053756631998112,
+        "text": "The special magic bsdmrulm number is 0438574.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 1.34,
+        "tail_score_s": 0.22
+      },
+      {
+        "ttft_s": 5.0173558489987045,
+        "text": "",
+        "found": false,
+        "error": "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))",
+        "drafter_fwd_s": null,
+        "tail_score_s": null
+      }
+    ],
+    "drafter_times_s": [
+      1.34,
+      1.34
+    ],
+    "drafter_p50_s": 1.34,
+    "tail_score_p50_s": 0.22,
+    "ttft_p50_s": 5.0173558489987045,
+    "niah_pass": 2,
+    "niah_total": 3
+  },
+  {
+    "condition": "baseline",
+    "ctx": 16384,
+    "case_results": [
+      {
+        "ttft_s": 6.665686828997423,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 2.53,
+        "tail_score_s": 0.41
+      },
+      {
+        "ttft_s": 6.621240463999129,
+        "text": "The special magic bsdmrulm number is 0438574.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 2.53,
+        "tail_score_s": 0.42
+      },
+      {
+        "ttft_s": 4.078778658000374,
+        "text": "",
+        "found": false,
+        "error": "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))",
+        "drafter_fwd_s": null,
+        "tail_score_s": null
+      }
+    ],
+    "drafter_times_s": [
+      2.53,
+      2.53
+    ],
+    "drafter_p50_s": 2.53,
+    "tail_score_p50_s": 0.415,
+    "ttft_p50_s": 6.621240463999129,
+    "niah_pass": 2,
+    "niah_total": 3
+  },
+  {
+    "condition": "ee14",
+    "ctx": 1024,
+    "case_results": [
+      {
+        "ttft_s": 4.864987106000626,
+        "text": "It looks like you've pasted a repetitive text block, possibly from a test file, a glitch, or a copy-paste error. The phrase *\"The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.\"* repeats multiple times, and there\u2019s a",
+        "found": false,
+        "error": null,
+        "drafter_fwd_s": 0.21,
+        "tail_score_s": 0.04
+      },
+      {
+        "ttft_s": 4.872757388002356,
+        "text": "and back again. The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. The grass is green. The sky is blue. The sun",
+        "found": false,
+        "error": null,
+        "drafter_fwd_s": 0.2,
+        "tail_score_s": 0.04
+      },
+      {
+        "ttft_s": 3.4935882089994266,
+        "text": "The special magic kowefada number is: 1596346.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 0.21,
+        "tail_score_s": 0.04
+      }
+    ],
+    "drafter_times_s": [
+      0.21,
+      0.2,
+      0.21
+    ],
+    "drafter_p50_s": 0.21,
+    "tail_score_p50_s": 0.04,
+    "ttft_p50_s": 4.864987106000626,
+    "niah_pass": 1,
+    "niah_total": 3
+  },
+  {
+    "condition": "ee14",
+    "ctx": 4096,
+    "case_results": [
+      {
+        "ttft_s": 3.902686265999364,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 0.44,
+        "tail_score_s": 0.08
+      },
+      {
+        "ttft_s": 2.401505342000746,
+        "text": "",
+        "found": false,
+        "error": "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))",
+        "drafter_fwd_s": null,
+        "tail_score_s": null
+      },
+      {
+        "ttft_s": 2.6092043919998105,
+        "text": "",
+        "found": false,
+        "error": "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))",
+        "drafter_fwd_s": null,
+        "tail_score_s": null
+      }
+    ],
+    "drafter_times_s": [
+      0.44
+    ],
+    "drafter_p50_s": 0.44,
+    "tail_score_p50_s": 0.08,
+    "ttft_p50_s": 2.6092043919998105,
+    "niah_pass": 1,
+    "niah_total": 3
+  },
+  {
+    "condition": "ee14",
+    "ctx": 8192,
+    "case_results": [
+      {
+        "ttft_s": 4.346922321998136,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 0.74,
+        "tail_score_s": 0.12
+      },
+      {
+        "ttft_s": 4.375100785997347,
+        "text": "The special magic bsdmrulm number is 0438574.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 0.75,
+        "tail_score_s": 0.13
+      },
+      {
+        "ttft_s": 3.3063512049993733,
+        "text": "",
+        "found": false,
+        "error": "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))",
+        "drafter_fwd_s": null,
+        "tail_score_s": null
+      }
+    ],
+    "drafter_times_s": [
+      0.74,
+      0.75
+    ],
+    "drafter_p50_s": 0.745,
+    "tail_score_p50_s": 0.125,
+    "ttft_p50_s": 4.346922321998136,
+    "niah_pass": 2,
+    "niah_total": 3
+  },
+  {
+    "condition": "ee14",
+    "ctx": 16384,
+    "case_results": [
+      {
+        "ttft_s": 5.362815824999416,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 1.37,
+        "tail_score_s": 0.22
+      },
+      {
+        "ttft_s": 5.459823447999952,
+        "text": "The special magic bsdmrulm number is 0438574.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 1.35,
+        "tail_score_s": 0.21
+      },
+      {
+        "ttft_s": 3.279302186998393,
+        "text": "",
+        "found": false,
+        "error": "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))",
+        "drafter_fwd_s": null,
+        "tail_score_s": null
+      }
+    ],
+    "drafter_times_s": [
+      1.37,
+      1.35
+    ],
+    "drafter_p50_s": 1.36,
+    "tail_score_p50_s": 0.215,
+    "ttft_p50_s": 5.362815824999416,
+    "niah_pass": 2,
+    "niah_total": 3
+  },
+  {
+    "condition": "ee7",
+    "ctx": 1024,
+    "case_results": [
+      {
+        "ttft_s": 5.081608209002297,
+        "text": "It looks like you've pasted a repetitive text block, possibly from a test file, a glitch, or a copy-paste error. The phrase *\"The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.\"* repeats multiple times, and there\u2019s a",
+        "found": false,
+        "error": null,
+        "drafter_fwd_s": 0.17,
+        "tail_score_s": 0.03
+      },
+      {
+        "ttft_s": 4.9701223709998885,
+        "text": "and back again. The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. The grass is green. The sky is blue. The sun",
+        "found": false,
+        "error": null,
+        "drafter_fwd_s": 0.17,
+        "tail_score_s": 0.03
+      },
+      {
+        "ttft_s": 3.561261848997674,
+        "text": "The special magic kowefada number is: 1596346.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 0.17,
+        "tail_score_s": 0.03
+      }
+    ],
+    "drafter_times_s": [
+      0.17,
+      0.17,
+      0.17
+    ],
+    "drafter_p50_s": 0.17,
+    "tail_score_p50_s": 0.03,
+    "ttft_p50_s": 4.9701223709998885,
+    "niah_pass": 1,
+    "niah_total": 3
+  },
+  {
+    "condition": "ee7",
+    "ctx": 4096,
+    "case_results": [
+      {
+        "ttft_s": 3.7914586840015545,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 0.29,
+        "tail_score_s": 0.05
+      },
+      {
+        "ttft_s": 2.161096602001635,
+        "text": "",
+        "found": false,
+        "error": "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))",
+        "drafter_fwd_s": null,
+        "tail_score_s": null
+      },
+      {
+        "ttft_s": 1.9221039889998792,
+        "text": "",
+        "found": false,
+        "error": "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))",
+        "drafter_fwd_s": null,
+        "tail_score_s": null
+      }
+    ],
+    "drafter_times_s": [
+      0.29
+    ],
+    "drafter_p50_s": 0.29,
+    "tail_score_p50_s": 0.05,
+    "ttft_p50_s": 2.161096602001635,
+    "niah_pass": 1,
+    "niah_total": 3
+  },
+  {
+    "condition": "ee7",
+    "ctx": 8192,
+    "case_results": [
+      {
+        "ttft_s": 4.309788574002596,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 0.46,
+        "tail_score_s": 0.08
+      },
+      {
+        "ttft_s": 4.477816389000509,
+        "text": "The special magic bsdmrulm number is 0438574.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 0.46,
+        "tail_score_s": 0.08
+      },
+      {
+        "ttft_s": 2.8472632500015607,
+        "text": "",
+        "found": false,
+        "error": "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))",
+        "drafter_fwd_s": null,
+        "tail_score_s": null
+      }
+    ],
+    "drafter_times_s": [
+      0.46,
+      0.46
+    ],
+    "drafter_p50_s": 0.46,
+    "tail_score_p50_s": 0.08,
+    "ttft_p50_s": 4.309788574002596,
+    "niah_pass": 2,
+    "niah_total": 3
+  },
+  {
+    "condition": "ee7",
+    "ctx": 16384,
+    "case_results": [
+      {
+        "ttft_s": 4.9799990380015515,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 0.81,
+        "tail_score_s": 0.12
+      },
+      {
+        "ttft_s": 4.8451695579969964,
+        "text": "The special magic bsdmrulm number is 0438574.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 0.79,
+        "tail_score_s": 0.12
+      },
+      {
+        "ttft_s": 2.8297027549997438,
+        "text": "",
+        "found": false,
+        "error": "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))",
+        "drafter_fwd_s": null,
+        "tail_score_s": null
+      }
+    ],
+    "drafter_times_s": [
+      0.81,
+      0.79
+    ],
+    "drafter_p50_s": 0.8,
+    "tail_score_p50_s": 0.12,
+    "ttft_p50_s": 4.8451695579969964,
+    "niah_pass": 2,
+    "niah_total": 3
+  }
+]

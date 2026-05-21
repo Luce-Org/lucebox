@@ -80,6 +80,77 @@ static void t6_start_pre_matches_loop_start() {
     printf("T6 pass: pre_start=%d loop_start=%d (match)\n", pre.start, loop.start);
 }
 
+// T7: alloc loop boundary check — the alloc loop iterates 0..n_layer but must only
+// fill K_norope_v for layers in [score_layer_start_pre, fwd_layer_limit_pre).
+// This replicates the guard added to the alloc loop: il >= start AND il < fwd_limit.
+// Before the fix: il was only bounded below (il >= start), causing K_norope_v[si]
+// out-of-bounds when n_score_layers < n_layer (e.g. ee14: si 0..27 but vec size 14).
+static void t7_alloc_loop_upper_bound() {
+    struct FakeVec {
+        int capacity;
+        int max_si_written = -1;
+        void write(int si) {
+            assert(si >= 0 && si < capacity && "si out of bounds");
+            if (si > max_si_written) max_si_written = si;
+        }
+    };
+
+    // Simulate ee14 (no SCORE_LAYERS, early_exit=14, n_layer=28).
+    {
+        const int n_layer = 28, score_layers = -1, early_exit = 14;
+        const int fwd_limit = early_exit;
+        ScoreRange r = compute_score_range(n_layer, score_layers, fwd_limit);
+        const int n_score = r.count();  // 14
+        FakeVec v{n_score};
+        int writes = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            // Correct guard: il >= start AND il < fwd_limit (the fix)
+            if (il >= r.start && il < fwd_limit) {
+                v.write(il - r.start);
+                writes++;
+            }
+        }
+        assert(writes == n_score && "ee14: must write exactly n_score_layers entries");
+        printf("T7a pass: ee14 alloc writes=%d capacity=%d (no overflow)\n", writes, n_score);
+    }
+
+    // Simulate ee7 (SCORE_LAYERS=7, early_exit=7, n_layer=28).
+    {
+        const int n_layer = 28, score_layers = 7, early_exit = 7;
+        const int fwd_limit = early_exit;
+        ScoreRange r = compute_score_range(n_layer, score_layers, fwd_limit);
+        const int n_score = r.count();  // 7
+        FakeVec v{n_score};
+        int writes = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            if (il >= r.start && il < fwd_limit) {
+                v.write(il - r.start);
+                writes++;
+            }
+        }
+        assert(writes == n_score && "ee7: must write exactly 7 entries");
+        printf("T7b pass: ee7 alloc writes=%d capacity=%d (no overflow)\n", writes, n_score);
+    }
+
+    // Simulate baseline (no ee, no score_layers).
+    {
+        const int n_layer = 28, score_layers = -1, early_exit = -1;
+        const int fwd_limit = n_layer;
+        ScoreRange r = compute_score_range(n_layer, score_layers, fwd_limit);
+        const int n_score = r.count();  // 28
+        FakeVec v{n_score};
+        int writes = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            if (il >= r.start && il < fwd_limit) {
+                v.write(il - r.start);
+                writes++;
+            }
+        }
+        assert(writes == n_score && "baseline: must write 28 entries");
+        printf("T7c pass: baseline alloc writes=%d capacity=%d (no overflow)\n", writes, n_score);
+    }
+}
+
 int main() {
     t1_baseline_full_alloc();
     t2_l7_trimmed_alloc();
@@ -87,6 +158,7 @@ int main() {
     t4_ee7_score7_composition();
     t5_all_score_with_early_exit();
     t6_start_pre_matches_loop_start();
+    t7_alloc_loop_upper_bound();
     printf("\nAll warm-path regression tests passed.\n");
     return 0;
 }

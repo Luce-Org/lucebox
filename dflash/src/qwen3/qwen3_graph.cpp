@@ -327,7 +327,7 @@ bool forward_qwen3_drafter_model(
                 cleanup_all();
                 return false;
             }
-            if (nope_tail && il >= score_layer_start_pre) {
+            if (nope_tail && il >= score_layer_start_pre && il < fwd_layer_limit_pre) {
                 const int si = il - score_layer_start_pre;
                 if (!make_pers(w.backend, half_type, 3, d_kv, K_norope_v[si]) ||
                     !make_pers(w.backend, GGML_TYPE_F32, 3, d_ql, Q_norope_v[si])) {
