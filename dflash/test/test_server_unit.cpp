@@ -1744,6 +1744,7 @@ int main() {
     RUN_TEST(test_sampler_temp_zero_with_penalties_uses_argmax);
     RUN_TEST(test_sampler_needs_logit_processing);
 
+
     std::fprintf(stderr, "\n── GenerateResult.accept_rate ──\n");
     RUN_TEST(test_generate_result_accept_rate_defaults_to_zero);
     RUN_TEST(test_generate_result_accept_rate_can_be_set);
