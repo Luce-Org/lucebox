@@ -90,6 +90,37 @@ int flash_prefill_forward_q8(
     ggml_type qkv_type,
     const FlashPrefillConfig & cfg);
 
+// ── Unified dispatch ──────────────────────────────────────────────────────────
+// Picks the best available kernel at compile time + runtime buffer type:
+//   BF16 buffers + sm_80 build → flash_prefill_forward_bf16
+//   F16 buffers  + Volta build → flash_prefill_forward_f16
+//   otherwise                  → flash_prefill_forward_q8 (ggml FA fallback)
+//
+// Callers no longer need to duplicate the ifdef/dispatch boilerplate.
+inline int flash_prefill_forward(
+    ggml_backend_t backend,
+    const void * Q, const void * K, const void * V, void * O,
+    int batch, int seq_len, int n_q_heads, int n_k_heads, int head_dim,
+    float scale,
+    ggml_type qkv_type,
+    const FlashPrefillConfig & cfg)
+{
+#if defined(DFLASH27B_HAVE_FLASHPREFILL) || defined(DFLASH27B_HAVE_SM80_FLASHPREFILL)
+    if (qkv_type == GGML_TYPE_BF16) {
+        return flash_prefill_forward_bf16(Q, K, V, O,
+            batch, seq_len, n_q_heads, n_k_heads, head_dim, scale, cfg);
+    }
+#endif
+#if defined(DFLASH27B_HAVE_VOLTA_FLASHPREFILL) || defined(DFLASH27B_HAVE_PASCAL_FLASHPREFILL)
+    if (qkv_type == GGML_TYPE_F16) {
+        return flash_prefill_forward_f16(Q, K, V, O,
+            batch, seq_len, n_q_heads, n_k_heads, head_dim, scale, cfg);
+    }
+#endif
+    return flash_prefill_forward_q8(backend, Q, K, V, O,
+        batch, seq_len, n_q_heads, n_k_heads, head_dim, scale, qkv_type, cfg);
+}
+
 #ifdef DFLASH27B_HAVE_BSA
 // Free BSA persistent device buffers (blockmask, head_mask_type, softmax_lse).
 // Safe to call any time; idempotent. Useful before unloading the drafter to

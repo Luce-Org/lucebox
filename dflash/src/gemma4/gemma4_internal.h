@@ -236,4 +236,17 @@ bool gemma4_project_hidden(
     int                     n_tokens,
     std::vector<int32_t> &  out_tokens);
 
+// BSA sparse-FA prefill: process the full prompt at once using block-sparse
+// attention for SWA layers (flash_prefill_forward_bf16). Full-attention layers
+// use dense FA. Returns logits for the last token.  Populates the KV cache
+// for subsequent decode. Returns false on failure.
+bool gemma4_prefill_bsa(
+    ggml_backend_t          backend,
+    const Gemma4Weights &   w,
+    Gemma4Cache &           cache,
+    const float *           embed,       // [n_embd, S] scaled
+    const int32_t *         token_ids,   // [S] (for per-layer embedding)
+    int                     S,           // total prompt length
+    std::vector<float> &    out_logits);
+
 }  // namespace dflash::common
