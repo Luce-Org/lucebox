@@ -18,10 +18,21 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <csignal>
 #include <memory>
 #include <string>
 
 using namespace dflash27b;
+
+// Global server pointer for signal handling.
+static HttpServer * g_server = nullptr;
+
+static void signal_handler(int sig) {
+    (void)sig;
+    if (g_server) {
+        g_server->request_stop();
+    }
+}
 
 static void print_usage(const char * prog) {
     std::fprintf(stderr,
@@ -45,7 +56,11 @@ static void print_usage(const char * prog) {
         "KV cache:\n"
         "  --cache-type-k <type>  KV cache K type (f16,bf16,q4_0,q4_1,q5_0,q5_1,q8_0,tq3_0)\n"
         "  --cache-type-v <type>  KV cache V type (same choices as above)\n"
+#ifdef GGML_USE_HIP
+        "                         Default: q4_0 (HIP builds; tq3_0 fattn unsupported)\n"
+#else
         "                         Default: tq3_0 when max_ctx>6144, else q4_0\n"
+#endif
         "\n"
         "PFlash (speculative prefill compression):\n"
         "  --prefill-compression off|auto|always  (default: off)\n"
@@ -53,6 +68,13 @@ static void print_usage(const char * prog) {
         "  --prefill-keep-ratio <F>    Fraction of tokens to keep (default: 0.05)\n"
         "  --prefill-drafter <path>    Drafter GGUF for compression (Qwen3-0.6B)\n"
         "  --prefill-skip-park         Skip park/unpark (for >=32GB GPUs)\n"
+        "\n"
+        "Disk KV cache:\n"
+        "  --kv-cache-dir <path>       Directory for ondisk KV cache (enables feature)\n"
+        "  --kv-cache-budget <MB>      Max disk usage in MB (default: 4096)\n"
+        "  --kv-cache-min-tokens <N>   Min tokens to persist (default: 512)\n"
+        "  --kv-cache-interval <N>     Continued checkpoint every N tokens (default: 10240)\n"
+        "  --kv-cache-cold-max <N>     Cold prefix for prompts longer than N tokens (default: 10240)\n"
         "\n", prog);
 }
 
@@ -118,6 +140,16 @@ int main(int argc, char ** argv) {
             sconfig.pflash_drafter_path = argv[++i];
         } else if (std::strcmp(argv[i], "--prefill-skip-park") == 0) {
             sconfig.pflash_skip_park = true;
+        } else if (std::strcmp(argv[i], "--kv-cache-dir") == 0 && i + 1 < argc) {
+            sconfig.disk_cache_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--kv-cache-budget") == 0 && i + 1 < argc) {
+            sconfig.disk_cache_budget_mb = (size_t)std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--kv-cache-min-tokens") == 0 && i + 1 < argc) {
+            sconfig.disk_cache_min_tokens = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--kv-cache-interval") == 0 && i + 1 < argc) {
+            sconfig.disk_cache_continued_interval = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--kv-cache-cold-max") == 0 && i + 1 < argc) {
+            sconfig.disk_cache_cold_max_tokens = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--cache-type-k") == 0 && i + 1 < argc) {
             cache_type_k = argv[++i];
         } else if (std::strcmp(argv[i], "--cache-type-v") == 0 && i + 1 < argc) {
@@ -147,9 +179,12 @@ int main(int argc, char ** argv) {
 
     // Auto-select TQ3_0 KV cache for large contexts (saves ~40% VRAM).
     // Q4_0 remains default for short contexts where quality matters more.
+    // HIP build skips this: tq3_0 fattn unsupported (ggml-cuda/fattn.cu).
+#ifndef GGML_USE_HIP
     if (sconfig.max_ctx > 6144 && cache_type_k.empty() && cache_type_v.empty()) {
         setenv("DFLASH27B_KV_TQ3", "1", 0);  // don't overwrite user env
     }
+#endif
 
     // PFlash performance defaults: BSA kernel + sparse alpha + full attention window.
     bool pflash_enabled = (sconfig.pflash_mode != ServerConfig::PflashMode::OFF);
@@ -212,9 +247,17 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
     std::fprintf(stderr, "[server] │  cors            = %s\n", sconfig.enable_cors ? "ON" : "off");
     std::fprintf(stderr, "[server] │  cache_type_k    = %s\n",
+#ifdef GGML_USE_HIP
+        cache_type_k.empty() ? "q4_0 (default, HIP)" : cache_type_k.c_str());
+#else
         cache_type_k.empty() ? (sconfig.max_ctx > 6144 ? "tq3_0 (auto)" : "q4_0 (default)") : cache_type_k.c_str());
+#endif
     std::fprintf(stderr, "[server] │  cache_type_v    = %s\n",
+#ifdef GGML_USE_HIP
+        cache_type_v.empty() ? "q4_0 (default, HIP)" : cache_type_v.c_str());
+#else
         cache_type_v.empty() ? (sconfig.max_ctx > 6144 ? "tq3_0 (auto)" : "q4_0 (default)") : cache_type_v.c_str());
+#endif
     std::fprintf(stderr, "[server] │  pflash          = %s\n",
         sconfig.pflash_mode == ServerConfig::PflashMode::AUTO ? "auto" :
         sconfig.pflash_mode == ServerConfig::PflashMode::ALWAYS ? "always" : "off");
@@ -229,6 +272,9 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] ╰─────────────────────────────────────────────────────╯\n\n");
 
     HttpServer server(*backend, tokenizer, sconfig);
+    g_server = &server;
+    std::signal(SIGTERM, signal_handler);
+    std::signal(SIGINT, signal_handler);
     if (pflash_enabled) {
         server.set_drafter_tokenizer(&drafter_tokenizer);
     }

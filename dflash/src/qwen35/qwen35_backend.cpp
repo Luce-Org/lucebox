@@ -199,6 +199,87 @@ int Qwen35Backend::snapshot_cur_pos(int slot) const {
     return prefix_snapshots_[slot].cur_pos;
 }
 
+ModelBackend::SnapshotRef Qwen35Backend::snapshot_ref(int slot) const {
+    SnapshotRef ref;
+    if (slot < 0 || slot >= PREFIX_SLOTS) return ref;
+    const auto & snap = prefix_snapshots_[slot];
+    if (!snap.ctx) return ref;
+    ref.ctx      = snap.ctx;
+    ref.buf      = snap.buf;
+    ref.cur_pos  = snap.cur_pos;
+    ref.last_tok = snap.last_tok;
+    return ref;
+}
+
+bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
+                                   ggml_backend_buffer_t buf, int cur_pos,
+                                   int32_t last_tok) {
+    if (slot < 0 || slot >= PREFIX_SLOTS) return false;
+    snapshot_free(slot);
+
+    auto & snap = prefix_snapshots_[slot];
+
+    // Count expected tensor layout from weights.
+    const int n_full_attn = w_.n_layer / w_.full_attention_interval;
+    const int n_delta     = w_.n_layer - n_full_attn;
+
+    snap.attn_k_snap.assign(n_full_attn, nullptr);
+    snap.attn_v_snap.assign(n_full_attn, nullptr);
+    snap.ssm_state_snap.assign(n_delta, nullptr);
+    snap.conv_state_snap.assign(n_delta, nullptr);
+    snap.target_feat_snap = nullptr;
+
+    // Rebind tensors by name.
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        if (!t->name[0]) continue;
+        int idx = -1;
+        if (std::sscanf(t->name, "snap_cache_k_%d", &idx) == 1 && idx >= 0 && idx < n_full_attn) {
+            snap.attn_k_snap[idx] = t;
+        } else if (std::sscanf(t->name, "snap_cache_v_%d", &idx) == 1 && idx >= 0 && idx < n_full_attn) {
+            snap.attn_v_snap[idx] = t;
+        } else if (std::sscanf(t->name, "snap_ssm_state_%d", &idx) == 1 && idx >= 0 && idx < n_delta) {
+            snap.ssm_state_snap[idx] = t;
+        } else if (std::sscanf(t->name, "snap_conv_state_%d", &idx) == 1 && idx >= 0 && idx < n_delta) {
+            snap.conv_state_snap[idx] = t;
+        } else if (std::strcmp(t->name, "snap_target_feat") == 0) {
+            snap.target_feat_snap = t;
+        }
+    }
+
+    // Validate all required tensors are present.
+    for (int i = 0; i < n_full_attn; ++i) {
+        if (!snap.attn_k_snap[i] || !snap.attn_v_snap[i]) {
+            snap.attn_k_snap.clear(); snap.attn_v_snap.clear();
+            snap.ssm_state_snap.clear(); snap.conv_state_snap.clear();
+            snap.target_feat_snap = nullptr;
+            return false;
+        }
+    }
+    for (int i = 0; i < n_delta; ++i) {
+        if (!snap.ssm_state_snap[i] || !snap.conv_state_snap[i]) {
+            snap.attn_k_snap.clear(); snap.attn_v_snap.clear();
+            snap.ssm_state_snap.clear(); snap.conv_state_snap.clear();
+            snap.target_feat_snap = nullptr;
+            return false;
+        }
+    }
+    if (!snap.target_feat_snap) {
+        snap.attn_k_snap.clear(); snap.attn_v_snap.clear();
+        snap.ssm_state_snap.clear(); snap.conv_state_snap.clear();
+        return false;
+    }
+
+    snap.ctx     = ctx;
+    snap.buf     = buf;
+    snap.cur_pos = cur_pos;
+    snap.last_tok        = last_tok;
+    snap.kv_k_type       = cache_.kv_k_type;
+    snap.max_ctx         = cache_.max_ctx;
+    snap.target_feat_cap = cache_.target_feat_cap;
+    std::fprintf(stderr, "[qwen35] snapshot adopted slot=%d pos=%d last_tok=%d\n", slot, cur_pos, last_tok);
+    return true;
+}
+
 // ── Compress (pflash) ───────────────────────────────────────────────────
 
 bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & io) {

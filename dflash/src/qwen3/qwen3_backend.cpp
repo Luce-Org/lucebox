@@ -855,6 +855,11 @@ bool Qwen3Backend::snapshot_save(int slot) {
     for (int il = 0; il < n_layer; ++il) {
         snap.k_snap[il] = ggml_dup_tensor(snap.ctx, cache_.k[il]);
         snap.v_snap[il] = ggml_dup_tensor(snap.ctx, cache_.v[il]);
+        char name[64];
+        std::snprintf(name, sizeof(name), "snap_k_%d", il);
+        ggml_set_name(snap.k_snap[il], name);
+        std::snprintf(name, sizeof(name), "snap_v_%d", il);
+        ggml_set_name(snap.v_snap[il], name);
     }
 
     snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, backend_);
@@ -888,6 +893,56 @@ bool Qwen3Backend::snapshot_used(int slot) const {
 int Qwen3Backend::snapshot_cur_pos(int slot) const {
     if (slot < 0 || slot >= PREFIX_SLOTS) return 0;
     return snapshots_[slot].cur_pos;
+}
+
+ModelBackend::SnapshotRef Qwen3Backend::snapshot_ref(int slot) const {
+    SnapshotRef ref;
+    if (slot < 0 || slot >= PREFIX_SLOTS) return ref;
+    const auto & snap = snapshots_[slot];
+    if (!snap.ctx) return ref;
+    ref.ctx     = snap.ctx;
+    ref.buf     = snap.buf;
+    ref.cur_pos = snap.cur_pos;
+    return ref;
+}
+
+bool Qwen3Backend::snapshot_adopt(int slot, ggml_context * ctx,
+                                  ggml_backend_buffer_t buf, int cur_pos,
+                                  int32_t /*last_tok*/) {
+    if (slot < 0 || slot >= PREFIX_SLOTS) return false;
+    snapshot_free(slot);
+
+    auto & snap = snapshots_[slot];
+    const int n_layer = cache_.n_layer;
+
+    snap.k_snap.resize(n_layer, nullptr);
+    snap.v_snap.resize(n_layer, nullptr);
+
+    // Rebind tensors by name.
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        if (!t->name[0]) continue;
+        int il = -1;
+        if (std::sscanf(t->name, "snap_k_%d", &il) == 1 && il >= 0 && il < n_layer) {
+            snap.k_snap[il] = t;
+        } else if (std::sscanf(t->name, "snap_v_%d", &il) == 1 && il >= 0 && il < n_layer) {
+            snap.v_snap[il] = t;
+        }
+    }
+
+    // Validate all layers bound.
+    for (int il = 0; il < n_layer; ++il) {
+        if (!snap.k_snap[il] || !snap.v_snap[il]) {
+            snap.k_snap.clear();
+            snap.v_snap.clear();
+            return false;
+        }
+    }
+
+    snap.ctx     = ctx;
+    snap.buf     = buf;
+    snap.cur_pos = cur_pos;
+    std::fprintf(stderr, "[qwen3] snapshot adopted slot=%d pos=%d\n", slot, cur_pos);
+    return true;
 }
 
 // ── Compress ───────────────────────────────────────────────────────────

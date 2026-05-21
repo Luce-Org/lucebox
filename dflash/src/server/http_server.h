@@ -16,6 +16,7 @@
 #include "chat_template.h"
 #include "tool_memory.h"
 #include "prefix_cache.h"
+#include "disk_prefix_cache.h"
 #include "api_types.h"
 #include <nlohmann/json.hpp>
 
@@ -27,6 +28,8 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 namespace dflash27b {
@@ -53,6 +56,13 @@ struct ServerConfig {
     float       pflash_keep_ratio = 0.05f;  // fraction of tokens to keep
     std::string pflash_drafter_path;        // path to drafter GGUF (Qwen3-0.6B)
     bool        pflash_skip_park = false;   // skip park/unpark for ≥32GB GPUs
+
+    // Disk prefix cache
+    std::string disk_cache_dir;             // empty = disabled
+    size_t      disk_cache_budget_mb = 4096; // max disk usage in MB
+    int         disk_cache_min_tokens = 512; // only persist >= this many tokens
+    int         disk_cache_continued_interval = 10240; // continued checkpoint every N tokens
+    int         disk_cache_cold_max_tokens = 10240;    // cold prefix for prompts longer than this
 };
 
 // ─── Parsed request ─────────────────────────────────────────────────────
@@ -95,6 +105,15 @@ public:
     // Signal the server to stop accepting new connections and drain.
     void shutdown();
 
+    // Async-signal-safe: only sets stopping flag and closes listen socket.
+    void request_stop() {
+        stopping_.store(true, std::memory_order_relaxed);
+        if (listen_fd_ >= 0) {
+            ::close(listen_fd_);
+            listen_fd_ = -1;
+        }
+    }
+
 private:
     // Client thread: read HTTP request, parse, enqueue job, wait.
     void handle_client(int fd);
@@ -135,6 +154,10 @@ private:
     ChatFormat       chat_format_;
     ToolMemory       tool_memory_;
     PrefixCache      prefix_cache_;
+    DiskPrefixCache  disk_cache_;
+
+    // Track prompt tokens for each snapshot slot (for shutdown save).
+    std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
 
     // Worker thread.
     std::thread                     worker_thread_;

@@ -263,6 +263,7 @@ add_library(dflash27b STATIC
     src/server/tool_memory.cpp
     src/server/sse_emitter.cpp
     src/server/prefix_cache.cpp
+    src/server/disk_prefix_cache.cpp
 )
 # BSA (Block-Sparse Attention) backs the speculative-prefill drafter scoring
 # path. Default ON so prefill is fast out of the box. Turn OFF if you don't

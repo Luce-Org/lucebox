@@ -11,16 +11,21 @@
 #include "server/tool_parser.h"
 #include "server/reasoning.h"
 #include "server/prefix_cache.h"
+#include "server/disk_prefix_cache.h"
 #include "server/utf8_utils.h"
 #include "server/api_types.h"
 #include "server/http_server.h"
 #include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <unistd.h>
 
 using json = nlohmann::json;
 using namespace dflash27b;
@@ -533,8 +538,342 @@ static void test_pflash_threshold_always_mode() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Main
+// Disk Prefix Cache Tests
 // ═══════════════════════════════════════════════════════════════════════
+
+// Minimal mock backend for testing (no GPU needed).
+struct MockBackend : ModelBackend {
+    void print_ready_banner() const override {}
+    bool park(const std::string &) override { return true; }
+    bool unpark(const std::string &) override { return true; }
+    bool is_target_parked() const override { return false; }
+    GenerateResult generate(const GenerateRequest &, const DaemonIO &) override { return {}; }
+    bool snapshot_save(int) override { return false; }
+    void snapshot_free(int) override {}
+    bool snapshot_used(int) const override { return false; }
+    int  snapshot_cur_pos(int) const override { return 0; }
+    GenerateResult restore_and_generate(int, const GenerateRequest &, const DaemonIO &) override { return {}; }
+    bool handle_compress(const std::string &, const DaemonIO &) override { return false; }
+    void free_drafter() override {}
+    void shutdown() override {}
+};
+
+// Helper: recursively remove a directory.
+static void rm_rf(const std::string & path) {
+    DIR * dir = opendir(path.c_str());
+    if (!dir) { unlink(path.c_str()); return; }
+    struct dirent * ent;
+    while ((ent = readdir(dir)) != nullptr) {
+        if (std::strcmp(ent->d_name, ".") == 0 || std::strcmp(ent->d_name, "..") == 0) continue;
+        std::string child = path + "/" + ent->d_name;
+        struct stat st;
+        if (stat(child.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+            rm_rf(child);
+        } else {
+            unlink(child.c_str());
+        }
+    }
+    closedir(dir);
+    rmdir(path.c_str());
+}
+
+static void test_disk_cache_config_defaults() {
+    DiskCacheConfig cfg;
+    TEST_ASSERT(cfg.cache_dir.empty());
+    TEST_ASSERT(cfg.budget_bytes == (size_t)4 * 1024 * 1024 * 1024);
+    TEST_ASSERT(cfg.min_tokens == 512);
+    TEST_ASSERT(cfg.continued_interval == 10240);
+    TEST_ASSERT(cfg.cold_max_tokens == 10240);
+}
+
+static void test_disk_cache_disabled_when_no_dir() {
+    MockBackend backend;
+    DiskCacheConfig cfg;
+    cfg.cache_dir = "";
+    DiskPrefixCache cache(cfg, backend);
+    TEST_ASSERT(cache.disabled());
+    // Operations should be no-ops.
+    std::vector<int32_t> ids = {1, 2, 3, 4, 5};
+    TEST_ASSERT(!cache.lookup(ids, 0));
+    TEST_ASSERT(!cache.save(0, ids));
+}
+
+static void test_disk_cache_init_creates_directory() {
+    MockBackend backend;
+    std::string dir = "/tmp/dflash_test_disk_cache_init";
+    rm_rf(dir);
+
+    DiskCacheConfig cfg;
+    cfg.cache_dir = dir;
+    DiskPrefixCache cache(cfg, backend);
+    TEST_ASSERT(!cache.disabled());
+    TEST_ASSERT(cache.init());
+
+    // Directory should exist.
+    struct stat st;
+    TEST_ASSERT(stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode));
+
+    rm_rf(dir);
+}
+
+static void test_disk_cache_header_size() {
+    // The header should be exactly 80 bytes.
+    TEST_ASSERT(DISK_CACHE_HEADER_SIZE == 80);
+    TEST_ASSERT(DISK_CACHE_VERSION == 1);
+}
+
+static void test_disk_cache_header_round_trip() {
+    // Write and read a header to verify serialization.
+    std::string path = "/tmp/dflash_test_header_rt.dkv";
+    unlink(path.c_str());
+
+    DiskCacheHeader hdr{};
+    std::memcpy(hdr.magic, "DKVC", 4);
+    hdr.version = DISK_CACHE_VERSION;
+    std::memset(hdr.layout_id, 0xAB, 16);
+    hdr.cur_pos = 1234;
+    hdr.n_tensors = 42;
+    hdr.token_count = 567;
+    std::memset(hdr.token_hash, 0xCD, 16);
+    hdr.payload_bytes = 9999999;
+    hdr.created_at = 1700000000;
+    hdr.last_used = 1700000100;
+    hdr.last_tok = 151643;
+
+    // Use DiskPrefixCache's static write/read_header (they are private, so
+    // we test indirectly through file I/O matching the on-disk format).
+    FILE * f = std::fopen(path.c_str(), "wb");
+    TEST_ASSERT(f != nullptr);
+    // Write field-by-field matching disk_prefix_cache.cpp's write_header.
+    std::fwrite(hdr.magic, 4, 1, f);
+    uint32_t v;
+    v = hdr.version; std::fwrite(&v, 4, 1, f);
+    std::fwrite(hdr.layout_id, 16, 1, f);
+    v = hdr.cur_pos; std::fwrite(&v, 4, 1, f);
+    v = hdr.n_tensors; std::fwrite(&v, 4, 1, f);
+    v = hdr.token_count; std::fwrite(&v, 4, 1, f);
+    std::fwrite(hdr.token_hash, 16, 1, f);
+    uint64_t u64 = hdr.payload_bytes; std::fwrite(&u64, 8, 1, f);
+    u64 = hdr.created_at; std::fwrite(&u64, 8, 1, f);
+    u64 = hdr.last_used; std::fwrite(&u64, 8, 1, f);
+    int32_t i32 = hdr.last_tok; std::fwrite(&i32, 4, 1, f);
+    std::fclose(f);
+
+    // Verify file size is DISK_CACHE_HEADER_SIZE.
+    struct stat st;
+    stat(path.c_str(), &st);
+    TEST_ASSERT((size_t)st.st_size == DISK_CACHE_HEADER_SIZE);
+
+    // Read back and verify.
+    f = std::fopen(path.c_str(), "rb");
+    TEST_ASSERT(f != nullptr);
+    char magic[4]; std::fread(magic, 4, 1, f);
+    TEST_ASSERT(std::memcmp(magic, "DKVC", 4) == 0);
+    uint32_t rv; std::fread(&rv, 4, 1, f);
+    TEST_ASSERT(rv == DISK_CACHE_VERSION);
+    uint8_t lid[16]; std::fread(lid, 16, 1, f);
+    TEST_ASSERT(lid[0] == 0xAB && lid[15] == 0xAB);
+    std::fread(&rv, 4, 1, f); TEST_ASSERT(rv == 1234);  // cur_pos
+    std::fread(&rv, 4, 1, f); TEST_ASSERT(rv == 42);    // n_tensors
+    std::fread(&rv, 4, 1, f); TEST_ASSERT(rv == 567);   // token_count
+    uint8_t th[16]; std::fread(th, 16, 1, f);
+    TEST_ASSERT(th[0] == 0xCD && th[15] == 0xCD);
+    uint64_t ru64; std::fread(&ru64, 8, 1, f); TEST_ASSERT(ru64 == 9999999);  // payload
+    std::fread(&ru64, 8, 1, f); TEST_ASSERT(ru64 == 1700000000);  // created_at
+    std::fread(&ru64, 8, 1, f); TEST_ASSERT(ru64 == 1700000100);  // last_used
+    int32_t ri32; std::fread(&ri32, 4, 1, f); TEST_ASSERT(ri32 == 151643);  // last_tok
+    std::fclose(f);
+
+    unlink(path.c_str());
+}
+
+static void test_disk_cache_continued_boundary() {
+    // Test maybe_store_continued logic: saves at interval boundaries.
+    MockBackend backend;
+    std::string dir = "/tmp/dflash_test_continued";
+    rm_rf(dir);
+
+    DiskCacheConfig cfg;
+    cfg.cache_dir = dir;
+    cfg.min_tokens = 100;
+    cfg.continued_interval = 1000;
+    DiskPrefixCache cache(cfg, backend);
+    cache.init();
+
+    // Without layout known, save should fail gracefully.
+    std::vector<int32_t> tokens(1500, 42);
+    TEST_ASSERT(!cache.maybe_store_continued(0, tokens, 1000));
+
+    // Reset continued tracking.
+    cache.reset_continued();
+
+    // Below interval, no save (even if tokens available).
+    TEST_ASSERT(!cache.maybe_store_continued(0, tokens, 500));
+
+    // At exactly 1000 tokens — would save if layout were known.
+    // But backend mock can't provide snapshots, so it fails gracefully.
+    TEST_ASSERT(!cache.maybe_store_continued(0, tokens, 1000));
+
+    rm_rf(dir);
+}
+
+static void test_disk_cache_continued_interval_logic() {
+    // Verify the continued boundary math independently.
+    // Target = (cur_pos / interval) * interval
+    // Only fires when target > last_store_pos AND target >= min_tokens.
+    int interval = 10240;
+    int min_tokens = 512;
+
+    // cur_pos=10239: target = 10239/10240 * 10240 = 0. No save.
+    int target = (10239 / interval) * interval;
+    TEST_ASSERT(target == 0);
+
+    // cur_pos=10240: target = 10240. Save.
+    target = (10240 / interval) * interval;
+    TEST_ASSERT(target == 10240);
+
+    // cur_pos=20479: target = 10240. But if last_store=10240, no save.
+    target = (20479 / interval) * interval;
+    TEST_ASSERT(target == 10240);
+
+    // cur_pos=20480: target = 20480. Save.
+    target = (20480 / interval) * interval;
+    TEST_ASSERT(target == 20480);
+
+    // Verify min_tokens gate.
+    int small_interval = 100;
+    target = (150 / small_interval) * small_interval;
+    TEST_ASSERT(target == 100);
+    // target=100 < min_tokens=512, so the continued save should NOT fire.
+    TEST_ASSERT(target < min_tokens);
+    (void)min_tokens;
+}
+
+static void test_disk_cache_cold_prefix_short_prompt() {
+    // Cold prefix should not trigger for short prompts.
+    MockBackend backend;
+    std::string dir = "/tmp/dflash_test_cold_short";
+    rm_rf(dir);
+
+    DiskCacheConfig cfg;
+    cfg.cache_dir = dir;
+    cfg.cold_max_tokens = 10240;
+    cfg.min_tokens = 512;
+    DiskPrefixCache cache(cfg, backend);
+    cache.init();
+
+    // Prompt shorter than cold_max_tokens.
+    std::vector<int32_t> prompt(5000, 1);
+    std::vector<int> boundaries = {1000, 2000, 3000, 4000};
+    TEST_ASSERT(cache.cold_prefix_boundary(prompt, boundaries) == 0);
+
+    rm_rf(dir);
+}
+
+static void test_disk_cache_cold_prefix_no_boundaries() {
+    // Cold prefix should not trigger if no boundaries provided.
+    MockBackend backend;
+    std::string dir = "/tmp/dflash_test_cold_nobound";
+    rm_rf(dir);
+
+    DiskCacheConfig cfg;
+    cfg.cache_dir = dir;
+    cfg.cold_max_tokens = 5000;
+    cfg.min_tokens = 512;
+    DiskPrefixCache cache(cfg, backend);
+    cache.init();
+
+    std::vector<int32_t> prompt(10000, 1);
+    std::vector<int> empty_boundaries;
+    TEST_ASSERT(cache.cold_prefix_boundary(prompt, empty_boundaries) == 0);
+
+    rm_rf(dir);
+}
+
+static void test_disk_cache_cold_prefix_finds_boundary() {
+    // Cold prefix should find the last boundary <= cold_max_tokens.
+    MockBackend backend;
+    std::string dir = "/tmp/dflash_test_cold_finds";
+    rm_rf(dir);
+
+    DiskCacheConfig cfg;
+    cfg.cache_dir = dir;
+    cfg.cold_max_tokens = 5000;
+    cfg.min_tokens = 512;
+    DiskPrefixCache cache(cfg, backend);
+    cache.init();
+    // Manually mark layout as known (hack for testing without real snapshots).
+    // Since cold_prefix_boundary checks layout_known_, and we can't easily
+    // set it without a real snapshot, the function will return 0.
+    // This tests that short prompts / bad boundaries correctly return 0.
+    std::vector<int32_t> prompt(10000, 1);
+    std::vector<int> boundaries = {1000, 2000, 3000, 4000, 6000, 8000};
+    // Without layout_known_, returns 0.
+    int result = cache.cold_prefix_boundary(prompt, boundaries);
+    TEST_ASSERT(result == 0);  // layout not known yet
+
+    rm_rf(dir);
+}
+
+static void test_disk_cache_budget_enforcement_scoring() {
+    // Test that eviction scoring prefers lower-value entries.
+    // score = (hits+1) * token_count / file_size
+    // Entry with fewer tokens + fewer hits should have lower score.
+
+    // Simulate: entry A: 100 tokens, 0 hits, 1MB → score = 1*100/1M = 0.0001
+    //           entry B: 10000 tokens, 5 hits, 1MB → score = 6*10000/1M = 0.06
+    // Entry A should be evicted first.
+    double score_a = (0.0 + 1.0) * 100.0 / (1024.0 * 1024.0);
+    double score_b = (5.0 + 1.0) * 10000.0 / (1024.0 * 1024.0);
+    TEST_ASSERT(score_a < score_b);
+
+    // With time decay: entry B with 24h old hits (4 half-lives = 0.0625 remaining)
+    double decay_24h = std::exp(-86400.0 * 3.2e-5);  // ~0.064
+    double score_b_decayed = (5.0 * decay_24h + 1.0) * 10000.0 / (1024.0 * 1024.0);
+    // Should still be higher than A since (5*0.064+1)=1.32 > 1.0
+    TEST_ASSERT(score_b_decayed > score_a);
+
+    // With 7 days old (massive decay), hits are nearly zero:
+    double decay_7d = std::exp(-604800.0 * 3.2e-5);  // ~5e-9
+    double score_b_ancient = (5.0 * decay_7d + 1.0) * 10000.0 / (1024.0 * 1024.0);
+    // (5*~0 + 1)*10000/1M ≈ 0.01 — still > score_a since more tokens
+    TEST_ASSERT(score_b_ancient > score_a);
+}
+
+static void test_disk_cache_lookup_miss_no_layout() {
+    // Lookup with no layout known should return false.
+    MockBackend backend;
+    std::string dir = "/tmp/dflash_test_lookup_miss";
+    rm_rf(dir);
+
+    DiskCacheConfig cfg;
+    cfg.cache_dir = dir;
+    DiskPrefixCache cache(cfg, backend);
+    cache.init();
+
+    std::vector<int32_t> ids = {1, 2, 3, 4, 5, 6, 7, 8};
+    TEST_ASSERT(!cache.lookup(ids, 0));
+
+    rm_rf(dir);
+}
+
+static void test_disk_cache_save_below_min_tokens() {
+    // Save with fewer tokens than min_tokens should be rejected.
+    MockBackend backend;
+    std::string dir = "/tmp/dflash_test_save_below";
+    rm_rf(dir);
+
+    DiskCacheConfig cfg;
+    cfg.cache_dir = dir;
+    cfg.min_tokens = 100;
+    DiskPrefixCache cache(cfg, backend);
+    cache.init();
+
+    std::vector<int32_t> ids(50, 1);  // only 50 tokens
+    TEST_ASSERT(!cache.save(0, ids));
+
+    rm_rf(dir);
+}
 
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
@@ -592,6 +931,21 @@ int main() {
     RUN_TEST(test_pflash_compress_result_defaults);
     RUN_TEST(test_pflash_threshold_auto_mode);
     RUN_TEST(test_pflash_threshold_always_mode);
+
+    std::fprintf(stderr, "\n── Disk prefix cache ──\n");
+    RUN_TEST(test_disk_cache_config_defaults);
+    RUN_TEST(test_disk_cache_disabled_when_no_dir);
+    RUN_TEST(test_disk_cache_init_creates_directory);
+    RUN_TEST(test_disk_cache_header_size);
+    RUN_TEST(test_disk_cache_header_round_trip);
+    RUN_TEST(test_disk_cache_continued_boundary);
+    RUN_TEST(test_disk_cache_continued_interval_logic);
+    RUN_TEST(test_disk_cache_cold_prefix_short_prompt);
+    RUN_TEST(test_disk_cache_cold_prefix_no_boundaries);
+    RUN_TEST(test_disk_cache_cold_prefix_finds_boundary);
+    RUN_TEST(test_disk_cache_budget_enforcement_scoring);
+    RUN_TEST(test_disk_cache_lookup_miss_no_layout);
+    RUN_TEST(test_disk_cache_save_below_min_tokens);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",

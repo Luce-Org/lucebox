@@ -66,6 +66,9 @@ public:
 
     bool disabled() const { return disabled_; }
 
+    // Expose chat markers for cold prefix boundary detection.
+    const ChatMarkers & chat_markers() const { return markers_; }
+
     // ── Inline prefix cache ─────────────────────────────────────────
 
     // Look up the longest cached prefix. Returns (slot, prefix_len) or (-1, 0).

@@ -92,6 +92,11 @@ public:
                                         const GenerateRequest & req,
                                         const DaemonIO & io) override;
 
+    SnapshotRef snapshot_ref(int slot) const override;
+    bool snapshot_adopt(int slot, ggml_context * ctx,
+                        ggml_backend_buffer_t buf, int cur_pos,
+                        int32_t last_tok = -1) override;
+
     CompressResult compress(const CompressRequest & req) override;
     bool handle_compress(const std::string & line,
                          const DaemonIO & io) override;

@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+#include "ggml.h"
+#include "ggml-backend.h"
 #include "sampler.h"
 
 namespace dflash27b {
@@ -104,6 +106,30 @@ struct ModelBackend {
     virtual GenerateResult restore_and_generate(int slot,
                                                  const GenerateRequest & req,
                                                  const DaemonIO & io) = 0;
+
+    // ── Snapshot serialization (for ondisk prefix cache) ─────────────
+    // Read-only reference to a snapshot's ggml tensors for serialization.
+    struct SnapshotRef {
+        ggml_context        * ctx     = nullptr;
+        ggml_backend_buffer_t buf     = nullptr;
+        int                   cur_pos = 0;
+        int32_t               last_tok = -1;  // last prefill token (for decode seeding)
+    };
+
+    // Export a snapshot's tensor context + buffer for read-only access.
+    // Ownership is NOT transferred — caller must only read tensor data.
+    // Returns empty ref (ctx==nullptr) if slot is invalid or unused.
+    virtual SnapshotRef snapshot_ref(int slot) const { (void)slot; return {}; }
+
+    // Import a deserialized snapshot into the given slot. Backend takes
+    // ownership of ctx and buf on success. On failure (returns false),
+    // the caller is responsible for freeing ctx and buf.
+    virtual bool snapshot_adopt(int slot, ggml_context * ctx,
+                                ggml_backend_buffer_t buf, int cur_pos,
+                                int32_t last_tok = -1) {
+        (void)slot; (void)ctx; (void)buf; (void)cur_pos; (void)last_tok;
+        return false;
+    }
 
     // ── Compress (pflash) ────────────────────────────────────────────
     // Backend owns the DrafterContext lifecycle and park/unpark policy.
