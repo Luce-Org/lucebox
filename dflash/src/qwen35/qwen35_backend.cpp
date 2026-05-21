@@ -13,6 +13,7 @@
 
 #include "ggml-cuda.h"
 #include "common/snapshot_backend.h"
+#include "pflash_ggml_adapter.h"
 
 #include <algorithm>
 #include <chrono>
@@ -36,6 +37,10 @@ Qwen35Backend::~Qwen35Backend() { shutdown(); }
 
 bool Qwen35Backend::init() {
     split_gpus_ = (cfg_.device.gpu != cfg_.draft_gpu);
+
+#if defined(DFLASH27B_HAVE_SM80_FLASHPREFILL) || defined(DFLASH27B_HAVE_FLASHPREFILL)
+    pflash_register_ggml_kernel();
+#endif
 
     target_backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
     if (!target_backend_) {
@@ -478,6 +483,19 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     const int prompt_len = (int)tokens.size();
     prefill_last_logits_valid_ = false;
 
+    // BSA (Block-Sparse Attention) for full-attention layers during prefill.
+    // Requires Q_len == KV_len, so we process the full prompt in one shot (no chunking).
+    // Only for fresh prefill (kv_offset==0) and prompts above threshold.
+    static const int BSA_THRESHOLD = 1024;
+    float bsa_alpha = 0.12f;
+    if (const char * s = std::getenv("DFLASH_FP_ALPHA")) {
+        bsa_alpha = std::atof(s);
+    }
+    const bool use_bsa = (kv_offset == 0) && (prompt_len > BSA_THRESHOLD);
+    if (use_bsa) {
+        prefill_ubatch = prompt_len;  // single-shot, no chunking
+    }
+
     // Skip KV-cache migration when resuming from a snapshot — the cache was
     // already migrated when the snapshot was taken; re-running migrate would
     // clobber the restored state.
@@ -508,7 +526,10 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (snap_pos > kv_pos && snap_pos < kv_pos + n_tokens) {
             n_tokens = snap_pos - kv_pos;
         }
-        const bool with_mask = (cfg_.kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
+        // BSA path: no mask needed (causality handled by the kernel).
+        // Dense path: mask required when n_tokens > 1.
+        const bool with_mask = use_bsa ? false
+            : ((cfg_.kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1));
 
         // Prefill always uses full attention (fa_window=0) so that all
         // positions encode the complete context — critical for tool
@@ -520,7 +541,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                /*capture_delta_intermediate=*/false,
                                /*fa_window=*/0,
                                /*last_token_logits_only=*/(start + n_tokens < prompt_len),
-                               cfg_.kq_stride_pad)) {
+                               cfg_.kq_stride_pad,
+                               use_bsa, bsa_alpha)) {
             std::fprintf(stderr, "prefill build @%d\n", kv_pos);
             return -1;
         }

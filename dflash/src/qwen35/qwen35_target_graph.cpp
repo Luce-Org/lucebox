@@ -471,7 +471,9 @@ static ggml_tensor * build_full_attn_block(
     bool kv_k_rotated = false,
     int fa_window = 0,
     ggml_tensor * q_tail_capture = nullptr,
-    int q_tail_start = 0
+    int q_tail_start = 0,
+    bool use_sparse_attn = false,
+    float sparse_alpha = 0.12f
 ) {
     const int head_dim = w.n_embd_head_k;
     const int n_head = w.n_head;
@@ -616,8 +618,16 @@ static ggml_tensor * build_full_attn_block(
     // a mask shaped [kv_len, n_tokens] with 0 for attendable positions and
     // -inf for positions beyond the causal boundary.
     const float kq_scale = 1.0f / std::sqrt((float)head_dim);
-    ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask,
-                                             kq_scale, 0.0f, 0.0f);
+    ggml_tensor * attn;
+    if (use_sparse_attn) {
+        // BSA path: ggml_flash_attn_sparse handles causality internally.
+        // On sm_80+ with pflash registered, this does block-sparse attention.
+        // On older hardware, falls back to dense FA transparently.
+        attn = ggml_flash_attn_sparse(ctx, Qfa, Kfa, Vfa, kq_scale, sparse_alpha);
+    } else {
+        attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask,
+                                   kq_scale, 0.0f, 0.0f);
+    }
     // attn: [head_dim, n_head, n_tokens] (permuted)
 
     // Un-rotate the FA output from FWHT-rotated V space (only when V is TQ3).
@@ -1061,7 +1071,9 @@ QwenGraphOutputs build_qwen35_graph(
                                         in.attn_mask, in.kv_start, n_tokens,
                                         cache.kv_k_type, cache.kv_v_type,
                                         cache.kv_k_rotated,
-                                        in.fa_window);
+                                        in.fa_window,
+                                        /*q_tail_capture=*/nullptr, /*q_tail_start=*/0,
+                                        in.use_sparse_attn, in.sparse_alpha);
             fa_idx++;
         } else {
             DeltaNetCapture * cap_ptr = nullptr;

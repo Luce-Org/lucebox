@@ -92,7 +92,9 @@ bool build_target_step(
     bool capture_delta_intermediate,
     int fa_window,
     bool last_token_logits_only,
-    int kq_stride_pad) {
+    int kq_stride_pad,
+    bool use_sparse_attn,
+    float sparse_alpha) {
     step_graph_free(sg);
 
     ggml_init_params ip{};
@@ -135,6 +137,8 @@ bool build_target_step(
     gi.capture_delta_intermediate = capture_delta_intermediate;
     gi.fa_window                  = fa_window;
     gi.last_token_logits_only     = last_token_logits_only;
+    gi.use_sparse_attn            = use_sparse_attn;
+    gi.sparse_alpha               = sparse_alpha;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;

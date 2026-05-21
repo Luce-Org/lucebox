@@ -499,6 +499,8 @@ struct QwenGraphInputs {
     int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
     bool          last_token_logits_only = false; // if true, only compute logits for last token (prefill optimization)
     ggml_tensor * parent_ids = nullptr; // [n_tokens] i32; tree mode when non-null
+    bool          use_sparse_attn = false; // use ggml_flash_attn_sparse (BSA) for full-attn layers
+    float         sparse_alpha = 0.12f;   // BSA block-selection threshold (lower = more blocks selected)
 };
 
 struct QwenGraphOutputs {
