@@ -554,6 +554,18 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
 
         req.thinking_enabled = enable_thinking;
 
+        // Bandit: parse session_id from extra_body (opt-in adaptive keep_ratio)
+        if (body.contains("extra_body")) {
+            const auto & eb = body["extra_body"];
+            if (eb.is_object() && eb.contains("session_id")) {
+                req.session_id = eb["session_id"].get<std::string>();
+            }
+        }
+        // Also accept session_id at the top level for convenience.
+        if (req.session_id.empty() && body.contains("session_id")) {
+            req.session_id = body["session_id"].get<std::string>();
+        }
+
         // Serialize tools JSON for template injection.
         std::string tools_json;
         if (req.tools.is_array() && !req.tools.empty()) {
@@ -718,7 +730,10 @@ void HttpServer::worker_loop() {
                         // 3. Compress via typed API
                         ModelBackend::CompressRequest creq;
                         creq.input_ids = std::move(drafter_ids);
-                        creq.keep_ratio = config_.pflash_keep_ratio;
+                        // Bandit: use per-session keep_ratio if session_id provided.
+                        creq.keep_ratio = req.session_id.empty()
+                            ? config_.pflash_keep_ratio
+                            : sessions_.get_keep_ratio(req.session_id);
                         creq.drafter_path = config_.pflash_drafter_path;
                         creq.skip_park = config_.pflash_skip_park;
 
@@ -924,6 +939,22 @@ void HttpServer::worker_loop() {
         // Release oversized scratch buffers (gallocr, BSA cache) so VRAM
         // doesn't grow monotonically across requests with different sizes.
         backend_.release_scratch();
+
+        // Bandit: update per-session state after generation.
+        if (!req.session_id.empty() && result.accept_rate > 0.0f) {
+            float old_keep = sessions_.get_keep_ratio(req.session_id);
+            int   old_turn = sessions_.turn_count(req.session_id);
+            sessions_.update(req.session_id, result.accept_rate);
+            float new_keep = sessions_.get_keep_ratio(req.session_id);
+            float ema_val  = dflash::kBanditEmaAlpha * result.accept_rate
+                             + (1.0f - dflash::kBanditEmaAlpha) * result.accept_rate;
+            (void)ema_val;  // reported via old_turn for now
+            std::fprintf(stderr,
+                "[pflash-bandit] session=%s turn=%d keep=%.4f->%.4f (accept=%.3f)\n",
+                req.session_id.c_str(), old_turn + 1,
+                old_keep, new_keep, result.accept_rate);
+        }
+
 
         // Confirm or abort the inline snapshot.
         if (snap_prepared) {

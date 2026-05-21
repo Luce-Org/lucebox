@@ -18,6 +18,7 @@
 #include "prefix_cache.h"
 #include "disk_prefix_cache.h"
 #include "api_types.h"
+#include "adaptive_keep_ratio.h"
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -94,6 +95,8 @@ struct ParsedRequest {
     bool                      started_in_thinking = false;
     // Stop sequences (OpenAI "stop" + Anthropic "stop_sequences")
     std::vector<std::string>  stop_sequences;
+    // Bandit: per-session adaptive keep_ratio opt-in
+    std::string               session_id;
 };
 
 // ─── HTTP server ────────────────────────────────────────────────────────
@@ -169,6 +172,9 @@ private:
     ToolMemory       tool_memory_;
     PrefixCache      prefix_cache_;
     DiskPrefixCache  disk_cache_;
+
+    // Per-session adaptive keep_ratio bandit state.
+    dflash::HttpServerSessions sessions_;
 
     // Track prompt tokens for each snapshot slot (for shutdown save).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
