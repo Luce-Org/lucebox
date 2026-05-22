@@ -693,3 +693,136 @@ class TestStopSequences:
         content = r.json()["choices"][0]["message"]["content"]
         # Should produce some output since stop didn't match
         assert len(content) > 0
+
+
+# ═══════════════════════════════════════════════════════════════════
+# /props introspection — parity with dflash/scripts/server.py:1221
+# ═══════════════════════════════════════════════════════════════════
+
+class TestProps:
+    """Mirrors the Python server's /props shape so cross-server consumers
+    (autotune, dashboards, snapshot/profile) see a stable contract."""
+
+    def _fetch(self):
+        r = requests.get(f"{SERVER_URL}/props", timeout=10)
+        assert r.status_code == 200, f"/props returned {r.status_code}"
+        return r.json()
+
+    def test_top_level_keys_present(self):
+        body = self._fetch()
+        expected = {
+            "default_generation_settings", "model_alias", "model_path",
+            "build_info", "speculative_mode", "server", "model", "runtime",
+            "reasoning", "speculative", "sampling", "pflash", "prefix_cache",
+            "full_cache", "tool_replay", "daemon", "api", "capabilities",
+        }
+        missing = expected - set(body.keys())
+        assert not missing, f"/props missing top-level keys: {missing}"
+
+    def test_server_block_shape(self):
+        srv = self._fetch()["server"]
+        assert srv["name"] == "luce-dflash"
+        assert "version" in srv
+        assert isinstance(srv["props_schema"], int)
+
+    def test_speculative_mode_consistency(self):
+        body = self._fetch()
+        mode = body["speculative_mode"]
+        assert mode in {"off", "dflash", "pflash"}
+        if mode == "dflash":
+            assert body["speculative"]["enabled"] is True
+            assert body["pflash"]["enabled"] is False
+        elif mode == "pflash":
+            assert body["pflash"]["enabled"] is True
+        else:
+            assert body["speculative"]["enabled"] is False
+            assert body["pflash"]["enabled"] is False
+
+    def test_runtime_backend_value(self):
+        rt = self._fetch()["runtime"]
+        assert rt["backend"] in {"cuda", "hip", "cpu"}
+        assert isinstance(rt["fa_window"], int)
+        assert rt["kv_cache_k"]
+        assert rt["kv_cache_v"]
+
+    def test_capabilities_match_arch(self):
+        body = self._fetch()
+        caps = body["capabilities"]
+        # Reasoning + speculative + tools all flip together with arch family.
+        if caps["reasoning_supported"]:
+            assert caps["speculative_supported"] is True
+            assert caps["tools_supported"] is True
+            assert "medium" in body["reasoning"]["supported_efforts"]
+
+    def test_api_endpoint_registry(self):
+        endpoints = self._fetch()["api"]["endpoints"]
+        # Every endpoint the test suite hits must be in the registry.
+        required = {
+            "GET /health", "GET /props", "GET /v1/models",
+            "POST /v1/chat/completions", "POST /v1/messages",
+            "POST /v1/messages/count_tokens", "POST /v1/responses",
+        }
+        assert required.issubset(set(endpoints)), \
+            f"/props missing endpoints: {required - set(endpoints)}"
+
+    def test_prefix_cache_stats_shape(self):
+        pc = self._fetch()["prefix_cache"]
+        for key in ("capacity", "in_use", "lifetime_hits"):
+            assert key in pc, f"prefix_cache missing {key}"
+            assert isinstance(pc[key], int)
+
+    def test_tool_replay_stats_shape(self):
+        tr = self._fetch()["tool_replay"]
+        for key in ("max_entries", "max_bytes", "current_entries", "current_bytes"):
+            assert key in tr, f"tool_replay missing {key}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# /v1/messages/count_tokens — Anthropic count_tokens parity
+# ═══════════════════════════════════════════════════════════════════
+
+class TestCountTokens:
+    def test_simple_count(self):
+        body = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "Hello, world."}],
+        }
+        r = post_json("/v1/messages/count_tokens", body, timeout=10)
+        assert r.status_code == 200
+        payload = r.json()
+        assert "input_tokens" in payload
+        assert isinstance(payload["input_tokens"], int)
+        assert payload["input_tokens"] > 0
+
+    def test_count_scales_with_message_length(self):
+        short = {"model": MODEL_NAME,
+                 "messages": [{"role": "user", "content": "hi"}]}
+        long = {"model": MODEL_NAME,
+                "messages": [{"role": "user", "content": "word " * 200}]}
+        r_short = post_json("/v1/messages/count_tokens", short, timeout=10).json()
+        r_long  = post_json("/v1/messages/count_tokens", long,  timeout=10).json()
+        assert r_long["input_tokens"] > r_short["input_tokens"]
+
+    def test_count_with_system_block(self):
+        body = {
+            "model": MODEL_NAME,
+            "system": "You are a helpful assistant.",
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        r = post_json("/v1/messages/count_tokens", body, timeout=10)
+        assert r.status_code == 200
+        assert r.json()["input_tokens"] > 0
+
+    def test_count_does_not_generate(self):
+        """count_tokens must be fast — no generation. <1s budget vs many
+        seconds for a real generation."""
+        body = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "What is 1+1?"}],
+        }
+        t0 = time.monotonic()
+        r = post_json("/v1/messages/count_tokens", body, timeout=10)
+        elapsed = time.monotonic() - t0
+        assert r.status_code == 200
+        # 1s is generous; real bound is dominated by tokenizer + HTTP RTT.
+        assert elapsed < 1.0, f"count_tokens took {elapsed:.2f}s (expected <1s)"

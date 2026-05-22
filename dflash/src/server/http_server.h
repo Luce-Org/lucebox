@@ -49,6 +49,21 @@ struct ServerConfig {
     std::string model_name  = "dflash";
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
 
+    // /props introspection inputs — captured at startup by server_main so
+    // the /props handler doesn't need to crack open BackendArgs or env.
+    // Matches dflash/scripts/server.py:1221-1312 field-for-field.
+    std::string arch;                  // detected model arch (qwen35/36, laguna, gemma4, ...)
+    std::string model_path;            // bargs.model_path
+    std::string draft_path;            // bargs.draft_path (empty if no draft)
+    std::string tokenizer_id;          // tokenizer name from GGUF metadata (best-effort)
+    std::string kv_cache_k;            // effective KV K type ("q4_0", "tq3_0", "f16", ...)
+    std::string kv_cache_v;            // effective KV V type
+    std::string runtime_backend;       // "cuda" | "hip" | "cpu"
+    int         fa_window           = 0;
+    int         ddtree_budget       = 0;
+    bool        speculative_enabled = false;
+    bool        target_sharding     = false;
+
     // PFlash (speculative prefill compression)
     enum class PflashMode { OFF, AUTO, ALWAYS };
     PflashMode  pflash_mode      = PflashMode::OFF;

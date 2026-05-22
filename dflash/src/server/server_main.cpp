@@ -434,6 +434,42 @@ int main(int argc, char ** argv) {
     }
     std::fprintf(stderr, "[server] ╰─────────────────────────────────────────────────────╯\n\n");
 
+    // Populate /props introspection fields. These are runtime config snaps
+    // — the /props handler reads them lockless from config_ so they need to
+    // be set BEFORE the HttpServer constructor copies sconfig.
+    sconfig.arch         = arch;
+    sconfig.model_path   = bargs.model_path ? bargs.model_path : "";
+    sconfig.draft_path   = bargs.draft_path ? bargs.draft_path : "";
+    sconfig.fa_window    = bargs.fa_window;
+    sconfig.ddtree_budget = bargs.ddtree_budget;
+    sconfig.speculative_enabled = bargs.ddtree_mode;
+    sconfig.target_sharding     = bargs.device.is_layer_split();
+    // KV type: report the operator's choice if set, else the auto-default
+    // the daemon picks. Matches the printed table above.
+    sconfig.kv_cache_k = cache_type_k.empty()
+#ifdef GGML_USE_HIP
+        ? "q4_0"
+#else
+        ? (sconfig.max_ctx > 6144 ? "tq3_0" : "q4_0")
+#endif
+        : cache_type_k;
+    sconfig.kv_cache_v = cache_type_v.empty()
+#ifdef GGML_USE_HIP
+        ? "q4_0"
+#else
+        ? (sconfig.max_ctx > 6144 ? "tq3_0" : "q4_0")
+#endif
+        : cache_type_v;
+    sconfig.runtime_backend =
+#ifdef GGML_USE_HIP
+        "hip";
+#else
+        "cuda";
+#endif
+    // Tokenizer ID: best-effort. The Tokenizer class doesn't currently
+    // expose the GGUF metadata key it was loaded from, so leave empty
+    // and let /props report null. (Add a getter on Tokenizer later.)
+
     HttpServer server(*backend, tokenizer, sconfig);
     server.set_chat_format(chat_format_for_arch(arch));
     g_server = &server;

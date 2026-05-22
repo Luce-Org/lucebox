@@ -105,6 +105,27 @@ public:
     // Abort reservation.
     void abort_full_snap(int slot);
 
+    // ── Introspection (for /props) ──────────────────────────────────
+
+    struct InlineStats {
+        int capacity;
+        int in_use;
+        int64_t lifetime_hits;
+    };
+    struct FullStats {
+        bool enabled;
+        int capacity;
+        int in_use;
+        int64_t disk_bytes;
+        int64_t lifetime_hits;
+    };
+
+    // Lockless snapshot for /props. A mutation under daemon_lock can tear
+    // in_use vs lifetime_hits across the read pair; acceptable for an
+    // introspection report (matches the Python implementation's semantics).
+    InlineStats stats() const;
+    FullStats full_stats() const;
+
 private:
     bool disabled_ = true;
     int cap_ = 0;
@@ -134,6 +155,9 @@ private:
     std::vector<FullLruEntry> full_entries_;
     PrefixHash full_pending_evict_key_{};
     bool full_has_pending_evict_ = false;
+    int64_t lifetime_hits_ = 0;       // inline cache hits
+    int64_t full_lifetime_hits_ = 0;  // full-compress cache hits
+    int64_t full_disk_bytes_ = 0;     // best-effort snapshot of disk usage
 
     // Helpers
     int find_entry(const PrefixHash & h) const;

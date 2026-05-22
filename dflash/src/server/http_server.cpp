@@ -24,6 +24,35 @@
 
 namespace dflash::common {
 
+// ─── /props constants ───────────────────────────────────────────────────
+//
+// SERVER_NAME / SERVER_VERSION mirror the Python server's identity strings
+// so cross-server consumers (autotune, dashboards) see a stable
+// `build_info` shape. Bump PROPS_SCHEMA on breaking changes only:
+//   - field renamed
+//   - field removed
+//   - existing field's semantics change (units, nullability, type)
+// Do NOT bump for additive changes (new fields, new sections).
+//
+// Matches dflash/scripts/server.py:175 (PROPS_SCHEMA constant).
+static constexpr int  kPropsSchema  = 1;
+static constexpr char kServerName[] = "luce-dflash";
+#ifndef DFLASH_SERVER_VERSION
+#define DFLASH_SERVER_VERSION "0.0.0+cpp"
+#endif
+
+// API endpoint registry served by /props. Keep in sync with the route
+// handlers in handle_client() and route_request().
+static const std::vector<std::string> kApiEndpoints = {
+    "GET /health",
+    "GET /props",
+    "GET /v1/models",
+    "POST /v1/chat/completions",
+    "POST /v1/messages",
+    "POST /v1/messages/count_tokens",
+    "POST /v1/responses",
+};
+
 // ─── Utilities ──────────────────────────────────────────────────────────
 
 static std::string generate_id(const char * prefix) {
@@ -32,6 +61,161 @@ static std::string generate_id(const char * prefix) {
     std::snprintf(buf, sizeof(buf), "%s_%016llx",
                   prefix, (unsigned long long)counter.fetch_add(1));
     return buf;
+}
+
+// Build the /props response body. Matches dflash/scripts/server.py:1221-1312
+// key-for-key so cross-server diffs stay clean. The Python version is the
+// reference impl; if a key drifts here, update it there too (or document the
+// intentional difference in docs/specs/thinking-budget.md).
+static json build_props_body(const ServerConfig & config,
+                             const PrefixCache & prefix_cache,
+                             const ToolMemory & tool_memory) {
+    // arch-gated capabilities (mirrors Python _capabilities()).
+    const bool is_qwen = (config.arch.rfind("qwen", 0) == 0);
+    const bool reasoning_supported = is_qwen;
+    const bool speculative_supported = is_qwen;
+    const bool tools_supported = is_qwen;
+
+    auto pcs  = prefix_cache.stats();
+    auto pcfs = prefix_cache.full_stats();
+    auto tms  = tool_memory.stats();
+
+    const bool pflash_enabled =
+        (config.pflash_mode != ServerConfig::PflashMode::OFF);
+    std::string speculative_mode;
+    if (pflash_enabled)             speculative_mode = "pflash";
+    else if (speculative_supported) speculative_mode = "dflash";
+    else                            speculative_mode = "off";
+
+    json reasoning_efforts = json::array();
+    if (reasoning_supported) reasoning_efforts.push_back("medium");
+
+    json server = {
+        {"name",         kServerName},
+        {"version",      DFLASH_SERVER_VERSION},
+        {"props_schema", kPropsSchema},
+    };
+
+    json pflash;
+    if (!pflash_enabled) {
+        pflash = {
+            {"enabled",      false},
+            {"mode",         "off"},
+            {"threshold",    nullptr},
+            {"keep_ratio",   nullptr},
+            {"drafter_gguf", nullptr},
+            {"skip_park",    nullptr},
+            {"bsa_enabled",  nullptr},
+            {"bsa_alpha",    nullptr},
+            {"lm_head_fix",  nullptr},
+        };
+    } else {
+        const char * bsa_env = std::getenv("DFLASH_FP_USE_BSA");
+        const char * alpha_env = std::getenv("DFLASH_FP_ALPHA");
+        const char * lmfix_env = std::getenv("DFLASH27B_LM_HEAD_FIX");
+        json bsa_alpha = nullptr;
+        if (alpha_env && *alpha_env) {
+            try { bsa_alpha = std::stod(alpha_env); }
+            catch (const std::exception &) { bsa_alpha = nullptr; }
+        }
+        std::string mode_str =
+            (config.pflash_mode == ServerConfig::PflashMode::AUTO)   ? "auto"   :
+            (config.pflash_mode == ServerConfig::PflashMode::ALWAYS) ? "always" : "off";
+        pflash = {
+            {"enabled",      true},
+            {"mode",         mode_str},
+            {"threshold",    config.pflash_threshold},
+            {"keep_ratio",   config.pflash_keep_ratio},
+            {"drafter_gguf", config.pflash_drafter_path.empty()
+                              ? json(nullptr)
+                              : json(config.pflash_drafter_path)},
+            {"skip_park",    config.pflash_skip_park},
+            {"bsa_enabled",  (bsa_env != nullptr && *bsa_env && std::strcmp(bsa_env, "0") != 0)},
+            {"bsa_alpha",    bsa_alpha},
+            {"lm_head_fix",  (lmfix_env != nullptr && *lmfix_env && std::strcmp(lmfix_env, "0") != 0)},
+        };
+    }
+
+    json body = {
+        {"default_generation_settings", {
+            {"n_ctx",          config.max_ctx},
+            {"temperature",    0.0},
+            {"top_p",          1.0},
+            {"top_k",          0},
+            {"min_p",          0.0},
+            {"repeat_penalty", 1.0},
+        }},
+        {"model_alias", config.model_name},
+        {"model_path",  config.model_path},
+        {"build_info",  std::string(kServerName) + " v" DFLASH_SERVER_VERSION
+                        " props_schema=" + std::to_string(kPropsSchema)},
+        {"speculative_mode", speculative_mode},
+        {"server", server},
+        {"model", {
+            {"arch",         config.arch},
+            {"draft_path",   config.draft_path.empty() ? json(nullptr) : json(config.draft_path)},
+            {"tokenizer_id", config.tokenizer_id.empty() ? json(nullptr) : json(config.tokenizer_id)},
+        }},
+        {"runtime", {
+            {"backend",         config.runtime_backend.empty() ? "cuda" : config.runtime_backend},
+            {"fa_window",       config.fa_window},
+            {"kv_cache_k",      config.kv_cache_k},
+            {"kv_cache_v",      config.kv_cache_v},
+            {"lazy_draft",      config.lazy_draft},
+            {"target_sharding", config.target_sharding},
+        }},
+        {"reasoning", {
+            {"supported",         reasoning_supported},
+            {"default",           nullptr},
+            {"supported_efforts", reasoning_efforts},
+        }},
+        {"speculative", {
+            {"enabled",       config.speculative_enabled},
+            {"ddtree_budget", config.speculative_enabled
+                                ? json(config.ddtree_budget) : json(nullptr)},
+        }},
+        {"sampling", {
+            {"capabilities", {
+                {"supports_temperature",        true},
+                {"supports_top_p",              true},
+                {"supports_top_k",              true},
+                {"supports_frequency_penalty",  true},
+                {"supports_seed",               true},
+            }},
+        }},
+        {"pflash", pflash},
+        {"prefix_cache", {
+            {"capacity",      pcs.capacity},
+            {"in_use",        pcs.in_use},
+            {"lifetime_hits", pcs.lifetime_hits},
+        }},
+        {"full_cache", {
+            {"enabled",       pcfs.enabled},
+            {"capacity",      pcfs.capacity},
+            {"in_use",        pcfs.in_use},
+            {"disk_bytes",    pcfs.disk_bytes},
+            {"lifetime_hits", pcfs.lifetime_hits},
+        }},
+        {"tool_replay", {
+            {"max_entries",     tms.max_entries},
+            {"max_bytes",       tms.max_bytes},
+            {"current_entries", tms.current_entries},
+            {"current_bytes",   tms.current_bytes},
+        }},
+        // The C++ daemon is linked in-process; if /props is responding,
+        // the daemon is alive by construction.
+        {"daemon", {{"alive", true}}},
+        {"api", {{"endpoints", kApiEndpoints}}},
+        // Capability flags surfaced for clients that don't want to crack
+        // open `reasoning` / `speculative` / etc. — matches the Python
+        // server's _capabilities() helper.
+        {"capabilities", {
+            {"reasoning_supported",   reasoning_supported},
+            {"speculative_supported", speculative_supported},
+            {"tools_supported",       tools_supported},
+        }},
+    };
+    return body;
 }
 
 // ─── HttpServer ─────────────────────────────────────────────────────────
@@ -224,6 +408,15 @@ void HttpServer::handle_client(int fd) {
         return;
     }
 
+    // Introspection: server config + cache stats + arch + capabilities.
+    // Matches dflash/scripts/server.py:1221-1312 key-for-key.
+    if (hr.method == "GET" && hr.path == "/props") {
+        json body = build_props_body(config_, prefix_cache_, tool_memory_);
+        send_response(fd, 200, "application/json", body.dump() + "\n");
+        ::close(fd);
+        return;
+    }
+
     // Models endpoint.
     if (hr.method == "GET" && hr.path == "/v1/models") {
         // Codex sends ?client_version= — serve the Codex-specific schema.
@@ -331,10 +524,45 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             }
         }
 
+        // count_tokens shares Anthropic's message parsing; flag so we
+        // short-circuit before enqueueing the generation job.
+        bool count_tokens_only = false;
+
         if (hr.path == "/v1/chat/completions") {
             req.format = ApiFormat::OPENAI_CHAT;
             req.response_id = generate_id("chatcmpl");
             req.messages = body["messages"];
+        } else if (hr.path == "/v1/messages/count_tokens") {
+            req.format = ApiFormat::ANTHROPIC;
+            req.response_id = generate_id("count");
+            req.messages = body.value("messages", json::array());
+            // System block — same shape as /v1/messages.
+            if (body.contains("system")) {
+                json sys_content = body["system"];
+                if (sys_content.is_array()) {
+                    json filtered = json::array();
+                    for (const auto & block : sys_content) {
+                        if (block.is_object() && block.value("type", "") == "text") {
+                            std::string text = block.value("text", "");
+                            if (text.rfind("x-anthropic-billing-header:", 0) == 0) {
+                                continue;
+                            }
+                        }
+                        filtered.push_back(block);
+                    }
+                    sys_content = std::move(filtered);
+                } else if (sys_content.is_string()) {
+                    std::string s = sys_content.get<std::string>();
+                    if (s.rfind("x-anthropic-billing-header:", 0) == 0) {
+                        sys_content = "";
+                    }
+                }
+                if (!sys_content.empty()) {
+                    json sys_msg = {{"role", "system"}, {"content", sys_content}};
+                    req.messages.insert(req.messages.begin(), sys_msg);
+                }
+            }
+            count_tokens_only = true;
         } else if (hr.path == "/v1/messages") {
             req.format = ApiFormat::ANTHROPIC;
             req.response_id = generate_id("msg");
@@ -513,6 +741,14 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             if (end >= 7 && rendered.compare(end - 7, 7, "<think>") == 0) {
                 req.started_in_thinking = true;
             }
+        }
+
+        // count_tokens: short-circuit after tokenization. Skip generation
+        // entirely — Anthropic's contract is just `{"input_tokens": N}`.
+        if (count_tokens_only) {
+            json resp = {{"input_tokens", (int)req.prompt_tokens.size()}};
+            send_response(fd, 200, "application/json", resp.dump() + "\n");
+            return true;
         }
 
     } catch (const std::exception & e) {
