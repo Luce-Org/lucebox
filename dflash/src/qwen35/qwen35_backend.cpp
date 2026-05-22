@@ -284,32 +284,15 @@ bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
 
 // ── Compress (pflash) ───────────────────────────────────────────────────
 
-bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & io) {
-    // Check for "nopark" suffix (must be a separate token, not part of a path)
-    bool skip_park = (line.size() >= 16 &&
-                      line.compare(line.size() - 7, 7, " nopark") == 0);
-
-    // Parse: "compress <path> <keep_x1000> <drafter_gguf> [nopark]"
-    char ppath[1024];
-    int  keep_x1000 = 0;
-    char drafter_path[1024] = {0};
-    const int n = std::sscanf(line.c_str() + 9, "%1023s %d %1023s",
-                               ppath, &keep_x1000, drafter_path);
-    if (n < 2) {
-        std::fprintf(stderr, "[compress] bad args\n");
-        io.emit(-1);
-        return false;
-    }
-
-    const char * dpath = (n >= 3 && drafter_path[0])
-        ? drafter_path
-        : "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
+ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req) {
+    CompressResult result;
+    if (req.input_ids.empty() || req.drafter_path.empty()) return result;
 
     // Park target+draft to free VRAM for the drafter (unless skip_park).
     // Also destroy the main target step graph allocator to release its CUDA buffer.
     const bool was_target_parked = target_parked_;
     const bool was_draft_parked  = draft_parked_;
-    if (!skip_park) {
+    if (!req.skip_park) {
         step_graph_destroy(sg_);
         if (!target_parked_) park("target");
         if (!draft_parked_)  park("draft");
@@ -328,45 +311,70 @@ bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & i
     // creates the backend + loads weights; subsequent calls reuse them.
     if (!drafter_loaded_) {
         // drafter_ctx_.backend == nullptr → load_drafter creates its own
-        std::fprintf(stderr, "[compress] loading drafter from %s ...\n", dpath);
-        if (!load_drafter(dpath, /*gpu_layers=*/999, drafter_ctx_)) {
+        std::fprintf(stderr, "[compress] loading drafter from %s ...\n",
+                     req.drafter_path.c_str());
+        if (!load_drafter(req.drafter_path, /*gpu_layers=*/999, drafter_ctx_)) {
             std::fprintf(stderr, "[compress] drafter init failed: %s\n",
                          dflash27b_last_error());
-            io.emit(-1);
-            if (!skip_park) {
+            if (!req.skip_park) {
                 if (!was_target_parked) unpark("target");
                 if (!was_draft_parked)  unpark("draft");
             }
-            return false;
+            return result;
         }
         drafter_loaded_ = true;
         std::fprintf(stderr, "[compress] drafter ready\n");
     }
 
-    std::vector<int32_t> tokens = read_int32_file(ppath);
-    bool ok = false;
-    if (!tokens.empty()) {
-        const float keep = (float)keep_x1000 / 1000.0f;
-        auto compressed = drafter_score_and_compress(drafter_ctx_, tokens, keep);
-        ok = !compressed.empty();
-        if (ok) {
-            std::fprintf(stderr, "[compress] %zu -> %zu tokens\n",
-                          tokens.size(), compressed.size());
-            for (int32_t t : compressed) io.emit(t);
-        }
+    result.compressed_ids = drafter_score_and_compress(
+        drafter_ctx_, req.input_ids, req.keep_ratio);
+    result.ok = !result.compressed_ids.empty();
+    if (result.ok) {
+        std::fprintf(stderr, "[compress] %zu -> %zu tokens\n",
+                     req.input_ids.size(), result.compressed_ids.size());
     }
-    io.emit(-1);
 
     // Keep drafter loaded (own backend + weights persist), matching test_dflash.
     // ~1.4 GB stays resident but avoids reload cost on subsequent compresses.
 
     // Restore park state
-    if (!skip_park) {
+    if (!req.skip_park) {
         if (!was_target_parked) unpark("target");
         if (!was_draft_parked)  unpark("draft");
     }
 
-    return ok;
+    return result;
+}
+
+bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & io) {
+    // Check for "nopark" suffix (must be a separate token, not part of a path)
+    bool skip_park = (line.size() >= 16 &&
+                      line.compare(line.size() - 7, 7, " nopark") == 0);
+
+    // Parse: "compress <path> <keep_x1000> <drafter_gguf> [nopark]"
+    char ppath[1024];
+    int  keep_x1000 = 0;
+    char drafter_path[1024] = {0};
+    const int n = std::sscanf(line.c_str() + 9, "%1023s %d %1023s",
+                               ppath, &keep_x1000, drafter_path);
+    if (n < 2) {
+        std::fprintf(stderr, "[compress] bad args\n");
+        io.emit(-1);
+        return false;
+    }
+
+    CompressRequest req;
+    req.input_ids = read_int32_file(ppath);
+    req.keep_ratio = (float)keep_x1000 / 1000.0f;
+    req.drafter_path = (n >= 3 && drafter_path[0])
+        ? drafter_path
+        : "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
+    req.skip_park = skip_park;
+
+    CompressResult result = compress(req);
+    for (int32_t t : result.compressed_ids) io.emit(t);
+    io.emit(-1);
+    return result.ok;
 }
 
 void Qwen35Backend::free_drafter() {

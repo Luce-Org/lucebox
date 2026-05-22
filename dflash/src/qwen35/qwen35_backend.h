@@ -97,6 +97,7 @@ public:
                         ggml_backend_buffer_t buf, int cur_pos,
                         int32_t last_tok = -1) override;
 
+    CompressResult compress(const CompressRequest & req) override;
     bool handle_compress(const std::string & line,
                          const DaemonIO & io) override;
     void free_drafter() override;
