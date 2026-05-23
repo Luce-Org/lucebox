@@ -131,6 +131,17 @@ std::string render_chat_template(
                 // Qwen3 thinking disabled: inject closed think block so the
                 // model skips reasoning and generates the answer directly.
                 result += "<think>\n\n</think>\n\n";
+            } else {
+                // Qwen3.6 enable_thinking: pre-open the thinking block so the
+                // model actually enters reasoning mode. Verified against the
+                // official Qwen3.6 chat_template.jinja:
+                //   enable_thinking=true  → suffix `assistant\n<think>\n`
+                //   enable_thinking=false → suffix `assistant\n<think>\n\n</think>\n\n`
+                // Without this prefix, Qwen3.6 stays in non-thinking mode
+                // even when the client opts in, defeating the thinking-budget
+                // mechanism entirely (phase-2 reprompt never fires because
+                // started_in_thinking=false).
+                result += "<think>\n";
             }
         }
         break;
