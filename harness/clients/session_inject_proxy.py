@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Thin proxy that injects extra_body.session_id into /v1/messages requests.
+"""Thin proxy that injects extra_body.session_id into LLM API requests.
 
-Run between the claude CLI and the dflash server when PFLASH_SESSION_ID is set.
+Run between an AI client and the dflash server when PFLASH_SESSION_ID is set.
 All other paths and methods are forwarded verbatim.
 
 Usage:
@@ -11,7 +11,12 @@ Usage:
         --session-id <id>
 
 The proxy listens on --port and forwards to --upstream, injecting
-extra_body.session_id on every POST /v1/messages request.
+extra_body.session_id on POST requests to routes listed in INJECT_ROUTES.
+
+C++ server route surface (http_server.cpp):
+  POST /v1/messages          - Anthropic Messages (claude_code)
+  POST /v1/chat/completions  - OpenAI Chat (hermes, opencode, pi)
+  POST /v1/responses         - OpenAI Responses (codex)
 """
 
 from __future__ import annotations
@@ -24,6 +29,14 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 import http.client
+
+
+# POST paths on which extra_body.session_id injection is performed.
+INJECT_ROUTES = frozenset({
+    "/v1/messages",
+    "/v1/chat/completions",
+    "/v1/responses",
+})
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -101,8 +114,9 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_body()
         path = self.path
 
-        # Inject session_id only on /v1/messages
-        if self.session_id and path.startswith("/v1/messages"):
+        # Inject session_id on all LLM API routes (see INJECT_ROUTES)
+        route_base = path.split("?")[0]  # strip query string
+        if self.session_id and route_base in INJECT_ROUTES:
             try:
                 obj = json.loads(body.decode("utf-8"))
                 if "extra_body" not in obj:

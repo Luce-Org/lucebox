@@ -1,8 +1,8 @@
 """Tests for session_inject_proxy.py.
 
 Seed tests (in plan order):
-  #2 - test_session_injector_anthropic_messages_round_trip  (regression lock, passes today)
-  #1 - test_session_injector_openai_chat_completions_round_trip  (fails today - no OpenAI route)
+  #2 - test_session_injector_anthropic_messages_round_trip  (regression lock)
+  #1 - test_session_injector_openai_chat_completions_round_trip  (OpenAI injection route)
 """
 
 from __future__ import annotations
@@ -103,22 +103,15 @@ class TestSessionInjectorAnthropicMessages(unittest.TestCase):
         # Must preserve client's session_id, not overwrite with proxy's
         self.assertEqual(upstream_body["extra_body"]["session_id"], "client-sess")
 
-    def test_session_injector_passthrough_on_non_messages_path(self):
-        """Non /v1/messages paths are forwarded verbatim (no extra_body injection)."""
+    def test_session_injector_passthrough_on_unknown_path(self):
+        """Unknown paths outside INJECT_ROUTES are forwarded verbatim."""
         with StubServer() as stub:
             proxy_srv, proxy_url = _start_proxy(stub.url, session_id="proxy-sess")
             try:
-                payload = {
-                    "model": "luce-dflash",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "max_tokens": 8,
-                }
-                body = json.dumps(payload).encode()
+                # /health is a GET, not an inject route
                 req = urllib.request.Request(
-                    proxy_url + "/v1/chat/completions",
-                    data=body,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
+                    proxy_url + "/health",
+                    method="GET",
                 )
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     resp.read()
@@ -126,26 +119,15 @@ class TestSessionInjectorAnthropicMessages(unittest.TestCase):
                 proxy_srv.shutdown()
 
         upstream_req = stub.last_request()
-        self.assertEqual(upstream_req["path"], "/v1/chat/completions")
-        upstream_body = upstream_req["body_json"]
-        # No extra_body injected on chat/completions
-        self.assertNotIn("extra_body", upstream_body)
+        self.assertEqual(upstream_req["method"], "GET")
+        self.assertEqual(upstream_req["path"], "/health")
 
 
 class TestSessionInjectorOpenAIChatCompletions(unittest.TestCase):
-    """Seed #1 — OpenAI /v1/chat/completions injection route (currently pass-through)."""
+    """Seed #1 — OpenAI /v1/chat/completions injection route."""
 
     def test_session_injector_openai_chat_completions_round_trip(self):
-        """POST /v1/chat/completions through proxy with OPENAI injection enabled.
-
-        Per the plan: seed #1 fails today because the proxy only injects on
-        /v1/messages. This test documents the desired behaviour once the
-        OpenAI injection route lands (commit 3).
-
-        For now the proxy forwards the request verbatim on chat/completions —
-        the test asserts the round-trip works and the request reaches upstream.
-        After commit 3, extra_body.session_id will be injected here too.
-        """
+        """POST /v1/chat/completions through proxy → upstream sees injected session_id."""
         with StubServer() as stub:
             proxy_srv, proxy_url = _start_proxy(stub.url, session_id="oai-sess-001")
             try:
@@ -168,16 +150,43 @@ class TestSessionInjectorOpenAIChatCompletions(unittest.TestCase):
                 proxy_srv.shutdown()
 
         self.assertEqual(status, 200)
-        # Upstream received the request on the correct path
         upstream_req = stub.last_request()
         self.assertIsNotNone(upstream_req)
         self.assertEqual(upstream_req["path"], "/v1/chat/completions")
         upstream_body = upstream_req["body_json"]
-        # After commit 3: uncomment the line below to lock down injection
-        # extra = upstream_body.get("extra_body", {})
-        # self.assertEqual(extra.get("session_id"), "oai-sess-001")
-        # For now: injection not expected on chat/completions
-        self.assertNotIn("extra_body", upstream_body)
+        # Injection must happen on chat/completions (INJECT_ROUTES)
+        extra = upstream_body.get("extra_body", {})
+        self.assertEqual(extra.get("session_id"), "oai-sess-001")
+
+    def test_session_injector_responses_round_trip(self):
+        """POST /v1/responses through proxy → upstream sees injected session_id."""
+        with StubServer() as stub:
+            proxy_srv, proxy_url = _start_proxy(stub.url, session_id="resp-sess-001")
+            try:
+                payload = {
+                    "model": "luce-dflash",
+                    "input": [{"type": "message", "role": "user",
+                               "content": [{"type": "input_text", "text": "hello"}]}],
+                    "max_output_tokens": 16,
+                }
+                body = json.dumps(payload).encode()
+                req = urllib.request.Request(
+                    proxy_url + "/v1/responses",
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    status = resp.status
+                    resp.read()
+            finally:
+                proxy_srv.shutdown()
+
+        self.assertEqual(status, 200)
+        upstream_req = stub.last_request()
+        upstream_body = upstream_req["body_json"]
+        extra = upstream_body.get("extra_body", {})
+        self.assertEqual(extra.get("session_id"), "resp-sess-001")
 
 
 if __name__ == "__main__":
