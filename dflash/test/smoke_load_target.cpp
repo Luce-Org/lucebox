@@ -44,8 +44,13 @@ int main(int argc, char ** argv) {
         if (attn) n_attn++;
         if (ssm)  n_delta++;
     }
-    std::printf("hparams: n_layer=%d n_embd=%d n_head=%d n_head_kv=%d head_dim=%d/%d n_ff=%d fai=%d\n",
-        w.n_layer, w.n_embd, w.n_head, w.n_head_kv, w.n_embd_head_k, w.n_embd_head_v, w.n_ff, w.full_attention_interval);
+    std::printf("hparams: n_layer=%d n_embd=%d n_head=%d n_head_kv=%d head_dim=%d/%d n_ff=%d fai=%d is_moe=%d\n",
+        w.n_layer, w.n_embd, w.n_head, w.n_head_kv, w.n_embd_head_k, w.n_embd_head_v, w.n_ff, w.full_attention_interval, (int)w.is_moe);
+    if (w.is_moe) {
+        std::printf("moe:     n_expert=%d used=%d n_ff_exp=%d n_ff_shexp=%d gate_func=%d scale=%.3f\n",
+            w.n_expert, w.n_expert_used, w.n_ff_exp, w.n_ff_shexp,
+            w.expert_gating_func, w.expert_weights_scale);
+    }
     std::printf("ssm:     conv=%d inner=%d state=%d dt_rank=%d n_group=%d\n",
         w.ssm_d_conv, w.ssm_d_inner, w.ssm_d_state, w.ssm_dt_rank, w.ssm_n_group);
     std::printf("rope sections: [%d, %d, %d, %d]\n",
@@ -83,12 +88,18 @@ int main(int argc, char ** argv) {
             std::printf("wqkv=%s[%" PRId64 ",%" PRId64 "] ",
                 ggml_type_name(L.wqkv->type), L.wqkv->ne[0], L.wqkv->ne[1]);
         }
-        std::printf("ffn_down=%s\n", ggml_type_name(L.w_down->type));
+        if (L.w_down) {
+            std::printf("ffn_down=%s\n", ggml_type_name(L.w_down->type));
+        } else if (L.ffn_down_exps) {
+            std::printf("ffn_down_exps=%s\n", ggml_type_name(L.ffn_down_exps->type));
+        } else {
+            std::printf("ffn=<missing>\n");
+        }
     };
     print_layer(0);
     print_layer(3);
-    print_layer(31);
-    print_layer(63);
+    if (w.n_layer > 31) print_layer(31);
+    if (w.n_layer > 63) print_layer(63);
 
     free_target_weights(w);
     ggml_backend_free(backend);

@@ -78,7 +78,7 @@ bool Qwen35Backend::init() {
     }
 
     // Load target
-    if (!load_target_gguf(cfg_.target_path, target_backend_, w_)) {
+    if (!load_target_model(target_backend_, w_)) {
         std::fprintf(stderr, "target load: %s\n", dflash27b_last_error());
         return false;
     }
@@ -137,13 +137,17 @@ bool Qwen35Backend::init() {
                                          cache_.target_feat_cap > 0 ? cache_.target_feat_cap : cfg_.device.max_ctx});
         if (!draft_feature_mirror_init(feature_mirror_, draft_backend_,
                                        cfg_.draft_gpu, cfg_.device.gpu, mirror_cap,
-                                       DFLASH27B_DRAFT_N_TARGET_LAYERS,
-                                       DFLASH27B_TARGET_HIDDEN)) {
+                                       w_.n_capture_layers,
+                                       w_.n_embd)) {
             std::fprintf(stderr, "warning: feature mirror init failed, spec decode will use AR fallback\n");
         }
     }
 
     return true;
+}
+
+bool Qwen35Backend::load_target_model(ggml_backend_t backend, TargetWeights & out) {
+    return load_target_gguf(cfg_.target_path, backend, out);
 }
 
 // ── print_ready_banner ──────────────────────────────────────────────────
@@ -185,7 +189,7 @@ bool Qwen35Backend::unpark(const std::string & what) {
     const bool use_remote_draft = cfg_.remote_draft.enabled();
 
     if (want_target && target_parked_) {
-        if (!load_target_gguf(cfg_.target_path, target_backend_, w_)) {
+        if (!load_target_model(target_backend_, w_)) {
             std::fprintf(stderr, "[unpark] target: %s\n", dflash27b_last_error());
             return false;
         }

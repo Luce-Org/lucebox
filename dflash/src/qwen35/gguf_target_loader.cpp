@@ -260,6 +260,8 @@ bool load_target_gguf_partial(const std::string & path,
     }
 
     // Validate arch + the dimensions we hardcode everywhere.
+    std::string arch_str;
+    bool is_moe = false;
     {
         int64_t arch_id = gguf_find_key(gctx, "general.architecture");
         if (arch_id < 0) {
@@ -268,41 +270,64 @@ bool load_target_gguf_partial(const std::string & path,
             return false;
         }
         const char * arch = gguf_get_val_str(gctx, arch_id);
-        if (std::string(arch) != "qwen35") {
-            set_last_error(std::string("unexpected arch: ") + arch + " (expected qwen35)");
+        arch_str = arch ? arch : "";
+        is_moe = arch_str == "qwen35moe";
+        if (arch_str != "qwen35" && arch_str != "qwen35moe") {
+            set_last_error(std::string("unexpected arch: ") + arch_str +
+                           " (expected qwen35 or qwen35moe)");
             gguf_free(gctx);
             return false;
         }
     }
 
     std::string err;
-    const uint32_t n_embd = get_u32_or(gctx, "qwen35.embedding_length",    0);
-    const uint32_t n_ff   = get_u32_or(gctx, "qwen35.feed_forward_length", 0);
-    const uint32_t n_layer= get_u32_or(gctx, "qwen35.block_count",         0);
-    const uint32_t n_head = get_u32_or(gctx, "qwen35.attention.head_count",0);
-    const uint32_t n_headkv=get_u32_or(gctx, "qwen35.attention.head_count_kv",0);
-    const uint32_t kl     = get_u32_or(gctx, "qwen35.attention.key_length",   0);
-    const uint32_t vl     = get_u32_or(gctx, "qwen35.attention.value_length", 0);
-    const uint32_t fai    = get_u32_or(gctx, "qwen35.full_attention_interval",0);
-    const uint32_t ssm_conv  = get_u32_or(gctx, "qwen35.ssm.conv_kernel",  0);
-    const uint32_t ssm_inner = get_u32_or(gctx, "qwen35.ssm.inner_size",   0);
-    const uint32_t ssm_state = get_u32_or(gctx, "qwen35.ssm.state_size",   0);
-    const uint32_t ssm_dt    = get_u32_or(gctx, "qwen35.ssm.time_step_rank",0);
-    const uint32_t ssm_grp   = get_u32_or(gctx, "qwen35.ssm.group_count",  0);
+    auto key = [&](const char * suffix) {
+        return arch_str + "." + suffix;
+    };
 
-    if (n_embd == 0 || n_layer == 0 || n_head == 0 || n_headkv == 0 ||
-        kl == 0 || vl == 0 || n_ff == 0 || fai == 0 ||
+    const uint32_t n_embd  = get_u32_or(gctx, key("embedding_length").c_str(), 0);
+    const uint32_t n_ff    = get_u32_or(gctx, key("feed_forward_length").c_str(), 0);
+    const uint32_t n_layer = get_u32_or(gctx, key("block_count").c_str(), 0);
+    const uint32_t n_head  = get_u32_or(gctx, key("attention.head_count").c_str(), 0);
+    const uint32_t n_headkv= get_u32_or(gctx, key("attention.head_count_kv").c_str(), 0);
+    const uint32_t kl      = get_u32_or(gctx, key("attention.key_length").c_str(), 0);
+    const uint32_t vl      = get_u32_or(gctx, key("attention.value_length").c_str(), 0);
+    const uint32_t fai     = get_u32_or(gctx, key("full_attention_interval").c_str(), 0);
+    const uint32_t ssm_conv  = get_u32_or(gctx, key("ssm.conv_kernel").c_str(), 0);
+    const uint32_t ssm_inner = get_u32_or(gctx, key("ssm.inner_size").c_str(), 0);
+    const uint32_t ssm_state = get_u32_or(gctx, key("ssm.state_size").c_str(), 0);
+    const uint32_t ssm_dt    = get_u32_or(gctx, key("ssm.time_step_rank").c_str(), 0);
+    const uint32_t ssm_grp   = get_u32_or(gctx, key("ssm.group_count").c_str(), 0);
+    const uint32_t n_ff_exp   = is_moe ? get_u32_or(gctx, key("expert_feed_forward_length").c_str(), 0) : 0;
+    const uint32_t n_ff_shexp = is_moe ? get_u32_or(gctx, key("expert_shared_feed_forward_length").c_str(), 0) : 0;
+    const uint32_t n_expert   = is_moe ? get_u32_or(gctx, key("expert_count").c_str(), 0) : 0;
+    const uint32_t n_expert_used = is_moe ? get_u32_or(gctx, key("expert_used_count").c_str(), 0) : 0;
+    const uint32_t expert_gating_func =
+        is_moe ? get_u32_or(gctx, key("expert_gating_func").c_str(), 1) : 1;
+    const float expert_weights_scale =
+        is_moe ? get_f32_or(gctx, key("expert_weights_scale").c_str(), 1.0f) : 1.0f;
+
+    const bool invalid_common =
+        n_embd == 0 || n_layer == 0 || n_head == 0 || n_headkv == 0 ||
+        kl == 0 || vl == 0 || fai == 0 ||
         ssm_conv == 0 || ssm_inner == 0 || ssm_state == 0 ||
-        ssm_dt == 0 || ssm_grp == 0 || ssm_inner % ssm_dt != 0) {
+        ssm_dt == 0 || ssm_grp == 0 || ssm_inner % ssm_dt != 0;
+    const bool invalid_dense = !is_moe && n_ff == 0;
+    const bool invalid_moe = is_moe && (n_ff_exp == 0 || n_ff_shexp == 0 ||
+                                        n_expert == 0 || n_expert_used == 0);
+
+    if (invalid_common || invalid_dense || invalid_moe) {
         char buf[512];
         std::snprintf(buf, sizeof(buf),
-            "invalid qwen35 hparams: n_embd=%u n_layer=%u n_head=%u n_head_kv=%u "
-            "kl=%u vl=%u n_ff=%u fai=%u ssm{conv=%u inner=%u state=%u dt=%u grp=%u}",
-            n_embd, n_layer, n_head, n_headkv, kl, vl, n_ff, fai,
-            ssm_conv, ssm_inner, ssm_state, ssm_dt, ssm_grp);
-        set_last_error(buf);
-        gguf_free(gctx);
-        return false;
+            "invalid %s hparams: n_embd=%u n_layer=%u n_head=%u n_head_kv=%u "
+            "kl=%u vl=%u n_ff=%u n_ff_exp=%u n_ff_shexp=%u n_expert=%u used=%u "
+            "fai=%u ssm{conv=%u inner=%u state=%u dt=%u grp=%u}",
+            arch_str.c_str(), n_embd, n_layer, n_head, n_headkv, kl, vl, n_ff,
+            n_ff_exp, n_ff_shexp, n_expert, n_expert_used,
+            fai, ssm_conv, ssm_inner, ssm_state, ssm_dt, ssm_grp);
+            set_last_error(buf);
+            gguf_free(gctx);
+            return false;
     }
 
     // Structural invariants required by the graph builder.
@@ -320,9 +345,10 @@ bool load_target_gguf_partial(const std::string & path,
     // rope dimension_sections (array of 4 uint32)
     int rope_sections[4] = {0, 0, 0, 0};
     {
-        int64_t rid = gguf_find_key(gctx, "qwen35.rope.dimension_sections");
+        std::string rope_sections_key = key("rope.dimension_sections");
+        int64_t rid = gguf_find_key(gctx, rope_sections_key.c_str());
         if (rid < 0) {
-            set_last_error("missing qwen35.rope.dimension_sections");
+            set_last_error("missing rope.dimension_sections");
             gguf_free(gctx); return false;
         }
         size_t n = gguf_get_arr_n(gctx, rid);
@@ -379,7 +405,11 @@ bool load_target_gguf_partial(const std::string & path,
     out.backend = backend;
     out.n_layer = (int)n_layer;
     out.n_embd  = (int)n_embd;
-    out.n_ff    = (int)n_ff;
+    out.n_ff    = (int)(n_ff ? n_ff : (n_ff_shexp ? n_ff_shexp : n_ff_exp));
+    out.n_ff_exp = (int)n_ff_exp;
+    out.n_ff_shexp = (int)n_ff_shexp;
+    out.n_expert = (int)n_expert;
+    out.n_expert_used = (int)n_expert_used;
     out.n_head  = (int)n_head;
     out.n_head_kv = (int)n_headkv;
     out.n_embd_head_k = (int)kl;
@@ -391,9 +421,12 @@ bool load_target_gguf_partial(const std::string & path,
     out.ssm_d_state= (int)ssm_state;
     out.ssm_dt_rank= (int)ssm_dt;
     out.ssm_n_group= (int)ssm_grp;
-    out.rope_dimension_count = (int)get_u32_or(gctx, "qwen35.rope.dimension_count", 64);
-    out.rope_theta = get_f32_or(gctx, "qwen35.rope.freq_base", 10000000.0f);
-    out.rms_eps = get_f32_or(gctx, "qwen35.attention.layer_norm_rms_epsilon", 1e-6f);
+    out.rope_dimension_count = (int)get_u32_or(gctx, key("rope.dimension_count").c_str(), 64);
+    out.rope_theta = get_f32_or(gctx, key("rope.freq_base").c_str(), 10000000.0f);
+    out.rms_eps = get_f32_or(gctx, key("attention.layer_norm_rms_epsilon").c_str(), 1e-6f);
+    out.expert_gating_func = (int)expert_gating_func;
+    out.expert_weights_scale = expert_weights_scale;
+    out.is_moe = is_moe;
 
     // EOS token ids from GGUF tokenizer metadata (stored as UINT32 by the
     // GGUF spec; we use the u32 helper and cast). UINT32_MAX is the
@@ -443,15 +476,34 @@ bool load_target_gguf_partial(const std::string & path,
         // Always-present tensors
         L.attn_norm      = fnd("attn_norm.weight");
         L.attn_post_norm = fnd("post_attention_norm.weight");
-        L.w_gate         = fnd("ffn_gate.weight");
-        L.w_up           = fnd("ffn_up.weight");
-        L.w_down         = fnd("ffn_down.weight");
-        if (!L.attn_norm || !L.attn_post_norm || !L.w_gate || !L.w_up || !L.w_down) {
+        if (!L.attn_norm || !L.attn_post_norm) {
             char b[128];
-            std::snprintf(b, sizeof(b), "layer %d: missing shared tensor", il);
+            std::snprintf(b, sizeof(b), "layer %d: missing shared norm tensor", il);
             set_last_error(b);
             gguf_free(gctx);
             return false;
+        }
+        if (is_moe) {
+            L.ffn_gate_inp       = fnd("ffn_gate_inp.weight");
+            L.ffn_gate_exps      = fnd("ffn_gate_exps.weight");
+            L.ffn_up_exps        = fnd("ffn_up_exps.weight");
+            L.ffn_down_exps      = fnd("ffn_down_exps.weight");
+            L.ffn_gate_up_exps   = fnd("ffn_gate_up_exps.weight");
+            L.ffn_gate_inp_shexp = fnd("ffn_gate_inp_shexp.weight");
+            L.ffn_gate_shexp     = fnd("ffn_gate_shexp.weight");
+            L.ffn_up_shexp       = fnd("ffn_up_shexp.weight");
+            L.ffn_down_shexp     = fnd("ffn_down_shexp.weight");
+        } else {
+            L.w_gate = fnd("ffn_gate.weight");
+            L.w_up   = fnd("ffn_up.weight");
+            L.w_down = fnd("ffn_down.weight");
+            if (!L.w_gate || !L.w_up || !L.w_down) {
+                char b[128];
+                std::snprintf(b, sizeof(b), "layer %d: missing dense FFN tensor", il);
+                set_last_error(b);
+                gguf_free(gctx);
+                return false;
+            }
         }
 
         // Full-attention tensors (only on layers where (il+1)%fai == 0,
@@ -493,6 +545,22 @@ bool load_target_gguf_partial(const std::string & path,
             set_last_error(b);
             gguf_free(gctx);
             return false;
+        }
+        if (is_moe) {
+            const bool has_routed =
+                L.ffn_gate_inp && L.ffn_down_exps &&
+                (L.ffn_gate_up_exps || (L.ffn_gate_exps && L.ffn_up_exps));
+            const bool has_shared_core =
+                L.ffn_gate_shexp && L.ffn_up_shexp && L.ffn_down_shexp;
+            const bool has_shared_partial =
+                (L.ffn_gate_shexp || L.ffn_up_shexp || L.ffn_down_shexp) && !has_shared_core;
+            if (!has_routed || has_shared_partial) {
+                char b[160];
+                std::snprintf(b, sizeof(b), "layer %d expected moe FFN tensors", il);
+                set_last_error(b);
+                gguf_free(gctx);
+                return false;
+            }
         }
     }
 
@@ -621,12 +689,26 @@ bool load_target_gguf_partial(const std::string & path,
             L.ssm_beta_s   = read_scale(il, "ssm_beta");
             L.ssm_alpha_s  = read_scale(il, "ssm_alpha");
             L.ssm_out_s    = read_scale(il, "ssm_out");
+            L.ffn_gate_inp_s       = read_scale(il, "ffn_gate_inp");
+            L.ffn_gate_exps_s      = read_scale(il, "ffn_gate_exps");
+            L.ffn_up_exps_s        = read_scale(il, "ffn_up_exps");
+            L.ffn_down_exps_s      = read_scale(il, "ffn_down_exps");
+            L.ffn_gate_up_exps_s   = read_scale(il, "ffn_gate_up_exps");
+            L.ffn_gate_inp_shexp_s = read_scale(il, "ffn_gate_inp_shexp");
+            L.ffn_gate_shexp_s     = read_scale(il, "ffn_gate_shexp");
+            L.ffn_up_shexp_s       = read_scale(il, "ffn_up_shexp");
+            L.ffn_down_shexp_s     = read_scale(il, "ffn_down_shexp");
             // Count non-trivial scales for the summary message.
             auto count_s = [&](float s) { if (s != 1.0f) n_scales++; };
             count_s(L.w_gate_s);   count_s(L.w_up_s);   count_s(L.w_down_s);
             count_s(L.wq_s);      count_s(L.wk_s);      count_s(L.wv_s);
             count_s(L.wo_s);      count_s(L.wqkv_s);    count_s(L.wqkv_gate_s);
             count_s(L.ssm_beta_s); count_s(L.ssm_alpha_s); count_s(L.ssm_out_s);
+            count_s(L.ffn_gate_inp_s); count_s(L.ffn_gate_exps_s);
+            count_s(L.ffn_up_exps_s); count_s(L.ffn_down_exps_s);
+            count_s(L.ffn_gate_up_exps_s); count_s(L.ffn_gate_inp_shexp_s);
+            count_s(L.ffn_gate_shexp_s); count_s(L.ffn_up_shexp_s);
+            count_s(L.ffn_down_shexp_s);
         }
         if (n_scales > 0) {
             std::printf("[loader] read %d NVFP4 per-tensor scale2 values (host-side, using ggml_scale)\n", n_scales);

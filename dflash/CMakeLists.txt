@@ -203,6 +203,7 @@ set(DFLASH27B_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/common
     ${CMAKE_CURRENT_SOURCE_DIR}/src/draft
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35moe
     ${CMAKE_CURRENT_SOURCE_DIR}/src/laguna
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
@@ -243,6 +244,9 @@ add_library(dflash_common STATIC
     src/common/dflash_draft_graph.cpp
     src/common/dflash_spec_decode.cpp
     src/qwen35/graph_builders.cpp
+    src/qwen35moe/qwen35moe_ffn.cpp
+    src/qwen35moe/qwen35moe_backend.cpp
+    src/qwen35moe/qwen35moe_daemon.cpp
     src/qwen35/layer_split_forward.cpp
     src/qwen35/layer_split_daemon.cpp
     src/qwen35/qwen35_backend.cpp

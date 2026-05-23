@@ -33,6 +33,8 @@
 #include "internal.h"
 #include "delta_net_chunked.h"
 #include "kv_quant.h"
+#include "qwen35_ops.h"
+#include "qwen35moe_ffn.h"
 
 #include <cmath>
 #include <cstdio>
@@ -423,20 +425,6 @@ void restore_ssm_state(TargetCache & c) {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────
-
-static ggml_tensor * rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
-                                  ggml_tensor * weight, float eps) {
-    ggml_tensor * n = ggml_rms_norm(ctx, x, eps);
-    return ggml_mul(ctx, n, weight);
-}
-
-// NVFP4 scale2: if weight has a per-tensor scale, multiply the matmul result
-// by that scale. No-op when scale==1.0f (non-NVFP4 models).
-static ggml_tensor * apply_scale2(ggml_context * ctx, ggml_tensor * mm_result,
-                                   float scale) {
-    if (scale == 1.0f) return mm_result;
-    return ggml_scale(ctx, mm_result, scale);
-}
 
 static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
                                       const TargetLayer & L) {
@@ -971,7 +959,8 @@ static ggml_tensor * build_single_layer(
 
     ggml_tensor * ffn_residual = cur;
     ggml_tensor * post = rms_norm_mul(ctx, cur, L.attn_post_norm, eps);
-    ggml_tensor * ffn  = build_swiglu_ffn(ctx, post, L);
+    ggml_tensor * ffn  = w.is_moe ? build_qwen35moe_ffn(ctx, post, w, L)
+                                  : build_swiglu_ffn(ctx, post, L);
     cur = ggml_add(ctx, ffn, ffn_residual);
 
     if (capture && cache.target_feat) {
@@ -1088,8 +1077,9 @@ QwenGraphOutputs build_qwen35_graph(
         ggml_tensor * ffn_residual = cur;
         ggml_tensor * post = rms_norm_mul(ctx, cur, L.attn_post_norm, eps);
 
-        // SwiGLU FFN
-        ggml_tensor * ffn = build_swiglu_ffn(ctx, post, L);
+        // FFN (dense SwiGLU for qwen35, MoE for qwen35moe)
+        ggml_tensor * ffn = w.is_moe ? build_qwen35moe_ffn(ctx, post, w, L)
+                                     : build_swiglu_ffn(ctx, post, L);
         cur = ggml_add(ctx, ffn, ffn_residual);
 
         // ── DFlash layer feature capture ──

@@ -118,10 +118,12 @@ public:
     // to prevent VRAM growth over time.
     void release_scratch() override;
 
-private:
+protected:
+    virtual bool load_target_model(ggml_backend_t backend, TargetWeights & out);
     // ── Configuration ────────────────────────────────────────────────
     Qwen35Config cfg_;
 
+private:
     // ── GPU backends ─────────────────────────────────────────────────
     ggml_backend_t target_backend_ = nullptr;
     ggml_backend_t draft_backend_  = nullptr;

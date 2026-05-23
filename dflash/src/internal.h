@@ -72,6 +72,17 @@ struct TargetLayer {
     ggml_tensor * ssm_norm       = nullptr;  // [head_v_dim]
     ggml_tensor * ssm_out        = nullptr;  // output projection after delta-net
 
+    // MoE FFN (qwen35moe only; nullptr on dense qwen35)
+    ggml_tensor * ffn_gate_inp       = nullptr;  // [hidden, n_expert] router
+    ggml_tensor * ffn_gate_exps      = nullptr;  // [hidden, n_ff_exp, n_expert]
+    ggml_tensor * ffn_up_exps        = nullptr;  // [hidden, n_ff_exp, n_expert]
+    ggml_tensor * ffn_down_exps      = nullptr;  // [n_ff_exp, hidden, n_expert]
+    ggml_tensor * ffn_gate_up_exps   = nullptr;  // [hidden, 2*n_ff_exp, n_expert] optional fused gate/up
+    ggml_tensor * ffn_gate_inp_shexp = nullptr;  // [hidden] shared-expert scalar gate
+    ggml_tensor * ffn_gate_shexp     = nullptr;  // [hidden, n_ff_shexp]
+    ggml_tensor * ffn_up_shexp       = nullptr;  // [hidden, n_ff_shexp]
+    ggml_tensor * ffn_down_shexp     = nullptr;  // [n_ff_shexp, hidden]
+
     // NVFP4 per-tensor weight scales (optional; 1.0f = no scaling).
     // Each corresponds to a weight tensor above: result = mul_mat(w, x) * scale.
     // Stored as host-side floats (read from the GGUF at load time) and applied
@@ -91,6 +102,15 @@ struct TargetLayer {
     float ssm_beta_s     = 1.0f;
     float ssm_alpha_s    = 1.0f;
     float ssm_out_s      = 1.0f;
+    float ffn_gate_inp_s       = 1.0f;
+    float ffn_gate_exps_s      = 1.0f;
+    float ffn_up_exps_s        = 1.0f;
+    float ffn_down_exps_s      = 1.0f;
+    float ffn_gate_up_exps_s   = 1.0f;
+    float ffn_gate_inp_shexp_s = 1.0f;
+    float ffn_gate_shexp_s     = 1.0f;
+    float ffn_up_shexp_s       = 1.0f;
+    float ffn_down_shexp_s     = 1.0f;
 };
 
 // CPU-side embedder: keeps a mmap of the GGUF alive and knows how to
@@ -142,10 +162,17 @@ struct TargetWeights {
     int n_layer                 = 64;
     int n_embd                  = 5120;
     int n_ff                    = 17408;
+    int n_ff_exp                = 0;
+    int n_ff_shexp              = 0;
+    int n_expert                = 0;
+    int n_expert_used           = 0;
     int n_vocab                 = DFLASH27B_TARGET_VOCAB;
     int rope_dimension_count    = 64;
     float rope_theta            = 10000000.0f;
     float rms_eps               = 1e-6f;
+    float expert_weights_scale  = 1.0f;
+    int expert_gating_func      = 1;    // 1=softmax, 2=sigmoid (llama.cpp enum values)
+    bool is_moe                 = false;
     int ssm_d_conv              = 4;
     int ssm_d_inner             = 6144;
     int ssm_d_state             = 128;
