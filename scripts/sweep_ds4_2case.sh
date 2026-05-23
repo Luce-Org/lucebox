@@ -185,6 +185,10 @@ PY
     if [ -z "${LUCEBOX_NO_PUSH:-}" ]; then
       local BRANCH=$(git rev-parse --abbrev-ref HEAD)
       local REMOTE=$(git config --get "branch.${BRANCH}.remote" || echo origin)
+      # Fetch + rebase before push — multiple hosts may be pushing
+      # snapshots on the same branch concurrently.
+      git fetch "$REMOTE" "$BRANCH" 2>/dev/null || true
+      git rebase "$REMOTE/$BRANCH" 2>&1 | tail -2 || true
       git push "$REMOTE" "$BRANCH" 2>&1 | tail -2 || true
     fi
   fi
