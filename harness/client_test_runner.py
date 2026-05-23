@@ -2492,6 +2492,29 @@ _ADAPTER_REGISTRY: dict[str, type[_BaseAdapter]] = {
 
 _CSV_COLUMNS = ["client", "preflight_ok", "session_id_captured", "accept_rate", "wall_s", "exit_code"]
 
+# Default pflash drafter path; override with --pflash-drafter or PFLASH_DRAFTER_PATH env var.
+_DEFAULT_PFLASH_DRAFTER = Path("/home/peppi/models/Qwen3-0.6B-BF16.gguf")
+
+# Server profile for bandit live runs: enables prefill compression + pflash drafter.
+BANDIT_SERVER_PROFILE = ServerProfile(
+    name="bandit_pflash",
+    args=(
+        "--budget", "22",
+        "--verify-mode", "ddtree",
+        "--max-ctx", "32768",
+        "--fa-window", "2048",
+        "--cache-type-k", "tq3_0",
+        "--cache-type-v", "tq3_0",
+        "--prefix-cache-slots", "0",
+        "--prefill-cache-slots", "0",
+        "--prefill-compression", "auto",
+        "--prefill-threshold", "4096",
+        "--prefill-keep-ratio", "0.10",
+        "--lazy-draft",
+    ),
+    needs_prefill_drafter=True,
+)
+
 
 def run_bandit(
     clients: list[str],
@@ -2500,11 +2523,15 @@ def run_bandit(
     dry_run: bool = False,
     output: IO[str] | None = None,
     session_id: str | None = None,
+    server_log_path: Path | None = None,
 ) -> list[AdapterResult]:
     """Run the bandit condition against the requested clients.
 
     In dry-run mode: performs preflight only, emits planned CSV to output.
     In live mode: runs full client + records metrics (requires server running).
+
+    server_log_path: if provided, each AdapterResult gets this path so
+    metrics_parser can extract accept_rate after live_run completes.
 
     Returns list of AdapterResult, one per client.
     """
@@ -2539,6 +2566,9 @@ def run_bandit(
                 continue
             sid = session_id or f"{name}-{condition}"
             result = adapter.live_run(session_id=sid)
+            # Attach server log path so accept_rate can be parsed below
+            if server_log_path is not None:
+                result.server_log_path = server_log_path
             # Populate accept_rate from server log if not already set
             if result.accept_rate is None and result.server_log_path is not None:
                 try:
@@ -2572,11 +2602,71 @@ def cmd_bandit(args: argparse.Namespace) -> int:
         clients = list(_ADAPTER_REGISTRY)
     else:
         clients = [c.strip() for c in raw_clients.split(",") if c.strip()]
+
+    dry_run = args.dry_run
+    sid = getattr(args, "session_id", None)
+
+    # Live mode with --start-server: launch a pflash-enabled server, run clients, stop it.
+    start_server_flag = getattr(args, "start_server", False)
+    if start_server_flag and not dry_run:
+        target = getattr(args, "target", None)
+        draft = getattr(args, "draft", None)
+        bin_path = getattr(args, "bin", None)
+        drafter_arg = getattr(args, "pflash_drafter", None)
+        pflash_drafter = (
+            Path(drafter_arg).resolve() if drafter_arg
+            else Path(os.environ.get("PFLASH_DRAFTER_PATH", str(_DEFAULT_PFLASH_DRAFTER)))
+        )
+        if target is None or draft is None or bin_path is None:
+            raise SystemExit(
+                "--start-server requires --target, --draft, and --bin "
+                "(paths to target model, draft model, and server binary)"
+            )
+        work_dir = args.work_dir.resolve()
+        port = getattr(args, "port", None) or free_port()
+        os.environ["BASE_URL"] = f"http://127.0.0.1:{port}"
+        proc = None
+        log_path: Path | None = None
+        try:
+            proc, log_path, server_args, _env = start_server(
+                BANDIT_SERVER_PROFILE,
+                target=Path(target).resolve(),
+                draft=Path(draft).resolve(),
+                bin_path=Path(bin_path).resolve(),
+                prefill_drafter=pflash_drafter,
+                port=port,
+                work_dir=work_dir,
+            )
+            print(
+                f"[bandit] started server (pid={proc.pid} port={port} "
+                f"pflash=on drafter={pflash_drafter.name})"
+            )
+            print(f"[bandit] server args: {' '.join(server_args)}")
+            up = wait_http(f"http://127.0.0.1:{port}", proc=proc,
+                           timeout=getattr(args, "start_timeout", 240))
+            if not up:
+                print("[bandit] ERROR: server did not start in time", file=sys.stderr)
+                if log_path:
+                    print(tail(log_path, 2000), file=sys.stderr)
+                return 1
+            run_bandit(
+                clients=clients,
+                condition=args.condition,
+                dry_run=False,
+                session_id=sid,
+                server_log_path=log_path,
+            )
+        finally:
+            if proc is not None:
+                stop_proc(proc)
+                close_server_log(proc)
+        return 0
+
     run_bandit(
         clients=clients,
         condition=args.condition,
-        dry_run=args.dry_run,
-        session_id=getattr(args, "session_id", None),
+        dry_run=dry_run,
+        session_id=sid,
     )
     return 0
 
@@ -2646,6 +2736,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_bandit.add_argument("--dry-run", action="store_true",
                           help="Preflight only; emit planned CSV without running clients")
     p_bandit.add_argument("--session-id", default=None)
+    # Server management: optional, launches a pflash-enabled server for the bandit run
+    p_bandit.add_argument("--start-server", action="store_true",
+                          help="Start a pflash-enabled dflash_server before running clients")
+    p_bandit.add_argument("--target", type=Path, default=None,
+                          help="Target model path (required with --start-server)")
+    p_bandit.add_argument("--draft", type=Path, default=None,
+                          help="Draft model path (required with --start-server)")
+    p_bandit.add_argument("--bin", type=Path, default=None,
+                          help="dflash_server binary path (required with --start-server)")
+    p_bandit.add_argument("--pflash-drafter", default=None,
+                          help=f"Pflash drafter model path (default: {_DEFAULT_PFLASH_DRAFTER})")
+    p_bandit.add_argument("--port", type=int, default=None,
+                          help="Server port (default: random free port)")
+    p_bandit.add_argument("--start-timeout", type=int, default=240,
+                          help="Seconds to wait for server to be healthy (default: 240)")
     p_bandit.set_defaults(func=cmd_bandit)
 
     return ap

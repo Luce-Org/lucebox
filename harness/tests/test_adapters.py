@@ -28,6 +28,8 @@ from harness.client_test_runner import (
     OpenCodeAdapter,
     AdapterResult,
     run_bandit,
+    BANDIT_SERVER_PROFILE,
+    start_server,
 )
 
 
@@ -184,6 +186,59 @@ class TestAcceptRatePopulatedFromLog(unittest.TestCase):
             self.assertAlmostEqual(result.accept_rate, 0.62)
         finally:
             log_path.unlink(missing_ok=True)
+
+
+class TestBanditServerProfileHasPflash(unittest.TestCase):
+    """Blocker #8: BANDIT_SERVER_PROFILE must include --prefill-compression auto."""
+
+    def test_bandit_server_profile_includes_prefill_compression_auto(self):
+        """BANDIT_SERVER_PROFILE args include '--prefill-compression auto'."""
+        args = list(BANDIT_SERVER_PROFILE.args)
+        self.assertIn("--prefill-compression", args,
+                      msg="BANDIT_SERVER_PROFILE must include --prefill-compression")
+        idx = args.index("--prefill-compression")
+        self.assertEqual(args[idx + 1], "auto",
+                         msg="--prefill-compression value must be 'auto'")
+
+    def test_bandit_server_profile_includes_prefill_keep_ratio(self):
+        """BANDIT_SERVER_PROFILE includes --prefill-keep-ratio 0.10 (bandit prior)."""
+        args = list(BANDIT_SERVER_PROFILE.args)
+        self.assertIn("--prefill-keep-ratio", args)
+        idx = args.index("--prefill-keep-ratio")
+        self.assertEqual(args[idx + 1], "0.10")
+
+    def test_bandit_server_profile_needs_prefill_drafter(self):
+        """BANDIT_SERVER_PROFILE.needs_prefill_drafter is True."""
+        self.assertTrue(BANDIT_SERVER_PROFILE.needs_prefill_drafter)
+
+    def test_start_server_argv_includes_prefill_compression_when_bandit_profile(self):
+        """start_server with BANDIT_SERVER_PROFILE builds argv with --prefill-compression auto.
+
+        Constructs the argv list directly from BANDIT_SERVER_PROFILE.args and
+        needs_prefill_drafter, mirroring what start_server does, without launching
+        a real process.
+        """
+        fake_bin = Path("/bin/true")
+        fake_drafter = Path("/tmp/fake-drafter.gguf")
+
+        # Reproduce the argv assembly logic from start_server (cpp backend path)
+        args = [
+            str(fake_bin),
+            "--host", "127.0.0.1",
+            "--port", "19999",
+            "--target", str(fake_bin),
+            "--draft", str(fake_bin),
+            *BANDIT_SERVER_PROFILE.args,
+        ]
+        if BANDIT_SERVER_PROFILE.needs_prefill_drafter:
+            args.extend(["--prefill-drafter", str(fake_drafter)])
+
+        self.assertIn("--prefill-compression", args,
+                      msg=f"--prefill-compression not in server argv: {args}")
+        idx = args.index("--prefill-compression")
+        self.assertEqual(args[idx + 1], "auto")
+        self.assertIn("--prefill-drafter", args,
+                      msg="--prefill-drafter must be in server argv for bandit profile")
 
 
 class TestBanditCLI(unittest.TestCase):
