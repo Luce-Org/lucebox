@@ -1,0 +1,11 @@
+seed=seed1
+prompt=decode_check.txt
+label=A_fixed_low
+keep_ratio=0.05
+session_id=
+wall_s=14
+ok_done=YES
+accept_rate=30.4
+mean_drafter_fwd_ms=1690 ms (n=1)
+bandit_log:
+none

@@ -1,0 +1,17 @@
+condition=16k_bandit
+ctx=16384
+keep_ratio=0.10
+n_cases=5
+pass=5
+fail=0
+accuracy=5/5
+bsa=1
+alpha=0.85
+compression_ratio=10.1x
+mean_drafter_s=6.47
+mean_target_prefill_s=1.68
+mean_e2e_ttft_s=9.4
+run_date=2026-05-23
+start=19:15:53
+end=19:17:12
+wall_s=79

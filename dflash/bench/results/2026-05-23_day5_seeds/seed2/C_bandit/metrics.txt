@@ -1,0 +1,11 @@
+seed=seed2
+prompt=logic_check.txt
+label=C_bandit
+keep_ratio=0.10
+session_id=claude_code_day5s2
+wall_s=21
+ok_done=YES
+accept_rate=30.4
+mean_drafter_fwd_ms=1600 ms (n=1)
+bandit_log:
+[pflash-bandit] session=claude_code_day5s2 turn=1 keep=0.1000->0.1100 ema=0.304 accept=0.304
