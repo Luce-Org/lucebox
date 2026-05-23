@@ -2797,6 +2797,221 @@ def cmd_bandit(args: argparse.Namespace) -> int:
     return 0
 
 
+_BANDIT_SESSION_PROMPTS_DIR = Path(__file__).resolve().parent / "clients" / "prompts"
+
+_BANDIT_SESSION_PROMPT_FILES = [
+    "decode_check.txt",
+    "logic_check.txt",
+    "math_check.txt",
+    "code_gen.txt",
+    "explain_algo.txt",
+]
+
+
+def _load_session_prompts(prompts_dir: Path, n: int) -> list[tuple[str, str]]:
+    """Return up to n (filename, content) pairs from the prompts directory."""
+    pairs: list[tuple[str, str]] = []
+    for fname in _BANDIT_SESSION_PROMPT_FILES:
+        path = prompts_dir / fname
+        if path.exists():
+            pairs.append((fname, path.read_text().strip()))
+        if len(pairs) >= n:
+            break
+    if not pairs:
+        raise HarnessError(
+            f"No prompt files found in {prompts_dir}. "
+            "Expected: " + ", ".join(_BANDIT_SESSION_PROMPT_FILES)
+        )
+    return pairs
+
+
+def cmd_bandit_session(args: argparse.Namespace) -> int:
+    """Multi-turn bandit session: start server once, run N turns, capture keep_ratio trajectory."""
+    dry_run: bool = getattr(args, "dry_run", False)
+    n_turns: int = getattr(args, "turns", 5)
+    client_name: str = getattr(args, "client", "claude_code")
+    sid: str = getattr(args, "session_id", None) or f"{client_name}-adaptive-{int(time.time())}"
+    prompts_dir = Path(getattr(args, "prompts_dir", None) or _BANDIT_SESSION_PROMPTS_DIR)
+
+    if client_name not in _ADAPTER_REGISTRY:
+        raise SystemExit(f"unknown client: {client_name}; choices: {', '.join(_ADAPTER_REGISTRY)}")
+
+    prompts = _load_session_prompts(prompts_dir, n_turns)
+    while len(prompts) < n_turns:
+        prompts.append(prompts[len(prompts) % len(prompts)])
+
+    out_csv = Path(getattr(args, "output", None) or "/tmp/harness_adaptive_evidence.csv")
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    _CSV_TURN_COLUMNS = [
+        "client", "turn", "session_id", "prompt",
+        "keep_before", "accept_rate", "keep_after", "ema", "wall_s",
+    ]
+
+    if dry_run:
+        print(f"[bandit-session] DRY RUN: would run {n_turns} turns for {client_name} "
+              f"session={sid}", flush=True)
+        print(f"[bandit-session] prompts: {[p[0] for p in prompts[:n_turns]]}", flush=True)
+        with open(out_csv, "w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=_CSV_TURN_COLUMNS, lineterminator="\n")
+            w.writeheader()
+        print(f"[bandit-session] wrote empty CSV to {out_csv}", flush=True)
+        return 0
+
+    target = getattr(args, "target", None)
+    draft = getattr(args, "draft", None)
+    bin_path_arg = getattr(args, "bin", None)
+    if target is None or draft is None or bin_path_arg is None:
+        raise SystemExit(
+            "bandit-session requires --target, --draft, and --bin "
+            "unless --dry-run is set"
+        )
+
+    drafter_arg = getattr(args, "pflash_drafter", None)
+    pflash_drafter = (
+        Path(drafter_arg).resolve() if drafter_arg
+        else Path(os.environ.get("PFLASH_DRAFTER_PATH", str(_DEFAULT_PFLASH_DRAFTER)))
+    )
+    work_dir = args.work_dir.resolve()
+    port = getattr(args, "port", None) or free_port()
+    os.environ["BASE_URL"] = f"http://127.0.0.1:{port}"
+
+    adapter = _ADAPTER_REGISTRY[client_name]()
+    pre = adapter.preflight_check()
+    if not pre.preflight_ok:
+        print(f"[bandit-session] PREFLIGHT FAIL: {pre.error}", file=sys.stderr)
+        return 78
+
+    proc = None
+    log_path: Path | None = None
+    turn_rows: list[dict[str, Any]] = []
+
+    try:
+        proc, log_path, server_args, _env = start_server(
+            BANDIT_SERVER_PROFILE,
+            target=Path(target).resolve(),
+            draft=Path(draft).resolve(),
+            bin_path=Path(bin_path_arg).resolve(),
+            prefill_drafter=pflash_drafter,
+            port=port,
+            work_dir=work_dir,
+        )
+        print(
+            f"[bandit-session] server pid={proc.pid} port={port} pflash=on",
+            flush=True,
+        )
+        up = wait_http(
+            f"http://127.0.0.1:{port}", proc=proc,
+            timeout=getattr(args, "start_timeout", 240),
+        )
+        if not up:
+            print("[bandit-session] ERROR: server did not start in time", file=sys.stderr)
+            if log_path:
+                print(tail(log_path, 2000), file=sys.stderr)
+            return 1
+
+        from harness.metrics_parser import parse_bandit_session_from_log
+
+        for turn_num in range(1, n_turns + 1):
+            prompt_fname, prompt_text = prompts[turn_num - 1]
+            print(
+                f"[bandit-session] turn={turn_num}/{n_turns} prompt={prompt_fname}",
+                flush=True,
+            )
+
+            # Snapshot log length before this turn so we can slice out the new lines
+            log_size_before = log_path.stat().st_size if log_path.exists() else 0
+
+            result = adapter.live_run(session_id=sid, prompt=prompt_text)
+            wall_s = result.wall_s
+
+            # Read only the new log lines produced during this turn
+            turn_log_text = ""
+            if log_path and log_path.exists():
+                with open(log_path, "r", errors="replace") as lf:
+                    lf.seek(log_size_before)
+                    turn_log_text = lf.read()
+
+            turn_records = parse_bandit_session_from_log(turn_log_text, session_id=None)
+            if turn_records:
+                rec = turn_records[-1]
+                row = {
+                    "client": client_name,
+                    "turn": turn_num,
+                    "session_id": sid,
+                    "prompt": prompt_fname,
+                    "keep_before": round(rec.keep_before, 4),
+                    "accept_rate": round(rec.accept_rate, 4),
+                    "keep_after": round(rec.keep_after, 4),
+                    "ema": round(rec.ema, 4),
+                    "wall_s": wall_s,
+                }
+                print(
+                    f"[bandit-session]   keep={rec.keep_before:.4f}->{rec.keep_after:.4f} "
+                    f"accept={rec.accept_rate:.4f} ema={rec.ema:.4f} wall={wall_s}s",
+                    flush=True,
+                )
+            else:
+                # No bandit line found for this turn — record what we can
+                row = {
+                    "client": client_name,
+                    "turn": turn_num,
+                    "session_id": sid,
+                    "prompt": prompt_fname,
+                    "keep_before": None,
+                    "accept_rate": None,
+                    "keep_after": None,
+                    "ema": None,
+                    "wall_s": wall_s,
+                }
+                print(
+                    f"[bandit-session]   WARNING: no [pflash-bandit] line for turn {turn_num}",
+                    flush=True,
+                )
+            turn_rows.append(row)
+
+        # Sanity: check if keep_after moved
+        keep_afters = [r["keep_after"] for r in turn_rows if r["keep_after"] is not None]
+        if keep_afters and len(set(f"{k:.4f}" for k in keep_afters)) == 1:
+            print(
+                "[bandit-session] WARNING: keep_after is STUCK at "
+                f"{keep_afters[0]:.4f} for all turns — bandit may not be adapting!",
+                flush=True,
+            )
+        elif keep_afters:
+            print(
+                f"[bandit-session] keep_after trajectory: "
+                + " -> ".join(f"{k:.4f}" for k in keep_afters),
+                flush=True,
+            )
+
+    finally:
+        if proc is not None:
+            stop_proc(proc)
+            close_server_log(proc)
+
+        # Write CSV regardless of success/failure
+        with open(out_csv, "w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=_CSV_TURN_COLUMNS, lineterminator="\n")
+            w.writeheader()
+            for row in turn_rows:
+                w.writerow(row)
+        print(f"[bandit-session] wrote {len(turn_rows)}-row CSV to {out_csv}", flush=True)
+
+        # Also save server.log into results dir
+        if log_path and log_path.exists():
+            date_str = time.strftime("%Y-%m-%d")
+            results_dir = ROOT / "dflash" / "bench" / "results" / f"{date_str}_adaptive_evidence"
+            results_dir.mkdir(parents=True, exist_ok=True)
+            import shutil as _shutil2
+            _shutil2.copy2(log_path, results_dir / "server.log")
+            _shutil2.copy2(out_csv, results_dir / "adaptive_evidence.csv")
+            print(f"[bandit-session] results saved to {results_dir}", flush=True)
+
+    # Return non-zero if no rows captured
+    return 0 if turn_rows else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--work-dir", type=Path, default=DEFAULT_WORK_DIR)
@@ -2878,6 +3093,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_bandit.add_argument("--start-timeout", type=int, default=240,
                           help="Seconds to wait for server to be healthy (default: 240)")
     p_bandit.set_defaults(func=cmd_bandit)
+
+    p_bs = sub.add_parser(
+        "bandit-session",
+        help="Multi-turn adaptive session: start server once, run N turns, capture trajectory",
+    )
+    p_bs.add_argument("--client", default="claude_code",
+                      help="Adapter to use (default: claude_code)")
+    p_bs.add_argument("--turns", type=int, default=5,
+                      help="Number of turns to run (default: 5)")
+    p_bs.add_argument("--session-id", default=None,
+                      help="Session ID (default: auto-generated)")
+    p_bs.add_argument("--target", type=Path, default=None)
+    p_bs.add_argument("--draft", type=Path, default=None)
+    p_bs.add_argument("--bin", type=Path, default=None)
+    p_bs.add_argument("--pflash-drafter", default=None)
+    p_bs.add_argument("--port", type=int, default=None)
+    p_bs.add_argument("--start-timeout", type=int, default=240)
+    p_bs.add_argument("--prompts-dir", default=None,
+                      help="Override prompts directory")
+    p_bs.add_argument("--output", default="/tmp/harness_adaptive_evidence.csv",
+                      help="Output CSV path (default: /tmp/harness_adaptive_evidence.csv)")
+    p_bs.add_argument("--dry-run", action="store_true",
+                      help="Preflight only; no server started, no clients run")
+    p_bs.set_defaults(func=cmd_bandit_session)
 
     return ap
 

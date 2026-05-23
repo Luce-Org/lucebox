@@ -33,6 +33,9 @@ from harness.client_test_runner import (
     run_bandit,
     BANDIT_SERVER_PROFILE,
     start_server,
+    _load_session_prompts,
+    _BANDIT_SESSION_PROMPT_FILES,
+    _BANDIT_SESSION_PROMPTS_DIR,
 )
 
 
@@ -425,6 +428,53 @@ class TestBanditCLI(unittest.TestCase):
         )
         self.assertEqual(rc, 0)
         self.assertIn("claude_code", out)
+
+
+class TestBanditSessionPrompts(unittest.TestCase):
+    """Tests for bandit-session prompt loading."""
+
+    def test_prompt_files_exist(self):
+        """All required prompt files exist in the prompts directory."""
+        missing = []
+        for fname in _BANDIT_SESSION_PROMPT_FILES:
+            p = _BANDIT_SESSION_PROMPTS_DIR / fname
+            if not p.exists():
+                missing.append(fname)
+        self.assertEqual(missing, [], msg=f"Missing prompt files: {missing}")
+
+    def test_load_session_prompts_returns_five(self):
+        """_load_session_prompts returns 5 (name, content) pairs."""
+        prompts = _load_session_prompts(_BANDIT_SESSION_PROMPTS_DIR, 5)
+        self.assertEqual(len(prompts), 5)
+        for fname, content in prompts:
+            self.assertTrue(content.strip(), msg=f"Prompt {fname} is empty")
+
+    def test_load_session_prompts_respects_limit(self):
+        """_load_session_prompts respects the n limit."""
+        prompts = _load_session_prompts(_BANDIT_SESSION_PROMPTS_DIR, 2)
+        self.assertEqual(len(prompts), 2)
+
+    def test_bandit_session_dry_run_cli(self):
+        """bandit-session --dry-run exits 0 and writes an empty CSV header."""
+        import subprocess, sys
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as f:
+            out_csv = Path(f.name)
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "harness.client_test_runner",
+                 "bandit-session", "--dry-run",
+                 "--client", "claude_code",
+                 "--turns", "3",
+                 "--output", str(out_csv)],
+                capture_output=True, text=True,
+                cwd=str(Path(__file__).resolve().parent.parent.parent),
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            rows = list(csv.DictReader(out_csv.open()))
+            # dry-run writes header only
+            self.assertEqual(len(rows), 0)
+        finally:
+            out_csv.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

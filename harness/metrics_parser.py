@@ -18,6 +18,29 @@ _SPEC_DECODE_RE = re.compile(
 )
 _PFLASH_BANDIT_ACCEPT_RE = re.compile(r"\[pflash-bandit\].*?\baccept=([0-9]*\.?[0-9]+)")
 
+# Matches: [pflash-bandit] session=X turn=N keep=A->B ema=C accept=D
+_PFLASH_BANDIT_TURN_RE = re.compile(
+    r"\[pflash-bandit\]\s+"
+    r"session=(\S+)\s+"
+    r"turn=(\d+)\s+"
+    r"keep=([0-9]*\.?[0-9]+)->([0-9]*\.?[0-9]+)\s+"
+    r"ema=([0-9]*\.?[0-9]+)\s+"
+    r"accept=([0-9]*\.?[0-9]+)"
+)
+
+
+@dataclass
+class BanditTurnRecord:
+    """Per-turn record parsed from a plain-text [pflash-bandit] log line."""
+
+    session_id: str
+    turn: int
+    keep_before: float
+    keep_after: float
+    ema: float
+    accept_rate: float
+    wall_s: Optional[float] = None
+
 
 @dataclass
 class BanditRunMetrics:
@@ -126,3 +149,35 @@ def extract_accept_rate_from_log(log_text: str) -> Optional[float]:
     if last_spec is not None:
         return last_spec.accept_rate
     return None
+
+
+def parse_bandit_session_from_log(
+    log_text: str,
+    *,
+    session_id: Optional[str] = None,
+) -> list[BanditTurnRecord]:
+    """Extract per-turn bandit records from a server log.
+
+    Parses lines matching:
+        [pflash-bandit] session=X turn=N keep=A->B ema=C accept=D
+
+    If session_id is given, only records for that session are returned.
+    Records are returned in log order (i.e. turn order).
+    """
+    records: list[BanditTurnRecord] = []
+    for line in log_text.splitlines():
+        m = _PFLASH_BANDIT_TURN_RE.search(line)
+        if not m:
+            continue
+        sid = m.group(1)
+        if session_id is not None and sid != session_id:
+            continue
+        records.append(BanditTurnRecord(
+            session_id=sid,
+            turn=int(m.group(2)),
+            keep_before=float(m.group(3)),
+            keep_after=float(m.group(4)),
+            ema=float(m.group(5)),
+            accept_rate=float(m.group(6)),
+        ))
+    return records

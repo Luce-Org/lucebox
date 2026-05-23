@@ -19,10 +19,12 @@ if str(HARNESS_DIR.parent) not in sys.path:
 
 from harness.metrics_parser import (
     BanditRunMetrics,
+    BanditTurnRecord,
     parse_bandit_log_line,
     parse_bandit_log,
     parse_spec_decode_line,
     extract_accept_rate_from_log,
+    parse_bandit_session_from_log,
 )
 
 
@@ -210,6 +212,78 @@ class TestExtractAcceptRateFromLog(unittest.TestCase):
         )
         rate = extract_accept_rate_from_log(log)
         self.assertAlmostEqual(rate, 0.75)
+
+
+class TestParseBanditSessionFromLog(unittest.TestCase):
+    """Tests for parse_bandit_session_from_log."""
+
+    def _make_log(self, turns: list[dict]) -> str:
+        lines = []
+        for t in turns:
+            keep_before = t.get("keep_before", 0.10)
+            keep_after = t.get("keep_after", 0.12)
+            ema = t.get("ema", 0.25)
+            accept = t.get("accept", 0.35)
+            turn = t.get("turn", 1)
+            session = t.get("session", "s1")
+            lines.append(
+                f"[pflash-bandit] session={session} turn={turn} "
+                f"keep={keep_before:.4f}->{keep_after:.4f} "
+                f"ema={ema:.3f} accept={accept:.3f}"
+            )
+        return "\n".join(lines) + "\n"
+
+    def test_parses_single_turn(self):
+        log = self._make_log([{"turn": 1, "keep_before": 0.10, "keep_after": 0.12,
+                                "ema": 0.25, "accept": 0.35}])
+        records = parse_bandit_session_from_log(log, session_id="s1")
+        self.assertEqual(len(records), 1)
+        r = records[0]
+        self.assertEqual(r.turn, 1)
+        self.assertAlmostEqual(r.keep_before, 0.10, places=4)
+        self.assertAlmostEqual(r.keep_after, 0.12, places=4)
+        self.assertAlmostEqual(r.ema, 0.25, places=3)
+        self.assertAlmostEqual(r.accept_rate, 0.35, places=3)
+
+    def test_parses_five_turns(self):
+        turns = [
+            {"turn": 1, "keep_before": 0.10, "keep_after": 0.12, "ema": 0.20, "accept": 0.40},
+            {"turn": 2, "keep_before": 0.12, "keep_after": 0.15, "ema": 0.30, "accept": 0.55},
+            {"turn": 3, "keep_before": 0.15, "keep_after": 0.18, "ema": 0.38, "accept": 0.62},
+            {"turn": 4, "keep_before": 0.18, "keep_after": 0.20, "ema": 0.44, "accept": 0.70},
+            {"turn": 5, "keep_before": 0.20, "keep_after": 0.22, "ema": 0.50, "accept": 0.75},
+        ]
+        log = self._make_log(turns)
+        records = parse_bandit_session_from_log(log, session_id="s1")
+        self.assertEqual(len(records), 5)
+        # keep_after changes across turns
+        keep_afters = [r.keep_after for r in records]
+        self.assertGreater(len(set(keep_afters)), 1, msg="keep_after must vary across turns")
+
+    def test_filters_by_session_id(self):
+        turns_s1 = [{"turn": 1, "session": "s1", "keep_before": 0.10, "keep_after": 0.12,
+                      "ema": 0.25, "accept": 0.35}]
+        turns_s2 = [{"turn": 1, "session": "s2", "keep_before": 0.10, "keep_after": 0.11,
+                      "ema": 0.20, "accept": 0.30}]
+        log = self._make_log(turns_s1) + self._make_log(turns_s2)
+        records = parse_bandit_session_from_log(log, session_id="s1")
+        self.assertEqual(len(records), 1)
+        self.assertAlmostEqual(records[0].keep_after, 0.12, places=4)
+
+    def test_session_id_none_returns_all(self):
+        turns = [
+            {"turn": 1, "session": "a", "keep_before": 0.10, "keep_after": 0.11,
+             "ema": 0.25, "accept": 0.30},
+            {"turn": 2, "session": "b", "keep_before": 0.15, "keep_after": 0.16,
+             "ema": 0.30, "accept": 0.40},
+        ]
+        log = self._make_log(turns)
+        records = parse_bandit_session_from_log(log, session_id=None)
+        self.assertEqual(len(records), 2)
+
+    def test_empty_log_returns_empty(self):
+        records = parse_bandit_session_from_log("no bandit lines here\n", session_id="s1")
+        self.assertEqual(records, [])
 
 
 if __name__ == "__main__":
