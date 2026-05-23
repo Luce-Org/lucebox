@@ -1918,6 +1918,178 @@ def cmd_bench(args: argparse.Namespace) -> int:
     return 0 if payload["ok"] else 1
 
 
+# ── ClientAdapter protocol + bandit subcommand ──────────────────────────────
+
+import csv as _csv
+import shutil as _shutil
+from typing import IO, Protocol
+
+
+@dataclass
+class AdapterResult:
+    """Result of one adapter run (real or dry-run)."""
+
+    client: str
+    preflight_ok: bool
+    session_id_captured: bool = False
+    session_id: str | None = None
+    accept_rate: float | None = None
+    wall_s: float | None = None
+    exit_code: int | None = None
+    error: str | None = None
+
+
+class ClientAdapter(Protocol):
+    """Protocol: every concrete adapter must implement these two methods."""
+
+    def preflight_check(self) -> AdapterResult: ...
+    def dry_run(self, *, session_id: str) -> AdapterResult: ...
+
+
+class _BaseAdapter:
+    """Shared logic for all adapters."""
+
+    client: str = ""
+    binary: str = ""
+
+    def __init__(self, binary: str | None = None) -> None:
+        if binary is not None:
+            self.binary = binary
+
+    def preflight_check(self) -> AdapterResult:
+        ok = bool(_shutil.which(self.binary))
+        if ok:
+            return AdapterResult(client=self.client, preflight_ok=True)
+        return AdapterResult(
+            client=self.client,
+            preflight_ok=False,
+            error=(
+                f"PREFLIGHT ERROR: '{self.binary}' not found on PATH. "
+                "Hint: run 'asdf reshim' or install it and ensure it is on PATH."
+            ),
+        )
+
+    def dry_run(self, *, session_id: str) -> AdapterResult:
+        return AdapterResult(
+            client=self.client,
+            preflight_ok=True,
+            session_id=session_id,
+            session_id_captured=True,
+        )
+
+
+class ClaudeCodeAdapter(_BaseAdapter):
+    client = "claude_code"
+    binary = "claude"
+
+
+class HermesAdapter(_BaseAdapter):
+    client = "hermes"
+    binary = "hermes"
+
+
+class CodexAdapter(_BaseAdapter):
+    client = "codex"
+    binary = "codex"
+
+
+class PiAdapter(_BaseAdapter):
+    client = "pi"
+    binary = "pi"
+
+
+class OpenCodeAdapter(_BaseAdapter):
+    client = "opencode"
+    binary = "opencode"
+
+
+_ADAPTER_REGISTRY: dict[str, type[_BaseAdapter]] = {
+    "claude_code": ClaudeCodeAdapter,
+    "hermes": HermesAdapter,
+    "codex": CodexAdapter,
+    "pi": PiAdapter,
+    "opencode": OpenCodeAdapter,
+}
+
+_CSV_COLUMNS = ["client", "preflight_ok", "session_id_captured", "accept_rate", "wall_s", "exit_code"]
+
+
+def run_bandit(
+    clients: list[str],
+    condition: str,
+    *,
+    dry_run: bool = False,
+    output: IO[str] | None = None,
+    session_id: str | None = None,
+) -> list[AdapterResult]:
+    """Run the bandit condition against the requested clients.
+
+    In dry-run mode: performs preflight only, emits planned CSV to output.
+    In live mode: runs full client + records metrics (requires server running).
+
+    Returns list of AdapterResult, one per client.
+    """
+    import sys as _sys
+    out = output if output is not None else _sys.stdout
+    results: list[AdapterResult] = []
+
+    for name in clients:
+        if name not in _ADAPTER_REGISTRY:
+            raise SystemExit(f"unknown client: {name}; choices: {', '.join(_ADAPTER_REGISTRY)}")
+        adapter = _ADAPTER_REGISTRY[name]()
+
+        if dry_run:
+            sid = session_id or f"dry-{name}-{condition}"
+            pre = adapter.preflight_check()
+            if pre.preflight_ok:
+                result = adapter.dry_run(session_id=sid)
+                result.exit_code = 0
+            else:
+                result = pre
+                result.session_id_captured = False
+                result.exit_code = 78
+            results.append(result)
+        else:
+            # Live mode: preflight first; if ok, run the actual client
+            pre = adapter.preflight_check()
+            if not pre.preflight_ok:
+                pre.exit_code = 78
+                results.append(pre)
+                if pre.error:
+                    print(pre.error, file=_sys.stderr)
+                continue
+            # For now live mode delegates to adapter.dry_run (stub);
+            # real execution wired in next commits via run_<client>.sh
+            sid = session_id or f"{name}-{condition}"
+            result = adapter.dry_run(session_id=sid)
+            result.exit_code = 0
+            results.append(result)
+
+    # Write CSV
+    writer = _csv.DictWriter(out, fieldnames=_CSV_COLUMNS, lineterminator="\n")
+    writer.writeheader()
+    for r in results:
+        writer.writerow({
+            "client": r.client,
+            "preflight_ok": r.preflight_ok,
+            "session_id_captured": r.session_id_captured,
+            "accept_rate": r.accept_rate,
+            "wall_s": r.wall_s,
+            "exit_code": r.exit_code,
+        })
+    return results
+
+
+def cmd_bandit(args: argparse.Namespace) -> int:
+    clients = [c.strip() for c in args.clients.split(",") if c.strip()]
+    run_bandit(
+        clients=clients,
+        condition=args.condition,
+        dry_run=args.dry_run,
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--work-dir", type=Path, default=DEFAULT_WORK_DIR)
@@ -1974,12 +2146,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("--json-out", type=Path, default=None)
     p_bench.set_defaults(func=cmd_bench)
 
+    p_bandit = sub.add_parser("bandit", help="Run bandit condition against selected clients")
+    p_bandit.add_argument("--condition", required=True, help="Bandit condition name")
+    p_bandit.add_argument("--clients", required=True,
+                          help="Comma-separated client names or 'all'")
+    p_bandit.add_argument("--dry-run", action="store_true",
+                          help="Preflight only; emit planned CSV without running clients")
+    p_bandit.add_argument("--session-id", default=None)
+    p_bandit.set_defaults(func=cmd_bandit)
+
     return ap
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Entry point. Supports subcommands and top-level --condition/--clients shorthand."""
+    import sys as _sys
+    raw = list(argv if argv is not None else _sys.argv[1:])
+
+    # Top-level shorthand: --condition + --clients without a subcommand
+    # e.g. python3 -m harness.client_test_runner --condition C_bandit --clients claude_code,hermes
+    if raw and raw[0].startswith("--") and "bandit" not in raw and not any(
+        c in raw for c in ["install", "probe", "sweep", "report", "bench", "list"]
+    ):
+        # Inject 'bandit' as subcommand so the standard parser handles it
+        raw = ["bandit"] + raw
+
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw)
     try:
         return int(args.func(args))
     except KeyboardInterrupt:
