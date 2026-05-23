@@ -7,7 +7,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${VERIFY_MODE:=ddtree}"
 : "${EXTRA_SERVER_ARGS:=--lazy-draft}"
 : "${HERMES_MAX_TURNS:=40}"
+export LUCEBOX_SERVER_BACKEND=cpp
 source "$SCRIPT_DIR/common.sh"
+preflight_require_bin hermes
 
 CLIENT_OUT="$LOG_DIR/hermes.out"
 HERMES_BIN="${HERMES_BIN:-$CLIENT_WORK_DIR/clients/hermes/home/.local/bin/hermes}"

@@ -6,7 +6,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${BUDGET:=22}"
 : "${VERIFY_MODE:=ddtree}"
 : "${EXTRA_SERVER_ARGS:=--lazy-draft}"
+export LUCEBOX_SERVER_BACKEND=cpp
 source "$SCRIPT_DIR/common.sh"
+preflight_require_bin opencode
 
 CLIENT_OUT="$LOG_DIR/opencode.out"
 EXPORT_OUT="$LOG_DIR/opencode-export.json"

@@ -9,7 +9,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "${MODEL_SERVER:-}" == "llamacpp" ]]; then
   : "${LLAMA_COMPAT_PROXY:=responses}"
 fi
+export LUCEBOX_SERVER_BACKEND=cpp
 source "$SCRIPT_DIR/common.sh"
+preflight_require_bin codex
 
 CLIENT_OUT="$LOG_DIR/codex.out"
 LAST_MSG="$LOG_DIR/codex-last-message.txt"

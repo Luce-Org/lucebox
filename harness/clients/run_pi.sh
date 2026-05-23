@@ -7,7 +7,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${VERIFY_MODE:=ddtree}"
 : "${EXTRA_SERVER_ARGS:=--lazy-draft}"
 : "${PI_TOOLS:=read,grep,find,ls}"
+export LUCEBOX_SERVER_BACKEND=cpp
 source "$SCRIPT_DIR/common.sh"
+preflight_require_bin pi
 
 CLIENT_OUT="$LOG_DIR/pi.out"
 PI_BIN="${PI_BIN:-$CLIENT_WORK_DIR/clients/pi/npm/bin/pi}"
