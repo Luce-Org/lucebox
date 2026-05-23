@@ -2111,56 +2111,341 @@ class HermesAdapter(_BaseAdapter):
     client = "hermes"
     binary = "hermes"
 
-    def live_run(self, *, session_id: str, prompt: str = "", **kwargs: Any) -> AdapterResult:
-        script = _CLIENTS_DIR / "run_hermes.sh"
-        return super().live_run(
-            session_id=session_id,
-            run_script=script,
-            prompt=prompt or "Reply with exactly: lucebox-bandit-ok",
-            **kwargs,
-        )
+    def live_run(self, *, session_id: str, prompt: str = "", timeout: int = 420, **kwargs: Any) -> AdapterResult:
+        _prompt = prompt or "Reply with exactly: lucebox-bandit-ok"
+        base_url = os.environ.get("BASE_URL", "http://127.0.0.1:18080")
+        model_id = os.environ.get("MODEL_ID", "luce-dflash")
+        api_key = os.environ.get("API_KEY", "sk-lucebox")
+        hermes_bin = os.environ.get("HERMES_BIN", self.binary)
+        max_turns = os.environ.get("HERMES_MAX_TURNS", "40")
+        env = os.environ.copy()
+        env.update({
+            "LUCEBOX_SERVER_BACKEND": "cpp",
+            "PFLASH_SESSION_ID": session_id,
+            "OPENAI_API_KEY": api_key,
+            "OPENAI_BASE_URL": f"{base_url}/v1",
+            "HERMES_INFERENCE_PROVIDER": "lucebox",
+            "HERMES_INFERENCE_MODEL": model_id,
+            "HERMES_ACCEPT_HOOKS": "1",
+            "HERMES_API_TIMEOUT": "600",
+            "HERMES_API_CALL_STALE_TIMEOUT": "600",
+            "NO_COLOR": "1",
+        })
+        cmd = [
+            hermes_bin, "chat",
+            "--quiet",
+            "--provider", "lucebox",
+            "--model", model_id,
+            "--accept-hooks",
+            "--yolo",
+            "--max-turns", max_turns,
+            "--source", "lucebox-harness",
+            "--query", _prompt,
+        ]
+        t0 = time.perf_counter()
+        try:
+            proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
+            wall = time.perf_counter() - t0
+            return AdapterResult(
+                client=self.client, preflight_ok=True, session_id=session_id,
+                session_id_captured=True, wall_s=round(wall, 3), exit_code=proc.returncode,
+            )
+        except subprocess.TimeoutExpired:
+            return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
+                                 exit_code=124, error="timeout")
+        except Exception as exc:
+            return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
+                                 exit_code=1, error=repr(exc))
 
 
 class CodexAdapter(_BaseAdapter):
     client = "codex"
     binary = "codex"
 
-    def live_run(self, *, session_id: str, prompt: str = "", **kwargs: Any) -> AdapterResult:
-        script = _CLIENTS_DIR / "run_codex.sh"
-        return super().live_run(
-            session_id=session_id,
-            run_script=script,
-            prompt=prompt or "Reply with exactly: lucebox-bandit-ok",
-            **kwargs,
-        )
+    def preflight_check(self) -> AdapterResult:
+        # codex does not support --version; use --help which exits 0 when the shim is healthy
+        if not _shutil.which(self.binary):
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=f"PREFLIGHT FAIL: 'codex' not found on PATH. Try `asdf reshim node` then re-run.",
+            )
+        try:
+            result = subprocess.run(
+                [self.binary, "--help"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error="PREFLIGHT FAIL: 'codex --help' timed out (5s) — asdf shim may be broken.",
+            )
+        except Exception as exc:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=f"PREFLIGHT FAIL: 'codex --help' raised {exc!r}.",
+            )
+        combined = (result.stdout + result.stderr).lower()
+        if "unknown command" in combined or "reshim" in combined:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=(
+                    f"PREFLIGHT FAIL: 'codex' via asdf shim is stale — "
+                    f"try `asdf reshim node` then re-run. (stderr: {result.stderr.strip()!r})"
+                ),
+            )
+        return AdapterResult(client=self.client, preflight_ok=True)
+
+    def live_run(self, *, session_id: str, prompt: str = "", timeout: int = 420, **kwargs: Any) -> AdapterResult:
+        _prompt = prompt or "Reply with exactly: lucebox-bandit-ok"
+        base_url = os.environ.get("BASE_URL", "http://127.0.0.1:18080")
+        model_id = os.environ.get("MODEL_ID", "luce-dflash")
+        api_key = os.environ.get("API_KEY", "sk-lucebox")
+        codex_bin = os.environ.get("CODEX_BIN", self.binary)
+        sandbox = os.environ.get("CODEX_SANDBOX", "danger-full-access")
+        wire_api = os.environ.get("CODEX_WIRE_API", "responses")
+        # Write codex config to a temp dir so we don't pollute HOME
+        import tempfile, json as _json
+        with tempfile.TemporaryDirectory() as codex_home:
+            config_path = Path(codex_home) / "config.toml"
+            config_path.write_text(
+                f'model = "{model_id}"\n'
+                f'model_provider = "luce"\n'
+                f'approval_policy = "never"\n'
+                f'sandbox_mode = "{sandbox}"\n'
+                f'\n'
+                f'[model_providers.luce]\n'
+                f'name = "Lucebox"\n'
+                f'base_url = "{base_url}/v1"\n'
+                f'env_key = "OPENAI_API_KEY"\n'
+                f'wire_api = "{wire_api}"\n'
+            )
+            env = os.environ.copy()
+            env.update({
+                "LUCEBOX_SERVER_BACKEND": "cpp",
+                "PFLASH_SESSION_ID": session_id,
+                "OPENAI_API_KEY": api_key,
+                "HOME": codex_home,
+                "CODEX_HOME": codex_home,
+            })
+            cmd = [
+                codex_bin, "exec",
+                "--skip-git-repo-check",
+                "--sandbox", sandbox,
+                "--model", model_id,
+                "--json",
+                _prompt,
+            ]
+            t0 = time.perf_counter()
+            try:
+                proc = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                                      timeout=timeout, stdin=subprocess.DEVNULL)
+                wall = time.perf_counter() - t0
+                return AdapterResult(
+                    client=self.client, preflight_ok=True, session_id=session_id,
+                    session_id_captured=True, wall_s=round(wall, 3), exit_code=proc.returncode,
+                )
+            except subprocess.TimeoutExpired:
+                return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
+                                     exit_code=124, error="timeout")
+            except Exception as exc:
+                return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
+                                     exit_code=1, error=repr(exc))
 
 
 class PiAdapter(_BaseAdapter):
     client = "pi"
     binary = "pi"
 
-    def live_run(self, *, session_id: str, prompt: str = "", **kwargs: Any) -> AdapterResult:
-        script = _CLIENTS_DIR / "run_pi.sh"
-        return super().live_run(
-            session_id=session_id,
-            run_script=script,
-            prompt=prompt or "Reply with exactly: lucebox-bandit-ok",
-            **kwargs,
-        )
+    def preflight_check(self) -> AdapterResult:
+        # pi --version may fail if asdf shim is stale; probe with --help
+        if not _shutil.which(self.binary):
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=f"PREFLIGHT FAIL: 'pi' not found on PATH. Try `asdf reshim node` then re-run.",
+            )
+        try:
+            result = subprocess.run(
+                [self.binary, "--help"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error="PREFLIGHT FAIL: 'pi --help' timed out (5s) — asdf shim may be broken.",
+            )
+        except Exception as exc:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=f"PREFLIGHT FAIL: 'pi --help' raised {exc!r}.",
+            )
+        combined = (result.stdout + result.stderr).lower()
+        if "unknown command" in combined or "reshim" in combined:
+            return AdapterResult(
+                client=self.client, preflight_ok=False,
+                error=(
+                    f"PREFLIGHT FAIL: 'pi' via asdf shim is stale — "
+                    f"try `asdf reshim node` then re-run. (stderr: {result.stderr.strip()!r})"
+                ),
+            )
+        return AdapterResult(client=self.client, preflight_ok=True)
+
+    def live_run(self, *, session_id: str, prompt: str = "", timeout: int = 300, **kwargs: Any) -> AdapterResult:
+        _prompt = prompt or "Reply with exactly: lucebox-bandit-ok"
+        base_url = os.environ.get("BASE_URL", "http://127.0.0.1:18080")
+        model_id = os.environ.get("MODEL_ID", "luce-dflash")
+        api_key = os.environ.get("API_KEY", "sk-lucebox")
+        max_ctx = os.environ.get("MAX_CTX", "65536")
+        max_tokens = os.environ.get("MAX_TOKENS", "2048")
+        pi_bin = os.environ.get("PI_BIN", self.binary)
+        pi_tools = os.environ.get("PI_TOOLS", "read,grep,find,ls")
+        provider_api = os.environ.get("PROVIDER_API", "openai-responses")
+        import tempfile, json as _json
+        with tempfile.TemporaryDirectory() as home_dir:
+            agent_dir = Path(home_dir) / "agent"
+            sessions_dir = Path(home_dir) / "sessions"
+            agent_dir.mkdir()
+            sessions_dir.mkdir()
+            (agent_dir / "settings.json").write_text(
+                _json.dumps({"compaction": {"enabled": False}})
+            )
+            (agent_dir / "models.json").write_text(_json.dumps({
+                "providers": {
+                    "lucebox": {
+                        "baseUrl": f"{base_url}/v1",
+                        "api": provider_api,
+                        "apiKey": api_key,
+                        "compat": {
+                            "supportsDeveloperRole": False,
+                            "supportsReasoningEffort": False,
+                            "supportsUsageInStreaming": True,
+                            "maxTokensField": "max_tokens",
+                        },
+                        "models": [{
+                            "id": model_id,
+                            "name": "Lucebox DFlash",
+                            "api": provider_api,
+                            "reasoning": False,
+                            "input": ["text"],
+                            "contextWindow": int(max_ctx),
+                            "maxTokens": int(max_tokens),
+                            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                        }],
+                    }
+                }
+            }))
+            env = os.environ.copy()
+            env.update({
+                "LUCEBOX_SERVER_BACKEND": "cpp",
+                "PFLASH_SESSION_ID": session_id,
+                "HOME": home_dir,
+                "PI_CODING_AGENT_DIR": str(agent_dir),
+                "PI_CODING_AGENT_SESSION_DIR": str(sessions_dir),
+                "PI_OFFLINE": "1",
+            })
+            cmd = [
+                pi_bin,
+                "--provider", "lucebox",
+                "--model", model_id,
+                "--print",
+                "--mode", "json",
+                "--tools", pi_tools,
+                "--no-session",
+                "--offline",
+                _prompt,
+            ]
+            t0 = time.perf_counter()
+            try:
+                proc = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                                      timeout=timeout, stdin=subprocess.DEVNULL)
+                wall = time.perf_counter() - t0
+                return AdapterResult(
+                    client=self.client, preflight_ok=True, session_id=session_id,
+                    session_id_captured=True, wall_s=round(wall, 3), exit_code=proc.returncode,
+                )
+            except subprocess.TimeoutExpired:
+                return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
+                                     exit_code=124, error="timeout")
+            except Exception as exc:
+                return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
+                                     exit_code=1, error=repr(exc))
 
 
 class OpenCodeAdapter(_BaseAdapter):
     client = "opencode"
     binary = "opencode"
 
-    def live_run(self, *, session_id: str, prompt: str = "", **kwargs: Any) -> AdapterResult:
-        script = _CLIENTS_DIR / "run_opencode.sh"
-        return super().live_run(
-            session_id=session_id,
-            run_script=script,
-            prompt=prompt or "Reply with exactly: lucebox-bandit-ok",
-            **kwargs,
-        )
+    def live_run(self, *, session_id: str, prompt: str = "", timeout: int = 300, **kwargs: Any) -> AdapterResult:
+        _prompt = prompt or "Reply with exactly: lucebox-bandit-ok"
+        base_url = os.environ.get("BASE_URL", "http://127.0.0.1:18080")
+        model_id = os.environ.get("MODEL_ID", "luce-dflash")
+        api_key = os.environ.get("API_KEY", "sk-lucebox")
+        max_ctx = os.environ.get("MAX_CTX", "86016")
+        max_tokens = os.environ.get("MAX_TOKENS", "2048")
+        opencode_bin = os.environ.get("OPENCODE_BIN", self.binary)
+        import tempfile, json as _json
+        with tempfile.TemporaryDirectory() as home_dir:
+            config_dir = Path(home_dir) / ".config"
+            data_dir = Path(home_dir) / ".local" / "share"
+            project_dir = Path(home_dir) / "project"
+            config_dir.mkdir(parents=True)
+            data_dir.mkdir(parents=True)
+            project_dir.mkdir()
+            (project_dir / "opencode.json").write_text(_json.dumps({
+                "$schema": "https://opencode.ai/config.json",
+                "model": f"lucebox/{model_id}",
+                "small_model": f"lucebox/{model_id}",
+                "provider": {
+                    "lucebox": {
+                        "npm": "@ai-sdk/openai-compatible",
+                        "name": "Lucebox",
+                        "options": {
+                            "baseURL": f"{base_url}/v1",
+                            "apiKey": api_key,
+                            "timeout": 600000,
+                            "chunkTimeout": 60000,
+                        },
+                        "models": {
+                            model_id: {
+                                "name": "Lucebox DFlash",
+                                "limit": {"context": int(max_ctx), "output": int(max_tokens)},
+                            }
+                        },
+                    }
+                },
+                "tools": {"write": False, "bash": False},
+            }))
+            env = os.environ.copy()
+            env.update({
+                "LUCEBOX_SERVER_BACKEND": "cpp",
+                "PFLASH_SESSION_ID": session_id,
+                "OPENAI_API_KEY": api_key,
+                "HOME": home_dir,
+                "XDG_CONFIG_HOME": str(config_dir),
+                "XDG_DATA_HOME": str(data_dir),
+            })
+            cmd = [
+                opencode_bin, "run",
+                "--pure",
+                "--model", f"lucebox/{model_id}",
+                "--format", "json",
+                _prompt,
+            ]
+            t0 = time.perf_counter()
+            try:
+                proc = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                                      timeout=timeout, stdin=subprocess.DEVNULL,
+                                      cwd=str(project_dir))
+                wall = time.perf_counter() - t0
+                return AdapterResult(
+                    client=self.client, preflight_ok=True, session_id=session_id,
+                    session_id_captured=True, wall_s=round(wall, 3), exit_code=proc.returncode,
+                )
+            except subprocess.TimeoutExpired:
+                return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
+                                     exit_code=124, error="timeout")
+            except Exception as exc:
+                return AdapterResult(client=self.client, preflight_ok=True, session_id=session_id,
+                                     exit_code=1, error=repr(exc))
 
 
 _ADAPTER_REGISTRY: dict[str, type[_BaseAdapter]] = {
