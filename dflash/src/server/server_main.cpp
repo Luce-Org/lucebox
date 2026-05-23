@@ -117,6 +117,7 @@ static void print_usage(const char * prog) {
         "  --chunk <N>          Chunked-prefill chunk size (default: 512)\n"
         "  --fa-window <N>     Flash-attention sliding window (default: 0=full)\n"
         "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
+        "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
         "  --ddtree             Enable DDTree speculative decode\n"
         "  --ddtree-budget <N>  DDTree budget (default: 64)\n"
         "  --no-cors            Disable CORS headers\n"
@@ -224,6 +225,8 @@ int main(int argc, char ** argv) {
             bargs.fa_window = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--model-name") == 0 && i + 1 < argc) {
             sconfig.model_name = argv[++i];
+        } else if (std::strcmp(argv[i], "--prefix-cache-slots") == 0 && i + 1 < argc) {
+            sconfig.prefix_cache_cap = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--ddtree") == 0) {
             bargs.ddtree_mode = true;
             bargs.fast_rollback = true;
@@ -394,7 +397,11 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  draft           = %s\n", bargs.draft_path ? bargs.draft_path : "(none)");
     std::fprintf(stderr, "[server] │  model_name      = %s\n", sconfig.model_name.c_str());
     std::fprintf(stderr, "[server] │  max_ctx         = %d\n", sconfig.max_ctx);
-    std::fprintf(stderr, "[server] │  max_tokens      = %d\n", sconfig.max_tokens);
+    // max_tokens default for requests that omit the field. The request
+    // parser reads default_max_tokens (16000), NOT sconfig.max_tokens
+    // (legacy 4096). Print default_max_tokens so the banner doesn't lie.
+    std::fprintf(stderr, "[server] │  max_tokens      = %d (default for requests omitting max_tokens)\n", sconfig.default_max_tokens);
+    std::fprintf(stderr, "[server] │  think_max_tokens= %d (phase-1 cap when thinking opted in)\n", sconfig.think_max_tokens);
     std::fprintf(stderr, "[server] │  target_device   = %s\n",
                  placement_device_name(bargs.device).c_str());
     if (bargs.device.is_layer_split()) {
@@ -413,6 +420,7 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  fa_window       = %d\n", bargs.fa_window);
     std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
+    std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
     std::fprintf(stderr, "[server] │  cors            = %s\n", sconfig.enable_cors ? "ON" : "off");
     std::fprintf(stderr, "[server] │  cache_type_k    = %s\n",
 #ifdef GGML_USE_HIP

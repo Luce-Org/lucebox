@@ -3,7 +3,7 @@
 #
 # Normal path: the host-side `lucebox` CLI has already populated every
 # DFLASH_* env var from its detection / benchmark, so this script just
-# resolves paths and execs uv run scripts/server.py.
+# resolves paths and execs the native dflash_server binary.
 #
 # Fallback path: a user runs the image directly (`docker run --gpus all
 # ghcr.io/luce-org/lucebox-hub:cuda12`) with no env-var prep. We then do a
@@ -103,6 +103,7 @@ if [ "$GPU_VRAM_GB" -gt 0 ]; then
 fi
 
 : "${DFLASH_BIN:=$DFLASH_DIR/build/test_dflash}"
+: "${DFLASH_SERVER_BIN:=$DFLASH_DIR/build/dflash_server}"
 : "${DFLASH_HOST:=0.0.0.0}"
 : "${DFLASH_PORT:=8080}"
 : "${DFLASH_BUDGET:=22}"
@@ -146,7 +147,7 @@ fi
 if [ -z "$DFLASH_TARGET" ] || [ ! -f "$DFLASH_TARGET" ]; then
     die "No target GGUF found. Mount a model dir: -v /host/models:/opt/lucebox-hub/dflash/models"
 fi
-[ -f "$DFLASH_BIN" ] || die "test_dflash binary missing at $DFLASH_BIN (image build failed?)"
+[ -x "$DFLASH_SERVER_BIN" ] || die "dflash_server binary missing at $DFLASH_SERVER_BIN (image build failed?)"
 
 # Qwen3.6 DFlash drafters use sliding-window attention in the draft. Some GGUFs
 # carry this metadata directly; keep the documented env override as the startup
@@ -175,14 +176,24 @@ if [ "$DFLASH_DRAFT" = "$DFLASH_DIR/models/draft" ] && [ ! -e "$DFLASH_DRAFT" ];
 fi
 
 # Draft: directory holding GGUF/safetensors, or a direct draft file.
+# The native dflash_server expects --draft to be a FILE path (not a dir).
+# If DFLASH_DRAFT points at a directory, resolve it to the first DFlash
+# draft GGUF inside (preferring the size-based largest dflash-draft-*.gguf
+# match). The Python server's resolve_draft() did the equivalent walk; this
+# block makes the C++ entrypoint accept the same DFLASH_DRAFT shape so
+# users don't have to know whether they're driving the Python or C++ path.
 DRAFT_ARG="$DFLASH_DRAFT"
 if [ -d "$DFLASH_DRAFT" ]; then
-    if ! find -L "$DFLASH_DRAFT" -maxdepth 4 -type f \( \
+    DRAFT_FILE="$(find -L "$DFLASH_DRAFT" -maxdepth 4 -type f \( \
             -name 'dflash-draft-*.gguf' -o \
             -name '*.gguf' -o \
             -name 'model.safetensors' -o \
             -name '*.safetensors' \
-        \) -print -quit | grep -q .; then
+        \) -printf '%s\t%p\n' 2>/dev/null | sort -rn | head -n1 | cut -f2)"
+    if [ -n "$DRAFT_FILE" ] && [ -f "$DRAFT_FILE" ]; then
+        DRAFT_ARG="$DRAFT_FILE"
+        info "Resolved draft dir $DFLASH_DRAFT → $DRAFT_ARG"
+    else
         warn "No DFlash draft GGUF/safetensors in draft dir $DFLASH_DRAFT — running without draft"
         DRAFT_ARG=""
     fi
@@ -191,22 +202,18 @@ elif [ -n "$DFLASH_DRAFT" ] && [ ! -f "$DFLASH_DRAFT" ]; then
     DRAFT_ARG=""
 fi
 
-[ "$GPU_COUNT" -gt 1 ] && warn "${GPU_COUNT} GPUs detected — multi-GPU sharding is not auto-enabled (see server.py --target-gpus)"
+[ "$GPU_COUNT" -gt 1 ] && warn "${GPU_COUNT} GPUs detected — native server layer sharding is not auto-enabled"
 
-# ── build + exec server.py ────────────────────────────────────────────────
-CMD=(uv run --directory "$DFLASH_DIR" python scripts/server.py
+# ── build + exec native server ────────────────────────────────────────────
+CMD=("$DFLASH_SERVER_BIN" "$DFLASH_TARGET"
      --host "$DFLASH_HOST"
      --port "$DFLASH_PORT"
-     --target "$DFLASH_TARGET"
-     --bin "$DFLASH_BIN"
-     --budget "$DFLASH_BUDGET"
      --max-ctx "$DFLASH_MAX_CTX"
-     --prefix-cache-slots "$DFLASH_PREFIX_CACHE_SLOTS"
-     --prefill-cache-slots "$DFLASH_PREFILL_CACHE_SLOTS")
+     --prefix-cache-slots "$DFLASH_PREFIX_CACHE_SLOTS")
 
 [ -n "$DRAFT_ARG" ]                && CMD+=(--draft "$DRAFT_ARG")
+[ -n "$DRAFT_ARG" ]                && CMD+=(--ddtree --ddtree-budget "$DFLASH_BUDGET")
 [ "$DFLASH_LAZY" = "1" ]           && CMD+=(--lazy-draft)
-[ "$DFLASH_VERBOSE" = "1" ]        && CMD+=(--verbose-daemon)
 [ -n "$DFLASH_CACHE_TYPE_K" ]      && CMD+=(--cache-type-k "$DFLASH_CACHE_TYPE_K")
 [ -n "$DFLASH_CACHE_TYPE_V" ]      && CMD+=(--cache-type-v "$DFLASH_CACHE_TYPE_V")
 

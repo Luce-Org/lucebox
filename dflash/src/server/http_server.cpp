@@ -1159,6 +1159,42 @@ void HttpServer::worker_loop() {
         std::vector<int32_t> phase2_tokens;
         std::string close_kind = "natural";
 
+        // Diagnostic: log all phase-2 gate inputs so we can correlate
+        // probe-vs-bench, cache-on-vs-off, pflash-on-vs-off behavior
+        // when phase-2 fires inconsistently. Strip after Level 1 ships.
+        {
+            std::vector<int32_t> tail_ids(
+                effective_prompt.size() >= 10
+                    ? effective_prompt.end() - 10
+                    : effective_prompt.begin(),
+                effective_prompt.end());
+            std::string tail_text = tokenizer_.decode(tail_ids);
+            // Replace control chars in tail so the log line stays single-line.
+            for (auto & ch : tail_text) {
+                if (ch == '\n') ch = '|';
+                else if (ch == '\r') ch = '|';
+            }
+            std::string phase1_decoded;
+            if (!phase1_tokens.empty()) {
+                phase1_decoded = tokenizer_.decode(phase1_tokens);
+            }
+            bool dbg_close_found =
+                phase1_decoded.find("</think>") != std::string::npos;
+            int dbg_ph2_gen_len =
+                std::max(0, req.max_output - (int)phase1_tokens.size());
+            std::fprintf(stderr,
+                "[phase2-gate] thinking_opt_in=%d started_in_thinking=%d "
+                "stream=%d client_disconnected=%d phase1_tokens=%zu "
+                "result_ok=%d req.max_output=%d phase1_cap=%d "
+                "ph2_gen_len_est=%d close_in_phase1=%d "
+                "effective_prompt_tail=%s\n",
+                (int)req.thinking_opt_in, (int)req.started_in_thinking,
+                (int)req.stream, (int)client_disconnected,
+                phase1_tokens.size(), (int)result.ok,
+                req.max_output, phase1_cap, dbg_ph2_gen_len,
+                (int)dbg_close_found, tail_text.c_str());
+        }
+
         if (req.thinking_opt_in &&
             req.started_in_thinking &&
             !req.stream &&
