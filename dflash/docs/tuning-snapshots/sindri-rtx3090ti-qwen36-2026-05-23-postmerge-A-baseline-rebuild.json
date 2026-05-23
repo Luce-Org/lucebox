@@ -1,0 +1,54 @@
+{
+  "schema": "sweep-2case-v1",
+  "captured_at": "2026-05-23T23:29:06+00:00",
+  "host": "sindri",
+  "binary_sha": "a1144dd",
+  "config_name": "A-baseline-rebuild",
+  "server_knobs": {
+    "cache_type_k": "q4_0",
+    "cache_type_v": "q4_0",
+    "max_ctx": "98304",
+    "think_max_tokens": "15488",
+    "ddtree": "ON"
+  },
+  "cases": {
+    "case1.GPQA_Diamond.recNu3MXkvWUzHZr9": {
+      "id": "recNu3MXkvWUzHZr9",
+      "source": "GPQA Diamond",
+      "given": "B",
+      "correct": "B",
+      "result": "PASS",
+      "graded_pass": true,
+      "strict_pass": true,
+      "format_pass": true,
+      "semantic_hint": true,
+      "wall_s": 1260.566,
+      "prompt_tokens": 227,
+      "completion_tokens": 15922,
+      "thinking_tokens": 15922,
+      "content_tokens": 0,
+      "close_kind": "natural",
+      "finish_reason": "stop",
+      "http_status": 200
+    },
+    "case2.SuperGPQA.001b51d76b4d422988f2c11f104a2c6c": {
+      "id": "001b51d76b4d422988f2c11f104a2c6c",
+      "source": "SuperGPQA",
+      "given": "C",
+      "correct": "C",
+      "result": "PASS",
+      "graded_pass": true,
+      "strict_pass": true,
+      "format_pass": true,
+      "semantic_hint": true,
+      "wall_s": 133.837,
+      "prompt_tokens": 163,
+      "completion_tokens": 1744,
+      "thinking_tokens": 1744,
+      "content_tokens": 0,
+      "close_kind": "natural",
+      "finish_reason": "stop",
+      "http_status": 200
+    }
+  }
+}
