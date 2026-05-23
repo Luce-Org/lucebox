@@ -2179,11 +2179,14 @@ class ClaudeCodeAdapter(_BaseAdapter):
         api_key = os.environ.get("API_KEY", "sk-lucebox")
         claude_bin = os.environ.get("CLAUDE_BIN", self.binary)
         claude_tools = os.environ.get("CLAUDE_TOOLS", "default")
-        client_base_url = base_url
+        # If a session-level proxy is already running (bandit-session sets PFLASH_SESSION_PROXY_URL),
+        # use it directly and skip spawning an additional proxy.
+        session_proxy_url = os.environ.get("PFLASH_SESSION_PROXY_URL", "")
+        client_base_url = session_proxy_url if session_proxy_url else base_url
         proxy_proc: subprocess.Popen | None = None
 
         try:
-            if session_id:
+            if session_id and not session_proxy_url:
                 proxy_proc, client_base_url = _start_session_inject_proxy(
                     session_id=session_id,
                     upstream=base_url,
@@ -2775,13 +2778,14 @@ _DEFAULT_PFLASH_DRAFTER = Path("/home/peppi/models/Qwen3-0.6B-BF16.gguf")
 BANDIT_SERVER_PROFILE = ServerProfile(
     name="bandit_pflash",
     args=(
-        "--max-ctx", "32768",
+        "--max-ctx", "49152",
         "--fa-window", "2048",
         "--cache-type-k", "tq3_0",
         "--cache-type-v", "tq3_0",
         "--prefill-compression", "auto",
         "--prefill-threshold", "4096",
-        "--prefill-keep-ratio", "0.10",
+        "--prefill-keep-ratio", "0.05",
+        "--prefill-skip-park",
     ),
     needs_prefill_drafter=True,
 )
@@ -2975,7 +2979,8 @@ def cmd_bandit_session(args: argparse.Namespace) -> int:
     dry_run: bool = getattr(args, "dry_run", False)
     n_turns: int = getattr(args, "turns", 5)
     client_name: str = getattr(args, "client", "claude_code")
-    sid: str = getattr(args, "session_id", None) or f"{client_name}-adaptive-{int(time.time())}"
+    # Stable session ID that spans all turns so the server's KV cache warms across turns.
+    sid: str = getattr(args, "session_id", None) or f"bandit-{client_name}-{int(time.time())}"
     prompts_dir = Path(getattr(args, "prompts_dir", None) or _BANDIT_SESSION_PROMPTS_DIR)
 
     if client_name not in _ADAPTER_REGISTRY:
@@ -3030,6 +3035,7 @@ def cmd_bandit_session(args: argparse.Namespace) -> int:
     proc = None
     log_path: Path | None = None
     turn_rows: list[dict[str, Any]] = []
+    session_proxy_proc: subprocess.Popen | None = None
 
     try:
         proc, log_path, server_args, _env = start_server(
@@ -3054,6 +3060,21 @@ def cmd_bandit_session(args: argparse.Namespace) -> int:
             if log_path:
                 print(tail(log_path, 2000), file=sys.stderr)
             return 1
+
+        # Start one session-inject proxy for the whole session so all turns share the
+        # same session_id. This lets the server's prefix cache warm across turns — turn 2+
+        # should show only delta-token prefill instead of the full context.
+        server_url = f"http://127.0.0.1:{port}"
+        session_proxy_proc, session_proxy_url = _start_session_inject_proxy(
+            session_id=sid, upstream=server_url
+        )
+        os.environ["PFLASH_SESSION_PROXY_URL"] = session_proxy_url
+        os.environ["BASE_URL"] = server_url  # adapters route through proxy via PFLASH_SESSION_PROXY_URL
+        print(
+            f"[bandit-session] session proxy pid={session_proxy_proc.pid} "
+            f"url={session_proxy_url} session_id={sid!r}",
+            flush=True,
+        )
 
         from harness.metrics_parser import parse_bandit_session_from_log
 
@@ -3131,6 +3152,11 @@ def cmd_bandit_session(args: argparse.Namespace) -> int:
             )
 
     finally:
+        if session_proxy_proc is not None:
+            stop_proc(session_proxy_proc)
+            close_server_log(session_proxy_proc)
+        # Clear session proxy URL so it doesn't leak to subsequent runs
+        os.environ.pop("PFLASH_SESSION_PROXY_URL", None)
         if proc is not None:
             stop_proc(proc)
             close_server_log(proc)
