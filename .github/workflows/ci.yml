@@ -24,8 +24,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      - name: Fetch submodules (PAT required for private org repos)
+        env:
+          SUBMODULE_PAT: ${{ secrets.SUBMODULE_PAT }}
+        run: |
+          if [ -n "${SUBMODULE_PAT}" ]; then
+            git config --global url."https://x-access-token:${SUBMODULE_PAT}@github.com/".insteadOf "https://github.com/"
+          fi
+          git submodule update --init --recursive --depth=1
 
       - uses: Jimver/cuda-toolkit@v0.2.35
         with:
