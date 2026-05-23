@@ -1356,7 +1356,19 @@ void HttpServer::worker_loop() {
             case ApiFormat::OPENAI_CHAT: {
                 json msg = {{"role", "assistant"}, {"content", emitter.accumulated_text()}};
                 if (!emitter.reasoning_text().empty()) {
-                    msg["reasoning_content"] = emitter.reasoning_text();
+                    // Multi-dialect reasoning emission — same text, three keys.
+                    // See docs/specs/thinking-budget.md "Response shape —
+                    // multi-dialect aliasing".
+                    //   reasoning_content : DeepSeek R1 / dflash primary
+                    //   reasoning         : OpenRouter / Anthropic-gateway flat
+                    //   reasoning_details : typed-block list; single block today,
+                    //                       room for phase-1/phase-2 splits later.
+                    const std::string & rt = emitter.reasoning_text();
+                    msg["reasoning_content"] = rt;
+                    msg["reasoning"]         = rt;
+                    msg["reasoning_details"] = json::array({
+                        {{"type", "reasoning.text"}, {"text", rt}}
+                    });
                 }
                 if (!emitter.tool_calls().empty()) {
                     json tcs = json::array();
@@ -1376,8 +1388,7 @@ void HttpServer::worker_loop() {
                 // envelope via `thinking:{type:enabled}`. close_kind reflects
                 // whether the model self-closed </think> ("natural") or the
                 // server force-closed it via phase-2 reprompt ("hard").
-                // See docs/specs/thinking-budget.md:43-58 for the contract
-                // and server.py:2271-2281 for the Python equivalent.
+                // See docs/specs/thinking-budget.md "v2 design".
                 if (req.thinking_opt_in) {
                     choice["finish_details"] = {
                         {"close_kind",      close_kind},
@@ -1386,6 +1397,9 @@ void HttpServer::worker_loop() {
                         {"total_tokens",    total_completion_tokens},
                     };
                 }
+                // usage.completion_tokens_details.reasoning_tokens — OpenAI
+                // o1/o3 standard location, also OR's normalized shape. Mirrors
+                // finish_details.thinking_tokens; kept in sync.
                 resp = {
                     {"id", req.response_id},
                     {"object", "chat.completion"},
@@ -1396,7 +1410,10 @@ void HttpServer::worker_loop() {
                     {"usage", {
                         {"prompt_tokens", (int)req.prompt_tokens.size()},
                         {"completion_tokens", total_completion_tokens},
-                        {"total_tokens", (int)req.prompt_tokens.size() + total_completion_tokens}
+                        {"total_tokens", (int)req.prompt_tokens.size() + total_completion_tokens},
+                        {"completion_tokens_details", {
+                            {"reasoning_tokens", (int)phase1_tokens.size()}
+                        }}
                     }}
                 };
                 break;

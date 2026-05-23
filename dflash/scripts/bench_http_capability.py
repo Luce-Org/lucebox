@@ -377,7 +377,20 @@ def run_case(
     choice = (choices[0] if choices else {}) or {}
     msg = choice.get("message") or {}
     output = msg.get("content") or ""
-    reasoning = msg.get("reasoning_content") or ""
+    # Multi-dialect reasoning extraction — see
+    # docs/specs/thinking-budget.md "Bench fallback chain".
+    #   reasoning_content : DeepSeek R1 / dflash primary
+    #   reasoning         : OpenRouter / Anthropic-gateway flat
+    #   reasoning_details : typed-block list (Anthropic / OR-structured)
+    reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    if not reasoning:
+        details = msg.get("reasoning_details") or []
+        if isinstance(details, list):
+            reasoning = "\n".join(
+                d.get("text", "")
+                for d in details
+                if isinstance(d, dict) and d.get("type") == "reasoning.text"
+            )
     got = find_answer_with_fallback(case, output, reasoning)
     expected = expected_answers(case)
     grade = grade_case(case, got, output, reasoning)
