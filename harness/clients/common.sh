@@ -12,7 +12,7 @@ TARGET="${TARGET:-$REPO_DIR/dflash/models/Qwen3.6-27B-Q4_K_M.gguf}"
 DRAFT="${DRAFT:-$REPO_DIR/dflash/models/draft/dflash-draft-3.6-q8_0.gguf}"
 DFLASH_BIN="${DFLASH_BIN:-$REPO_DIR/dflash/build/test_dflash}"
 MODEL_SERVER="${MODEL_SERVER:-lucebox}"
-LUCEBOX_SERVER_BACKEND="${LUCEBOX_SERVER_BACKEND:-python}"
+LUCEBOX_SERVER_BACKEND="${LUCEBOX_SERVER_BACKEND:-cpp}"
 DFLASH_SERVER_BIN="${DFLASH_SERVER_BIN:-$REPO_DIR/dflash/build/dflash_server}"
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/workspace/llama-cpp-server-build/bin/llama-server}"
 LLAMA_N_GPU_LAYERS="${LLAMA_N_GPU_LAYERS:-999}"
@@ -53,6 +53,15 @@ LOG_DIR="$RUN_DIR/$STAMP"
 SERVER_LOG="$LOG_DIR/server.log"
 
 mkdir -p "$LOG_DIR"
+
+preflight_require_bin() {
+  local bin="$1"
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    echo "PREFLIGHT ERROR: '${bin}' not found on PATH." >&2
+    echo "  Hint: run 'asdf reshim' or install ${bin} and ensure it is on PATH." >&2
+    exit 78
+  fi
+}
 
 start_lucebox_server() {
   if [[ "$MODEL_SERVER" == "llamacpp" ]]; then
