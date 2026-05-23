@@ -28,23 +28,23 @@ server.
 ```bash
 cd /workspace/lucebox-hub-harness
 
-harness/clients/run_codex.sh
+python3 -m harness.client_test_runner bandit --clients codex
 harness/clients/run_claude_code.sh
-harness/clients/run_opencode.sh
+python3 -m harness.client_test_runner bandit --clients opencode
 ```
 
 Common overrides:
 
 ```bash
-MAX_CTX=32768 BUDGET=22 VERIFY_MODE=ddtree harness/clients/run_codex.sh
-PROMPT_FILE=harness/clients/prompts/repo_inspection.txt harness/clients/run_hermes.sh
+MAX_CTX=32768 BUDGET=22 VERIFY_MODE=ddtree python3 -m harness.client_test_runner bandit --clients codex
+PROMPT_FILE=harness/clients/prompts/repo_inspection.txt python3 -m harness.client_test_runner bandit --clients hermes
 CLIENT=opencode harness/clients/run_backend_pair.sh
 ```
 
 Use the native C++ server instead of the Python server:
 
 ```bash
-LUCEBOX_SERVER_BACKEND=cpp harness/clients/run_codex.sh
+LUCEBOX_SERVER_BACKEND=cpp python3 -m harness.client_test_runner bandit --clients codex
 ```
 
 The native server binary defaults to `dflash/build/dflash_server`. Override the
@@ -58,7 +58,7 @@ DRAFT=dflash/models/draft/dflash-draft-3.6-q8_0.gguf \
 MODEL_ID=luce-dflash \
 MAX_CTX=32768 MAX_TOKENS=512 \
 BUDGET=22 VERIFY_MODE=ddtree FA_WINDOW=2048 \
-harness/clients/run_codex.sh
+python3 -m harness.client_test_runner bandit --clients codex
 ```
 
 To test an already-running native server:
