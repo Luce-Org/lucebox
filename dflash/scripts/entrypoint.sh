@@ -189,12 +189,17 @@ fi
 # users don't have to know whether they're driving the Python or C++ path.
 DRAFT_ARG="$DFLASH_DRAFT"
 if [ -d "$DFLASH_DRAFT" ]; then
-    DRAFT_FILE="$(find -L "$DFLASH_DRAFT" -maxdepth 4 -type f \( \
-            -name 'dflash-draft-*.gguf' -o \
-            -name '*.gguf' -o \
-            -name 'model.safetensors' -o \
-            -name '*.safetensors' \
-        \) -printf '%s\t%p\n' 2>/dev/null | sort -rn | head -n1 | cut -f2)"
+    # Priority-ordered: prefer the DFlash-quantized draft GGUF over a
+    # generic GGUF over a raw HuggingFace safetensors. Spec decode
+    # crashes (`verify_batch: embed failed`) when given the wrong format
+    # — `model.safetensors` is the unquantized HF weights, not a draft
+    # model. Size-based sort is wrong here because the safetensors file
+    # is bigger than the quantized GGUF but unusable as a draft.
+    DRAFT_FILE=""
+    for pattern in 'dflash-draft-*.gguf' '*.gguf' 'model.safetensors' '*.safetensors'; do
+        DRAFT_FILE="$(find -L "$DFLASH_DRAFT" -maxdepth 4 -type f -name "$pattern" -print -quit 2>/dev/null)"
+        [ -n "$DRAFT_FILE" ] && break
+    done
     if [ -n "$DRAFT_FILE" ] && [ -f "$DRAFT_FILE" ]; then
         DRAFT_ARG="$DRAFT_FILE"
         info "Resolved draft dir $DFLASH_DRAFT → $DRAFT_ARG"
