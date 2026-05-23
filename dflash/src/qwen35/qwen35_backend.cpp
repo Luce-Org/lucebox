@@ -501,15 +501,14 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
     // Decode (speculative)
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
-        // When a budget hook is set (thinking-enabled requests with
-        // hard-limit force-close), route through AR. Spec-decode
-        // integration of the BudgetHook is a follow-up — for now, take
-        // the perf hit for correctness. AR still works; we just lose
-        // spec-decode's tok/s for thinking turns.
-        bool budget_force_ar = (req.budget_hook.close_token_id >= 0);
-        if (budget_force_ar
-                ? !do_ar_decode(committed, req.n_gen, result.tokens, out_io, req.budget_hook)
-                : !do_spec_decode(committed, req.n_gen, result.tokens, out_io, req.hint_tokens)) {
+        // Pass the budget hook into spec-decode. When token count nears
+        // the budget edge, do_spec_decode breaks out and tails off via
+        // AR with the hook still active — force-close fires correctly
+        // without sacrificing spec-decode throughput for the bulk of
+        // generation. Most requests never hit the tail because the
+        // model closes </think> naturally well before the budget edge.
+        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
+                             req.hint_tokens, &req.budget_hook)) {
             result.error = "decode";
             return result;
         }
@@ -570,15 +569,14 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
     // Decode
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
-        // When a budget hook is set (thinking-enabled requests with
-        // hard-limit force-close), route through AR. Spec-decode
-        // integration of the BudgetHook is a follow-up — for now, take
-        // the perf hit for correctness. AR still works; we just lose
-        // spec-decode's tok/s for thinking turns.
-        bool budget_force_ar = (req.budget_hook.close_token_id >= 0);
-        if (budget_force_ar
-                ? !do_ar_decode(committed, req.n_gen, result.tokens, out_io, req.budget_hook)
-                : !do_spec_decode(committed, req.n_gen, result.tokens, out_io, req.hint_tokens)) {
+        // Pass the budget hook into spec-decode. When token count nears
+        // the budget edge, do_spec_decode breaks out and tails off via
+        // AR with the hook still active — force-close fires correctly
+        // without sacrificing spec-decode throughput for the bulk of
+        // generation. Most requests never hit the tail because the
+        // model closes </think> naturally well before the budget edge.
+        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
+                             req.hint_tokens, &req.budget_hook)) {
             result.error = "decode";
             return result;
         }
@@ -838,7 +836,8 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
 bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io,
-                                    const std::vector<int32_t> * hint_tokens) {
+                                    const std::vector<int32_t> * hint_tokens,
+                                    const BudgetHook * budget_hook) {
     const int hidden = w_.n_embd;
 
     // First token: use the argmax that do_prefill already sampled and stored.
@@ -860,8 +859,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     if (!can_spec) {
         // AR fallback consumes the final prefill position itself, then advances
-        // one token at a time.
-        bool ok = do_ar_decode(committed, n_gen, out_tokens, io);
+        // one token at a time. Pass the budget hook through so force-close
+        // still fires when spec-decode is unavailable.
+        bool ok = do_ar_decode(committed, n_gen, out_tokens, io,
+                                budget_hook ? *budget_hook : BudgetHook{});
         io.emit(-1);
         return ok;
     }
@@ -891,6 +892,30 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     while (n_generated < n_gen) {
         const int need_commit_budget = n_gen - n_generated;
+
+        // Budget tail-off: when remaining budget is within the spec-decode
+        // batch size of the force-close threshold, hand off to AR for the
+        // tail. AR handles the close-token override cleanly; spec-decode's
+        // verify-and-accept loop can't safely inject a token mid-batch
+        // without a KV-state rewrite. The hand-off uses cache_.last_tok as
+        // the AR seed (already up-to-date from the most recent commit).
+        if (budget_hook && budget_hook->close_token_id >= 0) {
+            int hard = budget_hook->hard_limit_remaining;
+            // Tail when remaining <= hard + one spec-decode batch worth of
+            // headroom. Ensures the force-close fires within the AR tail
+            // rather than after a final spec-decode batch overshoots.
+            if (need_commit_budget <= hard + q_len) {
+                std::fprintf(stderr,
+                    "[budget-hook] spec-decode tail-off at committed=%d/%d "
+                    "(remaining=%d, hard_limit=%d, batch=%d) — switching to AR\n",
+                    committed, n_gen, need_commit_budget, hard, q_len);
+                step_graph_destroy(draft_sg);
+                bool ok = do_ar_decode(committed, n_gen, out_tokens, io,
+                                        *budget_hook);
+                io.emit(-1);
+                return ok;
+            }
+        }
 
         // 1. Build noise input for draft
         noise_ids[0] = last_tok;
