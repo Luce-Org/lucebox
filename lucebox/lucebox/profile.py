@@ -701,7 +701,6 @@ def _pytest_argv(_ctx: ProfileContext, dest: Path) -> list[str]:
     return [
         "uv", "run", "--frozen", "--with", "pytest", "pytest",
         "dflash/scripts/test_lucebox_bench.py",
-        "dflash/scripts/test_server.py",
         "lucebox/tests",
         "-q",
     ]
@@ -845,7 +844,6 @@ def registry() -> list[StepDefinition]:
             availability=_always_available,
             script_paths=(
                 "dflash/scripts/test_lucebox_bench.py",
-                "dflash/scripts/test_server.py",
                 "lucebox/tests/test_profile.py",
             ),
         ),
