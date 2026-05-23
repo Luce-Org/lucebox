@@ -20,6 +20,18 @@
 variable "REGISTRY" { default = "" }
 variable "TAG"      { default = "" }
 
+# Fat-binary CUDA arch list. Defaults to all supported arches so the
+# released image runs on every consumer/datacenter GPU we target. Local
+# dev builds can narrow this to the host's compute capability to skip the
+# 5-6× CUDA template recompile cost:
+#
+#   DFLASH_CUDA_ARCHES=120 docker buildx bake cuda12-local --load
+#
+# (RTX 5090 / 5090 Laptop = 120, RTX 4090 = 89, RTX 3090 = 86, H100 = 90,
+# A100 = 80, RTX 2080 Ti = 75.) Use a semicolon-separated list to include
+# multiple arches.
+variable "DFLASH_CUDA_ARCHES" { default = "75;80;86;89;90;120" }
+
 # Image name prefix. With the default empty REGISTRY/TAG you get
 # `lucebox-hub:cuda12`.
 function "image_tag" {
@@ -48,7 +60,7 @@ target "_cuda12-base" {
     args = {
         CUDA_VERSION        = "12.8.1"
         UBUNTU_VERSION      = "22.04"
-        DFLASH_CUDA_ARCHES  = "75;80;86;89;90;120"
+        DFLASH_CUDA_ARCHES  = DFLASH_CUDA_ARCHES
     }
 }
 
