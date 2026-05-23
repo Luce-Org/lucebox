@@ -47,11 +47,22 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
     hybrid_mode_ = true;
     cfg_.draft_path = nullptr;  // policy: hybrid mode falls back to AR-only until hybrid FFN lands
     int total_cold = 0;
+    uint64_t hot_bytes = 0;
+    uint64_t cold_bytes = 0;
     for (const auto & layer : out.moe_hybrid->layers) {
         total_cold += (int)layer.cold_expert_ids.size();
+        const uint64_t per_expert_bytes = layer.fused_gate_up
+            ? (uint64_t)layer.gate_up_expert_bytes + (uint64_t)layer.down_expert_bytes
+            : (uint64_t)layer.gate_expert_bytes + (uint64_t)layer.up_expert_bytes + (uint64_t)layer.down_expert_bytes;
+        hot_bytes  += per_expert_bytes * (uint64_t)layer.hot_expert_ids.size();
+        cold_bytes += per_expert_bytes * (uint64_t)layer.cold_expert_ids.size();
     }
-    std::printf("[qwen35moe] hybrid storage ready: total_hot=%d total_cold=%d placement=%s (AR-only mode)\n",
-                out.moe_hybrid->placement.total_hot, total_cold, placement_path);
+    std::printf("[qwen35moe] hybrid storage ready: total_hot=%d (%.2f GiB VRAM) total_cold=%d (%.2f GiB RAM) placement=%s (AR-only mode)\n",
+                out.moe_hybrid->placement.total_hot,
+                hot_bytes / 1024.0 / 1024.0 / 1024.0,
+                total_cold,
+                cold_bytes / 1024.0 / 1024.0 / 1024.0,
+                placement_path);
     if (const char * out_path = std::getenv("DFLASH_QWEN35MOE_NEXT_PLACEMENT_OUT")) {
         placement_out_path_ = out_path;
     }
