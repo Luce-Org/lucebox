@@ -1977,30 +1977,130 @@ class _BaseAdapter:
             session_id_captured=True,
         )
 
+    def live_run(
+        self,
+        *,
+        session_id: str,
+        run_script: Path,
+        prompt: str,
+        env_overrides: dict[str, str] | None = None,
+        timeout: int = 420,
+    ) -> AdapterResult:
+        """Run client via bash run script, capture metrics from log output."""
+        env = os.environ.copy()
+        env["LUCEBOX_SERVER_BACKEND"] = "cpp"
+        env["PFLASH_SESSION_ID"] = session_id
+        env.setdefault("PROMPT", prompt)
+        if env_overrides:
+            env.update(env_overrides)
+        t0 = time.perf_counter()
+        try:
+            proc = subprocess.run(
+                ["bash", str(run_script)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            wall = time.perf_counter() - t0
+            rc = proc.returncode
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=True,
+                session_id=session_id,
+                session_id_captured=True,
+                wall_s=round(wall, 3),
+                exit_code=rc,
+            )
+        except subprocess.TimeoutExpired:
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=True,
+                session_id=session_id,
+                exit_code=124,
+                error="timeout",
+            )
+        except Exception as exc:
+            return AdapterResult(
+                client=self.client,
+                preflight_ok=True,
+                session_id=session_id,
+                exit_code=1,
+                error=repr(exc),
+            )
+
+
+_CLIENTS_DIR = Path(__file__).resolve().parent / "clients"
+
 
 class ClaudeCodeAdapter(_BaseAdapter):
     client = "claude_code"
     binary = "claude"
+
+    def live_run(self, *, session_id: str, prompt: str = "", **kwargs: Any) -> AdapterResult:
+        script = _CLIENTS_DIR / "run_claude_code.sh"
+        return super().live_run(
+            session_id=session_id,
+            run_script=script,
+            prompt=prompt or "Reply with exactly: lucebox-bandit-ok",
+            **kwargs,
+        )
 
 
 class HermesAdapter(_BaseAdapter):
     client = "hermes"
     binary = "hermes"
 
+    def live_run(self, *, session_id: str, prompt: str = "", **kwargs: Any) -> AdapterResult:
+        script = _CLIENTS_DIR / "run_hermes.sh"
+        return super().live_run(
+            session_id=session_id,
+            run_script=script,
+            prompt=prompt or "Reply with exactly: lucebox-bandit-ok",
+            **kwargs,
+        )
+
 
 class CodexAdapter(_BaseAdapter):
     client = "codex"
     binary = "codex"
+
+    def live_run(self, *, session_id: str, prompt: str = "", **kwargs: Any) -> AdapterResult:
+        script = _CLIENTS_DIR / "run_codex.sh"
+        return super().live_run(
+            session_id=session_id,
+            run_script=script,
+            prompt=prompt or "Reply with exactly: lucebox-bandit-ok",
+            **kwargs,
+        )
 
 
 class PiAdapter(_BaseAdapter):
     client = "pi"
     binary = "pi"
 
+    def live_run(self, *, session_id: str, prompt: str = "", **kwargs: Any) -> AdapterResult:
+        script = _CLIENTS_DIR / "run_pi.sh"
+        return super().live_run(
+            session_id=session_id,
+            run_script=script,
+            prompt=prompt or "Reply with exactly: lucebox-bandit-ok",
+            **kwargs,
+        )
+
 
 class OpenCodeAdapter(_BaseAdapter):
     client = "opencode"
     binary = "opencode"
+
+    def live_run(self, *, session_id: str, prompt: str = "", **kwargs: Any) -> AdapterResult:
+        script = _CLIENTS_DIR / "run_opencode.sh"
+        return super().live_run(
+            session_id=session_id,
+            run_script=script,
+            prompt=prompt or "Reply with exactly: lucebox-bandit-ok",
+            **kwargs,
+        )
 
 
 _ADAPTER_REGISTRY: dict[str, type[_BaseAdapter]] = {
@@ -2058,11 +2158,8 @@ def run_bandit(
                 if pre.error:
                     print(pre.error, file=_sys.stderr)
                 continue
-            # For now live mode delegates to adapter.dry_run (stub);
-            # real execution wired in next commits via run_<client>.sh
             sid = session_id or f"{name}-{condition}"
-            result = adapter.dry_run(session_id=sid)
-            result.exit_code = 0
+            result = adapter.live_run(session_id=sid)
             results.append(result)
 
     # Write CSV
