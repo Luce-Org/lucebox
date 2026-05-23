@@ -764,7 +764,7 @@ def registry() -> list[StepDefinition]:
                 "bench-ds4-eval.json",
                 "bench-ds4-eval-trace.txt",
                 min_pass_rate=0.0,
-                max_tokens=4096,
+                max_tokens=16000,
                 timeout=1800,
                 think=True,
             ),
