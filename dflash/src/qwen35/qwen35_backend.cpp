@@ -764,7 +764,17 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     // First token: consume the final prefill position.  Do not derive this
     // offset from committed/KV position: restore paths can prefill a delta at
     // nonzero KV offsets, and committed then no longer describes chunk size.
-    {
+    //
+    // Continuation mode: when out_tokens is non-empty, a previous decode
+    // path (e.g. spec-decode tail-off) already committed tokens and emitted
+    // them. Skip the first-token block — `committed` and `cache_.last_tok`
+    // are already pointing at the most recently committed token, and the
+    // main loop below uses out_tokens.back() as the embed input which IS
+    // that token. Without this skip we'd duplicate the last token in
+    // out_tokens, double-emit it, and advance committed past the actual
+    // KV state.
+    const int initial_emitted = out_tokens.empty() ? 1 : 0;
+    if (initial_emitted == 1) {
         int32_t first_tok;
         if (sampler_.needs_logit_processing()) {
             if (!prefill_last_logits_valid_) return false;
@@ -784,7 +794,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     }
 
     // AR decode loop for remaining tokens
-    for (int i = 1; i < n_gen; i++) {
+    for (int i = initial_emitted; i < n_gen; i++) {
         int32_t tok = out_tokens.back();
 
         if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;
@@ -897,8 +907,15 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // batch size of the force-close threshold, hand off to AR for the
         // tail. AR handles the close-token override cleanly; spec-decode's
         // verify-and-accept loop can't safely inject a token mid-batch
-        // without a KV-state rewrite. The hand-off uses cache_.last_tok as
-        // the AR seed (already up-to-date from the most recent commit).
+        // without a KV-state rewrite.
+        //
+        // IMPORTANT: cache_.last_tok is set during do_prefill (line 701)
+        // and NEVER updated by the spec-decode commit loop — local
+        // `last_tok` here is the authoritative most-recently-committed
+        // token. Sync it into cache_.last_tok before handing off so AR's
+        // `first_tok = cache_.last_tok` seed is correct. Without this
+        // sync, AR would re-seed from the prefill's last argmax (stale
+        // by `n_generated` positions) and produce garbage continuation.
         if (budget_hook && budget_hook->close_token_id >= 0) {
             int hard = budget_hook->hard_limit_remaining;
             // Tail when remaining <= hard + one spec-decode batch worth of
@@ -910,8 +927,18 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     "(remaining=%d, hard_limit=%d, batch=%d) — switching to AR\n",
                     committed, n_gen, need_commit_budget, hard, q_len);
                 step_graph_destroy(draft_sg);
-                bool ok = do_ar_decode(committed, n_gen, out_tokens, io,
-                                        *budget_hook);
+                cache_.last_tok = last_tok;  // sync spec-decode → AR seed
+                // Build a fresh hook keyed off this call's local n_gen
+                // (the remaining decode budget) so force-close fires once
+                // remaining <= hard_limit relative to AR's loop counter,
+                // not relative to the global decode budget. Without this
+                // remap force-close would either fire on every iter
+                // (negative remaining_for_hook) or never (positive but
+                // misscaled).
+                BudgetHook tail_hook = *budget_hook;
+                int ar_n_gen = need_commit_budget;
+                bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
+                                        tail_hook);
                 io.emit(-1);
                 return ok;
             }
