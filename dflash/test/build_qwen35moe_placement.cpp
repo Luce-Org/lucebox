@@ -66,7 +66,7 @@ int main(int argc, char ** argv) {
 
     std::string err;
     Qwen35MoeRoutingStats stats;
-    if (!Qwen35MoeRoutingStats::load_json(stats_path, stats, &err)) {
+    if (!Qwen35MoeRoutingStats::load_csv(stats_path, stats, &err)) {
         std::fprintf(stderr, "load stats: %s\n", err.c_str());
         return 1;
     }

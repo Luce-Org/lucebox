@@ -59,7 +59,7 @@ int main(int argc, char ** argv) {
 
     const int layer_idx = 0;
     const TargetLayer & L = w.layers[(size_t)layer_idx];
-    const auto & storage = hybrid.layers[(size_t)layer_idx];
+    auto & storage = hybrid.layers[(size_t)layer_idx];
 
     auto dump = [](const char * name, ggml_tensor * t) {
         if (!t) {

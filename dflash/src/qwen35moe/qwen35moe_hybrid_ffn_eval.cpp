@@ -17,6 +17,193 @@ static uint64_t elapsed_us(HybridClock::time_point start, HybridClock::time_poin
     return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 }
 
+// Build a cached FFN graph for the hot+shared path with a fixed n_hot.
+static bool build_cached_hot_graph(
+    CachedFfnGraph & out,
+    ggml_backend_t backend,
+    ggml_tensor * gate_tensor,
+    ggml_tensor * up_tensor,
+    ggml_tensor * down_tensor,
+    ggml_tensor * gate_up_tensor,
+    float gate_scale,
+    float up_scale,
+    float down_scale,
+    float gate_up_scale,
+    const TargetLayer & L,
+    int n_embd,
+    int n_ff_exp,
+    int n_hot) {
+
+    out.free();
+    out.n_hot = n_hot;
+
+    ggml_init_params ip{};
+    ip.mem_size = 48 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc = true;
+    out.ctx = ggml_init(ip);
+    if (!out.ctx) return false;
+
+    out.inp = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, n_embd, 1);
+    ggml_set_input(out.inp);
+
+    ggml_tensor * routed = nullptr;
+    if (n_hot > 0) {
+        out.ids = ggml_new_tensor_2d(out.ctx, GGML_TYPE_I32, n_hot, 1);
+        ggml_set_input(out.ids);
+        out.weights = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, n_hot, 1);
+        ggml_set_input(out.weights);
+
+        ggml_tensor * cur_3d = ggml_reshape_3d(out.ctx, out.inp, n_embd, 1, 1);
+        ggml_tensor * gu = nullptr;
+        if (gate_up_tensor) {
+            ggml_tensor * gate_up_e = apply_scale2(out.ctx,
+                ggml_mul_mat_id(out.ctx, gate_up_tensor, cur_3d, out.ids), gate_up_scale);
+            ggml_tensor * gate_e = ggml_view_3d(out.ctx, gate_up_e,
+                n_ff_exp, gate_up_e->ne[1], gate_up_e->ne[2],
+                gate_up_e->nb[1], gate_up_e->nb[2], 0);
+            ggml_tensor * up_e = ggml_view_3d(out.ctx, gate_up_e,
+                n_ff_exp, gate_up_e->ne[1], gate_up_e->ne[2],
+                gate_up_e->nb[1], gate_up_e->nb[2],
+                (size_t)n_ff_exp * ggml_element_size(gate_up_e));
+            gate_e = ggml_cont(out.ctx, gate_e);
+            up_e = ggml_cont(out.ctx, up_e);
+            gu = ggml_swiglu_split(out.ctx, gate_e, up_e);
+        } else {
+            ggml_tensor * gate_e = apply_scale2(out.ctx,
+                ggml_mul_mat_id(out.ctx, gate_tensor, cur_3d, out.ids), gate_scale);
+            ggml_tensor * up_e = apply_scale2(out.ctx,
+                ggml_mul_mat_id(out.ctx, up_tensor, cur_3d, out.ids), up_scale);
+            gu = ggml_swiglu_split(out.ctx, gate_e, up_e);
+        }
+
+        ggml_tensor * experts = apply_scale2(out.ctx,
+            ggml_mul_mat_id(out.ctx, down_tensor, gu, out.ids), down_scale);
+        ggml_tensor * w_view = ggml_reshape_3d(out.ctx, out.weights, 1, n_hot, 1);
+        experts = ggml_mul(out.ctx, experts, w_view);
+
+        for (int i = 0; i < n_hot; ++i) {
+            ggml_tensor * slice = ggml_view_2d(out.ctx, experts, n_embd, 1, experts->nb[2],
+                                               (size_t)i * experts->nb[1]);
+            routed = (i == 0) ? slice : ggml_add(out.ctx, routed, slice);
+        }
+    }
+
+    ggml_tensor * shared = nullptr;
+    const bool has_shared = (L.ffn_up_shexp && L.ffn_gate_shexp && L.ffn_down_shexp);
+    if (has_shared) {
+        ggml_tensor * sh_gate = apply_scale2(out.ctx, ggml_mul_mat(out.ctx, L.ffn_gate_shexp, out.inp), L.ffn_gate_shexp_s);
+        ggml_tensor * sh_up   = apply_scale2(out.ctx, ggml_mul_mat(out.ctx, L.ffn_up_shexp,   out.inp), L.ffn_up_shexp_s);
+        ggml_tensor * sh_gu   = ggml_swiglu_split(out.ctx, sh_gate, sh_up);
+        shared = apply_scale2(out.ctx, ggml_mul_mat(out.ctx, L.ffn_down_shexp, sh_gu), L.ffn_down_shexp_s);
+        if (L.ffn_gate_inp_shexp) {
+            ggml_tensor * shared_gate = apply_scale2(out.ctx,
+                ggml_mul_mat(out.ctx, L.ffn_gate_inp_shexp, out.inp), L.ffn_gate_inp_shexp_s);
+            shared_gate = ggml_sigmoid(out.ctx, shared_gate);
+            shared = ggml_mul(out.ctx, shared, shared_gate);
+        }
+    }
+
+    if (routed && shared) {
+        out.output = ggml_add(out.ctx, routed, shared);
+    } else if (routed) {
+        out.output = routed;
+    } else {
+        out.output = shared;
+    }
+    if (!out.output) { out.free(); return false; }
+
+    out.gf = ggml_new_graph_custom(out.ctx, 2048, false);
+    ggml_set_output(out.output);
+    ggml_build_forward_expand(out.gf, out.output);
+    out.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(out.alloc, out.gf)) {
+        out.free();
+        return false;
+    }
+    return true;
+}
+
+// Build a cached FFN graph for the cold (CPU) routed subset.
+static bool build_cached_cold_graph(
+    CachedFfnGraph & out,
+    ggml_backend_t cpu_backend,
+    ggml_tensor * gate_tensor,
+    ggml_tensor * up_tensor,
+    ggml_tensor * down_tensor,
+    ggml_tensor * gate_up_tensor,
+    float gate_scale,
+    float up_scale,
+    float down_scale,
+    float gate_up_scale,
+    int n_embd,
+    int n_ff_exp,
+    int n_cold) {
+
+    out.free();
+    out.n_hot = n_cold;  // reuse field for "n experts in this graph"
+
+    ggml_init_params ip{};
+    ip.mem_size = 32 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc = true;
+    out.ctx = ggml_init(ip);
+    if (!out.ctx) return false;
+
+    out.inp = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, n_embd, 1);
+    ggml_set_input(out.inp);
+    out.ids = ggml_new_tensor_2d(out.ctx, GGML_TYPE_I32, n_cold, 1);
+    ggml_set_input(out.ids);
+    out.weights = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, n_cold, 1);
+    ggml_set_input(out.weights);
+
+    ggml_tensor * cur_3d = ggml_reshape_3d(out.ctx, out.inp, n_embd, 1, 1);
+    ggml_tensor * gu = nullptr;
+    if (gate_up_tensor) {
+        ggml_tensor * gate_up_e = apply_scale2(out.ctx,
+            ggml_mul_mat_id(out.ctx, gate_up_tensor, cur_3d, out.ids), gate_up_scale);
+        ggml_tensor * gate_e = ggml_view_3d(out.ctx, gate_up_e,
+            n_ff_exp, gate_up_e->ne[1], gate_up_e->ne[2],
+            gate_up_e->nb[1], gate_up_e->nb[2], 0);
+        ggml_tensor * up_e = ggml_view_3d(out.ctx, gate_up_e,
+            n_ff_exp, gate_up_e->ne[1], gate_up_e->ne[2],
+            gate_up_e->nb[1], gate_up_e->nb[2],
+            (size_t)n_ff_exp * ggml_element_size(gate_up_e));
+        gate_e = ggml_cont(out.ctx, gate_e);
+        up_e = ggml_cont(out.ctx, up_e);
+        gu = ggml_swiglu_split(out.ctx, gate_e, up_e);
+    } else {
+        ggml_tensor * gate_e = apply_scale2(out.ctx,
+            ggml_mul_mat_id(out.ctx, gate_tensor, cur_3d, out.ids), gate_scale);
+        ggml_tensor * up_e = apply_scale2(out.ctx,
+            ggml_mul_mat_id(out.ctx, up_tensor, cur_3d, out.ids), up_scale);
+        gu = ggml_swiglu_split(out.ctx, gate_e, up_e);
+    }
+
+    ggml_tensor * experts = apply_scale2(out.ctx,
+        ggml_mul_mat_id(out.ctx, down_tensor, gu, out.ids), down_scale);
+    ggml_tensor * w_view = ggml_reshape_3d(out.ctx, out.weights, 1, n_cold, 1);
+    experts = ggml_mul(out.ctx, experts, w_view);
+
+    out.output = nullptr;
+    for (int i = 0; i < n_cold; ++i) {
+        ggml_tensor * slice = ggml_view_2d(out.ctx, experts, n_embd, 1, experts->nb[2],
+                                           (size_t)i * experts->nb[1]);
+        out.output = (i == 0) ? slice : ggml_add(out.ctx, out.output, slice);
+    }
+    if (!out.output) { out.free(); return false; }
+
+    out.gf = ggml_new_graph_custom(out.ctx, 1024, false);
+    ggml_set_output(out.output);
+    ggml_build_forward_expand(out.gf, out.output);
+    out.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
+    if (!ggml_gallocr_alloc_graph(out.alloc, out.gf)) {
+        out.free();
+        return false;
+    }
+    return true;
+}
+
 static bool run_routed_subset(ggml_backend_t backend,
                               ggml_tensor * gate_tensor,
                               ggml_tensor * up_tensor,
@@ -369,7 +556,7 @@ bool eval_qwen35moe_hybrid_ffn_single(
     ggml_backend_t                      gpu_backend,
     const TargetWeights &               w,
     const TargetLayer &                 L,
-    const Qwen35MoeHybridLayerStorage & storage,
+    Qwen35MoeHybridLayerStorage &       storage,
     ggml_backend_t                      cpu_backend,
     const float *                       cur_host,
     const int32_t *                     selected_ids,
@@ -393,7 +580,7 @@ bool eval_qwen35moe_hybrid_ffn_single(
         }
         const int32_t hot_local = storage.hot_local_by_global[(size_t)gid];
         if (hot_local >= 0) {
-            hot_ids.push_back(hot_local);  // use LOCAL id for hot tensor indexing
+            hot_ids.push_back(hot_local);
             hot_weights.push_back(selected_weights[i]);
             continue;
         }
@@ -412,20 +599,38 @@ bool eval_qwen35moe_hybrid_ffn_single(
 
     std::vector<float> hot_and_shared, cold;
 
-    // Launch cold on CPU first — it runs concurrently via CPU backend threads
-    // while we build and compute the GPU graph.
+    // ── Cold path: use cached graph if n_cold matches ──
     const auto cold_t0 = HybridClock::now();
     if (!cold_ids.empty()) {
-        if (!run_routed_subset(cpu_backend,
-                               storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
-                               L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
-                               w.n_embd, w.n_ff_exp,
-                               cur_host,
-                               cold_ids.data(),
-                               cold_weights.data(),
-                               (int)cold_ids.size(),
-                               cold, err)) {
-            return false;
+        const int n_cold = (int)cold_ids.size();
+        // Lazily build cached cold graph on first use with this n_cold
+        if (!storage.cold_graph.valid() || storage.cold_graph.n_hot != n_cold) {
+            build_cached_cold_graph(storage.cold_graph, cpu_backend,
+                                    storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
+                                    L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
+                                    w.n_embd, w.n_ff_exp, n_cold);
+        }
+        if (storage.cold_graph.valid() && storage.cold_graph.n_hot == n_cold) {
+            // Use cached graph
+            ggml_backend_tensor_set(storage.cold_graph.inp, cur_host, 0, sizeof(float) * (size_t)w.n_embd);
+            ggml_backend_tensor_set(storage.cold_graph.ids, cold_ids.data(), 0, sizeof(int32_t) * (size_t)n_cold);
+            ggml_backend_tensor_set(storage.cold_graph.weights, cold_weights.data(), 0, sizeof(float) * (size_t)n_cold);
+            auto st = ggml_backend_graph_compute(cpu_backend, storage.cold_graph.gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                if (err) *err = "cached cold graph compute failed";
+                return false;
+            }
+            cold.resize((size_t)w.n_embd);
+            ggml_backend_tensor_get(storage.cold_graph.output, cold.data(), 0, sizeof(float) * (size_t)w.n_embd);
+        } else {
+            // Fallback to dynamic
+            if (!run_routed_subset(cpu_backend,
+                                   storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
+                                   L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
+                                   w.n_embd, w.n_ff_exp,
+                                   cur_host, cold_ids.data(), cold_weights.data(), n_cold, cold, err)) {
+                return false;
+            }
         }
     } else {
         cold.assign((size_t)w.n_embd, 0.0f);
@@ -435,24 +640,56 @@ bool eval_qwen35moe_hybrid_ffn_single(
         telemetry->cold_us = cold_ids.empty() ? 0 : elapsed_us(cold_t0, cold_t1);
     }
 
-    // Fused hot routed + shared FFN in a single GPU graph compute
-    // Uses hot-only tensors with local expert IDs
+    // ── Hot + Shared path: use cached graph if n_hot matches ──
     const auto hot_t0 = HybridClock::now();
-    if (!run_hot_and_shared_ffn_gpu(gpu_backend,
-                                    storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
-                                    L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
-                                    L, w.n_embd, w.n_ff_exp,
-                                    cur_host,
-                                    hot_ids.empty() ? nullptr : hot_ids.data(),
-                                    hot_weights.empty() ? nullptr : hot_weights.data(),
-                                    (int)hot_ids.size(),
-                                    hot_and_shared, err)) {
-        return false;
+    const int n_hot = (int)hot_ids.size();
+    const bool has_hot = (n_hot > 0);
+    const bool has_shared = (L.ffn_up_shexp && L.ffn_gate_shexp && L.ffn_down_shexp);
+
+    if (!has_hot && !has_shared) {
+        hot_and_shared.assign((size_t)w.n_embd, 0.0f);
+    } else {
+        // Lazily build cached hot graph on first use
+        if (!storage.hot_graph.valid() || storage.hot_graph.n_hot != n_hot) {
+            build_cached_hot_graph(storage.hot_graph, gpu_backend,
+                                   storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
+                                   L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
+                                   L, w.n_embd, w.n_ff_exp, n_hot);
+        }
+        if (storage.hot_graph.valid() && storage.hot_graph.n_hot == n_hot) {
+            // Use cached graph
+            ggml_backend_tensor_set(storage.hot_graph.inp, cur_host, 0, sizeof(float) * (size_t)w.n_embd);
+            if (storage.hot_graph.ids && has_hot) {
+                ggml_backend_tensor_set(storage.hot_graph.ids, hot_ids.data(), 0, sizeof(int32_t) * (size_t)n_hot);
+            }
+            if (storage.hot_graph.weights && has_hot) {
+                ggml_backend_tensor_set(storage.hot_graph.weights, hot_weights.data(), 0, sizeof(float) * (size_t)n_hot);
+            }
+            auto st = ggml_backend_graph_compute(gpu_backend, storage.hot_graph.gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                if (err) *err = "cached hot graph compute failed";
+                return false;
+            }
+            hot_and_shared.resize((size_t)w.n_embd);
+            ggml_backend_tensor_get(storage.hot_graph.output, hot_and_shared.data(), 0, sizeof(float) * (size_t)w.n_embd);
+        } else {
+            // Fallback to dynamic
+            if (!run_hot_and_shared_ffn_gpu(gpu_backend,
+                                            storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
+                                            L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
+                                            L, w.n_embd, w.n_ff_exp,
+                                            cur_host,
+                                            hot_ids.empty() ? nullptr : hot_ids.data(),
+                                            hot_weights.empty() ? nullptr : hot_weights.data(),
+                                            n_hot, hot_and_shared, err)) {
+                return false;
+            }
+        }
     }
     const auto hot_t1 = HybridClock::now();
     if (telemetry) {
         telemetry->hot_us = elapsed_us(hot_t0, hot_t1);
-        telemetry->shared_us = 0;  // included in hot_us (fused)
+        telemetry->shared_us = 0;
     }
 
     const auto combine_t0 = HybridClock::now();

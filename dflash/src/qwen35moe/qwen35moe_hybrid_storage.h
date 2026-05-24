@@ -4,12 +4,30 @@
 
 #include "qwen35moe_expert_placement.h"
 
+#include "ggml-alloc.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
 
 namespace dflash::common {
+
+// Cached FFN graph for a fixed number of selected experts.
+// Built once, reused every token to avoid per-call graph rebuild overhead.
+struct CachedFfnGraph {
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t alloc = nullptr;
+    ggml_tensor * inp = nullptr;        // [n_embd, 1] F32 input
+    ggml_tensor * ids = nullptr;        // [n_hot, 1] I32 expert IDs
+    ggml_tensor * weights = nullptr;    // [n_hot, 1] F32 expert weights
+    ggml_tensor * output = nullptr;     // [n_embd, 1] F32 output (routed + shared)
+    int n_hot = 0;                      // number of hot experts this graph supports
+
+    bool valid() const { return ctx && gf && alloc && output; }
+    void free();
+};
 
 struct Qwen35MoeHybridLayerStorage {
     ggml_context * hot_ctx = nullptr;
@@ -41,6 +59,12 @@ struct Qwen35MoeHybridLayerStorage {
     std::vector<uint8_t> up_cold_bytes;
     std::vector<uint8_t> down_cold_bytes;
     std::vector<uint8_t> gate_up_cold_bytes;
+
+    // Cached FFN graphs: hot_graph for all-hot case (n_expert_used hot experts),
+    // cold_graph for all-cold case (n_expert_used cold experts).
+    // These cover the common case; mixed hot/cold falls back to dynamic build.
+    CachedFfnGraph hot_graph;   // GPU: fused routed(n_expert_used hot) + shared
+    CachedFfnGraph cold_graph;  // CPU: routed(n_expert_used cold)
 };
 
 struct Qwen35MoeHybridStorage {

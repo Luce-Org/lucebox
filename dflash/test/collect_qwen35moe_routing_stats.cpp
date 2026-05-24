@@ -175,8 +175,8 @@ int main(int argc, char ** argv) {
     }
 
     std::string err;
-    if (!stats.save_json(out_path, &err)) {
-        std::fprintf(stderr, "save_json failed: %s\n", err.c_str());
+    if (!stats.save_csv(out_path, &err)) {
+        std::fprintf(stderr, "save_csv failed: %s\n", err.c_str());
         return 1;
     }
 

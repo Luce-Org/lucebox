@@ -37,7 +37,7 @@ bool eval_qwen35moe_hybrid_ffn_single(
     ggml_backend_t                      gpu_backend,
     const TargetWeights &               w,
     const TargetLayer &                 L,
-    const Qwen35MoeHybridLayerStorage & storage,
+    Qwen35MoeHybridLayerStorage &       storage,
     ggml_backend_t                      cpu_backend,
     const float *                       cur_host,
     const int32_t *                     selected_ids,

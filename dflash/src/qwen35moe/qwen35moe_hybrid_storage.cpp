@@ -7,6 +7,17 @@
 
 namespace dflash::common {
 
+void CachedFfnGraph::free() {
+    if (alloc) { ggml_gallocr_free(alloc); alloc = nullptr; }
+    if (ctx) { ggml_free(ctx); ctx = nullptr; }
+    gf = nullptr;
+    inp = nullptr;
+    ids = nullptr;
+    weights = nullptr;
+    output = nullptr;
+    n_hot = 0;
+}
+
 namespace {
 
 static bool read_expert_slices(ggml_backend_t backend,
@@ -101,6 +112,8 @@ Qwen35MoeHybridStorage & Qwen35MoeHybridStorage::operator=(Qwen35MoeHybridStorag
 
 Qwen35MoeHybridStorage::~Qwen35MoeHybridStorage() {
     for (auto & layer : layers) {
+        layer.hot_graph.free();
+        layer.cold_graph.free();
         if (layer.hot_buf) {
             ggml_backend_buffer_free(layer.hot_buf);
             layer.hot_buf = nullptr;

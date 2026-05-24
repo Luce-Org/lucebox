@@ -49,12 +49,12 @@ int main() {
     expect(hot0.size() == 2, "hot size");
     expect(hot0[0] == 2, "hot leader");
 
-    const auto tmp = std::filesystem::temp_directory_path() / "qwen35moe-routing-stats-test.json";
+    const auto tmp = std::filesystem::temp_directory_path() / "qwen35moe-routing-stats-test.csv";
     std::string err;
-    expect(stats.save_json(tmp.string(), &err), err.c_str());
+    expect(stats.save_csv(tmp.string(), &err), err.c_str());
 
     Qwen35MoeRoutingStats loaded;
-    expect(Qwen35MoeRoutingStats::load_json(tmp.string(), loaded, &err), err.c_str());
+    expect(Qwen35MoeRoutingStats::load_csv(tmp.string(), loaded, &err), err.c_str());
     expect(loaded.matches(w), "loaded matches weights");
     expect(loaded.count(0, 2) == 2, "loaded count");
     expect(loaded.layer_totals[1] == 2, "loaded total");

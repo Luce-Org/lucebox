@@ -356,7 +356,7 @@ bool Qwen35MoeBackend::run_ar_decode_path(int committed, int n_gen,
             decode_prefn_us += elapsed_us(prefn_t0, prefn_t1);
 
             // Hybrid FFN: hot experts on GPU, cold on CPU
-            const auto & storage = target_weights().moe_hybrid->layers[(size_t)il];
+            auto & storage = target_weights().moe_hybrid->layers[(size_t)il];
             const auto & L = target_weights().layers[(size_t)il];
             if (!eval_qwen35moe_hybrid_ffn_single(
                     target_backend(), target_weights(), L, storage, cpu_be,
@@ -474,10 +474,12 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
     ggml_backend_t cpu_be = target_weights().moe_hybrid->cpu_backend;
 
     StepGraph layer_sg;
+    uint64_t build_us_total = 0, compute_us_total = 0, readback_us_total = 0, ffn_us_total = 0;
 
     // Helper: process one token through all layers (hybrid: pre-FFN on GPU, FFN split)
     auto process_one_token = [&](int kv_pos) -> bool {
         for (int il = 0; il < target_weights().n_layer; ++il) {
+            const auto t0 = HybridClock::now();
             if (!build_layer_prefn_step(layer_sg, target_weights(), target_cache(), target_backend(),
                                         il, kv_pos, /*n_tokens=*/1,
                                         /*with_mask=*/false, /*fa_window=*/0, cfg_.kq_stride_pad)) {
@@ -488,8 +490,13 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                 int32_t pos4[4] = {kv_pos, kv_pos, kv_pos, 0};
                 ggml_backend_tensor_set(layer_sg.positions, pos4, 0, sizeof(pos4));
             }
+            const auto t1 = HybridClock::now();
+            build_us_total += elapsed_us(t0, t1);
+
             auto st = ggml_backend_graph_compute(target_backend(), layer_sg.gf);
             if (st != GGML_STATUS_SUCCESS) return false;
+            const auto t2 = HybridClock::now();
+            compute_us_total += elapsed_us(t1, t2);
 
             ggml_backend_tensor_get(layer_sg.ffn_residual, residual_buf.data(), 0, sizeof(float) * (size_t)hidden);
             ggml_backend_tensor_get(layer_sg.ffn_post, post_buf.data(), 0, sizeof(float) * (size_t)hidden);
@@ -501,8 +508,10 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                 ggml_backend_tensor_get(layer_sg.moe_weights, weights_buf.data(), 0,
                                         sizeof(float) * weights_buf.size());
             }
+            const auto t3 = HybridClock::now();
+            readback_us_total += elapsed_us(t2, t3);
 
-            const auto & storage = target_weights().moe_hybrid->layers[(size_t)il];
+            auto & storage = target_weights().moe_hybrid->layers[(size_t)il];
             const auto & L = target_weights().layers[(size_t)il];
             if (!eval_qwen35moe_hybrid_ffn_single(
                     target_backend(), target_weights(), L, storage, cpu_be,
@@ -510,6 +519,8 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                     (int)selected.size(), ffn_out, nullptr, nullptr)) {
                 return false;
             }
+            const auto t4 = HybridClock::now();
+            ffn_us_total += elapsed_us(t3, t4);
 
             for (int i = 0; i < hidden; ++i) {
                 act_cur[(size_t)i] = ffn_out[(size_t)i] + residual_buf[(size_t)i];
@@ -644,6 +655,11 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
     }
 
     step_graph_destroy(layer_sg);
+    if (hybrid_telemetry_) {
+        std::printf("[qwen35moe] perf breakdown: build=%.1fms compute=%.1fms readback=%.1fms ffn=%.1fms\n",
+                    build_us_total / 1000.0, compute_us_total / 1000.0,
+                    readback_us_total / 1000.0, ffn_us_total / 1000.0);
+    }
     result.ok = true;
     if (result.ok) maybe_post_request_swap();
     return result;
