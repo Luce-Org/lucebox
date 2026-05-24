@@ -1768,6 +1768,99 @@ static void test_props_budget_envelope_shape() {
     TEST_ASSERT(body["server"]["props_schema"].get<int>() == 2);
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// usage.timings — per-request prefill / decode wall-clock breakdown
+// surfaced under usage.timings (spec §6.3). Tests cover all three
+// response shapes plus the zero-decode_s div-by-zero guard.
+// ═══════════════════════════════════════════════════════════════════════
+
+static void test_usage_timings_openai_chat_streaming() {
+    // OpenAI Chat streaming: the terminal usage chunk (just before
+    // data: [DONE]) carries `timings.{prefill_ms, decode_ms,
+    // decode_tokens_per_sec}` when timings are passed to emit_finish.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    em.emit_start();
+    em.emit_token("Hello world");
+
+    GenTimings t{0.2345, 2.4567};  // 234.5 ms / 2456.7 ms
+    auto finish = em.emit_finish(/*completion_tokens*/ 100, &t);
+    std::string finish_str = concat(finish);
+
+    TEST_ASSERT(finish_str.find("\"timings\"") != std::string::npos);
+    TEST_ASSERT(finish_str.find("\"prefill_ms\":234.5") != std::string::npos);
+    TEST_ASSERT(finish_str.find("\"decode_ms\":2456.7") != std::string::npos);
+    // 100 / 2.4567 = 40.7048... → rounds to 40.7
+    TEST_ASSERT(finish_str.find("\"decode_tokens_per_sec\":40.7") != std::string::npos);
+    TEST_ASSERT(finish_str.find("[DONE]") != std::string::npos);
+}
+
+static void test_usage_timings_anthropic_streaming() {
+    // Anthropic streaming: message_delta.usage gains a `timings`
+    // sibling alongside `output_tokens`.
+    auto em = make_emitter(ApiFormat::ANTHROPIC, false);
+    em.emit_start();
+    em.emit_token("ok");
+    GenTimings t{0.05, 0.5};  // 50.0 ms / 500.0 ms
+    auto finish = em.emit_finish(/*completion_tokens*/ 10, &t);
+    std::string finish_str = concat(finish);
+
+    TEST_ASSERT(finish_str.find("\"timings\"") != std::string::npos);
+    TEST_ASSERT(finish_str.find("\"prefill_ms\":50.0") != std::string::npos);
+    TEST_ASSERT(finish_str.find("\"decode_ms\":500.0") != std::string::npos);
+    // 10 / 0.5 = 20.0
+    TEST_ASSERT(finish_str.find("\"decode_tokens_per_sec\":20.0") != std::string::npos);
+}
+
+static void test_usage_timings_responses_streaming() {
+    // Responses streaming: response.completed.usage gains `timings`.
+    auto em = make_emitter(ApiFormat::RESPONSES, false);
+    em.emit_start();
+    em.emit_token("done");
+    GenTimings t{0.1, 1.0};
+    auto finish = em.emit_finish(/*completion_tokens*/ 25, &t);
+    std::string finish_str = concat(finish);
+
+    TEST_ASSERT(finish_str.find("\"timings\"") != std::string::npos);
+    TEST_ASSERT(finish_str.find("\"prefill_ms\":100.0") != std::string::npos);
+    TEST_ASSERT(finish_str.find("\"decode_ms\":1000.0") != std::string::npos);
+    // 25 / 1.0 = 25.0
+    TEST_ASSERT(finish_str.find("\"decode_tokens_per_sec\":25.0") != std::string::npos);
+}
+
+static void test_usage_timings_zero_decode_no_div_by_zero() {
+    // decode_s == 0 (prefill-only / no tokens generated path): emit
+    // decode_tokens_per_sec = 0.0 without div-by-zero.
+    GenTimings t{0.123, 0.0};
+    json j = build_timings_json(t, /*completion_tokens*/ 42);
+    TEST_ASSERT(j["prefill_ms"].get<double>() == 123.0);
+    TEST_ASSERT(j["decode_ms"].get<double>() == 0.0);
+    TEST_ASSERT(j["decode_tokens_per_sec"].get<double>() == 0.0);
+
+    // Also exercise via OpenAI streaming path — finite JSON output, no NaN/Inf.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    em.emit_start();
+    auto finish = em.emit_finish(/*completion_tokens*/ 0, &t);
+    std::string finish_str = concat(finish);
+    TEST_ASSERT(finish_str.find("\"decode_tokens_per_sec\":0.0") != std::string::npos);
+    // No NaN / Inf serialization leak.
+    TEST_ASSERT(finish_str.find("inf") == std::string::npos);
+    TEST_ASSERT(finish_str.find("nan") == std::string::npos);
+}
+
+static void test_usage_timings_omitted_when_null() {
+    // Backward compat: emit_finish(n) (no timings) emits the legacy
+    // usage block — no `timings` key. Guards the SDK-facing default
+    // for callers that don't yet wire timings through.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    em.emit_start();
+    em.emit_token("x");
+    auto finish = em.emit_finish(3);  // no timings arg
+    std::string finish_str = concat(finish);
+
+    TEST_ASSERT(finish_str.find("\"timings\"") == std::string::npos);
+    TEST_ASSERT(finish_str.find("[DONE]") != std::string::npos);
+}
+
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
     std::fprintf(stderr, " Server Unit Tests\n");
@@ -1892,6 +1985,13 @@ int main() {
     RUN_TEST(test_props_model_card_wholesale_sidecar);
     RUN_TEST(test_props_model_card_null_on_family_fallback);
     RUN_TEST(test_props_budget_envelope_shape);
+
+    std::fprintf(stderr, "\n── usage.timings ──\n");
+    RUN_TEST(test_usage_timings_openai_chat_streaming);
+    RUN_TEST(test_usage_timings_anthropic_streaming);
+    RUN_TEST(test_usage_timings_responses_streaming);
+    RUN_TEST(test_usage_timings_zero_decode_no_div_by_zero);
+    RUN_TEST(test_usage_timings_omitted_when_null);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",

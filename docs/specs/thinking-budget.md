@@ -490,6 +490,43 @@ clients that don't know about it ignore it.
 `finish_details` is omitted when the request did not opt into the
 budget envelope (no `thinking:{type:"enabled"}`).
 
+### 6.3 Response timings
+
+When the server completes a request, the response's `usage` block
+carries a `timings` object with per-request performance metrics:
+
+```json
+"usage": {
+  "prompt_tokens": 256,
+  "completion_tokens": 1024,
+  "total_tokens": 1280,
+  "completion_tokens_details": { "reasoning_tokens": 512 },
+  "timings": {
+    "prefill_ms": 234.5,
+    "decode_ms": 2456.7,
+    "decode_tokens_per_sec": 41.6
+  }
+}
+```
+
+- `prefill_ms` — wall time spent processing the input prompt before
+  generating the first output token (KV cache fill). Excludes queue
+  and scheduling overhead.
+- `decode_ms` — wall time spent generating output tokens
+  (`completion_tokens` of them). Includes speculative-decode overhead.
+- `decode_tokens_per_sec` — `completion_tokens / (decode_ms * 0.001)`.
+  The model's effective throughput on this request. Emitted as
+  `0.0` when `decode_ms` is zero (prefill-only / count-tokens paths)
+  rather than `null` / `NaN` so JSON parsers don't trip.
+
+These fields are emitted on every response (OpenAI Chat Completions,
+Anthropic Messages, OpenAI Responses), regardless of whether the
+thinking-budget envelope was opted into. Additive to the OpenAI /
+Anthropic shape; clients that don't know the field ignore it. For
+streaming requests, `timings` appears in the terminal usage chunk
+(OpenAI), the `message_delta.usage` event (Anthropic), and the
+`response.completed.usage` payload (Responses).
+
 ## 7. Close-kind taxonomy
 
 `finish_details.close_kind` records how the `<think>` block ended.

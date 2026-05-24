@@ -317,6 +317,34 @@ def default_thinking_enabled(area: str) -> bool:
     return area in {"ds4-eval", "all"}
 
 
+def format_timings_suffix(timings: dict[str, Any] | None) -> str:
+    """Render the ``prefill=… decode=… <tps>tok/s`` suffix for a bench row.
+
+    Returns an empty string when ``timings`` is missing/malformed so the
+    bench printout degrades gracefully against backends that don't
+    surface ``usage.timings`` (OpenRouter, older sindri binaries, the
+    forge area whose client doesn't propagate per-call timings).
+    """
+    if not isinstance(timings, dict):
+        return ""
+    # Require at least one of the three keys to be present; otherwise
+    # the response had no real timings (just an empty dict or partial
+    # payload) and the suffix would be misleading 0s.
+    if not any(k in timings for k in
+               ("prefill_ms", "decode_ms", "decode_tokens_per_sec")):
+        return ""
+    try:
+        prefill_ms = float(timings.get("prefill_ms", 0.0))
+        decode_ms = float(timings.get("decode_ms", 0.0))
+        tps = float(timings.get("decode_tokens_per_sec", 0.0))
+    except (TypeError, ValueError):
+        return ""
+    return (
+        f" prefill={prefill_ms / 1000.0:.1f}s "
+        f"decode={decode_ms / 1000.0:.1f}s {tps:.1f}tok/s"
+    )
+
+
 def run_case(
     url: str,
     case: dict[str, Any],
@@ -417,6 +445,12 @@ def run_case(
     # in the per-case row lets the trace explain why a turn ended (model
     # closed </think> naturally vs server force-closed at the budget).
     finish_details = choice.get("finish_details") or {}
+    # usage.timings — per-request prefill/decode wall-clock breakdown
+    # emitted by dflash_server (spec §6.3). Absent for backends that
+    # don't surface timings (OpenRouter, older sindri binaries); the
+    # bench printout and JSON degrade gracefully when None.
+    raw_timings = usage.get("timings")
+    timings = raw_timings if isinstance(raw_timings, dict) else None
     return {
         "area": case["area"],
         "source": case["source"],
@@ -434,6 +468,7 @@ def run_case(
         "content_tokens": finish_details.get("content_tokens"),
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
+        "timings": timings,
         "given": got,
         "correct": expected,
         "wall_s": round(wall, 3),
@@ -629,6 +664,11 @@ def run_forge_area(
             "given": "PASS" if graded_pass else (error_type or "FAIL"),
             "correct": ["PASS"],
             "wall_s": round(elapsed, 3),
+            # forge's AnthropicClient doesn't propagate the server's
+            # usage.timings into RunResult — keep the key for schema
+            # parity with the ds4/smoke rows; format_timings_suffix()
+            # omits the printed suffix when this is None.
+            "timings": None,
             "prompt": "",
             "output": "",
         })
@@ -818,11 +858,16 @@ def main() -> int:
     def format_status(idx: int, case: dict[str, Any], row: dict[str, Any]) -> str:
         status = "PASS" if row["ok"] else "FAIL"
         correct = "|".join(expected_answers(case))
+        # usage.timings (spec §6.3): dflash_server emits per-request
+        # prefill/decode wall-clock; tack it onto the bench line so the
+        # bench.log captures the throughput breakdown. Returns "" when
+        # the backend (OpenRouter, older sindri) didn't surface timings.
+        timings_suffix = format_timings_suffix(row.get("timings"))
         return (
             f"  {idx:2d} {status:4s} {case['source']:14s} {case['id']:20s} "
             f"given={row.get('given', '?')} correct={correct} "
             f"format={row.get('format_pass')} hint={row.get('semantic_hint')} "
-            f"wall={row['wall_s']:.2f}s"
+            f"wall={row['wall_s']:.2f}s{timings_suffix}"
         )
 
     # Case-area runner (smoke / ds4-eval / long / all). Parallel is opt-in
@@ -887,10 +932,14 @@ def main() -> int:
         rows.extend(forge_rows)
         for offset, row in enumerate(forge_rows, start=1):
             status = "PASS" if row["ok"] else "FAIL"
+            # Forge's RunResult doesn't expose per-iteration server
+            # timings (the AnthropicClient abstraction strips them);
+            # format_timings_suffix() returns "" for None.
+            timings_suffix = format_timings_suffix(row.get("timings"))
             print(
                 f"  {base + offset:2d} {status:4s} {row['source']:14s} "
                 f"{row['id']:30s} given={row.get('given', '?')} "
-                f"wall={row['wall_s']:.2f}s",
+                f"wall={row['wall_s']:.2f}s{timings_suffix}",
                 flush=True,
             )
 

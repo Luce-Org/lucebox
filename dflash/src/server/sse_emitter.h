@@ -31,6 +31,26 @@ using SseEventFn = std::function<bool(const std::string & event_type,
 // Stream state machine modes
 enum class StreamMode { REASONING, CONTENT, TOOL_BUFFER };
 
+// Per-request generation timings surfaced under `usage.timings` in every
+// response shape (OpenAI Chat Completions, Anthropic Messages, OpenAI
+// Responses). See docs/specs/thinking-budget.md §6.3.
+//
+// `prefill_s` and `decode_s` come straight from GenerateResult; the bench
+// & client side compute `decode_tokens_per_sec = completion_tokens /
+// decode_s` (server emits it pre-computed to avoid drift).
+struct GenTimings {
+    double prefill_s = 0.0;
+    double decode_s  = 0.0;
+};
+
+// Build the `timings` sub-object emitted under `usage`.
+//   prefill_ms              = prefill_s * 1000.0  (1 decimal)
+//   decode_ms               = decode_s  * 1000.0  (1 decimal)
+//   decode_tokens_per_sec   = completion_tokens / decode_s (0.0 when
+//                              decode_s == 0 to avoid div-by-zero on
+//                              prefill-only / count_tokens responses)
+nlohmann::json build_timings_json(const GenTimings & t, int completion_tokens);
+
 // Manages SSE streaming for a single request.
 class SseEmitter {
 public:
@@ -51,8 +71,14 @@ public:
     std::vector<std::string> emit_token(const std::string & piece);
 
     // Flush remaining buffered content and emit final events.
-    // `completion_tokens` is the total token count.
-    std::vector<std::string> emit_finish(int completion_tokens);
+    // `completion_tokens` is the total token count. `timings`, when
+    // non-null, is folded into the terminal `usage` block (OpenAI:
+    // usage chunk; Anthropic: message_delta usage; Responses:
+    // response.completed usage). Pass nullptr to suppress, matching
+    // the pre-timings API for unit tests that don't exercise that
+    // shape.
+    std::vector<std::string> emit_finish(int completion_tokens,
+                                         const GenTimings * timings = nullptr);
 
     // Get the finish_reason for non-streaming responses.
     std::string finish_reason() const;

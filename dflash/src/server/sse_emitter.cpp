@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 
 namespace dflash::common {
@@ -29,6 +30,25 @@ static std::string gen_item_id() {
 static int64_t unix_timestamp() {
     return std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// Round `x` to 1 decimal place. JSON serialization of doubles can emit
+// 17 significant digits which is noisy in client logs and bench output;
+// caller-side rounding keeps the wire format stable across runs.
+static double round1(double x) {
+    return std::round(x * 10.0) / 10.0;
+}
+
+json build_timings_json(const GenTimings & t, int completion_tokens) {
+    const double prefill_ms = round1(t.prefill_s * 1000.0);
+    const double decode_ms  = round1(t.decode_s  * 1000.0);
+    const double tps = t.decode_s > 0.0
+        ? round1((double)completion_tokens / t.decode_s) : 0.0;
+    return json{
+        {"prefill_ms",            prefill_ms},
+        {"decode_ms",             decode_ms},
+        {"decode_tokens_per_sec", tps}
+    };
 }
 
 // ─── Constructor ────────────────────────────────────────────────────────
@@ -427,7 +447,8 @@ void SseEmitter::emit_content_delta(std::vector<std::string> & out,
 
 // ─── emit_finish ────────────────────────────────────────────────────────
 
-std::vector<std::string> SseEmitter::emit_finish(int completion_tokens) {
+std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
+                                                 const GenTimings * timings) {
     std::vector<std::string> out;
 
     // Flush remaining window
@@ -564,16 +585,21 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens) {
     case ApiFormat::OPENAI_CHAT: {
         // Finish reason chunk
         out.push_back(format_openai_delta(json::object(), fr.c_str()));
-        // Usage chunk
+        // Usage chunk — includes timings sub-object when caller supplied
+        // generation wall-clock breakdown (see spec §6.3).
+        json usage_body = {
+            {"prompt_tokens", prompt_tokens_},
+            {"completion_tokens", completion_tokens},
+            {"total_tokens", prompt_tokens_ + completion_tokens}
+        };
+        if (timings) {
+            usage_body["timings"] = build_timings_json(*timings, completion_tokens);
+        }
         json usage = {
             {"id", request_id_}, {"object", "chat.completion.chunk"},
             {"created", created_at_}, {"model", model_name_},
             {"choices", json::array()},
-            {"usage", {
-                {"prompt_tokens", prompt_tokens_},
-                {"completion_tokens", completion_tokens},
-                {"total_tokens", prompt_tokens_ + completion_tokens}
-            }}
+            {"usage", usage_body}
         };
         out.push_back(sse_data(usage.dump()));
         out.push_back(sse_data("[DONE]"));
@@ -597,10 +623,14 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens) {
         // tool_result back), else "end_turn". Stop-sequence hits also report
         // "end_turn" (Anthropic has no dedicated reason for that case).
         const char * stop_reason = tool_calls_.empty() ? "end_turn" : "tool_use";
+        json anth_usage = {{"output_tokens", completion_tokens}};
+        if (timings) {
+            anth_usage["timings"] = build_timings_json(*timings, completion_tokens);
+        }
         json msg_delta = {
             {"type", "message_delta"},
             {"delta", {{"stop_reason", stop_reason}, {"stop_sequence", nullptr}}},
-            {"usage", {{"output_tokens", completion_tokens}}}
+            {"usage", anth_usage}
         };
         out.push_back(sse_event("message_delta", msg_delta.dump()));
         // message_stop
@@ -653,17 +683,21 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens) {
         }
 
         // response.completed
+        json resp_usage = {
+            {"input_tokens", prompt_tokens_},
+            {"output_tokens", completion_tokens},
+            {"total_tokens", prompt_tokens_ + completion_tokens}
+        };
+        if (timings) {
+            resp_usage["timings"] = build_timings_json(*timings, completion_tokens);
+        }
         json shell = {
             {"id", request_id_}, {"object", "response"},
             {"created_at", created_at_}, {"status", "completed"},
             {"model", model_name_},
             {"output", final_output},
             {"output_text", accumulated_content_},
-            {"usage", {
-                {"input_tokens", prompt_tokens_},
-                {"output_tokens", completion_tokens},
-                {"total_tokens", prompt_tokens_ + completion_tokens}
-            }}
+            {"usage", resp_usage}
         };
         out.push_back(format_responses_event("response.completed", {{"response", shell}}));
         break;

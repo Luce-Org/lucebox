@@ -1608,8 +1608,13 @@ void HttpServer::worker_loop() {
         }
 
         // Finalize.
+        // Per-request wall-clock timings forwarded to the response's
+        // `usage.timings` (OpenAI Chat usage chunk, Anthropic
+        // message_delta usage, Responses response.completed usage).
+        // See docs/specs/thinking-budget.md §6.3.
+        GenTimings gen_timings{ result.prefill_s, result.decode_s };
         if (req.stream && !client_disconnected) {
-            auto final_chunks = emitter.emit_finish(completion_tokens);
+            auto final_chunks = emitter.emit_finish(completion_tokens, &gen_timings);
             for (const auto & chunk : final_chunks) {
                 if (!send_all(fd, chunk.data(), chunk.size())) {
                     client_disconnected = true;
@@ -1767,6 +1772,20 @@ void HttpServer::worker_loop() {
                 // usage.completion_tokens_details.reasoning_tokens — OpenAI
                 // o1/o3 standard location, also OR's normalized shape. Mirrors
                 // finish_details.thinking_tokens; kept in sync.
+                // usage.timings — per-request prefill / decode wall clock
+                // (always emitted; additive to OpenAI shape, ignored by
+                // clients that don't recognize it). See spec §6.3.
+                json chat_usage = {
+                    {"prompt_tokens", (int)req.prompt_tokens.size()},
+                    {"completion_tokens", total_completion_tokens},
+                    {"total_tokens", (int)req.prompt_tokens.size() + total_completion_tokens},
+                    {"completion_tokens_details", {
+                        // Match finish_details.thinking_tokens (emitter-
+                        // tracked split, not phase1.size()).
+                        {"reasoning_tokens", reasoning_tokens_emitted}
+                    }},
+                    {"timings", build_timings_json(gen_timings, total_completion_tokens)}
+                };
                 resp = {
                     {"id", req.response_id},
                     {"object", "chat.completion"},
@@ -1774,16 +1793,7 @@ void HttpServer::worker_loop() {
                         std::chrono::system_clock::now().time_since_epoch()).count()},
                     {"model", req.model},
                     {"choices", json::array({choice})},
-                    {"usage", {
-                        {"prompt_tokens", (int)req.prompt_tokens.size()},
-                        {"completion_tokens", total_completion_tokens},
-                        {"total_tokens", (int)req.prompt_tokens.size() + total_completion_tokens},
-                        {"completion_tokens_details", {
-                            // Match finish_details.thinking_tokens (emitter-
-                            // tracked split, not phase1.size()).
-                            {"reasoning_tokens", reasoning_tokens_emitted}
-                        }}
-                    }}
+                    {"usage", chat_usage}
                 };
                 break;
             }
@@ -1838,15 +1848,17 @@ void HttpServer::worker_loop() {
                     else if (phase1_at_cap || phase2_at_cap) anthropic_stop_reason = "max_tokens";
                     else                               anthropic_stop_reason = "end_turn";
                 }
+                json anth_usage = {
+                    {"input_tokens", (int)req.prompt_tokens.size()},
+                    {"output_tokens", total_completion_tokens},
+                    {"timings", build_timings_json(gen_timings, total_completion_tokens)}
+                };
                 resp = {
                     {"id", req.response_id}, {"type", "message"},
                     {"role", "assistant"}, {"model", req.model},
                     {"content", content},
                     {"stop_reason", anthropic_stop_reason},
-                    {"usage", {
-                        {"input_tokens", (int)req.prompt_tokens.size()},
-                        {"output_tokens", total_completion_tokens}
-                    }}
+                    {"usage", anth_usage}
                 };
                 break;
             }
@@ -1870,15 +1882,17 @@ void HttpServer::worker_loop() {
                         }})}
                     });
                 }
+                json resp_usage = {
+                    {"input_tokens", (int)req.prompt_tokens.size()},
+                    {"output_tokens", total_completion_tokens},
+                    {"total_tokens", (int)req.prompt_tokens.size() + total_completion_tokens},
+                    {"timings", build_timings_json(gen_timings, total_completion_tokens)}
+                };
                 resp = {
                     {"id", req.response_id}, {"object", "response"},
                     {"status", "completed"}, {"model", req.model},
                     {"output", output},
-                    {"usage", {
-                        {"input_tokens", (int)req.prompt_tokens.size()},
-                        {"output_tokens", total_completion_tokens},
-                        {"total_tokens", (int)req.prompt_tokens.size() + total_completion_tokens}
-                    }}
+                    {"usage", resp_usage}
                 };
                 break;
             }
