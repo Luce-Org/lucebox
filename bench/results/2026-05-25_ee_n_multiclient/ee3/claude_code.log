@@ -1,0 +1,10 @@
+[bandit-session] server pid=442032 port=38535 pflash=on
+[bandit-session] session proxy pid=442079 url=http://127.0.0.1:40167 session_id='bandit-claude_code-1779632893'
+[bandit-session] turn=1/3 prompt=decode_check.txt
+[bandit-session]   WARNING: no [pflash-bandit] line for turn 1
+[bandit-session] turn=2/3 prompt=logic_check.txt
+[bandit-session]   WARNING: no [pflash-bandit] line for turn 2
+[bandit-session] turn=3/3 prompt=math_check.txt
+[bandit-session]   WARNING: no [pflash-bandit] line for turn 3
+[bandit-session] wrote 3-row CSV to /home/peppi/Dev/lucebox-hub/.claude/worktrees/drafter-fastpath/bench/results/2026-05-25_ee_n_multiclient/ee3/claude_code.csv
+[bandit-session] results saved to /home/peppi/Dev/lucebox-hub/.claude/worktrees/harness-adapters/dflash/bench/results/2026-05-24_adaptive_evidence

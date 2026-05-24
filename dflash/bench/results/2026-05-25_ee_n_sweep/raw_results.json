@@ -1,0 +1,518 @@
+[
+  {
+    "condition": "baseline",
+    "ctx": 32768,
+    "case_results": [
+      {
+        "ttft_s": 10.73171946399998,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 5.29,
+        "tail_score_s": 0.87,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 10.602848607000851,
+        "text": "The special magic bsdmrulm number is 0438574.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 5.24,
+        "tail_score_s": 0.84,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 10.41455414399934,
+        "text": "The special magic kowefada number is 1596346.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 5.22,
+        "tail_score_s": 0.83,
+        "a_compute_s": null,
+        "fp_s": null
+      }
+    ],
+    "drafter_p50_s": 5.24,
+    "tail_score_p50_s": 0.84,
+    "ttft_p50_s": 10.602848607000851,
+    "a_compute_p50_s": null,
+    "fp_p50_s": null,
+    "niah_pass": 3,
+    "niah_total": 3
+  },
+  {
+    "condition": "baseline",
+    "ctx": 65536,
+    "case_results": [
+      {
+        "ttft_s": 17.767624007999984,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 10.66,
+        "tail_score_s": 1.63,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 17.52602748299978,
+        "text": "The special magic bsdmrulm number is 0438574.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 10.58,
+        "tail_score_s": 1.65,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 17.613511978999668,
+        "text": "The special magic kowefada number is 1596346.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 10.66,
+        "tail_score_s": 1.63,
+        "a_compute_s": null,
+        "fp_s": null
+      }
+    ],
+    "drafter_p50_s": 10.66,
+    "tail_score_p50_s": 1.63,
+    "ttft_p50_s": 17.613511978999668,
+    "a_compute_p50_s": null,
+    "fp_p50_s": null,
+    "niah_pass": 3,
+    "niah_total": 3
+  },
+  {
+    "condition": "baseline",
+    "ctx": 131072,
+    "case_results": [
+      {
+        "ttft_s": 85.40157091799847,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 72.85,
+        "tail_score_s": 17.46,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 81.84061668699906,
+        "text": "The special magic bsdmrulm number is 0438574.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 69.52,
+        "tail_score_s": 14.85,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 79.63905328700093,
+        "text": "The special magic kowefada number is 1596346.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 68.68,
+        "tail_score_s": 14.57,
+        "a_compute_s": null,
+        "fp_s": null
+      }
+    ],
+    "drafter_p50_s": 69.52,
+    "tail_score_p50_s": 14.85,
+    "ttft_p50_s": 81.84061668699906,
+    "a_compute_p50_s": null,
+    "fp_p50_s": null,
+    "niah_pass": 3,
+    "niah_total": 3
+  },
+  {
+    "condition": "ee3",
+    "ctx": 32768,
+    "case_results": [
+      {
+        "ttft_s": 6.056483135000235,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 0.76,
+        "tail_score_s": 0.1,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 5.906857091000347,
+        "text": "The special magic bsdmrulm number is 0438574.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 0.74,
+        "tail_score_s": 0.09,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 6.149170538001272,
+        "text": "The special magic kowefada number is 1596346.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 0.77,
+        "tail_score_s": 0.1,
+        "a_compute_s": null,
+        "fp_s": null
+      }
+    ],
+    "drafter_p50_s": 0.76,
+    "tail_score_p50_s": 0.1,
+    "ttft_p50_s": 6.056483135000235,
+    "a_compute_p50_s": null,
+    "fp_p50_s": null,
+    "niah_pass": 3,
+    "niah_total": 3
+  },
+  {
+    "condition": "ee3",
+    "ctx": 65536,
+    "case_results": [
+      {
+        "ttft_s": 8.178992270999515,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 1.4,
+        "tail_score_s": 0.18,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 8.814853437999773,
+        "text": "The special magic bsdmrulm number is 0438574.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 1.41,
+        "tail_score_s": 0.17,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 8.194293537000704,
+        "text": "The special magic kowefada number is 1596346.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 1.4,
+        "tail_score_s": 0.17,
+        "a_compute_s": null,
+        "fp_s": null
+      }
+    ],
+    "drafter_p50_s": 1.4,
+    "tail_score_p50_s": 0.17,
+    "ttft_p50_s": 8.194293537000704,
+    "a_compute_p50_s": null,
+    "fp_p50_s": null,
+    "niah_pass": 3,
+    "niah_total": 3
+  },
+  {
+    "condition": "ee3",
+    "ctx": 131072,
+    "case_results": [
+      {
+        "ttft_s": 14.12525931699929,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 2.94,
+        "tail_score_s": 0.38,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 13.863009069000327,
+        "text": "The special magic bsdmrulm number is 0438574.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 2.85,
+        "tail_score_s": 0.35,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 13.540825919000781,
+        "text": "The special magic kowefada number is 1596346.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 2.86,
+        "tail_score_s": 0.35,
+        "a_compute_s": null,
+        "fp_s": null
+      }
+    ],
+    "drafter_p50_s": 2.86,
+    "tail_score_p50_s": 0.35,
+    "ttft_p50_s": 13.863009069000327,
+    "a_compute_p50_s": null,
+    "fp_p50_s": null,
+    "niah_pass": 3,
+    "niah_total": 3
+  },
+  {
+    "condition": "ee5",
+    "ctx": 32768,
+    "case_results": [
+      {
+        "ttft_s": 6.449506604998533,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 1.1,
+        "tail_score_s": 0.15,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 6.407680143000107,
+        "text": "The special magic bsdmrulm number is 0438574.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 1.11,
+        "tail_score_s": 0.16,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 6.341141827000683,
+        "text": "The special magic kowefada number is 1596346.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 1.11,
+        "tail_score_s": 0.15,
+        "a_compute_s": null,
+        "fp_s": null
+      }
+    ],
+    "drafter_p50_s": 1.11,
+    "tail_score_p50_s": 0.15,
+    "ttft_p50_s": 6.407680143000107,
+    "a_compute_p50_s": null,
+    "fp_p50_s": null,
+    "niah_pass": 3,
+    "niah_total": 3
+  },
+  {
+    "condition": "ee5",
+    "ctx": 65536,
+    "case_results": [
+      {
+        "ttft_s": 9.016755268999987,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 2.16,
+        "tail_score_s": 0.28,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 9.161264985999878,
+        "text": "The special magic bsdmrulm number is 0438574.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 2.12,
+        "tail_score_s": 0.3,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 9.090835861999949,
+        "text": "The special magic kowefada number is 1596346.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 2.12,
+        "tail_score_s": 0.28,
+        "a_compute_s": null,
+        "fp_s": null
+      }
+    ],
+    "drafter_p50_s": 2.12,
+    "tail_score_p50_s": 0.28,
+    "ttft_p50_s": 9.090835861999949,
+    "a_compute_p50_s": null,
+    "fp_p50_s": null,
+    "niah_pass": 3,
+    "niah_total": 3
+  },
+  {
+    "condition": "ee5",
+    "ctx": 131072,
+    "case_results": [
+      {
+        "ttft_s": 18.47141244500017,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 6.79,
+        "tail_score_s": 2.89,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 17.967793390000224,
+        "text": "The special magic bsdmrulm number is 0438574.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 6.47,
+        "tail_score_s": 2.66,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 17.660321662999195,
+        "text": "The special magic kowefada number is 1596346.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 6.54,
+        "tail_score_s": 2.74,
+        "a_compute_s": null,
+        "fp_s": null
+      }
+    ],
+    "drafter_p50_s": 6.54,
+    "tail_score_p50_s": 2.74,
+    "ttft_p50_s": 17.967793390000224,
+    "a_compute_p50_s": null,
+    "fp_p50_s": null,
+    "niah_pass": 3,
+    "niah_total": 3
+  },
+  {
+    "condition": "ee7",
+    "ctx": 32768,
+    "case_results": [
+      {
+        "ttft_s": 7.120239156000025,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 1.64,
+        "tail_score_s": 0.23,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 6.814394259999972,
+        "text": "The special magic bsdmrulm number is 0438574.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 1.48,
+        "tail_score_s": 0.22,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 6.832333981999909,
+        "text": "The special magic kowefada number is 1596346.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 1.47,
+        "tail_score_s": 0.22,
+        "a_compute_s": null,
+        "fp_s": null
+      }
+    ],
+    "drafter_p50_s": 1.48,
+    "tail_score_p50_s": 0.22,
+    "ttft_p50_s": 6.832333981999909,
+    "a_compute_p50_s": null,
+    "fp_p50_s": null,
+    "niah_pass": 3,
+    "niah_total": 3
+  },
+  {
+    "condition": "ee7",
+    "ctx": 65536,
+    "case_results": [
+      {
+        "ttft_s": 9.48727538499952,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 2.78,
+        "tail_score_s": 0.38,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 10.515225712999381,
+        "text": "The special magic bsdmrulm number is 0438574.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 2.99,
+        "tail_score_s": 0.45,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 9.68422493899925,
+        "text": "The special magic kowefada number is 1596346.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 2.81,
+        "tail_score_s": 0.4,
+        "a_compute_s": null,
+        "fp_s": null
+      }
+    ],
+    "drafter_p50_s": 2.81,
+    "tail_score_p50_s": 0.4,
+    "ttft_p50_s": 9.68422493899925,
+    "a_compute_p50_s": null,
+    "fp_p50_s": null,
+    "niah_pass": 3,
+    "niah_total": 3
+  },
+  {
+    "condition": "ee7",
+    "ctx": 131072,
+    "case_results": [
+      {
+        "ttft_s": 20.44279684400135,
+        "text": "The special magic qahftrxc number is 4025016.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 9.06,
+        "tail_score_s": 3.81,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 20.13405948000036,
+        "text": "The special magic bsdmrulm number is 0438574.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 8.05,
+        "tail_score_s": 2.77,
+        "a_compute_s": null,
+        "fp_s": null
+      },
+      {
+        "ttft_s": 20.06659987399871,
+        "text": "The special magic kowefada number is 1596346.",
+        "found": true,
+        "error": null,
+        "drafter_fwd_s": 8.42,
+        "tail_score_s": 3.18,
+        "a_compute_s": null,
+        "fp_s": null
+      }
+    ],
+    "drafter_p50_s": 8.42,
+    "tail_score_p50_s": 3.18,
+    "ttft_p50_s": 20.13405948000036,
+    "a_compute_p50_s": null,
+    "fp_p50_s": null,
+    "niah_pass": 3,
+    "niah_total": 3
+  }
+]

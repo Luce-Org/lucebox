@@ -1,0 +1,4 @@
+client,turn,session_id,prompt,keep_before,accept_rate,keep_after,ema,wall_s
+claude_code,1,bandit-claude_code-1779633289,decode_check.txt,,,,,2.037
+claude_code,2,bandit-claude_code-1779633289,logic_check.txt,,,,,0.93
+claude_code,3,bandit-claude_code-1779633289,math_check.txt,,,,,0.91
