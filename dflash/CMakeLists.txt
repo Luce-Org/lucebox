@@ -560,6 +560,19 @@ if(DFLASH27B_TESTS)
         add_test(NAME test_drafter_warm_path_regression
             COMMAND test_drafter_warm_path_regression)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_tail_capture_guard.cpp")
+        # GREEN phase: built with TAIL_GUARD_USE_NEW_FORMULA — must pass after Bug #42 fix.
+        add_executable(test_drafter_tail_capture_guard
+            test/test_drafter_tail_capture_guard.cpp)
+        target_compile_definitions(test_drafter_tail_capture_guard PRIVATE
+            TAIL_GUARD_USE_NEW_FORMULA)
+        add_test(NAME test_drafter_tail_capture_guard
+            COMMAND test_drafter_tail_capture_guard)
+        # RED phase binary: same source WITHOUT the fix flag — documents the bug.
+        add_executable(test_drafter_tail_capture_guard_red
+            test/test_drafter_tail_capture_guard.cpp)
+        # No TAIL_GUARD_USE_NEW_FORMULA — uses old (buggy) guard, expected to FAIL.
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_vs_reference.cpp")
         add_executable(test_draft_vs_reference test/test_draft_vs_reference.cpp)
         target_link_libraries(test_draft_vs_reference PRIVATE dflash_common)
