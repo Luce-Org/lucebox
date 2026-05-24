@@ -342,8 +342,12 @@ def run_case(
         "stream": False,
         "chat_template_kwargs": {"enable_thinking": think},
     }
-    if think:
-        body_payload["thinking"] = {"type": "enabled"}
+    # Send the thinking control field for both modes. chat_template_kwargs
+    # is only a Qwen-template hint and servers like antirez/ds4_server.c
+    # don't read it, so --no-think previously left ds4-server defaulting to
+    # DS4_THINK_HIGH and silently re-enabling thinking. Explicit type makes
+    # the opt-out reach servers that follow the Anthropic-shaped contract.
+    body_payload["thinking"] = {"type": "enabled" if think else "disabled"}
     body = json.dumps(body_payload).encode()
     headers = {"Content-Type": "application/json"}
     if auth_header:
