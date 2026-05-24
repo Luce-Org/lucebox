@@ -47,9 +47,9 @@ FILLER = (
 )
 
 CONDITIONS = [
-    {"name": "baseline", "drafter": DRAFTER_BF16, "score_layers": None},
-    {"name": "q8",       "drafter": DRAFTER_Q8,   "score_layers": None},
-    {"name": "q8_l7",    "drafter": DRAFTER_Q8,   "score_layers": 7},
+    {"name": "baseline", "drafter": DRAFTER_BF16, "score_layers": None, "early_exit_n": None},
+    {"name": "q8",       "drafter": DRAFTER_Q8,   "score_layers": None, "early_exit_n": None},
+    {"name": "q8_l7",    "drafter": DRAFTER_Q8,   "score_layers": 7,    "early_exit_n": 7},
 ]
 # Max context needed - server max-ctx must cover the largest
 MAX_CTX = 70000
@@ -73,6 +73,7 @@ def build_niah_prompt(ctx_tokens: int) -> str:
 def start_server(cond: dict) -> tuple:
     drafter = cond["drafter"]
     score_layers = cond["score_layers"]
+    early_exit_n = cond["early_exit_n"]
     name = cond["name"]
 
     env = os.environ.copy()
@@ -81,6 +82,10 @@ def start_server(cond: dict) -> tuple:
         env["PFLASH_DRAFTER_SCORE_LAYERS"] = str(score_layers)
     elif "PFLASH_DRAFTER_SCORE_LAYERS" in env:
         del env["PFLASH_DRAFTER_SCORE_LAYERS"]
+    if early_exit_n is not None:
+        env["PFLASH_DRAFTER_EARLY_EXIT_N"] = str(early_exit_n)
+    elif "PFLASH_DRAFTER_EARLY_EXIT_N" in env:
+        del env["PFLASH_DRAFTER_EARLY_EXIT_N"]
 
     cmd = [
         str(SERVER_BIN),
