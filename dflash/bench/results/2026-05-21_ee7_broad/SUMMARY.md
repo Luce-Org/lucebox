@@ -40,6 +40,6 @@ T7 (3 subcases) added to test_drafter_warm_path_regression to cover this boundar
 ## Verdict
 
 ee7 is equivalent to ee14 on NIAH at every context tested and preserves agentic OK_DONE.
-Speedup over ee14: 1.82x/2.66x/2.91x/3.16x at 1K/4K/8K/16K vs ee14 1.48x/1.75x/1.80x/1.86x.
+Speedup vs baseline: ee7 1.82x/2.66x/2.91x/3.16x at 1K/4K/8K/16K; ee14 1.48x/1.75x/1.80x/1.86x.
 Pass B agentic: 3.07x vs ee14 1.85x.
 Recommendation: promote ee7 to production default for RTX 3090.

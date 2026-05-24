@@ -85,7 +85,7 @@ def run_one_case_with_server(condition, ctx, case, case_idx, results_dir):
     """Start a fresh server, run one NIAH case, stop server. Returns timing."""
     log_path = results_dir / f"{condition}_{ctx}_case{case_idx}_server.log"
     proc = start_server(condition, ctx, log_path)
-    result = {"ttft_s": None, "text": "", "found": False, "error": None,
+    result = {"wall_s": None, "text": "", "found": False, "error": None,
               "drafter_fwd_s": None, "tail_score_s": None}
     try:
         if not wait_server(proc):
@@ -108,14 +108,14 @@ def run_one_case_with_server(condition, ctx, case, case_idx, results_dir):
         t0 = time.perf_counter()
         try:
             r = requests.post(f"{BASE_URL}/v1/chat/completions", json=payload, timeout=180)
-            result["ttft_s"] = time.perf_counter() - t0
+            result["wall_s"] = time.perf_counter() - t0
             r.raise_for_status()
             data = r.json()
             text = data["choices"][0]["message"]["content"]
             result["text"] = text[:300]
             result["found"] = case["answer"] in text
         except Exception as e:
-            result["ttft_s"] = time.perf_counter() - t0
+            result["wall_s"] = time.perf_counter() - t0
             result["error"] = str(e)
     finally:
         stop_server(proc)
@@ -146,16 +146,17 @@ def run_condition_ctx(condition, ctx, cases, results_dir):
         status = "OK" if r["found"] else "FAIL"
         drafter_s = f"{r['drafter_fwd_s']:.3f}s" if r['drafter_fwd_s'] else "N/A"
         tail_s = f"{r['tail_score_s']:.3f}s" if r['tail_score_s'] else "N/A"
-        print(f"  case {i}: ttft={r['ttft_s']:.2f}s drafter={drafter_s} tail={tail_s} [{status}]", flush=True)
+        print(f"  case {i}: wall={r['wall_s']:.2f}s drafter={drafter_s} tail={tail_s} [{status}]", flush=True)
         if r["text"]:
             print(f"  case {i}: text={r['text'][:80]!r}", flush=True)
         if r["error"]:
             print(f"  case {i}: error={r['error'][:100]}", flush=True)
 
-    drafter_times = [r["drafter_fwd_s"] for r in case_results if r["drafter_fwd_s"] is not None]
-    tail_times = [r["tail_score_s"] for r in case_results if r["tail_score_s"] is not None]
-    ttfts = [r["ttft_s"] for r in case_results if r["ttft_s"] is not None]
-    niah_pass = sum(1 for c in case_results if c["found"])
+    ok_results = [r for r in case_results if not r.get("error")]
+    drafter_times = [r["drafter_fwd_s"] for r in ok_results if r["drafter_fwd_s"] is not None]
+    tail_times = [r["tail_score_s"] for r in ok_results if r["tail_score_s"] is not None]
+    walls = [r["wall_s"] for r in ok_results if r["wall_s"] is not None]
+    niah_pass = sum(1 for c in ok_results if c["found"])
 
     return {
         "condition": condition, "ctx": ctx,
@@ -163,9 +164,9 @@ def run_condition_ctx(condition, ctx, cases, results_dir):
         "drafter_times_s": drafter_times,
         "drafter_p50_s": median(drafter_times) if drafter_times else None,
         "tail_score_p50_s": median(tail_times) if tail_times else None,
-        "ttft_p50_s": median(ttfts) if ttfts else None,
+        "wall_p50_s": median(walls) if walls else None,
         "niah_pass": niah_pass,
-        "niah_total": len(cases),
+        "niah_total": len(ok_results),
     }
 
 
