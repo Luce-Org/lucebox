@@ -223,6 +223,44 @@ static json build_props_body(const ServerConfig & config,
     return body;
 }
 
+// Normalize Anthropic's `system` field (top-level on /v1/messages and
+// /v1/messages/count_tokens) into a leading `{role:"system", content:...}`
+// entry on `messages`. Accepts either a flat string or an array of typed
+// blocks (`[{type:"text", text:"..."}]`), and strips any
+// `x-anthropic-billing-header:`-prefixed block injected by Claude Code so
+// it never reaches the model or the token counter.
+//
+// Side-effect: prepends a system message to `messages` when the body has
+// a non-empty `system` field after billing-header filtering. No-op
+// otherwise. Both endpoints call this with identical semantics — having
+// one helper guarantees token counting and generation can't drift.
+static void normalize_anthropic_system(const json & body, json & messages) {
+    if (!body.contains("system")) return;
+    json sys_content = body["system"];
+    if (sys_content.is_array()) {
+        json filtered = json::array();
+        for (const auto & block : sys_content) {
+            if (block.is_object() && block.value("type", "") == "text") {
+                std::string text = block.value("text", "");
+                if (text.rfind("x-anthropic-billing-header:", 0) == 0) {
+                    continue;  // skip Claude Code billing header block
+                }
+            }
+            filtered.push_back(block);
+        }
+        sys_content = std::move(filtered);
+    } else if (sys_content.is_string()) {
+        std::string s = sys_content.get<std::string>();
+        if (s.rfind("x-anthropic-billing-header:", 0) == 0) {
+            sys_content = "";
+        }
+    }
+    if (!sys_content.empty()) {
+        json sys_msg = {{"role", "system"}, {"content", sys_content}};
+        messages.insert(messages.begin(), sys_msg);
+    }
+}
+
 json parse_responses_arguments(const json & item) {
     if (!item.contains("arguments")) return json::object();
     const auto & arguments = item["arguments"];
@@ -680,64 +718,13 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             req.format = ApiFormat::ANTHROPIC;
             req.response_id = generate_id("count");
             req.messages = body.value("messages", json::array());
-            // System block — same shape as /v1/messages.
-            if (body.contains("system")) {
-                json sys_content = body["system"];
-                if (sys_content.is_array()) {
-                    json filtered = json::array();
-                    for (const auto & block : sys_content) {
-                        if (block.is_object() && block.value("type", "") == "text") {
-                            std::string text = block.value("text", "");
-                            if (text.rfind("x-anthropic-billing-header:", 0) == 0) {
-                                continue;
-                            }
-                        }
-                        filtered.push_back(block);
-                    }
-                    sys_content = std::move(filtered);
-                } else if (sys_content.is_string()) {
-                    std::string s = sys_content.get<std::string>();
-                    if (s.rfind("x-anthropic-billing-header:", 0) == 0) {
-                        sys_content = "";
-                    }
-                }
-                if (!sys_content.empty()) {
-                    json sys_msg = {{"role", "system"}, {"content", sys_content}};
-                    req.messages.insert(req.messages.begin(), sys_msg);
-                }
-            }
+            normalize_anthropic_system(body, req.messages);
             count_tokens_only = true;
         } else if (hr.path == "/v1/messages") {
             req.format = ApiFormat::ANTHROPIC;
             req.response_id = generate_id("msg");
             req.messages = body["messages"];
-            if (body.contains("system")) {
-                // Anthropic puts system as a top-level field.
-                // Strip billing header blocks injected by Claude Code.
-                json sys_content = body["system"];
-                if (sys_content.is_array()) {
-                    json filtered = json::array();
-                    for (const auto & block : sys_content) {
-                        if (block.is_object() && block.value("type", "") == "text") {
-                            std::string text = block.value("text", "");
-                            if (text.rfind("x-anthropic-billing-header:", 0) == 0) {
-                                continue;  // skip billing header block
-                            }
-                        }
-                        filtered.push_back(block);
-                    }
-                    sys_content = std::move(filtered);
-                } else if (sys_content.is_string()) {
-                    std::string s = sys_content.get<std::string>();
-                    if (s.rfind("x-anthropic-billing-header:", 0) == 0) {
-                        sys_content = "";
-                    }
-                }
-                if (!sys_content.empty()) {
-                    json sys_msg = {{"role", "system"}, {"content", sys_content}};
-                    req.messages.insert(req.messages.begin(), sys_msg);
-                }
-            }
+            normalize_anthropic_system(body, req.messages);
         } else if (hr.path == "/v1/responses") {
             req.format = ApiFormat::RESPONSES;
             req.response_id = generate_id("resp");
