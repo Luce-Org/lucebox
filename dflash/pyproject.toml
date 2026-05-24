@@ -24,12 +24,12 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 # Tool-calling eval harness (bench_http_capability.py --area forge).
-# Pulls antoinezambelli/forge's AnthropicClient + the runtime that backs
-# the vendored scenarios in dflash/scripts/fixtures/forge_eval/. Pinned
-# to the 0.7.x line because the vendored scenarios were synced from
-# 0.7.1 and may drift across minor versions.
+# The forge-guardrails runtime AND the eval harness are both vendored
+# under dflash/scripts/fixtures/forge_eval/ (eval driver alongside the
+# scenarios; runtime under ``_forge/``). Vendored from forge-guardrails
+# 0.7.1 — only the anthropic SDK is required at install time. See
+# scripts/fixtures/forge_eval/_forge/LICENSE for the upstream MIT.
 eval = [
-    "forge-guardrails>=0.7.1,<0.8",
     "anthropic>=0.40",
 ]
 

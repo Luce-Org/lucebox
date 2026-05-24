@@ -15,14 +15,14 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from forge.clients.base import ChunkType, LLMClient, StreamChunk
-from forge.context.manager import CompactEvent, ContextManager
-from forge.context.strategies import CompactStrategy, NoCompact, SlidingWindowCompact, TieredCompact
-from forge.core.messages import Message, MessageType
-from forge.core.runner import WorkflowRunner
-from forge.core.workflow import ToolCall, ToolDef, ToolSpec, Workflow
-from forge.errors import ForgeError, StreamError
-from forge.server import BudgetMode, ServerManager
+from ._forge.clients.base import ChunkType, LLMClient, StreamChunk
+from ._forge.context.manager import CompactEvent, ContextManager
+from ._forge.context.strategies import CompactStrategy, NoCompact, SlidingWindowCompact, TieredCompact
+from ._forge.core.messages import Message, MessageType
+from ._forge.core.runner import WorkflowRunner
+from ._forge.core.workflow import ToolCall, ToolDef, ToolSpec, Workflow
+from ._forge.errors import ForgeError, StreamError
+from ._forge.server import BudgetMode, ServerManager
 
 # Vendored: tests.eval.* imports rewired to local relative imports.
 from .ablation import ABLATION_PRESETS, AblationConfig

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from forge.core.workflow import ToolDef, ToolSpec, Workflow
+from .._forge.core.workflow import ToolDef, ToolSpec, Workflow
 
 from ._base import EvalScenario, _placeholder_workflow
 from ._compaction import (

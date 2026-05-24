@@ -7,11 +7,12 @@ corpus living in `bench_ds4_eval.py`; ds4-specific data, graders, and
 budget defaults stay colocated there so the upstream diff stays narrow.
 
 The `forge` area runs antoinezambelli/forge's tool-calling eval scenarios
-against our Anthropic-Messages-compatible ``/v1/messages`` endpoint. The
-runtime (forge.clients.AnthropicClient + forge.core.WorkflowRunner) comes
-from the ``forge-guardrails`` PyPI dep; the scenarios + ``run_eval``
-driver are vendored under ``scripts/fixtures/forge_eval/`` because forge's
-wheel does not ship its ``tests/eval`` tree.
+against our Anthropic-Messages-compatible ``/v1/messages`` endpoint. Both
+the runtime (``AnthropicClient`` + ``WorkflowRunner``) and the eval
+driver are vendored under ``scripts/fixtures/forge_eval/`` — the runtime
+in ``_forge/`` and the scenarios + ``run_eval`` driver alongside it. The
+``forge-guardrails`` PyPI dep is no longer required; only the
+``anthropic`` SDK is installed via the ``eval`` extra.
 
 Standalone `ds4-eval`, `long`, `forge`, and `all` runs are score-only
 unless `--min-pass-rate` is set explicitly.
@@ -527,10 +528,11 @@ def run_forge_area(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run antoinezambelli/forge tool-calling scenarios via /v1/messages.
 
-    Lazy-imports forge + the vendored ``forge_eval`` package so that
-    other areas (smoke, ds4-eval, long) keep working when ``forge-
-    guardrails`` is not installed. Builds an ``AnthropicClient`` pointed
-    at ``url`` (the Anthropic SDK appends ``/v1/messages``), then runs
+    Lazy-imports the vendored ``forge_eval`` package (which carries its
+    own ``_forge`` runtime) so that other areas (smoke, ds4-eval, long)
+    keep working when the ``anthropic`` SDK is not installed. Builds an
+    ``AnthropicClient`` pointed at ``url`` (the Anthropic SDK appends
+    ``/v1/messages``), then runs
     each scenario once via ``forge_eval.eval_runner.run_eval``.
 
     Returns ``(rows, forge_block)`` where ``rows`` is the per-scenario
@@ -550,10 +552,16 @@ def run_forge_area(
         sys.path.insert(0, str(fixtures_dir))
 
     try:
-        from forge.clients.anthropic import AnthropicClient
+        # AnthropicClient lives inside the vendored ``_forge`` tree —
+        # see dflash/scripts/fixtures/forge_eval/_forge/. The pypi
+        # ``forge-guardrails`` package is no longer required; only the
+        # ``anthropic`` SDK needs to be installed.
+        from forge_eval._forge.clients.anthropic import (  # type: ignore[import-not-found]
+            AnthropicClient,
+        )
     except ImportError as exc:
         raise SystemExit(
-            "[capability] --area forge requires forge-guardrails. "
+            "[capability] --area forge requires the ``anthropic`` SDK. "
             "Install via: pip install -e 'dflash[eval]' "
             f"(import failed: {exc})"
         ) from exc
@@ -650,7 +658,7 @@ def run_forge_area(
 
         rows.append({
             "area": "forge",
-            "source": "forge-guardrails",
+            "source": "forge-guardrails@0.7.1-vendored",
             "id": scenario_name,
             "name": f"forge/{scenario_name}",
             "kind": "tool-calling",
@@ -688,7 +696,7 @@ def run_forge_area(
 
     forge_block = {
         "scenarios": forge_scenarios,
-        "client": "forge.clients.AnthropicClient",
+        "client": "forge_eval._forge.clients.anthropic.AnthropicClient",
         "endpoint": f"{url.rstrip('/')}/v1/messages",
         "runs_per_scenario": 1,
         "tags_filter": tags,
@@ -706,9 +714,10 @@ def main() -> int:
         default="smoke",
         help=(
             "Case area to run. ``forge`` drives forge-guardrails' "
-            "tool-calling scenarios via /v1/messages (lazy-imports "
-            "forge_eval; the ``eval`` extra of dflash/pyproject.toml "
-            "must be installed)."
+            "tool-calling scenarios (vendored at "
+            "scripts/fixtures/forge_eval/) via /v1/messages. The "
+            "``eval`` extra of dflash/pyproject.toml (anthropic SDK) "
+            "must be installed."
         ),
     )
     ap.add_argument("--questions", type=int, default=None,

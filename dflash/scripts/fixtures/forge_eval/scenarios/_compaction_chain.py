@@ -17,7 +17,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from forge.core.workflow import ToolDef, ToolSpec, Workflow
+from .._forge.core.workflow import ToolDef, ToolSpec, Workflow
 
 from ._base import EvalScenario, _placeholder_workflow
 
