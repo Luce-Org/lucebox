@@ -1178,6 +1178,17 @@ def main() -> int:
             "Only meaningful with --area forge."
         ),
     )
+    ap.add_argument(
+        "--host-label",
+        default="",
+        help=(
+            "Free-form compute / hardware tag captured in the JSON output's "
+            "server_info.compute field (e.g. \"bragi RTX 5090 MaxQ 100W\" or "
+            "\"sindri RTX 3090 Ti 225W\"). Lets cross-host comparisons "
+            "attribute throughput differences to the actual GPU/power "
+            "envelope. Empty leaves the field None."
+        ),
+    )
     ap.add_argument("--json-out", type=Path)
     ap.add_argument("--trace", type=Path)
     ap.add_argument(
@@ -1240,6 +1251,39 @@ def main() -> int:
 
     rows: list[dict[str, Any]] = []
     forge_block: dict[str, Any] | None = None
+    # Probe the server's /props once at start so the JSON output records
+    # exactly which build/quant/model produced these rows. Symmetric with
+    # the OR per-row `provider` capture (servers like OR don't expose
+    # /props but do tag each response with their routing decision).
+    server_info: dict[str, Any] = {"compute": args.host_label or None}
+    try:
+        props_req = urllib.request.Request(args.url.rstrip('/') + "/props",
+                                            headers={"Accept": "application/json"})
+        with urllib.request.urlopen(props_req, timeout=10) as pr:
+            props = json.load(pr)
+        # Pull the fields actually useful for cross-run quant/perf analysis.
+        server_info.update({
+            "build_info":      props.get("build_info"),
+            "model_alias":     props.get("model_alias"),
+            "model_path":      props.get("model_path"),  # quant in filename
+            "model_arch":      (props.get("model") or {}).get("arch"),
+            "draft_path":      (props.get("model") or {}).get("draft_path"),
+            "kv_cache_k":      (props.get("runtime") or {}).get("kv_cache_k"),
+            "kv_cache_v":      (props.get("runtime") or {}).get("kv_cache_v"),
+            "fa_window":       (props.get("runtime") or {}).get("fa_window"),
+            "backend":         (props.get("runtime") or {}).get("backend"),
+            "think_max_tokens": (props.get("budget_envelope") or {}).get("think_max_tokens"),
+            "hard_limit_reply_budget": (props.get("budget_envelope") or {}).get("hard_limit_reply_budget"),
+            "model_card_name": (props.get("model_card") or {}).get("name"),
+            "model_card_source": (props.get("budget_envelope") or {}).get("model_card_source"),
+            "speculative":     props.get("speculative"),
+        })
+    except Exception:
+        # /props isn't always there (OpenRouter, plain OpenAI). That's fine —
+        # the OR runs already capture per-row provider/model_version, and the
+        # host-label still records compute. Leave server_info partial.
+        pass
+
     total_for_log = (
         len(selected) if args.area in case_areas else "forge"
     )
@@ -1249,6 +1293,11 @@ def main() -> int:
            if args.parallel > 1 and args.area in case_areas else ""),
         flush=True,
     )
+    if server_info.get("build_info") or server_info.get("compute"):
+        print(f"[capability] server={server_info.get('build_info','?')}  "
+              f"model={server_info.get('model_card_name','?')}  "
+              f"kv={server_info.get('kv_cache_k','?')}/{server_info.get('kv_cache_v','?')}  "
+              f"compute={server_info.get('compute','?')}", flush=True)
 
     def format_status(idx: int, case: dict[str, Any], row: dict[str, Any]) -> str:
         status = "PASS" if row["ok"] else "FAIL"
@@ -1376,6 +1425,7 @@ def main() -> int:
         "semantic_pass_rate": round(semantic_pass_rate, 4),
         "thinking_enabled": think,
         "min_pass_rate": min_pass_rate,
+        "server_info": server_info,
         "rows": rows,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
