@@ -114,9 +114,10 @@ run_client() {
   log "RESULT client=$client condition=$condition wall=${wall_s}s drafter_fwd=$drafter_fwd accept=$accept_rate ok_done=$ok_done rc=$rc"
   echo "{\"client\":\"$client\",\"condition\":\"$condition\",\"wall_s\":\"$wall_s\",\"drafter_fwd\":\"$drafter_fwd\",\"accept_rate\":\"$accept_rate\",\"ok_done\":\"$ok_done\",\"rc\":$rc,\"stamp\":\"$stamp\"}" >> "$JSONL"
 
-  # Kill any lingering server on non-zero rc to avoid GPU contention
+  # Kill any lingering server on non-zero rc to avoid GPU contention.
+  # Match on the specific binary path to avoid killing unrelated processes.
   if [[ $rc -ne 0 ]]; then
-    pkill -f "dflash_server" 2>/dev/null || true
+    pkill -f "$DFLASH_SERVER_BIN" 2>/dev/null || true
     sleep 2
   fi
 }

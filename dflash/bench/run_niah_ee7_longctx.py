@@ -218,6 +218,11 @@ def main():
     ap.add_argument("--contexts", nargs="+", type=int, default=CONTEXTS)
     args = ap.parse_args()
 
+    valid_conditions = {"baseline", "ee14", "ee7"}
+    unknown = set(args.conditions) - valid_conditions
+    if unknown:
+        sys.exit(f"[error] unknown condition(s): {sorted(unknown)}. Valid: {sorted(valid_conditions)}")
+
     results_dir = Path(args.out_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
 

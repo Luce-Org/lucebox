@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
 Pass B: Agentic claude_code harness for ee7 broad validation.
-Runs baseline, ee14, ee7 through run_claude_code.sh. Measures drafter_fwd,
-accept_rate, and OK_DONE for each condition.
+
+Purpose: measure drafter_fwd, accept_rate, and OK_DONE across baseline/ee14/ee7
+using the real claude_code client against a live dflash_server.
+Run manually from the drafter-fastpath worktree; results land in
+dflash/bench/results/2026-05-21_ee7_broad/. Keep as evidence trail for
+multi-client validation (commit 764b18e).
 """
 import os
 import re
@@ -79,15 +83,30 @@ def run_condition(cond: dict) -> dict:
 
     print(f"\n[passbv] running condition={name} stamp={stamp}", flush=True)
     t0 = time.perf_counter()
-    result = subprocess.run(
-        ["bash", str(HARNESS)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
-    elapsed = time.perf_counter() - t0
-    print(f"[passbv] condition={name} rc={result.returncode} elapsed={elapsed:.1f}s", flush=True)
+    try:
+        result = subprocess.run(
+            ["bash", str(HARNESS)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+        elapsed = time.perf_counter() - t0
+        print(f"[passbv] condition={name} rc={result.returncode} elapsed={elapsed:.1f}s", flush=True)
+    except subprocess.TimeoutExpired:
+        elapsed = time.perf_counter() - t0
+        print(f"[passbv] condition={name} TIMEOUT after {elapsed:.0f}s — marking as failed", flush=True)
+        return {
+            "condition": name,
+            "drafter_fwd_s": None,
+            "n_tokens": None,
+            "accept_rate": None,
+            "accept_detail": None,
+            "ok_done": False,
+            "run_dir": str(run_dir),
+            "rc": -1,
+            "error": "timeout",
+        }
 
     server_log = Path(f"/tmp/lucebox-harness-runs/{run_name}/server.log")
     client_out = Path(f"/tmp/lucebox-harness-runs/{run_name}/claude-code.out")
