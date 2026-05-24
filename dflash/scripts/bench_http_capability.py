@@ -556,6 +556,87 @@ def write_trace(path: Path, rows: list[dict[str, Any]]) -> None:
                 )
 
 
+def _forge_anthropic_finish_reason(stop_reason: str | None) -> str | None:
+    """Map Anthropic ``stop_reason`` → ds4-eval-style ``finish_reason`` token.
+
+    Anthropic emits ``end_turn`` / ``tool_use`` / ``max_tokens`` / ``stop_sequence``.
+    Translate to the OpenAI lexicon used by ds4-eval rows so downstream
+    consumers (trace dump, dashboards) don't have to special-case the area.
+    """
+    if stop_reason is None:
+        return None
+    mapping = {
+        "end_turn": "stop",
+        "stop_sequence": "stop",
+        "max_tokens": "length",
+        "tool_use": "tool_calls",
+    }
+    return mapping.get(stop_reason, stop_reason)
+
+
+def _forge_extract_timings(raw_usage: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Pull dflash's ``usage.timings`` sub-block from a raw anthropic Message dump.
+
+    Our cpp-server (post-#37) emits ``usage.timings`` with ``prefill_ms``,
+    ``decode_ms``, ``decode_tokens_per_sec`` etc. OR/Anthropic backends
+    don't surface this — return None so consumers degrade gracefully.
+    """
+    if not isinstance(raw_usage, dict):
+        return None
+    t = raw_usage.get("timings")
+    if not isinstance(t, dict):
+        return None
+    # Carry the keys verbatim plus a derived prefill_tokens_per_sec when
+    # we have prompt_tokens and prefill_ms — mirrors the ds4-eval path.
+    out = dict(t)
+    pt = raw_usage.get("input_tokens")
+    pms = out.get("prefill_ms")
+    try:
+        if pt and pms and float(pms) > 0:
+            out["prefill_tokens_per_sec"] = round(pt * 1000.0 / float(pms), 1)
+    except (TypeError, ValueError):
+        pass
+    return out
+
+
+def _forge_aggregate_timings(per_call: list[dict[str, Any] | None]) -> dict[str, Any] | None:
+    """Sum prefill_ms / decode_ms across iterations; weighted-mean tok/s.
+
+    Returns None when no iteration reports timings. Backends that only
+    emit timings on a subset of calls still produce a usable aggregate
+    over the calls that did report.
+    """
+    have_any = False
+    pf_ms = 0.0
+    de_ms = 0.0
+    dec_tok = 0.0  # estimated from decode_tokens_per_sec * decode_ms / 1000
+    pf_tok = 0.0
+    for t in per_call:
+        if not isinstance(t, dict):
+            continue
+        have_any = True
+        try:
+            pf_ms += float(t.get("prefill_ms") or 0.0)
+            de_ms += float(t.get("decode_ms") or 0.0)
+            dtps = float(t.get("decode_tokens_per_sec") or 0.0)
+            ptps = float(t.get("prefill_tokens_per_sec") or 0.0)
+            dec_tok += dtps * float(t.get("decode_ms") or 0.0) / 1000.0
+            pf_tok += ptps * float(t.get("prefill_ms") or 0.0) / 1000.0
+        except (TypeError, ValueError):
+            continue
+    if not have_any:
+        return None
+    agg: dict[str, Any] = {
+        "prefill_ms": round(pf_ms, 3),
+        "decode_ms": round(de_ms, 3),
+    }
+    if de_ms > 0 and dec_tok > 0:
+        agg["decode_tokens_per_sec"] = round(dec_tok * 1000.0 / de_ms, 1)
+    if pf_ms > 0 and pf_tok > 0:
+        agg["prefill_tokens_per_sec"] = round(pf_tok * 1000.0 / pf_ms, 1)
+    return agg
+
+
 def run_forge_area(
     url: str,
     *,
@@ -571,19 +652,25 @@ def run_forge_area(
 
     Lazy-imports the vendored ``forge_eval`` package (which carries its
     own ``_forge`` runtime) so that other areas (smoke, ds4-eval, long)
-    keep working when the ``anthropic`` SDK is not installed. Builds an
-    ``AnthropicClient`` pointed at ``url`` (the Anthropic SDK appends
-    ``/v1/messages``), then runs
-    each scenario once via ``forge_eval.eval_runner.run_eval``.
+    keep working when the ``anthropic`` SDK is not installed. Builds a
+    *recording* subclass of ``AnthropicClient`` pointed at ``url``
+    (the Anthropic SDK appends ``/v1/messages``) so we can intercept the
+    raw per-call API response (stop_reason, usage, usage.timings, raw
+    content blocks) BEFORE forge collapses it into the parsed
+    ``LLMResponse``. Each scenario is then driven through
+    ``forge_eval.eval_runner.run_scenario`` so its iteration log can be
+    isolated and aggregated into the enriched row.
 
-    Returns ``(rows, forge_block)`` where ``rows`` is the per-scenario
-    summary in the shape ``bench_http_capability`` already uses for its
-    table output and ``forge_block`` carries the raw forge-specific
-    detail (token counts, iteration counts, error type, …) for
+    Returns ``(rows, forge_block)`` where ``rows`` carries the same
+    ds4-eval-shaped fields (http_status, finish_reason, prompt_tokens,
+    completion_tokens, timings, prompt, output, …) PLUS a per-call
+    ``iterations[]`` breakdown. ``forge_block`` keeps the older
+    forge-specific summary for backward compatibility with existing
     ``--json-out`` consumers.
     """
     import asyncio
-    import os
+    import json as _json
+    import time as _time
 
     # Vendored fixtures live next to this script. The path append is
     # local to this function so other areas don't see the forge_eval
@@ -600,6 +687,9 @@ def run_forge_area(
         from forge_eval._forge.clients.anthropic import (  # type: ignore[import-not-found]
             AnthropicClient,
         )
+        from forge_eval._forge.core.workflow import (  # type: ignore[import-not-found]
+            TextResponse,
+        )
     except ImportError as exc:
         raise SystemExit(
             "[capability] --area forge requires the ``anthropic`` SDK. "
@@ -612,7 +702,7 @@ def run_forge_area(
             ALL_SCENARIOS,
             EvalConfig,
             RunResult,
-            run_eval,
+            run_scenario,
         )
     except ImportError as exc:
         raise SystemExit(
@@ -628,7 +718,169 @@ def run_forge_area(
         # ``x-api-key`` header itself, so we just need a non-empty value.
         api_key = auth_header.removeprefix("Bearer ").strip() or "dummy"
 
-    client = AnthropicClient(
+    # ── Recording client ──────────────────────────────────────────────
+    # Subclass AnthropicClient and override ``send`` so we can record the
+    # raw SDK Message (stop_reason, usage with timings, content blocks)
+    # BEFORE _parse_response collapses it to a forge LLMResponse.
+    # The bench's ds4-eval path uses urllib + direct JSON access; here
+    # we ride the Anthropic SDK so we must reach for ``model_dump()`` /
+    # attribute access on the typed Message.
+    class _RecordingAnthropicClient(AnthropicClient):  # type: ignore[misc, valid-type]
+        """AnthropicClient that records every send() into ``iteration_log``.
+
+        Each entry is a dict with: wall_s, http_status (200 on success,
+        BackendError.code on failure), finish_reason (OpenAI lexicon),
+        stop_reason (raw Anthropic), prompt_tokens, completion_tokens,
+        tool_calls (list of {name, arguments}), prompt (the messages
+        we sent, serialized), output (text content concat), reasoning
+        (text emitted alongside tool_use blocks — Anthropic puts the
+        "thinking-out-loud" text in plain text blocks ahead of the
+        tool_use), timings (dflash usage.timings or None), error (str
+        when send raised), raw_usage (the full usage dict for forensic
+        re-grading).
+        """
+
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            super().__init__(*a, **kw)
+            self.iteration_log: list[dict[str, Any]] = []
+
+        def reset_log(self) -> None:
+            """Clear iteration log before driving the next scenario."""
+            self.iteration_log.clear()
+
+        async def send(  # type: ignore[override]
+            self,
+            messages: list[dict[str, Any]],
+            tools: Any = None,
+            sampling: dict[str, Any] | None = None,
+            passthrough: dict[str, Any] | None = None,
+            inbound_anthropic_body: dict[str, Any] | None = None,
+        ) -> Any:
+            # Snapshot what forge is about to send so we can attribute
+            # the request-shape (incl. tool-call history) to this
+            # iteration. Best-effort serialize — anthropic-shape blocks
+            # are JSON-safe dicts of strings.
+            try:
+                prompt_blob = _json.dumps(messages, ensure_ascii=False, default=str)
+            except Exception:
+                prompt_blob = str(messages)
+
+            # Reach past the parent's send() so we can grab the raw SDK
+            # Message before _parse_response throws away usage / stop_reason.
+            from forge_eval._forge.errors import BackendError  # type: ignore[import-not-found]
+            import anthropic as _anthropic  # type: ignore[import-not-found]
+
+            kwargs = self._build_kwargs(
+                messages, tools, passthrough, inbound_anthropic_body,
+            )
+            t0 = _time.perf_counter()
+            record: dict[str, Any] = {
+                "wall_s": 0.0,
+                "http_status": None,
+                "finish_reason": None,
+                "stop_reason": None,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "tool_calls": [],
+                "prompt": prompt_blob,
+                "output": "",
+                "reasoning_content": "",
+                "timings": None,
+                "raw_usage": None,
+                "error": None,
+            }
+            try:
+                response = await self._client.messages.create(**kwargs)
+            except _anthropic.APIError as exc:
+                record["wall_s"] = round(_time.perf_counter() - t0, 4)
+                record["http_status"] = getattr(exc, "status_code", 0) or 0
+                record["error"] = f"{type(exc).__name__}: {exc}"
+                self.iteration_log.append(record)
+                # Preserve forge's error contract — the runner expects
+                # BackendError to surface as a ForgeError so it lands in
+                # RunResult.error_type. Don't bury a 5xx as a silent FAIL.
+                raise BackendError(
+                    getattr(exc, "status_code", 0), str(exc)
+                ) from exc
+
+            record["wall_s"] = round(_time.perf_counter() - t0, 4)
+            record["http_status"] = 200
+
+            # Pull the typed fields off the SDK Message. usage.input_tokens
+            # / output_tokens are stable; ``stop_reason`` is the Anthropic
+            # close lexicon. ``model_dump()`` is the safe path for the
+            # nested usage.timings the cpp-server emits (the SDK won't
+            # know about that custom field so attribute access fails).
+            try:
+                record["prompt_tokens"] = int(response.usage.input_tokens)
+                record["completion_tokens"] = int(response.usage.output_tokens)
+            except (AttributeError, TypeError, ValueError):
+                pass
+            stop_reason = getattr(response, "stop_reason", None)
+            record["stop_reason"] = stop_reason
+            record["finish_reason"] = _forge_anthropic_finish_reason(stop_reason)
+            raw_usage: dict[str, Any] | None = None
+            try:
+                dumped = response.model_dump()
+                raw_usage = dumped.get("usage") if isinstance(dumped, dict) else None
+            except Exception:
+                raw_usage = None
+            record["raw_usage"] = raw_usage
+            record["timings"] = _forge_extract_timings(raw_usage)
+
+            # Walk the content blocks to split text (reasoning when
+            # paired with tool_use) and tool_calls.
+            text_parts: list[str] = []
+            tool_calls_out: list[dict[str, Any]] = []
+            tool_uses_present = False
+            for block in getattr(response, "content", []) or []:
+                btype = getattr(block, "type", None)
+                if btype == "tool_use":
+                    tool_uses_present = True
+                    args = getattr(block, "input", None)
+                    if not isinstance(args, dict):
+                        try:
+                            args = dict(args or {})
+                        except Exception:
+                            args = {}
+                    tool_calls_out.append({
+                        "id": getattr(block, "id", None),
+                        "name": getattr(block, "name", None),
+                        "arguments": args,
+                    })
+                elif btype == "text":
+                    text_parts.append(getattr(block, "text", "") or "")
+            text_joined = "\n".join(text_parts)
+            record["tool_calls"] = tool_calls_out
+            if tool_uses_present:
+                # Anthropic shape: text alongside tool_use is the model's
+                # narration / chain-of-thought for the call. Mirror the
+                # ds4-eval convention and surface it as reasoning_content
+                # so consumers can grep both areas the same way.
+                record["reasoning_content"] = text_joined
+                record["output"] = ""
+            else:
+                record["output"] = text_joined
+
+            self.iteration_log.append(record)
+
+            # Update last_usage so forge's context manager keeps working
+            # — see AnthropicClient.send for the source-of-truth shape.
+            from forge_eval._forge.clients.base import TokenUsage  # type: ignore[import-not-found]
+            try:
+                self.last_usage = {
+                    0: TokenUsage(
+                        prompt_tokens=int(response.usage.input_tokens),
+                        completion_tokens=int(response.usage.output_tokens),
+                        total_tokens=int(response.usage.input_tokens)
+                        + int(response.usage.output_tokens),
+                    )
+                }
+            except (AttributeError, TypeError, ValueError):
+                pass
+            return self._parse_response(response)
+
+    client = _RecordingAnthropicClient(
         model=model,
         api_key=api_key,
         base_url=url.rstrip("/"),
@@ -637,7 +889,15 @@ def run_forge_area(
         max_retries=0,  # let bench surface errors directly; no retry storms
     )
 
-    scenarios = list(ALL_SCENARIOS)
+    all_scenarios = list(ALL_SCENARIOS)
+    # Apply tag and name filters here (forge's run_eval did this internally
+    # but we drive run_scenario directly to isolate the iteration log per
+    # scenario; reuse the same selection rules).
+    scenarios = all_scenarios
+    if tags:
+        scenarios = [s for s in scenarios if any(t in s.tags for t in tags)]
+    if names:
+        scenarios = [s for s in scenarios if s.name in names]
     if questions is not None and questions >= 0:
         scenarios = scenarios[:questions]
 
@@ -655,23 +915,36 @@ def run_forge_area(
         f"tags={tags or 'all'} names={names or 'all'}",
         flush=True,
     )
-    raw_results: dict[str, list[RunResult]] = asyncio.run(
-        run_eval(
-            client,
-            scenarios,
-            config,
-            resolved_budget=None,
-            tags=tags,
-            names=names,
-            ablation=None,
-        )
-    )
+
+    # Drive scenarios one at a time so each gets its own iteration log
+    # snapshot. forge's run_scenario already runs a single scenario once
+    # — we just have to reset the recorder between calls.
+    async def _drive_all() -> list[tuple[Any, "RunResult", list[dict[str, Any]]]]:
+        out: list[tuple[Any, RunResult, list[dict[str, Any]]]] = []
+        for scenario in scenarios:
+            client.reset_log()
+            result = await run_scenario(client, scenario, config, ablation=None)
+            # Snapshot the log NOW — the next scenario will mutate it.
+            iter_log = [dict(r) for r in client.iteration_log]
+            status = (
+                "OK" if result.completeness and result.accuracy is not False
+                else ("OK (incorrect)" if result.completeness else f"FAIL ({result.error_type})")
+            )
+            print(
+                f"  {scenario.name}: {status} — "
+                f"{result.iterations_used} iterations, "
+                f"{result.elapsed_seconds:.1f}s",
+                flush=True,
+            )
+            out.append((scenario, result, iter_log))
+        return out
+
+    driven = asyncio.run(_drive_all())
 
     rows: list[dict[str, Any]] = []
     forge_scenarios: list[dict[str, Any]] = []
-    for idx, (scenario_name, run_list) in enumerate(raw_results.items(), start=1):
-        # runs_per_scenario=1, so pick the first (and only) RunResult.
-        result = run_list[0] if run_list else None
+    for idx, (scenario, result, iter_log) in enumerate(driven, start=1):
+        scenario_name = scenario.name
         if result is None:
             graded_pass = False
             error_type = "no_runs"
@@ -680,6 +953,7 @@ def run_forge_area(
             iterations = 0
             accuracy = None
             completeness = False
+            error_message = None
         else:
             completeness = bool(result.completeness)
             # forge grades pass = completed AND validator did not return
@@ -688,6 +962,7 @@ def run_forge_area(
             accuracy = result.accuracy
             graded_pass = completeness and (accuracy is not False)
             error_type = result.error_type
+            error_message = result.error_message
             elapsed = result.elapsed_seconds
             iterations = result.iterations_used
             if not completeness:
@@ -697,12 +972,56 @@ def run_forge_area(
             else:
                 row_status = "passed"
 
+        # Aggregate iteration-level metrics into the scenario row.
+        prompt_tokens_sum = sum(
+            int(r.get("prompt_tokens") or 0) for r in iter_log
+        )
+        completion_tokens_sum = sum(
+            int(r.get("completion_tokens") or 0) for r in iter_log
+        )
+        # Forge runs without thinking (--no-think); the Anthropic shape
+        # doesn't split reasoning tokens out of completion_tokens. Until
+        # we wire a thinking-aware count, the conservative report is
+        # thinking_tokens=0 and content_tokens=completion_tokens.
+        thinking_tokens_sum = 0
+        content_tokens_sum = completion_tokens_sum
+
+        agg_timings = _forge_aggregate_timings([r.get("timings") for r in iter_log])
+
+        # Final-iteration top-level fields. Empty when iter_log is empty
+        # (e.g. import-time failure before the first call landed).
+        final = iter_log[-1] if iter_log else {}
+
+        # Build per-iteration rows. Strip raw_usage from the public
+        # iteration shape — it's redundant once we've extracted timings
+        # and (prompt|completion)_tokens, and bloats the JSON. Keep
+        # everything else.
+        iterations_out: list[dict[str, Any]] = []
+        for i, r in enumerate(iter_log, start=1):
+            iterations_out.append({
+                "i": i,
+                "wall_s": r.get("wall_s"),
+                "http_status": r.get("http_status"),
+                "finish_reason": r.get("finish_reason"),
+                "stop_reason": r.get("stop_reason"),
+                "prompt_tokens": r.get("prompt_tokens"),
+                "completion_tokens": r.get("completion_tokens"),
+                "tool_calls": r.get("tool_calls") or [],
+                "timings": r.get("timings"),
+                "reasoning_content": r.get("reasoning_content") or "",
+                "prompt": r.get("prompt") or "",
+                "output": r.get("output") or "",
+                "error": r.get("error"),
+            })
+
         rows.append({
+            # Identity (unchanged)
             "area": "forge",
             "source": "forge-guardrails@0.7.1-vendored",
             "id": scenario_name,
             "name": f"forge/{scenario_name}",
             "kind": "tool-calling",
+            # Aggregate verdict (unchanged)
             "status": row_status,
             "ok": graded_pass,
             "graded_pass": graded_pass,
@@ -712,14 +1031,28 @@ def run_forge_area(
             "semantic_pass": False,
             "given": "PASS" if graded_pass else (error_type or "FAIL"),
             "correct": ["PASS"],
+            # Aggregate timing / tokens — now actually populated.
             "wall_s": round(elapsed, 3),
-            # forge's AnthropicClient doesn't propagate the server's
-            # usage.timings into RunResult — keep the key for schema
-            # parity with the ds4/smoke rows; format_timings_suffix()
-            # omits the printed suffix when this is None.
-            "timings": None,
-            "prompt": "",
-            "output": "",
+            "prompt_tokens": prompt_tokens_sum or None,
+            "completion_tokens": completion_tokens_sum or None,
+            "thinking_tokens": thinking_tokens_sum,
+            "content_tokens": content_tokens_sum or None,
+            "iterations_used": iterations,
+            "timings": agg_timings,
+            "timed_out": (error_type in {"TimeoutError", "ReadTimeoutError"}),
+            "finish_reason": final.get("finish_reason"),
+            # forge doesn't use the dflash thinking-budget close path,
+            # so close_kind is always null. Kept for ds4-eval schema parity.
+            "close_kind": None,
+            "http_status": final.get("http_status"),
+            "reasoning_content": "\n".join(
+                r.get("reasoning_content") or "" for r in iter_log
+            ).strip(),
+            # Final-iteration content (existing fields, now populated).
+            "prompt": final.get("prompt") or "",
+            "output": final.get("output") or "",
+            # NEW: per-call detail.
+            "iterations": iterations_out,
         })
         forge_scenarios.append({
             "name": scenario_name,
@@ -728,7 +1061,7 @@ def run_forge_area(
             "graded_pass": graded_pass,
             "iterations_used": iterations,
             "error_type": error_type,
-            "error_message": getattr(result, "error_message", None) if result else None,
+            "error_message": error_message,
             "elapsed_seconds": round(elapsed, 3),
             "input_tokens": getattr(result, "input_tokens", 0) if result else 0,
             "output_tokens": getattr(result, "output_tokens", 0) if result else 0,
