@@ -492,6 +492,15 @@ def run_case(
         if pt and pms and float(pms) > 0:
             timings = {**timings,
                        "prefill_tokens_per_sec": round(pt * 1000.0 / float(pms), 1)}
+    # OpenRouter attribution: which provider actually served this request,
+    # what versioned model id was used, and the inference cost. None of
+    # these are emitted by dflash_server (we know our own provider/model)
+    # but the OR JSON exposes them and we were silently discarding them.
+    # Keeping them per-row lets cross-provider quant analysis attribute
+    # accuracy / latency to the actual fp8 vs bf16 routing decision.
+    or_provider = data.get("provider")
+    or_model_version = data.get("model")
+    or_cost = usage.get("cost")
     return {
         "area": case["area"],
         "source": case["source"],
@@ -507,6 +516,9 @@ def run_case(
         "close_kind": finish_details.get("close_kind"),
         "thinking_tokens": thinking_tokens_final,
         "content_tokens": content_tokens_final,
+        "provider": or_provider,
+        "model_version": or_model_version,
+        "cost_usd": or_cost,
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
         "timings": timings,
