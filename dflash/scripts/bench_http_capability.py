@@ -328,21 +328,20 @@ def format_timings_suffix(timings: dict[str, Any] | None) -> str:
     """
     if not isinstance(timings, dict):
         return ""
-    # Require at least one of the three keys to be present; otherwise
-    # the response had no real timings (just an empty dict or partial
-    # payload) and the suffix would be misleading 0s.
     if not any(k in timings for k in
-               ("prefill_ms", "decode_ms", "decode_tokens_per_sec")):
+               ("prefill_ms", "decode_ms", "decode_tokens_per_sec",
+                "prefill_tokens_per_sec")):
         return ""
     try:
         prefill_ms = float(timings.get("prefill_ms", 0.0))
         decode_ms = float(timings.get("decode_ms", 0.0))
-        tps = float(timings.get("decode_tokens_per_sec", 0.0))
+        dec_tps = float(timings.get("decode_tokens_per_sec", 0.0))
+        pre_tps = float(timings.get("prefill_tokens_per_sec", 0.0))
     except (TypeError, ValueError):
         return ""
     return (
-        f" prefill={prefill_ms / 1000.0:.1f}s "
-        f"decode={decode_ms / 1000.0:.1f}s {tps:.1f}tok/s"
+        f" prefill={prefill_ms / 1000.0:.1f}s/{pre_tps:.0f}tps "
+        f"decode={decode_ms / 1000.0:.1f}s/{dec_tps:.0f}tps"
     )
 
 
@@ -406,13 +405,26 @@ def run_case(
             data = json.loads(resp.read())
             http_status = resp.status
     except Exception as e:
+        # Distinguish timeout from other errors so the JSON row carries a
+        # clean flag rather than forcing readers to grep the error string.
+        # urllib raises socket.timeout (wrapped by urllib.error.URLError
+        # in older releases) for read-timeouts; the message also contains
+        # "timed out" / "timeout".
+        import socket
+        err_str = str(e)
+        timed_out = (
+            isinstance(e, socket.timeout)
+            or "timed out" in err_str.lower()
+            or "timeout" in err_str.lower()
+        )
         return {
             "source": case["source"],
             "id": case["id"],
             "name": f"{case['source']}/{case['id']}",
             "status": "error",
             "ok": False,
-            "error": str(e),
+            "error": err_str,
+            "timed_out": timed_out,
             "wall_s": round(time.perf_counter() - t0, 3),
             "prompt": prompt,
             "output": "",
@@ -452,6 +464,15 @@ def run_case(
     # bench printout and JSON degrade gracefully when None.
     raw_timings = usage.get("timings")
     timings = raw_timings if isinstance(raw_timings, dict) else None
+    # Derive prefill_tokens_per_sec from prompt_tokens / prefill_ms when both
+    # are present. Server's usage.timings emits decode_tokens_per_sec but not
+    # the prefill side (spec §6.3); deriving it here keeps the row uniform.
+    if isinstance(timings, dict):
+        pt = usage.get("prompt_tokens")
+        pms = timings.get("prefill_ms")
+        if pt and pms and float(pms) > 0:
+            timings = {**timings,
+                       "prefill_tokens_per_sec": round(pt * 1000.0 / float(pms), 1)}
     return {
         "area": case["area"],
         "source": case["source"],
@@ -470,6 +491,7 @@ def run_case(
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
         "timings": timings,
+        "timed_out": False,
         "given": got,
         "correct": expected,
         "wall_s": round(wall, 3),
@@ -867,16 +889,18 @@ def main() -> int:
     def format_status(idx: int, case: dict[str, Any], row: dict[str, Any]) -> str:
         status = "PASS" if row["ok"] else "FAIL"
         correct = "|".join(expected_answers(case))
-        # usage.timings (spec §6.3): dflash_server emits per-request
-        # prefill/decode wall-clock; tack it onto the bench line so the
-        # bench.log captures the throughput breakdown. Returns "" when
-        # the backend (OpenRouter, older sindri) didn't surface timings.
         timings_suffix = format_timings_suffix(row.get("timings"))
+        # Thinking-token count from finish_details (qwen thinking opt-in);
+        # None when not provided.
+        tt = row.get("thinking_tokens")
+        tt_suffix = f" thk={tt}" if tt is not None else ""
+        # Timeout marker — flag explicitly so it stands out in the log.
+        timeout_suffix = " TIMEOUT" if row.get("timed_out") else ""
         return (
             f"  {idx:2d} {status:4s} {case['source']:14s} {case['id']:20s} "
             f"given={row.get('given', '?')} correct={correct} "
             f"format={row.get('format_pass')} hint={row.get('semantic_hint')} "
-            f"wall={row['wall_s']:.2f}s{timings_suffix}"
+            f"wall={row['wall_s']:.2f}s{timings_suffix}{tt_suffix}{timeout_suffix}"
         )
 
     # Case-area runner (smoke / ds4-eval / long / all). Parallel is opt-in
