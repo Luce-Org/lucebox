@@ -1020,17 +1020,17 @@ void HttpServer::worker_loop() {
 
         // Level 2 force-close: when thinking is opted in, the server is
         // configured with a hard-limit reply budget, and we resolved the
-        // close-tag token at startup, wire the BudgetHook so the backend's
-        // AR decode injects `</think>` at the budget boundary. This
-        // supersedes Level 1's phase-2 reprompt for most cases — the model
-        // gets to write the visible answer in-stream rather than having
-        // its KV state reset by the reprompt. Phase-2 still runs as a
-        // fallback if the model fails to close `</think>` (e.g. when
-        // force-close didn't fire because the budget never tightened).
-        if (budget_active && config_.think_close_token_id >= 0 &&
+        // close-tag sequence at startup, wire the BudgetHook so the
+        // backend's AR decode injects `</think>` at the budget boundary.
+        // This supersedes Level 1's phase-2 reprompt for most cases — the
+        // model gets to write the visible answer in-stream rather than
+        // having its KV state reset by the reprompt. Phase-2 still runs
+        // as a fallback if the model fails to close `</think>` (e.g.
+        // when force-close didn't fire because the budget never tightened).
+        if (budget_active && !config_.think_close_token_ids.empty() &&
             config_.hard_limit_reply_budget > 0)
         {
-            gen_req.budget_hook.close_token_id = config_.think_close_token_id;
+            gen_req.budget_hook.close_token_ids = config_.think_close_token_ids;
             gen_req.budget_hook.hard_limit_remaining = config_.hard_limit_reply_budget;
         }
 

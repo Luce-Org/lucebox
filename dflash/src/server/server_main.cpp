@@ -494,26 +494,31 @@ int main(int argc, char ** argv) {
     // expose the GGUF metadata key it was loaded from, so leave empty
     // and let /props report null. (Add a getter on Tokenizer later.)
 
-    // Resolve `</think>` close-tag token for Level 2 force-close. For
-    // Qwen3.6 this is a single special token (id 248069); other archs
-    // may not have it, in which case the hook is disabled (close_id = -1).
-    // The encode() path picks up the special-token mapping the tokenizer
-    // built at load_from_gguf time.
+    // Resolve `</think>` close-tag sequence for Level 2 force-close. For
+    // Qwen3.6 this is a single special token (id 248069); for DeepSeek
+    // and laguna it tokenizes to multiple ordinary tokens (~3 for
+    // DeepSeek-V3: [1718, 37947, 32]). BudgetHook now supports both —
+    // the sampling loop injects the sequence across consecutive
+    // iterations. The encode() path picks up the special-token mapping
+    // the tokenizer built at load_from_gguf time.
     if (sconfig.hard_limit_reply_budget > 0) {
         auto close_ids = tokenizer.encode("</think>");
-        if (close_ids.size() == 1) {
-            sconfig.think_close_token_id = close_ids[0];
+        if (!close_ids.empty()) {
+            sconfig.think_close_token_ids = close_ids;
             std::fprintf(stderr,
-                "[server] level-2 force-close: </think> = token %d, "
-                "hard_limit_reply_budget = %d\n",
-                sconfig.think_close_token_id, sconfig.hard_limit_reply_budget);
+                "[server] level-2 force-close: </think> = ");
+            for (size_t i = 0; i < close_ids.size(); ++i) {
+                std::fprintf(stderr, "%s%d", i ? "," : "", close_ids[i]);
+            }
+            std::fprintf(stderr,
+                " (%zu token%s), hard_limit_reply_budget = %d\n",
+                close_ids.size(), close_ids.size() == 1 ? "" : "s",
+                sconfig.hard_limit_reply_budget);
         } else {
             std::fprintf(stderr,
                 "[server] level-2 force-close DISABLED: </think> tokenizes "
-                "to %zu tokens (expected 1); multi-token close not yet "
-                "supported. Falling back to Level 1 phase-2 reprompt only.\n",
-                close_ids.size());
-            sconfig.think_close_token_id = -1;
+                "to empty (tokenizer reject?). Falling back to Level 1 "
+                "phase-2 reprompt only.\n");
         }
     }
 

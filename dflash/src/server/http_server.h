@@ -66,13 +66,13 @@ struct ServerConfig {
     // 1 phase-2 reprompt only).
     int         hard_limit_reply_budget = 512;
 
-    // Token IDs resolved at server startup for the model's
-    // </think> close tag (typically a single special token for Qwen3.6,
-    // id 248069). When non-empty, used as the close_token_id for
-    // BudgetHook. server_main populates this from the tokenizer after
-    // loading; HttpServer just forwards into GenerateRequest.budget_hook
-    // when thinking is opted in.
-    int32_t     think_close_token_id = -1;
+    // Token IDs resolved at server startup for the model's </think>
+    // close-tag sequence. Single special token for Qwen3.6 (id 248069);
+    // multiple tokens for DeepSeek/laguna ([1718, 37947, 32]). When
+    // non-empty, used as BudgetHook.close_token_ids. server_main
+    // populates this from the tokenizer after loading; HttpServer just
+    // forwards into GenerateRequest.budget_hook when thinking is opted in.
+    std::vector<int32_t> think_close_token_ids;
 
     // /props introspection inputs — captured at startup by server_main so
     // the /props handler doesn't need to crack open BackendArgs or env.

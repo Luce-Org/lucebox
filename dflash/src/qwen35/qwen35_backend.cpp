@@ -732,25 +732,70 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                   std::vector<int32_t> & out_tokens,
                                   const DaemonIO & io,
                                   const BudgetHook & budget_hook) {
-    // Budget hook state: set to true once we've injected the close token
-    // so we don't inject it twice on subsequent iterations (the model
-    // continues generating after the injection to write the visible
-    // answer in the remaining budget).
-    bool budget_close_injected = false;
+    // Budget hook state.
+    //   - budget_close_started: true once we've begun injecting the close
+    //     sequence. Prevents re-triggering on continued forward generation.
+    //   - close_inject_pos: index into budget_hook.close_token_ids for the
+    //     NEXT token to inject. While < close_token_ids.size(), each
+    //     iteration overrides the sampled token with the corresponding
+    //     close-sequence token (single-token close = 1 override and done;
+    //     multi-token close like DeepSeek/laguna [1718,37947,32] = 3
+    //     consecutive overrides). Once equal to close_token_ids.size(),
+    //     normal sampling resumes (model writes visible answer).
+    bool budget_close_started = false;
+    int  close_inject_pos     = 0;
     auto maybe_force_close = [&](int32_t & tok, int committed_now) {
-        if (budget_close_injected) return;
-        if (budget_hook.close_token_id < 0) return;
+        if (budget_hook.close_token_ids.empty()) return;
+
+        // Continue an already-started multi-token close sequence.
+        if (budget_close_started &&
+            close_inject_pos < (int)budget_hook.close_token_ids.size())
+        {
+            int32_t inj = budget_hook.close_token_ids[close_inject_pos];
+            std::fprintf(stderr,
+                "[budget-hook] close-seq continue %d/%zu: overriding "
+                "sampled token %d with %d\n",
+                close_inject_pos + 1,
+                budget_hook.close_token_ids.size(), tok, inj);
+            tok = inj;
+            close_inject_pos++;
+            return;
+        }
+
+        // Already injected the full sequence — no further overrides.
+        if (budget_close_started) return;
+
+        // Check if budget has tightened to the force-close trigger.
         int remaining = n_gen - committed_now;
-        if (remaining <= budget_hook.hard_limit_remaining &&
-            tok != budget_hook.close_token_id) {
+        if (remaining <= budget_hook.hard_limit_remaining) {
+            // Don't trigger if the model already sampled the first close
+            // token naturally — avoids a redundant override.
+            int32_t first_close = budget_hook.close_token_ids.front();
+            if (tok == first_close) {
+                // Model self-closed at the boundary; consume that token
+                // as the first of the sequence so we still inject the
+                // remaining members (multi-token case) but don't double-emit.
+                budget_close_started = true;
+                close_inject_pos = 1;
+                std::fprintf(stderr,
+                    "[budget-hook] model self-emitted close[0]=%d at "
+                    "committed=%d/%d (remaining=%d <= hard_limit=%d); "
+                    "consuming as start of close sequence (%zu total)\n",
+                    first_close, committed_now, n_gen, remaining,
+                    budget_hook.hard_limit_remaining,
+                    budget_hook.close_token_ids.size());
+                return;
+            }
             std::fprintf(stderr,
                 "[budget-hook] force-close at committed=%d/%d (remaining=%d "
-                "<= hard_limit=%d): overriding sampled token %d with close=%d\n",
+                "<= hard_limit=%d): overriding sampled token %d with close[0]=%d "
+                "(seq len %zu)\n",
                 committed_now, n_gen, remaining,
-                budget_hook.hard_limit_remaining, tok,
-                budget_hook.close_token_id);
-            tok = budget_hook.close_token_id;
-            budget_close_injected = true;
+                budget_hook.hard_limit_remaining, tok, first_close,
+                budget_hook.close_token_ids.size());
+            tok = first_close;
+            budget_close_started = true;
+            close_inject_pos = 1;
         }
     };
     if (n_gen <= 0) return true;
@@ -916,7 +961,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // `first_tok = cache_.last_tok` seed is correct. Without this
         // sync, AR would re-seed from the prefill's last argmax (stale
         // by `n_generated` positions) and produce garbage continuation.
-        if (budget_hook && budget_hook->close_token_id >= 0) {
+        if (budget_hook && !budget_hook->close_token_ids.empty()) {
             int hard = budget_hook->hard_limit_remaining;
             // Tail when remaining <= hard + one spec-decode batch worth of
             // headroom. Ensures the force-close fires within the AR tail

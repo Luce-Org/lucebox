@@ -185,9 +185,9 @@ private:
                         const BudgetHook * budget_hook = nullptr);
 
     // AR decode fallback (no draft model or sampling mode).
-    // budget_hook (when close_token_id >= 0) overrides the next sampled
-    // token with close_token_id once (n_gen - committed) <= hard_limit.
-    // Mirrors antirez/ds4 ds4_eval.c's hard_limit_reply_budget.
+    // budget_hook (when close_token_ids is non-empty) overrides the next
+    // sampled token(s) with the close-tag sequence once (n_gen - committed)
+    // <= hard_limit. Mirrors antirez/ds4 ds4_eval.c's hard_limit_reply_budget.
     bool do_ar_decode(int committed, int n_gen,
                       std::vector<int32_t> & out_tokens,
                       const DaemonIO & io,

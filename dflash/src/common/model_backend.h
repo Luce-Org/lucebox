@@ -49,9 +49,16 @@ struct DaemonIO {
 // Thinking-budget force-close hook. Mirrors antirez/ds4 ds4_eval.c's
 // hard_limit_reply_budget semantics: when the budget remaining (n_gen
 // minus tokens committed so far) falls to hard_limit_remaining, the
-// next sampled token gets overridden with close_token_id, giving the
-// model the remaining budget to write a visible answer following
-// </think>.
+// next sampled tokens get overridden with close_token_ids in order,
+// giving the model the remaining budget to write a visible answer
+// after the injected close-tag sequence.
+//
+// Single vs multi-token close:
+//   Qwen3.6: </think> is one added_token (id 248069). close_token_ids
+//            has size 1. One override + budget_close_injected=true.
+//   DeepSeek/laguna: </think> tokenizes to 3 ordinary tokens
+//            ([1718, 37947, 32] for DS-V3). close_token_ids has
+//            size 3. Three consecutive overrides, then resume.
 //
 // This is "Level 2" of our thinking-budget migration: in-process
 // mid-stream force-close, KV-continuous. Beats Level 1's phase-2
@@ -63,8 +70,8 @@ struct DaemonIO {
 // decode) — the perf trade-off is acceptable since this only kicks in
 // for thinking-enabled requests. Spec-decode integration is a follow-up.
 struct BudgetHook {
-    int32_t close_token_id        = -1;  // -1 = disabled
-    int     hard_limit_remaining  = 0;   // force when (n_gen - committed) <= this
+    std::vector<int32_t> close_token_ids;  // empty = disabled
+    int                  hard_limit_remaining = 0;  // force when (n_gen - committed) <= this
 };
 
 struct GenerateRequest {
