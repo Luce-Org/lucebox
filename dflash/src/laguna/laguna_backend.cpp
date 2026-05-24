@@ -254,6 +254,7 @@ GenerateResult LagunaBackend::generate(const GenerateRequest & req,
             tok = first_close;
             budget_close_started = true;
             close_inject_pos = 1;
+            result.budget_forced_close = true;
         }
     };
 
@@ -389,6 +390,7 @@ GenerateResult LagunaBackend::restore_and_generate(int slot,
             tok = first_close;
             budget_close_started = true;
             close_inject_pos = 1;
+            result.budget_forced_close = true;
         }
     };
 

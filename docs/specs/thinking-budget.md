@@ -2,10 +2,10 @@
 
 A design spec for `dflash_server`'s handling of "thinking" requests:
 prompts where the model is expected to produce an internal reasoning
-trace before its visible reply. The spec covers the request opt-in,
-the configuration surface, the two close strategies (Level 1 and
-Level 2), the multi-dialect response shape, and the close-kind
-taxonomy.
+trace before its visible reply. The spec covers the request opt-in
+(including per-request budget controls), the configuration surface,
+the two close strategies (Level 1 and Level 2), the multi-dialect
+response shape, and the close-kind taxonomy.
 
 ## 1. Background
 
@@ -42,63 +42,234 @@ the model self-closing. That contract is the **thinking budget**.
 
 ## 3. Configuration
 
-The thinking budget is **server configuration**, not a wire-protocol
-field. Operators pick the policy at server start. The wire stays
-standard OpenAI/Anthropic so generic clients (vLLM, llama-server,
-OpenRouter passthrough, plain `curl`) work unchanged.
+Server-side configuration establishes the **ceilings** that bound
+every request's budget envelope. Per-request fields (see §4) may
+request *tighter* values than the ceilings, but never looser — this
+gives operators an unconditional resource-protection guarantee while
+letting clients tune for their use case (short chat vs. deep
+reasoning).
 
-### Server CLI
+### 3.1 Configuration sources
+
+The server resolves each knob from the first source that provides a
+value, in this order:
+
+1. **Explicit CLI flag** (e.g. `--think-max-tokens N`).
+2. **Model card sidecar.** A JSON file at
+   `share/model_cards/<name>.json`, where `<name>` is the loaded
+   GGUF's `general.name` metadata normalized to lowercase with
+   spaces replaced by `-`. Carries values from the upstream model
+   card (HuggingFace README or `generation_config.json`).
+3. **Per-family fallback table**, built into the C++ server, keyed
+   on the detected architecture (e.g. `qwen35`, `gemma4`, `laguna`).
+   A coarse safety net for known families when no sidecar is shipped.
+4. **Hard fallback**, matching `antirez/ds4 ds4_eval.c`:
+   `default_max_tokens=16000`, `hard_limit_reply_budget=512`,
+   `think_max_tokens = default_max_tokens − hard_limit_reply_budget`.
+
+The resolution is reported in the startup banner so operators can
+see which source supplied each value.
+
+### 3.2 Server CLI
 
 ```
 dflash_server \
-  --think-max-tokens 10000 \         # Phase-1 cap (default 10000)
-  --default-max-tokens 16000 \       # Combined cap when the request
-                                     # omits max_tokens (default 16000)
-  --hard-limit-reply-budget 512      # Tokens reserved for the visible
-                                     # reply when Level 2 force-closes
-                                     # (default 512)
+  --think-max-tokens 32256 \         # Phase-1 ceiling
+  --default-max-tokens 32768 \       # Combined ceiling when the
+                                     # request omits max_tokens
+  --hard-limit-reply-budget 512 \    # Reply-reserve ceiling
+  --reasoning-effort-low 4032 \      # Phase-1 budget for effort=low
+  --reasoning-effort-medium 16128 \  # Phase-1 budget for effort=medium
+  --reasoning-effort-high 32256 \    # Phase-1 budget for effort=high
+  --reasoning-effort-x-high 56832 \  # Phase-1 budget for effort=x-high
+  --reasoning-effort-max 81408 \     # Phase-1 budget for effort=max
+                                     # (each capped at --think-max-tokens)
 ```
 
-### Defaults
+CLI flags always win. Omit any flag to take the value from the
+model card sidecar, family fallback, or hard fallback in turn.
 
-Defaults are aligned with the reference values in antirez/ds4
-`ds4_eval.c` so quality numbers diff cleanly against the upstream
-benchmark suite without further normalization:
+### 3.3 Model card sidecar
 
-| Knob | Default | Role |
+Each known model has a sidecar JSON at
+`share/model_cards/<name>.json`. The file carries values transcribed
+from the upstream model card so future-us can reason about
+provenance:
+
+```json
+{
+  "name": "Qwen3.6 27B",
+  "source": "https://huggingface.co/Qwen/Qwen3.6-27B",
+  "verified_at": "2026-05-23",
+  "max_tokens": 32768,
+  "complex_problem_max_tokens": 81920,
+  "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+  "reasoning_effort_tiers": {
+    "low":    4032,
+    "medium": 16128,
+    "high":   32256,
+    "x-high": 56832,
+    "max":    81408
+  }
+}
+```
+
+Fields:
+
+| Field | Meaning |
+|---|---|
+| `name` | Display name. Informational; the filename is what matters for lookup. |
+| `source` | URL of the upstream card we transcribed. |
+| `verified_at` | ISO date the values were last checked against the source. |
+| `max_tokens` | The card's standard recommended combined cap. Drives `default_max_tokens`. |
+| `complex_problem_max_tokens` | Optional. The card's recommendation for hard reasoning / benchmark workloads. Drives the `x-high` and `max` effort tiers. If omitted, both collapse to the `high` tier value. |
+| `sampling` | Recommended sampler params. Used as defaults when the request doesn't pin sampler values. |
+| `reasoning_effort_tiers` | Explicit phase-1 budgets per tier. Override any computed default. Whichever tiers are present win; missing tiers fall through to the computed defaults below. |
+
+If the sidecar omits `reasoning_effort_tiers`, tier values are
+computed from `max_tokens` and `complex_problem_max_tokens`:
+
+| Tier | Default formula |
+|---|---|
+| `low` | `think_max × 0.125` |
+| `medium` | `think_max × 0.5` |
+| `high` | `think_max × 1.0` (= ceiling derived from `max_tokens`) |
+| `x-high` | `(think_max + complex_think_max) / 2` |
+| `max` | `complex_think_max` |
+
+Where `think_max = max_tokens − hard_limit_reply_budget` and
+`complex_think_max = complex_problem_max_tokens − hard_limit_reply_budget`
+(or `think_max` if the card has no complex recommendation).
+
+The explicit `reasoning_effort_tiers` field exists because the
+ratio-based defaults don't fit every model. A smaller model that
+caps at 8192 tokens has a very different tier curve from Qwen3.6's
+32768/81920 envelope, and the model card author is in a better
+position to pick sensible numbers than a global formula.
+
+### 3.4 Hard fallback
+
+When no sidecar matches the loaded model and no family fallback
+applies, the server uses the `antirez/ds4 ds4_eval.c` reference
+values:
+
+| Knob | Hard fallback | Role |
 |---|---|---|
-| `--think-max-tokens` | 10000 | Phase-1 token cap |
-| `--default-max-tokens` | 16000 | Combined (phase-1 + phase-2) cap when the request omits `max_tokens` |
-| `--hard-limit-reply-budget` | 512 | Tokens reserved for the visible reply when Level 2 force-closes the reasoning block |
+| `--default-max-tokens` | 16000 | Combined ceiling |
+| `--hard-limit-reply-budget` | 512 | Reply-reserve ceiling |
+| `--think-max-tokens` | 15488 | Phase-1 ceiling (= 16000 − 512) |
+
+Effort tiers in this configuration: `low=1936`, `medium=7744`,
+`high=15488`, `x-high=15488`, `max=15488` (the last two collapse to
+`high` because no `complex_problem_max_tokens` is defined).
+
+### 3.5 Effort-tier invariants
+
+The server enforces these invariants at startup and clamps with a
+warning if violated:
+
+- `low ≤ medium ≤ high ≤ x-high ≤ max`
+- `max ≤ default_max_tokens − hard_limit_reply_budget`
+
+A request that asks for an effort tier exceeding the model's
+ceiling (e.g. `effort: "max"` on a model whose card has no
+`complex_problem_max_tokens`) gets the `high` value with no error.
 
 ## 4. Request shape
 
-A client opts into the budget envelope with `thinking:{type:"enabled"}`:
+There are two equivalent ways a client opts into the budget envelope.
+Both unlock Level 1, Level 2, and `finish_details` emission.
+
+### 4.1 Anthropic-style `thinking`
 
 ```json
 {
   "model": "...",
   "messages": [...],
   "max_tokens": 16000,
-  "thinking": {"type": "enabled"}
+  "thinking": {
+    "type": "enabled",
+    "budget_tokens": 4000,
+    "reply_budget":  300
+  }
 }
 ```
 
-- `thinking.type` is the only field that matters; `"enabled"` opts
-  in, anything else (or omitting `thinking`) keeps the legacy single-
-  cap behavior.
-- No `budget_tokens`, `hard_max_tokens`, or other per-request knob is
-  read. The budget lives entirely in server config; clients cannot
-  override it. This is intentional: it prevents silent truncation on
-  backends that don't speak `thinking` (they ignore the field) and
-  keeps cross-server comparisons apples-to-apples.
+| Field | Meaning |
+|---|---|
+| `thinking.type` | `"enabled"` activates the envelope; anything else (or omitting `thinking`) keeps the legacy single-cap behaviour. |
+| `thinking.budget_tokens` | Optional. Client-preferred phase-1 cap. Effective value = `min(budget_tokens, --think-max-tokens)`. Omit to use the server default. |
+| `thinking.reply_budget` | Optional. Client-preferred reply reserve for Level 2 force-close. Effective value = `min(reply_budget, --hard-limit-reply-budget)`. Omit to use the server default. |
 
-`reasoning:{effort: "medium"|"high"}` (the OpenAI Responses opt-in)
-also turns on `<think>` rendering in the chat template, but it does
-**not** activate the budget envelope. A `reasoning.effort` request
-remains on the legacy single-cap behavior so existing OpenAI
-Responses clients see a stable shape. Only `thinking:{type:"enabled"}`
-unlocks Level 1, Level 2, and `finish_details` emission.
+### 4.2 OpenAI Responses-style `reasoning.effort`
+
+```json
+{
+  "model": "...",
+  "input": "...",
+  "reasoning": {"effort": "medium"}
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `reasoning.effort` | One of `"low"`, `"medium"`, `"high"`, `"x-high"`, or `"max"`. Each value selects a server-configured phase-1 budget (see §3) and activates the envelope. |
+
+`reasoning.effort` is the simpler shape for clients that don't want
+to pick a token number. The effective phase-1 budget is the
+`--reasoning-effort-<tier>` value at the chosen tier; the reply
+reserve falls back to `--hard-limit-reply-budget`.
+
+The five-tier vocabulary is a dflash extension to the
+OpenAI Responses three-tier (`low | medium | high`) standard.
+Clients that send only OpenAI-standard values continue to work; the
+extra tiers (`x-high`, `max`) let clients opt in to the model card's
+complex-problem budget when the prompt warrants it.
+
+An unknown tier value falls back to `high` rather than erroring, so
+clients that send a future tier (e.g. `"ultra"`) get sensible
+behaviour instead of a 400.
+
+### 4.3 Combining the two
+
+If a request sets **both** `thinking.budget_tokens` and
+`reasoning.effort`, `thinking.budget_tokens` wins (it is the more
+specific control). The effort tier still selects defaults for any
+unspecified `thinking.*` fields. This keeps mixed-dialect clients
+predictable and lets per-request fine-tuning sit on top of a coarse
+effort knob.
+
+### 4.4 Clamping rules
+
+All per-request budget fields clamp to the server ceiling — clients
+can ask for *less* than the operator-configured ceiling but never
+*more*:
+
+| Per-request field | Clamp |
+|---|---|
+| `thinking.budget_tokens` | `min(requested, --think-max-tokens)` |
+| `thinking.reply_budget` | `min(requested, --hard-limit-reply-budget)` |
+| `max_tokens` (combined cap) | `min(requested, --default-max-tokens)` |
+
+The server emits a single per-request log line whenever a clamp
+fires, recording requested-vs-effective values for both fields. No
+error response — clamping is silent at the wire to preserve OpenAI/
+Anthropic protocol compatibility.
+
+### 4.5 Why client-side controls are bounded, not full overrides
+
+A previous design allowed clients to override the server budget
+entirely. The footgun was: middleboxes that did not understand the
+new fields silently dropped them, leaving requests to hit the
+server's combined `max_tokens` as their only cap — invariably
+truncating mid-reasoning and producing artificially low quality
+numbers in cross-server benchmarks.
+
+Clamping to the server ceiling resolves this asymmetrically: if a
+middlebox drops the per-request field, the server falls back to its
+configured default (which is a reasonable production policy), not to
+the much-larger combined cap. Clients still get useful behaviour;
+nobody silently truncates mid-thought.
 
 ## 5. Close strategies
 
@@ -165,15 +336,20 @@ current AR loop**, not against the absolute KV position:
 ```
 generated = committed_now − committed_at_entry
 remaining = n_gen − generated
-if remaining ≤ --hard-limit-reply-budget: force-close
+if remaining ≤ effective_reply_budget: force-close
 ```
 
-This frame matters because `committed_now` includes the prompt
-length and any tokens already committed before AR took over (e.g.
-when the spec-decode path tails off into AR for the final stretch).
-Without the offset the check would fire `prompt_len` tokens early
-and could go negative after spec-decode tail-off, force-closing
-immediately as AR began.
+Where `effective_reply_budget` is the per-request `thinking.reply_budget`
+clamped to `--hard-limit-reply-budget` (see §4.4), and `n_gen` is the
+effective phase-1 cap derived from per-request `thinking.budget_tokens`
+or `reasoning.effort` clamped to `--think-max-tokens`.
+
+The generated-since-entry frame matters because `committed_now`
+includes the prompt length and any tokens already committed before
+AR took over (e.g. when the spec-decode path tails off into AR for
+the final stretch). Without the offset the check would fire
+`prompt_len` tokens early and could go negative after spec-decode
+tail-off, force-closing immediately as AR began.
 
 ## 6. Response shape
 
@@ -308,13 +484,14 @@ in the terminal `message_delta` event for Anthropic.
 
 ## 9. Out of scope
 
-- **Per-request budget override.** Clients cannot tighten or relax
-  the server's caps. Adding a wire field for this would re-create
-  the silent-truncation footgun of letting non-budget-aware
-  middleboxes drop the field.
+- **Per-request budget *override* (unclamped).** §4 describes the
+  bounded form: clients can request *tighter* budgets than the
+  server-configured ceiling, never looser. Allowing full override
+  would re-create the silent-truncation footgun of middleboxes that
+  drop unknown fields.
 - **Soft close-kind / soft-budget hint.** The mechanism (logit bias
   to nudge `</think>` selection before the hard cap) is sketched in
-  §7 but not implemented.
+  §7 but not specified.
 - **Per-token close-info metadata.** The upstream reference exposes
   `(token_index, remaining_budget, rank)` for the close event. The
   current `finish_details` reports aggregate counts only.

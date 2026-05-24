@@ -103,6 +103,14 @@ struct GenerateResult {
     std::vector<int32_t>       tokens;
     double                     prefill_s   = 0.0;
     double                     decode_s    = 0.0;
+    // True when the backend's Level 2 hook injected the </think> close
+    // sequence during this generation (vs. the model self-closing). The
+    // server uses this to attribute close_kind correctly: if the model
+    // produced </think> naturally we report "natural"; if the hook fired
+    // we report "hard". Without this flag, decoding the phase-1 token
+    // stream and grepping for "</think>" cannot distinguish the two
+    // (the injected close decodes identically).
+    bool                       budget_forced_close = false;
 };
 
 // ─── Backend interface ──────────────────────────────────────────────────

@@ -651,24 +651,39 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         req.max_output = body.value("max_tokens",
                          body.value("max_output_tokens",
                          body.value("max_completion_tokens", config_.default_max_tokens)));
+        // Spec §4.4: clamp request max_tokens to --default-max-tokens.
+        if (req.max_output > config_.default_max_tokens) {
+            std::fprintf(stderr,
+                "[server] max_tokens=%d clamped to default_max_tokens=%d\n",
+                req.max_output, config_.default_max_tokens);
+            req.max_output = config_.default_max_tokens;
+        }
 
-        // Sampler parameters.
-        req.sampler.temp = body.value("temperature", 0.0f);
-        req.sampler.top_p = body.value("top_p", 1.0f);
-        req.sampler.top_k = body.value("top_k", 0);
+        // Sampler parameters. When the request omits a value, fall back to
+        // the model card's sampling defaults (spec §3.3); when the card
+        // doesn't supply one either, use the hard-coded default.
+        const auto & sd = config_.sampler_defaults;
+        req.sampler.temp = body.value("temperature",
+                                      sd.has_temperature ? sd.temperature : 0.0f);
+        req.sampler.top_p = body.value("top_p",
+                                       sd.has_top_p ? sd.top_p : 1.0f);
+        req.sampler.top_k = body.value("top_k",
+                                       sd.has_top_k ? sd.top_k : 0);
         if (body.contains("seed")) {
             req.sampler.seed = body["seed"].get<uint64_t>();
         }
 
         // OpenAI-style additive penalties.
         req.sampler.freq_pen = body.value("frequency_penalty", 0.0f);
-        req.sampler.pres_pen = body.value("presence_penalty", 0.0f);
+        req.sampler.pres_pen = body.value("presence_penalty",
+                                          sd.has_presence_penalty ? sd.presence_penalty : 0.0f);
 
         // HuggingFace-style multiplicative repetition penalty (also used by
         // vLLM, llama.cpp, etc.). Accepts both "repetition_penalty" and
         // the shorter "rep_pen" for daemon compatibility.
         req.sampler.rep_pen = body.value("repetition_penalty",
-                              body.value("rep_pen", 1.0f));
+                              body.value("rep_pen",
+                                  sd.has_repetition_penalty ? sd.repetition_penalty : 1.0f));
         if (body.contains("rep_window")) {
             req.sampler.rep_window = body["rep_window"].get<int>();
         }
@@ -754,12 +769,34 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         // DFlash acceptance rates; clients opt in explicitly).
         bool enable_thinking = false;
 
-        // OpenAI Responses API: "reasoning" field
+        // Track which fields the request explicitly set, so we can apply
+        // §4.3 combined precedence: thinking.budget_tokens beats
+        // reasoning.effort for the phase-1 cap, but the effort tier still
+        // selects defaults for any unspecified thinking.* field.
+        int  request_budget_tokens   = -1;  // from thinking.budget_tokens
+        int  request_reply_budget    = -1;  // from thinking.reply_budget
+        int  effort_phase1_cap       = -1;  // from reasoning.effort lookup
+        bool effort_set              = false;
+
+        // OpenAI Responses API: "reasoning" field. Spec §4.2.
         if (body.contains("reasoning")) {
             auto & r = body["reasoning"];
             if (r.contains("effort")) {
-                std::string effort = r.value("effort", "low");
-                enable_thinking = (effort != "low");
+                std::string effort = r.value("effort", "high");
+                // Five-tier vocabulary (spec §4.2). Unknown → high.
+                int tier_value = config_.effort_tiers.high;
+                if      (effort == "low")    tier_value = config_.effort_tiers.low;
+                else if (effort == "medium") tier_value = config_.effort_tiers.medium;
+                else if (effort == "high")   tier_value = config_.effort_tiers.high;
+                else if (effort == "x-high") tier_value = config_.effort_tiers.x_high;
+                else if (effort == "max")    tier_value = config_.effort_tiers.max;
+                // else: unknown tier → fall back to high (no error).
+
+                effort_phase1_cap = tier_value;
+                effort_set = true;
+                enable_thinking = true;
+                // Spec §4.2: reasoning.effort activates the budget envelope.
+                req.thinking_opt_in = true;
             } else {
                 enable_thinking = true;
             }
@@ -774,6 +811,13 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                 enable_thinking = (type == "enabled");
                 req.thinking_opt_in = (type == "enabled");
             }
+            // Spec §4.1 fields. Clamp to server ceilings (§4.4).
+            if (th.contains("budget_tokens") && th["budget_tokens"].is_number_integer()) {
+                request_budget_tokens = th["budget_tokens"].get<int>();
+            }
+            if (th.contains("reply_budget") && th["reply_budget"].is_number_integer()) {
+                request_reply_budget = th["reply_budget"].get<int>();
+            }
         }
         // Direct: chat_template_kwargs.enable_thinking
         if (body.contains("chat_template_kwargs")) {
@@ -784,6 +828,37 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         }
 
         req.thinking_enabled = enable_thinking;
+
+        // Spec §4.3 combined precedence + §4.4 clamping.
+        // Phase-1 cap:
+        //   thinking.budget_tokens (if set) wins over reasoning.effort.
+        //   Either is clamped to think_max_tokens.
+        if (request_budget_tokens >= 0) {
+            int eff = std::min(request_budget_tokens, config_.think_max_tokens);
+            if (request_budget_tokens > config_.think_max_tokens) {
+                std::fprintf(stderr,
+                    "[server] thinking.budget_tokens=%d clamped to "
+                    "think_max_tokens=%d\n",
+                    request_budget_tokens, config_.think_max_tokens);
+            }
+            req.per_req_phase1_cap = eff;
+        } else if (effort_set) {
+            // effort tiers were already clamped at startup; defensive clamp here.
+            req.per_req_phase1_cap = std::min(effort_phase1_cap, config_.think_max_tokens);
+        }
+        // Reply budget:
+        if (request_reply_budget >= 0) {
+            int eff = std::min(request_reply_budget, config_.hard_limit_reply_budget);
+            if (request_reply_budget > config_.hard_limit_reply_budget) {
+                std::fprintf(stderr,
+                    "[server] thinking.reply_budget=%d clamped to "
+                    "hard_limit_reply_budget=%d\n",
+                    request_reply_budget, config_.hard_limit_reply_budget);
+            }
+            req.per_req_reply_budget = eff;
+        }
+        // (effort tier doesn't influence reply_budget — spec §4.2: "the reply
+        // reserve falls back to --hard-limit-reply-budget".)
 
         // Serialize tools JSON for template injection.
         std::string tools_json;
@@ -994,8 +1069,15 @@ void HttpServer::worker_loop() {
         // at scripts/server.py:1708-1724. Streaming requests keep the
         // legacy single-cap behaviour until streaming phase-2 lands.
         const bool budget_active = req.thinking_opt_in && !req.stream;
+        // Effective phase-1 cap: per-request value (already clamped to
+        // config_.think_max_tokens above) wins over the server-wide
+        // think_max_tokens. Then both must fit inside the combined
+        // max_output. Spec §4.4 + §5.3.
+        const int effective_phase1_ceiling = (req.per_req_phase1_cap >= 0)
+            ? req.per_req_phase1_cap
+            : config_.think_max_tokens;
         const int phase1_cap = budget_active
-            ? std::min(config_.think_max_tokens, req.max_output)
+            ? std::min(effective_phase1_ceiling, req.max_output)
             : req.max_output;
 
         GenerateRequest gen_req;
@@ -1014,11 +1096,18 @@ void HttpServer::worker_loop() {
         // having its KV state reset by the reprompt. Phase-2 still runs
         // as a fallback if the model fails to close `</think>` (e.g.
         // when force-close didn't fire because the budget never tightened).
+        //
+        // hard_limit_remaining is the per-request reply_budget when set
+        // (already clamped to config_.hard_limit_reply_budget above), else
+        // the server default. Spec §4.4 + §5.3.
         if (budget_active && !config_.think_close_token_ids.empty() &&
             config_.hard_limit_reply_budget > 0)
         {
+            int eff_reply_budget = (req.per_req_reply_budget >= 0)
+                ? req.per_req_reply_budget
+                : config_.hard_limit_reply_budget;
             gen_req.budget_hook.close_token_ids = config_.think_close_token_ids;
-            gen_req.budget_hook.hard_limit_remaining = config_.hard_limit_reply_budget;
+            gen_req.budget_hook.hard_limit_remaining = eff_reply_budget;
         }
 
         // Tool call hint generation: pre-tokenize predictable structural tokens
@@ -1269,7 +1358,13 @@ void HttpServer::worker_loop() {
         // phase-2 is a follow-up (needs SSE flush + re-open).
         std::vector<int32_t> phase1_tokens = result.tokens;  // copy
         std::vector<int32_t> phase2_tokens;
-        std::string close_kind = "natural";
+        // Start as "natural" — the backend will tell us via
+        // result.budget_forced_close if Level 2 actually injected the
+        // close, and Level 1 below sets "hard" when it has to reprompt.
+        std::string close_kind =
+            (req.thinking_opt_in && result.budget_forced_close)
+                ? "hard"
+                : "natural";
 
         // Phase-2 gate diagnostic — compile out by default. Enable with
         // -DDFLASH_DEBUG_PHASE2_GATE=1 to surface the gate-input dump
@@ -1440,11 +1535,17 @@ void HttpServer::worker_loop() {
             };
 
             bool keep_going = feed_tokens(phase1_tokens);
-            // Phase-2 reprompt (Level 1): inject the synthetic close+prefix
-            // through the emitter so it transitions REASONING → CONTENT,
-            // then feed phase-2 tokens as content.
+            // Phase-2 reprompt (Level 1): inject just the </think> close
+            // tag so the emitter transitions REASONING → CONTENT, then
+            // feed phase-2 tokens as content. The phase-2 daemon prompt
+            // includes "</think>\n\nFinal answer: " as scaffolding to
+            // anchor the model, but those bytes are server-injected and
+            // were neither generated by the model nor counted in usage —
+            // emitting them as visible content would prefix every
+            // hard-closed response with "Final answer: " text the user
+            // didn't write. Codex review caught this leak.
             if (keep_going && close_kind == "hard" && !phase2_tokens.empty()) {
-                emitter.emit_token("</think>\n\nFinal answer: ");
+                emitter.emit_token("</think>");
                 feed_tokens(phase2_tokens);
             }
             int total_completion_tokens =

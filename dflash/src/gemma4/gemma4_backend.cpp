@@ -262,7 +262,8 @@ int Gemma4Backend::do_prefill(const std::vector<int32_t> & tokens,
 bool Gemma4Backend::do_decode(int committed, int n_gen,
                                std::vector<int32_t> & out_tokens,
                                const DaemonIO & io,
-                               const BudgetHook & budget_hook) {
+                               const BudgetHook & budget_hook,
+                               bool * forced_close_out) {
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
     std::vector<float> embed_buf(hidden);
@@ -317,6 +318,7 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
             tok = first_close;
             budget_close_started = true;
             close_inject_pos = 1;
+            if (forced_close_out) *forced_close_out = true;
         }
     };
 
@@ -365,7 +367,8 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
 bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io,
-                                    const BudgetHook * budget_hook) {
+                                    const BudgetHook * budget_hook,
+                                    bool * forced_close_out) {
     const int hidden = w_.n_embd;
     int32_t last_tok = cache_.last_tok;
 
@@ -398,10 +401,12 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
         // without rewriting KV.
         //
         // Gemma4's do_decode reads `out_tokens.back()` as the seed each
-        // iter, so unlike qwen35 we don't need a cache_.last_tok sync —
-        // the most-recently-committed token is already pushed onto
-        // out_tokens at the bottom of this loop. We still update
-        // cache_.last_tok for consistency with the rest of the backend.
+        // iter. After the first spec-decode iteration the most-recently-
+        // committed token is on out_tokens, but on a small-budget request
+        // (budget_tokens <= reply_budget + q_len) tail-off can fire on
+        // iter 0 before out_tokens has been seeded. Codex review flagged
+        // the resulting UB on out_tokens.back(). Seed last_tok explicitly
+        // when out_tokens is empty so do_decode always reads a valid id.
         if (budget_hook && !budget_hook->close_token_ids.empty()) {
             int hard = budget_hook->hard_limit_remaining;
             if (need_commit_budget <= hard + q_len) {
@@ -412,10 +417,13 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
                     committed, n_gen, need_commit_budget, hard, q_len);
                 step_graph_destroy(draft_sg);
                 cache_.last_tok = last_tok;
+                if (out_tokens.empty()) {
+                    out_tokens.push_back(last_tok);
+                }
                 BudgetHook tail_hook = *budget_hook;
                 int ar_n_gen = need_commit_budget;
                 bool ok = do_decode(committed, ar_n_gen, out_tokens, io,
-                                    tail_hook);
+                                    tail_hook, forced_close_out);
                 auto t_dec1 = std::chrono::steady_clock::now();
                 const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
                 const int total_draft_pos = std::max(1, n_draft_steps * q_len);
@@ -626,7 +634,8 @@ GenerateResult Gemma4Backend::generate(const GenerateRequest & req,
 
         if (can_spec) {
             if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
-                                &req.budget_hook)) {
+                                &req.budget_hook,
+                                &result.budget_forced_close)) {
                 result.error = "spec_decode";
                 return result;
             }
@@ -676,7 +685,8 @@ GenerateResult Gemma4Backend::generate(const GenerateRequest & req,
 
             if (req.n_gen > 1) {
                 if (!do_decode(committed, req.n_gen - 1, result.tokens, out_io,
-                               req.budget_hook)) {
+                               req.budget_hook,
+                               &result.budget_forced_close)) {
                     result.error = "decode";
                     return result;
                 }
@@ -793,7 +803,8 @@ GenerateResult Gemma4Backend::restore_and_generate(int slot,
 
         if (can_spec) {
             if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
-                                &req.budget_hook)) {
+                                &req.budget_hook,
+                                &result.budget_forced_close)) {
                 result.error = "spec_decode";
                 return result;
             }
@@ -843,7 +854,8 @@ GenerateResult Gemma4Backend::restore_and_generate(int slot,
 
             if (req.n_gen > 1) {
                 if (!do_decode(committed, req.n_gen - 1, result.tokens, out_io,
-                               req.budget_hook)) {
+                               req.budget_hook,
+                               &result.budget_forced_close)) {
                     result.error = "decode";
                     return result;
                 }

@@ -18,6 +18,7 @@
 #include "prefix_cache.h"
 #include "disk_prefix_cache.h"
 #include "api_types.h"
+#include "model_card.h"
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -49,14 +50,16 @@ struct ServerConfig {
     std::string model_name  = "dflash";
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
 
-    // Thinking-budget v2 (mirrors antirez/ds4 ds4_eval.c knob names).
-    // Applied when a request opts in via `thinking: {type: "enabled"}`.
-    // think_max_tokens caps the phase-1 reasoning generation; the combined
-    // (reasoning + content) cap is the request's max_tokens, defaulting to
-    // default_max_tokens when omitted. The phase-1/phase-2 reprompt logic
-    // itself is a follow-up PR — this PR ships only the wire surface
-    // (CLI flag + finish_details emission) so consumers can probe + plan.
-    int         think_max_tokens    = 10000;
+    // Thinking-budget v2. Applied when a request opts in via
+    // `thinking: {type: "enabled"}` or `reasoning: {effort: ...}`.
+    // think_max_tokens caps phase-1 reasoning generation; the combined
+    // (reasoning + content) cap is the request's max_tokens, defaulting
+    // to default_max_tokens when omitted. The defaults below are the
+    // hard fallback (antirez/ds4 ds4_eval.c reference values); at startup
+    // server_main may raise them by loading share/model_cards/<name>.json
+    // when a sidecar matches the loaded model. CLI flags override both.
+    // See docs/specs/thinking-budget.md §3 for resolution order.
+    int         think_max_tokens    = 15488;  // = default_max_tokens - hard_limit_reply_budget
     int         default_max_tokens  = 16000;
     // Level 2 force-close (in-process, KV-continuous). When > 0 AND the
     // request opted into thinking, the backend's AR decode overrides
@@ -73,6 +76,23 @@ struct ServerConfig {
     // populates this from the tokenizer after loading; HttpServer just
     // forwards into GenerateRequest.budget_hook when thinking is opted in.
     std::vector<int32_t> think_close_token_ids;
+
+    // Phase-1 budgets per `reasoning.effort` tier (spec §4.2). Selected
+    // by the request parser when `reasoning.effort` is present. Each
+    // value is itself capped at `think_max_tokens` at startup.
+    // Populated by server_main from the resolved model card; CLI flags
+    // (--reasoning-effort-<tier>) override individual tiers.
+    EffortTiers effort_tiers;
+
+    // Sampler defaults from the model card (spec §3.3). Used to fill
+    // values the request body did not specify. has_* fields distinguish
+    // "card supplied a value" from "C++ default". HttpServer reads these
+    // in the request parser; CLI does not currently override.
+    SamplingDefaults sampler_defaults;
+
+    // Operator-facing tag for the startup banner: e.g.
+    // "share/model_cards/qwen3.6-27b.json", "family:qwen35", "hard-fallback".
+    std::string model_card_source_label;
 
     // /props introspection inputs — captured at startup by server_main so
     // the /props handler doesn't need to crack open BackendArgs or env.
@@ -137,6 +157,13 @@ struct ParsedRequest {
     // can be set via the chat template kwarg alone). When true, the response
     // includes a `finish_details` block. Mirrors server.py:2271 conditional.
     bool                      thinking_opt_in = false;
+    // Per-request thinking-budget envelope (spec §4). Populated from
+    // `thinking.budget_tokens` and `thinking.reply_budget`, or selected
+    // from server-configured effort tiers when `reasoning.effort` is set.
+    // -1 = not set; the server falls back to its global think_max_tokens /
+    // hard_limit_reply_budget. Values are already clamped to those ceilings.
+    int                       per_req_phase1_cap   = -1;
+    int                       per_req_reply_budget = -1;
     // Stop sequences (OpenAI "stop" + Anthropic "stop_sequences")
     std::vector<std::string>  stop_sequences;
 };

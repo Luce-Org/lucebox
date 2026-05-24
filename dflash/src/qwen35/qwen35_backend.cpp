@@ -508,7 +508,8 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
         // generation. Most requests never hit the tail because the
         // model closes </think> naturally well before the budget edge.
         if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
-                             req.hint_tokens, &req.budget_hook)) {
+                             req.hint_tokens, &req.budget_hook,
+                             &result.budget_forced_close)) {
             result.error = "decode";
             return result;
         }
@@ -576,7 +577,8 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
         // generation. Most requests never hit the tail because the
         // model closes </think> naturally well before the budget edge.
         if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
-                             req.hint_tokens, &req.budget_hook)) {
+                             req.hint_tokens, &req.budget_hook,
+                             &result.budget_forced_close)) {
             result.error = "decode";
             return result;
         }
@@ -731,7 +733,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
 bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                   std::vector<int32_t> & out_tokens,
                                   const DaemonIO & io,
-                                  const BudgetHook & budget_hook) {
+                                  const BudgetHook & budget_hook,
+                                  bool * forced_close_out) {
     // Budget hook state.
     //   - budget_close_started: true once we've begun injecting the close
     //     sequence. Prevents re-triggering on continued forward generation.
@@ -810,6 +813,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             tok = first_close;
             budget_close_started = true;
             close_inject_pos = 1;
+            if (forced_close_out) *forced_close_out = true;
         }
     };
     if (n_gen <= 0) return true;
@@ -906,7 +910,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io,
                                     const std::vector<int32_t> * hint_tokens,
-                                    const BudgetHook * budget_hook) {
+                                    const BudgetHook * budget_hook,
+                                    bool * forced_close_out) {
     const int hidden = w_.n_embd;
 
     // First token: use the argmax that do_prefill already sampled and stored.
@@ -931,7 +936,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // one token at a time. Pass the budget hook through so force-close
         // still fires when spec-decode is unavailable.
         bool ok = do_ar_decode(committed, n_gen, out_tokens, io,
-                                budget_hook ? *budget_hook : BudgetHook{});
+                                budget_hook ? *budget_hook : BudgetHook{},
+                                forced_close_out);
         io.emit(-1);
         return ok;
     }
@@ -997,7 +1003,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 BudgetHook tail_hook = *budget_hook;
                 int ar_n_gen = need_commit_budget;
                 bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
-                                        tail_hook);
+                                        tail_hook, forced_close_out);
                 io.emit(-1);
                 return ok;
             }

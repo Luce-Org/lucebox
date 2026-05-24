@@ -109,10 +109,14 @@ private:
     // sampled token(s) with the close-tag sequence once (n_gen - committed)
     // <= hard_limit. Mirrors qwen35's do_ar_decode. For Gemma4 the close
     // tag is typically `<channel|>` (single token in the gemma4 vocab).
+    // forced_close_out, when non-null, is set to true iff the hook injected
+    // the close sequence (vs. the model self-closing). See qwen35_backend.h
+    // for full rationale.
     bool do_decode(int committed, int n_gen,
                    std::vector<int32_t> & out_tokens,
                    const DaemonIO & io,
-                   const BudgetHook & budget_hook = {});
+                   const BudgetHook & budget_hook = {},
+                   bool * forced_close_out = nullptr);
 
     // DFlash speculative decode loop.
     // When budget_hook is non-null and (n_gen - generated) falls within
@@ -121,7 +125,8 @@ private:
     bool do_spec_decode(int committed, int n_gen,
                         std::vector<int32_t> & out_tokens,
                         const DaemonIO & io,
-                        const BudgetHook * budget_hook = nullptr);
+                        const BudgetHook * budget_hook = nullptr,
+                        bool * forced_close_out = nullptr);
 };
 
 }  // namespace dflash::common

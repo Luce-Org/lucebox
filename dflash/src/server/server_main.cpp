@@ -13,9 +13,12 @@
 
 #include "http_server.h"
 #include "chat_template.h"
+#include "model_card.h"
 #include "common/backend_factory.h"
 #include "common/gguf_inspect.h"
 #include "common/peer_access.h"
+
+#include "gguf.h"
 
 #include <csignal>
 #include <cstdio>
@@ -108,7 +111,9 @@ static void print_usage(const char * prog) {
         "  --port <N>           Listen port (default: 8080)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
         "  --max-ctx <N>        Max context length (default: 131072)\n"
-        "  --max-tokens <N>     Default max output tokens (default: 4096)\n"
+        "  --max-tokens <N>     Default max output tokens (legacy alias for\n"
+        "                       --default-max-tokens; loses to --default-max-tokens\n"
+        "                       when both are passed)\n"
         "  --target-device <backend:gpu>  Target device (default: auto:0)\n"
         "  --draft-device <backend:gpu>   Draft device (default: auto:0)\n"
         "  --target-devices <list>        Reserved layer-split devices, e.g. cuda:0,cuda:1\n"
@@ -122,15 +127,25 @@ static void print_usage(const char * prog) {
         "  --ddtree-budget <N>  DDTree budget (default: 64)\n"
         "  --no-cors            Disable CORS headers\n"
         "  --think-max-tokens <N>     Phase-1 reasoning cap when a request opts in\n"
-        "                             via thinking:{type:enabled} (default: 10000)\n"
+        "                             via thinking:{type:enabled} (default: 15488 =\n"
+        "                             default_max_tokens - hard_limit_reply_budget;\n"
+        "                             may be raised by share/model_cards/<name>.json)\n"
         "  --default-max-tokens <N>   Combined cap when request omits max_tokens\n"
-        "                             (default: 16000, matches antirez/ds4 ds4_eval.c)\n"
+        "                             (default: 16000, matches antirez/ds4 ds4_eval.c;\n"
+        "                             may be raised by share/model_cards/<name>.json)\n"
         "  --hard-limit-reply-budget <N>\n"
         "                             Level 2 force-close: when this many tokens\n"
         "                             remain (of the combined cap), inject </think>\n"
         "                             so the model gets that budget to write the\n"
         "                             visible answer. Mirrors ds4_eval.c's\n"
         "                             hard_limit_reply_budget. 0 disables. (default: 512)\n"
+        "  --reasoning-effort-low <N>      Phase-1 budget when request asks effort=low\n"
+        "  --reasoning-effort-medium <N>   Phase-1 budget when request asks effort=medium\n"
+        "  --reasoning-effort-high <N>     Phase-1 budget when request asks effort=high\n"
+        "  --reasoning-effort-x-high <N>   Phase-1 budget when request asks effort=x-high\n"
+        "  --reasoning-effort-max <N>      Phase-1 budget when request asks effort=max\n"
+        "                                  Defaults come from share/model_cards/<name>.json;\n"
+        "                                  see docs/specs/thinking-budget.md §3.\n"
         "\n"
         "KV cache:\n"
         "  --cache-type-k <type>  KV cache K type (f16,bf16,q4_0,q4_1,q5_0,q5_1,q8_0,tq3_0)\n"
@@ -180,6 +195,29 @@ int main(int argc, char ** argv) {
     bool target_device_seen = false;
     bool target_devices_seen = false;
 
+    // Track which thinking-budget tunables the operator set via CLI.
+    // Those values win over the model card (spec §3.1: "Explicit CLI
+    // flag" is the first source in the resolution order). Anything not
+    // overridden is taken from the resolved ModelCard after backend load.
+    struct CliOverrides {
+        bool think_max_tokens        = false;
+        bool default_max_tokens      = false;
+        bool hard_limit_reply_budget = false;
+        bool effort_low              = false;
+        bool effort_medium           = false;
+        bool effort_high             = false;
+        bool effort_x_high           = false;
+        bool effort_max              = false;
+    } cli_set;
+
+    // Track whether the operator passed the legacy --max-tokens alias.
+    // When set and --default-max-tokens is NOT also passed, --max-tokens
+    // wins over the model card for default_max_tokens (it was a documented
+    // CLI flag before the thinking-budget v2 work, and shipped deployments
+    // rely on it actually capping output).
+    bool legacy_max_tokens_set = false;
+    int  legacy_max_tokens_val = 0;
+
     for (int i = 2; i < argc; i++) {
         if (std::strcmp(argv[i], "--draft") == 0 && i + 1 < argc) {
             bargs.draft_path = argv[++i];
@@ -192,7 +230,12 @@ int main(int argc, char ** argv) {
             sconfig.max_ctx = v;
             bargs.device.max_ctx = v;
         } else if (std::strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc) {
-            sconfig.max_tokens = std::atoi(argv[++i]);
+            // Legacy alias for --default-max-tokens. Resolved after the
+            // arg-parse loop so an explicit --default-max-tokens still wins
+            // regardless of CLI order.
+            legacy_max_tokens_val = std::atoi(argv[++i]);
+            legacy_max_tokens_set = true;
+            sconfig.max_tokens = legacy_max_tokens_val;
         } else if (std::strcmp(argv[i], "--target-device") == 0 && i + 1 < argc) {
             if (target_devices_seen) {
                 std::fprintf(stderr, "[server] --target-device conflicts with --target-devices\n");
@@ -242,10 +285,28 @@ int main(int argc, char ** argv) {
             sconfig.enable_cors = false;
         } else if (std::strcmp(argv[i], "--think-max-tokens") == 0 && i + 1 < argc) {
             sconfig.think_max_tokens = std::atoi(argv[++i]);
+            cli_set.think_max_tokens = true;
         } else if (std::strcmp(argv[i], "--default-max-tokens") == 0 && i + 1 < argc) {
             sconfig.default_max_tokens = std::atoi(argv[++i]);
+            cli_set.default_max_tokens = true;
         } else if (std::strcmp(argv[i], "--hard-limit-reply-budget") == 0 && i + 1 < argc) {
             sconfig.hard_limit_reply_budget = std::atoi(argv[++i]);
+            cli_set.hard_limit_reply_budget = true;
+        } else if (std::strcmp(argv[i], "--reasoning-effort-low") == 0 && i + 1 < argc) {
+            sconfig.effort_tiers.low = std::atoi(argv[++i]);
+            cli_set.effort_low = true;
+        } else if (std::strcmp(argv[i], "--reasoning-effort-medium") == 0 && i + 1 < argc) {
+            sconfig.effort_tiers.medium = std::atoi(argv[++i]);
+            cli_set.effort_medium = true;
+        } else if (std::strcmp(argv[i], "--reasoning-effort-high") == 0 && i + 1 < argc) {
+            sconfig.effort_tiers.high = std::atoi(argv[++i]);
+            cli_set.effort_high = true;
+        } else if (std::strcmp(argv[i], "--reasoning-effort-x-high") == 0 && i + 1 < argc) {
+            sconfig.effort_tiers.x_high = std::atoi(argv[++i]);
+            cli_set.effort_x_high = true;
+        } else if (std::strcmp(argv[i], "--reasoning-effort-max") == 0 && i + 1 < argc) {
+            sconfig.effort_tiers.max = std::atoi(argv[++i]);
+            cli_set.effort_max = true;
         } else if (std::strcmp(argv[i], "--prefill-compression") == 0 && i + 1 < argc) {
             const char * mode = argv[++i];
             if (std::strcmp(mode, "auto") == 0)
@@ -396,6 +457,107 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // ── Thinking-budget v2: resolve model card and apply to ServerConfig ──
+    // Read general.name + general.architecture directly from the GGUF.
+    // This is best-effort; if the file can't be opened (corruption, removed
+    // after backend init) we fall through to hard-fallback defaults via
+    // resolve_model_card(...).
+    std::string general_name;
+    std::string general_arch = arch;  // fall back to detect_arch() result
+    {
+        gguf_init_params gip{};
+        gip.no_alloc = true;
+        gip.ctx = nullptr;
+        gguf_context * gctx = gguf_init_from_file(bargs.model_path, gip);
+        if (gctx) {
+            int64_t name_id = gguf_find_key(gctx, "general.name");
+            if (name_id >= 0) {
+                const char * v = gguf_get_val_str(gctx, name_id);
+                if (v) general_name = v;
+            }
+            int64_t arch_id = gguf_find_key(gctx, "general.architecture");
+            if (arch_id >= 0) {
+                const char * v = gguf_get_val_str(gctx, arch_id);
+                if (v) general_arch = v;
+            }
+            gguf_free(gctx);
+        }
+        std::fprintf(stderr,
+            "[server] gguf meta: general.name='%s' general.architecture='%s'\n",
+            general_name.c_str(), general_arch.c_str());
+    }
+
+    ModelCard card = resolve_model_card(
+        bargs.model_path ? bargs.model_path : "",
+        general_name,
+        general_arch,
+        /*repo_root_hint=*/"");
+
+    // Apply each tunable to sconfig only if the operator did NOT set it
+    // via CLI. CLI always wins (spec §3.1 source #1).
+    //
+    // --max-tokens is a documented legacy alias for --default-max-tokens
+    // and beats the card; --default-max-tokens still wins over it when
+    // both are passed (the more specific flag).
+    if (!cli_set.default_max_tokens) {
+        if (legacy_max_tokens_set) {
+            sconfig.default_max_tokens = legacy_max_tokens_val;
+            cli_set.default_max_tokens = true;
+        } else {
+            sconfig.default_max_tokens = card.max_tokens;
+        }
+    }
+    if (!cli_set.hard_limit_reply_budget) {
+        sconfig.hard_limit_reply_budget = card.hard_limit_reply_budget;
+    }
+    if (!cli_set.think_max_tokens) {
+        // Recompute from possibly-updated combined cap + reply budget so
+        // the invariant (think_max = default_max - hard_limit) holds when
+        // the operator overrode one but not the other.
+        sconfig.think_max_tokens = std::max(0,
+            sconfig.default_max_tokens - sconfig.hard_limit_reply_budget);
+        // But if the card itself specified a smaller think_max_tokens
+        // (because complex tiers ride above default_max_tokens — see
+        // spec §3.3), respect that as a floor on the ceiling.
+        // Practically: card.think_max_tokens is just (max_tokens - reply),
+        // so this collapses to the same value when neither was overridden.
+        if (card.think_max_tokens > 0 &&
+            card.think_max_tokens < sconfig.think_max_tokens) {
+            sconfig.think_max_tokens = card.think_max_tokens;
+        }
+    }
+    // Effort tiers: per-tier CLI override. We pre-stored the CLI value
+    // into sconfig.effort_tiers above; for any tier the operator didn't
+    // set, take the card's value.
+    if (!cli_set.effort_low)    sconfig.effort_tiers.low    = card.effort_tiers.low;
+    if (!cli_set.effort_medium) sconfig.effort_tiers.medium = card.effort_tiers.medium;
+    if (!cli_set.effort_high)   sconfig.effort_tiers.high   = card.effort_tiers.high;
+    if (!cli_set.effort_x_high) sconfig.effort_tiers.x_high = card.effort_tiers.x_high;
+    if (!cli_set.effort_max)    sconfig.effort_tiers.max    = card.effort_tiers.max;
+
+    // Sampler defaults — currently no CLI surface; always take from card.
+    sconfig.sampler_defaults = card.sampling;
+
+    sconfig.model_card_source_label = card.source_label;
+
+    // Spec §3.5 invariant: each effort tier must clamp to think_max_tokens
+    // (the server-wide phase-1 ceiling). Clamp now so the request parser
+    // doesn't have to.
+    auto clamp_tier = [&](const char * name, int & v) {
+        if (v > sconfig.think_max_tokens) {
+            std::fprintf(stderr,
+                "[server] reasoning-effort %s=%d clamped to think_max_tokens=%d\n",
+                name, v, sconfig.think_max_tokens);
+            v = sconfig.think_max_tokens;
+        }
+        if (v < 0) v = 0;
+    };
+    clamp_tier("low",    sconfig.effort_tiers.low);
+    clamp_tier("medium", sconfig.effort_tiers.medium);
+    clamp_tier("high",   sconfig.effort_tiers.high);
+    clamp_tier("x-high", sconfig.effort_tiers.x_high);
+    clamp_tier("max",    sconfig.effort_tiers.max);
+
     // Start HTTP server.
     std::fprintf(stderr, "\n");
     std::fprintf(stderr, "[server] ╭─── Configuration ───────────────────────────────────╮\n");
@@ -408,8 +570,29 @@ int main(int argc, char ** argv) {
     // max_tokens default for requests that omit the field. The request
     // parser reads default_max_tokens (16000), NOT sconfig.max_tokens
     // (legacy 4096). Print default_max_tokens so the banner doesn't lie.
-    std::fprintf(stderr, "[server] │  max_tokens      = %d (default for requests omitting max_tokens)\n", sconfig.default_max_tokens);
-    std::fprintf(stderr, "[server] │  think_max_tokens= %d (phase-1 cap when thinking opted in)\n", sconfig.think_max_tokens);
+    std::fprintf(stderr, "[server] │  model_card      = %s\n",
+                 sconfig.model_card_source_label.empty()
+                     ? "(unresolved)" : sconfig.model_card_source_label.c_str());
+    auto src_of = [&](bool cli_overridden) {
+        return cli_overridden ? "from CLI" : sconfig.model_card_source_label.c_str();
+    };
+    std::fprintf(stderr, "[server] │  max_tokens      = %d (%s)\n",
+                 sconfig.default_max_tokens, src_of(cli_set.default_max_tokens));
+    std::fprintf(stderr, "[server] │  think_max_tokens= %d (%s)\n",
+                 sconfig.think_max_tokens, src_of(cli_set.think_max_tokens));
+    std::fprintf(stderr, "[server] │  hard_limit_reply= %d (%s)\n",
+                 sconfig.hard_limit_reply_budget,
+                 src_of(cli_set.hard_limit_reply_budget));
+    std::fprintf(stderr, "[server] │  effort tiers    = low=%d (%s)\n",
+                 sconfig.effort_tiers.low, src_of(cli_set.effort_low));
+    std::fprintf(stderr, "[server] │                    medium=%d (%s)\n",
+                 sconfig.effort_tiers.medium, src_of(cli_set.effort_medium));
+    std::fprintf(stderr, "[server] │                    high=%d (%s)\n",
+                 sconfig.effort_tiers.high, src_of(cli_set.effort_high));
+    std::fprintf(stderr, "[server] │                    x-high=%d (%s)\n",
+                 sconfig.effort_tiers.x_high, src_of(cli_set.effort_x_high));
+    std::fprintf(stderr, "[server] │                    max=%d (%s)\n",
+                 sconfig.effort_tiers.max, src_of(cli_set.effort_max));
     std::fprintf(stderr, "[server] │  target_device   = %s\n",
                  placement_device_name(bargs.device).c_str());
     if (bargs.device.is_layer_split()) {

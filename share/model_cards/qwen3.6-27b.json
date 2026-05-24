@@ -1,0 +1,22 @@
+{
+  "name": "Qwen3.6 27B",
+  "source": "https://huggingface.co/Qwen/Qwen3.6-27B",
+  "verified_at": "2026-05-23",
+  "max_tokens": 32768,
+  "complex_problem_max_tokens": 81920,
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0
+  },
+  "reasoning_effort_tiers": {
+    "low":    4032,
+    "medium": 16128,
+    "high":   32256,
+    "x-high": 56832,
+    "max":    81408
+  }
+}
