@@ -298,7 +298,7 @@ def main():
             tp50 = r.get("ttft_p50_s")
             niah = r.get("niah_pass_rate")
             base = baseline_32k if ctx == 32768 else baseline_64k
-            speedup = f"{dp50/base:.2f}x" if dp50 and base else "n/a"
+            speedup = f"{base/dp50:.2f}x" if dp50 and base else "n/a"
             niah_s = f"{niah*100:.0f}%" if niah is not None else "n/a"
             dp50_s = f"{dp50:.2f}s" if dp50 else "n/a"
             tp50_s = f"{tp50:.1f}s" if tp50 else "n/a"
