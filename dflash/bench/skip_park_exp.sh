@@ -125,7 +125,7 @@ echo "[task47] DONE: NIAH=$PASS/3, peak=${PEAK_GB}GB, mean_dfwd=${MEAN_DFW}s"
 # Decide verdict
 if [ "$PASS" -ge 2 ] && [ "$(echo "$PEAK_GB < 23.5" | bc -l)" = "1" ]; then
   VERDICT="(A) ee7 + skip-park works at 32K — recommend as opt-in config for <=32K workloads"
-elif echo "$DFWDS" | grep -q "N/A"; then
+elif [ "$MEAN_DFW" = "N/A" ]; then
   VERDICT="(C) Server crashed mid-request — skip_park unsafe"
 else
   VERDICT="(B) VRAM OOM or quality issue — keep park/unpark at 32K"

@@ -17,6 +17,9 @@ DRAFTER_MODEL="/home/peppi/models/Qwen3-0.6B-BF16.gguf"
 
 mkdir -p "$OUT_DIR"
 
+# Clear stale VRAM log from a previous interrupted run.
+: > "$VRAM_LOG"
+
 echo "[task47] Generating NIAH cases (32K, n=3, seed=42)..."
 python3 "$REPO_ROOT/pflash/tests/niah_gen.py" \
   --target-tokens 32768 --n 3 \
@@ -201,7 +204,7 @@ $(if [ "$STARTUP_OK" -eq 0 ] || grep -q "cuMemSetAccess\|NOT_READY" "$SERVER_LOG
   echo "(C) cuMemSetAccess NOT_READY crash — historical skip_park bug recurs, choreography stays"
 elif [ "$CRASH_MID" -eq 1 ]; then
   echo "(C) Server crashed mid-request — skip_park unsafe at 32K with ee7"
-elif [ "$NIAH_PASS" -lt 2 ] || python3 -c "v='${PEAK_VRAM_GB}'; exit(0 if v != 'N/A' and float(v) < 23 else 1)" 2>/dev/null; then
+elif [ "$NIAH_PASS" -lt 2 ] || python3 -c "v='${PEAK_VRAM_GB}'; exit(0 if v == 'N/A' or float(v) >= 23 else 1)" 2>/dev/null; then
   echo "(B) VRAM OOM or quality degradation — keep park/unpark at 32K"
 else
   echo "(A) ee7 + skip-park works at 32K — recommend as opt-in config for ≤32K workloads"

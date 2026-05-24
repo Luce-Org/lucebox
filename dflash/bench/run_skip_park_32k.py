@@ -195,8 +195,9 @@ def main():
     dfwds = [r["drafter_fwd_s"] for r in results if r["drafter_fwd_s"] is not None]
     mean_dfw = sum(dfwds) / len(dfwds) if dfwds else None
 
+    mean_dfw_str = f"{mean_dfw:.2f}" if mean_dfw is not None else "N/A"
     print(f"\n[task47] RESULTS: NIAH {n_pass}/3, peak_vram={peak_gb:.1f}GB, "
-          f"mean_drafter_fwd={mean_dfw:.2f if mean_dfw else 'N/A'}s")
+          f"mean_drafter_fwd={mean_dfw_str}s")
 
     # Verdict
     if cuda_crash_seen:
