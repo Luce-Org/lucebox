@@ -69,6 +69,12 @@ public:
     // Get the reasoning text (after emit_finish).
     const std::string & reasoning_text() const { return reasoning_text_; }
 
+    // Current stream mode — callers tracking per-mode token counts use
+    // this to attribute a token to either REASONING or CONTENT. Sampled
+    // before each emit_token() call so tokens that span a </think>
+    // transition are attributed to the mode they entered with.
+    StreamMode mode() const { return mode_; }
+
 private:
     // Format helpers
     std::string format_openai_delta(const json & delta, const char * finish = nullptr);
