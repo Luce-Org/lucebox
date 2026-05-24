@@ -92,16 +92,16 @@ RUN cmake -S /src/dflash -B /src/dflash/build \
         -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
         -DDFLASH27B_USER_CUDA_ARCHITECTURES="${DFLASH_CUDA_ARCHES}" \
         -DCMAKE_CUDA_ARCHITECTURES="${DFLASH_CUDA_ARCHES}" \
-    && cmake --build /src/dflash/build --target test_dflash --parallel
+    && cmake --build /src/dflash/build --target test_dflash dflash_server --parallel
 
-# Prune the build tree to only what the runtime stage needs: the test_dflash
-# binary and the ggml shared libs its embedded rpath ($ORIGIN/deps/...) looks
-# up. Drops ~1 GB per image of CMakeFiles/, libdflash27b.a (statically linked
-# into the binary), ninja state, compile_commands.json, and the
-# template-instance .o tree from ggml-cuda.
+# Prune the build tree to only what the runtime stage needs: the native server,
+# test_dflash, and the ggml shared libs their embedded rpath
+# ($ORIGIN/deps/...) looks up. Drops ~1 GB per image of CMakeFiles/,
+# libdflash27b.a (statically linked into the binaries), ninja state,
+# compile_commands.json, and the template-instance .o tree from ggml-cuda.
 RUN cd /src/dflash/build \
     && find . -mindepth 1 -maxdepth 1 \
-            ! -name test_dflash ! -name deps -exec rm -rf {} + \
+            ! -name test_dflash ! -name dflash_server ! -name deps -exec rm -rf {} + \
     && find deps -mindepth 1 -type f ! -name 'lib*.so*' -delete \
     && find deps -depth -type d -empty -delete
 
@@ -154,16 +154,17 @@ COPY --from=builder /src/megakernel/pyproject.toml /src/megakernel/README.md \
 # subcommand other than `serve` / `benchmark` / `shell`.
 COPY --from=builder /src/lucebox /opt/lucebox-hub/lucebox
 
-# dflash: ship the Python orchestration (scripts/), the pyproject + README
-# that uv resolves against, and the pruned build tree (binary + .so files
-# from the prune step in the builder stage). Source code, headers, tests,
-# and submodule sources stay in the builder.
+# dflash: ship the entrypoint/benchmark scripts, the pyproject + README that uv
+# resolves against, and the pruned build tree (binaries + .so files from the
+# prune step in the builder stage). Source code, headers, tests, and submodule
+# sources stay in the builder.
 COPY --from=builder /src/dflash/scripts /opt/lucebox-hub/dflash/scripts
 COPY --from=builder /src/dflash/pyproject.toml /src/dflash/README.md \
                    /opt/lucebox-hub/dflash/
 COPY --from=builder /src/dflash/build /opt/lucebox-hub/dflash/build
 
 RUN test -x /opt/lucebox-hub/dflash/build/test_dflash \
+    && test -x /opt/lucebox-hub/dflash/build/dflash_server \
     && chmod +x /opt/lucebox-hub/dflash/scripts/entrypoint.sh
 
 # Register the ggml lib dir with ld.so so libggml-cpu.so (loaded transitively
@@ -178,7 +179,7 @@ RUN printf '%s\n%s\n' \
         > /etc/ld.so.conf.d/lucebox-ggml.conf \
     && ldconfig
 
-# Resolve Python deps for the dflash server (server.py + bench harness).
+# Resolve Python deps for the lucebox CLI and remaining Python benchmark harness.
 # Megakernel is an optional extra and is intentionally skipped — its CUDA
 # extension would require nvcc + matching torch headers in this stage.
 # `--no-cache` keeps wheels from being persisted in the layer; hardlink mode
@@ -205,7 +206,8 @@ VOLUME ["/opt/lucebox-hub/dflash/models"]
 
 ENV DFLASH_HOST=0.0.0.0 \
     DFLASH_PORT=8080 \
-    DFLASH_BIN=/opt/lucebox-hub/dflash/build/test_dflash
+    DFLASH_BIN=/opt/lucebox-hub/dflash/build/test_dflash \
+    DFLASH_SERVER_BIN=/opt/lucebox-hub/dflash/build/dflash_server
 
 EXPOSE 8080
 

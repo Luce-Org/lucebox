@@ -128,10 +128,10 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
 def benchmark_run_spec(cfg: Config, args: tuple[str, ...] = ()) -> DockerRunSpec:
     """One-shot optimizer container.
 
-    The benchmark entrypoint starts short-lived server.py instances on an
-    internal container port, writes its report under the bind-mounted models
-    directory, and exits. The host CLI reads that report back and updates
-    config.toml.
+    The benchmark entrypoint is still a Python harness while the serving
+    container now runs the native dflash_server binary. It writes its report
+    under the bind-mounted models directory and exits; the host CLI reads that
+    report back and updates config.toml.
     """
     env: list[tuple[str, str]] = [
         ("DFLASH_BUDGET", str(cfg.dflash.budget)),
