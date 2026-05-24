@@ -745,6 +745,16 @@ def main() -> int:
     )
     ap.add_argument("--json-out", type=Path)
     ap.add_argument("--trace", type=Path)
+    ap.add_argument(
+        "--parallel",
+        type=int,
+        default=1,
+        help=(
+            "Run up to N cases concurrently. Default 1 (sequential). Safe to "
+            "raise for stateless HTTP gateways (OpenRouter); leave at 1 for "
+            "single-GPU local servers since concurrent requests just queue."
+        ),
+    )
     args = ap.parse_args()
     min_pass_rate = (
         default_min_pass_rate(args.area)
@@ -799,22 +809,58 @@ def main() -> int:
         len(selected) if args.area in case_areas else "forge"
     )
     print(
-        f"[capability] url={args.url} area={args.area} questions={total_for_log}",
+        f"[capability] url={args.url} area={args.area} questions={total_for_log}"
+        + (f" parallel={args.parallel}"
+           if args.parallel > 1 and args.area in case_areas else ""),
         flush=True,
     )
-    for idx, case in enumerate(selected, start=1):
-        row = run_case(args.url, case, args.timeout, max_tokens, think,
-                        model=args.model, auth_header=auth_header)
-        rows.append(row)
+
+    def format_status(idx: int, case: dict[str, Any], row: dict[str, Any]) -> str:
         status = "PASS" if row["ok"] else "FAIL"
         correct = "|".join(expected_answers(case))
-        print(
+        return (
             f"  {idx:2d} {status:4s} {case['source']:14s} {case['id']:20s} "
             f"given={row.get('given', '?')} correct={correct} "
             f"format={row.get('format_pass')} hint={row.get('semantic_hint')} "
-            f"wall={row['wall_s']:.2f}s",
-            flush=True,
+            f"wall={row['wall_s']:.2f}s"
         )
+
+    # Case-area runner (smoke / ds4-eval / long / all). Parallel is opt-in
+    # via --parallel and only applies here; the forge runner below has its
+    # own scenario flow and stays sequential.
+    if args.area in case_areas:
+        if args.parallel > 1:
+            # Parallel runner: stateless HTTP gateways (OpenRouter) can serve
+            # many concurrent requests. Local single-GPU servers (dflash,
+            # ds4-server) just queue them, so this stays opt-in via --parallel.
+            # Output order is "as completed" so faster cases stream first; the
+            # JSON rows are sorted back to selection order before write so the
+            # snapshot matches the upstream eval_cases sequence.
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=args.parallel) as pool:
+                future_to_meta = {
+                    pool.submit(run_case, args.url, case, args.timeout,
+                                max_tokens, think, model=args.model,
+                                auth_header=auth_header):
+                        (idx, case)
+                    for idx, case in enumerate(selected, start=1)
+                }
+                for fut in as_completed(future_to_meta):
+                    idx, case = future_to_meta[fut]
+                    row = fut.result()
+                    row["_idx"] = idx
+                    rows.append(row)
+                    print(format_status(idx, case, row), flush=True)
+            rows.sort(key=lambda r: r["_idx"])
+            for r in rows:
+                r.pop("_idx", None)
+        else:
+            for idx, case in enumerate(selected, start=1):
+                row = run_case(args.url, case, args.timeout, max_tokens,
+                               think, model=args.model,
+                               auth_header=auth_header)
+                rows.append(row)
+                print(format_status(idx, case, row), flush=True)
 
     if args.area in forge_areas:
         forge_tags = (
