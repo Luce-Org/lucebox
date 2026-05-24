@@ -145,6 +145,15 @@ protected:
     std::mt19937_64 & sampler_rng_engine() { return sampler_rng_; }
     bool prefill_logits_valid() const { return prefill_last_logits_valid_; }
     std::size_t prefill_logits_offset() const { return prefill_last_logits_offset_; }
+
+    // Accessors for draft/spec-decode state (needed by hybrid spec-decode in subclass)
+    DraftWeights & draft_weights() { return dw_; }
+    const DraftWeights & draft_weights() const { return dw_; }
+    ggml_backend_t draft_backend() const { return draft_backend_; }
+    DraftFeatureMirror & feature_mirror() { return feature_mirror_; }
+    const DraftFeatureMirror & feature_mirror() const { return feature_mirror_; }
+    bool is_draft_parked() const { return draft_parked_; }
+
     // ── Configuration ────────────────────────────────────────────────
     Qwen35Config cfg_;
 

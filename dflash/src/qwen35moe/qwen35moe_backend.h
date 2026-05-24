@@ -50,6 +50,18 @@ private:
                                 const TargetWeights & w,
                                 Qwen35MoeExpertPlacement & out,
                                 std::string * err);
+
+    // Hybrid speculative decode: draft tokens using DFlash draft model,
+    // verify via hybrid forward (layer-by-layer with hot/cold FFN).
+    bool do_hybrid_spec_decode(int committed, int n_gen,
+                               std::vector<int32_t> & out_tokens,
+                               const DaemonIO & io);
+
+    // Run one token through hybrid forward, capturing features at capture layers.
+    // Returns the logits argmax token. Advances committed by 1.
+    bool hybrid_forward_one_token(int32_t tok, int kv_pos,
+                                  std::vector<float> & act_cur,
+                                  int32_t & argmax_out);
 };
 
 }  // namespace dflash::common
