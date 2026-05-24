@@ -163,8 +163,17 @@ COPY --from=builder /src/dflash/pyproject.toml /src/dflash/README.md \
                    /opt/lucebox-hub/dflash/
 COPY --from=builder /src/dflash/build /opt/lucebox-hub/dflash/build
 
+# Model-card sidecars resolved at startup. The server's search path
+# (model_card.cpp) looks at <binary>/../share/model_cards first, so
+# placing them at /opt/lucebox-hub/dflash/share/model_cards/ makes
+# them discoverable without DFLASH_MODEL_CARDS_DIR. Copied directly
+# from the build context (no builder roundtrip needed — these are
+# static JSON, not compiled).
+COPY share/model_cards /opt/lucebox-hub/dflash/share/model_cards
+
 RUN test -x /opt/lucebox-hub/dflash/build/test_dflash \
     && test -x /opt/lucebox-hub/dflash/build/dflash_server \
+    && test -f /opt/lucebox-hub/dflash/share/model_cards/qwen3.6-27b.json \
     && chmod +x /opt/lucebox-hub/dflash/scripts/entrypoint.sh
 
 # Register the ggml lib dir with ld.so so libggml-cpu.so (loaded transitively
