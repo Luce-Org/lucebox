@@ -273,6 +273,15 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
     // single- vs multi-token close-tag semantics.
     bool budget_close_started = false;
     int  close_inject_pos     = 0;
+    // Capture entry KV position so the budget check is in the
+    // "generated since entry" frame, not the absolute KV frame.
+    // committed_now (KV position) = prompt_len + tokens_generated; n_gen
+    // is the gen-only count (or remaining-budget remap from the
+    // spec-decode tail-off). Without this entry capture, force-close
+    // fires prompt_len tokens early on prompted requests and goes
+    // negative immediately after a tail-off. (Mirrors qwen35 fix 5c785f0
+    // — same bug since this lambda was ported verbatim.)
+    const int committed_at_entry = committed;
     auto maybe_force_close = [&](int32_t & tok, int committed_now) {
         if (budget_hook.close_token_ids.empty()) return;
         if (budget_close_started &&
@@ -289,7 +298,8 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
             return;
         }
         if (budget_close_started) return;
-        int remaining = n_gen - committed_now;
+        const int generated = committed_now - committed_at_entry;
+        int remaining = n_gen - generated;
         if (remaining <= budget_hook.hard_limit_remaining) {
             int32_t first_close = budget_hook.close_token_ids.front();
             if (tok == first_close) {
