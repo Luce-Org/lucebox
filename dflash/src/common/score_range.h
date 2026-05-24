@@ -4,7 +4,7 @@
 //
 // Parameters:
 //   n_layer        - total number of layers in the model (e.g. 28)
-//   score_layers   - value of DFLASH_DRAFTER_SCORE_LAYERS (-1 = all)
+//   score_layers   - value of PFLASH_DRAFTER_SCORE_LAYERS (-1 = all)
 //   fwd_layer_limit - number of layers actually computed (== early_exit_n when
 //                    early-exit is active, else n_layer)
 //

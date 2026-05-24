@@ -57,11 +57,11 @@ run_client() {
 
   # Set early-exit env for ee7 condition
   if [[ "$condition" == "ee7" ]]; then
-    export DFLASH_DRAFTER_EARLY_EXIT_N=7
-    export DFLASH_DRAFTER_SCORE_LAYERS=7
+    export PFLASH_DRAFTER_EARLY_EXIT_N=7
+    export PFLASH_DRAFTER_SCORE_LAYERS=7
   else
-    unset DFLASH_DRAFTER_EARLY_EXIT_N 2>/dev/null || true
-    unset DFLASH_DRAFTER_SCORE_LAYERS 2>/dev/null || true
+    unset PFLASH_DRAFTER_EARLY_EXIT_N 2>/dev/null || true
+    unset PFLASH_DRAFTER_SCORE_LAYERS 2>/dev/null || true
   fi
 
   local script="$CLIENTS_DIR/run_${client}.sh"

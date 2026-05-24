@@ -78,9 +78,9 @@ def start_server(cond: dict) -> tuple:
     env = os.environ.copy()
     env["GGML_CUDA_NO_VMM"] = "1"
     if score_layers is not None:
-        env["DFLASH_DRAFTER_SCORE_LAYERS"] = str(score_layers)
-    elif "DFLASH_DRAFTER_SCORE_LAYERS" in env:
-        del env["DFLASH_DRAFTER_SCORE_LAYERS"]
+        env["PFLASH_DRAFTER_SCORE_LAYERS"] = str(score_layers)
+    elif "PFLASH_DRAFTER_SCORE_LAYERS" in env:
+        del env["PFLASH_DRAFTER_SCORE_LAYERS"]
 
     cmd = [
         str(SERVER_BIN),

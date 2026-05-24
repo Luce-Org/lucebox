@@ -1,6 +1,6 @@
 // Regression test: layer-subset warm-path buffer sizing fix.
 //
-// Root cause (commit that introduced fix): when DFLASH_DRAFTER_SCORE_LAYERS=7
+// Root cause (commit that introduced fix): when PFLASH_DRAFTER_SCORE_LAYERS=7
 // with a 28-layer model, the old code allocated K_norope_v for ALL 28 layers
 // (~7.5 GB on RTX 3090 at S=128K) even though only 7 layers are read in scoring.
 // The extra 21 × 268 MB = 5.6 GB pushed total VRAM above 24 GB, causing GPU

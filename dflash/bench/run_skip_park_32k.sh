@@ -36,8 +36,8 @@ echo "[task47] GPU lock acquired at $(date)"
 echo "[task47] Starting server with --prefill-skip-park..."
 GGML_CUDA_NO_VMM=1 \
 DFLASH27B_KV_K=tq3_0 DFLASH27B_KV_V=tq3_0 \
-DFLASH_DRAFTER_EARLY_EXIT_N=7 \
-DFLASH_DRAFTER_SCORE_LAYERS=7 \
+PFLASH_DRAFTER_EARLY_EXIT_N=7 \
+PFLASH_DRAFTER_SCORE_LAYERS=7 \
 "$SERVER_BIN" "$TARGET_MODEL" \
   --host 127.0.0.1 --port $SERVER_PORT --max-ctx 36864 \
   --pflash-mode always --pflash-keep-ratio 0.05 \

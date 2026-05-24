@@ -24,8 +24,8 @@ EE7_PARK_BASELINE_S = 1.44
 def start_server(log_path):
     env = os.environ.copy()
     env["GGML_CUDA_NO_VMM"] = "1"
-    env["DFLASH_DRAFTER_EARLY_EXIT_N"] = "7"
-    env["DFLASH_DRAFTER_SCORE_LAYERS"] = "7"
+    env["PFLASH_DRAFTER_EARLY_EXIT_N"] = "7"
+    env["PFLASH_DRAFTER_SCORE_LAYERS"] = "7"
     cmd = [
         str(SERVER_BIN), str(TARGET),
         "--host", "127.0.0.1",

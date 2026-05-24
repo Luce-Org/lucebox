@@ -23,8 +23,8 @@ echo "[task47] GPU lock acquired $(date)"
 
 # Start server
 GGML_CUDA_NO_VMM=1 \
-DFLASH_DRAFTER_EARLY_EXIT_N=7 \
-DFLASH_DRAFTER_SCORE_LAYERS=7 \
+PFLASH_DRAFTER_EARLY_EXIT_N=7 \
+PFLASH_DRAFTER_SCORE_LAYERS=7 \
 "$BIN" "$TARGET" \
   --host 127.0.0.1 --port $PORT --max-ctx 36864 \
   --cache-type-k tq3_0 --cache-type-v tq3_0 \

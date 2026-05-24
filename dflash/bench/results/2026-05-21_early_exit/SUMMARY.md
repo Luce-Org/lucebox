@@ -1,12 +1,12 @@
 # Early-Exit Forward Bench — 2026-05-21
 
 Binary: `dflash/build/dflash_server` built 2026-05-21 21:48  
-Patch: `DFLASH_DRAFTER_EARLY_EXIT_N` support in `dflash/src/qwen3/qwen3_graph.cpp` (uncommitted)  
+Patch: `PFLASH_DRAFTER_EARLY_EXIT_N` support in `dflash/src/qwen3/qwen3_graph.cpp` (uncommitted)  
 GPU: RTX 3090 (24 GiB), TQ3_0 KV cache, BF16 drafter only
 
 ## Conditions
 
-| Condition | DFLASH_DRAFTER_EARLY_EXIT_N | DFLASH_DRAFTER_SCORE_LAYERS |
+| Condition | PFLASH_DRAFTER_EARLY_EXIT_N | PFLASH_DRAFTER_SCORE_LAYERS |
 |---|---|---|
 | baseline_ee | unset (28 layers) | unset (28 layers) |
 | ee14 | 14 | unset (28, clamped to 14) |
@@ -50,7 +50,7 @@ warm_fwd_warm is p50(rep1, rep2). warm_speedup = baseline_warm_p50 / cond_warm_p
 
 This confirms early-exit skips layers cleanly without the warm-cache inflation that plagued `score_layer_start > 0`.
 
-**ee7 scoring bug**: With `DFLASH_DRAFTER_EARLY_EXIT_N=7` and `DFLASH_DRAFTER_SCORE_LAYERS=7`, the clamp logic sets `score_layer_start = min(28-7, 7) = 7` and `score_layer_end = fwd_layer_limit = 7`, producing an empty range [7, 7). The tail-score runs zero iterations — quality is undefined. NIAH still passes 3/3 because with keep_ratio=0.05 at 32K/64K the compression is aggressive enough that any result is effectively random-but-lucky; this cannot be trusted for real-world quality. **ee7 as currently configured is broken for scoring.**
+**ee7 scoring bug**: With `PFLASH_DRAFTER_EARLY_EXIT_N=7` and `PFLASH_DRAFTER_SCORE_LAYERS=7`, the clamp logic sets `score_layer_start = min(28-7, 7) = 7` and `score_layer_end = fwd_layer_limit = 7`, producing an empty range [7, 7). The tail-score runs zero iterations — quality is undefined. NIAH still passes 3/3 because with keep_ratio=0.05 at 32K/64K the compression is aggressive enough that any result is effectively random-but-lucky; this cannot be trusted for real-world quality. **ee7 as currently configured is broken for scoring.**
 
 **ee14 is the viable condition**: 1.91-1.92x warm speedup with proper scoring (14 layers, range 0-13), NIAH 3/3 at both 32K and 64K. Cold run shows ~1.91x as well — no cold penalty vs warm, unlike the 128K layer-subset run.
 

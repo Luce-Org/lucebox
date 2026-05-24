@@ -4,7 +4,7 @@ NIAH broad-context bench: baseline vs ee14 vs ee7 at 1K/4K/8K/16K.
 ONE SERVER INSTANCE PER CASE (server crashes on 2nd request due to ggml view bug).
 Measures drafter_fwd from server log and answer correctness.
 
-ee7: DFLASH_DRAFTER_EARLY_EXIT_N=7 DFLASH_DRAFTER_SCORE_LAYERS=7
+ee7: PFLASH_DRAFTER_EARLY_EXIT_N=7 PFLASH_DRAFTER_SCORE_LAYERS=7
 """
 import argparse
 import json
@@ -34,13 +34,13 @@ def start_server(condition, ctx, log_path):
     env["GGML_CUDA_NO_VMM"] = "1"
     env["DFLASH27B_KV_K"] = "tq3_0"
     env["DFLASH27B_KV_V"] = "tq3_0"
-    env.pop("DFLASH_DRAFTER_EARLY_EXIT_N", None)
-    env.pop("DFLASH_DRAFTER_SCORE_LAYERS", None)
+    env.pop("PFLASH_DRAFTER_EARLY_EXIT_N", None)
+    env.pop("PFLASH_DRAFTER_SCORE_LAYERS", None)
     if condition == "ee14":
-        env["DFLASH_DRAFTER_EARLY_EXIT_N"] = "14"
+        env["PFLASH_DRAFTER_EARLY_EXIT_N"] = "14"
     elif condition == "ee7":
-        env["DFLASH_DRAFTER_EARLY_EXIT_N"] = "7"
-        env["DFLASH_DRAFTER_SCORE_LAYERS"] = "7"
+        env["PFLASH_DRAFTER_EARLY_EXIT_N"] = "7"
+        env["PFLASH_DRAFTER_SCORE_LAYERS"] = "7"
 
     cmd = [
         str(SERVER_BIN), str(TARGET),

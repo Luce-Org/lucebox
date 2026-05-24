@@ -254,12 +254,12 @@ bool forward_qwen3_drafter_model(
     // allocation is ~5.6 GB (21 unused layers × 268 MB) — skipping it keeps total
     // VRAM under 24 GB and eliminates the warm-path regression (A_compute 5.4x).
     static const int score_layers_pre = []() -> int {
-        const char * e = std::getenv("DFLASH_DRAFTER_SCORE_LAYERS");
+        const char * e = std::getenv("PFLASH_DRAFTER_SCORE_LAYERS");
         if (e) { int v = std::atoi(e); if (v > 0) return v; }
         return -1;
     }();
     static const int early_exit_pre = []() -> int {
-        const char * e = std::getenv("DFLASH_DRAFTER_EARLY_EXIT_N");
+        const char * e = std::getenv("PFLASH_DRAFTER_EARLY_EXIT_N");
         if (e) { int v = std::atoi(e); if (v > 0) return v; }
         return -1;
     }();
@@ -386,7 +386,7 @@ bool forward_qwen3_drafter_model(
         ggml_free(gctx);
     }
 
-    // DFLASH_DRAFTER_EARLY_EXIT_N: already read into early_exit_pre above.
+    // PFLASH_DRAFTER_EARLY_EXIT_N: already read into early_exit_pre above.
     // Alias used in the forward-loop limit below.
     const int & early_exit_n = early_exit_pre;
 

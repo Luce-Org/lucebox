@@ -64,14 +64,14 @@ def start_server(cond: dict, log_path: Path):
     env["DFLASH27B_KV_V"] = "tq3_0"
 
     if cond["early_exit_n"] is not None:
-        env["DFLASH_DRAFTER_EARLY_EXIT_N"] = str(cond["early_exit_n"])
-    elif "DFLASH_DRAFTER_EARLY_EXIT_N" in env:
-        del env["DFLASH_DRAFTER_EARLY_EXIT_N"]
+        env["PFLASH_DRAFTER_EARLY_EXIT_N"] = str(cond["early_exit_n"])
+    elif "PFLASH_DRAFTER_EARLY_EXIT_N" in env:
+        del env["PFLASH_DRAFTER_EARLY_EXIT_N"]
 
     if cond["score_layers"] is not None:
-        env["DFLASH_DRAFTER_SCORE_LAYERS"] = str(cond["score_layers"])
-    elif "DFLASH_DRAFTER_SCORE_LAYERS" in env:
-        del env["DFLASH_DRAFTER_SCORE_LAYERS"]
+        env["PFLASH_DRAFTER_SCORE_LAYERS"] = str(cond["score_layers"])
+    elif "PFLASH_DRAFTER_SCORE_LAYERS" in env:
+        del env["PFLASH_DRAFTER_SCORE_LAYERS"]
 
     cmd = [
         str(SERVER_BIN),

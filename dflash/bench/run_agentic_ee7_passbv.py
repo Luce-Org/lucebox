@@ -27,13 +27,13 @@ CONDITIONS = [
     },
     {
         "name": "ee14",
-        "env_extra": {"DFLASH_DRAFTER_EARLY_EXIT_N": "14"},
+        "env_extra": {"PFLASH_DRAFTER_EARLY_EXIT_N": "14"},
     },
     {
         "name": "ee7",
         "env_extra": {
-            "DFLASH_DRAFTER_EARLY_EXIT_N": "7",
-            "DFLASH_DRAFTER_SCORE_LAYERS": "7",
+            "PFLASH_DRAFTER_EARLY_EXIT_N": "7",
+            "PFLASH_DRAFTER_SCORE_LAYERS": "7",
         },
     },
 ]
@@ -76,8 +76,8 @@ def run_condition(cond: dict) -> dict:
         "CLAUDE_BIN": "/home/peppi/.local/bin/claude",
     })
     # Clear any previous early-exit env
-    env.pop("DFLASH_DRAFTER_EARLY_EXIT_N", None)
-    env.pop("DFLASH_DRAFTER_SCORE_LAYERS", None)
+    env.pop("PFLASH_DRAFTER_EARLY_EXIT_N", None)
+    env.pop("PFLASH_DRAFTER_SCORE_LAYERS", None)
     # Apply condition-specific env
     env.update(cond["env_extra"])
 

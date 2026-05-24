@@ -2,7 +2,7 @@
 
 ## Diagnosis
 
-With `DFLASH_DRAFTER_SCORE_LAYERS=7` (28-layer model), the old code allocated
+With `PFLASH_DRAFTER_SCORE_LAYERS=7` (28-layer model), the old code allocated
 `K_norope_v` for all 28 layers regardless of how many would be read in scoring.
 At S=128K each layer's K_norope buffer is D×Hk×S×2 = 128×8×131080×2 = 268 MB.
 All 28 layers = 7.5 GB; only 7 are needed = 1.9 GB.
