@@ -1,4 +1,0 @@
-{"client":"pi","condition":"baseline","wall_s":"10.2","drafter_fwd":"0.45s","accept_rate":"16.0%","ok_done":"YES","rc":0,"stamp":"fp2-pi-baseline-20260522-005555"}
-{"client":"pi","condition":"ee7","wall_s":"12.7","drafter_fwd":"0.21s","accept_rate":"31.9%","ok_done":"YES","rc":0,"stamp":"fp2-pi-ee7-20260522-005605"}
-{"client":"codex","condition":"baseline","wall_s":"10.8","drafter_fwd":"1.57s","accept_rate":"21.2%","ok_done":"NO","rc":0,"stamp":"fp2-codex-baseline-20260522-005618"}
-{"client":"codex","condition":"ee7","wall_s":"9.5","drafter_fwd":"0.50s","accept_rate":"15.6%","ok_done":"NO","rc":0,"stamp":"fp2-codex-ee7-20260522-005629"}
