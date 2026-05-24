@@ -1,0 +1,631 @@
+# lucebox HTTP capability trace
+
+===== CASE 1 forge-guardrails/basic_2step =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 2 forge-guardrails/sequential_3step =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 3 forge-guardrails/error_recovery =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 4 forge-guardrails/tool_selection =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 5 forge-guardrails/argument_fidelity =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 6 forge-guardrails/sequential_reasoning =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 7 forge-guardrails/conditional_routing =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 8 forge-guardrails/data_gap_recovery =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 9 forge-guardrails/data_gap_recovery_extended =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 10 forge-guardrails/argument_transformation =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 11 forge-guardrails/inconsistent_api_recovery =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 12 forge-guardrails/grounded_synthesis =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 13 forge-guardrails/relevance_detection =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 14 forge-guardrails/basic_2step_stateful =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 15 forge-guardrails/sequential_3step_stateful =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 16 forge-guardrails/error_recovery_stateful =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 17 forge-guardrails/tool_selection_stateful =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 18 forge-guardrails/argument_fidelity_stateful =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 19 forge-guardrails/sequential_reasoning_stateful =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 20 forge-guardrails/conditional_routing_stateful =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 21 forge-guardrails/data_gap_recovery_stateful =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 22 forge-guardrails/data_gap_recovery_extended_stateful =====
+ds4_index: None
+status: failed
+http_status: None
+finish_reason: None
+given: FAIL
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: False
+graded_pass: False
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 23 forge-guardrails/argument_transformation_stateful =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 24 forge-guardrails/inconsistent_api_recovery_stateful =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 25 forge-guardrails/grounded_synthesis_stateful =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 26 forge-guardrails/relevance_detection_stateful =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 27 forge-guardrails/compaction_chain_baseline =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 28 forge-guardrails/compaction_chain_p1 =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 29 forge-guardrails/compaction_chain_p2 =====
+ds4_index: None
+status: failed
+http_status: None
+finish_reason: None
+given: FAIL
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: False
+graded_pass: False
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
+
+===== CASE 30 forge-guardrails/compaction_chain_p3 =====
+ds4_index: None
+status: passed
+http_status: None
+finish_reason: None
+given: PASS
+correct: ['PASS']
+format_pass: True
+semantic_hint: False
+semantic_pass: False
+strict_pass: True
+graded_pass: True
+prompt_tokens: None
+completion_tokens: None
+PROMPT_BEGIN
+
+PROMPT_END
+MODEL_OUTPUT_BEGIN
+
+MODEL_OUTPUT_END
