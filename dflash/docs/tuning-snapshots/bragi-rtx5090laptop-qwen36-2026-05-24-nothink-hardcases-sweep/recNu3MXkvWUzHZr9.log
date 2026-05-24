@@ -1,0 +1,3 @@
+[capability] url=http://localhost:8080 area=ds4-eval questions=1
+   1 PASS GPQA Diamond   recNu3MXkvWUzHZr9    given=B correct=B format=True hint=True wall=79.76s
+[capability] pass_rate=100.00%

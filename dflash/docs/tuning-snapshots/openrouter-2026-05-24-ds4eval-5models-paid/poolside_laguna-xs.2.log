@@ -1,0 +1,94 @@
+[capability] url=https://openrouter.ai/api area=ds4-eval questions=92 parallel=8
+   5 FAIL SuperGPQA      b7e20eac98764fb0bf30e8366d951daa given=? correct=J format=None hint=None wall=0.06s
+   2 FAIL SuperGPQA      001b51d76b4d422988f2c11f104a2c6c given=? correct=C format=None hint=None wall=0.07s
+   1 FAIL GPQA Diamond   recNu3MXkvWUzHZr9    given=? correct=B format=None hint=None wall=0.07s
+   7 FAIL GPQA Diamond   rec4UqStf9WUVif1f    given=? correct=B format=None hint=None wall=0.07s
+   3 FAIL AIME2025       aime2025-01          given=? correct=70 format=None hint=None wall=0.07s
+   6 FAIL AIME2025       aime2025-16          given=? correct=468 format=None hint=None wall=0.07s
+   8 FAIL SuperGPQA      4a1d1780a93f4093b6fb7d3c314cbea8 given=? correct=E format=None hint=None wall=0.07s
+  13 FAIL GPQA Diamond   recDytVnNYZe2HuUU    given=? correct=A format=None hint=None wall=0.03s
+  10 FAIL GPQA Diamond   recgI6tUQ7RLJRWGx    given=? correct=B format=None hint=None wall=0.03s
+  14 FAIL SuperGPQA      bebf1ed45ae14ad7b4f205f3909cb58a given=? correct=J format=None hint=None wall=0.03s
+  12 FAIL AIME2025       aime2025-03          given=? correct=16 format=None hint=None wall=0.04s
+   9 FAIL AIME2025       aime2025-02          given=? correct=588 format=None hint=None wall=0.04s
+  11 FAIL SuperGPQA      6082513c8dba4ec68aa68f1bf5854d09 given=? correct=A format=None hint=None wall=0.04s
+  15 FAIL AIME2025       aime2025-18          given=? correct=82 format=None hint=None wall=0.04s
+  16 FAIL GPQA Diamond   recNFJjE5PPTqVJGv    given=? correct=D format=None hint=None wall=0.04s
+  18 FAIL AIME2025       aime2025-04          given=? correct=117 format=None hint=None wall=0.04s
+  17 FAIL SuperGPQA      7ca71b86327744b78e93185a45bc5cef given=? correct=I format=None hint=None wall=0.05s
+  19 FAIL GPQA Diamond   rec2UlKqC6RFHdcro    given=? correct=B format=None hint=None wall=0.04s
+  21 FAIL AIME2025       aime2025-19          given=? correct=106 format=None hint=None wall=0.04s
+  22 FAIL GPQA Diamond   recv7GsQg3f0fvB1f    given=? correct=B format=None hint=None wall=0.03s
+  20 FAIL SuperGPQA      d44b94f7749345a39a65f6312bda8764 given=? correct=E format=None hint=None wall=0.05s
+  23 FAIL SuperGPQA      febe406f44d74a40b50bb5b7c69d5dc1 given=? correct=B format=None hint=None wall=0.03s
+  25 FAIL GPQA Diamond   recrHBEJJoDTV05JR    given=? correct=C format=None hint=None wall=0.03s
+  24 FAIL AIME2025       aime2025-05          given=? correct=279 format=None hint=None wall=0.04s
+  27 FAIL AIME2025       aime2025-06          given=? correct=504 format=None hint=None wall=0.04s
+  29 FAIL SuperGPQA      0f14cd17be174618af6d60227e7dca9f given=? correct=C format=None hint=None wall=0.03s
+  30 FAIL AIME2025       aime2025-21          given=? correct=293 format=None hint=None wall=0.04s
+  32 FAIL SuperGPQA      cef9bcc087434cc2b4e354a9baef55eb given=? correct=J format=None hint=None wall=0.03s
+  33 FAIL AIME2025       aime2025-07          given=? correct=821 format=None hint=None wall=0.03s
+  31 FAIL GPQA Diamond   recA1i5ZAh0Uzclxp    given=? correct=C format=None hint=None wall=0.06s
+  34 FAIL GPQA Diamond   recqGD3fxPCI59vPQ    given=? correct=B format=None hint=None wall=0.05s
+  26 FAIL SuperGPQA      31950dc80ded400a9181f50626d1f75c given=? correct=C format=None hint=None wall=0.10s
+  36 FAIL AIME2025       aime2025-22          given=? correct=237 format=None hint=None wall=0.04s
+  40 FAIL GPQA Diamond   rec1zl5LvaatzGhFt    given=? correct=B format=None hint=None wall=0.05s
+  37 FAIL GPQA Diamond   rechKl68Uc6H7vU0N    given=? correct=A format=None hint=None wall=0.08s
+  38 FAIL SuperGPQA      97ad69dda7b2462c98638b79e78aea0b given=? correct=E format=None hint=None wall=0.07s
+  39 FAIL AIME2025       aime2025-08          given=? correct=77 format=None hint=None wall=0.07s
+  44 FAIL SuperGPQA      8483667a25e74fdfa3188de4ea734f03 given=? correct=A format=None hint=None wall=0.04s
+  43 FAIL GPQA Diamond   recTs7qzfJs6kfLUK    given=? correct=A format=None hint=None wall=0.04s
+  45 FAIL AIME2025       aime2025-24          given=? correct=149 format=None hint=None wall=0.04s
+  42 FAIL AIME2025       aime2025-09          given=? correct=62 format=None hint=None wall=0.05s
+  41 FAIL SuperGPQA      e78e4e539d6f4e379ac140d923d7b1be given=? correct=H format=None hint=None wall=0.11s
+  48 FAIL AIME2025       aime2025-10          given=? correct=81 format=None hint=None wall=0.03s
+  47 FAIL SuperGPQA      e5ed76ef98144f06843125daf1bccd35 given=? correct=A format=None hint=None wall=0.04s
+  50 FAIL SuperGPQA      fd7924876c4845cd83d95d61dfa0b236 given=? correct=H format=None hint=None wall=0.03s
+  52 FAIL GPQA Diamond   recVvpD8miVjmmyfe    given=? correct=C format=None hint=None wall=0.04s
+  51 FAIL AIME2025       aime2025-25          given=? correct=907 format=None hint=None wall=0.04s
+  28 FAIL GPQA Diamond   recb80OwMgNnceA9t    given=? correct=D format=None hint=None wall=0.27s
+  53 FAIL SuperGPQA      6bfe7d19299d4b3184636e1f51694306 given=? correct=I format=None hint=None wall=0.04s
+  54 FAIL AIME2025       aime2025-26          given=? correct=113 format=None hint=None wall=0.03s
+  57 FAIL AIME2025       aime2025-12          given=? correct=510 format=None hint=None wall=0.04s
+  58 FAIL GPQA Diamond   reckEnrOPFT9Ru7tW    given=? correct=C format=None hint=None wall=0.04s
+  56 FAIL SuperGPQA      e1825d70c5844c22933087eafa89e39c given=? correct=J format=None hint=None wall=0.06s
+   4 FAIL GPQA Diamond   recoiTJPGUmzAkief    given=? correct=C format=None hint=None wall=0.49s
+  59 FAIL SuperGPQA      ab430ac3f18e4e02a2cb3f35498c6b30 given=? correct=A format=None hint=None wall=0.04s
+  60 FAIL AIME2025       aime2025-27          given=? correct=19 format=None hint=None wall=0.03s
+  61 FAIL GPQA Diamond   rec8nshandHARTkrg    given=? correct=A format=None hint=None wall=0.04s
+  63 FAIL AIME2025       aime2025-13          given=? correct=204 format=None hint=None wall=0.03s
+  64 FAIL GPQA Diamond   recFaL6j8UMhutXrc    given=? correct=A format=None hint=None wall=0.03s
+  62 FAIL SuperGPQA      e8c5da5ca40647158b0c91dd695c6243 given=? correct=F format=None hint=None wall=0.05s
+  65 FAIL SuperGPQA      05efdc6fb2404ddc8dd5729bb68c74e5 given=? correct=H format=None hint=None wall=0.04s
+  66 FAIL AIME2025       aime2025-28          given=? correct=248 format=None hint=None wall=0.04s
+  68 FAIL SuperGPQA      ba52e06cbe1a4310a77a7d12cd1db943 given=? correct=H format=None hint=None wall=0.04s
+  70 FAIL GPQA Diamond   recWxGU8Q4YReJ1tb    given=? correct=C format=None hint=None wall=0.03s
+  69 FAIL AIME2025       aime2025-29          given=? correct=104 format=None hint=None wall=0.05s
+  71 FAIL SuperGPQA      591a77df21324272914be82ac6583399 given=? correct=F format=None hint=None wall=0.04s
+  73 FAIL GPQA Diamond   recMicVBcqy1xM1jq    given=? correct=B format=None hint=None wall=0.03s
+  72 FAIL AIME2025       aime2025-15          given=? correct=735 format=None hint=None wall=0.06s
+  74 FAIL SuperGPQA      e780f37a5baa4fe094cd9c157486664d given=? correct=H format=None hint=None wall=0.04s
+  75 FAIL AIME2025       aime2025-30          given=? correct=240 format=None hint=None wall=0.04s
+  77 FAIL COMPSEC        compsec-077          given=? correct=18-20 format=None hint=None wall=0.05s
+  78 FAIL COMPSEC        compsec-078          given=? correct=11 format=None hint=None wall=0.04s
+  55 FAIL GPQA Diamond   recAAJoHMW45Lv5je    given=? correct=D format=None hint=None wall=0.32s
+  76 FAIL COMPSEC        compsec-076          given=? correct=17-20 format=None hint=None wall=0.08s
+  79 FAIL COMPSEC        compsec-079          given=? correct=18-19 format=None hint=None wall=0.03s
+  80 FAIL COMPSEC        compsec-080          given=? correct=5-6 format=None hint=None wall=0.03s
+  83 FAIL COMPSEC        compsec-083          given=? correct=9-11 format=None hint=None wall=0.04s
+  82 FAIL COMPSEC        compsec-082          given=? correct=9-10 format=None hint=None wall=0.04s
+  84 FAIL COMPSEC        compsec-084          given=? correct=6-7 format=None hint=None wall=0.04s
+  87 FAIL COMPSEC        compsec-087          given=? correct=8,20-22 format=None hint=None wall=0.03s
+  86 FAIL COMPSEC        compsec-086          given=? correct=3,13-15 format=None hint=None wall=0.04s
+  85 FAIL COMPSEC        compsec-085          given=? correct=5 format=None hint=None wall=0.06s
+  88 FAIL COMPSEC        compsec-088          given=? correct=11 format=None hint=None wall=0.03s
+  89 FAIL COMPSEC        compsec-089          given=? correct=10 format=None hint=None wall=0.03s
+  90 FAIL COMPSEC        compsec-090          given=? correct=12-13 format=None hint=None wall=0.03s
+  92 FAIL COMPSEC        compsec-092          given=? correct=10-14 format=None hint=None wall=0.05s
+  91 FAIL COMPSEC        compsec-091          given=? correct=3 format=None hint=None wall=0.07s
+  81 FAIL COMPSEC        compsec-081          given=? correct=10-15 format=None hint=None wall=0.24s
+  35 FAIL SuperGPQA      9f93aa2cfdb547b5b3a4623f80f7fff6 given=? correct=I format=None hint=None wall=0.94s
+  46 FAIL GPQA Diamond   rec32C1ZEapBnCC0E    given=? correct=C format=None hint=None wall=0.86s
+  49 FAIL GPQA Diamond   recZWeueB7lSPR6wN    given=? correct=B format=None hint=None wall=1.06s
+  67 FAIL GPQA Diamond   reczQ4I0VpENdMtIj    given=? correct=C format=None hint=None wall=1.11s
+[capability] pass_rate=0.00%

@@ -1,0 +1,31 @@
+[capability] url=https://openrouter.ai/api area=ds4-eval questions=92 parallel=8
+   2 PASS SuperGPQA      001b51d76b4d422988f2c11f104a2c6c given=C correct=C format=True hint=True wall=16.69s
+   5 PASS SuperGPQA      b7e20eac98764fb0bf30e8366d951daa given=J correct=J format=True hint=True wall=63.66s
+   7 PASS GPQA Diamond   rec4UqStf9WUVif1f    given=B correct=B format=True hint=True wall=69.23s
+   8 PASS SuperGPQA      4a1d1780a93f4093b6fb7d3c314cbea8 given=E correct=E format=True hint=True wall=76.46s
+  11 FAIL SuperGPQA      6082513c8dba4ec68aa68f1bf5854d09 given=E correct=A format=True hint=False wall=15.24s
+   1 PASS GPQA Diamond   recNu3MXkvWUzHZr9    given=B correct=B format=True hint=True wall=86.62s
+  10 PASS GPQA Diamond   recgI6tUQ7RLJRWGx    given=B correct=B format=True hint=True wall=100.87s
+   6 PASS AIME2025       aime2025-16          given=468 correct=468 format=True hint=True wall=172.10s
+   9 FAIL AIME2025       aime2025-02          given=? correct=588 format=False hint=True wall=174.97s
+  17 PASS SuperGPQA      7ca71b86327744b78e93185a45bc5cef given=I correct=I format=True hint=True wall=24.47s
+  14 PASS SuperGPQA      bebf1ed45ae14ad7b4f205f3909cb58a given=J correct=J format=True hint=True wall=138.03s
+  12 PASS AIME2025       aime2025-03          given=16 correct=16 format=True hint=True wall=168.88s
+   3 FAIL AIME2025       aime2025-01          given=? correct=70 format=False hint=True wall=256.33s
+  13 PASS GPQA Diamond   recDytVnNYZe2HuUU    given=A correct=A format=True hint=True wall=173.09s
+  16 PASS GPQA Diamond   recNFJjE5PPTqVJGv    given=D correct=D format=True hint=True wall=152.71s
+  22 PASS GPQA Diamond   recv7GsQg3f0fvB1f    given=B correct=B format=True hint=True wall=79.46s
+  15 FAIL AIME2025       aime2025-18          given=? correct=82 format=False hint=True wall=197.07s
+  23 PASS SuperGPQA      febe406f44d74a40b50bb5b7c69d5dc1 given=B correct=B format=True hint=True wall=44.08s
+   4 PASS GPQA Diamond   recoiTJPGUmzAkief    given=C correct=C format=True hint=True wall=407.04s
+  18 FAIL AIME2025       aime2025-04          given=? correct=117 format=False hint=True wall=193.07s
+  21 PASS AIME2025       aime2025-19          given=106 correct=106 format=True hint=True wall=194.70s
+  20 PASS SuperGPQA      d44b94f7749345a39a65f6312bda8764 given=E correct=E format=True hint=True wall=206.44s
+  26 PASS SuperGPQA      31950dc80ded400a9181f50626d1f75c given=C correct=C format=True hint=True wall=105.61s
+  19 FAIL GPQA Diamond   rec2UlKqC6RFHdcro    given=? correct=B format=False hint=False wall=279.65s
+  29 FAIL SuperGPQA      0f14cd17be174618af6d60227e7dca9f given=? correct=C format=False hint=False wall=74.35s
+  31 FAIL GPQA Diamond   recA1i5ZAh0Uzclxp    given=? correct=C format=False hint=False wall=50.94s
+  32 PASS SuperGPQA      cef9bcc087434cc2b4e354a9baef55eb given=J correct=J format=True hint=True wall=66.15s
+  28 FAIL GPQA Diamond   recb80OwMgNnceA9t    given=? correct=D format=False hint=False wall=168.06s
+  30 FAIL AIME2025       aime2025-21          given=? correct=293 format=False hint=True wall=150.61s
+  35 PASS SuperGPQA      9f93aa2cfdb547b5b3a4623f80f7fff6 given=I correct=I format=True hint=True wall=46.59s
