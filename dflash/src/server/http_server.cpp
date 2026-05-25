@@ -168,14 +168,22 @@ json build_props_body(const ServerConfig & config,
         };
     }
 
+    // Reflect actual sampler defaults the server applies when a request
+    // omits the field — these come from the loaded model card's sampling
+    // section (spec §3.3), not from a hard-coded greedy fallback. Clients
+    // that read /props to pick their sampling shape were getting greedy
+    // here regardless of what the model card said, which caused gemma4
+    // benchmarks to silently run at temp=0 (degenerate-decode collapse)
+    // when the model card specifies temp=1.0/top_p=0.95/top_k=64.
+    const auto & smp = config.sampler_defaults;
     json body = {
         {"default_generation_settings", {
             {"n_ctx",          config.max_ctx},
-            {"temperature",    0.0},
-            {"top_p",          1.0},
-            {"top_k",          0},
-            {"min_p",          0.0},
-            {"repeat_penalty", 1.0},
+            {"temperature",    smp.has_temperature        ? smp.temperature        : 0.0f},
+            {"top_p",          smp.has_top_p              ? smp.top_p              : 1.0f},
+            {"top_k",          smp.has_top_k              ? smp.top_k              : 0},
+            {"min_p",          smp.has_min_p              ? smp.min_p              : 0.0f},
+            {"repeat_penalty", smp.has_repetition_penalty ? smp.repetition_penalty : 1.0f},
         }},
         {"model_alias", config.model_name},
         {"model_path",  config.model_path},
