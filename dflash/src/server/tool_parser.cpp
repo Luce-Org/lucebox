@@ -170,6 +170,67 @@ static const std::regex & re_native_tag() {
     return r;
 }
 
+// ─── Parameter-name alias resolution ────────────────────────────────────
+
+// Some quantized models (e.g. Qwen3.6-Q3) emit short forms of canonical
+// parameter names (cmd instead of command, path instead of file_path).
+// Map the emitted key to the schema's actual key when an alias is found.
+// Pure helper — returns the original `emitted` if no alias matches.
+static std::string resolve_param_alias(const std::string & emitted, const json & props) {
+    if (!props.is_object() || props.empty()) return emitted;
+
+    std::string lower = emitted;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+    // 1. Direct case-insensitive match against schema keys.
+    for (auto it = props.begin(); it != props.end(); ++it) {
+        std::string name = it.key();
+        std::string lname = name;
+        std::transform(lname.begin(), lname.end(), lname.begin(), ::tolower);
+        if (lname == lower) return name;
+    }
+
+    // 2. Alias map: common shortenings <=> canonical forms.
+    static const std::vector<std::pair<std::string, std::vector<std::string>>> aliases = {
+        {"cmd",        {"command"}},
+        {"command",    {"cmd"}},
+        {"path",       {"file_path", "directory", "dir"}},
+        {"file_path",  {"path", "file"}},
+        {"file",       {"file_path", "path"}},
+        {"filepath",   {"file_path"}},
+        {"dir",        {"directory", "path"}},
+        {"directory",  {"dir", "path"}},
+        {"query",      {"pattern", "q"}},
+        {"pattern",    {"query", "regex"}},
+        {"regex",      {"pattern"}},
+        {"q",          {"query", "pattern"}},
+        {"expr",       {"expression"}},
+        {"expression", {"expr"}},
+        {"text",       {"content"}},
+        {"content",    {"text"}},
+        {"src",        {"source"}},
+        {"source",     {"src"}},
+        {"dst",        {"destination", "target"}},
+        {"destination", {"dst", "target"}},
+        {"target",     {"dst", "destination"}},
+    };
+
+    for (const auto & [key, candidates] : aliases) {
+        if (key != lower) continue;
+        for (const std::string & candidate : candidates) {
+            for (auto pit = props.begin(); pit != props.end(); ++pit) {
+                std::string pname = pit.key();
+                std::string lpname = pname;
+                std::transform(lpname.begin(), lpname.end(), lpname.begin(), ::tolower);
+                if (lpname == candidate) return pname;
+            }
+        }
+        break;
+    }
+
+    return emitted;  // no alias matched; keep as-is
+}
+
 // ─── XML parameter parser ───────────────────────────────────────────────
 
 static json parse_xml_params(const std::string & region, const std::string & fn_name,
@@ -192,7 +253,8 @@ static json parse_xml_params(const std::string & region, const std::string & fn_
         if (!v.empty() && v.front() == '\n') v.erase(v.begin());
         if (!v.empty() && v.back() == '\n') v.pop_back();
 
-        args[k] = convert_param_value(v, k, props);
+        std::string canonical_k = resolve_param_alias(k, props);
+        args[canonical_k] = convert_param_value(v, canonical_k, props);
     }
     return args;
 }
