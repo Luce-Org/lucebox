@@ -59,6 +59,15 @@ struct ModelCard {
     SamplingDefaults  sampling;
     EffortTiers       effort_tiers;
     int               hard_limit_reply_budget    = 512;
+    // Soft-limit negotiated close window (spec §5.3). 0 = disabled
+    // (hard-only behavior). Operator can set per-model via sidecar.
+    int               soft_limit_reply_budget    = 0;
+    int               soft_limit_close_rank      = 8;
+    // Thinking-budget preamble (spec §3.3 / §5.4). Template string
+    // with `{think_max}` and `{reply_max}` placeholders. Empty =
+    // no preamble injected.
+    std::string       thinking_preamble;
+    std::string       thinking_preamble_format;
 
     // Phase-1 ceiling derived from `max_tokens - hard_limit_reply_budget`.
     // Convenience: also the spec's `think_max` quantity (§3.3 formula).

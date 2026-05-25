@@ -39,6 +39,30 @@
       "minimum": 1,
       "description": "Optional. Card's recommendation for hard reasoning / benchmark workloads. Drives x-high and max effort tiers."
     },
+    "hard_limit_reply_budget": {
+      "type": "integer",
+      "minimum": 256,
+      "description": "Optional. Tokens reserved post-`</think>` for the visible answer phase. Default 512 (terse-style models like DeepSeek-V4-flash, ds4_eval.c reference). Bump for verbose models that restate work after force-close (Qwen3.6 wants ~2k-4k). When set, drives both `think_max_tokens = max_tokens - hard_limit_reply_budget` and the force-close trigger in do_ar_decode."
+    },
+    "soft_limit_reply_budget": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Optional. Soft-limit negotiated close window (spec §5.3). When `(n_gen - generated)` falls into the range (hard_limit_reply_budget, soft_limit_reply_budget], the AR decode loop peeks the next-token logits — if `</think>` is in the top-`soft_limit_close_rank` candidates, accept it as a natural close (close_kind=\"soft\"). Lets the model self-close gracefully before the hard override fires. 0 disables (hard-only behavior, default)."
+    },
+    "soft_limit_close_rank": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Optional. Top-K cutoff for the soft-limit close peek. Default 8 (per ds4_eval.c:3050). Tighter = stricter (close has to be more strongly favored); looser = more cases negotiate a soft close."
+    },
+    "thinking_preamble": {
+      "type": "string",
+      "description": "Optional. Template string injected into the prompt right after the opening `<think>` tag when the request opted into thinking. Tells the model what its effective per-request `think_max` and `reply_max` budgets are so it can self-plan rather than being silently force-closed mid-thought. Supports `{think_max}` and `{reply_max}` substitution placeholders. Empty = no preamble (default). For Qwen3.6 the recommended template is an HTML-style comment so the directive is visible to the model but not parsed as content."
+    },
+    "thinking_preamble_format": {
+      "type": "string",
+      "enum": ["comment", "directive", "none"],
+      "description": "Optional. Rendering format hint for `thinking_preamble`. `comment` = HTML-style `<!-- ... -->` (default for Qwen3.6); `directive` = plain text directive; `none` = no preamble even if `thinking_preamble` is set. Reserved for future per-model rendering variants — current implementation emits `thinking_preamble` literally regardless of this hint."
+    },
     "sampling": {
       "type": "object",
       "description": "Optional. Recommended sampler defaults; used when the request omits a field.",

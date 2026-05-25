@@ -510,6 +510,13 @@ int main(int argc, char ** argv) {
     if (!cli_set.hard_limit_reply_budget) {
         sconfig.hard_limit_reply_budget = card.hard_limit_reply_budget;
     }
+    // Soft-limit window: no CLI override yet (sidecar-only knob);
+    // copy through. 0 = disabled.
+    sconfig.soft_limit_reply_budget = card.soft_limit_reply_budget;
+    sconfig.soft_limit_close_rank   = card.soft_limit_close_rank;
+    // Thinking preamble (sidecar-only knob, no CLI override).
+    sconfig.thinking_preamble        = card.thinking_preamble;
+    sconfig.thinking_preamble_format = card.thinking_preamble_format;
     if (!cli_set.think_max_tokens) {
         // Recompute from possibly-updated combined cap + reply budget so
         // the invariant (think_max = default_max - hard_limit) holds when

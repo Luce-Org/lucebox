@@ -123,6 +123,7 @@ Fields:
 | `verified_at` | ISO date the values were last checked against the source. |
 | `max_tokens` | The card's standard recommended combined cap. Drives `default_max_tokens`. |
 | `complex_problem_max_tokens` | Optional. The card's recommendation for hard reasoning / benchmark workloads. Drives the `x-high` and `max` effort tiers, which sit *above* `default_max_tokens` when this field is present — they are admissible as long as they fit under `max_ctx − hard_limit_reply_budget`. If omitted, both collapse to the `high` tier value. |
+| `hard_limit_reply_budget` | Optional. Tokens reserved post-`</think>` for the visible answer phase, used both to derive `think_max_tokens = max_tokens − hard_limit_reply_budget` and as the force-close trigger inside `do_ar_decode` / `do_spec_decode` (when `n_gen − generated ≤ hard_limit_reply_budget`, the engine overrides the next sampled token with `</think>`). Default 512 (terse-style models, per `ds4_eval.c` reference). Bump for models that restate work after force-close — Qwen3.6 sidecar ships 4096, Qwen family fallback bumped to 4096 in `model_card.cpp::family_fallback`. |
 | `sampling` | Recommended sampler params. Used as defaults when the request doesn't pin sampler values. |
 | `reasoning_effort_tiers` | Explicit phase-1 budgets per tier. Override any computed default. Whichever tiers are present win; missing tiers fall through to the computed defaults below. |
 

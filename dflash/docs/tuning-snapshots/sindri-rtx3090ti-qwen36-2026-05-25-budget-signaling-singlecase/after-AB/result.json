@@ -1,0 +1,229 @@
+{
+  "suite": "capability",
+  "area": "ds4-eval",
+  "source": "antirez/ds4 ds4-eval HTTP port",
+  "max_tokens": 8192,
+  "passed": 1,
+  "graded_passed": 1,
+  "strict_passed": 1,
+  "format_passed": 1,
+  "semantic_hints": 1,
+  "semantic_passed": 0,
+  "total": 1,
+  "pass_rate": 1.0,
+  "graded_pass_rate": 1.0,
+  "strict_pass_rate": 1.0,
+  "format_pass_rate": 1.0,
+  "semantic_hint_rate": 1.0,
+  "semantic_pass_rate": 0.0,
+  "thinking_enabled": true,
+  "min_pass_rate": 0.0,
+  "server_info": {
+    "compute": null,
+    "props": {
+      "api": {
+        "endpoints": [
+          "GET /health",
+          "GET /props",
+          "GET /v1/models",
+          "POST /v1/chat/completions",
+          "POST /v1/messages",
+          "POST /v1/messages/count_tokens",
+          "POST /v1/responses"
+        ]
+      },
+      "budget_envelope": {
+        "default_max_tokens": 32768,
+        "effort_tiers": {
+          "high": 32256,
+          "low": 4032,
+          "max": 81408,
+          "medium": 16128,
+          "x-high": 56832
+        },
+        "hard_limit_reply_budget": 4096,
+        "model_card_source": "share/model_cards/qwen3.6-27b.json",
+        "soft_limit_close_rank": 8,
+        "soft_limit_reply_budget": 5120,
+        "think_max_tokens": 4096
+      },
+      "build_info": "luce-dflash v0.0.0+cpp props_schema=2",
+      "capabilities": {
+        "reasoning_supported": true,
+        "speculative_supported": true,
+        "tools_supported": true
+      },
+      "default_generation_settings": {
+        "min_p": 0.0,
+        "n_ctx": 131072,
+        "repeat_penalty": 1.0,
+        "temperature": 0.0,
+        "top_k": 0,
+        "top_p": 1.0
+      },
+      "full_cache": {
+        "capacity": 0,
+        "disk_bytes": 0,
+        "enabled": false
+      },
+      "model": {
+        "arch": "qwen35",
+        "draft_path": "/home/erik/Projects/lucebox-hub/dflash/models/draft/dflash-draft-3.6-q8_0.gguf",
+        "tokenizer_id": null
+      },
+      "model_alias": "dflash",
+      "model_card": {
+        "complex_problem_max_tokens": 81920,
+        "hard_limit_reply_budget": 4096,
+        "max_tokens": 32768,
+        "name": "Qwen3.6 27B",
+        "reasoning_effort_tiers": {
+          "high": 32256,
+          "low": 4032,
+          "max": 81408,
+          "medium": 16128,
+          "x-high": 56832
+        },
+        "sampling": {
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repetition_penalty": 1.0,
+          "temperature": 1.0,
+          "top_k": 20,
+          "top_p": 0.95
+        },
+        "soft_limit_close_rank": 8,
+        "soft_limit_reply_budget": 5120,
+        "source": "https://huggingface.co/Qwen/Qwen3.6-27B",
+        "verified_at": "2026-05-25"
+      },
+      "model_path": "/home/erik/Projects/lucebox-hub/dflash/models/Qwen3.6-27B-Q4_K_M.gguf",
+      "pflash": {
+        "bsa_alpha": null,
+        "bsa_enabled": null,
+        "drafter_gguf": null,
+        "enabled": false,
+        "keep_ratio": null,
+        "lm_head_fix": null,
+        "mode": "off",
+        "skip_park": null,
+        "threshold": null
+      },
+      "prefix_cache": {
+        "capacity": 0
+      },
+      "reasoning": {
+        "default": null,
+        "supported": true,
+        "supported_efforts": [
+          "low",
+          "medium",
+          "high",
+          "x-high",
+          "max"
+        ]
+      },
+      "runtime": {
+        "backend": "cuda",
+        "chunk": 512,
+        "draft_device": "auto:0",
+        "fa_window": 2048,
+        "kv_cache_k": "q4_0",
+        "kv_cache_v": "q4_0",
+        "lazy_draft": false,
+        "target_device": "auto:0",
+        "target_sharding": false
+      },
+      "sampling": {
+        "capabilities": {
+          "supports_frequency_penalty": true,
+          "supports_seed": true,
+          "supports_temperature": true,
+          "supports_top_k": true,
+          "supports_top_p": true
+        }
+      },
+      "server": {
+        "name": "luce-dflash",
+        "props_schema": 2,
+        "version": "0.0.0+cpp"
+      },
+      "speculative": {
+        "ddtree_budget": 22,
+        "enabled": true
+      },
+      "speculative_mode": "dflash",
+      "tool_replay": {
+        "current_bytes": 0,
+        "current_entries": 0,
+        "max_bytes": 67108864,
+        "max_entries": 50000
+      }
+    },
+    "build_info": "luce-dflash v0.0.0+cpp props_schema=2",
+    "model_alias": "dflash",
+    "model_path": "/home/erik/Projects/lucebox-hub/dflash/models/Qwen3.6-27B-Q4_K_M.gguf",
+    "model_arch": "qwen35",
+    "draft_path": "/home/erik/Projects/lucebox-hub/dflash/models/draft/dflash-draft-3.6-q8_0.gguf",
+    "kv_cache_k": "q4_0",
+    "kv_cache_v": "q4_0",
+    "fa_window": 2048,
+    "backend": "cuda",
+    "chunk": 512,
+    "target_device": "auto:0",
+    "draft_device": "auto:0",
+    "think_max_tokens": 4096,
+    "hard_limit_reply_budget": 4096,
+    "model_card_name": "Qwen3.6 27B",
+    "model_card_source": "share/model_cards/qwen3.6-27b.json",
+    "speculative": {
+      "ddtree_budget": 22,
+      "enabled": true
+    }
+  },
+  "rows": [
+    {
+      "area": "ds4-eval",
+      "source": "GPQA Diamond",
+      "id": "recNu3MXkvWUzHZr9",
+      "name": "GPQA Diamond/recNu3MXkvWUzHZr9",
+      "domain": "Physics",
+      "title": "An intelligent civilization in the Large Magellanic Cloud has",
+      "ds4_index": 1,
+      "kind": "choice",
+      "status": "passed",
+      "ok": true,
+      "graded_pass": true,
+      "strict_pass": true,
+      "format_pass": true,
+      "semantic_hint": true,
+      "semantic_pass": false,
+      "http_status": 200,
+      "finish_reason": "stop",
+      "close_kind": "hard",
+      "thinking_tokens": 4097,
+      "content_tokens": 881,
+      "provider": null,
+      "model_version": "luce-dflash",
+      "cost_usd": null,
+      "prompt_tokens": 227,
+      "completion_tokens": 4979,
+      "timings": {
+        "decode_ms": 329279.6,
+        "decode_tokens_per_sec": 15.1,
+        "prefill_ms": 1044.4,
+        "prefill_tokens_per_sec": 217.3
+      },
+      "timed_out": false,
+      "given": "B",
+      "correct": [
+        "B"
+      ],
+      "wall_s": 330.407,
+      "prompt": "An intelligent civilization in the Large Magellanic Cloud has engineered an extraordinary spacecraft capable of traveling at a substantial fraction of the speed of light. The average lifetime of these aliens is roughly 150 solar years. Now, having Earth as their destination in mind, they are determined to travel with this spacecraft at a constant speed of 0.99999987*c, where c is the speed of light. Approximately, how long will it take for their 22 years old astronaut (from the point of view of the astronaut) to reach the Earth using this incredibly fast spacecraft?\n\nChoices:\nA. 72 years\nB. 81 years\nC. The astronaut will die before reaching to the Earth.\nD. 77 years\n\nSolve the question. At the end, write exactly one final line in this format and do not write anything after it:\nAnswer: <letter>",
+      "output": "\n\n\nTo solve this problem, we need to calculate the time experienced by the astronaut traveling from the Large Magellanic Cloud (LMC) to Earth. This involves concepts from Special Relativity, specifically time dilation.\n\n**1. Identify the Distance**\nThe Large Magellanic Cloud is a satellite galaxy of the Milky Way. The generally accepted average distance from Earth to the LMC is approximately **160,000 light-years**.\n\n**2. Identify the Speed and Calculate the Lorentz Factor ($\\gamma$)**\nThe spacecraft travels at a speed $v = 0.99999987c$.\nWe need to calculate the Lorentz factor $\\gamma$, which determines the magnitude of time dilation. The formula is:\n$$ \\gamma = \\frac{1}{\\sqrt{1 - \\frac{v^2}{c^2}}} $$\n\nLet $\\beta = \\frac{v}{c} = 0.99999987$.\nThen $1 - \\beta = 1 - 0.99999987 = 0.00000013 = 1.3 \\times 10^{-7}$.\n\nUsing the approximation for $\\beta \\approx 1$:\n$$ 1 - \\beta^2 = (1 - \\beta)(1 + \\beta) \\approx (1.3 \\times 10^{-7})(2) = 2.6 \\times 10^{-7} $$\n\nNow, calculate $\\gamma$:\n$$ \\gamma = \\frac{1}{\\sqrt{2.6 \\times 10^{-7}}} $$\n$$ \\sqrt{2.6 \\times 10^{-7}} = \\sqrt{26 \\times 10^{-8}} \\approx 5.099 \\times 10^{-4} $$\n$$ \\gamma \\approx \\frac{1}{5.099 \\times 10^{-4}} \\approx 1961 $$\n\nSo, time passes roughly 1961 times slower for the astronaut compared to an observer on Earth (or in the LMC frame).\n\n**3. Calculate the Time in the Earth Frame ($t_{\\text{earth}}$)**\nThe time taken for the journey as measured by an observer on Earth (or LMC) is the distance divided by the speed. Since the speed is extremely close to $c$, the time in years is approximately equal to the distance in light-years.\n$$ t_{\\text{earth}} \\approx \\frac{160,000 \\text{ light-years}}{c} \\approx 160,000 \\text{ years} $$\n\n**4. Calculate the Time in the Astronaut's Frame ($t_{\\text{astro}}$)**\nDue to time dilation, the time experienced by the astronaut is the Earth-frame time divided by the Lorentz factor $\\gamma$.\n$$ t_{\\text{astro}} = \\frac{t_{\\text{earth}}}{\\gamma} $$\n$$ t_{\\text{astro}} \\approx \\frac{160,000}{1961} $$\n$$ t_{\\text{astro}} \\approx 81.59 \\text{ years} $$\n\n**5. Analyze the Options**\n*   **A. 72 years:** Incorrect.\n*   **B. 81 years:** This is very close to our calculated value of ~81.6 years.\n*   **C. The astronaut will die before reaching to the Earth:** The astronaut starts at 22 years old. After ~81.6 years, they would be approximately $22 + 81.6 = 103.6$ years old. Since their average lifetime is 150 years, they would likely survive the trip. Thus, this option is incorrect.\n*   **D. 77 years:** Incorrect.\n\nThe calculated time is approximately 81.6 years, which rounds closest to 81 years among the given choices.\n\nAnswer: B",
+      "reasoning_content": "The user wants me to solve a physics problem involving special relativity.\n\n**1. Identify the given information:**\n*   **Source:** Large Magellanic Cloud (LMC).\n*   **Destination:** Earth.\n*   **Speed of spacecraft ($v$):** $0.99999987 \\times c$.\n*   **Average lifetime of aliens:** 150 solar years (This seems like context, maybe a distractor or a check for the \"die before reaching\" option).\n*   **Age of astronaut:** 22 years old.\n*   **Question:** How long will it take for the astronaut to reach Earth *from the point of view of the astronaut*?\n\n**2. Identify the missing information:**\n*   Distance from LMC to Earth.\n    *   I need to recall or estimate the distance to the Large Magellanic Cloud.\n    *   Standard astronomical knowledge: The LMC is a satellite galaxy of the Milky Way.\n    *   Distance is approximately 160,000 to 163,000 light-years. Let's use a standard value like 160,000 light-years ($1.6 \\times 10^5$ ly).\n\n**3. Physics Principles:**\n*   **Time Dilation:** The time experienced by the moving observer (astronaut) is related to the time measured by the stationary observer (Earth/LMC frame) by the Lorentz factor $\\gamma$.\n*   $t_{\\text{astronaut}} = t_{\\text{stationary}} / \\gamma$\n*   Alternatively, using length contraction: The distance $L$ in the stationary frame appears contracted to $L' = L / \\gamma$ in the moving frame. The time taken is $t' = L' / v$.\n*   $t_{\\text{stationary}} = \\text{Distance} / v$.\n*   So, $t_{\\text{astronaut}} = (\\text{Distance} / v) / \\gamma = \\text{Distance} / (v \\gamma)$.\n*   Since $v \\approx c$, $t_{\\text{astronaut}} \\approx \\text{Distance} / \\gamma$.\n\n**4. Calculation Steps:**\n\n*   **Step 1: Determine the distance ($d$).**\n    *   Distance to LMC $\\approx 160,000$ light-years. Let's check if there's a more precise value often used in such problems or if the specific speed implies a specific distance.\n    *   Let's check the speed value: $v = 0.99999987 c$.\n    *   Let's calculate $\\gamma$ (Lorentz factor).\n    *   $\\gamma = \\frac{1}{\\sqrt{1 - v^2/c^2}}$\n    *   Let $\\beta = v/c = 0.99999987$.\n    *   $1 - \\beta = 1 - 0.99999987 = 0.00000013 = 1.3 \\times 10^{-7}$.\n    *   $1 - \\beta^2 = (1-\\beta)(1+\\beta) \\approx (1.3 \\times 10^{-7}) \\times 2 = 2.6 \\times 10^{-7}$.\n    *   $\\gamma = \\frac{1}{\\sqrt{2.6 \\times 10^{-7}}}$.\n    *   $\\sqrt{2.6} \\approx 1.61$.\n    *   $\\sqrt{10^{-7}} = 10^{-3.5} \\approx 3.16 \\times 10^{-4}$.\n    *   Let's do this more precisely.\n    *   $\\beta = 1 - \\epsilon$, where $\\epsilon = 1.3 \\times 10^{-7}$.\n    *   $\\gamma \\approx \\frac{1}{\\sqrt{2\\epsilon}}$.\n    *   $2\\epsilon = 2.6 \\times 10^{-7}$.\n    *   $\\sqrt{2.6 \\times 10^{-7}} = \\sqrt{26 \\times 10^{-8}} = \\sqrt{26} \\times 10^{-4} \\approx 5.099 \\times 10^{-4}$.\n    *   $\\gamma \\approx \\frac{1}{5.099 \\times 10^{-4}} \\approx \\frac{10000}{5.1} \\approx 1961$.\n    *   Let's calculate exactly:\n        *   $v/c = 0.99999987$\n        *   $(v/c)^2 = (0.99999987)^2 \\approx 1 - 2(1.3 \\times 10^{-7}) = 1 - 2.6 \\times 10^{-7}$.\n        *   $1 - (v/c)^2 = 2.6 \\times 10^{-7}$.\n        *   $\\gamma = 1 / \\sqrt{2.6 \\times 10^{-7}} = 1 / (0.0005099) \\approx 1961.16$.\n\n*   **Step 2: Calculate time in Earth frame ($t_{\\text{earth}}$).**\n    *   $t_{\\text{earth}} = \\text{Distance} / v$.\n    *   Since $v \\approx c$, $t_{\\text{earth}} \\approx \\text{Distance}$ (in years).\n    *   Distance to LMC is roughly 160,000 light-years.\n    *   $t_{\\text{earth}} \\approx 160,000$ years.\n\n*   **Step 3: Calculate time in Astronaut frame ($t_{\\text{astro}}$).**\n    *   $t_{\\text{astro}} = t_{\\text{earth}} / \\gamma$.\n    *   $t_{\\text{astro}} \\approx 160,000 / 1961$.\n    *   $160,000 / 1961 \\approx 81.59$ years.\n\n*   **Step 3: Check the options.**\n    *   A. 72 years\n    *   B. 81 years\n    *   C. The astronaut will die before reaching to the Earth.\n    *   D. 77 years\n\n    *   My calculation gives ~81.6 years. This is very close to 81 years.\n    *   Let's check the distance again. Is it exactly 160,000?\n    *   Wikipedia says \"approximately 160,000 light-years (49 kpc)\".\n    *   Some sources might say 163,000 ly.\n    *   If $d = 163,000$, $t = 163000 / 1961 \\approx 83$ years.\n    *   If $d = 150,000$, $t = 150000 / 1961 \\approx 76.5$ years.\n    *   Let's look at the options again. 72, 77, 81.\n    *   81 is the closest to the calculation based on 160k ly.\n\n    *   Let's check the \"die before reaching\" option.\n    *   Astronaut age = 22.\n    *   Travel time = ~81 years.\n    *   Final age = 22 + 81 = 103 years.\n    *   Average lifetime = 150 years.\n    *   103 < 150. So the astronaut survives. Option C is incorrect.\n\n    *   Let's refine the calculation of $\\gamma$.\n    *   $v = 0.99999987 c$.\n    *   $1 - v/c = 1.3 \\times 10^{-7}$.\n    *   $\\gamma = 1 / \\sqrt{1 - v^2/c^2} = 1 / \\sqrt{(1-v/c)(1+v/c)}$.\n    *   $1+v/c \\approx 2$.\n    *   $\\gamma \\approx 1 / \\sqrt{2 \\times 1.3 \\times 10^{-7}} = 1 / \\sqrt{2.6 \\times 10^{-7}}$.\n    *   $\\sqrt{2.6} \\approx 1.61245$.\n    *   $\\sqrt{10^{-7}} = 10^{-3.5} \\approx 3.1622 \\times 10^{-4}$.\n    *   Denominator $\\approx 1.61245 \\times 3.1622 \\times 10^{-4} \\approx 5.099 \\times 10^{-4}$.\n    *   $\\gamma \\approx 1961.16$.\n\n    *   Now, what is the specific distance intended?\n    *   If the answer is exactly 81, then Distance = $81 \\times 1961 \\approx 158,844$ ly.\n    *   If the answer is 77, Distance $\\approx 152,000$ ly.\n    *   If the answer is 72, Distance $\\approx 141,000$ ly.\n    *   The generally accepted distance is 160,000 ly.\n    *   $160,000 / 1961 \\approx 81.59$.\n    *   Rounding to nearest integer gives 82.\n    *   However, 81 is an option. 82 is not.\n    *   Maybe the distance is taken as 160,000 and the calculation is rough? Or maybe the distance is 160,000 and the speed is slightly different?\n    *   Let's check if the speed $0.99999987$ corresponds to a specific $\\gamma$ that yields an integer.\n    *   If $\\gamma = 2000$, $1 - v^2/c^2 = 1/4,000,000 = 2.5 \\times 10^{-7}$.\n    *   $1 - v/c \\approx 1.25 \\times 10^{-7}$.\n    *   $v/c = 1 - 0.000000125 = 0.999999875$.\n    *   The given $v$ is $0.99999987$. This is very close to the $v$ for $\\gamma=2000$.\n    *   If $\\gamma = 2000$, and Distance = 160,000 ly.\n    *   $t = 160,000 / 2000 = 80$ years.\n    *   This is close to 81.\n\n    *   Let's check if the distance is 163,000 ly (another common value).\n    *   $163,000 / 1961 \\approx 83.1$.\n    *   Let's check if the distance is 150,000 ly.\n    *   $150,000 / 1961 \\approx 76.5$. Close to 77.\n\n    *   Is there a standard \"textbook\" distance for LMC?\n    *   Often cited as 160,000 light years.\n    *   Let's assume the question implies $d=160,000$.\n    *   Calculation: $160000 / 1961 \\approx 81.6$.\n    *   Rounding down? Or maybe the distance is slightly less?\n    *   Let's look at the options again. 72, 77, 81.\n    *   81 is the most likely candidate if we assume standard distance.\n    *   Let's check if the speed was meant to be $v$ such that $\\gamma$ is exactly something.\n    *   If $v/c = 0.99999987$, $\\gamma \\approx 1961$.\n    *   If $d = 160,000$, $t = 81.6$.\n    *   If $d = 159,000$, $t = 81.08$.\n    *   If $d = 158,000$, $t = 80.5$.\n    *   Maybe the distance is 160,000 and the answer is just \"approx 81\".\n\n    *   Let's consider the \"Average lifetime = 150\" clue.\n    *   If $t \\approx 81$, age $\\approx 103$. Safe.\n    *   If $t \\approx 128$, age $\\approx 150$.\n    *   If $t > 128$, astronaut dies.\n    *   This implies the distance must be large enough to make the time significant, but not huge.\n    *   If the distance was, say, 500,000 ly, $t \\approx 250$ years. Astronaut dies.\n    *   Since LMC is ~160k ly, the astronaut survives.\n\n    *   Let's try to reverse engineer the options.\n    *   Option B: 81 years.\n    *   $t = 81$.\n    *   $d = t \\times \\gamma \\approx 81 \\times 1961 \\approx 158,844$ ly.\n    *   This is very close to 160,000 ly.\n    *   Option D: 77 years.\n    *   $d \\approx 77 \\times 1961 \\approx 159,997$ ly.\n    *   Wait. $77 \\times 1961 \\approx 159,997$.\n    *   This is almost exactly 160,000.\n    *   Let's re-calculate $77 \\times 1961$.\n    *   $77 \\times 1900 = 141,300$.\n    *   $77 \\times 60 = 4,620$.\n    *   $77 \\times 1 = 77$.\n    *   Sum = $141,300 + 4,620 + 77 = 145,997$.\n    *   Wait, my mental math was wrong.\n    *   $77 \\times 1961$:\n    *   $77 \\times 2000 = 154,000$.\n    *   $77 \\times 39 = 3,003$.\n    *   $154,000 - 3,003 = 150,997$.\n    *   So if $d=160,000$, $t = 160,000 / 1961 \\approx 81.6$.\n    *   If $t=77$, $d \\approx 151,000$.\n    *   If $t=81$, $d \\approx 158,800$.\n    *   160,000 is closer to 158,800 (diff 1200) than to 151,000 (diff 9000).\n    *   So 81 is the better fit for 160,000.\n\n    *   Let's check if there is a specific value for LMC distance in some contexts.\n    *   Wikipedia: \"160,000 light-years\".\n    *   Some sources might say 150,000.\n    *   If 150,000: $150,000 / 1961 \\approx 76.5$. Rounds to 77.\n    *   If 160,000: $160,000 / 1961 \\approx 81.6$. Rounds to 82.\n    *   However, 81 is an option. 82 is not.\n    *   Maybe the calculation of $\\gamma$ is slightly different?\n    *   $v = 0.99999987$.\n    *   $1 - v/c = 1.3 \\times 10^{-7}$.\n    *   $\\gamma = 1 / \\sqrt{2.6 \\times 10^{-7}} \\approx 1961$.\n    *   Is it possible the speed is $v$ such that $\\gamma$ is exactly 2000?\n    *   $v/c = \\sqrt{1 - 1/4000000} \\approx 1 - 1.25 \\times 10^{-7} = 0.999999875$.\n    *   The given $v$ is $0.99999987$.\n    *   This is $0.999999870$.\n    *   Difference is $0.000000005$.\n    *   If $\\gamma = 2000$, $t = 16000 / 2000 = 80$.\n"
+    }
+  ],
+  "timestamp": "2026-05-25T12:09:32"
+}
