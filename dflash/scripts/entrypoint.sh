@@ -182,27 +182,50 @@ fi
 
 # Draft: directory holding GGUF/safetensors, or a direct draft file.
 # The native dflash_server expects --draft to be a FILE path (not a dir).
-# If DFLASH_DRAFT points at a directory, resolve it to the first DFlash
-# draft GGUF inside (preferring the size-based largest dflash-draft-*.gguf
-# match). The Python server's resolve_draft() did the equivalent walk; this
-# block makes the C++ entrypoint accept the same DFLASH_DRAFT shape so
-# users don't have to know whether they're driving the Python or C++ path.
+# If DFLASH_DRAFT points at a directory, resolve it to a draft GGUF inside.
+#
+# Draft files are arch-specific: a draft trained for qwen3.6 has a fc
+# weight shape that only divides evenly into the qwen3.6 target's hidden
+# size, and crashes hard at spec-decode time when fed gemma4 (or vice
+# versa) — see Gemma4Backend draft-incompatibility check. So when the
+# draft dir contains multiple drafts (e.g. a host with both qwen3.6 and
+# gemma4 drafts pre-downloaded), pick the one whose filename matches the
+# target's family. Falls back to the generic dflash-draft-*.gguf pattern
+# (legacy qwen3.6-only behavior) when the target family is unknown.
 DRAFT_ARG="$DFLASH_DRAFT"
 if [ -d "$DFLASH_DRAFT" ]; then
-    # Priority-ordered: prefer the DFlash-quantized draft GGUF over a
-    # generic GGUF over a raw HuggingFace safetensors. Spec decode
-    # crashes (`verify_batch: embed failed`) when given the wrong format
-    # — `model.safetensors` is the unquantized HF weights, not a draft
-    # model. Size-based sort is wrong here because the safetensors file
-    # is bigger than the quantized GGUF but unusable as a draft.
+    # Derive a target-family hint from the target filename. Matching the
+    # GGUF arch metadata would be cleaner but requires parsing the header
+    # in shell; the filename convention is enforced upstream by the
+    # publish-side dflash quantize scripts.
+    TARGET_BASENAME="$(basename "$DFLASH_TARGET" .gguf 2>/dev/null)"
+    case "$(echo "$TARGET_BASENAME" | tr 'A-Z' 'a-z')" in
+        *gemma-4-26b*|*gemma4-26b*)   DRAFT_FAMILY_GLOB='dflash-gemma-4-26b-*.gguf' ;;
+        *gemma-4-31b*|*gemma4-31b*)   DRAFT_FAMILY_GLOB='dflash-gemma-4-31b-*.gguf' ;;
+        *gemma-4*|*gemma4*)           DRAFT_FAMILY_GLOB='dflash-gemma-*.gguf'       ;;
+        *qwen3.6*|*qwen36*)           DRAFT_FAMILY_GLOB='dflash-draft-3.6-*.gguf'   ;;
+        *)                            DRAFT_FAMILY_GLOB=''                          ;;
+    esac
+
     DRAFT_FILE=""
-    for pattern in 'dflash-draft-*.gguf' '*.gguf' 'model.safetensors' '*.safetensors'; do
+    # Priority-ordered patterns. The family-specific pattern (if any)
+    # goes first; the generic dflash-draft-*.gguf legacy pattern comes
+    # after so older single-draft setups still resolve. Generic *.gguf
+    # / safetensors come last as a last-resort fallback.
+    PATTERNS=""
+    [ -n "$DRAFT_FAMILY_GLOB" ] && PATTERNS="$DRAFT_FAMILY_GLOB"
+    PATTERNS="$PATTERNS dflash-draft-*.gguf *.gguf model.safetensors *.safetensors"
+    for pattern in $PATTERNS; do
         DRAFT_FILE="$(find -L "$DFLASH_DRAFT" -maxdepth 4 -type f -name "$pattern" -print -quit 2>/dev/null)"
         [ -n "$DRAFT_FILE" ] && break
     done
     if [ -n "$DRAFT_FILE" ] && [ -f "$DRAFT_FILE" ]; then
         DRAFT_ARG="$DRAFT_FILE"
-        info "Resolved draft dir $DFLASH_DRAFT → $DRAFT_ARG"
+        if [ -n "$DRAFT_FAMILY_GLOB" ]; then
+            info "Resolved draft dir $DFLASH_DRAFT → $DRAFT_ARG (target family: $DRAFT_FAMILY_GLOB)"
+        else
+            info "Resolved draft dir $DFLASH_DRAFT → $DRAFT_ARG"
+        fi
     else
         warn "No DFlash draft GGUF/safetensors in draft dir $DFLASH_DRAFT — running without draft"
         DRAFT_ARG=""
