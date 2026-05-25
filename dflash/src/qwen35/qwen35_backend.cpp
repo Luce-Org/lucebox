@@ -818,6 +818,9 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     };
     if (n_gen <= 0) return true;
 
+    auto t_dec0_ar = std::chrono::steady_clock::now();
+    const size_t out_tokens_at_entry = out_tokens.size();
+
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
     std::vector<float> logits_buf(vocab);
@@ -901,6 +904,13 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
 
         if (IS_EOS_TOK(next_tok, w_)) break;
     }
+
+    auto t_dec1_ar = std::chrono::steady_clock::now();
+    const double ar_decode_s = std::chrono::duration<double>(t_dec1_ar - t_dec0_ar).count();
+    const int ar_tokens = (int)(out_tokens.size() - out_tokens_at_entry);
+    std::fprintf(stderr, "[ar-decode] tokens=%d time=%.3f s speed=%.2f tok/s\n",
+                 ar_tokens, ar_decode_s,
+                 ar_tokens > 0 && ar_decode_s > 0 ? ar_tokens / ar_decode_s : 0.0);
     return true;
 }
 

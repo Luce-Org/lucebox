@@ -1,0 +1,9 @@
+config_name,prefix_cache_slots,ddtree_budget,max_ctx,chunk,cache_type_v,wall_s,completion_tokens,prompt_tokens,specdec_tokens,specdec_speed_tps,specdec_accept_pct,specdec_avg_commit
+baseline,0,22,131072,512,q4_0,54.905,1024,123,NaN,NaN,NaN,NaN
+prefix-16,16,22,131072,512,q4_0,57.331,1024,123,NaN,NaN,NaN,NaN
+budget-8,0,8,131072,512,q4_0,57.898,1024,123,NaN,NaN,NaN,NaN
+budget-14,0,14,131072,512,q4_0,60.253,1024,123,NaN,NaN,NaN,NaN
+budget-32,0,32,131072,512,q4_0,56.968,1024,123,NaN,NaN,NaN,NaN
+max-ctx-32k,0,22,32768,512,q4_0,56.478,1024,123,NaN,NaN,NaN,NaN
+chunk-2048,0,22,131072,2048,q4_0,56.535,1024,123,NaN,NaN,NaN,NaN
+cache-v-q8,0,22,131072,512,q8_0,56.638,1024,123,NaN,NaN,NaN,NaN
