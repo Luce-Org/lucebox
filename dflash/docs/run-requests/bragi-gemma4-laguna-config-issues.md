@@ -1,14 +1,16 @@
 # Run request: bragi gemma4 + laguna config issues block local benchmarking
 
 **Date opened**: 2026-05-25
-**Owner**: gemma4 chat-template fixed in `f1d30f2` (PR #269 candidate).
-The remaining gemma4 `ggml_can_mul_mat` crash is being investigated by
-erik/Claude on `integration/props-uv-squared-clean` — will ship as an
-independent PR encapsulated outside the #269 thinking-budget series.
-Laguna OOM asks remain unowned (config / sidecar metadata, not engine).
-**Status**: Bragi has gemma-4-{26b,31b} + laguna-xs.2 models downloaded
-(~58 GB) and queued in the master sweep, but neither produces usable
-data at default config. Detail below.
+**Status**: gemma4 chat-template fixed in `f1d30f2` (PR #269 candidate).
+The gemma4 `ggml_can_mul_mat` crash root-caused: the entrypoint's
+draft auto-resolver was picking the wrong draft GGUF — the qwen3.6
+draft (`dflash-draft-3.6-q4_k_m.gguf`, fc.ne[0]=25600=5*5120) instead
+of the proper gemma4 drafts (`dflash-gemma-4-{26b,31b}-*-q8_0.gguf`,
+fc.ne[0] matches gemma4 hidden exactly). Code in `gemma4_backend.cpp`
+is correct; the wrong draft just couldn't satisfy the mul_mat shape
+contract. Fix landed as PR #277 (`fix(entrypoint): pick draft GGUF
+that matches target architecture`). Laguna OOM asks remain unowned
+(config / sidecar metadata, not engine).
 
 ## 1. Gemma4 — chat template / thought-token leakage in visible content
 
@@ -125,27 +127,29 @@ I re-probed gemma4 and confirmed three distinct failure modes:
    plain English).
 
    `ggml_can_mul_mat(a, b)` failing on `mul_mat` means two tensors
-   have incompatible shapes for matmul — likely in an attention head
-   reshape, MoE expert dispatch, or the Gemma4-specific per-layer
-   embedding path.
+   have incompatible shapes for matmul.
 
-   **Investigation owner**: erik/Claude on
-   `integration/props-uv-squared-clean`. Bisection so far:
-   - Crash is **structure-specific**, not length-specific. Plain
-     repeated text at 466 prompt_tokens runs clean; the HumanEval
-     `has_close_elements` prompt at 169 prompt_tokens crashes
-     deterministically.
-   - Reproduces with a single user message — no system prompt needed.
-   - 24 `ggml_mul_mat` call sites in `dflash/src/gemma4/gemma4_graph.cpp`
-     (attention Q/K/V/O, FFN gate/up/down, MoE router + experts,
-     per-layer embedding gate/proj, output head, per-layer model proj).
-     Stripped binary, so stack trace addresses don't resolve to names
-     yet — next step is either a debug-symbol build or per-mul-mat
-     name-tagging via `ggml_set_name` to identify which call asserts.
+   **Root cause** (resolved 2026-05-25): addr2line on the unstripped
+   binary inside the image resolves `dflash_server+0x154860` to
+   `dflash::common::build_draft_graph` — the speculative-decode
+   *draft* graph, NOT the gemma4 forward path. The entrypoint's
+   draft auto-resolver was picking `dflash-draft-3.6-q4_k_m.gguf`
+   (qwen3.6's draft, `fc.ne[0]=25600=5*5120`, target_hidden=5120)
+   for every target, including gemma4 (target_hidden=2816 — doesn't
+   divide 25600). The proper gemma4 drafts
+   (`dflash-gemma-4-{26b,31b}-*-q8_0.gguf`, `fc.ne[0]=16896=6*2816`)
+   exist in the same draft dir but never matched the entrypoint's
+   `dflash-draft-*.gguf` glob.
 
-   This is independent of the chat-template fix (commit `f1d30f2`)
-   and will ship as a separate PR (not part of #269 thinking-budget
-   series).
+   **Fix**: PR #277 — entrypoint derives target family from filename
+   and prefers `dflash-{family}-*.gguf` first, falling back to the
+   legacy glob. Verified end-to-end on bragi:
+   - Before: HE prompt at 169 prompt_tokens → SIGABRT every time.
+   - After: spec-decode loads correct draft, HE prompt emits clean
+     `i in range(len(numbers)):...` Python continuation.
+
+   No engine-side code changes needed — the gemma4 backend was
+   correct all along; it was just being fed a wrong-arch draft.
 
 These three issues block the bragi gemma4 column in our local
 benchmark matrix. Until fixed, the only gemma4 data we have is
