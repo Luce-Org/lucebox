@@ -1,0 +1,16 @@
+{
+  "schema": "lucebox-bench-cases-v1",
+  "source": "HumanEval-style mid-function completions, ported from bench_he_http.py 10-prompt set",
+  "cases": [
+    {"id": "has_close_elements",      "kind": "code-completion", "prompt": "from typing import List\n\ndef has_close_elements(numbers: List[float], threshold: float) -> bool:\n    \"\"\"Check if in given list of numbers, are any two numbers closer to each other than\n    given threshold.\n    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)\n    False\n    \"\"\"\n    for"},
+    {"id": "separate_paren_groups",   "kind": "code-completion", "prompt": "from typing import List\n\ndef separate_paren_groups(paren_string: str) -> List[str]:\n    \"\"\" Separate groups of nested parentheses into list of strings. \"\"\"\n    result = []\n    current = ''\n    depth = 0\n    for"},
+    {"id": "truncate_number",         "kind": "code-completion", "prompt": "def truncate_number(number: float) -> float:\n    \"\"\" Return the decimal part of a floating-point number. \"\"\"\n    return"},
+    {"id": "below_zero",              "kind": "code-completion", "prompt": "from typing import List\n\ndef below_zero(operations: List[int]) -> bool:\n    \"\"\" Detect if balance falls below zero. \"\"\"\n    balance = 0\n    for op in operations:\n"},
+    {"id": "mean_absolute_deviation", "kind": "code-completion", "prompt": "from typing import List\n\ndef mean_absolute_deviation(numbers: List[float]) -> float:\n    \"\"\" For a given list of input numbers, calculate Mean Absolute Deviation. \"\"\"\n    mean ="},
+    {"id": "intersperse",             "kind": "code-completion", "prompt": "from typing import List\n\ndef intersperse(numbers: List[int], delimeter: int) -> List[int]:\n    \"\"\" Insert delimiter between consecutive elements. \"\"\"\n    if not numbers:\n        return []\n    result ="},
+    {"id": "parse_nested_parens",     "kind": "code-completion", "prompt": "from typing import List\n\ndef parse_nested_parens(paren_string: str) -> List[int]:\n    \"\"\" For each group return deepest level of nesting. \"\"\"\n    def parse(s):\n        depth = max_depth ="},
+    {"id": "filter_by_substring",     "kind": "code-completion", "prompt": "from typing import List\n\ndef filter_by_substring(strings: List[str], substring: str) -> List[str]:\n    \"\"\" Filter strings that contain substring. \"\"\"\n    return"},
+    {"id": "sum_product",             "kind": "code-completion", "prompt": "from typing import List, Tuple\n\ndef sum_product(numbers: List[int]) -> Tuple[int, int]:\n    \"\"\" Return tuple (sum, product). Empty list -> (0,1). \"\"\"\n    s ="},
+    {"id": "rolling_max",             "kind": "code-completion", "prompt": "from typing import List\n\ndef rolling_max(numbers: List[int]) -> List[int]:\n    \"\"\" Rolling maximum of running list. \"\"\"\n    result = []\n    cur = -10**18\n    for n in numbers:\n"}
+  ]
+}

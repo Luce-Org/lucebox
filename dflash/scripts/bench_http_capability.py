@@ -48,6 +48,10 @@ from bench_ds4_eval import (  # noqa: E402
     parse_line_spec,
     visible_text,
 )
+# ``--area code`` dispatches into bench_humaneval (decode-only HumanEval-style
+# port). Same convention as ds4-eval: data + grader live in the sister
+# module, this file is the dispatcher.
+from bench_humaneval import HE_CASES, grade_completion  # noqa: E402
 
 __all__ = [
     "DS4_EVAL_CASES",
@@ -121,6 +125,16 @@ DEFAULT_MAX_TOKENS = 512
 
 
 def build_prompt(case: dict[str, Any]) -> str:
+    # Code-completion (HumanEval) cases ship a partial Python stub in
+    # ``prompt`` and want the model to continue it. No "Answer: X" line —
+    # the model output IS the completion, graded by parse-OK in the
+    # sister module.
+    if case.get("kind") == "code-completion":
+        return (
+            "Continue the following Python code. Output ONLY the function "
+            "body — no markdown, no explanation, no extra prose:\n\n"
+            + case["prompt"]
+        )
     parts = [case["question"]]
     choices = case.get("choices") or []
     if choices:
@@ -284,8 +298,10 @@ def select_cases(
 ) -> list[dict[str, Any]]:
     if area == "ds4-eval":
         selected = list(DS4_EVAL_CASES)
+    elif area == "code":
+        selected = list(HE_CASES)
     elif area == "all":
-        selected = list(LOCAL_CASES) + list(DS4_EVAL_CASES)
+        selected = list(LOCAL_CASES) + list(DS4_EVAL_CASES) + list(HE_CASES)
     else:
         selected = [case for case in LOCAL_CASES if case["area"] == area]
     if case_index is not None:
@@ -307,11 +323,13 @@ def default_max_tokens(area: str) -> int:
     # keep the short cap since a one-word answer doesn't need a buffer.
     # ``forge`` falls back to the long cap too — its scenarios are
     # multi-step tool-calling chains and benefit from headroom.
-    return (
-        DS4_EVAL_MAX_TOKENS
-        if area in {"ds4-eval", "forge", "all"}
-        else DEFAULT_MAX_TOKENS
-    )
+    # ``code`` (HumanEval-style mid-function completions) wants ~128
+    # tokens — the reference set bench_he_http.py used 96 as default.
+    if area in {"ds4-eval", "forge", "all"}:
+        return DS4_EVAL_MAX_TOKENS
+    if area == "code":
+        return 256
+    return DEFAULT_MAX_TOKENS
 
 
 def default_thinking_enabled(area: str) -> bool:
@@ -449,9 +467,17 @@ def run_case(
                 for d in details
                 if isinstance(d, dict) and d.get("type") == "reasoning.text"
             )
-    got = find_answer_with_fallback(case, output, reasoning)
-    expected = expected_answers(case)
-    grade = grade_case(case, got, output, reasoning)
+    # Code-completion (HumanEval-style) uses its own parse-OK grader.
+    # No `got`/`expected` letter-or-integer extraction — the model's
+    # raw output IS the answer, judged by whether prompt+output parses.
+    if case.get("kind") == "code-completion":
+        got = (output or "").strip()[:60]  # short preview for the log line
+        expected = []                       # no reference solution
+        grade = grade_completion(case["prompt"], output)
+    else:
+        got = find_answer_with_fallback(case, output, reasoning)
+        expected = expected_answers(case)
+        grade = grade_case(case, got, output, reasoning)
     usage = data.get("usage") or {}
     # finish_details is the server's ds4-style close-info record. Only
     # populated when the client opts into the thinking budget. Surfacing it
@@ -1096,7 +1122,7 @@ def main() -> int:
     ap.add_argument("--url", default="http://127.0.0.1:8000", help="Server base URL.")
     ap.add_argument(
         "--area",
-        choices=("smoke", "ds4-eval", "long", "forge", "all"),
+        choices=("smoke", "ds4-eval", "long", "code", "forge", "all"),
         default="smoke",
         help=(
             "Case area to run. ``forge`` drives forge-guardrails' "
@@ -1229,7 +1255,7 @@ def main() -> int:
     # ``forge`` is dispatched separately — it doesn't share the
     # build_prompt/grade_case path. ``all`` runs the case-based areas
     # first, then appends the forge results.
-    case_areas = {"smoke", "ds4-eval", "long", "all"}
+    case_areas = {"smoke", "ds4-eval", "long", "code", "all"}
     forge_areas = {"forge", "all"}
 
     if args.area in case_areas:
