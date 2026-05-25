@@ -58,7 +58,7 @@ struct ModelCard {
     int               complex_problem_max_tokens = 0;      // 0 = not specified
     SamplingDefaults  sampling;
     EffortTiers       effort_tiers;
-    int               hard_limit_reply_budget    = 512;
+    int               hard_limit_reply_budget    = 4096;
     // Soft-limit negotiated close window (spec §5.3). 0 = disabled
     // (hard-only behavior). Operator can set per-model via sidecar.
     int               soft_limit_reply_budget    = 0;

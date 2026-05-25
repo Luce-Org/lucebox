@@ -138,7 +138,7 @@ static void print_usage(const char * prog) {
         "                             remain (of the combined cap), inject </think>\n"
         "                             so the model gets that budget to write the\n"
         "                             visible answer. Mirrors ds4_eval.c's\n"
-        "                             hard_limit_reply_budget. 0 disables. (default: 512)\n"
+        "                             hard_limit_reply_budget. 0 disables. (default: 4096)\n"
         "  --reasoning-effort-low <N>      Phase-1 budget when request asks effort=low\n"
         "  --reasoning-effort-medium <N>   Phase-1 budget when request asks effort=medium\n"
         "  --reasoning-effort-high <N>     Phase-1 budget when request asks effort=high\n"
@@ -712,12 +712,21 @@ int main(int argc, char ** argv) {
     // varies by arch:
     //   - qwen35 / laguna: `</think>` (qwen35 = single special token id
     //     248069; laguna/DeepSeek-V3 = multi-token e.g. [1718, 37947, 32])
-    //   - gemma4:           `<channel|>` (the architecture's own channel
-    //     boundary marker — Gemma4 doesn't emit `</think>`)
+    //   - gemma4:           `<channel|>\n\n` — the channel boundary plus
+    //     two newlines. Qwen3's chat template renders the no-think guard
+    //     as `<think>\n\n</think>\n\n` and the model is trained to treat
+    //     the `\n\n` after the close as the "now answer" transition cue.
+    //     With just `<channel|>` alone, gemma4 continues whatever
+    //     derivation it was mid-flight — see Q3a in
+    //     dflash/docs/experiments/gemma4-26b-thinking-control-2026-05-25.md:
+    //     reasoning ended at `(40 - 65` and content began
+    //     `cos \theta, -65 \sin \theta)` (zero-cue continuation). The
+    //     two newlines give the model the same training-time transition
+    //     cue qwen gets, without putting words in its mouth.
     // BudgetHook supports both single- and multi-token close sequences;
     // the sampling loop injects across consecutive iterations.
     if (sconfig.hard_limit_reply_budget > 0) {
-        const char * close_tag = (arch == "gemma4") ? "<channel|>" : "</think>";
+        const char * close_tag = (arch == "gemma4") ? "<channel|>\n\n" : "</think>";
         auto close_ids = tokenizer.encode(close_tag);
         if (!close_ids.empty()) {
             sconfig.think_close_token_ids = close_ids;

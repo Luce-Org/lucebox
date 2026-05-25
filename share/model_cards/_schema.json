@@ -42,7 +42,7 @@
     "hard_limit_reply_budget": {
       "type": "integer",
       "minimum": 256,
-      "description": "Optional. Tokens reserved post-`</think>` for the visible answer phase. Default 512 (terse-style models like DeepSeek-V4-flash, ds4_eval.c reference). Bump for verbose models that restate work after force-close (Qwen3.6 wants ~2k-4k). When set, drives both `think_max_tokens = max_tokens - hard_limit_reply_budget` and the force-close trigger in do_ar_decode."
+      "description": "Optional. Tokens reserved post-`</think>` for the visible answer phase. Default 4096 (raised from 512 on 2026-05-25 — the original was sized for DeepSeek-V4-flash's terse style but silently truncated almost every other model mid-answer). Terse models can override down to 512-1024; verbose math/code models keep 4096. When set, drives both `think_max_tokens = max_tokens - hard_limit_reply_budget` and the force-close trigger in do_ar_decode."
     },
     "soft_limit_reply_budget": {
       "type": "integer",

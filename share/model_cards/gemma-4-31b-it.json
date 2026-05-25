@@ -10,6 +10,7 @@
   },
   "notes": "Gemma 4 31B IT — multimodal dense (30.7B params). Reasoning-capable via `<|think|>` token (or `enable_thinking=True` chat template kwarg). Native 256K context. Target GGUFs are community quantizations by bartowski; the DFlash drafter is published by Lucebox.",
   "max_tokens": 16384,
+  "hard_limit_reply_budget": 4096,
   "sampling": {
     "temperature": 1.0,
     "top_p": 0.95,

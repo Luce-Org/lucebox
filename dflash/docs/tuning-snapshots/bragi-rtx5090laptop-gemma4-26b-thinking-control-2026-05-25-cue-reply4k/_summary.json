@@ -1,0 +1,83 @@
+{
+  "case_id": "aime2025-02",
+  "model": "dflash",
+  "url": "http://localhost:8080",
+  "run_at": "2026-05-25T20:15:40.283877Z",
+  "rows": [
+    {
+      "case_id": "aime2025-02",
+      "mode": "think-low",
+      "wall_s": 41.872,
+      "content_len_chars": 6076,
+      "reasoning_len_chars": 2296,
+      "prompt_tokens": 664,
+      "completion_tokens": 4307,
+      "thinking_tokens": null,
+      "finish_reason": "stop",
+      "finish_details": {
+        "close_kind": "hard",
+        "content_tokens": 4303,
+        "thinking_tokens": 0,
+        "total_tokens": 4307
+      },
+      "prefill_ms": 0.0,
+      "decode_ms": 0.0,
+      "decode_tok_per_s": 0.0
+    },
+    {
+      "case_id": "aime2025-02",
+      "mode": "think-medium",
+      "wall_s": 53.727,
+      "content_len_chars": 2671,
+      "reasoning_len_chars": 8046,
+      "prompt_tokens": 664,
+      "completion_tokens": 5462,
+      "thinking_tokens": null,
+      "finish_reason": "stop",
+      "finish_details": {
+        "close_kind": "hard",
+        "content_tokens": 5459,
+        "thinking_tokens": 0,
+        "total_tokens": 5462
+      },
+      "prefill_ms": 0.0,
+      "decode_ms": 0.0,
+      "decode_tok_per_s": 0.0
+    },
+    {
+      "case_id": "aime2025-02",
+      "mode": "think-default",
+      "wall_s": 137.152,
+      "content_len_chars": 2520,
+      "reasoning_len_chars": 22994,
+      "prompt_tokens": 664,
+      "completion_tokens": 13585,
+      "thinking_tokens": null,
+      "finish_reason": "stop",
+      "finish_details": {
+        "close_kind": "hard",
+        "content_tokens": 13583,
+        "thinking_tokens": 0,
+        "total_tokens": 13585
+      },
+      "prefill_ms": 0.0,
+      "decode_ms": 0.0,
+      "decode_tok_per_s": 0.0
+    },
+    {
+      "case_id": "aime2025-02",
+      "mode": "nothink",
+      "wall_s": 42.495,
+      "content_len_chars": 8579,
+      "reasoning_len_chars": 0,
+      "prompt_tokens": 666,
+      "completion_tokens": 4241,
+      "thinking_tokens": null,
+      "finish_reason": "stop",
+      "finish_details": {},
+      "prefill_ms": 0.0,
+      "decode_ms": 0.0,
+      "decode_tok_per_s": 0.0
+    }
+  ]
+}

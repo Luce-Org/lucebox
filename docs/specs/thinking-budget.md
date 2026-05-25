@@ -63,8 +63,10 @@ value, in this order:
 3. **Per-family fallback table**, built into the C++ server, keyed
    on the detected architecture (e.g. `qwen35`, `gemma4`, `laguna`).
    A coarse safety net for known families when no sidecar is shipped.
-4. **Hard fallback**, matching `antirez/ds4 ds4_eval.c`:
-   `default_max_tokens=16000`, `hard_limit_reply_budget=512`,
+4. **Hard fallback**:
+   `default_max_tokens=16000`, `hard_limit_reply_budget=4096`
+   (raised from 512 on 2026-05-25 — see `hard_limit_reply_budget` row in
+   the sidecar field table below for why),
    `think_max_tokens = default_max_tokens − hard_limit_reply_budget`.
 
 The resolution is reported in the startup banner so operators can
@@ -77,7 +79,7 @@ dflash_server \
   --think-max-tokens 32256 \         # Phase-1 ceiling
   --default-max-tokens 32768 \       # Combined ceiling when the
                                      # request omits max_tokens
-  --hard-limit-reply-budget 512 \    # Reply-reserve ceiling
+  --hard-limit-reply-budget 4096 \   # Reply-reserve ceiling (default)
   --reasoning-effort-low 4032 \      # Phase-1 budget for effort=low
   --reasoning-effort-medium 16128 \  # Phase-1 budget for effort=medium
   --reasoning-effort-high 32256 \    # Phase-1 budget for effort=high
@@ -123,7 +125,7 @@ Fields:
 | `verified_at` | ISO date the values were last checked against the source. |
 | `max_tokens` | The card's standard recommended combined cap. Drives `default_max_tokens`. |
 | `complex_problem_max_tokens` | Optional. The card's recommendation for hard reasoning / benchmark workloads. Drives the `x-high` and `max` effort tiers, which sit *above* `default_max_tokens` when this field is present — they are admissible as long as they fit under `max_ctx − hard_limit_reply_budget`. If omitted, both collapse to the `high` tier value. |
-| `hard_limit_reply_budget` | Optional. Tokens reserved post-`</think>` for the visible answer phase, used both to derive `think_max_tokens = max_tokens − hard_limit_reply_budget` and as the force-close trigger inside `do_ar_decode` / `do_spec_decode` (when `n_gen − generated ≤ hard_limit_reply_budget`, the engine overrides the next sampled token with `</think>`). Default 512 (terse-style models, per `ds4_eval.c` reference). Bump for models that restate work after force-close — Qwen3.6 sidecar ships 4096, Qwen family fallback bumped to 4096 in `model_card.cpp::family_fallback`. |
+| `hard_limit_reply_budget` | Optional. Tokens reserved post-`</think>` for the visible answer phase, used both to derive `think_max_tokens = max_tokens − hard_limit_reply_budget` and as the force-close trigger inside `do_ar_decode` / `do_spec_decode` (when `n_gen − generated ≤ hard_limit_reply_budget`, the engine overrides the next sampled token with `</think>`). Default 4096 (raised from 512 on 2026-05-25). The original 512 came from `ds4_eval.c`, sized for DeepSeek-V4-flash's terse style, but it silently truncated almost every other model mid-answer — bench results from `dflash/docs/experiments/gemma4-26b-thinking-control-2026-05-25.md` showed every force-closed thinking probe getting cut off mid-coordinate-geometry-proof at 512. Without priors on a specific model, 4096 is the safer default; terse models should override down. Qwen3.6, Gemma 4 26B, Gemma 4 31B all ship 4096 in their sidecars. |
 | `sampling` | Recommended sampler params. Used as defaults when the request doesn't pin sampler values. |
 | `reasoning_effort_tiers` | Explicit phase-1 budgets per tier. Override any computed default. Whichever tiers are present win; missing tiers fall through to the computed defaults below. |
 

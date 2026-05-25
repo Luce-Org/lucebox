@@ -10,6 +10,7 @@
   },
   "notes": "Gemma 4 26B-A4B IT — multimodal MoE (25.2B total / 3.8B active / 128 experts, 8 active + 1 shared). Reasoning-capable via `<|think|>` token at start of system prompt. Native 256K context. Target GGUFs are community quantizations by bartowski; the DFlash drafter is published by Lucebox.",
   "max_tokens": 16384,
+  "hard_limit_reply_budget": 4096,
   "sampling": {
     "temperature": 1.0,
     "top_p": 0.95,

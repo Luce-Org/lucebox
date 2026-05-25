@@ -64,10 +64,19 @@ struct ServerConfig {
     // Level 2 force-close (in-process, KV-continuous). When > 0 AND the
     // request opted into thinking, the backend's AR decode overrides
     // the next sampled token with `</think>` once (n_gen - committed)
-    // <= hard_limit_reply_budget. Matches ds4_eval.c's hard_limit_reply
-    // _budget default of 512. 0 disables the hook (falls back to Level
-    // 1 phase-2 reprompt only).
-    int         hard_limit_reply_budget = 512;
+    // <= hard_limit_reply_budget. 0 disables the hook (falls back to
+    // Level 1 phase-2 reprompt only).
+    //
+    // Default 4096. The original 512 came from ds4_eval.c, which sized
+    // for DeepSeek-V4-flash's terse style. For most models that's far
+    // too small — Qwen3.6 restates work after `</think>` (needs ~4k);
+    // Gemma 4 after the channel-thought force-close + transition cue
+    // writes a clean coordinate-geometry proof for AIME (~2-4k tokens).
+    // Without priors on a specific model, 4096 is the safer default
+    // — bench results from gemma4-26b-thinking-control-2026-05-25
+    // showed every force-closed thinking probe getting truncated
+    // mid-answer at 512 reply tokens.
+    int         hard_limit_reply_budget = 4096;
 
     // Soft-limit negotiated close window (spec §5.3). When the
     // generated-tokens-remaining count drops into the window
