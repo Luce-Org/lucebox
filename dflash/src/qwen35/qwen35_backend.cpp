@@ -909,35 +909,43 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         if (IS_EOS_TOK(next_tok, w_)) break;
 
         // Degenerate-decode watchdog. Once we're past the budget-hook's
-        // close sequence (model is now in post-`</think>` content phase),
-        // watch for n-gram repetition loops. The aime2025-02 case at
-        // think_max=4k produces output like "Let's use the result:
-        // Area($AFNBCEM$) = ... | Let's use the result: Area($AFNBCEM$)
-        // = ... | Let's use the result: Area(..." until max_tokens. Pure
-        // waste — the model is stuck and won't recover.
+        // close sequence (model in post-`</think>` content phase), watch
+        // for repetition loops. The aime2025-02 case at think_max=4k
+        // produces a ~50-token phrase that repeats verbatim until
+        // max_tokens — pure waste.
         //
-        // Heuristic: 8-token suffix repeating 3× consecutively. Cheap
-        // (3 std::equal calls, no full sort), conservative enough that
-        // legitimate enumerations ("A. ...\nB. ...\nC. ...") don't trip
-        // it because each item differs. When tripped, break the loop —
-        // the caller sees a shorter completion. Server-log line tells
-        // the operator why.
-        if (budget_close_started && close_inject_pos >= (int)budget_hook.close_token_ids.size()
-            && (int)out_tokens.size() >= 24)
+        // Sweep several common loop periods. For each period P we check
+        // if the last P tokens equal the previous P tokens (one full
+        // repeat). One match is enough; the model has already burned 2P
+        // tokens at that point and isn't getting out. The minimum-3
+        // bar would catch tighter cycles but waits ~3P tokens to fire,
+        // which is wasteful for P ≥ 32. Periods are tuned to common
+        // failure modes: short loops (16-24) for "we have X, X, X"
+        // patterns, longer (48-64) for full-sentence restates like the
+        // aime02 case.
+        if (budget_close_started && close_inject_pos >= (int)budget_hook.close_token_ids.size())
         {
+            // Sweep contiguous periods 12..80. Any P where the last P
+            // tokens equal the previous P tokens means a loop of that
+            // period. Stop early on first match. Fixed periods missed
+            // the aime02 case which loops with period ~50; dense sweep
+            // covers any period in this range.
             auto end = out_tokens.end();
-            const bool s1 = std::equal(end - 24, end - 16, end - 16);
-            const bool s2 = std::equal(end - 16, end -  8, end -  8);
-            if (s1 && s2) {
-                std::fprintf(stderr,
-                    "[degenerate-decode] post-close 8-gram repeating 3× — "
-                    "breaking AR loop at committed=%d, content_tokens=%zu\n",
-                    committed,
-                    out_tokens.size() - out_tokens_at_entry);
-                if (degenerate_close_out) *degenerate_close_out = true;
-                break;
+            const int avail = (int)out_tokens.size();
+            for (int P = 12; P <= 80; P++) {
+                if (avail < 2 * P) break;  // larger P also won't have data
+                if (std::equal(end - 2*P, end - P, end - P)) {
+                    std::fprintf(stderr,
+                        "[degenerate-decode] post-close period=%d repeated — "
+                        "breaking AR loop at committed=%d, content_tokens=%zu\n",
+                        P, committed,
+                        out_tokens.size() - out_tokens_at_entry);
+                    if (degenerate_close_out) *degenerate_close_out = true;
+                    goto degenerate_break;
+                }
             }
         }
+        if (false) { degenerate_break: break; }
     }
 
     auto t_dec1_ar = std::chrono::steady_clock::now();

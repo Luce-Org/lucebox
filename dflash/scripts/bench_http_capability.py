@@ -591,6 +591,10 @@ def run_case(
         "http_status": http_status,
         "finish_reason": choice.get("finish_reason"),
         "close_kind": finish_details.get("close_kind"),
+        # Post-close repetition watchdog flag (dflash sibling field).
+        # True iff the server detected an n-gram loop in content space
+        # and broke generation early — treat the answer as unreliable.
+        "degenerate_decode": bool(finish_details.get("degenerate_decode")),
         "thinking_tokens": thinking_tokens_final,
         "content_tokens": content_tokens_final,
         "provider": or_provider,
