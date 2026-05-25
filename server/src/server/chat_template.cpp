@@ -411,7 +411,25 @@ std::string render_chat_template_jinja(
         jinja::runtime rt(ctx);
         jinja::value results = rt.execute(*prog);
         auto parts = jinja::runtime::gather_string_parts(results);
-        return parts->as_string().str();
+        std::string rendered = parts->as_string().str();
+
+        // The hard-coded Qwen renderer appends a closed think prefill when
+        // thinking is disabled. Some Qwen3.6 Jinja templates omit that final
+        // assistant suffix, which leaves the model in the wrong decoding state
+        // for tool use. Mirror the hard-coded behavior here when the rendered
+        // prompt ends with a bare assistant generation prompt.
+        if (!enable_thinking) {
+            static constexpr char kAssistantPrefix[] = "<|im_start|>assistant\n";
+            static constexpr char kNoThinkPrefill[] = "<think>\n\n</think>\n\n";
+            if (rendered.size() >= sizeof(kAssistantPrefix) - 1 &&
+                rendered.compare(rendered.size() - (sizeof(kAssistantPrefix) - 1),
+                                 sizeof(kAssistantPrefix) - 1,
+                                 kAssistantPrefix) == 0) {
+                rendered += kNoThinkPrefill;
+            }
+        }
+
+        return rendered;
     } catch (const std::exception & e) {
         throw std::runtime_error(std::string("jinja runtime: ") + e.what());
     }
