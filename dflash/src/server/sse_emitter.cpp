@@ -15,6 +15,15 @@ static const char THINK_CLOSE[] = "</think>";
 static const char TOOL_OPEN[]   = "<tool_call>";
 static const char FUNCTION_OPEN[] = "<function=";
 static const char TOOL_CODE_OPEN[] = "<tool_code>";
+// Native claude-code XML tool tags — the model uses these directly when
+// its system prompt teaches the <bash>CMD</bash> format.
+static const char BASH_OPEN[]  = "<bash>";
+static const char READ_OPEN[]  = "<read>";
+static const char WRITE_OPEN[] = "<write>";
+static const char EDIT_OPEN[]  = "<edit>";
+static const char LS_OPEN[]    = "<ls>";
+static const char GREP_OPEN[]  = "<grep>";
+static const char GLOB_OPEN[]  = "<glob>";
 static constexpr size_t THINK_OPEN_LEN  = 7;
 static constexpr size_t THINK_CLOSE_LEN = 8;
 
@@ -27,7 +36,14 @@ static bool find_tool_start(const std::string & text, size_t & pos) {
     while (idx != std::string::npos) {
         if (text.compare(idx, sizeof(TOOL_OPEN) - 1, TOOL_OPEN) == 0 ||
             text.compare(idx, sizeof(FUNCTION_OPEN) - 1, FUNCTION_OPEN) == 0 ||
-            text.compare(idx, sizeof(TOOL_CODE_OPEN) - 1, TOOL_CODE_OPEN) == 0) {
+            text.compare(idx, sizeof(TOOL_CODE_OPEN) - 1, TOOL_CODE_OPEN) == 0 ||
+            text.compare(idx, sizeof(BASH_OPEN) - 1, BASH_OPEN) == 0 ||
+            text.compare(idx, sizeof(READ_OPEN) - 1, READ_OPEN) == 0 ||
+            text.compare(idx, sizeof(WRITE_OPEN) - 1, WRITE_OPEN) == 0 ||
+            text.compare(idx, sizeof(EDIT_OPEN) - 1, EDIT_OPEN) == 0 ||
+            text.compare(idx, sizeof(LS_OPEN) - 1, LS_OPEN) == 0 ||
+            text.compare(idx, sizeof(GREP_OPEN) - 1, GREP_OPEN) == 0 ||
+            text.compare(idx, sizeof(GLOB_OPEN) - 1, GLOB_OPEN) == 0) {
             pos = idx;
             return true;
         }

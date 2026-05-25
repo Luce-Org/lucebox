@@ -1,11 +1,12 @@
 // Tool call parser implementation.
 //
-// Five detection patterns, tried in order:
+// Six detection patterns, tried in order:
 // 1. <tool_call><function=NAME>...<parameter=K>V</parameter>...</function></tool_call>
 // 2. <function=NAME>...params...</function>  (bare, outside tool_call)
 // 3. <function=NAME(k="v", ...)></function>  (function-signature style)
 // 4. <tool_code>{JSON}</tool_code>
 // 5. Bare JSON objects with name+arguments fields
+// 6. Native claude-code XML tags: <bash>CMD</bash>, <read>PATH</read>, etc.
 
 #include "tool_parser.h"
 
@@ -161,6 +162,14 @@ static const std::regex & re_tool_code() {
     return r;
 }
 
+// Pattern 6: native claude-code XML tags.
+// Matches <bash>BODY</bash>, <read>BODY</read>, etc.
+static const std::regex & re_native_tag() {
+    static std::regex r(R"(<(bash|read|write|edit|ls|grep|glob)>([\s\S]*?)</\1>)",
+                        std::regex::icase);
+    return r;
+}
+
 // ─── XML parameter parser ───────────────────────────────────────────────
 
 static json parse_xml_params(const std::string & region, const std::string & fn_name,
@@ -306,6 +315,48 @@ static bool parse_function_sig_args(const std::string & arg_text, json & out_arg
     return true;
 }
 
+// ─── Native tag helpers ─────────────────────────────────────────────────
+
+// Case-insensitive lookup of `tag` in the tools array.
+// Returns the tool's canonical name if found, otherwise returns `tag` as-is.
+static std::string lookup_tool_name(const std::string & tag, const json & tools) {
+    if (tools.is_null() || !tools.is_array() || tools.empty()) return tag;
+
+    std::string lower_tag = tag;
+    std::transform(lower_tag.begin(), lower_tag.end(), lower_tag.begin(), ::tolower);
+
+    for (const auto & t : tools) {
+        const auto & fn = t.contains("function") ? t["function"] : t;
+        if (!fn.is_object()) continue;
+        std::string name = fn.value("name", "");
+        if (name.empty()) continue;
+        std::string lower_name = name;
+        std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+        if (lower_name == lower_tag) return name;
+    }
+    return tag;  // no match → lowercase tag name
+}
+
+// Map native tag name to its default argument key + body.
+static json tag_to_args(const std::string & tag, const std::string & body) {
+    json args = json::object();
+    std::string lower = tag;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+    if (lower == "bash")        args["command"] = body;
+    else if (lower == "read")   args["file_path"] = body;
+    else if (lower == "grep")   args["pattern"] = body;
+    else if (lower == "glob")   args["pattern"] = body;
+    else if (lower == "write")  args["content"] = body;
+    else if (lower == "edit")   args["content"] = body;
+    else if (lower == "ls") {
+        if (!body.empty()) args["path"] = body;
+    } else {
+        args["content"] = body;  // unknown tag fallback
+    }
+    return args;
+}
+
 // ─── Main parser ────────────────────────────────────────────────────────
 
 ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
@@ -444,6 +495,24 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
                 add_call(name, args, start, end_pos);
             }
             cursor = end_pos;
+        }
+    }
+
+    // Pattern 6: native claude-code XML tags (<bash>, <read>, <write>, <edit>, <ls>, <grep>, <glob>)
+    {
+        auto begin = std::sregex_iterator(text.begin(), text.end(), re_native_tag());
+        auto end = std::sregex_iterator();
+        for (auto it = begin; it != end; ++it) {
+            size_t pos = it->position();
+            if (overlaps(removals, pos)) continue;
+            std::string tag  = (*it)[1].str();
+            std::string body = (*it)[2].str();
+            // Strip leading/trailing newline (consistent with parameter parser at line 172).
+            if (!body.empty() && body.front() == '\n') body.erase(body.begin());
+            if (!body.empty() && body.back()  == '\n') body.pop_back();
+
+            std::string canonical = lookup_tool_name(tag, tools);
+            add_call(canonical, tag_to_args(tag, body), pos, pos + it->length());
         }
     }
 

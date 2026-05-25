@@ -1753,6 +1753,141 @@ static void test_normalize_tools_empty() {
     TEST_ASSERT(out2.is_object());
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Native claude-code XML tag tests (<bash>, <ls>, etc.)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Helper: build a tools array with one entry named `name`.
+static json make_tools(const std::string & name) {
+    return json::array({{
+        {"type", "function"},
+        {"function", {
+            {"name", name},
+            {"description", "tool"},
+            {"parameters", {{"type", "object"}, {"properties", json::object()}}}
+        }}
+    }});
+}
+
+static void test_parse_tool_call_bash_simple() {
+    // Basic <bash>CMD</bash> → ToolCall with name matching tools casing and {"command": CMD}.
+    json tools = make_tools("Bash");
+    std::string text = "I'll run <bash>cat /etc/hostname</bash>";
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "Bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args.contains("command"));
+        TEST_ASSERT(args["command"] == "cat /etc/hostname");
+    }
+}
+
+static void test_parse_tool_call_bash_multiline() {
+    // Multiline body inside <bash>...</bash> — leading/trailing newlines stripped.
+    std::string text = "<bash>\nls -la\necho ok\n</bash>";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args.contains("command"));
+        // Consistent with tool_parser.cpp:172 — leading/trailing newline stripped.
+        std::string cmd = args["command"].get<std::string>();
+        TEST_ASSERT(cmd.find("ls -la") != std::string::npos);
+        TEST_ASSERT(cmd.find("echo ok") != std::string::npos);
+    }
+}
+
+static void test_parse_tool_call_ls_with_path() {
+    // <ls>/tmp</ls> → {"path": "/tmp"}.
+    std::string text = "<ls>/tmp</ls>";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args.contains("path"));
+        TEST_ASSERT(args["path"] == "/tmp");
+    }
+}
+
+static void test_parse_tool_call_bash_name_lookup() {
+    // Case-insensitive lookup: request tools has "Bash", model emits <bash>.
+    json tools = make_tools("Bash");
+    std::string text = "<bash>pwd</bash>";
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "Bash");
+    }
+}
+
+static void test_parse_tool_call_bash_no_match() {
+    // No tools array → fallback to lowercase tag name.
+    std::string text = "<bash>pwd</bash>";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+    }
+}
+
+static void test_parse_tool_call_bash_text_around() {
+    // Text before and after the tag — tag extracted as tool call, surrounding text preserved.
+    json tools = make_tools("Bash");
+    std::string text = "Sure, I'll do that.\n<bash>pwd</bash>\nLet me know the result.";
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "Bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "pwd");
+    }
+    // Surrounding text must not be swallowed.
+    TEST_ASSERT(result.cleaned_text.find("Sure") != std::string::npos ||
+                result.cleaned_text.find("Let me know") != std::string::npos);
+}
+
+static void test_parse_tool_call_existing_tool_call_still_works() {
+    // Regression: existing <tool_call><function=...> format still parses correctly.
+    std::string text =
+        "<tool_call>\n"
+        "<function=Edit>\n"
+        "<parameter=path>/foo/bar.txt</parameter>\n"
+        "<parameter=content>hello</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "Edit");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "/foo/bar.txt");
+        TEST_ASSERT(args["content"] == "hello");
+    }
+}
+
+static void test_emitter_native_bash_tag_detected() {
+    // When the model emits <bash>cmd</bash>, the SSE emitter should route
+    // it to the tool buffer and parse it as a Bash tool call.
+    json tools = make_tools("Bash");
+    SseEmitter em(ApiFormat::ANTHROPIC, "req_bash_001", "test-model", 10,
+                  tools, nullptr, false);
+    em.emit_start();
+    em.emit_token("I'll run: <bash>ls /tmp</bash>");
+    auto finish = em.emit_finish(10);
+    std::string s = concat(finish);
+
+    TEST_ASSERT(!em.tool_calls().empty());
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "Bash");
+        auto args = json::parse(em.tool_calls()[0].arguments);
+        TEST_ASSERT(args["command"] == "ls /tmp");
+    }
+    TEST_ASSERT(s.find("\"type\":\"tool_use\"") != std::string::npos);
+    TEST_ASSERT(s.find("\"name\":\"Bash\"")     != std::string::npos);
+    TEST_ASSERT(s.find("\"stop_reason\":\"tool_use\"") != std::string::npos);
+}
+
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
     std::fprintf(stderr, " Server Unit Tests\n");
@@ -1879,6 +2014,16 @@ int main() {
     RUN_TEST(test_normalize_tools_bare_qwen_passthrough);
     RUN_TEST(test_normalize_tools_mixed);
     RUN_TEST(test_normalize_tools_empty);
+
+    std::fprintf(stderr, "\n── Native claude-code XML tags (<bash> etc.) ──\n");
+    RUN_TEST(test_parse_tool_call_bash_simple);
+    RUN_TEST(test_parse_tool_call_bash_multiline);
+    RUN_TEST(test_parse_tool_call_ls_with_path);
+    RUN_TEST(test_parse_tool_call_bash_name_lookup);
+    RUN_TEST(test_parse_tool_call_bash_no_match);
+    RUN_TEST(test_parse_tool_call_bash_text_around);
+    RUN_TEST(test_parse_tool_call_existing_tool_call_still_works);
+    RUN_TEST(test_emitter_native_bash_tag_detected);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",
