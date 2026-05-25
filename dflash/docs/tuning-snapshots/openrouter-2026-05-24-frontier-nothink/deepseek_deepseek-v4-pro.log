@@ -1,0 +1,94 @@
+[capability] url=https://openrouter.ai/api area=ds4-eval questions=92 parallel=8
+   8 PASS SuperGPQA      4a1d1780a93f4093b6fb7d3c314cbea8 given=E correct=E format=True hint=True wall=9.79s
+   2 PASS SuperGPQA      001b51d76b4d422988f2c11f104a2c6c given=C correct=C format=True hint=True wall=10.68s
+   3 PASS AIME2025       aime2025-01          given=70 correct=70 format=True hint=True wall=12.91s
+   7 PASS GPQA Diamond   rec4UqStf9WUVif1f    given=B correct=B format=True hint=True wall=16.86s
+   6 PASS AIME2025       aime2025-16          given=468 correct=468 format=True hint=True wall=18.71s
+  10 PASS GPQA Diamond   recgI6tUQ7RLJRWGx    given=B correct=B format=True hint=True wall=12.80s
+  11 PASS SuperGPQA      6082513c8dba4ec68aa68f1bf5854d09 given=A correct=A format=True hint=True wall=10.79s
+   4 PASS GPQA Diamond   recoiTJPGUmzAkief    given=C correct=C format=True hint=True wall=24.62s
+  14 PASS SuperGPQA      bebf1ed45ae14ad7b4f205f3909cb58a given=J correct=J format=True hint=True wall=4.07s
+  17 PASS SuperGPQA      7ca71b86327744b78e93185a45bc5cef given=I correct=I format=True hint=True wall=5.16s
+  12 PASS AIME2025       aime2025-03          given=16 correct=16 format=True hint=True wall=23.83s
+  16 PASS GPQA Diamond   recNFJjE5PPTqVJGv    given=D correct=D format=True hint=True wall=16.29s
+  18 PASS AIME2025       aime2025-04          given=117 correct=117 format=True hint=True wall=25.76s
+   5 PASS SuperGPQA      b7e20eac98764fb0bf30e8366d951daa given=J correct=J format=True hint=True wall=62.09s
+  19 PASS GPQA Diamond   rec2UlKqC6RFHdcro    given=B correct=B format=True hint=True wall=29.35s
+  22 PASS GPQA Diamond   recv7GsQg3f0fvB1f    given=B correct=B format=True hint=True wall=18.19s
+  20 PASS SuperGPQA      d44b94f7749345a39a65f6312bda8764 given=E correct=E format=True hint=True wall=49.95s
+  21 PASS AIME2025       aime2025-19          given=106 correct=106 format=True hint=True wall=40.51s
+  26 PASS SuperGPQA      31950dc80ded400a9181f50626d1f75c given=C correct=C format=True hint=True wall=12.05s
+  23 PASS SuperGPQA      febe406f44d74a40b50bb5b7c69d5dc1 given=B correct=B format=True hint=True wall=46.75s
+  28 PASS GPQA Diamond   recb80OwMgNnceA9t    given=D correct=D format=True hint=True wall=13.91s
+   1 PASS GPQA Diamond   recNu3MXkvWUzHZr9    given=B correct=B format=True hint=True wall=135.42s
+  29 PASS SuperGPQA      0f14cd17be174618af6d60227e7dca9f given=C correct=C format=True hint=True wall=11.59s
+  27 PASS AIME2025       aime2025-06          given=504 correct=504 format=True hint=True wall=32.46s
+  32 PASS SuperGPQA      cef9bcc087434cc2b4e354a9baef55eb given=J correct=J format=True hint=True wall=14.18s
+  24 PASS AIME2025       aime2025-05          given=279 correct=279 format=True hint=True wall=105.29s
+  34 PASS GPQA Diamond   recqGD3fxPCI59vPQ    given=B correct=B format=True hint=True wall=40.16s
+  25 PASS GPQA Diamond   recrHBEJJoDTV05JR    given=C correct=C format=True hint=True wall=139.86s
+  35 PASS SuperGPQA      9f93aa2cfdb547b5b3a4623f80f7fff6 given=I correct=I format=True hint=True wall=13.90s
+  37 FAIL GPQA Diamond   rechKl68Uc6H7vU0N    given=B correct=A format=True hint=False wall=14.07s
+  36 PASS AIME2025       aime2025-22          given=237 correct=237 format=True hint=True wall=34.11s
+  38 PASS SuperGPQA      97ad69dda7b2462c98638b79e78aea0b given=E correct=E format=True hint=True wall=11.26s
+  40 PASS GPQA Diamond   rec1zl5LvaatzGhFt    given=B correct=B format=True hint=True wall=20.66s
+  41 FAIL SuperGPQA      e78e4e539d6f4e379ac140d923d7b1be given=E correct=H format=True hint=False wall=13.63s
+   9 FAIL AIME2025       aime2025-02          given=? correct=588 format=False hint=True wall=289.63s
+  39 PASS AIME2025       aime2025-08          given=77 correct=77 format=True hint=True wall=43.46s
+  43 PASS GPQA Diamond   recTs7qzfJs6kfLUK    given=A correct=A format=True hint=True wall=25.54s
+  30 PASS AIME2025       aime2025-21          given=293 correct=293 format=True hint=True wall=199.26s
+  13 FAIL GPQA Diamond   recDytVnNYZe2HuUU    given=? correct=A format=False hint=False wall=322.44s
+  45 FAIL AIME2025       aime2025-24          given=150 correct=149 format=True hint=False wall=24.43s
+  47 PASS SuperGPQA      e5ed76ef98144f06843125daf1bccd35 given=A correct=A format=True hint=True wall=21.85s
+  46 PASS GPQA Diamond   rec32C1ZEapBnCC0E    given=C correct=C format=True hint=True wall=32.23s
+  50 FAIL SuperGPQA      fd7924876c4845cd83d95d61dfa0b236 given=G correct=H format=True hint=False wall=14.87s
+  51 PASS AIME2025       aime2025-25          given=907 correct=907 format=True hint=True wall=86.69s
+  31 FAIL GPQA Diamond   recA1i5ZAh0Uzclxp    given=? correct=C format=False hint=False wall=326.61s
+  33 FAIL AIME2025       aime2025-07          given=? correct=821 format=False hint=True wall=330.64s
+  15 PASS AIME2025       aime2025-18          given=82 correct=82 format=True hint=True wall=474.60s
+  42 PASS AIME2025       aime2025-09          given=62 correct=62 format=True hint=True wall=212.18s
+  56 PASS SuperGPQA      e1825d70c5844c22933087eafa89e39c given=J correct=J format=True hint=True wall=11.07s
+  48 PASS AIME2025       aime2025-10          given=81 correct=81 format=True hint=True wall=209.89s
+  55 PASS GPQA Diamond   recAAJoHMW45Lv5je    given=D correct=D format=True hint=True wall=73.76s
+  58 PASS GPQA Diamond   reckEnrOPFT9Ru7tW    given=C correct=C format=True hint=True wall=41.52s
+  44 FAIL SuperGPQA      8483667a25e74fdfa3188de4ea734f03 given=E correct=A format=True hint=False wall=326.51s
+  60 PASS AIME2025       aime2025-27          given=19 correct=19 format=True hint=True wall=66.84s
+  59 PASS SuperGPQA      ab430ac3f18e4e02a2cb3f35498c6b30 given=A correct=A format=True hint=True wall=107.43s
+  62 PASS SuperGPQA      e8c5da5ca40647158b0c91dd695c6243 given=F correct=F format=True hint=True wall=34.01s
+  49 FAIL GPQA Diamond   recZWeueB7lSPR6wN    given=? correct=B format=False hint=False wall=347.06s
+  57 PASS AIME2025       aime2025-12          given=510 correct=510 format=True hint=True wall=190.69s
+  54 PASS AIME2025       aime2025-26          given=113 correct=113 format=True hint=True wall=231.86s
+  65 PASS SuperGPQA      05efdc6fb2404ddc8dd5729bb68c74e5 given=H correct=H format=True hint=True wall=17.58s
+  68 PASS SuperGPQA      ba52e06cbe1a4310a77a7d12cd1db943 given=H correct=H format=True hint=True wall=40.68s
+  52 FAIL GPQA Diamond   recVvpD8miVjmmyfe    given=? correct=C format=False hint=False wall=302.70s
+  53 FAIL SuperGPQA      6bfe7d19299d4b3184636e1f51694306 given=? correct=I format=False hint=False wall=330.28s
+  71 FAIL SuperGPQA      591a77df21324272914be82ac6583399 given=D correct=F format=True hint=False wall=59.57s
+  64 PASS GPQA Diamond   recFaL6j8UMhutXrc    given=A correct=A format=True hint=True wall=216.33s
+  61 FAIL GPQA Diamond   rec8nshandHARTkrg    given=? correct=A format=False hint=False wall=305.88s
+  69 PASS AIME2025       aime2025-29          given=104 correct=104 format=True hint=True wall=182.69s
+  74 FAIL SuperGPQA      e780f37a5baa4fe094cd9c157486664d given=J correct=H format=True hint=False wall=15.83s
+  76 PASS COMPSEC        compsec-076          given=20 correct=17-20 format=True hint=True wall=20.52s
+  66 FAIL AIME2025       aime2025-28          given=? correct=248 format=False hint=False wall=264.66s
+  78 PASS COMPSEC        compsec-078          given=11 correct=11 format=True hint=True wall=17.25s
+  63 FAIL AIME2025       aime2025-13          given=? correct=204 format=False hint=False wall=319.68s
+  77 PASS COMPSEC        compsec-077          given=18,19,20 correct=18-20 format=True hint=True wall=35.85s
+  79 PASS COMPSEC        compsec-079          given=18 correct=18-19 format=True hint=True wall=26.13s
+  80 PASS COMPSEC        compsec-080          given=5 correct=5-6 format=True hint=True wall=31.42s
+  81 PASS COMPSEC        compsec-081          given=10 correct=10-15 format=True hint=True wall=35.56s
+  82 FAIL COMPSEC        compsec-082          given=6 correct=9-10 format=True hint=True wall=36.05s
+  84 PASS COMPSEC        compsec-084          given=7 correct=6-7 format=True hint=True wall=23.98s
+  70 FAIL GPQA Diamond   recWxGU8Q4YReJ1tb    given=? correct=C format=False hint=False wall=305.73s
+  86 PASS COMPSEC        compsec-086          given=3 correct=3,13-15 format=True hint=True wall=15.87s
+  67 FAIL GPQA Diamond   reczQ4I0VpENdMtIj    given=? correct=C format=False hint=False wall=369.32s
+  83 PASS COMPSEC        compsec-083          given=9 correct=9-11 format=True hint=True wall=63.51s
+  85 PASS COMPSEC        compsec-085          given=5 correct=5 format=True hint=True wall=41.71s
+  73 PASS GPQA Diamond   recMicVBcqy1xM1jq    given=B correct=B format=True hint=True wall=181.19s
+  72 FAIL AIME2025       aime2025-15          given=? correct=735 format=False hint=False wall=250.66s
+  88 PASS COMPSEC        compsec-088          given=11 correct=11 format=True hint=True wall=21.48s
+  87 FAIL COMPSEC        compsec-087          given=? correct=8,20-22 format=None hint=None wall=37.56s
+  89 PASS COMPSEC        compsec-089          given=10 correct=10 format=True hint=True wall=28.91s
+  92 PASS COMPSEC        compsec-092          given=10,11 correct=10-14 format=True hint=True wall=27.85s
+  90 PASS COMPSEC        compsec-090          given=12 correct=12-13 format=True hint=True wall=34.05s
+  91 PASS COMPSEC        compsec-091          given=3 correct=3 format=True hint=True wall=30.50s
+  75 FAIL AIME2025       aime2025-30          given=? correct=240 format=False hint=True wall=752.51s
+[capability] pass_rate=75.00%
