@@ -183,7 +183,8 @@ private:
                         const DaemonIO & io,
                         const std::vector<int32_t> * hint_tokens = nullptr,
                         const BudgetHook * budget_hook = nullptr,
-                        bool * forced_close_out = nullptr);
+                        bool * forced_close_out = nullptr,
+                        bool * soft_close_out = nullptr);
 
     // AR decode fallback (no draft model or sampling mode).
     // budget_hook (when close_token_ids is non-empty) overrides the next
@@ -194,11 +195,15 @@ private:
     // server uses this to attribute close_kind=hard correctly — decoding
     // the token stream and grepping for "</think>" cannot distinguish an
     // injected close from a natural one because the bytes are identical.
+    // soft_close_out, when non-null, is set to true iff the soft-limit
+    // top-K peek (spec §5.3) accepted the close (close_kind=soft) —
+    // distinct from forced_close_out which only fires for hard overrides.
     bool do_ar_decode(int committed, int n_gen,
                       std::vector<int32_t> & out_tokens,
                       const DaemonIO & io,
                       const BudgetHook & budget_hook = {},
-                      bool * forced_close_out = nullptr);
+                      bool * forced_close_out = nullptr,
+                      bool * soft_close_out = nullptr);
 
     // Chain-mode verify (single batch of q_len tokens).
     int verify_chain(int committed, const int32_t * draft_tok, int q_len);

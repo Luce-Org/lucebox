@@ -69,6 +69,36 @@ struct ServerConfig {
     // 1 phase-2 reprompt only).
     int         hard_limit_reply_budget = 512;
 
+    // Soft-limit negotiated close window (spec §5.3). When the
+    // generated-tokens-remaining count drops into the window
+    // `(hard_limit_reply_budget, soft_limit_reply_budget]`, the AR
+    // decode loop peeks the top-K logits — if the close token is
+    // ranked in the top `soft_limit_close_rank`, accept it as a
+    // natural close (close_kind="soft"). This is the negotiated
+    // counterpart to the unilateral hard-limit override and ports
+    // ds4_eval.c:3030's two-tier strategy. Default 0 disables (hard-
+    // only behavior). Sidecar-overridable.
+    int         soft_limit_reply_budget = 0;
+    int         soft_limit_close_rank   = 8;
+
+    // Thinking-budget preamble (spec §3.3 / §5.4). When non-empty and
+    // the request opted into thinking, the chat template injects this
+    // string into the prompt right after the opening `<think>` tag so
+    // the model sees its budget upfront and can self-plan. Supports
+    // `{think_max}` and `{reply_max}` placeholders, substituted with
+    // the EFFECTIVE per-request values (after §4.4 clamping), not the
+    // server ceilings. Sidecar-overridable; default empty (no preamble).
+    // Tells the model what was previously communicated only through
+    // its sampling-side budget hook — closes the "model doesn't know
+    // it's being budget-limited" disconnect that drove qwen3.6's
+    // verbose-post-close failure mode.
+    std::string thinking_preamble;
+    // Format hint: "comment" (HTML-style `<!-- ... -->`), "directive"
+    // (plain text), or "none". Reserved for future per-model rendering
+    // variants — current implementation just emits the template
+    // literally. Default empty.
+    std::string thinking_preamble_format;
+
     // Token IDs resolved at server startup for the model's </think>
     // close-tag sequence. Single special token for Qwen3.6 (id 248069);
     // multiple tokens for DeepSeek/laguna ([1718, 37947, 32]). When

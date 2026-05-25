@@ -40,12 +40,19 @@ enum class ChatFormat {
 // `tools_json` is an optional JSON string containing the tool definitions
 // array. When non-empty, the Qwen3/3.5 template injects a tool preamble
 // into the system message instructing the model how to emit <tool_call> tags.
+// When `thinking_preamble` is non-empty AND `enable_thinking` is true,
+// the rendered prompt injects the string right after the opening
+// `<think>` tag — gives the model its budget upfront so it can self-
+// plan (spec §3.3 / §5.4). Caller is responsible for substituting any
+// `{think_max}` / `{reply_max}` placeholders BEFORE calling this — the
+// renderer emits the string literally so it can stay format-agnostic.
 std::string render_chat_template(
     const std::vector<ChatMessage> & messages,
     ChatFormat format,
     bool add_generation_prompt = true,
     bool enable_thinking = false,
-    const std::string & tools_json = "");
+    const std::string & tools_json = "",
+    const std::string & thinking_preamble = "");
 
 // Detect the appropriate chat format for an architecture.
 ChatFormat chat_format_for_arch(const std::string & arch);

@@ -1,9 +1,14 @@
 {
   "name": "Qwen3.6 27B",
   "source": "https://huggingface.co/Qwen/Qwen3.6-27B",
-  "verified_at": "2026-05-23",
+  "verified_at": "2026-05-25",
   "max_tokens": 32768,
   "complex_problem_max_tokens": 81920,
+  "hard_limit_reply_budget": 4096,
+  "soft_limit_reply_budget": 5120,
+  "soft_limit_close_rank": 8,
+  "thinking_preamble": "<!-- thinking_budget: {think_max} tokens; reply_budget: {reply_max} tokens. Within thinking_budget plan and reason; when ready output </think> and then write the final answer concisely without restating the derivation. -->\n",
+  "thinking_preamble_format": "comment",
   "sampling": {
     "temperature": 1.0,
     "top_p": 0.95,

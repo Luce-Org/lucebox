@@ -509,7 +509,8 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
         // model closes </think> naturally well before the budget edge.
         if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                              req.hint_tokens, &req.budget_hook,
-                             &result.budget_forced_close)) {
+                             &result.budget_forced_close,
+                             &result.budget_soft_close)) {
             result.error = "decode";
             return result;
         }
@@ -578,7 +579,8 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
         // model closes </think> naturally well before the budget edge.
         if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                              req.hint_tokens, &req.budget_hook,
-                             &result.budget_forced_close)) {
+                             &result.budget_forced_close,
+                             &result.budget_soft_close)) {
             result.error = "decode";
             return result;
         }
@@ -734,7 +736,8 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                   std::vector<int32_t> & out_tokens,
                                   const DaemonIO & io,
                                   const BudgetHook & budget_hook,
-                                  bool * forced_close_out) {
+                                  bool * forced_close_out,
+                                  bool * soft_close_out) {
     // Budget hook state.
     //   - budget_close_started: true once we've begun injecting the close
     //     sequence. Prevents re-triggering on continued forward generation.
@@ -894,6 +897,53 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                 if (logits_buf[j] > best) { best = logits_buf[j]; next_tok = j; }
             }
         }
+
+        // Soft-limit negotiated close (spec §5.3). When the budget is
+        // inside the (hard, soft] window AND the close token is in the
+        // top-K of the current logits, accept it as a natural close.
+        // This is a "the model was about to wrap up anyway" signal —
+        // gives the model a chance to self-close gracefully before the
+        // unilateral hard-limit override fires. Ports ds4_eval.c:3030's
+        // two-tier strategy that we previously only implemented at the
+        // hard tier. Skips if a close sequence is already in flight.
+        if (!budget_close_started
+            && !budget_hook.close_token_ids.empty()
+            && budget_hook.soft_limit_remaining > budget_hook.hard_limit_remaining)
+        {
+            const int generated_now = committed - committed_at_entry;
+            const int remaining_now = n_gen - generated_now;
+            if (remaining_now <= budget_hook.soft_limit_remaining
+                && remaining_now >  budget_hook.hard_limit_remaining)
+            {
+                int32_t close0 = budget_hook.close_token_ids.front();
+                const int K = std::max(1, budget_hook.soft_limit_close_rank);
+                // Partial-rank: count logits strictly greater than close0's.
+                // close0 is in top-K iff rank_better < K. Stop early at K
+                // to avoid sorting the whole 150k-token vocab every step.
+                const float close_logit = logits_buf[close0];
+                int rank_better = 0;
+                for (int j = 0; j < vocab; j++) {
+                    if (j == close0) continue;
+                    if (logits_buf[j] > close_logit) {
+                        if (++rank_better >= K) break;
+                    }
+                }
+                if (rank_better < K) {
+                    std::fprintf(stderr,
+                        "[budget-hook] soft-close accepted: committed=%d/%d "
+                        "remaining=%d (soft=%d hard=%d) close[0]=%d in top%d "
+                        "(sampled=%d → override)\n",
+                        committed, n_gen, remaining_now,
+                        budget_hook.soft_limit_remaining,
+                        budget_hook.hard_limit_remaining,
+                        close0, K, next_tok);
+                    next_tok = close0;
+                    budget_close_started = true;
+                    close_inject_pos = 1;
+                    if (soft_close_out) *soft_close_out = true;
+                }
+            }
+        }
         maybe_force_close(next_tok, committed);
 
         out_tokens.push_back(next_tok);
@@ -921,7 +971,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     const DaemonIO & io,
                                     const std::vector<int32_t> * hint_tokens,
                                     const BudgetHook * budget_hook,
-                                    bool * forced_close_out) {
+                                    bool * forced_close_out,
+                                    bool * soft_close_out) {
     const int hidden = w_.n_embd;
 
     // First token: use the argmax that do_prefill already sampled and stored.
@@ -947,7 +998,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // still fires when spec-decode is unavailable.
         bool ok = do_ar_decode(committed, n_gen, out_tokens, io,
                                 budget_hook ? *budget_hook : BudgetHook{},
-                                forced_close_out);
+                                forced_close_out, soft_close_out);
         io.emit(-1);
         return ok;
     }
@@ -1013,7 +1064,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 BudgetHook tail_hook = *budget_hook;
                 int ar_n_gen = need_commit_budget;
                 bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
-                                        tail_hook, forced_close_out);
+                                        tail_hook, forced_close_out,
+                                        soft_close_out);
                 io.emit(-1);
                 return ok;
             }

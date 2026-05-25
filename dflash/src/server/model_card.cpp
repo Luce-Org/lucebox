@@ -179,6 +179,36 @@ static bool load_sidecar(const std::string & path, ModelCard & out, std::string 
         j["complex_problem_max_tokens"].is_number_integer()) {
         out.complex_problem_max_tokens = j["complex_problem_max_tokens"].get<int>();
     }
+    if (j.contains("hard_limit_reply_budget") &&
+        j["hard_limit_reply_budget"].is_number_integer()) {
+        // Per-model override of the post-`</think>` reserved reply budget.
+        // Verbose-post-close models (Qwen3.6) want 2k-4k; terse models
+        // (DeepSeek-V4-flash style) stay at the 512 ds4_eval.c default.
+        // See docs/specs/thinking-budget.md §3.3.
+        out.hard_limit_reply_budget = j["hard_limit_reply_budget"].get<int>();
+    }
+    if (j.contains("soft_limit_reply_budget") &&
+        j["soft_limit_reply_budget"].is_number_integer()) {
+        // Soft-limit negotiated close window (spec §5.3). When set,
+        // ports ds4_eval.c:3030's two-tier strategy: in the window
+        // (hard_limit_reply_budget, soft_limit_reply_budget], the AR
+        // loop peeks the next-token logits — if `</think>` is in
+        // top-K, accept it as a natural close instead of unilateral
+        // override. Default 0 (disabled, hard-only path).
+        out.soft_limit_reply_budget = j["soft_limit_reply_budget"].get<int>();
+    }
+    if (j.contains("soft_limit_close_rank") &&
+        j["soft_limit_close_rank"].is_number_integer()) {
+        out.soft_limit_close_rank = j["soft_limit_close_rank"].get<int>();
+    }
+    if (j.contains("thinking_preamble") &&
+        j["thinking_preamble"].is_string()) {
+        out.thinking_preamble = j["thinking_preamble"].get<std::string>();
+    }
+    if (j.contains("thinking_preamble_format") &&
+        j["thinking_preamble_format"].is_string()) {
+        out.thinking_preamble_format = j["thinking_preamble_format"].get<std::string>();
+    }
 
     if (j.contains("sampling") && j["sampling"].is_object()) {
         const auto & s = j["sampling"];
@@ -224,6 +254,11 @@ static bool family_fallback(const std::string & arch, ModelCard & out) {
     if (arch == "qwen35" || arch == "qwen36" || arch == "qwen3") {
         out.max_tokens                 = 32768;
         out.complex_problem_max_tokens = 0;
+        // Qwen3.x is verbose post-`</think>` — restates derivation in the
+        // visible area before writing the answer line. The 512 default
+        // from ds4_eval.c (DeepSeek terse-style) clips this pattern. See
+        // docs/specs/thinking-budget.md §3.3.
+        out.hard_limit_reply_budget    = 4096;
         out.source_label = "family:" + arch;
         return true;
     }
