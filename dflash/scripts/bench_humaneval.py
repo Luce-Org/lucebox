@@ -37,8 +37,11 @@ def load_humaneval_cases(path: Path = FIXTURE_PATH) -> list[dict[str, Any]]:
     against a reference solution, just against "parses").
     """
     payload = json.loads(path.read_text())
+    # Accept the new schema (humaneval_prompts list) or the legacy
+    # "cases" list — both shapes turn into the same dict.
+    raw_list = payload.get("humaneval_prompts") or payload.get("cases") or []
     out = []
-    for raw in payload["cases"]:
+    for raw in raw_list:
         out.append({
             "area": "code",
             "source": "HumanEval-port",
@@ -53,7 +56,26 @@ def load_humaneval_cases(path: Path = FIXTURE_PATH) -> list[dict[str, Any]]:
     return out
 
 
+def load_autotune_preflight_prompts(path: Path = FIXTURE_PATH) -> list[tuple[str, str]]:
+    """Load the autotune preflight prompt(s) — name/text tuples.
+
+    These are intentionally separate from HumanEval: each is a longer
+    prompt mirroring the prefill footprint of a real tool-using chat
+    turn. lucebox_bench.py runs them first when sweeping a config to
+    catch chunked-flash-attn OOM at high max_ctx on consumer GPUs
+    before wasting time on the smaller HE prompts.
+    """
+    payload = json.loads(path.read_text())
+    return [(p["id"], p["prompt"])
+            for p in (payload.get("autotune_preflight_prompts") or [])]
+
+
 HE_CASES = load_humaneval_cases()
+# Tuple-shape exports for legacy callers (bench_he, lucebox_bench): the
+# data lives here now; bench_he re-exports these names for backward
+# compat with anything still importing from bench_he.
+PROMPTS: list[tuple[str, str]] = [(c["id"], c["prompt"]) for c in HE_CASES]
+AUTOTUNE_PREFLIGHT_PROMPTS: list[tuple[str, str]] = load_autotune_preflight_prompts()
 
 
 def grade_completion(prompt: str, completion: str) -> dict[str, Any]:

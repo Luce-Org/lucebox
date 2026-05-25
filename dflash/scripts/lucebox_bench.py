@@ -46,7 +46,11 @@ from typing import Protocol
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 from bench_daemon import run as run_decode  # noqa: E402
-from bench_he import AUTOTUNE_PREFLIGHT_PROMPTS, PROMPTS  # noqa: E402
+# HE + autotune-preflight prompt data centralized in bench_humaneval (sister of
+# bench_ds4_eval). bench_he still re-exports these names for the CLI test_dflash
+# bench path; autotune pulls from the source-of-truth module so the data
+# dependency is explicit and survives any future bench_he cleanup.
+from bench_humaneval import AUTOTUNE_PREFLIGHT_PROMPTS, PROMPTS  # noqa: E402
 
 DFLASH_DIR = Path(os.environ.get("DFLASH_DIR", "/opt/lucebox-hub/dflash"))
 MODELS_DIR = DFLASH_DIR / "models"

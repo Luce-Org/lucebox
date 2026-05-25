@@ -16,6 +16,15 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Bench-prompt data centralized in bench_humaneval.py (the data
+# source-of-truth for HE_CASES used by --area code and other entry
+# points). Re-export here so legacy callers keep working.
+from bench_humaneval import (  # noqa: E402,F401
+    AUTOTUNE_PREFLIGHT_PROMPTS,
+    PROMPTS,
+)
+
+
 from placement.backend_device import apply_backend_visible_devices
 from placement.test_dflash_args import TestDflashLaunchArgs
 
@@ -34,204 +43,6 @@ TEST_DFLASH = os.environ.get(
 )
 TMPDIR = Path(tempfile.gettempdir()) / "dflash_bench"
 TMPDIR.mkdir(parents=True, exist_ok=True)
-
-AUTOTUNE_PREFLIGHT_PROMPTS = [
-    # This prompt is intentionally larger (~300 tokens) than the HumanEval
-    # stubs below (~120-180 each). It mirrors the prefill footprint of a
-    # realistic tool-using chat turn, which is where the chunked flash
-    # attention workspace allocator tends to OOM on 24 GB consumer GPUs
-    # running Qwen3.6-27B at high max_ctx.
-    (
-        "scheduler_run_spec",
-        "You are reviewing a Python task scheduler. It exposes a Scheduler "
-        "class with add_task, cancel_task, and run methods. Tasks have a "
-        "string id, a callable, a delay in seconds, and a retry policy "
-        "(max_attempts, backoff_factor).\n\n"
-        "Requirements:\n"
-        "  1. Schedule tasks to run after their delay using a single "
-        "background thread.\n"
-        "  2. cancel_task(id) returns True if cancelled before run, "
-        "False otherwise.\n"
-        "  3. Retry failed tasks up to max_attempts with exponential "
-        "backoff (delay * backoff_factor ** attempt).\n"
-        "  4. Log every state change at INFO level with task id, attempt "
-        "count, and outcome.\n"
-        "  5. run() returns when the task queue is empty.\n\n"
-        "Complete the run method below. Standard library only:\n\n"
-        "import heapq, logging, threading, time\n"
-        "from dataclasses import dataclass, field\n"
-        "from typing import Callable\n\n"
-        "@dataclass(order=True)\n"
-        "class _Task:\n"
-        "    when: float\n"
-        "    id: str = field(compare=False)\n"
-        "    fn: Callable = field(compare=False)\n"
-        "    attempts: int = field(default=0, compare=False)\n"
-        "    max_attempts: int = field(default=1, compare=False)\n"
-        "    backoff: float = field(default=2.0, compare=False)\n\n"
-        "class Scheduler:\n"
-        "    def __init__(self):\n"
-        "        self._heap: list = []\n"
-        "        self._cancelled: set = set()\n"
-        "        self._lock = threading.Lock()\n\n"
-        "    def run(self):\n"
-        "        log = logging.getLogger(__name__)\n"
-        "        while True:",
-    ),
-]
-
-PROMPTS = [
-    # (name, source_code)
-    (
-        "has_close_elements",
-        "from typing import List\n\n"
-        "def has_close_elements(numbers: List[float], threshold: float) -> bool:\n"
-        '    """Check if in given list of numbers, are any two numbers closer to each other than\n'
-        "    given threshold.\n"
-        "    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)\n"
-        "    False\n"
-        "    >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)\n"
-        "    True\n"
-        '    """\n'
-        "    for",
-    ),
-    (
-        "separate_paren_groups",
-        "from typing import List\n\n"
-        "def separate_paren_groups(paren_string: str) -> List[str]:\n"
-        '    """ Input to this function is a string containing multiple groups of nested '
-        "parentheses. Your goal is to\n"
-        "    separate those group into separate strings and return the list of those.\n"
-        "    Separate groups are balanced (each open brace is properly closed) and not "
-        "nested within each other\n"
-        "    Ignore any spaces in the input string.\n"
-        "    >>> separate_paren_groups('( ) (( )) (( )( ))')\n"
-        "    ['()', '(())', '(()())']\n"
-        '    """\n'
-        "    result = []\n"
-        "    current_string = []\n"
-        "    current_depth = 0\n"
-        "    for",
-    ),
-    (
-        "truncate_number",
-        "def truncate_number(number: float) -> float:\n"
-        '    """ Given a positive floating point number, it can be decomposed into\n'
-        "    and integer part (largest integer smaller than given number) and decimals\n"
-        "    (leftover part always smaller than 1).\n"
-        "\n"
-        "    Return the decimal part of the number.\n"
-        "    >>> truncate_number(3.5)\n"
-        "    0.5\n"
-        '    """\n'
-        "    return",
-    ),
-    (
-        "below_zero",
-        "from typing import List\n\n"
-        "def below_zero(operations: List[int]) -> bool:\n"
-        '    """ You\'re given a list of deposit and withdrawal operations on a bank '
-        "account that starts with\n"
-        "    zero balance. Your task is to detect if at any point the balance of "
-        "account fallls below zero, and\n"
-        "    at that point function should return True. Otherwise it should return False.\n"
-        "    >>> below_zero([1, 2, 3])\n"
-        "    False\n"
-        "    >>> below_zero([1, 2, -4, 5])\n"
-        "    True\n"
-        '    """\n'
-        "    balance = 0\n"
-        "    for op in",
-    ),
-    (
-        "mean_absolute_deviation",
-        "from typing import List\n\n"
-        "def mean_absolute_deviation(numbers: List[float]) -> float:\n"
-        '    """ For a given list of input numbers, calculate Mean Absolute Deviation\n'
-        "    around the mean of this dataset.\n"
-        "    Mean Absolute Deviation is the average absolute difference between each\n"
-        "    element and a centerpoint (mean in this case):\n"
-        "    MAD = average | x - x_mean |\n"
-        "    >>> mean_absolute_deviation([1.0, 2.0, 3.0, 4.0])\n"
-        "    1.0\n"
-        '    """\n'
-        "    mean =",
-    ),
-    (
-        "intersperse",
-        "from typing import List\n\n"
-        "def intersperse(numbers: List[int], delimeter: int) -> List[int]:\n"
-        "    \"\"\" Insert a number 'delimeter' between every two consecutive elements "
-        "of input list `numbers'\n"
-        "    >>> intersperse([], 4)\n"
-        "    []\n"
-        "    >>> intersperse([1, 2, 3], 4)\n"
-        "    [1, 4, 2, 4, 3]\n"
-        '    """\n'
-        "    result = []\n"
-        "    for i, n in",
-    ),
-    (
-        "parse_nested_parens",
-        "from typing import List\n\n"
-        "def parse_nested_parens(paren_string: str) -> List[int]:\n"
-        '    """ Input to this function is a string represented multiple groups for '
-        "nested parentheses separated by spaces.\n"
-        "    For each of the group, output the deepest level of nesting of parentheses.\n"
-        "    E.g. (()()) has maximum two levels of nesting while ((())) has three.\n"
-        "    >>> parse_nested_parens('(()()) ((())) () ((())()())')\n"
-        "    [2, 3, 1, 3]\n"
-        '    """\n'
-        "    def parse_paren_group(s):\n"
-        "        depth = 0\n"
-        "        max_depth = 0\n"
-        "        for c in",
-    ),
-    (
-        "filter_by_substring",
-        "from typing import List\n\n"
-        "def filter_by_substring(strings: List[str], substring: str) -> List[str]:\n"
-        '    """ Filter an input list of strings only for ones that contain given substring\n'
-        "    >>> filter_by_substring([], 'a')\n"
-        "    []\n"
-        "    >>> filter_by_substring(['abc', 'bacd', 'cde', 'array'], 'a')\n"
-        "    ['abc', 'bacd', 'array']\n"
-        '    """\n'
-        "    return",
-    ),
-    (
-        "sum_product",
-        "from typing import List, Tuple\n\n"
-        "def sum_product(numbers: List[int]) -> Tuple[int, int]:\n"
-        '    """ For a given list of integers, return a tuple consisting of a sum and '
-        "a product of all the integers in a list.\n"
-        "    Empty sum should be equal to 0 and empty product should be equal to 1.\n"
-        "    >>> sum_product([])\n"
-        "    (0, 1)\n"
-        "    >>> sum_product([1, 2, 3, 4])\n"
-        "    (10, 24)\n"
-        '    """\n'
-        "    s = 0\n"
-        "    p = 1\n"
-        "    for n in",
-    ),
-    (
-        "rolling_max",
-        "from typing import List\n\n"
-        "def rolling_max(numbers: List[int]) -> List[int]:\n"
-        '    """ From a given list of integers, generate a list of rolling maximum '
-        "element found until given moment\n"
-        "    in the sequence.\n"
-        "    >>> rolling_max([1, 2, 3, 2, 3, 4, 2])\n"
-        "    [1, 2, 3, 3, 3, 4, 4]\n"
-        '    """\n'
-        "    result = []\n"
-        "    running_max = None\n"
-        "    for n in numbers:\n"
-        "        if running_max is",
-    ),
-]
-
 
 def _find_draft_file(root: Path) -> str | None:
     if root.is_file():
