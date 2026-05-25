@@ -74,38 +74,72 @@ std::string render_tool_call_xml(const std::string & name, const json & argument
     return out;
 }
 
+// Keys that the Unsloth Jinja template's render_extra_keys macro would expand into
+// XML tags, polluting the rendered prompt (e.g. <$schema>, <additionalProperties>).
+// We strip these at every level of the schema tree before the template sees it.
+static const std::vector<std::string> k_schema_metadata_keys = {
+    "$schema", "additionalProperties", "$defs", "$ref", "definitions"
+};
+
+// Strip JSON-Schema metadata keys from a single schema node and recurse into
+// nested object property schemas.  Only keys in k_schema_metadata_keys are
+// removed; all other keys (type, properties, required, enum, items, …) survive.
+static json scrub_schema_metadata(json schema) {
+    if (!schema.is_object()) return schema;
+    for (const auto & key : k_schema_metadata_keys) {
+        schema.erase(key);
+    }
+    // Recurse into each property's sub-schema.
+    if (schema.contains("properties") && schema["properties"].is_object()) {
+        for (auto & [prop_name, prop_schema] : schema["properties"].items()) {
+            prop_schema = scrub_schema_metadata(prop_schema);
+        }
+    }
+    // Recurse into array item schema.
+    if (schema.contains("items") && schema["items"].is_object()) {
+        schema["items"] = scrub_schema_metadata(schema["items"]);
+    }
+    return schema;
+}
+
 // Normalize tools array to OpenAI/Qwen3 shape: {"type":"function","function":{...}}.
 // Anthropic shape uses "input_schema"; bare Qwen shape has "parameters" at top level.
+// Also scrubs JSON-Schema metadata keys that the Unsloth Jinja template would render
+// as garbage XML tags (causing the model to hallucinate function names like <function=cls>).
 json normalize_tools_for_qwen(const json & tools) {
     if (!tools.is_array()) return tools;
     json out = json::array();
     for (const auto & elem : tools) {
         if (!elem.is_object()) { out.push_back(elem); continue; }
-        // Already OpenAI shape: pass through unchanged.
+        // Already OpenAI shape: scrub metadata and pass through.
         if (elem.contains("type") && elem["type"] == "function" && elem.contains("function")) {
-            out.push_back(elem);
+            json e = elem;
+            if (e["function"].contains("parameters")) {
+                e["function"]["parameters"] = scrub_schema_metadata(e["function"]["parameters"]);
+            }
+            out.push_back(std::move(e));
             continue;
         }
-        // Anthropic shape: input_schema → parameters.
+        // Anthropic shape: input_schema → parameters (scrubbed).
         if (elem.contains("input_schema")) {
             out.push_back({
                 {"type", "function"},
                 {"function", {
                     {"name",        elem.value("name", "")},
                     {"description", elem.value("description", "")},
-                    {"parameters",  elem["input_schema"]}
+                    {"parameters",  scrub_schema_metadata(elem["input_schema"])}
                 }}
             });
             continue;
         }
-        // Bare Qwen shape: top-level name + parameters, no wrapper.
+        // Bare Qwen shape: top-level name + parameters (scrubbed), no wrapper.
         if (elem.contains("name") && elem.contains("parameters")) {
             out.push_back({
                 {"type", "function"},
                 {"function", {
                     {"name",        elem.value("name", "")},
                     {"description", elem.value("description", "")},
-                    {"parameters",  elem["parameters"]}
+                    {"parameters",  scrub_schema_metadata(elem["parameters"])}
                 }}
             });
             continue;

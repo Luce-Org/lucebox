@@ -1753,6 +1753,92 @@ static void test_normalize_tools_empty() {
     TEST_ASSERT(out2.is_object());
 }
 
+static void test_normalize_tools_strips_schema_metadata() {
+    // $schema and additionalProperties must be removed; required must be kept.
+    json input = json::array({{
+        {"name", "my_tool"},
+        {"description", "A tool"},
+        {"input_schema", {
+            {"$schema", "http://json-schema.org/draft-07/schema#"},
+            {"type", "object"},
+            {"additionalProperties", false},
+            {"properties", {{"city", {{"type", "string"}}}}},
+            {"required", json::array({"city"})}
+        }}
+    }});
+    json out = dflash::common::normalize_tools_for_qwen(input);
+    TEST_ASSERT(out.size() == 1);
+    const auto & params = out[0]["function"]["parameters"];
+    TEST_ASSERT(!params.contains("$schema"));
+    TEST_ASSERT(!params.contains("additionalProperties"));
+    TEST_ASSERT(params.contains("required"));
+    TEST_ASSERT(params["required"][0] == "city");
+    TEST_ASSERT(params["type"] == "object");
+}
+
+static void test_normalize_tools_strips_metadata_recursively() {
+    // $schema inside a nested property schema must also be stripped.
+    json input = json::array({{
+        {"name", "deep_tool"},
+        {"description", "Nested"},
+        {"input_schema", {
+            {"type", "object"},
+            {"additionalProperties", false},
+            {"$defs", {{"MyDef", {{"type", "string"}}}}},
+            {"properties", {
+                {"foo", {
+                    {"type", "object"},
+                    {"$schema", "nested-schema-url"},
+                    {"additionalProperties", false},
+                    {"properties", {{"bar", {{"type", "string"}}}}}
+                }}
+            }}
+        }}
+    }});
+    json out = dflash::common::normalize_tools_for_qwen(input);
+    TEST_ASSERT(out.size() == 1);
+    const auto & params = out[0]["function"]["parameters"];
+    // Top-level metadata scrubbed
+    TEST_ASSERT(!params.contains("$defs"));
+    TEST_ASSERT(!params.contains("additionalProperties"));
+    // Nested property metadata scrubbed
+    const auto & foo = params["properties"]["foo"];
+    TEST_ASSERT(!foo.contains("$schema"));
+    TEST_ASSERT(!foo.contains("additionalProperties"));
+    // Nested real fields preserved
+    TEST_ASSERT(foo["type"] == "object");
+    TEST_ASSERT(foo["properties"].contains("bar"));
+}
+
+static void test_normalize_tools_preserves_real_fields() {
+    // type, properties, required, enum, items.type must all survive scrubbing.
+    json input = json::array({{
+        {"name", "full_tool"},
+        {"description", "Full schema"},
+        {"input_schema", {
+            {"$schema", "http://json-schema.org/draft-07/schema#"},
+            {"type", "object"},
+            {"additionalProperties", false},
+            {"required", json::array({"city", "units"})},
+            {"properties", {
+                {"city",  {{"type", "string"}, {"description", "City name"}}},
+                {"units", {{"type", "string"}, {"enum", json::array({"celsius", "fahrenheit"})}}},
+                {"tags",  {{"type", "array"},  {"items", {{"type", "string"}}}}}
+            }}
+        }}
+    }});
+    json out = dflash::common::normalize_tools_for_qwen(input);
+    TEST_ASSERT(out.size() == 1);
+    const auto & params = out[0]["function"]["parameters"];
+    TEST_ASSERT(params["type"] == "object");
+    TEST_ASSERT(params["required"].size() == 2);
+    TEST_ASSERT(params["properties"].contains("city"));
+    TEST_ASSERT(params["properties"]["units"]["enum"].size() == 2);
+    TEST_ASSERT(params["properties"]["tags"]["items"]["type"] == "string");
+    TEST_ASSERT(!params.contains("$schema"));
+    TEST_ASSERT(!params.contains("additionalProperties"));
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Native claude-code XML tag tests (<bash>, <ls>, etc.)
 // ═══════════════════════════════════════════════════════════════════════
@@ -2014,6 +2100,9 @@ int main() {
     RUN_TEST(test_normalize_tools_bare_qwen_passthrough);
     RUN_TEST(test_normalize_tools_mixed);
     RUN_TEST(test_normalize_tools_empty);
+    RUN_TEST(test_normalize_tools_strips_schema_metadata);
+    RUN_TEST(test_normalize_tools_strips_metadata_recursively);
+    RUN_TEST(test_normalize_tools_preserves_real_fields);
 
     std::fprintf(stderr, "\n── Native claude-code XML tags (<bash> etc.) ──\n");
     RUN_TEST(test_parse_tool_call_bash_simple);
