@@ -86,21 +86,48 @@ I re-probed gemma4 and confirmed three distinct failure modes:
    doesn't reference thinking at all — no `<|channel>` opener emitted
    in the prompt to put the model in thinking mode.
 
-3. **Crash on smoke-mc** (`What is 19 + 23?\nChoices: A. 41 ...`).
-   Bench reports the request errored client-side; container shows a
-   stack trace at `ggml_mul_mat`:
+3. **Hard crash on prompts ≥~160 tokens** (NOT just smoke-mc — any
+   long-ish prompt). Reproduces deterministically with a single curl
+   against image SHA `c344ad7c` (post-chat-template-fix `f1d30f2`,
+   so this is independent of the chat-template work):
+
+   ```bash
+   curl http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+     "model":"dflash",
+     "messages":[{"role":"user","content":"Continue the following Python code. Output ONLY the function body — no markdown, no explanation, no extra prose:\n\nfrom typing import List\n\ndef has_close_elements(numbers: List[float], threshold: float) -> bool:\n    \"\"\"Check if in given list of numbers, are any two numbers closer to each other than\n    given threshold.\n    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)\n    False\n    >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)\n    True\n    \"\"\"\n    for"}],
+     "max_tokens":256, "thinking":{"type":"disabled"}}'
+   ```
+
+   prompt_tokens=169, container exits with status 139 immediately
+   after printing the stack:
 
    ```
-   /opt/lucebox-hub/dflash/build/deps/llama.cpp/ggml/src/libggml-base.so.0(ggml_mul_mat+0x59)
-   /opt/lucebox-hub/dflash/build/dflash_server(+0x1526d0)
-   /opt/lucebox-hub/dflash/build/dflash_server(+0x1112ec)
-   /opt/lucebox-hub/dflash/build/dflash_server(+0x1114f7)
+   /src/dflash/deps/llama.cpp/ggml/src/ggml.c:3243: GGML_ASSERT(ggml_can_mul_mat(a, b)) failed
+   ggml_mul_mat+0x59  [libggml-base.so.0]
+   dflash_server+0x154860       ← gemma4 forward path
+   dflash_server+0x1130cc
+   dflash_server+0x1132d7
+   dflash_server+0x10b33e
+   dflash_server+0x10d097       ← worker_loop / chat handler
+   dflash_server+0x5345a        ← thread entry
    ```
 
-   The container survives (other prompts continue to work) but the
-   specific request errors out. Likely a tensor-shape mismatch in
-   Gemma4Backend's decode path when the prompt has specific structure.
-   Need stack symbolication.
+   Trivial prompts ("What is 2+2?", "Hello, world!") at <20 tokens
+   succeed fine. Smoke-mc multi-choice at 91 tokens succeeds (per
+   newer probe — see Update 2026-05-25 above). The crash threshold
+   appears to be somewhere between 91 and 169 tokens, OR is shape-
+   specific (Python code in the prompt may interact differently than
+   plain English).
+
+   `ggml_can_mul_mat(a, b)` failing on `mul_mat` means two tensors
+   have incompatible shapes for matmul — likely in an attention head
+   reshape, MoE expert dispatch, or the Gemma4-specific per-layer
+   embedding path. Needs sindri's eye on `gemma4_backend.cpp` /
+   `gemma4_decode.cu` to identify which mul is asserting.
+
+   This is independent of the chat-template fix (commit `f1d30f2`)
+   and should ship as a separate PR (not part of #269 thinking-budget
+   series).
 
 These three issues block the bragi gemma4 column in our local
 benchmark matrix. Until fixed, the only gemma4 data we have is
