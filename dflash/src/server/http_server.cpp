@@ -74,6 +74,48 @@ std::string render_tool_call_xml(const std::string & name, const json & argument
     return out;
 }
 
+// Normalize tools array to OpenAI/Qwen3 shape: {"type":"function","function":{...}}.
+// Anthropic shape uses "input_schema"; bare Qwen shape has "parameters" at top level.
+json normalize_tools_for_qwen(const json & tools) {
+    if (!tools.is_array()) return tools;
+    json out = json::array();
+    for (const auto & elem : tools) {
+        if (!elem.is_object()) { out.push_back(elem); continue; }
+        // Already OpenAI shape: pass through unchanged.
+        if (elem.contains("type") && elem["type"] == "function" && elem.contains("function")) {
+            out.push_back(elem);
+            continue;
+        }
+        // Anthropic shape: input_schema → parameters.
+        if (elem.contains("input_schema")) {
+            out.push_back({
+                {"type", "function"},
+                {"function", {
+                    {"name",        elem.value("name", "")},
+                    {"description", elem.value("description", "")},
+                    {"parameters",  elem["input_schema"]}
+                }}
+            });
+            continue;
+        }
+        // Bare Qwen shape: top-level name + parameters, no wrapper.
+        if (elem.contains("name") && elem.contains("parameters")) {
+            out.push_back({
+                {"type", "function"},
+                {"function", {
+                    {"name",        elem.value("name", "")},
+                    {"description", elem.value("description", "")},
+                    {"parameters",  elem["parameters"]}
+                }}
+            });
+            continue;
+        }
+        // Unknown shape: pass through unchanged.
+        out.push_back(elem);
+    }
+    return out;
+}
+
 std::vector<ChatMessage> normalize_chat_messages(
     const json & messages,
     ApiFormat format,
@@ -446,9 +488,9 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             req.sampler.rep_window = body["rep_window"].get<int>();
         }
 
-        // Tools.
+        // Tools — normalize Anthropic/bare-Qwen shape to OpenAI envelope.
         if (body.contains("tools")) {
-            req.tools = body["tools"];
+            req.tools = normalize_tools_for_qwen(body["tools"]);
         }
         // Tool choice constraint for hint generation.
         if (body.contains("tool_choice")) {

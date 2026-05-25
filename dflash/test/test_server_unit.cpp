@@ -38,6 +38,8 @@ std::vector<ChatMessage> normalize_chat_messages(
     const json & messages,
     ApiFormat format,
     ToolMemory & tool_memory);
+
+json normalize_tools_for_qwen(const json & tools);
 }
 
 // ─── Test framework (ds4 style) ────────────────────────────────────────
@@ -1649,6 +1651,108 @@ static void test_sampler_needs_logit_processing() {
     TEST_ASSERT(!cfg.needs_logit_processing());
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// normalize_tools_for_qwen tests
+// ═══════════════════════════════════════════════════════════════════════
+
+static void test_normalize_tools_anthropic_bare() {
+    // Anthropic shape: input_schema → parameters, wrapped in type/function envelope.
+    json input = json::array({{
+        {"name", "get_weather"},
+        {"description", "Get the weather for a city"},
+        {"input_schema", {
+            {"type", "object"},
+            {"properties", {{"city", {{"type", "string"}}}}},
+            {"required", json::array({"city"})}
+        }}
+    }});
+    json out = dflash::common::normalize_tools_for_qwen(input);
+    TEST_ASSERT(out.size() == 1);
+    TEST_ASSERT(out[0].contains("type"));
+    TEST_ASSERT(out[0]["type"] == "function");
+    TEST_ASSERT(out[0].contains("function"));
+    TEST_ASSERT(out[0]["function"]["name"] == "get_weather");
+    TEST_ASSERT(out[0]["function"]["description"] == "Get the weather for a city");
+    TEST_ASSERT(out[0]["function"].contains("parameters"));
+    TEST_ASSERT(out[0]["function"]["parameters"]["type"] == "object");
+    TEST_ASSERT(out[0]["function"]["parameters"]["properties"].contains("city"));
+    TEST_ASSERT(!out[0].contains("input_schema"));
+}
+
+static void test_normalize_tools_openai_passthrough() {
+    // OpenAI shape already: type/function envelope → pass through unchanged.
+    json input = json::array({{
+        {"type", "function"},
+        {"function", {
+            {"name", "search"},
+            {"description", "Search the web"},
+            {"parameters", {{"type", "object"}, {"properties", json::object()}}}
+        }}
+    }});
+    json out = dflash::common::normalize_tools_for_qwen(input);
+    TEST_ASSERT(out.size() == 1);
+    TEST_ASSERT(out[0]["type"] == "function");
+    TEST_ASSERT(out[0]["function"]["name"] == "search");
+    TEST_ASSERT(out[0]["function"]["description"] == "Search the web");
+}
+
+static void test_normalize_tools_bare_qwen_passthrough() {
+    // Bare Qwen shape: name + parameters at top level, no wrapper → wrap to type/function.
+    json input = json::array({{
+        {"name", "get_weather"},
+        {"description", "Get weather"},
+        {"parameters", {
+            {"type", "object"},
+            {"properties", {{"city", {{"type", "string"}}}}}
+        }}
+    }});
+    json out = dflash::common::normalize_tools_for_qwen(input);
+    TEST_ASSERT(out.size() == 1);
+    TEST_ASSERT(out[0]["type"] == "function");
+    TEST_ASSERT(out[0]["function"]["name"] == "get_weather");
+    TEST_ASSERT(out[0]["function"]["description"] == "Get weather");
+    TEST_ASSERT(out[0]["function"]["parameters"]["type"] == "object");
+}
+
+static void test_normalize_tools_mixed() {
+    // Mixed array: Anthropic + OpenAI shapes both normalize to OpenAI shape.
+    json input = json::array({
+        {
+            {"name", "tool_a"},
+            {"description", "Anthropic-shaped tool"},
+            {"input_schema", {{"type", "object"}, {"properties", json::object()}}}
+        },
+        {
+            {"type", "function"},
+            {"function", {
+                {"name", "tool_b"},
+                {"description", "Already OpenAI-shaped"}
+            }}
+        }
+    });
+    json out = dflash::common::normalize_tools_for_qwen(input);
+    TEST_ASSERT(out.size() == 2);
+    // First: Anthropic → normalized
+    TEST_ASSERT(out[0]["type"] == "function");
+    TEST_ASSERT(out[0]["function"]["name"] == "tool_a");
+    TEST_ASSERT(out[0]["function"].contains("parameters"));
+    // Second: OpenAI passthrough
+    TEST_ASSERT(out[1]["type"] == "function");
+    TEST_ASSERT(out[1]["function"]["name"] == "tool_b");
+}
+
+static void test_normalize_tools_empty() {
+    // Empty array stays empty.
+    json out = dflash::common::normalize_tools_for_qwen(json::array());
+    TEST_ASSERT(out.is_array());
+    TEST_ASSERT(out.empty());
+
+    // Non-array (defensive) stays unchanged.
+    json non_array = json::object();
+    json out2 = dflash::common::normalize_tools_for_qwen(non_array);
+    TEST_ASSERT(out2.is_object());
+}
+
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
     std::fprintf(stderr, " Server Unit Tests\n");
@@ -1768,6 +1872,13 @@ int main() {
     RUN_TEST(test_parse_sampler_token_no_samp);
     RUN_TEST(test_sampler_temp_zero_with_penalties_uses_argmax);
     RUN_TEST(test_sampler_needs_logit_processing);
+
+    std::fprintf(stderr, "\n── normalize_tools_for_qwen ──\n");
+    RUN_TEST(test_normalize_tools_anthropic_bare);
+    RUN_TEST(test_normalize_tools_openai_passthrough);
+    RUN_TEST(test_normalize_tools_bare_qwen_passthrough);
+    RUN_TEST(test_normalize_tools_mixed);
+    RUN_TEST(test_normalize_tools_empty);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",
