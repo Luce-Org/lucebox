@@ -16,6 +16,7 @@
 #include "qwen3_drafter.h"
 #include "qwen3_drafter_model.h"
 #include "internal.h"
+#include "anchor_scan.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -61,6 +62,13 @@ static int env_int(const char * name, int fallback) {
         if (x >= 0) return x;
     }
     return fallback;
+}
+
+static float env_float(const char * name, float def) {
+    if (const char * v = std::getenv(name)) {
+        try { return std::stof(v); } catch (...) {}
+    }
+    return def;
 }
 
 static void force_chunk_neighborhood(std::vector<uint8_t> & forced, int n_chunks,
@@ -545,33 +553,34 @@ static std::vector<int32_t> qwen35_score_and_compress(
         for (int c = std::max(0, n_chunks - t_n); c < n_chunks; ++c) if (!selected[(size_t)c]) { selected[(size_t)c] = 1; ++count; }
     }
 
-    const int query_tokens = env_int("DFLASH_COMPRESS_QUERY_TOKENS", 96);
-    const int anchor_radius = env_int("DFLASH_COMPRESS_ANCHOR_RADIUS", 2);
-    const int max_anchor_hits = env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", 8);
-    std::vector<uint8_t> forced((size_t)n_chunks, 0);
+    const int query_tokens        = env_int("DFLASH_COMPRESS_QUERY_TOKENS",   96);
+    const int anchor_radius       = env_int("DFLASH_COMPRESS_ANCHOR_RADIUS",   2);
+    const int max_anchor_hits     = env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", 8);
+    const int anchor_ngram        = env_int("DFLASH_COMPRESS_ANCHOR_NGRAM",    4);
+    const int rare_token_max_freq = env_int("DFLASH_COMPRESS_RARE_MAX_FREQ",   2);
+
+    const float cascade_min_anchor_frac = env_float("DFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC", 0.25f);
+    const float max_forced_ratio        = env_float("DFLASH_COMPRESS_MAX_FORCED_RATIO",        1.3f);
 
     const int q0 = std::max(0, S - query_tokens);
-    constexpr int NGRAM = 4;
-    for (int q = q0; q + NGRAM <= S; ++q) {
-        int hits = 0;
-        int hit_pos[8];
-        const int search_end = std::max(0, q0 - NGRAM);
-        for (int p = 0; p <= search_end && hits <= max_anchor_hits; ++p) {
-            bool same = true;
-            for (int k = 0; k < NGRAM; ++k) {
-                if (ids[(size_t)p + k] != ids[(size_t)q + k]) { same = false; break; }
-            }
-            if (same) {
-                if (hits < 8) hit_pos[hits] = p;
-                ++hits;
-            }
-        }
-        if (hits > 0 && hits <= max_anchor_hits) {
-            for (int i = 0; i < hits && i < 8; ++i) {
-                force_chunk_neighborhood(forced, n_chunks, hit_pos[i] / chunk_size, anchor_radius);
-            }
-        }
+    std::vector<int32_t> query_pool(ids.begin() + q0, ids.end());
+    std::vector<uint8_t> forced((size_t)n_chunks, 0);
+
+    dflash::qwen3::AnchorScanCfg anchor_cfg{chunk_size, anchor_radius,
+                                             max_anchor_hits, anchor_ngram,
+                                             rare_token_max_freq};
+    anchor_cfg.cascade_min_anchor_count = (int)(cascade_min_anchor_frac * n_keep);
+    anchor_cfg.max_forced_count         = (int)(max_forced_ratio * n_keep);
+
+    const bool use_transitive = env_int("DFLASH_COMPRESS_ANCHOR_TRANSITIVE", 0) != 0;
+    const int  max_iters      = env_int("DFLASH_COMPRESS_ANCHOR_MAX_ITERS",  3);
+    if (use_transitive) {
+        dflash::qwen3::scan_and_force_transitive(ids, q0, query_pool,
+                                                  anchor_cfg, max_iters, forced);
+    } else {
+        dflash::qwen3::scan_and_force(ids, q0, query_pool, anchor_cfg, forced);
     }
+
     for (int c = 0; c < n_chunks; ++c) {
         if (forced[(size_t)c] && !selected[(size_t)c]) {
             selected[(size_t)c] = 1;
@@ -737,34 +746,36 @@ std::vector<int32_t> drafter_score_and_compress(
         head_chunks = std::max(0, h_raw * budget / (h_raw + t_raw));
         tail_chunks = std::max(0, budget - head_chunks);
     }
-    const int query_tokens = env_int("DFLASH_COMPRESS_QUERY_TOKENS", 96);
-    const int anchor_radius = env_int("DFLASH_COMPRESS_ANCHOR_RADIUS", 2);
-    const int max_anchor_hits = env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", 8);
+    const int query_tokens        = env_int("DFLASH_COMPRESS_QUERY_TOKENS",   96);
+    const int anchor_radius       = env_int("DFLASH_COMPRESS_ANCHOR_RADIUS",   2);
+    const int max_anchor_hits     = env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", 8);
+    const int anchor_ngram        = env_int("DFLASH_COMPRESS_ANCHOR_NGRAM",    4);
+    const int rare_token_max_freq = env_int("DFLASH_COMPRESS_RARE_MAX_FREQ",   2);
+
+    const float cascade_min_anchor_frac = env_float("DFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC", 0.25f);
+    const float max_forced_ratio        = env_float("DFLASH_COMPRESS_MAX_FORCED_RATIO",        1.3f);
+
     std::vector<uint8_t> selected_mask((size_t)n_chunks, 0);
     std::vector<uint8_t> forced((size_t)n_chunks, 0);
     for (int c = 0; c < std::min(n_chunks, head_chunks); ++c) forced[(size_t)c] = 1;
     for (int c = std::max(0, n_chunks - tail_chunks); c < n_chunks; ++c) forced[(size_t)c] = 1;
 
     const int q0 = std::max(0, S - query_tokens);
-    constexpr int NGRAM = 4;
-    for (int q = q0; q + NGRAM <= S; ++q) {
-        int hits = 0;
-        int hit_pos[8];
-        const int search_end = std::max(0, q0 - NGRAM);
-        for (int p = 0; p <= search_end && hits <= max_anchor_hits; ++p) {
-            bool same = true;
-            for (int k = 0; k < NGRAM; ++k) {
-                if (ids[(size_t)p + k] != ids[(size_t)q + k]) { same = false; break; }
-            }
-            if (same) {
-                if (hits < 8) hit_pos[hits] = p;
-                ++hits;
-            }
-        }
-        if (hits > 0 && hits <= max_anchor_hits) {
-            for (int i = 0; i < hits && i < 8; ++i) {
-                force_chunk_neighborhood(forced, n_chunks, hit_pos[i] / chunk_size, anchor_radius);
-            }
+    {
+        std::vector<int32_t> query_pool(ids.begin() + q0, ids.end());
+        dflash::qwen3::AnchorScanCfg anchor_cfg{chunk_size, anchor_radius,
+                                                 max_anchor_hits, anchor_ngram,
+                                                 rare_token_max_freq};
+        anchor_cfg.cascade_min_anchor_count = (int)(cascade_min_anchor_frac * n_keep);
+        anchor_cfg.max_forced_count         = (int)(max_forced_ratio * n_keep);
+
+        const bool use_transitive = env_int("DFLASH_COMPRESS_ANCHOR_TRANSITIVE", 0) != 0;
+        const int  max_iters      = env_int("DFLASH_COMPRESS_ANCHOR_MAX_ITERS",  3);
+        if (use_transitive) {
+            dflash::qwen3::scan_and_force_transitive(ids, q0, query_pool,
+                                                      anchor_cfg, max_iters, forced);
+        } else {
+            dflash::qwen3::scan_and_force(ids, q0, query_pool, anchor_cfg, forced);
         }
     }
 

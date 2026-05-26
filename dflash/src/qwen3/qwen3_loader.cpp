@@ -96,6 +96,18 @@ bool load_qwen3_drafter_model(const std::string & path,
     out.head_dim   = (int)get_u32(gctx, "qwen3.attention.key_length", 128);
     out.rope_theta = get_f32(gctx, "qwen3.rope.freq_base", 1000000.0f);
 
+    // Detect weight quant type from blk.0.attn_q.weight; support BF16 and Q8_0.
+    ggml_type wtype = GGML_TYPE_BF16;
+    {
+        int64_t tidx = gguf_find_tensor(gctx, "blk.0.attn_q.weight");
+        if (tidx >= 0) {
+            wtype = gguf_get_tensor_type(gctx, tidx);
+        }
+    }
+    std::fprintf(stderr, "[qwen3-0.6b] detected weight type: %s\n",
+                 wtype == GGML_TYPE_Q8_0 ? "Q8_0" : "BF16");
+    std::fflush(stderr);
+
     // Compute total tensor metadata size for context allocation.
     const int n_layer = out.n_layer;
     const int n_tensors_per_layer = 11;
@@ -117,10 +129,10 @@ bool load_qwen3_drafter_model(const std::string & path,
     const int q_dim     = n_head * head_dim;
     const int kv_dim    = n_head_kv * head_dim;
 
-    // Top-level tensors.
-    out.tok_embd = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, n_embd, n_vocab);
+    // Top-level tensors. tok_embd/output use wtype; norms stay F32.
+    out.tok_embd = ggml_new_tensor_2d(out.ctx, wtype, n_embd, n_vocab);
     out.out_norm = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, n_embd);
-    out.output   = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, n_embd, n_vocab);
+    out.output   = ggml_new_tensor_2d(out.ctx, wtype, n_embd, n_vocab);
     ggml_set_name(out.tok_embd, "token_embd.weight");
     ggml_set_name(out.out_norm, "output_norm.weight");
     ggml_set_name(out.output,   "output.weight");
@@ -129,16 +141,16 @@ bool load_qwen3_drafter_model(const std::string & path,
     for (int il = 0; il < n_layer; ++il) {
         auto & L = out.layers[il];
         L.attn_norm = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, n_embd);
-        L.wq        = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, n_embd, q_dim);
-        L.wk        = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, n_embd, kv_dim);
-        L.wv        = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, n_embd, kv_dim);
-        L.wo        = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, q_dim, n_embd);
+        L.wq        = ggml_new_tensor_2d(out.ctx, wtype, n_embd, q_dim);
+        L.wk        = ggml_new_tensor_2d(out.ctx, wtype, n_embd, kv_dim);
+        L.wv        = ggml_new_tensor_2d(out.ctx, wtype, n_embd, kv_dim);
+        L.wo        = ggml_new_tensor_2d(out.ctx, wtype, q_dim, n_embd);
         L.q_norm    = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, head_dim);
         L.k_norm    = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, head_dim);
         L.ffn_norm  = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, n_embd);
-        L.ffn_gate  = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, n_embd, n_ff);
-        L.ffn_up    = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, n_embd, n_ff);
-        L.ffn_down  = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, n_ff, n_embd);
+        L.ffn_gate  = ggml_new_tensor_2d(out.ctx, wtype, n_embd, n_ff);
+        L.ffn_up    = ggml_new_tensor_2d(out.ctx, wtype, n_embd, n_ff);
+        L.ffn_down  = ggml_new_tensor_2d(out.ctx, wtype, n_ff, n_embd);
     }
 
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);

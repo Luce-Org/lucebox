@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Add nvm node to PATH for codex (a Node.js binary) in non-interactive subshells
+# Prefer the explicit nvm path over asdf shims which require asdf runtime state
+_NVM_NODE_BIN=""
+for _v in v24.13.0 v22.17.0 v20.18.0; do
+  if [[ -x "$HOME/.nvm/versions/node/$_v/bin/node" ]]; then
+    _NVM_NODE_BIN="$HOME/.nvm/versions/node/$_v/bin"
+    break
+  fi
+done
+[[ -n "$_NVM_NODE_BIN" ]] && export PATH="$_NVM_NODE_BIN:$PATH"
+unset _NVM_NODE_BIN _v
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${MAX_CTX:=32768}"
 : "${BUDGET:=22}"
