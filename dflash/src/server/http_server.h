@@ -54,7 +54,7 @@ struct ServerConfig {
     // PFlash (speculative prefill compression)
     enum class PflashMode { OFF, AUTO, ALWAYS };
     PflashMode  pflash_mode      = PflashMode::OFF;
-    int         pflash_threshold = 32000;   // token count threshold for AUTO mode
+    int         pflash_threshold = 2000;    // token count threshold for AUTO mode
     float       pflash_keep_ratio = 0.05f;  // fraction of tokens to keep
     std::string pflash_drafter_path;        // path to drafter GGUF (Qwen3-0.6B)
     int         pflash_drafter_gpu = 0;     // backend-local GPU for PFlash drafter

@@ -70,6 +70,59 @@ static void force_chunk_neighborhood(std::vector<uint8_t> & forced, int n_chunks
     for (int c = lo; c <= hi; ++c) forced[(size_t)c] = 1;
 }
 
+// Dynamic threshold: override n_keep based on score distribution rather than
+// a fixed ratio. Enabled via DFLASH_COMPRESS_DYNAMIC_THRESHOLD env var (float
+// alpha in (0,1)). Keeps all chunks whose mean score >= max_score * alpha,
+// clamped between [1, min(n_chunks/2, fixed_n_keep*3)].
+// Returns the original n_keep unchanged if env var is unset or invalid.
+static int maybe_dynamic_n_keep(
+    const std::vector<std::pair<float, int>> & chunk_means_sorted_desc,
+    int n_chunks,
+    int fixed_n_keep)
+{
+    static const char * dyn_env = std::getenv("DFLASH_COMPRESS_DYNAMIC_THRESHOLD");
+    if (!dyn_env) return fixed_n_keep;
+
+    char * end = nullptr;
+    float alpha = std::strtof(dyn_env, &end);
+    if (end == dyn_env || alpha <= 0.0f || alpha >= 1.0f) {
+        // Invalid value — log once and fall back.
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr, "[compress] DFLASH_COMPRESS_DYNAMIC_THRESHOLD='%s' "
+                         "invalid (need float in (0,1)), using fixed keep_ratio\n", dyn_env);
+            warned = true;
+        }
+        return fixed_n_keep;
+    }
+
+    if (chunk_means_sorted_desc.empty()) return fixed_n_keep;
+
+    float max_score = chunk_means_sorted_desc[0].first;
+    if (max_score <= 0.0f || !std::isfinite(max_score)) return fixed_n_keep;
+
+    float thresh = max_score * alpha;
+    int dyn_keep = 0;
+    for (const auto & cm : chunk_means_sorted_desc) {
+        if (cm.first >= thresh) ++dyn_keep;
+    }
+
+    // Clamp: floor=1, ceiling=min(n_chunks/2, fixed_n_keep*3) to prevent
+    // pathological cases (flat scores → keep everything).
+    int ceiling = std::min(n_chunks / 2, std::max(fixed_n_keep * 3, 1));
+    int result = std::max(1, std::min(dyn_keep, ceiling));
+
+    static bool logged_once = false;
+    if (!logged_once) {
+        std::fprintf(stderr, "[compress] dynamic threshold: alpha=%.3f max_score=%.4f "
+                     "thresh=%.4f dyn_keep=%d ceiling=%d final=%d (fixed was %d)\n",
+                     alpha, max_score, thresh, dyn_keep, ceiling, result, fixed_n_keep);
+        logged_once = true;
+    }
+
+    return result;
+}
+
 #if defined(DFLASH27B_BACKEND_HIP)
 bool prewarm_drafter_once(const Qwen3DrafterWeights & w) {
     static bool warmed = false;
@@ -501,7 +554,7 @@ static std::vector<int32_t> qwen35_score_and_compress(
     }
 
     const int n_chunks = (S + chunk_size - 1) / chunk_size;
-    const int n_keep = std::max(1, (int)((float)n_chunks * keep_ratio));
+    const int fixed_n_keep = std::max(1, (int)((float)n_chunks * keep_ratio));
     
     std::vector<float> smooth_score = score;
     // Caller pool_kernel takes precedence; if zero/negative, fall back to env or 5.
@@ -528,6 +581,8 @@ static std::vector<int32_t> qwen35_score_and_compress(
         chunk_means.push_back({s / std::max(1, hi - lo), c});
     }
     std::sort(chunk_means.begin(), chunk_means.end(), [](auto a, auto b) { return a.first > b.first; });
+
+    const int n_keep = maybe_dynamic_n_keep(chunk_means, n_chunks, fixed_n_keep);
     
     std::vector<uint8_t> selected((size_t)n_chunks, 0);
     int count = 0;
@@ -711,7 +766,7 @@ std::vector<int32_t> drafter_score_and_compress(
 
     // ── 4. Chunk-top-K + span merge ───────────────────────────────────
     int n_chunks = (S + chunk_size - 1) / chunk_size;
-    int n_keep   = std::max(1, (int)((float)n_chunks * keep_ratio));
+    int fixed_n_keep = std::max(1, (int)((float)n_chunks * keep_ratio));
     std::vector<std::pair<float, int>> chunk_means;
     chunk_means.reserve((size_t)n_chunks);
     for (int c = 0; c < n_chunks; ++c) {
@@ -724,6 +779,8 @@ std::vector<int32_t> drafter_score_and_compress(
     }
     std::sort(chunk_means.begin(), chunk_means.end(),
                       [](auto a, auto b) { return a.first > b.first; });
+
+    int n_keep = maybe_dynamic_n_keep(chunk_means, n_chunks, fixed_n_keep);
 
     // Retrieval tasks often repeat a rare key in the final query and in the
     // needle span. Exact scores alone can keep the query while dropping the
