@@ -1,0 +1,93 @@
+# auto-integration patch stack state
+# Branch: easel:auto-integration
+# Policy:
+#   - Track Luce-Org/lucebox-hub:main as the base.
+#   - Only auto-integrate PRs from known contributors, defined as authors with
+#     prior commits already present on upstream main.
+#   - Avoid draft PRs unless they are very small and strictly required by a
+#     selected non-draft PR.
+#   - Human review/merge first-contribution PRs.
+#   - Rebuild by resetting to upstream main and replaying included PRs in order.
+
+base:
+  remote: origin
+  repo: Luce-Org/lucebox-hub
+  branch: main
+  commit: b8a3b175c9edc979f97f460f6c6725585a043f06
+
+known_contributors:
+  # Generated from authors with previous commits on origin/main at stack creation.
+  - login: easel
+    evidence: "9 commits on origin/main"
+  - login: dusterbloom
+    evidence: "25 commits on origin/main"
+  - login: weicj
+    evidence: "18 commits on origin/main"
+  - login: howard0su
+    evidence: "174 commits on origin/main"
+  - login: Quitetall
+    evidence: "1 commit on origin/main"
+  - login: jkyamog
+    evidence: "recent merged commits on origin/main"
+  - login: sanastasiou
+    evidence: "recent merged commits on origin/main"
+  - login: mrciffa
+    evidence: "maintainer/merge commits on origin/main"
+  - login: 1TommyCheung
+    evidence: "recent merged commit on origin/main"
+
+included:
+  - pr: 262
+    title: "Split MoE weights between CPU & CUDA, support qwen35moe models"
+    author: howard0su
+    head_ref: howard0su:powerinfer
+    head_commit: d12dddeee52e578ab818d207d3eaf37c13acbdd7
+    merge_commit: 0dbebdc
+    status_at_selection: "ready, mergeable, CI pass, known contributor"
+    notes: "Merged first; later conflict with #269 resolved by threading #269 budget-hook parameters through #262's virtual AR decode path."
+  - pr: 269
+    title: "feat(cpp-server): thinking-budget v2 + multi-dialect reasoning aliases + spec"
+    author: easel
+    head_ref: easel:pr/server
+    head_commit: 403e598b98687656d3e07899e2dd9cda098c5db4
+    merge_commit: 3205cff
+    status_at_selection: "ready, mergeable, CI pass, known contributor"
+    notes: "Conflict with #262 in qwen35_backend.cpp resolved manually."
+  - pr: 274
+    title: "feat(pFlash): ee7 early-exit drafter saves up to 9.3× drafter wall at 128K"
+    author: dusterbloom
+    head_ref: dusterbloom:feat/pflash-drafter-ee7
+    head_commit: 1ffc8e6a86ad1f9455f6e0b7b406f4c215748419
+    merge_commit: 2564d1b
+    status_at_selection: "ready, mergeable, CI pass, known contributor"
+    notes: "Cleanly merged after #262 and #269."
+
+held:
+  - pr: 275
+    reason: "draft; depends on #274 but not strictly required for current stack"
+  - pr: 276
+    reason: "known contributor and non-draft, but upstream build CI failed; diagnose before inclusion"
+  - pr: 152
+    reason: "first-contribution/unknown contributor; leave to human"
+  - pr: 153
+    reason: "author has no prior commits on origin/main; leave to human"
+  - pr: 154
+    reason: "author has no prior commits on origin/main; leave to human"
+  - pr: 135
+    reason: "author has no prior commits on origin/main; leave to human"
+  - pr: 137
+    reason: "author has no prior commits on origin/main; leave to human"
+  - pr: 142
+    reason: "author has no prior commits on origin/main; leave to human"
+
+rebuild_commands: |
+  git fetch origin main --prune
+  git fetch easel auto-integration --prune
+  git checkout auto-integration
+  git reset --hard origin/main
+  for n in 262 269 274; do
+    git fetch origin pull/$n/head:refs/heads/pr-$n
+    git merge --no-ff pr-$n
+  done
+  # Re-apply any recorded conflict resolutions, then update .github/auto-integration/stack.yaml.
+  git push --force-with-lease easel auto-integration
