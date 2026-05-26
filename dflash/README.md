@@ -353,6 +353,22 @@ python3 scripts/bench_llm.py                                 # HE + GSM8K + Math
 python3 scripts/bench_he.py --n-gen 256 --ddtree-budget 22   # minimal HE bench
 ```
 
+**Early-exit drafter (requires PR #274 — `PFLASH_DRAFTER_EARLY_EXIT_N`):**
+
+Truncate the drafter forward at layer N instead of running all 28 layers. N=3 is the validated production default on RTX 3090 + Qwen2.5-0.5B-BF16:
+
+```bash
+PFLASH_DRAFTER_EARLY_EXIT_N=3 PFLASH_DRAFTER_SCORE_LAYERS=3 \
+  build/dflash_server ...
+```
+
+Headline numbers vs baseline (RTX 3090, Q4_K_M target, 0.5B-BF16 drafter):
+- 6.9× drafter speedup at 32K, 24.3× at 128K
+- accept_rate delta vs ee7: +1.2 pp (within ±2 pp gate across all 5 clients)
+- NIAH 3/3 at 32K, 64K, 128K (Bug #42 fix included)
+
+Reproduce: `dflash/bench/run_ee_n_sweep.sh` (NIAH + multi-client N-sweep) and `dflash/bench/run_ee_n_multiclient.sh` (5-client accept_rate comparison).
+
 **Long-context mode (up to 256K):**
 ```bash
 DFLASH27B_KV_TQ3=1 DFLASH27B_PREFILL_UBATCH=16 \
