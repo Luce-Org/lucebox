@@ -281,7 +281,15 @@ bool load_target_gguf_laguna(const std::string & path,
     out.expert_gating_sigmoid = (exp_gate_fn == 2);
     out.bos_id      = (raw_bos == kEosKeyMissing) ? -1 : (int32_t)raw_bos;
     out.eos_id      = (raw_eos == kEosKeyMissing) ? -1 : (int32_t)raw_eos;
-    out.eos_chat_id = (raw_eot == kEosKeyMissing) ? -1 : (int32_t)raw_eot;
+    // Laguna GGUF only ships tokenizer.ggml.eos_token_id (id 2 =
+    // 〈|EOS|〉); the chat-template end-of-turn marker is </assistant>
+    // (id 24). Without this fallback the decoder check
+    // `next == eos_chat_id` matches -1 (impossible) and the model
+    // never stops mid-stream — it just emits </assistant> and keeps
+    // going, then re-greets the user and answers again until
+    // max_tokens. See chat_template.cpp ChatFormat::LAGUNA and
+    // laguna_internal.h for the matching constant.
+    out.eos_chat_id = (raw_eot == kEosKeyMissing) ? 24 : (int32_t)raw_eot;
     out.pad_id      = (raw_pad == kEosKeyMissing) ? -1 : (int32_t)raw_pad;
     if ((int)n_layer <= (int)(sizeof(out.n_head_arr)/sizeof(out.n_head_arr[0]))) {
         for (uint32_t i = 0; i < n_layer; ++i) out.n_head_arr[i] = (int)heads_per_layer[i];

@@ -147,27 +147,87 @@ std::string render_chat_template(
     }
 
     case ChatFormat::LAGUNA: {
-        // Laguna/DeepSeek format:
-        //   <｜begin▁of▁sentence｜>system content
-        //   <｜User｜>user content<｜Assistant｜>
-        result = "<｜begin▁of▁sentence｜>";
-        for (const auto & msg : messages) {
-            if (msg.role == "system") {
+        // Laguna XS.2 format (verified against
+        // poolside/Laguna-XS.2/chat_template.jinja, 2026-05-25):
+        //
+        //   〈|EOS|〉<system>
+        //   {system_content_or_default}
+        //   </system>
+        //   <user>
+        //   {user_content}
+        //   </user>
+        //   <assistant>
+        //   <think>      ← if enable_thinking (gen prompt)
+        //   </think>     ← if NOT enable_thinking (gen prompt — empty
+        //                    think block; model continues with answer)
+        //
+        // Tokens 18/19/23/24/25/26 are special (<think>, </think>,
+        // <assistant>, </assistant>, <tool_call>, </tool_call>);
+        // <user> / <system> / </user> / </system> are not added-tokens
+        // and tokenize as regular bytes — which is what the upstream
+        // template expects.
+        //
+        // The DeepSeek-style template that used to live here
+        // (<｜begin▁of▁sentence｜> / <｜User｜> / <｜Assistant｜>)
+        // was a copy-paste error; the tokens don't exist in the laguna
+        // vocab, so the model saw replacement-character garbage in its
+        // prompt and degenerated into echoing the user message back
+        // with `<���Assistant���>` artifacts.
+        static const std::string DEFAULT_SYSTEM =
+            "You are a helpful, conversationally-fluent assistant "
+            "made by Poolside. You are here to be helpful to users "
+            "through natural language conversations.";
+        result = "〈|EOS|〉";
+
+        const bool has_system =
+            !messages.empty() && messages[0].role == "system";
+        const std::string system_content = has_system
+            ? messages[0].content
+            : DEFAULT_SYSTEM;
+        // System always emitted (default or supplied) when there's any
+        // content or tools — matches the template's
+        // `if (system_message and system_message.strip()) or tools`.
+        if (!system_content.empty() || has_tools) {
+            result += "<system>\n";
+            if (!system_content.empty()) result += system_content;
+            (void)tools_json;  // TODO: tools block per upstream template
+            result += "\n</system>\n";
+        }
+
+        const size_t start_idx = has_system ? 1 : 0;
+        for (size_t i = start_idx; i < messages.size(); i++) {
+            const auto & msg = messages[i];
+            if (msg.role == "user") {
+                result += "<user>\n";
                 result += msg.content;
-            } else if (msg.role == "user") {
-                result += "<｜User｜>";
-                result += msg.content;
+                result += "\n</user>\n";
             } else if (msg.role == "assistant") {
-                result += "<｜Assistant｜>";
+                // Past assistant turns: wrap in <assistant>...</assistant>.
+                // Reasoning content is extracted by the upstream template;
+                // for our minimal renderer the content is rendered as-is
+                // (including any embedded <think>...</think> blocks).
+                result += "<assistant>\n";
                 result += msg.content;
+                result += "\n</assistant>\n";
             } else if (msg.role == "tool") {
-                // Tool results inline as user content
-                result += "<｜User｜>[tool_result:" + msg.tool_call_id + "]\n";
+                result += "<tool_response>\n";
                 result += msg.content;
+                result += "\n</tool_response>\n";
+            } else if (msg.role == "system") {
+                // Additional system messages beyond the first
+                result += "<system>\n";
+                result += msg.content;
+                result += "\n</system>\n";
             }
         }
         if (add_generation_prompt) {
-            result += "<｜Assistant｜>";
+            result += "<assistant>\n";
+            if (enable_thinking) {
+                result += "<think>";
+            } else {
+                // Empty think block — model jumps straight to answer.
+                result += "</think>";
+            }
         }
         break;
     }
