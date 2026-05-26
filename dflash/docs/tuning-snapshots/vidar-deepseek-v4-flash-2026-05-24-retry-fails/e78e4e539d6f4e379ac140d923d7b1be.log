@@ -1,3 +1,0 @@
-[capability] url=http://vidar:1236 area=ds4-eval questions=1
-   1 FAIL SuperGPQA      e78e4e539d6f4e379ac140d923d7b1be given=E correct=H format=True hint=False wall=45.21s
-[capability] pass_rate=0.00%

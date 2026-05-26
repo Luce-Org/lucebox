@@ -1,3 +1,0 @@
-[capability] url=http://localhost:8080 area=ds4-eval questions=1
-   1 PASS AIME2025       aime2025-01          given=70 correct=70 format=True hint=True wall=75.02s
-[capability] pass_rate=100.00%

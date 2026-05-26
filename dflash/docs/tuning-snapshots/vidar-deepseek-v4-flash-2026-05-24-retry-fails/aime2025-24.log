@@ -1,3 +1,0 @@
-[capability] url=http://vidar:1236 area=ds4-eval questions=1
-   1 PASS AIME2025       aime2025-24          given=149 correct=149 format=True hint=True wall=781.81s
-[capability] pass_rate=100.00%

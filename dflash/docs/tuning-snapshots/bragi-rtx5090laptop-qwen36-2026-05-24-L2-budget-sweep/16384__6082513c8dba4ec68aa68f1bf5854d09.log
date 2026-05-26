@@ -1,3 +1,0 @@
-[capability] url=http://localhost:8080 area=ds4-eval questions=1
-   1 FAIL SuperGPQA      6082513c8dba4ec68aa68f1bf5854d09 given=E correct=A format=True hint=False wall=29.59s
-[capability] pass_rate=0.00%

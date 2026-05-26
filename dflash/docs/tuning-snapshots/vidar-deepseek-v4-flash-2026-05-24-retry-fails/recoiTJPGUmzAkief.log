@@ -1,3 +1,0 @@
-[capability] url=http://vidar:1236 area=ds4-eval questions=1
-   1 PASS GPQA Diamond   recoiTJPGUmzAkief    given=C correct=C format=True hint=True wall=519.01s
-[capability] pass_rate=100.00%

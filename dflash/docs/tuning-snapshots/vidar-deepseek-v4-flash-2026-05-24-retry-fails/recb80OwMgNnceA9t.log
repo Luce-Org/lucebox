@@ -1,3 +1,0 @@
-[capability] url=http://vidar:1236 area=ds4-eval questions=1
-   1 FAIL GPQA Diamond   recb80OwMgNnceA9t    given=A correct=D format=True hint=False wall=795.53s
-[capability] pass_rate=0.00%

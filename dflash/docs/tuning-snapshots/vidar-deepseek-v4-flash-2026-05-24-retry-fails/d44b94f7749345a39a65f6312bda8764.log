@@ -1,3 +1,0 @@
-[capability] url=http://vidar:1236 area=ds4-eval questions=1
-   1 PASS SuperGPQA      d44b94f7749345a39a65f6312bda8764 given=E correct=E format=True hint=True wall=148.15s
-[capability] pass_rate=100.00%

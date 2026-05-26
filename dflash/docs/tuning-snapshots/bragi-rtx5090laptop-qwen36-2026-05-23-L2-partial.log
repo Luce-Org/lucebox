@@ -1,7 +1,0 @@
-[capability] url=http://localhost:8080 area=ds4-eval questions=92
-   1 PASS GPQA Diamond   recNu3MXkvWUzHZr9    given=B correct=B format=True hint=True wall=263.33s
-   2 PASS SuperGPQA      001b51d76b4d422988f2c11f104a2c6c given=C correct=C format=True hint=True wall=35.74s
-   3 PASS AIME2025       aime2025-01          given=70 correct=70 format=True hint=True wall=205.82s
-   4 PASS GPQA Diamond   recoiTJPGUmzAkief    given=C correct=C format=True hint=True wall=378.43s
-   5 PASS SuperGPQA      b7e20eac98764fb0bf30e8366d951daa given=J correct=J format=True hint=True wall=273.75s
-   6 PASS AIME2025       aime2025-16          given=468 correct=468 format=True hint=True wall=229.44s
