@@ -446,6 +446,19 @@ def run_case(
     # DS4_THINK_HIGH and silently re-enabling thinking. Explicit type makes
     # the opt-out reach servers that follow the Anthropic-shaped contract.
     body_payload["thinking"] = {"type": "enabled" if think else "disabled"}
+    # OpenAI/OpenRouter-shape reasoning control. Empirically OR ignores
+    # `thinking:{type}` and `chat_template_kwargs.enable_thinking` for
+    # poolside/laguna-xs.2:free and similar provider-routed models,
+    # but respects top-level `reasoning_effort: "none"` to genuinely
+    # disable reasoning_tokens emission (validated 2026-05-25 — only
+    # this shape returned reasoning_tokens=0 in the 4-way probe).
+    # Sending alongside the other shapes is harmless for servers that
+    # don't read it. Without this, OR "nothink" runs silently keep
+    # reasoning enabled (the laguna OR runs in
+    # tuning-snapshots/openrouter-2026-05-24-fill-matrix/ show
+    # reasoning_tokens > 0 despite --no-think, so think and nothink
+    # report identical 55/92 pass rates).
+    body_payload["reasoning_effort"] = "high" if think else "none"
     body = json.dumps(body_payload).encode()
     headers = {"Content-Type": "application/json"}
     if auth_header:
