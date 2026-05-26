@@ -135,7 +135,7 @@ MODEL_NAME = "luce-dflash"
 #   laguna           -> dflash::common::run_laguna_daemon() (no spec-decode)
 # server.py just needs to omit --draft + the DFlash/DDTree flags when the
 # arch doesn't support speculative decoding yet.
-_QWEN35_ARCHES = {"qwen35", "qwen36"}
+_QWEN35_ARCHES = {"qwen35", "qwen36", "qwen35moe"}
 _LAGUNA_ARCHES  = {"laguna"}
 
 _ALLOWED_TEMPLATE_KWARGS = frozenset({"enable_thinking", "tools", "add_generation_prompt"})

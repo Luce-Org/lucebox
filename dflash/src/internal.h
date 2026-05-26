@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,8 @@
 #include "dflash27b.h"
 
 namespace dflash::common {
+
+struct Qwen35MoeHybridStorage;
 
 // Single source of truth for error reporting.
 // All loaders / graph builders push into this via set_last_error(...).
@@ -72,6 +75,17 @@ struct TargetLayer {
     ggml_tensor * ssm_norm       = nullptr;  // [head_v_dim]
     ggml_tensor * ssm_out        = nullptr;  // output projection after delta-net
 
+    // MoE FFN (qwen35moe only; nullptr on dense qwen35)
+    ggml_tensor * ffn_gate_inp       = nullptr;  // [hidden, n_expert] router
+    ggml_tensor * ffn_gate_exps      = nullptr;  // [hidden, n_ff_exp, n_expert]
+    ggml_tensor * ffn_up_exps        = nullptr;  // [hidden, n_ff_exp, n_expert]
+    ggml_tensor * ffn_down_exps      = nullptr;  // [n_ff_exp, hidden, n_expert]
+    ggml_tensor * ffn_gate_up_exps   = nullptr;  // [hidden, 2*n_ff_exp, n_expert] optional fused gate/up
+    ggml_tensor * ffn_gate_inp_shexp = nullptr;  // [hidden] shared-expert scalar gate
+    ggml_tensor * ffn_gate_shexp     = nullptr;  // [hidden, n_ff_shexp]
+    ggml_tensor * ffn_up_shexp       = nullptr;  // [hidden, n_ff_shexp]
+    ggml_tensor * ffn_down_shexp     = nullptr;  // [n_ff_shexp, hidden]
+
     // NVFP4 per-tensor weight scales (optional; 1.0f = no scaling).
     // Each corresponds to a weight tensor above: result = mul_mat(w, x) * scale.
     // Stored as host-side floats (read from the GGUF at load time) and applied
@@ -91,6 +105,15 @@ struct TargetLayer {
     float ssm_beta_s     = 1.0f;
     float ssm_alpha_s    = 1.0f;
     float ssm_out_s      = 1.0f;
+    float ffn_gate_inp_s       = 1.0f;
+    float ffn_gate_exps_s      = 1.0f;
+    float ffn_up_exps_s        = 1.0f;
+    float ffn_down_exps_s      = 1.0f;
+    float ffn_gate_up_exps_s   = 1.0f;
+    float ffn_gate_inp_shexp_s = 1.0f;
+    float ffn_gate_shexp_s     = 1.0f;
+    float ffn_up_shexp_s       = 1.0f;
+    float ffn_down_shexp_s     = 1.0f;
 };
 
 // CPU-side embedder: keeps a mmap of the GGUF alive and knows how to
@@ -112,6 +135,7 @@ struct CpuEmbedder {
     int64_t          n_embd = 0;
     int64_t          n_vocab = 0;
     size_t           row_bytes = 0;             // bytes per row in the quant format
+    std::vector<uint8_t> tok_embd_owned;        // optional owned tok_embd payload
 
     ~CpuEmbedder();
     // Dequantize N rows specified by `ids` into `out_f32` (shape [n_embd, n]).
@@ -131,6 +155,7 @@ struct TargetWeights {
     std::vector<TargetLayer> layers;         // size = 64
     ggml_tensor * out_norm = nullptr;        // [hidden]
     ggml_tensor * output   = nullptr;        // [hidden, vocab]  (lm_head)
+    std::shared_ptr<Qwen35MoeHybridStorage> moe_hybrid; // optional Phase 3 hybrid storage
 
     // Metadata from GGUF (validated at load time)
     int full_attention_interval = 4;
@@ -142,10 +167,17 @@ struct TargetWeights {
     int n_layer                 = 64;
     int n_embd                  = 5120;
     int n_ff                    = 17408;
+    int n_ff_exp                = 0;
+    int n_ff_shexp              = 0;
+    int n_expert                = 0;
+    int n_expert_used           = 0;
     int n_vocab                 = DFLASH27B_TARGET_VOCAB;
     int rope_dimension_count    = 64;
     float rope_theta            = 10000000.0f;
     float rms_eps               = 1e-6f;
+    float expert_weights_scale  = 1.0f;
+    int expert_gating_func      = 1;    // 1=softmax, 2=sigmoid (llama.cpp enum values)
+    bool is_moe                 = false;
     int ssm_d_conv              = 4;
     int ssm_d_inner             = 6144;
     int ssm_d_state             = 128;
@@ -180,6 +212,7 @@ struct TargetLoadPlan {
     int  layer_begin = 0;     // inclusive
     int  layer_end   = -1;    // exclusive; <0 means all layers
     bool load_output = true;  // output_norm + lm_head
+    bool skip_expert_tensors = false;  // skip ffn_*_exps from GPU (for hybrid MoE split load)
 };
 
 // Load a Q4_K_M target model from a GGUF file on disk.
@@ -231,6 +264,14 @@ struct DraftWeights {
     int n_ff      = DFLASH27B_TARGET_INTERMEDIATE;     // 17408
     int swa_window = 0;  // sliding window size (0 = disabled)
     float rope_theta = 0.0f;  // RoPE frequency base (must come from GGUF)
+
+    // YaRN rope scaling (populated by loader; 0 = disabled / plain RoPE).
+    float rope_freq_scale = 1.0f;   // 1/factor (e.g. 1/64 for factor=64)
+    float rope_ext_factor = 0.0f;   // >0 enables YaRN interpolation
+    float rope_attn_factor = 1.0f;
+    float rope_beta_fast  = 0.0f;
+    float rope_beta_slow  = 0.0f;
+    int   rope_n_ctx_orig = 0;      // original_max_position_embeddings
 
     // DFlash draft-specific config (populated by loader or set by caller).
     int block_size      = DFLASH27B_DRAFT_BLOCK_SIZE;       // tokens per draft step (16 or 10)
@@ -497,6 +538,7 @@ struct QwenGraphInputs {
     int           kv_start;       // position where the new tokens begin
     bool          capture_layers; // if true, write captured layer features into cache.target_feat
     bool          capture_delta_intermediate = false; // if true, populate out_delta_captures
+    bool          capture_moe_router = false; // if true, expose selected expert ids for MoE layers
     int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
     bool          last_token_logits_only = false; // if true, only compute logits for last token (prefill optimization)
     ggml_tensor * parent_ids = nullptr; // [n_tokens] i32; tree mode when non-null
@@ -509,6 +551,16 @@ struct QwenGraphOutputs {
     // views marked as ggml_set_output() so their data persists after
     // graph_compute; the spec-decode loop reads them host-side for rollback.
     std::vector<DeltaNetCapture> delta_captures;
+    // One entry per target layer. Populated only when capture_moe_router is
+    // true; qwen35 dense layers and non-MoE models leave entries null.
+    std::vector<ggml_tensor *> moe_selected;
+};
+
+struct QwenLayerPrefnOutputs {
+    ggml_tensor * residual = nullptr; // [hidden, n_tokens]
+    ggml_tensor * post = nullptr;     // [hidden, n_tokens]
+    ggml_tensor * moe_selected = nullptr; // [n_used, n_tokens] i32
+    ggml_tensor * moe_weights = nullptr;  // [n_used, n_tokens] f32
 };
 
 QwenGraphOutputs build_qwen35_graph(
@@ -536,6 +588,37 @@ ggml_tensor * build_qwen35_layer(
     int                   fa_window = 0,
     ggml_tensor *         q_tail_capture = nullptr,
     int                   q_tail_start = 0);
+
+// Overload that also exposes the MoE router selection tensor (if MoE layer).
+ggml_tensor * build_qwen35_layer(
+    ggml_context *        ctx,
+    ggml_cgraph *         gf,
+    const TargetWeights & w,
+    TargetCache &         cache,
+    int                   layer_idx,
+    ggml_tensor *         inp,
+    ggml_tensor *         positions,
+    ggml_tensor *         attn_mask,
+    int                   kv_start,
+    int                   n_tokens,
+    bool                  capture,
+    int                   fa_window,
+    ggml_tensor *         q_tail_capture,
+    int                   q_tail_start,
+    ggml_tensor **        moe_selected_out);
+
+QwenLayerPrefnOutputs build_qwen35_layer_prefn(
+    ggml_context *        ctx,
+    ggml_cgraph *         gf,
+    const TargetWeights & w,
+    TargetCache &         cache,
+    int                   layer_idx,
+    ggml_tensor *         inp,
+    ggml_tensor *         positions,
+    ggml_tensor *         attn_mask,
+    int                   kv_start,
+    int                   n_tokens,
+    int                   fa_window = 0);
 
 } // namespace dflash::common
 

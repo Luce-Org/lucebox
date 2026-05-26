@@ -40,6 +40,32 @@ bool build_layer_step(
     int fa_window = 0,
     int kq_stride_pad = KQ_MASK_PAD);
 
+bool build_layer_prefn_step(
+    StepGraph & sg,
+    const TargetWeights & w,
+    TargetCache & cache,
+    ggml_backend_t backend,
+    int layer_idx,
+    int kv_start,
+    int n_tokens,
+    bool with_mask,
+    int fa_window = 0,
+    int kq_stride_pad = KQ_MASK_PAD);
+
+// Full layer graph for hybrid decode: pre-FFN + MoE FFN + shared + residual in one compute.
+// Output: sg.hidden_input = layer_output, sg.moe_selected = router selections.
+bool build_hybrid_full_layer_step(
+    StepGraph & sg,
+    const TargetWeights & w,
+    TargetCache & cache,
+    ggml_backend_t backend,
+    int layer_idx,
+    int kv_start,
+    int n_tokens,
+    bool with_mask,
+    int fa_window = 0,
+    int kq_stride_pad = KQ_MASK_PAD);
+
 // Full target forward: chain mode (all layers, logits + argmax output).
 bool build_target_step(
     StepGraph & sg,
@@ -53,7 +79,8 @@ bool build_target_step(
     bool capture_delta_intermediate = false,
     int fa_window = 0,
     bool last_token_logits_only = false,
-    int kq_stride_pad = KQ_MASK_PAD);
+    int kq_stride_pad = KQ_MASK_PAD,
+    bool capture_moe_router = false);
 
 // Full target forward: DDTree tree-verify mode.
 bool build_target_step_tree(

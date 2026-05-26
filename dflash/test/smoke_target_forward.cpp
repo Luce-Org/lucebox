@@ -67,7 +67,7 @@ int main(int argc, char ** argv) {
     // on CPU and uploaded via inp_embed, so tok_embd never lives on GPU.
     // M-RoPE needs 4 position values per token (one per axis).
     const int n_tokens = 1;
-    const int hidden   = DFLASH27B_TARGET_HIDDEN;
+    const int hidden   = w.n_embd;
     ggml_tensor * inp_embed = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, hidden, n_tokens, 1);
     ggml_tensor * positions = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 4 * n_tokens);
     ggml_set_name(inp_embed, "inp_embed");
@@ -118,7 +118,7 @@ int main(int argc, char ** argv) {
     std::printf("[compute] OK\n");
 
     // Read logits
-    const int64_t vocab = DFLASH27B_TARGET_VOCAB;
+    const int64_t vocab = w.n_vocab;
     std::vector<float> logits(vocab);
     ggml_backend_tensor_get(go.logits, logits.data(), 0, sizeof(float) * vocab);
 

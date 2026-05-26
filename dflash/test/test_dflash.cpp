@@ -26,7 +26,8 @@
 #include "laguna_daemon.h"  // arch dispatch - laguna targets are served by
                             // dflash::common::run_laguna_daemon() instead of the
                             // qwen35 + DFlash + DDTree pipeline below.
-#include "qwen35_daemon.h"  // arch dispatch - single-GPU qwen35 daemon mode
+#include "qwen35_daemon.h"   // arch dispatch - single-GPU qwen35 daemon mode
+#include "qwen35moe_daemon.h"
 #include "qwen35_layer_split.h" // multi-GPU layer-split daemon args
 #include "layer_split_daemon_loop.h" // extracted layer-split daemon loop
 #include "qwen3_daemon.h"   // arch dispatch - qwen3 (0.6B standalone)
@@ -1122,7 +1123,7 @@ int main(int argc, char ** argv) {
                                              draft_ipc_ring_cap);
     }
 
-    // ---- Single-GPU qwen35 daemon: dispatch to run_qwen35_daemon() -----
+    // ---- Single-GPU qwen35-family daemon: dispatch to the dedicated daemon -----
     // This avoids the duplicated 1800-line inline loop below. The inline
     // loop remains for one-shot, test-window, and profile-scaling modes.
     if (daemon_mode && target_gpus.size() <= 1) {
@@ -1146,6 +1147,12 @@ int main(int argc, char ** argv) {
         qargs.ddtree_temp       = ddtree_temp;
         qargs.ddtree_chain_seed = ddtree_chain_seed;
         qargs.use_feature_mirror = draft_feature_mirror;
+        if (detected_arch == "qwen35moe") {
+            std::fprintf(stderr,
+                "[test_dflash] arch=qwen35moe daemon -> dispatching to run_qwen35moe_daemon "
+                "(max_ctx=%d stream_fd=%d)\n", max_ctx_eff, stream_fd);
+            return dflash::common::run_qwen35moe_daemon(qargs);
+        }
         std::fprintf(stderr,
             "[test_dflash] arch=qwen35 daemon -> dispatching to run_qwen35_daemon "
             "(max_ctx=%d stream_fd=%d)\n", max_ctx_eff, stream_fd);

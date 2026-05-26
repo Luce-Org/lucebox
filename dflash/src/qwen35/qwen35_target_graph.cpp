@@ -33,6 +33,8 @@
 #include "internal.h"
 #include "delta_net_chunked.h"
 #include "kv_quant.h"
+#include "qwen35_ops.h"
+#include "qwen35moe_ffn.h"
 
 #include <cmath>
 #include <cstdio>
@@ -423,20 +425,6 @@ void restore_ssm_state(TargetCache & c) {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────
-
-static ggml_tensor * rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
-                                  ggml_tensor * weight, float eps) {
-    ggml_tensor * n = ggml_rms_norm(ctx, x, eps);
-    return ggml_mul(ctx, n, weight);
-}
-
-// NVFP4 scale2: if weight has a per-tensor scale, multiply the matmul result
-// by that scale. No-op when scale==1.0f (non-NVFP4 models).
-static ggml_tensor * apply_scale2(ggml_context * ctx, ggml_tensor * mm_result,
-                                   float scale) {
-    if (scale == 1.0f) return mm_result;
-    return ggml_scale(ctx, mm_result, scale);
-}
 
 static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
                                       const TargetLayer & L) {
@@ -932,7 +920,8 @@ static ggml_tensor * build_single_layer(
     bool                  capture,
     int                   fa_window = 0,
     ggml_tensor *         q_tail_capture = nullptr,
-    int                   q_tail_start = 0)
+    int                   q_tail_start = 0,
+    ggml_tensor **        moe_selected_out = nullptr)
 {
     const int hidden = w.n_embd;
     const float eps   = w.rms_eps;
@@ -971,7 +960,12 @@ static ggml_tensor * build_single_layer(
 
     ggml_tensor * ffn_residual = cur;
     ggml_tensor * post = rms_norm_mul(ctx, cur, L.attn_post_norm, eps);
-    ggml_tensor * ffn  = build_swiglu_ffn(ctx, post, L);
+    ggml_tensor * moe_selected = nullptr;
+    ggml_tensor * ffn  = w.is_moe ? build_qwen35moe_ffn(ctx, post, w, L, &moe_selected)
+                                  : build_swiglu_ffn(ctx, post, L);
+    if (moe_selected_out) {
+        *moe_selected_out = moe_selected;
+    }
     cur = ggml_add(ctx, ffn, ffn_residual);
 
     if (capture && cache.target_feat) {
@@ -1038,6 +1032,9 @@ QwenGraphOutputs build_qwen35_graph(
         const int n_delta     = w.n_layer - n_full_attn;
         og_early.delta_captures.resize(n_delta);
     }
+    if (in.capture_moe_router && w.is_moe) {
+        og_early.moe_selected.assign((size_t)w.n_layer, nullptr);
+    }
 
     // DFlash target layer IDs for feature capture (from TargetWeights config).
     const int * CAPTURE_LAYERS = w.capture_layer_ids;
@@ -1088,8 +1085,15 @@ QwenGraphOutputs build_qwen35_graph(
         ggml_tensor * ffn_residual = cur;
         ggml_tensor * post = rms_norm_mul(ctx, cur, L.attn_post_norm, eps);
 
-        // SwiGLU FFN
-        ggml_tensor * ffn = build_swiglu_ffn(ctx, post, L);
+        // FFN (dense SwiGLU for qwen35, MoE for qwen35moe)
+        ggml_tensor * moe_selected = nullptr;
+        ggml_tensor * ffn = w.is_moe ? build_qwen35moe_ffn(ctx, post, w, L,
+                                                           in.capture_moe_router ? &moe_selected : nullptr)
+                                     : build_swiglu_ffn(ctx, post, L);
+        if (in.capture_moe_router && moe_selected) {
+            ggml_set_output(moe_selected);
+            og_early.moe_selected[(size_t)il] = moe_selected;
+        }
         cur = ggml_add(ctx, ffn, ffn_residual);
 
         // ── DFlash layer feature capture ──
@@ -1184,7 +1188,81 @@ ggml_tensor * build_qwen35_layer(
 {
     return build_single_layer(ctx, gf, w, cache, layer_idx, inp, positions,
                               attn_mask, kv_start, n_tokens, capture, fa_window,
-                              q_tail_capture, q_tail_start);
+                              q_tail_capture, q_tail_start, nullptr);
+}
+
+ggml_tensor * build_qwen35_layer(
+    ggml_context *        ctx,
+    ggml_cgraph *         gf,
+    const TargetWeights & w,
+    TargetCache &         cache,
+    int                   layer_idx,
+    ggml_tensor *         inp,
+    ggml_tensor *         positions,
+    ggml_tensor *         attn_mask,
+    int                   kv_start,
+    int                   n_tokens,
+    bool                  capture,
+    int                   fa_window,
+    ggml_tensor *         q_tail_capture,
+    int                   q_tail_start,
+    ggml_tensor **        moe_selected_out)
+{
+    return build_single_layer(ctx, gf, w, cache, layer_idx, inp, positions,
+                              attn_mask, kv_start, n_tokens, capture, fa_window,
+                              q_tail_capture, q_tail_start, moe_selected_out);
+}
+
+QwenLayerPrefnOutputs build_qwen35_layer_prefn(
+    ggml_context *        ctx,
+    ggml_cgraph *         gf,
+    const TargetWeights & w,
+    TargetCache &         cache,
+    int                   layer_idx,
+    ggml_tensor *         inp,
+    ggml_tensor *         positions,
+    ggml_tensor *         attn_mask,
+    int                   kv_start,
+    int                   n_tokens,
+    int                   fa_window) {
+    QwenLayerPrefnOutputs out{};
+    const float eps = w.rms_eps;
+    const TargetLayer & L = w.layers[layer_idx];
+    const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
+
+    ggml_tensor * inpSA = inp;
+    ggml_tensor * cur   = rms_norm_mul(ctx, inp, L.attn_norm, eps);
+
+    if (is_attn) {
+        int fa_idx = 0;
+        for (int il = 0; il < layer_idx; il++) {
+            if (((il + 1) % w.full_attention_interval) == 0) fa_idx++;
+        }
+        cur = build_full_attn_block(ctx, gf, w, L, cur, positions, w.rope_sections,
+                                    cache.attn_k[fa_idx], cache.attn_v[fa_idx],
+                                    attn_mask, kv_start, n_tokens,
+                                    cache.kv_k_type, cache.kv_v_type,
+                                    cache.kv_k_rotated,
+                                    fa_window);
+    } else {
+        int dn_idx = 0;
+        for (int il = 0; il < layer_idx; il++) {
+            if (((il + 1) % w.full_attention_interval) != 0) dn_idx++;
+        }
+        cur = build_delta_net_block(ctx, gf, w, L, cur,
+                                    cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
+                                    n_tokens, nullptr, nullptr);
+    }
+
+    cur = ggml_add(ctx, cur, inpSA);
+    out.residual = cur;
+    out.post = rms_norm_mul(ctx, cur, L.attn_post_norm, eps);
+    if (w.is_moe) {
+        Qwen35MoeRouterOutputs router = build_qwen35moe_router(ctx, out.post, w, L);
+        out.moe_selected = router.selected;
+        out.moe_weights = router.weights;
+    }
+    return out;
 }
 
 // ─── Cross-request prefix snapshot (Phase A) ─────────────────────────

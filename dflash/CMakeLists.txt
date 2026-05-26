@@ -203,6 +203,7 @@ set(DFLASH27B_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/common
     ${CMAKE_CURRENT_SOURCE_DIR}/src/draft
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35moe
     ${CMAKE_CURRENT_SOURCE_DIR}/src/laguna
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
@@ -244,6 +245,14 @@ add_library(dflash_common STATIC
     src/common/dflash_draft_graph.cpp
     src/common/dflash_spec_decode.cpp
     src/qwen35/graph_builders.cpp
+    src/qwen35moe/qwen35moe_ffn.cpp
+    src/qwen35moe/qwen35moe_backend.cpp
+    src/qwen35moe/qwen35moe_daemon.cpp
+    src/qwen35moe/qwen35moe_routing_stats.cpp
+    src/qwen35moe/qwen35moe_expert_placement.cpp
+    src/qwen35moe/qwen35moe_hybrid_storage.cpp
+    src/qwen35moe/qwen35moe_hybrid_ffn_eval.cpp
+    src/qwen35moe/qwen35moe_swap_manager.cpp
     src/qwen35/layer_split_forward.cpp
     src/qwen35/layer_split_daemon.cpp
     src/qwen35/qwen35_backend.cpp
@@ -549,6 +558,30 @@ if(DFLASH27B_TESTS)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_vs_reference.cpp")
         add_executable(test_draft_vs_reference test/test_draft_vs_reference.cpp)
         target_link_libraries(test_draft_vs_reference PRIVATE dflash_common)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_qwen35moe_routing_stats.cpp")
+        add_executable(test_qwen35moe_routing_stats test/test_qwen35moe_routing_stats.cpp)
+        target_include_directories(test_qwen35moe_routing_stats PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_include_directories(test_qwen35moe_routing_stats PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        endif()
+        target_link_libraries(test_qwen35moe_routing_stats PRIVATE dflash_common)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_qwen35moe_expert_placement.cpp")
+        add_executable(test_qwen35moe_expert_placement test/test_qwen35moe_expert_placement.cpp)
+        target_include_directories(test_qwen35moe_expert_placement PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_include_directories(test_qwen35moe_expert_placement PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        endif()
+        target_link_libraries(test_qwen35moe_expert_placement PRIVATE dflash_common)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_qwen35moe_swap_manager.cpp")
+        add_executable(test_qwen35moe_swap_manager test/test_qwen35moe_swap_manager.cpp)
+        target_include_directories(test_qwen35moe_swap_manager PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_include_directories(test_qwen35moe_swap_manager PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        endif()
+        target_link_libraries(test_qwen35moe_swap_manager PRIVATE dflash_common)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_draft.cpp")
         add_executable(smoke_load_draft test/smoke_load_draft.cpp)

@@ -78,7 +78,7 @@ bool Qwen35Backend::init() {
     }
 
     // Load target
-    if (!load_target_gguf(cfg_.target_path, target_backend_, w_)) {
+    if (!load_target_model(target_backend_, w_)) {
         std::fprintf(stderr, "target load: %s\n", dflash27b_last_error());
         return false;
     }
@@ -137,13 +137,23 @@ bool Qwen35Backend::init() {
                                          cache_.target_feat_cap > 0 ? cache_.target_feat_cap : cfg_.device.max_ctx});
         if (!draft_feature_mirror_init(feature_mirror_, draft_backend_,
                                        cfg_.draft_gpu, cfg_.device.gpu, mirror_cap,
-                                       DFLASH27B_DRAFT_N_TARGET_LAYERS,
-                                       DFLASH27B_TARGET_HIDDEN)) {
+                                       w_.n_capture_layers,
+                                       w_.n_embd)) {
             std::fprintf(stderr, "warning: feature mirror init failed, spec decode will use AR fallback\n");
         }
     }
 
     return true;
+}
+
+bool Qwen35Backend::load_target_model(ggml_backend_t backend, TargetWeights & out) {
+    return load_target_gguf(cfg_.target_path, backend, out);
+}
+
+bool Qwen35Backend::run_ar_decode_path(int committed, int n_gen,
+                                       std::vector<int32_t> & out_tokens,
+                                       const DaemonIO & io) {
+    return do_ar_decode(committed, n_gen, out_tokens, io);
 }
 
 // ── print_ready_banner ──────────────────────────────────────────────────
@@ -185,7 +195,7 @@ bool Qwen35Backend::unpark(const std::string & what) {
     const bool use_remote_draft = cfg_.remote_draft.enabled();
 
     if (want_target && target_parked_) {
-        if (!load_target_gguf(cfg_.target_path, target_backend_, w_)) {
+        if (!load_target_model(target_backend_, w_)) {
             std::fprintf(stderr, "[unpark] target: %s\n", dflash27b_last_error());
             return false;
         }
@@ -211,6 +221,17 @@ bool Qwen35Backend::unpark(const std::string & what) {
             if (!draft_ok) {
                 std::fprintf(stderr, "[unpark] draft: %s\n", dflash27b_last_error());
                 return false;
+            }
+            // Re-apply rope overrides after reload.
+            if (dw_.rope_theta != w_.rope_theta && w_.rope_theta > 0.0f)
+                dw_.rope_theta = w_.rope_theta;
+            if (dw_.rope_ext_factor == 0.0f && dw_.n_layer == 8 && dw_.n_embd == 2048) {
+                float yf = cfg_.draft_yarn_factor > 1.0f ? cfg_.draft_yarn_factor : 64.0f;
+                dw_.rope_freq_scale = 1.0f / yf;
+                dw_.rope_ext_factor = 1.0f; dw_.rope_attn_factor = 1.0f;
+                dw_.rope_beta_fast = cfg_.draft_yarn_beta_fast;
+                dw_.rope_beta_slow = cfg_.draft_yarn_beta_slow;
+                dw_.rope_n_ctx_orig = cfg_.draft_yarn_orig_ctx;
             }
             if (cfg_.draft_swa_window > 0) {
                 dw_.swa_window = cfg_.draft_swa_window;
@@ -686,7 +707,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                /*capture_delta_intermediate=*/false,
                                /*fa_window=*/0,
                                /*last_token_logits_only=*/(start + n_tokens < prompt_len),
-                               cfg_.kq_stride_pad)) {
+                               cfg_.kq_stride_pad,
+                               should_capture_moe_router())) {
             std::fprintf(stderr, "prefill build @%d\n", kv_pos);
             return -1;
         }
@@ -727,6 +749,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
             std::fprintf(stderr, "prefill compute @%d failed\n", kv_pos);
             return -1;
         }
+        after_target_compute(sg_, kv_pos, n_tokens);
 
         int32_t last_tok = -1;
         const bool is_final_chunk = (start + n_tokens >= prompt_len);
@@ -808,16 +831,19 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
 
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/committed, /*n_tokens=*/1,
-                               /*with_mask=*/false, /*capture=*/true,
+                               /*with_mask=*/false, /*capture=*/false,
                                /*capture_delta_intermediate=*/false,
                                /*fa_window=*/0,
                                /*last_token_logits_only=*/false,
-                               cfg_.kq_stride_pad)) {
+                               cfg_.kq_stride_pad,
+                               should_capture_moe_router())) {
             return false;
         }
 
         auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
         if (st != GGML_STATUS_SUCCESS) return false;
+
+        after_target_compute(sg_, committed, 1);
 
         ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
                                 sizeof(float) * vocab);
@@ -907,7 +933,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     if (!can_spec) {
         // AR fallback consumes the final prefill position itself, then advances
         // one token at a time.
-        bool ok = do_ar_decode(committed, n_gen, out_tokens, io);
+        bool ok = run_ar_decode_path(committed, n_gen, out_tokens, io);
         io.emit(-1);
         return ok;
     }

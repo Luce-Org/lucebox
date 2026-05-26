@@ -50,6 +50,12 @@ struct Qwen35Config {
     int          draft_swa_window = 0;
     int          draft_ctx_max    = 4096;
 
+    // Draft YaRN rope scaling (set by caller for models that need it).
+    float        draft_yarn_factor    = 0.0f;  // 0 = no YaRN; >1 = enable
+    float        draft_yarn_beta_fast = 32.0f;
+    float        draft_yarn_beta_slow = 1.0f;
+    int          draft_yarn_orig_ctx  = 4096;
+
     // Speculative decode strategy
     bool         fast_rollback   = false;
     bool         seq_verify      = false;
@@ -118,10 +124,40 @@ public:
     // to prevent VRAM growth over time.
     void release_scratch() override;
 
-private:
+protected:
+    virtual bool load_target_model(ggml_backend_t backend, TargetWeights & out);
+    virtual bool run_ar_decode_path(int committed, int n_gen,
+                                    std::vector<int32_t> & out_tokens,
+                                    const DaemonIO & io);
+    virtual bool should_capture_moe_router() const { return false; }
+    virtual void after_target_compute(StepGraph &,
+                                      int /*kv_start*/,
+                                      int /*n_tokens*/) {}
+
+    TargetWeights & target_weights() { return w_; }
+    const TargetWeights & target_weights() const { return w_; }
+    TargetCache & target_cache() { return cache_; }
+    const TargetCache & target_cache() const { return cache_; }
+    ggml_backend_t target_backend() const { return target_backend_; }
+    StepGraph & target_step_graph() { return sg_; }
+    const StepGraph & target_step_graph() const { return sg_; }
+    SamplerCfg & sampler_config() { return sampler_; }
+    std::mt19937_64 & sampler_rng_engine() { return sampler_rng_; }
+    bool prefill_logits_valid() const { return prefill_last_logits_valid_; }
+    std::size_t prefill_logits_offset() const { return prefill_last_logits_offset_; }
+
+    // Accessors for draft/spec-decode state (needed by hybrid spec-decode in subclass)
+    DraftWeights & draft_weights() { return dw_; }
+    const DraftWeights & draft_weights() const { return dw_; }
+    ggml_backend_t draft_backend() const { return draft_backend_; }
+    DraftFeatureMirror & feature_mirror() { return feature_mirror_; }
+    const DraftFeatureMirror & feature_mirror() const { return feature_mirror_; }
+    bool is_draft_parked() const { return draft_parked_; }
+
     // ── Configuration ────────────────────────────────────────────────
     Qwen35Config cfg_;
 
+private:
     // ── GPU backends ─────────────────────────────────────────────────
     ggml_backend_t target_backend_ = nullptr;
     ggml_backend_t draft_backend_  = nullptr;
