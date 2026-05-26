@@ -271,6 +271,7 @@ std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids)
     }
 
     if (best_slot >= 0) {
+        lifetime_hits_.fetch_add(1, std::memory_order_relaxed);
         std::fprintf(stderr, "[pc] lookup hit slot=%d prefix_len=%d (of %zu total)\n",
                      best_slot, best_len, prompt_ids.size());
     }
@@ -314,12 +315,16 @@ void PrefixCache::confirm_inline_snap(int slot, int target_cut,
     // Evict the reserved entry (if any).
     if (has_pending_evict_) {
         int idx = find_entry(pending_evict_key_);
-        if (idx >= 0) entries_.erase(entries_.begin() + idx);
+        if (idx >= 0) {
+            entries_.erase(entries_.begin() + idx);
+            entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
+        }
         has_pending_evict_ = false;
     }
 
     auto key = hash_prefix(prompt_ids.data(), target_cut);
     entries_.push_back({key, slot});
+    entries_size_count_.fetch_add(1, std::memory_order_relaxed);
     std::fprintf(stderr, "[pc] inline-snap committed slot=%d prefix_len=%d\n",
                  slot, target_cut);
 }
@@ -328,7 +333,10 @@ void PrefixCache::abort_inline_snap(int /*slot*/) {
     if (disabled_) return;
     if (has_pending_evict_) {
         int idx = find_entry(pending_evict_key_);
-        if (idx >= 0) entries_.erase(entries_.begin() + idx);
+        if (idx >= 0) {
+            entries_.erase(entries_.begin() + idx);
+            entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
+        }
         has_pending_evict_ = false;
     }
 }
@@ -337,6 +345,7 @@ void PrefixCache::mark_all_cleared() {
     if (disabled_) return;
     int n = (int)entries_.size();
     entries_.clear();
+    entries_size_count_.store(0, std::memory_order_relaxed);
     next_slot_ = 0;
     has_pending_evict_ = false;
     std::fprintf(stderr, "[pc] all-cleared — dropped %d LRU entries\n", n);
@@ -378,6 +387,7 @@ std::pair<int, int> PrefixCache::lookup_full(const std::vector<int32_t> & prompt
     int slot = e.slot;
     int cur_ids_len = e.cur_ids_len;
     move_full_to_end(idx);
+    full_lifetime_hits_.fetch_add(1, std::memory_order_relaxed);
 
     std::fprintf(stderr, "[pc] full-cache hit slot=%d cur_ids_len=%d\n",
                  slot, cur_ids_len);
@@ -412,7 +422,10 @@ void PrefixCache::confirm_full_snap(int slot,
 
     if (full_has_pending_evict_) {
         int idx = find_full_entry(full_pending_evict_key_);
-        if (idx >= 0) full_entries_.erase(full_entries_.begin() + idx);
+        if (idx >= 0) {
+            full_entries_.erase(full_entries_.begin() + idx);
+            full_entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
+        }
         full_has_pending_evict_ = false;
     }
 
@@ -425,6 +438,7 @@ void PrefixCache::confirm_full_snap(int slot,
         std::chrono::steady_clock::now().time_since_epoch()).count();
     entry.hits = 0;
     full_entries_.push_back({key, std::move(entry)});
+    full_entries_size_count_.fetch_add(1, std::memory_order_relaxed);
 
     std::fprintf(stderr, "[pc] full-cache committed slot=%d cur_ids_len=%d\n",
                  slot, cur_ids_len);
@@ -433,6 +447,21 @@ void PrefixCache::confirm_full_snap(int slot,
 void PrefixCache::abort_full_snap(int /*slot*/) {
     if (full_disabled_) return;
     full_has_pending_evict_ = false;
+}
+
+PrefixCache::InlineStats PrefixCache::stats() const {
+    if (disabled_) return {0, 0, 0};
+    return {cap_,
+            (int)entries_size_count_.load(std::memory_order_relaxed),
+            lifetime_hits_.load(std::memory_order_relaxed)};
+}
+
+PrefixCache::FullStats PrefixCache::full_stats() const {
+    if (full_disabled_) return {false, 0, 0, 0, 0};
+    return {true, full_cap_,
+            (int)full_entries_size_count_.load(std::memory_order_relaxed),
+            full_disk_bytes_.load(std::memory_order_relaxed),
+            full_lifetime_hits_.load(std::memory_order_relaxed)};
 }
 
 }  // namespace dflash::common

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 
 namespace dflash::common {
@@ -48,6 +49,25 @@ static int64_t unix_timestamp() {
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+// Round `x` to 1 decimal place. JSON serialization of doubles can emit
+// 17 significant digits which is noisy in client logs and bench output;
+// caller-side rounding keeps the wire format stable across runs.
+static double round1(double x) {
+    return std::round(x * 10.0) / 10.0;
+}
+
+json build_timings_json(const GenTimings & t, int completion_tokens) {
+    const double prefill_ms = round1(t.prefill_s * 1000.0);
+    const double decode_ms  = round1(t.decode_s  * 1000.0);
+    const double tps = t.decode_s > 0.0
+        ? round1((double)completion_tokens / t.decode_s) : 0.0;
+    return json{
+        {"prefill_ms",            prefill_ms},
+        {"decode_ms",             decode_ms},
+        {"decode_tokens_per_sec", tps}
+    };
+}
+
 // ─── Constructor ────────────────────────────────────────────────────────
 
 SseEmitter::SseEmitter(ApiFormat format,
@@ -56,7 +76,6 @@ SseEmitter::SseEmitter(ApiFormat format,
                        int prompt_tokens,
                        const json & tools,
                        ToolMemory * tool_memory,
-                       bool started_in_thinking,
                        const std::vector<std::string> & stop_sequences)
     : format_(format)
     , request_id_(request_id)
@@ -64,8 +83,8 @@ SseEmitter::SseEmitter(ApiFormat format,
     , prompt_tokens_(prompt_tokens)
     , tools_(tools)
     , tool_memory_(tool_memory)
-    , mode_(started_in_thinking ? StreamMode::REASONING : StreamMode::CONTENT)
-    , active_kind_(started_in_thinking ? "thinking" : "text")
+    , mode_(StreamMode::CONTENT)
+    , active_kind_("text")
     , stop_sequences_(stop_sequences)
     , created_at_(unix_timestamp())
     , msg_item_id_(gen_item_id())
@@ -194,6 +213,32 @@ std::vector<std::string> SseEmitter::emit_start() {
 std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
     if (stop_hit_) return {};  // already stopped
 
+    // Track the first emit_token call whose mode-on-entry is CONTENT —
+    // that's the first token attributed to the visible reply. Mode-on-
+    // entry matters because a token whose text *contains* `</think>`
+    // arrives while mode is still REASONING; the transition fires
+    // mid-emit. The token AFTER that transition is the first content
+    // token. Captured here so http_server can compute the natural-close
+    // split without a parallel bump_count loop.
+    //
+    // Exception: a leading `<think>` opener (Qwen3.6's thinking-enabled
+    // first token, or the synthesized `<|channel>` → `<think>` map for
+    // gemma4) arrives while mode is still CONTENT — the emitter's
+    // default — but the piece immediately transitions to REASONING.
+    // Capturing fci=0 in that case would misreport thinking_tokens as 0
+    // for any streamed-thinking response. Detect the `<think>` opener
+    // here (lookahead in the unsanitized piece, before the state
+    // machine runs) and skip the capture so it can fire on a later
+    // CONTENT-mode token after the natural </think> close.
+    const bool entry_is_think_opener =
+        mode_ == StreamMode::CONTENT &&
+        raw_piece.find(THINK_OPEN) != std::string::npos;
+    if (first_content_token_index_ < 0 && mode_ == StreamMode::CONTENT &&
+        !entry_is_think_opener) {
+        first_content_token_index_ = emit_token_count_;
+    }
+    emit_token_count_++;
+
     // Sanitize input to prevent json::dump() from throwing on invalid UTF-8.
     std::string piece = utf8_sanitize(raw_piece);
     std::vector<std::string> out;
@@ -247,7 +292,6 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
 
         if (mode_ == StreamMode::REASONING) {
             // Strip leading <think> tag from reasoning (ds4 pattern).
-            // When started_in_thinking=true, the model may echo <think> again.
             // The model may emit whitespace before <think>, so we skip leading
             // whitespace first, then check for the tag.
             if (!checked_think_prefix_) {
@@ -430,7 +474,8 @@ void SseEmitter::emit_content_delta(std::vector<std::string> & out,
 
 // ─── emit_finish ────────────────────────────────────────────────────────
 
-std::vector<std::string> SseEmitter::emit_finish(int completion_tokens) {
+std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
+                                                 const GenTimings * timings) {
     std::vector<std::string> out;
 
     // Flush remaining window
@@ -570,16 +615,21 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens) {
     case ApiFormat::OPENAI_CHAT: {
         // Finish reason chunk
         out.push_back(format_openai_delta(json::object(), fr.c_str()));
-        // Usage chunk
+        // Usage chunk — includes timings sub-object when caller supplied
+        // generation wall-clock breakdown (see spec §6.3).
+        json usage_body = {
+            {"prompt_tokens", prompt_tokens_},
+            {"completion_tokens", completion_tokens},
+            {"total_tokens", prompt_tokens_ + completion_tokens}
+        };
+        if (timings) {
+            usage_body["timings"] = build_timings_json(*timings, completion_tokens);
+        }
         json usage = {
             {"id", request_id_}, {"object", "chat.completion.chunk"},
             {"created", created_at_}, {"model", model_name_},
             {"choices", json::array()},
-            {"usage", {
-                {"prompt_tokens", prompt_tokens_},
-                {"completion_tokens", completion_tokens},
-                {"total_tokens", prompt_tokens_ + completion_tokens}
-            }}
+            {"usage", usage_body}
         };
         out.push_back(sse_data(usage.dump()));
         out.push_back(sse_data("[DONE]"));
@@ -603,10 +653,14 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens) {
         // tool_result back), else "end_turn". Stop-sequence hits also report
         // "end_turn" (Anthropic has no dedicated reason for that case).
         const char * stop_reason = tool_calls_.empty() ? "end_turn" : "tool_use";
+        json anth_usage = {{"output_tokens", completion_tokens}};
+        if (timings) {
+            anth_usage["timings"] = build_timings_json(*timings, completion_tokens);
+        }
         json msg_delta = {
             {"type", "message_delta"},
             {"delta", {{"stop_reason", stop_reason}, {"stop_sequence", nullptr}}},
-            {"usage", {{"output_tokens", completion_tokens}}}
+            {"usage", anth_usage}
         };
         out.push_back(sse_event("message_delta", msg_delta.dump()));
         // message_stop
@@ -659,17 +713,21 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens) {
         }
 
         // response.completed
+        json resp_usage = {
+            {"input_tokens", prompt_tokens_},
+            {"output_tokens", completion_tokens},
+            {"total_tokens", prompt_tokens_ + completion_tokens}
+        };
+        if (timings) {
+            resp_usage["timings"] = build_timings_json(*timings, completion_tokens);
+        }
         json shell = {
             {"id", request_id_}, {"object", "response"},
             {"created_at", created_at_}, {"status", "completed"},
             {"model", model_name_},
             {"output", final_output},
             {"output_text", accumulated_content_},
-            {"usage", {
-                {"input_tokens", prompt_tokens_},
-                {"output_tokens", completion_tokens},
-                {"total_tokens", prompt_tokens_ + completion_tokens}
-            }}
+            {"usage", resp_usage}
         };
         out.push_back(format_responses_event("response.completed", {{"response", shell}}));
         break;

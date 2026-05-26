@@ -131,6 +131,16 @@ std::string render_chat_template(
                 // Qwen3 thinking disabled: inject closed think block so the
                 // model skips reasoning and generates the answer directly.
                 result += "<think>\n\n</think>\n\n";
+            } else {
+                // Qwen3.6 enable_thinking: pre-open the thinking block so the
+                // model actually enters reasoning mode. Verified against the
+                // official Qwen3.6 chat_template.jinja:
+                //   enable_thinking=true  → suffix `assistant\n<think>\n`
+                //   enable_thinking=false → suffix `assistant\n<think>\n\n</think>\n\n`
+                // Without this prefix, Qwen3.6 stays in non-thinking mode
+                // even when the client opts in, defeating the thinking-budget
+                // mechanism entirely.
+                result += "<think>\n";
             }
         }
         break;
@@ -163,17 +173,63 @@ std::string render_chat_template(
     }
 
     case ChatFormat::GEMMA4: {
-        // Gemma4 format:
-        //   <bos><|turn>user\n{msg}<turn|>\n<|turn>model\n
-        // System messages are prepended to the first user message.
+        // Gemma4 format (see the chat template embedded in the GGUF
+        // metadata of google/gemma-4-26B-A4B-it):
+        //
+        //   <bos>
+        //   <|turn>system
+        //   [<|think|>\n      ← if enable_thinking]
+        //   {system content}
+        //   <turn|>
+        //   <|turn>user
+        //   {msg}<turn|>
+        //   <|turn>model
+        //   [<|channel>thought\n<channel|>  ← if NOT enable_thinking]
+        //
+        // The trailing channel-thought guard is the same trick Qwen3
+        // uses (`<think>\n\n</think>\n\n`): when thinking is disabled
+        // we pre-fill an empty thought channel so the model SKIPS
+        // emitting its own. Without this, Gemma4 self-emits
+        // `<|channel>thought\n…<channel|>` which then partially leaks
+        // into the visible content because the channel tokens were
+        // never opened from the prompt side.
+        //
+        // The `<|think|>` opener at the start of the system turn is
+        // the inverse: it signals "this conversation is in thinking
+        // mode" so the model's channel sequence routes to reasoning.
+        const bool has_system = !messages.empty() && messages[0].role == "system";
+        const bool emit_system_turn = enable_thinking || has_system || has_tools;
         result = "<bos>";
-        std::string system_content;
+
         size_t start_idx = 0;
-        if (!messages.empty() && messages[0].role == "system") {
+        std::string system_content;
+        if (has_system) {
             system_content = messages[0].content;
             start_idx = 1;
         }
 
+        // System turn — emitted when there's actual system content OR
+        // we need somewhere to put the `<|think|>` opener.
+        if (emit_system_turn) {
+            result += "<|turn>system\n";
+            if (enable_thinking) {
+                // Per the GGUF chat template: "Inject Thinking token at
+                // the very top of the FIRST system turn".
+                result += "<|think|>\n";
+            }
+            if (!system_content.empty()) {
+                result += system_content;
+            }
+            // TODO: tool definitions block (`<|tool>…<tool|>`) goes here
+            // when tools_json is non-empty. Out of scope for the
+            // budget-signaling fix.
+            (void)tools_json;
+            result += "<turn|>\n";
+        }
+
+        // User/assistant turns. Unlike the previous implementation we
+        // don't prepend system content to the first user message — the
+        // system turn above already carries it (or there isn't one).
         for (size_t i = start_idx; i < messages.size(); i++) {
             const auto & msg = messages[i];
             std::string role = msg.role;
@@ -182,16 +238,18 @@ std::string render_chat_template(
             result += "<|turn>";
             result += role;
             result += '\n';
-            // Inject system content at the start of the first user message.
-            if (i == start_idx && !system_content.empty() && msg.role == "user") {
-                result += system_content;
-                result += "\n\n";
-            }
             result += msg.content;
             result += "<turn|>\n";
         }
         if (add_generation_prompt) {
             result += "<|turn>model\n";
+            if (!enable_thinking) {
+                // Empty thought-channel guard: model will skip its own
+                // `<|channel>thought…<channel|>` block since this one
+                // already sits in the prompt. Matches the GGUF
+                // template's "if not enable_thinking" branch.
+                result += "<|channel>thought\n<channel|>";
+            }
         }
         break;
     }

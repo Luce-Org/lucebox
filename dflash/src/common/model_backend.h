@@ -46,6 +46,39 @@ struct DaemonIO {
 
 // ─── Generate request/result ────────────────────────────────────────────
 
+// Thinking-budget force-close hook. Mirrors antirez/ds4 ds4_eval.c's
+// hard_limit_reply_budget semantics: when the budget remaining (n_gen
+// minus tokens committed so far) falls to hard_limit_remaining, the
+// next sampled tokens get overridden with close_token_ids in order,
+// giving the model the remaining budget to write a visible answer
+// after the injected close-tag sequence.
+//
+// Single vs multi-token close:
+//   Qwen3.6: </think> is one added_token (id 248069). close_token_ids
+//            has size 1. One override + budget_close_injected=true.
+//   DeepSeek/laguna: </think> tokenizes to 3 ordinary tokens
+//            ([1718, 37947, 32] for DS-V3). close_token_ids has
+//            size 3. Three consecutive overrides, then resume.
+//
+// This is "Level 2" of our thinking-budget migration: in-process
+// mid-stream force-close, KV-continuous. Beats Level 1's phase-2
+// reprompt because the model never sees a fresh prefill — its KV
+// state continues naturally after the injected close.
+//
+// Current implementation: AR-decode only. When budget_hook is set,
+// backends MAY route generation through their AR path (skipping spec
+// decode) — the perf trade-off is acceptable since this only kicks in
+// for thinking-enabled requests. Spec-decode integration is a follow-up.
+struct BudgetHook {
+    // Multi-token close sequence injected when `(n_gen - committed)`
+    // drops to `hard_limit_remaining`. For Qwen3.x this is the
+    // canonical "Considering the limited time..." summarize-and-stop
+    // lead-in (tokenized at server startup); for non-qwen arches it's
+    // a single close-tag token. Empty = hook disabled.
+    std::vector<int32_t> close_token_ids;
+    int                  hard_limit_remaining = 0;
+};
+
 struct GenerateRequest {
     std::vector<int32_t>       prompt;
     int                        n_gen       = 0;
@@ -65,6 +98,8 @@ struct GenerateRequest {
     // When non-null, the spec decode loop uses these as draft overrides,
     // bypassing draft model computation for covered positions.
     const std::vector<int32_t> * hint_tokens = nullptr;
+    // Optional thinking-budget hook — see BudgetHook docs above.
+    BudgetHook                 budget_hook;
 };
 
 struct GenerateResult {
@@ -73,6 +108,19 @@ struct GenerateResult {
     std::vector<int32_t>       tokens;
     double                     prefill_s   = 0.0;
     double                     decode_s    = 0.0;
+    // True when the backend's Level 2 hook injected the </think> close
+    // sequence during this generation (vs. the model self-closing). The
+    // server uses this to attribute close_kind correctly: if the model
+    // produced </think> naturally we report "natural"; if the hook fired
+    // we report "hard". Without this flag, decoding the phase-1 token
+    // stream and grepping for "</think>" cannot distinguish the two
+    // (the injected close decodes identically).
+    bool                       budget_forced_close = false;
+    // True iff the AR decode loop's post-close watchdog detected an n-gram
+    // repetition loop and broke out early. Caller surfaces this so clients
+    // can mark the answer as unreliable rather than treating the
+    // (truncated) content as a clean response.
+    bool                       degenerate_decode_close = false;
 };
 
 // ─── Backend interface ──────────────────────────────────────────────────

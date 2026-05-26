@@ -571,7 +571,16 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
     // Decode (speculative)
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
-        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io, req.hint_tokens)) {
+        // Pass the budget hook into spec-decode. When token count nears
+        // the budget edge, do_spec_decode breaks out and tails off via
+        // AR with the hook still active — force-close fires correctly
+        // without sacrificing spec-decode throughput for the bulk of
+        // generation. Most requests never hit the tail because the
+        // model closes </think> naturally well before the budget edge.
+        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
+                             req.hint_tokens, &req.budget_hook,
+                             &result.budget_forced_close,
+                             &result.degenerate_decode_close)) {
             result.error = "decode";
             return result;
         }
@@ -632,7 +641,16 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
     // Decode
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
-        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io, req.hint_tokens)) {
+        // Pass the budget hook into spec-decode. When token count nears
+        // the budget edge, do_spec_decode breaks out and tails off via
+        // AR with the hook still active — force-close fires correctly
+        // without sacrificing spec-decode throughput for the bulk of
+        // generation. Most requests never hit the tail because the
+        // model closes </think> naturally well before the budget edge.
+        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
+                             req.hint_tokens, &req.budget_hook,
+                             &result.budget_forced_close,
+                             &result.degenerate_decode_close)) {
             result.error = "decode";
             return result;
         }
@@ -790,8 +808,95 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
 
 bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                   std::vector<int32_t> & out_tokens,
-                                  const DaemonIO & io) {
+                                  const DaemonIO & io,
+                                  const BudgetHook & budget_hook,
+                                  bool * forced_close_out,
+                                  bool * degenerate_close_out) {
+    // Budget hook state.
+    //   - budget_close_started: true once we've begun injecting the close
+    //     sequence. Prevents re-triggering on continued forward generation.
+    //   - close_inject_pos: index into budget_hook.close_token_ids for the
+    //     NEXT token to inject. While < close_token_ids.size(), each
+    //     iteration overrides the sampled token with the corresponding
+    //     close-sequence token (single-token close = 1 override and done;
+    //     multi-token close like DeepSeek/laguna [1718,37947,32] = 3
+    //     consecutive overrides). Once equal to close_token_ids.size(),
+    //     normal sampling resumes (model writes visible answer).
+    bool budget_close_started = false;
+    int  close_inject_pos     = 0;
+    // Capture entry KV position so the budget check is in the
+    // "generated since entry" frame, not the absolute KV frame.
+    // n_gen is the gen-only count (or the remaining-budget remap done by
+    // spec-decode tail-off); subtracting committed_now (absolute KV =
+    // prompt_len + tokens generated this call) directly would treat
+    // prompt-length tokens as if they were generated output, firing
+    // force-close prompt_len tokens early on prompted requests and
+    // potentially going negative after spec-decode tail-off.
+    const int committed_at_entry = committed;
+    auto maybe_force_close = [&](int32_t & tok, int committed_now) {
+        if (budget_hook.close_token_ids.empty()) return;
+
+        // Continue an already-started multi-token close sequence.
+        if (budget_close_started &&
+            close_inject_pos < (int)budget_hook.close_token_ids.size())
+        {
+            int32_t inj = budget_hook.close_token_ids[close_inject_pos];
+            std::fprintf(stderr,
+                "[budget-hook] close-seq continue %d/%zu: overriding "
+                "sampled token %d with %d\n",
+                close_inject_pos + 1,
+                budget_hook.close_token_ids.size(), tok, inj);
+            tok = inj;
+            close_inject_pos++;
+            return;
+        }
+
+        // Already injected the full sequence — no further overrides.
+        if (budget_close_started) return;
+
+        // Check if budget has tightened to the force-close trigger.
+        // generated = tokens produced in THIS do_ar_decode call;
+        // remaining = budget headroom, measured against n_gen (the
+        // requested gen count or tail-off remap, never against the
+        // absolute KV position which would mis-count the prompt).
+        const int generated = committed_now - committed_at_entry;
+        int remaining = n_gen - generated;
+        if (remaining <= budget_hook.hard_limit_remaining) {
+            // Don't trigger if the model already sampled the first close
+            // token naturally — avoids a redundant override.
+            int32_t first_close = budget_hook.close_token_ids.front();
+            if (tok == first_close) {
+                // Model self-closed at the boundary; consume that token
+                // as the first of the sequence so we still inject the
+                // remaining members (multi-token case) but don't double-emit.
+                budget_close_started = true;
+                close_inject_pos = 1;
+                std::fprintf(stderr,
+                    "[budget-hook] model self-emitted close[0]=%d at "
+                    "committed=%d/%d (remaining=%d <= hard_limit=%d); "
+                    "consuming as start of close sequence (%zu total)\n",
+                    first_close, committed_now, n_gen, remaining,
+                    budget_hook.hard_limit_remaining,
+                    budget_hook.close_token_ids.size());
+                return;
+            }
+            std::fprintf(stderr,
+                "[budget-hook] force-close at committed=%d/%d (remaining=%d "
+                "<= hard_limit=%d): overriding sampled token %d with close[0]=%d "
+                "(seq len %zu)\n",
+                committed_now, n_gen, remaining,
+                budget_hook.hard_limit_remaining, tok, first_close,
+                budget_hook.close_token_ids.size());
+            tok = first_close;
+            budget_close_started = true;
+            close_inject_pos = 1;
+            if (forced_close_out) *forced_close_out = true;
+        }
+    };
     if (n_gen <= 0) return true;
+
+    auto t_dec0_ar = std::chrono::steady_clock::now();
+    const size_t out_tokens_at_entry = out_tokens.size();
 
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
@@ -802,7 +907,17 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     // First token: consume the final prefill position.  Do not derive this
     // offset from committed/KV position: restore paths can prefill a delta at
     // nonzero KV offsets, and committed then no longer describes chunk size.
-    {
+    //
+    // Continuation mode: when out_tokens is non-empty, a previous decode
+    // path (e.g. spec-decode tail-off) already committed tokens and emitted
+    // them. Skip the first-token block — `committed` and `cache_.last_tok`
+    // are already pointing at the most recently committed token, and the
+    // main loop below uses out_tokens.back() as the embed input which IS
+    // that token. Without this skip we'd duplicate the last token in
+    // out_tokens, double-emit it, and advance committed past the actual
+    // KV state.
+    const int initial_emitted = out_tokens.empty() ? 1 : 0;
+    if (initial_emitted == 1) {
         int32_t first_tok;
         if (sampler_.needs_logit_processing()) {
             if (!prefill_last_logits_valid_) return false;
@@ -813,6 +928,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         } else {
             first_tok = cache_.last_tok;
         }
+        maybe_force_close(first_tok, committed);
         out_tokens.push_back(first_tok);
         io.emit(first_tok);
         if (IS_EOS_TOK(first_tok, w_)) return true;
@@ -821,7 +937,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     }
 
     // AR decode loop for remaining tokens
-    for (int i = 1; i < n_gen; i++) {
+    for (int i = initial_emitted; i < n_gen; i++) {
         int32_t tok = out_tokens.back();
 
         if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;
@@ -859,6 +975,8 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             }
         }
 
+        maybe_force_close(next_tok, committed);
+
         out_tokens.push_back(next_tok);
         io.emit(next_tok);
         committed++;
@@ -866,7 +984,53 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         if (io.cancelled) break;
 
         if (IS_EOS_TOK(next_tok, w_)) break;
+
+        // Degenerate-decode watchdog. Once we're past the budget-hook's
+        // close sequence (model in post-`</think>` content phase), watch
+        // for repetition loops. The aime2025-02 case at think_max=4k
+        // produces a ~50-token phrase that repeats verbatim until
+        // max_tokens — pure waste.
+        //
+        // Sweep several common loop periods. For each period P we check
+        // if the last P tokens equal the previous P tokens (one full
+        // repeat). One match is enough; the model has already burned 2P
+        // tokens at that point and isn't getting out. The minimum-3
+        // bar would catch tighter cycles but waits ~3P tokens to fire,
+        // which is wasteful for P ≥ 32. Periods are tuned to common
+        // failure modes: short loops (16-24) for "we have X, X, X"
+        // patterns, longer (48-64) for full-sentence restates like the
+        // aime02 case.
+        if (budget_close_started && close_inject_pos >= (int)budget_hook.close_token_ids.size())
+        {
+            // Sweep contiguous periods 12..80. Any P where the last P
+            // tokens equal the previous P tokens means a loop of that
+            // period. Stop early on first match. Fixed periods missed
+            // the aime02 case which loops with period ~50; dense sweep
+            // covers any period in this range.
+            auto end = out_tokens.end();
+            const int avail = (int)out_tokens.size();
+            for (int P = 12; P <= 80; P++) {
+                if (avail < 2 * P) break;  // larger P also won't have data
+                if (std::equal(end - 2*P, end - P, end - P)) {
+                    std::fprintf(stderr,
+                        "[degenerate-decode] post-close period=%d repeated — "
+                        "breaking AR loop at committed=%d, content_tokens=%zu\n",
+                        P, committed,
+                        out_tokens.size() - out_tokens_at_entry);
+                    if (degenerate_close_out) *degenerate_close_out = true;
+                    goto degenerate_break;
+                }
+            }
+        }
+        if (false) { degenerate_break: break; }
     }
+
+    auto t_dec1_ar = std::chrono::steady_clock::now();
+    const double ar_decode_s = std::chrono::duration<double>(t_dec1_ar - t_dec0_ar).count();
+    const int ar_tokens = (int)(out_tokens.size() - out_tokens_at_entry);
+    std::fprintf(stderr, "[ar-decode] tokens=%d time=%.3f s speed=%.2f tok/s\n",
+                 ar_tokens, ar_decode_s,
+                 ar_tokens > 0 && ar_decode_s > 0 ? ar_tokens / ar_decode_s : 0.0);
     return true;
 }
 
@@ -908,7 +1072,10 @@ bool Qwen35Backend::sync_remote_draft_features(int start_pos, int n_tokens) {
 bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io,
-                                    const std::vector<int32_t> * hint_tokens) {
+                                    const std::vector<int32_t> * hint_tokens,
+                                    const BudgetHook * budget_hook,
+                                    bool * forced_close_out,
+                                    bool * degenerate_close_out) {
     const int hidden = w_.n_embd;
 
     // First token: use the argmax that do_prefill already sampled and stored.
@@ -932,8 +1099,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     if (!can_spec) {
         // AR fallback consumes the final prefill position itself, then advances
-        // one token at a time.
-        bool ok = run_ar_decode_path(committed, n_gen, out_tokens, io);
+        // one token at a time. Pass the budget hook through so force-close
+        // still fires when spec-decode is unavailable.
+        bool ok = do_ar_decode(committed, n_gen, out_tokens, io,
+                                budget_hook ? *budget_hook : BudgetHook{},
+                                forced_close_out, degenerate_close_out);
         io.emit(-1);
         return ok;
     }
@@ -964,6 +1134,48 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     while (n_generated < n_gen) {
         const int need_commit_budget = n_gen - n_generated;
+
+        // Budget tail-off: when remaining budget is within the spec-decode
+        // batch size of the force-close threshold, hand off to AR for the
+        // tail. AR handles the close-token override cleanly; spec-decode's
+        // verify-and-accept loop can't safely inject a token mid-batch
+        // without a KV-state rewrite.
+        //
+        // IMPORTANT: cache_.last_tok is set during do_prefill (line 701)
+        // and NEVER updated by the spec-decode commit loop — local
+        // `last_tok` here is the authoritative most-recently-committed
+        // token. Sync it into cache_.last_tok before handing off so AR's
+        // `first_tok = cache_.last_tok` seed is correct. Without this
+        // sync, AR would re-seed from the prefill's last argmax (stale
+        // by `n_generated` positions) and produce garbage continuation.
+        if (budget_hook && !budget_hook->close_token_ids.empty()) {
+            int hard = budget_hook->hard_limit_remaining;
+            // Tail when remaining <= hard + one spec-decode batch worth of
+            // headroom. Ensures the force-close fires within the AR tail
+            // rather than after a final spec-decode batch overshoots.
+            if (need_commit_budget <= hard + q_len) {
+                std::fprintf(stderr,
+                    "[budget-hook] spec-decode tail-off at committed=%d/%d "
+                    "(remaining=%d, hard_limit=%d, batch=%d) — switching to AR\n",
+                    committed, n_gen, need_commit_budget, hard, q_len);
+                step_graph_destroy(draft_sg);
+                cache_.last_tok = last_tok;  // sync spec-decode → AR seed
+                // Build a fresh hook keyed off this call's local n_gen
+                // (the remaining decode budget) so force-close fires once
+                // remaining <= hard_limit relative to AR's loop counter,
+                // not relative to the global decode budget. Without this
+                // remap force-close would either fire on every iter
+                // (negative remaining_for_hook) or never (positive but
+                // misscaled).
+                BudgetHook tail_hook = *budget_hook;
+                int ar_n_gen = need_commit_budget;
+                bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
+                                        tail_hook, forced_close_out,
+                                        degenerate_close_out);
+                io.emit(-1);
+                return ok;
+            }
+        }
 
         // 1. Build noise input for draft
         noise_ids[0] = last_tok;

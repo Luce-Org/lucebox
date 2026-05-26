@@ -1,0 +1,23 @@
+{
+  "name": "Gemma 4 31B IT",
+  "source": "https://huggingface.co/google/gemma-4-31B-it",
+  "verified_at": "2026-05-24",
+  "download_urls": {
+    "Q4_K_M-target": "https://huggingface.co/bartowski/google_gemma-4-31B-it-GGUF/resolve/main/google_gemma-4-31B-it-Q4_K_M.gguf",
+    "Q5_K_M-target": "https://huggingface.co/bartowski/google_gemma-4-31B-it-GGUF/resolve/main/google_gemma-4-31B-it-Q5_K_M.gguf",
+    "Q8_0-target":   "https://huggingface.co/bartowski/google_gemma-4-31B-it-GGUF/resolve/main/google_gemma-4-31B-it-Q8_0.gguf",
+    "DFlash-draft":  "https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF/resolve/main/gemma-4-31B-it-DFlash-q8_0.gguf"
+  },
+  "notes": "Gemma 4 31B IT — multimodal dense (30.7B params). Reasoning-capable via `<|think|>` token (or `enable_thinking=True` chat template kwarg). Native 256K context. Target GGUFs are community quantizations by bartowski; the DFlash drafter is published by Lucebox.",
+  "max_tokens": 16384,
+  "hard_limit_reply_budget": 4096,
+  "thinking_terminator_hint": "<channel|>\n\n",
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 64,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0
+  }
+}

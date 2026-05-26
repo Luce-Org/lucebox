@@ -1,0 +1,929 @@
+openapi: 3.1.0
+
+info:
+  title: dflash_server /props endpoint
+  version: "2"
+  summary: Capability and configuration introspection for dflash_server.
+  description: |
+    `GET /props` returns enough JSON for a dashboard, a deployment
+    healthcheck, or a client SDK to know what this server can do
+    and how it's configured. See `docs/specs/props-endpoint.md`
+    for the human-readable spec, including schema-versioning rules.
+
+    The integer reported as `server.props_schema` (and as the
+    trailing token of `build_info`) bumps when the response shape
+    changes in a backward-incompatible way. The current schema is
+    `2`.
+
+    Schema `2` (breaking change vs. `1`): `model_card` is now the
+    wholesale on-disk sidecar JSON (or `null` when family / hard
+    fallback was used), validating against
+    `share/model_cards/_schema.json`. The runtime-resolved budget
+    knobs (`default_max_tokens`, `hard_limit_reply_budget`,
+    `think_max_tokens`, `effort_tiers`) moved out of `model_card`
+    into a new top-level `budget_envelope` section, alongside a
+    `model_card_source` lookup-hit label.
+  contact:
+    name: lucebox-hub
+    url: https://github.com/easel/lucebox-hub
+
+# The numeric value matches `server.props_schema` and the
+# `props_schema=<n>` token in `build_info`. Bumps on breaking
+# response-shape changes; additive changes keep the same value.
+x-props-schema: 2
+
+servers:
+  - url: http://localhost:8080
+    description: Default dflash_server bind.
+
+paths:
+  /props:
+    get:
+      operationId: getProps
+      summary: Server configuration and capability snapshot.
+      description: |
+        Returns a JSON document describing the server's HTTP
+        endpoints, loaded model, model-card-derived budgets,
+        reasoning / speculative / tools capabilities, sampler
+        capability flags, prefix-cache state, full-cache state,
+        tool-replay state, and PFlash configuration. Never blocks
+        on the worker thread; the response is a snapshot of
+        atomic counters and config state.
+      tags:
+        - introspection
+      responses:
+        "200":
+          description: Capability / configuration snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PropsResponse"
+              examples:
+                qwen36_27b_dflash:
+                  summary: Qwen3.6-27B with DDTree speculative decode enabled.
+                  value:
+                    api:
+                      endpoints:
+                        - "GET /health"
+                        - "GET /props"
+                        - "GET /v1/models"
+                        - "POST /v1/chat/completions"
+                        - "POST /v1/messages"
+                        - "POST /v1/messages/count_tokens"
+                        - "POST /v1/responses"
+                    budget_envelope:
+                      model_card_source: "share/model_cards/qwen3.6-27b.json"
+                      default_max_tokens: 32768
+                      hard_limit_reply_budget: 512
+                      think_max_tokens: 32256
+                      effort_tiers:
+                        low: 4032
+                        medium: 16128
+                        high: 32256
+                        x-high: 56832
+                        max: 81408
+                    build_info: "luce-dflash v0.0.0+cpp props_schema=2"
+                    capabilities:
+                      reasoning_supported: true
+                      speculative_supported: true
+                      tools_supported: true
+                    daemon:
+                      alive: true
+                    default_generation_settings:
+                      min_p: 0.0
+                      n_ctx: 98304
+                      repeat_penalty: 1.0
+                      temperature: 0.0
+                      top_k: 0
+                      top_p: 1.0
+                    full_cache:
+                      capacity: 0
+                      disk_bytes: 0
+                      enabled: false
+                      in_use: 0
+                      lifetime_hits: 0
+                    model:
+                      arch: "qwen35"
+                      draft_path: "/.../dflash-draft-3.6-q8_0.gguf"
+                      tokenizer_id: null
+                    model_alias: "dflash"
+                    model_card:
+                      name: "Qwen3.6 27B"
+                      source: "https://huggingface.co/Qwen/Qwen3.6-27B"
+                      verified_at: "2026-05-23"
+                      max_tokens: 32768
+                      complex_problem_max_tokens: 81920
+                      sampling:
+                        temperature: 1.0
+                        top_p: 0.95
+                        top_k: 20
+                        min_p: 0.0
+                        presence_penalty: 0.0
+                        repetition_penalty: 1.0
+                      reasoning_effort_tiers:
+                        low: 4032
+                        medium: 16128
+                        high: 32256
+                        x-high: 56832
+                        max: 81408
+                    model_path: "/.../Qwen3.6-27B-Q4_K_M.gguf"
+                    pflash:
+                      bsa_alpha: null
+                      bsa_enabled: null
+                      drafter_gguf: null
+                      enabled: false
+                      keep_ratio: null
+                      lm_head_fix: null
+                      mode: "off"
+                      skip_park: null
+                      threshold: null
+                    prefix_cache:
+                      capacity: 0
+                      in_use: 0
+                      lifetime_hits: 0
+                    reasoning:
+                      default: null
+                      supported: true
+                      supported_efforts:
+                        - "low"
+                        - "medium"
+                        - "high"
+                        - "x-high"
+                        - "max"
+                    runtime:
+                      backend: "cuda"
+                      fa_window: 2048
+                      kv_cache_k: "q4_0"
+                      kv_cache_v: "q4_0"
+                      lazy_draft: false
+                      target_sharding: false
+                      chunk: 512
+                      target_device: "auto:0"
+                      draft_device: "auto:0"
+                    sampling:
+                      capabilities:
+                        supports_frequency_penalty: true
+                        supports_seed: true
+                        supports_temperature: true
+                        supports_top_k: true
+                        supports_top_p: true
+                    server:
+                      name: "luce-dflash"
+                      props_schema: 2
+                      version: "0.0.0+cpp"
+                    speculative:
+                      enabled: true
+                      ddtree_budget: 22
+                    speculative_mode: "dflash"
+                    tool_replay:
+                      current_bytes: 0
+                      current_entries: 0
+                      max_bytes: 67108864
+                      max_entries: 50000
+
+components:
+  schemas:
+
+    PropsResponse:
+      description: Top-level /props body. All fields are required.
+      type: object
+      required:
+        - api
+        - budget_envelope
+        - build_info
+        - capabilities
+        - daemon
+        - default_generation_settings
+        - full_cache
+        - model
+        - model_alias
+        - model_card
+        - model_path
+        - pflash
+        - prefix_cache
+        - reasoning
+        - runtime
+        - sampling
+        - server
+        - speculative
+        - speculative_mode
+        - tool_replay
+      additionalProperties: true
+      properties:
+        api:
+          $ref: "#/components/schemas/Api"
+        budget_envelope:
+          $ref: "#/components/schemas/BudgetEnvelope"
+        build_info:
+          type: string
+          description: |
+            Single-string identity: `<server_name> v<version>
+            props_schema=<n>`. Matches the structured `server`
+            object. Bumps `props_schema` on breaking changes.
+          example: "luce-dflash v0.0.0+cpp props_schema=2"
+        capabilities:
+          $ref: "#/components/schemas/Capabilities"
+        daemon:
+          $ref: "#/components/schemas/Daemon"
+        default_generation_settings:
+          $ref: "#/components/schemas/DefaultGenerationSettings"
+        full_cache:
+          $ref: "#/components/schemas/FullCache"
+        model:
+          $ref: "#/components/schemas/Model"
+        model_alias:
+          type: string
+          description: |
+            The value clients should pass as the `model` field in
+            chat/responses requests. Defaults to `"dflash"`;
+            overridable with `--model-name`.
+          example: "dflash"
+        model_card:
+          oneOf:
+            - $ref: "#/components/schemas/ModelCard"
+            - type: "null"
+          description: |
+            Wholesale on-disk sidecar JSON when a sidecar matched
+            the loaded GGUF, or `null` when the server fell through
+            to a per-family or hard fallback (in which case the
+            resolved budget knobs still appear under
+            `budget_envelope`).
+        model_path:
+          type: string
+          description: Absolute filesystem path of the loaded target GGUF.
+          example: "/.../Qwen3.6-27B-Q4_K_M.gguf"
+        pflash:
+          $ref: "#/components/schemas/Pflash"
+        prefix_cache:
+          $ref: "#/components/schemas/PrefixCache"
+        reasoning:
+          $ref: "#/components/schemas/Reasoning"
+        runtime:
+          $ref: "#/components/schemas/Runtime"
+        sampling:
+          $ref: "#/components/schemas/Sampling"
+        server:
+          $ref: "#/components/schemas/Server"
+        speculative:
+          $ref: "#/components/schemas/Speculative"
+        speculative_mode:
+          type: string
+          description: |
+            Which speculative-decode path is currently active.
+            Derived: `"pflash"` when pflash is enabled,
+            `"dflash"` when DDTree is enabled, else `"off"`.
+          enum: ["off", "dflash", "pflash"]
+          example: "dflash"
+        tool_replay:
+          $ref: "#/components/schemas/ToolReplay"
+
+    Api:
+      description: HTTP endpoint registry.
+      type: object
+      required: [endpoints]
+      properties:
+        endpoints:
+          type: array
+          description: |
+            Method-and-path strings for every route the server
+            actually handles. Unordered. New endpoints appear here
+            without bumping props_schema (additive change).
+          items:
+            type: string
+          example:
+            - "GET /health"
+            - "GET /props"
+            - "GET /v1/models"
+            - "POST /v1/chat/completions"
+            - "POST /v1/messages"
+            - "POST /v1/messages/count_tokens"
+            - "POST /v1/responses"
+
+    Capabilities:
+      description: |
+        Coarse-grained boolean feature flags. Each corresponds to a
+        major client capability gated on the loaded model arch.
+      type: object
+      required:
+        - reasoning_supported
+        - speculative_supported
+        - tools_supported
+      properties:
+        reasoning_supported:
+          type: boolean
+          description: |
+            Server accepts `thinking:{type:"enabled"}` and
+            `reasoning:{effort:...}` request fields. If false,
+            those fields are silently ignored.
+          example: true
+        speculative_supported:
+          type: boolean
+          description: DDTree speculative decode is wired up for the loaded backend.
+          example: true
+        tools_supported:
+          type: boolean
+          description: |
+            Server accepts `tools` and `tool_choice` request
+            fields and emits `tool_calls` blocks.
+          example: true
+
+    Daemon:
+      description: Daemon-thread liveness flag.
+      type: object
+      required: [alive]
+      properties:
+        alive:
+          type: boolean
+          description: |
+            True when the model backend is loaded and ready.
+            Healthchecks should treat false as a failure even
+            when HTTP returns 200.
+          example: true
+
+    DefaultGenerationSettings:
+      description: |
+        Server-wide sampler defaults applied when a request omits
+        the corresponding field. Uses llama.cpp wire conventions
+        (`repeat_penalty`, not `repetition_penalty`). Does NOT
+        reflect the loaded model card's `sampling` block — those
+        are applied at request-parse time.
+      type: object
+      required:
+        - min_p
+        - n_ctx
+        - repeat_penalty
+        - temperature
+        - top_k
+        - top_p
+      properties:
+        min_p:
+          type: number
+          format: double
+          minimum: 0.0
+          maximum: 1.0
+          description: Sampler min-p threshold.
+          example: 0.0
+        n_ctx:
+          type: integer
+          minimum: 1
+          description: Maximum prompt+output context length (`--max-ctx`).
+          example: 98304
+        repeat_penalty:
+          type: number
+          format: double
+          description: llama.cpp-style repetition penalty.
+          example: 1.0
+        temperature:
+          type: number
+          format: double
+          minimum: 0.0
+          description: Sampler temperature default.
+          example: 0.0
+        top_k:
+          type: integer
+          minimum: 0
+          description: Sampler top-k cutoff. 0 = disabled.
+          example: 0
+        top_p:
+          type: number
+          format: double
+          minimum: 0.0
+          maximum: 1.0
+          description: Sampler top-p cutoff.
+          example: 1.0
+
+    FullCache:
+      description: |
+        Full-prompt (disk-backed) cache state. Atomic-snapshot
+        counters; per-field tear-free but the set is not
+        internally consistent. Not safe for control flow.
+      type: object
+      required:
+        - capacity
+        - disk_bytes
+        - enabled
+        - in_use
+        - lifetime_hits
+      properties:
+        capacity:
+          type: integer
+          minimum: 0
+          description: Configured slot capacity. 0 when disabled.
+          example: 0
+        disk_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Bytes currently used on disk.
+          example: 0
+        enabled:
+          type: boolean
+          description: True when the disk-backed cache is configured.
+          example: false
+        in_use:
+          type: integer
+          minimum: 0
+          description: Slots currently occupied.
+          example: 0
+        lifetime_hits:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Cumulative hit count since server start.
+          example: 0
+
+    Model:
+      description: Loaded model metadata.
+      type: object
+      required:
+        - arch
+        - draft_path
+        - tokenizer_id
+      properties:
+        arch:
+          type: string
+          description: |
+            Normalized `general.architecture` value from the loaded
+            GGUF (e.g. `qwen35`, `qwen36`, `gemma4`, `laguna`).
+          example: "qwen35"
+        draft_path:
+          type: ["string", "null"]
+          description: |
+            Filesystem path of the loaded speculative-decode draft
+            GGUF; `null` when no draft is loaded.
+          example: "/.../dflash-draft-3.6-q8_0.gguf"
+        tokenizer_id:
+          type: ["string", "null"]
+          description: |
+            Best-effort tokenizer family hint from GGUF metadata
+            (e.g. `qwen3`). `null` when unknown.
+          example: null
+
+    ModelCard:
+      description: |
+        Wholesale on-disk model-card sidecar JSON. Validates 1:1
+        against `share/model_cards/_schema.json` — the same shape
+        the sidecar author wrote in `share/model_cards/<name>.json`.
+
+        Note: the `source` field here is the **upstream model-card
+        URL** (e.g. the HuggingFace card the sidecar was
+        transcribed from), NOT a filepath. The lookup-hit label
+        (which sidecar / family / hard-fallback the server matched
+        on) lives at `budget_envelope.model_card_source`.
+
+        See `docs/specs/model-cards.md` for the sidecar format and
+        resolution order, and `docs/specs/props-endpoint.md` §4.10
+        for how this section is wired up at /props.
+      type: object
+      additionalProperties: false
+      required: [name, source, verified_at, max_tokens]
+      properties:
+        name:
+          type: string
+          description: Display name (informational).
+          example: "Qwen3.6 27B"
+        source:
+          type: string
+          format: uri
+          description: URL of the upstream model card the values were transcribed from.
+          example: "https://huggingface.co/Qwen/Qwen3.6-27B"
+        verified_at:
+          type: string
+          format: date
+          description: ISO 8601 date the values were last checked against the source.
+          example: "2026-05-23"
+        max_tokens:
+          type: integer
+          minimum: 1
+          description: |
+            Card's standard recommended combined cap. Drives
+            `budget_envelope.default_max_tokens` when no CLI
+            override is set.
+          example: 32768
+        complex_problem_max_tokens:
+          type: integer
+          minimum: 1
+          description: |
+            Card's recommendation for hard reasoning /
+            benchmark workloads. Drives `x-high` and `max`
+            effort tiers in `budget_envelope.effort_tiers`.
+          example: 81920
+        sampling:
+          type: object
+          additionalProperties: false
+          description: Recommended sampler defaults from the card.
+          properties:
+            temperature:        { type: number }
+            top_p:              { type: number }
+            top_k:              { type: integer }
+            min_p:              { type: number }
+            presence_penalty:   { type: number }
+            repetition_penalty: { type: number }
+        reasoning_effort_tiers:
+          type: object
+          additionalProperties: false
+          description: |
+            Card-authored phase-1 budgets per
+            `reasoning.effort` tier. May differ from
+            `budget_envelope.effort_tiers` because the latter is
+            clamped to `max_ctx - hard_limit_reply_budget` at
+            startup.
+          properties:
+            low:    { type: integer, minimum: 1 }
+            medium: { type: integer, minimum: 1 }
+            high:   { type: integer, minimum: 1 }
+            x-high: { type: integer, minimum: 1 }
+            max:    { type: integer, minimum: 1 }
+        download_urls:
+          type: object
+          description: Optional map of variant tag (e.g. `Q4_K_M`, `bf16`) to GGUF download URL.
+          additionalProperties:
+            type: string
+            format: uri
+        notes:
+          type: string
+          description: Free-form provenance / caveats.
+
+    BudgetEnvelope:
+      description: |
+        Runtime-resolved budget knobs driving the thinking-budget
+        envelope. Always present, regardless of whether a sidecar
+        loaded. May differ from the authored `model_card` values
+        because of CLI overrides and `max_ctx`-based tier clamping
+        (spec §3.5). See props-endpoint.md §4.2.
+      type: object
+      required:
+        - default_max_tokens
+        - effort_tiers
+        - hard_limit_reply_budget
+        - model_card_source
+        - think_max_tokens
+      properties:
+        model_card_source:
+          type: string
+          description: |
+            Lookup-hit label identifying where the resolved values
+            came from: one of `share/model_cards/<file>.json`,
+            `family:<arch>`, or `hard-fallback`. Always present;
+            matches the startup-banner value.
+          example: "share/model_cards/qwen3.6-27b.json"
+        default_max_tokens:
+          type: integer
+          minimum: 1
+          description: |
+            Effective combined cap (reasoning + reply) applied when
+            a request omits `max_tokens`. May diverge from
+            `model_card.max_tokens` if the operator passed
+            `--max-tokens` / `--default-max-tokens`.
+          example: 32768
+        hard_limit_reply_budget:
+          type: integer
+          minimum: 0
+          description: Effective reply-reserve ceiling in tokens.
+          example: 512
+        think_max_tokens:
+          type: integer
+          minimum: 0
+          description: |
+            Effective phase-1 (reasoning) ceiling. Derived as
+            `default_max_tokens - hard_limit_reply_budget` unless
+            `--think-max-tokens` overrides.
+          example: 32256
+        effort_tiers:
+          $ref: "#/components/schemas/EffortTiers"
+
+    EffortTiers:
+      description: |
+        Per-`reasoning.effort` phase-1 budgets. Five fields
+        (`low`, `medium`, `high`, `x-high`, `max`), monotone
+        non-decreasing, each clamped to `max_ctx -
+        hard_limit_reply_budget` at startup. Surfaced under
+        `budget_envelope.effort_tiers`.
+      type: object
+      required: [low, medium, high, x-high, max]
+      properties:
+        low:
+          type: integer
+          minimum: 0
+          example: 4032
+        medium:
+          type: integer
+          minimum: 0
+          example: 16128
+        high:
+          type: integer
+          minimum: 0
+          example: 32256
+        x-high:
+          type: integer
+          minimum: 0
+          example: 56832
+        max:
+          type: integer
+          minimum: 0
+          example: 81408
+
+    Pflash:
+      description: |
+        PFlash (speculative prefill compression) state. When
+        `enabled = false` and/or `mode = "off"`, all other
+        configuration fields are `null`.
+      type: object
+      required:
+        - bsa_alpha
+        - bsa_enabled
+        - drafter_gguf
+        - enabled
+        - keep_ratio
+        - lm_head_fix
+        - mode
+        - skip_park
+        - threshold
+      properties:
+        bsa_alpha:
+          type: ["number", "null"]
+          format: double
+          description: BSA alpha tunable (env `DFLASH_FP_ALPHA`).
+          example: null
+        bsa_enabled:
+          type: ["boolean", "null"]
+          description: BSA toggle (env `DFLASH_FP_USE_BSA`).
+          example: null
+        drafter_gguf:
+          type: ["string", "null"]
+          description: Path to the compression drafter GGUF.
+          example: null
+        enabled:
+          type: boolean
+          description: True when `mode != "off"`.
+          example: false
+        keep_ratio:
+          type: ["number", "null"]
+          format: float
+          description: Fraction of tokens retained after compression.
+          example: null
+        lm_head_fix:
+          type: ["boolean", "null"]
+          description: Backend-specific lm_head_fix tunable (env `DFLASH27B_LM_HEAD_FIX`).
+          example: null
+        mode:
+          type: string
+          enum: ["off", "auto", "always"]
+          description: Activation mode for PFlash.
+          example: "off"
+        skip_park:
+          type: ["boolean", "null"]
+          description: Whether to skip park/unpark (large-VRAM GPUs).
+          example: null
+        threshold:
+          type: ["integer", "null"]
+          minimum: 0
+          description: Token-count threshold for AUTO mode.
+          example: null
+
+    PrefixCache:
+      description: |
+        Inline prefix cache (system-prompt KV reuse). Atomic
+        non-strict snapshot; `capacity = 0` means the cache is
+        disabled.
+      type: object
+      required: [capacity, in_use, lifetime_hits]
+      properties:
+        capacity:
+          type: integer
+          minimum: 0
+          description: Configured slot count.
+          example: 0
+        in_use:
+          type: integer
+          minimum: 0
+          description: Slots currently occupied.
+          example: 0
+        lifetime_hits:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Cumulative hit count since server start.
+          example: 0
+
+    Reasoning:
+      description: |
+        Reasoning / thinking-budget capability. See
+        docs/specs/thinking-budget.md §4 for per-tier semantics.
+      type: object
+      required:
+        - default
+        - supported
+        - supported_efforts
+      properties:
+        default:
+          type: ["string", "null"]
+          enum: [null, "low", "medium", "high", "x-high", "max"]
+          description: |
+            Effort tier the server applies when a request enables
+            thinking without specifying `effort`. `null` means
+            no default.
+          example: null
+        supported:
+          type: boolean
+          description: |
+            Server accepts `reasoning.effort` and
+            `thinking:{type:"enabled"}` request fields.
+          example: true
+        supported_efforts:
+          type: array
+          description: |
+            Effort tier values the server will recognize.
+            dflash_server lists all five; other servers may
+            list a subset.
+          items:
+            type: string
+            enum: ["low", "medium", "high", "x-high", "max"]
+          example: ["low", "medium", "high", "x-high", "max"]
+
+    Runtime:
+      description: |
+        Runtime knobs resolved at startup (compute backend, KV
+        cache dtypes, FA window, sharding, prefill chunk, device
+        placement). New fields appear here without bumping
+        props_schema.
+      type: object
+      required:
+        - backend
+        - fa_window
+        - kv_cache_k
+        - kv_cache_v
+        - lazy_draft
+        - target_sharding
+        - chunk
+        - target_device
+        - draft_device
+      properties:
+        backend:
+          type: string
+          enum: ["cuda", "hip", "cpu"]
+          description: Active compute backend.
+          example: "cuda"
+        fa_window:
+          type: integer
+          minimum: 0
+          description: Sliding-window attention window in tokens.
+          example: 2048
+        kv_cache_k:
+          type: string
+          description: |
+            Effective KV cache K-tensor dtype (`q4_0`, `tq3_0`,
+            `f16`, ...). Empty when not resolved.
+          example: "q4_0"
+        kv_cache_v:
+          type: string
+          description: Effective KV cache V-tensor dtype.
+          example: "q4_0"
+        lazy_draft:
+          type: boolean
+          description: True when the decode draft is parked when idle.
+          example: false
+        target_sharding:
+          type: boolean
+          description: True when the target model is sharded across multiple GPUs.
+          example: false
+        chunk:
+          type: integer
+          minimum: 0
+          description: |
+            Prefill chunk size in tokens (`bargs.chunk`). Determines
+            how prompt tokens are batched into the target model
+            during prefill. Captured so bench/snapshot tooling has
+            a full record of the chunk size used.
+          example: 512
+        target_device:
+          type: string
+          description: |
+            Resolved target-model device placement (e.g. `"auto:0"`,
+            `"cuda:0"`). Empty string when no resolution was made.
+          example: "auto:0"
+        draft_device:
+          type:
+            - string
+            - "null"
+          description: |
+            Resolved draft-model device placement, or `null` when no
+            draft model is loaded.
+          example: "auto:0"
+
+    Sampling:
+      description: |
+        Sampler capability advertisement. Currently only nests
+        `capabilities`; future revisions may add a `defaults`
+        object alongside.
+      type: object
+      required: [capabilities]
+      properties:
+        capabilities:
+          $ref: "#/components/schemas/SamplingCapabilities"
+
+    SamplingCapabilities:
+      description: |
+        Which sampler request fields the server honors. A false
+        value means the field is silently ignored.
+      type: object
+      required:
+        - supports_frequency_penalty
+        - supports_seed
+        - supports_temperature
+        - supports_top_k
+        - supports_top_p
+      properties:
+        supports_frequency_penalty:
+          type: boolean
+          example: true
+        supports_seed:
+          type: boolean
+          example: true
+        supports_temperature:
+          type: boolean
+          example: true
+        supports_top_k:
+          type: boolean
+          example: true
+        supports_top_p:
+          type: boolean
+          example: true
+
+    Server:
+      description: |
+        Structured server identity. The `props_schema` integer
+        also appears in `build_info`. Bumps on breaking changes.
+      type: object
+      required: [name, props_schema, version]
+      properties:
+        name:
+          type: string
+          description: Server identity string.
+          example: "luce-dflash"
+        props_schema:
+          type: integer
+          minimum: 1
+          description: |
+            Integer schema version. Bumps when the response shape
+            changes in a backward-incompatible way (see §5 of
+            props-endpoint.md). Current value is `2`.
+          example: 2
+        version:
+          type: string
+          description: Build version string (semver + build tag).
+          example: "0.0.0+cpp"
+
+    Speculative:
+      description: |
+        DDTree speculative-decode runtime state. Always emitted;
+        `ddtree_budget` is `null` when `enabled` is false.
+      type: object
+      required: [enabled, ddtree_budget]
+      properties:
+        enabled:
+          type: boolean
+          description: |
+            True when DDTree speculative-decode is active for
+            this server.
+          example: true
+        ddtree_budget:
+          type: ["integer", "null"]
+          minimum: 0
+          description: Current DDTree budget (`--ddtree-budget`).
+          example: 22
+
+    ToolReplay:
+      description: |
+        In-memory tool-call replay cache state. Same atomic /
+        non-strict-snapshot semantics as the other cache
+        sections.
+      type: object
+      required:
+        - current_bytes
+        - current_entries
+        - max_bytes
+        - max_entries
+      properties:
+        current_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Bytes currently occupied.
+          example: 0
+        current_entries:
+          type: integer
+          minimum: 0
+          description: Entries currently cached.
+          example: 0
+        max_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Configured byte budget.
+          example: 67108864
+        max_entries:
+          type: integer
+          minimum: 0
+          description: Configured entry budget.
+          example: 50000

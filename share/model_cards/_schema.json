@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/lucebox/lucebox-hub/blob/main/share/model_cards/_schema.json",
+  "title": "dflash model card sidecar",
+  "description": "Sidecar JSON carrying per-model defaults transcribed from the upstream model card. Read by dflash_server at startup to set --default-max-tokens, --think-max-tokens, sampler, and reasoning.effort tier values. See docs/specs/thinking-budget.md §3.3 for the full field reference.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "source", "verified_at", "max_tokens"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Display name. Informational; the filename is what matters for lookup."
+    },
+    "source": {
+      "type": "string",
+      "format": "uri",
+      "description": "URL of the upstream model card we transcribed."
+    },
+    "verified_at": {
+      "type": "string",
+      "format": "date",
+      "description": "ISO 8601 date (YYYY-MM-DD) the values were last checked against the source."
+    },
+    "max_tokens": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The card's standard recommended combined cap. Drives default_max_tokens."
+    },
+    "download_urls": {
+      "type": "object",
+      "description": "Optional. Map of variant tag (e.g. Q4_K_M, bf16) to GGUF download URL. Used by deployment tooling to resolve a sidecar to a concrete artifact.",
+      "additionalProperties": {
+        "type": "string",
+        "format": "uri"
+      }
+    },
+    "complex_problem_max_tokens": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Optional. Card's recommendation for hard reasoning / benchmark workloads. Drives x-high and max effort tiers."
+    },
+    "hard_limit_reply_budget": {
+      "type": "integer",
+      "minimum": 256,
+      "description": "Optional. Tokens reserved post-`</think>` for the visible answer phase. When `(n_gen - generated) <= hard_limit_reply_budget` during decode, the engine injects `thinking_terminator_hint` (or the bare `thinking_marker` if no hint is set). Default 4096 (raised from 512 on 2026-05-25 — the original was sized for DeepSeek-V4-flash's terse style but silently truncated almost every other model mid-answer). Terse models can override down to 512-1024; verbose math/code models keep 4096. Drives both `think_max_tokens = max_tokens - hard_limit_reply_budget` and the force-close trigger in do_ar_decode."
+    },
+    "thinking_marker": {
+      "type": "string",
+      "description": "Optional. Bytes that signal end-of-thinking to PARSERS — bench grader, chat template, response formatter, started_in_thinking detect. If empty, the server uses arch defaults (`</think>` for qwen3-family, `<channel|>` for gemma4, `</think>` elsewhere). Sidecar override exists for arches we haven't enumerated yet; for current arches leave empty."
+    },
+    "thinking_terminator_hint": {
+      "type": "string",
+      "description": "Optional. Trained directive injected mid-stream when the budget hook fires. Tells the MODEL to wrap up. Tokenized at startup; the AR decode loop overrides sampled tokens with this sequence verbatim when `(n_gen - generated) <= hard_limit_reply_budget`. The server does NOT auto-append the marker — if the operator wants the close marker in the inject, they include it in the hint. This lets callers test whether a hint alone induces self-close (model emits marker itself) vs a full directive+marker (we force the close). For Qwen3.x the canonical hint per the Qwen3 technical report (arXiv 2505.09388) DOES include the marker: 'Considering the limited time by the user, I have to give the solution based on the thinking directly now.\\n</think>\\n\\n'. If empty, the server emits the bare `thinking_marker` only — safe but the model may continue derivation in content space."
+    },
+    "sampling": {
+      "type": "object",
+      "description": "Optional. Recommended sampler defaults; used when the request omits a field.",
+      "additionalProperties": false,
+      "properties": {
+        "temperature":        { "type": "number" },
+        "top_p":              { "type": "number" },
+        "top_k":              { "type": "integer" },
+        "min_p":              { "type": "number" },
+        "presence_penalty":   { "type": "number" },
+        "repetition_penalty": { "type": "number" }
+      }
+    },
+    "reasoning_effort_tiers": {
+      "type": "object",
+      "description": "Optional. Explicit per-tier phase-1 budgets. Overrides any computed default. Use when ratio-based defaults don't fit the model.",
+      "additionalProperties": false,
+      "properties": {
+        "low":    { "type": "integer", "minimum": 1 },
+        "medium": { "type": "integer", "minimum": 1 },
+        "high":   { "type": "integer", "minimum": 1 },
+        "x-high": { "type": "integer", "minimum": 1 },
+        "max":    { "type": "integer", "minimum": 1 }
+      }
+    },
+    "notes": {
+      "type": "string",
+      "description": "Optional. Free-form notes about provenance, caveats, or non-card-derived choices."
+    }
+  }
+}

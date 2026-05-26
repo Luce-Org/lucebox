@@ -1,0 +1,19 @@
+{
+  "name": "Laguna-XS.2",
+  "source": "https://huggingface.co/Lucebox/Laguna-XS.2-GGUF",
+  "verified_at": "2026-05-24",
+  "download_urls": {
+    "Q4_K_M": "https://huggingface.co/Lucebox/Laguna-XS.2-GGUF/resolve/main/laguna-xs2-Q4_K_M.gguf",
+    "bf16":   "https://huggingface.co/Lucebox/Laguna-XS.2-GGUF/resolve/main/laguna-xs2-bf16.gguf"
+  },
+  "notes": "Non-reasoning MoE code model (3B active / 33B total). Card does not specify generation params or a complex-problem mode. context: native 4096, PFlash-extended to 131072. Sampling defaults below are code-model-typical (not from card). general.name has not been verified against a loaded GGUF — confirm and rename file if needed.",
+  "max_tokens": 4096,
+  "sampling": {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 50,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0
+  }
+}

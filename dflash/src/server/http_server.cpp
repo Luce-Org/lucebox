@@ -24,6 +24,35 @@
 
 namespace dflash::common {
 
+// ─── /props constants ───────────────────────────────────────────────────
+//
+// SERVER_NAME / SERVER_VERSION mirror the Python server's identity strings
+// so cross-server consumers (autotune, dashboards) see a stable
+// `build_info` shape. Bump PROPS_SCHEMA on breaking changes only:
+//   - field renamed
+//   - field removed
+//   - existing field's semantics change (units, nullability, type)
+// Do NOT bump for additive changes (new fields, new sections).
+//
+// Matches dflash/scripts/server.py:175 (PROPS_SCHEMA constant).
+static constexpr int  kPropsSchema  = 2;
+static constexpr char kServerName[] = "luce-dflash";
+#ifndef DFLASH_SERVER_VERSION
+#define DFLASH_SERVER_VERSION "0.0.0+cpp"
+#endif
+
+// API endpoint registry served by /props. Keep in sync with the route
+// handlers in handle_client() and route_request().
+static const std::vector<std::string> kApiEndpoints = {
+    "GET /health",
+    "GET /props",
+    "GET /v1/models",
+    "POST /v1/chat/completions",
+    "POST /v1/messages",
+    "POST /v1/messages/count_tokens",
+    "POST /v1/responses",
+};
+
 // ─── Utilities ──────────────────────────────────────────────────────────
 
 static std::string generate_id(const char * prefix) {
@@ -34,6 +63,9 @@ static std::string generate_id(const char * prefix) {
     return buf;
 }
 
+// Logging helpers shared by route_request() / worker_loop(). Kept static
+// (file-scope) so they don't leak into the public ABI; the chat lifecycle
+// logs that use them are part of #270's request-tracing instrumentation.
 static const char * api_format_name(ApiFormat format) {
     switch (format) {
     case ApiFormat::OPENAI_CHAT: return "chat";
@@ -45,6 +77,258 @@ static const char * api_format_name(ApiFormat format) {
 
 static size_t json_array_size(const json & value) {
     return value.is_array() ? value.size() : 0;
+}
+
+// Build the /props response body. Matches dflash/scripts/server.py:1221-1312
+// key-for-key so cross-server diffs stay clean. The Python version is the
+// reference impl; if a key drifts here, update it there too (or document the
+// intentional difference in docs/specs/thinking-budget.md).
+//
+// Non-static so unit tests can call it directly (declared in http_server.h).
+json build_props_body(const ServerConfig & config,
+                      const PrefixCache & prefix_cache,
+                      const ToolMemory & tool_memory) {
+    // arch-gated capabilities (mirrors Python _capabilities()).
+    const bool is_qwen = (config.arch.rfind("qwen", 0) == 0);
+    const bool reasoning_supported = is_qwen;
+    const bool speculative_supported = is_qwen;
+    const bool tools_supported = is_qwen;
+
+    auto pcs  = prefix_cache.stats();
+    auto pcfs = prefix_cache.full_stats();
+    auto tms  = tool_memory.stats();
+
+    const bool pflash_enabled =
+        (config.pflash_mode != ServerConfig::PflashMode::OFF);
+    // speculative_mode reports the *active* path, not arch capability. A
+    // Qwen-family model started without --ddtree has the capability but no
+    // active speculative decode, so it must report "off" — otherwise clients
+    // see `speculative_mode == "dflash"` paired with `speculative.enabled ==
+    // false` and the two contradict (codex review feedback on 8d6ff04).
+    std::string speculative_mode;
+    if (pflash_enabled)                    speculative_mode = "pflash";
+    else if (config.speculative_enabled)   speculative_mode = "dflash";
+    else                                   speculative_mode = "off";
+
+    // Spec §4.2: the five-tier vocabulary (low | medium | high | x-high | max)
+    // all activate the phase-1 envelope. Advertise the full set when the
+    // arch supports reasoning so clients can negotiate the higher tiers.
+    json reasoning_efforts = json::array();
+    if (reasoning_supported) {
+        reasoning_efforts.push_back("low");
+        reasoning_efforts.push_back("medium");
+        reasoning_efforts.push_back("high");
+        reasoning_efforts.push_back("x-high");
+        reasoning_efforts.push_back("max");
+    }
+
+    json server = {
+        {"name",         kServerName},
+        {"version",      DFLASH_SERVER_VERSION},
+        {"props_schema", kPropsSchema},
+    };
+
+    json pflash;
+    if (!pflash_enabled) {
+        pflash = {
+            {"enabled",      false},
+            {"mode",         "off"},
+            {"threshold",    nullptr},
+            {"keep_ratio",   nullptr},
+            {"drafter_gguf", nullptr},
+            {"skip_park",    nullptr},
+            {"bsa_enabled",  nullptr},
+            {"bsa_alpha",    nullptr},
+            {"lm_head_fix",  nullptr},
+        };
+    } else {
+        const char * bsa_env = std::getenv("DFLASH_FP_USE_BSA");
+        const char * alpha_env = std::getenv("DFLASH_FP_ALPHA");
+        const char * lmfix_env = std::getenv("DFLASH27B_LM_HEAD_FIX");
+        json bsa_alpha = nullptr;
+        if (alpha_env && *alpha_env) {
+            try { bsa_alpha = std::stod(alpha_env); }
+            catch (const std::exception &) { bsa_alpha = nullptr; }
+        }
+        std::string mode_str =
+            (config.pflash_mode == ServerConfig::PflashMode::AUTO)   ? "auto"   :
+            (config.pflash_mode == ServerConfig::PflashMode::ALWAYS) ? "always" : "off";
+        pflash = {
+            {"enabled",      true},
+            {"mode",         mode_str},
+            {"threshold",    config.pflash_threshold},
+            {"keep_ratio",   config.pflash_keep_ratio},
+            {"drafter_gguf", config.pflash_drafter_path.empty()
+                              ? json(nullptr)
+                              : json(config.pflash_drafter_path)},
+            {"skip_park",    config.pflash_skip_park},
+            {"bsa_enabled",  (bsa_env != nullptr && *bsa_env && std::strcmp(bsa_env, "0") != 0)},
+            {"bsa_alpha",    bsa_alpha},
+            {"lm_head_fix",  (lmfix_env != nullptr && *lmfix_env && std::strcmp(lmfix_env, "0") != 0)},
+        };
+    }
+
+    // Reflect actual sampler defaults the server applies when a request
+    // omits the field — these come from the loaded model card's sampling
+    // section (spec §3.3), not from a hard-coded greedy fallback. Clients
+    // that read /props to pick their sampling shape were getting greedy
+    // here regardless of what the model card said, which caused gemma4
+    // benchmarks to silently run at temp=0 (degenerate-decode collapse)
+    // when the model card specifies temp=1.0/top_p=0.95/top_k=64.
+    const auto & smp = config.sampler_defaults;
+    json body = {
+        {"default_generation_settings", {
+            {"n_ctx",          config.max_ctx},
+            {"temperature",    smp.has_temperature        ? smp.temperature        : 0.0f},
+            {"top_p",          smp.has_top_p              ? smp.top_p              : 1.0f},
+            {"top_k",          smp.has_top_k              ? smp.top_k              : 0},
+            {"min_p",          smp.has_min_p              ? smp.min_p              : 0.0f},
+            {"repeat_penalty", smp.has_repetition_penalty ? smp.repetition_penalty : 1.0f},
+        }},
+        {"model_alias", config.model_name},
+        {"model_path",  config.model_path},
+        {"build_info",  std::string(kServerName) + " v" DFLASH_SERVER_VERSION
+                        " props_schema=" + std::to_string(kPropsSchema)},
+        {"speculative_mode", speculative_mode},
+        {"server", server},
+        {"model", {
+            {"arch",         config.arch},
+            {"draft_path",   config.draft_path.empty() ? json(nullptr) : json(config.draft_path)},
+            {"tokenizer_id", config.tokenizer_id.empty() ? json(nullptr) : json(config.tokenizer_id)},
+        }},
+        {"runtime", {
+            {"backend",         config.runtime_backend.empty() ? "cuda" : config.runtime_backend},
+            {"fa_window",       config.fa_window},
+            {"kv_cache_k",      config.kv_cache_k},
+            {"kv_cache_v",      config.kv_cache_v},
+            {"lazy_draft",      config.lazy_draft},
+            {"target_sharding", config.target_sharding},
+            // Prefill chunk size (bargs.chunk). Surfaced so snapshot
+            // tooling captures the full config — bench consumers
+            // (dflash/scripts/bench_http_capability.py) read
+            // /props.runtime wholesale into result.json.server_info.
+            {"chunk",           config.chunk},
+            // Device placement strings (e.g. "auto:0", "cuda:0"). Empty
+            // string when no draft model is loaded.
+            {"target_device",   config.target_device},
+            {"draft_device",    config.draft_device.empty() ? json(nullptr) : json(config.draft_device)},
+        }},
+        {"reasoning", {
+            {"supported",         reasoning_supported},
+            {"default",           nullptr},
+            {"supported_efforts", reasoning_efforts},
+        }},
+        // `model_card`: 1:1 with the on-disk sidecar JSON when one was
+        // loaded; null when family fallback or hard fallback was used.
+        // Validates against share/model_cards/_schema.json. The `source`
+        // field here is the upstream model-card URL (authored in the
+        // sidecar) — NOT a filepath. See spec §4.9.
+        {"model_card", config.model_card_json.is_null()
+                           ? json(nullptr)
+                           : config.model_card_json},
+        // `budget_envelope`: runtime-resolved values driving the
+        // thinking-budget envelope. May differ from the authored card
+        // values because of CLI overrides and max_ctx-based tier clamping
+        // (spec §3.5). Always emitted regardless of model_card source.
+        // See spec §4.2.
+        {"budget_envelope", {
+            {"model_card_source",       config.model_card_source_label},
+            {"default_max_tokens",      config.default_max_tokens},
+            {"hard_limit_reply_budget", config.hard_limit_reply_budget},
+            {"think_max_tokens",        config.think_max_tokens},
+            {"effort_tiers", {
+                {"low",    config.effort_tiers.low},
+                {"medium", config.effort_tiers.medium},
+                {"high",   config.effort_tiers.high},
+                {"x-high", config.effort_tiers.x_high},
+                {"max",    config.effort_tiers.max},
+            }},
+        }},
+        {"speculative", {
+            {"enabled",       config.speculative_enabled},
+            {"ddtree_budget", config.speculative_enabled
+                                ? json(config.ddtree_budget) : json(nullptr)},
+        }},
+        {"sampling", {
+            {"capabilities", {
+                {"supports_temperature",        true},
+                {"supports_top_p",              true},
+                {"supports_top_k",              true},
+                {"supports_frequency_penalty",  true},
+                {"supports_seed",               true},
+            }},
+        }},
+        {"pflash", pflash},
+        {"prefix_cache", {
+            {"capacity",      pcs.capacity},
+            {"in_use",        pcs.in_use},
+            {"lifetime_hits", pcs.lifetime_hits},
+        }},
+        {"full_cache", {
+            {"enabled",       pcfs.enabled},
+            {"capacity",      pcfs.capacity},
+            {"in_use",        pcfs.in_use},
+            {"disk_bytes",    pcfs.disk_bytes},
+            {"lifetime_hits", pcfs.lifetime_hits},
+        }},
+        {"tool_replay", {
+            {"max_entries",     tms.max_entries},
+            {"max_bytes",       tms.max_bytes},
+            {"current_entries", tms.current_entries},
+            {"current_bytes",   tms.current_bytes},
+        }},
+        // The C++ daemon is linked in-process; if /props is responding,
+        // the daemon is alive by construction.
+        {"daemon", {{"alive", true}}},
+        {"api", {{"endpoints", kApiEndpoints}}},
+        // Capability flags surfaced for clients that don't want to crack
+        // open `reasoning` / `speculative` / etc. — matches the Python
+        // server's _capabilities() helper.
+        {"capabilities", {
+            {"reasoning_supported",   reasoning_supported},
+            {"speculative_supported", speculative_supported},
+            {"tools_supported",       tools_supported},
+        }},
+    };
+    return body;
+}
+
+// Normalize Anthropic's `system` field (top-level on /v1/messages and
+// /v1/messages/count_tokens) into a leading `{role:"system", content:...}`
+// entry on `messages`. Accepts either a flat string or an array of typed
+// blocks (`[{type:"text", text:"..."}]`), and strips any
+// `x-anthropic-billing-header:`-prefixed block injected by Claude Code so
+// it never reaches the model or the token counter.
+//
+// Side-effect: prepends a system message to `messages` when the body has
+// a non-empty `system` field after billing-header filtering. No-op
+// otherwise. Both endpoints call this with identical semantics — having
+// one helper guarantees token counting and generation can't drift.
+static void normalize_anthropic_system(const json & body, json & messages) {
+    if (!body.contains("system")) return;
+    json sys_content = body["system"];
+    if (sys_content.is_array()) {
+        json filtered = json::array();
+        for (const auto & block : sys_content) {
+            if (block.is_object() && block.value("type", "") == "text") {
+                std::string text = block.value("text", "");
+                if (text.rfind("x-anthropic-billing-header:", 0) == 0) {
+                    continue;  // skip Claude Code billing header block
+                }
+            }
+            filtered.push_back(block);
+        }
+        sys_content = std::move(filtered);
+    } else if (sys_content.is_string()) {
+        std::string s = sys_content.get<std::string>();
+        if (s.rfind("x-anthropic-billing-header:", 0) == 0) {
+            sys_content = "";
+        }
+    }
+    if (!sys_content.empty()) {
+        json sys_msg = {{"role", "system"}, {"content", sys_content}};
+        messages.insert(messages.begin(), sys_msg);
+    }
 }
 
 json parse_responses_arguments(const json & item) {
@@ -356,6 +640,15 @@ void HttpServer::handle_client(int fd) {
         return;
     }
 
+    // Introspection: server config + cache stats + arch + capabilities.
+    // Matches dflash/scripts/server.py:1221-1312 key-for-key.
+    if (hr.method == "GET" && hr.path == "/props") {
+        json body = build_props_body(config_, prefix_cache_, tool_memory_);
+        send_response(fd, 200, "application/json", body.dump() + "\n");
+        ::close(fd);
+        return;
+    }
+
     // Models endpoint.
     if (hr.method == "GET" && hr.path == "/v1/models") {
         // Codex sends ?client_version= — serve the Codex-specific schema.
@@ -366,9 +659,31 @@ void HttpServer::handle_client(int fd) {
                      {"display_name", config_.model_name},
                      {"description", "Local DFlash speculative-decoding server"},
                      {"default_reasoning_level", "low"},
+                     // Spec §4.2: every tier activates the phase-1 envelope;
+                     // the difference is the budget cap selected from the
+                     // model card's effort_tiers. Descriptions surface the
+                     // resolved cap so clients can pick a tier purposefully.
                      {"supported_reasoning_levels", json::array({
-                         {{"effort", "low"}, {"description", "No thinking"}},
-                         {{"effort", "medium"}, {"description", "Thinking enabled"}},
+                         {{"effort", "low"},
+                          {"description", "Phase-1 budget at the model card's low tier ("
+                                          + std::to_string(config_.effort_tiers.low)
+                                          + " tokens)"}},
+                         {{"effort", "medium"},
+                          {"description", "Phase-1 budget at the model card's medium tier ("
+                                          + std::to_string(config_.effort_tiers.medium)
+                                          + " tokens)"}},
+                         {{"effort", "high"},
+                          {"description", "Phase-1 budget at the model card's standard recommendation ("
+                                          + std::to_string(config_.effort_tiers.high)
+                                          + " tokens)"}},
+                         {{"effort", "x-high"},
+                          {"description", "Phase-1 budget between high and the complex-problem ceiling ("
+                                          + std::to_string(config_.effort_tiers.x_high)
+                                          + " tokens)"}},
+                         {{"effort", "max"},
+                          {"description", "Phase-1 budget at the model card's complex-problem ceiling ("
+                                          + std::to_string(config_.effort_tiers.max)
+                                          + " tokens)"}},
                      })},
                      {"shell_type", "shell_command"},
                      {"visibility", "list"},
@@ -421,27 +736,49 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         // Common fields.
         req.stream = body.value("stream", false);
         req.model = body.value("model", config_.model_name);
+        // Default when client omits all three: use --default-max-tokens
+        // (16000, matches ds4_eval.c). Codex review flagged that
+        // --default-max-tokens was previously a dead flag because the
+        // parser read config_.max_tokens (legacy 4096) instead. The new
+        // default protects thinking-budget requests that omit max_tokens
+        // from being capped at 4096 — thinking alone can consume that,
+        // leaving no headroom for the visible reply.
         req.max_output = body.value("max_tokens",
                          body.value("max_output_tokens",
-                         body.value("max_completion_tokens", config_.max_tokens)));
+                         body.value("max_completion_tokens", config_.default_max_tokens)));
+        // Spec §4.4: clamp request max_tokens to --default-max-tokens.
+        if (req.max_output > config_.default_max_tokens) {
+            std::fprintf(stderr,
+                "[server] max_tokens=%d clamped to default_max_tokens=%d\n",
+                req.max_output, config_.default_max_tokens);
+            req.max_output = config_.default_max_tokens;
+        }
 
-        // Sampler parameters.
-        req.sampler.temp = body.value("temperature", 0.0f);
-        req.sampler.top_p = body.value("top_p", 1.0f);
-        req.sampler.top_k = body.value("top_k", 0);
+        // Sampler parameters. When the request omits a value, fall back to
+        // the model card's sampling defaults (spec §3.3); when the card
+        // doesn't supply one either, use the hard-coded default.
+        const auto & sd = config_.sampler_defaults;
+        req.sampler.temp = body.value("temperature",
+                                      sd.has_temperature ? sd.temperature : 0.0f);
+        req.sampler.top_p = body.value("top_p",
+                                       sd.has_top_p ? sd.top_p : 1.0f);
+        req.sampler.top_k = body.value("top_k",
+                                       sd.has_top_k ? sd.top_k : 0);
         if (body.contains("seed")) {
             req.sampler.seed = body["seed"].get<uint64_t>();
         }
 
         // OpenAI-style additive penalties.
         req.sampler.freq_pen = body.value("frequency_penalty", 0.0f);
-        req.sampler.pres_pen = body.value("presence_penalty", 0.0f);
+        req.sampler.pres_pen = body.value("presence_penalty",
+                                          sd.has_presence_penalty ? sd.presence_penalty : 0.0f);
 
         // HuggingFace-style multiplicative repetition penalty (also used by
         // vLLM, llama.cpp, etc.). Accepts both "repetition_penalty" and
         // the shorter "rep_pen" for daemon compatibility.
         req.sampler.rep_pen = body.value("repetition_penalty",
-                              body.value("rep_pen", 1.0f));
+                              body.value("rep_pen",
+                                  sd.has_repetition_penalty ? sd.repetition_penalty : 1.0f));
         if (body.contains("rep_window")) {
             req.sampler.rep_window = body["rep_window"].get<int>();
         }
@@ -479,41 +816,25 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             }
         }
 
+        // count_tokens shares Anthropic's message parsing; flag so we
+        // short-circuit before enqueueing the generation job.
+        bool count_tokens_only = false;
+
         if (hr.path == "/v1/chat/completions") {
             req.format = ApiFormat::OPENAI_CHAT;
             req.response_id = generate_id("chatcmpl");
             req.messages = body["messages"];
+        } else if (hr.path == "/v1/messages/count_tokens") {
+            req.format = ApiFormat::ANTHROPIC;
+            req.response_id = generate_id("count");
+            req.messages = body.value("messages", json::array());
+            normalize_anthropic_system(body, req.messages);
+            count_tokens_only = true;
         } else if (hr.path == "/v1/messages") {
             req.format = ApiFormat::ANTHROPIC;
             req.response_id = generate_id("msg");
             req.messages = body["messages"];
-            if (body.contains("system")) {
-                // Anthropic puts system as a top-level field.
-                // Strip billing header blocks injected by Claude Code.
-                json sys_content = body["system"];
-                if (sys_content.is_array()) {
-                    json filtered = json::array();
-                    for (const auto & block : sys_content) {
-                        if (block.is_object() && block.value("type", "") == "text") {
-                            std::string text = block.value("text", "");
-                            if (text.rfind("x-anthropic-billing-header:", 0) == 0) {
-                                continue;  // skip billing header block
-                            }
-                        }
-                        filtered.push_back(block);
-                    }
-                    sys_content = std::move(filtered);
-                } else if (sys_content.is_string()) {
-                    std::string s = sys_content.get<std::string>();
-                    if (s.rfind("x-anthropic-billing-header:", 0) == 0) {
-                        sys_content = "";
-                    }
-                }
-                if (!sys_content.empty()) {
-                    json sys_msg = {{"role", "system"}, {"content", sys_content}};
-                    req.messages.insert(req.messages.begin(), sys_msg);
-                }
-            }
+            normalize_anthropic_system(body, req.messages);
         } else if (hr.path == "/v1/responses") {
             req.format = ApiFormat::RESPONSES;
             req.response_id = generate_id("resp");
@@ -543,21 +864,54 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         // DFlash acceptance rates; clients opt in explicitly).
         bool enable_thinking = false;
 
-        // OpenAI Responses API: "reasoning" field
+        // Track which fields the request explicitly set, so we can apply
+        // §4.3 combined precedence: thinking.budget_tokens beats
+        // reasoning.effort for the phase-1 cap, but the effort tier still
+        // selects defaults for any unspecified thinking.* field.
+        int  request_budget_tokens   = -1;  // from thinking.budget_tokens
+        int  request_reply_budget    = -1;  // from thinking.reply_budget
+        int  effort_phase1_cap       = -1;  // from reasoning.effort lookup
+        bool effort_set              = false;
+
+        // OpenAI Responses API: "reasoning" field. Spec §4.2.
         if (body.contains("reasoning")) {
             auto & r = body["reasoning"];
             if (r.contains("effort")) {
-                std::string effort = r.value("effort", "low");
-                enable_thinking = (effort != "low");
+                std::string effort = r.value("effort", "high");
+                // Five-tier vocabulary (spec §4.2). Unknown → high.
+                int tier_value = config_.effort_tiers.high;
+                if      (effort == "low")    tier_value = config_.effort_tiers.low;
+                else if (effort == "medium") tier_value = config_.effort_tiers.medium;
+                else if (effort == "high")   tier_value = config_.effort_tiers.high;
+                else if (effort == "x-high") tier_value = config_.effort_tiers.x_high;
+                else if (effort == "max")    tier_value = config_.effort_tiers.max;
+                // else: unknown tier → fall back to high (no error).
+
+                effort_phase1_cap = tier_value;
+                effort_set = true;
+                enable_thinking = true;
+                // Spec §4.2: reasoning.effort activates the budget envelope.
+                req.thinking_opt_in = true;
             } else {
                 enable_thinking = true;
             }
         }
-        // Anthropic: "thinking" field
+        // Anthropic-style: "thinking" field. Presence-as-opt-in: any
+        // request that sends this field has opted in to the thinking-budget
+        // envelope (and will see a `finish_details` block on the response).
         if (body.contains("thinking")) {
             auto & th = body["thinking"];
             if (th.contains("type")) {
-                enable_thinking = (th.value("type", "") == "enabled");
+                std::string type = th.value("type", "");
+                enable_thinking = (type == "enabled");
+                req.thinking_opt_in = (type == "enabled");
+            }
+            // Spec §4.1 fields. Clamp to server ceilings (§4.4).
+            if (th.contains("budget_tokens") && th["budget_tokens"].is_number_integer()) {
+                request_budget_tokens = th["budget_tokens"].get<int>();
+            }
+            if (th.contains("reply_budget") && th["reply_budget"].is_number_integer()) {
+                request_reply_budget = th["reply_budget"].get<int>();
             }
         }
         // Direct: chat_template_kwargs.enable_thinking
@@ -569,6 +923,55 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         }
 
         req.thinking_enabled = enable_thinking;
+
+        // Spec §4.3 combined precedence + §4.4 clamping.
+        // Phase-1 cap:
+        //   thinking.budget_tokens (if set) wins over reasoning.effort.
+        //   Either is clamped to think_max_tokens.
+        if (request_budget_tokens >= 0) {
+            int eff = std::min(request_budget_tokens, config_.think_max_tokens);
+            if (request_budget_tokens > config_.think_max_tokens) {
+                std::fprintf(stderr,
+                    "[server] thinking.budget_tokens=%d clamped to "
+                    "think_max_tokens=%d\n",
+                    request_budget_tokens, config_.think_max_tokens);
+            }
+            req.per_req_phase1_cap = eff;
+        } else if (effort_set) {
+            // Spec §4.4: when reasoning.effort is set, the effective phase-1
+            // cap is min(effort_tier_value, request.max_tokens -
+            // hard_limit_reply_budget). The effort tier value can legitimately
+            // exceed default_max_tokens (e.g. Qwen3.6 max=81408 with
+            // default=32768) — clients that want that full budget must pass
+            // an explicit max_tokens. Otherwise we narrow silently to fit.
+            const int max_output_phase1_room = std::max(0,
+                req.max_output - config_.hard_limit_reply_budget);
+            int eff = std::min(effort_phase1_cap, max_output_phase1_room);
+            if (effort_phase1_cap > max_output_phase1_room) {
+                // Info-level: this is normal when clients use a tier name but
+                // don't pass an explicit max_tokens. Not a warning.
+                std::fprintf(stderr,
+                    "[server] reasoning.effort tier=%d narrowed to %d "
+                    "(max_tokens=%d - hard_limit_reply_budget=%d); "
+                    "pass a larger max_tokens to use the full tier budget\n",
+                    effort_phase1_cap, eff,
+                    req.max_output, config_.hard_limit_reply_budget);
+            }
+            req.per_req_phase1_cap = eff;
+        }
+        // Reply budget:
+        if (request_reply_budget >= 0) {
+            int eff = std::min(request_reply_budget, config_.hard_limit_reply_budget);
+            if (request_reply_budget > config_.hard_limit_reply_budget) {
+                std::fprintf(stderr,
+                    "[server] thinking.reply_budget=%d clamped to "
+                    "hard_limit_reply_budget=%d\n",
+                    request_reply_budget, config_.hard_limit_reply_budget);
+            }
+            req.per_req_reply_budget = eff;
+        }
+        // (effort tier doesn't influence reply_budget — spec §4.2: "the reply
+        // reserve falls back to --hard-limit-reply-budget".)
 
         // Serialize tools JSON for template injection.
         std::string tools_json;
@@ -612,15 +1015,13 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                                             tools_json);
         }
         req.prompt_tokens = tokenizer_.encode(rendered);
-        // Detect if prompt ends with <think> (model will start in reasoning mode).
-        if (enable_thinking) {
-            size_t end = rendered.size();
-            while (end > 0 && (rendered[end-1] == ' ' || rendered[end-1] == '\n' ||
-                   rendered[end-1] == '\r' || rendered[end-1] == '\t'))
-                end--;
-            if (end >= 7 && rendered.compare(end - 7, 7, "<think>") == 0) {
-                req.started_in_thinking = true;
-            }
+
+        // count_tokens: short-circuit after tokenization. Skip generation
+        // entirely — Anthropic's contract is just `{"input_tokens": N}`.
+        if (count_tokens_only) {
+            json resp = {{"input_tokens", (int)req.prompt_tokens.size()}};
+            send_response(fd, 200, "application/json", resp.dump() + "\n");
+            return true;
         }
 
     } catch (const std::exception & e) {
@@ -721,7 +1122,7 @@ void HttpServer::worker_loop() {
         // Create SSE emitter for streaming state machine.
         SseEmitter emitter(req.format, req.response_id, req.model,
                            (int)req.prompt_tokens.size(), req.tools,
-                           &tool_memory_, req.started_in_thinking,
+                           &tool_memory_,
                            req.stop_sequences);
 
         // Emit initial SSE events.
@@ -829,12 +1230,63 @@ void HttpServer::worker_loop() {
         }
 
         // Build generate request.
+        //
+        // Thinking-budget v2 (Level 2): when caller opts in via
+        // `thinking:{type:enabled}`, cap n_gen at think_max + reply_budget
+        // so the BudgetHook fires at the boundary, mid-stream, with KV
+        // state intact. Applies uniformly to streaming and non-streaming
+        // requests — the BudgetHook lives inside do_ar_decode /
+        // do_spec_decode and injects close tokens at the budget edge
+        // regardless of how the server is delivering the result.
+        const bool budget_active = req.thinking_opt_in;
+        // Effective think cap: per-request value (already clamped to
+        // config_.think_max_tokens above) wins over the server-wide
+        // think_max_tokens. Then both must fit inside the combined
+        // max_output. Spec §4.4 + §5.3.
+        const int effective_think_ceiling = (req.per_req_phase1_cap >= 0)
+            ? req.per_req_phase1_cap
+            : config_.think_max_tokens;
+        // The effective per-request reply budget is the operator's choice
+        // (CLI / sidecar / per-request override). The AR loop force-closes
+        // when `n_gen - generated <= eff_reply`, which means n_gen must
+        // include BOTH the think budget AND the reply reserve. Without the
+        // `+ eff_reply` term, force-close fires immediately when
+        // `eff_reply == effective_think_ceiling` (e.g. think_max=4096,
+        // hard_limit=4096 → remaining starts at 4096, condition fires
+        // before the model emits a single thinking token). Spec §4.4.
+        const int eff_reply_for_n_gen = (req.per_req_reply_budget >= 0)
+            ? req.per_req_reply_budget
+            : config_.hard_limit_reply_budget;
+        const int n_gen_cap = budget_active
+            ? std::min(effective_think_ceiling + eff_reply_for_n_gen, req.max_output)
+            : req.max_output;
+
         GenerateRequest gen_req;
         gen_req.prompt = effective_prompt;
-        gen_req.n_gen = req.max_output;
+        gen_req.n_gen = n_gen_cap;
         gen_req.sampler = req.sampler;
         gen_req.do_sample = req.sampler.needs_logit_processing();
         gen_req.stream = false;  // we handle streaming via on_token callback
+
+        // Level 2 force-close: when thinking is opted in, the server is
+        // configured with a hard-limit reply budget, and we resolved the
+        // close-tag sequence at startup, wire the BudgetHook so the
+        // backend's AR decode injects `</think>` at the budget boundary.
+        // The model gets to write the visible answer in-stream rather than
+        // running unbounded.
+        //
+        // hard_limit_remaining is the per-request reply_budget when set
+        // (already clamped to config_.hard_limit_reply_budget above), else
+        // the server default. Spec §4.4 + §5.3.
+        if (budget_active && !config_.think_close_token_ids.empty() &&
+            config_.hard_limit_reply_budget > 0)
+        {
+            int eff_reply_budget = (req.per_req_reply_budget >= 0)
+                ? req.per_req_reply_budget
+                : config_.hard_limit_reply_budget;
+            gen_req.budget_hook.close_token_ids = config_.think_close_token_ids;
+            gen_req.budget_hook.hard_limit_remaining = eff_reply_budget;
+        }
 
         // Tool call hint generation: pre-tokenize predictable structural tokens
         // to accelerate spec decode when tool_choice constrains the output.
@@ -976,6 +1428,23 @@ void HttpServer::worker_loop() {
                 return true;
             }
 
+            // Qwen3.6 thinking tokens: <think> (id 248068) and </think> (id 248069)
+            // are SINGLE special tokens in the added_tokens vocab. Without this
+            // mapping they hit the generic "skip <...>" filter below and get
+            // silently dropped — which means the emitter never sees the
+            // reasoning→content transition and stuffs everything into
+            // reasoning_content with empty visible content. Forward the text
+            // form into the emitter so parse_reasoning() can split correctly.
+            if (raw == "<think>" || raw == "</think>") {
+                if (req.stream) {
+                    auto chunks = emitter.emit_token(
+                        raw == "</think>" ? "</think>\n" : "<think>");
+                    for (const auto & chunk : chunks)
+                        if (!send_all(fd, chunk.data(), chunk.size())) { client_disconnected = true; return false; }
+                }
+                return true;
+            }
+
             // Skip other special tokens (starting with <|, or any <...> except byte-fallback)
             if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|') return true;
             if (raw.size() >= 2 && raw[0] == '<' && raw.back() == '>') {
@@ -1070,9 +1539,24 @@ void HttpServer::worker_loop() {
             }
         }
 
+        // close_kind reflects the Level 2 BudgetHook outcome: "hard" when
+        // the backend's AR/spec decode injected the close-token sequence
+        // at the budget boundary, "natural" when the model self-closed
+        // (or the request never opted in). Emitted as part of
+        // finish_details for thinking-budget callers.
+        std::string close_kind =
+            (req.thinking_opt_in && result.budget_forced_close)
+                ? "hard"
+                : "natural";
+
         // Finalize.
+        // Per-request wall-clock timings forwarded to the response's
+        // `usage.timings` (OpenAI Chat usage chunk, Anthropic
+        // message_delta usage, Responses response.completed usage).
+        // See docs/specs/thinking-budget.md §6.3.
+        GenTimings gen_timings{ result.prefill_s, result.decode_s };
         if (req.stream && !client_disconnected) {
-            auto final_chunks = emitter.emit_finish(completion_tokens);
+            auto final_chunks = emitter.emit_finish(completion_tokens, &gen_timings);
             for (const auto & chunk : final_chunks) {
                 if (!send_all(fd, chunk.data(), chunk.size())) {
                     client_disconnected = true;
@@ -1082,30 +1566,73 @@ void HttpServer::worker_loop() {
         } else if (!req.stream && !client_disconnected) {
             // Non-streaming: build complete response using emitter state.
             // Feed all tokens through emitter (skip specials like streaming path).
-            for (int32_t tok : result.tokens) {
-                const std::string & raw = tokenizer_.raw_token(tok);
-                if (tok == tokenizer_.eos_id()) continue;
-                if (tok == tokenizer_.eos_chat_id()) continue;
-                // Gemma4 channel → think mapping
-                if (raw == "<|channel>") { emitter.emit_token("<think>"); continue; }
-                if (raw == "<channel|>") { emitter.emit_token("</think>\n"); continue; }
-                if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|') continue;
-                if (raw.size() >= 2 && raw[0] == '<' && raw.back() == '>') {
-                    if (!(raw.size() == 6 && raw[1] == '0' && raw[2] == 'x'))
-                        continue;
+            auto feed_tokens = [&](const std::vector<int32_t> & toks) -> bool {
+                for (int32_t tok : toks) {
+                    const std::string & raw = tokenizer_.raw_token(tok);
+                    if (tok == tokenizer_.eos_id()) continue;
+                    if (tok == tokenizer_.eos_chat_id()) continue;
+                    // Gemma4 channel → think mapping
+                    if (raw == "<|channel>") { emitter.emit_token("<think>"); continue; }
+                    if (raw == "<channel|>") { emitter.emit_token("</think>\n"); continue; }
+                    // Qwen3.6 thinking tokens (id 248068 / 248069) — must
+                    // forward as text so the emitter transitions
+                    // reasoning→content. Without this the generic <...>
+                    // strip below drops them silently, leaving content
+                    // empty and the model's whole answer wedged in
+                    // reasoning_content. Mirrors the streaming-path fix
+                    // above.
+                    if (raw == "<think>") { emitter.emit_token("<think>"); continue; }
+                    if (raw == "</think>") { emitter.emit_token("</think>\n"); continue; }
+                    if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|') continue;
+                    if (raw.size() >= 2 && raw[0] == '<' && raw.back() == '>') {
+                        if (!(raw.size() == 6 && raw[1] == '0' && raw[2] == 'x'))
+                            continue;
+                    }
+                    std::string text = tokenizer_.token_text(tok);
+                    emitter.emit_token(text);
+                    if (emitter.stop_hit()) return false;
                 }
-                std::string text = tokenizer_.token_text(tok);
-                emitter.emit_token(text);
-                if (emitter.stop_hit()) break;
-            }
-            emitter.emit_finish((int)result.tokens.size());
+                return true;
+            };
+
+            feed_tokens(result.tokens);
+            const int total_completion_tokens = (int)result.tokens.size();
+            emitter.emit_finish(total_completion_tokens);
+
+            // Derive per-mode token counts from the emitter's REASONING
+            // → CONTENT transition. first_content_token_index() returns
+            // the emit_token index that first ran with mode == CONTENT;
+            // tokens before that index were emitted while the emitter
+            // was in REASONING (the `</think>`-carrying token itself
+            // lands in REASONING and the NEXT token is the first
+            // CONTENT). EOS/special tokens are skipped by feed_tokens
+            // above, so emit_token_count() may be smaller than
+            // result.tokens.size(); the remainder counts as
+            // unattributed (e.g., TOOL_BUFFER).
+            const int fci = emitter.first_content_token_index();
+            const int emitted = emitter.emit_token_count();
+            const int reasoning_tokens_emitted =
+                fci < 0 ? emitted : fci;
+            const int content_tokens_emitted =
+                fci < 0 ? 0 : emitted - fci;
 
             json resp;
             switch (req.format) {
             case ApiFormat::OPENAI_CHAT: {
                 json msg = {{"role", "assistant"}, {"content", emitter.accumulated_text()}};
                 if (!emitter.reasoning_text().empty()) {
-                    msg["reasoning_content"] = emitter.reasoning_text();
+                    // Multi-dialect reasoning emission — same text, three keys.
+                    // See docs/specs/thinking-budget.md "Response shape —
+                    // multi-dialect aliasing".
+                    //   reasoning_content : DeepSeek R1 / dflash primary
+                    //   reasoning         : OpenRouter / Anthropic-gateway flat
+                    //   reasoning_details : typed-block list; single block.
+                    const std::string & rt = emitter.reasoning_text();
+                    msg["reasoning_content"] = rt;
+                    msg["reasoning"]         = rt;
+                    msg["reasoning_details"] = json::array({
+                        {{"type", "reasoning.text"}, {"text", rt}}
+                    });
                 }
                 if (!emitter.tool_calls().empty()) {
                     json tcs = json::array();
@@ -1116,21 +1643,76 @@ void HttpServer::worker_loop() {
                     }
                     msg["tool_calls"] = tcs;
                 }
+                // finish_reason: emitter only knows about "stop" / "tool_calls"
+                // (EOS / tool-call detection). It can't see that the daemon
+                // hit the n_gen cap. Compute "length" here from the
+                // committed-token count vs the n_gen cap.
+                // OpenAI/Anthropic clients (open-webui, Cline) gate retry
+                // logic on finish_reason="length".
+                std::string effective_finish_reason = emitter.finish_reason();
+                if (effective_finish_reason == "stop") {
+                    bool at_cap = (int)result.tokens.size() >= n_gen_cap;
+                    if (at_cap) {
+                        effective_finish_reason = "length";
+                    }
+                }
+                json choice = {
+                    {"index", 0}, {"message", msg},
+                    {"finish_reason", effective_finish_reason}
+                };
+                // finish_details — mirrors ds4_eval.c's eval_think_close_info.
+                // Emitted when the caller opted in to the thinking-budget
+                // envelope via `thinking:{type:enabled}`. close_kind reflects
+                // whether the model self-closed the thinking block ("natural")
+                // or the BudgetHook force-closed it at the budget boundary
+                // ("hard"). See docs/specs/thinking-budget.md "v2 design".
+                if (req.thinking_opt_in) {
+                    // thinking_tokens / content_tokens come from the
+                    // emitter's REASONING→CONTENT transition tracking;
+                    // total_tokens is the raw committed-token count.
+                    choice["finish_details"] = {
+                        {"close_kind",      close_kind},
+                        {"thinking_tokens", reasoning_tokens_emitted},
+                        {"content_tokens",  content_tokens_emitted},
+                        {"total_tokens",    total_completion_tokens},
+                    };
+                    // Honest signaling: when the post-close watchdog
+                    // detected an n-gram repetition loop and aborted
+                    // generation, surface a sibling flag so callers know
+                    // the answer is unreliable. finish_reason stays
+                    // "length" (SDK-safe per the truncation-signaling
+                    // convention: OpenAI/Anthropic/Gemini all collapse
+                    // budget-class events to one closed enum and put
+                    // richer signal in sidecar fields).
+                    if (result.degenerate_decode_close) {
+                        choice["finish_details"]["degenerate_decode"] = true;
+                    }
+                }
+                // usage.completion_tokens_details.reasoning_tokens — OpenAI
+                // o1/o3 standard location, also OR's normalized shape. Mirrors
+                // finish_details.thinking_tokens; kept in sync.
+                // usage.timings — per-request prefill / decode wall clock
+                // (always emitted; additive to OpenAI shape, ignored by
+                // clients that don't recognize it). See spec §6.3.
+                json chat_usage = {
+                    {"prompt_tokens", (int)req.prompt_tokens.size()},
+                    {"completion_tokens", total_completion_tokens},
+                    {"total_tokens", (int)req.prompt_tokens.size() + total_completion_tokens},
+                    {"completion_tokens_details", {
+                        // Match finish_details.thinking_tokens
+                        // (emitter-tracked split).
+                        {"reasoning_tokens", reasoning_tokens_emitted}
+                    }},
+                    {"timings", build_timings_json(gen_timings, total_completion_tokens)}
+                };
                 resp = {
                     {"id", req.response_id},
                     {"object", "chat.completion"},
                     {"created", std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::system_clock::now().time_since_epoch()).count()},
                     {"model", req.model},
-                    {"choices", json::array({{
-                        {"index", 0}, {"message", msg},
-                        {"finish_reason", emitter.finish_reason()}
-                    }})},
-                    {"usage", {
-                        {"prompt_tokens", (int)req.prompt_tokens.size()},
-                        {"completion_tokens", (int)result.tokens.size()},
-                        {"total_tokens", (int)(req.prompt_tokens.size() + result.tokens.size())}
-                    }}
+                    {"choices", json::array({choice})},
+                    {"usage", chat_usage}
                 };
                 break;
             }
@@ -1170,15 +1752,28 @@ void HttpServer::worker_loop() {
                         });
                     }
                 }
+                // stop_reason: Anthropic's analog of finish_reason. Same
+                // length-vs-EOS distinction as OpenAI — Cline / Anthropic
+                // SDK gate retry on stop_reason=="max_tokens".
+                std::string anthropic_stop_reason;
+                {
+                    std::string er = emitter.finish_reason();
+                    bool at_cap = (int)result.tokens.size() >= n_gen_cap;
+                    if (er == "tool_calls") anthropic_stop_reason = "tool_use";
+                    else if (at_cap)        anthropic_stop_reason = "max_tokens";
+                    else                    anthropic_stop_reason = "end_turn";
+                }
+                json anth_usage = {
+                    {"input_tokens", (int)req.prompt_tokens.size()},
+                    {"output_tokens", total_completion_tokens},
+                    {"timings", build_timings_json(gen_timings, total_completion_tokens)}
+                };
                 resp = {
                     {"id", req.response_id}, {"type", "message"},
                     {"role", "assistant"}, {"model", req.model},
                     {"content", content},
-                    {"stop_reason", emitter.finish_reason() == "stop" ? "end_turn" : "tool_use"},
-                    {"usage", {
-                        {"input_tokens", (int)req.prompt_tokens.size()},
-                        {"output_tokens", (int)result.tokens.size()}
-                    }}
+                    {"stop_reason", anthropic_stop_reason},
+                    {"usage", anth_usage}
                 };
                 break;
             }
@@ -1202,15 +1797,17 @@ void HttpServer::worker_loop() {
                         }})}
                     });
                 }
+                json resp_usage = {
+                    {"input_tokens", (int)req.prompt_tokens.size()},
+                    {"output_tokens", total_completion_tokens},
+                    {"total_tokens", (int)req.prompt_tokens.size() + total_completion_tokens},
+                    {"timings", build_timings_json(gen_timings, total_completion_tokens)}
+                };
                 resp = {
                     {"id", req.response_id}, {"object", "response"},
                     {"status", "completed"}, {"model", req.model},
                     {"output", output},
-                    {"usage", {
-                        {"input_tokens", (int)req.prompt_tokens.size()},
-                        {"output_tokens", (int)result.tokens.size()},
-                        {"total_tokens", (int)(req.prompt_tokens.size() + result.tokens.size())}
-                    }}
+                    {"usage", resp_usage}
                 };
                 break;
             }

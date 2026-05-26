@@ -102,10 +102,9 @@ static json weather_tools() {
     });
 }
 
-static SseEmitter make_emitter(ApiFormat fmt, bool thinking = false,
-                               json tools = json::array()) {
+static SseEmitter make_emitter(ApiFormat fmt, json tools = json::array()) {
     return SseEmitter(fmt, "test_id_001", "test-model", 10,
-                      tools, nullptr, thinking);
+                      tools, nullptr);
 }
 
 // Concatenate all SSE chunks into a single string.
@@ -319,10 +318,14 @@ static void test_parse_tool_allowed_filter() {
 
 static void test_emitter_reasoning_split_openai() {
     // Feed reasoning + content through emitter, verify split.
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, true);
+    // Model emits the opening <think> as its first token (Qwen3.6 path
+    // — the streaming on_token lambda maps the special <think> id to
+    // emit_token("<think>")).
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
 
-    // Feed reasoning tokens
+    // Open reasoning, feed reasoning tokens
+    em.emit_token("<think>");
     em.emit_token("Let me think about this...");
     // Close thinking and start content
     em.emit_token("</think>");
@@ -337,12 +340,106 @@ static void test_emitter_reasoning_split_openai() {
     TEST_ASSERT(em.accumulated_text().find("</think>") == std::string::npos);
 }
 
-static void test_emitter_reasoning_strips_leading_think_tag() {
-    // When started_in_thinking=true, model may echo <think>.
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, true);
+// SseEmitter::emit_token_count() / accumulated text accessors drive
+// http_server's finish_details accounting on the natural-close path
+// (model self-closes </think> mid-stream). Each test feeds tokens
+// one-per-call so the emit_token index is straightforward to reason
+// about.
+static void test_emitter_first_content_index_natural_close() {
+    // Emit reasoning tokens (with explicit <think> open + </think>
+    // close), then content tokens. The emit_token_count() reflects
+    // all delivered tokens; the reasoning/content split is also
+    // recoverable from accumulated_text / reasoning_text.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
+    em.emit_start();
+    TEST_ASSERT(em.emit_token_count() == 0);
+
+    em.emit_token("<think>");
+    em.emit_token("reasoning1");
+    em.emit_token("reasoning2");
+    em.emit_token("end</think>");
+    em.emit_token("content1");
+    em.emit_token("content2");
+    em.emit_finish(6);
+
+    TEST_ASSERT(em.emit_token_count() == 6);
+    // Reasoning + content text both populated.
+    TEST_ASSERT(!em.reasoning_text().empty());
+    TEST_ASSERT(em.accumulated_text().find("content1") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("content2") != std::string::npos);
+}
+
+static void test_emitter_first_content_index_never_closed() {
+    // Model opens <think> then emits reasoning only — never closes
+    // </think>. All produced text lands in reasoning_text; visible
+    // accumulated_text stays empty.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
 
-    // Model echoes \n<think>\n before actual reasoning
+    em.emit_token("<think>");
+    em.emit_token("reasoning never closes");
+    em.emit_token("still thinking");
+    em.emit_finish(3);
+
+    TEST_ASSERT(em.emit_token_count() == 3);
+    TEST_ASSERT(em.reasoning_text().find("reasoning") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().empty());
+}
+
+static void test_emitter_first_content_index_content_only() {
+    // Non-thinking request: emitter starts in CONTENT mode, so the
+    // very first emit_token lands at index 0.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
+    em.emit_start();
+    em.emit_token("immediate content");
+    em.emit_finish(1);
+
+    TEST_ASSERT(em.first_content_token_index() == 0);
+    TEST_ASSERT(em.emit_token_count() == 1);
+}
+
+static void test_emitter_first_content_index_qwen36_streaming_thinking() {
+    // Regression: when the chat template emits a leading `<think>` token
+    // (Qwen3.6 thinking-enabled path, or gemma4 `<|channel>` → `<think>`
+    // map) the emitter starts in CONTENT mode by default and naively
+    // captured first_content_token_index_=0 on the first emit_token
+    // call, before the state machine transitioned to REASONING. Result:
+    // finish_details.thinking_tokens misreported as 0 for any streamed-
+    // thinking response. Fix: detect the `<think>` opener up-front and
+    // defer the fci capture until a true CONTENT-mode token arrives.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
+    em.emit_start();
+
+    // Mirror http_server's on_token mapping: the special <think> id is
+    // forwarded as a standalone "<think>" piece, followed by reasoning
+    // text, the closing "</think>" piece, then the answer.
+    em.emit_token("<think>");
+    em.emit_token("reasoning step 1");
+    em.emit_token("reasoning step 2");
+    em.emit_token("</think>\n");
+    em.emit_token("answer text");
+    em.emit_finish(5);
+
+    // fci must point at the first true content token, NOT 0.
+    TEST_ASSERT(em.first_content_token_index() > 0);
+    // Reasoning text populated, leading <think> stripped.
+    TEST_ASSERT(!em.reasoning_text().empty());
+    TEST_ASSERT(em.reasoning_text().find("<think>") == std::string::npos);
+    // Content text populated.
+    TEST_ASSERT(em.accumulated_text().find("answer") != std::string::npos);
+    // emit_token_count - fci should be the content-suffix size
+    // (>0 means at least one content-mode token was attributed).
+    TEST_ASSERT(em.emit_token_count() - em.first_content_token_index() > 0);
+}
+
+static void test_emitter_reasoning_strips_leading_think_tag() {
+    // Model emits leading whitespace + <think> as one token, then
+    // continues thinking. The leading-<think>-with-whitespace-prefix
+    // strip ensures the reasoning text doesn't contain the open tag.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
+    em.emit_start();
+
+    // Model emits \n<think>\n before actual reasoning
     em.emit_token("\n<think>\nActual reasoning here");
     em.emit_token("</think>");
     em.emit_token("Content");
@@ -355,7 +452,7 @@ static void test_emitter_reasoning_strips_leading_think_tag() {
 }
 
 static void test_emitter_content_only_no_thinking() {
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
     em.emit_token("Hello, world!");
     em.emit_finish(5);
@@ -366,7 +463,7 @@ static void test_emitter_content_only_no_thinking() {
 
 static void test_emitter_tool_buffer_detection() {
     // When the emitter sees <tool_call>, it should buffer and parse tools.
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false, weather_tools());
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
     em.emit_start();
     em.emit_token("<tool_call>\n"
                   "<function=get_weather>\n"
@@ -398,7 +495,7 @@ static void test_emitter_anthropic_tool_use_blocks() {
                           {"properties", {{"city", {{"type", "string"}}}}}}}
     });
     SseEmitter em(ApiFormat::ANTHROPIC, "req_id", "test-model", 10,
-                  tools, nullptr, /*thinking=*/false);
+                  tools, nullptr);
     (void)em.emit_start();
     // Feed Qwen3 XML tool call in chunks so the holdback buffer flushes;
     // parser will detect <tool_call><function=NAME>...</tool_call>.
@@ -423,7 +520,7 @@ static void test_emitter_anthropic_tool_use_blocks() {
 }
 
 static void test_emitter_bare_function_tool_buffer_detection() {
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false, weather_tools());
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
     em.emit_start();
     em.emit_token("<function=terminal>\n"
                   "<parameter=command>\n"
@@ -442,7 +539,7 @@ static void test_emitter_bare_function_tool_buffer_detection() {
 }
 
 static void test_emitter_does_not_leak_malformed_tool_xml() {
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false, weather_tools());
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
     em.emit_start();
     em.emit_token("Let me list files.\n\n");
     em.emit_token("<tool_call>\n"
@@ -459,7 +556,7 @@ static void test_emitter_does_not_leak_malformed_tool_xml() {
 }
 
 static void test_emitter_parses_tool_call_missing_outer_close() {
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false, weather_tools());
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
     em.emit_start();
     em.emit_token("<tool_call>\n"
                   "<function=terminal>\n"
@@ -480,7 +577,7 @@ static void test_emitter_parses_tool_call_missing_outer_close() {
 }
 
 static void test_emitter_no_tools_keeps_tool_like_text() {
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
     em.emit_token("<function=terminal>\n"
                   "<parameter=command>ls</parameter>\n"
@@ -493,7 +590,7 @@ static void test_emitter_no_tools_keeps_tool_like_text() {
 
 static void test_emitter_anthropic_structure() {
     // Verify Anthropic format emits proper event sequence.
-    auto em = make_emitter(ApiFormat::ANTHROPIC, false);
+    auto em = make_emitter(ApiFormat::ANTHROPIC);
     auto start = em.emit_start();
     std::string start_str = concat(start);
 
@@ -517,7 +614,7 @@ static void test_emitter_anthropic_structure() {
 }
 
 static void test_emitter_responses_structure() {
-    auto em = make_emitter(ApiFormat::RESPONSES, false);
+    auto em = make_emitter(ApiFormat::RESPONSES);
     auto start = em.emit_start();
     std::string start_str = concat(start);
 
@@ -543,7 +640,7 @@ static void test_emitter_responses_bare_function_tool_call() {
         }}
     }});
     SseEmitter em(ApiFormat::RESPONSES, "resp_test_001", "test-model", 10,
-                  tools, nullptr, false);
+                  tools, nullptr);
     em.emit_start();
     em.emit_token("\n\n<function=exec_command>\n<parameter=cmd>\ngit pull\n");
     em.emit_token("</parameter>\n</function>\n");
@@ -561,7 +658,7 @@ static void test_emitter_responses_bare_function_tool_call() {
 }
 
 static void test_emitter_streaming_openai_has_done() {
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
     em.emit_token("Hello");
     auto finish = em.emit_finish(3);
@@ -572,7 +669,7 @@ static void test_emitter_streaming_openai_has_done() {
 
 static void test_emitter_nonstreaming_accumulates() {
     // Non-streaming: tokens fed through emitter, accumulated_text() has all content.
-    auto em = make_emitter(ApiFormat::OPENAI_CHAT, false);
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_token("Hello ");
     em.emit_token("world");
     em.emit_finish(5);
@@ -582,20 +679,20 @@ static void test_emitter_nonstreaming_accumulates() {
 }
 
 static void test_emitter_anthropic_thinking_blocks() {
-    auto em = make_emitter(ApiFormat::ANTHROPIC, true);
+    auto em = make_emitter(ApiFormat::ANTHROPIC);
     auto start = em.emit_start();
     std::string start_str = concat(start);
 
-    TEST_ASSERT(start_str.find("thinking") != std::string::npos);
-
-    // Feed reasoning
-    em.emit_token("Reasoning about the problem at length here...");
-    em.emit_token("</think>");
-    em.emit_token("The answer is clear now.");
+    // Model opens <think>, emits reasoning, closes, emits content.
+    auto t1 = em.emit_token("<think>");
+    auto t2 = em.emit_token("Reasoning about the problem at length here...");
+    auto t3 = em.emit_token("</think>");
+    auto t4 = em.emit_token("The answer is clear now.");
     auto finish = em.emit_finish(20);
-    std::string all = start_str + concat(finish);
+    std::string all = start_str + concat(t1) + concat(t2) + concat(t3) +
+                      concat(t4) + concat(finish);
 
-    // Should have both thinking and text blocks
+    // Should have both thinking and text blocks somewhere in the stream
     TEST_ASSERT(all.find("thinking") != std::string::npos);
     TEST_ASSERT(!em.reasoning_text().empty());
     TEST_ASSERT(!em.accumulated_text().empty());
@@ -605,15 +702,15 @@ static void test_emitter_anthropic_thinking_blocks() {
 // Stop sequences tests
 // ═══════════════════════════════════════════════════════════════════════
 
-static SseEmitter make_emitter_with_stops(ApiFormat fmt, bool thinking,
+static SseEmitter make_emitter_with_stops(ApiFormat fmt,
                                            const std::vector<std::string> & stops) {
     return SseEmitter(fmt, "test_id_001", "test-model", 10,
-                      json::array(), nullptr, thinking, stops);
+                      json::array(), nullptr, stops);
 }
 
 static void test_stop_sequence_basic() {
     // Stop sequence should truncate content at the match point.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, false, {"STOP"});
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{"STOP"});
     em.emit_token("Hello ");
     em.emit_token("world ");
     em.emit_token("STOP");
@@ -629,7 +726,7 @@ static void test_stop_sequence_basic() {
 
 static void test_stop_sequence_mid_token() {
     // Stop sequence may span multiple tokens due to holdback buffering.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, false, {"END"});
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{"END"});
     em.emit_token("Go ");
     em.emit_token("to the E");
     em.emit_token("ND now");
@@ -643,7 +740,7 @@ static void test_stop_sequence_mid_token() {
 
 static void test_stop_sequence_multiple() {
     // Multiple stop sequences — earliest match wins.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, false, {"AAA", "BB"});
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{"AAA", "BB"});
     em.emit_token("xBBy");
 
     TEST_ASSERT(em.stop_hit());
@@ -653,7 +750,7 @@ static void test_stop_sequence_multiple() {
 
 static void test_stop_sequence_no_match() {
     // No stop sequence hit — normal operation.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, false, {"NOMATCH"});
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{"NOMATCH"});
     em.emit_token("Hello world this is a long text");
     em.emit_finish(10);
 
@@ -663,7 +760,7 @@ static void test_stop_sequence_no_match() {
 
 static void test_stop_sequence_empty_list() {
     // Empty stop list — no effect.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, false, {});
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{});
     em.emit_token("Hello STOP world");
     em.emit_finish(5);
 
@@ -673,7 +770,7 @@ static void test_stop_sequence_empty_list() {
 
 static void test_stop_sequence_finish_reason() {
     // finish_reason should be "stop" when stop sequence hit.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, false, {"END"});
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{"END"});
     em.emit_token("content END more");
 
     TEST_ASSERT(em.stop_hit());
@@ -683,7 +780,7 @@ static void test_stop_sequence_finish_reason() {
 
 static void test_stop_sequence_streaming_output() {
     // Streaming: verify the [DONE] is still emitted after stop.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, false, {"HALT"});
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{"HALT"});
     auto start = em.emit_start();
     em.emit_token("some text HALT rest");
 
@@ -696,7 +793,7 @@ static void test_stop_sequence_streaming_output() {
 
 static void test_stop_sequence_anthropic_format() {
     // Anthropic format should emit end_turn stop_reason.
-    auto em = make_emitter_with_stops(ApiFormat::ANTHROPIC, false, {"DONE"});
+    auto em = make_emitter_with_stops(ApiFormat::ANTHROPIC, {"DONE"});
     em.emit_start();
     em.emit_token("This is content DONE rest");
 
@@ -708,8 +805,10 @@ static void test_stop_sequence_anthropic_format() {
 }
 
 static void test_stop_sequence_in_reasoning_mode() {
-    // Stop sequence in reasoning mode should still stop.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, true, {"CUTOFF"});
+    // Stop sequence in reasoning mode should still stop. Model opens
+    // <think> first to enter REASONING.
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, {"CUTOFF"});
+    em.emit_token("<think>");
     em.emit_token("Thinking deeply about this CUTOFF answer");
 
     TEST_ASSERT(em.stop_hit());
@@ -721,7 +820,7 @@ static void test_stop_sequence_in_reasoning_mode() {
 static void test_stop_sequence_holdback_extends() {
     // With a long stop sequence, holdback buffer should extend to prevent
     // emitting text that's part of a stop sequence.
-    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, false,
+    auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,
                                        {"LONGSTOPSEQUENCE"});
     // Feed text token by token — the holdback should prevent premature emission
     em.emit_token("prefix ");
@@ -1759,6 +1858,288 @@ static void test_sampler_needs_logit_processing() {
     TEST_ASSERT(!cfg.needs_logit_processing());
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// /props body shape tests (model-free)
+//
+// Verify build_props_body's new wholesale-sidecar `model_card` + new
+// `budget_envelope` section per docs/specs/props-endpoint.md §4.9 / §4.X.
+// ═══════════════════════════════════════════════════════════════════════
+
+static ServerConfig make_props_config_with_sidecar(const json & sidecar) {
+    ServerConfig cfg;
+    cfg.arch                    = "qwen35";
+    cfg.model_path              = "/tmp/fake/model.gguf";
+    cfg.model_card_source_label = "share/model_cards/qwen3.6-27b.json";
+    cfg.model_card_json         = sidecar;
+    cfg.default_max_tokens      = 32768;
+    cfg.hard_limit_reply_budget = 512;
+    cfg.think_max_tokens        = 32256;
+    cfg.effort_tiers.low    = 4032;
+    cfg.effort_tiers.medium = 16128;
+    cfg.effort_tiers.high   = 32256;
+    cfg.effort_tiers.x_high = 56832;
+    cfg.effort_tiers.max    = 81408;
+    return cfg;
+}
+
+static void test_props_model_card_wholesale_sidecar() {
+    // When a sidecar was loaded, /props.model_card should be the parsed
+    // sidecar JSON verbatim — *all* fields from the file, not just the
+    // five budget-derived ones from the pre-refactor shape.
+    json sidecar = {
+        {"name",         "Qwen3.6 27B"},
+        {"source",       "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens",   32768},
+        {"complex_problem_max_tokens", 81920},
+        {"sampling", {
+            {"temperature", 1.0},
+            {"top_p",       0.95},
+            {"top_k",       20},
+        }},
+        {"reasoning_effort_tiers", {
+            {"low",    4032},
+            {"medium", 16128},
+            {"high",   32256},
+            {"x-high", 56832},
+            {"max",    81408},
+        }},
+        {"notes", "test card"},
+    };
+    ServerConfig cfg = make_props_config_with_sidecar(sidecar);
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body.contains("model_card"));
+    TEST_ASSERT(!body["model_card"].is_null());
+    // `source` is the upstream URL, NOT the filepath. The filepath label
+    // moved to budget_envelope.model_card_source post-refactor.
+    TEST_ASSERT(body["model_card"]["source"].get<std::string>() ==
+                "https://huggingface.co/Qwen/Qwen3.6-27B");
+    TEST_ASSERT(body["model_card"]["name"].get<std::string>() == "Qwen3.6 27B");
+    TEST_ASSERT(body["model_card"]["max_tokens"].get<int>() == 32768);
+    TEST_ASSERT(body["model_card"]["complex_problem_max_tokens"].get<int>() == 81920);
+    TEST_ASSERT(body["model_card"].contains("sampling"));
+    TEST_ASSERT(body["model_card"].contains("reasoning_effort_tiers"));
+    TEST_ASSERT(body["model_card"]["notes"].get<std::string>() == "test card");
+    // The pre-refactor `think_max_tokens` / `hard_limit_reply_budget`
+    // keys are NOT in the wholesale shape — they moved to budget_envelope.
+    TEST_ASSERT(!body["model_card"].contains("think_max_tokens"));
+    TEST_ASSERT(!body["model_card"].contains("hard_limit_reply_budget"));
+}
+
+static void test_props_model_card_null_on_family_fallback() {
+    // When family or hard fallback was used (no sidecar), /props.model_card
+    // is JSON null. The budget_envelope still carries the resolved values.
+    ServerConfig cfg;
+    cfg.arch                    = "qwen35";
+    cfg.model_card_source_label = "family:qwen35";
+    cfg.model_card_json         = nullptr;  // no sidecar parsed
+    cfg.default_max_tokens      = 32768;
+    cfg.hard_limit_reply_budget = 512;
+    cfg.think_max_tokens        = 32256;
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body.contains("model_card"));
+    TEST_ASSERT(body["model_card"].is_null());
+    // budget_envelope still present and carries the family-fallback label.
+    TEST_ASSERT(body.contains("budget_envelope"));
+    TEST_ASSERT(body["budget_envelope"]["model_card_source"].get<std::string>() ==
+                "family:qwen35");
+    TEST_ASSERT(body["budget_envelope"]["default_max_tokens"].get<int>() == 32768);
+}
+
+static void test_props_budget_envelope_shape() {
+    // budget_envelope is always present with all five fields and the
+    // expected effort_tiers vocabulary (low|medium|high|x-high|max).
+    // Values mirror ServerConfig regardless of what the sidecar carried.
+    json sidecar = {
+        {"name",        "Qwen3.6 27B"},
+        {"source",      "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens",  32768},
+    };
+    ServerConfig cfg = make_props_config_with_sidecar(sidecar);
+    // Simulate CLI override: budget_envelope reflects the runtime value,
+    // which may diverge from the sidecar (here, 16000 != sidecar 32768).
+    cfg.default_max_tokens      = 16000;
+    cfg.hard_limit_reply_budget = 512;
+    cfg.think_max_tokens        = 15488;
+    cfg.effort_tiers.low    = 100;
+    cfg.effort_tiers.medium = 200;
+    cfg.effort_tiers.high   = 300;
+    cfg.effort_tiers.x_high = 400;
+    cfg.effort_tiers.max    = 500;
+
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body.contains("budget_envelope"));
+    const json & be = body["budget_envelope"];
+    TEST_ASSERT(be["model_card_source"].get<std::string>() ==
+                "share/model_cards/qwen3.6-27b.json");
+    TEST_ASSERT(be["default_max_tokens"].get<int>() == 16000);
+    TEST_ASSERT(be["hard_limit_reply_budget"].get<int>() == 512);
+    TEST_ASSERT(be["think_max_tokens"].get<int>() == 15488);
+    TEST_ASSERT(be["effort_tiers"]["low"].get<int>()    == 100);
+    TEST_ASSERT(be["effort_tiers"]["medium"].get<int>() == 200);
+    TEST_ASSERT(be["effort_tiers"]["high"].get<int>()   == 300);
+    TEST_ASSERT(be["effort_tiers"]["x-high"].get<int>() == 400);
+    TEST_ASSERT(be["effort_tiers"]["max"].get<int>()    == 500);
+
+    // Sanity: budget_envelope can diverge from model_card.max_tokens
+    // (CLI override case). Verifies the two sections aren't a tautology.
+    TEST_ASSERT(body["model_card"]["max_tokens"].get<int>() == 32768);
+    TEST_ASSERT(be["default_max_tokens"].get<int>() == 16000);
+
+    // Sanity: props_schema bumped to 2 (breaking change).
+    TEST_ASSERT(body["server"]["props_schema"].get<int>() == 2);
+}
+
+// ─── /props.runtime captures full config (§4.16) ──────────────────────
+// Snapshot/bench tooling reads /props.runtime wholesale into
+// result.json.server_info; this test pins the field set so additions
+// elsewhere don't accidentally drop a knob we depend on for forensics.
+static void test_props_runtime_shape() {
+    ServerConfig cfg = make_props_config_with_sidecar(json{
+        {"name", "Qwen3.6 27B"},
+        {"source", "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens", 32768},
+    });
+    cfg.runtime_backend = "cuda";
+    cfg.fa_window       = 2048;
+    cfg.kv_cache_k      = "tq3_0";
+    cfg.kv_cache_v      = "tq3_0";
+    cfg.lazy_draft      = false;
+    cfg.target_sharding = false;
+    cfg.chunk           = 512;
+    cfg.target_device   = "auto:0";
+    cfg.draft_device    = "auto:0";
+
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body.contains("runtime"));
+    const json & rt = body["runtime"];
+    TEST_ASSERT(rt["backend"].get<std::string>()         == "cuda");
+    TEST_ASSERT(rt["fa_window"].get<int>()               == 2048);
+    TEST_ASSERT(rt["kv_cache_k"].get<std::string>()      == "tq3_0");
+    TEST_ASSERT(rt["kv_cache_v"].get<std::string>()      == "tq3_0");
+    TEST_ASSERT(rt["lazy_draft"].get<bool>()             == false);
+    TEST_ASSERT(rt["target_sharding"].get<bool>()        == false);
+    TEST_ASSERT(rt["chunk"].get<int>()                   == 512);
+    TEST_ASSERT(rt["target_device"].get<std::string>()   == "auto:0");
+    TEST_ASSERT(rt["draft_device"].get<std::string>()    == "auto:0");
+
+    // draft_device is null when no draft model is loaded.
+    cfg.draft_device.clear();
+    body = build_props_body(cfg, pc, tm);
+    TEST_ASSERT(body["runtime"]["draft_device"].is_null());
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// usage.timings — per-request prefill / decode wall-clock breakdown
+// surfaced under usage.timings (spec §6.3). Tests cover all three
+// response shapes plus the zero-decode_s div-by-zero guard.
+// ═══════════════════════════════════════════════════════════════════════
+
+static void test_usage_timings_openai_chat_streaming() {
+    // OpenAI Chat streaming: the terminal usage chunk (just before
+    // data: [DONE]) carries `timings.{prefill_ms, decode_ms,
+    // decode_tokens_per_sec}` when timings are passed to emit_finish.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
+    em.emit_start();
+    em.emit_token("Hello world");
+
+    GenTimings t{0.2345, 2.4567};  // 234.5 ms / 2456.7 ms
+    auto finish = em.emit_finish(/*completion_tokens*/ 100, &t);
+    std::string finish_str = concat(finish);
+
+    TEST_ASSERT(finish_str.find("\"timings\"") != std::string::npos);
+    TEST_ASSERT(finish_str.find("\"prefill_ms\":234.5") != std::string::npos);
+    TEST_ASSERT(finish_str.find("\"decode_ms\":2456.7") != std::string::npos);
+    // 100 / 2.4567 = 40.7048... → rounds to 40.7
+    TEST_ASSERT(finish_str.find("\"decode_tokens_per_sec\":40.7") != std::string::npos);
+    TEST_ASSERT(finish_str.find("[DONE]") != std::string::npos);
+}
+
+static void test_usage_timings_anthropic_streaming() {
+    // Anthropic streaming: message_delta.usage gains a `timings`
+    // sibling alongside `output_tokens`.
+    auto em = make_emitter(ApiFormat::ANTHROPIC);
+    em.emit_start();
+    em.emit_token("ok");
+    GenTimings t{0.05, 0.5};  // 50.0 ms / 500.0 ms
+    auto finish = em.emit_finish(/*completion_tokens*/ 10, &t);
+    std::string finish_str = concat(finish);
+
+    TEST_ASSERT(finish_str.find("\"timings\"") != std::string::npos);
+    TEST_ASSERT(finish_str.find("\"prefill_ms\":50.0") != std::string::npos);
+    TEST_ASSERT(finish_str.find("\"decode_ms\":500.0") != std::string::npos);
+    // 10 / 0.5 = 20.0
+    TEST_ASSERT(finish_str.find("\"decode_tokens_per_sec\":20.0") != std::string::npos);
+}
+
+static void test_usage_timings_responses_streaming() {
+    // Responses streaming: response.completed.usage gains `timings`.
+    auto em = make_emitter(ApiFormat::RESPONSES);
+    em.emit_start();
+    em.emit_token("done");
+    GenTimings t{0.1, 1.0};
+    auto finish = em.emit_finish(/*completion_tokens*/ 25, &t);
+    std::string finish_str = concat(finish);
+
+    TEST_ASSERT(finish_str.find("\"timings\"") != std::string::npos);
+    TEST_ASSERT(finish_str.find("\"prefill_ms\":100.0") != std::string::npos);
+    TEST_ASSERT(finish_str.find("\"decode_ms\":1000.0") != std::string::npos);
+    // 25 / 1.0 = 25.0
+    TEST_ASSERT(finish_str.find("\"decode_tokens_per_sec\":25.0") != std::string::npos);
+}
+
+static void test_usage_timings_zero_decode_no_div_by_zero() {
+    // decode_s == 0 (prefill-only / no tokens generated path): emit
+    // decode_tokens_per_sec = 0.0 without div-by-zero.
+    GenTimings t{0.123, 0.0};
+    json j = build_timings_json(t, /*completion_tokens*/ 42);
+    TEST_ASSERT(j["prefill_ms"].get<double>() == 123.0);
+    TEST_ASSERT(j["decode_ms"].get<double>() == 0.0);
+    TEST_ASSERT(j["decode_tokens_per_sec"].get<double>() == 0.0);
+
+    // Also exercise via OpenAI streaming path — finite JSON output, no NaN/Inf.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
+    em.emit_start();
+    auto finish = em.emit_finish(/*completion_tokens*/ 0, &t);
+    std::string finish_str = concat(finish);
+    TEST_ASSERT(finish_str.find("\"decode_tokens_per_sec\":0.0") != std::string::npos);
+    // No NaN / Inf serialization leak.
+    TEST_ASSERT(finish_str.find("inf") == std::string::npos);
+    TEST_ASSERT(finish_str.find("nan") == std::string::npos);
+}
+
+static void test_usage_timings_omitted_when_null() {
+    // Backward compat: emit_finish(n) (no timings) emits the legacy
+    // usage block — no `timings` key. Guards the SDK-facing default
+    // for callers that don't yet wire timings through.
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
+    em.emit_start();
+    em.emit_token("x");
+    auto finish = em.emit_finish(3);  // no timings arg
+    std::string finish_str = concat(finish);
+
+    TEST_ASSERT(finish_str.find("\"timings\"") == std::string::npos);
+    TEST_ASSERT(finish_str.find("[DONE]") != std::string::npos);
+}
+
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
     std::fprintf(stderr, " Server Unit Tests\n");
@@ -1792,6 +2173,10 @@ int main() {
 
     std::fprintf(stderr, "\n── SSE Emitter ──\n");
     RUN_TEST(test_emitter_reasoning_split_openai);
+    RUN_TEST(test_emitter_first_content_index_natural_close);
+    RUN_TEST(test_emitter_first_content_index_never_closed);
+    RUN_TEST(test_emitter_first_content_index_content_only);
+    RUN_TEST(test_emitter_first_content_index_qwen36_streaming_thinking);
     RUN_TEST(test_emitter_reasoning_strips_leading_think_tag);
     RUN_TEST(test_emitter_content_only_no_thinking);
     RUN_TEST(test_emitter_tool_buffer_detection);
@@ -1884,6 +2269,19 @@ int main() {
     RUN_TEST(test_parse_sampler_token_no_samp);
     RUN_TEST(test_sampler_temp_zero_with_penalties_uses_argmax);
     RUN_TEST(test_sampler_needs_logit_processing);
+
+    std::fprintf(stderr, "\n── /props body shape ──\n");
+    RUN_TEST(test_props_model_card_wholesale_sidecar);
+    RUN_TEST(test_props_model_card_null_on_family_fallback);
+    RUN_TEST(test_props_budget_envelope_shape);
+    RUN_TEST(test_props_runtime_shape);
+
+    std::fprintf(stderr, "\n── usage.timings ──\n");
+    RUN_TEST(test_usage_timings_openai_chat_streaming);
+    RUN_TEST(test_usage_timings_anthropic_streaming);
+    RUN_TEST(test_usage_timings_responses_streaming);
+    RUN_TEST(test_usage_timings_zero_decode_no_div_by_zero);
+    RUN_TEST(test_usage_timings_omitted_when_null);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",

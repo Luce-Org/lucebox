@@ -212,15 +212,40 @@ private:
                    int kv_offset = 0);
 
     // Speculative decode loop: draft → verify → accept until EOS/max.
+    // When budget_hook is non-null and (n_gen - generated) drops to the
+    // hard-limit boundary, breaks out of the spec-decode loop and tails
+    // off via do_ar_decode so the force-close override fires cleanly
+    // with KV state intact. Spec-decode itself can't safely inject the
+    // close token mid-batch (verify-and-accept assumes the sampled
+    // tokens are the ones that got committed), so the boundary switch
+    // is the simplest correct integration.
     bool do_spec_decode(int committed, int n_gen,
                         std::vector<int32_t> & out_tokens,
                         const DaemonIO & io,
-                        const std::vector<int32_t> * hint_tokens = nullptr);
+                        const std::vector<int32_t> * hint_tokens = nullptr,
+                        const BudgetHook * budget_hook = nullptr,
+                        bool * forced_close_out = nullptr,
+                        bool * degenerate_close_out = nullptr);
 
     // AR decode fallback (no draft model or sampling mode).
+    // budget_hook (when close_token_ids is non-empty) overrides the next
+    // sampled token(s) with the close-tag sequence once (n_gen - committed)
+    // <= hard_limit. For Qwen3.x, close_token_ids is the canonical
+    // "Considering the limited time..." summarize-and-stop lead-in (24
+    // tokens including `</think>`); for non-qwen arches it's a single
+    // close-tag token. Mirrors the trained pathway documented in the
+    // Qwen3 technical report (arXiv 2505.09388).
+    // forced_close_out, when non-null, is set to true iff the hook injected
+    // the close sequence (vs. the model self-closing at the boundary). The
+    // server uses this to attribute close_kind=hard correctly — decoding
+    // the token stream and grepping for "</think>" cannot distinguish an
+    // injected close from a natural one because the bytes are identical.
     bool do_ar_decode(int committed, int n_gen,
                       std::vector<int32_t> & out_tokens,
-                      const DaemonIO & io);
+                      const DaemonIO & io,
+                      const BudgetHook & budget_hook = {},
+                      bool * forced_close_out = nullptr,
+                      bool * degenerate_close_out = nullptr);
 
     bool sync_remote_draft_features(int start_pos, int n_tokens);
 

@@ -15,6 +15,7 @@
 #include "tokenizer.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -105,6 +106,31 @@ public:
     // Abort reservation.
     void abort_full_snap(int slot);
 
+    // ── Introspection (for /props) ──────────────────────────────────
+
+    struct InlineStats {
+        int capacity;
+        int in_use;
+        int64_t lifetime_hits;
+    };
+    struct FullStats {
+        bool enabled;
+        int capacity;
+        int in_use;
+        int64_t disk_bytes;
+        int64_t lifetime_hits;
+    };
+
+    // Lockless snapshot for /props. Every published field — hit
+    // counters, disk-bytes, AND the two in-use counts — is mirrored to
+    // an std::atomic that the daemon thread updates alongside the
+    // backing vector. /props reads those atomics with
+    // memory_order_relaxed, so the cross-thread read is well-defined
+    // under the C++ memory model. Used for an ops dashboard; not safe
+    // for control-flow decisions.
+    InlineStats stats() const;
+    FullStats full_stats() const;
+
 private:
     bool disabled_ = true;
     int cap_ = 0;
@@ -134,6 +160,21 @@ private:
     std::vector<FullLruEntry> full_entries_;
     PrefixHash full_pending_evict_key_{};
     bool full_has_pending_evict_ = false;
+    // Atomic so /props can read them from a client thread without
+    // tearing across the daemon thread's increments. Relaxed ordering
+    // is sufficient — no synchronization with other state required.
+    std::atomic<int64_t> lifetime_hits_{0};       // inline cache hits
+    std::atomic<int64_t> full_lifetime_hits_{0};  // full-compress cache hits
+    std::atomic<int64_t> full_disk_bytes_{0};     // best-effort snapshot of disk usage
+    // Atomic mirrors of `entries_.size()` and `full_entries_.size()`.
+    // The vectors themselves are mutated only on the daemon thread
+    // under the daemon's serialised request loop, but `/props` reads
+    // happen from the client thread — calling `.size()` there is a
+    // data race per the C++ memory model. Bump these alongside every
+    // push_back / erase / clear so the public introspection counters
+    // stay well-defined. (Codex r1 P2 follow-up.)
+    std::atomic<int64_t> entries_size_count_{0};       // mirrors entries_.size()
+    std::atomic<int64_t> full_entries_size_count_{0};  // mirrors full_entries_.size()
 
     // Helpers
     int find_entry(const PrefixHash & h) const;

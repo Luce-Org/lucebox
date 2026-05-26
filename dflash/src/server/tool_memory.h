@@ -31,6 +31,18 @@ public:
 
     bool disabled() const { return max_entries_ == 0 || max_bytes_ == 0; }
 
+    // Snapshot for /props. Two successive reads under the same thread,
+    // matching the Python implementation's "may tear by one entry" semantics.
+    struct Stats {
+        size_t max_entries;
+        size_t max_bytes;
+        size_t current_entries;
+        size_t current_bytes;
+    };
+    Stats stats() const {
+        return {max_entries_, max_bytes_, by_id_.size(), total_bytes_};
+    }
+
 private:
     struct Block {
         size_t      size_bytes;
