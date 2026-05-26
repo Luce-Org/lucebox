@@ -27,7 +27,7 @@ CONTEXTS = [32768, 65536, 131072]
 CONDITION_SPECS = {"ee7": (7, 7)}  # (EARLY_EXIT_N, SCORE_LAYERS)
 
 
-def start_server(condition, ctx, log_path, compression_mode="always", keep_ratio=0.05):
+def start_server(condition, log_path, compression_mode="always", keep_ratio=0.05):
     # server accepts off|auto|always; allow "none" as alias for "off"
     srv_compression = "off" if compression_mode == "none" else compression_mode
     max_ctx = 139264
@@ -112,9 +112,9 @@ def score_response(answer: int, response_text: str) -> bool:
 
 def run_one_case(condition, ctx, case, case_idx, results_dir, compression_mode="always", keep_ratio=0.05):
     log_path = results_dir / f"{condition}_{ctx}_case{case_idx}_server.log"
-    proc = start_server(condition, ctx, log_path, compression_mode=compression_mode, keep_ratio=keep_ratio)
+    proc = start_server(condition, log_path, compression_mode=compression_mode, keep_ratio=keep_ratio)
     result = {
-        "ttft_s": None, "text": "", "passed": False, "error": None,
+        "latency_s": None, "text": "", "passed": False, "error": None,
         "drafter_fwd_s": None, "tail_score_s": None, "ggml_assert_count": 0,
     }
     try:
@@ -138,14 +138,14 @@ def run_one_case(condition, ctx, case, case_idx, results_dir, compression_mode="
         t0 = time.perf_counter()
         try:
             r = requests.post(f"{BASE_URL}/v1/chat/completions", json=payload, timeout=600)
-            result["ttft_s"] = time.perf_counter() - t0
+            result["latency_s"] = time.perf_counter() - t0
             r.raise_for_status()
             data = r.json()
             text = data["choices"][0]["message"]["content"]
             result["text"] = text[:300]
             result["passed"] = score_response(case["answer"], text)
         except Exception as e:
-            result["ttft_s"] = time.perf_counter() - t0
+            result["latency_s"] = time.perf_counter() - t0
             result["error"] = str(e)
     finally:
         stop_server(proc)
@@ -165,8 +165,8 @@ def run_condition_ctx(condition, ctx, cases, results_dir, compression_mode="alwa
         case_results.append(r)
         status = "PASS" if r["passed"] else "FAIL"
         drafter_s = f"{r['drafter_fwd_s']:.3f}s" if r["drafter_fwd_s"] else "N/A"
-        ttft_s = f"{r['ttft_s']:.2f}s" if r["ttft_s"] is not None else "N/A"
-        print(f"  case {i}: ttft={ttft_s} drafter={drafter_s} [{status}] resp={r['text'][:80]!r}", flush=True)
+        latency_s = f"{r['latency_s']:.2f}s" if r["latency_s"] is not None else "N/A"
+        print(f"  case {i}: latency={latency_s} drafter={drafter_s} [{status}] resp={r['text'][:80]!r}", flush=True)
         if r["error"]:
             print(f"  case {i}: error={r['error'][:200]}", flush=True)
         if r.get("ggml_assert_count", 0) > 0:

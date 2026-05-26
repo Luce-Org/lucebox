@@ -153,7 +153,7 @@ def run_one_case(condition, case, case_idx, results_dir, compression_mode, keep_
     result = {
         "id": case.get("id", f"row_{case_idx}"),
         "answers": case["answers"],
-        "ttft_s": None,
+        "latency_s": None,
         "text": "",
         "f1": 0.0,
         "error": None,
@@ -182,14 +182,14 @@ def run_one_case(condition, case, case_idx, results_dir, compression_mode, keep_
         t0 = time.perf_counter()
         try:
             r = requests.post(f"{BASE_URL}/v1/chat/completions", json=payload, timeout=600)
-            result["ttft_s"] = time.perf_counter() - t0
+            result["latency_s"] = time.perf_counter() - t0
             r.raise_for_status()
             data = r.json()
             text = data["choices"][0]["message"]["content"]
             result["text"] = text[:400]
             result["f1"] = best_f1(text, case["answers"])
         except Exception as e:
-            result["ttft_s"] = time.perf_counter() - t0
+            result["latency_s"] = time.perf_counter() - t0
             result["error"] = str(e)
     finally:
         stop_server(proc)
@@ -206,8 +206,8 @@ def run_condition(condition, cases, results_dir, compression_mode, keep_ratio):
         print(f"  case {i}: id={case.get('id')} length={case.get('length')} answers={case['answers'][:2]}", flush=True)
         r = run_one_case(condition, case, i, results_dir, compression_mode, keep_ratio)
         case_results.append(r)
-        ttft_s = f"{r['ttft_s']:.2f}s" if r["ttft_s"] is not None else "N/A"
-        print(f"  case {i}: ttft={ttft_s} f1={r['f1']:.3f} resp={r['text'][:80]!r}", flush=True)
+        latency_s = f"{r['latency_s']:.2f}s" if r["latency_s"] is not None else "N/A"
+        print(f"  case {i}: latency={latency_s} f1={r['f1']:.3f} resp={r['text'][:80]!r}", flush=True)
         if r["error"]:
             print(f"  case {i}: error={r['error'][:200]}", flush=True)
         if r.get("ggml_assert_count", 0) > 0:
@@ -273,6 +273,8 @@ def main():
     with open(data_path) as f:
         cases = [json.loads(line) for line in f]
     cases = cases[: args.max_cases]
+    if not cases:
+        sys.exit(f"[error] no cases loaded from {data_path}")
     print(f"[init] {len(cases)} cases from {data_path}", flush=True)
     print(f"[init] length range: {min(c['length'] for c in cases)}-{max(c['length'] for c in cases)}", flush=True)
 
