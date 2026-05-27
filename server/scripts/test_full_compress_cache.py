@@ -34,14 +34,13 @@ ROOT          = Path(__file__).resolve().parent.parent.parent
 TARGET        = Path.home() / "models/qwen3.6-27b/Qwen3.6-27B-UD-Q4_K_XL.gguf"
 DRAFT         = Path.home() / "models/qwen3.6-27b-dflash"
 DRAFTER_GGUF  = Path.home() / "models/Qwen3-0.6B-BF16.gguf"
-BIN           = ROOT / "dflash/build/test_dflash"
-SERVER_SCRIPT = ROOT / "dflash/scripts/server.py"
+SERVER_BIN    = ROOT / "dflash/build/dflash_server"
 
 for p, label in [
     (TARGET,       "target GGUF"),
     (DRAFT,        "draft dir/GGUF"),
     (DRAFTER_GGUF, "drafter GGUF"),
-    (BIN,          "test_dflash binary"),
+    (SERVER_BIN,   "dflash_server binary"),
 ]:
     if not p.exists():
         print(f"SKIP: {label} missing at {p}")
@@ -94,14 +93,11 @@ SERVER_LOG = open("/tmp/test_full_compress_cache_server.log", "w")
 # Total = 8 == daemon hard cap (PREFIX_CACHE_SLOTS in test_dflash.cpp).
 proc = subprocess.Popen(
     [
-        sys.executable, "-u", str(SERVER_SCRIPT),
-        "--target",             str(TARGET),
+        str(SERVER_BIN),            str(TARGET),
         "--draft",              str(DRAFT),
-        "--bin",                str(BIN),
         "--max-ctx",            "8192",
         "--port",               str(PORT),
         "--prefix-cache-slots", "4",
-        "--prefill-cache-slots","4",
         "--prefill-compression","auto",
         "--prefill-threshold",  "32000",
         "--prefill-keep-ratio", "0.05",

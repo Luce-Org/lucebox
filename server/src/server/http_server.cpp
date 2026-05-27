@@ -33,8 +33,6 @@ namespace dflash::common {
 //   - field removed
 //   - existing field's semantics change (units, nullability, type)
 // Do NOT bump for additive changes (new fields, new sections).
-//
-// Matches dflash/scripts/server.py:175 (PROPS_SCHEMA constant).
 static constexpr int  kPropsSchema  = 2;
 static constexpr char kServerName[] = "luce-dflash";
 #ifndef DFLASH_SERVER_VERSION
@@ -79,10 +77,7 @@ static size_t json_array_size(const json & value) {
     return value.is_array() ? value.size() : 0;
 }
 
-// Build the /props response body. Matches dflash/scripts/server.py:1221-1312
-// key-for-key so cross-server diffs stay clean. The Python version is the
-// reference impl; if a key drifts here, update it there too (or document the
-// intentional difference in docs/specs/thinking-budget.md).
+// Build the /props response body.
 //
 // Non-static so unit tests can call it directly (declared in http_server.h).
 json build_props_body(const ServerConfig & config,
@@ -641,7 +636,6 @@ void HttpServer::handle_client(int fd) {
     }
 
     // Introspection: server config + cache stats + arch + capabilities.
-    // Matches dflash/scripts/server.py:1221-1312 key-for-key.
     if (hr.method == "GET" && hr.path == "/props") {
         json body = build_props_body(config_, prefix_cache_, tool_memory_);
         send_response(fd, 200, "application/json", body.dump() + "\n");
@@ -860,7 +854,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
 
         // Determine thinking mode BEFORE rendering so the template can inject
         // the <think>\n\n</think>\n\n block when thinking is disabled.
-        // Default: thinking OFF (matches server.py — Qwen3.6 thinking wrecks
+        // Default: thinking OFF (Qwen3.6 thinking wrecks
         // DFlash acceptance rates; clients opt in explicitly).
         bool enable_thinking = false;
 

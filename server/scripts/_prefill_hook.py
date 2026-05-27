@@ -6,7 +6,7 @@ in-process Qwen3-0.6B drafter + FlashPrefill scoring (BSA), then emits the
 compressed token-id stream. ``free drafter`` releases drafter weights + KV +
 BSA scratch, and ``park`` / ``unpark`` cycle target/draft weights through VRAM.
 
-This module wraps that protocol so server.py can fold ``--prefill-*`` flags
+This module wraps that protocol so dflash_server can fold ``--prefill-*`` flags
 into the existing request flow without duplicating the plumbing. The drafter
 and target use *different* tokenizers (Qwen3-0.6B vs
 Qwen3.5/3.6-27B), so the pipeline is:

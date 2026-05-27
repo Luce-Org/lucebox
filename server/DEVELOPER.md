@@ -113,7 +113,7 @@ The target path can also be set via the `DFLASH_TARGET` environment variable.
 
 ```bash
 cd dflash
-python scripts/server.py
+./build/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf --port 8080
 ```
 
 ### Server CLI flags
@@ -226,8 +226,6 @@ server/
 │   ├── Qwen3.6-27B-Q4_K_M.gguf
 │   └── draft/dflash-draft-3.6-q8_0.gguf
 ├── scripts/
-│   ├── server.py               # Main OpenAI/Codex server
-│   ├── prefix_cache.py         # LRU prefix cache
 │   ├── _prefill_hook.py        # Speculative prefill compression
 │   ├── run.py                  # CLI text generation
 │   ├── test_server.py          # Python unit tests ← must pass
@@ -267,7 +265,7 @@ No `env_key` is needed for local use.
 
 ```bash
 # Start the server
-python server/scripts/server.py --port 8080
+./build/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf --port 8080
 
 # In another terminal
 codex --provider dflash "Explain this codebase"

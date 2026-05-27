@@ -41,17 +41,16 @@ PROMPT_FILE=harness/clients/prompts/repo_inspection.txt harness/clients/run_herm
 CLIENT=opencode harness/clients/run_backend_pair.sh
 ```
 
-Use the native C++ server instead of the Python server:
+Use the native C++ server:
 
 ```bash
-LUCEBOX_SERVER_BACKEND=cpp harness/clients/run_codex.sh
+harness/clients/run_codex.sh
 ```
 
 The native server binary defaults to `server/build/dflash_server`. Override the
-paths and profile the same way as the Python backend:
+paths and profile:
 
 ```bash
-LUCEBOX_SERVER_BACKEND=cpp \
 DFLASH_SERVER_BIN=server/build/dflash_server \
 TARGET=server/models/Qwen3.6-27B-Q4_K_M.gguf \
 DRAFT=server/models/draft/dflash-draft-3.6-q8_0.gguf \
@@ -83,7 +82,7 @@ need different context limits on a 24 GB card.
 
 ## Test a server change
 
-If you already have `server/scripts/server.py` running, use `probe`:
+If you already have `dflash_server` running, use `probe`:
 
 ```bash
 python3 harness/client_test_runner.py probe \

@@ -64,11 +64,9 @@ harness/clients/run_claude_code.sh
 python3 harness/client_test_runner.py probe --url http://127.0.0.1:8000
 ```
 
-The harness can also launch the native C++ HTTP server instead of the Python
-server wrapper:
+The harness launches the native C++ HTTP server (`dflash_server`):
 
 ```bash
-LUCEBOX_SERVER_BACKEND=cpp \
 DFLASH_SERVER_BIN=server/build/dflash_server \
 MAX_CTX=32768 BUDGET=22 VERIFY_MODE=ddtree \
 harness/clients/run_codex.sh

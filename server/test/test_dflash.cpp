@@ -711,7 +711,7 @@ int main(int argc, char ** argv) {
     // ---- Architecture detection ------------------------------------------
     // Read general.architecture from the target GGUF before parsing argv
     // shape so we can route laguna requests to run_laguna_daemon() and
-    // accept the no-draft argv layout server.py uses for that arch.
+    // accept the no-draft argv layout used for that arch.
     #include "gguf_inspect.h"
     const auto model_info   = dflash::common::inspect_gguf_model_info(target_path);
     const std::string detected_arch = model_info.arch;
@@ -720,7 +720,7 @@ int main(int argc, char ** argv) {
     const bool is_gemma4 = (detected_arch == "gemma4");
 
     // When arch == laguna there is no DFlash draft model (Poolside hasn't
-    // released one); server.py omits --draft from the spawn cmd. Accept the
+    // released one); dflash_server omits --draft for laguna. Accept the
     // shorter argv layout: argv[1] = target, argv[2..] = flags. Same fall-
     // back applies if the user manually drops the draft (argv[2] starts with
     // a dash) on any arch — keeps the binary friendly to ad-hoc invocation.
@@ -951,7 +951,7 @@ int main(int argc, char ** argv) {
     // exists. Laguna is a pure-attention MoE arch with no published draft,
     // so dispatch to run_laguna_daemon() before any qwen35-specific init.
     // The daemon protocol it speaks (bare prompt, samp= tail, generate cmd)
-    // matches what scripts/server.py emits, so the OpenAI HTTP path is
+    // matches what dflash_server emits, so the OpenAI HTTP path is
     // byte-identical for the two arches — only the binary'́s internal
     // forward kernels differ.
     if (is_laguna) {

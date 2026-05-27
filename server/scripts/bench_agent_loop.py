@@ -31,8 +31,7 @@ from pathlib import Path
 ROOT          = Path(__file__).resolve().parent.parent.parent
 TARGET        = Path.home() / "models/qwen3.6-27b/Qwen3.6-27B-UD-Q4_K_XL.gguf"
 DRAFT         = Path.home() / "models/qwen3.6-27b-dflash"
-BIN           = ROOT / "dflash/build/test_dflash"
-SERVER_SCRIPT = ROOT / "dflash/scripts/server.py"
+SERVER_BIN    = ROOT / "dflash/build/dflash_server"
 SESSION_DIR   = Path.home() / ".claude/projects/-home-peppi-Dev-lucebox-hub"
 
 
@@ -85,8 +84,8 @@ def run_config(label: str, port: int, slots: int, user_turns: list[str],
     """Spin up server with --prefix-cache-slots=slots, replay turns, return latencies."""
     log_f = open(log_path, "w")
     proc = subprocess.Popen(
-        [sys.executable, "-u", str(SERVER_SCRIPT),
-         "--target", str(TARGET), "--draft", str(DRAFT), "--bin", str(BIN),
+        [str(SERVER_BIN), str(TARGET),
+         "--draft", str(DRAFT),
          "--max-ctx", "4096", "--port", str(port),
          "--prefix-cache-slots", str(slots)],
         stdout=log_f, stderr=subprocess.STDOUT, bufsize=1)
@@ -141,8 +140,8 @@ def main():
                          f"{SESSION_DIR}")
     args = ap.parse_args()
 
-    if not TARGET.exists() or not BIN.exists():
-        print(f"SKIP: prereqs missing (target={TARGET.exists()} bin={BIN.exists()})")
+    if not TARGET.exists() or not SERVER_BIN.exists():
+        print(f"SKIP: prereqs missing (target={TARGET.exists()} bin={SERVER_BIN.exists()})")
         return 0
 
     if args.session:

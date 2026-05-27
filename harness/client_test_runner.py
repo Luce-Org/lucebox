@@ -700,7 +700,7 @@ def probe_anthropic_messages(base_url: str, *, include_long: bool = False) -> li
         "max_tokens": 32,
         "temperature": 0,
         "stop_sequences": ["\n\n\n"],
-        # Claude Code sends tool metadata. server.py currently ignores extra
+        # Claude Code sends tool metadata. dflash_server currently ignores extra
         # Anthropic fields, but the request must not fail validation.
         "tools": [{
             "name": "Read",
@@ -1036,14 +1036,11 @@ def start_server(
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{profile.name}-{int(time.time())}-{port}.log"
     args = [
-        sys.executable,
-        "-u",
-        str(ROOT / "dflash" / "scripts" / "server.py"),
+        str(bin_path),
+        str(target),
         "--host", "127.0.0.1",
         "--port", str(port),
-        "--target", str(target),
         "--draft", str(draft),
-        "--bin", str(bin_path),
         *profile.args,
     ]
     if profile.needs_prefill_drafter:
@@ -1943,7 +1940,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sweep = sub.add_parser("sweep", help="Start server profiles and probe them")
     p_sweep.add_argument("--target", type=Path, required=True)
     p_sweep.add_argument("--draft", type=Path, required=True)
-    p_sweep.add_argument("--bin", type=Path, required=True)
+    p_sweep.add_argument("--bin", type=Path, required=True,
+                         help="Path to dflash_server binary")
     p_sweep.add_argument("--prefill-drafter", type=Path, default=None)
     p_sweep.add_argument("--profiles", default="rtx3090_dflash_fast,rtx3090_dflash_safe")
     p_sweep.add_argument("--clients", default="all")

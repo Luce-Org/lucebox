@@ -67,7 +67,7 @@ Prefill numbers assume `--max-ctx` sized to the prompt (auto-fit in `run.py` / `
 
 HE 10-prompt bench mean in 128K mode (ctx=131072, ddtree-budget=16, FA window=2048): **134.78 tok/s** at AL 8.33.
 
-Decode tok/s assume the default sliding-window flash attention (`--fa-window 2048`, lossless: 100% acceptance at all window sizes). Disable with `--fa-window 0` for full attention; expect ~25 tok/s at 60K+. Tune the window via `python3 scripts/run.py --fa-window N` or `--fa-window N` on `test_dflash`/`server.py` (sweet spot 1024–2048; bigger windows trade speed for marginally tighter attention).
+Decode tok/s assume the default sliding-window flash attention (`--fa-window 2048`, lossless: 100% acceptance at all window sizes). Disable with `--fa-window 0` for full attention; expect ~25 tok/s at 60K+. Tune the window via `python3 scripts/run.py --fa-window N` or `--fa-window N` on `test_dflash`/`dflash_server` (sweet spot 1024–2048; bigger windows trade speed for marginally tighter attention).
 
 Set `DFLASH27B_KV_TQ3=1` (TQ3_0, 3.5 bpv, default) or `DFLASH27B_KV_Q4=1` (Q4_0, 4.5 bpv, legacy) to enable. Full sweep in [RESULTS.md](RESULTS.md).
 
@@ -116,7 +116,7 @@ allows capacity checks where the draft and a target layer range share one GPU
 before serving integration. `--target-split-dflash` runs the same split target
 placement through a chain DFlash decode loop and reports acceptance length.
 
-**Python flags on `scripts/run.py`, `scripts/server.py`:**
+**CLI flags on `scripts/run.py`:**
 ```bash
 python3 scripts/run.py --ctk q8_0 --ctv q4_0 --prompt "hello"
 python3 scripts/run.py --cache-type-k q8_0 --cache-type-v q4_0 --prompt "hello"
@@ -134,7 +134,7 @@ Qwen3.6-27B is the default integration path. It uses the same `qwen35` target ar
 # 1. target
 hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
 
-# 2. matched 3.6 draft (GGUF, used by default by scripts/run.py and server.py)
+# 2. matched 3.6 draft (GGUF, used by default by scripts/run.py and dflash_server)
 hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q8_0.gguf --local-dir models/draft/
 
 # 3. bench
@@ -146,7 +146,7 @@ The default draft path is discovered under `models/draft/`. Scripts prefer `dfla
 ## Native C++ HTTP server
 
 `dflash_server` serves the same client-facing local API surface used by the
-harnesses without the Python `scripts/server.py` wrapper. It supports `/health`,
+harnesses. It supports `/health`,
 `/v1/models`, OpenAI Chat Completions including streaming and tool metadata,
 OpenAI Responses for Codex, Anthropic Messages for Claude Code, and Open WebUI
 model metadata.
@@ -212,8 +212,8 @@ and dispatches by arch:
   - `qwen35` / `qwen36` → existing DFlash + DDTree pipeline (no change).
   - `laguna` → `dflash::common::run_laguna_daemon()` (no spec-decode, no DDTree).
 
-The daemon stdin/stream-fd protocol is identical, so `scripts/server.py`
-drives both arches end-to-end. The only thing the user changes is `--target`.
+The daemon stdin/stream-fd protocol is identical, so `dflash_server`
+drives both arches end-to-end. The only thing the user changes is the model path.
 
 ### Build + run
 
@@ -226,11 +226,9 @@ hf download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-BF16.gguf --local-dir models/
 hf download poolside/Laguna-XS.2 --local-dir models/Laguna-XS-2 \
     --include 'tokenizer*' '*.json'
 
-# OpenAI-compatible HTTP server (same scripts/server.py used for qwen35).
-# server.py drops --draft and the DFlash/DDTree flags when arch=laguna;
-# test_dflash itself routes to run_laguna_daemon().
-python3 scripts/server.py \
-    --target models/laguna-xs2-Q4_K_M.gguf \
+# OpenAI-compatible HTTP server.
+# dflash_server routes to run_laguna_daemon() when arch=laguna.
+./build/dflash_server models/laguna-xs2-Q4_K_M.gguf \
     --max-ctx 16384 --port 8000
 
 curl -sN http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
@@ -243,7 +241,7 @@ curl -sN http://localhost:8000/v1/chat/completions -H 'Content-Type: application
 DFLASH_KV_TYPE=q4_0 ./build/bench_laguna_ttft models/laguna-xs2-Q4_K_M.gguf '4096,16384,65536'
 
 # NIAH single-needle, with PFlash compression. The driver still spawns the
-# standalone test_laguna_daemon binary so it can run without server.py.
+# standalone test_laguna_daemon binary so it can run without dflash_server.
 python3 scripts/laguna_pflash_niah.py \
     --target models/laguna-xs2-Q4_K_M.gguf \
     --drafter models/Qwen3-0.6B-BF16.gguf \
@@ -303,7 +301,7 @@ tokens) is the path to bring code recall to the same ratio as prose.
 ### Outstanding
 
 - **No Laguna spec-decode draft published yet.** Current decode is autoregressive only (~111 tok/s on RTX 3090). When a matched draft lands, the DFlash + DDTree machinery already in `test_dflash` ports across.
-- **Prefix cache + in-process PFlash compression** are disabled on the laguna server.py path. Both require `SNAPSHOT` / `RESTORE` / `FREE_SNAPSHOT` and `compress` / `park` / `unpark` commands inside `run_laguna_daemon`. Tracked as follow-ups; the qwen35 path uses them today.
+- **Prefix cache + in-process PFlash compression** are disabled on the laguna path. Both require `SNAPSHOT` / `RESTORE` / `FREE_SNAPSHOT` and `compress` / `park` / `unpark` commands inside `run_laguna_daemon`. Tracked as follow-ups; the qwen35 path uses them today.
 - **Path B (in-process Python drafter)** is not used here. Path A keeps the dflash daemon ggml-only.
 
 ## Quick start
@@ -343,10 +341,8 @@ python3 scripts/run.py --prompt "def fibonacci(n):"
 python3 examples/chat.py
 
 # OpenAI-compatible HTTP server (drop-in for Open WebUI / LM Studio / Cline).
-# Python deps are managed by the workspace at the repo root — run `uv sync`
-# once from `lucebox-hub/`, then the command below (uv finds the workspace
-# .venv automatically from any member subdir).
-uv run python scripts/server.py --port 8000 --daemon
+./build/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf \
+  --draft models/draft/dflash-draft-3.6-q8_0.gguf --port 8000
 
 # Reproduce paper numbers
 python3 scripts/bench_llm.py                                 # HE + GSM8K + Math500
@@ -457,10 +453,9 @@ only wire protocol used by [OpenAI Codex](https://github.com/openai/codex).
 ### 1. Start the DFlash server
 
 ```bash
-python server/scripts/server.py \
-  --target models/Qwen3.5-27B-Q4_K_M.gguf \
+./build/dflash_server models/Qwen3.5-27B-Q4_K_M.gguf \
   --draft models/Qwen3.5-3B-f16.safetensors \
-  --budget 22 --port 8080
+  --ddtree --ddtree-budget 22 --port 8080
 ```
 
 ### 2. Configure Codex

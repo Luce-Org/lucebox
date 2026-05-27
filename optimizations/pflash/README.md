@@ -92,7 +92,7 @@ uv run --directory pflash python tests/bench_niah_cpp.py \
 
 ## OpenAI server flags
 
-For an OpenAI-compatible server with transparent compression on long prompts, run [`server/scripts/server.py`](../server/scripts/server.py) with these flags:
+For an OpenAI-compatible server with transparent compression on long prompts, run `dflash_server` with these flags:
 
 | Flag | Choices / type | Default | Effect |
 |---|---|:---:|---|
@@ -105,10 +105,9 @@ For an OpenAI-compatible server with transparent compression on long prompts, ru
 When `--prefill-compression != off`, the server auto-sets `DFLASH27B_LM_HEAD_FIX=0` and `DFLASH27B_FA_WINDOW=0` (matching the bench harness — needed so the post-compress draft graph fits on a 24 GB card without OOM).
 
 ```bash
-python server/scripts/server.py \
-  --target server/models/Qwen3.6-27B-Q4_K_M.gguf \
+./build/dflash_server server/models/Qwen3.6-27B-Q4_K_M.gguf \
   --draft  server/models/draft/model.safetensors \
-  --max-ctx 8192 --budget 16 --fa-window 0 \
+  --max-ctx 8192 --fa-window 0 \
   --prefill-compression auto \
   --prefill-threshold 4096 \
   --prefill-keep-ratio 0.02 \
