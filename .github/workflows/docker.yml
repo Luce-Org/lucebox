@@ -22,13 +22,13 @@ on:
       - docker-bake.hcl
       - .dockerignore
       - .github/workflows/docker.yml
-      - dflash/CMakeLists.txt
-      - dflash/src/**
-      - dflash/test/**
-      - dflash/include/**
-      - dflash/scripts/**
-      - dflash/deps/**
-      - dflash/pyproject.toml
+      - server/CMakeLists.txt
+      - server/src/**
+      - server/test/**
+      - server/include/**
+      - server/scripts/**
+      - server/deps/**
+      - server/pyproject.toml
       - pyproject.toml
       - uv.lock
       - lucebox.sh
