@@ -127,7 +127,7 @@ MAX_CTX=32768 BUDGET=22 VERIFY_MODE=ddtree \
 harness/clients/run_codex.sh
 ```
 
-## Run the server
+## Run the Server
 
 Default: Qwen 3.6-27B Q4_K_M target + Lucebox Q8_0 DFlash drafter on RTX 3090. DDTree budget=22, TQ3_0 KV cache, sliding FA window 2048. OpenAI-compatible HTTP on `:8000`.
 
@@ -141,10 +141,11 @@ cmake --build server/build --target dflash_server -j
 hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir server/models/
 hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q8_0.gguf --local-dir server/models/draft/
 
-# run
+# run (TQ3_0 KV auto-enabled; set =0 to disable)
+DFLASH27B_KV_TQ3=1 \
 ./server/build/dflash_server server/models/Qwen3.6-27B-Q4_K_M.gguf \
   --draft server/models/draft/dflash-draft-3.6-q8_0.gguf \
-  --ddtree --ddtree-budget 22 --port 8000
+  --ddtree --ddtree-budget 22 --fa-window 2048 --port 8000
 ```
 
 ### Server flags
@@ -167,7 +168,7 @@ hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q8_0.gguf --local-d
 |---|---|---|
 | `--ddtree` | off (chain) | Enable tree verify |
 | `--ddtree-budget N` | `22` | Tree size. 22 on 3090, 40 on 5090, re-sweep on GB10 |
-| `--fa-window N` | `2048` | Sliding FA window (lossless); `0` = full attention |
+| `--fa-window N` | `2048` | Sliding FA window; `0` = full attention |
 | `--lazy-draft` | off | Defer draft load until first request |
 
 **Prefill compression (PFlash)**
@@ -220,7 +221,7 @@ hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q8_0.gguf --local-d
 
 ---
 
-## Megakernel research bench (Qwen 3.5-0.8B)
+## Run Megakernel Bench (Qwen 3.5-0.8B)
 
 Separate Python bench; 24 layers fused into one persistent CUDA dispatch.
 **413 tok/s decode, 21,347 prefill, 1.87 tok/J @220W** vs llama.cpp BF16.
