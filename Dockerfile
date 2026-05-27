@@ -116,6 +116,7 @@ COPY pyproject.toml uv.lock README.md /src/
 COPY server/pyproject.toml server/README.md /src/server/
 COPY server/scripts /src/server/scripts
 COPY lucebox /src/lucebox
+COPY luce-bench /src/luce-bench
 COPY optimizations/pflash /src/optimizations/pflash
 COPY optimizations/megakernel /src/optimizations/megakernel
 
@@ -165,6 +166,12 @@ COPY --from=builder /src/optimizations/megakernel/pyproject.toml \
 # member; entrypoint.sh execs `python -m lucebox` for any host-wrapper
 # subcommand other than `serve` / `benchmark` / `shell`.
 COPY --from=builder /src/lucebox /opt/lucebox-hub/lucebox
+
+# luce-bench is the standalone benchmark harness, in-tree as a workspace
+# member (see 490ff95 "absorb luce-bench into the monorepo"). Required so
+# the runtime stage's `uv sync` can resolve `luce-bench = { workspace = true }`
+# in the root pyproject.toml without falling over.
+COPY --from=builder /src/luce-bench /opt/lucebox-hub/luce-bench
 
 # server: ship the entrypoint/benchmark scripts, the pyproject + README that uv
 # resolves against, and the pruned build tree (binaries + .so files from the
