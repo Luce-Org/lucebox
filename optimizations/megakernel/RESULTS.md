@@ -77,12 +77,12 @@ PyTorch reference on the pp520 prompt from `final_bench.py`.
 
 ```bash
 # Auto-dispatches to the NVFP4 path on Blackwell
-python megakernel/final_bench.py
+python optimizations/megakernel/final_bench.py
 
 # Or force a backend
-python megakernel/final_bench.py --backend nvfp4
-python megakernel/final_bench.py --backend bf16
+python optimizations/megakernel/final_bench.py --backend nvfp4
+python optimizations/megakernel/final_bench.py --backend bf16
 
 # Switch prefill mode (default is "hybrid"; "raw" uses prefill_megakernel_nvfp4)
-MEGAKERNEL_PREFILL_MODE=raw python megakernel/final_bench.py --backend nvfp4
+MEGAKERNEL_PREFILL_MODE=raw python optimizations/megakernel/final_bench.py --backend nvfp4
 ```

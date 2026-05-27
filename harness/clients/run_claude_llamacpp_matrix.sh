@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="${REPO_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 RUN_ROOT="${RUN_ROOT:-${RUN_DIR:-/workspace/lucebox-client-harness-runs/claude-llamacpp-matrix}}"
-TARGET="${TARGET:-$REPO_DIR/dflash/models/Qwen3.6-27B-Q4_K_M.gguf}"
+TARGET="${TARGET:-$REPO_DIR/server/models/Qwen3.6-27B-Q4_K_M.gguf}"
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/workspace/llama-cpp-server-build/bin/llama-server}"
 PROMPT="${PROMPT:-Write exactly 120 words about why a repo-level agent benchmark should run the client harness instead of a handcrafted HTTP request. End with OK_DONE.}"
 MARKER="${MARKER:-OK_DONE}"

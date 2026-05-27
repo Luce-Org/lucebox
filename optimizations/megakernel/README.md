@@ -116,7 +116,7 @@ uv sync --extra megakernel
 uv run --directory megakernel python final_bench.py    # runs pp520 tg128 (properly warmed), prints tok/s
 ```
 
-The legacy standalone flow still works from inside `megakernel/`: create a
+The legacy standalone flow still works from inside `optimizations/megakernel/`: create a
 virtualenv, install `torch`, then run `pip install -e . --no-build-isolation`
 so `setup.py` can import torch while compiling the CUDA extension.
 

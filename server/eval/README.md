@@ -8,7 +8,7 @@ produce different bytes for the same prompt?", not "is the answer correct".
 ## quick A/B (`scripts/quality_ab_simple.py`)
 
 Runs ~7 short conversational prompts against several server configs. For each
-config it spawns a fresh `dflash/scripts/server.py`, fires the prompts in
+config it spawns a fresh `server/scripts/server.py`, fires the prompts in
 sequence, then tears the server down. At the end it prints a markdown table
 comparing each config against the matching baseline (configs ending in `_f16`
 are compared against `baseline_f16` so attention precision is held constant).
@@ -16,9 +16,9 @@ are compared against `baseline_f16` so attention precision is held constant).
 ```
 PFLASH_TARGET=/path/to/target.gguf \
 PFLASH_DRAFT=/path/to/draft-dir-or-safetensors \
-PFLASH_BIN=dflash/build/test_dflash \
+PFLASH_BIN=server/build/test_dflash \
 PFLASH_DRAFTER=/path/to/Qwen3-0.6B-BF16.gguf \
-python3 dflash/scripts/quality_ab_simple.py
+python3 server/scripts/quality_ab_simple.py
 ```
 
 Configs are defined in `CONFIGS` near the top of the script. Each spawns one

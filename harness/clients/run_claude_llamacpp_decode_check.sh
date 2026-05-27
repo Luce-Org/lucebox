@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="${REPO_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 RUN_ROOT="${RUN_ROOT:-${RUN_DIR:-/workspace/lucebox-client-harness-runs/claude-llamacpp-decode-check}}"
-TARGET="${TARGET:-$REPO_DIR/dflash/models/Qwen3.6-27B-Q4_K_M.gguf}"
+TARGET="${TARGET:-$REPO_DIR/server/models/Qwen3.6-27B-Q4_K_M.gguf}"
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/workspace/llama-cpp-server-build/bin/llama-server}"
 STAMP="${STAMP:-q8_32k_decode_check}"
 PROMPT="${PROMPT:-Reply with exactly: OK_DONE}"

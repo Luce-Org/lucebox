@@ -273,7 +273,7 @@ The 131K `keep=0.10` run depends on token-boundary repair in `scripts/laguna_pfl
 
 The table above uses synthetic uniform filler. Pass `--filler-file <path>` to
 use a real corpus instead (file or directory; directories are recursively
-concatenated). On `dflash/src` (1.3 MiB of C++/CUDA, ctx=16K, depth=0.5):
+concatenated). On `server/src` (1.3 MiB of C++/CUDA, ctx=16K, depth=0.5):
 
 | keep | drafter compressed | NIAH |
 |:----:|-------------------:|:----:|
@@ -473,7 +473,7 @@ only wire protocol used by [OpenAI Codex](https://github.com/openai/codex).
 ### 1. Start the DFlash server
 
 ```bash
-python dflash/scripts/server.py \
+python server/scripts/server.py \
   --target models/Qwen3.5-27B-Q4_K_M.gguf \
   --draft models/Qwen3.5-3B-f16.safetensors \
   --budget 22 --port 8080

@@ -47,14 +47,14 @@ Use the native C++ server instead of the Python server:
 LUCEBOX_SERVER_BACKEND=cpp harness/clients/run_codex.sh
 ```
 
-The native server binary defaults to `dflash/build/dflash_server`. Override the
+The native server binary defaults to `server/build/dflash_server`. Override the
 paths and profile the same way as the Python backend:
 
 ```bash
 LUCEBOX_SERVER_BACKEND=cpp \
-DFLASH_SERVER_BIN=dflash/build/dflash_server \
-TARGET=dflash/models/Qwen3.6-27B-Q4_K_M.gguf \
-DRAFT=dflash/models/draft/dflash-draft-3.6-q8_0.gguf \
+DFLASH_SERVER_BIN=server/build/dflash_server \
+TARGET=server/models/Qwen3.6-27B-Q4_K_M.gguf \
+DRAFT=server/models/draft/dflash-draft-3.6-q8_0.gguf \
 MODEL_ID=luce-dflash \
 MAX_CTX=32768 MAX_TOKENS=512 \
 BUDGET=22 VERIFY_MODE=ddtree FA_WINDOW=2048 \
@@ -64,8 +64,8 @@ harness/clients/run_codex.sh
 To test an already-running native server:
 
 ```bash
-dflash/build/dflash_server dflash/models/Qwen3.6-27B-Q4_K_M.gguf \
-  --draft dflash/models/draft/dflash-draft-3.6-q8_0.gguf \
+server/build/dflash_server server/models/Qwen3.6-27B-Q4_K_M.gguf \
+  --draft server/models/draft/dflash-draft-3.6-q8_0.gguf \
   --host 127.0.0.1 --port 18080 \
   --max-ctx 32768 --max-tokens 512 \
   --fa-window 2048 \
@@ -83,7 +83,7 @@ need different context limits on a 24 GB card.
 
 ## Test a server change
 
-If you already have `dflash/scripts/server.py` running, use `probe`:
+If you already have `server/scripts/server.py` running, use `probe`:
 
 ```bash
 python3 harness/client_test_runner.py probe \
@@ -99,9 +99,9 @@ For a GPU sweep, let the runner start Lucebox for each profile:
 
 ```bash
 python3 harness/client_test_runner.py sweep \
-  --target dflash/models/Qwen3.6-27B-Q4_K_M.gguf \
-  --draft dflash/models/draft \
-  --bin dflash/build/test_dflash \
+  --target server/models/Qwen3.6-27B-Q4_K_M.gguf \
+  --draft server/models/draft \
+  --bin server/build/test_dflash \
   --profiles rtx3090_dflash_safe,rtx3090_dflash_long \
   --clients all \
   --json-out /tmp/lucebox_harness_sweep.json

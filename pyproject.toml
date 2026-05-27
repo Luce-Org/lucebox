@@ -31,7 +31,7 @@ package = false
 no-build-isolation-package = ["qwen35-megakernel-bf16"]
 
 [tool.uv.workspace]
-members = ["dflash", "megakernel", "pflash"]
+members = ["server", "optimizations/megakernel", "optimizations/pflash"]
 
 [tool.uv.sources]
 lucebox-dflash = { workspace = true }

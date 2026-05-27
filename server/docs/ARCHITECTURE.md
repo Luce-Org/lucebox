@@ -36,7 +36,7 @@ using a uniform stdin/stdout protocol.
 ## Directory Structure
 
 ```
-dflash/src/
+server/src/
 ├── common/                 # Shared infrastructure (all backends)
 │   ├── model_backend.h     # ModelBackend abstract interface
 │   ├── snapshot_backend.h  # Platform-aware snapshot backend selection
@@ -406,7 +406,7 @@ by Qwen35Backend.
 ### Step 6: Build and Test
 
 ```bash
-cd dflash/build && cmake .. -DCMAKE_BUILD_TYPE=Release && cmake --build . -j$(nproc)
+cd server/build && cmake .. -DCMAKE_BUILD_TYPE=Release && cmake --build . -j$(nproc)
 
 # AR baseline
 ./test_dflash daemon --target ../../models/gemma4.gguf

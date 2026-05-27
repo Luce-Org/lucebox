@@ -8,12 +8,12 @@ REPO_DIR="${REPO_DIR:-/workspace/lucebox-hub-harness}"
 CLIENT_WORK_DIR="${CLIENT_WORK_DIR:-/workspace/lucebox-harness-work}"
 RUN_DIR="${RUN_DIR:-/workspace/lucebox-client-harness-runs}"
 
-TARGET="${TARGET:-$REPO_DIR/dflash/models/Qwen3.6-27B-Q4_K_M.gguf}"
-DRAFT="${DRAFT:-$REPO_DIR/dflash/models/draft/dflash-draft-3.6-q8_0.gguf}"
-DFLASH_BIN="${DFLASH_BIN:-$REPO_DIR/dflash/build/test_dflash}"
+TARGET="${TARGET:-$REPO_DIR/server/models/Qwen3.6-27B-Q4_K_M.gguf}"
+DRAFT="${DRAFT:-$REPO_DIR/server/models/draft/dflash-draft-3.6-q8_0.gguf}"
+DFLASH_BIN="${DFLASH_BIN:-$REPO_DIR/server/build/test_dflash}"
 MODEL_SERVER="${MODEL_SERVER:-lucebox}"
 LUCEBOX_SERVER_BACKEND="${LUCEBOX_SERVER_BACKEND:-python}"
-DFLASH_SERVER_BIN="${DFLASH_SERVER_BIN:-$REPO_DIR/dflash/build/dflash_server}"
+DFLASH_SERVER_BIN="${DFLASH_SERVER_BIN:-$REPO_DIR/server/build/dflash_server}"
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/workspace/llama-cpp-server-build/bin/llama-server}"
 LLAMA_N_GPU_LAYERS="${LLAMA_N_GPU_LAYERS:-999}"
 LLAMA_FLASH_ATTN="${LLAMA_FLASH_ATTN:-1}"
@@ -74,7 +74,7 @@ start_lucebox_server() {
     # EXTRA_SERVER_ARGS="--lazy-draft --prefill-compression auto"
     read -r -a extra_args <<< "$EXTRA_SERVER_ARGS"
   fi
-  python3 -u dflash/scripts/server.py \
+  python3 -u server/scripts/server.py \
     --host "$HOST" \
     --port "$PORT" \
     --target "$TARGET" \
@@ -97,8 +97,8 @@ start_dflash_native_server() {
   if [[ ! -x "$DFLASH_SERVER_BIN" ]]; then
     echo "dflash_server not found or not executable: $DFLASH_SERVER_BIN" >&2
     echo "Build it first, for example:" >&2
-    echo "  cmake -S $REPO_DIR/dflash -B $REPO_DIR/dflash/build -DGGML_CUDA=ON" >&2
-    echo "  cmake --build $REPO_DIR/dflash/build --target dflash_server -j\$(nproc)" >&2
+    echo "  cmake -S $REPO_DIR/dflash -B $REPO_DIR/server/build -DGGML_CUDA=ON" >&2
+    echo "  cmake --build $REPO_DIR/server/build --target dflash_server -j\$(nproc)" >&2
     return 1
   fi
   local extra_args=()
@@ -134,7 +134,7 @@ start_llamacpp_server() {
   if [[ ! -x "$LLAMA_SERVER_BIN" ]]; then
     echo "llama-server not found or not executable: $LLAMA_SERVER_BIN" >&2
     echo "Build it first, for example:" >&2
-    echo "  cmake -S $REPO_DIR/dflash/deps/llama.cpp -B /workspace/llama-cpp-server-build -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF" >&2
+    echo "  cmake -S $REPO_DIR/server/deps/llama.cpp -B /workspace/llama-cpp-server-build -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF" >&2
     echo "  cmake --build /workspace/llama-cpp-server-build --target llama-server -j2" >&2
     return 1
   fi

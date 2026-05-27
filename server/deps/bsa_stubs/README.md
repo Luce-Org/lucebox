@@ -16,7 +16,7 @@ the references BSA actually uses:
   returning `{seed, offset}` from the stub state.
 
 These headers are placed FIRST on the BSA include path
-(`dflash/CMakeLists.txt`, gated on `DFLASH27B_ENABLE_BSA`). When BSA's
+(`server/CMakeLists.txt`, gated on `DFLASH27B_ENABLE_BSA`). When BSA's
 generated CUDA includes `<c10/cuda/CUDAException.h>`, the compiler picks up
 this stub instead of trying to find PyTorch.
 

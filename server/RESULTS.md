@@ -577,7 +577,7 @@ Draft: local Qwen3.6-27B DFlash safetensors + Qwen3-0.6B-BF16 PFlash drafter.
 
 Build: `cmake -B build-luce-sm120 -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 -DDFLASH27B_USER_CUDA_ARCHITECTURES=120 -DDFLASH27B_ENABLE_BSA=ON`
 
-Final ("V4") runtime config — driven via the `pflash/tests/bench_niah_cpp.py`
+Final ("V4") runtime config — driven via the `optimizations/pflash/tests/bench_niah_cpp.py`
 CLI flags added in #90 plus daemon env vars (each bullet leads with the
 exact interface):
 
@@ -589,7 +589,7 @@ exact interface):
 - `--n-gen=1024`
 
 Test set: 10 NIAH prompts at 117K tokens (margin under Qwen3.6-27B's 131K
-native RoPE limit, generated with [`pflash/tests/niah_gen.py`](../pflash/tests/niah_gen.py)
+native RoPE limit, generated with [`optimizations/pflash/tests/niah_gen.py`](../optimizations/pflash/tests/niah_gen.py)
 at calibrated `char_per_tok`).
 
 ### RTX 5090 long-ctx headline
@@ -774,7 +774,7 @@ Linux 4090 should match or exceed the 3090 numbers.
 Running via `server.py` (OpenAI-compatible HTTP) with TQ3 KV cache and 128K context:
 
 ```bash
-DFLASH27B_KV_TQ3=1 python dflash/scripts/server.py \
+DFLASH27B_KV_TQ3=1 python server/scripts/server.py \
   --target Qwen3.6-27B-Q4_K_M.gguf --draft dflash-draft-3.6-q8_0.gguf \
   --port 8082 --budget 28 --max-ctx 131072
 ```

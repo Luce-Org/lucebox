@@ -16,24 +16,24 @@
 </p>
 
 <p align="center">
-  <strong>Local LLM inference server built for speed. Custom kernels, speculative prefill & decoding, quantized GGUF paths.</strong><br/>
-  Each project is a new optimization to our engine for a specific model family and hardware target.
+  <strong>Local LLM inference server built for speed. Custom kernels, speculative prefill & decoding.</strong><br/>
+  Each optimization to our engine is for specific model family and hardware target.
 </p>
 
 ---
 
-## Projects
+## Optimizations
 
-Each directory is a self-contained project with setup instructions and benchmark notes.
+Each directory is self-contained with setup instructions and benchmark notes.
 
 <p align="center">
-  <a href="megakernel/"><img src="assets/svg/card-megakernel-dark.svg" alt="Megakernel" width="46%"></a>
+  <a href="optimizations/megakernel/"><img src="assets/svg/card-megakernel-dark.svg" alt="Megakernel" width="46%"></a>
   &nbsp;&nbsp;
-  <a href="dflash/"><img src="assets/svg/card-dflash-dark.svg" alt="DFlash 27B" width="46%"></a>
+  <a href="server/"><img src="assets/svg/card-dflash-dark.svg" alt="DFlash 27B" width="46%"></a>
 </p>
 
 <p align="center">
-  <a href="pflash/"><img src="assets/svg/card-pflash-dark.svg" alt="PFlash speculative prefill" width="46%"></a>
+  <a href="optimizations/pflash/"><img src="assets/svg/card-pflash-dark.svg" alt="PFlash speculative prefill" width="46%"></a>
 </p>
 
 ---
@@ -69,7 +69,7 @@ server wrapper:
 
 ```bash
 LUCEBOX_SERVER_BACKEND=cpp \
-DFLASH_SERVER_BIN=dflash/build/dflash_server \
+DFLASH_SERVER_BIN=server/build/dflash_server \
 MAX_CTX=32768 BUDGET=22 VERIFY_MODE=ddtree \
 harness/clients/run_codex.sh
 ```
@@ -90,7 +90,7 @@ uv sync --extra megakernel          # builds the CUDA extension; torch is auto-i
 uv run --directory megakernel python final_bench.py
 ```
 
-> Don't have `uv`? Install with `curl -LsSf https://astral.sh/uv/install.sh | sh` or see [astral.sh/uv](https://astral.sh/uv/). The legacy `python -m venv` + `pip install -e . --no-build-isolation` flow still works from inside `megakernel/`.
+> Don't have `uv`? Install with `curl -LsSf https://astral.sh/uv/install.sh | sh` or see [astral.sh/uv](https://astral.sh/uv/). The legacy `python -m venv` + `pip install -e . --no-build-isolation` flow still works from inside `optimizations/megakernel/`.
 
 | Method | Prefill pp520 | Decode tg128 | tok/J |
 |--------|:-------------:|:------------:|:-----:|
@@ -100,9 +100,9 @@ uv run --directory megakernel python final_bench.py
 
 Implementation notes: 82 blocks, 512 threads, cooperative grid sync, no CPU round trips between layers, and weights streamed from Hugging Face on first run.
 
-[Full writeup →](megakernel/README.md) · [Benchmarks →](megakernel/RESULTS.md) · [Blog post →](https://lucebox.com/blog/megakernel)
+[Full writeup →](optimizations/megakernel/README.md) · [Benchmarks →](optimizations/megakernel/RESULTS.md) · [Blog post →](https://lucebox.com/blog/megakernel)
 
-> **Blackwell (RTX 5090, DGX Spark / GB10):** auto-detected by setup; NVFP4 decode path lands ~194 tok/s tg128 on GB10. See [megakernel/README.md#blackwell-sm_120--sm_121a](megakernel/README.md).
+> **Blackwell (RTX 5090, DGX Spark / GB10):** auto-detected by setup; NVFP4 decode path lands ~194 tok/s tg128 on GB10. See [optimizations/megakernel/README.md#blackwell-sm_120--sm_121a](optimizations/megakernel/README.md).
 
 ---
 
@@ -127,14 +127,14 @@ uv sync
 # 3. build the C++/CUDA decoder (CUDA 12+, CMake 3.18+)
 # Default compiles for Pascal/Volta/Turing/Ampere (60/61/62/70/75/86; +120 on CUDA 12.8+, +sm_121/DGX Spark on CUDA 12.9+, +sm_110/Thor on CUDA 13.0+) so the binary runs on every supported card.
 # 3090-only users can add -DCMAKE_CUDA_ARCHITECTURES=86 to skip the other archs and build faster (~3 min).
-cmake -B dflash/build -S dflash -DCMAKE_BUILD_TYPE=Release
-cmake --build dflash/build --target test_dflash -j
-cmake --build dflash/build --target test_generate -j
-cmake --build dflash/build --target dflash_server -j
+cmake -B server/build -S dflash -DCMAKE_BUILD_TYPE=Release
+cmake --build server/build --target test_dflash -j
+cmake --build server/build --target test_generate -j
+cmake --build server/build --target dflash_server -j
 
 # 4. fetch weights: ~16 GB Q4_K_M target + 1.84 GB Lucebox Q8_0 GGUF DFlash draft
-uv run hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir dflash/models/
-uv run hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q8_0.gguf --local-dir dflash/models/draft/
+uv run hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir server/models/
+uv run hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q8_0.gguf --local-dir server/models/draft/
 
 # 5a. one-shot streaming generate
 uv run --directory dflash python scripts/run.py --prompt "def fibonacci(n):"
@@ -163,7 +163,7 @@ Implemented here:
 
 ### Running on other GPUs (4090, 5090, DGX Spark / GB10, Jetson AGX Thor)
 
-Supported out of the box; the build just needs the right CUDA toolkit. `dflash/CMakeLists.txt` already auto-adds Blackwell archs when your nvcc is new enough, so the main quickstart above works as-is on newer cards.
+Supported out of the box; the build just needs the right CUDA toolkit. `server/CMakeLists.txt` already auto-adds Blackwell archs when your nvcc is new enough, so the main quickstart above works as-is on newer cards.
 
 | GPU | Arch | Min CUDA | Status |
 |-----|:----:|:--------:|--------|
@@ -203,9 +203,9 @@ cmake --build build --target test_dflash -j
 **Retune per GPU:**
 - **DDTree `budget=22`** tuned for 3090 + Q4_K_M + 24 GB. On the RTX 5090, budget=40 is optimal (swept). On GB10 (128 GB unified), re-sweep — larger tree = more verify throughput until memory bandwidth saturates. `scripts/bench_llm.py --budget N` has the sweep hooks.
 - **TQ3_0 KV cache + sliding `target_feat` ring** was shaped by 24 GB (fits up to 256K context on a 3090). On GB10 (128 GB unified) / 5090 (32 GB) you can push context further or skip quantization entirely and keep F16 KV.
-- **Perf numbers** (207 tok/s demo, 129.5 HumanEval, 2.8× vs SGLang AWQ) are RTX 3090 @ stock. RTX 5090 numbers (205 tok/s HumanEval, 4.84×) are in [RESULTS.md](dflash/RESULTS.md). Ada/GB10/Thor not yet swept, PRs with `RESULTS.md` entries welcome.
+- **Perf numbers** (207 tok/s demo, 129.5 HumanEval, 2.8× vs SGLang AWQ) are RTX 3090 @ stock. RTX 5090 numbers (205 tok/s HumanEval, 4.84×) are in [RESULTS.md](server/RESULTS.md). Ada/GB10/Thor not yet swept, PRs with `RESULTS.md` entries welcome.
 
-[Full writeup →](dflash/README.md) · [Benchmarks →](dflash/RESULTS.md) · [Blog post →](https://lucebox.com/blog/dflash27b)
+[Full writeup →](server/README.md) · [Benchmarks →](server/RESULTS.md) · [Blog post →](https://lucebox.com/blog/dflash27b)
 
 ---
 
@@ -245,7 +245,7 @@ DFLASH_FP_USE_BSA=1 DFLASH_FP_ALPHA=0.85 \
 
 Daemon stdin commands: `compress` runs the drafter with FlashPrefill block-sparse attention and returns the compressed token-id stream; `generate` runs the target on that stream with normal speculative decode + DDTree. `park` / `unpark` / `free drafter` swap weights in and out of VRAM so target + drafter coexist on a 24 GB card.
 
-**Runtime tunables** (full list in [`dflash/src/flashprefill.h`](dflash/src/flashprefill.h)):
+**Runtime tunables** (full list in [`server/src/flashprefill.h`](server/src/flashprefill.h)):
 ```
 DFLASH_FP_USE_BSA=1     # dispatch sparse FA forward through BSA (sm_80+)
 DFLASH_FP_ALPHA=0.85    # block-selection threshold; higher = stricter = fewer K-blocks per Q-row
@@ -254,11 +254,11 @@ DFLASH_FP_PROFILE=1     # log mean / score / select / forward stage timings
 
 **What's ours, what isn't.** Algorithms are from [Cross-Family Speculative Prefill (Liu et al., ICLR 2026)](https://arxiv.org/abs/2603.02631) for the scoring + selection layer and [FlashPrefill (Fan et al., 2026)](https://arxiv.org/abs/2603.06199) for the drafter sparse-attention forward. What we built:
 - C++/CUDA daemon-resident speculative prefill in front of a quantized GGUF target — no PyTorch, no Triton, no per-request subprocess.
-- BSA wired without `libtorch` via a 3-header ATen/c10 stub set under `dflash/deps/bsa_stubs/`.
+- BSA wired without `libtorch` via a 3-header ATen/c10 stub set under `server/deps/bsa_stubs/`.
 - Custom Qwen3-0.6B forward (`qwen3_0p6b_*`) so the drafter runs through the same ggml allocator as the 27B target.
 - 4 CUDA kernels (`flashprefill_kernels.cu`) for the FlashPrefill `mean_K / score / select / sparse_fwd` algorithm.
 
-[Full writeup →](pflash/README.md) · [Daemon-side build / tunables →](dflash/docs/SPEC_PREFILL.md) · [Blog post →](https://lucebox.com/blog/pflash)
+[Full writeup →](optimizations/pflash/README.md) · [Daemon-side build / tunables →](server/docs/SPEC_PREFILL.md) · [Blog post →](https://lucebox.com/blog/pflash)
 
 ---
 
@@ -282,7 +282,7 @@ cmake --build build --target test_dflash -j
 
 **Per-arch DDTree tuning**: gfx1151 (Strix Halo iGPU, bandwidth-bound on LPDDR5X) peaks at `--ddtree-budget=22`. gfx1100 (7900 XTX, GDDR6) prefers `budget=8` per the [PR #156 cross-arch perf plan](https://github.com/Luce-Org/lucebox-hub/pull/156). Run `scripts/bench_he.py --ddtree-budget N` to verify on your card.
 
-**Drafter recipe for max decode**: target = Qwen3.5-27B Q4_K_M, drafter = same gen quantized to Q8_0 via `dflash/scripts/quantize_draft_q8.py`. The matching Q8_0 GGUF on the unsloth Qwen3.6 target needs `DFLASH27B_DRAFT_SWA=2048` for sliding-window correctness.
+**Drafter recipe for max decode**: target = Qwen3.5-27B Q4_K_M, drafter = same gen quantized to Q8_0 via `server/scripts/quantize_draft_q8.py`. The matching Q8_0 GGUF on the unsloth Qwen3.6 target needs `DFLASH27B_DRAFT_SWA=2048` for sliding-window correctness.
 
 [Blog post →](https://lucebox.com/blog/amd) · [PR #119 →](https://github.com/Luce-Org/lucebox-hub/pull/119) · [PR #156 cross-arch perf plan →](https://github.com/Luce-Org/lucebox-hub/pull/156)
 
@@ -309,9 +309,9 @@ All experiments in this repo are built, tuned, and benchmarked on NVIDIA RTX 309
 - **Jetson AGX Thor** (sm_110): supported, CUDA 13+.
 - **Turing** (sm_75, RTX 2080): supported, CUDA 12+.
 
-PyTorch 2.0+. `dflash/` needs CMake 3.18+ and `--recurse-submodules` for the pinned `Luce-Org/llama.cpp@luce-dflash` fork (three tree-mode ggml ops); multi-arch build is automatic (see [Running on other GPUs](#running-on-other-gpus-4090-5090-dgx-spark--gb10-jetson-agx-thor)).
+PyTorch 2.0+. `server/` needs CMake 3.18+ and `--recurse-submodules` for the pinned `Luce-Org/llama.cpp@luce-dflash` fork (three tree-mode ggml ops); multi-arch build is automatic (see [Running on other GPUs](#running-on-other-gpus-4090-5090-dgx-spark--gb10-jetson-agx-thor)).
 
-**Megakernel porting note.** `megakernel/setup.py` auto-detects the GPU arch and SM count at build time via `torch.cuda.get_device_capability()`. The decode grid is persistent (one block per SM) and is clamped to the resident-block ceiling at runtime, so no manual tuning is needed. On SM < 80 (Turing), the kernel uses FP16 instead of BF16 via a compile-time `TARGET_SM` flag; on SM >= 80 (Ampere+), BF16 is used. From the workspace root, `uv sync --extra megakernel` builds the extension; the legacy `pip install -e . --no-build-isolation` flow still works from inside `megakernel/`.
+**Megakernel porting note.** `optimizations/megakernel/setup.py` auto-detects the GPU arch and SM count at build time via `torch.cuda.get_device_capability()`. The decode grid is persistent (one block per SM) and is clamped to the resident-block ceiling at runtime, so no manual tuning is needed. On SM < 80 (Turing), the kernel uses FP16 instead of BF16 via a compile-time `TARGET_SM` flag; on SM >= 80 (Ampere+), BF16 is used. From the workspace root, `uv sync --extra megakernel` builds the extension; the legacy `pip install -e . --no-build-isolation` flow still works from inside `optimizations/megakernel/`.
 
 **Optional, find your GPU's sweet spot:** `sudo nvidia-smi -pl 220` (megakernel hits best tok/J at 220 W on 3090; re-sweep for other cards).
 
@@ -321,9 +321,9 @@ PyTorch 2.0+. `dflash/` needs CMake 3.18+ and `--recurse-submodules` for the pin
 
 ```
 lucebox-hub/
-├── megakernel/    · fused forward pass for Qwen 3.5-0.8B
-├── dflash/        · DFlash speculative decoding port for Qwen 3.5/3.6-27B on RTX 3090
-├── pflash/        · speculative-prefill harness in front of dflash (12.5× TTFT at 128K)
+├── optimizations/megakernel/    · fused forward pass for Qwen 3.5-0.8B
+├── server/        · DFlash speculative decoding port for Qwen 3.5/3.6-27B on RTX 3090
+├── optimizations/pflash/        · speculative-prefill harness in front of dflash (12.5× TTFT at 128K)
 └── assets/        · banners, cards, diagrams
 ```
 

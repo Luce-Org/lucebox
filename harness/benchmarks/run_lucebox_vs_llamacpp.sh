@@ -7,10 +7,10 @@ RUN_DIR="${RUN_DIR:-$REPO_DIR/.harness-runs}"
 STAMP="${STAMP:-generation-baseline-$(date +%Y%m%d-%H%M%S)}"
 LOG_DIR="$RUN_DIR/$STAMP"
 
-TARGET="${TARGET:-$REPO_DIR/dflash/models/Qwen3.6-27B-Q4_K_M.gguf}"
-DRAFT="${DRAFT:-$REPO_DIR/dflash/models/draft/dflash-draft-3.6-q8_0.gguf}"
-DFLASH_BIN="${DFLASH_BIN:-$REPO_DIR/dflash/build/test_dflash}"
-LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-$REPO_DIR/dflash/deps/llama.cpp/build/bin/llama-server}"
+TARGET="${TARGET:-$REPO_DIR/server/models/Qwen3.6-27B-Q4_K_M.gguf}"
+DRAFT="${DRAFT:-$REPO_DIR/server/models/draft/dflash-draft-3.6-q8_0.gguf}"
+DFLASH_BIN="${DFLASH_BIN:-$REPO_DIR/server/build/test_dflash}"
+LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-$REPO_DIR/server/deps/llama.cpp/build/bin/llama-server}"
 
 HOST="${HOST:-127.0.0.1}"
 LUCEBOX_PORT="${LUCEBOX_PORT:-18080}"
@@ -30,7 +30,7 @@ API_KEY="${API_KEY:-sk-lucebox}"
 PROMPTS="${PROMPTS:-$SCRIPT_DIR/prompts/generation_smoke.jsonl}"
 
 LUCEBOX_SERVER_BACKEND="${LUCEBOX_SERVER_BACKEND:-python}"
-DFLASH_SERVER_BIN="${DFLASH_SERVER_BIN:-$REPO_DIR/dflash/build/dflash_server}"
+DFLASH_SERVER_BIN="${DFLASH_SERVER_BIN:-$REPO_DIR/server/build/dflash_server}"
 
 mkdir -p "$LOG_DIR"
 
@@ -115,8 +115,8 @@ if [[ "$LUCEBOX_SERVER_BACKEND" == "cpp" ]]; then
   if [[ ! -x "$DFLASH_SERVER_BIN" ]]; then
     echo "dflash_server not found or not executable: $DFLASH_SERVER_BIN" >&2
     echo "Build it first, for example:" >&2
-    echo "  cmake -S $REPO_DIR/dflash -B $REPO_DIR/dflash/build -DGGML_CUDA=ON" >&2
-    echo "  cmake --build $REPO_DIR/dflash/build --target dflash_server -j\$(nproc)" >&2
+    echo "  cmake -S $REPO_DIR/dflash -B $REPO_DIR/server/build -DGGML_CUDA=ON" >&2
+    echo "  cmake --build $REPO_DIR/server/build --target dflash_server -j\$(nproc)" >&2
     exit 1
   fi
   local_ddtree_args=()
@@ -142,7 +142,7 @@ if [[ "$LUCEBOX_SERVER_BACKEND" == "cpp" ]]; then
     > "$LUCEBOX_LOG" 2>&1 &
   LUCEBOX_PID=$!
 else
-  python3 -u dflash/scripts/server.py \
+  python3 -u server/scripts/server.py \
     --host "$HOST" \
     --port "$LUCEBOX_PORT" \
     --target "$TARGET" \

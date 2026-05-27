@@ -74,7 +74,7 @@ Examples:
 ### Cards directory search path
 
 The server probes (in order, matching
-`find_model_cards_dir` in `dflash/src/server/model_card.cpp`):
+`find_model_cards_dir` in `server/src/server/model_card.cpp`):
 
 1. `<repo_root_hint>/share/model_cards/` — an optional explicit
    directory passed by the embedding application (e.g. tests). Not
@@ -145,7 +145,7 @@ first source supplying a value wins:
    values: `max_tokens=16000`, `hard_limit_reply_budget=512`,
    `think_max_tokens = max_tokens − hard_limit_reply_budget = 15488`.
    These also match the `ServerConfig` defaults in
-   `dflash/src/server/http_server.h`.
+   `server/src/server/http_server.h`.
 
 The startup banner prints each tunable's value and which source
 supplied it, e.g.:
@@ -241,7 +241,7 @@ Rounding note: `low` and `medium` use nearest-integer rounding
 (`int(x + 0.5)`); `x-high` uses C++ integer division (truncation
 toward zero). For odd or non-divisible `think_max` values this
 produces deterministic but distinct off-by-one outcomes; see
-`compute_default_tiers` in `dflash/src/server/model_card.cpp`.
+`compute_default_tiers` in `server/src/server/model_card.cpp`.
 
 The `reasoning_effort_tiers` field exists because the ratio-based
 defaults don't fit every model. A smaller model that caps at 8192

@@ -12,26 +12,26 @@ Status: scaffolding. PR #115 in lucebox-hub bumps llama.cpp submodule to `luce-d
 
 ## Constraint
 
-No libllama dependency in dflash runtime. Keep ggml-only stack. (libllama+LAGUNA arch from PR #7 is used by quantize/inspect tools at /workspace/lucebox-hub/dflash/deps/llama.cpp/build-standalone/ and at HF upload time, not by the daemon.)
+No libllama dependency in dflash runtime. Keep ggml-only stack. (libllama+LAGUNA arch from PR #7 is used by quantize/inspect tools at /workspace/lucebox-hub/server/deps/llama.cpp/build-standalone/ and at HF upload time, not by the daemon.)
 
 ## Implementation outline
 
 ### Files to add
 
-1. `dflash/src/laguna_internal.h` (NEW, ~200 LOC) — structs:
+1. `server/src/laguna_internal.h` (NEW, ~200 LOC) — structs:
    - `LagunaTargetLayer` — per-layer tensors (attn_norm, wq/wk/wv/wo, q_norm/k_norm, attn_gate, ffn_norm, dense MLP for layer 0, MoE: ffn_gate_inp + ffn_exp_probs_b + ffn_gate_exps + ffn_up_exps + ffn_down_exps + ffn_gate_shexp + ffn_up_shexp + ffn_down_shexp)
    - `LagunaTargetWeights` — collection of layers + tok_embd + output_norm + output, plus metadata (n_layer=40, n_head_per_layer[40] = [48,64,64,64]*10, n_head_kv=8, head_dim=128, n_embd=2048, n_ff=8192, n_ff_exp=512, n_ff_shexp=512, n_expert=256, n_expert_used=8, expert_weights_scale=2.5, sliding_window=512, rope_freq_base_full=500000, rope_freq_base_swa=10000, n_rot_full=64, n_rot_swa=128, eos_id=2, eot_id=24)
    - `LagunaTargetCache` — KV cache (Q8_0, per layer, max_ctx tokens), no SSM/conv state
    - `LagunaGraphInputs` / `LagunaGraphOutputs`
 
-2. `dflash/src/laguna_target_loader.cpp` (NEW, ~500 LOC):
+2. `server/src/laguna_target_loader.cpp` (NEW, ~500 LOC):
    - `load_target_gguf_laguna(path, backend, LagunaTargetWeights & out)`
    - Validates `arch == "laguna"`, reads all hparams, mmaps GGUF, copies tensors to ggml_backend buffer
    - Per-layer head count: reads `laguna.attention.head_count` as ARRAY (length 40) into `n_head_arr`
    - Tensor naming: matches gguf-py's MODEL_ARCH.LAGUNA list (token_embd, output_norm, output, blk.<i>.{attn_norm, attn_q, attn_k, attn_v, attn_output, attn_q_norm, attn_k_norm, attn_gate, ffn_norm, ffn_gate, ffn_down, ffn_up, ffn_gate_inp, ffn_gate_exps, ffn_down_exps, ffn_up_exps, ffn_gate_shexp, ffn_up_shexp, ffn_down_shexp, exp_probs_b})
    - Layer 0: dense MLP (ffn_gate/down/up). Layers 1-39: sparse MoE (ffn_*_exps + shexp + gate_inp + exp_probs_b)
 
-3. `dflash/src/laguna_target_graph.cpp` (NEW, ~1500 LOC — multi-session):
+3. `server/src/laguna_target_graph.cpp` (NEW, ~1500 LOC — multi-session):
    - `build_laguna_full_attn_block` — full attention layer with YaRN RoPE (theta=500K, factor=32, partial_rotary=0.5, n_rot=64), per-head softplus gate, head_count from per-layer arr (48 on full)
    - `build_laguna_swa_block` — sliding-window attention layer (window=512, theta=10K, partial_rotary=1.0, n_rot=128), per-head softplus gate, head_count=64
    - `build_laguna_dense_mlp` — SwiGLU dense MLP (layer 0)
@@ -42,23 +42,23 @@ No libllama dependency in dflash runtime. Keep ggml-only stack. (libllama+LAGUNA
    - Reuses `flash_prefill_forward_bf16` for sparse prefill on full-attention layers (for sliding-window layers, use dense FA since window=512 is small)
    - Cache mgmt: `create_laguna_target_cache`, `free_laguna_target_cache`, `reset_laguna_target_cache`, `snapshot_laguna_target_cache`, `restore_laguna_target_cache`
 
-4. Modify `dflash/src/gguf_target_loader.cpp` (~30 LOC added):
+4. Modify `server/src/gguf_target_loader.cpp` (~30 LOC added):
    - Pre-detect arch string from GGUF header
    - Dispatch: arch == "qwen35" → existing path, arch == "laguna" → new path
 
-5. Modify `dflash/src/internal.h` (~50 LOC added):
+5. Modify `server/src/internal.h` (~50 LOC added):
    - `enum class TargetArch { Qwen35, Laguna }` to tag the loaded weights
    - Forward decls for Laguna structs / functions (or include `laguna_internal.h`)
 
-6. Modify `dflash/CMakeLists.txt`:
+6. Modify `server/CMakeLists.txt`:
    - Add `src/laguna_target_loader.cpp` and `src/laguna_target_graph.cpp` to `dflash27b` library sources
 
-7. Modify `dflash/test/test_dflash.cpp` (substantial changes — multi-session):
+7. Modify `server/test/test_dflash.cpp` (substantial changes — multi-session):
    - Detect arch from loaded weights
    - For Laguna arch, use `LagunaTargetCache` + `build_laguna_graph` instead of qwen35 equivalents
    - Adjust per-layer-head-count in attention buffer sizing
    - PFlash drafter call unchanged (drafter is Qwen3-0.6B regardless of target)
-   - Cross-tokenizer mapping (Qwen3 IDs → Laguna IDs): byte-level round-trip via existing pflash/ Python module OR port to C++ helper
+   - Cross-tokenizer mapping (Qwen3 IDs → Laguna IDs): byte-level round-trip via existing optimizations/pflash/ Python module OR port to C++ helper
 
 ## Phasing
 

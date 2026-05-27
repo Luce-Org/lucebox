@@ -46,7 +46,7 @@ jobs:
 
       - name: Build dflash (smoke + server)
         run: |
-          cd dflash
+          cd server
           cmake -B build \
             -DCMAKE_CUDA_ARCHITECTURES="86" \
             -DDFLASH27B_ENABLE_BSA=OFF \
@@ -59,13 +59,13 @@ jobs:
 
       - name: Run C++ server unit tests
         run: |
-          cd dflash/build
+          cd server/build
           ctest --output-on-failure -R server_unit --no-tests=error
 
       - name: Run Python server unit tests
         run: |
           pip install pytest fastapi httpx transformers
-          cd dflash/scripts
+          cd server/scripts
           python3 -m pytest test_server.py -v
 
       - name: Populate venv with cu128 torch + setuptools

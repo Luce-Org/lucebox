@@ -22,7 +22,7 @@ build-essential  cmake  git  git-lfs  nvcc (CUDA Toolkit)
 A setup script is provided that installs everything (run as root):
 
 ```bash
-sudo bash dflash/scripts/setup_system.sh
+sudo bash server/scripts/setup_system.sh
 ```
 
 This installs build tools, `hf` (via pipx), and the CUDA Toolkit.
@@ -71,7 +71,7 @@ cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target test_dflash -j
 ```
 
-The binary lands at `dflash/build/test_dflash`.
+The binary lands at `server/build/test_dflash`.
 
 ### CMake options
 
@@ -90,16 +90,16 @@ Download models before running the server:
 
 ```bash
 # Target model (Q4_K_M quantized Qwen3.6-27B)
-hf download <repo-id> --local-dir dflash/models/
+hf download <repo-id> --local-dir server/models/
 
 # Draft model (1.84 GB default Qwen3.6 GGUF draft)
-hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q8_0.gguf --local-dir dflash/models/draft/
+hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q8_0.gguf --local-dir server/models/draft/
 ```
 
 Expected layout:
 
 ```
-dflash/models/
+server/models/
 ├── Qwen3.6-27B-Q4_K_M.gguf          # --target (GGUF)
 └── draft/
     └── dflash-draft-3.6-q8_0.gguf     # --draft  (GGUF)
@@ -155,7 +155,7 @@ python scripts/server.py
 These tests **do not** require a GPU or running daemon — they use mocked backends:
 
 ```bash
-cd dflash/scripts
+cd server/scripts
 python -m pytest test_server.py -v
 ```
 
@@ -186,7 +186,7 @@ run the baseline tests above to validate code changes.
 After building:
 
 ```bash
-cd dflash/build
+cd server/build
 
 # Numerics tests
 ./test_vs_oracle --target ../models/Qwen3.6-27B-Q4_K_M.gguf \
@@ -203,7 +203,7 @@ cd dflash/build
 These scripts start their own server subprocess and need the daemon binary + models:
 
 ```bash
-cd dflash/scripts
+cd server/scripts
 python test_server_prefix_cache.py
 python test_multi_turn_prefix_cache.py
 python test_full_compress_cache.py
@@ -214,7 +214,7 @@ python test_full_compress_cache.py
 ## Project structure
 
 ```
-dflash/
+server/
 ├── CMakeLists.txt              # C++ build (cmake)
 ├── include/                    # C++ headers
 ├── src/                        # C++ sources (target/draft graph, KV cache, FlashPrefill)
@@ -267,7 +267,7 @@ No `env_key` is needed for local use.
 
 ```bash
 # Start the server
-python dflash/scripts/server.py --port 8080
+python server/scripts/server.py --port 8080
 
 # In another terminal
 codex --provider dflash "Explain this codebase"

@@ -41,7 +41,7 @@ Long-context prefill is O(S²): vanilla llama.cpp on a single RTX 3090 takes **~
 - C++/CUDA daemon-resident drafter + scoring + target generation, all in one process, one ggml allocator.
 - Custom Qwen3-0.6B BF16 forward (`qwen3_0p6b_loader.cpp` + `qwen3_0p6b_graph.cpp`) — no libllama.
 - 4 CUDA kernels for the FlashPrefill `mean_K → score → select → sparse_fwd` algorithm (`flashprefill_kernels.cu`).
-- BSA ([mit-han-lab/Block-Sparse-Attention](https://github.com/mit-han-lab/Block-Sparse-Attention), FA-2 derived, sm_80+) for the long-context drafter forward, wired without `libtorch` via 3 ATen/c10 header stubs (`dflash/deps/bsa_stubs/`).
+- BSA ([mit-han-lab/Block-Sparse-Attention](https://github.com/mit-han-lab/Block-Sparse-Attention), FA-2 derived, sm_80+) for the long-context drafter forward, wired without `libtorch` via 3 ATen/c10 header stubs (`server/deps/bsa_stubs/`).
 - 128K → 2.6K span selection at `keep_ratio=0.05`, NIAH retrieved at every measured context, decode ~74 tok/s downstream.
 
 ## Results
@@ -57,7 +57,7 @@ Decode after prefill: ~74 tok/s (dflash spec decode + DDTree). The pipeline is t
 
 ## Quick start
 
-PFlash is the algorithm. The implementation lives in [`../dflash/`](../dflash/) as part of the dflash daemon. The `pflash/` directory in this repo only contains the Python tooling for **benchmarking** (NIAH case generation, bench harness around the daemon stdin protocol). Production deploys hit the dflash daemon directly.
+PFlash is the algorithm. The implementation lives in [`../server/`](../server/) as part of the dflash daemon. The `optimizations/pflash/` directory in this repo only contains the Python tooling for **benchmarking** (NIAH case generation, bench harness around the daemon stdin protocol). Production deploys hit the dflash daemon directly.
 
 ```bash
 # 1. from the repo root, install Python deps and build dflash with the BSA
@@ -65,34 +65,34 @@ PFlash is the algorithm. The implementation lives in [`../dflash/`](../dflash/) 
 cd lucebox-hub
 uv sync
 git submodule update --init --recursive
-cmake -B dflash/build -S dflash -DCMAKE_BUILD_TYPE=Release \
+cmake -B server/build -S dflash -DCMAKE_BUILD_TYPE=Release \
                              -DCMAKE_CUDA_ARCHITECTURES=86 \
                              -DDFLASH27B_ENABLE_BSA=ON
-cmake --build dflash/build --target test_dflash test_flashprefill_kernels -j
+cmake --build server/build --target test_dflash test_flashprefill_kernels -j
 
 # 2. fetch weights (target + spec-decode draft + drafter scorer)
-uv run hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir dflash/models/
-uv run hf download Qwen/Qwen3-0.6B model.safetensors tokenizer.json --local-dir dflash/models/drafter/
-uv run hf download z-lab/Qwen3.6-27B-DFlash model.safetensors --local-dir dflash/models/draft/
+uv run hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir server/models/
+uv run hf download Qwen/Qwen3-0.6B model.safetensors tokenizer.json --local-dir server/models/drafter/
+uv run hf download z-lab/Qwen3.6-27B-DFlash model.safetensors --local-dir server/models/draft/
 
 # 2b. convert the drafter (Qwen3-0.6B HF) to a BF16 GGUF for the C++ scorer.
 #     The submodule already vendors llama.cpp at deps/llama.cpp.
-uv run python dflash/deps/llama.cpp/convert_hf_to_gguf.py dflash/models/drafter \
-       --outtype bf16 --outfile dflash/models/Qwen3-0.6B-BF16.gguf
+uv run python server/deps/llama.cpp/convert_hf_to_gguf.py server/models/drafter \
+       --outtype bf16 --outfile server/models/Qwen3-0.6B-BF16.gguf
 
 # 3. generate NIAH cases + run head-to-head bench against the C++ daemon
 uv run --directory pflash python tests/niah_gen.py --n 1 --ctx 131072 --out /tmp/niah_128k.jsonl
 uv run --directory pflash python tests/bench_niah_cpp.py \
-  --bin    ../dflash/build/test_dflash \
-  --target ../dflash/models/Qwen3.6-27B-Q4_K_M.gguf \
-  --draft-spec ../dflash/models/draft/model.safetensors \
-  --drafter-gguf ../dflash/models/Qwen3-0.6B-BF16.gguf \
+  --bin    ../server/build/test_dflash \
+  --target ../server/models/Qwen3.6-27B-Q4_K_M.gguf \
+  --draft-spec ../server/models/draft/model.safetensors \
+  --drafter-gguf ../server/models/Qwen3-0.6B-BF16.gguf \
   --cases  /tmp/niah_128k.jsonl --keep-ratio 0.05 --n-gen 256
 ```
 
 ## OpenAI server flags
 
-For an OpenAI-compatible server with transparent compression on long prompts, run [`dflash/scripts/server.py`](../dflash/scripts/server.py) with these flags:
+For an OpenAI-compatible server with transparent compression on long prompts, run [`server/scripts/server.py`](../server/scripts/server.py) with these flags:
 
 | Flag | Choices / type | Default | Effect |
 |---|---|:---:|---|
@@ -105,14 +105,14 @@ For an OpenAI-compatible server with transparent compression on long prompts, ru
 When `--prefill-compression != off`, the server auto-sets `DFLASH27B_LM_HEAD_FIX=0` and `DFLASH27B_FA_WINDOW=0` (matching the bench harness — needed so the post-compress draft graph fits on a 24 GB card without OOM).
 
 ```bash
-python dflash/scripts/server.py \
-  --target dflash/models/Qwen3.6-27B-Q4_K_M.gguf \
-  --draft  dflash/models/draft/model.safetensors \
+python server/scripts/server.py \
+  --target server/models/Qwen3.6-27B-Q4_K_M.gguf \
+  --draft  server/models/draft/model.safetensors \
   --max-ctx 8192 --budget 16 --fa-window 0 \
   --prefill-compression auto \
   --prefill-threshold 4096 \
   --prefill-keep-ratio 0.02 \
-  --prefill-drafter dflash/models/Qwen3-0.6B-BF16.gguf
+  --prefill-drafter server/models/Qwen3-0.6B-BF16.gguf
 ```
 
 Below the threshold the server runs the standard target generate (no compression). Above it, the server transparently runs `compress` on the daemon, swaps the prompt for the compressed text, and continues the normal `/v1/chat/completions` flow. Tool-calling requests (`req.tools` non-empty) skip compression so JSON tool definitions stay intact.
@@ -137,7 +137,7 @@ Typical flow at 128K on a 24 GB card: `park target` → `compress` → `free dra
 
 ## Runtime tunables
 
-Everything is configured via env vars on the daemon process. Full list in [`../dflash/src/flashprefill.h`](../dflash/src/flashprefill.h).
+Everything is configured via env vars on the daemon process. Full list in [`../server/src/flashprefill.h`](../server/src/flashprefill.h).
 
 | Env var | Default | Purpose |
 |---|:---:|---|
@@ -205,7 +205,7 @@ The algorithms are not ours:
 What we built:
 
 - C++/CUDA port of the FlashPrefill algorithm: 4 kernels (`mean_K / score / select / sparse_fwd`), no Triton dependency.
-- BSA ([mit-han-lab/Block-Sparse-Attention](https://github.com/mit-han-lab/Block-Sparse-Attention)) wired without `libtorch` via 3 ATen/c10 header stubs (`dflash/deps/bsa_stubs/`).
+- BSA ([mit-han-lab/Block-Sparse-Attention](https://github.com/mit-han-lab/Block-Sparse-Attention)) wired without `libtorch` via 3 ATen/c10 header stubs (`server/deps/bsa_stubs/`).
 - Custom Qwen3-0.6B BF16 forward so the drafter runs through the same ggml allocator as the 27B target.
 - Daemon stdin protocol (`compress` / `generate` / `park` / `unpark` / `free drafter`) so target + drafter coexist on a 24 GB card.
 - NIAH harness against `llama-bench` for end-to-end validation.

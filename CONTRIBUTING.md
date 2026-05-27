@@ -23,7 +23,7 @@ Thanks for considering a contribution. Lucebox is a hub of self-contained optimi
 On Ubuntu 22.04 or 24.04, one script installs all system dependencies — `build-essential`, `cmake`, `git`, `git-lfs`, and the CUDA Toolkit from NVIDIA's repo:
 
 ```bash
-sudo dflash/scripts/setup_system.sh
+sudo server/scripts/setup_system.sh
 ```
 
 The script is idempotent and configures `nvcc` on PATH for both bash and zsh. For other distros see the [CUDA installation guide](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/).
@@ -51,11 +51,11 @@ uv sync --extra megakernel    # also compile the megakernel CUDA extension
 bash scripts/check_uv_workspace.sh  # lockfile + frozen-sync import smoke
 
 # C++/CUDA decoder
-cmake -B dflash/build -S dflash -DCMAKE_BUILD_TYPE=Release
-cmake --build dflash/build --target test_dflash -j
+cmake -B server/build -S dflash -DCMAKE_BUILD_TYPE=Release
+cmake --build server/build --target test_dflash -j
 ```
 
-> If cmake was previously run without CUDA, wipe the build directory first (`rm -rf dflash/build`) to avoid a stale compiler cache.
+> If cmake was previously run without CUDA, wipe the build directory first (`rm -rf server/build`) to avoid a stale compiler cache.
 
 ---
 
