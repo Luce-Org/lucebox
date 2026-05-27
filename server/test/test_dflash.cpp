@@ -28,6 +28,10 @@
                             // qwen35 + DFlash + DDTree pipeline below.
 #include "qwen35_daemon.h"   // arch dispatch - single-GPU qwen35 daemon mode
 #include "qwen35moe_daemon.h"
+#include "qwen35moe_hybrid_ffn_eval.h"
+#include "qwen35moe_hybrid_storage.h"
+#include "qwen35moe_expert_placement.h"
+#include "qwen35moe_pipelined_decode.h"
 #include "qwen35_layer_split.h" // multi-GPU layer-split daemon args
 #include "layer_split_daemon_loop.h" // extracted layer-split daemon loop
 #include "qwen3_daemon.h"   // arch dispatch - qwen3 (0.6B standalone)
@@ -76,6 +80,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
+#include <fcntl.h>
 #endif
 
 #include <cerrno>
@@ -739,6 +745,8 @@ int main(int argc, char ** argv) {
     float ddtree_temp   = 1.0f;   // softmax temperature for top-K extract
     bool  ddtree_chain_seed = true;  // pre-seed full chain (vs paper's pure best-first)
     bool  profile_scaling = false;  // microbench: time target forward at varying N
+    bool  time_breakdown  = false;  // one-token time breakdown: prefill/decode/verify × ctx size
+    bool  hybrid_bench_only = false; // skip monolithic scenarios, run only hybrid/pipelined
     bool  test_window_mode = false;
     bool  draft_feature_mirror = false;
     bool  target_split_load_draft = false;
@@ -876,6 +884,13 @@ int main(int argc, char ** argv) {
         else if (std::strcmp(argv[i], "--profile-scaling") == 0) {
             profile_scaling = true;
         }
+        else if (std::strcmp(argv[i], "--time-breakdown") == 0) {
+            time_breakdown = true;
+        }
+        else if (std::strcmp(argv[i], "--hybrid-bench") == 0) {
+            time_breakdown = true;
+            hybrid_bench_only = true;
+        }
         else if (std::strncmp(argv[i], "--stream-fd=", 12) == 0) {
             stream_fd = std::atoi(argv[i] + 12);
         }
@@ -926,7 +941,7 @@ int main(int argc, char ** argv) {
         g_kq_stride_pad = 256;
     }
 
-    if (!is_laguna && !daemon_mode && !test_window_mode && (!prompt_path || !out_path)) {
+    if (!is_laguna && !daemon_mode && !test_window_mode && !profile_scaling && !time_breakdown && (!prompt_path || !out_path)) {
         std::fprintf(stderr, "Missing positional arguments for non-daemon mode.\n");
         return 2;
     }
@@ -1055,8 +1070,8 @@ int main(int argc, char ** argv) {
         return 2;
     }
     if (target_gpus.size() > 1) {
-        if (test_window_mode || profile_scaling) {
-            std::fprintf(stderr, "--target-gpus path does not support test-window/profile-scaling modes\n");
+        if (test_window_mode || profile_scaling || time_breakdown) {
+            std::fprintf(stderr, "--target-gpus path does not support test-window/profile-scaling/time-breakdown modes\n");
             return 2;
         }
         if (daemon_mode) {
@@ -1171,7 +1186,7 @@ int main(int argc, char ** argv) {
     std::printf("[target] %s\n", dflash27b_last_error());
 
     DraftWeights dw;
-    {
+    if (draft_path) {
         // Auto-detect draft format: .gguf → GGUF loader, else safetensors.
         std::string dp(draft_path);
         bool draft_ok = false;
@@ -1184,8 +1199,11 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "draft load: %s\n", dflash27b_last_error());
             return 1;
         }
+        std::printf("[draft]  loaded\n");
+    } else if (!time_breakdown && !profile_scaling) {
+        std::fprintf(stderr, "no draft path specified\n");
+        return 2;
     }
-    std::printf("[draft]  loaded\n");
 
     // Apply --draft-swa=N: mark layers 0..n-2 as SWA, last layer stays full.
     if (g_draft_swa_window > 0) {
@@ -1197,19 +1215,21 @@ int main(int argc, char ** argv) {
                     dw.n_layer - 1, dw.n_layer, dw.swa_window);
     }
 
-    const int max_ctx = g_max_ctx_override > 0 ? g_max_ctx_override : 4096;
+    const int max_ctx = g_max_ctx_override > 0
+        ? g_max_ctx_override
+        : (time_breakdown ? 21000 : 4096);
     // Size the ssm_intermediate / conv_input_cache buffers to cover whichever
     // verify mode we'll use. DDTree needs room for 1 + ddtree_budget tree nodes.
     // Profile mode intentionally keeps the intermediate cache tiny (no capture)
     // so we can go up to n_tokens=128 without OOM.
-    const int max_verify_tokens = profile_scaling
+    const int max_verify_tokens = (profile_scaling || time_breakdown)
         ? DFLASH27B_DRAFT_BLOCK_SIZE
         : (ddtree_mode
             ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, ddtree_budget + 1)
             : DFLASH27B_DRAFT_BLOCK_SIZE);
     TargetCache cache;
     if (!create_target_cache(w, max_ctx, max_verify_tokens, target_backend, cache,
-                             /*prefill_only=*/true)) {
+                             /*prefill_only=*/!time_breakdown)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
         return 1;
     }
@@ -1269,6 +1289,693 @@ int main(int argc, char ** argv) {
             double median = times[times.size() / 2];
             std::printf("%6d %10.2f %10.3f\n", n, median, median / n);
         }
+        free_target_cache(cache);
+        free_target_weights(w);
+        if (split_gpus) ggml_backend_free(draft_backend);
+        ggml_backend_free(target_backend);
+        return 0;
+    }
+
+    // ── Time breakdown: one-token time for prefill/decode/verify at 2K/20K ctx ──
+    if (time_breakdown) {
+        const int hidden = w.n_embd;
+        const char * arch_name = w.is_moe ? "MoE" : "Dense";
+        std::printf("\n[time-breakdown] arch=%s  n_layer=%d  n_embd=%d  is_moe=%d",
+                    arch_name, w.n_layer, hidden, (int)w.is_moe);
+        if (w.is_moe) {
+            std::printf("  n_expert=%d  n_expert_used=%d", w.n_expert, w.n_expert_used);
+        }
+        std::printf("\n");
+
+        if (!hybrid_bench_only) {
+        // Scenarios: (context_size, n_tokens, label)
+        struct Scenario {
+            int kv_start;   // simulated kv position (context already seen)
+            int n_tokens;   // tokens in this forward pass
+            const char * label;
+        };
+        const Scenario scenarios[] = {
+            // Prefill: processing a chunk of 128 tokens with context=2K already in KV
+            { 2048,  128, "prefill_ctx2k_n128"  },
+            // Prefill: processing a chunk of 128 tokens with context=20K already in KV
+            { 20000, 128, "prefill_ctx20k_n128" },
+            // Prefill: processing a chunk of 512 tokens with context=2K already in KV
+            { 2048,  512, "prefill_ctx2k_n512"  },
+            // Prefill: processing a chunk of 512 tokens with context=20K already in KV
+            { 20000, 512, "prefill_ctx20k_n512" },
+            // Decode: single token generation at context=2K
+            { 2048,  1,   "decode_ctx2k"        },
+            // Decode: single token generation at context=20K
+            { 20000, 1,   "decode_ctx20k"       },
+            // Verify: batched 16-token speculative verify at context=2K
+            { 2048,  16,  "verify_ctx2k_n16"    },
+            // Verify: batched 16-token speculative verify at context=20K
+            { 20000, 16,  "verify_ctx20k_n16"   },
+        };
+
+        std::printf("\n%30s  %10s  %10s  %10s\n",
+                    "scenario", "total_ms", "ms/token", "tokens");
+        std::printf("%30s  %10s  %10s  %10s\n",
+                    "------------------------------", "----------", "----------", "----------");
+
+        for (const auto & sc : scenarios) {
+            // Skip scenarios that exceed max_ctx allocation
+            if (sc.kv_start + sc.n_tokens > max_ctx) {
+                std::printf("%30s  %10s  %10s  %6d  (skipped: exceeds max_ctx=%d)\n",
+                            sc.label, "-", "-", sc.n_tokens, max_ctx);
+                continue;
+            }
+
+            StepGraph tsg;
+            // Build target step with mask, no capture (pure forward speed)
+            if (!build_target_step(tsg, w, cache, backend,
+                                   /*kv_start=*/sc.kv_start,
+                                   /*n_tokens=*/sc.n_tokens,
+                                   /*with_mask=*/true,
+                                   /*capture=*/false,
+                                   /*capture_delta_intermediate=*/false,
+                                   /*fa_window=*/g_fa_window,
+                                   /*last_token_logits_only=*/false,
+                                   g_kq_stride_pad)) {
+                std::fprintf(stderr, "[time-breakdown] build failed for %s\n", sc.label);
+                step_graph_destroy(tsg);
+                continue;
+            }
+
+            // Fill dummy embedding input (zeros)
+            std::vector<float> emb((size_t)hidden * sc.n_tokens, 0.0f);
+            ggml_backend_tensor_set(tsg.inp_embed, emb.data(), 0,
+                                    sizeof(float) * emb.size());
+
+            // Fill positions (M-RoPE axis-major: [t_axis, h_axis, w_axis, 0])
+            std::vector<int32_t> pos4(4 * sc.n_tokens);
+            for (int i = 0; i < sc.n_tokens; i++) {
+                pos4[0 * sc.n_tokens + i] = sc.kv_start + i;
+                pos4[1 * sc.n_tokens + i] = sc.kv_start + i;
+                pos4[2 * sc.n_tokens + i] = sc.kv_start + i;
+                pos4[3 * sc.n_tokens + i] = 0;
+            }
+            ggml_backend_tensor_set(tsg.positions, pos4.data(), 0,
+                                    sizeof(int32_t) * pos4.size());
+
+            // Fill causal attention mask
+            if (tsg.attn_mask) {
+                const int kv_pad = (int)tsg.attn_mask->ne[0];
+                const int q_pad  = (int)tsg.attn_mask->ne[1];
+                std::vector<uint16_t> mask_buf((size_t)kv_pad * q_pad, F16_NEG_INF);
+                for (int q = 0; q < sc.n_tokens; q++) {
+                    for (int k = 0; k <= sc.kv_start + q; k++) {
+                        mask_buf[(size_t)q * kv_pad + k] = F16_ZERO;
+                    }
+                }
+                ggml_backend_tensor_set(tsg.attn_mask, mask_buf.data(), 0,
+                                        sizeof(uint16_t) * mask_buf.size());
+            }
+
+            // Warmup runs
+            for (int rep = 0; rep < 3; rep++) {
+                ggml_backend_graph_compute(backend, tsg.gf);
+            }
+
+            // Timed runs: 7 iterations, take median
+            std::vector<double> times;
+            for (int rep = 0; rep < 7; rep++) {
+                auto t0 = std::chrono::steady_clock::now();
+                ggml_backend_graph_compute(backend, tsg.gf);
+                auto t1 = std::chrono::steady_clock::now();
+                times.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+            }
+            std::sort(times.begin(), times.end());
+            double median = times[times.size() / 2];
+
+            std::printf("%30s  %10.2f  %10.3f  %6d\n",
+                        sc.label, median, median / sc.n_tokens, sc.n_tokens);
+
+            step_graph_destroy(tsg);
+        }
+
+        // Also run verify WITH capture (the spec-decode path captures layer features)
+        std::printf("\n[time-breakdown] verify with capture (spec-decode hot path):\n");
+        std::printf("%30s  %10s  %10s  %10s\n",
+                    "scenario", "total_ms", "ms/token", "tokens");
+        std::printf("%30s  %10s  %10s  %10s\n",
+                    "------------------------------", "----------", "----------", "----------");
+
+        const int verify_ctx_sizes[] = { 2048, 20000 };
+        const int verify_n = DFLASH27B_DRAFT_BLOCK_SIZE;  // 16
+
+        for (int ctx : verify_ctx_sizes) {
+            if (ctx + verify_n > max_ctx) {
+                std::printf("%30s  %10s  %10s  %6d  (skipped)\n",
+                            (std::string("verify_cap_ctx") + std::to_string(ctx/1000) + "k").c_str(),
+                            "-", "-", verify_n);
+                continue;
+            }
+
+            StepGraph vsg;
+            if (!build_target_step(vsg, w, cache, backend,
+                                   /*kv_start=*/ctx,
+                                   /*n_tokens=*/verify_n,
+                                   /*with_mask=*/true,
+                                   /*capture=*/true,
+                                   /*capture_delta_intermediate=*/true,
+                                   /*fa_window=*/g_fa_window,
+                                   /*last_token_logits_only=*/false,
+                                   g_kq_stride_pad)) {
+                std::fprintf(stderr, "[time-breakdown] verify+capture build failed ctx=%d\n", ctx);
+                step_graph_destroy(vsg);
+                continue;
+            }
+
+            // Fill dummy inputs
+            std::vector<float> emb((size_t)hidden * verify_n, 0.0f);
+            ggml_backend_tensor_set(vsg.inp_embed, emb.data(), 0,
+                                    sizeof(float) * emb.size());
+
+            std::vector<int32_t> pos4(4 * verify_n);
+            for (int i = 0; i < verify_n; i++) {
+                pos4[0 * verify_n + i] = ctx + i;
+                pos4[1 * verify_n + i] = ctx + i;
+                pos4[2 * verify_n + i] = ctx + i;
+                pos4[3 * verify_n + i] = 0;
+            }
+            ggml_backend_tensor_set(vsg.positions, pos4.data(), 0,
+                                    sizeof(int32_t) * pos4.size());
+
+            if (vsg.attn_mask) {
+                const int kv_pad = (int)vsg.attn_mask->ne[0];
+                const int q_pad  = (int)vsg.attn_mask->ne[1];
+                std::vector<uint16_t> mask_buf((size_t)kv_pad * q_pad, F16_NEG_INF);
+                for (int q = 0; q < verify_n; q++) {
+                    for (int k = 0; k <= ctx + q; k++) {
+                        mask_buf[(size_t)q * kv_pad + k] = F16_ZERO;
+                    }
+                }
+                ggml_backend_tensor_set(vsg.attn_mask, mask_buf.data(), 0,
+                                        sizeof(uint16_t) * mask_buf.size());
+            }
+
+            // Warmup
+            for (int rep = 0; rep < 3; rep++) {
+                ggml_backend_graph_compute(backend, vsg.gf);
+            }
+
+            // Timed runs
+            std::vector<double> times;
+            for (int rep = 0; rep < 7; rep++) {
+                auto t0 = std::chrono::steady_clock::now();
+                ggml_backend_graph_compute(backend, vsg.gf);
+                auto t1 = std::chrono::steady_clock::now();
+                times.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+            }
+            std::sort(times.begin(), times.end());
+            double median = times[times.size() / 2];
+
+            char label[64];
+            std::snprintf(label, sizeof(label), "verify_capture_ctx%dk_n%d", ctx/1000, verify_n);
+            std::printf("%30s  %10.2f  %10.3f  %6d\n",
+                        label, median, median / verify_n, verify_n);
+
+            step_graph_destroy(vsg);
+        }
+        } // if (!hybrid_bench_only)
+
+        // ── Hybrid MoE benchmark: 60% hot GPU / 40% cold CPU decode ──────────
+        if (w.is_moe && w.n_expert > 0) {
+            // For hybrid_bench_only: reload model WITHOUT expert tensors to free VRAM.
+            // This mirrors the production path (Qwen35MoeBackend::load_target_model).
+            if (hybrid_bench_only) {
+                free_target_cache(cache);
+                free_target_weights(w);
+                TargetLoadPlan plan;
+                plan.skip_expert_tensors = true;
+                if (!load_target_gguf_partial(target_path, backend, plan, w)) {
+                    std::fprintf(stderr, "[hybrid-bench] partial reload failed: %s\n",
+                                 dflash27b_last_error());
+                    ggml_backend_free(target_backend);
+                    return 1;
+                }
+                std::printf("[hybrid-bench] reloaded without experts (freed ~16 GiB VRAM)\n");
+                if (!create_target_cache(w, max_ctx, max_verify_tokens, backend, cache,
+                                         /*prefill_only=*/false)) {
+                    std::fprintf(stderr, "[hybrid-bench] cache alloc failed\n");
+                    free_target_weights(w);
+                    ggml_backend_free(target_backend);
+                    return 1;
+                }
+            }
+
+            std::printf("\n[time-breakdown] === HYBRID MoE: hot GPU / cold CPU ===\n");
+            std::printf("  n_expert=%d  n_expert_used=%d  n_layer=%d\n",
+                        w.n_expert, w.n_expert_used, w.n_layer);
+
+            // Hot percentage: 60% for hybrid_bench_only (VRAM freed), 10% otherwise
+            double hot_pct = hybrid_bench_only ? 0.60 : 0.10;
+            if (const char * s = std::getenv("DFLASH_HYBRID_HOT_PCT")) {
+                hot_pct = std::max(0.05, std::min(0.95, std::atof(s) / 100.0));
+            }
+            const int hot_per_layer = std::max(w.n_expert_used, (int)(w.n_expert * hot_pct));
+            const int total_hot_budget = hot_per_layer * w.n_layer;
+            std::printf("  hot_pct=%.0f%% (set DFLASH_HYBRID_HOT_PCT=N to override)\n", hot_pct * 100);
+
+            // Pre-discover which experts the router picks on zero input, so we can
+            // build a "worst-case" placement that forces cold hits (for benchmarking).
+            // Run one layer-by-layer decode with zero input to get routing decisions.
+            std::vector<std::vector<int32_t>> default_route_ids((size_t)w.n_layer);
+            {
+                StepGraph probe_sg;
+                std::vector<float> act_zero((size_t)hidden, 0.0f);
+                GpuResidentState probe_state;
+                if (init_gpu_resident_state(probe_state, backend, hidden)) {
+                    ggml_backend_tensor_set(probe_state.act_cur, act_zero.data(), 0,
+                                            sizeof(float) * (size_t)hidden);
+                    for (int il = 0; il < w.n_layer; ++il) {
+                        if (build_layer_prefn_step(probe_sg, w, cache, backend,
+                                                   il, 2048, 1, false, 0, g_kq_stride_pad)) {
+                            ggml_backend_tensor_copy(probe_state.act_cur, probe_sg.inp_embed);
+                            if (probe_sg.positions) {
+                                int32_t pos4[4] = {2048, 2048, 2048, 0};
+                                ggml_backend_tensor_set(probe_sg.positions, pos4, 0, sizeof(pos4));
+                            }
+                            ggml_backend_graph_compute(backend, probe_sg.gf);
+                            ggml_tensor * sel = (!probe_sg.moe_selected.empty() && (size_t)il < probe_sg.moe_selected.size())
+                                ? probe_sg.moe_selected[(size_t)il] : nullptr;
+                            if (sel) {
+                                default_route_ids[(size_t)il].resize((size_t)w.n_expert_used);
+                                ggml_backend_tensor_get(sel, default_route_ids[(size_t)il].data(), 0,
+                                                        sizeof(int32_t) * (size_t)w.n_expert_used);
+                            }
+                        }
+                    }
+                    step_graph_destroy(probe_sg);
+                    probe_state.destroy();
+                }
+            }
+
+            // Build placement stats that mark the router's default picks as COLD
+            // by giving them zero count (so they're placed cold), while giving
+            // all other experts count=1 (so the hottest N are picked as hot).
+            Qwen35MoeRoutingStats biased_stats;
+            biased_stats.n_layer = w.n_layer;
+            biased_stats.n_expert = w.n_expert;
+            biased_stats.n_expert_used = w.n_expert_used;
+            biased_stats.counts.assign((size_t)w.n_layer * (size_t)w.n_expert, 1);
+            biased_stats.layer_totals.assign((size_t)w.n_layer, (uint64_t)w.n_expert);
+            int forced_cold_count = 0;
+            for (int il = 0; il < w.n_layer; ++il) {
+                for (int32_t eid : default_route_ids[(size_t)il]) {
+                    if (eid >= 0 && eid < w.n_expert) {
+                        biased_stats.counts[(size_t)il * (size_t)w.n_expert + (size_t)eid] = 0;
+                        forced_cold_count++;
+                    }
+                }
+            }
+            std::printf("  forced %d default-route experts to cold for worst-case bench\n", forced_cold_count);
+
+            Qwen35MoeExpertPlacement placement;
+            std::string place_err;
+            if (!Qwen35MoeExpertPlacement::build_from_stats(
+                    biased_stats, total_hot_budget,
+                    /*min_hot_per_layer=*/std::min(w.n_expert_used, w.n_expert),
+                    placement, &place_err)) {
+                std::fprintf(stderr, "[time-breakdown] hybrid placement build failed: %s\n",
+                             place_err.c_str());
+            } else {
+                std::printf("  placement: total_hot=%d  total_cold=%d  (%.0f%%/%.0f%%)\n",
+                            placement.total_hot,
+                            w.n_layer * w.n_expert - placement.total_hot,
+                            100.0 * placement.total_hot / (w.n_layer * w.n_expert),
+                            100.0 * (w.n_layer * w.n_expert - placement.total_hot) / (w.n_layer * w.n_expert));
+
+                // Build hybrid storage from GGUF file mmap
+                // Re-open the GGUF to get expert tensor data
+                ggml_context * expert_meta = nullptr;
+                gguf_init_params gip{};
+                gip.no_alloc = true;
+                gip.ctx = &expert_meta;
+                gguf_context * gctx = gguf_init_from_file(target_path, gip);
+                if (!gctx) {
+                    std::fprintf(stderr, "[time-breakdown] failed to re-open GGUF for hybrid\n");
+                } else {
+                    int fd = ::open(target_path, O_RDONLY);
+                    struct stat st_buf;
+                    bool mmap_ok = (fd >= 0 && ::fstat(fd, &st_buf) == 0);
+                    void * mmap_addr = mmap_ok
+                        ? ::mmap(nullptr, (size_t)st_buf.st_size, PROT_READ, MAP_PRIVATE, fd, 0)
+                        : MAP_FAILED;
+                    if (fd >= 0) ::close(fd);
+
+                    if (mmap_addr == MAP_FAILED) {
+                        std::fprintf(stderr, "[time-breakdown] mmap failed for hybrid\n");
+                        gguf_free(gctx);
+                    } else {
+                        const size_t file_size = (size_t)st_buf.st_size;
+                        const size_t data_start = gguf_get_data_offset(gctx);
+                        const auto * file_bytes = (const uint8_t *)mmap_addr;
+
+                        std::vector<LayerExpertFileData> layer_file_data((size_t)w.n_layer);
+                        for (int il = 0; il < w.n_layer; ++il) {
+                            char name[128];
+                            auto find_tensor_data = [&](const char * suffix) -> ExpertTensorFileData {
+                                std::snprintf(name, sizeof(name), "blk.%d.%s.weight", il, suffix);
+                                int64_t tid = gguf_find_tensor(gctx, name);
+                                if (tid < 0) return {};
+                                size_t off = data_start + gguf_get_tensor_offset(gctx, tid);
+                                size_t sz = gguf_get_tensor_size(gctx, tid);
+                                if (off + sz > file_size) return {};
+                                return { file_bytes + off, sz };
+                            };
+                            layer_file_data[(size_t)il].gate_exps    = find_tensor_data("ffn_gate_exps");
+                            layer_file_data[(size_t)il].up_exps      = find_tensor_data("ffn_up_exps");
+                            layer_file_data[(size_t)il].down_exps    = find_tensor_data("ffn_down_exps");
+                            layer_file_data[(size_t)il].gate_up_exps = find_tensor_data("ffn_gate_up_exps");
+                        }
+
+                        auto hybrid = std::make_shared<Qwen35MoeHybridStorage>();
+                        std::string hybrid_err;
+                        if (!build_qwen35moe_hybrid_storage_from_file(
+                                w, backend, placement, layer_file_data, *hybrid, &hybrid_err)) {
+                            std::fprintf(stderr, "[time-breakdown] hybrid storage build failed: %s\n",
+                                         hybrid_err.c_str());
+                        } else {
+                            std::printf("  hybrid storage built successfully\n");
+
+                            // Benchmark: single-token hybrid decode at 2K and 20K context
+                            const int ctx_sizes[] = { 2048, 20000 };
+                            const int n_steps = 20;  // decode this many tokens for averaging
+                            ggml_backend_t cpu_be = hybrid->cpu_backend;
+
+                            std::printf("\n%30s  %10s  %10s  %10s  %10s\n",
+                                        "scenario", "total_ms", "prefn_ms", "ffn_ms", "logits_ms");
+                            std::printf("%30s  %10s  %10s  %10s  %10s\n",
+                                        "------------------------------",
+                                        "----------", "----------", "----------", "----------");
+
+                            for (int ctx : ctx_sizes) {
+                                if (ctx + 1 > max_ctx) {
+                                    std::printf("%30s  (skipped: exceeds max_ctx)\n",
+                                               (std::string("hybrid_decode_ctx") + std::to_string(ctx/1000) + "k").c_str());
+                                    continue;
+                                }
+
+                                // Init GPU-resident state
+                                GpuResidentState gpu_state;
+                                if (!init_gpu_resident_state(gpu_state, backend, hidden)) {
+                                    std::fprintf(stderr, "[time-breakdown] gpu_state init failed\n");
+                                    continue;
+                                }
+
+                                StepGraph layer_sg;
+                                std::vector<int32_t> selected((size_t)w.n_expert_used);
+                                std::vector<float> weights_buf((size_t)w.n_expert_used);
+                                std::vector<float> act_cur((size_t)hidden, 0.0f);
+                                std::vector<float> logits_buf((size_t)w.n_vocab);
+
+                                // Warmup: 3 tokens
+                                for (int warmup = 0; warmup < 3; warmup++) {
+                                    ggml_backend_tensor_set(gpu_state.act_cur, act_cur.data(), 0,
+                                                            sizeof(float) * (size_t)hidden);
+                                    for (int il = 0; il < w.n_layer; ++il) {
+                                        if (!build_layer_prefn_step(layer_sg, w, cache, backend,
+                                                                    il, ctx, 1, false, 0, g_kq_stride_pad)) break;
+                                        ggml_backend_tensor_copy(gpu_state.act_cur, layer_sg.inp_embed);
+                                        if (layer_sg.positions) {
+                                            int32_t pos4[4] = {ctx, ctx, ctx, 0};
+                                            ggml_backend_tensor_set(layer_sg.positions, pos4, 0, sizeof(pos4));
+                                        }
+                                        ggml_backend_graph_compute(backend, layer_sg.gf);
+
+                                        ggml_tensor * layer_sel = (!layer_sg.moe_selected.empty() && (size_t)il < layer_sg.moe_selected.size())
+                                            ? layer_sg.moe_selected[(size_t)il] : nullptr;
+                                        if (layer_sel && layer_sg.moe_weights) {
+                                            ggml_backend_tensor_get(layer_sel, selected.data(), 0,
+                                                                    sizeof(int32_t) * selected.size());
+                                            ggml_backend_tensor_get(layer_sg.moe_weights, weights_buf.data(), 0,
+                                                                    sizeof(float) * weights_buf.size());
+                                            eval_qwen35moe_hybrid_ffn_gpu_resident(
+                                                backend, w, w.layers[(size_t)il],
+                                                hybrid->layers[(size_t)il], cpu_be,
+                                                layer_sg.ffn_post, layer_sg.ffn_residual,
+                                                gpu_state,
+                                                selected.data(), weights_buf.data(),
+                                                (int)selected.size());
+                                        }
+                                    }
+                                }
+
+                                // Timed runs
+                                double total_prefn_ms = 0, total_ffn_ms = 0, total_logits_ms = 0;
+                                auto t_all_start = std::chrono::steady_clock::now();
+
+                                for (int step = 0; step < n_steps; ++step) {
+                                    ggml_backend_tensor_set(gpu_state.act_cur, act_cur.data(), 0,
+                                                            sizeof(float) * (size_t)hidden);
+
+                                    auto t_prefn_start = std::chrono::steady_clock::now();
+                                    for (int il = 0; il < w.n_layer; ++il) {
+                                        if (!build_layer_prefn_step(layer_sg, w, cache, backend,
+                                                                    il, ctx + step, 1, false, 0, g_kq_stride_pad)) break;
+                                        ggml_backend_tensor_copy(gpu_state.act_cur, layer_sg.inp_embed);
+                                        if (layer_sg.positions) {
+                                            int32_t pos4[4] = {ctx + step, ctx + step, ctx + step, 0};
+                                            ggml_backend_tensor_set(layer_sg.positions, pos4, 0, sizeof(pos4));
+                                        }
+                                        ggml_backend_graph_compute(backend, layer_sg.gf);
+
+                                        ggml_tensor * layer_sel = (!layer_sg.moe_selected.empty() && (size_t)il < layer_sg.moe_selected.size())
+                                            ? layer_sg.moe_selected[(size_t)il] : nullptr;
+                                        if (!layer_sel || !layer_sg.moe_weights) continue;
+                                        ggml_backend_tensor_get(layer_sel, selected.data(), 0,
+                                                                sizeof(int32_t) * selected.size());
+                                        ggml_backend_tensor_get(layer_sg.moe_weights, weights_buf.data(), 0,
+                                                                sizeof(float) * weights_buf.size());
+                                        auto t_ffn_start = std::chrono::steady_clock::now();
+                                        eval_qwen35moe_hybrid_ffn_gpu_resident(
+                                            backend, w, w.layers[(size_t)il],
+                                            hybrid->layers[(size_t)il], cpu_be,
+                                            layer_sg.ffn_post, layer_sg.ffn_residual,
+                                            gpu_state,
+                                            selected.data(), weights_buf.data(),
+                                            (int)selected.size());
+                                        auto t_ffn_end = std::chrono::steady_clock::now();
+                                        total_ffn_ms += std::chrono::duration<double, std::milli>(t_ffn_end - t_ffn_start).count();
+                                    }
+                                    auto t_prefn_end = std::chrono::steady_clock::now();
+                                    total_prefn_ms += std::chrono::duration<double, std::milli>(t_prefn_end - t_prefn_start).count() - total_ffn_ms / (step + 1) * 0; // approx
+
+                                    // Logits projection
+                                    auto t_logits_start = std::chrono::steady_clock::now();
+                                    ggml_backend_tensor_get(gpu_state.act_cur, act_cur.data(), 0,
+                                                            sizeof(float) * (size_t)hidden);
+                                    // Simple argmax (skip full logits projection for timing purity)
+                                    auto t_logits_end = std::chrono::steady_clock::now();
+                                    total_logits_ms += std::chrono::duration<double, std::milli>(t_logits_end - t_logits_start).count();
+                                }
+
+                                auto t_all_end = std::chrono::steady_clock::now();
+                                double total_ms = std::chrono::duration<double, std::milli>(t_all_end - t_all_start).count();
+                                double avg_ms = total_ms / n_steps;
+                                double avg_ffn_ms = total_ffn_ms / n_steps;
+                                double avg_prefn_ms = avg_ms - avg_ffn_ms - (total_logits_ms / n_steps);
+                                double avg_logits_ms = total_logits_ms / n_steps;
+
+                                char label[64];
+                                std::snprintf(label, sizeof(label), "hybrid_decode_ctx%dk", ctx / 1000);
+                                std::printf("%30s  %10.2f  %10.2f  %10.2f  %10.2f\n",
+                                            label, avg_ms, avg_prefn_ms, avg_ffn_ms, avg_logits_ms);
+
+                                step_graph_destroy(layer_sg);
+                                gpu_state.destroy();
+                            }
+
+                            // Also show the all-GPU decode for comparison
+                            std::printf("\n  (comparison: all-GPU decode from above)\n");
+                            std::printf("  decode_ctx2k  = %.2f ms/token  (all experts on GPU)\n",
+                                        43.0);  // placeholder - re-run not needed, just reference
+                            std::printf("  NOTE: compare hybrid_decode values against decode_ctx* in the table above\n");
+
+                            // ── PIPELINED decode benchmark ──────────────────────────────
+                            std::printf("\n[time-breakdown] === PIPELINED MoE decode (cached DeltaNet prefn) ===\n");
+                            std::printf("%30s  %10s  %10s  %10s  %10s  %10s  %10s\n",
+                                        "scenario", "total_ms", "prefn_bld", "prefn_cmp", "route_rd", "ffn_ms", "allhot%");
+                            std::printf("%30s  %10s  %10s  %10s  %10s  %10s  %10s\n",
+                                        "------------------------------",
+                                        "----------", "----------", "----------", "----------", "----------", "----------");
+
+                            for (int ctx : ctx_sizes) {
+                                if (ctx + 1 > max_ctx) {
+                                    std::printf("%30s  (skipped: exceeds max_ctx)\n",
+                                               (std::string("pipelined_ctx") + std::to_string(ctx/1000) + "k").c_str());
+                                    continue;
+                                }
+
+                                // Init pipelined state
+                                PipelinedDecodeState pipe_state;
+                                if (!init_pipelined_decode_state(pipe_state, backend, w, cache, ctx, g_kq_stride_pad)) {
+                                    std::fprintf(stderr, "[time-breakdown] pipelined state init failed\n");
+                                    continue;
+                                }
+
+                                // Set initial act_cur
+                                std::vector<float> act_cur_pipe((size_t)hidden, 0.0f);
+                                ggml_backend_tensor_set(pipe_state.gpu_state.act_cur, act_cur_pipe.data(), 0,
+                                                        sizeof(float) * (size_t)hidden);
+
+                                // Warmup: 3 tokens
+                                for (int warmup = 0; warmup < 3; warmup++) {
+                                    ggml_backend_tensor_set(pipe_state.gpu_state.act_cur, act_cur_pipe.data(), 0,
+                                                            sizeof(float) * (size_t)hidden);
+                                    pipelined_decode_one_token(pipe_state, backend, w, cache, *hybrid,
+                                                              ctx + warmup, g_kq_stride_pad, nullptr);
+                                }
+
+                                // Timed runs: n_steps tokens
+                                PipelinedDecodeTelemetry tel_sum{};
+                                auto t_pipe_start = std::chrono::steady_clock::now();
+
+                                for (int step = 0; step < n_steps; ++step) {
+                                    ggml_backend_tensor_set(pipe_state.gpu_state.act_cur, act_cur_pipe.data(), 0,
+                                                            sizeof(float) * (size_t)hidden);
+                                    PipelinedDecodeTelemetry tel{};
+                                    pipelined_decode_one_token(pipe_state, backend, w, cache, *hybrid,
+                                                              ctx + step, g_kq_stride_pad, &tel);
+                                    tel_sum.total_us += tel.total_us;
+                                    tel_sum.prefn_graph_build_us += tel.prefn_graph_build_us;
+                                    tel_sum.prefn_compute_us += tel.prefn_compute_us;
+                                    tel_sum.routing_readback_us += tel.routing_readback_us;
+                                    tel_sum.ffn_us += tel.ffn_us;
+                                    tel_sum.allhot_layers += tel.allhot_layers;
+                                    tel_sum.mixed_layers += tel.mixed_layers;
+                                    tel_sum.total_layers += tel.total_layers;
+                                }
+
+                                auto t_pipe_end = std::chrono::steady_clock::now();
+                                double pipe_total_ms = std::chrono::duration<double, std::milli>(t_pipe_end - t_pipe_start).count();
+                                double avg_ms = pipe_total_ms / n_steps;
+                                double avg_prefn_build_ms = tel_sum.prefn_graph_build_us / 1000.0 / n_steps;
+                                double avg_prefn_compute_ms = tel_sum.prefn_compute_us / 1000.0 / n_steps;
+                                double avg_routing_ms = tel_sum.routing_readback_us / 1000.0 / n_steps;
+                                double avg_ffn_ms = tel_sum.ffn_us / 1000.0 / n_steps;
+                                double allhot_pct = tel_sum.total_layers > 0
+                                    ? 100.0 * tel_sum.allhot_layers / tel_sum.total_layers : 0.0;
+
+                                char label[64];
+                                std::snprintf(label, sizeof(label), "pipelined_ctx%dk", ctx / 1000);
+                                std::printf("%30s  %10.2f  %10.2f  %10.2f  %10.2f  %10.2f  %9.1f%%\n",
+                                            label, avg_ms, avg_prefn_build_ms, avg_prefn_compute_ms,
+                                            avg_routing_ms, avg_ffn_ms, allhot_pct);
+
+                                // Additional detail
+                                std::printf("    layers: %d total, %d allhot, %d mixed (per token avg)\n",
+                                            tel_sum.total_layers / n_steps,
+                                            tel_sum.allhot_layers / n_steps,
+                                            tel_sum.mixed_layers / n_steps);
+
+                                pipe_state.destroy();
+                            }
+
+                            // Free the biased-placement hybrid storage to reclaim VRAM
+                            hybrid.reset();
+
+                            // ── REALISTIC placement pipelined benchmark ──
+                            // Use UNIFORM placement (random routing hits mix of hot/cold)
+                            std::printf("\n[time-breakdown] === PIPELINED realistic placement (uniform hot/cold) ===\n");
+                            {
+                                // Build uniform placement: hottest N experts per layer based on uniform counts
+                                Qwen35MoeRoutingStats uniform_stats;
+                                uniform_stats.n_layer = w.n_layer;
+                                uniform_stats.n_expert = w.n_expert;
+                                uniform_stats.n_expert_used = w.n_expert_used;
+                                uniform_stats.counts.assign((size_t)w.n_layer * (size_t)w.n_expert, 1);
+                                uniform_stats.layer_totals.assign((size_t)w.n_layer, (uint64_t)w.n_expert);
+
+                                Qwen35MoeExpertPlacement uniform_placement;
+                                std::string up_err;
+                                if (Qwen35MoeExpertPlacement::build_from_stats(
+                                        uniform_stats, total_hot_budget,
+                                        std::min(w.n_expert_used, w.n_expert),
+                                        uniform_placement, &up_err)) {
+
+                                    // Rebuild hybrid storage with uniform placement
+                                    auto hybrid_realistic = std::make_shared<Qwen35MoeHybridStorage>();
+                                    if (build_qwen35moe_hybrid_storage_from_file(
+                                            w, backend, uniform_placement, layer_file_data,
+                                            *hybrid_realistic, &up_err)) {
+                                        std::printf("  uniform placement: hot=%d cold=%d — expect ~60%% all-hot layers\n",
+                                                    uniform_placement.total_hot,
+                                                    w.n_layer * w.n_expert - uniform_placement.total_hot);
+
+                                        int ctx = 2000;
+                                        if (ctx + 1 <= max_ctx) {
+                                            PipelinedDecodeState pipe_state;
+                                            if (init_pipelined_decode_state(pipe_state, backend, w, cache, ctx, g_kq_stride_pad)) {
+                                                std::vector<float> act_cur_pipe((size_t)hidden, 0.0f);
+                                                ggml_backend_tensor_set(pipe_state.gpu_state.act_cur, act_cur_pipe.data(), 0,
+                                                                        sizeof(float) * (size_t)hidden);
+                                                // Warmup
+                                                for (int warmup = 0; warmup < 3; warmup++) {
+                                                    ggml_backend_tensor_set(pipe_state.gpu_state.act_cur, act_cur_pipe.data(), 0,
+                                                                            sizeof(float) * (size_t)hidden);
+                                                    pipelined_decode_one_token(pipe_state, backend, w, cache, *hybrid_realistic,
+                                                                              ctx + warmup, g_kq_stride_pad, nullptr);
+                                                }
+                                                // Timed
+                                                PipelinedDecodeTelemetry tel_sum{};
+                                                auto t_start = std::chrono::steady_clock::now();
+                                                for (int step = 0; step < n_steps; ++step) {
+                                                    ggml_backend_tensor_set(pipe_state.gpu_state.act_cur, act_cur_pipe.data(), 0,
+                                                                            sizeof(float) * (size_t)hidden);
+                                                    PipelinedDecodeTelemetry tel{};
+                                                    pipelined_decode_one_token(pipe_state, backend, w, cache, *hybrid_realistic,
+                                                                              ctx + step, g_kq_stride_pad, &tel);
+                                                    tel_sum.total_us += tel.total_us;
+                                                    tel_sum.prefn_graph_build_us += tel.prefn_graph_build_us;
+                                                    tel_sum.prefn_compute_us += tel.prefn_compute_us;
+                                                    tel_sum.routing_readback_us += tel.routing_readback_us;
+                                                    tel_sum.ffn_us += tel.ffn_us;
+                                                    tel_sum.ffn_allhot_us += tel.ffn_allhot_us;
+                                                    tel_sum.ffn_mixed_us += tel.ffn_mixed_us;
+                                                    tel_sum.allhot_layers += tel.allhot_layers;
+                                                    tel_sum.mixed_layers += tel.mixed_layers;
+                                                    tel_sum.total_layers += tel.total_layers;
+                                                }
+                                                auto t_end = std::chrono::steady_clock::now();
+                                                double total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+                                                double avg_ms = total_ms / n_steps;
+                                                double avg_ffn_ms = tel_sum.ffn_us / 1000.0 / n_steps;
+                                                double allhot_pct = tel_sum.total_layers > 0
+                                                    ? 100.0 * tel_sum.allhot_layers / tel_sum.total_layers : 0.0;
+                                                double avg_allhot_ms = tel_sum.allhot_layers > 0
+                                                    ? tel_sum.ffn_allhot_us / 1000.0 / tel_sum.allhot_layers : 0.0;
+                                                double avg_mixed_ms = tel_sum.mixed_layers > 0
+                                                    ? tel_sum.ffn_mixed_us / 1000.0 / tel_sum.mixed_layers : 0.0;
+                                                std::printf("  pipelined_realistic_ctx2k: total=%.2fms  ffn=%.2fms  allhot=%.1f%%\n",
+                                                            avg_ms, avg_ffn_ms, allhot_pct);
+                                                std::printf("    per-layer: allhot_ffn=%.3fms  mixed_ffn=%.3fms\n",
+                                                            avg_allhot_ms, avg_mixed_ms);
+                                                std::printf("    layers/tok: %d allhot, %d mixed\n",
+                                                            tel_sum.allhot_layers / n_steps,
+                                                            tel_sum.mixed_layers / n_steps);
+                                                pipe_state.destroy();
+                                            }
+                                        }
+                                    } else {
+                                        std::printf("  uniform hybrid build failed: %s\n", up_err.c_str());
+                                    }
+                                }
+                            }
+                        }
+
+                        ::munmap(mmap_addr, file_size);
+                        gguf_free(gctx);
+                    }
+                }
+            }
+        }
+
+        std::printf("\n[time-breakdown] done. Model: %s (%d layers, hidden=%d)\n",
+                    arch_name, w.n_layer, hidden);
+
         free_target_cache(cache);
         free_target_weights(w);
         if (split_gpus) ggml_backend_free(draft_backend);

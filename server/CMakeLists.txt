@@ -254,6 +254,7 @@ add_library(dflash_common STATIC
     src/qwen35moe/qwen35moe_expert_placement.cpp
     src/qwen35moe/qwen35moe_hybrid_storage.cpp
     src/qwen35moe/qwen35moe_hybrid_ffn_eval.cpp
+    src/qwen35moe/qwen35moe_pipelined_decode.cpp
     src/qwen35moe/qwen35moe_swap_manager.cpp
     src/qwen35/layer_split_forward.cpp
     src/qwen35/layer_split_daemon.cpp
