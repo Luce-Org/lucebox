@@ -1,4 +1,4 @@
-updated_at: 2026-05-27T09:52:00-04:00
+updated_at: 2026-05-27T09:58:00-04:00
 repository: Luce-Org/lucebox-hub
 integration_branch: auto-integration
 remotes:
@@ -128,6 +128,8 @@ stack:
     - git merge-tree --write-tree HEAD origin/pr/<n> for open non-draft contributor PRs
     - git merge --no-ff --no-edit origin/pr/274 in isolated worktree
     - git merge --no-commit --no-ff origin/pr/266 in isolated worktree
+    - python3 -m compileall harness
   notes:
     - Primary checkout remained clean and unchanged during experiments.
     - Retained conflicted PR #266 worktree for inspection because cleanup/abort is not needed for the primary checkout and dangerous cleanup commands are forbidden.
+    - 2026-05-27T09:58-04:00 recheck: upstream/main still at bfe654f; PRs 274/276 remain represented in the stack, and PR 266 remains the next non-draft candidate but is still blocked by server-layout and obsolete-artifact conflicts.
