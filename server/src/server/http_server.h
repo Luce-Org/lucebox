@@ -115,7 +115,6 @@ struct ServerConfig {
 
     // /props introspection inputs — captured at startup by server_main so
     // the /props handler doesn't need to crack open BackendArgs or env.
-    // Matches dflash/scripts/server.py:1221-1312 field-for-field.
     std::string arch;                  // detected model arch (qwen35/36, laguna, gemma4, ...)
     std::string model_path;            // bargs.model_path
     std::string draft_path;            // bargs.draft_path (empty if no draft)
@@ -187,7 +186,7 @@ struct ParsedRequest {
     // True when the request opted in to the thinking-budget envelope via
     // `thinking: {type: "enabled"}`. Distinct from thinking_enabled (which
     // can be set via the chat template kwarg alone). When true, the response
-    // includes a `finish_details` block. Mirrors server.py:2271 conditional.
+    // includes a `finish_details` block when thinking was opted in.
     bool                      thinking_opt_in = false;
     // Per-request thinking-budget envelope (spec §4). Populated from
     // `thinking.budget_tokens` and `thinking.reply_budget`, or selected

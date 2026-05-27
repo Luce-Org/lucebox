@@ -60,9 +60,8 @@ CONFIGS = {
 PORT     = 8765
 TARGET   = os.environ.get("PFLASH_TARGET", "/home/peppi/models/qwen3.6-27b/Qwen3.6-27B-UD-Q4_K_XL.gguf")
 DRAFT    = os.environ.get("PFLASH_DRAFT",  "/home/peppi/models/qwen3.6-27b-dflash/model.safetensors")
-BIN      = os.environ.get("PFLASH_BIN",    "dflash/build/test_dflash")
+SERVER_BIN = os.environ.get("DFLASH_SERVER_BIN", str(PROJECT_ROOT / "dflash/build/dflash_server"))
 DRAFTER  = os.environ.get("PFLASH_DRAFTER", str(Path.home() / "models/Qwen3-0.6B-BF16.gguf"))
-SCRIPT   = PROJECT_ROOT / "dflash/scripts/server.py"
 
 # Canonical EvalPlus chat-mode prompt (evalplus/codegen.py:222-223)
 INSTRUCTION_PREFIX = (
@@ -120,8 +119,7 @@ def spawn(name, cfg, log_path):
         if idx + 1 < len(flags) and flags[idx + 1] != "off" and "--prefill-drafter" not in flags:
             flags += ["--prefill-drafter", DRAFTER]
     cmd = [
-        sys.executable, "-u", str(SCRIPT),
-        "--target", TARGET, "--draft", DRAFT, "--bin", BIN,
+        SERVER_BIN, TARGET, "--draft", DRAFT,
         "--port", str(PORT), *flags,
     ]
     env = {**os.environ, **cfg.get("env", {})}

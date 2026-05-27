@@ -164,7 +164,7 @@ void free_laguna_target_cache(LagunaTargetCache & c);
 void reset_laguna_target_cache(LagunaTargetCache & c);
 
 // ----------------------------------------------------------------------------
-// Cache snapshots for prefix-cache slots (server.py'́s PrefixCache).
+// Cache snapshots for prefix-cache slots (PrefixCache).
 //
 // A snapshot holds a parallel set of K/V tensors with the same shapes and
 // dtypes as the live LagunaTargetCache, plus the cur_pos at which the

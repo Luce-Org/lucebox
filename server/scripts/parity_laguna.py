@@ -10,7 +10,7 @@ The HF side uses `transformers.AutoModelForCausalLM` with the published
 `poolside/Laguna-XS.2` weights (BF16) on GPU.
 
 The dflash side uses the same `test_dflash`/`test_laguna_daemon` daemon that
-scripts/server.py drives. We send a `<prompt_bin> <gen_len=1>` bare-prompt
+dflash_server drives. We send a `<prompt_bin> <gen_len=1>` bare-prompt
 command with `--stream-fd` -- since the daemon only exposes the LAST-token
 logits, we sweep over context lengths to validate stability up to 128K.
 

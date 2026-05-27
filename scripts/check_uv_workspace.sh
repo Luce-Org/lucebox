@@ -13,16 +13,11 @@ uv run --frozen --no-sync python - <<'PY'
 import sys
 
 import datasets
-import fastapi
 import gguf
 import huggingface_hub
 import jinja2
 import numpy
 import transformers
-import uvicorn
-
-sys.path.insert(0, "server/scripts")
-import server  # noqa: F401
 
 print("workspace import OK from repo root")
 PY
@@ -35,8 +30,6 @@ import sys
 
 root_venv = Path("..").resolve() / ".venv"
 assert Path(sys.prefix).resolve() == root_venv, (sys.prefix, root_venv)
-sys.path.insert(0, "scripts")
-import server  # noqa: F401
 
 print("workspace discovery OK from server/")
 PY

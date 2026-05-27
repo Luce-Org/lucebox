@@ -26,7 +26,7 @@ codex --version          # should print 0.1xx.x
 
 ```bash
 cd dflash
-python scripts/server.py \
+./build/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf \
   --draft models/draft/draft-Qwen3.6-27B.gguf \
   --port 8080
 ```
@@ -34,7 +34,7 @@ python scripts/server.py \
 Wait until you see:
 
 ```
-INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+[server] listening on 0.0.0.0:8080
 ```
 
 ### Quick smoke test
@@ -123,7 +123,7 @@ The server is returning an error. Check:
 
 1. **Server is running** — `curl http://localhost:8080/health`
 2. **Port matches config** — `base_url` must match `--port`
-3. **Server logs** — look at the terminal where `server.py` is running
+3. **Server logs** — look at the terminal where `dflash_server` is running
 
 Common causes:
 
@@ -144,14 +144,12 @@ requests reuse the loaded model and are much faster.
 ## 6. Server CLI Reference
 
 ```
-python scripts/server.py [OPTIONS]
+./build/dflash_server <model.gguf> [OPTIONS]
 
 Options:
   --host HOST           Bind address (default: 0.0.0.0)
   --port PORT           Bind port (default: 8080)
-  --target PATH         Target model GGUF (default: models/Qwen3.6-27B-Q4_K_M.gguf)
   --draft PATH          Draft model for speculative decoding
-  --budget N            Speculation budget (default: 22)
-  --max-ctx N           Max context length (default: model-dependent)
-  --tokenizer NAME      HuggingFace tokenizer (auto-detected from model)
+  --ddtree-budget N     Speculation budget (default: 64)
+  --max-ctx N           Max context length (default: 131072)
 ```

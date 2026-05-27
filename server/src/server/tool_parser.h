@@ -1,6 +1,5 @@
 // Tool call parser — extracts structured tool calls from generated text.
 //
-// Ported from server.py parse_tool_calls().
 // Supports 5 detection patterns:
 //   1. <tool_call><function=name>...</function></tool_call>  (Qwen XML)
 //   2. <function=name>...</function>                          (bare function XML)

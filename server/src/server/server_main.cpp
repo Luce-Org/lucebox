@@ -1,8 +1,7 @@
 // dflash_server — native C++ HTTP server for dflash::common.
 //
-// Replaces the Python server.py for production use. Owns the target
-// ModelBackend directly, while optional draft/PFlash IPC paths can be used
-// for mixed-backend placement. The direct target path enables:
+// Owns the target ModelBackend directly, while optional draft/PFlash IPC
+// paths can be used for mixed-backend placement. Benefits:
 //   - Immediate client-disconnect cancellation (via send() failure)
 //   - Lower latency (no IPC overhead)
 //   - Single binary deployment
@@ -453,7 +452,7 @@ int main(int argc, char ** argv) {
     sconfig.pflash_remote_drafter = pflash_placement.remote_drafter;
     sconfig.pflash_remote = pflash_placement.remote;
 
-    // ── Apply environment defaults (mirrors server.py logic) ────────────
+    // ── Apply environment defaults ─────────────────────────────────────
     // Explicit --cache-type-k/v override via env vars.
     if (!cache_type_k.empty()) {
         setenv("DFLASH27B_KV_K", cache_type_k.c_str(), 1);

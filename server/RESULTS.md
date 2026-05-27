@@ -538,7 +538,7 @@ spends 1.5 s drafter + 0.4 s target, net 1.92 s vs llama.cpp 1.7 s).
 **Reproducing the 11.11 s drafter number requires Block-Sparse Attention
 on the Qwen3-0.6B drafter forward.** The PflashDaemon Python wrapper sets
 these env vars by default; the dflash daemon honours them at runtime but
-does not force them, so any caller (including `scripts/server.py`) is free
+does not force them, so any caller (including `dflash_server`) is free
 to opt out:
 
 ```bash
@@ -771,12 +771,12 @@ Linux 4090 should match or exceed the 3090 numbers.
 
 ### Server-mode reference (not apples-to-apples with bench_he.py)
 
-Running via `server.py` (OpenAI-compatible HTTP) with TQ3 KV cache and 128K context:
+Running via `dflash_server` (OpenAI-compatible HTTP) with TQ3 KV cache and 128K context:
 
 ```bash
-DFLASH27B_KV_TQ3=1 python server/scripts/server.py \
-  --target Qwen3.6-27B-Q4_K_M.gguf --draft dflash-draft-3.6-q8_0.gguf \
-  --port 8082 --budget 28 --max-ctx 131072
+DFLASH27B_KV_TQ3=1 ./build/dflash_server Qwen3.6-27B-Q4_K_M.gguf \
+  --draft dflash-draft-3.6-q8_0.gguf \
+  --port 8082 --ddtree --ddtree-budget 28 --max-ctx 131072
 ```
 
 54.7 tok/s at C=1 with 150 mixed chat prompts (short/medium/long, SSE streaming).

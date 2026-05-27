@@ -64,7 +64,7 @@ SYSTEM_NO_THINK = "/no_think"
 PORT = 8765
 TARGET = os.environ.get("PFLASH_TARGET", "/home/peppi/models/qwen3.6-27b/Qwen3.6-27B-UD-Q4_K_XL.gguf")
 DRAFT  = os.environ.get("PFLASH_DRAFT",  "/home/peppi/models/qwen3.6-27b-dflash/model.safetensors")
-BIN    = os.environ.get("PFLASH_BIN",    "dflash/build/test_dflash")
+SERVER_BIN = os.environ.get("DFLASH_SERVER_BIN", "dflash/build/dflash_server")
 DRAFTER = os.environ.get("PFLASH_DRAFTER", str(Path.home() / "models/Qwen3-0.6B-BF16.gguf"))
 
 
@@ -101,9 +101,12 @@ def spawn(name, cfg, log_path):
         idx = flags.index("--prefill-compression")
         if flags[idx + 1] != "off" and DRAFTER:
             flags += ["--prefill-drafter", DRAFTER]
+    # Translate --kv-f16 shorthand to explicit cache type flags.
+    if "--kv-f16" in flags:
+        flags.remove("--kv-f16")
+        flags += ["--cache-type-k", "f16", "--cache-type-v", "f16"]
     cmd = [
-        sys.executable, "-u", "dflash/scripts/server.py",
-        "--target", TARGET, "--draft", DRAFT, "--bin", BIN,
+        SERVER_BIN, TARGET, "--draft", DRAFT,
         "--port", str(PORT), *flags,
     ]
     env = {**os.environ, **cfg.get("env", {})}

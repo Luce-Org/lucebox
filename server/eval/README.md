@@ -8,7 +8,7 @@ produce different bytes for the same prompt?", not "is the answer correct".
 ## quick A/B (`scripts/quality_ab_simple.py`)
 
 Runs ~7 short conversational prompts against several server configs. For each
-config it spawns a fresh `server/scripts/server.py`, fires the prompts in
+config it spawns a fresh `dflash_server`, fires the prompts in
 sequence, then tears the server down. At the end it prints a markdown table
 comparing each config against the matching baseline (configs ending in `_f16`
 are compared against `baseline_f16` so attention precision is held constant).

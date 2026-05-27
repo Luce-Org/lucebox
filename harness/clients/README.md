@@ -11,15 +11,13 @@ cd /workspace/lucebox-hub-harness
 harness/clients/run_codex.sh
 ```
 
-Each launcher starts `server/scripts/server.py`, runs the client, writes logs
+Each launcher starts `server/build/dflash_server`, runs the client, writes logs
 under `/workspace/lucebox-client-harness-runs`, then stops the server.
 
-Set `LUCEBOX_SERVER_BACKEND=cpp` to run the native C++ HTTP server instead.
 The launcher will start `server/build/dflash_server` by default, or the path in
 `DFLASH_SERVER_BIN`.
 
 ```bash
-LUCEBOX_SERVER_BACKEND=cpp \
 DFLASH_SERVER_BIN=server/build/dflash_server \
 MAX_CTX=32768 MAX_TOKENS=512 \
 BUDGET=22 VERIFY_MODE=ddtree \

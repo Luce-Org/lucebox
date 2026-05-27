@@ -113,7 +113,7 @@ The target path can also be set via the `DFLASH_TARGET` environment variable.
 
 ```bash
 cd dflash
-python scripts/server.py
+./build/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf --port 8080
 ```
 
 ### Server CLI flags
@@ -150,37 +150,6 @@ python scripts/server.py
 
 ## Tests
 
-### Python unit tests (must pass)
-
-These tests **do not** require a GPU or running daemon — they use mocked backends:
-
-```bash
-cd server/scripts
-python -m pytest test_server.py -v
-```
-
-#### Baseline tests that must always pass
-
-```bash
-# Run only the unit tests (no daemon needed)
-python -m pytest test_server.py -k "parse or codex_models or models_endpoint" -v
-```
-
-These cover:
-
-| Test | What it verifies |
-|------|------------------|
-| `test_models_endpoint` | `/v1/models` returns OpenAI-format model list |
-| `test_codex_models_endpoint` | `/v1/models?client_version=` returns Codex format |
-| `test_parse_tool_calls_basic` | Qwen3 XML tool-call parsing extracts function name + args |
-| `test_parse_tool_calls_no_tools` | Plain text passes through without tool parsing |
-| `test_parse_reasoning_with_think` | `<think>` block extraction works |
-| `test_parse_reasoning_no_think` | Text without `<think>` returned as content |
-
-The full test suite (including integration tests that talk to the daemon) requires
-a running `test_dflash` binary and GPU. Those tests will fail in mock-only mode;
-run the baseline tests above to validate code changes.
-
 ### C++ tests (require GPU + model files)
 
 After building:
@@ -200,13 +169,20 @@ cd server/build
 
 ### Integration tests (require running server)
 
-These scripts start their own server subprocess and need the daemon binary + models:
+These scripts start their own server subprocess and need the server binary + models:
 
 ```bash
 cd server/scripts
 python test_server_prefix_cache.py
 python test_multi_turn_prefix_cache.py
 python test_full_compress_cache.py
+```
+
+Or run against an already-running server:
+
+```bash
+python test_server_prefix_cache.py --url http://localhost:8000
+python test_multi_turn_prefix_cache.py --url http://localhost:8000
 ```
 
 ---
@@ -226,13 +202,9 @@ server/
 │   ├── Qwen3.6-27B-Q4_K_M.gguf
 │   └── draft/dflash-draft-3.6-q8_0.gguf
 ├── scripts/
-│   ├── server.py               # Main OpenAI/Codex server
-│   ├── prefix_cache.py         # LRU prefix cache
-│   ├── _prefill_hook.py        # Speculative prefill compression
 │   ├── run.py                  # CLI text generation
-│   ├── test_server.py          # Python unit tests ← must pass
-│   ├── test_server_prefix_cache.py    # Integration test
-│   ├── test_multi_turn_prefix_cache.py # Integration test
+│   ├── test_server_prefix_cache.py    # Integration test (--url or auto-spawn)
+│   ├── test_multi_turn_prefix_cache.py # Integration test (--url or auto-spawn)
 │   ├── test_full_compress_cache.py    # Integration test
 │   └── setup_system.sh         # System dependency installer
 ├── README.md
@@ -267,7 +239,7 @@ No `env_key` is needed for local use.
 
 ```bash
 # Start the server
-python server/scripts/server.py --port 8080
+./build/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf --port 8080
 
 # In another terminal
 codex --provider dflash "Explain this codebase"

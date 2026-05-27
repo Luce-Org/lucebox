@@ -1,6 +1,4 @@
 // Reasoning parser — extracts <think>...</think> blocks from generated text.
-//
-// Ported from server.py parse_reasoning().
 
 #pragma once
 

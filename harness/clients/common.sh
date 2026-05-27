@@ -10,9 +10,7 @@ RUN_DIR="${RUN_DIR:-/workspace/lucebox-client-harness-runs}"
 
 TARGET="${TARGET:-$REPO_DIR/server/models/Qwen3.6-27B-Q4_K_M.gguf}"
 DRAFT="${DRAFT:-$REPO_DIR/server/models/draft/dflash-draft-3.6-q8_0.gguf}"
-DFLASH_BIN="${DFLASH_BIN:-$REPO_DIR/server/build/test_dflash}"
 MODEL_SERVER="${MODEL_SERVER:-lucebox}"
-LUCEBOX_SERVER_BACKEND="${LUCEBOX_SERVER_BACKEND:-python}"
 DFLASH_SERVER_BIN="${DFLASH_SERVER_BIN:-$REPO_DIR/server/build/dflash_server}"
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/workspace/llama-cpp-server-build/bin/llama-server}"
 LLAMA_N_GPU_LAYERS="${LLAMA_N_GPU_LAYERS:-999}"
@@ -63,34 +61,7 @@ start_lucebox_server() {
     echo "unknown MODEL_SERVER=$MODEL_SERVER; expected lucebox or llamacpp" >&2
     return 1
   fi
-  if [[ "$LUCEBOX_SERVER_BACKEND" == "cpp" ]]; then
-    start_dflash_native_server
-    return
-  fi
-  cd "$REPO_DIR"
-  local extra_args=()
-  if [[ -n "$EXTRA_SERVER_ARGS" ]]; then
-    # Shell-word splitting is intentional here for simple flag lists such as:
-    # EXTRA_SERVER_ARGS="--lazy-draft --prefill-compression auto"
-    read -r -a extra_args <<< "$EXTRA_SERVER_ARGS"
-  fi
-  python3 -u server/scripts/server.py \
-    --host "$HOST" \
-    --port "$PORT" \
-    --target "$TARGET" \
-    --draft "$DRAFT" \
-    --bin "$DFLASH_BIN" \
-    --budget "$BUDGET" \
-    --verify-mode "$VERIFY_MODE" \
-    --max-ctx "$MAX_CTX" \
-    --fa-window "$FA_WINDOW" \
-    --cache-type-k "$CACHE_TYPE_K" \
-    --cache-type-v "$CACHE_TYPE_V" \
-    --prefix-cache-slots 0 \
-    --prefill-cache-slots 0 \
-    "${extra_args[@]}" \
-    > "$SERVER_LOG" 2>&1 &
-  SERVER_PID=$!
+  start_dflash_native_server
 }
 
 start_dflash_native_server() {

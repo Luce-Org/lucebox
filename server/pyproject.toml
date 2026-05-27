@@ -7,11 +7,9 @@ requires-python = ">=3.12,<3.13"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Lucebox" }]
 
-# Runtime deps for scripts/server.py and the bench harness. The C++/CUDA
-# decoder is built separately via cmake (see README).
+# Runtime deps for the bench harness and helper scripts. The C++/CUDA
+# decoder and HTTP server are built separately via cmake (see README).
 dependencies = [
-    "fastapi>=0.115,<2.0",
-    "uvicorn>=0.30",
     "transformers>=4.50",
     "jinja2>=3.1",
     "torch>=2.0",
@@ -25,7 +23,7 @@ dependencies = [
 dev = ["pytest>=8"]
 
 # No installable Python package — scripts are invoked directly via
-# `.venv/bin/python scripts/server.py …`. Declared as a virtual project so
+# `.venv/bin/python scripts/bench_he.py …`. Declared as a virtual project so
 # uv resolves deps but skips wheel building.
 [tool.uv]
 package = false
