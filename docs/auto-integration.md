@@ -4,15 +4,15 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-27T18:17:12-04:00
-Current branch tip before this metadata refresh: `996b5a3` (`easel/auto-integration`).
+Last refresh: 2026-05-27T18:34:57-04:00
+Current branch tip before this metadata refresh: `e656ff0` (`easel/auto-integration`).
 
 ## Included in the current stack
 
 | PR | Head branch | State | Notes |
 |---:|---|---|---|
-| #288 | `fix/laguna-chat-template` | included | Current head `5e8136a` is an ancestor of `easel/auto-integration`. |
-| #287 | `feat/gemma4-timings` | included | Current head `b3163f4` is an ancestor of `easel/auto-integration`. |
+| #288 | `fix/laguna-chat-template` | included | Merged as `9a392e7`; current head `5e8136a` remains an ancestor of `easel/auto-integration`. |
+| #287 | `feat/gemma4-timings` | included | Merged as `bf7306e`; current head `b3163f4` remains an ancestor of `easel/auto-integration`. |
 | #284 | `fix/draft-safetensors-rope-theta` | included | Current head `697198a` is an ancestor of `easel/auto-integration`. |
 | #276 | `fix/qwen36-claude-code-tool-calling` | included | Current head `0e3c79a` is an ancestor of `easel/auto-integration`. |
 | #274 | `feat/pflash-drafter-ee7` | included | Current head `5037b28` is an ancestor of `easel/auto-integration`. |
@@ -56,7 +56,7 @@ Draft PRs remain outside the primary contributor integration target: #286, #285,
 
 ## Validation run
 
-No code integration was committed this run. Validation was limited to repository/auth/fetch status, PR classification, conflict probes, and integration metadata:
+No code integration was committed this run; this update only refreshes integration metadata. Validation was limited to repository/auth/fetch status, PR classification, conflict probes, and integration metadata, including confirming PRs #287 and #288 are already in the stack as merge commits:
 
 - `date -Is`
 - `git status --porcelain=v1; git branch --show-current; git remote -v`
