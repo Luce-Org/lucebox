@@ -4,8 +4,8 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-27T18:51:10-04:00
-Current branch tip before this metadata refresh: `6a54c27` (`auto-integration`, ahead of `easel/auto-integration` until pushed).
+Last refresh: 2026-05-27T19:19:38-04:00
+Current branch tip before this metadata refresh: `0e2d839` (`auto-integration`, equal to `easel/auto-integration` before this metadata-only refresh).
 
 ## Included in the current stack
 
@@ -29,10 +29,11 @@ Current branch tip before this metadata refresh: `6a54c27` (`auto-integration`, 
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| #174 | partially integrated | A read-only delegated assessment confirmed the final docs-only commit was safe to port to `server/README.md`; committed as `6a54c27`. The older inherited Gemma4 commits on the branch were not cherry-picked. |
-| #237 | not integrated | Revalidated with a read-only delegated feasibility review. Direct merge/cherry-pick still conflicts across the legacy `dflash/` to current `server/` migration, including `server/CMakeLists.txt`, `backend_factory`, `DFlashTarget`, Qwen35 backend/target internals, and native server CLI. Smallest coherent functional subset is still a manual MTP foundation port, not a safe cherry-pick. |
-| #137 | not integrated | Manual cherry-pick probe in `/tmp/luce-auto-run-20260527-1815` produced a modify/delete conflict on deleted legacy `dflash/CMakeLists.txt`; the current `server/CMakeLists.txt` architecture handling makes the old standalone BSA/sm_89 patch stale. |
-| #135 | not integrated | Manual cherry-pick probe conflicts in `server/src/internal.h`, `server/src/qwen35/qwen35_target_graph.cpp`, and `server/test/test_dflash.cpp`. Codex tmux review (`codex-pr135-1819`) concluded it is a selective architecture port, not a safe cherry-pick: the old daemon scheduler must be redesigned around current `HttpServer`/`ModelBackend`/Qwen35 cache APIs while preserving newer MoE, KV rotation, snapshot, `last_token_logits_only`, remote-draft, and tool-hint behavior. |
+| #237 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr237-20260527-190917` still produced 23 unmerged paths across `server/CMakeLists.txt`, backend factory, MTP/StepGraph interfaces, Qwen35 loader/backend/graph files, tests, and deleted legacy `dflash/` server entry points. Claude was unavailable due session limit; Codex tmux session `luce-pr237-codex-1914` completed a read-only feasibility note at `/tmp/pr237-feasibility.txt`: a safe minimal merge is not feasible; lowest-risk path is a fresh manual port with MTP disabled by default and existing draft/pflash/remote-draft/thinking-budget behavior preserved. |
+| #221 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr221-20260527-190917` produced 36 unmerged paths and many legacy `dflash/bench/results` artifacts. Codex tmux session `luce-pr221-1909` attempted a current-layout port (moved Qwen36 MTP pieces and edited namespace/backend paths) but left conflict markers/unmerged paths, so no changes were accepted into the stack. This remains dependent on a coherent #237-style MTP foundation port first. |
+| #174 | previously partially integrated | A prior read-only delegated assessment confirmed the final docs-only commit was safe to port to `server/README.md`; committed as `6a54c27`. The older inherited Gemma4 commits on the branch were not cherry-picked. |
+| #137 | previously not integrated | Manual cherry-pick probe in `/tmp/luce-auto-run-20260527-1815` produced a modify/delete conflict on deleted legacy `dflash/CMakeLists.txt`; the current `server/CMakeLists.txt` architecture handling makes the old standalone BSA/sm_89 patch stale. |
+| #135 | previously not integrated | Manual cherry-pick probe conflicts in `server/src/internal.h`, `server/src/qwen35/qwen35_target_graph.cpp`, and `server/test/test_dflash.cpp`. Codex tmux review (`codex-pr135-1819`) concluded it is a selective architecture port, not a safe cherry-pick: the old daemon scheduler must be redesigned around current `HttpServer`/`ModelBackend`/Qwen35 cache APIs while preserving newer MoE, KV rotation, snapshot, `last_token_logits_only`, remote-draft, and tool-hint behavior. |
 
 ## Held / not yet included
 
@@ -58,30 +59,28 @@ Draft PRs remain outside the primary contributor integration target: #286, #285,
 
 ## Validation run
 
-This run committed the documentation-only payload from PR #174 and refreshed integration metadata. Validation covered repository/auth/fetch status, PR classification, delegated read-only feasibility checks, and docs sanity:
+This run refreshed repository/auth/fetch status, re-enumerated open PRs, confirmed the currently included heads, and performed fresh worktree-based attempts for PR #237 and PR #221. Only this manifest changed in the final branch; no conflicted agent edits were accepted. Validation covered:
 
 - `date -Is`
-- `git status --porcelain=v1; git branch --show-current; git remote -v`
+- `git status --porcelain=v1; git branch --show-current; git remote -v; git worktree list`
 - `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status`
 - `HOME=/home/erik /home/erik/.local/bin/claude auth status --text`
 - `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --version`
 - `git fetch --prune origin`
 - `git fetch --prune easel`
-- `git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'` (reported the known submodule warning for `dflash/deps/Block-Sparse-Attention` at `bcddec6`)
-- `git merge-base --is-ancestor origin/main easel/auto-integration`
-- `git cherry easel/auto-integration origin/pr/<N>` for open non-draft heads
-- `git diff --name-status origin/main...origin/pr/<N>` for held/stale heads
-- `grep -n "Small-VRAM\|GGML_CUDA_NO_VMM" server/README.md`
-- Delegated read-only PR #174 assessment: safe docs-only port target was `server/README.md`, not removed `dflash/README.md`
-- Delegated read-only PR #237 assessment: still requires a manual MTP foundation port to current `server/`; not cherry-pickable
-- PR #137 cherry-pick probe in an isolated worktree, then restored to a clean index
-- PR #135 cherry-pick probe in an isolated worktree, then restored to a clean index
-- Codex tmux session `codex-pr135-1819` feasibility review for PR #135
+- `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...`
+- `git merge-base --is-ancestor <PR head> HEAD` for open non-draft heads
+- `git fetch origin pull/237/head:refs/remotes/origin/pr/237` and `git fetch origin pull/221/head:refs/remotes/origin/pr/221`
+- Fresh isolated merge probes in `/tmp/luce-attempt-pr237-20260527-190917` and `/tmp/luce-attempt-pr221-20260527-190917`
+- tmux-driven Codex feasibility/reconciliation attempts: `luce-pr237-codex-1914` and `luce-pr221-1909`
+- `git status --short` in the primary checkout before and after the metadata refresh
+- `git diff --check -- docs/auto-integration.md`
 
 ## Notes
 
-- Primary checkout `/home/erik/Projects/luce2` was clean at start; only `server/README.md` and this manifest were changed and committed.
-- This run did not create new temporary worktrees; delegated PR #174/#237 checks were read-only.
+- Primary checkout `/home/erik/Projects/luce2` was clean at start; only this manifest was changed and committed.
+- PR #237 fresh attempt retained conflicted worktree `/tmp/luce-attempt-pr237-20260527-190917`; Codex wrote `/tmp/pr237-feasibility.txt`.
+- PR #221 fresh attempt retained conflicted worktree `/tmp/luce-attempt-pr221-20260527-190917`; Codex attempted edits but still left 36 unmerged paths and no accepted stack changes.
 - Retained conflicted PR #221 worktree from prior run: `/tmp/luce-pr221-delegated-20260527-1727`.
 - Retained prior metadata-update worktree from prior run: `/tmp/luce-auto-report-update-20260527-1727`.
 - Retained prior metadata refresh worktree from prior run: `/tmp/luce-auto-report-20260527-175019`.
