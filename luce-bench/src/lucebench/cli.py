@@ -156,11 +156,72 @@ def format_row(idx: int, row: dict, graded: dict) -> str:
     correct = graded.get("correct") or "?"
     wall = row.get("wall_seconds") or 0
     timings = row.get("timings") or {}
-    tps = timings.get("decode_tokens_per_sec") or 0
+    if not isinstance(timings, dict):
+        timings = {}
+
+    # ── Throughput. Prefer the server-reported decode rate (lucebox /
+    # llama.cpp populate `decode_tokens_per_sec`); fall back to a wall-
+    # clock estimate so OpenRouter / vLLM (which don't surface decode_tps)
+    # don't always read "0tps". The fallback rolls prefill into the rate,
+    # so mark it with a trailing `*` to keep the distinction visible.
+    tps_val = timings.get("decode_tokens_per_sec")
+    completion_tokens = row.get("completion_tokens")
+    if tps_val:
+        tps_str = f"{tps_val:.0f}tps"
+    elif completion_tokens and wall and wall > 0:
+        tps_str = f"{completion_tokens / wall:.0f}tps*"
+    else:
+        tps_str = "?tps"
+
+    # ── Prefill / decode split. lucebox-server surfaces both in
+    # `usage.timings` (prefill_ms + decode_ms); OpenRouter / vLLM
+    # typically surface neither. Render whichever pair is available; if
+    # both are missing fall back to the plain wall time.
+    prefill_ms = timings.get("prefill_ms")
+    decode_ms = timings.get("decode_ms")
+
+    def _fmt_ms(ms: float) -> str:
+        # Sub-second renders as e.g. "210ms"; >=1s as "3.5s" to keep the line tight.
+        if ms < 1000:
+            return f"{ms:.0f}ms"
+        return f"{ms / 1000:.1f}s"
+
+    time_parts: list[str] = []
+    if prefill_ms is not None and decode_ms is not None:
+        time_parts.append(f"prefill={_fmt_ms(prefill_ms)}")
+        time_parts.append(f"decode={_fmt_ms(decode_ms)}")
+    elif prefill_ms is not None:
+        time_parts.append(f"prefill={_fmt_ms(prefill_ms)} wall={wall:.2f}s")
+    elif decode_ms is not None:
+        time_parts.append(f"decode={_fmt_ms(decode_ms)} wall={wall:.2f}s")
+    else:
+        time_parts.append(f"wall={wall:.2f}s")
+    time_str = " ".join(time_parts)
+
+    # ── Token breakdown: input / thinking / non-thinking. `reasoning_tokens`
+    # is captured by runner.run_case from `usage.completion_tokens_details`
+    # (OpenAI/OR) or the deprecated top-level `usage.reasoning_tokens`. We
+    # do NOT count tokens ourselves — no tokenizer dep — so when the server
+    # only ships `reasoning_content` text we leave `think` out and show `out`
+    # as the full completion_tokens count.
+    prompt_tokens = row.get("prompt_tokens")
+    reasoning_tokens = row.get("reasoning_tokens")
+    tok_bits: list[str] = []
+    if prompt_tokens is not None:
+        tok_bits.append(f"in={prompt_tokens}")
+    if isinstance(reasoning_tokens, int) and isinstance(completion_tokens, int):
+        non_thinking = max(completion_tokens - reasoning_tokens, 0)
+        tok_bits.append(f"think={reasoning_tokens}")
+        tok_bits.append(f"out={non_thinking}")
+    elif completion_tokens is not None:
+        tok_bits.append(f"out={completion_tokens}")
+    tok_str = " ".join(tok_bits)
+
     return (
         f"  {idx:3d} {verdict} {src:14s} {cid:24s} "
         f"given={given:20s} correct={correct:20s} "
-        f"wall={wall:.2f}s {tps:.0f}tps"
+        f"{time_str} {tps_str}"
+        + (f" {tok_str}" if tok_str else "")
     )
 
 

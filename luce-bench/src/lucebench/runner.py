@@ -154,6 +154,18 @@ def run_case(
     usage = data.get("usage", {}) or {}
     finish_details = choice.get("finish_details") or msg.get("finish_details") or {}
 
+    # Reasoning-token count is delivered in several shapes depending on the
+    # server. OpenAI / OpenRouter nest it under completion_tokens_details;
+    # some older builds put it at the top level of usage as `reasoning_tokens`.
+    # We surface both so format_row can render a `think=N` breakdown without
+    # needing a tokenizer.
+    ctd = usage.get("completion_tokens_details") or {}
+    if not isinstance(ctd, dict):
+        ctd = {}
+    reasoning_tokens = ctd.get("reasoning_tokens")
+    if reasoning_tokens is None:
+        reasoning_tokens = usage.get("reasoning_tokens")
+
     return {
         "case_id": case.get("id"),
         "source": case.get("source"),
@@ -162,6 +174,7 @@ def run_case(
         "http_status": http_status,
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
+        "reasoning_tokens": reasoning_tokens,
         "content": msg.get("content"),
         "reasoning_content": msg.get("reasoning_content") or msg.get("reasoning"),
         "finish_reason": choice.get("finish_reason"),
