@@ -109,6 +109,14 @@ included:
     merge_commit: da1c567
     status_at_selection: "non-draft + mergeable; clean merge after #264"
     notes: "Adds Gemma 4 RTX 4090 helper docs/scripts. Reviewed for obvious secret/destructive-command patterns; no secrets found."
+  - pr: 142
+    title: "feat(dflash): accept FP16 safetensors drafter alongside BF16"
+    author: javierpazo
+    head_ref: javierpazo:xabicasa/dflash-safetensors-draft-fp16
+    head_commit: f2fbf62f493896b46e52a917e2e2f836343bc423
+    merge_commit: 085fb0e
+    status_at_selection: "non-draft known contributor; one small conflict in server/src/draft/draft_safetensors_loader.cpp"
+    notes: "Resolved comment-only conflict by preserving #142's BF16/F16-on-disk wording while keeping the current native-BF16 fallback wording."
 
 attempted:
   - pr: 282
@@ -120,6 +128,9 @@ attempted:
   - pr: 152
     result: "merged"
     verification: "Merged cleanly; git diff --check, Python py_compile, and bash -n passed. PowerShell parse was skipped because pwsh is not installed in this WSL environment."
+  - pr: 142
+    result: "merged"
+    verification: "Resolved the only conflict in draft_safetensors_loader.cpp; git diff --check and conflict-marker scan passed."
 
 held:
   - pr: 278
@@ -165,6 +176,7 @@ conflicts_fixed:
       - "#276: resolved test_server_unit.cpp churn by keeping both alias/tool-normalization behaviors and fixing the stale constructor call."
       - "#275: layered on top of #274 with no extra code changes beyond the docs/bench follow-up."
       - "#264: resolved server/CMakeLists.txt and server/test/test_server_unit.cpp conflict markers by preserving both the new adaptive keep_ratio targets and the existing tool/accept-rate unit coverage."
+      - "#142: resolved a comment-only safetensors loader conflict by preserving FP16/BF16 support wording and current native-BF16 fallback wording."
 
 checks_run:
   - command: "git diff --stat origin/main...HEAD"
@@ -185,6 +197,8 @@ checks_run:
     result: "Passed."
   - command: "bash -n scripts/lucebox-gemma4-4090.sh"
     result: "Passed."
+  - command: "rg '^(<<<<<<<|=======|>>>>>>>)'"
+    result: "Passed; no unresolved merge conflict markers after #142 resolution."
   - command: "PowerShell parse of scripts/Start-LuceboxGemma4090.ps1"
     result: "Skipped because pwsh is not installed in this WSL environment."
 
@@ -197,7 +211,7 @@ rebuild_commands: |
   git fetch easel auto-integration --prune
   git checkout auto-integration
   git reset --hard origin/main
-  for n in 262 269 274 276 275 282 264 152; do
+  for n in 262 269 274 276 275 282 264 152 142; do
     git fetch origin pull/$n/head:refs/heads/pr-$n
     git merge --no-ff pr-$n
   done
