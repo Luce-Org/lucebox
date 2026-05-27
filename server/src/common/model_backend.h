@@ -121,6 +121,11 @@ struct GenerateResult {
     // can mark the answer as unreliable rather than treating the
     // (truncated) content as a clean response.
     bool                       degenerate_decode_close = false;
+    // DFlash chain accept rate: accepted_draft_tokens / total_draft_positions.
+    // 0.0 when spec decode did not run (AR fallback or no draft model).
+    float                      accept_rate     = 0.0f;
+    // True when spec decode actually ran (accept_rate==0 still needs a bandit update).
+    bool                       spec_decode_ran = false;
 };
 
 // ─── Backend interface ──────────────────────────────────────────────────

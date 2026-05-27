@@ -1116,6 +1116,9 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         // (effort tier doesn't influence reply_budget — spec §4.2: "the reply
         // reserve falls back to --hard-limit-reply-budget".)
 
+        // Bandit: parse session_id from extra_body (opt-in adaptive keep_ratio)
+        req.session_id = parse_session_id_from_body(body);
+
         // Serialize tools JSON for template injection.
         std::string tools_json;
         if (req.tools.is_array() && !req.tools.empty()) {
@@ -1323,7 +1326,10 @@ void HttpServer::worker_loop() {
                         // 3. Compress via typed API
                         ModelBackend::CompressRequest creq;
                         creq.input_ids = std::move(drafter_ids);
-                        creq.keep_ratio = config_.pflash_keep_ratio;
+                        // Bandit: use per-session keep_ratio if session_id provided.
+                        creq.keep_ratio = req.session_id.empty()
+                            ? config_.pflash_keep_ratio
+                            : sessions_.get_keep_ratio(req.session_id);
                         creq.drafter_path = config_.pflash_drafter_path;
                         creq.drafter_gpu = config_.pflash_drafter_gpu;
                         creq.skip_park = config_.pflash_skip_park;
@@ -1635,6 +1641,21 @@ void HttpServer::worker_loop() {
         // doesn't grow monotonically across requests with different sizes.
         backend_.release_scratch();
 
+        // Bandit: update when spec decode actually ran — including 0-accept case,
+        // which signals the current keep_ratio is too low.
+        if (!req.session_id.empty() && result.spec_decode_ran) {
+            float old_keep = sessions_.get_keep_ratio(req.session_id);
+            int   old_turn = sessions_.turn_count(req.session_id);
+            sessions_.update(req.session_id, result.accept_rate);
+            float new_keep = sessions_.get_keep_ratio(req.session_id);
+            float ema      = sessions_.get_ema(req.session_id);
+            std::fprintf(stderr,
+                "[pflash-bandit] session=%s turn=%d keep=%.4f->%.4f ema=%.3f accept=%.3f\n",
+                req.session_id.c_str(), old_turn + 1,
+                old_keep, new_keep, ema, result.accept_rate);
+        }
+
+
         // Confirm or abort the inline snapshot.
         if (snap_prepared) {
             if (completion_tokens > 0 && !client_disconnected) {
@@ -1847,7 +1868,8 @@ void HttpServer::worker_loop() {
                         // (emitter-tracked split).
                         {"reasoning_tokens", reasoning_tokens_emitted}
                     }},
-                    {"timings", build_timings_json(gen_timings, total_completion_tokens)}
+                    {"timings", build_timings_json(gen_timings, total_completion_tokens)},
+                    {"accept_rate", result.accept_rate}
                 };
                 resp = {
                     {"id", req.response_id},
@@ -1910,7 +1932,8 @@ void HttpServer::worker_loop() {
                 json anth_usage = {
                     {"input_tokens", (int)req.prompt_tokens.size()},
                     {"output_tokens", total_completion_tokens},
-                    {"timings", build_timings_json(gen_timings, total_completion_tokens)}
+                    {"timings", build_timings_json(gen_timings, total_completion_tokens)},
+                    {"accept_rate", result.accept_rate}
                 };
                 resp = {
                     {"id", req.response_id}, {"type", "message"},
@@ -1945,7 +1968,8 @@ void HttpServer::worker_loop() {
                     {"input_tokens", (int)req.prompt_tokens.size()},
                     {"output_tokens", total_completion_tokens},
                     {"total_tokens", (int)req.prompt_tokens.size() + total_completion_tokens},
-                    {"timings", build_timings_json(gen_timings, total_completion_tokens)}
+                    {"timings", build_timings_json(gen_timings, total_completion_tokens)},
+                    {"accept_rate", result.accept_rate}
                 };
                 resp = {
                     {"id", req.response_id}, {"object", "response"},

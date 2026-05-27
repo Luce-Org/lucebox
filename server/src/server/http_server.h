@@ -21,6 +21,7 @@
 #include "placement/remote_draft_config.h"
 #include "common/pflash_drafter_ipc.h"
 #include "model_card.h"
+#include "adaptive_keep_ratio.h"
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -197,6 +198,8 @@ struct ParsedRequest {
     int                       per_req_reply_budget = -1;
     // Stop sequences (OpenAI "stop" + Anthropic "stop_sequences")
     std::vector<std::string>  stop_sequences;
+    // Bandit: per-session adaptive keep_ratio opt-in
+    std::string               session_id;
 };
 
 // Build the /props response body. Exposed (non-static) so unit tests
@@ -281,6 +284,9 @@ private:
     PrefixCache      prefix_cache_;
     DiskPrefixCache  disk_cache_;
 
+    // Per-session adaptive keep_ratio bandit state.
+    HttpServerSessions sessions_;
+
     // Track prompt tokens for each snapshot slot (for shutdown save).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
 
@@ -310,5 +316,21 @@ struct ServerJob {
     std::condition_variable cv;
     ServerJob *   next = nullptr;
 };
+
+// ─── Parse session_id from a chat-completion JSON body ──────────────────
+// Returns empty string when session_id is absent or not a string (int/null/array).
+// Checks extra_body.session_id first, then top-level session_id.
+inline std::string parse_session_id_from_body(const json & body) {
+    if (body.contains("extra_body")) {
+        const auto & eb = body["extra_body"];
+        if (eb.is_object() && eb.contains("session_id") && eb["session_id"].is_string()) {
+            return eb["session_id"].get<std::string>();
+        }
+    }
+    if (body.contains("session_id") && body["session_id"].is_string()) {
+        return body["session_id"].get<std::string>();
+    }
+    return {};
+}
 
 }  // namespace dflash::common

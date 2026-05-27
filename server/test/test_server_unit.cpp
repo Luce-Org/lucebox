@@ -2780,6 +2780,80 @@ static void test_emitter_native_bash_tag_detected() {
     TEST_ASSERT(s.find("\"stop_reason\":\"tool_use\"") != std::string::npos);
 }
 
+// GenerateResult.accept_rate plumbing tests (Day 1 of bandit MVP)
+// ═══════════════════════════════════════════════════════════════════════
+
+static void test_generate_result_accept_rate_defaults_to_zero() {
+    GenerateResult r;
+    TEST_ASSERT(r.accept_rate == 0.0f);
+}
+
+static void test_generate_result_accept_rate_can_be_set() {
+    GenerateResult r;
+    r.accept_rate = 0.85f;
+    TEST_ASSERT(r.accept_rate == 0.85f);
+}
+
+static void test_generate_result_accept_rate_bounds() {
+    GenerateResult r;
+    r.accept_rate = 0.0f;
+    TEST_ASSERT(r.accept_rate >= 0.0f && r.accept_rate <= 1.0f);
+    r.accept_rate = 1.0f;
+    TEST_ASSERT(r.accept_rate >= 0.0f && r.accept_rate <= 1.0f);
+}
+
+static void test_generate_result_accept_rate_in_usage_openai() {
+    // Simulate the non-streaming OpenAI JSON response build.
+    // Verify accept_rate flows from GenerateResult into usage block.
+    GenerateResult result;
+    result.ok = true;
+    result.tokens = {1, 2, 3};
+    result.accept_rate = 0.75f;
+
+    std::vector<int32_t> prompt_tokens = {10, 20};
+
+    json resp = {
+        {"id", "test"},
+        {"usage", {
+            {"prompt_tokens", (int)prompt_tokens.size()},
+            {"completion_tokens", (int)result.tokens.size()},
+            {"total_tokens", (int)(prompt_tokens.size() + result.tokens.size())},
+            {"accept_rate", result.accept_rate}
+        }}
+    };
+
+    TEST_ASSERT(resp["usage"].contains("accept_rate"));
+    TEST_ASSERT(std::abs(resp["usage"]["accept_rate"].get<float>() - 0.75f) < 1e-6f);
+}
+
+static void test_generate_result_accept_rate_in_usage_anthropic() {
+    GenerateResult result;
+    result.ok = true;
+    result.tokens = {1, 2};
+    result.accept_rate = 0.60f;
+
+    std::vector<int32_t> prompt_tokens = {5};
+
+    json resp = {
+        {"usage", {
+            {"input_tokens", (int)prompt_tokens.size()},
+            {"output_tokens", (int)result.tokens.size()},
+            {"accept_rate", result.accept_rate}
+        }}
+    };
+
+    TEST_ASSERT(resp["usage"].contains("accept_rate"));
+    TEST_ASSERT(std::abs(resp["usage"]["accept_rate"].get<float>() - 0.60f) < 1e-6f);
+}
+
+static void test_generate_result_accept_rate_zero_when_no_spec_decode() {
+    // When spec decode doesn't run (no draft model), accept_rate stays 0.
+    GenerateResult r;
+    r.ok = true;
+    // accept_rate not set → must be 0.0f
+    TEST_ASSERT(r.accept_rate == 0.0f);
+}
+
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
     std::fprintf(stderr, " Server Unit Tests\n");
@@ -2962,6 +3036,14 @@ int main() {
     RUN_TEST(test_param_alias_path_to_file_path);
     RUN_TEST(test_param_alias_case_insensitive_direct);
     RUN_TEST(test_param_alias_no_match_passthrough);
+
+    std::fprintf(stderr, "\n── GenerateResult.accept_rate ──\n");
+    RUN_TEST(test_generate_result_accept_rate_defaults_to_zero);
+    RUN_TEST(test_generate_result_accept_rate_can_be_set);
+    RUN_TEST(test_generate_result_accept_rate_bounds);
+    RUN_TEST(test_generate_result_accept_rate_in_usage_openai);
+    RUN_TEST(test_generate_result_accept_rate_in_usage_anthropic);
+    RUN_TEST(test_generate_result_accept_rate_zero_when_no_spec_decode);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",

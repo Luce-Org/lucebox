@@ -57,6 +57,7 @@ env/
 *.qdrep
 *.sqlite
 bench-out/
+dflash/bench/results/
 profile-out/
 
 # Model weights and caches (pull fresh from HF)
