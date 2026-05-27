@@ -1,0 +1,5 @@
+Answer these logic puzzles. End your answer with OK_DONE.
+
+1. If all roses are flowers and some flowers fade quickly, can we conclude that some roses fade quickly?
+2. A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost?
+3. If you have a 3-litre jug and a 5-litre jug, how can you measure exactly 4 litres of water?

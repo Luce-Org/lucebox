@@ -28,16 +28,16 @@ server.
 ```bash
 cd /workspace/lucebox-hub-harness
 
-harness/clients/run_codex.sh
+python3 -m harness.client_test_runner bandit --clients codex
 harness/clients/run_claude_code.sh
-harness/clients/run_opencode.sh
+python3 -m harness.client_test_runner bandit --clients opencode
 ```
 
 Common overrides:
 
 ```bash
-MAX_CTX=32768 BUDGET=22 VERIFY_MODE=ddtree harness/clients/run_codex.sh
-PROMPT_FILE=harness/clients/prompts/repo_inspection.txt harness/clients/run_hermes.sh
+MAX_CTX=32768 BUDGET=22 VERIFY_MODE=ddtree python3 -m harness.client_test_runner bandit --clients codex
+PROMPT_FILE=harness/clients/prompts/repo_inspection.txt python3 -m harness.client_test_runner bandit --clients hermes
 CLIENT=opencode harness/clients/run_backend_pair.sh
 ```
 
@@ -45,6 +45,7 @@ Use the native C++ server:
 
 ```bash
 harness/clients/run_codex.sh
+LUCEBOX_SERVER_BACKEND=cpp python3 -m harness.client_test_runner bandit --clients codex
 ```
 
 The native server binary defaults to `server/build/dflash_server`. Override the
@@ -57,7 +58,7 @@ DRAFT=server/models/draft/dflash-draft-3.6-q8_0.gguf \
 MODEL_ID=luce-dflash \
 MAX_CTX=32768 MAX_TOKENS=512 \
 BUDGET=22 VERIFY_MODE=ddtree FA_WINDOW=2048 \
-harness/clients/run_codex.sh
+python3 -m harness.client_test_runner bandit --clients codex
 ```
 
 To test an already-running native server:
@@ -99,8 +100,8 @@ For a GPU sweep, let the runner start Lucebox for each profile:
 ```bash
 python3 harness/client_test_runner.py sweep \
   --target server/models/Qwen3.6-27B-Q4_K_M.gguf \
-  --draft server/models/draft \
-  --bin server/build/test_dflash \
+  --draft server/models/draft/dflash-draft-3.6-q8_0.gguf \
+  --bin server/build/dflash_server \
   --profiles rtx3090_dflash_safe,rtx3090_dflash_long \
   --clients all \
   --json-out /tmp/lucebox_harness_sweep.json

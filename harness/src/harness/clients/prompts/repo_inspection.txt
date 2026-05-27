@@ -1,0 +1,8 @@
+Use your normal file-reading tools if they are available. Do not modify files.
+
+Inspect the current repository and answer these questions:
+1. What is the first Markdown heading in README.md?
+2. What is the first Markdown heading in dflash/README.md?
+3. Does dflash/README.md mention Qwen3.6?
+
+Keep the answer short and end with OK_DONE.

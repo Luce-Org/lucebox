@@ -1,0 +1,9 @@
+label=A_fixed_low
+keep_ratio=0.05
+session_id=
+wall_s=17
+ok_done=YES
+accept_rate=31.7
+mean_drafter_fwd_ms=1610 ms (n=1)
+bandit_log:
+none

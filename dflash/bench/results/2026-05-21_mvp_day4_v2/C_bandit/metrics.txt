@@ -1,0 +1,10 @@
+label=C_bandit
+keep_ratio=0.10
+session_id=claude_code_s1
+wall_s=12
+ok_done=YES
+accept_rate=0.34742647409439087
+mean_drafter_fwd_ms=N/A
+N/A
+bandit_log:
+[pflash-bandit] session=claude_code_s1 turn=1 keep=0.1000->0.1100 (accept=0.347)

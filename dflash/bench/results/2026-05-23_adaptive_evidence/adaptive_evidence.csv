@@ -1,0 +1,6 @@
+client,turn,session_id,prompt,keep_before,accept_rate,keep_after,ema,wall_s
+claude_code,1,adaptive-evidence-20260523,decode_check.txt,0.1,0.062,0.11,0.062,7.409
+claude_code,2,adaptive-evidence-20260523,logic_check.txt,0.11,0.062,0.12,0.062,4.928
+claude_code,3,adaptive-evidence-20260523,math_check.txt,0.12,0.062,0.13,0.062,4.888
+claude_code,4,adaptive-evidence-20260523,code_gen.txt,0.13,0.062,0.14,0.062,5.185
+claude_code,5,adaptive-evidence-20260523,explain_algo.txt,0.14,0.062,0.15,0.062,5.335

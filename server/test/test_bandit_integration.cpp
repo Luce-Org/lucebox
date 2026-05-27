@@ -2,8 +2,8 @@
 // No GPU, no model files — uses a synchronous MockBackend that returns
 // a configurable accept_rate.
 //
-// Build: cmake --build dflash/build --target test_bandit_integration -j
-// Run:   cd dflash/build && ./test_bandit_integration
+// Build: cmake --build server/build --target test_bandit_integration -j
+// Run:   cd server/build && ./test_bandit_integration
 
 #include "server/http_server.h"
 #include "server/adaptive_keep_ratio.h"

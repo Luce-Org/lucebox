@@ -1,0 +1,2 @@
+Write a Python function that implements binary search on a sorted list.
+Include docstring, type hints, and a brief usage example. End your answer with OK_DONE.

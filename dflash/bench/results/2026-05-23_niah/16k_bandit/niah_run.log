@@ -1,0 +1,129 @@
+Starting NIAH 16K bandit at Sat May 23 19:15:53 CEST 2026
+[init] spawning daemon: /home/peppi/Dev/lucebox-hub/.claude/worktrees/pflash-auto/dflash/build/test_dflash
+[test_dflash] arch=qwen35 daemon -> dispatching to run_qwen35_daemon (max_ctx=4096 stream_fd=5)
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 24575 MiB):
+  Device 0: NVIDIA GeForce RTX 3090, compute capability 8.6, VMM: no, VRAM: 24575 MiB
+[cfg] seq_verify=0 fast_rollback=1 ddtree=1 budget=16 temp=1.00 chain_seed=1 fa_window=0 draft_swa=0 draft_ctx_max=4096 draft_feature_mirror=0 peer_access=0 target_gpu=0 draft_gpu=0
+[loader] eos_id=248046 eos_chat_id=-1
+[target] target loaded: layers [0,64) output=1, 850 tensors on GPU 14.99 GiB, tok_embd 682 MiB CPU-only (q4_K)
+[draft]  loaded
+[daemon] ready
+[park] draft released
+[case 0] src=16380 keep=0.1
+[compress] loading drafter from /home/peppi/models/Qwen3-0.6B-BF16.gguf ...
+[park] target released
+[drafter] loaded qwen3-0.6b BF16: n_layer=28 n_head=16 n_kv=8 n_embd=1024 n_ff=3072 head_dim=128 vocab=151936
+[compress] drafter ready
+[qwen3-0.6b-fp] layer 1/28 done (A_setup=0.000s A_alloc=0.000s A_compute=0.090s FP=0.160s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] layer 28/28 done (A_setup=0.001s A_alloc=0.001s A_compute=0.441s FP=4.311s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] forward 6.00s (S=16380, A_setup=0.00s A_alloc=0.00s A_compute=0.44s FP=4.31s B_warm=0.00s B_setup=0.00s B_alloc=0.00s B_copy_in=0.00s B_norm=0.00s B_compute=0.00s B_copy_out=0.00s)  tail-score 0.43s  total 6.43s
+[drafter] forward+score in 6.52s S=16380
+[drafter] score_and_compress total 6.52s S=16380 kept=1628 (51/512 chunks, forced=37)
+[compress] 16380 -> 1628 tokens
+[case 0] compressed=1628 ratio=10.1x score_s=6.9
+[loader] eos_id=248046 eos_chat_id=-1
+[unpark] target restored
+[drafter] freed
+[unpark] draft restored
+[spec-decode] tokens=20 time=0.301 s speed=66.48 tok/s steps=2 accepted=20/32 (62.5%) avg_commit=10.00
+ok N=1653 gen=20 prefill_s=1.810 decode_s=0.301 decode_tok_s=66.5 stream_fd=5
+[park] draft released
+[case 0] raw out_ids (20): [760, 3175, 10642, 2715, 1413, 69, 371, 7891, 1324, 369, 220, 19, 15, 17, 20, 15, 16, 21, 13, 248046]
+[case 0] out_with_special: 'The special magic qahftrxc number is 4025016.<|im_end|>'
+[case 0] gen_s=2.1 ttft=9.0 ok=True ans=4025016
+[case 0] out: 'The special magic qahftrxc number is 4025016.'
+[case 1] src=16380 keep=0.1
+[compress] loading drafter from /home/peppi/models/Qwen3-0.6B-BF16.gguf ...
+[park] target released
+[drafter] loaded qwen3-0.6b BF16: n_layer=28 n_head=16 n_kv=8 n_embd=1024 n_ff=3072 head_dim=128 vocab=151936
+[compress] drafter ready
+[qwen3-0.6b-fp] layer 1/28 done (A_setup=0.000s A_alloc=0.000s A_compute=0.016s FP=0.155s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] layer 28/28 done (A_setup=0.001s A_alloc=0.001s A_compute=0.372s FP=4.247s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] forward 5.87s (S=16380, A_setup=0.00s A_alloc=0.00s A_compute=0.37s FP=4.25s B_warm=0.00s B_setup=0.00s B_alloc=0.00s B_copy_in=0.00s B_norm=0.00s B_compute=0.00s B_copy_out=0.00s)  tail-score 0.42s  total 6.29s
+[drafter] forward+score in 6.38s S=16380
+[drafter] score_and_compress total 6.38s S=16380 kept=1628 (51/512 chunks, forced=37)
+[compress] 16380 -> 1628 tokens
+[case 1] compressed=1628 ratio=10.1x score_s=10.0
+[loader] eos_id=248046 eos_chat_id=-1
+[unpark] target restored
+[drafter] freed
+[unpark] draft restored
+[spec-decode] tokens=20 time=0.276 s speed=72.40 tok/s steps=2 accepted=20/32 (62.5%) avg_commit=10.00
+ok N=1653 gen=20 prefill_s=1.651 decode_s=0.276 decode_tok_s=72.4 stream_fd=5
+[park] draft released
+[case 1] raw out_ids (20): [760, 3175, 10642, 292, 13059, 20306, 355, 76, 1324, 369, 220, 15, 19, 18, 23, 20, 22, 19, 13, 248046]
+[case 1] out_with_special: 'The special magic bsdmrulm number is 0438574.<|im_end|>'
+[case 1] gen_s=1.9 ttft=11.9 ok=True ans=0438574
+[case 1] out: 'The special magic bsdmrulm number is 0438574.'
+[case 2] src=16378 keep=0.1
+[compress] loading drafter from /home/peppi/models/Qwen3-0.6B-BF16.gguf ...
+[park] target released
+[drafter] loaded qwen3-0.6b BF16: n_layer=28 n_head=16 n_kv=8 n_embd=1024 n_ff=3072 head_dim=128 vocab=151936
+[compress] drafter ready
+[qwen3-0.6b-fp] layer 1/28 done (A_setup=0.000s A_alloc=0.000s A_compute=0.017s FP=0.158s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] layer 28/28 done (A_setup=0.001s A_alloc=0.001s A_compute=0.374s FP=4.313s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] forward 5.95s (S=16378, A_setup=0.00s A_alloc=0.00s A_compute=0.37s FP=4.31s B_warm=0.00s B_setup=0.00s B_alloc=0.00s B_copy_in=0.00s B_norm=0.00s B_compute=0.00s B_copy_out=0.00s)  tail-score 0.41s  total 6.36s
+[drafter] forward+score in 6.45s S=16378
+[drafter] score_and_compress total 6.45s S=16378 kept=1626 (51/512 chunks, forced=37)
+[compress] 16378 -> 1626 tokens
+[case 2] compressed=1626 ratio=10.1x score_s=6.8
+[loader] eos_id=248046 eos_chat_id=-1
+[unpark] target restored
+[drafter] freed
+[unpark] draft restored
+[spec-decode] tokens=19 time=0.265 s speed=71.58 tok/s steps=2 accepted=19/32 (59.4%) avg_commit=9.50
+ok N=1651 gen=19 prefill_s=1.622 decode_s=0.266 decode_tok_s=71.5 stream_fd=5
+[park] draft released
+[case 2] raw out_ids (19): [760, 3175, 10642, 580, 358, 797, 2499, 1324, 369, 220, 16, 20, 24, 21, 18, 19, 21, 13, 248046]
+[case 2] out_with_special: 'The special magic kowefada number is 1596346.<|im_end|>'
+[case 2] gen_s=1.9 ttft=8.7 ok=True ans=1596346
+[case 2] out: 'The special magic kowefada number is 1596346.'
+[case 3] src=16380 keep=0.1
+[compress] loading drafter from /home/peppi/models/Qwen3-0.6B-BF16.gguf ...
+[park] target released
+[drafter] loaded qwen3-0.6b BF16: n_layer=28 n_head=16 n_kv=8 n_embd=1024 n_ff=3072 head_dim=128 vocab=151936
+[compress] drafter ready
+[qwen3-0.6b-fp] layer 1/28 done (A_setup=0.000s A_alloc=0.000s A_compute=0.016s FP=0.153s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] layer 28/28 done (A_setup=0.001s A_alloc=0.001s A_compute=0.368s FP=4.295s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] forward 5.90s (S=16380, A_setup=0.00s A_alloc=0.00s A_compute=0.37s FP=4.30s B_warm=0.00s B_setup=0.00s B_alloc=0.00s B_copy_in=0.00s B_norm=0.00s B_compute=0.00s B_copy_out=0.00s)  tail-score 0.40s  total 6.30s
+[drafter] forward+score in 6.39s S=16380
+[drafter] score_and_compress total 6.39s S=16380 kept=1628 (51/512 chunks, forced=38)
+[compress] 16380 -> 1628 tokens
+[case 3] compressed=1628 ratio=10.1x score_s=6.7
+[loader] eos_id=248046 eos_chat_id=-1
+[unpark] target restored
+[drafter] freed
+[unpark] draft restored
+[spec-decode] tokens=20 time=0.276 s speed=72.44 tok/s steps=2 accepted=20/32 (62.5%) avg_commit=10.00
+ok N=1653 gen=20 prefill_s=1.658 decode_s=0.276 decode_tok_s=72.4 stream_fd=5
+[park] draft released
+[case 3] raw out_ids (20): [760, 3175, 10642, 304, 12518, 564, 1413, 67, 1324, 369, 220, 18, 22, 15, 21, 16, 22, 22, 13, 248046]
+[case 3] out_with_special: 'The special magic hmcibahd number is 3706177.<|im_end|>'
+[case 3] gen_s=1.9 ttft=8.7 ok=True ans=3706177
+[case 3] out: 'The special magic hmcibahd number is 3706177.'
+[case 4] src=16380 keep=0.1
+[compress] loading drafter from /home/peppi/models/Qwen3-0.6B-BF16.gguf ...
+[park] target released
+[drafter] loaded qwen3-0.6b BF16: n_layer=28 n_head=16 n_kv=8 n_embd=1024 n_ff=3072 head_dim=128 vocab=151936
+[compress] drafter ready
+[qwen3-0.6b-fp] layer 1/28 done (A_setup=0.000s A_alloc=0.000s A_compute=0.017s FP=0.156s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] layer 28/28 done (A_setup=0.001s A_alloc=0.001s A_compute=0.378s FP=4.448s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] forward 6.09s (S=16380, A_setup=0.00s A_alloc=0.00s A_compute=0.38s FP=4.45s B_warm=0.00s B_setup=0.00s B_alloc=0.00s B_copy_in=0.00s B_norm=0.00s B_compute=0.00s B_copy_out=0.00s)  tail-score 0.40s  total 6.49s
+[drafter] forward+score in 6.58s S=16380
+[drafter] score_and_compress total 6.58s S=16380 kept=1628 (51/512 chunks, forced=37)
+[compress] 16380 -> 1628 tokens
+[case 4] compressed=1628 ratio=10.1x score_s=6.9
+[loader] eos_id=248046 eos_chat_id=-1
+[unpark] target restored
+[drafter] freed
+[unpark] draft restored
+[spec-decode] tokens=20 time=0.263 s speed=76.08 tok/s steps=2 accepted=19/32 (59.4%) avg_commit=10.00
+ok N=1653 gen=20 prefill_s=1.659 decode_s=0.263 decode_tok_s=76.1 stream_fd=5
+[park] draft released
+[case 4] raw out_ids (20): [760, 3175, 10642, 830, 74, 30816, 8556, 3181, 1324, 369, 220, 15, 15, 18, 23, 23, 16, 24, 13, 248046]
+[case 4] out_with_special: 'The special magic xkpwfnpy number is 0038819.<|im_end|>'
+[case 4] gen_s=1.9 ttft=8.8 ok=True ans=0038819
+[case 4] out: 'The special magic xkpwfnpy number is 0038819.'
+
+accuracy: 5/5
+16K bandit exit=0 at Sat May 23 19:17:12 CEST 2026

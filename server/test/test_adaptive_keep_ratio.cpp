@@ -165,6 +165,34 @@ static void unknown_session_returns_default() {
     TEST_ASSERT(mgr.turn_count("no-such-session") == 0);
 }
 
+static void lru_cap_evicts_oldest() {
+    // Create a manager with cap=3, insert 4 sessions, verify size stays at 3.
+    HttpServerSessions mgr(3);
+    mgr.update("a", 0.80f);
+    mgr.update("b", 0.80f);
+    mgr.update("c", 0.80f);
+    TEST_ASSERT_MSG(mgr.size() == 3, "size must be 3 after 3 inserts");
+    // 'a' is LRU; inserting 'd' should evict 'a'
+    mgr.update("d", 0.80f);
+    TEST_ASSERT_MSG(mgr.size() == 3, "size must remain at cap after overflow insert");
+    TEST_ASSERT_MSG(mgr.turn_count("a") == 0, "evicted session must look like unknown");
+    TEST_ASSERT_MSG(mgr.turn_count("d") == 1, "newly inserted session must have 1 turn");
+}
+
+static void lru_touch_updates_eviction_order() {
+    // Access 'a' after inserting a,b,c — now 'b' is LRU. Inserting 'd' must evict 'b'.
+    HttpServerSessions mgr(3);
+    mgr.update("a", 0.80f);
+    mgr.update("b", 0.80f);
+    mgr.update("c", 0.80f);
+    // Touch 'a' (moves to MRU); 'b' becomes LRU
+    (void)mgr.get_keep_ratio("a");
+    mgr.update("d", 0.80f);
+    TEST_ASSERT_MSG(mgr.size() == 3, "size must stay at cap");
+    TEST_ASSERT_MSG(mgr.turn_count("b") == 0, "b must have been evicted (LRU after touch(a))");
+    TEST_ASSERT_MSG(mgr.turn_count("a") == 1, "a must survive (was touched)");
+}
+
 static void get_ema_reflects_post_update_value() {
     HttpServerSessions mgr;
     TEST_ASSERT_MSG(approx_eq(mgr.get_ema("s1"), 0.0f), "unknown session ema is 0");
@@ -233,6 +261,8 @@ int main() {
     RUN_TEST(unknown_session_returns_default);
     RUN_TEST(get_ema_reflects_post_update_value);
     RUN_TEST(lru_eviction_bounds_map_size);
+    RUN_TEST(lru_cap_evicts_oldest);
+    RUN_TEST(lru_touch_updates_eviction_order);
 
     std::fprintf(stderr, "\n%d tests, %d failures\n", test_count, test_failures);
     return (test_failures == 0) ? 0 : 1;

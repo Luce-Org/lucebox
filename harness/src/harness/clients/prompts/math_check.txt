@@ -1,0 +1,5 @@
+Solve the following math problems. End your answer with OK_DONE.
+
+1. What is 17 * 23?
+2. What is the sum of the first 10 prime numbers?
+3. If a rectangle has width 7 and height 11, what is its area?

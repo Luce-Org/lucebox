@@ -1,0 +1,11 @@
+seed=seed2
+prompt=logic_check.txt
+label=B_fixed_high
+keep_ratio=0.20
+session_id=
+wall_s=23
+ok_done=YES
+accept_rate=29.8
+mean_drafter_fwd_ms=1590 ms (n=1)
+bandit_log:
+none

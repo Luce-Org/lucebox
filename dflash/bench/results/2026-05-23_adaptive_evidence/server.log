@@ -1,0 +1,145 @@
+[server] loading tokenizer from /home/peppi/models/qwen3.6-27b-q3ks/Qwen3.6-27B-Q3_K_S.gguf
+[tokenizer] added_tokens: 33 special tokens
+[tokenizer] loaded vocab=248320 merges=247587 bos=248044 eos=248046 eot=248046 pre=qwen35 sp=no
+[server] loading pflash drafter tokenizer from /home/peppi/models/Qwen3-0.6B-BF16.gguf
+[tokenizer] added_tokens: 26 special tokens
+[tokenizer] loaded vocab=151936 merges=151387 bos=151643 eos=151645 eot=151645 pre=qwen2 sp=no
+[server] pflash: mode=auto threshold=4096 keep=0.100 skip_park=0
+[server] creating backend...
+[backend_factory] detected arch=qwen35
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 24575 MiB):
+  Device 0: NVIDIA GeForce RTX 3090, compute capability 8.6, VMM: no, VRAM: 24575 MiB
+[draft GGUF] SWA layers: 4/5 (window=2048)
+
+[server] ╭─── Configuration ───────────────────────────────────╮
+[server] │  host            = 127.0.0.1
+[server] │  port            = 50443
+[server] │  model           = /home/peppi/models/qwen3.6-27b-q3ks/Qwen3.6-27B-Q3_K_S.gguf
+[server] │  draft           = /home/peppi/models/qwen3.6-27b-dflash/dflash-draft-3.6-q4_k_m.gguf
+[server] │  model_name      = dflash
+[server] │  max_ctx         = 32768
+[server] │  max_tokens      = 4096
+[server] │  target_device   = auto:0
+[server] │  draft_device    = auto:0
+[server] │  peer_access     = off
+[server] │  chunk           = 512
+[server] │  fa_window       = 2048
+[server] │  ddtree          = off
+[server] │  ddtree_budget   = 64
+[server] │  cors            = ON
+[server] │  cache_type_k    = tq3_0
+[server] │  cache_type_v    = tq3_0
+[server] │  pflash          = auto
+[server] │  pflash_threshold= 4096
+[server] │  pflash_keep     = 0.100
+[server] │  pflash_drafter  = /home/peppi/models/Qwen3-0.6B-BF16.gguf
+[server] │  pflash_skip_park= off
+[server] │  fp_use_bsa      = ON
+[server] │  fp_alpha        = 0.85
+[server] │  lazy_draft      = off
+[server] ╰─────────────────────────────────────────────────────╯
+
+[pc] enabled: cap=32 family=qwen
+[server] listening on http://127.0.0.1:50443
+[loader] eos_id=248046 eos_chat_id=-1
+[target] target loaded: layers [0,64) output=1, 850 tensors on GPU 10.73 GiB, tok_embd 521 MiB CPU-only (q3_K)
+[draft]  loaded
+[park] target released
+[park] draft released
+[compress] loading drafter from /home/peppi/models/Qwen3-0.6B-BF16.gguf ...
+[drafter] loaded qwen3-0.6b BF16: n_layer=28 n_head=16 n_kv=8 n_embd=1024 n_ff=3072 head_dim=128 vocab=151936
+[compress] drafter ready
+[qwen3-0.6b-fp] layer 1/28 done (A_setup=0.000s A_alloc=0.000s A_compute=0.232s FP=0.010s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] layer 28/28 done (A_setup=0.001s A_alloc=0.001s A_compute=0.425s FP=0.080s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] forward 1.18s (S=8755, A_setup=0.00s A_alloc=0.00s A_compute=0.42s FP=0.08s B_warm=0.00s B_setup=0.00s B_alloc=0.00s B_copy_in=0.00s B_norm=0.00s B_compute=0.00s B_copy_out=0.00s)  tail-score 0.31s  total 1.49s
+[drafter] forward+score in 1.56s S=8755
+[drafter] score_and_compress total 1.56s S=8755 kept=851 (27/274 chunks, forced=26)
+[compress] 8755 -> 851 tokens
+[loader] eos_id=248046 eos_chat_id=-1
+[unpark] target restored
+[draft GGUF] SWA layers: 4/5 (window=2048)
+[unpark] draft restored
+[pflash] 8766 -> 851 -> 864 tokens (9.9% kept)
+[snap] alloc right-sized: cur_pos=852 buf=202.88 MiB backend=CPU
+[snap] inline slot=0 cur_pos=852
+[spec-decode] tokens=1 time=0.118 s speed=8.44 tok/s steps=1 accepted=1/16 (6.2%) avg_commit=1.00
+[vram] released scratch buffers
+[pflash-bandit] session=adaptive-evidence-20260523 turn=1 keep=0.1000->0.1100 ema=0.062 accept=0.062
+[pc] inline-snap committed slot=0 prefix_len=852
+[park] target released
+[park] draft released
+[qwen3-0.6b-fp] layer 1/28 done (A_setup=0.000s A_alloc=0.000s A_compute=0.011s FP=0.003s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] layer 28/28 done (A_setup=0.001s A_alloc=0.001s A_compute=0.204s FP=0.074s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] forward 0.97s (S=8755, A_setup=0.00s A_alloc=0.00s A_compute=0.20s FP=0.07s B_warm=0.00s B_setup=0.00s B_alloc=0.00s B_copy_in=0.00s B_norm=0.00s B_compute=0.00s B_copy_out=0.00s)  tail-score 0.21s  total 1.18s
+[drafter] forward+score in 1.24s S=8755
+[drafter] score_and_compress total 1.24s S=8755 kept=947 (30/274 chunks, forced=29)
+[compress] 8755 -> 947 tokens
+[loader] eos_id=248046 eos_chat_id=-1
+[unpark] target restored
+[draft GGUF] SWA layers: 4/5 (window=2048)
+[unpark] draft restored
+[pflash] 8766 -> 947 -> 960 tokens (11.0% kept)
+[snap] alloc right-sized: cur_pos=948 buf=208.88 MiB backend=CPU
+[snap] inline slot=1 cur_pos=948
+[spec-decode] tokens=1 time=0.108 s speed=9.23 tok/s steps=1 accepted=1/16 (6.2%) avg_commit=1.00
+[vram] released scratch buffers
+[pflash-bandit] session=adaptive-evidence-20260523 turn=2 keep=0.1100->0.1200 ema=0.062 accept=0.062
+[pc] inline-snap committed slot=1 prefix_len=948
+[park] target released
+[park] draft released
+[qwen3-0.6b-fp] layer 1/28 done (A_setup=0.000s A_alloc=0.000s A_compute=0.010s FP=0.002s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] layer 28/28 done (A_setup=0.001s A_alloc=0.001s A_compute=0.200s FP=0.074s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] forward 0.95s (S=8755, A_setup=0.00s A_alloc=0.00s A_compute=0.20s FP=0.07s B_warm=0.00s B_setup=0.00s B_alloc=0.00s B_copy_in=0.00s B_norm=0.00s B_compute=0.00s B_copy_out=0.00s)  tail-score 0.21s  total 1.16s
+[drafter] forward+score in 1.22s S=8755
+[drafter] score_and_compress total 1.22s S=8755 kept=1011 (32/274 chunks, forced=31)
+[compress] 8755 -> 1011 tokens
+[loader] eos_id=248046 eos_chat_id=-1
+[unpark] target restored
+[draft GGUF] SWA layers: 4/5 (window=2048)
+[unpark] draft restored
+[pflash] 8766 -> 1011 -> 1024 tokens (11.7% kept)
+[snap] alloc right-sized: cur_pos=1012 buf=212.88 MiB backend=CPU
+[snap] inline slot=2 cur_pos=1012
+[spec-decode] tokens=1 time=0.110 s speed=9.09 tok/s steps=1 accepted=1/16 (6.2%) avg_commit=1.00
+[vram] released scratch buffers
+[pflash-bandit] session=adaptive-evidence-20260523 turn=3 keep=0.1200->0.1300 ema=0.062 accept=0.062
+[pc] inline-snap committed slot=2 prefix_len=1012
+[park] target released
+[park] draft released
+[qwen3-0.6b-fp] layer 1/28 done (A_setup=0.000s A_alloc=0.001s A_compute=0.010s FP=0.002s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] layer 28/28 done (A_setup=0.001s A_alloc=0.001s A_compute=0.199s FP=0.071s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] forward 0.94s (S=8755, A_setup=0.00s A_alloc=0.00s A_compute=0.20s FP=0.07s B_warm=0.00s B_setup=0.00s B_alloc=0.00s B_copy_in=0.00s B_norm=0.00s B_compute=0.00s B_copy_out=0.00s)  tail-score 0.22s  total 1.16s
+[drafter] forward+score in 1.21s S=8755
+[drafter] score_and_compress total 1.22s S=8755 kept=1107 (35/274 chunks, forced=32)
+[compress] 8755 -> 1107 tokens
+[loader] eos_id=248046 eos_chat_id=-1
+[unpark] target restored
+[draft GGUF] SWA layers: 4/5 (window=2048)
+[unpark] draft restored
+[pflash] 8766 -> 1107 -> 1119 tokens (12.8% kept)
+[snap] alloc right-sized: cur_pos=1107 buf=218.81 MiB backend=CPU
+[snap] inline slot=3 cur_pos=1107
+[spec-decode] tokens=1 time=0.114 s speed=8.75 tok/s steps=1 accepted=1/16 (6.2%) avg_commit=1.00
+[vram] released scratch buffers
+[pflash-bandit] session=adaptive-evidence-20260523 turn=4 keep=0.1300->0.1400 ema=0.062 accept=0.062
+[pc] inline-snap committed slot=3 prefix_len=1107
+[park] target released
+[park] draft released
+[qwen3-0.6b-fp] layer 1/28 done (A_setup=0.000s A_alloc=0.000s A_compute=0.011s FP=0.002s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] layer 28/28 done (A_setup=0.001s A_alloc=0.001s A_compute=0.203s FP=0.073s B_warm=0.000s B_setup=0.000s B_alloc=0.000s B_copy_in=0.000s B_norm=0.000s B_compute=0.000s B_copy_out=0.000s)
+[qwen3-0.6b-fp] forward 0.95s (S=8755, A_setup=0.00s A_alloc=0.00s A_compute=0.20s FP=0.07s B_warm=0.00s B_setup=0.00s B_alloc=0.00s B_copy_in=0.00s B_norm=0.00s B_compute=0.00s B_copy_out=0.00s)  tail-score 0.22s  total 1.17s
+[drafter] forward+score in 1.23s S=8755
+[drafter] score_and_compress total 1.23s S=8755 kept=1203 (38/274 chunks, forced=32)
+[compress] 8755 -> 1203 tokens
+[loader] eos_id=248046 eos_chat_id=-1
+[unpark] target restored
+[draft GGUF] SWA layers: 4/5 (window=2048)
+[unpark] draft restored
+[pflash] 8766 -> 1203 -> 1216 tokens (13.9% kept)
+[snap] alloc right-sized: cur_pos=1204 buf=224.88 MiB backend=CPU
+[snap] inline slot=4 cur_pos=1204
+[spec-decode] tokens=1 time=0.115 s speed=8.73 tok/s steps=1 accepted=1/16 (6.2%) avg_commit=1.00
+[vram] released scratch buffers
+[pflash-bandit] session=adaptive-evidence-20260523 turn=5 keep=0.1400->0.1500 ema=0.062 accept=0.062
+[pc] inline-snap committed slot=4 prefix_len=1204
+[drafter] freed

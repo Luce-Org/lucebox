@@ -1,0 +1,1 @@
+Explain how merge sort works. Cover: the divide step, the merge step, time complexity O(n log n), and one concrete example with a 6-element list. End your answer with OK_DONE.

@@ -9,13 +9,10 @@ PAIR_DIR="$RUN_DIR/$PAIR_STAMP"
 
 case "$CLIENT" in
   claude|claude_code) CLIENT_SCRIPT="$SCRIPT_DIR/run_claude_code.sh" ;;
-  codex) CLIENT_SCRIPT="$SCRIPT_DIR/run_codex.sh" ;;
-  hermes) CLIENT_SCRIPT="$SCRIPT_DIR/run_hermes.sh" ;;
-  opencode) CLIENT_SCRIPT="$SCRIPT_DIR/run_opencode.sh" ;;
+  codex|hermes|opencode|pi) CLIENT_SCRIPT="" ;;
   openclaw) CLIENT_SCRIPT="$SCRIPT_DIR/run_openclaw.sh" ;;
   openwebui) CLIENT_SCRIPT="$SCRIPT_DIR/run_openwebui.sh" ;;
   openwebui_tools) CLIENT_SCRIPT="$SCRIPT_DIR/run_openwebui_tools.sh" ;;
-  pi) CLIENT_SCRIPT="$SCRIPT_DIR/run_pi.sh" ;;
   *)
     echo "unknown CLIENT=$CLIENT" >&2
     exit 2
@@ -28,12 +25,19 @@ PAIR_LOG="$PAIR_DIR/pair.log"
 run_backend() {
   local backend="$1"
   local stamp="$PAIR_STAMP-$backend"
-  echo "[$(date -Is)] backend=$backend client=$CLIENT script=$CLIENT_SCRIPT" | tee -a "$PAIR_LOG"
+  echo "[$(date -Is)] backend=$backend client=$CLIENT" | tee -a "$PAIR_LOG"
   set +e
-  MODEL_SERVER="$backend" \
-  RUN_DIR="$PAIR_DIR" \
-  STAMP="$stamp" \
-  "$CLIENT_SCRIPT" 2>&1 | tee "$PAIR_DIR/$backend.out"
+  if [[ -n "$CLIENT_SCRIPT" ]]; then
+    MODEL_SERVER="$backend" \
+    RUN_DIR="$PAIR_DIR" \
+    STAMP="$stamp" \
+    "$CLIENT_SCRIPT" 2>&1 | tee "$PAIR_DIR/$backend.out"
+  else
+    MODEL_SERVER="$backend" \
+    RUN_DIR="$PAIR_DIR" \
+    STAMP="$stamp" \
+    python3 -m harness.client_test_runner bandit --clients "$CLIENT" --output "$PAIR_DIR/$backend.out" 2>&1 | tee "$PAIR_DIR/$backend.out"
+  fi
   local rc=${PIPESTATUS[0]}
   set -e
   echo "[$(date -Is)] backend=$backend rc=$rc" | tee -a "$PAIR_LOG"

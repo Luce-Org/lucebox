@@ -1,0 +1,17 @@
+condition=32k_baseline
+ctx=32768
+keep_ratio=0.20
+n_cases=5
+pass=5
+fail=0
+accuracy=5/5
+bsa=1
+alpha=0.85
+compression_ratio=5.0x
+mean_drafter_s=19.83
+mean_target_prefill_s=6.82
+mean_e2e_ttft_s=31.2
+run_date=2026-05-23
+start=19:17:23
+end=19:20:30
+wall_s=187

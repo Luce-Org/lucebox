@@ -1,0 +1,11 @@
+seed=seed3
+prompt=math_check.txt
+label=B_fixed_high
+keep_ratio=0.20
+session_id=
+wall_s=22
+ok_done=YES
+accept_rate=38.6
+mean_drafter_fwd_ms=1650 ms (n=1)
+bandit_log:
+none

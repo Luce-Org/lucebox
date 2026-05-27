@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <list>
 #include <mutex>
@@ -24,8 +25,6 @@ constexpr float kBanditKeepMax    = 0.20f;
 constexpr float kBanditEscalateLo = 0.70f;
 constexpr float kBanditEscalateHi = 0.90f;
 
-// Maximum number of concurrent sessions retained in memory.
-// When this limit is reached, the least-recently-used session is evicted.
 constexpr std::size_t kMaxSessions = 1024;
 
 inline AdaptiveKeepRatioState step_adaptive_keep_ratio(
@@ -49,68 +48,93 @@ inline AdaptiveKeepRatioState step_adaptive_keep_ratio(
     return next;
 }
 
-// Thread-safe per-session container with LRU eviction bounded to kMaxSessions.
-// Prevents memory exhaustion from unbounded unique-session insertion.
+// Thread-safe per-session container with LRU eviction.
+//
+// Bounds memory to at most max_sessions entries (env: DFLASH_BANDIT_MAX_SESSIONS,
+// default 1024). When the cap is reached, the least-recently-used session is
+// evicted so long-running servers don't accumulate unbounded state.
 class HttpServerSessions {
 public:
+    explicit HttpServerSessions(size_t max_sessions = 0) {
+        if (max_sessions != 0) {
+            max_sessions_ = max_sessions;
+        } else {
+            const char* env = std::getenv("DFLASH_BANDIT_MAX_SESSIONS");
+            max_sessions_ = (env && *env) ? static_cast<size_t>(std::atol(env)) : 1024;
+        }
+        if (max_sessions_ == 0) max_sessions_ = 1024;  // guard against env=0
+    }
+
     void update(const std::string& session_id, float observed_accept) {
         std::lock_guard<std::mutex> lock(mu_);
-        auto it = map_.find(session_id);
-        if (it == map_.end()) {
+        auto it = sessions_.find(session_id);
+        if (it == sessions_.end()) {
             evict_if_full_locked();
             lru_.push_front(session_id);
-            map_.emplace(session_id, Entry{step_adaptive_keep_ratio({}, observed_accept), lru_.begin()});
+            auto [ins, _] = sessions_.emplace(session_id,
+                Entry{AdaptiveKeepRatioState{}, lru_.begin()});
+            ins->second.state = step_adaptive_keep_ratio(ins->second.state, observed_accept);
         } else {
+            touch_locked(it->second.lru_it);
             it->second.state = step_adaptive_keep_ratio(it->second.state, observed_accept);
-            lru_.splice(lru_.begin(), lru_, it->second.lru_it);
         }
     }
 
     float get_keep_ratio(const std::string& session_id) const {
         std::lock_guard<std::mutex> lock(mu_);
-        auto it = map_.find(session_id);
-        if (it == map_.end()) return AdaptiveKeepRatioState{}.last_keep;
-        lru_.splice(lru_.begin(), lru_, it->second.lru_it);
+        auto it = sessions_.find(session_id);
+        if (it == sessions_.end()) return AdaptiveKeepRatioState{}.last_keep;
+        touch_locked(it->second.lru_it);
         return it->second.state.last_keep;
     }
 
-    float get_ema(const std::string & session_id) const {
+    float get_ema(const std::string& session_id) const {
         std::lock_guard<std::mutex> lock(mu_);
-        auto it = map_.find(session_id);
-        if (it == map_.end()) return 0.0f;
-        lru_.splice(lru_.begin(), lru_, it->second.lru_it);
+        auto it = sessions_.find(session_id);
+        if (it == sessions_.end()) return 0.0f;
+        touch_locked(it->second.lru_it);
         return it->second.state.ema;
     }
 
     int turn_count(const std::string& session_id) const {
         std::lock_guard<std::mutex> lock(mu_);
-        auto it = map_.find(session_id);
-        if (it == map_.end()) return 0;
-        lru_.splice(lru_.begin(), lru_, it->second.lru_it);
+        auto it = sessions_.find(session_id);
+        if (it == sessions_.end()) return 0;
+        touch_locked(it->second.lru_it);
         return it->second.state.turn_count;
     }
 
     size_t size() const {
         std::lock_guard<std::mutex> lock(mu_);
-        return map_.size();
+        return sessions_.size();
     }
+
+    size_t max_sessions() const { return max_sessions_; }
 
 private:
     struct Entry {
-        AdaptiveKeepRatioState          state;
+        AdaptiveKeepRatioState       state;
         std::list<std::string>::iterator lru_it;
     };
 
+    // Move an existing LRU entry to the front (most-recently-used).
+    // Must be called with mu_ held.
+    void touch_locked(std::list<std::string>::iterator it) const {
+        lru_.splice(lru_.begin(), lru_, it);
+    }
+
+    // Evict LRU entry if the map is at capacity.
+    // Must be called with mu_ held.
     void evict_if_full_locked() {
-        if (map_.size() < kMaxSessions) return;
-        const std::string& lru_key = lru_.back();
-        map_.erase(lru_key);
+        if (sessions_.size() < max_sessions_) return;
+        sessions_.erase(lru_.back());
         lru_.pop_back();
     }
 
-    mutable std::mutex                              mu_;
-    mutable std::list<std::string>                  lru_;
-    std::unordered_map<std::string, Entry>          map_;
+    size_t                                        max_sessions_;
+    mutable std::mutex                            mu_;
+    mutable std::list<std::string>                lru_;       // front = MRU, back = LRU
+    std::unordered_map<std::string, Entry>        sessions_;
 };
 
 }  // namespace dflash::common

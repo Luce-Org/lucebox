@@ -11,7 +11,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "${MODEL_SERVER:-}" == "llamacpp" ]]; then
   : "${LLAMA_COMPAT_PROXY:=anthropic}"
 fi
+export LUCEBOX_SERVER_BACKEND=cpp
 source "$SCRIPT_DIR/common.sh"
+preflight_require_bin claude
 
 CLIENT_OUT="$LOG_DIR/claude-code.out"
 CLAUDE_BIN="${CLAUDE_BIN:-$CLIENT_WORK_DIR/clients/claude_code/npm/bin/claude}"
