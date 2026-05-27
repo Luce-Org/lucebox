@@ -556,11 +556,11 @@ static std::vector<int32_t> qwen35_score_and_compress(
     const int query_tokens        = env_int("DFLASH_COMPRESS_QUERY_TOKENS",   96);
     const int anchor_radius       = env_int("DFLASH_COMPRESS_ANCHOR_RADIUS",   2);
     const int max_anchor_hits     = env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", 8);
-    const int anchor_ngram        = env_int("DFLASH_COMPRESS_ANCHOR_NGRAM",    4);
-    const int rare_token_max_freq = env_int("DFLASH_COMPRESS_RARE_MAX_FREQ",   2);
+    const int anchor_ngram        = env_int("PFLASH_COMPRESS_ANCHOR_NGRAM",    4);
+    const int rare_token_max_freq = env_int("PFLASH_COMPRESS_RARE_MAX_FREQ",   2);
 
-    const float cascade_min_anchor_frac = env_float("DFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC", 0.25f);
-    const float max_forced_ratio        = env_float("DFLASH_COMPRESS_MAX_FORCED_RATIO",        1.3f);
+    const float cascade_min_anchor_frac = env_float("PFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC", 0.25f);
+    const float max_forced_ratio        = env_float("PFLASH_COMPRESS_MAX_FORCED_RATIO",        1.3f);
 
     const int q0 = std::max(0, S - query_tokens);
     std::vector<int32_t> query_pool(ids.begin() + q0, ids.end());
@@ -572,8 +572,8 @@ static std::vector<int32_t> qwen35_score_and_compress(
     anchor_cfg.cascade_min_anchor_count = (int)(cascade_min_anchor_frac * n_keep);
     anchor_cfg.max_forced_count         = (int)(max_forced_ratio * n_keep);
 
-    const bool use_transitive = env_int("DFLASH_COMPRESS_ANCHOR_TRANSITIVE", 0) != 0;
-    const int  max_iters      = env_int("DFLASH_COMPRESS_ANCHOR_MAX_ITERS",  3);
+    const bool use_transitive = env_int("PFLASH_COMPRESS_ANCHOR_TRANSITIVE", 0) != 0;
+    const int  max_iters      = env_int("PFLASH_COMPRESS_ANCHOR_MAX_ITERS",  3);
     if (use_transitive) {
         dflash::qwen3::scan_and_force_transitive(ids, q0, query_pool,
                                                   anchor_cfg, max_iters, forced);
@@ -749,11 +749,11 @@ std::vector<int32_t> drafter_score_and_compress(
     const int query_tokens        = env_int("DFLASH_COMPRESS_QUERY_TOKENS",   96);
     const int anchor_radius       = env_int("DFLASH_COMPRESS_ANCHOR_RADIUS",   2);
     const int max_anchor_hits     = env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", 8);
-    const int anchor_ngram        = env_int("DFLASH_COMPRESS_ANCHOR_NGRAM",    4);
-    const int rare_token_max_freq = env_int("DFLASH_COMPRESS_RARE_MAX_FREQ",   2);
+    const int anchor_ngram        = env_int("PFLASH_COMPRESS_ANCHOR_NGRAM",    4);
+    const int rare_token_max_freq = env_int("PFLASH_COMPRESS_RARE_MAX_FREQ",   2);
 
-    const float cascade_min_anchor_frac = env_float("DFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC", 0.25f);
-    const float max_forced_ratio        = env_float("DFLASH_COMPRESS_MAX_FORCED_RATIO",        1.3f);
+    const float cascade_min_anchor_frac = env_float("PFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC", 0.25f);
+    const float max_forced_ratio        = env_float("PFLASH_COMPRESS_MAX_FORCED_RATIO",        1.3f);
 
     std::vector<uint8_t> selected_mask((size_t)n_chunks, 0);
     std::vector<uint8_t> forced((size_t)n_chunks, 0);
@@ -769,8 +769,8 @@ std::vector<int32_t> drafter_score_and_compress(
         anchor_cfg.cascade_min_anchor_count = (int)(cascade_min_anchor_frac * n_keep);
         anchor_cfg.max_forced_count         = (int)(max_forced_ratio * n_keep);
 
-        const bool use_transitive = env_int("DFLASH_COMPRESS_ANCHOR_TRANSITIVE", 0) != 0;
-        const int  max_iters      = env_int("DFLASH_COMPRESS_ANCHOR_MAX_ITERS",  3);
+        const bool use_transitive = env_int("PFLASH_COMPRESS_ANCHOR_TRANSITIVE", 0) != 0;
+        const int  max_iters      = env_int("PFLASH_COMPRESS_ANCHOR_MAX_ITERS",  3);
         if (use_transitive) {
             dflash::qwen3::scan_and_force_transitive(ids, q0, query_pool,
                                                       anchor_cfg, max_iters, forced);
