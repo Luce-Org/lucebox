@@ -1,10 +1,9 @@
 """Command-line entry point: ``lucebench --area X --url Y --model Z``.
 
-Minimal dispatcher around lucebench.runner. The full-featured
-multi-area runner from luce-dflash (parallelism, forge, agent areas,
-sampling-from-card, per-area max_tokens defaults) is the bigger
-brother; this CLI exists so external users can `pip install
-luce-bench` and benchmark any OpenAI-compatible endpoint.
+Minimal dispatcher around lucebench.runner — exposes parallelism,
+forge / agent areas, sampling-from-card, and per-area max_tokens
+defaults so external users can `pip install luce-bench` and benchmark
+any OpenAI-compatible endpoint.
 """
 
 from __future__ import annotations
@@ -233,12 +232,12 @@ def _preflight(
     timeout_s: int = 5,
     requested_model: str | None = None,
 ) -> tuple[bool, list[str]]:
-    """Probe the server's liveness + OpenAI shape + dflash /props endpoint.
+    """Probe the server's liveness + OpenAI shape + lucebox /props endpoint.
 
     Returns ``(ok, lines)`` where ``lines`` is the printed grid (already
     formatted, one check per line) and ``ok`` is False iff a HARD check
     failed — which is "liveness" or "/v1/models doesn't return a data
-    list". The /props check is dflash-specific: missing/404 prints a
+    list". The /props check is lucebox-specific: missing/404 prints a
     warning line but does NOT fail (OpenRouter, vLLM, stock ds4_server
     don't expose /props).
 
@@ -313,7 +312,7 @@ def _preflight(
     if not models_ok:
         return False, lines
 
-    # 3. /props — dflash-specific. Soft check: warn if absent, surface
+    # 3. /props — lucebox-specific. Soft check: warn if absent, surface
     # model_card_source + hard_limit_reply_budget if present.
     props_req = urllib.request.Request(base + "/props", headers={"Accept": "application/json"})
     if auth_header:
@@ -323,10 +322,10 @@ def _preflight(
             props = json.loads(resp.read())
     except Exception:
         # Not a hard failure — OpenRouter, vLLM, ds4_server don't expose this.
-        lines.append(_line("/props", True, "absent (non-dflash server) — skipped"))
+        lines.append(_line("/props", True, "absent (non-lucebox server) — skipped"))
         return True, lines
 
-    # Pull from budget_envelope first (dflash canonical), fall back to top-level.
+    # Pull from budget_envelope first (lucebox canonical), fall back to top-level.
     env = props.get("budget_envelope") if isinstance(props, dict) else None
     env = env if isinstance(env, dict) else {}
     card = env.get("model_card_source") or (props.get("model_card_source") if isinstance(props, dict) else None)
