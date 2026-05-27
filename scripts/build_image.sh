@@ -26,7 +26,10 @@
 
 set -euo pipefail
 
-cd "$(git rev-parse --show-toplevel 2>/dev/null || dirname "$0")/.."
+# Resolve to the repo root: prefer git's view (works from any subdir), else
+# fall back to one level up from this script (scripts/build_image.sh →
+# repo root).
+cd "$(git rev-parse --show-toplevel 2>/dev/null || cd "$(dirname "$0")/.." && pwd)"
 
 # Derive the version. `git describe --match 'lucebox-v*'` finds the nearest
 # matching annotated tag and appends commits-past + sha if not on the tag
