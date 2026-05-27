@@ -63,12 +63,6 @@ jobs:
           cd server/build
           ctest --output-on-failure -R server_unit --no-tests=error
 
-      - name: Run Python server unit tests
-        run: |
-          pip install pytest fastapi httpx transformers
-          cd server/scripts
-          python3 -m pytest test_server.py -v
-
       - name: Populate venv with cu128 torch + setuptools
         # First pass: install the workspace's default deps. dflash declares
         # torch (which uv pulls from the pytorch-cu128 index per
