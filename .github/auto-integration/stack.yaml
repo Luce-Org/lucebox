@@ -1,51 +1,126 @@
-updated_at: 2026-05-27
+updated_at: 2026-05-27T08:54:16-04:00
 repository: Luce-Org/lucebox-hub
 integration_branch: auto-integration
 remotes:
   upstream: origin
   writable: easel
 heads:
-  upstream_main: 2540f19
-  integration_head: 14ae91e
+  upstream_main: bfe654f
+  previous_integration_head: 2458aa1
+  integration_head: ec27aaa
 stack:
   included:
-    - pr: 274
-      status: already-on-branch
-      note: pflash early-exit drafter stack already present on easel/auto-integration
-    - pr: 275
-      status: already-on-branch
-      note: draft default follow-up already present on easel/auto-integration
     - pr: 276
-      status: already-on-branch
-      note: Qwen3.6 Claude-code tool-calling fix already present on easel/auto-integration
+      status: already-represented
+      evidence: git merge-tree of refs/pr-open/276 into refreshed stack produced the same tree as already-included PR #274/#264/#152/#142 set.
+      note: Qwen3.6 Claude-code Anthropic tool-calling fix is represented by current server/chat_template and tool parsing changes.
+    - pr: 274
+      status: already-represented
+      evidence: git merge-tree refs/pr-open/274 produced no tree delta against refreshed stack.
+      note: pFlash ee7 early-exit drafter stack already present.
     - pr: 264
-      status: already-on-branch
-      note: adaptive keep_ratio bandit MVP already present on easel/auto-integration
-    - pr: 142
-      status: already-on-branch
-      note: Gemma4 FP16 safetensors drafter support already present on easel/auto-integration
+      status: already-represented
+      evidence: git merge-tree refs/pr-open/264 produced no tree delta against refreshed stack.
+      note: adaptive keep_ratio bandit MVP already present.
     - pr: 152
-      status: already-on-branch
-      note: Gemma4 backend helpers already present on easel/auto-integration
+      status: already-represented
+      evidence: git merge-tree refs/pr-open/152 produced no tree delta against refreshed stack.
+      note: Gemma 4 RTX 4090 backend helper docs/scripts already present.
+    - pr: 142
+      status: already-represented
+      evidence: git merge-tree refs/pr-open/142 produced no tree delta against refreshed stack.
+      note: FP16 safetensors drafter support already present.
   attempted_this_run:
+    - pr: 266
+      status: blocked-after-worktree-merge-attempt
+      worktree: /home/erik/Projects/luce2-worktrees/codex-pr266-20260527-0854
+      evidence: actual git merge --no-commit --no-ff refs/pr-open/266 hit conflicts in CI, harness files, server/CMakeLists, model_backend, qwen35 backend, adaptive_keep_ratio tests, http_server, and server unit tests; dflash/src/server/http_server.cpp is obsolete under current server/ layout.
+      delegation: Codex conflict-resolution attempt was requested but Hermes command safety blocked the codex exec invocation; Claude Code is not authenticated.
+    - pr: 237
+      status: blocked-by-server-rename-and-mtp-foundation-conflicts
+      evidence: git merge-tree reports modify/delete conflicts under obsolete dflash paths plus conflicts in backend_factory, step_graph, qwen35 loader/graph/backend, CMake, and dflash tests.
+    - pr: 221
+      status: blocked-by-server-rename-and-mtp-prefix-cache-conflicts
+      evidence: git merge-tree reports obsolete dflash script/backend paths and conflicts across prefix/MTP common and qwen35 files.
+    - pr: 183
+      status: blocked-by-gemma4-mtp-stack-conflicts
+      evidence: git merge-tree reports Gemma4 target/MTP file-location and internal/CMake conflicts.
+    - pr: 182
+      status: blocked-by-gemma4-mtp-stack-conflicts
+      evidence: git merge-tree reports Gemma4 target/MTP file-location and internal/CMake conflicts.
+    - pr: 181
+      status: blocked-by-gemma4-dflash-runtime-conflicts
+      evidence: git merge-tree reports dflash/CMake modify-delete, Gemma4 file-location conflicts, and errors/internal conflicts.
+    - pr: 180
+      status: blocked-by-gemma4-draft-loader-conflicts
+      evidence: git merge-tree reports dflash/CMake modify-delete, Gemma4 file-location conflicts, and errors/internal conflicts.
+    - pr: 177
+      status: blocked-by-gemma4-kv-conflicts
+      evidence: git merge-tree reports dflash/CMake modify-delete, Gemma4 file-location conflicts, and errors/internal conflicts.
+    - pr: 174
+      status: blocked-by-gemma4-docs/code-stack-conflicts
+      evidence: git merge-tree reports dflash/CMake modify-delete plus Gemma4 file-location and errors/internal conflicts.
+    - pr: 154
+      status: blocked-by-native-mtp-stack-conflicts
+      evidence: git merge-tree reports MTP docs/scripts/test file-location conflicts and qwen35 target graph/loader/internal conflicts.
+    - pr: 153
+      status: blocked-by-native-mtp-stack-conflicts
+      evidence: git merge-tree reports MTP docs/src/test file-location conflicts and qwen35 target graph/loader/internal conflicts.
+    - pr: 137
+      status: stale-or-path-duplicate
+      evidence: git merge-tree conflicts only on obsolete dflash/CMakeLists.txt, while the active build file is server/CMakeLists.txt.
+    - pr: 135
+      status: blocked-by-qwen35-target-graph-conflicts
+      evidence: git merge-tree reports conflicts in server/src/internal.h, qwen35_target_graph.cpp, and test_dflash.cpp.
+    - pr: 131
+      status: blocked-by-large-gemma4-support-stack-conflicts
+      evidence: git merge-tree reports .gitignore/.gitmodules, obsolete dflash paths/submodule, Gemma4 file-location, pflash adapter add/add, and test conflicts.
+    - pr: 94
+      status: blocked-by-draft-loader-conflicts
+      evidence: git merge-tree reports draft_graph, draft_safetensors_loader, and internal.h conflicts.
+    - pr: 62
+      status: blocked-by-obsolete-dflash-test-path-conflicts
+      evidence: git merge-tree reports dflash/test/test_dflash.cpp modify-delete and test_daemon_reset file-location conflict.
+    - pr: 39
+      status: blocked-by-moe-and-obsolete-dflash-path-conflicts
+      evidence: git merge-tree reports obsolete dflash CMake/submodule/src/test modify-deletes plus draft loader/graph conflicts.
+  pending: []
+  blocked_needs_human:
+    - pr: 266
+      reason: Harness typed-adapter stack overlaps already-integrated adaptive keep-ratio/server work; needs a deliberate server-layout port rather than accepting obsolete dflash/src/server paths.
+    - prs: [237, 221, 183, 182, 181, 180, 177, 174, 154, 153, 135, 131, 94, 62, 39]
+      reason: Broad pre-rename dflash/Gemma4/MTP stacks conflict with the current server/ layout and each other; require a planned path-migration/rebase strategy.
+  suggested_close_or_superseded:
+    - pr: 137
+      reason: Appears stale after dflash-to-server layout migration; active CMake changes should be re-authored against server/CMakeLists.txt if still needed.
     - pr: 48
-      status: stale_or_duplicate
-      evidence: dflash/CMakeLists-path change is already represented in current server/CMakeLists; merge into this branch only hits path-level delete/modify churn.
-    - pr: 237
-      status: blocked_by_rename_conflicts
-      evidence: merging pr-237 into auto-integration hits conflicts in server/CMakeLists, backend_factory.{cpp,h}, step_graph.h, qwen35 backend/loader/graph files, and test_dflash; the local pr-237 branch is a much broader dflash-path stack that would require a larger path-migration pass than this run can safely finish.
-  held_or_unsalvageable:
-    - pr: 237
-      reason: blocked_by_rename_conflicts
-      evidence: same as attempted entry; high-risk, multi-file path migration.
+      reason: maintainer-authored non-draft excluded from contributor priority; previous run classified as represented/stale in active server/CMakeLists path.
+  draft_excluded:
+    - pr: 278
+    - pr: 275
+    - pr: 273
+    - pr: 265
+    - pr: 249
+    - pr: 226
+    - pr: 193
+    - pr: 75
   upstream_sync:
     - merged_origin_main: true
-    - note: upstream main currently includes merged PRs #282 and #283.
+    - note: refreshed from origin/main bfe654f over easel/auto-integration 2458aa1; upstream changed assets/banner.png.
   tests_and_checks:
-    - "git merge --no-edit origin/main"
-    - "git merge --no-commit --no-ff origin/pr/48 (aborted after modify/delete conflict)"
-    - "git merge --no-commit --no-ff origin/pr/237 (aborted after multi-file rename conflicts)"
+    - date -Is
+    - git status --short
+    - gh auth status
+    - claude auth status --text
+    - /home/linuxbrew/.linuxbrew/bin/codex --version
+    - git fetch --prune origin
+    - git fetch --prune easel
+    - gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ...
+    - git merge --no-edit origin/main in isolated worktree
+    - git fetch origin pull/<n>/head:refs/pr-open/<n> for all open non-draft contributor PRs
+    - git merge-tree --write-tree HEAD refs/pr-open/<n> for all open non-draft contributor PRs
+    - git merge --no-commit --no-ff refs/pr-open/266 in isolated worktree
   notes:
-    - The integration branch should continue to track upstream main first; this run refreshed it before any PR trials.
-    - No new PR was safely added this run; current work was limited to upstream refresh and integration-state recording.
-    - Next candidates to triage are the smaller green-check PRs that touch the same renamed area only after a path strategy is agreed.
+    - Primary checkout remained clean and unchanged during experiments.
+    - No new contributor PR was safely added beyond the upstream main refresh.
+    - Retained conflicted PR #266 worktree for inspection because abort/cleanup is not needed for the primary checkout and risky cleanup commands are forbidden.
