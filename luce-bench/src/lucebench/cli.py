@@ -339,7 +339,7 @@ def _run_sweep(args) -> int:
         auth_header = f"Bearer {token}"
 
     print(
-        f"[lucebench] v{__version__} sweep name={name} "
+        f"[lucebench] sweep name={name} "
         f"areas={','.join(sweep_areas)} url={args.url} model={args.model} "
         f"out={out_root}",
         flush=True,
@@ -877,7 +877,7 @@ def main() -> int:
         auth_header = f"Bearer {token}"
 
     print(
-        f"[lucebench] v{__version__} area={args.area} cases={len(selected)} "
+        f"[lucebench] area={args.area} cases={len(selected)} "
         f"url={args.url} model={args.model} think={think} max_tokens={max_tokens}",
         flush=True,
     )
