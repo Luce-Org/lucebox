@@ -493,6 +493,49 @@ static bool build_prefers_bf16_projection() {
 #endif
 }
 
+// Read rope_theta from config.json in the same directory as the .safetensors file.
+// HuggingFace models always ship config.json alongside the weights.
+// Returns 0.0f and prints a warning if the key is missing or the file is absent.
+static float read_rope_theta_from_config(const std::string & st_path) {
+    std::string dir = st_path;
+    const size_t slash = dir.find_last_of("/\\");
+    if (slash != std::string::npos) dir.resize(slash + 1); else dir = "./";
+    const std::string cfg_path = dir + "config.json";
+
+    FILE * f = std::fopen(cfg_path.c_str(), "r");
+    if (!f) {
+        std::fprintf(stderr, "[draft-st] WARNING: config.json not found at %s — rope_theta unknown\n",
+                     cfg_path.c_str());
+        return 0.0f;
+    }
+    std::string buf;
+    char tmp[4096];
+    while (std::fgets(tmp, sizeof(tmp), f)) buf += tmp;
+    std::fclose(f);
+
+    const char * key = "\"rope_theta\"";
+    size_t pos = buf.find(key);
+    if (pos == std::string::npos) {
+        std::fprintf(stderr, "[draft-st] WARNING: rope_theta not found in %s — rope will be wrong\n",
+                     cfg_path.c_str());
+        return 0.0f;
+    }
+    pos += std::strlen(key);
+    while (pos < buf.size() && (buf[pos] == ' ' || buf[pos] == '\t' || buf[pos] == '\n' || buf[pos] == '\r')) pos++;
+    if (pos >= buf.size() || buf[pos] != ':') {
+        std::fprintf(stderr, "[draft-st] WARNING: malformed rope_theta in %s\n", cfg_path.c_str());
+        return 0.0f;
+    }
+    pos++;
+    while (pos < buf.size() && (buf[pos] == ' ' || buf[pos] == '\t' || buf[pos] == '\n' || buf[pos] == '\r')) pos++;
+    float val = 0.0f;
+    if (std::sscanf(buf.c_str() + pos, "%f", &val) != 1 || val <= 0.0f) {
+        std::fprintf(stderr, "[draft-st] WARNING: invalid rope_theta value in %s\n", cfg_path.c_str());
+        return 0.0f;
+    }
+    return val;
+}
+
 } // namespace
 
 bool load_draft_safetensors(const std::string & path,
@@ -539,6 +582,11 @@ bool load_draft_safetensors(const std::string & path,
     // head_dim=128/n_head_kv=8. The header already contains the authoritative
     // tensor shapes, so infer from that instead of inheriting target dims.
     if (!infer_draft_dims_from_safetensors(st, out)) return false;
+    out.rope_theta = read_rope_theta_from_config(path);
+    if (out.rope_theta == 0.0f) {
+        set_last_error("draft safetensors: rope_theta missing from config.json — cannot load");
+        return false;
+    }
     if (target) {
         out.mask_token_id = target->mask_token_id;
         if (out.n_embd != target->n_embd) {
