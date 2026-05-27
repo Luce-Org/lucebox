@@ -1889,9 +1889,12 @@ int main(int argc, char ** argv) {
             // Reset cache state between requests. On the first request the
             // cache was promoted from prefill-only to full (with rollback
             // tensors) by migrate_prefill_cache. On subsequent requests we
-            // just zero all state tensors in place — no GPU buffer free/alloc.
+            // just zero all state tensors in place and drop transient graph
+            // descriptors for both target/draft graphs; persistent gallocr
+            // buffers stay resident.
             if (!daemon_first_iter) {
                 step_graph_free(sg);
+                step_graph_free(draft_sg);
                 reset_target_cache(cache);
             }
             daemon_first_iter = false;
@@ -2104,6 +2107,7 @@ int main(int argc, char ** argv) {
         // Promote prefill-only cache to full decode cache
         auto t_mig0 = std::chrono::steady_clock::now();
         step_graph_destroy(sg);
+        step_graph_destroy(draft_sg);
         if (!migrate_prefill_cache(w, max_ctx, max_verify_tokens, target_backend, cache)) {
             std::fprintf(stderr, "cache migration: %s\n", dflash27b_last_error());
             return 1;
@@ -2306,6 +2310,7 @@ int main(int argc, char ** argv) {
     // Copies KV, SSM/conv state, and target_feat device→device (~1 ms).
     auto t_mig0 = std::chrono::steady_clock::now();
     step_graph_destroy(sg);
+    step_graph_destroy(draft_sg);
     if (!migrate_prefill_cache(w, max_ctx, max_verify_tokens, target_backend, cache)) {
         std::fprintf(stderr, "cache migration: %s\n", dflash27b_last_error());
         return 1;
