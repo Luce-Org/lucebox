@@ -1,219 +1,51 @@
-# auto-integration patch stack state
-# Branch: easel:auto-integration
-# Policy:
-#   - Track Luce-Org/lucebox-hub:main as the base.
-#   - Only auto-integrate PRs from known contributors, defined as authors with
-#     prior commits already present on upstream main.
-#   - Avoid draft PRs unless they are very small and strictly required by a
-#     selected non-draft PR.
-#   - Human review/merge first-contribution PRs.
-#   - Rebuild by resetting to upstream main and replaying included PRs in order.
-
-base:
-  remote: origin
-  repo: Luce-Org/lucebox-hub
-  branch: main
-  commit: b9101fbf81532702e4e0d51f426c4ac8fa8fd32f
-  sync_merge_commit: fe6cf84
-  landed_since_last_run:
-    - pr: 281
-      title: "chore: rename server optimizations"
-      note: "Already on upstream main before the current replay pass."
-    - pr: 283
-      title: "chore(uv): refresh lock for relocated workspace members"
-      note: "Merged to upstream main after the previous replay base and before #264 was integrated."
-
-known_contributors:
-  # Generated from authors with previous commits on origin/main at stack creation.
-  - login: easel
-    evidence: "9 commits on origin/main"
-  - login: dusterbloom
-    evidence: "25 commits on origin/main"
-  - login: weicj
-    evidence: "18 commits on origin/main"
-  - login: howard0su
-    evidence: "174 commits on origin/main"
-  - login: Quitetall
-    evidence: "1 commit on origin/main"
-  - login: jkyamog
-    evidence: "recent merged commits on origin/main"
-  - login: sanastasiou
-    evidence: "recent merged commits on origin/main"
-  - login: mrciffa
-    evidence: "maintainer/merge commits on origin/main"
-  - login: 1TommyCheung
-    evidence: "recent merged commit on origin/main"
-
-included:
-  - pr: 262
-    title: "Split MoE weights between CPU & CUDA, support qwen35moe models"
-    author: howard0su
-    head_ref: howard0su:powerinfer
-    head_commit: d12dddeee52e578ab818d207d3eaf37c13acbdd7
-    merge_commit: 0dbebdc
-    status_at_selection: "ready, mergeable, CI pass, known contributor"
-    notes: "Merged first; later conflict with #269 resolved by threading #269 budget-hook parameters through #262's virtual AR decode path."
-  - pr: 269
-    title: "feat(cpp-server): thinking-budget v2 + multi-dialect reasoning aliases + spec"
-    author: easel
-    head_ref: easel:pr/server
-    head_commit: 403e598b98687656d3e07899e2dd9cda098c5db4
-    merge_commit: 3205cff
-    status_at_selection: "ready, mergeable, CI pass, known contributor"
-    notes: "Conflict with #262 in qwen35_backend.cpp resolved manually."
-  - pr: 274
-    title: "feat(pFlash): ee7 early-exit drafter saves up to 9.3× drafter wall at 128K"
-    author: dusterbloom
-    head_ref: dusterbloom:feat/pflash-drafter-ee7
-    head_commit: 1ffc8e6a86ad1f9455f6e0b7b406f4c215748419
-    merge_commit: 2564d1b
-    status_at_selection: "ready, mergeable, CI pass, known contributor"
-    notes: "Cleanly merged after #262 and #269."
-  - pr: 276
-    title: "fix(server): Qwen3.6-27B tool calling for claude-code Anthropic path"
-    author: dusterbloom
-    head_ref: dusterbloom:fix/qwen36-claude-code-tool-calling
-    head_commit: 0e3c79a74b15c93c97ba542b2339a87bed6f5372
-    merge_commit: 193d6ca
-    status_at_selection: "non-draft known contributor; upstream CI had build failure, but stack conflict was limited to test_server_unit.cpp and local stack verification passed after resolution"
-    notes: "Resolved test-only conflict by preserving both #269 /props+timings tests and #276 tool-normalization/native-tag tests; fixed stale SseEmitter ctor test call and Bash helper schema for alias tests."
-  - pr: 275
-    title: "feat(drafter): ee3 as production default (depends on #274)"
-    author: dusterbloom
-    head_ref: dusterbloom:feat/pflash-drafter-ee3-default
-    head_commit: dd9f7c64fdcdcff1bc64cc0e4b28c3dadd4f2174
-    merge_commit: 85bca8a
-    status_at_selection: "draft but CI green, known contributor, clean merge, explicit dependency on included #274"
-    notes: "Docs/bench follow-up to #274; included because it cleanly layers on the already-selected pFlash drafter stack."
-  - pr: 282
-    title: "Remove server.py and LUCEBOX_SERVER_BACKEND; use dflash_server directly"
-    author: howard0su
-    head_ref: howard0su:server_remove
-    head_commit: dd07be906e3714466b57e49951ecaa5d029aac51
-    merge_commit: 2055a84
-    status_at_selection: "mergeable, non-draft, known contributor"
-    notes: "Auto-integrated after the upstream main sync; removes the Python wrapper and points harness/docs at the native dflash_server path."
-  - pr: 264
-    title: "feat(pflash): adaptive keep_ratio bandit MVP"
-    author: dusterbloom
-    head_ref: dusterbloom:feat/pflash-mvp-adaptive-keep
-    head_commit: 3cdcf7b775a47632e57eca6f55c189b445ac4f71
-    merge_commit: ce02bac
-    status_at_selection: "non-draft + mergeable, taken after the upstream main refresh"
-    notes: "Merged with small CMake/test-stack conflict resolution; kept both the adaptive keep_ratio sources and the test registration additions."
-  - pr: 152
-    title: "Add Gemma 4 RTX 4090 backend helpers"
-    author: adybag14-cyber
-    head_ref: adybag14-cyber:main
-    head_commit: cf735bee36b809799f76e0ea79ac7228e872cdb2
-    merge_commit: da1c567
-    status_at_selection: "non-draft + mergeable; clean merge after #264"
-    notes: "Adds Gemma 4 RTX 4090 helper docs/scripts. Reviewed for obvious secret/destructive-command patterns; no secrets found."
-  - pr: 142
-    title: "feat(dflash): accept FP16 safetensors drafter alongside BF16"
-    author: javierpazo
-    head_ref: javierpazo:xabicasa/dflash-safetensors-draft-fp16
-    head_commit: f2fbf62f493896b46e52a917e2e2f836343bc423
-    merge_commit: 085fb0e
-    status_at_selection: "non-draft known contributor; one small conflict in server/src/draft/draft_safetensors_loader.cpp"
-    notes: "Resolved comment-only conflict by preserving #142's BF16/F16-on-disk wording while keeping the current native-BF16 fallback wording."
-
-attempted:
-  - pr: 282
-    result: "merged"
-    verification: "Merged cleanly on top of the refreshed upstream main base."
-  - pr: 264
-    result: "merged"
-    verification: "Merged after resolving server/CMakeLists.txt and server/test/test_server_unit.cpp conflicts, then verified uv.lock regeneration and merge cleanliness."
-  - pr: 152
-    result: "merged"
-    verification: "Merged cleanly; git diff --check, Python py_compile, and bash -n passed. PowerShell parse was skipped because pwsh is not installed in this WSL environment."
-  - pr: 142
-    result: "merged"
-    verification: "Resolved the only conflict in draft_safetensors_loader.cpp; git diff --check and conflict-marker scan passed."
-
-held:
-  - pr: 278
-    title: "fix(pflash): add legacy CUDA drafter precision fallback"
-    author: weicj
-    status: "draft + mergeable: CONFLICTING"
-    reason: "Conflicts with the refreshed stack; needs a manual conflict pass before it can be reconsidered."
-  - pr: 273
-    title: "feat(server): add Gemma4 target-layer-split adapter"
-    author: weicj
-    status: "draft + mergeable: CONFLICTING"
-    reason: "Conflicts with the current server stack; hold until the qwen35/qwen35moe/server changes are stabilized."
-  - pr: 266
-    title: "feat(harness): typed adapters + format-aware session-inject proxy + multi-turn bandit driver"
-    author: dusterbloom
-    status: "non-draft + mergeable: CONFLICTING"
-    reason: "Conflicts with the current harness/adapter stack; candidate for a later worktree merge pass."
-  - pr: 265
-    title: "feat(server): add target-layer-split backend adapter path"
-    author: weicj
-    status: "draft + mergeable: CONFLICTING"
-    reason: "Conflicts with current server changes; likely needs to land with #273 as a group or be rewritten against the refreshed server layout."
-  - pr: 249
-    title: "feat(pflash): add dynamic threshold for chunk selection and lower auto-mode trigger"
-    author: howard0su
-    status: "draft + mergeable: CONFLICTING"
-    reason: "Conflicts with the current pFlash stack and was previously build-failing upstream; keep held until the threshold expectations are reconciled."
-  - pr: 237
-    title: "feat(dFlash): MTP foundation"
-    author: dusterbloom
-    status: "non-draft + mergeable: CONFLICTING"
-    reason: "Conflicts with the current branch and has not been decomposed into a smaller trial merge yet."
-
-conflicts_fixed:
-  - context: "Merge of upstream main into auto-integration"
-    fixes:
-      - "Resolved rename churn from the server/optimization reorg by keeping the native dflash_server layout and adjusting references in harness/docs."
-      - "Preserved both sides of the qwen35_backend.cpp / qwen35moe_backend.cpp updates when replaying the stack over refreshed upstream main."
-      - "Kept the test and helper moves coherent after the server.py removal and script deletions."
-  - context: "Selected stack PRs"
-    fixes:
-      - "#262 + #269: merged despite qwen35_backend.cpp conflicts by threading the budget-hook path through the virtual AR decode flow."
-      - "#276: resolved test_server_unit.cpp churn by keeping both alias/tool-normalization behaviors and fixing the stale constructor call."
-      - "#275: layered on top of #274 with no extra code changes beyond the docs/bench follow-up."
-      - "#264: resolved server/CMakeLists.txt and server/test/test_server_unit.cpp conflict markers by preserving both the new adaptive keep_ratio targets and the existing tool/accept-rate unit coverage."
-      - "#142: resolved a comment-only safetensors loader conflict by preserving FP16/BF16 support wording and current native-BF16 fallback wording."
-
-checks_run:
-  - command: "git diff --stat origin/main...HEAD"
-    result: "Reviewed the current stack scope; most changes are already captured in the existing merge history, with #264 as the latest integration addition."
-  - command: "git log --oneline --first-parent -n 15"
-    result: "Confirmed the current first-parent stack order: 262 -> 269 -> 274 -> 276 -> 275 -> upstream main sync -> #282 -> #264."
-  - command: "gh pr list --repo Luce-Org/lucebox-hub --state open --limit 12 --json number,title,isDraft,mergeable,headRefName,author"
-    result: "Used to refresh the currently open PR classification for held/candidate decisions."
-  - command: "git diff --check"
-    result: "Passed with no whitespace or conflict-marker leftovers after the #264 merge."
-  - command: "cmake -S /home/erik/Projects/luce2/server -B /tmp/luce2-build-cuda132 -DDFLASH27B_GPU_BACKEND=cuda -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc"
-    result: "Configured with the local CUDA 13.2 toolchain, then stopped because deps/llama.cpp is missing from the source tree expected by server/CMakeLists.txt."
-  - command: "git merge-tree --write-tree easel/auto-integration pr-152"
-    result: "Reported PR #152 as a clean merge candidate."
-  - command: "git diff --check"
-    result: "Passed after merging #152 and updating stack metadata."
-  - command: "python3 -m py_compile scripts/probe_gemma4_context.py scripts/verify_gemma4_4090.py"
-    result: "Passed."
-  - command: "bash -n scripts/lucebox-gemma4-4090.sh"
-    result: "Passed."
-  - command: "rg '^(<<<<<<<|=======|>>>>>>>)'"
-    result: "Passed; no unresolved merge conflict markers after #142 resolution."
-  - command: "PowerShell parse of scripts/Start-LuceboxGemma4090.ps1"
-    result: "Skipped because pwsh is not installed in this WSL environment."
-
-notes:
-  - "No easel-only helper branches were needed for this run."
-  - "The branch is still intended to be pushed only to easel/auto-integration."
-
-rebuild_commands: |
-  git fetch origin main --prune
-  git fetch easel auto-integration --prune
-  git checkout auto-integration
-  git reset --hard origin/main
-  for n in 262 269 274 276 275 282 264 152 142; do
-    git fetch origin pull/$n/head:refs/heads/pr-$n
-    git merge --no-ff pr-$n
-  done
-  # Re-apply any recorded conflict resolutions, then update .github/auto-integration/stack.yaml.
-  git push --force-with-lease easel auto-integration
+updated_at: 2026-05-27
+repository: Luce-Org/lucebox-hub
+integration_branch: auto-integration
+remotes:
+  upstream: origin
+  writable: easel
+heads:
+  upstream_main: 2540f19
+  integration_head: 14ae91e
+stack:
+  included:
+    - pr: 274
+      status: already-on-branch
+      note: pflash early-exit drafter stack already present on easel/auto-integration
+    - pr: 275
+      status: already-on-branch
+      note: draft default follow-up already present on easel/auto-integration
+    - pr: 276
+      status: already-on-branch
+      note: Qwen3.6 Claude-code tool-calling fix already present on easel/auto-integration
+    - pr: 264
+      status: already-on-branch
+      note: adaptive keep_ratio bandit MVP already present on easel/auto-integration
+    - pr: 142
+      status: already-on-branch
+      note: Gemma4 FP16 safetensors drafter support already present on easel/auto-integration
+    - pr: 152
+      status: already-on-branch
+      note: Gemma4 backend helpers already present on easel/auto-integration
+  attempted_this_run:
+    - pr: 48
+      status: stale_or_duplicate
+      evidence: dflash/CMakeLists-path change is already represented in current server/CMakeLists; merge into this branch only hits path-level delete/modify churn.
+    - pr: 237
+      status: blocked_by_rename_conflicts
+      evidence: merging pr-237 into auto-integration hits conflicts in server/CMakeLists, backend_factory.{cpp,h}, step_graph.h, qwen35 backend/loader/graph files, and test_dflash; the local pr-237 branch is a much broader dflash-path stack that would require a larger path-migration pass than this run can safely finish.
+  held_or_unsalvageable:
+    - pr: 237
+      reason: blocked_by_rename_conflicts
+      evidence: same as attempted entry; high-risk, multi-file path migration.
+  upstream_sync:
+    - merged_origin_main: true
+    - note: upstream main currently includes merged PRs #282 and #283.
+  tests_and_checks:
+    - "git merge --no-edit origin/main"
+    - "git merge --no-commit --no-ff origin/pr/48 (aborted after modify/delete conflict)"
+    - "git merge --no-commit --no-ff origin/pr/237 (aborted after multi-file rename conflicts)"
+  notes:
+    - The integration branch should continue to track upstream main first; this run refreshed it before any PR trials.
+    - No new PR was safely added this run; current work was limited to upstream refresh and integration-state recording.
+    - Next candidates to triage are the smaller green-check PRs that touch the same renamed area only after a path strategy is agreed.
