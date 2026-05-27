@@ -1,9 +1,10 @@
 name: Release luce-bench
 
 # Builds and publishes the luce-bench package to PyPI when a tag
-# matching `luce-bench-v*` is pushed (e.g. `luce-bench-v0.2.5`). The
-# tag's version suffix must match `luce-bench/pyproject.toml`'s
-# `[project] version` — the workflow asserts this and fails otherwise.
+# matching `luce-bench-v*` is pushed (e.g. `luce-bench-v0.2.7`). The
+# release version is derived from the tag itself via hatch-vcs (see
+# `luce-bench/pyproject.toml`), so there's no version-in-file to keep
+# in sync.
 #
 # Uses PyPI trusted publishing (OIDC): set up the publisher in the
 # PyPI project settings as `easel/lucebox-hub` repo + this workflow
@@ -34,18 +35,6 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           version: latest
-
-      - name: Verify tag version matches pyproject.toml
-        run: |
-          set -euo pipefail
-          tag="${GITHUB_REF##*/}"            # luce-bench-v0.2.5
-          tag_version="${tag#luce-bench-v}"  # 0.2.5
-          file_version=$(awk -F'"' '/^version[[:space:]]*=/{print $2; exit}' luce-bench/pyproject.toml)
-          if [ "$tag_version" != "$file_version" ]; then
-            echo "Tag version ($tag_version) does not match luce-bench/pyproject.toml version ($file_version)"
-            exit 1
-          fi
-          echo "Releasing luce-bench v$tag_version"
 
       - name: Build wheel + sdist
         working-directory: luce-bench

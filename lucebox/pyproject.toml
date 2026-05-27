@@ -1,6 +1,10 @@
 [project]
 name = "lucebox"
-version = "0.2.0"
+# Version is derived from git tags via hatch-vcs (see [tool.hatch.version]
+# below). Tag `lucebox-v0.2.1` → release version `0.2.1`. Commits past a
+# tag get a `.devN+g<sha>` suffix so dev installs are visibly distinct
+# from releases. Single source of truth: the git tag.
+dynamic = ["version"]
 description = "Host-side CLI for the lucebox-hub container: orchestration, autotune, benchmark sweep"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,8 +24,21 @@ dependencies = [
 lucebox = "lucebox.cli:app"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+# Untagged checkouts (e.g. fresh clone before tagging lucebox-v0.2.1)
+# resolve to this rather than 0.0.0.dev0.
+fallback-version = "0.2.1.dev0"
+raw-options.tag_regex = '''^lucebox-v(?P<version>\d+\.\d+\.\d+)$'''
+
+[tool.hatch.build.hooks.vcs]
+# Build hook writes the resolved version into src/lucebox/_version.py
+# so `__init__.py` can `from lucebox._version import __version__`.
+# Generated file — see lucebox/.gitignore.
+version-file = "src/lucebox/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/lucebox"]

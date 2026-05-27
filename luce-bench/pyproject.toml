@@ -1,6 +1,10 @@
 [project]
 name = "luce-bench"
-version = "0.2.6"
+# Version is derived from git tags via hatch-vcs (see [tool.hatch.version]
+# below). Tag `luce-bench-v0.2.7` → release version `0.2.7`. Commits past
+# a tag get a `.devN+g<sha>` suffix so dev installs are visibly distinct
+# from releases. Single source of truth: the git tag.
+dynamic = ["version"]
 description = "Capability benchmarks for chat-completion endpoints (ds4-eval, HumanEval, long-context, forge)"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -52,8 +56,21 @@ Repository = "https://github.com/easel/luce-bench"
 Issues = "https://github.com/easel/luce-bench/issues"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+# Untagged checkouts (e.g. fresh clone before tagging luce-bench-v0.2.7)
+# resolve to this rather than 0.0.0.dev0.
+fallback-version = "0.2.7.dev0"
+raw-options.tag_regex = '''^luce-bench-v(?P<version>\d+\.\d+\.\d+)$'''
+
+[tool.hatch.build.hooks.vcs]
+# Build hook writes the resolved version into src/lucebench/_version.py
+# so `__init__.py` can `from lucebench._version import __version__`.
+# Generated file — see luce-bench/.gitignore.
+version-file = "src/lucebench/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/lucebench"]
