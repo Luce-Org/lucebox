@@ -13,7 +13,15 @@ base:
   remote: origin
   repo: Luce-Org/lucebox-hub
   branch: main
-  commit: b8a3b175c9edc979f97f460f6c6725585a043f06
+  commit: b9101fbf81532702e4e0d51f426c4ac8fa8fd32f
+  sync_merge_commit: fe6cf84
+  landed_since_last_run:
+    - pr: 281
+      title: "chore: rename server optimizations"
+      note: "Already on upstream main before the current replay pass."
+    - pr: 283
+      title: "chore(uv): refresh lock for relocated workspace members"
+      note: "Merged to upstream main after the previous replay base and before #264 was integrated."
 
 known_contributors:
   # Generated from authors with previous commits on origin/main at stack creation.
@@ -77,29 +85,98 @@ included:
     merge_commit: 85bca8a
     status_at_selection: "draft but CI green, known contributor, clean merge, explicit dependency on included #274"
     notes: "Docs/bench follow-up to #274; included because it cleanly layers on the already-selected pFlash drafter stack."
+  - pr: 282
+    title: "Remove server.py and LUCEBOX_SERVER_BACKEND; use dflash_server directly"
+    author: howard0su
+    head_ref: howard0su:server_remove
+    head_commit: dd07be906e3714466b57e49951ecaa5d029aac51
+    merge_commit: 2055a84
+    status_at_selection: "mergeable, non-draft, known contributor"
+    notes: "Auto-integrated after the upstream main sync; removes the Python wrapper and points harness/docs at the native dflash_server path."
+  - pr: 264
+    title: "feat(pflash): adaptive keep_ratio bandit MVP"
+    author: dusterbloom
+    head_ref: dusterbloom:feat/pflash-mvp-adaptive-keep
+    head_commit: 3cdcf7b775a47632e57eca6f55c189b445ac4f71
+    merge_commit: ce02bac
+    status_at_selection: "non-draft + mergeable, taken after the upstream main refresh"
+    notes: "Merged with small CMake/test-stack conflict resolution; kept both the adaptive keep_ratio sources and the test registration additions."
+
+attempted:
+  - pr: 282
+    result: "merged"
+    verification: "Merged cleanly on top of the refreshed upstream main base."
+  - pr: 264
+    result: "merged"
+    verification: "Merged after resolving server/CMakeLists.txt and server/test/test_server_unit.cpp conflicts, then verified uv.lock regeneration and merge cleanliness."
 
 held:
+  - pr: 278
+    title: "fix(pflash): add legacy CUDA drafter precision fallback"
+    author: weicj
+    status: "draft + mergeable: CONFLICTING"
+    reason: "Conflicts with the refreshed stack; needs a manual conflict pass before it can be reconsidered."
+  - pr: 273
+    title: "feat(server): add Gemma4 target-layer-split adapter"
+    author: weicj
+    status: "draft + mergeable: CONFLICTING"
+    reason: "Conflicts with the current server stack; hold until the qwen35/qwen35moe/server changes are stabilized."
+  - pr: 266
+    title: "feat(harness): typed adapters + format-aware session-inject proxy + multi-turn bandit driver"
+    author: dusterbloom
+    status: "non-draft + mergeable: CONFLICTING"
+    reason: "Conflicts with the current harness/adapter stack; candidate for a later worktree merge pass."
+  - pr: 265
+    title: "feat(server): add target-layer-split backend adapter path"
+    author: weicj
+    status: "draft + mergeable: CONFLICTING"
+    reason: "Conflicts with current server changes; likely needs to land with #273 as a group or be rewritten against the refreshed server layout."
   - pr: 249
-    reason: "draft and upstream build CI failed; clean merge but local server_unit fails until pflash_threshold default test is updated for the 32000→2000 behavior change"
-  - pr: 152
-    reason: "first-contribution/unknown contributor; leave to human"
-  - pr: 153
-    reason: "author has no prior commits on origin/main; leave to human"
-  - pr: 154
-    reason: "author has no prior commits on origin/main; leave to human"
-  - pr: 135
-    reason: "author has no prior commits on origin/main; leave to human"
-  - pr: 137
-    reason: "author has no prior commits on origin/main; leave to human"
-  - pr: 142
-    reason: "author has no prior commits on origin/main; leave to human"
+    title: "feat(pflash): add dynamic threshold for chunk selection and lower auto-mode trigger"
+    author: howard0su
+    status: "draft + mergeable: CONFLICTING"
+    reason: "Conflicts with the current pFlash stack and was previously build-failing upstream; keep held until the threshold expectations are reconciled."
+  - pr: 237
+    title: "feat(dFlash): MTP foundation"
+    author: dusterbloom
+    status: "non-draft + mergeable: CONFLICTING"
+    reason: "Conflicts with the current branch and has not been decomposed into a smaller trial merge yet."
+
+conflicts_fixed:
+  - context: "Merge of upstream main into auto-integration"
+    fixes:
+      - "Resolved rename churn from the server/optimization reorg by keeping the native dflash_server layout and adjusting references in harness/docs."
+      - "Preserved both sides of the qwen35_backend.cpp / qwen35moe_backend.cpp updates when replaying the stack over refreshed upstream main."
+      - "Kept the test and helper moves coherent after the server.py removal and script deletions."
+  - context: "Selected stack PRs"
+    fixes:
+      - "#262 + #269: merged despite qwen35_backend.cpp conflicts by threading the budget-hook path through the virtual AR decode flow."
+      - "#276: resolved test_server_unit.cpp churn by keeping both alias/tool-normalization behaviors and fixing the stale constructor call."
+      - "#275: layered on top of #274 with no extra code changes beyond the docs/bench follow-up."
+      - "#264: resolved server/CMakeLists.txt and server/test/test_server_unit.cpp conflict markers by preserving both the new adaptive keep_ratio targets and the existing tool/accept-rate unit coverage."
+
+checks_run:
+  - command: "git diff --stat origin/main...HEAD"
+    result: "Reviewed the current stack scope; most changes are already captured in the existing merge history, with #264 as the latest integration addition."
+  - command: "git log --oneline --first-parent -n 15"
+    result: "Confirmed the current first-parent stack order: 262 -> 269 -> 274 -> 276 -> 275 -> upstream main sync -> #282 -> #264."
+  - command: "gh pr list --repo Luce-Org/lucebox-hub --state open --limit 12 --json number,title,isDraft,mergeable,headRefName,author"
+    result: "Used to refresh the currently open PR classification for held/candidate decisions."
+  - command: "git diff --check"
+    result: "Passed with no whitespace or conflict-marker leftovers after the #264 merge."
+  - command: "cmake -S /home/erik/Projects/luce2/server -B /tmp/luce2-build-cuda132 -DDFLASH27B_GPU_BACKEND=cuda -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc"
+    result: "Configured with the local CUDA 13.2 toolchain, then stopped because deps/llama.cpp is missing from the source tree expected by server/CMakeLists.txt."
+
+notes:
+  - "No easel-only helper branches were needed for this run."
+  - "The branch is still intended to be pushed only to easel/auto-integration."
 
 rebuild_commands: |
   git fetch origin main --prune
   git fetch easel auto-integration --prune
   git checkout auto-integration
   git reset --hard origin/main
-  for n in 262 269 274 276 275; do
+  for n in 262 269 274 276 275 282 264; do
     git fetch origin pull/$n/head:refs/heads/pr-$n
     git merge --no-ff pr-$n
   done
