@@ -7,17 +7,16 @@ license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 authors = [{ name = "Lucebox" }]
 
-# Stdlib-only at runtime. luce-bench is the only declared dep (also stdlib-only
-# at runtime; anthropic SDK is opt-in via its [forge] extra). This keeps fresh
-# test-box installs cheap — `uv sync --package harness` resolves with zero
-# external wheel downloads.
+# luce-bench is the only declared dep — and via luce-bench's own
+# dependencies, anthropic + stdlib come along for the ride.
 dependencies = [
     "luce-bench",
 ]
 
 [project.optional-dependencies]
-# Mirrors luce-bench[forge] for callers that want forge area runs.
-forge = ["luce-bench[forge]"]
+# Kept as an empty alias for backward compatibility — luce-bench[forge]
+# is itself a back-compat no-op as of luce-bench v0.2.6.
+forge = []
 dev = ["pytest>=8.0"]
 
 [project.scripts]

@@ -11,9 +11,8 @@ Each scenario row carries the same shape as ds4-eval rows
 timings, prompt, output, …) PLUS a per-call ``iterations[]``
 breakdown for forensic re-grading.
 
-Requires the ``anthropic`` SDK — install via:
-
-    pip install 'luce-bench[forge]'
+The ``anthropic`` SDK is a hard dependency (as of v0.2.6); the import
+guard below is kept for graceful failure on an old install.
 
 The vendored ``_forge`` runtime + scenarios are MIT-licensed
 (antoinezambelli/forge 0.7.1); see NOTICE for full attribution.
@@ -127,8 +126,9 @@ def run_forge_area(
         )
     except ImportError as exc:
         raise SystemExit(
-            "[lucebench] --area forge requires the `anthropic` SDK. "
-            "Install via: pip install 'luce-bench[forge]' "
+            "[lucebench] --area forge: the `anthropic` SDK should have "
+            "been pulled in as a runtime dep (v0.2.6+). If you're on an "
+            "older install, `pip install -U luce-bench`. "
             f"(import failed: {exc})"
         ) from exc
 

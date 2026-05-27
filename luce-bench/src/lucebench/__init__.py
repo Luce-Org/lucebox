@@ -18,4 +18,4 @@ projects (antirez/ds4, openai/human-eval, antoinezambelli/forge). See
 NOTICE for attribution.
 """
 
-__version__ = "0.2.4"
+__version__ = "0.2.6"

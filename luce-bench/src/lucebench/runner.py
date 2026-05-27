@@ -37,6 +37,11 @@ def build_prompt(case: dict[str, Any]) -> str:
         return case["prompt"]
     if case.get("kind") == "agent-prompt":
         return case["user_message"]
+    if case.get("kind") == "smoke":
+        # Smoke prompts ship as plain strings — no answer-format scaffold.
+        # The whole point of the smoke area is "does the server reply?",
+        # so anything that wraps the prompt would just dilute the signal.
+        return case["prompt"]
     parts = [case["question"]]
     choices = case.get("choices") or []
     if choices:

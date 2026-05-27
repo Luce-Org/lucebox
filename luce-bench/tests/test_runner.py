@@ -277,9 +277,17 @@ def test_resolve_model_picks_single_model():
         assert resolve_model("http://localhost:8080") == "qwen3.6"
 
 
-def test_resolve_model_returns_none_for_multiple():
-    """Gateways exposing many models must NOT be auto-resolved."""
+def test_resolve_model_first_for_short_list():
+    """Servers exposing a small list (<5) auto-resolve to the first model.
+    The caller surfaces the full list so the choice is visible."""
     payload = {"data": [{"id": "a"}, {"id": "b"}], "object": "list"}
+    with patch("urllib.request.urlopen", return_value=_mock_urlopen(payload)):
+        assert resolve_model("http://localhost:8080") == "a"
+
+
+def test_resolve_model_returns_none_for_long_list():
+    """Gateways exposing 5+ models do NOT auto-resolve — explicit --model required."""
+    payload = {"data": [{"id": f"m{i}"} for i in range(6)], "object": "list"}
     with patch("urllib.request.urlopen", return_value=_mock_urlopen(payload)):
         assert resolve_model("http://localhost:8080") is None
 

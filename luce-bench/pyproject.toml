@@ -1,6 +1,6 @@
 [project]
 name = "luce-bench"
-version = "0.2.4"
+version = "0.2.6"
 description = "Capability benchmarks for chat-completion endpoints (ds4-eval, HumanEval, long-context, forge)"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -17,11 +17,18 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# Stdlib-only core. Anthropic SDK for forge area is opt-in via extras.
-dependencies = []
+# anthropic is a hard dep — the bench targets servers that expose
+# Anthropic-compatible `/v1/messages` (dflash does), and the forge area
+# already needs the SDK to drive its tool-calling scenarios. Making it
+# optional just created install-time surprise.
+dependencies = [
+    "anthropic>=0.40.0",
+]
 
 [project.optional-dependencies]
-forge = ["anthropic>=0.40.0"]
+# Kept as an empty alias for backward compatibility — old install
+# commands like `pip install 'luce-bench[forge]'` still resolve.
+forge = []
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",

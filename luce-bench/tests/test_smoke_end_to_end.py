@@ -92,19 +92,22 @@ def test_v1_models_autoresolve(mock_openai_server, tmp_path):
         str(out_json),
     )
     assert result.returncode == 0, f"stderr: {result.stderr}"
-    # Stderr should mention the autoresolve.
-    assert "resolved to 'mock-model'" in (result.stdout + result.stderr)
+    # Stdout/stderr should mention the autoresolve. Wording differs by
+    # how many models the server exposes; the chosen id always appears
+    # in a "→ 'mock-model'" autoresolve line.
+    assert "→ 'mock-model'" in (result.stdout + result.stderr)
     # And the actual POST should ship the resolved model id.
     posts = [c for c in captured if c["path"] == "/v1/chat/completions"]
     assert posts[0]["body"]["model"] == "mock-model"
 
 
 def test_sweep_smoke(mock_openai_server, tmp_path):
-    """`--sweep` writes per-area JSON + _summary files."""
+    """`--areas all` writes per-area JSON + _summary files."""
     url, _captured, _ = mock_openai_server
     out_dir = tmp_path / "snapshots"
     result = _run_cli_passthrough(
-        "--sweep",
+        "--areas",
+        "all",
         "--name",
         "ci-smoke",
         "--base-url",
@@ -122,8 +125,10 @@ def test_sweep_smoke(mock_openai_server, tmp_path):
 
     snap = out_dir / "ci-smoke"
     assert snap.exists()
-    # All four stdlib areas should have written a per-area JSON.
-    for area in ("ds4-eval", "code", "longctx", "agent"):
+    # All five stdlib areas should have written a per-area JSON (forge is
+    # gated by [forge] extra and skipped when anthropic isn't installed).
+    expected_areas = ["smoke", "ds4-eval", "code", "longctx", "agent"]
+    for area in expected_areas:
         f = snap / f"{area}.json"
         assert f.exists(), f"missing {f}"
         data = json.loads(f.read_text())
@@ -133,21 +138,27 @@ def test_sweep_smoke(mock_openai_server, tmp_path):
     assert (snap / "_summary.json").exists()
     summary = json.loads((snap / "_summary.json").read_text())
     assert summary["name"] == "ci-smoke"
-    assert len(summary["areas"]) == 4
+    # Forge MAY be in here if [forge] extra is installed; check >= len-without-forge.
+    assert len(summary["areas"]) >= len(expected_areas)
     assert (snap / "_summary.md").exists()
     md = (snap / "_summary.md").read_text()
     assert "ci-smoke" in md
     assert "| ds4-eval |" in md
+    assert "| smoke |" in md
 
 
-def test_sweep_fail_fast_on_unreachable(tmp_path):
-    """`--sweep` aborts cleanly when the URL is unreachable (no live server)."""
+def test_preflight_aborts_on_unreachable(tmp_path):
+    """Preflight aborts (exit 4) before any case runs when the URL is dead.
+
+    v0.2.5 added a pre-run liveness check so a typo'd --url surfaces in
+    ~50ms instead of after 92 timeouts. Exit code 4 = preflight bail.
+    """
     out_dir = tmp_path / "snapshots"
-    # Use a port that's almost certainly closed.
     result = _run_cli_passthrough(
-        "--sweep",
+        "--areas",
+        "all",
         "--name",
-        "fail-fast-smoke",
+        "preflight-bail",
         "--base-url",
         "http://127.0.0.1:1",  # Reserved / closed in practice
         "--model",
@@ -159,7 +170,32 @@ def test_sweep_fail_fast_on_unreachable(tmp_path):
         "--out-dir",
         str(out_dir),
     )
-    # Exit code 3 = sweep aborted by fail-fast guard.
+    assert result.returncode == 4, (
+        f"expected exit 4 (preflight bail), got {result.returncode}\nstderr: {result.stderr}"
+    )
+    assert "not reachable" in result.stderr or "preflight" in result.stdout
+
+
+def test_sweep_fail_fast_on_unreachable_when_preflight_skipped(tmp_path):
+    """With --no-preflight, the legacy fail-fast guard still fires (exit 3)."""
+    out_dir = tmp_path / "snapshots"
+    result = _run_cli_passthrough(
+        "--areas",
+        "all",
+        "--no-preflight",
+        "--name",
+        "fail-fast-smoke",
+        "--base-url",
+        "http://127.0.0.1:1",
+        "--model",
+        "mock-model",
+        "--questions",
+        "1",
+        "--timeout",
+        "5",
+        "--out-dir",
+        str(out_dir),
+    )
     assert result.returncode == 3, (
         f"expected exit 3 (fail-fast), got {result.returncode}\nstderr: {result.stderr}"
     )
@@ -167,14 +203,16 @@ def test_sweep_fail_fast_on_unreachable(tmp_path):
 
 
 def test_no_fail_fast_keeps_going(tmp_path):
-    """`--no-fail-fast` should NOT abort even when the server is down.
+    """`--no-fail-fast` + `--no-preflight` lets the sweep run to completion.
 
-    The sweep will still run to completion; every row is an error row.
-    Exit code 0 because pass_n == 0 isn't itself a failure signal.
+    Every row is an error row; exit code 0 because pass_n == 0 isn't
+    itself a failure signal.
     """
     out_dir = tmp_path / "snapshots"
     result = _run_cli_passthrough(
-        "--sweep",
+        "--areas",
+        "all",
+        "--no-preflight",
         "--name",
         "no-ff-smoke",
         "--base-url",
@@ -190,9 +228,9 @@ def test_no_fail_fast_keeps_going(tmp_path):
         str(out_dir),
     )
     assert result.returncode == 0, f"stderr: {result.stderr}"
-    # All four area files exist with error rows.
+    # Stdlib area files exist with error rows (forge is gated by [forge] extra).
     snap = out_dir / "no-ff-smoke"
-    for area in ("ds4-eval", "code", "longctx", "agent"):
+    for area in ("smoke", "ds4-eval", "code", "longctx", "agent"):
         data = json.loads((snap / f"{area}.json").read_text())
         assert data["n"] == 1
         assert data["pass"] == 0
