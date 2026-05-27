@@ -127,7 +127,7 @@ uv sync
 # 3. build the C++/CUDA decoder (CUDA 12+, CMake 3.18+)
 # Default compiles for Pascal/Volta/Turing/Ampere (60/61/62/70/75/86; +120 on CUDA 12.8+, +sm_121/DGX Spark on CUDA 12.9+, +sm_110/Thor on CUDA 13.0+) so the binary runs on every supported card.
 # 3090-only users can add -DCMAKE_CUDA_ARCHITECTURES=86 to skip the other archs and build faster (~3 min).
-cmake -B server/build -S dflash -DCMAKE_BUILD_TYPE=Release
+cmake -B server/build -S server -DCMAKE_BUILD_TYPE=Release
 cmake --build server/build --target test_dflash -j
 cmake --build server/build --target test_generate -j
 cmake --build server/build --target dflash_server -j
@@ -137,10 +137,10 @@ uv run hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir 
 uv run hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q8_0.gguf --local-dir server/models/draft/
 
 # 5a. one-shot streaming generate
-uv run --directory dflash python scripts/run.py --prompt "def fibonacci(n):"
+uv run --directory server python scripts/run.py --prompt "def fibonacci(n):"
 
 # 5b. or reproduce the paper-style bench (HumanEval + GSM8K + Math500, ~15 min)
-uv run --directory dflash python scripts/bench_llm.py
+uv run --directory server python scripts/bench_llm.py
 ```
 
 | Benchmark | AR (tok/s) | DFlash+DDTree (tok/s) | Speedup |
@@ -186,7 +186,7 @@ nvcc --version
 ```bash
 # CUDA 12.9+ required for sm_121
 nvcc --version  # must show >= 12.9
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release   # CMake auto-adds sm_121
 cmake --build build --target test_dflash -j
 ```
@@ -195,7 +195,7 @@ cmake --build build --target test_dflash -j
 ```bash
 # CUDA 13.0+ required for sm_110 / AGX Thor.
 nvcc --version
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release   # CMake auto-adds the Thor arch your nvcc supports
 cmake --build build --target test_dflash -j
 ```
@@ -219,7 +219,7 @@ Speculative prefill for long prompts. A Qwen3-0.6B BF16 drafter scores token imp
 
 ```bash
 # 1. build dflash + BSA kernel (sm_80+ required for BSA, ~10 min cold compile)
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
                     -DCMAKE_CUDA_ARCHITECTURES=86 \
                     -DDFLASH27B_ENABLE_BSA=ON
@@ -267,7 +267,7 @@ DFLASH_FP_PROFILE=1     # log mean / score / select / forward stage timings
 **Same DFlash + PFlash stack on an AMD iGPU.** PR #119 ports the Phase 2 rocWMMA flashprefill kernels to HIP. End-to-end on a single Ryzen AI MAX+ 395 box (Radeon 8060S iGPU, gfx1151, 128 GiB LPDDR5X-8000 unified): **37.0 tok/s** DFlash decode on Qwen3.5-27B Q4_K_M, **27.6 s** TTFT at 16K context with NIAH retrieval intact. That is **3.08×** decode and **2.24×** prefill over llama.cpp HIP AR on the same iGPU. End-to-end wall clock at a realistic 16K prompt + 1K generation workload: **2.66×** faster than vanilla llama.cpp.
 
 ```bash
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/dflash
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
 
 # Build for gfx1151 (Strix Halo). Swap the arch for gfx1100 / gfx1201.
 cmake -B build -S . \
