@@ -22,8 +22,6 @@
 
 #include "gguf.h"
 
-#include "gguf.h"
-
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -545,126 +543,6 @@ int main(int argc, char ** argv) {
         backend->shutdown();
         return 2;
     }
-
-    // ── Thinking-budget v2: resolve model card and apply to ServerConfig ──
-    // Read general.name + general.architecture directly from the GGUF.
-    // This is best-effort; if the file can't be opened (corruption, removed
-    // after backend init) we fall through to hard-fallback defaults via
-    // resolve_model_card(...).
-    std::string general_name;
-    std::string general_arch = arch;  // fall back to detect_arch() result
-    {
-        gguf_init_params gip{};
-        gip.no_alloc = true;
-        gip.ctx = nullptr;
-        gguf_context * gctx = gguf_init_from_file(bargs.model_path, gip);
-        if (gctx) {
-            int64_t name_id = gguf_find_key(gctx, "general.name");
-            if (name_id >= 0) {
-                const char * v = gguf_get_val_str(gctx, name_id);
-                if (v) general_name = v;
-            }
-            int64_t arch_id = gguf_find_key(gctx, "general.architecture");
-            if (arch_id >= 0) {
-                const char * v = gguf_get_val_str(gctx, arch_id);
-                if (v) general_arch = v;
-            }
-            gguf_free(gctx);
-        }
-        std::fprintf(stderr,
-            "[server] gguf meta: general.name='%s' general.architecture='%s'\n",
-            general_name.c_str(), general_arch.c_str());
-    }
-
-    ModelCard card = resolve_model_card(
-        bargs.model_path ? bargs.model_path : "",
-        general_name,
-        general_arch,
-        /*repo_root_hint=*/"");
-
-    // Apply each tunable to sconfig only if the operator did NOT set it
-    // via CLI. CLI always wins (spec §3.1 source #1).
-    //
-    // --max-tokens is a documented legacy alias for --default-max-tokens
-    // and beats the card; --default-max-tokens still wins over it when
-    // both are passed (the more specific flag).
-    if (!cli_set.default_max_tokens) {
-        if (legacy_max_tokens_set) {
-            sconfig.default_max_tokens = legacy_max_tokens_val;
-            cli_set.default_max_tokens = true;
-        } else {
-            sconfig.default_max_tokens = card.max_tokens;
-        }
-    }
-    if (!cli_set.hard_limit_reply_budget) {
-        sconfig.hard_limit_reply_budget = card.hard_limit_reply_budget;
-    }
-    if (!cli_set.think_max_tokens) {
-        // Recompute from possibly-updated combined cap + reply budget so
-        // the invariant (think_max = default_max - hard_limit) holds when
-        // the operator overrode one but not the other.
-        sconfig.think_max_tokens = std::max(0,
-            sconfig.default_max_tokens - sconfig.hard_limit_reply_budget);
-        // But if the card itself specified a smaller think_max_tokens
-        // (because complex tiers ride above default_max_tokens — see
-        // spec §3.3), respect that as a floor on the ceiling.
-        // Practically: card.think_max_tokens is just (max_tokens - reply),
-        // so this collapses to the same value when neither was overridden.
-        if (card.think_max_tokens > 0 &&
-            card.think_max_tokens < sconfig.think_max_tokens) {
-            sconfig.think_max_tokens = card.think_max_tokens;
-        }
-    }
-    // Effort tiers: per-tier CLI override. We pre-stored the CLI value
-    // into sconfig.effort_tiers above; for any tier the operator didn't
-    // set, take the card's value.
-    if (!cli_set.effort_low)    sconfig.effort_tiers.low    = card.effort_tiers.low;
-    if (!cli_set.effort_medium) sconfig.effort_tiers.medium = card.effort_tiers.medium;
-    if (!cli_set.effort_high)   sconfig.effort_tiers.high   = card.effort_tiers.high;
-    if (!cli_set.effort_x_high) sconfig.effort_tiers.x_high = card.effort_tiers.x_high;
-    if (!cli_set.effort_max)    sconfig.effort_tiers.max    = card.effort_tiers.max;
-
-    // Sampler defaults — currently no CLI surface; always take from card.
-    sconfig.sampler_defaults = card.sampling;
-
-    sconfig.model_card_source_label = card.source_label;
-    // Stash the raw sidecar JSON (or null on family/hard fallback) so
-    // /props.model_card can re-emit it verbatim. See
-    // docs/specs/props-endpoint.md §4.9.
-    sconfig.model_card_json = card.raw_json;
-
-    // Spec §3.5 invariant: each effort tier must fit under the server's
-    // absolute ceiling, which is `max_ctx - hard_limit_reply_budget` (the
-    // most tokens any single request — including its phase-1 portion —
-    // can occupy while still leaving the reply-reserve headroom).
-    //
-    // This is intentionally *not* clamped to think_max_tokens / default_
-    // max_tokens: effort tiers are phase-1 budgets, and the card's
-    // complex_problem_max_tokens can legitimately exceed default_max_tokens
-    // (Qwen3.6's card says max=81408 with default=32768). A request that
-    // wants to use such a tier must also pass an explicit max_tokens large
-    // enough to cover it (see spec §4.4); the request parser narrows the
-    // effective phase-1 cap when max_tokens is smaller.
-    const int tier_ceiling = std::max(0,
-        sconfig.max_ctx - sconfig.hard_limit_reply_budget);
-    std::fprintf(stderr,
-        "[server] effort-tier ceiling = max_ctx(%d) - hard_limit_reply_budget(%d) = %d\n",
-        sconfig.max_ctx, sconfig.hard_limit_reply_budget, tier_ceiling);
-    auto clamp_tier = [&](const char * name, int & v) {
-        if (tier_ceiling > 0 && v > tier_ceiling) {
-            std::fprintf(stderr,
-                "[server] reasoning-effort %s=%d clamped to "
-                "max_ctx - hard_limit_reply_budget = %d\n",
-                name, v, tier_ceiling);
-            v = tier_ceiling;
-        }
-        if (v < 0) v = 0;
-    };
-    clamp_tier("low",    sconfig.effort_tiers.low);
-    clamp_tier("medium", sconfig.effort_tiers.medium);
-    clamp_tier("high",   sconfig.effort_tiers.high);
-    clamp_tier("x-high", sconfig.effort_tiers.x_high);
-    clamp_tier("max",    sconfig.effort_tiers.max);
 
     // ── Thinking-budget v2: resolve model card and apply to ServerConfig ──
     // Read general.name + general.architecture directly from the GGUF.
