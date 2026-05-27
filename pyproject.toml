@@ -11,6 +11,7 @@ dependencies = [
     "lucebox",
     "lucebox-dflash",
     "luce-bench",
+    "harness",
     "pflash",
 ]
 
@@ -54,7 +55,7 @@ package = false
 no-build-isolation-package = ["qwen35-megakernel-bf16"]
 
 [tool.uv.workspace]
-members = ["server", "lucebox", "luce-bench", "optimizations/megakernel", "optimizations/pflash"]
+members = ["server", "lucebox", "luce-bench", "harness", "optimizations/megakernel", "optimizations/pflash"]
 
 [tool.uv.sources]
 lucebox = { workspace = true }
@@ -67,6 +68,11 @@ torch = { index = "pytorch-cu128" }
 # triggered on tag pushes matching `luce-bench-v*`. The standalone
 # repo at github.com/easel/luce-bench is archived and read-only.
 luce-bench = { workspace = true }
+# harness wraps "run a client against a Lucebox server" — both for the
+# client-compat sweep (harness/clients/*.sh + harness/client_test_runner.py)
+# and for `lucebox <client>` subcommands that exec real clients (claude,
+# codex, opencode, etc.) against a running Lucebox.
+harness = { workspace = true }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

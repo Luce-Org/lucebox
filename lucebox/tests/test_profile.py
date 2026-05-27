@@ -187,9 +187,11 @@ def test_luce_bench_argv_shape_for_each_area(tmp_path):
             area, max_tokens = expected_areas[step.id]
             assert step.argv is not None
             argv = step.argv(ctx, tmp_path)
-            # Every luce-bench step shells out to `python -m lucebench.cli`.
+            # Every luce-bench step delegates to `python -m harness.bench`,
+            # which composes the lucebench argv internally. Single source
+            # of truth for "run a bench against a Lucebox server".
             assert argv[1] == "-m"
-            assert argv[2] == "lucebench.cli"
+            assert argv[2] == "harness.bench"
             # Area + base-url + model are mandatory.
             assert "--area" in argv
             assert argv[argv.index("--area") + 1] == area

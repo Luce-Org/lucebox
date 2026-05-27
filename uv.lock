@@ -9,6 +9,7 @@ resolution-markers = [
 
 [manifest]
 members = [
+    "harness",
     "luce-bench",
     "lucebox",
     "lucebox-dflash",
@@ -415,6 +416,30 @@ wheels = [
 ]
 
 [[package]]
+name = "harness"
+version = "0.1.0"
+source = { editable = "harness" }
+dependencies = [
+    { name = "luce-bench" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "pytest" },
+]
+forge = [
+    { name = "luce-bench", extra = ["forge"] },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "luce-bench", editable = "luce-bench" },
+    { name = "luce-bench", extras = ["forge"], marker = "extra == 'forge'", editable = "luce-bench" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+]
+provides-extras = ["forge", "dev"]
+
+[[package]]
 name = "hf-xet"
 version = "1.5.0"
 source = { registry = "https://pypi.org/simple" }
@@ -639,6 +664,7 @@ name = "lucebox-hub"
 version = "0.0.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "harness" },
     { name = "luce-bench" },
     { name = "lucebox" },
     { name = "lucebox-dflash" },
@@ -657,6 +683,7 @@ megakernel = [
 
 [package.metadata]
 requires-dist = [
+    { name = "harness", editable = "harness" },
     { name = "luce-bench", editable = "luce-bench" },
     { name = "lucebox", editable = "lucebox" },
     { name = "lucebox-dflash", virtual = "server" },

@@ -1,0 +1,32 @@
+[project]
+name = "harness"
+version = "0.1.0"
+description = "Client launchers, server-profile sweeps, and bench orchestration for Lucebox."
+readme = "README.md"
+license = { file = "../LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "Lucebox" }]
+
+# Stdlib-only at runtime. luce-bench is the only declared dep (also stdlib-only
+# at runtime; anthropic SDK is opt-in via its [forge] extra). This keeps fresh
+# test-box installs cheap — `uv sync --package harness` resolves with zero
+# external wheel downloads.
+dependencies = [
+    "luce-bench",
+]
+
+[project.optional-dependencies]
+# Mirrors luce-bench[forge] for callers that want forge area runs.
+forge = ["luce-bench[forge]"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+harness-run-bench = "harness.bench:main"
+harness-claude-code = "harness.clients.claude_code:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["harness"]

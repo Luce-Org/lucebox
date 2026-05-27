@@ -13,6 +13,7 @@ Subcommand inventory:
     profile                — update local profile evidence and export snapshots
     smoke                  — hit /props + /v1/chat/completions on a running server
     download-models        — fetch target + draft via the container
+    claude                 — launch Claude Code pointed at the running server
 """
 
 from __future__ import annotations
@@ -485,6 +486,72 @@ def profile(
     if export_snapshot and not dry_run:
         written = profile_mod.export_snapshot(cfg, out, base_url=url or None)
         console.print(f"[green]Wrote[/green] {written}")
+
+
+@app.command()
+def claude(
+    prompt: Annotated[
+        str | None,
+        typer.Option(
+            "--prompt",
+            "-p",
+            help="One-shot prompt (non-interactive). Omit for the TUI.",
+        ),
+    ] = None,
+    url: Annotated[
+        str | None,
+        typer.Option(help="Lucebox base URL. Auto-detects localhost / docker host."),
+    ] = None,
+    model: Annotated[
+        str,
+        typer.Option(help="Model ID to advertise to Claude Code."),
+    ] = "luce-dflash",
+) -> None:
+    """Launch Claude Code pointed at the running Lucebox server.
+
+    The Anthropic Messages compatibility lives at <base>/v1; we set
+    ANTHROPIC_BASE_URL + a placeholder API key so Claude Code talks to
+    Lucebox instead of api.anthropic.com. Telemetry + the
+    nonstreaming-fallback retry are disabled (privacy + reliability —
+    local models don't need the fallback).
+
+    Interactive by default — exec into the full TUI. Pass --prompt for a
+    one-shot non-interactive run (matches `claude --print` mode).
+
+    Delegates to ``harness.clients.claude_code.launch`` so this and the
+    test-harness path (``harness/clients/run_claude_code.sh``) go through
+    one env-config source.
+    """
+    from harness.clients import claude_code as claude_launcher
+
+    cfg = _load_or_build()
+    base_url = url
+    if base_url is None:
+        bases = profile_mod._server_base_urls(cfg)
+        # Take the first that answers /health within a second.
+        for candidate in bases:
+            if profile_mod._json_get(candidate + "/health", timeout_s=1.0):
+                base_url = candidate
+                break
+        if base_url is None:
+            base_url = bases[0]  # fall through; let claude error if down
+            console.print(
+                f"[yellow]warning:[/yellow] no /health response at {bases[0]} "
+                f"— starting claude anyway (server may be down)."
+            )
+
+    try:
+        rc = claude_launcher.launch(
+            base_url=base_url,
+            model=model,
+            prompt=prompt,
+            interactive=prompt is None,
+        )
+    except FileNotFoundError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=127) from e
+    if rc != 0:
+        raise typer.Exit(code=rc)
 
 
 @app.command()

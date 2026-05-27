@@ -669,21 +669,26 @@ def _luce_bench_area_argv(
     timeout: int | None = None,
     model: str = "default",
 ) -> Callable[[ProfileContext, Path], list[str]]:
-    """argv builder for a single luce-bench area.
+    """argv builder for a single luce-bench area via the harness wrapper.
 
     Each StepDefinition's `argv` callable produces a fresh command per
     invocation, parameterized by the live ProfileContext (base_url) and
-    the destination directory the framework owns. Writing the per-case
-    rows to `dest/<report>.json` lets the framework version and dedup
-    profile snapshots without luce-bench needing to know about that
-    machinery.
+    the destination directory the framework owns. We delegate to
+    ``harness.bench`` (not lucebench.cli directly) so all "run a bench
+    against a Lucebox server" callers — profile + harness/clients/run_*.sh
+    + ad-hoc operators — go through one entry point. ``harness.bench``
+    handles the lucebench argv composition internally.
+
+    Writing the per-case rows to ``dest/<report>.json`` (via --json-out)
+    lets the framework version + dedup snapshots without harness or
+    luce-bench needing to know about that machinery.
     """
 
     def build(ctx: ProfileContext, dest: Path) -> list[str]:
         argv: list[str] = [
             sys.executable,
             "-m",
-            "lucebench.cli",
+            "harness.bench",
             "--area",
             area,
             "--base-url",
