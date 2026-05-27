@@ -632,7 +632,13 @@ GenerateResult Gemma4Backend::generate(const GenerateRequest & req,
 
     cache_.cur_pos = 0;
 
+    // Timing: prefill wall-clock — surfaced in usage.timings.prefill_ms
+    // by http_server.cpp via the GenTimings struct from sse_emitter.
+    // Mirrors qwen35_backend.cpp's instrumentation (commit 3b80fa8).
+    auto t_prefill_start = std::chrono::steady_clock::now();
     const int committed = do_prefill(req.prompt, out_io, /*kv_offset=*/0);
+    result.prefill_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_prefill_start).count();
     if (committed < 0) {
         result.error = "prefill";
         return result;
@@ -648,6 +654,7 @@ GenerateResult Gemma4Backend::generate(const GenerateRequest & req,
         cache_.cur_pos = committed;
     }
 
+    auto t_decode_start = std::chrono::steady_clock::now();
     if (req.n_gen > 0) {
         // Try speculative decode if draft is available and temp==0
         const bool can_spec = dflash_target_
@@ -719,6 +726,8 @@ GenerateResult Gemma4Backend::generate(const GenerateRequest & req,
     } else {
         out_io.emit(-1);
     }
+    result.decode_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_decode_start).count();
     result.ok = true;
     return result;
 }
@@ -784,6 +793,10 @@ GenerateResult Gemma4Backend::restore_and_generate(int slot,
     const int prompt_len = (int)req.prompt.size();
     int committed = snap_pos;
 
+    // Timing: prefill wall-clock for the delta. Same instrumentation as
+    // generate() — only the delta range is prefilled; the snap-pos prefix
+    // is already in cache. Surface via result.prefill_s for usage.timings.
+    auto t_prefill_start = std::chrono::steady_clock::now();
     if (prompt_len > snap_pos) {
         // Compute delta (tokens after the snapshot)
         std::vector<int32_t> delta(req.prompt.begin() + snap_pos, req.prompt.end());
@@ -798,6 +811,8 @@ GenerateResult Gemma4Backend::restore_and_generate(int slot,
         return result;
     }
     // else: prompt_len == snap_pos → no delta, committed stays at snap_pos
+    result.prefill_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_prefill_start).count();
 
     // Inline snapshot at snap_pos for prefix cache (new snap from this request)
     if (req.snap_slot >= 0 && req.snap_pos > 0 && req.snap_pos <= committed) {
@@ -818,6 +833,7 @@ GenerateResult Gemma4Backend::restore_and_generate(int slot,
     }
 
     // Generate
+    auto t_decode_start = std::chrono::steady_clock::now();
     if (req.n_gen > 0) {
         const bool can_spec = dflash_target_
             && !draft_parked_
@@ -888,6 +904,8 @@ GenerateResult Gemma4Backend::restore_and_generate(int slot,
     } else {
         out_io.emit(-1);
     }
+    result.decode_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_decode_start).count();
     result.ok = true;
     return result;
 }

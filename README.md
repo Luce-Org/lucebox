@@ -53,6 +53,24 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 | Qwen 3.5-27B Q4_K_M (DFlash + PFlash, HIP) | **~2.6×** |
 | Gemma-4-26B-A4B Q4_K_M (DFlash) | **1.31×** |
 
+## Supported Machines
+
+Reference target: **RTX 3090 (Ampere sm_86)** — all headline numbers. Other NVIDIA archs auto-detected by CMake / `setup.py`; AMD HIP backend separate ([Strix Halo section](#amd-strix-halo-hip-backend)).
+
+| Arch | GPUs | Min CUDA | Status | Bench |
+|------|------|:--------:|--------|:-----:|
+| Ampere `sm_86` | RTX 3090, A-series | 12.0 | ✅ reference | [megakernel](optimizations/megakernel/RESULTS.md#rtx-3090-pp520-tg128) · [dflash](server/RESULTS.md) |
+| Blackwell `sm_120` | RTX 5090 | 12.8 | ✅ 205 tok/s, 4.84× | [↗](server/RESULTS.md#rtx-5090-blackwell-sm_120sm_120a-32-gb) |
+| Blackwell `sm_121` | DGX Spark / GB10 | 12.9 | ✅ megakernel NVFP4 | [↗](optimizations/megakernel/RESULTS.md#nvidia-dgx-spark-gb10-sm_121a) |
+| Turing `sm_75` | RTX 2080 Ti | 12.0 | ✅ 53 tok/s DFlash | [↗](server/RESULTS.md#rtx-2080-ti-turing-sm_75-22-gb) |
+| Ada `sm_89` | RTX 40xx | 12.0 | 🟡 community WSL2 bench | [↗](server/RESULTS.md#rtx-4090-ada-sm_89-24-gb--wsl2-community) |
+| Blackwell `sm_110` | Jetson AGX Thor | 13.0 | 🟡 builds, unbenched | — |
+| Volta `sm_70` / Pascal `sm_61` | V100, P40 | 12.0 | 🟡 fallback paths, unbenched | — |
+| RDNA3.5 `gfx1151` | Ryzen AI MAX+ 395 / Strix Halo | ROCm 6+ | ✅ 37 tok/s HIP | [↗](#amd-strix-halo-hip-backend) |
+| RDNA3 `gfx1100` | Radeon RX 7900 XTX | ROCm 6+ | ✅ 50 tok/s HIP | [↗](server/docs/HIP_PERF_PLAN.md) |
+
+Build needs CMake 3.18+, PyTorch 2.0+, `--recurse-submodules` for `Luce-Org/llama.cpp@luce-dflash`. Power-tune: `sudo nvidia-smi -pl 220` (3090 sweet spot, re-sweep for other cards).
+
 ## Supported Harnesses
 
 [`harness/`](harness/) contains RTX 3090 client launchers and regression tests
@@ -314,23 +332,6 @@ General-purpose frameworks dominated the last decade because hand-tuning kernels
 AI-assisted development flips that calculus. Rewrites that took a quarter now fit in a release cycle. Lucebox is where we publish them, one chip and one model family at a time. Apache 2.0 source, full writeup, reproducible benchmarks.
 
 ---
-
-## Requirements
-
-All experiments in this repo are built, tuned, and benchmarked on NVIDIA RTX 3090 (2020), the reference target. Supported GPU families:
-
-- **Ampere** (sm_86, RTX 3090 / A-series): reference, CUDA 12+.
-- **Ada** (sm_89, RTX 40xx): should work, unverified, CUDA 12+.
-- **Blackwell consumer** (sm_120, RTX 50xx incl. 5090): supported, CUDA 12.8+.
-- **DGX Spark / GB10** (sm_121, compute capability 12.1): supported, CUDA 12.9+.
-- **Jetson AGX Thor** (sm_110): supported, CUDA 13+.
-- **Turing** (sm_75, RTX 2080): supported, CUDA 12+.
-
-PyTorch 2.0+. `server/` needs CMake 3.18+ and `--recurse-submodules` for the pinned `Luce-Org/llama.cpp@luce-dflash` fork (three tree-mode ggml ops); multi-arch build is automatic (see [Running on other GPUs](#running-on-other-gpus-4090-5090-dgx-spark--gb10-jetson-agx-thor)).
-
-**Megakernel porting note.** `optimizations/megakernel/setup.py` auto-detects the GPU arch and SM count at build time via `torch.cuda.get_device_capability()`. The decode grid is persistent (one block per SM) and is clamped to the resident-block ceiling at runtime, so no manual tuning is needed. On SM < 80 (Turing), the kernel uses FP16 instead of BF16 via a compile-time `TARGET_SM` flag; on SM >= 80 (Ampere+), BF16 is used. From the workspace root, `uv sync --extra megakernel` builds the extension; the legacy `pip install -e . --no-build-isolation` flow still works from inside `optimizations/megakernel/`.
-
-**Optional, find your GPU's sweet spot:** `sudo nvidia-smi -pl 220` (megakernel hits best tok/J at 220 W on 3090; re-sweep for other cards).
 
 ---
 
