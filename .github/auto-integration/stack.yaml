@@ -1,16 +1,21 @@
-updated_at: 2026-05-27T09:58:00-04:00
+updated_at: 2026-05-27T16:10:00-04:00
 repository: Luce-Org/lucebox-hub
 integration_branch: auto-integration
 remotes:
   upstream: origin
   writable: easel
 heads:
-  upstream_main: bfe654f
-  previous_integration_head: f116c2f
+  upstream_main: aee0591
+  previous_integration_head: 5e504f1
   base_before_run: easel/auto-integration
-  integration_worktree_head_before_metadata_commit: da28161
+  integration_worktree_head_before_metadata_commit: 3c4a370
 stack:
   included:
+    - pr: 284
+      status: integrated-this-run
+      head: 697198a
+      evidence: clean merge added config.json-based rope_theta loading for the safetensors draft path; compile-only verification of draft_safetensors_loader.cpp succeeded after syncing server/deps/llama.cpp.
+      merge_commit: 3c4a370
     - pr: 276
       status: already-represented
       head: 0e3c79a
@@ -33,6 +38,10 @@ stack:
       head: f2fbf62
       evidence: merge-tree into refreshed stack is tree-identical; FP16 safetensors drafter support already present.
   attempted_this_run:
+    - pr: 284
+      status: integrated
+      worktree: /home/erik/Projects/luce2
+      evidence: git merge --no-ff --no-edit pr-284 completed without conflicts after first merging origin/main.
     - pr: 274
       status: integrated
       worktree: /home/erik/Projects/luce2-worktrees/auto-int-20260527-0938
@@ -111,8 +120,8 @@ stack:
     - pr: 193
     - pr: 75
   upstream_sync:
-    - merged_origin_main: already-current
-    - note: origin/main bfe654f is an ancestor of the integration stack; no upstream base change after previous refresh.
+    - merged_origin_main: refreshed_this_run
+    - note: origin/main advanced to aee0591 (readme); merged cleanly into the integration branch before replaying PR #284.
   tests_and_checks:
     - date -Is
     - git status --short --branch
@@ -125,6 +134,13 @@ stack:
     - git fetch --prune easel
     - git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*' (submodule recursion emitted known missing dflash/deps warning after refs fetched)
     - gh pr list --repo Luce-Org/lucebox-hub --state open --limit 100 --json ...
+    - git merge --no-ff --no-edit origin/main
+    - git fetch origin pull/284/head:pr-284
+    - git merge --no-ff --no-edit pr-284
+    - git submodule update --init --recursive server/deps/llama.cpp
+    - cmake -S server -B /tmp/luce2-server-build -DDFLASH27B_GPU_BACKEND=cuda -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+    - cmake --build /tmp/luce2-server-build --target dflash_server -j2 (timed out after 600s while compiling ggml-cuda sources)
+    - /usr/bin/c++ ... -c /home/erik/Projects/luce2/server/src/draft/draft_safetensors_loader.cpp (succeeded; existing unused-result warning only)
     - git merge-tree --write-tree HEAD origin/pr/<n> for open non-draft contributor PRs
     - git merge --no-ff --no-edit origin/pr/274 in isolated worktree
     - git merge --no-commit --no-ff origin/pr/266 in isolated worktree
@@ -132,4 +148,5 @@ stack:
   notes:
     - Primary checkout remained clean and unchanged during experiments.
     - Retained conflicted PR #266 worktree for inspection because cleanup/abort is not needed for the primary checkout and dangerous cleanup commands are forbidden.
-    - 2026-05-27T09:58-04:00 recheck: upstream/main still at bfe654f; PRs 274/276 remain represented in the stack, and PR 266 remains the next non-draft candidate but is still blocked by server-layout and obsolete-artifact conflicts.
+    - 2026-05-27T16:10-04:00 recheck: upstream/main is now aee0591 and PR #284 is integrated on top of it; PRs 274/276/264 remain represented in the stack, and PR 266 remains the next non-draft candidate but is still blocked by server-layout and obsolete-artifact conflicts.
+    - server/deps/llama.cpp had to be initialized locally before the CUDA build check could proceed.
