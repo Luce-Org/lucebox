@@ -55,8 +55,8 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 
 ## Supported Harnesses
 
-<p align="center">
-  <a href="harness/"><img src="harness/assets/hero.png" alt="Lucebox client harness experiments on RTX 3090" width="600" /></a>
+<p align="left">
+  <a href="harness/"><img src="harness/assets/hero.png" alt="Lucebox client harness experiments on RTX 3090" width="320" align="left" /></a>
 </p>
 
 [`harness/`](harness/) contains RTX 3090 client launchers and regression tests
