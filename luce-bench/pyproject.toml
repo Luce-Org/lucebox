@@ -1,0 +1,76 @@
+[project]
+name = "luce-bench"
+version = "0.2.4"
+description = "Capability benchmarks for chat-completion endpoints (ds4-eval, HumanEval, long-context, forge)"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "Erik LaBianca", email = "erik@telepathdata.com" }]
+keywords = ["llm", "benchmark", "evaluation", "chat-completion", "reasoning"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Stdlib-only core. Anthropic SDK for forge area is opt-in via extras.
+dependencies = []
+
+[project.optional-dependencies]
+forge = ["anthropic>=0.40.0"]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+# Primary entry point — name matches the package so `uvx luce-bench`
+# Just Works. Keep `lucebench` as a back-compat alias for users who
+# remember the no-dash form.
+luce-bench = "lucebench.cli:main"
+lucebench = "lucebench.cli:main"
+luce-bench-probe = "lucebench.probe:main"
+lucebench-probe = "lucebench.probe:main"
+luce-bench-report = "lucebench.report:main"
+lucebench-report = "lucebench.report:main"
+
+[project.urls]
+Homepage = "https://github.com/easel/luce-bench"
+Repository = "https://github.com/easel/luce-bench"
+Issues = "https://github.com/easel/luce-bench/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lucebench"]
+
+# Fixtures live under src/lucebench/fixtures, so they're auto-included
+# as package data. No force-include needed (would duplicate entries).
+
+[tool.hatch.build.targets.sdist]
+include = ["src/lucebench", "README.md", "LICENSE", "NOTICE", "tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# Vendored upstream code is preserved verbatim — exclude from lint so
+# we don't accumulate style noise we don't own. Re-include if we ever
+# fork upstream meaningfully.
+extend-exclude = [
+    "src/lucebench/fixtures/forge_eval",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "UP"]
+ignore = ["E501"]  # line-length handled by formatter
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"

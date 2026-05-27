@@ -54,7 +54,7 @@ package = false
 no-build-isolation-package = ["qwen35-megakernel-bf16"]
 
 [tool.uv.workspace]
-members = ["server", "lucebox", "optimizations/megakernel", "optimizations/pflash"]
+members = ["server", "lucebox", "luce-bench", "optimizations/megakernel", "optimizations/pflash"]
 
 [tool.uv.sources]
 lucebox = { workspace = true }
@@ -62,10 +62,11 @@ lucebox-dflash = { workspace = true }
 pflash = { workspace = true }
 qwen35-megakernel-bf16 = { workspace = true }
 torch = { index = "pytorch-cu128" }
-# luce-bench is the standalone PyPI benchmark package (formerly
-# `dflash/scripts/bench_*.py`). Pinned to a git tag until we land the
-# trusted-publishing flow on PyPI; switch to a plain version pin then.
-luce-bench = { git = "https://github.com/easel/luce-bench.git", tag = "v0.2.4" }
+# luce-bench lives in-tree under `luce-bench/`. It is published to PyPI
+# from this monorepo via `.github/workflows/release-luce-bench.yml`,
+# triggered on tag pushes matching `luce-bench-v*`. The standalone
+# repo at github.com/easel/luce-bench is archived and read-only.
+luce-bench = { workspace = true }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
