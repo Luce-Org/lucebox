@@ -10,7 +10,7 @@
 
 <p align="center">
   <strong>GGUF DFlash speculative decoding for Qwen3.5/Qwen3.6 27B.</strong><br/>
-  C++/CUDA runtime on top of ggml. Default path: Qwen3.6-27B Q4_K_M target + Lucebox Q8_0 GGUF DFlash draft.<br/>
+  C++/CUDA runtime on top of ggml. Default path: Qwen3.6-27B Q4_K_M target + Lucebox Q4_K_M GGUF DFlash draft.<br/>
   Qwen3.5 reference: 129.5 tok/s mean on HumanEval (3.43x vs AR); best demo run: 207.6 tok/s vs 38.0 tok/s AR (5.46x).<br/><br/>
   <a href="https://lucebox.com/blog/dflash27b">Blog post</a> · <a href="RESULTS.md">Benchmarks</a> · <a href="https://discord.gg/yHfswqZmJQ">Discord</a> · <a href="https://lucebox.com">lucebox.com</a>
 </p>
@@ -135,7 +135,7 @@ Qwen3.6-27B is the default integration path. It uses the same `qwen35` target ar
 hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
 
 # 2. matched 3.6 draft (GGUF, used by default by scripts/run.py and dflash_server)
-hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q8_0.gguf --local-dir models/draft/
+hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf --local-dir models/draft/
 
 # 3. bench
 DFLASH_TARGET=models/Qwen3.6-27B-Q4_K_M.gguf python3 scripts/bench_he.py --n-gen 128
@@ -162,7 +162,7 @@ Run it directly:
 
 ```bash
 ./build/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf \
-  --draft models/draft/dflash-draft-3.6-q8_0.gguf \
+  --draft models/draft/dflash-draft-3.6-q4_k_m.gguf \
   --host 127.0.0.1 --port 18080 \
   --max-ctx 32768 --max-tokens 512 \
   --fa-window 2048 \
@@ -326,12 +326,12 @@ cd lucebox-hub/dflash
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build --target test_dflash -j
 
-# Fetch models: ~16 GB target + 1.84 GB Lucebox Q8_0 GGUF DFlash draft.
+# Fetch models: ~16 GB target + 0.98 GB Lucebox Q4_K_M GGUF DFlash draft.
 # Quickstart pins to Qwen3.6-27B (latest release). For Qwen3.5-27B swap in
 # unsloth/Qwen3.5-27B-GGUF + z-lab/Qwen3.5-27B-DFlash; arch is identical so
 # no rebuild is needed.
 hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
-hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q8_0.gguf --local-dir models/draft/
+hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf --local-dir models/draft/
 
 # Streaming one-shot generate (run.py defaults to models/Qwen3.6-27B-Q4_K_M.gguf;
 # override with --target or DFLASH_TARGET=... env var).
@@ -342,7 +342,7 @@ python3 examples/chat.py
 
 # OpenAI-compatible HTTP server (drop-in for Open WebUI / LM Studio / Cline).
 ./build/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf \
-  --draft models/draft/dflash-draft-3.6-q8_0.gguf --port 8000
+  --draft models/draft/dflash-draft-3.6-q4_k_m.gguf --port 8000
 
 # Reproduce paper numbers
 python3 scripts/bench_llm.py                                 # HE + GSM8K + Math500
@@ -353,7 +353,7 @@ python3 scripts/bench_he.py --n-gen 256 --ddtree-budget 22   # minimal HE bench
 ```bash
 DFLASH27B_KV_TQ3=1 DFLASH27B_PREFILL_UBATCH=16 \
   build/test_dflash models/Qwen3.6-27B-Q4_K_M.gguf \
-  models/draft/dflash-draft-3.6-q8_0.gguf /tmp/long_prompt.bin 64 /tmp/out.bin \
+  models/draft/dflash-draft-3.6-q4_k_m.gguf /tmp/long_prompt.bin 64 /tmp/out.bin \
   --fast-rollback --ddtree --ddtree-budget=16 --max-ctx=4096   # align_up(prompt + n_gen + 64, 256); raise up to 262144 for long prompts
 ```
 

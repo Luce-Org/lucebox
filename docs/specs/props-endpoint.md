@@ -570,7 +570,7 @@ version increments.
   },
   "model": {
     "arch":         "qwen35",
-    "draft_path":   "/.../dflash-draft-3.6-q8_0.gguf",
+    "draft_path":   "/.../dflash-draft-3.6-q4_k_m.gguf",
     "tokenizer_id": "qwen3"
   },
   "model_alias": "dflash",
