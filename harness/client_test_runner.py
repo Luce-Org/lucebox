@@ -216,6 +216,7 @@ def run_cmd(
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
     timeout: int = 300,
+    stream: bool = False,
 ) -> dict[str, Any]:
     t0 = time.perf_counter()
     try:
@@ -224,17 +225,18 @@ def run_cmd(
             cwd=str(cwd) if cwd else None,
             env=env,
             text=True,
-            stdout=subprocess.PIPE,
+            stdout=None if stream else subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=timeout,
             check=False,
         )
+        output = "" if stream else proc.stdout
         return {
             "ok": proc.returncode == 0,
             "returncode": proc.returncode,
             "seconds": round(time.perf_counter() - t0, 3),
             "cmd": cmd,
-            "output_tail": proc.stdout[-4000:],
+            "output_tail": output[-4000:],
         }
     except FileNotFoundError as exc:
         return {
@@ -297,14 +299,17 @@ def install_client(work_dir: Path, spec: ClientSpec) -> dict[str, Any]:
         result = run_cmd(
             ["npm", "install", "--global", "--prefix", str(prefix), spec.package],
             timeout=900,
+            stream=True,
         )
     elif spec.install == "pip":
         env_dir = pip_venv(work_dir, spec.name)
         if not (env_dir / "bin" / "python").exists():
             venv.EnvBuilder(with_pip=True).create(env_dir)
+        timeout = 3600 if spec.name == "openwebui" else 1200
         result = run_cmd(
             [str(env_dir / "bin" / "python"), "-m", "pip", "install", "-U", spec.package],
-            timeout=1200,
+            timeout=timeout,
+            stream=True,
         )
     elif spec.install == "hermes":
         root = work_dir / "clients" / spec.name
@@ -327,6 +332,7 @@ def install_client(work_dir: Path, spec: ClientSpec) -> dict[str, Any]:
             ["bash", str(script_path), "--skip-setup", "--skip-browser"],
             env=env,
             timeout=1800,
+            stream=True,
         )
     else:
         raise HarnessError(f"unknown installer {spec.install}")
