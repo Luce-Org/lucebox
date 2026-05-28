@@ -4,9 +4,9 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T12:35:00-04:00
+Last refresh: 2026-05-28T12:42:00-04:00
 Current base: `origin/main` `6a6b0081`
-Current integration tip before this refresh: `easel/auto-integration` `575034db`
+Current integration tip before this refresh: `easel/auto-integration` `9b7972a1`
 Refreshed stack tip prepared in this run: this commit
 
 This branch is maintained as a reproducible patch stack over `origin/main`.
@@ -14,7 +14,10 @@ The primary checkout was clean at the start of this unattended run. Upstream
 `origin/main` and the current `easel/auto-integration` tip had not advanced
 since the prior refresh, and all previously integrated non-draft contributor PR
 refs remained ancestors of the stack. No new non-draft contributor PR head
-required a new integration merge in this run.
+required a new integration merge in this run. After the first manifest-only push,
+CI exposed integration-only build breakage; this refresh also removes duplicate
+CMake test target registrations and installs libcurl development headers for the
+new server target in CI/Docker builds.
 
 ## Included in the current stack
 
@@ -47,6 +50,7 @@ required a new integration merge in this run.
 | current integrated PRs | checked | `git merge-base --is-ancestor origin/pr/<n> HEAD` shows #294, #292, #289, #284, #276, #274, #266, #152, and #142 are ancestors of the refreshed stack. #278 and #265 are included through `origin/main`. |
 | remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39 against current stack tip `575034db`. Every direct probe conflicted and was aborted in the isolated probe worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-123547.txt`. |
 | #237 manual/delegated status | still blocked-needs-human | No new #237 head since the prior deep manual/delegated recheck. This run's direct probe again showed broad conflicts across old `dflash/` paths, common MTP interfaces, Qwen35 graph/backend files, CMake, daemon/server wiring, and tests. Prior Claude/Codex tmux attempts did not produce a trusted ready-to-apply resolution, and the required next step remains a deliberate current-layout MTP port rather than conflict-marker resolution. |
+| integration-only CI fix | fixed | GitHub checks for the manifest-only push `9b7972a1` failed during CMake configure because several tests were registered twice in `server/CMakeLists.txt` and the new `dflash_server` target required libcurl development headers on the hosted runner. This refresh removes the duplicate target block and adds `libcurl4-openssl-dev` to CI/Docker build dependencies. |
 
 ## Pending / blocked-needs-human / selective-port candidates
 
@@ -91,8 +95,10 @@ This run performed:
 - `origin/main`, `easel/auto-integration`, and local `HEAD` were checked as `6a6b0081`, `575034db`, and `575034db` respectively; `git rev-list --left-right --count HEAD...easel/auto-integration` returned `0 0`.
 - Isolated probe worktree `/tmp/luce-probe-20260528-123547` reran direct conflict probes for all remaining non-ancestor non-draft PRs.
 - Ancestor checks passed for included contributor PR refs #294, #292, #289, #284, #276, #274, #266, #152, and #142; #278 and #265 are included through upstream main.
-- `git diff --check` passed for this manifest refresh.
+- `git diff --check` passed for this manifest refresh and the integration-only CI fix.
 - Targeted conflict-marker scan over `docs/auto-integration.md` found no merge markers.
+- GitHub checks on intermediate commit `9b7972a1` were inspected with `gh pr checks 286 --watch` and `gh run view 26588281995 --log-failed`; `uv workspace` passed, while CMake configure failed on duplicate test targets and missing CURL dev headers.
+- Local `cmake -S server -B /tmp/luce-cmake-fix-124202 ...` could not reach project configure due to the known local WSL CUDA compiler-id blocker (`ptxas fatal: Value 'sm_52' is not defined`), so CI is the authoritative CMake verifier for this fix.
 
 ## Notes
 

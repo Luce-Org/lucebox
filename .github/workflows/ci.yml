@@ -43,7 +43,7 @@ jobs:
           cuda: '12.8.0'
           method: network
           sub-packages: '["nvcc", "cudart-dev", "thrust", "driver-dev"]'
-          non-cuda-sub-packages: '["libcublas-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev", "libcurl4-openssl-dev"]'
 
       - uses: astral-sh/setup-uv@v3
         with:

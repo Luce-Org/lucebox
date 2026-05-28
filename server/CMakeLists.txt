@@ -612,44 +612,6 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_bandit_integration PRIVATE dflash_common)
         add_test(NAME bandit_integration COMMAND test_bandit_integration)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_early_exit_score_range.cpp")
-        add_executable(test_drafter_early_exit_score_range
-            test/test_drafter_early_exit_score_range.cpp)
-        target_include_directories(test_drafter_early_exit_score_range PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
-        add_test(NAME test_drafter_early_exit_score_range
-            COMMAND test_drafter_early_exit_score_range)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_anchor_transitive.cpp")
-        add_executable(test_anchor_transitive
-            test/test_anchor_transitive.cpp
-            src/qwen3/anchor_scan.cpp)
-        target_include_directories(test_anchor_transitive PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3)
-        add_test(NAME test_anchor_transitive
-            COMMAND test_anchor_transitive)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_warm_path_regression.cpp")
-        add_executable(test_drafter_warm_path_regression
-            test/test_drafter_warm_path_regression.cpp)
-        target_include_directories(test_drafter_warm_path_regression PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
-        add_test(NAME test_drafter_warm_path_regression
-            COMMAND test_drafter_warm_path_regression)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_tail_capture_guard.cpp")
-        # GREEN phase: built with TAIL_GUARD_USE_NEW_FORMULA — must pass after Bug #42 fix.
-        add_executable(test_drafter_tail_capture_guard
-            test/test_drafter_tail_capture_guard.cpp)
-        target_compile_definitions(test_drafter_tail_capture_guard PRIVATE
-            TAIL_GUARD_USE_NEW_FORMULA)
-        add_test(NAME test_drafter_tail_capture_guard
-            COMMAND test_drafter_tail_capture_guard)
-        # RED phase binary: same source WITHOUT the fix flag — documents the bug.
-        add_executable(test_drafter_tail_capture_guard_red
-            test/test_drafter_tail_capture_guard.cpp)
-        # No TAIL_GUARD_USE_NEW_FORMULA — uses old (buggy) guard, expected to FAIL.
-    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_vs_reference.cpp")
         add_executable(test_draft_vs_reference test/test_draft_vs_reference.cpp)
         target_link_libraries(test_draft_vs_reference PRIVATE dflash_common)
