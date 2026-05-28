@@ -11,6 +11,7 @@ source "$SCRIPT_DIR/common.sh"
 
 CLIENT_OUT="$LOG_DIR/pi.out"
 PI_BIN="${PI_BIN:-$CLIENT_WORK_DIR/clients/pi/npm/bin/pi}"
+require_client_binary "Pi" "$PI_BIN" "pi" "PI_BIN"
 HOME_DIR="$LOG_DIR/pi-home"
 AGENT_DIR="$HOME_DIR/agent"
 PROVIDER_API="${PROVIDER_API:-openai-responses}"

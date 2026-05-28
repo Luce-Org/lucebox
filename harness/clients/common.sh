@@ -4,9 +4,11 @@ set -euo pipefail
 # Source this file from a client harness launcher on the RTX 3090 host.
 # Assumes the repo and client package cache already exist on that machine.
 
-REPO_DIR="${REPO_DIR:-/workspace/lucebox-hub-harness}"
-CLIENT_WORK_DIR="${CLIENT_WORK_DIR:-/workspace/lucebox-harness-work}"
-RUN_DIR="${RUN_DIR:-/workspace/lucebox-client-harness-runs}"
+SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+DEFAULT_REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_DIR="${REPO_DIR:-$DEFAULT_REPO_DIR}"
+CLIENT_WORK_DIR="${CLIENT_WORK_DIR:-$REPO_DIR/.harness-work}"
+RUN_DIR="${RUN_DIR:-$CLIENT_WORK_DIR/runs}"
 
 DEFAULT_TARGET="$REPO_DIR/server/models/Qwen3.6-27B-Q4_K_M.gguf"
 DEFAULT_DRAFT="$REPO_DIR/server/models/draft/dflash-draft-3.6-q4_k_m.gguf"
@@ -32,7 +34,8 @@ else
 fi
 MODEL_SERVER="${MODEL_SERVER:-lucebox}"
 DFLASH_SERVER_BIN="${DFLASH_SERVER_BIN:-$REPO_DIR/server/build/dflash_server}"
-LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/workspace/llama-cpp-server-build/bin/llama-server}"
+LLAMA_BUILD_DIR="${LLAMA_BUILD_DIR:-$CLIENT_WORK_DIR/llama-cpp-server-build}"
+LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-$LLAMA_BUILD_DIR/bin/llama-server}"
 LLAMA_N_GPU_LAYERS="${LLAMA_N_GPU_LAYERS:-999}"
 LLAMA_FLASH_ATTN="${LLAMA_FLASH_ATTN:-1}"
 LLAMA_PARALLEL="${LLAMA_PARALLEL:-1}"
@@ -71,6 +74,21 @@ LOG_DIR="$RUN_DIR/$STAMP"
 SERVER_LOG="$LOG_DIR/server.log"
 
 mkdir -p "$LOG_DIR"
+
+require_client_binary() {
+  local label="$1"
+  local path="$2"
+  local client="$3"
+  local env_var="$4"
+  if [[ -x "$path" ]]; then
+    return 0
+  fi
+  echo "$label binary not found or not executable: $path" >&2
+  echo "Install it with:" >&2
+  echo "  python3 $REPO_DIR/harness/client_test_runner.py install --clients $client" >&2
+  echo "or set $env_var=/path/to/$(basename "$path")." >&2
+  return 1
+}
 
 draft_enabled() {
   [[ -n "${DRAFT:-}" && "$DRAFT" != "none" && "$DRAFT" != "off" && "$DRAFT" != "0" ]]
@@ -145,8 +163,8 @@ start_llamacpp_server() {
   if [[ ! -x "$LLAMA_SERVER_BIN" ]]; then
     echo "llama-server not found or not executable: $LLAMA_SERVER_BIN" >&2
     echo "Build it first, for example:" >&2
-    echo "  cmake -S $REPO_DIR/server/deps/llama.cpp -B /workspace/llama-cpp-server-build -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF" >&2
-    echo "  cmake --build /workspace/llama-cpp-server-build --target llama-server -j2" >&2
+    echo "  cmake -S $REPO_DIR/server/deps/llama.cpp -B $LLAMA_BUILD_DIR -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF" >&2
+    echo "  cmake --build $LLAMA_BUILD_DIR --target llama-server -j2" >&2
     return 1
   fi
   if [[ ! -f "$TARGET" ]]; then

@@ -2,7 +2,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_DIR="${RUN_DIR:-/workspace/lucebox-client-harness-runs}"
+DEFAULT_REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_DIR="${REPO_DIR:-$DEFAULT_REPO_DIR}"
+CLIENT_WORK_DIR="${CLIENT_WORK_DIR:-$REPO_DIR/.harness-work}"
+RUN_DIR="${RUN_DIR:-$CLIENT_WORK_DIR/runs}"
 CLIENT="${CLIENT:-opencode}"
 PAIR_STAMP="${PAIR_STAMP:-backend-pair-$CLIENT-$(date +%Y%m%d-%H%M%S)}"
 PAIR_DIR="$RUN_DIR/$PAIR_STAMP"

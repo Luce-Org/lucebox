@@ -133,6 +133,21 @@ For no-draft targets such as Gemma, set only `DFLASH_TARGET` or pass
 `DRAFT=none`; the harness will not attach the default Qwen draft to a custom
 target.
 
+Install real-client CLIs before running launcher scripts:
+
+```bash
+python3 harness/client_test_runner.py install --clients codex,hermes,openwebui
+```
+
+For direct TPS/TTFT numbers against a running server:
+
+```bash
+python3 harness/client_test_runner.py bench \
+  --url http://127.0.0.1:8000 \
+  --suite he,agent \
+  --n-sample 3
+```
+
 ## Run the Server
 
 Default: Qwen 3.6-27B Q4_K_M target + Lucebox Q4_K_M DFlash drafter on RTX 3090. DDTree budget=22, TQ3_0 KV cache, sliding FA window 2048. OpenAI-compatible HTTP on `:8000`.

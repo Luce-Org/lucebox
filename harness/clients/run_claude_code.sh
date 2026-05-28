@@ -15,6 +15,7 @@ source "$SCRIPT_DIR/common.sh"
 
 CLIENT_OUT="$LOG_DIR/claude-code.out"
 CLAUDE_BIN="${CLAUDE_BIN:-$CLIENT_WORK_DIR/clients/claude_code/npm/bin/claude}"
+require_client_binary "Claude Code" "$CLAUDE_BIN" "claude_code" "CLAUDE_BIN"
 HOME_DIR="$LOG_DIR/claude-home"
 mkdir -p "$HOME_DIR"
 

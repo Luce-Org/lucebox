@@ -11,6 +11,7 @@ source "$SCRIPT_DIR/common.sh"
 
 CLIENT_OUT="$LOG_DIR/openclaw.out"
 OPENCLAW_BIN="${OPENCLAW_BIN:-$CLIENT_WORK_DIR/clients/openclaw/npm/bin/openclaw}"
+require_client_binary "OpenClaw" "$OPENCLAW_BIN" "openclaw" "OPENCLAW_BIN"
 HOME_DIR="$LOG_DIR/openclaw-home"
 CONFIG_PATCH="$LOG_DIR/openclaw.patch.json"
 PROVIDER_API="${PROVIDER_API:-openai-completions}"

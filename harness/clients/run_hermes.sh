@@ -11,6 +11,7 @@ source "$SCRIPT_DIR/common.sh"
 
 CLIENT_OUT="$LOG_DIR/hermes.out"
 HERMES_BIN="${HERMES_BIN:-$CLIENT_WORK_DIR/clients/hermes/home/.local/bin/hermes}"
+require_client_binary "Hermes" "$HERMES_BIN" "hermes" "HERMES_BIN"
 HOME_DIR="$LOG_DIR/hermes-home"
 mkdir -p "$HOME_DIR"
 
