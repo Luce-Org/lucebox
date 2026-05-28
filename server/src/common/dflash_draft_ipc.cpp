@@ -115,7 +115,8 @@ bool DFlashDraftIpcClient::propose(
     FILE * cmd = process_.command_stream();
     const int stream_fd = process_.stream_fd();
     const int payload_fd = process_.payload_fd();
-    if (!active_ || !cmd || stream_fd < 0 || committed < 0 || ctx_len <= 0) {
+    if (!active_ || !cmd || stream_fd < 0 || committed < 0 ||
+        ctx_len <= 0 || ctx_len > ring_cap_) {
         return false;
     }
     const size_t noise_expected =

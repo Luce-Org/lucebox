@@ -114,6 +114,27 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
         return true;
     };
 
+    auto store_feature_slice = [&](int capture_idx,
+                                   int start_pos,
+                                   int n_tokens,
+                                   const std::vector<float> & slice) -> bool {
+        const size_t expected = (size_t)n_tokens * (size_t)hidden;
+        if (slice.size() != expected) return false;
+        const size_t dst_stride = feature_ring.target_feat->nb[1];
+        const size_t slice_offset =
+            (size_t)capture_idx * (size_t)hidden * sizeof(float);
+        for (int i = 0; i < n_tokens; i++) {
+            const int slot = (start_pos + i) % feature_ring.cap;
+            const size_t dst_off = (size_t)slot * dst_stride + slice_offset;
+            ggml_backend_tensor_set(feature_ring.target_feat,
+                                    slice.data() + (size_t)i * hidden,
+                                    dst_off,
+                                    (size_t)hidden * sizeof(float));
+        }
+        ggml_backend_synchronize(backend);
+        return true;
+    };
+
     auto run_proposal = [&](int committed, int ctx_len) -> ProposalResult {
         int mirror_slot0 = 0;
         const bool use_mirror_view =
@@ -190,18 +211,11 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
                 stream_status(stream_fd, -1);
                 continue;
             }
-            const size_t dst_stride = feature_ring.target_feat->nb[1];
-            const size_t slice_offset =
-                (size_t)capture_idx * (size_t)hidden * sizeof(float);
-            for (int i = 0; i < n_tokens; i++) {
-                const int slot = (start_pos + i) % feature_ring.cap;
-                const size_t dst_off = (size_t)slot * dst_stride + slice_offset;
-                ggml_backend_tensor_set(feature_ring.target_feat,
-                                        slice.data() + (size_t)i * hidden,
-                                        dst_off,
-                                        (size_t)hidden * sizeof(float));
+            if (!store_feature_slice(capture_idx, start_pos, n_tokens, slice)) {
+                std::fprintf(stderr, "[draft-ipc-daemon] store feature_slice failed\n");
+                stream_status(stream_fd, -1);
+                continue;
             }
-            ggml_backend_synchronize(backend);
             stream_status(stream_fd, 0);
             continue;
         }
@@ -230,18 +244,11 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
                 stream_status(stream_fd, -1);
                 break;
             }
-            const size_t dst_stride = feature_ring.target_feat->nb[1];
-            const size_t slice_offset =
-                (size_t)capture_idx * (size_t)hidden * sizeof(float);
-            for (int i = 0; i < n_tokens; i++) {
-                const int slot = (start_pos + i) % feature_ring.cap;
-                const size_t dst_off = (size_t)slot * dst_stride + slice_offset;
-                ggml_backend_tensor_set(feature_ring.target_feat,
-                                        slice.data() + (size_t)i * hidden,
-                                        dst_off,
-                                        (size_t)hidden * sizeof(float));
+            if (!store_feature_slice(capture_idx, start_pos, n_tokens, slice)) {
+                std::fprintf(stderr, "[draft-ipc-daemon] store feature_slice_pipe failed\n");
+                stream_status(stream_fd, -1);
+                continue;
             }
-            ggml_backend_synchronize(backend);
             stream_status(stream_fd, 0);
             continue;
         }
