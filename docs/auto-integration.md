@@ -4,13 +4,15 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-27T22:46:08-04:00 through 2026-05-27T22:47:00-04:00
-Current stack tip before this refresh: `e414a87` (already aligned with `origin/main` `4f4d82e`; this run found no upstream-base advance and revalidated all open non-draft contributor PR heads with fresh fetches, ancestry checks, and direct merge probes).
+Last refresh: 2026-05-27T22:56:45-04:00 through 2026-05-27T22:56:45-04:00
+Current stack tip before this refresh: `a448139` (already aligned with `origin/main` `4f4d82e`; this run found no upstream-base advance and revalidated all open non-draft contributor PR heads with fresh fetches, ancestry checks, and direct merge probes).
 
 ## Included in the current stack
 
 | PR | Head branch | State | Notes |
 |---:|---|---|---|
+| #288 | `fix/laguna-chat-template` | included | Current head `5e8136a` is an ancestor of the refreshed stack. |
+| #287 | `feat/gemma4-timings` | included | Current head `b3163f4` is an ancestor of the refreshed stack. |
 | #284 | `fix/draft-safetensors-rope-theta` | included | Current head `697198a` is an ancestor of the refreshed stack. |
 | #276 | `fix/qwen36-claude-code-tool-calling` | included | Current head `0e3c79a` is an ancestor of the refreshed stack. |
 | #274 | `feat/pflash-drafter-ee7` | included | Current head `5037b28` is an ancestor of the refreshed stack. |
@@ -83,7 +85,7 @@ This run performed:
 - `git fetch --prune origin` and `git fetch --prune easel`.
 - `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...`.
 - Targeted fetches for all open non-draft PR refs (`origin/pr/<n>`).
-- `git merge-base --is-ancestor origin/pr/<n> easel/auto-integration` classification checks: #284, #276, #274, #266, #152, and #142 are current ancestors; #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39 remain non-ancestor/selective-port candidates.
+- `git merge-base --is-ancestor origin/pr/<n> easel/auto-integration` classification checks: #288, #287, #284, #276, #274, #266, #152, and #142 are current ancestors; #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39 remain non-ancestor/selective-port candidates.
 - Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260527-224700`; `git merge --no-edit origin/main` reported already up to date.
 - Fresh direct merge probes for all currently non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260527-224700.txt`.
 - `git diff --check -- docs/auto-integration.md` (clean).
@@ -95,7 +97,7 @@ Previous retained validation/audit details:
 - `git fetch --prune origin` and `git fetch --prune easel`.
 - `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...`.
 - Targeted fetches for all open non-draft PR refs (`origin/pr/<n>`).
-- `git merge-base --is-ancestor origin/pr/<n> easel/auto-integration` classification checks: #284, #276, #274, #266, #152, and #142 are current ancestors; #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39 remain non-ancestor/selective-port candidates.
+- `git merge-base --is-ancestor origin/pr/<n> easel/auto-integration` classification checks: #288, #287, #284, #276, #274, #266, #152, and #142 are current ancestors; #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39 remain non-ancestor/selective-port candidates.
 - Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260527-222142`; `git merge --no-edit origin/main` reported already up to date.
 - Fresh direct merge probes for all currently non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260527-222142.txt`.
 - Fresh isolated PR #39 conflicted worktree `/tmp/luce-attempt-pr39-20260527-222159`.
