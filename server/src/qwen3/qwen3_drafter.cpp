@@ -72,11 +72,110 @@ static float env_float(const char * name, float def) {
     return def;
 }
 
-static void force_chunk_neighborhood(std::vector<uint8_t> & forced, int n_chunks,
-                                     int chunk, int radius) {
-    int lo = std::max(0, chunk - radius);
-    int hi = std::min(n_chunks - 1, chunk + radius);
-    for (int c = lo; c <= hi; ++c) forced[(size_t)c] = 1;
+// All pflash/dflash compression knobs read from env, derived per-request.
+// anchor_radius and max_anchor_hits use an adaptive ladder keyed on n_chunks
+// to prevent the 64K NIAH cliff; see docs/pflash-compress-cfg.md.
+// Override any ladder value via PFLASH_COMPRESS_* env vars.
+struct CompressCfg {
+    int   query_tokens;
+    int   head_chunks;
+    int   tail_chunks;
+    dflash::qwen3::AnchorScanCfg anchor;
+    bool  use_transitive;
+    int   max_iters;
+};
+
+static CompressCfg compress_cfg_from_env(int n_chunks, int n_keep) {
+    CompressCfg c{};
+
+    c.query_tokens = env_int("DFLASH_COMPRESS_QUERY_TOKENS", 96);
+
+    // head/tail forced chunks scale so top-K scoring always gets slots
+    const int h_raw = env_int("DFLASH_COMPRESS_HEAD_CHUNKS", 8);
+    const int t_raw = env_int("DFLASH_COMPRESS_TAIL_CHUNKS", 24);
+    c.head_chunks = h_raw;
+    c.tail_chunks = t_raw;
+    if (c.head_chunks + c.tail_chunks >= n_keep) {
+        const int budget = std::max(1, n_keep - 1);
+        c.head_chunks = std::max(0, h_raw * budget / (h_raw + t_raw));
+        c.tail_chunks = std::max(0, budget - c.head_chunks);
+    }
+
+    // anchor_radius: adaptive ladder prevents 64K NIAH cliff
+    // (<32K=2, 32-64K=4, >=64K=8); override via PFLASH_COMPRESS_ANCHOR_RADIUS
+    {
+        const int env_r    = env_int("PFLASH_COMPRESS_ANCHOR_RADIUS", -1);
+        const int legacy_r = env_int("DFLASH_COMPRESS_ANCHOR_RADIUS", -1);
+        if      (env_r    >= 0)    c.anchor.anchor_radius = env_r;
+        else if (legacy_r >= 0)    c.anchor.anchor_radius = legacy_r;
+        else if (n_chunks <  1024) c.anchor.anchor_radius = 2;
+        else if (n_chunks <  2048) c.anchor.anchor_radius = 4;
+        else                       c.anchor.anchor_radius = 8;
+    }
+
+    // max_anchor_hits: same ladder — sparser anchors at long context
+    {
+        const int env_h    = env_int("PFLASH_COMPRESS_MAX_ANCHOR_HITS", -1);
+        const int legacy_h = env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", -1);
+        if      (env_h    >= 0)    c.anchor.max_anchor_hits = env_h;
+        else if (legacy_h >= 0)    c.anchor.max_anchor_hits = legacy_h;
+        else if (n_chunks <  1024) c.anchor.max_anchor_hits = 8;
+        else if (n_chunks <  2048) c.anchor.max_anchor_hits = 16;
+        else                       c.anchor.max_anchor_hits = 32;
+    }
+
+    c.anchor.ngram = [&]{
+        const int nv = env_int("PFLASH_COMPRESS_ANCHOR_NGRAM", -1);
+        const int lv = env_int("DFLASH_COMPRESS_ANCHOR_NGRAM", -1);
+        if (nv >= 0) return nv;
+        if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_ANCHOR_NGRAM deprecated, use PFLASH_COMPRESS_ANCHOR_NGRAM\n"); return lv; }
+        return 4;
+    }();
+
+    c.anchor.rare_token_max_freq = [&]{
+        const int nv = env_int("PFLASH_COMPRESS_RARE_MAX_FREQ", -1);
+        const int lv = env_int("DFLASH_COMPRESS_RARE_MAX_FREQ", -1);
+        if (nv >= 0) return nv;
+        if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_RARE_MAX_FREQ deprecated, use PFLASH_COMPRESS_RARE_MAX_FREQ\n"); return lv; }
+        return 2;
+    }();
+
+    const float cascade_min_anchor_frac = [&]{
+        const float nv = env_float("PFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC", -1.0f);
+        const float lv = env_float("DFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC", -1.0f);
+        if (nv >= 0.0f) return nv;
+        if (lv >= 0.0f) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC deprecated, use PFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC\n"); return lv; }
+        return 0.0f;
+    }();
+
+    const float max_forced_ratio = [&]{
+        const float nv = env_float("PFLASH_COMPRESS_MAX_FORCED_RATIO", -1.0f);
+        const float lv = env_float("DFLASH_COMPRESS_MAX_FORCED_RATIO", -1.0f);
+        if (nv >= 0.0f) return nv;
+        if (lv >= 0.0f) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_MAX_FORCED_RATIO deprecated, use PFLASH_COMPRESS_MAX_FORCED_RATIO\n"); return lv; }
+        return 10.0f;
+    }();
+
+    c.anchor.cascade_min_anchor_count = (int)(cascade_min_anchor_frac * n_keep);
+    c.anchor.max_forced_count         = (int)(max_forced_ratio * n_keep);
+
+    c.use_transitive = [&]{
+        const int nv = env_int("PFLASH_COMPRESS_ANCHOR_TRANSITIVE", -1);
+        const int lv = env_int("DFLASH_COMPRESS_ANCHOR_TRANSITIVE", -1);
+        if (nv >= 0) return nv != 0;
+        if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_ANCHOR_TRANSITIVE deprecated, use PFLASH_COMPRESS_ANCHOR_TRANSITIVE\n"); return lv != 0; }
+        return true;  // on by default; see docs/anchor-transitive.md
+    }();
+
+    c.max_iters = [&]{
+        const int nv = env_int("PFLASH_COMPRESS_ANCHOR_MAX_ITERS", -1);
+        const int lv = env_int("DFLASH_COMPRESS_ANCHOR_MAX_ITERS", -1);
+        if (nv >= 0) return nv;
+        if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_ANCHOR_MAX_ITERS deprecated, use PFLASH_COMPRESS_ANCHOR_MAX_ITERS\n"); return lv; }
+        return 3;
+    }();
+
+    return c;
 }
 
 #if defined(DFLASH27B_BACKEND_HIP)
@@ -126,30 +225,6 @@ const char * drafter_arch_name(DrafterArch arch) {
         case DrafterArch::Qwen35_0p8b: return "qwen35-0.8b";
     }
     return "unknown";
-}
-
-bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
-                  DrafterContext & out) {
-    return load_drafter(gguf_path, /*gpu_layers=*/999, /*gpu=*/0, out);
-}
-
-bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
-                  int gpu, DrafterContext & out) {
-    DrafterArch arch = DrafterArch::Qwen3_0p6b;
-    {
-        std::string lower = gguf_path;
-        for (auto & c : lower) c = (char)std::tolower((unsigned char)c);
-        if (lower.find("qwen3.5") != std::string::npos ||
-            lower.find("qwen35")  != std::string::npos) {
-            arch = DrafterArch::Qwen35_0p8b;
-        }
-    }
-    return load_drafter(gguf_path, /*gpu_layers=*/999, arch, gpu, out);
-}
-
-bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
-                  DrafterArch arch, DrafterContext & out) {
-    return load_drafter(gguf_path, /*gpu_layers=*/999, arch, /*gpu=*/0, out);
 }
 
 bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
@@ -239,6 +314,22 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
 #endif
 
     return true;
+}
+
+// Thin overloads for API compat; all forward to the canonical 4-arg form.
+bool load_drafter(const std::string & gguf_path, int gpu_layers,
+                  DrafterContext & out) {
+    return load_drafter(gguf_path, gpu_layers, DrafterArch::Qwen3_0p6b, /*gpu=*/0, out);
+}
+
+bool load_drafter(const std::string & gguf_path, int gpu_layers,
+                  int gpu, DrafterContext & out) {
+    return load_drafter(gguf_path, gpu_layers, DrafterArch::Qwen3_0p6b, gpu, out);
+}
+
+bool load_drafter(const std::string & gguf_path, int gpu_layers,
+                  DrafterArch arch, DrafterContext & out) {
+    return load_drafter(gguf_path, gpu_layers, arch, /*gpu=*/0, out);
 }
 
 void free_drafter(DrafterContext & ctx) {
@@ -522,24 +613,23 @@ static std::vector<int32_t> qwen35_score_and_compress(
 
     const int n_chunks = (S + chunk_size - 1) / chunk_size;
     const int n_keep = std::max(1, (int)((float)n_chunks * keep_ratio));
-    
-    std::vector<float> smooth_score = score;
-    // Caller pool_kernel takes precedence; if zero/negative, fall back to env or 5.
+
     const int pk = (pool_kernel > 0)
         ? pool_kernel
         : std::max(3, env_int("DFLASH_COMPRESS_POOL_KERNEL", 5));
-    std::vector<float> smoothed((size_t)S, 0.0f);
-    int half = pk / 2;
-    for (int j = 0; j < S; ++j) {
-        int lo = std::max(0, j - half);
-        int hi = std::min(S - 1, j + half);
-        float s = 0.0f;
-        int n = 0;
-        for (int k = lo; k <= hi; ++k) { s += score[(size_t)k]; ++n; }
-        smoothed[(size_t)j] = (n > 0) ? (s / (float)n) : 0.0f;
+    std::vector<float> smooth_score((size_t)S, 0.0f);
+    {
+        int half = pk / 2;
+        for (int j = 0; j < S; ++j) {
+            int lo = std::max(0, j - half);
+            int hi = std::min(S - 1, j + half);
+            float s = 0.0f;
+            int n = 0;
+            for (int k = lo; k <= hi; ++k) { s += score[(size_t)k]; ++n; }
+            smooth_score[(size_t)j] = (n > 0) ? (s / (float)n) : 0.0f;
+        }
     }
-    smooth_score.swap(smoothed);
-    
+
     std::vector<std::pair<float, int>> chunk_means;
     for (int c = 0; c < n_chunks; ++c) {
         int lo = c * chunk_size, hi = std::min(S, lo + chunk_size);
@@ -548,108 +638,24 @@ static std::vector<int32_t> qwen35_score_and_compress(
         chunk_means.push_back({s / std::max(1, hi - lo), c});
     }
     std::sort(chunk_means.begin(), chunk_means.end(), [](auto a, auto b) { return a.first > b.first; });
-    
+
+    const CompressCfg cfg = compress_cfg_from_env(n_chunks, n_keep);
+
     std::vector<uint8_t> selected((size_t)n_chunks, 0);
     int count = 0;
-    // Scale head/tail forced chunks so they don't crowd out top-K scoring.
-    {
-        const int h_raw = env_int("DFLASH_COMPRESS_HEAD_CHUNKS", 8);
-        const int t_raw = env_int("DFLASH_COMPRESS_TAIL_CHUNKS", 24);
-        int h_n = h_raw, t_n = t_raw;
-        if (h_n + t_n >= n_keep) {
-            const int budget = std::max(1, n_keep - 1);
-            h_n = std::max(0, h_raw * budget / (h_raw + t_raw));
-            t_n = std::max(0, budget - h_n);
-        }
-        for (int c = 0; c < std::min(n_chunks, h_n); ++c) { selected[(size_t)c] = 1; ++count; }
-        for (int c = std::max(0, n_chunks - t_n); c < n_chunks; ++c) if (!selected[(size_t)c]) { selected[(size_t)c] = 1; ++count; }
-    }
+    for (int c = 0; c < std::min(n_chunks, cfg.head_chunks); ++c) { selected[(size_t)c] = 1; ++count; }
+    for (int c = std::max(0, n_chunks - cfg.tail_chunks); c < n_chunks; ++c) if (!selected[(size_t)c]) { selected[(size_t)c] = 1; ++count; }
 
-    const int query_tokens        = env_int("DFLASH_COMPRESS_QUERY_TOKENS",   96);
-    // Anchor radius scales with n_chunks to prevent the 64K NIAH cliff:
-    // at long context the needle text is more likely to straddle multiple
-    // chunks, and a fixed radius=2 window (5 chunks ~160 tokens) loses the
-    // back half of the needle. Adaptive: <32K = 2, 32-64K = 4, >=64K = 8.
-    // Override via PFLASH_COMPRESS_ANCHOR_RADIUS env var (>= 0 wins).
-    int anchor_radius;
-    {
-        const int env_r = env_int("PFLASH_COMPRESS_ANCHOR_RADIUS", -1);
-        const int legacy_r = env_int("DFLASH_COMPRESS_ANCHOR_RADIUS", -1);
-        if (env_r >= 0)         anchor_radius = env_r;
-        else if (legacy_r >= 0) anchor_radius = legacy_r;
-        else if (n_chunks <  1024) anchor_radius = 2;
-        else if (n_chunks <  2048) anchor_radius = 4;
-        else                       anchor_radius = 8;
-    }
-    // max_anchor_hits scales the same way: at long context, distinctive
-    // anchors are sparser, so we can afford to keep more hits per qi.
-    int max_anchor_hits;
-    {
-        const int env_h = env_int("PFLASH_COMPRESS_MAX_ANCHOR_HITS", -1);
-        const int legacy_h = env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", -1);
-        if (env_h >= 0)         max_anchor_hits = env_h;
-        else if (legacy_h >= 0) max_anchor_hits = legacy_h;
-        else if (n_chunks <  1024) max_anchor_hits = 8;
-        else if (n_chunks <  2048) max_anchor_hits = 16;
-        else                       max_anchor_hits = 32;
-    }
-    const int anchor_ngram = [&]{
-        const int nv = env_int("PFLASH_COMPRESS_ANCHOR_NGRAM", -1);
-        const int lv = env_int("DFLASH_COMPRESS_ANCHOR_NGRAM", -1);
-        if (nv >= 0) return nv;
-        if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_ANCHOR_NGRAM set without PFLASH_COMPRESS_ANCHOR_NGRAM; honoring legacy name (deprecated)\n"); return lv; }
-        return 4;
-    }();
-    const int rare_token_max_freq = [&]{
-        const int nv = env_int("PFLASH_COMPRESS_RARE_MAX_FREQ", -1);
-        const int lv = env_int("DFLASH_COMPRESS_RARE_MAX_FREQ", -1);
-        if (nv >= 0) return nv;
-        if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_RARE_MAX_FREQ set without PFLASH_COMPRESS_RARE_MAX_FREQ; honoring legacy name (deprecated)\n"); return lv; }
-        return 2;
-    }();
-
-    const float cascade_min_anchor_frac = [&]{
-        const float nv = env_float("PFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC", -1.0f);
-        const float lv = env_float("DFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC", -1.0f);
-        if (nv >= 0.0f) return nv;
-        if (lv >= 0.0f) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC set without PFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC; honoring legacy name (deprecated)\n"); return lv; }
-        return 0.0f;  // gate off by default: always run cascade
-    }();
-    const float max_forced_ratio = [&]{
-        const float nv = env_float("PFLASH_COMPRESS_MAX_FORCED_RATIO", -1.0f);
-        const float lv = env_float("DFLASH_COMPRESS_MAX_FORCED_RATIO", -1.0f);
-        if (nv >= 0.0f) return nv;
-        if (lv >= 0.0f) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_MAX_FORCED_RATIO set without PFLASH_COMPRESS_MAX_FORCED_RATIO; honoring legacy name (deprecated)\n"); return lv; }
-        return 10.0f;  // generous cap: allows bridge to rescue multi-hop (original: ~6x n_keep)
-    }();
-
-    const int q0 = std::max(0, S - query_tokens);
+    const int q0 = std::max(0, S - cfg.query_tokens);
     std::vector<int32_t> query_pool(ids.begin() + q0, ids.end());
     std::vector<uint8_t> forced((size_t)n_chunks, 0);
 
-    dflash::qwen3::AnchorScanCfg anchor_cfg{chunk_size, anchor_radius,
-                                             max_anchor_hits, anchor_ngram,
-                                             rare_token_max_freq};
-    anchor_cfg.cascade_min_anchor_count = (int)(cascade_min_anchor_frac * n_keep);
-    anchor_cfg.max_forced_count         = (int)(max_forced_ratio * n_keep);
+    dflash::qwen3::AnchorScanCfg anchor_cfg = cfg.anchor;
+    anchor_cfg.chunk_size = chunk_size;
 
-    const bool use_transitive = [&]{
-        const int nv = env_int("PFLASH_COMPRESS_ANCHOR_TRANSITIVE", -1);
-        const int lv = env_int("DFLASH_COMPRESS_ANCHOR_TRANSITIVE", -1);
-        if (nv >= 0) return nv != 0;
-        if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_ANCHOR_TRANSITIVE set without PFLASH_COMPRESS_ANCHOR_TRANSITIVE; honoring legacy name (deprecated)\n"); return lv != 0; }
-        return true;  // on by default: gated rare-token bridge improves multi-hop F1
-    }();
-    const int  max_iters = [&]{
-        const int nv = env_int("PFLASH_COMPRESS_ANCHOR_MAX_ITERS", -1);
-        const int lv = env_int("DFLASH_COMPRESS_ANCHOR_MAX_ITERS", -1);
-        if (nv >= 0) return nv;
-        if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_ANCHOR_MAX_ITERS set without PFLASH_COMPRESS_ANCHOR_MAX_ITERS; honoring legacy name (deprecated)\n"); return lv; }
-        return 3;
-    }();
-    if (use_transitive) {
+    if (cfg.use_transitive) {
         dflash::qwen3::scan_and_force_transitive(ids, q0, query_pool,
-                                                  anchor_cfg, max_iters, forced);
+                                                  anchor_cfg, cfg.max_iters, forced);
     } else {
         dflash::qwen3::scan_and_force(ids, q0, query_pool, anchor_cfg, forced);
     }
@@ -661,16 +667,14 @@ static std::vector<int32_t> qwen35_score_and_compress(
         }
     }
 
-    // Global aggregation tasks often depend on repeated rare tokens that do
-    // not appear in the final query. Preserve high-frequency-but-not-filler
-    // token chunks before filling with model-score top-K.
+    // Global aggregation tasks: preserve high-frequency-but-not-filler token chunks.
     const int repeat_min = env_int("DFLASH_COMPRESS_REPEAT_MIN", 4);
     const int repeat_max = env_int("DFLASH_COMPRESS_REPEAT_MAX", 32);
     const int repeat_limit = env_int("DFLASH_COMPRESS_REPEAT_CHUNKS", n_keep);
     if (repeat_min > 1 && count < repeat_limit) {
         std::unordered_map<int32_t, int> freq;
         freq.reserve((size_t)S);
-        const int repeat_scan_end = std::max(0, S - query_tokens);
+        const int repeat_scan_end = std::max(0, S - cfg.query_tokens);
         for (int j = 0; j < repeat_scan_end; ++j) {
             ++freq[ids[(size_t)j]];
         }
@@ -698,12 +702,12 @@ static std::vector<int32_t> qwen35_score_and_compress(
             }
         }
     }
-    
+
     for (auto [_, c] : chunk_means) {
         if (count >= n_keep) break;
         if (!selected[(size_t)c]) { selected[(size_t)c] = 1; ++count; }
     }
-    
+
     std::vector<int32_t> out_ids;
     std::vector<int> selected_chunks;
     for (int c = 0; c < n_chunks; ++c) {
@@ -807,110 +811,25 @@ std::vector<int32_t> drafter_score_and_compress(
     std::sort(chunk_means.begin(), chunk_means.end(),
                       [](auto a, auto b) { return a.first > b.first; });
 
-    // Retrieval tasks often repeat a rare key in the final query and in the
-    // needle span. Exact scores alone can keep the query while dropping the
-    // neighboring answer chunk, so force a small token-only anchor neighborhood.
-    // Head/tail forced chunks scale with n_keep so top-K scoring always gets slots.
-    const int h_raw = env_int("DFLASH_COMPRESS_HEAD_CHUNKS", 8);
-    const int t_raw = env_int("DFLASH_COMPRESS_TAIL_CHUNKS", 24);
-    int head_chunks = h_raw, tail_chunks = t_raw;
-    if (head_chunks + tail_chunks >= n_keep) {
-        const int budget = std::max(1, n_keep - 1);
-        head_chunks = std::max(0, h_raw * budget / (h_raw + t_raw));
-        tail_chunks = std::max(0, budget - head_chunks);
-    }
-    const int query_tokens        = env_int("DFLASH_COMPRESS_QUERY_TOKENS",   96);
-    // Anchor radius scales with n_chunks to prevent the 64K NIAH cliff:
-    // at long context the needle text is more likely to straddle multiple
-    // chunks, and a fixed radius=2 window (5 chunks ~160 tokens) loses the
-    // back half of the needle. Adaptive: <32K = 2, 32-64K = 4, >=64K = 8.
-    // Override via PFLASH_COMPRESS_ANCHOR_RADIUS env var (>= 0 wins).
-    int anchor_radius;
-    {
-        const int env_r = env_int("PFLASH_COMPRESS_ANCHOR_RADIUS", -1);
-        const int legacy_r = env_int("DFLASH_COMPRESS_ANCHOR_RADIUS", -1);
-        if (env_r >= 0)         anchor_radius = env_r;
-        else if (legacy_r >= 0) anchor_radius = legacy_r;
-        else if (n_chunks <  1024) anchor_radius = 2;
-        else if (n_chunks <  2048) anchor_radius = 4;
-        else                       anchor_radius = 8;
-    }
-    // max_anchor_hits scales the same way: at long context, distinctive
-    // anchors are sparser, so we can afford to keep more hits per qi.
-    int max_anchor_hits;
-    {
-        const int env_h = env_int("PFLASH_COMPRESS_MAX_ANCHOR_HITS", -1);
-        const int legacy_h = env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", -1);
-        if (env_h >= 0)         max_anchor_hits = env_h;
-        else if (legacy_h >= 0) max_anchor_hits = legacy_h;
-        else if (n_chunks <  1024) max_anchor_hits = 8;
-        else if (n_chunks <  2048) max_anchor_hits = 16;
-        else                       max_anchor_hits = 32;
-    }
-    const int anchor_ngram = [&]{
-        const int nv = env_int("PFLASH_COMPRESS_ANCHOR_NGRAM", -1);
-        const int lv = env_int("DFLASH_COMPRESS_ANCHOR_NGRAM", -1);
-        if (nv >= 0) return nv;
-        if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_ANCHOR_NGRAM set without PFLASH_COMPRESS_ANCHOR_NGRAM; honoring legacy name (deprecated)\n"); return lv; }
-        return 4;
-    }();
-    const int rare_token_max_freq = [&]{
-        const int nv = env_int("PFLASH_COMPRESS_RARE_MAX_FREQ", -1);
-        const int lv = env_int("DFLASH_COMPRESS_RARE_MAX_FREQ", -1);
-        if (nv >= 0) return nv;
-        if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_RARE_MAX_FREQ set without PFLASH_COMPRESS_RARE_MAX_FREQ; honoring legacy name (deprecated)\n"); return lv; }
-        return 2;
-    }();
-
-    const float cascade_min_anchor_frac = [&]{
-        const float nv = env_float("PFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC", -1.0f);
-        const float lv = env_float("DFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC", -1.0f);
-        if (nv >= 0.0f) return nv;
-        if (lv >= 0.0f) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC set without PFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC; honoring legacy name (deprecated)\n"); return lv; }
-        return 0.0f;  // gate off by default: always run cascade
-    }();
-    const float max_forced_ratio = [&]{
-        const float nv = env_float("PFLASH_COMPRESS_MAX_FORCED_RATIO", -1.0f);
-        const float lv = env_float("DFLASH_COMPRESS_MAX_FORCED_RATIO", -1.0f);
-        if (nv >= 0.0f) return nv;
-        if (lv >= 0.0f) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_MAX_FORCED_RATIO set without PFLASH_COMPRESS_MAX_FORCED_RATIO; honoring legacy name (deprecated)\n"); return lv; }
-        return 10.0f;  // generous cap: allows bridge to rescue multi-hop (original: ~6x n_keep)
-    }();
+    const CompressCfg cfg = compress_cfg_from_env(n_chunks, n_keep);
 
     std::vector<uint8_t> selected_mask((size_t)n_chunks, 0);
     std::vector<uint8_t> forced((size_t)n_chunks, 0);
-    for (int c = 0; c < std::min(n_chunks, head_chunks); ++c) forced[(size_t)c] = 1;
-    for (int c = std::max(0, n_chunks - tail_chunks); c < n_chunks; ++c) forced[(size_t)c] = 1;
+    for (int c = 0; c < std::min(n_chunks, cfg.head_chunks); ++c) forced[(size_t)c] = 1;
+    for (int c = std::max(0, n_chunks - cfg.tail_chunks); c < n_chunks; ++c) forced[(size_t)c] = 1;
 
-    const int q0 = std::max(0, S - query_tokens);
+    const int q0 = std::max(0, S - cfg.query_tokens);
     {
         std::vector<int32_t> query_pool(ids.begin() + q0, ids.end());
-        dflash::qwen3::AnchorScanCfg anchor_cfg{chunk_size, anchor_radius,
-                                                 max_anchor_hits, anchor_ngram,
-                                                 rare_token_max_freq};
-        anchor_cfg.cascade_min_anchor_count = (int)(cascade_min_anchor_frac * n_keep);
-        anchor_cfg.max_forced_count         = (int)(max_forced_ratio * n_keep);
-        std::fprintf(stderr, "[drafter_cascade] n_keep=%d max_forced=%d min_anchor=%d ratio=%.2f\n",
-            n_keep, anchor_cfg.max_forced_count, anchor_cfg.cascade_min_anchor_count, max_forced_ratio);
+        dflash::qwen3::AnchorScanCfg anchor_cfg = cfg.anchor;
+        anchor_cfg.chunk_size = chunk_size;
+        std::fprintf(stderr, "[drafter_cascade] n_keep=%d max_forced=%d min_anchor=%d\n",
+            n_keep, anchor_cfg.max_forced_count, anchor_cfg.cascade_min_anchor_count);
         std::fflush(stderr);
 
-        const bool use_transitive = [&]{
-            const int nv = env_int("PFLASH_COMPRESS_ANCHOR_TRANSITIVE", -1);
-            const int lv = env_int("DFLASH_COMPRESS_ANCHOR_TRANSITIVE", -1);
-            if (nv >= 0) return nv != 0;
-            if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_ANCHOR_TRANSITIVE set without PFLASH_COMPRESS_ANCHOR_TRANSITIVE; honoring legacy name (deprecated)\n"); return lv != 0; }
-            return true;  // on by default: gated rare-token bridge improves multi-hop F1
-        }();
-        const int  max_iters = [&]{
-            const int nv = env_int("PFLASH_COMPRESS_ANCHOR_MAX_ITERS", -1);
-            const int lv = env_int("DFLASH_COMPRESS_ANCHOR_MAX_ITERS", -1);
-            if (nv >= 0) return nv;
-            if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_ANCHOR_MAX_ITERS set without PFLASH_COMPRESS_ANCHOR_MAX_ITERS; honoring legacy name (deprecated)\n"); return lv; }
-            return 3;
-        }();
-        if (use_transitive) {
+        if (cfg.use_transitive) {
             dflash::qwen3::scan_and_force_transitive(ids, q0, query_pool,
-                                                      anchor_cfg, max_iters, forced);
+                                                      anchor_cfg, cfg.max_iters, forced);
         } else {
             dflash::qwen3::scan_and_force(ids, q0, query_pool, anchor_cfg, forced);
         }
