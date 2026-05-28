@@ -92,8 +92,8 @@ Download models before running the server:
 # Target model (Q4_K_M quantized Qwen3.6-27B)
 hf download <repo-id> --local-dir server/models/
 
-# Draft model (1.84 GB default Qwen3.6 GGUF draft)
-hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q8_0.gguf --local-dir server/models/draft/
+# Draft model (0.98 GB default Qwen3.6 GGUF draft)
+hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf --local-dir server/models/draft/
 ```
 
 Expected layout:
@@ -102,7 +102,7 @@ Expected layout:
 server/models/
 ├── Qwen3.6-27B-Q4_K_M.gguf          # --target (GGUF)
 └── draft/
-    └── dflash-draft-3.6-q8_0.gguf     # --draft  (GGUF)
+    └── dflash-draft-3.6-q4_k_m.gguf   # --draft  (GGUF)
 ```
 
 The target path can also be set via the `DFLASH_TARGET` environment variable.
@@ -159,12 +159,12 @@ cd server/build
 
 # Numerics tests
 ./test_vs_oracle --target ../models/Qwen3.6-27B-Q4_K_M.gguf \
-                 --draft ../models/draft/dflash-draft-3.6-q8_0.gguf
+                 --draft ../models/draft/dflash-draft-3.6-q4_k_m.gguf
 
 # Smoke tests
 ./smoke_load_target --target ../models/Qwen3.6-27B-Q4_K_M.gguf
-./smoke_load_draft --draft ../models/draft/dflash-draft-3.6-q8_0.gguf
-./smoke_draft_graph --draft ../models/draft/dflash-draft-3.6-q8_0.gguf
+./smoke_load_draft --draft ../models/draft/dflash-draft-3.6-q4_k_m.gguf
+./smoke_draft_graph --draft ../models/draft/dflash-draft-3.6-q4_k_m.gguf
 ```
 
 ### Integration tests (require running server)
@@ -200,7 +200,7 @@ server/
 │   └── Block-Sparse-Attention/ # BSA kernels (submodule)
 ├── models/                     # Model files (not in git)
 │   ├── Qwen3.6-27B-Q4_K_M.gguf
-│   └── draft/dflash-draft-3.6-q8_0.gguf
+│   └── draft/dflash-draft-3.6-q4_k_m.gguf
 ├── scripts/
 │   ├── run.py                  # CLI text generation
 │   ├── test_server_prefix_cache.py    # Integration test (--url or auto-spawn)

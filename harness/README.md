@@ -53,7 +53,7 @@ paths and profile:
 ```bash
 DFLASH_SERVER_BIN=server/build/dflash_server \
 TARGET=server/models/Qwen3.6-27B-Q4_K_M.gguf \
-DRAFT=server/models/draft/dflash-draft-3.6-q8_0.gguf \
+DRAFT=server/models/draft/dflash-draft-3.6-q4_k_m.gguf \
 MODEL_ID=luce-dflash \
 MAX_CTX=32768 MAX_TOKENS=512 \
 BUDGET=22 VERIFY_MODE=ddtree FA_WINDOW=2048 \
@@ -64,7 +64,7 @@ To test an already-running native server:
 
 ```bash
 server/build/dflash_server server/models/Qwen3.6-27B-Q4_K_M.gguf \
-  --draft server/models/draft/dflash-draft-3.6-q8_0.gguf \
+  --draft server/models/draft/dflash-draft-3.6-q4_k_m.gguf \
   --host 127.0.0.1 --port 18080 \
   --max-ctx 32768 --max-tokens 512 \
   --fa-window 2048 \

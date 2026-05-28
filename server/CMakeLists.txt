@@ -428,7 +428,10 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
         target_compile_definitions(dflash_common PRIVATE
             DFLASH27B_HAVE_CUDA_SCALAR_FLASHPREFILL=1
             DFLASH27B_HAVE_PASCAL_FLASHPREFILL=1)
-        # Scalar Pascal kernels only target sm_60-69.
+        # Best-effort narrowing for CMake versions/toolchains that honor
+        # per-source CUDA_ARCHITECTURES; flashprefill_scalar.cu also keeps
+        # its kernels visible in newer arch passes so default fatbinary builds
+        # do not end up with host launchers but missing device symbols.
         set_source_files_properties(src/flashprefill_scalar.cu PROPERTIES
             CUDA_ARCHITECTURES "60;61;62")
     endif()
