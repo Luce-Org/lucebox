@@ -100,6 +100,10 @@ struct GenerateRequest {
     const std::vector<int32_t> * hint_tokens = nullptr;
     // Optional thinking-budget hook — see BudgetHook docs above.
     BudgetHook                 budget_hook;
+    // Per-request override for target spec-decode verify fa_window. Set by
+    // http_server when pflash compresses, so verify sees the entire compressed
+    // prompt (not just the last cfg_.fa_window positions). Zero = no override.
+    int                        fa_window_override = 0;
 };
 
 struct GenerateResult {
