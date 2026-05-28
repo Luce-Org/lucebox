@@ -1009,7 +1009,6 @@ bool eval_qwen35moe_hybrid_ffn_batched(
         ggml_set_output(hot_output);
         ggml_build_forward_expand(hot_gf, hot_output);
         hot_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu_backend));
-
         if (!ggml_gallocr_alloc_graph(hot_alloc, hot_gf)) {
             if (err) *err = "hybrid batched hot gallocr failed";
             ggml_gallocr_free(hot_alloc); ggml_free(hot_ctx);

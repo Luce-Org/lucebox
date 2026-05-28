@@ -1,5 +1,4 @@
 #include "qwen35moe_backend.h"
-#include "qwen35moe_pipelined_decode.h"
 
 #include "common/sampler.h"
 #include "common/dflash_spec_decode.h"
@@ -282,7 +281,6 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
     const int vocab  = target_weights().n_vocab;
     std::vector<float> logits_buf((size_t)vocab);
     std::vector<float> act_cur((size_t)hidden);
-    const auto decode_t0 = HybridClock::now();
 
     // Persistent logits graph (built once, reused per token)
     StepGraph logits_sg;
@@ -338,9 +336,6 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
         return false;
     }
 
-    uint64_t hot_selected_total = 0;
-    uint64_t cold_selected_total = 0;
-
     for (int step = 1; step < n_gen; ++step) {
         int32_t tok = out_tokens.back();
         if (!target_weights().embedder.embed(&tok, 1, act_cur.data())) {
@@ -349,18 +344,10 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
         ggml_backend_tensor_set(pipe_state_->gpu_state.act_cur, act_cur.data(), 0,
                                 sizeof(float) * (size_t)hidden);
 
-        PipelinedDecodeTelemetry tel;
         if (!pipelined_decode_one_token(*pipe_state_, target_backend(), target_weights(),
                                         target_cache(), *target_weights().moe_hybrid,
-                                        committed, cfg_.kq_stride_pad,
-                                        hybrid_telemetry_ ? &tel : nullptr)) {
+                                        committed, cfg_.kq_stride_pad, nullptr)) {
             return false;
-        }
-
-        if (hybrid_telemetry_) {
-            hot_selected_total += (uint64_t)tel.allhot_layers * target_weights().n_expert_used
-                                  + (uint64_t)(tel.mixed_layers * target_weights().n_expert_used - tel.mixed_layers);
-            cold_selected_total += (uint64_t)tel.mixed_layers;
         }
 
         ggml_backend_tensor_get(pipe_state_->gpu_state.act_cur, act_cur.data(), 0,
@@ -392,16 +379,6 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
         if (is_eos_tok(next_tok, target_weights())) break;
     }
 
-    last_hot_selected_ = hot_selected_total;
-    last_cold_selected_ = cold_selected_total;
-    std::printf("[qwen35moe] pipelined decode stats: hot_selected=%llu cold_selected=%llu\n",
-                (unsigned long long)last_hot_selected_,
-                (unsigned long long)last_cold_selected_);
-    if (hybrid_telemetry_) {
-        const uint64_t decode_us = elapsed_us(decode_t0, HybridClock::now());
-        std::printf("[qwen35moe] pipelined telemetry: total_decode_ms=%.2f\n",
-                    decode_us / 1000.0);
-    }
     step_graph_destroy(logits_sg);
     return true;
 }
