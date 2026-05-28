@@ -548,6 +548,19 @@ int HttpServer::run() {
         return 1;
     }
 
+    // Non-blocking listen socket so the accept loop polls stopping_ on a short
+    // timeout. This guarantees the loop exits on SIGTERM/SIGINT regardless of
+    // which thread the signal handler runs on (it only sets the atomic flag).
+    {
+        int fl = fcntl(listen_fd_, F_GETFL, 0);
+        if (fl < 0 || fcntl(listen_fd_, F_SETFL, fl | O_NONBLOCK) < 0) {
+            std::fprintf(stderr, "[server] fcntl(O_NONBLOCK) failed: %s\n", strerror(errno));
+            ::close(listen_fd_);
+            listen_fd_ = -1;
+            return 1;
+        }
+    }
+
     std::fprintf(stderr, "[server] listening on http://%s:%d\n",
                  config_.host.c_str(), config_.port);
 
@@ -556,12 +569,22 @@ int HttpServer::run() {
 
     // Accept loop.
     while (!stopping_.load()) {
+        struct pollfd pfd{listen_fd_, POLLIN, 0};
+        int pr = poll(&pfd, 1, 200 /* ms */);
+        if (pr <= 0) {
+            // 0 = timeout (re-check stopping_); <0 with EINTR = signal. Both loop.
+            if (pr < 0 && errno != EINTR) {
+                std::fprintf(stderr, "[server] poll() error: %s\n", strerror(errno));
+            }
+            continue;
+        }
+
         struct sockaddr_in client_sa{};
         socklen_t client_len = sizeof(client_sa);
         int client_fd = accept(listen_fd_, (struct sockaddr *)&client_sa, &client_len);
         if (client_fd < 0) {
             if (stopping_.load()) break;
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
             std::fprintf(stderr, "[server] accept() error: %s\n", strerror(errno));
             continue;
         }
@@ -584,10 +607,20 @@ int HttpServer::run() {
     // Wake the worker thread so it can observe stopping_ and exit.
     queue_cv_.notify_all();
 
-    // Wait for all client threads to finish.
+    // Wait for client threads to drain, but bound it: a client mid-stream (long
+    // SSE generation) must not hold the process resident on shutdown. After the
+    // grace period we proceed — detached client threads are torn down on exit.
     {
         std::unique_lock<std::mutex> lk(clients_mu_);
-        clients_cv_.wait(lk, [this]() { return active_clients_.load() == 0; });
+        bool drained = clients_cv_.wait_for(
+            lk, std::chrono::seconds(5),
+            [this]() { return active_clients_.load() == 0; });
+        if (!drained) {
+            std::fprintf(stderr,
+                         "[server] shutdown: %d client thread(s) still active "
+                         "after grace period, exiting anyway\n",
+                         active_clients_.load());
+        }
     }
 
     // Wait for worker to finish.
