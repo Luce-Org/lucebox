@@ -360,7 +360,8 @@ std::string render_chat_template_jinja(
     const std::string & eos_token,
     bool add_generation_prompt,
     bool enable_thinking,
-    const std::string & tools_json)
+    const std::string & tools_json,
+    ChatFormat arch_hint)
 {
     if (template_src.empty()) {
         throw std::runtime_error("render_chat_template_jinja: template_src is empty");
@@ -413,12 +414,14 @@ std::string render_chat_template_jinja(
         auto parts = jinja::runtime::gather_string_parts(results);
         std::string rendered = parts->as_string().str();
 
-        // The hard-coded Qwen renderer appends a closed think prefill when
-        // thinking is disabled. Some Qwen3.6 Jinja templates omit that final
-        // assistant suffix, which leaves the model in the wrong decoding state
-        // for tool use. Mirror the hard-coded behavior here when the rendered
-        // prompt ends with a bare assistant generation prompt.
-        if (!enable_thinking) {
+        // Qwen3/3.5/3.6 only: the hard-coded renderer appends a closed think
+        // prefill when thinking is disabled. Some Qwen3.6 Jinja templates omit
+        // that final assistant suffix, leaving the model in the wrong decoding
+        // state for tool use. Mirror the hard-coded behavior here when the
+        // rendered prompt ends with a bare assistant generation prompt.
+        // Other architectures (Laguna, Gemma4, ...) do not use ChatML tokens
+        // and must not be touched here.
+        if (arch_hint == ChatFormat::QWEN3 && !enable_thinking) {
             // Tolerate template variants that emit extra trailing whitespace
             // after the assistant marker (single \n, double \n\n, trailing
             // space). Strategy: trim trailing whitespace, check for the BARE

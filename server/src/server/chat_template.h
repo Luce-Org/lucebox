@@ -63,6 +63,8 @@ ChatFormat chat_format_for_arch(const std::string & arch);
 //                {{bos_token}} / {{eos_token}}). Use empty strings if unknown.
 // `tools_json`   optional JSON array of tool definitions; when non-empty it
 //                is parsed and injected as `tools` into the template context.
+// `arch_hint`    model architecture (controls arch-specific post-processing;
+//                the closed-think prefill injection is Qwen3/3.5/3.6 only).
 //
 // Internally caches the most recently parsed program per thread (avoids
 // re-parsing the template on every request). Throws std::runtime_error on
@@ -74,6 +76,7 @@ std::string render_chat_template_jinja(
     const std::string & eos_token,
     bool add_generation_prompt = true,
     bool enable_thinking = false,
-    const std::string & tools_json = "");
+    const std::string & tools_json = "",
+    ChatFormat arch_hint = ChatFormat::QWEN3);
 
 }  // namespace dflash::common

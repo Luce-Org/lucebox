@@ -1000,7 +1000,8 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                     eos_str,
                     /*add_generation_prompt=*/true,
                     enable_thinking,
-                    tools_json);
+                    tools_json,
+                    chat_format_);
             } catch (const std::exception & e) {
                 send_error(fd, 500,
                     std::string("chat template (jinja) render failed: ") + e.what());
