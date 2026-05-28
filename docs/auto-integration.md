@@ -4,19 +4,17 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T03:23:00-04:00
+Last refresh: 2026-05-28T03:26:00-04:00
 Current base: `origin/main` `4f4d82e`
-Current integration tip before this refresh: `easel/auto-integration` `577f2f1`
+Current integration tip before this refresh: `easel/auto-integration` `2c408f9`
 
 This branch is maintained as a reproducible patch stack over `origin/main`. The
-primary checkout was clean at the start of this unattended run. This refresh
-merged two newly non-draft/current contributor PRs into the stack in dependency
-order: #265 (`target-layer-split` backend adapter path) first, then #273
-(Gemma4 target-layer-split adapter). Upstream `origin/main` was already merged
-into the previous stack, so the source change this run is limited to those two
-PR merges plus this manifest refresh. Remaining old-layout/non-ancestor PRs were
-re-probed after #265/#273; direct merge still conflicts and the prior
-selective-port notes remain the reference for future work.
+primary checkout was clean at the start of this unattended run. No new open
+non-draft contributor PR heads appeared since the previous refresh, and every
+current non-draft PR that is mechanically current remains integrated. Upstream
+`origin/main` was already merged into the stack. Remaining old-layout/non-ancestor
+PRs were re-probed in an isolated worktree; direct merge still conflicts and the
+prior selective-port notes remain the reference for future work.
 
 ## Included in the current stack
 
@@ -45,10 +43,9 @@ carried.
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| upstream sync | checked | In isolated worktree `/tmp/luce-auto-cron-20260528-031117`, `git merge --no-edit origin/main` reported `Already up to date.` |
-| #265 | integrated | Clean merge into the reconciliation worktree. |
-| #273 | integrated | Clean merge after #265. |
-| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges after #265/#273 for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every direct probe conflicted and was aborted in the isolated worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-031117.txt`. |
+| upstream sync | checked | In isolated worktree `/tmp/luce-auto-cron-20260528-032612`, `git merge --no-edit origin/main` reported `Already up to date.` |
+| current integrated PRs | checked | Current heads for #284, #276, #274, #273, #266, #265, #152, and #142 are ancestors of the refreshed stack. |
+| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every direct probe conflicted and was aborted in the isolated worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-032612.txt`. |
 
 ## Prior probe results (retained)
 
@@ -87,7 +84,7 @@ remains partially carried only as an integration dependency.
 
 This run performed:
 
-- `date -Is` -> 2026-05-28T03:10:22-04:00 during preflight.
+- `date -Is` -> 2026-05-28T03:25:23-04:00 during preflight.
 - Primary checkout `git status --short` was clean before work began and stayed clean while probing in worktrees.
 - `git remote -v` verified `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
 - `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status` succeeded for account `easel`.
@@ -95,19 +92,18 @@ This run performed:
 - `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --version` succeeded (`codex-cli 0.130.0`).
 - `git fetch --prune origin` and `git fetch --prune easel` completed; targeted fetches recreated current open non-draft PR refs.
 - `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...` enumerated all open PRs.
-- `git merge-base --is-ancestor origin/pr/<n> <stack>` classification checks before this run showed #273 and #265 were the only open non-draft heads not yet integrated and mechanically current; both are included by this refresh.
-- Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260528-031117`; `git merge --no-edit origin/main` reported already up to date.
-- Merged #265 and #273 cleanly in that order.
-- Fresh direct merge probes for remaining non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260528-031117.txt`.
+- `git merge-base --is-ancestor origin/pr/<n> HEAD` classification showed #284, #276, #274, #273, #266, #265, #152, and #142 are current integrated non-draft heads.
+- Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260528-032612`; `git merge --no-edit origin/main` reported already up to date.
+- Fresh direct merge probes for remaining non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260528-032612.txt`.
 - `git diff --check origin/main...HEAD` reported only pre-existing whitespace warnings in `luce-bench/src/lucebench/fixtures/forge_eval/scenarios/_model_quality.py` and `_stateful_model_quality.py`.
-- `git diff --check 577f2f1..HEAD` passed for this run's new source changes.
-- Search for exact merge conflict markers (`^(<<<<<<<|=======|>>>>>>>)`) under the worktree returned no results.
-- `cmake -S server -B /tmp/luce-build-20260528-031117 -DLUCE_BUILD_TESTS=ON` still fails before project compilation in this WSL CUDA setup because compiler identification selects unsupported `sm_52` (`ptxas fatal: Value 'sm_52' is not defined for option 'gpu-name'`). Passing `-DCMAKE_CUDA_ARCHITECTURES=86` did not affect the compiler-identification failure.
+- `git diff --check 2c408f9..HEAD` passed for this run's manifest-only change.
+- Search for exact merge conflict markers (`^(<<<<<<<|=======|>>>>>>>)`) under the primary checkout returned no results.
+- `cmake -S server -B /tmp/luce-build-20260528-031117 -DLUCE_BUILD_TESTS=ON` was not rerun this cycle; the prior same-day result remains the current environment blocker: local WSL CUDA compiler identification selects unsupported `sm_52` (`ptxas fatal: Value 'sm_52' is not defined for option 'gpu-name'`).
 
 ## Notes
 
 - Primary checkout `/home/erik/Projects/luce2` stayed clean during probing and was modified only after the verified refresh was ready.
-- Retained worktree `/tmp/luce-auto-cron-20260528-031117` for direct-merge probe audit until the pushed branch is reviewed.
-- Retained direct-probe log `/tmp/luce-merge-probes-20260528-031117.txt`.
-- Retained CMake configure directories `/tmp/luce-build-20260528-031117` and `/tmp/luce-build-20260528-031117-sm86` for inspection of the local CUDA compiler-identification failure.
+- Retained worktree `/tmp/luce-auto-cron-20260528-032612` for direct-merge probe audit until the pushed branch is reviewed.
+- Retained direct-probe log `/tmp/luce-merge-probes-20260528-032612.txt`.
+- Retained earlier worktree `/tmp/luce-auto-cron-20260528-031117`, direct-probe log `/tmp/luce-merge-probes-20260528-031117.txt`, and CMake configure directories `/tmp/luce-build-20260528-031117` and `/tmp/luce-build-20260528-031117-sm86` for inspection.
 - Prior retained conflicted worktrees and agent reports remain as listed in earlier manifest revisions; cleanup is separate maintenance.
