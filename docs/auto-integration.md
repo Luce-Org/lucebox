@@ -84,7 +84,7 @@ remains partially carried only as an integration dependency.
 This run performed:
 
 - `date -Is` -> 2026-05-28T15:47:19-04:00 at preflight.
-- Primary checkout `/home/erik/Projects/luce2` was clean at preflight (`git status --short` returned no paths), on local branch `auto-integration`, with remotes `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
+- Primary checkout `/home/erik/Projects/luce2` was clean at preflight (`git status --short` returned no paths), on local branch `auto-integration`, with remotes `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`. A later #237 delegated setup command was accidentally launched from the primary checkout; its conflicted merge state was immediately aborted with `git merge --abort`, and a follow-up `git status --short` returned clean.
 - `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status` succeeded for account `easel` with repo/workflow scopes.
 - `HOME=/home/erik /home/erik/.local/bin/claude auth status --text` succeeded for the Claude Team account.
 - `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --help` succeeded.
@@ -98,6 +98,6 @@ This run performed:
 
 ## Notes
 
-- Primary checkout `/home/erik/Projects/luce2` was left untouched and remains behind fetched `easel/auto-integration`; the pushed branch is the source of truth.
+- Primary checkout `/home/erik/Projects/luce2` is clean again and remains behind fetched `easel/auto-integration`; the pushed branch is the source of truth.
 - Retained worktrees/logs from this run: `/tmp/luce-auto-cron-20260528-1547`, `/tmp/luce-probe-20260528-1547`, `/tmp/luce-pr237-delegated-20260528-1547`, `/tmp/luce-merge-probes-20260528-1547.txt`, `/tmp/claude-pr237-1547-report.txt`, and `/tmp/codex-pr237-1547-report.txt`.
 - Prior retained worktrees, probe logs, agent reports, and configure directories remain as listed in earlier manifest revisions; cleanup is separate maintenance.
