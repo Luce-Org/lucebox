@@ -3420,10 +3420,20 @@ int main(int argc, char ** argv) {
             T_verify_compute = sync_us();
             tt_verify_compute += std::chrono::duration<double, std::micro>(T_verify_compute - T_verify_set).count();
 
-            // Read only the actual tree slots (not padding)
+            // DDTree test mode reads full logits and computes posterior on
+            // CPU. The GPU argmax shortcut has returned -1 for tree-shaped
+            // verify graphs on some builds, which makes the harness stop
+            // after the root even though logits are valid. This is test-only;
+            // server decode paths are unaffected.
             std::vector<int32_t> posterior(N_actual);
-            ggml_backend_tensor_get(sg.argmax_tokens, posterior.data(), 0,
-                                    sizeof(int32_t) * N_actual);
+            ggml_backend_tensor_get(sg.logits, verify_logits_buf.data(), 0,
+                                    sizeof(float) * (size_t)vocab * N_actual);
+            for (int i = 0; i < N_actual; i++) {
+                posterior[i] = argmax_f32(verify_logits_buf.data() + (size_t)i * vocab, vocab);
+            }
+            auto T_verify_logits_ddtree = sync_us();
+            tt_verify_logits += std::chrono::duration<double, std::micro>(
+                T_verify_logits_ddtree - T_verify_compute).count();
 
             // Walk tree: accepted DFS indices and next bonus token.
             int next_token = -1;
@@ -3431,9 +3441,9 @@ int main(int argc, char ** argv) {
             std::vector<int> accepted = follow_verified_tree(tree, posterior.data(), next_token, &bonus_node_idx);
             if (g_sampler.temp > 0.0f) {
                 std::vector<float> bonus_logits(vocab);
-                ggml_backend_tensor_get(sg.logits, bonus_logits.data(),
-                                        (size_t)bonus_node_idx * sg.logits->nb[1],
-                                        (size_t)vocab * sizeof(float));
+                std::memcpy(bonus_logits.data(),
+                            verify_logits_buf.data() + (size_t)bonus_node_idx * vocab,
+                            (size_t)vocab * sizeof(float));
                 next_token = sample_logits(bonus_logits.data(), vocab, g_sampler, out_all, g_sampler_rng);
             }
             const int accept_depth = (int)accepted.size();  // includes root
@@ -3488,14 +3498,21 @@ int main(int argc, char ** argv) {
             last_tok = next_token;
 
             auto T_accept = sync_us();
-            tt_accept += std::chrono::duration<double, std::micro>(T_accept - T_verify_compute).count();
+            tt_accept += std::chrono::duration<double, std::micro>(
+                T_accept - T_verify_logits_ddtree).count();
 
             // A `next_token` of -1 means the tree walk found no continuation
             // (EOS region / dead-end). Stop here: otherwise last_tok stays -1,
             // the next iteration feeds it to w.embedder.embed(), that fails,
             // and the decode loop returns 1 without writing the output file
             // or printing the summary line (issue #191).
-            if (hit_eos || last_tok < 0 || IS_EOS_TOK(last_tok, w)) break;
+            if (hit_eos || last_tok < 0 || IS_EOS_TOK(last_tok, w)) {
+                committed    += commit_n;
+                n_generated  += commit_n;
+                n_accept_sum += commit_n;
+                n_draft_steps++;
+                break;
+            }
 
             // Rollback: per-layer DeltaNet SSM and conv state + KV compaction
             // for full-attention layers.
