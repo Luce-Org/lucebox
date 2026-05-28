@@ -2,6 +2,8 @@
 
 #include "qwen35_ops.h"
 
+#include <cmath>
+
 namespace dflash::common {
 
 Qwen35MoeRouterOutputs build_qwen35moe_router(
@@ -31,11 +33,16 @@ Qwen35MoeRouterOutputs build_qwen35moe_router(
     ggml_tensor * weights  = ggml_get_rows(ctx, probs_3d, selected);
     weights = ggml_reshape_2d(ctx, weights, n_used, n_tokens);
 
-    if (w.expert_gating_func == 2) {
+    // Always normalize selected expert weights by their sum (matches
+    // llama.cpp's norm_w=true for qwen35moe). Without this, top-k softmax
+    // weights sum to much less than 1.0, causing systematically underscaled
+    // FFN output.
+    {
         ggml_tensor * w_sum = ggml_sum_rows(ctx, weights);
+        w_sum = ggml_clamp(ctx, w_sum, 6.103515625e-5f, INFINITY);
         weights = ggml_div(ctx, weights, w_sum);
     }
-    if (w.expert_weights_scale != 1.0f) {
+    if (w.expert_weights_scale != 0.0f && w.expert_weights_scale != 1.0f) {
         weights = ggml_scale(ctx, weights, w.expert_weights_scale);
     }
 
