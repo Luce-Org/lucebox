@@ -411,7 +411,35 @@ std::string render_chat_template_jinja(
         jinja::runtime rt(ctx);
         jinja::value results = rt.execute(*prog);
         auto parts = jinja::runtime::gather_string_parts(results);
-        return parts->as_string().str();
+        std::string rendered = parts->as_string().str();
+
+        // The hard-coded Qwen renderer appends a closed think prefill when
+        // thinking is disabled. Some Qwen3.6 Jinja templates omit that final
+        // assistant suffix, which leaves the model in the wrong decoding state
+        // for tool use. Mirror the hard-coded behavior here when the rendered
+        // prompt ends with a bare assistant generation prompt.
+        if (!enable_thinking) {
+            // Tolerate template variants that emit extra trailing whitespace
+            // after the assistant marker (single \n, double \n\n, trailing
+            // space). Strategy: trim trailing whitespace, check for the BARE
+            // assistant marker (no newline), then re-emit marker + prefill.
+            static constexpr char kAssistantBare[]    = "<|im_start|>assistant";
+            static constexpr char kAssistantPrefill[] = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+            size_t trim_end = rendered.size();
+            while (trim_end > 0) {
+                char c = rendered[trim_end - 1];
+                if (c != ' ' && c != '\t' && c != '\n' && c != '\r') break;
+                --trim_end;
+            }
+            const size_t blen = sizeof(kAssistantBare) - 1;
+            if (trim_end >= blen &&
+                rendered.compare(trim_end - blen, blen, kAssistantBare) == 0) {
+                rendered.resize(trim_end - blen);
+                rendered += kAssistantPrefill;
+            }
+        }
+
+        return rendered;
     } catch (const std::exception & e) {
         throw std::runtime_error(std::string("jinja runtime: ") + e.what());
     }
