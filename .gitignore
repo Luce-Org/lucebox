@@ -79,3 +79,7 @@ fix-plan.md
 # Harness test artifacts
 .harness-work/
 health
+
+# Workdir editor backup suffixes
+*.git-head
+*.pre-pflash-rename

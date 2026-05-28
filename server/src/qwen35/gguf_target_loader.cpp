@@ -38,10 +38,7 @@
 //     ssm_out.weight                 [inner, hidden]           Q5_K
 //     ffn_gate/up/down              (same as full-attn)
 //
-// This loader reads the file via ggml's built-in GGUF API, which returns a
-// ggml_context pre-populated with tensors. We then wire that context onto
-// the CUDA backend (via ggml_backend_alloc_ctx_tensors) and copy each
-// tensor's bytes from the mmap'd file.
+// Loads via ggml GGUF API; tensors copied from mmap to CUDA backend.
 
 #include "internal.h"
 #include "common/layer_split_utils.h"
