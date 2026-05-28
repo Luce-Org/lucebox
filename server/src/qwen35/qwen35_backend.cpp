@@ -645,6 +645,16 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
         sampler_rng_.seed(sampler_.seed);
     }
 
+    // Design 1: apply the per-request verify fa_window override (set by
+    // http_server when pflash compresses), then restore cfg_.fa_window after
+    // this generate completes so concurrent requests aren't affected. Calling
+    // dflash_target() lazily constructs it on first use.
+    const int eff_fa_window =
+        (req.fa_window_override > 0) ? req.fa_window_override : cfg_.fa_window;
+    if (auto * dt = dynamic_cast<Qwen35DFlashTarget *>(dflash_target())) {
+        dt->set_fa_window(eff_fa_window);
+    }
+
     // Zero delta-net recurrent state (SSM + conv) so a fresh prompt doesn't
     // inherit stale hidden state from the previous request. KV cache is
     // position-addressed and will be overwritten during prefill.
@@ -660,17 +670,29 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     auto t_prefill_end = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_prefill_end - t_prefill_start).count();
 
-    // Decode (speculative)
+    // C2 adaptive-mechanism gate: pflash's override always reflects the
+    // FULL compressed-prompt size — we never cap visibility (would waste
+    // pflash's anchor-selection work). The gate here decides whether
+    // spec-decode's verify arithmetic still earns its drafter cost at
+    // that window size. Threshold 2× cfg_.fa_window:
+    //   override <= 4096 (32K → ~1.5K, 64K → ~3K compressed) → spec-decode
+    //   override >  4096 (128K → ~6.4K compressed)            → AR fallback
+    // AR uses fa_window=0 (full attention) so every kept token is visible
+    // regardless of which path runs. We choose mechanism, not visibility.
+    const bool fa_within_budget =
+        (req.fa_window_override == 0)
+     || (eff_fa_window <= 2 * cfg_.fa_window);
+
+    // Decode (speculative or AR)
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
-        // Pass the budget hook into spec-decode. When token count nears
-        // the budget edge, do_spec_decode breaks out and tails off via
-        // AR with the hook still active — force-close fires correctly
-        // without sacrificing spec-decode throughput for the bulk of
-        // generation. Most requests never hit the tail because the
-        // model closes </think> naturally well before the budget edge.
+        // AR path when either: a prior spec-decode emitted no tokens and a
+        // retry was requested (force_ar_decode), or the pflash fa_window
+        // override is too wide for spec-decode (!fa_within_budget). Otherwise
+        // spec-decode with the budget hook (tails off via AR near the budget
+        // edge; most requests close </think> before that).
         bool decode_ok = false;
-        if (req.force_ar_decode) {
+        if (req.force_ar_decode || !fa_within_budget) {
             decode_ok = do_ar_decode(committed, req.n_gen, result.tokens, out_io,
                                      req.budget_hook,
                                      &result.budget_forced_close,

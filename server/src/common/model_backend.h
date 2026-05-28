@@ -112,6 +112,10 @@ struct GenerateRequest {
     // path returns success but emits no tokens, so each backend can route the
     // retry through its existing AR path without copying retry policy.
     bool                       force_ar_decode = false;
+    // Per-request override for target spec-decode verify fa_window. Set by
+    // http_server when pflash compresses, so verify sees the entire compressed
+    // prompt (not just the last cfg_.fa_window positions). Zero = no override.
+    int                        fa_window_override = 0;
 };
 
 struct GenerateResult {
