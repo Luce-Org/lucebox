@@ -557,6 +557,16 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
         sampler_rng_.seed(sampler_.seed);
     }
 
+    // Design 1: apply the per-request verify fa_window override (set by
+    // http_server when pflash compresses), then restore cfg_.fa_window after
+    // this generate completes so concurrent requests aren't affected. Calling
+    // dflash_target() lazily constructs it on first use.
+    const int eff_fa_window =
+        (req.fa_window_override > 0) ? req.fa_window_override : cfg_.fa_window;
+    if (auto * dt = dynamic_cast<Qwen35DFlashTarget *>(dflash_target())) {
+        dt->set_fa_window(eff_fa_window);
+    }
+
     // Zero delta-net recurrent state (SSM + conv) so a fresh prompt doesn't
     // inherit stale hidden state from the previous request. KV cache is
     // position-addressed and will be overwritten during prefill.
@@ -572,22 +582,38 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
     auto t_prefill_end = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_prefill_end - t_prefill_start).count();
 
-    // Decode (speculative)
+    // C2 gate: spec-decode when override <= 2x fa_window; AR fallback otherwise.
+    // Both paths see all kept tokens. See docs/pflash-adaptive-composition.md.
+    const bool fa_within_budget =
+        (req.fa_window_override == 0)
+     || (eff_fa_window <= 2 * cfg_.fa_window);
+
+    // Decode (speculative or AR)
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
-        // Pass the budget hook into spec-decode. When token count nears
-        // the budget edge, do_spec_decode breaks out and tails off via
-        // AR with the hook still active — force-close fires correctly
-        // without sacrificing spec-decode throughput for the bulk of
-        // generation. Most requests never hit the tail because the
-        // model closes </think> naturally well before the budget edge.
-        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
-                             result.accept_rate, result.spec_decode_ran,
-                             req.hint_tokens, &req.budget_hook,
-                             &result.budget_forced_close,
-                             &result.degenerate_decode_close)) {
-            result.error = "decode";
-            return result;
+        if (!fa_within_budget) {
+            // AR fallback: fa_window override too wide for spec decode.
+            bool ok = do_ar_decode(committed, req.n_gen, result.tokens, out_io,
+                                    req.budget_hook,
+                                    &result.budget_forced_close,
+                                    &result.degenerate_decode_close);
+            out_io.emit(-1);
+            if (!ok) { result.error = "decode"; return result; }
+        } else {
+            // Pass the budget hook into spec-decode. When token count nears
+            // the budget edge, do_spec_decode breaks out and tails off via
+            // AR with the hook still active — force-close fires correctly
+            // without sacrificing spec-decode throughput for the bulk of
+            // generation. Most requests never hit the tail because the
+            // model closes </think> naturally well before the budget edge.
+            if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
+                                 result.accept_rate, result.spec_decode_ran,
+                                 req.hint_tokens, &req.budget_hook,
+                                 &result.budget_forced_close,
+                                 &result.degenerate_decode_close)) {
+                result.error = "decode";
+                return result;
+            }
         }
         result.decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_decode_start).count();
@@ -818,26 +844,12 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                   const BudgetHook & budget_hook,
                                   bool * forced_close_out,
                                   bool * degenerate_close_out) {
-    // Budget hook state.
-    //   - budget_close_started: true once we've begun injecting the close
-    //     sequence. Prevents re-triggering on continued forward generation.
-    //   - close_inject_pos: index into budget_hook.close_token_ids for the
-    //     NEXT token to inject. While < close_token_ids.size(), each
-    //     iteration overrides the sampled token with the corresponding
-    //     close-sequence token (single-token close = 1 override and done;
-    //     multi-token close like DeepSeek/laguna [1718,37947,32] = 3
-    //     consecutive overrides). Once equal to close_token_ids.size(),
-    //     normal sampling resumes (model writes visible answer).
+    // budget_close_started: prevents re-triggering; close_inject_pos: next
+    // token index to inject from close_token_ids. See docs/specs/thinking-budget.md.
     bool budget_close_started = false;
     int  close_inject_pos     = 0;
-    // Capture entry KV position so the budget check is in the
-    // "generated since entry" frame, not the absolute KV frame.
-    // n_gen is the gen-only count (or the remaining-budget remap done by
-    // spec-decode tail-off); subtracting committed_now (absolute KV =
-    // prompt_len + tokens generated this call) directly would treat
-    // prompt-length tokens as if they were generated output, firing
-    // force-close prompt_len tokens early on prompted requests and
-    // potentially going negative after spec-decode tail-off.
+    // committed_at_entry: anchors budget check to "generated since entry" frame,
+    // not absolute KV (avoids firing prompt_len tokens early).
     const int committed_at_entry = committed;
     auto maybe_force_close = [&](int32_t & tok, int committed_now) {
         if (budget_hook.close_token_ids.empty()) return;

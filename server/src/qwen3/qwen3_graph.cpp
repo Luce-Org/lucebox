@@ -5,23 +5,10 @@
 // buffers. Sliding-window flash-attention via ggml-cuda's tensor-core
 // `flash_attn_ext` keeps attention cost linear in S.
 //
-// **Algorithmic note vs blog**:
-//   The blog stack is Liu Q-hook tail scoring + FlashPrefill block-sparse FA.
-//   The Liu Q-hook is implemented with a NoPE fix: by default (DFLASH_FP_NOPE_TAIL=1)
-//   the tail score uses pre-RoPE K/Q, removing the RoPE distance decay that
-//   buries early-position needle chunks and was causing NIAH failures.
-//   Set DFLASH_FP_NOPE_TAIL=0 to revert to post-RoPE scoring.  The block-sparse FA is replaced
-//   with a sliding-window approximation here because (a) ggml-cuda's
-//   `flash_attn_ext` already gives tensor-core speed inside the ubatch
-//   graph, and (b) our own block-sparse CUDA kernel needs a tensor-core
-//   rewrite (mma.sync.aligned) to actually beat ggml's FA — see
-//   `src/flashprefill_kernels.cu` for the (slow) scalar reference path.
-//   At S=140K with W=512 sliding window the NIAH magic key still propagates
-//   through 28 layers and is recovered in the kept tokens, so this
-//   approximation passes the actual e2e correctness check the user cares
-//   about. The block-sparse FA upgrade remains the next deliverable for
-//   "match the article algorithmically", but is functionally equivalent
-//   for the deployed perf budget today.
+// Tail score uses pre-RoPE K/Q (DFLASH_FP_NOPE_TAIL=1 default) to remove
+// distance decay that buries early-position needle chunks (NIAH fix).
+// Block-sparse FA replaced by sliding-window via ggml-cuda flash_attn_ext;
+// BSA upgrade tracked in flashprefill_kernels.cu.
 //
 // Memory at S=140K, B=1, H=16, Hk=8, D=128, hidden=1024, ff=3072:
 //   weights                                            ~1.5 GB
@@ -251,9 +238,8 @@ bool forward_qwen3_drafter_model(
     running_max.assign((size_t)n_lookahead * S, -INFINITY);
 
     // Compute score_layer_start early so we can avoid allocating K_norope/Q_norope
-    // for layers that will never be used in scoring.  At S=128K the full K_norope
-    // allocation is ~5.6 GB (21 unused layers × 268 MB) — skipping it keeps total
-    // VRAM under 24 GB and eliminates the warm-path regression (A_compute 5.4x).
+    // for layers that will never be used in scoring. At S=128K this trims ~5.6 GB
+    // (21 × 268 MB); see test_drafter_warm_path_regression.
     static const int score_layers_pre = []() -> int {
         const char * e = std::getenv("PFLASH_DRAFTER_SCORE_LAYERS");
         if (e) { int v = std::atoi(e); if (v > 0) return v; }
@@ -279,8 +265,7 @@ bool forward_qwen3_drafter_model(
     std::vector<PersBuf> V_curr_v((size_t)w.n_layer);
     std::vector<PersBuf> Q_last_v((size_t)w.n_layer);
     // NoPE: only allocate K_norope/Q_norope for layers that will be scored.
-    // When score_layer_start_pre > 0 this trims up to 21 × 268 MB = 5.6 GB,
-    // preventing the VRAM overflow that causes the warm-path regression at 128K.
+    // When score_layer_start_pre > 0 this prevents the 128K warm-path VRAM regression.
     std::vector<PersBuf> K_norope_v(nope_tail ? (size_t)n_score_layers : 0);
     std::vector<PersBuf> Q_norope_v(nope_tail ? (size_t)n_score_layers : 0);
     auto cleanup_all = [&]() {

@@ -96,3 +96,7 @@ dflash/docs/tuning-snapshots/
 # luce-bench --sweep default output dir (per-host bench runs); reference
 # baselines live in github.com/easel/luce-bench-baselines.
 luce-bench/snapshots/
+
+# Workdir editor backup suffixes
+*.git-head
+*.pre-pflash-rename

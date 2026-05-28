@@ -1417,6 +1417,11 @@ void HttpServer::worker_loop() {
         gen_req.sampler = req.sampler;
         gen_req.do_sample = req.sampler.needs_logit_processing();
         gen_req.stream = false;  // we handle streaming via on_token callback
+        // Widen verify window to cover the full compressed prompt; C2 gate in
+        // qwen35_backend.cpp selects spec-decode vs AR. See docs/pflash-adaptive-composition.md.
+        if (pflash_compressed) {
+            gen_req.fa_window_override = (int)effective_prompt.size() + 256;
+        }
 
         // Level 2 force-close: when thinking is opted in, the server is
         // configured with a hard-limit reply budget, and we resolved the
