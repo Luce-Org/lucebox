@@ -4,8 +4,8 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-27T21:22:54-04:00 through 2026-05-27T21:29:00-04:00
-Current stack tip before this metadata refresh: `d465a7e` (already aligned with `origin/main` `4f4d82e`; this run found no upstream-base advance and revalidated PR #237 with a fresh conflicted worktree plus tmux-driven Codex feasibility report).
+Last refresh: 2026-05-27T21:43:23-04:00 through 2026-05-27T21:52:00-04:00
+Current stack tip before this metadata refresh: `61aa4a1` (already aligned with `origin/main` `4f4d82e`; this run found no upstream-base advance, re-probed every currently non-ancestor non-draft PR in an isolated worktree, and performed a fresh tmux-driven Codex feasibility assessment for PR #221).
 
 ## Included in the current stack
 
@@ -27,7 +27,9 @@ Current stack tip before this metadata refresh: `d465a7e` (already aligned with 
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| #237 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr237-20260527-2124` produced broad conflicts across current `server/CMakeLists.txt`, common backend/MTP interfaces, Qwen35 loader/graph/backend files, tests, and deleted legacy `dflash/scripts/server.py` / `dflash/src/server/server_main.cpp`. tmux-driven Codex session `luce-pr237-codex-2124` wrote `/tmp/pr237-feasibility-20260527-2124.txt`: selective port is feasible, but a direct conflict-marker resolution is unsafe because the current native server CLI/config, Qwen35 MoE/remote-draft/thinking-budget behavior, and restore/prefix-cache semantics must be preserved with MTP off by default first. |
+| all non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated reconciliation worktree `/tmp/luce-auto-cron-20260527-214507` rebased/checked the stack against `origin/main` (already up to date) and then attempted `--no-commit` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every probe conflicted; consolidated conflict output is retained in `/tmp/luce-merge-probes-20260527-214507.txt`. |
+| #221 | not integrated | Fresh conflicted worktree `/tmp/luce-attempt-pr221-20260527-2149` plus tmux-driven Codex session `luce-pr221-codex-2149` produced `/tmp/pr221-feasibility-20260527-2149.txt`. Codex concluded direct merge is unsafe: PR #221 layers prefix-cache warm/ghost behavior and speculator dispatch on top of the older MTP foundation, mixes legacy `dflash/` paths with current `server/`, adds `qwen36` MTP pathing likely superseded by PR #237's current naming, and should wait for a current-layout PR #237/equivalent MTP foundation before selectively porting prefix-cache/range-warm pieces. |
+| #237 | not integrated | Fresh worktree merge probe in `/tmp/luce-auto-cron-20260527-214507` reproduced the same broad conflicts across current `server/CMakeLists.txt`, common backend/MTP interfaces, Qwen35 loader/graph/backend files, tests, and deleted legacy `dflash/scripts/server.py` / `dflash/src/server/server_main.cpp`; prior tmux-driven Codex session `luce-pr237-codex-2124` wrote `/tmp/pr237-feasibility-20260527-2124.txt`: selective port is feasible, but a direct conflict-marker resolution is unsafe because the current native server CLI/config, Qwen35 MoE/remote-draft/thinking-budget behavior, and restore/prefix-cache semantics must be preserved with MTP off by default first. |
 | #177 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr177-20260527-2020` produced conflicts in deleted legacy `dflash/CMakeLists.txt`, moved Gemma4 header/source/test paths, `server/src/errors.cpp`, and `server/src/internal.h`. A tmux-driven Claude assessment session was launched (`luce-pr177-claude-2020`) but exited without producing a report; the raw conflict shape still confirms this older Gemma4 KV-correctness split is not mechanically mergeable into the current `server/src/gemma4` architecture. |
 | #153 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr153-20260527-2020` produced conflicts in legacy `dflash/CMakeLists.txt`, current `server/src/internal.h`, `server/src/qwen35/gguf_target_loader.cpp`, `server/src/qwen35/qwen35_target_graph.cpp`, and path-mapped MTP docs/tests. Codex tmux session `luce-pr153-codex-2020` wrote `/tmp/pr153-feasibility-20260527-2020.txt`: selective port is feasible, but not as conflict-marker resolution; current-layout loader/graph/token embedding/MoE/cache semantics need deliberate design. |
 | #39 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr39-20260527-2020` produced broad conflicts across deleted legacy `dflash/*` files plus current draft graph/safetensors loader and MoE smoke tests. A tmux-driven Claude assessment session was launched (`luce-pr39-claude-2020`) but exited without producing a report; the branch remains an older MoE/DDTree stack that needs a survivorship review against current qwen35moe support. |
@@ -46,7 +48,7 @@ Current stack tip before this metadata refresh: `d465a7e` (already aligned with 
 | PR | Head branch | State | Why held |
 |---:|---|---|---|
 | #237 | `feat/dflash-mtp-foundation` | attempted / blocked-needs-human / selective-port | Revalidated this run in `/tmp/luce-attempt-pr237-20260527-2124`; Codex report says selective current-layout MTP foundation port is feasible, but not by resolving the merge markers directly. First port current server MTP CLI/config with MTP off by default, preserve Qwen35 MoE/remote-draft/thinking-budget behavior, and defer or design restore/prefix-cache MTP warm semantics. |
-| #221 | `feat/mtp-prefix-warm-ghost` | blocked-needs-human / dependency | Prior direct + Codex attempts left many unmerged paths and legacy artifacts; depends on a coherent #237-style MTP foundation first. |
+| #221 | `feat/mtp-prefix-warm-ghost` | attempted / blocked-needs-human / dependency | Revalidated this run in `/tmp/luce-attempt-pr221-20260527-2149`; Codex report `/tmp/pr221-feasibility-20260527-2149.txt` says direct merge is unsafe and PR #221 should be a follow-on selective port after a current-layout #237/equivalent MTP foundation, salvaging prefix-cache MTP warm/range-warm behavior and dispatcher/benchmark lessons while leaving old `dflash/`/`qwen36` artifacts behind. |
 | #183 | `split/gemma4-11a-target-mtp-integration` | blocked-needs-human / superseded-by-current-architecture | Revalidated in the previous run. Its direct `h_prev` assertion has no current target location until Gemma4 MTP runtime is reintroduced in the current `server/src/gemma4` architecture. |
 | #182 | `split/gemma4-10-mtp-loader-step-graph` | attempted / selective-port | Revalidated this run in `/tmp/luce-attempt-pr182-20260527-2039`; Codex report says the assistant loader/MTP graph are portable only as current-layout `server/src/gemma4` work. |
 | #181 | `split/gemma4-09-dflash-draft-runtime` | attempted / likely superseded | Revalidated this run in `/tmp/luce-attempt-pr181-20260527-2039`; conflicts overlap current Gemma4 DFlash backend and the #182 MTP port decision. |
@@ -85,6 +87,12 @@ This run performed:
 - `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...`
 - Targeted fetches for all open non-draft PR refs (`origin/pr/<n>`)
 - `git cherry easel/auto-integration origin/pr/<n>` and `git merge-base --is-ancestor origin/pr/<n> easel/auto-integration` classification checks
+- Isolated metadata/probe worktree `/tmp/luce-auto-cron-20260527-214507`
+- `git merge --no-edit origin/main` in that worktree (already up to date)
+- Fresh direct merge probes for all currently non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260527-214507.txt`
+- Fresh isolated PR #221 conflicted worktree `/tmp/luce-attempt-pr221-20260527-2149`
+- tmux-driven Codex assessment session `luce-pr221-codex-2149`, producing `/tmp/pr221-feasibility-20260527-2149.txt`
+- `git diff --check -- docs/auto-integration.md` before this metadata commit (clean)
 - Isolated metadata worktree `/tmp/luce-auto-cron-20260527-212401`
 - Fresh isolated PR #237 merge probe in `/tmp/luce-attempt-pr237-20260527-2124`
 - tmux-driven Codex assessment session `luce-pr237-codex-2124`, producing `/tmp/pr237-feasibility-20260527-2124.txt`
@@ -115,6 +123,8 @@ This run performed:
 ## Notes
 
 - Primary checkout `/home/erik/Projects/luce2` was clean at start and was not edited directly during reconciliation.
+- Retained worktree `/tmp/luce-auto-cron-20260527-214507` for this metadata refresh until pushed/verified.
+- Retained conflicted worktree `/tmp/luce-attempt-pr221-20260527-2149` for audit; it contains unmerged PR #221 probe state and Codex report `/tmp/pr221-feasibility-20260527-2149.txt`.
 - Retained worktree `/tmp/luce-auto-cron-20260527-212401` for this metadata refresh until pushed/verified.
 - Retained conflicted worktree `/tmp/luce-attempt-pr237-20260527-2124` for audit; it contains unmerged PR #237 probe state.
 - Retained prior metadata/conflicted worktrees from earlier runs as previously reported; cleanup would be separate maintenance.
