@@ -724,6 +724,7 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                 target_cache().cur_pos = committed;
 
                 // Pipelined decode loop
+                PipelinedDecodeTelemetry decode_tel_accum{};
                 for (int step = 1; step < req.n_gen; ++step) {
                     int32_t tok = result.tokens.back();
                     if (!target_weights().embedder.embed(&tok, 1, act_cur.data())) {
@@ -734,12 +735,26 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                     ggml_backend_tensor_set(pipe_state_->gpu_state.act_cur, act_cur.data(), 0,
                                             sizeof(float) * (size_t)hidden);
 
+                    PipelinedDecodeTelemetry tel;
                     if (!pipelined_decode_one_token(*pipe_state_, target_backend(), target_weights(),
                                                     target_cache(), *target_weights().moe_hybrid,
-                                                    committed, cfg_.kq_stride_pad, nullptr)) {
+                                                    committed, cfg_.kq_stride_pad,
+                                                    hybrid_telemetry_ ? &tel : nullptr)) {
                         result.error = "decode";
                         cleanup_graphs();
                         return result;
+                    }
+                    if (hybrid_telemetry_) {
+                        decode_tel_accum.total_us += tel.total_us;
+                        decode_tel_accum.prefn_graph_build_us += tel.prefn_graph_build_us;
+                        decode_tel_accum.prefn_compute_us += tel.prefn_compute_us;
+                        decode_tel_accum.routing_readback_us += tel.routing_readback_us;
+                        decode_tel_accum.ffn_us += tel.ffn_us;
+                        decode_tel_accum.ffn_allhot_us += tel.ffn_allhot_us;
+                        decode_tel_accum.ffn_mixed_us += tel.ffn_mixed_us;
+                        decode_tel_accum.allhot_layers += tel.allhot_layers;
+                        decode_tel_accum.mixed_layers += tel.mixed_layers;
+                        decode_tel_accum.total_layers += tel.total_layers;
                     }
 
                     ggml_backend_tensor_get(pipe_state_->gpu_state.act_cur, act_cur.data(), 0,
@@ -767,6 +782,28 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                     target_cache().cur_pos = committed;
                     if (out_io.cancelled) break;
                     if (is_eos_tok(next_tok, target_weights())) break;
+                }
+                if (hybrid_telemetry_) {
+                    const int n_dec = (int)result.tokens.size() - 1;
+                    std::printf("[qwen35moe] === DECODE BREAKDOWN (n_tokens=%d) ===\n", n_dec);
+                    std::printf("  prefn_build=%.1fms prefn_compute=%.1fms routing_readback=%.1fms ffn=%.1fms\n",
+                                decode_tel_accum.prefn_graph_build_us / 1000.0,
+                                decode_tel_accum.prefn_compute_us / 1000.0,
+                                decode_tel_accum.routing_readback_us / 1000.0,
+                                decode_tel_accum.ffn_us / 1000.0);
+                    std::printf("  ffn_allhot=%.1fms ffn_mixed=%.1fms allhot_layers=%d mixed_layers=%d\n",
+                                decode_tel_accum.ffn_allhot_us / 1000.0,
+                                decode_tel_accum.ffn_mixed_us / 1000.0,
+                                decode_tel_accum.allhot_layers,
+                                decode_tel_accum.mixed_layers);
+                    if (n_dec > 0) {
+                        std::printf("  per-token avg: prefn_build=%.2fms prefn_compute=%.2fms readback=%.2fms ffn=%.2fms\n",
+                                    decode_tel_accum.prefn_graph_build_us / 1000.0 / n_dec,
+                                    decode_tel_accum.prefn_compute_us / 1000.0 / n_dec,
+                                    decode_tel_accum.routing_readback_us / 1000.0 / n_dec,
+                                    decode_tel_accum.ffn_us / 1000.0 / n_dec);
+                    }
+                    std::fflush(stdout);
                 }
             }
             cleanup_graphs();
