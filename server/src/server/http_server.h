@@ -241,13 +241,13 @@ public:
     // Signal the server to stop accepting new connections and drain.
     void shutdown();
 
-    // Async-signal-safe: only sets stopping flag and closes listen socket.
+    // Async-signal-safe: only sets the stopping flag. The accept loop polls
+    // this flag on a short timeout, so it wakes regardless of which thread the
+    // signal is delivered to. (Closing listen_fd_ here is unsafe: on Linux a
+    // close() from another thread does not wake a blocked accept(), and it
+    // races the accept loop's own close on exit.)
     void request_stop() {
         stopping_.store(true, std::memory_order_relaxed);
-        if (listen_fd_ >= 0) {
-            ::close(listen_fd_);
-            listen_fd_ = -1;
-        }
     }
 
 private:
