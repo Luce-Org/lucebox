@@ -6,6 +6,7 @@
 #include "common/dflash_draft_graph.h"
 #include "peer_access.h"
 #include "attn_masks.h"
+#include "qwen35/c2_gate.h"
 #include "common/sampler.h"
 #include "common/io_utils.h"
 #include "common/restore_delta.h"
@@ -585,8 +586,9 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
     // C2 gate: spec-decode when override <= 2x fa_window; AR fallback otherwise.
     // Both paths see all kept tokens. See docs/pflash-adaptive-composition.md.
     const bool fa_within_budget =
-        (req.fa_window_override == 0)
-     || (eff_fa_window <= 2 * cfg_.fa_window);
+        dflash::common::c2_spec_decode_permitted(req.fa_window_override,
+                                                 cfg_.fa_window,
+                                                 /*kv_committed*/ 0);
 
     // Decode (speculative or AR)
     if (req.n_gen > 0) {
