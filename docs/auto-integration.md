@@ -4,9 +4,9 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T06:42:35-04:00
+Last refresh: 2026-05-28T06:55:39-04:00
 Current base: `origin/main` `4f4d82e`
-Current integration tip before this refresh: `easel/auto-integration` `4a027f7`
+Current integration tip before this refresh: `easel/auto-integration` `d735948`
 
 This branch is maintained as a reproducible patch stack over `origin/main`. The
 primary checkout was clean at the start of this unattended run. Upstream
@@ -14,9 +14,10 @@ primary checkout was clean at the start of this unattended run. Upstream
 head needed a code merge beyond the current `easel/auto-integration` tip. This
 refresh revalidated the ready/non-draft PR set, reran direct probes for the
 remaining old-layout/non-ancestor PRs, and added a fresh Codex feasibility pass
-for #182. Codex confirmed #182 remains a current-layout Gemma4 MTP selective-port
-rather than an immediate cherry-pick: the old `dflash/` MTP graph/loader needs to
-be adapted into `server/src/gemma4` types and build/test wiring first.
+for #181. Codex confirmed #181 is feasible only as a current-layout Gemma4 draft
+runtime selective port: keep the useful Gemma4 quantizer metadata, error-handling
+intent, draft runtime concepts, and smoke-test coverage, but discard the stale
+old `dflash/`/top-level `server/src/gemma4_*.cpp` layout.
 
 ## Included in the current stack
 
@@ -48,10 +49,10 @@ carried.
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| upstream sync | checked | In isolated worktree `/tmp/luce-auto-cron-20260528-063427`, `git merge --no-edit origin/main` reported `Already up to date.` |
-| current integrated PRs | checked | Current heads for #289, #284, #278, #276, #274, #273, #266, #265, #152, and #142 are ancestors of `easel/auto-integration` `4a027f7`; no new ready contributor head required a code merge this run. |
-| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every direct probe conflicted and was aborted in the isolated worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-063427.txt`. |
-| #182 | delegated feasibility refreshed | Claude in tmux reached `--max-turns 12` with only `/tmp/pr182-claude-feasibility-20260528-063427.txt` recording the turn-limit error. A Codex tmux rerun completed at `/tmp/pr182-codex-feasibility-20260528-063427.txt`: no direct cherry-pick is safe; port order is MTP declarations/cache fields into `server/src/gemma4/gemma4_internal.h`, assistant loader pieces into `gemma4_loader.cpp`, a new `gemma4_mtp_graph.cpp` with PR follow-up cleanups, then CMake/tests. |
+| upstream sync | checked | In isolated worktree `/tmp/luce-auto-cron-20260528-065539`, `git merge --no-edit origin/main` reported `Already up to date.` |
+| current integrated PRs | checked | Current heads for #289, #284, #278, #276, #274, #273, #266, #265, #152, and #142 are ancestors of `easel/auto-integration` `d735948`; no new ready contributor head required a code merge this run. |
+| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every direct probe conflicted and was aborted in the isolated worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-065539.txt`. |
+| #181 | delegated feasibility refreshed | Claude in tmux exited without producing report content in `/tmp/pr181-claude-feasibility-20260528-065539.txt`. Codex in tmux completed at `/tmp/pr181-codex-feasibility-20260528-065539.txt`: direct conflict resolution is unsafe; portable pieces are Gemma4 support in `server/scripts/quantize_draft_q8.py`, thread-local/optional Gemma4 error reporting intent, draft runtime concepts already partly covered by current `server/src/gemma4` and generic draft code, and stale smoke-test intent. Recommended port order is current-layout quantizer metadata alignment, optional current-layout error API, replacement of hard-coded Gemma4 draft overrides with reliable GGUF metadata, capture-layer validation, current-style tests, then evaluate prefix-direct cached draft performance separately. |
 
 ## Prior probe results (retained)
 
@@ -67,7 +68,7 @@ carried.
 | #221 | `feat/mtp-prefix-warm-ghost` | blocked-needs-human / dependency | Fresh Claude feasibility report `/tmp/pr221-claude2-feasibility-20260528-043924.txt` says this should not be direct-merged: path and namespace migrations plus a highly diverged `qwen35_backend` require a feature port. After #237/equivalent MTP foundation, port pure-add MTP files and tests into `server/`, add `ModelBackend`/`DFlashTarget`/`StepGraph` hidden-state and speculator hooks additively, then hand-port Qwen35 backend dispatcher, daemon wiring, bench scripts, and prefix-cache WARM tests. |
 | #183 | `split/gemma4-11a-target-mtp-integration` | blocked-needs-human / selective-port | Fresh Claude feasibility report `/tmp/pr183-claude2-feasibility-20260528-051446.txt` says direct merge is unsafe because the PR targets the retired `dflash/` + `dflash27b` layout and duplicates current `server/src/gemma4` loader/graph work. Portable value is Gemma4 MTP graph/loader, long-context KV correctness, asymmetric KV/`h_prev` capture, dead-cast hardening, and MTP/KV tests. Port order: KV fix, `h_prev`/asymmetric KV hook, extracted `gemma4_mtp_loader.cpp`, `gemma4_mtp_graph.cpp`, hardening, then tests/CMake. |
 | #182 | `split/gemma4-10-mtp-loader-step-graph` | blocked-needs-human / selective-port | Fresh Codex feasibility report `/tmp/pr182-codex-feasibility-20260528-063427.txt` says no direct cherry-pick is safe because the branch adds old `dflash/` Gemma4 MTP graph/loader code while current HEAD lacks the corresponding `server/src/gemma4` MTP structs and cache fields. Port order: add MTP declarations/cache fields to `gemma4_internal.h`, port assistant loader pieces into `gemma4_loader.cpp`, add new `gemma4_mtp_graph.cpp` with the PR's cleanup commits folded in, then wire `server/CMakeLists.txt` and current-layout MTP loader/shape tests. |
-| #181 | `split/gemma4-09-dflash-draft-runtime` | likely superseded / selective-port | Overlaps current Gemma4 DFlash backend and should be mined only after the current Gemma4 MTP shape is chosen. |
+| #181 | `split/gemma4-09-dflash-draft-runtime` | blocked-needs-human / selective-port | Fresh Codex feasibility report `/tmp/pr181-codex-feasibility-20260528-065539.txt` says direct conflict resolution is unsafe because the PR is mostly old-layout Gemma4 draft runtime code (`dflash27b`, top-level `server/src/gemma4_*.cpp`, and deleted `dflash/CMakeLists.txt`) while current HEAD owns Gemma4 under `server/src/gemma4` with generic draft plumbing. Portable pieces: Gemma4 quantizer metadata support in `server/scripts/quantize_draft_q8.py`, current-layout error reporting hardening, draft runtime metadata/capture concepts, and reauthored smoke tests. Port order: align quantizer metadata with `draft_gguf_loader.cpp`, add optional current-layout Gemma4 error API only if needed, replace hard-coded Gemma4 draft overrides with reliable GGUF metadata, validate capture-layer IDs, then port tests. |
 | #180 | `split/gemma4-08-draft-loader-quant` | likely superseded / selective-port | Overlaps current Gemma4 loader/backend code; not mechanically mergeable. |
 | #177 | `split/gemma4-06-kv-correctness` | partially integrated / selective-port | This run ported PR #177's SWA ring-buffer wrap-safe K/V cache write into current `server/src/gemma4/gemma4_graph.cpp`. Direct merge still conflicts and the remaining old-layout `dflash/include/gemma4.h`, `dflash/src/gemma4_target_graph.cpp`, `dflash/src/gemma4_target_loader.cpp`, and Gemma4 tests need deliberate mapping into current `server/` APIs before #177 is fully integrated. |
 | #154 | `xabicasa/dflash-mtp-speculative-loop` | selective-port | Linear native MTP decode semantics are portable with moderate risk after a current-layout Qwen35 MTP design. Prior Codex report: `/tmp/pr154-feasibility-20260527-2039.txt`. |
@@ -90,29 +91,30 @@ remains partially carried only as an integration dependency.
 
 This run performed:
 
-- `date -Is` -> 2026-05-28T06:33:17-04:00 at preflight and 2026-05-28T06:42:35-04:00 during manifest refresh.
+- `date -Is` -> 2026-05-28T06:55:39-04:00 at preflight and manifest refresh.
 - Primary checkout `git status --short` was clean before work began.
 - `git remote -v` verified `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
 - `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status` succeeded for account `easel`.
 - `HOME=/home/erik /home/erik/.local/bin/claude auth status --text` succeeded for the Claude Team account.
-- `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --help` succeeded.
+- `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --version` succeeded (`codex-cli 0.130.0`).
 - `git fetch --prune origin` and `git fetch --prune easel` completed; targeted fetches recreated current open non-draft PR refs.
 - `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...` enumerated all open PRs and showed #291, #290, #286, #285, #275, #249, #193, and #75 as drafts/excluded.
 - `git merge-base --is-ancestor origin/pr/<n> easel/auto-integration` showed #289, #284, #278, #276, #274, #273, #266, #265, #152, and #142 were current integrated non-draft heads.
-- Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260528-063427`; `git merge --no-edit origin/main` reported already up to date.
-- Fresh direct merge probes for remaining non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260528-063427.txt`.
-- Claude delegation for #182: tmux run reached `--max-turns 12` and produced only the turn-limit error in `/tmp/pr182-claude-feasibility-20260528-063427.txt`.
-- Codex delegation for #182: tmux run completed and produced `/tmp/pr182-codex-feasibility-20260528-063427.txt`, recommending a deliberate current-layout MTP graph/loader port rather than an immediate patch.
+- Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260528-065539`; `git merge --no-edit origin/main` reported already up to date.
+- Fresh direct merge probes for remaining non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260528-065539.txt`.
+- Claude delegation for #181: tmux run exited without report content in `/tmp/pr181-claude-feasibility-20260528-065539.txt`.
+- Codex delegation for #181: tmux run completed and produced `/tmp/pr181-codex-feasibility-20260528-065539.txt`, recommending a current-layout Gemma4 draft-runtime selective port rather than accepting the conflicted PR files.
 - `git diff --check` passed for this refresh's manifest change.
 - Search for exact merge conflict markers (`^(<<<<<<<|=======|>>>>>>>)`) under the reconciliation worktree returned no results.
 - No CMake configure/build was rerun because no code changed in this refresh; validation focused on repo state, direct probes, delegated feasibility, diff sanity, and conflict-marker checks.
 
 ## Notes
 
-- Primary checkout `/home/erik/Projects/luce2` was clean at preflight and matched fetched `easel/auto-integration` (`4a027f7`).
-- Retained worktree `/tmp/luce-auto-cron-20260528-063427` for direct-merge probe audit and final commit preparation until the pushed branch is reviewed.
-- Retained direct-probe log `/tmp/luce-merge-probes-20260528-063427.txt`.
-- Retained #182 probe worktree `/tmp/luce-pr182-feas-20260528-063427` plus reports `/tmp/pr182-claude-feasibility-20260528-063427.txt` (turn-limit only) and `/tmp/pr182-codex-feasibility-20260528-063427.txt` (completed feasibility).
+- Primary checkout `/home/erik/Projects/luce2` was clean at preflight and matched fetched `easel/auto-integration` (`d735948`).
+- Retained worktree `/tmp/luce-auto-cron-20260528-065539` for direct-merge probe audit and final commit preparation until the pushed branch is reviewed.
+- Retained direct-probe log `/tmp/luce-merge-probes-20260528-065539.txt`.
+- Retained #181 probe worktree `/tmp/luce-pr181-feas-20260528-065539` plus reports `/tmp/pr181-claude-feasibility-20260528-065539.txt` (empty report) and `/tmp/pr181-codex-feasibility-20260528-065539.txt` (completed feasibility).
+- Retained previous #182 probe worktree `/tmp/luce-pr182-feas-20260528-063427` plus reports `/tmp/pr182-claude-feasibility-20260528-063427.txt` (turn-limit only) and `/tmp/pr182-codex-feasibility-20260528-063427.txt` (completed feasibility).
 - Retained previous #237 Claude probe worktree `/tmp/luce-pr237-claude-20260528-061548` plus reports `/tmp/pr237-claude-feasibility-20260528-061548.txt` (turn-limit only) and `/tmp/pr237-claude2-feasibility-20260528-061548.txt` (completed feasibility).
 - Retained conflicted #177 probe worktree `/tmp/luce-pr177-feas-20260528-053512` plus Claude turn-limit reports `/tmp/pr177-claude-feasibility-20260528-053512.txt` and `/tmp/pr177-claude2-feasibility-20260528-053512.txt`.
 - Retained previous conflicted #183 probe worktree `/tmp/luce-pr183-feas-20260528-051446` plus Claude reports `/tmp/pr183-claude-feasibility-20260528-051446.txt` and `/tmp/pr183-claude2-feasibility-20260528-051446.txt`.
