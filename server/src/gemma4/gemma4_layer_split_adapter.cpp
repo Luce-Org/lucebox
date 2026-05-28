@@ -140,7 +140,10 @@ bool Gemma4LayerSplitAdapter::init() {
 }
 
 void Gemma4LayerSplitAdapter::begin_request(const GenerateRequest & req) {
-    (void)req;
+    sampler_ = req.sampler;
+    if (req.do_sample && sampler_.seed != 0) {
+        sampler_rng_.seed(sampler_.seed);
+    }
 }
 
 void Gemma4LayerSplitAdapter::reset_request_state() {
@@ -148,12 +151,14 @@ void Gemma4LayerSplitAdapter::reset_request_state() {
         shard.cache.cur_pos = 0;
         shard.cache.last_tok = -1;
     }
+    prefill_last_logits_.clear();
 }
 
 bool Gemma4LayerSplitAdapter::run_forward(
         const std::vector<int32_t> & tokens,
         int base_pos,
-        int & last_tok) {
+        int & last_tok,
+        std::vector<float> * logits_out) {
     if (shards_.empty() || tokens.empty()) return false;
     const Gemma4Weights & ref = shards_.front().weights;
     const int hidden = ref.n_embd;
@@ -336,9 +341,9 @@ bool Gemma4LayerSplitAdapter::run_forward(
 
     std::vector<int32_t> argmax;
     Gemma4LayerSplitShard & last = shards_.back();
-    const bool ok = compute_gemma4_split_argmax(
+    const bool ok = compute_gemma4_split_projection(
         last.backend, last.weights, act_in,
-        n_tokens_total - 1, 1, argmax);
+        n_tokens_total - 1, 1, &argmax, logits_out);
     activation_buffer_free(orig);
     activation_pair_free(acts);
     if (!ok || argmax.empty()) return false;
@@ -353,7 +358,8 @@ bool Gemma4LayerSplitAdapter::run_forward(
 bool Gemma4LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
                                       int base_pos,
                                       int & last_tok) {
-    return run_forward(prompt, base_pos, last_tok);
+    return run_forward(prompt, base_pos, last_tok,
+                       sampler_.needs_logit_processing() ? &prefill_last_logits_ : nullptr);
 }
 
 bool Gemma4LayerSplitAdapter::decode_ar(
@@ -366,6 +372,13 @@ bool Gemma4LayerSplitAdapter::decode_ar(
     if (shards_.empty()) return false;
 
     const auto & w = shards_.front().weights;
+    const int vocab = w.n_vocab;
+    std::vector<float> logits_buf;
+    if (sampler_.needs_logit_processing()) {
+        if ((int)prefill_last_logits_.size() != vocab) return false;
+        last_tok = sample_logits(prefill_last_logits_.data(), vocab, sampler_,
+                                 out_tokens, sampler_rng_);
+    }
     out_tokens.push_back(last_tok);
     io.emit(last_tok);
     if (io.cancelled) {
@@ -381,7 +394,16 @@ bool Gemma4LayerSplitAdapter::decode_ar(
     for (int i = 1; i < n_gen; ++i) {
         std::vector<int32_t> one(1, last_tok);
         int next_tok = -1;
-        if (!run_forward(one, committed - 1, next_tok)) return false;
+        logits_buf.clear();
+        if (!run_forward(one, committed - 1, next_tok,
+                         sampler_.needs_logit_processing() ? &logits_buf : nullptr)) {
+            return false;
+        }
+        if (sampler_.needs_logit_processing()) {
+            if ((int)logits_buf.size() != vocab) return false;
+            next_tok = sample_logits(logits_buf.data(), vocab, sampler_,
+                                     out_tokens, sampler_rng_);
+        }
         last_tok = next_tok;
         out_tokens.push_back(last_tok);
         io.emit(last_tok);

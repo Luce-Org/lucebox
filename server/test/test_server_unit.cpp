@@ -1401,6 +1401,7 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     std::vector<int32_t> emitted_tokens;
     bool dflash_enabled = false;
     bool dflash_called = false;
+    bool sampling_enabled = false;
     int shutdown_calls = 0;
     ModelBackend::CompressRequest last_compress_req;
 
@@ -1435,6 +1436,7 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
         return true;
     }
     bool can_dflash_decode() const override { return dflash_enabled; }
+    bool supports_cpu_sampling() const override { return sampling_enabled; }
     bool decode_dflash(const std::vector<int32_t> & prompt, int base_pos,
                        int last_tok, int n_gen, std::vector<int32_t> & out_tokens,
                        const DaemonIO & io) override {
@@ -1527,6 +1529,42 @@ static void test_layer_split_backend_inline_snapshot_and_restore_delta() {
     TEST_ASSERT(raw->prefill_sizes[0] == 1);
     TEST_ASSERT(raw->dflash_base == 3);
     TEST_ASSERT(raw->dflash_last == 99);
+}
+
+static void test_layer_split_backend_sampling_capability_gate() {
+    {
+        auto * raw = new MockLayerSplitAdapter();
+        LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
+
+        GenerateRequest req;
+        req.prompt = {10, 11};
+        req.n_gen = 1;
+        req.do_sample = true;
+        req.sampler.temp = 0.8f;
+        DaemonIO io;
+        GenerateResult result = backend.generate(req, io);
+
+        TEST_ASSERT(!result.ok);
+        TEST_ASSERT(result.error == "sampling_unsupported");
+    }
+
+    {
+        auto * raw = new MockLayerSplitAdapter();
+        raw->sampling_enabled = true;
+        LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
+
+        GenerateRequest req;
+        req.prompt = {10, 11};
+        req.n_gen = 1;
+        req.do_sample = true;
+        req.sampler.temp = 0.8f;
+        DaemonIO io;
+        GenerateResult result = backend.generate(req, io);
+
+        TEST_ASSERT(result.ok);
+        TEST_ASSERT(result.tokens.size() == 1);
+        TEST_ASSERT(result.tokens[0] == 12);
+    }
 }
 
 static void test_layer_split_compress_nopark_uses_default_drafter_path() {
@@ -3442,6 +3480,7 @@ int main() {
     RUN_TEST(test_parse_target_device_list_single_gpu_is_not_layer_split);
     RUN_TEST(test_validate_layer_split_weights_shape);
     RUN_TEST(test_layer_split_backend_inline_snapshot_and_restore_delta);
+    RUN_TEST(test_layer_split_backend_sampling_capability_gate);
     RUN_TEST(test_layer_split_compress_nopark_uses_default_drafter_path);
     RUN_TEST(test_layer_split_compress_rejects_bad_keep_ratio);
     RUN_TEST(test_layer_split_backend_shutdown_is_idempotent);

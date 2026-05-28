@@ -171,6 +171,7 @@ void Qwen35LayerSplitAdapter::begin_request(const GenerateRequest & req) {
 
 void Qwen35LayerSplitAdapter::reset_request_state() {
     for (auto & shard : shards_) reset_target_cache(shard.cache);
+    prefill_last_logits_.clear();
 }
 
 bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
@@ -190,7 +191,8 @@ bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
         shards_, shards_.front().weights, prompt, base_pos, ubatch, last_tok,
         cfg_.kq_stride_pad, /*fa_window=*/0,
         (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
-        /*argmax_out=*/nullptr, /*logits_out=*/nullptr,
+        /*argmax_out=*/nullptr,
+        sampler_.needs_logit_processing() ? &prefill_last_logits_ : nullptr,
         cfg_.run_dflash ? &remote_draft_ : nullptr);
 }
 
@@ -377,14 +379,22 @@ bool Qwen35LayerSplitAdapter::decode_ar(
         std::vector<int32_t> & out_tokens,
         const DaemonIO & io) {
     if (n_gen <= 0) return true;
+    const auto & w = shards_.front().weights;
+    const int vocab = w.n_vocab;
+    std::vector<float> logits_buf;
 
+    if (sampler_.needs_logit_processing()) {
+        if ((int)prefill_last_logits_.size() != vocab) return false;
+        last_tok = sample_logits(prefill_last_logits_.data(), vocab, sampler_,
+                                 out_tokens, sampler_rng_);
+    }
     out_tokens.push_back(last_tok);
     io.emit(last_tok);
     if (io.cancelled) {
         io.emit(-1);
         return true;
     }
-    if (is_eos_tok(last_tok, shards_.front().weights)) {
+    if (is_eos_tok(last_tok, w)) {
         io.emit(-1);
         return true;
     }
@@ -393,16 +403,24 @@ bool Qwen35LayerSplitAdapter::decode_ar(
     for (int i = 1; i < n_gen; ++i) {
         std::vector<int32_t> one(1, last_tok);
         int next_tok = -1;
+        logits_buf.clear();
         if (!run_qwen35_layer_split_forward(
                 shards_, shards_.front().weights, one, committed, 1, next_tok,
                 cfg_.kq_stride_pad, cfg_.fa_window,
-                cfg_.run_dflash ? &feature_ring_ : nullptr)) {
+                cfg_.run_dflash ? &feature_ring_ : nullptr,
+                /*argmax_out=*/nullptr,
+                sampler_.needs_logit_processing() ? &logits_buf : nullptr)) {
             return false;
+        }
+        if (sampler_.needs_logit_processing()) {
+            if ((int)logits_buf.size() != vocab) return false;
+            next_tok = sample_logits(logits_buf.data(), vocab, sampler_,
+                                     out_tokens, sampler_rng_);
         }
         out_tokens.push_back(next_tok);
         io.emit(next_tok);
         if (io.cancelled) break;
-        if (is_eos_tok(next_tok, shards_.front().weights)) break;
+        if (is_eos_tok(next_tok, w)) break;
         last_tok = next_tok;
         ++committed;
     }
@@ -411,7 +429,7 @@ bool Qwen35LayerSplitAdapter::decode_ar(
 }
 
 bool Qwen35LayerSplitAdapter::can_dflash_decode() const {
-    return cfg_.run_dflash && cfg_.draft_path && sampler_.temp == 0.0f;
+    return cfg_.run_dflash && cfg_.draft_path && !sampler_.needs_logit_processing();
 }
 
 bool Qwen35LayerSplitAdapter::decode_dflash(

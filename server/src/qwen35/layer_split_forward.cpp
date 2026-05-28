@@ -17,7 +17,7 @@
 
 namespace dflash::common {
 
-bool compute_target_split_argmax(
+bool compute_target_split_projection(
         StepGraph & sg,
         const TargetWeights & w,
         ggml_backend_t backend,
@@ -26,7 +26,8 @@ bool compute_target_split_argmax(
         int n_tokens,
         int hidden,
         int vocab,
-        std::vector<int32_t> & argmax_out) {
+        std::vector<int32_t> * argmax_out,
+        std::vector<float> * logits_out) {
     step_graph_free(sg);
     ggml_init_params ip{};
     ip.mem_size = 256 * 1024 * 1024;
@@ -43,22 +44,49 @@ bool compute_target_split_argmax(
     ggml_tensor * logits = ggml_mul_mat(sg.ctx, w.output, normed);
     ggml_set_name(logits, "target_split_logits");
     sg.logits = logits;
-    sg.argmax_tokens = ggml_argmax(sg.ctx, logits);
-    ggml_set_name(sg.argmax_tokens, "target_split_argmax");
-    ggml_set_output(sg.argmax_tokens);
+    if (argmax_out) {
+        sg.argmax_tokens = ggml_argmax(sg.ctx, logits);
+        ggml_set_name(sg.argmax_tokens, "target_split_argmax");
+        ggml_set_output(sg.argmax_tokens);
+    }
+    if (logits_out) {
+        ggml_set_output(sg.logits);
+    }
     sg.gf = ggml_new_graph_custom(sg.ctx, 1024, false);
-    ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
+    if (argmax_out) ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
+    if (logits_out) ggml_build_forward_expand(sg.gf, sg.logits);
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     }
     if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) return false;
     auto st = ggml_backend_graph_compute(backend, sg.gf);
     if (st != GGML_STATUS_SUCCESS) return false;
-    (void)vocab;
-    argmax_out.assign((size_t)n_tokens, 0);
-    ggml_backend_tensor_get(sg.argmax_tokens, argmax_out.data(), 0,
-                            sizeof(int32_t) * (size_t)n_tokens);
+    if (argmax_out) {
+        argmax_out->assign((size_t)n_tokens, 0);
+        ggml_backend_tensor_get(sg.argmax_tokens, argmax_out->data(), 0,
+                                sizeof(int32_t) * (size_t)n_tokens);
+    }
+    if (logits_out) {
+        logits_out->assign((size_t)vocab * (size_t)n_tokens, 0.0f);
+        ggml_backend_tensor_get(sg.logits, logits_out->data(), 0,
+                                sizeof(float) * (size_t)vocab * (size_t)n_tokens);
+    }
     return true;
+}
+
+bool compute_target_split_argmax(
+        StepGraph & sg,
+        const TargetWeights & w,
+        ggml_backend_t backend,
+        ggml_tensor * act,
+        int token_offset,
+        int n_tokens,
+        int hidden,
+        int vocab,
+        std::vector<int32_t> & argmax_out) {
+    return compute_target_split_projection(
+        sg, w, backend, act, token_offset, n_tokens, hidden, vocab,
+        &argmax_out, nullptr);
 }
 
 bool run_qwen35_layer_split_forward(
@@ -208,9 +236,10 @@ bool run_qwen35_layer_split_forward(
     const bool need_all_argmax = argmax_out != nullptr;
     const int argmax_offset = need_all_argmax ? 0 : (n_tokens_total - 1);
     const int argmax_count = need_all_argmax ? n_tokens_total : 1;
-    const bool ok = compute_target_split_argmax(
+    const bool ok = compute_target_split_projection(
         final_sg, last_shard.weights, last_shard.backend, act_in,
-        argmax_offset, argmax_count, hidden, vocab, argmax_tokens);
+        argmax_offset, argmax_count, hidden, vocab,
+        &argmax_tokens, logits_out);
     step_graph_destroy(final_sg);
     activation_pair_free(acts);
     if (!ok) return false;
@@ -220,7 +249,6 @@ bool run_qwen35_layer_split_forward(
         shard.cache.last_tok = last_tok;
     }
     if (argmax_out) *argmax_out = std::move(argmax_tokens);
-    if (logits_out) logits_out->clear();
     return true;
 }
 

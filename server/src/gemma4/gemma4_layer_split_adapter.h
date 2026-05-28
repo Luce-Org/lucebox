@@ -51,6 +51,7 @@ public:
     bool decode_ar(int last_tok, int committed, int n_gen,
                    std::vector<int32_t> & out_tokens,
                    const DaemonIO & io) override;
+    bool supports_cpu_sampling() const override { return true; }
 
     bool snapshot_save(int slot) override;
     void snapshot_free(int slot) override;
@@ -65,13 +66,17 @@ public:
 private:
     bool run_forward(const std::vector<int32_t> & tokens,
                      int base_pos,
-                     int & last_tok);
+                     int & last_tok,
+                     std::vector<float> * logits_out = nullptr);
 
     Gemma4LayerSplitAdapterConfig cfg_;
     std::vector<Gemma4LayerSplitShard> shards_;
     std::vector<ggml_backend_t> snapshot_backends_;
     std::vector<Gemma4LayerSplitSnapshot> snapshots_;
     static constexpr int PREFIX_SLOTS = ModelBackend::kMaxSlots;
+    SamplerCfg sampler_;
+    std::mt19937_64 sampler_rng_{std::random_device{}()};
+    std::vector<float> prefill_last_logits_;
 };
 
 void free_gemma4_layer_split_shards(std::vector<Gemma4LayerSplitShard> & shards);

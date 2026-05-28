@@ -286,6 +286,15 @@ bool compute_gemma4_split_argmax(
     int                     n_tokens,
     std::vector<int32_t> &  out_argmax);
 
+bool compute_gemma4_split_projection(
+    ggml_backend_t          backend,
+    const Gemma4Weights &   w,
+    ggml_tensor *           act,
+    int                     token_offset,
+    int                     n_tokens,
+    std::vector<int32_t> *  out_argmax,
+    std::vector<float> *    out_logits);
+
 // BSA sparse-FA prefill: process the full prompt at once using block-sparse
 // attention for SWA layers (flash_prefill_forward_bf16). Full-attention layers
 // use dense FA. Returns logits for the last token.  Populates the KV cache
