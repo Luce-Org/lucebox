@@ -4,8 +4,8 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-27T22:20:33-04:00 through 2026-05-27T22:29:30-04:00
-Current stack tip before this refresh: `1985b45` (already aligned with `origin/main` `4f4d82e`; this run found no upstream-base advance, revalidated open PR heads, performed fresh direct merge probes for all remaining non-ancestor non-draft PRs, and selectively ported the safe PR #39 draft-config/YaRN subset).
+Last refresh: 2026-05-27T22:46:08-04:00 through 2026-05-27T22:47:00-04:00
+Current stack tip before this refresh: `e414a87` (already aligned with `origin/main` `4f4d82e`; this run found no upstream-base advance and revalidated all open non-draft contributor PR heads with fresh fetches, ancestry checks, and direct merge probes).
 
 ## Included in the current stack
 
@@ -28,7 +28,7 @@ Current stack tip before this refresh: `1985b45` (already aligned with `origin/m
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| all non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated reconciliation worktree `/tmp/luce-auto-cron-20260527-222142` rebased/checked the stack against `origin/main` (already up to date) and then attempted `--no-commit` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every direct probe conflicted; consolidated conflict output is retained in `/tmp/luce-merge-probes-20260527-222142.txt`. |
+| all non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated reconciliation worktree `/tmp/luce-auto-cron-20260527-224700` confirmed `origin/main` was already merged and then attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every direct probe conflicted; consolidated conflict output is retained in `/tmp/luce-merge-probes-20260527-224700.txt`. No PR head newly became mechanically mergeable since the previous refresh. |
 | #39 | partially integrated | Fresh conflicted worktree `/tmp/luce-attempt-pr39-20260527-222159` plus tmux-driven Codex session `luce-pr39-codex-20260527-222159` produced `/tmp/pr39-survivorship-20260527-222159.txt`. Codex found the MoE loader/FFN/target-graph pieces already superseded by current qwen35moe/DDTree code, but identified draft safetensors config parsing and YaRN RoPE as portable. This run ported that subset into `server/src/draft/draft_safetensors_loader.cpp` and `server/src/draft/draft_graph.cpp`; old `dflash/` files and obsolete tests were not resurrected. |
 | #221 | not integrated | Fresh conflicted worktree `/tmp/luce-attempt-pr221-20260527-2149` plus tmux-driven Codex session `luce-pr221-codex-2149` produced `/tmp/pr221-feasibility-20260527-2149.txt`. Codex concluded direct merge is unsafe: PR #221 layers prefix-cache warm/ghost behavior and speculator dispatch on top of the older MTP foundation, mixes legacy `dflash/` paths with current `server/`, adds `qwen36` MTP pathing likely superseded by PR #237's current naming, and should wait for a current-layout PR #237/equivalent MTP foundation before selectively porting prefix-cache/range-warm pieces. |
 | #237 | not integrated | Fresh worktree merge probe in `/tmp/luce-auto-cron-20260527-214507` reproduced the same broad conflicts across current `server/CMakeLists.txt`, common backend/MTP interfaces, Qwen35 loader/graph/backend files, tests, and deleted legacy `dflash/scripts/server.py` / `dflash/src/server/server_main.cpp`; prior tmux-driven Codex session `luce-pr237-codex-2124` wrote `/tmp/pr237-feasibility-20260527-2124.txt`: selective port is feasible, but a direct conflict-marker resolution is unsafe because the current native server CLI/config, Qwen35 MoE/remote-draft/thinking-budget behavior, and restore/prefix-cache semantics must be preserved with MTP off by default first. |
@@ -78,6 +78,18 @@ Draft PRs remain outside the primary contributor integration target: #289, #286,
 ## Validation run
 
 This run performed:
+
+- 2026-05-27 22:46 preflight: `date -Is`, primary `git status --short` (clean), branch/remotes, `gh auth status`, `claude auth status --text`, and `codex --version` with the real user HOME/config.
+- `git fetch --prune origin` and `git fetch --prune easel`.
+- `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...`.
+- Targeted fetches for all open non-draft PR refs (`origin/pr/<n>`).
+- `git merge-base --is-ancestor origin/pr/<n> easel/auto-integration` classification checks: #284, #276, #274, #266, #152, and #142 are current ancestors; #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39 remain non-ancestor/selective-port candidates.
+- Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260527-224700`; `git merge --no-edit origin/main` reported already up to date.
+- Fresh direct merge probes for all currently non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260527-224700.txt`.
+- `git diff --check -- docs/auto-integration.md` (clean).
+- No source/build validation was rerun because this refresh changed only integration metadata; the previous source validation result remains unchanged: local CMake/CUDA configure fails before project compilation on unsupported `sm_52` compiler identification in this WSL CUDA setup.
+
+Previous retained validation/audit details:
 
 - 2026-05-27 22:20 preflight: `date -Is`, primary `git status --short` (clean), branch/remotes, `gh auth status`, `claude auth status --text`, and `codex --help` with the real user HOME/config.
 - `git fetch --prune origin` and `git fetch --prune easel`.
@@ -141,8 +153,9 @@ This run performed:
 
 ## Notes
 
-- Primary checkout `/home/erik/Projects/luce2` was clean at start and was not edited directly during reconciliation.
-- Retained worktree `/tmp/luce-auto-cron-20260527-222142` for this selective-port commit and probe audit.
+- Primary checkout `/home/erik/Projects/luce2` was clean at start and was only edited for the final metadata refresh after probe verification.
+- Retained worktree `/tmp/luce-auto-cron-20260527-224700` for this metadata refresh and probe audit; consolidated direct-merge probe output is `/tmp/luce-merge-probes-20260527-224700.txt`.
+- Retained worktree `/tmp/luce-auto-cron-20260527-222142` for the prior selective-port commit and probe audit.
 - Retained conflicted worktree `/tmp/luce-attempt-pr39-20260527-222159` for audit; it contains unmerged PR #39 probe state and Codex report `/tmp/pr39-survivorship-20260527-222159.txt`.
 - Retained worktree `/tmp/luce-auto-cron-20260527-214507` for this metadata refresh until pushed/verified.
 - Retained conflicted worktree `/tmp/luce-attempt-pr221-20260527-2149` for audit; it contains unmerged PR #221 probe state and Codex report `/tmp/pr221-feasibility-20260527-2149.txt`.
