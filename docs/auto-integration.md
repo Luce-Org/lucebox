@@ -4,17 +4,18 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T17:38:15-04:00
+Last refresh: 2026-05-28T17:42:06-04:00
 Current base: `origin/main` `6691d3b4`
-Current integration tip before this refresh: `easel/auto-integration` `dd4c82b1`
-Refreshed stack tip prepared in this run: this commit
+Current integration tip before this refresh: `easel/auto-integration` `faf8165e`
+Refreshed stack tip prepared in this run: merge commit `dd5e556e`
 
 This branch is maintained as a reproducible patch stack over `origin/main`.
 The primary checkout was clean at the start of this unattended run. Since the
 previous refresh, `origin/main` advanced from `9ed3c155` to `6691d3b4` by
 merging PR #292. The existing `easel/auto-integration` stack already contained
 that PR head, so an isolated worktree merge of `origin/main` completed with no
-new tree changes and required no merge commit.
+new tree changes. The local checkout then recorded a merge commit to keep
+ancestry aligned with upstream.
 
 All currently direct-mergeable non-draft contributor PRs are included in the
 stack. Remaining non-ancestor PRs still conflict in old-layout MTP/scheduler or
@@ -45,8 +46,8 @@ than direct merges.
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| upstream sync | already integrated | `git merge --no-ff --no-commit origin/main` in `/tmp/luce-auto-cron-20260528-173715` completed with no tree changes because PR #292 was already carried before it landed upstream. |
-| current integrated PRs | checked | `git merge-base --is-ancestor origin/pr/<n> HEAD` passed for open non-draft PRs #295, #294, #289, #276, #274, #266, #152, and #142. #292/#298/#299/#300/#301/#302 are included through `origin/main`. |
+|| upstream sync | merged cleanly | `git merge --no-ff --no-edit origin/main` in the primary checkout created merge commit `dd5e556e` with no tree changes because PR #292 was already carried before it landed upstream. |
+|| current integrated PRs | checked | `git merge-base --is-ancestor origin/pr/<n> HEAD` passed for open non-draft PRs #295, #294, #289, #276, #274, #266, #152, and #142. #292/#298/#299/#300/#301/#302 are included through `origin/main`. |
 | #237 | blocked-needs-human / selective-port | Direct merge still conflicts across moved legacy `dflash/` server paths, CMake, backend factory, common MTP interfaces/orchestrator, Qwen35 backend/graph/loader files, and tests. A current-layout MTP foundation port remains the next useful action. |
 | #221 | blocked-needs-human / dependency | Direct merge still conflicts across old prefix-cache/MTP/common/Qwen35 files, server tests, and legacy script paths. It depends on a current-layout #237-equivalent MTP foundation before a useful port can be made. |
 | #154 | blocked-needs-human / dependency | Direct merge conflicts in legacy `dflash/CMakeLists.txt`, MTP docs, `server/src/internal.h`, Qwen35 loader/target graph, and MTP smoke/contract tests. Portable only after current-layout Qwen35 MTP exists. |
@@ -82,20 +83,16 @@ dependency awareness: #297, #291, #290, #286, #285, #275, #249, and #193.
 
 This run performed:
 
-- `date -Is` -> 2026-05-28T17:36:42-04:00 at preflight; manifest refresh timestamp 2026-05-28T17:38:15-04:00.
-- Primary checkout `/home/erik/Projects/luce2` `git status --short` was clean before work began.
-- `git branch --show-current` reported `auto-integration` in the primary checkout.
-- `git remote -v` verified `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
-- `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status` succeeded for account `easel` with repo/workflow scopes.
-- `HOME=/home/erik /home/erik/.local/bin/claude auth status --text` succeeded for the Claude Team account.
-- `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --version` completed successfully with `codex-cli 0.130.0`.
+- `date -Is` -> 2026-05-28T17:42:06-04:00 for the final sync/push timestamp.
+- Primary checkout `/home/erik/Projects/luce2` was clean before the upstream sync step.
 - `git fetch --prune origin` and `git fetch --prune easel` completed separately; targeted fetches recreated open non-draft contributor PR refs.
-- Worktree `/tmp/luce-auto-cron-20260528-173715` was created from `easel/auto-integration` `dd4c82b1`.
-- `git merge --no-ff --no-commit origin/main` completed with no conflicts and no tree changes.
+- Worktree `/tmp/luce-auto-cron-20260528-173715` was created from `easel/auto-integration` `dd4c82b1` for isolated direct PR probes.
+- `git merge --no-ff --no-commit origin/main` in the worktree completed with no conflicts and no tree changes because PR #292 was already carried before it landed upstream.
+- The primary checkout then recorded `git merge --no-ff --no-edit origin/main`, producing merge commit `dd5e556e` with no content changes.
 - Isolated direct probes attempted `git merge --no-commit --no-ff origin/pr/<n>` for #237, #221, #154, #153, #137, #135, #94, and #48; each conflicted and was aborted in the worktree. Logs: `/tmp/luce-merge-probes-20260528-173715.txt` and `/tmp/luce-merge-probe-237-20260528-173715.txt`.
 - Ancestor checks passed for included open non-draft contributor PR refs #295, #294, #289, #276, #274, #266, #152, and #142.
-- `bash -n harness/clients/common.sh`, `git diff --check`, and an anchored conflict-marker scan (`git grep -n -E '^(<<<<<<<|>>>>>>>|=======)( |$)' -- . ':!server/eval/humaneval_plus/humanevalplus.jsonl'`) passed before this manifest commit.
-- Push status is recorded after this manifest commit and final push attempt.
+- `bash -n harness/clients/common.sh`, `git diff --check`, and an anchored conflict-marker scan (`git grep -n -E '^(<<<<<<<|>>>>>>>|=======)( |$)' -- . ':!server/eval/humaneval_plus/humanevalplus.jsonl'`) passed after the manifest refresh.
+- `git push easel auto-integration` updated the writable remote from `faf8165e` to `dd5e556e`.
 
 ## Notes
 
