@@ -773,9 +773,6 @@ if(DFLASH27B_TESTS)
             src/server/http_server.cpp
             src/server/model_card.cpp)
         target_include_directories(test_server_unit PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        target_include_directories(test_server_unit PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/common)
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(test_server_unit PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
         else()
@@ -783,11 +780,13 @@ if(DFLASH27B_TESTS)
                 DFLASH27B_BACKEND_CUDA=1
                 DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
         endif()
-        target_link_libraries(test_server_unit PRIVATE
-            ggml-base
-            ggml-cpu
-            nlohmann_json::nlohmann_json
-            pthread)
+        target_link_libraries(test_server_unit PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_server_unit PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_server_unit PRIVATE hip::host)
+        endif()
         add_test(NAME server_unit COMMAND test_server_unit)
     endif()
 
