@@ -358,8 +358,7 @@ bool Gemma4LayerSplitAdapter::run_forward(
 bool Gemma4LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
                                       int base_pos,
                                       int & last_tok) {
-    return run_forward(prompt, base_pos, last_tok,
-                       sampler_.needs_logit_processing() ? &prefill_last_logits_ : nullptr);
+    return run_forward(prompt, base_pos, last_tok, &prefill_last_logits_);
 }
 
 bool Gemma4LayerSplitAdapter::decode_ar(
@@ -477,6 +476,7 @@ bool Gemma4LayerSplitAdapter::snapshot_save(int slot) {
     }
     snap.cur_pos = snap_pos;
     snap.last_tok = shards_.front().cache.last_tok;
+    snap.prefill_last_logits = prefill_last_logits_;
     return true;
 }
 
@@ -488,6 +488,7 @@ void Gemma4LayerSplitAdapter::snapshot_free(int slot) {
     }
     snap.cur_pos = 0;
     snap.last_tok = -1;
+    snap.prefill_last_logits.clear();
     if (snap.shards.size() != shards_.size()) snap.shards.resize(shards_.size());
 }
 
@@ -498,6 +499,7 @@ bool Gemma4LayerSplitAdapter::snapshot_used(int slot) const {
     }
     const auto & snap = snapshots_[(size_t)slot];
     if (snap.cur_pos <= 0 || snap.shards.size() != shards_.size()) return false;
+    if (snap.prefill_last_logits.empty()) return false;
     for (const auto & ss : snap.shards) {
         if (!ss.ctx) return false;
     }
@@ -537,6 +539,7 @@ bool Gemma4LayerSplitAdapter::snapshot_restore(int slot) {
         shards_[i].cache.cur_pos = snap.cur_pos;
         shards_[i].cache.last_tok = snap.last_tok;
     }
+    prefill_last_logits_ = snap.prefill_last_logits;
     return true;
 }
 

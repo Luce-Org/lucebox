@@ -30,6 +30,7 @@ struct Gemma4LayerSplitSnapshot {
     int cur_pos = 0;
     int32_t last_tok = -1;
     std::vector<Gemma4Snapshot> shards;
+    std::vector<float> prefill_last_logits;
 };
 
 class Gemma4LayerSplitAdapter : public LayerSplitAdapter {

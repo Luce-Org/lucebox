@@ -100,6 +100,7 @@ private:
     bool pflash_drafter_loaded_ = false;
     static constexpr int PREFIX_SLOTS = ModelBackend::kMaxSlots;
     std::vector<std::vector<PrefixSnapshot>> prefix_snapshots_;
+    std::vector<std::vector<float>> snapshot_prefill_logits_;
     std::vector<ggml_backend_t> snapshot_backends_;
     struct DraftFeatureSnapshot {
         int cur_pos = 0;

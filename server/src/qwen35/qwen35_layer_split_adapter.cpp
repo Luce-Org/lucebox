@@ -86,6 +86,7 @@ bool Qwen35LayerSplitAdapter::init() {
     for (auto & slot : prefix_snapshots_) {
         slot.resize(shards_.size());
     }
+    snapshot_prefill_logits_.resize(PREFIX_SLOTS);
     draft_feature_snapshots_.resize(PREFIX_SLOTS);
 
     return true;
@@ -192,7 +193,7 @@ bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
         cfg_.kq_stride_pad, /*fa_window=*/0,
         (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
         /*argmax_out=*/nullptr,
-        sampler_.needs_logit_processing() ? &prefill_last_logits_ : nullptr,
+        &prefill_last_logits_,
         cfg_.run_dflash ? &remote_draft_ : nullptr);
 }
 
@@ -217,6 +218,8 @@ bool Qwen35LayerSplitAdapter::snapshot_save(int slot) {
             return false;
         }
     }
+    if (snapshot_prefill_logits_.size() != (size_t)PREFIX_SLOTS) return false;
+    snapshot_prefill_logits_[(size_t)slot] = prefill_last_logits_;
     if (!snapshot_draft_features(slot)) {
         snapshot_free(slot);
         return false;
@@ -229,6 +232,9 @@ void Qwen35LayerSplitAdapter::snapshot_free(int slot) {
     for (auto & snap : prefix_snapshots_[(size_t)slot]) {
         free_prefix_snapshot(snap);
     }
+    if (snapshot_prefill_logits_.size() == (size_t)PREFIX_SLOTS) {
+        snapshot_prefill_logits_[(size_t)slot].clear();
+    }
     free_draft_feature_snapshot(slot);
 }
 
@@ -238,6 +244,10 @@ bool Qwen35LayerSplitAdapter::snapshot_used(int slot) const {
     if (snaps.size() != shards_.size()) return false;
     for (const auto & snap : snaps) {
         if (!snap.ctx) return false;
+    }
+    if (snapshot_prefill_logits_.size() != (size_t)PREFIX_SLOTS ||
+        snapshot_prefill_logits_[(size_t)slot].empty()) {
+        return false;
     }
     if (cfg_.run_dflash && cfg_.draft_path) {
         if (draft_feature_snapshots_.size() != (size_t)PREFIX_SLOTS) return false;
@@ -263,6 +273,8 @@ bool Qwen35LayerSplitAdapter::snapshot_restore(int slot) {
             return false;
         }
     }
+    if (snapshot_prefill_logits_.size() != (size_t)PREFIX_SLOTS) return false;
+    prefill_last_logits_ = snapshot_prefill_logits_[(size_t)slot];
     if (!restore_draft_features(slot)) return false;
     return true;
 }
@@ -517,6 +529,7 @@ void Qwen35LayerSplitAdapter::shutdown() {
         for (auto & snap : slot) free_prefix_snapshot(snap);
     }
     prefix_snapshots_.clear();
+    snapshot_prefill_logits_.clear();
     draft_feature_snapshots_.clear();
     auto shard_metas = layer_split_shard_metas(shards_);
     free_layer_split_snapshot_backends(shard_metas, snapshot_backends_);
