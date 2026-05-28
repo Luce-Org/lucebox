@@ -1135,6 +1135,90 @@ static void test_jinja_render_bad_tools_json_throws() {
     TEST_ASSERT(threw);
 }
 
+// ---------------------------------------------------------------------------
+// Drafter / target distribution alignment (closed <think> prefill on Qwen3).
+// The hard-coded Qwen renderer appends a closed think prefill when thinking is
+// disabled; some Qwen3.6 Jinja templates omit it. render_chat_template_jinja
+// mirrors the hard-coded behavior when arch_hint == QWEN3 && !enable_thinking
+// && the rendered prompt ends with a bare assistant generation marker.
+// ---------------------------------------------------------------------------
+
+static const char QWEN3_BARE_ASSISTANT_TPL[] =
+    "{%- for m in messages -%}"
+    "<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n"
+    "{%- endfor -%}"
+    "{%- if add_generation_prompt -%}"
+    "<|im_start|>assistant\n"
+    "{%- endif -%}";
+
+static void test_jinja_render_qwen3_closes_think_when_thinking_off() {
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    std::string out = render_chat_template_jinja(
+        QWEN3_BARE_ASSISTANT_TPL, msgs, "", "",
+        /*add_gen=*/true, /*think=*/false, /*tools=*/"",
+        /*arch_hint=*/ChatFormat::QWEN3);
+    TEST_ASSERT(out.find("<|im_start|>assistant\n<think>\n\n</think>\n\n") != std::string::npos);
+}
+
+static void test_jinja_render_does_not_close_think_when_thinking_on() {
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    std::string out = render_chat_template_jinja(
+        QWEN3_BARE_ASSISTANT_TPL, msgs, "", "",
+        /*add_gen=*/true, /*think=*/true, /*tools=*/"",
+        /*arch_hint=*/ChatFormat::QWEN3);
+    TEST_ASSERT(out.find("</think>") == std::string::npos);
+}
+
+static void test_jinja_render_does_not_close_think_for_non_qwen3_arch() {
+    // Laguna and Gemma4 do not use ChatML tokens; the closed-think suffix
+    // must NOT be appended for them even if the rendered prompt happens to
+    // end with the same string.
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    std::string out_laguna = render_chat_template_jinja(
+        QWEN3_BARE_ASSISTANT_TPL, msgs, "", "",
+        /*add_gen=*/true, /*think=*/false, /*tools=*/"",
+        /*arch_hint=*/ChatFormat::LAGUNA);
+    TEST_ASSERT(out_laguna.find("</think>") == std::string::npos);
+    std::string out_gemma4 = render_chat_template_jinja(
+        QWEN3_BARE_ASSISTANT_TPL, msgs, "", "",
+        /*add_gen=*/true, /*think=*/false, /*tools=*/"",
+        /*arch_hint=*/ChatFormat::GEMMA4);
+    TEST_ASSERT(out_gemma4.find("</think>") == std::string::npos);
+}
+
+static void test_chat_format_for_arch_qwen35moe_returns_qwen3() {
+    // qwen35moe MUST inherit ChatFormat::QWEN3 — the closed-think prefill
+    // depends on it, and a future enum-add must not silently flip behavior.
+    TEST_ASSERT(chat_format_for_arch("qwen35moe") == ChatFormat::QWEN3);
+    TEST_ASSERT(chat_format_for_arch("qwen35")    == ChatFormat::QWEN3);
+    TEST_ASSERT(chat_format_for_arch("qwen3")     == ChatFormat::QWEN3);
+    TEST_ASSERT(chat_format_for_arch("laguna")    == ChatFormat::LAGUNA);
+    TEST_ASSERT(chat_format_for_arch("gemma4")    == ChatFormat::GEMMA4);
+}
+
+static void test_jinja_render_does_not_double_append_close_think() {
+    // A user-supplied template that already closes the think block must not
+    // get a second </think> suffix from the bare-marker post-processing.
+    static const char TPL_ALREADY_CLOSED[] =
+        "{%- for m in messages -%}"
+        "<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n"
+        "{%- endfor -%}"
+        "{%- if add_generation_prompt -%}"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        "{%- endif -%}";
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    std::string out = render_chat_template_jinja(
+        TPL_ALREADY_CLOSED, msgs, "", "",
+        /*add_gen=*/true, /*think=*/false, /*tools=*/"",
+        /*arch_hint=*/ChatFormat::QWEN3);
+    // Exactly one </think> — the one the template emitted itself.
+    size_t first  = out.find("</think>");
+    size_t second = (first == std::string::npos) ? std::string::npos
+                                                  : out.find("</think>", first + 1);
+    TEST_ASSERT(first  != std::string::npos);
+    TEST_ASSERT(second == std::string::npos);
+}
+
 static void test_normalize_responses_tool_followup_messages() {
     ToolMemory tool_memory;
     const std::string call_id = "call_exec_001";
@@ -3218,6 +3302,11 @@ int main() {
     RUN_TEST(test_jinja_render_empty_tools_skipped);
     RUN_TEST(test_jinja_render_bos_eos_threaded);
     RUN_TEST(test_jinja_render_empty_template_throws);
+    RUN_TEST(test_jinja_render_qwen3_closes_think_when_thinking_off);
+    RUN_TEST(test_jinja_render_does_not_close_think_when_thinking_on);
+    RUN_TEST(test_jinja_render_does_not_close_think_for_non_qwen3_arch);
+    RUN_TEST(test_chat_format_for_arch_qwen35moe_returns_qwen3);
+    RUN_TEST(test_jinja_render_does_not_double_append_close_think);
     RUN_TEST(test_jinja_render_bad_tools_json_throws);
     RUN_TEST(test_normalize_responses_tool_followup_messages);
 
