@@ -30,7 +30,7 @@ struct Qwen35DaemonArgs {
     bool         fast_rollback     = false;
     bool         seq_verify        = false;
     bool         ddtree_mode       = false;
-    int          ddtree_budget     = 64;
+    int          ddtree_budget     = 22;
     float        ddtree_temp       = 1.0f;
     bool         ddtree_chain_seed = true;
     bool         use_feature_mirror = false;

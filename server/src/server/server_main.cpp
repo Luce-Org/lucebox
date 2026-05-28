@@ -154,7 +154,7 @@ static void print_usage(const char * prog) {
         "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
         "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
         "  --ddtree             Enable DDTree speculative decode\n"
-        "  --ddtree-budget <N>  DDTree budget (default: 64)\n"
+        "  --ddtree-budget <N>  DDTree budget (default: 22)\n"
         "  --no-cors            Disable CORS headers\n"
         "  --think-max-tokens <N>     Phase-1 reasoning cap when a request opts in\n"
         "                             via thinking:{type:enabled} (default: 15488 =\n"

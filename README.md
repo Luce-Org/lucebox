@@ -167,7 +167,7 @@ DFLASH27B_KV_TQ3=1 \
 | Flag | Default | Effect |
 |---|---|---|
 | `--ddtree` | off (chain) | Enable tree verify |
-| `--ddtree-budget N` | `22` | Tree size. 22 on 3090, 40 on 5090, re-sweep on GB10 |
+| `--ddtree-budget N` | `22` | Tree size. 22 on 3090 (default), 40 on 5090, re-sweep on GB10 |
 | `--fa-window N` | `2048` | Sliding FA window; `0` = full attention |
 | `--lazy-draft` | off | Defer draft load until first request |
 
@@ -179,7 +179,6 @@ DFLASH27B_KV_TQ3=1 \
 | `--prefill-threshold N` | `32000` | Token threshold for `auto` |
 | `--prefill-keep-ratio F` | `0.05` | Fraction of source tokens kept (0.02 @128K, 0.10 @32K) |
 | `--prefill-drafter <gguf>` | required if on | Drafter weights (Qwen3-0.6B BF16 GGUF) |
-| `--prefill-drafter-tokenizer <repo>` | `Qwen/Qwen3-0.6B` | HF tokenizer for drafter vocab |
 | `--prefill-skip-park` | off | Keep drafter resident across requests (more VRAM, faster) |
 | `DFLASH_FP_USE_BSA=1` | `0` | Dispatch sparse FA through BSA (sm_80+); required for headline 10.4× |
 | `DFLASH_FP_ALPHA=0.85` | `0.12` | Block-selection threshold; higher = stricter = fewer K-blocks |
@@ -189,7 +188,7 @@ DFLASH27B_KV_TQ3=1 \
 
 | Flag / env | Default | Effect |
 |---|---|---|
-| `--cache-type-k <t>` / `--cache-type-v <t>` | `tq3_0` | Per-side quant: `f16,bf16,q4_0,q4_1,q5_0,q5_1,q8_0,tq3_0` |
+| `--cache-type-k <t>` / `--cache-type-v <t>` | env-driven | Per-side quant override: `f16,bf16,q4_0,q4_1,q5_0,q5_1,q8_0,tq3_0` |
 | `DFLASH27B_KV_TQ3=1` | (default) | Preset TQ3_0 K+V (3.5 bpv, fits 256K @ 24 GB) |
 | `DFLASH27B_KV_Q4=1` | off | Q4_0 K+V (4.5 bpv, legacy, ~128K ceiling) |
 | `--prefix-cache-slots N` | — | Live prefix-cache slot count |
@@ -214,7 +213,7 @@ DFLASH27B_KV_TQ3=1 \
 | `--target-devices <list>` / `--target-layer-split` | single GPU | Layer-split target across GPUs |
 | `--draft-ipc-bin <path>` | — | Out-of-process draft binary (mixed CUDA/HIP) |
 | `--peer-access` | off | Enable P2P between target GPUs |
-| `--chunk N` | `1024` | Prefill ubatch size |
+| `--chunk N` | backend default | Prefill ubatch size |
 | `--no-cors` | CORS on | Disable CORS headers |
 
 [DFlash benchmarks →](server/RESULTS.md) · [DFlash blog →](https://lucebox.com/blog/dflash27b) · [PFlash benchmarks →](optimizations/pflash/README.md) · [PFlash blog →](https://lucebox.com/blog/pflash) · [Per-machine quick starts (DGX Spark, Jetson Thor, HIP) →](server/README.md#quick-start)
