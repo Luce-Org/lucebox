@@ -4,9 +4,9 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-27T23:11:09-04:00
+Last refresh: 2026-05-27T23:28:35-04:00
 Current base: `origin/main` `4f4d82e`
-Current integration tip before this refresh: `easel/auto-integration` `be0a139`
+Current integration tip before this refresh: `easel/auto-integration` `2dd4115`
 
 This branch is maintained as a reproducible patch stack over `origin/main`. The
 primary checkout was clean at the start of this unattended run. This refresh did
@@ -37,15 +37,17 @@ carried.
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| upstream sync | checked | In isolated worktree `/tmp/luce-auto-cron-20260527-231046`, `git merge --no-edit origin/main` reported `Already up to date.` |
-| all non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated direct probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every direct probe conflicted and was aborted in the isolated worktree. Consolidated output: `/tmp/luce-merge-probes-20260527-231046.txt`. |
+| upstream sync | checked | In isolated worktree `/tmp/luce-auto-cron-20260527-232446`, `git merge --no-edit origin/main` reported `Already up to date.` |
+| all non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated direct probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every direct probe conflicted and was aborted in the isolated worktree. Consolidated output: `/tmp/luce-merge-probes-20260527-232446.txt`. |
+| #237 | delegated feasibility attempt incomplete | A tmux-driven Claude read-only feasibility run was attempted for the current-layout dFlash MTP foundation port, but the first session ended without a report and the narrower redirected rerun produced an empty report file (`/tmp/pr237-claude-feasibility-20260527-232446.txt`). Manual diff inspection still shows the PR is a large old-layout MTP foundation (`dflash/src/common/mtp_*`, `dflash/src/qwen35/qwen35_mtp*`, tests) that would need a deliberate current `server/` port rather than conflict-marker resolution. |
+| #221 | delegated feasibility attempt incomplete | A tmux-driven Codex read-only feasibility run was attempted for MTP prefix-cache warm/ghost follow-up behavior. It did not write the requested report (`/tmp/pr221-codex-feasibility-20260527-232446.txt` absent) and was stopped after emitting diff/log excerpts. Manual diff inspection confirms #221 layers a large PR #237-like MTP stack plus bench artifacts, matrix scripts, Qwen36 MTP files, and prefix-cache snapshot/shape-contract pieces; it remains dependent on a current-layout MTP foundation. |
 
 ## Pending / blocked-needs-human / selective-port candidates
 
 | PR | Head branch | Current status | Next useful action |
 |---:|---|---|---|
-| #237 | `feat/dflash-mtp-foundation` | blocked-needs-human / selective-port | Keep open for deliberate current-layout MTP foundation port with MTP off by default. Prior Codex report: `/tmp/pr237-feasibility-20260527-2124.txt`. |
-| #221 | `feat/mtp-prefix-warm-ghost` | blocked-needs-human / dependency | Follow-on after #237/equivalent MTP foundation; salvage prefix-cache MTP warm/range-warm behavior only after current-layout MTP exists. Prior Codex report: `/tmp/pr221-feasibility-20260527-2149.txt`. |
+| #237 | `feat/dflash-mtp-foundation` | blocked-needs-human / selective-port | Keep open for deliberate current-layout MTP foundation port with MTP off by default. This run revalidated that the direct merge still conflicts and that the branch is a 33-file / ~7.2k-line old-layout MTP foundation touching `dflash/src/common/mtp_*`, `dflash/src/qwen35/qwen35_mtp*`, backend interfaces, daemon/server wiring, and tests. Prior Codex report remains `/tmp/pr237-feasibility-20260527-2124.txt`; this run's Claude delegation failed to produce a usable report. |
+| #221 | `feat/mtp-prefix-warm-ghost` | blocked-needs-human / dependency | Follow-on after #237/equivalent MTP foundation; salvage prefix-cache MTP warm/range-warm behavior only after current-layout MTP exists. This run revalidated that the branch is ~88 files / ~18k lines and includes many bench/result artifacts plus Qwen36 MTP files. Prior Codex report remains `/tmp/pr221-feasibility-20260527-2149.txt`; this run's Codex delegation only emitted excerpts and no final report. |
 | #183 | `split/gemma4-11a-target-mtp-integration` | blocked-needs-human / superseded-by-current-architecture | Needs a current-layout Gemma4 MTP target integration design; direct old split-chain merge remains unsafe. |
 | #182 | `split/gemma4-10-mtp-loader-step-graph` | selective-port | Portable only as current-layout `server/src/gemma4` assistant loader/MTP graph work. Prior Codex report: `/tmp/pr182-feasibility-20260527-2039.txt`. |
 | #181 | `split/gemma4-09-dflash-draft-runtime` | likely superseded / selective-port | Overlaps current Gemma4 DFlash backend and should be mined only after the current Gemma4 MTP shape is chosen. |
@@ -71,18 +73,21 @@ and #75. #285 remains partially carried only as an integration dependency.
 
 This run performed:
 
-- `date -Is` -> 2026-05-27T23:09:53-04:00 during preflight, 2026-05-27T23:11:09-04:00 for this metadata refresh.
+- `date -Is` -> 2026-05-27T23:23:44-04:00 during preflight, 2026-05-27T23:28:35-04:00 for this metadata refresh.
 - Primary checkout `git status --short` was clean before work began and remained clean while probing in worktrees.
 - `git remote -v` verified `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
 - `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status` succeeded for account `easel`.
 - `HOME=/home/erik /home/erik/.local/bin/claude auth status --text` succeeded for the Claude Team account.
 - `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --version` reported `codex-cli 0.130.0`.
-- `git fetch --prune origin` and `git fetch --prune easel` completed; fetch pruned stale local `origin/pr/*` refs for PRs that are no longer open and fetched the latest `easel/feat/lucebox-docker` update.
+- `/home/linuxbrew/.linuxbrew/bin/tmux -V` reported `tmux 3.6a`.
+- `git fetch --prune origin` and `git fetch --prune easel` completed; fetch pruned stale local `origin/pr/*` refs from the previous run, then targeted fetches recreated current open non-draft PR refs.
 - `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...` enumerated all open PRs.
 - Targeted fetches for all open non-draft PR refs (`origin/pr/<n>`).
 - `git merge-base --is-ancestor origin/pr/<n> easel/auto-integration` classification checks: #284, #276, #274, #266, #152, and #142 are current ancestors; #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39 remain non-ancestor/selective-port candidates.
-- Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260527-231046`; `git merge --no-edit origin/main` reported already up to date.
-- Fresh direct merge probes for all currently non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260527-231046.txt`.
+- Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260527-232446`; `git merge --no-edit origin/main` reported already up to date.
+- Fresh direct merge probes for all currently non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260527-232446.txt`.
+- Tmux-driven Claude and Codex delegation attempts for #237/#221 were monitorable but did not produce usable final reports; this is recorded above rather than treated as a successful delegated conclusion.
+- Manual read-only `git diff --stat` / `git diff --name-status` inspection of #237 and #221 against the integration tip to confirm scope and dependency ordering.
 - `git diff --check -- docs/auto-integration.md` (clean).
 
 No source/build validation was rerun because this refresh changes only
@@ -94,6 +99,7 @@ Value 'sm_52' is not defined for option 'gpu-name'`).
 ## Notes
 
 - Primary checkout `/home/erik/Projects/luce2` stayed clean during probing and will only be fast-forwarded after the metadata push is verified.
-- Retained worktree `/tmp/luce-auto-cron-20260527-231046` for this metadata refresh and direct-merge probe audit.
-- Retained consolidated direct-merge probe output at `/tmp/luce-merge-probes-20260527-231046.txt`.
+- Retained worktree `/tmp/luce-auto-cron-20260527-232446` for this metadata refresh and direct-merge probe audit.
+- Retained consolidated direct-merge probe output at `/tmp/luce-merge-probes-20260527-232446.txt`.
+- Retained empty/incomplete delegated report path `/tmp/pr237-claude-feasibility-20260527-232446.txt`; `/tmp/pr221-codex-feasibility-20260527-232446.txt` was not created.
 - Prior retained conflicted worktrees and agent reports remain as listed in earlier manifest revisions; cleanup is separate maintenance.
