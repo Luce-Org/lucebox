@@ -35,7 +35,7 @@ int main(int argc, char ** argv) {
     } else {
         std::fprintf(stderr,
             "usage: %s --backend-ipc-mode=dflash-draft <draft.safetensors|draft.gguf> "
-            "--ring-cap=N --stream-fd=FD [--draft-gpu=N]\n"
+            "--ring-cap=N --stream-fd=FD [--payload-fd=FD] [--draft-gpu=N]\n"
             "   or: %s --backend-ipc-mode=pflash-compress <drafter.gguf> "
             "--stream-fd=FD [--draft-gpu=N]\n",
             argv[0],
@@ -45,6 +45,7 @@ int main(int argc, char ** argv) {
 
     int ring_cap = 4096;
     int draft_gpu = 0;
+    int payload_fd = -1;
     int stream_fd = -1;
     for (int i = arg_begin; i < argc; i++) {
         if (std::strncmp(argv[i], "--ring-cap=", 11) == 0) {
@@ -59,6 +60,10 @@ int main(int argc, char ** argv) {
             stream_fd = std::atoi(argv[i] + 12);
         } else if (std::strcmp(argv[i], "--stream-fd") == 0) {
             if (i + 1 < argc) stream_fd = std::atoi(argv[++i]);
+        } else if (std::strncmp(argv[i], "--payload-fd=", 13) == 0) {
+            payload_fd = std::atoi(argv[i] + 13);
+        } else if (std::strcmp(argv[i], "--payload-fd") == 0) {
+            if (i + 1 < argc) payload_fd = std::atoi(argv[++i]);
         } else {
             std::fprintf(stderr, "[backend-ipc-daemon] unknown option: %s\n", argv[i]);
             return 2;
@@ -67,7 +72,8 @@ int main(int argc, char ** argv) {
 
     switch (mode) {
         case BackendIpcMode::DFlashDraft:
-            return run_dflash_draft_ipc_daemon(payload_path, ring_cap, draft_gpu, stream_fd);
+            return run_dflash_draft_ipc_daemon(payload_path, ring_cap, draft_gpu,
+                                               stream_fd, payload_fd);
         case BackendIpcMode::PFlashCompress:
             return run_pflash_drafter_ipc_daemon(payload_path, draft_gpu, stream_fd);
     }

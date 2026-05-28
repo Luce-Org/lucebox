@@ -1,8 +1,9 @@
 // backend_ipc.h - generic backend IPC process launcher.
 //
 // Owns the out-of-process backend daemon lifecycle: fork/exec, command pipe,
-// binary status stream, and scratch work directory. Individual IPC modes keep
-// their own payload protocol on top of this process wrapper.
+// parent->daemon payload pipe, binary status stream, and scratch work
+// directory. Individual IPC modes keep their own payload protocol on top of
+// this process wrapper.
 
 #pragma once
 
@@ -44,6 +45,7 @@ public:
 
     bool active() const { return active_; }
     FILE * command_stream() const { return cmd_; }
+    int payload_fd() const { return payload_fd_; }
     int stream_fd() const { return stream_fd_; }
     const std::string & work_dir() const { return work_dir_; }
 
@@ -56,6 +58,7 @@ private:
     pid_t pid_ = -1;
 #endif
     FILE * cmd_ = nullptr;
+    int payload_fd_ = -1;
     int stream_fd_ = -1;
     std::string work_dir_;
     int seq_ = 0;

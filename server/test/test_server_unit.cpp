@@ -1543,6 +1543,45 @@ static void test_backend_ipc_rejects_file_work_dir() {
     unlink(file_path.c_str());
 }
 
+static void test_backend_ipc_payload_pipe_round_trip() {
+    int payload_pipe[2] = {-1, -1};
+    int status_pipe[2] = {-1, -1};
+    TEST_ASSERT(pipe(payload_pipe) == 0);
+    TEST_ASSERT(pipe(status_pipe) == 0);
+    if (payload_pipe[0] < 0 || payload_pipe[1] < 0 ||
+        status_pipe[0] < 0 || status_pipe[1] < 0) {
+        if (payload_pipe[0] >= 0) close(payload_pipe[0]);
+        if (payload_pipe[1] >= 0) close(payload_pipe[1]);
+        if (status_pipe[0] >= 0) close(status_pipe[0]);
+        if (status_pipe[1] >= 0) close(status_pipe[1]);
+        return;
+    }
+
+    const std::vector<float> payload = {1.0f, 2.5f, -3.0f, 4.25f};
+    TEST_ASSERT(write_exact_fd(payload_pipe[1],
+                               payload.data(),
+                               payload.size() * sizeof(float)));
+    close(payload_pipe[1]);
+    payload_pipe[1] = -1;
+
+    std::vector<float> received(payload.size(), 0.0f);
+    TEST_ASSERT(read_exact_fd(payload_pipe[0],
+                              received.data(),
+                              received.size() * sizeof(float)));
+    close(payload_pipe[0]);
+    payload_pipe[0] = -1;
+    TEST_ASSERT(received == payload);
+
+    const int32_t ready = 0;
+    TEST_ASSERT(write_exact_fd(status_pipe[1], &ready, sizeof(ready)));
+    close(status_pipe[1]);
+    status_pipe[1] = -1;
+    int32_t status = -1;
+    TEST_ASSERT(read_exact_fd(status_pipe[0], &status, sizeof(status)));
+    TEST_ASSERT(status == 0);
+    close(status_pipe[0]);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Sampler tests (model-independent, CPU-only)
 // ═══════════════════════════════════════════════════════════════════════
@@ -2323,6 +2362,7 @@ int main() {
     RUN_TEST(test_disk_cache_lookup_miss_no_layout);
     RUN_TEST(test_disk_cache_save_below_min_tokens);
     RUN_TEST(test_backend_ipc_rejects_file_work_dir);
+    RUN_TEST(test_backend_ipc_payload_pipe_round_trip);
 
     std::fprintf(stderr, "\n── Sampler ──\n");
     RUN_TEST(test_sampler_cfg_defaults);

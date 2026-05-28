@@ -1,14 +1,12 @@
 // dflash_draft_ipc.h - DFlash draft IPC mode.
 //
 // The draft IPC mechanism spawns a child process running the draft model on
-// a separate GPU. Communication is via stdin commands + a stream pipe for
-// binary status/data. Feature slices and noise embeddings are exchanged
-// through temporary files.
+// a separate GPU. Communication is via stdin commands, a parent->daemon
+// payload pipe, and a stream pipe for binary status/data. The daemon still
+// accepts the older temporary-file commands for compatibility.
 //
 // The IPC client class and the remote feature-copy helper are target-agnostic
-// and live in this common header. The daemon entry point is declared here too
-// but its implementation lives next to a specific target architecture (which
-// owns the draft graph builder used inside the daemon loop).
+// and live in this common header. The daemon entry point is declared here too.
 
 #pragma once
 
@@ -101,6 +99,7 @@ inline bool stream_status(int stream_fd, int32_t status) {
 int run_dflash_draft_ipc_daemon(const char * draft_path,
                                 int ring_cap,
                                 int draft_gpu,
-                                int stream_fd);
+                                int stream_fd,
+                                int payload_fd = -1);
 
 } // namespace dflash::common

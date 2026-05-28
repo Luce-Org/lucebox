@@ -2,9 +2,7 @@
 //
 // Target-agnostic portion of the DFlash draft IPC: parent-side client that
 // spawns the daemon, sends commands, and the row-extraction helper that
-// ships feature slices to it. The daemon implementation lives next to the
-// owning target architecture (e.g. qwen35/draft_ipc_daemon.cpp) because it
-// drives a target-specific draft graph builder.
+// ships feature slices to it.
 
 #include "dflash_draft_ipc.h"
 #include "io_utils.h"
@@ -64,9 +62,29 @@ bool DFlashDraftIpcClient::send_feature_slice(
 #else
     FILE * cmd = process_.command_stream();
     const int stream_fd = process_.stream_fd();
-    if (!active_ || !cmd || stream_fd < 0 || n_tokens <= 0) return false;
+    const int payload_fd = process_.payload_fd();
+    if (!active_ || !cmd || stream_fd < 0 || capture_idx < 0 ||
+        capture_idx >= n_target_layers_ || start_pos < 0 || n_tokens <= 0) {
+        return false;
+    }
     const size_t expected = (size_t)n_tokens * hidden_size_;
     if (slice.size() != expected) return false;
+    if (payload_fd >= 0) {
+        const size_t bytes = slice.size() * sizeof(float);
+        std::fprintf(cmd, "feature_slice_pipe %d %d %d %zu\n",
+                     capture_idx, start_pos, n_tokens, bytes);
+        std::fflush(cmd);
+        if (!write_exact_fd(payload_fd, slice.data(), bytes)) {
+            std::fprintf(stderr, "draft-ipc feature_slice payload write failed\n");
+            return false;
+        }
+        int32_t status = -1;
+        const bool ok = read_exact_fd(stream_fd, &status, sizeof(status)) && status == 0;
+        if (!ok) {
+            std::fprintf(stderr, "draft-ipc feature_slice failed status=%d\n", status);
+        }
+        return ok;
+    }
     const std::string path = process_.next_path("feature");
     if (!write_binary_file(path, slice.data(), slice.size() * sizeof(float))) {
         std::fprintf(stderr, "draft-ipc write feature failed: %s\n", path.c_str());
@@ -96,10 +114,33 @@ bool DFlashDraftIpcClient::propose(
 #else
     FILE * cmd = process_.command_stream();
     const int stream_fd = process_.stream_fd();
-    if (!active_ || !cmd || stream_fd < 0 || ctx_len <= 0) return false;
+    const int payload_fd = process_.payload_fd();
+    if (!active_ || !cmd || stream_fd < 0 || committed < 0 || ctx_len <= 0) {
+        return false;
+    }
     const size_t noise_expected =
         (size_t)hidden_size_ * block_size_;
     if (noise_embed.size() != noise_expected) return false;
+    if (payload_fd >= 0) {
+        const size_t bytes = noise_embed.size() * sizeof(float);
+        std::fprintf(cmd, "propose_pipe %d %d %zu\n", committed, ctx_len, bytes);
+        std::fflush(cmd);
+        if (!write_exact_fd(payload_fd, noise_embed.data(), bytes)) {
+            std::fprintf(stderr, "draft-ipc propose payload write failed\n");
+            return false;
+        }
+        int32_t status = -1;
+        bool ok = read_exact_fd(stream_fd, &status, sizeof(status)) && status == 0;
+        if (ok) {
+            hidden_out.assign(noise_expected, 0.0f);
+            ok = read_exact_fd(stream_fd, hidden_out.data(),
+                               hidden_out.size() * sizeof(float));
+        }
+        if (!ok) {
+            std::fprintf(stderr, "draft-ipc propose failed status=%d\n", status);
+        }
+        return ok;
+    }
     const std::string path = process_.next_path("noise");
     if (!write_binary_file(path, noise_embed.data(), noise_embed.size() * sizeof(float))) {
         std::fprintf(stderr, "draft-ipc write noise failed: %s\n", path.c_str());

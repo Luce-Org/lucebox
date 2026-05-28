@@ -18,6 +18,8 @@
 #include "ggml-cuda.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <iostream>
 #include <sstream>
@@ -26,12 +28,23 @@
 
 namespace dflash::common {
 
+namespace {
+
+enum class ProposalResult {
+    Ok,
+    CommandFailed,
+    StreamFailed,
+};
+
+}  // namespace
+
 int run_dflash_draft_ipc_daemon(const char * draft_path,
                                 int ring_cap,
                                 int draft_gpu,
-                                int stream_fd) {
+                                int stream_fd,
+                                int payload_fd) {
 #if defined(_WIN32)
-    (void)draft_path; (void)ring_cap; (void)draft_gpu; (void)stream_fd;
+    (void)draft_path; (void)ring_cap; (void)draft_gpu; (void)stream_fd; (void)payload_fd;
     std::fprintf(stderr, "DFlash draft IPC daemon is only implemented on POSIX hosts\n");
     return 2;
 #else
@@ -89,6 +102,54 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
     std::vector<int32_t> pos_k;
     std::vector<float> hidden_out((size_t)hidden * q_len);
 
+    auto run_proposal = [&](int committed, int ctx_len) -> ProposalResult {
+        int mirror_slot0 = 0;
+        const bool use_mirror_view =
+            draft_feature_mirror_can_view(feature_ring, committed, ctx_len, mirror_slot0);
+        if (!build_draft_step(draft_sg, draft_weights, /*lm_head=*/nullptr, backend,
+                              ctx_len, use_mirror_view ? &feature_ring : nullptr,
+                              committed,
+                              /*ctx_len_max=*/feature_ring.cap)) {
+            std::fprintf(stderr, "[draft-ipc-daemon] draft build failed\n");
+            stream_status(stream_fd, -1);
+            return ProposalResult::CommandFailed;
+        }
+        if (!use_mirror_view &&
+            !copy_feature_ring_range_to_tensor(feature_ring,
+                                               draft_sg.target_hidden_cat,
+                                               committed - ctx_len,
+                                               ctx_len)) {
+            std::fprintf(stderr, "[draft-ipc-daemon] feature copy failed\n");
+            stream_status(stream_fd, -1);
+            return ProposalResult::CommandFailed;
+        }
+        ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
+                                noise_embed.size() * sizeof(float));
+        pos_k.resize((size_t)ctx_len + q_len);
+        for (int i = 0; i < q_len; i++) pos_q[i] = ctx_len + i;
+        for (int i = 0; i < ctx_len + q_len; i++) pos_k[i] = i;
+        ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
+                                pos_q.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
+                                pos_k.size() * sizeof(int32_t));
+        auto st = ggml_backend_graph_compute(backend, draft_sg.gf);
+        if (st != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "[draft-ipc-daemon] draft compute failed status=%d\n",
+                         (int)st);
+            stream_status(stream_fd, -1);
+            return ProposalResult::CommandFailed;
+        }
+        ggml_backend_tensor_get(draft_sg.hidden_states, hidden_out.data(), 0,
+                                hidden_out.size() * sizeof(float));
+        if (!stream_status(stream_fd, 0) ||
+            !write_exact_fd(stream_fd, hidden_out.data(),
+                            hidden_out.size() * sizeof(float))) {
+            std::fprintf(stderr, "[draft-ipc-daemon] stream write failed\n");
+            return ProposalResult::StreamFailed;
+        }
+        return ProposalResult::Ok;
+    };
+
     std::string line;
     while (std::getline(std::cin, line)) {
         std::istringstream iss(line);
@@ -132,6 +193,41 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
             stream_status(stream_fd, 0);
             continue;
         }
+        if (cmd == "feature_slice_pipe") {
+            int capture_idx = -1;
+            int start_pos = -1;
+            int n_tokens = 0;
+            size_t bytes = 0;
+            iss >> capture_idx >> start_pos >> n_tokens >> bytes;
+            const size_t expected_bytes = (size_t)n_tokens * (size_t)hidden * sizeof(float);
+            if (payload_fd < 0 || capture_idx < 0 || capture_idx >= n_tgt_layers ||
+                start_pos < 0 || n_tokens <= 0 || bytes != expected_bytes) {
+                std::fprintf(stderr, "[draft-ipc-daemon] bad feature_slice_pipe: %s\n",
+                             line.c_str());
+                stream_status(stream_fd, -1);
+                continue;
+            }
+            std::vector<float> slice(bytes / sizeof(float));
+            if (!read_exact_fd(payload_fd, slice.data(), bytes)) {
+                std::fprintf(stderr, "[draft-ipc-daemon] read feature_slice pipe failed\n");
+                stream_status(stream_fd, -1);
+                break;
+            }
+            const size_t dst_stride = feature_ring.target_feat->nb[1];
+            const size_t slice_offset =
+                (size_t)capture_idx * (size_t)hidden * sizeof(float);
+            for (int i = 0; i < n_tokens; i++) {
+                const int slot = (start_pos + i) % feature_ring.cap;
+                const size_t dst_off = (size_t)slot * dst_stride + slice_offset;
+                ggml_backend_tensor_set(feature_ring.target_feat,
+                                        slice.data() + (size_t)i * hidden,
+                                        dst_off,
+                                        (size_t)hidden * sizeof(float));
+            }
+            ggml_backend_synchronize(backend);
+            stream_status(stream_fd, 0);
+            continue;
+        }
         if (cmd == "propose") {
             int committed = -1;
             int ctx_len = 0;
@@ -151,48 +247,30 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
                 continue;
             }
 
-            int mirror_slot0 = 0;
-            const bool use_mirror_view =
-                draft_feature_mirror_can_view(feature_ring, committed, ctx_len, mirror_slot0);
-            if (!build_draft_step(draft_sg, draft_weights, /*lm_head=*/nullptr, backend,
-                                  ctx_len, use_mirror_view ? &feature_ring : nullptr,
-                                  committed,
-                                  /*ctx_len_max=*/feature_ring.cap)) {
-                std::fprintf(stderr, "[draft-ipc-daemon] draft build failed\n");
+            if (run_proposal(committed, ctx_len) == ProposalResult::StreamFailed) {
+                break;
+            }
+            continue;
+        }
+        if (cmd == "propose_pipe") {
+            int committed = -1;
+            int ctx_len = 0;
+            size_t bytes = 0;
+            iss >> committed >> ctx_len >> bytes;
+            const size_t expected_bytes = noise_embed.size() * sizeof(float);
+            if (payload_fd < 0 || committed < 0 || ctx_len <= 0 ||
+                ctx_len > feature_ring.cap || bytes != expected_bytes) {
+                std::fprintf(stderr, "[draft-ipc-daemon] bad propose_pipe: %s\n",
+                             line.c_str());
                 stream_status(stream_fd, -1);
                 continue;
             }
-            if (!use_mirror_view &&
-                !copy_feature_ring_range_to_tensor(feature_ring,
-                                                   draft_sg.target_hidden_cat,
-                                                   committed - ctx_len,
-                                                   ctx_len)) {
-                std::fprintf(stderr, "[draft-ipc-daemon] feature copy failed\n");
+            if (!read_exact_fd(payload_fd, noise_embed.data(), bytes)) {
+                std::fprintf(stderr, "[draft-ipc-daemon] read noise pipe failed\n");
                 stream_status(stream_fd, -1);
-                continue;
+                break;
             }
-            ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
-                                    noise_embed.size() * sizeof(float));
-            pos_k.resize((size_t)ctx_len + q_len);
-            for (int i = 0; i < q_len; i++) pos_q[i] = ctx_len + i;
-            for (int i = 0; i < ctx_len + q_len; i++) pos_k[i] = i;
-            ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
-                                    pos_q.size() * sizeof(int32_t));
-            ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
-                                    pos_k.size() * sizeof(int32_t));
-            auto st = ggml_backend_graph_compute(backend, draft_sg.gf);
-            if (st != GGML_STATUS_SUCCESS) {
-                std::fprintf(stderr, "[draft-ipc-daemon] draft compute failed status=%d\n",
-                             (int)st);
-                stream_status(stream_fd, -1);
-                continue;
-            }
-            ggml_backend_tensor_get(draft_sg.hidden_states, hidden_out.data(), 0,
-                                    hidden_out.size() * sizeof(float));
-            if (!stream_status(stream_fd, 0) ||
-                !write_exact_fd(stream_fd, hidden_out.data(),
-                                hidden_out.size() * sizeof(float))) {
-                std::fprintf(stderr, "[draft-ipc-daemon] stream write failed\n");
+            if (run_proposal(committed, ctx_len) == ProposalResult::StreamFailed) {
                 break;
             }
             continue;
