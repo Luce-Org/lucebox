@@ -4,23 +4,19 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T14:49:06-04:00
+Last refresh: 2026-05-28T15:36:00-04:00
 Current base: `origin/main` `3ba525e0`
-Current integration tip before this refresh: `easel/auto-integration` `72355a11`
+Current integration tip before this refresh: `easel/auto-integration` `1ae2f2cb`
 Refreshed stack tip prepared in this run: this commit
 
 This branch is maintained as a reproducible patch stack over `origin/main`.
-The primary checkout was clean at the start of this unattended run, but the local
-primary branch was still behind/diverged from the fetched `easel/auto-integration`
-tip; all reconciliation and validation work therefore happened in isolated
-worktree `/tmp/luce-auto-cron-20260528-144958`. `origin/main` did not advance
-beyond `3ba525e0`, and every currently open non-draft contributor PR that can be
-directly integrated remains present in the stack. This refresh is manifest-only:
-it records the latest PR inventory, rerun direct-conflict probes for the remaining
-non-ancestor PRs, and the improved CI state after the prior integration-only CMake
-fix. The GitHub `Build (cmake + uv sync --extra megakernel)` and `uv workspace`
-checks now pass for PR #286 at tip `72355a11`; `cuda12` was still pending after a
-six-minute watch window.
+The primary checkout was not used directly because it still carries unrelated
+local modifications; this refresh used isolated worktree
+`/tmp/luce-auto-integration-20260528` on top of fetched `easel/auto-integration`.
+`origin/main` remains at `3ba525e0`, and the currently maintained stack already
+includes the sampled layer-split fix from #295. Since the prior refresh, a new
+draft follow-up (#297) appeared stacked on #295, so this run is a manifest update
+and inventory refresh rather than a new integration merge.
 
 ## Included in the current stack
 
@@ -51,11 +47,11 @@ six-minute watch window.
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| upstream sync | checked / no-op | `origin/main` remains `3ba525e0`; it is already an ancestor of `easel/auto-integration` `72355a11`, so no upstream merge was required this run. |
-| open non-draft inventory | checked | Open non-draft PRs were #295, #294, #292, #289, #276, #274, #266, #237, #221, #154, #153, #152, #142, #137, #135, #94, and #48. Ancestor checks passed for #295, #294, #292, #289, #276, #274, #266, #152, and #142; #296, #284, #278, and #265 are included through `origin/main`. |
-| integration-only CI fix | improved / awaiting one check | For PR #286 at `72355a11`, `Build (cmake + uv sync --extra megakernel)` now passes and `uv workspace` passes. `cuda12` was still pending after `gh pr checks 286 --watch --interval 30` ran for six minutes; no new failure was observed. |
-| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #154, #153, #137, #135, #94, and #48 against stack tip `72355a11` in probe branch `auto-integration-probe-20260528-144958`. Every direct probe conflicted and was aborted in the isolated probe worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-144958.txt`. |
-| #237 manual/delegated status | still blocked-needs-human | No new #237 head since the prior deep manual/delegated recheck (`02c6a6c4`). This run's direct probe again showed broad conflicts across old `dflash/` paths, common MTP interfaces, Qwen35 graph/backend files, CMake, daemon/server wiring, and tests. Prior Claude/Codex tmux attempts did not produce a trusted ready-to-apply resolution, and the required next step remains a deliberate current-layout MTP port rather than conflict-marker resolution. |
+| upstream sync | checked / no-op | `origin/main` remains `3ba525e0`; fetched `easel/auto-integration` is `1ae2f2cb`, and no upstream merge was needed for this refresh. |
+| open inventory | checked | Open non-draft PRs still include #295, #294, #292, #289, #276, #274, #266, #237, #221, #154, #153, #152, #142, #137, #135, #94, and #48. Draft #297 is stacked on #295 and stays outside the non-draft stack. |
+| stack ancestry | checked | `git merge-base --is-ancestor origin/pr/295 HEAD` returned yes in the worktree; `origin/pr/297`, `origin/pr/291`, and `origin/pr/290` were not ancestors of the current stack tip. The included upstream PRs #296, #284, #278, and #265 remain present through `origin/main`. |
+| historical conflict status | carried forward | The earlier direct-probe findings for #237, #221, #154, #153, #137, #135, #94, and #48 remain the basis for their blocked/stale classifications. |
+| review note | recorded | #291 and #290 stay draft/conflicting; they remain on the hold list for later manual porting work if their dependency chain becomes worthwhile. |
 
 ## Pending / blocked-needs-human / selective-port candidates
 
@@ -73,31 +69,27 @@ six-minute watch window.
 ## Draft / excluded
 
 Draft PRs remain outside the primary non-draft integration target except for
-dependency awareness: #291, #290, #286, #285, #275, #249, #193, and #75. #286 is
-the current draft auto-integration snapshot. #285 remains partially carried only
-as an integration dependency.
+dependency awareness: #297, #291, #290, #286, #285, #275, #249, #193, and #75.
+#297 is a draft Laguna follow-up stacked on #295. #286 is the current draft
+auto-integration snapshot. #285 remains partially carried only as an integration
+dependency.
 
 ## Validation run
 
 This run performed:
 
-- `date -Is` -> 2026-05-28T14:49:06-04:00 at preflight.
-- Primary checkout `git status --short` was clean before work began; `git branch --show-current` reported `auto-integration`.
+- `date -Is` -> 2026-05-28T15:36:00-04:00 at preflight.
+- Primary checkout `/home/erik/Projects/luce2` still contains unrelated local modifications, so the refresh work happened in clean worktree `/tmp/luce-auto-integration-20260528`.
+- `git status --short --branch` in the worktree reported `## auto-integration-maint-20260528...easel/auto-integration`.
 - `git remote -v` verified `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
-- `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status` succeeded for account `easel` with repo/workflow scopes.
-- `HOME=/home/erik /home/erik/.local/bin/claude auth status --text` succeeded for the Claude Team account.
-- `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --help` succeeded (`codex help ok`).
-- `git fetch --prune origin` and `git fetch --prune easel` completed separately; targeted fetches recreated current open non-draft contributor PR refs.
-- `origin/main`, fetched `easel/auto-integration`, local primary `HEAD`, and prepared worktree `HEAD` were checked as `3ba525e0`, `72355a11`, `f13a7459`, and `72355a11` respectively before this manifest commit. The primary local branch is still behind/diverged from fetched `easel/auto-integration`, so it was not used for reconciliation.
-- Worktree `/tmp/luce-auto-cron-20260528-144958` confirmed `origin/main` is already an ancestor of `HEAD`; no upstream merge was needed.
-- Isolated probe worktree `/tmp/luce-probe-20260528-144958` reran direct conflict probes for all remaining non-ancestor non-draft PRs.
-- Ancestor checks passed for included contributor PR refs #295, #294, #292, #289, #276, #274, #266, #152, and #142; #296, #284, #278, and #265 are included through upstream main.
-- `gh pr checks 286 --repo Luce-Org/lucebox-hub` reported `Build (cmake + uv sync --extra megakernel)` pass and `uv workspace` pass for `72355a11`; `cuda12` remained pending. A six-minute `gh pr checks 286 --watch --interval 30` timed out with `cuda12` still pending and the other two checks still passing.
+- `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 40` refreshed the open PR inventory, including new draft follow-up #297.
+- `gh pr view` was used for #295, #297, #291, and #290 to confirm bodies, draft state, and stack relationships.
+- `git merge-base --is-ancestor origin/pr/295 HEAD` returned yes in the worktree; `origin/pr/297`, `origin/pr/291`, and `origin/pr/290` were not ancestors of the current stack tip.
+- `origin/main` and fetched `easel/auto-integration` remained at `3ba525e0` and `1ae2f2cb` respectively, so no upstream merge was needed.
 - `git diff --check` passed before this manifest refresh.
-- Targeted conflict-marker scan over `docs/auto-integration.md` found no merge markers before commit.
 
 ## Notes
 
-- Primary checkout `/home/erik/Projects/luce2` was clean at preflight but local `HEAD` (`f13a7459`) still lags/diverges from fetched `easel/auto-integration` (`72355a11`). The pushed branch from this run should be treated as source of truth; primary fast-forward is deferred because the local branch divergence needs supervised cleanup.
-- Retained integration worktree `/tmp/luce-auto-cron-20260528-144958`, probe worktree `/tmp/luce-probe-20260528-144958`, and probe log `/tmp/luce-merge-probes-20260528-144958.txt`.
+- Primary checkout `/home/erik/Projects/luce2` retains unrelated uncommitted changes and is intentionally left untouched.
+- Retained integration worktree `/tmp/luce-auto-integration-20260528`; no new probe worktree or log was created in this refresh.
 - Prior retained worktrees, probe logs, agent reports, and configure directories remain as listed in earlier manifest revisions; cleanup is separate maintenance.
