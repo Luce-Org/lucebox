@@ -708,6 +708,7 @@ if(DFLASH27B_TESTS)
         add_executable(dflash_server
             src/server/server_main.cpp
             src/server/http_server.cpp
+            src/server/compaction.cpp
             src/server/model_card.cpp
         )
         target_include_directories(dflash_server PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
@@ -776,6 +777,7 @@ if(DFLASH27B_TESTS)
         add_executable(test_server_unit test/test_server_unit.cpp)
         target_sources(test_server_unit PRIVATE
             src/server/http_server.cpp
+            src/server/compaction.cpp
             src/server/model_card.cpp)
         target_include_directories(test_server_unit PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")

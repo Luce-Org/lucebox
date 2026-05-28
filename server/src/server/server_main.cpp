@@ -226,6 +226,13 @@ static void print_usage(const char * prog) {
         "                               Overrides the hardcoded Qwen3/Laguna\n"
         "                               renderer. Empty or missing falls back\n"
         "                               to the hardcoded template.\n"
+        "\n"
+        "Context compaction:\n"
+        "  --compaction                 Enable auto context compaction\n"
+        "  --compaction-threshold <F>   Trigger ratio of max_ctx (default: 0.9)\n"
+        "  --compaction-max-tokens <N>  Max tokens for self-summary (default: 1024)\n"
+        "  --compaction-keep-recent <F> Fraction of recent turns kept verbatim\n"
+        "                               during summarization (default: 0.3)\n"
         "\n", prog);
 }
 
@@ -421,6 +428,14 @@ int main(int argc, char ** argv) {
                 sconfig.chat_template_path = path;
                 std::fprintf(stderr, "[server] loaded chat template from %s (%ld bytes)\n", path, n);
             }
+        } else if (std::strcmp(argv[i], "--compaction") == 0) {
+            sconfig.compaction_enabled = true;
+        } else if (std::strcmp(argv[i], "--compaction-threshold") == 0 && i + 1 < argc) {
+            sconfig.compaction_threshold = std::stof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--compaction-max-tokens") == 0 && i + 1 < argc) {
+            sconfig.compaction_max_tokens = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--compaction-keep-recent") == 0 && i + 1 < argc) {
+            sconfig.compaction_keep_recent = std::stof(argv[++i]);
         } else if (std::strcmp(argv[i], "--kv-cache-dir") == 0 && i + 1 < argc) {
             sconfig.disk_cache_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--kv-cache-budget") == 0 && i + 1 < argc) {
@@ -758,6 +773,12 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
     std::fprintf(stderr, "[server] │  cors            = %s\n", sconfig.enable_cors ? "ON" : "off");
+    std::fprintf(stderr, "[server] │  compaction      = %s\n", sconfig.compaction_enabled ? "ON" : "off");
+    if (sconfig.compaction_enabled) {
+        std::fprintf(stderr, "[server] │  compact_thresh  = %.3f\n", sconfig.compaction_threshold);
+        std::fprintf(stderr, "[server] │  compact_recent  = %.3f\n", sconfig.compaction_keep_recent);
+        std::fprintf(stderr, "[server] │  compact_summary = %d\n", sconfig.compaction_max_tokens);
+    }
     std::fprintf(stderr, "[server] │  cache_type_k    = %s\n",
 #ifdef GGML_USE_HIP
         cache_type_k.empty() ? "q4_0 (default, HIP)" : cache_type_k.c_str());

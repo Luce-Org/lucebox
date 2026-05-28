@@ -163,6 +163,14 @@ struct ServerConfig {
     // the Anthropic tool_use envelope, e.g. froggeric Qwen3.6 template.
     std::string chat_template_src;          // literal Jinja source (loaded from file)
     std::string chat_template_path;         // path it was loaded from (logged at startup)
+
+    bool        compaction_enabled        = false;
+    float       compaction_threshold      = 0.9f;
+    int         compaction_max_tokens     = 1024;
+    float       compaction_keep_recent    = 0.3f;
+    bool        compaction_strip_thinking = true;
+    int         compaction_keep_tool_uses = 3;
+    std::string compaction_prompt;
 };
 
 // ─── Parsed request ─────────────────────────────────────────────────────
@@ -200,6 +208,11 @@ struct ParsedRequest {
     std::vector<std::string>  stop_sequences;
     // Bandit: per-session adaptive keep_ratio opt-in
     std::string               session_id;
+    bool                      compaction_needed             = false;
+    bool                      compaction_applied            = false;
+    int                       pre_compaction_tokens         = 0;
+    int                       compaction_threshold_override = 0;
+    std::vector<ChatMessage>  chat_messages_copy;
 };
 
 // Build the /props response body. Exposed (non-static) so unit tests
