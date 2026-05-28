@@ -421,6 +421,15 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
     // just zeroed; rebuilding is cheap (~30 graphs) and avoids stale-pointer crashes.
     pipe_state_.reset();
 
+    // Free per-layer cached FFN graphs from previous decode to release GPU memory
+    // before prefill allocates its own graph buffers.
+    if (target_weights().moe_hybrid) {
+        for (auto & layer : target_weights().moe_hybrid->layers) {
+            layer.hot_graph.free();
+            layer.cold_graph.free();
+        }
+    }
+
     const int hidden = target_weights().n_embd;
     const int vocab  = target_weights().n_vocab;
     std::vector<float> act_cur((size_t)hidden);
