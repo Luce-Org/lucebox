@@ -911,6 +911,39 @@ int main(int argc, char ** argv) {
         server.set_drafter_tokenizer(&drafter_tokenizer);
     }
 
+    // When --prefill-drafter is present and compaction is enabled, use the
+    // drafter (Qwen3-0.6B) as a dedicated compaction backend for Layer 2
+    // summarization. This avoids tying up the main target model for summary
+    // generation and is much faster (~0.6B vs 27B+).
+    std::unique_ptr<ModelBackend> compaction_backend;
+    if (sconfig.compaction_enabled && !sconfig.pflash_drafter_path.empty()) {
+        std::fprintf(stderr, "[server] creating compaction backend from %s\n",
+                     sconfig.pflash_drafter_path.c_str());
+        BackendArgs cbargs;
+        cbargs.model_path = sconfig.pflash_drafter_path.c_str();
+        cbargs.device.gpu = sconfig.pflash_drafter_gpu;
+        cbargs.device.max_ctx = 4096;  // compaction summaries are short
+        cbargs.stream_fd = -1;
+        cbargs.chunk = 512;
+        compaction_backend = create_backend(cbargs);
+        if (compaction_backend) {
+            // Use the drafter_tokenizer (already loaded for pflash) or load one.
+            if (!pflash_enabled) {
+                if (!drafter_tokenizer.load_from_gguf(sconfig.pflash_drafter_path.c_str())) {
+                    std::fprintf(stderr, "[server] compaction backend tokenizer load failed\n");
+                    compaction_backend.reset();
+                }
+            }
+            if (compaction_backend) {
+                server.set_compaction_backend(compaction_backend.get(), &drafter_tokenizer);
+                std::fprintf(stderr, "[server] compaction backend ready (drafter model)\n");
+            }
+        } else {
+            std::fprintf(stderr, "[server] compaction backend creation failed, "
+                         "falling back to main model for summarization\n");
+        }
+    }
+
     // Lazy-draft: park decode draft at startup to free VRAM (~3.3 GB).
     if (sconfig.lazy_draft && bargs.draft_path) {
         backend->park("draft");
@@ -919,6 +952,9 @@ int main(int argc, char ** argv) {
     int ret = server.run();
 
     // Cleanup.
+    if (compaction_backend) {
+        compaction_backend->shutdown();
+    }
     backend->shutdown();
     return ret;
 }

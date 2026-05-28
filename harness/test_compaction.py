@@ -99,6 +99,8 @@ def build_command(args: argparse.Namespace) -> list[str]:
     ]
     if args.draft:
         cmd += ["--draft", args.draft]
+    if args.prefill_drafter:
+        cmd += ["--prefill-drafter", args.prefill_drafter]
     if args.extra_server_args:
         cmd += shlex.split(args.extra_server_args)
     return cmd
@@ -109,6 +111,7 @@ def main() -> int:
     parser.add_argument("--server-bin", type=Path, default=DEFAULT_BIN)
     parser.add_argument("--model", default=os.getenv("TARGET") or os.getenv("MODEL_PATH"))
     parser.add_argument("--draft", default=os.getenv("DRAFT"))
+    parser.add_argument("--prefill-drafter", default=os.getenv("PREFILL_DRAFTER"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=int(os.getenv("COMPACTION_TEST_PORT", "18081")))
     parser.add_argument("--model-name", default=os.getenv("MODEL_ID", "luce-dflash"))

@@ -1185,14 +1185,22 @@ void HttpServer::worker_loop() {
             if (render_failed) continue;
 
             if ((int)req.prompt_tokens.size() + req.max_output > config_.max_ctx) {
+                // Use dedicated compaction backend (small model) if available,
+                // otherwise fall back to the main target model.
+                ModelBackend * sum_backend = compaction_backend_ ? compaction_backend_ : &backend_;
+                Tokenizer * sum_tokenizer = compaction_tokenizer_ ? compaction_tokenizer_ : &tokenizer_;
+                // Compaction backend (Qwen3-0.6B) always uses QWEN3 chat format.
+                int sum_chat_format = compaction_backend_
+                    ? (int)ChatFormat::QWEN3
+                    : (int)chat_format_;
                 auto sum_result = summarize_compact(
                     current_messages,
                     config_.compaction_keep_recent,
                     config_.compaction_max_tokens,
                     config_.compaction_prompt,
-                    &backend_,
-                    &tokenizer_,
-                    (int)chat_format_);
+                    sum_backend,
+                    sum_tokenizer,
+                    sum_chat_format);
                 if (sum_result.applied) {
                     current_messages = std::move(sum_result.compacted_messages);
                     if (!render_compacted_prompt(current_messages, req.prompt_tokens)) {

@@ -236,6 +236,13 @@ public:
     // Set the optional pflash drafter tokenizer.
     void set_drafter_tokenizer(Tokenizer * tok) { drafter_tokenizer_ = tok; }
 
+    // Set a dedicated compaction backend (e.g. Qwen3-0.6B from --prefill-drafter).
+    // When set, Layer 2 summarization uses this small model instead of the main target.
+    void set_compaction_backend(ModelBackend * b, Tokenizer * tok) {
+        compaction_backend_ = b;
+        compaction_tokenizer_ = tok;
+    }
+
     // Set the chat template format (detected from model arch).
     void set_chat_format(ChatFormat fmt) { chat_format_ = fmt; }
 
@@ -290,6 +297,8 @@ private:
     ModelBackend &   backend_;
     Tokenizer &      tokenizer_;
     Tokenizer *      drafter_tokenizer_ = nullptr;  // pflash drafter (optional)
+    ModelBackend *   compaction_backend_ = nullptr;  // dedicated compaction backend (optional)
+    Tokenizer *      compaction_tokenizer_ = nullptr; // tokenizer for compaction backend
     ServerConfig     config_;
     ChatFormat       chat_format_;
     PFlashDrafterIpcClient pflash_remote_;
