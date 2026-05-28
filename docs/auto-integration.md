@@ -4,20 +4,20 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T12:54:00-04:00
-Current base: `origin/main` `6a6b0081`
-Current integration tip before this refresh: `easel/auto-integration` `c967d8e9`
-Refreshed stack tip prepared in this run: this commit
+Last refresh: 2026-05-28T13:17:57-04:00
+Current base: `origin/main` `315a9bdb`
+Current integration tip before this refresh: `easel/auto-integration` `161014ae`
+Refreshed stack tip prepared in this run: `11f7424b`
 
 This branch is maintained as a reproducible patch stack over `origin/main`.
-The primary checkout was clean at the start of this unattended run. Upstream
-`origin/main` and the current `easel/auto-integration` tip had not advanced
-since the prior refresh, and all previously integrated non-draft contributor PR
-refs remained ancestors of the stack. No new non-draft contributor PR head
-required a new integration merge in this run. After the first manifest-only push,
-CI exposed integration-only build breakage; this refresh also removes duplicate
-CMake test target registrations and installs libcurl development headers for the
-new server target in CI/Docker builds.
+The primary checkout was clean at the start of this unattended run. Since the
+prior refresh, `origin/main` advanced by the merge commit for PR #284, so this
+run first synced that upstream change into the integration branch. All previously
+integrated non-draft contributor PR refs remained ancestors of the stack, and no
+new non-draft contributor PR head required a fresh integration merge. After the
+first manifest-only push, CI exposed integration-only build breakage; this
+refresh also removes duplicate CMake test target registrations and installs
+libcurl development headers for the new server target in CI/Docker builds.
 
 ## Included in the current stack
 
