@@ -15,6 +15,7 @@
 
 #include "qwen3_drafter.h"
 #include "qwen3_drafter_model.h"
+#include "common/backend_precision.h"
 #include "internal.h"
 #include "anchor_scan.h"
 
@@ -211,9 +212,11 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
     out.loaded = true;
     out.arch = arch;
     std::fprintf(stderr,
-        "[drafter] loaded %s BF16: n_layer=%d n_head=%d n_kv=%d "
+        "[drafter] loaded %s weights=%s compute=%s: n_layer=%d n_head=%d n_kv=%d "
         "n_embd=%d n_ff=%d head_dim=%d vocab=%d gpu=%d\n",
         drafter_arch_name(arch),
+        backend_precision_type_name(out.weights.weight_type),
+        backend_precision_type_name(out.weights.compute_type),
         out.weights.n_layer, out.weights.n_head, out.weights.n_head_kv,
         out.weights.n_embd, out.weights.n_ff, out.weights.head_dim,
         out.weights.n_vocab, out.gpu);

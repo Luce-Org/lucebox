@@ -36,13 +36,7 @@ bool create_qwen3_cache(ggml_backend_t backend, const Qwen3DrafterWeights & w,
     out.ctx = ggml_init(ip);
     if (!out.ctx) return false;
 
-    // Use BF16 where available, else F16.
-    const ggml_type half_type =
-#ifdef DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL
-        GGML_TYPE_BF16;
-#else
-        GGML_TYPE_F16;
-#endif
+    const ggml_type half_type = w.compute_type;
 
     out.k.resize(n_layer);
     out.v.resize(n_layer);
@@ -174,17 +168,11 @@ bool Qwen3Backend::do_step(const float * embed, int n_tokens, int kv_start,
     const int H      = w_.n_head;
     const int Hk     = w_.n_head_kv;
     const int D      = w_.head_dim;
-    const int ff     = w_.n_ff;
     const int vocab  = w_.n_vocab;
     const float eps  = 1e-6f;
     const int kv_len = kv_start + n_tokens;
 
-    const ggml_type half_type =
-#ifdef DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL
-        GGML_TYPE_BF16;
-#else
-        GGML_TYPE_F16;
-#endif
+    const ggml_type half_type = w_.compute_type;
 
     // Allocate graph context
     ggml_init_params ip{};

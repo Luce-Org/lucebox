@@ -81,7 +81,7 @@ struct HipChunkGraphB {
     ggml_backend_buffer_t buf = nullptr;
 
     ggml_tensor * h_in    = nullptr;   // input: hidden state slice (F32)
-    ggml_tensor * attn_in = nullptr;   // input: attention output slice (BF16)
+    ggml_tensor * attn_in = nullptr;   // input: attention output slice
     ggml_tensor * h_after = nullptr;   // h_in + attn_proj residual (F32)
     ggml_tensor * hf      = nullptr;   // FFN norm result written by custom kernel (F32)
     ggml_tensor * h_next  = nullptr;   // output: updated hidden state (F32)
@@ -130,6 +130,7 @@ bool build_hip_chunk_graph_b(const Qwen3DrafterLayer & L,
                              int hidden,
                              int q_dim,
                              int chunk,
+                             ggml_type compute_type,
                              float eps,
                              HipChunkGraphB & out) {
     ggml_init_params ip{};
@@ -141,7 +142,7 @@ bool build_hip_chunk_graph_b(const Qwen3DrafterLayer & L,
     if (!out.ctx) return false;
 
     out.h_in = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, hidden, chunk);
-    out.attn_in = ggml_new_tensor_2d(out.ctx, GGML_TYPE_BF16, q_dim, chunk);
+    out.attn_in = ggml_new_tensor_2d(out.ctx, compute_type, q_dim, chunk);
     ggml_set_input(out.h_in);
     ggml_set_input(out.attn_in);
 
@@ -302,14 +303,7 @@ bool forward_qwen3_drafter_model(
         int64_t d_ql[]  = {(int64_t)D, (int64_t)H,  (int64_t)n_lookahead};
         int64_t d_p[]   = {(int64_t)S};
         int64_t d_mt[]  = {(int64_t)S, (int64_t)n_lookahead};
-        // Use BF16 when rocWMMA or CUDA WMMA flashprefill kernels are compiled.
-        // HIP Phase 1 (q8 ggml fallback) and old CUDA arches stay with F16.
-        const ggml_type half_type =
-#if defined(DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL) || defined(DFLASH27B_HAVE_FLASHPREFILL)
-            GGML_TYPE_BF16;
-#else
-            GGML_TYPE_F16;
-#endif
+        const ggml_type half_type = w.compute_type;
         if (!make_pers(w.backend, GGML_TYPE_F32,  2, d_h, hidden_buf) ||
             !make_pers(w.backend, GGML_TYPE_I32,  1, d_p, pos_buf)    ||
             !make_pers(w.backend, GGML_TYPE_F32,  2, d_mt, mask_tail_buf) ||
@@ -577,7 +571,7 @@ bool forward_qwen3_drafter_model(
 #if defined(DFLASH27B_BACKEND_HIP)
         auto tB_setup0 = std::chrono::steady_clock::now();
         HipChunkGraphB gb{};
-        if (!build_hip_chunk_graph_b(L, w.backend, hidden, D * H, chunk_s_ff_v, eps, gb)) {
+        if (!build_hip_chunk_graph_b(L, w.backend, hidden, D * H, chunk_s_ff_v, w.compute_type, eps, gb)) {
             set_last_error("graph B reusable build failed at layer " + std::to_string(il));
             ggml_gallocr_free(galloc); cleanup_all(); return false;
         }

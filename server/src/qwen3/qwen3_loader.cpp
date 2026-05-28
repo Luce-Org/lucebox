@@ -23,11 +23,13 @@
 // (mirrors the dflash gguf_target_loader pattern).
 
 #include "qwen3_drafter_model.h"
+#include "common/backend_precision.h"
 #include "internal.h"
 
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <vector>
 #if defined(_WIN32)
 #if !defined(NOMINMAX)
 #define NOMINMAX
@@ -55,10 +57,42 @@ bool copy_tensor_from_file(gguf_context * gctx, const char * name,
         return false;
     }
     const size_t off = gguf_get_tensor_offset(gctx, idx);
-    const size_t bytes = ggml_nbytes(dst);
     const uint8_t * src = (const uint8_t *)mmap_base + data_offset + off;
-    ggml_backend_tensor_set(dst, src, 0, bytes);
-    return true;
+    const ggml_type src_type = gguf_get_tensor_type(gctx, idx);
+    const ggml_type dst_type = dst->type;
+    const int64_t n = ggml_nelements(dst);
+
+    if (src_type == dst_type) {
+        ggml_backend_tensor_set(dst, src, 0, ggml_nbytes(dst));
+        return true;
+    }
+
+    if (src_type == GGML_TYPE_BF16 && dst_type == GGML_TYPE_F16) {
+        std::vector<float> tmp_f32((size_t)n);
+        std::vector<ggml_fp16_t> tmp_f16((size_t)n);
+        ggml_bf16_to_fp32_row((const ggml_bf16_t *)src, tmp_f32.data(), n);
+        ggml_fp32_to_fp16_row(tmp_f32.data(), tmp_f16.data(), n);
+        ggml_backend_tensor_set(dst, tmp_f16.data(), 0, ggml_nbytes(dst));
+        return true;
+    }
+
+    if (src_type == GGML_TYPE_BF16 && dst_type == GGML_TYPE_F32) {
+        std::vector<float> tmp_f32((size_t)n);
+        ggml_bf16_to_fp32_row((const ggml_bf16_t *)src, tmp_f32.data(), n);
+        ggml_backend_tensor_set(dst, tmp_f32.data(), 0, ggml_nbytes(dst));
+        return true;
+    }
+
+    if (src_type == GGML_TYPE_F16 && dst_type == GGML_TYPE_F32) {
+        std::vector<float> tmp_f32((size_t)n);
+        ggml_fp16_to_fp32_row((const ggml_fp16_t *)src, tmp_f32.data(), n);
+        ggml_backend_tensor_set(dst, tmp_f32.data(), 0, ggml_nbytes(dst));
+        return true;
+    }
+
+    std::fprintf(stderr, "[qwen3-0.6b] unsupported tensor conversion for %s: %s -> %s\n",
+                 name, ggml_type_name(src_type), ggml_type_name(dst_type));
+    return false;
 }
 
 uint32_t get_u32(gguf_context * g, const char * key, uint32_t def) {
@@ -79,6 +113,9 @@ bool load_qwen3_drafter_model(const std::string & path,
                               ggml_backend_t backend,
                               Qwen3DrafterWeights & out) {
     out.backend = backend;
+    const BackendPrecisionPolicy precision = select_drafter_precision_policy(backend);
+    out.weight_type = precision.weight_type;
+    out.compute_type = precision.compute_type;
 
     gguf_init_params iparams{ /*no_alloc=*/ false, /*ctx=*/ nullptr };
     gguf_context * gctx = gguf_init_from_file(path.c_str(), iparams);
@@ -96,16 +133,20 @@ bool load_qwen3_drafter_model(const std::string & path,
     out.head_dim   = (int)get_u32(gctx, "qwen3.attention.key_length", 128);
     out.rope_theta = get_f32(gctx, "qwen3.rope.freq_base", 1000000.0f);
 
-    // Detect weight quant type from blk.0.attn_q.weight; support BF16 and Q8_0.
-    ggml_type wtype = GGML_TYPE_BF16;
+    // Detect quantized GGUF weights while still allowing the backend precision
+    // policy to choose F16 for BF16 source weights on legacy CUDA devices.
+    ggml_type file_weight_type = GGML_TYPE_BF16;
     {
         int64_t tidx = gguf_find_tensor(gctx, "blk.0.attn_q.weight");
         if (tidx >= 0) {
-            wtype = gguf_get_tensor_type(gctx, tidx);
+            file_weight_type = gguf_get_tensor_type(gctx, tidx);
         }
     }
-    std::fprintf(stderr, "[qwen3-0.6b] detected weight type: %s\n",
-                 wtype == GGML_TYPE_Q8_0 ? "Q8_0" : "BF16");
+    if (file_weight_type == GGML_TYPE_Q8_0) {
+        out.weight_type = GGML_TYPE_Q8_0;
+    }
+    std::fprintf(stderr, "[qwen3-0.6b] detected source weight type: %s; allocation weight type: %s\n",
+                 ggml_type_name(file_weight_type), ggml_type_name(out.weight_type));
     std::fflush(stderr);
 
     // Compute total tensor metadata size for context allocation.
@@ -128,11 +169,13 @@ bool load_qwen3_drafter_model(const std::string & path,
     const int n_vocab   = out.n_vocab;
     const int q_dim     = n_head * head_dim;
     const int kv_dim    = n_head_kv * head_dim;
+    const ggml_type weight_type = out.weight_type;
 
-    // Top-level tensors. tok_embd/output use wtype; norms stay F32.
-    out.tok_embd = ggml_new_tensor_2d(out.ctx, wtype, n_embd, n_vocab);
+    // Top-level tensors. tok_embd/output use the selected allocation type;
+    // norms stay F32.
+    out.tok_embd = ggml_new_tensor_2d(out.ctx, weight_type, n_embd, n_vocab);
     out.out_norm = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, n_embd);
-    out.output   = ggml_new_tensor_2d(out.ctx, wtype, n_embd, n_vocab);
+    out.output   = ggml_new_tensor_2d(out.ctx, weight_type, n_embd, n_vocab);
     ggml_set_name(out.tok_embd, "token_embd.weight");
     ggml_set_name(out.out_norm, "output_norm.weight");
     ggml_set_name(out.output,   "output.weight");
@@ -141,16 +184,16 @@ bool load_qwen3_drafter_model(const std::string & path,
     for (int il = 0; il < n_layer; ++il) {
         auto & L = out.layers[il];
         L.attn_norm = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, n_embd);
-        L.wq        = ggml_new_tensor_2d(out.ctx, wtype, n_embd, q_dim);
-        L.wk        = ggml_new_tensor_2d(out.ctx, wtype, n_embd, kv_dim);
-        L.wv        = ggml_new_tensor_2d(out.ctx, wtype, n_embd, kv_dim);
-        L.wo        = ggml_new_tensor_2d(out.ctx, wtype, q_dim, n_embd);
+        L.wq        = ggml_new_tensor_2d(out.ctx, weight_type, n_embd, q_dim);
+        L.wk        = ggml_new_tensor_2d(out.ctx, weight_type, n_embd, kv_dim);
+        L.wv        = ggml_new_tensor_2d(out.ctx, weight_type, n_embd, kv_dim);
+        L.wo        = ggml_new_tensor_2d(out.ctx, weight_type, q_dim, n_embd);
         L.q_norm    = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, head_dim);
         L.k_norm    = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, head_dim);
         L.ffn_norm  = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, n_embd);
-        L.ffn_gate  = ggml_new_tensor_2d(out.ctx, wtype, n_embd, n_ff);
-        L.ffn_up    = ggml_new_tensor_2d(out.ctx, wtype, n_embd, n_ff);
-        L.ffn_down  = ggml_new_tensor_2d(out.ctx, wtype, n_ff, n_embd);
+        L.ffn_gate  = ggml_new_tensor_2d(out.ctx, weight_type, n_embd, n_ff);
+        L.ffn_up    = ggml_new_tensor_2d(out.ctx, weight_type, n_embd, n_ff);
+        L.ffn_down  = ggml_new_tensor_2d(out.ctx, weight_type, n_ff, n_embd);
     }
 
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
@@ -161,6 +204,17 @@ bool load_qwen3_drafter_model(const std::string & path,
         out.ctx = nullptr;
         return false;
     }
+
+    std::fprintf(stderr,
+        "[qwen3-0.6b] precision weights=%s compute=%s backend=%s device=%s id=%d arch=%s reason=%s\n",
+        backend_precision_type_name(out.weight_type),
+        backend_precision_type_name(out.compute_type),
+        precision.backend_name.c_str(),
+        precision.device_name.c_str(),
+        precision.device_id,
+        precision.runtime_arch.empty() ? "-" : precision.runtime_arch.c_str(),
+        precision.reason.c_str());
+    std::fflush(stderr);
 
     // mmap the GGUF data section.
     const size_t data_off = gguf_get_data_offset(gctx);

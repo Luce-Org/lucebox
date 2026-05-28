@@ -35,7 +35,7 @@ const char * drafter_arch_name(DrafterArch arch);
 
 struct DrafterContext {
     ggml_backend_t        backend = nullptr;   // owned (created in load_drafter)
-    Qwen3DrafterWeights   weights;             // BF16 weights on the backend
+    Qwen3DrafterWeights   weights;             // weights on the selected backend
     DrafterArch           arch    = DrafterArch::Qwen3_0p6b;
     void *                arch_state = nullptr;
     int                   gpu = -1;
@@ -43,7 +43,7 @@ struct DrafterContext {
 };
 
 // Load the drafter GGUF (e.g. /opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf).
-// Creates a fresh CUDA backend if `backend` is null. Otherwise uses the
+// Creates a fresh GPU backend if `backend` is null. Otherwise uses the
 // caller-provided backend (so the drafter shares the daemon's allocator).
 //
 // `gpu_layers` is accepted for API compat but ignored — every layer goes on
@@ -59,8 +59,8 @@ bool load_drafter(const std::string & gguf_path, int gpu_layers,
 
 void free_drafter(DrafterContext & ctx);
 
-// Free only model weights, keeping the CUDA backend alive for reuse.
-// Avoids repeated ggml backend create/destroy which corrupts CUDA state.
+// Free only model weights, keeping the backend alive for reuse.
+// Avoids repeated ggml backend create/destroy during daemon reuse.
 void free_drafter_weights(DrafterContext & ctx);
 
 // Score importance per token via Liu Q-hook tail attention, then chunk-top-K

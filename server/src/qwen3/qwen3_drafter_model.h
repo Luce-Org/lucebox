@@ -1,7 +1,7 @@
 // Custom Qwen3-0.6B drafter forward, in dflash, replacing libllama.
 //
-// Uses our FlashPrefill CUDA kernels for the attention compute. Single
-// process, single CUDA context, single ggml allocator — no Python, no
+// Uses the FlashPrefill dispatch path for the attention compute. Single
+// process, single backend context, single ggml allocator — no Python, no
 // Triton, no subprocess.
 //
 // Public API:
@@ -9,10 +9,9 @@
 //   bool forward_qwen3_drafter_model(weights, ids, out_q_capture, out_k_capture)
 //   void free_qwen3_drafter_model(weights)
 //
-// Status (2026-04-29 session): scaffolding written; full graph + integration
-// is multi-hour work, in progress.
-
 #pragma once
+
+#include "ggml.h"
 
 #include <cstdint>
 #include <string>
@@ -45,6 +44,8 @@ struct Qwen3DrafterWeights {
     ggml_context *        ctx     = nullptr;
     ggml_backend_t        backend = nullptr;
     ggml_backend_buffer_t buf     = nullptr;
+    ggml_type             weight_type  = GGML_TYPE_BF16;
+    ggml_type             compute_type = GGML_TYPE_BF16;
 
     ggml_tensor * tok_embd    = nullptr;  // [hidden, vocab]
     ggml_tensor * out_norm    = nullptr;  // [hidden]
@@ -73,7 +74,7 @@ void free_qwen3_drafter_model(Qwen3DrafterWeights & w);
 // Custom Qwen3-0.6B forward, fused with Liu Q-hook tail attention scoring.
 //
 // Inputs:
-//   w           — loaded weights (must be on a CUDA backend)
+//   w           — loaded weights (must be on the selected GPU backend)
 //   ids         — input token IDs of length S (drafter vocab)
 //   n_lookahead — number of trailing query tokens for tail attention (=8)
 //
