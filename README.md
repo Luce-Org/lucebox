@@ -129,7 +129,7 @@ harness/clients/run_codex.sh
 
 ## Run the Server
 
-Default: Qwen 3.6-27B Q4_K_M target + Lucebox Q8_0 DFlash drafter on RTX 3090. DDTree budget=22, TQ3_0 KV cache, sliding FA window 2048. OpenAI-compatible HTTP on `:8000`.
+Default: Qwen 3.6-27B Q4_K_M target + Lucebox Q4_K_M DFlash drafter on RTX 3090. DDTree budget=22, TQ3_0 KV cache, sliding FA window 2048. OpenAI-compatible HTTP on `:8000`.
 
 ```bash
 # build (CUDA 12+, CMake 3.18+)
@@ -139,12 +139,12 @@ cmake --build server/build --target dflash_server -j
 
 # default weights (~18 GB)
 hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir server/models/
-hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q8_0.gguf --local-dir server/models/draft/
+hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf --local-dir server/models/draft/
 
 # run (TQ3_0 KV auto-enabled; set =0 to disable)
 DFLASH27B_KV_TQ3=1 \
 ./server/build/dflash_server server/models/Qwen3.6-27B-Q4_K_M.gguf \
-  --draft server/models/draft/dflash-draft-3.6-q8_0.gguf \
+  --draft server/models/draft/dflash-draft-3.6-q4_k_m.gguf \
   --ddtree --ddtree-budget 22 --fa-window 2048 --port 8000
 ```
 

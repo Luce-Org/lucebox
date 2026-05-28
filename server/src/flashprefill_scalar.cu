@@ -4,16 +4,16 @@
 //   - F16 (half) instead of __nv_bfloat16 — Pascal has no BF16 hardware
 //   - Scalar F16×F16→F32 math instead of WMMA tensor cores
 //   - Cooperative shared-memory loads instead of cp.async (Pascal has no async copy)
-//   - __shfl / __shfl_down instead of __shfl_sync / __shfl_down_sync
-//   - membar.gl instead of fence.acq_rel.gpu
+//   - Uses full-warp _sync vote/shuffle intrinsics, which CUDA 12 accepts for
+//     Pascal and newer targets.
 //
 // Dispatched from flashprefill.cpp when DFLASH27B_HAVE_PASCAL_FLASHPREFILL is set.
 // The drafter's persistent buffers must be GGML_TYPE_F16.
 //
-// Guarded to compile only for sm_60-69 so Pascal-specific intrinsics
-// (__shfl without _sync, etc.) don't affect sm_70+ codepaths.
-
-#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 600 && __CUDA_ARCH__ < 700)
+// CMake's CUDA_ARCHITECTURES is a target property in many supported CMake
+// versions, so this file may still be compiled during an sm_70+ pass in a
+// default multi-arch build. Keep the kernel definitions visible for every pass
+// and use warp intrinsics that compile cleanly across those targets.
 
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -22,6 +22,14 @@
 namespace dflash::common {
 namespace flashprefill {
 
+__device__ inline float scalar_shfl_xor(float v, int lane_mask) {
+    return __shfl_xor_sync(0xffffffffu, v, lane_mask);
+}
+
+__device__ inline unsigned scalar_ballot(bool pred) {
+    return __ballot_sync(0xffffffffu, pred);
+}
+
 // =============================================================================
 // Kernel 1: compute_mean_vector (F16, scalar)
 // =============================================================================
@@ -29,7 +37,7 @@ namespace flashprefill {
 // along the sequence dim, computing the mean per dim.
 
 template <int BLOCK, int D_HEAD>
-__global__ void compute_mean_vector_kernel_f16(
+__global__ void compute_mean_vector_kernel_f16_pascal(
     const half * __restrict__ K,
     half       * __restrict__ mean_K,
     int batch, int seq_len, int n_kv_heads,
@@ -73,7 +81,7 @@ extern "C" void launch_compute_mean_vector_f16_pascal(
     dim3 grid(n_k_blocks, batch * n_kv_heads, 1);
     dim3 block(head_dim, 1, 1);
     if (head_dim == 128 && block_size == 128) {
-        compute_mean_vector_kernel_f16<128, 128><<<grid, block, 0, stream>>>(
+        compute_mean_vector_kernel_f16_pascal<128, 128><<<grid, block, 0, stream>>>(
             (const half *)K, (half *)mean_K,
             batch, seq_len, n_kv_heads,
             s_K_b, s_K_n, s_K_h, s_K_d,
@@ -87,7 +95,7 @@ extern "C" void launch_compute_mean_vector_f16_pascal(
 // Per (q_block, k_block), compute the attention score via Q · mean_K^T.
 
 template <int BLOCK, int D_HEAD, int N_BLOCKS_TILE>
-__global__ void compute_block_score_kernel_f16(
+__global__ void compute_block_score_kernel_f16_pascal(
     const half * __restrict__ Q,
     const half * __restrict__ mean_K,
     float sm_scale,
@@ -174,7 +182,7 @@ extern "C" void launch_compute_block_score_f16_pascal(
     dim3 block(block_size, 1, 1);
     size_t smem = block_size * sizeof(float);
     if (head_dim == 128 && block_size == 128) {
-        compute_block_score_kernel_f16<128, 128, 1><<<grid, block, smem, stream>>>(
+        compute_block_score_kernel_f16_pascal<128, 128, 1><<<grid, block, smem, stream>>>(
             (const half *)Q, (const half *)mean_K, sm_scale,
             (float *)score, (float *)score_max,
             batch, n_q_heads, n_k_heads, M, M,
@@ -192,7 +200,7 @@ extern "C" void launch_compute_block_score_f16_pascal(
 // Scalar F16×F16→F32 math, shared-memory tiled, no WMMA.
 
 template <int Q_TILE, int K_TILE, int BLOCK, int D_HEAD>
-__global__ void sparse_flash_forward_kernel_f16(
+__global__ void sparse_flash_forward_kernel_f16_pascal(
     const half * __restrict__ Q,
     const half * __restrict__ K,
     const half * __restrict__ V,
@@ -404,7 +412,7 @@ extern "C" void launch_sparse_flash_forward_f16_pascal(
                            + sizeof(half) * (K_TILE * D_HEAD)     // KV tile
                            + sizeof(half) * (Q_TILE * K_TILE)     // P tile
                            + sizeof(float) * (2 * Q_TILE);        // row_m + row_l
-        sparse_flash_forward_kernel_f16<Q_TILE, K_TILE, BLOCK, D_HEAD><<<grid, block, smem_bytes, stream>>>(
+        sparse_flash_forward_kernel_f16_pascal<Q_TILE, K_TILE, BLOCK, D_HEAD><<<grid, block, smem_bytes, stream>>>(
             (const half *)Q, (const half *)K,
             (const half *)V, (half *)O,
             block_index, counts, scale,
@@ -453,10 +461,9 @@ __global__ void block_select_kernel_pascal(
         float v = valid ? sp[(size_t)n * s_n] : NEG_INF;
         local_max = fmaxf(local_max, v);
     }
-    // Pascal: __shfl_xor (no _sync suffix)
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
-        local_max = fmaxf(local_max, __shfl_xor(local_max, off));
+        local_max = fmaxf(local_max, scalar_shfl_xor(local_max, off));
     const float max_score = local_max;
     const float thresh = max_score * alpha;
 
@@ -473,7 +480,7 @@ __global__ void block_select_kernel_pascal(
                 || ((m - n) < window)
                 || (v >= thresh);
         }
-        unsigned mask = __ballot(keep);  // Pascal: __ballot (no _sync suffix)
+        unsigned mask = scalar_ballot(keep);
         int rank = __popc(mask & ((1u << lane) - 1u));
         if (keep) {
             idxp[(size_t)(total + rank) * idx_s_n] = (int32_t)n;
@@ -513,5 +520,3 @@ extern "C" void launch_block_select_pascal(
 
 } // namespace flashprefill
 } // namespace dflash::common
-
-#endif // !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 600 && __CUDA_ARCH__ < 700)

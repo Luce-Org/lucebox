@@ -8,7 +8,7 @@ STAMP="${STAMP:-generation-baseline-$(date +%Y%m%d-%H%M%S)}"
 LOG_DIR="$RUN_DIR/$STAMP"
 
 TARGET="${TARGET:-$REPO_DIR/server/models/Qwen3.6-27B-Q4_K_M.gguf}"
-DRAFT="${DRAFT:-$REPO_DIR/server/models/draft/dflash-draft-3.6-q8_0.gguf}"
+DRAFT="${DRAFT:-$REPO_DIR/server/models/draft/dflash-draft-3.6-q4_k_m.gguf}"
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-$REPO_DIR/server/deps/llama.cpp/build/bin/llama-server}"
 
 HOST="${HOST:-127.0.0.1}"

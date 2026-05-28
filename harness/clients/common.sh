@@ -9,7 +9,7 @@ CLIENT_WORK_DIR="${CLIENT_WORK_DIR:-/workspace/lucebox-harness-work}"
 RUN_DIR="${RUN_DIR:-/workspace/lucebox-client-harness-runs}"
 
 TARGET="${TARGET:-$REPO_DIR/server/models/Qwen3.6-27B-Q4_K_M.gguf}"
-DRAFT="${DRAFT:-$REPO_DIR/server/models/draft/dflash-draft-3.6-q8_0.gguf}"
+DRAFT="${DRAFT:-$REPO_DIR/server/models/draft/dflash-draft-3.6-q4_k_m.gguf}"
 MODEL_SERVER="${MODEL_SERVER:-lucebox}"
 LUCEBOX_SERVER_BACKEND="${LUCEBOX_SERVER_BACKEND:-cpp}"
 DFLASH_SERVER_BIN="${DFLASH_SERVER_BIN:-$REPO_DIR/server/build/dflash_server}"
