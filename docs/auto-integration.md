@@ -4,22 +4,21 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T06:01:38-04:00
+Last refresh: 2026-05-28T06:19:49-04:00
 Current base: `origin/main` `4f4d82e`
-Current integration tip before this refresh: `easel/auto-integration` `123d069`
+Current integration tip before this refresh: `easel/auto-integration` `7cdef8a`
 
 This branch is maintained as a reproducible patch stack over `origin/main`. The
 primary checkout was clean at the start of this unattended run. Upstream
-`origin/main` was already merged into the stack. This refresh integrated the new
-non-draft contributor PR #289 by merging `origin/pr/289` in an isolated
-worktree and resolving the single Qwen35 MoE decode-signature conflict against
-the current thinking-budget hook API. The PR's `server/deps/llama.cpp` submodule
-pointer was deliberately not advanced because commit
-`3b32d7ebb6879da4357cc7f52c64a640ba241ec6` is not fetchable from the configured
-submodule remote; the current vendored ggml already exposes the async backend API
-used by the ported code. The remaining old-layout/non-ancestor PRs were re-probed
-after #289 and still conflict on direct merge, so the selective-port notes remain
-the reference for future work.
+`origin/main` was already merged into the stack, and no new ready contributor PR
+head needed a code merge beyond the current `easel/auto-integration` tip. This
+refresh revalidated the ready/non-draft PR set, recorded the newly opened draft
+Gemma4 residency PRs for dependency awareness, and reran direct probes for the
+remaining old-layout/non-ancestor PRs. A new Claude feasibility pass on #237
+confirmed that no low-risk additive server-only subset should be ported without
+the full MTP architecture design because the apparent additive pieces are coupled
+to the native MTP daemon path while other server changes would remove current
+PFlash IPC drafter and multi-format tool-call behavior.
 
 ## Included in the current stack
 
@@ -51,10 +50,10 @@ carried.
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| upstream sync | checked | In isolated worktree `/tmp/luce-auto-cron-20260528-055822`, `git merge --no-edit origin/main` reported `Already up to date.` |
-| #289 | integrated | Direct merge conflicted only in `server/src/qwen35moe/qwen35moe_backend.cpp`. Manual resolution kept the current `run_ar_decode_path(..., BudgetHook, forced_close_out, degenerate_close_out)` override and routes hybrid MoE generation through the PR's new `run_pipelined_decode_path`; non-hybrid generation still falls back to `Qwen35Backend` with budget hooks intact. The PR submodule pointer was tested with `git fetch origin 3b32d7ebb6879da4357cc7f52c64a640ba241ec6` inside `server/deps/llama.cpp` and rejected by the remote, so it was left at the existing integration commit. |
-| current integrated PRs | checked | Current heads for #289, #284, #278, #276, #274, #273, #266, #265, #152, and #142 are ancestors of the refreshed stack after the #289 merge commit. |
-| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39 after #289. Every direct probe conflicted and was aborted in the isolated worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-055822.txt`. |
+| upstream sync | checked | In isolated worktree `/tmp/luce-auto-cron-20260528-061548`, `git merge --no-edit origin/main` reported `Already up to date.` |
+| current integrated PRs | checked | Current heads for #289, #284, #278, #276, #274, #273, #266, #265, #152, and #142 are ancestors of `easel/auto-integration` `7cdef8a`; no new ready contributor head required a code merge this run. |
+| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every direct probe conflicted and was aborted in the isolated worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-061548.txt`. |
+| #237 | delegated feasibility refreshed | Claude first hit the configured turn limit with no report at `/tmp/pr237-claude-feasibility-20260528-061548.txt`; a narrower rerun completed at `/tmp/pr237-claude2-feasibility-20260528-061548.txt`. Conclusion: no clean low-risk additive server-only subset exists; `server.py`/daemon flag changes are MTP-coupled, and the server/parser/SSE edits would remove current PFlash IPC drafter and multi-format tool-call behavior. Next useful action remains a full MTP design/port rather than a partial server cherry-pick. |
 
 ## Prior probe results (retained)
 
@@ -66,7 +65,7 @@ carried.
 
 | PR | Head branch | Current status | Next useful action |
 |---:|---|---|---|
-| #237 | `feat/dflash-mtp-foundation` | blocked-needs-human / selective-port | Direct merge probe still conflicts. Prior Codex report `/tmp/pr237-codex-feasibility-20260528-023928.txt` recommends: port additive MTP files/CMake first; merge `ModelBackend`, `DFlashTarget`, `StepGraph`, and `BackendArgs` additively; preserve current remote-draft, PFlash, qwen35moe, and reasoning-budget paths; then add optional Qwen35 backend/native-server MTP flags and tests. |
+| #237 | `feat/dflash-mtp-foundation` | blocked-needs-human / selective-port | Direct merge probe still conflicts. Prior Codex report `/tmp/pr237-codex-feasibility-20260528-023928.txt` recommended a layered full MTP port. This run's narrower Claude report `/tmp/pr237-claude2-feasibility-20260528-061548.txt` tightened the guidance: do not cherry-pick a server-only subset, because the apparent additive flags are MTP-coupled and adjacent server/parser/SSE edits would regress current PFlash IPC drafter plus Anthropic/Responses/tool-call handling. Next useful action is a deliberate full MTP architecture/port. |
 | #221 | `feat/mtp-prefix-warm-ghost` | blocked-needs-human / dependency | Fresh Claude feasibility report `/tmp/pr221-claude2-feasibility-20260528-043924.txt` says this should not be direct-merged: path and namespace migrations plus a highly diverged `qwen35_backend` require a feature port. After #237/equivalent MTP foundation, port pure-add MTP files and tests into `server/`, add `ModelBackend`/`DFlashTarget`/`StepGraph` hidden-state and speculator hooks additively, then hand-port Qwen35 backend dispatcher, daemon wiring, bench scripts, and prefix-cache WARM tests. |
 | #183 | `split/gemma4-11a-target-mtp-integration` | blocked-needs-human / selective-port | Fresh Claude feasibility report `/tmp/pr183-claude2-feasibility-20260528-051446.txt` says direct merge is unsafe because the PR targets the retired `dflash/` + `dflash27b` layout and duplicates current `server/src/gemma4` loader/graph work. Portable value is Gemma4 MTP graph/loader, long-context KV correctness, asymmetric KV/`h_prev` capture, dead-cast hardening, and MTP/KV tests. Port order: KV fix, `h_prev`/asymmetric KV hook, extracted `gemma4_mtp_loader.cpp`, `gemma4_mtp_graph.cpp`, hardening, then tests/CMake. |
 | #182 | `split/gemma4-10-mtp-loader-step-graph` | selective-port | Portable only as current-layout `server/src/gemma4` assistant loader/MTP graph work. Prior Codex report: `/tmp/pr182-feasibility-20260527-2039.txt`. |
@@ -86,35 +85,35 @@ carried.
 ## Draft / excluded
 
 Draft PRs remain outside the primary non-draft integration target except for
-dependency awareness: #290, #286, #285, #275, #249, #193, and #75. #285
+dependency awareness: #291, #290, #286, #285, #275, #249, #193, and #75. #285
 remains partially carried only as an integration dependency.
 
 ## Validation run
 
 This run performed:
 
-- `date -Is` -> 2026-05-28T06:01:38-04:00 during this refresh.
+- `date -Is` -> 2026-05-28T06:14:47-04:00 at preflight and 2026-05-28T06:19:49-04:00 during manifest refresh.
 - Primary checkout `git status --short` was clean before work began.
 - `git remote -v` verified `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
 - `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status` succeeded for account `easel`.
 - `HOME=/home/erik /home/erik/.local/bin/claude auth status --text` succeeded for the Claude Team account.
 - `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --help` succeeded.
 - `git fetch --prune origin` and `git fetch --prune easel` completed; targeted fetches recreated current open non-draft PR refs.
-- `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...` enumerated all open PRs and showed #290, #286, #285, #275, #249, #193, and #75 as drafts/excluded.
-- `git merge-base --is-ancestor origin/pr/<n> easel/auto-integration` pre-merge classification showed #284, #278, #276, #274, #273, #266, #265, #152, and #142 were current integrated non-draft heads; #289 was the new non-integrated ready PR.
-- Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260528-055822`; `git merge --no-edit origin/main` reported already up to date.
-- `git merge --no-edit --no-ff origin/pr/289` conflicted in `server/src/qwen35moe/qwen35moe_backend.cpp`; the conflict was resolved manually, `git diff --cached --check` passed, and the merge was committed as `4fd4eef`.
-- The #289 submodule pointer was not adopted after `git -C server/deps/llama.cpp fetch origin 3b32d7ebb6879da4357cc7f52c64a640ba241ec6` failed with `upload-pack: not our ref`.
-- Fresh direct merge probes for remaining non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260528-055822.txt`.
-- `git diff --check` passed for this refresh's code and manifest changes.
+- `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...` enumerated all open PRs and showed #291, #290, #286, #285, #275, #249, #193, and #75 as drafts/excluded.
+- `git merge-base --is-ancestor origin/pr/<n> easel/auto-integration` showed #289, #284, #278, #276, #274, #273, #266, #265, #152, and #142 were current integrated non-draft heads.
+- Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260528-061548`; `git merge --no-edit origin/main` reported already up to date.
+- Fresh direct merge probes for remaining non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260528-061548.txt`.
+- Claude delegation for #237: first tmux run reached `--max-turns 8` with no useful report; narrower tmux rerun with `--max-turns 15` produced `/tmp/pr237-claude2-feasibility-20260528-061548.txt` and recommended keeping #237 blocked for full MTP design rather than a partial server port.
+- `git diff --check` passed for this refresh's manifest change.
 - Search for exact merge conflict markers (`^(<<<<<<<|=======|>>>>>>>)`) under the reconciliation worktree returned no results.
-- `cmake -S server -B /tmp/luce-build-20260528-055822 -DLUCE_BUILD_TESTS=ON -DCMAKE_CUDA_ARCHITECTURES=89` was attempted and failed before project compilation due to the known local WSL CUDA compiler identification blocker: unsupported `sm_52` (`ptxas fatal: Value 'sm_52' is not defined for option 'gpu-name'`).
+- No CMake configure/build was rerun because no code changed after the previous #289 integration; validation focused on repo state, direct probes, delegated feasibility, diff sanity, and conflict-marker checks.
 
 ## Notes
 
-- Primary checkout `/home/erik/Projects/luce2` was clean at preflight and matched fetched `easel/auto-integration` (`123d069`).
-- Retained worktree `/tmp/luce-auto-cron-20260528-055822` for direct-merge probe audit and final commit preparation until the pushed branch is reviewed.
-- Retained direct-probe log `/tmp/luce-merge-probes-20260528-055822.txt`.
+- Primary checkout `/home/erik/Projects/luce2` was clean at preflight and matched fetched `easel/auto-integration` (`7cdef8a`).
+- Retained worktree `/tmp/luce-auto-cron-20260528-061548` for direct-merge probe audit and final commit preparation until the pushed branch is reviewed.
+- Retained direct-probe log `/tmp/luce-merge-probes-20260528-061548.txt`.
+- Retained #237 Claude probe worktree `/tmp/luce-pr237-claude-20260528-061548` plus reports `/tmp/pr237-claude-feasibility-20260528-061548.txt` (turn-limit only) and `/tmp/pr237-claude2-feasibility-20260528-061548.txt` (completed feasibility).
 - Retained conflicted #177 probe worktree `/tmp/luce-pr177-feas-20260528-053512` plus Claude turn-limit reports `/tmp/pr177-claude-feasibility-20260528-053512.txt` and `/tmp/pr177-claude2-feasibility-20260528-053512.txt`.
 - Retained previous conflicted #183 probe worktree `/tmp/luce-pr183-feas-20260528-051446` plus Claude reports `/tmp/pr183-claude-feasibility-20260528-051446.txt` and `/tmp/pr183-claude2-feasibility-20260528-051446.txt`.
 - Retained previous conflicted #221 probe worktree `/tmp/luce-pr221-feas-20260528-043924` plus Claude reports `/tmp/pr221-claude-feasibility-20260528-043924.txt` and `/tmp/pr221-claude2-feasibility-20260528-043924.txt`.
