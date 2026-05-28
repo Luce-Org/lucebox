@@ -4,28 +4,27 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T16:31:00-04:00
-Current base: `origin/main` `3ba525e0`
-Current integration tip before this refresh: `easel/auto-integration` `01f0dab7`
+Last refresh: 2026-05-28T16:48:47-04:00
+Current base: `origin/main` `cfdd2fd5`
+Current integration tip before this refresh: `easel/auto-integration` `ab29fc32`
 Refreshed stack tip prepared in this run: this commit
 
 This branch is maintained as a reproducible patch stack over `origin/main`.
-The primary checkout was clean at the start of this unattended run. `origin/main`
-was already an ancestor of `easel/auto-integration`, so no upstream merge was
-needed. This run refreshed the manifest after re-enumerating open PRs, fetching
-all open non-draft contributor refs, verifying the included PR heads, rerunning
-isolated direct-merge probes for the remaining non-ancestor PR heads, and then
-performing the required post-push re-enumeration. That post-push check found new
-non-draft PR #299, which was fetched, merged cleanly, verified with changed-file
-`git diff --check`, documented here, and pushed in a second update.
+The primary checkout was clean at the start of this unattended run. Since the
+previous refresh, `origin/main` advanced from `3ba525e0` to `cfdd2fd5`, bringing
+upstream merges for #299, #300, and #298. This run created an isolated worktree
+from fetched `easel/auto-integration`, merged the new upstream base first, then
+re-enumerated and re-checked all open non-draft contributor PRs. No additional
+open non-draft PR head became directly mergeable on top of the refreshed stack.
 
 ## Included in the current stack
 
 | PR | Head branch | Head | State | Notes |
 |---:|---|---:|---|---|
-| #299 | `feat/draft-swa-flag` | `79c86c0` | included this run | Adds `DFLASH27B_DRAFT_SWA` env fallback for draft SWA window when `--draft-swa` is absent. Found during the required post-push re-enumeration and merged cleanly. |
-| #298 | `fix/gemma4-destructor-link` | `32ba96e9` | included | Gemma4 destructor-link fix is an ancestor of the stack. |
-| #295 | `fix-layer-split-sampling` | `a9aedf7d` | included | Target layer-split sampling support is an ancestor of the stack. |
+| #300 | `fix/sigterm-gpu-unload` | upstream | included through upstream | `origin/main` now includes the SIGTERM GPU-unload fix via merge commit `a308008a`. |
+| #299 | `feat/draft-swa-flag` | upstream | included through upstream | `origin/main` now includes the draft SWA env/flag support via merge commit `e1a75548`; the previous auto-integration merge is also still in history. |
+| #298 | `fix/gemma4-destructor-link` | upstream | included through upstream | `origin/main` now includes the Gemma4 destructor-link fix via merge commit `cfdd2fd5`; the previous auto-integration merge is also still in history. |
+| #295 | `fix-layer-split-sampling` | `a9aedf7d` | included | Target layer-split sampling support remains an ancestor of the stack. |
 | #294 | `feat/server-passthrough-proxy` | `0883c2e` | included | Server passthrough proxy wiring, piecewise keep-ratio curve, query survival checks, and unit coverage are carried. |
 | #292 | `feat-backend-ipc-payload-pipe-open` | `90bc52f` | included | Backend IPC payload-pipe support for remote draft feature/noise payloads is carried. |
 | #289 | `pipeline_moe` | `0ffab8a` | included | Pipelined hybrid Qwen35 MoE decode update is carried; inaccessible submodule history remains excluded. |
@@ -40,9 +39,9 @@ non-draft PR #299, which was fetched, merged cleanly, verified with changed-file
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| upstream sync | checked | `origin/main` `3ba525e0` is already an ancestor of `easel/auto-integration` `ea777e0c`; no upstream merge was required. |
-| current integrated PRs | checked | Initial `git merge-base --is-ancestor origin/pr/<n> HEAD` passed for open non-draft PRs #298, #295, #294, #292, #289, #276, #274, #266, #152, and #142. Post-push re-enumeration discovered #299, which was fetched and cleanly merged. |
-| #237 | blocked-needs-human / selective-port | Direct merge still conflicts across moved legacy `dflash/` paths, common MTP interfaces, Qwen35 backend/graph/loader files, CMake, daemon/server wiring, and tests. A tmux-driven Codex feasibility pass (`/tmp/luce-pr237-codex-20260528-162440.txt`) concluded there is no safe mechanical production port; the next step is a deliberate current-layout MTP design/port. |
+| upstream sync | merged | `origin/main` `cfdd2fd5` was merged into the integration worktree, producing merge commit `28ff7c2e` before this manifest commit. The upstream merge touched `server/src/server/http_server.cpp` and `.h` for the SIGTERM cleanup path. |
+| current integrated PRs | checked | `git merge-base --is-ancestor origin/pr/<n> HEAD` passed for open non-draft PRs #295, #294, #292, #289, #276, #274, #266, #152, and #142. #298/#299/#300 are included through `origin/main`. |
+| #237 | blocked-needs-human / selective-port | Direct merge still conflicts across moved legacy `dflash/` paths, common MTP interfaces, Qwen35 backend/graph/loader files, CMake, daemon/server wiring, and tests. A fresh tmux-driven Codex feasibility pass (`/tmp/luce-pr237-codex-20260528-1643.txt`) used read-only inspection and concluded direct merge is unsafe; current-layout salvage is valuable but non-trivial because current `server/src` still lacks `MtpSource`, `IMtpModule`, `Qwen35MtpModule`, `--mtp-*`, and MTP backend support. |
 | #221 | blocked-needs-human / dependency | Direct merge still conflicts across prefix-cache/MTP/common/Qwen35 files and tests. It depends on a current-layout #237-equivalent MTP foundation before a useful port can be made. |
 | #154 | blocked-needs-human / dependency | Direct merge conflicts in old `dflash/CMakeLists.txt`, MTP docs, old internal/target graph paths, and MTP smoke/contract tests. Portable only after the current-layout Qwen35 MTP foundation exists. |
 | #153 | blocked-needs-human / dependency | Same old-layout MTP integrated runtime conflict class as #154; requires current-layout loader/graph/cache design work. |
@@ -51,14 +50,14 @@ non-draft PR #299, which was fetched, merged cleanly, verified with changed-file
 | #94 | suggested-close/superseded | Direct merge conflicts in draft graph/safetensors loader/old internal paths. Current code already carries the useful SWA draft parsing and causal-mask behavior; remaining branch edits are old-layout. |
 | #48 | suggested-close/superseded | Direct merge conflicts only in legacy `dflash/CMakeLists.txt`; current server CMake supersedes the old Blackwell arch detection patch. |
 
-Direct-probe log: `/tmp/luce-merge-probes-20260528-162440.txt`.
-Worktree used for this refresh: `/tmp/luce-auto-cron-20260528-162440`.
+Direct-probe log: `/tmp/luce-merge-probes-20260528-1643.txt`.
+Worktree used for this refresh: `/tmp/luce-auto-cron-20260528-1643`.
 
 ## Pending / blocked-needs-human / selective-port candidates
 
 | PR | Head branch | Current status | Next useful action |
 |---:|---|---|---|
-| #237 | `feat/dflash-mtp-foundation` | blocked-needs-human / selective-port | Define current `server/` MTP contracts first: generic vs qwen35-only backend capability, hidden-capture semantics, rollback with DDTree/spec-decode, CLI precedence among draft/remote/pflash/lazy/MTP, then port interfaces, Qwen35 capture, MTP module/build, CLI, and tests in layers. |
+| #237 | `feat/dflash-mtp-foundation` | blocked-needs-human / selective-port | Create a fresh current-layout port from `auto-integration`: add MTP core under `server/src/common` and `server/src/qwen35`, wire CMake disabled-by-default, then port hidden capture, rollback, CLI, and tests while preserving current pFlash, remote-draft, and reasoning-budget behavior. |
 | #221 | `feat/mtp-prefix-warm-ghost` | blocked-needs-human / dependency | Revisit after #237-equivalent MTP foundation; then port hidden-state/speculator hooks, backend dispatcher, daemon wiring, and WARM tests to current `server/` layout. |
 | #154 | `xabicasa/dflash-mtp-speculative-loop` | blocked-needs-human / dependency | Mine linear MTP decode semantics after current-layout Qwen35 MTP exists. |
 | #153 | `xabicasa/dflash-mtp-integrated` | blocked-needs-human / dependency | Mine loader/graph/cache/test ideas after current-layout Qwen35 MTP exists. |
@@ -77,26 +76,22 @@ dependency awareness: #297, #291, #290, #286, #285, #275, #249, #193, and #75.
 
 This run performed:
 
-- `date -Is` -> 2026-05-28T16:23:47-04:00 at preflight; manifest refresh timestamp 2026-05-28T16:31:00-04:00.
+- `date -Is` -> 2026-05-28T16:43:01-04:00 at preflight; manifest refresh timestamp 2026-05-28T16:48:47-04:00.
 - Primary checkout `/home/erik/Projects/luce2` `git status --short` was clean before work began.
 - `git branch --show-current` reported `auto-integration` in the primary checkout.
 - `git remote -v` verified `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
 - `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status` succeeded for account `easel` with repo/workflow scopes.
 - `HOME=/home/erik /home/erik/.local/bin/claude auth status --text` succeeded for the Claude Team account.
-- `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --version` succeeded with `codex-cli 0.130.0`; `/home/linuxbrew/.linuxbrew/bin/tmux -V` reported `tmux 3.6a`.
+- `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --help` completed successfully.
 - `git fetch --prune origin` and `git fetch --prune easel` completed separately; targeted fetches recreated open non-draft contributor PR refs.
-- Worktree `/tmp/luce-auto-cron-20260528-162440` was created from `easel/auto-integration` and verified `origin/main` is already an ancestor.
-- Isolated direct probes attempted `git merge --no-commit --no-ff origin/pr/<n>` for #237, #221, #154, #153, #137, #135, #94, and #48; each conflicted and was aborted in the worktree. Log: `/tmp/luce-merge-probes-20260528-162440.txt`.
-- tmux-driven Codex feasibility analysis for #237 completed without file modifications and produced `/tmp/luce-pr237-codex-20260528-162440.txt`.
-- Ancestor checks passed for included open non-draft contributor PR refs #298, #295, #294, #292, #289, #276, #274, #266, #152, and #142.
-- First `git diff --check` passed for the manifest-only refresh before commit.
-- First push advanced `easel/auto-integration` from `ea777e0c` to `01f0dab7`.
-- Required post-push PR re-enumeration discovered new non-draft PR #299 (`origin/pr/299` `79c86c0`), fetched it, and merged it cleanly as `9427369d`.
-- Changed-file `git diff --check HEAD^..HEAD` passed for the #299 merge; full-stack `git diff --check origin/main...HEAD` still reports two pre-existing blank-line-at-EOF warnings in `luce-bench/src/lucebench/fixtures/forge_eval/scenarios/_model_quality.py` and `_stateful_model_quality.py`.
-- `gh pr checks 286 --repo Luce-Org/lucebox-hub` after the first push showed both checks pending for run `26600417835`.
+- Worktree `/tmp/luce-auto-cron-20260528-1643` was created from `easel/auto-integration` `ab29fc32`.
+- `git merge --no-edit origin/main` succeeded and produced merge commit `28ff7c2e`.
+- Isolated direct probes attempted `git merge --no-commit --no-ff origin/pr/<n>` for #237, #221, #154, #153, #137, #135, #94, and #48; each conflicted and was aborted in the worktree. Log: `/tmp/luce-merge-probes-20260528-1643.txt`.
+- tmux-driven Codex feasibility analysis for #237 completed without file modifications and produced `/tmp/luce-pr237-codex-20260528-1643.txt`; the tmux session was then closed.
+- Ancestor checks passed for included open non-draft contributor PR refs #295, #294, #292, #289, #276, #274, #266, #152, and #142.
 
 ## Notes
 
-- The primary checkout is clean but its local `auto-integration` branch remains at `89f80c58`, diverged from fetched `easel/auto-integration` `ea777e0c`; the pushed `easel/auto-integration` branch remains source of truth until supervised local branch cleanup.
-- Retained worktree `/tmp/luce-auto-cron-20260528-162440`, direct-probe log `/tmp/luce-merge-probes-20260528-162440.txt`, and Codex report `/tmp/luce-pr237-codex-20260528-162440.txt`.
+- The primary checkout is clean but its local `auto-integration` branch remains at `89f80c58`, diverged from fetched `easel/auto-integration`; the pushed `easel/auto-integration` branch remains source of truth until supervised local branch cleanup.
+- Retained worktree `/tmp/luce-auto-cron-20260528-1643`, direct-probe log `/tmp/luce-merge-probes-20260528-1643.txt`, and Codex report `/tmp/luce-pr237-codex-20260528-1643.txt`.
 - Prior retained worktrees, probe logs, agent reports, and configure directories remain as listed in earlier manifest revisions; cleanup is separate maintenance.
