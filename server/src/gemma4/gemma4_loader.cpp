@@ -517,9 +517,19 @@ bool create_gemma4_cache_partial(ggml_backend_t backend,
     out.v.resize(w.n_layer, nullptr);
     out.kv_source.resize(w.n_layer);
 
-    // SWA layers use a ring buffer of size min(sliding_window, max_ctx).
-    const int swa_size = (w.sliding_window > 0 && w.sliding_window < max_ctx)
-                             ? w.sliding_window : max_ctx;
+    // SWA layers use a ring buffer, but it must be larger than the logical
+    // attention window. During chunked prefill, queries near the beginning of a
+    // chunk can still attend to keys from before the chunk; a ring of exactly
+    // sliding_window slots can overwrite those keys before the chunk's mask is
+    // evaluated. PR #177's old-layout Gemma4 cache used a 2x padded SWA ring to
+    // preserve the full logical window while still saving VRAM versus max_ctx.
+    const int swa_size = [&]() {
+        if (w.sliding_window <= 0 || w.sliding_window >= max_ctx) return max_ctx;
+        const int align_stride = 256;
+        const int swa_window_padded =
+            ((w.sliding_window + align_stride - 1) / align_stride) * align_stride;
+        return std::min(max_ctx, 2 * swa_window_padded);
+    }();
 
     // Determine KV source for each layer
     int last_kv_layer = -1;
