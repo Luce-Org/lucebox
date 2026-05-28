@@ -306,8 +306,6 @@ tokens) is the path to bring code recall to the same ratio as prose.
 
 ## Quick start
 
-> **Looking for the prebuilt Docker image?** See [Quick start](../README.md#quick-start) in the top-level README — `ghcr.io/luce-org/lucebox-hub:cuda12` ships the dflash daemon, Python server, and all weights bind-mountable from the host. The instructions below are for building dflash from source (kernel development, custom arch lists, non-Docker hosts).
-
 ```bash
 git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub
 cd lucebox-hub/dflash
@@ -351,22 +349,6 @@ python3 scripts/bench_llm.py                                 # HE + GSM8K + Math
 python3 scripts/bench_he.py --n-gen 256 --ddtree-budget 22   # minimal HE bench
 ```
 
-**Early-exit drafter (requires PR #274 — `PFLASH_DRAFTER_EARLY_EXIT_N`):**
-
-Truncate the drafter forward at layer N instead of running all 28 layers. N=3 is the validated production default on RTX 3090 + Qwen2.5-0.5B-BF16:
-
-```bash
-PFLASH_DRAFTER_EARLY_EXIT_N=3 PFLASH_DRAFTER_SCORE_LAYERS=3 \
-  build/dflash_server ...
-```
-
-Headline numbers vs baseline (RTX 3090, Q4_K_M target, 0.5B-BF16 drafter):
-- 6.9× drafter speedup at 32K, 24.3× at 128K
-- accept_rate delta vs ee7: +1.2 pp (within ±2 pp gate across all 5 clients)
-- NIAH 3/3 at 32K, 64K, 128K (Bug #42 fix included)
-
-Reproduce: `dflash/bench/run_ee_n_sweep.sh` (NIAH + multi-client N-sweep) and `dflash/bench/run_ee_n_multiclient.sh` (5-client accept_rate comparison).
-
 **Long-context mode (up to 256K):**
 ```bash
 DFLASH27B_KV_TQ3=1 DFLASH27B_PREFILL_UBATCH=16 \
@@ -384,6 +366,63 @@ VMM-backed pools waste VRAM on cards under ~24 GiB. The 32 GB VMM pool reservati
     cmake -B build -S . -DGGML_CUDA_NO_VMM=ON -DCMAKE_BUILD_TYPE=Release
 
 `GGML_CUDA_NO_VMM` is a **compile-time** CMake option — it cannot be set at runtime via environment variable.
+
+### Verify your target
+
+```bash
+python -c "import torch; p=torch.cuda.get_device_properties(0); print(p.name, 'sm_%d%d'%(p.major,p.minor), p.multi_processor_count,'SMs', round(p.total_memory/1e9,1),'GB')"
+nvcc --version
+```
+
+### DGX Spark / GB10 (sm_121, CUDA 12.9+)
+
+```bash
+nvcc --version  # must show >= 12.9
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release   # CMake auto-adds sm_121
+cmake --build build --target test_dflash dflash_server -j
+```
+
+On GB10 (128 GB unified), re-sweep `--ddtree-budget` (larger tree = more verify throughput until memory bandwidth saturates) and consider skipping KV quantization entirely (`--cache-type-k f16 --cache-type-v f16`).
+
+### Jetson AGX Thor (sm_110, CUDA 13.0+)
+
+```bash
+nvcc --version  # must show >= 13.0
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release   # CMake auto-adds Thor arch
+cmake --build build --target test_dflash dflash_server -j
+```
+
+### Per-GPU retune
+
+- **DDTree `--ddtree-budget`**: 22 on 3090 + Q4_K_M + 24 GB (default). RTX 5090 = 40 (swept). GB10 = re-sweep.
+- **TQ3_0 KV** sized for 24 GB. On 32 GB (5090) or 128 GB (GB10) you can push context further or skip quantization.
+- Headline numbers (207 tok/s demo, 129.5 HumanEval, 2.8× vs SGLang AWQ) are RTX 3090 stock. RTX 5090 numbers (205 tok/s HE, 4.84×) are in [RESULTS.md](RESULTS.md). Ada / GB10 / Thor not yet swept, PRs welcome.
+
+## AMD HIP backend (Strix Halo, RX 7900 XTX)
+
+Same DFlash + PFlash stack on AMD GPUs. PR #119 ports the Phase 2 rocWMMA flashprefill kernels to HIP. End-to-end on a Ryzen AI MAX+ 395 box (Radeon 8060S iGPU, `gfx1151`, 128 GiB LPDDR5X-8000 unified): **37.0 tok/s DFlash decode** on Qwen3.5-27B Q4_K_M, **27.6 s TTFT @ 16K** with NIAH retrieval intact. **3.08× decode and 2.24× prefill over llama.cpp HIP AR** on the same iGPU. End-to-end wall clock at a 16K prompt + 1K generation workload: **2.66× faster** than vanilla llama.cpp.
+
+```bash
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
+
+# Build for gfx1151 (Strix Halo). Swap arch for gfx1100 / gfx1201.
+cmake -B build -S . \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DDFLASH27B_GPU_BACKEND=hip \
+  -DDFLASH27B_HIP_ARCHITECTURES=gfx1151 \
+  -DDFLASH27B_HIP_SM80_EQUIV=ON
+cmake --build build --target test_dflash -j
+```
+
+`DFLASH27B_HIP_SM80_EQUIV=ON` enables the rocWMMA Phase 2 flashprefill kernels (path that delivers the prefill speedup). `OFF` falls back to ggml's `flash_attn_ext` (slower but no rocwmma headers needed).
+
+**Per-arch DDTree tuning:** `gfx1151` (Strix Halo iGPU, bandwidth-bound on LPDDR5X) peaks at `--ddtree-budget=22`. `gfx1100` (7900 XTX, GDDR6) prefers `budget=8` per the [PR #156 cross-arch perf plan](https://github.com/Luce-Org/lucebox-hub/pull/156). Run `scripts/bench_he.py --ddtree-budget N` to verify on your card.
+
+**Drafter recipe for max decode:** target = Qwen3.5-27B Q4_K_M, drafter = same gen quantized to Q8_0 via `server/scripts/quantize_draft_q8.py`. Matching Q8_0 GGUF on the unsloth Qwen3.6 target needs `DFLASH27B_DRAFT_SWA=2048` for sliding-window correctness.
+
+See also: [`docs/HIP_PERF_PLAN.md`](docs/HIP_PERF_PLAN.md) (perf sweeps), [`docs/MIXED_BACKEND.md`](docs/MIXED_BACKEND.md) (mixed CUDA+HIP runs).
 
 ## How it works
 
