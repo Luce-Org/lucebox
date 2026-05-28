@@ -24,6 +24,7 @@ struct ResidualCombineGraph {
     ggml_tensor * cold_in = nullptr;       // [n_embd] F32 input (zeros when no cold)
     ggml_tensor * output = nullptr;        // [n_embd] F32 output
 
+    ~ResidualCombineGraph() { free(); }
     bool valid() const { return ctx && gf && alloc && output; }
     void free();
     void destroy();
@@ -40,6 +41,7 @@ struct GpuResidentState {
 
     ResidualCombineGraph combine;
 
+    ~GpuResidentState() { destroy(); }
     bool valid() const { return ctx && buf && act_cur && combine.valid(); }
     void destroy();
 };

@@ -910,12 +910,17 @@ bool eval_qwen35moe_hybrid_ffn_batched(
     if (n_tokens <= 0) return true;
 
     // ── Step 1: Partition routing into hot and cold ──
-    // Use dummy expert ID 0 with weight 0.0 for "other device" slots
-    // (ggml_mul_mat_id does not handle -1 IDs safely)
+    // Dummy slots use weight 0.0 and are distributed evenly across all experts
+    // to avoid pathological routing imbalance that triggers OOB in MMQ stream-k.
     const int total_slots = n_used * n_tokens;
-    std::vector<int32_t> hot_sel(total_slots, 0);
+    const int n_hot_stack = storage.gate_up_hot ? (int)storage.gate_up_hot->ne[2]
+                          : storage.gate_hot    ? (int)storage.gate_hot->ne[2]
+                          : 1;
+    std::vector<int32_t> hot_sel(total_slots);
+    for (int i = 0; i < total_slots; ++i) hot_sel[i] = i % n_hot_stack;
     std::vector<float>   hot_wts(total_slots, 0.0f);
-    std::vector<int32_t> cold_sel(total_slots, 0);
+    std::vector<int32_t> cold_sel(total_slots);
+    for (int i = 0; i < total_slots; ++i) cold_sel[i] = i % std::max(1, (int)(storage.down_cold ? storage.down_cold->ne[2] : 1));
     std::vector<float>   cold_wts(total_slots, 0.0f);
     bool has_hot = false, has_cold = false;
 
@@ -1004,6 +1009,7 @@ bool eval_qwen35moe_hybrid_ffn_batched(
         ggml_set_output(hot_output);
         ggml_build_forward_expand(hot_gf, hot_output);
         hot_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu_backend));
+
         if (!ggml_gallocr_alloc_graph(hot_alloc, hot_gf)) {
             if (err) *err = "hybrid batched hot gallocr failed";
             ggml_gallocr_free(hot_alloc); ggml_free(hot_ctx);
