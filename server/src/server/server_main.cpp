@@ -128,6 +128,12 @@ static bool validate_server_placement(const BackendArgs & bargs,
                          placement_error.c_str());
             return false;
         }
+        if (!sconfig.disk_cache_dir.empty()) {
+            std::fprintf(stderr,
+                "[server] --kv-cache-dir is not supported with --target-devices yet; "
+                "sharded disk snapshot/restore will be added separately\n");
+            return false;
+        }
     }
     if (bargs.device.is_layer_split() && target != compiled) {
         std::fprintf(stderr,
@@ -461,9 +467,6 @@ int main(int argc, char ** argv) {
     sconfig.pflash_drafter_gpu = pflash_placement.drafter_gpu;
     sconfig.pflash_remote_drafter = pflash_placement.remote_drafter;
     sconfig.pflash_remote = pflash_placement.remote;
-    if (bargs.device.is_layer_split()) {
-        sconfig.disk_cache_dir.clear();
-    }
 
     // ── Apply environment defaults ─────────────────────────────────────
     // Explicit --cache-type-k/v override via env vars.

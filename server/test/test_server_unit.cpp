@@ -1248,6 +1248,7 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     std::vector<int32_t> emitted_tokens;
     bool dflash_enabled = false;
     bool dflash_called = false;
+    int shutdown_calls = 0;
     ModelBackend::CompressRequest last_compress_req;
 
     const char * name() const override { return "mock"; }
@@ -1328,7 +1329,7 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
         result.compressed_ids = {77, 88};
         return result;
     }
-    void shutdown() override {}
+    void shutdown() override { shutdown_calls++; }
 };
 
 static void test_layer_split_backend_inline_snapshot_and_restore_delta() {
@@ -1393,6 +1394,30 @@ static void test_layer_split_compress_nopark_uses_default_drafter_path() {
                 "/tmp/default-layer-split-drafter.gguf");
 
     unlink(ids_path.c_str());
+}
+
+static void test_layer_split_compress_rejects_bad_keep_ratio() {
+    const std::string ids_path = "/tmp/dflash_test_layer_split_compress_bad.bin";
+    unlink(ids_path.c_str());
+    TEST_ASSERT(write_int32_file(ids_path, {1, 2, 3, 4}));
+
+    auto * raw = new MockLayerSplitAdapter();
+    LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
+    DaemonIO io;
+
+    const std::string cmd = "compress " + ids_path + " 1250 nopark";
+    TEST_ASSERT(!backend.handle_compress(cmd, io));
+    TEST_ASSERT(raw->last_compress_req.input_ids.empty());
+
+    unlink(ids_path.c_str());
+}
+
+static void test_layer_split_backend_shutdown_is_idempotent() {
+    auto * raw = new MockLayerSplitAdapter();
+    LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
+    backend.shutdown();
+    backend.shutdown();
+    TEST_ASSERT(raw->shutdown_calls == 1);
 }
 
 // Disk Prefix Cache Tests
@@ -3164,6 +3189,8 @@ int main() {
     RUN_TEST(test_validate_layer_split_weights_shape);
     RUN_TEST(test_layer_split_backend_inline_snapshot_and_restore_delta);
     RUN_TEST(test_layer_split_compress_nopark_uses_default_drafter_path);
+    RUN_TEST(test_layer_split_compress_rejects_bad_keep_ratio);
+    RUN_TEST(test_layer_split_backend_shutdown_is_idempotent);
 
     std::fprintf(stderr, "\n── Disk prefix cache ──\n");
     RUN_TEST(test_disk_cache_config_defaults);

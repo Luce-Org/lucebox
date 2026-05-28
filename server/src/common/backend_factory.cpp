@@ -55,6 +55,7 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
             cfg.remote_draft       = args.remote_draft;
             cfg.fa_window          = args.fa_window;
             cfg.kq_stride_pad      = args.kq_stride_pad;
+            cfg.draft_swa_window   = args.draft_swa_window;
             cfg.draft_ctx_max      = args.draft_ctx_max;
             cfg.max_verify_tokens  = args.ddtree_mode
                 ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, args.ddtree_budget + 1)

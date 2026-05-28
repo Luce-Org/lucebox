@@ -33,6 +33,7 @@ struct Qwen35LayerSplitAdapterConfig {
     int draft_ctx_max = 4096;
     int max_verify_tokens = DFLASH27B_DRAFT_BLOCK_SIZE;
     bool run_dflash = false;
+    int draft_swa_window = 0;
 };
 
 class Qwen35LayerSplitAdapter : public LayerSplitAdapter {

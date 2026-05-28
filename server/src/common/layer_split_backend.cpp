@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cmath>
 #include <utility>
 
 namespace dflash::common {
@@ -20,6 +21,7 @@ bool LayerSplitBackend::init() {
         std::fprintf(stderr, "[target-split] missing model adapter\n");
         return false;
     }
+    shutdown_done_ = false;
     return adapter_->init();
 }
 
@@ -189,6 +191,14 @@ bool LayerSplitBackend::handle_compress(const std::string & line,
     CompressRequest req;
     req.input_ids = read_int32_file(ppath);
     req.keep_ratio = (float)keep_x1000 / 1000.0f;
+    if (!std::isfinite(req.keep_ratio) ||
+        req.keep_ratio < 0.0f || req.keep_ratio > 1.0f) {
+        std::fprintf(stderr,
+            "[target-split][compress] keep ratio must be in [0,1], got %d/1000\n",
+            keep_x1000);
+        io.emit(-1);
+        return false;
+    }
     if (n >= 3 && drafter_path[0]) {
         req.drafter_path = drafter_path;
     } else if (adapter_) {
@@ -219,6 +229,8 @@ bool LayerSplitBackend::supports_remote_draft() const {
 }
 
 void LayerSplitBackend::shutdown() {
+    if (shutdown_done_) return;
+    shutdown_done_ = true;
     if (adapter_) adapter_->shutdown();
 }
 

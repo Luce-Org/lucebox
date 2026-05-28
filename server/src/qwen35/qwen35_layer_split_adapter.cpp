@@ -107,6 +107,9 @@ bool Qwen35LayerSplitAdapter::load_draft() {
         draft_weights_.n_embd = DFLASH27B_TARGET_HIDDEN;
         draft_weights_.block_size = DFLASH27B_DRAFT_BLOCK_SIZE;
         draft_weights_.n_target_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;
+        if (cfg_.draft_swa_window > 0) {
+            draft_weights_.swa_window = cfg_.draft_swa_window;
+        }
         std::fprintf(stderr,
             "[target-split] remote draft ready gpu=%d cap=%d\n",
             cfg_.draft_gpu, cap);
@@ -141,6 +144,9 @@ bool Qwen35LayerSplitAdapter::load_draft() {
         std::fprintf(stderr, "[target-split] draft load gpu=%d: %s\n",
                      cfg_.draft_gpu, dflash27b_last_error());
         return false;
+    }
+    if (cfg_.draft_swa_window > 0) {
+        draft_weights_.swa_window = cfg_.draft_swa_window;
     }
 
     const int cap = std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);
@@ -502,6 +508,7 @@ void Qwen35LayerSplitAdapter::shutdown() {
     draft_backend_ = nullptr;
     draft_backend_owned_ = false;
     free_qwen35_layer_split_shards(shards_);
+    shards_.clear();
 }
 
 }  // namespace dflash::common

@@ -107,6 +107,7 @@ private:
                                   bool reset_state);
 
     std::unique_ptr<LayerSplitAdapter> adapter_;
+    bool shutdown_done_ = false;
 };
 
 }  // namespace dflash::common
