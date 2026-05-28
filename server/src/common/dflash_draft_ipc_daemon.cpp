@@ -265,17 +265,31 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
             const int fc_in = feature_ring.n_target_layers * feature_ring.hidden_size;
             const size_t row_bytes = (size_t)fc_in * sizeof(float);
             const size_t src_stride = feature_ring.target_feat->nb[1];
-            std::vector<float> data((size_t)n_tokens * (size_t)fc_in);
-            for (int i = 0; i < n_tokens; ++i) {
-                const int slot = (start_pos + i) % feature_ring.cap;
-                ggml_backend_tensor_get(feature_ring.target_feat,
-                                        data.data() + (size_t)i * (size_t)fc_in,
-                                        (size_t)slot * src_stride,
-                                        row_bytes);
+            // Stream in bounded chunks so daemon host memory stays O(chunk)
+            // instead of O(n_tokens) — avoids large transient allocs / OOM
+            // on long-context snapshot ranges. Total bytes on the wire are
+            // unchanged, so the client read is identical.
+            constexpr int kFeatRangeChunkTok = 256;
+            const int chunk_tok = std::min(kFeatRangeChunkTok, n_tokens);
+            std::vector<float> data((size_t)chunk_tok * (size_t)fc_in);
+            if (!stream_status(stream_fd, 0)) {
+                std::fprintf(stderr, "[draft-ipc-daemon] feature range stream failed\n");
+                break;
             }
-            const size_t bytes = data.size() * sizeof(float);
-            if (!stream_status(stream_fd, 0) ||
-                !write_exact_fd(stream_fd, data.data(), bytes)) {
+            bool stream_ok = true;
+            for (int base = 0; base < n_tokens && stream_ok; base += chunk_tok) {
+                const int nc = std::min(chunk_tok, n_tokens - base);
+                for (int i = 0; i < nc; ++i) {
+                    const int slot = (start_pos + base + i) % feature_ring.cap;
+                    ggml_backend_tensor_get(feature_ring.target_feat,
+                                            data.data() + (size_t)i * (size_t)fc_in,
+                                            (size_t)slot * src_stride,
+                                            row_bytes);
+                }
+                stream_ok = write_exact_fd(stream_fd, data.data(),
+                                           (size_t)nc * row_bytes);
+            }
+            if (!stream_ok) {
                 std::fprintf(stderr, "[draft-ipc-daemon] feature range stream failed\n");
                 break;
             }
@@ -296,20 +310,41 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
             const int fc_in = feature_ring.n_target_layers * feature_ring.hidden_size;
             const size_t row_bytes = (size_t)fc_in * sizeof(float);
             const size_t dst_stride = feature_ring.target_feat->nb[1];
-            const size_t bytes = (size_t)n_tokens * row_bytes;
-            std::vector<float> data(bytes / sizeof(float));
-            if (!read_binary_file_exact(path, data.data(), bytes)) {
+            // Read + apply in bounded chunks so daemon host memory stays
+            // O(chunk) instead of O(n_tokens) — avoids large transient allocs
+            // / OOM on long-context snapshot restore.
+            constexpr int kFeatRangeChunkTok = 256;
+            const int chunk_tok = std::min(kFeatRangeChunkTok, n_tokens);
+            std::ifstream fin(path, std::ios::binary);
+            if (!fin) {
                 std::fprintf(stderr, "[draft-ipc-daemon] read feature range failed: %s\n",
                              path.c_str());
                 stream_status(stream_fd, -1);
                 continue;
             }
-            for (int i = 0; i < n_tokens; ++i) {
-                const int slot = (start_pos + i) % feature_ring.cap;
-                ggml_backend_tensor_set(feature_ring.target_feat,
-                                        data.data() + (size_t)i * (size_t)fc_in,
-                                        (size_t)slot * dst_stride,
-                                        row_bytes);
+            std::vector<float> data((size_t)chunk_tok * (size_t)fc_in);
+            bool read_ok = true;
+            for (int base = 0; base < n_tokens && read_ok; base += chunk_tok) {
+                const int nc = std::min(chunk_tok, n_tokens - base);
+                const std::streamsize want = (std::streamsize)((size_t)nc * row_bytes);
+                fin.read(reinterpret_cast<char *>(data.data()), want);
+                if (fin.gcount() != want) {
+                    read_ok = false;
+                    break;
+                }
+                for (int i = 0; i < nc; ++i) {
+                    const int slot = (start_pos + base + i) % feature_ring.cap;
+                    ggml_backend_tensor_set(feature_ring.target_feat,
+                                            data.data() + (size_t)i * (size_t)fc_in,
+                                            (size_t)slot * dst_stride,
+                                            row_bytes);
+                }
+            }
+            if (!read_ok) {
+                std::fprintf(stderr, "[draft-ipc-daemon] read feature range failed: %s\n",
+                             path.c_str());
+                stream_status(stream_fd, -1);
+                continue;
             }
             ggml_backend_synchronize(backend);
             stream_status(stream_fd, 0);

@@ -84,14 +84,27 @@ bool init_layer_split_snapshot_backends(
         const char * log_prefix) {
     const char * prefix = log_prefix ? log_prefix : "target-split";
     snapshot_backends.assign(shards.size(), nullptr);
+    auto rollback = [&]() {
+        for (size_t j = 0; j < snapshot_backends.size(); ++j) {
+            if (shards[j]) {
+                free_snapshot_backend(snapshot_backends[j], shards[j]->backend);
+            }
+            snapshot_backends[j] = nullptr;
+        }
+        snapshot_backends.clear();
+    };
     for (size_t i = 0; i < shards.size(); ++i) {
         const auto * shard = shards[i];
-        if (!shard || !shard->backend) return false;
+        if (!shard || !shard->backend) {
+            rollback();
+            return false;
+        }
         snapshot_backends[i] = create_snapshot_backend(shard->backend);
         if (!snapshot_backends[i]) {
             std::fprintf(stderr,
                 "[%s] snapshot backend init failed gpu=%d\n",
                 prefix, shard->gpu);
+            rollback();
             return false;
         }
     }
