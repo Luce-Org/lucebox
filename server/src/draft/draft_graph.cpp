@@ -116,13 +116,15 @@ DraftGraphOutputs build_draft_graph(
                               ctx_offset * ggml_element_size(in.positions_k));
         }
         Q = ggml_rope_ext(ctx, Q, in.positions_q, /*freq_factors=*/nullptr,
-                          head_dim, GGML_ROPE_TYPE_NEOX, /*n_ctx_orig=*/0,
-                          rope_base, /*freq_scale=*/1.0f,
-                          /*ext_factor=*/0.0f, /*attn_factor=*/1.0f,
-                          /*beta_fast=*/0.0f, /*beta_slow=*/0.0f);
+                          head_dim, GGML_ROPE_TYPE_NEOX, w.rope_n_ctx_orig,
+                          rope_base, w.rope_freq_scale,
+                          w.rope_ext_factor, w.rope_attn_factor,
+                          w.rope_beta_fast, w.rope_beta_slow);
         K = ggml_rope_ext(ctx, K, pk, nullptr,
-                          head_dim, GGML_ROPE_TYPE_NEOX, 0,
-                          rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+                          head_dim, GGML_ROPE_TYPE_NEOX, w.rope_n_ctx_orig,
+                          rope_base, w.rope_freq_scale,
+                          w.rope_ext_factor, w.rope_attn_factor,
+                          w.rope_beta_fast, w.rope_beta_slow);
 
         // ── 2e. Permute into the layout flash_attn_ext wants
         //   q: [n_embd_k=head_dim, n_batch=q_len, n_head,   ne3]

@@ -672,6 +672,75 @@ bool load_draft_safetensors(const std::string & path,
             std::fread(&cfg[0], 1, flen, f);
             std::fclose(f);
 
+            auto find_number = [&](const std::string & key, double def) -> double {
+                const auto key_pos = cfg.find("\"" + key + "\"");
+                if (key_pos == std::string::npos) return def;
+                const auto colon = cfg.find(':', key_pos + key.size() + 2);
+                if (colon == std::string::npos) return def;
+                size_t start = colon + 1;
+                while (start < cfg.size() &&
+                       (cfg[start] == ' ' || cfg[start] == '\t' ||
+                        cfg[start] == '\n' || cfg[start] == '\r')) {
+                    start++;
+                }
+                if (start >= cfg.size()) return def;
+                char * end = nullptr;
+                const double v = std::strtod(cfg.c_str() + start, &end);
+                if (end == cfg.c_str() + start) return def;
+                return v;
+            };
+            auto find_int = [&](const std::string & key, int def) -> int {
+                return (int)find_number(key, (double)def);
+            };
+
+            // Parse DFlash/HF config fields that are not recoverable from tensor shapes.
+            out.block_size = find_int("block_size", out.block_size);
+            out.mask_token_id = find_int("mask_token_id", out.mask_token_id);
+            if (out.block_size <= 0) out.block_size = DFLASH27B_DRAFT_BLOCK_SIZE;
+
+            auto dflash_pos = cfg.find("\"dflash_config\"");
+            if (dflash_pos != std::string::npos) {
+                const auto ids_pos = cfg.find("\"target_layer_ids\"", dflash_pos);
+                if (ids_pos != std::string::npos) {
+                    const auto arr_start = cfg.find('[', ids_pos);
+                    const auto arr_end = cfg.find(']', arr_start);
+                    if (arr_start != std::string::npos && arr_end != std::string::npos) {
+                        int count = 0;
+                        const std::string arr = cfg.substr(arr_start + 1, arr_end - arr_start - 1);
+                        const char * p = arr.c_str();
+                        while (*p) {
+                            while (*p && (*p == ' ' || *p == ',' || *p == '\t' ||
+                                          *p == '\n' || *p == '\r')) {
+                                p++;
+                            }
+                            if (!*p) break;
+                            char * ep = nullptr;
+                            std::strtol(p, &ep, 10);
+                            if (ep == p) break;
+                            count++;
+                            p = ep;
+                        }
+                        if (count > 0 && count != out.n_target_layers) {
+                            std::fprintf(stderr,
+                                "[draft-st] WARNING: config target_layer_ids=%d but fc.weight implies %d; using tensor shape\n",
+                                count, out.n_target_layers);
+                        }
+                    }
+                }
+            }
+
+            const auto rope_scaling_pos = cfg.find("\"rope_scaling\"");
+            if (rope_scaling_pos != std::string::npos) {
+                const float factor = (float)find_number("factor", 1.0);
+                if (factor > 0.0f && factor != 1.0f) {
+                    out.rope_freq_scale = 1.0f / factor;
+                    out.rope_ext_factor = 1.0f;
+                }
+                out.rope_beta_fast = (float)find_number("beta_fast", out.rope_beta_fast);
+                out.rope_beta_slow = (float)find_number("beta_slow", out.rope_beta_slow);
+                out.rope_n_ctx_orig = find_int("original_max_position_embeddings", out.rope_n_ctx_orig);
+            }
+
             // Parse sliding_window
             auto sw_pos = cfg.find("\"sliding_window\"");
             if (sw_pos != std::string::npos) {

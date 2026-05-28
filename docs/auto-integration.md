@@ -4,8 +4,8 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-27T22:01:53-04:00 through 2026-05-27T22:06:00-04:00
-Current stack tip before this metadata refresh: `af1e2eb` (already aligned with `origin/main` `4f4d82e`; this run found no upstream-base advance, revalidated open PR heads, and performed a fresh tmux-driven Codex feasibility assessment for PR #135).
+Last refresh: 2026-05-27T22:20:33-04:00 through 2026-05-27T22:29:30-04:00
+Current stack tip before this refresh: `1985b45` (already aligned with `origin/main` `4f4d82e`; this run found no upstream-base advance, revalidated open PR heads, performed fresh direct merge probes for all remaining non-ancestor non-draft PRs, and selectively ported the safe PR #39 draft-config/YaRN subset).
 
 ## Included in the current stack
 
@@ -21,13 +21,15 @@ Current stack tip before this metadata refresh: `af1e2eb` (already aligned with 
 | #94 | `feat/dflash-qwen36-swa-draft` | absorbed / selectively included | Not an ancestor after the `dflash/` → `server/` migration, but its safetensors SWA config parsing and causal-mask support remain present under current draft/common code. |
 | #62 | `fix/issue-55-stable-kv-pad` | absorbed / selectively included | Not an ancestor after layout migration, but the daemon reset regression test and follow-up daemon reset fixes remain carried. |
 | #48 | `fix/consumer-blackwell-auto-detect` | superseded / selectively included | The old `dflash/CMakeLists.txt` change is obsolete; current `server/CMakeLists.txt` explicitly resolves CUDA architectures and carries Blackwell/GB10 handling. |
+| #39 | `feat/moe-35b-a3b` | selectively included | This run mined the still-useful draft safetensors `config.json`/YaRN handling into current `server/src/draft/*`: `block_size`, `mask_token_id`, `rope_scaling` beta/original-context fields, and graph-side YaRN RoPE parameters are now wired while keeping current qwen35moe/DDTree code. Older MoE loader/FFN/target-graph pieces remain superseded by current `server/src/qwen35moe` and `server/src/qwen35` architecture. |
 | #285 | `feat/lucebox-docker` | partially included / draft dependency | Draft PR, not part of the non-draft target, but an earlier head is carried as the Docker/CLI/bench integration dependency. Latest draft head `32961a1` is not required by any non-draft PR this run. |
 
 ## Attempted this run
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| all non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated reconciliation worktree `/tmp/luce-auto-cron-20260527-214507` rebased/checked the stack against `origin/main` (already up to date) and then attempted `--no-commit` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every probe conflicted; consolidated conflict output is retained in `/tmp/luce-merge-probes-20260527-214507.txt`. |
+| all non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated reconciliation worktree `/tmp/luce-auto-cron-20260527-222142` rebased/checked the stack against `origin/main` (already up to date) and then attempted `--no-commit` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39. Every direct probe conflicted; consolidated conflict output is retained in `/tmp/luce-merge-probes-20260527-222142.txt`. |
+| #39 | partially integrated | Fresh conflicted worktree `/tmp/luce-attempt-pr39-20260527-222159` plus tmux-driven Codex session `luce-pr39-codex-20260527-222159` produced `/tmp/pr39-survivorship-20260527-222159.txt`. Codex found the MoE loader/FFN/target-graph pieces already superseded by current qwen35moe/DDTree code, but identified draft safetensors config parsing and YaRN RoPE as portable. This run ported that subset into `server/src/draft/draft_safetensors_loader.cpp` and `server/src/draft/draft_graph.cpp`; old `dflash/` files and obsolete tests were not resurrected. |
 | #221 | not integrated | Fresh conflicted worktree `/tmp/luce-attempt-pr221-20260527-2149` plus tmux-driven Codex session `luce-pr221-codex-2149` produced `/tmp/pr221-feasibility-20260527-2149.txt`. Codex concluded direct merge is unsafe: PR #221 layers prefix-cache warm/ghost behavior and speculator dispatch on top of the older MTP foundation, mixes legacy `dflash/` paths with current `server/`, adds `qwen36` MTP pathing likely superseded by PR #237's current naming, and should wait for a current-layout PR #237/equivalent MTP foundation before selectively porting prefix-cache/range-warm pieces. |
 | #237 | not integrated | Fresh worktree merge probe in `/tmp/luce-auto-cron-20260527-214507` reproduced the same broad conflicts across current `server/CMakeLists.txt`, common backend/MTP interfaces, Qwen35 loader/graph/backend files, tests, and deleted legacy `dflash/scripts/server.py` / `dflash/src/server/server_main.cpp`; prior tmux-driven Codex session `luce-pr237-codex-2124` wrote `/tmp/pr237-feasibility-20260527-2124.txt`: selective port is feasible, but a direct conflict-marker resolution is unsafe because the current native server CLI/config, Qwen35 MoE/remote-draft/thinking-budget behavior, and restore/prefix-cache semantics must be preserved with MTP off by default first. |
 | #177 | not integrated | Fresh worktree merge probe in `/tmp/luce-attempt-pr177-20260527-2020` produced conflicts in deleted legacy `dflash/CMakeLists.txt`, moved Gemma4 header/source/test paths, `server/src/errors.cpp`, and `server/src/internal.h`. A tmux-driven Claude assessment session was launched (`luce-pr177-claude-2020`) but exited without producing a report; the raw conflict shape still confirms this older Gemma4 KV-correctness split is not mechanically mergeable into the current `server/src/gemma4` architecture. |
@@ -59,7 +61,7 @@ Current stack tip before this metadata refresh: `af1e2eb` (already aligned with 
 | #137 | `xabicasa/dflash-build-cmake-sm89-bsa` | attempted / stale | Revalidated this run in `/tmp/luce-attempt-pr137-20260527-2105`; conflicts only on deleted legacy `dflash/CMakeLists.txt`. Current `server/CMakeLists.txt` supersedes it. Suggested close unless re-targeted to current server layout. |
 | #135 | `xabicasa/dflash-multi-request-scheduler-batched-target-step` | attempted / selective-port | Revalidated this run in `/tmp/luce-attempt-pr135-20260527-220258`; Codex report `/tmp/pr135-feasibility-20260527-2203.txt` says the low-level aligned-bucket and `n_seqs` batched-target graph pieces are portable only after deliberate current-layout graph/API work. The old daemon scheduler loop should not be reintroduced into `server/test/test_dflash.cpp`; design a current `ModelBackend`/Qwen35Backend multi-request scheduler first. |
 | #131 | `feature/gemma4-support` | attempted / selective-port | Revalidated this run in `/tmp/luce-attempt-pr131-20260527-2039`; Codex report says broad Gemma4 support can be mined, but direct merge would resurrect old `dflash27b`/`dflash/` layout. |
-| #39 | `feat/moe-35b-a3b` | attempted / likely superseded | Revalidated this run in `/tmp/luce-attempt-pr39-20260527-2020`; direct merge conflicts with current qwen35moe/draft graph work. Needs a MoE/DDTree survivorship review rather than a branch merge. |
+| #39 | `feat/moe-35b-a3b` | partially integrated / mostly superseded | Revalidated this run in `/tmp/luce-attempt-pr39-20260527-222159`; Codex report `/tmp/pr39-survivorship-20260527-222159.txt` found current qwen35moe/DDTree code supersedes the old loader/FFN/target-graph pieces. The safe remaining draft safetensors config/YaRN subset was ported this run; remaining test ideas can be reauthored against current APIs if desired. |
 
 ## Draft / excluded
 
@@ -70,11 +72,25 @@ Draft PRs remain outside the primary contributor integration target: #289, #286,
 - #137: close or ask author to re-target current `server/CMakeLists.txt`.
 - #48: close as superseded by current CUDA architecture/Blackwell handling unless the author has a specific missing Blackwell case.
 - #237: keep open for a deliberate current-layout MTP foundation port; direct merge is unsafe, but the Codex report identifies a viable compile-first path with MTP disabled by default.
-- #183/#182/#181/#180/#177/#154/#153/#131/#39: do not close solely as conflicts yet; ask authors or maintainers to identify which current-layout Gemma4/MTP pieces are still intended after the newer `server/src/gemma4` architecture and #237 direction.
+- #39: remaining old branch content is mostly superseded by current qwen35moe/DDTree code after this run's draft config/YaRN selective port; ask author/maintainers whether any of the old MoE smoke coverage should be reauthored against current APIs before closing.
+- #183/#182/#181/#180/#177/#154/#153/#131: do not close solely as conflicts yet; ask authors or maintainers to identify which current-layout Gemma4/MTP pieces are still intended after the newer `server/src/gemma4` architecture and #237 direction.
 
 ## Validation run
 
 This run performed:
+
+- 2026-05-27 22:20 preflight: `date -Is`, primary `git status --short` (clean), branch/remotes, `gh auth status`, `claude auth status --text`, and `codex --help` with the real user HOME/config.
+- `git fetch --prune origin` and `git fetch --prune easel`.
+- `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json ... --jq ...`.
+- Targeted fetches for all open non-draft PR refs (`origin/pr/<n>`).
+- `git merge-base --is-ancestor origin/pr/<n> easel/auto-integration` classification checks: #284, #276, #274, #266, #152, and #142 are current ancestors; #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39 remain non-ancestor/selective-port candidates.
+- Isolated reconciliation/probe worktree `/tmp/luce-auto-cron-20260527-222142`; `git merge --no-edit origin/main` reported already up to date.
+- Fresh direct merge probes for all currently non-ancestor non-draft PR refs: #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39; all direct probes conflicted and were aborted in the isolated worktree; consolidated output retained at `/tmp/luce-merge-probes-20260527-222142.txt`.
+- Fresh isolated PR #39 conflicted worktree `/tmp/luce-attempt-pr39-20260527-222159`.
+- tmux-driven Codex assessment session `luce-pr39-codex-20260527-222159`, producing `/tmp/pr39-survivorship-20260527-222159.txt`.
+- Selective PR #39 port: current draft safetensors loader now reads `block_size`, `mask_token_id`, `dflash_config.target_layer_ids` sanity, and YaRN `rope_scaling` from `config.json`; current draft graph now passes loaded YaRN RoPE fields to `ggml_rope_ext`.
+- `git diff --check -- server/src/draft/draft_graph.cpp server/src/draft/draft_safetensors_loader.cpp docs/auto-integration.md` (clean).
+- CMake configure/build attempt for `dflash_common` failed before compiling project code because the local CUDA toolkit defaults compiler identification to unsupported `sm_52` (`ptxas fatal : Value 'sm_52' is not defined for option 'gpu-name'`); retrying with `-DCMAKE_CUDA_ARCHITECTURES=89` hit the same pre-project compiler-identification failure. No project compile result was available in this WSL CUDA setup.
 
 - `git merge --no-edit origin/main` check in the metadata worktree (no merge needed; `origin/main` was already an ancestor of `d465a7e`)
 - `date -Is`
@@ -126,6 +142,8 @@ This run performed:
 ## Notes
 
 - Primary checkout `/home/erik/Projects/luce2` was clean at start and was not edited directly during reconciliation.
+- Retained worktree `/tmp/luce-auto-cron-20260527-222142` for this selective-port commit and probe audit.
+- Retained conflicted worktree `/tmp/luce-attempt-pr39-20260527-222159` for audit; it contains unmerged PR #39 probe state and Codex report `/tmp/pr39-survivorship-20260527-222159.txt`.
 - Retained worktree `/tmp/luce-auto-cron-20260527-214507` for this metadata refresh until pushed/verified.
 - Retained conflicted worktree `/tmp/luce-attempt-pr221-20260527-2149` for audit; it contains unmerged PR #221 probe state and Codex report `/tmp/pr221-feasibility-20260527-2149.txt`.
 - Retained worktree `/tmp/luce-auto-cron-20260527-212401` for this metadata refresh until pushed/verified.
