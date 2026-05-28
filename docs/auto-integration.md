@@ -4,17 +4,17 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T12:31:00-04:00
+Last refresh: 2026-05-28T12:35:00-04:00
 Current base: `origin/main` `6a6b0081`
-Current integration tip before this refresh: `easel/auto-integration` `3fc6d270`
+Current integration tip before this refresh: `easel/auto-integration` `575034db`
 Refreshed stack tip prepared in this run: this commit
 
 This branch is maintained as a reproducible patch stack over `origin/main`.
-The primary checkout was clean at the start of this unattended run. This refresh
-rebases the existing stack over the latest upstream `origin/main`, whose new
-commit merges PR #278 upstream, and preserves all previously integrated
-non-draft contributor PR refs. No new non-draft contributor PR head required a
-new integration merge in this run.
+The primary checkout was clean at the start of this unattended run. Upstream
+`origin/main` and the current `easel/auto-integration` tip had not advanced
+since the prior refresh, and all previously integrated non-draft contributor PR
+refs remained ancestors of the stack. No new non-draft contributor PR head
+required a new integration merge in this run.
 
 ## Included in the current stack
 
@@ -43,10 +43,10 @@ new integration merge in this run.
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| upstream sync | integrated | `origin/main` advanced from `fda8877b` to `6a6b0081` by merging #278 upstream. Reconciliation worktree `/tmp/luce-auto-cron-20260528-121623` started from `easel/auto-integration` `3fc6d270` and merged upstream as `b191ba15`. |
-| current integrated PRs | checked | After upstream sync, `git merge-base --is-ancestor origin/pr/<n> HEAD` shows #294, #292, #289, #284, #276, #274, #266, #152, and #142 are ancestors of the refreshed stack. #278 and #265 are included through `origin/main`. |
-| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39 against the post-upstream-sync stack. Every direct probe conflicted and was aborted in the isolated probe worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-121623.txt`. |
-| #237 manual/delegated recheck | still blocked-needs-human | A fresh conflicted #237 worktree `/tmp/luce-pr237-agent-20260528-121623` confirmed broad conflicts across old `dflash/` paths, common MTP interfaces, Qwen35 graph/backend files, CMake, daemon/server wiring, and tests. Claude in tmux reached max turns without a usable report; Codex in tmux produced long read-only excerpts but no final feasibility conclusion before being stopped. Manual inspection matches prior delegated findings: direct conflict-marker resolution is unsafe; this requires a deliberate current-layout MTP port. |
+| upstream sync | checked | `origin/main` remains `6a6b0081`; `easel/auto-integration` and the primary checkout both started at `575034db`, with no upstream-base merge needed in this run. |
+| current integrated PRs | checked | `git merge-base --is-ancestor origin/pr/<n> HEAD` shows #294, #292, #289, #284, #276, #274, #266, #152, and #142 are ancestors of the refreshed stack. #278 and #265 are included through `origin/main`. |
+| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #183, #182, #181, #180, #177, #174, #154, #153, #137, #135, #131, #94, #62, #48, and #39 against current stack tip `575034db`. Every direct probe conflicted and was aborted in the isolated probe worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-123547.txt`. |
+| #237 manual/delegated status | still blocked-needs-human | No new #237 head since the prior deep manual/delegated recheck. This run's direct probe again showed broad conflicts across old `dflash/` paths, common MTP interfaces, Qwen35 graph/backend files, CMake, daemon/server wiring, and tests. Prior Claude/Codex tmux attempts did not produce a trusted ready-to-apply resolution, and the required next step remains a deliberate current-layout MTP port rather than conflict-marker resolution. |
 
 ## Pending / blocked-needs-human / selective-port candidates
 
@@ -80,25 +80,22 @@ as an integration dependency.
 
 This run performed:
 
-- `date -Is` -> 2026-05-28T12:15:27-04:00 at preflight.
-- Primary checkout `git status --short` was clean before work began.
+- `date -Is` -> 2026-05-28T12:34:53-04:00 at preflight.
+- Primary checkout `git status --short --branch` was clean before work began and reported `## auto-integration...easel/auto-integration`.
 - `git branch --show-current` reported `auto-integration` in the primary checkout.
 - `git remote -v` verified `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
 - `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status` succeeded for account `easel` with repo/workflow scopes.
 - `HOME=/home/erik /home/erik/.local/bin/claude auth status --text` succeeded for the Claude Team account.
-- `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --help` succeeded and printed Codex CLI usage.
+- `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --version` succeeded with `codex-cli 0.130.0`.
 - `git fetch --prune origin` and `git fetch --prune easel` completed; targeted fetches recreated current open non-draft contributor PR refs.
-- Isolated reconciliation worktree `/tmp/luce-auto-cron-20260528-121623` merged latest `origin/main` (`6a6b0081`) into the stack as `b191ba15`.
-- Isolated probe worktree `/tmp/luce-probe-20260528-121623` reran direct conflict probes for all remaining non-ancestor non-draft PRs.
-- Fresh #237 conflicted worktree `/tmp/luce-pr237-agent-20260528-121623` was inspected manually and delegated to Claude/Codex tmux sessions; both delegated attempts failed to produce a concise final report, so their failure is recorded rather than trusted.
+- `origin/main`, `easel/auto-integration`, and local `HEAD` were checked as `6a6b0081`, `575034db`, and `575034db` respectively; `git rev-list --left-right --count HEAD...easel/auto-integration` returned `0 0`.
+- Isolated probe worktree `/tmp/luce-probe-20260528-123547` reran direct conflict probes for all remaining non-ancestor non-draft PRs.
 - Ancestor checks passed for included contributor PR refs #294, #292, #289, #284, #276, #274, #266, #152, and #142; #278 and #265 are included through upstream main.
-- `git diff --check` passed for the upstream-sync merge plus manifest refresh.
+- `git diff --check` passed for this manifest refresh.
 - Targeted conflict-marker scan over `docs/auto-integration.md` found no merge markers.
 
 ## Notes
 
-- Primary checkout `/home/erik/Projects/luce2` was clean at preflight and matched fetched `easel/auto-integration` (`3fc6d270`).
-- Retained reconciliation worktree `/tmp/luce-auto-cron-20260528-121623` for audit/final push preparation.
-- Retained probe worktree `/tmp/luce-probe-20260528-121623` plus direct-probe log `/tmp/luce-merge-probes-20260528-121623.txt`.
-- Retained conflicted #237 analysis worktree `/tmp/luce-pr237-agent-20260528-121623` and agent logs `/tmp/luce-pr237-claude2-20260528-121623.txt`, `/tmp/luce-pr237-codex2-20260528-121623.txt`.
+- Primary checkout `/home/erik/Projects/luce2` was clean at preflight and matched fetched `easel/auto-integration` (`575034db`).
+- Retained probe worktree `/tmp/luce-probe-20260528-123547` plus direct-probe log `/tmp/luce-merge-probes-20260528-123547.txt`.
 - Prior retained worktrees, probe logs, agent reports, and configure directories remain as listed in earlier manifest revisions; cleanup is separate maintenance.
