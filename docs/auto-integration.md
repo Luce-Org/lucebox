@@ -4,24 +4,23 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T14:22:07-04:00
+Last refresh: 2026-05-28T14:49:06-04:00
 Current base: `origin/main` `3ba525e0`
-Current integration tip before this refresh: `easel/auto-integration` `6a9e50cd`
+Current integration tip before this refresh: `easel/auto-integration` `72355a11`
 Refreshed stack tip prepared in this run: this commit
 
 This branch is maintained as a reproducible patch stack over `origin/main`.
 The primary checkout was clean at the start of this unattended run, but the local
-primary branch was behind the fetched `easel/auto-integration` tip; all
-reconciliation work therefore happened in isolated worktree
-`/tmp/luce-auto-cron-20260528-142207`. This refresh first merged the latest
-upstream `origin/main` (which now includes PR #296), then integrated the updated
-non-draft PR #295 head. #295 conflicted only with the stack's previous
-integration of the same feature in the target layer-split prefill-logit capture
-calls; the resolution preserves #295's required always-capture behavior so
-sampling and prefix snapshots can restore prefill logits correctly. After the
-first push, CI exposed duplicate CMake test target registrations inherited from
-the long-running stack; this refresh also removes the repeated registration block
-so the CMake configure step can progress past CMP0002 target-name errors.
+primary branch was still behind/diverged from the fetched `easel/auto-integration`
+tip; all reconciliation and validation work therefore happened in isolated
+worktree `/tmp/luce-auto-cron-20260528-144958`. `origin/main` did not advance
+beyond `3ba525e0`, and every currently open non-draft contributor PR that can be
+directly integrated remains present in the stack. This refresh is manifest-only:
+it records the latest PR inventory, rerun direct-conflict probes for the remaining
+non-ancestor PRs, and the improved CI state after the prior integration-only CMake
+fix. The GitHub `Build (cmake + uv sync --extra megakernel)` and `uv workspace`
+checks now pass for PR #286 at tip `72355a11`; `cuda12` was still pending after a
+six-minute watch window.
 
 ## Included in the current stack
 
@@ -52,12 +51,11 @@ so the CMake configure step can progress past CMP0002 target-name errors.
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| upstream sync | integrated | `origin/main` advanced from `315a9bdb` to `3ba525e0`; merged cleanly in the worktree. |
-| #295 | integrated after manual conflict resolution | Direct merge conflicted in `server/src/gemma4/gemma4_layer_split_adapter.cpp` and `server/src/qwen35/qwen35_layer_split_adapter.cpp` where the stack had conditional prefill-logit capture. The final resolution uses #295's `&prefill_last_logits_` path so sampled target layer split and snapshot restore both retain logits. |
-| integration-only CI fix | applied | After push `c8da5c5b`, PR #286 CI failed in both CMake and Docker CUDA configure with duplicate `test_drafter_*` / `test_anchor_transitive` target and test registrations in `server/CMakeLists.txt`. This run removed the second duplicate block and verified no duplicate `add_executable` / `add_test(NAME ...)` entries remain. |
-| current integrated PRs | checked | Ancestor checks passed for #295, #294, #292, #289, #276, #274, #266, #152, and #142 at stack tip `98da34f0`; #296, #284, #278, and #265 are included through `origin/main`. |
-| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #154, #153, #137, #135, #94, and #48 against stack tip `98da34f0` in probe branch `auto-integration-probe-20260528-142207`. Every direct probe conflicted and was aborted in the isolated probe worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-142207.txt`. |
-| #237 manual/delegated status | still blocked-needs-human | No new #237 head since the prior deep manual/delegated recheck. This run's direct probe again showed broad conflicts across old `dflash/` paths, common MTP interfaces, Qwen35 graph/backend files, CMake, daemon/server wiring, and tests. Prior Claude/Codex tmux attempts did not produce a trusted ready-to-apply resolution, and the required next step remains a deliberate current-layout MTP port rather than conflict-marker resolution. |
+| upstream sync | checked / no-op | `origin/main` remains `3ba525e0`; it is already an ancestor of `easel/auto-integration` `72355a11`, so no upstream merge was required this run. |
+| open non-draft inventory | checked | Open non-draft PRs were #295, #294, #292, #289, #276, #274, #266, #237, #221, #154, #153, #152, #142, #137, #135, #94, and #48. Ancestor checks passed for #295, #294, #292, #289, #276, #274, #266, #152, and #142; #296, #284, #278, and #265 are included through `origin/main`. |
+| integration-only CI fix | improved / awaiting one check | For PR #286 at `72355a11`, `Build (cmake + uv sync --extra megakernel)` now passes and `uv workspace` passes. `cuda12` was still pending after `gh pr checks 286 --watch --interval 30` ran for six minutes; no new failure was observed. |
+| remaining non-ancestor non-draft PRs | direct merge probes still conflicted | Fresh isolated probes attempted `--no-commit --no-ff` merges for #237, #221, #154, #153, #137, #135, #94, and #48 against stack tip `72355a11` in probe branch `auto-integration-probe-20260528-144958`. Every direct probe conflicted and was aborted in the isolated probe worktree. Consolidated output: `/tmp/luce-merge-probes-20260528-144958.txt`. |
+| #237 manual/delegated status | still blocked-needs-human | No new #237 head since the prior deep manual/delegated recheck (`02c6a6c4`). This run's direct probe again showed broad conflicts across old `dflash/` paths, common MTP interfaces, Qwen35 graph/backend files, CMake, daemon/server wiring, and tests. Prior Claude/Codex tmux attempts did not produce a trusted ready-to-apply resolution, and the required next step remains a deliberate current-layout MTP port rather than conflict-marker resolution. |
 
 ## Pending / blocked-needs-human / selective-port candidates
 
@@ -83,24 +81,23 @@ as an integration dependency.
 
 This run performed:
 
-- `date -Is` -> 2026-05-28T14:22:07-04:00 at preflight.
+- `date -Is` -> 2026-05-28T14:49:06-04:00 at preflight.
 - Primary checkout `git status --short` was clean before work began; `git branch --show-current` reported `auto-integration`.
 - `git remote -v` verified `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
 - `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status` succeeded for account `easel` with repo/workflow scopes.
 - `HOME=/home/erik /home/erik/.local/bin/claude auth status --text` succeeded for the Claude Team account.
-- `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --version` succeeded with `codex-cli 0.130.0`.
+- `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --help` succeeded (`codex help ok`).
 - `git fetch --prune origin` and `git fetch --prune easel` completed separately; targeted fetches recreated current open non-draft contributor PR refs.
-- `origin/main`, `easel/auto-integration`, local primary `HEAD`, and prepared worktree `HEAD` were checked as `3ba525e0`, `6a9e50cd`, `f13a7459`, and `98da34f0` respectively before this manifest commit. The primary local branch was behind fetched `easel/auto-integration`, so it was not used for reconciliation.
-- Worktree `/tmp/luce-auto-cron-20260528-142207` merged `origin/main` cleanly and merged #295 after resolving two content conflicts in layer-split adapter prefill-logit capture.
-- After the first push (`c8da5c5b`), `gh pr checks 286 --watch` reported `uv workspace` passed, while `Build (cmake + uv sync --extra megakernel)` and `cuda12` failed during CMake configure with duplicate target/test names in `server/CMakeLists.txt`.
-- The duplicate CMake block was removed, and a local static check over `server/CMakeLists.txt` reported `target duplicates []` and `test duplicates []`.
-- Isolated probe worktree `/tmp/luce-probe-20260528-142207` reran direct conflict probes for all remaining non-ancestor non-draft PRs.
+- `origin/main`, fetched `easel/auto-integration`, local primary `HEAD`, and prepared worktree `HEAD` were checked as `3ba525e0`, `72355a11`, `f13a7459`, and `72355a11` respectively before this manifest commit. The primary local branch is still behind/diverged from fetched `easel/auto-integration`, so it was not used for reconciliation.
+- Worktree `/tmp/luce-auto-cron-20260528-144958` confirmed `origin/main` is already an ancestor of `HEAD`; no upstream merge was needed.
+- Isolated probe worktree `/tmp/luce-probe-20260528-144958` reran direct conflict probes for all remaining non-ancestor non-draft PRs.
 - Ancestor checks passed for included contributor PR refs #295, #294, #292, #289, #276, #274, #266, #152, and #142; #296, #284, #278, and #265 are included through upstream main.
+- `gh pr checks 286 --repo Luce-Org/lucebox-hub` reported `Build (cmake + uv sync --extra megakernel)` pass and `uv workspace` pass for `72355a11`; `cuda12` remained pending. A six-minute `gh pr checks 286 --watch --interval 30` timed out with `cuda12` still pending and the other two checks still passing.
 - `git diff --check` passed before this manifest refresh.
-- `cmake -S server -B /tmp/luce-cmake-20260528-142207 -DDFLASH27B_BUILD_TESTS=ON -DDFLASH27B_ENABLE_CUDA=OFF` did not reach project configure because local WSL CUDA compiler identification still selects unsupported `sm_52` and fails with `ptxas fatal: Value 'sm_52' is not defined`; this is the known local toolchain blocker, not a project compile result.
+- Targeted conflict-marker scan over `docs/auto-integration.md` found no merge markers before commit.
 
 ## Notes
 
-- Primary checkout `/home/erik/Projects/luce2` was clean at preflight but local `HEAD` (`f13a7459`) lagged fetched `easel/auto-integration` (`6a9e50cd`) by 18 commits. The pushed branch from this run should be treated as source of truth; primary fast-forward is deferred because the local branch divergence needs supervised cleanup.
-- Retained integration worktree `/tmp/luce-auto-cron-20260528-142207`, probe worktree `/tmp/luce-probe-20260528-142207`, probe log `/tmp/luce-merge-probes-20260528-142207.txt`, and local configure directory `/tmp/luce-cmake-20260528-142207`.
+- Primary checkout `/home/erik/Projects/luce2` was clean at preflight but local `HEAD` (`f13a7459`) still lags/diverges from fetched `easel/auto-integration` (`72355a11`). The pushed branch from this run should be treated as source of truth; primary fast-forward is deferred because the local branch divergence needs supervised cleanup.
+- Retained integration worktree `/tmp/luce-auto-cron-20260528-144958`, probe worktree `/tmp/luce-probe-20260528-144958`, and probe log `/tmp/luce-merge-probes-20260528-144958.txt`.
 - Prior retained worktrees, probe logs, agent reports, and configure directories remain as listed in earlier manifest revisions; cleanup is separate maintenance.
