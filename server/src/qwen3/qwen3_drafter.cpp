@@ -593,11 +593,35 @@ static std::vector<int32_t> qwen35_score_and_compress(
         else if (n_chunks <  2048) max_anchor_hits = 16;
         else                       max_anchor_hits = 32;
     }
-    const int anchor_ngram        = env_int("PFLASH_COMPRESS_ANCHOR_NGRAM",    4);
-    const int rare_token_max_freq = env_int("PFLASH_COMPRESS_RARE_MAX_FREQ",   2);
+    const int anchor_ngram = [&]{
+        const int nv = env_int("PFLASH_COMPRESS_ANCHOR_NGRAM", -1);
+        const int lv = env_int("DFLASH_COMPRESS_ANCHOR_NGRAM", -1);
+        if (nv >= 0) return nv;
+        if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_ANCHOR_NGRAM set without PFLASH_COMPRESS_ANCHOR_NGRAM; honoring legacy name (deprecated)\n"); return lv; }
+        return 4;
+    }();
+    const int rare_token_max_freq = [&]{
+        const int nv = env_int("PFLASH_COMPRESS_RARE_MAX_FREQ", -1);
+        const int lv = env_int("DFLASH_COMPRESS_RARE_MAX_FREQ", -1);
+        if (nv >= 0) return nv;
+        if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_RARE_MAX_FREQ set without PFLASH_COMPRESS_RARE_MAX_FREQ; honoring legacy name (deprecated)\n"); return lv; }
+        return 2;
+    }();
 
-    const float cascade_min_anchor_frac = env_float("PFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC", 0.25f);
-    const float max_forced_ratio        = env_float("PFLASH_COMPRESS_MAX_FORCED_RATIO",        1.3f);
+    const float cascade_min_anchor_frac = [&]{
+        const float nv = env_float("PFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC", -1.0f);
+        const float lv = env_float("DFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC", -1.0f);
+        if (nv >= 0.0f) return nv;
+        if (lv >= 0.0f) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC set without PFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC; honoring legacy name (deprecated)\n"); return lv; }
+        return 0.0f;  // gate off by default: always run cascade
+    }();
+    const float max_forced_ratio = [&]{
+        const float nv = env_float("PFLASH_COMPRESS_MAX_FORCED_RATIO", -1.0f);
+        const float lv = env_float("DFLASH_COMPRESS_MAX_FORCED_RATIO", -1.0f);
+        if (nv >= 0.0f) return nv;
+        if (lv >= 0.0f) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_MAX_FORCED_RATIO set without PFLASH_COMPRESS_MAX_FORCED_RATIO; honoring legacy name (deprecated)\n"); return lv; }
+        return 10.0f;  // generous cap: allows bridge to rescue multi-hop (original: ~6x n_keep)
+    }();
 
     const int q0 = std::max(0, S - query_tokens);
     std::vector<int32_t> query_pool(ids.begin() + q0, ids.end());
@@ -609,8 +633,20 @@ static std::vector<int32_t> qwen35_score_and_compress(
     anchor_cfg.cascade_min_anchor_count = (int)(cascade_min_anchor_frac * n_keep);
     anchor_cfg.max_forced_count         = (int)(max_forced_ratio * n_keep);
 
-    const bool use_transitive = env_int("PFLASH_COMPRESS_ANCHOR_TRANSITIVE", 0) != 0;
-    const int  max_iters      = env_int("PFLASH_COMPRESS_ANCHOR_MAX_ITERS",  3);
+    const bool use_transitive = [&]{
+        const int nv = env_int("PFLASH_COMPRESS_ANCHOR_TRANSITIVE", -1);
+        const int lv = env_int("DFLASH_COMPRESS_ANCHOR_TRANSITIVE", -1);
+        if (nv >= 0) return nv != 0;
+        if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_ANCHOR_TRANSITIVE set without PFLASH_COMPRESS_ANCHOR_TRANSITIVE; honoring legacy name (deprecated)\n"); return lv != 0; }
+        return true;  // on by default: gated rare-token bridge improves multi-hop F1
+    }();
+    const int  max_iters = [&]{
+        const int nv = env_int("PFLASH_COMPRESS_ANCHOR_MAX_ITERS", -1);
+        const int lv = env_int("DFLASH_COMPRESS_ANCHOR_MAX_ITERS", -1);
+        if (nv >= 0) return nv;
+        if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_ANCHOR_MAX_ITERS set without PFLASH_COMPRESS_ANCHOR_MAX_ITERS; honoring legacy name (deprecated)\n"); return lv; }
+        return 3;
+    }();
     if (use_transitive) {
         dflash::qwen3::scan_and_force_transitive(ids, q0, query_pool,
                                                   anchor_cfg, max_iters, forced);
@@ -811,11 +847,35 @@ std::vector<int32_t> drafter_score_and_compress(
         else if (n_chunks <  2048) max_anchor_hits = 16;
         else                       max_anchor_hits = 32;
     }
-    const int anchor_ngram        = env_int("PFLASH_COMPRESS_ANCHOR_NGRAM",    4);
-    const int rare_token_max_freq = env_int("PFLASH_COMPRESS_RARE_MAX_FREQ",   2);
+    const int anchor_ngram = [&]{
+        const int nv = env_int("PFLASH_COMPRESS_ANCHOR_NGRAM", -1);
+        const int lv = env_int("DFLASH_COMPRESS_ANCHOR_NGRAM", -1);
+        if (nv >= 0) return nv;
+        if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_ANCHOR_NGRAM set without PFLASH_COMPRESS_ANCHOR_NGRAM; honoring legacy name (deprecated)\n"); return lv; }
+        return 4;
+    }();
+    const int rare_token_max_freq = [&]{
+        const int nv = env_int("PFLASH_COMPRESS_RARE_MAX_FREQ", -1);
+        const int lv = env_int("DFLASH_COMPRESS_RARE_MAX_FREQ", -1);
+        if (nv >= 0) return nv;
+        if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_RARE_MAX_FREQ set without PFLASH_COMPRESS_RARE_MAX_FREQ; honoring legacy name (deprecated)\n"); return lv; }
+        return 2;
+    }();
 
-    const float cascade_min_anchor_frac = env_float("PFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC", 0.25f);
-    const float max_forced_ratio        = env_float("PFLASH_COMPRESS_MAX_FORCED_RATIO",        1.3f);
+    const float cascade_min_anchor_frac = [&]{
+        const float nv = env_float("PFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC", -1.0f);
+        const float lv = env_float("DFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC", -1.0f);
+        if (nv >= 0.0f) return nv;
+        if (lv >= 0.0f) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC set without PFLASH_COMPRESS_CASCADE_MIN_ANCHOR_FRAC; honoring legacy name (deprecated)\n"); return lv; }
+        return 0.0f;  // gate off by default: always run cascade
+    }();
+    const float max_forced_ratio = [&]{
+        const float nv = env_float("PFLASH_COMPRESS_MAX_FORCED_RATIO", -1.0f);
+        const float lv = env_float("DFLASH_COMPRESS_MAX_FORCED_RATIO", -1.0f);
+        if (nv >= 0.0f) return nv;
+        if (lv >= 0.0f) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_MAX_FORCED_RATIO set without PFLASH_COMPRESS_MAX_FORCED_RATIO; honoring legacy name (deprecated)\n"); return lv; }
+        return 10.0f;  // generous cap: allows bridge to rescue multi-hop (original: ~6x n_keep)
+    }();
 
     std::vector<uint8_t> selected_mask((size_t)n_chunks, 0);
     std::vector<uint8_t> forced((size_t)n_chunks, 0);
@@ -830,9 +890,24 @@ std::vector<int32_t> drafter_score_and_compress(
                                                  rare_token_max_freq};
         anchor_cfg.cascade_min_anchor_count = (int)(cascade_min_anchor_frac * n_keep);
         anchor_cfg.max_forced_count         = (int)(max_forced_ratio * n_keep);
+        std::fprintf(stderr, "[drafter_cascade] n_keep=%d max_forced=%d min_anchor=%d ratio=%.2f\n",
+            n_keep, anchor_cfg.max_forced_count, anchor_cfg.cascade_min_anchor_count, max_forced_ratio);
+        std::fflush(stderr);
 
-        const bool use_transitive = env_int("PFLASH_COMPRESS_ANCHOR_TRANSITIVE", 0) != 0;
-        const int  max_iters      = env_int("PFLASH_COMPRESS_ANCHOR_MAX_ITERS",  3);
+        const bool use_transitive = [&]{
+            const int nv = env_int("PFLASH_COMPRESS_ANCHOR_TRANSITIVE", -1);
+            const int lv = env_int("DFLASH_COMPRESS_ANCHOR_TRANSITIVE", -1);
+            if (nv >= 0) return nv != 0;
+            if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_ANCHOR_TRANSITIVE set without PFLASH_COMPRESS_ANCHOR_TRANSITIVE; honoring legacy name (deprecated)\n"); return lv != 0; }
+            return true;  // on by default: gated rare-token bridge improves multi-hop F1
+        }();
+        const int  max_iters = [&]{
+            const int nv = env_int("PFLASH_COMPRESS_ANCHOR_MAX_ITERS", -1);
+            const int lv = env_int("DFLASH_COMPRESS_ANCHOR_MAX_ITERS", -1);
+            if (nv >= 0) return nv;
+            if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_ANCHOR_MAX_ITERS set without PFLASH_COMPRESS_ANCHOR_MAX_ITERS; honoring legacy name (deprecated)\n"); return lv; }
+            return 3;
+        }();
         if (use_transitive) {
             dflash::qwen3::scan_and_force_transitive(ids, q0, query_pool,
                                                       anchor_cfg, max_iters, forced);
