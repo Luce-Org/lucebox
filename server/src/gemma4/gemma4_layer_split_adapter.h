@@ -36,7 +36,7 @@ struct Gemma4LayerSplitSnapshot {
 class Gemma4LayerSplitAdapter : public LayerSplitAdapter {
 public:
     explicit Gemma4LayerSplitAdapter(const Gemma4LayerSplitAdapterConfig & cfg);
-    ~Gemma4LayerSplitAdapter() override;
+    ~Gemma4LayerSplitAdapter() noexcept override;
 
     Gemma4LayerSplitAdapter(const Gemma4LayerSplitAdapter &) = delete;
     Gemma4LayerSplitAdapter & operator=(const Gemma4LayerSplitAdapter &) = delete;

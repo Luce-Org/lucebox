@@ -71,7 +71,13 @@ Gemma4LayerSplitAdapter::Gemma4LayerSplitAdapter(
         const Gemma4LayerSplitAdapterConfig & cfg)
     : cfg_(cfg) {}
 
-Gemma4LayerSplitAdapter::~Gemma4LayerSplitAdapter() { shutdown(); }
+Gemma4LayerSplitAdapter::~Gemma4LayerSplitAdapter() noexcept {
+    try {
+        shutdown();
+    } catch (...) {
+        // Destructors must not depend on newer libstdc++ termination helpers.
+    }
+}
 
 bool Gemma4LayerSplitAdapter::init() {
     if (!cfg_.target_path || cfg_.device.layer_split_gpus.size() < 2) {
