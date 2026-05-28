@@ -1267,19 +1267,8 @@ void HttpServer::worker_loop() {
         gen_req.sampler = req.sampler;
         gen_req.do_sample = req.sampler.needs_logit_processing();
         gen_req.stream = false;  // we handle streaming via on_token callback
-        // Design 1: when pflash compresses, widen the target spec-decode verify
-        // fa_window to cover the entire compressed prompt. Otherwise verify sees
-        // only the last cfg_.fa_window positions of the compressed sequence,
-        // losing needle context and truncating the answer at long ctx.
-        //
-        // Principle: pflash already paid compute to pick which tokens matter.
-        // Don't throw any of them away in verify by capping fa_window — that
-        // would waste pflash's work. Always request enough verify window to
-        // see the entire compressed prompt. The C2 gate in qwen35_backend.cpp
-        // then decides per request whether spec-decode arithmetic still beats
-        // AR at this window size; if not, AR fallback kicks in (which uses
-        // fa_window=0 → full attention over the compressed prompt). Either
-        // path sees every kept token. We choose mechanism, not visibility.
+        // Widen verify window to cover the full compressed prompt; C2 gate in
+        // qwen35_backend.cpp selects spec-decode vs AR. See docs/pflash-adaptive-composition.md.
         if (pflash_compressed) {
             gen_req.fa_window_override = (int)effective_prompt.size() + 256;
         }

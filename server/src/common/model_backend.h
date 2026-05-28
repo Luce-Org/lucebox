@@ -46,35 +46,10 @@ struct DaemonIO {
 
 // ─── Generate request/result ────────────────────────────────────────────
 
-// Thinking-budget force-close hook. Mirrors antirez/ds4 ds4_eval.c's
-// hard_limit_reply_budget semantics: when the budget remaining (n_gen
-// minus tokens committed so far) falls to hard_limit_remaining, the
-// next sampled tokens get overridden with close_token_ids in order,
-// giving the model the remaining budget to write a visible answer
-// after the injected close-tag sequence.
-//
-// Single vs multi-token close:
-//   Qwen3.6: </think> is one added_token (id 248069). close_token_ids
-//            has size 1. One override + budget_close_injected=true.
-//   DeepSeek/laguna: </think> tokenizes to 3 ordinary tokens
-//            ([1718, 37947, 32] for DS-V3). close_token_ids has
-//            size 3. Three consecutive overrides, then resume.
-//
-// This is "Level 2" of our thinking-budget migration: in-process
-// mid-stream force-close, KV-continuous. Beats Level 1's phase-2
-// reprompt because the model never sees a fresh prefill — its KV
-// state continues naturally after the injected close.
-//
-// Current implementation: AR-decode only. When budget_hook is set,
-// backends MAY route generation through their AR path (skipping spec
-// decode) — the perf trade-off is acceptable since this only kicks in
-// for thinking-enabled requests. Spec-decode integration is a follow-up.
+// Thinking-budget force-close hook; see docs/specs/thinking-budget.md.
+// When (n_gen - committed) == hard_limit_remaining, overrides sampled
+// tokens with close_token_ids (AR path only). Empty = disabled.
 struct BudgetHook {
-    // Multi-token close sequence injected when `(n_gen - committed)`
-    // drops to `hard_limit_remaining`. For Qwen3.x this is the
-    // canonical "Considering the limited time..." summarize-and-stop
-    // lead-in (tokenized at server startup); for non-qwen arches it's
-    // a single close-tag token. Empty = hook disabled.
     std::vector<int32_t> close_token_ids;
     int                  hard_limit_remaining = 0;
 };

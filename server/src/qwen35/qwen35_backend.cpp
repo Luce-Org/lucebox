@@ -578,15 +578,8 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
     auto t_prefill_end = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_prefill_end - t_prefill_start).count();
 
-    // C2 adaptive-mechanism gate: pflash's override always reflects the
-    // FULL compressed-prompt size — we never cap visibility (would waste
-    // pflash's anchor-selection work). The gate here decides whether
-    // spec-decode's verify arithmetic still earns its drafter cost at
-    // that window size. Threshold 2× cfg_.fa_window:
-    //   override <= 4096 (32K → ~1.5K, 64K → ~3K compressed) → spec-decode
-    //   override >  4096 (128K → ~6.4K compressed)            → AR fallback
-    // AR uses fa_window=0 (full attention) so every kept token is visible
-    // regardless of which path runs. We choose mechanism, not visibility.
+    // C2 gate: spec-decode when override <= 2x fa_window; AR fallback otherwise.
+    // Both paths see all kept tokens. See docs/pflash-adaptive-composition.md.
     const bool fa_within_budget =
         (req.fa_window_override == 0)
      || (eff_fa_window <= 2 * cfg_.fa_window);
@@ -847,26 +840,12 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                   const BudgetHook & budget_hook,
                                   bool * forced_close_out,
                                   bool * degenerate_close_out) {
-    // Budget hook state.
-    //   - budget_close_started: true once we've begun injecting the close
-    //     sequence. Prevents re-triggering on continued forward generation.
-    //   - close_inject_pos: index into budget_hook.close_token_ids for the
-    //     NEXT token to inject. While < close_token_ids.size(), each
-    //     iteration overrides the sampled token with the corresponding
-    //     close-sequence token (single-token close = 1 override and done;
-    //     multi-token close like DeepSeek/laguna [1718,37947,32] = 3
-    //     consecutive overrides). Once equal to close_token_ids.size(),
-    //     normal sampling resumes (model writes visible answer).
+    // budget_close_started: prevents re-triggering; close_inject_pos: next
+    // token index to inject from close_token_ids. See docs/specs/thinking-budget.md.
     bool budget_close_started = false;
     int  close_inject_pos     = 0;
-    // Capture entry KV position so the budget check is in the
-    // "generated since entry" frame, not the absolute KV frame.
-    // n_gen is the gen-only count (or the remaining-budget remap done by
-    // spec-decode tail-off); subtracting committed_now (absolute KV =
-    // prompt_len + tokens generated this call) directly would treat
-    // prompt-length tokens as if they were generated output, firing
-    // force-close prompt_len tokens early on prompted requests and
-    // potentially going negative after spec-decode tail-off.
+    // committed_at_entry: anchors budget check to "generated since entry" frame,
+    // not absolute KV (avoids firing prompt_len tokens early).
     const int committed_at_entry = committed;
     auto maybe_force_close = [&](int32_t & tok, int committed_now) {
         if (budget_hook.close_token_ids.empty()) return;
