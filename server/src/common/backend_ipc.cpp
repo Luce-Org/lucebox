@@ -50,11 +50,14 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
     if (!init_work_dir(cfg.work_dir)) return false;
 
     int cmd_pipe[2] = {-1, -1};
+    int payload_pipe[2] = {-1, -1};
     int stream_pipe[2] = {-1, -1};
-    if (::pipe(cmd_pipe) != 0 || ::pipe(stream_pipe) != 0) {
+    if (::pipe(cmd_pipe) != 0 || ::pipe(payload_pipe) != 0 || ::pipe(stream_pipe) != 0) {
         std::fprintf(stderr, "backend-ipc pipe failed: %s\n", std::strerror(errno));
         if (cmd_pipe[0] >= 0) ::close(cmd_pipe[0]);
         if (cmd_pipe[1] >= 0) ::close(cmd_pipe[1]);
+        if (payload_pipe[0] >= 0) ::close(payload_pipe[0]);
+        if (payload_pipe[1] >= 0) ::close(payload_pipe[1]);
         if (stream_pipe[0] >= 0) ::close(stream_pipe[0]);
         if (stream_pipe[1] >= 0) ::close(stream_pipe[1]);
         return false;
@@ -64,6 +67,7 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
     if (pid_ < 0) {
         std::fprintf(stderr, "backend-ipc fork failed: %s\n", std::strerror(errno));
         ::close(cmd_pipe[0]); ::close(cmd_pipe[1]);
+        ::close(payload_pipe[0]); ::close(payload_pipe[1]);
         ::close(stream_pipe[0]); ::close(stream_pipe[1]);
         pid_ = -1;
         return false;
@@ -75,15 +79,17 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
         }
         if (cmd_pipe[0] != STDIN_FILENO) ::close(cmd_pipe[0]);
         ::close(cmd_pipe[1]);
+        ::close(payload_pipe[1]);
         ::close(stream_pipe[0]);
 
         std::vector<std::string> argv_storage;
-        argv_storage.reserve(cfg.args.size() + 5);
+        argv_storage.reserve(cfg.args.size() + 6);
         argv_storage.emplace_back(cfg.bin);
         argv_storage.emplace_back(
             std::string("--backend-ipc-mode=") + backend_ipc_mode_name(cfg.mode));
         argv_storage.emplace_back(cfg.payload_path);
         for (const std::string & arg : cfg.args) argv_storage.emplace_back(arg);
+        argv_storage.emplace_back("--payload-fd=" + std::to_string(payload_pipe[0]));
         argv_storage.emplace_back("--stream-fd=" + std::to_string(stream_pipe[1]));
 
         std::vector<char *> argv;
@@ -97,7 +103,9 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
     }
 
     ::close(cmd_pipe[0]);
+    ::close(payload_pipe[0]);
     ::close(stream_pipe[1]);
+    payload_fd_ = payload_pipe[1];
     stream_fd_ = stream_pipe[0];
     cmd_ = ::fdopen(cmd_pipe[1], "w");
     if (!cmd_) {
@@ -128,6 +136,10 @@ void BackendIpcProcess::close() {
     if (stream_fd_ >= 0) {
         ::close(stream_fd_);
         stream_fd_ = -1;
+    }
+    if (payload_fd_ >= 0) {
+        ::close(payload_fd_);
+        payload_fd_ = -1;
     }
     if (pid_ > 0) {
         int status = 0;
