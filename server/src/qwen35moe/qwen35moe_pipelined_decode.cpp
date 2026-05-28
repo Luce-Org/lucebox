@@ -150,7 +150,6 @@ bool init_pipelined_decode_state(
     out.cold_in_zeroed = true;
     // cold_in was already zeroed in init_gpu_resident_state
 
-    std::printf("[pipelined] init: cached %d/%d DeltaNet pre-FFN graphs\n", cached_count, w.n_layer);
     return true;
 }
 
