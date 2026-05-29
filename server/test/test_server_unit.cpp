@@ -890,7 +890,7 @@ static void test_pflash_config_defaults() {
     ServerConfig cfg;
     TEST_ASSERT(cfg.pflash_mode == ServerConfig::PflashMode::OFF);
     TEST_ASSERT(cfg.pflash_threshold == 32000);
-    TEST_ASSERT(cfg.pflash_keep_ratio > 0.04f && cfg.pflash_keep_ratio < 0.06f);
+    TEST_ASSERT(cfg.pflash_keep_ratio > 0.09f && cfg.pflash_keep_ratio < 0.11f);
     TEST_ASSERT(cfg.pflash_drafter_path.empty());
     TEST_ASSERT(!cfg.pflash_skip_park);
 }
@@ -952,6 +952,76 @@ static void test_pflash_threshold_always_mode() {
     bool should = (cfg.pflash_mode == ServerConfig::PflashMode::ALWAYS) ||
                   (cfg.pflash_mode == ServerConfig::PflashMode::AUTO && n_prompt >= cfg.pflash_threshold);
     TEST_ASSERT(should);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Admission gate tests (check_admission pure helper)
+// ═══════════════════════════════════════════════════════════════════════
+
+static void test_admission_pflash_raw_large_effective_fits() {
+    // pflash on, raw=170000, effective=65000, max_output=512, max_ctx=131072 → ADMITTED
+    TEST_ASSERT(check_admission(/*effective=*/65000, /*raw=*/170000,
+                                /*max_output=*/512, /*max_ctx=*/131072,
+                                /*pflash_on=*/true));
+}
+
+static void test_admission_pflash_effective_too_large() {
+    // Post-compression: effective still too large → REJECTED.
+    // The post-compression call uses pflash_on=false (direct effective check).
+    TEST_ASSERT(!check_admission(/*effective=*/131000, /*raw=*/170000,
+                                 /*max_output=*/512, /*max_ctx=*/131072,
+                                 /*pflash_on=*/false));
+}
+
+static void test_admission_no_pflash_raw_too_large() {
+    // pflash off, raw > max_ctx → REJECTED (unchanged from original behavior)
+    TEST_ASSERT(!check_admission(/*effective=*/100000, /*raw=*/100000,
+                                 /*max_output=*/512, /*max_ctx=*/8192,
+                                 /*pflash_on=*/false));
+}
+
+static void test_admission_small_request_admitted() {
+    // Normal small request → ADMITTED regardless of pflash flag
+    TEST_ASSERT(check_admission(/*effective=*/1000, /*raw=*/1000,
+                                /*max_output=*/512, /*max_ctx=*/8192,
+                                /*pflash_on=*/false));
+    TEST_ASSERT(check_admission(/*effective=*/1000, /*raw=*/1000,
+                                /*max_output=*/512, /*max_ctx=*/8192,
+                                /*pflash_on=*/true));
+}
+
+static void test_admission_pflash_raw_sanity_guard() {
+    // pflash on, keep_ratio=0.25 (explicit guard-test input), raw=32769:
+    // 32769*0.25 + 512 = 8704.25 > 8192 → REJECTED.
+    TEST_ASSERT(!check_admission(/*effective=*/1000, /*raw=*/32769,
+                                 /*max_output=*/512, /*max_ctx=*/8192,
+                                 /*pflash_on=*/true, /*keep_ratio=*/0.25f));
+}
+
+static void test_admission_no_max_ctx_always_admits() {
+    // max_ctx=0 means no limit: always admit
+    TEST_ASSERT(check_admission(/*effective=*/999999, /*raw=*/999999,
+                                /*max_output=*/9999, /*max_ctx=*/0,
+                                /*pflash_on=*/false));
+}
+
+static void test_admission_keep_ratio_derived_guard_admits_low_ratio() {
+    // keep_ratio=0.05, raw=65536 (8× max_ctx=8192):
+    // best-case effective = 65536*0.05 = 3276.8 tokens.
+    // 3276.8 + 512 = 3788.8 < 8192 → guard PASSES → ADMITTED.
+    // The old hardcoded 4× guard would have rejected (65536 > 4*8192=32768).
+    TEST_ASSERT(check_admission(/*effective=*/65536, /*raw=*/65536,
+                                /*max_output=*/512, /*max_ctx=*/8192,
+                                /*pflash_on=*/true, /*keep_ratio=*/0.05f));
+}
+
+static void test_admission_keep_ratio_derived_guard_rejects_impossible() {
+    // keep_ratio=0.05, raw=2_000_000, max_ctx=8192:
+    // best-case effective = 2000000*0.05 = 100000 tokens.
+    // 100000 + 512 = 100512 > 8192 → REJECTED.
+    TEST_ASSERT(!check_admission(/*effective=*/2000000, /*raw=*/2000000,
+                                 /*max_output=*/512, /*max_ctx=*/8192,
+                                 /*pflash_on=*/true, /*keep_ratio=*/0.05f));
 }
 
 static void test_pflash_placement_same_backend_local() {
@@ -2663,6 +2733,17 @@ int main() {
     RUN_TEST(test_pflash_compress_result_defaults);
     RUN_TEST(test_pflash_threshold_auto_mode);
     RUN_TEST(test_pflash_threshold_always_mode);
+
+    std::fprintf(stderr, "\n── Admission gate ──\n");
+    RUN_TEST(test_admission_pflash_raw_large_effective_fits);
+    RUN_TEST(test_admission_pflash_effective_too_large);
+    RUN_TEST(test_admission_no_pflash_raw_too_large);
+    RUN_TEST(test_admission_small_request_admitted);
+    RUN_TEST(test_admission_pflash_raw_sanity_guard);
+    RUN_TEST(test_admission_no_max_ctx_always_admits);
+    RUN_TEST(test_admission_keep_ratio_derived_guard_admits_low_ratio);
+    RUN_TEST(test_admission_keep_ratio_derived_guard_rejects_impossible);
+
     RUN_TEST(test_pflash_placement_same_backend_local);
     RUN_TEST(test_pflash_placement_mixed_backend_remote);
     RUN_TEST(test_pflash_placement_auto_draft_follows_target);

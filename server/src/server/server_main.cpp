@@ -205,7 +205,7 @@ static void print_usage(const char * prog) {
         "PFlash (speculative prefill compression):\n"
         "  --prefill-compression off|auto|always  (default: off)\n"
         "  --prefill-threshold <N>     Token threshold for auto mode (default: 32000)\n"
-        "  --prefill-keep-ratio <F>    Fraction of tokens to keep (default: 0.05)\n"
+        "  --prefill-keep-ratio <F>    Fraction of tokens to keep (default: 0.10)\n"
         "  --prefill-drafter <path>    Drafter GGUF for compression (Qwen3-0.6B)\n"
         "  --prefill-skip-park         Skip park/unpark (for >=32GB GPUs)\n"
         "  --lazy-draft                Park decode draft when idle to save VRAM\n"
