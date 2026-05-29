@@ -26,9 +26,10 @@ line-length = 100
 # benchmark, autotune, and host-CLI stack. Untouched server-adjacent scripts and
 # vendored dependencies stay outside this gate until they are cleaned up.
 include = [
-    "dflash/scripts/prefix_cache.py",
-    "dflash/scripts/test_server.py",
-    "dflash/scripts/tool_memory.py",
+    # The legacy per-file pins for dflash/scripts/{prefix_cache,test_server,
+    # tool_memory}.py are gone: the dflash/ → server/ rename moved them and
+    # they were subsequently deleted upstream, so the include patterns
+    # matched nothing. Only the lucebox surface remains gated here.
     "lucebox/**/*.py",
 ]
 extend-exclude = [

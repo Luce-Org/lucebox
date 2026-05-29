@@ -56,6 +56,7 @@ def launch(
     timeout: int | None = None,
     interactive: bool = True,
     work_dir: Path | None = None,
+    tools: str = "read,grep,find,ls",
     extra_args: list[str] | None = None,
 ) -> int:
     bin_path = find_bin("pi", env_var="PI_BIN",
@@ -63,17 +64,39 @@ def launch(
     home = work_dir or mktempdir("pi")
     write_config(home, base_url=base_url, model=model, api_key=api_key)
 
-    env = {**os.environ, "HOME": str(home)}
+    agent_dir = home / "agent"
+    sessions_dir = home / "sessions"
+    # Mirror the env exports in harness/clients/run_pi.sh (PI_CODING_AGENT_*
+    # tell Pi where its config + session state live; PI_OFFLINE keeps it
+    # from reaching out to the public Pi API).
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PI_CODING_AGENT_DIR": str(agent_dir),
+        "PI_CODING_AGENT_SESSION_DIR": str(sessions_dir),
+        "PI_OFFLINE": "1",
+    }
     argv: list[str] = [bin_path]
-    if not interactive:
-        if prompt is None:
-            raise ValueError("non-interactive mode requires prompt=...")
-        # Pi exits cleanly when stdin closes; we'll just pipe the prompt.
+    if interactive:
         if extra_args:
             argv += extra_args
-    if interactive and extra_args:
-        argv += extra_args
-    if not interactive:
+    else:
+        if prompt is None:
+            raise ValueError("non-interactive mode requires prompt=...")
+        # Mirror harness/clients/run_pi.sh's validated invocation: route via
+        # the lucebox provider with the json print mode + a fixed tool
+        # allowlist, no session persistence, offline (no cloud Pi calls).
+        argv += [
+            "--provider", "lucebox",
+            "--model", model,
+            "--print",
+            "--mode", "json",
+            "--tools", tools,
+            "--no-session",
+            "--offline",
+        ]
+        if extra_args:
+            argv += extra_args
         argv += [prompt]
     return exec_client(argv, env, interactive=interactive, timeout=timeout)
 
@@ -87,12 +110,16 @@ def main() -> int:
     parser.add_argument("--api-key", default=DEFAULT_API_KEY)
     parser.add_argument("--prompt", default=None)
     parser.add_argument("--timeout", type=int, default=None)
+    parser.add_argument("--tools", default="read,grep,find,ls",
+                        help="Comma-separated tool allowlist passed to "
+                        "`pi --tools` (matches PI_TOOLS in run_pi.sh).")
     args, extra = parser.parse_known_args()
     try:
         return launch(
             base_url=args.base_url, model=args.model, api_key=args.api_key,
             prompt=args.prompt, timeout=args.timeout,
-            interactive=args.prompt is None, extra_args=extra or None,
+            interactive=args.prompt is None, tools=args.tools,
+            extra_args=extra or None,
         )
     except FileNotFoundError as e:
         print(f"[harness-pi] {e}", file=sys.stderr)

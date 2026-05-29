@@ -59,10 +59,18 @@ def exec_client(
     """Run a client binary with env, return its exit code.
 
     Interactive: inherits stdio (TUI works), no timeout.
-    Non-interactive: stdin from /dev/null, optional timeout wrap.
+    Non-interactive: stdin from /dev/null, optional wall-time timeout via
+    ``subprocess.run(..., timeout=N)`` — no dependency on the external
+    ``timeout`` binary, which isn't guaranteed across base images. On
+    timeout we return 124 to match the conventional GNU ``timeout`` exit
+    code, so harness scripts that branch on $? see the same value either
+    way.
     """
     if interactive:
         return subprocess.run(argv, env=env).returncode
-    if timeout is not None:
-        argv = ["timeout", f"{timeout}s", *argv]
-    return subprocess.run(argv, env=env, stdin=subprocess.DEVNULL).returncode
+    try:
+        return subprocess.run(
+            argv, env=env, stdin=subprocess.DEVNULL, timeout=timeout
+        ).returncode
+    except subprocess.TimeoutExpired:
+        return 124

@@ -58,9 +58,15 @@ variable "BUILD_TIME" { default = "" }
 # `lucebox-hub:cuda12`. With VERSION set we also emit a pinned
 # `lucebox-hub:<version>-cuda12`. Both point at the same image so users
 # can pull either form. TAG (legacy) still works as a single-tag override.
+#
+# Docker tag charset is [A-Za-z0-9_.-], so PEP 440 local-version segments
+# (e.g. `0.2.7.dev0+gabc1234` from hatch-vcs on a post-tag dev commit)
+# need their `+` replaced before they can be used as a tag. We map `+` →
+# `-` so the pinned tag becomes e.g. `0.2.7.dev0-gabc1234-cuda12`.
+sanitized_version = regex_replace(VERSION, "\\+", "-")
 function "image_tags" {
     params = [variant]
-    result = TAG != "" ? ["${REGISTRY}lucebox-hub:${TAG}-${variant}"] : (VERSION != "" ? ["${REGISTRY}lucebox-hub:${variant}", "${REGISTRY}lucebox-hub:${VERSION}-${variant}"] : ["${REGISTRY}lucebox-hub:${variant}"])
+    result = TAG != "" ? ["${REGISTRY}lucebox-hub:${TAG}-${variant}"] : (VERSION != "" ? ["${REGISTRY}lucebox-hub:${variant}", "${REGISTRY}lucebox-hub:${sanitized_version}-${variant}"] : ["${REGISTRY}lucebox-hub:${variant}"])
 }
 
 group "default" {

@@ -87,20 +87,20 @@ jobs:
           large-packages: false   # slow; preinstalled apt packages we don't need
           swap-storage: true
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           # Submodule contents are needed by the cmake build (llama.cpp ggml
           # subtree, mit-han-lab Block-Sparse-Attention). The Dockerfile
           # asserts they're present before running cmake.
           submodules: recursive
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
         # Skip on PR runs: we never push from a PR and the token from a fork
         # PR can't `packages:write` anyway.
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -119,7 +119,7 @@ jobs:
 
       - name: Derive image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           # Suffix every tag with the variant so future CUDA stacks can
@@ -149,7 +149,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Build and push
-        uses: docker/bake-action@v5
+        uses: docker/bake-action@4a9a8d494466d37134e2bfca2d3a8de8fb2681ad # v5
         env:
           # Wire identity into docker-bake.hcl's GIT_SHA / IMAGE_TAG /
           # BUILD_TIME variables. IMAGE_TAG is `${{ steps.meta.outputs.

@@ -1,14 +1,15 @@
 """Launch OpenClaw pointed at a Lucebox server.
 
 Mirrors ``harness/clients/run_openclaw.sh``. OpenClaw takes a JSON config
-patch via $HOME/openclaw.patch.json that's merged into its baked-in
-provider registry on startup.
+patch that's applied via ``openclaw config patch --file`` before the
+agent run; we mirror both the patch step and the agent invocation here.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -68,6 +69,7 @@ def launch(
     work_dir: Path | None = None,
     max_ctx: int = 204800,
     max_tokens: int = 4096,
+    agent_timeout: int = 300,
     extra_args: list[str] | None = None,
 ) -> int:
     bin_path = find_bin("openclaw", env_var="OPENCLAW_BIN",
@@ -80,8 +82,19 @@ def launch(
     env = {
         **os.environ,
         "HOME": str(home),
+        "OPENAI_API_KEY": api_key,
+        # Kept for back-compat with prior callers that referenced this env
+        # var; the canonical patch application happens via the explicit
+        # `config patch` step below (mirroring run_openclaw.sh).
         "OPENCLAW_CONFIG_PATCH": str(patch_path),
     }
+    # Apply the JSON patch via OpenClaw's `config patch` subcommand — same
+    # step run_openclaw.sh performs before invoking `agent`. Without this,
+    # the agent run can't see the lucebox provider entry.
+    subprocess.run(
+        [bin_path, "config", "patch", "--file", str(patch_path)],
+        env=env, check=True, stdin=subprocess.DEVNULL,
+    )
     argv: list[str] = [bin_path]
     if interactive:
         if extra_args:
@@ -89,10 +102,22 @@ def launch(
     else:
         if prompt is None:
             raise ValueError("non-interactive mode requires prompt=...")
-        argv += ["agent"]
+        # Mirror run_openclaw.sh: `agent --local --json --model
+        # lucebox/<model> --session-id … --timeout … --message <prompt>`.
+        # Selecting the explicit model+session keeps the run reproducible
+        # and stops OpenClaw from falling back to a default provider when
+        # the patch is partial.
+        argv += [
+            "agent",
+            "--local",
+            "--json",
+            "--model", f"lucebox/{model}",
+            "--session-id", "lucebox-client-harness",
+            "--timeout", str(agent_timeout),
+        ]
         if extra_args:
             argv += extra_args
-        argv += [prompt]
+        argv += ["--message", prompt]
     return exec_client(argv, env, interactive=interactive, timeout=timeout)
 
 
@@ -107,6 +132,9 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=None)
     parser.add_argument("--max-ctx", type=int, default=204800)
     parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument("--agent-timeout", type=int, default=300,
+                        help="Inner `openclaw agent --timeout` value "
+                        "(mirrors the literal `--timeout 300` in run_openclaw.sh).")
     args, extra = parser.parse_known_args()
     try:
         return launch(
@@ -114,6 +142,7 @@ def main() -> int:
             prompt=args.prompt, timeout=args.timeout,
             interactive=args.prompt is None,
             max_ctx=args.max_ctx, max_tokens=args.max_tokens,
+            agent_timeout=args.agent_timeout,
             extra_args=extra or None,
         )
     except FileNotFoundError as e:

@@ -31,7 +31,7 @@ pre-commit:
       # — needed for harness/clients/common.sh consumers. The submodule
       # excludes keep us from scanning vendored llama.cpp / Block-Sparse-Attention
       # / cutlass scripts on every commit.
-      glob: "*.sh"
+      glob: "**/*.sh"
       exclude:
         - "server/deps/**"
         - "optimizations/megakernel/deps/**"
@@ -40,7 +40,7 @@ pre-commit:
     bash-parse:
       # `bash -n` catches syntax errors that shellcheck can miss when
       # configured to error-only. Cheap second pass — runs in parallel.
-      glob: "*.sh"
+      glob: "**/*.sh"
       exclude:
         - "server/deps/**"
         - "optimizations/megakernel/deps/**"

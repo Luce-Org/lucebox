@@ -73,6 +73,7 @@ def launch(
     work_dir: Path | None = None,
     max_ctx: int = 98304,
     max_tokens: int = 4096,
+    max_turns: int = 40,
     extra_args: list[str] | None = None,
 ) -> int:
     bin_path = find_bin("hermes", env_var="HERMES_BIN",
@@ -82,7 +83,22 @@ def launch(
     write_config(home, base_url=base_url, model=model, api_key=api_key,
                  max_ctx=max_ctx, max_tokens=max_tokens, repo_dir=repo_dir)
 
-    env = {**os.environ, "HOME": str(home)}
+    base = f"{base_url.rstrip('/')}/v1"
+    # Mirror harness/clients/run_hermes.sh: HERMES_HOME tells the binary
+    # which config dir to read (Hermes does not always honor HOME alone);
+    # the OPENAI_/HERMES_INFERENCE_* env vars are the canonical wiring;
+    # NO_COLOR keeps the batch log diffable.
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "HERMES_HOME": str(home),
+        "OPENAI_API_KEY": api_key,
+        "OPENAI_BASE_URL": base,
+        "HERMES_INFERENCE_PROVIDER": "lucebox",
+        "HERMES_INFERENCE_MODEL": model,
+        "HERMES_ACCEPT_HOOKS": "1",
+        "NO_COLOR": "1",
+    }
     argv: list[str] = [bin_path]
     if interactive:
         if extra_args:
@@ -90,11 +106,22 @@ def launch(
     else:
         if prompt is None:
             raise ValueError("non-interactive mode requires prompt=...")
-        # Hermes's batch-mode flag; mirror what run_hermes.sh sends.
-        argv += ["--non-interactive"]
+        # Mirror run_hermes.sh's validated batch invocation: `chat` subcommand
+        # with the lucebox provider, accept-hooks/yolo so it doesn't stop on
+        # interactive prompts, `--query` for the user prompt (not positional).
+        argv += [
+            "chat",
+            "--quiet",
+            "--provider", "lucebox",
+            "--model", model,
+            "--accept-hooks",
+            "--yolo",
+            "--max-turns", str(max_turns),
+            "--source", "lucebox-harness",
+        ]
         if extra_args:
             argv += extra_args
-        argv += [prompt]
+        argv += ["--query", prompt]
 
     old_cwd = os.getcwd()
     try:
@@ -115,6 +142,9 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=None)
     parser.add_argument("--max-ctx", type=int, default=98304)
     parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument("--max-turns", type=int, default=40,
+                        help="Max agent turns for `hermes chat --max-turns` "
+                        "(mirrors HERMES_MAX_TURNS in run_hermes.sh).")
     args, extra = parser.parse_known_args()
     try:
         return launch(
@@ -122,6 +152,7 @@ def main() -> int:
             prompt=args.prompt, timeout=args.timeout,
             interactive=args.prompt is None,
             max_ctx=args.max_ctx, max_tokens=args.max_tokens,
+            max_turns=args.max_turns,
             extra_args=extra or None,
         )
     except FileNotFoundError as e:

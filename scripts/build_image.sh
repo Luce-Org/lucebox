@@ -48,7 +48,15 @@ else
 fi
 
 export VERSION
-export REGISTRY="${REGISTRY:-}"
+# `REGISTRY` composes into the bake tag as `${REGISTRY}lucebox-hub:…`, so
+# the value MUST end with `/` (e.g. `ghcr.io/luce-org/`). Normalize a
+# trailing slash so callers that forget it (`REGISTRY=ghcr.io/luce-org`)
+# get the right image name rather than `ghcr.io/luce-orglucebox-hub:…`.
+REGISTRY="${REGISTRY:-}"
+if [ -n "$REGISTRY" ] && [ "${REGISTRY: -1}" != "/" ]; then
+    REGISTRY="${REGISTRY}/"
+fi
+export REGISTRY
 export DFLASH_CUDA_ARCHES="${DFLASH_CUDA_ARCHES:-75;80;86;89;90;120}"
 
 # /props.build identity (baked into /opt/lucebox-hub/IMAGE_INFO and surfaced
