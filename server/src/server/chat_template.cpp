@@ -51,7 +51,7 @@ ChatFormat chat_format_for_arch(const std::string & arch) {
     return ChatFormat::QWEN3;
 }
 
-std::string render_chat_template(
+PromptRenderResult render_chat_template(
     const std::vector<ChatMessage> & messages,
     ChatFormat format,
     bool add_generation_prompt,
@@ -59,6 +59,10 @@ std::string render_chat_template(
     const std::string & tools_json)
 {
     std::string result;
+    // `started_in_thinking` is derived deterministically from the template
+    // branch + render flags below. Set per format inside the switch so a
+    // future format addition can't silently miss the wiring.
+    bool started_in_thinking = false;
     bool has_tools = !tools_json.empty() && tools_json != "[]" && tools_json != "null";
 
     switch (format) {
@@ -141,6 +145,14 @@ std::string render_chat_template(
                 // even when the client opts in, defeating the thinking-budget
                 // mechanism entirely.
                 result += "<think>\n";
+                // The prompt suffix pre-opens `<think>` — the model's very
+                // first generated token is reasoning, never preceded by an
+                // explicit `<think>` opener in the stream. Callers must
+                // start the SSE state machine in REASONING mode and pass
+                // `started_in_thinking=true` to parse_reasoning() so that
+                // reasoning text routes to reasoning_content instead of
+                // leaking into content.
+                started_in_thinking = true;
             }
         }
         break;
@@ -224,6 +236,11 @@ std::string render_chat_template(
             result += "<assistant>\n";
             if (enable_thinking) {
                 result += "<think>";
+                // Same situation as Qwen3.6: Laguna XS.2's enable_thinking
+                // generation prompt ends with `<think>` so the model starts
+                // emitting reasoning tokens with no explicit opener in the
+                // stream. Route subsequent tokens to the reasoning channel.
+                started_in_thinking = true;
             } else {
                 // Empty think block — model jumps straight to answer.
                 result += "</think>";
@@ -311,11 +328,17 @@ std::string render_chat_template(
                 result += "<|channel>thought\n<channel|>";
             }
         }
+        // Gemma4 does NOT pre-open `<think>` from the prompt; its
+        // reasoning channel is opened by the model emitting `<|channel>`
+        // which http_server forwards into the SseEmitter as the text
+        // `<think>` — so the emitter's existing CONTENT→REASONING
+        // transition fires on that synthesized opener. started_in_thinking
+        // stays false (initial CONTENT mode is correct).
         break;
     }
     }
 
-    return result;
+    return PromptRenderResult{std::move(result), started_in_thinking};
 }
 
 // ─── Jinja path ─────────────────────────────────────────────────────────
@@ -353,7 +376,29 @@ static std::shared_ptr<jinja::program> get_or_parse(const std::string & template
 
 }  // namespace
 
-std::string render_chat_template_jinja(
+// Sniff a rendered prompt for a trailing `<think>` opener so the caller
+// can route subsequent stream tokens to the reasoning channel. Accepts
+// optional whitespace after the opener (Qwen3.6 emits `<think>\n`).
+// True positive ⇒ caller should treat the prompt as having pre-opened
+// the reasoning channel (and the renderer warns loudly so a model-card
+// mismatch is visible at runtime).
+static bool prompt_ends_with_think_open(const std::string & s) {
+    static const std::string OPEN = "<think>";
+    // Walk back over trailing ASCII whitespace.
+    size_t end = s.size();
+    while (end > 0) {
+        char c = s[end - 1];
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+            end--;
+        } else {
+            break;
+        }
+    }
+    if (end < OPEN.size()) return false;
+    return s.compare(end - OPEN.size(), OPEN.size(), OPEN) == 0;
+}
+
+PromptRenderResult render_chat_template_jinja(
     const std::string & template_src,
     const std::vector<ChatMessage> & messages,
     const std::string & bos_token,
@@ -407,14 +452,37 @@ std::string render_chat_template_jinja(
         throw std::runtime_error(std::string("jinja global_from_json: ") + e.what());
     }
 
+    std::string rendered;
     try {
         jinja::runtime rt(ctx);
         jinja::value results = rt.execute(*prog);
         auto parts = jinja::runtime::gather_string_parts(results);
-        return parts->as_string().str();
+        rendered = parts->as_string().str();
     } catch (const std::exception & e) {
         throw std::runtime_error(std::string("jinja runtime: ") + e.what());
     }
+
+    // Jinja path: we don't know which template family the caller passed
+    // in, so derive `started_in_thinking` by sniffing the rendered tail
+    // for a `<think>` opener. This catches the common Qwen3.6 / Laguna
+    // chat templates that end with `<think>\n` when enable_thinking is
+    // honored, plus any custom template that follows the same convention.
+    //
+    // Warn loudly when sniffing decides true so a template/model-card
+    // mismatch (e.g. enable_thinking=false but template hard-codes
+    // `<think>` anyway) surfaces in server logs.
+    bool started_in_thinking =
+        enable_thinking && add_generation_prompt &&
+        prompt_ends_with_think_open(rendered);
+    if (started_in_thinking) {
+        std::fprintf(stderr,
+            "[WARN] render_chat_template_jinja: rendered prompt ends with "
+            "`<think>` opener — treating as started_in_thinking=true. If "
+            "this is unexpected, check the template's enable_thinking "
+            "branch or the model card's reasoning configuration.\n");
+    }
+
+    return PromptRenderResult{std::move(rendered), started_in_thinking};
 }
 
 }  // namespace dflash::common

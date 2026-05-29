@@ -76,15 +76,16 @@ SseEmitter::SseEmitter(ApiFormat format,
                        int prompt_tokens,
                        const json & tools,
                        ToolMemory * tool_memory,
-                       const std::vector<std::string> & stop_sequences)
+                       const std::vector<std::string> & stop_sequences,
+                       StreamMode initial_mode)
     : format_(format)
     , request_id_(request_id)
     , model_name_(model_name)
     , prompt_tokens_(prompt_tokens)
     , tools_(tools)
     , tool_memory_(tool_memory)
-    , mode_(StreamMode::CONTENT)
-    , active_kind_("text")
+    , mode_(initial_mode)
+    , active_kind_(initial_mode == StreamMode::REASONING ? "thinking" : "text")
     , stop_sequences_(stop_sequences)
     , created_at_(unix_timestamp())
     , msg_item_id_(gen_item_id())
@@ -93,6 +94,12 @@ SseEmitter::SseEmitter(ApiFormat format,
     for (const auto & s : stop_sequences_) {
         if (s.size() > stop_holdback_) stop_holdback_ = s.size();
     }
+    // NOTE on `checked_think_prefix_`: we deliberately leave the default
+    // (false) here even when initial_mode == REASONING. The emitter has a
+    // one-time guard in emit_token() that strips a redundantly-emitted
+    // leading `<think>` if the model emits one anyway (model-card /
+    // template-mismatch edge case). Pre-setting the flag to true would
+    // skip that strip and leak the duplicate opener into reasoning_text.
 }
 
 // ─── SSE formatting helpers ─────────────────────────────────────────────

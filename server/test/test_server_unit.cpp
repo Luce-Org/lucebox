@@ -1541,11 +1541,11 @@ static void test_jinja_render_basic() {
         {"system", "you are helpful", ""},
         {"user",   "hi",              ""},
     };
-    std::string out = render_chat_template_jinja(
+    auto out = render_chat_template_jinja(
         MINI_JINJA_TEMPLATE, msgs,
         /*bos=*/"<s>", /*eos=*/"</s>",
         /*add_gen=*/true, /*think=*/false,
-        /*tools=*/"");
+        /*tools=*/"").text;
     TEST_ASSERT(out.find("<|system|>you are helpful") != std::string::npos);
     TEST_ASSERT(out.find("<|user|>hi")               != std::string::npos);
     TEST_ASSERT(out.find("<|assistant|>")            != std::string::npos);
@@ -1553,9 +1553,9 @@ static void test_jinja_render_basic() {
 
 static void test_jinja_render_no_gen_prompt() {
     std::vector<ChatMessage> msgs = {{"user", "ping", ""}};
-    std::string out = render_chat_template_jinja(
+    auto out = render_chat_template_jinja(
         MINI_JINJA_TEMPLATE, msgs, "", "",
-        /*add_gen=*/false, /*think=*/false, "");
+        /*add_gen=*/false, /*think=*/false, "").text;
     TEST_ASSERT(out.find("<|user|>ping") != std::string::npos);
     TEST_ASSERT(out.find("<|assistant|>") == std::string::npos);
 }
@@ -1567,8 +1567,8 @@ static void test_jinja_render_tools_injected() {
         "{%- for m in messages -%}<|{{ m.role }}|>{{ m.content }}{%- endfor -%}";
     std::vector<ChatMessage> msgs = {{"user", "?", ""}};
     std::string tools = R"([{"name":"my_tool","description":"test"}])";
-    std::string out = render_chat_template_jinja(
-        TPL, msgs, "", "", false, false, tools);
+    auto out = render_chat_template_jinja(
+        TPL, msgs, "", "", false, false, tools).text;
     TEST_ASSERT(out.find("TOOLS_PRESENT:my_tool") != std::string::npos);
 }
 
@@ -1577,8 +1577,8 @@ static void test_jinja_render_empty_tools_skipped() {
     static const char TPL[] =
         "{%- if tools -%}TOOLS_PRESENT{%- else -%}NO_TOOLS{%- endif -%}";
     std::vector<ChatMessage> msgs = {{"user", "?", ""}};
-    std::string out = render_chat_template_jinja(
-        TPL, msgs, "", "", false, false, "[]");
+    auto out = render_chat_template_jinja(
+        TPL, msgs, "", "", false, false, "[]").text;
     TEST_ASSERT(out.find("NO_TOOLS")        != std::string::npos);
     TEST_ASSERT(out.find("TOOLS_PRESENT")   == std::string::npos);
 }
@@ -1587,8 +1587,8 @@ static void test_jinja_render_bos_eos_threaded() {
     // {{ bos_token }} and {{ eos_token }} must reach the template.
     static const char TPL[] = "{{ bos_token }}HI{{ eos_token }}";
     std::vector<ChatMessage> msgs;
-    std::string out = render_chat_template_jinja(
-        TPL, msgs, "<BOS>", "<EOS>", false, false, "");
+    auto out = render_chat_template_jinja(
+        TPL, msgs, "<BOS>", "<EOS>", false, false, "").text;
     TEST_ASSERT(out == "<BOS>HI<EOS>");
 }
 
@@ -1614,6 +1614,213 @@ static void test_jinja_render_bad_tools_json_throws() {
         threw = true;
     }
     TEST_ASSERT(threw);
+}
+
+// ─── started_in_thinking provenance ─────────────────────────────────────
+//
+// Regression suite for the Qwen3.6 / Laguna think-mode channel-routing
+// bug: the rendered prompt suffix pre-opens `<think>` so the model
+// starts emitting reasoning tokens with no explicit opener. Callers
+// route PromptRenderResult.started_in_thinking → SseEmitter initial
+// mode so reasoning text lands in reasoning_content, not content.
+
+static void test_chat_template_qwen3_enable_thinking_pre_opens() {
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto result = render_chat_template(msgs, ChatFormat::QWEN3,
+                                       /*add_gen=*/true,
+                                       /*enable_thinking=*/true,
+                                       /*tools=*/"");
+    TEST_ASSERT(result.started_in_thinking);
+    // Sanity: rendered suffix ends with `<think>\n` per the Qwen3.6
+    // chat_template.jinja's enable_thinking branch.
+    TEST_ASSERT(result.text.size() >= 8);
+    TEST_ASSERT(result.text.compare(result.text.size() - 8, 8, "<think>\n") == 0);
+}
+
+static void test_chat_template_qwen3_disable_thinking_does_not_pre_open() {
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto result = render_chat_template(msgs, ChatFormat::QWEN3,
+                                       /*add_gen=*/true,
+                                       /*enable_thinking=*/false,
+                                       /*tools=*/"");
+    TEST_ASSERT(!result.started_in_thinking);
+    // The disabled branch emits `<think>\n\n</think>\n\n` — closes
+    // immediately, so the reasoning channel is NOT left open.
+    TEST_ASSERT(result.text.find("</think>") != std::string::npos);
+}
+
+static void test_chat_template_qwen3_no_gen_prompt_does_not_pre_open() {
+    // Without add_generation_prompt the assistant turn isn't appended
+    // and there's nothing to pre-open.
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto result = render_chat_template(msgs, ChatFormat::QWEN3,
+                                       /*add_gen=*/false,
+                                       /*enable_thinking=*/true,
+                                       /*tools=*/"");
+    TEST_ASSERT(!result.started_in_thinking);
+}
+
+static void test_chat_template_laguna_enable_thinking_pre_opens() {
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto result = render_chat_template(msgs, ChatFormat::LAGUNA,
+                                       /*add_gen=*/true,
+                                       /*enable_thinking=*/true,
+                                       /*tools=*/"");
+    TEST_ASSERT(result.started_in_thinking);
+    TEST_ASSERT(result.text.size() >= 7);
+    TEST_ASSERT(result.text.compare(result.text.size() - 7, 7, "<think>") == 0);
+}
+
+static void test_chat_template_laguna_disable_thinking_does_not_pre_open() {
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto result = render_chat_template(msgs, ChatFormat::LAGUNA,
+                                       /*add_gen=*/true,
+                                       /*enable_thinking=*/false,
+                                       /*tools=*/"");
+    TEST_ASSERT(!result.started_in_thinking);
+}
+
+static void test_chat_template_gemma4_does_not_pre_open() {
+    // Gemma4's reasoning channel is opened by the model's `<|channel>`
+    // token (which http_server forwards into the emitter as `<think>`).
+    // The prompt itself never pre-opens `<think>` regardless of
+    // enable_thinking, so started_in_thinking must stay false.
+    std::vector<ChatMessage> msgs = {{"user", "hi", ""}};
+    auto enabled = render_chat_template(msgs, ChatFormat::GEMMA4,
+                                        /*add_gen=*/true,
+                                        /*enable_thinking=*/true,
+                                        /*tools=*/"");
+    TEST_ASSERT(!enabled.started_in_thinking);
+    auto disabled = render_chat_template(msgs, ChatFormat::GEMMA4,
+                                         /*add_gen=*/true,
+                                         /*enable_thinking=*/false,
+                                         /*tools=*/"");
+    TEST_ASSERT(!disabled.started_in_thinking);
+}
+
+// Jinja path: suffix-sniff detection. The renderer should set
+// started_in_thinking=true when the rendered prompt ends with `<think>`
+// (optionally followed by whitespace) AND enable_thinking is honored.
+static void test_jinja_render_suffix_sniff_sets_started_in_thinking() {
+    static const char TPL[] =
+        "{%- for m in messages -%}<|{{ m.role }}|>{{ m.content }}{%- endfor -%}"
+        "{%- if add_generation_prompt -%}"
+        "<|assistant|>{%- if enable_thinking -%}<think>\n{%- endif -%}"
+        "{%- endif -%}";
+    std::vector<ChatMessage> msgs = {{"user", "?", ""}};
+    auto r = render_chat_template_jinja(
+        TPL, msgs, "", "", /*add_gen=*/true, /*think=*/true, "");
+    TEST_ASSERT(r.started_in_thinking);
+}
+
+static void test_jinja_render_suffix_sniff_negative() {
+    // Template doesn't end with `<think>` → started_in_thinking=false
+    // even with enable_thinking=true.
+    static const char TPL[] =
+        "{%- for m in messages -%}<|{{ m.role }}|>{{ m.content }}{%- endfor -%}"
+        "{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
+    std::vector<ChatMessage> msgs = {{"user", "?", ""}};
+    auto r = render_chat_template_jinja(
+        TPL, msgs, "", "", /*add_gen=*/true, /*think=*/true, "");
+    TEST_ASSERT(!r.started_in_thinking);
+}
+
+// ─── SseEmitter initial_mode=REASONING ──────────────────────────────────
+//
+// Regression: when constructed with initial_mode=REASONING (the
+// Qwen3.6/Laguna enable_thinking path), the emitter must route the
+// model's first generated tokens to reasoning_content until a natural
+// `</think>` is seen, even though no explicit `<think>` opener appears
+// in the stream.
+
+static void test_emitter_initial_mode_reasoning_routes_to_reasoning_content() {
+    SseEmitter em(ApiFormat::OPENAI_CHAT, "req-1", "test-model", 10,
+                  json::array(), nullptr,
+                  /*stops=*/{},
+                  StreamMode::REASONING);
+    em.emit_start();
+
+    // Model emits reasoning tokens directly with no leading `<think>`
+    // (because the prompt suffix already opened the channel), then
+    // closes with `</think>` and emits the answer.
+    em.emit_token("alpha ");
+    em.emit_token("beta ");
+    em.emit_token("</think>\n\nAnswer: 4");
+    em.emit_finish(4);
+
+    TEST_ASSERT(em.reasoning_text().find("alpha")  != std::string::npos);
+    TEST_ASSERT(em.reasoning_text().find("beta")   != std::string::npos);
+    // No spurious <think> tag leaked into reasoning or content.
+    TEST_ASSERT(em.reasoning_text().find("<think>")  == std::string::npos);
+    TEST_ASSERT(em.reasoning_text().find("</think>") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("<think>")  == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("</think>") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("Answer: 4") != std::string::npos);
+}
+
+static void test_emitter_initial_mode_reasoning_unclosed_stays_reasoning() {
+    // No </think> close — everything stays in reasoning_content, content
+    // stays empty. Matches parse_reasoning(started_in_thinking=true)
+    // behavior for the non-streaming path.
+    SseEmitter em(ApiFormat::OPENAI_CHAT, "req-2", "test-model", 10,
+                  json::array(), nullptr,
+                  /*stops=*/{},
+                  StreamMode::REASONING);
+    em.emit_start();
+    em.emit_token("still thinking");
+    em.emit_token(" more thinking");
+    em.emit_finish(3);
+
+    TEST_ASSERT(em.reasoning_text().find("still thinking") != std::string::npos);
+    TEST_ASSERT(em.reasoning_text().find("more thinking")  != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().empty());
+}
+
+static void test_emitter_initial_mode_reasoning_strips_redundant_think_opener() {
+    // Edge case: prompt pre-opened <think>, but the model also emits a
+    // leading <think> anyway (template/model-card mismatch). The
+    // emitter's strip guard (checked_think_prefix_) must still trip
+    // because we deliberately leave it at its default (false) in the
+    // constructor — otherwise the duplicate opener would leak into
+    // reasoning_text.
+    SseEmitter em(ApiFormat::OPENAI_CHAT, "req-3", "test-model", 10,
+                  json::array(), nullptr,
+                  /*stops=*/{},
+                  StreamMode::REASONING);
+    em.emit_start();
+    em.emit_token("<think>actual reasoning</think>answer");
+    em.emit_finish(3);
+
+    TEST_ASSERT(em.reasoning_text().find("<think>") == std::string::npos);
+    TEST_ASSERT(em.reasoning_text().find("actual reasoning") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("answer") != std::string::npos);
+}
+
+static void test_emitter_initial_mode_reasoning_anthropic_first_block_is_thinking() {
+    // Anthropic format: when starting in REASONING mode, the very first
+    // content_block_start must be `thinking`, not `text`. Otherwise the
+    // emitter would open a text block, then have to stop+restart it as
+    // thinking on the first reasoning delta — wasteful and visible to
+    // SDK clients as a spurious empty text block.
+    SseEmitter em(ApiFormat::ANTHROPIC, "req-4", "test-model", 10,
+                  json::array(), nullptr,
+                  /*stops=*/{},
+                  StreamMode::REASONING);
+    auto start = em.emit_start();
+    std::string all;
+    for (const auto & c : start) all += c;
+    // First content block must be a thinking block. nlohmann::json sorts
+    // keys alphabetically on dump(), so the inner block serializes as
+    // `{"thinking":"","type":"thinking"}` (NOT type-first). Assert on
+    // the unique `"thinking":""` opener which only appears in the
+    // thinking-kind serialization.
+    TEST_ASSERT(all.find("\"thinking\":\"\",\"type\":\"thinking\"")
+                != std::string::npos);
+    // And the initial text-block opener must NOT appear (regression: if
+    // active_kind_ defaulted to "text", emit_start would have emitted
+    // `{"text":"","type":"text"}` here instead).
+    TEST_ASSERT(all.find("\"text\":\"\",\"type\":\"text\"")
+                == std::string::npos);
 }
 
 static void test_normalize_responses_tool_followup_messages() {
@@ -3903,6 +4110,10 @@ int main() {
     RUN_TEST(test_emitter_streaming_openai_has_done);
     RUN_TEST(test_emitter_nonstreaming_accumulates);
     RUN_TEST(test_emitter_anthropic_thinking_blocks);
+    RUN_TEST(test_emitter_initial_mode_reasoning_routes_to_reasoning_content);
+    RUN_TEST(test_emitter_initial_mode_reasoning_unclosed_stays_reasoning);
+    RUN_TEST(test_emitter_initial_mode_reasoning_strips_redundant_think_opener);
+    RUN_TEST(test_emitter_initial_mode_reasoning_anthropic_first_block_is_thinking);
 
     std::fprintf(stderr, "\n── Stop sequences ──\n");
     RUN_TEST(test_stop_sequence_basic);
@@ -3965,6 +4176,14 @@ int main() {
     RUN_TEST(test_jinja_render_bos_eos_threaded);
     RUN_TEST(test_jinja_render_empty_template_throws);
     RUN_TEST(test_jinja_render_bad_tools_json_throws);
+    RUN_TEST(test_chat_template_qwen3_enable_thinking_pre_opens);
+    RUN_TEST(test_chat_template_qwen3_disable_thinking_does_not_pre_open);
+    RUN_TEST(test_chat_template_qwen3_no_gen_prompt_does_not_pre_open);
+    RUN_TEST(test_chat_template_laguna_enable_thinking_pre_opens);
+    RUN_TEST(test_chat_template_laguna_disable_thinking_does_not_pre_open);
+    RUN_TEST(test_chat_template_gemma4_does_not_pre_open);
+    RUN_TEST(test_jinja_render_suffix_sniff_sets_started_in_thinking);
+    RUN_TEST(test_jinja_render_suffix_sniff_negative);
     RUN_TEST(test_normalize_responses_tool_followup_messages);
 
     std::fprintf(stderr, "\n── Placement config ──\n");
