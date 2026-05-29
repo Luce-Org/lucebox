@@ -490,7 +490,12 @@ class TestReasoning:
 
     @pytest.mark.slow
     def test_thinking_enabled_via_chat_template_kwargs(self):
-        """Enabling thinking should produce reasoning_content."""
+        """Enabling thinking must route reasoning into reasoning_content,
+        not leak it into content. Regression guard for the Qwen3.6/Laguna
+        pre-opened-<think> bug: the chat template appends `<think>` to the
+        prompt suffix, so the model emits reasoning directly with no
+        opening tag. If the renderer→emitter wiring drops, reasoning_content
+        stays empty and the raw reasoning text appears in content."""
         r = post_json("/v1/chat/completions", {
             "model": MODEL_NAME,
             "messages": [{"role": "user", "content": "What is 15 * 17?"}],
@@ -500,13 +505,26 @@ class TestReasoning:
         })
         assert r.status_code == 200
         msg = r.json()["choices"][0]["message"]
-        assert msg["content"]
-        # With thinking enabled, model may produce reasoning_content
-        # (not guaranteed for short prompts, so we just check it doesn't crash)
+        reasoning = msg.get("reasoning_content") or ""
+        content = msg.get("content") or ""
+        assert reasoning, (
+            f"reasoning_content empty with enable_thinking=True — "
+            f"renderer→emitter wiring likely broken. content={content[:200]!r}"
+        )
+        assert "<think>" not in reasoning and "</think>" not in reasoning, (
+            f"raw think tags leaked into reasoning_content: {reasoning[:200]!r}"
+        )
+        assert "<think>" not in content and "</think>" not in content, (
+            f"think tags leaked into content channel: {content[:200]!r}"
+        )
+        assert content, "content channel empty — model never closed </think>"
 
     @pytest.mark.slow
     def test_thinking_enabled_via_reasoning_effort(self):
-        """OpenAI Responses-style reasoning.effort field."""
+        """OpenAI Responses-style reasoning.effort=high must also route
+        reasoning to reasoning_content. Same regression class as above
+        but reached through a different request shape (effort→template
+        kwargs translation in http_server.cpp)."""
         r = post_json("/v1/chat/completions", {
             "model": MODEL_NAME,
             "messages": [{"role": "user", "content": "What is 15 * 17?"}],
@@ -516,7 +534,15 @@ class TestReasoning:
         })
         assert r.status_code == 200
         msg = r.json()["choices"][0]["message"]
-        assert msg["content"]
+        reasoning = msg.get("reasoning_content") or ""
+        content = msg.get("content") or ""
+        assert reasoning, (
+            f"reasoning_content empty with reasoning.effort=high — "
+            f"renderer→emitter wiring likely broken. content={content[:200]!r}"
+        )
+        assert "<think>" not in reasoning and "</think>" not in reasoning
+        assert "<think>" not in content and "</think>" not in content
+        assert content
 
 
 # ═══════════════════════════════════════════════════════════════════

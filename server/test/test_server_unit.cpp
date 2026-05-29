@@ -1340,6 +1340,104 @@ static void test_emitter_initial_mode_reasoning_anthropic_first_block_is_thinkin
                 == std::string::npos);
 }
 
+// ─── Integration: render_chat_template → SseEmitter wiring ──────────────
+//
+// The original bug was an integration gap: render_chat_template correctly
+// reported started_in_thinking=true, but no caller routed it into the
+// SseEmitter's initial_mode, so reasoning text leaked into content and
+// reasoning_content stayed empty. Each end of the wire has its own unit
+// tests above; these chain the two ends so a future refactor that drops
+// the propagation cannot pass without an assertion failure here.
+//
+// The body mirrors the production wiring in
+// server/src/server/http_server.cpp (the `started_in_thinking →
+// initial_mode → SseEmitter` chain). Keep these in sync if that wiring
+// moves.
+
+static void test_integration_qwen3_enable_thinking_render_to_emit_routes_to_reasoning() {
+    std::vector<ChatMessage> msgs = {{"user", "What is 2+2?", ""}};
+    auto render = render_chat_template(msgs, ChatFormat::QWEN3,
+                                       /*add_gen=*/true,
+                                       /*enable_thinking=*/true,
+                                       /*tools=*/"");
+    TEST_ASSERT_MSG(render.started_in_thinking,
+        "renderer end of wire: QWEN3 enable_thinking must pre-open <think>");
+
+    const StreamMode initial_mode = render.started_in_thinking
+        ? StreamMode::REASONING : StreamMode::CONTENT;
+    SseEmitter em(ApiFormat::OPENAI_CHAT, "rid-q", "test-model", 10,
+                  json::array(), nullptr, /*stops=*/{}, initial_mode);
+    em.emit_start();
+    em.emit_token("Let me compute. ");
+    em.emit_token("2+2 equals 4.");
+    em.emit_token("</think>\n\nThe answer is 4.");
+    em.emit_finish(5);
+
+    TEST_ASSERT_MSG(!em.reasoning_text().empty(),
+        "wiring broken: reasoning_content empty despite started_in_thinking=true");
+    TEST_ASSERT(em.reasoning_text().find("Let me compute")    != std::string::npos);
+    TEST_ASSERT(em.reasoning_text().find("<think>")           == std::string::npos);
+    TEST_ASSERT(em.reasoning_text().find("</think>")          == std::string::npos);
+    TEST_ASSERT_MSG(em.accumulated_text().find("Let me compute") == std::string::npos,
+        "wiring broken: reasoning text leaked into content channel");
+    TEST_ASSERT(em.accumulated_text().find("The answer is 4") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("<think>")         == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("</think>")        == std::string::npos);
+}
+
+static void test_integration_laguna_enable_thinking_render_to_emit_routes_to_reasoning() {
+    std::vector<ChatMessage> msgs = {{"user", "Solve 7*8.", ""}};
+    auto render = render_chat_template(msgs, ChatFormat::LAGUNA,
+                                       /*add_gen=*/true,
+                                       /*enable_thinking=*/true,
+                                       /*tools=*/"");
+    TEST_ASSERT_MSG(render.started_in_thinking,
+        "renderer end of wire: LAGUNA enable_thinking must pre-open <think>");
+
+    const StreamMode initial_mode = render.started_in_thinking
+        ? StreamMode::REASONING : StreamMode::CONTENT;
+    SseEmitter em(ApiFormat::OPENAI_CHAT, "rid-l", "test-model", 10,
+                  json::array(), nullptr, /*stops=*/{}, initial_mode);
+    em.emit_start();
+    em.emit_token("Working through it: ");
+    em.emit_token("7*8 = 56.");
+    em.emit_token("</think>\n\n56.");
+    em.emit_finish(4);
+
+    TEST_ASSERT_MSG(!em.reasoning_text().empty(),
+        "wiring broken: reasoning_content empty despite started_in_thinking=true");
+    TEST_ASSERT(em.reasoning_text().find("Working through it") != std::string::npos);
+    TEST_ASSERT_MSG(em.accumulated_text().find("Working through it") == std::string::npos,
+        "wiring broken: reasoning text leaked into content channel");
+    TEST_ASSERT(em.accumulated_text().find("56.") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("<think>")  == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("</think>") == std::string::npos);
+}
+
+static void test_integration_qwen3_disable_thinking_render_to_emit_stays_in_content() {
+    // Inverse direction: when enable_thinking=false the renderer must not
+    // pre-open and the emitter must start in CONTENT, so the model's
+    // tokens land in content from the first byte. Guards against the
+    // opposite regression of unconditionally starting in REASONING.
+    std::vector<ChatMessage> msgs = {{"user", "Hi.", ""}};
+    auto render = render_chat_template(msgs, ChatFormat::QWEN3,
+                                       /*add_gen=*/true,
+                                       /*enable_thinking=*/false,
+                                       /*tools=*/"");
+    TEST_ASSERT(!render.started_in_thinking);
+
+    const StreamMode initial_mode = render.started_in_thinking
+        ? StreamMode::REASONING : StreamMode::CONTENT;
+    SseEmitter em(ApiFormat::OPENAI_CHAT, "rid-n", "test-model", 10,
+                  json::array(), nullptr, /*stops=*/{}, initial_mode);
+    em.emit_start();
+    em.emit_token("Hello there.");
+    em.emit_finish(2);
+
+    TEST_ASSERT(em.reasoning_text().empty());
+    TEST_ASSERT(em.accumulated_text().find("Hello there") != std::string::npos);
+}
+
 static void test_normalize_responses_tool_followup_messages() {
     ToolMemory tool_memory;
     const std::string call_id = "call_exec_001";
@@ -2798,6 +2896,9 @@ int main() {
     RUN_TEST(test_chat_template_gemma4_does_not_pre_open);
     RUN_TEST(test_jinja_render_suffix_sniff_sets_started_in_thinking);
     RUN_TEST(test_jinja_render_suffix_sniff_negative);
+    RUN_TEST(test_integration_qwen3_enable_thinking_render_to_emit_routes_to_reasoning);
+    RUN_TEST(test_integration_laguna_enable_thinking_render_to_emit_routes_to_reasoning);
+    RUN_TEST(test_integration_qwen3_disable_thinking_render_to_emit_stays_in_content);
     RUN_TEST(test_normalize_responses_tool_followup_messages);
 
     std::fprintf(stderr, "\n── Placement config ──\n");
