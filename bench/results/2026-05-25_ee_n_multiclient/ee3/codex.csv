@@ -1,0 +1,4 @@
+client,turn,session_id,prompt,keep_before,accept_rate,keep_after,ema,wall_s
+codex,1,bandit-codex-1779633006,decode_check.txt,,,,,17.757
+codex,2,bandit-codex-1779633006,logic_check.txt,,,,,49.196
+codex,3,bandit-codex-1779633006,math_check.txt,,,,,15.212

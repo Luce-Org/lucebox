@@ -293,6 +293,7 @@ static size_t json_array_size(const json & value) {
     return value.is_array() ? value.size() : 0;
 }
 
+<<<<<<< HEAD
 static bool env_flag_enabled(const char * name) {
     const char * raw = std::getenv(name);
     if (!raw || !*raw) return false;
@@ -375,6 +376,32 @@ static std::string build_stall_tool_prefix(const json & tools,
         prefix += "<parameter=" + param + ">\n";
     }
     return prefix;
+}
+// ─── Admission gate ──────────────────────────────────────────────────────
+// Pre-compression sanity guard uses first principles: reject only when even
+// best-case compression cannot fit — (double)raw*keep_ratio + max_output > max_ctx.
+// This is keep-ratio-derived, so it correctly admits large prompts at low
+// keep ratios rather than using a hardcoded 4× multiplier calibrated to 0.25.
+
+bool check_admission(int effective_size, int raw_size,
+                     int max_output, int max_ctx, bool pflash_on,
+                     float pflash_keep_ratio) {
+    if (max_ctx <= 0) return true;  // no limit configured
+    if (pflash_on) {
+        // Pre-compression guard: reject only when even best-case compression
+        // cannot fit. Skip when keep_ratio <= 0 (degenerate config; let the
+        // post-compression gate decide).
+        if (pflash_keep_ratio > 0.0f) {
+            if ((double)raw_size * pflash_keep_ratio + max_output > (double)max_ctx)
+                return false;
+        }
+        // Pre-compression guard passed: admit. The real effective-size gate
+        // runs post-compression (caller passes pflash_on=false after pflash).
+        return true;
+    }
+    // Non-pflash (or post-compression): check effective size directly.
+    return effective_size + max_output <= max_ctx;
+}
 }
 
 // Build the /props response body.
@@ -1366,8 +1393,27 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         return true;  // handled (with error)
     }
 
-    // Check context length.
-    if ((int)req.prompt_tokens.size() + req.max_output > config_.max_ctx) {
+    // Pre-compression admission: reject non-pflash requests that can't fit,
+    // and pflash requests whose raw prompt cannot possibly compress to fit
+    // (first-principles guard: raw*keep_ratio + max_output > max_ctx).
+    // The real post-compression gate runs in worker_loop after pflash runs.
+    const int raw_size = (int)req.prompt_tokens.size();
+    const bool pflash_will_run =
+        config_.max_ctx > 0 &&
+        config_.pflash_mode != ServerConfig::PflashMode::OFF &&
+        drafter_tokenizer_ != nullptr &&
+        (config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
+         raw_size >= config_.pflash_threshold);
+    if (!check_admission(raw_size, raw_size, req.max_output, config_.max_ctx,
+                         /*pflash_on=*/false) && !pflash_will_run) {
+        // Non-pflash path: raw is the effective size, reject immediately.
+        send_error(fd, 400, "prompt + max_tokens exceeds context window");
+        return true;
+    }
+    if (pflash_will_run &&
+        !check_admission(raw_size, raw_size, req.max_output, config_.max_ctx,
+                         /*pflash_on=*/true, config_.pflash_keep_ratio)) {
+        // Pre-compression guard: best-case compression still can't fit.
         send_error(fd, 400, "prompt + max_tokens exceeds context window");
         return true;
     }
@@ -1675,6 +1721,20 @@ void HttpServer::worker_loop() {
                              req.response_id, upstream_model);
             }
             finish_job();
+            continue;
+        }
+
+        // Effective-size admission gate: check post-compression prompt fits max_ctx.
+        // For non-pflash requests this was already checked in handle_client;
+        // for pflash requests the raw guard passed but the effective size may
+        // still be too large (unlikely but possible if compression ratio is poor).
+        // Use pflash_on=false here so the function directly checks effective size
+        // (pflash_on=true only runs the pre-compression guard, not useful here).
+        if (!check_admission((int)effective_prompt.size(), (int)req.prompt_tokens.size(),
+                             req.max_output, config_.max_ctx,
+                             /*pflash_on=*/false,
+                             config_.pflash_keep_ratio)) {
+            fail_request(400, "prompt + max_tokens exceeds context window");
             continue;
         }
 
