@@ -6,9 +6,11 @@ Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
 Last refresh: 2026-05-29T00:03:17-04:00
 Current base: `origin/main` `8782d07a`
-Current integration tip before this refresh: `easel/auto-integration` `7dc1f502`
+Current integration tip before this refresh: `easel/auto-integration` `e5e88938`
 Refreshed stack merge commit prepared in this run: none; stack already current
 Final manifest commit prepared after stack/probe refresh: this commit
+
+Note: preflight initially observed `easel/auto-integration` at `7dc1f502`; an overlapping manifest-only refresh advanced it to `e5e88938` before this commit was created. This run was committed on top of `e5e88938`.
 
 This branch is maintained as a reproducible patch stack over `origin/main`. At
 this run's start the upstream base and writable integration branch were already
@@ -106,7 +108,7 @@ Agent reports/logs retained:
 
 ## Notes
 
-This run produced a manifest-only refresh on top of `7dc1f502`; no source stack
+This run produced a manifest-only refresh on top of `e5e88938`; no source stack
 rewrite was needed because `origin/main`, `easel/auto-integration`, and all
 carried mergeable non-draft PR heads were already current. The next useful work
 remains a human-reviewed selective port of #237's MTP foundation into the current
