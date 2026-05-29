@@ -4,10 +4,10 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-29T01:28:45-04:00
+Last refresh: 2026-05-29T01:31:02-04:00
 Current base: `origin/main` `8782d07a`
-Current integration tip before this refresh: `easel/auto-integration` `d318694b`; intermediate manifest-only push `f167e85d`
-Refreshed stack merge commit prepared in this run: PR #285 was resolved and merged after it changed from draft to open during final re-enumeration
+Current integration tip before this refresh: `easel/auto-integration` `d318694b`; intermediate manifest-only push `f167e85d`; PR #285 merge push `bf5ada61`
+Refreshed stack merge commit prepared in this run: PR #285 was resolved and merged after it changed from draft to open during final re-enumeration; final follow-up ignores the generated `.docker-build/` scratch directory surfaced by the fast-forwarded checkout
 Final manifest commit prepared after stack/probe refresh: this commit
 
 This branch is maintained as a reproducible patch stack over `origin/main`.
@@ -44,7 +44,7 @@ or were re-probed as selective-port/superseded conflicts.
 
 This run performed:
 
-- `date -Is` -> 2026-05-29T01:18:51-04:00 for preflight and 2026-05-29T01:28:45-04:00 for the final manifest refresh timestamp.
+- `date -Is` -> 2026-05-29T01:18:51-04:00 for preflight and 2026-05-29T01:31:02-04:00 for the final manifest refresh timestamp.
 - Primary checkout preflight: `git status --short` was clean; branch was `auto-integration`; remotes were `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
 - Auth/tooling checks with real user credentials succeeded: `gh auth status`, `claude auth status --text`, and a harmless `codex --version` smoke check.
 - `git fetch --prune origin` and `git fetch --prune easel` completed successfully.
@@ -57,7 +57,8 @@ This run performed:
 - Fresh delegation for #237: Claude Code ran in tmux session `luce237-luce-auto-cron-20260529-011930-claude` and exited with `Error: Reached max turns (8)` without a usable report; Codex then ran in tmux session `luce237-luce-auto-cron-20260529-011930-codex` and produced `/tmp/luce237-luce-auto-cron-20260529-011930-codex-report.txt`. Codex confirmed direct merge is unsafe and a selective current-layout MTP foundation port is required.
 - PR #285 changed from draft to open after the first manifest-only push. Probe worktree `/tmp/luce-auto-cron-20260529-011930/pr-285-probe` resolved the refreshed Docker/lucebox/luce-bench stack by taking the PR head for conflicted feature files and preserving `<algorithm>` in `server/src/server/server_main.cpp` for the existing auto-integration stack.
 - PR #285 validation in the resolved worktree: `git diff --check` passed; `python3 -m compileall -q lucebox/src lucebox/tests luce-bench/src luce-bench/tests harness/src` passed; plain `python3 -m pytest ...` and `uv run python -m pytest ...` could not run because pytest was not installed in those environments; `uv run --with pytest python -m pytest lucebox/tests luce-bench/tests/test_report.py luce-bench/tests/test_smoke_area.py luce-bench/tests/test_runner.py -q` passed with `151 passed in 14.41s`.
-- `git diff --check -- docs/auto-integration.md` passed after this manifest update.
+- After fast-forwarding the primary checkout, the already-present generated `.docker-build/` scratch directory surfaced as untracked because PR #285's `.gitignore` no longer ignored it. The final follow-up commit adds `.docker-build/` back to `.gitignore` without deleting any local files.
+- `git diff --check -- .gitignore docs/auto-integration.md` passed after the final manifest update.
 
 ## Pending / blocked-needs-human / selective-port candidates
 

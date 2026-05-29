@@ -83,6 +83,7 @@ health
 # lucebox host-side generated config + benchmark output
 .lucebox/
 models/.lucebox/
+.docker-build/
 
 # Claude Code session state (worktrees, agent scratchpads)
 .claude/
