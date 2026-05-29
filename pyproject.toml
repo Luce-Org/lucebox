@@ -8,13 +8,37 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "Lucebox" }]
 
 dependencies = [
+    "lucebox",
     "lucebox-dflash",
+    "luce-bench",
+    "harness",
     "pflash",
 ]
 
 [project.optional-dependencies]
 megakernel = ["qwen35-megakernel-bf16"]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "mypy>=1.10,<2", "ruff>=0.14,<1"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+# Staged lint adoption for the Python surfaces touched by the Docker,
+# benchmark, autotune, and host-CLI stack. Untouched server-adjacent scripts and
+# vendored dependencies stay outside this gate until they are cleaned up.
+include = [
+    "dflash/scripts/prefix_cache.py",
+    "dflash/scripts/test_server.py",
+    "dflash/scripts/tool_memory.py",
+    "lucebox/**/*.py",
+]
+extend-exclude = [
+    "dflash/deps",
+    "megakernel",
+    "pflash",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
 
 [tool.uv]
 package = false
@@ -31,13 +55,24 @@ package = false
 no-build-isolation-package = ["qwen35-megakernel-bf16"]
 
 [tool.uv.workspace]
-members = ["server", "optimizations/megakernel", "optimizations/pflash"]
+members = ["server", "lucebox", "luce-bench", "harness", "optimizations/megakernel", "optimizations/pflash"]
 
 [tool.uv.sources]
+lucebox = { workspace = true }
 lucebox-dflash = { workspace = true }
 pflash = { workspace = true }
 qwen35-megakernel-bf16 = { workspace = true }
 torch = { index = "pytorch-cu128" }
+# luce-bench lives in-tree under `luce-bench/`. It is published to PyPI
+# from this monorepo via `.github/workflows/release-luce-bench.yml`,
+# triggered on tag pushes matching `luce-bench-v*`. The standalone
+# repo at github.com/easel/luce-bench is archived and read-only.
+luce-bench = { workspace = true }
+# harness wraps "run a client against a Lucebox server" — both for the
+# client-compat sweep (harness/clients/*.sh + harness/client_test_runner.py)
+# and for `lucebox <client>` subcommands that exec real clients (claude,
+# codex, opencode, etc.) against a running Lucebox.
+harness = { workspace = true }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

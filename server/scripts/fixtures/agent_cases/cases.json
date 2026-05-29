@@ -1,0 +1,30 @@
+{
+  "schema": "lucebox-bench-cases-v1",
+  "source": "Agent-style probes: real codex agent system prompt + coding-task user message. Tests whether the model produces agent-shaped output (tool calls, code blocks, apply_patch envelopes) given a realistic coding-agent context. Complement to --area forge (which exercises tool-calling reliability with mocked scenarios).",
+  "cases": [
+    {
+      "id": "codex-mini-read-task",
+      "kind": "agent-prompt",
+      "system_prompt_file": "codex_gpt5_codex.md",
+      "user_message": "Read the file dflash/src/server/http_server.cpp and summarize what it does in 2-3 sentences. Don't actually open the file — describe what tool you would use and what arguments."
+    },
+    {
+      "id": "codex-mini-apply-patch",
+      "kind": "agent-prompt",
+      "system_prompt_file": "codex_gpt52_codex.md",
+      "user_message": "The function `qwen35_decode` in dflash/src/qwen35/qwen35_backend.cpp has a bug on the force-close path: it doesn't reset `budget_close_started` between requests. Show me the apply_patch envelope to fix it."
+    },
+    {
+      "id": "codex-large-explore",
+      "kind": "agent-prompt",
+      "system_prompt_file": "codex_apply_patch.md",
+      "user_message": "Which files in this repository handle authentication? List the steps you would take to find them."
+    },
+    {
+      "id": "codex-medium-test",
+      "kind": "agent-prompt",
+      "system_prompt_file": "codex_gpt52.md",
+      "user_message": "Write a unit test for a function `parse_thinking_budget(s: str) -> int` that returns the integer budget from strings like 'high', 'low', '4096'. Use pytest. Use apply_patch to add the test file."
+    }
+  ]
+}

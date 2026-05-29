@@ -1,0 +1,61 @@
+# lefthook.yml — git hook config for the lucebox-hub monorepo.
+#
+# Install once per checkout:
+#
+#     # Option A: standalone binary (recommended)
+#     curl -sSfL https://raw.githubusercontent.com/evilmartians/lefthook/master/install.sh | sh
+#     lefthook install
+#
+#     # Option B: via npm
+#     npm install -g lefthook && lefthook install
+#
+# After `lefthook install`, git's hook dir is wired so the pre-commit
+# block below fires on every `git commit`. Skip a one-off with
+# `LEFTHOOK=0 git commit ...`.
+#
+# What we enforce here is the same surface CI does — keeping commits
+# from breaking the bash scripts that ship with the image. The goal is
+# specifically to prevent another `unbound variable` regression like the
+# DRAFT_FAMILY_GLOB / LUCEBOX_HOST_HAS_SYSTEMD ones from landing.
+
+pre-commit:
+  parallel: true
+  commands:
+    shellcheck:
+      # Run shellcheck on every staged *.sh file with the same
+      # `--severity=error` gate the CI test runner uses
+      # (scripts/test_lucebox_sh.sh). Warning-level findings are
+      # informational; errors fail the commit.
+      #
+      # `--external-sources` lets shellcheck follow `source` directives
+      # — needed for harness/clients/common.sh consumers. The submodule
+      # excludes keep us from scanning vendored llama.cpp / Block-Sparse-Attention
+      # / cutlass scripts on every commit.
+      glob: "*.sh"
+      exclude:
+        - "server/deps/**"
+        - "optimizations/megakernel/deps/**"
+      run: shellcheck --severity=error --external-sources {staged_files}
+
+    bash-parse:
+      # `bash -n` catches syntax errors that shellcheck can miss when
+      # configured to error-only. Cheap second pass — runs in parallel.
+      glob: "*.sh"
+      exclude:
+        - "server/deps/**"
+        - "optimizations/megakernel/deps/**"
+      run: |
+        rc=0
+        for f in {staged_files}; do
+          bash -n "$f" || rc=1
+        done
+        exit "$rc"
+
+# pre-push runs the full bash smoke test — more thorough, slower than
+# pre-commit. Covers every subcommand dispatch under `set -u` plus the
+# entrypoint's draft-resolution branches. Skip with `LEFTHOOK=0 git push`
+# if you really need to push without local validation (CI still catches it).
+pre-push:
+  commands:
+    bash-smoke:
+      run: bash scripts/test_lucebox_sh.sh

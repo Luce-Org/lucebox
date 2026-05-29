@@ -22,15 +22,19 @@
 
 #include "gguf.h"
 
+#include <nlohmann/json.hpp>
+
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
 
 using namespace dflash::common;
+using nlohmann::json;
 
 // Global server pointer for signal handling.
 static HttpServer * g_server = nullptr;
@@ -39,6 +43,87 @@ static void signal_handler(int sig) {
     (void)sig;
     if (g_server) {
         g_server->request_stop();
+    }
+}
+
+// Render a GgufMetadata as the JSON object surfaced under
+// /props.model.target / /props.model.draft (schema 3+). Header keys that
+// the file didn't carry come through as JSON null so consumers can tell
+// "no key in GGUF" from "0" — important for context_length / vocab_size
+// where 0 is implausible but missing is common on hand-edited drafters.
+static json gguf_metadata_to_json(const GgufMetadata & m) {
+    auto str_or_null = [](const std::string & s) -> json {
+        return s.empty() ? json(nullptr) : json(s);
+    };
+    auto i32_or_null = [](int32_t v) -> json {
+        return v < 0 ? json(nullptr) : json(v);
+    };
+    json gguf = {
+        {"general.architecture",         str_or_null(m.general_architecture)},
+        {"general.name",                 str_or_null(m.general_name)},
+        {"general.file_type",            i32_or_null(m.file_type)},
+        {"general.file_type_name",       str_or_null(m.file_type_name)},
+        {"general.quantization_version", i32_or_null(m.quantization_version)},
+        {"block_count",                  i32_or_null(m.block_count)},
+        {"embedding_length",             i32_or_null(m.embedding_length)},
+        {"context_length",               i32_or_null(m.context_length)},
+        {"vocab_size",                   i32_or_null(m.vocab_size)},
+    };
+    return {
+        {"path",       m.path},
+        {"size_bytes", m.size_bytes < 0 ? json(nullptr) : json(m.size_bytes)},
+        {"sha256",     str_or_null(m.sha256)},
+        {"gguf",       gguf},
+    };
+}
+
+// Read /opt/lucebox-hub/IMAGE_INFO (three lines: git_sha, image_tag,
+// build_time) into a JSON object surfaced under /props.build. Returns
+// JSON null when the file is missing or unreadable — the normal case
+// for bare-metal dev builds. Path override via $DFLASH_IMAGE_INFO_PATH
+// (set by tests to point at a fixture).
+static json read_image_info() {
+    const char * env_path = std::getenv("DFLASH_IMAGE_INFO_PATH");
+    const std::string path = (env_path && *env_path)
+        ? std::string(env_path)
+        : std::string("/opt/lucebox-hub/IMAGE_INFO");
+    std::ifstream f(path);
+    if (!f) return nullptr;
+    std::string git_sha, image_tag, build_time;
+    std::getline(f, git_sha);
+    std::getline(f, image_tag);
+    std::getline(f, build_time);
+    // If all three are empty (file existed but was blank), treat as missing
+    // so /props doesn't carry a useless `{git_sha: "", ...}` blob.
+    if (git_sha.empty() && image_tag.empty() && build_time.empty()) {
+        return nullptr;
+    }
+    json out = json::object();
+    if (!git_sha.empty())    out["git_sha"]    = git_sha;
+    if (!image_tag.empty())  out["image_tag"]  = image_tag;
+    if (!build_time.empty()) out["build_time"] = build_time;
+    return out;
+}
+
+// Read /opt/lucebox-hub/HOST_INFO (JSON written by server/scripts/
+// entrypoint.sh from the LUCEBOX_HOST_* env vars the host wrapper
+// exports) into a JSON object surfaced verbatim under /props.host.
+// Returns JSON null on missing file or parse error so /props.host
+// becomes literal null rather than crashing the handler. Path override
+// via $DFLASH_HOST_INFO_PATH for unit tests.
+static json read_host_info() {
+    const char * env_path = std::getenv("DFLASH_HOST_INFO_PATH");
+    const std::string path = (env_path && *env_path)
+        ? std::string(env_path)
+        : std::string("/opt/lucebox-hub/HOST_INFO");
+    std::ifstream f(path);
+    if (!f) return nullptr;
+    try {
+        json out = json::parse(f);
+        if (!out.is_object()) return nullptr;
+        return out;
+    } catch (const json::parse_error &) {
+        return nullptr;
     }
 }
 
@@ -829,6 +914,80 @@ int main(int argc, char ** argv) {
     // Tokenizer ID: best-effort. The Tokenizer class doesn't currently
     // expose the GGUF metadata key it was loaded from, so leave empty
     // and let /props report null. (Add a getter on Tokenizer later.)
+
+    // ── /props identity payloads ────────────────────────────────────────
+    //
+    // Target + draft GGUF identity for /props.model.target / .draft. The
+    // hash is the slow part (~30s per multi-GB file on NVMe); the GGUF
+    // header read is cheap. Cached in a sidecar `<path>.sha256` so
+    // subsequent restarts skip the rehash.
+    //
+    // `DFLASH_SKIP_SHA256=1` env disables hashing entirely — useful when
+    // benchmarking server cold-start latency or when the model dir is
+    // read-only (no place to write the sidecar). Leaves `sha256` as JSON
+    // null in /props; the other identity fields still populate.
+    const bool skip_sha = []() {
+        const char * v = std::getenv("DFLASH_SKIP_SHA256");
+        return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    if (bargs.model_path && *bargs.model_path) {
+        std::fprintf(stderr,
+            "[server] inspecting target GGUF for /props%s\n",
+            skip_sha ? " (sha256 disabled by $DFLASH_SKIP_SHA256)" : "");
+        GgufMetadata tm = read_gguf_metadata(bargs.model_path, !skip_sha);
+        if (tm.ok) {
+            sconfig.target_gguf = gguf_metadata_to_json(tm);
+            std::fprintf(stderr,
+                "[server] target gguf: %s size=%lld sha=%s%s ftype=%s\n",
+                tm.path.c_str(), (long long)tm.size_bytes,
+                tm.sha256.empty() ? "(skipped)" : tm.sha256.substr(0, 12).c_str(),
+                tm.sha256.empty() ? "" : "...",
+                tm.file_type_name.empty() ? "?" : tm.file_type_name.c_str());
+        } else {
+            std::fprintf(stderr,
+                "[server] WARNING: could not read target GGUF metadata: %s\n",
+                bargs.model_path);
+        }
+    }
+    if (bargs.draft_path && *bargs.draft_path) {
+        std::fprintf(stderr,
+            "[server] inspecting draft GGUF for /props%s\n",
+            skip_sha ? " (sha256 disabled by $DFLASH_SKIP_SHA256)" : "");
+        GgufMetadata dm = read_gguf_metadata(bargs.draft_path, !skip_sha);
+        if (dm.ok) {
+            sconfig.draft_gguf = gguf_metadata_to_json(dm);
+            std::fprintf(stderr,
+                "[server] draft gguf: %s size=%lld sha=%s%s ftype=%s\n",
+                dm.path.c_str(), (long long)dm.size_bytes,
+                dm.sha256.empty() ? "(skipped)" : dm.sha256.substr(0, 12).c_str(),
+                dm.sha256.empty() ? "" : "...",
+                dm.file_type_name.empty() ? "?" : dm.file_type_name.c_str());
+        } else {
+            std::fprintf(stderr,
+                "[server] WARNING: could not read draft GGUF metadata: %s\n",
+                bargs.draft_path);
+        }
+    }
+    // Container/image identity (Dockerfile bakes /opt/lucebox-hub/IMAGE_INFO).
+    sconfig.image_info = read_image_info();
+    if (!sconfig.image_info.is_null()) {
+        std::fprintf(stderr,
+            "[server] image_info: git_sha=%s image_tag=%s build_time=%s\n",
+            sconfig.image_info.value("git_sha",    "(none)").c_str(),
+            sconfig.image_info.value("image_tag",  "(none)").c_str(),
+            sconfig.image_info.value("build_time", "(none)").c_str());
+    }
+    // Host identity (entrypoint.sh writes /opt/lucebox-hub/HOST_INFO from
+    // LUCEBOX_HOST_*). Surfaced verbatim under /props.host (schema 4+).
+    // Null on bare-metal dev builds that bypass the container entrypoint.
+    sconfig.host_info = read_host_info();
+    if (!sconfig.host_info.is_null()) {
+        std::fprintf(stderr,
+            "[server] host_info: source=%s os=%s kernel=%s\n",
+            sconfig.host_info.value("source",    "(none)").c_str(),
+            sconfig.host_info.value("os_pretty", "(none)").c_str(),
+            sconfig.host_info.value("kernel",    "(none)").c_str());
+    }
 
     // Resolve the Level 2 force-close sequence. Two concepts, both sourced
     // from the model card sidecar (see model_card.h for semantics):

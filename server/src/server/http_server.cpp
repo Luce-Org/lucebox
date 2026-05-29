@@ -28,12 +28,31 @@ namespace dflash::common {
 //
 // SERVER_NAME / SERVER_VERSION mirror the Python server's identity strings
 // so cross-server consumers (autotune, dashboards) see a stable
-// `build_info` shape. Bump PROPS_SCHEMA on breaking changes only:
-//   - field renamed
-//   - field removed
-//   - existing field's semantics change (units, nullability, type)
-// Do NOT bump for additive changes (new fields, new sections).
-static constexpr int  kPropsSchema  = 2;
+// `build_info` shape. Bump PROPS_SCHEMA when the response shape changes
+// — either:
+//   - breaking: field renamed, removed, or its semantics changed
+//     (units, nullability, type tightening)
+//   - additive (new fields / sections) when downstream consumers need
+//     to negotiate the new shape. Pre-bump consumers keep working
+//     because they ignore unknown fields; the bump signals "the new
+//     fields are guaranteed-present at this version or higher" so
+//     code like lucebench's preflight can opt in to the richer display.
+//
+// Schema 3 (additive vs 2): new top-level `build` block (structured
+// version of `build_info` with git_sha/image_tag/build_time), and new
+// `model.target` / `model.draft` GGUF-identity sub-objects carrying
+// size_bytes + sha256 + gguf header fields. The pre-3 top-level
+// `build_info`, `model_path`, `model_alias`, and `model.draft_path`
+// are preserved verbatim for back-compat.
+//
+// Schema 4 (additive vs 3): new top-level `host` block — verbatim
+// pass-through of /opt/lucebox-hub/HOST_INFO (written by
+// server/scripts/entrypoint.sh from the LUCEBOX_HOST_* env the host
+// wrapper probes). Null when HOST_INFO is missing (bare-metal dev or
+// manual docker run that bypasses entrypoint). luce-bench's snapshot
+// subcommand uses the version bump to gate on the new shape — pre-4
+// servers force a client-side fallback probe.
+static constexpr int  kPropsSchema  = 4;
 static constexpr char kServerName[] = "luce-dflash";
 #ifndef DFLASH_SERVER_VERSION
 #define DFLASH_SERVER_VERSION "0.0.0+cpp"
@@ -123,6 +142,34 @@ json build_props_body(const ServerConfig & config,
         {"props_schema", kPropsSchema},
     };
 
+    // Structured replacement for the single-string `build_info` (schema 3+).
+    // Reads image identity stashed by server_main from /opt/lucebox-hub/
+    // IMAGE_INFO when the binary is running inside a Docker image built by
+    // docker-bake.hcl. On bare-metal / dev builds, image_info is null and
+    // the three image_* fields stay null; git_sha / image_tag / build_time
+    // are always present as keys for shape stability.
+    auto pull_string = [&](const char * field) -> json {
+        if (!config.image_info.is_object()) return nullptr;
+        auto it = config.image_info.find(field);
+        if (it == config.image_info.end()) return nullptr;
+        if (!it->is_string()) return nullptr;
+        const std::string & s = it->get_ref<const std::string &>();
+        if (s.empty()) return nullptr;
+        return s;
+    };
+    json build_block = {
+        {"server_name",    kServerName},
+        {"server_version", DFLASH_SERVER_VERSION},
+        {"props_schema",   kPropsSchema},
+        {"git_sha",        pull_string("git_sha")},
+        {"image_tag",      pull_string("image_tag")},
+        // image_digest is set externally (image is content-addressable only
+        // after push; the running container would need to query its own
+        // image via the Docker socket, which we don't do today). Reserved.
+        {"image_digest",   nullptr},
+        {"build_time",     pull_string("build_time")},
+    };
+
     json pflash;
     if (!pflash_enabled) {
         pflash = {
@@ -184,12 +231,29 @@ json build_props_body(const ServerConfig & config,
         {"model_path",  config.model_path},
         {"build_info",  std::string(kServerName) + " v" DFLASH_SERVER_VERSION
                         " props_schema=" + std::to_string(kPropsSchema)},
+        {"build",       build_block},
         {"speculative_mode", speculative_mode},
         {"server", server},
         {"model", {
             {"arch",         config.arch},
+            // `alias` mirrors top-level `model_alias` for grouping under
+            // `model`. The top-level field stays for back-compat (clients
+            // already grep for `model_alias`); new consumers should prefer
+            // `model.alias` since that's where all the model identity
+            // (arch, target, draft, tokenizer_id) lives.
+            {"alias",        config.model_name},
+            // Back-compat: pre-schema-3 readers grep `model.draft_path`
+            // directly. New shape exposes the same path under
+            // `model.draft.path` along with size/sha256/header fields.
             {"draft_path",   config.draft_path.empty() ? json(nullptr) : json(config.draft_path)},
             {"tokenizer_id", config.tokenizer_id.empty() ? json(nullptr) : json(config.tokenizer_id)},
+            // Schema 3 additions. Always emitted; `target` is null if the
+            // GGUF couldn't be inspected at startup (rare — implies a load
+            // failure that should have aborted boot). `draft` is null when
+            // no draft GGUF is loaded (`--draft` not passed), which is the
+            // normal target-only configuration for laguna / qwen3.6-moe.
+            {"target", config.target_gguf.is_null() ? json(nullptr) : config.target_gguf},
+            {"draft",  config.draft_gguf.is_null()  ? json(nullptr) : config.draft_gguf},
         }},
         {"runtime", {
             {"backend",         config.runtime_backend.empty() ? "cuda" : config.runtime_backend},
@@ -275,6 +339,13 @@ json build_props_body(const ServerConfig & config,
         // The C++ daemon is linked in-process; if /props is responding,
         // the daemon is alive by construction.
         {"daemon", {{"alive", true}}},
+        // Host identity (schema 4+). Verbatim pass-through of
+        // /opt/lucebox-hub/HOST_INFO — see server_main::read_host_info
+        // and entrypoint.sh::write_host_info. Null when HOST_INFO is
+        // missing or malformed; null is the explicit "bare metal dev"
+        // signal that luce-bench's snapshot uses to trigger a
+        // client-side fallback probe.
+        {"host", config.host_info.is_null() ? json(nullptr) : config.host_info},
         {"api", {{"endpoints", kApiEndpoints}}},
         // Capability flags surfaced for clients that don't want to crack
         // open `reasoning` / `speculative` / etc. — matches the Python

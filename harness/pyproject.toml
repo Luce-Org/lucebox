@@ -1,0 +1,31 @@
+[project]
+name = "harness"
+version = "0.1.0"
+description = "Client launchers, server-profile sweeps, and bench orchestration for Lucebox."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [{ name = "Lucebox" }]
+
+# luce-bench is the only declared dep — and via luce-bench's own
+# dependencies, anthropic + stdlib come along for the ride.
+dependencies = [
+    "luce-bench",
+]
+
+[project.optional-dependencies]
+# Kept as an empty alias for backward compatibility — luce-bench[forge]
+# is itself a back-compat no-op as of luce-bench v0.2.6.
+forge = []
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+harness-run-bench = "harness.bench:main"
+harness-claude-code = "harness.clients.claude_code:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/harness"]

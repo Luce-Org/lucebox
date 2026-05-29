@@ -2272,8 +2272,11 @@ static void test_props_budget_envelope_shape() {
     TEST_ASSERT(body["model_card"]["max_tokens"].get<int>() == 32768);
     TEST_ASSERT(be["default_max_tokens"].get<int>() == 16000);
 
-    // Sanity: props_schema bumped to 2 (breaking change).
-    TEST_ASSERT(body["server"]["props_schema"].get<int>() == 2);
+    // Sanity: props_schema bumped to 4 (schema 4 added the top-level
+    // `host` block over schema 3; schema 3 over 2 added `build` and
+    // `model.target`/`model.draft`. All additive but the bump
+    // propagates so consumers can negotiate.)
+    TEST_ASSERT(body["server"]["props_schema"].get<int>() == 4);
 }
 
 // ─── /props.runtime captures full config (§4.16) ──────────────────────
@@ -2318,6 +2321,257 @@ static void test_props_runtime_shape() {
     cfg.draft_device.clear();
     body = build_props_body(cfg, pc, tm);
     TEST_ASSERT(body["runtime"]["draft_device"].is_null());
+}
+
+// ─── /props.build block (schema 3) ────────────────────────────────────
+// The new structured replacement for the single-string `build_info`.
+// Always emitted; image_* fields are null when the binary isn't running
+// in a Docker image (no /opt/lucebox-hub/IMAGE_INFO baked in).
+static void test_props_build_block_shape_no_image_info() {
+    ServerConfig cfg = make_props_config_with_sidecar(json{
+        {"name", "Qwen3.6 27B"},
+        {"source", "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens", 32768},
+    });
+    // image_info default = null → image_* fields stay null.
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body.contains("build"));
+    const json & b = body["build"];
+    // Stable identity always populated.
+    TEST_ASSERT(b["server_name"].get<std::string>() == "luce-dflash");
+    TEST_ASSERT(b["server_version"].is_string());
+    TEST_ASSERT(b["props_schema"].get<int>() == 4);
+    // Image-baked fields null in the no-IMAGE_INFO case.
+    TEST_ASSERT(b["git_sha"].is_null());
+    TEST_ASSERT(b["image_tag"].is_null());
+    TEST_ASSERT(b["image_digest"].is_null());
+    TEST_ASSERT(b["build_time"].is_null());
+
+    // Legacy build_info still present for back-compat readers.
+    TEST_ASSERT(body.contains("build_info"));
+    TEST_ASSERT(body["build_info"].get<std::string>().find("props_schema=4")
+                != std::string::npos);
+}
+
+// ─── /props.host (schema 4) ───────────────────────────────────────────
+// Verbatim pass-through of the JSON written by entrypoint.sh to
+// /opt/lucebox-hub/HOST_INFO. Surfaces /props.host so luce-bench's
+// snapshot subcommand can capture the rig identity alongside the run.
+// `null` when ServerConfig.host_info was not populated (bare-metal
+// dev builds that bypass the container entrypoint).
+static void test_props_host_block_present_when_populated() {
+    ServerConfig cfg = make_props_config_with_sidecar(json{
+        {"name", "Qwen3.6 27B"},
+        {"source", "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens", 32768},
+    });
+    cfg.host_info = json::object({
+        {"os_pretty",          "Ubuntu 22.04.3 LTS"},
+        {"kernel",             "6.6.87.2-microsoft-standard-WSL2"},
+        {"wsl_version",        "wsl2"},
+        {"docker_version",     "29.1.3"},
+        {"nvidia_driver",      "596.36"},
+        {"nvidia_ctk_version", "1.16.2"},
+        {"cpu_model",          "Intel(R) Core(TM) Ultra 9 275HX"},
+        {"nproc",              24},
+        {"ram_gb",             64},
+        {"gpus", json::array({
+            json::object({
+                {"index",         0},
+                {"uuid",          "GPU-abc"},
+                {"pci_bus_id",    "00000000:01:00.0"},
+                {"name",          "NVIDIA GeForce RTX 5090 Laptop GPU"},
+                {"sm",            "12.0"},
+                {"vram_gb",       24},
+                {"power_limit_w", 175},
+            }),
+        })},
+        {"cuda_visible_devices", "0"},
+        {"source",               "lucebox.sh"},
+        {"collector",            "lucebox.sh"},
+        {"collected_at",         "2026-05-28T20:31:42Z"},
+    });
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body.contains("host"));
+    TEST_ASSERT(!body["host"].is_null());
+    const json & h = body["host"];
+    TEST_ASSERT(h["os_pretty"].get<std::string>()    == "Ubuntu 22.04.3 LTS");
+    TEST_ASSERT(h["wsl_version"].get<std::string>()  == "wsl2");
+    TEST_ASSERT(h["nvidia_ctk_version"].get<std::string>() == "1.16.2");
+    TEST_ASSERT(h["source"].get<std::string>()       == "lucebox.sh");
+    TEST_ASSERT(h["gpus"].is_array());
+    TEST_ASSERT(h["gpus"].size() == 1);
+    TEST_ASSERT(h["gpus"][0]["name"].get<std::string>()
+                == "NVIDIA GeForce RTX 5090 Laptop GPU");
+    TEST_ASSERT(h["gpus"][0]["vram_gb"].get<int>()   == 24);
+}
+
+static void test_props_host_block_null_when_missing() {
+    // ServerConfig.host_info default = null → /props.host emits JSON null.
+    ServerConfig cfg = make_props_config_with_sidecar(json{
+        {"name", "Qwen3.6 27B"},
+        {"source", "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens", 32768},
+    });
+    // cfg.host_info stays at its default nullptr.
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body.contains("host"));
+    TEST_ASSERT(body["host"].is_null());
+    // /props.server.props_schema reflects the schema-4 bump regardless.
+    TEST_ASSERT(body["server"]["props_schema"].get<int>() == 4);
+}
+
+static void test_props_build_block_with_image_info() {
+    ServerConfig cfg = make_props_config_with_sidecar(json{
+        {"name", "Qwen3.6 27B"},
+        {"source", "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens", 32768},
+    });
+    cfg.image_info = json::object({
+        {"git_sha",    "6d12378"},
+        {"image_tag",  "sha-6d12378-cuda12"},
+        {"build_time", "2026-05-28T13:43:57Z"},
+    });
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    const json & b = body["build"];
+    TEST_ASSERT(b["git_sha"].get<std::string>()    == "6d12378");
+    TEST_ASSERT(b["image_tag"].get<std::string>()  == "sha-6d12378-cuda12");
+    TEST_ASSERT(b["build_time"].get<std::string>() == "2026-05-28T13:43:57Z");
+    // image_digest is reserved for external population; still null.
+    TEST_ASSERT(b["image_digest"].is_null());
+}
+
+// ─── /props.model.target + /props.model.draft (schema 3) ──────────────
+// Verbatim GGUF identity surfaced under model.target / model.draft.
+// `draft` is null when no draft GGUF is loaded; the legacy
+// `model.draft_path` string stays alongside for back-compat readers.
+static void test_props_model_target_draft_shape() {
+    ServerConfig cfg = make_props_config_with_sidecar(json{
+        {"name", "Qwen3.6 27B"},
+        {"source", "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens", 32768},
+    });
+    cfg.draft_path = "/opt/models/dflash-draft-3.6-q4_k_m.gguf";
+    cfg.target_gguf = json::object({
+        {"path",       "/opt/models/Qwen3.6-27B-Q4_K_M.gguf"},
+        {"size_bytes", int64_t(17134510080)},
+        {"sha256",     "abc123def456" + std::string(52, '0')},
+        {"gguf", {
+            {"general.architecture",         "qwen35"},
+            {"general.name",                 "Qwen3.6-27B"},
+            {"general.file_type",            15},
+            {"general.file_type_name",       "Q4_K_M"},
+            {"general.quantization_version", 2},
+            {"block_count",                  64},
+            {"embedding_length",             5120},
+            {"context_length",               65536},
+            {"vocab_size",                   152064},
+        }},
+    });
+    cfg.draft_gguf = json::object({
+        {"path",       "/opt/models/dflash-draft-3.6-q4_k_m.gguf"},
+        {"size_bytes", int64_t(425000000)},
+        {"sha256",     "deadbeef" + std::string(56, '0')},
+        {"gguf", {
+            {"general.architecture",         "qwen3"},
+            {"general.name",                 "Qwen3-0.6B-DFlash-draft"},
+            {"general.file_type",            15},
+            {"general.file_type_name",       "Q4_K_M"},
+            {"general.quantization_version", 2},
+            {"block_count",                  28},
+            {"embedding_length",             1024},
+            {"context_length",               32768},
+            {"vocab_size",                   152064},
+        }},
+    });
+
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    const json & m = body["model"];
+
+    // arch + back-compat fields preserved.
+    TEST_ASSERT(m["arch"].get<std::string>() == "qwen35");
+    TEST_ASSERT(m["alias"].get<std::string>() == cfg.model_name);
+    TEST_ASSERT(m["draft_path"].get<std::string>() ==
+                "/opt/models/dflash-draft-3.6-q4_k_m.gguf");
+
+    // target: required, never null when GGUF is loaded.
+    TEST_ASSERT(!m["target"].is_null());
+    const json & tgt = m["target"];
+    TEST_ASSERT(tgt["path"].get<std::string>() ==
+                "/opt/models/Qwen3.6-27B-Q4_K_M.gguf");
+    TEST_ASSERT(tgt["size_bytes"].get<int64_t>() == int64_t(17134510080));
+    TEST_ASSERT(tgt["sha256"].get<std::string>().size() == 64);
+    TEST_ASSERT(tgt["gguf"]["general.architecture"].get<std::string>() == "qwen35");
+    TEST_ASSERT(tgt["gguf"]["general.file_type_name"].get<std::string>() == "Q4_K_M");
+    TEST_ASSERT(tgt["gguf"]["context_length"].get<int>() == 65536);
+    TEST_ASSERT(tgt["gguf"]["vocab_size"].get<int>() == 152064);
+
+    // draft: required key, populated when --draft was passed.
+    TEST_ASSERT(!m["draft"].is_null());
+    TEST_ASSERT(m["draft"]["path"].get<std::string>() ==
+                "/opt/models/dflash-draft-3.6-q4_k_m.gguf");
+    TEST_ASSERT(m["draft"]["gguf"]["general.architecture"].get<std::string>() == "qwen3");
+}
+
+static void test_props_model_draft_null_when_target_only() {
+    // laguna / qwen3.6-moe configs run target-only: model.draft is JSON
+    // null (NOT omitted), so consumers can distinguish "feature absent"
+    // from "field not in this schema version".
+    ServerConfig cfg = make_props_config_with_sidecar(json{
+        {"name", "qwen3.6-moe-test"},
+        {"source", "https://huggingface.co/test"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens", 32768},
+    });
+    cfg.draft_path = "";              // no --draft
+    cfg.target_gguf = json::object({
+        {"path",       "/opt/models/qwen3.6-moe.gguf"},
+        {"size_bytes", int64_t(18000000000)},
+        {"sha256",     nullptr},
+        {"gguf", {
+            {"general.architecture", "qwen35moe"},
+            {"general.name",         "Qwen3.6-35B-A3B"},
+        }},
+    });
+    // draft_gguf left at default (null).
+
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm);
+
+    TEST_ASSERT(body["model"].contains("draft"));
+    TEST_ASSERT(body["model"]["draft"].is_null());
+    TEST_ASSERT(body["model"]["draft_path"].is_null());  // legacy field too
+    // target still populated.
+    TEST_ASSERT(!body["model"]["target"].is_null());
+    TEST_ASSERT(body["model"]["target"]["gguf"]["general.architecture"]
+                    .get<std::string>() == "qwen35moe");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2633,6 +2887,12 @@ int main() {
     RUN_TEST(test_props_model_card_null_on_family_fallback);
     RUN_TEST(test_props_budget_envelope_shape);
     RUN_TEST(test_props_runtime_shape);
+    RUN_TEST(test_props_build_block_shape_no_image_info);
+    RUN_TEST(test_props_build_block_with_image_info);
+    RUN_TEST(test_props_model_target_draft_shape);
+    RUN_TEST(test_props_model_draft_null_when_target_only);
+    RUN_TEST(test_props_host_block_present_when_populated);
+    RUN_TEST(test_props_host_block_null_when_missing);
 
     std::fprintf(stderr, "\n── usage.timings ──\n");
     RUN_TEST(test_usage_timings_openai_chat_streaming);
