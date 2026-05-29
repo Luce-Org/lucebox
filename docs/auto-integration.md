@@ -4,9 +4,9 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T20:40:52-04:00
+Last refresh: 2026-05-28T20:56:46-04:00
 Current base: `origin/main` `8782d07a`
-Current integration tip before this refresh: `easel/auto-integration` `fbea9380`
+Current integration tip before this refresh: `easel/auto-integration` `9117fc1d`
 Refreshed stack merge commit prepared in this run: none; stack already current
 Final manifest commit prepared after stack merge: this commit
 
@@ -44,7 +44,7 @@ triage for the same unchanged conflict classes.
 
 | PR | Outcome | Notes |
 |---:|---|---|
-| current upstream/base | checked | `git merge --no-edit origin/main` in isolated worktree `/tmp/luce-cron-20260528-204052/reconcile` reported `Already up to date.`; no upstream reconciliation commit was needed. |
+| current upstream/base | checked | `git merge --no-edit origin/main` in isolated worktree `/tmp/luce-cron-20260528-205500/reconcile` reported `Already up to date.`; no upstream reconciliation commit was needed. |
 | current integrated PRs | checked | Ancestor checks still pass for carried open non-draft contributor PR refs: #295, #294, #289, #276, #274, #266, #152, and #142. |
 | upstream-adjacent PRs | checked | #292/#298/#299/#300/#301/#302/#303 are included through `origin/main`. |
 | #237 | blocked-needs-human / selective-port | Fresh direct merge probe still conflicts across deleted legacy `dflash/` server files, `server/CMakeLists.txt`, backend factory/model backend, MTP common interfaces/orchestrator, Qwen35 loader/graph/backend/target files, and tests. Prior tmux-driven Claude/Codex review found this is not a safe mechanical merge because the old MTP API/loader/graph/decode path collides with current remote-draft, layer-split, pFlash, thinking-budget, telemetry, and MoE hooks. |
@@ -81,12 +81,12 @@ integrated because it is draft.
 
 This run performed:
 
-- `date -Is` -> 2026-05-28T20:40:52-04:00 for the manifest refresh timestamp.
+- `date -Is` -> 2026-05-28T20:56:46-04:00 for the manifest refresh timestamp.
 - `GH_CONFIG_DIR=/home/erik/.config/gh XDG_CONFIG_HOME=/home/erik/.config HOME=/home/erik gh auth status`, `HOME=/home/erik /home/erik/.local/bin/claude auth status --text`, and `HOME=/home/erik /home/linuxbrew/.linuxbrew/bin/codex --version` all succeeded.
 - `git fetch --prune origin` and `git fetch --prune easel` completed separately; targeted pull-ref fetch recreated open PR refs for #304, #297, #295, #294, #291, #290, #289, #286, #285, #276, #275, #274, #266, #249, #237, #221, #193, #154, #153, #152, #142, #137, #135, #94, and #48.
-- Isolated reconciliation worktree `/tmp/luce-cron-20260528-204052/reconcile` was created from `easel/auto-integration`; `git merge --no-edit origin/main` reported `Already up to date.`
+- Isolated reconciliation worktree `/tmp/luce-cron-20260528-205500/reconcile` was created from `easel/auto-integration`; `git merge --no-edit origin/main` reported `Already up to date.`
 - Ancestor checks still pass for carried open non-draft PR refs: #295, #294, #289, #276, #274, #266, #152, and #142. Draft #297 remains carried at `53dd1686`.
-- Fresh direct merge probes were run in isolated worktrees for the still-unintegrated non-draft PRs #237, #221, #154, #153, #137, #135, #94, and #48; each still conflicts as summarized above. Probe log: `/tmp/luce-cron-20260528-204052/probe-results.txt`.
+- Fresh direct merge probes were run in isolated worktrees for the still-unintegrated non-draft PRs #237, #221, #154, #153, #137, #135, #94, and #48; each still conflicts as summarized above. Probe log: `/tmp/luce-cron-20260528-205500/probe-results.txt`.
 - No new non-draft PR head required another external-agent run this cycle. The retained prior tmux-driven Codex feasibility inspection for #135 remains applicable and recommended keeping #135 blocked for a designed current-layout port.
 - Manifest-only validation on the reconciliation worktree: `git diff --check HEAD -- docs/auto-integration.md` passed.
 - Full stack whitespace validation `git diff --check origin/main...HEAD` still reports only known pre-existing whitespace warnings outside this run's change (`luce-bench/src/lucebench/fixtures/forge_eval/scenarios/_model_quality.py`, `_stateful_model_quality.py`, and `scripts/docker_build_env.sh`).
@@ -94,7 +94,7 @@ This run performed:
 
 ## Notes
 
-- This run produced a manifest-only refresh on top of `fbea9380`; no source stack rewrite was needed because `origin/main`, `easel/auto-integration`, and all carried non-draft PR heads were unchanged.
-- Retained reconciliation worktree `/tmp/luce-cron-20260528-204052/reconcile` contains this manifest refresh.
-- Retained fresh conflict probe worktrees `/tmp/luce-cron-20260528-204052/probe-pr237`, `/tmp/luce-cron-20260528-204052/probe-pr221`, `/tmp/luce-cron-20260528-204052/probe-pr154`, `/tmp/luce-cron-20260528-204052/probe-pr153`, `/tmp/luce-cron-20260528-204052/probe-pr137`, `/tmp/luce-cron-20260528-204052/probe-pr135`, `/tmp/luce-cron-20260528-204052/probe-pr94`, and `/tmp/luce-cron-20260528-204052/probe-pr48` are intentionally left for review because they are conflicted.
+- This run produced a manifest-only refresh on top of `9117fc1d`; no source stack rewrite was needed because `origin/main`, `easel/auto-integration`, and all carried non-draft PR heads were unchanged.
+- Retained reconciliation worktree `/tmp/luce-cron-20260528-205500/reconcile` contains this manifest refresh.
+- Retained fresh conflict probe worktrees `/tmp/luce-cron-20260528-205500/probe-pr237`, `/tmp/luce-cron-20260528-205500/probe-pr221`, `/tmp/luce-cron-20260528-205500/probe-pr154`, `/tmp/luce-cron-20260528-205500/probe-pr153`, `/tmp/luce-cron-20260528-205500/probe-pr137`, `/tmp/luce-cron-20260528-205500/probe-pr135`, `/tmp/luce-cron-20260528-205500/probe-pr94`, and `/tmp/luce-cron-20260528-205500/probe-pr48` are intentionally left for review because they are conflicted.
 - Prior retained worktrees, probe logs, agent reports, and configure directories remain as listed in earlier manifest revisions; cleanup is separate maintenance.
