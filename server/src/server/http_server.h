@@ -166,7 +166,7 @@ struct ServerConfig {
 
     bool        compaction_enabled        = true;
     float       compaction_threshold      = 0.9f;
-    int         compaction_max_tokens     = 1024;
+    int         compaction_max_tokens     = 0;   // resolved at startup: max_ctx / 10, clamped [256,2048]
     float       compaction_keep_recent    = 0.3f;
     bool        compaction_strip_thinking = true;
     int         compaction_keep_tool_uses = 3;
