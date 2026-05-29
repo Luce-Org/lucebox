@@ -4,20 +4,20 @@ Repository: `Luce-Org/lucebox-hub`
 Integration branch: `auto-integration`
 Writable remote: `easel`
 Upstream remote: `origin` / `Luce-Org`
-Last refresh: 2026-05-28T23:28:51-04:00
+Last refresh: 2026-05-29T00:03:57-04:00
 Current base: `origin/main` `8782d07a`
-Current integration tip before this refresh: `easel/auto-integration` `ad4f37cd`
+Current integration tip before this refresh: `easel/auto-integration` `7dc1f502`
 Refreshed stack merge commit prepared in this run: none; stack already current
 Final manifest commit prepared after stack/probe refresh: this commit
 
 This branch is maintained as a reproducible patch stack over `origin/main`. At
 this run's start the upstream base and writable integration branch were already
-aligned (`0` behind / `373` ahead), and every currently mergeable non-draft
-contributor PR head was already an ancestor of `easel/auto-integration`. This
-refresh revalidated auth/tooling, fetched current pull refs, repeated direct
-worktree merge probes for the remaining conflicted non-draft PRs, and added a
-fresh tmux-driven Codex salvage report for #135. No source stack rewrite was
-made.
+aligned (`0` behind / `374` ahead), and every currently mergeable non-draft
+contributor PR head was already an ancestor of `easel/auto-integration`. Since
+the last refresh, upstream main absorbed #303, #302, #301, #300, #299, and #298.
+This refresh revalidated auth/tooling, fetched current pull refs, re-checked the
+latest upstream merge history, and updated the manifest only. No source stack
+rewrite was made.
 
 ## Included in the current stack
 
@@ -45,19 +45,13 @@ made.
 
 This run performed:
 
-- `date -Is` -> 2026-05-28T23:28:51-04:00 for the run timestamp.
+- `date -Is` -> 2026-05-29T00:03:57-04:00 for the run timestamp.
 - Primary checkout preflight: `git status --short` was clean; branch was `auto-integration`; remotes were `origin=https://github.com/Luce-Org/lucebox-hub` and `easel=https://github.com/easel/lucebox-hub`.
 - Auth/tooling checks with real user credentials succeeded: `gh auth status`, `claude auth status --text`, and `codex --version`.
 - `git fetch --prune origin` and `git fetch --prune easel` completed successfully.
-- Open PR enumeration used `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json number,title,author,isDraft,headRefName,headRepositoryOwner,baseRefName,updatedAt,mergeable,url --jq ...`.
-- Fetched open non-draft PR refs explicitly: #295, #294, #289, #276, #274, #266, #237, #221, #154, #153, #152, #142, #137, #135, #94, and #48.
-- `git rev-list --left-right --count origin/main...easel/auto-integration` reported `0` behind and `373` ahead before this manifest commit.
-- `git merge-base --is-ancestor` checks pass for carried open non-draft PR refs: #295, #294, #289, #276, #274, #266, #152, and #142.
-- Reconciliation worktree `/tmp/luce-auto-cron-20260528-232939/reconcile` was created from `easel/auto-integration`; `origin/main` is already an ancestor and no base merge was required.
-- Repeated direct merge probes from `easel/auto-integration` in `/tmp/luce-auto-cron-20260528-232939/` for #237, #221, #154, #153, #137, #135, #94, and #48. All still conflict.
-- Delegation for #135: Claude Code was run through tmux but reached `--max-turns` without a usable report (`/tmp/luce135claude-20260528-232939-report.txt`); Codex was then run through tmux and produced a usable selective-port report (`/tmp/luce135codex-20260528-232939-report.txt`).
-- Prior delegation for #221 remains applicable: Codex report `/tmp/luce221codex-20260528-230909-report.txt` classified #221 as a dependent `salvage-port` after a #237-equivalent MTP foundation.
-- Prior delegation for #237 remains applicable: Claude Code reached `--max-turns` without a usable report (`/tmp/luce237claude224833-report.txt`), while Codex report `/tmp/luce237codex224833-report.txt` classified #237 as a `salvage-port`, not a direct merge and not superseded.
+- Open PR enumeration used `gh pr list --repo Luce-Org/lucebox-hub --state open --limit 200 --json number,title,author,isDraft,headRefName,headRepositoryOwner,baseRefName,updatedAt,mergeable,url`.
+- Upstream history inspection on `origin/main` confirmed the latest merged PRs since the previous refresh: #303, #302, #301, #300, #299, and #298.
+- `git rev-list --left-right --count origin/main...easel/auto-integration` reported `0` behind and `374` ahead before this manifest commit.
 - `git diff --check -- docs/auto-integration.md` passed after this manifest update.
 
 ## Pending / blocked-needs-human / selective-port candidates
@@ -109,13 +103,13 @@ Agent reports/logs retained:
 
 ## Notes
 
-This run produced a manifest-only refresh on top of `ad4f37cd`; no source stack
+This run produced a manifest-only refresh on top of `7dc1f502`; no source stack
 rewrite was needed because `origin/main`, `easel/auto-integration`, and all
 carried mergeable non-draft PR heads were already current. The next useful work
 remains a human-reviewed selective port of #237's MTP foundation into the current
 `server/` layout. After that, mine #221's WARM-cache/dispatcher behavior and
-#153/#154's native/integrated MTP semantics. #135 is now also confirmed by Codex
-as a selective current-layout port focused on the qwen35 daemon scheduler and
-batched target-step API. #137 and #48 look like old `dflash/CMakeLists.txt`
-changes that should be closed or retargeted, and #94 appears largely superseded
-by current draft/SWA support.
+#153/#154's native/integrated MTP semantics. #135 is still a selective
+current-layout port candidate focused on the qwen35 daemon scheduler and batched
+target-step API. #137 and #48 look like old `dflash/CMakeLists.txt` changes that
+should be closed or retargeted, and #94 appears largely superseded by current
+draft/SWA support.
