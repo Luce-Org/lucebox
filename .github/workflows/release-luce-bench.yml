@@ -25,6 +25,10 @@ jobs:
       name: pypi
       url: https://pypi.org/p/luce-bench
     permissions:
+      # Job-level `permissions` completely replaces the workflow-level
+      # block, so `contents: read` has to be repeated here for
+      # actions/checkout to be able to read the repo.
+      contents: read
       id-token: write  # trusted publishing
     steps:
       - uses: actions/checkout@v4
