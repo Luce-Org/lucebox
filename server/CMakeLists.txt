@@ -247,6 +247,7 @@ add_library(dflash_common STATIC
     src/common/dflash_draft_graph.cpp
     src/common/dflash_spec_decode.cpp
     src/common/layer_split_backend.cpp
+    src/common/layer_split_runtime.cpp
     src/qwen35/graph_builders.cpp
     src/qwen35moe/qwen35moe_ffn.cpp
     src/qwen35moe/qwen35moe_backend.cpp

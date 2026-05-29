@@ -5,6 +5,7 @@
 #include "common/dflash_layer_split_runtime.h"
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
+#include "common/layer_split_runtime.h"
 #include "dflash27b.h"
 
 #include "ggml-cuda.h"
@@ -80,42 +81,14 @@ Gemma4LayerSplitAdapter::~Gemma4LayerSplitAdapter() noexcept {
 }
 
 bool Gemma4LayerSplitAdapter::init() {
-    if (!cfg_.target_path || cfg_.device.layer_split_gpus.size() < 2) {
-        std::fprintf(stderr, "[gemma4-target-split] invalid layer-split config\n");
+    const LayerSplitRuntimeInit runtime_cfg{
+        cfg_.target_path,
+        &cfg_.device,
+        "gemma4-target-split",
+    };
+    if (!init_layer_split_runtime(runtime_cfg, shards_, snapshot_backends_)) {
         return false;
     }
-
-    const auto info = inspect_gguf_model_info(cfg_.target_path);
-    const int n_layer = info.n_layer;
-    if (n_layer <= 0) {
-        std::fprintf(stderr, "[gemma4-target-split] failed to inspect layer count\n");
-        return false;
-    }
-
-    const auto ranges = compute_layer_ranges(
-        n_layer,
-        (int)cfg_.device.layer_split_gpus.size(),
-        cfg_.device.layer_split_weights);
-    if (ranges.size() != cfg_.device.layer_split_gpus.size()) {
-        std::fprintf(stderr,
-            "[gemma4-target-split] bad layer split for %zu GPUs and %d layers\n",
-            cfg_.device.layer_split_gpus.size(), n_layer);
-        return false;
-    }
-
-    shards_.resize(cfg_.device.layer_split_gpus.size());
-    auto shard_metas = layer_split_shard_metas(shards_);
-    if (!init_layer_split_shard_metas(
-            shard_metas, cfg_.device.layer_split_gpus, ranges,
-            "gemma4-target-split")) {
-        return false;
-    }
-
-    (void)enable_layer_split_peer_access(
-        cfg_.device.layer_split_gpus, cfg_.device.peer_access);
-
-    if (!init_layer_split_snapshot_backends(
-            shard_metas, snapshot_backends_, "gemma4-target-split")) return false;
 
     for (size_t i = 0; i < shards_.size(); ++i) {
         auto & shard = shards_[i];
@@ -378,46 +351,15 @@ bool Gemma4LayerSplitAdapter::decode_ar(
 
     const auto & w = shards_.front().weights;
     const int vocab = w.n_vocab;
-    std::vector<float> logits_buf;
-    if (sampler_.needs_logit_processing()) {
-        if ((int)prefill_last_logits_.size() != vocab) return false;
-        last_tok = sample_logits(prefill_last_logits_.data(), vocab, sampler_,
-                                 out_tokens, sampler_rng_);
-    }
-    out_tokens.push_back(last_tok);
-    io.emit(last_tok);
-    if (io.cancelled) {
-        io.emit(-1);
-        return true;
-    }
-    if (last_tok == w.eos_id || last_tok == w.eos_chat_id) {
-        io.emit(-1);
-        return true;
-    }
-    ++committed;
-
-    for (int i = 1; i < n_gen; ++i) {
-        std::vector<int32_t> one(1, last_tok);
-        int next_tok = -1;
-        logits_buf.clear();
-        if (!run_forward(one, committed - 1, next_tok,
-                         sampler_.needs_logit_processing() ? &logits_buf : nullptr)) {
-            return false;
-        }
-        if (sampler_.needs_logit_processing()) {
-            if ((int)logits_buf.size() != vocab) return false;
-            next_tok = sample_logits(logits_buf.data(), vocab, sampler_,
-                                     out_tokens, sampler_rng_);
-        }
-        last_tok = next_tok;
-        out_tokens.push_back(last_tok);
-        io.emit(last_tok);
-        ++committed;
-        if (io.cancelled) break;
-        if (last_tok == w.eos_id || last_tok == w.eos_chat_id) break;
-    }
-    io.emit(-1);
-    return true;
+    return run_layer_split_ar_decode(
+        last_tok, committed, n_gen, vocab, prefill_last_logits_, sampler_,
+        sampler_rng_,
+        [&](const std::vector<int32_t> & one, int pos, int & next_tok,
+            std::vector<float> * logits_out) {
+            return run_forward(one, pos - 1, next_tok, logits_out);
+        },
+        [&](int tok) { return tok == w.eos_id || tok == w.eos_chat_id; },
+        out_tokens, io);
 }
 
 bool Gemma4LayerSplitAdapter::snapshot_save(int slot) {
