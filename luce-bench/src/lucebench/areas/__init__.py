@@ -9,6 +9,28 @@ Each module exposes:
 The dispatcher in lucebench.cli routes ``--area X`` to ``lucebench.areas.X``.
 """
 
-from . import ds4_eval, gsm8k, hellaswag, humaneval, truthfulqa_mc1
+from . import (
+    agent,
+    agent_recorded,
+    ds4_eval,
+    forge,
+    gsm8k,
+    hellaswag,
+    humaneval,
+    longctx,
+    smoke,
+    truthfulqa_mc1,
+)
 
-__all__ = ["ds4_eval", "gsm8k", "hellaswag", "humaneval", "truthfulqa_mc1"]
+__all__ = [
+    "agent",
+    "agent_recorded",
+    "ds4_eval",
+    "forge",
+    "gsm8k",
+    "hellaswag",
+    "humaneval",
+    "longctx",
+    "smoke",
+    "truthfulqa_mc1",
+]

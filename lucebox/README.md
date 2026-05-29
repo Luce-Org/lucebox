@@ -13,5 +13,5 @@ tests, model download) is Python in the container. Host facts (driver,
 GPU, RAM, VRAM, systemd availability) are passed in via `LUCEBOX_HOST_*`
 environment variables so the Python side doesn't reprobe.
 
-Subcommands are defined in [`lucebox/cli.py`](lucebox/cli.py). See the
+Subcommands are defined in [`lucebox/cli.py`](src/lucebox/cli.py). See the
 top-level [README.md](../README.md) for the user-facing flow.

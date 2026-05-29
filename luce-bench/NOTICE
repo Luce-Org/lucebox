@@ -74,7 +74,7 @@ the per-fixture README/header where space allows.
              (_forge/) is also vendored.
     License: MIT
     SPDX:    MIT
-    Copyright (c) 2024 Antoine Zambelli
+    Copyright (c) 2025-2026 Antoine Zambelli
 
   src/lucebench/fixtures/agent_recorded/cases.json
     Source:  own — mined from local Claude Code + Codex session logs
