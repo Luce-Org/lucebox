@@ -27,7 +27,8 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from pathlib import Path
 from typing import Annotated, Any
 
 import typer
@@ -75,10 +76,33 @@ DFLASH_ALLOWLIST: tuple[str, ...] = (
 
 
 def _load_or_build() -> config_mod.Config:  # type: ignore[name-defined]
+    """env > config.toml > dataclass defaults — the canonical precedence.
+
+    Without the env-overlay step below, `config_mod.load()` returned the
+    persisted config verbatim and `LUCEBOX_IMAGE` / `LUCEBOX_VARIANT` /
+    `LUCEBOX_PORT` / `LUCEBOX_CONTAINER` / `LUCEBOX_MODELS` from the
+    systemd unit's `Environment=` (or any one-shot shell export) were
+    silently dropped. That contradicted the precedence lucebox.sh
+    documents and applies — and bit sindri when its config.toml had
+    `[image]` without `registry`, so the dataclass default
+    `ghcr.io/luce-org/lucebox-hub` won over the unit's
+    `LUCEBOX_IMAGE=ghcr.io/easel/lucebox-hub`.
+
+    Fix: overlay env on top of the loaded config (or the live_config
+    fallback when config.toml is absent). Only the five top-level
+    scalars have env hooks — dflash/host/model don't, by design.
+    """
     cfg = config_mod.load()
-    if cfg is not None:
-        return cfg
-    return live_config()
+    if cfg is None:
+        cfg = live_config()
+    return replace(
+        cfg,
+        variant=os.environ.get("LUCEBOX_VARIANT", cfg.variant),
+        image=os.environ.get("LUCEBOX_IMAGE", cfg.image),
+        container_name=os.environ.get("LUCEBOX_CONTAINER", cfg.container_name),
+        port=int(os.environ.get("LUCEBOX_PORT", str(cfg.port))),
+        models_dir=Path(os.environ.get("LUCEBOX_MODELS", str(cfg.models_dir))),
+    )
 
 
 # ── subcommands ────────────────────────────────────────────────────────────
