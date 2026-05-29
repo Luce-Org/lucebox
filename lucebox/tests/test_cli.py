@@ -92,7 +92,10 @@ def test_server_run_spec_forwards_lucebox_host_env(monkeypatch) -> None:
     monkeypatch.setenv("LUCEBOX_HOST_OS_PRETTY", "Ubuntu 22.04.3 LTS")
     monkeypatch.setenv("LUCEBOX_HOST_KERNEL", "6.6.87.2-microsoft-standard-WSL2")
     monkeypatch.setenv("LUCEBOX_HOST_WSL_VERSION", "wsl2")
-    monkeypatch.setenv("LUCEBOX_HOST_GPU_LIST_CSV", "0, GPU-x, 00000000:01:00.0, NVIDIA RTX 5090, 12.0, 24576 MiB, 175.00 W")
+    monkeypatch.setenv(
+        "LUCEBOX_HOST_GPU_LIST_CSV",
+        "0, GPU-x, 00000000:01:00.0, NVIDIA RTX 5090, 12.0, 24576 MiB, 175.00 W",
+    )
 
     cfg = live_config()
     spec = docker_run.server_run_spec(cfg)

@@ -15,10 +15,9 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
-
-from lucebox import sweep as sweep_mod
 from lucebox.types import DflashRuntime, HostFacts
 
+from lucebox import sweep as sweep_mod
 
 # ── fixtures ───────────────────────────────────────────────────────────────
 
@@ -172,10 +171,12 @@ def test_pick_winner_picks_highest_tps() -> None:
         index=0, config=DflashRuntime(budget=8), snapshot_dir=None, mean_decode_tps=10.0, error=None
     )
     r2 = sweep_mod.CellResult(
-        index=1, config=DflashRuntime(budget=22), snapshot_dir=None, mean_decode_tps=50.0, error=None
+        index=1, config=DflashRuntime(budget=22), snapshot_dir=None,
+        mean_decode_tps=50.0, error=None,
     )
     r3 = sweep_mod.CellResult(
-        index=2, config=DflashRuntime(budget=32), snapshot_dir=None, mean_decode_tps=30.0, error=None
+        index=2, config=DflashRuntime(budget=32), snapshot_dir=None,
+        mean_decode_tps=30.0, error=None,
     )
     assert sweep_mod._pick_winner([r1, r2, r3]) is r2
 

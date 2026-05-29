@@ -169,7 +169,7 @@ def _host_confounders(snapshots: list[tuple[str, dict[str, dict[str, Any]], Host
             )
         warnings.append(
             "⚠ confounder: hosts differ on host.gpus lineup "
-            f"(values: {sorted(_fmt(l) for l in gpu_lineups)})"
+            f"(values: {sorted(_fmt(lineup) for lineup in gpu_lineups)})"
         )
     if len(cuda_visible) > 1:
         warnings.append(

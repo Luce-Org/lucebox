@@ -36,22 +36,23 @@ def test_check_prints_host_facts_section(monkeypatch: pytest.MonkeyPatch) -> Non
     # Stub HostFacts so the pass/fail checks succeed at least minimally.
     # `cli.check` imports `from_env` into its module namespace, so patch
     # both names.
-    stub = lambda: HostFacts(
-        nproc=24,
-        ram_gb=64,
-        gpu_vendor="nvidia",
-        gpu_name="NVIDIA RTX 5090",
-        gpu_count=1,
-        vram_gb=24,
-        gpu_sm="120",
-        driver_version="596.36",
-        driver_major=596,
-        has_systemd=True,
-        is_wsl=True,
-        has_docker=True,
-        docker_version="29.1.3",
-        ctk="runtime",
-    )
+    def stub() -> HostFacts:
+        return HostFacts(
+            nproc=24,
+            ram_gb=64,
+            gpu_vendor="nvidia",
+            gpu_name="NVIDIA RTX 5090",
+            gpu_count=1,
+            vram_gb=24,
+            gpu_sm="120",
+            driver_version="596.36",
+            driver_major=596,
+            has_systemd=True,
+            is_wsl=True,
+            has_docker=True,
+            docker_version="29.1.3",
+            ctk="runtime",
+        )
     monkeypatch.setattr("lucebox.host_facts.from_env", stub)
     monkeypatch.setattr("lucebox.cli.from_env", stub)
     result = CliRunner().invoke(app, ["check"])
@@ -92,22 +93,23 @@ def test_check_exit_code_independent_of_host_facts(
     facts block prints.
     """
     monkeypatch.setenv("LUCEBOX_HOST_OS_PRETTY", "Bare Linux")
-    stub = lambda: HostFacts(
-        nproc=8,
-        ram_gb=16,
-        gpu_vendor="nvidia",
-        gpu_name="X",
-        gpu_count=1,
-        vram_gb=24,
-        gpu_sm="86",
-        driver_version="555.00",
-        driver_major=555,
-        has_systemd=False,
-        is_wsl=False,
-        has_docker=False,  # → fail
-        docker_version="",
-        ctk="none",  # also fail
-    )
+    def stub() -> HostFacts:
+        return HostFacts(
+            nproc=8,
+            ram_gb=16,
+            gpu_vendor="nvidia",
+            gpu_name="X",
+            gpu_count=1,
+            vram_gb=24,
+            gpu_sm="86",
+            driver_version="555.00",
+            driver_major=555,
+            has_systemd=False,
+            is_wsl=False,
+            has_docker=False,  # → fail
+            docker_version="",
+            ctk="none",  # also fail
+        )
     monkeypatch.setattr("lucebox.host_facts.from_env", stub)
     monkeypatch.setattr("lucebox.cli.from_env", stub)
     result = CliRunner().invoke(app, ["check"])

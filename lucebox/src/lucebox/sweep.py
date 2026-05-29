@@ -31,7 +31,6 @@ import os
 import shutil
 import signal
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.request
@@ -44,7 +43,6 @@ from lucebox import autotune as autotune_mod
 from lucebox import config as config_mod
 from lucebox.host_facts import from_env
 from lucebox.types import DflashRuntime
-
 
 # ── allowlist: the 11 dflash.* fields that lucebox autotune --apply writes ──
 # Kept in sync with cli.DFLASH_ALLOWLIST — we duplicate it locally to
