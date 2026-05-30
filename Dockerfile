@@ -204,7 +204,15 @@ COPY --from=builder /src/server/build /opt/lucebox-hub/server/build
 # them discoverable without DFLASH_MODEL_CARDS_DIR. Copied directly
 # from the build context (no builder roundtrip needed — these are
 # static JSON, not compiled).
-COPY share/model_cards /opt/lucebox-hub/server/share/model_cards
+# One copy under share/; a symlink wires in the server search path so
+# we don't duplicate. luce-bench force-include expects
+# /opt/lucebox-hub/share/model_cards (../share relative to luce-bench/).
+# The C++ server binary resolves <binary>/../share/model_cards
+# = server/build/../share/model_cards = server/share/model_cards.
+COPY share/model_cards /opt/lucebox-hub/share/model_cards
+RUN mkdir -p /opt/lucebox-hub/server/share \
+    && ln -s /opt/lucebox-hub/share/model_cards \
+             /opt/lucebox-hub/server/share/model_cards
 
 RUN test -x /opt/lucebox-hub/server/build/test_dflash \
     && test -x /opt/lucebox-hub/server/build/dflash_server \

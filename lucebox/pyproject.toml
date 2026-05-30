@@ -22,6 +22,11 @@ dependencies = [
     "httpx>=0.27",
     "tomli-w>=1.0",
     "huggingface_hub>=0.27",
+    # luce-bench is needed by the autotune sweep scorer (agent_replay_pass_rate
+    # in sweep.py imports lucebench.areas.agent_recorded). Kept as a workspace
+    # dep so the scorer can run host-side via `uv run --project lucebox` without
+    # a separate `uvx` invocation.
+    "luce-bench",
 ]
 
 [project.scripts]
