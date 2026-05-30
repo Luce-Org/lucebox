@@ -112,6 +112,7 @@ GRADER_VERSION = 1
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 FIXTURE_PATH = SCRIPT_DIR / "fixtures" / "agent_recorded" / "cases.json"
+MULTI_TURN_FIXTURE_PATH = SCRIPT_DIR / "fixtures" / "agent_recorded" / "multi_turn_cases.json"
 
 # Tool name → set of phrases that count as "the model meant this tool".
 # Intentionally loose so a model that says "use a Bash command" passes
@@ -188,6 +189,85 @@ def load_agent_recorded_cases(path: Path = FIXTURE_PATH) -> list[dict[str, Any]]
             }
         )
     return out
+
+
+def load_agent_recorded_multi_turn_cases(
+    path: Path = MULTI_TURN_FIXTURE_PATH,
+) -> list[dict[str, Any]]:
+    """Return multi-turn replay cases for the coding-agent-loop autotune sweep.
+
+    Distinct from :func:`load_agent_recorded_cases` (the single-prompt
+    tool-schema-coverage fixture). Multi-turn cases ship an OpenAI-shape
+    ``messages`` list — sendable verbatim to ``/v1/chat/completions`` —
+    plus a ``target_bucket_tokens`` field that lets a caller pick the
+    longest case fitting under a given ``max_ctx − reply_budget`` cap.
+    See ``scripts/extract-agentic-fixture.py --multi-turn``.
+
+    The fixture is OPTIONAL: returns ``[]`` when absent. Callers that
+    require it should check the result and surface their own error.
+    """
+    if not path.exists():
+        return []
+    payload = json.loads(path.read_text())
+    cases: list[dict[str, Any]] = []
+    for raw in payload.get("cases", []):
+        cases.append(
+            {
+                "id": raw["id"],
+                "source": raw["source"],
+                "kind": raw.get("kind", "multi-turn-replay"),
+                "messages": raw["messages"],
+                "context_tokens_approx": raw["context_tokens_approx"],
+                "target_bucket_tokens": raw["target_bucket_tokens"],
+                "n_messages": raw.get("n_messages", len(raw["messages"])),
+                "initial_state": raw.get("initial_state", {}),
+                "verifier": raw.get("verifier", {}),
+            }
+        )
+    # Sorted ascending by bucket so callers can iterate or bisect to
+    # find the largest case fitting a budget.
+    cases.sort(key=lambda c: c["target_bucket_tokens"])
+    return cases
+
+
+def pick_multi_turn_case_for_budget(
+    cases: list[dict[str, Any]], prompt_budget_tokens: int
+) -> dict[str, Any] | None:
+    """Pick the largest multi-turn case that fits within ``prompt_budget_tokens``.
+
+    The sweep uses this to choose the right trace per cell: for a cell
+    with ``max_ctx = N`` and a reply budget of ``r``, prompt_budget is
+    ``N − r``. Returns ``None`` when no case fits (every case
+    over-budget — caller should skip the cell or shrink the case).
+    """
+    fit = [c for c in cases if c["context_tokens_approx"] <= prompt_budget_tokens]
+    if not fit:
+        return None
+    return max(fit, key=lambda c: c["context_tokens_approx"])
+
+
+def grade_prefill_and_decode(
+    row: dict[str, Any], *, min_response_chars: int = 1, max_wall_seconds: float = 300.0
+) -> dict[str, Any]:
+    """Pass/fail grader for the multi-turn prefill-and-decode verifier.
+
+    Pass criterion: server returned content within ``max_wall_seconds``,
+    the assistant emitted at least ``min_response_chars`` (combining
+    visible content and any reasoning_content), and no HTTP/server
+    error was reported. The verifier exists to score "this max_ctx
+    setting actually serves a trace of this length", not the quality
+    of the model's reply — anything coherent enough to render passes.
+    """
+    err = row.get("error")
+    if err:
+        return {"pass": False, "reason": f"server error: {err}"}
+    wall = float(row.get("wall_s") or 0.0)
+    if wall > max_wall_seconds:
+        return {"pass": False, "reason": f"wall {wall:.1f}s > {max_wall_seconds}s budget"}
+    content = (row.get("content") or "") + (row.get("reasoning_content") or "")
+    if len(content) < min_response_chars:
+        return {"pass": False, "reason": f"response too short ({len(content)} < {min_response_chars})"}
+    return {"pass": True, "reason": f"prefill+decode ok, {len(content)} chars in {wall:.1f}s"}
 
 
 def _normalize(text: str) -> str:
