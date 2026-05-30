@@ -876,7 +876,9 @@ bool eval_moe_hybrid_ffn_batched(
     const float *                   selected_weights,
     int                             n_tokens,
     std::vector<float> &            out,
-    std::string *                   err) {
+    std::string *                   err,
+    ggml_gallocr_t *                p_hot_alloc,
+    ggml_gallocr_t *                p_cold_alloc) {
 
     const int n_embd = cfg.n_embd;
     const int n_used = cfg.n_expert_used;
@@ -976,10 +978,17 @@ bool eval_moe_hybrid_ffn_batched(
         hot_gf = ggml_new_graph_custom(hot_ctx, 4096, false);
         ggml_set_output(hot_output);
         ggml_build_forward_expand(hot_gf, hot_output);
-        hot_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu_backend));
+        if (p_hot_alloc) {
+            if (!*p_hot_alloc)
+                *p_hot_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu_backend));
+            hot_alloc = *p_hot_alloc;
+        } else {
+            hot_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu_backend));
+        }
         if (!ggml_gallocr_alloc_graph(hot_alloc, hot_gf)) {
             if (err) *err = "hybrid batched hot gallocr failed";
-            ggml_gallocr_free(hot_alloc); ggml_free(hot_ctx);
+            if (!p_hot_alloc) ggml_gallocr_free(hot_alloc);
+            ggml_free(hot_ctx);
             return false;
         }
 
@@ -1027,12 +1036,20 @@ bool eval_moe_hybrid_ffn_batched(
         ggml_cgraph * cold_gf = ggml_new_graph_custom(cold_ctx, 4096, false);
         ggml_set_output(cold_routed);
         ggml_build_forward_expand(cold_gf, cold_routed);
-        ggml_gallocr_t cold_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
+        ggml_gallocr_t cold_alloc;
+        if (p_cold_alloc) {
+            if (!*p_cold_alloc)
+                *p_cold_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
+            cold_alloc = *p_cold_alloc;
+        } else {
+            cold_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
+        }
         if (!ggml_gallocr_alloc_graph(cold_alloc, cold_gf)) {
             if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
-            if (hot_alloc) ggml_gallocr_free(hot_alloc);
+            if (!p_hot_alloc && hot_alloc) ggml_gallocr_free(hot_alloc);
             if (hot_ctx) ggml_free(hot_ctx);
-            ggml_gallocr_free(cold_alloc); ggml_free(cold_ctx);
+            if (!p_cold_alloc) ggml_gallocr_free(cold_alloc);
+            ggml_free(cold_ctx);
             if (err) *err = "hybrid batched cold gallocr failed";
             return false;
         }
@@ -1045,16 +1062,17 @@ bool eval_moe_hybrid_ffn_batched(
         auto st = ggml_backend_graph_compute(cpu_backend, cold_gf);
         if (st != GGML_STATUS_SUCCESS) {
             if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
-            if (hot_alloc) ggml_gallocr_free(hot_alloc);
+            if (!p_hot_alloc && hot_alloc) ggml_gallocr_free(hot_alloc);
             if (hot_ctx) ggml_free(hot_ctx);
-            ggml_gallocr_free(cold_alloc); ggml_free(cold_ctx);
+            if (!p_cold_alloc) ggml_gallocr_free(cold_alloc);
+            ggml_free(cold_ctx);
             if (err) *err = "hybrid batched cold compute failed";
             return false;
         }
 
         ggml_backend_tensor_get(cold_routed, cold_partial.data(), 0,
             sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
-        ggml_gallocr_free(cold_alloc);
+        if (!p_cold_alloc) ggml_gallocr_free(cold_alloc);
         ggml_free(cold_ctx);
     }
 
@@ -1064,7 +1082,7 @@ bool eval_moe_hybrid_ffn_batched(
         ggml_backend_tensor_get(hot_output, hot_partial.data(), 0,
             sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
     }
-    if (hot_alloc) ggml_gallocr_free(hot_alloc);
+    if (!p_hot_alloc && hot_alloc) ggml_gallocr_free(hot_alloc);
     if (hot_ctx) ggml_free(hot_ctx);
 
     // ── Step 5: Merge hot + cold ──

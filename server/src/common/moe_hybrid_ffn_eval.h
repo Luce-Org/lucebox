@@ -136,7 +136,9 @@ bool eval_moe_hybrid_ffn_batched(
     const float *                   selected_weights,
     int                             n_tokens,
     std::vector<float> &            out,
-    std::string *                   err = nullptr);
+    std::string *                   err = nullptr,
+    ggml_gallocr_t *                p_hot_alloc = nullptr,
+    ggml_gallocr_t *                p_cold_alloc = nullptr);
 
 // GPU-resident single-token hybrid FFN: keeps data on GPU, only reads router
 // IDs to CPU for hot/cold partitioning.

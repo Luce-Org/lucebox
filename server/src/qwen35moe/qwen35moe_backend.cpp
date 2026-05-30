@@ -495,6 +495,10 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
     }
 
     // Process layer by layer, chunked within each layer
+    StepGraph prefill_sg;  // persistent across layers to reuse GPU buffer
+    ggml_gallocr_t ffn_hot_alloc = nullptr;
+    ggml_gallocr_t ffn_cold_alloc = nullptr;
+
     for (int il = 0; il < n_layer; ++il) {
         auto & storage = target_weights().moe_hybrid->layers[(size_t)il];
 
@@ -505,12 +509,14 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
             const bool with_mask = (cfg_.kq_stride_pad > KQ_MASK_PAD) || (chunk_len > 1);
 
             // Build pre-FFN graph for this chunk
-            StepGraph prefill_sg;
+            step_graph_free(prefill_sg);  // reset ctx/graph but keep gallocr buffer
             if (!build_layer_prefn_step(prefill_sg, target_weights(), target_cache(), target_backend(),
                                         il, /*kv_start=*/chunk_start, /*n_tokens=*/chunk_len,
                                         with_mask, /*fa_window=*/0, cfg_.kq_stride_pad)) {
                 result.error = "prefill_build";
                 step_graph_destroy(prefill_sg);
+                if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+                if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
                 cleanup_graphs();
                 return result;
             }
@@ -551,6 +557,8 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
             if (st != GGML_STATUS_SUCCESS) {
                 result.error = "prefill_compute";
                 step_graph_destroy(prefill_sg);
+                if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+                if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
                 cleanup_graphs();
                 return result;
             }
@@ -590,35 +598,22 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                 }
             }
 
-            // Batched hybrid FFN for this chunk.
-            // The routed-expert mul_mat_id MMQ kernel writes out of bounds on
-            // Ampere when the per-call token count exceeds ~8: the expert token
-            // distribution overshoots the destination tiles on the
-            // need_check=false write path, silently corrupting neighbouring GPU
-            // allocations during prefill and crashing with an illegal memory
-            // access at a later decode sync (~4th request under the server).
-            // Sub-batch the FFN to a safe width so the attention prefill can
-            // stay at the full chunk size.
+            // Batched hybrid FFN for this chunk
             MoeHybridConfig chunk_cfg = make_moe_hybrid_config(target_weights());
             MoeLayerDesc chunk_desc = make_moe_layer_desc(target_weights().layers[(size_t)il]);
-            std::vector<float> ffn_batch_out((size_t)chunk_len * (size_t)hidden);
-            constexpr int kFfnSafeBatch = 8;
-            for (int fb = 0; fb < chunk_len; fb += kFfnSafeBatch) {
-                const int fl = std::min(kFfnSafeBatch, chunk_len - fb);
-                std::vector<float> sub_out;
-                if (!eval_moe_hybrid_ffn_batched(
-                        target_backend(), cpu_be, chunk_cfg, chunk_desc, storage,
-                        chunk_post.data()     + (size_t)fb * (size_t)hidden,
-                        chunk_selected.data() + (size_t)fb * (size_t)n_expert_used,
-                        chunk_weights.data()  + (size_t)fb * (size_t)n_expert_used,
-                        fl, sub_out, &result.error)) {
-                    step_graph_destroy(prefill_sg);
-                    cleanup_graphs();
-                    return result;
-                }
-                std::memcpy(ffn_batch_out.data() + (size_t)fb * (size_t)hidden,
-                            sub_out.data(),
-                            (size_t)fl * (size_t)hidden * sizeof(float));
+            std::vector<float> ffn_batch_out;
+            if (!eval_moe_hybrid_ffn_batched(
+                    target_backend(), cpu_be, chunk_cfg, chunk_desc, storage,
+                    chunk_post.data(),
+                    chunk_selected.data(),
+                    chunk_weights.data(),
+                    chunk_len, ffn_batch_out, &result.error,
+                    &ffn_hot_alloc, &ffn_cold_alloc)) {
+                step_graph_destroy(prefill_sg);
+                if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+                if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
+                cleanup_graphs();
+                return result;
             }
 
             // Combine FFN output + residual → embed_all for next layer
@@ -656,10 +651,11 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
             }
             const auto t4 = HybridClock::now();
             ffn_us_total += elapsed_us(t3, t4);
-
-            step_graph_destroy(prefill_sg);
         }
     }
+    step_graph_destroy(prefill_sg);
+    if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+    if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
 
     // Copy last token's output to act_cur for decode
     std::memcpy(act_cur.data(), embed_all.data() + (size_t)(prompt_len - 1) * (size_t)hidden,

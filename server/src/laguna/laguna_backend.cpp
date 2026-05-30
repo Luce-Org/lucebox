@@ -1190,6 +1190,10 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
     auto t_pf0 = std::chrono::steady_clock::now();
     const int prefill_chunk = std::min(args_.chunk, N);
 
+    StepGraph prefill_sg;  // persistent across layers to reuse GPU buffer
+    ggml_gallocr_t ffn_hot_alloc = nullptr;
+    ggml_gallocr_t ffn_cold_alloc = nullptr;
+
     for (int il = 0; il < w_.n_layer; ++il) {
         const bool is_dense = (il < w_.n_layer_dense_lead);
         const bool is_full = laguna_is_full_attn_layer(w_, il);
@@ -1197,11 +1201,13 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
         for (int chunk_start = 0; chunk_start < N; chunk_start += prefill_chunk) {
             const int chunk_len = std::min(prefill_chunk, N - chunk_start);
 
-            StepGraph prefill_sg;
+            step_graph_free(prefill_sg);  // reset ctx/graph but keep gallocr buffer
             if (!build_laguna_layer_prefn_step(prefill_sg, w_, cache_, backend_,
                                                il, chunk_start, chunk_len)) {
                 result.error = "prefill_build";
                 step_graph_destroy(prefill_sg);
+                if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+                if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
                 return result;
             }
 
@@ -1236,6 +1242,8 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
             if (st != GGML_STATUS_SUCCESS) {
                 result.error = "prefill_compute";
                 step_graph_destroy(prefill_sg);
+                if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+                if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
                 return result;
             }
 
@@ -1263,6 +1271,8 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
                 if (!sel_tensor || !prefill_sg.moe_weights) {
                     result.error = "prefill_router_outputs";
                     step_graph_destroy(prefill_sg);
+                    if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+                    if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
                     return result;
                 }
                 ggml_backend_tensor_get(sel_tensor, chunk_selected.data(), 0,
@@ -1277,27 +1287,22 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
                     }
                 }
 
-                // Batched hybrid FFN (sub-batched to avoid MMQ OOB)
+                // Batched hybrid FFN evaluation
                 auto & storage = moe_hybrid_->layers[(size_t)il];
                 MoeHybridConfig chunk_cfg = make_moe_hybrid_config(w_);
                 MoeLayerDesc chunk_desc = make_moe_layer_desc(w_.layers[(size_t)il]);
-                std::vector<float> ffn_batch_out((size_t)chunk_len * (size_t)hidden);
-                constexpr int kFfnSafeBatch = 8;
-                for (int fb = 0; fb < chunk_len; fb += kFfnSafeBatch) {
-                    const int fl = std::min(kFfnSafeBatch, chunk_len - fb);
-                    std::vector<float> sub_out;
-                    if (!eval_moe_hybrid_ffn_batched(
-                            backend_, cpu_be, chunk_cfg, chunk_desc, storage,
-                            chunk_post.data()     + (size_t)fb * (size_t)hidden,
-                            chunk_selected.data() + (size_t)fb * (size_t)n_expert_used,
-                            chunk_weights.data()  + (size_t)fb * (size_t)n_expert_used,
-                            fl, sub_out, &result.error)) {
-                        step_graph_destroy(prefill_sg);
-                        return result;
-                    }
-                    std::memcpy(ffn_batch_out.data() + (size_t)fb * (size_t)hidden,
-                                sub_out.data(),
-                                (size_t)fl * (size_t)hidden * sizeof(float));
+                std::vector<float> ffn_batch_out;
+                if (!eval_moe_hybrid_ffn_batched(
+                        backend_, cpu_be, chunk_cfg, chunk_desc, storage,
+                        chunk_post.data(),
+                        chunk_selected.data(),
+                        chunk_weights.data(),
+                        chunk_len, ffn_batch_out, &result.error,
+                        &ffn_hot_alloc, &ffn_cold_alloc)) {
+                    step_graph_destroy(prefill_sg);
+                    if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+                    if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
+                    return result;
                 }
 
                 // Combine: FFN output + residual → embed_all for next layer
@@ -1310,10 +1315,11 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
                     }
                 }
             }
-
-            step_graph_destroy(prefill_sg);
         }
     }
+    step_graph_destroy(prefill_sg);
+    if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+    if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
 
     // Project logits from last token's hidden state
     cache_.cur_pos = N;
