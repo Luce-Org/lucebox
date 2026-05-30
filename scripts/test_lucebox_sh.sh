@@ -870,6 +870,246 @@ test_completion_bash() {
 }
 test_completion_bash "lucebox completion bash completes a known prefix"
 
+# ── docker exec routing ───────────────────────────────────────────────────
+# When the lucebox container is running, steady-state subcommands must
+# `docker exec` into it (cheap + shares the live server's net namespace) and
+# service-restarting subcommands (autotune --sweep, serve, ...) must stay on
+# `docker run`. We mock docker via a PATH shim that:
+#   - on `docker ps -q -f name=^lucebox$` prints a fake container id
+#     (signals "container is running") iff DOCKER_FAKE_RUNNING=1.
+#   - on any other call (run, exec, pull, ...) echoes its argv on stdout and
+#     exits 0. The test then asserts on the captured first-token (run vs exec)
+#     and trailing argv.
+#
+# nvidia-smi is stubbed too so probe_host doesn't barf, but the captured argv
+# we care about is the docker invocation downstream of dispatch.
+_make_docker_shim() {
+    local sandbox="$1" running="$2"
+    local shim_dir="$sandbox/bin"
+    mkdir -p "$shim_dir"
+    # docker shim: dispatch on first arg. Important: ps -q -f name=^lucebox$
+    # must print a fake id when DOCKER_FAKE_RUNNING=1 and nothing otherwise.
+    # All other invocations (run, exec, pull) print "DOCKER_INVOKED <argv>"
+    # on stdout so the caller can grep it.
+    cat > "$shim_dir/docker" <<STUB
+#!/usr/bin/env bash
+case "\$1" in
+    ps)
+        # The wrapper calls: docker ps -q -f name=^lucebox\$
+        if [ "$running" = "1" ]; then
+            echo "deadbeefcafe"
+        fi
+        exit 0
+        ;;
+    version)
+        echo "29.1.3"
+        exit 0
+        ;;
+    inspect)
+        # cmd_serve probes container state — only relevant for the serve
+        # path which our tests don't drive. Return "absent" defensively.
+        echo "absent"
+        exit 0
+        ;;
+    *)
+        printf 'DOCKER_INVOKED'
+        for a in "\$@"; do printf ' %q' "\$a"; done
+        printf '\n'
+        exit 0
+        ;;
+esac
+STUB
+    chmod +x "$shim_dir/docker"
+    # nvidia-smi stub (lets probe_host succeed without real hardware).
+    cat > "$shim_dir/nvidia-smi" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+    *"--query-gpu="*) echo "Fake GPU, 24576, 550.00, 8.9" ;;
+    *) echo "ok" ;;
+esac
+exit 0
+STUB
+    chmod +x "$shim_dir/nvidia-smi"
+}
+
+# Drive the wrapper through the dispatch case under test and capture the
+# docker invocation it would have exec'd. Because `cmd_in_container` /
+# `cmd_exec_in_container` call `exec docker ...` we replace `exec` semantics
+# by running the wrapper in a subshell — the docker shim prints what it was
+# called with and the captured stdout is the proof.
+_run_wrapper_capture_docker() {
+    local sandbox="$1"; shift
+    local shim_dir="$sandbox/bin"
+    set +e
+    HOME="$sandbox" \
+    XDG_CONFIG_HOME="$sandbox/.config" \
+    XDG_DATA_HOME="$sandbox/.local/share" \
+    LUCEBOX_HOME="$sandbox/.lucebox" \
+    PATH="$shim_dir:$PATH" \
+    LUCEBOX_HOST_HAS_DOCKER=1 \
+    LUCEBOX_HOST_HAS_CTK=runtime \
+    LUCEBOX_HOST_GPU_VENDOR=nvidia \
+    LUCEBOX_HOST_DRIVER_MAJOR=550 \
+    LUCEBOX_HOST_DRIVER_VERSION="550.00" \
+    LUCEBOX_HOST_GPU_NAME="Fake GPU" \
+    LUCEBOX_HOST_GPU_COUNT=1 \
+    LUCEBOX_HOST_VRAM_GB=24 \
+    LUCEBOX_HOST_GPU_SM="89" \
+    LUCEBOX_HOST_NPROC=8 \
+    LUCEBOX_HOST_RAM_GB=64 \
+    LUCEBOX_HOST_HAS_SYSTEMD=0 \
+    LUCEBOX_HOST_IS_WSL=0 \
+    LUCEBOX_HOST_DOCKER_VERSION="29.1.3" \
+    _LUCEBOX_HOST_PROBED=1 \
+    NO_COLOR=1 \
+        timeout 10 bash "$SCRIPT" "$@" 2>&1
+    set -e
+}
+
+test_routes_to_exec_when_running() {
+    local label="$1" sandbox out
+    sandbox=$(mktemp -d -t lucebox-route.XXXXXX)
+    _make_docker_shim "$sandbox" 1
+    out=$(_run_wrapper_capture_docker "$sandbox" config get model.preset || true)
+    rm -rf "$sandbox"
+    if ! grep -q '^DOCKER_INVOKED exec' <<<"$out"; then
+        report fail "$label" "expected 'docker exec' invocation; got: $(head -3 <<<"$out")"
+        return
+    fi
+    if grep -q '^DOCKER_INVOKED run' <<<"$out"; then
+        report fail "$label" "got 'docker run' when container is up — should have exec'd"
+        return
+    fi
+    # Sanity: the exec line ends with `lucebox config get model.preset`.
+    if ! grep -qE 'lucebox config get model.preset' <<<"$out"; then
+        report fail "$label" "exec argv missing tail 'lucebox config get model.preset'; got: $(head -3 <<<"$out")"
+        return
+    fi
+    report ok "$label"
+}
+test_routes_to_exec_when_running "config get routes to docker exec when container running"
+
+test_routes_to_run_when_not_running() {
+    local label="$1" sandbox out
+    sandbox=$(mktemp -d -t lucebox-route.XXXXXX)
+    _make_docker_shim "$sandbox" 0
+    out=$(_run_wrapper_capture_docker "$sandbox" config get model.preset || true)
+    rm -rf "$sandbox"
+    if ! grep -q '^DOCKER_INVOKED run' <<<"$out"; then
+        report fail "$label" "expected 'docker run' invocation (container not running); got: $(head -3 <<<"$out")"
+        return
+    fi
+    if grep -q '^DOCKER_INVOKED exec' <<<"$out"; then
+        report fail "$label" "got 'docker exec' but container is not running — should fall back to run"
+        return
+    fi
+    report ok "$label"
+}
+test_routes_to_run_when_not_running "config get falls back to docker run when container not running"
+
+test_sweep_stays_on_run_even_when_running() {
+    local label="$1" sandbox out
+    sandbox=$(mktemp -d -t lucebox-route.XXXXXX)
+    _make_docker_shim "$sandbox" 1
+    out=$(_run_wrapper_capture_docker "$sandbox" autotune --sweep || true)
+    rm -rf "$sandbox"
+    if grep -q '^DOCKER_INVOKED exec' <<<"$out"; then
+        report fail "$label" "autotune --sweep used docker exec — would restart the container it's in"
+        return
+    fi
+    if ! grep -q '^DOCKER_INVOKED run' <<<"$out"; then
+        report fail "$label" "expected 'docker run' for sweep; got: $(head -3 <<<"$out")"
+        return
+    fi
+    report ok "$label"
+}
+test_sweep_stays_on_run_even_when_running "autotune --sweep stays on docker run even when container is up"
+
+test_autotune_no_sweep_uses_exec() {
+    local label="$1" sandbox out
+    sandbox=$(mktemp -d -t lucebox-route.XXXXXX)
+    _make_docker_shim "$sandbox" 1
+    out=$(_run_wrapper_capture_docker "$sandbox" autotune --list-profiles || true)
+    rm -rf "$sandbox"
+    if ! grep -q '^DOCKER_INVOKED exec' <<<"$out"; then
+        report fail "$label" "expected 'docker exec' for autotune --list-profiles; got: $(head -3 <<<"$out")"
+        return
+    fi
+    report ok "$label"
+}
+test_autotune_no_sweep_uses_exec "autotune --list-profiles routes to docker exec when container running"
+
+test_no_exec_flag_forces_run() {
+    local label="$1" sandbox out
+    sandbox=$(mktemp -d -t lucebox-route.XXXXXX)
+    _make_docker_shim "$sandbox" 1
+    # --no-exec must override the prefer-exec path even when container is up.
+    out=$(_run_wrapper_capture_docker "$sandbox" --no-exec config get model.preset || true)
+    rm -rf "$sandbox"
+    if grep -q '^DOCKER_INVOKED exec' <<<"$out"; then
+        report fail "$label" "--no-exec failed to force run path; got exec"
+        return
+    fi
+    if ! grep -q '^DOCKER_INVOKED run' <<<"$out"; then
+        report fail "$label" "expected 'docker run' under --no-exec; got: $(head -3 <<<"$out")"
+        return
+    fi
+    report ok "$label"
+}
+test_no_exec_flag_forces_run "--no-exec flag forces docker run even when container is up"
+
+test_no_exec_env_forces_run() {
+    local label="$1" sandbox out
+    sandbox=$(mktemp -d -t lucebox-route.XXXXXX)
+    _make_docker_shim "$sandbox" 1
+    out=$(
+        LUCEBOX_NO_EXEC=1 _run_wrapper_capture_docker "$sandbox" config get model.preset || true
+    )
+    rm -rf "$sandbox"
+    if grep -q '^DOCKER_INVOKED exec' <<<"$out"; then
+        report fail "$label" "LUCEBOX_NO_EXEC=1 failed to force run path; got exec"
+        return
+    fi
+    if ! grep -q '^DOCKER_INVOKED run' <<<"$out"; then
+        report fail "$label" "expected 'docker run' under LUCEBOX_NO_EXEC=1; got: $(head -3 <<<"$out")"
+        return
+    fi
+    report ok "$label"
+}
+test_no_exec_env_forces_run "LUCEBOX_NO_EXEC=1 env override forces docker run"
+
+test_smoke_routes_to_exec() {
+    local label="$1" sandbox out
+    sandbox=$(mktemp -d -t lucebox-route.XXXXXX)
+    _make_docker_shim "$sandbox" 1
+    out=$(_run_wrapper_capture_docker "$sandbox" smoke || true)
+    rm -rf "$sandbox"
+    if ! grep -q '^DOCKER_INVOKED exec' <<<"$out"; then
+        report fail "$label" "expected 'docker exec' for smoke when running; got: $(head -3 <<<"$out")"
+        return
+    fi
+    # Confirm the exec'd command tail is `lucebox smoke` — the in-container
+    # CLI's argv must NOT be polluted with the dispatcher's bookkeeping.
+    if ! grep -qE 'lucebox smoke' <<<"$out"; then
+        report fail "$label" "exec'd argv missing 'lucebox smoke' tail"
+        return
+    fi
+    report ok "$label"
+}
+test_smoke_routes_to_exec "smoke routes to docker exec when container running"
+
+# ── usage mentions exec-when-running ──────────────────────────────────────
+test_usage_mentions_exec_routing() {
+    local label="$1" out
+    out=$(NO_COLOR=1 bash "$SCRIPT" --help 2>&1)
+    if ! grep -qi 'docker exec\|--no-exec' <<<"$out"; then
+        report fail "$label" "usage doesn't mention the exec routing / --no-exec flag"
+        return
+    fi
+    report ok "$label"
+}
+test_usage_mentions_exec_routing "usage documents docker exec routing + --no-exec flag"
+
 echo
 if [ "$fail" -eq 0 ]; then
     echo "[test_lucebox_sh] $pass passed, 0 failed"

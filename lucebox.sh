@@ -1039,6 +1039,123 @@ cmd_in_container() {
     exec "${argv[@]}"
 }
 
+# Is the long-running lucebox container currently up? Used by the dispatcher
+# to decide between `docker exec` into it (cheap, shares the running server's
+# network namespace so localhost:8080 reaches the server) vs. `docker run`
+# (cold start, isolated network — can't reach the live server).
+#
+# `docker ps -q -f name=^<CONTAINER>$` prints the container id when running,
+# empty otherwise. The anchored regex avoids matching `lucebox-cli-12345`
+# style ephemeral siblings.
+_lucebox_container_running() {
+    # No docker on PATH → definitely not running. Don't even probe.
+    command -v docker >/dev/null 2>&1 || return 1
+    local id
+    id=$(docker ps -q -f "name=^${CONTAINER_NAME}\$" 2>/dev/null || true)
+    [ -n "$id" ]
+}
+
+# `docker exec` variant of cmd_in_container. Same calling convention, but:
+#   - shares the running container's network namespace (localhost:8080 → the
+#     server), filesystem, and mounts — no bind mounts needed.
+#   - skips the ~1-3s cold-start cost of a fresh `docker run --rm`.
+#   - only safe for steady-state / read-only / config-only subcommands. Any
+#     command that restarts the lucebox service (autotune --sweep, serve)
+#     would kill the very container the exec is in — caller must route those
+#     to cmd_in_container instead.
+#
+# Pass through the same env-var subset the run path uses so the in-container
+# CLI sees consistent overrides whichever route it took: HOME, every
+# LUCEBOX_HOST_*, the image/port/container/models scalars, and HF_TOKEN.
+cmd_exec_in_container() {
+    require_host_prereqs
+    ensure_probed
+    local argv=(docker exec)
+    if [ -t 0 ] && [ -t 1 ]; then
+        argv+=(-it)
+    else
+        argv+=(-i)
+    fi
+    argv+=(--user "$(id -u):$(id -g)")
+    argv+=(-w "$PWD")
+    argv+=(-e "HOME=$HOME")
+    local var
+    for var in $(compgen -e | grep '^LUCEBOX_HOST_' || true); do
+        argv+=(-e "$var=${!var}")
+    done
+    argv+=(-e "LUCEBOX_IMAGE=$IMAGE_BASE")
+    argv+=(-e "LUCEBOX_VARIANT=$(pick_variant)")
+    argv+=(-e "LUCEBOX_PORT=$DEFAULT_PORT")
+    argv+=(-e "LUCEBOX_CONTAINER=$CONTAINER_NAME")
+    argv+=(-e "LUCEBOX_MODELS=$DEFAULT_MODELS_DIR")
+    [ -n "${HF_TOKEN:-}" ] && argv+=(-e "HF_TOKEN=$HF_TOKEN")
+    # The image has no top-level `lucebox` binary on PATH — that name only
+    # works as the first arg to /opt/lucebox-hub/server/scripts/entrypoint.sh,
+    # which then `exec uv run ... python -m lucebox`s. docker exec bypasses
+    # the image's ENTRYPOINT, so we invoke the entrypoint shim explicitly
+    # with `lucebox` as its SUBCMD and the user's argv tail. Keeps the
+    # exec path bit-for-bit equivalent to what docker run does on the
+    # SUBCMD=lucebox branch.
+    argv+=("$CONTAINER_NAME" /opt/lucebox-hub/server/scripts/entrypoint.sh lucebox "$@")
+    exec "${argv[@]}"
+}
+
+# Decide whether a given (subcommand, argv) pair is safe to run via
+# `docker exec` into the live container. Returns 0 (yes, prefer exec) or 1
+# (no, must use docker run / host-side).
+#
+# The safe-to-exec set is exactly the steady-state / read-only / hits-the-
+# running-server subcommands. Anything that restarts the service, mutates
+# images, or is itself the long-running service must stay on cmd_in_container.
+#
+# `autotune` is a special case: read-only (`autotune` alone, `--list-profiles`)
+# is exec-safe, but `--sweep` restarts the service per cell and MUST stay on
+# the docker-run path (sweeping into the live container would kill it mid-run).
+_lucebox_prefer_exec() {
+    local cmd="$1"; shift
+    case "$cmd" in
+        config|smoke|models|check|profile|print-run|print-serve-argv)
+            return 0
+            ;;
+        autotune)
+            # Scan the rest of the argv for --sweep. If present, this is a
+            # service-restarting workload and must stay on cmd_in_container.
+            local a
+            for a in "$@"; do
+                [ "$a" = "--sweep" ] && return 1
+            done
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Top-level routing for the in-container Python CLI. Picks between exec
+# (cheap, shares the live server's namespace) and run (cold start, isolated).
+#
+# Decision tree:
+#   1. LUCEBOX_NO_EXEC=1 / --no-exec was set → always run, never exec.
+#      Useful for debugging the wrapper or when the in-container Python is
+#      stale relative to the image.
+#   2. cmd is not in the prefer-exec list → run (sweep, service mutators).
+#   3. container is running → exec (the fast path, hits the live server).
+#   4. container is not running → run (fall back so first-run / pre-install
+#      flows still work without a live service).
+cmd_route_to_container() {
+    local cmd="$1"; shift
+    if [ "${LUCEBOX_NO_EXEC:-0}" = "1" ]; then
+        cmd_in_container "$cmd" "$@"
+        return
+    fi
+    if _lucebox_prefer_exec "$cmd" "$@" && _lucebox_container_running; then
+        cmd_exec_in_container "$cmd" "$@"
+        return
+    fi
+    cmd_in_container "$cmd" "$@"
+}
+
 usage() {
     cat <<EOF
 $SCRIPT_NAME $VERSION — host-side wrapper for the lucebox-hub container
@@ -1077,13 +1194,38 @@ Environment overrides:
   LUCEBOX_PORT          host port for the server (default: 8080)
   LUCEBOX_CONTAINER     server container name (default: lucebox)
   LUCEBOX_MODELS        host model directory (default: \$XDG_DATA_HOME/lucebox/models
-  HF_TOKEN              propagated to `models download` for gated HF repos
+  LUCEBOX_NO_EXEC=1     force docker-run for in-container subcommands even
+                        when the container is up (equivalent to --no-exec)
+  HF_TOKEN              propagated to \`models download\` for gated HF repos
+
+Container routing:
+  When the long-running '$CONTAINER_NAME' container is up, steady-state
+  subcommands (config, smoke, models, check, profile, print-run,
+  print-serve-argv, autotune without --sweep) 'docker exec' into it instead
+  of starting a fresh container. This avoids the ~1-3s docker-run cold-start
+  AND shares the live server's network namespace so localhost:\$LUCEBOX_PORT
+  reaches the server. Service-restarting commands (autotune --sweep, serve,
+  pull, update, install, etc.) stay on the host-side / docker-run path.
+  Pass --no-exec (or LUCEBOX_NO_EXEC=1) to force the docker-run path.
 EOF
 }
 
 # ── dispatch ──────────────────────────────────────────────────────────────
 
 main() {
+    # Global flag pass: `--no-exec` anywhere before the subcommand forces the
+    # docker-run path even if the container is up. Equivalent to
+    # `LUCEBOX_NO_EXEC=1 lucebox ...`. We pop it out of argv up-front so the
+    # rest of dispatch doesn't have to know about it.
+    local args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-exec) export LUCEBOX_NO_EXEC=1; shift ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    set -- "${args[@]}"
+
     local cmd="${1:-help}"
     [ $# -gt 0 ] && shift
     case "$cmd" in
@@ -1114,8 +1256,11 @@ main() {
         help|--help|-h)   usage ;;
         version|--version) printf '%s\n' "$VERSION" ;;
 
-        # Everything else → in-container Python CLI
-        *)                cmd_in_container "$cmd" "$@" ;;
+        # Everything else → in-container Python CLI. cmd_route_to_container
+        # picks between `docker exec` into the live container (cheap, shares
+        # the running server's network namespace) and `docker run` (cold,
+        # isolated) based on container state + the safe-to-exec command set.
+        *)                cmd_route_to_container "$cmd" "$@" ;;
     esac
 }
 
