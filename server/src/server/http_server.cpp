@@ -1524,6 +1524,7 @@ void HttpServer::worker_loop() {
         // If pflash is enabled and prompt exceeds threshold, compress.
         std::vector<int32_t> effective_prompt = req.prompt_tokens;
         bool pflash_compressed = false;
+        bool pflash_is_agentic = false;  // hoisted for post-generate guard
 
         if (config_.pflash_mode != ServerConfig::PflashMode::OFF &&
             drafter_tokenizer_ != nullptr)
@@ -1594,6 +1595,7 @@ void HttpServer::worker_loop() {
                             const bool is_agentic = (detect_request_type(
                                 _has_tools, _has_tool_use_blocks, _has_tool_calls)
                                     == RequestType::Agentic);
+                            pflash_is_agentic = is_agentic;  // hoist for post-generate guard
                             const RequestFeatures rf {
                                 is_agentic,
                                 n_prompt
@@ -1608,7 +1610,32 @@ void HttpServer::worker_loop() {
                                 if (req.session_id.empty()) {
                                     creq.keep_ratio = (float)rd.keep_target;
                                 } else {
-                                    creq.keep_ratio = sessions_.get_keep_ratio(req.session_id);
+                                    // PIECE 2: recover_full_next — one-shot full-keep recovery
+                                    // after a compression_failed turn.  Consumed here (one turn).
+                                    if (!req.session_id.empty() &&
+                                        sessions_.consume_recover_full_next(req.session_id)) {
+                                        creq.keep_ratio = (float)config_.pflash_router.full_keep_target;
+                                        std::fprintf(stderr,
+                                            "[pflash-guard] recover_full_next consumed — "
+                                            "session=%s full_keep=%.3f\n",
+                                            req.session_id.c_str(), creq.keep_ratio);
+                                    } else {
+                                        // PIECE 1: floor clamp — bandit must not undercut
+                                        // the router's agentic floor.
+                                        float raw_keep = sessions_.get_keep_ratio(req.session_id);
+                                        creq.keep_ratio = (float)clamp_keep_to_floor(
+                                            raw_keep,
+                                            config_.pflash_router.agentic_keep_target,
+                                            is_agentic);
+                                        if (is_agentic && creq.keep_ratio > raw_keep) {
+                                            std::fprintf(stderr,
+                                                "[pflash-router] floor-clamp: "
+                                                "agentic bandit %.3f < floor %.3f → %.3f\n",
+                                                raw_keep,
+                                                config_.pflash_router.agentic_keep_target,
+                                                creq.keep_ratio);
+                                        }
+                                    }
                                 }
                                 // cascade = use_transitive: 0 = off, 1 = on, -1 = env default
                                 creq.use_transitive = rd.cascade ? 1 : 0;
@@ -2117,18 +2144,36 @@ void HttpServer::worker_loop() {
         // doesn't grow monotonically across requests with different sizes.
         backend_.release_scratch();
 
-        // Bandit: update when spec decode actually ran — including 0-accept case,
-        // which signals the current keep_ratio is too low.
-        if (!req.session_id.empty() && result.spec_decode_ran) {
-            float old_keep = sessions_.get_keep_ratio(req.session_id);
-            int   old_turn = sessions_.turn_count(req.session_id);
-            sessions_.update(req.session_id, result.accept_rate);
-            float new_keep = sessions_.get_keep_ratio(req.session_id);
-            float ema      = sessions_.get_ema(req.session_id);
+        // PIECE 2: compression failure guard — deterministic recovery.
+        // When an agentic compressed turn produces an empty or degenerate response:
+        //   (a) skip the bandit update (failure noise — don't reward/penalise)
+        //   (b) schedule full-keep recovery for the next turn of this session
+        const bool agentic_compressed = pflash_is_agentic && pflash_compressed;
+        const int  n_response_tokens  = (int)result.tokens.size();
+        if (!req.session_id.empty() &&
+            compression_failed(n_response_tokens, result.degenerate_decode_close,
+                               agentic_compressed)) {
             std::fprintf(stderr,
-                "[pflash-bandit] session=%s turn=%d keep=%.4f->%.4f ema=%.3f accept=%.3f\n",
-                req.session_id.c_str(), old_turn + 1,
-                old_keep, new_keep, ema, result.accept_rate);
+                "[pflash-guard] compression_failed → full-keep next: "
+                "session=%s resp_tokens=%d degenerate=%s\n",
+                req.session_id.c_str(), n_response_tokens,
+                result.degenerate_decode_close ? "true" : "false");
+            sessions_.set_recover_full_next(req.session_id);
+            // Fall through — skip bandit update below (spec_decode_ran may still be true).
+        } else {
+            // Bandit: update when spec decode actually ran — including 0-accept case,
+            // which signals the current keep_ratio is too low.
+            if (!req.session_id.empty() && result.spec_decode_ran) {
+                float old_keep = sessions_.get_keep_ratio(req.session_id);
+                int   old_turn = sessions_.turn_count(req.session_id);
+                sessions_.update(req.session_id, result.accept_rate);
+                float new_keep = sessions_.get_keep_ratio(req.session_id);
+                float ema      = sessions_.get_ema(req.session_id);
+                std::fprintf(stderr,
+                    "[pflash-bandit] session=%s turn=%d keep=%.4f->%.4f ema=%.3f accept=%.3f\n",
+                    req.session_id.c_str(), old_turn + 1,
+                    old_keep, new_keep, ema, result.accept_rate);
+            }
         }
 
 

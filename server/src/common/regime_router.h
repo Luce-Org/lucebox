@@ -68,6 +68,38 @@ inline RouterDecisionV2 decide_v2(const RequestFeatures& f,
     return { p.full_keep_target, true, "retrieval_full" };
 }
 
+// ─── PIECE 1: floor clamp ────────────────────────────────────────────────────
+//
+// When the router routed a request as agentic, the bandit must not compress
+// harder than the router's agentic_keep_target floor.  Non-agentic sessions
+// are passed through unchanged (bandit drives retrieval sessions freely).
+//
+// Pure, stdlib-only, no IO.
+inline double clamp_keep_to_floor(double bandit_keep,
+                                   double router_floor,
+                                   bool   agentic) {
+    if (!agentic) return bandit_keep;
+    return bandit_keep >= router_floor ? bandit_keep : router_floor;
+}
+
+// ─── PIECE 2: compression failure guard ──────────────────────────────────────
+//
+// Returns true when a compressed agentic turn produced an empty or degenerate
+// response.  Used to skip the bandit update (failure noise) and schedule a
+// full-keep recovery for the next turn.
+//
+// Fires ONLY on the agentic+compressed path — non-compressed failures are not
+// our fault and do not need recovery.
+//
+// Pure, stdlib-only, no IO.
+inline bool compression_failed(int  response_tokens,
+                                bool degenerate_close,
+                                bool agentic_compressed,
+                                int  min_tokens = 8) {
+    if (!agentic_compressed) return false;
+    return response_tokens < min_tokens || degenerate_close;
+}
+
 // ─── TYPE GATE ───────────────────────────────────────────────────────────────
 //
 // Coarse request-type classifier.  Pure function — no IO, no globals, no JSON.

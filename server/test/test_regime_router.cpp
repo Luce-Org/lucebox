@@ -276,6 +276,108 @@ static void t18_detect_request_type() {
     }
 }
 
+// ─── T19: clamp_keep_to_floor ────────────────────────────────────────────────
+// agentic=true  → effective keep = max(bandit_keep, router_floor)
+// agentic=false → pass through bandit_keep unchanged
+// bandit_keep > floor → no clamping even for agentic
+
+static void t19_clamp_keep_to_floor() {
+    // Agentic + bandit below floor → clamped up to floor.
+    {
+        double result = clamp_keep_to_floor(0.10, 0.25, /*agentic=*/true);
+        TEST_ASSERT_MSG(approx_eq(result, 0.25),
+                        "T19a: agentic, bandit 0.10 < floor 0.25 -> clamped to 0.25");
+    }
+    // Agentic + bandit == floor → returns floor.
+    {
+        double result = clamp_keep_to_floor(0.25, 0.25, /*agentic=*/true);
+        TEST_ASSERT_MSG(approx_eq(result, 0.25),
+                        "T19b: agentic, bandit == floor -> 0.25");
+    }
+    // Agentic + bandit above floor → no clamping (bandit wins).
+    {
+        double result = clamp_keep_to_floor(0.30, 0.25, /*agentic=*/true);
+        TEST_ASSERT_MSG(approx_eq(result, 0.30),
+                        "T19c: agentic, bandit 0.30 > floor 0.25 -> 0.30 (bandit wins)");
+    }
+    // Non-agentic → pass through, even if below floor.
+    {
+        double result = clamp_keep_to_floor(0.05, 0.25, /*agentic=*/false);
+        TEST_ASSERT_MSG(approx_eq(result, 0.05),
+                        "T19d: non-agentic -> 0.05 passed through unchanged");
+    }
+    // Non-agentic, bandit above floor → pass through.
+    {
+        double result = clamp_keep_to_floor(0.50, 0.25, /*agentic=*/false);
+        TEST_ASSERT_MSG(approx_eq(result, 0.50),
+                        "T19e: non-agentic, bandit above floor -> 0.50 passed through");
+    }
+    // Agentic, bandit=0.0 (minimum possible) → clamped to floor.
+    {
+        double result = clamp_keep_to_floor(0.0, 0.25, /*agentic=*/true);
+        TEST_ASSERT_MSG(approx_eq(result, 0.25),
+                        "T19f: agentic, bandit=0.0 -> clamped to floor 0.25");
+    }
+}
+
+// ─── T20: compression_failed truth table ─────────────────────────────────────
+// Returns true iff agentic_compressed && (response_tokens < min_tokens || degenerate_close).
+// When not agentic_compressed, always false.
+
+static void t20_compression_failed() {
+    // agentic_compressed=true, response_tokens < min_tokens → failed.
+    {
+        bool result = compression_failed(/*response_tokens=*/3, /*degenerate_close=*/false,
+                                         /*agentic_compressed=*/true, /*min_tokens=*/8);
+        TEST_ASSERT_MSG(result, "T20a: agentic, 3 tokens < 8 min -> failed=true");
+    }
+    // agentic_compressed=true, response_tokens == min_tokens-1 → failed.
+    {
+        bool result = compression_failed(7, false, true, 8);
+        TEST_ASSERT_MSG(result, "T20b: agentic, 7 < 8 -> failed=true");
+    }
+    // agentic_compressed=true, response_tokens == min_tokens → NOT failed.
+    {
+        bool result = compression_failed(8, false, true, 8);
+        TEST_ASSERT_MSG(!result, "T20c: agentic, 8 == 8 -> failed=false");
+    }
+    // agentic_compressed=true, response_tokens > min_tokens → NOT failed (normal).
+    {
+        bool result = compression_failed(100, false, true, 8);
+        TEST_ASSERT_MSG(!result, "T20d: agentic, 100 tokens, normal -> failed=false");
+    }
+    // agentic_compressed=true, degenerate_close=true (even with enough tokens) → failed.
+    {
+        bool result = compression_failed(50, /*degenerate_close=*/true, true, 8);
+        TEST_ASSERT_MSG(result, "T20e: agentic, degenerate_close -> failed=true");
+    }
+    // agentic_compressed=true, both degenerate + empty → failed.
+    {
+        bool result = compression_failed(0, true, true, 8);
+        TEST_ASSERT_MSG(result, "T20f: agentic, 0 tokens + degenerate -> failed=true");
+    }
+    // agentic_compressed=false, even with empty response → NOT failed (not our fault).
+    {
+        bool result = compression_failed(0, false, /*agentic_compressed=*/false, 8);
+        TEST_ASSERT_MSG(!result, "T20g: not agentic_compressed, empty -> failed=false");
+    }
+    // agentic_compressed=false, degenerate_close=true → NOT failed (guard only fires on compression path).
+    {
+        bool result = compression_failed(0, true, false, 8);
+        TEST_ASSERT_MSG(!result, "T20h: not agentic_compressed, degenerate -> failed=false");
+    }
+    // Default min_tokens=8: verify default is honoured.
+    {
+        bool result = compression_failed(5, false, true);
+        TEST_ASSERT_MSG(result, "T20i: agentic, 5<8 with default min_tokens -> failed=true");
+    }
+    // Default min_tokens=8: 8 tokens → not failed.
+    {
+        bool result = compression_failed(8, false, true);
+        TEST_ASSERT_MSG(!result, "T20j: agentic, 8 tokens with default min_tokens -> failed=false");
+    }
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -289,6 +391,10 @@ int main() {
 
     std::fprintf(stderr, "--- detect_request_type ---\n");
     RUN_TEST(t18_detect_request_type);
+
+    std::fprintf(stderr, "--- floor clamp + compression_failed ---\n");
+    RUN_TEST(t19_clamp_keep_to_floor);
+    RUN_TEST(t20_compression_failed);
 
     std::fprintf(stderr, "\n%d tests, %d failures\n", test_count, test_failures);
     return (test_failures == 0) ? 0 : 1;
