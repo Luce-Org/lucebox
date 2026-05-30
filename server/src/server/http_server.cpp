@@ -1222,10 +1222,74 @@ void HttpServer::worker_loop() {
                         // 3. Compress via typed API
                         ModelBackend::CompressRequest creq;
                         creq.input_ids = std::move(drafter_ids);
-                        // Bandit: use per-session keep_ratio if session_id provided.
-                        creq.keep_ratio = req.session_id.empty()
-                            ? config_.pflash_keep_ratio
-                            : sessions_.get_keep_ratio(req.session_id);
+
+                        // TYPE-GATE router (default-off via pflash_router.enabled).
+                        // When enabled, detect request type and override keep_ratio +
+                        // cascade per the v2 policy.  When disabled → exact no-op.
+                        {
+                            // Extract agentic-signal bools from the parsed JSON
+                            // (json-walking belongs at the handler boundary, not
+                            //  in the pure router header).
+                            const bool _has_tools =
+                                req.tools.is_array() && !req.tools.empty();
+                            bool _has_tool_use_blocks = false;
+                            bool _has_tool_calls      = false;
+                            if (req.messages.is_array()) {
+                                for (const auto & _msg : req.messages) {
+                                    if (!_msg.is_object()) continue;
+                                    if (_msg.contains("tool_calls")) {
+                                        const auto & _tc = _msg["tool_calls"];
+                                        if (_tc.is_array() && !_tc.empty())
+                                            _has_tool_calls = true;
+                                    }
+                                    if (_msg.contains("content")) {
+                                        const auto & _c = _msg["content"];
+                                        if (_c.is_array()) {
+                                            for (const auto & _b : _c) {
+                                                if (!_b.is_object()) continue;
+                                                const std::string _bt = _b.value("type", "");
+                                                if (_bt == "tool_use" || _bt == "tool_result")
+                                                    _has_tool_use_blocks = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            const bool is_agentic = (detect_request_type(
+                                _has_tools, _has_tool_use_blocks, _has_tool_calls)
+                                    == RequestType::Agentic);
+                            const RequestFeatures rf {
+                                is_agentic,
+                                n_prompt
+                            };
+                            const RouterDecisionV2 rd = decide_v2(rf, config_.pflash_router);
+                            if (config_.pflash_router.enabled) {
+                                // Router is on: apply per-request keep + cascade override.
+                                // Bandit keeps winning if session_id is present — bandit
+                                // is the M2 lever for agentic keep level tuning.
+                                // For M1 the TYPE decision overrides keep_ratio when no
+                                // session bandit is active.
+                                if (req.session_id.empty()) {
+                                    creq.keep_ratio = (float)rd.keep_target;
+                                } else {
+                                    creq.keep_ratio = sessions_.get_keep_ratio(req.session_id);
+                                }
+                                // cascade = use_transitive: 0 = off, 1 = on, -1 = env default
+                                creq.use_transitive = rd.cascade ? 1 : 0;
+                                std::fprintf(stderr,
+                                    "[pflash-router] type=%s keep=%.3f cascade=%s reason=%s\n",
+                                    is_agentic ? "agentic" : "retrieval",
+                                    creq.keep_ratio,
+                                    rd.cascade ? "on" : "off",
+                                    rd.reason);
+                            } else {
+                                // Router disabled: legacy keep_ratio path, no change.
+                                creq.keep_ratio = req.session_id.empty()
+                                    ? config_.pflash_keep_ratio
+                                    : sessions_.get_keep_ratio(req.session_id);
+                                // use_transitive stays at -1 (env default).
+                            }
+                        }
                         creq.drafter_path = config_.pflash_drafter_path;
                         creq.drafter_gpu = config_.pflash_drafter_gpu;
                         creq.skip_park = config_.pflash_skip_park;

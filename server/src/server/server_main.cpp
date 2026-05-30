@@ -540,6 +540,21 @@ int main(int argc, char ** argv) {
                      sconfig.pflash_threshold, sconfig.pflash_keep_ratio,
                      sconfig.pflash_drafter_gpu,
                      (int)sconfig.pflash_skip_park);
+        // TYPE-gate router: opt-in via env var, default-off.
+        {
+            const char * router_env = std::getenv("PFLASH_ROUTER_ENABLE");
+            if (router_env && *router_env && std::strcmp(router_env, "0") != 0) {
+                sconfig.pflash_router.enabled = true;
+                // Inherit pflash threshold so the router fires at the same
+                // token count as the compression admission gate.
+                sconfig.pflash_router.threshold_tokens = sconfig.pflash_threshold;
+                std::fprintf(stderr,
+                    "[server] pflash-router: ENABLED (type-gate v2) "
+                    "threshold=%d agentic_keep=%.3f\n",
+                    sconfig.pflash_router.threshold_tokens,
+                    sconfig.pflash_router.agentic_keep_target);
+            }
+        }
     }
 
     // Create backend.
@@ -771,6 +786,7 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "[server] │  pflash_skip_park= %s\n", sconfig.pflash_skip_park ? "ON" : "off");
         std::fprintf(stderr, "[server] │  fp_use_bsa      = %s\n", getenv("DFLASH_FP_USE_BSA") ? "ON" : "off");
         std::fprintf(stderr, "[server] │  fp_alpha        = %s\n", getenv("DFLASH_FP_ALPHA") ? getenv("DFLASH_FP_ALPHA") : "0.12 (default)");
+        std::fprintf(stderr, "[server] │  pflash_router   = %s\n", sconfig.pflash_router.enabled ? "ON" : "off");
     }
     if (bargs.draft_path) {
         std::fprintf(stderr, "[server] │  lazy_draft      = %s\n", sconfig.lazy_draft ? "ON" : "off");

@@ -18,7 +18,6 @@
 #include "common/backend_precision.h"
 #include "internal.h"
 #include "anchor_scan.h"
-#include "regime_router.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -81,13 +80,13 @@ struct CompressCfg {
     int   query_tokens;
     int   head_chunks;
     int   tail_chunks;
-    int   recency_floor_tokens; // PFLASH_RECENCY_FLOOR_TOKENS: force-keep last N tokens (0 = off)
     dflash::qwen3::AnchorScanCfg anchor;
     bool  use_transitive;
     int   max_iters;
 };
 
-static CompressCfg compress_cfg_from_env(int n_chunks, int n_keep) {
+static CompressCfg compress_cfg_from_env(int n_chunks, int n_keep,
+                                          int use_transitive_override = -1) {
     CompressCfg c{};
 
     c.query_tokens = env_int("DFLASH_COMPRESS_QUERY_TOKENS", 96);
@@ -162,6 +161,10 @@ static CompressCfg compress_cfg_from_env(int n_chunks, int n_keep) {
     c.anchor.max_forced_count         = (int)(max_forced_ratio * n_keep);
 
     c.use_transitive = [&]{
+        // Per-request override (0=off, 1=on) from router decision takes precedence.
+        if (use_transitive_override == 0) return false;
+        if (use_transitive_override == 1) return true;
+        // Fallback: read from env (same as before, no behaviour change when -1).
         const int nv = env_int("PFLASH_COMPRESS_ANCHOR_TRANSITIVE", -1);
         const int lv = env_int("DFLASH_COMPRESS_ANCHOR_TRANSITIVE", -1);
         if (nv >= 0) return nv != 0;
@@ -176,23 +179,6 @@ static CompressCfg compress_cfg_from_env(int n_chunks, int n_keep) {
         if (lv >= 0) { fprintf(stderr, "[WARN] DFLASH_COMPRESS_ANCHOR_MAX_ITERS deprecated, use PFLASH_COMPRESS_ANCHOR_MAX_ITERS\n"); return lv; }
         return 3;
     }();
-
-    // Recency floor: unconditionally force-keep the last R tokens of the prompt
-    // body before anchor scoring.  DEFAULT 0 = no-op (unchanged behavior).
-    //   0  = off
-    //  -1  = auto: min(1024, ceil(0.04 * S))  [resolved at compress time when S is known]
-    //  >0  = explicit token count
-    // Note: env_int() rejects negatives, so read raw and parse to preserve -1.
-    // Rescues recent wiring-sequence turns dropped when anchors seed from a
-    // short/sparse tail (e.g. bare [tool_result] turns).
-    {
-        const char * rfv = std::getenv("PFLASH_RECENCY_FLOOR_TOKENS");
-        if (rfv) {
-            c.recency_floor_tokens = std::atoi(rfv);  // preserves -1 sentinel
-        } else {
-            c.recency_floor_tokens = 0;
-        }
-    }
 
     return c;
 }
@@ -381,7 +367,8 @@ static std::vector<int32_t> qwen35_score_and_compress(
     float keep_ratio,
     int chunk_size,
     int n_lookahead,
-    int pool_kernel) {
+    int pool_kernel,
+    int use_transitive_override = -1) {
 
     const int S = (int)ids.size();
     const int hidden = w.n_embd;
@@ -658,7 +645,7 @@ static std::vector<int32_t> qwen35_score_and_compress(
     }
     std::sort(chunk_means.begin(), chunk_means.end(), [](auto a, auto b) { return a.first > b.first; });
 
-    const CompressCfg cfg = compress_cfg_from_env(n_chunks, n_keep);
+    const CompressCfg cfg = compress_cfg_from_env(n_chunks, n_keep, use_transitive_override);
 
     std::vector<uint8_t> selected((size_t)n_chunks, 0);
     int count = 0;
@@ -668,19 +655,6 @@ static std::vector<int32_t> qwen35_score_and_compress(
     const int q0 = std::max(0, S - cfg.query_tokens);
     std::vector<int32_t> query_pool(ids.begin() + q0, ids.end());
     std::vector<uint8_t> forced((size_t)n_chunks, 0);
-
-    // Recency floor: force-keep the last R tokens worth of chunks before anchor
-    // scoring so that recent wiring-sequence turns are never dropped regardless
-    // of anchor seed quality.  R=0 is a no-op (default).  R=-1 = auto.
-    {
-        const int R = dflash::common::recency_floor_for(S, cfg.recency_floor_tokens);
-        if (R > 0) {
-            const int floor_tok = std::min(S, R);
-            const int floor_start_tok = S - floor_tok;
-            const int floor_start_chunk = floor_start_tok / chunk_size;
-            for (int c = floor_start_chunk; c < n_chunks; ++c) forced[(size_t)c] = 1;
-        }
-    }
 
     dflash::qwen3::AnchorScanCfg anchor_cfg = cfg.anchor;
     anchor_cfg.chunk_size = chunk_size;
@@ -775,7 +749,8 @@ std::vector<int32_t> drafter_score_and_compress(
     float keep_ratio,
     int chunk_size,
     int n_lookahead,
-    int pool_kernel) {
+    int pool_kernel,
+    int use_transitive_override) {
     if (!ctx.loaded) {
         set_last_error("drafter not loaded");
         return {};
@@ -786,7 +761,7 @@ std::vector<int32_t> drafter_score_and_compress(
             return {};
         }
         auto * st = static_cast<Qwen35DrafterState *>(ctx.arch_state);
-        return qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size, n_lookahead, pool_kernel);
+        return qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size, n_lookahead, pool_kernel, use_transitive_override);
     }
     const int S = (int)ids.size();
     if (S < n_lookahead + 1) {
@@ -843,35 +818,20 @@ std::vector<int32_t> drafter_score_and_compress(
     std::sort(chunk_means.begin(), chunk_means.end(),
                       [](auto a, auto b) { return a.first > b.first; });
 
-    const CompressCfg cfg = compress_cfg_from_env(n_chunks, n_keep);
+    const CompressCfg cfg = compress_cfg_from_env(n_chunks, n_keep, use_transitive_override);
 
     std::vector<uint8_t> selected_mask((size_t)n_chunks, 0);
     std::vector<uint8_t> forced((size_t)n_chunks, 0);
     for (int c = 0; c < std::min(n_chunks, cfg.head_chunks); ++c) forced[(size_t)c] = 1;
     for (int c = std::max(0, n_chunks - cfg.tail_chunks); c < n_chunks; ++c) forced[(size_t)c] = 1;
 
-    // Recency floor: force-keep the last R tokens worth of chunks before anchor
-    // scoring so that recent wiring-sequence turns are never dropped regardless
-    // of anchor seed quality.  R=0 is a no-op (default).  R=-1 = auto.
-    {
-        const int R = dflash::common::recency_floor_for(S, cfg.recency_floor_tokens);
-        if (R > 0) {
-            const int floor_tok = std::min(S, R);
-            const int floor_start_tok = S - floor_tok;
-            const int floor_start_chunk = floor_start_tok / chunk_size;
-            for (int c = floor_start_chunk; c < n_chunks; ++c) forced[(size_t)c] = 1;
-        }
-    }
-
     const int q0 = std::max(0, S - cfg.query_tokens);
     {
-        const int resolved_R = dflash::common::recency_floor_for(S, cfg.recency_floor_tokens);
         std::vector<int32_t> query_pool(ids.begin() + q0, ids.end());
         dflash::qwen3::AnchorScanCfg anchor_cfg = cfg.anchor;
         anchor_cfg.chunk_size = chunk_size;
-        std::fprintf(stderr, "[drafter_cascade] n_keep=%d max_forced=%d min_anchor=%d recency_floor=%d (resolved=%d)\n",
-            n_keep, anchor_cfg.max_forced_count, anchor_cfg.cascade_min_anchor_count,
-            cfg.recency_floor_tokens, resolved_R);
+        std::fprintf(stderr, "[drafter_cascade] n_keep=%d max_forced=%d min_anchor=%d\n",
+            n_keep, anchor_cfg.max_forced_count, anchor_cfg.cascade_min_anchor_count);
         std::fflush(stderr);
 
         if (cfg.use_transitive) {
@@ -933,6 +893,20 @@ std::vector<int32_t> drafter_score_and_compress(
     std::fflush(stderr);
 
     return out;
+}
+
+// ABI-stable 6-arg overload — old callers compiled before the use_transitive_override
+// parameter was added link here without requiring recompilation.
+std::vector<int32_t> drafter_score_and_compress(
+    DrafterContext & ctx,
+    const std::vector<int32_t> & ids,
+    float keep_ratio,
+    int chunk_size,
+    int n_lookahead,
+    int pool_kernel) {
+    return drafter_score_and_compress(ctx, ids, keep_ratio,
+                                      chunk_size, n_lookahead, pool_kernel,
+                                      /*use_transitive_override=*/-1);
 }
 
 } // namespace dflash::common

@@ -12,6 +12,7 @@
 #pragma once
 
 #include "common/model_backend.h"
+#include "common/regime_router.h"
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool_memory.h"
@@ -150,6 +151,11 @@ struct ServerConfig {
     RemoteDraftConfig pflash_remote;        // IPC binary/work-dir for remote PFlash drafter
     bool        pflash_skip_park = false;   // skip park/unpark for >=32GB GPUs
     bool        lazy_draft      = false;   // park decode draft when idle to save VRAM
+
+    // TYPE-gate compression router (v2).
+    // Default: disabled (exact no-op, correct-by-construction).
+    // Enable via PFLASH_ROUTER_ENABLE=1 env var at server startup.
+    RouterPolicyV2 pflash_router;          // enabled=false by default
 
     // Disk prefix cache
     std::string disk_cache_dir;             // empty = disabled
