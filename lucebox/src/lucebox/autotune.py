@@ -71,6 +71,12 @@ def runtime_from_host(host: HostFacts) -> DflashRuntime:
     if host.vram_gb < 22:
         return DflashRuntime(max_ctx=32768)
     if host.vram_gb < 32:
+        # tq3_0 is required at 98K on 23 GB cards: model (~18-19 GB) +
+        # q8_0 KV cache at 98K (~5-6 GB) = 24-25 GB → OOM.
+        # tq3_0 KV (~2 GB) leaves ~3 GB headroom. Confirmed on bragi
+        # (RTX 5090 Laptop, 23 GB VRAM) 2026-05-30 — q8_0 timed out on
+        # every 98K cell; all tq3_0 cells passed. See
+        # docs/experiments/qwen3.6-27b-coding-agent-loop-sweep-bragi-2026-05-30.md
         if host.is_wsl:
             # Bumped from max_ctx=65536 → 98304 on 2026-05-30 after the
             # coding-agent-loop sweep on sindri proved 98K serves real
@@ -79,8 +85,14 @@ def runtime_from_host(host: HostFacts) -> DflashRuntime:
             # docs/experiments/gemma4-26b-coding-agent-loop-sweep-2026-05-30.md.
             # The original 65K cap cited unverified VMM failures —
             # bisect history showed no commit reproducing them.
-            return DflashRuntime(budget=16, max_ctx=98304)
-        return DflashRuntime(max_ctx=98304)
+            return DflashRuntime(
+                budget=16, max_ctx=98304,
+                cache_type_k="tq3_0", cache_type_v="tq3_0",
+            )
+        return DflashRuntime(
+            max_ctx=98304,
+            cache_type_k="tq3_0", cache_type_v="tq3_0",
+        )
     if host.vram_gb < 48:
         return DflashRuntime(max_ctx=131072)
     return DflashRuntime(max_ctx=131072)
@@ -221,14 +233,21 @@ def _coding_agent_loop_gemma_bracket(
 
     KV-quant axis is intentionally absent — gemma4_loader.cpp forces
     F16 regardless of ``cache_type_k/v``. The 24 GB tier targets up to
-    131K max_ctx (proven on sindri 2026-05-29 with VRAM headroom);
-    higher tiers also peak at 131K because that is the model's
-    practical ceiling (196K KV doesn't fit alongside the Q4_K_M
+    131K max_ctx; higher tiers also peak at 131K because that is the
+    model's practical ceiling (196K KV doesn't fit alongside the Q4_K_M
     weights even on 48 GB cards — model+KV would be ~33 GB).
+
+    131K is confirmed viable on 23-24 GB VRAM: model (~14-15 GB) +
+    F16 KV at 131K (~7-8 GB) ≈ 22-23 GB total. Validated on bragi
+    (RTX 5090 Laptop, 23 GB) 2026-05-30 — all 6 131K cells passed.
+    Earlier sindri run (RTX 3090 Ti, 24 GB) appeared to fail at 131K,
+    but that was a fixture-picker issue (selected the 100K case which
+    expanded to ~130K real tokens > 126976 server ceiling), not VRAM.
+    See docs/experiments/gemma4-26b-coding-agent-loop-sweep-bragi-2026-05-30.md.
 
     Per-tier:
       <22 GB → base only (model barely fits; sweeping risks OOM)
-      22-31  → 7 cells: max_ctx × {98K, 131K}, fa_window × {0, 2048},
+      22-31  → 12 cells: max_ctx × {98K, 131K}, fa_window × {0, 2048},
                budget × {16, 22, 32}, pflash off (pflash needs a
                drafter file; can be enabled by the operator manually
                then re-swept)
@@ -294,10 +313,15 @@ def _coding_agent_loop_qwen_bracket(
         return candidates
 
     if host.vram_gb < 32:
-        # 24 GB tier: try tq3_0 (KV savings → bigger ctx) vs q8_0
-        # (less quality risk on long context).
+        # 24 GB tier: tq3_0 vs q8_0 at 65K; tq3_0-only at 98K.
+        # q8_0 at 98K OOMs on 23 GB cards: model (~18-19 GB) +
+        # q8_0 KV at 96K (~5-6 GB) = 24-25 GB. Verified on bragi
+        # (RTX 5090 Laptop 23 GB) 2026-05-30 — all q8_0/98K cells
+        # timed out. See
+        # docs/experiments/qwen3.6-27b-coding-agent-loop-sweep-bragi-2026-05-30.md
         for max_ctx in (65_536, 98_304):
-            for kv in ("tq3_0", "q8_0"):
+            kvs: tuple[str, ...] = ("tq3_0", "q8_0") if max_ctx <= 65_536 else ("tq3_0",)
+            for kv in kvs:
                 for budget in (16, 22, 32):
                     add(
                         replace(

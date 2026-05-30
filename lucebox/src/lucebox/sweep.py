@@ -420,9 +420,19 @@ def _pick_winner(results: list[CellResult], scorer: str) -> CellResult | None:
     ``mean_decode_tps is None`` are excluded.
 
     ``scorer == "agent_replay_pass_rate"``: only passing cells qualify;
-    among those, highest ``speed_metric`` wins; ties → larger max_ctx
-    first (more context is more useful for a coding-agent-loop
-    workload), then larger fa_window, then lower budget.
+    among those, largest ``max_ctx`` wins first (a coding-agent-loop
+    workload must not silently downgrade the context window — a faster
+    result at a smaller ctx is not a better result). Within the same
+    max_ctx, highest ``speed_metric`` breaks the tie, then larger
+    fa_window, then lower budget.
+
+    Why max_ctx before speed: cells at different max_ctx values run
+    against different fixture cases (32K case for 65K ctx, 64K case for
+    96K ctx). The 32K case prefills and decodes faster, so a 65K cell
+    always shows higher tok/s than a 96K cell — not because the config
+    is better, but because the test input is shorter. Sorting by
+    speed first would systematically pick the smaller context as the
+    "winner". See bragi sweep 2026-05-30 for a concrete example.
     """
     if scorer == "agent_replay_pass_rate":
         valid = [r for r in results if r.passed is True]
@@ -430,8 +440,8 @@ def _pick_winner(results: list[CellResult], scorer: str) -> CellResult | None:
             return None
         valid.sort(
             key=lambda r: (
-                -float(r.speed_metric or 0),
                 -int(r.config.max_ctx),
+                -float(r.speed_metric or 0),
                 -int(r.config.fa_window),
                 int(r.config.budget),
             )

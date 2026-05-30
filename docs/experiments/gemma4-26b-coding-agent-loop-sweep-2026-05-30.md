@@ -37,9 +37,19 @@ the server's actual `prompt_tokens` after tokenization + chat template
 wrapping. Real gemma tokenization expands by ~1.39× relative to chars/4
 on this fixture.
 
+## Correction (added 2026-05-30 after bragi sweep)
+
+The 131K failures below were a **fixture-picker artifact, not a VRAM limit**.
+After `safety_factor` was updated to 0.7, the picker selects the 64K case
+for 131K cells instead of the 100K case, and 131K cells pass on both sindri
+and bragi. See
+`docs/experiments/gemma4-26b-coding-agent-loop-sweep-bragi-2026-05-30.md`
+for the full analysis. Finding 1 below describes what happened mechanically;
+the conclusion "98K is the ceiling" no longer holds.
+
 ## Findings
 
-1. **98K is the proven ceiling for this fixture on this rig.** All six
+1. **131K cells failed due to fixture selection, not VRAM.** All six
    98K cells passed; all six 131K cells failed fast with HTTP 400
    *before* any prefill. The failure mode is request-validation, not
    OOM — the server's "effort-tier ceiling = max_ctx(131072) − 4096 =
