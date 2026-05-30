@@ -590,6 +590,15 @@ def run_sweep(
 
     cfg = config_mod.load() or config_mod.live_config()
     host = from_env()
+    # The LUCEBOX_HOST_* env vars are set by the lucebox.sh wrapper.
+    # When the sweep is invoked directly (e.g. via `uv run python -m
+    # lucebox` for development), those env vars are missing and
+    # from_env() returns a zero-VRAM HostFacts — which makes every
+    # profile bracket fall through to base-only. Fall back to the
+    # persisted [host] block in config.toml, which was populated by an
+    # earlier `lucebox check` / `autotune` run via the wrapper.
+    if host.vram_gb == 0 and cfg.host.vram_gb > 0:
+        host = cfg.host
     candidates = active_profile.candidate_configs(host, cfg.model.preset)
     if not candidates:
         console.print(

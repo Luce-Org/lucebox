@@ -10,6 +10,7 @@ profile.run_profile) have their own tests.
 from __future__ import annotations
 
 import json
+import os
 import signal
 from pathlib import Path
 from unittest import mock
@@ -261,6 +262,45 @@ def test_fa_window_in_dflash_allowlist() -> None:
     """fa_window must be in the sweep's write allowlist so the
     bracket axis lands on disk per cell."""
     assert "fa_window" in sweep_mod.DFLASH_ALLOWLIST
+
+
+def test_sweep_falls_back_to_persisted_host_when_env_empty(
+    stub_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: when LUCEBOX_HOST_* env vars are absent (e.g. sweep
+    invoked via `uv run` instead of the lucebox.sh wrapper), the sweep
+    must read host facts from config.toml's persisted [host] block —
+    otherwise every profile bracket falls through to base-only and the
+    sweep silently degrades to a 1-cell smoke test."""
+    # Persist a [host] section with real VRAM in the test's config.toml.
+    cfg_path = stub_env / "lucebox" / "config.toml"
+    cfg_text = cfg_path.read_text() if cfg_path.exists() else ""
+    cfg_path.write_text(
+        cfg_text
+        + "\n[host]\nvram_gb = 24\ngpu_vendor = \"nvidia\"\ngpu_count = 1\n"
+    )
+    # Ensure the LUCEBOX_HOST_* env vars are NOT set.
+    for k in list(os.environ):
+        if k.startswith("LUCEBOX_HOST_"):
+            monkeypatch.delenv(k, raising=False)
+
+    # Stub the heavyweight side-effects (subprocess, urllib, restart)
+    # so the test only exercises the host-facts resolution path.
+    monkeypatch.setattr(sweep_mod, "_systemctl_restart", lambda: 0)
+    monkeypatch.setattr(sweep_mod, "_wait_ready", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        sweep_mod,
+        "_score_agent_replay",
+        lambda *a, **kw: (True, "ok", 20.0, "test-case", 1024),
+    )
+
+    rc = sweep_mod.run_sweep(yes=True, profile="coding-agent-loop")
+    assert rc == 0
+    # If the fallback works, the gemma 24 GB bracket emits >1 cell.
+    # Read the persisted config to confirm at least one non-base cell
+    # was applied (the winner-apply step writes dflash.max_ctx).
+    final = (stub_env / "lucebox" / "config.toml").read_text()
+    assert "max_ctx" in final, "sweep should have written a winning max_ctx"
 
 
 # ── pre-flight ─────────────────────────────────────────────────────────────
