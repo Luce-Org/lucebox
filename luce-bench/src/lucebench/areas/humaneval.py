@@ -110,14 +110,32 @@ def grade_completion(prompt: str, completion: str) -> dict[str, Any]:
     # range`` and fail to parse. Try a few naive separators before
     # declaring it broken — we're only trying to detect "the model
     # produced obvious noise", not strict whitespace fidelity.
+    #
+    # Also handle trailing-garbage emissions: models often produce a
+    # valid function body and then drop chat-template tokens / hallucinated
+    # tails (``return Falsestring\n``, ``"thought\n"`` artifacts, leaked
+    # stop tokens etc.) after the function ends. We try the full
+    # completion first, then progressively trim from the end one line
+    # at a time until either ``ast.parse`` accepts the prefix or we run
+    # out of lines. The grader's intent is "did the model produce
+    # parseable code", not "was the model's entire emission lint-clean".
     parse_pass = False
-    for sep in ("", " ", "\n"):
-        try:
-            ast.parse(prompt + sep + completion)
-            parse_pass = True
+    completion_lines = (completion or "").splitlines(keepends=True)
+    # Budget: try at most 32 progressive truncations. Real cases need 0-3;
+    # the cap stops a degenerate ~1000-line response from spending O(n)
+    # parses per grader call.
+    truncation_budget = min(32, len(completion_lines))
+    for trim in range(truncation_budget + 1):
+        candidate = "".join(completion_lines[: len(completion_lines) - trim]) if trim else completion
+        for sep in ("", " ", "\n"):
+            try:
+                ast.parse(prompt + sep + candidate)
+                parse_pass = True
+                break
+            except (SyntaxError, ValueError):
+                continue
+        if parse_pass:
             break
-        except (SyntaxError, ValueError):
-            continue
     return {
         "graded_pass": parse_pass and nonempty,
         "strict_pass": parse_pass and nonempty,
