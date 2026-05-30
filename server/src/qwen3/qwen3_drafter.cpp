@@ -85,7 +85,8 @@ struct CompressCfg {
     int   max_iters;
 };
 
-static CompressCfg compress_cfg_from_env(int n_chunks, int n_keep) {
+static CompressCfg compress_cfg_from_env(int n_chunks, int n_keep,
+                                          int use_transitive_override = -1) {
     CompressCfg c{};
 
     c.query_tokens = env_int("DFLASH_COMPRESS_QUERY_TOKENS", 96);
@@ -160,6 +161,10 @@ static CompressCfg compress_cfg_from_env(int n_chunks, int n_keep) {
     c.anchor.max_forced_count         = (int)(max_forced_ratio * n_keep);
 
     c.use_transitive = [&]{
+        // Per-request override (0=off, 1=on) from router decision takes precedence.
+        if (use_transitive_override == 0) return false;
+        if (use_transitive_override == 1) return true;
+        // Fallback: read from env (same as before, no behaviour change when -1).
         const int nv = env_int("PFLASH_COMPRESS_ANCHOR_TRANSITIVE", -1);
         const int lv = env_int("DFLASH_COMPRESS_ANCHOR_TRANSITIVE", -1);
         if (nv >= 0) return nv != 0;
@@ -362,7 +367,8 @@ static std::vector<int32_t> qwen35_score_and_compress(
     float keep_ratio,
     int chunk_size,
     int n_lookahead,
-    int pool_kernel) {
+    int pool_kernel,
+    int use_transitive_override = -1) {
 
     const int S = (int)ids.size();
     const int hidden = w.n_embd;
@@ -639,7 +645,7 @@ static std::vector<int32_t> qwen35_score_and_compress(
     }
     std::sort(chunk_means.begin(), chunk_means.end(), [](auto a, auto b) { return a.first > b.first; });
 
-    const CompressCfg cfg = compress_cfg_from_env(n_chunks, n_keep);
+    const CompressCfg cfg = compress_cfg_from_env(n_chunks, n_keep, use_transitive_override);
 
     std::vector<uint8_t> selected((size_t)n_chunks, 0);
     int count = 0;
@@ -743,7 +749,8 @@ std::vector<int32_t> drafter_score_and_compress(
     float keep_ratio,
     int chunk_size,
     int n_lookahead,
-    int pool_kernel) {
+    int pool_kernel,
+    int use_transitive_override) {
     if (!ctx.loaded) {
         set_last_error("drafter not loaded");
         return {};
@@ -754,7 +761,7 @@ std::vector<int32_t> drafter_score_and_compress(
             return {};
         }
         auto * st = static_cast<Qwen35DrafterState *>(ctx.arch_state);
-        return qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size, n_lookahead, pool_kernel);
+        return qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size, n_lookahead, pool_kernel, use_transitive_override);
     }
     const int S = (int)ids.size();
     if (S < n_lookahead + 1) {
@@ -811,7 +818,7 @@ std::vector<int32_t> drafter_score_and_compress(
     std::sort(chunk_means.begin(), chunk_means.end(),
                       [](auto a, auto b) { return a.first > b.first; });
 
-    const CompressCfg cfg = compress_cfg_from_env(n_chunks, n_keep);
+    const CompressCfg cfg = compress_cfg_from_env(n_chunks, n_keep, use_transitive_override);
 
     std::vector<uint8_t> selected_mask((size_t)n_chunks, 0);
     std::vector<uint8_t> forced((size_t)n_chunks, 0);
@@ -886,6 +893,20 @@ std::vector<int32_t> drafter_score_and_compress(
     std::fflush(stderr);
 
     return out;
+}
+
+// ABI-stable 6-arg overload — old callers compiled before the use_transitive_override
+// parameter was added link here without requiring recompilation.
+std::vector<int32_t> drafter_score_and_compress(
+    DrafterContext & ctx,
+    const std::vector<int32_t> & ids,
+    float keep_ratio,
+    int chunk_size,
+    int n_lookahead,
+    int pool_kernel) {
+    return drafter_score_and_compress(ctx, ids, keep_ratio,
+                                      chunk_size, n_lookahead, pool_kernel,
+                                      /*use_transitive_override=*/-1);
 }
 
 } // namespace dflash::common

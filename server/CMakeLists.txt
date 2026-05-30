@@ -595,6 +595,14 @@ if(DFLASH27B_TESTS)
         add_test(NAME test_drafter_early_exit_score_range
             COMMAND test_drafter_early_exit_score_range)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_regime_router.cpp")
+        add_executable(test_regime_router
+            test/test_regime_router.cpp)
+        target_include_directories(test_regime_router PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
+        add_test(NAME regime_router
+            COMMAND test_regime_router)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_anchor_transitive.cpp")
         add_executable(test_anchor_transitive
             test/test_anchor_transitive.cpp

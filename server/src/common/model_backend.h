@@ -244,6 +244,10 @@ struct ModelBackend {
         std::string          drafter_path;    // GGUF path (for lazy-load)
         int                  drafter_gpu = 0;  // backend-local GPU for PFlash drafter
         bool                 skip_park = false; // true on >=32GB GPUs
+        // Per-request transitive-cascade override (-1 = use env default).
+        // 0 = off (agentic path: suppress cascade to avoid anchor bloat).
+        // 1 = on  (retrieval path: full expansion, same as today).
+        int                  use_transitive = -1;
         DraftResidencyAction residency_action = DraftResidencyAction::KeepLoaded;
     };
 

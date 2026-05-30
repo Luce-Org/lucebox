@@ -610,6 +610,21 @@ int main(int argc, char ** argv) {
                          sconfig.pflash_upstream_base.c_str(),
                          sconfig.pflash_upstream_model.c_str());
         }
+        // TYPE-gate router: opt-in via env var, default-off.
+        {
+            const char * router_env = std::getenv("PFLASH_ROUTER_ENABLE");
+            if (router_env && *router_env && std::strcmp(router_env, "0") != 0) {
+                sconfig.pflash_router.enabled = true;
+                // Inherit pflash threshold so the router fires at the same
+                // token count as the compression admission gate.
+                sconfig.pflash_router.threshold_tokens = sconfig.pflash_threshold;
+                std::fprintf(stderr,
+                    "[server] pflash-router: ENABLED (type-gate v2) "
+                    "threshold=%d agentic_keep=%.3f\n",
+                    sconfig.pflash_router.threshold_tokens,
+                    sconfig.pflash_router.agentic_keep_target);
+            }
+        }
     }
 
     // Honor DFLASH27B_DRAFT_SWA env (documented in server/README.md) when --draft-swa is absent.
@@ -848,6 +863,7 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "[server] │  pflash_skip_park= %s\n", sconfig.pflash_skip_park ? "ON" : "off");
         std::fprintf(stderr, "[server] │  fp_use_bsa      = %s\n", getenv("DFLASH_FP_USE_BSA") ? "ON" : "off");
         std::fprintf(stderr, "[server] │  fp_alpha        = %s\n", getenv("DFLASH_FP_ALPHA") ? getenv("DFLASH_FP_ALPHA") : "0.12 (default)");
+        std::fprintf(stderr, "[server] │  pflash_router   = %s\n", sconfig.pflash_router.enabled ? "ON" : "off");
     }
     std::fprintf(stderr, "[server] │  draft_residency = %s\n",
                  draft_residency_policy_name(sconfig.draft_residency));
