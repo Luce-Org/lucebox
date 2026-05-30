@@ -60,7 +60,8 @@ bool LagunaBackend::init() {
 
     // Check if hybrid mode is requested BEFORE full load
     const char * hotness_path = std::getenv("DFLASH_LAGUNA_HOTNESS");
-    if (hotness_path && hotness_path[0]) {
+    const char * budget_pct_env = std::getenv("DFLASH_EXPERT_BUDGET_PCT");
+    if ((hotness_path && hotness_path[0]) || (budget_pct_env && budget_pct_env[0])) {
         // Hybrid mode: partial load (skip expert tensors)
         if (!init_hybrid_mode()) {
             ggml_backend_free(backend_); backend_ = nullptr;
@@ -571,7 +572,7 @@ bool LagunaBackend::init_hybrid_mode() {
             return false;
         }
     } else {
-        // Uniform hotness (shouldn't reach here since we gate on hotness_path, but safety)
+        // Uniform hotness (budget-only mode, no hotness file)
         hotness.n_layer = w_.n_layer;
         hotness.n_expert = w_.n_expert;
         hotness.n_expert_used = w_.n_expert_used;
@@ -631,13 +632,27 @@ bool LagunaBackend::init_hybrid_mode() {
         expert_budget = total_expert_bytes;
     }
 
-    // Manual budget cap
+    // Manual budget cap (absolute MB)
     if (const char * cap_env = std::getenv("DFLASH_EXPERT_BUDGET_MB")) {
         uint64_t cap_bytes = (uint64_t)std::atoi(cap_env) * 1024ULL * 1024ULL;
         if (cap_bytes > 0 && cap_bytes < expert_budget) {
             std::printf("[laguna-hybrid] capping expert budget from %.2f GiB to %d MB\n",
                         expert_budget / 1024.0 / 1024.0 / 1024.0, std::atoi(cap_env));
             expert_budget = cap_bytes;
+        }
+    }
+
+    // Percentage-based budget cap
+    if (const char * pct_env = std::getenv("DFLASH_EXPERT_BUDGET_PCT")) {
+        int pct = std::atoi(pct_env);
+        if (pct > 0 && pct < 100) {
+            uint64_t pct_bytes = total_expert_bytes * (uint64_t)pct / 100ULL;
+            if (pct_bytes < expert_budget) {
+                std::printf("[laguna-hybrid] capping expert budget to %d%% = %.2f GiB (of %.2f GiB)\n",
+                            pct, pct_bytes / 1024.0 / 1024.0 / 1024.0,
+                            total_expert_bytes / 1024.0 / 1024.0 / 1024.0);
+                expert_budget = pct_bytes;
+            }
         }
     }
 
@@ -670,11 +685,10 @@ bool LagunaBackend::init_hybrid_mode() {
     std::printf("[laguna-hybrid] placement result: %d hot experts, %d cold experts\n",
                 placement.total_hot, total_moe_experts - placement.total_hot);
 
-    // If all experts fit, no hybrid needed
+    // If all experts fit, still use hybrid storage (partial load skipped expert buffers)
     if (placement.total_hot >= total_moe_experts) {
-        std::printf("[laguna-hybrid] all experts fit in VRAM, using full GPU path\n");
+        std::printf("[laguna-hybrid] all experts fit in VRAM — all-hot hybrid path\n");
         std::fflush(stdout);
-        return true;  // w_ already fully loaded, hybrid_mode_ stays false
     }
 
     // Step 5: Load expert data from GGUF mmap into hot/cold split buffers
@@ -774,7 +788,8 @@ bool LagunaBackend::init_hybrid_mode() {
         hybrid_mode_ = true;
         std::printf("[laguna-hybrid] hybrid decode path active (%d cold experts)\n", total_cold);
     } else {
-        std::printf("[laguna-hybrid] all experts hot — using fused all-GPU decode path\n");
+        hybrid_mode_ = true;  // partial load: expert tensors only in hybrid storage
+        std::printf("[laguna-hybrid] all experts hot — using hybrid path (all-hot)\n");
     }
 
     // Configure telemetry and swap policy
@@ -904,23 +919,25 @@ static bool build_laguna_layer_prefn_step(
                           n_ctx_orig, rope_th, freq_scale,
                           ext_factor, attn_factor, beta_fast, beta_slow);
 
-    // KV cache write
+    // KV cache write — permute to [head_dim, n_tokens, n_head_kv] layout
     ggml_tensor * cache_k = cache.attn_k[(size_t)il];
     ggml_tensor * cache_v = cache.attn_v[(size_t)il];
 
-    // Store K to cache: view [head_dim, n_tokens, n_head_kv] into cache at kv_start
+    ggml_tensor * Kcur_T = ggml_permute(sg.ctx, Kcur, 0, 2, 1, 3);
+    ggml_tensor * Vcur_T = ggml_permute(sg.ctx, Vcur, 0, 2, 1, 3);
+
     ggml_tensor * k_view = ggml_view_3d(sg.ctx, cache_k,
         head_dim, n_tokens, n_head_kv,
         cache_k->nb[1], cache_k->nb[2],
         cache_k->nb[1] * (size_t)kv_start);
-    ggml_tensor * k_cpy = ggml_cpy(sg.ctx, Kcur, k_view);
+    ggml_tensor * k_cpy = ggml_cpy(sg.ctx, Kcur_T, k_view);
     ggml_build_forward_expand(sg.gf, k_cpy);
 
     ggml_tensor * v_view = ggml_view_3d(sg.ctx, cache_v,
         head_dim, n_tokens, n_head_kv,
         cache_v->nb[1], cache_v->nb[2],
         cache_v->nb[1] * (size_t)kv_start);
-    ggml_tensor * v_cpy = ggml_cpy(sg.ctx, Vcur, v_view);
+    ggml_tensor * v_cpy = ggml_cpy(sg.ctx, Vcur_T, v_view);
     ggml_build_forward_expand(sg.gf, v_cpy);
 
     // Flash attention
@@ -1170,26 +1187,187 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
 
     reset_laguna_target_cache(cache_);
 
-    // ── Prefill (all-GPU, using existing laguna_step for chunks) ──
-    std::vector<float> embed_pf((size_t)N * w_.n_embd);
-    if (!w_.embedder.embed(req.prompt.data(), N, embed_pf.data())) {
+    // ── Hybrid Prefill: layer-by-layer pre-FFN + batched hybrid FFN ──
+    const int hidden = w_.n_embd;
+    const int n_expert_used = w_.n_expert_used;
+    ggml_backend_t cpu_be = moe_hybrid_->cpu_backend;
+
+    std::vector<float> embed_all((size_t)N * (size_t)hidden);
+    if (!w_.embedder.embed(req.prompt.data(), N, embed_all.data())) {
         result.error = "embed_prefill";
         return result;
     }
 
-    const bool no_mask = (std::getenv("DFLASH_NO_MASK") != nullptr);
     auto t_pf0 = std::chrono::steady_clock::now();
-    std::vector<float> last_logits;
-    bool ok = true;
-    const int n_chunks = (N + args_.chunk - 1) / args_.chunk;
-    for (int c = 0; c < n_chunks && ok; ++c) {
-        const int kv_start = c * args_.chunk;
-        const int n_tok    = std::min(args_.chunk, N - c * args_.chunk);
-        ok = laguna_step(backend_, w_, cache_,
-                          embed_pf.data() + (size_t)kv_start * w_.n_embd,
-                          n_tok, kv_start, no_mask, last_logits);
+    const int prefill_chunk = std::min(args_.chunk, N);
+
+    for (int il = 0; il < w_.n_layer; ++il) {
+        const bool is_dense = (il < w_.n_layer_dense_lead);
+        const bool is_full = laguna_is_full_attn_layer(w_, il);
+
+        for (int chunk_start = 0; chunk_start < N; chunk_start += prefill_chunk) {
+            const int chunk_len = std::min(prefill_chunk, N - chunk_start);
+
+            StepGraph prefill_sg;
+            if (!build_laguna_layer_prefn_step(prefill_sg, w_, cache_, backend_,
+                                               il, chunk_start, chunk_len)) {
+                result.error = "prefill_build";
+                step_graph_destroy(prefill_sg);
+                return result;
+            }
+
+            // Set input embeddings
+            ggml_backend_tensor_set(prefill_sg.inp_embed,
+                                    embed_all.data() + (size_t)chunk_start * (size_t)hidden, 0,
+                                    sizeof(float) * (size_t)chunk_len * (size_t)hidden);
+
+            // Set positions
+            std::vector<int32_t> pos_data((size_t)chunk_len);
+            for (int i = 0; i < chunk_len; ++i) pos_data[i] = chunk_start + i;
+            ggml_backend_tensor_set(prefill_sg.positions, pos_data.data(), 0,
+                                    sizeof(int32_t) * (size_t)chunk_len);
+
+            // Set attention mask (causal or causal+SWA depending on layer)
+            if (prefill_sg.attn_mask) {
+                const int kv_len = chunk_start + chunk_len;
+                std::vector<float> mask((size_t)kv_len * (size_t)chunk_len, -INFINITY);
+                for (int q = 0; q < chunk_len; ++q) {
+                    const int abs_q = chunk_start + q;
+                    const int win_lo = is_full ? 0 : std::max(0, abs_q - w_.sliding_window + 1);
+                    for (int k = win_lo; k <= abs_q && k < kv_len; ++k) {
+                        mask[(size_t)q * (size_t)kv_len + (size_t)k] = 0.0f;
+                    }
+                }
+                ggml_backend_tensor_set(prefill_sg.attn_mask, mask.data(), 0,
+                                        sizeof(float) * mask.size());
+            }
+
+            // Compute pre-FFN graph
+            auto st = ggml_backend_graph_compute(backend_, prefill_sg.gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                result.error = "prefill_compute";
+                step_graph_destroy(prefill_sg);
+                return result;
+            }
+
+            if (is_dense) {
+                // Dense layer outputs full result directly
+                std::vector<float> layer_out((size_t)chunk_len * (size_t)hidden);
+                ggml_backend_tensor_get(prefill_sg.hidden_input, layer_out.data(), 0,
+                                        sizeof(float) * layer_out.size());
+                std::memcpy(embed_all.data() + (size_t)chunk_start * (size_t)hidden,
+                            layer_out.data(),
+                            sizeof(float) * layer_out.size());
+            } else {
+                // MoE layer: read router decisions, run hybrid FFN
+                std::vector<float> chunk_residuals((size_t)chunk_len * (size_t)hidden);
+                std::vector<float> chunk_post((size_t)chunk_len * (size_t)hidden);
+                std::vector<int32_t> chunk_selected((size_t)chunk_len * (size_t)n_expert_used);
+                std::vector<float> chunk_weights((size_t)chunk_len * (size_t)n_expert_used);
+
+                ggml_backend_tensor_get(prefill_sg.ffn_residual, chunk_residuals.data(), 0,
+                                        sizeof(float) * chunk_residuals.size());
+                ggml_backend_tensor_get(prefill_sg.ffn_post, chunk_post.data(), 0,
+                                        sizeof(float) * chunk_post.size());
+
+                ggml_tensor * sel_tensor = prefill_sg.moe_selected.empty() ? nullptr : prefill_sg.moe_selected[0];
+                if (!sel_tensor || !prefill_sg.moe_weights) {
+                    result.error = "prefill_router_outputs";
+                    step_graph_destroy(prefill_sg);
+                    return result;
+                }
+                ggml_backend_tensor_get(sel_tensor, chunk_selected.data(), 0,
+                                        sizeof(int32_t) * chunk_selected.size());
+                ggml_backend_tensor_get(prefill_sg.moe_weights, chunk_weights.data(), 0,
+                                        sizeof(float) * chunk_weights.size());
+
+                // Observe routing stats
+                if (routing_stats_) {
+                    for (int i = 0; i < chunk_len; ++i) {
+                        routing_stats_->observe(il, chunk_selected.data() + (size_t)i * (size_t)n_expert_used, n_expert_used);
+                    }
+                }
+
+                // Batched hybrid FFN (sub-batched to avoid MMQ OOB)
+                auto & storage = moe_hybrid_->layers[(size_t)il];
+                MoeHybridConfig chunk_cfg = make_moe_hybrid_config(w_);
+                MoeLayerDesc chunk_desc = make_moe_layer_desc(w_.layers[(size_t)il]);
+                std::vector<float> ffn_batch_out((size_t)chunk_len * (size_t)hidden);
+                constexpr int kFfnSafeBatch = 8;
+                for (int fb = 0; fb < chunk_len; fb += kFfnSafeBatch) {
+                    const int fl = std::min(kFfnSafeBatch, chunk_len - fb);
+                    std::vector<float> sub_out;
+                    if (!eval_moe_hybrid_ffn_batched(
+                            backend_, cpu_be, chunk_cfg, chunk_desc, storage,
+                            chunk_post.data()     + (size_t)fb * (size_t)hidden,
+                            chunk_selected.data() + (size_t)fb * (size_t)n_expert_used,
+                            chunk_weights.data()  + (size_t)fb * (size_t)n_expert_used,
+                            fl, sub_out, &result.error)) {
+                        step_graph_destroy(prefill_sg);
+                        return result;
+                    }
+                    std::memcpy(ffn_batch_out.data() + (size_t)fb * (size_t)hidden,
+                                sub_out.data(),
+                                (size_t)fl * (size_t)hidden * sizeof(float));
+                }
+
+                // Combine: FFN output + residual → embed_all for next layer
+                for (int i = 0; i < chunk_len; ++i) {
+                    const float * ffn = ffn_batch_out.data() + (size_t)i * (size_t)hidden;
+                    const float * res = chunk_residuals.data() + (size_t)i * (size_t)hidden;
+                    float * out_embed = embed_all.data() + (size_t)(chunk_start + i) * (size_t)hidden;
+                    for (int j = 0; j < hidden; ++j) {
+                        out_embed[j] = ffn[j] + res[j];
+                    }
+                }
+            }
+
+            step_graph_destroy(prefill_sg);
+        }
     }
-    if (!ok) { result.error = "prefill"; return result; }
+
+    // Project logits from last token's hidden state
+    cache_.cur_pos = N;
+    std::vector<float> last_logits;
+    {
+        ggml_init_params ip{};
+        ip.mem_size = 64 * 1024 * 1024;
+        ip.no_alloc = true;
+        ggml_context * ctx = ggml_init(ip);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 1024, false);
+
+        ggml_tensor * h_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, 1);
+        ggml_set_input(h_in);
+        ggml_tensor * normed = ggml_rms_norm(ctx, h_in, 1e-6f);
+        normed = ggml_mul(ctx, normed, w_.out_norm);
+        ggml_tensor * logits = ggml_mul_mat(ctx, w_.output, normed);
+        ggml_set_output(logits);
+        ggml_build_forward_expand(gf, logits);
+
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+        if (!ggml_gallocr_alloc_graph(alloc, gf)) {
+            ggml_gallocr_free(alloc);
+            ggml_free(ctx);
+            result.error = "prefill_logits_alloc";
+            return result;
+        }
+        // Set last token's hidden state
+        ggml_backend_tensor_set(h_in,
+                                embed_all.data() + (size_t)(N - 1) * (size_t)hidden, 0,
+                                sizeof(float) * (size_t)hidden);
+        if (ggml_backend_graph_compute(backend_, gf) != GGML_STATUS_SUCCESS) {
+            ggml_gallocr_free(alloc);
+            ggml_free(ctx);
+            result.error = "prefill_logits_compute";
+            return result;
+        }
+        last_logits.resize((size_t)w_.embedder.n_vocab);
+        ggml_backend_tensor_get(logits, last_logits.data(), 0,
+                                sizeof(float) * last_logits.size());
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+    }
+
     auto t_pf1 = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_pf1 - t_pf0).count();
 
