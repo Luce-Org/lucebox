@@ -150,7 +150,7 @@ def test_pick_winner_breaks_ties_by_max_ctx_then_budget() -> None:
         mean_decode_tps=50.0,
         error=None,
     )
-    winner = sweep_mod._pick_winner([r1, r2, r3])
+    winner = sweep_mod._pick_winner([r1, r2, r3], "decode_tps_snapshot")
     # All tied tps. Lower max_ctx wins, then lower budget.
     assert winner is r2
 
@@ -163,7 +163,7 @@ def test_pick_winner_returns_none_when_all_failed() -> None:
         mean_decode_tps=None,
         error="server-not-ready",
     )
-    assert sweep_mod._pick_winner([r]) is None
+    assert sweep_mod._pick_winner([r], "decode_tps_snapshot") is None
 
 
 def test_pick_winner_picks_highest_tps() -> None:
@@ -178,7 +178,89 @@ def test_pick_winner_picks_highest_tps() -> None:
         index=2, config=DflashRuntime(budget=32), snapshot_dir=None,
         mean_decode_tps=30.0, error=None,
     )
-    assert sweep_mod._pick_winner([r1, r2, r3]) is r2
+    assert sweep_mod._pick_winner([r1, r2, r3], "decode_tps_snapshot") is r2
+
+
+def test_pick_winner_agent_replay_filters_failures_and_ranks_by_speed() -> None:
+    """coding-agent-loop ranking: only passing cells qualify; higher
+    speed_metric wins; among ties, larger max_ctx then larger
+    fa_window then lower budget."""
+    failed = sweep_mod.CellResult(
+        index=0,
+        config=DflashRuntime(max_ctx=131072, fa_window=2048, budget=22),
+        snapshot_dir=None,
+        mean_decode_tps=None,
+        error=None,
+        passed=False,
+        pass_reason="HTTP 500",
+        speed_metric=None,
+    )
+    slow = sweep_mod.CellResult(
+        index=1,
+        config=DflashRuntime(max_ctx=131072, fa_window=0, budget=22),
+        snapshot_dir=None,
+        mean_decode_tps=None,
+        error=None,
+        passed=True,
+        pass_reason="ok",
+        speed_metric=5.0,
+    )
+    fast = sweep_mod.CellResult(
+        index=2,
+        config=DflashRuntime(max_ctx=98304, fa_window=2048, budget=22),
+        snapshot_dir=None,
+        mean_decode_tps=None,
+        error=None,
+        passed=True,
+        pass_reason="ok",
+        speed_metric=25.0,
+    )
+    winner = sweep_mod._pick_winner([failed, slow, fast], "agent_replay_pass_rate")
+    assert winner is fast, "highest speed_metric should win among passing cells"
+
+
+def test_pick_winner_agent_replay_returns_none_when_all_failed() -> None:
+    failed = sweep_mod.CellResult(
+        index=0,
+        config=DflashRuntime(max_ctx=131072),
+        snapshot_dir=None,
+        mean_decode_tps=None,
+        error=None,
+        passed=False,
+        pass_reason="HTTP 500",
+        speed_metric=None,
+    )
+    assert sweep_mod._pick_winner([failed], "agent_replay_pass_rate") is None
+
+
+def test_pick_winner_agent_replay_tiebreak_prefers_larger_max_ctx() -> None:
+    """Tied speed → larger max_ctx wins (more headroom for the workload)."""
+    small_ctx = sweep_mod.CellResult(
+        index=0,
+        config=DflashRuntime(max_ctx=65536, fa_window=0, budget=22),
+        snapshot_dir=None,
+        mean_decode_tps=None,
+        error=None,
+        passed=True,
+        speed_metric=20.0,
+    )
+    big_ctx = sweep_mod.CellResult(
+        index=1,
+        config=DflashRuntime(max_ctx=131072, fa_window=0, budget=22),
+        snapshot_dir=None,
+        mean_decode_tps=None,
+        error=None,
+        passed=True,
+        speed_metric=20.0,
+    )
+    winner = sweep_mod._pick_winner([small_ctx, big_ctx], "agent_replay_pass_rate")
+    assert winner is big_ctx
+
+
+def test_fa_window_in_dflash_allowlist() -> None:
+    """fa_window must be in the sweep's write allowlist so the
+    bracket axis lands on disk per cell."""
+    assert "fa_window" in sweep_mod.DFLASH_ALLOWLIST
 
 
 # ── pre-flight ─────────────────────────────────────────────────────────────

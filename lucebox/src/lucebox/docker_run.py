@@ -180,6 +180,12 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
         ]
         if cfg.dflash.prefill_drafter:
             env.append(("DFLASH_PREFILL_DRAFTER", cfg.dflash.prefill_drafter))
+    # fa_window=0 is the server's own default (full attention); only emit
+    # the env when the operator has selected a sparse decode window. The
+    # entrypoint mirrors this guard so an unset env reproduces the
+    # server's stock behavior.
+    if cfg.dflash.fa_window > 0:
+        env.append(("DFLASH_FA_WINDOW", str(cfg.dflash.fa_window)))
 
     return DockerRunSpec(
         image=f"{cfg.image}:{cfg.variant}",

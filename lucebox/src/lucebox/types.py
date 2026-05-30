@@ -80,6 +80,13 @@ class DflashRuntime:
     # antirez/ds4 ds4_eval.c: think_max_tokens = max_tokens - hard_limit_reply
     # budget = 16000 - 512 = 15488. The server's own hardcoded default is 10000.
     think_max: int = 15488
+    # Flash-attention sliding-window on full-attention layers. 0 = full
+    # attention (server default). On gemma4's hybrid iSWA the full-attn
+    # layers grow KV linearly with max_ctx; a sparse fa_window keeps
+    # decode compute bounded on long prompts without changing the KV
+    # footprint. Q: passed through to the server's `--fa-window <N>`
+    # flag (see server/src/server/server_main.cpp).
+    fa_window: int = 0
 
 
 @dataclass(frozen=True, slots=True)

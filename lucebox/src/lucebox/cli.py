@@ -195,6 +195,28 @@ def autotune(
             help="With --sweep: skip the confirmation prompt before starting.",
         ),
     ] = False,
+    profile: Annotated[
+        str,
+        typer.Option(
+            "--profile",
+            help=(
+                "With --sweep: which workload profile to use. "
+                "'heuristic' (default) brackets KV-quant axes and scores by "
+                "mean decode_tps from a luce-bench snapshot. "
+                "'coding-agent-loop' brackets max_ctx × fa_window × budget × "
+                "pflash and scores by pass-rate on a real recorded agentic "
+                "session replay, then speed. See `lucebox autotune "
+                "--list-profiles` for the full set."
+            ),
+        ),
+    ] = "heuristic",
+    list_profiles: Annotated[
+        bool,
+        typer.Option(
+            "--list-profiles",
+            help="Print registered autotune profiles + descriptions and exit.",
+        ),
+    ] = False,
 ) -> None:
     """Compute the recommended DflashRuntime for this host.
 
@@ -220,6 +242,17 @@ def autotune(
     is interactive). Pass ``--yes`` / ``-y`` to skip the confirmation
     prompt.
     """
+    if list_profiles:
+        table = Table(title="Autotune profiles")
+        table.add_column("name")
+        table.add_column("scorer")
+        table.add_column("description")
+        for name in sorted(autotune_mod.PROFILES):
+            p = autotune_mod.PROFILES[name]
+            table.add_row(p.name, p.scorer, p.description)
+        console.print(table)
+        return
+
     if sweep and (apply_ or json_out):
         console.print(
             "[red]--sweep is mutually exclusive with --apply and --json[/red]"
@@ -228,7 +261,7 @@ def autotune(
     if sweep:
         from lucebox.sweep import run_sweep
 
-        rc = run_sweep(console=console, yes=yes)
+        rc = run_sweep(console=console, yes=yes, profile=profile)
         if rc != 0:
             raise typer.Exit(code=rc)
         return

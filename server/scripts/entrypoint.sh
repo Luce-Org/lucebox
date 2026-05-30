@@ -292,6 +292,12 @@ fi
 # reply budget(512) = 15488. The server's own hardcoded default is 10000;
 # overriding here aligns ds4-eval and similar reasoning benches with upstream.
 : "${DFLASH_THINK_MAX:=15488}"
+# Flash-attention sliding-window on full-attention layers. 0 = server's
+# stock full attention. Sparse decode windows (e.g. 2048-8192) bound
+# the compute on long prompts for gemma4's hybrid iSWA without changing
+# the KV footprint. Only emitted to the server CLI when nonzero so
+# unset reproduces the server's own default unchanged.
+: "${DFLASH_FA_WINDOW:=0}"
 
 # ── auto-detect target ─────────────────────────────────────────────────────
 # Target .gguf is typically 10-30 GB (Q4_K_M). Drafts are 1-2 GB (Q8_0 / Q4)
@@ -481,6 +487,7 @@ if [ "$DFLASH_LAZY" = "1" ]; then
 fi
 [ -n "$DFLASH_CACHE_TYPE_K" ]      && CMD+=(--cache-type-k "$DFLASH_CACHE_TYPE_K")
 [ -n "$DFLASH_CACHE_TYPE_V" ]      && CMD+=(--cache-type-v "$DFLASH_CACHE_TYPE_V")
+[ "$DFLASH_FA_WINDOW" -gt 0 ] 2>/dev/null && CMD+=(--fa-window "$DFLASH_FA_WINDOW")
 
 if [ "$DFLASH_PREFILL_MODE" != "off" ]; then
     [ -n "$DFLASH_PREFILL_DRAFTER" ] || die "DFLASH_PREFILL_MODE=$DFLASH_PREFILL_MODE requires DFLASH_PREFILL_DRAFTER"

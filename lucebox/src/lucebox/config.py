@@ -82,6 +82,7 @@ KEY_REGISTRY: dict[str, tuple[tuple[str, str], Callable[[Any], Any]]] = {
     "dflash.prefill_threshold": (("dflash", "prefill_threshold"), int),
     "dflash.prefill_drafter": (("dflash", "prefill_drafter"), str),
     "dflash.think_max": (("dflash", "think_max"), int),
+    "dflash.fa_window": (("dflash", "fa_window"), int),
 }
 
 
@@ -212,6 +213,7 @@ def _from_dict(raw: dict[str, Any]) -> Config:
         prefill_threshold=int(df.get("prefill_threshold", 32000)),
         prefill_drafter=str(df.get("prefill_drafter", "")),
         think_max=int(df.get("think_max", 15488)),
+        fa_window=int(df.get("fa_window", 0)),
     )
 
     host_raw = raw.get("host", {})

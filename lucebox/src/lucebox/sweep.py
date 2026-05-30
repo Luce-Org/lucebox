@@ -44,9 +44,12 @@ from lucebox import config as config_mod
 from lucebox.host_facts import from_env
 from lucebox.types import DflashRuntime
 
-# ── allowlist: the 11 dflash.* fields that lucebox autotune --apply writes ──
+# ── allowlist: dflash.* fields written by the sweep per cell ────────────────
 # Kept in sync with cli.DFLASH_ALLOWLIST — we duplicate it locally to
-# avoid an import cycle (cli.py imports this module).
+# avoid an import cycle (cli.py imports this module). ``fa_window`` is
+# included even though it's not part of the strict lucebench snapshot
+# allowlist; the sweep needs to be able to vary it as a per-cell
+# bracket axis for the coding-agent-loop profile.
 DFLASH_ALLOWLIST: tuple[str, ...] = (
     "budget",
     "max_ctx",
@@ -59,18 +62,39 @@ DFLASH_ALLOWLIST: tuple[str, ...] = (
     "prefill_keep_ratio",
     "prefill_threshold",
     "prefill_drafter",
+    "fa_window",
 )
 
 
 @dataclasses.dataclass(slots=True)
 class CellResult:
-    """One sweep cell's outcome."""
+    """One sweep cell's outcome.
+
+    Carries either the legacy ``mean_decode_tps`` (heuristic profile) or
+    the composite ``(passed, speed_metric, pass_reason)`` set used by
+    the coding-agent-loop profile. The fields are not mutually
+    exclusive — a cell can carry both when both scorers ran — but the
+    sweep driver only populates one per profile run.
+    """
 
     index: int
     config: DflashRuntime
     snapshot_dir: Path | None
     mean_decode_tps: float | None
     error: str | None
+    # Coding-agent-loop scorer outputs. ``passed`` is None when the
+    # profile didn't run; True/False after a pass/fail check.
+    passed: bool | None = None
+    pass_reason: str = ""
+    # Higher = better. For agent_replay_pass_rate this is
+    # completion_tokens / wall_seconds (rough throughput when the
+    # snapshot's ``decode_tokens_per_sec`` is empty, as it is for
+    # longctx cells on gemma).
+    speed_metric: float | None = None
+    # Echoed case length so the results table can show "which trace was
+    # actually exercised" — useful when the bracket varied max_ctx.
+    case_id: str = ""
+    case_tokens: int | None = None
 
 
 # ── snapshot dir + decode-tps extraction ───────────────────────────────────
@@ -256,7 +280,7 @@ def _restore_backup(console: Console, backup: Path | None) -> None:
 
 
 def _apply_config(runtime: DflashRuntime) -> None:
-    """Write the 11 dflash.* fields of ``runtime`` to config.toml.
+    """Write the swept dflash.* fields of ``runtime`` to config.toml.
 
     Uses ``config_set`` so each field lands sparsely — other on-disk
     keys (model.preset etc.) are untouched.
@@ -265,16 +289,156 @@ def _apply_config(runtime: DflashRuntime) -> None:
         config_mod.config_set(f"dflash.{name}", getattr(runtime, name))
 
 
+# ── coding-agent-loop scorer (alternative to decode-tps snapshot) ──────────
+
+
+def _score_agent_replay(
+    port: int,
+    max_ctx: int,
+    *,
+    hard_limit_reply_budget: int = 4096,
+    request_timeout_s: int = 300,
+) -> tuple[bool, str, float | None, str, int | None]:
+    """Run the largest fitting multi-turn case against the live server.
+
+    Returns ``(passed, reason, speed_metric, case_id, case_tokens)``:
+
+    * ``passed`` — True iff the server returned a non-empty,
+      non-erroring response within ``request_timeout_s``.
+    * ``reason`` — human-readable verdict (carried into the results table).
+    * ``speed_metric`` — ``completion_tokens / wall_seconds`` when the
+      response carried a usage block; ``None`` when not. Higher = better.
+    * ``case_id`` / ``case_tokens`` — which fixture case actually ran.
+
+    The fixture is loaded lazily so a sweep cell that won't reach this
+    scorer (e.g. the heuristic profile) pays no import cost. When the
+    fixture is missing or has no case fitting under the cell's
+    ``max_ctx − hard_limit_reply_budget`` budget, the call returns a
+    fail with a descriptive reason — the cell is then excluded from
+    winner selection.
+    """
+    import time
+    import urllib.error
+    import urllib.request
+
+    try:
+        from lucebench.areas.agent_recorded import (
+            load_agent_recorded_multi_turn_cases,
+            pick_multi_turn_case_for_budget,
+        )
+    except ImportError as exc:
+        return (False, f"luce-bench not importable: {exc}", None, "", None)
+
+    cases = load_agent_recorded_multi_turn_cases()
+    if not cases:
+        return (False, "no multi-turn cases on disk", None, "", None)
+
+    prompt_budget = max(1, max_ctx - hard_limit_reply_budget)
+    case = pick_multi_turn_case_for_budget(cases, prompt_budget)
+    if case is None:
+        return (
+            False,
+            f"no case fits under prompt_budget={prompt_budget}",
+            None,
+            "",
+            None,
+        )
+
+    # Cap completion to a fraction of the reply budget so we don't
+    # gobble wall time on hopeless decodes — the verifier just needs
+    # to confirm the server is producing tokens, not full sessions.
+    body = {
+        "model": "dflash",
+        "messages": case["messages"],
+        "max_tokens": min(hard_limit_reply_budget, 256),
+        "temperature": 0.0,
+        "stream": False,
+    }
+    payload = json.dumps(body).encode()
+    req = urllib.request.Request(
+        f"http://localhost:{port}/v1/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    t0 = time.perf_counter()
+    try:
+        with urllib.request.urlopen(req, timeout=request_timeout_s) as resp:
+            raw = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        wall = time.perf_counter() - t0
+        return (
+            False,
+            f"HTTP {exc.code} after {wall:.1f}s",
+            None,
+            case["id"],
+            int(case["context_tokens_approx"]),
+        )
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        wall = time.perf_counter() - t0
+        return (
+            False,
+            f"{type(exc).__name__} after {wall:.1f}s: {exc}",
+            None,
+            case["id"],
+            int(case["context_tokens_approx"]),
+        )
+    wall = time.perf_counter() - t0
+
+    choice = (raw.get("choices") or [{}])[0]
+    msg = choice.get("message", {}) if isinstance(choice, dict) else {}
+    content = (msg.get("content") or "") + (msg.get("reasoning_content") or "")
+    if not content.strip():
+        return (
+            False,
+            f"empty response after {wall:.1f}s",
+            None,
+            case["id"],
+            int(case["context_tokens_approx"]),
+        )
+
+    usage = raw.get("usage") or {}
+    completion_tokens = usage.get("completion_tokens")
+    speed: float | None = None
+    if isinstance(completion_tokens, int | float) and completion_tokens > 0 and wall > 0:
+        speed = float(completion_tokens) / wall
+
+    reason = (
+        f"pass: {len(content)} chars / {completion_tokens or '?'} tok in "
+        f"{wall:.1f}s (case {case['id']})"
+    )
+    return (True, reason, speed, case["id"], int(case["context_tokens_approx"]))
+
+
 # ── winner selection + results table ───────────────────────────────────────
 
 
-def _pick_winner(results: list[CellResult]) -> CellResult | None:
-    """Highest mean_decode_tps wins; ties → lower max_ctx, then lower budget.
+def _pick_winner(results: list[CellResult], scorer: str) -> CellResult | None:
+    """Profile-aware winner selection.
 
-    Cells with ``mean_decode_tps is None`` are excluded — they didn't
-    produce a measurement (server-never-ready, no decode tps in the
-    snapshot rows).
+    ``scorer == "decode_tps_snapshot"``: highest mean_decode_tps wins;
+    ties → lower max_ctx, then lower budget. Cells with
+    ``mean_decode_tps is None`` are excluded.
+
+    ``scorer == "agent_replay_pass_rate"``: only passing cells qualify;
+    among those, highest ``speed_metric`` wins; ties → larger max_ctx
+    first (more context is more useful for a coding-agent-loop
+    workload), then larger fa_window, then lower budget.
     """
+    if scorer == "agent_replay_pass_rate":
+        valid = [r for r in results if r.passed is True]
+        if not valid:
+            return None
+        valid.sort(
+            key=lambda r: (
+                -float(r.speed_metric or 0),
+                -int(r.config.max_ctx),
+                -int(r.config.fa_window),
+                int(r.config.budget),
+            )
+        )
+        return valid[0]
+
+    # Default / heuristic path.
     valid = [r for r in results if r.mean_decode_tps is not None]
     if not valid:
         return None
@@ -292,8 +456,59 @@ def _print_results(
     console: Console,
     results: list[CellResult],
     winner: CellResult | None,
+    scorer: str = "decode_tps_snapshot",
 ) -> None:
-    """Pretty-print the final results table after the sweep completes."""
+    """Pretty-print the final results table after the sweep completes.
+
+    Columns vary by scorer:
+      * decode_tps_snapshot: budget / max_ctx / kv / tps / status
+      * agent_replay_pass_rate: budget / max_ctx / fa_win / kv /
+        case_tok / tok_per_s / pass / status
+    """
+    if scorer == "agent_replay_pass_rate":
+        table = Table(title=f"Sweep complete (coding-agent-loop). {len(results)} cell(s).")
+        table.add_column("#")
+        table.add_column("budget", justify="right")
+        table.add_column("max_ctx", justify="right")
+        table.add_column("fa_win", justify="right")
+        table.add_column("kv")
+        table.add_column("pflash")
+        table.add_column("case tok", justify="right")
+        table.add_column("tok/s", justify="right")
+        table.add_column("pass")
+        table.add_column("status")
+        for r in results:
+            cfg = r.config
+            kv = cfg.cache_type_k or "—"
+            case_tok = "—" if r.case_tokens is None else str(r.case_tokens)
+            speed = "—" if r.speed_metric is None else f"{r.speed_metric:.1f}"
+            if r.error:
+                pass_cell = "—"
+                status = f"[red]{r.error}[/red]"
+            elif r.passed is None:
+                pass_cell = "—"
+                status = "[yellow]not scored[/yellow]"
+            elif r.passed:
+                pass_cell = "[green]✓[/green]"
+                status = "[green]← winner[/green]" if winner is r else r.pass_reason[:60]
+            else:
+                pass_cell = "[red]✗[/red]"
+                status = r.pass_reason[:60]
+            table.add_row(
+                str(r.index + 1),
+                str(cfg.budget),
+                str(cfg.max_ctx),
+                str(cfg.fa_window),
+                kv,
+                cfg.prefill_mode,
+                case_tok,
+                speed,
+                pass_cell,
+                status,
+            )
+        console.print(table)
+        return
+
     table = Table(title=f"Sweep complete. Tested {len(results)} config(s).")
     table.add_column("#")
     table.add_column("budget", justify="right")
@@ -340,20 +555,34 @@ def run_sweep(
     console: Console | None = None,
     ready_timeout: int = 60,
     yes: bool = False,
+    profile: str = "heuristic",
 ) -> int:
     """Top-level sweep driver. Returns process exit code.
 
     1. Pre-flight: refuse if no systemd unit or no model preset.
     2. Snapshot config.toml + install signal trap.
-    3. For each candidate from ``autotune.candidate_configs(host_facts)``:
+    3. For each candidate from the selected profile's
+       ``candidate_configs(host, preset)``:
          a. Write dflash.* fields via ``config_set``.
          b. Restart the systemd unit.
          c. Wait for /v1/models healthy.
-         d. Invoke ``lucebox profile --level level1`` against the running server.
-         e. Parse decode_tps from the snapshot's per-area JSONs.
-    4. Apply the winning config (highest mean_decode_tps), restart, remove backup.
+         d. Score the cell — either by invoking ``lucebox profile`` and
+            parsing decode_tps (``decode_tps_snapshot``), or by replaying
+            the largest fitting multi-turn fixture case
+            (``agent_replay_pass_rate``).
+    4. Apply the winning config, restart, remove backup.
+
+    ``profile``: one of ``autotune.PROFILES`` keys
+    (``heuristic`` is the legacy preset-agnostic path; ``coding-agent-loop``
+    is the agentic-workload-aware path).
     """
     console = console or Console()
+
+    try:
+        active_profile = autotune_mod.get_profile(profile)
+    except KeyError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
 
     rc = _preflight(console)
     if rc is not None:
@@ -361,9 +590,12 @@ def run_sweep(
 
     cfg = config_mod.load() or config_mod.live_config()
     host = from_env()
-    candidates = autotune_mod.candidate_configs(host)
+    candidates = active_profile.candidate_configs(host, cfg.model.preset)
     if not candidates:
-        console.print("[red]candidate_configs returned no configs — nothing to sweep.[/red]")
+        console.print(
+            f"[red]profile {profile!r} returned no candidate configs — "
+            "nothing to sweep.[/red]"
+        )
         return 2
 
     if not yes:
@@ -401,9 +633,14 @@ def run_sweep(
         for idx, candidate in enumerate(candidates):
             short = _short_hash(candidate)
             kv = candidate.cache_type_k or "auto"
+            extras = ""
+            if active_profile.scorer == "agent_replay_pass_rate":
+                extras = (
+                    f"  fa_window={candidate.fa_window}  pflash={candidate.prefill_mode}"
+                )
             console.print(
                 f"[bold][{idx + 1}/{len(candidates)}][/bold] "
-                f"budget={candidate.budget}  max_ctx={candidate.max_ctx}  kv={kv}"
+                f"budget={candidate.budget}  max_ctx={candidate.max_ctx}  kv={kv}{extras}"
             )
 
             try:
@@ -446,10 +683,35 @@ def run_sweep(
                 continue
 
             cell_name = f"cell-{idx + 1:02d}-{short}"
-            # Shell out to `lucebox profile` so the snapshot pipeline
-            # stays the user-visible single source of truth. Pass
-            # --label so the auto-derived name still slots under the
-            # sweep dir if the user inspects results manually.
+
+            if active_profile.scorer == "agent_replay_pass_rate":
+                passed, reason, speed, case_id, case_tokens = _score_agent_replay(
+                    cfg.port,
+                    max_ctx=candidate.max_ctx,
+                )
+                results.append(
+                    CellResult(
+                        index=idx,
+                        config=candidate,
+                        snapshot_dir=None,
+                        mean_decode_tps=None,
+                        error=None,
+                        passed=passed,
+                        pass_reason=reason,
+                        speed_metric=speed,
+                        case_id=case_id,
+                        case_tokens=case_tokens,
+                    )
+                )
+                speed_str = "—" if speed is None else f"{speed:.1f} tok/s"
+                console.print(
+                    f"    → {'pass' if passed else 'fail'} ({reason[:80]}) "
+                    f"speed={speed_str}"
+                )
+                continue
+
+            # Legacy heuristic path: shell out to `lucebox profile`
+            # and parse mean decode_tps from the snapshot.
             snapshot_rc = subprocess.run(
                 [
                     "lucebox",
@@ -462,11 +724,11 @@ def run_sweep(
                     **os.environ,
                     # Pipe the sweep-cell out-dir through the env so
                     # run_profile lands snapshots under our sweep
-                    # tree. The profile command honors --out-dir / -name
-                    # via run_profile kwargs — for the sweep path we
-                    # invoke run_profile directly below so the env
-                    # plumbing isn't actually needed; kept here as a
-                    # belt+suspenders override for any out-of-band
+                    # tree. The profile command honors --out-dir /
+                    # --name via run_profile kwargs — for the sweep
+                    # path we invoke run_profile directly below so the
+                    # env plumbing isn't actually needed; kept here as
+                    # a belt+suspenders override for any out-of-band
                     # lucebox invocation.
                     "LUCEBOX_SWEEP_OUT_DIR": str(sweep_root),
                     "LUCEBOX_SWEEP_CELL_NAME": cell_name,
@@ -522,14 +784,16 @@ def run_sweep(
         _systemctl_restart()
         return 130  # canonical SIGINT exit code
 
-    winner = _pick_winner(results)
+    winner = _pick_winner(results, active_profile.scorer)
     if winner is None:
-        console.print(
-            "[red]No cell produced a decode_tps measurement — restoring pre-sweep config.[/red]"
-        )
+        if active_profile.scorer == "agent_replay_pass_rate":
+            msg = "No cell passed the agent_replay probe — restoring pre-sweep config."
+        else:
+            msg = "No cell produced a decode_tps measurement — restoring pre-sweep config."
+        console.print(f"[red]{msg}[/red]")
         _restore_backup(console, backup)
         _systemctl_restart()
-        _print_results(console, results, None)
+        _print_results(console, results, None, active_profile.scorer)
         return 1
 
     # Apply the winner. The losing cells already wrote their dflash.*
@@ -542,14 +806,14 @@ def run_sweep(
             f"[red]Restart after applying winner failed (exit={rc}). "
             "Backup retained.[/red]"
         )
-        _print_results(console, results, winner)
+        _print_results(console, results, winner, active_profile.scorer)
         return rc
 
     if not _wait_ready(cfg.port, ready_timeout):
         console.print(
             "[red]Server didn't come back after applying winner — backup retained.[/red]"
         )
-        _print_results(console, results, winner)
+        _print_results(console, results, winner, active_profile.scorer)
         return 1
 
     # Success path — purge the backup so the next `lucebox autotune
@@ -557,7 +821,7 @@ def run_sweep(
     if backup is not None and backup.exists():
         backup.unlink()
 
-    _print_results(console, results, winner)
+    _print_results(console, results, winner, active_profile.scorer)
     return 0
 
 
