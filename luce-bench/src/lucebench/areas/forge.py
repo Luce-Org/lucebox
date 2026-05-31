@@ -20,9 +20,193 @@ The vendored ``_forge`` runtime + scenarios are MIT-licensed
 
 from __future__ import annotations
 
+import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
+
+# Pattern for ``call:<verb>{`` openers. The verb part allows snake_case,
+# kebab-case, dotted, or namespaced (``ns:verb``) names — same alphabet
+# as ``_CALL_INVOCATION`` in lucebench.areas.agent.
+_CALL_OPEN = re.compile(r"\bcall:([A-Za-z0-9_.:-]+)\s*\{")
+
+
+def _balanced_braces_end(text: str, start: int) -> int | None:
+    """Return the index *after* the closing ``}`` that matches ``text[start] == '{'``.
+
+    Respects nesting and skips over string literals (single + double
+    quoted, with backslash escapes). Returns ``None`` if no matching
+    close brace is found.
+    """
+    depth = 0
+    i = start
+    n = len(text)
+    in_str: str | None = None  # None or one of ", '
+    while i < n:
+        ch = text[i]
+        if in_str is not None:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            in_str = ch
+            i += 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def _coerce_relaxed_json(payload: str) -> Any:
+    """Parse a relaxed JSON5-ish arg block (unquoted keys, etc.).
+
+    The plain-text tool emissions look like ``{country: "France"}`` —
+    valid JSON5 but not strict JSON. Strategy:
+
+    1. Try ``json.loads`` first (covers cases where the model happens to
+       emit valid JSON).
+    2. Else quote bare keys (``foo:`` → ``"foo":``) and retry.
+    3. If parsing still fails, raise ``ValueError`` so the caller can
+       drop the invocation without crashing the bench.
+    """
+    payload = payload.strip()
+    try:
+        return json.loads(payload)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Permissive pass: quote bare keys. The regex matches an identifier
+    # followed by ``:`` only when it isn't already inside a string. We
+    # walk the text and skip string contents to avoid mangling values.
+    out: list[str] = []
+    i = 0
+    n = len(payload)
+    in_str: str | None = None
+    while i < n:
+        ch = payload[i]
+        if in_str is not None:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(payload[i + 1])
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            # Normalize single-quoted strings to double-quoted so json.loads accepts them.
+            if ch == "'":
+                out.append('"')
+                in_str = "'"
+            else:
+                out.append(ch)
+                in_str = ch
+            i += 1
+            continue
+        # Try to match a bare identifier followed by optional whitespace + ':'
+        m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)(\s*:)", payload[i:])
+        if m and (not out or out[-1] not in ('"',)):
+            out.append('"')
+            out.append(m.group(1))
+            out.append('"')
+            out.append(m.group(2))
+            i += m.end()
+            continue
+        out.append(ch)
+        i += 1
+
+    # Replace any single-quoted string close markers in the rewrite. We
+    # already opened them as double quotes; close them as double quotes
+    # too. This is a no-op for inputs that didn't use single quotes.
+    rewritten = "".join(out).replace("'", '"')
+    return json.loads(rewritten)
+
+
+def _strip_plain_text_tool_calls(text: str) -> str:
+    """Remove every full ``call:<verb>{...}`` span from *text*.
+
+    Used to clean a model's narrative reasoning before echoing it back
+    as the assistant message that precedes a synthesized tool call —
+    without this, the conversation history accumulates duplicate signal
+    (the structured tool_use AND its plain-text twin) and re-train the
+    model toward the wrong shape inside a single scenario.
+    """
+    if not text:
+        return text
+    out: list[str] = []
+    pos = 0
+    n = len(text)
+    while pos < n:
+        m = _CALL_OPEN.search(text, pos)
+        if m is None:
+            out.append(text[pos:])
+            break
+        out.append(text[pos : m.start()])
+        brace_open = m.end() - 1
+        brace_end = _balanced_braces_end(text, brace_open)
+        if brace_end is None:
+            # Unbalanced — leave the rest as-is (we couldn't have
+            # synthesized a ToolCall from this span anyway).
+            out.append(text[m.start():])
+            break
+        pos = brace_end
+    return "".join(out)
+
+
+def _parse_plain_text_tool_calls(text: str) -> list[dict[str, Any]]:
+    """Extract ``call:<verb>{args}`` invocations from a plain-text response.
+
+    Returns a list of ``{"name": <verb>, "input": <dict>}`` dicts —
+    same shape as Anthropic ``tool_use`` content blocks minus the SDK
+    object overhead — preserving emission order. The caller wraps each
+    entry in a ``ToolCall`` (forge-internal type) or a record dict
+    (snapshot ``tool_calls`` field).
+
+    Malformed args (unparseable even after the permissive pass) cause
+    that single invocation to be dropped — no exception escapes, no
+    placeholder tool_use is synthesized. This keeps a partially-mangled
+    response from crashing the bench while still surfacing the
+    correctly-formatted calls that precede or follow it.
+    """
+    if not text:
+        return []
+    results: list[dict[str, Any]] = []
+    pos = 0
+    while True:
+        m = _CALL_OPEN.search(text, pos)
+        if m is None:
+            break
+        name = m.group(1)
+        brace_open = m.end() - 1  # index of the '{' itself
+        brace_end = _balanced_braces_end(text, brace_open)
+        if brace_end is None:
+            # Unbalanced — stop scanning (the rest of the text can't
+            # reliably contain more calls if we got the bracket count
+            # wrong).
+            break
+        payload = text[brace_open + 1 : brace_end - 1]
+        try:
+            args = _coerce_relaxed_json("{" + payload + "}")
+            if not isinstance(args, dict):
+                raise ValueError("tool args must be a JSON object")
+        except (ValueError, json.JSONDecodeError):
+            # Drop this invocation, keep scanning past it.
+            pos = brace_end
+            continue
+        results.append({"name": name, "input": args})
+        pos = brace_end
+    return results
 
 # Vendored forge_eval lives next to this module (one level up, under
 # fixtures/). Insert the fixtures dir on sys.path so the package
@@ -123,6 +307,7 @@ def run_forge_area(
         )
         from forge_eval._forge.core.workflow import (  # type: ignore[import-not-found]
             TextResponse,
+            ToolCall,
         )
     except ImportError as exc:
         raise SystemExit(
@@ -243,7 +428,27 @@ def run_forge_area(
                         }
                     )
             text_join = "\n".join(p for p in text_parts if p)
-            if tool_uses_present:
+
+            # If the server returned proper ``tool_use`` content blocks
+            # we hand them to forge as-is. Otherwise — and this is the
+            # gemma case (2026-05-30 bench), where the model emits
+            # ``call:<verb>{...}`` as inline text instead of structured
+            # blocks — scan the text for those invocations and
+            # synthesize ToolCall entries so forge's validator sees the
+            # tool calls it expects. This client-side synthesis
+            # future-proofs the bench for any model that uses the same
+            # plain-text tool serialization (codex-mini, DDX bead
+            # executor, etc.) without requiring a server-side fix.
+            synthesized: list[dict[str, Any]] = []
+            if not tool_uses_present and text_join:
+                synthesized = _parse_plain_text_tool_calls(text_join)
+                for syn in synthesized:
+                    tool_calls_out.append(
+                        {"name": syn["name"], "arguments": syn["input"]}
+                    )
+
+            had_tool_calls = tool_uses_present or bool(synthesized)
+            if had_tool_calls:
                 record["reasoning_content"] = text_join
                 record["output"] = ""
             else:
@@ -251,7 +456,42 @@ def run_forge_area(
             record["tool_calls"] = tool_calls_out
 
             self.iteration_log.append(record)
-            return TextResponse(text=text_join)
+
+            # Build a forge-native LLMResponse. The contract
+            # (forge_eval._forge.core.workflow.LLMResponse) is
+            # ``list[ToolCall] | TextResponse``. We previously returned
+            # ``TextResponse(text=...)`` which raised a pydantic
+            # ValidationError every call (the field is named
+            # ``content``, not ``text``) — that's the
+            # ``error_type=ValidationError`` seen across the 2026-05-30
+            # gemma full bench's forge rows.
+            if tool_uses_present:
+                reasoning = text_join or None
+                return [
+                    ToolCall(
+                        tool=getattr(block, "name", ""),
+                        args=dict(getattr(block, "input", {}) or {}),
+                        reasoning=reasoning if i == 0 else None,
+                    )
+                    for i, block in enumerate(
+                        b for b in (getattr(response, "content", None) or [])
+                        if getattr(b, "type", None) == "tool_use"
+                    )
+                ]
+            if synthesized:
+                # Strip the synthesized call:<verb>{...} fragments out
+                # of the reasoning text so it isn't echoed back to the
+                # model as both a tool_call AND its plain-text twin.
+                cleaned = _strip_plain_text_tool_calls(text_join).strip() or None
+                return [
+                    ToolCall(
+                        tool=syn["name"],
+                        args=dict(syn["input"]),
+                        reasoning=cleaned if i == 0 else None,
+                    )
+                    for i, syn in enumerate(synthesized)
+                ]
+            return TextResponse(content=text_join)
 
     # ── Scenario selection + runner ───────────────────────────────────
     scenarios = list(ALL_SCENARIOS)
