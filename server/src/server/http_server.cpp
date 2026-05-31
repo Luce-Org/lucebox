@@ -491,6 +491,7 @@ std::vector<ChatMessage> normalize_chat_messages(
             cm.role = m.value("role", "user");
 
             bool replayed = false;
+            // OpenAI format: assistant message with tool_calls field.
             if (cm.role == "assistant" && m.contains("tool_calls") &&
                 m["tool_calls"].is_array() && !m["tool_calls"].empty()) {
                 std::vector<std::string> call_ids;
@@ -505,6 +506,43 @@ std::vector<ChatMessage> normalize_chat_messages(
                 }
             }
 
+            // Anthropic format: assistant message with tool_use content blocks.
+            // IDs in tool_use blocks match the IDs stored in tool_memory when
+            // this server emitted the tool calls. Look them up to get the raw
+            // model output (already formatted for the model's chat template).
+            if (!replayed && cm.role == "assistant" &&
+                m.contains("content") && m["content"].is_array()) {
+                std::vector<std::string> call_ids;
+                for (const auto & part : m["content"]) {
+                    if (part.value("type", "") == "tool_use") {
+                        std::string id = part.value("id", "");
+                        if (!id.empty()) call_ids.push_back(id);
+                    }
+                }
+                if (!call_ids.empty()) {
+                    std::string raw = tool_memory.lookup(call_ids);
+                    if (!raw.empty()) {
+                        cm.content = raw;
+                        replayed = true;
+                    } else {
+                        // tool_memory miss (cross-session replay): synthesize
+                        // from the block fields using the model's tool_call XML.
+                        for (const auto & part : m["content"]) {
+                            if (part.value("type", "") == "tool_use") {
+                                json input = part.contains("input")
+                                    ? part["input"] : json::object();
+                                cm.content += "<tool_call>\n";
+                                cm.content += render_tool_call_xml(
+                                    part.value("name", ""), input);
+                                cm.content += "</tool_call>\n";
+                            }
+                        }
+                        replayed = !cm.content.empty();
+                    }
+                }
+            }
+
+            bool has_tool_results = false;
             if (!replayed) {
                 if (m.contains("content") && m["content"].is_string()) {
                     cm.content = m["content"].get<std::string>();
@@ -514,16 +552,45 @@ std::vector<ChatMessage> normalize_chat_messages(
                         if (ptype == "text" || ptype == "input_text" ||
                             ptype == "output_text") {
                             cm.content += part.value("text", "");
+                        } else if (ptype == "tool_result") {
+                            // Anthropic format: tool result inside a user
+                            // message. Push as a tool-role message so the
+                            // chat template wraps it in <tool_response> tags.
+                            has_tool_results = true;
+                            std::string result_content;
+                            if (part.contains("content")) {
+                                if (part["content"].is_string()) {
+                                    result_content =
+                                        part["content"].get<std::string>();
+                                } else if (part["content"].is_array()) {
+                                    for (const auto & c : part["content"]) {
+                                        if (c.value("type", "") == "text") {
+                                            result_content +=
+                                                c.value("text", "");
+                                        }
+                                    }
+                                }
+                            }
+                            std::string result_id =
+                                part.value("tool_use_id", "");
+                            chat_msgs.push_back(
+                                {"tool", result_content, result_id});
                         }
                     }
                 }
             }
 
-            if (format == ApiFormat::RESPONSES &&
-                (cm.role == "system" || cm.role == "developer")) {
-                system_parts.push_back(cm.content);
-            } else {
-                chat_msgs.push_back(std::move(cm));
+            // Skip pushing an empty user container when all content was
+            // tool_result blocks (already pushed as individual tool messages).
+            bool skip = (cm.role == "user" && has_tool_results &&
+                         cm.content.empty());
+            if (!skip) {
+                if (format == ApiFormat::RESPONSES &&
+                    (cm.role == "system" || cm.role == "developer")) {
+                    system_parts.push_back(cm.content);
+                } else {
+                    chat_msgs.push_back(std::move(cm));
+                }
             }
         }
     } else if (messages.is_string()) {
