@@ -44,22 +44,26 @@ All results on image `dc20057e-cuda12` (commit `dc20057e`), bragi throttled stat
 | Benchmark | Qwen3.6 nothink | Qwen3.6 think | Gemma4 nothink | Gemma4 think |
 |-----------|-----------------|---------------|----------------|--------------|
 | **forge** | **100% (5/5)** ★ | — | 20% (1/5) | — |
+| **agent** | **100% (4/4)** ★ | 50% | 25% (1/4) | 50% |
+| **longctx** | **100% (6/6)** ★ | — | 100% | 83.3% |
 | **agent_recorded** | 42.3% (11/26) | **46.2% (12/26)** | 19.2% (5/26) | — |
-| agent | 75% | 50% | 25% | 50% |
-| code | ~90% (9/10) | ~20% | 0% | 0% |
-| ds4-eval | 70.7% | **81.5%** | 77.2% | 81.5% |
-| gsm8k | **89%** | 82% | 91% | 91% |
-| hellaswag | **90%** | 73% | 73% | 42% |
+| code | **90% (9/10)** | ~20% | 0% | 0% |
+| ds4-eval | 77.2% (71/92)† | **81.5%** | 77.2% | 81.5% |
 | truthfulqa-mc1 | 80% | **84%** | 77% | 68% |
-| longctx | — | — | **100%** | 83.3% |
+| hellaswag | **88%** | 73% | 73% | 42% |
+| gsm8k | 86% | 82% | **91%** | 91% |
+
+† ds4-eval nothink updated 2026-05-31 on image dc20057e-cuda12 (comprehensive sweep).
+  Previous run (70.7%) was on earlier image; +6.5pp is within run-to-run variance.
 
 **Verdict**: Qwen3.6 is the preferred model for coding/agent tasks on bragi.
 - forge: Qwen3.6 100% vs Gemma4 20% (+80pp)
-- agent_recorded: Qwen3.6 46.2% vs Gemma4 19.2% (+27pp)
-- agent: Qwen3.6 75% vs Gemma4 25% (+50pp nothink)
-- code: Qwen3.6 ~90% vs Gemma4 0%
+- agent_recorded: Qwen3.6 42.3% vs Gemma4 19.2% (+23pp)
+- agent: Qwen3.6 100% vs Gemma4 25% (+75pp nothink)
+- code: Qwen3.6 90% vs Gemma4 0%
+- longctx: both 100% nothink (Qwen3.6 newly verified)
 
-Gemma4 advantages (pure reasoning, no tool use): gsm8k (+2pp), longctx (100%),
+Gemma4 advantages (pure reasoning, no tool use): gsm8k (+5pp),
 faster decode speed (66 tok/s vs 24 tok/s due to sparse MoE 4B active params).
 
 ## Qwen3.6: think vs nothink guidance
