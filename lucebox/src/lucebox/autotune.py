@@ -57,6 +57,10 @@ def runtime_from_host(host: HostFacts) -> DflashRuntime:
     Prefix cache remains an explicit sweep tunable, but the automatic
     baseline keeps it off because tool prompts currently exercise a daemon
     snapshot path that is not reliable with prefix slots enabled.
+    Empirically confirmed on bragi 2026-05-31: prefix_cache_slots=32
+    caused -19pp regression on agent_recorded (23.1% vs 42.3% baseline).
+    5 previously-passing cases regressed; 0 new cases unlocked. See
+    docs/experiments/qwen3.6-27b-prefix-cache-regression-bragi-2026-05-31.md.
 
     On `lazy`: the C++ server requires `--prefill-drafter` (and `--draft`)
     to be set for `--lazy-draft` to take effect, and silently ignores it
