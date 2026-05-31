@@ -228,15 +228,19 @@ DFLASH27B_KV_TQ3=1 \
 
 **Multi-GPU / IPC**
 
-| Flag | Default | Effect |
+| Flag / env | Default | Effect |
 |---|---|---|
 | `--target-device <dev>` | `cuda:0` | Target backend (e.g. `cuda:0`, `hip:0`) |
 | `--draft-device <dev>` | same as target | Draft backend; mixed backend needs `--draft-ipc-bin` |
+| `--target-gpu N` | `0` | Target GPU index |
+| `--draft-gpu N` | same as target | Draft GPU index; offload draft to a second GPU |
 | `--target-devices <list>` / `--target-layer-split` | single GPU | Layer-split target across GPUs |
 | `--draft-ipc-bin <path>` | — | Out-of-process draft binary (mixed CUDA/HIP) |
 | `--peer-access` | off | Enable P2P between target GPUs |
 | `--chunk N` | backend default | Prefill ubatch size |
 | `--no-cors` | CORS on | Disable CORS headers |
+| `DFLASH_TARGET_GPU=N` | `0` | Env var equivalent of `--target-gpu` |
+| `DFLASH_DRAFT_GPU=N` | same as target | Env var equivalent of `--draft-gpu` |
 
 [DFlash benchmarks →](server/RESULTS.md) · [DFlash blog →](https://lucebox.com/blog/dflash27b) · [PFlash benchmarks →](optimizations/pflash/README.md) · [PFlash blog →](https://lucebox.com/blog/pflash) · [Per-machine quick starts (DGX Spark, Jetson Thor, HIP) →](server/README.md#quick-start)
 
