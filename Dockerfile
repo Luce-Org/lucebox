@@ -216,6 +216,7 @@ RUN mkdir -p /opt/lucebox-hub/server/share \
 
 RUN test -x /opt/lucebox-hub/server/build/test_dflash \
     && test -x /opt/lucebox-hub/server/build/dflash_server \
+    && test -x /opt/lucebox-hub/server/build/test_server_unit \
     && test -f /opt/lucebox-hub/server/share/model_cards/qwen3.6-27b.json \
     && chmod +x /opt/lucebox-hub/server/scripts/entrypoint.sh
 
