@@ -5,6 +5,9 @@ first run on bragi (Blackwell sm_120). Corrects an incorrect conclusion from
 the earlier sindri sweep where all 131K cells appeared to fail.
 
 * **Host**: bragi (RTX 5090 Laptop MaxQ, 23 GB VRAM, WSL2, sm_120)
+  * **Note**: GPU at ~86–90 W / 1515 MHz (Windows Balanced mode; WSL2 cannot
+    set TDP). At full performance (150–175 W) decode rate would be ~50–60 tok/s
+    vs the ~30 tok/s observed here.
 * **Image**: locally-built `lucebox-hub:cuda12` from
   `feat/lucebox-docker` @ `48fafe6` (DFLASH_CUDA_ARCHES=120)
 * **Fixture**: one 6-bucket multi-turn replay case from

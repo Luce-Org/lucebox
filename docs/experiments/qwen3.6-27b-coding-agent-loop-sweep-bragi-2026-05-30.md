@@ -4,6 +4,10 @@ First end-to-end run of the `coding-agent-loop` autotune profile on
 Qwen3.6-27B on bragi, a consumer Blackwell laptop.
 
 * **Host**: bragi (RTX 5090 Laptop MaxQ, 23 GB VRAM, WSL2, sm_120)
+  * **Note**: GPU running at ~86–90 W / 1515 MHz during this run (Windows
+    Balanced power mode; WSL2 cannot set TDP). Full-performance mode
+    (Best performance) would yield ~150–175 W / 2500+ MHz and ~40–50 tok/s
+    decode vs the 24–25 tok/s observed here.
 * **Image**: locally-built `lucebox-hub:cuda12` from
   `feat/lucebox-docker` @ `48fafe6` (DFLASH_CUDA_ARCHES=120, sm_120 fat
   binary)
