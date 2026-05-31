@@ -134,20 +134,35 @@ Post-fix scenario detail (2026-05-31, image `dc20057e-cuda12`):
 All scenarios complete in 2–4 calls (down from 15 failed iterations).
 Total bench wall time: ~32s (down from ~118s).
 
-## Comparison: Qwen3.6 vs Gemma4 forge
+## Comparison: Qwen3.6 vs Gemma4 forge (both on image `dc20057e-cuda12`)
 
-| Model | forge pass_rate | notes |
-|-------|-----------------|-------|
-| Gemma4-26B-A4B (Q4_K_M) | 20% (1/5) | post Gemma4-specific fixes (step_enforcer + find_tool_start) |
-| Qwen3.6-27B (Q4_K_M) | **100% (5/5)** | post tool_result fix |
+| Model | forge pass_rate | calls | notes |
+|-------|-----------------|-------|-------|
+| Gemma4-26B-A4B (Q4_K_M) | 20% (1/5) | 1,9,6,6,15 | basic_2step PASS (one-shot); rest fail on model behavior |
+| Qwen3.6-27B (Q4_K_M) | **100% (5/5)** | 2,3,3,4,3 | all scenarios pass cleanly |
 
-**Qwen3.6 is substantially better on forge** (100% vs 20%). Gemma4's
-20% ceiling is a model behavior issue (unreliable multi-step tool calling
-with forge-style prompts); Qwen3.6 passes all 5 scenarios cleanly.
+**Qwen3.6 is substantially better on forge** (100% vs 20%). The tool_result fix
+was decisive for Qwen3.6 (0%→100%) and neutral for Gemma4 (20%→20%).
 
-**The tool_use/tool_result fix is a general server fix** — it applies to all
-models using the Anthropic Messages API format (`/v1/messages`). Gemma4's
-forge result may also improve once re-tested with the new image.
+### Why the fix is neutral for Gemma4
+
+Gemma4's only passing scenario (basic_2step) works via **one-shot batching**: the
+model emits both required and terminal tools in a single response. The runner
+executes them in order and reaches `terminal_reached` without ever needing to send
+tool_results back. So the tool_result fix doesn't affect this path.
+
+The failing Gemma4 scenarios: when the model receives tool results (now properly
+contextualized by the fix), it still fails to continue correctly — it generates
+text responses instead of the next tool call. This is a model behavior limitation,
+not a server bug.
+
+### Why the fix is critical for Qwen3.6
+
+Qwen3.6 uses turn-by-turn tool calling: call one tool, receive the result, call the
+next. This requires multi-turn conversation with proper tool_result context. Without
+the fix, each turn was sending only role delimiters (+10 tokens) instead of actual
+results, so the model kept calling the same tool in a loop (15 iterations → FAIL).
+With the fix: 2–4 calls per scenario, all pass.
 
 ## Why `--think`/`--no-think` don't affect forge
 
@@ -166,6 +181,6 @@ capability under the model's default generation behavior.
 4. ~~Assess what Qwen3.6 forge ceiling looks like~~ Done — 100% (5/5)
 5. ~~Consider: does the same tool_result bug affect agent_recorded?~~ No —
    agent_recorded reads text content, not tool_use blocks
-6. Re-run Gemma4 forge with new image to measure improvement from general fix
-7. Consider running think-mode forge for Qwen3.6 (expect identical, since
-   --think/--no-think don't inject into forge runner)
+6. ~~Re-run Gemma4 forge with new image~~ Done (20%→20%, neutral for Gemma4)
+7. Think-mode forge for Qwen3.6: skip — --think/--no-think don't inject into
+   forge runner, so result is identical
