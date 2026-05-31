@@ -850,11 +850,12 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
 
         // Compute
         auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
-        if (io.should_cancel()) return -1;
-        if (st != GGML_STATUS_SUCCESS) {
+        const auto compute_result = classify_daemon_compute_result(st, io);
+        if (compute_result == DaemonComputeResult::Failed) {
             std::fprintf(stderr, "prefill compute @%d failed\n", kv_pos);
             return -1;
         }
+        if (compute_result == DaemonComputeResult::Cancelled) return -1;
         after_target_compute(sg_, kv_pos, n_tokens);
 
         int32_t last_tok = -1;
@@ -1320,12 +1321,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     sizeof(int32_t) * pos_k.size());
 
             auto st = ggml_backend_graph_compute(draft_backend_, draft_sg.gf);
-            if (io.should_cancel()) break;
-            if (st != GGML_STATUS_SUCCESS) {
+            const auto compute_result = classify_daemon_compute_result(st, io);
+            if (compute_result == DaemonComputeResult::Failed) {
                 std::fprintf(stderr, "spec-decode: draft compute failed\n");
                 step_graph_destroy(draft_sg);
                 return false;
             }
+            if (compute_result == DaemonComputeResult::Cancelled) break;
 
             // Read draft hidden states to host for LM-head projection.
             local_hidden.resize((size_t)hidden * q_len);

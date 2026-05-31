@@ -51,6 +51,22 @@ struct DaemonIO {
     DaemonIO with_token_callback(const TokenCallback & cb) const;
 };
 
+enum class DaemonComputeResult {
+    Success,
+    Cancelled,
+    Failed,
+};
+
+inline DaemonComputeResult classify_daemon_compute_result(
+        ggml_status status,
+        const DaemonIO & io) {
+    // A completed graph failure is a backend error even if the client also
+    // disconnected while the graph was running.
+    if (status != GGML_STATUS_SUCCESS) return DaemonComputeResult::Failed;
+    if (io.should_cancel()) return DaemonComputeResult::Cancelled;
+    return DaemonComputeResult::Success;
+}
+
 // ─── Generate request/result ────────────────────────────────────────────
 
 // Thinking-budget force-close hook. Mirrors antirez/ds4 ds4_eval.c's

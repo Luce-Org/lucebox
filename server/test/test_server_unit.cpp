@@ -16,6 +16,7 @@
 #include "server/api_types.h"
 #include "server/http_server.h"
 #include "server/chat_template.h"
+#include "common/model_backend.h"
 #include "common/sampler.h"
 #include "common/backend_ipc.h"
 #include "placement/pflash_placement.h"
@@ -2456,6 +2457,38 @@ static void test_daemon_io_with_token_callback_preserves_cancel_callback() {
     TEST_ASSERT(callback_score == 11);
 }
 
+static void test_daemon_compute_result_prefers_failure_over_cancel() {
+    int cancel_polls = 0;
+    DaemonIO io;
+    io.is_cancelled = [&]() {
+        cancel_polls++;
+        return true;
+    };
+
+    const auto result =
+        classify_daemon_compute_result(GGML_STATUS_FAILED, io);
+
+    TEST_ASSERT(result == DaemonComputeResult::Failed);
+    TEST_ASSERT(cancel_polls == 0);
+    TEST_ASSERT(!io.cancelled);
+}
+
+static void test_daemon_compute_result_reports_cancel_after_success() {
+    int cancel_polls = 0;
+    DaemonIO io;
+    io.is_cancelled = [&]() {
+        cancel_polls++;
+        return true;
+    };
+
+    const auto result =
+        classify_daemon_compute_result(GGML_STATUS_SUCCESS, io);
+
+    TEST_ASSERT(result == DaemonComputeResult::Cancelled);
+    TEST_ASSERT(cancel_polls == 1);
+    TEST_ASSERT(io.cancelled);
+}
+
 static void test_tokenizer_encode_honors_cancel_callback() {
     Tokenizer tok;
     bool callback_called = false;
@@ -2827,6 +2860,8 @@ int main() {
     std::fprintf(stderr, "\n── DaemonIO cancellation ──\n");
     RUN_TEST(test_daemon_io_cancel_callback_stops_emit_before_token_callback);
     RUN_TEST(test_daemon_io_with_token_callback_preserves_cancel_callback);
+    RUN_TEST(test_daemon_compute_result_prefers_failure_over_cancel);
+    RUN_TEST(test_daemon_compute_result_reports_cancel_after_success);
     RUN_TEST(test_tokenizer_encode_honors_cancel_callback);
 
     std::fprintf(stderr, "\n── ModelBackend empty-spec retry ──\n");

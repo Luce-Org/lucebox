@@ -141,11 +141,12 @@ bool run_dflash_spec_decode(
             ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
                                     sizeof(int32_t) * pos_k.size());
             auto st = ggml_backend_graph_compute(draft_backend, draft_sg.gf);
-            if (io.should_cancel()) break;
-            if (st != GGML_STATUS_SUCCESS) {
+            const auto compute_result = classify_daemon_compute_result(st, io);
+            if (compute_result == DaemonComputeResult::Failed) {
                 std::fprintf(stderr, "dflash-spec draft compute %d\n", (int)st);
                 return false;
             }
+            if (compute_result == DaemonComputeResult::Cancelled) break;
             // Read draft hidden states out to host so the target adapter can
             // project them through its own LM head (target-internal layout).
             local_hidden.resize((size_t)hidden * q_len);

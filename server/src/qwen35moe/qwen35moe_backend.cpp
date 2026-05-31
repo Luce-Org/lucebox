@@ -552,8 +552,9 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
             build_us_total += elapsed_us(t0, t1);
 
             auto st = ggml_backend_graph_compute(target_backend(), sg_ptr->gf);
-            if (out_io.should_cancel()) return false;
-            if (st != GGML_STATUS_SUCCESS) return false;
+            const auto compute_result = classify_daemon_compute_result(st, out_io);
+            if (compute_result == DaemonComputeResult::Failed) return false;
+            if (compute_result == DaemonComputeResult::Cancelled) return false;
             const auto t2 = HybridClock::now();
             compute_us_total += elapsed_us(t1, t2);
 
@@ -720,14 +721,15 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
 
             // Compute batched pre-FFN
             auto st = ggml_backend_graph_compute(target_backend(), prefill_sg.gf);
-            if (out_io.should_cancel()) {
-                result.ok = true;
+            const auto compute_result = classify_daemon_compute_result(st, out_io);
+            if (compute_result == DaemonComputeResult::Failed) {
+                result.error = "prefill_compute";
                 step_graph_destroy(prefill_sg);
                 cleanup_graphs();
                 return result;
             }
-            if (st != GGML_STATUS_SUCCESS) {
-                result.error = "prefill_compute";
+            if (compute_result == DaemonComputeResult::Cancelled) {
+                result.ok = true;
                 step_graph_destroy(prefill_sg);
                 cleanup_graphs();
                 return result;
