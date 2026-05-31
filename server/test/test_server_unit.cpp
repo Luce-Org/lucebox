@@ -316,6 +316,172 @@ static void test_parse_tool_allowed_filter() {
     TEST_ASSERT(result.tool_calls.empty());
 }
 
+// ─── Pattern 5: call:<verb>{relaxed-JSON args} (gemma plain-text) ─────
+
+static void test_parse_call_verb_single() {
+    std::string text = "call:get_country_info{country: \"France\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_country_info");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["country"] == "France");
+    }
+    TEST_ASSERT(result.cleaned_text.find("call:") == std::string::npos);
+}
+
+static void test_parse_call_verb_back_to_back() {
+    std::string text =
+        "call:get_country_info{country: \"France\"}"
+        "call:summarize{text: \"ok\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 2);
+    if (result.tool_calls.size() == 2) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_country_info");
+        TEST_ASSERT(result.tool_calls[1].name == "summarize");
+    }
+}
+
+static void test_parse_call_verb_namespaced() {
+    std::string text = "call:execute-bead:read-file{path: \"crates/foo/src/lib.rs\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        // Verb only — namespace stripped.
+        TEST_ASSERT(result.tool_calls[0].name == "read-file");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "crates/foo/src/lib.rs");
+    }
+}
+
+static void test_parse_call_verb_snake_and_hyphen() {
+    std::string text =
+        "call:execute-bead:list-files{path: \"src/\"}\n\n"
+        "call:execute-bead:read_file{path: \"a/b.rs\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 2);
+    if (result.tool_calls.size() == 2) {
+        TEST_ASSERT(result.tool_calls[0].name == "list-files");
+        TEST_ASSERT(result.tool_calls[1].name == "read_file");
+    }
+}
+
+static void test_parse_call_verb_tool_allowed_filter() {
+    std::string text = "call:disallowed_verb{x: 1}call:allowed_verb{y: 2}";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {{"name", "allowed_verb"}}}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "allowed_verb");
+    }
+}
+
+static void test_parse_call_verb_inline_prose_rejected() {
+    // No sentinel char before `call:` — must NOT match.
+    std::string text = "narrative.call:foo{x:1}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.empty());
+}
+
+static void test_parse_call_verb_inline_prose_after_space() {
+    // Whitespace IS a valid sentinel — this should match.
+    std::string text = "Sure, I'll call:foo{x: 1}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "foo");
+    }
+}
+
+static void test_parse_call_verb_malformed_args() {
+    // Unterminated brace — drop the call, don't crash.
+    std::string text = "call:foo{country: \"France\"";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.empty());
+}
+
+static void test_parse_call_verb_inner_brace_in_string() {
+    // The `{` and `}` inside the string value must not confuse the
+    // balanced-brace scanner.
+    std::string text = "call:foo{cmd: \"echo {not_a_brace} ok\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["cmd"] == "echo {not_a_brace} ok");
+    }
+}
+
+static void test_parse_call_verb_strict_json_args() {
+    // Strict-JSON path: keys already quoted.
+    std::string text = "call:foo{\"path\": \"x\"}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "x");
+    }
+}
+
+static void test_parse_call_verb_unquoted_keys() {
+    // Relaxed-JSON path: bare keys get quoted.
+    std::string text = "call:foo{path: \"x\", count: 3}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "x");
+        TEST_ASSERT(args["count"] == 3);
+    }
+}
+
+static void test_parse_call_verb_cleaned_text() {
+    // The matched span should be stripped from cleaned_text.
+    std::string text = "Hello call:foo{x: 1} world.";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    TEST_ASSERT(result.cleaned_text.find("call:") == std::string::npos);
+    TEST_ASSERT(result.cleaned_text.find("Hello") != std::string::npos);
+    TEST_ASSERT(result.cleaned_text.find("world.") != std::string::npos);
+}
+
+static void test_parse_call_verb_intercept_inner_json() {
+    // Codex-requested: inner args of the form {"name": ..., "arguments": ...}
+    // must NOT be picked up by pattern 6 (bare-JSON sweep) as a spurious
+    // `inner` ToolCall. Exactly one ToolCall, named `outer`, with the
+    // inner JSON intact in its arguments.
+    std::string text = "call:outer{\"name\": \"inner\", \"arguments\": {}}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "outer");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["name"] == "inner");
+        TEST_ASSERT(args["arguments"].is_object());
+    }
+}
+
+static void test_parse_call_verb_multiline_args() {
+    // Snapshot rows have multi-line nested args; the balanced-brace
+    // scanner is line-agnostic, so this must Just Work.
+    std::string text =
+        "call:default_api:analyze_data{\n"
+        "  data: [{\"date\": \"2024-10-05\", \"qty\": 50}, {\"date\": \"2024-10-06\", \"qty\": 60}],\n"
+        "  metric: \"qty\"\n"
+        "}";
+    auto result = parse_tool_calls(text);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "analyze_data");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["metric"] == "qty");
+        TEST_ASSERT(args["data"].is_array());
+        TEST_ASSERT(args["data"].size() == 2);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // SSE Emitter tests
 // ═══════════════════════════════════════════════════════════════════════
@@ -2590,6 +2756,20 @@ int main() {
     RUN_TEST(test_parse_no_tools);
     RUN_TEST(test_parse_tool_code_wrapper);
     RUN_TEST(test_parse_tool_allowed_filter);
+    RUN_TEST(test_parse_call_verb_single);
+    RUN_TEST(test_parse_call_verb_back_to_back);
+    RUN_TEST(test_parse_call_verb_namespaced);
+    RUN_TEST(test_parse_call_verb_snake_and_hyphen);
+    RUN_TEST(test_parse_call_verb_tool_allowed_filter);
+    RUN_TEST(test_parse_call_verb_inline_prose_rejected);
+    RUN_TEST(test_parse_call_verb_inline_prose_after_space);
+    RUN_TEST(test_parse_call_verb_malformed_args);
+    RUN_TEST(test_parse_call_verb_inner_brace_in_string);
+    RUN_TEST(test_parse_call_verb_strict_json_args);
+    RUN_TEST(test_parse_call_verb_unquoted_keys);
+    RUN_TEST(test_parse_call_verb_cleaned_text);
+    RUN_TEST(test_parse_call_verb_intercept_inner_json);
+    RUN_TEST(test_parse_call_verb_multiline_args);
 
     std::fprintf(stderr, "\n── SSE Emitter ──\n");
     RUN_TEST(test_emitter_reasoning_split_openai);
