@@ -69,12 +69,52 @@ server now returns proper `tool_calls` for Gemma4's emission format.
 | Model | Config | Score | Notes |
 |-------|--------|-------|-------|
 | Qwen3.6-27B (Q4_K_M) | budget=16, max_ctx=98304, kv=tq3_0 | 46.2% (12/26) | 2026-05-31, tq3_0 KV |
-| Gemma4-26B-A4B (Q4_K_M) | budget=22, max_ctx=131072, kv=F16 | *TBD* | running |
+| Gemma4-26B-A4B (Q4_K_M) | budget=22, max_ctx=131072, kv=F16 | *TBD* (partial: 2/4=50%) | full run pending forge completion |
+
+**Partial results** (4/26 cases, run interrupted to allow forge to complete):
+
+| # | in_tok | Gemma4 | Qwen3.6 | notes |
+|---|--------|--------|---------|-------|
+| 1 | 1928   | PASS   | FAIL    | Gemma4 advantage |
+| 2 | 2584   | FAIL   | FAIL    | tied |
+| 3 | 3245   | PASS   | PASS    | tied |
+| 4 | 1839   | FAIL   | FAIL    | tied |
+
+Early signal: Gemma4 2/4 (50%) vs Qwen3.6 1/4 (25%) on these 4 cases.
+Non-determinism note: too few cases for statistical conclusion; full run needed.
+
+Note: Gemma4 consistently generates out=4096 tokens (maximum reply budget)
+at 64-65 tok/s, giving ~64s per case. Qwen3.6 generates varying lengths at
+24 tok/s. Both take ~64s per long case. Gemma4 is verbose but faster per-token.
 
 Note: Gemma4 decode rate is ~64-65 tok/s vs Qwen3.6 ~24 tok/s (2.7× faster
 generation) because Gemma4-26B-A4B is a sparse MoE model (4B active params
 per token vs 27B dense for Qwen3.6). Prefill is proportionally slower for
 Gemma4 due to larger vocabulary (262144 vs 151936).
+
+## What caused the agent_recorded improvement?
+
+The new image (`14432393`) contains TWO relevant fixes vs the prior baseline:
+
+1. **call:<verb>{} server-side parser** (easel merge `5ca695cd`): converts
+   `call:read_file{...}` model output into proper OpenAI `tool_calls`. Primarily
+   targets forge (which uses the Messages API and expects structured tool_calls).
+   
+2. **`<|channel>thought` routing fix** (`4b757d10` + `14432393`): correctly routes
+   Gemma4's `<|channel>thought` channel tokens to `reasoning_content` (via
+   `<think>` emission). Before this fix: `<|channel>thought` leaked as literal
+   `thought\n` text into `content`, garbling the model's output. After: clean
+   content + thinking properly in `reasoning_content`.
+
+**For agent_recorded**, the improvement likely comes primarily from fix #2, not #1:
+- The agent_recorded grader looks for tool names in `content` + `reasoning_content`
+- The luce-bench runner does NOT extract `tool_calls` from the API response
+- Before fix #2: `content` was polluted with `thought\n` garbage before each tool call
+- After fix #2: `content` is clean; model's `call:read_file{...}` is parseable by
+  `_CALL_VERB_RE` without interference from leaked channel tokens
+
+Baseline comparison: prior agent_recorded Gemma4 nothink = 11.5% (3/26)
+New result: partial 2/4 (50%) — likely large improvement from channel routing fix
 
 ## C++17 compat fix note
 
