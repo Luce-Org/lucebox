@@ -66,6 +66,7 @@ static bool looks_like_plain_text_call(const std::string & text) {
 }
 
 static bool find_tool_start(const std::string & text, size_t & pos) {
+    // Pattern A: XML-like openers (<tool_call>, <function=, <tool_code>).
     size_t idx = text.find('<');
     while (idx != std::string::npos) {
         if (text.compare(idx, sizeof(TOOL_OPEN) - 1, TOOL_OPEN) == 0 ||
@@ -75,6 +76,41 @@ static bool find_tool_start(const std::string & text, size_t & pos) {
             return true;
         }
         idx = text.find('<', idx + 1);
+    }
+
+    // Pattern B: call:<verb>{ opener (Gemma4 plain-text emissions).
+    // Valid sentinels before "call:" mirror tool_parser.cpp Pattern 5:
+    //   start-of-text, whitespace, or one of ,;:()[]{}>
+    // Require at least one alpha char after the colon (the verb start)
+    // to avoid false-positives on English "I'll call: ..." prose.
+    // We do NOT require the closing '{' here — it may arrive in a later
+    // token.  The full parse in parse_tool_calls() at emit_finish() handles
+    // validation; entering TOOL_BUFFER too eagerly costs only a buffered
+    // flush, not incorrect output.
+    static const char CALL_PREFIX[] = "call:";
+    static constexpr size_t CALL_PREFIX_LEN = 5;  // strlen("call:")
+    size_t call_pos = 0;
+    while (call_pos < text.size()) {
+        size_t found = text.find(CALL_PREFIX, call_pos);
+        if (found == std::string::npos) break;
+
+        bool valid_sentinel = (found == 0);
+        if (!valid_sentinel && found > 0) {
+            char prev = text[found - 1];
+            valid_sentinel = (prev == '\n' || prev == '\r' || prev == ' ' || prev == '\t' ||
+                              prev == ',' || prev == ';' || prev == ':' ||
+                              prev == '(' || prev == '[' || prev == '{' ||
+                              prev == ')' || prev == ']' || prev == '}' || prev == '>');
+        }
+
+        if (valid_sentinel) {
+            size_t verb_start = found + CALL_PREFIX_LEN;
+            if (verb_start < text.size() && std::isalpha((unsigned char)text[verb_start])) {
+                pos = found;
+                return true;
+            }
+        }
+        call_pos = found + 1;
     }
     return false;
 }

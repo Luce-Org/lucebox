@@ -76,6 +76,22 @@ class StepEnforcer:
         has_terminal = any(tc.tool in self.terminal_tools for tc in tool_calls)
 
         if has_terminal and not self._tracker.is_satisfied():
+            # Local modification (2026-05-31): allow one-shot batch calls where
+            # every pending required step appears *before* the terminal tool in
+            # the batch.  Models like Gemma4 emit all tool calls in a single
+            # response (e.g. [fetch, analyze, report]).  The runner executes
+            # them in order, so required steps are recorded before the terminal
+            # executes — the batch is not truly premature.
+            pending = set(self._tracker.pending())
+            if pending:
+                terminal_idx = next(
+                    i for i, tc in enumerate(tool_calls)
+                    if tc.tool in self.terminal_tools
+                )
+                names_before_terminal = {tc.tool for tc in tool_calls[:terminal_idx]}
+                if pending.issubset(names_before_terminal):
+                    return StepCheck(nudge=None, needs_nudge=False)
+
             self._premature_attempts += 1
             tier = min(self._premature_attempts, 3)
             # Find which terminal tool was attempted for the nudge message
