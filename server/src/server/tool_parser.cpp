@@ -1,11 +1,18 @@
 // Tool call parser implementation.
 //
-// Five detection patterns, tried in order:
+// Six detection patterns, tried in order:
 // 1. <tool_call><function=NAME>...<parameter=K>V</parameter>...</function></tool_call>
 // 2. <function=NAME>...params...</function>  (bare, outside tool_call)
 // 3. <function=NAME(k="v", ...)></function>  (function-signature style)
 // 4. <tool_code>{JSON}</tool_code>
-// 5. Bare JSON objects with name+arguments fields
+// 5. call:<ns>?<verb>{relaxed-JSON args}    (gemma plain-text emissions)
+// 6. Bare JSON objects with name+arguments fields
+//
+// Pattern 5 runs *before* pattern 6 so that args like
+//   call:outer{"name": "inner", "arguments": {}}
+// don't get hijacked by the bare-JSON sweep into a spurious `inner` tool
+// call. The brace-balanced span pattern 5 records in `removals` shadows
+// the inner JSON from pattern 6's view via `overlaps()`.
 
 #include "tool_parser.h"
 
@@ -159,6 +166,125 @@ static const std::regex & re_function_signature() {
 static const std::regex & re_tool_code() {
     static std::regex r(R"(<tool_code>([\s\S]*?)</tool_code>)");
     return r;
+}
+
+// Pattern 5: `call:<ns>?<verb>{` opener. The sentinel alternation in front
+// rejects narrative usages like "I'll call:foo{x:1}" where `call:` is glued
+// to a preceding word — whitespace, common punctuation, and open/close
+// brackets are the realistic boundaries seen in the snapshot data. `\s`
+// covers `\n` so a `call:` at the start of any line is matched without
+// relying on std::regex multiline support (which is non-portable).
+//
+// Note that `}` is in the sentinel list — gemma frequently emits multiple
+// invocations back-to-back: `call:a{x:1}call:b{y:2}`. Without `}` as a
+// sentinel the second match would be missed.
+static const std::regex & re_call_verb_open() {
+    static std::regex r(R"((^|[\s,;:\(\[\{\}\)\]\>])call:([A-Za-z0-9_.:\-]+)\s*\{)");
+    return r;
+}
+
+// Find the index one past the `}` that matches `text[open] == '{'`.
+// Respects nested {}/[] depth and skips over "..." / '...' / `...`
+// string literals (with backslash escapes). Returns std::string::npos if
+// no matching close is found.
+static size_t balanced_braces_end(const std::string & text, size_t open) {
+    int depth = 0;
+    char in_str = 0;  // 0, or one of '"', '\'', '`'
+    for (size_t i = open; i < text.size(); i++) {
+        char c = text[i];
+        if (in_str) {
+            if (c == '\\' && i + 1 < text.size()) { i++; continue; }
+            if (c == in_str) in_str = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'' || c == '`') { in_str = c; continue; }
+        if (c == '{' || c == '[') {
+            depth++;
+        } else if (c == '}' || c == ']') {
+            depth--;
+            if (depth == 0 && c == '}') return i + 1;
+            if (depth < 0) return std::string::npos;
+        }
+    }
+    return std::string::npos;
+}
+
+// Try strict json::parse first; on failure rewrite single- and
+// backtick-quoted strings to double-quoted, wrap bare identifier keys
+// in double quotes, and retry. Returns true and populates `out` on
+// success; returns false on irrecoverable failure (and `out` is unset).
+//
+// The rewrite walks the buffer char-by-char tracking string state so it
+// doesn't mangle identifiers that live inside string values.
+static bool coerce_relaxed_json(const std::string & payload, json & out) {
+    {
+        json parsed = json::parse(payload, nullptr, false);
+        if (!parsed.is_discarded()) {
+            out = std::move(parsed);
+            return true;
+        }
+    }
+
+    // Permissive pass.
+    static const std::regex re_bare_key(R"(([A-Za-z_][A-Za-z0-9_]*)(\s*:))");
+
+    std::string rewritten;
+    rewritten.reserve(payload.size() + 16);
+    char in_str = 0;  // 0, or the *opening* quote we saw
+    for (size_t i = 0; i < payload.size(); ) {
+        char c = payload[i];
+        if (in_str) {
+            // Inside a string we already opened. Mirror escapes verbatim.
+            if (c == '\\' && i + 1 < payload.size()) {
+                rewritten += c;
+                rewritten += payload[i + 1];
+                i += 2;
+                continue;
+            }
+            if (c == in_str) {
+                // Close — always emit a double-quote regardless of which
+                // quote style opened the string. The opening side already
+                // emitted a `"`.
+                rewritten += '"';
+                in_str = 0;
+                i++;
+                continue;
+            }
+            rewritten += c;
+            i++;
+            continue;
+        }
+        if (c == '"' || c == '\'' || c == '`') {
+            rewritten += '"';
+            in_str = c;
+            i++;
+            continue;
+        }
+        // Try to match a bare-key identifier here. Don't fire if the
+        // previous emitted char is `"` — that would indicate we're sitting
+        // right after a JSON string boundary and the "identifier" is
+        // probably part of a value continuation (e.g. `"k": foo: 1` would
+        // be malformed JSON anyway, but better to leave it untouched).
+        std::smatch m;
+        std::string tail = payload.substr(i);
+        if (std::regex_search(tail, m, re_bare_key,
+                              std::regex_constants::match_continuous) &&
+            (rewritten.empty() || rewritten.back() != '"')) {
+            rewritten += '"';
+            rewritten += m[1].str();
+            rewritten += '"';
+            rewritten += m[2].str();
+            i += m.length();
+            continue;
+        }
+        rewritten += c;
+        i++;
+    }
+
+    json parsed = json::parse(rewritten, nullptr, false);
+    if (parsed.is_discarded()) return false;
+    out = std::move(parsed);
+    return true;
 }
 
 // ─── XML parameter parser ───────────────────────────────────────────────
@@ -397,7 +523,45 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
         }
     }
 
-    // Pattern 5: Bare JSON objects
+    // Pattern 5: call:<ns>?<verb>{relaxed-JSON args}
+    //
+    // Runs before the bare-JSON sweep so that inner JSON of the form
+    //   call:outer{"name": "inner", "arguments": {}}
+    // doesn't get hijacked into a spurious `inner` ToolCall.
+    {
+        auto begin = std::sregex_iterator(text.begin(), text.end(), re_call_verb_open());
+        auto end = std::sregex_iterator();
+        for (auto it = begin; it != end; ++it) {
+            // Group 1: sentinel char (may be empty if matched at `^`).
+            // Group 2: full verb including any embedded namespaces.
+            size_t prefix_len = (*it)[1].matched ? (*it)[1].length() : 0;
+            size_t call_start = it->position() + prefix_len;
+            if (overlaps(removals, call_start)) continue;
+
+            // The matched substring runs from call_start through the `{`
+            // (consuming the opener and any whitespace between verb and
+            // brace). Compute the brace index from the match end.
+            size_t brace_open = it->position() + it->length() - 1;
+            if (brace_open >= text.size() || text[brace_open] != '{') continue;
+
+            size_t brace_close = balanced_braces_end(text, brace_open);
+            if (brace_close == std::string::npos) continue;
+
+            std::string raw_args = text.substr(brace_open, brace_close - brace_open);
+            json args;
+            if (!coerce_relaxed_json(raw_args, args)) continue;
+            if (!args.is_object()) continue;
+
+            std::string verb = (*it)[2].str();
+            size_t colon = verb.find_last_of(':');
+            if (colon != std::string::npos) verb = verb.substr(colon + 1);
+            if (verb.empty()) continue;
+
+            add_call(verb, args, call_start, brace_close);
+        }
+    }
+
+    // Pattern 6: Bare JSON objects
     {
         size_t cursor = 0;
         while (cursor < text.size()) {
