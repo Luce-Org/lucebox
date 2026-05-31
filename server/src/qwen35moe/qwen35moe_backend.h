@@ -19,11 +19,11 @@ public:
     explicit Qwen35MoeBackend(const Qwen35Config & cfg);
     ~Qwen35MoeBackend() override = default;
 
-    GenerateResult generate(const GenerateRequest & req,
-                            const DaemonIO & io) override;
-    GenerateResult restore_and_generate(int slot,
-                                        const GenerateRequest & req,
-                                        const DaemonIO & io) override;
+    GenerateResult generate_impl(const GenerateRequest & req,
+                                 const DaemonIO & io) override;
+    GenerateResult restore_and_generate_impl(int slot,
+                                             const GenerateRequest & req,
+                                             const DaemonIO & io) override;
     bool supports_dflash_spec_decode() const override { return !hybrid_mode_; }
 
 protected:

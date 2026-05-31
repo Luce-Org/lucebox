@@ -1385,7 +1385,7 @@ void HttpServer::worker_loop() {
                 cold_req.snap_pos = cold_boundary;  // save at end of prefix
                 DaemonIO cold_io;
                 cold_io.stream_fd = -1;
-                auto cold_result = backend_.generate_with_empty_spec_fallback(cold_req, cold_io);
+                auto cold_result = backend_.generate(cold_req, cold_io);
                 if (cold_result.ok && backend_.snapshot_used(DISK_STAGING_SLOT)) {
                     disk_cache_.learn_layout(DISK_STAGING_SLOT);
                     std::vector<int32_t> prefix_tokens(effective_prompt.begin(),
@@ -1510,9 +1510,9 @@ void HttpServer::worker_loop() {
 
         GenerateResult result;
         if (using_restore) {
-            result = backend_.restore_and_generate_with_empty_spec_fallback(cache_slot, gen_req, io);
+            result = backend_.restore_and_generate(cache_slot, gen_req, io);
         } else {
-            result = backend_.generate_with_empty_spec_fallback(gen_req, io);
+            result = backend_.generate(gen_req, io);
         }
 
         // Lazy-draft: park decode draft after generate to free VRAM.

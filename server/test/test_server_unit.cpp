@@ -1427,12 +1427,12 @@ struct MockBackend : ModelBackend {
     bool park(const std::string &) override { return true; }
     bool unpark(const std::string &) override { return true; }
     bool is_target_parked() const override { return false; }
-    GenerateResult generate(const GenerateRequest &, const DaemonIO &) override { return {}; }
+    GenerateResult generate_impl(const GenerateRequest &, const DaemonIO &) override { return {}; }
     bool snapshot_save(int) override { return false; }
     void snapshot_free(int) override {}
     bool snapshot_used(int) const override { return false; }
     int  snapshot_cur_pos(int) const override { return 0; }
-    GenerateResult restore_and_generate(int, const GenerateRequest &, const DaemonIO &) override { return {}; }
+    GenerateResult restore_and_generate_impl(int, const GenerateRequest &, const DaemonIO &) override { return {}; }
     bool handle_compress(const std::string &, const DaemonIO &) override { return false; }
     void free_drafter() override {}
     void shutdown() override {}
@@ -2422,7 +2422,7 @@ struct EmptySpecRetryBackend : MockBackend {
     bool generate_saw_force_ar = false;
     bool restore_saw_force_ar = false;
 
-    GenerateResult generate(const GenerateRequest & req,
+    GenerateResult generate_impl(const GenerateRequest & req,
                             const DaemonIO &) override {
         generate_calls++;
         GenerateResult result;
@@ -2436,7 +2436,7 @@ struct EmptySpecRetryBackend : MockBackend {
         return result;
     }
 
-    GenerateResult restore_and_generate(int, const GenerateRequest & req,
+    GenerateResult restore_and_generate_impl(int, const GenerateRequest & req,
                                         const DaemonIO &) override {
         restore_calls++;
         GenerateResult result;
@@ -2458,7 +2458,7 @@ static void test_model_backend_retries_empty_spec_generate_once_with_ar() {
     req.n_gen = 4;
     DaemonIO io;
 
-    GenerateResult result = backend.generate_with_empty_spec_fallback(req, io);
+    GenerateResult result = backend.generate(req, io);
 
     TEST_ASSERT(result.ok);
     TEST_ASSERT(result.tokens.size() == 1);
@@ -2476,7 +2476,7 @@ static void test_model_backend_retries_empty_spec_restore_once_with_ar() {
     DaemonIO io;
 
     GenerateResult result =
-        backend.restore_and_generate_with_empty_spec_fallback(7, req, io);
+        backend.restore_and_generate(7, req, io);
 
     TEST_ASSERT(result.ok);
     TEST_ASSERT(result.tokens.size() == 1);

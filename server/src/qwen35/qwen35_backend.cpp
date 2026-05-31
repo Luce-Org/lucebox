@@ -544,8 +544,8 @@ void Qwen35Backend::release_scratch() {
 
 // ── Generate (speculative decode) ───────────────────────────────────────
 
-GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
-                                        const DaemonIO & io) {
+GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
+                                            const DaemonIO & io) {
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     sampler_ = req.sampler;
@@ -605,9 +605,9 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
 
 // ── Restore + generate ──────────────────────────────────────────────────
 
-GenerateResult Qwen35Backend::restore_and_generate(int slot,
-                                                    const GenerateRequest & req,
-                                                    const DaemonIO & io) {
+GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
+                                                        const GenerateRequest & req,
+                                                        const DaemonIO & io) {
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) {

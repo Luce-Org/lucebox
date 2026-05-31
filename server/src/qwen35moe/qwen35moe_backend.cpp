@@ -472,10 +472,10 @@ bool Qwen35MoeBackend::run_ar_decode_path(int committed, int n_gen,
     return true;
 }
 
-GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
-                                          const DaemonIO & io) {
+GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
+                                               const DaemonIO & io) {
     if (!hybrid_mode_ || !target_weights().moe_hybrid) {
-        auto result = Qwen35Backend::generate(req, io);
+        auto result = Qwen35Backend::generate_impl(req, io);
         if (result.ok) maybe_post_request_swap();
         return result;
     }
@@ -985,17 +985,17 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
     return result;
 }
 
-GenerateResult Qwen35MoeBackend::restore_and_generate(int slot,
-                                                      const GenerateRequest & req,
-                                                      const DaemonIO & io) {
+GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
+                                                           const GenerateRequest & req,
+                                                           const DaemonIO & io) {
     if (!hybrid_mode_ || !target_weights().moe_hybrid) {
-        auto result = Qwen35Backend::restore_and_generate(slot, req, io);
+        auto result = Qwen35Backend::restore_and_generate_impl(slot, req, io);
         if (result.ok) maybe_post_request_swap();
         return result;
     }
     // Snapshot restore not supported in hybrid split-load mode.
     // Fall back to full generate (ignores snapshot).
-    return generate(req, io);
+    return generate_impl(req, io);
 }
 
 // ── Hybrid spec-decode: draft → verify via hybrid forward → accept ──────────

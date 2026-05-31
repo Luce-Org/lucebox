@@ -292,7 +292,7 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
             req.do_sample = do_sample;
             req.stream    = false;
 
-            auto result = backend.generate_with_empty_spec_fallback(req, io);
+            auto result = backend.generate(req, io);
             if (!result.ok) {
                 std::printf("err %s\n", result.error.c_str());
                 std::fflush(stdout);
@@ -349,7 +349,7 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
             req.snap_pos  = snap_pos;
             req.snap_slot = snap_slot;
 
-            auto result = backend.restore_and_generate_with_empty_spec_fallback(slot, req, io);
+            auto result = backend.restore_and_generate(slot, req, io);
             if (!result.ok) {
                 std::printf("err %s\n", result.error.c_str());
                 std::fflush(stdout);
@@ -398,7 +398,7 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
             req.snap_pos  = snap_pos;
             req.snap_slot = snap_slot;
 
-            auto result = backend.generate_with_empty_spec_fallback(req, io);
+            auto result = backend.generate(req, io);
             if (!result.ok) {
                 io.emit(-1);
                 std::printf("err %s\n", result.error.c_str());

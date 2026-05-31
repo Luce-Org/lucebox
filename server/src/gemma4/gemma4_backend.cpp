@@ -619,8 +619,8 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
 
 // ── Generate ───────────────────────────────────────────────────────────
 
-GenerateResult Gemma4Backend::generate(const GenerateRequest & req,
-                                        const DaemonIO & io) {
+GenerateResult Gemma4Backend::generate_impl(const GenerateRequest & req,
+                                            const DaemonIO & io) {
     GenerateResult result;
     if (parked_) { result.error = "model is parked"; return result; }
 
@@ -736,9 +736,9 @@ GenerateResult Gemma4Backend::generate(const GenerateRequest & req,
 
 // ── Restore + Generate ─────────────────────────────────────────────────
 
-GenerateResult Gemma4Backend::restore_and_generate(int slot,
-                                                     const GenerateRequest & req,
-                                                     const DaemonIO & io) {
+GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
+                                                        const GenerateRequest & req,
+                                                        const DaemonIO & io) {
     GenerateResult result;
     if (parked_) { result.error = "model is parked"; return result; }
 
