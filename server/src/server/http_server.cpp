@@ -1430,6 +1430,7 @@ void HttpServer::worker_loop() {
         io.stream_fd = -1;  // no pipe — we write SSE directly
 
         int completion_tokens = 0;
+        bool visible_output_seen = false;
         bool client_disconnected = false;
 
         io.on_token = [&](int32_t token) -> bool {
@@ -1445,6 +1446,7 @@ void HttpServer::worker_loop() {
 
             // Gemma4 thinking channel: map <|channel> → <think>, <channel|> → </think>\n
             if (raw == "<|channel>") {
+                visible_output_seen = true;
                 if (req.stream) {
                     auto chunks = emitter.emit_token("<think>");
                     for (const auto & chunk : chunks)
@@ -1453,6 +1455,7 @@ void HttpServer::worker_loop() {
                 return true;
             }
             if (raw == "<channel|>") {
+                visible_output_seen = true;
                 if (req.stream) {
                     auto chunks = emitter.emit_token("</think>\n");
                     for (const auto & chunk : chunks)
@@ -1469,6 +1472,7 @@ void HttpServer::worker_loop() {
             // reasoning_content with empty visible content. Forward the text
             // form into the emitter so parse_reasoning() can split correctly.
             if (raw == "<think>" || raw == "</think>") {
+                visible_output_seen = true;
                 if (req.stream) {
                     auto chunks = emitter.emit_token(
                         raw == "</think>" ? "</think>\n" : "<think>");
@@ -1486,6 +1490,10 @@ void HttpServer::worker_loop() {
             }
 
             std::string text = tokenizer_.token_text(token);
+
+            if (!text.empty()) {
+                visible_output_seen = true;
+            }
 
             if (req.stream && !text.empty()) {
                 auto chunks = emitter.emit_token(text);
@@ -1541,7 +1549,7 @@ void HttpServer::worker_loop() {
 
         // Confirm or abort the inline snapshot.
         if (snap_prepared) {
-            if (completion_tokens > 0 && !client_disconnected &&
+            if (completion_tokens > 0 && visible_output_seen && !client_disconnected &&
                 backend_.snapshot_used(snap_slot)) {
                 prefix_cache_.confirm_inline_snap(snap_slot, snap_cut, effective_prompt);
                 // Track for shutdown save.
@@ -1564,7 +1572,8 @@ void HttpServer::worker_loop() {
 
         // Continued checkpoint: save if total tokens crossed an interval boundary.
         // This captures prompt + all generated tokens for long conversation reuse.
-        if (!disk_cache_.disabled() && result.ok && completion_tokens > 0 && !client_disconnected) {
+        if (!disk_cache_.disabled() && result.ok && completion_tokens > 0 &&
+            visible_output_seen && !client_disconnected) {
             int final_pos = (int)effective_prompt.size() + (int)result.tokens.size();
             if (final_pos >= disk_cache_.continued_interval()) {
                 // Build all_tokens = effective_prompt + result.tokens
@@ -1580,7 +1589,8 @@ void HttpServer::worker_loop() {
         }
 
         // Full-compress cache: reserve + confirm after successful generation.
-        if (pflash_compressed && completion_tokens > 0 && !client_disconnected) {
+        if (pflash_compressed && completion_tokens > 0 &&
+            visible_output_seen && !client_disconnected) {
             int full_slot = prefix_cache_.prepare_full_snap(req.prompt_tokens);
             if (full_slot >= 0) {
                 prefix_cache_.confirm_full_snap(full_slot, req.prompt_tokens,

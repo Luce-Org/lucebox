@@ -131,6 +131,11 @@ struct GenerateResult {
     float                      accept_rate     = 0.0f;
     // True when spec decode actually ran (accept_rate==0 still needs a bandit update).
     bool                       spec_decode_ran = false;
+    // True when decode emitted only tokens that the API layer suppresses
+    // (for example an immediate EOS/EOT). This is semantically equivalent
+    // to zero output for clients and should take the same AR retry path as
+    // an empty token vector.
+    bool                       empty_visible_output = false;
 };
 
 // ─── Backend interface ──────────────────────────────────────────────────
@@ -160,7 +165,7 @@ struct ModelBackend {
         if (!should_retry_empty_spec_decode(req, result)) return result;
 
         std::fprintf(stderr,
-            "[backend] spec-decode produced zero tokens; retrying with AR decode\n");
+            "[backend] spec-decode produced no visible output; retrying with AR decode\n");
         GenerateRequest retry = req;
         retry.force_ar_decode = true;
         return merge_empty_spec_retry_result(result, generate(retry, io));
@@ -188,7 +193,7 @@ struct ModelBackend {
         if (!should_retry_empty_spec_decode(req, result)) return result;
 
         std::fprintf(stderr,
-            "[backend] restored spec-decode produced zero tokens; retrying with AR decode\n");
+            "[backend] restored spec-decode produced no visible output; retrying with AR decode\n");
         GenerateRequest retry = req;
         retry.force_ar_decode = true;
         return merge_empty_spec_retry_result(result,
@@ -201,7 +206,7 @@ struct ModelBackend {
             && !req.force_ar_decode
             && result.ok
             && result.spec_decode_ran
-            && result.tokens.empty();
+            && (result.tokens.empty() || result.empty_visible_output);
     }
 
     static GenerateResult merge_empty_spec_retry_result(

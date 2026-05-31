@@ -2421,6 +2421,8 @@ struct EmptySpecRetryBackend : MockBackend {
     int restore_calls = 0;
     bool generate_saw_force_ar = false;
     bool restore_saw_force_ar = false;
+    bool generate_first_empty_visible = false;
+    bool restore_first_empty_visible = false;
 
     GenerateResult generate(const GenerateRequest & req,
                             const DaemonIO &) override {
@@ -2432,6 +2434,10 @@ struct EmptySpecRetryBackend : MockBackend {
             result.tokens = {42};
         } else {
             result.spec_decode_ran = true;
+            if (generate_first_empty_visible) {
+                result.tokens = {2};
+                result.empty_visible_output = true;
+            }
         }
         return result;
     }
@@ -2446,6 +2452,10 @@ struct EmptySpecRetryBackend : MockBackend {
             result.tokens = {84};
         } else {
             result.spec_decode_ran = true;
+            if (restore_first_empty_visible) {
+                result.tokens = {2};
+                result.empty_visible_output = true;
+            }
         }
         return result;
     }
@@ -2481,6 +2491,44 @@ static void test_model_backend_retries_empty_spec_restore_once_with_ar() {
     TEST_ASSERT(result.ok);
     TEST_ASSERT(result.tokens.size() == 1);
     TEST_ASSERT(result.tokens[0] == 84);
+    TEST_ASSERT(result.spec_decode_ran);
+    TEST_ASSERT(backend.restore_calls == 2);
+    TEST_ASSERT(backend.restore_saw_force_ar);
+}
+
+static void test_model_backend_retries_empty_visible_spec_generate_once_with_ar() {
+    EmptySpecRetryBackend backend;
+    backend.generate_first_empty_visible = true;
+    GenerateRequest req;
+    req.prompt = {1, 2, 3};
+    req.n_gen = 4;
+    DaemonIO io;
+
+    GenerateResult result = backend.generate(req, io);
+
+    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.tokens.size() == 1);
+    TEST_ASSERT(result.tokens[0] == 42);
+    TEST_ASSERT(!result.empty_visible_output);
+    TEST_ASSERT(result.spec_decode_ran);
+    TEST_ASSERT(backend.generate_calls == 2);
+    TEST_ASSERT(backend.generate_saw_force_ar);
+}
+
+static void test_model_backend_retries_empty_visible_spec_restore_once_with_ar() {
+    EmptySpecRetryBackend backend;
+    backend.restore_first_empty_visible = true;
+    GenerateRequest req;
+    req.prompt = {1, 2, 3};
+    req.n_gen = 4;
+    DaemonIO io;
+
+    GenerateResult result = backend.restore_and_generate(7, req, io);
+
+    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.tokens.size() == 1);
+    TEST_ASSERT(result.tokens[0] == 84);
+    TEST_ASSERT(!result.empty_visible_output);
     TEST_ASSERT(result.spec_decode_ran);
     TEST_ASSERT(backend.restore_calls == 2);
     TEST_ASSERT(backend.restore_saw_force_ar);
@@ -2717,6 +2765,8 @@ int main() {
     std::fprintf(stderr, "\n── ModelBackend empty-spec retry ──\n");
     RUN_TEST(test_model_backend_retries_empty_spec_generate_once_with_ar);
     RUN_TEST(test_model_backend_retries_empty_spec_restore_once_with_ar);
+    RUN_TEST(test_model_backend_retries_empty_visible_spec_generate_once_with_ar);
+    RUN_TEST(test_model_backend_retries_empty_visible_spec_restore_once_with_ar);
 
     std::fprintf(stderr, "\n── GenerateResult.accept_rate ──\n");
     RUN_TEST(test_generate_result_accept_rate_defaults_to_zero);
