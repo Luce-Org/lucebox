@@ -14,11 +14,14 @@ preset-agnostic, ranks cells by mean ``decode_tokens_per_sec``. The
 ``coding-agent-loop`` profile brackets per architecture (gemma4 vs
 qwen3.6/laguna): for gemma4 the KV-quant axis is dead (KV is hardcoded
 F16 in the backend; see ``server/src/gemma4/gemma4_loader.cpp``), so
-the bracket sweeps ``max_ctx × fa_window × budget × pflash_mode``
-instead. For qwen3.6/laguna the KV quant axis is live and the bracket
-includes it. Winner is picked by composite ``pass-rate then speed``
-against the agent_recorded multi-turn fixture — the sweep driver in
-``sweep.py`` calls the profile's ``scorer`` per cell.
+the bracket sweeps ``max_ctx × fa_window × budget`` instead (pflash is
+kept off in the sweep: pflash requires both a drafter file AND
+prefix_cache_slots > 0; with the default prefix_cache_slots=0 all
+KV chunks are forced → zero compression). For qwen3.6/laguna the KV
+quant axis is live and the bracket includes it. Winner is picked by
+composite ``pass-rate then speed`` against the agent_recorded multi-turn
+fixture — the sweep driver in ``sweep.py`` calls the profile's
+``scorer`` per cell.
 
 Profiles are intentionally a lightweight dataclass + module-level
 registry: add a profile by appending to ``PROFILES``; no plugin
@@ -248,9 +251,11 @@ def _coding_agent_loop_gemma_bracket(
     Per-tier:
       <22 GB → base only (model barely fits; sweeping risks OOM)
       22-31  → 12 cells: max_ctx × {98K, 131K}, fa_window × {0, 2048},
-               budget × {16, 22, 32}, pflash off (pflash needs a
-               drafter file; can be enabled by the operator manually
-               then re-swept)
+               budget × {16, 22, 32}, pflash off (pflash needs both a
+               drafter file AND prefix_cache_slots > 0 to compress
+               anything; with prefix_cache_slots=0 all chunks are
+               forced → zero compression. Enable manually for real
+               multi-turn sessions; see pflash A/B test 2026-05-31)
       ≥32     → same shape, defaulting max_ctx=131K (with VRAM headroom
                to take fa_window=0 paths)
     """
