@@ -356,6 +356,14 @@ def _coding_agent_loop_qwen_bracket(
         # (RTX 5090 Laptop 23 GB) 2026-05-30 — all q8_0/98K cells
         # timed out. See
         # docs/experiments/qwen3.6-27b-coding-agent-loop-sweep-bragi-2026-05-30.md
+        #
+        # budget=32+q8_0 at 65K is kept in the bracket despite being known
+        # to fail on bragi — it causes a GPU compute hang (100% SM / 0%
+        # mem bandwidth) on 23 GB cards (observed 2026-06-01, same
+        # DFlash hang bug as Gemma4-31B). The sweep handles it by
+        # timing out after 300s and restarting for the next cell. The
+        # systemd restart clears the GPU hang state. See
+        # docs/experiments/qwen3.6-27b-coding-agent-loop-sweep-bragi-2026-06-01.md
         for max_ctx in (65_536, 98_304):
             kvs: tuple[str, ...] = ("tq3_0", "q8_0") if max_ctx <= 65_536 else ("tq3_0",)
             for kv in kvs:
