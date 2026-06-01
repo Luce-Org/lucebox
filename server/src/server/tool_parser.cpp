@@ -178,8 +178,17 @@ static const std::regex & re_tool_code() {
 // Note that `}` is in the sentinel list — gemma frequently emits multiple
 // invocations back-to-back: `call:a{x:1}call:b{y:2}`. Without `}` as a
 // sentinel the second match would be missed.
+//
+// `_` is also in the sentinel list to handle a SentencePiece / chat-template
+// artifact: post-bragi-channel-routing (commit 4b757d1) the gemma server
+// occasionally emits raw tokens like `_call:get_country_info{...}` where
+// the leading `_` is residual tokenizer serialization. Without `_` here
+// the parser misses every such invocation — empirically confirmed against
+// gemma-4-26b 2026-05-31 smoke test. Tradeoff: `my_call:foo{}` mid-
+// identifier could match, but real model output doesn't emit `my_call:`
+// strings (tool names come from the request's tool definitions).
 static const std::regex & re_call_verb_open() {
-    static std::regex r(R"((^|[\s,;:\(\[\{\}\)\]\>])call:([A-Za-z0-9_.:\-]+)\s*\{)");
+    static std::regex r(R"((^|[\s,;:\(\[\{\}\)\]\>_])call:([A-Za-z0-9_.:\-]+)\s*\{)");
     return r;
 }
 

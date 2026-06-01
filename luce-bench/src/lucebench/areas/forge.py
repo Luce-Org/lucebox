@@ -29,7 +29,15 @@ from typing import Any
 # Pattern for ``call:<verb>{`` openers. The verb part allows snake_case,
 # kebab-case, dotted, or namespaced (``ns:verb``) names — same alphabet
 # as ``_CALL_INVOCATION`` in lucebench.areas.agent.
-_CALL_OPEN = re.compile(r"\bcall:([A-Za-z0-9_.:-]+)\s*\{")
+#
+# The leading prefix accepts ``^`` (start), whitespace, common punctuation,
+# OR an underscore. The underscore is required to handle a SentencePiece
+# tokenizer-residual artifact post-bragi-channel-routing where the gemma
+# server occasionally emits raw tokens like ``_call:foo{...}``. Matching
+# ``\bcall:`` would miss these because ``_`` is a word char and the word-
+# boundary ``\b`` does not fire between ``_`` and ``c``. Verified 2026-05-31
+# against gemma-4-26b smoke test on lucebox-hub:cuda12 @ 8039911.
+_CALL_OPEN = re.compile(r"(?:^|(?<=[\s,;:\(\[\{\}\)\]\>_]))call:([A-Za-z0-9_.:-]+)\s*\{")
 
 
 def _balanced_braces_end(text: str, start: int) -> int | None:

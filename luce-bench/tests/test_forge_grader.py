@@ -164,3 +164,24 @@ def test_strip_preserves_text_when_no_calls():
 def test_strip_handles_empty_input():
     """Empty/None safe."""
     assert _strip_plain_text_tool_calls("") == ""
+
+
+def test_underscore_prefix_call_verb():
+    """Regression for 2026-05-31 gemma smoke test against lucebox-hub@8039911:
+    the server now sometimes emits a leading underscore — `_call:foo{...}` —
+    as a SentencePiece tokenizer artifact post-channel-routing. Without
+    handling the `_` prefix, the parser misses every such invocation.
+    """
+    text = '_call:get_country_info{country: "France"}\n\nresponse.'
+    calls = _parse_plain_text_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0]["name"] == "get_country_info"
+    assert calls[0]["input"] == {"country": "France"}
+
+
+def test_underscore_prefix_among_back_to_back_calls():
+    """Multiple invocations, some preceded by `_`, all should match."""
+    text = '_call:foo{x:1}call:bar{y:2}_call:baz{z:3}'
+    calls = _parse_plain_text_tool_calls(text)
+    names = [c["name"] for c in calls]
+    assert names == ["foo", "bar", "baz"]
