@@ -49,17 +49,29 @@ lazy = false
 
 ## Benchmark results on dc20057e-cuda12 (nothink)
 
-| area | pass_rate | wall_median |
-|------|-----------|-------------|
-| forge | **100%** (5/5) | 6.1s |
-| agent | **100%** (4/4) | 11s |
-| longctx | **100%** (6/6) | 40s |
-| code | **90%** (9/10) | 1.5s |
-| truthfulqa-mc1 | **80%** (80/100) | — |
-| hellaswag | **88%** (88/100) | 0.5s |
-| gsm8k | **86%** (86/100) | — |
-| ds4-eval | **77.2%** (71/92) | 68.7s |
-| agent_recorded | **42.3%** (11/26) | 26s |
+Final authoritative run: `bragi-rtx5090laptop-qwen36-27b-dc20057e-nothink-2026-05-31` (2026-05-31).
+
+| area | n | pass_rate | wall_median |
+|------|---|-----------|-------------|
+| forge | 30 | **100.0%** | 17.6s |
+| agent | 4 | **75.0%** (3/4) | 6.8s |
+| longctx | 6 | **100.0%** | 40.8s |
+| code | 10 | **90.0%** (9/10) | 1.4s |
+| hellaswag | 100 | **93.0%** | 0.5s |
+| gsm8k | 100 | **81.0%** | 14.8s |
+| truthfulqa-mc1 | 100 | **82.0%** | 0.3s |
+| agent_recorded | 26 | **38.5%** (10/26) | 43.9s |
+| smoke | 3 | **100.0%** | 0.2s |
+| ds4-eval | 92 | **77.2%** (71/92) | 68.7s |
+
+Notes:
+- forge, agent, agent_recorded, code have stochastic variation across runs.
+  The `agent` codex-large-explore case fails ~50% of the time in nothink mode
+  (long prompt with no tool-use cue). See comprehensive sweep doc for details.
+- hellaswag was 88% in an earlier run affected by a mid-run server restart
+  (contaminated cases returned `given=?`). 93% is the clean baseline.
+- ds4-eval run on image 658d016f-cuda12 (structurally identical; sub-areas:
+  GPQA 68%, SuperGPQA 76%, AIME 76%, COMPSEC 94.1%).
 
 Think mode results (from image 658d016f, unaffected by dc20057e fix):
 
@@ -111,8 +123,23 @@ Three fixes required for correct results on this image:
 |-------|-------------|-------|
 | Qwen3.6-27B Q4_K_M | ~24–25 tok/s | 27B dense, speculative budget=16 |
 | Gemma4-26B-A4B Q4_K_M | ~66 tok/s | 4B active (sparse MoE); most are thinking |
+| Laguna-XS.2 Q4_K_M | ~125 tok/s | 3B active MoE, safetensors speculator budget=8 |
 
 At Windows "Best Performance" TDP, expect ~40-60% higher decode speeds.
+
+## New models benchmarked (2026-05-31)
+
+### Laguna-XS.2 (poolside/Laguna-XS.2, MoE 3B active / 33B total)
+
+- **File**: laguna-xs2-Q4_K_M.gguf, 20.3 GB
+- **Speculator**: poolside/Laguna-XS.2-speculator.dflash (model.safetensors), 1.2 GB
+  — 5-layer Qwen3-flavored draft, head_dim=128, hidden=2048, +60% decode vs target-only
+- **Architecture**: 40 layers, embed=2048, 8 KV heads (GQA), head_dim=128, 131K ctx native
+- **VRAM at 32K tq3_0**: 22,955 / 24,463 MiB (1.2 GB free → KV ~960 MB at 32K)
+- **Max safe context**: ~56K tokens (KV limited by 1.5 GB VRAM headroom)
+- **Reasoning**: `<think>` token supported, but server `reasoning_supported=False` (arch gap)
+- **Tools**: `/v1/chat/completions` tools unsupported; `/v1/messages` forge TBD
+- **Benchmarks**: see `bragi-rtx5090laptop-laguna-xs2-speculator-nothink-32k-2026-05-31/`
 
 ## What was NOT swept (and why)
 
