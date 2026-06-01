@@ -54,6 +54,13 @@ def default_config_path() -> Path:
 
 # ── dotted-key registry ────────────────────────────────────────────────────
 
+def _cast_prefill_mode(v: Any) -> str:
+    s = str(v)
+    if s not in {"off", "auto", "always"}:
+        raise ValueError(f"prefill_mode must be off/auto/always, got {s!r}")
+    return s
+
+
 # Each entry: dotted-key → (toml_path, type_caster, default_getter).
 # ``toml_path`` is the (section, field) pair on disk; ``"_root"`` means the
 # key lives at the top level (no [section]). ``default_getter`` returns the
@@ -77,7 +84,7 @@ KEY_REGISTRY: dict[str, tuple[tuple[str, str], Callable[[Any], Any]]] = {
     "dflash.prefill_cache_slots": (("dflash", "prefill_cache_slots"), int),
     "dflash.cache_type_k": (("dflash", "cache_type_k"), str),
     "dflash.cache_type_v": (("dflash", "cache_type_v"), str),
-    "dflash.prefill_mode": (("dflash", "prefill_mode"), str),
+    "dflash.prefill_mode": (("dflash", "prefill_mode"), _cast_prefill_mode),
     "dflash.prefill_keep_ratio": (("dflash", "prefill_keep_ratio"), float),
     "dflash.prefill_threshold": (("dflash", "prefill_threshold"), int),
     "dflash.prefill_drafter": (("dflash", "prefill_drafter"), str),
