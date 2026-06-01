@@ -60,13 +60,21 @@ KV formula: `40 layers × 8 KV heads × 128 dim × 2 (K+V) × 3/8 bytes × conte
 
 ### Context window feasibility
 
-| max_ctx | KV (MiB) | Free after | feasible? |
-|---------|----------|------------|-----------|
-| 32,768 | 960 | 1,183 | ✓ working |
-| 40,960 | 1,200 | 1,063 | ✓ expected |
-| 49,152 | 1,440 | 823 | likely ok |
-| 57,344 | 1,680 | 583 | tight |
-| 65,536 | 1,920 | 343 | risky |
+**WARNING: Increasing max_ctx above 32K causes severe performance regression on bragi.**
+
+Testing at max_ctx=49152 showed that DFlash selects slower CUDA kernels for contexts >32K:
+- frontier-2k: 21s (was ~2s at 32K) — **10× slower**
+- frontier-4k: 55s (was ~3.5s at 32K) — **15× slower**
+- frontier-8k: 303s (was ~4.4s at 32K) — **70× slower**
+- frontier-16k: TIMEOUT at 300s (was ~8s at 32K)
+
+**Verdict: max_ctx=32768 is the optimal setting for Laguna on bragi.** Increasing the context window trades away catastrophic prefill performance with no quality benefit.
+
+| max_ctx | KV (MiB) | Free after | VRAM OK? | Performance |
+|---------|----------|------------|----------|-------------|
+| 32,768 | 960 | 1,183 | ✓ | ✓ fast — use this |
+| 49,152 | 1,440 | 823 | ✓ | ✗ 10-70× slower — do NOT use |
+| 65,536 | 1,920 | 343 | risky | ✗ even slower + VRAM risk |
 
 ## Performance
 
@@ -103,7 +111,7 @@ Baseline: `bragi-rtx5090laptop-laguna-xs2-speculator-nothink-32k-2026-05-31`
 |--------|------------|-------------|
 | VRAM | 17.9 GB target + 1.4 GB draft | 20.3 GB target + 1.2 GB spec |
 | Decode speed | ~25 tok/s | ~60 tok/s (2.4× faster) |
-| Max safe ctx | 98,304 (96K, tq3_0) | ~49K-57K (tq3_0) |
+| Max safe ctx | 98,304 (96K, tq3_0) | 32,768 (kernel perf cliff above this) |
 | Tool support | ✓ full | ✗ (chat completions) / ✓ (/v1/messages) |
 | Reasoning | ✓ wired (think_max=15488) | ✗ not wired |
 | Specialization | general | code-optimized |
@@ -111,8 +119,8 @@ Baseline: `bragi-rtx5090laptop-laguna-xs2-speculator-nothink-32k-2026-05-31`
 
 ## Next Steps
 
-1. Fill in benchmark results table above
-2. Context window sweep: try max_ctx=40960, 49152, 57344
-3. Budget sweep: compare budget=4, 8, 16 on Laguna
+1. ~~Fill in benchmark results table above~~ Done.
+2. ~~Context window sweep~~ Done: 49K tested, severe regression found, **32K is optimal.**
+3. Budget sweep: compare budget=4, 8, 16 on Laguna (gsm8k speed/quality trade-off)
 4. Evaluate think mode (once server reasoning support is wired)
 5. Characterize Gemma4-31B and Qwen3.6-MoE on bragi
