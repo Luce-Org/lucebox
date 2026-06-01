@@ -147,6 +147,24 @@ multi-turn tool calls. Keep at 0.
 
 At full performance (~175W), prefill ~3-4× faster; decode ~40-50 tok/s.
 
+## Sweep Status
+
+All tunables swept as of 2026-06-01. **Autotune complete** for Qwen3.6-27B on bragi.
+
+| tunable | explored | winner | blocker |
+|---------|----------|--------|---------|
+| budget | ✅ | 22 | — |
+| max_ctx | ✅ | 98304 | — |
+| cache_type (KV) | ✅ | tq3_0 | — |
+| prefix_cache_slots | ✅ | 0 | snapshot path bug (see known issues) |
+| prefill_mode | ✅ | off | requires prefix cache > 0 |
+| fa_window | ✅ | 0 | optimal when pflash off |
+| quality (agent_recorded) | ✅ | 34.6% (9/26) | — |
+
+**Future work** (blocked):
+- Re-sweep prefix_cache_slots and fa_window/pflash once the daemon snapshot path bug is fixed.
+- Gemma4-31B think mode: `reasoning_supported=False` not yet wired in server.
+
 ## Sweep History
 
 | date       | profile              | winner                           | key finding                         |
