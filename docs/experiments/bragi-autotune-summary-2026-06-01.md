@@ -125,7 +125,7 @@ multi-turn tool calls. Keep at 0.
 
 | model | VRAM | max_ctx | decode | forge | agent | code | gsm8k | notes |
 |-------|------|---------|--------|-------|-------|------|-------|-------|
-| Qwen3.6-27B | 18 GB | 98K | 22-25 tok/s | 100% | 38.5% | 90% | 81% | **preferred** |
+| Qwen3.6-27B | 18 GB | 98K | 22-25 tok/s | 100% | 34.6%† | 90% | 81% | **preferred** |
 | Laguna-XS.2 | 22 GB | 32K | 60-63 tok/s | 0%* | 50% | 20%** | 93% | fast math |
 | Gemma4-31B | 22 GB | 32K | 22-23 tok/s | 0%* | 38.5% | 70% | 95% | best math |
 | Gemma4-26B-A4B | 15 GB | 65K+ | ~25 tok/s | 0%* | 19% | 0%*** | 84% | tool bug |
@@ -133,7 +133,9 @@ multi-turn tool calls. Keep at 0.
 
 \*Model can't emit tool_use blocks.  
 \*\*FIM format mismatch, not capability gap.  
-\*\*\*Token leak bug in old image.
+\*\*\*Token leak bug in old image.  
+†Winner-config run (budget=22, 98K, tq3_0): 9/26 (34.6%). Prior dc20057e baseline: 10/26 (38.5%). 7 cases
+ flipped (3 FAIL→PASS, 4 PASS→FAIL) — 1-case delta is within noise at n=26 (σ≈9.5pp). No regression.
 
 ## Performance Reference (Qwen3.6-27B, budget=22, 98K, tq3_0, throttled 86W)
 
@@ -151,6 +153,7 @@ At full performance (~175W), prefill ~3-4× faster; decode ~40-50 tok/s.
 |------------|----------------------|----------------------------------|-------------------------------------|
 | 2026-05-30 | coding-agent-loop    | budget=16, 98K, tq3_0           | q8_0 at 98K OOMs; tok/s ≠ quality proxy |
 | 2026-06-01 | coding-agent-loop    | budget=22, 98K, tq3_0           | budget=32 hangs at 65K+q8_0; 35% slower at 98K |
+| 2026-06-01 | agent_recorded QA    | (winner confirmed)               | 9/26 (34.6%) vs baseline 10/26 (38.5%) — within noise |
 
 Reference experiments:
 - `qwen3.6-27b-coding-agent-loop-sweep-bragi-2026-05-30.md`
