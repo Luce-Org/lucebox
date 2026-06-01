@@ -60,6 +60,13 @@ class ModelPreset:
     where no GGUF DFlash draft is published (e.g. Laguna's safetensors
     speculator). In that case the entrypoint runs target-only — DFlash
     speculative decoding is disabled but the server still works.
+
+    ``speculator_dir`` names a directory under ``models/draft/`` that holds
+    a safetensors-format speculator (e.g. ``model.safetensors``). When
+    present on disk the server launch sets ``DFLASH_DRAFT`` to that
+    directory; absent, the server runs target-only. Unlike ``draft_file``
+    (which marks the preset as incomplete when missing), ``speculator_dir``
+    is optional supplementary hardware and doesn't affect installed_status.
     """
 
     name: str
@@ -69,6 +76,7 @@ class ModelPreset:
     draft_file: str | None
     approx_total_gb: int
     description: str = ""
+    speculator_dir: str | None = None
 
     @property
     def has_draft(self) -> bool:
@@ -111,16 +119,19 @@ PRESETS: dict[str, ModelPreset] = {
         name="laguna-xs.2",
         target_repo="Lucebox/Laguna-XS.2-GGUF",
         target_file="laguna-xs2-Q4_K_M.gguf",
-        # Laguna's published DFlash speculator is safetensors
-        # (poolside/Laguna-XS.2-speculator.dflash), not GGUF — the
-        # download command doesn't fetch it. Target-only here; users
-        # who want the speculator pull it manually.
+        # Laguna's DFlash speculator is safetensors-format
+        # (poolside/Laguna-XS.2-speculator.dflash), downloaded manually
+        # into models/draft/laguna-xs2-speculator/. The download command
+        # doesn't fetch it automatically — it's opt-in. When present,
+        # speculator_dir wires it into DFLASH_DRAFT at server launch.
         draft_repo=None,
         draft_file=None,
+        speculator_dir="laguna-xs2-speculator",
         approx_total_gb=20,
         description=(
-            "Laguna-XS.2 MoE code model (Q4_K_M), target-only. "
-            "DFlash speculator is safetensors — download manually if needed."
+            "Laguna-XS.2 MoE code model (Q4_K_M). "
+            "DFlash safetensors speculator in draft/laguna-xs2-speculator/ "
+            "is used automatically when present."
         ),
     ),
     "qwen3.6-moe": ModelPreset(

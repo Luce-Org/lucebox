@@ -38,19 +38,27 @@ def _host_facts_env() -> list[tuple[str, str]]:
     return out
 
 
-def _resolve_model_files(cfg: Config) -> tuple[str, str]:
-    """Return (target_file, draft_file) bare filenames for DFLASH_TARGET / DFLASH_DRAFT.
+def _resolve_model_files(cfg: Config) -> tuple[str, str, str]:
+    """Return (target_file, draft_file, draft_dir) for DFLASH_TARGET / DFLASH_DRAFT.
 
     Resolution order — first non-empty wins per field:
         1. cfg.model.target_file / draft_file (explicit override in config.toml)
-        2. PRESETS[cfg.model.preset].target_file / draft_file (registry)
+        2. PRESETS[cfg.model.preset].target_file / draft_file / speculator_dir (registry)
         3. "" (entrypoint autodetect path runs unchanged).
+
+    ``draft_dir`` is a directory name under ``models/draft/`` holding a
+    safetensors speculator (e.g. ``laguna-xs2-speculator``). It is only set
+    when the preset declares one AND the directory exists on disk; otherwise
+    it is empty. When non-empty, docker_run_spec uses it as DFLASH_DRAFT
+    (a directory path) instead of the GGUF-file path, allowing the entrypoint
+    to discover the safetensors file inside it.
 
     Imported lazily to avoid the lucebox.types ↔ lucebox.download circular
     import that surfaces when this module is imported from ``__init__``.
     """
     target = cfg.model.target_file
     draft = cfg.model.draft_file
+    draft_dir = ""
     if (not target or not draft) and cfg.model.preset:
         from lucebox.download import PRESETS
 
@@ -60,7 +68,11 @@ def _resolve_model_files(cfg: Config) -> tuple[str, str]:
                 target = pres.target_file
             if not draft and pres.has_draft and pres.draft_file:
                 draft = pres.draft_file
-    return target, draft
+            if not draft and pres.speculator_dir:
+                spec_path = cfg.models_dir / "draft" / pres.speculator_dir
+                if spec_path.is_dir():
+                    draft_dir = pres.speculator_dir
+    return target, draft, draft_dir
 
 
 def _runtime_volumes(cfg: Config) -> tuple[tuple[str, str], ...]:
@@ -157,15 +169,19 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
     ]
     # Resolve target/draft GGUFs in priority order:
     #   1. cfg.model.target_file / draft_file (explicit override in config.toml)
-    #   2. PRESETS[cfg.model.preset].target_file / draft_file (registry default)
+    #   2. PRESETS[cfg.model.preset].target_file / draft_file / speculator_dir (registry)
     #   3. unset — entrypoint's autodetect path runs unchanged.
     # Container view of the models dir is /opt/lucebox-hub/server/models
     # (see _runtime_volumes); the entrypoint reads DFLASH_TARGET / DFLASH_DRAFT.
-    target_file, draft_file = _resolve_model_files(cfg)
+    # draft_dir is a subdirectory of models/draft/ holding a safetensors speculator;
+    # it takes effect only when draft_file is empty and the directory exists on disk.
+    target_file, draft_file, draft_dir = _resolve_model_files(cfg)
     if target_file:
         env.append(("DFLASH_TARGET", f"/opt/lucebox-hub/server/models/{target_file}"))
     if draft_file:
         env.append(("DFLASH_DRAFT", f"/opt/lucebox-hub/server/models/draft/{draft_file}"))
+    elif draft_dir:
+        env.append(("DFLASH_DRAFT", f"/opt/lucebox-hub/server/models/draft/{draft_dir}"))
     if cfg.dflash.lazy:
         env.append(("DFLASH_LAZY", "1"))
     if cfg.dflash.cache_type_k:
