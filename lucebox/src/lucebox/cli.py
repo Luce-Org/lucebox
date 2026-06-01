@@ -267,7 +267,8 @@ def autotune(
         return
 
     host = from_env()
-    runtime = autotune_mod.runtime_from_host(host)
+    cfg = _load_or_build()
+    runtime = autotune_mod.runtime_from_host(host, preset=cfg.model.preset)
     if json_out:
         print(json.dumps(asdict(runtime), indent=2))
         return

@@ -106,3 +106,30 @@ def test_coding_agent_loop_low_vram_falls_back_to_base():
     cells_q = PROFILES["coding-agent-loop"].candidate_configs(host, "qwen3.6-27b")
     assert len(cells_g) == 1
     assert len(cells_q) == 1
+
+
+def test_large_model_gets_reduced_ctx_on_24gb() -> None:
+    """gemma-4-31b (~21 GB model) only has ~2 GB headroom on 24 GB VRAM.
+    The heuristic must cap max_ctx at 32K to avoid OOM, not 98K.
+    Confirmed empirically on bragi (RTX 5090 Laptop) 2026-05-31."""
+    host = HostFacts(vram_gb=24, is_wsl=True)
+    runtime_large = runtime_from_host(host, preset="gemma-4-31b")
+    runtime_small = runtime_from_host(host, preset="qwen3.6-27b")
+
+    assert runtime_large.max_ctx == 32768, (
+        "gemma-4-31b (~21 GB) leaves only ~2 GB for KV at 24 GB VRAM → must cap at 32K"
+    )
+    assert runtime_small.max_ctx == 98304, (
+        "qwen3.6-27b (~18 GB) leaves ~5 GB for KV at 24 GB VRAM → can use 98K"
+    )
+
+
+def test_unknown_preset_uses_tier_default() -> None:
+    """An unknown preset string falls back to the model-agnostic tier default."""
+    host = HostFacts(vram_gb=24, is_wsl=True)
+    runtime_unknown = runtime_from_host(host, preset="some-future-model")
+    runtime_no_preset = runtime_from_host(host)
+
+    assert runtime_unknown.max_ctx == runtime_no_preset.max_ctx, (
+        "Unknown preset should produce the same result as no preset"
+    )
