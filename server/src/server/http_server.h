@@ -81,13 +81,28 @@ struct ServerConfig {
     // mid-answer at 512 reply tokens.
     int         hard_limit_reply_budget = 4096;
 
-    // Token IDs resolved at server startup for the model's </think>
-    // close-tag sequence. Single special token for Qwen3.6 (id 248069);
-    // multiple tokens for DeepSeek/laguna ([1718, 37947, 32]). When
+    // Token IDs resolved at server startup for the full INJECT directive.
+    // Verbatim tokenization of model card `thinking_terminator_hint` (or
+    // the bare marker when the card has no hint). Single special token
+    // for Qwen3.6 (id 248069 when the card has no hint) but typically
+    // many tokens for trained-hint models (Qwen3.6's
+    // "Considering the limited time..." lead-in is ≈16 tokens). When
     // non-empty, used as BudgetHook.close_token_ids. server_main
     // populates this from the tokenizer after loading; HttpServer just
     // forwards into GenerateRequest.budget_hook when thinking is opted in.
     std::vector<int32_t> think_close_token_ids;
+
+    // Token IDs resolved at server startup for the soft-close PROBE.
+    // Tokenization of just the close MARKER substring (e.g. `</think>`)
+    // — the bytes the soft-close logit-ratio peek compares against the
+    // chosen-token logit at each AR step. Conceptually separate from
+    // the inject sequence above: probing on the full directive's first
+    // token (typically a content lead-in like "Considering") forces
+    // soft-close to read a perpetually-low logit and never fire. See
+    // fix/soft-close-split-probe-from-inject for the empirical finding
+    // (PR #326 trajectory showed prob_ratio < 1e-8 across 1085 steps).
+    // Empty = legacy fallback: peek close_token_ids.front().
+    std::vector<int32_t> think_close_probe_token_ids;
 
     // Soft-close min-ratio default. When > 0 AND a request opts into
     // thinking, the AR loop force-emits </think> early once

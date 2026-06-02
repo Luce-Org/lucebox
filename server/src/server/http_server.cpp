@@ -1662,6 +1662,13 @@ void HttpServer::worker_loop() {
                 ? req.per_req_reply_budget
                 : config_.hard_limit_reply_budget;
             gen_req.budget_hook.close_token_ids = config_.think_close_token_ids;
+            // Soft-close PROBE ids (split from inject sequence). Empty
+            // when the operator did not configure a separate marker
+            // probe; in that case the AR loop falls back to peeking
+            // close_token_ids.front() (legacy behavior). See
+            // model_backend.h BudgetHook::soft_close_probe_token().
+            gen_req.budget_hook.soft_close_probe_ids =
+                config_.think_close_probe_token_ids;
             // Clamp hard_limit to min(max_output, eff_reply_budget): when
             // max_tokens is small (response-only budget), the actual reply
             // window must respect it even though n_gen already accounts for

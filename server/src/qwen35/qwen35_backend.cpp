@@ -967,6 +967,17 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         if (budget_close_started) return;                       // sequence already in progress
         if (budget_hook.close_token_ids.empty()) return;        // hook disabled
 
+        // PROBE vs INJECT split (fix/soft-close-split-probe-from-inject):
+        //   - probe0 is the token id we PEEK to decide whether to fire
+        //     (the short close marker, e.g. `</think>` = 248069 on Qwen3.6).
+        //   - inject0 / inject sequence is what we WRITE when it fires
+        //     (the full trained-hint directive).
+        // Fall back to close_token_ids.front() when no separate probe is
+        // configured (legacy / single-token-marker models). See
+        // BudgetHook::soft_close_probe_token().
+        const int32_t probe0  = budget_hook.soft_close_probe_token();
+        const int32_t inject0 = budget_hook.close_token_ids.front();
+
         // Diagnostic trajectory log. Fires every AR step (gated on
         // operator flag) regardless of soft_close_min_ratio, so we can
         // record close-vs-chosen logit curves even when the dial is off.
@@ -977,22 +988,22 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         // comparator), already useful for picking ratio_start/ratio_end
         // for a sliding curve. Capped at exp(50) ≈ 5.2e21 to avoid
         // scientific-notation noise on near-argmax steps.
+        // close0 reports the PROBE token id (what the comparator uses),
+        // so trajectory CSVs remain interpretable post-split.
         if (budget_hook.debug_thinking_logits) {
-            const int32_t close0 = budget_hook.close_token_ids.front();
             const int generated = committed_now - committed_at_entry;
-            const float diff = logits_row[close0] - logits_row[tok];
+            const float diff = logits_row[probe0] - logits_row[tok];
             const float ratio = (diff > 50.0f) ? std::exp(50.0f) : std::exp(diff);
             std::fprintf(stderr,
                 "[soft-trace] step=%d committed=%d chosen=%d close0=%d "
                 "logit_close=%.4f logit_chosen=%.4f diff=%.4f prob_ratio=%.6g\n",
-                generated, committed_now, tok, close0,
-                logits_row[close0], logits_row[tok], diff, ratio);
+                generated, committed_now, tok, probe0,
+                logits_row[probe0], logits_row[tok], diff, ratio);
         }
 
         if (budget_hook.soft_close_min_ratio <= 0.0f) return;   // dial disabled
 
-        const int32_t close0 = budget_hook.close_token_ids.front();
-        if (!soft_close::should_fire(logits_row, tok, close0,
+        if (!soft_close::should_fire(logits_row, tok, probe0,
                                      budget_hook.soft_close_min_ratio)) {
             return;
         }
@@ -1000,16 +1011,16 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         const int remaining = n_gen - generated;
         std::fprintf(stderr,
             "[budget-hook] soft-close at committed=%d/%d (remaining=%d, "
-            "min_ratio=%.4f, logit[close0]=%.3f logit[chosen]=%.3f diff=%.3f "
-            "log_ratio=%.3f): overriding sampled token %d with close[0]=%d "
-            "(seq len %zu)\n",
+            "min_ratio=%.4f, logit[probe0=%d]=%.3f logit[chosen]=%.3f "
+            "diff=%.3f log_ratio=%.3f): overriding sampled token %d with "
+            "inject[0]=%d (inject seq len %zu)\n",
             committed_now, n_gen, remaining,
             budget_hook.soft_close_min_ratio,
-            logits_row[close0], logits_row[tok],
-            logits_row[close0] - logits_row[tok],
+            probe0, logits_row[probe0], logits_row[tok],
+            logits_row[probe0] - logits_row[tok],
             std::log(budget_hook.soft_close_min_ratio),
-            tok, close0, budget_hook.close_token_ids.size());
-        tok = close0;
+            tok, inject0, budget_hook.close_token_ids.size());
+        tok = inject0;
         budget_close_started = true;
         close_inject_pos = 1;
         if (soft_forced_close_out) *soft_forced_close_out = true;

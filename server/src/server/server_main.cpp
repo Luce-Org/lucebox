@@ -1096,12 +1096,59 @@ int main(int argc, char ** argv) {
                 src, close_text.size(), close_ids.size(),
                 sconfig.hard_limit_reply_budget);
             std::fprintf(stderr,
-                "[server] level-2 force-close token ids: ");
+                "[server] level-2 force-close inject token ids: ");
             for (size_t i = 0; i < std::min<size_t>(close_ids.size(), 16); ++i) {
                 std::fprintf(stderr, "%s%d", i ? "," : "", close_ids[i]);
             }
             if (close_ids.size() > 16) std::fprintf(stderr, ",...");
             std::fprintf(stderr, "\n");
+
+            // Soft-close PROBE token ids: tokenize ONLY the close marker
+            // substring (e.g. `</think>`), distinct from the full inject
+            // hint. This is what the logit-ratio peek reads at each AR
+            // step. Without the split, models whose hint begins with a
+            // content lead-in like "Considering" peek a perpetually-low
+            // logit (≈-30 nats below chosen) and never fire — see PR
+            // #326 trajectory analysis. Detection: find the marker
+            // substring inside the full hint and tokenize it in
+            // isolation. Fallback: when the marker is not found OR
+            // tokenizes to empty, leave think_close_probe_token_ids
+            // empty (BudgetHook::soft_close_probe_token() falls back to
+            // close_token_ids.front() — same as pre-split behavior).
+            const std::string & hint = card.thinking_terminator_hint;
+            if (!hint.empty() && hint != marker) {
+                if (hint.find(marker) != std::string::npos) {
+                    auto probe_ids = tokenizer.encode(marker);
+                    if (!probe_ids.empty()) {
+                        sconfig.think_close_probe_token_ids = probe_ids;
+                        std::fprintf(stderr,
+                            "[server] soft-close probe (marker=\"%s\", %zu tokens): ",
+                            marker.c_str(), probe_ids.size());
+                        for (size_t i = 0;
+                             i < std::min<size_t>(probe_ids.size(), 16); ++i) {
+                            std::fprintf(stderr, "%s%d",
+                                         i ? "," : "", probe_ids[i]);
+                        }
+                        if (probe_ids.size() > 16) std::fprintf(stderr, ",...");
+                        std::fprintf(stderr, "\n");
+                    } else {
+                        std::fprintf(stderr,
+                            "[server] WARN soft-close probe DISABLED: "
+                            "marker \"%s\" tokenizes to empty; falling "
+                            "back to inject[0] as probe (legacy behavior, "
+                            "may never fire for trained-hint models)\n",
+                            marker.c_str());
+                    }
+                } else {
+                    std::fprintf(stderr,
+                        "[server] WARN soft-close probe DISABLED: marker "
+                        "\"%s\" not found in inject hint; falling back to "
+                        "inject[0] as probe (legacy behavior)\n",
+                        marker.c_str());
+                }
+            }
+            // When hint is empty/equals marker, inject==marker and the
+            // split is moot: leave probe empty, peek inject[0].
         } else {
             std::fprintf(stderr,
                 "[server] level-2 force-close DISABLED: text %.40s... "
