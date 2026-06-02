@@ -675,9 +675,12 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
 
     // C2 gate: spec-decode when override <= 2x fa_window; AR fallback otherwise.
     // Both paths see all kept tokens. See docs/pflash-adaptive-composition.md.
+    // fa_window=0 is full-attention (tool calls) — the spec budget must not
+    // collapse to 0, so resolve to kSpecCompressFaRef when no --fa-window given.
+    const int spec_fa_cfg = dflash::common::spec_fa_ref(cfg_.fa_window);
     const bool fa_within_budget =
         dflash::common::c2_spec_decode_permitted(req.fa_window_override,
-                                                 cfg_.fa_window,
+                                                 spec_fa_cfg,
                                                  /*kv_committed*/ 0);
 
     // Decode (speculative or AR)

@@ -10,6 +10,19 @@
 
 namespace dflash::common {
 
+// Spec-decode budget reference. fa_window=0 is full attention (required for
+// tool calls — a finite window drops the system prompt). But the spec-decode
+// admission budget must NOT collapse to 0; it is decoupled from the AR window.
+constexpr int kSpecCompressFaRef = 2048;
+
+// Resolve the fa_window reference used by the spec-decode admission math.
+// Production default fa_window=0 → use kSpecCompressFaRef so the gate/ladder
+// bands (2x, 1.5x) yield the intended 4096 ceiling. A passed --fa-window>0
+// is honored verbatim (preserves prior behavior/tests).
+inline int spec_fa_ref(int fa_window_cfg) {
+    return fa_window_cfg > 0 ? fa_window_cfg : kSpecCompressFaRef;
+}
+
 // Returns true if spec-decode should be attempted.
 //   fa_window_override: 0 = no pflash; else = compressed_prompt_size + 256
 //   fa_window_cfg     : cfg_.fa_window (default 2048)

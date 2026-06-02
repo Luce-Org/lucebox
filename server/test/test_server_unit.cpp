@@ -3359,6 +3359,24 @@ static void test_c2_gate_boundary_at_2x_fa_window() {
     TEST_ASSERT(!dflash::common::c2_spec_decode_permitted(4097, 2048, 3841));
 }
 
+static void test_spec_fa_ref_zero_falls_back_to_const() {
+    // Production default fa_window=0 must NOT collapse the spec budget to 0.
+    TEST_ASSERT(dflash::common::spec_fa_ref(0) == dflash::common::kSpecCompressFaRef);
+    TEST_ASSERT(dflash::common::spec_fa_ref(0) == 2048);
+    // A passed --fa-window>0 is honored verbatim.
+    TEST_ASSERT(dflash::common::spec_fa_ref(2048) == 2048);
+    TEST_ASSERT(dflash::common::spec_fa_ref(512) == 512);
+}
+
+static void test_c2_gate_fa_window_zero_small_compressed_permits() {
+    // THE BUG: production default fa_window=0. A ~2K compressed prompt
+    // (override=2300) must be PERMITTED under the spec_fa_ref(0)->2048 fallback.
+    const int spec_fa = dflash::common::spec_fa_ref(/*cfg fa_window*/ 0);
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(2300, spec_fa, 2044));
+    // Huge compressed prompt still BLOCKED (override=9000 > 2*2048=4096).
+    TEST_ASSERT(!dflash::common::c2_spec_decode_permitted(9000, spec_fa, 8744));
+}
+
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
     std::fprintf(stderr, " Server Unit Tests\n");
@@ -3586,6 +3604,8 @@ int main() {
     RUN_TEST(test_c2_gate_65k_compressed_blocks_spec);
     RUN_TEST(test_c2_gate_small_compressed_permits_spec);
     RUN_TEST(test_c2_gate_boundary_at_2x_fa_window);
+    RUN_TEST(test_spec_fa_ref_zero_falls_back_to_const);
+    RUN_TEST(test_c2_gate_fa_window_zero_small_compressed_permits);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",
