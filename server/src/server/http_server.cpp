@@ -1616,19 +1616,21 @@ void HttpServer::worker_loop() {
         const int effective_think_ceiling = (req.per_req_phase1_cap >= 0)
             ? req.per_req_phase1_cap
             : config_.think_max_tokens;
-        // The effective per-request reply budget is the operator's choice
-        // (CLI / sidecar / per-request override). The AR loop force-closes
-        // when `n_gen - generated <= eff_reply`, which means n_gen must
-        // include BOTH the think budget AND the reply reserve. Without the
-        // `+ eff_reply` term, force-close fires immediately when
-        // `eff_reply == effective_think_ceiling` (e.g. think_max=4096,
-        // hard_limit=4096 → remaining starts at 4096, condition fires
-        // before the model emits a single thinking token). Spec §4.4.
+        // When thinking is active, max_tokens is the *response* budget only —
+        // thinking tokens are additive. n_gen = think_ceiling + response_budget,
+        // where response_budget = min(max_tokens, hard_limit_reply_budget).
+        // This prevents immediate force-close on benchmarks whose max_tokens
+        // were sized for nothink responses (e.g. gsm8k=2048, agent_recorded=4096).
+        // Without this, n_gen = min(think+reply, max_tokens) would cap n_gen
+        // below the hard_limit threshold, firing force-close at step 0. Spec §4.4.
         const int eff_reply_for_n_gen = (req.per_req_reply_budget >= 0)
             ? req.per_req_reply_budget
             : config_.hard_limit_reply_budget;
+        const int response_budget = budget_active
+            ? std::min(req.max_output, eff_reply_for_n_gen)
+            : req.max_output;
         const int n_gen_cap = budget_active
-            ? std::min(effective_think_ceiling + eff_reply_for_n_gen, req.max_output)
+            ? effective_think_ceiling + response_budget
             : req.max_output;
 
         GenerateRequest gen_req;
@@ -1660,7 +1662,12 @@ void HttpServer::worker_loop() {
                 ? req.per_req_reply_budget
                 : config_.hard_limit_reply_budget;
             gen_req.budget_hook.close_token_ids = config_.think_close_token_ids;
-            gen_req.budget_hook.hard_limit_remaining = eff_reply_budget;
+            // Clamp hard_limit to min(max_output, eff_reply_budget): when
+            // max_tokens is small (response-only budget), the actual reply
+            // window must respect it even though n_gen already accounts for
+            // thinking being additive. Spec §4.4.
+            gen_req.budget_hook.hard_limit_remaining =
+                std::min(req.max_output, eff_reply_budget);
 
             // Soft-close min-ratio. Operator-gated: only forwarded when
             // config_.soft_close_min_ratio > 0. Per-request value (if
