@@ -46,7 +46,7 @@ static bool looks_like_plain_text_call(const std::string & text) {
     while ((pos = text.find("call:", pos)) != std::string::npos) {
         size_t v = pos + 5;  // step past "call:"
         if (v < text.size() &&
-            (std::isalpha((unsigned char)text[v]) || text[v] == '_')) {
+            (std::isalnum((unsigned char)text[v]) || text[v] == '_')) {
             size_t w = v;
             while (w < text.size() &&
                    (std::isalnum((unsigned char)text[w]) ||
@@ -542,6 +542,20 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
     }
     window_.clear();
 
+    // Snapshot of what the Responses stream actually emitted as text
+    // deltas. The CONTENT-mode plain-text tool-call branch below
+    // mutates accumulated_content_ (strips matched call spans so the
+    // non-streaming response shape doesn't duplicate them as both text
+    // AND tool_use), but the Responses-format finalization events
+    // (response.output_text.done / content_part.done / completed) must
+    // reflect what was actually streamed in earlier
+    // response.output_text.delta events — otherwise a streaming client
+    // sees its accumulated buffer disagree with the .done payload.
+    // Other formats (OpenAI Chat, Anthropic) don't echo final
+    // aggregated text in the stream, so they can continue to read the
+    // (possibly stripped) accumulated_content_ directly.
+    const std::string responses_streamed_text = accumulated_content_;
+
     // Parse tool calls from buffer
     std::string fr = "stop";
     if (mode_ == StreamMode::TOOL_BUFFER && !tool_buffer_.empty()) {
@@ -700,6 +714,16 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             // the pre-strip text in earlier deltas; this only affects
             // the final accumulated_text() consumed by the response
             // builders in http_server.cpp.
+            //
+            // For the Responses format we capture a separate snapshot
+            // (responses_streamed_text, see top of emit_finish) before
+            // this strip so the streaming finalization events
+            // (.output_text.done / .content_part.done / .completed)
+            // continue to agree with the raw .delta events the client
+            // already received. Without the snapshot the .done payload
+            // would carry the stripped text and a streaming client's
+            // accumulated buffer would disagree with the server's
+            // claimed "done" text.
             accumulated_content_ = parsed.cleaned_text;
 
             fr = "tool_calls";
@@ -840,16 +864,21 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
     }
 
     case ApiFormat::RESPONSES: {
+        // Use the pre-strip snapshot for the streaming finalization
+        // events (.done / .completed) so they agree with the
+        // .delta events that preceded them. See
+        // responses_streamed_text init at the top of emit_finish for
+        // rationale.
         // output_text.done
         out.push_back(format_responses_event("response.output_text.done", {
             {"item_id", msg_item_id_}, {"output_index", 0},
-            {"content_index", 0}, {"text", accumulated_content_}
+            {"content_index", 0}, {"text", responses_streamed_text}
         }));
         // content_part.done
         out.push_back(format_responses_event("response.content_part.done", {
             {"item_id", msg_item_id_}, {"output_index", 0},
             {"content_index", 0},
-            {"part", {{"type", "output_text"}, {"text", accumulated_content_},
+            {"part", {{"type", "output_text"}, {"text", responses_streamed_text},
                       {"annotations", json::array()}}}
         }));
 
@@ -868,7 +897,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                 {"type", "message"}, {"id", msg_item_id_},
                 {"status", "completed"}, {"role", "assistant"},
                 {"content", json::array({{
-                    {"type", "output_text"}, {"text", accumulated_content_},
+                    {"type", "output_text"}, {"text", responses_streamed_text},
                     {"annotations", json::array()}
                 }})}
             });
@@ -896,7 +925,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             {"created_at", created_at_}, {"status", "completed"},
             {"model", model_name_},
             {"output", final_output},
-            {"output_text", accumulated_content_},
+            {"output_text", responses_streamed_text},
             {"usage", resp_usage}
         };
         out.push_back(format_responses_event("response.completed", {{"response", shell}}));
