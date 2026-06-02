@@ -89,6 +89,15 @@ struct ServerConfig {
     // forwards into GenerateRequest.budget_hook when thinking is opted in.
     std::vector<int32_t> think_close_token_ids;
 
+    // Soft-close min-ratio default. When > 0 AND a request opts into
+    // thinking, the AR loop force-emits </think> early once
+    // prob[</think>] / prob[chosen] >= this ratio. 0.0 = soft-close
+    // entirely disabled at the operator level; per-request overrides
+    // are silently ignored when this is zero (operator-policy gate).
+    // Range [0.0, 1.0]. See docs/specs/thinking-budget.md §7 and
+    // docs/experiments/soft-close-thinking-termination-plan.md.
+    float       soft_close_min_ratio = 0.0f;
+
     // Phase-1 budgets per `reasoning.effort` tier (spec §4.2). Selected
     // by the request parser when `reasoning.effort` is present. Each
     // value is itself capped at `think_max_tokens` at startup.
@@ -235,6 +244,14 @@ struct ParsedRequest {
     // hard_limit_reply_budget. Values are already clamped to those ceilings.
     int                       per_req_phase1_cap   = -1;
     int                       per_req_reply_budget = -1;
+    // Per-request soft-close min-ratio override. -1.0 = not set (use
+    // server default). Honored only when the server has soft-close
+    // enabled (config_.soft_close_min_ratio > 0); when the operator has
+    // disabled soft-close, this is silently ignored. When honored,
+    // clamps to min(requested, server_default) — clients can tighten
+    // (lower the threshold) but never loosen (raise it). See spec §4.4
+    // and plan §6.3.
+    float                     per_req_soft_close_min_ratio = -1.0f;
     // Stop sequences (OpenAI "stop" + Anthropic "stop_sequences")
     std::vector<std::string>  stop_sequences;
     // Bandit: per-session adaptive keep_ratio opt-in

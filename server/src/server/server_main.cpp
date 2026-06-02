@@ -280,6 +280,16 @@ static void print_usage(const char * prog) {
         "  --reasoning-effort-max <N>      Phase-1 budget when request asks effort=max\n"
         "                                  Defaults come from share/model_cards/<name>.json;\n"
         "                                  see docs/specs/thinking-budget.md §3.\n"
+        "  --think-soft-close-min-ratio <F>\n"
+        "                             Soft-close dial. When > 0 AND a request opts\n"
+        "                             into thinking, the AR loop force-emits </think>\n"
+        "                             early once prob[</think>]/prob[chosen] >= ratio,\n"
+        "                             reclaiming tokens the model would have spent\n"
+        "                             running to the hard cap. Range [0.0, 1.0]:\n"
+        "                             0.0=disabled (default), 0.1=fire when within\n"
+        "                             10x of argmax (mild), 0.5=fire at half-prob\n"
+        "                             (aggressive), 1.0=fire only when close is\n"
+        "                             argmax. See docs/specs/thinking-budget.md §7.\n"
         "\n"
         "KV cache:\n"
         "  --cache-type-k <type>  KV cache K type (f16,bf16,q4_0,q4_1,q5_0,q5_1,q8_0,tq3_0)\n"
@@ -342,6 +352,7 @@ int main(int argc, char ** argv) {
         bool effort_high             = false;
         bool effort_x_high           = false;
         bool effort_max              = false;
+        bool soft_close_min_ratio    = false;
     } cli_set;
 
     // Track whether the operator passed the legacy --max-tokens alias.
@@ -453,6 +464,24 @@ int main(int argc, char ** argv) {
         } else if (std::strcmp(argv[i], "--reasoning-effort-max") == 0 && i + 1 < argc) {
             sconfig.effort_tiers.max = std::atoi(argv[++i]);
             cli_set.effort_max = true;
+        } else if (std::strcmp(argv[i], "--think-soft-close-min-ratio") == 0 && i + 1 < argc) {
+            float r = std::strtof(argv[++i], nullptr);
+            // Clamp to [0, 1] with a warning if the operator passed
+            // something nonsensical. Bounded posture: the dial is
+            // operator-only, the bounds are tight by design.
+            if (r < 0.0f) {
+                std::fprintf(stderr,
+                    "[server] --think-soft-close-min-ratio=%.4f < 0; "
+                    "clamping to 0 (disabled)\n", r);
+                r = 0.0f;
+            } else if (r > 1.0f) {
+                std::fprintf(stderr,
+                    "[server] --think-soft-close-min-ratio=%.4f > 1; "
+                    "clamping to 1\n", r);
+                r = 1.0f;
+            }
+            sconfig.soft_close_min_ratio = r;
+            cli_set.soft_close_min_ratio = true;
         } else if (std::strcmp(argv[i], "--prefill-compression") == 0 && i + 1 < argc) {
             const char * mode = argv[++i];
             if (std::strcmp(mode, "auto") == 0)
@@ -816,6 +845,9 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  hard_limit_reply= %d (%s)\n",
                  sconfig.hard_limit_reply_budget,
                  src_of(cli_set.hard_limit_reply_budget));
+    std::fprintf(stderr, "[server] │  soft_close_ratio= %.4f (%s)\n",
+                 sconfig.soft_close_min_ratio,
+                 cli_set.soft_close_min_ratio ? "from CLI" : "default (disabled)");
     std::fprintf(stderr, "[server] │  effort tiers    = low=%d (%s)\n",
                  sconfig.effort_tiers.low, src_of(cli_set.effort_low));
     std::fprintf(stderr, "[server] │                    medium=%d (%s)\n",

@@ -87,6 +87,15 @@ class DflashRuntime:
     # footprint. Q: passed through to the server's `--fa-window <N>`
     # flag (see server/src/server/server_main.cpp).
     fa_window: int = 0
+    # Soft-close thinking termination dial (PR #326 in lucebox-hub).
+    # Lets the AR loop force </think> early when the close-token logit
+    # comes within this probability ratio of the chosen-token logit.
+    # Range [0.0, 1.0]; 0.0 = disabled (byte-identical to pre-change
+    # behaviour). 0.5 = close when close-token prob >= 0.5 * chosen-token
+    # prob; 0.9 = aggressive. Qwen3.5/3.6 AR path only in v1. Surfaced
+    # to the server via DFLASH_THINK_SOFT_CLOSE_MIN_RATIO →
+    # --think-soft-close-min-ratio.
+    think_soft_close_min_ratio: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)

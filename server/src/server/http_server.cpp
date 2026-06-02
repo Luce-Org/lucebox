@@ -1037,6 +1037,38 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             if (th.contains("reply_budget") && th["reply_budget"].is_number_integer()) {
                 request_reply_budget = th["reply_budget"].get<int>();
             }
+            // Soft-close per-request override (plan §6.3). Honored only
+            // when the operator has soft-close enabled; clamped against
+            // the server ceiling so clients can tighten but not loosen.
+            // Applied after clamping logic below.
+            if (th.contains("soft_close_min_ratio") &&
+                th["soft_close_min_ratio"].is_number())
+            {
+                float requested = th["soft_close_min_ratio"].get<float>();
+                if (requested < 0.0f) requested = 0.0f;
+                if (requested > 1.0f) requested = 1.0f;
+                if (config_.soft_close_min_ratio <= 0.0f) {
+                    // Operator has disabled soft-close at the server
+                    // level — silently ignore the per-request override.
+                    // Logged at info so operators can see clients
+                    // attempting to opt in.
+                    std::fprintf(stderr,
+                        "[server] thinking.soft_close_min_ratio=%.4f "
+                        "ignored: server has soft-close disabled "
+                        "(config_.soft_close_min_ratio=0)\n",
+                        requested);
+                } else {
+                    float eff = std::min(requested,
+                                          config_.soft_close_min_ratio);
+                    if (requested > config_.soft_close_min_ratio) {
+                        std::fprintf(stderr,
+                            "[server] thinking.soft_close_min_ratio=%.4f "
+                            "clamped to soft_close_min_ratio=%.4f\n",
+                            requested, config_.soft_close_min_ratio);
+                    }
+                    req.per_req_soft_close_min_ratio = eff;
+                }
+            }
         }
         // Direct: chat_template_kwargs.enable_thinking
         if (body.contains("chat_template_kwargs")) {
@@ -1562,6 +1594,17 @@ void HttpServer::worker_loop() {
                 : config_.hard_limit_reply_budget;
             gen_req.budget_hook.close_token_ids = config_.think_close_token_ids;
             gen_req.budget_hook.hard_limit_remaining = eff_reply_budget;
+
+            // Soft-close min-ratio. Operator-gated: only forwarded when
+            // config_.soft_close_min_ratio > 0. Per-request value (if
+            // set and operator enabled) is already clamped to the
+            // server ceiling in the request parser. See plan §6.3.
+            if (config_.soft_close_min_ratio > 0.0f) {
+                gen_req.budget_hook.soft_close_min_ratio =
+                    (req.per_req_soft_close_min_ratio >= 0.0f)
+                        ? req.per_req_soft_close_min_ratio
+                        : config_.soft_close_min_ratio;
+            }
         }
 
         // Tool call hint generation: pre-tokenize predictable structural tokens
@@ -1850,15 +1893,25 @@ void HttpServer::worker_loop() {
             }
         }
 
-        // close_kind reflects the Level 2 BudgetHook outcome: "hard" when
-        // the backend's AR/spec decode injected the close-token sequence
-        // at the budget boundary, "natural" when the model self-closed
-        // (or the request never opted in). Emitted as part of
-        // finish_details for thinking-budget callers.
-        std::string close_kind =
-            (req.thinking_opt_in && result.budget_forced_close)
-                ? "hard"
-                : "natural";
+        // close_kind reflects the Level 2 BudgetHook outcome:
+        //   "natural" — the model emitted </think> on its own (or the
+        //               request never opted in to the envelope).
+        //   "soft"    — the soft-close logit-ratio peek (Level 2.5)
+        //               fired before the hard cap, indicating the
+        //               model was willing to close. See
+        //               docs/specs/thinking-budget.md §7.
+        //   "hard"    — the budget edge was reached without the model
+        //               or the soft path agreeing; the AR loop forced
+        //               </think> in. Original Level 2 behavior.
+        // Soft wins ties against hard on the same step (see plan §4 +
+        // §12) — soft_forced_close and budget_forced_close are mutually
+        // exclusive per AR-loop step. Emitted as part of finish_details
+        // for thinking-budget callers.
+        std::string close_kind = "natural";
+        if (req.thinking_opt_in) {
+            if (result.soft_forced_close)        close_kind = "soft";
+            else if (result.budget_forced_close) close_kind = "hard";
+        }
 
         // Finalize.
         // Per-request wall-clock timings forwarded to the response's

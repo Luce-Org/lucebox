@@ -186,6 +186,14 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
     # server's stock behavior.
     if cfg.dflash.fa_window > 0:
         env.append(("DFLASH_FA_WINDOW", str(cfg.dflash.fa_window)))
+    # Soft-close ratio: 0.0 is server-side disabled (byte-identical
+    # to pre-PR-#326 behavior). Emit only when nonzero to keep the
+    # docker env minimal and mirror the entrypoint's `case` guard.
+    if cfg.dflash.think_soft_close_min_ratio > 0.0:
+        env.append((
+            "DFLASH_THINK_SOFT_CLOSE_MIN_RATIO",
+            f"{cfg.dflash.think_soft_close_min_ratio:g}",
+        ))
 
     return DockerRunSpec(
         image=f"{cfg.image}:{cfg.variant}",

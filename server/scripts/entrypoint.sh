@@ -292,6 +292,14 @@ fi
 # reply budget(512) = 15488. The server's own hardcoded default is 10000;
 # overriding here aligns ds4-eval and similar reasoning benches with upstream.
 : "${DFLASH_THINK_MAX:=15488}"
+# Soft-close thinking termination dial (PR #326). Lets the AR loop force
+# </think> early when the close-token logit comes within this probability
+# ratio of the chosen-token logit. Range [0.0, 1.0]; 0.0 = disabled (server
+# default, byte-identical to pre-change behavior). 0.5 = close when close
+# is within 2× of chosen; 0.9 = aggressive (close when close is within
+# ~10% of chosen). Only emitted to the server CLI when nonzero so unset
+# reproduces the server's own default. Qwen3.5/3.6 AR path only in v1.
+: "${DFLASH_THINK_SOFT_CLOSE_MIN_RATIO:=0.0}"
 # Flash-attention sliding-window on full-attention layers. 0 = server's
 # stock full attention. Sparse decode windows (e.g. 2048-8192) bound
 # the compute on long prompts for gemma4's hybrid iSWA without changing
@@ -488,6 +496,14 @@ fi
 [ -n "$DFLASH_CACHE_TYPE_K" ]      && CMD+=(--cache-type-k "$DFLASH_CACHE_TYPE_K")
 [ -n "$DFLASH_CACHE_TYPE_V" ]      && CMD+=(--cache-type-v "$DFLASH_CACHE_TYPE_V")
 [ "$DFLASH_FA_WINDOW" -gt 0 ] 2>/dev/null && CMD+=(--fa-window "$DFLASH_FA_WINDOW")
+# Soft-close ratio: emit only when nonzero. The default-string compare
+# guards against the floating-point quirks of `[` numeric tests for
+# values like 0.0/0/0.00 — anything non-"0.0" passes through to the
+# server, which clamps to [0,1] itself.
+case "$DFLASH_THINK_SOFT_CLOSE_MIN_RATIO" in
+    0|0.0|0.00|0.000) ;;  # disabled — don't emit
+    *) CMD+=(--think-soft-close-min-ratio "$DFLASH_THINK_SOFT_CLOSE_MIN_RATIO") ;;
+esac
 
 if [ "$DFLASH_PREFILL_MODE" != "off" ]; then
     [ -n "$DFLASH_PREFILL_DRAFTER" ] || die "DFLASH_PREFILL_MODE=$DFLASH_PREFILL_MODE requires DFLASH_PREFILL_DRAFTER"

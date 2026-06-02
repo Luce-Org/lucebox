@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -53,7 +54,43 @@ struct DaemonIO {
 struct BudgetHook {
     std::vector<int32_t> close_token_ids;
     int                  hard_limit_remaining = 0;
+    // Soft-close (Level 2 voluntary). When > 0, at each AR step the
+    // loop compares the close-token logit against the chosen-token
+    // logit; if `prob[close[0]] / prob[chosen] >= soft_close_min_ratio`
+    // (equivalently `logit[close[0]] - logit[chosen] >= log(min_ratio)`),
+    // the close sequence is injected BEFORE the hard-limit is reached.
+    // 0.0 = disabled (default); 1.0 = fire only when close is already
+    // the most-likely token; lower values = fire more aggressively.
+    // See docs/specs/thinking-budget.md §7 and
+    // docs/experiments/soft-close-thinking-termination-plan.md.
+    float                soft_close_min_ratio = 0.0f;
 };
+
+namespace soft_close {
+
+// Returns true when the soft-close comparator would fire on this AR
+// step. Side-effect free; safe to call from unit tests.
+//
+// Fast path: returns false in O(1) when min_ratio <= 0 (the disabled
+// default). When the model has already chosen the close token on its
+// own, also returns false — the natural-close path handles that.
+//
+// Math: `prob[i]/prob[j] = exp(logit[i] - logit[j])`, so
+// `prob[close]/prob[chosen] >= min_ratio` ⟺
+// `logit[close] - logit[chosen] >= log(min_ratio)`. We compare on
+// logits to avoid `exp()` and full-softmax cost; this is numerically
+// stable in fp32 for typical LLM logit ranges (~±20).
+inline bool should_fire(const float * logits,
+                        int32_t       chosen_tok,
+                        int32_t       close0_tok,
+                        float         min_ratio) {
+    if (min_ratio <= 0.0f)          return false;
+    if (chosen_tok == close0_tok)    return false;
+    const float log_ratio = std::log(min_ratio);
+    return (logits[close0_tok] - logits[chosen_tok]) >= log_ratio;
+}
+
+}  // namespace soft_close
 
 struct GenerateRequest {
     std::vector<int32_t>       prompt;
@@ -100,6 +137,13 @@ struct GenerateResult {
     // stream and grepping for "</think>" cannot distinguish the two
     // (the injected close decodes identically).
     bool                       budget_forced_close = false;
+    // True when the soft-close path (logit-ratio peek) injected the
+    // </think> close sequence in this generation. Mutually exclusive
+    // with budget_forced_close: when both could fire on the same step,
+    // soft wins and budget_forced_close stays false. The server uses
+    // this to attribute close_kind="soft" (vs "hard"). See
+    // docs/specs/thinking-budget.md §7.
+    bool                       soft_forced_close = false;
     // True iff the AR decode loop's post-close watchdog detected an n-gram
     // repetition loop and broke out early. Caller surfaces this so clients
     // can mark the answer as unreliable rather than treating the
@@ -191,6 +235,8 @@ struct ModelBackend {
         retry.spec_decode_ran = first.spec_decode_ran || retry.spec_decode_ran;
         retry.budget_forced_close =
             first.budget_forced_close || retry.budget_forced_close;
+        retry.soft_forced_close =
+            first.soft_forced_close || retry.soft_forced_close;
         retry.degenerate_decode_close =
             first.degenerate_decode_close || retry.degenerate_decode_close;
         return retry;
