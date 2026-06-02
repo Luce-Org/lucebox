@@ -955,6 +955,10 @@ ModelBackend::CompressResult Qwen3Backend::compress(const CompressRequest & req)
         drafter_ctx_, req.input_ids, req.keep_ratio);
     result.ok = true;
 
+    if (req.residency_action == DraftResidencyAction::ReleaseAfterUse) {
+        free_drafter();
+    }
+
     if (!req.skip_park && !was_parked) unpark("target");
     return result;
 }

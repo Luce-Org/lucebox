@@ -191,7 +191,8 @@ DFLASH27B_KV_TQ3=1 \
 | `--ddtree` | off (chain) | Enable tree verify |
 | `--ddtree-budget N` | `22` | Tree size. 22 on 3090 (default), 40 on 5090, re-sweep on GB10 |
 | `--fa-window N` | `2048` | Sliding FA window; `0` = full attention |
-| `--lazy-draft` | off | Defer draft load until first request |
+| `--draft-residency {auto,persistent,request-scoped}` | `auto` | When draft weights are evicted from VRAM. `request-scoped` parks/frees them after each request's draft work (frees VRAM for the target on tight GPUs); `persistent` keeps them resident across requests; `auto` preserves current behavior while honoring the low-VRAM / `--lazy-draft` hint. Reported at `/props.runtime.draft_residency`. |
+| `--lazy-draft` | off | Legacy alias for `--draft-residency=request-scoped` (defer draft load until first request, release after) |
 
 **Prefill compression (PFlash)**
 

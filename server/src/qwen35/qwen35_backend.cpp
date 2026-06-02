@@ -402,8 +402,9 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
                      req.input_ids.size(), result.compressed_ids.size());
     }
 
-    // Keep drafter loaded (own backend + weights persist), matching test_dflash.
-    // ~1.4 GB stays resident but avoids reload cost on subsequent compresses.
+    if (req.residency_action == DraftResidencyAction::ReleaseAfterUse) {
+        free_drafter();
+    }
 
     // Restore park state
     if (!req.skip_park) {

@@ -19,6 +19,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "sampler.h"
+#include "placement/draft_residency.h"
 
 namespace dflash::common {
 
@@ -250,6 +251,7 @@ struct ModelBackend {
         std::string          drafter_path;    // GGUF path (for lazy-load)
         int                  drafter_gpu = 0;  // backend-local GPU for PFlash drafter
         bool                 skip_park = false; // true on >=32GB GPUs
+        DraftResidencyAction residency_action = DraftResidencyAction::KeepLoaded;
     };
 
     struct CompressResult {

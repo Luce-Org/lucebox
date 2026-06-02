@@ -23,6 +23,7 @@
 #include "placement/placement_config.h"
 #include "common/layer_split_backend.h"
 #include "common/layer_split_utils.h"
+#include "placement/draft_residency.h"
 #include <nlohmann/json.hpp>
 
 #include <cmath>
@@ -892,6 +893,7 @@ static void test_pflash_config_defaults() {
     TEST_ASSERT(cfg.pflash_keep_ratio > 0.04f && cfg.pflash_keep_ratio < 0.06f);
     TEST_ASSERT(cfg.pflash_drafter_path.empty());
     TEST_ASSERT(!cfg.pflash_skip_park);
+    TEST_ASSERT(cfg.draft_residency == DraftResidencyPolicy::Auto);
 }
 
 static void test_pflash_config_modes() {
@@ -1036,6 +1038,77 @@ static void test_pflash_placement_usage_gate() {
         /*pflash_enabled=*/true, /*has_decode_draft=*/false));
     TEST_ASSERT(pflash_drafter_placement_used(
         /*pflash_enabled=*/true, /*has_decode_draft=*/true));
+}
+
+static void test_draft_residency_parse() {
+    DraftResidencyPolicy policy = DraftResidencyPolicy::Auto;
+    TEST_ASSERT(parse_draft_residency_policy("auto", policy));
+    TEST_ASSERT(policy == DraftResidencyPolicy::Auto);
+    TEST_ASSERT(parse_draft_residency_policy("persistent", policy));
+    TEST_ASSERT(policy == DraftResidencyPolicy::Persistent);
+    TEST_ASSERT(parse_draft_residency_policy("request-scoped", policy));
+    TEST_ASSERT(policy == DraftResidencyPolicy::RequestScoped);
+    TEST_ASSERT(parse_draft_residency_policy("request_scoped", policy));
+    TEST_ASSERT(policy == DraftResidencyPolicy::RequestScoped);
+    TEST_ASSERT(!parse_draft_residency_policy("request", policy));
+}
+
+static void test_draft_residency_pflash_auto() {
+    auto action = resolve_draft_residency_action(
+        DraftResidencyPolicy::Auto,
+        DraftResidencyContext{
+            DraftResidencyUse::PFlashCompress,
+            /*low_vram_hint=*/false,
+            /*has_decode_draft=*/false,
+        });
+    TEST_ASSERT(action == DraftResidencyAction::KeepLoaded);
+
+    action = resolve_draft_residency_action(
+        DraftResidencyPolicy::Auto,
+        DraftResidencyContext{
+            DraftResidencyUse::PFlashCompress,
+            /*low_vram_hint=*/true,
+            /*has_decode_draft=*/true,
+        });
+    TEST_ASSERT(action == DraftResidencyAction::ReleaseAfterUse);
+}
+
+static void test_draft_residency_dflash_auto_and_request_scoped() {
+    auto action = resolve_draft_residency_action(
+        DraftResidencyPolicy::Auto,
+        DraftResidencyContext{
+            DraftResidencyUse::DFlashDecode,
+            /*low_vram_hint=*/false,
+            /*has_decode_draft=*/true,
+        });
+    TEST_ASSERT(action == DraftResidencyAction::KeepLoaded);
+
+    action = resolve_draft_residency_action(
+        DraftResidencyPolicy::Auto,
+        DraftResidencyContext{
+            DraftResidencyUse::DFlashDecode,
+            /*low_vram_hint=*/true,
+            /*has_decode_draft=*/true,
+        });
+    TEST_ASSERT(action == DraftResidencyAction::ReleaseAfterUse);
+
+    action = resolve_draft_residency_action(
+        DraftResidencyPolicy::RequestScoped,
+        DraftResidencyContext{
+            DraftResidencyUse::DFlashDecode,
+            /*low_vram_hint=*/false,
+            /*has_decode_draft=*/true,
+        });
+    TEST_ASSERT(action == DraftResidencyAction::ReleaseAfterUse);
+
+    action = resolve_draft_residency_action(
+        DraftResidencyPolicy::Persistent,
+        DraftResidencyContext{
+            DraftResidencyUse::DFlashDecode,
+            /*low_vram_hint=*/true,
+            /*has_decode_draft=*/true,
+        });
+    TEST_ASSERT(action == DraftResidencyAction::KeepLoaded);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2316,6 +2389,7 @@ static void test_props_runtime_shape() {
     cfg.kv_cache_k      = "tq3_0";
     cfg.kv_cache_v      = "tq3_0";
     cfg.lazy_draft      = false;
+    cfg.draft_residency = DraftResidencyPolicy::Persistent;
     cfg.target_sharding = false;
     cfg.chunk           = 512;
     cfg.target_device   = "auto:0";
@@ -2333,10 +2407,12 @@ static void test_props_runtime_shape() {
     TEST_ASSERT(rt["kv_cache_k"].get<std::string>()      == "tq3_0");
     TEST_ASSERT(rt["kv_cache_v"].get<std::string>()      == "tq3_0");
     TEST_ASSERT(rt["lazy_draft"].get<bool>()             == false);
+    TEST_ASSERT(rt["draft_residency"].get<std::string>() == "persistent");
     TEST_ASSERT(rt["target_sharding"].get<bool>()        == false);
     TEST_ASSERT(rt["chunk"].get<int>()                   == 512);
     TEST_ASSERT(rt["target_device"].get<std::string>()   == "auto:0");
     TEST_ASSERT(rt["draft_device"].get<std::string>()    == "auto:0");
+    TEST_ASSERT(body["pflash"]["draft_residency"].get<std::string>() == "persistent");
 
     // draft_device is null when no draft model is loaded.
     cfg.draft_device.clear();
@@ -2667,6 +2743,9 @@ int main() {
     RUN_TEST(test_pflash_placement_auto_draft_follows_target);
     RUN_TEST(test_pflash_placement_disabled_never_remote);
     RUN_TEST(test_pflash_placement_usage_gate);
+    RUN_TEST(test_draft_residency_parse);
+    RUN_TEST(test_draft_residency_pflash_auto);
+    RUN_TEST(test_draft_residency_dflash_auto_and_request_scoped);
 
     std::fprintf(stderr, "\n── Jinja chat template ──\n");
     RUN_TEST(test_jinja_render_basic);
