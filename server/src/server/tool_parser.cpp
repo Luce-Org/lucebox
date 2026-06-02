@@ -259,6 +259,18 @@ static bool coerce_relaxed_json(const std::string & payload, json & out) {
                 i++;
                 continue;
             }
+            // Escape inner `"` when we opened the string with a non-`"`
+            // quote (single or backtick). Without this, content like
+            // `'he said "hi"'` rewrites to `"he said "hi""` which is
+            // invalid JSON and silently drops the whole tool call.
+            // When in_str == '"', a `"` inside should have arrived via
+            // the `\\` escape branch above; a bare `"` here is malformed
+            // input we pass through unchanged.
+            if (in_str != '"' && c == '"') {
+                rewritten += "\\\"";
+                i++;
+                continue;
+            }
             rewritten += c;
             i++;
             continue;
@@ -295,6 +307,7 @@ static bool coerce_relaxed_json(const std::string & payload, json & out) {
     out = std::move(parsed);
     return true;
 }
+
 
 // ─── XML parameter parser ───────────────────────────────────────────────
 

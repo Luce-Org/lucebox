@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -21,6 +22,47 @@ static constexpr size_t THINK_CLOSE_LEN = 8;
 
 static bool has_request_tools(const json & tools) {
     return tools.is_array() && !tools.empty();
+}
+
+// Cheap pre-check: scan `text` for a plausible `call:<verb>{` opener
+// before invoking the full parse_tool_calls regex sweep. Mirrors the
+// shape of re_call_verb_open() in tool_parser.cpp at a coarse
+// granularity. Single O(N) pass with a substring skip; no heap alloc
+// and no regex compile, so a response with no `call:` substring pays
+// only a `find()` cost.
+//
+// Returns true if any `call:` occurrence is followed by an identifier
+// start (`[A-Za-z_]`), more verb chars (`[A-Za-z0-9_.:-]`), optional
+// whitespace, and a `{`. We deliberately do NOT validate balanced
+// braces here — parse_tool_calls owns that check, and a leading
+// `call:foo{` with no close still costs us only one regex scan.
+//
+// The pre-check intentionally accepts `_call:foo{` (SentencePiece
+// underscore artifact, see tool_parser.cpp re_call_verb_open()
+// rationale) by including `_` in the verb-start charset alternation
+// at the top — `find("call:")` lands inside the `_call:` window.
+static bool looks_like_plain_text_call(const std::string & text) {
+    size_t pos = 0;
+    while ((pos = text.find("call:", pos)) != std::string::npos) {
+        size_t v = pos + 5;  // step past "call:"
+        if (v < text.size() &&
+            (std::isalnum((unsigned char)text[v]) || text[v] == '_')) {
+            size_t w = v;
+            while (w < text.size() &&
+                   (std::isalnum((unsigned char)text[w]) ||
+                    text[w] == '_' || text[w] == '.' ||
+                    text[w] == ':' || text[w] == '-')) {
+                w++;
+            }
+            // Allow whitespace between verb and brace (mirrors `\s*\{`).
+            while (w < text.size() && std::isspace((unsigned char)text[w])) {
+                w++;
+            }
+            if (w < text.size() && text[w] == '{') return true;
+        }
+        pos = v;
+    }
+    return false;
 }
 
 static bool find_tool_start(const std::string & text, size_t & pos) {
@@ -507,6 +549,20 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
     }
     window_.clear();
 
+    // Snapshot of what the Responses stream actually emitted as text
+    // deltas. The CONTENT-mode plain-text tool-call branch below
+    // mutates accumulated_content_ (strips matched call spans so the
+    // non-streaming response shape doesn't duplicate them as both text
+    // AND tool_use), but the Responses-format finalization events
+    // (response.output_text.done / content_part.done / completed) must
+    // reflect what was actually streamed in earlier
+    // response.output_text.delta events — otherwise a streaming client
+    // sees its accumulated buffer disagree with the .done payload.
+    // Other formats (OpenAI Chat, Anthropic) don't echo final
+    // aggregated text in the stream, so they can continue to read the
+    // (possibly stripped) accumulated_content_ directly.
+    const std::string responses_streamed_text = accumulated_content_;
+
     // Parse tool calls from buffer
     std::string fr = "stop";
     if (mode_ == StreamMode::TOOL_BUFFER && !tool_buffer_.empty()) {
@@ -615,6 +671,144 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                 "request_id=%s format=%d bytes=%zu\n",
                 request_id_.c_str(), (int)format_, tool_buffer_.size());
         }
+    } else if (mode_ == StreamMode::CONTENT &&
+               !accumulated_content_.empty() &&
+               has_request_tools(tools_) &&
+               looks_like_plain_text_call(accumulated_content_)) {
+        // CONTENT-mode plain-text tool-call hoist. Gemma4 (and similar
+        // models with no XML tool-call template) emits invocations as
+        // literal text like `call:get_weather{location: "SF"}` or
+        // `_call:get_weather{...}` (SentencePiece artifact). The emitter
+        // stays in CONTENT mode for the whole stream because no
+        // `<tool_call>` / `<function=` / `<tool_code>` opener ever
+        // arrives. Without this branch the response stops with
+        // finish_reason="stop" / stop_reason="end_turn" and no tool_use
+        // block is emitted, breaking forge/agent_recorded scenarios
+        // that depend on structured tool_calls.
+        //
+        // The branch runs parse_tool_calls over accumulated_content_,
+        // hoists any ToolCalls (the allowlist filter `tool_allowed` is
+        // already enforced inside parse_tool_calls' add_call lambda,
+        // so unauthorized verbs never enter parsed.tool_calls), and
+        // replaces accumulated_content_ with cleaned_text so the final
+        // response carries the prose-only text (no duplicate `call:`
+        // span). Streaming clients have already received the raw call
+        // text as content deltas — they get a post-hoc tool_use block
+        // appended at finalize. Text + tool_use is a legal stream in
+        // both OpenAI and Anthropic specs.
+        //
+        // Gated on has_request_tools(tools_) to mirror the
+        // TOOL_BUFFER-entry condition at line 391 — if the request
+        // didn't declare tools we keep `call:foo{}` as visible content
+        // (see test_emitter_no_tools_keeps_tool_like_text for the
+        // equivalent XML-shape behavior).
+        auto parsed = parse_tool_calls(accumulated_content_, tools_);
+        if (!parsed.tool_calls.empty()) {
+            tool_calls_ = std::move(parsed.tool_calls);
+
+            // Remember for tool memory (mirrors TOOL_BUFFER branch).
+            if (tool_memory_) {
+                std::vector<std::string> ids;
+                for (const auto & tc : tool_calls_) ids.push_back(tc.id);
+                tool_memory_->remember(ids, accumulated_raw_);
+            }
+
+            // Strip matched call spans from the visible content so the
+            // non-streaming final-message shape doesn't duplicate them
+            // as both text AND tool_use. Mirrors
+            // _strip_plain_text_tool_calls in
+            // luce-bench/.../forge.py. Streaming clients already saw
+            // the pre-strip text in earlier deltas; this only affects
+            // the final accumulated_text() consumed by the response
+            // builders in http_server.cpp.
+            //
+            // For the Responses format we capture a separate snapshot
+            // (responses_streamed_text, see top of emit_finish) before
+            // this strip so the streaming finalization events
+            // (.output_text.done / .content_part.done / .completed)
+            // continue to agree with the raw .delta events the client
+            // already received. Without the snapshot the .done payload
+            // would carry the stripped text and a streaming client's
+            // accumulated buffer would disagree with the server's
+            // claimed "done" text.
+            accumulated_content_ = parsed.cleaned_text;
+
+            fr = "tool_calls";
+
+            // Format-specific tool call events — same shape as the
+            // TOOL_BUFFER branch above. Kept inlined (rather than
+            // refactored into a helper) to keep this commit's diff
+            // minimal and side-by-side reviewable against the
+            // upstream block.
+            switch (format_) {
+            case ApiFormat::OPENAI_CHAT: {
+                json tc_list = json::array();
+                for (size_t i = 0; i < tool_calls_.size(); i++) {
+                    tc_list.push_back({
+                        {"index", (int)i},
+                        {"id", tool_calls_[i].id},
+                        {"type", "function"},
+                        {"function", {
+                            {"name", tool_calls_[i].name},
+                            {"arguments", tool_calls_[i].arguments}
+                        }}
+                    });
+                }
+                out.push_back(format_openai_delta({{"tool_calls", tc_list}}));
+                break;
+            }
+            case ApiFormat::ANTHROPIC: {
+                if (!active_kind_.empty()) {
+                    out.push_back(sse_event("content_block_stop",
+                        json({{"type", "content_block_stop"}, {"index", block_index_}}).dump()));
+                    active_kind_.clear();
+                }
+                for (const auto & tc : tool_calls_) {
+                    block_index_++;
+                    json tu_block = {
+                        {"type",  "tool_use"},
+                        {"id",    tc.id},
+                        {"name",  tc.name},
+                        {"input", json::object()}
+                    };
+                    out.push_back(sse_event("content_block_start",
+                        json({{"type", "content_block_start"},
+                              {"index", block_index_},
+                              {"content_block", tu_block}}).dump()));
+                    if (!tc.arguments.empty()) {
+                        out.push_back(sse_event("content_block_delta",
+                            json({{"type",  "content_block_delta"},
+                                  {"index", block_index_},
+                                  {"delta", {{"type",         "input_json_delta"},
+                                             {"partial_json", tc.arguments}}}}).dump()));
+                    }
+                    out.push_back(sse_event("content_block_stop",
+                        json({{"type", "content_block_stop"},
+                              {"index", block_index_}}).dump()));
+                }
+                break;
+            }
+            case ApiFormat::RESPONSES:
+                for (const auto & tc : tool_calls_) {
+                    out.push_back(format_responses_event(
+                        "response.function_call_arguments.delta", {
+                            {"item_id", tc.id}, {"output_index", 0},
+                            {"delta", tc.arguments}
+                        }));
+                    out.push_back(format_responses_event(
+                        "response.function_call_arguments.done", {
+                            {"item_id", tc.id}, {"output_index", 0},
+                            {"arguments", tc.arguments}, {"name", tc.name}
+                        }));
+                }
+                break;
+            default: break;
+            }
+        }
+        // If parse_tool_calls matched the substring pre-check but
+        // returned no calls (all filtered by tool_allowed, or all args
+        // malformed), `fr` stays "stop" and accumulated_content_ is
+        // left intact. Caller sees the original prose; no leak.
     }
 
     // Format-specific final events
@@ -677,16 +871,21 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
     }
 
     case ApiFormat::RESPONSES: {
+        // Use the pre-strip snapshot for the streaming finalization
+        // events (.done / .completed) so they agree with the
+        // .delta events that preceded them. See
+        // responses_streamed_text init at the top of emit_finish for
+        // rationale.
         // output_text.done
         out.push_back(format_responses_event("response.output_text.done", {
             {"item_id", msg_item_id_}, {"output_index", 0},
-            {"content_index", 0}, {"text", accumulated_content_}
+            {"content_index", 0}, {"text", responses_streamed_text}
         }));
         // content_part.done
         out.push_back(format_responses_event("response.content_part.done", {
             {"item_id", msg_item_id_}, {"output_index", 0},
             {"content_index", 0},
-            {"part", {{"type", "output_text"}, {"text", accumulated_content_},
+            {"part", {{"type", "output_text"}, {"text", responses_streamed_text},
                       {"annotations", json::array()}}}
         }));
 
@@ -705,7 +904,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                 {"type", "message"}, {"id", msg_item_id_},
                 {"status", "completed"}, {"role", "assistant"},
                 {"content", json::array({{
-                    {"type", "output_text"}, {"text", accumulated_content_},
+                    {"type", "output_text"}, {"text", responses_streamed_text},
                     {"annotations", json::array()}
                 }})}
             });
@@ -733,7 +932,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             {"created_at", created_at_}, {"status", "completed"},
             {"model", model_name_},
             {"output", final_output},
-            {"output_text", accumulated_content_},
+            {"output_text", responses_streamed_text},
             {"usage", resp_usage}
         };
         out.push_back(format_responses_event("response.completed", {{"response", shell}}));
