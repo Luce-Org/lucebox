@@ -4149,6 +4149,7 @@ static void test_soft_close_determinism_when_disabled() {
     }
     TEST_ASSERT(state.soft_fired == false);
     TEST_ASSERT(state.hard_fired == false);
+}
 
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
