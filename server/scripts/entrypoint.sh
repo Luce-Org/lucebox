@@ -300,6 +300,10 @@ fi
 # ~10% of chosen). Only emitted to the server CLI when nonzero so unset
 # reproduces the server's own default. Qwen3.5/3.6 AR path only in v1.
 : "${DFLASH_THINK_SOFT_CLOSE_MIN_RATIO:=0.0}"
+# Diagnostic: when "1", forward --debug-thinking-logits to the server so
+# the AR loop emits per-step [soft-trace] lines for fitting a sliding-
+# ratio curve. Heavy stderr; operator-only. Default off.
+: "${DFLASH_DEBUG_THINKING_LOGITS:=0}"
 # Flash-attention sliding-window on full-attention layers. 0 = server's
 # stock full attention. Sparse decode windows (e.g. 2048-8192) bound
 # the compute on long prompts for gemma4's hybrid iSWA without changing
@@ -504,6 +508,7 @@ case "$DFLASH_THINK_SOFT_CLOSE_MIN_RATIO" in
     0|0.0|0.00|0.000) ;;  # disabled — don't emit
     *) CMD+=(--think-soft-close-min-ratio "$DFLASH_THINK_SOFT_CLOSE_MIN_RATIO") ;;
 esac
+[ "$DFLASH_DEBUG_THINKING_LOGITS" = "1" ] && CMD+=(--debug-thinking-logits)
 
 if [ "$DFLASH_PREFILL_MODE" != "off" ]; then
     [ -n "$DFLASH_PREFILL_DRAFTER" ] || die "DFLASH_PREFILL_MODE=$DFLASH_PREFILL_MODE requires DFLASH_PREFILL_DRAFTER"

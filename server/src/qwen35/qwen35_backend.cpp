@@ -966,6 +966,29 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                 int committed_now) {
         if (budget_close_started) return;                       // sequence already in progress
         if (budget_hook.close_token_ids.empty()) return;        // hook disabled
+
+        // Diagnostic trajectory log. Fires every AR step (gated on
+        // operator flag) regardless of soft_close_min_ratio, so we can
+        // record close-vs-chosen logit curves even when the dial is off.
+        // One-line CSV-ish shape for easy parsing in the probe harness:
+        //   [soft-trace] step=N committed=N chosen=N close0=N
+        //   logit_close=F logit_chosen=F diff=F prob_ratio=F
+        // The prob ratio is exp(diff) (the natural-log scale of the
+        // comparator), already useful for picking ratio_start/ratio_end
+        // for a sliding curve. Capped at exp(50) ≈ 5.2e21 to avoid
+        // scientific-notation noise on near-argmax steps.
+        if (budget_hook.debug_thinking_logits) {
+            const int32_t close0 = budget_hook.close_token_ids.front();
+            const int generated = committed_now - committed_at_entry;
+            const float diff = logits_row[close0] - logits_row[tok];
+            const float ratio = (diff > 50.0f) ? std::exp(50.0f) : std::exp(diff);
+            std::fprintf(stderr,
+                "[soft-trace] step=%d committed=%d chosen=%d close0=%d "
+                "logit_close=%.4f logit_chosen=%.4f diff=%.4f prob_ratio=%.6g\n",
+                generated, committed_now, tok, close0,
+                logits_row[close0], logits_row[tok], diff, ratio);
+        }
+
         if (budget_hook.soft_close_min_ratio <= 0.0f) return;   // dial disabled
 
         const int32_t close0 = budget_hook.close_token_ids.front();
@@ -1025,7 +1048,8 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         // disabled: only fetched when soft_close_min_ratio > 0.
         const bool need_logits =
             sampler_.needs_logit_processing() ||
-            budget_hook.soft_close_min_ratio > 0.0f;
+            budget_hook.soft_close_min_ratio > 0.0f ||
+            budget_hook.debug_thinking_logits;
         if (need_logits) {
             if (!prefill_last_logits_valid_) {
                 if (sampler_.needs_logit_processing()) return false;

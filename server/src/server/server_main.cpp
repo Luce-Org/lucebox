@@ -290,6 +290,12 @@ static void print_usage(const char * prog) {
         "                             10x of argmax (mild), 0.5=fire at half-prob\n"
         "                             (aggressive), 1.0=fire only when close is\n"
         "                             argmax. See docs/specs/thinking-budget.md §7.\n"
+        "  --debug-thinking-logits    Emit one stderr line per AR step inside the\n"
+        "                             thinking phase recording committed/chosen/\n"
+        "                             logit[close]/logit[chosen]/diff/prob_ratio.\n"
+        "                             Use to record close-vs-chosen logit\n"
+        "                             trajectories for fitting a sliding-ratio\n"
+        "                             curve. Stderr-heavy; operator dial only.\n"
         "\n"
         "KV cache:\n"
         "  --cache-type-k <type>  KV cache K type (f16,bf16,q4_0,q4_1,q5_0,q5_1,q8_0,tq3_0)\n"
@@ -353,6 +359,7 @@ int main(int argc, char ** argv) {
         bool effort_x_high           = false;
         bool effort_max              = false;
         bool soft_close_min_ratio    = false;
+        bool debug_thinking_logits   = false;
     } cli_set;
 
     // Track whether the operator passed the legacy --max-tokens alias.
@@ -482,6 +489,16 @@ int main(int argc, char ** argv) {
             }
             sconfig.soft_close_min_ratio = r;
             cli_set.soft_close_min_ratio = true;
+        } else if (std::strcmp(argv[i], "--debug-thinking-logits") == 0) {
+            // Diagnostic: emit one stderr line per AR step inside the
+            // thinking phase recording the close-vs-chosen logit gap.
+            // Used to fit a sliding ratio curve from real trajectory
+            // data rather than guessing. Adds zero GPU cost (the logits
+            // were already on CPU for sampling) but is gated as
+            // operator-only because the stderr volume is one line per
+            // thinking token. See qwen35_backend.cpp [soft-trace] log.
+            sconfig.debug_thinking_logits = true;
+            cli_set.debug_thinking_logits = true;
         } else if (std::strcmp(argv[i], "--prefill-compression") == 0 && i + 1 < argc) {
             const char * mode = argv[++i];
             if (std::strcmp(mode, "auto") == 0)
@@ -848,6 +865,10 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  soft_close_ratio= %.4f (%s)\n",
                  sconfig.soft_close_min_ratio,
                  cli_set.soft_close_min_ratio ? "from CLI" : "default (disabled)");
+    if (cli_set.debug_thinking_logits) {
+        std::fprintf(stderr, "[server] │  debug_thinking_logits = ON "
+                             "(per-step [soft-trace] stderr enabled)\n");
+    }
     std::fprintf(stderr, "[server] │  effort tiers    = low=%d (%s)\n",
                  sconfig.effort_tiers.low, src_of(cli_set.effort_low));
     std::fprintf(stderr, "[server] │                    medium=%d (%s)\n",

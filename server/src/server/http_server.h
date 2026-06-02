@@ -98,6 +98,15 @@ struct ServerConfig {
     // docs/experiments/soft-close-thinking-termination-plan.md.
     float       soft_close_min_ratio = 0.0f;
 
+    // Diagnostic: when true, the AR loop emits one stderr line per
+    // thinking-phase step with the close-vs-chosen logit values, so a
+    // sliding-ratio curve can be tuned from real trajectory data.
+    // Operator-only flag; per-request overrides not exposed because
+    // the stderr volume is heavy. Plumbed through to
+    // BudgetHook::debug_thinking_logits when the budget hook is wired
+    // (i.e. only inside thinking-active requests).
+    bool        debug_thinking_logits = false;
+
     // Phase-1 budgets per `reasoning.effort` tier (spec §4.2). Selected
     // by the request parser when `reasoning.effort` is present. Each
     // value is itself capped at `think_max_tokens` at startup.

@@ -92,6 +92,8 @@ KEY_REGISTRY: dict[str, tuple[tuple[str, str], Callable[[Any], Any]]] = {
     "dflash.fa_window": (("dflash", "fa_window"), int),
     "dflash.think_soft_close_min_ratio": (
         ("dflash", "think_soft_close_min_ratio"), float),
+    "dflash.debug_thinking_logits": (
+        ("dflash", "debug_thinking_logits"), bool),
 }
 
 
@@ -225,6 +227,7 @@ def _from_dict(raw: dict[str, Any]) -> Config:
         fa_window=int(df.get("fa_window", 0)),
         think_soft_close_min_ratio=float(
             df.get("think_soft_close_min_ratio", 0.0)),
+        debug_thinking_logits=bool(df.get("debug_thinking_logits", False)),
     )
 
     host_raw = raw.get("host", {})

@@ -194,6 +194,8 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
             "DFLASH_THINK_SOFT_CLOSE_MIN_RATIO",
             f"{cfg.dflash.think_soft_close_min_ratio:g}",
         ))
+    if cfg.dflash.debug_thinking_logits:
+        env.append(("DFLASH_DEBUG_THINKING_LOGITS", "1"))
 
     return DockerRunSpec(
         image=f"{cfg.image}:{cfg.variant}",

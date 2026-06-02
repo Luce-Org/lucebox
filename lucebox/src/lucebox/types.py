@@ -96,6 +96,13 @@ class DflashRuntime:
     # to the server via DFLASH_THINK_SOFT_CLOSE_MIN_RATIO →
     # --think-soft-close-min-ratio.
     think_soft_close_min_ratio: float = 0.0
+    # Diagnostic: when True, surface --debug-thinking-logits to the
+    # server CLI via DFLASH_DEBUG_THINKING_LOGITS=1, producing one
+    # stderr line per thinking AR step recording the close-vs-chosen
+    # logit gap. Used to fit a sliding-ratio curve from real trajectory
+    # data. Heavy stderr (one line per thinking token across all
+    # in-flight requests); leave off in production.
+    debug_thinking_logits: bool = False
 
 
 @dataclass(frozen=True, slots=True)

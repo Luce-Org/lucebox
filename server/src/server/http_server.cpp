@@ -1605,6 +1605,13 @@ void HttpServer::worker_loop() {
                         ? req.per_req_soft_close_min_ratio
                         : config_.soft_close_min_ratio;
             }
+
+            // Diagnostic trajectory log — operator dial only. Carried
+            // through the BudgetHook so the AR loop can emit one line
+            // per thinking step regardless of whether soft-close is
+            // armed. See model_backend.h BudgetHook::debug_thinking_logits.
+            gen_req.budget_hook.debug_thinking_logits =
+                config_.debug_thinking_logits;
         }
 
         // Tool call hint generation: pre-tokenize predictable structural tokens

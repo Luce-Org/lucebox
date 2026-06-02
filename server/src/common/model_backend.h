@@ -64,6 +64,13 @@ struct BudgetHook {
     // See docs/specs/thinking-budget.md §7 and
     // docs/experiments/soft-close-thinking-termination-plan.md.
     float                soft_close_min_ratio = 0.0f;
+    // Diagnostic: when true, emit one stderr line per AR step inside the
+    // thinking phase with (committed, chosen_tok, logit[close0],
+    // logit[chosen], diff). Used to record the close-vs-chosen logit
+    // trajectory across a full thinking run so a sliding-threshold curve
+    // can be designed from empirical data rather than guessed. Zero cost
+    // when off. See server_main.cpp --debug-thinking-logits.
+    bool                 debug_thinking_logits = false;
 };
 
 namespace soft_close {
