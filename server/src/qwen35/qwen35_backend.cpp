@@ -22,7 +22,9 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 namespace dflash::common {
 
@@ -83,12 +85,36 @@ static FILE * open_dflash_floor_log() {
     static constexpr const char * kPath = "/tmp/dflash_floor.log";
     static constexpr off_t kMaxBytes = 1024 * 1024;
 
+    int flags = O_WRONLY | O_CREAT | O_APPEND;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    int fd = ::open(kPath, flags, 0600);
+    if (fd < 0) return nullptr;
+
     struct stat st;
-    if (::stat(kPath, &st) == 0 && st.st_size > kMaxBytes) {
-        FILE * reset = std::fopen(kPath, "w");
-        if (reset) std::fclose(reset);
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        ::close(fd);
+        return nullptr;
     }
-    return std::fopen(kPath, "a");
+    if (st.st_size > kMaxBytes) {
+#ifdef O_NOFOLLOW
+        if (::ftruncate(fd, 0) != 0) {
+            ::close(fd);
+            return nullptr;
+        }
+#else
+        ::close(fd);
+        return nullptr;
+#endif
+    }
+
+    FILE * out = fdopen(fd, "a");
+    if (!out) ::close(fd);
+    return out;
 }
 }  // namespace
 
