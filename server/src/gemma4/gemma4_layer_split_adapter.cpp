@@ -146,7 +146,10 @@ bool Gemma4LayerSplitAdapter::init() {
 }
 
 void Gemma4LayerSplitAdapter::begin_request(const GenerateRequest & req) {
-    (void)req;
+    sampler_ = req.sampler;
+    if (req.do_sample && sampler_.seed != 0) {
+        sampler_rng_.seed(sampler_.seed);
+    }
 }
 
 void Gemma4LayerSplitAdapter::reset_request_state() {
@@ -154,12 +157,14 @@ void Gemma4LayerSplitAdapter::reset_request_state() {
         shard.cache.cur_pos = 0;
         shard.cache.last_tok = -1;
     }
+    prefill_last_logits_.clear();
 }
 
 bool Gemma4LayerSplitAdapter::run_forward(
         const std::vector<int32_t> & tokens,
         int base_pos,
-        int & last_tok) {
+        int & last_tok,
+        std::vector<float> * logits_out) {
     if (shards_.empty() || tokens.empty()) return false;
     const Gemma4Weights & ref = shards_.front().weights;
     const int hidden = ref.n_embd;
@@ -342,9 +347,9 @@ bool Gemma4LayerSplitAdapter::run_forward(
 
     std::vector<int32_t> argmax;
     Gemma4LayerSplitShard & last = shards_.back();
-    const bool ok = compute_gemma4_split_argmax(
+    const bool ok = compute_gemma4_split_projection(
         last.backend, last.weights, act_in,
-        n_tokens_total - 1, 1, argmax);
+        n_tokens_total - 1, 1, &argmax, logits_out);
     activation_buffer_free(orig);
     activation_pair_free(acts);
     if (!ok || argmax.empty()) return false;
@@ -359,7 +364,7 @@ bool Gemma4LayerSplitAdapter::run_forward(
 bool Gemma4LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
                                       int base_pos,
                                       int & last_tok) {
-    return run_forward(prompt, base_pos, last_tok);
+    return run_forward(prompt, base_pos, last_tok, &prefill_last_logits_);
 }
 
 bool Gemma4LayerSplitAdapter::decode_ar(
@@ -372,6 +377,13 @@ bool Gemma4LayerSplitAdapter::decode_ar(
     if (shards_.empty()) return false;
 
     const auto & w = shards_.front().weights;
+    const int vocab = w.n_vocab;
+    std::vector<float> logits_buf;
+    if (sampler_.needs_logit_processing()) {
+        if ((int)prefill_last_logits_.size() != vocab) return false;
+        last_tok = sample_logits(prefill_last_logits_.data(), vocab, sampler_,
+                                 out_tokens, sampler_rng_);
+    }
     out_tokens.push_back(last_tok);
     io.emit(last_tok);
     if (io.cancelled) {
@@ -387,7 +399,16 @@ bool Gemma4LayerSplitAdapter::decode_ar(
     for (int i = 1; i < n_gen; ++i) {
         std::vector<int32_t> one(1, last_tok);
         int next_tok = -1;
-        if (!run_forward(one, committed - 1, next_tok)) return false;
+        logits_buf.clear();
+        if (!run_forward(one, committed - 1, next_tok,
+                         sampler_.needs_logit_processing() ? &logits_buf : nullptr)) {
+            return false;
+        }
+        if (sampler_.needs_logit_processing()) {
+            if ((int)logits_buf.size() != vocab) return false;
+            next_tok = sample_logits(logits_buf.data(), vocab, sampler_,
+                                     out_tokens, sampler_rng_);
+        }
         last_tok = next_tok;
         out_tokens.push_back(last_tok);
         io.emit(last_tok);
@@ -461,6 +482,7 @@ bool Gemma4LayerSplitAdapter::snapshot_save(int slot) {
     }
     snap.cur_pos = snap_pos;
     snap.last_tok = shards_.front().cache.last_tok;
+    snap.prefill_last_logits = prefill_last_logits_;
     return true;
 }
 
@@ -472,6 +494,7 @@ void Gemma4LayerSplitAdapter::snapshot_free(int slot) {
     }
     snap.cur_pos = 0;
     snap.last_tok = -1;
+    snap.prefill_last_logits.clear();
     if (snap.shards.size() != shards_.size()) snap.shards.resize(shards_.size());
 }
 
@@ -482,6 +505,7 @@ bool Gemma4LayerSplitAdapter::snapshot_used(int slot) const {
     }
     const auto & snap = snapshots_[(size_t)slot];
     if (snap.cur_pos <= 0 || snap.shards.size() != shards_.size()) return false;
+    if (snap.prefill_last_logits.empty()) return false;
     for (const auto & ss : snap.shards) {
         if (!ss.ctx) return false;
     }
@@ -521,6 +545,7 @@ bool Gemma4LayerSplitAdapter::snapshot_restore(int slot) {
         shards_[i].cache.cur_pos = snap.cur_pos;
         shards_[i].cache.last_tok = snap.last_tok;
     }
+    prefill_last_logits_ = snap.prefill_last_logits;
     return true;
 }
 

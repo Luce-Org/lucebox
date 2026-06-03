@@ -32,6 +32,18 @@ bool compute_target_split_argmax(
         int vocab,
         std::vector<int32_t> & argmax_out);
 
+bool compute_target_split_projection(
+        StepGraph & sg,
+        const TargetWeights & w,
+        ggml_backend_t backend,
+        ggml_tensor * act,
+        int token_offset,
+        int n_tokens,
+        int hidden,
+        int vocab,
+        std::vector<int32_t> * argmax_out,
+        std::vector<float> * logits_out);
+
 // Run a full forward pass through all shards, writing K/V into each shard's
 // cache.  Returns the argmax of the last token in `last_tok`.
 // Optionally captures features into `feature_ring` / remote draft.
