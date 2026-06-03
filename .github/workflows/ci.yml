@@ -10,8 +10,8 @@ jobs:
     name: uv workspace (lock + sync + import smoke)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
         with:
           version: "0.11.x"
       - name: Verify uv lockfile and workspace sync
@@ -19,11 +19,40 @@ jobs:
         # full sync and builds megakernel against torch.
         run: bash scripts/check_uv_workspace.sh
 
+      - name: Verify bundled model cards match share/ (drift guard)
+        run: bash scripts/check_card_bundle_drift.sh
+
+      - name: Lint Python surfaces touched by lucebox tooling
+        run: uv run --frozen --extra dev ruff check .
+
+      - name: Typecheck lucebox CLI
+        run: uv run --frozen --extra dev python -m mypy --package lucebox
+
+      - name: Install shellcheck (for bash test runner)
+        # ubuntu-latest typically ships shellcheck pre-installed, but pin
+        # the dependency explicitly so the bash test runner can always rely
+        # on `command -v shellcheck` succeeding.
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+          shellcheck --version | head -3
+
+      - name: Smoke-test lucebox.sh wrapper
+        # Catches `set -u` regressions, syntax errors, and stale dispatch
+        # handlers in the host-side wrapper + the in-container entrypoint.
+        # Runs shellcheck --severity=error across every shipped .sh file,
+        # exercises every subcommand dispatch under `set -u`, and drives the
+        # entrypoint's draft-resolution block through every family-glob
+        # branch — all on the bare runner without docker/nvidia/systemd.
+        run: bash scripts/test_lucebox_sh.sh
+
   build:
     name: Build (cmake + uv sync --extra megakernel)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           submodules: recursive
           token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
@@ -39,7 +68,7 @@ jobs:
           sub-packages: '["nvcc", "cudart-dev", "thrust", "driver-dev"]'
           non-cuda-sub-packages: '["libcublas-dev"]'
 
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
         with:
           version: "0.11.x"
           # uv reads .python-version (3.12, matching the previous CI) and downloads the matching

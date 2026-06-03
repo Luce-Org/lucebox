@@ -1,0 +1,32 @@
+# Local venv and Python caches — uv rebuilds inside the image.
+.venv/
+**/__pycache__/
+**/*.pyc
+
+# Build artefacts.
+**/build/
+**/build-*/
+dflash/build/
+
+# Model weights — bind-mount at runtime instead of baking into the image.
+dflash/models/
+**/*.gguf
+**/*.safetensors
+
+# Git metadata. Submodule contents are kept; .git files inside the worktree
+# are not needed at build time.
+.git/
+**/.git
+**/.gitignore.local
+
+# Local agent / IDE state.
+.claude/
+.idea/
+.vscode/
+
+# Misc large or volatile.
+*.log
+*.tmp
+*.swp
+**/*.bin
+**/*.npy

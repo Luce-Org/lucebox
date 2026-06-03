@@ -1,0 +1,51 @@
+name: Release luce-bench
+
+# Builds and publishes the luce-bench package to PyPI when a tag
+# matching `luce-bench-v*` is pushed (e.g. `luce-bench-v0.2.7`). The
+# release version is derived from the tag itself via hatch-vcs (see
+# `luce-bench/pyproject.toml`), so there's no version-in-file to keep
+# in sync.
+#
+# Uses PyPI trusted publishing (OIDC): set up the publisher in the
+# PyPI project settings as `easel/lucebox-hub` repo + this workflow
+# file + the `pypi` environment. No long-lived API token needed.
+
+on:
+  push:
+    tags:
+      - 'luce-bench-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/luce-bench
+    permissions:
+      # Job-level `permissions` completely replaces the workflow-level
+      # block, so `contents: read` has to be repeated here for
+      # actions/checkout to be able to read the repo.
+      contents: read
+      id-token: write  # trusted publishing
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: latest
+
+      - name: Build wheel + sdist
+        working-directory: luce-bench
+        run: |
+          uv build --out-dir dist
+
+      - name: Publish to PyPI (trusted publisher)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: luce-bench/dist

@@ -1,0 +1,177 @@
+name: Docker prebuilds
+
+# Builds the cuda12 lucebox-hub Docker image defined in docker-bake.hcl
+# and pushes it to GHCR. The bake file is the source of
+# truth for arch matrices and CUDA pinning; this workflow only handles
+# fetching submodules, freeing runner disk, signing in to the registry, and
+# wiring the cache.
+
+on:
+  # Build + push to GHCR when a GitHub Release is published. The release tag
+  # becomes one of the image tags via docker/metadata-action's `type=ref,
+  # event=tag` + `type=semver` rules below.
+  release:
+    types: [published]
+  # Build-only CI guard on PRs that touch the docker surface. We never push
+  # from a PR — even if we wanted to, GITHUB_TOKEN on PRs from forks lacks
+  # `packages:write`. The point is to catch Dockerfile / bake-file / arch-
+  # list regressions before they land on main.
+  pull_request:
+    paths:
+      - Dockerfile
+      - docker-bake.hcl
+      - .dockerignore
+      - .github/workflows/docker.yml
+      - server/CMakeLists.txt
+      - server/src/**
+      - server/test/**
+      - server/include/**
+      - server/scripts/**
+      - server/deps/**
+      - server/pyproject.toml
+      - pyproject.toml
+      - uv.lock
+      - lucebox.sh
+      - lucebox/**
+  # Manual trigger for one-off rebuilds or pre-release smoke tests. The
+  # `push` input controls whether the resulting images land in GHCR or only
+  # populate the buildx cache.
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push images to GHCR after build"
+        type: boolean
+        default: false
+
+# Single in-flight build per ref. New pushes cancel the previous run so we
+# don't queue 30-min compiles.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/lucebox-hub
+
+jobs:
+  build:
+    name: ${{ matrix.variant }}
+    # ubuntu-latest = 4 CPU / 16 GB RAM / 14 GB free disk on the GitHub-
+    # hosted plan. The disk-free step at the top of the job claws back
+    # ~30 GB, which is enough to land a 14 GB image with build cache.
+    # CPU is the harder constraint: the fat-binary arch list can take hours
+    # on hosted runners. If you outgrow this:
+    #   • Larger GitHub-hosted runners (`ubuntu-latest-8-cores`, paid)
+    #     halve wall time.
+    #   • A self-hosted runner with the host's nvcc avoids the
+    #     containerised CUDA toolkit pull entirely.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cuda12]
+    steps:
+      - name: Free runner disk space
+        # The default ubuntu-latest image keeps ~25 GB of preinstalled
+        # tooling (Android SDK, .NET, Haskell, ghc, etc.) we don't need.
+        # Pinned action; check upstream releases before bumping.
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false   # slow; preinstalled apt packages we don't need
+          swap-storage: true
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Submodule contents are needed by the cmake build (llama.cpp ggml
+          # subtree, mit-han-lab Block-Sparse-Attention). The Dockerfile
+          # asserts they're present before running cmake.
+          submodules: recursive
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        # Skip on PR runs: we never push from a PR and the token from a fork
+        # PR can't `packages:write` anyway.
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Capture build identity
+        id: identity
+        # /props.build identity baked into the image. GIT_SHA is the full
+        # commit sha (matches `${{ github.sha }}` — short-form is fine, we
+        # use the full 40-char form for "exactly which weights are running"
+        # forensics). BUILD_TIME is ISO 8601 UTC. IMAGE_TAG is filled in
+        # after the metadata-action step below picks the headline tag.
+        run: |
+          echo "git_sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Derive image metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Suffix every tag with the variant so future CUDA stacks can
+          # coexist under the same image name. Examples (using cuda12):
+          #   ghcr.io/<owner>/lucebox-hub:cuda12              (moving — main/dispatch/release)
+          #   ghcr.io/<owner>/lucebox-hub:0.3.0-cuda12        (pinned — from `lucebox-v0.3.0` tag)
+          #   ghcr.io/<owner>/lucebox-hub:feat-x-cuda12       (per branch)
+          #   ghcr.io/<owner>/lucebox-hub:sha-abc1234-cuda12  (per commit)
+          flavor: |
+            latest=false
+            suffix=-${{ matrix.variant }},onlatest=true
+          tags: |
+            # Moving variant tag — emitted on main, release, and any
+            # workflow_dispatch with push:true. The `enable=` gate keeps
+            # branch + PR builds from clobbering the published `:cuda12`.
+            type=raw,value=${{ matrix.variant }},suffix=,priority=1000,enable=${{ github.event_name == 'release' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') || (github.event_name == 'workflow_dispatch' && inputs.push) }}
+            # Pinned version tag — extracts the version from a
+            # `lucebox-v<X.Y.Z>` git tag push, mirroring the hatch-vcs
+            # scheme used by luce-bench and lucebox. Yields e.g.
+            # `0.3.0-cuda12` when `lucebox-v0.3.0` is pushed.
+            type=match,pattern=lucebox-v(\d+\.\d+\.\d+),group=1
+            type=ref,event=branch
+            type=ref,event=tag
+            type=ref,event=pr
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push
+        uses: docker/bake-action@4a9a8d494466d37134e2bfca2d3a8de8fb2681ad # v5
+        env:
+          # Wire identity into docker-bake.hcl's GIT_SHA / IMAGE_TAG /
+          # BUILD_TIME variables. IMAGE_TAG is `${{ steps.meta.outputs.
+          # version }}` — the headline tag metadata-action picked
+          # (e.g. `cuda12` on main, `0.3.0-cuda12` on a release tag).
+          # The image's /props.build will surface these so a curl can
+          # pin down "what binary is this exactly" without inspecting
+          # the registry.
+          GIT_SHA: ${{ steps.identity.outputs.git_sha }}
+          IMAGE_TAG: ${{ steps.meta.outputs.version }}
+          BUILD_TIME: ${{ steps.identity.outputs.build_time }}
+        with:
+          files: |
+            docker-bake.hcl
+            ${{ steps.meta.outputs.bake-file }}
+          targets: ${{ matrix.variant }}
+          push: ${{ github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.push) }}
+          # gha cache stores layer blobs in the workflow's Actions cache,
+          # scoped by variant so future CUDA stacks don't evict each other.
+          # mode=max also caches multi-stage intermediate layers (the
+          # builder stage with the 30-min nvcc compile), which is the whole
+          # point of doing this.
+          set: |
+            ${{ matrix.variant }}.cache-from=type=gha,scope=${{ matrix.variant }}
+            ${{ matrix.variant }}.cache-to=type=gha,scope=${{ matrix.variant }},mode=max
