@@ -79,3 +79,22 @@ fix-plan.md
 # Harness test artifacts
 .harness-work/
 health
+
+# lucebox host-side generated config + benchmark output
+.lucebox/
+models/.lucebox/
+
+# Claude Code session state (worktrees, agent scratchpads)
+.claude/
+
+# Benchmark snapshots live in the standalone luce-bench-baselines repo
+# (https://github.com/easel/luce-bench-baselines) — not in lucebox-hub.
+dflash/docs/tuning-snapshots/
+
+# luce-bench --sweep default output dir (per-host bench runs); reference
+# baselines live in github.com/easel/luce-bench-baselines.
+luce-bench/snapshots/
+
+# Workdir editor backup suffixes
+*.git-head
+*.pre-pflash-rename
