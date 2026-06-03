@@ -66,13 +66,27 @@ void free_drafter_weights(DrafterContext & ctx);
 // Score importance per token via Liu Q-hook tail attention, then chunk-top-K
 // span merge. Returns surviving token IDs (drafter vocab).
 //
-//   ids          input token IDs of length S
-//   keep_ratio   fraction of `chunk_size`-token chunks to keep
-//   chunk_size   span granularity (default 32)
-//   n_lookahead  trailing Q tokens used for tail attention (default 8)
-//   pool_kernel  AvgPool kernel for score smoothing (default 13)
+//   ids                    input token IDs of length S
+//   keep_ratio             fraction of `chunk_size`-token chunks to keep
+//   chunk_size             span granularity (default 32)
+//   n_lookahead            trailing Q tokens used for tail attention (default 8)
+//   pool_kernel            AvgPool kernel for score smoothing (default 13)
+//   use_transitive_override  -1 = read from env (default, no behaviour change)
+//                             0 = cascade off (agentic path)
+//                             1 = cascade on  (retrieval path)
 //
 // On failure returns empty vector + sets last_error.
+std::vector<int32_t> drafter_score_and_compress(
+    DrafterContext & ctx,
+    const std::vector<int32_t> & ids,
+    float  keep_ratio,
+    int    chunk_size,
+    int    n_lookahead,
+    int    pool_kernel,
+    int    use_transitive_override);
+
+// Backward-compatible 6-arg overload — ABI-stable wrapper, defined in qwen3_drafter.cpp.
+// Old callers compiled against the 6-arg signature continue to link without recompile.
 std::vector<int32_t> drafter_score_and_compress(
     DrafterContext & ctx,
     const std::vector<int32_t> & ids,
