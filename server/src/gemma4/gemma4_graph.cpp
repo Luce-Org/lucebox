@@ -515,14 +515,13 @@ bool build_gemma4_layer_step(
     return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
 }
 
-bool compute_gemma4_split_projection(
+bool compute_gemma4_split_argmax(
     ggml_backend_t          backend,
     const Gemma4Weights &   w,
     ggml_tensor *           act,
     int                     token_offset,
     int                     n_tokens,
-    std::vector<int32_t> *  out_argmax,
-    std::vector<float> *    out_logits) {
+    std::vector<int32_t> &  out_argmax) {
     ggml_init_params ip{};
     ip.mem_size = ggml_tensor_overhead() * 64 + ggml_graph_overhead() + 1024 * 1024;
     ip.no_alloc = true;
@@ -540,17 +539,9 @@ bool compute_gemma4_split_projection(
         cur = ggml_tanh(ctx, cur);
         cur = ggml_scale(ctx, cur, w.final_logit_softcap);
     }
-    ggml_tensor * logits = cur;
-    ggml_tensor * argmax = nullptr;
-    if (out_logits) {
-        ggml_set_output(logits);
-        ggml_build_forward_expand(gf, logits);
-    }
-    if (out_argmax) {
-        argmax = ggml_argmax(ctx, logits);
-        ggml_set_output(argmax);
-        ggml_build_forward_expand(gf, argmax);
-    }
+    cur = ggml_argmax(ctx, cur);
+    ggml_set_output(cur);
+    ggml_build_forward_expand(gf, cur);
 
     ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     if (!alloc || !ggml_gallocr_alloc_graph(alloc, gf)) {
@@ -563,30 +554,12 @@ bool compute_gemma4_split_projection(
         ggml_free(ctx);
         return false;
     }
-    if (out_argmax) {
-        out_argmax->resize((size_t)n_tokens);
-        ggml_backend_tensor_get(argmax, out_argmax->data(), 0,
-                                sizeof(int32_t) * (size_t)n_tokens);
-    }
-    if (out_logits) {
-        out_logits->resize((size_t)w.n_vocab * (size_t)n_tokens);
-        ggml_backend_tensor_get(logits, out_logits->data(), 0,
-                                sizeof(float) * (size_t)w.n_vocab * (size_t)n_tokens);
-    }
+    out_argmax.resize((size_t)n_tokens);
+    ggml_backend_tensor_get(cur, out_argmax.data(), 0,
+                            sizeof(int32_t) * (size_t)n_tokens);
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
     return true;
-}
-
-bool compute_gemma4_split_argmax(
-    ggml_backend_t          backend,
-    const Gemma4Weights &   w,
-    ggml_tensor *           act,
-    int                     token_offset,
-    int                     n_tokens,
-    std::vector<int32_t> &  out_argmax) {
-    return compute_gemma4_split_projection(
-        backend, w, act, token_offset, n_tokens, &out_argmax, nullptr);
 }
 
 bool gemma4_step(

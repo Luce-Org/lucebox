@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -48,38 +49,94 @@ struct DaemonIO {
 
 // ─── Generate request/result ────────────────────────────────────────────
 
-// Thinking-budget force-close hook. Mirrors antirez/ds4 ds4_eval.c's
-// hard_limit_reply_budget semantics: when the budget remaining (n_gen
-// minus tokens committed so far) falls to hard_limit_remaining, the
-// next sampled tokens get overridden with close_token_ids in order,
-// giving the model the remaining budget to write a visible answer
-// after the injected close-tag sequence.
-//
-// Single vs multi-token close:
-//   Qwen3.6: </think> is one added_token (id 248069). close_token_ids
-//            has size 1. One override + budget_close_injected=true.
-//   DeepSeek/laguna: </think> tokenizes to 3 ordinary tokens
-//            ([1718, 37947, 32] for DS-V3). close_token_ids has
-//            size 3. Three consecutive overrides, then resume.
-//
-// This is "Level 2" of our thinking-budget migration: in-process
-// mid-stream force-close, KV-continuous. Beats Level 1's phase-2
-// reprompt because the model never sees a fresh prefill — its KV
-// state continues naturally after the injected close.
-//
-// Current implementation: AR-decode only. When budget_hook is set,
-// backends MAY route generation through their AR path (skipping spec
-// decode) — the perf trade-off is acceptable since this only kicks in
-// for thinking-enabled requests. Spec-decode integration is a follow-up.
+// Thinking-budget force-close hook; see docs/specs/thinking-budget.md.
+// When (n_gen - committed) == hard_limit_remaining, overrides sampled
+// tokens with close_token_ids (AR path only). Empty = disabled.
 struct BudgetHook {
-    // Multi-token close sequence injected when `(n_gen - committed)`
-    // drops to `hard_limit_remaining`. For Qwen3.x this is the
-    // canonical "Considering the limited time..." summarize-and-stop
-    // lead-in (tokenized at server startup); for non-qwen arches it's
-    // a single close-tag token. Empty = hook disabled.
+    // Inject sequence written when the hard cap fires OR when soft-close
+    // fires. This is the verbatim tokenization of the model card's
+    // `thinking_terminator_hint` (e.g. for Qwen3.6 the lead-in
+    // "Considering the limited time by the user, ... </think>\n\n").
+    // May be many tokens long; the first element is what the AR loop
+    // writes on the firing step, with the rest streamed out on
+    // subsequent steps. Empty = disabled.
     std::vector<int32_t> close_token_ids;
+    // Short PROBE sequence used by the soft-close logit-ratio peek.
+    // Conceptually this is the tokenization of just the close MARKER
+    // (e.g. `</think>` — a single token id 248069 on Qwen3.6) rather
+    // than the full inject directive above. Splitting probe-vs-inject
+    // matters because the inject sequence for trained-hint models
+    // starts with a content token like "Considering" whose logit is
+    // 19-35 nats below the chosen token at every step, masking the
+    // close-marker's true probability and preventing soft-close from
+    // ever firing.
+    // When empty, the soft-close peek falls back to
+    // `close_token_ids.front()` (legacy behavior — kept so models that
+    // haven't been updated keep working identically to before the split).
+    std::vector<int32_t> soft_close_probe_ids;
     int                  hard_limit_remaining = 0;
+    // Soft-close (Level 2 voluntary). When > 0, at each AR step the
+    // loop compares the probe-token logit against the chosen-token
+    // logit; if `prob[probe[0]] / prob[chosen] >= soft_close_min_ratio`
+    // (equivalently `logit[probe[0]] - logit[chosen] >= log(min_ratio)`),
+    // the inject sequence (close_token_ids) is written BEFORE the hard
+    // limit is reached. 0.0 = disabled (default); 1.0 = fire only when
+    // the probe token is already the most-likely token; lower values =
+    // fire more aggressively. See docs/specs/thinking-budget.md §7 and
+    // docs/experiments/soft-close-thinking-termination-plan.md.
+    float                soft_close_min_ratio = 0.0f;
+    // Minimum thinking tokens before soft-close is allowed to fire.
+    // Soft-close peek runs on every AR step but the fire decision is
+    // gated by this floor — protects against premature termination on
+    // prompts where the close-marker logit briefly spikes mid-thought.
+    // 0 = floor disabled (default). Per empirical trajectory data on
+    // qwen3.6-27b (5 diverse prompts), </think> only becomes
+    // argmax-competitive at 66-94% of natural reasoning length — so a
+    // floor in the 64-256 range is the typical operating point.
+    int                  soft_close_min_tokens = 0;
+    // Diagnostic: when true, emit one stderr line per AR step inside the
+    // thinking phase with (committed, chosen_tok, logit[probe0],
+    // logit[chosen], diff). Used to record the close-vs-chosen logit
+    // trajectory across a full thinking run so a sliding-threshold curve
+    // can be designed from empirical data rather than guessed. Zero cost
+    // when off. See server_main.cpp --debug-thinking-logits.
+    bool                 debug_thinking_logits = false;
+
+    // Probe token id used by the soft-close peek. Returns the first
+    // element of soft_close_probe_ids when set, otherwise falls back to
+    // close_token_ids.front() (legacy behavior). Callers must guard
+    // against an empty hook before calling this.
+    int32_t soft_close_probe_token() const {
+        if (!soft_close_probe_ids.empty()) return soft_close_probe_ids.front();
+        return close_token_ids.front();
+    }
 };
+
+namespace soft_close {
+
+// Returns true when the soft-close comparator would fire on this AR
+// step. Side-effect free; safe to call from unit tests.
+//
+// Fast path: returns false in O(1) when min_ratio <= 0 (the disabled
+// default). When the model has already chosen the close token on its
+// own, also returns false — the natural-close path handles that.
+//
+// Math: `prob[i]/prob[j] = exp(logit[i] - logit[j])`, so
+// `prob[close]/prob[chosen] >= min_ratio` ⟺
+// `logit[close] - logit[chosen] >= log(min_ratio)`. We compare on
+// logits to avoid `exp()` and full-softmax cost; this is numerically
+// stable in fp32 for typical LLM logit ranges (~±20).
+inline bool should_fire(const float * logits,
+                        int32_t       chosen_tok,
+                        int32_t       close0_tok,
+                        float         min_ratio) {
+    if (min_ratio <= 0.0f)          return false;
+    if (chosen_tok == close0_tok)    return false;
+    const float log_ratio = std::log(min_ratio);
+    return (logits[close0_tok] - logits[chosen_tok]) >= log_ratio;
+}
+
+}  // namespace soft_close
 
 struct GenerateRequest {
     std::vector<int32_t>       prompt;
@@ -102,6 +159,10 @@ struct GenerateRequest {
     const std::vector<int32_t> * hint_tokens = nullptr;
     // Optional thinking-budget hook — see BudgetHook docs above.
     BudgetHook                 budget_hook;
+    // Per-request override for target spec-decode verify fa_window. Set by
+    // http_server when pflash compresses, so verify sees the entire compressed
+    // prompt (not just the last cfg_.fa_window positions). Zero = no override.
+    int                        fa_window_override = 0;
     // Common retry knob. Upper layers set this after a speculative decode
     // path returns success but emits no tokens, so each backend can route the
     // retry through its existing AR path without copying retry policy.
@@ -122,6 +183,13 @@ struct GenerateResult {
     // stream and grepping for "</think>" cannot distinguish the two
     // (the injected close decodes identically).
     bool                       budget_forced_close = false;
+    // True when the soft-close path (logit-ratio peek) injected the
+    // </think> close sequence in this generation. Mutually exclusive
+    // with budget_forced_close: when both could fire on the same step,
+    // soft wins and budget_forced_close stays false. The server uses
+    // this to attribute close_kind="soft" (vs "hard"). See
+    // docs/specs/thinking-budget.md §7.
+    bool                       soft_forced_close = false;
     // True iff the AR decode loop's post-close watchdog detected an n-gram
     // repetition loop and broke out early. Caller surfaces this so clients
     // can mark the answer as unreliable rather than treating the
@@ -213,6 +281,8 @@ struct ModelBackend {
         retry.spec_decode_ran = first.spec_decode_ran || retry.spec_decode_ran;
         retry.budget_forced_close =
             first.budget_forced_close || retry.budget_forced_close;
+        retry.soft_forced_close =
+            first.soft_forced_close || retry.soft_forced_close;
         retry.degenerate_decode_close =
             first.degenerate_decode_close || retry.degenerate_decode_close;
         return retry;
@@ -251,6 +321,10 @@ struct ModelBackend {
         std::string          drafter_path;    // GGUF path (for lazy-load)
         int                  drafter_gpu = 0;  // backend-local GPU for PFlash drafter
         bool                 skip_park = false; // true on >=32GB GPUs
+        // Per-request transitive-cascade override (-1 = use env default).
+        // 0 = off (agentic path: suppress cascade to avoid anchor bloat).
+        // 1 = on  (retrieval path: full expansion, same as today).
+        int                  use_transitive = -1;
         DraftResidencyAction residency_action = DraftResidencyAction::KeepLoaded;
     };
 
