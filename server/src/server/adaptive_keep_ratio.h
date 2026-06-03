@@ -9,9 +9,10 @@
 namespace dflash::common {
 
 struct AdaptiveKeepRatioState {
-    float ema        = 0.0f;
-    float last_keep  = 0.10f;
-    int   turn_count = 0;
+    float ema              = 0.0f;
+    float last_keep        = 0.10f;
+    int   turn_count       = 0;
+    bool  recover_full_next = false;  // set by compression_failed guard; cleared after one turn
 };
 
 constexpr float kBanditEmaAlpha   = 0.7f;
@@ -88,6 +89,37 @@ public:
         if (it == map_.end()) return 0;
         lru_.splice(lru_.begin(), lru_, it->second.lru_it);
         return it->second.state.turn_count;
+    }
+
+    // Schedule full-keep recovery for the next turn of this session.
+    // Called by the compression_failed guard when an agentic compressed turn
+    // produced an empty or degenerate response.  Creates the session entry if
+    // it does not exist yet (guard may fire before any bandit update).
+    void set_recover_full_next(const std::string& session_id) {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = map_.find(session_id);
+        if (it == map_.end()) {
+            evict_if_full_locked();
+            lru_.push_front(session_id);
+            AdaptiveKeepRatioState s{};
+            s.recover_full_next = true;
+            map_.emplace(session_id, Entry{s, lru_.begin()});
+        } else {
+            it->second.state.recover_full_next = true;
+            lru_.splice(lru_.begin(), lru_, it->second.lru_it);
+        }
+    }
+
+    // Returns true and clears the flag if recovery was scheduled; false otherwise.
+    // One-shot: the flag is consumed on read so the next turn runs normally.
+    bool consume_recover_full_next(const std::string& session_id) {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = map_.find(session_id);
+        if (it == map_.end()) return false;
+        lru_.splice(lru_.begin(), lru_, it->second.lru_it);
+        if (!it->second.state.recover_full_next) return false;
+        it->second.state.recover_full_next = false;
+        return true;
     }
 
     size_t size() const {
