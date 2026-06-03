@@ -262,6 +262,49 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
         }
     };
 
+    // Soft-close: fires when close-token logit is within soft_close_min_ratio
+    // of the chosen-token logit, injecting the close sequence early rather
+    // than waiting for the hard think_max boundary. Mirrors qwen35's
+    // maybe_soft_close lambda — same BudgetHook fields, same soft_close::
+    // should_fire predicate from model_backend.h.
+    auto maybe_soft_close = [&](int32_t & tok,
+                                const float * logits_row,
+                                int committed_now) {
+        if (budget_close_started) return;
+        if (budget_hook.close_token_ids.empty()) return;
+        if (budget_hook.debug_thinking_logits) {
+            const int32_t close0 = budget_hook.close_token_ids.front();
+            const int generated = committed_now - committed_at_entry;
+            const float diff = logits_row[close0] - logits_row[tok];
+            const float ratio = (diff > 50.0f) ? std::exp(50.0f) : std::exp(diff);
+            std::fprintf(stderr,
+                "[soft-trace] gemma4 step=%d committed=%d chosen=%d close0=%d "
+                "logit_close=%.4f logit_chosen=%.4f diff=%.4f prob_ratio=%.6g\n",
+                generated, committed_now, tok, close0,
+                logits_row[close0], logits_row[tok], diff, ratio);
+        }
+        if (budget_hook.soft_close_min_ratio <= 0.0f) return;
+        const int32_t close0 = budget_hook.close_token_ids.front();
+        if (!soft_close::should_fire(logits_row, tok, close0,
+                                     budget_hook.soft_close_min_ratio)) return;
+        const int generated = committed_now - committed_at_entry;
+        const int remaining = n_gen - generated;
+        std::fprintf(stderr,
+            "[budget-hook] gemma4 soft-close at committed=%d/%d "
+            "(remaining=%d, min_ratio=%.4f, logit[close0]=%.3f "
+            "logit[chosen]=%.3f diff=%.3f): overriding token %d with "
+            "close[0]=%d (seq len %zu)\n",
+            committed_now, n_gen, remaining,
+            budget_hook.soft_close_min_ratio,
+            logits_row[close0], logits_row[tok],
+            logits_row[close0] - logits_row[tok],
+            tok, close0, budget_hook.close_token_ids.size());
+        tok = close0;
+        budget_close_started = true;
+        close_inject_pos = 1;
+        if (forced_close_out) *forced_close_out = true;
+    };
+
     for (int i = 0; i < n_gen; ++i) {
         // Seed for this iteration's embed step:
         //  - Normal case: previous iteration just pushed a sampled
@@ -302,6 +345,7 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
                 if (logits[j] > best) { best = logits[j]; next = j; }
             }
         }
+        maybe_soft_close(next, logits.data(), committed);
         maybe_force_close(next, committed);
 
         out_tokens.push_back(next);

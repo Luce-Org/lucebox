@@ -23,15 +23,19 @@
 
 #include "gguf.h"
 
+#include <nlohmann/json.hpp>
+
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
 
 using namespace dflash::common;
+using nlohmann::json;
 
 // Global server pointer for signal handling.
 static HttpServer * g_server = nullptr;
@@ -40,6 +44,87 @@ static void signal_handler(int sig) {
     (void)sig;
     if (g_server) {
         g_server->request_stop();
+    }
+}
+
+// Render a GgufMetadata as the JSON object surfaced under
+// /props.model.target / /props.model.draft (schema 3+). Header keys that
+// the file didn't carry come through as JSON null so consumers can tell
+// "no key in GGUF" from "0" — important for context_length / vocab_size
+// where 0 is implausible but missing is common on hand-edited drafters.
+static json gguf_metadata_to_json(const GgufMetadata & m) {
+    auto str_or_null = [](const std::string & s) -> json {
+        return s.empty() ? json(nullptr) : json(s);
+    };
+    auto i32_or_null = [](int32_t v) -> json {
+        return v < 0 ? json(nullptr) : json(v);
+    };
+    json gguf = {
+        {"general.architecture",         str_or_null(m.general_architecture)},
+        {"general.name",                 str_or_null(m.general_name)},
+        {"general.file_type",            i32_or_null(m.file_type)},
+        {"general.file_type_name",       str_or_null(m.file_type_name)},
+        {"general.quantization_version", i32_or_null(m.quantization_version)},
+        {"block_count",                  i32_or_null(m.block_count)},
+        {"embedding_length",             i32_or_null(m.embedding_length)},
+        {"context_length",               i32_or_null(m.context_length)},
+        {"vocab_size",                   i32_or_null(m.vocab_size)},
+    };
+    return {
+        {"path",       m.path},
+        {"size_bytes", m.size_bytes < 0 ? json(nullptr) : json(m.size_bytes)},
+        {"sha256",     str_or_null(m.sha256)},
+        {"gguf",       gguf},
+    };
+}
+
+// Read /opt/lucebox-hub/IMAGE_INFO (three lines: git_sha, image_tag,
+// build_time) into a JSON object surfaced under /props.build. Returns
+// JSON null when the file is missing or unreadable — the normal case
+// for bare-metal dev builds. Path override via $DFLASH_IMAGE_INFO_PATH
+// (set by tests to point at a fixture).
+static json read_image_info() {
+    const char * env_path = std::getenv("DFLASH_IMAGE_INFO_PATH");
+    const std::string path = (env_path && *env_path)
+        ? std::string(env_path)
+        : std::string("/opt/lucebox-hub/IMAGE_INFO");
+    std::ifstream f(path);
+    if (!f) return nullptr;
+    std::string git_sha, image_tag, build_time;
+    std::getline(f, git_sha);
+    std::getline(f, image_tag);
+    std::getline(f, build_time);
+    // If all three are empty (file existed but was blank), treat as missing
+    // so /props doesn't carry a useless `{git_sha: "", ...}` blob.
+    if (git_sha.empty() && image_tag.empty() && build_time.empty()) {
+        return nullptr;
+    }
+    json out = json::object();
+    if (!git_sha.empty())    out["git_sha"]    = git_sha;
+    if (!image_tag.empty())  out["image_tag"]  = image_tag;
+    if (!build_time.empty()) out["build_time"] = build_time;
+    return out;
+}
+
+// Read /opt/lucebox-hub/HOST_INFO (JSON written by server/scripts/
+// entrypoint.sh from the LUCEBOX_HOST_* env vars the host wrapper
+// exports) into a JSON object surfaced verbatim under /props.host.
+// Returns JSON null on missing file or parse error so /props.host
+// becomes literal null rather than crashing the handler. Path override
+// via $DFLASH_HOST_INFO_PATH for unit tests.
+static json read_host_info() {
+    const char * env_path = std::getenv("DFLASH_HOST_INFO_PATH");
+    const std::string path = (env_path && *env_path)
+        ? std::string(env_path)
+        : std::string("/opt/lucebox-hub/HOST_INFO");
+    std::ifstream f(path);
+    if (!f) return nullptr;
+    try {
+        json out = json::parse(f);
+        if (!out.is_object()) return nullptr;
+        return out;
+    } catch (const json::parse_error &) {
+        return nullptr;
     }
 }
 
@@ -196,6 +281,29 @@ static void print_usage(const char * prog) {
         "  --reasoning-effort-max <N>      Phase-1 budget when request asks effort=max\n"
         "                                  Defaults come from share/model_cards/<name>.json;\n"
         "                                  see docs/specs/thinking-budget.md §3.\n"
+        "  --think-soft-close-min-ratio <F>\n"
+        "                             Soft-close dial. When > 0 AND a request opts\n"
+        "                             into thinking, the AR loop force-emits </think>\n"
+        "                             early once prob[</think>]/prob[chosen] >= ratio,\n"
+        "                             reclaiming tokens the model would have spent\n"
+        "                             running to the hard cap. Range [0.0, 1.0]:\n"
+        "                             0.0=disabled (default), 0.1=fire when within\n"
+        "                             10x of argmax (mild), 0.5=fire at half-prob\n"
+        "                             (aggressive), 1.0=fire only when close is\n"
+        "                             argmax. See docs/specs/thinking-budget.md §7.\n"
+        "  --think-soft-close-min-tokens <N>\n"
+        "                             Minimum thinking tokens before soft-close\n"
+        "                             may fire. Floors the fire decision so a\n"
+        "                             brief close-marker logit spike early in\n"
+        "                             reasoning cannot prematurely terminate\n"
+        "                             thinking. 0 = disabled (default). Typical\n"
+        "                             values: 64-256 for qwen3.6-27b.\n"
+        "  --debug-thinking-logits    Emit one stderr line per AR step inside the\n"
+        "                             thinking phase recording committed/chosen/\n"
+        "                             logit[close]/logit[chosen]/diff/prob_ratio.\n"
+        "                             Use to record close-vs-chosen logit\n"
+        "                             trajectories for fitting a sliding-ratio\n"
+        "                             curve. Stderr-heavy; operator dial only.\n"
         "\n"
         "KV cache:\n"
         "  --cache-type-k <type>  KV cache K type (f16,bf16,q4_0,q4_1,q5_0,q5_1,q8_0,tq3_0)\n"
@@ -209,7 +317,7 @@ static void print_usage(const char * prog) {
         "PFlash (speculative prefill compression):\n"
         "  --prefill-compression off|auto|always  (default: off)\n"
         "  --prefill-threshold <N>     Token threshold for auto mode (default: 32000)\n"
-        "  --prefill-keep-ratio <F>    Fraction of tokens to keep (default: 0.05)\n"
+        "  --prefill-keep-ratio <F>    Fraction of tokens to keep (default: 0.10)\n"
         "  --prefill-drafter <path>    Drafter GGUF for compression (Qwen3-0.6B)\n"
         "  --prefill-skip-park         Skip park/unpark (for >=32GB GPUs)\n"
         "  --draft-residency auto|persistent|request-scoped\n"
@@ -260,6 +368,9 @@ int main(int argc, char ** argv) {
         bool effort_high             = false;
         bool effort_x_high           = false;
         bool effort_max              = false;
+        bool soft_close_min_ratio    = false;
+        bool soft_close_min_tokens   = false;
+        bool debug_thinking_logits   = false;
     } cli_set;
 
     // Track whether the operator passed the legacy --max-tokens alias.
@@ -371,6 +482,44 @@ int main(int argc, char ** argv) {
         } else if (std::strcmp(argv[i], "--reasoning-effort-max") == 0 && i + 1 < argc) {
             sconfig.effort_tiers.max = std::atoi(argv[++i]);
             cli_set.effort_max = true;
+        } else if (std::strcmp(argv[i], "--think-soft-close-min-ratio") == 0 && i + 1 < argc) {
+            float r = std::strtof(argv[++i], nullptr);
+            // Clamp to [0, 1] with a warning if the operator passed
+            // something nonsensical. Bounded posture: the dial is
+            // operator-only, the bounds are tight by design.
+            if (r < 0.0f) {
+                std::fprintf(stderr,
+                    "[server] --think-soft-close-min-ratio=%.4f < 0; "
+                    "clamping to 0 (disabled)\n", r);
+                r = 0.0f;
+            } else if (r > 1.0f) {
+                std::fprintf(stderr,
+                    "[server] --think-soft-close-min-ratio=%.4f > 1; "
+                    "clamping to 1\n", r);
+                r = 1.0f;
+            }
+            sconfig.soft_close_min_ratio = r;
+            cli_set.soft_close_min_ratio = true;
+        } else if (std::strcmp(argv[i], "--think-soft-close-min-tokens") == 0 && i + 1 < argc) {
+            int n = std::atoi(argv[++i]);
+            if (n < 0) {
+                std::fprintf(stderr,
+                    "[server] --think-soft-close-min-tokens=%d < 0; "
+                    "clamping to 0 (disabled)\n", n);
+                n = 0;
+            }
+            sconfig.soft_close_min_tokens = n;
+            cli_set.soft_close_min_tokens = true;
+        } else if (std::strcmp(argv[i], "--debug-thinking-logits") == 0) {
+            // Diagnostic: emit one stderr line per AR step inside the
+            // thinking phase recording the close-vs-chosen logit gap.
+            // Used to fit a sliding ratio curve from real trajectory
+            // data rather than guessing. Adds zero GPU cost (the logits
+            // were already on CPU for sampling) but is gated as
+            // operator-only because the stderr volume is one line per
+            // thinking token. See qwen35_backend.cpp [soft-trace] log.
+            sconfig.debug_thinking_logits = true;
+            cli_set.debug_thinking_logits = true;
         } else if (std::strcmp(argv[i], "--prefill-compression") == 0 && i + 1 < argc) {
             const char * mode = argv[++i];
             if (std::strcmp(mode, "auto") == 0)
@@ -562,6 +711,21 @@ int main(int argc, char ** argv) {
                      sconfig.pflash_threshold, sconfig.pflash_keep_ratio,
                      sconfig.pflash_drafter_gpu,
                      (int)sconfig.pflash_skip_park);
+        // TYPE-gate router: opt-in via env var, default-off.
+        {
+            const char * router_env = std::getenv("PFLASH_ROUTER_ENABLE");
+            if (router_env && *router_env && std::strcmp(router_env, "0") != 0) {
+                sconfig.pflash_router.enabled = true;
+                // Inherit pflash threshold so the router fires at the same
+                // token count as the compression admission gate.
+                sconfig.pflash_router.threshold_tokens = sconfig.pflash_threshold;
+                std::fprintf(stderr,
+                    "[server] pflash-router: ENABLED (type-gate v2) "
+                    "threshold=%d agentic_keep=%.3f\n",
+                    sconfig.pflash_router.threshold_tokens,
+                    sconfig.pflash_router.agentic_keep_target);
+            }
+        }
     }
 
     // Honor DFLASH27B_DRAFT_SWA env (documented in server/README.md) when --draft-swa is absent.
@@ -733,6 +897,15 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  hard_limit_reply= %d (%s)\n",
                  sconfig.hard_limit_reply_budget,
                  src_of(cli_set.hard_limit_reply_budget));
+    std::fprintf(stderr, "[server] │  soft_close_ratio= %.4f (%s)\n",
+                 sconfig.soft_close_min_ratio,
+                 cli_set.soft_close_min_ratio ? "from CLI" : "default (disabled)");
+    std::fprintf(stderr, "[server] │  soft_close_floor= %d (%s)\n",
+                 sconfig.soft_close_min_tokens,
+                 cli_set.soft_close_min_tokens ? "from CLI" : "default (disabled)");
+    std::fprintf(stderr, "[server] │  debug_think_log = %s (%s)\n",
+                 sconfig.debug_thinking_logits ? "true" : "false",
+                 cli_set.debug_thinking_logits ? "from CLI" : "default (off)");
     std::fprintf(stderr, "[server] │  effort tiers    = low=%d (%s)\n",
                  sconfig.effort_tiers.low, src_of(cli_set.effort_low));
     std::fprintf(stderr, "[server] │                    medium=%d (%s)\n",
@@ -800,6 +973,7 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "[server] │  pflash_skip_park= %s\n", sconfig.pflash_skip_park ? "ON" : "off");
         std::fprintf(stderr, "[server] │  fp_use_bsa      = %s\n", getenv("DFLASH_FP_USE_BSA") ? "ON" : "off");
         std::fprintf(stderr, "[server] │  fp_alpha        = %s\n", getenv("DFLASH_FP_ALPHA") ? getenv("DFLASH_FP_ALPHA") : "0.12 (default)");
+        std::fprintf(stderr, "[server] │  pflash_router   = %s\n", sconfig.pflash_router.enabled ? "ON" : "off");
     }
     std::fprintf(stderr, "[server] │  draft_residency = %s\n",
                  draft_residency_policy_name(sconfig.draft_residency));
@@ -849,6 +1023,80 @@ int main(int argc, char ** argv) {
     // expose the GGUF metadata key it was loaded from, so leave empty
     // and let /props report null. (Add a getter on Tokenizer later.)
 
+    // ── /props identity payloads ────────────────────────────────────────
+    //
+    // Target + draft GGUF identity for /props.model.target / .draft. The
+    // hash is the slow part (~30s per multi-GB file on NVMe); the GGUF
+    // header read is cheap. Cached in a sidecar `<path>.sha256` so
+    // subsequent restarts skip the rehash.
+    //
+    // `DFLASH_SKIP_SHA256=1` env disables hashing entirely — useful when
+    // benchmarking server cold-start latency or when the model dir is
+    // read-only (no place to write the sidecar). Leaves `sha256` as JSON
+    // null in /props; the other identity fields still populate.
+    const bool skip_sha = []() {
+        const char * v = std::getenv("DFLASH_SKIP_SHA256");
+        return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    if (bargs.model_path && *bargs.model_path) {
+        std::fprintf(stderr,
+            "[server] inspecting target GGUF for /props%s\n",
+            skip_sha ? " (sha256 disabled by $DFLASH_SKIP_SHA256)" : "");
+        GgufMetadata tm = read_gguf_metadata(bargs.model_path, !skip_sha);
+        if (tm.ok) {
+            sconfig.target_gguf = gguf_metadata_to_json(tm);
+            std::fprintf(stderr,
+                "[server] target gguf: %s size=%lld sha=%s%s ftype=%s\n",
+                tm.path.c_str(), (long long)tm.size_bytes,
+                tm.sha256.empty() ? "(skipped)" : tm.sha256.substr(0, 12).c_str(),
+                tm.sha256.empty() ? "" : "...",
+                tm.file_type_name.empty() ? "?" : tm.file_type_name.c_str());
+        } else {
+            std::fprintf(stderr,
+                "[server] WARNING: could not read target GGUF metadata: %s\n",
+                bargs.model_path);
+        }
+    }
+    if (bargs.draft_path && *bargs.draft_path) {
+        std::fprintf(stderr,
+            "[server] inspecting draft GGUF for /props%s\n",
+            skip_sha ? " (sha256 disabled by $DFLASH_SKIP_SHA256)" : "");
+        GgufMetadata dm = read_gguf_metadata(bargs.draft_path, !skip_sha);
+        if (dm.ok) {
+            sconfig.draft_gguf = gguf_metadata_to_json(dm);
+            std::fprintf(stderr,
+                "[server] draft gguf: %s size=%lld sha=%s%s ftype=%s\n",
+                dm.path.c_str(), (long long)dm.size_bytes,
+                dm.sha256.empty() ? "(skipped)" : dm.sha256.substr(0, 12).c_str(),
+                dm.sha256.empty() ? "" : "...",
+                dm.file_type_name.empty() ? "?" : dm.file_type_name.c_str());
+        } else {
+            std::fprintf(stderr,
+                "[server] WARNING: could not read draft GGUF metadata: %s\n",
+                bargs.draft_path);
+        }
+    }
+    // Container/image identity (Dockerfile bakes /opt/lucebox-hub/IMAGE_INFO).
+    sconfig.image_info = read_image_info();
+    if (!sconfig.image_info.is_null()) {
+        std::fprintf(stderr,
+            "[server] image_info: git_sha=%s image_tag=%s build_time=%s\n",
+            sconfig.image_info.value("git_sha",    "(none)").c_str(),
+            sconfig.image_info.value("image_tag",  "(none)").c_str(),
+            sconfig.image_info.value("build_time", "(none)").c_str());
+    }
+    // Host identity (entrypoint.sh writes /opt/lucebox-hub/HOST_INFO from
+    // LUCEBOX_HOST_*). Surfaced verbatim under /props.host (schema 4+).
+    // Null on bare-metal dev builds that bypass the container entrypoint.
+    sconfig.host_info = read_host_info();
+    if (!sconfig.host_info.is_null()) {
+        std::fprintf(stderr,
+            "[server] host_info: source=%s os=%s kernel=%s\n",
+            sconfig.host_info.value("source",    "(none)").c_str(),
+            sconfig.host_info.value("os_pretty", "(none)").c_str(),
+            sconfig.host_info.value("kernel",    "(none)").c_str());
+    }
+
     // Resolve the Level 2 force-close sequence. Two concepts, both sourced
     // from the model card sidecar (see model_card.h for semantics):
     //   - marker: bytes that signal end-of-thinking to *us* (parsers).
@@ -893,6 +1141,40 @@ int main(int argc, char ** argv) {
             }
             if (close_ids.size() > 16) std::fprintf(stderr, ",...");
             std::fprintf(stderr, "\n");
+
+            // Probe-vs-inject split: when the inject sequence is the
+            // full directive hint (Qwen3.x-style trained lead-in), the
+            // first inject token is a content lead-in like "Considering"
+            // whose logit sits 19-35 nats below chosen during reasoning.
+            // Soft-close peeking that token never fires (empirical: see
+            // probe trajectory data). Tokenize JUST the marker substring
+            // and ship it as the probe sequence — at the AR boundary the
+            // marker's logit IS argmax-competitive (~prob_ratio>=0.5).
+            // When the hint and marker are identical (marker-only case),
+            // leave the probe field empty: BudgetHook::soft_close_probe_token()
+            // falls back to close_token_ids.front(), so this is a no-op.
+            if (!card.thinking_terminator_hint.empty() &&
+                close_text.find(marker) != std::string::npos &&
+                close_text != marker)
+            {
+                auto probe_ids = tokenizer.encode(marker);
+                if (!probe_ids.empty()) {
+                    sconfig.think_close_probe_token_ids = probe_ids;
+                    std::fprintf(stderr,
+                        "[server] soft-close probe (marker=\"%s\", %zu tokens): ",
+                        marker.c_str(), probe_ids.size());
+                    for (size_t i = 0; i < std::min<size_t>(probe_ids.size(), 8); ++i) {
+                        std::fprintf(stderr, "%s%d", i ? "," : "", probe_ids[i]);
+                    }
+                    if (probe_ids.size() > 8) std::fprintf(stderr, ",...");
+                    std::fprintf(stderr, "\n");
+                } else {
+                    std::fprintf(stderr,
+                        "[server] soft-close probe DISABLED: marker \"%s\" "
+                        "tokenizes to empty; legacy fallback (probe = inject[0]) "
+                        "in effect.\n", marker.c_str());
+                }
+            }
         } else {
             std::fprintf(stderr,
                 "[server] level-2 force-close DISABLED: text %.40s... "

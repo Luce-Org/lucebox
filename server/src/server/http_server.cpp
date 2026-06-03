@@ -28,12 +28,31 @@ namespace dflash::common {
 //
 // SERVER_NAME / SERVER_VERSION mirror the Python server's identity strings
 // so cross-server consumers (autotune, dashboards) see a stable
-// `build_info` shape. Bump PROPS_SCHEMA on breaking changes only:
-//   - field renamed
-//   - field removed
-//   - existing field's semantics change (units, nullability, type)
-// Do NOT bump for additive changes (new fields, new sections).
-static constexpr int  kPropsSchema  = 2;
+// `build_info` shape. Bump PROPS_SCHEMA when the response shape changes
+// — either:
+//   - breaking: field renamed, removed, or its semantics changed
+//     (units, nullability, type tightening)
+//   - additive (new fields / sections) when downstream consumers need
+//     to negotiate the new shape. Pre-bump consumers keep working
+//     because they ignore unknown fields; the bump signals "the new
+//     fields are guaranteed-present at this version or higher" so
+//     code like lucebench's preflight can opt in to the richer display.
+//
+// Schema 3 (additive vs 2): new top-level `build` block (structured
+// version of `build_info` with git_sha/image_tag/build_time), and new
+// `model.target` / `model.draft` GGUF-identity sub-objects carrying
+// size_bytes + sha256 + gguf header fields. The pre-3 top-level
+// `build_info`, `model_path`, `model_alias`, and `model.draft_path`
+// are preserved verbatim for back-compat.
+//
+// Schema 4 (additive vs 3): new top-level `host` block — verbatim
+// pass-through of /opt/lucebox-hub/HOST_INFO (written by
+// server/scripts/entrypoint.sh from the LUCEBOX_HOST_* env the host
+// wrapper probes). Null when HOST_INFO is missing (bare-metal dev or
+// manual docker run that bypasses entrypoint). luce-bench's snapshot
+// subcommand uses the version bump to gate on the new shape — pre-4
+// servers force a client-side fallback probe.
+static constexpr int  kPropsSchema  = 4;
 static constexpr char kServerName[] = "luce-dflash";
 #ifndef DFLASH_SERVER_VERSION
 #define DFLASH_SERVER_VERSION "0.0.0+cpp"
@@ -75,6 +94,32 @@ static const char * api_format_name(ApiFormat format) {
 
 static size_t json_array_size(const json & value) {
     return value.is_array() ? value.size() : 0;
+}
+
+// ─── Admission gate ──────────────────────────────────────────────────────
+// Pre-compression sanity guard uses first principles: reject only when even
+// best-case compression cannot fit — (double)raw*keep_ratio + max_output > max_ctx.
+// This is keep-ratio-derived, so it correctly admits large prompts at low
+// keep ratios rather than using a hardcoded 4× multiplier calibrated to 0.25.
+
+bool check_admission(int effective_size, int raw_size,
+                     int max_output, int max_ctx, bool pflash_on,
+                     float pflash_keep_ratio) {
+    if (max_ctx <= 0) return true;  // no limit configured
+    if (pflash_on) {
+        // Pre-compression guard: reject only when even best-case compression
+        // cannot fit. Skip when keep_ratio <= 0 (degenerate config; let the
+        // post-compression gate decide).
+        if (pflash_keep_ratio > 0.0f) {
+            if ((double)raw_size * pflash_keep_ratio + max_output > (double)max_ctx)
+                return false;
+        }
+        // Pre-compression guard passed: admit. The real effective-size gate
+        // runs post-compression (caller passes pflash_on=false after pflash).
+        return true;
+    }
+    // Non-pflash (or post-compression): check effective size directly.
+    return effective_size + max_output <= max_ctx;
 }
 
 // Build the /props response body.
@@ -121,6 +166,34 @@ json build_props_body(const ServerConfig & config,
         {"name",         kServerName},
         {"version",      DFLASH_SERVER_VERSION},
         {"props_schema", kPropsSchema},
+    };
+
+    // Structured replacement for the single-string `build_info` (schema 3+).
+    // Reads image identity stashed by server_main from /opt/lucebox-hub/
+    // IMAGE_INFO when the binary is running inside a Docker image built by
+    // docker-bake.hcl. On bare-metal / dev builds, image_info is null and
+    // the three image_* fields stay null; git_sha / image_tag / build_time
+    // are always present as keys for shape stability.
+    auto pull_string = [&](const char * field) -> json {
+        if (!config.image_info.is_object()) return nullptr;
+        auto it = config.image_info.find(field);
+        if (it == config.image_info.end()) return nullptr;
+        if (!it->is_string()) return nullptr;
+        const std::string & s = it->get_ref<const std::string &>();
+        if (s.empty()) return nullptr;
+        return s;
+    };
+    json build_block = {
+        {"server_name",    kServerName},
+        {"server_version", DFLASH_SERVER_VERSION},
+        {"props_schema",   kPropsSchema},
+        {"git_sha",        pull_string("git_sha")},
+        {"image_tag",      pull_string("image_tag")},
+        // image_digest is set externally (image is content-addressable only
+        // after push; the running container would need to query its own
+        // image via the Docker socket, which we don't do today). Reserved.
+        {"image_digest",   nullptr},
+        {"build_time",     pull_string("build_time")},
     };
 
     json pflash;
@@ -186,12 +259,29 @@ json build_props_body(const ServerConfig & config,
         {"model_path",  config.model_path},
         {"build_info",  std::string(kServerName) + " v" DFLASH_SERVER_VERSION
                         " props_schema=" + std::to_string(kPropsSchema)},
+        {"build",       build_block},
         {"speculative_mode", speculative_mode},
         {"server", server},
         {"model", {
             {"arch",         config.arch},
+            // `alias` mirrors top-level `model_alias` for grouping under
+            // `model`. The top-level field stays for back-compat (clients
+            // already grep for `model_alias`); new consumers should prefer
+            // `model.alias` since that's where all the model identity
+            // (arch, target, draft, tokenizer_id) lives.
+            {"alias",        config.model_name},
+            // Back-compat: pre-schema-3 readers grep `model.draft_path`
+            // directly. New shape exposes the same path under
+            // `model.draft.path` along with size/sha256/header fields.
             {"draft_path",   config.draft_path.empty() ? json(nullptr) : json(config.draft_path)},
             {"tokenizer_id", config.tokenizer_id.empty() ? json(nullptr) : json(config.tokenizer_id)},
+            // Schema 3 additions. Always emitted; `target` is null if the
+            // GGUF couldn't be inspected at startup (rare — implies a load
+            // failure that should have aborted boot). `draft` is null when
+            // no draft GGUF is loaded (`--draft` not passed), which is the
+            // normal target-only configuration for laguna / qwen3.6-moe.
+            {"target", config.target_gguf.is_null() ? json(nullptr) : config.target_gguf},
+            {"draft",  config.draft_gguf.is_null()  ? json(nullptr) : config.draft_gguf},
         }},
         {"runtime", {
             {"backend",         config.runtime_backend.empty() ? "cuda" : config.runtime_backend},
@@ -278,6 +368,13 @@ json build_props_body(const ServerConfig & config,
         // The C++ daemon is linked in-process; if /props is responding,
         // the daemon is alive by construction.
         {"daemon", {{"alive", true}}},
+        // Host identity (schema 4+). Verbatim pass-through of
+        // /opt/lucebox-hub/HOST_INFO — see server_main::read_host_info
+        // and entrypoint.sh::write_host_info. Null when HOST_INFO is
+        // missing or malformed; null is the explicit "bare metal dev"
+        // signal that luce-bench's snapshot uses to trigger a
+        // client-side fallback probe.
+        {"host", config.host_info.is_null() ? json(nullptr) : config.host_info},
         {"api", {{"endpoints", kApiEndpoints}}},
         // Capability flags surfaced for clients that don't want to crack
         // open `reasoning` / `speculative` / etc. — matches the Python
@@ -397,6 +494,7 @@ std::vector<ChatMessage> normalize_chat_messages(
             cm.role = m.value("role", "user");
 
             bool replayed = false;
+            // OpenAI format: assistant message with tool_calls field.
             if (cm.role == "assistant" && m.contains("tool_calls") &&
                 m["tool_calls"].is_array() && !m["tool_calls"].empty()) {
                 std::vector<std::string> call_ids;
@@ -411,6 +509,43 @@ std::vector<ChatMessage> normalize_chat_messages(
                 }
             }
 
+            // Anthropic format: assistant message with tool_use content blocks.
+            // IDs in tool_use blocks match the IDs stored in tool_memory when
+            // this server emitted the tool calls. Look them up to get the raw
+            // model output (already formatted for the model's chat template).
+            if (!replayed && cm.role == "assistant" &&
+                m.contains("content") && m["content"].is_array()) {
+                std::vector<std::string> call_ids;
+                for (const auto & part : m["content"]) {
+                    if (part.value("type", "") == "tool_use") {
+                        std::string id = part.value("id", "");
+                        if (!id.empty()) call_ids.push_back(id);
+                    }
+                }
+                if (!call_ids.empty()) {
+                    std::string raw = tool_memory.lookup(call_ids);
+                    if (!raw.empty()) {
+                        cm.content = raw;
+                        replayed = true;
+                    } else {
+                        // tool_memory miss (cross-session replay): synthesize
+                        // from the block fields using the model's tool_call XML.
+                        for (const auto & part : m["content"]) {
+                            if (part.value("type", "") == "tool_use") {
+                                json input = part.contains("input")
+                                    ? part["input"] : json::object();
+                                cm.content += "<tool_call>\n";
+                                cm.content += render_tool_call_xml(
+                                    part.value("name", ""), input);
+                                cm.content += "</tool_call>\n";
+                            }
+                        }
+                        replayed = !cm.content.empty();
+                    }
+                }
+            }
+
+            bool has_tool_results = false;
             if (!replayed) {
                 if (m.contains("content") && m["content"].is_string()) {
                     cm.content = m["content"].get<std::string>();
@@ -420,16 +555,45 @@ std::vector<ChatMessage> normalize_chat_messages(
                         if (ptype == "text" || ptype == "input_text" ||
                             ptype == "output_text") {
                             cm.content += part.value("text", "");
+                        } else if (ptype == "tool_result") {
+                            // Anthropic format: tool result inside a user
+                            // message. Push as a tool-role message so the
+                            // chat template wraps it in <tool_response> tags.
+                            has_tool_results = true;
+                            std::string result_content;
+                            if (part.contains("content")) {
+                                if (part["content"].is_string()) {
+                                    result_content =
+                                        part["content"].get<std::string>();
+                                } else if (part["content"].is_array()) {
+                                    for (const auto & c : part["content"]) {
+                                        if (c.value("type", "") == "text") {
+                                            result_content +=
+                                                c.value("text", "");
+                                        }
+                                    }
+                                }
+                            }
+                            std::string result_id =
+                                part.value("tool_use_id", "");
+                            chat_msgs.push_back(
+                                {"tool", result_content, result_id});
                         }
                     }
                 }
             }
 
-            if (format == ApiFormat::RESPONSES &&
-                (cm.role == "system" || cm.role == "developer")) {
-                system_parts.push_back(cm.content);
-            } else {
-                chat_msgs.push_back(std::move(cm));
+            // Skip pushing an empty user container when all content was
+            // tool_result blocks (already pushed as individual tool messages).
+            bool skip = (cm.role == "user" && has_tool_results &&
+                         cm.content.empty());
+            if (!skip) {
+                if (format == ApiFormat::RESPONSES &&
+                    (cm.role == "system" || cm.role == "developer")) {
+                    system_parts.push_back(cm.content);
+                } else {
+                    chat_msgs.push_back(std::move(cm));
+                }
             }
         }
     } else if (messages.is_string()) {
@@ -943,6 +1107,38 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             if (th.contains("reply_budget") && th["reply_budget"].is_number_integer()) {
                 request_reply_budget = th["reply_budget"].get<int>();
             }
+            // Soft-close per-request override (plan §6.3). Honored only
+            // when the operator has soft-close enabled; clamped against
+            // the server ceiling so clients can tighten but not loosen.
+            // Applied after clamping logic below.
+            if (th.contains("soft_close_min_ratio") &&
+                th["soft_close_min_ratio"].is_number())
+            {
+                float requested = th["soft_close_min_ratio"].get<float>();
+                if (requested < 0.0f) requested = 0.0f;
+                if (requested > 1.0f) requested = 1.0f;
+                if (config_.soft_close_min_ratio <= 0.0f) {
+                    // Operator has disabled soft-close at the server
+                    // level — silently ignore the per-request override.
+                    // Logged at info so operators can see clients
+                    // attempting to opt in.
+                    std::fprintf(stderr,
+                        "[server] thinking.soft_close_min_ratio=%.4f "
+                        "ignored: server has soft-close disabled "
+                        "(config_.soft_close_min_ratio=0)\n",
+                        requested);
+                } else {
+                    float eff = std::min(requested,
+                                          config_.soft_close_min_ratio);
+                    if (requested > config_.soft_close_min_ratio) {
+                        std::fprintf(stderr,
+                            "[server] thinking.soft_close_min_ratio=%.4f "
+                            "clamped to soft_close_min_ratio=%.4f\n",
+                            requested, config_.soft_close_min_ratio);
+                    }
+                    req.per_req_soft_close_min_ratio = eff;
+                }
+            }
         }
         // Direct: chat_template_kwargs.enable_thinking
         if (body.contains("chat_template_kwargs")) {
@@ -1012,7 +1208,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             tools_json = req.tools.dump();
         }
 
-        std::string rendered;
+        PromptRenderResult render_result;
         if (!config_.chat_template_src.empty()) {
             // Jinja path: caller supplied a chat template file via
             // --chat-template-file. Override the hardcoded QWEN3/LAGUNA
@@ -1029,25 +1225,33 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                 ? tokenizer_.raw_token(tokenizer_.eos_id())
                 : std::string();
             try {
-                rendered = render_chat_template_jinja(
+                render_result = render_chat_template_jinja(
                     config_.chat_template_src,
                     chat_msgs,
                     bos_str,
                     eos_str,
                     /*add_generation_prompt=*/true,
                     enable_thinking,
-                    tools_json);
+                    tools_json,
+                    chat_format_);
             } catch (const std::exception & e) {
                 send_error(fd, 500,
                     std::string("chat template (jinja) render failed: ") + e.what());
                 return true;
             }
         } else {
-            rendered = render_chat_template(chat_msgs, chat_format_,
-                                            true, enable_thinking,
-                                            tools_json);
+            render_result = render_chat_template(chat_msgs, chat_format_,
+                                                 true, enable_thinking,
+                                                 tools_json);
         }
-        req.prompt_tokens = tokenizer_.encode(rendered);
+        // Propagate prompt provenance so the SseEmitter's initial mode
+        // matches the template's pre-opened reasoning channel (Qwen3.6 /
+        // Laguna enable_thinking case). Without this, reasoning text
+        // leaks into the content channel and `reasoning_content` stays
+        // empty — see fix(server): route Qwen3.6/Laguna think-mode
+        // reasoning to reasoning_content channel.
+        req.started_in_thinking = render_result.started_in_thinking;
+        req.prompt_tokens = tokenizer_.encode(render_result.text);
 
         // count_tokens: short-circuit after tokenization. Skip generation
         // entirely — Anthropic's contract is just `{"input_tokens": N}`.
@@ -1062,8 +1266,27 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         return true;  // handled (with error)
     }
 
-    // Check context length.
-    if ((int)req.prompt_tokens.size() + req.max_output > config_.max_ctx) {
+    // Pre-compression admission: reject non-pflash requests that can't fit,
+    // and pflash requests whose raw prompt cannot possibly compress to fit
+    // (first-principles guard: raw*keep_ratio + max_output > max_ctx).
+    // The real post-compression gate runs in worker_loop after pflash runs.
+    const int raw_size = (int)req.prompt_tokens.size();
+    const bool pflash_will_run =
+        config_.max_ctx > 0 &&
+        config_.pflash_mode != ServerConfig::PflashMode::OFF &&
+        drafter_tokenizer_ != nullptr &&
+        (config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
+         raw_size >= config_.pflash_threshold);
+    if (!check_admission(raw_size, raw_size, req.max_output, config_.max_ctx,
+                         /*pflash_on=*/false) && !pflash_will_run) {
+        // Non-pflash path: raw is the effective size, reject immediately.
+        send_error(fd, 400, "prompt + max_tokens exceeds context window");
+        return true;
+    }
+    if (pflash_will_run &&
+        !check_admission(raw_size, raw_size, req.max_output, config_.max_ctx,
+                         /*pflash_on=*/true, config_.pflash_keep_ratio)) {
+        // Pre-compression guard: best-case compression still can't fit.
         send_error(fd, 400, "prompt + max_tokens exceeds context window");
         return true;
     }
@@ -1152,11 +1375,20 @@ void HttpServer::worker_loop() {
             }
         }
 
-        // Create SSE emitter for streaming state machine.
+        // Create SSE emitter for streaming state machine. `initial_mode`
+        // tracks whether the chat-template prompt pre-opened a `<think>`
+        // block (Qwen3.6 / Laguna enable_thinking path). When true, the
+        // emitter starts in REASONING so the model's first generated
+        // token routes to reasoning_content even though no explicit
+        // `<think>` opener appears in the token stream.
+        const StreamMode initial_mode = req.started_in_thinking
+            ? StreamMode::REASONING
+            : StreamMode::CONTENT;
         SseEmitter emitter(req.format, req.response_id, req.model,
                            (int)req.prompt_tokens.size(), req.tools,
                            &tool_memory_,
-                           req.stop_sequences);
+                           req.stop_sequences,
+                           initial_mode);
 
         // Emit initial SSE events.
         if (req.stream) {
@@ -1177,6 +1409,7 @@ void HttpServer::worker_loop() {
         // If pflash is enabled and prompt exceeds threshold, compress.
         std::vector<int32_t> effective_prompt = req.prompt_tokens;
         bool pflash_compressed = false;
+        bool pflash_is_agentic = false;  // hoisted for post-generate guard
 
         if (config_.pflash_mode != ServerConfig::PflashMode::OFF &&
             drafter_tokenizer_ != nullptr)
@@ -1212,10 +1445,100 @@ void HttpServer::worker_loop() {
                         // 3. Compress via typed API
                         ModelBackend::CompressRequest creq;
                         creq.input_ids = std::move(drafter_ids);
-                        // Bandit: use per-session keep_ratio if session_id provided.
-                        creq.keep_ratio = req.session_id.empty()
-                            ? config_.pflash_keep_ratio
-                            : sessions_.get_keep_ratio(req.session_id);
+
+                        // TYPE-GATE router (default-off via pflash_router.enabled).
+                        // When enabled, detect request type and override keep_ratio +
+                        // cascade per the v2 policy.  When disabled → exact no-op.
+                        {
+                            // Extract agentic-signal bools from the parsed JSON
+                            // (json-walking belongs at the handler boundary, not
+                            //  in the pure router header).
+                            const bool _has_tools =
+                                req.tools.is_array() && !req.tools.empty();
+                            bool _has_tool_use_blocks = false;
+                            bool _has_tool_calls      = false;
+                            if (req.messages.is_array()) {
+                                for (const auto & _msg : req.messages) {
+                                    if (!_msg.is_object()) continue;
+                                    if (_msg.contains("tool_calls")) {
+                                        const auto & _tc = _msg["tool_calls"];
+                                        if (_tc.is_array() && !_tc.empty())
+                                            _has_tool_calls = true;
+                                    }
+                                    if (_msg.contains("content")) {
+                                        const auto & _c = _msg["content"];
+                                        if (_c.is_array()) {
+                                            for (const auto & _b : _c) {
+                                                if (!_b.is_object()) continue;
+                                                const std::string _bt = _b.value("type", "");
+                                                if (_bt == "tool_use" || _bt == "tool_result")
+                                                    _has_tool_use_blocks = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            const bool is_agentic = (detect_request_type(
+                                _has_tools, _has_tool_use_blocks, _has_tool_calls)
+                                    == RequestType::Agentic);
+                            pflash_is_agentic = is_agentic;  // hoist for post-generate guard
+                            const RequestFeatures rf {
+                                is_agentic,
+                                n_prompt
+                            };
+                            const RouterDecisionV2 rd = decide_v2(rf, config_.pflash_router);
+                            if (config_.pflash_router.enabled) {
+                                // Router is on: apply per-request keep + cascade override.
+                                // Bandit keeps winning if session_id is present — bandit
+                                // is the M2 lever for agentic keep level tuning.
+                                // For M1 the TYPE decision overrides keep_ratio when no
+                                // session bandit is active.
+                                if (req.session_id.empty()) {
+                                    creq.keep_ratio = (float)rd.keep_target;
+                                } else {
+                                    // PIECE 2: recover_full_next — one-shot full-keep recovery
+                                    // after a compression_failed turn.  Consumed here (one turn).
+                                    if (!req.session_id.empty() &&
+                                        sessions_.consume_recover_full_next(req.session_id)) {
+                                        creq.keep_ratio = (float)config_.pflash_router.full_keep_target;
+                                        std::fprintf(stderr,
+                                            "[pflash-guard] recover_full_next consumed — "
+                                            "session=%s full_keep=%.3f\n",
+                                            req.session_id.c_str(), creq.keep_ratio);
+                                    } else {
+                                        // PIECE 1: floor clamp — bandit must not undercut
+                                        // the router's agentic floor.
+                                        float raw_keep = sessions_.get_keep_ratio(req.session_id);
+                                        creq.keep_ratio = (float)clamp_keep_to_floor(
+                                            raw_keep,
+                                            config_.pflash_router.agentic_keep_target,
+                                            is_agentic);
+                                        if (is_agentic && creq.keep_ratio > raw_keep) {
+                                            std::fprintf(stderr,
+                                                "[pflash-router] floor-clamp: "
+                                                "agentic bandit %.3f < floor %.3f → %.3f\n",
+                                                raw_keep,
+                                                config_.pflash_router.agentic_keep_target,
+                                                creq.keep_ratio);
+                                        }
+                                    }
+                                }
+                                // cascade = use_transitive: 0 = off, 1 = on, -1 = env default
+                                creq.use_transitive = rd.cascade ? 1 : 0;
+                                std::fprintf(stderr,
+                                    "[pflash-router] type=%s keep=%.3f cascade=%s reason=%s\n",
+                                    is_agentic ? "agentic" : "retrieval",
+                                    creq.keep_ratio,
+                                    rd.cascade ? "on" : "off",
+                                    rd.reason);
+                            } else {
+                                // Router disabled: legacy keep_ratio path, no change.
+                                creq.keep_ratio = req.session_id.empty()
+                                    ? config_.pflash_keep_ratio
+                                    : sessions_.get_keep_ratio(req.session_id);
+                                // use_transitive stays at -1 (env default).
+                            }
+                        }
                         creq.drafter_path = config_.pflash_drafter_path;
                         creq.drafter_gpu = config_.pflash_drafter_gpu;
                         creq.skip_park = config_.pflash_skip_park;
@@ -1277,6 +1600,20 @@ void HttpServer::worker_loop() {
             }
         }
 
+        // Effective-size admission gate: check post-compression prompt fits max_ctx.
+        // For non-pflash requests this was already checked in handle_client;
+        // for pflash requests the raw guard passed but the effective size may
+        // still be too large (unlikely but possible if compression ratio is poor).
+        // Use pflash_on=false here so the function directly checks effective size
+        // (pflash_on=true only runs the pre-compression guard, not useful here).
+        if (!check_admission((int)effective_prompt.size(), (int)req.prompt_tokens.size(),
+                             req.max_output, config_.max_ctx,
+                             /*pflash_on=*/false,
+                             config_.pflash_keep_ratio)) {
+            fail_request(400, "prompt + max_tokens exceeds context window");
+            continue;
+        }
+
         // Build generate request.
         //
         // Thinking-budget v2 (Level 2): when caller opts in via
@@ -1294,19 +1631,21 @@ void HttpServer::worker_loop() {
         const int effective_think_ceiling = (req.per_req_phase1_cap >= 0)
             ? req.per_req_phase1_cap
             : config_.think_max_tokens;
-        // The effective per-request reply budget is the operator's choice
-        // (CLI / sidecar / per-request override). The AR loop force-closes
-        // when `n_gen - generated <= eff_reply`, which means n_gen must
-        // include BOTH the think budget AND the reply reserve. Without the
-        // `+ eff_reply` term, force-close fires immediately when
-        // `eff_reply == effective_think_ceiling` (e.g. think_max=4096,
-        // hard_limit=4096 → remaining starts at 4096, condition fires
-        // before the model emits a single thinking token). Spec §4.4.
+        // When thinking is active, max_tokens is the *response* budget only —
+        // thinking tokens are additive. n_gen = think_ceiling + response_budget,
+        // where response_budget = min(max_tokens, hard_limit_reply_budget).
+        // This prevents immediate force-close on benchmarks whose max_tokens
+        // were sized for nothink responses (e.g. gsm8k=2048, agent_recorded=4096).
+        // Without this, n_gen = min(think+reply, max_tokens) would cap n_gen
+        // below the hard_limit threshold, firing force-close at step 0. Spec §4.4.
         const int eff_reply_for_n_gen = (req.per_req_reply_budget >= 0)
             ? req.per_req_reply_budget
             : config_.hard_limit_reply_budget;
+        const int response_budget = budget_active
+            ? std::min(req.max_output, eff_reply_for_n_gen)
+            : req.max_output;
         const int n_gen_cap = budget_active
-            ? std::min(effective_think_ceiling + eff_reply_for_n_gen, req.max_output)
+            ? effective_think_ceiling + response_budget
             : req.max_output;
 
         GenerateRequest gen_req;
@@ -1315,6 +1654,11 @@ void HttpServer::worker_loop() {
         gen_req.sampler = req.sampler;
         gen_req.do_sample = req.sampler.needs_logit_processing();
         gen_req.stream = false;  // we handle streaming via on_token callback
+        // Widen verify window to cover the full compressed prompt; C2 gate in
+        // qwen35_backend.cpp selects spec-decode vs AR. See docs/pflash-adaptive-composition.md.
+        if (pflash_compressed) {
+            gen_req.fa_window_override = (int)effective_prompt.size() + 256;
+        }
 
         // Level 2 force-close: when thinking is opted in, the server is
         // configured with a hard-limit reply budget, and we resolved the
@@ -1333,7 +1677,37 @@ void HttpServer::worker_loop() {
                 ? req.per_req_reply_budget
                 : config_.hard_limit_reply_budget;
             gen_req.budget_hook.close_token_ids = config_.think_close_token_ids;
-            gen_req.budget_hook.hard_limit_remaining = eff_reply_budget;
+            gen_req.budget_hook.soft_close_probe_ids =
+                config_.think_close_probe_token_ids;
+            // Clamp hard_limit to min(max_output, eff_reply_budget): when
+            // max_tokens is small (response-only budget), the actual reply
+            // window must respect it even though n_gen already accounts for
+            // thinking being additive. Spec §4.4.
+            gen_req.budget_hook.hard_limit_remaining =
+                std::min(req.max_output, eff_reply_budget);
+
+            // Soft-close min-ratio. Operator-gated: only forwarded when
+            // config_.soft_close_min_ratio > 0. Per-request value (if
+            // set and operator enabled) is already clamped to the
+            // server ceiling in the request parser. See plan §6.3.
+            if (config_.soft_close_min_ratio > 0.0f) {
+                gen_req.budget_hook.soft_close_min_ratio =
+                    (req.per_req_soft_close_min_ratio >= 0.0f)
+                        ? req.per_req_soft_close_min_ratio
+                        : config_.soft_close_min_ratio;
+            }
+
+            // Minimum-thinking-tokens floor: false-positive guard for
+            // soft-close. Server-policy only (no per-request override).
+            gen_req.budget_hook.soft_close_min_tokens =
+                config_.soft_close_min_tokens;
+
+            // Diagnostic trajectory log — operator dial only. Carried
+            // through the BudgetHook so the AR loop can emit one line
+            // per thinking step regardless of whether soft-close is
+            // armed. See model_backend.h BudgetHook::debug_thinking_logits.
+            gen_req.budget_hook.debug_thinking_logits =
+                config_.debug_thinking_logits;
         }
 
         // Tool call hint generation: pre-tokenize predictable structural tokens
@@ -1458,8 +1832,9 @@ void HttpServer::worker_loop() {
 
             const std::string & raw = tokenizer_.raw_token(token);
 
-            // Gemma4 thinking channel: map <|channel> → <think>, <channel|> → </think>\n
-            if (raw == "<|channel>") {
+            // Gemma4 thinking channel: map <|channel>* → <think>, <channel|> → </think>\n
+            // raw vocab token is "<|channel>thought", not just "<|channel>".
+            if (raw.rfind("<|channel>", 0) == 0) {
                 if (req.stream) {
                     auto chunks = emitter.emit_token("<think>");
                     for (const auto & chunk : chunks)
@@ -1550,18 +1925,36 @@ void HttpServer::worker_loop() {
         // doesn't grow monotonically across requests with different sizes.
         backend_.release_scratch();
 
-        // Bandit: update when spec decode actually ran — including 0-accept case,
-        // which signals the current keep_ratio is too low.
-        if (!req.session_id.empty() && result.spec_decode_ran) {
-            float old_keep = sessions_.get_keep_ratio(req.session_id);
-            int   old_turn = sessions_.turn_count(req.session_id);
-            sessions_.update(req.session_id, result.accept_rate);
-            float new_keep = sessions_.get_keep_ratio(req.session_id);
-            float ema      = sessions_.get_ema(req.session_id);
+        // PIECE 2: compression failure guard — deterministic recovery.
+        // When an agentic compressed turn produces an empty or degenerate response:
+        //   (a) skip the bandit update (failure noise — don't reward/penalise)
+        //   (b) schedule full-keep recovery for the next turn of this session
+        const bool agentic_compressed = pflash_is_agentic && pflash_compressed;
+        const int  n_response_tokens  = (int)result.tokens.size();
+        if (!req.session_id.empty() &&
+            compression_failed(n_response_tokens, result.degenerate_decode_close,
+                               agentic_compressed)) {
             std::fprintf(stderr,
-                "[pflash-bandit] session=%s turn=%d keep=%.4f->%.4f ema=%.3f accept=%.3f\n",
-                req.session_id.c_str(), old_turn + 1,
-                old_keep, new_keep, ema, result.accept_rate);
+                "[pflash-guard] compression_failed → full-keep next: "
+                "session=%s resp_tokens=%d degenerate=%s\n",
+                req.session_id.c_str(), n_response_tokens,
+                result.degenerate_decode_close ? "true" : "false");
+            sessions_.set_recover_full_next(req.session_id);
+            // Fall through — skip bandit update below (spec_decode_ran may still be true).
+        } else {
+            // Bandit: update when spec decode actually ran — including 0-accept case,
+            // which signals the current keep_ratio is too low.
+            if (!req.session_id.empty() && result.spec_decode_ran) {
+                float old_keep = sessions_.get_keep_ratio(req.session_id);
+                int   old_turn = sessions_.turn_count(req.session_id);
+                sessions_.update(req.session_id, result.accept_rate);
+                float new_keep = sessions_.get_keep_ratio(req.session_id);
+                float ema      = sessions_.get_ema(req.session_id);
+                std::fprintf(stderr,
+                    "[pflash-bandit] session=%s turn=%d keep=%.4f->%.4f ema=%.3f accept=%.3f\n",
+                    req.session_id.c_str(), old_turn + 1,
+                    old_keep, new_keep, ema, result.accept_rate);
+            }
         }
 
 
@@ -1614,15 +2007,25 @@ void HttpServer::worker_loop() {
             }
         }
 
-        // close_kind reflects the Level 2 BudgetHook outcome: "hard" when
-        // the backend's AR/spec decode injected the close-token sequence
-        // at the budget boundary, "natural" when the model self-closed
-        // (or the request never opted in). Emitted as part of
-        // finish_details for thinking-budget callers.
-        std::string close_kind =
-            (req.thinking_opt_in && result.budget_forced_close)
-                ? "hard"
-                : "natural";
+        // close_kind reflects the Level 2 BudgetHook outcome:
+        //   "natural" — the model emitted </think> on its own (or the
+        //               request never opted in to the envelope).
+        //   "soft"    — the soft-close logit-ratio peek (Level 2.5)
+        //               fired before the hard cap, indicating the
+        //               model was willing to close. See
+        //               docs/specs/thinking-budget.md §7.
+        //   "hard"    — the budget edge was reached without the model
+        //               or the soft path agreeing; the AR loop forced
+        //               </think> in. Original Level 2 behavior.
+        // Soft wins ties against hard on the same step (see plan §4 +
+        // §12) — soft_forced_close and budget_forced_close are mutually
+        // exclusive per AR-loop step. Emitted as part of finish_details
+        // for thinking-budget callers.
+        std::string close_kind = "natural";
+        if (req.thinking_opt_in) {
+            if (result.soft_forced_close)        close_kind = "soft";
+            else if (result.budget_forced_close) close_kind = "hard";
+        }
 
         // Finalize.
         // Per-request wall-clock timings forwarded to the response's
@@ -1646,8 +2049,8 @@ void HttpServer::worker_loop() {
                     const std::string & raw = tokenizer_.raw_token(tok);
                     if (tok == tokenizer_.eos_id()) continue;
                     if (tok == tokenizer_.eos_chat_id()) continue;
-                    // Gemma4 channel → think mapping
-                    if (raw == "<|channel>") { emitter.emit_token("<think>"); continue; }
+                    // Gemma4 channel → think mapping; raw token is "<|channel>thought"
+                    if (raw.rfind("<|channel>", 0) == 0) { emitter.emit_token("<think>"); continue; }
                     if (raw == "<channel|>") { emitter.emit_token("</think>\n"); continue; }
                     // Qwen3.6 thinking tokens (id 248068 / 248069) — must
                     // forward as text so the emitter transitions

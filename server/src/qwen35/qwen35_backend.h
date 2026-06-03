@@ -229,7 +229,8 @@ private:
                         const std::vector<int32_t> * hint_tokens = nullptr,
                         const BudgetHook * budget_hook = nullptr,
                         bool * forced_close_out = nullptr,
-                        bool * degenerate_close_out = nullptr);
+                        bool * degenerate_close_out = nullptr,
+                        bool * soft_forced_close_out = nullptr);
 
     // AR decode fallback (no draft model or sampling mode).
     // budget_hook (when close_token_ids is non-empty) overrides the next
@@ -249,7 +250,8 @@ private:
                       const DaemonIO & io,
                       const BudgetHook & budget_hook = {},
                       bool * forced_close_out = nullptr,
-                      bool * degenerate_close_out = nullptr);
+                      bool * degenerate_close_out = nullptr,
+                      bool * soft_forced_close_out = nullptr);
 
     bool sync_remote_draft_features(int start_pos, int n_tokens);
 
