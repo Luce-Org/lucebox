@@ -70,6 +70,7 @@ The defaults below are the current RTX 3090 starting points for
 | OpenClaw | `run_openclaw.sh` | `MAX_CTX=204800 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
 | Open WebUI chat | `run_openwebui.sh` | `MAX_CTX=262144 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
 | Open WebUI tools | `run_openwebui_tools.sh` | `MAX_CTX=65536 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
+| luce-bench | `run_lucebench.sh` | `MAX_CTX=32768 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
 
 Override any setting inline:
 
@@ -101,6 +102,29 @@ CLIENT=opencode PROMPT_FILE=harness/clients/prompts/repo_inspection.txt \
 OpenAI Chat Completions clients can call llama.cpp directly. Claude Code and
 Codex use `llamacpp_compat_proxy.py` so their real Anthropic Messages and
 Responses requests can be compared too.
+
+## luce-bench
+
+`run_lucebench.sh` is the odd one out: the "client" is `luce-bench` (the
+in-tree capability bench at `luce-bench/`), not a vendored binary. It hits
+`/v1/chat/completions` with the standard ds4-eval / HumanEval / longctx /
+agent / forge case sets and writes per-case PASS/FAIL + timings.
+
+Useful as a regression gate: a server change that breaks tool-call parsing,
+chat-template rendering, or sampling defaults will show up here the same way
+it would break a real-client launcher above.
+
+```bash
+# Full sweep (default — runs all 4 stdlib areas)
+harness/clients/run_lucebench.sh
+
+# Single area
+LUCEBENCH_AREA=code harness/clients/run_lucebench.sh
+LUCEBENCH_AREA=ds4-eval LUCEBENCH_THINK=1 harness/clients/run_lucebench.sh
+
+# Knobs (see top of run_lucebench.sh): LUCEBENCH_AREA, LUCEBENCH_THINK,
+# LUCEBENCH_MAX_TOKENS, LUCEBENCH_TIMEOUT, LUCEBENCH_PARALLEL.
+```
 
 ## Notes
 
