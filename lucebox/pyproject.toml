@@ -1,0 +1,53 @@
+[project]
+name = "lucebox"
+# Version is derived from git tags via hatch-vcs (see [tool.hatch.version]
+# below). Tag `lucebox-v0.2.1` → release version `0.2.1`. Commits past a
+# tag get a `.devN+g<sha>` suffix so dev installs are visibly distinct
+# from releases. Single source of truth: the git tag.
+dynamic = ["version"]
+description = "Host-side CLI for the lucebox-hub container: orchestration, autotune + sweep"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Lucebox" }]
+license = { text = "Apache-2.0" }
+
+# Kept intentionally narrow. typer pulls click+rich; tomli-w gives us TOML
+# writes (stdlib tomllib only reads). httpx for the smoke + readiness probes.
+# huggingface_hub for download-models — used directly (not via subprocess)
+# so we can drive a Rich progress bar + verify sha256 against the repo
+# metadata before re-fetching multi-GB GGUFs.
+dependencies = [
+    "typer>=0.12",
+    "rich>=13",
+    "httpx>=0.27",
+    "tomli-w>=1.0",
+    "huggingface_hub>=0.27",
+    # luce-bench is needed by the autotune sweep scorer (agent_replay_pass_rate
+    # in sweep.py imports lucebench.areas.agent_recorded). Kept as a workspace
+    # dep so the scorer can run host-side via `uv run --project lucebox` without
+    # a separate `uvx` invocation.
+    "luce-bench",
+]
+
+[project.scripts]
+lucebox = "lucebox.cli:app"
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+# Untagged checkouts (e.g. fresh clone before tagging lucebox-v0.2.1)
+# resolve to this rather than 0.0.0.dev0.
+fallback-version = "0.2.1.dev0"
+raw-options.tag_regex = '''^lucebox-v(?P<version>\d+\.\d+\.\d+)$'''
+
+[tool.hatch.build.hooks.vcs]
+# Build hook writes the resolved version into src/lucebox/_version.py
+# so `__init__.py` can `from lucebox._version import __version__`.
+# Generated file — see lucebox/.gitignore.
+version-file = "src/lucebox/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lucebox"]
