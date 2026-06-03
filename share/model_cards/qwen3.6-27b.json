@@ -20,5 +20,10 @@
     "high": 32256,
     "x-high": 56832,
     "max": 81408
+  },
+  "thinking_control": {
+    "think_prompt_token": "/think",
+    "nothink_prompt_token": "/no_think",
+    "injection_point": "user_turn_suffix"
   }
 }

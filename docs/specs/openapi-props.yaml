@@ -2,7 +2,7 @@ openapi: 3.1.0
 
 info:
   title: dflash_server /props endpoint
-  version: "2"
+  version: "3"
   summary: Capability and configuration introspection for dflash_server.
   description: |
     `GET /props` returns enough JSON for a dashboard, a deployment
@@ -13,7 +13,18 @@ info:
     The integer reported as `server.props_schema` (and as the
     trailing token of `build_info`) bumps when the response shape
     changes in a backward-incompatible way. The current schema is
-    `2`.
+    `3`.
+
+    Schema `3` (additive over `2`): new top-level `build` block —
+    a structured replacement for the single-string `build_info`
+    that carries `git_sha`, `image_tag`, and `build_time` baked
+    into the container at build time. New `model.target` and
+    `model.draft` sub-objects carry full GGUF identity (absolute
+    path, `size_bytes`, `sha256`, and a `gguf` header field set —
+    architecture, quant `file_type`, `block_count`,
+    `embedding_length`, `context_length`, `vocab_size`). The
+    pre-3 fields (`build_info`, `model_path`, `model.draft_path`,
+    `model_alias`) stay verbatim for back-compat.
 
     Schema `2` (breaking change vs. `1`): `model_card` is now the
     wholesale on-disk sidecar JSON (or `null` when family / hard
@@ -29,8 +40,10 @@ info:
 
 # The numeric value matches `server.props_schema` and the
 # `props_schema=<n>` token in `build_info`. Bumps on breaking
-# response-shape changes; additive changes keep the same value.
-x-props-schema: 2
+# response-shape changes; additive changes keep the same value
+# (e.g. schema 2 → 3 is additive but still bumps so consumers
+# can negotiate the new fields).
+x-props-schema: 3
 
 servers:
   - url: http://localhost:8080
@@ -82,7 +95,15 @@ paths:
                         high: 32256
                         x-high: 56832
                         max: 81408
-                    build_info: "luce-dflash v0.0.0+cpp props_schema=2"
+                    build:
+                      server_name: "luce-dflash"
+                      server_version: "0.0.0+cpp"
+                      props_schema: 3
+                      git_sha: "6d12378"
+                      image_tag: "sha-6d12378-cuda12"
+                      image_digest: null
+                      build_time: "2026-05-28T13:43:57Z"
+                    build_info: "luce-dflash v0.0.0+cpp props_schema=3"
                     capabilities:
                       reasoning_supported: true
                       speculative_supported: true
@@ -104,8 +125,37 @@ paths:
                       lifetime_hits: 0
                     model:
                       arch: "qwen35"
-                      draft_path: "/.../dflash-draft-3.6-q4_k_m.gguf"
+                      alias: "dflash"
+                      draft_path: "/.../dflash-draft-3.6-q8_0.gguf"
                       tokenizer_id: null
+                      target:
+                        path: "/.../Qwen3.6-27B-Q4_K_M.gguf"
+                        size_bytes: 17134510080
+                        sha256: "abc123def456...0a1b2c3d4e5f"
+                        gguf:
+                          general.architecture: "qwen35"
+                          general.name: "Qwen3.6-27B"
+                          general.file_type: 15
+                          general.file_type_name: "Q4_K_M"
+                          general.quantization_version: 2
+                          block_count: 64
+                          embedding_length: 5120
+                          context_length: 65536
+                          vocab_size: 152064
+                      draft:
+                        path: "/.../dflash-draft-3.6-q8_0.gguf"
+                        size_bytes: 425000000
+                        sha256: "deadbeef...0a1b2c3d4e5f"
+                        gguf:
+                          general.architecture: "qwen3"
+                          general.name: "Qwen3-0.6B-DFlash-draft"
+                          general.file_type: 7
+                          general.file_type_name: "Q8_0"
+                          general.quantization_version: 2
+                          block_count: 28
+                          embedding_length: 1024
+                          context_length: 32768
+                          vocab_size: 152064
                     model_alias: "dflash"
                     model_card:
                       name: "Qwen3.6 27B"
@@ -169,7 +219,7 @@ paths:
                         supports_top_p: true
                     server:
                       name: "luce-dflash"
-                      props_schema: 2
+                      props_schema: 3
                       version: "0.0.0+cpp"
                     speculative:
                       enabled: true
@@ -190,6 +240,7 @@ components:
       required:
         - api
         - budget_envelope
+        - build
         - build_info
         - capabilities
         - daemon
@@ -214,13 +265,21 @@ components:
           $ref: "#/components/schemas/Api"
         budget_envelope:
           $ref: "#/components/schemas/BudgetEnvelope"
+        build:
+          $ref: "#/components/schemas/Build"
         build_info:
           type: string
           description: |
             Single-string identity: `<server_name> v<version>
             props_schema=<n>`. Matches the structured `server`
             object. Bumps `props_schema` on breaking changes.
-          example: "luce-dflash v0.0.0+cpp props_schema=2"
+
+            Deprecated in favor of the structured `build` block
+            (schema 3+), which also carries `git_sha`,
+            `image_tag`, and `build_time`. Retained for
+            back-compat — consumers that grep `build_info` keep
+            working.
+          example: "luce-dflash v0.0.0+cpp props_schema=3"
         capabilities:
           $ref: "#/components/schemas/Capabilities"
         daemon:
@@ -437,7 +496,10 @@ components:
       type: object
       required:
         - arch
+        - alias
+        - draft
         - draft_path
+        - target
         - tokenizer_id
       properties:
         arch:
@@ -446,18 +508,228 @@ components:
             Normalized `general.architecture` value from the loaded
             GGUF (e.g. `qwen35`, `qwen36`, `gemma4`, `laguna`).
           example: "qwen35"
+        alias:
+          type: string
+          description: |
+            Mirror of the top-level `model_alias` (schema 3+),
+            grouped under `model` alongside arch / target / draft.
+            The top-level `model_alias` stays for back-compat.
+          example: "dflash"
         draft_path:
           type: ["string", "null"]
           description: |
             Filesystem path of the loaded speculative-decode draft
-            GGUF; `null` when no draft is loaded.
-          example: "/.../dflash-draft-3.6-q4_k_m.gguf"
+            GGUF; `null` when no draft is loaded. Deprecated in
+            favor of `model.draft.path` (same value); retained for
+            back-compat with pre-schema-3 readers.
+          example: "/.../dflash-draft-3.6-q8_0.gguf"
         tokenizer_id:
           type: ["string", "null"]
           description: |
             Best-effort tokenizer family hint from GGUF metadata
             (e.g. `qwen3`). `null` when unknown.
           example: null
+        target:
+          oneOf:
+            - $ref: "#/components/schemas/GgufFile"
+            - type: "null"
+          description: |
+            GGUF identity for the loaded target weights (schema 3+).
+            `null` only when the file couldn't be inspected at
+            startup — typically a load failure that should have
+            aborted boot, so seeing `null` here is a strong signal
+            something is wrong.
+        draft:
+          oneOf:
+            - $ref: "#/components/schemas/GgufFile"
+            - type: "null"
+          description: |
+            GGUF identity for the loaded draft weights (schema 3+).
+            `null` when `--draft` was not passed — the normal
+            target-only configuration for `laguna` and the
+            `qwen3.6-moe` preset. Explicit null (not omitted) so
+            consumers can distinguish "no draft" from "missing
+            from this schema version."
+
+    GgufFile:
+      description: |
+        Identity payload for one loaded GGUF file (schema 3+).
+        Surfaced under `model.target` and `model.draft`. The triple
+        `path` + `size_bytes` + `sha256` is what "exactly what
+        weights is this server running" forensics need; the `gguf`
+        sub-object adds the header fields the loader parses anyway.
+
+        Header fields may be `null` when the GGUF doesn't carry the
+        corresponding key — drafter GGUFs in particular omit
+        `context_length` and `vocab_size` more often than full
+        target models do.
+      type: object
+      required:
+        - path
+        - size_bytes
+        - sha256
+        - gguf
+      properties:
+        path:
+          type: string
+          description: Absolute filesystem path of the loaded GGUF.
+          example: "/.../Qwen3.6-27B-Q4_K_M.gguf"
+        size_bytes:
+          type: ["integer", "null"]
+          format: int64
+          minimum: 0
+          description: File size in bytes; `null` if the stat() failed.
+          example: 17134510080
+        sha256:
+          type: ["string", "null"]
+          description: |
+            Lowercase hex sha256 of the GGUF file. Computed once at
+            server startup and cached to a `<path>.sha256` sidecar
+            so subsequent restarts skip the rehash. `null` when
+            hashing was disabled (`$DFLASH_SKIP_SHA256=1`) or the
+            sidecar was unreadable and the file couldn't be opened
+            for reading.
+          example: "abc123def456789...0a1b2c3d4e5f"
+        gguf:
+          type: object
+          description: |
+            Selected `general.*` and `<arch>.*` header fields read
+            from the GGUF. Each field is `null` when the file
+            doesn't carry the corresponding key.
+          additionalProperties: true
+          properties:
+            "general.architecture":
+              type: ["string", "null"]
+              description: Raw `general.architecture` value (e.g. `qwen35`).
+              example: "qwen35"
+            "general.name":
+              type: ["string", "null"]
+              description: Display name from the GGUF (`general.name`).
+              example: "Qwen3.6-27B"
+            "general.file_type":
+              type: ["integer", "null"]
+              minimum: 0
+              description: |
+                Raw `LLAMA_FTYPE_*` integer from the GGUF
+                (`general.file_type`). 15 = Q4_K_M, 17 = Q5_K_M,
+                30 = IQ4_XS, 32 = BF16, etc. See
+                `server/deps/llama.cpp/include/llama.h` for the
+                full table.
+              example: 15
+            "general.file_type_name":
+              type: ["string", "null"]
+              description: |
+                Decoded operator-friendly tag for `general.file_type`
+                (`Q4_K_M`, `IQ4_XS`, `BF16`, …). Empty string maps
+                to `null` when the int is outside the known table.
+              example: "Q4_K_M"
+            "general.quantization_version":
+              type: ["integer", "null"]
+              minimum: 0
+              description: |
+                Raw `general.quantization_version` from the GGUF.
+                Bumped on quant-format changes; 2 is the current
+                value for K-quants and IQ-quants in 2025-2026.
+              example: 2
+            block_count:
+              type: ["integer", "null"]
+              minimum: 0
+              description: "`<arch>.block_count` — number of transformer blocks."
+              example: 64
+            embedding_length:
+              type: ["integer", "null"]
+              minimum: 0
+              description: "`<arch>.embedding_length` — model hidden size."
+              example: 5120
+            context_length:
+              type: ["integer", "null"]
+              minimum: 0
+              description: |
+                `<arch>.context_length` — the maximum context the
+                weights themselves were trained for. May exceed the
+                server's runtime `n_ctx` cap.
+              example: 65536
+            vocab_size:
+              type: ["integer", "null"]
+              minimum: 0
+              description: |
+                `<arch>.vocab_size` or the length of
+                `tokenizer.ggml.tokens` (fallback). Useful for
+                catching target/draft tokenizer mismatches at a
+                glance.
+              example: 152064
+
+    Build:
+      description: |
+        Structured server + container identity (schema 3+). The
+        first three fields mirror the `server` block and the
+        single-string `build_info`; the next three carry the
+        Docker image identity baked in at build time via
+        `docker-bake.hcl` (`GIT_SHA`, `IMAGE_TAG`, `BUILD_TIME`).
+
+        On bare-metal / non-Docker builds (no
+        `/opt/lucebox-hub/IMAGE_INFO` file), `git_sha`,
+        `image_tag`, and `build_time` are all `null` — the keys
+        are still present for shape stability.
+      type: object
+      required:
+        - server_name
+        - server_version
+        - props_schema
+        - git_sha
+        - image_tag
+        - image_digest
+        - build_time
+      properties:
+        server_name:
+          type: string
+          description: Server identity string (= `server.name`).
+          example: "luce-dflash"
+        server_version:
+          type: string
+          description: Build version string (= `server.version`).
+          example: "0.0.0+cpp"
+        props_schema:
+          type: integer
+          minimum: 1
+          description: |
+            Integer schema version (= `server.props_schema`).
+            Repeated here so a single curl on `/props` `.build`
+            returns the schema version alongside the rest of the
+            identity.
+          example: 3
+        git_sha:
+          type: ["string", "null"]
+          description: |
+            Full git commit sha of the source tree the image was
+            built from. Set by CI from `${{ github.sha }}` via
+            docker-bake.hcl. `null` outside Docker.
+          example: "6d12378abc456789012345678901234567890abcd"
+        image_tag:
+          type: ["string", "null"]
+          description: |
+            Headline tag the image was published under (e.g.
+            `cuda12`, `sha-6d12378-cuda12`, `0.3.0-cuda12`). Set
+            by CI from `docker/metadata-action` `version` output.
+            `null` outside Docker.
+          example: "sha-6d12378-cuda12"
+        image_digest:
+          type: ["string", "null"]
+          description: |
+            Reserved for future use — the registry-side
+            content-addressable digest. Not currently populated by
+            the build pipeline (the running container doesn't
+            query its own image via the Docker socket). Always
+            `null` today.
+          example: null
+        build_time:
+          type: ["string", "null"]
+          format: date-time
+          description: |
+            ISO 8601 UTC timestamp the image was built at. Set by
+            CI via `date -u`; for local builds via
+            `scripts/build_image.sh`. `null` outside Docker.
+          example: "2026-05-28T13:43:57Z"
 
     ModelCard:
       description: |
@@ -866,9 +1138,12 @@ components:
           minimum: 1
           description: |
             Integer schema version. Bumps when the response shape
-            changes in a backward-incompatible way (see §5 of
-            props-endpoint.md). Current value is `2`.
-          example: 2
+            changes (see §5 of props-endpoint.md). Current value
+            is `3`. Schema 3 is additive over 2 (new `build`
+            block, new `model.target`/`model.draft`); the bump
+            still happens so consumers can negotiate the new
+            fields.
+          example: 3
         version:
           type: string
           description: Build version string (semver + build tag).

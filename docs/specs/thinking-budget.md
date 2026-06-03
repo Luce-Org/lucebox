@@ -125,7 +125,7 @@ Fields:
 | `verified_at` | ISO date the values were last checked against the source. |
 | `max_tokens` | The card's standard recommended combined cap. Drives `default_max_tokens`. |
 | `complex_problem_max_tokens` | Optional. The card's recommendation for hard reasoning / benchmark workloads. Drives the `x-high` and `max` effort tiers, which sit *above* `default_max_tokens` when this field is present — they are admissible as long as they fit under `max_ctx − hard_limit_reply_budget`. If omitted, both collapse to the `high` tier value. |
-| `hard_limit_reply_budget` | Optional. Tokens reserved post-`</think>` for the visible answer phase, used both to derive `think_max_tokens = max_tokens − hard_limit_reply_budget` and as the force-close trigger inside `do_ar_decode` / `do_spec_decode` (when `n_gen − generated ≤ hard_limit_reply_budget`, the engine overrides the next sampled token with `</think>`). Default 4096 (raised from 512 on 2026-05-25). The original 512 came from `ds4_eval.c`, sized for DeepSeek-V4-flash's terse style, but it silently truncated almost every other model mid-answer — bench results from `server/docs/experiments/gemma4-26b-thinking-control-2026-05-25.md` showed every force-closed thinking probe getting cut off mid-coordinate-geometry-proof at 512. Without priors on a specific model, 4096 is the safer default; terse models should override down. Qwen3.6, Gemma 4 26B, Gemma 4 31B all ship 4096 in their sidecars. |
+| `hard_limit_reply_budget` | Optional. Tokens reserved post-`</think>` for the visible answer phase, used both to derive `think_max_tokens = max_tokens − hard_limit_reply_budget` and as the force-close trigger inside `do_ar_decode` / `do_spec_decode` (when `n_gen − generated ≤ hard_limit_reply_budget`, the engine overrides the next sampled token with `</think>`). Default 4096 (raised from 512 on 2026-05-25). The original 512 came from `ds4_eval.c`, sized for DeepSeek-V4-flash's terse style, but it silently truncated almost every other model mid-answer — bench results from `docs/experiments/gemma4-26b-thinking-control-2026-05-25.md` showed every force-closed thinking probe getting cut off mid-coordinate-geometry-proof at 512. Without priors on a specific model, 4096 is the safer default; terse models should override down. Qwen3.6, Gemma 4 26B, Gemma 4 31B all ship 4096 in their sidecars. |
 | `sampling` | Recommended sampler params. Used as defaults when the request doesn't pin sampler values. |
 | `reasoning_effort_tiers` | Explicit phase-1 budgets per tier. Override any computed default. Whichever tiers are present win; missing tiers fall through to the computed defaults below. |
 
@@ -538,13 +538,44 @@ The current taxonomy is:
 | Value | Meaning |
 |---|---|
 | `natural` | The model emitted `</think>` on its own, either before reaching the phase-1 cap or before Level 2 had to force-close. |
-| `hard` | The phase-1 cap was reached without a model-emitted `</think>`. Either Level 2 force-closed the block in-loop (preserving KV) or Level 1 ran the phase-2 reprompt. |
+| `soft` | The soft-close logit-ratio peek (Level 2.5) fired before the hard cap — `prob[</think>] / prob[chosen_tok]` cleared the operator-configured `soft_close_min_ratio` threshold, and the AR loop injected `</think>` while the model was already "near" closing. Indicates voluntary cooperation: the model would have closed soon anyway; we just hurried it along to reclaim tokens. Currently Qwen3.5/3.6 only. |
+| `hard` | The phase-1 cap was reached without a model-emitted `</think>` and without the soft path triggering. Either Level 2 force-closed the block in-loop (preserving KV) or Level 1 ran the phase-2 reprompt. |
 
-A third value `soft` is reserved for a future voluntary-close
-mechanism (logit-biasing the model toward `</think>` as the cap
-approaches, before forcing it). Reserved so consumers can switch on
-the value without an exhaustive-match warning when a future server
-version adds it; not emitted today.
+When both `soft` and `hard` could fire on the same AR step (the
+soft threshold cleared at exactly the budget-edge step), `soft`
+wins — the soft trigger carries more information (the model agreed
+it was time) than the hard trigger (which only reports coercion).
+See `docs/experiments/soft-close-thinking-termination-plan.md` §4 +
+§12 for the design rationale.
+
+Soft-close is enabled by the operator via the CLI flag
+`--think-soft-close-min-ratio <F>`. Default `0.0` keeps the legacy
+two-value taxonomy (`natural` / `hard`); any positive value
+activates the third. The dial is a probability ratio in `[0, 1]`:
+
+| `min_ratio` | Behaviour |
+|---|---|
+| `0.0` | Disabled. Soft path inert; per-request overrides silently ignored. |
+| `0.05`–`0.2` | Conservative — fires only when `</think>` is within 5×–20× of the argmax probability. Recommended starting range. |
+| `0.5` | Aggressive — fires when `</think>` has at least half the probability of the chosen token. |
+| `1.0` | Strict — fires only when `</think>` IS the most-likely token. Useful as a safety check. |
+
+Per-request override (Anthropic envelope, see §4.1):
+
+```jsonc
+{
+  "thinking": {
+    "type": "enabled",
+    "soft_close_min_ratio": 0.1
+  }
+}
+```
+
+The per-request value clamps to `min(requested, server_default)` —
+clients can tighten (lower the threshold, fire more aggressively)
+but not loosen (raise it above the operator's ceiling). When the
+server has the dial disabled (`0.0`), per-request overrides are
+silently ignored — the feature is operator-policy gated.
 
 ## 8. Streaming
 
@@ -564,9 +595,18 @@ in the terminal `message_delta` event for Anthropic.
   server-configured ceiling, never looser. Allowing full override
   would re-create the silent-truncation footgun of middleboxes that
   drop unknown fields.
-- **Soft close-kind / soft-budget hint.** The mechanism (logit bias
-  to nudge `</think>` selection before the hard cap) is sketched in
-  §7 but not specified.
+- **Spec-decode soft-close peek.** Soft-close fires inside the AR
+  loop. When spec-decode is in use, the close still triggers at the
+  spec-decode → AR tail-off boundary (slightly later than pure-AR
+  mode); the verify/accept inner loop does not run the comparator.
+  Gemma 4 and Laguna are pure-AR; this only matters for Qwen3.5/3.6
+  with a draft model.
+- **Multi-token close joint probability.** When `</think>` tokenizes
+  to multiple ids, the soft-close comparator peeks only the FIRST
+  id's logit (the existing multi-token inject machinery drives the
+  remainder of the sequence on subsequent steps). The joint
+  `P(t_0, t_1, …)` peek is left to a v2 if false-positive rates
+  warrant it.
 - **Per-token close-info metadata.** The upstream reference exposes
   `(token_index, remaining_budget, rank)` for the close event. The
   current `finish_details` reports aggregate counts only.
