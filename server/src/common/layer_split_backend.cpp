@@ -57,8 +57,7 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
         result.error = "context";
         return result;
     }
-    if (req.do_sample && req.sampler.needs_logit_processing() &&
-        !adapter_->supports_cpu_sampling()) {
+    if (req.do_sample && req.sampler.temp > 0.0f) {
         result.error = "sampling_unsupported";
         return result;
     }

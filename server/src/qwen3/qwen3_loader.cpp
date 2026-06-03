@@ -133,6 +133,18 @@ bool load_qwen3_drafter_model(const std::string & path,
     out.head_dim   = (int)get_u32(gctx, "qwen3.attention.key_length", 128);
     out.rope_theta = get_f32(gctx, "qwen3.rope.freq_base", 1000000.0f);
 
+    // Detect weight quant type from blk.0.attn_q.weight; support BF16 and Q8_0.
+    ggml_type wtype = GGML_TYPE_BF16;
+    {
+        int64_t tidx = gguf_find_tensor(gctx, "blk.0.attn_q.weight");
+        if (tidx >= 0) {
+            wtype = gguf_get_tensor_type(gctx, tidx);
+        }
+    }
+    std::fprintf(stderr, "[qwen3-0.6b] detected weight type: %s\n",
+                 wtype == GGML_TYPE_Q8_0 ? "Q8_0" : "BF16");
+    std::fflush(stderr);
+
     // Compute total tensor metadata size for context allocation.
     const int n_layer = out.n_layer;
     const int n_tensors_per_layer = 11;

@@ -306,6 +306,8 @@ tokens) is the path to bring code recall to the same ratio as prose.
 
 ## Quick start
 
+> **Looking for the prebuilt Docker image?** See [Quick start](../README.md#quick-start) in the top-level README — `ghcr.io/luce-org/lucebox-hub:cuda12` ships the dflash daemon, Python server, and all weights bind-mountable from the host. The instructions below are for building dflash from source (kernel development, custom arch lists, non-Docker hosts).
+
 ```bash
 git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub
 cd lucebox-hub/dflash

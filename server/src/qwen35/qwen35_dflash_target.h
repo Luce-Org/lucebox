@@ -53,6 +53,11 @@ public:
     int mask_token_id() const override;
     const std::vector<int> & capture_layer_ids() const override;
 
+    // Per-call override for the verify-time flash-attention window. Used by
+    // do_spec_decode to widen the window when pflash compression has shrunk
+    // the prompt — see GenerateRequest.fa_window_override.
+    void set_fa_window(int fa) { fa_window_ = fa; }
+
 private:
     TargetWeights & w_;
     TargetCache & cache_;

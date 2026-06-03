@@ -102,6 +102,10 @@ struct GenerateRequest {
     const std::vector<int32_t> * hint_tokens = nullptr;
     // Optional thinking-budget hook — see BudgetHook docs above.
     BudgetHook                 budget_hook;
+    // Per-request override for target spec-decode verify fa_window. Set by
+    // http_server when pflash compresses, so verify sees the entire compressed
+    // prompt (not just the last cfg_.fa_window positions). Zero = no override.
+    int                        fa_window_override = 0;
     // Common retry knob. Upper layers set this after a speculative decode
     // path returns success but emits no tokens, so each backend can route the
     // retry through its existing AR path without copying retry policy.
@@ -251,6 +255,10 @@ struct ModelBackend {
         std::string          drafter_path;    // GGUF path (for lazy-load)
         int                  drafter_gpu = 0;  // backend-local GPU for PFlash drafter
         bool                 skip_park = false; // true on >=32GB GPUs
+        // Per-request transitive-cascade override (-1 = use env default).
+        // 0 = off (agentic path: suppress cascade to avoid anchor bloat).
+        // 1 = on  (retrieval path: full expansion, same as today).
+        int                  use_transitive = -1;
         DraftResidencyAction residency_action = DraftResidencyAction::KeepLoaded;
     };
 

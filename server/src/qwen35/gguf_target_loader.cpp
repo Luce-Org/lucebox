@@ -38,10 +38,7 @@
 //     ssm_out.weight                 [inner, hidden]           Q5_K
 //     ffn_gate/up/down              (same as full-attn)
 //
-// This loader reads the file via ggml's built-in GGUF API, which returns a
-// ggml_context pre-populated with tensors. We then wire that context onto
-// the CUDA backend (via ggml_backend_alloc_ctx_tensors) and copy each
-// tensor's bytes from the mmap'd file.
+// Loads via ggml GGUF API; tensors copied from mmap to CUDA backend.
 
 #include "internal.h"
 #include "common/layer_split_utils.h"
@@ -737,6 +734,51 @@ bool load_target_gguf_partial(const std::string & path,
     }
 
     gguf_free(gctx);
+
+    // Structural defense: derive scalar dims from weight tensor shapes and
+    // assert against GGUF-declared metadata. Catches stale/zero dw_ or w_
+    // scalars before they silently corrupt graph-build (Bug #2 class).
+    // Uses the first full-attention layer (il = fai-1) because deltanet
+    // layers don't carry wq/wk. wq packs Q+gate so ne[1] = n_head*kl*2.
+    {
+        const int fa_il = out.full_attention_interval - 1;  // first full-attn layer
+        const TargetLayer & fa = out.layers[(size_t)fa_il];
+        if (fa.wq && fa.wk) {
+            const int64_t derived_q_dim  = fa.wq->ne[1];  // n_head * head_dim * 2
+            const int64_t derived_kv_dim = fa.wk->ne[1];  // n_head_kv * head_dim
+            const int64_t expected_q_dim  = (int64_t)out.n_head * out.n_embd_head_k * 2;
+            const int64_t expected_kv_dim = (int64_t)out.n_head_kv * out.n_embd_head_k;
+            if (derived_q_dim != expected_q_dim) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "GGUF shape mismatch: blk.%d.attn_q.weight->ne[1]=%lld "
+                    "!= n_head*head_dim*2=%d*%d*2=%lld",
+                    fa_il, (long long)derived_q_dim,
+                    out.n_head, out.n_embd_head_k, (long long)expected_q_dim);
+                set_last_error(buf);
+                return false;
+            }
+            if (derived_kv_dim != expected_kv_dim) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "GGUF shape mismatch: blk.%d.attn_k.weight->ne[1]=%lld "
+                    "!= n_head_kv*head_dim=%d*%d=%lld",
+                    fa_il, (long long)derived_kv_dim,
+                    out.n_head_kv, out.n_embd_head_k, (long long)expected_kv_dim);
+                set_last_error(buf);
+                return false;
+            }
+            const int64_t derived_n_embd = fa.wq->ne[0];  // input dim = n_embd
+            if (derived_n_embd != (int64_t)out.n_embd) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "GGUF shape mismatch: blk.%d.attn_q.weight->ne[0]=%lld != n_embd=%d",
+                    fa_il, (long long)derived_n_embd, out.n_embd);
+                set_last_error(buf);
+                return false;
+            }
+        }
+    }
 
     if (tok_embd_off == 0 || tok_embd_type == GGML_TYPE_COUNT) {
         set_last_error("token_embd.weight not found or invalid type");

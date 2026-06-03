@@ -23,6 +23,7 @@
 #include "placement/placement_config.h"
 #include "common/layer_split_backend.h"
 #include "common/layer_split_utils.h"
+#include "qwen35/c2_gate.h"
 #include "placement/draft_residency.h"
 #include <nlohmann/json.hpp>
 
@@ -2696,6 +2697,58 @@ static void test_generate_result_accept_rate_zero_when_no_spec_decode() {
     TEST_ASSERT(r.accept_rate == 0.0f);
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// C2 gate: c2_spec_decode_permitted() unit tests
+//
+// Gate logic: permit spec-decode when eff_fa_window <= 2*fa_window_cfg.
+// eff_fa_window = fa_window_override when set, else fa_window_cfg.
+//
+// Empirical validation (Round 5 bench):
+// - D_composition 128K: effective_in=10988, eff_fa_window=11244 > 4096
+//   → gate BLOCKS spec-decode → AR at 27.5 tok/s (correct — spec at 5.74)
+// - D_composition short: eff_fa_window <= 4096 → gate permits spec-decode
+// ═══════════════════════════════════════════════════════════════════════
+
+static void test_c2_gate_no_override_always_permits() {
+    // fa_window_override == 0 → no pflash, always spec-decode permitted.
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(0, 2048, 1));
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(0, 2048, 4096));
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(0, 2048, 131072));
+}
+
+static void test_c2_gate_128k_compressed_blocks_spec() {
+    // Round 5 D 128K: effective_in=10988, fa_window_override=11244.
+    // 11244 > 2*2048=4096 → gate correctly BLOCKS spec-decode (AR wins empirically).
+    int fa_window_cfg = 2048;
+    int compressed_size = 10988;
+    int fa_window_override = compressed_size + 256;  // = 11244
+    TEST_ASSERT(!dflash::common::c2_spec_decode_permitted(
+        fa_window_override, fa_window_cfg, compressed_size));
+}
+
+static void test_c2_gate_65k_compressed_blocks_spec() {
+    // D 65K cell: effective_in≈5383, fa_window_override≈5639 > 4096 → blocks.
+    int compressed_size = 5383;
+    int fa_window_override = compressed_size + 256;
+    TEST_ASSERT(!dflash::common::c2_spec_decode_permitted(
+        fa_window_override, 2048, compressed_size));
+}
+
+static void test_c2_gate_small_compressed_permits_spec() {
+    // Small compressed KV (override <= 2*fa_window): spec-decode permitted.
+    // fa_window_override=3000 <= 4096 → permit
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(3000, 2048, 2744));
+    // fa_window_override=4096 == 2*2048 → permit (at boundary)
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(4096, 2048, 3840));
+}
+
+static void test_c2_gate_boundary_at_2x_fa_window() {
+    // At exactly 2*fa_window_cfg: permit (<=).
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(4096, 2048, 3840));
+    // At 2*fa_window_cfg + 1: block.
+    TEST_ASSERT(!dflash::common::c2_spec_decode_permitted(4097, 2048, 3841));
+}
+
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
     std::fprintf(stderr, " Server Unit Tests\n");
@@ -2866,6 +2919,13 @@ int main() {
     RUN_TEST(test_generate_result_accept_rate_in_usage_openai);
     RUN_TEST(test_generate_result_accept_rate_in_usage_anthropic);
     RUN_TEST(test_generate_result_accept_rate_zero_when_no_spec_decode);
+
+    std::fprintf(stderr, "\n── C2 gate (spec-decode gate) ──\n");
+    RUN_TEST(test_c2_gate_no_override_always_permits);
+    RUN_TEST(test_c2_gate_128k_compressed_blocks_spec);
+    RUN_TEST(test_c2_gate_65k_compressed_blocks_spec);
+    RUN_TEST(test_c2_gate_small_compressed_permits_spec);
+    RUN_TEST(test_c2_gate_boundary_at_2x_fa_window);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",
