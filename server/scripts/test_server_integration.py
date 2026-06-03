@@ -490,7 +490,12 @@ class TestReasoning:
 
     @pytest.mark.slow
     def test_thinking_enabled_via_chat_template_kwargs(self):
-        """Enabling thinking should produce reasoning_content."""
+        """Enabling thinking must route reasoning into reasoning_content,
+        not leak it into content. Regression guard for the Qwen3.6/Laguna
+        pre-opened-<think> bug: the chat template appends `<think>` to the
+        prompt suffix, so the model emits reasoning directly with no
+        opening tag. If the renderer→emitter wiring drops, reasoning_content
+        stays empty and the raw reasoning text appears in content."""
         r = post_json("/v1/chat/completions", {
             "model": MODEL_NAME,
             "messages": [{"role": "user", "content": "What is 15 * 17?"}],
@@ -500,13 +505,26 @@ class TestReasoning:
         })
         assert r.status_code == 200
         msg = r.json()["choices"][0]["message"]
-        assert msg["content"]
-        # With thinking enabled, model may produce reasoning_content
-        # (not guaranteed for short prompts, so we just check it doesn't crash)
+        reasoning = msg.get("reasoning_content") or ""
+        content = msg.get("content") or ""
+        assert reasoning, (
+            f"reasoning_content empty with enable_thinking=True — "
+            f"renderer→emitter wiring likely broken. content={content[:200]!r}"
+        )
+        assert "<think>" not in reasoning and "</think>" not in reasoning, (
+            f"raw think tags leaked into reasoning_content: {reasoning[:200]!r}"
+        )
+        assert "<think>" not in content and "</think>" not in content, (
+            f"think tags leaked into content channel: {content[:200]!r}"
+        )
+        assert content, "content channel empty — model never closed </think>"
 
     @pytest.mark.slow
     def test_thinking_enabled_via_reasoning_effort(self):
-        """OpenAI Responses-style reasoning.effort field."""
+        """OpenAI Responses-style reasoning.effort=high must also route
+        reasoning to reasoning_content. Same regression class as above
+        but reached through a different request shape (effort→template
+        kwargs translation in http_server.cpp)."""
         r = post_json("/v1/chat/completions", {
             "model": MODEL_NAME,
             "messages": [{"role": "user", "content": "What is 15 * 17?"}],
@@ -516,7 +534,15 @@ class TestReasoning:
         })
         assert r.status_code == 200
         msg = r.json()["choices"][0]["message"]
-        assert msg["content"]
+        reasoning = msg.get("reasoning_content") or ""
+        content = msg.get("content") or ""
+        assert reasoning, (
+            f"reasoning_content empty with reasoning.effort=high — "
+            f"renderer→emitter wiring likely broken. content={content[:200]!r}"
+        )
+        assert "<think>" not in reasoning and "</think>" not in reasoning
+        assert "<think>" not in content and "</think>" not in content
+        assert content
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -871,3 +897,243 @@ class TestStopSequences:
         content = r.json()["choices"][0]["message"]["content"]
         # Should produce some output since stop didn't match
         assert len(content) > 0
+
+
+# ═══════════════════════════════════════════════════════════════════
+# /props introspection — parity with dflash/scripts/server.py:1221
+# ═══════════════════════════════════════════════════════════════════
+
+class TestProps:
+    """Mirrors the Python server's /props shape so cross-server consumers
+    (autotune, dashboards, snapshot/profile) see a stable contract."""
+
+    def _fetch(self):
+        r = requests.get(f"{SERVER_URL}/props", timeout=10)
+        assert r.status_code == 200, f"/props returned {r.status_code}"
+        return r.json()
+
+    def test_top_level_keys_present(self):
+        body = self._fetch()
+        expected = {
+            "default_generation_settings", "model_alias", "model_path",
+            "build_info", "speculative_mode", "server", "model", "runtime",
+            "reasoning", "speculative", "sampling", "pflash", "prefix_cache",
+            "full_cache", "tool_replay", "daemon", "api", "capabilities",
+        }
+        missing = expected - set(body.keys())
+        assert not missing, f"/props missing top-level keys: {missing}"
+
+    def test_server_block_shape(self):
+        srv = self._fetch()["server"]
+        assert srv["name"] == "luce-dflash"
+        assert "version" in srv
+        assert isinstance(srv["props_schema"], int)
+
+    def test_speculative_mode_consistency(self):
+        body = self._fetch()
+        mode = body["speculative_mode"]
+        assert mode in {"off", "dflash", "pflash"}
+        if mode == "dflash":
+            assert body["speculative"]["enabled"] is True
+            assert body["pflash"]["enabled"] is False
+        elif mode == "pflash":
+            assert body["pflash"]["enabled"] is True
+        else:
+            assert body["speculative"]["enabled"] is False
+            assert body["pflash"]["enabled"] is False
+
+    def test_runtime_backend_value(self):
+        rt = self._fetch()["runtime"]
+        assert rt["backend"] in {"cuda", "hip", "cpu"}
+        assert isinstance(rt["fa_window"], int)
+        assert rt["kv_cache_k"]
+        assert rt["kv_cache_v"]
+
+    def test_capabilities_match_arch(self):
+        body = self._fetch()
+        caps = body["capabilities"]
+        # Reasoning + speculative + tools all flip together with arch family.
+        if caps["reasoning_supported"]:
+            assert caps["speculative_supported"] is True
+            assert caps["tools_supported"] is True
+            assert "medium" in body["reasoning"]["supported_efforts"]
+
+    def test_api_endpoint_registry(self):
+        endpoints = self._fetch()["api"]["endpoints"]
+        # Every endpoint the test suite hits must be in the registry.
+        required = {
+            "GET /health", "GET /props", "GET /v1/models",
+            "POST /v1/chat/completions", "POST /v1/messages",
+            "POST /v1/messages/count_tokens", "POST /v1/responses",
+        }
+        assert required.issubset(set(endpoints)), \
+            f"/props missing endpoints: {required - set(endpoints)}"
+
+    def test_prefix_cache_stats_shape(self):
+        pc = self._fetch()["prefix_cache"]
+        for key in ("capacity", "in_use", "lifetime_hits"):
+            assert key in pc, f"prefix_cache missing {key}"
+            assert isinstance(pc[key], int)
+
+    def test_tool_replay_stats_shape(self):
+        tr = self._fetch()["tool_replay"]
+        for key in ("max_entries", "max_bytes", "current_entries", "current_bytes"):
+            assert key in tr, f"tool_replay missing {key}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# /v1/messages/count_tokens — Anthropic count_tokens parity
+# ═══════════════════════════════════════════════════════════════════
+
+class TestCountTokens:
+    def test_simple_count(self):
+        body = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "Hello, world."}],
+        }
+        r = post_json("/v1/messages/count_tokens", body, timeout=10)
+        assert r.status_code == 200
+        payload = r.json()
+        assert "input_tokens" in payload
+        assert isinstance(payload["input_tokens"], int)
+        assert payload["input_tokens"] > 0
+
+    def test_count_scales_with_message_length(self):
+        short = {"model": MODEL_NAME,
+                 "messages": [{"role": "user", "content": "hi"}]}
+        long = {"model": MODEL_NAME,
+                "messages": [{"role": "user", "content": "word " * 200}]}
+        r_short = post_json("/v1/messages/count_tokens", short, timeout=10).json()
+        r_long  = post_json("/v1/messages/count_tokens", long,  timeout=10).json()
+        assert r_long["input_tokens"] > r_short["input_tokens"]
+
+    def test_count_with_system_block(self):
+        body = {
+            "model": MODEL_NAME,
+            "system": "You are a helpful assistant.",
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        r = post_json("/v1/messages/count_tokens", body, timeout=10)
+        assert r.status_code == 200
+        assert r.json()["input_tokens"] > 0
+
+    def test_count_does_not_generate(self):
+        """count_tokens must be fast — no generation. <1s budget vs many
+        seconds for a real generation."""
+        body = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "What is 1+1?"}],
+        }
+        t0 = time.monotonic()
+        r = post_json("/v1/messages/count_tokens", body, timeout=10)
+        elapsed = time.monotonic() - t0
+        assert r.status_code == 200
+        # 1s is generous; real bound is dominated by tokenizer + HTTP RTT.
+        assert elapsed < 1.0, f"count_tokens took {elapsed:.2f}s (expected <1s)"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Thinking-budget envelope — finish_details emission
+# ═══════════════════════════════════════════════════════════════════
+
+class TestThinkingBudget:
+    """Verifies the response includes a `finish_details` block when the
+    request opted in via `thinking: {type: "enabled"}`. Mirrors
+    docs/specs/thinking-budget.md:43-58.
+
+    Level 1 phase-1/phase-2 reprompt is now wired up: when the model
+    fails to emit </think> within --think-max-tokens, the server force-
+    closes via a synthetic "</think>\\n\\nFinal answer: " reprompt and
+    runs phase-2 for the remaining budget. close_kind reflects the path
+    taken ("natural" for self-close, "hard" for force-close).
+    """
+
+    @pytest.mark.slow
+    def test_finish_details_present_when_thinking_opted_in(self):
+        body = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "What is 2+2? Answer in one word."}],
+            "max_tokens": 256,
+            "thinking": {"type": "enabled"},
+            "temperature": 0,
+        }
+        r = post_json("/v1/chat/completions", body)
+        assert r.status_code == 200
+        choice = r.json()["choices"][0]
+        assert "finish_details" in choice, \
+            "finish_details missing despite thinking:{type:enabled}"
+        fd = choice["finish_details"]
+        assert fd["close_kind"] in {"natural", "hard"}
+        assert isinstance(fd["thinking_tokens"], int)
+        assert isinstance(fd["content_tokens"], int)
+        assert isinstance(fd["total_tokens"], int)
+        # Invariant: the two sub-counts sum to the total.
+        assert fd["thinking_tokens"] + fd["content_tokens"] == fd["total_tokens"]
+
+    def test_finish_details_absent_when_thinking_not_opted_in(self):
+        body = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "Say hi"}],
+            "max_tokens": 16,
+            "temperature": 0,
+        }
+        r = post_json("/v1/chat/completions", body)
+        assert r.status_code == 200
+        choice = r.json()["choices"][0]
+        assert "finish_details" not in choice, \
+            "finish_details should only appear when thinking is opted in"
+
+    @pytest.mark.slow
+    def test_close_kind_natural_when_model_self_closes(self):
+        """An easy prompt with a generous budget should let the model emit
+        </think> well within --think-max-tokens, producing close_kind="natural"
+        (no phase-2 reprompt fires)."""
+        body = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content":
+                          "What is 2+2? Answer in one word."}],
+            "max_tokens": 4096,
+            "thinking": {"type": "enabled"},
+            "temperature": 0,
+        }
+        r = post_json("/v1/chat/completions", body)
+        assert r.status_code == 200
+        fd = r.json()["choices"][0]["finish_details"]
+        assert fd["close_kind"] == "natural", \
+            f"expected natural close, got {fd['close_kind']}"
+        assert fd["content_tokens"] >= 0
+        # Phase-2 did not fire — content_tokens stays 0 when the model
+        # self-closes (all generated tokens are reasoning + content interleaved
+        # via the emitter on the phase-1 stream).
+        assert fd["content_tokens"] == 0
+        assert fd["thinking_tokens"] == fd["total_tokens"]
+
+    @pytest.mark.skipif(
+        os.environ.get("THINK_MAX_TOKENS_LOW") != "1",
+        reason="requires server started with very low --think-max-tokens "
+               "(set THINK_MAX_TOKENS_LOW=1 to enable when the running "
+               "server was launched with e.g. --think-max-tokens 32)",
+    )
+    @pytest.mark.slow
+    def test_close_kind_hard_on_phase2_trigger(self):
+        """A think-heavy prompt with a deliberately tiny --think-max-tokens
+        should trigger phase-2: the model can't finish reasoning in time,
+        the server force-closes </think> and runs a Final-answer reprompt."""
+        body = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content":
+                          "Reason step by step about the following: list the "
+                          "first 20 prime numbers, then explain why each is "
+                          "prime, then compute their sum. Be thorough."}],
+            "max_tokens": 4096,
+            "thinking": {"type": "enabled"},
+            "temperature": 0,
+        }
+        r = post_json("/v1/chat/completions", body)
+        assert r.status_code == 200
+        fd = r.json()["choices"][0]["finish_details"]
+        assert fd["close_kind"] == "hard", \
+            f"expected hard close, got {fd['close_kind']}"
+        assert fd["thinking_tokens"] > 0
+        assert fd["content_tokens"] > 0
+        assert fd["thinking_tokens"] + fd["content_tokens"] == fd["total_tokens"]
