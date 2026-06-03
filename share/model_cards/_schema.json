@@ -65,6 +65,17 @@
         "repetition_penalty": { "type": "number" }
       }
     },
+    "thinking_control": {
+      "type": "object",
+      "description": "Optional. Client-side prompt-level thinking-control tokens. Read by luce-bench when running against providers that ignore the API-side flags (chat_template_kwargs.enable_thinking / thinking / reasoning_effort) — for the Qwen3.x family this is e.g. '/think' and '/no_think'. The token is appended to the last user turn before serialization; see luce-bench/src/lucebench/_thinking.py. Only `user_turn_suffix` is supported in v1.",
+      "additionalProperties": false,
+      "required": ["think_prompt_token", "nothink_prompt_token", "injection_point"],
+      "properties": {
+        "think_prompt_token":   { "type": "string", "minLength": 1 },
+        "nothink_prompt_token": { "type": "string", "minLength": 1 },
+        "injection_point":      { "type": "string", "enum": ["user_turn_suffix"] }
+      }
+    },
     "reasoning_effort_tiers": {
       "type": "object",
       "description": "Optional. Explicit per-tier phase-1 budgets. Overrides any computed default. Use when ratio-based defaults don't fit the model.",

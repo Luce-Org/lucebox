@@ -3,11 +3,15 @@
   "source": "https://huggingface.co/Lucebox/Laguna-XS.2-GGUF",
   "verified_at": "2026-05-24",
   "download_urls": {
-    "Q4_K_M": "https://huggingface.co/Lucebox/Laguna-XS.2-GGUF/resolve/main/laguna-xs2-Q4_K_M.gguf",
-    "bf16":   "https://huggingface.co/Lucebox/Laguna-XS.2-GGUF/resolve/main/laguna-xs2-bf16.gguf"
+    "Q4_K_M-target":    "https://huggingface.co/Lucebox/Laguna-XS.2-GGUF/resolve/main/laguna-xs2-Q4_K_M.gguf",
+    "bf16-target":      "https://huggingface.co/Lucebox/Laguna-XS.2-GGUF/resolve/main/laguna-xs2-bf16.gguf",
+    "DFlash-speculator":"https://huggingface.co/poolside/Laguna-XS.2-speculator.dflash/resolve/main/model.safetensors",
+    "DFlash-speculator-config":"https://huggingface.co/poolside/Laguna-XS.2-speculator.dflash/resolve/main/config.json"
   },
-  "notes": "Non-reasoning MoE code model (3B active / 33B total). Card does not specify generation params or a complex-problem mode. context: native 4096, PFlash-extended to 131072. Sampling defaults below are code-model-typical (not from card). general.name has not been verified against a loaded GGUF — confirm and rename file if needed.",
-  "max_tokens": 4096,
+  "notes": "Reasoning MoE code model (3B active / 33B total). The README and the published Poolside speculator confirm a `<think>` reasoning channel and an `enable_thinking=true` chat-template flag. Native 131072 context. DFlash speculator is published as poolside/Laguna-XS.2-speculator.dflash (safetensors, 5-layer Qwen3-flavored draft: head_dim=128, hidden=2048, q_norm + k_norm). Our existing safetensors loader consumes it directly with dynamic dim inference; bench measured +60% decode rate vs no-draft (125 vs 78 tok/s at temp=0) on bragi. Sampling defaults are code-model conservative; the upstream card does not pin them.",
+  "max_tokens": 16384,
+  "hard_limit_reply_budget": 4096,
+  "thinking_terminator_hint": "Considering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n",
   "sampling": {
     "temperature": 0.6,
     "top_p": 0.95,
