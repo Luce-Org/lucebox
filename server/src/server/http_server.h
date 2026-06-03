@@ -88,6 +88,16 @@ struct ServerConfig {
     // forwards into GenerateRequest.budget_hook when thinking is opted in.
     std::vector<int32_t> think_close_token_ids;
 
+    // Token IDs resolved at server startup for the soft-close PROBE.
+    // Tokenization of just the close MARKER substring (e.g. `</think>`)
+    // — the bytes the soft-close logit-ratio peek compares against the
+    // chosen-token logit at each AR step. Conceptually separate from
+    // the inject sequence above: probing on the full directive's first
+    // token (typically a content lead-in like "Considering") forces
+    // soft-close to read a perpetually-low logit and never fire.
+    // Empty = legacy fallback: peek close_token_ids.front().
+    std::vector<int32_t> think_close_probe_token_ids;
+
     // Soft-close min-ratio default. When > 0 AND a request opts into
     // thinking, the AR loop force-emits </think> early once
     // prob[</think>] / prob[chosen] >= this ratio. 0.0 = soft-close
@@ -96,6 +106,21 @@ struct ServerConfig {
     // Range [0.0, 1.0]. See docs/specs/thinking-budget.md §7 and
     // docs/experiments/soft-close-thinking-termination-plan.md.
     float       soft_close_min_ratio = 0.0f;
+
+    // Minimum thinking tokens before soft-close is allowed to fire. The
+    // soft-close peek still runs every AR step (so trajectory logs
+    // remain complete), but the fire decision is suppressed until this
+    // many thinking tokens have been committed. False-positive guard.
+    // 0 = disabled (default — pre-floor behavior).
+    int         soft_close_min_tokens = 0;
+
+    // Diagnostic: when true, the AR loop emits one stderr line per
+    // thinking-phase step with the close-vs-chosen logit values, so a
+    // sliding-ratio curve can be tuned from real trajectory data.
+    // Operator-only flag; per-request overrides not exposed because
+    // the stderr volume is heavy. Plumbed through to
+    // BudgetHook::debug_thinking_logits when the budget hook is wired.
+    bool        debug_thinking_logits = false;
 
     // Phase-1 budgets per `reasoning.effort` tier (spec §4.2). Selected
     // by the request parser when `reasoning.effort` is present. Each

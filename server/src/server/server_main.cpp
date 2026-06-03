@@ -205,6 +205,18 @@ static void print_usage(const char * prog) {
         "                             10x of argmax (mild), 0.5=fire at half-prob\n"
         "                             (aggressive), 1.0=fire only when close is\n"
         "                             argmax. See docs/specs/thinking-budget.md §7.\n"
+        "  --think-soft-close-min-tokens <N>\n"
+        "                             Minimum thinking tokens before soft-close\n"
+        "                             may fire. Floors the fire decision so a\n"
+        "                             brief close-marker logit spike early in\n"
+        "                             reasoning cannot prematurely terminate\n"
+        "                             thinking. 0 = disabled (default). Typical\n"
+        "                             values: 64-256 for qwen3.6-27b.\n"
+        "  --debug-thinking-logits    Emit one stderr line per AR step inside the\n"
+        "                             thinking phase recording committed/chosen/\n"
+        "                             logit[close]/logit[chosen]/diff/prob_ratio.\n"
+        "                             Use to record close-vs-chosen logit\n"
+        "                             trajectories. Stderr-heavy; operator only.\n"
         "\n"
         "KV cache:\n"
         "  --cache-type-k <type>  KV cache K type (f16,bf16,q4_0,q4_1,q5_0,q5_1,q8_0,tq3_0)\n"
@@ -268,6 +280,8 @@ int main(int argc, char ** argv) {
         bool effort_x_high           = false;
         bool effort_max              = false;
         bool soft_close_min_ratio    = false;
+        bool soft_close_min_tokens   = false;
+        bool debug_thinking_logits   = false;
     } cli_set;
 
     // Track whether the operator passed the legacy --max-tokens alias.
@@ -397,6 +411,19 @@ int main(int argc, char ** argv) {
             }
             sconfig.soft_close_min_ratio = r;
             cli_set.soft_close_min_ratio = true;
+        } else if (std::strcmp(argv[i], "--think-soft-close-min-tokens") == 0 && i + 1 < argc) {
+            int n = std::atoi(argv[++i]);
+            if (n < 0) {
+                std::fprintf(stderr,
+                    "[server] --think-soft-close-min-tokens=%d < 0; "
+                    "clamping to 0 (disabled)\n", n);
+                n = 0;
+            }
+            sconfig.soft_close_min_tokens = n;
+            cli_set.soft_close_min_tokens = true;
+        } else if (std::strcmp(argv[i], "--debug-thinking-logits") == 0) {
+            sconfig.debug_thinking_logits = true;
+            cli_set.debug_thinking_logits = true;
         } else if (std::strcmp(argv[i], "--prefill-compression") == 0 && i + 1 < argc) {
             const char * mode = argv[++i];
             if (std::strcmp(mode, "auto") == 0)
@@ -748,6 +775,12 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  soft_close_ratio= %.4f (%s)\n",
                  sconfig.soft_close_min_ratio,
                  cli_set.soft_close_min_ratio ? "from CLI" : "default (disabled)");
+    std::fprintf(stderr, "[server] │  soft_close_floor= %d (%s)\n",
+                 sconfig.soft_close_min_tokens,
+                 cli_set.soft_close_min_tokens ? "from CLI" : "default (disabled)");
+    std::fprintf(stderr, "[server] │  debug_think_log = %s (%s)\n",
+                 sconfig.debug_thinking_logits ? "true" : "false",
+                 cli_set.debug_thinking_logits ? "from CLI" : "default (off)");
     std::fprintf(stderr, "[server] │  effort tiers    = low=%d (%s)\n",
                  sconfig.effort_tiers.low, src_of(cli_set.effort_low));
     std::fprintf(stderr, "[server] │                    medium=%d (%s)\n",
@@ -906,6 +939,40 @@ int main(int argc, char ** argv) {
             }
             if (close_ids.size() > 16) std::fprintf(stderr, ",...");
             std::fprintf(stderr, "\n");
+
+            // Probe-vs-inject split: when the inject sequence is the
+            // full directive hint (Qwen3.x-style trained lead-in), the
+            // first inject token is a content lead-in like "Considering"
+            // whose logit sits 19-35 nats below chosen during reasoning.
+            // Soft-close peeking that token never fires (empirical: see
+            // probe trajectory data). Tokenize JUST the marker substring
+            // and ship it as the probe sequence — at the AR boundary the
+            // marker's logit IS argmax-competitive (~prob_ratio>=0.5).
+            // When the hint and marker are identical (marker-only case),
+            // leave the probe field empty: BudgetHook::soft_close_probe_token()
+            // falls back to close_token_ids.front(), so this is a no-op.
+            if (!card.thinking_terminator_hint.empty() &&
+                close_text.find(marker) != std::string::npos &&
+                close_text != marker)
+            {
+                auto probe_ids = tokenizer.encode(marker);
+                if (!probe_ids.empty()) {
+                    sconfig.think_close_probe_token_ids = probe_ids;
+                    std::fprintf(stderr,
+                        "[server] soft-close probe (marker=\"%s\", %zu tokens): ",
+                        marker.c_str(), probe_ids.size());
+                    for (size_t i = 0; i < std::min<size_t>(probe_ids.size(), 8); ++i) {
+                        std::fprintf(stderr, "%s%d", i ? "," : "", probe_ids[i]);
+                    }
+                    if (probe_ids.size() > 8) std::fprintf(stderr, ",...");
+                    std::fprintf(stderr, "\n");
+                } else {
+                    std::fprintf(stderr,
+                        "[server] soft-close probe DISABLED: marker \"%s\" "
+                        "tokenizes to empty; legacy fallback (probe = inject[0]) "
+                        "in effect.\n", marker.c_str());
+                }
+            }
         } else {
             std::fprintf(stderr,
                 "[server] level-2 force-close DISABLED: text %.40s... "

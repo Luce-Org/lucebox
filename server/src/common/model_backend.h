@@ -72,23 +72,63 @@ struct DaemonIO {
 // decode) — the perf trade-off is acceptable since this only kicks in
 // for thinking-enabled requests. Spec-decode integration is a follow-up.
 struct BudgetHook {
-    // Multi-token close sequence injected when `(n_gen - committed)`
-    // drops to `hard_limit_remaining`. For Qwen3.x this is the
-    // canonical "Considering the limited time..." summarize-and-stop
-    // lead-in (tokenized at server startup); for non-qwen arches it's
-    // a single close-tag token. Empty = hook disabled.
+    // Inject sequence written when the hard cap fires OR when soft-close
+    // fires. This is the verbatim tokenization of the model card's
+    // `thinking_terminator_hint` (e.g. for Qwen3.6 the lead-in
+    // "Considering the limited time by the user, ... </think>\n\n").
+    // May be many tokens long; the first element is what the AR loop
+    // writes on the firing step, with the rest streamed out on
+    // subsequent steps. Empty = disabled.
     std::vector<int32_t> close_token_ids;
+    // Short PROBE sequence used by the soft-close logit-ratio peek.
+    // Conceptually this is the tokenization of just the close MARKER
+    // (e.g. `</think>` — a single token id 248069 on Qwen3.6) rather
+    // than the full inject directive above. Splitting probe-vs-inject
+    // matters because the inject sequence for trained-hint models
+    // starts with a content token like "Considering" whose logit is
+    // 19-35 nats below the chosen token at every step, masking the
+    // close-marker's true probability and preventing soft-close from
+    // ever firing.
+    // When empty, the soft-close peek falls back to
+    // `close_token_ids.front()` (legacy behavior — kept so models that
+    // haven't been updated keep working identically to before the split).
+    std::vector<int32_t> soft_close_probe_ids;
     int                  hard_limit_remaining = 0;
     // Soft-close (Level 2 voluntary). When > 0, at each AR step the
-    // loop compares the close-token logit against the chosen-token
-    // logit; if `prob[close[0]] / prob[chosen] >= soft_close_min_ratio`
-    // (equivalently `logit[close[0]] - logit[chosen] >= log(min_ratio)`),
-    // the close sequence is injected BEFORE the hard-limit is reached.
-    // 0.0 = disabled (default); 1.0 = fire only when close is already
-    // the most-likely token; lower values = fire more aggressively.
-    // See docs/specs/thinking-budget.md §7 and
+    // loop compares the probe-token logit against the chosen-token
+    // logit; if `prob[probe[0]] / prob[chosen] >= soft_close_min_ratio`
+    // (equivalently `logit[probe[0]] - logit[chosen] >= log(min_ratio)`),
+    // the inject sequence (close_token_ids) is written BEFORE the hard
+    // limit is reached. 0.0 = disabled (default); 1.0 = fire only when
+    // the probe token is already the most-likely token; lower values =
+    // fire more aggressively. See docs/specs/thinking-budget.md §7 and
     // docs/experiments/soft-close-thinking-termination-plan.md.
     float                soft_close_min_ratio = 0.0f;
+    // Minimum thinking tokens before soft-close is allowed to fire.
+    // Soft-close peek runs on every AR step but the fire decision is
+    // gated by this floor — protects against premature termination on
+    // prompts where the close-marker logit briefly spikes mid-thought.
+    // 0 = floor disabled (default). Per empirical trajectory data on
+    // qwen3.6-27b (5 diverse prompts), </think> only becomes
+    // argmax-competitive at 66-94% of natural reasoning length — so a
+    // floor in the 64-256 range is the typical operating point.
+    int                  soft_close_min_tokens = 0;
+    // Diagnostic: when true, emit one stderr line per AR step inside the
+    // thinking phase with (committed, chosen_tok, logit[probe0],
+    // logit[chosen], diff). Used to record the close-vs-chosen logit
+    // trajectory across a full thinking run so a sliding-threshold curve
+    // can be designed from empirical data rather than guessed. Zero cost
+    // when off. See server_main.cpp --debug-thinking-logits.
+    bool                 debug_thinking_logits = false;
+
+    // Probe token id used by the soft-close peek. Returns the first
+    // element of soft_close_probe_ids when set, otherwise falls back to
+    // close_token_ids.front() (legacy behavior). Callers must guard
+    // against an empty hook before calling this.
+    int32_t soft_close_probe_token() const {
+        if (!soft_close_probe_ids.empty()) return soft_close_probe_ids.front();
+        return close_token_ids.front();
+    }
 };
 
 namespace soft_close {

@@ -2604,17 +2604,23 @@ static int32_t step_close_state(int32_t                       chosen_tok,
     if (state.started) return chosen_tok;  // sequence already complete
 
     // Soft check (BEFORE hard, per plan §4).
+    // Probe-vs-inject split: peek hook.soft_close_probe_token(), write
+    // hook.close_token_ids.front() on fire.
+    // Min-tokens floor: suppress fire until generated_so_far >=
+    // hook.soft_close_min_tokens. Mirrors qwen35_backend.cpp gate.
+    const int generated_so_far = committed_now - committed_at_entry;
     if (!hook.close_token_ids.empty() &&
         hook.soft_close_min_ratio > 0.0f &&
+        generated_so_far >= hook.soft_close_min_tokens &&
         dflash::common::soft_close::should_fire(
             logits, chosen_tok,
-            hook.close_token_ids.front(),
+            hook.soft_close_probe_token(),
             hook.soft_close_min_ratio))
     {
         state.started    = true;
         state.inject_pos = 1;
         state.soft_fired = true;
-        return hook.close_token_ids.front();
+        return hook.close_token_ids.front();  // INJECT, not probe
     }
 
     // Hard check: remaining <= hard_limit_remaining.
@@ -2900,6 +2906,142 @@ static void test_soft_close_natural_at_boundary() {
     TEST_ASSERT(state.hard_fired == false);
 }
 
+// Probe-vs-inject split. When soft_close_probe_ids is set, the
+// comparator MUST peek the probe[0] logit, NOT inject[0]. Otherwise
+// trained-hint sidecars (inject[0] = content lead-in token) keep
+// the dial pinned at zero.
+static void test_soft_close_probe_uses_probe_ids_not_inject_ids() {
+    using namespace dflash::common;
+    BudgetHook hook;
+    // Multi-token inject (mirrors a trained-hint sidecar).
+    hook.close_token_ids = { 99, 100, 101 };
+    // Distinct single-token probe (the close marker).
+    hook.soft_close_probe_ids = { 42 };
+    hook.soft_close_min_ratio = 0.5f;
+
+    std::vector<float> row(250000, -100.0f);
+    row[300] = 11.0f;     // chosen
+    row[42]  = 10.0f;     // probe — within ratio 0.5 (exp(10-11)=0.37 < 0.5? no, 0.367)
+    row[42]  = 10.31f;    // exp(10.31-11) ≈ 0.502 — JUST fires at 0.5
+    row[99]  = -50.0f;    // inject[0] far below — must not influence fire
+
+    CloseState state;
+    int32_t out = step_close_state(/*chosen=*/300, row.data(), hook,
+                                    /*committed_now=*/200, 50, 500, state);
+    TEST_ASSERT(state.soft_fired == true);
+    TEST_ASSERT(out == 99);   // wrote inject[0], not probe[0]
+    TEST_ASSERT(state.inject_pos == 1);
+}
+
+// Empty soft_close_probe_ids ⇒ legacy fallback: peek close_token_ids
+// front. Guarantees zero churn for any caller that doesn't set the
+// new probe field.
+static void test_soft_close_probe_ids_empty_falls_back_to_close_token_ids() {
+    using namespace dflash::common;
+    BudgetHook hook;
+    hook.close_token_ids = { 248069 };
+    // hook.soft_close_probe_ids left empty (legacy).
+    hook.soft_close_min_ratio = 0.5f;
+
+    std::vector<float> row(250000, -100.0f);
+    row[300]    = 11.0f;
+    row[248069] = 10.31f;  // close_token_ids[0]'s logit — same as before
+
+    CloseState state;
+    int32_t out = step_close_state(/*chosen=*/300, row.data(), hook,
+                                    /*committed_now=*/200, 50, 500, state);
+    TEST_ASSERT(state.soft_fired == true);
+    TEST_ASSERT(out == 248069);
+    // Sanity: soft_close_probe_token() returns inject[0] when probe is empty.
+    TEST_ASSERT(hook.soft_close_probe_token() == 248069);
+}
+
+// When soft-close fires, the WRITTEN sequence MUST be close_token_ids
+// (the full inject), regardless of what soft_close_probe_ids contains.
+// The probe is read-only — never appears in the output stream.
+static void test_soft_close_inject_sequence_unchanged_when_fires() {
+    using namespace dflash::common;
+    BudgetHook hook;
+    hook.close_token_ids = { 1718, 37947, 32 };
+    hook.soft_close_probe_ids = { 42 };
+    hook.soft_close_min_ratio = 0.1f;
+
+    std::vector<float> row(250000, -100.0f);
+    row[300] = 5.0f;
+    row[42]  = 3.0f;        // probe within ratio 0.1
+    row[1718] = -80.0f;     // inject[0] far below — must not matter
+
+    CloseState state;
+    int32_t out = step_close_state(/*chosen=*/300, row.data(), hook,
+                                    /*committed_now=*/100, 50, 200, state);
+    TEST_ASSERT(state.soft_fired == true);
+    TEST_ASSERT(out == 1718);
+
+    std::vector<float> row2(250000, -100.0f);
+    row2[999] = 5.0f;
+    out = step_close_state(/*chosen=*/999, row2.data(), hook,
+                            /*committed_now=*/101, 50, 200, state);
+    TEST_ASSERT(out == 37947);
+    out = step_close_state(/*chosen=*/999, row2.data(), hook,
+                            /*committed_now=*/102, 50, 200, state);
+    TEST_ASSERT(out == 32);
+    out = step_close_state(/*chosen=*/999, row2.data(), hook,
+                            /*committed_now=*/103, 50, 200, state);
+    TEST_ASSERT(out == 999);
+}
+
+// min_thinking_tokens floor: when set, fire is suppressed until
+// generated_so_far >= soft_close_min_tokens.
+static void test_soft_close_min_tokens_blocks_early_fire() {
+    using namespace dflash::common;
+    BudgetHook hook;
+    hook.close_token_ids = { 1718 };
+    hook.soft_close_probe_ids = { 42 };
+    hook.soft_close_min_ratio = 0.5f;
+    hook.soft_close_min_tokens = 100;
+
+    std::vector<float> row(250000, -100.0f);
+    row[300] = 5.0f;
+    row[42]  = 5.0f;   // prob_ratio = 1.0 ≫ 0.5
+
+    // Below floor: generated_so_far = 90 - 50 = 40 < 100 ⇒ no fire.
+    CloseState state_early;
+    int32_t out = step_close_state(/*chosen=*/300, row.data(), hook,
+                                    /*committed_now=*/90, 50, 500,
+                                    state_early);
+    TEST_ASSERT(state_early.soft_fired == false);
+    TEST_ASSERT(out == 300);
+
+    // Above floor: generated_so_far = 200 - 50 = 150 >= 100 ⇒ fires.
+    CloseState state_late;
+    out = step_close_state(/*chosen=*/300, row.data(), hook,
+                            /*committed_now=*/200, 50, 500,
+                            state_late);
+    TEST_ASSERT(state_late.soft_fired == true);
+    TEST_ASSERT(out == 1718);
+}
+
+// Default soft_close_min_tokens=0 ⇒ no floor ⇒ fire as soon as
+// qualifying logits show up. Confirms the floor is opt-in.
+static void test_soft_close_min_tokens_default_zero_unchanged_behavior() {
+    using namespace dflash::common;
+    BudgetHook hook;
+    hook.close_token_ids = { 1718 };
+    hook.soft_close_probe_ids = { 42 };
+    hook.soft_close_min_ratio = 0.5f;
+    // soft_close_min_tokens left at default 0.
+
+    std::vector<float> row(250000, -100.0f);
+    row[300] = 5.0f;
+    row[42]  = 5.0f;
+
+    CloseState state;
+    int32_t out = step_close_state(/*chosen=*/300, row.data(), hook,
+                                    /*committed_now=*/1, 0, 500, state);
+    TEST_ASSERT(state.soft_fired == true);
+    TEST_ASSERT(out == 1718);
+}
+
 static void test_soft_close_determinism_when_disabled() {
     // Byte-identical generation invariant: with min_ratio=0, the
     // override token MUST equal the chosen token for every step, for
@@ -2917,7 +3059,10 @@ static void test_soft_close_determinism_when_disabled() {
         int32_t chosen = (int32_t)(rng() % 1000);
         float l_chosen = (float)(rng() % 100) / 10.0f - 5.0f;
         float l_close  = (float)(rng() % 100) / 10.0f - 5.0f;
-        auto row = make_logits(1000, chosen, /*close=*/248069,
+        // vocab=250000 covers close_tok=248069. Pre-existing OOB on the
+        // 1000-element row was silently passing in Release builds; new
+        // tests perturbing heap layout could turn it into a crash.
+        auto row = make_logits(/*vocab=*/250000, chosen, /*close=*/248069,
                                 l_chosen, l_close);
         int32_t out = step_close_state(chosen, row.data(), hook,
                                         /*committed_now=*/step, 0, 200,
@@ -3106,6 +3251,11 @@ int main() {
     RUN_TEST(test_soft_close_then_hard_would_fire);
     RUN_TEST(test_soft_close_disabled_hard_still_fires);
     RUN_TEST(test_soft_close_natural_at_boundary);
+    RUN_TEST(test_soft_close_probe_uses_probe_ids_not_inject_ids);
+    RUN_TEST(test_soft_close_probe_ids_empty_falls_back_to_close_token_ids);
+    RUN_TEST(test_soft_close_inject_sequence_unchanged_when_fires);
+    RUN_TEST(test_soft_close_min_tokens_blocks_early_fire);
+    RUN_TEST(test_soft_close_min_tokens_default_zero_unchanged_behavior);
     RUN_TEST(test_soft_close_determinism_when_disabled);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");

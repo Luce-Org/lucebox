@@ -1350,6 +1350,8 @@ void HttpServer::worker_loop() {
                 ? req.per_req_reply_budget
                 : config_.hard_limit_reply_budget;
             gen_req.budget_hook.close_token_ids = config_.think_close_token_ids;
+            gen_req.budget_hook.soft_close_probe_ids =
+                config_.think_close_probe_token_ids;
             gen_req.budget_hook.hard_limit_remaining = eff_reply_budget;
 
             // Soft-close min-ratio. Operator-gated: only forwarded when
@@ -1362,6 +1364,18 @@ void HttpServer::worker_loop() {
                         ? req.per_req_soft_close_min_ratio
                         : config_.soft_close_min_ratio;
             }
+
+            // Minimum-thinking-tokens floor: false-positive guard for
+            // soft-close. Server-policy only (no per-request override).
+            gen_req.budget_hook.soft_close_min_tokens =
+                config_.soft_close_min_tokens;
+
+            // Diagnostic trajectory log — operator dial only. Carried
+            // through the BudgetHook so the AR loop can emit one line
+            // per thinking step regardless of whether soft-close is
+            // armed. See model_backend.h BudgetHook::debug_thinking_logits.
+            gen_req.budget_hook.debug_thinking_logits =
+                config_.debug_thinking_logits;
         }
 
         // Tool call hint generation: pre-tokenize predictable structural tokens
