@@ -69,10 +69,22 @@ _AREAS = {
     "code": (humaneval, humaneval.grade_humaneval_case, humaneval.load_humaneval_cases()),
     "longctx": (longctx, longctx.grade_longctx_case, longctx.LONGCTX_CASES),
     "agent": (agent, agent.grade_agent_case, agent.load_agent_cases()),
+    # ``agent_recorded`` (new default, multi-turn replay + LLM judge) is
+    # NOT regradable by this CLI — the rows already carry a judge
+    # verdict and re-grading would require re-billing the Anthropic API.
+    # The legacy v1 area (single-turn tool-schema-coverage) IS
+    # regradable; we keep the ``agent_recorded`` key pointed at the v1
+    # grader so old snapshot files (which used the ``agent_recorded``
+    # area name when v1 was the default) re-grade unchanged.
     "agent_recorded": (
         agent_recorded,
-        agent_recorded.grade_agent_recorded_case,
-        agent_recorded.load_agent_recorded_cases(),
+        agent_recorded.grade_agent_recorded_v1_case,
+        agent_recorded.load_agent_recorded_v1_cases(),
+    ),
+    "agent_recorded_v1": (
+        agent_recorded,
+        agent_recorded.grade_agent_recorded_v1_case,
+        agent_recorded.load_agent_recorded_v1_cases(),
     ),
 }
 

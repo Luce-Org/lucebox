@@ -603,6 +603,47 @@ def _append_message(messages: list[dict[str, str]], role: str, text: str) -> int
     return added
 
 
+def _truncate_to_user_with_reference(
+    messages: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], str | None]:
+    """Split ``messages`` into (prefix_ending_on_user, last_assistant_text).
+
+    The v1 multi-turn schema requires that ``messages`` ends on a user
+    turn (so the model under test is being asked to *generate* the next
+    assistant response — that's what we send to /v1/chat/completions) and
+    that ``reference_response`` carries the assistant text that Claude
+    actually emitted at that point — that's the ground truth the LLM
+    judge compares the candidate's response to.
+
+    Returns ``([...], None)`` if there's no assistant turn to lift out
+    (e.g. the prefix is one short user message). The caller must skip
+    cases with ``reference_response is None`` because they can't be
+    quality-graded.
+    """
+    if not messages:
+        return ([], None)
+    # Find the last assistant index.
+    last_asst_idx: int | None = None
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i]["role"] == "assistant":
+            last_asst_idx = i
+            break
+    if last_asst_idx is None:
+        return (messages, None)
+    # The reference is that assistant turn's content.
+    reference = messages[last_asst_idx]["content"]
+    # Everything before that assistant turn is the prefix to send.
+    prefix = messages[:last_asst_idx]
+    # The prefix must end on user — if the prior turn was assistant
+    # (consecutive same-role collapse should have prevented this, but be
+    # defensive), drop it.
+    while prefix and prefix[-1]["role"] != "user":
+        prefix = prefix[:-1]
+    if not prefix:
+        return ([], None)
+    return (prefix, reference)
+
+
 def _build_multi_turn_case(
     *,
     source: str,
@@ -614,13 +655,36 @@ def _build_multi_turn_case(
     cwd: str | None,
     git_branch: str | None,
     timestamp: str | None,
-) -> dict[str, Any]:
-    """Assemble one multi-turn case snapshot at a bucket crossing."""
+) -> dict[str, Any] | None:
+    """Assemble one multi-turn case snapshot at a bucket crossing.
+
+    Returns ``None`` if the snapshot has no extractable
+    ``reference_response`` (no assistant turn before a user-ending
+    prefix). Callers must skip these — the v1 schema requires a
+    reference_response for the LLM judge.
+    """
+    prefix, reference = _truncate_to_user_with_reference(messages)
+    if not prefix or reference is None or not reference.strip():
+        return None
+    # Demand at least one full user-assistant-user exchange in the
+    # prefix. A single-turn prefix (just the AGENTS.md preamble) gives
+    # the judge nothing to compare the model's response to in context —
+    # the model has no prior assistant work to be coherent with.
+    if len(prefix) < 3:
+        return None
+    # And a non-trivial reference — anything shorter than 40 chars
+    # ("ok.", "Sure.") doesn't carry enough signal for the judge.
+    if len(reference.strip()) < 40:
+        return None
     scrubbed_messages = [
-        {"role": m["role"], "content": _scrub(m["content"])} for m in messages
+        {"role": m["role"], "content": _scrub(m["content"])} for m in prefix
     ]
+    scrubbed_reference = _scrub(reference)
     scrubbed_cwd = _scrub(cwd) if cwd else None
-    actual_tokens = actual_chars // _CHARS_PER_TOKEN
+    # Recompute char count over the truncated prefix — the actual_chars
+    # the slicer tracked included the lifted-out assistant turn.
+    actual_chars_trunc = sum(len(m["content"]) for m in scrubbed_messages)
+    actual_tokens = actual_chars_trunc // _CHARS_PER_TOKEN
 
     # Stable id: source session + target bucket. Same session re-extracted
     # produces the same id per bucket; different buckets from the same
@@ -635,8 +699,9 @@ def _build_multi_turn_case(
         "source": source,
         "kind": "multi-turn-replay",
         "messages": scrubbed_messages,
+        "reference_response": scrubbed_reference,
         "context_tokens_approx": actual_tokens,
-        "context_chars": actual_chars,
+        "context_chars": actual_chars_trunc,
         "target_bucket_tokens": bucket_tokens,
         "n_messages": len(scrubbed_messages),
         "source_session_id": session_id,
@@ -646,7 +711,7 @@ def _build_multi_turn_case(
             "git_branch": git_branch,
         },
         "verifier": {
-            "type": "prefill-and-decode",
+            "type": "cache-and-quality",
             "min_response_chars": 1,
             "max_wall_seconds": 300,
         },
@@ -713,19 +778,19 @@ def _slice_session_multi_turn(
         # < sorted_buckets[next_idx].
         while next_idx < len(sorted_buckets) and projected_tokens > sorted_buckets[next_idx]:
             if meta["session_id"] is not None and messages:
-                cases.append(
-                    _build_multi_turn_case(
-                        source=source,
-                        session_id=meta["session_id"],
-                        bucket_tokens=sorted_buckets[next_idx],
-                        actual_chars=cum_chars,
-                        messages=messages,
-                        source_path=path,
-                        cwd=meta["cwd"],
-                        git_branch=meta["git_branch"],
-                        timestamp=meta["first_timestamp"],
-                    )
+                built = _build_multi_turn_case(
+                    source=source,
+                    session_id=meta["session_id"],
+                    bucket_tokens=sorted_buckets[next_idx],
+                    actual_chars=cum_chars,
+                    messages=messages,
+                    source_path=path,
+                    cwd=meta["cwd"],
+                    git_branch=meta["git_branch"],
+                    timestamp=meta["first_timestamp"],
                 )
+                if built is not None:
+                    cases.append(built)
             next_idx += 1
 
         if next_idx >= len(sorted_buckets):
@@ -746,19 +811,19 @@ def _slice_session_multi_turn(
             fit_idx += 1
         fit_idx -= 1  # last bucket where final_tokens <= bucket
         if fit_idx >= next_idx:
-            cases.append(
-                _build_multi_turn_case(
-                    source=source,
-                    session_id=meta["session_id"],
-                    bucket_tokens=sorted_buckets[fit_idx],
-                    actual_chars=cum_chars,
-                    messages=messages,
-                    source_path=path,
-                    cwd=meta["cwd"],
-                    git_branch=meta["git_branch"],
-                    timestamp=meta["first_timestamp"],
-                )
+            built = _build_multi_turn_case(
+                source=source,
+                session_id=meta["session_id"],
+                bucket_tokens=sorted_buckets[fit_idx],
+                actual_chars=cum_chars,
+                messages=messages,
+                source_path=path,
+                cwd=meta["cwd"],
+                git_branch=meta["git_branch"],
+                timestamp=meta["first_timestamp"],
             )
+            if built is not None:
+                cases.append(built)
 
     return cases
 
@@ -896,10 +961,57 @@ def main(argv: list[str] | None = None) -> int:
         help="Comma-separated target token counts for --multi-turn slicing "
         "(accepts K/M suffixes; default: 8K,16K,32K,64K,100K,128K).",
     )
+    ap.add_argument(
+        "--multi-turn-scan",
+        action="store_true",
+        help="Walk ~/.claude/projects + ~/.codex/sessions, emit a combined "
+        "multi-turn fixture aiming for --per-bucket cases per bucket. "
+        "Schema v1 (carries reference_response for the LLM judge).",
+    )
+    ap.add_argument(
+        "--per-bucket",
+        type=int,
+        default=8,
+        help="When --multi-turn-scan: cases per bucket to collect "
+        "(default 8). Walks sessions in size-descending order and stops "
+        "once every bucket has hit the target (or sessions exhausted).",
+    )
     args = ap.parse_args(argv)
 
     if args.scan and args.multi_turn:
         ap.error("--multi-turn is not compatible with --scan")
+    if args.multi_turn_scan and (args.scan or args.multi_turn or args.path):
+        ap.error("--multi-turn-scan is exclusive of --scan / --multi-turn / path")
+
+    if args.multi_turn_scan:
+        try:
+            buckets = _parse_buckets(args.buckets)
+        except ValueError as e:
+            print(f"--buckets: {e}", file=sys.stderr)
+            return 2
+        cases = list(_scan_multi_turn(buckets=buckets, per_bucket=args.per_bucket))
+        out = {
+            "schema": "lucebox-bench-agent-recorded-multi-turn-v1",
+            "buckets": buckets,
+            "per_bucket_target": args.per_bucket,
+            "cases": cases,
+        }
+        text = json.dumps(out, indent=2)
+        if args.out:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(text)
+            counts: dict[int, int] = {}
+            for c in cases:
+                counts[c["target_bucket_tokens"]] = counts.get(c["target_bucket_tokens"], 0) + 1
+            counts_str = ", ".join(f"{k}={counts.get(k, 0)}" for k in buckets)
+            print(
+                f"wrote {len(cases)} cases to {args.out} ({len(text)} bytes); "
+                f"per bucket: {counts_str}",
+                file=sys.stderr,
+            )
+        else:
+            sys.stdout.write(text + "\n")
+        return 0
 
     if args.scan:
         cases = list(_scan_all(limit=args.limit))
@@ -940,7 +1052,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 3
         out = {
-            "schema": "lucebox-bench-agent-recorded-multi-turn-v0",
+            "schema": "lucebox-bench-agent-recorded-multi-turn-v1",
             "buckets": buckets,
             "source_session_path": _scrub(str(args.path)),
             "cases": cases,
@@ -975,6 +1087,88 @@ def main(argv: list[str] | None = None) -> int:
     else:
         sys.stdout.write(text + "\n")
     return 0
+
+
+def _iter_session_files() -> Iterable[tuple[str, Path]]:
+    """Yield ``(source, path)`` over every session JSONL, largest first.
+
+    Largest-first because long sessions are the only ones that reach the
+    100K / 128K buckets; sorting by size lets the scanner fill the upper
+    buckets quickly and gives smaller sessions a chance at the lower
+    buckets. Sources covered: Claude Code ``~/.claude/projects`` and Codex
+    ``~/.codex/sessions`` (plus ``~/.config/codex/sessions``).
+    """
+    candidates: list[tuple[int, str, Path]] = []
+    claude_root = Path(HOME) / ".claude" / "projects"
+    if claude_root.exists():
+        for f in claude_root.glob("*/*.jsonl"):
+            try:
+                candidates.append((f.stat().st_size, "claude-code", f))
+            except OSError:
+                continue
+    codex_session_roots = (
+        Path(HOME) / ".codex" / "sessions",
+        Path(HOME) / ".config" / "codex" / "sessions",
+    )
+    for codex_root in codex_session_roots:
+        if not codex_root.exists():
+            continue
+        for f in codex_root.rglob("*.jsonl"):
+            try:
+                candidates.append((f.stat().st_size, "codex", f))
+            except OSError:
+                continue
+    candidates.sort(key=lambda t: -t[0])
+    for _size, source, path in candidates:
+        yield (source, path)
+
+
+def _scan_multi_turn(
+    *, buckets: list[int], per_bucket: int
+) -> Iterable[dict[str, Any]]:
+    """Walk every session, emit multi-turn cases, stop at per-bucket cap.
+
+    The slicer emits *at most one* case per (session, bucket). Stable
+    case ids ensure re-scanning the same session yields the same id, so
+    the de-dup set ``seen_ids`` correctly skips duplicates if a session
+    is somehow traversed twice. Buckets are filled greedily — a session
+    that crosses 8K/16K/32K but not higher contributes to those three
+    buckets and is then dropped.
+    """
+    sorted_buckets = sorted(buckets)
+    target_counts: dict[int, int] = {b: 0 for b in sorted_buckets}
+    seen_ids: set[str] = set()
+    out: list[dict[str, Any]] = []
+
+    for source, path in _iter_session_files():
+        # All buckets full → stop scanning.
+        if all(target_counts[b] >= per_bucket for b in sorted_buckets):
+            break
+        try:
+            if source == "claude-code":
+                if not _is_claude_session(path):
+                    continue
+                session_cases = _slice_claude_multi_turn(path, sorted_buckets)
+            else:
+                session_cases = _slice_codex_multi_turn(path, sorted_buckets)
+        except Exception as e:  # noqa: BLE001 - one bad file shouldn't kill the scan
+            print(f"skip {path}: {e}", file=sys.stderr)
+            continue
+        for case in session_cases:
+            if case["id"] in seen_ids:
+                continue
+            b = case["target_bucket_tokens"]
+            if target_counts.get(b, 0) >= per_bucket:
+                continue
+            target_counts[b] = target_counts.get(b, 0) + 1
+            seen_ids.add(case["id"])
+            out.append(case)
+
+    # Sort ascending by bucket then by approx tokens so the fixture is
+    # readable + the loader (which sorts by bucket again) is a no-op.
+    out.sort(key=lambda c: (c["target_bucket_tokens"], c["context_tokens_approx"]))
+    for case in out:
+        yield case
 
 
 def _scan_all(*, limit: int | None = None) -> Iterable[dict[str, Any]]:

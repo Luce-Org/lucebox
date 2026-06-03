@@ -175,6 +175,7 @@ def _infer_area(raw: dict[str, Any], source_path: Path | None) -> str:
         stem = source_path.stem
         # Per-area sweep files: <out>/<name>/ds4-eval.json etc.
         if stem in {"ds4-eval", "code", "longctx", "agent", "agent_recorded",
+                    "agent_recorded_v1",
                     "forge", "smoke", "gsm8k", "hellaswag", "truthfulqa-mc1"}:
             return stem
     suite = raw.get("suite")

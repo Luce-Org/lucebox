@@ -1,140 +1,108 @@
 r"""Recorded-session agent probes for ``--areas agent_recorded``.
 
-Replaces the format-detection grader of the synthetic ``agent`` area
-with cases mined from *real* Claude Code and Codex sessions the user
-actually drove (see ``scripts/extract-agentic-fixture.py``). The
-fixture lives at ``fixtures/agent_recorded/cases.json`` and is the
-output of running that collector with ``--scan`` against the local
-``~/.claude/projects`` and ``~/.codex/sessions`` trees, with PII
-strip + tool-result hashing applied at collection time.
+This module ships **two** evaluation areas mined from real Claude Code
+and Codex sessions (see ``scripts/extract-agentic-fixture.py``):
 
-Case shape (see also the collector's docstring):
+1. ``agent_recorded`` — **multi-turn replay with cache metrics + LLM
+   judge** (default). Replays full session prefixes against the server,
+   measures cold/warm prefill+decode timings, and grades the model's
+   response with a Claude Sonnet judge that compares against the
+   reference assistant response. Fixture:
+   ``fixtures/agent_recorded/multi_turn_cases.json`` (schema v1).
 
-.. code-block:: json
+2. ``agent_recorded_v1`` — **single-turn tool-schema coverage**
+   (deprecated). Sends just the first user message and pattern-matches
+   the model's reply against the tools Claude actually used. Kept for
+   back-compat with archived result snapshots. Fixture:
+   ``fixtures/agent_recorded/cases.json``.
 
-    {
-      "id": "claude-2026-05-28-...-c22cc4fdad",
-      "source": "claude-code" | "codex",
-      "prompt": "<the first user message of the session>",
-      "initial_state": {
-        "cwd": "<HOME>/Projects/...",
-        "git_ref": "abc1234" | null,
-        "git_branch": "feat/...",
-        "files_referenced": ["path/to/file", ...]
-      },
-      "reference_trace": {
-        "tool_calls": [{"tool": "Edit", "args": {"file_path": "...",
-                       "old_string_hash": "...", "new_string_hash": "..."}},
-                      ...],
-        "outcome": {
-          "files_modified": [...],
-          "commands_run_count": 7,
-          "total_tool_calls": 21
-        }
-      },
-      "verifier": {
-        "type": "tool-schema-coverage",
-        "expected_tools": ["Edit", "Bash", ...],
-        "min_tool_calls": 2,
-        "expected_files_touched": ["lucebox.sh", ...]
-      }
-    }
+------------------------------------------------------------------------
+Why two areas? Substring matching against Claude's tool names biases
+against models that solve the task with a different but valid approach
+(e.g. ``write_file`` vs ``Edit``). The new area uses Claude itself as
+the judge, with explicit license to mark "divergent but valid" as a
+pass. See :mod:`lucebench.grading.llm_judge`.
 
-v0 verifier — ``tool-schema-coverage``
-======================================
+Cost: one full pass over the 48-case fixture is roughly $0.30 -- $1.50
+in Anthropic billing (Sonnet 4.6 list pricing, ~5K input + ~150 output
+per judge call × 96 calls cold+warm). The judge cache zeroes-out re-runs
+with identical inputs (see ``~/.cache/luce-bench/judge/``).
 
-This module ships exactly one verifier today: ``tool-schema-coverage``.
-The luce-bench runner sends the candidate model just the ``prompt``
-(no tool definitions, no system prompt, single-turn) and we grade by
-*pattern-matching the model's text reply* against the case's
-``expected_tools`` + ``expected_files_touched``. Three bins:
+Cold vs warm
+============
+Each case is sent twice in sequence:
 
-* ``pass`` — model named at least one tool from ``expected_tools``
-  AND named at least one file from ``expected_files_touched`` (or, if
-  no files are expected, named >= 1 expected tool). Response is also
-  required to be coherent (>= 80 chars, not a refusal).
-* ``partial`` — some expected tool OR some expected file was named, but
-  not both. Response is coherent.
-* ``fail`` — model refused, produced a stub, or wandered off-topic
-  (no expected tool AND no expected file mentioned).
+* **Cold pass** — preceded by ``systemctl --user restart
+  lucebox.service`` and a ``/health`` wait. The server's prefix cache is
+  empty, so ``prefill_s`` is the full first-token latency for the
+  case's context.
+* **Warm pass** — immediately after, no restart. The same exact
+  ``messages`` are sent again; the server should now reuse its prefix
+  cache and ``prefill_s`` should drop sharply.
 
-Why pattern-match instead of replay? The user's stated mitigation
-ordering: *grade on outcome, not trace; verifiable subgoals over
-end-to-end; tool-schema validation when no verifier exists*. v0
-implements the tool-schema-validation step — it's broadly applicable
-(works for every recorded session without per-case grader code), cheap
-(no shell, no git replay), and catches the obvious failure mode of
-"model produced narrative prose instead of engaging as an agent". The
-``verifier.type`` field is a versioned discriminator so future verifier
-types (``outcome-equivalence``, ``subgoal``) can land additively
-without forking the area.
+The ratio ``cold.prefill_s / max(warm.prefill_s, ε)`` is the cache
+speedup the area surfaces. Quality grading runs on the cold response
+only — warm is purely about cache effectiveness.
 
-Threshold rationale
--------------------
+If ``systemctl`` isn't available (CI, non-systemd hosts), the runner
+falls back to "warm both passes" mode and stamps a warning on the
+output; the area still runs, but the cache-speedup metric is degraded
+to a sanity check (warm-vs-warm should be ~1.0).
 
-* ``len(text) >= 80`` for the coherence bar. A real agent reply to one
-  of these prompts (most are 200-2000 char engineering tasks) that
-  fits in <80 chars is either a refusal ("I cannot help with this.")
-  or a stub. 80 is two short sentences — generous enough to not eat
-  legitimate one-line answers.
-* Tool-name matching is case-sensitive but tolerates the common
-  near-synonyms ("Bash" matches "bash command", "shell", "run a
-  command"). See ``_TOOL_SYNONYMS``.
-* File matching uses basename to dodge the path-rewriting variance
-  ("docs/foo.md" vs "./docs/foo.md" vs "the foo.md file"). When the
-  expected file list is empty the file-name check is skipped, not
-  failed.
+Constraints
+===========
+* Does NOT modify systemd state files or the installed lucebox binary.
+  It only invokes ``systemctl --user restart`` and polls ``/health``
+  on the configured URL. The user's running service is the one being
+  benchmarked — that's the intended use case.
+* ``ANTHROPIC_API_KEY`` must be set for the judge to run. Missing key
+  → ``JudgeUnavailable`` raised on first case; the area aborts cleanly.
 
-Future work this module is shaped to absorb without rewrites
------------------------------------------------------------
-
-* ``verifier.type == "outcome-equivalence"`` would need a sandbox
-  that replays the case's ``initial_state`` (git checkout to
-  ``git_ref``) and compares the candidate's ``files_modified`` to the
-  reference. The grader can branch on ``case["verifier"]["type"]``.
-* ``verifier.type == "subgoal"`` adds a ``subgoals`` list of
-  ``{description, check}`` pairs and grades the *intermediate* state
-  of a multi-turn run. Same branch point.
-* Multi-reference: ``reference_trace`` already nests under one key, so
-  a future ``alternative_traces: [...]`` can sit alongside without
-  schema churn.
+Schema migration
+================
+The new fixture schema is
+``lucebox-bench-agent-recorded-multi-turn-v1``. v0 (no
+``reference_response``) is loadable for back-compat: cases without a
+reference get ``judge_pending`` and don't contribute to the pass rate.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
 # See lucebench.areas.ds4_eval.GRADER_VERSION for the bump policy.
-GRADER_VERSION = 1
+GRADER_VERSION = 2
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 FIXTURE_PATH = SCRIPT_DIR / "fixtures" / "agent_recorded" / "cases.json"
 MULTI_TURN_FIXTURE_PATH = SCRIPT_DIR / "fixtures" / "agent_recorded" / "multi_turn_cases.json"
+
+# ── v1 (legacy single-turn) constants — see module docstring. ────────
+#
+# These all support the ``agent_recorded_v1`` area now. The v0 grader
+# matched the model's text against the tools Claude actually used; that
+# biases against valid non-Claude approaches, which is why the new
+# default area exists. We keep this code unchanged for back-compat with
+# archived result snapshots that referenced it.
 
 # Tool name → set of phrases that count as "the model meant this tool".
 # Intentionally loose so a model that says "use a Bash command" passes
 # even though it didn't literally say "Bash". Keys must match the
 # canonical names emitted by the collector (Claude tool names + the
 # normalized Codex shapes — see ``scripts/extract-agentic-fixture.py``).
-#
-# Also covers hyphen/underscore-named verbs that models commonly emit
-# when they invent their own tool format (``call:execute-bead:read-file``,
-# ``call:read_file``). Models running through this benchmark may not be
-# Claude/Codex — they only know what the prompt taught them, which is
-# often a DDX/bead-style verb namespace. We map those verbs back to the
-# Claude tool the fixture expected.
 _TOOL_SYNONYMS: dict[str, tuple[str, ...]] = {
     "Bash": (
         "bash", "shell command", "shell", "run a command",
         "execute a command", "command line",
-        # Verb-style emissions. ``execute-bead`` alone is intentionally
-        # NOT here: bead execution is a tool-namespace that wraps many
-        # verbs (read_file, list_files, etc.) — the verb under the
-        # namespace decides what Claude tool it maps to, not the
-        # namespace itself.
         "exec_command", "exec-command", "shell-exec", "run_shell",
         "run-script", "exec_shell",
     ),
@@ -177,41 +145,29 @@ _TOOL_SYNONYMS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Compiled once: extract verbs from any ``call:<...:>:<verb>{...}`` or
-# ``call:<verb>{...}`` pattern the model emits. The fallback synonym
-# match handles plain-English mentions; this captures the structured
-# tool-call-shaped emissions models invent when given a custom tool
-# namespace in the prompt (DDX bead verbs, codex-mini-style commands,
-# etc.). The verb is whatever follows the LAST colon before the brace —
-# we strip the namespace prefix so ``call:execute-bead:read-file{}``
-# yields the verb ``read-file`` (which the Read synonym list matches).
 _CALL_VERB_RE = re.compile(r"\bcall:(?:[A-Za-z0-9_.-]+:)*([A-Za-z0-9_.-]+)\s*\{")
 
-# Phrases that signal the model refused / punted. Any of these in the
-# first ~200 chars of the reply forces a fail regardless of tool
-# coverage — a "I can't do that" with a Bash-shaped citation in the
-# follow-up still loses.
 _REFUSAL_PATTERNS = (
     re.compile(r"\bi (?:can(?:not|'t)|am unable|won't|will not)\b", re.IGNORECASE),
     re.compile(r"\bsorry,?\s+(?:but\s+)?i\b", re.IGNORECASE),
     re.compile(r"\bi don't have (?:access|the ability|tools)\b", re.IGNORECASE),
 )
 
-# Minimum reply length to count as "the model engaged at all". Below
-# this the result is fail-due-to-stub regardless of content.
 _MIN_REPLY_CHARS = 80
 
 
-def load_agent_recorded_cases(path: Path = FIXTURE_PATH) -> list[dict[str, Any]]:
-    """Return the fixture cases shaped for the lucebench runner.
+# ── v1 (legacy single-turn) loader + grader. ─────────────────────────
+
+
+def load_agent_recorded_v1_cases(path: Path = FIXTURE_PATH) -> list[dict[str, Any]]:
+    """Return the legacy single-turn cases shaped for the lucebench runner.
 
     Each fixture entry maps to the canonical runner case shape: the
     ``user_message`` carries the original session prompt verbatim
-    (post-PII-strip), and the runner-internal fields
-    (``area``, ``source``, ``id``, ``kind``, ``answer``, ``domain``,
-    ``title``) are filled in here. The verifier / reference_trace /
-    initial_state blobs ride along under their own keys so the grader
-    can read them without re-loading the JSON.
+    (post-PII-strip), and the runner-internal fields are filled in here.
+    The verifier / reference_trace / initial_state blobs ride along
+    under their own keys so the grader can read them without re-loading
+    the JSON.
     """
     if not path.exists():  # pragma: no cover - missing fixture = packaging bug
         return []
@@ -220,22 +176,15 @@ def load_agent_recorded_cases(path: Path = FIXTURE_PATH) -> list[dict[str, Any]]
     for raw in payload["cases"]:
         out.append(
             {
-                "area": "agent_recorded",
+                "area": "agent_recorded_v1",
                 "source": "agent-recorded-" + raw["source"],
                 "id": raw["id"],
-                # Use the existing "agent-prompt" kind so the
-                # lucebench runner's build_prompt() routes us to
-                # ``case["user_message"]`` directly. That matches the
-                # synthetic ``agent`` area's dispatch path so we
-                # don't need a new runner branch.
                 "kind": "agent-prompt",
-                # Ship both fields so either dispatch path works.
                 "prompt": raw["prompt"],
                 "user_message": raw["prompt"],
                 "answer": None,
-                "domain": "agent_recorded",
+                "domain": "agent_recorded_v1",
                 "title": raw["id"],
-                # Side-band: grader reads these via `case["verifier"]` etc.
                 "initial_state": raw.get("initial_state", {}),
                 "reference_trace": raw.get("reference_trace", {}),
                 "verifier": raw.get("verifier", {}),
@@ -244,105 +193,13 @@ def load_agent_recorded_cases(path: Path = FIXTURE_PATH) -> list[dict[str, Any]]
     return out
 
 
-def load_agent_recorded_multi_turn_cases(
-    path: Path = MULTI_TURN_FIXTURE_PATH,
-) -> list[dict[str, Any]]:
-    """Return multi-turn replay cases for the coding-agent-loop autotune sweep.
-
-    Distinct from :func:`load_agent_recorded_cases` (the single-prompt
-    tool-schema-coverage fixture). Multi-turn cases ship an OpenAI-shape
-    ``messages`` list — sendable verbatim to ``/v1/chat/completions`` —
-    plus a ``target_bucket_tokens`` field that lets a caller pick the
-    longest case fitting under a given ``max_ctx − reply_budget`` cap.
-    See ``scripts/extract-agentic-fixture.py --multi-turn``.
-
-    The fixture is OPTIONAL: returns ``[]`` when absent. Callers that
-    require it should check the result and surface their own error.
-    """
-    if not path.exists():
-        return []
-    payload = json.loads(path.read_text())
-    cases: list[dict[str, Any]] = []
-    for raw in payload.get("cases", []):
-        cases.append(
-            {
-                "id": raw["id"],
-                "source": raw["source"],
-                "kind": raw.get("kind", "multi-turn-replay"),
-                "messages": raw["messages"],
-                "context_tokens_approx": raw["context_tokens_approx"],
-                "target_bucket_tokens": raw["target_bucket_tokens"],
-                "n_messages": raw.get("n_messages", len(raw["messages"])),
-                "initial_state": raw.get("initial_state", {}),
-                "verifier": raw.get("verifier", {}),
-            }
-        )
-    # Sorted ascending by bucket so callers can iterate or bisect to
-    # find the largest case fitting a budget.
-    cases.sort(key=lambda c: c["target_bucket_tokens"])
-    return cases
-
-
-def pick_multi_turn_case_for_budget(
-    cases: list[dict[str, Any]],
-    prompt_budget_tokens: int,
-    *,
-    safety_factor: float = 0.7,
-) -> dict[str, Any] | None:
-    """Pick the largest multi-turn case that fits within ``prompt_budget_tokens``.
-
-    The sweep uses this to choose the right trace per cell: for a cell
-    with ``max_ctx = N`` and a reply budget of ``r``, prompt_budget is
-    ``N − r``. Returns ``None`` when no case fits (every case
-    over-budget — caller should skip the cell or shrink the case).
-
-    ``safety_factor`` (default 0.7) accounts for the gap between the
-    extractor's ``chars / 4`` token approximation and the real
-    tokenizer + chat template expansion. Empirical evidence from the
-    gemma4-26b sweep on 2026-05-30 (see
-    ``docs/experiments/gemma4-26b-coding-agent-loop-sweep-2026-05-30.md``):
-    a 65205-approx-token Claude session tokenized to **90799 real
-    tokens** through the gemma chat template — a 1.39× expansion. The
-    102397-approx-token case overshoots a 126976-token budget at
-    max_ctx=131072 and triggers HTTP 400 server-side. Without a safety
-    margin the sweep's 131K cells fail uniformly. ``0.7`` corresponds
-    to a 1.43× expansion guard; tune downward if a future fixture is
-    even denser per char (e.g. heavy multibyte content).
-    """
-    effective_budget = int(prompt_budget_tokens * safety_factor)
-    fit = [c for c in cases if c["context_tokens_approx"] <= effective_budget]
-    if not fit:
-        return None
-    return max(fit, key=lambda c: c["context_tokens_approx"])
-
-
-def grade_prefill_and_decode(
-    row: dict[str, Any], *, min_response_chars: int = 1, max_wall_seconds: float = 300.0
-) -> dict[str, Any]:
-    """Pass/fail grader for the multi-turn prefill-and-decode verifier.
-
-    Pass criterion: server returned content within ``max_wall_seconds``,
-    the assistant emitted at least ``min_response_chars`` (combining
-    visible content and any reasoning_content), and no HTTP/server
-    error was reported. The verifier exists to score "this max_ctx
-    setting actually serves a trace of this length", not the quality
-    of the model's reply — anything coherent enough to render passes.
-    """
-    err = row.get("error")
-    if err:
-        return {"pass": False, "reason": f"server error: {err}"}
-    wall = float(row.get("wall_s") or 0.0)
-    if wall > max_wall_seconds:
-        return {"pass": False, "reason": f"wall {wall:.1f}s > {max_wall_seconds}s budget"}
-    content = (row.get("content") or "") + (row.get("reasoning_content") or "")
-    if len(content) < min_response_chars:
-        return {"pass": False, "reason": f"response too short ({len(content)} < {min_response_chars})"}
-    return {"pass": True, "reason": f"prefill+decode ok, {len(content)} chars in {wall:.1f}s"}
+# Back-compat alias for snapshot consumers / regrade pipelines that
+# stamp ``load_agent_recorded_cases``. The v1 area still gets the same
+# legacy cases.
+load_agent_recorded_cases = load_agent_recorded_v1_cases
 
 
 def _normalize(text: str) -> str:
-    """Lowercased text with collapsed whitespace, used for substring
-    checks against tool synonyms and file basenames."""
     return re.sub(r"\s+", " ", (text or "").lower())
 
 
@@ -352,17 +209,6 @@ def _refused(text: str) -> bool:
 
 
 def _tool_mentioned(text: str, tool: str) -> bool:
-    """True if the model named ``tool`` either by canonical name, by
-    one of the loose synonyms in ``_TOOL_SYNONYMS``, or as the verb of a
-    ``call:<...>:<verb>{...}`` structured-tool-call emission.
-
-    The canonical-name check is case-sensitive so plain English
-    sentences (\"would edit the file\") don't accidentally match the
-    capitalized ``Edit`` token; the synonym list covers the
-    lowercase / paraphrased cases; the call-verb pass covers models
-    that emit their own structured format when given a custom tool
-    namespace in the prompt.
-    """
     if not text:
         return False
     if re.search(rf"\b{re.escape(tool)}\b", text):
@@ -372,11 +218,6 @@ def _tool_mentioned(text: str, tool: str) -> bool:
     for syn in synonyms:
         if syn in haystack:
             return True
-    # Structured tool-call emissions: pull out every ``call:<verb>{...}``
-    # invocation and treat its verb as a synonym candidate. This catches
-    # models that invented their own tool format following a prompt's
-    # custom namespace (DDX bead verbs etc.) without forcing the grader
-    # to enumerate every prompt-driven naming convention.
     if synonyms:
         for m in _CALL_VERB_RE.finditer(text):
             verb = m.group(1).lower()
@@ -386,7 +227,6 @@ def _tool_mentioned(text: str, tool: str) -> bool:
 
 
 def _file_mentioned(text: str, file_path: str) -> bool:
-    """True if the basename or full path appears in ``text``."""
     if not text or not file_path:
         return False
     haystack = _normalize(text)
@@ -398,21 +238,14 @@ def _file_mentioned(text: str, file_path: str) -> bool:
     return False
 
 
-def grade_agent_recorded_case(case: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
-    """Three-bin tool-schema-coverage grader.
+def grade_agent_recorded_v1_case(case: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    """Three-bin tool-schema-coverage grader (legacy v1 area).
 
-    Reads the verifier off the case (which makes it trivial to add
-    new ``verifier.type`` branches later); the v0 branch is
-    ``tool-schema-coverage``. The output shape matches the lucebench
-    runner's grader contract (``pass``, ``given``, ``correct``,
-    ``status``, ``format_pass``, ``semantic_hint``); the extra
-    ``coverage`` / ``bin`` fields are surfaced so the row inspector
-    can show which subgoal passed without re-running the grader.
+    See module docstring for why this exists and why the new
+    ``agent_recorded`` area uses an LLM judge instead.
     """
     verifier = case.get("verifier") or {}
     completion = (row.get("content") or "")
-    # Some servers route the answer to reasoning_content when
-    # max_tokens trips mid-think (same fallback as the smoke grader).
     reasoning = (row.get("reasoning_content") or "")
     text = (completion + "\n" + reasoning).strip()
 
@@ -431,7 +264,6 @@ def grade_agent_recorded_case(case: dict[str, Any], row: dict[str, Any]) -> dict
     if not nonempty or refused:
         bin_ = "fail"
     elif expected_files:
-        # Both axes available — full pass requires at least one of each.
         if tools_hit and files_hit:
             bin_ = "pass"
         elif tools_hit or files_hit:
@@ -439,8 +271,6 @@ def grade_agent_recorded_case(case: dict[str, Any], row: dict[str, Any]) -> dict
         else:
             bin_ = "fail"
     else:
-        # File-list empty (codex sessions where we couldn't recover
-        # paths from the patch envelope). Grade purely on tools.
         if tools_hit:
             bin_ = "pass"
         else:
@@ -464,4 +294,545 @@ def grade_agent_recorded_case(case: dict[str, Any], row: dict[str, Any]) -> dict
         "files_hit": files_hit,
         "tool_coverage": round(tool_coverage, 3),
         "file_coverage": None if file_coverage is None else round(file_coverage, 3),
+    }
+
+
+# Back-compat alias.
+grade_agent_recorded_case = grade_agent_recorded_v1_case
+
+
+# ── Multi-turn replay (new default agent_recorded area). ─────────────
+
+
+def load_agent_recorded_multi_turn_cases(
+    path: Path = MULTI_TURN_FIXTURE_PATH,
+) -> list[dict[str, Any]]:
+    """Return multi-turn replay cases (v1 schema: with reference_response).
+
+    Each case carries an OpenAI-shape ``messages`` list ending on a user
+    turn (sendable verbatim to ``/v1/chat/completions``) plus a
+    ``reference_response`` string holding the assistant text Claude
+    actually emitted at that point — that's the ground truth the LLM
+    judge compares the candidate's response to.
+
+    Back-compat: v0 fixtures (no ``reference_response``) load with
+    ``reference_response = None``; consumers that need it must handle
+    None (the area runner surfaces ``judge_pending`` for those cases).
+
+    The fixture is OPTIONAL: returns ``[]`` when absent. The autotune
+    sweep also calls this loader and expects ``[]`` to mean "no data,
+    skip the cell" — see ``lucebox.sweep.run_multi_turn_probe``.
+    """
+    if not path.exists():
+        return []
+    payload = json.loads(path.read_text())
+    cases: list[dict[str, Any]] = []
+    for raw in payload.get("cases", []):
+        cases.append(
+            {
+                "id": raw["id"],
+                "source": raw["source"],
+                "kind": raw.get("kind", "multi-turn-replay"),
+                "messages": raw["messages"],
+                "reference_response": raw.get("reference_response"),
+                "context_tokens_approx": raw["context_tokens_approx"],
+                "target_bucket_tokens": raw["target_bucket_tokens"],
+                "n_messages": raw.get("n_messages", len(raw["messages"])),
+                "initial_state": raw.get("initial_state", {}),
+                "verifier": raw.get("verifier", {}),
+            }
+        )
+    cases.sort(key=lambda c: c["target_bucket_tokens"])
+    return cases
+
+
+def pick_multi_turn_case_for_budget(
+    cases: list[dict[str, Any]],
+    prompt_budget_tokens: int,
+    *,
+    safety_factor: float = 0.7,
+) -> dict[str, Any] | None:
+    """Pick the largest multi-turn case that fits within ``prompt_budget_tokens``.
+
+    Used by the autotune sweep to choose a case for a given (max_ctx,
+    reply_budget) cell. ``safety_factor`` defaults to 0.7 so the
+    extractor's ``chars / 4`` approximation has headroom against the
+    real tokenizer + chat template expansion (see
+    ``docs/experiments/gemma4-26b-coding-agent-loop-sweep-2026-05-30.md``).
+    """
+    effective_budget = int(prompt_budget_tokens * safety_factor)
+    fit = [c for c in cases if c["context_tokens_approx"] <= effective_budget]
+    if not fit:
+        return None
+    return max(fit, key=lambda c: c["context_tokens_approx"])
+
+
+# ── Legacy prefill-and-decode grader. ────────────────────────────────
+
+
+def grade_prefill_and_decode(
+    row: dict[str, Any], *, min_response_chars: int = 1, max_wall_seconds: float = 300.0
+) -> dict[str, Any]:
+    """Pass/fail grader for the legacy prefill-and-decode verifier.
+
+    Pre-judge consumers (the autotune sweep) still call this. The new
+    multi-turn replay area uses :func:`grade_cache_and_quality` instead,
+    which additionally invokes the LLM judge.
+    """
+    err = row.get("error")
+    if err:
+        return {"pass": False, "reason": f"server error: {err}"}
+    wall = float(row.get("wall_s") or 0.0)
+    if wall > max_wall_seconds:
+        return {"pass": False, "reason": f"wall {wall:.1f}s > {max_wall_seconds}s budget"}
+    content = (row.get("content") or "") + (row.get("reasoning_content") or "")
+    if len(content) < min_response_chars:
+        return {"pass": False, "reason": f"response too short ({len(content)} < {min_response_chars})"}
+    return {"pass": True, "reason": f"prefill+decode ok, {len(content)} chars in {wall:.1f}s"}
+
+
+# ── HTTP + service-restart helpers. ──────────────────────────────────
+
+
+def _http_post_chat_completions(
+    *,
+    url: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    auth_header: str = "",
+    timeout_s: int = 600,
+) -> tuple[dict[str, Any], float]:
+    """POST ``messages`` to ``url/v1/chat/completions``, return (parsed, wall).
+
+    Raises on transport/HTTP failures so the caller can stamp a row
+    error and continue. Streaming is intentionally OFF — we want the
+    server-reported ``usage.timings`` block (prefill_ms / decode_ms /
+    prefix_len) which lucebox surfaces on the non-stream path.
+    """
+    body = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "stream": False,
+    }
+    headers = {"Content-Type": "application/json"}
+    if auth_header:
+        headers["Authorization"] = auth_header
+    req = urllib.request.Request(
+        url.rstrip("/") + "/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers=headers,
+    )
+    t0 = time.perf_counter()
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        raw = json.loads(resp.read())
+    wall = time.perf_counter() - t0
+    return raw, wall
+
+
+def _extract_row_from_response(raw: dict[str, Any], wall: float) -> dict[str, Any]:
+    """Pull the bench-shape row fields out of a chat completions response."""
+    choice = (raw.get("choices") or [{}])[0]
+    msg = choice.get("message", {}) if isinstance(choice, dict) else {}
+    usage = raw.get("usage", {}) or {}
+    timings = usage.get("timings") if isinstance(usage, dict) else None
+    if not isinstance(timings, dict):
+        timings = {}
+    prefill_ms = timings.get("prefill_ms")
+    decode_ms = timings.get("decode_ms")
+    prefix_len = timings.get("prompt_n_cached") or timings.get("prefix_len") or 0
+    tps_decode = timings.get("decode_tokens_per_sec")
+    out_tokens = usage.get("completion_tokens")
+    if tps_decode is None and decode_ms and out_tokens:
+        # Compute a fallback if the server didn't ship decode_tokens_per_sec.
+        if decode_ms > 0:
+            tps_decode = (out_tokens / decode_ms) * 1000.0
+    return {
+        "content": msg.get("content"),
+        "reasoning_content": msg.get("reasoning_content") or msg.get("reasoning"),
+        "finish_reason": choice.get("finish_reason"),
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": out_tokens,
+        "wall_s": round(wall, 3),
+        "prefill_s": round(prefill_ms / 1000.0, 3) if prefill_ms is not None else None,
+        "decode_s": round(decode_ms / 1000.0, 3) if decode_ms is not None else None,
+        "tps_decode": round(tps_decode, 2) if tps_decode is not None else None,
+        "prefix_len": int(prefix_len) if prefix_len else 0,
+        "restore": bool(prefix_len) and int(prefix_len) > 0,
+        "timings_raw": timings,
+        "out_tokens": out_tokens,
+    }
+
+
+def _health_wait(url: str, *, timeout_s: float = 120.0) -> bool:
+    """Poll ``url/health`` until 2xx or ``timeout_s`` elapses. Returns success."""
+    deadline = time.monotonic() + timeout_s
+    health_url = url.rstrip("/") + "/health"
+    last_err: str | None = None
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(health_url, timeout=5) as resp:
+                if 200 <= resp.status < 300:
+                    return True
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
+            last_err = f"{type(e).__name__}: {e}"
+        time.sleep(1.0)
+    print(
+        f"[agent_recorded] health wait failed: last error: {last_err}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return False
+
+
+def _restart_lucebox_service(*, log_prefix: str = "[agent_recorded]") -> tuple[bool, str]:
+    """Issue ``systemctl --user restart lucebox.service``.
+
+    Returns ``(ok, reason)``. ``ok=False`` triggers the warm-only
+    fallback. We intentionally do NOT modify the unit file or the
+    binary — just restart the running service. If the user opted into
+    a different supervisor (no systemd, podman, etc.) we skip and warn.
+    """
+    if shutil.which("systemctl") is None:
+        return (False, "systemctl not on PATH")
+    try:
+        result = subprocess.run(  # noqa: S603 - operator-approved invocation
+            ["systemctl", "--user", "restart", "lucebox.service"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return (False, "systemctl restart timed out (>30s)")
+    except OSError as e:
+        return (False, f"systemctl invocation failed: {e}")
+    if result.returncode != 0:
+        return (
+            False,
+            f"systemctl exited {result.returncode}: {result.stderr.strip() or result.stdout.strip()}",
+        )
+    return (True, "ok")
+
+
+# ── Per-case cold/warm driver. ───────────────────────────────────────
+
+
+def _run_one_multi_turn_case(
+    *,
+    case: dict[str, Any],
+    url: str,
+    model: str,
+    max_tokens: int,
+    auth_header: str,
+    timeout_s: int,
+    restart_between_cases: bool,
+    judge_fn: Any,
+    log_prefix: str = "[agent_recorded]",
+) -> dict[str, Any]:
+    """Run one case through cold-then-warm passes, judge the cold response.
+
+    ``judge_fn`` is the callable used to grade the cold response. The
+    production path passes :func:`lucebench.grading.llm_judge.judge_response`;
+    tests pass a mock so the runner can be exercised without billing
+    Anthropic.
+    """
+    case_id = case["id"]
+    bucket = case["target_bucket_tokens"]
+    messages = case["messages"]
+    reference = case.get("reference_response")
+
+    cold_row: dict[str, Any] = {}
+    warm_row: dict[str, Any] = {}
+    error: str | None = None
+    restart_status = "skipped"
+    restart_reason = "restart_between_cases=False"
+
+    if restart_between_cases:
+        ok, reason = _restart_lucebox_service(log_prefix=log_prefix)
+        restart_status = "ok" if ok else "failed"
+        restart_reason = reason
+        if ok:
+            if not _health_wait(url):
+                error = "service did not become healthy after restart"
+        else:
+            print(
+                f"{log_prefix} cold-restart not available ({reason}); "
+                f"falling back to warm/warm for case {case_id}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    # Cold pass.
+    if error is None:
+        try:
+            raw, wall = _http_post_chat_completions(
+                url=url,
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                auth_header=auth_header,
+                timeout_s=timeout_s,
+            )
+            cold_row = _extract_row_from_response(raw, wall)
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", errors="replace")[:300]
+            except Exception:  # noqa: BLE001
+                body = ""
+            error = f"cold HTTP {e.code}: {body}"
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            error = f"cold transport: {type(e).__name__}: {e}"
+
+    # Warm pass — sent immediately after cold with no restart.
+    if error is None:
+        try:
+            raw, wall = _http_post_chat_completions(
+                url=url,
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                auth_header=auth_header,
+                timeout_s=timeout_s,
+            )
+            warm_row = _extract_row_from_response(raw, wall)
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", errors="replace")[:300]
+            except Exception:  # noqa: BLE001
+                body = ""
+            error = f"warm HTTP {e.code}: {body}"
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            error = f"warm transport: {type(e).__name__}: {e}"
+
+    # Cache speedup metric: cold.prefill / max(warm.prefill, ε). When
+    # either prefill is None we can't compute it; same when warm is
+    # zero or smaller than 1ms (server isn't reporting prefill at all
+    # in that case, treat as "no signal").
+    cache_speedup_x: float | None = None
+    cold_pf = cold_row.get("prefill_s")
+    warm_pf = warm_row.get("prefill_s")
+    if cold_pf is not None and warm_pf is not None and warm_pf > 0.001:
+        cache_speedup_x = round(cold_pf / warm_pf, 2)
+
+    # Judge the COLD response (not warm — warm is solely about cache
+    # measurement; the model output should be identical bit-for-bit
+    # except for sampler RNG, but we judge the first sample for
+    # deterministic accounting).
+    judge_result: dict[str, Any]
+    cold_content = (cold_row.get("content") or "") + (cold_row.get("reasoning_content") or "")
+    if error is not None:
+        judge_result = {
+            "pass": False,
+            "verdict": "off_track",
+            "rationale": f"transport error precluded judging: {error}",
+            "cached": False,
+            "model": None,
+            "error": error,
+        }
+    elif not reference:
+        judge_result = {
+            "pass": False,
+            "verdict": "judge_pending",
+            "rationale": "case has no reference_response (v0 fixture); judge skipped",
+            "cached": False,
+            "model": None,
+            "error": "no_reference",
+        }
+    else:
+        try:
+            verdict = judge_fn(
+                case_id=case_id,
+                messages=messages,
+                reference_response=reference,
+                candidate_response=cold_content,
+            )
+            judge_result = verdict.to_dict() if hasattr(verdict, "to_dict") else dict(verdict)
+        except Exception as e:  # noqa: BLE001 - one judge failure → pending, not abort
+            judge_result = {
+                "pass": False,
+                "verdict": "judge_pending",
+                "rationale": f"judge invocation raised: {type(e).__name__}: {e}",
+                "cached": False,
+                "model": None,
+                "error": f"{type(e).__name__}: {e}",
+            }
+
+    return {
+        "case_id": case_id,
+        "source": case.get("source"),
+        "bucket_tokens": bucket,
+        "n_messages": case.get("n_messages"),
+        "context_tokens_approx": case.get("context_tokens_approx"),
+        "restart": {"status": restart_status, "reason": restart_reason},
+        "cold": cold_row,
+        "warm": warm_row,
+        "cache_speedup_x": cache_speedup_x,
+        "model_response_cold": cold_content,
+        "judge": judge_result,
+        "pass": bool(judge_result.get("pass")),
+        "error": error,
+    }
+
+
+def _resolve_judge_fn(*, mock_judge: Any = None) -> Any:
+    """Return the judge callable to use for the run.
+
+    Production: :func:`lucebench.grading.llm_judge.judge_response`.
+    Tests / dry-runs: pass a mock with the same signature.
+    """
+    if mock_judge is not None:
+        return mock_judge
+    from lucebench.grading.llm_judge import judge_response
+
+    return judge_response
+
+
+def run_agent_recorded_area(
+    *,
+    url: str,
+    model: str,
+    max_tokens: int = 512,
+    auth_header: str = "",
+    timeout_s: int = 600,
+    restart_between_cases: bool = True,
+    fixture_path: Path = MULTI_TURN_FIXTURE_PATH,
+    questions: int | None = None,
+    mock_judge: Any = None,
+    log_prefix: str = "[agent_recorded]",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run the full multi-turn replay sweep and return (rows, summary).
+
+    Each row is shaped per the module docstring: cold/warm sub-blocks,
+    cache_speedup_x, judge verdict, pass flag. The summary aggregates
+    pass rate, p50/p90 cache speedup, and p50 prefill/decode.
+    """
+    cases = load_agent_recorded_multi_turn_cases(fixture_path)
+    if questions is not None:
+        cases = cases[:questions]
+    if not cases:
+        return ([], {"area": "agent_recorded", "n": 0, "error": "no cases in fixture"})
+
+    judge_fn = _resolve_judge_fn(mock_judge=mock_judge)
+    rows: list[dict[str, Any]] = []
+    for idx, case in enumerate(cases, start=1):
+        print(
+            f"{log_prefix} case {idx}/{len(cases)} id={case['id']} "
+            f"bucket={case['target_bucket_tokens']} ctx≈{case['context_tokens_approx']}",
+            flush=True,
+        )
+        row = _run_one_multi_turn_case(
+            case=case,
+            url=url,
+            model=model,
+            max_tokens=max_tokens,
+            auth_header=auth_header,
+            timeout_s=timeout_s,
+            restart_between_cases=restart_between_cases,
+            judge_fn=judge_fn,
+            log_prefix=log_prefix,
+        )
+        rows.append(row)
+        # Brief per-row console line so the operator can watch progress.
+        cold = row["cold"]
+        warm = row["warm"]
+        judge = row["judge"]
+        print(
+            f"{log_prefix}   cold prefill={cold.get('prefill_s')}s decode={cold.get('decode_s')}s "
+            f"tps={cold.get('tps_decode')}  warm prefill={warm.get('prefill_s')}s "
+            f"speedup={row['cache_speedup_x']}x  judge={judge.get('verdict')} "
+            f"pass={row['pass']}",
+            flush=True,
+        )
+
+    return rows, _summarize_rows(rows)
+
+
+def _percentile(values: list[float], pct: float) -> float | None:
+    """Naive linear-interp percentile, or None for an empty input.
+
+    NumPy isn't a dep so we hand-roll. The bench rows are at most a few
+    hundred per area; sort + linear interp is plenty fast.
+    """
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    s = sorted(values)
+    pos = (len(s) - 1) * (pct / 100.0)
+    lo = int(pos)
+    hi = min(lo + 1, len(s) - 1)
+    frac = pos - lo
+    return s[lo] + (s[hi] - s[lo]) * frac
+
+
+def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate per-row metrics into the per-area summary.
+
+    Pass rate excludes ``judge_pending`` from the denominator — those
+    cases couldn't be graded (no reference response, or judge
+    errored) and shouldn't drag the rate down or inflate it.
+    """
+    n_total = len(rows)
+    judged = [r for r in rows if r["judge"].get("verdict") != "judge_pending"]
+    n_pass = sum(1 for r in judged if r["pass"])
+    pass_rate = (100.0 * n_pass / len(judged)) if judged else 0.0
+
+    speedups = [r["cache_speedup_x"] for r in rows if r["cache_speedup_x"] is not None]
+    cold_prefills = [r["cold"].get("prefill_s") for r in rows if r["cold"].get("prefill_s") is not None]
+    warm_prefills = [r["warm"].get("prefill_s") for r in rows if r["warm"].get("prefill_s") is not None]
+    cold_decodes = [r["cold"].get("decode_s") for r in rows if r["cold"].get("decode_s") is not None]
+    warm_decodes = [r["warm"].get("decode_s") for r in rows if r["warm"].get("decode_s") is not None]
+
+    # Per-verdict counts so the operator can see suitable_match vs
+    # divergent_but_valid vs off_track without re-parsing rows.
+    verdict_counts: dict[str, int] = {}
+    for r in rows:
+        v = r["judge"].get("verdict") or "unknown"
+        verdict_counts[v] = verdict_counts.get(v, 0) + 1
+
+    return {
+        "area": "agent_recorded",
+        "n": n_total,
+        "n_judged": len(judged),
+        "n_pass": n_pass,
+        "pass_rate": round(pass_rate, 2),
+        "cache_speedup_p50": _percentile(speedups, 50.0),
+        "cache_speedup_p90": _percentile(speedups, 90.0),
+        "cold_prefill_p50": _percentile(cold_prefills, 50.0),
+        "warm_prefill_p50": _percentile(warm_prefills, 50.0),
+        "cold_decode_p50": _percentile(cold_decodes, 50.0),
+        "warm_decode_p50": _percentile(warm_decodes, 50.0),
+        "verdict_counts": verdict_counts,
+        "median_wall_cold": _percentile(
+            [r["cold"].get("wall_s") for r in rows if r["cold"].get("wall_s") is not None], 50.0,
+        ),
+        "median_wall_warm": _percentile(
+            [r["warm"].get("wall_s") for r in rows if r["warm"].get("wall_s") is not None], 50.0,
+        ),
+    }
+
+
+# ── Stub grader for the standard runner dispatch. ────────────────────
+#
+# The CLI's _run_standard_area_to_dir path expects an ``AREAS[area]``
+# entry with a ``grade`` callable that takes (case, row). The new area
+# doesn't fit that 1:1 path (it needs cold+warm + restart + judge), so
+# the CLI dispatches it through a separate ``_run_agent_recorded_to_dir``
+# wrapper. The stub below is kept ONLY so legacy CLI code paths /
+# regrade hooks that import ``grade_agent_recorded_case`` still load
+# this module without an AttributeError. It returns a noop "pending"
+# grade — the real grading happens in run_agent_recorded_area.
+
+
+def grade_multi_turn_replay_stub(case: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    """Stub grader. The real per-row grading lives in
+    :func:`run_agent_recorded_area` which builds and grades each row
+    end-to-end. This stub exists so import-time hooks don't crash."""
+    return {
+        "pass": bool(row.get("pass")),
+        "given": row.get("judge", {}).get("verdict") or "?",
+        "correct": "judge-graded",
+        "status": "passed" if row.get("pass") else "failed",
     }

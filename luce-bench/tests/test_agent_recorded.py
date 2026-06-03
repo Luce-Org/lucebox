@@ -1,16 +1,22 @@
-"""Unit tests for the ``agent_recorded`` area.
+"""Unit tests for the ``agent_recorded`` + ``agent_recorded_v1`` areas.
 
 Covers:
 
-* Fixture loads, is non-empty, and every case has the expected schema
-  (id, prompt, verifier with type + expected_tools).
-* The area is registered in the CLI's AREAS dict with the documented
-  defaults.
-* The three-bin grader (pass / partial / fail) maps the obvious
-  positive/negative inputs to the right verdicts. Includes a refusal
-  case, a stub case, and a "tool but no file" partial.
+* Legacy v1 area (single-turn tool-schema coverage):
+  - Fixture loads, every case has the expected schema.
+  - Area registered in AREAS as ``agent_recorded_v1``.
+  - Three-bin grader (pass / partial / fail) maps the obvious
+    positive/negative inputs to the right verdicts.
+* New multi-turn area:
+  - Fixture loads with v1 schema (carries reference_response).
+  - Mocked judge round-trips through the area runner end-to-end.
+  - Cache speedup arithmetic.
+* LLM judge:
+  - Disk cache hit/miss with mocked client.
+  - Verdict parsing (strict JSON + tolerant Markdown fence).
+  - Missing API key path raises JudgeUnavailable.
 
-No live server. Each grader call is fed a canned ``row["content"]``.
+No live server, no live judge — every API call is mocked.
 """
 
 from __future__ import annotations
@@ -19,17 +25,17 @@ from lucebench.areas import agent_recorded
 from lucebench.cli import AREAS
 
 
-def test_agent_recorded_cases_load_non_empty():
-    cases = agent_recorded.load_agent_recorded_cases()
+def test_agent_recorded_v1_cases_load_non_empty():
+    cases = agent_recorded.load_agent_recorded_v1_cases()
     assert len(cases) > 0, "fixture must ship with at least one case"
     # The collector caps the scan but we want a meaningful suite.
     assert len(cases) >= 5, f"expected >=5 cases, got {len(cases)}"
 
 
-def test_agent_recorded_case_schema():
-    cases = agent_recorded.load_agent_recorded_cases()
+def test_agent_recorded_v1_case_schema():
+    cases = agent_recorded.load_agent_recorded_v1_cases()
     for c in cases:
-        assert c["area"] == "agent_recorded"
+        assert c["area"] == "agent_recorded_v1"
         assert c["kind"] == "agent-prompt"
         assert c["prompt"], "every case needs a non-empty prompt"
         assert c["user_message"] == c["prompt"]
@@ -42,12 +48,25 @@ def test_agent_recorded_case_schema():
         assert c["source"] in ("agent-recorded-claude-code", "agent-recorded-codex")
 
 
-def test_agent_recorded_registered_in_areas():
-    assert "agent_recorded" in AREAS
-    cfg = AREAS["agent_recorded"]
+def test_agent_recorded_v1_registered_in_areas():
+    assert "agent_recorded_v1" in AREAS
+    cfg = AREAS["agent_recorded_v1"]
     assert cfg["default_max_tokens"] == 4096
     assert cfg["default_thinking"] is False
     assert callable(cfg["load"])
+    assert callable(cfg["grade"])
+
+
+def test_agent_recorded_new_area_registered():
+    """The new multi-turn area is registered as ``agent_recorded``."""
+    assert "agent_recorded" in AREAS
+    cfg = AREAS["agent_recorded"]
+    # Different defaults than v1 (the judge cost dominates so we cap
+    # decode tokens lower).
+    assert cfg["default_thinking"] is False
+    assert callable(cfg["load"])
+    # The grade entry is a stub (real grading happens in
+    # run_agent_recorded_area); it should still be callable.
     assert callable(cfg["grade"])
 
 
@@ -220,10 +239,21 @@ def test_multi_turn_fixture_loads_when_present():
     assert targets == sorted(targets), "loader must return cases sorted by bucket"
     for c in cases:
         assert c["kind"] == "multi-turn-replay"
-        assert c["verifier"]["type"] == "prefill-and-decode"
+        # v1 schema: cache-and-quality. v0 fixtures (legacy) used
+        # prefill-and-decode; we accept either to keep loaders working
+        # against snapshots produced by older extractors.
+        assert c["verifier"]["type"] in ("cache-and-quality", "prefill-and-decode")
         assert isinstance(c["messages"], list) and c["messages"], c["id"]
         # Contract from the extractor: every case fits under its bucket.
         assert c["context_tokens_approx"] <= c["target_bucket_tokens"], c["id"]
+        # v1 schema also requires the messages list to end on a user
+        # turn (so the model under test is generating the next assistant
+        # response). Tolerate v0 (no reference_response) by skipping the
+        # tail-role check for those.
+        if c.get("reference_response"):
+            assert c["messages"][-1]["role"] == "user", c["id"]
+            assert isinstance(c["reference_response"], str)
+            assert c["reference_response"].strip(), c["id"]
 
 
 def test_pick_multi_turn_case_for_budget():
@@ -359,3 +389,356 @@ def test_grade_full_pass_with_call_verb_emission():
     assert "Read" in g["tools_hit"]
     assert "Glob" in g["tools_hit"]
     assert "lucebox.sh" in g["files_hit"]
+
+
+# ── New multi-turn area: runner + judge integration ──────────────────
+
+
+def test_multi_turn_runner_with_mocked_judge_and_http(tmp_path, monkeypatch):
+    """Drive run_agent_recorded_area end-to-end with both the HTTP call
+    and the judge stubbed. Verifies the cold/warm flow, the cache
+    speedup arithmetic, and the row schema the operator sees."""
+    from lucebench.areas import agent_recorded as ar
+    from lucebench.grading.llm_judge import JudgeVerdict
+
+    # Mock HTTP: first call returns a "cold" response (slow prefill),
+    # second returns a "warm" response (fast prefill, prefix_len > 0).
+    cold_response = {
+        "choices": [{"message": {"content": "Cold response, here's my plan: I'd start by reading the relevant config."}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": 8000,
+            "completion_tokens": 50,
+            "timings": {
+                "prefill_ms": 3500.0,
+                "decode_ms": 2400.0,
+                "decode_tokens_per_sec": 20.8,
+                "prompt_n_cached": 0,
+            },
+        },
+    }
+    warm_response = {
+        "choices": [{"message": {"content": "Warm response, same content."}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": 8000,
+            "completion_tokens": 50,
+            "timings": {
+                "prefill_ms": 200.0,
+                "decode_ms": 2400.0,
+                "decode_tokens_per_sec": 20.8,
+                "prompt_n_cached": 7950,
+            },
+        },
+    }
+
+    call_count = {"n": 0}
+
+    def fake_post(*, url, model, messages, max_tokens, auth_header="", timeout_s=600):
+        call_count["n"] += 1
+        # Return cold then warm alternating.
+        raw = cold_response if call_count["n"] % 2 == 1 else warm_response
+        return raw, 5.9 if call_count["n"] % 2 == 1 else 2.6
+
+    monkeypatch.setattr(ar, "_http_post_chat_completions", fake_post)
+    monkeypatch.setattr(ar, "_restart_lucebox_service", lambda **kw: (False, "test"))
+    # When restart fails we fall back to warm/warm; but we still want
+    # to test the cold/warm path. Pretend restart works.
+    monkeypatch.setattr(ar, "_restart_lucebox_service", lambda **kw: (True, "ok"))
+    monkeypatch.setattr(ar, "_health_wait", lambda url, timeout_s=120: True)
+
+    # Mock the judge: pass on cases mentioning "plan", fail otherwise.
+    def fake_judge(*, case_id, messages, reference_response, candidate_response):
+        passed = "plan" in candidate_response.lower()
+        return JudgeVerdict(
+            passed=passed,
+            verdict="suitable_match" if passed else "off_track",
+            rationale="mocked",
+            cached=False,
+            model="mock",
+        )
+
+    # Build a one-case fake fixture so the runner doesn't depend on the
+    # shipped 48-case fixture in this unit test.
+    fake_fixture = tmp_path / "multi_turn_cases.json"
+    import json
+    fake_fixture.write_text(json.dumps({
+        "schema": "lucebox-bench-agent-recorded-multi-turn-v1",
+        "buckets": [8192],
+        "cases": [
+            {
+                "id": "test-case-1",
+                "source": "claude-code",
+                "kind": "multi-turn-replay",
+                "messages": [
+                    {"role": "user", "content": "Help me debug this"},
+                    {"role": "assistant", "content": "Sure, what error?"},
+                    {"role": "user", "content": "It crashes on startup"},
+                ],
+                "reference_response": "Let me look at the startup sequence and grep for any obvious crash paths.",
+                "context_tokens_approx": 7900,
+                "target_bucket_tokens": 8192,
+                "n_messages": 3,
+                "initial_state": {},
+                "verifier": {"type": "cache-and-quality"},
+            }
+        ],
+    }))
+
+    rows, summary = ar.run_agent_recorded_area(
+        url="http://test.invalid",
+        model="test-model",
+        max_tokens=128,
+        restart_between_cases=True,
+        fixture_path=fake_fixture,
+        mock_judge=fake_judge,
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["case_id"] == "test-case-1"
+    assert row["bucket_tokens"] == 8192
+    assert row["restart"]["status"] == "ok"
+    assert row["cold"]["prefill_s"] == 3.5
+    assert row["warm"]["prefill_s"] == 0.2
+    assert row["warm"]["restore"] is True
+    assert row["warm"]["prefix_len"] == 7950
+    # speedup = 3.5 / 0.2 = 17.5
+    assert row["cache_speedup_x"] == 17.5
+    assert row["judge"]["pass"] is True
+    assert row["judge"]["verdict"] == "suitable_match"
+    assert row["pass"] is True
+
+    assert summary["n"] == 1
+    assert summary["n_judged"] == 1
+    assert summary["n_pass"] == 1
+    assert summary["pass_rate"] == 100.0
+    assert summary["cache_speedup_p50"] == 17.5
+
+
+def test_multi_turn_runner_marks_judge_pending_without_reference(tmp_path, monkeypatch):
+    """A v0 fixture case without ``reference_response`` returns
+    ``judge_pending`` rather than failing — quality wasn't checkable."""
+    from lucebench.areas import agent_recorded as ar
+
+    def fake_post(*, url, model, messages, max_tokens, auth_header="", timeout_s=600):
+        return ({
+            "choices": [{"message": {"content": "fine"}}],
+            "usage": {"completion_tokens": 1, "timings": {"prefill_ms": 100, "decode_ms": 50}},
+        }, 0.5)
+
+    monkeypatch.setattr(ar, "_http_post_chat_completions", fake_post)
+    monkeypatch.setattr(ar, "_restart_lucebox_service", lambda **kw: (True, "ok"))
+    monkeypatch.setattr(ar, "_health_wait", lambda url, timeout_s=120: True)
+
+    import json
+    fake_fixture = tmp_path / "no_ref.json"
+    fake_fixture.write_text(json.dumps({
+        "schema": "lucebox-bench-agent-recorded-multi-turn-v0",
+        "cases": [{
+            "id": "v0-case",
+            "source": "claude-code",
+            "kind": "multi-turn-replay",
+            "messages": [{"role": "user", "content": "hi"}],
+            "context_tokens_approx": 100,
+            "target_bucket_tokens": 8192,
+            "n_messages": 1,
+        }],
+    }))
+
+    # Judge should NEVER be called for a case lacking reference_response.
+    def boom(**kw):  # pragma: no cover - asserted by absence of call
+        raise AssertionError("judge should not be invoked without a reference")
+
+    rows, summary = ar.run_agent_recorded_area(
+        url="http://test.invalid", model="test",
+        fixture_path=fake_fixture, mock_judge=boom,
+    )
+    assert len(rows) == 1
+    assert rows[0]["judge"]["verdict"] == "judge_pending"
+    assert rows[0]["pass"] is False
+    # Pass rate denominator excludes judge_pending → pass_rate = 0 of 0 → 0.0.
+    assert summary["n_judged"] == 0
+
+
+# ── LLM judge unit tests (mocked SDK client) ─────────────────────────
+
+
+def test_judge_parses_strict_json(tmp_path):
+    """The judge parses a strict-JSON verdict and returns the expected
+    JudgeVerdict; the cache file lands at the expected path."""
+    from lucebench.grading import llm_judge
+
+    class _FakeBlock:
+        def __init__(self, text):
+            self.text = text
+
+    class _FakeResp:
+        def __init__(self, text):
+            self.content = [_FakeBlock(text)]
+
+    class _FakeMessagesAPI:
+        def create(self, **kwargs):
+            return _FakeResp('{"verdict": "suitable_match", "rationale": "matches well"}')
+
+    class _FakeClient:
+        def __init__(self):
+            self.messages = _FakeMessagesAPI()
+
+    v = llm_judge.judge_response(
+        case_id="t1",
+        messages=[{"role": "user", "content": "x"}],
+        reference_response="abc",
+        candidate_response="xyz",
+        cache_root=tmp_path,
+        _client_factory=_FakeClient,
+    )
+    assert v.passed is True
+    assert v.verdict == "suitable_match"
+    assert v.cached is False
+
+    # Re-run with same inputs hits the cache.
+    v2 = llm_judge.judge_response(
+        case_id="t1",
+        messages=[{"role": "user", "content": "x"}],
+        reference_response="abc",
+        candidate_response="xyz",
+        cache_root=tmp_path,
+        _client_factory=_FakeClient,
+    )
+    assert v2.cached is True
+    assert v2.verdict == "suitable_match"
+
+
+def test_judge_handles_markdown_fenced_json(tmp_path):
+    """Judges sometimes wrap their JSON in ```json fences; the parser
+    strips them rather than mapping to off_track."""
+    from lucebench.grading import llm_judge
+
+    class _FakeBlock:
+        def __init__(self, text):
+            self.text = text
+
+    class _FakeResp:
+        def __init__(self, text):
+            self.content = [_FakeBlock(text)]
+
+    class _FakeMessagesAPI:
+        def create(self, **kwargs):
+            return _FakeResp('```json\n{"verdict": "divergent_but_valid", "rationale": "ok"}\n```')
+
+    class _FakeClient:
+        def __init__(self):
+            self.messages = _FakeMessagesAPI()
+
+    v = llm_judge.judge_response(
+        case_id="t-fenced",
+        messages=[{"role": "user", "content": "x"}],
+        reference_response="a",
+        candidate_response="b",
+        cache_root=tmp_path,
+        _client_factory=_FakeClient,
+    )
+    assert v.passed is True  # divergent_but_valid maps to pass
+    assert v.verdict == "divergent_but_valid"
+
+
+def test_judge_off_track_fails(tmp_path):
+    """off_track maps to fail."""
+    from lucebench.grading import llm_judge
+
+    class _FakeBlock:
+        def __init__(self, text):
+            self.text = text
+
+    class _FakeResp:
+        def __init__(self, text):
+            self.content = [_FakeBlock(text)]
+
+    class _FakeMessagesAPI:
+        def create(self, **kwargs):
+            return _FakeResp('{"verdict": "off_track", "rationale": "irrelevant"}')
+
+    class _FakeClient:
+        def __init__(self):
+            self.messages = _FakeMessagesAPI()
+
+    v = llm_judge.judge_response(
+        case_id="t-off",
+        messages=[{"role": "user", "content": "x"}],
+        reference_response="a",
+        candidate_response="b",
+        cache_root=tmp_path,
+        _client_factory=_FakeClient,
+    )
+    assert v.passed is False
+    assert v.verdict == "off_track"
+
+
+def test_judge_malformed_response_maps_to_off_track(tmp_path):
+    """A junk judge response biases against the candidate."""
+    from lucebench.grading import llm_judge
+
+    class _FakeBlock:
+        def __init__(self, text):
+            self.text = text
+
+    class _FakeResp:
+        def __init__(self, text):
+            self.content = [_FakeBlock(text)]
+
+    class _FakeMessagesAPI:
+        def create(self, **kwargs):
+            return _FakeResp("I'm not going to answer that.")
+
+    class _FakeClient:
+        def __init__(self):
+            self.messages = _FakeMessagesAPI()
+
+    v = llm_judge.judge_response(
+        case_id="t-junk",
+        messages=[{"role": "user", "content": "x"}],
+        reference_response="a",
+        candidate_response="b",
+        cache_root=tmp_path,
+        _client_factory=_FakeClient,
+    )
+    assert v.passed is False
+    assert v.verdict == "off_track"
+
+
+def test_judge_unavailable_when_no_key_and_no_factory(monkeypatch, tmp_path):
+    """Without ANTHROPIC_API_KEY and no _client_factory, judge raises
+    JudgeUnavailable so the area can surface a clear error."""
+    from lucebench.grading import llm_judge
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    try:
+        llm_judge.judge_response(
+            case_id="t-noenv",
+            messages=[{"role": "user", "content": "x"}],
+            reference_response="a",
+            candidate_response="b",
+            cache_root=tmp_path,
+        )
+    except llm_judge.JudgeUnavailable as e:
+        assert "ANTHROPIC_API_KEY" in str(e)
+    else:  # pragma: no cover - test should always raise
+        raise AssertionError("expected JudgeUnavailable")
+
+
+def test_extract_row_from_response_includes_cache_signal():
+    """The row extractor pulls prefill/decode/prefix_len from the
+    server's ``usage.timings`` block."""
+    from lucebench.areas import agent_recorded as ar
+    raw = {
+        "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+        "usage": {
+            "completion_tokens": 10,
+            "timings": {"prefill_ms": 1200, "decode_ms": 500, "prompt_n_cached": 3000},
+        },
+    }
+    row = ar._extract_row_from_response(raw, wall=1.8)
+    assert row["prefill_s"] == 1.2
+    assert row["decode_s"] == 0.5
+    assert row["prefix_len"] == 3000
+    assert row["restore"] is True
+    assert row["content"] == "ok"
