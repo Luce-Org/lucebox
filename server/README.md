@@ -231,6 +231,59 @@ Full `bench_llm.py` suite on Qwen3.6-27B UD-Q4_K_XL, 10 prompts, n_gen=256, RTX 
 | Math500 | 35.13 | 69.77 | 5.15 | **1.99×** |
 | **Mean** | 34.97 | 69.19 | 5.17 | **1.98×** |
 
+## Hybrid MoE (hot/cold expert split)
+
+For MoE targets whose experts don't fit in VRAM, dflash can split experts
+across the GPU and CPU: the most-used (**hot**) experts stay resident on the
+GPU, the rest (**cold**) live in host RAM and are evaluated on the CPU,
+overlapped with the GPU hot path. This trades some decode/prefill speed for
+VRAM headroom, and is computed automatically at load by a dynamic-placement
+pass. It applies to both MoE arches: `qwen35`/`qwen36` and `laguna`.
+
+**When it triggers.** If the experts fit in the available VRAM budget, all
+experts load to GPU (no split, fastest path). Otherwise placement keeps as
+many hot experts as the budget allows and routes the rest to CPU. You can also
+shrink the budget manually to force a split (e.g. to free VRAM for a longer
+context or a larger target).
+
+### Budget knobs
+
+| Env | Arch | Effect |
+|---|---|---|
+| `DFLASH_EXPERT_BUDGET_MB N` | both | Cap hot-expert VRAM to `N` MB. Applies only when `N` is below the auto-computed budget; experts beyond it go cold (CPU). |
+| `DFLASH_EXPERT_BUDGET_PCT P` | laguna | Keep hot experts to `P`% (`0<P<100`) of total expert bytes. Applies only when below the auto budget. |
+| `DFLASH_MAX_CONTEXT N` | both | Override the max context used when sizing the KV cache (more KV = less VRAM left for hot experts). |
+
+### Placement / tuning knobs (per arch)
+
+Substitute `<ARCH>` = `LAGUNA` or `QWEN35MOE`:
+
+| Env | Effect |
+|---|---|
+| `DFLASH_<ARCH>_HOTNESS <file>` | Expert frequency/hotness file driving which experts are placed hot. |
+| `DFLASH_<ARCH>_TELEMETRY 1` | Log per-layer hot/cold FFN timing telemetry. |
+| `DFLASH_<ARCH>_SWAP_MAX N` | Max hot/cold promotions per request boundary (runtime re-placement); `0` disables swapping. |
+| `DFLASH_<ARCH>_SWAP_MIN_GAIN N` | Min observed-frequency gain before a cold expert is promoted to hot. |
+| `DFLASH_<ARCH>_NEXT_PLACEMENT_OUT <file>` | Dump the placement chosen this run (warm-start the hotness file next time). |
+| `DFLASH_QWEN35MOE_RUNTIME_STATS_OUT <file>` | (qwen only) Dump runtime routing-frequency stats. |
+
+### Example
+
+```bash
+# Force ~8 GB of hot experts on GPU; the rest run cold on the CPU.
+DFLASH_EXPERT_BUDGET_MB=8000 ./build/dflash_server models/laguna-xs2-Q4_K_M.gguf --port 8000
+# Startup log e.g.: "dynamic placement result: 4717 hot experts, 5267 cold experts"
+```
+
+### Caveat: reduced-stack prefill chunking
+
+When a layer's hot-expert stack is **reduced** (i.e. a genuine split), the
+ggml-cuda MMQ `mul_mat_id` kernel illegal-accesses for certain batch sizes on
+**both** HIP/gfx1151 and CUDA/sm_86. As a guard, hybrid-split **prefill** is
+sliced into ≤4-token sub-batches (forcing the stable MMVQ path); **decode**
+(single-token) is unaffected. This costs some prefill throughput on split
+layers and is removed once the kernel is fixed upstream.
+
 ## Laguna-XS.2 target (experimental, Poolside MoE)
 
 [Poolside Laguna-XS.2](https://huggingface.co/poolside/Laguna-XS.2) is a 40-layer MoE LLM with 256 experts (top-8) plus an always-on shared expert, per-layer head counts `[48,64,64,64]×10`, and a per-layer SWA pattern (window 512). It is **architecturally distinct from `qwen35`**, so dflash adds a hand-rolled CUDA forward path (`Path A`, ggml-only — no libllama dependency) that mirrors the qwen35 stack. The Q4_K_M GGUF lands at 18.77 GiB on a single RTX 3090; tok_embd stays CPU-only (110 MiB) to keep the GPU budget under 24 GB.
