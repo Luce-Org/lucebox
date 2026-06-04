@@ -405,8 +405,7 @@ PromptRenderResult render_chat_template_jinja(
     const std::string & eos_token,
     bool add_generation_prompt,
     bool enable_thinking,
-    const std::string & tools_json,
-    ChatFormat arch_hint)
+    const std::string & tools_json)
 {
     if (template_src.empty()) {
         throw std::runtime_error("render_chat_template_jinja: template_src is empty");
@@ -459,30 +458,6 @@ PromptRenderResult render_chat_template_jinja(
         jinja::value results = rt.execute(*prog);
         auto parts = jinja::runtime::gather_string_parts(results);
         rendered = parts->as_string().str();
-
-        // Qwen3/3.5/3.6 only: the hard-coded renderer appends a closed think
-        // prefill when thinking is disabled. Some Qwen3.6 Jinja templates omit
-        // that final assistant suffix, leaving the model in the wrong decoding
-        // state for tool use. Mirror the hard-coded behavior here when the
-        // rendered prompt ends with a bare assistant generation prompt.
-        // Other architectures (Laguna, Gemma4, ...) do not use ChatML tokens
-        // and must not be touched here.
-        if (arch_hint == ChatFormat::QWEN3 && !enable_thinking) {
-            static constexpr char kAssistantBare[]    = "<|im_start|>assistant";
-            static constexpr char kAssistantPrefill[] = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
-            size_t trim_end = rendered.size();
-            while (trim_end > 0) {
-                char c = rendered[trim_end - 1];
-                if (c != ' ' && c != '\t' && c != '\n' && c != '\r') break;
-                --trim_end;
-            }
-            const size_t blen = sizeof(kAssistantBare) - 1;
-            if (trim_end >= blen &&
-                rendered.compare(trim_end - blen, blen, kAssistantBare) == 0) {
-                rendered.resize(trim_end - blen);
-                rendered += kAssistantPrefill;
-            }
-        }
     } catch (const std::exception & e) {
         throw std::runtime_error(std::string("jinja runtime: ") + e.what());
     }

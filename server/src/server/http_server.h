@@ -411,23 +411,6 @@ struct ServerJob {
     ServerJob *   next = nullptr;
 };
 
-// ─── Admission gate (pure, testable) ────────────────────────────────────
-// Returns true when the request should be admitted (effective prompt fits).
-//
-// effective_size   : post-compression prompt token count (== raw_size when
-//                    pflash is off or the prompt is below threshold).
-// raw_size         : pre-compression token count; used for the pre-compression
-//                    sanity guard: reject early when even best-case compression
-//                    cannot fit — i.e. raw*keep_ratio + max_output > max_ctx.
-// max_output       : request's requested generation tokens.
-// max_ctx          : server's configured context window (--max-ctx).
-// pflash_on        : true when pflash compressed this request.
-// pflash_keep_ratio: configured keep fraction; drives the pre-compression guard.
-//                    Guard is skipped when <= 0.
-bool check_admission(int effective_size, int raw_size,
-                     int max_output, int max_ctx, bool pflash_on,
-                     float pflash_keep_ratio = 0.05f);
-
 // ─── Parse session_id from a chat-completion JSON body ──────────────────
 // Returns empty string when session_id is absent or not a string (int/null/array).
 // Checks extra_body.session_id first, then top-level session_id.
