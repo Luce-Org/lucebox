@@ -1,0 +1,115 @@
+[project]
+name = "luce-bench"
+# Version is derived from git tags via hatch-vcs (see [tool.hatch.version]
+# below). Tag `luce-bench-v0.2.7` → release version `0.2.7`. Commits past
+# a tag get a `.devN+g<sha>` suffix so dev installs are visibly distinct
+# from releases. Single source of truth: the git tag.
+dynamic = ["version"]
+description = "Capability benchmarks for chat-completion endpoints (ds4-eval, HumanEval, long-context, forge)"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "Erik LaBianca", email = "erik@telepathdata.com" }]
+keywords = ["llm", "benchmark", "evaluation", "chat-completion", "reasoning"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# anthropic is a hard dep — the bench targets servers that expose
+# Anthropic-compatible `/v1/messages` (dflash does), and the forge area
+# already needs the SDK to drive its tool-calling scenarios. Making it
+# optional just created install-time surprise.
+dependencies = [
+    "anthropic>=0.40.0",
+]
+
+[project.optional-dependencies]
+# Kept as an empty alias for backward compatibility — old install
+# commands like `pip install 'luce-bench[forge]'` still resolve.
+forge = []
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+# Primary entry point — name matches the package so `uvx luce-bench`
+# Just Works. Keep `lucebench` as a back-compat alias for users who
+# remember the no-dash form.
+luce-bench = "lucebench.cli:main"
+lucebench = "lucebench.cli:main"
+luce-bench-probe = "lucebench.probe:main"
+lucebench-probe = "lucebench.probe:main"
+# `luce-bench regrade` is also exposed as a subcommand of `luce-bench`,
+# but the standalone entry-point lets shell completion and `uvx luce-
+# bench-regrade --glob '...'` work without the verb wrapper.
+luce-bench-regrade = "lucebench.regrade:main"
+lucebench-regrade = "lucebench.regrade:main"
+
+[project.urls]
+Homepage = "https://github.com/easel/luce-bench"
+Repository = "https://github.com/easel/luce-bench"
+Issues = "https://github.com/easel/luce-bench/issues"
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+# Untagged checkouts (e.g. fresh clone before tagging luce-bench-v0.2.7)
+# resolve to this rather than 0.0.0.dev0.
+fallback-version = "0.2.7.dev0"
+raw-options.tag_regex = '''^luce-bench-v(?P<version>\d+\.\d+\.\d+)$'''
+
+[tool.hatch.build.hooks.vcs]
+# Build hook writes the resolved version into src/lucebench/_version.py
+# so `__init__.py` can `from lucebench._version import __version__`.
+# Generated file — see luce-bench/.gitignore.
+version-file = "src/lucebench/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lucebench"]
+
+# Fixtures live under src/lucebench/fixtures, so they're auto-included
+# as package data. No force-include needed (would duplicate entries).
+
+# Embed the canonical model cards at build time. The cards live at repo
+# root share/model_cards/ (the C++ server's on-disk contract); we copy
+# them into the wheel as package data under lucebench/_model_cards/ so the
+# standalone PyPI build can resolve cards without reaching repo share/.
+# The git tree carries NO duplicate — only built artifacts do. Path is
+# relative to this pyproject (luce-bench/), so ../share reaches repo root.
+[tool.hatch.build.targets.wheel.force-include]
+"../share/model_cards" = "lucebench/_model_cards"
+
+[tool.hatch.build.targets.sdist]
+include = ["src/lucebench", "README.md", "LICENSE", "NOTICE", "tests"]
+
+[tool.hatch.build.targets.sdist.force-include]
+"../share/model_cards" = "lucebench/_model_cards"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# Vendored upstream code is preserved verbatim — exclude from lint so
+# we don't accumulate style noise we don't own. Re-include if we ever
+# fork upstream meaningfully.
+extend-exclude = [
+    "src/lucebench/fixtures/forge_eval",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "UP"]
+ignore = ["E501"]  # line-length handled by formatter
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
