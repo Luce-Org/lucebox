@@ -159,7 +159,7 @@ int LagunaBackend::snapshot_cur_pos(int slot) const {
 
 // ── Generation ──────────────────────────────────────────────────────────
 
-GenerateResult LagunaBackend::generate(const GenerateRequest & req,
+GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
                                         const DaemonIO & io) {
     if (hybrid_mode_ && moe_hybrid_) {
         auto result = generate_hybrid(req, io);
@@ -308,9 +308,9 @@ GenerateResult LagunaBackend::generate(const GenerateRequest & req,
 
 // ── RESTORE + generate ──────────────────────────────────────────────────
 
-GenerateResult LagunaBackend::restore_and_generate(int slot,
-                                                     const GenerateRequest & req,
-                                                     const DaemonIO & io) {
+GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
+                                                        const GenerateRequest & req,
+                                                        const DaemonIO & io) {
     const bool no_mask = (std::getenv("DFLASH_NO_MASK") != nullptr);
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);

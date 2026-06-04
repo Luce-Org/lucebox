@@ -40,6 +40,15 @@ static float bf16_bits_to_f32(uint16_t bits) {
     ( ((w).eos_chat_id >= 0 && (tok) == (w).eos_chat_id)                  \
    || ((w).eos_id      >= 0 && (tok) == (w).eos_id     ) )
 
+static bool qwen35_empty_visible_output(const std::vector<int32_t> & tokens,
+                                        const TargetWeights & w) {
+    if (tokens.empty()) return false;
+    for (int32_t tok : tokens) {
+        if (!IS_EOS_TOK(tok, w)) return false;
+    }
+    return true;
+}
+
 // ── Construction / destruction ──────────────────────────────────────────
 
 Qwen35Backend::Qwen35Backend(const Qwen35Config & cfg) : cfg_(cfg) {}
@@ -545,8 +554,8 @@ void Qwen35Backend::release_scratch() {
 
 // ── Generate (speculative decode) ───────────────────────────────────────
 
-GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
-                                        const DaemonIO & io) {
+GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
+                                            const DaemonIO & io) {
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     sampler_ = req.sampler;
@@ -591,6 +600,10 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
                                        req.hint_tokens, &req.budget_hook,
                                        &result.budget_forced_close,
                                        &result.degenerate_decode_close);
+            if (decode_ok) {
+                result.empty_visible_output =
+                    qwen35_empty_visible_output(result.tokens, w_);
+            }
         }
         if (!decode_ok) {
             result.error = "decode";
@@ -606,9 +619,9 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
 
 // ── Restore + generate ──────────────────────────────────────────────────
 
-GenerateResult Qwen35Backend::restore_and_generate(int slot,
-                                                    const GenerateRequest & req,
-                                                    const DaemonIO & io) {
+GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
+                                                        const GenerateRequest & req,
+                                                        const DaemonIO & io) {
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) {
@@ -692,6 +705,10 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
                                        req.hint_tokens, &req.budget_hook,
                                        &result.budget_forced_close,
                                        &result.degenerate_decode_close);
+            if (decode_ok) {
+                result.empty_visible_output =
+                    qwen35_empty_visible_output(result.tokens, w_);
+            }
         }
         if (!decode_ok) {
             result.error = "decode";

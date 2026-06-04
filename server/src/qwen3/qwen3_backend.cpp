@@ -511,8 +511,8 @@ bool Qwen3Backend::do_decode(int committed, int n_gen,
 
 // ── Generate ───────────────────────────────────────────────────────────
 
-GenerateResult Qwen3Backend::generate(const GenerateRequest & req,
-                                       const DaemonIO & io) {
+GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
+                                           const DaemonIO & io) {
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     sampler_ = req.sampler;
@@ -659,9 +659,9 @@ GenerateResult Qwen3Backend::generate(const GenerateRequest & req,
 
 // ── Restore + generate ─────────────────────────────────────────────────
 
-GenerateResult Qwen3Backend::restore_and_generate(int slot,
-                                                    const GenerateRequest & req,
-                                                    const DaemonIO & io) {
+GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
+                                                       const GenerateRequest & req,
+                                                       const DaemonIO & io) {
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     if (slot < 0 || slot >= PREFIX_SLOTS || !snapshots_[slot].ctx) {

@@ -127,8 +127,8 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
     return result;
 }
 
-GenerateResult LayerSplitBackend::generate(const GenerateRequest & req,
-                                           const DaemonIO & io) {
+GenerateResult LayerSplitBackend::generate_impl(const GenerateRequest & req,
+                                                const DaemonIO & io) {
     return run_from_state(req, io, /*base_pos=*/0, /*reset_state=*/true);
 }
 
@@ -148,7 +148,7 @@ int LayerSplitBackend::snapshot_cur_pos(int slot) const {
     return adapter_ ? adapter_->snapshot_cur_pos(slot) : 0;
 }
 
-GenerateResult LayerSplitBackend::restore_and_generate(
+GenerateResult LayerSplitBackend::restore_and_generate_impl(
         int slot, const GenerateRequest & req, const DaemonIO & io) {
     GenerateResult result;
     if (!adapter_ || !adapter_->snapshot_restore(slot)) {
