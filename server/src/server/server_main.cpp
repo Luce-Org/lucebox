@@ -229,6 +229,12 @@ static void print_usage(const char * prog) {
         "                               Overrides the hardcoded Qwen3/Laguna\n"
         "                               renderer. Empty or missing falls back\n"
         "                               to the hardcoded template.\n"
+        "\n"
+        "Context compaction (enabled by default, triggered by client request):\n"
+        "  --no-compaction              Disable auto context compaction\n"
+        "  --compaction-threshold <F>   Trigger ratio of max_ctx (default: 0.9)\n"
+        "  --compaction-keep-recent <F> Fraction of recent turns kept verbatim\n"
+        "                               during summarization (default: 0.3)\n"
         "\n", prog);
 }
 
@@ -435,6 +441,12 @@ int main(int argc, char ** argv) {
                 sconfig.chat_template_path = path;
                 std::fprintf(stderr, "[server] loaded chat template from %s (%ld bytes)\n", path, n);
             }
+        } else if (std::strcmp(argv[i], "--no-compaction") == 0) {
+            sconfig.compaction_enabled = false;
+        } else if (std::strcmp(argv[i], "--compaction-threshold") == 0 && i + 1 < argc) {
+            sconfig.compaction_threshold = std::stof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--compaction-keep-recent") == 0 && i + 1 < argc) {
+            sconfig.compaction_keep_recent = std::stof(argv[++i]);
         } else if (std::strcmp(argv[i], "--kv-cache-dir") == 0 && i + 1 < argc) {
             sconfig.disk_cache_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--kv-cache-budget") == 0 && i + 1 < argc) {
@@ -775,6 +787,17 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
     std::fprintf(stderr, "[server] │  cors            = %s\n", sconfig.enable_cors ? "ON" : "off");
+    // Resolve compaction_max_tokens from max_ctx if not explicitly set.
+    if (sconfig.compaction_max_tokens <= 0) {
+        sconfig.compaction_max_tokens = std::max(256, std::min(2048, sconfig.max_ctx / 10));
+    }
+
+    std::fprintf(stderr, "[server] │  compaction      = %s\n", sconfig.compaction_enabled ? "ON" : "off");
+    if (sconfig.compaction_enabled) {
+        std::fprintf(stderr, "[server] │  compact_thresh  = %.3f\n", sconfig.compaction_threshold);
+        std::fprintf(stderr, "[server] │  compact_recent  = %.3f\n", sconfig.compaction_keep_recent);
+        std::fprintf(stderr, "[server] │  compact_summary = %d (max_ctx=%d)\n", sconfig.compaction_max_tokens, sconfig.max_ctx);
+    }
     std::fprintf(stderr, "[server] │  cache_type_k    = %s\n",
 #ifdef GGML_USE_HIP
         cache_type_k.empty() ? "q4_0 (default, HIP)" : cache_type_k.c_str());
@@ -909,6 +932,39 @@ int main(int argc, char ** argv) {
         server.set_drafter_tokenizer(&drafter_tokenizer);
     }
 
+    // When --prefill-drafter is present and compaction is enabled, use the
+    // drafter (Qwen3-0.6B) as a dedicated compaction backend for Layer 2
+    // summarization. This avoids tying up the main target model for summary
+    // generation and is much faster (~0.6B vs 27B+).
+    std::unique_ptr<ModelBackend> compaction_backend;
+    if (sconfig.compaction_enabled && !sconfig.pflash_drafter_path.empty()) {
+        std::fprintf(stderr, "[server] creating compaction backend from %s\n",
+                     sconfig.pflash_drafter_path.c_str());
+        BackendArgs cbargs;
+        cbargs.model_path = sconfig.pflash_drafter_path.c_str();
+        cbargs.device.gpu = sconfig.pflash_drafter_gpu;
+        cbargs.device.max_ctx = 4096;  // compaction summaries are short
+        cbargs.stream_fd = -1;
+        cbargs.chunk = 512;
+        compaction_backend = create_backend(cbargs);
+        if (compaction_backend) {
+            // Use the drafter_tokenizer (already loaded for pflash) or load one.
+            if (!pflash_enabled) {
+                if (!drafter_tokenizer.load_from_gguf(sconfig.pflash_drafter_path.c_str())) {
+                    std::fprintf(stderr, "[server] compaction backend tokenizer load failed\n");
+                    compaction_backend.reset();
+                }
+            }
+            if (compaction_backend) {
+                server.set_compaction_backend(compaction_backend.get(), &drafter_tokenizer);
+                std::fprintf(stderr, "[server] compaction backend ready (drafter model)\n");
+            }
+        } else {
+            std::fprintf(stderr, "[server] compaction backend creation failed, "
+                         "falling back to main model for summarization\n");
+        }
+    }
+
     // Lazy-draft: park decode draft at startup to free VRAM (~3.3 GB).
     if (sconfig.lazy_draft && bargs.draft_path) {
         backend->park("draft");
@@ -917,6 +973,9 @@ int main(int argc, char ** argv) {
     int ret = server.run();
 
     // Cleanup.
+    if (compaction_backend) {
+        compaction_backend->shutdown();
+    }
     backend->shutdown();
     return ret;
 }

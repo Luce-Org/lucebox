@@ -4,10 +4,12 @@
 // job queue, worker thread with SSE streaming and disconnect detection.
 
 #include "http_server.h"
+#include "compaction.h"
 #include "sse_emitter.h"
 #include "tool_hint.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -75,6 +77,32 @@ static const char * api_format_name(ApiFormat format) {
 
 static size_t json_array_size(const json & value) {
     return value.is_array() ? value.size() : 0;
+}
+
+static std::string render_request_messages(const ServerConfig & config,
+                                           const Tokenizer & tokenizer,
+                                           ChatFormat chat_format,
+                                           const std::vector<ChatMessage> & messages,
+                                           bool enable_thinking,
+                                           const std::string & tools_json) {
+    if (!config.chat_template_src.empty()) {
+        const std::string & bos_str = (tokenizer.bos_id() >= 0)
+            ? tokenizer.raw_token(tokenizer.bos_id())
+            : std::string();
+        const std::string & eos_str = (tokenizer.eos_id() >= 0)
+            ? tokenizer.raw_token(tokenizer.eos_id())
+            : std::string();
+        return render_chat_template_jinja(
+            config.chat_template_src,
+            messages,
+            bos_str,
+            eos_str,
+            /*add_generation_prompt=*/true,
+            enable_thinking,
+            tools_json);
+    }
+
+    return render_chat_template(messages, chat_format, true, enable_thinking, tools_json);
 }
 
 // Build the /props response body.
@@ -759,6 +787,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
 
     ParsedRequest req;
     std::string err;
+    std::vector<ChatMessage> chat_msgs;
 
     try {
         json body = json::parse(hr.body);
@@ -885,8 +914,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         }
 
         // Render messages to text and tokenize.
-        std::vector<ChatMessage> chat_msgs =
-            normalize_chat_messages(req.messages, req.format, tool_memory_);
+        chat_msgs = normalize_chat_messages(req.messages, req.format, tool_memory_);
 
         // Determine thinking mode BEFORE rendering so the template can inject
         // the <think>\n\n</think>\n\n block when thinking is disabled.
@@ -1006,6 +1034,15 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         // Bandit: parse session_id from extra_body (opt-in adaptive keep_ratio)
         req.session_id = parse_session_id_from_body(body);
 
+        if (req.format == ApiFormat::RESPONSES && body.contains("context_management")
+            && body["context_management"].is_array()) {
+            for (auto & cm : body["context_management"]) {
+                if (cm.is_object() && cm.value("type", "") == "compaction") {
+                    req.compaction_threshold_override = cm.value("compact_threshold", 0);
+                }
+            }
+        }
+
         // Serialize tools JSON for template injection.
         std::string tools_json;
         if (req.tools.is_array() && !req.tools.empty()) {
@@ -1013,39 +1050,13 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         }
 
         std::string rendered;
-        if (!config_.chat_template_src.empty()) {
-            // Jinja path: caller supplied a chat template file via
-            // --chat-template-file. Override the hardcoded QWEN3/LAGUNA
-            // renderer. Used for tool-using agents that need the Anthropic
-            // tool_use envelope (e.g. froggeric Qwen3.6 template).
-            //
-            // Special tokens like <|im_start|> / <|im_end|> are stored
-            // verbatim in the GGUF vocab — use raw_token() to skip the
-            // GPT-2 byte decode (otherwise <0xC4><0x91> nonsense appears).
-            const std::string & bos_str = (tokenizer_.bos_id() >= 0)
-                ? tokenizer_.raw_token(tokenizer_.bos_id())
-                : std::string();
-            const std::string & eos_str = (tokenizer_.eos_id() >= 0)
-                ? tokenizer_.raw_token(tokenizer_.eos_id())
-                : std::string();
-            try {
-                rendered = render_chat_template_jinja(
-                    config_.chat_template_src,
-                    chat_msgs,
-                    bos_str,
-                    eos_str,
-                    /*add_generation_prompt=*/true,
-                    enable_thinking,
-                    tools_json);
-            } catch (const std::exception & e) {
-                send_error(fd, 500,
-                    std::string("chat template (jinja) render failed: ") + e.what());
-                return true;
-            }
-        } else {
-            rendered = render_chat_template(chat_msgs, chat_format_,
-                                            true, enable_thinking,
-                                            tools_json);
+        try {
+            rendered = render_request_messages(
+                config_, tokenizer_, chat_format_, chat_msgs, enable_thinking, tools_json);
+        } catch (const std::exception & e) {
+            send_error(fd, 500,
+                std::string("chat template render failed: ") + e.what());
+            return true;
         }
         req.prompt_tokens = tokenizer_.encode(rendered);
 
@@ -1062,8 +1073,17 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         return true;  // handled (with error)
     }
 
-    // Check context length.
-    if ((int)req.prompt_tokens.size() + req.max_output > config_.max_ctx) {
+    // Check context length / compaction threshold.
+    const int total_request_tokens = (int)req.prompt_tokens.size() + req.max_output;
+    const int compaction_trigger = req.compaction_threshold_override > 0
+        ? req.compaction_threshold_override
+        : std::max(1, (int)std::ceil((double)config_.max_ctx * config_.compaction_threshold));
+    if (config_.compaction_enabled
+        && total_request_tokens >= std::min(config_.max_ctx, compaction_trigger)) {
+        req.compaction_needed = true;
+        req.pre_compaction_tokens = (int)req.prompt_tokens.size();
+        req.chat_messages_copy = chat_msgs;
+    } else if (total_request_tokens > config_.max_ctx) {
         send_error(fd, 400, "prompt + max_tokens exceeds context window");
         return true;
     }
@@ -1111,8 +1131,9 @@ void HttpServer::worker_loop() {
         if (!job) break;  // stopping
 
         int fd = job->fd;
-        const auto & req = job->req;
+        auto & req = job->req;
         auto started_at = std::chrono::steady_clock::now();
+        bool stream_headers_sent = false;
 
         auto finish_job = [&]() {
             std::lock_guard<std::mutex> lk(job->mu);
@@ -1121,7 +1142,7 @@ void HttpServer::worker_loop() {
         };
         auto fail_request = [&](int status, const std::string & message) {
             std::fprintf(stderr, "[server] request failed: %s\n", message.c_str());
-            if (req.stream) {
+            if (req.stream && stream_headers_sent) {
                 json err = {{"error", {{"message", message}, {"type", "server_error"}}}};
                 const std::string chunk = "data: " + err.dump() + "\n\n";
                 send_all(fd, chunk.data(), chunk.size());
@@ -1132,6 +1153,113 @@ void HttpServer::worker_loop() {
             }
             finish_job();
         };
+
+        std::string tools_json;
+        if (req.tools.is_array() && !req.tools.empty()) {
+            tools_json = req.tools.dump();
+        }
+        auto render_compacted_prompt = [&](const std::vector<ChatMessage> & messages,
+                                           std::vector<int32_t> & tokens_out) {
+            try {
+                const std::string rendered = render_request_messages(
+                    config_, tokenizer_, chat_format_, messages, req.thinking_enabled, tools_json);
+                tokens_out = tokenizer_.encode(rendered);
+                return true;
+            } catch (const std::exception & e) {
+                fail_request(500, std::string("chat template render failed: ") + e.what());
+                return false;
+            }
+        };
+
+        if (req.compaction_needed && config_.compaction_enabled && !req.chat_messages_copy.empty()) {
+            std::vector<ChatMessage> current_messages = req.chat_messages_copy;
+            bool                     render_failed = false;
+
+            auto edit_result = edit_compact(
+                current_messages,
+                config_.compaction_keep_tool_uses,
+                config_.compaction_strip_thinking);
+            if (edit_result.applied) {
+                current_messages = std::move(edit_result.compacted_messages);
+                if (!render_compacted_prompt(current_messages, req.prompt_tokens)) {
+                    render_failed = true;
+                }
+            }
+            if (render_failed) continue;
+
+            if ((int)req.prompt_tokens.size() + req.max_output > config_.max_ctx) {
+                // Use dedicated compaction backend (small model) if available,
+                // otherwise fall back to the main target model.
+                ModelBackend * sum_backend = compaction_backend_ ? compaction_backend_ : &backend_;
+                Tokenizer * sum_tokenizer = compaction_tokenizer_ ? compaction_tokenizer_ : &tokenizer_;
+                // Compaction backend (Qwen3-0.6B) always uses QWEN3 chat format.
+                int sum_chat_format = compaction_backend_
+                    ? (int)ChatFormat::QWEN3
+                    : (int)chat_format_;
+                auto sum_result = summarize_compact(
+                    current_messages,
+                    config_.compaction_keep_recent,
+                    config_.compaction_max_tokens,
+                    config_.compaction_prompt,
+                    sum_backend,
+                    sum_tokenizer,
+                    sum_chat_format);
+                if (sum_result.applied) {
+                    current_messages = std::move(sum_result.compacted_messages);
+                    if (!render_compacted_prompt(current_messages, req.prompt_tokens)) {
+                        render_failed = true;
+                    }
+                }
+            }
+            if (render_failed) continue;
+
+            if ((int)req.prompt_tokens.size() + req.max_output > config_.max_ctx) {
+                size_t system_prefix = 0;
+                while (system_prefix < current_messages.size()
+                    && current_messages[system_prefix].role == "system") {
+                    ++system_prefix;
+                }
+                const int non_system = (int)current_messages.size() - (int)system_prefix;
+                bool truncated_to_fit = false;
+                for (int keep = std::max(0, non_system - 1); keep >= 0; --keep) {
+                    auto trunc_result = hard_truncate(current_messages, keep);
+                    const auto & candidate_messages = trunc_result.applied
+                        ? trunc_result.compacted_messages
+                        : current_messages;
+                    std::vector<int32_t> candidate_tokens;
+                    if (!render_compacted_prompt(candidate_messages, candidate_tokens)) {
+                        render_failed = true;
+                        break;
+                    }
+                    if ((int)candidate_tokens.size() + req.max_output <= config_.max_ctx) {
+                        current_messages = candidate_messages;
+                        req.prompt_tokens = std::move(candidate_tokens);
+                        truncated_to_fit = true;
+                        break;
+                    }
+                }
+                if (render_failed) continue;
+                if (!truncated_to_fit && (int)req.prompt_tokens.size() + req.max_output > config_.max_ctx) {
+                    fail_request(400, "context too long even after compaction");
+                    continue;
+                }
+            }
+
+            const int saved = req.pre_compaction_tokens - (int)req.prompt_tokens.size();
+            req.compaction_applied = saved > 0;
+            if (req.compaction_applied) {
+                std::fprintf(stderr,
+                    "[server] compaction applied: %d -> %d tokens (saved %d)\n",
+                    req.pre_compaction_tokens,
+                    (int)req.prompt_tokens.size(),
+                    saved);
+            }
+        }
+
+        if ((int)req.prompt_tokens.size() + req.max_output > config_.max_ctx) {
+            fail_request(400, "context too long even after compaction");
+            continue;
+        }
 
         std::fprintf(stderr,
             "[server] chat START %s format=%s stream=%s prompt_tokens=%zu "
@@ -1150,6 +1278,7 @@ void HttpServer::worker_loop() {
                 finish_job();
                 continue;
             }
+            stream_headers_sent = true;
         }
 
         // Create SSE emitter for streaming state machine.
@@ -1690,6 +1819,9 @@ void HttpServer::worker_loop() {
                 fci < 0 ? emitted : fci;
             const int content_tokens_emitted =
                 fci < 0 ? 0 : emitted - fci;
+            const int compacted_tokens_saved = req.compaction_applied
+                ? std::max(0, req.pre_compaction_tokens - (int)req.prompt_tokens.size())
+                : 0;
 
             json resp;
             switch (req.format) {
@@ -1781,6 +1913,9 @@ void HttpServer::worker_loop() {
                     {"timings", build_timings_json(gen_timings, total_completion_tokens)},
                     {"accept_rate", result.accept_rate}
                 };
+                if (compacted_tokens_saved > 0) {
+                    chat_usage["compacted_tokens_saved"] = compacted_tokens_saved;
+                }
                 resp = {
                     {"id", req.response_id},
                     {"object", "chat.completion"},
@@ -1845,6 +1980,9 @@ void HttpServer::worker_loop() {
                     {"timings", build_timings_json(gen_timings, total_completion_tokens)},
                     {"accept_rate", result.accept_rate}
                 };
+                if (compacted_tokens_saved > 0) {
+                    anth_usage["compacted_tokens_saved"] = compacted_tokens_saved;
+                }
                 resp = {
                     {"id", req.response_id}, {"type", "message"},
                     {"role", "assistant"}, {"model", req.model},
@@ -1881,6 +2019,9 @@ void HttpServer::worker_loop() {
                     {"timings", build_timings_json(gen_timings, total_completion_tokens)},
                     {"accept_rate", result.accept_rate}
                 };
+                if (compacted_tokens_saved > 0) {
+                    resp_usage["compacted_tokens_saved"] = compacted_tokens_saved;
+                }
                 resp = {
                     {"id", req.response_id}, {"object", "response"},
                     {"status", "completed"}, {"model", req.model},
