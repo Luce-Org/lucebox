@@ -765,9 +765,9 @@ if(DFLASH27B_TESTS)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/server/server_main.cpp")
         find_package(CURL QUIET)
         if(NOT CURL_FOUND)
-            message(WARNING "CURL not found — skipping dflash_server (passthrough proxy disabled)")
-        else()
-            add_executable(dflash_server
+            message(WARNING "CURL not found — building dflash_server without passthrough proxy")
+        endif()
+        add_executable(dflash_server
                 src/server/server_main.cpp
                 src/server/http_server.cpp
                 src/server/model_card.cpp
@@ -780,7 +780,11 @@ if(DFLASH27B_TESTS)
                     DFLASH27B_BACKEND_CUDA=1
                     DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
             endif()
-            target_link_libraries(dflash_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread CURL::libcurl)
+            target_link_libraries(dflash_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread)
+        if(CURL_FOUND)
+            target_compile_definitions(dflash_server PRIVATE DFLASH_HAS_CURL=1)
+            target_link_libraries(dflash_server PRIVATE CURL::libcurl)
+        endif()
             if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
                 find_package(CUDAToolkit REQUIRED)
                 target_link_libraries(dflash_server PRIVATE CUDA::cudart)
@@ -909,4 +913,3 @@ if(DFLASH27B_TESTS)
             ${DFLASH27B_SRC_INCLUDE_DIRS})
     endif()
     endif()
-endif()
