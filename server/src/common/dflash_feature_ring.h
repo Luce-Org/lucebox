@@ -1,10 +1,11 @@
 // dflash_feature_ring.h — DFlash draft feature ring buffer (target-agnostic).
 //
-// Hosts the F32 ring buffer that mirrors target hidden-state captures on the
-// draft GPU, plus the helpers that move data:
+// Hosts the ring buffer that mirrors target hidden-state captures on the
+// draft GPU, plus the helpers that move data across the storage/input dtype
+// boundary:
 //   - target activation tensor → ring slot
 //   - ring range → contiguous draft input tensor
-//   - target BF16 feature cache tensor → ring (with BF16→F32 conversion,
+//   - target BF16 feature cache tensor → ring (with dtype conversion,
 //     possibly across devices)
 //
 // Lives in common/ so any DFlash target architecture (qwen35, gemma4,
@@ -18,20 +19,22 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace dflash::common {
 
 struct DraftFeatureMirror {
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
-    ggml_tensor * target_feat = nullptr; // F32 [n_target_layers*hidden_size, cap]
-    void * bf16_staging = nullptr;
-    size_t bf16_staging_elems = 0;
+    ggml_tensor * target_feat = nullptr; // [n_target_layers*hidden_size, cap]
+    void * staging = nullptr;
+    size_t staging_bytes = 0;
     int device = 0;
     int target_device = 0;
     int cap = 0;
     int n_target_layers = 0;
     int hidden_size = 0;
+    ggml_type storage_type = GGML_TYPE_F32;
 };
 
 void draft_feature_mirror_free(DraftFeatureMirror & mirror);
@@ -87,5 +90,17 @@ bool copy_feature_ring_range_to_tensor(
     ggml_tensor * dst,
     int start_pos,
     int n_tokens);
+
+bool copy_feature_ring_range_to_host_f32(
+    const DraftFeatureMirror & feature_ring,
+    int start_pos,
+    int n_tokens,
+    std::vector<float> & out);
+
+bool copy_host_f32_to_feature_ring_range(
+    DraftFeatureMirror & feature_ring,
+    int start_pos,
+    int n_tokens,
+    const std::vector<float> & src);
 
 }  // namespace dflash::common

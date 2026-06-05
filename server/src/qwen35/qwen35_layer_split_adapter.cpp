@@ -296,18 +296,8 @@ bool Qwen35LayerSplitAdapter::snapshot_draft_features(int slot) {
         return remote_draft_.get_feature_range(start_pos, n_tokens, snap.data);
     }
 
-    if (!feature_ring_.target_feat) return false;
-    const int fc_in = n_layers * hidden;
-    const size_t row_bytes = (size_t)fc_in * sizeof(float);
-    const size_t src_stride = feature_ring_.target_feat->nb[1];
-    for (int i = 0; i < n_tokens; ++i) {
-        const int ring_slot = (start_pos + i) % ring_cap;
-        ggml_backend_tensor_get(feature_ring_.target_feat,
-                                snap.data.data() + (size_t)i * (size_t)fc_in,
-                                (size_t)ring_slot * src_stride,
-                                row_bytes);
-    }
-    return true;
+    return copy_feature_ring_range_to_host_f32(
+        feature_ring_, start_pos, n_tokens, snap.data);
 }
 
 void Qwen35LayerSplitAdapter::free_draft_feature_snapshot(int slot) {
@@ -347,17 +337,8 @@ bool Qwen35LayerSplitAdapter::restore_draft_features(int slot) {
         snap.hidden_size != feature_ring_.hidden_size) {
         return false;
     }
-    const int fc_in = snap.n_target_layers * snap.hidden_size;
-    const size_t row_bytes = (size_t)fc_in * sizeof(float);
-    const size_t dst_stride = feature_ring_.target_feat->nb[1];
-    for (int i = 0; i < snap.n_tokens; ++i) {
-        const int ring_slot = (snap.start_pos + i) % snap.cap;
-        ggml_backend_tensor_set(feature_ring_.target_feat,
-                                snap.data.data() + (size_t)i * (size_t)fc_in,
-                                (size_t)ring_slot * dst_stride,
-                                row_bytes);
-    }
-    return true;
+    return copy_host_f32_to_feature_ring_range(
+        feature_ring_, snap.start_pos, snap.n_tokens, snap.data);
 }
 
 int Qwen35LayerSplitAdapter::current_last_token() const {
