@@ -468,17 +468,23 @@ PromptRenderResult render_chat_template_jinja(
     // chat templates that end with `<think>\n` when enable_thinking is
     // honored, plus any custom template that follows the same convention.
     //
-    // Warn loudly when sniffing decides true so a template/model-card
-    // mismatch (e.g. enable_thinking=false but template hard-codes
-    // `<think>` anyway) surfaces in server logs.
+    // The sniff is the source of truth — if the rendered prompt ends
+    // with `<think>`, the model's first generated token is reasoning
+    // regardless of the `enable_thinking` flag we passed in. A template
+    // that hard-codes `<think>` even with enable_thinking=false will
+    // still pre-open the channel, and we must route accordingly to
+    // avoid leaking reasoning into the content stream.
+    //
+    // Warn only on the mismatch case (sniff=true, enable_thinking=false)
+    // so a template/model-card disagreement surfaces in server logs
+    // without spamming the normal-success path.
     bool started_in_thinking =
-        enable_thinking && add_generation_prompt &&
-        prompt_ends_with_think_open(rendered);
-    if (started_in_thinking) {
+        add_generation_prompt && prompt_ends_with_think_open(rendered);
+    if (started_in_thinking && !enable_thinking) {
         std::fprintf(stderr,
             "[WARN] render_chat_template_jinja: rendered prompt ends with "
-            "`<think>` opener — treating as started_in_thinking=true. If "
-            "this is unexpected, check the template's enable_thinking "
+            "`<think>` opener despite enable_thinking=false — treating as "
+            "started_in_thinking=true. Check the template's enable_thinking "
             "branch or the model card's reasoning configuration.\n");
     }
 

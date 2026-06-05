@@ -1987,6 +1987,39 @@ static void test_jinja_render_suffix_sniff_negative() {
     TEST_ASSERT(!r.started_in_thinking);
 }
 
+// Jinja path: the sniff is the source of truth for started_in_thinking,
+// not the enable_thinking flag. If a template hard-codes `<think>` despite
+// enable_thinking=false (custom template, model-card mismatch, etc.) we
+// still need to route the model's first tokens to the reasoning channel
+// or they'll leak into content. The renderer logs a [WARN] in that case
+// (verified manually; we don't capture stderr in this test).
+static void test_jinja_render_suffix_sniff_overrides_enable_thinking_flag() {
+    // Template hardcodes `<think>` regardless of enable_thinking.
+    static const char TPL[] =
+        "{%- for m in messages -%}<|{{ m.role }}|>{{ m.content }}{%- endfor -%}"
+        "{%- if add_generation_prompt -%}<|assistant|><think>\n{%- endif -%}";
+    std::vector<ChatMessage> msgs = {{"user", "?", ""}};
+    auto r = render_chat_template_jinja(
+        TPL, msgs, "", "", /*add_gen=*/true, /*think=*/false, "");
+    // Even though enable_thinking=false, the rendered prompt ends with
+    // `<think>` so started_in_thinking must be true to avoid routing
+    // reasoning tokens into the content channel.
+    TEST_ASSERT(r.started_in_thinking);
+}
+
+// Jinja path: sniff still requires add_generation_prompt — without it the
+// rendered prompt is a transcript, not a continuation, and any embedded
+// `<think>` in past turns shouldn't claim the channel is pre-opened.
+static void test_jinja_render_suffix_sniff_requires_add_generation_prompt() {
+    static const char TPL[] =
+        "{%- for m in messages -%}<|{{ m.role }}|>{{ m.content }}{%- endfor -%}"
+        "{%- if add_generation_prompt -%}<|assistant|><think>\n{%- endif -%}";
+    std::vector<ChatMessage> msgs = {{"user", "?", ""}};
+    auto r = render_chat_template_jinja(
+        TPL, msgs, "", "", /*add_gen=*/false, /*think=*/true, "");
+    TEST_ASSERT(!r.started_in_thinking);
+}
+
 // ─── SseEmitter initial_mode=REASONING ──────────────────────────────────
 //
 // Regression: when constructed with initial_mode=REASONING (the
@@ -4810,6 +4843,8 @@ int main() {
     RUN_TEST(test_chat_template_gemma4_does_not_pre_open);
     RUN_TEST(test_jinja_render_suffix_sniff_sets_started_in_thinking);
     RUN_TEST(test_jinja_render_suffix_sniff_negative);
+    RUN_TEST(test_jinja_render_suffix_sniff_overrides_enable_thinking_flag);
+    RUN_TEST(test_jinja_render_suffix_sniff_requires_add_generation_prompt);
     RUN_TEST(test_integration_qwen3_enable_thinking_render_to_emit_routes_to_reasoning);
     RUN_TEST(test_integration_laguna_enable_thinking_render_to_emit_routes_to_reasoning);
     RUN_TEST(test_integration_qwen3_disable_thinking_render_to_emit_stays_in_content);

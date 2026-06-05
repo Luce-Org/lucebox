@@ -618,13 +618,17 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
     // Cases:
     //   - Pattern A (XML envelope, mode==TOOL_BUFFER): tool_buffer_ holds
     //     protocol artifact text (`<tool_call>...`) that was never streamed
-    //     as a delta. Excluded from responses_streamed_text — the .done
-    //     events expose only the pre-call accumulated_content_ (current
-    //     behavior).
+    //     as a delta. The raw envelope is excluded from
+    //     responses_streamed_text — but any `cleaned_text` the parser
+    //     extracts (text outside the XML span) IS emitted as a content
+    //     delta below, so it must also be folded into the snapshot once
+    //     the parse succeeds (handled inline at the cleaned_text emit).
     //   - Pattern B (plain-text `call:`, mode==TOOL_BUFFER): tool_buffer_
     //     holds the raw `call:<verb>{...}` span plus any post-call trailing
     //     text. Both belong in the visible text snapshot per the PR #329
-    //     review (tests #1126 et al).
+    //     review (tests #1126 et al). The snapshot already includes the
+    //     full raw buffer, which is a superset of `cleaned_text`, so we
+    //     don't double-count when the cleaned_text emit happens.
     //   - mode==CONTENT plain-text hoist branch below: accumulated_content_
     //     already contains the full pre-strip text; the snapshot taken
     //     here freezes it before the strip mutates it.
@@ -651,6 +655,17 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             if (!parsed.cleaned_text.empty()) {
                 accumulated_content_ += parsed.cleaned_text;
                 emit_content_delta(out, parsed.cleaned_text);
+                // Pattern A: snapshot was taken before parsing and only
+                // included pre-buffer accumulated_content_; the
+                // cleaned_text we just streamed must also appear in the
+                // .done/.completed payloads or the client's accumulated
+                // delta buffer will disagree with the server's final
+                // text. Pattern B's snapshot already contains the full
+                // raw buffer (which is a superset of cleaned_text), so
+                // we skip the append there to avoid double-counting.
+                if (!tool_open_is_plain_text_) {
+                    responses_streamed_text += parsed.cleaned_text;
+                }
             }
 
             fr = "tool_calls";

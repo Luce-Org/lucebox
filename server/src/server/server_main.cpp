@@ -1233,14 +1233,28 @@ int main(int argc, char ** argv) {
                 bargs.draft_path);
         }
     }
+    // nlohmann::json::value<std::string>() throws type_error when the
+    // key exists but isn't a string (e.g. `"kernel": null`). IMAGE_INFO
+    // and HOST_INFO are sourced from operator-provided env via
+    // entrypoint.sh, so we can't assume well-typed values — fall back
+    // to "(none)" on any missing-or-non-string field rather than
+    // crashing server startup.
+    auto json_str_or_none = [](const json & j, const char * key) -> const char * {
+        auto it = j.find(key);
+        if (it == j.end() || !it->is_string()) {
+            return "(none)";
+        }
+        return it->get_ref<const std::string &>().c_str();
+    };
+
     // Container/image identity (Dockerfile bakes /opt/lucebox-hub/IMAGE_INFO).
     sconfig.image_info = read_image_info();
     if (!sconfig.image_info.is_null()) {
         std::fprintf(stderr,
             "[server] image_info: git_sha=%s image_tag=%s build_time=%s\n",
-            sconfig.image_info.value("git_sha",    "(none)").c_str(),
-            sconfig.image_info.value("image_tag",  "(none)").c_str(),
-            sconfig.image_info.value("build_time", "(none)").c_str());
+            json_str_or_none(sconfig.image_info, "git_sha"),
+            json_str_or_none(sconfig.image_info, "image_tag"),
+            json_str_or_none(sconfig.image_info, "build_time"));
     }
     // Host identity (entrypoint.sh writes /opt/lucebox-hub/HOST_INFO from
     // LUCEBOX_HOST_*). Surfaced verbatim under /props.host (schema 4+).
@@ -1249,9 +1263,9 @@ int main(int argc, char ** argv) {
     if (!sconfig.host_info.is_null()) {
         std::fprintf(stderr,
             "[server] host_info: source=%s os=%s kernel=%s\n",
-            sconfig.host_info.value("source",    "(none)").c_str(),
-            sconfig.host_info.value("os_pretty", "(none)").c_str(),
-            sconfig.host_info.value("kernel",    "(none)").c_str());
+            json_str_or_none(sconfig.host_info, "source"),
+            json_str_or_none(sconfig.host_info, "os_pretty"),
+            json_str_or_none(sconfig.host_info, "kernel"));
     }
 
     // Resolve the Level 2 force-close sequence. Two concepts, both sourced

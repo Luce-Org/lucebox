@@ -2,7 +2,7 @@ openapi: 3.1.0
 
 info:
   title: dflash_server /props endpoint
-  version: "3"
+  version: "4"
   summary: Capability and configuration introspection for dflash_server.
   description: |
     `GET /props` returns enough JSON for a dashboard, a deployment
@@ -13,7 +13,17 @@ info:
     The integer reported as `server.props_schema` (and as the
     trailing token of `build_info`) bumps when the response shape
     changes in a backward-incompatible way. The current schema is
-    `3`.
+    `4`.
+
+    Schema `4` (additive over `3`): new top-level `host` block —
+    host-identity facts (OS, kernel, WSL version, docker version,
+    NVIDIA driver, NVIDIA Container Toolkit version, CPU model,
+    nproc, RAM, per-GPU array with UUID/PCI/SM/VRAM/power,
+    CUDA_VISIBLE_DEVICES) captured by
+    `server/scripts/entrypoint.sh` from the `LUCEBOX_HOST_*` env
+    the host wrapper exports. `null` when
+    `/opt/lucebox-hub/HOST_INFO` is missing (bare-metal dev). See
+    `props-endpoint.md` §4.17.
 
     Schema `3` (additive over `2`): new top-level `build` block —
     a structured replacement for the single-string `build_info`
@@ -43,7 +53,7 @@ info:
 # response-shape changes; additive changes keep the same value
 # (e.g. schema 2 → 3 is additive but still bumps so consumers
 # can negotiate the new fields).
-x-props-schema: 3
+x-props-schema: 4
 
 servers:
   - url: http://localhost:8080
@@ -98,12 +108,34 @@ paths:
                     build:
                       server_name: "luce-dflash"
                       server_version: "0.0.0+cpp"
-                      props_schema: 3
+                      props_schema: 4
                       git_sha: "6d12378"
                       image_tag: "sha-6d12378-cuda12"
                       image_digest: null
                       build_time: "2026-05-28T13:43:57Z"
-                    build_info: "luce-dflash v0.0.0+cpp props_schema=3"
+                    build_info: "luce-dflash v0.0.0+cpp props_schema=4"
+                    host:
+                      os_pretty: "Ubuntu 22.04.3 LTS"
+                      kernel: "6.6.87.2-microsoft-standard-WSL2"
+                      wsl_version: "wsl2"
+                      docker_version: "29.1.3"
+                      nvidia_driver: "596.36"
+                      nvidia_ctk_version: "1.16.2"
+                      cpu_model: "Intel(R) Core(TM) Ultra 9 275HX"
+                      nproc: 24
+                      ram_gb: 64
+                      gpus:
+                        - index: 0
+                          uuid: "GPU-abc"
+                          pci_bus_id: "00000000:01:00.0"
+                          name: "NVIDIA GeForce RTX 5090 Laptop GPU"
+                          sm: "12.0"
+                          vram_gb: 24
+                          power_limit_w: 175
+                      cuda_visible_devices: "0"
+                      source: "lucebox.sh"
+                      collector: "lucebox.sh"
+                      collected_at: "2026-05-28T20:31:42Z"
                     capabilities:
                       reasoning_supported: true
                       speculative_supported: true
@@ -219,7 +251,7 @@ paths:
                         supports_top_p: true
                     server:
                       name: "luce-dflash"
-                      props_schema: 3
+                      props_schema: 4
                       version: "0.0.0+cpp"
                     speculative:
                       enabled: true
@@ -246,6 +278,7 @@ components:
         - daemon
         - default_generation_settings
         - full_cache
+        - host
         - model
         - model_alias
         - model_card
@@ -279,7 +312,7 @@ components:
             `image_tag`, and `build_time`. Retained for
             back-compat — consumers that grep `build_info` keep
             working.
-          example: "luce-dflash v0.0.0+cpp props_schema=3"
+          example: "luce-dflash v0.0.0+cpp props_schema=4"
         capabilities:
           $ref: "#/components/schemas/Capabilities"
         daemon:
@@ -288,6 +321,17 @@ components:
           $ref: "#/components/schemas/DefaultGenerationSettings"
         full_cache:
           $ref: "#/components/schemas/FullCache"
+        host:
+          oneOf:
+            - $ref: "#/components/schemas/Host"
+            - type: "null"
+          description: |
+            Host-identity facts captured at container startup by
+            `server/scripts/entrypoint.sh` from the
+            `LUCEBOX_HOST_*` env the host wrapper exports. `null`
+            when `/opt/lucebox-hub/HOST_INFO` is missing (bare-
+            metal dev). Added in schema 4 (additive over 3); pre-4
+            consumers ignore the key.
         model:
           $ref: "#/components/schemas/Model"
         model_alias:
@@ -490,6 +534,139 @@ components:
           minimum: 0
           description: Cumulative hit count since server start.
           example: 0
+
+    Host:
+      description: |
+        Host-identity facts captured at container startup by
+        `server/scripts/entrypoint.sh` from the `LUCEBOX_HOST_*`
+        env the host wrapper (`lucebox.sh::probe_host`) exports.
+        Written to `/opt/lucebox-hub/HOST_INFO` (path override:
+        `$DFLASH_HOST_INFO_PATH` for tests) and read verbatim
+        into `ServerConfig.host_info`. See
+        `docs/specs/props-endpoint.md` §4.17 for the prose spec.
+
+        Surfaces so every benchmark snapshot can self-classify
+        the rig it ran on. `luce-bench snapshot` writes this
+        verbatim into `host.json` and into each per-area
+        `<area>.json` so individual area files self-describe.
+      type: object
+      required:
+        - collected_at
+        - collector
+        - source
+      additionalProperties: true
+      properties:
+        os_pretty:
+          type: ["string", "null"]
+          description: |
+            `PRETTY_NAME` from `/etc/os-release`.
+          example: "Ubuntu 22.04.3 LTS"
+        kernel:
+          type: ["string", "null"]
+          description: |
+            `uname -r` on the host.
+          example: "6.6.87.2-microsoft-standard-WSL2"
+        wsl_version:
+          type: ["string", "null"]
+          enum: ["wsl1", "wsl2", null]
+          description: |
+            `"wsl2"` matches the modern `microsoft-standard-WSL2`
+            kernel string; `"wsl1"` is the legacy translation
+            layer; `null` is bare Linux / macOS.
+        docker_version:
+          type: ["string", "null"]
+          description: |
+            Docker server version from
+            `docker version --format '{{.Server.Version}}'`.
+          example: "29.1.3"
+        nvidia_driver:
+          type: ["string", "null"]
+          description: Driver version from `nvidia-smi`.
+          example: "596.36"
+        nvidia_ctk_version:
+          type: ["string", "null"]
+          description: |
+            NVIDIA Container Toolkit version
+            (`nvidia-ctk --version`). Distinct from
+            `docker_version` — the runtime that wires GPUs into
+            containers can lag behind the daemon.
+          example: "1.16.2"
+        cpu_model:
+          type: ["string", "null"]
+          description: First `"model name"` from `/proc/cpuinfo`.
+          example: "Intel(R) Core(TM) Ultra 9 275HX"
+        nproc:
+          type: ["integer", "null"]
+          minimum: 0
+          description: Logical CPU count.
+          example: 24
+        ram_gb:
+          type: ["integer", "null"]
+          minimum: 0
+          description: Total RAM in GB.
+          example: 64
+        gpus:
+          type: array
+          description: |
+            One entry per installed GPU; the array preserves
+            nvidia-smi's enumeration order. Possibly empty.
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              index:
+                type: integer
+                minimum: 0
+                example: 0
+              uuid:
+                type: string
+                example: "GPU-abc"
+              pci_bus_id:
+                type: string
+                example: "00000000:01:00.0"
+              name:
+                type: string
+                example: "NVIDIA GeForce RTX 5090 Laptop GPU"
+              sm:
+                type: string
+                description: Compute capability (e.g. "12.0").
+                example: "12.0"
+              vram_gb:
+                type: integer
+                minimum: 0
+                example: 24
+              power_limit_w:
+                type: integer
+                minimum: 0
+                description: |
+                  May differ from manufacturer spec when the
+                  operator has set a power cap.
+                example: 175
+        cuda_visible_devices:
+          type: ["string", "null"]
+          description: |
+            Mirrors the env var; `null` means "all GPUs visible".
+          example: "0"
+        source:
+          type: string
+          enum: ["lucebox.sh", "unknown"]
+          description: |
+            How the block was populated. `"lucebox.sh"` when the
+            host wrapper drove the run; `"unknown"` for the
+            entrypoint stub-only path.
+          example: "lucebox.sh"
+        collector:
+          type: string
+          description: |
+            The script that wrote HOST_INFO: usually
+            `"lucebox.sh"` when the host wrapper drove the run, or
+            `"entrypoint.sh"` on the stub-only path.
+          example: "lucebox.sh"
+        collected_at:
+          type: string
+          format: date-time
+          description: ISO 8601 UTC timestamp.
+          example: "2026-05-28T20:31:42Z"
 
     Model:
       description: Loaded model metadata.
@@ -697,7 +874,7 @@ components:
             Repeated here so a single curl on `/props` `.build`
             returns the schema version alongside the rest of the
             identity.
-          example: 3
+          example: 4
         git_sha:
           type: ["string", "null"]
           description: |
@@ -1139,11 +1316,12 @@ components:
           description: |
             Integer schema version. Bumps when the response shape
             changes (see §5 of props-endpoint.md). Current value
-            is `3`. Schema 3 is additive over 2 (new `build`
-            block, new `model.target`/`model.draft`); the bump
-            still happens so consumers can negotiate the new
+            is `4`. Schema 4 is additive over 3 (new top-level
+            `host` block); schema 3 was additive over 2 (new
+            `build` block, new `model.target`/`model.draft`). The
+            bumps still happen so consumers can negotiate the new
             fields.
-          example: 3
+          example: 4
         version:
           type: string
           description: Build version string (semver + build tag).
