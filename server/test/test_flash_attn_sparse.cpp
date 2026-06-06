@@ -104,7 +104,10 @@ static bool test_sparse_matches_dense(ggml_backend_t backend, int S, int H, int 
         if (diff > max_diff) max_diff = diff;
     }
 
-    const bool pass = max_diff < 1e-3f && !any_nonfinite;
+    // The sparse kernel accumulates and writes its output in BF16, whose ~2^-8
+    // mantissa precision floors the achievable diff against the F16 dense
+    // reference at roughly 4e-3. 5e-3 leaves a little headroom over that floor.
+    const bool pass = max_diff < 5e-3f && !any_nonfinite;
     printf("[test] S=%d H=%d Hk=%d D=%d max_diff=%.6f nonfinite=%s %s\n",
            S, H, Hk, D, max_diff,
            any_nonfinite ? "YES" : "no",

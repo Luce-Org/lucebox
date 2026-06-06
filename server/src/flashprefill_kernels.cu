@@ -417,16 +417,16 @@ __global__ void sparse_flash_forward_kernel_bf16(
                 }
             }
 
-            // ── Apply causal/seq mask + per-lane rowmax for both row pairs owned ──
-            // sm_8x mma.m16n16k16 acc layout: lane t holds 8 elems mapping to:
-            //   e[0..3]: row = 2*(t/4)+0
-            //   e[4..7]: row = 2*(t/4)+1
-            //   e[0,1,4,5]: col_in_tile = 2*(t%4) + {0,1}
-            //   e[2,3,6,7]: col_in_tile = 2*(t%4) + 8 + {0,1}
+            // ── Apply causal/seq mask + per-lane rowmax for both rows owned ──
+            // MEASURED nvcuda::wmma m16n16k16 f32 accumulator layout (sm_86):
+            //   row(i) = (lane/4) + ((i & 2) ? 8 : 0)
+            //   col(i) = 2*(lane%4) + ((i & 4) ? 8 : 0) + (i & 1)
+            // Each lane owns rows row_a = lane/4 and row_b = lane/4 + 8;
+            // elements i in {0,1,4,5} -> row_a, i in {2,3,6,7} -> row_b.
             const int q = lane >> 2;
             const int c = lane & 3;
-            const int row0_in_warp = 2 * q + 0;
-            const int row1_in_warp = 2 * q + 1;
+            const int row0_in_warp = q;          // row_a
+            const int row1_in_warp = q + 8;      // row_b
             const int row0_g = q_tile_idx * Q_TILE + wid * MMA_M + row0_in_warp;
             const int row1_g = q_tile_idx * Q_TILE + wid * MMA_M + row1_in_warp;
 
@@ -435,16 +435,15 @@ __global__ void sparse_flash_forward_kernel_bf16(
             for (int nt = 0; nt < NNK; ++nt) {
                 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
-                    int col_pair = i & 1;
-                    int col_off  = ((i >> 1) & 1) ? 8 : 0;
-                    int col_in_tile = 2 * c + col_pair + col_off;
+                    int col_in_tile = 2 * c + ((i & 4) ? 8 : 0) + (i & 1);
                     int col_g = k_lo + nt * MMA_N + col_in_tile;
-                    int rg = (i < 4) ? row0_g : row1_g;
+                    bool is_b = (i & 2);
+                    int rg = is_b ? row1_g : row0_g;
                     bool valid = (col_g < seq_len);
                     if (is_diag) valid = valid && (col_g <= rg);
                     if (!valid) S_frag[nt].x[i] = -INFINITY;
-                    if (i < 4) lm0 = fmaxf(lm0, S_frag[nt].x[i]);
-                    else       lm1 = fmaxf(lm1, S_frag[nt].x[i]);
+                    if (is_b) lm1 = fmaxf(lm1, S_frag[nt].x[i]);
+                    else      lm0 = fmaxf(lm0, S_frag[nt].x[i]);
                 }
             }
             // Reduce rowmax across the 4 lanes of the quad (lanes with same q value).
@@ -481,15 +480,14 @@ __global__ void sparse_flash_forward_kernel_bf16(
             for (int nt = 0; nt < NNK; ++nt) {
                 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
-                    int col_pair = i & 1;
-                    int col_off  = ((i >> 1) & 1) ? 8 : 0;
-                    int col_in_tile = 2 * c + col_pair + col_off;
+                    int col_in_tile = 2 * c + ((i & 4) ? 8 : 0) + (i & 1);
                     int col_in_KTILE = nt * MMA_N + col_in_tile;
+                    bool is_b = (i & 2);
                     float v = S_frag[nt].x[i];
-                    float mn = (i < 4) ? m_new0 : m_new1;
+                    float mn = is_b ? m_new1 : m_new0;
                     float p = (v == -INFINITY) ? 0.0f : exp2f(v - mn);
-                    if (i < 4) rs0 += p; else rs1 += p;
-                    int p_row = wid * MMA_M + ((i < 4) ? row0_in_warp : row1_in_warp);
+                    if (is_b) rs1 += p; else rs0 += p;
+                    int p_row = wid * MMA_M + (is_b ? row1_in_warp : row0_in_warp);
                     P_sh[(size_t)p_row * K_TILE + col_in_KTILE] = __float2bfloat16(p);
                 }
             }
@@ -508,15 +506,16 @@ __global__ void sparse_flash_forward_kernel_bf16(
                 row_l[row1_warp] = alpha1 * l_old1 + rs1;
             }
 
-            // Frag-direct rescale of O accumulator
+            // Frag-direct rescale of O accumulator (same acc layout as S):
+            //   i in {0,1,4,5} -> row_a (alpha0); i in {2,3,6,7} -> row_b (alpha1)
             #pragma unroll
             for (int d = 0; d < NDK; ++d) {
                 O_frag[d].x[0] *= alpha0;
                 O_frag[d].x[1] *= alpha0;
-                O_frag[d].x[2] *= alpha0;
-                O_frag[d].x[3] *= alpha0;
-                O_frag[d].x[4] *= alpha1;
-                O_frag[d].x[5] *= alpha1;
+                O_frag[d].x[2] *= alpha1;
+                O_frag[d].x[3] *= alpha1;
+                O_frag[d].x[4] *= alpha0;
+                O_frag[d].x[5] *= alpha0;
                 O_frag[d].x[6] *= alpha1;
                 O_frag[d].x[7] *= alpha1;
             }
