@@ -100,19 +100,28 @@ For production, you don't run any of the offline pipeline. `dflash_server`
 auto-tunes from its own traffic:
 
 ```bash
-dflash_server <model.gguf> --spark            # laguna or qwen35moe MoE
+dflash_server <model.gguf> --spark                   # use the card, auto-size everything
+dflash_server <model.gguf> --spark --spark-vram 14   # cap total VRAM at 14 GiB
 ```
 
-`--spark` (optionally `--spark-slots N`, default 32):
+The only knob is `--spark-vram <GiB>`: the total VRAM Spark may use. From that
+target it sizes everything itself. It fits the non-expert weights, the KV cache
+and a safety margin, pins as many calibrated-hot experts as the rest allows, and
+carves an auto-sized cache ring out of the budget (you never set a slot count).
+Omit it and Spark sizes to the whole card.
+
+That one flag aside, `--spark`:
 - enables the **bounded expert cache** (auto-tunes the working set at serve time),
 - **auto-loads** a learned placement profile from `<model>.gguf.spark.csv` if present,
 - keeps **persisting** that profile after every request from live routing.
 
 First boot starts uniform and warms the cache within a session; each restart
 loads a better profile and starts warmer. No corpus, no CSV juggling, no env
-vars. Verified on RTX 3090 for **both** Laguna-XS.2 and Qwen3.6-35B-A3B: the
-profile is written, reloaded (`source=hotness:...`), and generation stays
-coherent under offload.
+vars. Verified on RTX 3090 for **both** Laguna-XS.2 and Qwen3.6-35B-A3B:
+`--spark-vram 13`/`15` holds peak VRAM at 11.6/13.8 GiB, the profile is written
+and reloaded (`source=hotness:...`), and generation stays coherent under offload.
+(`--spark-slots N` forces an explicit cache size if you ever want to override the
+auto-sizing.)
 
 The offline pipeline below is for **bootstrapping** a profile before first serve
 (e.g. from your own Claude Code and Codex session history) and for

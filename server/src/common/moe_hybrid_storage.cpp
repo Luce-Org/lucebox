@@ -542,4 +542,28 @@ int moe_hybrid_cache_swap_in(MoeHybridLayerStorage & st, int global_expert,
     return hslot;
 }
 
+MoeSparkBudget spark_budget_split(uint64_t expert_budget, uint64_t total_expert_bytes,
+                                  int n_expert, uint64_t core_kv_safety,
+                                  uint64_t target_bytes) {
+    if (target_bytes > 0) {
+        const uint64_t avail = target_bytes > core_kv_safety ? target_bytes - core_kv_safety : 0;
+        if (avail < expert_budget) expert_budget = avail;
+    }
+    MoeSparkBudget r{expert_budget, 0};
+    if (n_expert > 0 && total_expert_bytes > 0 && expert_budget > 0) {
+        const uint64_t bytes_per_slot = total_expert_bytes / (uint64_t)n_expert;  // 1 expert, all layers
+        if (bytes_per_slot > 0) {
+            uint64_t reserve = expert_budget / 8;             // ~12% for the cache ring
+            const uint64_t cap = 1536ULL * 1024 * 1024;       // capped at 1.5 GiB
+            if (reserve > cap) reserve = cap;
+            const int slots = (int)(reserve / bytes_per_slot);
+            if (slots > 0) {
+                r.cache_slots = slots;
+                r.hot_bytes = expert_budget - (uint64_t)slots * bytes_per_slot;
+            }
+        }
+    }
+    return r;
+}
+
 }  // namespace dflash::common

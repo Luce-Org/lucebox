@@ -136,4 +136,12 @@ bool build_moe_hybrid_storage_from_file(
     std::string * err = nullptr,
     int cache_slots = 0);
 
+// Spark: split a VRAM budget into a pinned-hot tier + an auto-sized expert
+// cache ring. target_bytes==0 keeps the current budget (use the card);
+// otherwise the budget is clamped to fit target_bytes minus core_kv_safety.
+struct MoeSparkBudget { uint64_t hot_bytes; int cache_slots; };
+MoeSparkBudget spark_budget_split(uint64_t expert_budget, uint64_t total_expert_bytes,
+                                  int n_expert, uint64_t core_kv_safety,
+                                  uint64_t target_bytes);
+
 }  // namespace dflash::common

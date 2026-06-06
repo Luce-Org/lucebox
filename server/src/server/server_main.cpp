@@ -255,8 +255,9 @@ int main(int argc, char ** argv) {
     BackendArgs bargs;
     ServerConfig sconfig;
     bargs.model_path = argv[1];
-    bool spark_autotune = false;   // --spark: self-tuning hot/cold MoE residency
-    int  spark_slots = 32;          // --spark-slots: GPU expert-cache slots/layer
+    bool   spark_autotune = false; // --spark: self-tuning hot/cold MoE residency
+    int    spark_slots = -1;       // --spark-slots: explicit cache slots/layer (-1=auto)
+    double spark_vram_gib = 0.0;   // --spark-vram: total VRAM target in GiB (0=use card)
     std::string cache_type_k;  // explicit --cache-type-k override
     std::string cache_type_v;  // explicit --cache-type-v override
     bool target_device_seen = false;
@@ -364,6 +365,8 @@ int main(int argc, char ** argv) {
             spark_autotune = true;
         } else if (std::strcmp(argv[i], "--spark-slots") == 0 && i + 1 < argc) {
             spark_slots = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--spark-vram") == 0 && i + 1 < argc) {
+            spark_vram_gib = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--no-cors") == 0) {
             sconfig.enable_cors = false;
         } else if (std::strcmp(argv[i], "--think-max-tokens") == 0 && i + 1 < argc) {
@@ -643,8 +646,12 @@ int main(int argc, char ** argv) {
             std::FILE * pf = std::fopen(profile.c_str(), "rb");
             const bool have_profile = (pf != nullptr);
             if (pf) std::fclose(pf);
-            const std::string slots = std::to_string(spark_slots);
-            ::setenv((pfx + "CACHE_SLOTS").c_str(), slots.c_str(), 1);
+            ::setenv("DFLASH_SPARK", "1", 1);   // backend auto-sizes the cache ring from the VRAM target
+            if (spark_vram_gib > 0.0)
+                ::setenv("DFLASH_SPARK_VRAM_MB",
+                         std::to_string((long long)(spark_vram_gib * 1024.0)).c_str(), 1);
+            if (spark_slots >= 0)               // explicit --spark-slots overrides auto-sizing
+                ::setenv((pfx + "CACHE_SLOTS").c_str(), std::to_string(spark_slots).c_str(), 1);
             if (is_laguna) {
                 ::setenv("DFLASH_LAGUNA_EXPERT_CACHE", "1", 1);
                 ::setenv("DFLASH_LAGUNA_GPU_REMAP", "1", 1);
@@ -656,10 +663,12 @@ int main(int argc, char ** argv) {
             const char * save_var = is_laguna ? "DFLASH_LAGUNA_NEXT_PLACEMENT_OUT"
                                               : "DFLASH_QWEN35MOE_RUNTIME_STATS_OUT";
             ::setenv(save_var, profile.c_str(), 1);
-            std::fprintf(stderr,
-                "[spark] autotune ON (%s): cache_slots=%d, profile=%s (%s)\n",
-                arch.c_str(), spark_slots, profile.c_str(),
-                have_profile ? "loaded" : "new — will be learned from traffic");
+            if (spark_vram_gib > 0.0)
+                std::fprintf(stderr, "[spark] autotune ON (%s): vram target %.1f GiB, profile=%s (%s)\n",
+                    arch.c_str(), spark_vram_gib, profile.c_str(), have_profile ? "loaded" : "new");
+            else
+                std::fprintf(stderr, "[spark] autotune ON (%s): vram auto (use card), profile=%s (%s)\n",
+                    arch.c_str(), profile.c_str(), have_profile ? "loaded" : "new");
         } else {
             std::fprintf(stderr,
                 "[spark] --spark ignored: arch '%s' has no hot/cold MoE offload path\n",

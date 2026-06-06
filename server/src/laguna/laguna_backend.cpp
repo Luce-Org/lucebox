@@ -648,6 +648,18 @@ bool LagunaBackend::init_hybrid_mode() {
         }
     }
 
+    // Spark: clamp experts to the --spark-vram target and auto-size the cache ring.
+    if (std::getenv("DFLASH_SPARK")) {
+        uint64_t target = 0;
+        if (const char * t = std::getenv("DFLASH_SPARK_VRAM_MB")) target = (uint64_t)std::atoll(t) << 20;
+        auto sb = dflash::common::spark_budget_split(expert_budget, total_expert_bytes, w_.n_expert,
+                                                     core_bytes + kv_total + safety_bytes, target);
+        expert_budget = sb.hot_bytes;
+        cache_slots_ = sb.cache_slots;
+        std::printf("[spark] vram=%s, hot=%.2f GiB, cache=%d slots/layer\n",
+                    target ? "target" : "auto(card)", expert_budget / 1073741824.0, cache_slots_);
+    }
+
     std::printf("[laguna] dynamic placement: gpu_total=%.2f GiB, core=%.2f GiB, "
                 "kv_cache=%.2f GiB (ctx=%d), warm=%.0f MB, safety=%.0f MB, "
                 "expert_budget=%.2f GiB (of %.2f GiB total experts)\n",
@@ -1509,6 +1521,7 @@ bool LagunaBackend::build_hybrid_storage_from_file(
     }
     int cache_slots = 0;
     if (const char * cs = std::getenv("DFLASH_LAGUNA_CACHE_SLOTS")) cache_slots = std::max(0, std::atoi(cs));
+    else if (cache_slots_ >= 0) cache_slots = cache_slots_;
     bool ok = build_moe_hybrid_storage_from_file(hybrid_cfg, backend_, placement,
                                                  layer_descs, layer_file_data, *hybrid, &err, cache_slots);
     ::munmap(mmap_addr, file_size);

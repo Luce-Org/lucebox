@@ -39,6 +39,7 @@ private:
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string routing_stats_out_path_;
     std::string placement_out_path_;
+    int cache_slots_ = -1;  // Spark auto-sized (-1=unset)
     MoeHybridSwapPolicy swap_policy_;
     bool hybrid_telemetry_ = false;
 
