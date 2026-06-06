@@ -1389,6 +1389,18 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
         hotness.layer_totals.assign((size_t)w.n_layer, (uint64_t)w.n_expert);
     }
 
+    // Spark: seed the live accumulator from the loaded profile so calibration
+    // accumulates across restarts instead of resetting to zero each boot.
+    if (routing_stats_ && hotness_path && hotness_path[0] &&
+        hotness.counts.size() == (size_t)w.n_layer * (size_t)w.n_expert) {
+        routing_stats_->counts = hotness.counts;
+        routing_stats_->layer_totals.assign((size_t)w.n_layer, 0);
+        for (int il = 0; il < w.n_layer; ++il)
+            for (int ie = 0; ie < w.n_expert; ++ie)
+                routing_stats_->layer_totals[(size_t)il] +=
+                    hotness.counts[(size_t)il * (size_t)w.n_expert + ie];
+    }
+
     // Query GPU memory
     size_t gpu_free = 0, gpu_total = 0;
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);

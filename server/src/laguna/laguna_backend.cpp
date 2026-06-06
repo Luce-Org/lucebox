@@ -758,8 +758,19 @@ bool LagunaBackend::init_hybrid_mode() {
         routing_stats_->n_layer = w_.n_layer;
         routing_stats_->n_expert = w_.n_expert;
         routing_stats_->n_expert_used = w_.n_expert_used;
-        routing_stats_->counts.assign((size_t)w_.n_layer * (size_t)w_.n_expert, 0);
+        // Spark: seed the live accumulator from the loaded profile so calibration
+        // accumulates across restarts instead of resetting to zero each boot.
+        if (hotness_path && hotness_path[0] &&
+            hotness.counts.size() == (size_t)w_.n_layer * (size_t)w_.n_expert) {
+            routing_stats_->counts = hotness.counts;
+        } else {
+            routing_stats_->counts.assign((size_t)w_.n_layer * (size_t)w_.n_expert, 0);
+        }
         routing_stats_->layer_totals.assign((size_t)w_.n_layer, 0);
+        for (int il = 0; il < w_.n_layer; ++il)
+            for (int ie = 0; ie < w_.n_expert; ++ie)
+                routing_stats_->layer_totals[(size_t)il] +=
+                    routing_stats_->counts[(size_t)il * (size_t)w_.n_expert + ie];
     }
 
     std::fflush(stdout);
