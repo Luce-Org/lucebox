@@ -111,6 +111,15 @@ jobs:
     # Runs only after the GitHub-hosted jobs pass. Those compile the dflash
     # kernels for sm_86 but execute on GPU-less VMs, so the kernel never runs.
     # This job lands on lucebox3 (RTX 3090) and actually executes it.
+    #
+    # SECURITY: a self-hosted runner must never execute untrusted fork code.
+    # This guard restricts the job to same-repo PRs (head repo == this repo)
+    # and manual dispatch, so fork PRs against this public repo skip it
+    # entirely and never run on the box. The ubuntu-latest jobs above still
+    # run for forks (safe, ephemeral GitHub VMs).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     needs: [uv-workspace, build]
     runs-on: [self-hosted, gpu, sm86]
     timeout-minutes: 30
@@ -166,6 +175,12 @@ jobs:
     # all. The runner is pinned to ROCm 6.4.4 on kernel 6.14 (ROCm 7.2 page-
     # faults on gfx1151); hipcc is not on the runner's minimal PATH, so it is
     # invoked by absolute path.
+    #
+    # SECURITY: same fork guard as gpu-tests - never execute untrusted fork
+    # code on the self-hosted box. Fork PRs skip this job.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     needs: [uv-workspace, build]
     runs-on: [self-hosted, rocm, gfx1151]
     timeout-minutes: 20
