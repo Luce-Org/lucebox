@@ -2,6 +2,7 @@
 
 #include "qwen35_target_shard_ipc.h"
 
+#include "common/backend_ipc.h"
 #include "common/dflash_draft_ipc.h"
 #include "common/dflash_layer_split_runtime.h"
 #include "common/io_utils.h"
@@ -77,19 +78,31 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
     }
 
     void * shared_payload = nullptr;
+    void * shared_payload_data = nullptr;
+    size_t shared_payload_capacity = 0;
+    size_t shared_payload_map_bytes = 0;
     if (shared_payload_fd >= 0 || shared_payload_bytes > 0) {
         if (shared_payload_fd < 0 || shared_payload_bytes == 0) {
             std::fprintf(stderr, "[qwen35-target-shard-daemon] bad shared payload fd/size\n");
             stream_status(stream_fd, -1);
             return 1;
         }
-        shared_payload = ::mmap(nullptr, shared_payload_bytes, PROT_READ | PROT_WRITE,
+        if (!backend_ipc_shared_payload_map_bytes(shared_payload_bytes,
+                                                  shared_payload_map_bytes)) {
+            std::fprintf(stderr, "[qwen35-target-shard-daemon] bad shared payload size\n");
+            stream_status(stream_fd, -1);
+            return 1;
+        }
+        shared_payload = ::mmap(nullptr, shared_payload_map_bytes, PROT_READ | PROT_WRITE,
                                 MAP_SHARED, shared_payload_fd, 0);
         if (shared_payload == MAP_FAILED) {
             std::fprintf(stderr, "[qwen35-target-shard-daemon] shared payload mmap failed\n");
             stream_status(stream_fd, -1);
             return 1;
         }
+        shared_payload_data =
+            static_cast<char *>(shared_payload) + backend_ipc_shared_payload_header_bytes();
+        shared_payload_capacity = shared_payload_bytes;
     }
 
     std::vector<Qwen35LayerSplitShard> shards(gpus.size());
@@ -106,7 +119,7 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
             stream_status(stream_fd, -1);
             free_qwen35_layer_split_shards(shards);
             if (shared_payload && shared_payload != MAP_FAILED) {
-                ::munmap(shared_payload, shared_payload_bytes);
+                ::munmap(shared_payload, shared_payload_map_bytes);
             }
             return 1;
         }
@@ -128,7 +141,7 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
             stream_status(stream_fd, -1);
             free_qwen35_layer_split_shards(shards);
             if (shared_payload && shared_payload != MAP_FAILED) {
-                ::munmap(shared_payload, shared_payload_bytes);
+                ::munmap(shared_payload, shared_payload_map_bytes);
             }
             return 1;
         }
@@ -153,7 +166,7 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
             free_snapshot_backends();
             free_qwen35_layer_split_shards(shards);
             if (shared_payload && shared_payload != MAP_FAILED) {
-                ::munmap(shared_payload, shared_payload_bytes);
+                ::munmap(shared_payload, shared_payload_map_bytes);
             }
             return 1;
         }
@@ -186,7 +199,7 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
     if (shards.empty()) {
         stream_status(stream_fd, -1);
         if (shared_payload && shared_payload != MAP_FAILED) {
-            ::munmap(shared_payload, shared_payload_bytes);
+            ::munmap(shared_payload, shared_payload_map_bytes);
         }
         return 1;
     }
@@ -318,13 +331,16 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
             uint64_t seq = 0;
             iss >> base_pos >> n_tokens >> want_argmax >> want_logits >> bytes >> seq;
             if (!(iss >> want_captures)) want_captures = 0;
-            (void)seq;
             const size_t expected_bytes =
                 (size_t)n_tokens * (size_t)hidden * sizeof(float);
-            if (shared_payload && shared_payload != MAP_FAILED &&
-                bytes == expected_bytes && bytes <= shared_payload_bytes) {
+            const auto * header =
+                static_cast<const BackendIpcSharedPayloadHeader *>(shared_payload);
+            if (shared_payload && shared_payload != MAP_FAILED && shared_payload_data &&
+                seq != 0 && bytes == expected_bytes &&
+                backend_ipc_payload_in_bounds(0, bytes, shared_payload_capacity) &&
+                header->sequence == seq && header->bytes == (uint64_t)bytes) {
                 host_act.assign(bytes / sizeof(float), 0.0f);
-                std::memcpy(host_act.data(), shared_payload, bytes);
+                std::memcpy(host_act.data(), shared_payload_data, bytes);
                 payload_ok = true;
             }
         } else {
@@ -468,7 +484,7 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
     free_snapshot_backends();
     free_qwen35_layer_split_shards(shards);
     if (shared_payload && shared_payload != MAP_FAILED) {
-        ::munmap(shared_payload, shared_payload_bytes);
+        ::munmap(shared_payload, shared_payload_map_bytes);
     }
     return 0;
 #endif

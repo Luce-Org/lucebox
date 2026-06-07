@@ -159,7 +159,7 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
             argv_storage.emplace_back("--shared-payload-fd=" +
                                       std::to_string(shared_payload_fd_));
             argv_storage.emplace_back("--shared-payload-bytes=" +
-                                      std::to_string(shared_payload_bytes_));
+                                      std::to_string(shared_payload_capacity_));
         }
         argv_storage.emplace_back("--stream-fd=" + std::to_string(stream_pipe[1]));
 
@@ -234,6 +234,7 @@ void BackendIpcProcess::close() {
     active_ = false;
     owns_work_dir_ = false;
     shared_payload_bytes_ = 0;
+    shared_payload_capacity_ = 0;
     shared_payload_seq_ = 0;
     resolved_payload_transport_ = BackendIpcPayloadTransport::Stream;
     work_dir_.clear();
@@ -245,27 +246,38 @@ std::string BackendIpcProcess::next_path(const char * prefix) {
 }
 
 bool BackendIpcProcess::write_shared_payload(const void * data, size_t bytes, uint64_t & seq) {
-    if (!shared_payload_map_ || bytes > shared_payload_bytes_) return false;
+    if (!shared_payload_map_ || bytes > shared_payload_capacity_) return false;
     if (bytes > 0 && !data) return false;
+    auto * header = static_cast<BackendIpcSharedPayloadHeader *>(shared_payload_map_);
+    void * payload = static_cast<void *>(
+        static_cast<char *>(shared_payload_map_) + backend_ipc_shared_payload_header_bytes());
     if (bytes > 0) {
-        std::memcpy(shared_payload_map_, data, bytes);
+        std::memcpy(payload, data, bytes);
     }
     seq = ++shared_payload_seq_;
+    header->bytes = (uint64_t)bytes;
+    header->sequence = seq;
     return true;
 }
 
 #if !defined(_WIN32)
 bool BackendIpcProcess::init_shared_payload(size_t bytes) {
     if (bytes == 0) return false;
+    size_t map_bytes = 0;
+    if (!backend_ipc_shared_payload_map_bytes(bytes, map_bytes)) return false;
     int fd = -1;
 #  if defined(__linux__) && defined(SYS_memfd_create)
     fd = (int)::syscall(SYS_memfd_create, "backend-ipc-payload", 0);
 #  endif
     if (fd < 0) {
-        char templ[] = "/tmp/backend-ipc-payload-XXXXXX";
-        fd = ::mkstemp(templ);
+        const char * tmp = std::getenv("TMPDIR");
+        std::string templ = std::string(tmp && *tmp ? tmp : "/tmp") +
+                            "/backend-ipc-payload-XXXXXX";
+        std::vector<char> templ_buf(templ.begin(), templ.end());
+        templ_buf.push_back('\0');
+        fd = ::mkstemp(templ_buf.data());
         if (fd >= 0) {
-            ::unlink(templ);
+            ::unlink(templ_buf.data());
         }
     }
     if (fd < 0) {
@@ -273,22 +285,24 @@ bool BackendIpcProcess::init_shared_payload(size_t bytes) {
                      std::strerror(errno));
         return false;
     }
-    if (::ftruncate(fd, (off_t)bytes) != 0) {
+    if (::ftruncate(fd, (off_t)map_bytes) != 0) {
         std::fprintf(stderr, "backend-ipc shared payload truncate failed: %s\n",
                      std::strerror(errno));
         ::close(fd);
         return false;
     }
-    void * mapped = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    void * mapped = ::mmap(nullptr, map_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (mapped == MAP_FAILED) {
         std::fprintf(stderr, "backend-ipc shared payload mmap failed: %s\n",
                      std::strerror(errno));
         ::close(fd);
         return false;
     }
+    std::memset(mapped, 0, map_bytes);
     shared_payload_fd_ = fd;
     shared_payload_map_ = mapped;
-    shared_payload_bytes_ = bytes;
+    shared_payload_bytes_ = map_bytes;
+    shared_payload_capacity_ = bytes;
     return true;
 }
 

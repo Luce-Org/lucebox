@@ -1800,8 +1800,9 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     bool supports_cpu_sampling() const override { return sampling_enabled; }
     bool decode_dflash(const std::vector<int32_t> & prompt, int base_pos,
                        int last_tok, int n_gen, std::vector<int32_t> & out_tokens,
-                       const DaemonIO & io) override {
+                       const DaemonIO & io, float & accept_rate_out) override {
         (void)prompt;
+        accept_rate_out = 0.0f;
         dflash_called = true;
         dflash_base = base_pos;
         dflash_last = last_tok;
@@ -2417,6 +2418,21 @@ static void test_backend_ipc_payload_bounds() {
     TEST_ASSERT(!backend_ipc_payload_in_bounds(9, 8, 16));
     TEST_ASSERT(!backend_ipc_payload_in_bounds(
         std::numeric_limits<size_t>::max(), 1, 16));
+}
+
+static void test_backend_ipc_shared_payload_map_sizing() {
+    size_t map_bytes = 0;
+    TEST_ASSERT(backend_ipc_shared_payload_map_bytes(1024, map_bytes));
+    TEST_ASSERT(map_bytes == 1024 + backend_ipc_shared_payload_header_bytes());
+
+    BackendIpcSharedPayloadHeader header;
+    header.sequence = 7;
+    header.bytes = 1024;
+    TEST_ASSERT(header.sequence == 7);
+    TEST_ASSERT(header.bytes == 1024);
+
+    TEST_ASSERT(!backend_ipc_shared_payload_map_bytes(
+        std::numeric_limits<size_t>::max(), map_bytes));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -3338,6 +3354,13 @@ int main() {
     RUN_TEST(test_backend_ipc_payload_pipe_round_trip);
     RUN_TEST(test_backend_ipc_payload_transport_parse);
     RUN_TEST(test_backend_ipc_payload_bounds);
+
+    std::fprintf(stderr, "\n── Backend IPC ──\n");
+    RUN_TEST(test_backend_ipc_rejects_file_work_dir);
+    RUN_TEST(test_backend_ipc_payload_pipe_round_trip);
+    RUN_TEST(test_backend_ipc_payload_transport_parse);
+    RUN_TEST(test_backend_ipc_payload_bounds);
+    RUN_TEST(test_backend_ipc_shared_payload_map_sizing);
 
     std::fprintf(stderr, "\n── Jinja chat template ──\n");
     RUN_TEST(test_jinja_render_basic);

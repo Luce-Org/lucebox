@@ -6,10 +6,13 @@
 #include "qwen35_target_shard_ipc.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <cctype>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -35,6 +38,47 @@ bool parse_int_list(const char * raw, std::vector<int> & out) {
         begin = end + 1;
     }
     return !out.empty();
+}
+
+bool parse_nonnegative_int(const char * text, int & out) {
+    if (!text || !*text) return false;
+    const char * p = text;
+    while (std::isspace((unsigned char)*p)) ++p;
+    if (*p == '-') return false;
+    errno = 0;
+    char * end = nullptr;
+    const long value = std::strtol(p, &end, 10);
+    if (errno == ERANGE || end == p || *end != '\0' ||
+        value < 0 || value > std::numeric_limits<int>::max()) {
+        return false;
+    }
+    out = (int)value;
+    return true;
+}
+
+bool parse_size_arg(const char * text, size_t & out) {
+    if (!text || !*text) return false;
+    const char * p = text;
+    while (std::isspace((unsigned char)*p)) ++p;
+    if (*p == '-') return false;
+    errno = 0;
+    char * end = nullptr;
+    const unsigned long long value = std::strtoull(p, &end, 10);
+    if (errno == ERANGE || end == p || *end != '\0' ||
+        value > (unsigned long long)std::numeric_limits<size_t>::max()) {
+        return false;
+    }
+    out = (size_t)value;
+    return true;
+}
+
+bool require_value(int & i, int argc, char ** argv, const char * opt, const char *& out) {
+    if (i + 1 >= argc) {
+        std::fprintf(stderr, "[backend-ipc-daemon] missing value for %s\n", opt);
+        return false;
+    }
+    out = argv[++i];
+    return true;
 }
 
 }  // namespace
@@ -95,13 +139,17 @@ int main(int argc, char ** argv) {
     bool enable_dflash = false;
     for (int i = arg_begin; i < argc; i++) {
         if (std::strncmp(argv[i], "--ring-cap=", 11) == 0) {
-            ring_cap = std::atoi(argv[i] + 11);
+            if (!parse_nonnegative_int(argv[i] + 11, ring_cap)) return 2;
         } else if (std::strcmp(argv[i], "--ring-cap") == 0) {
-            if (i + 1 < argc) ring_cap = std::atoi(argv[++i]);
+            const char * value = nullptr;
+            if (!require_value(i, argc, argv, "--ring-cap", value) ||
+                !parse_nonnegative_int(value, ring_cap)) return 2;
         } else if (std::strncmp(argv[i], "--draft-gpu=", 12) == 0) {
-            draft_gpu = std::max(0, std::atoi(argv[i] + 12));
+            if (!parse_nonnegative_int(argv[i] + 12, draft_gpu)) return 2;
         } else if (std::strcmp(argv[i], "--draft-gpu") == 0) {
-            if (i + 1 < argc) draft_gpu = std::max(0, std::atoi(argv[++i]));
+            const char * value = nullptr;
+            if (!require_value(i, argc, argv, "--draft-gpu", value) ||
+                !parse_nonnegative_int(value, draft_gpu)) return 2;
         } else if (std::strncmp(argv[i], "--target-gpu=", 13) == 0) {
             target_gpu = std::max(0, std::atoi(argv[i] + 13));
         } else if (std::strcmp(argv[i], "--target-gpu") == 0) {
@@ -161,23 +209,29 @@ int main(int argc, char ** argv) {
         } else if (std::strcmp(argv[i], "--fa-window") == 0) {
             if (i + 1 < argc) fa_window = std::atoi(argv[++i]);
         } else if (std::strncmp(argv[i], "--stream-fd=", 12) == 0) {
-            stream_fd = std::atoi(argv[i] + 12);
+            if (!parse_nonnegative_int(argv[i] + 12, stream_fd)) return 2;
         } else if (std::strcmp(argv[i], "--stream-fd") == 0) {
-            if (i + 1 < argc) stream_fd = std::atoi(argv[++i]);
+            const char * value = nullptr;
+            if (!require_value(i, argc, argv, "--stream-fd", value) ||
+                !parse_nonnegative_int(value, stream_fd)) return 2;
         } else if (std::strncmp(argv[i], "--payload-fd=", 13) == 0) {
-            payload_fd = std::atoi(argv[i] + 13);
+            if (!parse_nonnegative_int(argv[i] + 13, payload_fd)) return 2;
         } else if (std::strcmp(argv[i], "--payload-fd") == 0) {
-            if (i + 1 < argc) payload_fd = std::atoi(argv[++i]);
+            const char * value = nullptr;
+            if (!require_value(i, argc, argv, "--payload-fd", value) ||
+                !parse_nonnegative_int(value, payload_fd)) return 2;
         } else if (std::strncmp(argv[i], "--shared-payload-fd=", 20) == 0) {
-            shared_payload_fd = std::atoi(argv[i] + 20);
+            if (!parse_nonnegative_int(argv[i] + 20, shared_payload_fd)) return 2;
         } else if (std::strcmp(argv[i], "--shared-payload-fd") == 0) {
-            if (i + 1 < argc) shared_payload_fd = std::atoi(argv[++i]);
+            const char * value = nullptr;
+            if (!require_value(i, argc, argv, "--shared-payload-fd", value) ||
+                !parse_nonnegative_int(value, shared_payload_fd)) return 2;
         } else if (std::strncmp(argv[i], "--shared-payload-bytes=", 23) == 0) {
-            shared_payload_bytes = (size_t)std::strtoull(argv[i] + 23, nullptr, 10);
+            if (!parse_size_arg(argv[i] + 23, shared_payload_bytes)) return 2;
         } else if (std::strcmp(argv[i], "--shared-payload-bytes") == 0) {
-            if (i + 1 < argc) {
-                shared_payload_bytes = (size_t)std::strtoull(argv[++i], nullptr, 10);
-            }
+            const char * value = nullptr;
+            if (!require_value(i, argc, argv, "--shared-payload-bytes", value) ||
+                !parse_size_arg(value, shared_payload_bytes)) return 2;
         } else if (std::strcmp(argv[i], "--enable-dflash") == 0) {
             enable_dflash = true;
         } else {

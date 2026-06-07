@@ -54,6 +54,21 @@ inline bool backend_ipc_payload_in_bounds(size_t offset,
     return backend_ipc_checked_add_size(offset, bytes, end) && end <= capacity;
 }
 
+struct BackendIpcSharedPayloadHeader {
+    uint64_t sequence = 0;
+    uint64_t bytes = 0;
+};
+
+inline size_t backend_ipc_shared_payload_header_bytes() {
+    return sizeof(BackendIpcSharedPayloadHeader);
+}
+
+inline bool backend_ipc_shared_payload_map_bytes(size_t payload_bytes,
+                                                 size_t & map_bytes) {
+    return backend_ipc_checked_add_size(
+        backend_ipc_shared_payload_header_bytes(), payload_bytes, map_bytes);
+}
+
 struct BackendIpcLaunchConfig {
     std::string bin;
     BackendIpcMode mode = BackendIpcMode::DFlashDraft;
@@ -82,7 +97,7 @@ public:
         return resolved_payload_transport_;
     }
     bool has_shared_payload() const { return shared_payload_map_ != nullptr; }
-    size_t shared_payload_capacity() const { return shared_payload_bytes_; }
+    size_t shared_payload_capacity() const { return shared_payload_capacity_; }
     const std::string & work_dir() const { return work_dir_; }
 
     std::string next_path(const char * prefix);
@@ -101,6 +116,7 @@ private:
     int shared_payload_fd_ = -1;
     void * shared_payload_map_ = nullptr;
     size_t shared_payload_bytes_ = 0;
+    size_t shared_payload_capacity_ = 0;
     uint64_t shared_payload_seq_ = 0;
     BackendIpcPayloadTransport resolved_payload_transport_ =
         BackendIpcPayloadTransport::Stream;

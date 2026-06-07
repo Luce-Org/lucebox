@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -66,13 +67,25 @@ size_t draft_ipc_shared_bytes_from_env(size_t required_bytes) {
     if (!raw || !*raw) {
         return required_bytes;
     }
-    if (raw[0] == '-') {
+    const char * p = raw;
+    while (*p == ' ' || *p == '\t' || *p == '\n' ||
+           *p == '\r' || *p == '\f' || *p == '\v') {
+        ++p;
+    }
+    if (*p == '-') {
+        std::fprintf(stderr,
+                     "draft-ipc ignoring negative DFLASH_DRAFT_IPC_SHARED_BYTES=%s\n",
+                     raw);
         return required_bytes;
     }
+    errno = 0;
     char * end = nullptr;
-    const unsigned long long parsed = std::strtoull(raw, &end, 10);
-    if (end == raw || *end != '\0' ||
+    const unsigned long long parsed = std::strtoull(p, &end, 10);
+    if (errno == ERANGE || end == p || *end != '\0' ||
         parsed > (unsigned long long)std::numeric_limits<size_t>::max()) {
+        std::fprintf(stderr,
+                     "draft-ipc ignoring invalid DFLASH_DRAFT_IPC_SHARED_BYTES=%s\n",
+                     raw);
         return required_bytes;
     }
     return std::max((size_t)parsed, required_bytes);
