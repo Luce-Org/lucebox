@@ -1,4 +1,5 @@
 #include "moe_hybrid_storage.h"
+#include "moe_hybrid_types.h"
 
 #include "ggml-cpu.h"
 #include "ggml-backend.h"
@@ -7,6 +8,10 @@
 #include <algorithm>
 #include <cstring>
 
+#if defined(DFLASH27B_BACKEND_CUDA)
+#include <cuda_runtime_api.h>
+#endif
+
 #if !defined(_WIN32)
 #include <sys/mman.h>
 #else
@@ -14,6 +19,19 @@
 #endif
 
 namespace dflash::common {
+
+int query_gpu_compute_sm() {
+#if defined(DFLASH27B_BACKEND_CUDA)
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0) return 0;
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) return 0;
+    return prop.major * 10 + prop.minor;
+#else
+    // HIP/gfx1151 has the same MMQ bug — keep sub-batch workaround active.
+    return 0;
+#endif
+}
 
 void CachedFfnGraph::free() {
     if (alloc) { ggml_gallocr_free(alloc); alloc = nullptr; }

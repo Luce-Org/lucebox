@@ -1206,12 +1206,13 @@ bool eval_moe_hot_only_batched(
 
     // Workaround for ggml-cuda MMQ mul_mat_id bug on sm_75/gfx1151: when the
     // hot stack is smaller than n_expert, slice into <=4-token sub-batches to
-    // route through the stable MMVQ path.
+    // route through the stable MMVQ path. Skipped on sm_80+ where MMQ is safe.
     const int n_hot_stack = storage.gate_up_hot ? (int)storage.gate_up_hot->ne[2]
                           : storage.gate_hot    ? (int)storage.gate_hot->ne[2]
                           : 0;
     static const int MMQ_SAFE_SUB_BATCH = 4;
-    if (n_hot_stack > 0 && n_hot_stack < cfg.n_expert && n_tokens > MMQ_SAFE_SUB_BATCH) {
+    if (!cfg.mmq_safe_full_batch
+        && n_hot_stack > 0 && n_hot_stack < cfg.n_expert && n_tokens > MMQ_SAFE_SUB_BATCH) {
         std::vector<float> sub_out;
         for (int t0 = 0; t0 < n_tokens; t0 += MMQ_SAFE_SUB_BATCH) {
             const int tc = std::min(MMQ_SAFE_SUB_BATCH, n_tokens - t0);
@@ -1260,8 +1261,10 @@ bool eval_moe_hot_only_batched(
     }
 
     // ── Slow path: build graph (first call or size mismatch) ──
-    // Try to build and cache for this n_tokens size
-    if (n_tokens == MMQ_SAFE_SUB_BATCH || (n_hot_stack == 0 || n_hot_stack >= cfg.n_expert)) {
+    // Try to build and cache for this n_tokens size.
+    // Cache when: sub-batch size (legacy), full stack (all hot), or full-batch safe (sm_80+).
+    if (cfg.mmq_safe_full_batch || n_tokens == MMQ_SAFE_SUB_BATCH
+        || (n_hot_stack == 0 || n_hot_stack >= cfg.n_expert)) {
         if (build_cached_hot_batched_graph(cached, gpu_backend, storage, desc, cfg, n_tokens)) {
             // Successfully cached — use it immediately
             ggml_backend_tensor_set(cached.inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
@@ -1390,7 +1393,8 @@ bool eval_moe_hybrid_ffn_batched(
                           : storage.gate_hot    ? (int)storage.gate_hot->ne[2]
                           : 0;
     static const int MMQ_SAFE_SUB_BATCH = 4;
-    if (n_hot_stack > 0 && n_hot_stack < cfg.n_expert && n_tokens > MMQ_SAFE_SUB_BATCH) {
+    if (!cfg.mmq_safe_full_batch
+        && n_hot_stack > 0 && n_hot_stack < cfg.n_expert && n_tokens > MMQ_SAFE_SUB_BATCH) {
         const int n_embd = cfg.n_embd;
         const int n_used = cfg.n_expert_used;
         out.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);

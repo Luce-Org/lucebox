@@ -146,6 +146,10 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
 
         auto hybrid = std::make_shared<MoeHybridStorage>();
         MoeHybridConfig hybrid_cfg = make_moe_hybrid_config(out);
+        if (hybrid_cfg.mmq_safe_full_batch) {
+            std::fprintf(stderr, "[qwen35moe] GPU sm_%d: MMQ full-batch enabled (no sub-batch workaround)\n",
+                         query_gpu_compute_sm());
+        }
         std::vector<MoeLayerDesc> layer_descs((size_t)out.n_layer);
         for (int il = 0; il < out.n_layer; ++il) {
             layer_descs[(size_t)il] = make_moe_layer_desc(out.layers[(size_t)il]);
