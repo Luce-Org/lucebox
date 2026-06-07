@@ -57,7 +57,8 @@ bool run_dflash_spec_decode(
         const DaemonIO & io,
         DFlashDraftIpcClient * remote_draft,
         const std::vector<int32_t> * hint_tokens,
-        int base_pos) {
+        int base_pos,
+        double * accept_rate_out) {
     const bool use_remote_draft = remote_draft && remote_draft->active();
     if (!use_remote_draft && !feature_ring.target_feat) return false;
 
@@ -242,6 +243,10 @@ bool run_dflash_spec_decode(
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
     const int total_draft_pos = std::max(1, n_draft_steps * q_len);
     const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
+    if (accept_rate_out) {
+        *accept_rate_out = total_draft_pos > 0
+            ? (double)n_accept_sum / (double)total_draft_pos : 0.0;
+    }
     std::printf("[target-split-dflash] decode tokens=%d time=%.3f s speed=%.2f tok/s\n",
                 n_generated, decode_s, n_generated > 0 ? n_generated / decode_s : 0.0);
     std::printf("[target-split-dflash] %d draft steps, accepted=%d/%d (%.1f%%), avg commit/step=%.2f\n",

@@ -37,9 +37,10 @@ public:
     virtual bool decode_dflash(const std::vector<int32_t> & prompt,
                                int base_pos, int last_tok, int n_gen,
                                std::vector<int32_t> & out_tokens,
-                               const DaemonIO & io) {
+                               const DaemonIO & io, float & accept_rate_out) {
         (void)prompt; (void)base_pos; (void)last_tok; (void)n_gen;
         (void)out_tokens; (void)io;
+        accept_rate_out = 0.0f;
         return false;
     }
 

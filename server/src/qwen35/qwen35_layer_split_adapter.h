@@ -65,7 +65,7 @@ public:
     bool can_dflash_decode() const override;
     bool decode_dflash(const std::vector<int32_t> & prompt, int base_pos,
                        int last_tok, int n_gen, std::vector<int32_t> & out_tokens,
-                       const DaemonIO & io) override;
+                       const DaemonIO & io, float & accept_rate_out) override;
 
     ModelBackend::CompressResult
     compress(const ModelBackend::CompressRequest & req) override;

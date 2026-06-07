@@ -70,6 +70,7 @@ bool run_dflash_spec_decode(
         const DaemonIO & io,
         DFlashDraftIpcClient * remote_draft = nullptr,
         const std::vector<int32_t> * hint_tokens = nullptr,
-        int base_pos = 0);
+        int base_pos = 0,
+        double * accept_rate_out = nullptr);
 
 } // namespace dflash::common

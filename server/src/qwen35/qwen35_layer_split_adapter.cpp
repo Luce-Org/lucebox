@@ -553,7 +553,9 @@ bool Qwen35LayerSplitAdapter::can_dflash_decode() const {
 
 bool Qwen35LayerSplitAdapter::decode_dflash(
         const std::vector<int32_t> & prompt, int base_pos, int last_tok, int n_gen,
-        std::vector<int32_t> & out_tokens, const DaemonIO & io) {
+        std::vector<int32_t> & out_tokens, const DaemonIO & io,
+        float & accept_rate_out) {
+    accept_rate_out = 0.0f;
     const bool use_remote_draft = remote_draft_.active();
     Qwen35LayerSplitDFlashTarget target(
         shards_, use_remote_draft ? nullptr : &feature_ring_,
@@ -564,10 +566,13 @@ bool Qwen35LayerSplitAdapter::decode_dflash(
         out_tokens.push_back(tok);
         return true;
     });
+    double accept_rate = 0.0;
     const bool ok = run_dflash_spec_decode(
         target, draft_weights_, draft_backend_, feature_ring_, prompt, n_gen,
         last_tok, /*out_path=*/nullptr, cfg_.draft_ctx_max, collect_io,
-        use_remote_draft ? &remote_draft_ : nullptr, /*hint_tokens=*/nullptr, base_pos);
+        use_remote_draft ? &remote_draft_ : nullptr, /*hint_tokens=*/nullptr, base_pos,
+        &accept_rate);
+    accept_rate_out = (float)accept_rate;
     return ok;
 }
 

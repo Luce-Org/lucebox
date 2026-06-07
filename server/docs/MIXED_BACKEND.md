@@ -8,8 +8,10 @@ kept at host-data or process boundaries:
   the target run.
 - DFlash draft split can run the draft model in a separate backend process and
   feed a target process through host IPC.
-- Target layer split remains inside one backend binary; cross-backend target
-  layer split is intentionally out of scope.
+- Target layer split can run across two backends: `dflash_server` runs the
+  head layer group on its compiled backend and hands the boundary activation
+  to a remote `backend_ipc_daemon` (other backend) for the tail group. DFlash
+  speculative decode works across this boundary.
 
 ## Build CUDA and HIP binaries
 
@@ -85,3 +87,38 @@ Use these `test_dflash` options for the target process:
 
 `scripts/bench_he.py` passes these options through for HumanEval-style
 validation runs.
+
+
+## Mixed-backend target layer split
+
+`dflash_server` can split the target across two backends in a single decode:
+the local process (this binary's compiled backend) runs the first contiguous
+layer group, then hands the boundary activation to a remote `backend_ipc_daemon`
+(built for the other backend) that runs the remaining layers, the final norm,
+and the LM-head projection. DFlash verify, target feature capture, KV
+snapshot/restore, and draft-token projection all work across this boundary.
+
+Use these `dflash_server` flags:
+
+| Flag | Purpose |
+|---|---|
+| `--target-devices <list>` | Comma-separated per-shard devices; mixed backends allowed, e.g. `cuda:0,hip:0`. The first group must be this binary's compiled backend (the local group); the remainder forms one remote backend group. |
+| `--target-layer-split <weights>` | Proportional layer split across the shards, e.g. `0.5,0.5`. |
+| `--target-shard-ipc-bin <path>` | Remote `backend_ipc_daemon` built for the remote backend. Required for mixed target split. |
+| `--target-shard-ipc-work-dir <path>` | Scratch directory for the remote target-shard IPC payload files. |
+
+Only one backend boundary is supported: one local group followed by one remote
+group (e.g. `cuda:0` local + `hip:0,hip:1` remote).
+
+Example: a CUDA-built server running the head layers on an RTX GPU, with the
+tail layers + LM head on a HIP `backend_ipc_daemon` (Strix Halo iGPU):
+
+```bash
+./build-cuda/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf \
+  --draft models/draft/dflash-draft-3.6-q4_k_m.gguf \
+  --target-devices cuda:0,hip:0 \
+  --target-layer-split 0.5,0.5 \
+  --target-shard-ipc-bin build-hip/backend_ipc_daemon \
+  --target-shard-ipc-work-dir /tmp/target_shard \
+  --host 127.0.0.1 --port 18080
+```
