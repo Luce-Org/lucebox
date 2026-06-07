@@ -136,16 +136,17 @@ static bool validate_server_placement(const BackendArgs & bargs,
                          placement_error.c_str());
             return false;
         }
-        if (!sconfig.disk_cache_dir.empty()) {
-            std::fprintf(stderr,
-                "[server] --kv-cache-dir is not supported with --target-devices yet; "
-                "sharded disk snapshot/restore will be added separately\n");
-            return false;
-        }
     }
     const bool mixed_target_split =
         bargs.device.is_layer_split() && bargs.device.is_mixed_layer_split();
     if (mixed_target_split) {
+        if (!sconfig.disk_cache_dir.empty()) {
+            std::fprintf(stderr,
+                "[server] --kv-cache-dir is not supported with mixed-backend "
+                "target layer split yet; remote shard disk snapshot/restore "
+                "needs IPC export/import support\n");
+            return false;
+        }
         if (!bargs.remote_target_shard.enabled()) {
             std::fprintf(stderr,
                 "[server] mixed-backend target layer split requires "

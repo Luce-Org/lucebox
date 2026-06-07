@@ -150,6 +150,18 @@ int LayerSplitBackend::snapshot_cur_pos(int slot) const {
     return adapter_ ? adapter_->snapshot_cur_pos(slot) : 0;
 }
 
+ModelBackend::SnapshotRef LayerSplitBackend::snapshot_ref(int slot) const {
+    return adapter_ ? adapter_->snapshot_ref(slot) : SnapshotRef{};
+}
+
+bool LayerSplitBackend::snapshot_adopt(int slot,
+                                       ggml_context * ctx,
+                                       ggml_backend_buffer_t buf,
+                                       int cur_pos,
+                                       int32_t last_tok) {
+    return adapter_ && adapter_->snapshot_adopt(slot, ctx, buf, cur_pos, last_tok);
+}
+
 GenerateResult LayerSplitBackend::restore_and_generate_impl(
         int slot, const GenerateRequest & req, const DaemonIO & io) {
     GenerateResult result;

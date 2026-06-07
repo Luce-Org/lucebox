@@ -59,6 +59,10 @@ public:
     bool snapshot_used(int slot) const override;
     int snapshot_cur_pos(int slot) const override;
     bool snapshot_restore(int slot) override;
+    ModelBackend::SnapshotRef snapshot_ref(int slot) const override;
+    bool snapshot_adopt(int slot, ggml_context * ctx,
+                        ggml_backend_buffer_t buf, int cur_pos,
+                        int32_t last_tok) override;
     int current_last_token() const override;
 
     void free_drafter() override {}
@@ -69,11 +73,16 @@ private:
                      int base_pos,
                      int & last_tok,
                      std::vector<float> * logits_out = nullptr);
+    bool rebuild_disk_snapshot(int slot);
 
     LagunaLayerSplitAdapterConfig cfg_;
     std::vector<LagunaLayerSplitShard> shards_;
     std::vector<ggml_backend_t> snapshot_backends_;
     std::vector<LagunaLayerSplitSnapshot> snapshots_;
+    std::vector<std::vector<ggml_tensor *>> snapshot_prefill_logit_tensors_;
+    std::vector<ggml_context *> disk_snapshot_contexts_;
+    std::vector<ggml_backend_buffer_t> disk_snapshot_buffers_;
+    std::vector<ggml_backend_t> disk_snapshot_backends_;
     ggml_type activation_type_ = GGML_TYPE_F32;
     static constexpr int PREFIX_SLOTS = ModelBackend::kMaxSlots;
     SamplerCfg sampler_;

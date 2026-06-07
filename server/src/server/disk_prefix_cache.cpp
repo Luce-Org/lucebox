@@ -305,7 +305,7 @@ void DiskPrefixCache::try_learn_from_disk() {
 // ─── Lookup ─────────────────────────────────────────────────────────────
 
 bool DiskPrefixCache::lookup(const std::vector<int32_t> & prompt_ids, int slot) {
-    if (disabled() || !layout_known_ || layout_from_disk_) return false;
+    if (disabled() || !layout_known_) return false;
 
     PrefixHash hash = hash_prefix(prompt_ids.data(), (int)prompt_ids.size());
 
@@ -316,10 +316,38 @@ bool DiskPrefixCache::lookup(const std::vector<int32_t> & prompt_ids, int slot) 
     auto & entry = entries_[idx];
     if (!read_file(entry.path, slot)) {
         // File is corrupt or incompatible — remove it.
+        std::fprintf(stderr, "[disk-cache] lookup failed, removing %s\n",
+                     entry.path.c_str());
         std::remove(entry.path.c_str());
         total_bytes_ -= entry.file_size;
         entries_.erase(entries_.begin() + idx);
         return false;
+    }
+
+    if (layout_from_disk_) {
+        const std::array<uint8_t, 16> disk_id = layout_id_;
+        auto ref = backend_.snapshot_ref(slot);
+        if (!ref.ctx) {
+            backend_.snapshot_free(slot);
+            return false;
+        }
+        compute_layout_id(ref.ctx);
+        if (std::memcmp(disk_id.data(), layout_id_.data(), 16) != 0) {
+            std::fprintf(stderr,
+                         "[disk-cache] adopted layout mismatch: disk=%s model=%s\n",
+                         hex(disk_id.data(), 16).c_str(),
+                         hex(layout_id_.data(), 16).c_str());
+            backend_.snapshot_free(slot);
+            entries_.clear();
+            total_bytes_ = 0;
+            layout_from_disk_ = false;
+            layout_dir_ = config_.cache_dir + "/" + hex(layout_id_.data(), 16);
+            mkdir_p(layout_dir_);
+            scan_directory();
+            return false;
+        }
+        layout_from_disk_ = false;
+        layout_dir_ = config_.cache_dir + "/" + hex(layout_id_.data(), 16);
     }
 
     // Update last_used on disk.
