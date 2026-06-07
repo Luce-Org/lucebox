@@ -658,6 +658,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
 
     const int n_layer = target_weights().n_layer;
     uint64_t build_us_total = 0, compute_us_total = 0, readback_us_total = 0, ffn_us_total = 0;
+    int hot_only_layers = 0, total_ffn_layers = 0;
     MoeHybridFfnTelemetry ffn_tel_accum{};
 
     StepGraph logits_sg;  // Persistent logits graph (used by spec-decode branch)
@@ -834,8 +835,10 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             MoeLayerDesc chunk_desc = make_moe_layer_desc(target_weights().layers[(size_t)il]);
             std::vector<float> ffn_batch_out;
             bool ffn_ok = false;
+            ++total_ffn_layers;
             if (storage.cold_expert_ids.empty()) {
                 // All experts hot — safe to use batched path
+                ++hot_only_layers;
                 ffn_ok = eval_moe_hybrid_ffn_batched(
                         target_backend(), cpu_be, chunk_cfg, chunk_desc, storage,
                         chunk_post.data(),
@@ -843,6 +846,17 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                         chunk_weights.data(),
                         chunk_len, ffn_batch_out, &result.error,
                         &ffn_hot_alloc, &ffn_cold_alloc);
+            } else if (storage.all_routed_are_hot(chunk_selected.data(),
+                                                   chunk_len * n_expert_used)) {
+                // All selected experts happen to be in VRAM — pure GPU, no CPU
+                ++hot_only_layers;
+                ffn_ok = eval_moe_hot_only_batched(
+                        target_backend(), chunk_cfg, chunk_desc, storage,
+                        chunk_post.data(),
+                        chunk_selected.data(),
+                        chunk_weights.data(),
+                        chunk_len, ffn_batch_out, &result.error,
+                        &ffn_hot_alloc);
             } else if (target_weights().moe_hybrid->has_mmap() &&
                        !target_weights().moe_hybrid->layer_regions.empty() &&
                        stream_engine_.is_ready() && chunk_len >= 16 &&
@@ -1167,6 +1181,11 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
         std::printf("  build=%.1fms compute=%.1fms readback=%.1fms ffn=%.1fms\n",
                     build_us_total / 1000.0, compute_us_total / 1000.0,
                     readback_us_total / 1000.0, ffn_us_total / 1000.0);
+        if (total_ffn_layers > 0) {
+            std::printf("  hot_only_layers=%d/%d (%.1f%% skip CPU)\n",
+                        hot_only_layers, total_ffn_layers,
+                        100.0 * hot_only_layers / total_ffn_layers);
+        }
         const double prefill_total_us = (double)(build_us_total + compute_us_total + readback_us_total + ffn_us_total);
         if (prefill_total_us > 0) {
             std::printf("  pct: build=%.1f%% compute=%.1f%% readback=%.1f%% ffn=%.1f%%\n",

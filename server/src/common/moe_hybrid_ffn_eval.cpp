@@ -1116,6 +1116,151 @@ static bool eval_moe_hybrid_ffn_batched_core(
     return true;
 }
 
+// ── Hot-Only Batched Prefill ──
+// When all selected experts are in VRAM, skip cold entirely: no CPU graph,
+// no partition into hot/cold, no merge loop. Pure GPU.
+
+bool eval_moe_hot_only_batched(
+    ggml_backend_t                  gpu_backend,
+    const MoeHybridConfig &         cfg,
+    const MoeLayerDesc &            desc,
+    MoeHybridLayerStorage &         storage,
+    const float *                   cur_host,
+    const int32_t *                 selected_ids,
+    const float *                   selected_weights,
+    int                             n_tokens,
+    std::vector<float> &            out,
+    std::string *                   err,
+    ggml_gallocr_t *                p_hot_alloc) {
+
+    const int n_embd = cfg.n_embd;
+    const int n_used = cfg.n_expert_used;
+    const int n_ff_exp = cfg.n_ff_exp;
+    out.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
+    if (n_tokens <= 0) return true;
+
+    // Workaround for ggml-cuda MMQ mul_mat_id bug on sm_75/gfx1151: when the
+    // hot stack is smaller than n_expert, slice into <=4-token sub-batches to
+    // route through the stable MMVQ path.
+    const int n_hot_stack = storage.gate_up_hot ? (int)storage.gate_up_hot->ne[2]
+                          : storage.gate_hot    ? (int)storage.gate_hot->ne[2]
+                          : 0;
+    static const int MMQ_SAFE_SUB_BATCH = 4;
+    if (n_hot_stack > 0 && n_hot_stack < cfg.n_expert && n_tokens > MMQ_SAFE_SUB_BATCH) {
+        std::vector<float> sub_out;
+        for (int t0 = 0; t0 < n_tokens; t0 += MMQ_SAFE_SUB_BATCH) {
+            const int tc = std::min(MMQ_SAFE_SUB_BATCH, n_tokens - t0);
+            if (!eval_moe_hot_only_batched(
+                    gpu_backend, cfg, desc, storage,
+                    cur_host + (size_t)t0 * (size_t)n_embd,
+                    selected_ids + (size_t)t0 * (size_t)n_used,
+                    selected_weights + (size_t)t0 * (size_t)n_used,
+                    tc, sub_out, err, p_hot_alloc)) {
+                return false;
+            }
+            std::memcpy(out.data() + (size_t)t0 * (size_t)n_embd,
+                        sub_out.data(),
+                        sizeof(float) * (size_t)n_embd * (size_t)tc);
+        }
+        return true;
+    }
+
+    // Remap global expert IDs → hot-local IDs
+    const int total_slots = n_used * n_tokens;
+    std::vector<int32_t> hot_sel(total_slots);
+    for (int i = 0; i < total_slots; ++i) {
+        const int32_t gid = selected_ids[i];
+        if (gid < 0 || gid >= (int32_t)storage.hot_local_by_global.size()) {
+            hot_sel[i] = 0;
+        } else {
+            hot_sel[i] = storage.hot_local_by_global[(size_t)gid];
+        }
+    }
+
+    // Build hot GPU graph
+    ggml_init_params ip{};
+    ip.mem_size = 128 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) { if (err) *err = "hot_only ggml_init failed"; return false; }
+
+    ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_input(inp);
+    ggml_tensor * sel = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+    ggml_set_input(sel);
+    ggml_tensor * wts = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_used, n_tokens);
+    ggml_set_input(wts);
+
+    ggml_tensor * routed = nullptr;
+    build_batched_routed_graph(ctx,
+        storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
+        desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
+        inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens, &routed);
+
+    // Shared expert (always on GPU)
+    ggml_tensor * combined = routed;
+    const bool has_shared = (desc.ffn_up_shexp && desc.ffn_gate_shexp && desc.ffn_down_shexp);
+    if (has_shared) {
+        ggml_tensor * sh_gate = apply_scale2(ctx,
+            ggml_mul_mat(ctx, desc.ffn_gate_shexp, inp), desc.ffn_gate_shexp_s);
+        ggml_tensor * sh_up = apply_scale2(ctx,
+            ggml_mul_mat(ctx, desc.ffn_up_shexp, inp), desc.ffn_up_shexp_s);
+        ggml_tensor * sh_gu = ggml_swiglu_split(ctx, sh_gate, sh_up);
+        ggml_tensor * shared = apply_scale2(ctx,
+            ggml_mul_mat(ctx, desc.ffn_down_shexp, sh_gu), desc.ffn_down_shexp_s);
+        if (desc.ffn_gate_inp_shexp) {
+            ggml_tensor * shared_gate = apply_scale2(ctx,
+                ggml_mul_mat(ctx, desc.ffn_gate_inp_shexp, inp), desc.ffn_gate_inp_shexp_s);
+            shared_gate = ggml_sigmoid(ctx, shared_gate);
+            shared = ggml_mul(ctx, shared, shared_gate);
+        }
+        combined = combined ? ggml_add(ctx, combined, shared) : shared;
+    }
+
+    if (!combined) {
+        ggml_free(ctx);
+        if (err) *err = "hot_only: no routed or shared output";
+        return false;
+    }
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 4096, false);
+    ggml_set_output(combined);
+    ggml_build_forward_expand(gf, combined);
+
+    ggml_gallocr_t alloc = nullptr;
+    if (p_hot_alloc) {
+        if (!*p_hot_alloc)
+            *p_hot_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu_backend));
+        alloc = *p_hot_alloc;
+    } else {
+        alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu_backend));
+    }
+    if (!ggml_gallocr_alloc_graph(alloc, gf)) {
+        if (err) *err = "hot_only gallocr failed";
+        if (!p_hot_alloc) ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_set(inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+    ggml_backend_tensor_set(sel, hot_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
+    ggml_backend_tensor_set(wts, selected_weights, 0, sizeof(float) * (size_t)total_slots);
+
+    auto st = ggml_backend_graph_compute(gpu_backend, gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        if (err) *err = "hot_only compute failed";
+        if (!p_hot_alloc) ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_get(combined, out.data(), 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+    if (!p_hot_alloc) ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    return true;
+}
+
 // ── GPU-Resident Residual State ──
 
 // Public entry. Workaround for a ggml-cuda/HIP defect: the MMQ mul_mat_id

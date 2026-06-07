@@ -1477,6 +1477,16 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
                             chunk_weights.data(),
                             chunk_len, ffn_batch_out, &result.error,
                             &ffn_hot_alloc, &ffn_cold_alloc);
+                } else if (storage.all_routed_are_hot(chunk_selected.data(),
+                                                      chunk_len * n_expert_used)) {
+                    // All selected experts happen to be in VRAM — pure GPU, no CPU
+                    ffn_ok = eval_moe_hot_only_batched(
+                            backend_, chunk_cfg, chunk_desc, storage,
+                            chunk_post.data(),
+                            chunk_selected.data(),
+                            chunk_weights.data(),
+                            chunk_len, ffn_batch_out, &result.error,
+                            &ffn_hot_alloc);
                 } else if (moe_hybrid_->has_mmap() &&
                            !moe_hybrid_->layer_regions.empty() &&
                            stream_engine_.is_ready() && chunk_len >= 16 &&

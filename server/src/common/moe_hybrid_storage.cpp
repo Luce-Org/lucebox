@@ -205,6 +205,13 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
             }
         }
 
+        // Populate VRAM bitmask from hot expert IDs
+        std::memset(dst.expert_vram_mask, 0, sizeof(dst.expert_vram_mask));
+        for (int32_t eid : dst.hot_expert_ids) {
+            if (eid >= 0 && eid < 256)
+                dst.expert_vram_mask[eid >> 6] |= (1ULL << (eid & 63));
+        }
+
         dst.fused_gate_up = desc.has_fused_gate_up();
         if (!validate_expert_tensor(desc.ffn_gate_exps, cfg.n_expert, &dst.gate_expert_bytes, err) ||
             !validate_expert_tensor(desc.ffn_up_exps, cfg.n_expert, &dst.up_expert_bytes, err) ||
@@ -379,6 +386,13 @@ bool build_moe_hybrid_storage_from_file(
                 dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
                 dst.cold_expert_ids.push_back((int32_t)expert);
             }
+        }
+
+        // Populate VRAM bitmask from hot expert IDs
+        std::memset(dst.expert_vram_mask, 0, sizeof(dst.expert_vram_mask));
+        for (int32_t eid : dst.hot_expert_ids) {
+            if (eid >= 0 && eid < 256)
+                dst.expert_vram_mask[eid >> 6] |= (1ULL << (eid & 63));
         }
 
         dst.fused_gate_up = desc.has_fused_gate_up();

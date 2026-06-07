@@ -140,6 +140,21 @@ bool eval_moe_hybrid_ffn_batched(
     ggml_gallocr_t *                p_hot_alloc = nullptr,
     ggml_gallocr_t *                p_cold_alloc = nullptr);
 
+// Hot-only batched prefill: all selected experts are in VRAM.
+// Skips cold graph build, CPU compute, and merge — pure GPU path.
+bool eval_moe_hot_only_batched(
+    ggml_backend_t                  gpu_backend,
+    const MoeHybridConfig &         cfg,
+    const MoeLayerDesc &            desc,
+    MoeHybridLayerStorage &         storage,
+    const float *                   cur_host,
+    const int32_t *                 selected_ids,
+    const float *                   selected_weights,
+    int                             n_tokens,
+    std::vector<float> &            out,
+    std::string *                   err = nullptr,
+    ggml_gallocr_t *                p_hot_alloc = nullptr);
+
 // GPU-resident single-token hybrid FFN: keeps data on GPU, only reads router
 // IDs to CPU for hot/cold partitioning.
 bool eval_moe_hybrid_ffn_gpu_resident(

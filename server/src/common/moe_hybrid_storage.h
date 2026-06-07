@@ -84,6 +84,21 @@ struct MoeHybridLayerStorage {
     std::vector<uint64_t> spare_lru;    // [cache_slots] last-use tick
     uint64_t lru_clock = 0;
 
+    // Bitmask: bit set = expert is in VRAM (hot). Supports up to 256 experts.
+    uint64_t expert_vram_mask[4] = {};
+
+    // Fast check: are ALL routed experts in VRAM for this batch?
+    // selected_ids has n_slots entries (n_tokens * n_expert_used).
+    bool all_routed_are_hot(const int32_t * selected_ids, int n_slots) const {
+        for (int i = 0; i < n_slots; ++i) {
+            const int g = selected_ids[i];
+            if (g < 0 || g >= 256) continue;
+            if (!((expert_vram_mask[g >> 6] >> (g & 63)) & 1ULL))
+                return false;
+        }
+        return true;
+    }
+
     bool fused_gate_up = false;
     size_t gate_expert_bytes = 0;
     size_t up_expert_bytes = 0;
