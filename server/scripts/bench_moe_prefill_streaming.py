@@ -140,7 +140,11 @@ def main():
 
         print(f"\n{'T':>8}  {'Baseline ms':>12}  {'Stream ms':>12}  {'Speedup':>8}")
         print("-" * 50)
-        for b, s in zip(baseline, streaming):
+        stream_map = {s["target_tokens"]: s for s in streaming}
+        for b in baseline:
+            s = stream_map.get(b["target_tokens"])
+            if not s:
+                continue
             speedup = b["avg_prefill_ms"] / s["avg_prefill_ms"] if s["avg_prefill_ms"] > 0 else 0
             print(f"{b['actual_tokens']:>8}  {b['avg_prefill_ms']:>12.1f}  "
                   f"{s['avg_prefill_ms']:>12.1f}  {speedup:>7.2f}x")

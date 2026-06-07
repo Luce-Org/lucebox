@@ -11,6 +11,7 @@
 
 #if !defined(_WIN32)
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 namespace dflash::common {
@@ -116,7 +117,7 @@ void MoeHybridStreamEngine::prefetch_cold_experts(const void * mmap_data, size_t
 #if !defined(_WIN32)
     auto do_advise = [&](size_t offset, size_t length) {
         if (offset + length > mmap_size) return;
-        const size_t page_size = 4096;
+        const size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
         const size_t aligned_offset = (offset / page_size) * page_size;
         const size_t aligned_length = length + (offset - aligned_offset);
         ::madvise(const_cast<uint8_t *>(static_cast<const uint8_t *>(mmap_data)) + aligned_offset,
@@ -169,6 +170,12 @@ bool MoeHybridStreamEngine::stream_expert_sync(const void * mmap_data, size_t mm
 
     const auto * file_base = static_cast<const uint8_t *>(mmap_data);
     size_t staging_offset = 0;
+
+    // Validate expert_id against region size
+    if (expert_id < 0) {
+        if (err) *err = "expert_id is negative";
+        return false;
+    }
 
     // Copy gate (or fused gate_up) from mmap → pinned
     if (regions.fused_gate_up) {

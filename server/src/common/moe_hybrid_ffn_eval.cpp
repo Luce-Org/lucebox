@@ -24,6 +24,28 @@ static uint64_t elapsed_us(HybridClock::time_point start, HybridClock::time_poin
     return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 }
 
+// Build the shared-expert FFN subgraph onto an existing ggml_context.
+// Returns the output tensor (or nullptr if no shared expert is present).
+static ggml_tensor * build_shared_expert_subgraph(
+        ggml_context * ctx, const MoeLayerDesc & desc, ggml_tensor * inp) {
+    if (!desc.ffn_up_shexp || !desc.ffn_gate_shexp || !desc.ffn_down_shexp)
+        return nullptr;
+    ggml_tensor * sh_gate = apply_scale2(ctx,
+        ggml_mul_mat(ctx, desc.ffn_gate_shexp, inp), desc.ffn_gate_shexp_s);
+    ggml_tensor * sh_up = apply_scale2(ctx,
+        ggml_mul_mat(ctx, desc.ffn_up_shexp, inp), desc.ffn_up_shexp_s);
+    ggml_tensor * sh_gu = ggml_swiglu_split(ctx, sh_gate, sh_up);
+    ggml_tensor * shared = apply_scale2(ctx,
+        ggml_mul_mat(ctx, desc.ffn_down_shexp, sh_gu), desc.ffn_down_shexp_s);
+    if (desc.ffn_gate_inp_shexp) {
+        ggml_tensor * shared_gate = apply_scale2(ctx,
+            ggml_mul_mat(ctx, desc.ffn_gate_inp_shexp, inp), desc.ffn_gate_inp_shexp_s);
+        shared_gate = ggml_sigmoid(ctx, shared_gate);
+        shared = ggml_mul(ctx, shared, shared_gate);
+    }
+    return shared;
+}
+
 // Run routed expert subset on a given backend (GPU or CPU).
 static bool run_routed_subset(ggml_backend_t backend,
                               ggml_tensor * gate_tensor,
@@ -172,15 +194,10 @@ static bool run_shared_ffn_gpu(ggml_backend_t backend,
     ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
     ggml_set_input(inp);
 
-    ggml_tensor * sh_gate = apply_scale2(ctx, ggml_mul_mat(ctx, desc.ffn_gate_shexp, inp), desc.ffn_gate_shexp_s);
-    ggml_tensor * sh_up   = apply_scale2(ctx, ggml_mul_mat(ctx, desc.ffn_up_shexp,   inp), desc.ffn_up_shexp_s);
-    ggml_tensor * sh_gu   = ggml_swiglu_split(ctx, sh_gate, sh_up);
-    ggml_tensor * shared  = apply_scale2(ctx, ggml_mul_mat(ctx, desc.ffn_down_shexp, sh_gu), desc.ffn_down_shexp_s);
-    if (desc.ffn_gate_inp_shexp) {
-        ggml_tensor * shared_gate = apply_scale2(ctx,
-            ggml_mul_mat(ctx, desc.ffn_gate_inp_shexp, inp), desc.ffn_gate_inp_shexp_s);
-        shared_gate = ggml_sigmoid(ctx, shared_gate);
-        shared = ggml_mul(ctx, shared, shared_gate);
+    ggml_tensor * shared = build_shared_expert_subgraph(ctx, desc, inp);
+    if (!shared) {
+        ggml_free(ctx);
+        return true;
     }
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 512, false);
@@ -292,19 +309,7 @@ static bool run_hot_and_shared_ffn_gpu(
         }
     }
 
-    ggml_tensor * shared = nullptr;
-    if (has_shared) {
-        ggml_tensor * sh_gate = apply_scale2(ctx, ggml_mul_mat(ctx, desc.ffn_gate_shexp, inp), desc.ffn_gate_shexp_s);
-        ggml_tensor * sh_up   = apply_scale2(ctx, ggml_mul_mat(ctx, desc.ffn_up_shexp,   inp), desc.ffn_up_shexp_s);
-        ggml_tensor * sh_gu   = ggml_swiglu_split(ctx, sh_gate, sh_up);
-        shared = apply_scale2(ctx, ggml_mul_mat(ctx, desc.ffn_down_shexp, sh_gu), desc.ffn_down_shexp_s);
-        if (desc.ffn_gate_inp_shexp) {
-            ggml_tensor * shared_gate = apply_scale2(ctx,
-                ggml_mul_mat(ctx, desc.ffn_gate_inp_shexp, inp), desc.ffn_gate_inp_shexp_s);
-            shared_gate = ggml_sigmoid(ctx, shared_gate);
-            shared = ggml_mul(ctx, shared, shared_gate);
-        }
-    }
+    ggml_tensor * shared = build_shared_expert_subgraph(ctx, desc, inp);
 
     // Combine hot routed + shared into a single output tensor
     ggml_tensor * combined = nullptr;
@@ -494,20 +499,7 @@ bool build_cached_hot_graph(
         }
     }
 
-    ggml_tensor * shared = nullptr;
-    const bool has_shared = (desc.ffn_up_shexp && desc.ffn_gate_shexp && desc.ffn_down_shexp);
-    if (has_shared) {
-        ggml_tensor * sh_gate = apply_scale2(out.ctx, ggml_mul_mat(out.ctx, desc.ffn_gate_shexp, out.inp), desc.ffn_gate_shexp_s);
-        ggml_tensor * sh_up   = apply_scale2(out.ctx, ggml_mul_mat(out.ctx, desc.ffn_up_shexp,   out.inp), desc.ffn_up_shexp_s);
-        ggml_tensor * sh_gu   = ggml_swiglu_split(out.ctx, sh_gate, sh_up);
-        shared = apply_scale2(out.ctx, ggml_mul_mat(out.ctx, desc.ffn_down_shexp, sh_gu), desc.ffn_down_shexp_s);
-        if (desc.ffn_gate_inp_shexp) {
-            ggml_tensor * shared_gate = apply_scale2(out.ctx,
-                ggml_mul_mat(out.ctx, desc.ffn_gate_inp_shexp, out.inp), desc.ffn_gate_inp_shexp_s);
-            shared_gate = ggml_sigmoid(out.ctx, shared_gate);
-            shared = ggml_mul(out.ctx, shared, shared_gate);
-        }
-    }
+    ggml_tensor * shared = build_shared_expert_subgraph(out.ctx, desc, out.inp);
 
     if (routed && shared) {
         out.output = ggml_add(out.ctx, routed, shared);
@@ -646,21 +638,8 @@ bool build_cached_hot_batched_graph(
 
     // Shared expert (always on GPU)
     ggml_tensor * combined = routed;
-    const bool has_shared = (desc.ffn_up_shexp && desc.ffn_gate_shexp && desc.ffn_down_shexp);
-    if (has_shared) {
-        ggml_tensor * sh_gate = apply_scale2(out.ctx,
-            ggml_mul_mat(out.ctx, desc.ffn_gate_shexp, out.inp), desc.ffn_gate_shexp_s);
-        ggml_tensor * sh_up = apply_scale2(out.ctx,
-            ggml_mul_mat(out.ctx, desc.ffn_up_shexp, out.inp), desc.ffn_up_shexp_s);
-        ggml_tensor * sh_gu = ggml_swiglu_split(out.ctx, sh_gate, sh_up);
-        ggml_tensor * shared = apply_scale2(out.ctx,
-            ggml_mul_mat(out.ctx, desc.ffn_down_shexp, sh_gu), desc.ffn_down_shexp_s);
-        if (desc.ffn_gate_inp_shexp) {
-            ggml_tensor * shared_gate = apply_scale2(out.ctx,
-                ggml_mul_mat(out.ctx, desc.ffn_gate_inp_shexp, out.inp), desc.ffn_gate_inp_shexp_s);
-            shared_gate = ggml_sigmoid(out.ctx, shared_gate);
-            shared = ggml_mul(out.ctx, shared, shared_gate);
-        }
+    ggml_tensor * shared = build_shared_expert_subgraph(out.ctx, desc, out.inp);
+    if (shared) {
         combined = combined ? ggml_add(out.ctx, combined, shared) : shared;
     }
 
@@ -906,21 +885,9 @@ bool eval_moe_batched_prefill_ffn(
 
     // Shared expert
     ggml_tensor * combined = routed;
-    if (desc.ffn_up_shexp && desc.ffn_gate_shexp && desc.ffn_down_shexp) {
-        ggml_tensor * sh_gate = apply_scale2(ctx,
-            ggml_mul_mat(ctx, desc.ffn_gate_shexp, inp), desc.ffn_gate_shexp_s);
-        ggml_tensor * sh_up = apply_scale2(ctx,
-            ggml_mul_mat(ctx, desc.ffn_up_shexp, inp), desc.ffn_up_shexp_s);
-        ggml_tensor * sh_gu = ggml_swiglu_split(ctx, sh_gate, sh_up);
-        ggml_tensor * shared = apply_scale2(ctx,
-            ggml_mul_mat(ctx, desc.ffn_down_shexp, sh_gu), desc.ffn_down_shexp_s);
-        if (desc.ffn_gate_inp_shexp) {
-            ggml_tensor * shared_gate = apply_scale2(ctx,
-                ggml_mul_mat(ctx, desc.ffn_gate_inp_shexp, inp), desc.ffn_gate_inp_shexp_s);
-            shared_gate = ggml_sigmoid(ctx, shared_gate);
-            shared = ggml_mul(ctx, shared, shared_gate);
-        }
-        combined = ggml_add(ctx, routed, shared);
+    ggml_tensor * shared = build_shared_expert_subgraph(ctx, desc, inp);
+    if (shared) {
+        combined = combined ? ggml_add(ctx, combined, shared) : shared;
     }
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 4096, false);
@@ -1044,20 +1011,8 @@ static bool eval_moe_hybrid_ffn_batched_core(
 
         // Shared expert (always on GPU)
         ggml_tensor * combined = routed;
-        if (has_shared) {
-            ggml_tensor * sh_gate = apply_scale2(hot_ctx,
-                ggml_mul_mat(hot_ctx, desc.ffn_gate_shexp, inp), desc.ffn_gate_shexp_s);
-            ggml_tensor * sh_up = apply_scale2(hot_ctx,
-                ggml_mul_mat(hot_ctx, desc.ffn_up_shexp, inp), desc.ffn_up_shexp_s);
-            ggml_tensor * sh_gu = ggml_swiglu_split(hot_ctx, sh_gate, sh_up);
-            ggml_tensor * shared = apply_scale2(hot_ctx,
-                ggml_mul_mat(hot_ctx, desc.ffn_down_shexp, sh_gu), desc.ffn_down_shexp_s);
-            if (desc.ffn_gate_inp_shexp) {
-                ggml_tensor * shared_gate = apply_scale2(hot_ctx,
-                    ggml_mul_mat(hot_ctx, desc.ffn_gate_inp_shexp, inp), desc.ffn_gate_inp_shexp_s);
-                shared_gate = ggml_sigmoid(hot_ctx, shared_gate);
-                shared = ggml_mul(hot_ctx, shared, shared_gate);
-            }
+        ggml_tensor * shared = build_shared_expert_subgraph(hot_ctx, desc, inp);
+        if (shared) {
             combined = combined ? ggml_add(hot_ctx, combined, shared) : shared;
         }
         hot_output = combined;
@@ -1305,21 +1260,8 @@ bool eval_moe_hot_only_batched(
 
     // Shared expert (always on GPU)
     ggml_tensor * combined = routed;
-    const bool has_shared = (desc.ffn_up_shexp && desc.ffn_gate_shexp && desc.ffn_down_shexp);
-    if (has_shared) {
-        ggml_tensor * sh_gate = apply_scale2(ctx,
-            ggml_mul_mat(ctx, desc.ffn_gate_shexp, inp), desc.ffn_gate_shexp_s);
-        ggml_tensor * sh_up = apply_scale2(ctx,
-            ggml_mul_mat(ctx, desc.ffn_up_shexp, inp), desc.ffn_up_shexp_s);
-        ggml_tensor * sh_gu = ggml_swiglu_split(ctx, sh_gate, sh_up);
-        ggml_tensor * shared = apply_scale2(ctx,
-            ggml_mul_mat(ctx, desc.ffn_down_shexp, sh_gu), desc.ffn_down_shexp_s);
-        if (desc.ffn_gate_inp_shexp) {
-            ggml_tensor * shared_gate = apply_scale2(ctx,
-                ggml_mul_mat(ctx, desc.ffn_gate_inp_shexp, inp), desc.ffn_gate_inp_shexp_s);
-            shared_gate = ggml_sigmoid(ctx, shared_gate);
-            shared = ggml_mul(ctx, shared, shared_gate);
-        }
+    ggml_tensor * shared = build_shared_expert_subgraph(ctx, desc, inp);
+    if (shared) {
         combined = combined ? ggml_add(ctx, combined, shared) : shared;
     }
 

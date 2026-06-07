@@ -212,7 +212,7 @@ inline void GgufMmap::advise_willneed(size_t offset, size_t length) const {
     PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
 #else
     // Align to page boundary for madvise
-    const size_t page_size = 4096;
+    const size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
     const size_t aligned_offset = (offset / page_size) * page_size;
     const size_t aligned_length = length + (offset - aligned_offset);
     ::madvise(const_cast<uint8_t *>(static_cast<const uint8_t *>(data_)) + aligned_offset,
