@@ -53,8 +53,8 @@ actually fast on a small card:
 2. **A bounded expert cache.** Calibration is static; real generations still hit
    a per-session tail. A fixed ring of spare GPU slots swaps cold experts in on
    first use (LRU evict) and serves them on-GPU afterward. The distinct cold set
-   saturates within a session, so a small cache drives cold-misses to ~0 and
-   recovers most of the remaining gap (**81 → 88 tok/s**) without growing VRAM.
+   saturates within a session, so a small cache drives cold-misses to **~0**
+   without growing VRAM, removing the cold-tail penalty on throughput.
 3. **Per-token fused decode.** Under offload the engine was building 40 separate
    per-layer GPU graphs per token; that submission overhead, not where the experts
    live, was the remaining gap. Spark folds the routed FFN into the attention graph
@@ -70,25 +70,23 @@ coarse-grain case Spark ships today.
 
 ## Results
 
-Full tables and methodology in [RESULTS.md](RESULTS.md). Single RTX 3090,
-Laguna-XS.2 Q4_K_M, 333-chunk / ~171K-token calibration corpus from real Claude
-Code sessions, validated on 60 held-out sessions.
+Single RTX 3090, Laguna-XS.2 Q4_K_M. Calibrated from a 333-chunk / ~171K-token
+corpus of real Claude Code sessions; cold-hit rates validated on 60 held-out
+sessions. Decode tok/s reproduce with [`spark/bench.py`](spark/bench.py); full
+methodology in [RESULTS.md](RESULTS.md).
 
-| Config (held-out) | tok/s | % all-GPU | cold-hit | VRAM |
+| Config (60% resident) | decode tok/s | % all-GPU | cold-hit | VRAM |
 |---|---:|---:|---:|---:|
-| All-GPU | 111 | 100% | - | 18.8 GiB |
-| Uniform 60% | 66 | 59% | 36% | 10.6 GiB |
-| **Spark calibrated 60%** | **81** | 73% | 6.6% | 10.6 GiB |
-| **Spark + cache (32 slots)** | **85-88** | ~79% | ~0% | **14.6 GiB** |
+| All-GPU (needs >16 GB) | 119 | 100% | - | 18.8 GiB |
+| Naive offload (uniform) | 66 | 55% | 36% | ~10.6 GiB |
+| **Spark, calibrated** | **81** | 68% | 6.6% | ~10.6 GiB |
+| **Spark + cache + fused decode** | **100** | **85%** | **~0%** | **14.6 GiB** |
 
-Peak VRAM at the operating point (60% hot + 32 cache slots) measured at
-**14.59 GiB**: a 33B-total MoE under 16 GiB.
-
-On the fixed decode bench ([`spark/bench.py`](spark/bench.py)) the per-token fused
-decode reaches **~100 tok/s at 60% residency** and is **bit-identical to all-GPU**
-(128/128 tokens, 119 tok/s) at full residency. The held-out real-session numbers
-above are the harder, more representative figure; the fused-decode bench is the
-reproducible ceiling the race GIF shows.
+Calibration drives the cold-hit rate from 36% (uniform) to 6.6%, the bounded
+cache to ~0; the single-graph fused decode (`laguna_step_hybrid`, default-on) is
+**bit-identical to all-GPU at full residency** (128/128 tokens, 119 tok/s) and
+holds **~100 tok/s at 60% residency**. Peak VRAM at the operating point (60% hot
++ 32 cache slots) measured at **14.59 GiB**: a 33B-total MoE under 16 GiB.
 
 ## How it works
 

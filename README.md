@@ -246,6 +246,20 @@ DFLASH27B_KV_TQ3=1 \
 | `DFLASH_TARGET_GPU=N` | `0` | Env var equivalent of `--target-gpu` |
 | `DFLASH_DRAFT_GPU=N` | same as target | Env var equivalent of `--draft-gpu` |
 
+**MoE expert offload (Spark)**
+
+For MoE targets (`laguna`, `qwen35`/`qwen36`) whose experts don't fit in VRAM. `--spark` self-tunes the hot/cold expert split, a bounded GPU cache, and the placement profile from live traffic; decode stays near the all-GPU ceiling via the default single-graph fused path. See [Luce Spark →](optimizations/spark/README.md).
+
+| Flag / env | Default | Effect |
+|---|---|---|
+| `--spark` | off | One-flag autotune: enable the bounded expert cache, size it from the VRAM target, auto-load and keep persisting a placement profile (`<model>.gguf.spark.csv`). |
+| `--spark-vram <GiB>` | whole card | Total VRAM Spark may use; it sizes the hot tier + cache + KV under this cap. |
+| `DFLASH_SPARK=1` | off | Env equivalent of `--spark`. |
+| `DFLASH_SPARK_VRAM_MB=N` | — | Env equivalent of `--spark-vram` (in MB). |
+| `DFLASH_<ARCH>_EXPERT_CACHE=1` | off | Bounded GPU expert cache (`<ARCH>` = `LAGUNA` or `QWEN35MOE`); cold-miss falls toward 0 after warmup. |
+| `DFLASH_<ARCH>_CACHE_SLOTS=N` | auto | Cache slots per layer. |
+| `DFLASH_LAGUNA_NO_SINGLE_GRAPH=1` | off | Fall back to per-layer decode instead of the default single-graph fused hybrid. |
+
 [DFlash benchmarks →](server/RESULTS.md) · [DFlash blog →](https://lucebox.com/blog/dflash27b) · [PFlash benchmarks →](optimizations/pflash/README.md) · [PFlash blog →](https://lucebox.com/blog/pflash) · [Per-machine quick starts (DGX Spark, Jetson Thor, HIP) →](server/README.md#quick-start)
 
 ---

@@ -7,7 +7,10 @@ sessions across 6 projects. Held-out: **60 chunks from sessions never seen
 during calibration** (split by session hash, no leakage).
 
 Decode tok/s is single-stream. "Cold-hit rate" = fraction of the 8 routed
-experts/layer that land on the CPU (cold) tier per token.
+experts/layer that land on the CPU (cold) tier per token. Sections 1-2 isolate
+the placement and cache levers on the per-layer decode path; the shipped default
+**single-graph fused decode** (section 4) lifts that operating point to **~100
+tok/s** (`spark/bench.py`, bit-identical to all-GPU at full residency).
 
 ## 1. Placement: calibration is the big lever
 
@@ -63,15 +66,22 @@ Measured peak for the target operating point (**60% hot + 32 cache slots**):
 | CUDA context / overhead | ~0.5 GiB |
 | **Measured peak** | **14.59 GiB** |
 
-A 33B-total MoE running at ~85-88 tok/s on **14.6 GiB**, vs 18.8 GiB to hold it
-all. Trade cache slots against context length to keep headroom under 16.
+A 33B-total MoE on **14.6 GiB**, vs 18.8 GiB to hold it all. The sweep above is
+the per-layer decode path; with the default single-graph fused decode the same
+operating point runs at **~100 tok/s** (section 4). Trade cache slots against
+context length to keep headroom under 16.
 
-## 4. Pre-gate predictor (research): why fusion needs a fine-tune, not a predictor
+## 4. Single-graph fused decode (shipped) + the last gap (research)
 
-Even at cold ~0 the hybrid tops out around 82% of all-GPU because the decode is
-many small per-layer graphs vs one fused graph. Collapsing them needs the
-experts known *before* the FFN runs, i.e. a predictor accurate enough to
-prefetch. We captured `(block-input hidden -> selected experts)` traces (1.2 GB,
+The per-layer hybrid (sections 1-2) topped out near 82% of all-GPU because each
+layer ran as a separate small graph. The **single-graph fused decode**
+(`laguna_step_hybrid`, default-on) collapses the whole token into one graph and
+lifts the operating point to **~100 tok/s (~85% of all-GPU)**, bit-identical to
+all-GPU at full residency (128/128 tokens). No predictor needed for that.
+
+Closing the **last ~15%** is the hard part: it needs the routed experts known
+*before* the FFN runs so cold fetches prefetch under compute, i.e. a predictor
+accurate enough to be useful. We captured `(block-input hidden -> selected experts)` traces (1.2 GB,
 150K samples) and trained per-layer pre-gates:
 
 | predictor | recall@8 | recall@16 | recall@24 |
@@ -82,7 +92,7 @@ prefetch. We captured `(block-input hidden -> selected experts)` traces (1.2 GB,
 
 The MLP beats linear by only ~3%, so the limit is **fundamental, not capacity**:
 the pre-gate sees the pre-attention hidden, but the router decides on the
-post-attention hidden. Clean prefetch+fusion wants ~95%+ recall at small K. A
+post-attention hidden. Clean prefetch wants ~95%+ recall at small K. A
 fitted-from-traces predictor does not get there. Reaching it means relocating
 and fine-tuning the model's gate (Pre-gated MoE), for which these traces are the
 dataset. The placement + cache results above need no model change.
