@@ -12,12 +12,25 @@
 #pragma once
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace dflash::common {
 
+// Per-position top-K distribution: [position][k] = (token_id, logit). Used by
+// stochastic (Leviathan) acceptance at temp>0. Populated by verify_batch /
+// project_hidden_to_tokens ONLY when stochastic capture is enabled.
+using TopKDist = std::vector<std::vector<std::pair<int32_t, float>>>;
+
 struct DFlashTarget {
     virtual ~DFlashTarget() = default;
+
+    // ── Stochastic-acceptance distribution capture (default: unsupported) ──
+    // When enabled, verify_batch/project_hidden_to_tokens stash per-position
+    // top-K logits so the spec loop can run Leviathan accept at temp>0.
+    virtual void set_stochastic_capture(bool /*on*/) {}
+    virtual const TopKDist & last_target_topk() const { static const TopKDist e; return e; }
+    virtual const TopKDist & last_draft_topk()  const { static const TopKDist e; return e; }
 
     // ── Target forward ──────────────────────────────────────────────
 

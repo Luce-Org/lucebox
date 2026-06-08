@@ -750,7 +750,8 @@ std::vector<int32_t> drafter_score_and_compress(
     int chunk_size,
     int n_lookahead,
     int pool_kernel,
-    int use_transitive_override) {
+    int use_transitive_override,
+    int attn_primary_override) {
     if (!ctx.loaded) {
         set_last_error("drafter not loaded");
         return {};
@@ -825,8 +826,17 @@ std::vector<int32_t> drafter_score_and_compress(
     for (int c = 0; c < std::min(n_chunks, cfg.head_chunks); ++c) forced[(size_t)c] = 1;
     for (int c = std::max(0, n_chunks - cfg.tail_chunks); c < n_chunks; ++c) forced[(size_t)c] = 1;
 
+    // PFLASH_ATTN_PRIMARY: trust the drafter's query-aware tail-attention ranking
+    // (chunk_means, sorted above) as the PRIMARY selector and SKIP the lexical
+    // 4-gram/cascade anchor flood that buries it on dense code (keeps 99%). With
+    // anchors off, keep% follows keep_ratio. Head/tail structural forced remain.
+    // SOTA-aligned (SAGE-KV attention top-k); see thoughts/2026-06-06_attention_guided_selection_scope.md
+    // Per-request override: -1 = use env, 0 = force off, 1 = force on.
+    const bool attn_primary = (attn_primary_override >= 0)
+        ? (attn_primary_override != 0)
+        : (std::getenv("PFLASH_ATTN_PRIMARY") != nullptr);
     const int q0 = std::max(0, S - cfg.query_tokens);
-    {
+    if (!attn_primary) {
         std::vector<int32_t> query_pool(ids.begin() + q0, ids.end());
         dflash::qwen3::AnchorScanCfg anchor_cfg = cfg.anchor;
         anchor_cfg.chunk_size = chunk_size;
@@ -840,6 +850,12 @@ std::vector<int32_t> drafter_score_and_compress(
         } else {
             dflash::qwen3::scan_and_force(ids, q0, query_pool, anchor_cfg, forced);
         }
+    } else {
+        // Attention-primary: structural head/tail forced (above) + the query-aware
+        // tail-attention chunk ranking (chunk_means, sorted) fills to n_keep below.
+        // No lexical anchors, no def-floor — keep% follows keep_ratio (general selector).
+        std::fprintf(stderr, "[drafter] PFLASH_ATTN_PRIMARY: attention top-K selector\n");
+        std::fflush(stderr);
     }
 
     int selected_count = 0;
@@ -906,7 +922,8 @@ std::vector<int32_t> drafter_score_and_compress(
     int pool_kernel) {
     return drafter_score_and_compress(ctx, ids, keep_ratio,
                                       chunk_size, n_lookahead, pool_kernel,
-                                      /*use_transitive_override=*/-1);
+                                      /*use_transitive_override=*/-1,
+                                      /*attn_primary_override=*/-1);
 }
 
 } // namespace dflash::common

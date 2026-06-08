@@ -91,6 +91,10 @@ struct GenerateRequest {
     // http_server when pflash compresses, so verify sees the entire compressed
     // prompt (not just the last cfg_.fa_window positions). Zero = no override.
     int                        fa_window_override = 0;
+    // Per-request stochastic spec-decode override. -1 = unset (use env
+    // DFLASH_STOCHASTIC default); 0 = force off; 1 = force on.
+    // Additionally gated on sampler_.temp > 0 at the consumer site.
+    int                        stochastic_override = -1;
 };
 
 struct GenerateResult {
@@ -248,6 +252,9 @@ struct ModelBackend {
         // 0 = off (agentic path: suppress cascade to avoid anchor bloat).
         // 1 = on  (retrieval path: full expansion, same as today).
         int                  use_transitive = -1;
+        // Per-request PFLASH_ATTN_PRIMARY override. -1 = unset (use env
+        // default); 0 = force off; 1 = force on (attention-top-K selector).
+        int                  attn_primary_override = -1;
         DraftResidencyAction residency_action = DraftResidencyAction::KeepLoaded;
     };
 

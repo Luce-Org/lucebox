@@ -58,6 +58,11 @@ public:
     // the prompt — see GenerateRequest.fa_window_override.
     void set_fa_window(int fa) { fa_window_ = fa; }
 
+    // ── Stochastic-acceptance distribution capture ──
+    void set_stochastic_capture(bool on) override { stochastic_capture_ = on; }
+    const TopKDist & last_target_topk() const override { return target_topk_; }
+    const TopKDist & last_draft_topk()  const override { return draft_topk_; }
+
 private:
     TargetWeights & w_;
     TargetCache & cache_;
@@ -65,6 +70,11 @@ private:
     StepGraph & sg_;
     int kq_stride_pad_;
     int fa_window_;
+
+    // Stochastic-acceptance capture (filled in verify_batch/project when on).
+    bool     stochastic_capture_ = false;
+    TopKDist target_topk_;
+    TopKDist draft_topk_;
 
     // Cached vector form of capture layer IDs (built once in constructor).
     std::vector<int> capture_ids_;

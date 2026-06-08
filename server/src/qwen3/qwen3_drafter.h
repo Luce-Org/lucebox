@@ -83,7 +83,8 @@ std::vector<int32_t> drafter_score_and_compress(
     int    chunk_size,
     int    n_lookahead,
     int    pool_kernel,
-    int    use_transitive_override);
+    int    use_transitive_override,
+    int    attn_primary_override = -1);
 
 // Backward-compatible 6-arg overload — ABI-stable wrapper, defined in qwen3_drafter.cpp.
 // Old callers compiled against the 6-arg signature continue to link without recompile.

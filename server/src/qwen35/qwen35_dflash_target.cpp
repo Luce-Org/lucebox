@@ -5,7 +5,46 @@
 #include "step_graph.h"
 #include "attn_masks.h"
 
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
 namespace dflash::common {
+
+namespace {
+constexpr int TOPK_K = 64;  // top-K logit mass kept per position for stochastic acceptance
+
+// Fill a TopKDist (per-position top-K (id,logit)) from a [vocab,n_tokens] logits
+// tensor. Used by stochastic (Leviathan) acceptance — captures the mass on peaked dists.
+//
+// NOTE(perf): this downloads the full vocab logit tensor D2H (~10-20 MB per call)
+// then partial_sort on CPU. A GPU sparse top-K (ggml_top_k wired into the verify
+// graph) would eliminate the D2H entirely but requires restructuring the graph
+// build (>50 LOC, separate task). For now the cost is bounded: this function is
+// only called when stochastic_capture_ is true (verified at both call sites), so
+// the full-vocab D2H only occurs on the stochastic path.
+void fill_topk(TopKDist & out, ggml_tensor * logits) {
+    out.clear();
+    if (!logits) return;
+    const int vocab    = (int)logits->ne[0];
+    const int n_tokens = (int)logits->ne[1];
+    if (vocab <= 0 || n_tokens <= 0) return;
+    std::vector<float> buf((size_t)vocab * n_tokens);
+    ggml_backend_tensor_get(logits, buf.data(), 0, sizeof(float) * buf.size());
+    const int K = std::min(TOPK_K, vocab);
+    out.resize(n_tokens);
+    std::vector<int> idx(vocab);
+    for (int i = 0; i < n_tokens; i++) {
+        const float * li = buf.data() + (size_t)i * vocab;
+        for (int j = 0; j < vocab; j++) idx[j] = j;
+        std::partial_sort(idx.begin(), idx.begin() + K, idx.end(),
+                          [&](int a, int b) { return li[a] > li[b]; });
+        out[i].resize(K);
+        for (int k = 0; k < K; k++) out[i][k] = { idx[k], li[idx[k]] };
+    }
+}
+}  // namespace
 
 Qwen35DFlashTarget::~Qwen35DFlashTarget() {
     step_graph_destroy(proj_sg_);
@@ -95,6 +134,8 @@ bool Qwen35DFlashTarget::verify_batch(
         *all_argmax = std::move(argmax_buf);
     }
 
+    if (stochastic_capture_) fill_topk(target_topk_, sg_.logits);
+
     cache_.cur_pos = base_pos + n_tokens;
     return true;
 }
@@ -138,6 +179,9 @@ bool Qwen35DFlashTarget::project_hidden_to_tokens(
     tokens_out.resize(n_tokens);
     ggml_backend_tensor_get(proj_sg_.argmax_tokens, tokens_out.data(), 0,
                             sizeof(int32_t) * n_tokens);
+
+    if (stochastic_capture_) fill_topk(draft_topk_, proj_sg_.logits);
+
     return true;
 }
 

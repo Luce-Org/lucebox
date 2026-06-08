@@ -15,6 +15,10 @@ namespace dflash::common {
 // admission budget must NOT collapse to 0; it is decoupled from the AR window.
 constexpr int kSpecCompressFaRef = 2048;
 
+// Spec-decode only wins on short, high-accept contexts (empirically lost to AR
+// by ~17K on agentic; won ~6K); 8192 is a conservative default — tunable per workload.
+inline constexpr int kSpecMaxUncompressedCtx = 8192;
+
 // Resolve the fa_window reference used by the spec-decode admission math.
 // Production default fa_window=0 → use kSpecCompressFaRef so the gate/ladder
 // bands (2x, 1.5x) yield the intended 4096 ceiling. A passed --fa-window>0
@@ -26,19 +30,18 @@ inline int spec_fa_ref(int fa_window_cfg) {
 // Returns true if spec-decode should be attempted.
 //   fa_window_override: 0 = no pflash; else = compressed_prompt_size + 256
 //   fa_window_cfg     : cfg_.fa_window (default 2048)
-//   kv_committed      : KV position after prefill (unused; kept for future use)
+//   kv_committed      : KV position after prefill (real context depth)
 //
-// Gate: permit spec-decode when eff_fa_window <= 2 * fa_window_cfg.
-// For uncompressed (override==0): always permit.
-// For pflash-compressed: permit only when compressed_size <= 3840 tokens.
-// At compressed_size > 3840, target KV is large enough that AR is faster
-// than spec-decode (empirically: D_composition 128K AR=27.5 vs spec=5.74 tok/s).
+// Compressed (pflash active): keep existing budget gate.
+// Uncompressed warm/cold turn: gate on real context length.
+// Spec-decode loses to AR on long context (accept collapses); force AR there.
 inline bool c2_spec_decode_permitted(int fa_window_override,
                                      int fa_window_cfg,
                                      int kv_committed) {
-    (void)kv_committed;
-    return (fa_window_override == 0)
-        || (fa_window_override <= 2 * fa_window_cfg);
+    if (fa_window_override > 0) {
+        return fa_window_override <= 2 * fa_window_cfg;
+    }
+    return kv_committed < kSpecMaxUncompressedCtx;
 }
 
 } // namespace dflash::common

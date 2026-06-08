@@ -194,6 +194,10 @@ private:
     SamplerCfg      sampler_;
     std::mt19937_64 sampler_rng_{std::random_device{}()};
 
+    // Per-request stochastic mode resolved from stochastic_override + env.
+    // Set in generate_impl/restore_and_generate_impl before do_spec_decode.
+    bool            stochastic_req_ = false;
+
     // Last prefill chunk metadata, used to sample the first generated token
     // without deriving a chunk-local offset from absolute KV position.
     std::size_t     prefill_last_logits_offset_ = 0;

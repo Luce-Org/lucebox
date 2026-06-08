@@ -1545,6 +1545,49 @@ void HttpServer::worker_loop() {
                 should_compress = (n_prompt >= config_.pflash_threshold);
             }
 
+            // Continuation gate: suppress pFlash on warm multi-turn conversations.
+            // A continuation (has prior assistant or tool history) is already served
+            // by the raw prefix KV cache at ~22x. Compressing it poisons the cache
+            // (raw SHA1 != compressed SHA1) — net loss. Only cold single-shot
+            // prompts benefit from compression.
+            if (should_compress) {
+                bool is_continuation = false;
+                if (req.messages.is_array()) {
+                    for (const auto & _m : req.messages) {
+                        if (!_m.is_object()) continue;
+                        // OpenAI / Anthropic: role="assistant" or tool_calls present
+                        const std::string _role = _m.value("role", "");
+                        if (_role == "assistant") { is_continuation = true; break; }
+                        if (_m.contains("tool_calls")) {
+                            const auto & _tc = _m["tool_calls"];
+                            if (_tc.is_array() && !_tc.empty()) { is_continuation = true; break; }
+                        }
+                        // Anthropic: user message with tool_result content blocks
+                        if (_m.contains("content") && _m["content"].is_array()) {
+                            for (const auto & _b : _m["content"]) {
+                                if (_b.is_object() &&
+                                    (_b.value("type", "") == "tool_result" ||
+                                     _b.value("type", "") == "tool_use")) {
+                                    is_continuation = true;
+                                    break;
+                                }
+                            }
+                        }
+                        // Responses API: function_call / function_call_output items
+                        const std::string _itype = _m.value("type", "");
+                        if (_itype == "function_call" || _itype == "function_call_output") {
+                            is_continuation = true; break;
+                        }
+                        if (is_continuation) break;
+                    }
+                }
+                if (is_continuation) {
+                    should_compress = false;
+                    std::fprintf(stderr,
+                        "[pflash] skip-compress (continuation: prior assistant/tool history)\n");
+                }
+            }
+
             if (should_compress) {
                 // Check full-compress cache FIRST — if we've seen this exact
                 // raw prompt before, skip the expensive compress cycle entirely.
@@ -1673,6 +1716,10 @@ void HttpServer::worker_loop() {
                                     !config_.draft_path.empty(),
                                 });
                         creq.residency_action = pflash_residency;
+                        // attn_primary is a compression-time strategy; only
+                        // meaningful when we are actually compressing.  Force on
+                        // so the per-request field overrides any stale env state.
+                        creq.attn_primary_override = 1;
 
                         ModelBackend::CompressResult cresult;
                         if (config_.pflash_remote_drafter) {
