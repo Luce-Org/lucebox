@@ -30,6 +30,11 @@ struct DeepSeek4I32InputBinding {
     int32_t       value  = 0;
 };
 
+struct DeepSeek4I32ArrayBinding {
+    ggml_tensor *          tensor = nullptr;
+    std::vector<int32_t>   values;
+};
+
 // ─── Helper: RMSNorm ────────────────────────────────────────────────────
 
 static ggml_tensor * build_rms_norm(ggml_context * ctx, ggml_tensor * x,
@@ -52,41 +57,64 @@ static ggml_tensor * build_clamped_swiglu(ggml_context * ctx,
     return ggml_mul(ctx, gate, up);
 }
 
-// ─── Helper: Partial RoPE ───────────────────────────────────────────────
+// ─── Helper: Partial RoPE (tail rotation) ───────────────────────────────
 // DS4 applies RoPE only to the last n_rot dimensions of each head.
-// For a single KV head of size head_dim with rotation on last n_rot dims,
-// we split, apply rope to the tail, and concat back.
+// ggml_rope_ext applies to the first n_dims, so we split, rope the tail, concat.
+//
+// x: [head_dim, n_heads, n_tokens] (3D) — applies tail RoPE to each head.
+// pos: [n_tokens] I32 — position for each token.
+// Returns: [head_dim, n_heads, n_tokens] with last n_rot dims rotated.
 
-static ggml_tensor * build_partial_rope(ggml_context * ctx,
+static ggml_tensor * build_tail_rope_3d(ggml_context * ctx,
                                          ggml_tensor * x,
+                                         ggml_tensor * pos,
                                          int n_rot,
                                          int head_dim,
                                          int n_heads,
                                          int n_tokens,
-                                         int position_offset,
                                          float freq_base,
-                                         float scale_factor) {
-    // x: [head_dim * n_heads, n_tokens] or [head_dim, n_tokens] for KV
-    // RoPE is applied to the LAST n_rot dims of each head.
-    // ggml_rope applies to the first n_rot dims, so we need to handle the split.
-    //
-    // For now, we use ggml_rope with mode flags to handle partial rotation.
-    // ggml_rope mode=0 rotates first n_rot dims of each head.
-    // DS4 rotates the TAIL, so we'd need mode=GGML_ROPE_TYPE_NEOX style or manual split.
-    //
-    // TODO: Implement exact DS4 tail-rotation. For initial correctness,
-    // use ggml_rope with appropriate mode that handles DS4's convention.
-    // The GGUF should encode the rope style appropriately.
+                                         float freq_scale,
+                                         float ext_factor,
+                                         float attn_factor,
+                                         float beta_fast,
+                                         float beta_slow) {
+    const int n_nope = head_dim - n_rot;
+    // Split: nope [n_nope, n_heads, n_tokens], tail [n_rot, n_heads, n_tokens]
+    ggml_tensor * nope = ggml_view_3d(ctx, x, n_nope, n_heads, n_tokens,
+                                       x->nb[1], x->nb[2], 0);
+    ggml_tensor * tail = ggml_view_3d(ctx, x, n_rot, n_heads, n_tokens,
+                                       x->nb[1], x->nb[2],
+                                       (size_t)n_nope * ggml_type_size(x->type));
+    // tail is non-contiguous (stride between heads = head_dim, not n_rot)
+    tail = ggml_cont(ctx, tail);
+    // Apply rope to the contiguous tail: [n_rot, n_heads, n_tokens]
+    tail = ggml_rope_ext(ctx, tail, pos, nullptr,
+                         n_rot, GGML_ROPE_TYPE_NEOX, 0,
+                         freq_base, freq_scale,
+                         ext_factor, attn_factor, beta_fast, beta_slow);
+    // Concat nope + tail along dim 0 → [head_dim, n_heads, n_tokens]
+    return ggml_concat(ctx, ggml_cont(ctx, nope), tail, 0);
+}
 
-    (void)head_dim; (void)n_heads; (void)scale_factor;
-
-    // Placeholder: apply standard rope (will need adjustment for DS4's tail convention)
-    ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
-    return ggml_rope_ext(ctx, x, positions, nullptr,
-                         n_rot, 2 /* NEOX mode */,
-                         0 /* context size (unused) */,
-                         freq_base, 1.0f /* ext_factor */,
-                         0.0f, 0.0f, 0.0f, 0.0f);
+// For KV (single head): x is [head_dim, n_tokens]
+static ggml_tensor * build_tail_rope_2d(ggml_context * ctx,
+                                         ggml_tensor * x,
+                                         ggml_tensor * pos,
+                                         int n_rot,
+                                         int head_dim,
+                                         int n_tokens,
+                                         float freq_base,
+                                         float freq_scale,
+                                         float ext_factor,
+                                         float attn_factor,
+                                         float beta_fast,
+                                         float beta_slow) {
+    // Reshape to 3D with n_heads=1 for the shared rope function
+    ggml_tensor * x3d = ggml_reshape_3d(ctx, x, head_dim, 1, n_tokens);
+    ggml_tensor * result = build_tail_rope_3d(ctx, x3d, pos, n_rot, head_dim, 1, n_tokens,
+                                              freq_base, freq_scale, ext_factor, attn_factor,
+                                              beta_fast, beta_slow);
+    return ggml_reshape_2d(ctx, result, head_dim, n_tokens);
 }
 
 // ─── KV Compressor Step ────────────────────────────────────────────────
@@ -142,17 +170,39 @@ static void build_compressor_step(
         return;
     }
 
-    // Pooling: placeholder — just take first head_dim elements of last kv row.
-    // The real algorithm uses a per-dim softmax-weighted sum across the window
-    // with cross-window interleaving for ratio-4. Correctness deferred.
-    ggml_tensor * pooled = ggml_view_2d(ctx, state.state_kv, head_dim, 1,
-                                         state.state_kv->nb[1], 0);
+    // ── Pooling: per-dim softmax-weighted average across state rows ──
+    // For ratio-128: straight per-dim softmax over all 128 rows
+    // For ratio-4: interleaved across prev/current windows (complex, simplified here)
+    //
+    // state_kv: [comp_width, n_state_rows]
+    // state_score: [comp_width, n_state_rows]
+    // For ratio-128: n_state_rows = ratio = 128, all rows used directly
+    // For ratio-4: n_state_rows = 2*ratio = 8 (prev 4 + current 4)
+    //   Correct interleaving would select prev[j] and current[head_dim+j] alternately.
+    //   Simplified: use all rows, take first head_dim of result.
+
+    const int n_state_rows = (ratio == 4) ? 2 * ratio : ratio;
+    // View the full state
+    ggml_tensor * sv_kv = ggml_view_2d(ctx, state.state_kv, comp_width, n_state_rows,
+                                        state.state_kv->nb[1], 0);
+    ggml_tensor * sv_sc = ggml_view_2d(ctx, state.state_score, comp_width, n_state_rows,
+                                        state.state_score->nb[1], 0);
+    // Transpose to [n_state_rows, comp_width] so softmax operates per-dimension
+    ggml_tensor * sc_T = ggml_cont(ctx, ggml_transpose(ctx, sv_sc));
+    ggml_tensor * kv_T = ggml_cont(ctx, ggml_transpose(ctx, sv_kv));
+    // Softmax over ne[0] = n_state_rows for each of comp_width dims
+    ggml_tensor * probs_T = ggml_soft_max(ctx, sc_T);
+    // Element-wise: probs * kv
+    ggml_tensor * weighted_T = ggml_mul(ctx, probs_T, kv_T);
+    // Sum over ne[0] = n_state_rows → [1, comp_width]
+    ggml_tensor * pooled_sum = ggml_sum_rows(ctx, weighted_T);
+    // Reshape to [comp_width] then take first head_dim
+    ggml_tensor * pooled = ggml_reshape_1d(ctx, pooled_sum, comp_width);
+    if (comp_width > head_dim) {
+        pooled = ggml_view_1d(ctx, pooled, head_dim, 0);
+    }
     pooled = ggml_cont(ctx, pooled);
     pooled = build_rms_norm(ctx, pooled, norm_weight, rms_eps);
-
-    // TODO: RoPE on compressed row (requires I32 position input allocated
-    // in a way gallocr can handle for side-effect-only subgraphs).
-    // Skipping for now — output is placeholder anyway.
 
     ggml_tensor * pooled_f16 = ggml_cast(ctx, pooled, GGML_TYPE_F16);
     const int comp_row = token_pos / ratio;
@@ -295,7 +345,8 @@ static ggml_tensor * build_mla_attention(
         int layer_idx,
         int kv_start,
         int n_tokens,
-        std::vector<DeepSeek4I32InputBinding> & i32_inputs) {
+        std::vector<DeepSeek4I32InputBinding> & i32_inputs,
+        std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs) {
 
     const int n_embd    = w.n_embd;
     const int head_dim  = w.head_dim;
@@ -321,10 +372,33 @@ static ggml_tensor * build_mla_attention(
     ggml_tensor * kv = ggml_mul_mat(ctx, L.attn_kv, cur);
     kv = build_rms_norm(ctx, kv, L.attn_kv_a_norm, w.rms_eps);
 
-    // ── RoPE on Q and KV (partial rotation on tail dims) ────────────
-    // TODO: Apply partial RoPE correctly (tail n_rot dims)
-    // For now, this is a placeholder that marks where RoPE goes.
-    (void)n_rot;
+    // ── RoPE on Q and KV (tail rotation on last n_rot dims) ────────
+    // DS4 uses per-layer RoPE params: compressed layers get YaRN scaling.
+    const bool compressed = (ratio > 0);
+    const float rope_freq = compressed ? w.compress_rope_freq_base : w.rope_freq_base;
+    const float rope_scale = compressed ? (1.0f / w.rope_scale_factor) : 1.0f;
+    const float rope_ext = compressed ? 1.0f : 0.0f;
+    // For YaRN: attn_factor cancels the magnitude scaling in rope_yarn
+    float rope_attn = 1.0f;
+    if (rope_ext != 0.0f && rope_scale > 0.0f) {
+        rope_attn /= (1.0f + 0.1f * logf(1.0f / rope_scale));
+    }
+
+    // Position tensor for this token batch
+    ggml_tensor * rope_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(rope_pos);
+    {
+        std::vector<int32_t> pos_vals(n_tokens);
+        for (int i = 0; i < n_tokens; i++) pos_vals[i] = kv_start + i;
+        i32_array_inputs.push_back({rope_pos, std::move(pos_vals)});
+    }
+
+    q = build_tail_rope_3d(ctx, q, rope_pos, n_rot, head_dim, n_head, n_tokens,
+                           rope_freq, rope_scale, rope_ext, rope_attn,
+                           w.rope_yarn_beta_fast, w.rope_yarn_beta_slow);
+    kv = build_tail_rope_2d(ctx, kv, rope_pos, n_rot, head_dim, n_tokens,
+                            rope_freq, rope_scale, rope_ext, rope_attn,
+                            w.rope_yarn_beta_fast, w.rope_yarn_beta_slow);
 
     // ── Store newest KV row in the raw SWA ring ─────────────────────
     const int token_pos = kv_start + n_tokens - 1;
@@ -363,16 +437,58 @@ static ggml_tensor * build_mla_attention(
         allowed_comp = build_indexer_score(ctx, qr_last, cur_last, w, L, lc, token_pos, i32_inputs);
     }
 
-    // ── Attention: placeholder dense path + DS4 selective compressed context ──
-    // TODO: Implement full MLA attention kernel.
-    // For now: simple dot-product attention between q and the latest kv entry,
-    // broadcast to all heads. This produces the correct output shape.
-    // q: [head_dim, n_head, n_tokens], kv: [head_dim, n_tokens]
-    // Placeholder: just reshape q to [head_dim*n_head, n_tokens]
-    ggml_tensor * attn_out = ggml_reshape_2d(ctx, q, head_dim * n_head, n_tokens);
+    // ── MLA Dot-Product Attention (SWA ring buffer) ────────────────
+    // q: [head_dim, n_head, n_tokens] (after RoPE)
+    // raw_kv: [head_dim, n_swa] F16 persistent ring buffer (single KV head, shared)
+    // n_raw = min(kv_start + n_tokens, n_swa)
+    const int n_raw = std::min(kv_start + n_tokens, w.n_swa);
+    const float kq_scale = 1.0f / sqrtf((float)head_dim);
 
-    // TODO: Compressed context from indexer — shape needs adaptation for production MLA.
-    // Disabled pending full attention kernel implementation.
+    // Get valid KV rows from ring buffer (cast F16→F32)
+    ggml_tensor * kv_f32 = ggml_cast(ctx, ggml_view_2d(ctx, lc.raw_kv, head_dim, n_raw,
+                                                         lc.raw_kv->nb[1], 0), GGML_TYPE_F32);
+    // kv_f32: [head_dim, n_raw]
+
+    // Flatten q to [head_dim, n_head*n_tokens] for batched matmul
+    ggml_tensor * q_flat = ggml_reshape_2d(ctx, q, head_dim, n_head * n_tokens);
+
+    // Scores: mul_mat(kv_f32, q_flat) = kv_f32^T[n_raw, head_dim] @ q_flat[head_dim, n_head*n_tokens]
+    //       → [n_raw, n_head*n_tokens]
+    ggml_tensor * scores = ggml_mul_mat(ctx, kv_f32, q_flat);
+    scores = ggml_scale(ctx, scores, kq_scale);
+
+    // Softmax over ne[0] = n_raw (the KV dimension)
+    ggml_tensor * probs = ggml_soft_max(ctx, scores);
+    // probs: [n_raw, n_head*n_tokens]
+
+    // Context: kv_T^T[head_dim, n_raw] @ probs[n_raw, n_head*n_tokens] → [head_dim, n_head*n_tokens]
+    // i.e. mul_mat(kv_T, probs) where kv_T = cont(transpose(kv_f32)) = [n_raw, head_dim]
+    ggml_tensor * kv_T = ggml_cont(ctx, ggml_transpose(ctx, kv_f32));
+    ggml_tensor * context = ggml_mul_mat(ctx, kv_T, probs);
+    // context: [head_dim, n_head*n_tokens]
+
+    // Reshape back to [head_dim, n_head, n_tokens]
+    context = ggml_reshape_3d(ctx, context, head_dim, n_head, n_tokens);
+
+    // ── Inverse tail RoPE on attention output ───────────────────────
+    // DS4 applies inverse RoPE (negate) to heads after attention, before output projection.
+    // Inverse = RoPE with negated position (equivalent to freq_scale negation).
+    // Use negative positions to achieve inverse rotation.
+    ggml_tensor * neg_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(neg_pos);
+    {
+        std::vector<int32_t> neg_vals(n_tokens);
+        for (int i = 0; i < n_tokens; i++) neg_vals[i] = -(kv_start + i);
+        i32_array_inputs.push_back({neg_pos, std::move(neg_vals)});
+    }
+    context = build_tail_rope_3d(ctx, context, neg_pos, n_rot, head_dim, n_head, n_tokens,
+                                 rope_freq, rope_scale, rope_ext, rope_attn,
+                                 w.rope_yarn_beta_fast, w.rope_yarn_beta_slow);
+
+    // Flatten to [head_dim*n_head, n_tokens] for output projection
+    ggml_tensor * attn_out = ggml_reshape_2d(ctx, context, head_dim * n_head, n_tokens);
+
+    (void)allowed_comp; // TODO: incorporate compressed context in mixed attention
 
     // ── Grouped output projection ──────────────────────────────────
     // DS4 output uses grouped low-rank projection:
@@ -584,6 +700,7 @@ static bool deepseek4_step_hybrid(
         ggml_set_input(inp);
         ggml_tensor * cur_tensor = inp;
         std::vector<DeepSeek4I32InputBinding> i32_inputs;
+        std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
         ggml_cgraph * gf = ggml_new_graph(ctx);
 
         ggml_tensor * attn_in = cur_tensor;
@@ -591,7 +708,8 @@ static bool deepseek4_step_hybrid(
         // For now, bypass HC and use direct residual path.
         ggml_tensor * normed = build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
         ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
-                                                     kv_start, n_tokens, i32_inputs);
+                                                     kv_start, n_tokens, i32_inputs,
+                                                     i32_array_inputs);
         ggml_tensor * residual = ggml_add(ctx, cur_tensor, attn_out);
 
         ggml_tensor * ffn_in = residual;
@@ -613,6 +731,10 @@ static bool deepseek4_step_hybrid(
             ggml_backend_tensor_set(inp, cur.data(), 0, sizeof(float) * cur.size());
             for (const DeepSeek4I32InputBinding & binding : i32_inputs) {
                 ggml_backend_tensor_set(binding.tensor, &binding.value, 0, sizeof(binding.value));
+            }
+            for (const DeepSeek4I32ArrayBinding & binding : i32_array_inputs) {
+                ggml_backend_tensor_set(binding.tensor, binding.values.data(), 0,
+                                        sizeof(int32_t) * binding.values.size());
             }
             const bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
             if (ok) {
@@ -645,6 +767,10 @@ static bool deepseek4_step_hybrid(
         ggml_backend_tensor_set(inp, cur.data(), 0, sizeof(float) * cur.size());
         for (const DeepSeek4I32InputBinding & binding : i32_inputs) {
             ggml_backend_tensor_set(binding.tensor, &binding.value, 0, sizeof(binding.value));
+        }
+        for (const DeepSeek4I32ArrayBinding & binding : i32_array_inputs) {
+            ggml_backend_tensor_set(binding.tensor, binding.values.data(), 0,
+                                    sizeof(int32_t) * binding.values.size());
         }
         const bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
         if (!ok) {
@@ -778,6 +904,7 @@ bool deepseek4_step(
     ggml_tensor * cur = inp;
     ggml_cgraph * gf = ggml_new_graph(ctx);
     std::vector<DeepSeek4I32InputBinding> i32_inputs;
+    std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
 
     // Layer loop
     for (int il = 0; il < n_layer; il++) {
@@ -794,7 +921,7 @@ bool deepseek4_step(
         // ── MLA attention ───────────────────────────────────────────
         ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc,
                                                       il, kv_start, n_tokens,
-                                                      i32_inputs);
+                                                      i32_inputs, i32_array_inputs);
 
         // ── Residual ────────────────────────────────────────────────
         cur = ggml_add(ctx, cur, attn_out);
@@ -839,6 +966,10 @@ bool deepseek4_step(
     ggml_backend_tensor_set(inp, embed, 0, n_embd * n_tokens * sizeof(float));
     for (const DeepSeek4I32InputBinding & binding : i32_inputs) {
         ggml_backend_tensor_set(binding.tensor, &binding.value, 0, sizeof(binding.value));
+    }
+    for (const DeepSeek4I32ArrayBinding & binding : i32_array_inputs) {
+        ggml_backend_tensor_set(binding.tensor, binding.values.data(), 0,
+                                sizeof(int32_t) * binding.values.size());
     }
 
     // Compute
