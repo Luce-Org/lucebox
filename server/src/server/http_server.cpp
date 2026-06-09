@@ -28,7 +28,11 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
+
+#include <array>
+#include <cstdint>
 
 namespace dflash::common {
 
@@ -762,6 +766,102 @@ std::vector<ChatMessage> normalize_chat_messages(
     return chat_msgs;
 }
 
+// ─── Disk-cache identity salt ───────────────────────────────────────────
+// Inline SHA-1 (same algorithm as prefix_cache.cpp / disk_prefix_cache.cpp).
+static void disk_sha1(const void * data, size_t len, uint8_t out[20]) {
+    auto rotl = [](uint32_t x, int n) -> uint32_t {
+        return (x << n) | (x >> (32 - n));
+    };
+    uint32_t h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE,
+             h3 = 0x10325476, h4 = 0xC3D2E1F0;
+    size_t new_len = len + 1;
+    while (new_len % 64 != 56) new_len++;
+    std::vector<uint8_t> msg(new_len + 8, 0);
+    std::memcpy(msg.data(), data, len);
+    msg[len] = 0x80;
+    uint64_t bit_len = (uint64_t)len * 8;
+    for (int i = 0; i < 8; i++) msg[new_len + i] = (uint8_t)(bit_len >> (56 - 8 * i));
+    for (size_t offset = 0; offset < msg.size(); offset += 64) {
+        uint32_t w[80];
+        for (int i = 0; i < 16; i++) {
+            w[i] = ((uint32_t)msg[offset + 4*i]   << 24) |
+                   ((uint32_t)msg[offset + 4*i+1] << 16) |
+                   ((uint32_t)msg[offset + 4*i+2] <<  8) |
+                   ((uint32_t)msg[offset + 4*i+3]);
+        }
+        for (int i = 16; i < 80; i++)
+            w[i] = rotl(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1);
+        uint32_t a = h0, b = h1, c = h2, d = h3, e = h4;
+        for (int i = 0; i < 80; i++) {
+            uint32_t f, k;
+            if      (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999; }
+            else if (i < 40) { f = b ^ c ^ d;           k = 0x6ED9EBA1; }
+            else if (i < 60) { f = (b&c)|(b&d)|(c&d);  k = 0x8F1BBCDC; }
+            else              { f = b ^ c ^ d;           k = 0xCA62C1D6; }
+            uint32_t temp = rotl(a, 5) + f + e + k + w[i];
+            e = d; d = c; c = rotl(b, 30); b = a; a = temp;
+        }
+        h0+=a; h1+=b; h2+=c; h3+=d; h4+=e;
+    }
+    auto s32 = [](uint8_t * p, uint32_t v) {
+        p[0]=(uint8_t)(v>>24); p[1]=(uint8_t)(v>>16); p[2]=(uint8_t)(v>>8); p[3]=(uint8_t)v;
+    };
+    s32(out,    h0); s32(out+4, h1); s32(out+8, h2); s32(out+12,h3); s32(out+16,h4);
+}
+
+// Compute a 16-byte identity salt from the inputs that affect KV cache validity:
+//   - target GGUF path + stat(size + mtime)  [covers model weights + rope/yarn]
+//   - max_ctx
+//   - SHA-1 of chat_template_src (empty string if none)
+//
+// Rope/yarn params have no CLI override: they come purely from the GGUF, so
+// GGUF path+stat is a sufficient proxy without re-hashing weight content.
+//
+// kv_dtype (tq3_0 etc.) is already captured by tensor types in compute_layout_id
+// and is NOT included here to avoid double-counting.
+//
+// Returns all-zeroes if the model_path is empty (disk cache disabled or no model).
+static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg) {
+    std::array<uint8_t, 16> salt{};
+    if (cfg.model_path.empty()) return salt;
+
+    // 1. GGUF file identity: path + size + mtime.
+    std::string path = cfg.model_path;
+    struct stat st{};
+    int64_t file_size = 0;
+    int64_t file_mtime = 0;
+    if (stat(path.c_str(), &st) == 0) {
+        file_size  = (int64_t)st.st_size;
+        file_mtime = (int64_t)st.st_mtime;
+    } else {
+        // Model stat failed — log and fall through. Zero size+mtime still
+        // incorporates the path into the fingerprint.
+        std::fprintf(stderr, "[disk-cache] salt: stat(%s) failed — path-only fingerprint\n",
+                     path.c_str());
+    }
+
+    // 2. SHA-1 of chat_template_src (empty string hashes deterministically).
+    uint8_t tmpl_digest[20] = {};
+    disk_sha1(cfg.chat_template_src.data(), cfg.chat_template_src.size(), tmpl_digest);
+
+    // 3. Build serialization buffer:
+    //    path_len(4) + path_bytes + file_size(8) + file_mtime(8) + max_ctx(4) + tmpl_digest(20)
+    std::vector<uint8_t> buf;
+    uint32_t plen = (uint32_t)path.size();
+    buf.insert(buf.end(), (uint8_t *)&plen, (uint8_t *)&plen + 4);
+    buf.insert(buf.end(), (uint8_t *)path.data(), (uint8_t *)path.data() + path.size());
+    buf.insert(buf.end(), (uint8_t *)&file_size, (uint8_t *)&file_size + 8);
+    buf.insert(buf.end(), (uint8_t *)&file_mtime, (uint8_t *)&file_mtime + 8);
+    int32_t mc = (int32_t)cfg.max_ctx;
+    buf.insert(buf.end(), (uint8_t *)&mc, (uint8_t *)&mc + 4);
+    buf.insert(buf.end(), tmpl_digest, tmpl_digest + 20);
+
+    uint8_t digest[20];
+    disk_sha1(buf.data(), buf.size(), digest);
+    std::memcpy(salt.data(), digest, 16);
+    return salt;
+}
+
 // ─── HttpServer ─────────────────────────────────────────────────────────
 
 HttpServer::HttpServer(ModelBackend & backend,
@@ -781,6 +881,14 @@ HttpServer::HttpServer(ModelBackend & backend,
     #ifdef DFLASH_HAS_CURL
     curl_global_init(CURL_GLOBAL_DEFAULT);
 #endif
+    // Set identity salt BEFORE init() so compute_layout_id sees it on the
+    // very first layout learn/verify call. This folds model path+stat,
+    // max_ctx, and chat_template into the layout_id, preventing stale-hit
+    // corruption when the server is restarted with a different model or config
+    // over the same --kv-cache-dir.
+    if (!disk_cache_.disabled()) {
+        disk_cache_.set_identity_salt(compute_disk_cache_salt(config));
+    }
     disk_cache_.init();
 }
 

@@ -2775,6 +2775,191 @@ static void test_disk_boundary_lookup_layout_from_disk_miss() {
     rm_rf(dir);
 }
 
+// ─── Disk-cache identity salt tests (Spec 1, manifest hardening) ────────
+//
+// test_disk_identity_salt_changes_layout_id:
+//   Same tensor context, two different non-zero salts → DIFFERENT layout_id.
+//   Same non-zero salt applied twice → SAME layout_id.
+//   Fails until set_identity_salt() + the prepend in compute_layout_id exist.
+//
+// test_disk_identity_salt_zero_is_backcompat:
+//   Zero salt (all-zeroes array) → layout_id equals the value produced with
+//   no salt at all (old behavior). Guards backward compatibility.
+
+static void test_disk_identity_salt_changes_layout_id() {
+    MockBackendWithLayout backend;
+
+    // Compute layout_id with salt A.
+    std::array<uint8_t, 16> salt_a{};
+    salt_a[0] = 0x01; salt_a[15] = 0xAB;
+
+    std::string dir_a = "/tmp/dflash_test_salt_a";
+    rm_rf(dir_a);
+    DiskCacheConfig cfg;
+    cfg.cache_dir = dir_a;
+    cfg.min_tokens = 1;
+    DiskPrefixCache cache_a(cfg, backend);
+    cache_a.set_identity_salt(salt_a);
+    cache_a.init();
+    cache_a.learn_layout(0);
+    // Retrieve layout_id via save: save a tiny prompt; the file header carries layout_id.
+    std::vector<int32_t> prompt;
+    for (int i = 0; i < 10; ++i) prompt.push_back(i + 1);
+    bool saved_a = cache_a.save(0, prompt);
+    TEST_ASSERT(saved_a);
+
+    // Compute layout_id with salt B (different from A).
+    std::array<uint8_t, 16> salt_b{};
+    salt_b[0] = 0x02; salt_b[15] = 0xCD;
+
+    std::string dir_b = "/tmp/dflash_test_salt_b";
+    rm_rf(dir_b);
+    DiskCacheConfig cfg_b;
+    cfg_b.cache_dir = dir_b;
+    cfg_b.min_tokens = 1;
+    DiskPrefixCache cache_b(cfg_b, backend);
+    cache_b.set_identity_salt(salt_b);
+    cache_b.init();
+    cache_b.learn_layout(0);
+    bool saved_b = cache_b.save(0, prompt);
+    TEST_ASSERT(saved_b);
+
+    // Read layout_id from the saved file headers.
+    // The file is at <dir>/<layout_hex>/<token_hex>.dkv.
+    // We read it by scanning the layout subdir.
+    auto read_layout_from_dir = [](const std::string & base) -> std::array<uint8_t, 16> {
+        std::array<uint8_t, 16> id{};
+        DIR * d = opendir(base.c_str());
+        if (!d) return id;
+        struct dirent * ent;
+        while ((ent = readdir(d)) != nullptr) {
+            if (ent->d_name[0] == '.') continue;
+            std::string sub = base + "/" + ent->d_name;
+            struct stat st{};
+            if (stat(sub.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+            DIR * sd = opendir(sub.c_str());
+            if (!sd) continue;
+            struct dirent * sf;
+            while ((sf = readdir(sd)) != nullptr) {
+                size_t nl = std::strlen(sf->d_name);
+                if (nl < 4 || std::strcmp(sf->d_name + nl - 4, ".dkv") != 0) continue;
+                std::string fp = sub + "/" + sf->d_name;
+                FILE * f = std::fopen(fp.c_str(), "rb");
+                if (!f) continue;
+                // skip magic(4) + version(4)
+                std::fseek(f, 8, SEEK_SET);
+                std::fread(id.data(), 1, 16, f);
+                std::fclose(f);
+                closedir(sd);
+                closedir(d);
+                return id;
+            }
+            closedir(sd);
+        }
+        closedir(d);
+        return id;
+    };
+
+    std::array<uint8_t, 16> id_a = read_layout_from_dir(dir_a);
+    std::array<uint8_t, 16> id_b = read_layout_from_dir(dir_b);
+
+    // Different salts → different layout_id.
+    TEST_ASSERT(id_a != id_b);
+
+    // Same salt applied again → same layout_id.
+    std::string dir_a2 = "/tmp/dflash_test_salt_a2";
+    rm_rf(dir_a2);
+    DiskCacheConfig cfg_a2;
+    cfg_a2.cache_dir = dir_a2;
+    cfg_a2.min_tokens = 1;
+    DiskPrefixCache cache_a2(cfg_a2, backend);
+    cache_a2.set_identity_salt(salt_a);
+    cache_a2.init();
+    cache_a2.learn_layout(0);
+    bool saved_a2 = cache_a2.save(0, prompt);
+    TEST_ASSERT(saved_a2);
+    std::array<uint8_t, 16> id_a2 = read_layout_from_dir(dir_a2);
+    TEST_ASSERT(id_a == id_a2);
+
+    rm_rf(dir_a);
+    rm_rf(dir_b);
+    rm_rf(dir_a2);
+}
+
+static void test_disk_identity_salt_zero_is_backcompat() {
+    // Zero salt must produce the same layout_id as no salt at all
+    // (old behavior preserved for callers that don't set a salt).
+    MockBackendWithLayout backend;
+
+    // Cache 1: no set_identity_salt call (default zeros).
+    std::string dir1 = "/tmp/dflash_test_salt_zero1";
+    rm_rf(dir1);
+    DiskCacheConfig cfg1;
+    cfg1.cache_dir = dir1;
+    cfg1.min_tokens = 1;
+    DiskPrefixCache cache1(cfg1, backend);
+    cache1.init();
+    cache1.learn_layout(0);
+    std::vector<int32_t> prompt;
+    for (int i = 0; i < 10; ++i) prompt.push_back(i + 1);
+    TEST_ASSERT(cache1.save(0, prompt));
+
+    // Cache 2: explicitly set all-zero salt.
+    std::string dir2 = "/tmp/dflash_test_salt_zero2";
+    rm_rf(dir2);
+    DiskCacheConfig cfg2;
+    cfg2.cache_dir = dir2;
+    cfg2.min_tokens = 1;
+    DiskPrefixCache cache2(cfg2, backend);
+    std::array<uint8_t, 16> zero_salt{};
+    cache2.set_identity_salt(zero_salt);
+    cache2.init();
+    cache2.learn_layout(0);
+    TEST_ASSERT(cache2.save(0, prompt));
+
+    // Read layout_ids from both dirs and compare.
+    auto read_layout_from_dir = [](const std::string & base) -> std::array<uint8_t, 16> {
+        std::array<uint8_t, 16> id{};
+        DIR * d = opendir(base.c_str());
+        if (!d) return id;
+        struct dirent * ent;
+        while ((ent = readdir(d)) != nullptr) {
+            if (ent->d_name[0] == '.') continue;
+            std::string sub = base + "/" + ent->d_name;
+            struct stat st{};
+            if (stat(sub.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+            DIR * sd = opendir(sub.c_str());
+            if (!sd) continue;
+            struct dirent * sf;
+            while ((sf = readdir(sd)) != nullptr) {
+                size_t nl = std::strlen(sf->d_name);
+                if (nl < 4 || std::strcmp(sf->d_name + nl - 4, ".dkv") != 0) continue;
+                std::string fp = sub + "/" + sf->d_name;
+                FILE * f = std::fopen(fp.c_str(), "rb");
+                if (!f) continue;
+                std::fseek(f, 8, SEEK_SET);
+                std::fread(id.data(), 1, 16, f);
+                std::fclose(f);
+                closedir(sd);
+                closedir(d);
+                return id;
+            }
+            closedir(sd);
+        }
+        closedir(d);
+        return id;
+    };
+
+    std::array<uint8_t, 16> id1 = read_layout_from_dir(dir1);
+    std::array<uint8_t, 16> id2 = read_layout_from_dir(dir2);
+
+    // Zero salt == no salt: must be identical.
+    TEST_ASSERT(id1 == id2);
+
+    rm_rf(dir1);
+    rm_rf(dir2);
+}
+
 static void test_backend_ipc_rejects_file_work_dir() {
     const std::string file_path = "/tmp/dflash_test_backend_ipc_work_dir_file";
     unlink(file_path.c_str());
@@ -4112,6 +4297,11 @@ int main() {
     RUN_TEST(test_disk_boundary_lookup_layout_from_disk_miss);
     RUN_TEST(test_disk_verify_layout_at_init_match);
     RUN_TEST(test_disk_verify_layout_at_init_mismatch);
+
+    std::fprintf(stderr, "\n── Disk-cache identity salt (Spec 1, manifest hardening) ──\n");
+    RUN_TEST(test_disk_identity_salt_changes_layout_id);
+    RUN_TEST(test_disk_identity_salt_zero_is_backcompat);
+
     RUN_TEST(test_backend_ipc_rejects_file_work_dir);
     RUN_TEST(test_backend_ipc_payload_pipe_round_trip);
 

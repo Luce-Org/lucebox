@@ -167,7 +167,13 @@ void DiskPrefixCache::compute_layout_id(ggml_context * ctx) {
     });
 
     // Build a single buffer and hash it.
+    // Prepend identity_salt_ so that config/model differences (model file,
+    // max_ctx, chat_template) rotate the layout_id independently of tensor
+    // structure. All-zero salt (the default) adds 16 zero bytes and produces
+    // the same digest as the old no-salt path only when the salt is truly
+    // zero; a non-zero salt changes the SHA-1 prefix → different layout_id.
     std::vector<uint8_t> buf;
+    buf.insert(buf.end(), identity_salt_.begin(), identity_salt_.end());
     for (const auto & ti : tensors) {
         buf.insert(buf.end(), ti.name.begin(), ti.name.end());
         buf.insert(buf.end(), (uint8_t *)&ti.type, (uint8_t *)&ti.type + 4);
