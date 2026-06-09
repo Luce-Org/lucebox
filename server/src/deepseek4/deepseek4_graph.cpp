@@ -125,6 +125,8 @@ static void build_compressor_step(
 
     ggml_tensor * ape_col = ggml_view_2d(
         ctx, ape, comp_width, 1, ape->nb[1], (size_t)pos_mod * ape->nb[1]);
+    // APE is F16 in the GGUF; cast to F32 for the add
+    ape_col = ggml_cast(ctx, ape_col, GGML_TYPE_F32);
     sc_cur = ggml_add(ctx, sc_cur, ape_col);
 
     ggml_tensor * kv_slot = ggml_view_2d(
