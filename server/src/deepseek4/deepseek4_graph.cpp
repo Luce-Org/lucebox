@@ -88,8 +88,9 @@ static ggml_tensor * build_tail_rope_3d(ggml_context * ctx,
     // tail is non-contiguous (stride between heads = head_dim, not n_rot)
     tail = ggml_cont(ctx, tail);
     // Apply rope to the contiguous tail: [n_rot, n_heads, n_tokens]
+    // DS4 uses standard sequential pairs (i, i+1), which is GGML_ROPE_TYPE_NORMAL
     tail = ggml_rope_ext(ctx, tail, pos, nullptr,
-                         n_rot, GGML_ROPE_TYPE_NEOX, 0,
+                         n_rot, GGML_ROPE_TYPE_NORMAL, 0,
                          freq_base, freq_scale,
                          ext_factor, attn_factor, beta_fast, beta_slow);
     // Concat nope + tail along dim 0 → [head_dim, n_heads, n_tokens]
