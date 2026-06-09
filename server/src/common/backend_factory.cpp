@@ -10,6 +10,7 @@
 #include "qwen3_backend.h"
 #include "gemma4_backend.h"
 #include "gemma4_layer_split_adapter.h"
+#include "deepseek4_backend.h"
 #include "layer_split_backend.h"
 #include "qwen35_layer_split_adapter.h"
 
@@ -208,6 +209,21 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         auto backend = std::make_unique<Gemma4Backend>(gcfg);
         if (!backend->init()) {
             std::fprintf(stderr, "[backend_factory] Gemma4Backend init failed\n");
+            return nullptr;
+        }
+        return backend;
+
+    } else if (arch == "deepseek4") {
+        DeepSeek4BackendConfig cfg;
+        cfg.model_path = args.model_path;
+        cfg.device     = args.device;
+        cfg.stream_fd  = args.stream_fd;
+        cfg.max_ctx    = args.device.max_ctx;
+        cfg.chunk      = args.chunk;
+
+        auto backend = std::make_unique<DeepSeek4Backend>(cfg);
+        if (!backend->init()) {
+            std::fprintf(stderr, "[backend_factory] DeepSeek4Backend init failed\n");
             return nullptr;
         }
         return backend;

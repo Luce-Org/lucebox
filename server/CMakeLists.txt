@@ -222,6 +222,7 @@ set(DFLASH27B_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/laguna
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/deepseek4
     ${CMAKE_CURRENT_SOURCE_DIR}/src/server
 )
 
@@ -245,6 +246,11 @@ add_library(dflash_common STATIC
     src/gemma4/gemma4_daemon.cpp
     src/gemma4/gemma4_dflash_target.cpp
     src/gemma4/gemma4_layer_split_adapter.cpp
+    # DeepSeek V4 Flash target arch
+    src/deepseek4/deepseek4_loader.cpp
+    src/deepseek4/deepseek4_graph.cpp
+    src/deepseek4/deepseek4_backend.cpp
+    src/deepseek4/deepseek4_daemon.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
@@ -581,8 +587,10 @@ find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(dflash_common PRIVATE OpenMP::OpenMP_CXX)
 endif()
-if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
-    target_link_libraries(dflash_common PRIVATE hip::host)
+if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+    target_link_libraries(dflash_common PUBLIC CUDA::cudart)
+elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+    target_link_libraries(dflash_common PUBLIC hip::host)
 endif()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -601,6 +609,11 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/pflash_daemon.cpp")
     add_executable(pflash_daemon test/pflash_daemon.cpp)
     target_include_directories(pflash_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
     target_link_libraries(pflash_daemon PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+        target_link_libraries(pflash_daemon PRIVATE CUDA::cudart)
+    else()
+        target_link_libraries(pflash_daemon PRIVATE hip::host)
+    endif()
 endif()
 
 # ─── Tests (numerics vs oracle) ────────────────────────────────────
@@ -748,6 +761,12 @@ if(DFLASH27B_TESTS)
             target_include_directories(test_qwen35moe_swap_manager PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
         endif()
         target_link_libraries(test_qwen35moe_swap_manager PRIVATE dflash_common)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_unit.cpp")
+        add_executable(test_deepseek4_unit test/test_deepseek4_unit.cpp)
+        target_include_directories(test_deepseek4_unit PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_link_libraries(test_deepseek4_unit PRIVATE ggml ggml-cpu)
+        add_test(NAME deepseek4_unit COMMAND test_deepseek4_unit)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_draft.cpp")
         add_executable(smoke_load_draft test/smoke_load_draft.cpp)
