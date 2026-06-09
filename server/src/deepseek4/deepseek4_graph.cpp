@@ -582,22 +582,15 @@ static bool deepseek4_step_hybrid(
         ggml_cgraph * gf = ggml_new_graph(ctx);
 
         ggml_tensor * attn_in = cur_tensor;
-        if (L.hc_attn_fn && cache.hc_state) {
-            attn_in = build_hc_pre(ctx, cache.hc_state, w,
-                                   L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base,
-                                   n_tokens);
-        }
+        // TODO: HC pre-mix (requires proper [n_embd, n_tokens] HC state management)
+        // For now, bypass HC and use direct residual path.
         ggml_tensor * normed = build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
         ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
                                                      kv_start, n_tokens, i32_inputs);
         ggml_tensor * residual = ggml_add(ctx, cur_tensor, attn_out);
 
         ggml_tensor * ffn_in = residual;
-        if (L.hc_ffn_fn && cache.hc_state) {
-            ffn_in = build_hc_pre(ctx, cache.hc_state, w,
-                                  L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base,
-                                  n_tokens);
-        }
+        // TODO: HC pre-mix for FFN path
         ggml_tensor * ffn_post = build_rms_norm(ctx, ffn_in, L.ffn_norm, w.rms_eps);
 
         if (il < w.n_hash_layer && L.ffn_gate_tid2eid) {
@@ -715,11 +708,7 @@ static bool deepseek4_step_hybrid(
     ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
     ggml_set_input(inp);
     ggml_tensor * cur_tensor = inp;
-    if (w.output_hc_fn && cache.hc_state) {
-        cur_tensor = build_hc_pre(ctx, cache.hc_state, w,
-                                  w.output_hc_fn, w.output_hc_scale, w.output_hc_base,
-                                  n_tokens);
-    }
+    // TODO: output HC pre-mix
     cur_tensor = build_rms_norm(ctx, cur_tensor, w.out_norm, w.rms_eps);
     ggml_tensor * logits = ggml_mul_mat(ctx, w.output, cur_tensor);
     ggml_cgraph * gf = ggml_new_graph(ctx);
@@ -793,11 +782,6 @@ bool deepseek4_step(
         // ── HC pre (attention) ──────────────────────────────────────
         // TODO: Full HC implementation. For now, pass cur through directly.
         ggml_tensor * attn_in = cur;
-        if (L.hc_attn_fn && cache.hc_state) {
-            attn_in = build_hc_pre(ctx, cache.hc_state, w,
-                                    L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base,
-                                    n_tokens);
-        }
 
         // ── Attention norm ──────────────────────────────────────────
         ggml_tensor * normed = build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
@@ -812,11 +796,6 @@ bool deepseek4_step(
 
         // ── HC pre (FFN) ────────────────────────────────────────────
         ggml_tensor * ffn_in = cur;
-        if (L.hc_ffn_fn && cache.hc_state) {
-            ffn_in = build_hc_pre(ctx, cache.hc_state, w,
-                                   L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base,
-                                   n_tokens);
-        }
 
         // ── FFN norm ────────────────────────────────────────────────
         ggml_tensor * ffn_normed = build_rms_norm(ctx, ffn_in, L.ffn_norm, w.rms_eps);
@@ -829,12 +808,7 @@ bool deepseek4_step(
     }
 
     // ── Output head ─────────────────────────────────────────────────────
-    // HC output pre (merge residual streams for final projection)
-    if (w.output_hc_fn && cache.hc_state) {
-        cur = build_hc_pre(ctx, cache.hc_state, w,
-                            w.output_hc_fn, w.output_hc_scale, w.output_hc_base,
-                            n_tokens);
-    }
+    // TODO: HC output pre (merge residual streams for final projection)
 
     // Final RMSNorm
     cur = build_rms_norm(ctx, cur, w.out_norm, w.rms_eps);
