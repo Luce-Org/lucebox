@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 
 namespace dflash::common {
@@ -395,7 +396,7 @@ bool Qwen35LayerSplitAdapter::snapshot_save(int slot) {
         snapshot_free(slot);
         return false;
     }
-    if (!use_mixed_target_split() && !rebuild_disk_snapshot(slot)) {
+    if (!rebuild_disk_snapshot(slot)) {
         snapshot_free(slot);
         return false;
     }
@@ -487,7 +488,7 @@ bool Qwen35LayerSplitAdapter::snapshot_restore(int slot) {
 }
 
 bool Qwen35LayerSplitAdapter::rebuild_disk_snapshot(int slot) {
-    if (!snapshot_slot_valid(slot) || use_mixed_target_split()) return false;
+    if (!snapshot_slot_valid(slot)) return false;
     if (disk_snapshot_contexts_.size() != (size_t)PREFIX_SLOTS ||
         disk_snapshot_buffers_.size() != (size_t)PREFIX_SLOTS ||
         disk_snapshot_backends_.size() != (size_t)PREFIX_SLOTS) {
@@ -507,6 +508,28 @@ bool Qwen35LayerSplitAdapter::rebuild_disk_snapshot(int slot) {
     }
 
     const auto & snaps = prefix_snapshots_[(size_t)slot];
+    const bool mixed_target_split = use_mixed_target_split();
+    Qwen35TargetShardSnapshotData remote_snapshot;
+    if (mixed_target_split) {
+        if (!remote_target_shard_.snapshot_export(slot, remote_snapshot) ||
+            remote_snapshot.shard_count <= 0 ||
+            remote_snapshot.cur_pos <= 0 ||
+            remote_snapshot.tensors.empty() ||
+            remote_snapshot.logits.empty()) {
+            return false;
+        }
+        if (snaps.empty() || !snaps.front().ctx ||
+            remote_snapshot.cur_pos != snaps.front().cur_pos) {
+            return false;
+        }
+        for (const auto & t : remote_snapshot.tensors) {
+            if (t.shard < 0 || t.shard >= remote_snapshot.shard_count ||
+                t.name.empty() || t.name.size() >= (size_t)GGML_MAX_NAME ||
+                t.type >= GGML_TYPE_COUNT || t.data.empty()) {
+                return false;
+            }
+        }
+    }
     const bool has_dflash_features = cfg_.run_dflash && cfg_.draft_path;
     const DraftFeatureSnapshot * draft_snap = nullptr;
     if (has_dflash_features) {
@@ -529,6 +552,7 @@ bool Qwen35LayerSplitAdapter::rebuild_disk_snapshot(int slot) {
             n_tensors++;
         }
     }
+    n_tensors += remote_snapshot.tensors.size();
 
     ggml_init_params ip{};
     ip.mem_size = ggml_tensor_overhead() * (n_tensors + 8) + 4096;
@@ -542,6 +566,12 @@ bool Qwen35LayerSplitAdapter::rebuild_disk_snapshot(int slot) {
     };
     std::vector<CopyPair> copies;
     copies.reserve(n_tensors);
+    struct RemoteCopy {
+        const Qwen35TargetShardSnapshotTensor * src = nullptr;
+        ggml_tensor * dst = nullptr;
+    };
+    std::vector<RemoteCopy> remote_copies;
+    remote_copies.reserve(remote_snapshot.tensors.size());
 
     for (size_t shard_idx = 0; shard_idx < snaps.size(); ++shard_idx) {
         const auto & snap = snaps[shard_idx];
@@ -557,6 +587,23 @@ bool Qwen35LayerSplitAdapter::rebuild_disk_snapshot(int slot) {
             ggml_set_name(dst, name.c_str());
             copies.push_back({src, dst});
         }
+    }
+    for (const auto & src : remote_snapshot.tensors) {
+        ggml_tensor * dst = ggml_new_tensor(
+            ctx, (ggml_type)src.type, 4, src.ne);
+        if (!dst) {
+            ggml_free(ctx);
+            return false;
+        }
+        if (ggml_nbytes(dst) != src.data.size()) {
+            ggml_free(ctx);
+            return false;
+        }
+        const std::string name =
+            "ls" + std::to_string(snaps.size() + (size_t)src.shard) +
+            "_" + src.name;
+        ggml_set_name(dst, name.c_str());
+        remote_copies.push_back({&src, dst});
     }
 
     const auto & logits = snapshot_prefill_logits_[(size_t)slot];
@@ -613,6 +660,10 @@ bool Qwen35LayerSplitAdapter::rebuild_disk_snapshot(int slot) {
             offset += chunk;
         }
     }
+    for (const RemoteCopy & cp : remote_copies) {
+        ggml_backend_tensor_set(cp.dst, cp.src->data.data(), 0,
+                                cp.src->data.size());
+    }
     ggml_backend_tensor_set(logits_t, logits.data(), 0,
                             sizeof(float) * logits.size());
     if (draft_meta_t && draft_data_t && draft_snap) {
@@ -636,9 +687,12 @@ bool Qwen35LayerSplitAdapter::rebuild_disk_snapshot(int slot) {
 
 ModelBackend::SnapshotRef Qwen35LayerSplitAdapter::snapshot_ref(int slot) const {
     ModelBackend::SnapshotRef ref;
-    if (use_mixed_target_split()) return ref;
     if (!snapshot_used(slot)) return ref;
     if (slot < 0 || slot >= (int)disk_snapshot_contexts_.size()) return ref;
+    if (!disk_snapshot_contexts_[(size_t)slot] ||
+        !disk_snapshot_buffers_[(size_t)slot]) {
+        return ref;
+    }
     ref.ctx = disk_snapshot_contexts_[(size_t)slot];
     ref.buf = disk_snapshot_buffers_[(size_t)slot];
     ref.cur_pos = snapshot_cur_pos(slot);
@@ -653,8 +707,8 @@ bool Qwen35LayerSplitAdapter::snapshot_adopt(int slot,
                                              ggml_backend_buffer_t buf,
                                              int cur_pos,
                                              int32_t last_tok) {
-    if (use_mixed_target_split() || !snapshot_slot_valid(slot) || !ctx ||
-        !buf || cur_pos <= 0) {
+    const bool mixed_target_split = use_mixed_target_split();
+    if (!snapshot_slot_valid(slot) || !ctx || !buf || cur_pos <= 0) {
         return false;
     }
     snapshot_free(slot);
@@ -671,12 +725,31 @@ bool Qwen35LayerSplitAdapter::snapshot_adopt(int slot,
     ggml_tensor * logits_tensor = nullptr;
     ggml_tensor * dflash_feature_meta = nullptr;
     ggml_tensor * dflash_feature_data = nullptr;
+    Qwen35TargetShardSnapshotData remote_import;
+    std::vector<int> remote_tensor_counts;
+    if (mixed_target_split) {
+        const size_t local_shard_count = shards_.size();
+        const size_t total_shard_count = cfg_.device.layer_split_gpus.size();
+        if (total_shard_count <= local_shard_count ||
+            total_shard_count - local_shard_count >
+                (size_t)std::numeric_limits<int>::max()) {
+            return false;
+        }
+        remote_import.shard_count =
+            (int)(total_shard_count - local_shard_count);
+        remote_import.cur_pos = cur_pos;
+        remote_import.last_tok = last_tok;
+        remote_tensor_counts.assign((size_t)remote_import.shard_count, 0);
+    }
 
     auto fail = [&]() {
         for (auto & snap : snaps) snap = PrefixSnapshot{};
         snapshot_prefill_logits_[(size_t)slot].clear();
         snapshot_prefill_logit_tensors_[(size_t)slot].clear();
         free_draft_feature_snapshot(slot);
+        if (mixed_target_split) {
+            remote_target_shard_.snapshot_free(slot);
+        }
         return false;
     };
 
@@ -735,6 +808,33 @@ bool Qwen35LayerSplitAdapter::snapshot_adopt(int slot,
                    shard_idx >= 0 && shard_idx < (int)shards_.size()) {
             snapshot_prefill_logit_tensors_[(size_t)slot][(size_t)shard_idx] = t;
             logits_tensor = t;
+        } else if (mixed_target_split) {
+            const char * name = t->name;
+            if (name[0] == 'l' && name[1] == 's') {
+                char * end = nullptr;
+                const long parsed = std::strtol(name + 2, &end, 10);
+                if (end && *end == '_' && parsed >= (long)shards_.size() &&
+                    parsed < (long)shards_.size() + remote_import.shard_count) {
+                    const int remote_shard = (int)parsed - (int)shards_.size();
+                    const char * raw_name = end + 1;
+                    if (!raw_name[0] || t->type >= GGML_TYPE_COUNT) {
+                        return fail();
+                    }
+                    Qwen35TargetShardSnapshotTensor remote_tensor;
+                    remote_tensor.shard = remote_shard;
+                    remote_tensor.name = raw_name;
+                    remote_tensor.type = (uint32_t)t->type;
+                    for (int d = 0; d < 4; ++d) {
+                        remote_tensor.ne[d] = t->ne[d];
+                    }
+                    const size_t nbytes = ggml_nbytes(t);
+                    if (nbytes == 0) return fail();
+                    remote_tensor.data.assign(nbytes, 0);
+                    ggml_backend_tensor_get(t, remote_tensor.data.data(), 0, nbytes);
+                    remote_import.tensors.push_back(std::move(remote_tensor));
+                    remote_tensor_counts[(size_t)remote_shard]++;
+                }
+            }
         }
     }
 
@@ -768,6 +868,21 @@ bool Qwen35LayerSplitAdapter::snapshot_adopt(int slot,
                             0,
                             sizeof(float) *
                                 snapshot_prefill_logits_[(size_t)slot].size());
+    if (mixed_target_split) {
+        if (remote_import.tensors.empty()) {
+            return fail();
+        }
+        if (remote_tensor_counts.size() != (size_t)remote_import.shard_count) {
+            return fail();
+        }
+        for (int count : remote_tensor_counts) {
+            if (count <= 0) return fail();
+        }
+        remote_import.logits = snapshot_prefill_logits_[(size_t)slot];
+        if (!remote_target_shard_.snapshot_import(slot, remote_import)) {
+            return fail();
+        }
+    }
 
     if (cfg_.run_dflash && cfg_.draft_path) {
         if (!dflash_feature_meta || !dflash_feature_data ||
@@ -814,9 +929,15 @@ bool Qwen35LayerSplitAdapter::snapshot_adopt(int slot,
     disk_snapshot_contexts_[(size_t)slot] = ctx;
     disk_snapshot_buffers_[(size_t)slot] = buf;
     disk_snapshot_backends_[(size_t)slot] = nullptr;
-    std::fprintf(stderr,
-                 "[target-split] adopted disk snapshot slot=%d shards=%zu pos=%d\n",
-                 slot, shards_.size(), cur_pos);
+    if (mixed_target_split) {
+        std::fprintf(stderr,
+                     "[target-split] adopted disk snapshot slot=%d local_shards=%zu remote_shards=%d pos=%d\n",
+                     slot, shards_.size(), remote_import.shard_count, cur_pos);
+    } else {
+        std::fprintf(stderr,
+                     "[target-split] adopted disk snapshot slot=%d shards=%zu pos=%d\n",
+                     slot, shards_.size(), cur_pos);
+    }
     return true;
 }
 

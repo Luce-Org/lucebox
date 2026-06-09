@@ -41,6 +41,52 @@ BackendIpcPayloadTransport target_shard_ipc_transport_from_env() {
     return transport;
 }
 
+bool write_snapshot_tensor_header_fd(int fd,
+                                     const Qwen35TargetShardSnapshotTensor & t) {
+    if (fd < 0 || t.shard < 0 || t.name.empty() ||
+        t.name.size() >= (size_t)GGML_MAX_NAME ||
+        t.data.size() > (size_t)std::numeric_limits<uint64_t>::max()) {
+        return false;
+    }
+    const int32_t shard = (int32_t)t.shard;
+    const int32_t name_len = (int32_t)t.name.size();
+    const uint32_t type = t.type;
+    const uint64_t nbytes = (uint64_t)t.data.size();
+    return write_exact_fd(fd, &shard, sizeof(shard)) &&
+           write_exact_fd(fd, &name_len, sizeof(name_len)) &&
+           write_exact_fd(fd, t.name.data(), (size_t)name_len) &&
+           write_exact_fd(fd, &type, sizeof(type)) &&
+           write_exact_fd(fd, t.ne, sizeof(t.ne)) &&
+           write_exact_fd(fd, &nbytes, sizeof(nbytes));
+}
+
+bool read_snapshot_tensor_header_fd(int fd,
+                                    Qwen35TargetShardSnapshotTensor & t) {
+    int32_t shard = -1;
+    int32_t name_len = 0;
+    uint32_t type = 0;
+    uint64_t nbytes = 0;
+    if (!read_exact_fd(fd, &shard, sizeof(shard)) ||
+        !read_exact_fd(fd, &name_len, sizeof(name_len)) ||
+        shard < 0 || name_len <= 0 || name_len >= GGML_MAX_NAME) {
+        return false;
+    }
+    std::string name((size_t)name_len, '\0');
+    if (!read_exact_fd(fd, name.data(), (size_t)name_len) ||
+        !read_exact_fd(fd, &type, sizeof(type)) ||
+        !read_exact_fd(fd, t.ne, sizeof(t.ne)) ||
+        !read_exact_fd(fd, &nbytes, sizeof(nbytes)) ||
+        nbytes > (uint64_t)std::numeric_limits<size_t>::max()) {
+        return false;
+    }
+    t.shard = shard;
+    t.name = std::move(name);
+    t.type = type;
+    t.data.clear();
+    t.data.resize((size_t)nbytes);
+    return true;
+}
+
 size_t target_shard_required_shared_bytes(int hidden, int max_tokens) {
     if (hidden <= 0 || max_tokens <= 0) return 0;
     size_t elements = 0;
@@ -412,6 +458,118 @@ bool Qwen35TargetShardIpcClient::snapshot_restore(int slot) {
     std::fprintf(cmd, "prefix_snapshot_restore %d\n", slot);
     std::fflush(cmd);
     int32_t status = -1;
+    return read_exact_fd(stream_fd, &status, sizeof(status)) && status == 0;
+#endif
+}
+
+bool Qwen35TargetShardIpcClient::snapshot_export(
+        int slot,
+        Qwen35TargetShardSnapshotData & out) {
+#if defined(_WIN32)
+    (void)slot; (void)out;
+    return false;
+#else
+    FILE * cmd = process_.command_stream();
+    const int stream_fd = process_.stream_fd();
+    if (!active_ || !cmd || stream_fd < 0 || slot < 0) return false;
+    out = Qwen35TargetShardSnapshotData{};
+    std::fprintf(cmd, "prefix_snapshot_export %d\n", slot);
+    std::fflush(cmd);
+
+    int32_t status = -1;
+    int32_t cur_pos = 0;
+    int32_t last_tok = -1;
+    int32_t shard_count = 0;
+    int32_t n_tensors = 0;
+    int32_t logits_count = 0;
+    if (!read_exact_fd(stream_fd, &status, sizeof(status)) || status != 0 ||
+        !read_exact_fd(stream_fd, &cur_pos, sizeof(cur_pos)) ||
+        !read_exact_fd(stream_fd, &last_tok, sizeof(last_tok)) ||
+        !read_exact_fd(stream_fd, &shard_count, sizeof(shard_count)) ||
+        !read_exact_fd(stream_fd, &n_tensors, sizeof(n_tensors)) ||
+        !read_exact_fd(stream_fd, &logits_count, sizeof(logits_count)) ||
+        cur_pos <= 0 || shard_count <= 0 || n_tensors <= 0 ||
+        logits_count <= 0) {
+        return false;
+    }
+
+    out.shard_count = shard_count;
+    out.cur_pos = cur_pos;
+    out.last_tok = last_tok;
+    out.tensors.resize((size_t)n_tensors);
+    for (int32_t i = 0; i < n_tensors; ++i) {
+        if (!read_snapshot_tensor_header_fd(stream_fd, out.tensors[(size_t)i]) ||
+            out.tensors[(size_t)i].shard >= shard_count) {
+            return false;
+        }
+    }
+    for (auto & t : out.tensors) {
+        if (!t.data.empty() &&
+            !read_exact_fd(stream_fd, t.data.data(), t.data.size())) {
+            return false;
+        }
+    }
+    out.logits.assign((size_t)logits_count, 0.0f);
+    return read_exact_fd(stream_fd, out.logits.data(),
+                         sizeof(float) * out.logits.size());
+#endif
+}
+
+bool Qwen35TargetShardIpcClient::snapshot_import(
+        int slot,
+        const Qwen35TargetShardSnapshotData & data) {
+#if defined(_WIN32)
+    (void)slot; (void)data;
+    return false;
+#else
+    FILE * cmd = process_.command_stream();
+    const int stream_fd = process_.stream_fd();
+    const int payload_fd = process_.payload_fd();
+    if (!active_ || !cmd || stream_fd < 0 || payload_fd < 0 || slot < 0 ||
+        data.shard_count <= 0 || data.cur_pos <= 0 ||
+        data.tensors.empty() || data.logits.empty() ||
+        data.tensors.size() > (size_t)std::numeric_limits<int32_t>::max() ||
+        data.logits.size() > (size_t)std::numeric_limits<int32_t>::max()) {
+        return false;
+    }
+    const int32_t n_tensors = (int32_t)data.tensors.size();
+    const int32_t logits_count = (int32_t)data.logits.size();
+    for (const auto & t : data.tensors) {
+        if (t.shard < 0 || t.shard >= data.shard_count ||
+            t.name.empty() || t.name.size() >= (size_t)GGML_MAX_NAME ||
+            t.data.size() > (size_t)std::numeric_limits<uint64_t>::max()) {
+            return false;
+        }
+    }
+    std::fprintf(cmd, "prefix_snapshot_import %d %d %d %d %d %d\n",
+                 slot, data.cur_pos, data.last_tok, data.shard_count,
+                 n_tensors, logits_count);
+    std::fflush(cmd);
+
+    int32_t status = -1;
+    if (!read_exact_fd(stream_fd, &status, sizeof(status)) || status != 0) {
+        return false;
+    }
+
+    for (const auto & t : data.tensors) {
+        if (!write_snapshot_tensor_header_fd(payload_fd, t)) {
+            return false;
+        }
+    }
+    if (!read_exact_fd(stream_fd, &status, sizeof(status)) || status != 0) {
+        return false;
+    }
+
+    for (const auto & t : data.tensors) {
+        if (!t.data.empty() &&
+            !write_exact_fd(payload_fd, t.data.data(), t.data.size())) {
+            return false;
+        }
+    }
+    if (!write_exact_fd(payload_fd, data.logits.data(),
+                        sizeof(float) * data.logits.size())) {
+        return false;
+    }
     return read_exact_fd(stream_fd, &status, sizeof(status)) && status == 0;
 #endif
 }

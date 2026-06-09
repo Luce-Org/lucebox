@@ -7,7 +7,9 @@
 #include "sse_emitter.h"
 #include "tool_hint.h"
 
+#ifdef DFLASH_HAS_CURL
 #include <curl/curl.h>
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -49,6 +51,7 @@ static float pflash_keep_ratio(const ServerConfig & cfg, int n_tokens) {
 }
 
 // ─── curl helpers for upstream proxy ─────────────────────────────────────
+#ifdef DFLASH_HAS_CURL
 
 struct CurlWriteCtx {
     int client_fd;
@@ -242,6 +245,7 @@ static bool curl_forward(int client_fd, const std::string & url,
     curl_easy_cleanup(curl);
     return res == CURLE_OK;
 }
+#endif // DFLASH_HAS_CURL
 
 // ─── /props constants ───────────────────────────────────────────────────
 //
@@ -770,7 +774,9 @@ HttpServer::HttpServer(ModelBackend & backend,
                    config.disk_cache_continued_interval,
                    config.disk_cache_cold_max_tokens}, backend)
 {
+    #ifdef DFLASH_HAS_CURL
     curl_global_init(CURL_GLOBAL_DEFAULT);
+    #endif
     disk_cache_.init();
     status_html_path_ = resolve_status_html();
 }
@@ -906,7 +912,9 @@ void HttpServer::sse_heartbeat() {
 
 HttpServer::~HttpServer() {
     shutdown();
+    #ifdef DFLASH_HAS_CURL
     curl_global_cleanup();
+    #endif
 }
 
 void HttpServer::shutdown() {
@@ -1857,6 +1865,7 @@ void HttpServer::worker_loop() {
         }
 
         // ── Upstream proxy: forward to remote server if configured ────
+#ifdef DFLASH_HAS_CURL
         if (!config_.pflash_upstream_base.empty()) {
             const std::string & upstream = config_.pflash_upstream_base;
             const std::string & upstream_key = config_.pflash_upstream_key;
@@ -1905,6 +1914,7 @@ void HttpServer::worker_loop() {
             finish_job();
             continue;
         }
+#endif // DFLASH_HAS_CURL
 
         // Build generate request.
         //

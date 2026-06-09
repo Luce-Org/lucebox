@@ -18,6 +18,22 @@ struct Qwen35TargetCaptureSlice {
     std::vector<float> data;
 };
 
+struct Qwen35TargetShardSnapshotTensor {
+    int shard = -1;
+    std::string name;
+    uint32_t type = 0;
+    int64_t ne[4] = {1, 1, 1, 1};
+    std::vector<uint8_t> data;
+};
+
+struct Qwen35TargetShardSnapshotData {
+    int shard_count = 0;
+    int cur_pos = 0;
+    int32_t last_tok = -1;
+    std::vector<Qwen35TargetShardSnapshotTensor> tensors;
+    std::vector<float> logits;
+};
+
 class Qwen35TargetShardIpcClient {
 public:
     Qwen35TargetShardIpcClient() = default;
@@ -59,6 +75,8 @@ public:
     bool snapshot_save(int slot);
     void snapshot_free(int slot);
     bool snapshot_restore(int slot);
+    bool snapshot_export(int slot, Qwen35TargetShardSnapshotData & out);
+    bool snapshot_import(int slot, const Qwen35TargetShardSnapshotData & data);
 
     bool active() const { return active_; }
     void close();

@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -34,6 +35,135 @@
 #endif
 
 namespace dflash::common {
+
+namespace {
+
+struct IpcSnapshotTensor {
+    int shard = -1;
+    std::string name;
+    uint32_t type = 0;
+    int64_t ne[4] = {1, 1, 1, 1};
+    uint64_t nbytes = 0;
+    ggml_tensor * tensor = nullptr;
+};
+
+bool write_snapshot_tensor_header_fd(int fd,
+                                     int shard,
+                                     const ggml_tensor * t) {
+    if (fd < 0 || shard < 0 || !t || !t->name[0]) return false;
+    const size_t name_len_size = std::strlen(t->name);
+    if (name_len_size == 0 || name_len_size >= GGML_MAX_NAME) return false;
+    const int32_t shard_i = (int32_t)shard;
+    const int32_t name_len = (int32_t)name_len_size;
+    const uint32_t type = (uint32_t)t->type;
+    const uint64_t nbytes = (uint64_t)ggml_nbytes(t);
+    return write_exact_fd(fd, &shard_i, sizeof(shard_i)) &&
+           write_exact_fd(fd, &name_len, sizeof(name_len)) &&
+           write_exact_fd(fd, t->name, (size_t)name_len) &&
+           write_exact_fd(fd, &type, sizeof(type)) &&
+           write_exact_fd(fd, t->ne, sizeof(t->ne)) &&
+           write_exact_fd(fd, &nbytes, sizeof(nbytes));
+}
+
+bool read_snapshot_tensor_header_fd(int fd, IpcSnapshotTensor & t) {
+    int32_t shard = -1;
+    int32_t name_len = 0;
+    uint32_t type = 0;
+    uint64_t nbytes = 0;
+    if (!read_exact_fd(fd, &shard, sizeof(shard)) ||
+        !read_exact_fd(fd, &name_len, sizeof(name_len)) ||
+        shard < 0 || name_len <= 0 || name_len >= GGML_MAX_NAME) {
+        return false;
+    }
+    std::string name((size_t)name_len, '\0');
+    if (!read_exact_fd(fd, name.data(), (size_t)name_len) ||
+        !read_exact_fd(fd, &type, sizeof(type)) ||
+        !read_exact_fd(fd, t.ne, sizeof(t.ne)) ||
+        !read_exact_fd(fd, &nbytes, sizeof(nbytes))) {
+        return false;
+    }
+    t.shard = shard;
+    t.name = std::move(name);
+    t.type = type;
+    t.nbytes = nbytes;
+    return true;
+}
+
+bool drain_exact_fd(int fd, uint64_t bytes) {
+    if (fd < 0) return false;
+    std::vector<uint8_t> tmp(4 * 1024 * 1024);
+    uint64_t done = 0;
+    while (done < bytes) {
+        const size_t chunk = (size_t)std::min<uint64_t>(
+            (uint64_t)tmp.size(), bytes - done);
+        if (!read_exact_fd(fd, tmp.data(), chunk)) {
+            return false;
+        }
+        done += chunk;
+    }
+    return true;
+}
+
+bool bind_snapshot_tensor(PrefixSnapshot & snap,
+                          const TargetCache & cache,
+                          ggml_tensor * tensor) {
+    if (!tensor || !tensor->name[0]) return false;
+    int idx = -1;
+    if (std::sscanf(tensor->name, "snap_cache_k_%d", &idx) == 1 &&
+        idx >= 0 && idx < (int)snap.attn_k_snap.size()) {
+        snap.attn_k_snap[(size_t)idx] = tensor;
+        return true;
+    }
+    if (std::sscanf(tensor->name, "snap_cache_v_%d", &idx) == 1 &&
+        idx >= 0 && idx < (int)snap.attn_v_snap.size()) {
+        snap.attn_v_snap[(size_t)idx] = tensor;
+        return true;
+    }
+    if (std::sscanf(tensor->name, "snap_ssm_state_%d", &idx) == 1 &&
+        idx >= 0 && idx < (int)snap.ssm_state_snap.size()) {
+        snap.ssm_state_snap[(size_t)idx] = tensor;
+        return true;
+    }
+    if (std::sscanf(tensor->name, "snap_conv_state_%d", &idx) == 1 &&
+        idx >= 0 && idx < (int)snap.conv_state_snap.size()) {
+        snap.conv_state_snap[(size_t)idx] = tensor;
+        return true;
+    }
+    if (std::strcmp(tensor->name, "snap_target_feat") == 0) {
+        snap.target_feat_snap = tensor;
+        return cache.target_feat != nullptr;
+    }
+    return false;
+}
+
+bool validate_snapshot_tensors(const PrefixSnapshot & snap,
+                               const TargetCache & cache) {
+    for (size_t i = 0; i < snap.attn_k_snap.size(); ++i) {
+        const bool cache_has_kv =
+            (i < cache.attn_k.size() && cache.attn_k[i]) ||
+            (i < cache.attn_v.size() && cache.attn_v[i]);
+        if (cache_has_kv) {
+            if (i >= snap.attn_v_snap.size() ||
+                !snap.attn_k_snap[i] || !snap.attn_v_snap[i]) {
+                return false;
+            }
+        }
+    }
+    for (size_t i = 0; i < snap.ssm_state_snap.size(); ++i) {
+        const bool cache_has_state =
+            (i < cache.ssm_state.size() && cache.ssm_state[i]) ||
+            (i < cache.conv_state.size() && cache.conv_state[i]);
+        if (cache_has_state) {
+            if (i >= snap.conv_state_snap.size() ||
+                !snap.ssm_state_snap[i] || !snap.conv_state_snap[i]) {
+                return false;
+            }
+        }
+    }
+    return !cache.target_feat || snap.target_feat_snap;
+}
+
+}  // namespace
 
 int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                                        const std::vector<int> & gpus,
@@ -461,6 +591,232 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                 }
                 if (ok) {
                     prefill_last_logits = snapshot_logits[(size_t)slot];
+                }
+                stream_status(stream_fd, ok ? 0 : -1);
+                continue;
+            }
+            if (cmd == "prefix_snapshot_export") {
+                int slot = -1;
+                iss >> slot;
+                bool ok = prefix_slot_used(slot);
+                std::vector<std::pair<int, ggml_tensor *>> tensors;
+                int32_t cur_pos = 0;
+                int32_t last_tok = -1;
+                if (ok) {
+                    const auto & snaps = prefix_snapshots[(size_t)slot];
+                    cur_pos = snaps.front().cur_pos;
+                    last_tok = snaps.front().last_tok;
+                    for (size_t shard_idx = 0; shard_idx < snaps.size(); ++shard_idx) {
+                        const auto & snap = snaps[shard_idx];
+                        for (ggml_tensor * t = ggml_get_first_tensor(snap.ctx); t;
+                             t = ggml_get_next_tensor(snap.ctx, t)) {
+                            tensors.push_back({(int)shard_idx, t});
+                        }
+                    }
+                    ok = !tensors.empty() &&
+                         !snapshot_logits[(size_t)slot].empty() &&
+                         tensors.size() <= (size_t)std::numeric_limits<int32_t>::max() &&
+                         snapshot_logits[(size_t)slot].size() <=
+                             (size_t)std::numeric_limits<int32_t>::max();
+                }
+                if (!ok) {
+                    stream_status(stream_fd, -1);
+                    continue;
+                }
+
+                const int32_t status = 0;
+                const int32_t shard_count = (int32_t)shards.size();
+                const int32_t n_tensors = (int32_t)tensors.size();
+                const int32_t logits_count =
+                    (int32_t)snapshot_logits[(size_t)slot].size();
+                ok = write_exact_fd(stream_fd, &status, sizeof(status)) &&
+                     write_exact_fd(stream_fd, &cur_pos, sizeof(cur_pos)) &&
+                     write_exact_fd(stream_fd, &last_tok, sizeof(last_tok)) &&
+                     write_exact_fd(stream_fd, &shard_count, sizeof(shard_count)) &&
+                     write_exact_fd(stream_fd, &n_tensors, sizeof(n_tensors)) &&
+                     write_exact_fd(stream_fd, &logits_count, sizeof(logits_count));
+                for (const auto & entry : tensors) {
+                    ok = ok && write_snapshot_tensor_header_fd(
+                        stream_fd, entry.first, entry.second);
+                }
+                std::vector<uint8_t> tmp(4 * 1024 * 1024);
+                for (const auto & entry : tensors) {
+                    ggml_tensor * t = entry.second;
+                    const size_t nbytes = ggml_nbytes(t);
+                    size_t offset = 0;
+                    while (ok && offset < nbytes) {
+                        const size_t chunk = std::min(tmp.size(), nbytes - offset);
+                        ggml_backend_tensor_get(t, tmp.data(), offset, chunk);
+                        ok = write_exact_fd(stream_fd, tmp.data(), chunk);
+                        offset += chunk;
+                    }
+                }
+                const auto & logits = snapshot_logits[(size_t)slot];
+                ok = ok && write_exact_fd(stream_fd, logits.data(),
+                                          sizeof(float) * logits.size());
+                if (!ok) break;
+                continue;
+            }
+            if (cmd == "prefix_snapshot_import") {
+                int slot = -1;
+                int cur_pos = 0;
+                int last_tok = -1;
+                int shard_count = 0;
+                int n_tensors = 0;
+                int logits_count = 0;
+                iss >> slot >> cur_pos >> last_tok >> shard_count >>
+                    n_tensors >> logits_count;
+                bool ok = payload_fd >= 0 &&
+                          slot >= 0 && slot < ModelBackend::kMaxSlots &&
+                          cur_pos > 0 &&
+                          shard_count == (int)shards.size() &&
+                          n_tensors > 0 &&
+                          logits_count > 0;
+                if (!stream_status(stream_fd, ok ? 0 : -1)) break;
+                if (!ok) {
+                    continue;
+                }
+
+                std::vector<IpcSnapshotTensor> table;
+                table.resize((size_t)n_tensors);
+                std::vector<int> tensor_counts(shards.size(), 0);
+                uint64_t payload_bytes = 0;
+                bool headers_read = true;
+                for (int i = 0; i < n_tensors; ++i) {
+                    auto & entry = table[(size_t)i];
+                    if (!read_snapshot_tensor_header_fd(payload_fd, entry)) {
+                        headers_read = false;
+                        ok = false;
+                        break;
+                    }
+                    const bool valid =
+                        entry.shard >= 0 &&
+                        entry.shard < shard_count &&
+                        entry.nbytes <=
+                            (uint64_t)std::numeric_limits<size_t>::max() &&
+                        payload_bytes <=
+                            std::numeric_limits<uint64_t>::max() -
+                                entry.nbytes;
+                    if (!valid) {
+                        ok = false;
+                        continue;
+                    }
+                    tensor_counts[(size_t)entry.shard]++;
+                    payload_bytes += entry.nbytes;
+                }
+                if (!headers_read) break;
+                ok = ok && payload_bytes <=
+                               std::numeric_limits<uint64_t>::max() -
+                                   (uint64_t)logits_count * sizeof(float);
+                payload_bytes += (uint64_t)logits_count * sizeof(float);
+                for (int count : tensor_counts) {
+                    if (count <= 0) ok = false;
+                }
+                if (!stream_status(stream_fd, ok ? 0 : -1)) break;
+                if (!ok) {
+                    continue;
+                }
+
+                std::vector<PrefixSnapshot> imported;
+                if (ok) {
+                    imported.resize(shards.size());
+                    for (size_t shard_idx = 0; ok && shard_idx < shards.size(); ++shard_idx) {
+                        auto & snap = imported[shard_idx];
+                        snap.attn_k_snap.assign(shards[shard_idx].cache.attn_k.size(), nullptr);
+                        snap.attn_v_snap.assign(shards[shard_idx].cache.attn_v.size(), nullptr);
+                        snap.ssm_state_snap.assign(shards[shard_idx].cache.ssm_state.size(), nullptr);
+                        snap.conv_state_snap.assign(shards[shard_idx].cache.conv_state.size(), nullptr);
+                        snap.target_feat_snap = nullptr;
+                        snap.cur_pos = cur_pos;
+                        snap.last_tok = last_tok;
+                        snap.kv_k_type = shards[shard_idx].cache.kv_k_type;
+                        snap.max_ctx = shards[shard_idx].cache.max_ctx;
+                        snap.target_feat_cap = shards[shard_idx].cache.target_feat_cap;
+
+                        ggml_init_params ip{};
+                        ip.mem_size =
+                            ggml_tensor_overhead() *
+                            (size_t)(tensor_counts[shard_idx] + 16);
+                        ip.no_alloc = true;
+                        snap.ctx = ggml_init(ip);
+                        ok = snap.ctx != nullptr;
+                    }
+                    for (auto & entry : table) {
+                        if (!ok) break;
+                        PrefixSnapshot & snap = imported[(size_t)entry.shard];
+                        ggml_tensor * t = ggml_new_tensor(
+                            snap.ctx, (ggml_type)entry.type, 4, entry.ne);
+                        if (!t || ggml_nbytes(t) != (size_t)entry.nbytes) {
+                            ok = false;
+                            break;
+                        }
+                        ggml_set_name(t, entry.name.c_str());
+                        entry.tensor = t;
+                        ok = bind_snapshot_tensor(
+                            snap, shards[(size_t)entry.shard].cache, t);
+                    }
+                    for (size_t shard_idx = 0; ok && shard_idx < shards.size(); ++shard_idx) {
+                        auto & snap = imported[shard_idx];
+                        snap.buf = ggml_backend_alloc_ctx_tensors(
+                            snap.ctx, snapshot_backends[shard_idx]);
+                        ok = snap.buf != nullptr;
+                    }
+                }
+
+                std::vector<uint8_t> tmp(4 * 1024 * 1024);
+                uint64_t consumed_payload_bytes = 0;
+                bool payload_read = true;
+                if (ok) {
+                    for (auto & entry : table) {
+                        size_t offset = 0;
+                        const size_t nbytes = (size_t)entry.nbytes;
+                        while (ok && offset < nbytes) {
+                            const size_t chunk = std::min(tmp.size(), nbytes - offset);
+                            if (!read_exact_fd(payload_fd, tmp.data(), chunk)) {
+                                payload_read = false;
+                                ok = false;
+                                break;
+                            }
+                            ggml_backend_tensor_set(
+                                entry.tensor, tmp.data(), offset, chunk);
+                            offset += chunk;
+                            consumed_payload_bytes += chunk;
+                        }
+                    }
+                }
+                if (!payload_read) break;
+
+                std::vector<float> imported_logits;
+                if (ok) {
+                    imported_logits.assign((size_t)logits_count, 0.0f);
+                    const size_t logits_bytes =
+                        sizeof(float) * imported_logits.size();
+                    if (!read_exact_fd(payload_fd, imported_logits.data(),
+                                       logits_bytes)) {
+                        payload_read = false;
+                        ok = false;
+                    } else {
+                        consumed_payload_bytes += (uint64_t)logits_bytes;
+                    }
+                }
+                if (!payload_read) break;
+                for (size_t shard_idx = 0; ok && shard_idx < shards.size(); ++shard_idx) {
+                    ok = validate_snapshot_tensors(
+                        imported[shard_idx], shards[shard_idx].cache);
+                }
+                if (ok) {
+                    free_prefix_slot(slot);
+                    prefix_snapshots[(size_t)slot] = std::move(imported);
+                    snapshot_logits[(size_t)slot] = std::move(imported_logits);
+                } else {
+                    for (auto & snap : imported) {
+                        free_prefix_snapshot(snap);
+                    }
+                    if (consumed_payload_bytes < payload_bytes) {
+                        const bool drained = drain_exact_fd(
+                            payload_fd, payload_bytes - consumed_payload_bytes);
+                        if (!drained) break;
+                    }
                 }
                 stream_status(stream_fd, ok ? 0 : -1);
                 continue;

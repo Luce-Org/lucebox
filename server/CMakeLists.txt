@@ -721,34 +721,34 @@ if(DFLASH27B_TESTS)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/server/server_main.cpp")
         find_package(CURL QUIET)
         if(NOT CURL_FOUND)
-            message(WARNING "CURL not found — skipping dflash_server (passthrough proxy disabled)")
+            message(WARNING "CURL not found — building dflash_server without passthrough proxy")
+        endif()
+        add_executable(dflash_server
+            src/server/server_main.cpp
+            src/server/http_server.cpp
+            src/server/model_card.cpp
+        )
+        target_include_directories(dflash_server PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(dflash_server PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
         else()
-            add_executable(dflash_server
-                src/server/server_main.cpp
-                src/server/http_server.cpp
-                src/server/model_card.cpp
-            )
-            target_include_directories(dflash_server PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-            if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
-                target_compile_definitions(dflash_server PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
-            else()
-                target_compile_definitions(dflash_server PRIVATE
-                    DFLASH27B_BACKEND_CUDA=1
-                    DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
-            endif()
-            target_link_libraries(dflash_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread CURL::libcurl)
-            if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-                find_package(CUDAToolkit REQUIRED)
-                target_link_libraries(dflash_server PRIVATE CUDA::cudart)
-            else()
-                target_link_libraries(dflash_server PRIVATE hip::host)
-            endif()
+            target_compile_definitions(dflash_server PRIVATE
+                DFLASH27B_BACKEND_CUDA=1
+                DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
+        endif()
+        target_link_libraries(dflash_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread)
+        if(CURL_FOUND)
+            target_compile_definitions(dflash_server PRIVATE DFLASH_HAS_CURL=1)
+            target_link_libraries(dflash_server PRIVATE CURL::libcurl)
+        endif()
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(dflash_server PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(dflash_server PRIVATE hip::host)
         endif()
 
         # Copy share/status.html next to the binary so it can be found at runtime.
-        # Guard on the target: dflash_server is skipped when CURL is absent
-        # (e.g. CI without libcurl-dev), and referencing a missing target in
-        # add_custom_command/install is a hard CMake configure error.
         if(TARGET dflash_server)
             add_custom_command(TARGET dflash_server POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory
