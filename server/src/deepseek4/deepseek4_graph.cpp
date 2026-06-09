@@ -264,8 +264,8 @@ static ggml_tensor * build_indexer_score(
     // Weight each head's contribution: dots[n_indexer_head, n_comp] * weights[n_indexer_head, 1]
     ggml_tensor * weight_rep = ggml_repeat(ctx, head_weights, dots);
     ggml_tensor * weighted = ggml_mul(ctx, dots, weight_rep);
-    // Sum across heads → [1, n_comp]
-    ggml_tensor * scores = ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, weighted)));
+    // Sum across heads (ne[0]) → [1, n_comp]
+    ggml_tensor * scores = ggml_sum_rows(ctx, weighted);
     scores = ggml_cont(ctx, scores);
     scores = ggml_reshape_2d(ctx, scores, n_comp, 1);
 
