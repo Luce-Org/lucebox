@@ -608,14 +608,17 @@ static bool deepseek4_step_hybrid(
             ggml_tensor * ffn_out = build_shared_ffn(ctx, ffn_post, w, L);
             ggml_tensor * next = ggml_add(ctx, residual, ffn_out);
             ggml_build_forward_expand(gf, next);
+            fprintf(stderr, "[ds4] layer %d graph built (%d nodes), allocating...\n", il, ggml_graph_n_nodes(gf));
             ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
             if (!ggml_gallocr_alloc_graph(alloc, gf)) {
+                fprintf(stderr, "[ds4] layer %d alloc failed\n", il);
                 ggml_gallocr_free(alloc);
                 ggml_free(ctx);
                 if (hot_alloc) ggml_gallocr_free(hot_alloc);
                 if (cold_alloc) ggml_gallocr_free(cold_alloc);
                 return false;
             }
+            fprintf(stderr, "[ds4] layer %d alloc OK, computing...\n", il);
             ggml_backend_tensor_set(inp, cur.data(), 0, sizeof(float) * cur.size());
             for (const DeepSeek4I32InputBinding & binding : i32_inputs) {
                 ggml_backend_tensor_set(binding.tensor, &binding.value, 0, sizeof(binding.value));
