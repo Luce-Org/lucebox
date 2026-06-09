@@ -76,6 +76,10 @@ public:
 
     bool disabled() const { return config_.cache_dir.empty(); }
 
+    // True when a layout is known AND not pending live-model verification.
+    // False means either no layout or layout_from_disk_ is still set.
+    bool layout_verified() const { return layout_known_ && !layout_from_disk_; }
+
     // Initialize: create directory, scan existing files, learn layout from
     // first available snapshot. Returns false on fatal error.
     bool init();
@@ -83,6 +87,16 @@ public:
     // Look up a prompt on disk. On hit, loads the snapshot into `out_slot`
     // using backend.snapshot_adopt(). Returns true if loaded successfully.
     bool lookup(const std::vector<int32_t> & prompt_ids, int slot);
+
+    // Look up the longest boundary-prefix that exists on disk.
+    // Iterates `boundaries` (ascending token counts), hashes each prefix of
+    // `effective_prompt`, and returns {true, boundary_len} for the longest hit.
+    // Returns {false, 0} on miss. Mirrors in-memory PrefixCache::lookup() semantics.
+    // On hit, loads the snapshot into `slot` via snapshot_adopt.
+    std::pair<bool, int> lookup_boundary_prefix(
+        const std::vector<int32_t> & effective_prompt,
+        const std::vector<int> & boundaries,
+        int slot);
 
     // Save the snapshot in `slot` to disk, keyed by prompt_ids.
     // Returns true on success.
@@ -116,6 +130,9 @@ public:
 
     // Get the continued-interval setting.
     int continued_interval() const { return config_.continued_interval; }
+
+    // Get the min-tokens threshold (for cross-session anchor saves).
+    int min_tokens() const { return config_.min_tokens; }
 
     // Learn the layout fingerprint from a live snapshot (call once after
     // first snapshot_save, before any disk operations).
@@ -153,6 +170,10 @@ private:
     void compute_layout_id(ggml_context * ctx);
     void scan_directory();
     void try_learn_from_disk();
+    // If layout was loaded from disk (layout_from_disk_==true), verify it
+    // against the live model layout via backend_.snapshot_layout_ctx().
+    // Clears layout_from_disk_ on match; invalidates on mismatch.
+    void verify_layout_at_init();
     std::string make_path(const PrefixHash & hash) const;
     int find_entry(const PrefixHash & hash) const;
 

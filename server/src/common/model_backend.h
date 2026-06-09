@@ -229,6 +229,13 @@ struct ModelBackend {
     // Returns empty ref (ctx==nullptr) if slot is invalid or unused.
     virtual SnapshotRef snapshot_ref(int slot) const { (void)slot; return {}; }
 
+    // Return a lightweight ggml_context containing tensors with the same names,
+    // types, and shapes as a real snapshot — but with no_alloc=true (no data).
+    // Used by DiskPrefixCache::verify_layout_at_init() to verify the disk-loaded
+    // layout fingerprint against the live model before the first request.
+    // Caller must ggml_free() the returned context. Returns nullptr if not supported.
+    virtual ggml_context * snapshot_layout_ctx() const { return nullptr; }
+
     // Import a deserialized snapshot into the given slot. Backend takes
     // ownership of ctx and buf on success. On failure (returns false),
     // the caller is responsible for freeing ctx and buf.

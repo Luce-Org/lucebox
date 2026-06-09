@@ -105,6 +105,7 @@ public:
     bool snapshot_adopt(int slot, ggml_context * ctx,
                         ggml_backend_buffer_t buf, int cur_pos,
                         int32_t last_tok = -1) override;
+    ggml_context * snapshot_layout_ctx() const override;
 
     CompressResult compress(const CompressRequest & req) override;
     bool handle_compress(const std::string & line,

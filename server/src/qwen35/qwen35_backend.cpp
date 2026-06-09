@@ -377,6 +377,59 @@ ModelBackend::SnapshotRef Qwen35Backend::snapshot_ref(int slot) const {
     return ref;
 }
 
+ggml_context * Qwen35Backend::snapshot_layout_ctx() const {
+    const int n_full_attn = (int)cache_.attn_k.size();
+    const int n_delta     = (int)cache_.ssm_state.size();
+    if (n_full_attn <= 0 || n_delta <= 0) return nullptr;
+    if (cache_.attn_k.empty() || !cache_.attn_k[0]) return nullptr;
+    if (cache_.ssm_state.empty() || !cache_.ssm_state[0]) return nullptr;
+
+    // One layout-ctx tensor per snapshot tensor: 2*n_full_attn KV + 2*n_delta
+    // SSM/conv + 1 target_feat (if present). Mirrors snapshot_target_cache().
+    const int n_tensors = n_full_attn * 2 + n_delta * 2 + (cache_.target_feat ? 1 : 0);
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * (size_t)(n_tensors + 4) + 4096;
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return nullptr;
+
+    char name[64];
+
+    // KV tensors (full-attn layers): "snap_cache_k_N" / "snap_cache_v_N".
+    // ggml_dup_tensor preserves type + shape; compute_layout_id normalises
+    // ne[1]=1 so max_ctx vs snap_pos is irrelevant to the fingerprint.
+    for (int i = 0; i < n_full_attn; ++i) {
+        if (!cache_.attn_k[i] || !cache_.attn_v[i]) { ggml_free(ctx); return nullptr; }
+        ggml_tensor * k = ggml_dup_tensor(ctx, cache_.attn_k[i]);
+        std::snprintf(name, sizeof(name), "snap_cache_k_%d", i);
+        ggml_set_name(k, name);
+        ggml_tensor * v = ggml_dup_tensor(ctx, cache_.attn_v[i]);
+        std::snprintf(name, sizeof(name), "snap_cache_v_%d", i);
+        ggml_set_name(v, name);
+    }
+
+    // SSM/conv tensors (delta-net layers): "snap_ssm_state_N" / "snap_conv_state_N".
+    // Snapshot uses full-size copies (same shape as live cache tensors).
+    for (int i = 0; i < n_delta; ++i) {
+        if (!cache_.ssm_state[i] || !cache_.conv_state[i]) { ggml_free(ctx); return nullptr; }
+        ggml_tensor * s = ggml_dup_tensor(ctx, cache_.ssm_state[i]);
+        std::snprintf(name, sizeof(name), "snap_ssm_state_%d", i);
+        ggml_set_name(s, name);
+        ggml_tensor * c = ggml_dup_tensor(ctx, cache_.conv_state[i]);
+        std::snprintf(name, sizeof(name), "snap_conv_state_%d", i);
+        ggml_set_name(c, name);
+    }
+
+    // target_feat (optional): "snap_target_feat".
+    // ne[1] is normalised away by compute_layout_id, so live cap == snap feat_len.
+    if (cache_.target_feat) {
+        ggml_tensor * tf = ggml_dup_tensor(ctx, cache_.target_feat);
+        ggml_set_name(tf, "snap_target_feat");
+    }
+
+    return ctx;
+}
+
 bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
                                    ggml_backend_buffer_t buf, int cur_pos,
                                    int32_t last_tok) {

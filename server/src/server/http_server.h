@@ -24,6 +24,7 @@
 #include "common/pflash_drafter_ipc.h"
 #include "model_card.h"
 #include "adaptive_keep_ratio.h"
+#include "freeze_history.h"
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -306,6 +307,25 @@ private:
 
     // Track prompt tokens for each snapshot slot (for shutdown save).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
+
+    // FlowKV freeze-history: per-message compression cache.
+    // Key: SHA-1 hash of the drafter-token slice for an aged message.
+    // Value: compressed content text (output of drafter_tokenizer_->decode).
+    // Bounded to kFrozenCacheMax entries; cleared on overflow (simple eviction).
+    static constexpr size_t kFrozenCacheMax = 256;
+    struct PrefixHashEqual {
+        bool operator()(const PrefixHash & a, const PrefixHash & b) const { return a == b; }
+    };
+    struct PrefixHashHasher {
+        size_t operator()(const PrefixHash & h) const {
+            size_t v = 0;
+            for (size_t i = 0; i < h.size(); ++i)
+                v ^= (size_t)h[i] << ((i % sizeof(size_t)) * 8);
+            return v;
+        }
+    };
+    std::unordered_map<PrefixHash, std::string,
+                       PrefixHashHasher, PrefixHashEqual> frozen_content_cache_;
 
     // Worker thread.
     std::thread                     worker_thread_;

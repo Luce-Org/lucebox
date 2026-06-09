@@ -894,6 +894,29 @@ ModelBackend::SnapshotRef Qwen3Backend::snapshot_ref(int slot) const {
     return ref;
 }
 
+ggml_context * Qwen3Backend::snapshot_layout_ctx() const {
+    const int n_layer = cache_.n_layer;
+    if (n_layer <= 0 || cache_.k.empty() || !cache_.k[0]) return nullptr;
+
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * (size_t)(n_layer * 2 + 4) + 4096;
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return nullptr;
+
+    for (int il = 0; il < n_layer; ++il) {
+        if (!cache_.k[il] || !cache_.v[il]) { ggml_free(ctx); return nullptr; }
+        char name[64];
+        ggml_tensor * k = ggml_dup_tensor(ctx, cache_.k[il]);
+        std::snprintf(name, sizeof(name), "snap_k_%d", il);
+        ggml_set_name(k, name);
+        ggml_tensor * v = ggml_dup_tensor(ctx, cache_.v[il]);
+        std::snprintf(name, sizeof(name), "snap_v_%d", il);
+        ggml_set_name(v, name);
+    }
+    return ctx;
+}
+
 bool Qwen3Backend::snapshot_adopt(int slot, ggml_context * ctx,
                                   ggml_backend_buffer_t buf, int cur_pos,
                                   int32_t /*last_tok*/) {

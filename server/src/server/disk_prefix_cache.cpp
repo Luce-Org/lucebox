@@ -129,13 +129,20 @@ bool DiskPrefixCache::init() {
         return false;
     }
 
-    // Try to learn layout from existing files (enables first-request disk hits).
+    // Try to learn layout from existing files.
     try_learn_from_disk();
 
-    std::fprintf(stderr, "[disk-cache] initialized dir=%s budget=%.1f GB layout=%s\n",
+    // If we got a layout from disk, verify it against the live model now so
+    // the first request can hit the disk cache without waiting for a save.
+    if (layout_from_disk_) {
+        verify_layout_at_init();
+    }
+
+    std::fprintf(stderr, "[disk-cache] initialized dir=%s budget=%.1f GB layout=%s%s\n",
                  config_.cache_dir.c_str(),
                  (double)config_.budget_bytes / (1024.0 * 1024.0 * 1024.0),
-                 layout_known_ ? hex(layout_id_.data(), 16).c_str() : "pending");
+                 layout_known_ ? hex(layout_id_.data(), 16).c_str() : "pending",
+                 layout_from_disk_ ? " (unverified)" : "");
     return true;
 }
 
@@ -302,6 +309,42 @@ void DiskPrefixCache::try_learn_from_disk() {
     closedir(dir);
 }
 
+// ─── Verify disk layout against live model at init ──────────────────────
+
+void DiskPrefixCache::verify_layout_at_init() {
+    // Only meaningful when we have an unverified disk layout.
+    if (!layout_from_disk_) return;
+
+    ggml_context * live_ctx = backend_.snapshot_layout_ctx();
+    if (!live_ctx) {
+        // Backend doesn't support layout introspection — leave layout_from_disk_
+        // set; first save will call learn_layout() as before.
+        std::fprintf(stderr, "[disk-cache] verify_layout_at_init: backend returned no layout ctx, deferring\n");
+        return;
+    }
+
+    std::array<uint8_t, 16> disk_id = layout_id_;
+    compute_layout_id(live_ctx);
+    ggml_free(live_ctx);
+
+    if (std::memcmp(disk_id.data(), layout_id_.data(), 16) == 0) {
+        // Live model matches disk layout — safe to serve from disk immediately.
+        layout_from_disk_ = false;
+        std::fprintf(stderr, "[disk-cache] layout verified at init: %s (disk entries ready)\n",
+                     hex(layout_id_.data(), 16).c_str());
+    } else {
+        // Model changed — invalidate stale entries.
+        std::fprintf(stderr, "[disk-cache] layout mismatch at init: disk=%s model=%s — invalidating\n",
+                     hex(disk_id.data(), 16).c_str(),
+                     hex(layout_id_.data(), 16).c_str());
+        entries_.clear();
+        total_bytes_ = 0;
+        layout_known_ = false;
+        layout_from_disk_ = false;
+        layout_dir_.clear();
+    }
+}
+
 // ─── Lookup ─────────────────────────────────────────────────────────────
 
 bool DiskPrefixCache::lookup(const std::vector<int32_t> & prompt_ids, int slot) {
@@ -408,6 +451,49 @@ bool DiskPrefixCache::save(int slot, const std::vector<int32_t> & prompt_ids) {
 
     enforce_budget();
     return true;
+}
+
+// ─── Boundary-prefix lookup ─────────────────────────────────────────────
+
+std::pair<bool, int> DiskPrefixCache::lookup_boundary_prefix(
+        const std::vector<int32_t> & effective_prompt,
+        const std::vector<int> & boundaries,
+        int slot) {
+    if (disabled() || !layout_known_ || layout_from_disk_) return {false, 0};
+    if (boundaries.empty()) return {false, 0};
+
+    // Find the longest boundary-prefix that exists on disk, mirroring
+    // PrefixCache::lookup() which iterates all boundaries and keeps the max.
+    std::lock_guard<std::mutex> lock(mu_);
+    int best_len = 0;
+    int best_idx = -1;
+
+    for (int cut : boundaries) {
+        if (cut <= 0 || cut > (int)effective_prompt.size()) continue;
+        PrefixHash hash = hash_prefix(effective_prompt.data(), cut);
+        int idx = find_entry(hash);
+        if (idx >= 0 && cut > best_len) {
+            best_len = cut;
+            best_idx = idx;
+        }
+    }
+
+    if (best_idx < 0) return {false, 0};
+
+    auto & entry = entries_[best_idx];
+    if (!read_file(entry.path, slot)) {
+        // Corrupt file — evict.
+        std::remove(entry.path.c_str());
+        total_bytes_ -= entry.file_size;
+        entries_.erase(entries_.begin() + best_idx);
+        return {false, 0};
+    }
+
+    entry.last_used = now_unix();
+    entry.hits++;
+    std::fprintf(stderr, "[disk-cache] boundary-prefix hit boundary=%d (of %zu total)\n",
+                 best_len, effective_prompt.size());
+    return {true, best_len};
 }
 
 // ─── Continued checkpoints ──────────────────────────────────────────────
