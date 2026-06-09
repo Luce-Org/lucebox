@@ -569,6 +569,7 @@ static bool deepseek4_step_hybrid(
     ggml_gallocr_t cold_alloc = nullptr;
 
     for (int il = 0; il < w.n_layer; ++il) {
+        fprintf(stderr, "[ds4] layer %d/%d start (n_tokens=%d)\n", il, w.n_layer, n_tokens);
         const DeepSeek4Layer & L = w.layers[(size_t) il];
         DeepSeek4LayerCache & lc = cache.layers[(size_t) il];
         const size_t ctx_size = 48 * 1024 * 1024;
@@ -618,6 +619,7 @@ static bool deepseek4_step_hybrid(
                 ggml_backend_tensor_set(binding.tensor, &binding.value, 0, sizeof(binding.value));
             }
             const bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+            fprintf(stderr, "[ds4] layer %d hash-ffn compute %s\n", il, ok ? "OK" : "FAIL");
             if (ok) {
                 ggml_backend_tensor_get(next, cur.data(), 0, sizeof(float) * cur.size());
             }
@@ -649,7 +651,9 @@ static bool deepseek4_step_hybrid(
         for (const DeepSeek4I32InputBinding & binding : i32_inputs) {
             ggml_backend_tensor_set(binding.tensor, &binding.value, 0, sizeof(binding.value));
         }
+        fprintf(stderr, "[ds4] layer %d moe graph compute...\n", il);
         const bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+        fprintf(stderr, "[ds4] layer %d moe compute %s\n", il, ok ? "OK" : "FAIL");
         if (!ok) {
             ggml_gallocr_free(alloc);
             ggml_free(ctx);
