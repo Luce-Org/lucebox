@@ -347,25 +347,32 @@ static ggml_tensor * build_mla_attention(
         ctx, cur, n_embd, 1, cur->nb[1], (size_t)(n_tokens - 1) * cur->nb[1]);
     ggml_tensor * qr_last = ggml_view_2d(
         ctx, qr, n_lora_q, 1, qr->nb[1], (size_t)(n_tokens - 1) * qr->nb[1]);
-    build_compressor_step(ctx, gf, cur_last,
-                          L.attn_compressor_ape,
-                          L.attn_compressor_kv,
-                          L.attn_compressor_gate,
-                          L.attn_compressor_norm,
-                          lc.attn_compressor,
-                          lc.comp_kv,
-                          ratio,
-                          head_dim,
-                          token_pos,
-                          w.n_rot,
-                          w.rms_eps,
-                          w.compress_rope_freq_base,
-                          i32_inputs);
+    if (ratio > 0 && L.attn_compressor_kv) {
+        fprintf(stderr, "[ds4] layer %d: compressor step (ratio=%d, pos=%d)...\n", layer_idx, ratio, token_pos);
+        build_compressor_step(ctx, gf, cur_last,
+                              L.attn_compressor_ape,
+                              L.attn_compressor_kv,
+                              L.attn_compressor_gate,
+                              L.attn_compressor_norm,
+                              lc.attn_compressor,
+                              lc.comp_kv,
+                              ratio,
+                              head_dim,
+                              token_pos,
+                              w.n_rot,
+                              w.rms_eps,
+                              w.compress_rope_freq_base,
+                              i32_inputs);
+        fprintf(stderr, "[ds4] layer %d: compressor done\n", layer_idx);
+    }
 
     ggml_tensor * allowed_comp = nullptr;
-    if (ratio == 4) {
+    if (ratio == 4 && L.indexer_compressor_kv) {
+        fprintf(stderr, "[ds4] layer %d: indexer compressor step...\n", layer_idx);
         build_indexer_compressor_step(ctx, gf, cur_last, w, L, lc, token_pos, i32_inputs);
+        fprintf(stderr, "[ds4] layer %d: indexer score...\n", layer_idx);
         allowed_comp = build_indexer_score(ctx, qr_last, cur_last, w, L, lc, token_pos, i32_inputs);
+        fprintf(stderr, "[ds4] layer %d: indexer done (comp=%p)\n", layer_idx, (void*)allowed_comp);
     }
 
     // ── Attention: placeholder dense path + DS4 selective compressed context ──
