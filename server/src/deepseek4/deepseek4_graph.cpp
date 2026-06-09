@@ -400,14 +400,18 @@ static ggml_tensor * build_mla_attention(
                             rope_freq, rope_scale, rope_ext, rope_attn,
                             w.rope_yarn_beta_fast, w.rope_yarn_beta_slow);
 
-    // ── Store newest KV row in the raw SWA ring ─────────────────────
+    // ── Store ALL KV rows in the raw SWA ring ─────────────────────
+    // For decode (n_tokens=1): write single row. For prefill: write all rows.
+    for (int ti = 0; ti < n_tokens; ti++) {
+        const int pos_ti = kv_start + ti;
+        ggml_tensor * kv_row = ggml_view_2d(
+            ctx, kv, head_dim, 1, kv->nb[1], (size_t)ti * kv->nb[1]);
+        ggml_tensor * kv_slot = ggml_view_2d(
+            ctx, lc.raw_kv, head_dim, 1, lc.raw_kv->nb[1],
+            (size_t)(pos_ti % w.n_swa) * lc.raw_kv->nb[1]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_cast(ctx, kv_row, GGML_TYPE_F16), kv_slot));
+    }
     const int token_pos = kv_start + n_tokens - 1;
-    ggml_tensor * kv_last = ggml_view_2d(
-        ctx, kv, head_dim, 1, kv->nb[1], (size_t)(n_tokens - 1) * kv->nb[1]);
-    ggml_tensor * kv_slot = ggml_view_2d(
-        ctx, lc.raw_kv, head_dim, 1, lc.raw_kv->nb[1],
-        (size_t)(token_pos % w.n_swa) * lc.raw_kv->nb[1]);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_cast(ctx, kv_last, GGML_TYPE_F16), kv_slot));
 
     // ── Learned compression update ──────────────────────────────────
     ggml_tensor * cur_last = ggml_view_2d(
