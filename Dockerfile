@@ -34,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         git \
         git-lfs \
+        libcurl4-openssl-dev \
         ninja-build \
         pkg-config \
         python3 \
