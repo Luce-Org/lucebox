@@ -377,16 +377,22 @@ static ggml_tensor * build_mla_attention(
 
     // ── Grouped output projection ──────────────────────────────────
     // DS4 output uses grouped low-rank projection:
-    //   attn_out: [head_dim*n_head, n_tokens] → reshape to [group_dim, n_groups, n_tokens]
-    //   out_a: [group_dim, n_groups*n_lora_o] → reshape to [group_dim, n_lora_o, n_groups]
-    //   batched matmul: [n_lora_o, n_groups, n_tokens]
-    //   reshape to [n_lora_o*n_groups, n_tokens]
+    //   attn_out: [head_dim*n_head, n_tokens] → reshape [group_dim, n_tokens, n_groups]
+    //   out_a: [group_dim, n_groups*n_lora_o] → reshape [group_dim, n_lora_o, n_groups]
+    //   batched matmul over n_groups: → [n_lora_o, n_tokens, n_groups]
+    //   → reshape [n_lora_o*n_groups, n_tokens]
     //   out_b: [n_lora_o*n_groups, n_embd] → final: [n_embd, n_tokens]
     const int group_dim = head_dim * (n_head / n_out_group);  // 512 * 8 = 4096
+    // Reshape attn_out: [32768, n_tokens] → [4096, 8, n_tokens] → permute to [4096, n_tokens, 8]
     attn_out = ggml_reshape_3d(ctx, attn_out, group_dim, n_out_group, n_tokens);
+    attn_out = ggml_cont(ctx, ggml_permute(ctx, attn_out, 0, 2, 1, 3));
+    // attn_out is now [group_dim, n_tokens, n_out_group]
     ggml_tensor * out_a_3d = ggml_reshape_3d(ctx, L.attn_output_a, group_dim, n_lora_o, n_out_group);
+    // out_a_3d: [group_dim, n_lora_o, n_out_group] — ne[2] matches
     ggml_tensor * attn_low = ggml_mul_mat(ctx, out_a_3d, attn_out);
-    // attn_low: [n_lora_o, n_out_group, n_tokens]
+    // attn_low: [n_lora_o, n_tokens, n_out_group]
+    // Permute back to [n_lora_o, n_out_group, n_tokens] then flatten
+    attn_low = ggml_cont(ctx, ggml_permute(ctx, attn_low, 0, 2, 1, 3));
     attn_low = ggml_reshape_2d(ctx, attn_low, n_lora_o * n_out_group, n_tokens);
     ggml_tensor * out = ggml_mul_mat(ctx, L.attn_output_b, attn_low);
 
