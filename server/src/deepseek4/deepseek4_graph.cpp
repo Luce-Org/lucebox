@@ -650,20 +650,180 @@ static ggml_tensor * build_hc_pre(
     // hc_mix_dim = 2*n_hc + n_hc*n_hc (pre weights + post gates + combine matrix)
     ggml_tensor * mix = ggml_mul_mat(ctx, hc_fn, flat);
 
-    // Split mix into: pre_logits [n_hc], post_logits [n_hc], comb_logits [n_hc*n_hc]
-    // Then:
-    //   pre_weights = sigmoid(pre_logits * pre_scale + base) + eps
-    //   post_gates  = 2 * sigmoid(post_logits * post_scale)
-    //   combine     = sinkhorn(reshape(comb_logits * comb_scale, [n_hc, n_hc]))
-    //
-    // Output = weighted sum of HC streams: Σ pre[i] * hc_state[i*n_embd : (i+1)*n_embd]
-
     // Placeholder: return first HC stream as the working vector
-    // Full Sinkhorn implementation will be added
     ggml_tensor * out = ggml_view_1d(ctx, hc_state, n_embd, 0);
 
     (void)mix; (void)hc_scale; (void)hc_base; (void)n_hc;
     return out;
+}
+
+// ─── CPU-side HC for hybrid path ────────────────────────────────────────
+// HC involves Sinkhorn normalization (iterative, 4×4 matrix) which doesn't
+// map well to ggml ops. For the hybrid path (per-layer graph execution),
+// we implement HC entirely on CPU between layer graphs.
+
+struct HcPreResult {
+    std::vector<float> working;   // [n_embd] — input to sublayer
+    float post[4];                // post gates
+    float comb[16];               // combine matrix [4×4]
+};
+
+static void cpu_rms_norm(float * out, const float * x, int n, float eps) {
+    float ss = 0.0f;
+    for (int i = 0; i < n; i++) ss += x[i] * x[i];
+    const float scale = 1.0f / sqrtf(ss / (float)n + eps);
+    for (int i = 0; i < n; i++) out[i] = x[i] * scale;
+}
+
+static void cpu_matvec_f16(float * out, const uint16_t * mat, const float * x, int rows, int cols) {
+    // mat: [cols, rows] in row-major F16 (ggml layout: ne[0]=cols, ne[1]=rows)
+    // out[r] = dot(mat_row_r, x) for r in [0, rows)
+    for (int r = 0; r < rows; r++) {
+        float acc = 0.0f;
+        const uint16_t * row = mat + (size_t)r * cols;
+        for (int c = 0; c < cols; c++) {
+            acc += ggml_fp16_to_fp32(row[c]) * x[c];
+        }
+        out[r] = acc;
+    }
+}
+
+static void cpu_hc_sinkhorn(float * out, const float * mix, const float * scale,
+                             const float * base, int n_hc, int iters, float eps) {
+    const float pre_scale  = scale[0];
+    const float post_scale = scale[1];
+    const float comb_scale = scale[2];
+
+    // Pre weights: sigmoid(mix[i] * pre_scale + base[i]) + eps
+    for (int i = 0; i < n_hc; i++) {
+        const float z = mix[i] * pre_scale + base[i];
+        out[i] = 1.0f / (1.0f + expf(-z)) + eps;
+    }
+    // Post gates: 2 * sigmoid(mix[n_hc+i] * post_scale + base[n_hc+i])
+    for (int i = 0; i < n_hc; i++) {
+        const float z = mix[n_hc + i] * post_scale + base[n_hc + i];
+        out[n_hc + i] = 2.0f / (1.0f + expf(-z));
+    }
+
+    // Combine matrix: Sinkhorn normalization on [n_hc × n_hc]
+    float c[16];
+    for (int dst = 0; dst < n_hc; dst++) {
+        float row_max = -1e30f;
+        for (int src = 0; src < n_hc; src++) {
+            const int idx = src + dst * n_hc;
+            const float v = mix[2 * n_hc + idx] * comb_scale + base[2 * n_hc + idx];
+            c[idx] = v;
+            if (v > row_max) row_max = v;
+        }
+        float row_sum = 0.0f;
+        for (int src = 0; src < n_hc; src++) {
+            const int idx = src + dst * n_hc;
+            c[idx] = expf(c[idx] - row_max);
+            row_sum += c[idx];
+        }
+        const float inv = 1.0f / row_sum;
+        for (int src = 0; src < n_hc; src++) {
+            c[src + dst * n_hc] = c[src + dst * n_hc] * inv + eps;
+        }
+    }
+    // Column normalization
+    for (int src = 0; src < n_hc; src++) {
+        float sum = 0.0f;
+        for (int dst = 0; dst < n_hc; dst++) sum += c[src + dst * n_hc];
+        const float inv = 1.0f / (sum + eps);
+        for (int dst = 0; dst < n_hc; dst++) c[src + dst * n_hc] *= inv;
+    }
+    // Additional Sinkhorn iterations
+    for (int iter = 1; iter < iters; iter++) {
+        for (int dst = 0; dst < n_hc; dst++) {
+            float sum = 0.0f;
+            for (int src = 0; src < n_hc; src++) sum += c[src + dst * n_hc];
+            const float inv = 1.0f / (sum + eps);
+            for (int src = 0; src < n_hc; src++) c[src + dst * n_hc] *= inv;
+        }
+        for (int src = 0; src < n_hc; src++) {
+            float sum = 0.0f;
+            for (int dst = 0; dst < n_hc; dst++) sum += c[src + dst * n_hc];
+            const float inv = 1.0f / (sum + eps);
+            for (int dst = 0; dst < n_hc; dst++) c[src + dst * n_hc] *= inv;
+        }
+    }
+    for (int i = 0; i < n_hc * n_hc; i++) out[2 * n_hc + i] = c[i];
+}
+
+static HcPreResult cpu_hc_pre(const float * hc_state, const uint16_t * fn_data,
+                               const float * scale_data, const float * base_data,
+                               int n_embd, int n_hc, int sinkhorn_iters, float hc_eps) {
+    const int hc_dim = n_hc * n_embd;
+    const int mix_dim = 2 * n_hc + n_hc * n_hc;  // 24 for n_hc=4
+
+    HcPreResult result;
+    result.working.resize(n_embd);
+
+    // RMSNorm over full HC state
+    std::vector<float> flat(hc_dim);
+    cpu_rms_norm(flat.data(), hc_state, hc_dim, hc_eps);
+
+    // Matmul: fn^T @ flat → mix[mix_dim]
+    // fn is [hc_dim, mix_dim] F16 (ggml layout: ne[0]=hc_dim, ne[1]=mix_dim)
+    std::vector<float> mix(mix_dim);
+    cpu_matvec_f16(mix.data(), fn_data, flat.data(), mix_dim, hc_dim);
+
+    // Sinkhorn split
+    float split[24];  // 2*4 + 4*4 = 24
+    cpu_hc_sinkhorn(split, mix.data(), scale_data, base_data, n_hc, sinkhorn_iters, 1.0e-6f);
+
+    // Weighted sum: out[d] = Σ_h split[h] * hc_state[h*n_embd + d]
+    for (int d = 0; d < n_embd; d++) {
+        float acc = 0.0f;
+        for (int h = 0; h < n_hc; h++) {
+            acc += split[h] * hc_state[(size_t)h * n_embd + d];
+        }
+        result.working[d] = acc;
+    }
+
+    memcpy(result.post, split + n_hc, (size_t)n_hc * sizeof(float));
+    memcpy(result.comb, split + 2 * n_hc, (size_t)n_hc * n_hc * sizeof(float));
+    return result;
+}
+
+static void cpu_hc_post(float * out_hc, const float * block_out,
+                         const float * residual_hc, const float * post,
+                         const float * comb, int n_embd, int n_hc) {
+    for (int dst = 0; dst < n_hc; dst++) {
+        for (int d = 0; d < n_embd; d++) {
+            float acc = block_out[d] * post[dst];
+            for (int src = 0; src < n_hc; src++) {
+                acc += comb[dst + src * n_hc] * residual_hc[(size_t)src * n_embd + d];
+            }
+            out_hc[(size_t)dst * n_embd + d] = acc;
+        }
+    }
+}
+
+// Per-layer CPU-side HC weight cache (read from GPU once)
+struct HcWeightsCpu {
+    std::vector<uint16_t> fn_data;   // [hc_dim * mix_dim] F16
+    std::vector<float> scale_data;   // [3]
+    std::vector<float> base_data;    // [2*n_hc + n_hc*n_hc]
+    bool loaded = false;
+};
+
+struct HcLayerWeightsCpu {
+    HcWeightsCpu attn;
+    HcWeightsCpu ffn;
+};
+
+static void load_hc_weights_cpu(HcWeightsCpu & dst, ggml_tensor * fn,
+                                 ggml_tensor * scale, ggml_tensor * base) {
+    if (!fn || !scale || !base || dst.loaded) return;
+    dst.fn_data.resize(ggml_nelements(fn));
+    dst.scale_data.resize(ggml_nelements(scale));
+    dst.base_data.resize(ggml_nelements(base));
+    ggml_backend_tensor_get(fn, dst.fn_data.data(), 0, ggml_nbytes(fn));
+    ggml_backend_tensor_get(scale, dst.scale_data.data(), 0, ggml_nbytes(scale));
+    ggml_backend_tensor_get(base, dst.base_data.data(), 0, ggml_nbytes(base));
+    dst.loaded = true;
 }
 
 static bool deepseek4_step_hybrid(
@@ -676,14 +836,55 @@ static bool deepseek4_step_hybrid(
         int kv_start,
         std::vector<float> & out_logits) {
     const int n_embd = w.n_embd;
-    std::vector<float> cur(embed, embed + (size_t) n_embd * (size_t) n_tokens);
+    const int n_hc = w.n_hc;
+    const int hc_dim = n_hc * n_embd;
     ggml_backend_t cpu_backend = moe_hybrid.cpu_backend;
     ggml_gallocr_t hot_alloc = nullptr;
     ggml_gallocr_t cold_alloc = nullptr;
 
+    // HC state: 4 streams, each n_embd. Initialize to copies of embedding.
+    // For n_tokens=1 (decode), embed is [n_embd].
+    std::vector<float> hc_state((size_t)hc_dim * (size_t)n_tokens);
+    for (int t = 0; t < n_tokens; t++) {
+        for (int h = 0; h < n_hc; h++) {
+            memcpy(hc_state.data() + (size_t)t * hc_dim + (size_t)h * n_embd,
+                   embed + (size_t)t * n_embd, (size_t)n_embd * sizeof(float));
+        }
+    }
+
+    // Lazy-loaded per-layer HC weights on CPU
+    static std::vector<HcLayerWeightsCpu> hc_layer_weights;
+    static HcWeightsCpu hc_output_weights;
+    if (hc_layer_weights.empty()) {
+        hc_layer_weights.resize((size_t)w.n_layer);
+        for (int il = 0; il < w.n_layer; il++) {
+            const DeepSeek4Layer & L = w.layers[(size_t)il];
+            load_hc_weights_cpu(hc_layer_weights[il].attn, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base);
+            load_hc_weights_cpu(hc_layer_weights[il].ffn, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base);
+        }
+        load_hc_weights_cpu(hc_output_weights, w.output_hc_fn, w.output_hc_scale, w.output_hc_base);
+    }
+
     for (int il = 0; il < w.n_layer; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t) il];
         DeepSeek4LayerCache & lc = cache.layers[(size_t) il];
+        const HcLayerWeightsCpu & hc_lw = hc_layer_weights[(size_t)il];
+
+        // ── HC pre (attention) ──────────────────────────────────────
+        // For decode (n_tokens=1): compute working vector from HC state
+        std::vector<float> cur((size_t)n_embd * (size_t)n_tokens);
+        HcPreResult hc_attn_result;
+        if (hc_lw.attn.loaded && n_tokens == 1) {
+            hc_attn_result = cpu_hc_pre(hc_state.data(), hc_lw.attn.fn_data.data(),
+                                         hc_lw.attn.scale_data.data(), hc_lw.attn.base_data.data(),
+                                         n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
+            memcpy(cur.data(), hc_attn_result.working.data(), (size_t)n_embd * sizeof(float));
+        } else {
+            // Fallback: use first HC stream
+            memcpy(cur.data(), hc_state.data(), (size_t)n_embd * (size_t)n_tokens * sizeof(float));
+        }
+
+        // ── Build attention graph ───────────────────────────────────
         const size_t ctx_size = 48 * 1024 * 1024;
         ggml_init_params params{};
         params.mem_size = ctx_size;
@@ -698,72 +899,24 @@ static bool deepseek4_step_hybrid(
 
         ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
         ggml_set_input(inp);
-        ggml_tensor * cur_tensor = inp;
         std::vector<DeepSeek4I32InputBinding> i32_inputs;
         std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
         ggml_cgraph * gf = ggml_new_graph(ctx);
 
-        ggml_tensor * attn_in = cur_tensor;
-        // TODO: HC pre-mix (requires proper [n_embd, n_tokens] HC state management)
-        // For now, bypass HC and use direct residual path.
-        ggml_tensor * normed = build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
+        ggml_tensor * normed = build_rms_norm(ctx, inp, L.attn_norm, w.rms_eps);
         ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
                                                      kv_start, n_tokens, i32_inputs,
                                                      i32_array_inputs);
-        ggml_tensor * residual = ggml_add(ctx, cur_tensor, attn_out);
-
-        ggml_tensor * ffn_in = residual;
-        // TODO: HC pre-mix for FFN path
-        ggml_tensor * ffn_post = build_rms_norm(ctx, ffn_in, L.ffn_norm, w.rms_eps);
-
-        if (il < w.n_hash_layer && L.ffn_gate_tid2eid) {
-            ggml_tensor * ffn_out = build_shared_ffn(ctx, ffn_post, w, L);
-            ggml_tensor * next = ggml_add(ctx, residual, ffn_out);
-            ggml_build_forward_expand(gf, next);
-            ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-            if (!ggml_gallocr_alloc_graph(alloc, gf)) {
-                ggml_gallocr_free(alloc);
-                ggml_free(ctx);
-                if (hot_alloc) ggml_gallocr_free(hot_alloc);
-                if (cold_alloc) ggml_gallocr_free(cold_alloc);
-                return false;
-            }
-            ggml_backend_tensor_set(inp, cur.data(), 0, sizeof(float) * cur.size());
-            for (const DeepSeek4I32InputBinding & binding : i32_inputs) {
-                ggml_backend_tensor_set(binding.tensor, &binding.value, 0, sizeof(binding.value));
-            }
-            for (const DeepSeek4I32ArrayBinding & binding : i32_array_inputs) {
-                ggml_backend_tensor_set(binding.tensor, binding.values.data(), 0,
-                                        sizeof(int32_t) * binding.values.size());
-            }
-            const bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
-            if (ok) {
-                ggml_backend_tensor_get(next, cur.data(), 0, sizeof(float) * cur.size());
-            }
-            ggml_gallocr_free(alloc);
-            ggml_free(ctx);
-            if (!ok) {
-                if (hot_alloc) ggml_gallocr_free(hot_alloc);
-                if (cold_alloc) ggml_gallocr_free(cold_alloc);
-                return false;
-            }
-            continue;
-        }
-
-        Ds4MoeRouting routing = build_moe_routing(ctx, ffn_post, w, L, n_tokens);
-        ggml_build_forward_expand(gf, residual);
-        ggml_build_forward_expand(gf, ffn_post);
-        ggml_build_forward_expand(gf, routing.selected);
-        ggml_build_forward_expand(gf, routing.weights);
-        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        if (!ggml_gallocr_alloc_graph(alloc, gf)) {
-            ggml_gallocr_free(alloc);
+        // Output just attn_out (HC post handles the residual mixing)
+        ggml_build_forward_expand(gf, attn_out);
+        ggml_gallocr_t attn_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!ggml_gallocr_alloc_graph(attn_alloc, gf)) {
+            ggml_gallocr_free(attn_alloc);
             ggml_free(ctx);
             if (hot_alloc) ggml_gallocr_free(hot_alloc);
             if (cold_alloc) ggml_gallocr_free(cold_alloc);
             return false;
         }
-
         ggml_backend_tensor_set(inp, cur.data(), 0, sizeof(float) * cur.size());
         for (const DeepSeek4I32InputBinding & binding : i32_inputs) {
             ggml_backend_tensor_set(binding.tensor, &binding.value, 0, sizeof(binding.value));
@@ -772,97 +925,225 @@ static bool deepseek4_step_hybrid(
             ggml_backend_tensor_set(binding.tensor, binding.values.data(), 0,
                                     sizeof(int32_t) * binding.values.size());
         }
-        const bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+        bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+        std::vector<float> attn_out_host((size_t)n_embd * (size_t)n_tokens);
+        if (ok) {
+            ggml_backend_tensor_get(attn_out, attn_out_host.data(), 0, sizeof(float) * attn_out_host.size());
+        }
+        ggml_gallocr_free(attn_alloc);
+        ggml_free(ctx);
         if (!ok) {
-            ggml_gallocr_free(alloc);
-            ggml_free(ctx);
             if (hot_alloc) ggml_gallocr_free(hot_alloc);
             if (cold_alloc) ggml_gallocr_free(cold_alloc);
             return false;
         }
 
-        std::vector<float> residual_host((size_t) n_embd * (size_t) n_tokens);
-        std::vector<float> ffn_post_host((size_t) n_embd * (size_t) n_tokens);
-        std::vector<int32_t> selected_host((size_t) w.n_expert_used * (size_t) n_tokens);
-        std::vector<float> weights_host((size_t) w.n_expert_used * (size_t) n_tokens);
-        ggml_backend_tensor_get(residual, residual_host.data(), 0, sizeof(float) * residual_host.size());
-        ggml_backend_tensor_get(ffn_post, ffn_post_host.data(), 0, sizeof(float) * ffn_post_host.size());
-        ggml_backend_tensor_get(routing.selected, selected_host.data(), 0, sizeof(int32_t) * selected_host.size());
-        ggml_backend_tensor_get(routing.weights, weights_host.data(), 0, sizeof(float) * weights_host.size());
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx);
-
-        std::vector<float> ffn_out_host;
-        MoeHybridConfig hybrid_cfg = make_ds4_moe_hybrid_config(w);
-        MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
-        auto & storage = moe_hybrid.layers[(size_t) il];
-        bool ffn_ok = eval_moe_hybrid_ffn_batched(
-            backend, cpu_backend, hybrid_cfg, desc, storage,
-            ffn_post_host.data(), selected_host.data(), weights_host.data(),
-            n_tokens, ffn_out_host, nullptr, &hot_alloc, &cold_alloc);
-        if (!ffn_ok) {
-            ffn_out_host.assign((size_t) n_embd * (size_t) n_tokens, 0.0f);
-            std::vector<float> single_out;
-            for (int ti = 0; ti < n_tokens; ++ti) {
-                if (!eval_moe_hybrid_ffn_single(
-                        backend, hybrid_cfg, desc, storage, cpu_backend,
-                        ffn_post_host.data() + (size_t) ti * (size_t) n_embd,
-                        selected_host.data() + (size_t) ti * (size_t) w.n_expert_used,
-                        weights_host.data() + (size_t) ti * (size_t) w.n_expert_used,
-                        w.n_expert_used, single_out)) {
-                    if (hot_alloc) ggml_gallocr_free(hot_alloc);
-                    if (cold_alloc) ggml_gallocr_free(cold_alloc);
-                    return false;
-                }
-                std::memcpy(ffn_out_host.data() + (size_t) ti * (size_t) n_embd,
-                            single_out.data(), sizeof(float) * (size_t) n_embd);
+        // ── HC post (attention) ─────────────────────────────────────
+        if (hc_lw.attn.loaded && n_tokens == 1) {
+            std::vector<float> new_hc((size_t)hc_dim);
+            cpu_hc_post(new_hc.data(), attn_out_host.data(), hc_state.data(),
+                        hc_attn_result.post, hc_attn_result.comb, n_embd, n_hc);
+            memcpy(hc_state.data(), new_hc.data(), (size_t)hc_dim * sizeof(float));
+        } else {
+            for (int i = 0; i < n_embd * n_tokens; i++) {
+                hc_state[(size_t)i] += attn_out_host[(size_t)i];
             }
         }
 
-        cur.resize(residual_host.size());
-        for (size_t i = 0; i < cur.size(); ++i) {
-            cur[i] = residual_host[i] + ffn_out_host[i];
+        // ── HC pre (FFN) ────────────────────────────────────────────
+        std::vector<float> ffn_working((size_t)n_embd * (size_t)n_tokens);
+        HcPreResult hc_ffn_result;
+        if (hc_lw.ffn.loaded && n_tokens == 1) {
+            hc_ffn_result = cpu_hc_pre(hc_state.data(), hc_lw.ffn.fn_data.data(),
+                                        hc_lw.ffn.scale_data.data(), hc_lw.ffn.base_data.data(),
+                                        n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
+            memcpy(ffn_working.data(), hc_ffn_result.working.data(), (size_t)n_embd * sizeof(float));
+        } else {
+            memcpy(ffn_working.data(), hc_state.data(), (size_t)n_embd * (size_t)n_tokens * sizeof(float));
+        }
+
+        // ── FFN ─────────────────────────────────────────────────────
+        std::vector<float> ffn_out_host((size_t)n_embd * (size_t)n_tokens, 0.0f);
+
+        if (il < w.n_hash_layer && L.ffn_gate_tid2eid) {
+            // Hash-routed layers: shared FFN only
+            ggml_init_params ffn_params{};
+            ffn_params.mem_size = 16 * 1024 * 1024;
+            ffn_params.mem_buffer = nullptr;
+            ffn_params.no_alloc = true;
+            ggml_context * ffn_ctx = ggml_init(ffn_params);
+            if (!ffn_ctx) {
+                if (hot_alloc) ggml_gallocr_free(hot_alloc);
+                if (cold_alloc) ggml_gallocr_free(cold_alloc);
+                return false;
+            }
+            ggml_tensor * ffn_inp = ggml_new_tensor_2d(ffn_ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_input(ffn_inp);
+            ggml_tensor * ffn_normed = build_rms_norm(ffn_ctx, ffn_inp, L.ffn_norm, w.rms_eps);
+            ggml_tensor * ffn_result = build_shared_ffn(ffn_ctx, ffn_normed, w, L);
+            ggml_cgraph * ffn_gf = ggml_new_graph(ffn_ctx);
+            ggml_build_forward_expand(ffn_gf, ffn_result);
+            ggml_gallocr_t ffn_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            if (!ggml_gallocr_alloc_graph(ffn_alloc, ffn_gf)) {
+                ggml_gallocr_free(ffn_alloc); ggml_free(ffn_ctx);
+                if (hot_alloc) ggml_gallocr_free(hot_alloc);
+                if (cold_alloc) ggml_gallocr_free(cold_alloc);
+                return false;
+            }
+            ggml_backend_tensor_set(ffn_inp, ffn_working.data(), 0, sizeof(float) * ffn_working.size());
+            ok = ggml_backend_graph_compute(backend, ffn_gf) == GGML_STATUS_SUCCESS;
+            if (ok) {
+                ggml_backend_tensor_get(ffn_result, ffn_out_host.data(), 0, sizeof(float) * ffn_out_host.size());
+            }
+            ggml_gallocr_free(ffn_alloc);
+            ggml_free(ffn_ctx);
+            if (!ok) {
+                if (hot_alloc) ggml_gallocr_free(hot_alloc);
+                if (cold_alloc) ggml_gallocr_free(cold_alloc);
+                return false;
+            }
+        } else {
+            // MoE layers: compute routing on GPU, experts via hybrid
+            ggml_init_params ffn_params{};
+            ffn_params.mem_size = 16 * 1024 * 1024;
+            ffn_params.mem_buffer = nullptr;
+            ffn_params.no_alloc = true;
+            ggml_context * ffn_ctx = ggml_init(ffn_params);
+            if (!ffn_ctx) {
+                if (hot_alloc) ggml_gallocr_free(hot_alloc);
+                if (cold_alloc) ggml_gallocr_free(cold_alloc);
+                return false;
+            }
+            ggml_tensor * ffn_inp = ggml_new_tensor_2d(ffn_ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_input(ffn_inp);
+            ggml_tensor * ffn_normed = build_rms_norm(ffn_ctx, ffn_inp, L.ffn_norm, w.rms_eps);
+            Ds4MoeRouting routing = build_moe_routing(ffn_ctx, ffn_normed, w, L, n_tokens);
+            ggml_cgraph * ffn_gf = ggml_new_graph(ffn_ctx);
+            ggml_build_forward_expand(ffn_gf, ffn_normed);
+            ggml_build_forward_expand(ffn_gf, routing.selected);
+            ggml_build_forward_expand(ffn_gf, routing.weights);
+            ggml_gallocr_t ffn_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            if (!ggml_gallocr_alloc_graph(ffn_alloc, ffn_gf)) {
+                ggml_gallocr_free(ffn_alloc); ggml_free(ffn_ctx);
+                if (hot_alloc) ggml_gallocr_free(hot_alloc);
+                if (cold_alloc) ggml_gallocr_free(cold_alloc);
+                return false;
+            }
+            ggml_backend_tensor_set(ffn_inp, ffn_working.data(), 0, sizeof(float) * ffn_working.size());
+            ok = ggml_backend_graph_compute(backend, ffn_gf) == GGML_STATUS_SUCCESS;
+            if (!ok) {
+                ggml_gallocr_free(ffn_alloc); ggml_free(ffn_ctx);
+                if (hot_alloc) ggml_gallocr_free(hot_alloc);
+                if (cold_alloc) ggml_gallocr_free(cold_alloc);
+                return false;
+            }
+
+            std::vector<float> ffn_normed_host((size_t)n_embd * (size_t)n_tokens);
+            std::vector<int32_t> selected_host((size_t)w.n_expert_used * (size_t)n_tokens);
+            std::vector<float> weights_host((size_t)w.n_expert_used * (size_t)n_tokens);
+            ggml_backend_tensor_get(ffn_normed, ffn_normed_host.data(), 0, sizeof(float) * ffn_normed_host.size());
+            ggml_backend_tensor_get(routing.selected, selected_host.data(), 0, sizeof(int32_t) * selected_host.size());
+            ggml_backend_tensor_get(routing.weights, weights_host.data(), 0, sizeof(float) * weights_host.size());
+            ggml_gallocr_free(ffn_alloc);
+            ggml_free(ffn_ctx);
+
+            MoeHybridConfig hybrid_cfg = make_ds4_moe_hybrid_config(w);
+            MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
+            auto & storage = moe_hybrid.layers[(size_t) il];
+            bool ffn_ok = eval_moe_hybrid_ffn_batched(
+                backend, cpu_backend, hybrid_cfg, desc, storage,
+                ffn_normed_host.data(), selected_host.data(), weights_host.data(),
+                n_tokens, ffn_out_host, nullptr, &hot_alloc, &cold_alloc);
+            if (!ffn_ok) {
+                ffn_out_host.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
+                std::vector<float> single_out;
+                for (int ti = 0; ti < n_tokens; ++ti) {
+                    if (!eval_moe_hybrid_ffn_single(
+                            backend, hybrid_cfg, desc, storage, cpu_backend,
+                            ffn_normed_host.data() + (size_t)ti * (size_t)n_embd,
+                            selected_host.data() + (size_t)ti * (size_t)w.n_expert_used,
+                            weights_host.data() + (size_t)ti * (size_t)w.n_expert_used,
+                            w.n_expert_used, single_out)) {
+                        if (hot_alloc) ggml_gallocr_free(hot_alloc);
+                        if (cold_alloc) ggml_gallocr_free(cold_alloc);
+                        return false;
+                    }
+                    std::memcpy(ffn_out_host.data() + (size_t)ti * (size_t)n_embd,
+                                single_out.data(), sizeof(float) * (size_t)n_embd);
+                }
+            }
+        }
+
+        // ── HC post (FFN) ───────────────────────────────────────────
+        if (hc_lw.ffn.loaded && n_tokens == 1) {
+            std::vector<float> new_hc((size_t)hc_dim);
+            cpu_hc_post(new_hc.data(), ffn_out_host.data(), hc_state.data(),
+                        hc_ffn_result.post, hc_ffn_result.comb, n_embd, n_hc);
+            memcpy(hc_state.data(), new_hc.data(), (size_t)hc_dim * sizeof(float));
+        } else {
+            for (int i = 0; i < n_embd * n_tokens; i++) {
+                hc_state[(size_t)i] += ffn_out_host[(size_t)i];
+            }
         }
     }
 
     if (hot_alloc) ggml_gallocr_free(hot_alloc);
     if (cold_alloc) ggml_gallocr_free(cold_alloc);
 
-    const size_t final_ctx_size = 16 * 1024 * 1024;
-    ggml_init_params params{};
-    params.mem_size = final_ctx_size;
-    params.mem_buffer = nullptr;
-    params.no_alloc = true;
-    ggml_context * ctx = ggml_init(params);
-    if (!ctx) return false;
+    // ── Output HC pre → norm → logits ───────────────────────────────────
+    std::vector<float> final_embd((size_t)n_embd * (size_t)n_tokens);
+    if (hc_output_weights.loaded && n_tokens == 1) {
+        std::vector<float> flat((size_t)hc_dim);
+        cpu_rms_norm(flat.data(), hc_state.data(), hc_dim, w.hc_eps);
+        std::vector<float> pre(n_hc);
+        cpu_matvec_f16(pre.data(), hc_output_weights.fn_data.data(), flat.data(), n_hc, hc_dim);
+        float hc_weights[4];
+        for (int i = 0; i < n_hc; i++) {
+            const float z = pre[i] * hc_output_weights.scale_data[0] + hc_output_weights.base_data[i];
+            hc_weights[i] = 1.0f / (1.0f + expf(-z)) + 1.0e-6f;
+        }
+        for (int d = 0; d < n_embd; d++) {
+            float acc = 0.0f;
+            for (int h = 0; h < n_hc; h++) {
+                acc += hc_weights[h] * hc_state[(size_t)h * n_embd + d];
+            }
+            final_embd[d] = acc;
+        }
+    } else {
+        memcpy(final_embd.data(), hc_state.data(), (size_t)n_embd * (size_t)n_tokens * sizeof(float));
+    }
 
-    ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
-    ggml_set_input(inp);
-    ggml_tensor * cur_tensor = inp;
-    // TODO: output HC pre-mix
-    cur_tensor = build_rms_norm(ctx, cur_tensor, w.out_norm, w.rms_eps);
-    ggml_tensor * logits = ggml_mul_mat(ctx, w.output, cur_tensor);
-    ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, logits);
-    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    if (!ggml_gallocr_alloc_graph(alloc, gf)) {
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx);
+    const size_t final_ctx_size = 16 * 1024 * 1024;
+    ggml_init_params params2{};
+    params2.mem_size = final_ctx_size;
+    params2.mem_buffer = nullptr;
+    params2.no_alloc = true;
+    ggml_context * ctx2 = ggml_init(params2);
+    if (!ctx2) return false;
+
+    ggml_tensor * final_inp = ggml_new_tensor_2d(ctx2, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_input(final_inp);
+    ggml_tensor * normed_out = build_rms_norm(ctx2, final_inp, w.out_norm, w.rms_eps);
+    ggml_tensor * logits = ggml_mul_mat(ctx2, w.output, normed_out);
+    ggml_cgraph * final_gf = ggml_new_graph(ctx2);
+    ggml_build_forward_expand(final_gf, logits);
+    ggml_gallocr_t final_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(final_alloc, final_gf)) {
+        ggml_gallocr_free(final_alloc);
+        ggml_free(ctx2);
         return false;
     }
-
-    ggml_backend_tensor_set(inp, cur.data(), 0, sizeof(float) * cur.size());
-    const bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
-    if (ok) {
-        out_logits.resize((size_t) w.n_vocab);
-        const size_t logits_offset = (size_t) (n_tokens - 1) * (size_t) w.n_vocab * sizeof(float);
+    ggml_backend_tensor_set(final_inp, final_embd.data(), 0, sizeof(float) * final_embd.size());
+    bool final_ok = ggml_backend_graph_compute(backend, final_gf) == GGML_STATUS_SUCCESS;
+    if (final_ok) {
+        out_logits.resize((size_t)w.n_vocab);
+        const size_t logits_offset = (size_t)(n_tokens - 1) * (size_t)w.n_vocab * sizeof(float);
         ggml_backend_tensor_get(logits, out_logits.data(), logits_offset,
-                                sizeof(float) * (size_t) w.n_vocab);
+                                sizeof(float) * (size_t)w.n_vocab);
     }
-    ggml_gallocr_free(alloc);
-    ggml_free(ctx);
-    if (!ok) return false;
-
+    ggml_gallocr_free(final_alloc);
+    ggml_free(ctx2);
+    if (!final_ok) return false;
     cache.cur_pos = kv_start + n_tokens;
     return true;
 }
