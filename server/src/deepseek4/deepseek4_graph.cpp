@@ -151,6 +151,7 @@ static void build_compressor_step(
     pooled = build_rms_norm(ctx, pooled, norm_weight, rms_eps);
 
     ggml_tensor * comp_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_input(comp_pos);
     i32_inputs.push_back({comp_pos, token_pos / ratio});
     pooled = ggml_rope_ext(ctx, pooled, comp_pos, nullptr,
                            n_rot, GGML_ROPE_TYPE_NEOX, 0,
@@ -230,6 +231,7 @@ static ggml_tensor * build_indexer_score(
     index_q = ggml_reshape_3d(ctx, index_q, head_dim, n_indexer_head, 1);
 
     ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_input(pos);
     i32_inputs.push_back({pos, token_pos});
     index_q = ggml_rope_ext(ctx, index_q, pos, nullptr,
                             head_dim, GGML_ROPE_TYPE_NEOX, 0,
