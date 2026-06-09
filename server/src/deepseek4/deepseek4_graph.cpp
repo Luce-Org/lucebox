@@ -150,13 +150,9 @@ static void build_compressor_step(
     pooled = ggml_cont(ctx, pooled);
     pooled = build_rms_norm(ctx, pooled, norm_weight, rms_eps);
 
-    ggml_tensor * comp_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-    ggml_set_input(comp_pos);
-    i32_inputs.push_back({comp_pos, token_pos / ratio});
-    pooled = ggml_rope_ext(ctx, pooled, comp_pos, nullptr,
-                           n_rot, GGML_ROPE_TYPE_NEOX, 0,
-                           compress_rope_freq_base, 1.0f,
-                           0.0f, 0.0f, 0.0f, 0.0f);
+    // TODO: RoPE on compressed row (requires I32 position input allocated
+    // in a way gallocr can handle for side-effect-only subgraphs).
+    // Skipping for now — output is placeholder anyway.
 
     ggml_tensor * pooled_f16 = ggml_cast(ctx, pooled, GGML_TYPE_F16);
     const int comp_row = token_pos / ratio;
@@ -230,13 +226,9 @@ static ggml_tensor * build_indexer_score(
     ggml_tensor * index_q = ggml_mul_mat(ctx, L.indexer_attn_q_b, qr_norm_last);
     index_q = ggml_reshape_3d(ctx, index_q, head_dim, n_indexer_head, 1);
 
-    ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-    ggml_set_input(pos);
-    i32_inputs.push_back({pos, token_pos});
-    index_q = ggml_rope_ext(ctx, index_q, pos, nullptr,
-                            head_dim, GGML_ROPE_TYPE_NEOX, 0,
-                            w.rope_freq_base, 1.0f,
-                            0.0f, 0.0f, 0.0f, 0.0f);
+    // TODO: RoPE on indexer query (same gallocr issue as compressor RoPE)
+    // Skipping for now — correctness deferred.
+    index_q = ggml_reshape_2d(ctx, index_q, head_dim, n_indexer_head);
 
     ggml_tensor * head_weights = ggml_mul_mat(ctx, L.indexer_proj, cur_last);
     head_weights = ggml_scale(ctx, head_weights,
@@ -253,14 +245,13 @@ static ggml_tensor * build_indexer_score(
 
     // index_q: [head_dim, n_indexer_head, 1] → repeat to [head_dim, n_indexer_head, n_comp]
     // But ggml_mul needs same shapes, so use matmul approach:
-    // Reshape q: [head_dim, n_indexer_head] → transpose → [n_indexer_head, head_dim]
+    // Reshape q: [head_dim, n_indexer_head] → used directly as A in matmul
     // comp: [head_dim, n_comp]
     // matmul: A^T @ B = [n_indexer_head, n_comp] dot scores
-    ggml_tensor * q_2d = ggml_reshape_2d(ctx, index_q, head_dim, n_indexer_head);
     ggml_tensor * comp_2d = ggml_reshape_2d(ctx, comp_view, head_dim, n_comp);
-    // mul_mat(q_2d, comp_2d): A=[head_dim, n_indexer_head], B=[head_dim, n_comp]
+    // mul_mat(index_q, comp_2d): A=[head_dim, n_indexer_head], B=[head_dim, n_comp]
     // → result=[n_indexer_head, n_comp]
-    ggml_tensor * dots = ggml_mul_mat(ctx, q_2d, comp_2d);
+    ggml_tensor * dots = ggml_mul_mat(ctx, index_q, comp_2d);
     dots = ggml_relu(ctx, dots);
 
     // Weight each head's contribution: dots[n_indexer_head, n_comp] * weights[n_indexer_head, 1]
