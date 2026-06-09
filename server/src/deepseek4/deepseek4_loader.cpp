@@ -305,7 +305,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
 
     // ── Build load plan ─────────────────────────────────────────────────
     TargetLoadPlan plan = plan_in;
-    if (plan.layer_end == 0) plan.layer_end = (int)n_layer;
+    if (plan.layer_end < 0) plan.layer_end = (int)n_layer;
     plan.load_output = true;
 
     // ── Collect tensors for allocation ──────────────────────────────────
