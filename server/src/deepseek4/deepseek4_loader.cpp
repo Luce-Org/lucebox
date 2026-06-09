@@ -74,6 +74,10 @@ uint32_t get_u32_or(gguf_context * g, const char * key, uint32_t def) {
 uint64_t get_u64_or(gguf_context * g, const char * key, uint64_t def) {
     int64_t id = gguf_find_key(g, key);
     if (id < 0) return def;
+    // Handle both u32 and u64 storage in GGUF
+    if (gguf_get_kv_type(g, id) == GGUF_TYPE_UINT32) {
+        return (uint64_t)gguf_get_val_u32(g, id);
+    }
     return (uint64_t)gguf_get_val_u64(g, id);
 }
 
@@ -91,8 +95,13 @@ std::vector<uint32_t> get_u32_arr(gguf_context * g, const char * key) {
     int64_t id = gguf_find_key(g, key);
     if (id < 0 || gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY) return {};
     const size_t n = gguf_get_arr_n(g, id);
-    const uint32_t * data = (const uint32_t *)gguf_get_arr_data(g, id);
-    return std::vector<uint32_t>(data, data + n);
+    // Handle both i32 and u32 element types (values are positive either way)
+    const void * raw = gguf_get_arr_data(g, id);
+    std::vector<uint32_t> out(n);
+    for (size_t i = 0; i < n; ++i) {
+        out[i] = (uint32_t)((const int32_t *)raw)[i];
+    }
+    return out;
 }
 
 ggml_tensor * find_tensor(ggml_context * ctx, const char * name) {
