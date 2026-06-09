@@ -153,6 +153,8 @@ static bool should_keep_ds4_tensor(const char * name,
 static bool should_upload_ds4_tensor(const char * name,
                                      const TargetLoadPlan & plan) {
     if (!should_keep_ds4_tensor(name, plan)) return false;
+    // token_embd stays on CPU for embedding lookup
+    if (std::strcmp(name, "token_embd.weight") == 0) return false;
     return !(plan.skip_expert_tensors && is_expert_tensor(name));
 }
 
@@ -309,6 +311,9 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     // ── Collect tensors for allocation ──────────────────────────────────
     const int n_tensors = gguf_get_n_tensors(gctx);
     const size_t data_offset = gguf_get_data_offset(gctx);
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+
     std::vector<DS4TensorAlloc> allocs;
     allocs.reserve(n_tensors);
     size_t total_buf_size = 0;
@@ -321,17 +326,17 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         if (!t) continue;
 
         const size_t offset = data_offset + gguf_get_tensor_offset(gctx, ti);
-        const size_t nbytes = ggml_nbytes(t);
         const bool upload_to_backend = should_upload_ds4_tensor(tname, plan);
 
         DS4TensorAlloc a;
         a.tensor = t;
         a.file_offset = offset;
-        a.file_size = nbytes;
+        a.file_size = gguf_get_tensor_size(gctx, ti);
         a.upload_to_backend = upload_to_backend;
         if (upload_to_backend) {
+            total_buf_size = align_up_size(total_buf_size, alignment);
             a.buffer_offset = total_buf_size;
-            total_buf_size = align_up_size(total_buf_size + nbytes, 64);
+            total_buf_size += ggml_backend_buft_get_alloc_size(buft, t);
         }
         allocs.push_back(a);
     }
@@ -345,33 +350,22 @@ bool load_deepseek4_gguf_partial(const std::string & path,
             gguf_free(gctx);
             return false;
         }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     }
     out.buf = buf;
 
-    // ── Create ggml context for weight tensors ──────────────────────────
-    const size_t ctx_size = ggml_tensor_overhead() * allocs.size() + 1024;
-    ggml_init_params ctx_params{};
-    ctx_params.mem_size = ctx_size;
-    ctx_params.mem_buffer = nullptr;
-    ctx_params.no_alloc = true;
-    out.ctx = ggml_init(ctx_params);
-    if (!out.ctx) {
-        set_last_error("ggml_init failed for weight context");
-        ggml_backend_buffer_free(buf);
-        gguf_free(gctx);
-        return false;
-    }
-
-    // ── Create tensors in our context and assign buffer offsets ──────────
+    // ── Assign tensors from meta_ctx to the backend buffer ──────────────
+    // Use ggml_backend_tensor_alloc to properly set the buffer association.
+    out.ctx = meta_ctx;  // Reuse the meta context (tensors already exist)
+    char * buf_base = buf ? (char *)ggml_backend_buffer_get_base(buf) : nullptr;
     for (auto & a : allocs) {
-        ggml_tensor * src = a.tensor;
-        ggml_tensor * dst = ggml_new_tensor(out.ctx, src->type,
-                                            ggml_n_dims(src), src->ne);
-        ggml_set_name(dst, ggml_get_name(src));
-        if (a.upload_to_backend && buf) {
-            dst->data = (char *)ggml_backend_buffer_get_base(buf) + a.buffer_offset;
+        if (!a.upload_to_backend || !buf) continue;
+        if (ggml_backend_tensor_alloc(buf, a.tensor, buf_base + a.buffer_offset) != GGML_STATUS_SUCCESS) {
+            set_last_error("ggml_backend_tensor_alloc failed");
+            ggml_backend_buffer_free(buf); out.buf = nullptr;
+            gguf_free(gctx);
+            return false;
         }
-        a.tensor = dst;  // Update to point to our context's tensor
     }
 
     // ── Memory-map the file and copy tensor data ────────────────────────
@@ -379,7 +373,6 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     std::string mmap_err;
     if (!mmap.open_ro(path, mmap_err)) {
         set_last_error("mmap: " + mmap_err);
-        ggml_free(out.ctx); out.ctx = nullptr;
         ggml_backend_buffer_free(buf); out.buf = nullptr;
         gguf_free(gctx);
         return false;
@@ -494,7 +487,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     }
 
     gguf_free(gctx);
-    ggml_free(meta_ctx);
+    // Note: meta_ctx is now owned by out.ctx — do NOT free it here.
 
     std::fprintf(stderr, "[deepseek4] loaded %zu tensors, %.1f MB GPU buffer\n",
                  allocs.size(), (double)total_buf_size / (1024.0 * 1024.0));
