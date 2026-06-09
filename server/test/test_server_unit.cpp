@@ -25,6 +25,7 @@
 #include "common/layer_split_utils.h"
 #include "qwen35/c2_gate.h"
 #include "placement/draft_residency.h"
+#include "server/prompt_normalize.h"
 #include <nlohmann/json.hpp>
 
 #include <cmath>
@@ -1293,7 +1294,6 @@ static void test_pflash_threshold_always_mode() {
     TEST_ASSERT(should);
 }
 
-<<<<<<< HEAD
 static void test_pflash_config_upstream_defaults() {
     ServerConfig cfg;
     TEST_ASSERT(cfg.pflash_upstream_base.empty());
@@ -1360,6 +1360,7 @@ static void test_pflash_raw_body_preserved() {
     TEST_ASSERT(req.raw_body.contains("model"));
     TEST_ASSERT(req.raw_body.contains("temperature"));
     TEST_ASSERT(req.raw_body["temperature"].get<float>() > 0.6f);
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // Admission gate tests (check_admission pure helper)
@@ -1429,7 +1430,6 @@ static void test_admission_keep_ratio_derived_guard_rejects_impossible() {
     TEST_ASSERT(!check_admission(/*effective=*/2000000, /*raw=*/2000000,
                                  /*max_output=*/512, /*max_ctx=*/8192,
                                  /*pflash_on=*/true, /*keep_ratio=*/0.05f));
->>>>>>> 2668f6c (feat(pflash): effective-size admission gate + keep-ratio guard (keep default 0.10))
 }
 
 static void test_pflash_placement_same_backend_local() {
@@ -3320,10 +3320,16 @@ static void test_generate_result_accept_rate_zero_when_no_spec_decode() {
 // ═══════════════════════════════════════════════════════════════════════
 
 static void test_c2_gate_no_override_always_permits() {
-    // fa_window_override == 0 → no pflash, always spec-decode permitted.
+    // fa_window_override == 0 → uncompressed path; gate on kv_committed.
+    // Short/medium ctx: permitted.
     TEST_ASSERT(dflash::common::c2_spec_decode_permitted(0, 2048, 1));
     TEST_ASSERT(dflash::common::c2_spec_decode_permitted(0, 2048, 4096));
-    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(0, 2048, 131072));
+    // kv_committed below threshold → permitted.
+    TEST_ASSERT(dflash::common::c2_spec_decode_permitted(0, 2048, dflash::common::kSpecMaxUncompressedCtx - 1));
+    // kv_committed at/above threshold → blocked (AR wins on long uncompressed ctx).
+    TEST_ASSERT(!dflash::common::c2_spec_decode_permitted(0, 2048, dflash::common::kSpecMaxUncompressedCtx));
+    TEST_ASSERT(!dflash::common::c2_spec_decode_permitted(0, 2048, 63000));
+    TEST_ASSERT(!dflash::common::c2_spec_decode_permitted(0, 2048, 131072));
 }
 
 static void test_c2_gate_128k_compressed_blocks_spec() {
@@ -3375,6 +3381,112 @@ static void test_c2_gate_fa_window_zero_small_compressed_permits() {
     TEST_ASSERT(dflash::common::c2_spec_decode_permitted(2300, spec_fa, 2044));
     // Huge compressed prompt still BLOCKED (override=9000 > 2*2048=4096).
     TEST_ASSERT(!dflash::common::c2_spec_decode_permitted(9000, spec_fa, 8744));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// normalize_system_for_cache — Phase A header-strip RED tests
+//
+// All tests with "strips" or "idempotent" FAIL with the passthrough stub.
+// test_normalize_preserves_legit_system_content PASSES (guard test).
+// ═══════════════════════════════════════════════════════════════════════
+
+static void test_normalize_strips_billing_header_anthropic_array() {
+    // Anthropic system-as-array: one billing-header block + one real block.
+    // After stripping, output must contain only the real-block text.
+    json system_blocks = json::array({
+        {{"type", "text"},
+         {"text", "x-anthropic-billing-header: session=abc123 turn=4 ts=1749430000"}},
+        {{"type", "text"},
+         {"text", "You are a helpful coding assistant."}}
+    });
+    std::string out = normalize_system_for_cache(system_blocks);
+    // Must NOT contain the billing header.
+    TEST_ASSERT(out.find("x-anthropic-billing-header:") == std::string::npos);
+    // Must still contain the real content.
+    TEST_ASSERT(out.find("helpful coding assistant") != std::string::npos);
+}
+
+static void test_normalize_strips_billing_header_openai_messages0() {
+    // OpenAI messages[0] system containing the billing header in content.
+    // After stripping, output must exclude the header.
+    json messages = json::array({
+        {{"role", "system"},
+         {"content", "x-anthropic-billing-header: session=xyz789 turn=12 ts=1749431000\nYou are a code reviewer."}},
+        {{"role", "user"}, {"content", "Review this diff."}}
+    });
+    std::string out = normalize_system_for_cache(messages);
+    TEST_ASSERT(out.find("x-anthropic-billing-header:") == std::string::npos);
+    TEST_ASSERT(out.find("code reviewer") != std::string::npos);
+}
+
+static void test_normalize_idempotent_across_changing_header() {
+    // Two OpenAI messages arrays identical except the header session/turn value.
+    // normalize_system_for_cache must return EQUAL strings for both.
+    json messages_turn4 = json::array({
+        {{"role", "system"},
+         {"content", "x-anthropic-billing-header: session=S1 turn=4 ts=1749430000\nYou help with Rust."}},
+        {{"role", "user"}, {"content", "What is a lifetime?"}}
+    });
+    json messages_turn5 = json::array({
+        {{"role", "system"},
+         {"content", "x-anthropic-billing-header: session=S1 turn=5 ts=1749430060\nYou help with Rust."}},
+        {{"role", "user"}, {"content", "What is a lifetime?"}}
+    });
+    std::string out4 = normalize_system_for_cache(messages_turn4);
+    std::string out5 = normalize_system_for_cache(messages_turn5);
+    // Must be identical after stripping the volatile header.
+    TEST_ASSERT(out4 == out5);
+}
+
+static void test_normalize_preserves_legit_system_content() {
+    // A normal system prompt containing no billing header must pass through unchanged.
+    // This test PASSES even with the passthrough stub — it is a regression guard.
+    json messages = json::array({
+        {{"role", "system"},
+         {"content", "You are an expert in C++ performance optimization."}},
+        {{"role", "user"}, {"content", "Help me optimize this loop."}}
+    });
+    std::string out = normalize_system_for_cache(messages);
+    TEST_ASSERT(out == "You are an expert in C++ performance optimization.");
+}
+
+static void test_normalize_handles_leading_whitespace_header() {
+    // Header block with leading whitespace/newline must still be stripped.
+    json system_blocks = json::array({
+        {{"type", "text"},
+         {"text", "  x-anthropic-billing-header: session=W1 turn=1 ts=1749432000"}},
+        {{"type", "text"},
+         {"text", "Be concise."}}
+    });
+    std::string out = normalize_system_for_cache(system_blocks);
+    // Must NOT contain the billing header (stripped even with leading space).
+    TEST_ASSERT(out.find("x-anthropic-billing-header:") == std::string::npos);
+    // Must still contain the real instruction.
+    TEST_ASSERT(out.find("Be concise.") != std::string::npos);
+}
+
+static void test_prefix_key_stable_across_header_change() {
+    // Integration: two /v1/chat/completions-style messages arrays differing ONLY
+    // in the billing header value should normalize to EQUAL strings, producing
+    // equal cache keys (hash_prefix of the tokenized normalized string).
+    // With the passthrough stub the strings DIFFER → test fails RED.
+    json messages_a = json::array({
+        {{"role", "system"},
+         {"content", "x-anthropic-billing-header: session=S2 turn=1 ts=1749440000\nYou are a senior engineer."}},
+        {{"role", "user"}, {"content", "What is RAII?"}}
+    });
+    json messages_b = json::array({
+        {{"role", "system"},
+         {"content", "x-anthropic-billing-header: session=S2 turn=7 ts=1749440420\nYou are a senior engineer."}},
+        {{"role", "user"}, {"content", "What is RAII?"}}
+    });
+    std::string norm_a = normalize_system_for_cache(messages_a);
+    std::string norm_b = normalize_system_for_cache(messages_b);
+    // After header removal both normalize to identical system text.
+    // Identical normalized text → identical tokenization → identical hash_prefix → cache HIT.
+    TEST_ASSERT(norm_a == norm_b);
+    // The legitimate content must survive.
+    TEST_ASSERT(norm_a.find("senior engineer") != std::string::npos);
 }
 
 int main() {
@@ -3606,6 +3718,14 @@ int main() {
     RUN_TEST(test_c2_gate_boundary_at_2x_fa_window);
     RUN_TEST(test_spec_fa_ref_zero_falls_back_to_const);
     RUN_TEST(test_c2_gate_fa_window_zero_small_compressed_permits);
+
+    std::fprintf(stderr, "\n── normalize_system_for_cache (Phase A, RED) ──\n");
+    RUN_TEST(test_normalize_strips_billing_header_anthropic_array);
+    RUN_TEST(test_normalize_strips_billing_header_openai_messages0);
+    RUN_TEST(test_normalize_idempotent_across_changing_header);
+    RUN_TEST(test_normalize_preserves_legit_system_content);
+    RUN_TEST(test_normalize_handles_leading_whitespace_header);
+    RUN_TEST(test_prefix_key_stable_across_header_change);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",
