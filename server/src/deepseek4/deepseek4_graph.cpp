@@ -341,7 +341,6 @@ static ggml_tensor * build_mla_attention(
     ggml_tensor * qr_last = ggml_view_2d(
         ctx, qr, n_lora_q, 1, qr->nb[1], (size_t)(n_tokens - 1) * qr->nb[1]);
     if (ratio > 0 && L.attn_compressor_kv) {
-        fprintf(stderr, "[ds4] layer %d: compressor step (ratio=%d, pos=%d)...\n", layer_idx, ratio, token_pos);
         build_compressor_step(ctx, gf, cur_last,
                               L.attn_compressor_ape,
                               L.attn_compressor_kv,
@@ -356,16 +355,12 @@ static ggml_tensor * build_mla_attention(
                               w.rms_eps,
                               w.compress_rope_freq_base,
                               i32_inputs);
-        fprintf(stderr, "[ds4] layer %d: compressor done\n", layer_idx);
     }
 
     ggml_tensor * allowed_comp = nullptr;
     if (ratio == 4 && L.indexer_compressor_kv) {
-        fprintf(stderr, "[ds4] layer %d: indexer compressor step...\n", layer_idx);
         build_indexer_compressor_step(ctx, gf, cur_last, w, L, lc, token_pos, i32_inputs);
-        fprintf(stderr, "[ds4] layer %d: indexer score...\n", layer_idx);
         allowed_comp = build_indexer_score(ctx, qr_last, cur_last, w, L, lc, token_pos, i32_inputs);
-        fprintf(stderr, "[ds4] layer %d: indexer done (comp=%p)\n", layer_idx, (void*)allowed_comp);
     }
 
     // ── Attention: placeholder dense path + DS4 selective compressed context ──
@@ -571,7 +566,6 @@ static bool deepseek4_step_hybrid(
     ggml_gallocr_t cold_alloc = nullptr;
 
     for (int il = 0; il < w.n_layer; ++il) {
-        fprintf(stderr, "[ds4] layer %d/%d start (n_tokens=%d)\n", il, w.n_layer, n_tokens);
         const DeepSeek4Layer & L = w.layers[(size_t) il];
         DeepSeek4LayerCache & lc = cache.layers[(size_t) il];
         const size_t ctx_size = 48 * 1024 * 1024;
@@ -596,10 +590,8 @@ static bool deepseek4_step_hybrid(
         // TODO: HC pre-mix (requires proper [n_embd, n_tokens] HC state management)
         // For now, bypass HC and use direct residual path.
         ggml_tensor * normed = build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
-        fprintf(stderr, "[ds4] layer %d: rms_norm OK, building MLA...\n", il);
         ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
                                                      kv_start, n_tokens, i32_inputs);
-        fprintf(stderr, "[ds4] layer %d: MLA OK, building residual+ffn...\n", il);
         ggml_tensor * residual = ggml_add(ctx, cur_tensor, attn_out);
 
         ggml_tensor * ffn_in = residual;
@@ -610,23 +602,19 @@ static bool deepseek4_step_hybrid(
             ggml_tensor * ffn_out = build_shared_ffn(ctx, ffn_post, w, L);
             ggml_tensor * next = ggml_add(ctx, residual, ffn_out);
             ggml_build_forward_expand(gf, next);
-            fprintf(stderr, "[ds4] layer %d graph built (%d nodes), allocating...\n", il, ggml_graph_n_nodes(gf));
             ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
             if (!ggml_gallocr_alloc_graph(alloc, gf)) {
-                fprintf(stderr, "[ds4] layer %d alloc failed\n", il);
                 ggml_gallocr_free(alloc);
                 ggml_free(ctx);
                 if (hot_alloc) ggml_gallocr_free(hot_alloc);
                 if (cold_alloc) ggml_gallocr_free(cold_alloc);
                 return false;
             }
-            fprintf(stderr, "[ds4] layer %d alloc OK, computing...\n", il);
             ggml_backend_tensor_set(inp, cur.data(), 0, sizeof(float) * cur.size());
             for (const DeepSeek4I32InputBinding & binding : i32_inputs) {
                 ggml_backend_tensor_set(binding.tensor, &binding.value, 0, sizeof(binding.value));
             }
             const bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
-            fprintf(stderr, "[ds4] layer %d hash-ffn compute %s\n", il, ok ? "OK" : "FAIL");
             if (ok) {
                 ggml_backend_tensor_get(next, cur.data(), 0, sizeof(float) * cur.size());
             }
@@ -658,9 +646,7 @@ static bool deepseek4_step_hybrid(
         for (const DeepSeek4I32InputBinding & binding : i32_inputs) {
             ggml_backend_tensor_set(binding.tensor, &binding.value, 0, sizeof(binding.value));
         }
-        fprintf(stderr, "[ds4] layer %d moe graph compute...\n", il);
         const bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
-        fprintf(stderr, "[ds4] layer %d moe compute %s\n", il, ok ? "OK" : "FAIL");
         if (!ok) {
             ggml_gallocr_free(alloc);
             ggml_free(ctx);
