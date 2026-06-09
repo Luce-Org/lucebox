@@ -596,8 +596,10 @@ static bool deepseek4_step_hybrid(
         // TODO: HC pre-mix (requires proper [n_embd, n_tokens] HC state management)
         // For now, bypass HC and use direct residual path.
         ggml_tensor * normed = build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
+        fprintf(stderr, "[ds4] layer %d: rms_norm OK, building MLA...\n", il);
         ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
                                                      kv_start, n_tokens, i32_inputs);
+        fprintf(stderr, "[ds4] layer %d: MLA OK, building residual+ffn...\n", il);
         ggml_tensor * residual = ggml_add(ctx, cur_tensor, attn_out);
 
         ggml_tensor * ffn_in = residual;
