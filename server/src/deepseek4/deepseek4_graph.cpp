@@ -10,6 +10,7 @@
 
 #include "deepseek4_internal.h"
 #include "internal.h"
+#include "../common/deepseek4_expert_ipc.h"
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_types.h"
 
@@ -670,6 +671,99 @@ static ggml_tensor * build_shared_ffn(
     return ggml_mul_mat(ctx, L.ffn_down_shexp, mid_sh);
 }
 
+static bool eval_ds4_hybrid_or_worker(
+        ggml_backend_t backend,
+        ggml_backend_t cpu_backend,
+        const MoeHybridConfig & hybrid_cfg,
+        const MoeLayerDesc & desc,
+        MoeHybridLayerStorage & storage,
+        DeepSeek4ExpertIpcClient * expert_worker,
+        int layer,
+        int n_embd,
+        int n_expert_used,
+        const float * ffn_normed_host,
+        const int32_t * selected_host,
+        const float * weights_host,
+        int n_tokens,
+        std::vector<float> & ffn_out_host,
+        ggml_gallocr_t * hot_alloc,
+        ggml_gallocr_t * cold_alloc) {
+    const bool use_worker = expert_worker && expert_worker->active() &&
+        !storage.down_cold && !storage.gate_up_cold;
+    if (!use_worker) {
+        bool ffn_ok = eval_moe_hybrid_ffn_batched(
+            backend, cpu_backend, hybrid_cfg, desc, storage,
+            ffn_normed_host, selected_host, weights_host,
+            n_tokens, ffn_out_host, nullptr, hot_alloc, cold_alloc);
+        if (ffn_ok) return true;
+
+        ffn_out_host.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
+        std::vector<float> single_out;
+        for (int ti = 0; ti < n_tokens; ++ti) {
+            if (!eval_moe_hybrid_ffn_single(
+                    backend, hybrid_cfg, desc, storage, cpu_backend,
+                    ffn_normed_host + (size_t)ti * (size_t)n_embd,
+                    selected_host + (size_t)ti * (size_t)n_expert_used,
+                    weights_host + (size_t)ti * (size_t)n_expert_used,
+                    n_expert_used, single_out)) {
+                return false;
+            }
+            std::memcpy(ffn_out_host.data() + (size_t)ti * (size_t)n_embd,
+                        single_out.data(), sizeof(float) * (size_t)n_embd);
+        }
+        return true;
+    }
+
+    ffn_out_host.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
+    std::vector<float> single_out;
+    std::vector<float> worker_out;
+    std::vector<int32_t> local_ids;
+    std::vector<float> local_weights;
+    std::vector<int32_t> remote_ids;
+    std::vector<float> remote_weights;
+    for (int ti = 0; ti < n_tokens; ++ti) {
+        local_ids.clear();
+        local_weights.clear();
+        remote_ids.clear();
+        remote_weights.clear();
+        const int32_t * ids = selected_host + (size_t)ti * (size_t)n_expert_used;
+        const float * weights = weights_host + (size_t)ti * (size_t)n_expert_used;
+        for (int ei = 0; ei < n_expert_used; ++ei) {
+            const int32_t gid = ids[ei];
+            if (gid < 0 || gid >= (int32_t)storage.hot_local_by_global.size()) return false;
+            if (storage.hot_local_by_global[(size_t)gid] >= 0) {
+                local_ids.push_back(gid);
+                local_weights.push_back(weights[ei]);
+            } else {
+                remote_ids.push_back(gid);
+                remote_weights.push_back(weights[ei]);
+            }
+        }
+
+        float * dst = ffn_out_host.data() + (size_t)ti * (size_t)n_embd;
+        if (!eval_moe_hybrid_ffn_single(
+                backend, hybrid_cfg, desc, storage, cpu_backend,
+                ffn_normed_host + (size_t)ti * (size_t)n_embd,
+                local_ids.data(), local_weights.data(), (int)local_ids.size(),
+                single_out)) {
+            return false;
+        }
+        std::memcpy(dst, single_out.data(), sizeof(float) * (size_t)n_embd);
+        if (!remote_ids.empty()) {
+            if (!expert_worker->eval(layer, 1, n_embd, (int)remote_ids.size(),
+                                     ffn_normed_host + (size_t)ti * (size_t)n_embd,
+                                     remote_ids.data(), remote_weights.data(),
+                                     worker_out)) {
+                return false;
+            }
+            for (int i = 0; i < n_embd; ++i) {
+                dst[i] += worker_out[(size_t)i];
+            }
+        }
+    }
+    return true;
+}
+
 static Ds4MoeRouting build_moe_routing(
         ggml_context * ctx,
         ggml_tensor * cur,
@@ -962,7 +1056,8 @@ static bool deepseek4_step_hybrid(
         int n_tokens,
         int kv_start,
         std::vector<float> & out_logits,
-        const int32_t * token_ids) {
+        const int32_t * token_ids,
+        DeepSeek4ExpertIpcClient * expert_worker) {
     const int n_embd = w.n_embd;
     const int n_hc = w.n_hc;
     const int hc_dim = n_hc * n_embd;
@@ -1181,27 +1276,14 @@ static bool deepseek4_step_hybrid(
             MoeHybridConfig hybrid_cfg = make_ds4_moe_hybrid_config(w);
             MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
             auto & storage = moe_hybrid.layers[(size_t) il];
-            bool ffn_ok = eval_moe_hybrid_ffn_batched(
-                backend, cpu_backend, hybrid_cfg, desc, storage,
-                ffn_normed_host.data(), selected_host.data(), weights_host.data(),
-                n_tokens, ffn_out_host, nullptr, &hot_alloc, &cold_alloc);
-            if (!ffn_ok) {
-                ffn_out_host.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
-                std::vector<float> single_out;
-                for (int ti = 0; ti < n_tokens; ++ti) {
-                    if (!eval_moe_hybrid_ffn_single(
-                            backend, hybrid_cfg, desc, storage, cpu_backend,
-                            ffn_normed_host.data() + (size_t)ti * (size_t)n_embd,
-                            selected_host.data() + (size_t)ti * (size_t)w.n_expert_used,
-                            weights_host.data() + (size_t)ti * (size_t)w.n_expert_used,
-                            w.n_expert_used, single_out)) {
-                        if (hot_alloc) ggml_gallocr_free(hot_alloc);
-                        if (cold_alloc) ggml_gallocr_free(cold_alloc);
-                        return false;
-                    }
-                    std::memcpy(ffn_out_host.data() + (size_t)ti * (size_t)n_embd,
-                                single_out.data(), sizeof(float) * (size_t)n_embd);
-                }
+            if (!eval_ds4_hybrid_or_worker(
+                    backend, cpu_backend, hybrid_cfg, desc, storage, expert_worker,
+                    il, n_embd, w.n_expert_used,
+                    ffn_normed_host.data(), selected_host.data(), weights_host.data(),
+                    n_tokens, ffn_out_host, &hot_alloc, &cold_alloc)) {
+                if (hot_alloc) ggml_gallocr_free(hot_alloc);
+                if (cold_alloc) ggml_gallocr_free(cold_alloc);
+                return false;
             }
         } else {
             // MoE layers: compute routing on GPU, experts via hybrid
@@ -1293,27 +1375,14 @@ static bool deepseek4_step_hybrid(
             MoeHybridConfig hybrid_cfg = make_ds4_moe_hybrid_config(w);
             MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
             auto & storage = moe_hybrid.layers[(size_t) il];
-            bool ffn_ok = eval_moe_hybrid_ffn_batched(
-                backend, cpu_backend, hybrid_cfg, desc, storage,
-                ffn_normed_host.data(), selected_host.data(), weights_host.data(),
-                n_tokens, ffn_out_host, nullptr, &hot_alloc, &cold_alloc);
-            if (!ffn_ok) {
-                ffn_out_host.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
-                std::vector<float> single_out;
-                for (int ti = 0; ti < n_tokens; ++ti) {
-                    if (!eval_moe_hybrid_ffn_single(
-                            backend, hybrid_cfg, desc, storage, cpu_backend,
-                            ffn_normed_host.data() + (size_t)ti * (size_t)n_embd,
-                            selected_host.data() + (size_t)ti * (size_t)w.n_expert_used,
-                            weights_host.data() + (size_t)ti * (size_t)w.n_expert_used,
-                            w.n_expert_used, single_out)) {
-                        if (hot_alloc) ggml_gallocr_free(hot_alloc);
-                        if (cold_alloc) ggml_gallocr_free(cold_alloc);
-                        return false;
-                    }
-                    std::memcpy(ffn_out_host.data() + (size_t)ti * (size_t)n_embd,
-                                single_out.data(), sizeof(float) * (size_t)n_embd);
-                }
+            if (!eval_ds4_hybrid_or_worker(
+                    backend, cpu_backend, hybrid_cfg, desc, storage, expert_worker,
+                    il, n_embd, w.n_expert_used,
+                    ffn_normed_host.data(), selected_host.data(), weights_host.data(),
+                    n_tokens, ffn_out_host, &hot_alloc, &cold_alloc)) {
+                if (hot_alloc) ggml_gallocr_free(hot_alloc);
+                if (cold_alloc) ggml_gallocr_free(cold_alloc);
+                return false;
             }
         }
 
@@ -1403,12 +1472,13 @@ bool deepseek4_step(
         int kv_start,
         std::vector<float> & out_logits,
         MoeHybridStorage * moe_hybrid,
-        const int32_t * token_ids) {
+        const int32_t * token_ids,
+        DeepSeek4ExpertIpcClient * expert_worker) {
 
     if (w.moe_hybrid && moe_hybrid != nullptr) {
         return deepseek4_step_hybrid(backend, w, cache, *moe_hybrid,
                                      embed, n_tokens, kv_start, out_logits,
-                                     token_ids);
+                                     token_ids, expert_worker);
     }
 
     const int n_embd = w.n_embd;

@@ -33,6 +33,17 @@ static double gib(uint64_t bytes) {
     return (double) bytes / 1024.0 / 1024.0 / 1024.0;
 }
 
+static int env_int(const char * name, int fallback) {
+    const char * value = std::getenv(name);
+    if (!value || !value[0]) return fallback;
+    return std::atoi(value);
+}
+
+static const char * env_str(const char * name, const char * fallback) {
+    const char * value = std::getenv(name);
+    return (value && value[0]) ? value : fallback;
+}
+
 static uint64_t layer_expert_bytes(const DeepSeek4Layer & layer, int n_expert) {
     if (n_expert <= 0) return 0;
     uint64_t bytes = 0;
@@ -133,6 +144,20 @@ static uint64_t estimate_ds4_cache_bytes(const DeepSeek4Weights & w, int max_ctx
     return total_bytes;
 }
 
+static MoeHybridConfig make_ds4_parent_worker_cfg(const DeepSeek4Weights & w) {
+    MoeHybridConfig cfg;
+    cfg.n_embd = w.n_embd;
+    cfg.n_expert = w.n_expert;
+    cfg.n_expert_used = w.n_expert_used;
+    cfg.n_ff_exp = w.n_ff_exp;
+    cfg.n_ff_shexp = w.n_ff_exp;
+    cfg.n_layer = w.n_layer;
+    cfg.first_moe_layer = 0;
+    cfg.swiglu_clamp = w.swiglu_clamp_exp;
+    cfg.materialize_cold_experts = false;
+    return cfg;
+}
+
 }  // namespace
 
 DeepSeek4Backend::DeepSeek4Backend(const DeepSeek4BackendConfig & cfg)
@@ -171,6 +196,21 @@ bool DeepSeek4Backend::init() {
     if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
         std::fprintf(stderr, "[deepseek4] failed to allocate KV cache (ctx=%d)\n", max_ctx);
         return false;
+    }
+
+    if (moe_hybrid_ && env_flag_enabled("DFLASH_DS4_EXPERT_IPC")) {
+        const std::string bin = env_str("DFLASH_DS4_EXPERT_IPC_BIN", "backend_ipc_daemon");
+        const std::string model = env_str("DFLASH_DS4_EXPERT_IPC_MODEL", cfg_.model_path);
+        const std::string work_dir = env_str("DFLASH_DS4_EXPERT_IPC_WORK_DIR", "");
+        const int worker_gpu = env_int("DFLASH_DS4_EXPERT_IPC_GPU", 0);
+        expert_worker_ = std::make_unique<DeepSeek4ExpertIpcClient>();
+        if (!expert_worker_->start(bin, model, worker_gpu, work_dir)) {
+            std::fprintf(stderr, "[deepseek4] failed to start expert IPC worker: bin=%s model=%s gpu=%d\n",
+                         bin.c_str(), model.c_str(), worker_gpu);
+            return false;
+        }
+        std::fprintf(stderr, "[deepseek4] expert IPC worker ready: bin=%s gpu=%d\n",
+                     bin.c_str(), worker_gpu);
     }
 
     std::fprintf(stderr, "[deepseek4] initialized: %d layers, ctx=%d, %d experts (%d used)%s\n",
@@ -298,7 +338,13 @@ bool DeepSeek4Backend::init_hybrid_model() {
     }
 
     auto hybrid = std::make_shared<MoeHybridStorage>();
-    if (!build_deepseek4_moe_hybrid_storage_from_file(cfg_.model_path, backend_, w_, moe_placement_, *hybrid, &err)) {
+    MoeHybridConfig worker_cfg;
+    MoeHybridConfig * cfg_override = nullptr;
+    if (env_flag_enabled("DFLASH_DS4_EXPERT_IPC")) {
+        worker_cfg = make_ds4_parent_worker_cfg(w_);
+        cfg_override = &worker_cfg;
+    }
+    if (!build_deepseek4_moe_hybrid_storage_from_file(cfg_.model_path, backend_, w_, moe_placement_, cfg_override, *hybrid, &err)) {
         std::fprintf(stderr, "[deepseek4] failed to build hybrid expert storage: %s\n", err.c_str());
         return false;
     }
@@ -354,7 +400,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         // Run forward pass
         std::vector<float> logits;
         if (!deepseek4_step(backend_, w_, cache_, embed.data(), n_tok, pos, logits,
-                            moe_hybrid_.get(), tokens.data() + i)) {
+                            moe_hybrid_.get(), tokens.data() + i, expert_worker_.get())) {
             std::fprintf(stderr, "[deepseek4] prefill step failed at pos=%d\n", pos);
             return -1;
         }
@@ -399,7 +445,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             const int pos = std::max(0, committed + generated - 1);
             if (!deepseek4_step(backend_, w_, cache_, embed.data(), 1,
                                 pos, logits,
-                                moe_hybrid_.get(), &tok_to_eval)) {
+                                moe_hybrid_.get(), &tok_to_eval, expert_worker_.get())) {
                 std::fprintf(stderr, "[deepseek4] decode step failed\n");
                 return false;
             }
@@ -511,6 +557,7 @@ void DeepSeek4Backend::shutdown() {
         free_deepseek4_snapshot(snapshots_[i]);
     }
     free_deepseek4_cache(cache_);
+    expert_worker_.reset();
     moe_hybrid_.reset();
     moe_placement_ = {};
     free_deepseek4_weights(w_);

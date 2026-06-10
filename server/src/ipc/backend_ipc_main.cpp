@@ -161,6 +161,8 @@ int main(int argc, char ** argv) {
     bool enable_dflash = false;
     int kvflash_pool_tokens = 0;
     const char * placement_path = nullptr;
+    const char * ds4_expert_budget_mb = nullptr;
+    const char * ds4_expert_offset = nullptr;
     for (int i = arg_begin; i < argc; i++) {
         if (std::strncmp(argv[i], "--ring-cap=", 11) == 0) {
             if (!parse_nonnegative_int(argv[i] + 11, ring_cap)) return 2;
@@ -286,6 +288,14 @@ int main(int argc, char ** argv) {
             placement_path = argv[i] + 12;
         } else if (std::strcmp(argv[i], "--placement") == 0) {
             if (!require_value(i, argc, argv, "--placement", placement_path)) return 2;
+        } else if (std::strncmp(argv[i], "--expert-budget-mb=", 19) == 0) {
+            ds4_expert_budget_mb = argv[i] + 19;
+        } else if (std::strcmp(argv[i], "--expert-budget-mb") == 0) {
+            if (i + 1 < argc) ds4_expert_budget_mb = argv[++i];
+        } else if (std::strncmp(argv[i], "--expert-offset=", 16) == 0) {
+            ds4_expert_offset = argv[i] + 16;
+        } else if (std::strcmp(argv[i], "--expert-offset") == 0) {
+            if (i + 1 < argc) ds4_expert_offset = argv[++i];
         } else {
             std::fprintf(stderr, "[backend-ipc-daemon] unknown option: %s\n", argv[i]);
             return 2;
@@ -294,6 +304,13 @@ int main(int argc, char ** argv) {
     (void)target_hidden;
     (void)target_vocab;
     (void)target_max_tokens;
+
+    if (ds4_expert_budget_mb) {
+        setenv("DFLASH_DS4_EXPERT_WORKER_BUDGET_MB", ds4_expert_budget_mb, 1);
+    }
+    if (ds4_expert_offset) {
+        setenv("DFLASH_DS4_EXPERT_WORKER_OFFSET", ds4_expert_offset, 1);
+    }
 
     switch (mode) {
         case BackendIpcMode::Invalid:

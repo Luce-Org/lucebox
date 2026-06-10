@@ -82,6 +82,8 @@ struct BackendIpcLaunchConfig {
     std::string work_dir;
     BackendIpcPayloadTransport payload_transport = BackendIpcPayloadTransport::Auto;
     size_t shared_payload_bytes = 0;
+    bool run_with_sudo = false;
+    bool stream_on_stdout = false;
 };
 
 struct BackendIpcPayloadSegment {

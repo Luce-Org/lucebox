@@ -23,6 +23,7 @@ namespace {
 
 struct Ds4ExpertWorker {
     ggml_backend_t backend = nullptr;
+    std::string model_path;
     DeepSeek4Weights weights;
     MoeHybridPlacement placement;
     std::shared_ptr<MoeHybridStorage> storage;
@@ -69,6 +70,21 @@ static MoeLayerDesc make_worker_desc(const DeepSeek4Layer & L) {
     return desc;
 }
 
+static MoeHybridPlacement make_single_layer_placement(const DeepSeek4Weights & w,
+                                                      int layer,
+                                                      const std::vector<int32_t> & experts) {
+    MoeHybridPlacement placement;
+    placement.n_layer = w.n_layer;
+    placement.n_expert = w.n_expert;
+    placement.n_expert_used = w.n_expert_used;
+    placement.total_hot = (int)experts.size();
+    placement.hot_counts.assign((size_t)w.n_layer, 0);
+    placement.hot_expert_ids.resize((size_t)w.n_layer);
+    placement.hot_counts[(size_t)layer] = (int)experts.size();
+    placement.hot_expert_ids[(size_t)layer] = experts;
+    return placement;
+}
+
 static bool build_worker_placement(const DeepSeek4Weights & w,
                                    int worker_gpu,
                                    MoeHybridPlacement & out,
@@ -106,31 +122,42 @@ static bool build_worker_placement(const DeepSeek4Weights & w,
         err = "worker expert budget is smaller than one uniform expert round";
         return false;
     }
+    int first_expert = 0;
+    if (const char * env = std::getenv("DFLASH_DS4_EXPERT_WORKER_OFFSET")) {
+        first_expert = std::max(0, std::atoi(env));
+    }
+    if (first_expert >= w.n_expert) first_expert = 0;
+    const int resident_per_layer = std::min(hot_per_layer, w.n_expert - first_expert);
+    if (resident_per_layer <= 0) {
+        err = "worker expert offset leaves no resident experts";
+        return false;
+    }
 
     out = {};
     out.n_layer = w.n_layer;
     out.n_expert = w.n_expert;
     out.n_expert_used = w.n_expert_used;
-    out.total_hot = hot_per_layer * w.n_layer;
-    out.hot_counts.assign((size_t)w.n_layer, hot_per_layer);
+    out.total_hot = resident_per_layer * w.n_layer;
+    out.hot_counts.assign((size_t)w.n_layer, resident_per_layer);
     out.hot_expert_ids.resize((size_t)w.n_layer);
     for (int il = 0; il < w.n_layer; ++il) {
         auto & ids = out.hot_expert_ids[(size_t)il];
-        ids.reserve((size_t)hot_per_layer);
-        for (int ie = 0; ie < hot_per_layer; ++ie) {
+        ids.reserve((size_t)resident_per_layer);
+        for (int ie = first_expert; ie < first_expert + resident_per_layer; ++ie) {
             ids.push_back((int32_t)ie);
         }
     }
     std::fprintf(stderr,
-                 "[deepseek4-expert-ipc-daemon] placement gpu_total=%.2f GiB gpu_free=%.2f GiB budget=%.2f GiB hot/layer=%d total_hot=%d\n",
+                 "[deepseek4-expert-ipc-daemon] placement gpu_total=%.2f GiB gpu_free=%.2f GiB budget=%.2f GiB hot/layer=%d first=%d total_hot=%d\n",
                  (double)gpu_total / 1024.0 / 1024.0 / 1024.0,
                  (double)gpu_free / 1024.0 / 1024.0 / 1024.0,
                  (double)budget / 1024.0 / 1024.0 / 1024.0,
-                 hot_per_layer, out.total_hot);
+                 resident_per_layer, first_expert, out.total_hot);
     return true;
 }
 
 static bool init_worker(const char * model_path, int worker_gpu, Ds4ExpertWorker & worker) {
+    worker.model_path = model_path;
     worker.backend = ggml_backend_cuda_init(std::max(0, worker_gpu));
     if (!worker.backend) {
         std::fprintf(stderr, "[deepseek4-expert-ipc-daemon] backend init failed gpu=%d\n",
@@ -166,6 +193,92 @@ static bool init_worker(const char * model_path, int worker_gpu, Ds4ExpertWorker
                  "[deepseek4-expert-ipc-daemon] expert storage ready hot=%d cold=%d cold_materialized=%s\n",
                  worker.placement.total_hot, total_cold,
                  worker.storage->materialized_cold_experts ? "yes" : "no");
+    return true;
+}
+
+static bool eval_worker_selected(ggml_backend_t backend,
+                                 const MoeHybridConfig & cfg,
+                                 const MoeLayerDesc & desc,
+                                 MoeHybridLayerStorage & storage,
+                                 ggml_backend_t cpu_backend,
+                                 const float * activation,
+                                 const std::vector<int32_t> & selected_ids,
+                                 const std::vector<float> & selected_weights,
+                                 std::vector<float> & out,
+                                 std::string & err) {
+    if (selected_ids.empty()) {
+        out.assign((size_t)cfg.n_embd, 0.0f);
+        return true;
+    }
+    return eval_moe_hybrid_ffn_single(
+        backend, cfg, desc, storage, cpu_backend, activation,
+        selected_ids.data(), selected_weights.data(), (int)selected_ids.size(),
+        out, nullptr, &err);
+}
+
+static bool eval_worker_token(Ds4ExpertWorker & worker,
+                              int layer,
+                              const float * activation,
+                              const int32_t * selected_ids,
+                              const float * selected_weights,
+                              int n_selected,
+                              std::vector<float> & out,
+                              std::string & err) {
+    auto & resident = worker.storage->layers[(size_t)layer];
+    std::vector<int32_t> resident_ids;
+    std::vector<float> resident_weights;
+    std::vector<int32_t> miss_ids;
+    std::vector<float> miss_weights;
+    for (int i = 0; i < n_selected; ++i) {
+        const int32_t gid = selected_ids[i];
+        if (gid < 0 || gid >= worker.weights.n_expert) {
+            err = "selected id out of range";
+            return false;
+        }
+        if (gid < (int32_t)resident.hot_local_by_global.size() &&
+            resident.hot_local_by_global[(size_t)gid] >= 0) {
+            resident_ids.push_back(gid);
+            resident_weights.push_back(selected_weights[i]);
+        } else {
+            miss_ids.push_back(gid);
+            miss_weights.push_back(selected_weights[i]);
+        }
+    }
+
+    out.assign((size_t)worker.cfg.n_embd, 0.0f);
+    MoeLayerDesc desc = make_worker_desc(worker.weights.layers[(size_t)layer]);
+    std::vector<float> partial;
+    if (!eval_worker_selected(worker.backend, worker.cfg, desc, resident,
+                              worker.storage->cpu_backend, activation,
+                              resident_ids, resident_weights, partial, err)) {
+        return false;
+    }
+    for (int i = 0; i < worker.cfg.n_embd; ++i) {
+        out[(size_t)i] += partial[(size_t)i];
+    }
+
+    if (miss_ids.empty()) return true;
+
+    MoeHybridStorage miss_storage;
+    MoeHybridPlacement miss_placement =
+        make_single_layer_placement(worker.weights, layer, miss_ids);
+    if (!build_deepseek4_moe_hybrid_storage_from_file(
+            worker.model_path, worker.backend, worker.weights, miss_placement,
+            &worker.cfg, miss_storage, &err)) {
+        return false;
+    }
+    std::fprintf(stderr,
+                 "[deepseek4-expert-ipc-daemon] file-backed miss layer=%d experts=%zu\n",
+                 layer, miss_ids.size());
+    if (!eval_worker_selected(worker.backend, worker.cfg, desc,
+                              miss_storage.layers[(size_t)layer],
+                              miss_storage.cpu_backend, activation,
+                              miss_ids, miss_weights, partial, err)) {
+        return false;
+    }
+    for (int i = 0; i < worker.cfg.n_embd; ++i) {
+        out[(size_t)i] += partial[(size_t)i];
+    }
     return true;
 }
 
@@ -265,17 +378,14 @@ int run_deepseek4_expert_ipc_daemon(const char * model_path,
             std::vector<float> out((size_t)hdr.n_tokens * (size_t)hdr.n_embd, 0.0f);
             std::vector<float> one_out;
             bool ok = true;
-            MoeLayerDesc desc = make_worker_desc(worker.weights.layers[(size_t)hdr.layer]);
             for (int t = 0; t < hdr.n_tokens; ++t) {
                 std::string err;
-                if (!eval_moe_hybrid_ffn_single(
-                        worker.backend, worker.cfg, desc,
-                        worker.storage->layers[(size_t)hdr.layer],
-                        worker.storage->cpu_backend,
+                if (!eval_worker_token(
+                        worker, hdr.layer,
                         activations.data() + (size_t)t * (size_t)hdr.n_embd,
                         ids.data() + (size_t)t * (size_t)hdr.n_selected,
                         weights.data() + (size_t)t * (size_t)hdr.n_selected,
-                        hdr.n_selected, one_out, nullptr, &err)) {
+                        hdr.n_selected, one_out, err)) {
                     std::fprintf(stderr, "[deepseek4-expert-ipc-daemon] eval failed layer=%d: %s\n",
                                  hdr.layer, err.c_str());
                     ok = false;

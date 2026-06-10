@@ -29,6 +29,7 @@ namespace dflash::common {
 
 struct MoeHybridPlacement;
 struct MoeHybridConfig;
+class DeepSeek4ExpertIpcClient;
 
 // ─── Per-layer tensor pointers ──────────────────────────────────────────
 
@@ -259,7 +260,8 @@ bool deepseek4_step(
     int                         kv_start,
     std::vector<float> &        out_logits,
     MoeHybridStorage *          moe_hybrid = nullptr,
-    const int32_t *             token_ids = nullptr);
+    const int32_t *             token_ids = nullptr,
+    DeepSeek4ExpertIpcClient *  expert_worker = nullptr);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,
