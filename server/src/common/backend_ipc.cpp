@@ -33,6 +33,7 @@ const char * backend_ipc_mode_name(BackendIpcMode mode) {
         case BackendIpcMode::Gemma4TargetShard: return "gemma4-target-shard";
         case BackendIpcMode::LagunaTargetShard: return "laguna-target-shard";
         case BackendIpcMode::MoeExpertCompute: return "moe-expert-compute";
+        case BackendIpcMode::DeepSeek4Expert: return "deepseek4-expert";
     }
     return "unknown";
 }
@@ -60,6 +61,10 @@ bool parse_backend_ipc_mode(const std::string & value, BackendIpcMode & out) {
     }
     if (value == "moe-expert-compute") {
         out = BackendIpcMode::MoeExpertCompute;
+        return true;
+    }
+    if (value == "deepseek4-expert") {
+        out = BackendIpcMode::DeepSeek4Expert;
         return true;
     }
     return false;
