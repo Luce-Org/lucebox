@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace dflash::common {
 
@@ -44,6 +45,14 @@ public:
                const std::string & work_dir);
 
     bool ping();
+    bool eval(int layer,
+              int n_tokens,
+              int n_embd,
+              int n_selected,
+              const float * activations,
+              const int32_t * selected_ids,
+              const float * selected_weights,
+              std::vector<float> & out);
     bool active() const { return active_; }
     void close();
 

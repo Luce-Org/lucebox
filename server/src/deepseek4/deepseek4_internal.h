@@ -28,6 +28,7 @@
 namespace dflash::common {
 
 struct MoeHybridPlacement;
+struct MoeHybridConfig;
 
 // ─── Per-layer tensor pointers ──────────────────────────────────────────
 
@@ -259,6 +260,15 @@ bool deepseek4_step(
     std::vector<float> &        out_logits,
     MoeHybridStorage *          moe_hybrid = nullptr,
     const int32_t *             token_ids = nullptr);
+
+bool build_deepseek4_moe_hybrid_storage_from_file(
+    const std::string &         path,
+    ggml_backend_t              backend,
+    const DeepSeek4Weights &    w,
+    const MoeHybridPlacement &  placement,
+    const MoeHybridConfig *     cfg_override,
+    MoeHybridStorage &          out,
+    std::string *               err = nullptr);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,

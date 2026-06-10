@@ -539,6 +539,7 @@ bool build_deepseek4_moe_hybrid_storage_from_file(
         ggml_backend_t backend,
         const DeepSeek4Weights & w,
         const MoeHybridPlacement & placement,
+        const MoeHybridConfig * cfg_override,
         MoeHybridStorage & out,
         std::string * err) {
     ggml_context * expert_meta = nullptr;
@@ -586,13 +587,25 @@ bool build_deepseek4_moe_hybrid_storage_from_file(
         layer_descs[(size_t)il] = make_ds4_moe_layer_desc(w.layers[(size_t)il]);
     }
 
+    const MoeHybridConfig cfg = cfg_override ? *cfg_override : make_ds4_moe_hybrid_config(w);
     const bool ok = build_moe_hybrid_storage_from_file(
-        make_ds4_moe_hybrid_config(w), backend, placement, layer_descs, layer_file_data, out, err);
+        cfg, backend, placement, layer_descs, layer_file_data, out, err);
 
     mmap.close_map();
     gguf_free(gctx);
     if (expert_meta) ggml_free(expert_meta);
     return ok;
+}
+
+bool build_deepseek4_moe_hybrid_storage_from_file(
+        const std::string & path,
+        ggml_backend_t backend,
+        const DeepSeek4Weights & w,
+        const MoeHybridPlacement & placement,
+        MoeHybridStorage & out,
+        std::string * err) {
+    return build_deepseek4_moe_hybrid_storage_from_file(
+        path, backend, w, placement, nullptr, out, err);
 }
 
 void free_deepseek4_weights(DeepSeek4Weights & w) {

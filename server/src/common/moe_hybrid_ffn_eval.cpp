@@ -885,6 +885,11 @@ bool eval_moe_hybrid_ffn_single(
     // ── Cold path on selected cold backend ──
     const auto cold_t0 = HybridClock::now();
     if (has_cold) {
+        if (!storage.down_cold) {
+            if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
+            if (err) *err = "selected cold experts are not materialized";
+            return false;
+        }
         if (!storage.cold_graph.valid() || storage.cold_graph.n_hot != n_cold) {
             build_cached_cold_graph(storage.cold_graph, cold_backend,
                                     storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
@@ -1381,6 +1386,13 @@ static bool eval_moe_hybrid_ffn_batched_core(
             return false;
         }
     } else if (has_cold) {
+        if (!storage.down_cold) {
+            if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
+            if (!p_hot_alloc && hot_alloc) ggml_gallocr_free(hot_alloc);
+            if (hot_ctx) ggml_free(hot_ctx);
+            if (err) *err = "selected cold experts are not materialized";
+            return false;
+        }
         ggml_init_params ip{};
         ip.mem_size = 128 * 1024 * 1024;
         ip.mem_buffer = nullptr;
@@ -2176,6 +2188,10 @@ bool eval_moe_hybrid_ffn_gpu_resident(
                 return false;
             }
         } else {
+            if (!storage.down_cold) {
+                if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
+                return false;
+            }
             if (!storage.cold_graph.valid() || storage.cold_graph.n_hot != n_cold) {
                 build_cached_cold_graph(storage.cold_graph, cold_backend,
                                         storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,

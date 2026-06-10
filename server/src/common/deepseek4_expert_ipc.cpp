@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <fstream>
 
 namespace dflash::common {
 
@@ -47,6 +48,72 @@ bool DeepSeek4ExpertIpcClient::ping() {
     std::fflush(cmd);
     int32_t status = -1;
     return read_exact_fd(stream_fd, &status, sizeof(status)) && status == 0;
+#endif
+}
+
+bool DeepSeek4ExpertIpcClient::eval(int layer,
+                                    int n_tokens,
+                                    int n_embd,
+                                    int n_selected,
+                                    const float * activations,
+                                    const int32_t * selected_ids,
+                                    const float * selected_weights,
+                                    std::vector<float> & out) {
+#if defined(_WIN32)
+    (void)layer; (void)n_tokens; (void)n_embd; (void)n_selected;
+    (void)activations; (void)selected_ids; (void)selected_weights; (void)out;
+    return false;
+#else
+    out.clear();
+    FILE * cmd = process_.command_stream();
+    const int stream_fd = process_.stream_fd();
+    if (!active_ || !cmd || stream_fd < 0 || layer < 0 ||
+        n_tokens <= 0 || n_embd <= 0 || n_selected <= 0 ||
+        !activations || !selected_ids || !selected_weights) {
+        return false;
+    }
+
+    const std::string path = process_.next_path("ds4_expert_req");
+    {
+        std::ofstream f(path, std::ios::binary);
+        if (!f) return false;
+        DeepSeek4ExpertIpcRequestHeader hdr;
+        hdr.layer = layer;
+        hdr.n_tokens = n_tokens;
+        hdr.n_embd = n_embd;
+        hdr.n_selected = n_selected;
+        f.write((const char *)&hdr, sizeof(hdr));
+        f.write((const char *)activations,
+                sizeof(float) * (size_t)n_tokens * (size_t)n_embd);
+        f.write((const char *)selected_ids,
+                sizeof(int32_t) * (size_t)n_tokens * (size_t)n_selected);
+        f.write((const char *)selected_weights,
+                sizeof(float) * (size_t)n_tokens * (size_t)n_selected);
+        if (!f) {
+            std::remove(path.c_str());
+            return false;
+        }
+    }
+
+    std::fprintf(cmd, "eval %s\n", path.c_str());
+    std::fflush(cmd);
+
+    DeepSeek4ExpertIpcResponseHeader resp;
+    bool ok = read_exact_fd(stream_fd, &resp, sizeof(resp)) &&
+              resp.magic == 0x44533452u &&
+              resp.version == 1 &&
+              resp.status == 0 &&
+              resp.n_tokens == n_tokens &&
+              resp.n_embd == n_embd;
+    if (ok) {
+        out.assign((size_t)n_tokens * (size_t)n_embd, 0.0f);
+        ok = read_exact_fd(stream_fd, out.data(), out.size() * sizeof(float));
+    }
+    std::remove(path.c_str());
+    if (!ok) {
+        out.clear();
+    }
+    return ok;
 #endif
 }
 
