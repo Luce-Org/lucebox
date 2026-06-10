@@ -710,10 +710,11 @@ static bool eval_ds4_hybrid_or_worker(
         std::vector<float> & ffn_out_host,
         ggml_gallocr_t * hot_alloc,
         ggml_gallocr_t * cold_alloc,
+        bool worker_owns_hot_ids,
         DeepSeek4StepTelemetry * step_tel) {
     const auto ffn_t0 = Ds4TimingClock::now();
     const bool use_worker = expert_worker && expert_worker->active() &&
-        !storage.down_cold && !storage.gate_up_cold;
+        (worker_owns_hot_ids || (!storage.down_cold && !storage.gate_up_cold));
     if (!use_worker) {
         MoeHybridFfnTelemetry ffn_tel;
         bool ffn_ok = eval_moe_hybrid_ffn_batched(
@@ -767,7 +768,8 @@ static bool eval_ds4_hybrid_or_worker(
         for (int ei = 0; ei < n_expert_used; ++ei) {
             const int32_t gid = ids[ei];
             if (gid < 0 || gid >= (int32_t)storage.hot_local_by_global.size()) return false;
-            if (storage.hot_local_by_global[(size_t)gid] >= 0) {
+            const bool is_hot_id = storage.hot_local_by_global[(size_t)gid] >= 0;
+            if (worker_owns_hot_ids ? !is_hot_id : is_hot_id) {
                 local_ids.push_back(gid);
                 local_weights.push_back(weights[ei]);
             } else {
@@ -796,6 +798,13 @@ static bool eval_ds4_hybrid_or_worker(
                 return false;
             }
             if (step_tel) step_tel->worker_us += ds4_elapsed_us(worker_t0, Ds4TimingClock::now());
+            if (step_tel) {
+                if (worker_owns_hot_ids) {
+                    step_tel->hot_selected += (int)remote_ids.size();
+                } else {
+                    step_tel->cold_selected += (int)remote_ids.size();
+                }
+            }
             for (int i = 0; i < n_embd; ++i) {
                 dst[i] += worker_out[(size_t)i];
             }
@@ -1099,6 +1108,7 @@ static bool deepseek4_step_hybrid(
         std::vector<float> & out_logits,
         const int32_t * token_ids,
         DeepSeek4ExpertIpcClient * expert_worker,
+        bool worker_owns_hot_ids,
         DeepSeek4StepTelemetry * telemetry) {
     const auto step_t0 = Ds4TimingClock::now();
     const int n_embd = w.n_embd;
@@ -1343,7 +1353,8 @@ static bool deepseek4_step_hybrid(
                     backend, cpu_backend, hybrid_cfg, desc, storage, expert_worker,
                     il, n_embd, w.n_expert_used,
                     ffn_normed_host.data(), selected_host.data(), weights_host.data(),
-                    n_tokens, ffn_out_host, &hot_alloc, &cold_alloc, telemetry)) {
+                    n_tokens, ffn_out_host, &hot_alloc, &cold_alloc,
+                    worker_owns_hot_ids, telemetry)) {
                 if (hot_alloc) ggml_gallocr_free(hot_alloc);
                 if (cold_alloc) ggml_gallocr_free(cold_alloc);
                 return false;
@@ -1450,7 +1461,8 @@ static bool deepseek4_step_hybrid(
                     backend, cpu_backend, hybrid_cfg, desc, storage, expert_worker,
                     il, n_embd, w.n_expert_used,
                     ffn_normed_host.data(), selected_host.data(), weights_host.data(),
-                    n_tokens, ffn_out_host, &hot_alloc, &cold_alloc, telemetry)) {
+                    n_tokens, ffn_out_host, &hot_alloc, &cold_alloc,
+                    worker_owns_hot_ids, telemetry)) {
                 if (hot_alloc) ggml_gallocr_free(hot_alloc);
                 if (cold_alloc) ggml_gallocr_free(cold_alloc);
                 return false;
@@ -1552,12 +1564,13 @@ bool deepseek4_step(
         MoeHybridStorage * moe_hybrid,
         const int32_t * token_ids,
         DeepSeek4ExpertIpcClient * expert_worker,
+        bool worker_owns_hot_ids,
         DeepSeek4StepTelemetry * telemetry) {
 
     if (w.moe_hybrid && moe_hybrid != nullptr) {
         return deepseek4_step_hybrid(backend, w, cache, *moe_hybrid,
                                      embed, n_tokens, kv_start, out_logits,
-                                     token_ids, expert_worker, telemetry);
+                                     token_ids, expert_worker, worker_owns_hot_ids, telemetry);
     }
 
     const int n_embd = w.n_embd;

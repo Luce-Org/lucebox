@@ -160,6 +160,7 @@ struct MoeHybridStorage {
     ggml_backend_t cpu_backend = nullptr;
     ggml_backend_t cold_backend = nullptr; // Alias: either cpu_backend or caller-owned GPU/HIP backend.
     MoeHybridColdBackend cold_backend_kind = MoeHybridColdBackend::Cpu;
+    bool materialized_hot_experts = true;
     bool materialized_cold_experts = true;
     MoeHybridPlacement placement;
     std::vector<MoeHybridLayerStorage> layers;

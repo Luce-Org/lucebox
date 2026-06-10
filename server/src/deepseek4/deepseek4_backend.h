@@ -95,6 +95,7 @@ private:
     std::shared_ptr<MoeHybridStorage> moe_hybrid_;
     MoeHybridPlacement                moe_placement_;
     std::unique_ptr<DeepSeek4ExpertIpcClient> expert_worker_;
+    bool                              expert_worker_owns_hot_ids_ = false;
 };
 
 }  // namespace dflash::common

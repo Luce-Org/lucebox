@@ -135,6 +135,14 @@ static bool is_expert_tensor(const char * name) {
 
 static bool should_keep_ds4_tensor(const char * name,
                                    const TargetLoadPlan & plan) {
+    int layer_id = -1;
+    if (plan.expert_metadata_only) {
+        return parse_block_tensor_name(name, layer_id) &&
+               layer_id >= plan.layer_begin &&
+               layer_id < plan.layer_end &&
+               is_expert_tensor(name);
+    }
+
     // Global tensors
     if (std::strcmp(name, "token_embd.weight") == 0 ||
         std::strcmp(name, "output_norm.weight") == 0 ||
@@ -145,7 +153,6 @@ static bool should_keep_ds4_tensor(const char * name,
         return plan.load_output;
     }
 
-    int layer_id = -1;
     if (!parse_block_tensor_name(name, layer_id)) return false;
     return layer_id >= plan.layer_begin && layer_id < plan.layer_end;
 }
@@ -153,6 +160,7 @@ static bool should_keep_ds4_tensor(const char * name,
 static bool should_upload_ds4_tensor(const char * name,
                                      const TargetLoadPlan & plan) {
     if (!should_keep_ds4_tensor(name, plan)) return false;
+    if (plan.expert_metadata_only) return false;
     // token_embd stays on CPU for embedding lookup
     if (std::strcmp(name, "token_embd.weight") == 0) return false;
     return !(plan.skip_expert_tensors && is_expert_tensor(name));
@@ -306,7 +314,10 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     // ── Build load plan ─────────────────────────────────────────────────
     TargetLoadPlan plan = plan_in;
     if (plan.layer_end < 0) plan.layer_end = (int)n_layer;
-    plan.load_output = true;
+    if (plan.expert_metadata_only) {
+        plan.load_output = false;
+        plan.skip_expert_tensors = true;
+    }
 
     // ── Collect tensors for allocation ──────────────────────────────────
     const int n_tensors = gguf_get_n_tensors(gctx);
@@ -489,8 +500,9 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     gguf_free(gctx);
     // Note: meta_ctx is now owned by out.ctx — do NOT free it here.
 
-    std::fprintf(stderr, "[deepseek4] loaded %zu tensors, %.1f MB GPU buffer\n",
-                 allocs.size(), (double)total_buf_size / (1024.0 * 1024.0));
+    std::fprintf(stderr, "[deepseek4] loaded %zu tensors, %.1f MB GPU buffer%s\n",
+                 allocs.size(), (double)total_buf_size / (1024.0 * 1024.0),
+                 plan.expert_metadata_only ? " [expert-metadata-only]" : "");
     return true;
 }
 

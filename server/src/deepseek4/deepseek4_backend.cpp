@@ -217,6 +217,80 @@ static MoeHybridConfig make_ds4_parent_worker_cfg(const DeepSeek4Weights & w) {
     return cfg;
 }
 
+static MoeHybridConfig make_ds4_parent_cpu_tail_cfg(const DeepSeek4Weights & w) {
+    MoeHybridConfig cfg = make_ds4_parent_worker_cfg(w);
+    cfg.materialize_hot_experts = false;
+    cfg.materialize_cold_experts = true;
+    cfg.cold_expert_backend = MoeHybridColdBackend::Cpu;
+    return cfg;
+}
+
+static bool env_ds4_hip_hot_cpu_cold_split() {
+    const char * value = std::getenv("DFLASH_DS4_EXPERT_SPLIT");
+    return value && std::strcmp(value, "hip_hot_cpu_cold") == 0;
+}
+
+static bool compute_worker_hot_placement_from_env(const DeepSeek4Weights & w,
+                                                  MoeHybridPlacement & out,
+                                                  std::string * err) {
+    Ds4ExpertMemoryInfo mem;
+    if (!compute_ds4_expert_memory_info(w, nullptr, mem, err)) {
+        return false;
+    }
+
+    int hot_per_layer = env_int("DFLASH_DS4_HIP_HOT_PER_LAYER", 0);
+    if (hot_per_layer <= 0) {
+        const char * budget_env = std::getenv("DFLASH_DS4_EXPERT_WORKER_BUDGET_MB");
+        if (!budget_env || !budget_env[0]) {
+            budget_env = std::getenv("DFLASH_EXPERT_BUDGET_MB");
+        }
+        if (!budget_env || !budget_env[0]) {
+            if (err) *err = "split mode requires DFLASH_DS4_HIP_HOT_PER_LAYER or DFLASH_DS4_EXPERT_WORKER_BUDGET_MB";
+            return false;
+        }
+        const uint64_t budget = (uint64_t)std::max(0, std::atoi(budget_env)) << 20;
+        hot_per_layer = std::min(w.n_expert, (int)(budget / mem.bytes_per_uniform_round));
+    }
+    hot_per_layer = std::min(std::max(0, hot_per_layer), w.n_expert);
+    if (hot_per_layer <= 0) {
+        if (err) *err = "worker hot expert budget is smaller than one uniform expert round";
+        return false;
+    }
+
+    int first_expert = std::max(0, env_int("DFLASH_DS4_EXPERT_WORKER_OFFSET", 0));
+    if (first_expert >= w.n_expert) first_expert = 0;
+    const int resident_per_layer = std::min(hot_per_layer, w.n_expert - first_expert);
+    if (resident_per_layer <= 0) {
+        if (err) *err = "worker expert offset leaves no resident experts";
+        return false;
+    }
+
+    out = {};
+    out.n_layer = w.n_layer;
+    out.n_expert = w.n_expert;
+    out.n_expert_used = w.n_expert_used;
+    out.total_hot = resident_per_layer * w.n_layer;
+    out.hot_counts.assign((size_t) w.n_layer, resident_per_layer);
+    out.hot_expert_ids.resize((size_t) w.n_layer);
+    for (int il = 0; il < w.n_layer; ++il) {
+        auto & ids = out.hot_expert_ids[(size_t) il];
+        ids.reserve((size_t) resident_per_layer);
+        for (int ie = first_expert; ie < first_expert + resident_per_layer; ++ie) {
+            ids.push_back((int32_t) ie);
+        }
+    }
+
+    Ds4ExpertMemoryInfo placed_mem;
+    if (!compute_ds4_expert_memory_info(w, &out, placed_mem, err)) {
+        return false;
+    }
+    std::fprintf(stderr,
+                 "[deepseek4] split placement: worker_hot/layer=%d first=%d total_hot=%d\n",
+                 resident_per_layer, first_expert, out.total_hot);
+    log_ds4_expert_memory_info("split-worker-hot", placed_mem, w.n_layer);
+    return true;
+}
+
 }  // namespace
 
 DeepSeek4Backend::DeepSeek4Backend(const DeepSeek4BackendConfig & cfg)
@@ -257,7 +331,7 @@ bool DeepSeek4Backend::init() {
         return false;
     }
 
-    if (moe_hybrid_ && env_flag_enabled("DFLASH_DS4_EXPERT_IPC")) {
+    if (moe_hybrid_ && (env_flag_enabled("DFLASH_DS4_EXPERT_IPC") || expert_worker_owns_hot_ids_)) {
         const std::string bin = env_str("DFLASH_DS4_EXPERT_IPC_BIN", "backend_ipc_daemon");
         const std::string model = env_str("DFLASH_DS4_EXPERT_IPC_MODEL", cfg_.model_path);
         const std::string work_dir = env_str("DFLASH_DS4_EXPERT_IPC_WORK_DIR", "");
@@ -359,6 +433,7 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
 }
 
 bool DeepSeek4Backend::init_hybrid_model() {
+    expert_worker_owns_hot_ids_ = false;
     TargetLoadPlan plan;
     plan.skip_expert_tensors = true;
     if (!load_deepseek4_gguf_partial(cfg_.model_path, backend_, plan, w_)) {
@@ -369,7 +444,14 @@ bool DeepSeek4Backend::init_hybrid_model() {
 
     std::string err;
     const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
-    if (!compute_uniform_hybrid_placement(w_, max_ctx, moe_placement_, &err)) {
+    const bool split_hip_hot_cpu_cold = env_ds4_hip_hot_cpu_cold_split();
+    if (split_hip_hot_cpu_cold) {
+        if (!compute_worker_hot_placement_from_env(w_, moe_placement_, &err)) {
+            std::fprintf(stderr, "[deepseek4] failed to compute split placement: %s\n", err.c_str());
+            return false;
+        }
+        expert_worker_owns_hot_ids_ = true;
+    } else if (!compute_uniform_hybrid_placement(w_, max_ctx, moe_placement_, &err)) {
         std::fprintf(stderr, "[deepseek4] failed to compute hybrid placement: %s\n", err.c_str());
         return false;
     }
@@ -399,7 +481,10 @@ bool DeepSeek4Backend::init_hybrid_model() {
     auto hybrid = std::make_shared<MoeHybridStorage>();
     MoeHybridConfig worker_cfg;
     MoeHybridConfig * cfg_override = nullptr;
-    if (env_flag_enabled("DFLASH_DS4_EXPERT_IPC")) {
+    if (split_hip_hot_cpu_cold) {
+        worker_cfg = make_ds4_parent_cpu_tail_cfg(w_);
+        cfg_override = &worker_cfg;
+    } else if (env_flag_enabled("DFLASH_DS4_EXPERT_IPC")) {
         worker_cfg = make_ds4_parent_worker_cfg(w_);
         cfg_override = &worker_cfg;
     }
@@ -413,8 +498,9 @@ bool DeepSeek4Backend::init_hybrid_model() {
     const int total_cold = w_.n_layer * w_.n_expert - moe_placement_.total_hot;
     const char * cold_backend =
         moe_hybrid_->cold_backend_kind == MoeHybridColdBackend::Gpu ? "gpu" : "cpu";
-    std::fprintf(stderr, "[deepseek4] hybrid experts ready: hot=%d cold=%d cold_backend=%s\n",
-                 moe_placement_.total_hot, total_cold, cold_backend);
+    std::fprintf(stderr, "[deepseek4] hybrid experts ready: hot=%d cold=%d cold_backend=%s%s\n",
+                 moe_placement_.total_hot, total_cold, cold_backend,
+                 expert_worker_owns_hot_ids_ ? " [worker-hot/cpu-cold]" : "");
     return true;
 }
 
@@ -467,6 +553,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         std::vector<float> logits;
         if (!deepseek4_step(backend_, w_, cache_, embed.data(), n_tok, pos, logits,
                             moe_hybrid_.get(), tokens.data() + i, expert_worker_.get(),
+                            expert_worker_owns_hot_ids_,
                             timing ? &step_tel : nullptr)) {
             std::fprintf(stderr, "[deepseek4] prefill step failed at pos=%d\n", pos);
             return -1;
@@ -527,6 +614,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             if (!deepseek4_step(backend_, w_, cache_, embed.data(), 1,
                                 pos, logits,
                                 moe_hybrid_.get(), &tok_to_eval, expert_worker_.get(),
+                                expert_worker_owns_hot_ids_,
                                 timing ? &step_tel : nullptr)) {
                 std::fprintf(stderr, "[deepseek4] decode step failed\n");
                 return false;

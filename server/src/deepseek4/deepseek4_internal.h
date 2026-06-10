@@ -289,6 +289,7 @@ bool deepseek4_step(
     MoeHybridStorage *          moe_hybrid = nullptr,
     const int32_t *             token_ids = nullptr,
     DeepSeek4ExpertIpcClient *  expert_worker = nullptr,
+    bool                        worker_owns_hot_ids = false,
     DeepSeek4StepTelemetry *    telemetry = nullptr);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(

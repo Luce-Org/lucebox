@@ -165,7 +165,7 @@ static bool init_worker(const char * model_path, int worker_gpu, Ds4ExpertWorker
         return false;
     }
     TargetLoadPlan plan;
-    plan.skip_expert_tensors = true;
+    plan.expert_metadata_only = true;
     if (!load_deepseek4_gguf_partial(model_path, worker.backend, plan, worker.weights)) {
         std::fprintf(stderr, "[deepseek4-expert-ipc-daemon] partial model load failed: %s\n",
                      model_path);
@@ -190,7 +190,7 @@ static bool init_worker(const char * model_path, int worker_gpu, Ds4ExpertWorker
     }
     const int total_cold = worker.weights.n_layer * worker.weights.n_expert - worker.placement.total_hot;
     std::fprintf(stderr,
-                 "[deepseek4-expert-ipc-daemon] expert storage ready hot=%d cold=%d cold_materialized=%s\n",
+                 "[deepseek4-expert-ipc-daemon] expert storage ready expert_only=yes hot=%d cold=%d cold_materialized=%s\n",
                  worker.placement.total_hot, total_cold,
                  worker.storage->materialized_cold_experts ? "yes" : "no");
     return true;

@@ -842,6 +842,10 @@ bool eval_moe_hybrid_ffn_single(
     // ── Hot + Shared path on GPU ──
     bool hot_async_launched = false;
     const auto hot_t0 = HybridClock::now();
+    if (has_hot && !storage.down_hot && !storage.gate_up_hot) {
+        if (err) *err = "selected hot experts are not materialized";
+        return false;
+    }
     if (!has_hot && !has_shared) {
         hot_and_shared.assign((size_t)cfg.n_embd, 0.0f);
     } else {

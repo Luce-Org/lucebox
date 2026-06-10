@@ -192,6 +192,7 @@ bool MoeHybridStorage::matches(const MoeHybridConfig & cfg) const {
     return placement.matches(cfg) &&
            (int)layers.size() == cfg.n_layer &&
            cold_backend_kind == cfg.cold_expert_backend &&
+           materialized_hot_experts == cfg.materialize_hot_experts &&
            materialized_cold_experts == cfg.materialize_cold_experts;
 }
 
@@ -223,6 +224,7 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
     }
     ggml_backend_cpu_set_n_threads(out.cpu_backend, std::max(1, std::min(cfg.n_expert_used, 8)));
     out.cold_backend_kind = cfg.cold_expert_backend;
+    out.materialized_hot_experts = cfg.materialize_hot_experts;
     out.materialized_cold_experts = cfg.materialize_cold_experts;
     out.cold_backend = (cfg.cold_expert_backend == MoeHybridColdBackend::Gpu) ? gpu_backend : out.cpu_backend;
     if (!out.cold_backend) {
@@ -281,7 +283,7 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
         const int hot_count = (int)dst.hot_expert_ids.size();
 
         // Allocate hot expert tensors on GPU
-        if (hot_count > 0) {
+        if (hot_count > 0 && cfg.materialize_hot_experts) {
             ggml_init_params ip{};
             ip.mem_size   = 16 * ggml_tensor_overhead();
             ip.mem_buffer = nullptr;
@@ -424,6 +426,7 @@ bool build_moe_hybrid_storage_from_file(
     }
     ggml_backend_cpu_set_n_threads(out.cpu_backend, std::max(1, std::min(cfg.n_expert_used, 8)));
     out.cold_backend_kind = cfg.cold_expert_backend;
+    out.materialized_hot_experts = cfg.materialize_hot_experts;
     out.materialized_cold_experts = cfg.materialize_cold_experts;
     out.cold_backend = (cfg.cold_expert_backend == MoeHybridColdBackend::Gpu) ? gpu_backend : out.cpu_backend;
     if (!out.cold_backend) {
@@ -492,7 +495,7 @@ bool build_moe_hybrid_storage_from_file(
         dst.spare_lru.assign((size_t)spare, 0);
 
         // Allocate hot expert tensors on GPU
-        if (hot_count > 0) {
+        if (hot_count > 0 && cfg.materialize_hot_experts) {
             ggml_init_params ip{};
             ip.mem_size   = 16 * ggml_tensor_overhead();
             ip.mem_buffer = nullptr;
