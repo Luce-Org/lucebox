@@ -5,6 +5,7 @@
 
 #include "http_server.h"
 #include "sse_emitter.h"
+#include "prompt_normalize.h"
 #include "tool_hint.h"
 #include "common/sha1.h"
 
@@ -617,27 +618,10 @@ json build_props_body(const ServerConfig & config,
 // one helper guarantees token counting and generation can't drift.
 static void normalize_anthropic_system(const json & body, json & messages) {
     if (!body.contains("system")) return;
-    json sys_content = body["system"];
-    if (sys_content.is_array()) {
-        json filtered = json::array();
-        for (const auto & block : sys_content) {
-            if (block.is_object() && block.value("type", "") == "text") {
-                std::string text = block.value("text", "");
-                if (text.rfind("x-anthropic-billing-header:", 0) == 0) {
-                    continue;  // skip Claude Code billing header block
-                }
-            }
-            filtered.push_back(block);
-        }
-        sys_content = std::move(filtered);
-    } else if (sys_content.is_string()) {
-        std::string s = sys_content.get<std::string>();
-        if (s.rfind("x-anthropic-billing-header:", 0) == 0) {
-            sys_content = "";
-        }
-    }
-    if (!sys_content.empty()) {
-        json sys_msg = {{"role", "system"}, {"content", sys_content}};
+    // Delegate strip to the pure fn; insert as system message.
+    std::string text = dflash::common::normalize_system_for_cache(body["system"]);
+    if (!text.empty()) {
+        json sys_msg = {{"role", "system"}, {"content", text}};
         messages.insert(messages.begin(), sys_msg);
     }
 }
@@ -1415,6 +1399,14 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             req.format = ApiFormat::OPENAI_CHAT;
             req.response_id = generate_id("chatcmpl");
             req.messages = body["messages"];
+            // Strip volatile billing header from messages[0] (OpenAI system).
+            if (req.messages.is_array() && !req.messages.empty()) {
+                auto & m0 = req.messages[0];
+                if (m0.is_object() && m0.value("role", "") == "system" &&
+                    m0.contains("content") && m0["content"].is_string()) {
+                    m0["content"] = dflash::common::normalize_system_for_cache(req.messages);
+                }
+            }
         } else if (hr.path == "/v1/messages/count_tokens") {
             req.format = ApiFormat::ANTHROPIC;
             req.response_id = generate_id("count");
@@ -1434,7 +1426,9 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                 req.messages = body["input"];
             }
             if (body.contains("instructions")) {
-                json sys_msg = {{"role", "system"}, {"content", body["instructions"]}};
+                // Strip billing header from codex instructions before hashing.
+                std::string inst = dflash::common::normalize_system_for_cache(body["instructions"]);
+                json sys_msg = {{"role", "system"}, {"content", inst}};
                 if (req.messages.is_array()) {
                     req.messages.insert(req.messages.begin(), sys_msg);
                 } else {

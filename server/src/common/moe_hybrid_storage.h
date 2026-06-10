@@ -14,6 +14,25 @@
 
 namespace dflash::common {
 
+// File region for one expert tensor (offset into mmap).
+struct ExpertFileRegion {
+    size_t offset = 0;
+    size_t size   = 0;
+};
+
+// Per-layer file regions for all expert tensors (used by streaming prefill).
+struct LayerExpertRegions {
+    ExpertFileRegion gate_exps;
+    ExpertFileRegion up_exps;
+    ExpertFileRegion down_exps;
+    ExpertFileRegion gate_up_exps;  // optional fused
+    size_t expert_bytes_gate    = 0;
+    size_t expert_bytes_up      = 0;
+    size_t expert_bytes_down    = 0;
+    size_t expert_bytes_gate_up = 0;
+    bool   fused_gate_up        = false;
+};
+
 // Cached FFN graph for a fixed number of selected experts.
 // Built once, reused every token to avoid per-call graph rebuild overhead.
 struct CachedFfnGraph {
@@ -30,6 +49,22 @@ struct CachedFfnGraph {
     ggml_tensor * valid_lut = nullptr;    // [1,n_expert] F32 1=hot 0=cold
     ggml_tensor * residual_in = nullptr; // [n_embd,1] F32 residual (gpu-remap)
     int n_hot = 0;                      // number of hot experts this graph supports
+
+    bool valid() const { return ctx && gf && alloc && output; }
+    void free();
+};
+
+// Cached batched FFN graph for hot-only prefill (n_tokens = MMQ_SAFE_SUB_BATCH).
+// Eliminates per-call graph rebuild + gallocr planning overhead.
+struct CachedHotBatchedGraph {
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t alloc = nullptr;
+    ggml_tensor * inp = nullptr;        // [n_embd, n_tokens] F32 input
+    ggml_tensor * sel = nullptr;        // [n_used, n_tokens] I32 hot-local IDs
+    ggml_tensor * wts = nullptr;        // [n_used, n_tokens] F32 expert weights
+    ggml_tensor * output = nullptr;     // [n_embd, n_tokens] F32 output
+    int n_tokens = 0;
 
     bool valid() const { return ctx && gf && alloc && output; }
     void free();
@@ -65,6 +100,21 @@ struct MoeHybridLayerStorage {
     std::vector<uint64_t> spare_lru;    // [cache_slots] last-use tick
     uint64_t lru_clock = 0;
 
+    // Bitmask: bit set = expert is in VRAM (hot). Supports up to 256 experts.
+    uint64_t expert_vram_mask[4] = {};
+
+    // Fast check: are ALL routed experts in VRAM for this batch?
+    // selected_ids has n_slots entries (n_tokens * n_expert_used).
+    bool all_routed_are_hot(const int32_t * selected_ids, int n_slots) const {
+        for (int i = 0; i < n_slots; ++i) {
+            const int g = selected_ids[i];
+            if (g < 0 || g >= 256) continue;
+            if (!((expert_vram_mask[g >> 6] >> (g & 63)) & 1ULL))
+                return false;
+        }
+        return true;
+    }
+
     bool fused_gate_up = false;
     size_t gate_expert_bytes = 0;
     size_t up_expert_bytes = 0;
@@ -79,6 +129,9 @@ struct MoeHybridLayerStorage {
     // Cached FFN graphs for common-case expert counts.
     CachedFfnGraph hot_graph;
     CachedFfnGraph cold_graph;
+
+    // Cached batched hot-only graph for prefill sub-batches (n_tokens=4).
+    CachedHotBatchedGraph hot_batched_graph;
 };
 
 struct MoeHybridStorage {
@@ -93,8 +146,18 @@ struct MoeHybridStorage {
     MoeHybridPlacement placement;
     std::vector<MoeHybridLayerStorage> layers;
 
+    // Persistent mmap for streaming prefill (nullptr if not available).
+    // When set, the streaming engine can DMA cold experts directly from here.
+    const void * mmap_data = nullptr;
+    size_t mmap_size = 0;
+    int mmap_fd = -1;  // POSIX fd for madvise; -1 on Windows or if not available
+
+    // Per-layer file region metadata for streaming (populated when mmap is active).
+    std::vector<LayerExpertRegions> layer_regions;
+
     bool matches(const MoeHybridConfig & cfg) const;
     bool empty() const;
+    bool has_mmap() const { return mmap_data != nullptr && mmap_size > 0; }
 };
 
 // Expert tensor file data for split loading (one entry per expert tensor).
@@ -143,5 +206,22 @@ struct MoeSparkBudget { uint64_t hot_bytes; int cache_slots; };
 MoeSparkBudget spark_budget_split(uint64_t expert_budget, uint64_t total_expert_bytes,
                                   int n_expert, uint64_t core_kv_safety,
                                   uint64_t target_bytes);
+
+// Build hybrid storage from file AND retain mmap for streaming prefill.
+// The caller must keep the mmap region alive for the lifetime of the storage.
+// mmap_base: pointer to start of mmap'd file.
+// mmap_total_size: total file size.
+// This variant populates out.layer_regions for use by MoeHybridStreamEngine.
+bool build_moe_hybrid_storage_from_file_with_mmap(
+    const MoeHybridConfig & cfg,
+    ggml_backend_t gpu_backend,
+    const MoeHybridPlacement & placement,
+    const std::vector<MoeLayerDesc> & layer_descs,
+    const std::vector<LayerExpertFileData> & file_data,
+    const void * mmap_base,
+    size_t mmap_total_size,
+    MoeHybridStorage & out,
+    std::string * err = nullptr,
+    int cache_slots = 0);
 
 }  // namespace dflash::common

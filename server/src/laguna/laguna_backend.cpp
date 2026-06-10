@@ -735,6 +735,28 @@ bool LagunaBackend::init_hybrid_mode() {
     if (total_cold > 0) {
         hybrid_mode_ = true;
         std::printf("[laguna-hybrid] hybrid decode path active (%d cold experts)\n", total_cold);
+
+        // Initialize streaming engine for prefill
+        if (moe_hybrid_->has_mmap()) {
+            size_t max_expert_bytes = 0;
+            for (int il = 0; il < w_.n_layer; ++il) {
+                const auto & layer = moe_hybrid_->layers[(size_t)il];
+                size_t eb = layer.fused_gate_up
+                    ? (size_t)layer.gate_up_expert_bytes + (size_t)layer.down_expert_bytes
+                    : (size_t)layer.gate_expert_bytes + (size_t)layer.up_expert_bytes
+                      + (size_t)layer.down_expert_bytes;
+                if (eb > max_expert_bytes) max_expert_bytes = eb;
+            }
+            std::string stream_err;
+            if (stream_engine_.init(backend_, max_expert_bytes, &stream_err)) {
+                std::printf("[laguna-hybrid] stream engine ready: pinned=%.1f MiB scratch=%.1f MiB\n",
+                            stream_engine_.pinned_bytes() / 1024.0 / 1024.0,
+                            stream_engine_.scratch_bytes() / 1024.0 / 1024.0);
+            } else {
+                std::fprintf(stderr, "[laguna-hybrid] stream engine init failed: %s (prefill will use CPU fallback)\n",
+                            stream_err.c_str());
+            }
+        }
     } else {
         hybrid_mode_ = true;  // partial load: expert tensors only in hybrid storage
         std::printf("[laguna-hybrid] all experts hot — using hybrid path (all-hot)\n");
@@ -1444,13 +1466,57 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
                 MoeHybridConfig chunk_cfg = make_moe_hybrid_config(w_);
                 MoeLayerDesc chunk_desc = make_moe_layer_desc(w_.layers[(size_t)il]);
                 std::vector<float> ffn_batch_out;
-                if (!eval_moe_hybrid_ffn_batched(
-                        backend_, cpu_be, chunk_cfg, chunk_desc, storage,
-                        chunk_post.data(),
-                        chunk_selected.data(),
-                        chunk_weights.data(),
-                        chunk_len, ffn_batch_out, &result.error,
-                        &ffn_hot_alloc, &ffn_cold_alloc)) {
+                bool ffn_ok = false;
+
+                if (storage.cold_expert_ids.empty()) {
+                    // All experts hot — use batched path directly
+                    ffn_ok = eval_moe_hybrid_ffn_batched(
+                            backend_, cpu_be, chunk_cfg, chunk_desc, storage,
+                            chunk_post.data(),
+                            chunk_selected.data(),
+                            chunk_weights.data(),
+                            chunk_len, ffn_batch_out, &result.error,
+                            &ffn_hot_alloc, &ffn_cold_alloc);
+                } else if (storage.all_routed_are_hot(chunk_selected.data(),
+                                                      chunk_len * n_expert_used)) {
+                    // All selected experts happen to be in VRAM — pure GPU, no CPU
+                    ffn_ok = eval_moe_hot_only_batched(
+                            backend_, chunk_cfg, chunk_desc, storage,
+                            chunk_post.data(),
+                            chunk_selected.data(),
+                            chunk_weights.data(),
+                            chunk_len, ffn_batch_out, &result.error,
+                            &ffn_hot_alloc);
+                } else if (moe_hybrid_->has_mmap() &&
+                           !moe_hybrid_->layer_regions.empty() &&
+                           stream_engine_.is_ready() && chunk_len >= 16 &&
+                           !storage.cold_expert_ids.empty()) {
+                    // Streaming prefill: prefetch cold data then batched eval (hot GPU + cold CPU)
+                    const auto & regions = moe_hybrid_->layer_regions[(size_t)il];
+                    std::vector<int32_t> cold_ids_copy(storage.cold_expert_ids.begin(),
+                                                      storage.cold_expert_ids.end());
+                    stream_engine_.prefetch_cold_experts(moe_hybrid_->mmap_data, moe_hybrid_->mmap_size,
+                                                        regions, cold_ids_copy.data(),
+                                                        (int)cold_ids_copy.size());
+                    ffn_ok = eval_moe_hybrid_ffn_batched(
+                            backend_, cpu_be, chunk_cfg, chunk_desc, storage,
+                            chunk_post.data(),
+                            chunk_selected.data(),
+                            chunk_weights.data(),
+                            chunk_len, ffn_batch_out, &result.error,
+                            &ffn_hot_alloc, &ffn_cold_alloc);
+                } else {
+                    // Fallback: batched eval handles both hot+cold (CPU for cold)
+                    ffn_ok = eval_moe_hybrid_ffn_batched(
+                            backend_, cpu_be, chunk_cfg, chunk_desc, storage,
+                            chunk_post.data(),
+                            chunk_selected.data(),
+                            chunk_weights.data(),
+                            chunk_len, ffn_batch_out, &result.error,
+                            &ffn_hot_alloc, &ffn_cold_alloc);
+                }
+
+                if (!ffn_ok) {
                     step_graph_destroy(prefill_sg);
                     if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
                     if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
@@ -1676,11 +1742,15 @@ bool LagunaBackend::build_hybrid_storage_from_file(
     int cache_slots = 0;
     if (const char * cs = std::getenv("DFLASH_LAGUNA_CACHE_SLOTS")) cache_slots = std::max(0, std::atoi(cs));
     else if (cache_slots_ >= 0) cache_slots = cache_slots_;
-    bool ok = build_moe_hybrid_storage_from_file(hybrid_cfg, backend_, placement,
-                                                 layer_descs, layer_file_data, *hybrid, &err, cache_slots);
-    ::munmap(mmap_addr, file_size);
+    bool ok = build_moe_hybrid_storage_from_file_with_mmap(hybrid_cfg, backend_, placement,
+                                                            layer_descs, layer_file_data,
+                                                            mmap_addr, file_size, *hybrid, &err, cache_slots);
     gguf_free(gctx);
-    if (!ok) return false;
+    if (!ok) {
+        ::munmap(mmap_addr, file_size);
+        return false;
+    }
+    // mmap ownership transferred to the storage (munmapped in ~MoeHybridStorage)
     out_storage = std::move(hybrid);
     return true;
 }

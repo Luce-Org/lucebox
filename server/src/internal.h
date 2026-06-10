@@ -621,7 +621,8 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
     ggml_tensor *         attn_mask,
     int                   kv_start,
     int                   n_tokens,
-    int                   fa_window = 0);
+    int                   fa_window = 0,
+    ggml_tensor *         kv_write_rows = nullptr);
 
 } // namespace dflash::common
 

@@ -239,6 +239,13 @@ struct LagunaGraphInputs {
     ggml_tensor * attn_mask_swa;  // optional [kv_len, n_tokens] F16 (causal + sliding window) for SWA layers
     int           n_tokens;
     int           kv_start;
+    // CUDA-graph-stable decode: when kv_pad > 0 the FA K/V views + masks span
+    // kv_pad slots (stride-rounded; mask gates validity) and the K/V append
+    // goes through ggml_set_rows with kv_idx as a graph INPUT, so node
+    // properties stay identical across decode steps and the ggml-cuda
+    // CUDA-graph cache replays instead of re-launching every kernel.
+    int           kv_pad = 0;             // 0 = legacy exact-length views + cpy append
+    ggml_tensor * kv_idx = nullptr;       // [n_tokens] I32 cache row indices (graph input)
     bool          output_logits = true;
     bool          output_hidden_states = false;
     // If true, lm_head only runs on the LAST token (saves ~6 GB of logit memory

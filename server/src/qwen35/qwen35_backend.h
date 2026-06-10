@@ -145,6 +145,7 @@ protected:
     std::mt19937_64 & sampler_rng_engine() { return sampler_rng_; }
     bool prefill_logits_valid() const { return prefill_last_logits_valid_; }
     std::size_t prefill_logits_offset() const { return prefill_last_logits_offset_; }
+    bool restore_target_cache_from_snapshot(int slot);
 
     // Accessors for draft/spec-decode state (needed by hybrid spec-decode in subclass)
     DraftWeights & draft_weights() { return dw_; }

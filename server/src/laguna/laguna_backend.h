@@ -14,6 +14,7 @@
 #include "../common/moe_hybrid_storage.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_swap_manager.h"
+#include "../common/moe_hybrid_stream.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -94,6 +95,7 @@ private:
     std::vector<uint64_t>                      layer_expert_bytes_;       // per-layer 1-expert bytes
     MoeHybridSwapPolicy                        swap_policy_;
     bool                                       hybrid_telemetry_ = false;
+    MoeHybridStreamEngine                      stream_engine_;
 
     bool ensure_slot(int slot);
 

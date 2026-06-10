@@ -354,6 +354,11 @@ bool Qwen35Backend::snapshot_used(int slot) const {
     return prefix_snapshots_[slot].ctx != nullptr;
 }
 
+bool Qwen35Backend::restore_target_cache_from_snapshot(int slot) {
+    if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) return false;
+    return restore_target_cache(prefix_snapshots_[slot], cache_);
+}
+
 int Qwen35Backend::snapshot_cur_pos(int slot) const {
     if (slot < 0 || slot >= PREFIX_SLOTS) return 0;
     return prefix_snapshots_[slot].cur_pos;
@@ -715,6 +720,11 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         out_io.emit(-1);
         return result;
     }
+
+    // Clear-then-restore: the step-invariant decode reads a 256-padded,
+    // mask-less FA span, so rows beyond the restored prefix must be ZERO,
+    // not leftovers from the previous request. cudaMemset is ~0.2ms.
+    if (cache_.base_buf) ggml_backend_buffer_clear(cache_.base_buf, 0);
 
     // Restore snapshot
     restore_target_cache(prefix_snapshots_[slot], cache_);

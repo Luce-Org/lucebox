@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 namespace dflash::common {
@@ -35,6 +36,10 @@ public:
     const void * data() const;   // nullptr when not open
     size_t       size() const;   // 0 when not open
     bool         is_open() const;
+
+    // Advise the kernel to read ahead the given byte range into page cache.
+    // No-op if not open or range is invalid. Safe to call from any thread.
+    void advise_willneed(size_t offset, size_t length) const;
 
     // Transfer ownership of the mmap'd region to the caller.
     // After release() this object is empty (is_open() == false).
@@ -195,6 +200,26 @@ inline bool GgufMmap::open(const std::string & path, std::string & out_error) {
 inline const void * GgufMmap::data() const { return data_; }
 inline size_t       GgufMmap::size() const { return size_; }
 inline bool         GgufMmap::is_open() const { return data_ != nullptr; }
+
+inline void GgufMmap::advise_willneed(size_t offset, size_t length) const {
+    if (!data_ || offset >= size_) return;
+    if (offset + length > size_) length = size_ - offset;
+    if (length == 0) return;
+#if defined(_WIN32)
+    // PrefetchVirtualMemory (Windows 8+)
+    WIN32_MEMORY_RANGE_ENTRY entry{};
+    entry.VirtualAddress = const_cast<uint8_t *>(static_cast<const uint8_t *>(data_)) + offset;
+    entry.NumberOfBytes  = length;
+    PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+#else
+    // Align to page boundary for madvise
+    const size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+    const size_t aligned_offset = (offset / page_size) * page_size;
+    const size_t aligned_length = length + (offset - aligned_offset);
+    ::madvise(const_cast<uint8_t *>(static_cast<const uint8_t *>(data_)) + aligned_offset,
+              aligned_length, MADV_WILLNEED);
+#endif
+}
 
 inline GgufMmap::OwnedRegion GgufMmap::release() {
     OwnedRegion r{};

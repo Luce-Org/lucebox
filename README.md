@@ -184,9 +184,13 @@ Drop a GGUF model target into `server/models/` first, then
 docker pull ghcr.io/luce-org/lucebox-hub:cuda12   # NVIDIA
 docker pull ghcr.io/luce-org/lucebox-hub:rocm     # AMD
 
-# 2. Download a target model into server/models/
+# 2. Download a target model into server/models/ and the DFlash draft
+#    into server/models/draft/ (the entrypoint only auto-discovers the
+#    draft there; without it the server runs slower, target-only)
 hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf \
   --local-dir server/models/
+hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf \
+  --local-dir server/models/draft/
 
 # 3a. NVIDIA (CUDA 12+)
 docker run --rm --gpus all -p 8000:8080 \

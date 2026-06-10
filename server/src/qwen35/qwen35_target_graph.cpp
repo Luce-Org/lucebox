@@ -308,6 +308,15 @@ void reset_target_cache(TargetCache & c) {
 }
 
 void reset_recurrent_state(TargetCache & c) {
+    // Device-side clear of the whole base buffer (KV + SSM + conv): with the
+    // step-invariant decode the FA span is 256-padded and mask-less, so stale
+    // K/V rows from the PREVIOUS request inside the padded tail would be
+    // attended with real scores. cudaMemset is ~0.2ms — cheaper than the old
+    // host-zero writes, and zeroing KV too is what the padded span requires.
+    if (c.base_buf) {
+        ggml_backend_buffer_clear(c.base_buf, 0);
+        return;
+    }
     auto zero_tensors = [](const std::vector<ggml_tensor *> & tensors) {
         std::vector<uint8_t> zeros;
         for (ggml_tensor * t : tensors) {
@@ -578,8 +587,20 @@ static ggml_tensor * build_full_attn_block(
     const int kv_len = kv_start + n_tokens;
     const int win_len = kv_len - win_start;
 
-    const int fattn_stride  = (kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0) ? 256 : 1;
-    const int win_len_padded = ((win_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
+    // Stride-256 FA span when (a) TQ3_0 requires it, or (b) the step-invariant
+    // set_rows KV write is active (kv_write_rows): a fixed span within each
+    // 256-token window keeps node properties identical across decode steps so
+    // the ggml-cuda CUDA-graph cache can replay. Same numerics as the existing
+    // TQ3_0 path: the cache is zero-initialised, so padded rows contribute
+    // exp(-row_max) ~ 0 to the (mask-less) softmax denominator.
+    const bool  step_invariant = (kv_write_rows != nullptr);
+    const int fattn_stride  = (kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0 ||
+                               step_invariant) ? 256 : 1;
+    int win_len_padded = ((win_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
+    if (step_invariant) {
+        // Never view past the cache tensor (max_ctx may not be 256-aligned).
+        win_len_padded = std::min(win_len_padded, (int)cache_k->ne[1]);
+    }
 
     ggml_tensor * Qfa = ggml_permute(ctx, Q, 0, 2, 1, 3);
     // When K is rotated (TQ3_0 or explicit FWHT), Q needs forward rotation too.
@@ -1231,7 +1252,8 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
     ggml_tensor *         attn_mask,
     int                   kv_start,
     int                   n_tokens,
-    int                   fa_window) {
+    int                   fa_window,
+    ggml_tensor *         kv_write_rows) {
     QwenLayerPrefnOutputs out{};
     const float eps = w.rms_eps;
     const TargetLayer & L = w.layers[layer_idx];
@@ -1251,7 +1273,9 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
                                     attn_mask, kv_start, n_tokens,
                                     cache.kv_k_type, cache.kv_v_type,
                                     cache.kv_k_rotated,
-                                    fa_window);
+                                    fa_window,
+                                    /*q_tail_capture=*/nullptr, /*q_tail_start=*/0,
+                                    kv_write_rows);
     } else {
         int dn_idx = 0;
         for (int il = 0; il < layer_idx; il++) {

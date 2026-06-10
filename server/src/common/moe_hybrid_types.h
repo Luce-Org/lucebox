@@ -13,6 +13,11 @@
 
 namespace dflash::common {
 
+// ─── GPU SM version query ───────────────────────────────────────────────
+// Returns the compute capability as major*10+minor (e.g. 86 for sm_86).
+// Returns 0 if CUDA/HIP runtime is unavailable.
+int query_gpu_compute_sm();
+
 // ─── MoE architecture config (model-agnostic) ──────────────────────────
 
 struct MoeHybridConfig {
@@ -23,6 +28,12 @@ struct MoeHybridConfig {
     int n_ff_shexp    = 0;   // shared expert intermediate dimension (0 = no shared)
     int n_layer       = 0;   // number of MoE layers
     int first_moe_layer = 0; // index of first MoE layer (e.g., 0 for qwen35moe, 1 for laguna)
+
+    // When true, MMQ mul_mat_id works correctly with reduced hot stacks
+    // (n_hot < n_expert). Safe on sm_80+ (Ampere/Ada/Hopper/Blackwell).
+    // On sm_75 (Turing) and gfx1151, the kernel has illegal memory accesses
+    // with reduced stacks, requiring the <=4-token sub-batch workaround.
+    bool mmq_safe_full_batch = false;
 };
 
 // ─── Per-layer expert tensor descriptor ─────────────────────────────────

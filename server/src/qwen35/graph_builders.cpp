@@ -239,9 +239,16 @@ bool build_target_step(
     bool capture_moe_router) {
     step_graph_free(sg);
 
+    // Persistent thread_local arena: rebuilt step graphs land at identical
+    // addresses, keeping the ggml-cuda CUDA-graph cache key (nodes[0]) and
+    // every node property stable across AR decode steps -> captured graph
+    // replays instead of re-launching every kernel. Pairs with the
+    // step-invariant set_rows KV write (kv_write_rows) below.
     ggml_init_params ip{};
     ip.mem_size   = 512 * 1024 * 1024;
-    ip.mem_buffer = nullptr;
+    static thread_local std::vector<uint8_t> g_step_arena;
+    if (g_step_arena.size() < ip.mem_size) g_step_arena.resize(ip.mem_size);
+    ip.mem_buffer = g_step_arena.data();
     ip.no_alloc   = true;
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
@@ -270,7 +277,10 @@ bool build_target_step(
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
 
     // Step-invariant KV write: only when topology can't vary per step.
-    const bool use_kv_write_rows = (n_tokens == 1 && fa_window == 0 &&
+    // DFLASH_QWEN35_NO_KVPAD=1 restores the legacy cpy append + exact-length
+    // FA span (per-step node properties -> no CUDA-graph replay).
+    static const bool g_no_kvpad = (std::getenv("DFLASH_QWEN35_NO_KVPAD") != nullptr);
+    const bool use_kv_write_rows = (!g_no_kvpad && n_tokens == 1 && fa_window == 0 &&
                                     !with_mask && !capture && !capture_delta_intermediate);
     if (use_kv_write_rows) {
         sg.kv_write_rows = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_I64,

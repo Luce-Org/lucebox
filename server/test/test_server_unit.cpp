@@ -26,6 +26,7 @@
 #include "common/layer_split_utils.h"
 #include "placement/draft_residency.h"
 #include "ggml-cpu.h"
+#include "server/prompt_normalize.h"
 #include <nlohmann/json.hpp>
 
 #include <cmath>
@@ -3460,6 +3461,96 @@ static void test_generate_result_accept_rate_zero_when_no_spec_decode() {
     TEST_ASSERT(r.accept_rate == 0.0f);
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// normalize_system_for_cache — header-strip tests
+// ═══════════════════════════════════════════════════════════════════════
+
+static void test_normalize_strips_billing_header_anthropic_array() {
+    // Anthropic system-as-array: one billing-header block + one real block.
+    json system_blocks = json::array({
+        {{"type", "text"},
+         {"text", "x-anthropic-billing-header: session=abc123 turn=4 ts=1749430000"}},
+        {{"type", "text"},
+         {"text", "You are a helpful coding assistant."}}
+    });
+    std::string out = dflash::common::normalize_system_for_cache(system_blocks);
+    TEST_ASSERT(out.find("x-anthropic-billing-header:") == std::string::npos);
+    TEST_ASSERT(out.find("helpful coding assistant") != std::string::npos);
+}
+
+static void test_normalize_strips_billing_header_openai_messages0() {
+    // OpenAI messages[0] system containing the billing header in content.
+    json messages = json::array({
+        {{"role", "system"},
+         {"content", "x-anthropic-billing-header: session=xyz789 turn=12 ts=1749431000\nYou are a code reviewer."}},
+        {{"role", "user"}, {"content", "Review this diff."}}
+    });
+    std::string out = dflash::common::normalize_system_for_cache(messages);
+    TEST_ASSERT(out.find("x-anthropic-billing-header:") == std::string::npos);
+    TEST_ASSERT(out.find("code reviewer") != std::string::npos);
+}
+
+static void test_normalize_idempotent_across_changing_header() {
+    // Two OpenAI messages arrays identical except the header turn value.
+    // normalize_system_for_cache must return EQUAL strings for both.
+    json messages_turn4 = json::array({
+        {{"role", "system"},
+         {"content", "x-anthropic-billing-header: session=S1 turn=4 ts=1749430000\nYou help with Rust."}},
+        {{"role", "user"}, {"content", "What is a lifetime?"}}
+    });
+    json messages_turn5 = json::array({
+        {{"role", "system"},
+         {"content", "x-anthropic-billing-header: session=S1 turn=5 ts=1749430060\nYou help with Rust."}},
+        {{"role", "user"}, {"content", "What is a lifetime?"}}
+    });
+    std::string out4 = dflash::common::normalize_system_for_cache(messages_turn4);
+    std::string out5 = dflash::common::normalize_system_for_cache(messages_turn5);
+    TEST_ASSERT(out4 == out5);
+}
+
+static void test_normalize_preserves_legit_system_content() {
+    // A normal system prompt containing no billing header must pass through unchanged.
+    json messages = json::array({
+        {{"role", "system"},
+         {"content", "You are an expert in C++ performance optimization."}},
+        {{"role", "user"}, {"content", "Help me optimize this loop."}}
+    });
+    std::string out = dflash::common::normalize_system_for_cache(messages);
+    TEST_ASSERT(out == "You are an expert in C++ performance optimization.");
+}
+
+static void test_normalize_handles_leading_whitespace_header() {
+    // Header block with leading whitespace must still be stripped.
+    json system_blocks = json::array({
+        {{"type", "text"},
+         {"text", "  x-anthropic-billing-header: session=W1 turn=1 ts=1749432000"}},
+        {{"type", "text"},
+         {"text", "Be concise."}}
+    });
+    std::string out = dflash::common::normalize_system_for_cache(system_blocks);
+    TEST_ASSERT(out.find("x-anthropic-billing-header:") == std::string::npos);
+    TEST_ASSERT(out.find("Be concise.") != std::string::npos);
+}
+
+static void test_prefix_key_stable_across_header_change() {
+    // Two /v1/chat/completions-style messages arrays differing ONLY in the
+    // billing header value must normalize to EQUAL strings.
+    json messages_a = json::array({
+        {{"role", "system"},
+         {"content", "x-anthropic-billing-header: session=S2 turn=1 ts=1749440000\nYou are a senior engineer."}},
+        {{"role", "user"}, {"content", "What is RAII?"}}
+    });
+    json messages_b = json::array({
+        {{"role", "system"},
+         {"content", "x-anthropic-billing-header: session=S2 turn=7 ts=1749440420\nYou are a senior engineer."}},
+        {{"role", "user"}, {"content", "What is RAII?"}}
+    });
+    std::string norm_a = dflash::common::normalize_system_for_cache(messages_a);
+    std::string norm_b = dflash::common::normalize_system_for_cache(messages_b);
+    TEST_ASSERT(norm_a == norm_b);
+    TEST_ASSERT(norm_a.find("senior engineer") != std::string::npos);
+}
+
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
     std::fprintf(stderr, " Server Unit Tests\n");
@@ -3683,6 +3774,14 @@ int main() {
     RUN_TEST(test_generate_result_accept_rate_in_usage_openai);
     RUN_TEST(test_generate_result_accept_rate_in_usage_anthropic);
     RUN_TEST(test_generate_result_accept_rate_zero_when_no_spec_decode);
+
+    std::fprintf(stderr, "\n── normalize_system_for_cache ──\n");
+    RUN_TEST(test_normalize_strips_billing_header_anthropic_array);
+    RUN_TEST(test_normalize_strips_billing_header_openai_messages0);
+    RUN_TEST(test_normalize_idempotent_across_changing_header);
+    RUN_TEST(test_normalize_preserves_legit_system_content);
+    RUN_TEST(test_normalize_handles_leading_whitespace_header);
+    RUN_TEST(test_prefix_key_stable_across_header_change);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",

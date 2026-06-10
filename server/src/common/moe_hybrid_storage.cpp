@@ -1,4 +1,5 @@
 #include "moe_hybrid_storage.h"
+#include "moe_hybrid_types.h"
 
 #include "ggml-cpu.h"
 #include "ggml-backend.h"
@@ -7,7 +8,30 @@
 #include <algorithm>
 #include <cstring>
 
+#if defined(DFLASH27B_BACKEND_CUDA)
+#include <cuda_runtime_api.h>
+#endif
+
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#else
+#include <windows.h>
+#endif
+
 namespace dflash::common {
+
+int query_gpu_compute_sm() {
+#if defined(DFLASH27B_BACKEND_CUDA)
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0) return 0;
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) return 0;
+    return prop.major * 10 + prop.minor;
+#else
+    // HIP/gfx1151 has the same MMQ bug — keep sub-batch workaround active.
+    return 0;
+#endif
+}
 
 void CachedFfnGraph::free() {
     if (alloc) { ggml_gallocr_free(alloc); alloc = nullptr; }
@@ -18,6 +42,17 @@ void CachedFfnGraph::free() {
     weights = nullptr;
     output = nullptr;
     n_hot = 0;
+}
+
+void CachedHotBatchedGraph::free() {
+    if (alloc) { ggml_gallocr_free(alloc); alloc = nullptr; }
+    if (ctx) { ggml_free(ctx); ctx = nullptr; }
+    gf = nullptr;
+    inp = nullptr;
+    sel = nullptr;
+    wts = nullptr;
+    output = nullptr;
+    n_tokens = 0;
 }
 
 namespace {
@@ -124,6 +159,17 @@ MoeHybridStorage::~MoeHybridStorage() {
         ggml_backend_free(cpu_backend);
         cpu_backend = nullptr;
     }
+    if (mmap_data) {
+#if !defined(_WIN32)
+        ::munmap(const_cast<void *>(mmap_data), mmap_size);
+#else
+        // On Windows, the mapping is unmapped when the view handle is closed.
+        // mmap_data was mapped via MapViewOfFile; UnmapViewOfFile is the correct cleanup.
+        ::UnmapViewOfFile(mmap_data);
+#endif
+        mmap_data = nullptr;
+        mmap_size = 0;
+    }
 }
 
 bool MoeHybridStorage::matches(const MoeHybridConfig & cfg) const {
@@ -186,6 +232,13 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
                 dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
                 dst.cold_expert_ids.push_back((int32_t)expert);
             }
+        }
+
+        // Populate VRAM bitmask from hot expert IDs
+        std::memset(dst.expert_vram_mask, 0, sizeof(dst.expert_vram_mask));
+        for (int32_t eid : dst.hot_expert_ids) {
+            if (eid >= 0 && eid < 256)
+                dst.expert_vram_mask[eid >> 6] |= (1ULL << (eid & 63));
         }
 
         dst.fused_gate_up = desc.has_fused_gate_up();
@@ -364,6 +417,13 @@ bool build_moe_hybrid_storage_from_file(
             }
         }
 
+        // Populate VRAM bitmask from hot expert IDs
+        std::memset(dst.expert_vram_mask, 0, sizeof(dst.expert_vram_mask));
+        for (int32_t eid : dst.hot_expert_ids) {
+            if (eid >= 0 && eid < 256)
+                dst.expert_vram_mask[eid >> 6] |= (1ULL << (eid & 63));
+        }
+
         dst.fused_gate_up = desc.has_fused_gate_up();
         if (!validate_expert_tensor(desc.ffn_gate_exps, cfg.n_expert, &dst.gate_expert_bytes, err) ||
             !validate_expert_tensor(desc.ffn_up_exps, cfg.n_expert, &dst.up_expert_bytes, err) ||
@@ -523,6 +583,7 @@ int moe_hybrid_cache_swap_in(MoeHybridLayerStorage & st, int global_expert,
     if (slot < 0) return -1;
     const int evicted = st.spare_global[(size_t)slot];
     if (evicted >= 0) st.hot_local_by_global[(size_t)evicted] = -1;  // evicted -> served cold again
+    if (evicted >= 0 && evicted < 256) st.expert_vram_mask[evicted >> 6] &= ~(1ULL << (evicted & 63));
 
     const int hslot = st.hot_active + slot;  // hot-local index of the spare slot
     auto copy_slice = [&](ggml_tensor * cold_t, ggml_tensor * hot_t, size_t ebytes) {
@@ -541,6 +602,7 @@ int moe_hybrid_cache_swap_in(MoeHybridLayerStorage & st, int global_expert,
     }
 
     st.hot_local_by_global[(size_t)global_expert] = hslot;
+    if (global_expert < 256) st.expert_vram_mask[global_expert >> 6] |= 1ULL << (global_expert & 63);
     st.spare_global[(size_t)slot] = global_expert;
     st.spare_lru[(size_t)slot] = ++st.lru_clock;
     return hslot;
@@ -568,6 +630,63 @@ MoeSparkBudget spark_budget_split(uint64_t expert_budget, uint64_t total_expert_
         }
     }
     return r;
+}
+
+bool build_moe_hybrid_storage_from_file_with_mmap(
+    const MoeHybridConfig & cfg,
+    ggml_backend_t gpu_backend,
+    const MoeHybridPlacement & placement,
+    const std::vector<MoeLayerDesc> & layer_descs,
+    const std::vector<LayerExpertFileData> & file_data,
+    const void * mmap_base,
+    size_t mmap_total_size,
+    MoeHybridStorage & out,
+    std::string * err,
+    int cache_slots) {
+
+    // First build storage normally (hot GPU + cold CPU buffers).
+    if (!build_moe_hybrid_storage_from_file(cfg, gpu_backend, placement, layer_descs, file_data, out, err, cache_slots)) {
+        return false;
+    }
+
+    // Store mmap metadata for streaming prefill.
+    out.mmap_data = mmap_base;
+    out.mmap_size = mmap_total_size;
+
+    // Compute per-layer expert file regions (offsets relative to mmap base).
+    const auto * base = static_cast<const uint8_t *>(mmap_base);
+    out.layer_regions.resize((size_t)cfg.n_layer);
+    for (int il = 0; il < cfg.n_layer; ++il) {
+        const auto & fd = file_data[(size_t)il];
+        auto & reg = out.layer_regions[(size_t)il];
+
+        if (fd.gate_exps.data && fd.gate_exps.size > 0) {
+            reg.gate_exps.offset = (size_t)(fd.gate_exps.data - base);
+            reg.gate_exps.size = fd.gate_exps.size;
+        }
+        if (fd.up_exps.data && fd.up_exps.size > 0) {
+            reg.up_exps.offset = (size_t)(fd.up_exps.data - base);
+            reg.up_exps.size = fd.up_exps.size;
+        }
+        if (fd.down_exps.data && fd.down_exps.size > 0) {
+            reg.down_exps.offset = (size_t)(fd.down_exps.data - base);
+            reg.down_exps.size = fd.down_exps.size;
+        }
+        if (fd.gate_up_exps.data && fd.gate_up_exps.size > 0) {
+            reg.gate_up_exps.offset = (size_t)(fd.gate_up_exps.data - base);
+            reg.gate_up_exps.size = fd.gate_up_exps.size;
+        }
+
+        // Copy per-expert byte sizes from layer storage (already computed)
+        const auto & ls = out.layers[(size_t)il];
+        reg.expert_bytes_gate    = ls.gate_expert_bytes;
+        reg.expert_bytes_up      = ls.up_expert_bytes;
+        reg.expert_bytes_down    = ls.down_expert_bytes;
+        reg.expert_bytes_gate_up = ls.gate_up_expert_bytes;
+        reg.fused_gate_up        = ls.fused_gate_up;
+    }
+
+    return true;
 }
 
 }  // namespace dflash::common

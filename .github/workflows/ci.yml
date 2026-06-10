@@ -115,15 +115,17 @@ jobs:
     # kernels for sm_86 but execute on GPU-less VMs, so the kernel never runs.
     # This job lands on lucebox3 (RTX 3090) and actually executes it.
     #
-    # SECURITY: a self-hosted runner must never execute untrusted fork code.
-    # This guard restricts the job to same-repo PRs (head repo == this repo)
-    # and manual dispatch, so fork PRs against this public repo skip it
-    # entirely and never run on the box. The ubuntu-latest jobs above still
-    # run for forks (safe, ephemeral GitHub VMs).
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.pull_request.head.repo.full_name == github.repository
-    needs: [uv-workspace, build]
+    # SECURITY: fork PRs DO run here, but only after a maintainer approves the
+    # workflow run. The repo enforces approval_policy=all_external_contributors,
+    # so every push from an outside collaborator parks the run as
+    # action_required until a maintainer reviews the diff and approves it.
+    # That human checkpoint is the line of defense for the self-hosted box;
+    # do not weaken the approval policy while this job runs fork code.
+    # Gate only on the 1-minute workspace check, NOT the ~18-minute hosted
+    # CPU build: the GPU job compiles the same tree itself in ~2 minutes on
+    # real hardware, so serializing it behind the cloud build only delayed
+    # the strongest signal this CI produces.
+    needs: [uv-workspace]
     runs-on: [self-hosted, gpu, sm86]
     timeout-minutes: 30
     # The box has a single physical GPU: serialize GPU jobs across PRs instead
@@ -186,12 +188,13 @@ jobs:
     # faults on gfx1151); hipcc is not on the runner's minimal PATH, so it is
     # invoked by absolute path.
     #
-    # SECURITY: same fork guard as gpu-tests - never execute untrusted fork
-    # code on the self-hosted box. Fork PRs skip this job.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.pull_request.head.repo.full_name == github.repository
-    needs: [uv-workspace, build]
+    # SECURITY: same model as gpu-tests - fork PRs run only after a maintainer
+    # approves the workflow run (approval_policy=all_external_contributors).
+    # Gate only on the 1-minute workspace check, NOT the ~18-minute hosted
+    # CPU build: the GPU job compiles the same tree itself in ~2 minutes on
+    # real hardware, so serializing it behind the cloud build only delayed
+    # the strongest signal this CI produces.
+    needs: [uv-workspace]
     runs-on: [self-hosted, rocm, gfx1151]
     timeout-minutes: 20
     # Same single box as gpu-tests: serialize GPU jobs across PRs.

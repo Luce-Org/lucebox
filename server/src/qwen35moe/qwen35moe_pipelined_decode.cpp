@@ -31,6 +31,9 @@ void CachedPrefnGraph::free() {
     ffn_residual = nullptr;
     moe_selected = nullptr;
     moe_weights = nullptr;
+    positions = nullptr;
+    kv_write_rows = nullptr;
+    kv_win = 0;
 }
 
 
@@ -87,6 +90,85 @@ static bool build_cached_deltanet_prefn(
     ggml_build_forward_expand(out.gf, go.post);
 
     out.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(out.alloc, out.gf)) {
+        out.free();
+        return false;
+    }
+    return true;
+}
+
+// Build a cached pre-FFN graph for a FULL-ATTENTION layer.
+// With the step-invariant set_rows KV write (kv_write_rows input) and a
+// 256-aligned FA span (kv_win baked into the view shapes), the graph is
+// bit-stable across decode steps inside the window — node addresses come from
+// a per-graph arena held by ctx, so the ggml-cuda CUDA-graph cache replays.
+// Rebuild only when kv crosses the kv_win boundary.
+static bool build_cached_attn_prefn(
+    CachedPrefnGraph & out,
+    ggml_backend_t backend,
+    const TargetWeights & w,
+    TargetCache & cache,
+    int layer_idx,
+    int kv_win,                 // 256-aligned FA span to bake in
+    int kq_stride_pad) {
+
+    ggml_gallocr_t keep_alloc = out.alloc;  // reuse allocator across rebuilds
+    out.alloc = nullptr;
+    out.free();
+    out.alloc = keep_alloc;
+
+    ggml_init_params ip{};
+    ip.mem_size   = 512 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    out.ctx = ggml_init(ip);
+    if (!out.ctx) return false;
+
+    const int hidden = w.n_embd;
+    out.inp_embed = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, hidden, 1, 1);
+    ggml_set_name(out.inp_embed, "inp_embed");
+    ggml_set_input(out.inp_embed);
+
+    out.positions = ggml_new_tensor_1d(out.ctx, GGML_TYPE_I32, 4);
+    ggml_set_name(out.positions, "positions");
+    ggml_set_input(out.positions);
+
+    out.kv_write_rows = ggml_new_tensor_2d(out.ctx, GGML_TYPE_I64, 1, w.n_head_kv);
+    ggml_set_name(out.kv_write_rows, "kv_write_rows");
+    ggml_set_input(out.kv_write_rows);
+
+    // Bake the FA span: build with kv_start = kv_win-1 so win_len_padded == kv_win.
+    // The actual write/read positions come from kv_write_rows + positions DATA.
+    out.gf = ggml_new_graph_custom(out.ctx, 16384, false);
+    QwenLayerPrefnOutputs go = build_qwen35_layer_prefn(
+        out.ctx, out.gf, w, cache, layer_idx,
+        out.inp_embed, out.positions, /*attn_mask=*/nullptr,
+        /*kv_start=*/kv_win - 1, /*n_tokens=*/1, /*fa_window=*/0,
+        out.kv_write_rows);
+    if (!go.residual || !go.post) { out.free(); return false; }
+
+    out.ffn_residual = go.residual;
+    out.ffn_post = go.post;
+    out.moe_selected = go.moe_selected;
+    out.moe_weights = go.moe_weights;
+    out.kv_win = kv_win;
+
+    if (go.moe_selected) {
+        ggml_set_output(go.moe_selected);
+        ggml_build_forward_expand(out.gf, go.moe_selected);
+    }
+    if (go.moe_weights) {
+        ggml_set_output(go.moe_weights);
+        ggml_build_forward_expand(out.gf, go.moe_weights);
+    }
+    ggml_set_output(go.residual);
+    ggml_build_forward_expand(out.gf, go.residual);
+    ggml_set_output(go.post);
+    ggml_build_forward_expand(out.gf, go.post);
+
+    if (!out.alloc) {
+        out.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
     if (!ggml_gallocr_alloc_graph(out.alloc, out.gf)) {
         out.free();
         return false;
@@ -412,8 +494,49 @@ bool pipelined_decode_one_token(
         ggml_tensor * moe_selected_tensor = nullptr;
         ggml_tensor * moe_weights_tensor = nullptr;
 
-        if (is_attn || !state.cached_prefn[(size_t)il].valid()) {
-            // Attention layer OR failed DeltaNet cache: rebuild graph dynamically
+        // Attention layers: cached step-invariant graph (set_rows KV write +
+        // 256-aligned FA span). Built once per 256-token window, then reused
+        // with input-data updates only -> the ggml-cuda CUDA-graph cache
+        // replays it. DFLASH_QWEN35MOE_NO_KVPAD=1 restores per-token rebuild.
+        static const bool g_no_kvpad =
+            (std::getenv("DFLASH_QWEN35MOE_NO_KVPAD") != nullptr);
+        bool attn_cached_ok = false;
+        if (is_attn && !g_no_kvpad) {
+            auto & cpg = state.cached_prefn[(size_t)il];
+            const int kv_win_needed = ((kv_pos + 1) + 255) & ~255;
+            if (!cpg.valid() || cpg.kv_win < kv_win_needed) {
+                if (!build_cached_attn_prefn(cpg, backend, w, cache, il,
+                                             kv_win_needed, kq_stride_pad)) {
+                    std::fprintf(stderr,
+                        "[pipelined] cached attn prefn build failed (layer %d); dyn fallback\n", il);
+                }
+            }
+            attn_cached_ok = cpg.valid() && cpg.kv_win >= kv_win_needed;
+        }
+
+        if (attn_cached_ok) {
+            auto & cpg = state.cached_prefn[(size_t)il];
+            ggml_backend_tensor_copy_async(backend, backend, state.gpu_state.act_cur, cpg.inp_embed);
+            int32_t pos4[4] = {kv_pos, kv_pos, kv_pos, 0};
+            ggml_backend_tensor_set_async(backend, cpg.positions, pos4, 0, sizeof(pos4));
+            std::vector<int64_t> row_vals((size_t)w.n_head_kv, (int64_t)kv_pos);
+            ggml_backend_tensor_set_async(backend, cpg.kv_write_rows, row_vals.data(), 0,
+                                          sizeof(int64_t) * row_vals.size());
+
+            if (tel) tel->prefn_graph_build_us += pipe_elapsed_us(prefn_build_t0, PipelineClock::now());
+
+            const auto prefn_compute_t0 = PipelineClock::now();
+            auto st = ggml_backend_graph_compute(backend, cpg.gf);
+            if (st != GGML_STATUS_SUCCESS) return false;
+            if (tel) tel->prefn_compute_us += pipe_elapsed_us(prefn_compute_t0, PipelineClock::now());
+
+            ffn_post_gpu = cpg.ffn_post;
+            ffn_residual_gpu = cpg.ffn_residual;
+            moe_selected_tensor = cpg.moe_selected;
+            moe_weights_tensor = cpg.moe_weights;
+        } else if (is_attn || !state.cached_prefn[(size_t)il].valid()) {
+            // Attention layer (legacy/fallback) OR failed DeltaNet cache:
+            // rebuild graph dynamically
             if (!build_layer_prefn_step(dyn_sg, w, cache, backend,
                                         il, kv_pos, /*n_tokens=*/1,
                                         /*with_mask=*/false, /*fa_window=*/0, kq_stride_pad)) {

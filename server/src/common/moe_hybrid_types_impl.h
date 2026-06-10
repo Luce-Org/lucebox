@@ -22,6 +22,9 @@ inline MoeHybridConfig make_moe_hybrid_config(const TargetWeights & w) {
     cfg.n_ff_shexp    = w.n_ff_shexp;
     cfg.n_layer       = w.n_layer;
     cfg.first_moe_layer = 0;  // all layers are MoE in qwen35moe
+    // sm_80+ (Ampere and later): MMQ mul_mat_id is safe with reduced hot stacks
+    static const int sm = query_gpu_compute_sm();
+    cfg.mmq_safe_full_batch = (sm >= 80);
     return cfg;
 }
 
@@ -61,6 +64,9 @@ inline MoeHybridConfig make_moe_hybrid_config(const LagunaTargetWeights & w) {
     cfg.n_ff_shexp    = w.n_ff_shexp;
     cfg.n_layer       = w.n_layer;
     cfg.first_moe_layer = w.n_layer_dense_lead;  // layer 0 is dense in laguna
+    // sm_80+ (Ampere and later): MMQ mul_mat_id is safe with reduced hot stacks
+    static const int sm = query_gpu_compute_sm();
+    cfg.mmq_safe_full_batch = (sm >= 80);
     return cfg;
 }
 

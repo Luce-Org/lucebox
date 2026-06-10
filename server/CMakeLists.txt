@@ -260,6 +260,7 @@ add_library(dflash_common STATIC
     src/common/moe_hybrid_storage.cpp
     src/common/spark_corpus.cpp
     src/common/moe_hybrid_ffn_eval.cpp
+    src/common/moe_hybrid_stream.cpp
     src/common/cold_ffn_cpu.cpp
     src/common/moe_hybrid_swap_manager.cpp
     src/qwen35/layer_split_forward.cpp
@@ -589,6 +590,27 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_bandit_integration PRIVATE dflash_common)
         add_test(NAME bandit_integration COMMAND test_bandit_integration)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_anchor_params.cpp")
+        add_executable(test_anchor_params test/test_anchor_params.cpp)
+        target_include_directories(test_anchor_params PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_anchor_params PRIVATE dflash_common)
+        add_test(NAME anchor_params COMMAND test_anchor_params)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_tail_capture_guard.cpp")
+        # GREEN phase: built with TAIL_GUARD_USE_NEW_FORMULA — must pass after Bug #42 fix.
+        add_executable(test_drafter_tail_capture_guard
+            test/test_drafter_tail_capture_guard.cpp)
+        target_compile_definitions(test_drafter_tail_capture_guard PRIVATE
+            TAIL_GUARD_USE_NEW_FORMULA)
+        add_test(NAME test_drafter_tail_capture_guard
+            COMMAND test_drafter_tail_capture_guard)
+        # RED phase binary: same source WITHOUT the fix flag — documents the bug.
+        add_executable(test_drafter_tail_capture_guard_red
+            test/test_drafter_tail_capture_guard.cpp)
+        # No TAIL_GUARD_USE_NEW_FORMULA — uses old (buggy) guard, expected to FAIL.
+        add_test(NAME test_drafter_tail_capture_guard_red COMMAND test_drafter_tail_capture_guard_red)
+        set_tests_properties(test_drafter_tail_capture_guard_red PROPERTIES WILL_FAIL TRUE)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_vs_reference.cpp")
         add_executable(test_draft_vs_reference test/test_draft_vs_reference.cpp)
         target_link_libraries(test_draft_vs_reference PRIVATE dflash_common)
@@ -672,6 +694,16 @@ if(DFLASH27B_TESTS)
         target_include_directories(bench_laguna_generate PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(bench_laguna_generate PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_laguna_spark.cpp")
+        add_executable(bench_laguna_spark test/bench_laguna_spark.cpp)
+        target_include_directories(bench_laguna_spark PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(bench_laguna_spark PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_moe_stream.cpp" AND DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+        add_executable(bench_moe_stream test/bench_moe_stream.cpp)
+        target_include_directories(bench_moe_stream PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(bench_moe_stream PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} CUDA::cudart)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_laguna_daemon.cpp")
         add_executable(test_laguna_daemon test/test_laguna_daemon.cpp)
         target_include_directories(test_laguna_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
@@ -727,6 +759,7 @@ if(DFLASH27B_TESTS)
             src/server/server_main.cpp
             src/server/http_server.cpp
             src/server/model_card.cpp
+            src/server/prompt_normalize.cpp
         )
         target_include_directories(dflash_server PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
@@ -812,7 +845,8 @@ if(DFLASH27B_TESTS)
         add_executable(test_server_unit test/test_server_unit.cpp)
         target_sources(test_server_unit PRIVATE
             src/server/http_server.cpp
-            src/server/model_card.cpp)
+            src/server/model_card.cpp
+            src/server/prompt_normalize.cpp)
         target_include_directories(test_server_unit PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(test_server_unit PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)

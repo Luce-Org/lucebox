@@ -31,6 +31,9 @@ struct CachedPrefnGraph {
     ggml_cgraph * gf = nullptr;
     ggml_gallocr_t alloc = nullptr;
     ggml_tensor * inp_embed = nullptr;     // [n_embd, 1, 1] F32 input
+    ggml_tensor * positions = nullptr;     // [4] I32 input (attn layers only)
+    ggml_tensor * kv_write_rows = nullptr; // [1, n_head_kv] I64 input (attn layers only)
+    int kv_win = 0;                        // FA span baked into the graph (attn layers; 256-aligned)
     ggml_tensor * ffn_post = nullptr;      // output: post-norm hidden state
     ggml_tensor * ffn_residual = nullptr;  // output: pre-FFN residual
     ggml_tensor * moe_selected = nullptr;  // output: selected expert IDs
@@ -48,10 +51,14 @@ struct CachedPrefnGraph {
             inp_embed = o.inp_embed; ffn_post = o.ffn_post;
             ffn_residual = o.ffn_residual;
             moe_selected = o.moe_selected; moe_weights = o.moe_weights;
+            positions = o.positions; kv_write_rows = o.kv_write_rows;
+            kv_win = o.kv_win;
             o.ctx = nullptr; o.gf = nullptr; o.alloc = nullptr;
             o.inp_embed = nullptr; o.ffn_post = nullptr;
             o.ffn_residual = nullptr;
             o.moe_selected = nullptr; o.moe_weights = nullptr;
+            o.positions = nullptr; o.kv_write_rows = nullptr;
+            o.kv_win = 0;
         }
         return *this;
     }

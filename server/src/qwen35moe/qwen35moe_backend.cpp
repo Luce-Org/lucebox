@@ -1,6 +1,7 @@
 #include "qwen35moe_backend.h"
 
 #include "../common/moe_hybrid_placement.h"
+#include "../common/moe_hybrid_stream.h"
 #include "../common/moe_hybrid_types.h"
 #include "../common/moe_hybrid_types_impl.h"
 #include "common/ggml_graph_precision.h"
@@ -145,24 +146,52 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
 
         auto hybrid = std::make_shared<MoeHybridStorage>();
         MoeHybridConfig hybrid_cfg = make_moe_hybrid_config(out);
+        if (hybrid_cfg.mmq_safe_full_batch) {
+            std::fprintf(stderr, "[qwen35moe] GPU sm_%d: MMQ full-batch enabled (no sub-batch workaround)\n",
+                         query_gpu_compute_sm());
+        }
         std::vector<MoeLayerDesc> layer_descs((size_t)out.n_layer);
         for (int il = 0; il < out.n_layer; ++il) {
             layer_descs[(size_t)il] = make_moe_layer_desc(out.layers[(size_t)il]);
         }
         int cache_slots = 0;
-    if (const char * cs = std::getenv("DFLASH_QWEN35MOE_CACHE_SLOTS")) cache_slots = std::max(0, std::atoi(cs));
-    else if (cache_slots_ >= 0) cache_slots = cache_slots_;
-    if (!build_moe_hybrid_storage_from_file(hybrid_cfg, backend, placement, layer_descs, layer_file_data, *hybrid, &err, cache_slots)) {
+        if (const char * cs = std::getenv("DFLASH_QWEN35MOE_CACHE_SLOTS")) cache_slots = std::max(0, std::atoi(cs));
+        else if (cache_slots_ >= 0) cache_slots = cache_slots_;
+        if (!build_moe_hybrid_storage_from_file_with_mmap(hybrid_cfg, backend, placement, layer_descs, layer_file_data, mmap_addr, file_size, *hybrid, &err, cache_slots)) {
             ::munmap(mmap_addr, file_size);
             gguf_free(gctx);
             set_last_error(std::string("qwen35moe hybrid storage build failed: ") + err);
             return false;
         }
 
-        ::munmap(mmap_addr, file_size);
+        // Keep mmap open for streaming prefill — do NOT munmap here.
+        // The mmap_data/mmap_size are stored in hybrid storage for lifetime management.
         gguf_free(gctx);
 
         out.moe_hybrid = std::move(hybrid);
+    }
+
+    // Initialize streaming engine for prefill (if cold experts exist and mmap is available)
+    if (out.moe_hybrid && out.moe_hybrid->has_mmap() && !out.moe_hybrid->layers.empty()) {
+        // Compute max expert size across all layers
+        size_t max_expert_bytes = 0;
+        for (const auto & layer : out.moe_hybrid->layers) {
+            size_t per_expert = layer.fused_gate_up
+                ? layer.gate_up_expert_bytes + layer.down_expert_bytes
+                : layer.gate_expert_bytes + layer.up_expert_bytes + layer.down_expert_bytes;
+            max_expert_bytes = std::max(max_expert_bytes, per_expert);
+        }
+        if (max_expert_bytes > 0) {
+            std::string stream_err;
+            if (stream_engine_.init(backend, max_expert_bytes, &stream_err)) {
+                std::printf("[qwen35moe] streaming prefill engine ready (pinned=%.1f MiB, scratch=%.1f MiB)\n",
+                            stream_engine_.pinned_bytes() / 1024.0 / 1024.0,
+                            stream_engine_.scratch_bytes() / 1024.0 / 1024.0);
+            } else {
+                std::fprintf(stderr, "[qwen35moe] warning: streaming engine init failed: %s (prefill will use fallback)\n",
+                             stream_err.c_str());
+            }
+        }
     }
 
     int total_cold = 0;
@@ -636,6 +665,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
 
     const int n_layer = target_weights().n_layer;
     uint64_t build_us_total = 0, compute_us_total = 0, readback_us_total = 0, ffn_us_total = 0;
+    int hot_only_layers = 0, total_ffn_layers = 0;
     MoeHybridFfnTelemetry ffn_tel_accum{};
 
     StepGraph logits_sg;  // Persistent logits graph (used by spec-decode branch)
@@ -812,8 +842,42 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             MoeLayerDesc chunk_desc = make_moe_layer_desc(target_weights().layers[(size_t)il]);
             std::vector<float> ffn_batch_out;
             bool ffn_ok = false;
+            ++total_ffn_layers;
             if (storage.cold_expert_ids.empty()) {
                 // All experts hot — safe to use batched path
+                ++hot_only_layers;
+                ffn_ok = eval_moe_hybrid_ffn_batched(
+                        target_backend(), cpu_be, chunk_cfg, chunk_desc, storage,
+                        chunk_post.data(),
+                        chunk_selected.data(),
+                        chunk_weights.data(),
+                        chunk_len, ffn_batch_out, &result.error,
+                        &ffn_hot_alloc, &ffn_cold_alloc);
+            } else if (storage.all_routed_are_hot(chunk_selected.data(),
+                                                   chunk_len * n_expert_used)) {
+                // All selected experts happen to be in VRAM — pure GPU, no CPU
+                ++hot_only_layers;
+                ffn_ok = eval_moe_hot_only_batched(
+                        target_backend(), chunk_cfg, chunk_desc, storage,
+                        chunk_post.data(),
+                        chunk_selected.data(),
+                        chunk_weights.data(),
+                        chunk_len, ffn_batch_out, &result.error,
+                        &ffn_hot_alloc);
+            } else if (target_weights().moe_hybrid->has_mmap() &&
+                       !target_weights().moe_hybrid->layer_regions.empty() &&
+                       stream_engine_.is_ready() && chunk_len >= 16 &&
+                       !storage.cold_expert_ids.empty()) {
+                // Streaming prefill: batched eval handles hot on GPU + cold on CPU.
+                // The streaming engine's mmap keeps data paged in via madvise.
+                auto * hybrid = target_weights().moe_hybrid.get();
+                const auto & regions = hybrid->layer_regions[(size_t)il];
+                // Prefetch cold expert data from mmap for upcoming layers
+                std::vector<int32_t> cold_ids_copy(storage.cold_expert_ids.begin(),
+                                                   storage.cold_expert_ids.end());
+                stream_engine_.prefetch_cold_experts(hybrid->mmap_data, hybrid->mmap_size,
+                                                    regions, cold_ids_copy.data(),
+                                                    (int)cold_ids_copy.size());
                 ffn_ok = eval_moe_hybrid_ffn_batched(
                         target_backend(), cpu_be, chunk_cfg, chunk_desc, storage,
                         chunk_post.data(),
@@ -895,6 +959,32 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
     target_cache().cur_pos = committed;
     auto t_prefill_end = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_prefill_end - t_prefill_start).count();
+
+    if (req.snap_slot >= 0 && req.snap_pos > 0 && req.snap_pos == committed) {
+        if (compute_logits()) {
+            int32_t last_tok = 0;
+            float best = logits_buf[0];
+            for (int j = 1; j < vocab; ++j) {
+                if (logits_buf[(size_t)j] > best) {
+                    best = logits_buf[(size_t)j];
+                    last_tok = j;
+                }
+            }
+            target_cache().last_tok = last_tok;
+            if (snapshot_save(req.snap_slot)) {
+                std::printf("[snap] hybrid boundary slot=%d cur_pos=%d\n",
+                            req.snap_slot, committed);
+                std::fflush(stdout);
+            }
+        } else {
+            std::fprintf(stderr, "[snap] hybrid boundary logits failed at cur_pos=%d\n",
+                         committed);
+        }
+    } else if (req.snap_slot >= 0 && req.snap_pos > 0) {
+        std::fprintf(stderr,
+                     "[snap] hybrid skip unsafe boundary slot=%d req_snap_pos=%d cur_pos=%d\n",
+                     req.snap_slot, req.snap_pos, committed);
+    }
 
     // ── Hybrid Decode ──
     if (req.n_gen > 0) {
@@ -1124,6 +1214,11 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
         std::printf("  build=%.1fms compute=%.1fms readback=%.1fms ffn=%.1fms\n",
                     build_us_total / 1000.0, compute_us_total / 1000.0,
                     readback_us_total / 1000.0, ffn_us_total / 1000.0);
+        if (total_ffn_layers > 0) {
+            std::printf("  hot_only_layers=%d/%d (%.1f%% skip CPU)\n",
+                        hot_only_layers, total_ffn_layers,
+                        100.0 * hot_only_layers / total_ffn_layers);
+        }
         const double prefill_total_us = (double)(build_us_total + compute_us_total + readback_us_total + ffn_us_total);
         if (prefill_total_us > 0) {
             std::printf("  pct: build=%.1f%% compute=%.1f%% readback=%.1f%% ffn=%.1f%%\n",
@@ -1158,16 +1253,93 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
         if (result.ok) maybe_post_request_swap();
         return result;
     }
-    // Snapshot restore not supported in hybrid split-load mode.
-    // Fall back to full generate (ignores snapshot).
-    return generate_impl(req, io);
+    GenerateResult result;
+    DaemonIO out_io = io.with_token_callback(req.on_token);
+    if (slot < 0 || !snapshot_used(slot)) {
+        result.error = "bad slot";
+        out_io.emit(-1);
+        return result;
+    }
+
+    sampler_config() = req.sampler;
+    if (req.do_sample && sampler_config().seed != 0) {
+        sampler_rng_engine().seed(sampler_config().seed);
+    }
+
+    if (req.n_gen > 0 && sampler_config().temp > 0) {
+        std::fprintf(stderr,
+                     "[qwen35moe] hybrid snapshot restore falls back to full generate for temp sampling\n");
+        return generate_impl(req, io);
+    }
+
+    pipe_state_.reset();
+    for (auto & layer : target_weights().moe_hybrid->layers) {
+        layer.hot_graph.free();
+        layer.cold_graph.free();
+    }
+
+    if (!restore_target_cache_from_snapshot(slot)) {
+        result.error = "restore";
+        out_io.emit(-1);
+        return result;
+    }
+
+    const int snap_pos = snapshot_cur_pos(slot);
+    int committed = snap_pos;
+    target_cache().cur_pos = committed;
+
+    const int prompt_len = (int)req.prompt.size();
+    if (prompt_len > 0 && prompt_len < snap_pos) {
+        result.error = "snapshot_longer_than_prompt";
+        out_io.emit(-1);
+        return result;
+    }
+
+    const int hidden = target_weights().n_embd;
+    std::vector<float> act_cur((size_t)hidden);
+    if (prompt_len > snap_pos) {
+        auto t_prefill_start = std::chrono::steady_clock::now();
+        for (int i = snap_pos; i < prompt_len; ++i) {
+            int32_t argmax = -1;
+            if (!hybrid_forward_one_token(req.prompt[(size_t)i], committed,
+                                          act_cur, argmax)) {
+                result.error = "prefill_delta";
+                return result;
+            }
+            committed++;
+            target_cache().cur_pos = committed;
+            target_cache().last_tok = argmax;
+        }
+        result.prefill_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_prefill_start).count();
+    }
+
+    if (req.n_gen > 0) {
+        if (target_cache().last_tok < 0) {
+            std::fprintf(stderr,
+                         "[qwen35moe] hybrid snapshot has no last token; falling back to full generate\n");
+            return generate_impl(req, io);
+        }
+        auto t_decode_start = std::chrono::steady_clock::now();
+        if (!run_pipelined_decode_path(committed, req.n_gen, result.tokens, out_io)) {
+            result.error = "decode";
+            return result;
+        }
+        result.decode_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_decode_start).count();
+    }
+
+    result.ok = true;
+    if (result.ok) maybe_post_request_swap();
+    return result;
 }
 
 // ── Hybrid spec-decode: draft → verify via hybrid forward → accept ──────────
 
 bool Qwen35MoeBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
                                                  std::vector<float> & act_cur,
-                                                 int32_t & argmax_out) {
+                                                 int32_t & argmax_out,
+                                                 std::vector<float> * logits_out) {
     const int hidden = target_weights().n_embd;
 
     // Embed the token
@@ -1244,6 +1416,9 @@ bool Qwen35MoeBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
     std::vector<float> logits_buf((size_t)vocab);
     ggml_backend_tensor_get(proj_sg.logits, logits_buf.data(), 0, sizeof(float) * (size_t)vocab);
     step_graph_destroy(proj_sg);
+    if (logits_out) {
+        *logits_out = logits_buf;
+    }
 
     // Argmax
     argmax_out = 0;
@@ -1253,6 +1428,247 @@ bool Qwen35MoeBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
             best = logits_buf[(size_t)j];
             argmax_out = j;
         }
+    }
+    return true;
+}
+
+// ── Batched hybrid forward ─────────────────────────────────────────────────
+// Processes all tokens layer-by-layer using the same approach as prefill:
+//   per layer: build_layer_prefn_step (DeltaNet + router) → MoE FFN (batched)
+// Then project all tokens to logits and take argmax.
+// This is ~22× fewer dispatches than sequential hybrid_forward_one_token.
+
+bool Qwen35MoeBackend::hybrid_forward_batch(
+    const int32_t * tokens, int n_tokens, int base_pos,
+    std::vector<float> & act_cur,
+    std::vector<int32_t> & argmax_out,
+    bool capture_features) {
+
+    const int hidden = target_weights().n_embd;
+    const int n_layer = target_weights().n_layer;
+    const int n_expert_used = target_weights().n_expert_used;
+
+    // Embed all tokens
+    std::vector<float> embed_all((size_t)n_tokens * (size_t)hidden);
+    for (int i = 0; i < n_tokens; ++i) {
+        if (!target_weights().embedder.embed(&tokens[i], 1,
+                embed_all.data() + (size_t)i * (size_t)hidden)) {
+            return false;
+        }
+    }
+
+    // Process layer-by-layer (same as prefill)
+    StepGraph prefn_sg;
+    ggml_gallocr_t ffn_hot_alloc = nullptr;
+
+    MoeHybridConfig chunk_cfg = make_moe_hybrid_config(target_weights());
+
+    for (int il = 0; il < n_layer; ++il) {
+        auto & storage = target_weights().moe_hybrid->layers[(size_t)il];
+
+        const bool with_mask = (cfg_.kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
+
+        // Build pre-FFN graph (DeltaNet/attention + router) for all tokens
+        step_graph_free(prefn_sg);
+        if (!build_layer_prefn_step(prefn_sg, target_weights(), target_cache(), target_backend(),
+                                    il, /*kv_start=*/base_pos, n_tokens,
+                                    with_mask, /*fa_window=*/0, cfg_.kq_stride_pad)) {
+            step_graph_destroy(prefn_sg);
+            if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+            return false;
+        }
+
+        // Upload embeddings
+        ggml_backend_tensor_set(prefn_sg.inp_embed, embed_all.data(), 0,
+                                sizeof(float) * (size_t)n_tokens * (size_t)hidden);
+
+        // Set positions for attention layers
+        if (prefn_sg.positions) {
+            std::vector<int32_t> pos_data((size_t)n_tokens * 4);
+            for (int i = 0; i < n_tokens; ++i) {
+                pos_data[(size_t)i * 4 + 0] = base_pos + i;
+                pos_data[(size_t)i * 4 + 1] = base_pos + i;
+                pos_data[(size_t)i * 4 + 2] = base_pos + i;
+                pos_data[(size_t)i * 4 + 3] = 0;
+            }
+            ggml_backend_tensor_set(prefn_sg.positions, pos_data.data(), 0,
+                                    sizeof(int32_t) * pos_data.size());
+        }
+
+        // Set causal mask
+        if (prefn_sg.attn_mask) {
+            const int kv_len = base_pos + n_tokens;
+            const int kv_pad_override = (int)prefn_sg.attn_mask->ne[0];
+            std::vector<uint16_t> mask_buf;
+            build_causal_mask(mask_buf, kv_len, n_tokens, /*kv_start=*/base_pos,
+                              cfg_.kq_stride_pad, /*win_start=*/0, kv_pad_override);
+            ggml_backend_tensor_set(prefn_sg.attn_mask, mask_buf.data(), 0,
+                                    sizeof(uint16_t) * mask_buf.size());
+        }
+
+        // Compute pre-FFN (DeltaNet + router for all tokens in one dispatch)
+        auto st = ggml_backend_graph_compute(target_backend(), prefn_sg.gf);
+        if (st != GGML_STATUS_SUCCESS) {
+            step_graph_destroy(prefn_sg);
+            if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+            return false;
+        }
+
+        // Readback results
+        std::vector<float> chunk_residuals((size_t)n_tokens * (size_t)hidden);
+        std::vector<float> chunk_post((size_t)n_tokens * (size_t)hidden);
+        std::vector<int32_t> chunk_selected((size_t)n_tokens * (size_t)n_expert_used);
+        std::vector<float> chunk_weights((size_t)n_tokens * (size_t)n_expert_used);
+
+        ggml_backend_tensor_get(prefn_sg.ffn_residual, chunk_residuals.data(), 0,
+                                sizeof(float) * chunk_residuals.size());
+        ggml_backend_tensor_get(prefn_sg.ffn_post, chunk_post.data(), 0,
+                                sizeof(float) * chunk_post.size());
+
+        ggml_tensor * layer_selected = (!prefn_sg.moe_selected.empty() && (size_t)il < prefn_sg.moe_selected.size())
+            ? prefn_sg.moe_selected[(size_t)il] : nullptr;
+        if (!layer_selected || !prefn_sg.moe_weights) {
+            step_graph_destroy(prefn_sg);
+            if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+            return false;
+        }
+        ggml_backend_tensor_get(layer_selected, chunk_selected.data(), 0,
+                                sizeof(int32_t) * chunk_selected.size());
+        ggml_backend_tensor_get(prefn_sg.moe_weights, chunk_weights.data(), 0,
+                                sizeof(float) * chunk_weights.size());
+
+        // MoE FFN — batched
+        MoeLayerDesc chunk_desc = make_moe_layer_desc(target_weights().layers[(size_t)il]);
+        std::vector<float> ffn_batch_out;
+        bool ffn_ok = false;
+
+        if (storage.cold_expert_ids.empty()) {
+            // All-hot: use batched hot-only path
+            ffn_ok = eval_moe_hot_only_batched(
+                target_backend(), chunk_cfg, chunk_desc, storage,
+                chunk_post.data(), chunk_selected.data(), chunk_weights.data(),
+                n_tokens, ffn_batch_out, nullptr, &ffn_hot_alloc);
+        } else {
+            // Mixed hot/cold: use hybrid path
+            ffn_ok = eval_moe_hybrid_ffn_batched(
+                target_backend(), target_weights().moe_hybrid->cpu_backend,
+                chunk_cfg, chunk_desc, storage,
+                chunk_post.data(), chunk_selected.data(), chunk_weights.data(),
+                n_tokens, ffn_batch_out, nullptr, &ffn_hot_alloc, nullptr);
+        }
+
+        if (!ffn_ok) {
+            // Per-token fallback
+            ffn_batch_out.assign((size_t)hidden * (size_t)n_tokens, 0.0f);
+            std::vector<float> single_out;
+            for (int ti = 0; ti < n_tokens; ++ti) {
+                if (!eval_moe_hybrid_ffn_single(
+                        target_backend(), chunk_cfg, chunk_desc, storage,
+                        target_weights().moe_hybrid->cpu_backend,
+                        chunk_post.data() + (size_t)ti * (size_t)hidden,
+                        chunk_selected.data() + (size_t)ti * (size_t)n_expert_used,
+                        chunk_weights.data() + (size_t)ti * (size_t)n_expert_used,
+                        n_expert_used, single_out, nullptr)) {
+                    step_graph_destroy(prefn_sg);
+                    if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+                    return false;
+                }
+                std::memcpy(ffn_batch_out.data() + (size_t)ti * (size_t)hidden,
+                            single_out.data(), sizeof(float) * (size_t)hidden);
+            }
+        }
+
+        // Combine FFN + residual → embed_all for next layer
+        for (int i = 0; i < n_tokens; ++i) {
+            const float * ffn = ffn_batch_out.data() + (size_t)i * (size_t)hidden;
+            const float * res = chunk_residuals.data() + (size_t)i * (size_t)hidden;
+            float * emb = embed_all.data() + (size_t)i * (size_t)hidden;
+            for (int j = 0; j < hidden; ++j) {
+                emb[j] = ffn[j] + res[j];
+            }
+
+            // Feature capture at capture layers
+            if (capture_features && target_cache().target_feat && cfg_.draft_path) {
+                int capture_idx = -1;
+                for (int k = 0; k < target_weights().n_capture_layers; k++) {
+                    if (target_weights().capture_layer_ids[k] == il) {
+                        capture_idx = k;
+                        break;
+                    }
+                }
+                if (capture_idx >= 0) {
+                    const int token_pos = base_pos + i;
+                    const int cap = target_cache().target_feat_cap;
+                    const int slot = token_pos % cap;
+                    const size_t elt = ggml_element_size(target_cache().target_feat);
+                    const size_t col_stride = target_cache().target_feat->nb[1];
+                    const size_t offset = (size_t)slot * col_stride +
+                                          (size_t)capture_idx * (size_t)hidden * elt;
+                    std::vector<ggml_bf16_t> bf16_tmp((size_t)hidden);
+                    ggml_fp32_to_bf16_row(emb, bf16_tmp.data(), hidden);
+                    ggml_backend_tensor_set(target_cache().target_feat, bf16_tmp.data(),
+                                            offset, (size_t)hidden * elt);
+                }
+            }
+        }
+    }
+    step_graph_destroy(prefn_sg);
+    if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+
+    // Store last token hidden state in act_cur
+    act_cur.assign(embed_all.data() + (size_t)(n_tokens - 1) * (size_t)hidden,
+                   embed_all.data() + (size_t)n_tokens * (size_t)hidden);
+
+    // Project ALL tokens to logits and get argmax for each
+    const int vocab = target_weights().n_vocab;
+    argmax_out.resize(n_tokens);
+
+    StepGraph proj_sg;
+    ggml_init_params ip{};
+    ip.mem_size = 64 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc = true;
+    proj_sg.ctx = ggml_init(ip);
+    if (!proj_sg.ctx) return false;
+
+    proj_sg.hidden_input = ggml_new_tensor_2d(proj_sg.ctx, GGML_TYPE_F32, hidden, n_tokens);
+    ggml_set_input(proj_sg.hidden_input);
+    proj_sg.gf = ggml_new_graph_custom(proj_sg.ctx, 1024, false);
+    ggml_tensor * normed = ggml_rms_norm(proj_sg.ctx, proj_sg.hidden_input, target_weights().rms_eps);
+    normed = ggml_mul(proj_sg.ctx, normed, target_weights().out_norm);
+    proj_sg.logits = ggml_mul_mat(proj_sg.ctx, target_weights().output, normed);
+    ggml_set_output(proj_sg.logits);
+    ggml_build_forward_expand(proj_sg.gf, proj_sg.logits);
+    proj_sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(target_backend()));
+    if (!ggml_gallocr_alloc_graph(proj_sg.alloc, proj_sg.gf)) {
+        step_graph_destroy(proj_sg);
+        return false;
+    }
+    ggml_backend_tensor_set(proj_sg.hidden_input, embed_all.data(), 0,
+                            sizeof(float) * (size_t)n_tokens * (size_t)hidden);
+    auto proj_st = ggml_backend_graph_compute(target_backend(), proj_sg.gf);
+    if (proj_st != GGML_STATUS_SUCCESS) {
+        step_graph_destroy(proj_sg);
+        return false;
+    }
+
+    // Read logits and compute argmax per token
+    std::vector<float> logits_buf((size_t)vocab * (size_t)n_tokens);
+    ggml_backend_tensor_get(proj_sg.logits, logits_buf.data(), 0,
+                            sizeof(float) * logits_buf.size());
+    step_graph_destroy(proj_sg);
+
+    for (int t = 0; t < n_tokens; ++t) {
+        const float * tok_logits = logits_buf.data() + (size_t)t * (size_t)vocab;
+        int32_t best_id = 0;
+        float best_val = tok_logits[0];
+        for (int j = 1; j < vocab; ++j) {
+            if (tok_logits[j] > best_val) {
+                best_val = tok_logits[j];
+                best_id = j;
+            }
+        }
+        argmax_out[t] = best_id;
     }
     return true;
 }
@@ -1366,19 +1782,13 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         }
         draft_tok[0] = last_tok;
 
-        // 4. Verify: snapshot recurrent state, then run each draft token through hybrid forward
+        // 4. Verify: snapshot recurrent state, then run ALL draft tokens batched
         snapshot_ssm_state(target_cache());
 
         target_tok.resize(q_len);
-        bool verify_ok = true;
-        for (int i = 0; i < q_len; i++) {
-            int32_t argmax = -1;
-            if (!hybrid_forward_one_token(draft_tok[i], committed + i, act_cur, argmax)) {
-                verify_ok = false;
-                break;
-            }
-            target_tok[i] = argmax;
-        }
+        bool verify_ok = hybrid_forward_batch(
+            draft_tok.data(), q_len, committed,
+            act_cur, target_tok, /*capture_features=*/false);
         if (!verify_ok) {
             std::fprintf(stderr, "[hybrid-spec] verify failed\n");
             restore_ssm_state(target_cache());
@@ -1407,18 +1817,15 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
             replay_tok[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
         }
 
-        // Replay tokens through hybrid forward (captures features for next draft step)
-        int32_t replay_last = -1;
-        for (int i = 0; i < commit_n; i++) {
-            int32_t argmax = -1;
-            if (!hybrid_forward_one_token(replay_tok[i], committed + i, act_cur, argmax)) {
-                std::fprintf(stderr, "[hybrid-spec] replay failed\n");
-                step_graph_destroy(draft_sg);
-                return false;
-            }
-            replay_last = argmax;
+        // Replay tokens through batched hybrid forward (captures features for next draft step)
+        std::vector<int32_t> replay_argmax;
+        if (!hybrid_forward_batch(replay_tok.data(), commit_n, committed,
+                                  act_cur, replay_argmax, /*capture_features=*/true)) {
+            std::fprintf(stderr, "[hybrid-spec] replay failed\n");
+            step_graph_destroy(draft_sg);
+            return false;
         }
-        last_tok = replay_last;
+        last_tok = replay_argmax[commit_n - 1];
 
         // 7. Sync features to mirror for next draft step
         if (feature_mirror().target_feat && target_cache().target_feat) {

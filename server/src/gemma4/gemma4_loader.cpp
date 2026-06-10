@@ -548,6 +548,11 @@ bool create_gemma4_cache_partial(ggml_backend_t backend,
         return false;
     }
 
+    // Zero-init KV: the FA views span the 256-padded tail beyond the written
+    // positions (mask gates it to -inf), so reads there must dequantise to
+    // finite values — F16 garbage can be NaN/Inf and NaN + (-inf) = NaN.
+    ggml_backend_buffer_clear(out.buf, 0);
+
     out.cur_pos = 0;
     out.max_ctx = max_ctx;
     out.n_layer = w.n_layer;

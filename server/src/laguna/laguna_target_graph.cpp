@@ -599,7 +599,9 @@ static ggml_tensor * build_laguna_attn_block(
     ggml_tensor * attn_mask_swa,
     int kv_start,
     int n_tokens,
-    bool is_full)
+    bool is_full,
+    int kv_pad = 0,
+    ggml_tensor * kv_idx = nullptr)
 {
     const int head_dim   = w.head_dim;
     const int n_head     = w.n_head_arr[il];
@@ -656,16 +658,30 @@ static ggml_tensor * build_laguna_attn_block(
     ggml_tensor * Kcur_T = ggml_permute(ctx, Kcur, 0, 2, 1, 3);
     ggml_tensor * Vcur_T = ggml_permute(ctx, Vcur, 0, 2, 1, 3);
 
-    ggml_tensor * k_slot = ggml_view_3d(ctx, cache_k,
-        head_dim, n_tokens, n_head_kv,
-        cache_k->nb[1], cache_k->nb[2],
-        cache_k->nb[1] * (size_t)kv_start);
-    ggml_tensor * v_slot = ggml_view_3d(ctx, cache_v,
-        head_dim, n_tokens, n_head_kv,
-        cache_v->nb[1], cache_v->nb[2],
-        cache_v->nb[1] * (size_t)kv_start);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_T, k_slot));
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
+    if (kv_idx) {
+        // CUDA-graph-stable append: the destination is the WHOLE cache tensor
+        // (stable data pointer) and the row index is a graph input whose DATA
+        // changes per step but whose pointer doesn't. A kv_start-offset view
+        // (below) changes node properties every step, which resets the
+        // ggml-cuda CUDA-graph warmup and forfeits replay.
+        // kv_idx [n_tokens] broadcasts over the n_head_kv dim (ggml_set_rows
+        // requires b->ne[2] % c->ne[1] == 0).
+        ggml_tensor * Krows = ggml_cont(ctx, Kcur_T);  // set_rows needs contiguous rows
+        ggml_tensor * Vrows = ggml_cont(ctx, Vcur_T);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_k, Krows, kv_idx));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_v, Vrows, kv_idx));
+    } else {
+        ggml_tensor * k_slot = ggml_view_3d(ctx, cache_k,
+            head_dim, n_tokens, n_head_kv,
+            cache_k->nb[1], cache_k->nb[2],
+            cache_k->nb[1] * (size_t)kv_start);
+        ggml_tensor * v_slot = ggml_view_3d(ctx, cache_v,
+            head_dim, n_tokens, n_head_kv,
+            cache_v->nb[1], cache_v->nb[2],
+            cache_v->nb[1] * (size_t)kv_start);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_T, k_slot));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
+    }
 
     // ---- Flash attention ---
     // BOTH full and SWA layers read the FULL kv_len of K/V from the cache.
@@ -675,7 +691,11 @@ static ggml_tensor * build_laguna_attn_block(
     // rows (which need [p-sw+1..p+1)).
     const int kv_len   = kv_start + n_tokens;
     const int win_start = 0;
-    const int win_len   = kv_len;
+    // kv_pad > 0: read a stride-rounded fixed span so the view shape (and thus
+    // every downstream FA node's properties) stays constant across decode
+    // steps; the mask carries -inf for [kv_len, kv_pad) and the cache buffer
+    // is zero-initialised, so the padded tail contributes exactly nothing.
+    const int win_len   = kv_pad > 0 ? kv_pad : kv_len;
 
     ggml_tensor * Qfa = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
     Qfa = ggml_cont(ctx, Qfa);
@@ -723,7 +743,9 @@ static ggml_tensor * build_laguna_layer(
     int kv_start,
     int n_tokens,
     ggml_tensor * attn_mask_swa,
-    const LagunaHybridMoe * hyb = nullptr)
+    const LagunaHybridMoe * hyb = nullptr,
+    int kv_pad = 0,
+    ggml_tensor * kv_idx = nullptr)
 {
     const LagunaTargetLayer & L = w.layers[il];
     ggml_tensor * inp_f32 = graph_tensor_f32(ctx, inp);
@@ -735,7 +757,8 @@ static ggml_tensor * build_laguna_layer(
     const bool is_full = laguna_is_full_attn_layer(w, il);
     cur = build_laguna_attn_block(ctx, gf, w, L, il, cur,
                                     positions, cache.attn_k[il], cache.attn_v[il],
-                                    attn_mask, attn_mask_swa, kv_start, n_tokens, is_full);
+                                    attn_mask, attn_mask_swa, kv_start, n_tokens, is_full,
+                                    kv_pad, kv_idx);
 
     // Residual
     ggml_tensor * ffn_inp = ggml_add(ctx, cur, inp_f32);
@@ -912,7 +935,7 @@ LagunaGraphOutputs build_laguna_graph(
     for (int il = 0; il < w.n_layer; ++il) {
         cur = build_laguna_layer(ctx, gf, w, cache, il, cur,
                                   in.positions, in.attn_mask, in.kv_start, in.n_tokens,
-                                  in.attn_mask_swa, in.hybrid);
+                                  in.attn_mask_swa, in.hybrid, in.kv_pad, in.kv_idx);
     }
 
     // Final norm + lm_head
@@ -957,8 +980,19 @@ bool laguna_step(
     bool                        no_mask,
     std::vector<float> &        out_logits)
 {
+    // Same CUDA-graph-replay treatment as laguna_step_hybrid: persistent
+    // arena (stable node addresses -> stable graph key), stride-padded KV
+    // span, and set_rows K/V append (index is an input, so node properties
+    // are bit-identical across decode steps and the captured graph replays).
+    const size_t arena_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() + 16 * 1024 * 1024;
+    // thread_local: decode is single-threaded per process today (the static
+    // gallocr below makes the same assumption), but a second decode thread
+    // must not share the arena — each thread gets its own stable addresses.
+    static thread_local std::vector<uint8_t> g_arena;
+    if (g_arena.size() < arena_size) g_arena.resize(arena_size);
     ggml_init_params ip{};
-    ip.mem_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() + 16 * 1024 * 1024;
+    ip.mem_size = arena_size;
+    ip.mem_buffer = g_arena.data();
     ip.no_alloc = true;
     ggml_context * ctx = ggml_init(ip);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16384, false);
@@ -967,14 +1001,31 @@ bool laguna_step(
     ggml_set_input(ie);
     ggml_tensor * pp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tok);
     ggml_set_input(pp);
+
+    const int kv_len = kv_start + n_tok;
+    static const bool g_no_kvpad = (std::getenv("DFLASH_LAGUNA_NO_KVPAD") != nullptr);
+    static const bool g_pad_cpy = (std::getenv("DFLASH_LAGUNA_PAD_CPY") != nullptr);
+    int kv_cap = 0;
+    for (int il = 0; il < w.n_layer; ++il) {
+        if (cache.attn_k[(size_t)il]) { kv_cap = (int)cache.attn_k[(size_t)il]->ne[1]; break; }
+    }
+    const int kv_pad = (!g_no_kvpad && kv_cap > 0)
+        ? std::min((kv_len + 255) & ~255, kv_cap) : 0;
+    const int mk_w = kv_pad > 0 ? kv_pad : kv_len;
+
+    ggml_tensor * kvi = nullptr;
+    if (kv_pad > 0 && !g_pad_cpy) {
+        kvi = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tok);
+        ggml_set_input(kvi);
+    }
+
     ggml_tensor * mk_full = nullptr, * mk_full_cnv = nullptr;
     ggml_tensor * mk_swa  = nullptr, * mk_swa_cnv  = nullptr;
-    const int kv_len = kv_start + n_tok;
     if (!no_mask) {
-        mk_full = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len, n_tok, 1, 1);
+        mk_full = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, mk_w, n_tok, 1, 1);
         ggml_set_input(mk_full);
         mk_full_cnv = ggml_cast(ctx, mk_full, GGML_TYPE_F16);
-        mk_swa = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len, n_tok, 1, 1);
+        mk_swa = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, mk_w, n_tok, 1, 1);
         ggml_set_input(mk_swa);
         mk_swa_cnv = ggml_cast(ctx, mk_swa, GGML_TYPE_F16);
     }
@@ -986,6 +1037,8 @@ bool laguna_step(
     gi.attn_mask_swa = mk_swa_cnv;
     gi.n_tokens      = n_tok;
     gi.kv_start      = kv_start;
+    gi.kv_pad        = kv_pad;
+    gi.kv_idx        = kvi;
     gi.output_last_only = true;
 
     LagunaGraphOutputs go = build_laguna_graph(ctx, gf, w, cache, gi);
@@ -1003,24 +1056,29 @@ bool laguna_step(
     std::vector<int32_t> pos((size_t)n_tok);
     for (int i = 0; i < n_tok; ++i) pos[i] = kv_start + i;
     ggml_backend_tensor_set(pp, pos.data(), 0, ggml_nbytes(pp));
+    if (kvi) {
+        ggml_backend_tensor_set(kvi, pos.data(), 0, ggml_nbytes(kvi));
+    }
 
     if (!no_mask) {
-        std::vector<float> mfull((size_t)kv_len * n_tok, -INFINITY);
+        // Width mk_w (= kv_pad when padding): [kv_len, mk_w) stays -inf so the
+        // zero-initialised padded cache tail contributes nothing.
+        std::vector<float> mfull((size_t)mk_w * n_tok, -INFINITY);
         for (int q = 0; q < n_tok; ++q) {
             const int abs_q = kv_start + q;
             for (int k = 0; k <= abs_q && k < kv_len; ++k) {
-                mfull[(size_t)q * kv_len + k] = 0.0f;
+                mfull[(size_t)q * mk_w + k] = 0.0f;
             }
         }
         ggml_backend_tensor_set(mk_full, mfull.data(), 0, ggml_nbytes(mk_full));
 
-        std::vector<float> mswa((size_t)kv_len * n_tok, -INFINITY);
+        std::vector<float> mswa((size_t)mk_w * n_tok, -INFINITY);
         const int W = w.sliding_window;
         for (int q = 0; q < n_tok; ++q) {
             const int abs_q = kv_start + q;
             const int win_lo = std::max(0, abs_q - W + 1);
             for (int k = win_lo; k <= abs_q && k < kv_len; ++k) {
-                mswa[(size_t)q * kv_len + k] = 0.0f;
+                mswa[(size_t)q * mk_w + k] = 0.0f;
             }
         }
         ggml_backend_tensor_set(mk_swa, mswa.data(), 0, ggml_nbytes(mk_swa));
@@ -1055,8 +1113,20 @@ bool laguna_step_hybrid(
     std::vector<float> &        out_logits,
     std::vector<int32_t> *      out_selected)
 {
+    // Persistent arena: rebuilt graphs land at IDENTICAL addresses every step.
+    // The ggml-cuda CUDA-graph cache is keyed on nodes[0] and memcmps node
+    // properties (incl. src data pointers); address stability across steps is
+    // what lets the captured CUDA graph replay instead of re-launching ~1.4k
+    // kernels per token.
+    const size_t arena_size = ggml_tensor_overhead() * 32768 + ggml_graph_overhead() + 32 * 1024 * 1024;
+    // thread_local: decode is single-threaded per process today (the static
+    // gallocr below makes the same assumption), but a second decode thread
+    // must not share the arena — each thread gets its own stable addresses.
+    static thread_local std::vector<uint8_t> g_arena;
+    if (g_arena.size() < arena_size) g_arena.resize(arena_size);
     ggml_init_params ip{};
-    ip.mem_size = ggml_tensor_overhead() * 32768 + ggml_graph_overhead() + 32 * 1024 * 1024;
+    ip.mem_size = arena_size;
+    ip.mem_buffer = g_arena.data();
     ip.no_alloc = true;
     ggml_context * ctx = ggml_init(ip);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 32768, false);
@@ -1066,14 +1136,36 @@ bool laguna_step_hybrid(
     ggml_tensor * pp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tok);
     ggml_set_input(pp);
 
+    // Stride-pad the KV span so the graph topology only changes when decode
+    // crosses a 256-token boundary (clamped to cache capacity). Within a
+    // window the masks gate validity and the K/V append uses ggml_set_rows,
+    // so every node's properties are bit-identical step to step.
+    const int kv_len = kv_start + n_tok;
+    static const bool g_no_kvpad = (std::getenv("DFLASH_LAGUNA_NO_KVPAD") != nullptr);
+    int kv_cap = 0;
+    for (int il = 0; il < w.n_layer; ++il) {
+        if (cache.attn_k[(size_t)il]) { kv_cap = (int)cache.attn_k[(size_t)il]->ne[1]; break; }
+    }
+    const int kv_pad = (!g_no_kvpad && kv_cap > 0)
+        ? std::min((kv_len + 255) & ~255, kv_cap) : 0;
+    const int mk_w = kv_pad > 0 ? kv_pad : kv_len;
+
+    // Decomposition knob: pad the FA span but keep the legacy cpy append
+    // (kv_idx=null). No CUDA-graph replay; isolates pad-rounding vs set_rows.
+    static const bool g_pad_cpy = (std::getenv("DFLASH_LAGUNA_PAD_CPY") != nullptr);
+    ggml_tensor * kvi = nullptr;
+    if (kv_pad > 0 && !g_pad_cpy) {
+        kvi = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tok);
+        ggml_set_input(kvi);
+    }
+
     ggml_tensor * mk_full = nullptr, * mk_full_cnv = nullptr;
     ggml_tensor * mk_swa  = nullptr, * mk_swa_cnv  = nullptr;
-    const int kv_len = kv_start + n_tok;
     if (!no_mask) {
-        mk_full = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len, n_tok, 1, 1);
+        mk_full = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, mk_w, n_tok, 1, 1);
         ggml_set_input(mk_full);
         mk_full_cnv = ggml_cast(ctx, mk_full, GGML_TYPE_F16);
-        mk_swa = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len, n_tok, 1, 1);
+        mk_swa = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, mk_w, n_tok, 1, 1);
         ggml_set_input(mk_swa);
         mk_swa_cnv = ggml_cast(ctx, mk_swa, GGML_TYPE_F16);
     }
@@ -1098,6 +1190,8 @@ bool laguna_step_hybrid(
     gi.attn_mask_swa    = mk_swa_cnv;
     gi.n_tokens         = n_tok;
     gi.kv_start         = kv_start;
+    gi.kv_pad           = kv_pad;
+    gi.kv_idx           = kvi;
     gi.output_last_only = true;
     gi.hybrid           = &hybm;
     LagunaGraphOutputs go = build_laguna_graph(ctx, gf, w, cache, gi);
@@ -1115,20 +1209,26 @@ bool laguna_step_hybrid(
     std::vector<int32_t> pos((size_t)n_tok);
     for (int i = 0; i < n_tok; ++i) pos[i] = kv_start + i;
     ggml_backend_tensor_set(pp, pos.data(), 0, ggml_nbytes(pp));
+    if (kvi) {
+        // set_rows row indices = absolute cache positions of this step's tokens
+        ggml_backend_tensor_set(kvi, pos.data(), 0, ggml_nbytes(kvi));
+    }
 
     if (!no_mask) {
-        std::vector<float> mfull((size_t)kv_len * n_tok, -INFINITY);
+        // Width mk_w (= kv_pad when padding): columns in [kv_len, mk_w) stay
+        // -inf so the zero-initialised padded cache tail contributes nothing.
+        std::vector<float> mfull((size_t)mk_w * n_tok, -INFINITY);
         for (int q = 0; q < n_tok; ++q) {
             const int abs_q = kv_start + q;
-            for (int k = 0; k <= abs_q && k < kv_len; ++k) mfull[(size_t)q * kv_len + k] = 0.0f;
+            for (int k = 0; k <= abs_q && k < kv_len; ++k) mfull[(size_t)q * mk_w + k] = 0.0f;
         }
         ggml_backend_tensor_set(mk_full, mfull.data(), 0, ggml_nbytes(mk_full));
-        std::vector<float> mswa((size_t)kv_len * n_tok, -INFINITY);
+        std::vector<float> mswa((size_t)mk_w * n_tok, -INFINITY);
         const int Wsw = w.sliding_window;
         for (int q = 0; q < n_tok; ++q) {
             const int abs_q = kv_start + q;
             const int lo = std::max(0, abs_q - Wsw + 1);
-            for (int k = lo; k <= abs_q && k < kv_len; ++k) mswa[(size_t)q * kv_len + k] = 0.0f;
+            for (int k = lo; k <= abs_q && k < kv_len; ++k) mswa[(size_t)q * mk_w + k] = 0.0f;
         }
         ggml_backend_tensor_set(mk_swa, mswa.data(), 0, ggml_nbytes(mk_swa));
     }

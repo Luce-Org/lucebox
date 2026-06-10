@@ -40,6 +40,10 @@ on:
   # from a PR — even if we wanted to, GITHUB_TOKEN on PRs from forks lacks
   # `packages:write`. The point is to catch Dockerfile / bake-file / arch-
   # list regressions before they land on main.
+  # Only when the DOCKER surface itself changes. Source-tree changes are
+  # already compiled and smoke-tested on the self-hosted GPU runners (sm_86 +
+  # gfx1151) by ci.yml — rebuilding the image for every server/src PR
+  # duplicated that coverage at ~20 GitHub-runner minutes per push.
   pull_request:
     paths:
       - Dockerfile
@@ -47,15 +51,6 @@ on:
       - docker-bake.hcl
       - .dockerignore
       - .github/workflows/docker.yml
-      - server/CMakeLists.txt
-      - server/src/**
-      - server/test/**
-      - server/include/**
-      - server/scripts/**
-      - server/deps/**
-      - server/pyproject.toml
-      - pyproject.toml
-      - uv.lock
   # Manual trigger for one-off rebuilds or pre-release smoke tests. The
   # `push` input controls whether the resulting images land in GHCR or only
   # populate the buildx cache.
@@ -66,11 +61,16 @@ on:
         type: boolean
         default: false
 
-# Single in-flight build per ref. New pushes cancel the previous run so we
-# don't queue 30-min compiles.
+# Single in-flight build per ref. PR pushes cancel the previous run so we
+# don't queue 30-min compiles on every force-push. Main publishes QUEUE
+# instead: with cancel-in-progress on main, any merge during the ~2 h
+# fat-binary build kills the in-flight publish, and on an active merge day
+# no publish ever completes (and the layer cache, written only on success,
+# never lands) — the rolling tags starve. A queued main run is superseded
+# by the next queued one, so at most one stale publish runs to completion.
 concurrency:
   group: docker-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   REGISTRY: ghcr.io
@@ -189,6 +189,12 @@ jobs:
           # dispatch builds keep the full consumer-GPU list so the published
           # image runs on every supported card.
           DFLASH_CUDA_ARCHES: ${{ github.event_name == 'pull_request' && '86' || '75;80;86;89;90;120' }}
+          # Same split for HIP: PR builds compile gfx1151 only (the verified
+          # reference, Strix Halo); main / release builds widen to consumer
+          # RDNA so the published :rocm runs on RX 7900 (gfx1100) and RDNA4
+          # (gfx1200) too. CDNA datacenter parts (gfx90a/gfx942) stay out
+          # until someone can test them.
+          DFLASH_HIP_ARCHES: ${{ github.event_name == 'pull_request' && 'gfx1151' || 'gfx1151;gfx1100;gfx1200' }}
         with:
           files: |
             docker-bake.hcl

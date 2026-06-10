@@ -416,7 +416,7 @@ bool forward_qwen3_drafter_model(
             // NoPE: capture pre-RoPE Q tail so the tail scorer is not biased by distance.
             if (nope_tail) {
                 const int tail_lo_nr = S - n_lookahead;
-                if (tail_lo_nr >= cs && tail_lo_nr < cs + cl) {
+                if (tail_lo_nr >= cs && tail_lo_nr + n_lookahead <= cs + cl) {
                     const int local_lo_nr = tail_lo_nr - cs;
                     ggml_tensor * Q_prenrope_tail = ggml_view_3d(
                         gA, Q, D, H, n_lookahead,
@@ -466,7 +466,7 @@ bool forward_qwen3_drafter_model(
 
             // Copy Q tail to Q_last_v[il] in the chunk that contains the tail.
             const int tail_lo = S - n_lookahead;
-            if (tail_lo >= cs && tail_lo < cs + cl) {
+            if (tail_lo >= cs && tail_lo + n_lookahead <= cs + cl) {
                 int local_lo = tail_lo - cs;
                 ggml_tensor * Q_tail_local = ggml_view_3d(
                     gA, Q, D, H, n_lookahead,

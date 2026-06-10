@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "moe_hybrid_ffn_eval.h"
 
 #include "ggml-alloc.h"
@@ -11,8 +12,6 @@
 
 namespace dflash::common {
 
-namespace {
-
 // NVFP4 scale2: if weight has a per-tensor scale, multiply the matmul result
 // by that scale. No-op when scale==1.0f (non-NVFP4 models).
 inline ggml_tensor * apply_scale2(ggml_context * ctx, ggml_tensor * mm_result, float scale) {
@@ -24,6 +23,28 @@ using HybridClock = std::chrono::steady_clock;
 
 static uint64_t elapsed_us(HybridClock::time_point start, HybridClock::time_point end) {
     return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+}
+
+// Build the shared-expert FFN subgraph onto an existing ggml_context.
+// Returns the output tensor (or nullptr if no shared expert is present).
+static ggml_tensor * build_shared_expert_subgraph(
+        ggml_context * ctx, const MoeLayerDesc & desc, ggml_tensor * inp) {
+    if (!desc.ffn_up_shexp || !desc.ffn_gate_shexp || !desc.ffn_down_shexp)
+        return nullptr;
+    ggml_tensor * sh_gate = apply_scale2(ctx,
+        ggml_mul_mat(ctx, desc.ffn_gate_shexp, inp), desc.ffn_gate_shexp_s);
+    ggml_tensor * sh_up = apply_scale2(ctx,
+        ggml_mul_mat(ctx, desc.ffn_up_shexp, inp), desc.ffn_up_shexp_s);
+    ggml_tensor * sh_gu = ggml_swiglu_split(ctx, sh_gate, sh_up);
+    ggml_tensor * shared = apply_scale2(ctx,
+        ggml_mul_mat(ctx, desc.ffn_down_shexp, sh_gu), desc.ffn_down_shexp_s);
+    if (desc.ffn_gate_inp_shexp) {
+        ggml_tensor * shared_gate = apply_scale2(ctx,
+            ggml_mul_mat(ctx, desc.ffn_gate_inp_shexp, inp), desc.ffn_gate_inp_shexp_s);
+        shared_gate = ggml_sigmoid(ctx, shared_gate);
+        shared = ggml_mul(ctx, shared, shared_gate);
+    }
+    return shared;
 }
 
 // Run routed expert subset on a given backend (GPU or CPU).
@@ -174,15 +195,10 @@ static bool run_shared_ffn_gpu(ggml_backend_t backend,
     ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
     ggml_set_input(inp);
 
-    ggml_tensor * sh_gate = apply_scale2(ctx, ggml_mul_mat(ctx, desc.ffn_gate_shexp, inp), desc.ffn_gate_shexp_s);
-    ggml_tensor * sh_up   = apply_scale2(ctx, ggml_mul_mat(ctx, desc.ffn_up_shexp,   inp), desc.ffn_up_shexp_s);
-    ggml_tensor * sh_gu   = ggml_swiglu_split(ctx, sh_gate, sh_up);
-    ggml_tensor * shared  = apply_scale2(ctx, ggml_mul_mat(ctx, desc.ffn_down_shexp, sh_gu), desc.ffn_down_shexp_s);
-    if (desc.ffn_gate_inp_shexp) {
-        ggml_tensor * shared_gate = apply_scale2(ctx,
-            ggml_mul_mat(ctx, desc.ffn_gate_inp_shexp, inp), desc.ffn_gate_inp_shexp_s);
-        shared_gate = ggml_sigmoid(ctx, shared_gate);
-        shared = ggml_mul(ctx, shared, shared_gate);
+    ggml_tensor * shared = build_shared_expert_subgraph(ctx, desc, inp);
+    if (!shared) {
+        ggml_free(ctx);
+        return true;
     }
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 512, false);
@@ -294,19 +310,7 @@ static bool run_hot_and_shared_ffn_gpu(
         }
     }
 
-    ggml_tensor * shared = nullptr;
-    if (has_shared) {
-        ggml_tensor * sh_gate = apply_scale2(ctx, ggml_mul_mat(ctx, desc.ffn_gate_shexp, inp), desc.ffn_gate_shexp_s);
-        ggml_tensor * sh_up   = apply_scale2(ctx, ggml_mul_mat(ctx, desc.ffn_up_shexp,   inp), desc.ffn_up_shexp_s);
-        ggml_tensor * sh_gu   = ggml_swiglu_split(ctx, sh_gate, sh_up);
-        shared = apply_scale2(ctx, ggml_mul_mat(ctx, desc.ffn_down_shexp, sh_gu), desc.ffn_down_shexp_s);
-        if (desc.ffn_gate_inp_shexp) {
-            ggml_tensor * shared_gate = apply_scale2(ctx,
-                ggml_mul_mat(ctx, desc.ffn_gate_inp_shexp, inp), desc.ffn_gate_inp_shexp_s);
-            shared_gate = ggml_sigmoid(ctx, shared_gate);
-            shared = ggml_mul(ctx, shared, shared_gate);
-        }
-    }
+    ggml_tensor * shared = build_shared_expert_subgraph(ctx, desc, inp);
 
     // Combine hot routed + shared into a single output tensor
     ggml_tensor * combined = nullptr;
@@ -404,8 +408,6 @@ static bool build_batched_routed_graph(
     return true;
 }
 
-} // namespace (anon)
-
 // ── Public API ──────────────────────────────────────────────────────────────────
 
 bool build_cached_hot_graph(
@@ -498,20 +500,7 @@ bool build_cached_hot_graph(
         }
     }
 
-    ggml_tensor * shared = nullptr;
-    const bool has_shared = (desc.ffn_up_shexp && desc.ffn_gate_shexp && desc.ffn_down_shexp);
-    if (has_shared) {
-        ggml_tensor * sh_gate = apply_scale2(out.ctx, ggml_mul_mat(out.ctx, desc.ffn_gate_shexp, out.inp), desc.ffn_gate_shexp_s);
-        ggml_tensor * sh_up   = apply_scale2(out.ctx, ggml_mul_mat(out.ctx, desc.ffn_up_shexp,   out.inp), desc.ffn_up_shexp_s);
-        ggml_tensor * sh_gu   = ggml_swiglu_split(out.ctx, sh_gate, sh_up);
-        shared = apply_scale2(out.ctx, ggml_mul_mat(out.ctx, desc.ffn_down_shexp, sh_gu), desc.ffn_down_shexp_s);
-        if (desc.ffn_gate_inp_shexp) {
-            ggml_tensor * shared_gate = apply_scale2(out.ctx,
-                ggml_mul_mat(out.ctx, desc.ffn_gate_inp_shexp, out.inp), desc.ffn_gate_inp_shexp_s);
-            shared_gate = ggml_sigmoid(out.ctx, shared_gate);
-            shared = ggml_mul(out.ctx, shared, shared_gate);
-        }
-    }
+    ggml_tensor * shared = build_shared_expert_subgraph(out.ctx, desc, out.inp);
 
     if (routed && shared) {
         out.output = ggml_add(out.ctx, routed, shared);
@@ -606,6 +595,62 @@ bool build_cached_cold_graph(
     ggml_set_output(out.output);
     ggml_build_forward_expand(out.gf, out.output);
     out.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
+    if (!ggml_gallocr_alloc_graph(out.alloc, out.gf)) {
+        out.free();
+        return false;
+    }
+    return true;
+}
+
+bool build_cached_hot_batched_graph(
+    CachedHotBatchedGraph & out,
+    ggml_backend_t gpu_backend,
+    MoeHybridLayerStorage & storage,
+    const MoeLayerDesc & desc,
+    const MoeHybridConfig & cfg,
+    int n_tokens) {
+
+    out.free();
+    out.n_tokens = n_tokens;
+
+    const int n_embd = cfg.n_embd;
+    const int n_used = cfg.n_expert_used;
+    const int n_ff_exp = cfg.n_ff_exp;
+
+    ggml_init_params ip{};
+    ip.mem_size = 128 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc = true;
+    out.ctx = ggml_init(ip);
+    if (!out.ctx) return false;
+
+    out.inp = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_input(out.inp);
+    out.sel = ggml_new_tensor_2d(out.ctx, GGML_TYPE_I32, n_used, n_tokens);
+    ggml_set_input(out.sel);
+    out.wts = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, n_used, n_tokens);
+    ggml_set_input(out.wts);
+
+    ggml_tensor * routed = nullptr;
+    build_batched_routed_graph(out.ctx,
+        storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
+        desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
+        out.inp, out.sel, out.wts, n_embd, n_ff_exp, n_used, n_tokens, &routed);
+
+    // Shared expert (always on GPU)
+    ggml_tensor * combined = routed;
+    ggml_tensor * shared = build_shared_expert_subgraph(out.ctx, desc, out.inp);
+    if (shared) {
+        combined = combined ? ggml_add(out.ctx, combined, shared) : shared;
+    }
+
+    if (!combined) { out.free(); return false; }
+    out.output = combined;
+
+    out.gf = ggml_new_graph_custom(out.ctx, 4096, false);
+    ggml_set_output(out.output);
+    ggml_build_forward_expand(out.gf, out.output);
+    out.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu_backend));
     if (!ggml_gallocr_alloc_graph(out.alloc, out.gf)) {
         out.free();
         return false;
@@ -841,21 +886,9 @@ bool eval_moe_batched_prefill_ffn(
 
     // Shared expert
     ggml_tensor * combined = routed;
-    if (desc.ffn_up_shexp && desc.ffn_gate_shexp && desc.ffn_down_shexp) {
-        ggml_tensor * sh_gate = apply_scale2(ctx,
-            ggml_mul_mat(ctx, desc.ffn_gate_shexp, inp), desc.ffn_gate_shexp_s);
-        ggml_tensor * sh_up = apply_scale2(ctx,
-            ggml_mul_mat(ctx, desc.ffn_up_shexp, inp), desc.ffn_up_shexp_s);
-        ggml_tensor * sh_gu = ggml_swiglu_split(ctx, sh_gate, sh_up);
-        ggml_tensor * shared = apply_scale2(ctx,
-            ggml_mul_mat(ctx, desc.ffn_down_shexp, sh_gu), desc.ffn_down_shexp_s);
-        if (desc.ffn_gate_inp_shexp) {
-            ggml_tensor * shared_gate = apply_scale2(ctx,
-                ggml_mul_mat(ctx, desc.ffn_gate_inp_shexp, inp), desc.ffn_gate_inp_shexp_s);
-            shared_gate = ggml_sigmoid(ctx, shared_gate);
-            shared = ggml_mul(ctx, shared, shared_gate);
-        }
-        combined = ggml_add(ctx, routed, shared);
+    ggml_tensor * shared = build_shared_expert_subgraph(ctx, desc, inp);
+    if (shared) {
+        combined = combined ? ggml_add(ctx, combined, shared) : shared;
     }
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 4096, false);
@@ -885,6 +918,21 @@ bool eval_moe_batched_prefill_ffn(
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
     return true;
+}
+
+// MMQ full-batch mul_mat_id on a reduced hot stack is only stable for large
+// batches. Small batches (spec verify/replay, <=~24 tokens) spread n_used*n_tokens
+// slots over thousands of hot experts; that extreme imbalance hits an unbounded
+// stream-k tile load in the MMQ kernel and faults (observed on sm_86, not just
+// sm_75). Prefill chunks (>=64 tokens) are dense enough and run clean, so keep
+// the sm_80+ fast path for them and route small batches through the proven
+// <=4-token MMVQ sub-batch path.
+static bool mmq_full_batch_ok(const MoeHybridConfig & cfg, int n_tokens) {
+    static const int min_tokens = [](){
+        const char * v = std::getenv("DFLASH_MMQ_FULL_BATCH_MIN");
+        return v ? std::atoi(v) : 64;
+    }();
+    return cfg.mmq_safe_full_batch && n_tokens >= min_tokens;
 }
 
 static bool eval_moe_hybrid_ffn_batched_core(
@@ -979,20 +1027,8 @@ static bool eval_moe_hybrid_ffn_batched_core(
 
         // Shared expert (always on GPU)
         ggml_tensor * combined = routed;
-        if (has_shared) {
-            ggml_tensor * sh_gate = apply_scale2(hot_ctx,
-                ggml_mul_mat(hot_ctx, desc.ffn_gate_shexp, inp), desc.ffn_gate_shexp_s);
-            ggml_tensor * sh_up = apply_scale2(hot_ctx,
-                ggml_mul_mat(hot_ctx, desc.ffn_up_shexp, inp), desc.ffn_up_shexp_s);
-            ggml_tensor * sh_gu = ggml_swiglu_split(hot_ctx, sh_gate, sh_up);
-            ggml_tensor * shared = apply_scale2(hot_ctx,
-                ggml_mul_mat(hot_ctx, desc.ffn_down_shexp, sh_gu), desc.ffn_down_shexp_s);
-            if (desc.ffn_gate_inp_shexp) {
-                ggml_tensor * shared_gate = apply_scale2(hot_ctx,
-                    ggml_mul_mat(hot_ctx, desc.ffn_gate_inp_shexp, inp), desc.ffn_gate_inp_shexp_s);
-                shared_gate = ggml_sigmoid(hot_ctx, shared_gate);
-                shared = ggml_mul(hot_ctx, shared, shared_gate);
-            }
+        ggml_tensor * shared = build_shared_expert_subgraph(hot_ctx, desc, inp);
+        if (shared) {
             combined = combined ? ggml_add(hot_ctx, combined, shared) : shared;
         }
         hot_output = combined;
@@ -1116,6 +1152,178 @@ static bool eval_moe_hybrid_ffn_batched_core(
     return true;
 }
 
+// ── Hot-Only Batched Prefill ──
+// When all selected experts are in VRAM, skip cold entirely: no CPU graph,
+// no partition into hot/cold, no merge loop. Pure GPU.
+
+bool eval_moe_hot_only_batched(
+    ggml_backend_t                  gpu_backend,
+    const MoeHybridConfig &         cfg,
+    const MoeLayerDesc &            desc,
+    MoeHybridLayerStorage &         storage,
+    const float *                   cur_host,
+    const int32_t *                 selected_ids,
+    const float *                   selected_weights,
+    int                             n_tokens,
+    std::vector<float> &            out,
+    std::string *                   err,
+    ggml_gallocr_t *                p_hot_alloc) {
+
+    const int n_embd = cfg.n_embd;
+    const int n_used = cfg.n_expert_used;
+    const int n_ff_exp = cfg.n_ff_exp;
+    out.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
+    if (n_tokens <= 0) return true;
+
+    // Workaround for ggml-cuda MMQ mul_mat_id bug on sm_75/gfx1151: when the
+    // hot stack is smaller than n_expert, slice into <=4-token sub-batches to
+    // route through the stable MMVQ path. Skipped on sm_80+ where MMQ is safe.
+    const int n_hot_stack = storage.gate_up_hot ? (int)storage.gate_up_hot->ne[2]
+                          : storage.gate_hot    ? (int)storage.gate_hot->ne[2]
+                          : 0;
+    static const int MMQ_SAFE_SUB_BATCH = 4;
+    if (!mmq_full_batch_ok(cfg, n_tokens)
+        && n_hot_stack > 0 && n_hot_stack < cfg.n_expert && n_tokens > MMQ_SAFE_SUB_BATCH) {
+        std::vector<float> sub_out;
+        for (int t0 = 0; t0 < n_tokens; t0 += MMQ_SAFE_SUB_BATCH) {
+            const int tc = std::min(MMQ_SAFE_SUB_BATCH, n_tokens - t0);
+            if (!eval_moe_hot_only_batched(
+                    gpu_backend, cfg, desc, storage,
+                    cur_host + (size_t)t0 * (size_t)n_embd,
+                    selected_ids + (size_t)t0 * (size_t)n_used,
+                    selected_weights + (size_t)t0 * (size_t)n_used,
+                    tc, sub_out, err, p_hot_alloc)) {
+                return false;
+            }
+            std::memcpy(out.data() + (size_t)t0 * (size_t)n_embd,
+                        sub_out.data(),
+                        sizeof(float) * (size_t)n_embd * (size_t)tc);
+        }
+        return true;
+    }
+
+    // Remap global expert IDs → hot-local IDs
+    const int total_slots = n_used * n_tokens;
+    std::vector<int32_t> hot_sel(total_slots);
+    for (int i = 0; i < total_slots; ++i) {
+        const int32_t gid = selected_ids[i];
+        if (gid < 0 || gid >= (int32_t)storage.hot_local_by_global.size()) {
+            hot_sel[i] = 0;
+        } else {
+            hot_sel[i] = storage.hot_local_by_global[(size_t)gid];
+        }
+    }
+
+    // ── Fast path: use cached graph (avoids rebuild + realloc) ──
+    auto & cached = storage.hot_batched_graph;
+    if (cached.n_tokens == n_tokens && cached.valid()) {
+        // Reuse pre-built graph: just upload data and compute
+        ggml_backend_tensor_set(cached.inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+        ggml_backend_tensor_set(cached.sel, hot_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
+        ggml_backend_tensor_set(cached.wts, selected_weights, 0, sizeof(float) * (size_t)total_slots);
+
+        auto st = ggml_backend_graph_compute(gpu_backend, cached.gf);
+        if (st != GGML_STATUS_SUCCESS) {
+            if (err) *err = "hot_only cached compute failed";
+            return false;
+        }
+        ggml_backend_tensor_get(cached.output, out.data(), 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+        return true;
+    }
+
+    // ── Slow path: build graph (first call or size mismatch) ──
+    // Try to build and cache for this n_tokens size.
+    // Cache when: sub-batch size (legacy), full stack (all hot), or full-batch safe (sm_80+).
+    if (mmq_full_batch_ok(cfg, n_tokens) || n_tokens == MMQ_SAFE_SUB_BATCH
+        || (n_hot_stack == 0 || n_hot_stack >= cfg.n_expert)) {
+        if (build_cached_hot_batched_graph(cached, gpu_backend, storage, desc, cfg, n_tokens)) {
+            // Successfully cached — use it immediately
+            ggml_backend_tensor_set(cached.inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+            ggml_backend_tensor_set(cached.sel, hot_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
+            ggml_backend_tensor_set(cached.wts, selected_weights, 0, sizeof(float) * (size_t)total_slots);
+
+            auto st = ggml_backend_graph_compute(gpu_backend, cached.gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                if (err) *err = "hot_only cached compute failed (first)";
+                return false;
+            }
+            ggml_backend_tensor_get(cached.output, out.data(), 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+            return true;
+        }
+        // Fall through to uncached path if build fails
+    }
+
+    // ── Uncached fallback (remainder sub-batches with n_tokens < MMQ_SAFE_SUB_BATCH) ──
+    ggml_init_params ip{};
+    ip.mem_size = 128 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) { if (err) *err = "hot_only ggml_init failed"; return false; }
+
+    ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_input(inp);
+    ggml_tensor * sel = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+    ggml_set_input(sel);
+    ggml_tensor * wts = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_used, n_tokens);
+    ggml_set_input(wts);
+
+    ggml_tensor * routed = nullptr;
+    build_batched_routed_graph(ctx,
+        storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
+        desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
+        inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens, &routed);
+
+    // Shared expert (always on GPU)
+    ggml_tensor * combined = routed;
+    ggml_tensor * shared = build_shared_expert_subgraph(ctx, desc, inp);
+    if (shared) {
+        combined = combined ? ggml_add(ctx, combined, shared) : shared;
+    }
+
+    if (!combined) {
+        ggml_free(ctx);
+        if (err) *err = "hot_only: no routed or shared output";
+        return false;
+    }
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 4096, false);
+    ggml_set_output(combined);
+    ggml_build_forward_expand(gf, combined);
+
+    ggml_gallocr_t alloc = nullptr;
+    if (p_hot_alloc) {
+        if (!*p_hot_alloc)
+            *p_hot_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu_backend));
+        alloc = *p_hot_alloc;
+    } else {
+        alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu_backend));
+    }
+    if (!ggml_gallocr_alloc_graph(alloc, gf)) {
+        if (err) *err = "hot_only gallocr failed";
+        if (!p_hot_alloc) ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_set(inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+    ggml_backend_tensor_set(sel, hot_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
+    ggml_backend_tensor_set(wts, selected_weights, 0, sizeof(float) * (size_t)total_slots);
+
+    auto st = ggml_backend_graph_compute(gpu_backend, gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        if (err) *err = "hot_only compute failed";
+        if (!p_hot_alloc) ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_get(combined, out.data(), 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+    if (!p_hot_alloc) ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    return true;
+}
+
 // ── GPU-Resident Residual State ──
 
 // Public entry. Workaround for a ggml-cuda/HIP defect: the MMQ mul_mat_id
@@ -1143,7 +1351,8 @@ bool eval_moe_hybrid_ffn_batched(
                           : storage.gate_hot    ? (int)storage.gate_hot->ne[2]
                           : 0;
     static const int MMQ_SAFE_SUB_BATCH = 4;
-    if (n_hot_stack > 0 && n_hot_stack < cfg.n_expert && n_tokens > MMQ_SAFE_SUB_BATCH) {
+    if (!mmq_full_batch_ok(cfg, n_tokens)
+        && n_hot_stack > 0 && n_hot_stack < cfg.n_expert && n_tokens > MMQ_SAFE_SUB_BATCH) {
         const int n_embd = cfg.n_embd;
         const int n_used = cfg.n_expert_used;
         out.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);

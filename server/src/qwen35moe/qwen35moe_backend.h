@@ -7,6 +7,7 @@
 #include "qwen35moe_pipelined_decode.h"
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_storage.h"
+#include "../common/moe_hybrid_stream.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_swap_manager.h"
 
@@ -47,6 +48,7 @@ private:
     bool rebuild_hybrid_from_placement(const MoeHybridPlacement & placement, std::string & err);
     MoeHybridSwapPolicy swap_policy_;
     bool hybrid_telemetry_ = false;
+    MoeHybridStreamEngine stream_engine_;
 
     void maybe_post_request_swap();
     bool load_dynamic_placement(const char * hotness_path,
@@ -65,7 +67,15 @@ private:
     // Returns the logits argmax token. Advances committed by 1.
     bool hybrid_forward_one_token(int32_t tok, int kv_pos,
                                   std::vector<float> & act_cur,
-                                  int32_t & argmax_out);
+                                  int32_t & argmax_out,
+                                  std::vector<float> * logits_out = nullptr);
+
+    // Batched hybrid forward: processes all tokens layer-by-layer (like prefill).
+    // Returns argmax for each token. Much faster than sequential hybrid_forward_one_token.
+    bool hybrid_forward_batch(const int32_t * tokens, int n_tokens, int base_pos,
+                              std::vector<float> & act_cur,
+                              std::vector<int32_t> & argmax_out,
+                              bool capture_features);
 
     // Pipelined decode: uses cached DeltaNet graphs + optimized FFN loop
     bool run_pipelined_decode_path(int committed, int n_gen,
