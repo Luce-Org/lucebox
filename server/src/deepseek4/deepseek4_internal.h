@@ -31,6 +31,33 @@ struct MoeHybridPlacement;
 struct MoeHybridConfig;
 class DeepSeek4ExpertIpcClient;
 
+struct DeepSeek4StepTelemetry {
+    uint64_t total_us = 0;
+    uint64_t embed_us = 0;
+    uint64_t hc_pre_attn_us = 0;
+    uint64_t attn_build_us = 0;
+    uint64_t attn_compute_us = 0;
+    uint64_t attn_read_us = 0;
+    uint64_t hc_post_attn_us = 0;
+    uint64_t hc_pre_ffn_us = 0;
+    uint64_t route_build_us = 0;
+    uint64_t route_compute_us = 0;
+    uint64_t route_read_us = 0;
+    uint64_t route_select_us = 0;
+    uint64_t ffn_eval_us = 0;
+    uint64_t ffn_hot_us = 0;
+    uint64_t ffn_cold_us = 0;
+    uint64_t ffn_combine_us = 0;
+    uint64_t ffn_partition_us = 0;
+    uint64_t worker_us = 0;
+    uint64_t hc_post_ffn_us = 0;
+    uint64_t output_us = 0;
+    uint64_t sample_us = 0;
+    uint64_t emit_us = 0;
+    int hot_selected = 0;
+    int cold_selected = 0;
+};
+
 // ─── Per-layer tensor pointers ──────────────────────────────────────────
 
 struct DeepSeek4Layer {
@@ -261,7 +288,8 @@ bool deepseek4_step(
     std::vector<float> &        out_logits,
     MoeHybridStorage *          moe_hybrid = nullptr,
     const int32_t *             token_ids = nullptr,
-    DeepSeek4ExpertIpcClient *  expert_worker = nullptr);
+    DeepSeek4ExpertIpcClient *  expert_worker = nullptr,
+    DeepSeek4StepTelemetry *    telemetry = nullptr);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,

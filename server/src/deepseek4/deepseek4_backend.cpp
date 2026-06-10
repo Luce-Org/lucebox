@@ -24,6 +24,10 @@ static double elapsed_s(Clock::time_point start) {
     return std::chrono::duration<double>(Clock::now() - start).count();
 }
 
+static uint64_t elapsed_us(Clock::time_point start, Clock::time_point end) {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+}
+
 static bool env_flag_enabled(const char * name) {
     const char * value = std::getenv(name);
     return value && value[0] && std::strcmp(value, "0") != 0;
@@ -42,6 +46,61 @@ static int env_int(const char * name, int fallback) {
 static const char * env_str(const char * name, const char * fallback) {
     const char * value = std::getenv(name);
     return (value && value[0]) ? value : fallback;
+}
+
+static void add_step_tel(DeepSeek4StepTelemetry & dst, const DeepSeek4StepTelemetry & src) {
+    dst.total_us += src.total_us;
+    dst.embed_us += src.embed_us;
+    dst.hc_pre_attn_us += src.hc_pre_attn_us;
+    dst.attn_build_us += src.attn_build_us;
+    dst.attn_compute_us += src.attn_compute_us;
+    dst.attn_read_us += src.attn_read_us;
+    dst.hc_post_attn_us += src.hc_post_attn_us;
+    dst.hc_pre_ffn_us += src.hc_pre_ffn_us;
+    dst.route_build_us += src.route_build_us;
+    dst.route_compute_us += src.route_compute_us;
+    dst.route_read_us += src.route_read_us;
+    dst.route_select_us += src.route_select_us;
+    dst.ffn_eval_us += src.ffn_eval_us;
+    dst.ffn_hot_us += src.ffn_hot_us;
+    dst.ffn_cold_us += src.ffn_cold_us;
+    dst.ffn_combine_us += src.ffn_combine_us;
+    dst.ffn_partition_us += src.ffn_partition_us;
+    dst.worker_us += src.worker_us;
+    dst.hc_post_ffn_us += src.hc_post_ffn_us;
+    dst.output_us += src.output_us;
+    dst.sample_us += src.sample_us;
+    dst.emit_us += src.emit_us;
+    dst.hot_selected += src.hot_selected;
+    dst.cold_selected += src.cold_selected;
+}
+
+static double ms(uint64_t us) {
+    return (double)us / 1000.0;
+}
+
+static void log_step_tel(const char * phase,
+                         int tokens,
+                         int steps,
+                         double wall_s,
+                         const DeepSeek4StepTelemetry & t) {
+    const double tok_s = wall_s > 0.0 ? (double)tokens / wall_s : 0.0;
+    std::fprintf(stderr,
+        "[deepseek4-timing] %s tokens=%d steps=%d wall=%.3fs %.2f tok/s "
+        "step=%.1fms embed=%.1fms attn_build=%.1fms attn_compute=%.1fms attn_read=%.1fms "
+        "route_build=%.1fms route_compute=%.1fms route_read=%.1fms route_select=%.1fms "
+        "ffn=%.1fms hot=%.1fms cold=%.1fms combine=%.1fms partition=%.1fms worker=%.1fms "
+        "hc_pre=%.1fms hc_post=%.1fms output=%.1fms sample=%.1fms emit=%.1fms "
+        "hot_sel=%d cold_sel=%d\n",
+        phase, tokens, steps, wall_s, tok_s,
+        ms(t.total_us), ms(t.embed_us), ms(t.attn_build_us), ms(t.attn_compute_us), ms(t.attn_read_us),
+        ms(t.route_build_us), ms(t.route_compute_us), ms(t.route_read_us), ms(t.route_select_us),
+        ms(t.ffn_eval_us), ms(t.ffn_hot_us), ms(t.ffn_cold_us), ms(t.ffn_combine_us),
+        ms(t.ffn_partition_us), ms(t.worker_us),
+        ms(t.hc_pre_attn_us + t.hc_pre_ffn_us),
+        ms(t.hc_post_attn_us + t.hc_post_ffn_us),
+        ms(t.output_us), ms(t.sample_us), ms(t.emit_us),
+        t.hot_selected, t.cold_selected);
 }
 
 static uint64_t layer_expert_bytes(const DeepSeek4Layer & layer, int n_expert) {
@@ -387,6 +446,10 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     const int n_total = (int)tokens.size();
     int pos = kv_offset;
     last_logits_.clear();
+    const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
+    const auto phase_t0 = Clock::now();
+    DeepSeek4StepTelemetry tel_acc;
+    int steps = 0;
 
     for (int i = 0; i < n_total; i += chunk) {
         if (io.cancelled) return pos;
@@ -395,17 +458,28 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
 
         // Embed tokens
         std::vector<float> embed(w_.n_embd * n_tok);
+        const auto embed_t0 = Clock::now();
         w_.embedder.embed(tokens.data() + i, n_tok, embed.data());
+        DeepSeek4StepTelemetry step_tel;
+        if (timing) step_tel.embed_us = elapsed_us(embed_t0, Clock::now());
 
         // Run forward pass
         std::vector<float> logits;
         if (!deepseek4_step(backend_, w_, cache_, embed.data(), n_tok, pos, logits,
-                            moe_hybrid_.get(), tokens.data() + i, expert_worker_.get())) {
+                            moe_hybrid_.get(), tokens.data() + i, expert_worker_.get(),
+                            timing ? &step_tel : nullptr)) {
             std::fprintf(stderr, "[deepseek4] prefill step failed at pos=%d\n", pos);
             return -1;
         }
+        if (timing) {
+            add_step_tel(tel_acc, step_tel);
+            steps++;
+        }
         last_logits_ = std::move(logits);
         pos += n_tok;
+    }
+    if (timing) {
+        log_step_tel("prefill", n_total, steps, elapsed_s(phase_t0), tel_acc);
     }
     return pos;
 }
@@ -416,6 +490,10 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
                                   const BudgetHook & budget_hook,
                                   bool * forced_close_out) {
     if (forced_close_out) *forced_close_out = false;
+    const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
+    const auto phase_t0 = Clock::now();
+    DeepSeek4StepTelemetry tel_acc;
+    int steps = 0;
 
     for (int generated = 0; generated < n_gen; generated++) {
         if (io.cancelled) break;
@@ -440,20 +518,29 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
         } else {
             std::vector<float> embed(w_.n_embd);
             int32_t tok_to_eval = out_tokens.empty() ? 0 : out_tokens.back();
+            const auto embed_t0 = Clock::now();
             w_.embedder.embed(&tok_to_eval, 1, embed.data());
+            DeepSeek4StepTelemetry step_tel;
+            if (timing) step_tel.embed_us = elapsed_us(embed_t0, Clock::now());
 
             const int pos = std::max(0, committed + generated - 1);
             if (!deepseek4_step(backend_, w_, cache_, embed.data(), 1,
                                 pos, logits,
-                                moe_hybrid_.get(), &tok_to_eval, expert_worker_.get())) {
+                                moe_hybrid_.get(), &tok_to_eval, expert_worker_.get(),
+                                timing ? &step_tel : nullptr)) {
                 std::fprintf(stderr, "[deepseek4] decode step failed\n");
                 return false;
+            }
+            if (timing) {
+                add_step_tel(tel_acc, step_tel);
+                steps++;
             }
         }
 
         // Sample (argmax for now)
         int32_t next_token = 0;
         {
+            const auto sample_t0 = Clock::now();
             float max_val = logits[0];
             for (int i = 1; i < w_.n_vocab; i++) {
                 if (logits[i] > max_val) {
@@ -461,15 +548,21 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
                     next_token = i;
                 }
             }
+            if (timing) tel_acc.sample_us += elapsed_us(sample_t0, Clock::now());
         }
         out_tokens.push_back(next_token);
+        const auto emit_t0 = Clock::now();
         io.emit(next_token);
+        if (timing) tel_acc.emit_us += elapsed_us(emit_t0, Clock::now());
 
         // Check EOS
         // TODO: proper EOS detection from tokenizer metadata
         if (next_token == 151643 || next_token == 151644) {  // common DS EOS/EOT
             break;
         }
+    }
+    if (timing) {
+        log_step_tel("decode", (int)out_tokens.size(), steps, elapsed_s(phase_t0), tel_acc);
     }
     return true;
 }

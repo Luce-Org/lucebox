@@ -19,12 +19,34 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
 namespace dflash::common {
+
+namespace {
+using Ds4TimingClock = std::chrono::steady_clock;
+
+static uint64_t ds4_elapsed_us(Ds4TimingClock::time_point start,
+                               Ds4TimingClock::time_point end) {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+}
+
+static void add_ffn_telemetry(DeepSeek4StepTelemetry * dst,
+                              const MoeHybridFfnTelemetry & src) {
+    if (!dst) return;
+    dst->ffn_hot_us += src.hot_us;
+    dst->ffn_cold_us += src.cold_us;
+    dst->ffn_combine_us += src.combine_us;
+    dst->ffn_partition_us += src.partition_us;
+    dst->hot_selected += src.hot_selected;
+    dst->cold_selected += src.cold_selected;
+}
+
+} // namespace
 
 struct DeepSeek4I32InputBinding {
     ggml_tensor * tensor = nullptr;
@@ -687,30 +709,44 @@ static bool eval_ds4_hybrid_or_worker(
         int n_tokens,
         std::vector<float> & ffn_out_host,
         ggml_gallocr_t * hot_alloc,
-        ggml_gallocr_t * cold_alloc) {
+        ggml_gallocr_t * cold_alloc,
+        DeepSeek4StepTelemetry * step_tel) {
+    const auto ffn_t0 = Ds4TimingClock::now();
     const bool use_worker = expert_worker && expert_worker->active() &&
         !storage.down_cold && !storage.gate_up_cold;
     if (!use_worker) {
+        MoeHybridFfnTelemetry ffn_tel;
         bool ffn_ok = eval_moe_hybrid_ffn_batched(
             backend, cpu_backend, hybrid_cfg, desc, storage,
             ffn_normed_host, selected_host, weights_host,
-            n_tokens, ffn_out_host, nullptr, hot_alloc, cold_alloc);
-        if (ffn_ok) return true;
+            n_tokens, ffn_out_host, nullptr, hot_alloc, cold_alloc,
+            step_tel ? &ffn_tel : nullptr);
+        if (ffn_ok) {
+            if (step_tel) {
+                step_tel->ffn_eval_us += ds4_elapsed_us(ffn_t0, Ds4TimingClock::now());
+                add_ffn_telemetry(step_tel, ffn_tel);
+            }
+            return true;
+        }
 
         ffn_out_host.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
         std::vector<float> single_out;
         for (int ti = 0; ti < n_tokens; ++ti) {
+            MoeHybridFfnTelemetry single_tel;
             if (!eval_moe_hybrid_ffn_single(
                     backend, hybrid_cfg, desc, storage, cpu_backend,
                     ffn_normed_host + (size_t)ti * (size_t)n_embd,
                     selected_host + (size_t)ti * (size_t)n_expert_used,
                     weights_host + (size_t)ti * (size_t)n_expert_used,
-                    n_expert_used, single_out)) {
+                    n_expert_used, single_out,
+                    step_tel ? &single_tel : nullptr)) {
                 return false;
             }
+            add_ffn_telemetry(step_tel, single_tel);
             std::memcpy(ffn_out_host.data() + (size_t)ti * (size_t)n_embd,
                         single_out.data(), sizeof(float) * (size_t)n_embd);
         }
+        if (step_tel) step_tel->ffn_eval_us += ds4_elapsed_us(ffn_t0, Ds4TimingClock::now());
         return true;
     }
 
@@ -741,26 +777,31 @@ static bool eval_ds4_hybrid_or_worker(
         }
 
         float * dst = ffn_out_host.data() + (size_t)ti * (size_t)n_embd;
+        MoeHybridFfnTelemetry local_tel;
         if (!eval_moe_hybrid_ffn_single(
                 backend, hybrid_cfg, desc, storage, cpu_backend,
                 ffn_normed_host + (size_t)ti * (size_t)n_embd,
                 local_ids.data(), local_weights.data(), (int)local_ids.size(),
-                single_out)) {
+                single_out, step_tel ? &local_tel : nullptr)) {
             return false;
         }
+        add_ffn_telemetry(step_tel, local_tel);
         std::memcpy(dst, single_out.data(), sizeof(float) * (size_t)n_embd);
         if (!remote_ids.empty()) {
+            const auto worker_t0 = Ds4TimingClock::now();
             if (!expert_worker->eval(layer, 1, n_embd, (int)remote_ids.size(),
                                      ffn_normed_host + (size_t)ti * (size_t)n_embd,
                                      remote_ids.data(), remote_weights.data(),
                                      worker_out)) {
                 return false;
             }
+            if (step_tel) step_tel->worker_us += ds4_elapsed_us(worker_t0, Ds4TimingClock::now());
             for (int i = 0; i < n_embd; ++i) {
                 dst[i] += worker_out[(size_t)i];
             }
         }
     }
+    if (step_tel) step_tel->ffn_eval_us += ds4_elapsed_us(ffn_t0, Ds4TimingClock::now());
     return true;
 }
 
@@ -1057,7 +1098,9 @@ static bool deepseek4_step_hybrid(
         int kv_start,
         std::vector<float> & out_logits,
         const int32_t * token_ids,
-        DeepSeek4ExpertIpcClient * expert_worker) {
+        DeepSeek4ExpertIpcClient * expert_worker,
+        DeepSeek4StepTelemetry * telemetry) {
+    const auto step_t0 = Ds4TimingClock::now();
     const int n_embd = w.n_embd;
     const int n_hc = w.n_hc;
     const int hc_dim = n_hc * n_embd;
@@ -1100,6 +1143,7 @@ static bool deepseek4_step_hybrid(
 
         // ── HC pre (attention) ──────────────────────────────────────
         // For decode (n_tokens=1): compute working vector from HC state
+        const auto hc_pre_attn_t0 = Ds4TimingClock::now();
         std::vector<float> cur((size_t)n_embd * (size_t)n_tokens);
         HcPreResult hc_attn_result;
         if (hc_lw.attn.loaded && n_tokens == 1) {
@@ -1111,8 +1155,10 @@ static bool deepseek4_step_hybrid(
             // Fallback: use first HC stream
             memcpy(cur.data(), hc_state.data(), (size_t)n_embd * (size_t)n_tokens * sizeof(float));
         }
+        if (telemetry) telemetry->hc_pre_attn_us += ds4_elapsed_us(hc_pre_attn_t0, Ds4TimingClock::now());
 
         // ── Build attention graph ───────────────────────────────────
+        const auto attn_build_t0 = Ds4TimingClock::now();
         const size_t ctx_size = 48 * 1024 * 1024;
         ggml_init_params params{};
         params.mem_size = ctx_size;
@@ -1145,6 +1191,7 @@ static bool deepseek4_step_hybrid(
             if (cold_alloc) ggml_gallocr_free(cold_alloc);
             return false;
         }
+        if (telemetry) telemetry->attn_build_us += ds4_elapsed_us(attn_build_t0, Ds4TimingClock::now());
         ggml_backend_tensor_set(inp, cur.data(), 0, sizeof(float) * cur.size());
         for (const DeepSeek4I32InputBinding & binding : i32_inputs) {
             ggml_backend_tensor_set(binding.tensor, &binding.value, 0, sizeof(binding.value));
@@ -1153,10 +1200,14 @@ static bool deepseek4_step_hybrid(
             ggml_backend_tensor_set(binding.tensor, binding.values.data(), 0,
                                     sizeof(int32_t) * binding.values.size());
         }
+        const auto attn_compute_t0 = Ds4TimingClock::now();
         bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+        if (telemetry) telemetry->attn_compute_us += ds4_elapsed_us(attn_compute_t0, Ds4TimingClock::now());
         std::vector<float> attn_out_host((size_t)n_embd * (size_t)n_tokens);
         if (ok) {
+            const auto attn_read_t0 = Ds4TimingClock::now();
             ggml_backend_tensor_get(attn_out, attn_out_host.data(), 0, sizeof(float) * attn_out_host.size());
+            if (telemetry) telemetry->attn_read_us += ds4_elapsed_us(attn_read_t0, Ds4TimingClock::now());
         }
         ggml_gallocr_free(attn_alloc);
         ggml_free(ctx);
@@ -1167,6 +1218,7 @@ static bool deepseek4_step_hybrid(
         }
 
         // ── HC post (attention) ─────────────────────────────────────
+        const auto hc_post_attn_t0 = Ds4TimingClock::now();
         if (hc_lw.attn.loaded && n_tokens == 1) {
             std::vector<float> new_hc((size_t)hc_dim);
             cpu_hc_post(new_hc.data(), attn_out_host.data(), hc_state.data(),
@@ -1177,8 +1229,10 @@ static bool deepseek4_step_hybrid(
                 hc_state[(size_t)i] += attn_out_host[(size_t)i];
             }
         }
+        if (telemetry) telemetry->hc_post_attn_us += ds4_elapsed_us(hc_post_attn_t0, Ds4TimingClock::now());
 
         // ── HC pre (FFN) ────────────────────────────────────────────
+        const auto hc_pre_ffn_t0 = Ds4TimingClock::now();
         std::vector<float> ffn_working((size_t)n_embd * (size_t)n_tokens);
         HcPreResult hc_ffn_result;
         if (hc_lw.ffn.loaded && n_tokens == 1) {
@@ -1189,6 +1243,7 @@ static bool deepseek4_step_hybrid(
         } else {
             memcpy(ffn_working.data(), hc_state.data(), (size_t)n_embd * (size_t)n_tokens * sizeof(float));
         }
+        if (telemetry) telemetry->hc_pre_ffn_us += ds4_elapsed_us(hc_pre_ffn_t0, Ds4TimingClock::now());
 
         // ── FFN ─────────────────────────────────────────────────────
         std::vector<float> ffn_out_host((size_t)n_embd * (size_t)n_tokens, 0.0f);
@@ -1203,6 +1258,7 @@ static bool deepseek4_step_hybrid(
                 return false;
             }
             ggml_init_params ffn_params{};
+            const auto route_build_t0 = Ds4TimingClock::now();
             ffn_params.mem_size = 16 * 1024 * 1024;
             ffn_params.mem_buffer = nullptr;
             ffn_params.no_alloc = true;
@@ -1227,13 +1283,18 @@ static bool deepseek4_step_hybrid(
                 if (cold_alloc) ggml_gallocr_free(cold_alloc);
                 return false;
             }
+            if (telemetry) telemetry->route_build_us += ds4_elapsed_us(route_build_t0, Ds4TimingClock::now());
             ggml_backend_tensor_set(ffn_inp, ffn_working.data(), 0, sizeof(float) * ffn_working.size());
+            const auto route_compute_t0 = Ds4TimingClock::now();
             ok = ggml_backend_graph_compute(backend, ffn_gf) == GGML_STATUS_SUCCESS;
+            if (telemetry) telemetry->route_compute_us += ds4_elapsed_us(route_compute_t0, Ds4TimingClock::now());
             std::vector<float> ffn_normed_host((size_t)n_embd * (size_t)n_tokens);
             std::vector<float> probs_host((size_t)w.n_expert * (size_t)n_tokens);
             if (ok) {
+                const auto route_read_t0 = Ds4TimingClock::now();
                 ggml_backend_tensor_get(ffn_normed, ffn_normed_host.data(), 0, sizeof(float) * ffn_normed_host.size());
                 ggml_backend_tensor_get(router_probs, probs_host.data(), 0, sizeof(float) * probs_host.size());
+                if (telemetry) telemetry->route_read_us += ds4_elapsed_us(route_read_t0, Ds4TimingClock::now());
             }
             ggml_gallocr_free(ffn_alloc);
             ggml_free(ffn_ctx);
@@ -1245,6 +1306,7 @@ static bool deepseek4_step_hybrid(
 
             std::vector<int32_t> selected_host((size_t)w.n_expert_used * (size_t)n_tokens);
             std::vector<float> weights_host((size_t)w.n_expert_used * (size_t)n_tokens);
+            const auto route_select_t0 = Ds4TimingClock::now();
             const auto & hash_table = hash_routing_tables[(size_t)il].ids;
             for (int ti = 0; ti < n_tokens; ++ti) {
                 const int32_t tok = token_ids[ti];
@@ -1272,6 +1334,7 @@ static bool deepseek4_step_hybrid(
                     weight = weight / sum * w.expert_weight_scale;
                 }
             }
+            if (telemetry) telemetry->route_select_us += ds4_elapsed_us(route_select_t0, Ds4TimingClock::now());
 
             MoeHybridConfig hybrid_cfg = make_ds4_moe_hybrid_config(w);
             MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
@@ -1280,13 +1343,14 @@ static bool deepseek4_step_hybrid(
                     backend, cpu_backend, hybrid_cfg, desc, storage, expert_worker,
                     il, n_embd, w.n_expert_used,
                     ffn_normed_host.data(), selected_host.data(), weights_host.data(),
-                    n_tokens, ffn_out_host, &hot_alloc, &cold_alloc)) {
+                    n_tokens, ffn_out_host, &hot_alloc, &cold_alloc, telemetry)) {
                 if (hot_alloc) ggml_gallocr_free(hot_alloc);
                 if (cold_alloc) ggml_gallocr_free(cold_alloc);
                 return false;
             }
         } else {
             // MoE layers: compute routing on GPU, experts via hybrid
+            const auto route_build_t0 = Ds4TimingClock::now();
             ggml_init_params ffn_params{};
             ffn_params.mem_size = 16 * 1024 * 1024;
             ffn_params.mem_buffer = nullptr;
@@ -1312,8 +1376,11 @@ static bool deepseek4_step_hybrid(
                 if (cold_alloc) ggml_gallocr_free(cold_alloc);
                 return false;
             }
+            if (telemetry) telemetry->route_build_us += ds4_elapsed_us(route_build_t0, Ds4TimingClock::now());
             ggml_backend_tensor_set(ffn_inp, ffn_working.data(), 0, sizeof(float) * ffn_working.size());
+            const auto route_compute_t0 = Ds4TimingClock::now();
             ok = ggml_backend_graph_compute(backend, ffn_gf) == GGML_STATUS_SUCCESS;
+            if (telemetry) telemetry->route_compute_us += ds4_elapsed_us(route_compute_t0, Ds4TimingClock::now());
             if (!ok) {
                 ggml_gallocr_free(ffn_alloc); ggml_free(ffn_ctx);
                 if (hot_alloc) ggml_gallocr_free(hot_alloc);
@@ -1325,12 +1392,15 @@ static bool deepseek4_step_hybrid(
             std::vector<float> probs_host((size_t)w.n_expert * (size_t)n_tokens);
             std::vector<int32_t> selected_host((size_t)w.n_expert_used * (size_t)n_tokens);
             std::vector<float> weights_host((size_t)w.n_expert_used * (size_t)n_tokens);
+            const auto route_read_t0 = Ds4TimingClock::now();
             ggml_backend_tensor_get(ffn_normed, ffn_normed_host.data(), 0, sizeof(float) * ffn_normed_host.size());
             ggml_backend_tensor_get(router_probs, probs_host.data(), 0, sizeof(float) * probs_host.size());
+            if (telemetry) telemetry->route_read_us += ds4_elapsed_us(route_read_t0, Ds4TimingClock::now());
             ggml_gallocr_free(ffn_alloc);
             ggml_free(ffn_ctx);
 
             std::vector<float> bias_host;
+            const auto route_select_t0 = Ds4TimingClock::now();
             if (L.ffn_exp_probs_b) {
                 bias_host.resize((size_t)w.n_expert);
                 ggml_backend_tensor_get(L.ffn_exp_probs_b, bias_host.data(), 0,
@@ -1371,6 +1441,7 @@ static bool deepseek4_step_hybrid(
                     weight = weight / sum * w.expert_weight_scale;
                 }
             }
+            if (telemetry) telemetry->route_select_us += ds4_elapsed_us(route_select_t0, Ds4TimingClock::now());
 
             MoeHybridConfig hybrid_cfg = make_ds4_moe_hybrid_config(w);
             MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
@@ -1379,7 +1450,7 @@ static bool deepseek4_step_hybrid(
                     backend, cpu_backend, hybrid_cfg, desc, storage, expert_worker,
                     il, n_embd, w.n_expert_used,
                     ffn_normed_host.data(), selected_host.data(), weights_host.data(),
-                    n_tokens, ffn_out_host, &hot_alloc, &cold_alloc)) {
+                    n_tokens, ffn_out_host, &hot_alloc, &cold_alloc, telemetry)) {
                 if (hot_alloc) ggml_gallocr_free(hot_alloc);
                 if (cold_alloc) ggml_gallocr_free(cold_alloc);
                 return false;
@@ -1387,6 +1458,7 @@ static bool deepseek4_step_hybrid(
         }
 
         // ── HC post (FFN) ───────────────────────────────────────────
+        const auto hc_post_ffn_t0 = Ds4TimingClock::now();
         if (hc_lw.ffn.loaded && n_tokens == 1) {
             std::vector<float> new_hc((size_t)hc_dim);
             cpu_hc_post(new_hc.data(), ffn_out_host.data(), hc_state.data(),
@@ -1397,12 +1469,14 @@ static bool deepseek4_step_hybrid(
                 hc_state[(size_t)i] += ffn_out_host[(size_t)i];
             }
         }
+        if (telemetry) telemetry->hc_post_ffn_us += ds4_elapsed_us(hc_post_ffn_t0, Ds4TimingClock::now());
     }
 
     if (hot_alloc) ggml_gallocr_free(hot_alloc);
     if (cold_alloc) ggml_gallocr_free(cold_alloc);
 
     // ── Output HC pre → norm → logits ───────────────────────────────────
+    const auto output_t0 = Ds4TimingClock::now();
     std::vector<float> final_embd((size_t)n_embd * (size_t)n_tokens);
     if (hc_output_weights.loaded && n_tokens == 1) {
         std::vector<float> flat((size_t)hc_dim);
@@ -1456,6 +1530,10 @@ static bool deepseek4_step_hybrid(
     ggml_gallocr_free(final_alloc);
     ggml_free(ctx2);
     if (!final_ok) return false;
+    if (telemetry) {
+        telemetry->output_us += ds4_elapsed_us(output_t0, Ds4TimingClock::now());
+        telemetry->total_us += ds4_elapsed_us(step_t0, Ds4TimingClock::now());
+    }
 
     cache.cur_pos = kv_start + n_tokens;
     return true;
@@ -1473,12 +1551,13 @@ bool deepseek4_step(
         std::vector<float> & out_logits,
         MoeHybridStorage * moe_hybrid,
         const int32_t * token_ids,
-        DeepSeek4ExpertIpcClient * expert_worker) {
+        DeepSeek4ExpertIpcClient * expert_worker,
+        DeepSeek4StepTelemetry * telemetry) {
 
     if (w.moe_hybrid && moe_hybrid != nullptr) {
         return deepseek4_step_hybrid(backend, w, cache, *moe_hybrid,
                                      embed, n_tokens, kv_start, out_logits,
-                                     token_ids, expert_worker);
+                                     token_ids, expert_worker, telemetry);
     }
 
     const int n_embd = w.n_embd;
