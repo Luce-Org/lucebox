@@ -20,15 +20,18 @@
 #include "sse_emitter.h"
 #include "prompt_normalize.h"
 #include "tool_hint.h"
+#include "common/sha1.h"
 
 #ifdef DFLASH_HAS_CURL
 #include <curl/curl.h>
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -786,6 +789,48 @@ std::vector<ChatMessage> normalize_chat_messages(
     return chat_msgs;
 }
 
+// ─── Disk-cache identity salt ───────────────────────────────────────────
+// Compute a 16-byte salt from inputs that affect KV cache validity:
+//   model path + stat(size + mtime)  [covers rope/yarn — GGUF-derived],
+//   max_ctx, and sha1(chat_template_src).
+// Returns all-zeroes if model_path is empty (back-compat / disk disabled).
+static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg) {
+    std::array<uint8_t, 16> salt{};
+    if (cfg.model_path.empty()) return salt;
+
+    const std::string & path = cfg.model_path;
+    struct stat st{};
+    int64_t file_size  = 0;
+    int64_t file_mtime = 0;
+    if (::stat(path.c_str(), &st) == 0) {
+        file_size  = (int64_t)st.st_size;
+        file_mtime = (int64_t)st.st_mtime;
+    } else {
+        std::fprintf(stderr, "[disk-cache] salt: stat(%s) failed — path-only fingerprint\n",
+                     path.c_str());
+    }
+
+    // Hash chat_template_src separately (can be large; fold as digest).
+    uint8_t tmpl_digest[20] = {};
+    sha1_hash(cfg.chat_template_src.data(), cfg.chat_template_src.size(), tmpl_digest);
+
+    // Serialization: path_len(4) + path + file_size(8) + file_mtime(8) + max_ctx(4) + tmpl_digest(20).
+    std::vector<uint8_t> buf;
+    uint32_t plen = (uint32_t)path.size();
+    buf.insert(buf.end(), (uint8_t *)&plen,        (uint8_t *)&plen        + 4);
+    buf.insert(buf.end(), (uint8_t *)path.data(),  (uint8_t *)path.data()  + path.size());
+    buf.insert(buf.end(), (uint8_t *)&file_size,   (uint8_t *)&file_size   + 8);
+    buf.insert(buf.end(), (uint8_t *)&file_mtime,  (uint8_t *)&file_mtime  + 8);
+    int32_t mc = (int32_t)cfg.max_ctx;
+    buf.insert(buf.end(), (uint8_t *)&mc,          (uint8_t *)&mc          + 4);
+    buf.insert(buf.end(), tmpl_digest, tmpl_digest + 20);
+
+    uint8_t digest[20];
+    sha1_hash(buf.data(), buf.size(), digest);
+    std::memcpy(salt.data(), digest, 16);
+    return salt;
+}
+
 // ─── HttpServer ─────────────────────────────────────────────────────────
 
 HttpServer::HttpServer(ModelBackend & backend,
@@ -805,6 +850,13 @@ HttpServer::HttpServer(ModelBackend & backend,
     #ifdef DFLASH_HAS_CURL
     curl_global_init(CURL_GLOBAL_DEFAULT);
     #endif
+    // Fold model+config identity into the layout fingerprint BEFORE init()
+    // so compute_layout_id sees it on every learn/verify call. Prevents stale
+    // KV hits when the server restarts over the same --kv-cache-dir with a
+    // different model, max_ctx, or chat_template (gemma4 ↔ qwen3.6, etc.).
+    if (!disk_cache_.disabled()) {
+        disk_cache_.set_identity_salt(compute_disk_cache_salt(config));
+    }
     disk_cache_.init();
     status_html_path_ = resolve_status_html();
 }

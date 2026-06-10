@@ -16,6 +16,7 @@
 #include "prefix_cache.h"
 #include "common/model_backend.h"
 
+#include <array>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -121,12 +122,23 @@ public:
     // first snapshot_save, before any disk operations).
     void learn_layout(int slot);
 
+    // Set a config/model identity salt prepended to the layout hash buffer
+    // so that layout_id encodes model identity in addition to tensor structure.
+    // Call this BEFORE init(). All-zeroes (the default) → back-compat behavior.
+    void set_identity_salt(const std::array<uint8_t, 16> & salt) {
+        identity_salt_ = salt;
+    }
+
 private:
     DiskCacheConfig config_;
     ModelBackend &  backend_;
 
     // Continued checkpoint tracking (per-session).
     int continued_last_store_pos_ = 0;
+
+    // Config/model identity salt (set via set_identity_salt before init()).
+    // All-zeroes by default → backward-compatible behavior.
+    std::array<uint8_t, 16> identity_salt_{};
 
     // Layout fingerprint (learned from first snapshot).
     std::array<uint8_t, 16> layout_id_{};
