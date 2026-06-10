@@ -12,11 +12,12 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
-#include <dirent.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include <filesystem>
+#include <system_error>
 
 namespace dflash::common {
+
+namespace fs = std::filesystem;
 
 // ─── Inline SHA-1 (same as prefix_cache.cpp) ────────────────────────────
 
@@ -88,14 +89,10 @@ static std::string hex(const uint8_t * data, int len) {
 }
 
 static bool mkdir_p(const std::string & path) {
-    struct stat st{};
-    if (stat(path.c_str(), &st) == 0) return S_ISDIR(st.st_mode);
-    // Try to create parent first.
-    size_t slash = path.rfind('/');
-    if (slash != std::string::npos && slash > 0) {
-        mkdir_p(path.substr(0, slash));
-    }
-    return mkdir(path.c_str(), 0755) == 0 || errno == EEXIST;
+    std::error_code ec;
+    if (fs::is_directory(path, ec)) return true;
+    fs::create_directories(path, ec);
+    return fs::is_directory(path, ec);
 }
 
 static uint64_t now_unix() {
@@ -213,16 +210,13 @@ void DiskPrefixCache::scan_directory() {
 
     if (layout_dir_.empty()) return;
 
-    DIR * dir = opendir(layout_dir_.c_str());
-    if (!dir) return;
+    std::error_code ec;
+    for (const auto & de : fs::directory_iterator(layout_dir_, ec)) {
+        const std::string name = de.path().filename().string();
+        size_t nlen = name.size();
+        if (nlen < 36 || name.compare(nlen - 4, 4, ".dkv") != 0) continue;
 
-    struct dirent * ent;
-    while ((ent = readdir(dir)) != nullptr) {
-        const char * name = ent->d_name;
-        size_t nlen = std::strlen(name);
-        if (nlen < 36 || std::strcmp(name + nlen - 4, ".dkv") != 0) continue;
-
-        std::string path = layout_dir_ + "/" + name;
+        std::string path = de.path().string();
         FILE * f = std::fopen(path.c_str(), "rb");
         if (!f) continue;
 
@@ -241,15 +235,13 @@ void DiskPrefixCache::scan_directory() {
         entry.cur_pos     = hdr.cur_pos;
         entry.last_used   = hdr.last_used;
 
-        struct stat st{};
-        if (stat(path.c_str(), &st) == 0) {
-            entry.file_size = (uint64_t)st.st_size;
-        }
+        std::error_code fec;
+        auto fsz = fs::file_size(path, fec);
+        if (!fec) entry.file_size = (uint64_t)fsz;
 
         total_bytes_ += entry.file_size;
         entries_.push_back(std::move(entry));
     }
-    closedir(dir);
 
     std::fprintf(stderr, "[disk-cache] scanned %zu files, %.1f MB\n",
                  entries_.size(), (double)total_bytes_ / (1024.0 * 1024.0));
@@ -259,27 +251,23 @@ void DiskPrefixCache::scan_directory() {
 
 void DiskPrefixCache::try_learn_from_disk() {
     // Scan cache_dir for subdirectories (each is a layout fingerprint).
-    DIR * dir = opendir(config_.cache_dir.c_str());
-    if (!dir) return;
-
-    struct dirent * ent;
-    while ((ent = readdir(dir)) != nullptr) {
-        if (ent->d_name[0] == '.') continue;
-        std::string subdir = config_.cache_dir + "/" + ent->d_name;
-        struct stat st{};
-        if (stat(subdir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+    std::error_code ec;
+    for (const auto & de : fs::directory_iterator(config_.cache_dir, ec)) {
+        const std::string base = de.path().filename().string();
+        if (!base.empty() && base[0] == '.') continue;
+        std::error_code dec;
+        if (!de.is_directory(dec)) continue;
+        const std::string subdir = de.path().string();
 
         // Check if this subdir has any .dkv files.
-        DIR * sub = opendir(subdir.c_str());
-        if (!sub) continue;
-
-        struct dirent * sent;
-        while ((sent = readdir(sub)) != nullptr) {
-            size_t nlen = std::strlen(sent->d_name);
-            if (nlen < 4 || std::strcmp(sent->d_name + nlen - 4, ".dkv") != 0) continue;
+        std::error_code sec;
+        for (const auto & se : fs::directory_iterator(subdir, sec)) {
+            const std::string sname = se.path().filename().string();
+            size_t nlen = sname.size();
+            if (nlen < 4 || sname.compare(nlen - 4, 4, ".dkv") != 0) continue;
 
             // Read the header to get the layout_id.
-            std::string fpath = subdir + "/" + sent->d_name;
+            std::string fpath = se.path().string();
             FILE * f = std::fopen(fpath.c_str(), "rb");
             if (!f) continue;
 
@@ -290,16 +278,12 @@ void DiskPrefixCache::try_learn_from_disk() {
                 layout_from_disk_ = true;  // unverified — must be confirmed by learn_layout()
                 layout_dir_ = subdir;
                 std::fclose(f);
-                closedir(sub);
-                closedir(dir);
                 scan_directory();
                 return;
             }
             std::fclose(f);
         }
-        closedir(sub);
     }
-    closedir(dir);
 }
 
 // ─── Lookup ─────────────────────────────────────────────────────────────
@@ -423,8 +407,9 @@ bool DiskPrefixCache::save(int slot, const std::vector<int32_t> & prompt_ids) {
     entry.cur_pos     = (uint32_t)ref.cur_pos;
     entry.last_used   = now_unix();
     entry.created_at  = entry.last_used;
-    struct stat st{};
-    if (stat(path.c_str(), &st) == 0) entry.file_size = (uint64_t)st.st_size;
+    std::error_code fec;
+    auto fsz = fs::file_size(path, fec);
+    if (!fec) entry.file_size = (uint64_t)fsz;
 
     total_bytes_ += entry.file_size;
     entries_.push_back(std::move(entry));

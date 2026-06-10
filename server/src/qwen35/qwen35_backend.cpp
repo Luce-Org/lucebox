@@ -21,10 +21,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace dflash::common {
 
@@ -82,6 +85,10 @@ static int dflash_min_tokens_floor() {
 }
 
 static FILE * open_dflash_floor_log() {
+#if defined(_WIN32)
+    // Simple append-mode log on Windows (no file size check).
+    return std::fopen("dflash_floor.log", "a");
+#else
     static constexpr const char * kPath = "/tmp/dflash_floor.log";
     static constexpr off_t kMaxBytes = 1024 * 1024;
 
@@ -115,6 +122,7 @@ static FILE * open_dflash_floor_log() {
     FILE * out = fdopen(fd, "a");
     if (!out) ::close(fd);
     return out;
+#endif
 }
 }  // namespace
 
