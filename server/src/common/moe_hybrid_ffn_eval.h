@@ -196,6 +196,7 @@ bool build_cached_hot_graph(
     int n_embd,
     int n_ff_exp,
     int n_hot,
+    float swiglu_clamp = 0.0f,
     bool gpu_remap = false,
     int n_expert = 0);
 
@@ -213,7 +214,8 @@ bool build_cached_cold_graph(
     float gate_up_scale,
     int n_embd,
     int n_ff_exp,
-    int n_cold);
+    int n_cold,
+    float swiglu_clamp = 0.0f);
 
 // Build cached hot-only batched graph for prefill (n_tokens=MMQ_SAFE_SUB_BATCH).
 bool build_cached_hot_batched_graph(

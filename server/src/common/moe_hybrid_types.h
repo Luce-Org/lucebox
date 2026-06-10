@@ -28,6 +28,7 @@ struct MoeHybridConfig {
     int n_ff_shexp    = 0;   // shared expert intermediate dimension (0 = no shared)
     int n_layer       = 0;   // number of MoE layers
     int first_moe_layer = 0; // index of first MoE layer (e.g., 0 for qwen35moe, 1 for laguna)
+    float swiglu_clamp = 0.0f; // 0 = regular SwiGLU; >0 clamps gate upper/up symmetric (DS4)
 
     // When true, MMQ mul_mat_id works correctly with reduced hot stacks
     // (n_hot < n_expert). Safe on sm_80+ (Ampere/Ada/Hopper/Blackwell).
@@ -71,4 +72,3 @@ struct MoeLayerDesc {
 };
 
 }  // namespace dflash::common
-

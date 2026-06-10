@@ -37,6 +37,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bench_llm import _extract_boxed, _normalize_math, _math_equiv
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BENCH_PROMPT_DIR = REPO_ROOT / "harness" / "benchmarks" / "prompts"
+
 N_SAMPLE = 10
 N_GEN_DEFAULT = 256
 N_GEN_MATH = 2048
@@ -144,45 +147,133 @@ def workload_he(url: str, n_sample: int, n_gen: int, **_kw):
 
 # ── Workload: GSM8K ──────────────────────────────────────────────────────
 
+def _load_jsonl_cases(path: Path, n_sample: int):
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    rows = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows[:min(n_sample, len(rows))]
+
+
 def _load_gsm8k(n_sample: int):
-    from datasets import load_dataset
-    ds = load_dataset("gsm8k", "main", split="test")
-    n_sample = min(n_sample, len(ds))
-    ds = ds.shuffle(seed=42).select(range(n_sample))
-    return [
-        {"name": f"gsm8k_{i:02d}",
-         "prompt": f"Question: {row['question']}\nAnswer: "}
-        for i, row in enumerate(ds)
-    ]
+    try:
+        from datasets import load_dataset
+        ds = load_dataset("gsm8k", "main", split="test")
+        n_sample = min(n_sample, len(ds))
+        ds = ds.shuffle(seed=42).select(range(n_sample))
+        return [
+            {"name": f"gsm8k_{i:02d}",
+             "prompt": f"Question: {row['question']}\nAnswer: ",
+             "answer": row["answer"].rsplit("####", 1)[-1].strip().replace(",", "")}
+            for i, row in enumerate(ds)
+        ]
+    except ImportError:
+        rows = _load_jsonl_cases(BENCH_PROMPT_DIR / "bench_gsm.jsonl", n_sample)
+        return [
+            {"name": row["id"],
+             "messages": row["messages"],
+             "answer": row.get("gold_answer", "")}
+            for row in rows
+        ]
+
+
+def _score_gsm_text(text: str, gold_answer: str) -> tuple[bool, str]:
+    """Score a GSM8K response against a numeric gold answer."""
+    think_end = text.rfind("</think>")
+    answer_text = text[think_end + len("</think>"):] if think_end >= 0 else text
+
+    pred = None
+    boxed = _extract_boxed(answer_text)
+    if boxed:
+        cleaned = boxed.replace(",", "").replace("$", "").strip()
+        if re.match(r"^[+-]?\d+\.?\d*$", cleaned):
+            pred = cleaned
+    if pred is None:
+        m = re.search(r"####\s*\$?([+-]?\d[\d,]*\.?\d*)", answer_text)
+        if m:
+            pred = m.group(1).replace(",", "")
+    if pred is None:
+        m = re.search(
+            r"(?:answer\s+is|result\s+is|equals?|there\s+are|we\s+get)\s*"
+            r"\*?\*?\$?([+-]?\d[\d,]*\.?\d*)",
+            answer_text, re.IGNORECASE)
+        if m:
+            pred = m.group(1).replace(",", "")
+    if pred is None:
+        m = re.search(r"\*\*\$?([+-]?\d[\d,]*\.?\d*)\*\*", answer_text)
+        if m:
+            pred = m.group(1).replace(",", "")
+    if pred is None:
+        nums = re.findall(r"(?<![.\d])([+-]?\d[\d,]*\.?\d*)(?![.\d])", answer_text)
+        if nums:
+            pred = nums[-1].replace(",", "")
+
+    correct = False
+    if pred is not None:
+        try:
+            correct = abs(float(pred) - float(gold_answer)) < 1e-6
+        except (ValueError, TypeError):
+            correct = pred.strip() == gold_answer.strip()
+
+    if correct:
+        return True, f"🎯 {pred}"
+    if pred:
+        return False, f"✗ pred={pred} gold={gold_answer}"
+    return False, f"✗ no answer found, gold={gold_answer}"
 
 
 def workload_gsm8k(url: str, n_sample: int, n_gen: int, **_kw):
     rows = _load_gsm8k(n_sample)
     results = []
+    n_correct, n_scored = 0, 0
     for row in rows:
-        msgs = [{"role": "user", "content": row["prompt"]}]
+        msgs = row.get("messages") or [{"role": "user", "content": row["prompt"]}]
         try:
             r = stream_chat(url, msgs, n_gen)
+            detail = ""
+            if row.get("answer"):
+                correct, detail = _score_gsm_text(r["text"], row["answer"])
+                r["correct"] = correct
+                r["score_detail"] = detail
+                n_scored += 1
+                if correct:
+                    n_correct += 1
             results.append({"name": row["name"], **r})
-            _print_row(row["name"], r)
+            _print_row(row["name"], r, score=detail)
         except Exception as e:
             print(f"  {row['name']:28s}  FAILED: {e}", flush=True)
+    if n_scored:
+        pct = n_correct / n_scored * 100
+        print(f"\n  accuracy: {n_correct}/{n_scored} ({pct:.0f}%)")
     return results
 
 
 # ── Workload: Math500 ────────────────────────────────────────────────────
 
 def _load_math500(n_sample: int):
-    from datasets import load_dataset
-    ds = load_dataset("HuggingFaceH4/MATH-500", split="test")
-    n_sample = min(n_sample, len(ds))
-    ds = ds.shuffle(seed=42).select(range(n_sample))
-    return [
-        {"name": f"math_{i:02d}",
-         "prompt": f"Problem: {row['problem']}\nSolution: Put your final answer in \\boxed{{}}.\n",
-         "answer": row["answer"]}
-        for i, row in enumerate(ds)
-    ]
+    try:
+        from datasets import load_dataset
+        ds = load_dataset("HuggingFaceH4/MATH-500", split="test")
+        n_sample = min(n_sample, len(ds))
+        ds = ds.shuffle(seed=42).select(range(n_sample))
+        return [
+            {"name": f"math_{i:02d}",
+             "prompt": f"Problem: {row['problem']}\nSolution: Put your final answer in \\boxed{{}}.\n",
+             "answer": row["answer"]}
+            for i, row in enumerate(ds)
+        ]
+    except ImportError:
+        rows = _load_jsonl_cases(BENCH_PROMPT_DIR / "bench_math.jsonl", n_sample)
+        return [
+            {"name": row["id"],
+             "messages": row["messages"],
+             "answer": row.get("gold_answer", "")}
+            for row in rows
+        ]
 
 
 def _score_math_text(text: str, gold_answer: str) -> tuple[bool, str]:
@@ -232,7 +323,7 @@ def workload_math500(url: str, n_sample: int, n_gen: int, thinking: bool = False
     results = []
     n_correct, n_scored = 0, 0
     for row in rows:
-        msgs = [{"role": "user", "content": row["prompt"]}]
+        msgs = row.get("messages") or [{"role": "user", "content": row["prompt"]}]
         try:
             r = stream_chat(url, msgs, gen, thinking=thinking)
             correct, detail = _score_math_text(r["text"], row["answer"])

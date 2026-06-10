@@ -45,6 +45,7 @@ static const char QWEN3_TOOL_SUFFIX[] =
     "</IMPORTANT>";
 
 ChatFormat chat_format_for_arch(const std::string & arch) {
+    if (arch == "deepseek4") return ChatFormat::DEEPSEEK4;
     if (arch == "laguna") return ChatFormat::LAGUNA;
     if (arch == "gemma4") return ChatFormat::GEMMA4;
     // qwen35, qwen3 use the Qwen3/ChatML format
@@ -310,6 +311,65 @@ std::string render_chat_template(
                 // template's "if not enable_thinking" branch.
                 result += "<|channel>thought\n<channel|>";
             }
+        }
+        break;
+    }
+
+    case ChatFormat::DEEPSEEK4: {
+        // DeepSeek V4 Flash DSML renderer, matching the ds4 reference server:
+        //   <｜begin▁of▁sentence｜>{system}<｜User｜>{user}<｜Assistant｜></think>
+        // Completed assistant turns are terminated with <｜end▁of▁sentence｜>.
+        bool has_system = false;
+        std::string system_content;
+        for (const auto & msg : messages) {
+            if (msg.role != "system") continue;
+            if (!system_content.empty()) system_content += "\n\n";
+            system_content += msg.content;
+            has_system = true;
+        }
+
+        result = "<｜begin▁of▁sentence｜>";
+        if (has_tools) {
+            // Tool schema rendering is not implemented for the native DSML
+            // path yet; keep the JSON visible in the system prefix rather than
+            // silently dropping it.
+            result += tools_json;
+            if (has_system) result += "\n\n";
+        }
+        result += system_content;
+
+        bool pending_assistant = false;
+        bool pending_tool_result = false;
+        for (const auto & msg : messages) {
+            if (msg.role == "system") {
+                continue;
+            } else if (msg.role == "user") {
+                result += "<｜User｜>";
+                result += msg.content;
+                pending_assistant = true;
+                pending_tool_result = false;
+            } else if (msg.role == "tool" || msg.role == "function") {
+                if (!pending_tool_result) result += "<｜User｜>";
+                result += "<tool_result>";
+                result += msg.content;
+                result += "</tool_result>";
+                pending_assistant = true;
+                pending_tool_result = true;
+            } else if (msg.role == "assistant") {
+                if (pending_assistant) {
+                    result += "<｜Assistant｜>";
+                    result += enable_thinking ? "<think>" : "</think>";
+                }
+                result += msg.content;
+                result += "<｜end▁of▁sentence｜>";
+                pending_assistant = false;
+                pending_tool_result = false;
+            }
+        }
+
+        if (add_generation_prompt && pending_assistant) {
+            result += "<｜Assistant｜>";
+            result += enable_thinking ? "<think>" : "</think>";
         }
         break;
     }

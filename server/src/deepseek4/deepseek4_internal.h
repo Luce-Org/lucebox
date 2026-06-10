@@ -257,7 +257,8 @@ bool deepseek4_step(
     int                         n_tokens,
     int                         kv_start,
     std::vector<float> &        out_logits,
-    MoeHybridStorage *          moe_hybrid = nullptr);
+    MoeHybridStorage *          moe_hybrid = nullptr,
+    const int32_t *             token_ids = nullptr);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,

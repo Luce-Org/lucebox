@@ -49,8 +49,8 @@ static ggml_tensor * build_clamped_swiglu(ggml_context * ctx,
                                            ggml_tensor * gate,
                                            ggml_tensor * up,
                                            float clamp) {
-    // clamp gate and up to [-clamp, +clamp]
-    gate = ggml_clamp(ctx, gate, -clamp, clamp);
+    // DS4 clamps only the upper side of gate, but both sides of up.
+    gate = ggml_clamp(ctx, gate, -INFINITY, clamp);
     up   = ggml_clamp(ctx, up,   -clamp, clamp);
     // silu(gate) * up
     gate = ggml_silu(ctx, gate);
@@ -77,7 +77,8 @@ static ggml_tensor * build_tail_rope_3d(ggml_context * ctx,
                                          float ext_factor,
                                          float attn_factor,
                                          float beta_fast,
-                                         float beta_slow) {
+                                         float beta_slow,
+                                         int n_ctx_orig) {
     const int n_nope = head_dim - n_rot;
     // Split: nope [n_nope, n_heads, n_tokens], tail [n_rot, n_heads, n_tokens]
     ggml_tensor * nope = ggml_view_3d(ctx, x, n_nope, n_heads, n_tokens,
@@ -90,7 +91,7 @@ static ggml_tensor * build_tail_rope_3d(ggml_context * ctx,
     // Apply rope to the contiguous tail: [n_rot, n_heads, n_tokens]
     // DS4 uses standard sequential pairs (i, i+1), which is GGML_ROPE_TYPE_NORMAL
     tail = ggml_rope_ext(ctx, tail, pos, nullptr,
-                         n_rot, GGML_ROPE_TYPE_NORMAL, 0,
+                         n_rot, GGML_ROPE_TYPE_NORMAL, n_ctx_orig,
                          freq_base, freq_scale,
                          ext_factor, attn_factor, beta_fast, beta_slow);
     // Concat nope + tail along dim 0 → [head_dim, n_heads, n_tokens]
@@ -109,12 +110,13 @@ static ggml_tensor * build_tail_rope_2d(ggml_context * ctx,
                                          float ext_factor,
                                          float attn_factor,
                                          float beta_fast,
-                                         float beta_slow) {
+                                         float beta_slow,
+                                         int n_ctx_orig) {
     // Reshape to 3D with n_heads=1 for the shared rope function
     ggml_tensor * x3d = ggml_reshape_3d(ctx, x, head_dim, 1, n_tokens);
     ggml_tensor * result = build_tail_rope_3d(ctx, x3d, pos, n_rot, head_dim, 1, n_tokens,
                                               freq_base, freq_scale, ext_factor, attn_factor,
-                                              beta_fast, beta_slow);
+                                              beta_fast, beta_slow, n_ctx_orig);
     return ggml_reshape_2d(ctx, result, head_dim, n_tokens);
 }
 
@@ -136,7 +138,11 @@ static void build_compressor_step(
         int n_rot,
         float rms_eps,
         float compress_rope_freq_base,
-        std::vector<DeepSeek4I32InputBinding> & i32_inputs) {
+        float rope_scale_factor,
+        float rope_yarn_beta_fast,
+        float rope_yarn_beta_slow,
+        int rope_orig_ctx,
+        std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs) {
     if (!gf || !cur_last || !ape || !kv_proj || !gate_proj || !norm_weight ||
         !state.state_kv || !state.state_score || !comp_cache || ratio <= 0) {
         return;
@@ -182,12 +188,31 @@ static void build_compressor_step(
     //   Correct interleaving would select prev[j] and current[head_dim+j] alternately.
     //   Simplified: use all rows, take first head_dim of result.
 
-    const int n_state_rows = (ratio == 4) ? 2 * ratio : ratio;
-    // View the full state
-    ggml_tensor * sv_kv = ggml_view_2d(ctx, state.state_kv, comp_width, n_state_rows,
-                                        state.state_kv->nb[1], 0);
-    ggml_tensor * sv_sc = ggml_view_2d(ctx, state.state_score, comp_width, n_state_rows,
-                                        state.state_score->nb[1], 0);
+    ggml_tensor * sv_kv = nullptr;
+    ggml_tensor * sv_sc = nullptr;
+    int n_state_rows = ratio;
+    if (ratio == 4) {
+        const size_t hi_off_kv = (size_t)ratio * state.state_kv->nb[1] +
+                                 (size_t)head_dim * state.state_kv->nb[0];
+        const size_t hi_off_sc = (size_t)ratio * state.state_score->nb[1] +
+                                 (size_t)head_dim * state.state_score->nb[0];
+        ggml_tensor * prev_kv = ggml_view_2d(ctx, state.state_kv, head_dim, ratio,
+                                             state.state_kv->nb[1], 0);
+        ggml_tensor * cur_kv_hi = ggml_view_2d(ctx, state.state_kv, head_dim, ratio,
+                                               state.state_kv->nb[1], hi_off_kv);
+        ggml_tensor * prev_sc = ggml_view_2d(ctx, state.state_score, head_dim, ratio,
+                                             state.state_score->nb[1], 0);
+        ggml_tensor * cur_sc_hi = ggml_view_2d(ctx, state.state_score, head_dim, ratio,
+                                               state.state_score->nb[1], hi_off_sc);
+        sv_kv = ggml_concat(ctx, prev_kv, cur_kv_hi, 1);
+        sv_sc = ggml_concat(ctx, prev_sc, cur_sc_hi, 1);
+        n_state_rows = 2 * ratio;
+    } else {
+        sv_kv = ggml_view_2d(ctx, state.state_kv, comp_width, n_state_rows,
+                             state.state_kv->nb[1], 0);
+        sv_sc = ggml_view_2d(ctx, state.state_score, comp_width, n_state_rows,
+                             state.state_score->nb[1], 0);
+    }
     // Transpose to [n_state_rows, comp_width] so softmax operates per-dimension
     ggml_tensor * sc_T = ggml_cont(ctx, ggml_transpose(ctx, sv_sc));
     ggml_tensor * kv_T = ggml_cont(ctx, ggml_transpose(ctx, sv_kv));
@@ -197,13 +222,22 @@ static void build_compressor_step(
     ggml_tensor * weighted_T = ggml_mul(ctx, probs_T, kv_T);
     // Sum over ne[0] = n_state_rows → [1, comp_width]
     ggml_tensor * pooled_sum = ggml_sum_rows(ctx, weighted_T);
-    // Reshape to [comp_width] then take first head_dim
-    ggml_tensor * pooled = ggml_reshape_1d(ctx, pooled_sum, comp_width);
-    if (comp_width > head_dim) {
-        pooled = ggml_view_1d(ctx, pooled, head_dim, 0);
-    }
+    ggml_tensor * pooled = ggml_reshape_1d(ctx, pooled_sum, head_dim);
     pooled = ggml_cont(ctx, pooled);
     pooled = build_rms_norm(ctx, pooled, norm_weight, rms_eps);
+    pooled = ggml_reshape_2d(ctx, pooled, head_dim, 1);
+
+    ggml_tensor * comp_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_input(comp_pos);
+    i32_array_inputs.push_back({comp_pos, {token_pos + 1 - ratio}});
+    const float rope_scale = rope_scale_factor > 0.0f ? (1.0f / rope_scale_factor) : 1.0f;
+    float rope_attn = 1.0f;
+    if (rope_scale > 0.0f) {
+        rope_attn /= (1.0f + 0.1f * logf(1.0f / rope_scale));
+    }
+    pooled = build_tail_rope_2d(ctx, pooled, comp_pos, n_rot, head_dim, 1,
+                                compress_rope_freq_base, rope_scale, 1.0f, rope_attn,
+                                rope_yarn_beta_fast, rope_yarn_beta_slow, rope_orig_ctx);
 
     ggml_tensor * pooled_f16 = ggml_cast(ctx, pooled, GGML_TYPE_F16);
     const int comp_row = token_pos / ratio;
@@ -215,6 +249,33 @@ static void build_compressor_step(
         ctx, comp_cache, head_dim, 1, comp_cache->nb[1],
         (size_t)comp_row * comp_cache->nb[1]);
     ggml_build_forward_expand(gf, ggml_cpy(ctx, pooled_f16, comp_slot));
+
+    if (ratio == 4) {
+        for (int r = 0; r < ratio; ++r) {
+            ggml_tensor * src_kv = ggml_view_2d(ctx, state.state_kv, comp_width, 1,
+                                                state.state_kv->nb[1],
+                                                (size_t)(ratio + r) * state.state_kv->nb[1]);
+            ggml_tensor * dst_kv = ggml_view_2d(ctx, state.state_kv, comp_width, 1,
+                                                state.state_kv->nb[1],
+                                                (size_t)r * state.state_kv->nb[1]);
+            ggml_tensor * src_sc = ggml_view_2d(ctx, state.state_score, comp_width, 1,
+                                                state.state_score->nb[1],
+                                                (size_t)(ratio + r) * state.state_score->nb[1]);
+            ggml_tensor * dst_sc = ggml_view_2d(ctx, state.state_score, comp_width, 1,
+                                                state.state_score->nb[1],
+                                                (size_t)r * state.state_score->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, src_kv, dst_kv));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, src_sc, dst_sc));
+            ggml_tensor * dup_kv = ggml_view_2d(ctx, state.state_kv, comp_width, 1,
+                                                state.state_kv->nb[1],
+                                                (size_t)(ratio + r) * state.state_kv->nb[1]);
+            ggml_tensor * dup_sc = ggml_view_2d(ctx, state.state_score, comp_width, 1,
+                                                state.state_score->nb[1],
+                                                (size_t)(ratio + r) * state.state_score->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, dst_kv, dup_kv));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, dst_sc, dup_sc));
+        }
+    }
 }
 
 static void build_indexer_compressor_step(
@@ -225,7 +286,7 @@ static void build_indexer_compressor_step(
         const DeepSeek4Layer & L,
         DeepSeek4LayerCache & lc,
         int token_pos,
-        std::vector<DeepSeek4I32InputBinding> & i32_inputs) {
+        std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs) {
     build_compressor_step(ctx, gf, cur_last,
                           L.indexer_compressor_ape,
                           L.indexer_compressor_kv,
@@ -236,10 +297,14 @@ static void build_indexer_compressor_step(
                           4,
                           w.n_indexer_head_dim,  // indexer head_dim = 128
                           token_pos,
-                          w.n_indexer_head_dim,
+                          w.n_rot,
                           w.rms_eps,
                           w.compress_rope_freq_base,
-                          i32_inputs);
+                          w.rope_scale_factor,
+                          w.rope_yarn_beta_fast,
+                          w.rope_yarn_beta_slow,
+                          (int)w.rope_orig_ctx,
+                          i32_array_inputs);
 }
 
 static int ds4_comp_rows_used(const ggml_tensor * comp_cache, int n_cached, int ratio, int token_pos) {
@@ -367,6 +432,8 @@ static ggml_tensor * build_mla_attention(
     ggml_tensor * q = ggml_mul_mat(ctx, L.attn_q_b, qr);
     // Reshape to [head_dim, n_head, n_tokens] for per-head ops
     q = ggml_reshape_3d(ctx, q, head_dim, n_head, n_tokens);
+    // Reference DS4 applies unweighted RMSNorm independently to every Q head.
+    q = ggml_rms_norm(ctx, q, w.rms_eps);
 
     // ── KV path: cur → kv → norm ───────────────────────────────────
     // kv: [n_embd, n_tokens] → [head_dim, n_tokens]
@@ -394,12 +461,15 @@ static ggml_tensor * build_mla_attention(
         i32_array_inputs.push_back({rope_pos, std::move(pos_vals)});
     }
 
+    // n_ctx_orig is critical for YaRN correction on compressed layers
+    const int rope_n_ctx_orig = (int)w.rope_orig_ctx;  // 65536
+
     q = build_tail_rope_3d(ctx, q, rope_pos, n_rot, head_dim, n_head, n_tokens,
                            rope_freq, rope_scale, rope_ext, rope_attn,
-                           w.rope_yarn_beta_fast, w.rope_yarn_beta_slow);
+                           w.rope_yarn_beta_fast, w.rope_yarn_beta_slow, rope_n_ctx_orig);
     kv = build_tail_rope_2d(ctx, kv, rope_pos, n_rot, head_dim, n_tokens,
                             rope_freq, rope_scale, rope_ext, rope_attn,
-                            w.rope_yarn_beta_fast, w.rope_yarn_beta_slow);
+                            w.rope_yarn_beta_fast, w.rope_yarn_beta_slow, rope_n_ctx_orig);
 
     // ── Store ALL KV rows in the raw SWA ring ─────────────────────
     // For decode (n_tokens=1): write single row. For prefill: write all rows.
@@ -433,40 +503,82 @@ static ggml_tensor * build_mla_attention(
                               w.n_rot,
                               w.rms_eps,
                               w.compress_rope_freq_base,
-                              i32_inputs);
+                              w.rope_scale_factor,
+                              w.rope_yarn_beta_fast,
+                              w.rope_yarn_beta_slow,
+                              (int)w.rope_orig_ctx,
+                              i32_array_inputs);
     }
 
-    ggml_tensor * allowed_comp = nullptr;
     if (ratio == 4 && L.indexer_compressor_kv) {
-        build_indexer_compressor_step(ctx, gf, cur_last, w, L, lc, token_pos, i32_inputs);
-        allowed_comp = build_indexer_score(ctx, qr_last, cur_last, w, L, lc, token_pos, i32_inputs);
+        build_indexer_compressor_step(ctx, gf, cur_last, w, L, lc, token_pos, i32_array_inputs);
+        (void)build_indexer_score(ctx, qr_last, cur_last, w, L, lc, token_pos, i32_inputs);
     }
 
-    // ── MLA Dot-Product Attention (SWA ring buffer) ────────────────
+    // ── MLA Dot-Product Attention (SWA + compressed KV) ────────────
     // q: [head_dim, n_head, n_tokens] (after RoPE)
     // raw_kv: [head_dim, n_swa] F16 persistent ring buffer (single KV head, shared)
+    // comp_kv: [head_dim, comp_cap] F16 compressed rows.
     // n_raw = min(kv_start + n_tokens, n_swa)
     const int n_raw = std::min(kv_start + n_tokens, w.n_swa);
+    const int n_comp_attn = (ratio > 0) ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos) : 0;
+    const int n_attn = n_raw + n_comp_attn;
     const float kq_scale = 1.0f / sqrtf((float)head_dim);
 
-    // Get valid KV rows from ring buffer (cast F16→F32)
-    ggml_tensor * kv_f32 = ggml_cast(ctx, ggml_view_2d(ctx, lc.raw_kv, head_dim, n_raw,
-                                                         lc.raw_kv->nb[1], 0), GGML_TYPE_F32);
-    // kv_f32: [head_dim, n_raw]
+    // Get valid KV rows. For single-token decode/prefill, include the current
+    // in-graph KV row directly; otherwise attention can race the side-effecting
+    // cache write and see the previous contents of the raw KV slot.
+    ggml_tensor * kv_f32 = nullptr;
+    if (n_tokens == 1) {
+        ggml_tensor * cur_kv_f32 = ggml_cast(ctx, kv, GGML_TYPE_F32);
+        if (n_raw > 1) {
+            ggml_tensor * prev_f32 = ggml_cast(ctx,
+                ggml_view_2d(ctx, lc.raw_kv, head_dim, n_raw - 1,
+                             lc.raw_kv->nb[1], 0),
+                GGML_TYPE_F32);
+            kv_f32 = ggml_concat(ctx, prev_f32, cur_kv_f32, 1);
+        } else {
+            kv_f32 = cur_kv_f32;
+        }
+    } else {
+        kv_f32 = ggml_cast(ctx, ggml_view_2d(ctx, lc.raw_kv, head_dim, n_raw,
+                                             lc.raw_kv->nb[1], 0), GGML_TYPE_F32);
+    }
+    if (n_comp_attn > 0 && lc.comp_kv) {
+        ggml_tensor * comp_f32 = ggml_cast(ctx,
+            ggml_view_2d(ctx, lc.comp_kv, head_dim, n_comp_attn, lc.comp_kv->nb[1], 0),
+            GGML_TYPE_F32);
+        kv_f32 = ggml_concat(ctx, kv_f32, comp_f32, 1);
+    }
+    // kv_f32: [head_dim, n_attn]
 
     // Flatten q to [head_dim, n_head*n_tokens] for batched matmul
     ggml_tensor * q_flat = ggml_reshape_2d(ctx, q, head_dim, n_head * n_tokens);
 
-    // Scores: mul_mat(kv_f32, q_flat) = kv_f32^T[n_raw, head_dim] @ q_flat[head_dim, n_head*n_tokens]
-    //       → [n_raw, n_head*n_tokens]
+    // Scores: mul_mat(kv_f32, q_flat) = kv_f32^T[n_attn, head_dim] @ q_flat[head_dim, n_head*n_tokens]
+    //       → [n_attn, n_head*n_tokens]
     ggml_tensor * scores = ggml_mul_mat(ctx, kv_f32, q_flat);
     scores = ggml_scale(ctx, scores, kq_scale);
 
-    // Softmax over ne[0] = n_raw (the KV dimension)
-    ggml_tensor * probs = ggml_soft_max(ctx, scores);
-    // probs: [n_raw, n_head*n_tokens]
+    // Sink-aware softmax: DS4 adds one learned per-head sink logit to the
+    // denominator, but the sink contributes no value vector.
+    ggml_tensor * probs = nullptr;
+    if (L.attn_sinks) {
+        ggml_tensor * sink_scores = ggml_reshape_2d(ctx, L.attn_sinks, 1, n_head);
+        if (n_tokens > 1) {
+            ggml_tensor * sink_shape = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_head * n_tokens);
+            sink_scores = ggml_repeat(ctx, sink_scores, sink_shape);
+        }
+        ggml_tensor * scores_with_sink = ggml_concat(ctx, scores, sink_scores, 0);
+        ggml_tensor * probs_with_sink = ggml_soft_max(ctx, scores_with_sink);
+        probs = ggml_view_2d(ctx, probs_with_sink, n_attn, n_head * n_tokens,
+                             probs_with_sink->nb[1], 0);
+    } else {
+        probs = ggml_soft_max(ctx, scores);
+    }
+    // probs: [n_attn, n_head*n_tokens]
 
-    // Context: kv_T^T[head_dim, n_raw] @ probs[n_raw, n_head*n_tokens] → [head_dim, n_head*n_tokens]
+    // Context: kv_T^T[head_dim, n_attn] @ probs[n_attn, n_head*n_tokens] → [head_dim, n_head*n_tokens]
     // i.e. mul_mat(kv_T, probs) where kv_T = cont(transpose(kv_f32)) = [n_raw, head_dim]
     ggml_tensor * kv_T = ggml_cont(ctx, ggml_transpose(ctx, kv_f32));
     ggml_tensor * context = ggml_mul_mat(ctx, kv_T, probs);
@@ -476,9 +588,6 @@ static ggml_tensor * build_mla_attention(
     context = ggml_reshape_3d(ctx, context, head_dim, n_head, n_tokens);
 
     // ── Inverse tail RoPE on attention output ───────────────────────
-    // DS4 applies inverse RoPE (negate) to heads after attention, before output projection.
-    // Inverse = RoPE with negated position (equivalent to freq_scale negation).
-    // Use negative positions to achieve inverse rotation.
     ggml_tensor * neg_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
     ggml_set_input(neg_pos);
     {
@@ -488,12 +597,10 @@ static ggml_tensor * build_mla_attention(
     }
     context = build_tail_rope_3d(ctx, context, neg_pos, n_rot, head_dim, n_head, n_tokens,
                                  rope_freq, rope_scale, rope_ext, rope_attn,
-                                 w.rope_yarn_beta_fast, w.rope_yarn_beta_slow);
+                                 w.rope_yarn_beta_fast, w.rope_yarn_beta_slow, rope_n_ctx_orig);
 
     // Flatten to [head_dim*n_head, n_tokens] for output projection
     ggml_tensor * attn_out = ggml_reshape_2d(ctx, context, head_dim * n_head, n_tokens);
-
-    (void)allowed_comp; // TODO: incorporate compressed context in mixed attention
 
     // ── Grouped output projection ──────────────────────────────────
     // DS4 output uses grouped low-rank projection:
@@ -535,6 +642,7 @@ static MoeHybridConfig make_ds4_moe_hybrid_config(const DeepSeek4Weights & w) {
     cfg.n_ff_shexp = w.n_ff_exp;
     cfg.n_layer = w.n_layer;
     cfg.first_moe_layer = 0;
+    cfg.swiglu_clamp = w.swiglu_clamp_exp;
     return cfg;
 }
 
@@ -819,6 +927,11 @@ struct HcLayerWeightsCpu {
     HcWeightsCpu ffn;
 };
 
+struct HashRoutingTableCpu {
+    std::vector<int32_t> ids;  // [n_vocab, n_expert_used]
+    bool loaded = false;
+};
+
 static void load_hc_weights_cpu(HcWeightsCpu & dst, ggml_tensor * fn,
                                  ggml_tensor * scale, ggml_tensor * base) {
     if (!fn || !scale || !base || dst.loaded) return;
@@ -831,6 +944,15 @@ static void load_hc_weights_cpu(HcWeightsCpu & dst, ggml_tensor * fn,
     dst.loaded = true;
 }
 
+static bool load_hash_routing_cpu(HashRoutingTableCpu & dst, ggml_tensor * table) {
+    if (dst.loaded) return true;
+    if (!table) return false;
+    dst.ids.resize(ggml_nelements(table));
+    ggml_backend_tensor_get(table, dst.ids.data(), 0, ggml_nbytes(table));
+    dst.loaded = true;
+    return true;
+}
+
 static bool deepseek4_step_hybrid(
         ggml_backend_t backend,
         const DeepSeek4Weights & w,
@@ -839,7 +961,8 @@ static bool deepseek4_step_hybrid(
         const float * embed,
         int n_tokens,
         int kv_start,
-        std::vector<float> & out_logits) {
+        std::vector<float> & out_logits,
+        const int32_t * token_ids) {
     const int n_embd = w.n_embd;
     const int n_hc = w.n_hc;
     const int hc_dim = n_hc * n_embd;
@@ -860,12 +983,17 @@ static bool deepseek4_step_hybrid(
     // Lazy-loaded per-layer HC weights on CPU
     static std::vector<HcLayerWeightsCpu> hc_layer_weights;
     static HcWeightsCpu hc_output_weights;
+    static std::vector<HashRoutingTableCpu> hash_routing_tables;
     if (hc_layer_weights.empty()) {
         hc_layer_weights.resize((size_t)w.n_layer);
+        hash_routing_tables.resize((size_t)w.n_layer);
         for (int il = 0; il < w.n_layer; il++) {
             const DeepSeek4Layer & L = w.layers[(size_t)il];
             load_hc_weights_cpu(hc_layer_weights[il].attn, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base);
             load_hc_weights_cpu(hc_layer_weights[il].ffn, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base);
+            if (il < w.n_hash_layer && L.ffn_gate_tid2eid) {
+                load_hash_routing_cpu(hash_routing_tables[(size_t)il], L.ffn_gate_tid2eid);
+            }
         }
         load_hc_weights_cpu(hc_output_weights, w.output_hc_fn, w.output_hc_scale, w.output_hc_base);
     }
@@ -971,7 +1099,14 @@ static bool deepseek4_step_hybrid(
         std::vector<float> ffn_out_host((size_t)n_embd * (size_t)n_tokens, 0.0f);
 
         if (il < w.n_hash_layer && L.ffn_gate_tid2eid) {
-            // Hash-routed layers: shared FFN only
+            // Hash-routed layers: selected experts come from token_id -> expert_ids,
+            // while weights still come from router probabilities for those experts.
+            if (!token_ids || !hash_routing_tables[(size_t)il].loaded) {
+                std::fprintf(stderr, "[deepseek4] missing token ids/hash table for layer %d\n", il);
+                if (hot_alloc) ggml_gallocr_free(hot_alloc);
+                if (cold_alloc) ggml_gallocr_free(cold_alloc);
+                return false;
+            }
             ggml_init_params ffn_params{};
             ffn_params.mem_size = 16 * 1024 * 1024;
             ffn_params.mem_buffer = nullptr;
@@ -985,9 +1120,11 @@ static bool deepseek4_step_hybrid(
             ggml_tensor * ffn_inp = ggml_new_tensor_2d(ffn_ctx, GGML_TYPE_F32, n_embd, n_tokens);
             ggml_set_input(ffn_inp);
             ggml_tensor * ffn_normed = build_rms_norm(ffn_ctx, ffn_inp, L.ffn_norm, w.rms_eps);
-            ggml_tensor * ffn_result = build_shared_ffn(ffn_ctx, ffn_normed, w, L);
+            ggml_tensor * router_logits = ggml_mul_mat(ffn_ctx, L.ffn_gate_inp, ffn_normed);
+            ggml_tensor * router_probs = ggml_sqrt(ffn_ctx, ggml_softplus(ffn_ctx, router_logits));
             ggml_cgraph * ffn_gf = ggml_new_graph(ffn_ctx);
-            ggml_build_forward_expand(ffn_gf, ffn_result);
+            ggml_build_forward_expand(ffn_gf, ffn_normed);
+            ggml_build_forward_expand(ffn_gf, router_probs);
             ggml_gallocr_t ffn_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
             if (!ggml_gallocr_alloc_graph(ffn_alloc, ffn_gf)) {
                 ggml_gallocr_free(ffn_alloc); ggml_free(ffn_ctx);
@@ -997,8 +1134,11 @@ static bool deepseek4_step_hybrid(
             }
             ggml_backend_tensor_set(ffn_inp, ffn_working.data(), 0, sizeof(float) * ffn_working.size());
             ok = ggml_backend_graph_compute(backend, ffn_gf) == GGML_STATUS_SUCCESS;
+            std::vector<float> ffn_normed_host((size_t)n_embd * (size_t)n_tokens);
+            std::vector<float> probs_host((size_t)w.n_expert * (size_t)n_tokens);
             if (ok) {
-                ggml_backend_tensor_get(ffn_result, ffn_out_host.data(), 0, sizeof(float) * ffn_out_host.size());
+                ggml_backend_tensor_get(ffn_normed, ffn_normed_host.data(), 0, sizeof(float) * ffn_normed_host.size());
+                ggml_backend_tensor_get(router_probs, probs_host.data(), 0, sizeof(float) * probs_host.size());
             }
             ggml_gallocr_free(ffn_alloc);
             ggml_free(ffn_ctx);
@@ -1006,6 +1146,62 @@ static bool deepseek4_step_hybrid(
                 if (hot_alloc) ggml_gallocr_free(hot_alloc);
                 if (cold_alloc) ggml_gallocr_free(cold_alloc);
                 return false;
+            }
+
+            std::vector<int32_t> selected_host((size_t)w.n_expert_used * (size_t)n_tokens);
+            std::vector<float> weights_host((size_t)w.n_expert_used * (size_t)n_tokens);
+            const auto & hash_table = hash_routing_tables[(size_t)il].ids;
+            for (int ti = 0; ti < n_tokens; ++ti) {
+                const int32_t tok = token_ids[ti];
+                if (tok < 0 || tok >= w.n_vocab) {
+                    std::fprintf(stderr, "[deepseek4] token id %d outside hash table for layer %d\n", tok, il);
+                    if (hot_alloc) ggml_gallocr_free(hot_alloc);
+                    if (cold_alloc) ggml_gallocr_free(cold_alloc);
+                    return false;
+                }
+                const int32_t * row = hash_table.data() + (size_t)tok * (size_t)w.n_expert_used;
+                float sum = 0.0f;
+                for (int ei = 0; ei < w.n_expert_used; ++ei) {
+                    const int32_t expert = row[ei];
+                    selected_host[(size_t)ti * (size_t)w.n_expert_used + (size_t)ei] = expert;
+                    float prob = 0.0f;
+                    if (expert >= 0 && expert < w.n_expert) {
+                        prob = probs_host[(size_t)ti * (size_t)w.n_expert + (size_t)expert];
+                    }
+                    weights_host[(size_t)ti * (size_t)w.n_expert_used + (size_t)ei] = prob;
+                    sum += prob;
+                }
+                sum = std::max(sum, 6.103515625e-5f);
+                for (int ei = 0; ei < w.n_expert_used; ++ei) {
+                    float & weight = weights_host[(size_t)ti * (size_t)w.n_expert_used + (size_t)ei];
+                    weight = weight / sum * w.expert_weight_scale;
+                }
+            }
+
+            MoeHybridConfig hybrid_cfg = make_ds4_moe_hybrid_config(w);
+            MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
+            auto & storage = moe_hybrid.layers[(size_t) il];
+            bool ffn_ok = eval_moe_hybrid_ffn_batched(
+                backend, cpu_backend, hybrid_cfg, desc, storage,
+                ffn_normed_host.data(), selected_host.data(), weights_host.data(),
+                n_tokens, ffn_out_host, nullptr, &hot_alloc, &cold_alloc);
+            if (!ffn_ok) {
+                ffn_out_host.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
+                std::vector<float> single_out;
+                for (int ti = 0; ti < n_tokens; ++ti) {
+                    if (!eval_moe_hybrid_ffn_single(
+                            backend, hybrid_cfg, desc, storage, cpu_backend,
+                            ffn_normed_host.data() + (size_t)ti * (size_t)n_embd,
+                            selected_host.data() + (size_t)ti * (size_t)w.n_expert_used,
+                            weights_host.data() + (size_t)ti * (size_t)w.n_expert_used,
+                            w.n_expert_used, single_out)) {
+                        if (hot_alloc) ggml_gallocr_free(hot_alloc);
+                        if (cold_alloc) ggml_gallocr_free(cold_alloc);
+                        return false;
+                    }
+                    std::memcpy(ffn_out_host.data() + (size_t)ti * (size_t)n_embd,
+                                single_out.data(), sizeof(float) * (size_t)n_embd);
+                }
             }
         } else {
             // MoE layers: compute routing on GPU, experts via hybrid
@@ -1022,11 +1218,11 @@ static bool deepseek4_step_hybrid(
             ggml_tensor * ffn_inp = ggml_new_tensor_2d(ffn_ctx, GGML_TYPE_F32, n_embd, n_tokens);
             ggml_set_input(ffn_inp);
             ggml_tensor * ffn_normed = build_rms_norm(ffn_ctx, ffn_inp, L.ffn_norm, w.rms_eps);
-            Ds4MoeRouting routing = build_moe_routing(ffn_ctx, ffn_normed, w, L, n_tokens);
+            ggml_tensor * router_logits = ggml_mul_mat(ffn_ctx, L.ffn_gate_inp, ffn_normed);
+            ggml_tensor * router_probs = ggml_sqrt(ffn_ctx, ggml_softplus(ffn_ctx, router_logits));
             ggml_cgraph * ffn_gf = ggml_new_graph(ffn_ctx);
             ggml_build_forward_expand(ffn_gf, ffn_normed);
-            ggml_build_forward_expand(ffn_gf, routing.selected);
-            ggml_build_forward_expand(ffn_gf, routing.weights);
+            ggml_build_forward_expand(ffn_gf, router_probs);
             ggml_gallocr_t ffn_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
             if (!ggml_gallocr_alloc_graph(ffn_alloc, ffn_gf)) {
                 ggml_gallocr_free(ffn_alloc); ggml_free(ffn_ctx);
@@ -1044,13 +1240,55 @@ static bool deepseek4_step_hybrid(
             }
 
             std::vector<float> ffn_normed_host((size_t)n_embd * (size_t)n_tokens);
+            std::vector<float> probs_host((size_t)w.n_expert * (size_t)n_tokens);
             std::vector<int32_t> selected_host((size_t)w.n_expert_used * (size_t)n_tokens);
             std::vector<float> weights_host((size_t)w.n_expert_used * (size_t)n_tokens);
             ggml_backend_tensor_get(ffn_normed, ffn_normed_host.data(), 0, sizeof(float) * ffn_normed_host.size());
-            ggml_backend_tensor_get(routing.selected, selected_host.data(), 0, sizeof(int32_t) * selected_host.size());
-            ggml_backend_tensor_get(routing.weights, weights_host.data(), 0, sizeof(float) * weights_host.size());
+            ggml_backend_tensor_get(router_probs, probs_host.data(), 0, sizeof(float) * probs_host.size());
             ggml_gallocr_free(ffn_alloc);
             ggml_free(ffn_ctx);
+
+            std::vector<float> bias_host;
+            if (L.ffn_exp_probs_b) {
+                bias_host.resize((size_t)w.n_expert);
+                ggml_backend_tensor_get(L.ffn_exp_probs_b, bias_host.data(), 0,
+                                        sizeof(float) * bias_host.size());
+            }
+            for (int ti = 0; ti < n_tokens; ++ti) {
+                const float * probs = probs_host.data() + (size_t)ti * (size_t)w.n_expert;
+                std::vector<int32_t> top((size_t)w.n_expert_used, -1);
+                for (int expert = 0; expert < w.n_expert; ++expert) {
+                    const float score = probs[expert] +
+                        (!bias_host.empty() ? bias_host[(size_t)expert] : 0.0f);
+                    for (int slot = 0; slot < w.n_expert_used; ++slot) {
+                        const int32_t cur_expert = top[(size_t)slot];
+                        const float cur_score = cur_expert >= 0
+                            ? probs[cur_expert] +
+                                (!bias_host.empty() ? bias_host[(size_t)cur_expert] : 0.0f)
+                            : -INFINITY;
+                        if (cur_expert < 0 || score > cur_score) {
+                            for (int m = w.n_expert_used - 1; m > slot; --m) {
+                                top[(size_t)m] = top[(size_t)m - 1];
+                            }
+                            top[(size_t)slot] = expert;
+                            break;
+                        }
+                    }
+                }
+                float sum = 0.0f;
+                for (int slot = 0; slot < w.n_expert_used; ++slot) {
+                    const int32_t expert = top[(size_t)slot];
+                    selected_host[(size_t)ti * (size_t)w.n_expert_used + (size_t)slot] = expert;
+                    const float weight = expert >= 0 ? probs[expert] : 0.0f;
+                    weights_host[(size_t)ti * (size_t)w.n_expert_used + (size_t)slot] = weight;
+                    sum += weight;
+                }
+                sum = std::max(sum, 6.103515625e-5f);
+                for (int slot = 0; slot < w.n_expert_used; ++slot) {
+                    float & weight = weights_host[(size_t)ti * (size_t)w.n_expert_used + (size_t)slot];
+                    weight = weight / sum * w.expert_weight_scale;
+                }
+            }
 
             MoeHybridConfig hybrid_cfg = make_ds4_moe_hybrid_config(w);
             MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
@@ -1149,6 +1387,7 @@ static bool deepseek4_step_hybrid(
     ggml_gallocr_free(final_alloc);
     ggml_free(ctx2);
     if (!final_ok) return false;
+
     cache.cur_pos = kv_start + n_tokens;
     return true;
 }
@@ -1163,11 +1402,13 @@ bool deepseek4_step(
         int n_tokens,
         int kv_start,
         std::vector<float> & out_logits,
-        MoeHybridStorage * moe_hybrid) {
+        MoeHybridStorage * moe_hybrid,
+        const int32_t * token_ids) {
 
     if (w.moe_hybrid && moe_hybrid != nullptr) {
         return deepseek4_step_hybrid(backend, w, cache, *moe_hybrid,
-                                     embed, n_tokens, kv_start, out_logits);
+                                     embed, n_tokens, kv_start, out_logits,
+                                     token_ids);
     }
 
     const int n_embd = w.n_embd;

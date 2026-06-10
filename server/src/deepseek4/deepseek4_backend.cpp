@@ -252,9 +252,12 @@ bool DeepSeek4Backend::unpark(const std::string & what) {
 int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   const DaemonIO & io,
                                   int kv_offset) {
-    const int chunk = cfg_.chunk > 0 ? cfg_.chunk : 512;
+    // Hybrid currently implements HC for single-token steps only; keep prefill
+    // token-by-token so the first sampled token is seeded from the correct HC state.
+    const int chunk = moe_hybrid_ ? 1 : (cfg_.chunk > 0 ? cfg_.chunk : 512);
     const int n_total = (int)tokens.size();
     int pos = kv_offset;
+    last_logits_.clear();
 
     for (int i = 0; i < n_total; i += chunk) {
         if (io.cancelled) return pos;
@@ -268,10 +271,11 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         // Run forward pass
         std::vector<float> logits;
         if (!deepseek4_step(backend_, w_, cache_, embed.data(), n_tok, pos, logits,
-                            moe_hybrid_.get())) {
+                            moe_hybrid_.get(), tokens.data() + i)) {
             std::fprintf(stderr, "[deepseek4] prefill step failed at pos=%d\n", pos);
             return -1;
         }
+        last_logits_ = std::move(logits);
         pos += n_tok;
     }
     return pos;
@@ -302,29 +306,17 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
 
         // Get last logits and sample
         std::vector<float> logits;
-        {
-            // For decode, we embed the last token and run one step
-            int32_t last_tok = out_tokens.empty()
-                ? -1  // Should not happen in normal flow
-                : out_tokens.back();
-
-            // First token of decode uses the last prefill logits
-            if (generated == 0 && cache_.cur_pos > 0) {
-                // Logits from the last prefill step are already computed
-                // We need to sample from them — they should be in the last step's output
-                // For now, run one more forward step with the last token
-                std::vector<float> embed(w_.n_embd);
-                // This is a placeholder — real decode seeds from prefill's last logits
-                // TODO: Cache logits from prefill and sample directly
-            }
-
+        if (generated == 0 && !last_logits_.empty()) {
+            logits = last_logits_;
+        } else {
             std::vector<float> embed(w_.n_embd);
             int32_t tok_to_eval = out_tokens.empty() ? 0 : out_tokens.back();
             w_.embedder.embed(&tok_to_eval, 1, embed.data());
 
+            const int pos = std::max(0, committed + generated - 1);
             if (!deepseek4_step(backend_, w_, cache_, embed.data(), 1,
-                                committed + generated, logits,
-                                moe_hybrid_.get())) {
+                                pos, logits,
+                                moe_hybrid_.get(), &tok_to_eval)) {
                 std::fprintf(stderr, "[deepseek4] decode step failed\n");
                 return false;
             }
