@@ -22,21 +22,16 @@ on:
   # from a PR — even if we wanted to, GITHUB_TOKEN on PRs from forks lacks
   # `packages:write`. The point is to catch Dockerfile / bake-file / arch-
   # list regressions before they land on main.
+  # Only when the DOCKER surface itself changes. Source-tree changes are
+  # already compiled and smoke-tested on the self-hosted GPU runners (sm_86 +
+  # gfx1151) by ci.yml — rebuilding the image for every server/src PR
+  # duplicated that coverage at ~20 GitHub-runner minutes per push.
   pull_request:
     paths:
       - Dockerfile
       - docker-bake.hcl
       - .dockerignore
       - .github/workflows/docker.yml
-      - server/CMakeLists.txt
-      - server/src/**
-      - server/test/**
-      - server/include/**
-      - server/scripts/**
-      - server/deps/**
-      - server/pyproject.toml
-      - pyproject.toml
-      - uv.lock
   # Manual trigger for one-off rebuilds or pre-release smoke tests. The
   # `push` input controls whether the resulting images land in GHCR or only
   # populate the buildx cache.
