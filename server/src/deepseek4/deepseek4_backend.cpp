@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cinttypes>
 
 namespace dflash::common {
 
@@ -28,6 +29,10 @@ static bool env_flag_enabled(const char * name) {
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
+static double gib(uint64_t bytes) {
+    return (double) bytes / 1024.0 / 1024.0 / 1024.0;
+}
+
 static uint64_t layer_expert_bytes(const DeepSeek4Layer & layer, int n_expert) {
     if (n_expert <= 0) return 0;
     uint64_t bytes = 0;
@@ -35,6 +40,70 @@ static uint64_t layer_expert_bytes(const DeepSeek4Layer & layer, int n_expert) {
     if (layer.ffn_up_exps) bytes += ggml_nbytes(layer.ffn_up_exps) / (uint64_t) n_expert;
     if (layer.ffn_down_exps) bytes += ggml_nbytes(layer.ffn_down_exps) / (uint64_t) n_expert;
     return bytes;
+}
+
+struct Ds4ExpertMemoryInfo {
+    std::vector<uint64_t> layer_expert_bytes;
+    uint64_t total_expert_bytes = 0;
+    uint64_t bytes_per_uniform_round = 0;
+    uint64_t hot_bytes = 0;
+    uint64_t cold_bytes = 0;
+    int total_hot = 0;
+    int total_cold = 0;
+};
+
+static bool compute_ds4_expert_memory_info(const DeepSeek4Weights & w,
+                                           const MoeHybridPlacement * placement,
+                                           Ds4ExpertMemoryInfo & out,
+                                           std::string * err) {
+    out = {};
+    out.layer_expert_bytes.assign((size_t) w.n_layer, 0);
+    for (int il = 0; il < w.n_layer; ++il) {
+        const uint64_t bytes = layer_expert_bytes(w.layers[(size_t) il], w.n_expert);
+        out.layer_expert_bytes[(size_t) il] = bytes;
+        out.total_expert_bytes += bytes * (uint64_t) w.n_expert;
+        out.bytes_per_uniform_round += bytes;
+    }
+    if (out.bytes_per_uniform_round == 0) {
+        if (err) *err = "expert tensor metadata missing after partial load";
+        return false;
+    }
+    if (!placement) return true;
+    if (!placement->matches(w.n_layer, w.n_expert, w.n_expert_used)) {
+        if (err) *err = "placement does not match DS4 dimensions";
+        return false;
+    }
+    out.total_hot = placement->total_hot;
+    out.total_cold = w.n_layer * w.n_expert - placement->total_hot;
+    for (int il = 0; il < w.n_layer; ++il) {
+        const uint64_t layer_bytes = out.layer_expert_bytes[(size_t) il];
+        const uint64_t hot_count = (uint64_t) placement->hot_counts[(size_t) il];
+        out.hot_bytes += layer_bytes * hot_count;
+        out.cold_bytes += layer_bytes * ((uint64_t) w.n_expert - hot_count);
+    }
+    return true;
+}
+
+static void log_ds4_expert_memory_info(const char * tag,
+                                       const Ds4ExpertMemoryInfo & info,
+                                       int n_layer) {
+    std::fprintf(stderr,
+                 "[deepseek4] %s expert_memory: total=%.2f GiB uniform_round=%.2f MiB hot=%d %.2f GiB cold=%d %.2f GiB\n",
+                 tag,
+                 gib(info.total_expert_bytes),
+                 (double) info.bytes_per_uniform_round / 1024.0 / 1024.0,
+                 info.total_hot,
+                 gib(info.hot_bytes),
+                 info.total_cold,
+                 gib(info.cold_bytes));
+    if (env_flag_enabled("DFLASH_DS4_EXPERT_MEMORY_VERBOSE")) {
+        for (int il = 0; il < n_layer; ++il) {
+            std::fprintf(stderr,
+                         "[deepseek4] %s layer=%d expert_bytes=%" PRIu64 " (%.2f MiB per expert)\n",
+                         tag, il, info.layer_expert_bytes[(size_t) il],
+                         (double) info.layer_expert_bytes[(size_t) il] / 1024.0 / 1024.0);
+        }
+    }
 }
 
 static uint64_t estimate_ds4_cache_bytes(const DeepSeek4Weights & w, int max_ctx) {
@@ -122,17 +191,8 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
         return false;
     }
 
-    std::vector<uint64_t> layer_bytes((size_t) w.n_layer, 0);
-    uint64_t total_expert_bytes = 0;
-    uint64_t bytes_per_uniform_round = 0;
-    for (int il = 0; il < w.n_layer; ++il) {
-        const uint64_t bytes = layer_expert_bytes(w.layers[(size_t) il], w.n_expert);
-        layer_bytes[(size_t) il] = bytes;
-        total_expert_bytes += bytes * (uint64_t) w.n_expert;
-        bytes_per_uniform_round += bytes;
-    }
-    if (bytes_per_uniform_round == 0) {
-        if (err) *err = "expert tensor metadata missing after partial load";
+    Ds4ExpertMemoryInfo mem;
+    if (!compute_ds4_expert_memory_info(w, nullptr, mem, err)) {
         return false;
     }
 
@@ -145,8 +205,8 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
     if (gpu_total > core_bytes + kv_bytes + warm_bytes + safety_bytes) {
         expert_budget = gpu_total - core_bytes - kv_bytes - warm_bytes - safety_bytes;
     }
-    if (expert_budget > total_expert_bytes) {
-        expert_budget = total_expert_bytes;
+    if (expert_budget > mem.total_expert_bytes) {
+        expert_budget = mem.total_expert_bytes;
     }
     if (const char * cap_env = std::getenv("DFLASH_EXPERT_BUDGET_MB")) {
         const uint64_t cap_bytes = (uint64_t) std::max(0, std::atoi(cap_env)) * 1024ULL * 1024ULL;
@@ -159,7 +219,7 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
         return false;
     }
 
-    const int hot_per_layer = std::min(w.n_expert, (int) (expert_budget / bytes_per_uniform_round));
+    const int hot_per_layer = std::min(w.n_expert, (int) (expert_budget / mem.bytes_per_uniform_round));
     if (hot_per_layer <= 0) {
         if (err) *err = "expert budget is smaller than one uniform expert round";
         return false;
@@ -180,13 +240,22 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
         }
     }
 
+    Ds4ExpertMemoryInfo placed_mem;
+    if (!compute_ds4_expert_memory_info(w, &out, placed_mem, err)) {
+        return false;
+    }
+
     std::fprintf(stderr,
-                 "[deepseek4] hybrid placement: gpu_total=%.2f GiB core=%.2f GiB kv=%.2f GiB expert_budget=%.2f GiB hot/layer=%d\n",
-                 gpu_total / 1024.0 / 1024.0 / 1024.0,
-                 core_bytes / 1024.0 / 1024.0 / 1024.0,
-                 kv_bytes / 1024.0 / 1024.0 / 1024.0,
-                 expert_budget / 1024.0 / 1024.0 / 1024.0,
+                 "[deepseek4] hybrid placement: gpu_total=%.2f GiB gpu_free=%.2f GiB core=%.2f GiB kv=%.2f GiB warm=%.2f GiB safety=%.2f GiB expert_budget=%.2f GiB hot/layer=%d\n",
+                 gib((uint64_t) gpu_total),
+                 gib((uint64_t) gpu_free),
+                 gib(core_bytes),
+                 gib(kv_bytes),
+                 gib(warm_bytes),
+                 gib(safety_bytes),
+                 gib(expert_budget),
                  hot_per_layer);
+    log_ds4_expert_memory_info("placement", placed_mem, w.n_layer);
     return true;
 }
 
@@ -203,6 +272,18 @@ bool DeepSeek4Backend::init_hybrid_model() {
     const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
     if (!compute_uniform_hybrid_placement(w_, max_ctx, moe_placement_, &err)) {
         std::fprintf(stderr, "[deepseek4] failed to compute hybrid placement: %s\n", err.c_str());
+        return false;
+    }
+    if (const char * out_path = std::getenv("DFLASH_DS4_PLACEMENT_OUT")) {
+        if (!moe_placement_.save_json(out_path, "deepseek4", &err)) {
+            std::fprintf(stderr, "[deepseek4] failed to write placement %s: %s\n",
+                         out_path, err.c_str());
+            return false;
+        }
+        std::fprintf(stderr, "[deepseek4] wrote placement: %s\n", out_path);
+    }
+    if (env_flag_enabled("DFLASH_DS4_PLACEMENT_ONLY")) {
+        std::fprintf(stderr, "[deepseek4] placement-only requested; skipping expert allocation\n");
         return false;
     }
 
