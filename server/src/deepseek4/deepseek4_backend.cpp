@@ -225,8 +225,10 @@ bool DeepSeek4Backend::init_hybrid_model() {
     moe_hybrid_ = std::move(hybrid);
     w_.moe_hybrid = true;
     const int total_cold = w_.n_layer * w_.n_expert - moe_placement_.total_hot;
-    std::fprintf(stderr, "[deepseek4] hybrid experts ready: hot=%d cold=%d\n",
-                 moe_placement_.total_hot, total_cold);
+    const char * cold_backend =
+        moe_hybrid_->cold_backend_kind == MoeHybridColdBackend::Gpu ? "gpu" : "cpu";
+    std::fprintf(stderr, "[deepseek4] hybrid experts ready: hot=%d cold=%d cold_backend=%s\n",
+                 moe_placement_.total_hot, total_cold, cold_backend);
     return true;
 }
 

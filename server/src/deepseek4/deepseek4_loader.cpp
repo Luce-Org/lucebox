@@ -496,6 +496,16 @@ bool load_deepseek4_gguf_partial(const std::string & path,
 
 namespace {
 
+static MoeHybridColdBackend ds4_cold_backend_from_env() {
+    const char * value = std::getenv("DFLASH_MOE_COLD_BACKEND");
+    if (!value || !value[0]) return MoeHybridColdBackend::Cpu;
+    if (std::strcmp(value, "gpu") == 0 || std::strcmp(value, "hip") == 0 ||
+        std::strcmp(value, "rocm") == 0) {
+        return MoeHybridColdBackend::Gpu;
+    }
+    return MoeHybridColdBackend::Cpu;
+}
+
 static MoeHybridConfig make_ds4_moe_hybrid_config(const DeepSeek4Weights & w) {
     MoeHybridConfig cfg;
     cfg.n_embd = w.n_embd;
@@ -505,6 +515,7 @@ static MoeHybridConfig make_ds4_moe_hybrid_config(const DeepSeek4Weights & w) {
     cfg.n_ff_shexp = w.n_ff_exp;
     cfg.n_layer = w.n_layer;
     cfg.first_moe_layer = 0;
+    cfg.cold_expert_backend = ds4_cold_backend_from_env();
     return cfg;
 }
 

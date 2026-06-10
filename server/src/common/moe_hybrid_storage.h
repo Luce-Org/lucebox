@@ -1,4 +1,4 @@
-// Common MoE hybrid expert storage — manages hot (GPU) and cold (CPU) expert buffers.
+// Common MoE hybrid expert storage — manages hot and cold expert buffers.
 
 #pragma once
 
@@ -85,6 +85,8 @@ struct MoeHybridLayerStorage {
     ggml_tensor * up_cold = nullptr;
     ggml_tensor * down_cold = nullptr;
     ggml_tensor * gate_up_cold = nullptr;
+    ggml_backend_t cold_backend = nullptr; // Alias: either CPU backend or caller-owned GPU/HIP backend.
+    MoeHybridColdBackend cold_backend_kind = MoeHybridColdBackend::Cpu;
 
     std::vector<int32_t> hot_expert_ids;
     std::vector<int32_t> cold_expert_ids;
@@ -156,6 +158,8 @@ struct MoeHybridStorage {
     ~MoeHybridStorage();
 
     ggml_backend_t cpu_backend = nullptr;
+    ggml_backend_t cold_backend = nullptr; // Alias: either cpu_backend or caller-owned GPU/HIP backend.
+    MoeHybridColdBackend cold_backend_kind = MoeHybridColdBackend::Cpu;
     MoeHybridPlacement placement;
     std::vector<MoeHybridLayerStorage> layers;
 
