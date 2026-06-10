@@ -34,7 +34,9 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#if !defined(_WIN32)
 #include <unistd.h>
+#endif
 #include <unordered_map>
 #include <vector>
 
