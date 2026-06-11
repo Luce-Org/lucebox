@@ -2138,6 +2138,70 @@ static void test_disk_cache_config_defaults() {
     TEST_ASSERT(cfg.cold_max_tokens == 10240);
 }
 
+static void test_disk_cache_policy_parse() {
+    DiskPrefixCachePolicy policy;
+    TEST_ASSERT(parse_disk_prefix_cache_policy("off", policy));
+    TEST_ASSERT(policy.mode == DiskPrefixCacheMode::Off);
+    TEST_ASSERT(parse_disk_prefix_cache_policy("full", policy));
+    TEST_ASSERT(policy.mode == DiskPrefixCacheMode::Full);
+    TEST_ASSERT(parse_disk_prefix_cache_policy("auto", policy));
+    TEST_ASSERT(policy.mode == DiskPrefixCacheMode::Auto);
+    TEST_ASSERT(policy.auto_window == 30);
+    TEST_ASSERT(parse_disk_prefix_cache_policy("auto:30", policy));
+    TEST_ASSERT(policy.mode == DiskPrefixCacheMode::Auto);
+    TEST_ASSERT(policy.auto_window == 30);
+    TEST_ASSERT(parse_disk_prefix_cache_policy("1000", policy));
+    TEST_ASSERT(policy.mode == DiskPrefixCacheMode::Fixed);
+    TEST_ASSERT(policy.fixed_tokens == 1000);
+    TEST_ASSERT(!parse_disk_prefix_cache_policy("core", policy));
+    TEST_ASSERT(!parse_disk_prefix_cache_policy("task", policy));
+    TEST_ASSERT(!parse_disk_prefix_cache_policy("auto:0", policy));
+}
+
+static void test_disk_cache_fixed_boundary() {
+    DiskPrefixCachePolicy policy;
+    TEST_ASSERT(parse_disk_prefix_cache_policy("1000", policy));
+    TEST_ASSERT(disk_prefix_cache_fixed_boundary(policy, 2000) == 1000);
+    TEST_ASSERT(disk_prefix_cache_fixed_boundary(policy, 500) == 0);
+    TEST_ASSERT(disk_prefix_cache_fixed_boundary(policy, 2000, 1001) == 0);
+    TEST_ASSERT(disk_prefix_cache_fixed_boundary(policy, 2000, 1000) == 1000);
+}
+
+static void test_disk_cache_auto_boundary_lcp() {
+    std::vector<int32_t> current{1, 2, 3, 4, 5, 9};
+    std::vector<std::vector<int32_t>> recent{
+        {1, 2, 3, 4, 8},
+        {1, 2, 3, 4, 7},
+        {7, 8},
+    };
+    std::vector<int> safe_boundaries{2, 4};
+    TEST_ASSERT(disk_prefix_cache_auto_boundary(
+        current, recent, 2, safe_boundaries, 2) == 4);
+    TEST_ASSERT(disk_prefix_cache_auto_boundary(
+        current, recent, 2, {}, 2) == 4);
+    TEST_ASSERT(disk_prefix_cache_auto_boundary(
+        current, recent, 3, {}, 2) == 4);
+    TEST_ASSERT(disk_prefix_cache_auto_boundary(
+        current, recent, 2, safe_boundaries, 5) == 0);
+}
+
+static void test_disk_cache_auto_window_limits_history() {
+    std::vector<int32_t> current{1, 2, 3, 4, 5};
+    std::vector<std::vector<int32_t>> recent{
+        {9},
+        {1, 2, 3, 4, 0},
+        {1, 2, 3, 4, 9},
+    };
+    TEST_ASSERT(disk_prefix_cache_auto_boundary(
+        current, recent, 1, {}, 2) == 0);
+    TEST_ASSERT(disk_prefix_cache_auto_boundary(
+        current, recent, 2, {}, 2) == 4);
+    TEST_ASSERT(disk_prefix_cache_auto_boundary(
+        current, recent, 3, {}, 2) == 4);
+    TEST_ASSERT(disk_prefix_cache_auto_boundary(
+        current, recent, 0, {}, 2) == 0);
+}
+
 static void test_disk_cache_disabled_when_no_dir() {
     MockBackend backend;
     DiskCacheConfig cfg;
@@ -3711,6 +3775,10 @@ int main() {
 
     std::fprintf(stderr, "\n── Disk prefix cache ──\n");
     RUN_TEST(test_disk_cache_config_defaults);
+    RUN_TEST(test_disk_cache_policy_parse);
+    RUN_TEST(test_disk_cache_fixed_boundary);
+    RUN_TEST(test_disk_cache_auto_boundary_lcp);
+    RUN_TEST(test_disk_cache_auto_window_limits_history);
     RUN_TEST(test_disk_cache_disabled_when_no_dir);
     RUN_TEST(test_disk_cache_init_creates_directory);
     RUN_TEST(test_disk_cache_header_size);

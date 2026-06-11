@@ -9,8 +9,10 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <dirent.h>
@@ -45,6 +47,118 @@ static bool mkdir_p(const std::string & path) {
 
 static uint64_t now_unix() {
     return (uint64_t)std::time(nullptr);
+}
+
+const char * disk_prefix_cache_mode_name(DiskPrefixCacheMode mode) {
+    switch (mode) {
+        case DiskPrefixCacheMode::Off:   return "off";
+        case DiskPrefixCacheMode::Full:  return "full";
+        case DiskPrefixCacheMode::Auto:  return "auto";
+        case DiskPrefixCacheMode::Fixed: return "fixed";
+    }
+    return "full";
+}
+
+std::string disk_prefix_cache_policy_name(const DiskPrefixCachePolicy & policy) {
+    if (policy.mode == DiskPrefixCacheMode::Fixed) {
+        return "fixed:" + std::to_string(policy.fixed_tokens);
+    }
+    if (policy.mode == DiskPrefixCacheMode::Auto) {
+        return "auto:" + std::to_string(policy.auto_window);
+    }
+    return disk_prefix_cache_mode_name(policy.mode);
+}
+
+bool parse_disk_prefix_cache_policy(const std::string & value,
+                                    DiskPrefixCachePolicy & out) {
+    std::string v;
+    v.reserve(value.size());
+    for (char c : value) v.push_back((char)std::tolower((unsigned char)c));
+
+    if (v == "off" || v == "none" || v == "disabled") {
+        out = {};
+        out.mode = DiskPrefixCacheMode::Off;
+        return true;
+    }
+    if (v == "full" || v == "full-prefix") {
+        out = {};
+        out.mode = DiskPrefixCacheMode::Full;
+        return true;
+    }
+    if (v == "auto") {
+        out = {};
+        out.mode = DiskPrefixCacheMode::Auto;
+        return true;
+    }
+
+    const std::string auto_prefix = "auto:";
+    if (v.rfind(auto_prefix, 0) == 0) {
+        char * end = nullptr;
+        long n = std::strtol(v.c_str() + auto_prefix.size(), &end, 10);
+        if (!end || *end != '\0' || n <= 0 || n > 1000000) return false;
+        out = {};
+        out.mode = DiskPrefixCacheMode::Auto;
+        out.auto_window = (int)n;
+        return true;
+    }
+
+    char * end = nullptr;
+    long n = std::strtol(v.c_str(), &end, 10);
+    if (end && *end == '\0' && n > 0 && n <= 1000000) {
+        out = {};
+        out.mode = DiskPrefixCacheMode::Fixed;
+        out.fixed_tokens = (int)n;
+        return true;
+    }
+    return false;
+}
+
+static bool valid_boundary(int n, int full_len) {
+    return n > 0 && n <= full_len;
+}
+
+int disk_prefix_cache_fixed_boundary(const DiskPrefixCachePolicy & policy,
+                                     int full_len,
+                                     int min_tokens) {
+    if (policy.mode != DiskPrefixCacheMode::Fixed) return 0;
+    if (policy.fixed_tokens < min_tokens) return 0;
+    return valid_boundary(policy.fixed_tokens, full_len) ? policy.fixed_tokens : 0;
+}
+
+static int lcp_len(const std::vector<int32_t> & a,
+                   const std::vector<int32_t> & b) {
+    const int n = std::min((int)a.size(), (int)b.size());
+    int i = 0;
+    while (i < n && a[(size_t)i] == b[(size_t)i]) i++;
+    return i;
+}
+
+static int floor_to_safe_boundary(int n, const std::vector<int> & safe_boundaries) {
+    if (n <= 0) return 0;
+    if (safe_boundaries.empty()) return n;
+
+    int best = 0;
+    for (int b : safe_boundaries) {
+        if (b > 0 && b <= n) best = std::max(best, b);
+    }
+    return best;
+}
+
+int disk_prefix_cache_auto_boundary(
+    const std::vector<int32_t> & prompt_ids,
+    const std::vector<std::vector<int32_t>> & recent_prompts,
+    int window,
+    const std::vector<int> & safe_boundaries,
+    int min_tokens) {
+    if (prompt_ids.empty() || recent_prompts.empty() || window <= 0) return 0;
+
+    const int n_recent = std::min(window, (int)recent_prompts.size());
+    int common = 0;
+    for (int i = 0; i < n_recent; ++i) {
+        common = std::max(common, lcp_len(prompt_ids, recent_prompts[(size_t)i]));
+    }
+    common = floor_to_safe_boundary(common, safe_boundaries);
+    return common >= min_tokens ? common : 0;
 }
 
 // Little-endian I/O helpers.

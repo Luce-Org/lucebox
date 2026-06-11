@@ -582,6 +582,7 @@ json build_props_body(const ServerConfig & config,
             {"in_use",        pcfs.in_use},
             {"disk_bytes",    pcfs.disk_bytes},
             {"lifetime_hits", pcfs.lifetime_hits},
+            {"disk_policy",   disk_prefix_cache_policy_name(config.disk_cache_policy)},
         }},
         {"tool_replay", {
             {"max_entries",     tms.max_entries},
@@ -1311,6 +1312,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         // Common fields.
         req.stream = body.value("stream", false);
         req.model = body.value("model", config_.model_name);
+        req.disk_cache_policy = config_.disk_cache_policy;
         // Default when client omits all three: use --default-max-tokens
         // (16000, matches ds4_eval.c). Codex review flagged that
         // --default-max-tokens was previously a dead flag because the
@@ -1365,6 +1367,28 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         // Tool choice constraint for hint generation.
         if (body.contains("tool_choice")) {
             req.tool_choice = body["tool_choice"];
+        }
+
+        if (body.contains("prefix_cache") && body["prefix_cache"].is_object()) {
+            const auto & pc = body["prefix_cache"];
+            if (pc.contains("scope") && pc["scope"].is_string()) {
+                DiskPrefixCachePolicy parsed_policy;
+                if (!parse_disk_prefix_cache_policy(pc["scope"].get<std::string>(),
+                                                    parsed_policy)) {
+                    send_error(fd, 400,
+                        "prefix_cache.scope must be off, full, auto, auto:<window>, or a positive token count");
+                    return true;
+                }
+                req.disk_cache_policy = parsed_policy;
+            }
+            if (pc.contains("window") && pc["window"].is_number_integer()) {
+                const int window = pc["window"].get<int>();
+                if (window <= 0 || window > 1000000) {
+                    send_error(fd, 400, "prefix_cache.window must be a positive integer");
+                    return true;
+                }
+                req.disk_cache_policy.auto_window = window;
+            }
         }
 
         // Stop sequences — OpenAI uses "stop" (string or array), Anthropic uses "stop_sequences" (array).
@@ -2087,14 +2111,127 @@ void HttpServer::worker_loop() {
         // so slot 63 is safe as long as total cache slots < 63.
         static constexpr int DISK_STAGING_SLOT = ModelBackend::kMaxSlots - 1;
         bool disk_hit = false;
+        DiskPrefixCachePolicy disk_policy = req.disk_cache_policy;
+        if (pflash_compressed) {
+            // Auto/fixed boundaries are selected against the uncompressed
+            // request stream. Once PFlash rewrites effective_prompt, only
+            // exact full-cache restore remains well-defined.
+            if (disk_policy.mode != DiskPrefixCacheMode::Full) {
+                disk_policy.mode = DiskPrefixCacheMode::Off;
+            }
+        }
+        std::vector<int> safe_boundaries;
+        if (disk_policy.mode == DiskPrefixCacheMode::Auto) {
+            safe_boundaries =
+                find_all_boundaries(effective_prompt, prefix_cache_.chat_markers());
+        }
+        int selected_prefix_boundary = 0;
+        if (disk_policy.mode == DiskPrefixCacheMode::Fixed) {
+            selected_prefix_boundary =
+                disk_prefix_cache_fixed_boundary(
+                    disk_policy, (int)effective_prompt.size(),
+                    config_.disk_cache_min_tokens);
+        } else if (disk_policy.mode == DiskPrefixCacheMode::Auto) {
+            selected_prefix_boundary =
+                disk_prefix_cache_auto_boundary(
+                    effective_prompt, recent_disk_prompts_, disk_policy.auto_window,
+                    safe_boundaries, config_.disk_cache_min_tokens);
+            std::fprintf(stderr,
+                "[disk-cache] auto scope: window=%d recent=%zu safe=%zu selected=%d\n",
+                disk_policy.auto_window,
+                std::min(recent_disk_prompts_.size(), (size_t)disk_policy.auto_window),
+                safe_boundaries.size(), selected_prefix_boundary);
+        }
+        std::vector<int> disk_lookup_lengths;
+        if (disk_policy.mode == DiskPrefixCacheMode::Full &&
+            !effective_prompt.empty()) {
+            disk_lookup_lengths.push_back((int)effective_prompt.size());
+            if ((int)effective_prompt.size() > config_.disk_cache_cold_max_tokens) {
+                auto boundaries =
+                    find_all_boundaries(effective_prompt, prefix_cache_.chat_markers());
+                int cold_boundary = 0;
+                for (int b : boundaries) {
+                    if (b <= config_.disk_cache_cold_max_tokens &&
+                        b >= config_.disk_cache_min_tokens) {
+                        cold_boundary = b;
+                    }
+                }
+                if (cold_boundary > 0 &&
+                    cold_boundary != (int)effective_prompt.size()) {
+                    disk_lookup_lengths.push_back(cold_boundary);
+                }
+            }
+        } else if (selected_prefix_boundary > 0) {
+            disk_lookup_lengths.push_back(selected_prefix_boundary);
+        } else if (disk_policy.mode == DiskPrefixCacheMode::Auto) {
+            for (auto it = safe_boundaries.rbegin(); it != safe_boundaries.rend(); ++it) {
+                const int b = *it;
+                if (b >= config_.disk_cache_min_tokens &&
+                    b <= (int)effective_prompt.size()) {
+                    disk_lookup_lengths.push_back(b);
+                }
+            }
+        }
         if (!using_restore && !disk_cache_.disabled()) {
-            if (disk_cache_.lookup(effective_prompt, DISK_STAGING_SLOT)) {
-                cache_slot = DISK_STAGING_SLOT;
-                prefix_len = backend_.snapshot_cur_pos(DISK_STAGING_SLOT);
-                using_restore = true;
-                disk_hit = true;
-                std::fprintf(stderr, "[disk-cache] hit, loaded to slot=%d pos=%d\n",
-                             DISK_STAGING_SLOT, prefix_len);
+            for (int lookup_len : disk_lookup_lengths) {
+                std::vector<int32_t> prefix_tokens(
+                    effective_prompt.begin(), effective_prompt.begin() + lookup_len);
+                if (disk_cache_.lookup(prefix_tokens, DISK_STAGING_SLOT)) {
+                    cache_slot = DISK_STAGING_SLOT;
+                    prefix_len = backend_.snapshot_cur_pos(DISK_STAGING_SLOT);
+                    if (prefix_len <= 0 || prefix_len > (int)effective_prompt.size()) {
+                        std::fprintf(stderr,
+                            "[disk-cache] ignoring invalid hit pos=%d prompt=%zu\n",
+                            prefix_len, effective_prompt.size());
+                        backend_.snapshot_free(DISK_STAGING_SLOT);
+                        continue;
+                    }
+                    using_restore = true;
+                    disk_hit = true;
+                    std::fprintf(stderr,
+                        "[disk-cache] hit policy=%s len=%d slot=%d pos=%d\n",
+                        disk_prefix_cache_policy_name(disk_policy).c_str(), lookup_len,
+                        DISK_STAGING_SLOT, prefix_len);
+                    break;
+                }
+            }
+        }
+
+        // Scoped prefix save: auto/fixed modes prefill exactly to the
+        // selected token boundary and save that snapshot.
+        // This keeps the disk key and snapshot position aligned; unlike the
+        // legacy full-prompt key path, scoped entries must not point at a
+        // longer snapshot than their token hash covers.
+        if (!using_restore && !disk_cache_.disabled() &&
+            selected_prefix_boundary > 0) {
+            const int scoped_boundary = selected_prefix_boundary;
+            if (scoped_boundary > 0) {
+                std::fprintf(stderr,
+                    "[disk-cache] scoped prefix: policy=%s boundary=%d\n",
+                    disk_prefix_cache_policy_name(disk_policy).c_str(), scoped_boundary);
+                GenerateRequest scoped_req;
+                scoped_req.prompt = std::vector<int32_t>(
+                    effective_prompt.begin(), effective_prompt.begin() + scoped_boundary);
+                scoped_req.n_gen = 0;
+                scoped_req.snap_slot = DISK_STAGING_SLOT;
+                scoped_req.snap_pos = scoped_boundary;
+                DaemonIO scoped_io;
+                scoped_io.stream_fd = -1;
+                auto scoped_result = backend_.generate(scoped_req, scoped_io);
+                if (scoped_result.ok && backend_.snapshot_used(DISK_STAGING_SLOT)) {
+                    disk_cache_.learn_layout(DISK_STAGING_SLOT);
+                    const bool saved =
+                        disk_cache_.save(DISK_STAGING_SLOT, scoped_req.prompt);
+                    cache_slot = DISK_STAGING_SLOT;
+                    prefix_len = scoped_boundary;
+                    using_restore = true;
+                    disk_hit = true;
+                    std::fprintf(stderr,
+                        "[disk-cache] scoped prefix %s, restoring from %d\n",
+                        saved ? "saved" : "staged", scoped_boundary);
+                } else {
+                    backend_.snapshot_free(DISK_STAGING_SLOT);
+                }
             }
         }
 
@@ -2102,7 +2239,8 @@ void HttpServer::worker_loop() {
         // turn boundary and save a cold checkpoint before the full generation.
         // This makes subsequent requests to similar (but not identical) prompts
         // much faster by reusing the cold prefix.
-        if (!using_restore && !disk_cache_.disabled()) {
+        if (!using_restore && !disk_cache_.disabled() &&
+            disk_policy.mode == DiskPrefixCacheMode::Full) {
             auto boundaries = find_all_boundaries(effective_prompt, prefix_cache_.chat_markers());
             int cold_boundary = disk_cache_.cold_prefix_boundary(effective_prompt, boundaries);
             if (cold_boundary > 0) {
@@ -2146,13 +2284,15 @@ void HttpServer::worker_loop() {
 
         std::fprintf(stderr,
             "[server] chat CACHE %s restore=%s slot=%d prefix_len=%d "
-            "effective_prompt=%zu pflash=%s disk_hit=%s snap_slot=%d snap_pos=%d\n",
+            "effective_prompt=%zu pflash=%s disk_policy=%s disk_hit=%s "
+            "snap_slot=%d snap_pos=%d\n",
             req.response_id.c_str(),
             using_restore ? "true" : "false",
             cache_slot,
             prefix_len,
             effective_prompt.size(),
             pflash_compressed ? "true" : "false",
+            disk_prefix_cache_policy_name(disk_policy).c_str(),
             disk_hit ? "true" : "false",
             snap_slot,
             snap_cut);
@@ -2331,7 +2471,9 @@ void HttpServer::worker_loop() {
                 // Save to disk cache if threshold met.
                 if (!disk_cache_.disabled()) {
                     disk_cache_.learn_layout(snap_slot);
-                    disk_cache_.save(snap_slot, effective_prompt);
+                    if (disk_policy.mode == DiskPrefixCacheMode::Full) {
+                        disk_cache_.save(snap_slot, effective_prompt);
+                    }
                 }
             } else {
                 prefix_cache_.abort_inline_snap(snap_slot);
@@ -2345,7 +2487,8 @@ void HttpServer::worker_loop() {
 
         // Continued checkpoint: save if total tokens crossed an interval boundary.
         // This captures prompt + all generated tokens for long conversation reuse.
-        if (!disk_cache_.disabled() && result.ok && completion_tokens > 0 &&
+        if (!disk_cache_.disabled() && disk_policy.mode == DiskPrefixCacheMode::Full &&
+            result.ok && completion_tokens > 0 &&
             visible_output_seen && !client_disconnected) {
             int final_pos = (int)effective_prompt.size() + (int)result.tokens.size();
             if (final_pos >= disk_cache_.continued_interval()) {
@@ -2358,6 +2501,14 @@ void HttpServer::worker_loop() {
                     disk_cache_.maybe_store_continued(DISK_STAGING_SLOT, all_tokens, final_pos);
                     backend_.snapshot_free(DISK_STAGING_SLOT);
                 }
+            }
+        }
+
+        if (!disk_cache_.disabled() && !pflash_compressed) {
+            recent_disk_prompts_.insert(recent_disk_prompts_.begin(), effective_prompt);
+            static constexpr size_t kMaxRecentDiskPrompts = 256;
+            if (recent_disk_prompts_.size() > kMaxRecentDiskPrompts) {
+                recent_disk_prompts_.resize(kMaxRecentDiskPrompts);
             }
         }
 

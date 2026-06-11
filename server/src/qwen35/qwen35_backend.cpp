@@ -966,6 +966,19 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         start += n_tokens;
     }
 
+    // End-of-prefill snapshot: scoped disk-cache saves (auto/fixed policy)
+    // request snap_pos == prompt end, which never falls inside a chunk so the
+    // boundary branch above cannot fire. Taking the snapshot here changes
+    // nothing about the prefill computation; it only persists the final state
+    // (cache_.cur_pos == committed).
+    if (snap_slot >= 0 && snap_pos == committed) {
+        if (snapshot_save(snap_slot)) {
+            std::printf("[snap] end-of-prefill slot=%d cur_pos=%d\n",
+                        snap_slot, committed);
+            std::fflush(stdout);
+        }
+    }
+
     return committed;
 }
 

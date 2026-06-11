@@ -273,6 +273,11 @@ static void print_usage(const char * prog) {
         "  --kv-cache-min-tokens <N>   Min tokens to persist (default: 512)\n"
         "  --kv-cache-interval <N>     Continued checkpoint every N tokens (default: 10240)\n"
         "  --kv-cache-cold-max <N>     Cold prefix for prompts longer than N tokens (default: 10240)\n"
+        "  --disk-prefix-cache off|full|auto|auto:N|N\n"
+        "                              Default disk prefix-cache policy (default: full).\n"
+        "                              auto compares recent requests to select a stable\n"
+        "                              prefix; auto:N uses the last N requests.\n"
+        "                              A plain N caches the first N prompt tokens.\n"
         "\n"
         "Chat template (optional, e.g. froggeric Qwen3.6 template for tool-using\n"
         "agents that need the Anthropic tool_use envelope):\n"
@@ -533,6 +538,14 @@ int main(int argc, char ** argv) {
             sconfig.disk_cache_continued_interval = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--kv-cache-cold-max") == 0 && i + 1 < argc) {
             sconfig.disk_cache_cold_max_tokens = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--disk-prefix-cache") == 0 && i + 1 < argc) {
+            DiskPrefixCachePolicy policy;
+            if (!parse_disk_prefix_cache_policy(argv[++i], policy)) {
+                std::fprintf(stderr,
+                    "[server] --disk-prefix-cache must be off, full, auto, auto:<window>, or a positive token count\n");
+                return 2;
+            }
+            sconfig.disk_cache_policy = policy;
         } else if (std::strcmp(argv[i], "--cache-type-k") == 0 && i + 1 < argc) {
             cache_type_k = argv[++i];
         } else if (std::strcmp(argv[i], "--cache-type-v") == 0 && i + 1 < argc) {
