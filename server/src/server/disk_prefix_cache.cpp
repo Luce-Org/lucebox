@@ -116,6 +116,18 @@ bool parse_disk_prefix_cache_policy(const std::string & value,
     return false;
 }
 
+bool apply_request_scope_override(DiskPrefixCachePolicy & server_policy,
+                                  const std::string & scope_str) {
+    DiskPrefixCachePolicy parsed;
+    if (!parse_disk_prefix_cache_policy(scope_str, parsed)) {
+        return false;
+    }
+    // Preserve server-level flags (e.g. compress) across the scope override.
+    parsed.compress = server_policy.compress;
+    server_policy = parsed;
+    return true;
+}
+
 static bool valid_boundary(int n, int full_len) {
     return n > 0 && n <= full_len;
 }

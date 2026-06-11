@@ -55,6 +55,43 @@ static void test_one_over_limit_with_compression_accepts() {
     TEST_ASSERT(!should_reject_oversized(1025, 0, 1024, true));
 }
 
+// ── effective_prompt_overflows tests ───────────────────────────────────────
+
+// (a) FlowKV-compressed request, effective_tokens already within budget → no reject.
+static void test_effective_overflows_compressed_within_budget() {
+    // raw=50000, after FlowKV effective=5000, max_output=2048, max_ctx=65536
+    TEST_ASSERT(!effective_prompt_overflows(5000, 0, 2048, 65536));
+}
+
+// (b) BUG-B: raw-oversized request that is a pFlash full-cache hit (served_from_cache
+//     tokens=800 which fits) must NOT be rejected.
+// This is THE BUG: current code uses effective_tokens (raw=70000) and rejects.
+static void test_effective_overflows_full_cache_hit_uses_served_size() {
+    // raw prompt = 70000 tokens, but full-cache hit stores only 800 compressed tokens.
+    // max_output=2048, max_ctx=65536.
+    // Served size 800 + 2048 = 2848 <= 65536 → must NOT overflow.
+    // BUG: current implementation ignores served size → returns true (false reject).
+    TEST_ASSERT(!effective_prompt_overflows(70000, 800, 2048, 65536));
+}
+
+// (c) Genuinely oversized post-compress, no cache hit → reject.
+static void test_effective_overflows_post_compress_genuinely_oversized() {
+    // effective=60000, max_output=10000, max_ctx=65536 → 70000 > 65536 → reject.
+    TEST_ASSERT(effective_prompt_overflows(60000, 0, 10000, 65536));
+}
+
+// (d) Verbatim turn-1 within budget → no reject.
+static void test_effective_overflows_verbatim_within_budget() {
+    // effective=1000, no cache, max_output=2048, max_ctx=65536 → accept.
+    TEST_ASSERT(!effective_prompt_overflows(1000, 0, 2048, 65536));
+}
+
+// (e) Full-cache hit but served size + max_output itself overflows → reject.
+static void test_effective_overflows_full_cache_hit_still_too_large() {
+    // served=60000, max_output=10000, max_ctx=65536 → 70000 > 65536 → reject.
+    TEST_ASSERT(effective_prompt_overflows(200000, 60000, 10000, 65536));
+}
+
 int main() {
     std::fprintf(stderr, "=== test_admission ===\n");
     RUN_TEST(test_small_prompt_no_compression_accepts);
@@ -63,6 +100,11 @@ int main() {
     RUN_TEST(test_exactly_at_limit_accepts);
     RUN_TEST(test_one_over_limit_no_compression_rejects);
     RUN_TEST(test_one_over_limit_with_compression_accepts);
+    RUN_TEST(test_effective_overflows_compressed_within_budget);
+    RUN_TEST(test_effective_overflows_full_cache_hit_uses_served_size);
+    RUN_TEST(test_effective_overflows_post_compress_genuinely_oversized);
+    RUN_TEST(test_effective_overflows_verbatim_within_budget);
+    RUN_TEST(test_effective_overflows_full_cache_hit_still_too_large);
     std::fprintf(stderr, "\n%d tests, %d failures\n", test_count, test_failures);
     return (test_failures == 0) ? 0 : 1;
 }

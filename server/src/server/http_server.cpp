@@ -1374,14 +1374,12 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         if (body.contains("prefix_cache") && body["prefix_cache"].is_object()) {
             const auto & pc = body["prefix_cache"];
             if (pc.contains("scope") && pc["scope"].is_string()) {
-                DiskPrefixCachePolicy parsed_policy;
-                if (!parse_disk_prefix_cache_policy(pc["scope"].get<std::string>(),
-                                                    parsed_policy)) {
+                if (!apply_request_scope_override(req.disk_cache_policy,
+                                                  pc["scope"].get<std::string>())) {
                     send_error(fd, 400,
                         "prefix_cache.scope must be off, full, auto, auto:<window>, or a positive token count");
                     return true;
                 }
-                req.disk_cache_policy = parsed_policy;
             }
             if (pc.contains("window") && pc["window"].is_number_integer()) {
                 const int window = pc["window"].get<int>();
@@ -1796,6 +1794,8 @@ void HttpServer::worker_loop() {
         // ── PFlash / FlowKV unified gate: FlowKV > WS1 skip > whole-prompt pFlash ──
         std::vector<int32_t> effective_prompt = req.prompt_tokens;
         bool pflash_compressed = false;
+        // Compressed token count served from pFlash full-cache (0 = not a full-cache hit).
+        int pflash_full_cache_served_tokens = 0;
 
         if (config_.pflash_mode != ServerConfig::PflashMode::OFF &&
             drafter_tokenizer_ != nullptr)
@@ -2044,6 +2044,8 @@ void HttpServer::worker_loop() {
                     pflash_compressed = true;
                     // effective_prompt stays as req.prompt_tokens — the cached KV
                     // state will be restored via cache_slot below.
+                    // Record the compressed size for the post-compress budget gate.
+                    pflash_full_cache_served_tokens = full_len;
                 } else {
                     std::string compression_error;
                     // 1. Decode prompt to text using target tokenizer
@@ -2172,7 +2174,11 @@ void HttpServer::worker_loop() {
         }
 
         // Post-compress gate: reject if still oversized after FlowKV/pFlash.
-        if ((int)effective_prompt.size() + req.max_output > config_.max_ctx) {
+        // On a pFlash full-cache hit, use the cached compressed size (not the raw
+        // effective_prompt) — the KV was built from the compressed form.
+        if (effective_prompt_overflows((int)effective_prompt.size(),
+                                       pflash_full_cache_served_tokens,
+                                       req.max_output, config_.max_ctx)) {
             fail_request(400, "effective prompt + max_tokens exceeds context window after compression");
             continue;
         }

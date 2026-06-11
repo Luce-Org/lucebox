@@ -2159,6 +2159,48 @@ static void test_disk_cache_policy_parse() {
     TEST_ASSERT(!parse_disk_prefix_cache_policy("auto:0", policy));
 }
 
+// BUG-A: apply_request_scope_override must preserve server-level compress flag.
+// A request-level scope override (e.g. "auto") must NOT clear compress=true
+// that was set by the server configuration.
+static void test_scope_override_preserves_compress() {
+    // Server policy: compress=true, mode=Full.
+    DiskPrefixCachePolicy server;
+    server.mode = DiskPrefixCacheMode::Full;
+    server.compress = true;
+
+    // Request sends scope="auto" — should change mode but keep compress.
+    TEST_ASSERT(apply_request_scope_override(server, "auto"));
+    TEST_ASSERT(server.mode == DiskPrefixCacheMode::Auto);
+    TEST_ASSERT_MSG(server.compress,
+        "BUG-A: scope override dropped server-level compress=true");
+
+    // Same with a fixed-token scope.
+    DiskPrefixCachePolicy server2;
+    server2.mode = DiskPrefixCacheMode::Full;
+    server2.compress = true;
+    TEST_ASSERT(apply_request_scope_override(server2, "1000"));
+    TEST_ASSERT(server2.mode == DiskPrefixCacheMode::Fixed);
+    TEST_ASSERT(server2.fixed_tokens == 1000);
+    TEST_ASSERT_MSG(server2.compress,
+        "BUG-A: fixed-token scope override dropped server-level compress=true");
+
+    // scope="off" must also preserve compress flag.
+    DiskPrefixCachePolicy server3;
+    server3.compress = true;
+    TEST_ASSERT(apply_request_scope_override(server3, "off"));
+    TEST_ASSERT(server3.mode == DiskPrefixCacheMode::Off);
+    TEST_ASSERT_MSG(server3.compress,
+        "BUG-A: off scope override dropped server-level compress=true");
+
+    // Invalid scope string must return false and leave policy unchanged.
+    DiskPrefixCachePolicy server4;
+    server4.compress = true;
+    server4.mode = DiskPrefixCacheMode::Full;
+    TEST_ASSERT(!apply_request_scope_override(server4, "core"));
+    TEST_ASSERT(server4.compress);
+    TEST_ASSERT(server4.mode == DiskPrefixCacheMode::Full);
+}
+
 static void test_disk_cache_fixed_boundary() {
     DiskPrefixCachePolicy policy;
     TEST_ASSERT(parse_disk_prefix_cache_policy("1000", policy));
@@ -3944,6 +3986,7 @@ int main() {
     std::fprintf(stderr, "\n── Disk prefix cache ──\n");
     RUN_TEST(test_disk_cache_config_defaults);
     RUN_TEST(test_disk_cache_policy_parse);
+    RUN_TEST(test_scope_override_preserves_compress);
     RUN_TEST(test_disk_cache_fixed_boundary);
     RUN_TEST(test_disk_cache_auto_boundary_lcp);
     RUN_TEST(test_disk_cache_auto_window_limits_history);
