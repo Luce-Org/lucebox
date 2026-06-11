@@ -891,7 +891,8 @@ if(DFLASH27B_TESTS)
             test/scenario_store.cpp
             test/stub_model_backend.cpp
             src/server/http_server.cpp
-            src/server/model_card.cpp)
+            src/server/model_card.cpp
+            src/server/prompt_normalize.cpp)
         target_include_directories(replay_http_server PRIVATE
             ${DFLASH27B_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/test
