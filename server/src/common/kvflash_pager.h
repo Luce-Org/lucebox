@@ -478,6 +478,13 @@ inline bool kvflash_policy_is_lru() {
     return env && std::strcmp(env, "lru") == 0;
 }
 
+// "qk": target-QK residency scoring (kvflash_qk.h) — pooled post-RoPE keys
+// vs the current decode query, no drafter involved.
+inline bool kvflash_policy_is_qk() {
+    const char * env = std::getenv("DFLASH_KVFLASH_POLICY");
+    return env && std::strcmp(env, "qk") == 0;
+}
+
 // Locate the Qwen3-0.6B residency drafter: the explicit override
 // (DFLASH_KVFLASH_DRAFTER, set from --prefill-drafter), then the
 // well-known locations next to the target model, then the appliance path.

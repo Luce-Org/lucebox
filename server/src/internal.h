@@ -367,6 +367,11 @@ struct TargetCache {
     // cast (ggml_get_to_fp32_cuda).
     ggml_tensor * target_feat = nullptr;
     int target_feat_cap = 0;
+
+    // KVFlash target-QK scorer: last token's post-RoPE (and post-FWHT when
+    // kv_k_rotated) query per full-attention layer, written by the graph
+    // when QwenGraphInputs::q_capture is set. F32 [head_dim, n_head, n_fa].
+    ggml_tensor * q_cap = nullptr;
 };
 
 // Snapshot the current SSM+conv state into TargetCache::*_snap tensors.
@@ -554,6 +559,10 @@ struct QwenGraphInputs {
     ggml_tensor * parent_ids = nullptr; // [n_tokens] i32; tree mode when non-null
     // [n_tokens,n_head_kv] i64; non-null = step-invariant KV write via ggml_set_rows (carries kv_start).
     ggml_tensor * kv_write_rows = nullptr;
+    // Capture the LAST token's post-RoPE/post-rotation Q per full-attention
+    // layer into cache.q_cap (KVFlash target-QK scorer). Step-invariant:
+    // node properties depend only on n_tokens and the layer index.
+    bool q_capture = false;
 };
 
 struct QwenGraphOutputs {

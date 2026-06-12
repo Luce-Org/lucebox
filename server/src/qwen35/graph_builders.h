@@ -91,7 +91,8 @@ bool build_target_step(
     bool last_token_logits_only = false,
     int kq_stride_pad = KQ_MASK_PAD,
     bool capture_moe_router = false,
-    bool kvflash_mask = false);
+    bool kvflash_mask = false,
+    bool capture_qk = false);
 
 // Full target forward: DDTree tree-verify mode.
 bool build_target_step_tree(

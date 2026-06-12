@@ -24,6 +24,7 @@
 #include "dflash27b.h"
 #include "internal.h"
 #include "kvflash_pager.h"
+#include "kvflash_qk.h"
 #include "attn_masks.h"
 #include "qwen3_drafter.h"
 #include "qwen3_kvflash_scorer.h"
@@ -88,6 +89,7 @@ struct Stepper {
     ggml_backend_t backend = nullptr;
     int span = 0;
     bool with_mask = false;
+    bool q_capture = false;   // write last token's per-layer post-RoPE Q to cache.q_cap
 
     std::vector<uint8_t> arena;
     std::vector<float> embed_buf;
@@ -97,9 +99,9 @@ struct Stepper {
     int mask_fills = 0;
 
     bool init(const TargetWeights & tw, TargetCache & tc, ggml_backend_t be,
-              int span_, bool with_mask_) {
+              int span_, bool with_mask_, bool q_capture_ = false) {
         w = &tw; cache = &tc; backend = be;
-        span = span_; with_mask = with_mask_;
+        span = span_; with_mask = with_mask_; q_capture = q_capture_;
         embed_buf.resize(tw.n_embd);
         arena.resize((size_t)512 * 1024 * 1024);
         return build();
@@ -146,6 +148,7 @@ struct Stepper {
         gi.kv_start       = span - 1;
         gi.capture_layers = false;
         gi.kv_write_rows  = kv_write_rows;
+        gi.q_capture      = q_capture;
 
         QwenGraphOutputs go = build_qwen35_graph(ctx, gf, *w, *cache, gi);
         if (!go.logits) return false;
@@ -365,6 +368,44 @@ bool arg_flag(int argc, char ** argv, const char * key) {
     return false;
 }
 
+const char * arg_str(int argc, char ** argv, const char * key, const char * defv) {
+    const size_t kl = std::strlen(key);
+    for (int i = 2; i < argc; i++) {
+        if (std::strncmp(argv[i], key, kl) == 0 && argv[i][kl] == '=') {
+            return argv[i] + kl + 1;
+        }
+    }
+    return defv;
+}
+
+// Real-content filler: raw little-endian i32 token stream. Ids are folded
+// below 100000 (drafter-scoreable, same fold as KvFlashDrafterScorer /
+// make_prompt). If the file is shorter than n, the remainder is synthetic.
+std::vector<int32_t> load_token_stream(const char * path, int n, int vocab) {
+    std::vector<int32_t> out;
+    if (std::FILE * f = std::fopen(path, "rb")) {
+        std::fseek(f, 0, SEEK_END);
+        const long bytes = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        out.resize(std::min<long>(bytes / 4, n));
+        if (!out.empty() && std::fread(out.data(), 4, out.size(), f) != out.size()) {
+            out.clear();
+        }
+        std::fclose(f);
+    }
+    const size_t real_n = out.size();
+    for (auto & t : out) {
+        if (t < 0 || t >= 100000) t = 1000 + (t < 0 ? -t : t) % 99000;
+    }
+    if ((int)out.size() < n) {
+        auto pad = make_prompt(n - (int)out.size(), vocab);
+        out.insert(out.end(), pad.begin(), pad.end());
+    }
+    std::printf("[qkbench] filler: %zu real tokens from %s + %d synthetic\n",
+                real_n, path, n - (int)real_n);
+    return out;
+}
+
 struct StepTimes {
     double p50 = 0, p95 = 0, mean = 0;
 };
@@ -417,6 +458,225 @@ int main(int argc, char ** argv) {
     }
     std::printf("[load] weights ok, vram_used=%.1f MiB\n",
                 (vram_used_now() - vram0) / 1048576.0);
+
+    // ── --qkbench: LRU vs drafter vs target-QK residency policies ───
+    // Adopt-vs-build decision bench (optimizations/msa-sm86/PLAN.md pivot):
+    // per cell {L, pool, arm} measure prefill wall, one-shot rescore cost,
+    // decode tok/s (240-token free run), needle /16 (longab methodology,
+    // depth 0.25) and a 4-fact cold-history retrieval probe with decoys
+    // (exact-token recall /16 each + whether the gold chunks paged in).
+    // Filler is a REAL token stream (--qk-tokens) padded synthetically.
+    // Run ONE cell per process (--qk-L/--qk-pool/--qk-arm): the CUDA VMM
+    // pool grows monotonically across large-cache configs.
+    if (arg_flag(argc, argv, "--qkbench")) {
+        const int  L    = arg_int(argc, argv, "--qk-L", 65536);
+        const int  pool = arg_int(argc, argv, "--qk-pool", 4096);
+        const char * arm = arg_str(argc, argv, "--qk-arm", "qk");   // lru|drafter|qk
+        const char * tok_path = arg_str(argc, argv, "--qk-tokens",
+            "/tmp/lsa-msa-64k/goldgate_xl.turn10.65536.tokens.i32");
+        const bool is_drafter = std::strcmp(arm, "drafter") == 0;
+        const bool is_qk      = std::strcmp(arm, "qk") == 0;
+
+        DrafterContext dctx;
+        KvFlashDrafterScorer dscorer(&dctx);
+        if (is_drafter) {
+            const char * dpath = arg_str(argc, argv, "--qk-drafter",
+                "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf");
+            if (!load_drafter(dpath, 0, dctx)) {
+                std::fprintf(stderr, "drafter load failed\n");
+                return 1;
+            }
+            // Reserve drafter compute buffers before cache churn fragments
+            // the CUDA pool (same warmup as --niah).
+            std::vector<int32_t> warm(33024, 1234);
+            std::vector<float> tmp;
+            dscorer.score_chunks(warm, 64, tmp);
+        }
+
+        auto prompt = load_token_stream(tok_path, L, w.n_vocab);
+
+        // Needle (longab methodology): 48 seeded tokens at depth 0.25.
+        std::vector<int32_t> needle(48);
+        {
+            uint64_t ns = 0xDEADBEEFCAFEull;
+            for (int i = 0; i < 48; i++) {
+                ns = ns * 6364136223846793005ull + 1442695040888963407ull;
+                needle[i] = (int32_t)(1000 + (ns >> 33) % 49000);
+            }
+            const int npos = ((int)(0.25 * (L - 512)) / 32) * 32;
+            for (int i = 0; i < 48; i++) prompt[npos + i] = needle[i];
+        }
+
+        // 4 facts + 4 decoys. A decoy shares the fact's first 16 tokens and
+        // diverges after — retrieval must discriminate continuations, not
+        // just prefix-match. Gold = the fact's chunks; query = first 32.
+        constexpr int NF = 4;
+        const double fact_depth[NF]  = {0.10, 0.40, 0.60, 0.85};
+        const double decoy_depth[NF] = {0.17, 0.47, 0.67, 0.92};
+        std::vector<std::vector<int32_t>> fact(NF), decoy(NF);
+        int fact_pos[NF], decoy_pos[NF];
+        for (int fidx = 0; fidx < NF; fidx++) {
+            uint64_t s = 0xF00DF00DULL + (uint64_t)fidx * 0x9E3779B97F4A7C15ull;
+            fact[fidx].resize(48);
+            decoy[fidx].resize(48);
+            for (int i = 0; i < 48; i++) {
+                s = s * 6364136223846793005ull + 1442695040888963407ull;
+                fact[fidx][i] = (int32_t)(1000 + (s >> 33) % 49000);
+            }
+            for (int i = 0; i < 16; i++) decoy[fidx][i] = fact[fidx][i];
+            for (int i = 16; i < 48; i++) {
+                s = s * 6364136223846793005ull + 1442695040888963407ull;
+                decoy[fidx][i] = (int32_t)(1000 + (s >> 33) % 49000);
+            }
+            fact_pos[fidx]  = ((int)(fact_depth[fidx]  * (L - 512)) / 32) * 32;
+            decoy_pos[fidx] = ((int)(decoy_depth[fidx] * (L - 512)) / 32) * 32;
+            for (int i = 0; i < 48; i++) prompt[fact_pos[fidx]  + i] = fact[fidx][i];
+            for (int i = 0; i < 48; i++) prompt[decoy_pos[fidx] + i] = decoy[fidx][i];
+        }
+
+        // ── Cache + pager + (qk) key pool ────────────────────────────
+        TargetCache cache;
+        if (!create_target_cache(w, pool, 0, backend, cache, true)) return 1;
+        KvFlashPager pager;
+        KvFlashConfig pc; pc.pool_tokens = pool;
+        if (!pager.attach(pc, cache.attn_k, cache.attn_v)) return 1;
+
+        KvFlashQkPool qkpool;
+        KvFlashQkDims qd;
+        qd.n_layers = (int)cache.attn_k.size();
+        qd.n_q_heads = w.n_head; qd.n_kv_heads = w.n_head_kv;
+        qd.head_dim = w.n_embd_head_k;
+        qkpool.reset(qd);
+        KvFlashTargetQkScorer qscorer(&qkpool);
+
+        // ── Prefill (pooled, 64-token chunks); qk pools keys at seal ──
+        double t0 = now_ms();
+        BatchStepper bs;
+        if (!bs.init(w, cache, backend, pool)) return 1;
+        for (int p = 0; p < L; p += 64) {
+            bs.step_chunk(prompt.data() + p, p, pager);
+            if (is_qk) {
+                const int c = p / 64;
+                if (!qkpool.pool_chunk(cache.attn_k, pager.block_of(c), 64, c)) {
+                    std::fprintf(stderr, "[qkbench] pool_chunk failed @chunk %d\n", c);
+                    return 1;
+                }
+            }
+        }
+        bs.destroy();
+        const double prefill_s = (now_ms() - t0) / 1000.0;
+
+        Stepper st;
+        if (!st.init(w, cache, backend, pool, /*with_mask=*/true, /*q_capture=*/is_qk)) return 1;
+        std::vector<int32_t> hist = prompt;   // drafter arm history
+        int cur = L;
+        std::vector<float> scores;
+        double rescore_s_total = 0.0;
+        int    rescore_n = 0;
+
+        auto feed = [&](int32_t tok) -> int32_t {
+            const int slot = pager.slot_for(cur);
+            st.refresh_mask(pager);
+            const int32_t next = st.step(tok, cur, slot);
+            hist.push_back(tok);
+            cur++;
+            // keep qk pooled keys current as decode seals chunks
+            if (is_qk && cur % 64 == 0) {
+                const int c = cur / 64 - 1;
+                if (!qkpool.has(c)) qkpool.pool_chunk(cache.attn_k, pager.block_of(c), 64, c);
+            }
+            return next;
+        };
+
+        // Arm-specific rescore + reselect (timed). LRU arm: no-op.
+        auto reselect_arm = [&]() -> double {
+            const double r0 = now_ms();
+            bool ok = false;
+            if (is_drafter) {
+                ok = dscorer.score_chunks(hist, pc.chunk_tokens, scores);
+            } else if (is_qk) {
+                std::vector<float> q((size_t)ggml_nelements(cache.q_cap));
+                ggml_backend_tensor_get(cache.q_cap, q.data(), 0, q.size() * sizeof(float));
+                qscorer.set_query(q.data(), q.size());
+                ok = qscorer.score_chunks(hist, pc.chunk_tokens, scores);
+            }
+            if (ok) {   // lru arm: intentional no-op (ok stays false)
+                pager.score_hook = [&scores](int c) {
+                    return c < (int)scores.size() ? scores[c] : 1e30f;
+                };
+                pager.reselect();
+                pager.score_hook = nullptr;
+            }
+            const double r_s = (now_ms() - r0) / 1000.0;
+            rescore_s_total += r_s;
+            rescore_n++;
+            return r_s;
+        };
+
+        auto chunks_resident = [&](int pos0, int n_tok) {
+            int res = 0, tot = 0;
+            for (int c = pos0 / 64; c <= (pos0 + n_tok - 1) / 64; c++) {
+                tot++;
+                if (pager.is_resident(c)) res++;
+            }
+            return std::pair<int,int>(res, tot);
+        };
+
+        // ── Needle probe (their /16) ──────────────────────────────────
+        int32_t next = -1;
+        for (int i = 0; i < 32; i++) next = feed(needle[i]);
+        const double needle_rescore_s = reselect_arm();
+        int needle_match = 0;
+        for (int i = 0; i < 16; i++) {
+            if (next == needle[32 + i]) needle_match++;
+            next = feed(needle[32 + i]);
+        }
+        const auto needle_res = chunks_resident(((int)(0.25 * (L - 512)) / 32) * 32, 48);
+
+        // ── Timed free run (decode tok/s) ─────────────────────────────
+        t0 = now_ms();
+        for (int i = 0; i < 240; i++) next = feed(next);
+        const double tok_s = 240.0 / ((now_ms() - t0) / 1000.0);
+
+        // ── Fact probes ───────────────────────────────────────────────
+        int fact_match_total = 0, gold_res_total = 0, gold_tot_total = 0;
+        int fact_match[NF];
+        for (int fidx = 0; fidx < NF; fidx++) {
+            for (int i = 0; i < 32; i++) next = feed(fact[fidx][i]);
+            reselect_arm();
+            const auto gr = chunks_resident(fact_pos[fidx], 48);
+            gold_res_total += gr.first;
+            gold_tot_total += gr.second;
+            fact_match[fidx] = 0;
+            for (int i = 0; i < 16; i++) {
+                if (next == fact[fidx][32 + i]) fact_match[fidx]++;
+                next = feed(fact[fidx][32 + i]);
+            }
+            fact_match_total += fact_match[fidx];
+        }
+
+        const auto & ps = pager.stats();
+        std::printf("\n[qkbench] L=%d pool=%d arm=%s\n", L, pool, arm);
+        std::printf("QKBENCH %-7d %-6d %-8s prefill_s=%-8.1f needle_rescore_s=%-7.2f "
+                    "rescore_mean_s=%-7.2f dec_tok_s=%-6.1f needle=%d/16 "
+                    "needle_gold_res=%d/%d facts=%d/64 [%d,%d,%d,%d] "
+                    "gold_res=%d/%d page_outs=%" PRId64 " page_ins=%" PRId64 "\n",
+                    L, pool, arm, prefill_s, needle_rescore_s,
+                    rescore_n ? rescore_s_total / rescore_n : 0.0, tok_s,
+                    needle_match, needle_res.first, needle_res.second,
+                    fact_match_total,
+                    fact_match[0], fact_match[1], fact_match[2], fact_match[3],
+                    gold_res_total, gold_tot_total,
+                    ps.page_outs, ps.page_ins);
+        std::fflush(stdout);
+
+        st.destroy();
+        free_target_cache(cache);
+        if (dctx.loaded) free_drafter(dctx);
+        free_target_weights(w);
+        ggml_backend_free(backend);
+        return 0;
+    }
 
     // ── --longab: end-to-end long-prompt A/B (speed + accuracy) ─────
     // For L in {32K, 64K, 128K}: full-cache baseline vs pool-4096 with

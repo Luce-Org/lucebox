@@ -254,7 +254,8 @@ bool build_target_step(
     bool last_token_logits_only,
     int kq_stride_pad,
     bool capture_moe_router,
-    bool kvflash_mask) {
+    bool kvflash_mask,
+    bool capture_qk) {
     step_graph_free(sg);
 
     // Persistent thread_local arena: rebuilt step graphs land at identical
@@ -333,6 +334,7 @@ bool build_target_step(
     gi.fa_window                  = fa_window;
     gi.last_token_logits_only     = last_token_logits_only;
     gi.kv_write_rows              = sg.kv_write_rows;
+    gi.q_capture                  = capture_qk;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;

@@ -146,7 +146,7 @@ bool create_target_cache_partial(const TargetWeights & w,
 
     // ── Base context: KV cache + SSM/conv state + target_feat ────────
     {
-        const int base_tensors = 2 * n_full_attn + 2 * n_delta + 1;
+        const int base_tensors = 2 * n_full_attn + 2 * n_delta + 2;
         ggml_init_params ip{};
         ip.mem_size   = (size_t)(base_tensors + 16) * ggml_tensor_overhead();
         ip.mem_buffer = nullptr;
@@ -199,6 +199,12 @@ bool create_target_cache_partial(const TargetWeights & w,
         } else {
             out.target_feat = nullptr;
         }
+
+        // KVFlash target-QK query capture (~393 KB at 256*24*16 f32):
+        // always allocated; written only when QwenGraphInputs::q_capture.
+        out.q_cap = ggml_new_tensor_3d(out.base_ctx, GGML_TYPE_F32,
+                                       head_dim, w.n_head, n_full_attn);
+        ggml_set_name(out.q_cap, "q_cap");
 
         out.base_buf = ggml_backend_alloc_ctx_tensors(out.base_ctx, backend);
         if (!out.base_buf) {
@@ -291,6 +297,7 @@ void free_target_cache(TargetCache & c) {
     c.ssm_intermediate.clear();
     c.conv_input_cache.clear();
     c.target_feat = nullptr;
+    c.q_cap = nullptr;
     c.cur_pos = 0;
 }
 
@@ -539,7 +546,8 @@ static ggml_tensor * build_full_attn_block(
     int fa_window = 0,
     ggml_tensor * q_tail_capture = nullptr,
     int q_tail_start = 0,
-    ggml_tensor * kv_write_rows = nullptr
+    ggml_tensor * kv_write_rows = nullptr,
+    ggml_tensor ** q_fa_out = nullptr   // post-RoPE/post-rotation Q [head_dim, n_tokens, n_head]
 ) {
     const int head_dim = w.n_embd_head_k;
     const int n_head = w.n_head;
@@ -681,6 +689,10 @@ static ggml_tensor * build_full_attn_block(
     } else {
         Qfa = ggml_cont(ctx, Qfa);
     }
+    // Post-rotation Q matches the basis of the K rows in the cache, so a
+    // cosine between this Q and pooled cache keys equals the unrotated
+    // cosine (orthogonal transform).
+    if (q_fa_out) *q_fa_out = Qfa;
 
     // K and V from cache: a windowed view starting at win_start.
     ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
@@ -1146,6 +1158,8 @@ QwenGraphOutputs build_qwen35_graph(
         ggml_tensor * cur = rms_norm_mul(ctx, inp_f32, L.attn_norm, eps);
 
         if (is_attn) {
+            const bool want_q_cap = in.q_capture && cache.q_cap;
+            ggml_tensor * q_fa = nullptr;
             cur = build_full_attn_block(ctx, gf, w, L, cur, in.positions, w.rope_sections,
                                         cache.attn_k[fa_idx], cache.attn_v[fa_idx],
                                         in.attn_mask, in.kv_start, n_tokens,
@@ -1154,7 +1168,23 @@ QwenGraphOutputs build_qwen35_graph(
                                         in.fa_window,
                                         /*q_tail_capture=*/nullptr,
                                         /*q_tail_start=*/0,
-                                        in.kv_write_rows);
+                                        in.kv_write_rows,
+                                        want_q_cap ? &q_fa : nullptr);
+            if (want_q_cap && q_fa) {
+                // Last token's Q, all heads: src [head_dim, 1, n_head] view of
+                // [head_dim, n_tokens, n_head]; dst = q_cap plane fa_idx
+                // ([head_dim, n_head] viewed as [head_dim, 1, n_head]).
+                ggml_tensor * src = ggml_view_3d(ctx, q_fa,
+                    q_fa->ne[0], 1, q_fa->ne[2],
+                    q_fa->nb[1], q_fa->nb[2],
+                    (size_t)(n_tokens - 1) * q_fa->nb[1]);
+                src = ggml_cont(ctx, src);   // strided head axis -> packed
+                ggml_tensor * dst = ggml_view_3d(ctx, cache.q_cap,
+                    cache.q_cap->ne[0], 1, cache.q_cap->ne[1],
+                    cache.q_cap->nb[1], cache.q_cap->nb[1],
+                    (size_t)fa_idx * cache.q_cap->nb[2]);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, src, dst));
+            }
             fa_idx++;
         } else {
             DeltaNetCapture * cap_ptr = nullptr;
