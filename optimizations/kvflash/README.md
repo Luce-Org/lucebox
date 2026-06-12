@@ -44,10 +44,14 @@ dflash_server model.gguf --max-ctx 32768 --kvflash auto \
 dflash_server model.gguf --max-ctx 32768 --kvflash 8192           # explicit pool size
 ```
 
-`--prefill-drafter` alone is enough for the drafter policy: the drafter
-loads lazily on the first reselect and becomes the residency scorer, with
-or without prefill compression. `auto` sizes the pool from `--max-ctx`:
-25% with a drafter configured, 50% LRU-only.
+Drafter-scored residency is the DEFAULT policy on qwen-family targets:
+the server probes for `Qwen3-0.6B-BF16.gguf` next to the model (same
+dir, `drafter/`, `draft/`, then `/opt/lucebox/models/drafter/`) and
+lazy-loads it on the first reselect; `--prefill-drafter` overrides the
+location, prefill compression can stay off either way. LRU is the
+fallback when no drafter is found, not the default (the banner says
+which policy you got). `auto` sizes the pool from `--max-ctx`: 25% with
+a drafter, 50% LRU-only.
 
 - `--kvflash <tokens|auto>`: resident pool size (rounded to 256; clamped to
   `--max-ctx`; floored at the protected minimum — 512 for qwen-family and

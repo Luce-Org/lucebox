@@ -282,7 +282,7 @@ DFLASH27B_KV_TQ3=1 \
 
 **Bounded KV residency (KVFlash)**
 
-Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token chunks live in host RAM, bit-exact and recallable. Decode speed stops depending on context length and resident KV stays pool-sized at any context. Off by default; works on every model family. Pass `--prefill-drafter` and the drafter automatically becomes the relevance scorer that decides which chunks stay resident (loaded lazily on the first reselect; prefill compression itself can stay off). Per-model numbers in [Luce KVFlash →](optimizations/kvflash/README.md).
+Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token chunks live in host RAM, bit-exact and recallable. Decode speed stops depending on context length and resident KV stays pool-sized at any context. Off by default; works on every model family. Drafter-scored residency is the default on qwen-family targets: the server finds the Qwen3-0.6B drafter next to the model (or via `--prefill-drafter`) and lazy-loads it as the relevance scorer that decides which chunks stay resident; LRU is the fallback when no drafter is present. Per-model numbers in [Luce KVFlash →](optimizations/kvflash/README.md).
 
 | Flag / env | Default | Effect |
 |---|---|---|
