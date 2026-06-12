@@ -7,7 +7,7 @@
   <a href="https://huggingface.co/Lucebox"><img src="https://img.shields.io/badge/HuggingFace-f5c842?style=for-the-badge&logo=huggingface&logoColor=f5c842&labelColor=090909" alt="HuggingFace"></a>
   <a href="https://discord.gg/yHfswqZmJQ"><img src="https://img.shields.io/badge/Discord-f5c842?style=for-the-badge&logo=discord&logoColor=f5c842&labelColor=090909" alt="Discord"></a>
   <a href="https://lucebox.com/blog"><img src="https://img.shields.io/badge/Blog-f5c842?style=for-the-badge&logo=rss&logoColor=f5c842&labelColor=090909" alt="Blog"></a>
-  <a href="#demos"><img src="https://img.shields.io/badge/Demos-f5c842?style=for-the-badge&logo=youtube&logoColor=f5c842&labelColor=090909" alt="Demos"></a>
+  <a href="#tutorials"><img src="https://img.shields.io/badge/Tutorials-f5c842?style=for-the-badge&logo=youtube&logoColor=f5c842&labelColor=090909" alt="Tutorials"></a>
 </p>
 
 <p align="center">
@@ -342,9 +342,9 @@ uv run --directory megakernel python final_bench.py
 
 ---
 
-## Demos
+## Tutorials
 
-Video walkthroughs of each optimization and the harness setup.
+Video tutorials for each optimization and the harness setup.
 
 |   |   |   |
 |:-:|:-:|:-:|
