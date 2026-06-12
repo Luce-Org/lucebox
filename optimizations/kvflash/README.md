@@ -55,7 +55,14 @@ of the TEXT, so the target's history is detokenized, re-tokenized for
 the drafter, scored, and mapped back to chunk boundaries by character
 spans). LRU is the fallback when no drafter is found (the banner says
 which policy you got) or the explicit choice via `--kvflash-policy lru`.
-`auto` sizes the pool from `--max-ctx`: 25% with a drafter, 50% LRU-only.
+`auto` sizes the pool from the GPU, not a fixed fraction: half of the
+free VRAM left after weights (minus a reserve for compute buffers and
+the drafter), converted at the model's KV density, capped where decode
+speed stays near the flat optimum (16384 tokens by default,
+`DFLASH_KVFLASH_MAX_POOL` to override) and at `--max-ctx`. Bigger pools
+mean more resident chunks and fewer forced evictions of useful context;
+the cap keeps the per-step KV read small enough that decode stays near
+the small-pool speed.
 
 - `--kvflash <tokens|auto>`: resident pool size (rounded to 256; clamped to
   `--max-ctx`; floored at the protected minimum — 512 for qwen-family and

@@ -101,8 +101,23 @@ void LagunaBackend::kvflash_read_config() {
     if (std::getenv("DFLASH_KVFLASH")) {
         kvflash_drafter_path_ = kvflash_find_drafter(args_.target_path.c_str());
     }
+    // "auto" sizes from the GPU (weights resident, cache not yet allocated):
+    // laguna pools ALL n_layer layers at the configured KV quant.
+    KvFlashAutoBudget kvf_budget;
+    {
+        size_t gpu_free = 0, gpu_total = 0;
+        if (ggml_backend_dev_t dev = ggml_backend_get_device(backend_)) {
+            ggml_backend_dev_memory(dev, &gpu_free, &gpu_total);
+        }
+        kvf_budget.free_bytes      = (int64_t)gpu_free;
+        kvf_budget.bytes_per_token = (int64_t)w_.n_layer * w_.n_head_kv * 2 *
+            (int64_t)ggml_row_size(args_.kv_type, w_.head_dim);
+        kvf_budget.reserve_bytes   = (int64_t)(1.5 * 1073741824.0) +
+            (kvflash_drafter_path_.empty() ? 0 : (int64_t)(1.7 * 1073741824.0));
+    }
     kvflash_tokens_ = kvflash_pool_from_env(args_.max_ctx, kvflash_config(),
-                                            !kvflash_drafter_path_.empty());
+                                            !kvflash_drafter_path_.empty(),
+                                            kvf_budget);
     if (kvflash_tokens_ > 0) {
         const char * tau = std::getenv("DFLASH_KVFLASH_TAU");
         kvflash_tau_ = std::max(1, tau ? std::atoi(tau) : 64);

@@ -286,7 +286,7 @@ Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token ch
 
 | Flag / env | Default | Effect |
 |---|---|---|
-| `--kvflash <tokens\|auto>` | off | Resident pool size. `auto` sizes from `--max-ctx` (25% with a drafter configured, 50% LRU-only). Explicit values are rounded to 256, clamped to `--max-ctx`, floored at the protected minimum (512 on qwen-family/gemma4, larger on laguna) so eviction always has a victim. |
+| `--kvflash <tokens\|auto>` | off | Resident pool size. `auto` sizes from the GPU: half of free VRAM after weights and reserves, at the model's KV density, capped where decode speed stays near the flat optimum (default 16384, override `DFLASH_KVFLASH_MAX_POOL`) and at `--max-ctx`. Explicit values are rounded to 256, clamped to `--max-ctx`, floored at the protected minimum so eviction always has a victim. |
 | `--kvflash-policy {drafter,lru}` | `drafter` | Residency policy. `lru` opts out of the drafter probe/load (recency-only paging, no extra VRAM). |
 | `--kvflash-tau N` | `64` | Reselect interval floor (drafter policy only); the effective interval grows with history to cap rescore overhead. |
 | `DFLASH_KVFLASH=N` | off | Env equivalent of `--kvflash`. |

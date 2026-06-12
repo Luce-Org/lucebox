@@ -384,28 +384,62 @@ private:
 // and build slot-space inputs for the graph. The first and last live here
 // so the per-arch code reduces to wiring.
 
+// VRAM budget for "auto" pool sizing. Backends fill this AFTER the target
+// weights are on the GPU and BEFORE the cache is allocated, so free_bytes
+// reflects what the pool can actually use.
+struct KvFlashAutoBudget {
+    int64_t free_bytes      = 0;   // device free memory right now
+    int64_t reserve_bytes   = 0;   // compute buffers + (if expected) drafter
+    int64_t bytes_per_token = 0;   // pooled attention KV density for this model
+    // Decode cost grows with the FA span (= the pool), so cap the auto pool
+    // where speed stays near the small-pool point. Measured on the 27B/3090:
+    // 1K pool 39.6 tok/s, 4K 38.7; 16K extrapolates to ~31-33, still 1.7-2.4x
+    // the full cache at 128-256K. Override: DFLASH_KVFLASH_MAX_POOL.
+    int     speed_cap_tokens = 16384;
+};
+
 // Pool size from DFLASH_KVFLASH for a backend with `cfg` protections:
 // 0 = off; otherwise rounded to a 256 multiple, floored at
 // min_pool_tokens(cfg) (eviction must keep a victim) and clamped to
 // `max_ctx` (a pool larger than the logical context is meaningless), with
 // warnings on both adjustments.
 //
-// The literal value "auto" sizes the pool from the logical context:
-// 25% of max_ctx when a relevance scorer is expected (`scorer_expected`,
-// e.g. a pflash drafter is configured — the measured-safe retrieval
-// default), 50% when residency will be recency-only LRU (an undersized
-// LRU pool can page out the question itself).
+// The literal value "auto" sizes the pool from the GPU, not from a fixed
+// fraction: take half of (free VRAM - reserve), convert to tokens at the
+// model's KV density, then cap at the speed point and max_ctx. Big pools
+// avoid relevance-crowding (more resident chunks = fewer forced evictions
+// of useful context); the speed cap keeps decode near the flat optimum.
+// Falls back to max_ctx/4 (scorer expected) or /2 (LRU) when the backend
+// supplies no budget.
 inline int kvflash_pool_from_env(int max_ctx, const KvFlashConfig & cfg = {},
-                                 bool scorer_expected = false) {
+                                 bool scorer_expected = false,
+                                 const KvFlashAutoBudget & budget = {}) {
     const char * env = std::getenv("DFLASH_KVFLASH");
     if (!env) return 0;
     int tokens;
     if (std::strcmp(env, "auto") == 0) {
-        tokens = max_ctx / (scorer_expected ? 4 : 2);
-        std::fprintf(stderr, "[kvflash] auto pool: %d tokens (%d%% of max_ctx %d, "
-                             "%s policy expected)\n",
-                     tokens, scorer_expected ? 25 : 50, max_ctx,
-                     scorer_expected ? "drafter" : "lru");
+        int speed_cap = budget.speed_cap_tokens;
+        if (const char * mp = std::getenv("DFLASH_KVFLASH_MAX_POOL")) {
+            speed_cap = std::max(256, std::atoi(mp));
+        }
+        if (budget.bytes_per_token > 0 && budget.free_bytes > 0) {
+            const int64_t usable =
+                std::max<int64_t>(0, budget.free_bytes - budget.reserve_bytes) / 2;
+            const int64_t vram_tokens = usable / budget.bytes_per_token;
+            tokens = (int)std::min<int64_t>(vram_tokens,
+                                            std::min(max_ctx, speed_cap));
+            std::fprintf(stderr,
+                "[kvflash] auto pool: %d tokens (free %.1f GiB - reserve %.1f GiB, "
+                "%.1f KiB/token, caps: speed %d / max_ctx %d)\n",
+                tokens, budget.free_bytes / 1073741824.0,
+                budget.reserve_bytes / 1073741824.0,
+                budget.bytes_per_token / 1024.0, speed_cap, max_ctx);
+        } else {
+            tokens = max_ctx / (scorer_expected ? 4 : 2);
+            std::fprintf(stderr, "[kvflash] auto pool: %d tokens (%d%% of max_ctx %d, "
+                                 "no VRAM budget supplied)\n",
+                         tokens, scorer_expected ? 25 : 50, max_ctx);
+        }
     } else {
         tokens = std::atoi(env);
     }

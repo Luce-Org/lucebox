@@ -155,8 +155,29 @@ void Gemma4Backend::kvflash_read_config() {
     if (std::getenv("DFLASH_KVFLASH")) {
         kvflash_drafter_path_ = kvflash_find_drafter(cfg_.model_path);
     }
+    // "auto" sizes from the GPU (weights resident, cache not yet allocated):
+    // gemma4 pools the FULL-attention layers only (F16 cache); SWA rings are
+    // fixed-size and excluded from the density.
+    KvFlashAutoBudget kvf_budget;
+    {
+        size_t gpu_free = 0, gpu_total = 0;
+        if (ggml_backend_dev_t dev = ggml_backend_get_device(backend_)) {
+            ggml_backend_dev_memory(dev, &gpu_free, &gpu_total);
+        }
+        int64_t bpt = 0;
+        for (int il = 0; il < w_.n_layer; ++il) {
+            if (!gemma4_has_kv(w_, il) || gemma4_is_swa_layer(w_, il)) continue;
+            bpt += (int64_t)gemma4_n_head_kv(w_, il) * 2 *
+                   (int64_t)ggml_row_size(GGML_TYPE_F16, gemma4_head_dim(w_, il));
+        }
+        kvf_budget.free_bytes      = (int64_t)gpu_free;
+        kvf_budget.bytes_per_token = bpt;
+        kvf_budget.reserve_bytes   = (int64_t)(1.5 * 1073741824.0) +
+            (kvflash_drafter_path_.empty() ? 0 : (int64_t)(1.7 * 1073741824.0));
+    }
     kvflash_tokens_ = kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{},
-                                            !kvflash_drafter_path_.empty());
+                                            !kvflash_drafter_path_.empty(),
+                                            kvf_budget);
     if (kvflash_tokens_ > 0) {
         const char * tau = std::getenv("DFLASH_KVFLASH_TAU");
         kvflash_tau_ = std::max(1, tau ? std::atoi(tau) : 64);

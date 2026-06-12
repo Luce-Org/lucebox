@@ -27,6 +27,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "kv_quant.h"
+
 namespace dflash::common {
 
 namespace {
@@ -218,8 +220,7 @@ bool Qwen35Backend::init() {
         : dw_.block_size;
     // kvflash (bounded residency): pool size from the env, rounded/floored/
     // clamped by the shared reader (256-stride keeps FA vec-kernel
-    // eligibility; the floor keeps eviction from deadlocking). "auto" sizes
-    // from max_ctx, smaller when a drafter is configured to score residency.
+    // eligibility; the floor keeps eviction from deadlocking).
     // Drafter-scored residency is the DEFAULT policy: explicit
     // --prefill-drafter first, then the well-known locations next to the
     // model (Spark's pattern). LRU is the fallback when nothing is found
@@ -227,8 +228,29 @@ bool Qwen35Backend::init() {
     if (std::getenv("DFLASH_KVFLASH")) {
         kvflash_drafter_path_ = kvflash_find_drafter(cfg_.target_path);
     }
+    // "auto" sizes the pool from the GPU: weights are resident at this
+    // point and the cache is not yet allocated, so device-free minus a
+    // reserve (compute buffers + the drafter when expected) is what the
+    // pool can really use, converted at this model's pooled-KV density.
+    KvFlashAutoBudget kvf_budget;
+    {
+        size_t gpu_free = 0, gpu_total = 0;
+        if (ggml_backend_dev_t dev = ggml_backend_get_device(target_backend_)) {
+            ggml_backend_dev_memory(dev, &gpu_free, &gpu_total);
+        }
+        ggml_type kv_k = GGML_TYPE_Q8_0, kv_v = GGML_TYPE_Q8_0;
+        dflash::resolve_kv_types(kv_k, kv_v);
+        const int n_full = w_.n_layer / w_.full_attention_interval;
+        kvf_budget.free_bytes      = (int64_t)gpu_free;
+        kvf_budget.bytes_per_token = (int64_t)n_full * w_.n_head_kv *
+            (int64_t)(ggml_row_size(kv_k, w_.n_embd_head_k) +
+                      ggml_row_size(kv_v, w_.n_embd_head_v));
+        kvf_budget.reserve_bytes   = (int64_t)(1.5 * 1073741824.0) +
+            (kvflash_drafter_path_.empty() ? 0 : (int64_t)(1.7 * 1073741824.0));
+    }
     kvflash_tokens_ = kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{},
-                                            !kvflash_drafter_path_.empty());
+                                            !kvflash_drafter_path_.empty(),
+                                            kvf_budget);
     if (kvflash_tokens_ > 0) {
         kvflash_tau_ = std::max(1, env_int_or_default("DFLASH_KVFLASH_TAU", 64));
     }
