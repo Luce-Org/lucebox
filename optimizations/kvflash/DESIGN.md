@@ -134,9 +134,11 @@ The pool is wired into the qwen35 backend behind `--kvflash <tokens>`
 
 - `create_target_cache(..., ctx_alloc)`: attention tensors allocated at
   pool capacity; `cache.max_ctx` stays the logical bound.
-- `do_prefill`: rows land identity-mapped (prompt must fit the pool —
-  with pflash the compressed prompt does; without it, size the pool);
-  `kvflash_sync_prefill` rebuilds the pager map per request/restore.
+- `do_prefill`: prompts that fit the pool land identity-mapped
+  (`kvflash_sync_prefill` rebuilds the pager map per request/restore);
+  LARGER prompts switch to pooled chunked prefill — pager-chunk batches,
+  slot-mapped set_rows writes, a slot-space mask per chunk, live
+  eviction. Constant VRAM, linear time (qwen35 only so far).
 - `do_ar_decode`: `build_target_step(..., kvflash_mask=true)` keeps the
   step-invariant set_rows write active alongside the slot mask;
   `kv_write_rows` carries the pool slot; the mask uploads per step;
@@ -237,21 +239,30 @@ and masks through it. What differs per arch:
   `--fa-window` (sparse full-attn) and kvflash are mutually exclusive;
   DFlash spec verify falls back to AR.
 
-Policy: qwen35/qwen35moe get the pflash drafter scorer when pflash is on;
-laguna and gemma4 are LRU-only (the drafter is Qwen-tokenizer bound) with
-the `KvFlashScorer` seam open for their own indexers.
+Policy: drafter-scored residency is the default on all four archs. The
+server probes for the Qwen3-0.6B next to the model (or --prefill-drafter)
+and lazy-loads it at the first reselect; `--kvflash-policy lru` opts out.
+qwen35/qwen35moe feed the drafter target ids directly; laguna/gemma4 use
+KvFlashCrossTokScorer (detokenize -> re-tokenize -> score -> map back by
+char spans; functional but untuned, see RESULTS). `--kvflash auto` sizes
+the pool from free VRAM at the model's KV density, capped at the decode
+speed knee (16384 default).
 
 Snapshots on laguna/gemma4 are refused once a chunk has relocated
 (page_outs > 0); identity-layout snapshots before that still work.
 
-## Not in the prototype (next phases)
+## Follow-ups
 
+Done since the prototype: pooled chunked prefill in the qwen35 daemon
+(prompt > pool, eviction during prefill), spec-decode chain verify on the
+pool, VRAM-aware auto sizing, cross-tokenizer scoring for laguna/gemma4.
+
+Open:
 1. Drafter KV persistence for the indexer (incremental rescore: push
    only the new τ tokens through the drafter; kills the ~240 ms re-prefill).
-2. Pooled chunked prefill (prompt > pool with eviction during prefill).
-3. Spec-decode verify on the pool (block-aligned multi-token writes).
-4. Pooled snapshot save/restore (serialize the page table + host store).
-5. Async paging on a copy stream (currently synchronous
+2. Pooled chunked prefill for laguna/gemma4 (qwen35-only today).
+3. Pooled snapshot save/restore (serialize the page table + host store).
+4. Async paging on a copy stream (currently synchronous
    ggml_backend_tensor_get/set between steps).
-6. Quality benches through the harness (NIAH-64K, accept-rate) with the
-   drafter policy active.
+5. Teacher-forced NIAH harness for non-qwen archs + cross-tok scorer
+   tuning (tail window, normalization).

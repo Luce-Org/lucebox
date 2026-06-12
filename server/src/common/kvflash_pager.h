@@ -165,12 +165,19 @@ public:
     int slot_for(int64_t pos) {
         const int c = (int)(pos / cfg_.chunk_tokens);
         // cur_chunk_ tracks the append head only; a page_in of an older
-        // chunk must not shrink the protected tail window.
+        // chunk must not shrink the protected tail window. It must advance
+        // BEFORE eviction (so the victim search protects the new tail), but
+        // a failed allocation must roll it back or the next eviction's tail
+        // window is computed from a chunk that never materialized.
+        const int prev_cur_chunk = cur_chunk_;
         if (c > cur_chunk_) cur_chunk_ = c;
         if ((int)chunks_.size() <= c) chunks_.resize(c + 1);
         ChunkState & st = chunks_[c];
         if (st.block < 0) {
-            if (!ensure_free_block()) return -1;
+            if (!ensure_free_block()) {
+                cur_chunk_ = prev_cur_chunk;
+                return -1;
+            }
             st.block = free_blocks_.back();
             free_blocks_.pop_back();
             epoch_++;

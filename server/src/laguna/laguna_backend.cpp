@@ -227,7 +227,12 @@ bool LagunaBackend::unpark(const std::string & what) {
             std::fprintf(stderr, "[unpark] cache: %s\n", dflash27b_last_error());
             return false;
         }
-        if (!kvflash_attach()) return false;
+        if (!kvflash_attach()) {
+            free_laguna_target_cache(cache_);
+            free_laguna_target_weights(w_);
+            return false;          // still parked, resources released
+        }
+        kvflash_drafter_failed_ = false;   // fresh VRAM: allow a retry
         target_parked_ = false;
         std::printf("[unpark] target restored\n"); std::fflush(stdout);
     }

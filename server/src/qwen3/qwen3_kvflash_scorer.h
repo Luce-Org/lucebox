@@ -48,6 +48,8 @@ public:
         : ctx_(ctx), target_gguf_(std::move(target_gguf)),
           drafter_gguf_(std::move(drafter_gguf)) {}
     ~KvFlashCrossTokScorer() override;
+    KvFlashCrossTokScorer(const KvFlashCrossTokScorer &) = delete;
+    KvFlashCrossTokScorer & operator=(const KvFlashCrossTokScorer &) = delete;
 
     bool score_chunks(const std::vector<int32_t> & ids, int chunk_tokens,
                       std::vector<float> & out) override;

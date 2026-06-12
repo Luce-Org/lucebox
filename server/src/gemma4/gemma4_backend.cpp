@@ -135,6 +135,7 @@ bool Gemma4Backend::unpark(const std::string & what) {
         cache_.fa_window = cfg_.fa_window;
         if (!kvflash_attach()) return false;
 
+        kvflash_drafter_failed_ = false;   // fresh VRAM: allow a retry
         parked_ = false;
         std::printf("[gemma4] unparked (VRAM restored)\n"); std::fflush(stdout);
         if (cfg_.draft_path && !draft_parked_ && draft_backend_) {

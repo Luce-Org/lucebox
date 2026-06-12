@@ -345,6 +345,7 @@ bool Qwen35Backend::unpark(const std::string & what) {
             std::fprintf(stderr, "[unpark] target: %s\n", dflash27b_last_error());
             return false;
         }
+        kvflash_drafter_failed_ = false;   // fresh VRAM: allow a retry
         target_parked_ = false;
         std::printf("[unpark] target restored\n"); std::fflush(stdout);
     }
