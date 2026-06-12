@@ -86,42 +86,24 @@ bool LagunaBackend::init() {
 
 // ── kvflash helpers ─────────────────────────────────────────────────────
 
-void LagunaBackend::kvflash_read_config() {
-    const char * env = std::getenv("DFLASH_KVFLASH");
-    kvflash_tokens_ = env ? std::atoi(env) : 0;
-    if (kvflash_tokens_ <= 0) { kvflash_tokens_ = 0; return; }
-    kvflash_tokens_ = ((kvflash_tokens_ + 255) / 256) * 256;
-    // Floor: laguna's protected tail covers the SWA window, so the minimum
-    // pool is larger than other archs (see kvflash_attach); without an
-    // evictable block beyond sinks + tail, eviction deadlocks.
+// Laguna's pager protections: the trailing sliding_window span (+1 chunk
+// for the partially filled head) must stay resident so SWA attention stays
+// exact under paging. This drives both the pool floor and the attach config.
+KvFlashConfig LagunaBackend::kvflash_config() const {
     KvFlashConfig pc;
     pc.tail_window_chunks =
         std::max(4, (w_.sliding_window + pc.chunk_tokens - 1) / pc.chunk_tokens + 1);
-    const int floor_tokens =
-        ((KvFlashPager::min_pool_tokens(pc) + 255) / 256) * 256;
-    if (kvflash_tokens_ < floor_tokens) {
-        std::fprintf(stderr, "[kvflash] requested pool %d < minimum %d "
-                             "(SWA tail must stay resident); raising\n",
-                     kvflash_tokens_, floor_tokens);
-        kvflash_tokens_ = floor_tokens;
-    }
-    if (kvflash_tokens_ > args_.max_ctx) {
-        std::fprintf(stderr, "[kvflash] requested pool %d > max_ctx %d; clamping "
-                             "(pool only helps when smaller than the context)\n",
-                     kvflash_tokens_, args_.max_ctx);
-        kvflash_tokens_ = (args_.max_ctx / 256) * 256;
-    }
+    return pc;
+}
+
+void LagunaBackend::kvflash_read_config() {
+    kvflash_tokens_ = kvflash_pool_from_env(args_.max_ctx, kvflash_config());
 }
 
 bool LagunaBackend::kvflash_attach() {
     if (!kvflash_active()) return true;
-    KvFlashConfig pc;
+    KvFlashConfig pc = kvflash_config();
     pc.pool_tokens = kvflash_tokens_;
-    // SWA layers attend to the trailing sliding_window positions; keep at
-    // least that span (+1 chunk for the partially filled head) protected so
-    // SWA attention stays exact under paging.
-    pc.tail_window_chunks =
-        std::max(4, (w_.sliding_window + pc.chunk_tokens - 1) / pc.chunk_tokens + 1);
     if (!kvflash_pager_.attach(pc, cache_.attn_k, cache_.attn_v)) {
         std::fprintf(stderr, "kvflash: pager attach failed (pool=%d)\n",
                      kvflash_tokens_);
@@ -135,15 +117,7 @@ bool LagunaBackend::kvflash_attach() {
 }
 
 bool LagunaBackend::kvflash_alloc_span(int kv_start, int n_tok) {
-    if (!kvflash_active()) return true;
-    for (int i = 0; i < n_tok; ++i) {
-        if (kvflash_pager_.slot_for(kv_start + i) < 0) {
-            std::fprintf(stderr, "[kvflash] no pool slot at pos %d "
-                                 "(pool %d exhausted)\n", kv_start + i, kvflash_tokens_);
-            return false;
-        }
-    }
-    return true;
+    return !kvflash_active() || kvflash_pager_.alloc_span(kv_start, n_tok);
 }
 
 void LagunaBackend::print_ready_banner() const {

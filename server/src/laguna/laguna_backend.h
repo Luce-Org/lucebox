@@ -108,6 +108,8 @@ private:
     KvFlashPager kvflash_pager_;
     int          kvflash_tokens_ = 0;     // 0 = off
     bool kvflash_active() const { return kvflash_tokens_ > 0; }
+    // Pager protections (SWA tail) shared by the floor and attach.
+    KvFlashConfig kvflash_config() const;
     // Read DFLASH_KVFLASH and round/clamp; call before cache creation.
     void kvflash_read_config();
     // Attach the pager to the freshly created cache (init / unpark).

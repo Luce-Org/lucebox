@@ -793,22 +793,21 @@ bool gemma4_step(
         ggml_free(ctx);
         return false;
     }
+    std::vector<float> kvf_mfull;  // slot-space full mask (kvflash)
     if (kvi_full) {
         // Full layers append at the absolute position (or the kvflash pool
         // slot); SWA layers at the ring slot. Per-token modular indices also
         // land chunks that cross the ring wrap boundary correctly (the
         // offset-view path wrote one contiguous block).
         if (kvflash) {
-            std::vector<int32_t> rows((size_t)n_tokens);
-            for (int i = 0; i < n_tokens; ++i) {
-                const int s = kvflash->slot_of(kv_start + i);
-                if (s < 0) {
-                    std::fprintf(stderr, "[kvflash] gemma4 step: position %d has "
-                                         "no pool slot\n", kv_start + i);
-                    ggml_free(ctx);
-                    return false;
-                }
-                rows[(size_t)i] = s;
+            // Rows + slot-space full mask in one pass (shared helper; the
+            // mask is uploaded below where the legacy path builds its own).
+            std::vector<int32_t> rows;
+            if (!kvflash_fill_rows_and_masks(*kvflash, kv_start, n_tokens,
+                                             kv_len_padded, /*swa_window=*/0,
+                                             rows, &kvf_mfull, nullptr)) {
+                ggml_free(ctx);
+                return false;
             }
             ggml_backend_tensor_set(kvi_full, rows.data(), 0, ggml_nbytes(kvi_full));
         } else {
@@ -826,21 +825,12 @@ bool gemma4_step(
     }
 
     // Causal mask (full attention) — padded positions are masked with -inf.
-    // kvflash: SLOT space — the causal condition is evaluated on the
-    // position each pool slot holds (free slots stay -inf).
-    std::vector<float> mfull((size_t)kv_len_padded * n_tokens, -INFINITY);
+    // kvflash: SLOT-space mask already built alongside the append rows.
+    std::vector<float> mfull;
     if (kvflash) {
-        std::vector<int32_t> spos((size_t)kvflash->pool_tokens(), -1);
-        kvflash->fill_slot_pos(spos.data());
-        const int s_hi = std::min(kv_len_padded, (int)spos.size());
-        for (int q = 0; q < n_tokens; ++q) {
-            const int abs_q = kv_start + q;
-            for (int s = 0; s < s_hi; ++s) {
-                const int p = spos[(size_t)s];
-                if (p >= 0 && p <= abs_q) mfull[(size_t)q * kv_len_padded + s] = 0.0f;
-            }
-        }
+        mfull = std::move(kvf_mfull);
     } else {
+        mfull.assign((size_t)kv_len_padded * n_tokens, -INFINITY);
         for (int q = 0; q < n_tokens; ++q) {
             const int abs_q = kv_start + q;
             for (int k = 0; k <= abs_q && k < kv_len_raw; ++k) {

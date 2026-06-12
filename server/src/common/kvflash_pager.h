@@ -38,8 +38,10 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <vector>
@@ -140,6 +142,21 @@ public:
 
     // Optional external relevance score; higher = keep. Falls back to LRU.
     std::function<float(int /*chunk*/)> score_hook;
+
+    // Allocate slots for [kv_start, kv_start + n_tok) ahead of a forward
+    // step (evicting LRU/low-score chunks as needed). False — with a
+    // diagnostic — if the pool has no evictable block left.
+    bool alloc_span(int kv_start, int n_tok) {
+        for (int i = 0; i < n_tok; ++i) {
+            if (slot_for(kv_start + i) < 0) {
+                std::fprintf(stderr, "[kvflash] no pool slot at pos %d "
+                                     "(pool %d exhausted)\n",
+                             kv_start + i, cfg_.pool_tokens);
+                return false;
+            }
+        }
+        return true;
+    }
 
     // Physical pool slot for logical position `pos`. Allocates (and, when
     // the pool is full, evicts) at chunk granularity. Call once per
@@ -346,5 +363,80 @@ private:
     uint64_t clock_ = 0;
     uint64_t epoch_ = 0;
 };
+
+// ── Shared backend helpers ─────────────────────────────────────────────
+//
+// Every backend integration needs the same three steps: read the pool size
+// from the env, allocate slots ahead of each forward (alloc_span above),
+// and build slot-space inputs for the graph. The first and last live here
+// so the per-arch code reduces to wiring.
+
+// Pool size from DFLASH_KVFLASH for a backend with `cfg` protections:
+// 0 = off; otherwise rounded to a 256 multiple, floored at
+// min_pool_tokens(cfg) (eviction must keep a victim) and clamped to
+// `max_ctx` (a pool larger than the logical context is meaningless), with
+// warnings on both adjustments.
+inline int kvflash_pool_from_env(int max_ctx, const KvFlashConfig & cfg = {}) {
+    const char * env = std::getenv("DFLASH_KVFLASH");
+    int tokens = env ? std::atoi(env) : 0;
+    if (tokens <= 0) return 0;
+    tokens = ((tokens + 255) / 256) * 256;
+    const int floor_tokens =
+        ((KvFlashPager::min_pool_tokens(cfg) + 255) / 256) * 256;
+    if (tokens < floor_tokens) {
+        std::fprintf(stderr, "[kvflash] requested pool %d < minimum %d "
+                             "(%d sink + %d tail chunks must leave an "
+                             "evictable block); raising\n",
+                     tokens, floor_tokens, cfg.sink_chunks, cfg.tail_window_chunks);
+        tokens = floor_tokens;
+    }
+    if (tokens > max_ctx) {
+        std::fprintf(stderr, "[kvflash] requested pool %d > max_ctx %d; clamping "
+                             "(raise --max-ctx for a larger pool)\n",
+                     tokens, max_ctx);
+        tokens = (max_ctx / 256) * 256;
+    }
+    return tokens;
+}
+
+// Slot-space step inputs for masked consumers: the K/V append row for each
+// of this step's tokens, plus F32 causal (`mfull`) and sliding-window
+// (`mswa`, optional) masks of width `mk_w` whose conditions are evaluated
+// on the POSITION each pool slot holds (free slots stay -inf). The caller
+// must have alloc_span()'d [kv_start, kv_start + n_tok) first. The pager
+// zeroes freed slots, but the mask is what keeps relocation exact.
+inline bool kvflash_fill_rows_and_masks(
+    const KvFlashPager & pager,
+    int kv_start, int n_tok, int mk_w, int swa_window,
+    std::vector<int32_t> & rows,
+    std::vector<float> * mfull, std::vector<float> * mswa) {
+    rows.resize((size_t)n_tok);
+    for (int i = 0; i < n_tok; ++i) {
+        const int s = pager.slot_of(kv_start + i);
+        if (s < 0) {
+            std::fprintf(stderr, "[kvflash] no pool slot at pos %d "
+                                 "(alloc_span not called?)\n", kv_start + i);
+            return false;
+        }
+        rows[(size_t)i] = s;
+    }
+    if (!mfull) return true;
+    std::vector<int32_t> spos((size_t)pager.pool_tokens(), -1);
+    pager.fill_slot_pos(spos.data());
+    mfull->assign((size_t)mk_w * n_tok, -INFINITY);
+    if (mswa) mswa->assign((size_t)mk_w * n_tok, -INFINITY);
+    const int s_hi = std::min(mk_w, (int)spos.size());
+    for (int q = 0; q < n_tok; ++q) {
+        const int abs_q = kv_start + q;
+        const int win_lo = std::max(0, abs_q - swa_window + 1);
+        for (int s = 0; s < s_hi; ++s) {
+            const int p = spos[(size_t)s];
+            if (p < 0 || p > abs_q) continue;
+            (*mfull)[(size_t)q * mk_w + s] = 0.0f;
+            if (mswa && p >= win_lo) (*mswa)[(size_t)q * mk_w + s] = 0.0f;
+        }
+    }
+    return true;
+}
 
 } // namespace dflash::common

@@ -151,25 +151,7 @@ bool Gemma4Backend::unpark(const std::string & what) {
 // ── kvflash helpers ────────────────────────────────────────────────────
 
 void Gemma4Backend::kvflash_read_config() {
-    const char * env = std::getenv("DFLASH_KVFLASH");
-    kvflash_tokens_ = env ? std::atoi(env) : 0;
-    if (kvflash_tokens_ <= 0) { kvflash_tokens_ = 0; return; }
-    kvflash_tokens_ = ((kvflash_tokens_ + 255) / 256) * 256;
-    // Floor: sinks + trailing window must leave an evictable block or
-    // eviction deadlocks once the pool fills.
-    const int floor_tokens =
-        ((KvFlashPager::min_pool_tokens(KvFlashConfig{}) + 255) / 256) * 256;
-    if (kvflash_tokens_ < floor_tokens) {
-        std::fprintf(stderr, "[kvflash] requested pool %d < minimum %d; "
-                             "raising\n", kvflash_tokens_, floor_tokens);
-        kvflash_tokens_ = floor_tokens;
-    }
-    if (kvflash_tokens_ > cfg_.device.max_ctx) {
-        std::fprintf(stderr, "[kvflash] requested pool %d > max_ctx %d; clamping "
-                             "(pool only helps when smaller than the context)\n",
-                     kvflash_tokens_, cfg_.device.max_ctx);
-        kvflash_tokens_ = (cfg_.device.max_ctx / 256) * 256;
-    }
+    kvflash_tokens_ = kvflash_pool_from_env(cfg_.device.max_ctx);
 }
 
 bool Gemma4Backend::kvflash_attach() {
@@ -200,15 +182,7 @@ bool Gemma4Backend::kvflash_attach() {
 }
 
 bool Gemma4Backend::kvflash_alloc_span(int kv_start, int n_tok) {
-    if (!kvflash_active()) return true;
-    for (int i = 0; i < n_tok; ++i) {
-        if (kvflash_pager_.slot_for(kv_start + i) < 0) {
-            std::fprintf(stderr, "[kvflash] no pool slot at pos %d "
-                                 "(pool %d exhausted)\n", kv_start + i, kvflash_tokens_);
-            return false;
-        }
-    }
-    return true;
+    return !kvflash_active() || kvflash_pager_.alloc_span(kv_start, n_tok);
 }
 
 // ── Prefill ────────────────────────────────────────────────────────────

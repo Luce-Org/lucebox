@@ -216,30 +216,11 @@ bool Qwen35Backend::init() {
     const int max_verify_tokens = cfg_.ddtree_mode
         ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
         : dw_.block_size;
-    // kvflash (bounded residency): round the pool to a 256-token multiple
-    // so the FA span keeps vec-kernel eligibility and a stable 256-stride.
-    kvflash_tokens_ = env_int_or_default("DFLASH_KVFLASH", 0);
+    // kvflash (bounded residency): pool size from the env, rounded/floored/
+    // clamped by the shared reader (256-stride keeps FA vec-kernel
+    // eligibility; the floor keeps eviction from deadlocking).
+    kvflash_tokens_ = kvflash_pool_from_env(cfg_.device.max_ctx);
     if (kvflash_tokens_ > 0) {
-        kvflash_tokens_ = ((kvflash_tokens_ + 255) / 256) * 256;
-        // Floor: the pool must keep at least one evictable block beyond the
-        // protected sinks + trailing window, or eviction deadlocks once it
-        // fills (pager attach would refuse; clamp up with a warning instead).
-        const int floor_tokens =
-            ((KvFlashPager::min_pool_tokens(KvFlashConfig{}) + 255) / 256) * 256;
-        if (kvflash_tokens_ < floor_tokens) {
-            std::fprintf(stderr, "[kvflash] requested pool %d < minimum %d; "
-                                 "raising\n", kvflash_tokens_, floor_tokens);
-            kvflash_tokens_ = floor_tokens;
-        }
-        // A pool larger than the logical context is meaningless (and the
-        // cache tensors are capped at max_ctx): clamp instead of failing
-        // pager attach at init.
-        if (kvflash_tokens_ > cfg_.device.max_ctx) {
-            std::fprintf(stderr, "[kvflash] requested pool %d > max_ctx %d; clamping "
-                                 "(raise --max-ctx for a larger pool)\n",
-                         kvflash_tokens_, cfg_.device.max_ctx);
-            kvflash_tokens_ = (cfg_.device.max_ctx / 256) * 256;
-        }
         kvflash_tau_ = std::max(1, env_int_or_default("DFLASH_KVFLASH_TAU", 64));
     }
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,

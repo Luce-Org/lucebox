@@ -40,49 +40,6 @@ namespace dflash::common {
 
 static constexpr float LAGUNA_EPS = 1e-6f;
 
-// ---- kvflash step inputs --------------------------------------------------
-//
-// With a bounded-residency pool the K/V append rows come from the pager's
-// slot mapping, and both masks must be built in SLOT space: column s of the
-// mask gates pool slot s, so the causal / sliding-window conditions are
-// evaluated on the POSITION that slot currently holds (-1 = free, masked).
-// The pager zeroes freed slots, but the mask is what keeps relocation exact.
-// Returns false if any of this step's positions has no slot (caller must
-// slot_for() them beforehand).
-static bool kvflash_fill_step_inputs(
-    const KvFlashPager * pager,
-    int kv_start, int n_tok, int mk_w, int swa_window,
-    std::vector<int32_t> & rows,
-    std::vector<float> * mfull, std::vector<float> * mswa) {
-    rows.resize((size_t)n_tok);
-    for (int i = 0; i < n_tok; ++i) {
-        const int s = pager->slot_of(kv_start + i);
-        if (s < 0) {
-            std::fprintf(stderr,
-                "[kvflash] laguna step: position %d has no pool slot\n", kv_start + i);
-            return false;
-        }
-        rows[(size_t)i] = s;
-    }
-    if (!mfull) return true;
-    std::vector<int32_t> spos((size_t)pager->pool_tokens(), -1);
-    pager->fill_slot_pos(spos.data());
-    mfull->assign((size_t)mk_w * n_tok, -INFINITY);
-    mswa->assign((size_t)mk_w * n_tok, -INFINITY);
-    const int s_hi = std::min(mk_w, (int)spos.size());
-    for (int q = 0; q < n_tok; ++q) {
-        const int abs_q = kv_start + q;
-        const int win_lo = std::max(0, abs_q - swa_window + 1);
-        for (int s = 0; s < s_hi; ++s) {
-            const int p = spos[(size_t)s];
-            if (p < 0 || p > abs_q) continue;
-            (*mfull)[(size_t)q * mk_w + s] = 0.0f;
-            if (p >= win_lo) (*mswa)[(size_t)q * mk_w + s] = 0.0f;
-        }
-    }
-    return true;
-}
-
 // ---- Cache lifecycle ----------------------------------------------------
 
 bool create_laguna_target_cache(const LagunaTargetWeights & w,
@@ -1122,8 +1079,8 @@ bool laguna_step(
         }
         std::vector<int32_t> rows;
         std::vector<float> mfull, mswa;
-        if (!kvflash_fill_step_inputs(kvflash, kv_start, n_tok, mk_w,
-                                      w.sliding_window, rows, &mfull, &mswa)) {
+        if (!kvflash_fill_rows_and_masks(*kvflash, kv_start, n_tok, mk_w,
+                                         w.sliding_window, rows, &mfull, &mswa)) {
             ggml_free(ctx);
             return false;
         }
@@ -1301,8 +1258,8 @@ bool laguna_step_hybrid(
         }
         std::vector<int32_t> rows;
         std::vector<float> mfull, mswa;
-        if (!kvflash_fill_step_inputs(kvflash, kv_start, n_tok, mk_w,
-                                      w.sliding_window, rows, &mfull, &mswa)) {
+        if (!kvflash_fill_rows_and_masks(*kvflash, kv_start, n_tok, mk_w,
+                                         w.sliding_window, rows, &mfull, &mswa)) {
             ggml_free(ctx);
             return false;
         }

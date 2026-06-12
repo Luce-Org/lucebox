@@ -1372,12 +1372,10 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
     // zero stale free slots BEFORE any forward reads them.
     if (kvflash_active()) {
         kvflash_pager_.reset();
-        for (int p = 0; p < snap_pos; ++p) {
-            if (kvflash_pager_.slot_for(p) < 0) {
-                result.error = "kvflash_slot";
-                out_io.emit(-1);
-                return result;
-            }
+        if (!kvflash_pager_.alloc_span(0, snap_pos)) {
+            result.error = "kvflash_slot";
+            out_io.emit(-1);
+            return result;
         }
         kvflash_pager_.zero_free_blocks();
     }
