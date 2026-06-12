@@ -420,6 +420,14 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             ::setenv("DFLASH_KVFLASH", argv[i], 1);
+        } else if (std::strcmp(argv[i], "--kvflash-policy") == 0 && i + 1 < argc) {
+            ++i;
+            if (std::strcmp(argv[i], "drafter") != 0 && std::strcmp(argv[i], "lru") != 0) {
+                std::fprintf(stderr, "--kvflash-policy expects 'drafter' or 'lru', got '%s'\n",
+                             argv[i]);
+                return 1;
+            }
+            ::setenv("DFLASH_KVFLASH_POLICY", argv[i], 1);
         } else if (std::strcmp(argv[i], "--kvflash-tau") == 0 && i + 1 < argc) {
             if (std::atoi(argv[++i]) <= 0) {
                 std::fprintf(stderr, "--kvflash-tau expects a positive interval, got '%s'\n",

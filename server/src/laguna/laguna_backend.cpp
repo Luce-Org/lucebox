@@ -8,6 +8,7 @@
 
 #include "laguna_backend.h"
 #include "laguna_internal.h"
+#include "qwen3/qwen3_kvflash_scorer.h"
 #include "dflash27b.h"
 
 #include <chrono>
@@ -97,7 +98,60 @@ KvFlashConfig LagunaBackend::kvflash_config() const {
 }
 
 void LagunaBackend::kvflash_read_config() {
-    kvflash_tokens_ = kvflash_pool_from_env(args_.max_ctx, kvflash_config());
+    if (std::getenv("DFLASH_KVFLASH")) {
+        kvflash_drafter_path_ = kvflash_find_drafter(args_.target_path.c_str());
+    }
+    kvflash_tokens_ = kvflash_pool_from_env(args_.max_ctx, kvflash_config(),
+                                            !kvflash_drafter_path_.empty());
+    if (kvflash_tokens_ > 0) {
+        const char * tau = std::getenv("DFLASH_KVFLASH_TAU");
+        kvflash_tau_ = std::max(1, tau ? std::atoi(tau) : 64);
+    }
+}
+
+// Drafter rescore + repage (FlashMemory tau loop) with the cross-tokenizer
+// scorer: laguna ids are detokenized and re-scored through the Qwen3-0.6B
+// drafter (relevance is text-level, so the tokenizer gap is bridged by
+// re-tokenization). Lazy: the drafter + tokenizers load on the first
+// reselect that needs them, never on a request's first tokens.
+void LagunaBackend::kvflash_maybe_reselect(const std::vector<int32_t> & history,
+                                           int generated) {
+    if (!kvflash_active() || kvflash_tau_ <= 0) return;
+    const int tau = std::max<int>(kvflash_tau_, (int)(history.size() / 45));
+    if (generated % tau != 0) return;
+    if (!kvflash_scorer_) {
+        if (kvflash_drafter_path_.empty() || kvflash_drafter_failed_) return;
+        if (!drafter_loaded_) {
+            ggml_backend_synchronize(backend_);
+            std::fprintf(stderr, "[kvflash] loading drafter for residency scoring: %s\n",
+                         kvflash_drafter_path_.c_str());
+            if (!load_drafter(kvflash_drafter_path_, /*gpu_layers=*/999,
+                              args_.device.gpu, drafter_ctx_)) {
+                std::fprintf(stderr, "[kvflash] drafter load failed (%s); staying on "
+                                     "LRU residency\n", dflash27b_last_error());
+                kvflash_drafter_failed_ = true;
+                return;
+            }
+            drafter_loaded_ = true;
+        }
+        kvflash_scorer_ = std::make_unique<KvFlashCrossTokScorer>(
+            &drafter_ctx_, args_.target_path, kvflash_drafter_path_);
+        std::fprintf(stderr, "[kvflash] cross-tokenizer drafter scorer attached "
+                             "(tau=%d)\n", kvflash_tau_);
+    }
+    if (!kvflash_scorer_->score_chunks(history, kvflash_pager_.chunk_tokens(),
+                                       kvflash_scores_)) {
+        return;  // scorer failure -> keep LRU behavior this round
+    }
+    kvflash_pager_.score_hook = [this](int c) {
+        return c < (int)kvflash_scores_.size() ? kvflash_scores_[c] : 1e30f;
+    };
+    const int events = kvflash_pager_.reselect();
+    kvflash_pager_.score_hook = nullptr;
+    if (events > 0) {
+        std::fprintf(stderr, "[kvflash] reselect @gen=%d: %d page events\n",
+                     generated, events);
+    }
 }
 
 bool LagunaBackend::kvflash_attach() {
@@ -110,8 +164,12 @@ bool LagunaBackend::kvflash_attach() {
         return false;
     }
     std::printf("[kvflash] resident pool %d tokens (logical max_ctx %d), "
-                "policy=lru, swa_tail=%d chunks\n",
-                kvflash_tokens_, args_.max_ctx, pc.tail_window_chunks);
+                "policy=%s, swa_tail=%d chunks\n",
+                kvflash_tokens_, args_.max_ctx,
+                !kvflash_drafter_path_.empty()
+                    ? "drafter/cross-tok (attaches on first reselect)"
+                    : "lru (recency-only: no Qwen3-0.6B drafter found)",
+                pc.tail_window_chunks);
     std::fflush(stdout);
     return true;
 }
@@ -377,6 +435,7 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
         if (!kvflash_alloc_span(cache_.cur_pos, 1) ||
             !laguna_step(backend_, w_, cache_, embed_step.data(), 1,
                           cache_.cur_pos, no_mask, step_logits, kvf)) { ok = false; break; }
+        kvflash_maybe_reselect(history, s + 1);
         next_tok = pick(step_logits);
     }
     auto t_g1 = std::chrono::steady_clock::now();
@@ -531,6 +590,7 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
         if (!kvflash_alloc_span(cache_.cur_pos, 1) ||
             !laguna_step(backend_, w_, cache_, embed_step.data(), 1,
                           cache_.cur_pos, no_mask, step_logits, kvf)) { ok = false; break; }
+        kvflash_maybe_reselect(history, s + 1);
         next_tok = pick(step_logits);
     }
     auto t_g1 = std::chrono::steady_clock::now();
@@ -1772,6 +1832,7 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
             break;
         }
         cache_.cur_pos++;
+        kvflash_maybe_reselect(history, s + 1);
 
         if (req.do_sample) {
             // For sampling, we need full logits — project from act_cur

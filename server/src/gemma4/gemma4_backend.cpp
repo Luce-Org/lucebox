@@ -6,6 +6,7 @@
 
 #include "gemma4_backend.h"
 #include "dflash27b.h"
+#include "../qwen3/qwen3_kvflash_scorer.h"
 #include "common/sampler.h"
 #include "common/io_utils.h"
 #include "common/dflash_feature_ring.h"
@@ -151,7 +152,58 @@ bool Gemma4Backend::unpark(const std::string & what) {
 // ── kvflash helpers ────────────────────────────────────────────────────
 
 void Gemma4Backend::kvflash_read_config() {
-    kvflash_tokens_ = kvflash_pool_from_env(cfg_.device.max_ctx);
+    if (std::getenv("DFLASH_KVFLASH")) {
+        kvflash_drafter_path_ = kvflash_find_drafter(cfg_.model_path);
+    }
+    kvflash_tokens_ = kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{},
+                                            !kvflash_drafter_path_.empty());
+    if (kvflash_tokens_ > 0) {
+        const char * tau = std::getenv("DFLASH_KVFLASH_TAU");
+        kvflash_tau_ = std::max(1, tau ? std::atoi(tau) : 64);
+    }
+}
+
+// Drafter rescore + repage (FlashMemory tau loop) with the cross-tokenizer
+// scorer: gemma ids are detokenized and re-scored through the Qwen3-0.6B
+// drafter. Lazy: the drafter + tokenizers load on the first reselect that
+// needs them, never on a request's first tokens.
+void Gemma4Backend::kvflash_maybe_reselect(int generated) {
+    if (!kvflash_active() || kvflash_tau_ <= 0) return;
+    const int tau = std::max<int>(kvflash_tau_, (int)(kvflash_history_.size() / 45));
+    if (generated % tau != 0) return;
+    if (!kvflash_scorer_) {
+        if (kvflash_drafter_path_.empty() || kvflash_drafter_failed_) return;
+        if (!drafter_loaded_) {
+            ggml_backend_synchronize(backend_);
+            std::fprintf(stderr, "[kvflash] loading drafter for residency scoring: %s\n",
+                         kvflash_drafter_path_.c_str());
+            if (!load_drafter(kvflash_drafter_path_, /*gpu_layers=*/999,
+                              cfg_.device.gpu, drafter_ctx_)) {
+                std::fprintf(stderr, "[kvflash] drafter load failed (%s); staying on "
+                                     "LRU residency\n", dflash27b_last_error());
+                kvflash_drafter_failed_ = true;
+                return;
+            }
+            drafter_loaded_ = true;
+        }
+        kvflash_scorer_ = std::make_unique<KvFlashCrossTokScorer>(
+            &drafter_ctx_, cfg_.model_path, kvflash_drafter_path_);
+        std::fprintf(stderr, "[kvflash] cross-tokenizer drafter scorer attached "
+                             "(tau=%d)\n", kvflash_tau_);
+    }
+    if (!kvflash_scorer_->score_chunks(kvflash_history_, kvflash_pager_.chunk_tokens(),
+                                       kvflash_scores_)) {
+        return;  // scorer failure -> keep LRU behavior this round
+    }
+    kvflash_pager_.score_hook = [this](int c) {
+        return c < (int)kvflash_scores_.size() ? kvflash_scores_[c] : 1e30f;
+    };
+    const int events = kvflash_pager_.reselect();
+    kvflash_pager_.score_hook = nullptr;
+    if (events > 0) {
+        std::fprintf(stderr, "[kvflash] reselect @gen=%d: %d page events\n",
+                     generated, events);
+    }
 }
 
 bool Gemma4Backend::kvflash_attach() {
@@ -174,9 +226,12 @@ bool Gemma4Backend::kvflash_attach() {
         return false;
     }
     std::printf("[kvflash] resident pool %d tokens over %zu full-attn layers "
-                "(logical max_ctx %d, SWA ring %d), policy=lru\n",
+                "(logical max_ctx %d, SWA ring %d), policy=%s\n",
                 kvflash_tokens_, full_k.size(), cfg_.device.max_ctx,
-                cache_.swa_size);
+                cache_.swa_size,
+                !kvflash_drafter_path_.empty()
+                    ? "drafter/cross-tok (attaches on first reselect)"
+                    : "lru (recency-only: no Qwen3-0.6B drafter found)");
     std::fflush(stdout);
     return true;
 }
@@ -253,6 +308,15 @@ int Gemma4Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (feature_mirror_.target_feat && cache_.target_feat && !draft_parked_) {
             draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
                                             feature_mirror_, kv_pos, len);
+        }
+    }
+
+    if (kvflash_active()) {
+        if (kv_offset == 0) {
+            kvflash_history_.assign(tokens.begin(), tokens.end());
+        } else {
+            kvflash_history_.resize((size_t)kv_offset, 0);  // restored prefix ids unknown
+            kvflash_history_.insert(kvflash_history_.end(), tokens.begin(), tokens.end());
         }
     }
 
@@ -372,6 +436,10 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
         io.emit(next);
         committed++;
         cache_.cur_pos = committed;
+        if (kvflash_active()) {
+            kvflash_history_.push_back(next);
+            kvflash_maybe_reselect((int)out_tokens.size());
+        }
         if (io.cancelled) break;
 
         // Check EOS

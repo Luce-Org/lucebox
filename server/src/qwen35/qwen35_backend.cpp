@@ -220,31 +220,12 @@ bool Qwen35Backend::init() {
     // clamped by the shared reader (256-stride keeps FA vec-kernel
     // eligibility; the floor keeps eviction from deadlocking). "auto" sizes
     // from max_ctx, smaller when a drafter is configured to score residency.
-    if (const char * dp = std::getenv("DFLASH_KVFLASH_DRAFTER")) {
-        kvflash_drafter_path_ = dp;
-    }
-    // Drafter-scored residency is the DEFAULT policy: without an explicit
-    // --prefill-drafter, probe the well-known locations for the Qwen3-0.6B
-    // drafter (Spark's load-what-sits-next-to-the-model pattern). LRU is
-    // the fallback when nothing is found, not the default.
-    if (kvflash_drafter_path_.empty() && std::getenv("DFLASH_KVFLASH") &&
-        cfg_.target_path) {
-        std::string dir(cfg_.target_path);
-        const size_t slash = dir.find_last_of('/');
-        dir = (slash == std::string::npos) ? "." : dir.substr(0, slash);
-        const std::string candidates[] = {
-            dir + "/Qwen3-0.6B-BF16.gguf",
-            dir + "/drafter/Qwen3-0.6B-BF16.gguf",
-            dir + "/draft/Qwen3-0.6B-BF16.gguf",
-            "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf",
-        };
-        for (const std::string & c : candidates) {
-            if (::access(c.c_str(), R_OK) == 0) {
-                kvflash_drafter_path_ = c;
-                std::fprintf(stderr, "[kvflash] found residency drafter: %s\n", c.c_str());
-                break;
-            }
-        }
+    // Drafter-scored residency is the DEFAULT policy: explicit
+    // --prefill-drafter first, then the well-known locations next to the
+    // model (Spark's pattern). LRU is the fallback when nothing is found
+    // (or the explicit choice via --kvflash-policy lru).
+    if (std::getenv("DFLASH_KVFLASH")) {
+        kvflash_drafter_path_ = kvflash_find_drafter(cfg_.target_path);
     }
     kvflash_tokens_ = kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{},
                                             !kvflash_drafter_path_.empty());

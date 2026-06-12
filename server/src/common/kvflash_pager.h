@@ -44,6 +44,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <string>
 #include <vector>
 
 namespace dflash::common {
@@ -426,6 +427,41 @@ inline int kvflash_pool_from_env(int max_ctx, const KvFlashConfig & cfg = {},
         tokens = (max_ctx / 256) * 256;
     }
     return tokens;
+}
+
+// Residency policy from DFLASH_KVFLASH_POLICY (--kvflash-policy): "lru"
+// forces recency-only paging (no drafter probe, no scorer); anything else
+// (default "drafter") means scored residency when a drafter is available.
+inline bool kvflash_policy_is_lru() {
+    const char * env = std::getenv("DFLASH_KVFLASH_POLICY");
+    return env && std::strcmp(env, "lru") == 0;
+}
+
+// Locate the Qwen3-0.6B residency drafter: the explicit override
+// (DFLASH_KVFLASH_DRAFTER, set from --prefill-drafter), then the
+// well-known locations next to the target model, then the appliance path.
+// Returns "" when nothing is readable (callers fall back to LRU, loudly).
+inline std::string kvflash_find_drafter(const char * target_path) {
+    if (kvflash_policy_is_lru()) return "";
+    if (const char * dp = std::getenv("DFLASH_KVFLASH_DRAFTER")) return dp;
+    if (!target_path) return "";
+    std::string dir(target_path);
+    const size_t slash = dir.find_last_of('/');
+    dir = (slash == std::string::npos) ? "." : dir.substr(0, slash);
+    const std::string candidates[] = {
+        dir + "/Qwen3-0.6B-BF16.gguf",
+        dir + "/drafter/Qwen3-0.6B-BF16.gguf",
+        dir + "/draft/Qwen3-0.6B-BF16.gguf",
+        "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf",
+    };
+    for (const std::string & c : candidates) {
+        if (std::FILE * f = std::fopen(c.c_str(), "rb")) {
+            std::fclose(f);
+            std::fprintf(stderr, "[kvflash] found residency drafter: %s\n", c.c_str());
+            return c;
+        }
+    }
+    return "";
 }
 
 // Slot-space step inputs for masked consumers: the K/V append row for each

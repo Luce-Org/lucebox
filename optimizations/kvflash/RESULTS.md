@@ -86,6 +86,17 @@ deterministic) rounding lineage, not noise and not a correctness effect.
 Gemma4 control on the same build without the flag: 120.2 tok/s, no
 kvflash code engaged — the default path is unchanged.
 
+## Cross-tokenizer scorer (laguna/gemma4) — early result
+
+Stress A/B on gemma4 26B-A4B (pool 1024, needle at pos ~170, recital
+demanded ~1700 generated tokens later, beyond the SWA ring and the pool):
+LRU never recites and degenerates into filler repetition; the cross-tok
+drafter stays coherent for 1.9K tokens, reaches the recital, and recalls
+the correct prefix but not the exact code. Strictly better than LRU,
+not yet at the qwen-native scorer's 14-16/16; treat as functional but
+untuned (follow-up: teacher-forced NIAH harness for non-qwen archs,
+tail-window/normalization tuning).
+
 ## Known limits
 
 - DDTree tree-verify is not pool-aware (falls back to AR with KVFlash).

@@ -1,6 +1,7 @@
 #include "qwen3_kvflash_scorer.h"
 
 #include "qwen3_drafter_model.h"
+#include "server/tokenizer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -114,6 +115,94 @@ bool KvFlashDrafterScorer::score_chunks(const std::vector<int32_t> & ids,
         float m = 0.0f;
         for (int j = s_; j < e_; j++) m += smooth[j];
         out[c] = m / std::max(1, e_ - s_);
+    }
+    return true;
+}
+
+// ── KvFlashCrossTokScorer ───────────────────────────────────────────────
+
+struct KvFlashCrossTokScorer::Toks {
+    Tokenizer target;
+    Tokenizer drafter;
+};
+
+KvFlashCrossTokScorer::~KvFlashCrossTokScorer() { delete toks_; }
+
+bool KvFlashCrossTokScorer::ensure_tokenizers() {
+    if (toks_) return true;
+    if (toks_failed_) return false;
+    auto * t = new Toks();
+    if (!t->target.load_from_gguf(target_gguf_.c_str()) ||
+        !t->drafter.load_from_gguf(drafter_gguf_.c_str())) {
+        std::fprintf(stderr, "[kvflash] cross-tokenizer scorer: tokenizer load "
+                             "failed (%s / %s)\n",
+                     target_gguf_.c_str(), drafter_gguf_.c_str());
+        delete t;
+        toks_failed_ = true;
+        return false;
+    }
+    toks_ = t;
+    return true;
+}
+
+bool KvFlashCrossTokScorer::score_chunks(const std::vector<int32_t> & ids,
+                                         int chunk_tokens,
+                                         std::vector<float> & out) {
+    const int S = (int)ids.size();
+    out.clear();
+    if (!ctx_ || !ctx_->loaded || S < kLookahead + 1 || chunk_tokens <= 0) return false;
+    if (!ensure_tokenizers()) return false;
+
+    // 1) Target ids -> text, recording each target token's char end offset.
+    //    Byte-level BPE pieces concatenate exactly, so per-id decode gives
+    //    exact spans; special/template tokens may decode empty (their chunk
+    //    contribution then comes from neighboring text, which is fine).
+    std::string text;
+    text.reserve((size_t)S * 4);
+    std::vector<int32_t> tgt_end((size_t)S);
+    std::vector<int32_t> one(1);
+    for (int i = 0; i < S; i++) {
+        one[0] = ids[(size_t)i];
+        text += toks_->target.decode(one);
+        tgt_end[(size_t)i] = (int32_t)text.size();
+    }
+
+    // 2) Text -> drafter ids, with each drafter token's char midpoint.
+    const std::vector<int32_t> dids = toks_->drafter.encode(text);
+    const int D = (int)dids.size();
+    if (D < kLookahead + 1) return false;
+    std::vector<float> dmid((size_t)D);
+    {
+        size_t pos = 0;
+        for (int i = 0; i < D; i++) {
+            one[0] = dids[(size_t)i];
+            const size_t len = toks_->drafter.decode(one).size();
+            dmid[(size_t)i] = (float)pos + (float)len * 0.5f;
+            pos += len;
+        }
+    }
+
+    // 3) Same tail-attention forward as the same-tokenizer scorer.
+    std::vector<float> dscore;
+    if (!score_tokens_resilient(*ctx_, dids, dscore)) return false;
+
+    // 4) Map drafter-token scores onto target chunks by char span: a chunk's
+    //    score is the mean of drafter tokens whose midpoint falls inside the
+    //    chunk's text span. Empty spans (pure template tokens) stay at 0,
+    //    i.e. z-score-neutral.
+    const int n_chunks = (S + chunk_tokens - 1) / chunk_tokens;
+    out.assign((size_t)n_chunks, 0.0f);
+    std::vector<int> counts((size_t)n_chunks, 0);
+    int d = 0;
+    for (int c = 0; c < n_chunks; c++) {
+        const int last_tok_idx = std::min(S, (c + 1) * chunk_tokens) - 1;
+        const float span_end = (float)tgt_end[(size_t)last_tok_idx];
+        while (d < D && dmid[(size_t)d] < span_end) {
+            out[(size_t)c] += dscore[(size_t)d];
+            counts[(size_t)c]++;
+            d++;
+        }
+        if (counts[(size_t)c] > 0) out[(size_t)c] /= (float)counts[(size_t)c];
     }
     return true;
 }

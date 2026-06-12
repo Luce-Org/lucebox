@@ -282,11 +282,12 @@ DFLASH27B_KV_TQ3=1 \
 
 **Bounded KV residency (KVFlash)**
 
-Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token chunks live in host RAM, bit-exact and recallable. Decode speed stops depending on context length and resident KV stays pool-sized at any context. Off by default; works on every model family. Drafter-scored residency is the default on qwen-family targets: the server finds the Qwen3-0.6B drafter next to the model (or via `--prefill-drafter`) and lazy-loads it as the relevance scorer that decides which chunks stay resident; LRU is the fallback when no drafter is present. Per-model numbers in [Luce KVFlash →](optimizations/kvflash/README.md).
+Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token chunks live in host RAM, bit-exact and recallable. Decode speed stops depending on context length and resident KV stays pool-sized at any context. Off by default; works on every model family. Drafter-scored residency is the default on every family: the server finds the Qwen3-0.6B drafter next to the model (or via `--prefill-drafter`) and lazy-loads it as the relevance scorer that decides which chunks stay resident — non-qwen targets (laguna, gemma4) bridge the tokenizer gap by re-tokenizing the context text for the drafter. LRU is the fallback when no drafter is present, or the explicit choice via `--kvflash-policy lru`. Per-model numbers in [Luce KVFlash →](optimizations/kvflash/README.md).
 
 | Flag / env | Default | Effect |
 |---|---|---|
 | `--kvflash <tokens\|auto>` | off | Resident pool size. `auto` sizes from `--max-ctx` (25% with a drafter configured, 50% LRU-only). Explicit values are rounded to 256, clamped to `--max-ctx`, floored at the protected minimum (512 on qwen-family/gemma4, larger on laguna) so eviction always has a victim. |
+| `--kvflash-policy {drafter,lru}` | `drafter` | Residency policy. `lru` opts out of the drafter probe/load (recency-only paging, no extra VRAM). |
 | `--kvflash-tau N` | `64` | Reselect interval floor (drafter policy only); the effective interval grows with history to cap rescore overhead. |
 | `DFLASH_KVFLASH=N` | off | Env equivalent of `--kvflash`. |
 | `DFLASH_KVFLASH_TAU=N` | `64` | Env equivalent of `--kvflash-tau`. |

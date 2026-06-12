@@ -44,14 +44,18 @@ dflash_server model.gguf --max-ctx 32768 --kvflash auto \
 dflash_server model.gguf --max-ctx 32768 --kvflash 8192           # explicit pool size
 ```
 
-Drafter-scored residency is the DEFAULT policy on qwen-family targets:
+Drafter-scored residency is the DEFAULT policy on every model family:
 the server probes for `Qwen3-0.6B-BF16.gguf` next to the model (same
 dir, `drafter/`, `draft/`, then `/opt/lucebox/models/drafter/`) and
 lazy-loads it on the first reselect; `--prefill-drafter` overrides the
-location, prefill compression can stay off either way. LRU is the
-fallback when no drafter is found, not the default (the banner says
-which policy you got). `auto` sizes the pool from `--max-ctx`: 25% with
-a drafter, 50% LRU-only.
+location, prefill compression can stay off either way. Qwen-family
+targets feed the drafter their ids directly; laguna and gemma4 bridge
+the tokenizer gap with `KvFlashCrossTokScorer` (relevance is a property
+of the TEXT, so the target's history is detokenized, re-tokenized for
+the drafter, scored, and mapped back to chunk boundaries by character
+spans). LRU is the fallback when no drafter is found (the banner says
+which policy you got) or the explicit choice via `--kvflash-policy lru`.
+`auto` sizes the pool from `--max-ctx`: 25% with a drafter, 50% LRU-only.
 
 - `--kvflash <tokens|auto>`: resident pool size (rounded to 256; clamped to
   `--max-ctx`; floored at the protected minimum — 512 for qwen-family and
@@ -74,12 +78,12 @@ conservative default and 6-9% is measured safe for retrieval workloads.
 |---|---|---|---|---|
 | qwen35 | Qwen3.5/3.6-27B | masked set_rows decode + slot-mapped spec verify | LRU or pflash drafter | reference integration; all RESULTS.md numbers |
 | qwen35moe | Qwen3.6-35B-A3B | pipelined hybrid decode (Spark) + all-GPU | LRU or pflash drafter | maskless pool span (zero-row approximation, same as production padding); hybrid spec falls back to AR |
-| laguna | Laguna-XS.2 | single-graph hybrid + all-GPU, slot-space full+SWA masks | LRU | pager covers all 40 layers; protected tail >= sliding_window keeps SWA exact |
-| gemma4 | Gemma4 26B-A4B / 31B | masked decode, slot-space full mask | LRU | pools FULL-attention layers only (SWA layers already ring-buffer); spec falls back to AR |
+| laguna | Laguna-XS.2 | single-graph hybrid + all-GPU, slot-space full+SWA masks | LRU or drafter (cross-tok, untuned) | pager covers all 40 layers; protected tail >= sliding_window keeps SWA exact |
+| gemma4 | Gemma4 26B-A4B / 31B | masked decode, slot-space full mask | LRU or drafter (cross-tok, untuned) | pools FULL-attention layers only (SWA layers already ring-buffer); spec falls back to AR |
 
-LRU-only architectures keep the `KvFlashScorer` seam open: the pflash
-drafter scorer is Qwen-tokenizer bound, so laguna/gemma4 need their own
-indexer for relevance-driven reselect (follow-up).
+Non-qwen targets use the cross-tokenizer scorer (detokenize target ids,
+re-tokenize for the drafter, score, map back by char spans); the
+`KvFlashScorer` seam stays open for native indexers.
 
 ## How it works
 
