@@ -174,9 +174,11 @@ protected:
     std::vector<int32_t>           kvflash_history_;     // prompt + generated ids
     std::vector<float>             kvflash_scores_;      // latest chunk scores
     std::vector<uint16_t>          kvflash_mask_buf_;    // host mirror of slot mask
+    std::string                    kvflash_drafter_path_; // DFLASH_KVFLASH_DRAFTER
     uint64_t                       kvflash_mask_epoch_ = (uint64_t)-1;
     int  kvflash_tokens_ = 0;                       // 0 = off
     int  kvflash_tau_    = 64;
+    bool kvflash_drafter_failed_ = false;           // don't retry a failed load
     bool kvflash_active() const { return kvflash_tokens_ > 0; }
     // Rebuild pager mapping after (re)prefill: positions [0, committed)
     // occupy pool slots identity-mapped (prefill is contiguous).
@@ -187,6 +189,10 @@ protected:
     void kvflash_upload_mask();
     // Drafter rescore + reselect every kvflash_tau_ generated tokens.
     void kvflash_maybe_reselect(int generated);
+    // Attach the drafter scorer if a drafter path is configured and the
+    // scorer is missing (lazy-loads the drafter on first need; also heals
+    // after a residency release frees it). No-op without a path.
+    void kvflash_ensure_scorer();
 
 private:
     // ── GPU backends ─────────────────────────────────────────────────

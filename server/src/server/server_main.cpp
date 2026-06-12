@@ -413,9 +413,10 @@ int main(int argc, char ** argv) {
             // tokens; cold 64-token chunks page to host. Works with or
             // without pflash (drafter becomes the reselect scorer when
             // loaded; plain LRU otherwise). Forces AR decode.
-            if (std::atoi(argv[++i]) <= 0) {
-                std::fprintf(stderr, "--kvflash expects a positive token count, got '%s'\n",
-                             argv[i]);
+            ++i;
+            if (std::strcmp(argv[i], "auto") != 0 && std::atoi(argv[i]) <= 0) {
+                std::fprintf(stderr, "--kvflash expects a positive token count or "
+                                     "'auto', got '%s'\n", argv[i]);
                 return 1;
             }
             ::setenv("DFLASH_KVFLASH", argv[i], 1);
@@ -477,6 +478,9 @@ int main(int argc, char ** argv) {
             sconfig.pflash_keep_ratio = (float)std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--prefill-drafter") == 0 && i + 1 < argc) {
             sconfig.pflash_drafter_path = argv[++i];
+            // kvflash reads this to lazy-attach the drafter as its
+            // residency scorer even when prefill compression is off.
+            ::setenv("DFLASH_KVFLASH_DRAFTER", argv[i], 1);
         } else if (std::strcmp(argv[i], "--prefill-skip-park") == 0) {
             sconfig.pflash_skip_park = true;
         } else if (std::strcmp(argv[i], "--prefill-upstream-base") == 0 && i + 1 < argc) {

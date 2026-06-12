@@ -38,12 +38,18 @@ does not fit at all.)
 ## Usage
 
 ```bash
-dflash_server model.gguf --max-ctx 32768 --kvflash 8192          # LRU policy
-dflash_server model.gguf --max-ctx 32768 --kvflash 8192 \
-    --prefill-compression always --prefill-drafter qwen3-0.6b.gguf  # drafter policy
+dflash_server model.gguf --max-ctx 32768 --kvflash auto           # one flag, LRU policy
+dflash_server model.gguf --max-ctx 32768 --kvflash auto \
+    --prefill-drafter qwen3-0.6b.gguf                             # drafter-scored residency
+dflash_server model.gguf --max-ctx 32768 --kvflash 8192           # explicit pool size
 ```
 
-- `--kvflash <tokens>`: resident pool size (rounded to 256; clamped to
+`--prefill-drafter` alone is enough for the drafter policy: the drafter
+loads lazily on the first reselect and becomes the residency scorer, with
+or without prefill compression. `auto` sizes the pool from `--max-ctx`:
+25% with a drafter configured, 50% LRU-only.
+
+- `--kvflash <tokens|auto>`: resident pool size (rounded to 256; clamped to
   `--max-ctx`; floored at the protected minimum — 512 for qwen-family and
   gemma4, larger on laguna where the SWA window stays resident — so
   eviction always has a victim). Env: `DFLASH_KVFLASH`.

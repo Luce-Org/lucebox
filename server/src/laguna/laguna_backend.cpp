@@ -178,7 +178,7 @@ bool LagunaBackend::ensure_slot(int slot) {
 bool LagunaBackend::snapshot_save(int slot) {
     // kvflash: snapshots copy rows assuming identity layout, which breaks
     // after the first page-out relocates a chunk.
-    if (kvflash_active() && kvflash_pager_.stats().page_outs > 0) {
+    if (kvflash_active() && !kvflash_pager_.is_identity()) {
         std::fprintf(stderr, "[kvflash] snapshot skipped: pool has relocated "
                              "chunks (page-table serialization not implemented)\n");
         return false;
@@ -281,7 +281,7 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
     // kvflash: snapshots copy rows [0, snap_pos) assuming identity layout,
     // which holds until the first page-out relocates a chunk.
     if (kvflash_active() && req.snap_slot >= 0 &&
-        kvflash_pager_.stats().page_outs > 0) {
+        !kvflash_pager_.is_identity()) {
         std::fprintf(stderr, "[kvflash] snapshot skipped: pool has relocated "
                              "chunks (page-table serialization not implemented)\n");
     } else

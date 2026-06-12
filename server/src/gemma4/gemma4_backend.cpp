@@ -959,7 +959,7 @@ bool Gemma4Backend::snapshot_save(int slot) {
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
     // kvflash: snapshots copy rows [0, snap_pos) assuming identity layout,
     // which breaks after the first page-out relocates a chunk.
-    if (kvflash_active() && kvflash_pager_.stats().page_outs > 0) {
+    if (kvflash_active() && !kvflash_pager_.is_identity()) {
         std::fprintf(stderr, "[kvflash] snapshot skipped: pool has relocated "
                              "chunks (page-table serialization not implemented)\n");
         return false;

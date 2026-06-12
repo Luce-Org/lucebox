@@ -211,6 +211,18 @@ public:
     bool is_resident(int c) const {
         return c < (int)chunks_.size() && chunks_[c].block >= 0;
     }
+
+    // True while every materialized chunk still sits in its identity block
+    // (chunk c in block c, nothing paged out). This is the layout contract
+    // identity-copy snapshots rely on; it holds from reset() until the
+    // first eviction of the CURRENT request (cumulative stats do not).
+    bool is_identity() const {
+        for (int c = 0; c < (int)chunks_.size(); c++) {
+            if (chunks_[c].block >= 0 && chunks_[c].block != c) return false;
+            if (chunks_[c].block < 0 && chunks_[c].on_host) return false;
+        }
+        return true;
+    }
     int block_of(int c) const {
         return c < (int)chunks_.size() ? chunks_[c].block : -1;
     }
@@ -376,9 +388,26 @@ private:
 // min_pool_tokens(cfg) (eviction must keep a victim) and clamped to
 // `max_ctx` (a pool larger than the logical context is meaningless), with
 // warnings on both adjustments.
-inline int kvflash_pool_from_env(int max_ctx, const KvFlashConfig & cfg = {}) {
+//
+// The literal value "auto" sizes the pool from the logical context:
+// 25% of max_ctx when a relevance scorer is expected (`scorer_expected`,
+// e.g. a pflash drafter is configured — the measured-safe retrieval
+// default), 50% when residency will be recency-only LRU (an undersized
+// LRU pool can page out the question itself).
+inline int kvflash_pool_from_env(int max_ctx, const KvFlashConfig & cfg = {},
+                                 bool scorer_expected = false) {
     const char * env = std::getenv("DFLASH_KVFLASH");
-    int tokens = env ? std::atoi(env) : 0;
+    if (!env) return 0;
+    int tokens;
+    if (std::strcmp(env, "auto") == 0) {
+        tokens = max_ctx / (scorer_expected ? 4 : 2);
+        std::fprintf(stderr, "[kvflash] auto pool: %d tokens (%d%% of max_ctx %d, "
+                             "%s policy expected)\n",
+                     tokens, scorer_expected ? 25 : 50, max_ctx,
+                     scorer_expected ? "drafter" : "lru");
+    } else {
+        tokens = std::atoi(env);
+    }
     if (tokens <= 0) return 0;
     tokens = ((tokens + 255) / 256) * 256;
     const int floor_tokens =
