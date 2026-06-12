@@ -128,8 +128,8 @@ jobs:
     needs: [uv-workspace]
     runs-on: [self-hosted, gpu, sm86]
     timeout-minutes: 30
-    # The box has a single physical GPU: serialize GPU jobs across PRs instead
-    # of letting concurrent runs clobber each other.
+    # Serialize CUDA jobs across PRs (one RTX 3090). The ROCm job has its
+    # own group: different physical GPU, no contention.
     concurrency:
       group: lucebox3-gpu-runner
       cancel-in-progress: false
@@ -197,9 +197,13 @@ jobs:
     needs: [uv-workspace]
     runs-on: [self-hosted, rocm, gfx1151]
     timeout-minutes: 20
-    # Same single box as gpu-tests: serialize GPU jobs across PRs.
+    # Serialize across PRs per GPU. NOT the same group as the CUDA job:
+    # the combo box has two distinct GPUs (RTX 3090 + Strix iGPU), and a
+    # shared group only holds one waiting job, so the Radeon leg was
+    # chronically displaced ("higher priority waiting request") by every
+    # new CUDA job entering the queue.
     concurrency:
-      group: lucebox3-gpu-runner
+      group: lucebox3-rocm-runner
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
