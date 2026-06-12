@@ -219,6 +219,7 @@ add_library(dflash_common STATIC
     src/draft/draft_safetensors_loader.cpp
     src/draft/draft_graph.cpp
     src/qwen3/qwen3_drafter.cpp
+    src/qwen3/qwen3_kvflash_scorer.cpp
     src/qwen3/qwen3_loader.cpp
     src/qwen3/qwen3_graph.cpp
     src/qwen3/qwen3_backend.cpp
@@ -723,6 +724,11 @@ if(DFLASH27B_TESTS)
         add_executable(test_generate test/test_generate.cpp)
         target_include_directories(test_generate PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(test_generate PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash.cpp")
+        add_executable(test_kvflash test/test_kvflash.cpp)
+        target_include_directories(test_kvflash PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_kvflash PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_restore_delta.cpp")
         add_executable(test_restore_delta test/test_restore_delta.cpp)
