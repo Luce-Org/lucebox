@@ -99,7 +99,9 @@ tail-window/normalization tuning).
 
 ## Known limits
 
-- DDTree tree-verify is not pool-aware (falls back to AR with KVFlash).
+- The harness-only tree-verify graphs (test_dflash) are not pool-aware;
+  the daemon's spec decode, including the --ddtree configuration (chain
+  verify + fast rollback), runs fully on the pool.
 - Post-generation snapshots are skipped once cur_pos exceeds the pool
   (pooled snapshots need page-table serialization).
 - Paging is synchronous (copy-stream overlap is a follow-up).

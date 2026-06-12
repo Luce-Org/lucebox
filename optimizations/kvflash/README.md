@@ -107,8 +107,9 @@ re-tokenize for the drafter, score, map back by char spans); the
 - **Spec decode**: chain-mode verify is slot-mapped (per-token
   `kv_write_rows` + slot-space mask); rejected drafts need no rollback —
   their slots are excluded by the validity rule until rewritten.
-  Acceptance parity with the full cache (15.4-15.6% vs 15.3%). DDTree
-  falls back to AR while KVFlash is active.
+  Acceptance parity with the full cache (15.4-15.6% vs 15.3%), with or
+  without the --ddtree configuration (fast rollback only snapshots
+  DeltaNet state, which is never pooled).
 - **Prefill**: prompts larger than the pool prefill in 64-token chunks at
   constant VRAM (linear time; 256K in ~5.9 min on the 3090).
 

@@ -1657,19 +1657,14 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // - draft model loaded and not parked
     // - feature mirror initialized
     // - greedy decoding (no logit processing) — spec decode uses argmax verification
-    // - kvflash: chain verify is slot-mapped (Qwen35DFlashTarget pooled
-    //   path); DDTree's tree-verify writes are not pool-aware yet, so
-    //   ddtree + pool falls back to AR. Drafter reselect runs in AR mode
-    //   only for now; pooled spec evicts LRU.
-    static bool kvflash_ddtree_warned = false;
-    if (kvflash_active() && cfg_.ddtree_mode && !kvflash_ddtree_warned) {
-        std::fprintf(stderr, "[kvflash] ddtree verify is not pool-aware; "
-                             "using AR decode\n");
-        kvflash_ddtree_warned = true;
-    }
+    // - kvflash: verify_batch is slot-mapped (Qwen35DFlashTarget pooled
+    //   path), and that covers --ddtree too: in the daemon, ddtree_mode
+    //   configures larger verify intermediates + fast_rollback, whose
+    //   snapshot_kv/restore_kv only touch DeltaNet/conv state (pool-
+    //   neutral); generation runs this same chain loop either way. The
+    //   tree-verify graphs exist only in the test harness (test_dflash).
     const bool can_spec = cfg_.draft_path
         && !draft_parked_
-        && !(kvflash_active() && cfg_.ddtree_mode)
         && (cfg_.remote_draft.enabled()
             ? remote_draft_.active()
             : feature_mirror_.target_feat != nullptr)
