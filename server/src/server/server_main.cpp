@@ -413,9 +413,19 @@ int main(int argc, char ** argv) {
             // tokens; cold 64-token chunks page to host. Works with or
             // without pflash (drafter becomes the reselect scorer when
             // loaded; plain LRU otherwise). Forces AR decode.
-            ::setenv("DFLASH_KVFLASH", argv[++i], 1);
+            if (std::atoi(argv[++i]) <= 0) {
+                std::fprintf(stderr, "--kvflash expects a positive token count, got '%s'\n",
+                             argv[i]);
+                return 1;
+            }
+            ::setenv("DFLASH_KVFLASH", argv[i], 1);
         } else if (std::strcmp(argv[i], "--kvflash-tau") == 0 && i + 1 < argc) {
-            ::setenv("DFLASH_KVFLASH_TAU", argv[++i], 1);
+            if (std::atoi(argv[++i]) <= 0) {
+                std::fprintf(stderr, "--kvflash-tau expects a positive interval, got '%s'\n",
+                             argv[i]);
+                return 1;
+            }
+            ::setenv("DFLASH_KVFLASH_TAU", argv[i], 1);
         } else if (std::strcmp(argv[i], "--spark") == 0) {
             spark_autotune = true;
         } else if (std::strcmp(argv[i], "--spark-slots") == 0 && i + 1 < argc) {

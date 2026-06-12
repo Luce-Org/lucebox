@@ -91,6 +91,20 @@ void LagunaBackend::kvflash_read_config() {
     kvflash_tokens_ = env ? std::atoi(env) : 0;
     if (kvflash_tokens_ <= 0) { kvflash_tokens_ = 0; return; }
     kvflash_tokens_ = ((kvflash_tokens_ + 255) / 256) * 256;
+    // Floor: laguna's protected tail covers the SWA window, so the minimum
+    // pool is larger than other archs (see kvflash_attach); without an
+    // evictable block beyond sinks + tail, eviction deadlocks.
+    KvFlashConfig pc;
+    pc.tail_window_chunks =
+        std::max(4, (w_.sliding_window + pc.chunk_tokens - 1) / pc.chunk_tokens + 1);
+    const int floor_tokens =
+        ((KvFlashPager::min_pool_tokens(pc) + 255) / 256) * 256;
+    if (kvflash_tokens_ < floor_tokens) {
+        std::fprintf(stderr, "[kvflash] requested pool %d < minimum %d "
+                             "(SWA tail must stay resident); raising\n",
+                     kvflash_tokens_, floor_tokens);
+        kvflash_tokens_ = floor_tokens;
+    }
     if (kvflash_tokens_ > args_.max_ctx) {
         std::fprintf(stderr, "[kvflash] requested pool %d > max_ctx %d; clamping "
                              "(pool only helps when smaller than the context)\n",

@@ -95,7 +95,7 @@ bool KvFlashDrafterScorer::score_chunks(const std::vector<int32_t> & ids,
                                    std::vector<float> & out) {
     const int S = (int)ids.size();
     out.clear();
-    if (!ctx_ || !ctx_->loaded || S < kLookahead + 1) return false;
+    if (!ctx_ || !ctx_->loaded || S < kLookahead + 1 || chunk_tokens <= 0) return false;
 
     std::vector<int32_t> score_ids = ids;
     if (vocab_clamp_ > 1001) {   // fold range must stay positive

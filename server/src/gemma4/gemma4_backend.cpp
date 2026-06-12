@@ -155,6 +155,15 @@ void Gemma4Backend::kvflash_read_config() {
     kvflash_tokens_ = env ? std::atoi(env) : 0;
     if (kvflash_tokens_ <= 0) { kvflash_tokens_ = 0; return; }
     kvflash_tokens_ = ((kvflash_tokens_ + 255) / 256) * 256;
+    // Floor: sinks + trailing window must leave an evictable block or
+    // eviction deadlocks once the pool fills.
+    const int floor_tokens =
+        ((KvFlashPager::min_pool_tokens(KvFlashConfig{}) + 255) / 256) * 256;
+    if (kvflash_tokens_ < floor_tokens) {
+        std::fprintf(stderr, "[kvflash] requested pool %d < minimum %d; "
+                             "raising\n", kvflash_tokens_, floor_tokens);
+        kvflash_tokens_ = floor_tokens;
+    }
     if (kvflash_tokens_ > cfg_.device.max_ctx) {
         std::fprintf(stderr, "[kvflash] requested pool %d > max_ctx %d; clamping "
                              "(pool only helps when smaller than the context)\n",

@@ -221,6 +221,16 @@ bool Qwen35Backend::init() {
     kvflash_tokens_ = env_int_or_default("DFLASH_KVFLASH", 0);
     if (kvflash_tokens_ > 0) {
         kvflash_tokens_ = ((kvflash_tokens_ + 255) / 256) * 256;
+        // Floor: the pool must keep at least one evictable block beyond the
+        // protected sinks + trailing window, or eviction deadlocks once it
+        // fills (pager attach would refuse; clamp up with a warning instead).
+        const int floor_tokens =
+            ((KvFlashPager::min_pool_tokens(KvFlashConfig{}) + 255) / 256) * 256;
+        if (kvflash_tokens_ < floor_tokens) {
+            std::fprintf(stderr, "[kvflash] requested pool %d < minimum %d; "
+                                 "raising\n", kvflash_tokens_, floor_tokens);
+            kvflash_tokens_ = floor_tokens;
+        }
         // A pool larger than the logical context is meaningless (and the
         // cache tensors are capped at max_ctx): clamp instead of failing
         // pager attach at init.
@@ -1306,6 +1316,13 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             const int n_head_kv = w_.n_head_kv;
             const int64_t slot = pool ? (int64_t)kvflash_pager_.slot_for(committed)
                                       : (int64_t)committed;
+            if (pool && slot < 0) {
+                std::fprintf(stderr, "[kvflash] no pool slot at pos %d "
+                                     "(pool %d exhausted)\n",
+                             committed, kvflash_tokens_);
+                set_last_error("kvflash: no evictable pool block");
+                return false;
+            }
             std::vector<int64_t> row_vals(n_head_kv, slot);
             ggml_backend_tensor_set(sg_.kv_write_rows, row_vals.data(), 0,
                                     sizeof(int64_t) * n_head_kv);

@@ -4,7 +4,7 @@
 // pflash compression uses (forward_qwen3_drafter_model), but returns the
 // per-chunk relevance scores instead of a compressed token list. The
 // DrafterContext is borrowed: the daemon shares its pflash drafter; the
-// pager itself never depends on this file (see common/kv_scorer.h).
+// pager itself never depends on this file (see common/kvflash_scorer.h).
 
 #pragma once
 

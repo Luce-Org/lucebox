@@ -68,10 +68,10 @@ bool build_hybrid_full_layer_step(
 
 // Full target forward: chain mode (all layers, logits + argmax output).
 //
-// `kvflash_mask`: kvflash decode mode — keep the step-invariant set_rows
-// KV write active even though a mask is requested (the mask carries pool
-// slot validity, refreshed by the caller every step). Only meaningful
-// with n_tokens == 1.
+// `kvflash_mask`: kvflash pooled mode — keep the set_rows KV write active
+// even though a mask is requested (the mask carries pool-slot validity and
+// must be re-uploaded by the caller before every compute). Used by both
+// single-token decode and multi-token spec verify; requires fa_window == 0.
 bool build_target_step(
     StepGraph & sg,
     const TargetWeights & w,

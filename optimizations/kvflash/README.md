@@ -37,7 +37,9 @@ dflash_server model.gguf --max-ctx 32768 --kvflash 8192 \
 ```
 
 - `--kvflash <tokens>`: resident pool size (rounded to 256; clamped to
-  `--max-ctx`). Env: `DFLASH_KVFLASH`.
+  `--max-ctx`; floored at the protected minimum — 512 for qwen-family and
+  gemma4, larger on laguna where the SWA window stays resident — so
+  eviction always has a victim). Env: `DFLASH_KVFLASH`.
 - `--kvflash-tau <N>`: reselect interval floor (default 64; the effective
   interval grows with history so rescore overhead stays ~15% of decode).
   Env: `DFLASH_KVFLASH_TAU`.

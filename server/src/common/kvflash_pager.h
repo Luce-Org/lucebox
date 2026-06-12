@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <vector>
@@ -64,10 +65,26 @@ public:
     // `attn_k` / `attn_v` are the per-full-attention-layer cache tensors,
     // each [head_dim, pool_tokens, n_head_kv]. All must share dims/types
     // within their K/V group.
+    // Minimum pool for a config: sinks + trailing window stay resident
+    // unconditionally, so at least 2 more chunks are required (1 evictable
+    // victim + the partially filled append head) or eviction deadlocks and
+    // slot_for() starts failing once the pool fills.
+    static int min_pool_tokens(const KvFlashConfig & cfg) {
+        return (cfg.sink_chunks + cfg.tail_window_chunks + 2) * cfg.chunk_tokens;
+    }
+
     bool attach(const KvFlashConfig & cfg,
                 const std::vector<ggml_tensor *> & attn_k,
                 const std::vector<ggml_tensor *> & attn_v) {
         if (cfg.pool_tokens <= 0 || cfg.pool_tokens % cfg.chunk_tokens != 0) return false;
+        if (cfg.pool_tokens < min_pool_tokens(cfg)) {
+            std::fprintf(stderr,
+                "kvflash: pool %d < minimum %d (%d sink + %d tail chunks must "
+                "leave an evictable block)\n",
+                cfg.pool_tokens, min_pool_tokens(cfg),
+                cfg.sink_chunks, cfg.tail_window_chunks);
+            return false;
+        }
         if (attn_k.empty() || attn_k.size() != attn_v.size()) return false;
         cfg_ = cfg;
         attn_k_ = attn_k;
