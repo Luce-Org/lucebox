@@ -419,10 +419,12 @@ bool build_moe_hybrid_storage_from_file(
             dst.hot_local_by_global[(size_t)expert] = (int32_t)i;
             is_hot[(size_t)expert] = 1;
         }
-        for (int expert = 0; expert < cfg.n_expert; ++expert) {
-            if (!is_hot[(size_t)expert]) {
-                dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
-                dst.cold_expert_ids.push_back((int32_t)expert);
+        if (allocate_cold) {
+            for (int expert = 0; expert < cfg.n_expert; ++expert) {
+                if (!is_hot[(size_t)expert]) {
+                    dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
+                    dst.cold_expert_ids.push_back((int32_t)expert);
+                }
             }
         }
 

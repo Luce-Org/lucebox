@@ -334,14 +334,6 @@ bool emit_status(int stream_fd, int32_t status) {
 #endif
 }
 
-bool checked_mul_size(size_t a, size_t b, size_t & out) {
-    if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
-        return false;
-    }
-    out = a * b;
-    return true;
-}
-
 uint64_t moe_expert_compute_batch_graph_key(int n_tokens, int n_selected) {
     return ((uint64_t)(uint32_t)n_tokens << 32) | (uint32_t)n_selected;
 }
@@ -424,11 +416,11 @@ size_t moe_expert_required_shared_bytes(int n_embd,
     size_t total = 0;
     size_t input_elems = 0;
     size_t selected_elems = 0;
-    if (!checked_mul_size((size_t)batch_limit, (size_t)n_embd, input_elems) ||
-        !checked_mul_size((size_t)batch_limit, (size_t)n_expert_used, selected_elems) ||
-        !checked_mul_size(input_elems, sizeof(float), input_bytes) ||
-        !checked_mul_size(selected_elems, sizeof(int32_t), ids_bytes) ||
-        !checked_mul_size(selected_elems, sizeof(float), weights_bytes) ||
+    if (!moe_expert_compute_checked_mul_size((size_t)batch_limit, (size_t)n_embd, input_elems) ||
+        !moe_expert_compute_checked_mul_size((size_t)batch_limit, (size_t)n_expert_used, selected_elems) ||
+        !moe_expert_compute_checked_mul_size(input_elems, sizeof(float), input_bytes) ||
+        !moe_expert_compute_checked_mul_size(selected_elems, sizeof(int32_t), ids_bytes) ||
+        !moe_expert_compute_checked_mul_size(selected_elems, sizeof(float), weights_bytes) ||
         !backend_ipc_checked_add_size(input_bytes, ids_bytes, total) ||
         !backend_ipc_checked_add_size(total, weights_bytes, total)) {
         return 0;

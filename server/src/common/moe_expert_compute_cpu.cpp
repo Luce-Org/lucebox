@@ -34,6 +34,7 @@ public:
 #ifdef _OPENMP
         if (n_threads <= 0) {
             const char * env = std::getenv("DFLASH_MOE_EXPERT_COMPUTE_THREADS");
+            if (!env) env = std::getenv("DFLASH_COLD_THREADS");
             n_threads = env ? std::atoi(env) : 0;
         }
         n_threads_ = n_threads > 0 ? n_threads : std::min(omp_get_max_threads(), 8);

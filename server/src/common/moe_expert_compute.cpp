@@ -98,6 +98,7 @@ std::vector<MoeExpertLayer> make_moe_expert_layers(
 void MoeExpertComputeRuntime::reset() {
     compute.reset();
     layers.clear();
+    target_path.clear();
     placement_fingerprint = 0;
 }
 
@@ -124,9 +125,11 @@ bool ensure_moe_expert_compute_runtime(
     const bool can_reuse =
         runtime.compute &&
         runtime.compute->healthy() &&
+        runtime.target_path == cfg.target_path &&
         runtime.placement_fingerprint == fingerprint;
     if (!can_reuse) {
         runtime.compute.reset();
+        runtime.target_path.clear();
         runtime.placement_fingerprint = 0;
     }
 
@@ -156,6 +159,7 @@ bool ensure_moe_expert_compute_runtime(
     }
 
     runtime.layers = make_moe_expert_layers(hybrid, layer_descs);
+    runtime.target_path = cfg.target_path;
     runtime.placement_fingerprint = fingerprint;
     return true;
 }

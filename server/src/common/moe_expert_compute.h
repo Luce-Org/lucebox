@@ -117,6 +117,7 @@ struct MoeExpertComputeIpcStartResult {
 struct MoeExpertComputeRuntime {
     std::unique_ptr<MoeExpertCompute> compute;
     std::vector<MoeExpertLayer> layers;
+    std::string target_path;
     uint64_t placement_fingerprint = 0;
 
     void reset();

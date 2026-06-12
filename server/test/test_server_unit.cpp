@@ -43,6 +43,14 @@
 #include <dirent.h>
 #include <unistd.h>
 
+#if defined(_WIN32)
+#define dflash_setenv(name, value) _putenv_s(name, value)
+#define dflash_unsetenv(name) _putenv_s(name, "")
+#else
+#define dflash_setenv(name, value) setenv(name, value, 1)
+#define dflash_unsetenv(name) unsetenv(name)
+#endif
+
 using json = nlohmann::json;
 using namespace dflash::common;
 
@@ -2692,31 +2700,25 @@ static void test_backend_ipc_shared_payload_segment_contract() {
 }
 
 static void test_moe_hybrid_expert_compute_batch_default() {
-#if !defined(_WIN32)
-    unsetenv("DFLASH_MOE_EXPERT_COMPUTE_BATCH");
-    unsetenv("DFLASH_MOE_EXPERT_COMPUTE_BATCH_MAX");
-#endif
+    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_BATCH");
+    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_BATCH_MAX");
     TEST_ASSERT(moe_hybrid_expert_compute_batch_limit() == 32);
 }
 
 static void test_moe_hybrid_prefill_hot_sub_batch_limit() {
-#if !defined(_WIN32)
-    unsetenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH");
+    dflash_unsetenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH");
     TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 4);
 
-    setenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH", "0", 1);
+    dflash_setenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH", "0");
     TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 4);
 
-    setenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH", "3", 1);
+    dflash_setenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH", "3");
     TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 3);
 
-    setenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH", "8", 1);
+    dflash_setenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH", "8");
     TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 4);
 
-    unsetenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH");
-#else
-    TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 4);
-#endif
+    dflash_unsetenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
