@@ -19,7 +19,7 @@
 ---
 
 ```
-                         decode tok/s   KV in VRAM   needle (d=10/50/90%)
+                         decode tok/s   KV in VRAM (Q8_0)   needle (d=10/50/90%)
 full cache  @  64K            27.8        1152 MiB        16/16
 full cache  @ 128K            19.6        2304 MiB        16/16
 full cache  @ 256K            13.1        4608 MiB        16/16

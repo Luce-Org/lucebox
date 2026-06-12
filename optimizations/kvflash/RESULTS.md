@@ -6,7 +6,7 @@ Qwen3-0.6B pflash drafter as the scorer. June 2026, `test_kvflash` +
 
 ## End-to-end long-prompt A/B (`--longab`; needle depth 0.25, 240-token timed free run)
 
-| context | mode | prefill | decode tok/s | needle /16 | KV in VRAM |
+| context | mode | prefill | decode tok/s | needle /16 | KV in VRAM (Q8_0) |
 |---|---|---|---|---|---|
 | 32K  | full    | 47.2 s  | 32.8 | 16 | 576 MiB |
 | 32K  | KVFlash 4K | 41.8 s | 29.0 | 15 | 72 MiB |
