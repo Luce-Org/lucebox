@@ -26,10 +26,28 @@ struct DeepSeek4ExpertIpcRequestHeader {
 
 struct DeepSeek4ExpertIpcResponseHeader {
     uint32_t magic = 0x44533452u; // "DS4R"
-    uint32_t version = 1;
+    uint32_t version = 2;
     int32_t status = 0;
     int32_t n_tokens = 0;
     int32_t n_embd = 0;
+    uint64_t worker_request_read_us = 0;
+    uint64_t worker_partition_us = 0;
+    uint64_t worker_resident_eval_us = 0;
+    uint64_t worker_miss_build_us = 0;
+    uint64_t worker_miss_eval_us = 0;
+};
+
+struct DeepSeek4ExpertIpcTiming {
+    uint64_t parent_write_us = 0;
+    uint64_t parent_wait_us = 0;
+    uint64_t parent_read_us = 0;
+    uint64_t worker_request_read_us = 0;
+    uint64_t worker_partition_us = 0;
+    uint64_t worker_resident_eval_us = 0;
+    uint64_t worker_miss_build_us = 0;
+    uint64_t worker_miss_eval_us = 0;
+    uint64_t request_bytes = 0;
+    uint64_t response_bytes = 0;
 };
 
 class DeepSeek4ExpertIpcClient {
@@ -52,7 +70,8 @@ public:
               const float * activations,
               const int32_t * selected_ids,
               const float * selected_weights,
-              std::vector<float> & out);
+              std::vector<float> & out,
+              DeepSeek4ExpertIpcTiming * timing = nullptr);
     bool active() const { return active_; }
     void close();
 

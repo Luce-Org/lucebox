@@ -10,6 +10,7 @@
 #include "ggml-cuda.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -20,6 +21,13 @@
 namespace dflash::common {
 
 namespace {
+
+using WorkerClock = std::chrono::steady_clock;
+
+static uint64_t worker_elapsed_us(WorkerClock::time_point start,
+                                  WorkerClock::time_point end) {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+}
 
 struct Ds4ExpertWorker {
     ggml_backend_t backend = nullptr;
@@ -223,12 +231,14 @@ static bool eval_worker_token(Ds4ExpertWorker & worker,
                               const float * selected_weights,
                               int n_selected,
                               std::vector<float> & out,
-                              std::string & err) {
+                              std::string & err,
+                              DeepSeek4ExpertIpcTiming * timing) {
     auto & resident = worker.storage->layers[(size_t)layer];
     std::vector<int32_t> resident_ids;
     std::vector<float> resident_weights;
     std::vector<int32_t> miss_ids;
     std::vector<float> miss_weights;
+    const auto partition_t0 = WorkerClock::now();
     for (int i = 0; i < n_selected; ++i) {
         const int32_t gid = selected_ids[i];
         if (gid < 0 || gid >= worker.weights.n_expert) {
@@ -244,15 +254,18 @@ static bool eval_worker_token(Ds4ExpertWorker & worker,
             miss_weights.push_back(selected_weights[i]);
         }
     }
+    if (timing) timing->worker_partition_us += worker_elapsed_us(partition_t0, WorkerClock::now());
 
     out.assign((size_t)worker.cfg.n_embd, 0.0f);
     MoeLayerDesc desc = make_worker_desc(worker.weights.layers[(size_t)layer]);
     std::vector<float> partial;
+    const auto resident_t0 = WorkerClock::now();
     if (!eval_worker_selected(worker.backend, worker.cfg, desc, resident,
                               worker.storage->cpu_backend, activation,
                               resident_ids, resident_weights, partial, err)) {
         return false;
     }
+    if (timing) timing->worker_resident_eval_us += worker_elapsed_us(resident_t0, WorkerClock::now());
     for (int i = 0; i < worker.cfg.n_embd; ++i) {
         out[(size_t)i] += partial[(size_t)i];
     }
@@ -262,20 +275,24 @@ static bool eval_worker_token(Ds4ExpertWorker & worker,
     MoeHybridStorage miss_storage;
     MoeHybridPlacement miss_placement =
         make_single_layer_placement(worker.weights, layer, miss_ids);
+    const auto miss_build_t0 = WorkerClock::now();
     if (!build_deepseek4_moe_hybrid_storage_from_file(
             worker.model_path, worker.backend, worker.weights, miss_placement,
             &worker.cfg, miss_storage, &err)) {
         return false;
     }
+    if (timing) timing->worker_miss_build_us += worker_elapsed_us(miss_build_t0, WorkerClock::now());
     std::fprintf(stderr,
                  "[deepseek4-expert-ipc-daemon] file-backed miss layer=%d experts=%zu\n",
                  layer, miss_ids.size());
+    const auto miss_eval_t0 = WorkerClock::now();
     if (!eval_worker_selected(worker.backend, worker.cfg, desc,
                               miss_storage.layers[(size_t)layer],
                               miss_storage.cpu_backend, activation,
                               miss_ids, miss_weights, partial, err)) {
         return false;
     }
+    if (timing) timing->worker_miss_eval_us += worker_elapsed_us(miss_eval_t0, WorkerClock::now());
     for (int i = 0; i < worker.cfg.n_embd; ++i) {
         out[(size_t)i] += partial[(size_t)i];
     }
@@ -309,11 +326,19 @@ static bool write_eval_response(int stream_fd,
                                 int status,
                                 int n_tokens,
                                 int n_embd,
-                                const std::vector<float> * out) {
+                                const std::vector<float> * out,
+                                const DeepSeek4ExpertIpcTiming * timing = nullptr) {
     DeepSeek4ExpertIpcResponseHeader resp;
     resp.status = status;
     resp.n_tokens = n_tokens;
     resp.n_embd = n_embd;
+    if (timing) {
+        resp.worker_request_read_us = timing->worker_request_read_us;
+        resp.worker_partition_us = timing->worker_partition_us;
+        resp.worker_resident_eval_us = timing->worker_resident_eval_us;
+        resp.worker_miss_build_us = timing->worker_miss_build_us;
+        resp.worker_miss_eval_us = timing->worker_miss_eval_us;
+    }
     if (!write_exact_fd(stream_fd, &resp, sizeof(resp))) return false;
     if (status == 0 && out && !out->empty()) {
         return write_exact_fd(stream_fd, out->data(), out->size() * sizeof(float));
@@ -366,12 +391,16 @@ int run_deepseek4_expert_ipc_daemon(const char * model_path,
             std::vector<float> activations;
             std::vector<int32_t> ids;
             std::vector<float> weights;
-            if (path.empty() || !read_eval_request(path, hdr, activations, ids, weights) ||
+            DeepSeek4ExpertIpcTiming timing;
+            const auto request_read_t0 = WorkerClock::now();
+            const bool request_ok = !path.empty() && read_eval_request(path, hdr, activations, ids, weights);
+            timing.worker_request_read_us = worker_elapsed_us(request_read_t0, WorkerClock::now());
+            if (!request_ok ||
                 hdr.layer >= worker.weights.n_layer ||
                 hdr.n_embd != worker.weights.n_embd) {
                 std::fprintf(stderr, "[deepseek4-expert-ipc-daemon] bad eval request: %s\n",
                              line.c_str());
-                write_eval_response(stream_fd, -1, 0, 0, nullptr);
+                write_eval_response(stream_fd, -1, 0, 0, nullptr, &timing);
                 continue;
             }
 
@@ -385,7 +414,7 @@ int run_deepseek4_expert_ipc_daemon(const char * model_path,
                         activations.data() + (size_t)t * (size_t)hdr.n_embd,
                         ids.data() + (size_t)t * (size_t)hdr.n_selected,
                         weights.data() + (size_t)t * (size_t)hdr.n_selected,
-                        hdr.n_selected, one_out, err)) {
+                        hdr.n_selected, one_out, err, &timing)) {
                     std::fprintf(stderr, "[deepseek4-expert-ipc-daemon] eval failed layer=%d: %s\n",
                                  hdr.layer, err.c_str());
                     ok = false;
@@ -395,7 +424,7 @@ int run_deepseek4_expert_ipc_daemon(const char * model_path,
                           out.begin() + (size_t)t * (size_t)hdr.n_embd);
             }
             write_eval_response(stream_fd, ok ? 0 : -2, hdr.n_tokens, hdr.n_embd,
-                                ok ? &out : nullptr);
+                                ok ? &out : nullptr, &timing);
             continue;
         }
         std::fprintf(stderr, "[deepseek4-expert-ipc-daemon] unknown command: %s\n", line.c_str());

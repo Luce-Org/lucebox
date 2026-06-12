@@ -50,6 +50,16 @@ struct DeepSeek4StepTelemetry {
     uint64_t ffn_combine_us = 0;
     uint64_t ffn_partition_us = 0;
     uint64_t worker_us = 0;
+    uint64_t worker_parent_write_us = 0;
+    uint64_t worker_parent_wait_us = 0;
+    uint64_t worker_parent_read_us = 0;
+    uint64_t worker_request_read_us = 0;
+    uint64_t worker_partition_us = 0;
+    uint64_t worker_resident_eval_us = 0;
+    uint64_t worker_miss_build_us = 0;
+    uint64_t worker_miss_eval_us = 0;
+    uint64_t worker_request_bytes = 0;
+    uint64_t worker_response_bytes = 0;
     uint64_t hc_post_ffn_us = 0;
     uint64_t output_us = 0;
     uint64_t sample_us = 0;

@@ -4,11 +4,21 @@
 #include "io_utils.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cstdio>
 #include <fstream>
 
 namespace dflash::common {
+namespace {
+
+using IpcClock = std::chrono::steady_clock;
+
+static uint64_t ipc_elapsed_us(IpcClock::time_point start, IpcClock::time_point end) {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+}
+
+} // namespace
 
 bool DeepSeek4ExpertIpcClient::start(const std::string & bin,
                                      const std::string & model_path,
@@ -71,7 +81,8 @@ bool DeepSeek4ExpertIpcClient::eval(int layer,
                                     const float * activations,
                                     const int32_t * selected_ids,
                                     const float * selected_weights,
-                                    std::vector<float> & out) {
+                                    std::vector<float> & out,
+                                    DeepSeek4ExpertIpcTiming * timing) {
 #if defined(_WIN32)
     (void)layer; (void)n_tokens; (void)n_embd; (void)n_selected;
     (void)activations; (void)selected_ids; (void)selected_weights; (void)out;
@@ -86,7 +97,16 @@ bool DeepSeek4ExpertIpcClient::eval(int layer,
         return false;
     }
 
+    DeepSeek4ExpertIpcTiming local_timing;
+    DeepSeek4ExpertIpcTiming & t = timing ? *timing : local_timing;
+    t = {};
+    t.request_bytes = sizeof(DeepSeek4ExpertIpcRequestHeader) +
+        sizeof(float) * (size_t)n_tokens * (size_t)n_embd +
+        sizeof(int32_t) * (size_t)n_tokens * (size_t)n_selected +
+        sizeof(float) * (size_t)n_tokens * (size_t)n_selected;
+
     const std::string path = process_.next_path("ds4_expert_req");
+    const auto write_t0 = IpcClock::now();
     {
         std::ofstream f(path, std::ios::binary);
         if (!f) return false;
@@ -107,20 +127,33 @@ bool DeepSeek4ExpertIpcClient::eval(int layer,
             return false;
         }
     }
+    t.parent_write_us = ipc_elapsed_us(write_t0, IpcClock::now());
 
     std::fprintf(cmd, "eval %s\n", path.c_str());
     std::fflush(cmd);
 
     DeepSeek4ExpertIpcResponseHeader resp;
+    const auto wait_t0 = IpcClock::now();
     bool ok = read_exact_fd(stream_fd, &resp, sizeof(resp)) &&
               resp.magic == 0x44533452u &&
-              resp.version == 1 &&
+              resp.version >= 1 &&
               resp.status == 0 &&
               resp.n_tokens == n_tokens &&
               resp.n_embd == n_embd;
+    t.parent_wait_us = ipc_elapsed_us(wait_t0, IpcClock::now());
+    if (ok) {
+        t.worker_request_read_us = resp.worker_request_read_us;
+        t.worker_partition_us = resp.worker_partition_us;
+        t.worker_resident_eval_us = resp.worker_resident_eval_us;
+        t.worker_miss_build_us = resp.worker_miss_build_us;
+        t.worker_miss_eval_us = resp.worker_miss_eval_us;
+    }
     if (ok) {
         out.assign((size_t)n_tokens * (size_t)n_embd, 0.0f);
+        const auto read_t0 = IpcClock::now();
         ok = read_exact_fd(stream_fd, out.data(), out.size() * sizeof(float));
+        t.parent_read_us = ipc_elapsed_us(read_t0, IpcClock::now());
+        t.response_bytes = sizeof(resp) + out.size() * sizeof(float);
     }
     std::remove(path.c_str());
     if (!ok) {

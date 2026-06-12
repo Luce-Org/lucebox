@@ -67,6 +67,16 @@ static void add_step_tel(DeepSeek4StepTelemetry & dst, const DeepSeek4StepTeleme
     dst.ffn_combine_us += src.ffn_combine_us;
     dst.ffn_partition_us += src.ffn_partition_us;
     dst.worker_us += src.worker_us;
+    dst.worker_parent_write_us += src.worker_parent_write_us;
+    dst.worker_parent_wait_us += src.worker_parent_wait_us;
+    dst.worker_parent_read_us += src.worker_parent_read_us;
+    dst.worker_request_read_us += src.worker_request_read_us;
+    dst.worker_partition_us += src.worker_partition_us;
+    dst.worker_resident_eval_us += src.worker_resident_eval_us;
+    dst.worker_miss_build_us += src.worker_miss_build_us;
+    dst.worker_miss_eval_us += src.worker_miss_eval_us;
+    dst.worker_request_bytes += src.worker_request_bytes;
+    dst.worker_response_bytes += src.worker_response_bytes;
     dst.hc_post_ffn_us += src.hc_post_ffn_us;
     dst.output_us += src.output_us;
     dst.sample_us += src.sample_us;
@@ -90,6 +100,9 @@ static void log_step_tel(const char * phase,
         "step=%.1fms embed=%.1fms attn_build=%.1fms attn_compute=%.1fms attn_read=%.1fms "
         "route_build=%.1fms route_compute=%.1fms route_read=%.1fms route_select=%.1fms "
         "ffn=%.1fms hot=%.1fms cold=%.1fms combine=%.1fms partition=%.1fms worker=%.1fms "
+        "worker_write=%.1fms worker_wait=%.1fms worker_read=%.1fms worker_req_read=%.1fms "
+        "worker_part=%.1fms worker_resident=%.1fms worker_miss_build=%.1fms worker_miss=%.1fms "
+        "worker_req_kib=%.1f worker_resp_kib=%.1f "
         "hc_pre=%.1fms hc_post=%.1fms output=%.1fms sample=%.1fms emit=%.1fms "
         "hot_sel=%d cold_sel=%d\n",
         phase, tokens, steps, wall_s, tok_s,
@@ -97,6 +110,11 @@ static void log_step_tel(const char * phase,
         ms(t.route_build_us), ms(t.route_compute_us), ms(t.route_read_us), ms(t.route_select_us),
         ms(t.ffn_eval_us), ms(t.ffn_hot_us), ms(t.ffn_cold_us), ms(t.ffn_combine_us),
         ms(t.ffn_partition_us), ms(t.worker_us),
+        ms(t.worker_parent_write_us), ms(t.worker_parent_wait_us), ms(t.worker_parent_read_us),
+        ms(t.worker_request_read_us), ms(t.worker_partition_us), ms(t.worker_resident_eval_us),
+        ms(t.worker_miss_build_us), ms(t.worker_miss_eval_us),
+        (double)t.worker_request_bytes / 1024.0,
+        (double)t.worker_response_bytes / 1024.0,
         ms(t.hc_pre_attn_us + t.hc_pre_ffn_us),
         ms(t.hc_post_attn_us + t.hc_post_ffn_us),
         ms(t.output_us), ms(t.sample_us), ms(t.emit_us),

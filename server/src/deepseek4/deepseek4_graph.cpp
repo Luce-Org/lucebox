@@ -793,14 +793,25 @@ static bool eval_ds4_hybrid_or_worker(
         std::memcpy(dst, single_out.data(), sizeof(float) * (size_t)n_embd);
         if (!remote_ids.empty()) {
             const auto worker_t0 = Ds4TimingClock::now();
+            DeepSeek4ExpertIpcTiming ipc_timing;
             if (!expert_worker->eval(layer, 1, n_embd, (int)remote_ids.size(),
                                      ffn_normed_host + (size_t)ti * (size_t)n_embd,
                                      remote_ids.data(), remote_weights.data(),
-                                     worker_out)) {
+                                     worker_out, step_tel ? &ipc_timing : nullptr)) {
                 return false;
             }
             if (step_tel) step_tel->worker_us += ds4_elapsed_us(worker_t0, Ds4TimingClock::now());
             if (step_tel) {
+                step_tel->worker_parent_write_us += ipc_timing.parent_write_us;
+                step_tel->worker_parent_wait_us += ipc_timing.parent_wait_us;
+                step_tel->worker_parent_read_us += ipc_timing.parent_read_us;
+                step_tel->worker_request_read_us += ipc_timing.worker_request_read_us;
+                step_tel->worker_partition_us += ipc_timing.worker_partition_us;
+                step_tel->worker_resident_eval_us += ipc_timing.worker_resident_eval_us;
+                step_tel->worker_miss_build_us += ipc_timing.worker_miss_build_us;
+                step_tel->worker_miss_eval_us += ipc_timing.worker_miss_eval_us;
+                step_tel->worker_request_bytes += ipc_timing.request_bytes;
+                step_tel->worker_response_bytes += ipc_timing.response_bytes;
                 if (worker_owns_hot_ids) {
                     step_tel->hot_selected += (int)remote_ids.size();
                 } else {
