@@ -7,6 +7,7 @@
   <a href="https://huggingface.co/Lucebox"><img src="https://img.shields.io/badge/HuggingFace-f5c842?style=for-the-badge&logo=huggingface&logoColor=f5c842&labelColor=090909" alt="HuggingFace"></a>
   <a href="https://discord.gg/yHfswqZmJQ"><img src="https://img.shields.io/badge/Discord-f5c842?style=for-the-badge&logo=discord&logoColor=f5c842&labelColor=090909" alt="Discord"></a>
   <a href="https://lucebox.com/blog"><img src="https://img.shields.io/badge/Blog-f5c842?style=for-the-badge&logo=rss&logoColor=f5c842&labelColor=090909" alt="Blog"></a>
+  <a href="#demos"><img src="https://img.shields.io/badge/Demos-f5c842?style=for-the-badge&logo=youtube&logoColor=f5c842&labelColor=090909" alt="Demos"></a>
 </p>
 
 <p align="center">
@@ -387,6 +388,21 @@ Nothing was built for local AI inference. Most machines bolt a stock GPU onto a 
 - **Website**: [lucebox.com](https://lucebox.com)
 - **Issues**: [github.com/Luce-Org/lucebox-hub/issues](https://github.com/Luce-Org/lucebox-hub/issues)
 - **Blog**: [lucebox.com/blog](https://lucebox.com/blog)
+
+---
+
+## Demos
+
+Video walkthroughs of each optimization and the harness setup.
+
+| Demo | Video |
+|------|-------|
+| Luce Spark | [YouTube](https://www.youtube.com/watch?v=LB1aVj9lNhg) |
+| Luce DFlash | [YouTube](https://www.youtube.com/watch?v=vbPGvvSB8IQ) |
+| Luce Turboquant | [YouTube](https://www.youtube.com/watch?v=uTOOrfhrnBk) |
+| Luce Harness setup | [YouTube](https://www.youtube.com/watch?v=PysoxVGfvRE) |
+| Luce PFlash | [YouTube](https://www.youtube.com/watch?v=NWeKUL9Bc6Y) |
+| Luce Megakernel | [YouTube](https://www.youtube.com/watch?v=e6jY4goVIu0) |
 
 ---
 
