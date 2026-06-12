@@ -67,6 +67,11 @@ bool build_hybrid_full_layer_step(
     int kq_stride_pad = KQ_MASK_PAD);
 
 // Full target forward: chain mode (all layers, logits + argmax output).
+//
+// `kvflash_mask`: kvflash decode mode — keep the step-invariant set_rows
+// KV write active even though a mask is requested (the mask carries pool
+// slot validity, refreshed by the caller every step). Only meaningful
+// with n_tokens == 1.
 bool build_target_step(
     StepGraph & sg,
     const TargetWeights & w,
@@ -80,7 +85,8 @@ bool build_target_step(
     int fa_window = 0,
     bool last_token_logits_only = false,
     int kq_stride_pad = KQ_MASK_PAD,
-    bool capture_moe_router = false);
+    bool capture_moe_router = false,
+    bool kvflash_mask = false);
 
 // Full target forward: DDTree tree-verify mode.
 bool build_target_step_tree(

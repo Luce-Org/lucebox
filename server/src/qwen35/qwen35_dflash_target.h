@@ -10,6 +10,7 @@
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights
 #include "step_graph.h"
 #include "graph_builders.h"
+#include "kvflash_pager.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -53,6 +54,14 @@ public:
     int mask_token_id() const override;
     const std::vector<int> & capture_layer_ids() const override;
 
+    // kvflash mode: verify writes are slot-mapped via the pager and the
+    // attention mask carries slot validity (resident committed positions
+    // only) plus causal structure among the verify tokens. Rejected draft
+    // tokens need no explicit rollback: their slots are excluded by the
+    // pos < base_pos validity rule on the next verify and get rewritten.
+    // Forces fa_window = 0 (logical windowing is meaningless in slot space).
+    void set_kvflash_pager(KvFlashPager * pager) { pager_ = pager; }
+
 private:
     TargetWeights & w_;
     TargetCache & cache_;
@@ -60,6 +69,7 @@ private:
     StepGraph & sg_;
     int kq_stride_pad_;
     int fa_window_;
+    KvFlashPager * pager_ = nullptr;
 
     // Cached vector form of capture layer IDs (built once in constructor).
     std::vector<int> capture_ids_;

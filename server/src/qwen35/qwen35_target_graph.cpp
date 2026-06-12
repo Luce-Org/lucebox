@@ -76,10 +76,11 @@ bool create_target_cache(const TargetWeights & w,
                          int max_verify_tokens,
                          ggml_backend_t backend,
                          TargetCache & out,
-                         bool prefill_only) {
+                         bool prefill_only,
+                         int ctx_alloc) {
     return create_target_cache_partial(w, max_ctx, max_verify_tokens, backend,
                                        out, prefill_only,
-                                       0, w.n_layer, true);
+                                       0, w.n_layer, true, ctx_alloc);
 }
 
 bool create_target_cache_partial(const TargetWeights & w,
@@ -90,7 +91,8 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  bool prefill_only,
                                  int layer_begin,
                                  int layer_end,
-                                 bool allocate_target_feat) {
+                                 bool allocate_target_feat,
+                                 int ctx_alloc) {
     if (layer_begin < 0) layer_begin = 0;
     if (layer_end < 0 || layer_end > w.n_layer) layer_end = w.n_layer;
     if (layer_begin > layer_end) {
@@ -133,9 +135,14 @@ bool create_target_cache_partial(const TargetWeights & w,
 
     const bool needs_256_stride =
         kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0;
+    // kvflash mode: attention tensors are allocated at the (smaller)
+    // physical pool capacity; logical positions are mapped to pool slots
+    // by KvFlashPager. The 256-stride rounding applies to whichever capacity
+    // is in effect.
+    const int ctx_phys = (ctx_alloc > 0 && ctx_alloc < max_ctx) ? ctx_alloc : max_ctx;
     const int max_ctx_alloc = needs_256_stride
-        ? ((max_ctx + 255) / 256) * 256
-        : max_ctx;
+        ? ((ctx_phys + 255) / 256) * 256
+        : ctx_phys;
 
     // ── Base context: KV cache + SSM/conv state + target_feat ────────
     {

@@ -471,12 +471,18 @@ bool restore_target_cache_chain(const PrefixSnapshot * thick,
 // When prefill_only is true, rollback tensors (snapshots, intermediates) are
 // skipped — saving ~1.4 GB on 48 DeltaNet layers. Use migrate_prefill_cache()
 // to promote the cache to a full decode cache after prefill.
+// `ctx_alloc` (0 = max_ctx): physical token capacity of the attention KV
+// tensors. When smaller than max_ctx, a KvFlashPager maps logical positions to
+// pool slots and pages cold chunks to host (bounded KV residency); the
+// logical context bound stays max_ctx. Recurrent (DeltaNet) state is
+// unaffected.
 bool create_target_cache(const TargetWeights & w,
                          int max_ctx,
                          int max_verify_tokens,
                          ggml_backend_t backend,
                          TargetCache & out,
-                         bool prefill_only = false);
+                         bool prefill_only = false,
+                         int ctx_alloc = 0);
 
 bool create_target_cache_partial(const TargetWeights & w,
                                  int max_ctx,
@@ -486,7 +492,8 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  bool prefill_only,
                                  int layer_begin,
                                  int layer_end,
-                                 bool allocate_target_feat);
+                                 bool allocate_target_feat,
+                                 int ctx_alloc = 0);
 
 void free_target_cache(TargetCache & c);
 

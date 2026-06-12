@@ -408,6 +408,14 @@ int main(int argc, char ** argv) {
             bargs.fast_rollback = true;
         } else if (std::strcmp(argv[i], "--ddtree-budget") == 0 && i + 1 < argc) {
             bargs.ddtree_budget = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--kvflash") == 0 && i + 1 < argc) {
+            // Bounded KV residency: attention KV lives in a fixed pool of N
+            // tokens; cold 64-token chunks page to host. Works with or
+            // without pflash (drafter becomes the reselect scorer when
+            // loaded; plain LRU otherwise). Forces AR decode.
+            ::setenv("DFLASH_KVFLASH", argv[++i], 1);
+        } else if (std::strcmp(argv[i], "--kvflash-tau") == 0 && i + 1 < argc) {
+            ::setenv("DFLASH_KVFLASH_TAU", argv[++i], 1);
         } else if (std::strcmp(argv[i], "--spark") == 0) {
             spark_autotune = true;
         } else if (std::strcmp(argv[i], "--spark-slots") == 0 && i + 1 < argc) {
