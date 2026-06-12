@@ -236,8 +236,12 @@ and masks through it. What differs per arch:
 - **gemma4**: pools FULL-attention layers only — SWA layers already use
   sliding-window ring buffers and KV-reuse layers share their source's
   tensors. The full mask is slot-space; the SWA ring path is untouched.
-  `--fa-window` (sparse full-attn) and kvflash are mutually exclusive;
-  DFlash spec verify falls back to AR.
+  `--fa-window` (sparse full-attn) and kvflash are mutually exclusive.
+  DFlash spec verify is slot-mapped (gemma4_verify_batch gains set_rows
+  inputs + the slot-space causal mask; its KV-truncation rejection
+  semantics map directly onto the pool's validity rule). Measured:
+  identical acceptance pooled vs full (407/3104 = 13.1%, avg_commit
+  3.09, identical text).
 
 Policy: drafter-scored residency is the default on all four archs. The
 server probes for the Qwen3-0.6B next to the model (or --prefill-drafter)

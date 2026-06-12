@@ -54,13 +54,17 @@ Base-vs-base control: 16/16 byte-identical — the stack is deterministic.
 Text drift under KVFlash is the masked decode kernel's different (equally
 deterministic) rounding lineage, not noise and not a correctness effect.
 
-## Spec decode (chain mode, slot-mapped verify, daemon)
+## Spec decode (slot-mapped verify, daemon)
 
 | config | accept rate | avg_commit | output |
 |---|---|---|---|
-| full cache, 2400 tok | 15.3% | 3.45 | coherent |
-| KVFlash 2K, 1800 tok | 15.4% | 3.47 | coherent |
-| KVFlash 2K, 2400 tok (live eviction mid-spec) | 15.6% | 3.49 | coherent |
+| qwen35 full cache, 2400 tok | 15.3% | 3.45 | coherent |
+| qwen35 KVFlash 2K, 1800 tok | 15.4% | 3.47 | coherent |
+| qwen35 KVFlash 2K, 2400 tok (live eviction mid-spec) | 15.6% | 3.49 | coherent |
+| qwen35 --ddtree full cache, 600 tok | 13.9% | 3.23 | coherent |
+| qwen35 --ddtree KVFlash 2K, 600 tok | 14.6% | 3.33 | coherent |
+| gemma4 full cache, 600 tok | 13.1% (407/3104) | 3.09 | coherent |
+| gemma4 KVFlash 2K, 600 tok | 13.1% (407/3104) | 3.09 | identical text to full |
 
 ## Microbenchmarks
 

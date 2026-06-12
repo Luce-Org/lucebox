@@ -86,7 +86,7 @@ conservative default and 6-9% is measured safe for retrieval workloads.
 | qwen35 | Qwen3.5/3.6-27B | masked set_rows decode + slot-mapped spec verify | LRU or pflash drafter | reference integration; all RESULTS.md numbers |
 | qwen35moe | Qwen3.6-35B-A3B | pipelined hybrid decode (Spark) + all-GPU | LRU or pflash drafter | maskless pool span (zero-row approximation, same as production padding); hybrid spec falls back to AR |
 | laguna | Laguna-XS.2 | single-graph hybrid + all-GPU, slot-space full+SWA masks | LRU or drafter (cross-tok, untuned) | pager covers all 40 layers; protected tail >= sliding_window keeps SWA exact |
-| gemma4 | Gemma4 26B-A4B / 31B | masked decode, slot-space full mask | LRU or drafter (cross-tok, untuned) | pools FULL-attention layers only (SWA layers already ring-buffer); spec falls back to AR |
+| gemma4 | Gemma4 26B-A4B / 31B | masked decode + slot-mapped spec verify, slot-space full mask | LRU or drafter (cross-tok, untuned) | pools FULL-attention layers only (SWA layers already ring-buffer) |
 
 Non-qwen targets use the cross-tokenizer scorer (detokenize target ids,
 re-tokenize for the drafter, score, map back by char spans); the

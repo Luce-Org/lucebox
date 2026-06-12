@@ -32,6 +32,10 @@ public:
                       int & last_tok,
                       std::vector<int32_t> * all_argmax = nullptr) override;
 
+    // kvflash: route verify writes through the pool (slots allocated here,
+    // slot-space mask inside gemma4_verify_batch). Non-owning.
+    void set_kvflash_pager(class KvFlashPager * pager) { pager_ = pager; }
+
     bool snapshot_kv() override;
     bool restore_kv() override;
 
@@ -52,6 +56,7 @@ private:
     Gemma4Weights & w_;
     Gemma4Cache & cache_;
     ggml_backend_t backend_;
+    class KvFlashPager * pager_ = nullptr;
 
     // Capture layer IDs (built once in constructor).
     std::vector<int> capture_ids_;

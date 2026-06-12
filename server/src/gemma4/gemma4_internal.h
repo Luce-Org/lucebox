@@ -245,6 +245,12 @@ bool gemma4_step(
 
 // Verify batch: run forward pass returning argmax for ALL positions.
 // Used by DFlash speculative decode target.
+// `kvflash`: optional bounded-residency pager (caller must alloc_span()
+// [kv_start, kv_start+n_tokens) first). Full-layer writes go to pool slots
+// via set_rows with a slot-space causal mask; SWA ring writes/masks are
+// unchanged. Rejected draft slots hold future positions, so the validity
+// rule excludes them until the next verify rewrites them (KV truncation
+// semantics, same as the full cache).
 bool gemma4_verify_batch(
     ggml_backend_t          backend,
     const Gemma4Weights &   w,
@@ -253,7 +259,8 @@ bool gemma4_verify_batch(
     const int32_t *         token_ids,
     int                     n_tokens,
     int                     kv_start,
-    std::vector<int32_t> &  out_argmax);
+    std::vector<int32_t> &  out_argmax,
+    const class KvFlashPager * kvflash = nullptr);
 
 // Project hidden states through lm_head (out_norm + output + softcap + argmax).
 // Used by DFlash draft to convert draft hidden states to token IDs.

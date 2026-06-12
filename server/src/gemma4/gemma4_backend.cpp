@@ -141,6 +141,7 @@ bool Gemma4Backend::unpark(const std::string & what) {
         if (cfg_.draft_path && !draft_parked_ && draft_backend_) {
             delete dflash_target_;
             dflash_target_ = new Gemma4DFlashTarget(w_, cache_, backend_);
+        if (kvflash_active()) dflash_target_->set_kvflash_pager(&kvflash_pager_);
         }
     }
 
@@ -477,7 +478,8 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io,
                                     const BudgetHook * budget_hook,
-                                    bool * forced_close_out) {
+                                    bool * forced_close_out,
+                                    float * accept_rate_out) {
     const int hidden = w_.n_embd;
     int32_t last_tok = cache_.last_tok;
 
@@ -707,6 +709,12 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
                  n_draft_steps, n_accept_sum, total_draft_pos, accept_pct,
                  n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0);
 
+    // Surface acceptance to the HTTP usage block (was silently 0.0, the
+    // same reporting-only gap as the layer-split path fixed in PR #321).
+    if (accept_rate_out) {
+        *accept_rate_out = (float)(n_accept_sum / (double)total_draft_pos);
+    }
+
     io.emit(-1);
     return true;
 }
@@ -752,23 +760,17 @@ GenerateResult Gemma4Backend::generate_impl(const GenerateRequest & req,
     if (req.n_gen > 0) {
         // Try speculative decode if draft is available and temp==0
         const bool can_spec = !req.force_ar_decode
-            && !kvflash_active()
             && dflash_target_
             && !draft_parked_
             && feature_mirror_.target_feat
             && !sampler_.needs_logit_processing();
-        static bool kvflash_spec_warned = false;
-        if (kvflash_active() && dflash_target_ && !kvflash_spec_warned) {
-            std::fprintf(stderr, "[kvflash] gemma4 spec decode is not pool-aware; "
-                                 "falling back to AR\n");
-            kvflash_spec_warned = true;
-        }
 
         if (can_spec) {
             result.spec_decode_ran = true;
             if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                                 &req.budget_hook,
-                                &result.budget_forced_close)) {
+                                &result.budget_forced_close,
+                                &result.accept_rate)) {
                 result.error = "spec_decode";
                 return result;
             }
@@ -964,7 +966,6 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
     auto t_decode_start = std::chrono::steady_clock::now();
     if (req.n_gen > 0) {
         const bool can_spec = !req.force_ar_decode
-            && !kvflash_active()
             && dflash_target_
             && !draft_parked_
             && feature_mirror_.target_feat
@@ -974,7 +975,8 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
             result.spec_decode_ran = true;
             if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                                 &req.budget_hook,
-                                &result.budget_forced_close)) {
+                                &result.budget_forced_close,
+                                &result.accept_rate)) {
                 result.error = "spec_decode";
                 return result;
             }
@@ -1316,6 +1318,7 @@ bool Gemma4Backend::load_decode_draft() {
 
     delete dflash_target_;
     dflash_target_ = new Gemma4DFlashTarget(w_, cache_, backend_);
+        if (kvflash_active()) dflash_target_->set_kvflash_pager(&kvflash_pager_);
     draft_parked_ = false;
     std::printf("[gemma4] spec-decode ready: capture_layers=%d mirror_cap=%d\n",
                 n_capture, mirror_cap);

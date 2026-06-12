@@ -1,6 +1,7 @@
 // Gemma4DFlashTarget — DFlashTarget adapter for Gemma4 iSWA models.
 
 #include "gemma4_dflash_target.h"
+#include "../common/kvflash_pager.h"
 #include "dflash27b.h"
 
 #include <algorithm>
@@ -53,11 +54,16 @@ bool Gemma4DFlashTarget::verify_batch(
     const float scale = std::sqrt((float)hidden);
     for (size_t i = 0; i < embed.size(); ++i) embed[i] *= scale;
 
+    // kvflash: allocate the verify block's slots up front (may evict).
+    if (pager_ && !pager_->alloc_span(base_pos, n_tokens)) {
+        return false;
+    }
+
     // Run verify (all-token argmax)
     std::vector<int32_t> argmax_buf;
     if (!gemma4_verify_batch(backend_, w_, cache_, embed.data(),
                               tokens.data(), n_tokens, base_pos,
-                              argmax_buf)) {
+                              argmax_buf, pager_)) {
         return false;
     }
 
