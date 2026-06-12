@@ -9,6 +9,7 @@
 //   6. MoE FFN (hash routing + top-k + shared expert + clamped SwiGLU)
 
 #include "deepseek4_internal.h"
+#include "deepseek4_hc_cuda.h"
 #include "internal.h"
 #include "../common/deepseek4_expert_ipc.h"
 #include "../common/moe_hybrid_ffn_eval.h"
@@ -22,6 +23,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -925,6 +927,25 @@ struct HcPreResult {
     float comb[16];               // combine matrix [4×4]
 };
 
+// Per-layer CPU-side HC weight cache (read from GPU once for CPU fallback and
+// CUDA HC scalar parameters).
+struct HcWeightsCpu {
+    std::vector<uint16_t> fn_data;   // [hc_dim * mix_dim] F16
+    std::vector<float> scale_data;   // [3]
+    std::vector<float> base_data;    // [2*n_hc + n_hc*n_hc]
+    bool loaded = false;
+};
+
+struct HcLayerWeightsCpu {
+    HcWeightsCpu attn;
+    HcWeightsCpu ffn;
+};
+
+struct HashRoutingTableCpu {
+    std::vector<int32_t> ids;  // [n_vocab, n_expert_used]
+    bool loaded = false;
+};
+
 static void cpu_rms_norm(float * out, const float * x, int n, float eps) {
     float ss = 0.0f;
     for (int i = 0; i < n; i++) ss += x[i] * x[i];
@@ -1008,27 +1029,19 @@ static void cpu_hc_sinkhorn(float * out, const float * mix, const float * scale,
     for (int i = 0; i < n_hc * n_hc; i++) out[2 * n_hc + i] = c[i];
 }
 
-static HcPreResult cpu_hc_pre(const float * hc_state, const uint16_t * fn_data,
-                               const float * scale_data, const float * base_data,
-                               int n_embd, int n_hc, int sinkhorn_iters, float hc_eps) {
-    const int hc_dim = n_hc * n_embd;
-    const int mix_dim = 2 * n_hc + n_hc * n_hc;  // 24 for n_hc=4
-
+static HcPreResult finish_hc_pre_from_mix(const float * hc_state,
+                                          const float * mix,
+                                          const float * scale_data,
+                                          const float * base_data,
+                                          int n_embd,
+                                          int n_hc,
+                                          int sinkhorn_iters) {
     HcPreResult result;
     result.working.resize(n_embd);
 
-    // RMSNorm over full HC state
-    std::vector<float> flat(hc_dim);
-    cpu_rms_norm(flat.data(), hc_state, hc_dim, hc_eps);
-
-    // Matmul: fn^T @ flat → mix[mix_dim]
-    // fn is [hc_dim, mix_dim] F16 (ggml layout: ne[0]=hc_dim, ne[1]=mix_dim)
-    std::vector<float> mix(mix_dim);
-    cpu_matvec_f16(mix.data(), fn_data, flat.data(), mix_dim, hc_dim);
-
     // Sinkhorn split
     float split[24];  // 2*4 + 4*4 = 24
-    cpu_hc_sinkhorn(split, mix.data(), scale_data, base_data, n_hc, sinkhorn_iters, 1.0e-6f);
+    cpu_hc_sinkhorn(split, mix, scale_data, base_data, n_hc, sinkhorn_iters, 1.0e-6f);
 
     // Weighted sum: out[d] = Σ_h split[h] * hc_state[h*n_embd + d]
     for (int d = 0; d < n_embd; d++) {
@@ -1044,6 +1057,94 @@ static HcPreResult cpu_hc_pre(const float * hc_state, const uint16_t * fn_data,
     return result;
 }
 
+static HcPreResult cpu_hc_pre(const float * hc_state, const uint16_t * fn_data,
+                               const float * scale_data, const float * base_data,
+                               int n_embd, int n_hc, int sinkhorn_iters, float hc_eps) {
+    const int hc_dim = n_hc * n_embd;
+    const int mix_dim = 2 * n_hc + n_hc * n_hc;  // 24 for n_hc=4
+
+    // RMSNorm over full HC state
+    std::vector<float> flat(hc_dim);
+    cpu_rms_norm(flat.data(), hc_state, hc_dim, hc_eps);
+
+    // Matmul: fn^T @ flat → mix[mix_dim]
+    // fn is [hc_dim, mix_dim] F16 (ggml layout: ne[0]=hc_dim, ne[1]=mix_dim)
+    std::vector<float> mix(mix_dim);
+    cpu_matvec_f16(mix.data(), fn_data, flat.data(), mix_dim, hc_dim);
+    return finish_hc_pre_from_mix(hc_state, mix.data(), scale_data, base_data,
+                                  n_embd, n_hc, sinkhorn_iters);
+}
+
+static bool ds4_hc_cuda_enabled() {
+#if defined(DFLASH27B_BACKEND_CUDA)
+    const char * value = std::getenv("DFLASH_DS4_HC_BACKEND");
+    if (value && std::strcmp(value, "cpu") == 0) return false;
+    if (value && std::strcmp(value, "cuda") == 0) return true;
+    return true;
+#else
+    return false;
+#endif
+}
+
+static bool ds4_hc_compare_enabled() {
+    const char * value = std::getenv("DFLASH_DS4_HC_COMPARE");
+    return value && value[0] && std::strcmp(value, "0") != 0;
+}
+
+static HcPreResult hc_pre_auto(const float * hc_state,
+                               const HcWeightsCpu & weights,
+                               ggml_tensor * fn_tensor,
+                               int n_embd,
+                               int n_hc,
+                               int sinkhorn_iters,
+                               float hc_eps) {
+#if defined(DFLASH27B_BACKEND_CUDA)
+    if (ds4_hc_cuda_enabled() && fn_tensor && fn_tensor->data) {
+        float mix[24];
+        if (deepseek4_cuda_hc_pre_mix(hc_state, fn_tensor->data,
+                                      n_embd, n_hc, hc_eps, mix)) {
+            HcPreResult cuda_result = finish_hc_pre_from_mix(hc_state, mix,
+                                                             weights.scale_data.data(),
+                                                             weights.base_data.data(),
+                                                             n_embd, n_hc, sinkhorn_iters);
+            if (ds4_hc_compare_enabled()) {
+                static int compare_logs = 0;
+                HcPreResult cpu_result = cpu_hc_pre(hc_state, weights.fn_data.data(),
+                                                    weights.scale_data.data(),
+                                                    weights.base_data.data(),
+                                                    n_embd, n_hc, sinkhorn_iters, hc_eps);
+                float max_working = 0.0f;
+                for (int i = 0; i < n_embd; ++i) {
+                    max_working = std::max(max_working,
+                                           std::fabs(cuda_result.working[(size_t)i] -
+                                                     cpu_result.working[(size_t)i]));
+                }
+                float max_post = 0.0f;
+                for (int i = 0; i < n_hc; ++i) {
+                    max_post = std::max(max_post, std::fabs(cuda_result.post[i] - cpu_result.post[i]));
+                }
+                float max_comb = 0.0f;
+                for (int i = 0; i < n_hc * n_hc; ++i) {
+                    max_comb = std::max(max_comb, std::fabs(cuda_result.comb[i] - cpu_result.comb[i]));
+                }
+                if (compare_logs < 16) {
+                    std::fprintf(stderr,
+                                 "[deepseek4-hc-compare] max_abs working=%.8g post=%.8g comb=%.8g\n",
+                                 max_working, max_post, max_comb);
+                    compare_logs++;
+                }
+            }
+            return cuda_result;
+        }
+    }
+#else
+    (void)fn_tensor;
+#endif
+    return cpu_hc_pre(hc_state, weights.fn_data.data(),
+                      weights.scale_data.data(), weights.base_data.data(),
+                      n_embd, n_hc, sinkhorn_iters, hc_eps);
+}
+
 static void cpu_hc_post(float * out_hc, const float * block_out,
                          const float * residual_hc, const float * post,
                          const float * comb, int n_embd, int n_hc) {
@@ -1057,24 +1158,6 @@ static void cpu_hc_post(float * out_hc, const float * block_out,
         }
     }
 }
-
-// Per-layer CPU-side HC weight cache (read from GPU once)
-struct HcWeightsCpu {
-    std::vector<uint16_t> fn_data;   // [hc_dim * mix_dim] F16
-    std::vector<float> scale_data;   // [3]
-    std::vector<float> base_data;    // [2*n_hc + n_hc*n_hc]
-    bool loaded = false;
-};
-
-struct HcLayerWeightsCpu {
-    HcWeightsCpu attn;
-    HcWeightsCpu ffn;
-};
-
-struct HashRoutingTableCpu {
-    std::vector<int32_t> ids;  // [n_vocab, n_expert_used]
-    bool loaded = false;
-};
 
 static void load_hc_weights_cpu(HcWeightsCpu & dst, ggml_tensor * fn,
                                  ggml_tensor * scale, ggml_tensor * base) {
@@ -1157,8 +1240,7 @@ static bool deepseek4_step_hybrid(
         std::vector<float> cur((size_t)n_embd * (size_t)n_tokens);
         HcPreResult hc_attn_result;
         if (hc_lw.attn.loaded && n_tokens == 1) {
-            hc_attn_result = cpu_hc_pre(hc_state.data(), hc_lw.attn.fn_data.data(),
-                                         hc_lw.attn.scale_data.data(), hc_lw.attn.base_data.data(),
+            hc_attn_result = hc_pre_auto(hc_state.data(), hc_lw.attn, L.hc_attn_fn,
                                          n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
             memcpy(cur.data(), hc_attn_result.working.data(), (size_t)n_embd * sizeof(float));
         } else {
@@ -1246,8 +1328,7 @@ static bool deepseek4_step_hybrid(
         std::vector<float> ffn_working((size_t)n_embd * (size_t)n_tokens);
         HcPreResult hc_ffn_result;
         if (hc_lw.ffn.loaded && n_tokens == 1) {
-            hc_ffn_result = cpu_hc_pre(hc_state.data(), hc_lw.ffn.fn_data.data(),
-                                        hc_lw.ffn.scale_data.data(), hc_lw.ffn.base_data.data(),
+            hc_ffn_result = hc_pre_auto(hc_state.data(), hc_lw.ffn, L.hc_ffn_fn,
                                         n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
             memcpy(ffn_working.data(), hc_ffn_result.working.data(), (size_t)n_embd * sizeof(float));
         } else {

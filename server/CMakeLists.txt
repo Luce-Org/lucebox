@@ -356,7 +356,9 @@ endif()
 # Apply the arch list to local sources. HIP builds pass CMAKE_HIP_ARCHITECTURES
 # through to the HIP toolchain/ggml backend and optionally build rocWMMA kernels.
 if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-    target_sources(dflash_common PRIVATE src/cuda_cross_device_copy.cpp)
+    target_sources(dflash_common PRIVATE
+        src/cuda_cross_device_copy.cpp
+        src/deepseek4/deepseek4_hc_cuda.cu)
     set_target_properties(dflash_common PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
     list(GET _dflash_archs 0 _dflash_cuda_min_sm)
     # Strip any trailing 'a' suffix (e.g. "121a" -> "121")
