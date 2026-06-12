@@ -282,7 +282,7 @@ DFLASH27B_KV_TQ3=1 \
 
 **Bounded KV residency (KVFlash)**
 
-Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token chunks live in host RAM, bit-exact and recallable. Decode speed stops depending on context length (flat 38.6 tok/s from 64K to 256K on a 3090, 72 MiB resident). Off by default; works on every model family. With pflash enabled, its drafter automatically becomes the relevance scorer that decides which chunks stay resident. See [Luce KVFlash →](optimizations/kvflash/README.md).
+Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token chunks live in host RAM, bit-exact and recallable. Decode speed stops depending on context length and resident KV stays pool-sized at any context. Off by default; works on every model family. With pflash enabled, its drafter automatically becomes the relevance scorer that decides which chunks stay resident. Per-model numbers in [Luce KVFlash →](optimizations/kvflash/README.md).
 
 | Flag / env | Default | Effect |
 |---|---|---|
