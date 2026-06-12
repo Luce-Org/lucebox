@@ -469,6 +469,7 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
         if (is_eos_tok(first_tok, target_weights())) return true;
         committed++;
         target_cache().cur_pos = committed;
+        if (kvflash_active()) kvflash_history_.push_back(first_tok);
     }
 
     // ── Ensure persistent pipelined state (built once, reused) ──
@@ -487,11 +488,23 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
                                       act_cur.data(), 0, sizeof(float) * (size_t)hidden);
         const auto embed_done = DecodeClock::now();
 
+        // kvflash: physical pool slot for this token's KV rows (may evict).
+        int kv_slot = -1;
+        if (kvflash_active()) {
+            kv_slot = kvflash_pager_.slot_for(committed);
+            if (kv_slot < 0) {
+                std::fprintf(stderr, "[kvflash] pipelined decode: no slot at pos %d\n",
+                             committed);
+                return false;
+            }
+        }
+
         PipelinedDecodeTelemetry tel;
         if (!pipelined_decode_one_token(*pipe_state_, target_backend(), target_weights(),
                                        target_cache(), *target_weights().moe_hybrid,
                                        committed, cfg_.kq_stride_pad,
-                                       hybrid_telemetry_ ? &tel : nullptr)) {
+                                       hybrid_telemetry_ ? &tel : nullptr,
+                                       kv_slot)) {
             return false;
         }
         const auto layers_done = DecodeClock::now();
@@ -563,6 +576,10 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
         io.emit(next_tok);
         committed++;
         target_cache().cur_pos = committed;
+        if (kvflash_active()) {
+            kvflash_history_.push_back(next_tok);
+            kvflash_maybe_reselect((int)out_tokens.size());
+        }
         if (io.cancelled) break;
         if (is_eos_tok(next_tok, target_weights())) break;
     }
@@ -720,6 +737,19 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
     auto t_prefill_start = std::chrono::steady_clock::now();
     const int prompt_len = (int)req.prompt.size();
     const int prefill_chunk = std::min(128, prompt_len); // batch size per GPU compute
+
+    // kvflash: hybrid prefill writes rows identity-mapped, so the prompt must
+    // fit the pool with one chunk of decode headroom (same contract as the
+    // base do_prefill).
+    if (kvflash_active() &&
+        prompt_len > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
+        std::fprintf(stderr,
+            "[kvflash] hybrid prompt (%d) exceeds pool %d; raise --kvflash "
+            "or enable pflash compression\n", prompt_len, kvflash_tokens_);
+        result.error = "kvflash: prompt exceeds resident pool";
+        cleanup_graphs();
+        return result;
+    }
 
     // Embed all prompt tokens
     const int n_expert_used = target_weights().n_expert_used;
@@ -957,6 +987,9 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
 
     int committed = prompt_len;
     target_cache().cur_pos = committed;
+    if (kvflash_active()) {
+        kvflash_sync_prefill(committed, req.prompt, /*kv_offset=*/0);
+    }
     auto t_prefill_end = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_prefill_end - t_prefill_start).count();
 
@@ -990,8 +1023,17 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
 
-        // Check if hybrid spec-decode is available
+        // Check if hybrid spec-decode is available. Not pool-aware yet:
+        // hybrid_forward_batch writes KV at literal view offsets, which a
+        // kvflash pool cannot express — fall back to pipelined AR.
+        static bool kvflash_hybrid_spec_warned = false;
+        if (kvflash_active() && !kvflash_hybrid_spec_warned && cfg_.draft_path) {
+            std::fprintf(stderr, "[kvflash] hybrid spec decode is not pool-aware; "
+                                 "falling back to pipelined AR\n");
+            kvflash_hybrid_spec_warned = true;
+        }
         const bool can_hybrid_spec = !req.force_ar_decode
+            && !kvflash_active()
             && cfg_.draft_path
             && !is_draft_parked()
             && feature_mirror().target_feat
@@ -1057,6 +1099,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             if (!is_eos_tok(first_tok, target_weights())) {
                 committed++;
                 target_cache().cur_pos = committed;
+                if (kvflash_active()) kvflash_history_.push_back(first_tok);
 
                 // Pipelined decode loop
                 PipelinedDecodeTelemetry decode_tel_accum{};
@@ -1071,11 +1114,23 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                     ggml_backend_tensor_set_async(target_backend(), pipe_state_->gpu_state.act_cur,
                                                   act_cur.data(), 0, sizeof(float) * (size_t)hidden);
 
+                    // kvflash: pool slot for this token's KV rows (may evict)
+                    int kv_slot = -1;
+                    if (kvflash_active()) {
+                        kv_slot = kvflash_pager_.slot_for(committed);
+                        if (kv_slot < 0) {
+                            result.error = "kvflash_slot";
+                            cleanup_graphs();
+                            return result;
+                        }
+                    }
+
                     PipelinedDecodeTelemetry tel;
                     if (!pipelined_decode_one_token(*pipe_state_, target_backend(), target_weights(),
                                                     target_cache(), *target_weights().moe_hybrid,
                                                     committed, cfg_.kq_stride_pad,
-                                                    hybrid_telemetry_ ? &tel : nullptr)) {
+                                                    hybrid_telemetry_ ? &tel : nullptr,
+                                                    kv_slot)) {
                         result.error = "decode";
                         cleanup_graphs();
                         return result;
@@ -1133,6 +1188,10 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                     out_io.emit(next_tok);
                     committed++;
                     target_cache().cur_pos = committed;
+                    if (kvflash_active()) {
+                        kvflash_history_.push_back(next_tok);
+                        kvflash_maybe_reselect((int)result.tokens.size());
+                    }
                     if (out_io.cancelled) break;
                     if (is_eos_tok(next_tok, target_weights())) break;
                 }
@@ -1295,6 +1354,34 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
         return result;
     }
 
+    // kvflash: the restored prefix + delta prefill land identity-mapped, so
+    // the full prompt must fit the pool (snapshots past the pool are never
+    // saved, but the delta can still overflow it).
+    if (kvflash_active() &&
+        prompt_len > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
+        std::fprintf(stderr,
+            "[kvflash] hybrid restore prompt (%d) exceeds pool %d; raise "
+            "--kvflash\n", prompt_len, kvflash_tokens_);
+        result.error = "kvflash: prompt exceeds resident pool";
+        out_io.emit(-1);
+        return result;
+    }
+
+    // kvflash: the delta prefill below runs the maskless pipelined forward
+    // over the padded pool span; map the restored prefix identity-style and
+    // zero stale free slots BEFORE any forward reads them.
+    if (kvflash_active()) {
+        kvflash_pager_.reset();
+        for (int p = 0; p < snap_pos; ++p) {
+            if (kvflash_pager_.slot_for(p) < 0) {
+                result.error = "kvflash_slot";
+                out_io.emit(-1);
+                return result;
+            }
+        }
+        kvflash_pager_.zero_free_blocks();
+    }
+
     const int hidden = target_weights().n_embd;
     std::vector<float> act_cur((size_t)hidden);
     if (prompt_len > snap_pos) {
@@ -1312,6 +1399,17 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
         }
         result.prefill_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_prefill_start).count();
+    }
+
+    if (kvflash_active()) {
+        // Rebuild the pager mapping over the identity-mapped [0, committed).
+        // With the full prompt available the history carries real ids;
+        // restore-only generates keep an unknown-prefix history.
+        if (prompt_len == committed) {
+            kvflash_sync_prefill(committed, req.prompt, /*kv_offset=*/0);
+        } else {
+            kvflash_sync_prefill(committed, {}, /*kv_offset=*/committed);
+        }
     }
 
     if (req.n_gen > 0) {

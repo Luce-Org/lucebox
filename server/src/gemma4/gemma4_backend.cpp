@@ -49,11 +49,19 @@ bool Gemma4Backend::init() {
         return false;
     }
 
-    if (!create_gemma4_cache(backend_, w_, cfg_.device.max_ctx, cache_)) {
+    kvflash_read_config();
+    if (!create_gemma4_cache(backend_, w_, cfg_.device.max_ctx, cache_,
+                             kvflash_tokens_)) {
         std::fprintf(stderr, "[gemma4] cache alloc failed\n");
         return false;
     }
     cache_.fa_window = cfg_.fa_window;
+    if (kvflash_active() && cache_.fa_window > 0) {
+        std::fprintf(stderr, "[kvflash] --fa-window and --kvflash are mutually "
+                             "exclusive full-attention policies\n");
+        return false;
+    }
+    if (!kvflash_attach()) return false;
 
     // Load draft model for speculative decode.
     if (cfg_.draft_path && !load_decode_draft()) {
@@ -117,12 +125,14 @@ bool Gemma4Backend::unpark(const std::string & what) {
         }
 
         // Recreate KV cache
-        if (!create_gemma4_cache(backend_, w_, cfg_.device.max_ctx, cache_)) {
+        if (!create_gemma4_cache(backend_, w_, cfg_.device.max_ctx, cache_,
+                                 kvflash_tokens_)) {
             std::fprintf(stderr, "[gemma4] unpark: failed to recreate cache\n");
             free_gemma4_weights(w_);
             return false;
         }
         cache_.fa_window = cfg_.fa_window;
+        if (!kvflash_attach()) return false;
 
         parked_ = false;
         std::printf("[gemma4] unparked (VRAM restored)\n"); std::fflush(stdout);
@@ -138,6 +148,60 @@ bool Gemma4Backend::unpark(const std::string & what) {
     return true;
 }
 
+// ── kvflash helpers ────────────────────────────────────────────────────
+
+void Gemma4Backend::kvflash_read_config() {
+    const char * env = std::getenv("DFLASH_KVFLASH");
+    kvflash_tokens_ = env ? std::atoi(env) : 0;
+    if (kvflash_tokens_ <= 0) { kvflash_tokens_ = 0; return; }
+    kvflash_tokens_ = ((kvflash_tokens_ + 255) / 256) * 256;
+    if (kvflash_tokens_ > cfg_.device.max_ctx) {
+        std::fprintf(stderr, "[kvflash] requested pool %d > max_ctx %d; clamping "
+                             "(pool only helps when smaller than the context)\n",
+                     kvflash_tokens_, cfg_.device.max_ctx);
+        kvflash_tokens_ = (cfg_.device.max_ctx / 256) * 256;
+    }
+}
+
+bool Gemma4Backend::kvflash_attach() {
+    if (!kvflash_active()) return true;
+    // Pool the FULL-attention layers only; SWA layers ring-buffer natively
+    // and KV-reuse layers share their source layer's tensors.
+    std::vector<ggml_tensor *> full_k, full_v;
+    for (int il = 0; il < w_.n_layer; ++il) {
+        if (cache_.k[(size_t)il] && !gemma4_is_swa_layer(w_, il)) {
+            full_k.push_back(cache_.k[(size_t)il]);
+            full_v.push_back(cache_.v[(size_t)il]);
+        }
+    }
+    KvFlashConfig pc;
+    pc.pool_tokens = kvflash_tokens_;
+    if (!kvflash_pager_.attach(pc, full_k, full_v)) {
+        std::fprintf(stderr, "kvflash: pager attach failed (pool=%d, "
+                             "full-attn layers=%zu)\n",
+                     kvflash_tokens_, full_k.size());
+        return false;
+    }
+    std::printf("[kvflash] resident pool %d tokens over %zu full-attn layers "
+                "(logical max_ctx %d, SWA ring %d), policy=lru\n",
+                kvflash_tokens_, full_k.size(), cfg_.device.max_ctx,
+                cache_.swa_size);
+    std::fflush(stdout);
+    return true;
+}
+
+bool Gemma4Backend::kvflash_alloc_span(int kv_start, int n_tok) {
+    if (!kvflash_active()) return true;
+    for (int i = 0; i < n_tok; ++i) {
+        if (kvflash_pager_.slot_for(kv_start + i) < 0) {
+            std::fprintf(stderr, "[kvflash] no pool slot at pos %d "
+                                 "(pool %d exhausted)\n", kv_start + i, kvflash_tokens_);
+            return false;
+        }
+    }
+    return true;
+}
+
 // ── Prefill ────────────────────────────────────────────────────────────
 
 int Gemma4Backend::do_prefill(const std::vector<int32_t> & tokens,
@@ -146,6 +210,19 @@ int Gemma4Backend::do_prefill(const std::vector<int32_t> & tokens,
     const int n = (int)tokens.size();
     const int hidden = w_.n_embd;
     const int chunk = cfg_.chunk;
+
+    if (kvflash_active()) {
+        // Fresh request: rebuild the pager mapping. Restore paths land the
+        // prefix identity-mapped and pre-allocate [0, kv_offset) themselves.
+        if (kv_offset == 0) kvflash_pager_.reset();
+        if (kv_offset + n > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
+            std::fprintf(stderr,
+                "[kvflash] prompt (%d @ offset %d) exceeds pool %d; raise "
+                "--kvflash or enable pflash compression\n",
+                n, kv_offset, kvflash_tokens_);
+            return -1;
+        }
+    }
 
     std::vector<float> embed(chunk * hidden);
     std::vector<float> logits;
@@ -168,8 +245,10 @@ int Gemma4Backend::do_prefill(const std::vector<int32_t> & tokens,
         for (int i = 0; i < len * hidden; ++i) embed[i] *= scale;
 
         const int kv_pos = kv_offset + pos;
-        if (!gemma4_step(backend_, w_, cache_, embed.data(),
-                         tokens.data() + pos, len, kv_pos, logits)) {
+        if (!kvflash_alloc_span(kv_pos, len) ||
+            !gemma4_step(backend_, w_, cache_, embed.data(),
+                         tokens.data() + pos, len, kv_pos, logits,
+                         kvflash_active() ? &kvflash_pager_ : nullptr)) {
             std::fprintf(stderr, "[gemma4] prefill step failed at pos=%d\n", kv_pos);
             return -1;
         }
@@ -285,8 +364,10 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
         float scale = std::sqrt((float)hidden);
         for (int j = 0; j < hidden; ++j) embed_buf[j] *= scale;
 
-        if (!gemma4_step(backend_, w_, cache_, embed_buf.data(),
-                         &tok, 1, committed, logits)) {
+        if (!kvflash_alloc_span(committed, 1) ||
+            !gemma4_step(backend_, w_, cache_, embed_buf.data(),
+                         &tok, 1, committed, logits,
+                         kvflash_active() ? &kvflash_pager_ : nullptr)) {
             return false;
         }
 
@@ -598,10 +679,17 @@ GenerateResult Gemma4Backend::generate_impl(const GenerateRequest & req,
     if (req.n_gen > 0) {
         // Try speculative decode if draft is available and temp==0
         const bool can_spec = !req.force_ar_decode
+            && !kvflash_active()
             && dflash_target_
             && !draft_parked_
             && feature_mirror_.target_feat
             && !sampler_.needs_logit_processing();
+        static bool kvflash_spec_warned = false;
+        if (kvflash_active() && dflash_target_ && !kvflash_spec_warned) {
+            std::fprintf(stderr, "[kvflash] gemma4 spec decode is not pool-aware; "
+                                 "falling back to AR\n");
+            kvflash_spec_warned = true;
+        }
 
         if (can_spec) {
             result.spec_decode_ran = true;
@@ -624,7 +712,8 @@ GenerateResult Gemma4Backend::generate_impl(const GenerateRequest & req,
             for (int j = 0; j < hidden; ++j) embed_buf[j] *= scale;
 
             if (!gemma4_step(backend_, w_, cache_, embed_buf.data(),
-                             &last_tok, 1, committed - 1, logits)) {
+                             &last_tok, 1, committed - 1, logits,
+                             kvflash_active() ? &kvflash_pager_ : nullptr)) {
                 result.error = "first logits";
                 return result;
             }
@@ -725,6 +814,22 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
     cache_.cur_pos = snap_pos;
     cache_.last_tok = snap.last_tok;
 
+    // kvflash: the restored prefix is identity-mapped; rebuild the pager
+    // mapping over [0, snap_pos) before the delta prefill extends it.
+    if (kvflash_active()) {
+        if (snap_pos > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
+            std::fprintf(stderr, "[kvflash] restored prefix (%d) exceeds pool %d\n",
+                         snap_pos, kvflash_tokens_);
+            result.error = "kvflash: prompt exceeds resident pool";
+            return result;
+        }
+        kvflash_pager_.reset();
+        if (!kvflash_alloc_span(0, snap_pos)) {
+            result.error = "kvflash_slot";
+            return result;
+        }
+    }
+
     // Set up sampler
     sampler_ = req.sampler;
     if (req.do_sample && sampler_.seed != 0) {
@@ -786,6 +891,7 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
     auto t_decode_start = std::chrono::steady_clock::now();
     if (req.n_gen > 0) {
         const bool can_spec = !req.force_ar_decode
+            && !kvflash_active()
             && dflash_target_
             && !draft_parked_
             && feature_mirror_.target_feat
@@ -812,7 +918,8 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
             for (int j = 0; j < hidden; ++j) embed_buf[j] *= scale;
 
             if (!gemma4_step(backend_, w_, cache_, embed_buf.data(),
-                             &last_tok, 1, committed - 1, logits)) {
+                             &last_tok, 1, committed - 1, logits,
+                             kvflash_active() ? &kvflash_pager_ : nullptr)) {
                 result.error = "first logits";
                 return result;
             }
@@ -867,6 +974,13 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
 bool Gemma4Backend::snapshot_save(int slot) {
     if (parked_) return false;
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
+    // kvflash: snapshots copy rows [0, snap_pos) assuming identity layout,
+    // which breaks after the first page-out relocates a chunk.
+    if (kvflash_active() && kvflash_pager_.stats().page_outs > 0) {
+        std::fprintf(stderr, "[kvflash] snapshot skipped: pool has relocated "
+                             "chunks (page-table serialization not implemented)\n");
+        return false;
+    }
 
     auto & snap = snapshots_[slot];
     const int n_layer = cache_.n_layer;

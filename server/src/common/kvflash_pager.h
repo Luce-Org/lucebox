@@ -108,6 +108,15 @@ public:
         epoch_++;
     }
 
+    // Zero every currently-free block. reset() drops mappings but leaves the
+    // previous request's bytes in place; maskless consumers (the qwen35moe
+    // pipelined decode reads the whole padded pool span with no slot mask)
+    // need stale rows to dequantise to ~zero contribution. Masked consumers
+    // don't need this but it is cheap (pool-sized memset, sub-ms).
+    void zero_free_blocks() {
+        for (int b : free_blocks_) zero_block(b);
+    }
+
     bool attached() const { return n_blocks_ > 0; }
     int pool_tokens() const { return cfg_.pool_tokens; }
     int chunk_tokens() const { return cfg_.chunk_tokens; }
@@ -170,6 +179,29 @@ public:
     }
     int block_of(int c) const {
         return c < (int)chunks_.size() ? chunks_[c].block : -1;
+    }
+
+    // Const lookup (no alloc / LRU touch): physical slot currently holding
+    // logical `pos`, or -1 if its chunk is not resident. Callers that may
+    // need an allocation must use slot_for() beforehand.
+    int slot_of(int64_t pos) const {
+        const int c = (int)(pos / cfg_.chunk_tokens);
+        if (c >= (int)chunks_.size() || chunks_[c].block < 0) return -1;
+        return chunks_[c].block * cfg_.chunk_tokens + (int)(pos % cfg_.chunk_tokens);
+    }
+
+    // Logical position held by each pool slot, -1 for free blocks. `dst`
+    // must hold pool_tokens entries. Lets callers build masks that need
+    // POSITION semantics in slot space (causal / sliding-window): the
+    // mask condition is evaluated on dst[slot] instead of the column index.
+    void fill_slot_pos(int32_t * dst) const {
+        for (int i = 0; i < cfg_.pool_tokens; i++) dst[i] = -1;
+        for (int c = 0; c < (int)chunks_.size(); c++) {
+            if (chunks_[c].block < 0) continue;
+            int32_t * p = dst + (size_t)chunks_[c].block * cfg_.chunk_tokens;
+            for (int i = 0; i < cfg_.chunk_tokens; i++)
+                p[i] = (int32_t)c * cfg_.chunk_tokens + i;
+        }
     }
     const KvFlashStats & stats() const { return stats_; }
     int resident_blocks() const { return n_blocks_ - (int)free_blocks_.size(); }

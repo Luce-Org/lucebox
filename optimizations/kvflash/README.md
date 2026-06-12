@@ -47,6 +47,21 @@ Sizing rule: without a drafter, pool >= prompt + generation headroom
 itself). With pflash's drafter attached, 25% of the expected context is a
 conservative default and 6-9% is measured safe for retrieval workloads.
 
+## Model support
+
+`--kvflash` works on every architecture the daemon serves:
+
+| arch | models | decode path | policy | notes |
+|---|---|---|---|---|
+| qwen35 | Qwen3.5/3.6-27B | masked set_rows decode + slot-mapped spec verify | LRU or pflash drafter | reference integration; all RESULTS.md numbers |
+| qwen35moe | Qwen3.6-35B-A3B | pipelined hybrid decode (Spark) + all-GPU | LRU or pflash drafter | maskless pool span (zero-row approximation, same as production padding); hybrid spec falls back to AR |
+| laguna | Laguna-XS.2 | single-graph hybrid + all-GPU, slot-space full+SWA masks | LRU | pager covers all 40 layers; protected tail >= sliding_window keeps SWA exact |
+| gemma4 | Gemma4 26B-A4B / 31B | masked decode, slot-space full mask | LRU | pools FULL-attention layers only (SWA layers already ring-buffer); spec falls back to AR |
+
+LRU-only architectures keep the `KvFlashScorer` seam open: the pflash
+drafter scorer is Qwen-tokenizer bound, so laguna/gemma4 need their own
+indexer for relevance-driven reselect (follow-up).
+
 ## How it works
 
 - **Pool**: attention KV tensors are allocated at pool size; a pager maps

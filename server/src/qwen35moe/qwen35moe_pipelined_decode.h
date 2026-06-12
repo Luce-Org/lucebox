@@ -197,14 +197,18 @@ bool init_pipelined_decode_state(
 // Run one full token through the pipelined decode loop (all n_layer layers).
 // On success, gpu_state.act_cur holds the final hidden state on GPU.
 // selected_ids_out / weights_out: optional per-layer routing capture for telemetry.
+// kv_slot: physical KV row to write (kvflash pool slot); -1 = kv_pos (identity,
+// no pool). The FA span clamps to the cache tensor's physical capacity, so
+// pool-sized tensors bound the cached-graph window automatically.
 bool pipelined_decode_one_token(
     PipelinedDecodeState & state,
     ggml_backend_t backend,
     const TargetWeights & w,
     TargetCache & cache,
     MoeHybridStorage & hybrid,
-    int kv_pos,              // current KV position
+    int kv_pos,              // current KV position (logical; drives RoPE)
     int kq_stride_pad,
-    PipelinedDecodeTelemetry * telemetry = nullptr);
+    PipelinedDecodeTelemetry * telemetry = nullptr,
+    int kv_slot = -1);
 
 }  // namespace dflash::common

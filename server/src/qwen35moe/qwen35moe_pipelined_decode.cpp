@@ -314,12 +314,16 @@ bool pipelined_decode_one_token(
     MoeHybridStorage & hybrid,
     int kv_pos,
     int kq_stride_pad,
-    PipelinedDecodeTelemetry * tel) {
+    PipelinedDecodeTelemetry * tel,
+    int kv_slot) {
 
     const int n_layer = state.n_layer;
     const int n_embd = state.n_embd;
     const int n_expert_used = state.n_expert_used;
     ggml_backend_t cpu_be = hybrid.cpu_backend;
+    // Physical KV row for this token: kvflash pool slot, or the logical
+    // position itself. positions (RoPE) always carry the logical kv_pos.
+    const int kv_row = kv_slot >= 0 ? kv_slot : kv_pos;
 
     if (tel) {
         *tel = PipelinedDecodeTelemetry{};
@@ -503,7 +507,12 @@ bool pipelined_decode_one_token(
         bool attn_cached_ok = false;
         if (is_attn && !g_no_kvpad) {
             auto & cpg = state.cached_prefn[(size_t)il];
-            const int kv_win_needed = ((kv_pos + 1) + 255) & ~255;
+            // Clamp the baked FA span to the cache tensor's physical capacity:
+            // with kvflash the tensors are pool-sized, so the window stops
+            // growing at the pool (and the cached graph never rebuilds again).
+            const int kv_phys = (int)cache.attn_k[0]->ne[1];
+            const int kv_win_needed =
+                std::min(((kv_pos + 1) + 255) & ~255, kv_phys);
             if (!cpg.valid() || cpg.kv_win < kv_win_needed) {
                 if (!build_cached_attn_prefn(cpg, backend, w, cache, il,
                                              kv_win_needed, kq_stride_pad)) {
@@ -519,7 +528,7 @@ bool pipelined_decode_one_token(
             ggml_backend_tensor_copy_async(backend, backend, state.gpu_state.act_cur, cpg.inp_embed);
             int32_t pos4[4] = {kv_pos, kv_pos, kv_pos, 0};
             ggml_backend_tensor_set_async(backend, cpg.positions, pos4, 0, sizeof(pos4));
-            std::vector<int64_t> row_vals((size_t)w.n_head_kv, (int64_t)kv_pos);
+            std::vector<int64_t> row_vals((size_t)w.n_head_kv, (int64_t)kv_row);
             ggml_backend_tensor_set_async(backend, cpg.kv_write_rows, row_vals.data(), 0,
                                           sizeof(int64_t) * row_vals.size());
 
@@ -536,7 +545,16 @@ bool pipelined_decode_one_token(
             moe_weights_tensor = cpg.moe_weights;
         } else if (is_attn || !state.cached_prefn[(size_t)il].valid()) {
             // Attention layer (legacy/fallback) OR failed DeltaNet cache:
-            // rebuild graph dynamically
+            // rebuild graph dynamically. The legacy path writes KV at the
+            // literal view offset kv_pos and cannot express a pool slot —
+            // refuse instead of corrupting the pool / running off its end.
+            if (is_attn && kv_slot >= 0) {
+                std::fprintf(stderr,
+                    "[pipelined] kvflash requires the cached set_rows attn path "
+                    "(layer %d cached-graph build failed)\n", il);
+                step_graph_destroy(dyn_sg);
+                return false;
+            }
             if (!build_layer_prefn_step(dyn_sg, w, cache, backend,
                                         il, kv_pos, /*n_tokens=*/1,
                                         /*with_mask=*/false, /*fa_window=*/0, kq_stride_pad)) {

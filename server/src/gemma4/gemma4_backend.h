@@ -12,6 +12,7 @@
 #include "gemma4_internal.h"
 #include "gemma4_dflash_target.h"
 #include "common/sampler.h"
+#include "../common/kvflash_pager.h"
 #include "../qwen3/qwen3_drafter.h"
 
 #include "ggml.h"
@@ -98,6 +99,17 @@ private:
     // Snapshots
     static constexpr int PREFIX_SLOTS = 64;
     Gemma4Snapshot        snapshots_[PREFIX_SLOTS];
+
+    // ── kvflash (bounded KV residency; see common/kvflash_pager.h) ──
+    // Pools the FULL-attention layers only (SWA layers already ring-buffer).
+    // LRU policy: the pflash drafter scorer is Qwen-tokenizer bound, so no
+    // relevance scorer attaches on gemma4 (the KvFlashScorer seam stays open).
+    KvFlashPager kvflash_pager_;
+    int          kvflash_tokens_ = 0;     // 0 = off
+    bool kvflash_active() const { return kvflash_tokens_ > 0; }
+    void kvflash_read_config();
+    bool kvflash_attach();
+    bool kvflash_alloc_span(int kv_start, int n_tok);
 
     // Prefill prompt tokens in chunks, return absolute committed position.
     // kv_offset: starting KV cache position (0 for fresh prefill, snap_pos for restore).

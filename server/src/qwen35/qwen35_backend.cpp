@@ -1095,6 +1095,9 @@ void Qwen35Backend::kvflash_sync_prefill(int committed,
         kvflash_history_.resize((size_t)kv_offset, 0);  // restored prefix ids unknown
         kvflash_history_.insert(kvflash_history_.end(), tokens.begin(), tokens.end());
     }
+    // Slots past the prompt still hold the previous request's rows; the
+    // maskless qwen35moe pipelined decode reads the whole padded pool span.
+    kvflash_pager_.zero_free_blocks();
     kvflash_mask_epoch_ = (uint64_t)-1;
 }
 

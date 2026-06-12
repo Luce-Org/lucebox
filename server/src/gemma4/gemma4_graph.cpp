@@ -18,6 +18,7 @@
 #include "gemma4_internal.h"
 #include "common/ggml_graph_precision.h"
 #include "common/gpu_runtime_compat.h"
+#include "../common/kvflash_pager.h"
 #include "dflash27b.h"
 #include "flashprefill.h"
 
@@ -249,7 +250,10 @@ static ggml_tensor * build_gemma4_attn_block(
                                    ? (kv_start - fa_window) : 0;
     const int kv_len_raw = is_swa ? std::min(kv_start + n_tokens, cache_len)
                                   : (kv_start + n_tokens - full_win_start);
-    const int kv_len = (kv_len_raw + 255) & ~255;  // pad to 256 for CUDA FA
+    // Pad to 256 for CUDA FA, clamped to the tensor's physical capacity
+    // (kvflash pools allocate full layers below max_ctx; the slot mask keeps
+    // the clamped span exact).
+    const int kv_len = std::min((kv_len_raw + 255) & ~255, cache_len);
 
     ggml_tensor * Qfa = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
     Qfa = ggml_cont(ctx, Qfa);
@@ -620,8 +624,14 @@ bool gemma4_step(
     const int32_t *         token_ids,
     int                     n_tokens,
     int                     kv_start,
-    std::vector<float> &    out_logits)
+    std::vector<float> &    out_logits,
+    const KvFlashPager *    kvflash)
 {
+    if (kvflash && cache.fa_window > 0) {
+        std::fprintf(stderr, "gemma4_step: kvflash and fa_window are mutually "
+                             "exclusive full-attention policies\n");
+        return false;
+    }
     // Allocate graph context. Persistent thread_local arena: rebuilt graphs
     // land at identical addresses every step, so the ggml-cuda CUDA-graph
     // cache (keyed on nodes[0], memcmps node properties) can replay the
@@ -662,9 +672,18 @@ bool gemma4_step(
     }
 
     // Attention masks (full + SWA)
-    // Full-attention mask: covers all positions [0, kv_start+n_tokens)
+    // Full-attention mask: covers all positions [0, kv_start+n_tokens),
+    // clamped to the full-layer tensor capacity (pool-sized under kvflash) —
+    // must agree with the FA span clamp in build_gemma4_attn_block.
+    int full_cap = cache.max_ctx;
+    for (int il = 0; il < (int)cache.k.size(); ++il) {
+        if (cache.k[(size_t)il] && !gemma4_is_swa_layer(w, il)) {
+            full_cap = (int)cache.k[(size_t)il]->ne[1];
+            break;
+        }
+    }
     const int kv_len_raw = kv_start + n_tokens;
-    const int kv_len_padded = (kv_len_raw + 255) & ~255;
+    const int kv_len_padded = std::min((kv_len_raw + 255) & ~255, full_cap);
     ggml_tensor * mk_full = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len_padded, n_tokens, 1, 1);
     ggml_set_input(mk_full);
     ggml_tensor * mk_full_f16 = ggml_cast(ctx, mk_full, GGML_TYPE_F16);
@@ -768,12 +787,33 @@ bool gemma4_step(
     std::vector<int32_t> pos((size_t)n_tokens);
     for (int i = 0; i < n_tokens; ++i) pos[i] = kv_start + i;
     ggml_backend_tensor_set(pp, pos.data(), 0, ggml_nbytes(pp));
+    if (!kvi_full && kvflash) {
+        std::fprintf(stderr, "gemma4_step: kvflash requires the set_rows path "
+                             "(DFLASH_GEMMA4_NO_KVPAD is incompatible)\n");
+        ggml_free(ctx);
+        return false;
+    }
     if (kvi_full) {
-        // Full layers append at the absolute position; SWA layers at the ring
-        // slot. Per-token modular indices also land chunks that cross the
-        // ring wrap boundary correctly (the offset-view path wrote one
-        // contiguous block).
-        ggml_backend_tensor_set(kvi_full, pos.data(), 0, ggml_nbytes(kvi_full));
+        // Full layers append at the absolute position (or the kvflash pool
+        // slot); SWA layers at the ring slot. Per-token modular indices also
+        // land chunks that cross the ring wrap boundary correctly (the
+        // offset-view path wrote one contiguous block).
+        if (kvflash) {
+            std::vector<int32_t> rows((size_t)n_tokens);
+            for (int i = 0; i < n_tokens; ++i) {
+                const int s = kvflash->slot_of(kv_start + i);
+                if (s < 0) {
+                    std::fprintf(stderr, "[kvflash] gemma4 step: position %d has "
+                                         "no pool slot\n", kv_start + i);
+                    ggml_free(ctx);
+                    return false;
+                }
+                rows[(size_t)i] = s;
+            }
+            ggml_backend_tensor_set(kvi_full, rows.data(), 0, ggml_nbytes(kvi_full));
+        } else {
+            ggml_backend_tensor_set(kvi_full, pos.data(), 0, ggml_nbytes(kvi_full));
+        }
         GGML_ASSERT(swa_size > 0);
         std::vector<int32_t> ring((size_t)n_tokens);
         for (int i = 0; i < n_tokens; ++i) ring[i] = (kv_start + i) % swa_size;
@@ -785,12 +825,27 @@ bool gemma4_step(
         ggml_backend_tensor_set(tok_ids, token_ids, 0, (size_t)n_tokens * sizeof(int32_t));
     }
 
-    // Causal mask (full attention) — padded positions are masked with -inf
+    // Causal mask (full attention) — padded positions are masked with -inf.
+    // kvflash: SLOT space — the causal condition is evaluated on the
+    // position each pool slot holds (free slots stay -inf).
     std::vector<float> mfull((size_t)kv_len_padded * n_tokens, -INFINITY);
-    for (int q = 0; q < n_tokens; ++q) {
-        const int abs_q = kv_start + q;
-        for (int k = 0; k <= abs_q && k < kv_len_raw; ++k) {
-            mfull[(size_t)q * kv_len_padded + k] = 0.0f;
+    if (kvflash) {
+        std::vector<int32_t> spos((size_t)kvflash->pool_tokens(), -1);
+        kvflash->fill_slot_pos(spos.data());
+        const int s_hi = std::min(kv_len_padded, (int)spos.size());
+        for (int q = 0; q < n_tokens; ++q) {
+            const int abs_q = kv_start + q;
+            for (int s = 0; s < s_hi; ++s) {
+                const int p = spos[(size_t)s];
+                if (p >= 0 && p <= abs_q) mfull[(size_t)q * kv_len_padded + s] = 0.0f;
+            }
+        }
+    } else {
+        for (int q = 0; q < n_tokens; ++q) {
+            const int abs_q = kv_start + q;
+            for (int k = 0; k <= abs_q && k < kv_len_raw; ++k) {
+                mfull[(size_t)q * kv_len_padded + k] = 0.0f;
+            }
         }
     }
     ggml_backend_tensor_set(mk_full, mfull.data(), 0, ggml_nbytes(mk_full));

@@ -69,6 +69,18 @@ deterministic) rounding lineage, not noise and not a correctness effect.
   1200 tokens): ~99% argmax agreement; page_out/page_in roundtrip
   bit-exact.
 
+## Multi-architecture smokes (pool 1024, --max-ctx 8192, ~1235 logical tokens, live LRU eviction mid-request, RTX 3090)
+
+| arch | model | mode | decode tok/s | output |
+|---|---|---|---|---|
+| qwen35 | Qwen3.6-27B Q4_K_M | all-GPU, masked pool | 37.4 | coherent |
+| qwen35moe | Qwen3.6-35B-A3B UD-Q4_K_M | Spark hybrid (9403 hot / 837 cold experts), pipelined decode | 101.6 | coherent |
+| laguna | Laguna-XS.2 Q4_K_M | Spark hybrid, single-graph decode, slot-space full+SWA masks | 137.1 | coherent |
+| gemma4 | Gemma4 26B-A4B UD-Q4_K_M | all-GPU, slot-space full mask, SWA rings untouched | 119.0 | coherent |
+
+Gemma4 control on the same build without the flag: 120.2 tok/s, no
+kvflash code engaged — the default path is unchanged.
+
 ## Known limits
 
 - DDTree tree-verify is not pool-aware (falls back to AR with KVFlash).

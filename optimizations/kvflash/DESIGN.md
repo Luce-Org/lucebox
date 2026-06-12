@@ -208,6 +208,42 @@ per segment).
   reselect interval is max(configured tau, history/45), capping rescore
   overhead near 15% of decode time.
 
+## Per-architecture integration
+
+The pager core is architecture-blind; each backend routes its own KV writes
+and masks through it. What differs per arch:
+
+- **qwen35** (reference): masked set_rows decode, slot-mapped chain-spec
+  verify, drafter scorer auto-attach. Everything in RESULTS.md.
+- **qwen35moe** (Qwen3.6-35B-A3B): inherits the qwen35 path all-GPU. The
+  Spark hybrid pipelined decode keeps its per-layer cached CUDA graphs:
+  `pipelined_decode_one_token` takes a `kv_slot`, the cached FA span clamps
+  to the pool (so the graph stops rebuilding once the window hits pool
+  size), and the pool span stays MASKLESS like the rest of that path — the
+  pager zeroes freed blocks (page-out and `zero_free_blocks()` on request
+  reset), so evicted slots contribute exp(-max) ~ 0, production's own
+  padded-span approximation. Hybrid spec decode (literal-offset KV writes)
+  falls back to pipelined AR under kvflash.
+- **laguna**: ALL 40 layers pooled (full + SWA share the pager).
+  `laguna_step` / `laguna_step_hybrid` take a const pager; both masks are
+  built in SLOT space via `fill_slot_pos` (the causal / sliding-window
+  conditions evaluate on the position each slot holds). SWA exactness:
+  `tail_window_chunks >= sliding_window/64 + 1`, so positions inside the
+  window are never evicted. The per-layer hybrid decode fallback and
+  NO_KVPAD / PAD_CPY / no_mask ablations are refused under kvflash.
+- **gemma4**: pools FULL-attention layers only — SWA layers already use
+  sliding-window ring buffers and KV-reuse layers share their source's
+  tensors. The full mask is slot-space; the SWA ring path is untouched.
+  `--fa-window` (sparse full-attn) and kvflash are mutually exclusive;
+  DFlash spec verify falls back to AR.
+
+Policy: qwen35/qwen35moe get the pflash drafter scorer when pflash is on;
+laguna and gemma4 are LRU-only (the drafter is Qwen-tokenizer bound) with
+the `KvFlashScorer` seam open for their own indexers.
+
+Snapshots on laguna/gemma4 are refused once a chunk has relocated
+(page_outs > 0); identity-layout snapshots before that still work.
+
 ## Not in the prototype (next phases)
 
 1. Drafter KV persistence for the indexer (incremental rescore: push
