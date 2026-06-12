@@ -208,8 +208,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: KFD health (diagnose instead of hanging)
+        # rocminfo on a wedged KFD blocks in uninterruptible sleep and eats
+        # the whole 20-minute job timeout. Probe with a hard timeout first,
+        # and when it hangs, dump the evidence (D-state holders, dmesg) so
+        # the job fails in seconds with a diagnosis instead of silently.
+        run: |
+          if timeout 15 /opt/rocm/bin/rocminfo > /tmp/rocminfo.out 2>&1; then
+            echo "KFD healthy"
+          else
+            echo "::error::rocminfo hung or failed — ROCm/KFD wedged on the runner box"
+            echo "--- processes holding /dev/kfd:"
+            sudo fuser -v /dev/kfd 2>&1 || true
+            echo "--- D-state processes:"
+            ps -eo pid,user,stat,wchan:32,comm | awk '$3 ~ /D/' || true
+            echo "--- recent amdgpu/kfd dmesg:"
+            sudo dmesg 2>/dev/null | grep -iE "amdgpu|kfd" | tail -15 || true
+            exit 1
+          fi
+
       - name: ROCm smoke (rocminfo sees gfx1151)
-        run: /opt/rocm/bin/rocminfo | grep -E "Name:|Marketing Name:" | grep -iE "gfx1151|Radeon 8060S"
+        run: cat /tmp/rocminfo.out | grep -E "Name:|Marketing Name:" | grep -iE "gfx1151|Radeon 8060S"
 
       - name: Build + run HIP vector-add on the Radeon 8060S
         # Self-contained HIP kernel correctness test (no model weights). This is
