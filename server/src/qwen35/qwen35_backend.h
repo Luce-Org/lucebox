@@ -80,7 +80,7 @@ public:
     // ── Initialization ───────────────────────────────────────────────
     // Load target + draft models, create KV caches.
     // Returns false on failure (check dflash27b_last_error()).
-    bool init();
+    virtual bool init();
 
     // ── ModelBackend interface ────────────────────────────────────────
     void print_ready_banner() const override;

@@ -1,8 +1,8 @@
-// CpuColdFfnCompute: Fused cold expert FFN using ggml vec_dot primitives.
+// CpuMoeExpertCompute: fused selected expert FFN using ggml vec_dot primitives.
 // Bypasses ggml graph dispatch overhead. Uses OpenMP to saturate memory bandwidth.
 // Memory-bandwidth bound at ~45 GB/s DDR4. Target: 15.7ms → ~3ms/token.
 
-#include "cold_ffn_compute.h"
+#include "moe_expert_compute.h"
 #include "ggml-cpu.h"
 
 #include <cmath>
@@ -17,7 +17,7 @@
 
 namespace dflash::common {
 
-class CpuColdFfnCompute : public ColdFfnCompute {
+class CpuMoeExpertCompute : public MoeExpertCompute {
     int n_ff_max_;
     int n_threads_;
 
@@ -30,25 +30,25 @@ class CpuColdFfnCompute : public ColdFfnCompute {
     std::vector<uint8_t> inp_conv_;  // input converted (shared, read-only during matmul)
 
 public:
-    explicit CpuColdFfnCompute(int n_ff_max, int n_threads = 0) : n_ff_max_(n_ff_max) {
+    explicit CpuMoeExpertCompute(int n_ff_max, int n_threads = 0) : n_ff_max_(n_ff_max) {
 #ifdef _OPENMP
         if (n_threads <= 0) {
-            const char * env = std::getenv("DFLASH_COLD_THREADS");
+            const char * env = std::getenv("DFLASH_MOE_EXPERT_COMPUTE_THREADS");
             n_threads = env ? std::atoi(env) : 0;
         }
         n_threads_ = n_threads > 0 ? n_threads : std::min(omp_get_max_threads(), 8);
 #else
         n_threads_ = 1;
 #endif
-        fprintf(stderr, "[cold_ffn] using %d threads\n", n_threads_);
+        fprintf(stderr, "[moe-expert-compute-cpu] using %d threads\n", n_threads_);
         thread_bufs_.resize(n_threads_);
         for (auto & tb : thread_bufs_) {
             tb.scratch.resize((size_t)n_ff_max * 2);
         }
     }
 
-    void compute(
-        const ColdFfnLayer & layer,
+    bool compute(
+        const MoeExpertLayer & layer,
         const float * input,
         const int32_t * ids,
         const float * weights,
@@ -57,7 +57,7 @@ public:
         int n_ff,
         float * output) override {
 
-        if (n_cold <= 0) return;
+        if (n_cold <= 0) return true;
         std::memset(output, 0, sizeof(float) * (size_t)n_embd);
 
         // Gate/up phase type traits
@@ -180,11 +180,12 @@ public:
                 output[row] += scale * val;
             }
         }
+        return true;
     }
 };
 
-std::unique_ptr<ColdFfnCompute> make_cpu_cold_ffn_compute(int n_ff_max) {
-    return std::make_unique<CpuColdFfnCompute>(n_ff_max);
+std::unique_ptr<MoeExpertCompute> make_cpu_moe_expert_compute(int n_ff_max) {
+    return std::make_unique<CpuMoeExpertCompute>(n_ff_max);
 }
 
 }  // namespace dflash::common

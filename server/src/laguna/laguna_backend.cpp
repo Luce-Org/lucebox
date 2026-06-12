@@ -614,7 +614,7 @@ bool LagunaBackend::init_hybrid_mode() {
 
     const uint64_t warm_cache_bytes = 200ULL * 1024 * 1024;
     const uint64_t safety_bytes = 512ULL * 1024 * 1024;
-    const uint64_t core_bytes = gpu_total - gpu_free;
+    const uint64_t core_bytes = gpu_total > gpu_free ? gpu_total - gpu_free : 0;
 
     uint64_t expert_budget = 0;
     if (gpu_total > core_bytes + kv_total + warm_cache_bytes + safety_bytes) {
@@ -1070,7 +1070,7 @@ bool LagunaBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
     auto _pnow = []{ return std::chrono::steady_clock::now(); };
     auto _pus = [](_pclk::time_point a, _pclk::time_point b){ return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count(); };
     static uint64_t g_total=0, g_ffn=0, g_logits=0, g_build=0, g_compute=0, g_calls=0;
-    static uint64_t g_cold_experts=0, g_cold_layers=0;
+    static uint64_t g_cold_experts=0, g_expert_layers=0;
     const auto _t_start = _prof ? _pnow() : _pclk::time_point{};
 
     // Embed token
@@ -1248,17 +1248,20 @@ bool LagunaBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
             auto & storage = moe_hybrid_->layers[(size_t)il];
             { int _lc=0; for (int _k=0;_k<(int)selected.size();++_k){ int _g=selected[(size_t)_k];
                 if (_g>=0 && _g<(int)storage.hot_local_by_global.size() && storage.hot_local_by_global[(size_t)_g]<0 && storage.cold_local_by_global[(size_t)_g]>=0) { _lc++; } }
-              if (_prof){ g_cold_experts+=(uint64_t)_lc; if(_lc>0) g_cold_layers++; } }
+              if (_prof){ g_cold_experts+=(uint64_t)_lc; if(_lc>0) g_expert_layers++; } }
 
             MoeHybridConfig cfg = make_moe_hybrid_config(w_);
             MoeLayerDesc desc = make_moe_layer_desc(w_.layers[(size_t)il]);
+            MoeExpertCompute * expert_compute = expert_runtime_.compute_ptr();
+            const MoeExpertLayer * expert_layer =
+                expert_runtime_.layer_ptr((size_t)il);
             const auto _t_ffn = _prof ? _pnow() : _pclk::time_point{};
             if (!eval_moe_hybrid_ffn_gpu_resident(
                     backend_, cfg, desc, storage, cpu_be,
                     layer_sg.ffn_post, layer_sg.ffn_residual,
                     gpu_state,
                     selected.data(), weights_buf.data(),
-                    (int)selected.size())) {
+                    (int)selected.size(), expert_compute, expert_layer)) {
                 step_graph_destroy(layer_sg);
                 gpu_state.destroy();
                 return false;
@@ -1326,10 +1329,33 @@ bool LagunaBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
             const double n = 32.0;
             const double tot = g_total/n/1000.0, ffn = g_ffn/n/1000.0, lg = g_logits/n/1000.0;
             const double bld = g_build/n/1000.0, cmp = g_compute/n/1000.0;
-            std::fprintf(stderr, "[lag-prof] avg/tok over 32: total=%.2f ms  prefn=%.2f (build=%.2f compute=%.2f)  ffn=%.2f  logits=%.2f  cold_experts/tok=%.1f cold_layers/tok=%.1f\n",
-                         tot, tot-ffn-lg, bld, cmp, ffn, lg, g_cold_experts/n, g_cold_layers/n);
-            g_total=g_ffn=g_logits=g_build=g_compute=0; g_cold_experts=g_cold_layers=0;
+            std::fprintf(stderr, "[lag-prof] avg/tok over 32: total=%.2f ms  prefn=%.2f (build=%.2f compute=%.2f)  ffn=%.2f  logits=%.2f  cold_experts/tok=%.1f expert_layers/tok=%.1f\n",
+                         tot, tot-ffn-lg, bld, cmp, ffn, lg, g_cold_experts/n, g_expert_layers/n);
+            g_total=g_ffn=g_logits=g_build=g_compute=0; g_cold_experts=g_expert_layers=0;
         }
+    }
+    return true;
+}
+
+bool LagunaBackend::ensure_moe_expert_compute() {
+    if (!moe_hybrid_) return false;
+    std::vector<MoeLayerDesc> layer_descs((size_t)w_.n_layer);
+    for (int il = 0; il < w_.n_layer; ++il) {
+        layer_descs[(size_t)il] = make_moe_layer_desc(w_.layers[(size_t)il]);
+    }
+    MoeExpertComputeRuntimeConfig runtime_cfg;
+    runtime_cfg.target_path = args_.target_path;
+    runtime_cfg.n_layer = w_.n_layer;
+    runtime_cfg.n_expert = w_.n_expert;
+    runtime_cfg.n_expert_used = w_.n_expert_used;
+    runtime_cfg.n_embd = w_.n_embd;
+    runtime_cfg.n_ff_exp = w_.n_ff_exp;
+    runtime_cfg.enabled = true;
+    runtime_cfg.log_prefix = "[laguna-hybrid]";
+    std::string err;
+    if (!ensure_moe_expert_compute_runtime(expert_runtime_, runtime_cfg,
+                                           *moe_hybrid_, layer_descs, &err)) {
+        return false;
     }
     return true;
 }
@@ -1349,6 +1375,10 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
     }
 
     reset_laguna_target_cache(cache_);
+    if (!ensure_moe_expert_compute()) {
+        result.error = "moe_expert_compute";
+        return result;
+    }
 
     // ── Hybrid Prefill: layer-by-layer pre-FFN + batched hybrid FFN ──
     const int hidden = w_.n_embd;
@@ -1465,6 +1495,9 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
                 auto & storage = moe_hybrid_->layers[(size_t)il];
                 MoeHybridConfig chunk_cfg = make_moe_hybrid_config(w_);
                 MoeLayerDesc chunk_desc = make_moe_layer_desc(w_.layers[(size_t)il]);
+                MoeExpertCompute * expert_compute = expert_runtime_.compute_ptr();
+                const MoeExpertLayer * expert_layer =
+                    expert_runtime_.layer_ptr((size_t)il);
                 std::vector<float> ffn_batch_out;
                 bool ffn_ok = false;
 
@@ -1476,7 +1509,8 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
                             chunk_selected.data(),
                             chunk_weights.data(),
                             chunk_len, ffn_batch_out, &result.error,
-                            &ffn_hot_alloc, &ffn_cold_alloc);
+                            &ffn_hot_alloc, &ffn_cold_alloc,
+                            expert_compute, expert_layer);
                 } else if (storage.all_routed_are_hot(chunk_selected.data(),
                                                       chunk_len * n_expert_used)) {
                     // All selected experts happen to be in VRAM — pure GPU, no CPU
@@ -1504,7 +1538,8 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
                             chunk_selected.data(),
                             chunk_weights.data(),
                             chunk_len, ffn_batch_out, &result.error,
-                            &ffn_hot_alloc, &ffn_cold_alloc);
+                            &ffn_hot_alloc, &ffn_cold_alloc,
+                            expert_compute, expert_layer);
                 } else {
                     // Fallback: batched eval handles both hot+cold (CPU for cold)
                     ffn_ok = eval_moe_hybrid_ffn_batched(
@@ -1513,7 +1548,8 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
                             chunk_selected.data(),
                             chunk_weights.data(),
                             chunk_len, ffn_batch_out, &result.error,
-                            &ffn_hot_alloc, &ffn_cold_alloc);
+                            &ffn_hot_alloc, &ffn_cold_alloc,
+                            expert_compute, expert_layer);
                 }
 
                 if (!ffn_ok) {

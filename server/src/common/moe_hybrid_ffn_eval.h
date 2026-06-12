@@ -4,6 +4,7 @@
 
 #include "moe_hybrid_types.h"
 #include "moe_hybrid_storage.h"
+#include "moe_expert_compute.h"
 
 #include "ggml-backend.h"
 
@@ -97,6 +98,9 @@ struct MoeHybridFfnTelemetry {
     int cold_selected = 0;
 };
 
+int moe_hybrid_expert_compute_batch_limit();
+int moe_hybrid_prefill_hot_sub_batch_limit();
+
 // Single-token hybrid FFN: hot on GPU, cold on CPU, combine on host.
 bool eval_moe_hybrid_ffn_single(
     ggml_backend_t                  gpu_backend,
@@ -138,7 +142,10 @@ bool eval_moe_hybrid_ffn_batched(
     std::vector<float> &            out,
     std::string *                   err = nullptr,
     ggml_gallocr_t *                p_hot_alloc = nullptr,
-    ggml_gallocr_t *                p_cold_alloc = nullptr);
+    ggml_gallocr_t *                p_cold_alloc = nullptr,
+    MoeExpertCompute *                expert_compute = nullptr,
+    const MoeExpertLayer *            expert_layer = nullptr,
+    MoeHybridFfnTelemetry *         telemetry = nullptr);
 
 // Hot-only batched prefill: all selected experts are in VRAM.
 // Skips cold graph build, CPU compute, and merge — pure GPU path.
@@ -168,7 +175,9 @@ bool eval_moe_hybrid_ffn_gpu_resident(
     GpuResidentState &              gpu_state,
     const int32_t *                 selected_ids,
     const float *                   selected_weights,
-    int                             n_selected);
+    int                             n_selected,
+    MoeExpertCompute *                expert_compute = nullptr,
+    const MoeExpertLayer *            expert_layer = nullptr);
 
 // Build/rebuild cached hot FFN graph.
 bool build_cached_hot_graph(
@@ -189,7 +198,7 @@ bool build_cached_hot_graph(
     bool gpu_remap = false,
     int n_expert = 0);
 
-// Build/rebuild cached cold FFN graph.
+// Build/rebuild cached MoE expert compute graph.
 bool build_cached_cold_graph(
     CachedFfnGraph & out,
     ggml_backend_t cpu_backend,

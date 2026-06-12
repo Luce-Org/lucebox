@@ -261,7 +261,9 @@ add_library(dflash_common STATIC
     src/common/spark_corpus.cpp
     src/common/moe_hybrid_ffn_eval.cpp
     src/common/moe_hybrid_stream.cpp
-    src/common/cold_ffn_cpu.cpp
+    src/common/moe_expert_compute.cpp
+    src/common/moe_expert_compute_cpu.cpp
+    src/common/moe_expert_compute_ipc.cpp
     src/common/moe_hybrid_swap_manager.cpp
     src/qwen35/layer_split_forward.cpp
     src/qwen35/qwen35_target_shard_ipc.cpp
@@ -531,7 +533,7 @@ target_link_libraries(dflash_common
         ggml-base
         nlohmann_json::nlohmann_json
 )
-# OpenMP for parallel cold FFN kernel (saturate memory bandwidth).
+# OpenMP for parallel MoE expert compute kernel (saturate memory bandwidth).
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(dflash_common PRIVATE OpenMP::OpenMP_CXX)

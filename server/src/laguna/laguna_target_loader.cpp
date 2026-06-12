@@ -484,28 +484,31 @@ bool load_target_gguf_laguna_partial(const std::string & path,
         alloc_total += ggml_backend_buft_get_alloc_size(buft, t);
         allocs.push_back(a);
     }
-    if (allocs.empty()) {
+    if (plan.metadata_only) {
+        out.buf = nullptr;
+    } else if (allocs.empty()) {
         set_last_error("laguna: load plan selected no GPU tensors");
         gguf_free(gctx);
         return false;
-    }
-
-    out.buf = ggml_backend_alloc_buffer(backend, alloc_total);
-    if (!out.buf) {
-        set_last_error("ggml_backend_alloc_buffer failed (laguna target)");
-        gguf_free(gctx); return false;
-    }
-    ggml_backend_buffer_set_usage(out.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-    char * base = (char *)ggml_backend_buffer_get_base(out.buf);
-    for (const LagunaTensorAlloc & a : allocs) {
-        if (ggml_backend_tensor_alloc(out.buf, a.tensor,
-                                      base + a.buffer_offset) != GGML_STATUS_SUCCESS) {
-            set_last_error("ggml_backend_tensor_alloc failed (laguna target)");
-            ggml_backend_buffer_free(out.buf);
-            out.buf = nullptr;
+    } else {
+        out.buf = ggml_backend_alloc_buffer(backend, alloc_total);
+        if (!out.buf) {
+            set_last_error("ggml_backend_alloc_buffer failed (laguna target)");
             gguf_free(gctx);
             return false;
+        }
+        ggml_backend_buffer_set_usage(out.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        char * base = (char *)ggml_backend_buffer_get_base(out.buf);
+        for (const LagunaTensorAlloc & a : allocs) {
+            if (ggml_backend_tensor_alloc(out.buf, a.tensor,
+                                          base + a.buffer_offset) != GGML_STATUS_SUCCESS) {
+                set_last_error("ggml_backend_tensor_alloc failed (laguna target)");
+                ggml_backend_buffer_free(out.buf);
+                out.buf = nullptr;
+                gguf_free(gctx);
+                return false;
+            }
         }
     }
 
@@ -530,11 +533,19 @@ bool load_target_gguf_laguna_partial(const std::string & path,
             continue;
         }
         if (!should_load_laguna_tensor(tname, plan)) continue;
+        if (plan.metadata_only) continue;
         ggml_backend_tensor_set(t, (const uint8_t *)mm.addr + off, 0, sz);
         total += sz;
     }
 
     gguf_free(gctx);
+
+    if (plan.metadata_only) {
+        std::printf("[laguna-loader] metadata-only load: layers=[%d,%d) output=%d tensors=%zu\n",
+                    plan.layer_begin, plan.layer_end, plan.load_output ? 1 : 0,
+                    allocs.size());
+        return true;
+    }
 
     if (tok_embd_off == 0 || tok_embd_type == GGML_TYPE_COUNT) {
         set_last_error("token_embd.weight not found or invalid type");

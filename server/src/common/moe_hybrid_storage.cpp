@@ -41,7 +41,13 @@ void CachedFfnGraph::free() {
     ids = nullptr;
     weights = nullptr;
     output = nullptr;
+    global_ids = nullptr;
+    raw_weights = nullptr;
+    hot_local_lut = nullptr;
+    valid_lut = nullptr;
+    residual_in = nullptr;
     n_hot = 0;
+    n_tokens = 1;
 }
 
 void CachedHotBatchedGraph::free() {
@@ -130,6 +136,8 @@ MoeHybridStorage::~MoeHybridStorage() {
     for (auto & layer : layers) {
         layer.hot_graph.free();
         layer.cold_graph.free();
+        layer.hot_batched_graph.free();
+        layer.shared_batched_graph.free();
         if (layer.hot_buf) {
             ggml_backend_buffer_free(layer.hot_buf);
             layer.hot_buf = nullptr;
@@ -366,7 +374,8 @@ bool build_moe_hybrid_storage_from_file(
     const std::vector<LayerExpertFileData> & file_data,
     MoeHybridStorage & out,
     std::string * err,
-    int cache_slots) {
+    int cache_slots,
+    bool allocate_cold) {
 
     if (!placement.matches(cfg)) {
         if (err) *err = "placement does not match config";
@@ -497,7 +506,7 @@ bool build_moe_hybrid_storage_from_file(
         }
 
         // Allocate cold expert tensors on CPU
-        if (cold_count > 0) {
+        if (allocate_cold && cold_count > 0) {
             ggml_init_params ip{};
             ip.mem_size   = 16 * ggml_tensor_overhead();
             ip.mem_buffer = nullptr;
