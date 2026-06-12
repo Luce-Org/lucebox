@@ -22,6 +22,11 @@ Decode is flat at 38.6 tok/s from 64K to native-max 256K (speedups 1.4x /
 query: 9-70 s scaling with context (bisected above the drafter's ~65K
 single-pass ceiling).
 
+Note on the 256K full-cache row: it fits the 24 GB card only because the
+KV is Q8_0 (~15.3 GiB weights + 4.6 GiB KV ~ 21 GiB, measured, no OOM).
+With F16 KV the cache alone is 9.2 GiB and 256K does NOT fit; KVFlash is
+indifferent (72 MiB resident either way).
+
 ## Retrieval quality vs residency (synthetic NIAH, teacher-forced /16)
 
 | context | residency | LRU (d=10/50/90%) | drafter (d=10/50/90%) | full control |

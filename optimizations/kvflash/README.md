@@ -2,6 +2,10 @@
   <a href="../README.md">← lucebox-hub</a>
 </p>
 
+<p align="center">
+  <img src="hero.png" width="600" />
+</p>
+
 <h1 align="center">Luce KVFlash</h1>
 
 <p align="center">
@@ -27,6 +31,9 @@ KVFlash 4K  @ 256K            38.6          72 MiB        15/16
 Decode speed is flat at any context length (the per-step KV read is pool-sized,
 not context-sized), prefill is up to 2.8x faster, and a 256K prompt that costs
 4.6 GiB of VRAM as a full cache costs 72 MiB resident + 4.2 GiB of host RAM.
+(The full-cache 256K rows are measured, not extrapolated: they fit the 24 GB
+card only thanks to Q8_0 KV; with F16 KV the cache alone is 9.2 GiB and 256K
+does not fit at all.)
 
 ## Usage
 

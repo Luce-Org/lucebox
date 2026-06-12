@@ -39,6 +39,10 @@ Each one is self-contained with setup instructions and benchmark notes.
   <a href="optimizations/spark/"><img src="assets/cards/spark_card.png" alt="Luce Spark MoE expert offload" width="46%"></a>
 </p>
 
+<p align="center">
+  <a href="optimizations/kvflash/"><img src="assets/cards/kvflash_card.png" alt="Luce KVFlash paged KV cache" width="46%"></a>
+</p>
+
 ---
 
 ## Supported Models & Drafters
