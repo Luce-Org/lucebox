@@ -280,6 +280,17 @@ DFLASH27B_KV_TQ3=1 \
 | `--kv-cache-dir <path>` | — | Persist prefix cache to disk |
 | `--kv-cache-budget N` | — | On-disk cache size cap |
 
+**Bounded KV residency (KVFlash)**
+
+Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token chunks live in host RAM, bit-exact and recallable. Decode speed stops depending on context length (flat 38.6 tok/s from 64K to 256K on a 3090, 72 MiB resident). Off by default; works on every model family. With pflash enabled, its drafter automatically becomes the relevance scorer that decides which chunks stay resident. See [Luce KVFlash →](optimizations/kvflash/README.md).
+
+| Flag / env | Default | Effect |
+|---|---|---|
+| `--kvflash <tokens>` | off | Resident pool size. Rounded to 256, clamped to `--max-ctx`, floored at the protected minimum (512 on qwen-family/gemma4, larger on laguna) so eviction always has a victim. |
+| `--kvflash-tau N` | `64` | Reselect interval floor (drafter policy only); the effective interval grows with history to cap rescore overhead. |
+| `DFLASH_KVFLASH=N` | off | Env equivalent of `--kvflash`. |
+| `DFLASH_KVFLASH_TAU=N` | `64` | Env equivalent of `--kvflash-tau`. |
+
 **Thinking budget**
 
 | Flag | Default | Effect |
