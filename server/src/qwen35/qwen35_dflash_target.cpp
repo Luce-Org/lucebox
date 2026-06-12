@@ -99,6 +99,16 @@ bool Qwen35DFlashTarget::verify_batch(
     return true;
 }
 
+bool Qwen35DFlashTarget::read_verify_logits(int n_tokens, std::vector<float> & out) {
+    if (!sg_.logits || n_tokens <= 0) return false;
+    const int64_t vocab = sg_.logits->ne[0];
+    if (n_tokens > (int)sg_.logits->ne[1]) return false;
+    out.resize((size_t)n_tokens * (size_t)vocab);
+    ggml_backend_tensor_get(sg_.logits, out.data(), 0,
+                            sizeof(float) * out.size());
+    return true;
+}
+
 bool Qwen35DFlashTarget::snapshot_kv() {
     snapshot_ssm_state(cache_);
     return true;
