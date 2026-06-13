@@ -132,6 +132,17 @@ struct MoeHybridLayerStorage {
 
     // Cached batched hot-only graph for prefill sub-batches (n_tokens=4).
     CachedHotBatchedGraph hot_batched_graph;
+
+    // Per-n_tokens cached graphs for the MIXED (hot+cold) batched path. The
+    // all-hot path already caches via hot_batched_graph, but the mixed path used
+    // to rebuild+free its hot AND cold ggml graphs on every call — that churn
+    // dominated the spec-decode verify cost (many cold-bearing layers x
+    // sub-batches x steps). Cache per n_tokens (index 1..kMaxBatchedCache-1) so
+    // steady-state verify/replay rebuilds zero graphs. Large prefill batches
+    // (n_tokens >= kMaxBatchedCache) keep using the inline build.
+    static constexpr int kMaxBatchedCache = 9;  // covers spec sub-batch n_tokens 1..8
+    CachedHotBatchedGraph hot_batched_mixed[kMaxBatchedCache];
+    CachedHotBatchedGraph cold_batched_mixed[kMaxBatchedCache];
 };
 
 struct MoeHybridStorage {

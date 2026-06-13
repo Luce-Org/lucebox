@@ -130,6 +130,9 @@ MoeHybridStorage::~MoeHybridStorage() {
     for (auto & layer : layers) {
         layer.hot_graph.free();
         layer.cold_graph.free();
+        layer.hot_batched_graph.free();
+        for (auto & g : layer.hot_batched_mixed) g.free();
+        for (auto & g : layer.cold_batched_mixed) g.free();
         if (layer.hot_buf) {
             ggml_backend_buffer_free(layer.hot_buf);
             layer.hot_buf = nullptr;

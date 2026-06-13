@@ -61,7 +61,8 @@ private:
     // verify via hybrid forward (layer-by-layer with hot/cold FFN).
     bool do_hybrid_spec_decode(int committed, int n_gen,
                                std::vector<int32_t> & out_tokens,
-                               const DaemonIO & io);
+                               const DaemonIO & io,
+                               float * accept_rate_out = nullptr);
 
     // Run one token through hybrid forward, capturing features at capture layers.
     // Returns the logits argmax token. Advances committed by 1.

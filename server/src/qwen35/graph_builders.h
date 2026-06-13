@@ -40,6 +40,10 @@ bool build_layer_step(
     int fa_window = 0,
     int kq_stride_pad = KQ_MASK_PAD);
 
+// `kvflash`: pooled mode — KV rows go through a set_rows input
+// (sg.kv_write_rows, [n_tokens, n_head_kv] ne0-major slots) and the mask
+// (forced on) is sized to the PHYSICAL tensor capacity so the caller can
+// fill it in slot space. Caller allocates slots and fills rows + mask.
 bool build_layer_prefn_step(
     StepGraph & sg,
     const TargetWeights & w,
@@ -50,7 +54,8 @@ bool build_layer_prefn_step(
     int n_tokens,
     bool with_mask,
     int fa_window = 0,
-    int kq_stride_pad = KQ_MASK_PAD);
+    int kq_stride_pad = KQ_MASK_PAD,
+    bool kvflash = false);
 
 // Full layer graph for hybrid decode: pre-FFN + MoE FFN + shared + residual in one compute.
 // Output: sg.hidden_input = layer_output, sg.moe_selected = router selections.

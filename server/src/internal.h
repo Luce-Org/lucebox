@@ -373,6 +373,8 @@ struct TargetCache {
 void snapshot_ssm_state(TargetCache & c);
 // Restore the SSM+conv state from the snapshot.
 void restore_ssm_state(TargetCache & c);
+// Allocate rollback snapshot tensors mirroring live ssm/conv state (MoE path).
+bool ensure_ssm_snapshot(TargetCache & c, ggml_backend_t backend);
 
 // ─── Cross-request prefix snapshot (Phase A) ──────────────────────
 //

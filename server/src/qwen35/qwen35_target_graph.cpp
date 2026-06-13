@@ -440,6 +440,62 @@ void restore_ssm_state(TargetCache & c) {
     }
 }
 
+// Allocate SSM/conv rollback snapshot tensors by mirroring the live recurrent
+// state tensors' shapes. The MoE hybrid spec-decode path sets up its DeltaNet
+// state in base_buf but never calls migrate_prefill_cache, so without this
+// snapshot_ssm_state/restore_ssm_state are silent no-ops (the _snap arrays are
+// empty/null) and rejected draft tokens leak permanently into the linear
+// recurrent state, collapsing generation. Idempotent: reuses an existing
+// rollback_ctx (from a prior request or migrate_prefill_cache).
+bool ensure_ssm_snapshot(TargetCache & c, ggml_backend_t backend) {
+    if (c.rollback_ctx) return true;
+    const size_t n = c.ssm_state.size();
+    if (n == 0) return true;
+    c.ssm_state_snap.assign(n, nullptr);
+    c.conv_state_snap.assign(n, nullptr);
+
+    size_t cnt = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (c.ssm_state[i]) cnt++;
+        if (i < c.conv_state.size() && c.conv_state[i]) cnt++;
+    }
+    if (cnt == 0) return true;
+
+    ggml_init_params ip{};
+    ip.mem_size   = (cnt + 8) * ggml_tensor_overhead();
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    c.rollback_ctx = ggml_init(ip);
+    if (!c.rollback_ctx) { set_last_error("ensure_ssm_snapshot ggml_init failed"); return false; }
+
+    for (size_t i = 0; i < n; i++) {
+        char name[64];
+        if (c.ssm_state[i]) {
+            ggml_tensor * t = c.ssm_state[i];
+            ggml_tensor * sn = ggml_new_tensor(c.rollback_ctx, t->type, ggml_n_dims(t), t->ne);
+            std::snprintf(name, sizeof(name), "ssm_state_snap_%zu", i);
+            ggml_set_name(sn, name);
+            c.ssm_state_snap[i] = sn;
+        }
+        if (i < c.conv_state.size() && c.conv_state[i]) {
+            ggml_tensor * t = c.conv_state[i];
+            ggml_tensor * cn = ggml_new_tensor(c.rollback_ctx, t->type, ggml_n_dims(t), t->ne);
+            std::snprintf(name, sizeof(name), "conv_state_snap_%zu", i);
+            ggml_set_name(cn, name);
+            c.conv_state_snap[i] = cn;
+        }
+    }
+
+    c.rollback_buf = ggml_backend_alloc_ctx_tensors(c.rollback_ctx, backend);
+    if (!c.rollback_buf) {
+        set_last_error("ensure_ssm_snapshot alloc_ctx_tensors failed");
+        ggml_free(c.rollback_ctx);
+        c.rollback_ctx = nullptr;
+        return false;
+    }
+    return true;
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────
 
 static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
