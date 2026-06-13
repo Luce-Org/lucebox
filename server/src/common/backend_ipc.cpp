@@ -29,6 +29,7 @@ const char * backend_ipc_mode_name(BackendIpcMode mode) {
         case BackendIpcMode::DFlashDraft: return "dflash-draft";
         case BackendIpcMode::PFlashCompress: return "pflash-compress";
         case BackendIpcMode::Qwen35TargetShard: return "qwen35-target-shard";
+        case BackendIpcMode::MoeExpertCompute: return "moe-expert-compute";
     }
     return "unknown";
 }
@@ -44,6 +45,10 @@ bool parse_backend_ipc_mode(const std::string & value, BackendIpcMode & out) {
     }
     if (value == "qwen35-target-shard") {
         out = BackendIpcMode::Qwen35TargetShard;
+        return true;
+    }
+    if (value == "moe-expert-compute") {
+        out = BackendIpcMode::MoeExpertCompute;
         return true;
     }
     return false;
@@ -187,7 +192,26 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
     }
     int32_t status = -1;
     if (!read_exact_fd(stream_fd_, &status, sizeof(status)) || status != 0) {
-        std::fprintf(stderr, "backend-ipc daemon did not become ready (status=%d)\n", status);
+        int child_status = 0;
+        const pid_t exited = ::waitpid(pid_, &child_status, WNOHANG);
+        if (exited == pid_) {
+            if (WIFEXITED(child_status)) {
+                std::fprintf(stderr,
+                             "backend-ipc daemon did not become ready (status=%d, exit=%d)\n",
+                             status, WEXITSTATUS(child_status));
+            } else if (WIFSIGNALED(child_status)) {
+                std::fprintf(stderr,
+                             "backend-ipc daemon did not become ready (status=%d, signal=%d)\n",
+                             status, WTERMSIG(child_status));
+            } else {
+                std::fprintf(stderr,
+                             "backend-ipc daemon did not become ready (status=%d, child-status=%d)\n",
+                             status, child_status);
+            }
+            pid_ = -1;
+        } else {
+            std::fprintf(stderr, "backend-ipc daemon did not become ready (status=%d)\n", status);
+        }
         close();
         return false;
     }
@@ -246,17 +270,53 @@ std::string BackendIpcProcess::next_path(const char * prefix) {
 }
 
 bool BackendIpcProcess::write_shared_payload(const void * data, size_t bytes, uint64_t & seq) {
-    if (!shared_payload_map_ || bytes > shared_payload_capacity_) return false;
-    if (bytes > 0 && !data) return false;
+    BackendIpcPayloadSegment segment{data, bytes};
+    return write_shared_payload_segments(&segment, 1, seq);
+}
+
+bool BackendIpcProcess::write_shared_payload_segments(
+        const BackendIpcPayloadSegment * segments,
+        size_t n_segments,
+        uint64_t & seq) {
+    if (!shared_payload_map_ || (!segments && n_segments > 0)) return false;
+    size_t bytes = 0;
+    for (size_t i = 0; i < n_segments; ++i) {
+        if (segments[i].bytes > 0 && !segments[i].data) return false;
+        if (!backend_ipc_checked_add_size(bytes, segments[i].bytes, bytes)) {
+            return false;
+        }
+    }
+    if (bytes > shared_payload_capacity_) return false;
     auto * header = static_cast<BackendIpcSharedPayloadHeader *>(shared_payload_map_);
-    void * payload = static_cast<void *>(
+    auto * payload = static_cast<char *>(
         static_cast<char *>(shared_payload_map_) + backend_ipc_shared_payload_header_bytes());
-    if (bytes > 0) {
-        std::memcpy(payload, data, bytes);
+    size_t off = 0;
+    for (size_t i = 0; i < n_segments; ++i) {
+        if (segments[i].bytes > 0) {
+            std::memcpy(payload + off, segments[i].data, segments[i].bytes);
+            off += segments[i].bytes;
+        }
     }
     seq = ++shared_payload_seq_;
     header->bytes = (uint64_t)bytes;
     header->sequence = seq;
+    return true;
+}
+
+bool BackendIpcProcess::read_shared_payload(void * data, size_t bytes, uint64_t seq) const {
+    if (!shared_payload_map_ || bytes > shared_payload_capacity_) return false;
+    if (bytes > 0 && !data) return false;
+    const auto * header =
+        static_cast<const BackendIpcSharedPayloadHeader *>(shared_payload_map_);
+    if (header->sequence != seq || header->bytes != (uint64_t)bytes) {
+        return false;
+    }
+    const void * payload = static_cast<const void *>(
+        static_cast<const char *>(shared_payload_map_) +
+        backend_ipc_shared_payload_header_bytes());
+    if (bytes > 0) {
+        std::memcpy(data, payload, bytes);
+    }
     return true;
 }
 

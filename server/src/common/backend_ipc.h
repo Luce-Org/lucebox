@@ -24,6 +24,7 @@ enum class BackendIpcMode {
     DFlashDraft,
     PFlashCompress,
     Qwen35TargetShard,
+    MoeExpertCompute,
 };
 
 const char * backend_ipc_mode_name(BackendIpcMode mode);
@@ -79,6 +80,11 @@ struct BackendIpcLaunchConfig {
     size_t shared_payload_bytes = 0;
 };
 
+struct BackendIpcPayloadSegment {
+    const void * data = nullptr;
+    size_t bytes = 0;
+};
+
 class BackendIpcProcess {
 public:
     BackendIpcProcess() = default;
@@ -102,6 +108,10 @@ public:
 
     std::string next_path(const char * prefix);
     bool write_shared_payload(const void * data, size_t bytes, uint64_t & seq);
+    bool write_shared_payload_segments(const BackendIpcPayloadSegment * segments,
+                                       size_t n_segments,
+                                       uint64_t & seq);
+    bool read_shared_payload(void * data, size_t bytes, uint64_t seq) const;
 
 private:
 #if !defined(_WIN32)

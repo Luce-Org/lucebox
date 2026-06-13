@@ -96,6 +96,7 @@ private:
     MoeHybridSwapPolicy                        swap_policy_;
     bool                                       hybrid_telemetry_ = false;
     MoeHybridStreamEngine                      stream_engine_;
+    MoeExpertComputeRuntime                    expert_runtime_;
 
     bool ensure_slot(int slot);
 
@@ -107,6 +108,7 @@ private:
     bool build_hybrid_storage_from_file(const MoeHybridPlacement & placement,
                                         std::shared_ptr<MoeHybridStorage> & out_storage,
                                         std::string & err);
+    bool ensure_moe_expert_compute();
     GenerateResult generate_hybrid(const GenerateRequest & req, const DaemonIO & io);
     bool hybrid_forward_one_token(int32_t tok, int kv_pos,
                                   std::vector<float> & act_cur,

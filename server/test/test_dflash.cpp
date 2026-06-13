@@ -1818,7 +1818,8 @@ int main(int argc, char ** argv) {
 
                                 // Init pipelined state
                                 PipelinedDecodeState pipe_state;
-                                if (!init_pipelined_decode_state(pipe_state, backend, w, cache, *hybrid, ctx, g_kq_stride_pad)) {
+                                if (!init_pipelined_decode_state(pipe_state, backend, w, target_path,
+                                                                 cache, *hybrid, ctx, g_kq_stride_pad)) {
                                     std::fprintf(stderr, "[time-breakdown] pipelined state init failed\n");
                                     continue;
                                 }
@@ -1915,7 +1916,8 @@ int main(int argc, char ** argv) {
                                         int ctx = 2000;
                                         if (ctx + 1 <= max_ctx) {
                                             PipelinedDecodeState pipe_state;
-                                            if (init_pipelined_decode_state(pipe_state, backend, w, cache, *hybrid_realistic, ctx, g_kq_stride_pad)) {
+                                            if (init_pipelined_decode_state(pipe_state, backend, w, target_path,
+                                                                            cache, *hybrid_realistic, ctx, g_kq_stride_pad)) {
                                                 std::vector<float> act_cur_pipe((size_t)hidden, 0.0f);
                                                 ggml_backend_tensor_set(pipe_state.gpu_state.act_cur, act_cur_pipe.data(), 0,
                                                                         sizeof(float) * (size_t)hidden);

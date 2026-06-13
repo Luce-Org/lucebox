@@ -21,12 +21,14 @@ public:
     explicit Qwen35MoeBackend(const Qwen35Config & cfg);
     ~Qwen35MoeBackend() override = default;
 
+    bool init() override;
+
     GenerateResult generate_impl(const GenerateRequest & req,
                                  const DaemonIO & io) override;
     GenerateResult restore_and_generate_impl(int slot,
                                              const GenerateRequest & req,
                                              const DaemonIO & io) override;
-    bool supports_dflash_spec_decode() const override { return !target_weights().moe_hybrid; }
+    bool supports_dflash_spec_decode() const override { return true; }
 
 protected:
     bool load_target_model(ggml_backend_t backend, TargetWeights & out) override;
@@ -58,10 +60,11 @@ private:
                                 std::string * err);
 
     // Hybrid speculative decode: draft tokens using DFlash draft model,
-    // verify via hybrid forward (layer-by-layer with hot/cold FFN).
+    // verify via hybrid forward (layer-by-layer with hot/MoE expert compute).
     bool do_hybrid_spec_decode(int committed, int n_gen,
                                std::vector<int32_t> & out_tokens,
-                               const DaemonIO & io);
+                               const DaemonIO & io,
+                               float & out_accept_rate);
 
     // Run one token through hybrid forward, capturing features at capture layers.
     // Returns the logits argmax token. Advances committed by 1.
