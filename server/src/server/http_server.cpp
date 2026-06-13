@@ -61,13 +61,16 @@ static inline const char* sock_strerror() {
     return buf;
 }
 #else
+#include <fcntl.h>
 #include <sys/stat.h>
+#define SOCK_FD(fd)    (fd)
 static inline int sock_get_flags(int fd) { return fcntl(fd, F_GETFL, 0); }
-static inline void sock_set_nonblock(int fd) { fcntl(fd, F_SETFL, O_NONBLOCK); }
+static inline void sock_set_nonblock(int fd) { int f = fcntl(fd, F_GETFL, 0); if (f >= 0) fcntl(fd, F_SETFL, f | O_NONBLOCK); }
+static inline void sock_set_block(int fd) { int f = fcntl(fd, F_GETFL, 0); if (f >= 0) fcntl(fd, F_SETFL, f & ~O_NONBLOCK); }
 static inline void socket_close(int fd) { ::close(fd); }
 #define SETSOCKOPT_CAST  /* empty on POSIX */
 #include <unistd.h>
-static inline const char* sock_strerror() { return sock_strerror(); }
+static inline const char* sock_strerror() { return strerror(errno); }
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
