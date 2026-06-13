@@ -1708,7 +1708,15 @@ bool LagunaBackend::build_hybrid_storage_from_file(
         return false;
     }
     const size_t file_size = _mf.size();
-    const void * mmap_addr = _mf.data();
+    // Transfer mmap ownership out of the RAII wrapper: the hybrid storage keeps
+    // the mapping alive and unmaps it in ~MoeHybridStorage. On POSIX the fd can
+    // be closed now (the mapping stays valid); on Windows release() already
+    // closed the mapping handle.
+    GgufMmap::OwnedRegion _region = _mf.release();
+    const void * mmap_addr = _region.data;
+#if !defined(_WIN32)
+    if (_region.fd >= 0) ::close(_region.fd);
+#endif
 
     const size_t data_start = gguf_get_data_offset(gctx);
     const auto * file_bytes = (const uint8_t *)mmap_addr;
@@ -1745,10 +1753,14 @@ bool LagunaBackend::build_hybrid_storage_from_file(
                                                             mmap_addr, file_size, *hybrid, &err, cache_slots);
     gguf_free(gctx);
     if (!ok) {
-        ::munmap(mmap_addr, file_size);
+#if defined(_WIN32)
+        UnmapViewOfFile(const_cast<void *>(mmap_addr));
+#else
+        ::munmap(const_cast<void *>(mmap_addr), file_size);
+#endif
         return false;
     }
-    // mmap ownership transferred to the storage (munmapped in ~MoeHybridStorage)
+    // mmap ownership transferred to the storage (unmapped in ~MoeHybridStorage)
     out_storage = std::move(hybrid);
     return true;
 }

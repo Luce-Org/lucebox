@@ -104,7 +104,15 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
             return false;
         }
         const size_t file_size = _mf.size();
-        const void * mmap_addr = _mf.data();
+        // Transfer mmap ownership out of the RAII wrapper: the hybrid storage
+        // keeps the mapping alive for streaming prefill and unmaps it in
+        // ~MoeHybridStorage. On POSIX the fd can be closed now (the mapping
+        // stays valid); on Windows release() already closed the mapping handle.
+        GgufMmap::OwnedRegion _region = _mf.release();
+        const void * mmap_addr = _region.data;
+#if !defined(_WIN32)
+        if (_region.fd >= 0) ::close(_region.fd);
+#endif
 
         const size_t data_start = gguf_get_data_offset(gctx);
         const auto * file_bytes = (const uint8_t *)mmap_addr;
@@ -143,6 +151,11 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
     if (const char * cs = std::getenv("DFLASH_QWEN35MOE_CACHE_SLOTS")) cache_slots = std::max(0, std::atoi(cs));
     else if (cache_slots_ >= 0) cache_slots = cache_slots_;
     if (!build_moe_hybrid_storage_from_file_with_mmap(hybrid_cfg, backend, placement, layer_descs, layer_file_data, mmap_addr, file_size, *hybrid, &err, cache_slots)) {
+#if defined(_WIN32)
+            UnmapViewOfFile(const_cast<void *>(mmap_addr));
+#else
+            ::munmap(const_cast<void *>(mmap_addr), file_size);
+#endif
             gguf_free(gctx);
             set_last_error(std::string("qwen35moe hybrid storage build failed: ") + err);
             return false;
