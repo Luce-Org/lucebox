@@ -1810,6 +1810,22 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
     const int q_len = draft_weights().block_size;
     if (q_len <= 0) return false;
 
+    // Verify width: cap how many draft tokens we actually verify. The batched
+    // verify's cost is dominated by the distinct experts its tokens touch
+    // (especially under --spark expert offload, where extra tokens stream extra
+    // cold experts). Tokens past the realized accept length are wasted, so
+    // capping the verify to a width above the typical accept length cuts that
+    // waste at no acceptance cost. Default = full draft block; tune via env.
+    // Verify-width control (see note above). DFLASH_VERIFY_WIDTH pins a fixed
+    // width; otherwise the width adapts to the realized accept length so chain
+    // decoding (low AL) verifies just a few tokens (cheap, especially under
+    // expert offload) while a high-AL draft still gets enough width.
+    const int forced_verify_width = [&]{
+        const char * e = std::getenv("DFLASH_VERIFY_WIDTH");
+        return e ? std::max(1, std::min(q_len, std::atoi(e))) : 0;
+    }();
+    int observed_max_accept = 1;
+
     int32_t last_tok = target_cache().last_tok;
     std::vector<float> act_cur((size_t)hidden);
 
@@ -1839,6 +1855,9 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
 
     while (n_generated < n_gen) {
         const int need_commit_budget = n_gen - n_generated;
+        const int verify_width = forced_verify_width > 0
+            ? forced_verify_width
+            : std::min(q_len, std::max(6, observed_max_accept + 2));
 
         // 1. Build noise input for draft
         noise_ids[0] = last_tok;
@@ -1924,9 +1943,9 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         // 4. Verify: snapshot recurrent state, then run ALL draft tokens batched
         snapshot_ssm_state(target_cache());
 
-        target_tok.resize(q_len);
+        target_tok.resize(verify_width);
         bool verify_ok = hybrid_forward_batch(
-            draft_tok.data(), q_len, committed,
+            draft_tok.data(), verify_width, committed,
             act_cur, target_tok, /*capture_features=*/false);
         if (!verify_ok) {
             std::fprintf(stderr, "[hybrid-spec] verify failed\n");
@@ -1937,11 +1956,12 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
 
         // 5. Acceptance: longest matching prefix
         int accept_n = 1;
-        for (int i = 0; i < q_len - 1; i++) {
+        for (int i = 0; i < verify_width - 1; i++) {
             if (draft_tok[i + 1] == target_tok[i]) accept_n++;
             else break;
         }
-        int bonus_tok = (accept_n < q_len) ? target_tok[accept_n - 1] : -1;
+        int bonus_tok = (accept_n < verify_width) ? target_tok[accept_n - 1] : -1;
+        observed_max_accept = std::max(observed_max_accept, accept_n);
         int commit_n = accept_n + (bonus_tok >= 0 ? 1 : 0);
         if (commit_n > need_commit_budget) {
             commit_n = need_commit_budget;
