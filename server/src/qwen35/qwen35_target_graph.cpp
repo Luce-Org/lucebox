@@ -489,6 +489,11 @@ bool ensure_ssm_snapshot(TargetCache & c, ggml_backend_t backend) {
     c.rollback_buf = ggml_backend_alloc_ctx_tensors(c.rollback_ctx, backend);
     if (!c.rollback_buf) {
         set_last_error("ensure_ssm_snapshot alloc_ctx_tensors failed");
+        // Null the snap pointers so a later snapshot/restore_ssm_state (which
+        // iterates ssm_state.size()) skips them instead of dereferencing
+        // tensors from the freed rollback_ctx.
+        for (auto & p : c.ssm_state_snap)  p = nullptr;
+        for (auto & p : c.conv_state_snap) p = nullptr;
         ggml_free(c.rollback_ctx);
         c.rollback_ctx = nullptr;
         return false;

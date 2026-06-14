@@ -2005,6 +2005,13 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         }
         committed += emitted;
         target_cache().cur_pos = committed;
+        // Keep the kvflash pool history + scorer reselection in sync during spec
+        // decode (the AR paths do this); otherwise the pool evicts on stale,
+        // prompt-only history under --spark --draft --kvflash.
+        if (kvflash_active()) {
+            for (int i = 0; i < emitted; i++) kvflash_history_.push_back(replay_tok[(size_t)i]);
+            kvflash_maybe_reselect((int)out_tokens.size());
+        }
         n_generated += emitted;
         n_accept_sum += std::min(accept_n, emitted);
         n_draft_steps++;

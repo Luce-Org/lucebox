@@ -1050,7 +1050,11 @@ static bool eval_moe_hybrid_ffn_batched_core(
         std::vector<float>   hot_wts(total_slots, 0.0f);
         std::vector<int32_t> cold_sel(total_slots);
         std::vector<float>   cold_wts(total_slots, 0.0f);
-        for (int i = 0; i < total_slots; ++i) { hot_sel[i] = i % n_hot_stack; cold_sel[i] = i % n_cold_stack; }
+        // Dummy (unused) slots must point at INITIALIZED pinned experts, not
+        // uninitialized cache-ring spare slots (hot_active..n_hot_stack), whose
+        // garbage Q4_K scale bits could dequantize to NaN (x weight 0 = NaN).
+        const int n_hot_init = std::max(1, storage.hot_active);
+        for (int i = 0; i < total_slots; ++i) { hot_sel[i] = i % n_hot_init; cold_sel[i] = i % n_cold_stack; }
         bool fp_has_cold = false;
         for (int i = 0; i < total_slots; ++i) {
             const int32_t gid = selected_ids[i];
@@ -1088,7 +1092,11 @@ static bool eval_moe_hybrid_ffn_batched_core(
                 ggml_backend_tensor_set(cg->inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
                 ggml_backend_tensor_set(cg->sel, cold_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
                 ggml_backend_tensor_set(cg->wts, cold_wts.data(), 0, sizeof(float) * (size_t)total_slots);
-                ggml_backend_graph_compute(cpu_backend, cg->gf);  // sync; overlaps the async hot GPU graph
+                if (ggml_backend_graph_compute(cpu_backend, cg->gf) != GGML_STATUS_SUCCESS) {
+                    ggml_backend_synchronize(gpu_backend);
+                    if (err) *err = "batched cold cached compute failed";
+                    return false;
+                }
                 ggml_backend_tensor_get(cg->output, cold_partial.data(), 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
             }
 
@@ -1111,7 +1119,9 @@ static bool eval_moe_hybrid_ffn_batched_core(
                           : storage.gate_hot    ? (int)storage.gate_hot->ne[2]
                           : 1;
     std::vector<int32_t> hot_sel(total_slots);
-    for (int i = 0; i < total_slots; ++i) hot_sel[i] = i % n_hot_stack;
+    // Dummy slots -> pinned (initialized) experts only; see note above.
+    const int n_hot_init = std::max(1, storage.hot_active);
+    for (int i = 0; i < total_slots; ++i) hot_sel[i] = i % n_hot_init;
     std::vector<float>   hot_wts(total_slots, 0.0f);
     std::vector<int32_t> cold_sel(total_slots);
     for (int i = 0; i < total_slots; ++i) cold_sel[i] = i % std::max(1, (int)(storage.down_cold ? storage.down_cold->ne[2] : 1));
