@@ -29,7 +29,7 @@ Request 2: [system + user1 + assistant1 + user2 + assistant2 + user3]
 │  • detect chat boundaries via ChatMarkers               │
 │  • SHA-1 hash prefix at each boundary                   │
 │  • LRU eviction when cap is reached                     │
-│  • Two tiers: inline prefix + full-compress             │
+│  • Two RAM pools: inline prefix + exact prefill         │
 └────────────────────────┬────────────────────────────────┘
                          │ snapshot_save / restore_and_generate
                          ▼
@@ -41,7 +41,7 @@ Request 2: [system + user1 + assistant1 + user2 + assistant2 + user3]
 └─────────────────────────────────────────────────────────┘
 ```
 
-## Two-Tier Caching
+## Cache Pools
 
 ### Tier 1: Inline Prefix Cache
 
@@ -55,14 +55,24 @@ token sequences.
 - **confirm_inline_snap()**: Commits the entry after successful save.
 - LRU eviction: oldest entry's slot is reused when capacity is reached.
 
-### Tier 2: Full-Compress Cache
+### Tier 2: Exact Prefill Cache
 
-Caches the **entire post-compression KV state**, keyed on the raw
+Caches the **entire post-compression KV state** in RAM, keyed on the raw
 (pre-compression) prompt. Hits skip both PFlash compression and prefill
-entirely — the fastest path.
+entirely -- the fastest path for repeated prompts.
 
 - Separate slot pool starting at `cap` (inline slots are `[0, cap)`).
 - Keyed on SHA-1 of the full raw prompt (not just a prefix).
+
+The two flags are intentionally separate:
+
+- `--prefix-cache-slots` controls turn-boundary prefix snapshots.
+- `--prefill-cache-slots` controls exact full-prompt snapshots.
+
+The disk prefix cache is a separate persistence/overflow layer for token-keyed
+snapshots. Today it is integrated with the inline/effective-prompt path; exact
+prefill snapshots are kept in RAM unless a dedicated raw-prompt disk path is
+added.
 
 ## Snapshot Memory Management
 
@@ -170,11 +180,11 @@ free_snapshot_backend(snap_backend_, compute_backend_);  // then backend
 
 | Server flag | Default | Description |
 |-------------|---------|-------------|
-| `--prefix-cache-cap N` | 32 | Max inline prefix cache slots |
-| `--prefix-cache-full N` | 0 | Max full-compress cache slots |
+| `--prefix-cache-slots N` | 32 | Max turn-boundary prefix cache slots |
+| `--prefill-cache-slots N` | 0 | Max exact full-prompt prefill cache slots |
 | `--skip-park` | false | Skip parking draft model during compress |
 
-### Choosing `--prefix-cache-cap`
+### Choosing `--prefix-cache-slots`
 
 With right-sized, CPU-resident snapshots the limiting resource is **system RAM**,
 not VRAM. Each slot costs approximately `cur_pos × 5 KB` (for Qwen3.5-27B Q8_0 KV),

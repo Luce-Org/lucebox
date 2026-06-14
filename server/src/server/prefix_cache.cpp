@@ -147,6 +147,7 @@ PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer)
 {
     if (cap_ <= 0) {
         disabled_ = true;
+        cap_ = 0;
         return;
     }
     if (!resolve_chat_markers(tokenizer, markers_)) {
@@ -308,7 +309,7 @@ void PrefixCache::mark_all_cleared() {
 // ── Full-compress cache ─────────────────────────────────────────────────
 
 void PrefixCache::init_full_cache(int full_cap) {
-    if (disabled_ || full_cap <= 0) {
+    if (full_cap <= 0) {
         full_disabled_ = true;
         full_cap_ = 0;
         return;

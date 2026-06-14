@@ -98,6 +98,7 @@ proc = subprocess.Popen(
         "--max-ctx",            "8192",
         "--port",               str(PORT),
         "--prefix-cache-slots", "4",
+        "--prefill-cache-slots","4",
         "--prefill-compression","auto",
         "--prefill-threshold",  "32000",
         "--prefill-keep-ratio", "0.05",
