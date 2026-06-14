@@ -8,7 +8,7 @@
 
 #include "common/model_backend.h"
 #include "common/sampler.h"
-#include "../common/deepseek4_expert_ipc.h"
+#include "expert_ipc.h"
 #include "../common/moe_hybrid_placement.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_storage.h"
@@ -96,7 +96,7 @@ private:
 
     std::shared_ptr<MoeHybridStorage> moe_hybrid_;
     MoeHybridPlacement                moe_placement_;
-    std::unique_ptr<DeepSeek4ExpertIpcClient> expert_worker_;
+    std::unique_ptr<ExpertIpcClient> expert_worker_;
     bool                              expert_worker_owns_hot_ids_ = false;
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string                       routing_stats_out_path_;

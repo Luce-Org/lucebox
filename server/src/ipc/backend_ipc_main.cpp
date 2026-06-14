@@ -2,7 +2,7 @@
 
 #include "backend_ipc.h"
 #include "moe_expert_compute.h"
-#include "deepseek4_expert_ipc.h"
+#include "expert_ipc.h"
 #include "dflash_draft_ipc.h"
 #include "gemma4/gemma4_layer_split_adapter.h"
 #include "laguna/laguna_layer_split_adapter.h"
@@ -128,7 +128,7 @@ int main(int argc, char ** argv) {
             "[--hidden=N --vocab=N --max-tokens=N]\n"
             "   or: %s --backend-ipc-mode=moe-expert-compute <target.gguf> "
             "--stream-fd=FD --target-gpu=N --placement=PATH\n"
-            "   or: %s --backend-ipc-mode=deepseek4-expert <model.gguf> "
+            "   or: %s --backend-ipc-mode=moe-expert <model.gguf> "
             "--stream-fd=FD [--payload-fd=FD] [--draft-gpu=N]\n",
             argv[0],
             argv[0],
@@ -366,9 +366,9 @@ int main(int argc, char ** argv) {
                                                      target_gpu, stream_fd,
                                                      payload_fd, shared_payload_fd,
                                                      shared_payload_bytes);
-        case BackendIpcMode::DeepSeek4Expert:
-            return run_deepseek4_expert_ipc_daemon(payload_path, draft_gpu,
-                                                   stream_fd, payload_fd);
+        case BackendIpcMode::MoeExpert:
+            return run_expert_ipc_daemon(payload_path, draft_gpu,
+                                         stream_fd, payload_fd);
     }
     std::fprintf(stderr, "[backend-ipc-daemon] unsupported mode\n");
     return 2;

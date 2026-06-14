@@ -11,7 +11,7 @@
 #include "deepseek4_internal.h"
 #include "deepseek4_hc_cuda.h"
 #include "internal.h"
-#include "../common/deepseek4_expert_ipc.h"
+#include "expert_ipc.h"
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_types.h"
@@ -711,7 +711,7 @@ static bool eval_ds4_hybrid_or_worker(
         const MoeHybridConfig & hybrid_cfg,
         const MoeLayerDesc & desc,
         MoeHybridLayerStorage & storage,
-        DeepSeek4ExpertIpcClient * expert_worker,
+        ExpertIpcClient * expert_worker,
         int layer,
         int n_embd,
         int n_expert_used,
@@ -793,8 +793,8 @@ static bool eval_ds4_hybrid_or_worker(
 
         float * dst = ffn_out_host.data() + (size_t)ti * (size_t)n_embd;
         MoeHybridFfnTelemetry local_tel;
-        DeepSeek4ExpertIpcTiming ipc_timing;
-        DeepSeek4ExpertIpcClient::PendingEval pending;
+        ExpertIpcTiming ipc_timing;
+        ExpertIpcClient::PendingEval pending;
         bool worker_pending = false;
         Ds4TimingClock::time_point worker_t0{};
         if (!remote_ids.empty() && async_worker) {
@@ -1255,7 +1255,7 @@ static bool deepseek4_step_hybrid(
         int kv_start,
         std::vector<float> & out_logits,
         const int32_t * token_ids,
-        DeepSeek4ExpertIpcClient * expert_worker,
+        ExpertIpcClient * expert_worker,
         bool worker_owns_hot_ids,
         DeepSeek4StepTelemetry * telemetry,
         MoeHybridRoutingStats * routing_stats) {
@@ -1724,7 +1724,7 @@ bool deepseek4_step(
         std::vector<float> & out_logits,
         MoeHybridStorage * moe_hybrid,
         const int32_t * token_ids,
-        DeepSeek4ExpertIpcClient * expert_worker,
+        ExpertIpcClient * expert_worker,
         bool worker_owns_hot_ids,
         DeepSeek4StepTelemetry * telemetry,
         MoeHybridRoutingStats * routing_stats) {

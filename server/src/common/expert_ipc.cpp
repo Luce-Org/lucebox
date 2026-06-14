@@ -1,6 +1,6 @@
-// deepseek4_expert_ipc.cpp - DeepSeek4 expert IPC client.
+// expert_ipc.cpp - Expert IPC client.
 
-#include "deepseek4_expert_ipc.h"
+#include "expert_ipc.h"
 #include "io_utils.h"
 
 #include <algorithm>
@@ -20,20 +20,20 @@ static uint64_t ipc_elapsed_us(IpcClock::time_point start, IpcClock::time_point 
 
 } // namespace
 
-bool DeepSeek4ExpertIpcClient::start(const std::string & bin,
+bool ExpertIpcClient::start(const std::string & bin,
                                      const std::string & model_path,
                                      int worker_gpu,
                                      const std::string & work_dir) {
 #if defined(_WIN32)
     (void)bin; (void)model_path; (void)worker_gpu; (void)work_dir;
-    std::fprintf(stderr, "DeepSeek4 expert IPC is only implemented on POSIX hosts\n");
+    std::fprintf(stderr, "Expert IPC is only implemented on POSIX hosts\n");
     return false;
 #else
     close();
     if (bin.empty() || model_path.empty()) return false;
     BackendIpcLaunchConfig launch;
     launch.bin = bin;
-    launch.mode = BackendIpcMode::DeepSeek4Expert;
+    launch.mode = BackendIpcMode::MoeExpert;
     launch.payload_path = model_path;
     launch.work_dir = work_dir;
     launch.args.push_back("--draft-gpu=" + std::to_string(std::max(0, worker_gpu)));
@@ -58,17 +58,17 @@ bool DeepSeek4ExpertIpcClient::start(const std::string & bin,
         }
     }
     if (!process_.start(launch)) {
-        std::fprintf(stderr, "deepseek4-expert-ipc backend process start failed\n");
+        std::fprintf(stderr, "expert-ipc backend process start failed\n");
         return false;
     }
     active_ = true;
-    std::fprintf(stderr, "[deepseek4-expert-ipc] ready bin=%s gpu=%d work_dir=%s\n",
+    std::fprintf(stderr, "[expert-ipc] ready bin=%s gpu=%d work_dir=%s\n",
                  bin.c_str(), worker_gpu, process_.work_dir().c_str());
     return true;
 #endif
 }
 
-bool DeepSeek4ExpertIpcClient::ping() {
+bool ExpertIpcClient::ping() {
 #if defined(_WIN32)
     return false;
 #else
@@ -82,7 +82,7 @@ bool DeepSeek4ExpertIpcClient::ping() {
 #endif
 }
 
-bool DeepSeek4ExpertIpcClient::eval(int layer,
+bool ExpertIpcClient::eval(int layer,
                                     int n_tokens,
                                     int n_embd,
                                     int n_selected,
@@ -90,7 +90,7 @@ bool DeepSeek4ExpertIpcClient::eval(int layer,
                                     const int32_t * selected_ids,
                                     const float * selected_weights,
                                     std::vector<float> & out,
-                                    DeepSeek4ExpertIpcTiming * timing) {
+                                    ExpertIpcTiming * timing) {
     PendingEval pending;
     if (!eval_begin(layer, n_tokens, n_embd, n_selected, activations,
                     selected_ids, selected_weights, pending, timing)) {
@@ -99,7 +99,7 @@ bool DeepSeek4ExpertIpcClient::eval(int layer,
     return eval_end(pending, out, timing);
 }
 
-bool DeepSeek4ExpertIpcClient::eval_begin(int layer,
+bool ExpertIpcClient::eval_begin(int layer,
                                           int n_tokens,
                                           int n_embd,
                                           int n_selected,
@@ -107,7 +107,7 @@ bool DeepSeek4ExpertIpcClient::eval_begin(int layer,
                                           const int32_t * selected_ids,
                                           const float * selected_weights,
                                           PendingEval & pending,
-                                          DeepSeek4ExpertIpcTiming * timing) {
+                                          ExpertIpcTiming * timing) {
 #if defined(_WIN32)
     (void)layer; (void)n_tokens; (void)n_embd; (void)n_selected;
     (void)activations; (void)selected_ids; (void)selected_weights; (void)pending; (void)timing;
@@ -122,10 +122,10 @@ bool DeepSeek4ExpertIpcClient::eval_begin(int layer,
         return false;
     }
 
-    DeepSeek4ExpertIpcTiming local_timing;
-    DeepSeek4ExpertIpcTiming & t = timing ? *timing : local_timing;
+    ExpertIpcTiming local_timing;
+    ExpertIpcTiming & t = timing ? *timing : local_timing;
     t = {};
-    t.request_bytes = sizeof(DeepSeek4ExpertIpcRequestHeader) +
+    t.request_bytes = sizeof(ExpertIpcRequestHeader) +
         sizeof(float) * (size_t)n_tokens * (size_t)n_embd +
         sizeof(int32_t) * (size_t)n_tokens * (size_t)n_selected +
         sizeof(float) * (size_t)n_tokens * (size_t)n_selected;
@@ -135,12 +135,12 @@ bool DeepSeek4ExpertIpcClient::eval_begin(int layer,
     {
         std::ofstream f(path, std::ios::binary);
         if (!f) return false;
-        DeepSeek4ExpertIpcRequestHeader hdr;
+        ExpertIpcRequestHeader hdr;
         hdr.layer = layer;
         hdr.n_tokens = n_tokens;
         hdr.n_embd = n_embd;
         hdr.n_selected = n_selected;
-        hdr.flags = timing ? DS4_EXPERT_IPC_FLAG_GRAPH_TIMING : 0;
+        hdr.flags = timing ? EXPERT_IPC_FLAG_GRAPH_TIMING : 0;
         f.write((const char *)&hdr, sizeof(hdr));
         f.write((const char *)activations,
                 sizeof(float) * (size_t)n_tokens * (size_t)n_embd);
@@ -165,9 +165,9 @@ bool DeepSeek4ExpertIpcClient::eval_begin(int layer,
 #endif
 }
 
-bool DeepSeek4ExpertIpcClient::eval_end(PendingEval & pending,
+bool ExpertIpcClient::eval_end(PendingEval & pending,
                                         std::vector<float> & out,
-                                        DeepSeek4ExpertIpcTiming * timing) {
+                                        ExpertIpcTiming * timing) {
 #if defined(_WIN32)
     (void)pending; (void)out; (void)timing;
     return false;
@@ -179,7 +179,7 @@ bool DeepSeek4ExpertIpcClient::eval_end(PendingEval & pending,
         return false;
     }
 
-    DeepSeek4ExpertIpcResponseHeader resp;
+    ExpertIpcResponseHeader resp;
     const auto wait_t0 = IpcClock::now();
     bool header_prefix_ok = read_exact_fd(stream_fd, &resp, sizeof(resp)) &&
                             resp.magic == 0x44533452u &&
@@ -187,15 +187,15 @@ bool DeepSeek4ExpertIpcClient::eval_end(PendingEval & pending,
     if (timing) timing->parent_wait_us += ipc_elapsed_us(wait_t0, IpcClock::now());
     bool ok = header_prefix_ok;
     if (header_prefix_ok) {
-        DeepSeek4ExpertIpcTiming local_timing;
-        DeepSeek4ExpertIpcTiming & t = timing ? *timing : local_timing;
+        ExpertIpcTiming local_timing;
+        ExpertIpcTiming & t = timing ? *timing : local_timing;
         t.worker_request_read_us = resp.worker_request_read_us;
         t.worker_partition_us = resp.worker_partition_us;
         t.worker_resident_eval_us = resp.worker_resident_eval_us;
         t.worker_miss_build_us = resp.worker_miss_build_us;
         t.worker_miss_eval_us = resp.worker_miss_eval_us;
         if (resp.version == 3) {
-            DeepSeek4ExpertIpcGraphTiming graph_timing;
+            ExpertIpcGraphTiming graph_timing;
             ok = read_exact_fd(stream_fd, &graph_timing, sizeof(graph_timing)) &&
                  graph_timing.magic == 0x44533447u &&
                  graph_timing.version == 2;
@@ -225,7 +225,7 @@ bool DeepSeek4ExpertIpcClient::eval_end(PendingEval & pending,
         ok = read_exact_fd(stream_fd, out.data(), out.size() * sizeof(float));
         if (timing) {
             timing->parent_read_us += ipc_elapsed_us(read_t0, IpcClock::now());
-            timing->response_bytes = sizeof(resp) + (resp.version == 3 ? sizeof(DeepSeek4ExpertIpcGraphTiming) : 0) +
+            timing->response_bytes = sizeof(resp) + (resp.version == 3 ? sizeof(ExpertIpcGraphTiming) : 0) +
                 out.size() * sizeof(float);
         }
     }
@@ -238,7 +238,7 @@ bool DeepSeek4ExpertIpcClient::eval_end(PendingEval & pending,
 #endif
 }
 
-void DeepSeek4ExpertIpcClient::close() {
+void ExpertIpcClient::close() {
     process_.close();
     active_ = false;
 }

@@ -30,7 +30,7 @@ namespace dflash::common {
 struct MoeHybridPlacement;
 struct MoeHybridConfig;
 struct MoeHybridRoutingStats;
-class DeepSeek4ExpertIpcClient;
+class ExpertIpcClient;
 
 struct DeepSeek4StepTelemetry {
     uint64_t total_us = 0;
@@ -315,7 +315,7 @@ bool deepseek4_step(
     std::vector<float> &        out_logits,
     MoeHybridStorage *          moe_hybrid = nullptr,
     const int32_t *             token_ids = nullptr,
-    DeepSeek4ExpertIpcClient *  expert_worker = nullptr,
+    ExpertIpcClient *  expert_worker = nullptr,
     bool                        worker_owns_hot_ids = false,
     DeepSeek4StepTelemetry *    telemetry = nullptr,
     MoeHybridRoutingStats *     routing_stats = nullptr);

@@ -408,7 +408,7 @@ bool DeepSeek4Backend::init() {
         const std::string model = env_str("DFLASH_DS4_EXPERT_IPC_MODEL", cfg_.model_path);
         const std::string work_dir = env_str("DFLASH_DS4_EXPERT_IPC_WORK_DIR", "");
         const int worker_gpu = env_int("DFLASH_DS4_EXPERT_IPC_GPU", 0);
-        expert_worker_ = std::make_unique<DeepSeek4ExpertIpcClient>();
+        expert_worker_ = std::make_unique<ExpertIpcClient>();
         if (!expert_worker_->start(bin, model, worker_gpu, work_dir)) {
             std::fprintf(stderr, "[deepseek4] failed to start expert IPC worker: bin=%s model=%s gpu=%d\n",
                          bin.c_str(), model.c_str(), worker_gpu);

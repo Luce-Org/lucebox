@@ -1,7 +1,7 @@
-// deepseek4_expert_ipc_daemon.cpp - DeepSeek4 expert IPC worker boundary.
+// deepseek4_expert_ipc_daemon.cpp - DeepSeek4 expert IPC worker daemon.
 
-#include "deepseek4_expert_ipc.h"
-#include "../deepseek4/deepseek4_internal.h"
+#include "expert_ipc.h"
+#include "deepseek4_internal.h"
 #include "dflash_draft_ipc.h"
 #include "io_utils.h"
 #include "moe_hybrid_ffn_eval.h"
@@ -109,7 +109,7 @@ static bool build_worker_placement(const DeepSeek4Weights & w,
             }
             out = std::move(placement);
             std::fprintf(stderr,
-                         "[deepseek4-expert-ipc-daemon] loaded placement=%s total_hot=%d\n",
+                         "[expert-ipc-daemon] loaded placement=%s total_hot=%d\n",
                          placement_in, out.total_hot);
             return true;
         }
@@ -174,7 +174,7 @@ static bool build_worker_placement(const DeepSeek4Weights & w,
         }
     }
     std::fprintf(stderr,
-                 "[deepseek4-expert-ipc-daemon] placement gpu_total=%.2f GiB gpu_free=%.2f GiB budget=%.2f GiB hot/layer=%d first=%d total_hot=%d\n",
+                 "[expert-ipc-daemon] placement gpu_total=%.2f GiB gpu_free=%.2f GiB budget=%.2f GiB hot/layer=%d first=%d total_hot=%d\n",
                  (double)gpu_total / 1024.0 / 1024.0 / 1024.0,
                  (double)gpu_free / 1024.0 / 1024.0 / 1024.0,
                  (double)budget / 1024.0 / 1024.0 / 1024.0,
@@ -186,20 +186,20 @@ static bool init_worker(const char * model_path, int worker_gpu, Ds4ExpertWorker
     worker.model_path = model_path;
     worker.backend = ggml_backend_cuda_init(std::max(0, worker_gpu));
     if (!worker.backend) {
-        std::fprintf(stderr, "[deepseek4-expert-ipc-daemon] backend init failed gpu=%d\n",
+        std::fprintf(stderr, "[expert-ipc-daemon] backend init failed gpu=%d\n",
                      std::max(0, worker_gpu));
         return false;
     }
     TargetLoadPlan plan;
     plan.expert_metadata_only = true;
     if (!load_deepseek4_gguf_partial(model_path, worker.backend, plan, worker.weights)) {
-        std::fprintf(stderr, "[deepseek4-expert-ipc-daemon] partial model load failed: %s\n",
+        std::fprintf(stderr, "[expert-ipc-daemon] partial model load failed: %s\n",
                      model_path);
         return false;
     }
     std::string err;
     if (!build_worker_placement(worker.weights, std::max(0, worker_gpu), worker.placement, err)) {
-        std::fprintf(stderr, "[deepseek4-expert-ipc-daemon] placement failed: %s\n", err.c_str());
+        std::fprintf(stderr, "[expert-ipc-daemon] placement failed: %s\n", err.c_str());
         return false;
     }
     worker.cfg = make_worker_cfg(worker.weights);
@@ -211,12 +211,12 @@ static bool init_worker(const char * model_path, int worker_gpu, Ds4ExpertWorker
     if (!build_deepseek4_moe_hybrid_storage_from_file(
             model_path, worker.backend, worker.weights, worker.placement,
             &worker.cfg, *worker.storage, &err)) {
-        std::fprintf(stderr, "[deepseek4-expert-ipc-daemon] expert storage failed: %s\n", err.c_str());
+        std::fprintf(stderr, "[expert-ipc-daemon] expert storage failed: %s\n", err.c_str());
         return false;
     }
     const int total_cold = worker.weights.n_layer * worker.weights.n_expert - worker.placement.total_hot;
     std::fprintf(stderr,
-                 "[deepseek4-expert-ipc-daemon] expert storage ready expert_only=yes hot=%d cold=%d cold_materialized=%s\n",
+                 "[expert-ipc-daemon] expert storage ready expert_only=yes hot=%d cold=%d cold_materialized=%s\n",
                  worker.placement.total_hot, total_cold,
                  worker.storage->materialized_cold_experts ? "yes" : "no");
     return true;
@@ -251,7 +251,7 @@ static bool eval_worker_token(Ds4ExpertWorker & worker,
                               int n_selected,
                               std::vector<float> & out,
                               std::string & err,
-                              DeepSeek4ExpertIpcTiming * timing) {
+                              ExpertIpcTiming * timing) {
     auto & resident = worker.storage->layers[(size_t)layer];
     std::vector<int32_t> resident_ids;
     std::vector<float> resident_weights;
@@ -318,7 +318,7 @@ static bool eval_worker_token(Ds4ExpertWorker & worker,
     }
     if (timing) timing->worker_miss_build_us += worker_elapsed_us(miss_build_t0, WorkerClock::now());
     std::fprintf(stderr,
-                 "[deepseek4-expert-ipc-daemon] file-backed miss layer=%d experts=%zu\n",
+                 "[expert-ipc-daemon] file-backed miss layer=%d experts=%zu\n",
                  layer, miss_ids.size());
     const auto miss_eval_t0 = WorkerClock::now();
     ffn_tel = {};
@@ -351,7 +351,7 @@ static bool eval_worker_token(Ds4ExpertWorker & worker,
 }
 
 static bool read_eval_request(const std::string & path,
-                              DeepSeek4ExpertIpcRequestHeader & hdr,
+                              ExpertIpcRequestHeader & hdr,
                               std::vector<float> & activations,
                               std::vector<int32_t> & ids,
                               std::vector<float> & weights) {
@@ -378,9 +378,9 @@ static bool write_eval_response(int stream_fd,
                                 int n_tokens,
                                 int n_embd,
                                 const std::vector<float> * out,
-                                const DeepSeek4ExpertIpcTiming * timing = nullptr,
+                                const ExpertIpcTiming * timing = nullptr,
                                 bool include_graph_timing = false) {
-    DeepSeek4ExpertIpcResponseHeader resp;
+    ExpertIpcResponseHeader resp;
     resp.version = include_graph_timing ? 3 : 2;
     resp.status = status;
     resp.n_tokens = n_tokens;
@@ -394,7 +394,7 @@ static bool write_eval_response(int stream_fd,
     }
     if (!write_exact_fd(stream_fd, &resp, sizeof(resp))) return false;
     if (include_graph_timing) {
-        DeepSeek4ExpertIpcGraphTiming graph_timing;
+        ExpertIpcGraphTiming graph_timing;
         if (timing) {
             graph_timing.worker_hot_graph_builds = timing->worker_hot_graph_builds;
             graph_timing.worker_hot_graph_hits = timing->worker_hot_graph_hits;
@@ -419,13 +419,13 @@ static bool write_eval_response(int stream_fd,
 
 } // namespace
 
-int run_deepseek4_expert_ipc_daemon(const char * model_path,
+int run_expert_ipc_daemon(const char * model_path,
                                     int worker_gpu,
                                     int stream_fd,
                                     int payload_fd) {
 #if defined(_WIN32)
     (void)model_path; (void)worker_gpu; (void)stream_fd; (void)payload_fd;
-    std::fprintf(stderr, "DeepSeek4 expert IPC daemon is only implemented on POSIX hosts\n");
+    std::fprintf(stderr, "Expert IPC daemon is only implemented on POSIX hosts\n");
     return 2;
 #else
     (void)payload_fd;
@@ -442,7 +442,7 @@ int run_deepseek4_expert_ipc_daemon(const char * model_path,
         return 1;
     }
 
-    std::fprintf(stderr, "[deepseek4-expert-ipc-daemon] ready gpu=%d model=%s\n",
+    std::fprintf(stderr, "[expert-ipc-daemon] ready gpu=%d model=%s\n",
                  std::max(0, worker_gpu), model_path);
     stream_status(stream_fd, 0);
 
@@ -458,21 +458,21 @@ int run_deepseek4_expert_ipc_daemon(const char * model_path,
         }
         if (cmd == "eval") {
             std::string path = read_line_tail(iss);
-            DeepSeek4ExpertIpcRequestHeader hdr;
+            ExpertIpcRequestHeader hdr;
             std::vector<float> activations;
             std::vector<int32_t> ids;
             std::vector<float> weights;
-            DeepSeek4ExpertIpcTiming timing;
+            ExpertIpcTiming timing;
             const auto request_read_t0 = WorkerClock::now();
             const bool request_ok = !path.empty() && read_eval_request(path, hdr, activations, ids, weights);
             timing.worker_request_read_us = worker_elapsed_us(request_read_t0, WorkerClock::now());
             if (!request_ok ||
                 hdr.layer >= worker.weights.n_layer ||
                 hdr.n_embd != worker.weights.n_embd) {
-                std::fprintf(stderr, "[deepseek4-expert-ipc-daemon] bad eval request: %s\n",
+                std::fprintf(stderr, "[expert-ipc-daemon] bad eval request: %s\n",
                              line.c_str());
                 write_eval_response(stream_fd, -1, 0, 0, nullptr, &timing,
-                                   (hdr.flags & DS4_EXPERT_IPC_FLAG_GRAPH_TIMING) != 0);
+                                   (hdr.flags & EXPERT_IPC_FLAG_GRAPH_TIMING) != 0);
                 continue;
             }
 
@@ -487,7 +487,7 @@ int run_deepseek4_expert_ipc_daemon(const char * model_path,
                         ids.data() + (size_t)t * (size_t)hdr.n_selected,
                         weights.data() + (size_t)t * (size_t)hdr.n_selected,
                         hdr.n_selected, one_out, err, &timing)) {
-                    std::fprintf(stderr, "[deepseek4-expert-ipc-daemon] eval failed layer=%d: %s\n",
+                    std::fprintf(stderr, "[expert-ipc-daemon] eval failed layer=%d: %s\n",
                                  hdr.layer, err.c_str());
                     ok = false;
                     break;
@@ -497,14 +497,14 @@ int run_deepseek4_expert_ipc_daemon(const char * model_path,
             }
             write_eval_response(stream_fd, ok ? 0 : -2, hdr.n_tokens, hdr.n_embd,
                                 ok ? &out : nullptr, &timing,
-                                (hdr.flags & DS4_EXPERT_IPC_FLAG_GRAPH_TIMING) != 0);
+                                (hdr.flags & EXPERT_IPC_FLAG_GRAPH_TIMING) != 0);
             continue;
         }
-        std::fprintf(stderr, "[deepseek4-expert-ipc-daemon] unknown command: %s\n", line.c_str());
+        std::fprintf(stderr, "[expert-ipc-daemon] unknown command: %s\n", line.c_str());
         stream_status(stream_fd, -1);
     }
 
-    std::fprintf(stderr, "[deepseek4-expert-ipc-daemon] stopped\n");
+    std::fprintf(stderr, "[expert-ipc-daemon] stopped\n");
     return 0;
 #endif
 }

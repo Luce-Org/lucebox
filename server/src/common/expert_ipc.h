@@ -1,7 +1,7 @@
-// deepseek4_expert_ipc.h - DeepSeek4 routed expert IPC boundary.
+// expert_ipc.h - Routed expert IPC boundary.
 //
 // This mode is intended for CUDA-primary + HIP-expert split execution. The
-// parent keeps the main DeepSeek4 graph on CUDA and sends normalized FFN
+// parent keeps the main MoE graph on CUDA and sends normalized FFN
 // activations plus selected expert IDs/weights to a backend-specific worker.
 
 #pragma once
@@ -14,9 +14,9 @@
 
 namespace dflash::common {
 
-constexpr uint32_t DS4_EXPERT_IPC_FLAG_GRAPH_TIMING = 1u << 0;
+constexpr uint32_t EXPERT_IPC_FLAG_GRAPH_TIMING = 1u << 0;
 
-struct DeepSeek4ExpertIpcRequestHeader {
+struct ExpertIpcRequestHeader {
     uint32_t magic = 0x44533445u; // "DS4E"
     uint32_t version = 1;
     int32_t layer = 0;
@@ -26,7 +26,7 @@ struct DeepSeek4ExpertIpcRequestHeader {
     uint32_t flags = 0;
 };
 
-struct DeepSeek4ExpertIpcResponseHeader {
+struct ExpertIpcResponseHeader {
     uint32_t magic = 0x44533452u; // "DS4R"
     uint32_t version = 2;
     int32_t status = 0;
@@ -39,7 +39,7 @@ struct DeepSeek4ExpertIpcResponseHeader {
     uint64_t worker_miss_eval_us = 0;
 };
 
-struct DeepSeek4ExpertIpcGraphTiming {
+struct ExpertIpcGraphTiming {
     uint32_t magic = 0x44533447u; // "DS4G"
     uint32_t version = 2;
     uint64_t worker_hot_graph_builds = 0;
@@ -56,7 +56,7 @@ struct DeepSeek4ExpertIpcGraphTiming {
     uint64_t worker_cold_read_us = 0;
 };
 
-struct DeepSeek4ExpertIpcTiming {
+struct ExpertIpcTiming {
     uint64_t parent_write_us = 0;
     uint64_t parent_wait_us = 0;
     uint64_t parent_read_us = 0;
@@ -81,7 +81,7 @@ struct DeepSeek4ExpertIpcTiming {
     uint64_t response_bytes = 0;
 };
 
-class DeepSeek4ExpertIpcClient {
+class ExpertIpcClient {
 public:
     struct PendingEval {
         std::string path;
@@ -90,10 +90,10 @@ public:
         bool active = false;
     };
 
-    DeepSeek4ExpertIpcClient() = default;
-    DeepSeek4ExpertIpcClient(const DeepSeek4ExpertIpcClient &) = delete;
-    DeepSeek4ExpertIpcClient & operator=(const DeepSeek4ExpertIpcClient &) = delete;
-    ~DeepSeek4ExpertIpcClient() { close(); }
+    ExpertIpcClient() = default;
+    ExpertIpcClient(const ExpertIpcClient &) = delete;
+    ExpertIpcClient & operator=(const ExpertIpcClient &) = delete;
+    ~ExpertIpcClient() { close(); }
 
     bool start(const std::string & bin,
                const std::string & model_path,
@@ -109,7 +109,7 @@ public:
               const int32_t * selected_ids,
               const float * selected_weights,
               std::vector<float> & out,
-              DeepSeek4ExpertIpcTiming * timing = nullptr);
+              ExpertIpcTiming * timing = nullptr);
     bool eval_begin(int layer,
                     int n_tokens,
                     int n_embd,
@@ -118,10 +118,10 @@ public:
                     const int32_t * selected_ids,
                     const float * selected_weights,
                     PendingEval & pending,
-                    DeepSeek4ExpertIpcTiming * timing = nullptr);
+                    ExpertIpcTiming * timing = nullptr);
     bool eval_end(PendingEval & pending,
                   std::vector<float> & out,
-                  DeepSeek4ExpertIpcTiming * timing = nullptr);
+                  ExpertIpcTiming * timing = nullptr);
     bool active() const { return active_; }
     void close();
 
@@ -130,7 +130,7 @@ private:
     bool active_ = false;
 };
 
-int run_deepseek4_expert_ipc_daemon(const char * model_path,
+int run_expert_ipc_daemon(const char * model_path,
                                     int worker_gpu,
                                     int stream_fd,
                                     int payload_fd = -1);

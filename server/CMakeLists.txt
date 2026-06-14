@@ -251,6 +251,7 @@ add_library(dflash_common STATIC
     src/deepseek4/deepseek4_graph.cpp
     src/deepseek4/deepseek4_backend.cpp
     src/deepseek4/deepseek4_daemon.cpp
+    src/deepseek4/deepseek4_expert_ipc_daemon.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
@@ -269,8 +270,7 @@ add_library(dflash_common STATIC
     src/common/target_shard_ipc_daemon.cpp
     src/common/dflash_feature_ring.cpp
     src/common/dflash_capture.cpp
-    src/common/deepseek4_expert_ipc.cpp
-    src/common/deepseek4_expert_ipc_daemon.cpp
+    src/common/expert_ipc.cpp
     src/common/dflash_draft_ipc.cpp
     src/common/dflash_draft_ipc_daemon.cpp
     src/common/pflash_drafter_ipc.cpp
