@@ -57,14 +57,13 @@ jobs:
             -DDFLASH27B_FA_ALL_QUANTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target \
-            test_dflash test_generate test_flash_attn_sparse \
+            test_dflash test_generate test_flash_attn_sparse test_server_unit \
             -j$(nproc)
 
-      # Server unit tests require libcurl-dev; skipped when CURL is absent.
-      # - name: Run C++ server unit tests
-      #   run: |
-      #     cd server/build
-      #     ctest --output-on-failure -R server_unit --no-tests=error
+      - name: Run C++ server unit tests
+        run: |
+          cd server/build
+          ctest --output-on-failure -R server_unit --no-tests=error
 
       - name: Populate venv with cu128 torch + setuptools
         # First pass: install the workspace's default deps. dflash declares
