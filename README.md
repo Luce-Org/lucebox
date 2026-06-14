@@ -271,7 +271,7 @@ DFLASH27B_KV_TQ3=1 \
 | `DFLASH_FP_ALPHA=0.85` | `0.12` | Block-selection threshold; higher = stricter = fewer K-blocks |
 | `DFLASH_FP_PROFILE=1` | `0` | Per-stage timing log |
 
-When compression is on, the request path picks one of three modes automatically, so they never stack: the first turn is sent verbatim (the system prompt stays as a stable cache anchor), multi-turn continuations use **FlowKV** (only the aged history is compressed, recent turns kept verbatim, so the disk prefix cache from `--prefix-cache-slots` keeps hitting), and a single oversized prompt with no prior turns uses whole-prompt PFlash. With `--prefill-compression off` the request path is identical to a build without compression.
+When compression is on, the request path picks one of three modes automatically, so they never stack: the first turn is sent verbatim (the system prompt stays as a stable cache anchor), multi-turn continuations use **FlowKV** (only the aged history is compressed, recent turns kept verbatim, so the prefix cache keeps hitting), and a single oversized prompt with no prior turns uses whole-prompt PFlash. With `--prefill-compression off` the request path is identical to a build without compression.
 
 **KV cache**
 
@@ -280,9 +280,16 @@ When compression is on, the request path picks one of three modes automatically,
 | `--cache-type-k <t>` / `--cache-type-v <t>` | env-driven | Per-side quant override: `f16,bf16,q4_0,q4_1,q5_0,q5_1,q8_0,tq3_0` |
 | `DFLASH27B_KV_TQ3=1` | (default) | Preset TQ3_0 K+V (3.5 bpv, fits 256K @ 24 GB) |
 | `DFLASH27B_KV_Q4=1` | off | Q4_0 K+V (4.5 bpv, legacy, ~128K ceiling) |
-| `--prefix-cache-slots N` | — | Live prefix-cache slot count |
+| `--cache-prefix-ram <size>` | `2GiB` | RAM budget for turn-boundary prefix snapshots |
+| `--cache-prefill-ram <size>` | `0` | RAM budget for exact full-prompt snapshots |
 | `--kv-cache-dir <path>` | — | Persist prefix cache to disk |
-| `--kv-cache-budget N` | — | On-disk cache size cap |
+| `--cache-prefix-disk <size>` | `4GiB` | Disk budget for turn-boundary prefix snapshots |
+| `--cache-prefill-disk <size>` | `0` | Disk budget for exact full-prompt snapshots |
+
+Cache sizes are hard byte budgets. A snapshot larger than the configured RAM
+or disk pool is evicted immediately, so exact prefill caching needs a pool at
+least as large as the largest full prompt you expect to reuse; Qwen3.6
+benchmarks commonly use `--cache-prefill-ram 1GiB` or larger.
 
 **Bounded KV residency (KVFlash)**
 

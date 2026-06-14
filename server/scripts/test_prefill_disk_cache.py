@@ -1,11 +1,11 @@
-"""End-to-end proof for exact prefill/full-prompt cache.
+"""End-to-end proof for exact prefill disk cache.
 
-Starts dflash_server with inline prefix cache disabled and prefill cache
+Starts dflash_server with exact prefill RAM disabled and exact prefill disk
 enabled, sends the same long chat prompt three times, and asserts:
 
-  - /props.full_cache reports an enabled RAM budget.
-  - the first request commits a full-cache entry.
-  - requests 2 and 3 hit that entry.
+  - /props.cache.prefill reports a disk budget.
+  - the first request saves an exact prefill snapshot to disk.
+  - requests 2 and 3 restore that disk snapshot.
   - warm prefill time is at least 5x faster than cold prefill.
 
 Environment overrides:
@@ -17,9 +17,11 @@ Environment overrides:
 import atexit
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -30,17 +32,14 @@ ROOT = Path(__file__).resolve().parent.parent
 SERVER_BIN = Path(os.environ.get("DFLASH_SERVER_BIN", ROOT / "build/dflash_server"))
 TARGET = Path(os.environ.get("DFLASH_TARGET", Path.home() / "models/Qwen3.6-27B-Q4_K_M.gguf"))
 DRAFT = Path(os.environ.get("DFLASH_DRAFT", Path.home() / "models/draft/dflash-draft-3.6-q4_k_m.gguf"))
-PORT = int(os.environ.get("DFLASH_PREFILL_CACHE_TEST_PORT", "18185"))
-LOG_PATH = Path(os.environ.get("DFLASH_PREFILL_CACHE_TEST_LOG", "/tmp/test_prefill_cache_server.log"))
+PORT = int(os.environ.get("DFLASH_PREFILL_DISK_CACHE_TEST_PORT", "18186"))
+LOG_PATH = Path(os.environ.get("DFLASH_PREFILL_DISK_CACHE_TEST_LOG", "/tmp/test_prefill_disk_cache_server.log"))
 
 
-def require_path(path: Path, label: str, *, executable: bool = False) -> None:
+def require_path(path: Path, label: str) -> None:
     if not path.exists():
         print(f"SKIP: {label} missing at {path}")
         sys.exit(0)
-    if executable and not os.access(path, os.X_OK):
-        print(f"ERROR: {label} is not executable at {path}", file=sys.stderr)
-        sys.exit(1)
 
 
 def post_json(path: str, payload: dict, timeout: int = 900) -> dict:
@@ -87,10 +86,11 @@ def wait_server(proc: subprocess.Popen, deadline_s: int = 240) -> None:
 
 
 def main() -> int:
-    require_path(SERVER_BIN, "dflash_server", executable=True)
+    require_path(SERVER_BIN, "dflash_server")
     require_path(TARGET, "target GGUF")
     require_path(DRAFT, "draft GGUF")
 
+    cache_dir = Path(tempfile.mkdtemp(prefix="prefill-disk-cache-"))
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     log_f = LOG_PATH.open("w")
     cmd = [
@@ -100,7 +100,10 @@ def main() -> int:
         "--max-ctx", "16384",
         "--port", str(PORT),
         "--cache-prefix-ram", "0",
-        "--cache-prefill-ram", "1GiB",
+        "--cache-prefill-ram", "0",
+        "--kv-cache-dir", str(cache_dir),
+        "--cache-prefix-disk", "0",
+        "--cache-prefill-disk", "1GiB",
         "--ddtree",
         "--ddtree-budget", "16",
         "--cache-type-k", "tq3_0",
@@ -117,15 +120,18 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 proc.kill()
         log_f.close()
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
     atexit.register(cleanup)
     wait_server(proc)
 
     props = get_json("/props")
-    full_cache = props.get("full_cache", {})
-    print(f"startup full_cache={full_cache}", flush=True)
-    if not full_cache.get("enabled") or full_cache.get("ram_budget_bytes", 0) < (1 << 30):
-        raise RuntimeError(f"full cache not active in /props: {full_cache}")
+    prefill_pool = ((props.get("cache") or {}).get("prefill") or {})
+    print(f"startup prefill_pool={prefill_pool}", flush=True)
+    if prefill_pool.get("ram_budget_bytes") != 0:
+        raise RuntimeError(f"prefill RAM should be disabled: {prefill_pool}")
+    if prefill_pool.get("disk_budget_bytes", 0) <= 0:
+        raise RuntimeError(f"prefill disk not active in /props: {prefill_pool}")
 
     filler = (
         "The repository contains an inference server, a benchmark harness, "
@@ -150,19 +156,19 @@ def main() -> int:
         print(f"turn {i + 1}: wall={wall:.3f}s prefill={pf:.3f}s", flush=True)
 
     after = get_json("/props")
-    full_after = after.get("full_cache", {})
+    prefill_after = ((after.get("cache") or {}).get("prefill") or {})
     log_text = LOG_PATH.read_text(errors="replace")
-    commits = log_text.count("[pc] full-cache committed")
-    hits = log_text.count("[pc] full-cache hit")
-    print(f"after full_cache={full_after}", flush=True)
-    print(f"log commits={commits} hits={hits}", flush=True)
+    saves = log_text.count("[disk-cache] saved")
+    hits = log_text.count("[prefill-disk] hit")
+    print(f"after prefill_pool={prefill_after}", flush=True)
+    print(f"log disk_saves={saves} prefill_disk_hits={hits}", flush=True)
 
-    if full_after.get("in_use", 0) < 1:
-        raise RuntimeError(f"full cache did not retain an entry: {full_after}")
-    if full_after.get("lifetime_hits", 0) < 2 or hits < 2:
-        raise RuntimeError(f"full cache did not hit twice: props={full_after} log_hits={hits}")
-    if commits < 1:
-        raise RuntimeError("full cache did not log a committed entry")
+    if prefill_after.get("disk_bytes", 0) <= 0:
+        raise RuntimeError(f"prefill disk bytes did not increase: {prefill_after}")
+    if saves < 1:
+        raise RuntimeError("prefill disk cache did not save a snapshot")
+    if hits < 2:
+        raise RuntimeError(f"prefill disk cache did not hit twice: hits={hits}")
 
     cold = prefill[0]
     warm_best = min(prefill[1:])

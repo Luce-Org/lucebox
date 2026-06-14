@@ -87,18 +87,17 @@ print(f"Built NIAH prompt: ~{len(PROMPT) // 4} tokens (target ~40000), "
 PORT       = 18184
 SERVER_LOG = open("/tmp/test_full_compress_cache_server.log", "w")
 
-# --prefix-cache-slots 4: prefix-cache pool (slots 0-3, unused when
-#   compression fires because compressed tokens lack chat-template markers).
-# --prefill-cache-slots 4: full-cache pool (slots 4-7).
-# Total = 8 == daemon hard cap (PREFIX_CACHE_SLOTS in test_dflash.cpp).
+# --cache-prefix-ram 256MiB: prefix-cache RAM pool, unused when compression
+#   fires because compressed tokens lack chat-template markers.
+# --cache-prefill-ram 256MiB: exact full-prompt RAM pool.
 proc = subprocess.Popen(
     [
         str(SERVER_BIN),            str(TARGET),
         "--draft",              str(DRAFT),
         "--max-ctx",            "8192",
         "--port",               str(PORT),
-        "--prefix-cache-slots", "4",
-        "--prefill-cache-slots","4",
+        "--cache-prefix-ram", "256MiB",
+        "--cache-prefill-ram", "256MiB",
         "--prefill-compression","auto",
         "--prefill-threshold",  "32000",
         "--prefill-keep-ratio", "0.05",

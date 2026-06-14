@@ -109,7 +109,7 @@ struct ModelBackend {
     virtual bool unpark(const std::string & what) = 0;
     virtual bool is_target_parked() const = 0;
 
-    // Prefix cache snapshots (up to 8 slots)
+    // Cache snapshots (backend handles; user config is byte pools)
     virtual bool snapshot_save(int slot) = 0;
     virtual void snapshot_free(int slot) = 0;
     virtual bool snapshot_used(int slot) const = 0;

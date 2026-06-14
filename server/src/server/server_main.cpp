@@ -213,8 +213,10 @@ static void print_usage(const char * prog) {
         "                       WARNING: >0 drops system prompt / tool definitions\n"
         "                       from attention at long contexts. Use 0 for tools.\n"
         "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
-        "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
-        "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
+        "  --cache-prefix-ram <size>   RAM budget for turn-boundary prefix cache (default: 2GiB)\n"
+        "  --cache-prefill-ram <size>  RAM budget for exact full-prompt cache (default: 0)\n"
+        "  --prefix-cache-slots <N>    Deprecated alias: N * 64MiB prefix RAM budget\n"
+        "  --prefill-cache-slots <N>   Deprecated alias: N * 64MiB prefill RAM budget\n"
         "  --ddtree             Enable DDTree speculative decode\n"
         "  --ddtree-budget <N>  DDTree budget (default: 22)\n"
         "  --no-cors            Disable CORS headers\n"
@@ -272,7 +274,9 @@ static void print_usage(const char * prog) {
         "\n"
         "Disk KV cache:\n"
         "  --kv-cache-dir <path>       Directory for ondisk KV cache (enables feature)\n"
-        "  --kv-cache-budget <MB>      Max disk usage in MB (default: 4096)\n"
+        "  --cache-prefix-disk <size>  Disk budget for turn-boundary prefix cache (default: 4GiB)\n"
+        "  --cache-prefill-disk <size> Disk budget for exact full-prompt cache (default: 0)\n"
+        "  --kv-cache-budget <MB>      Deprecated alias for --cache-prefix-disk\n"
         "  --kv-cache-min-tokens <N>   Min tokens to persist (default: 512)\n"
         "  --kv-cache-interval <N>     Continued checkpoint every N tokens (default: 10240)\n"
         "  --kv-cache-cold-max <N>     Cold prefix for prompts longer than N tokens (default: 10240)\n"
@@ -311,6 +315,16 @@ int main(int argc, char ** argv) {
     std::string cache_type_v;  // explicit --cache-type-v override
     bool target_device_seen = false;
     bool target_devices_seen = false;
+    bool cache_prefix_ram_seen = false;
+    bool cache_prefill_ram_seen = false;
+    bool cache_prefix_disk_seen = false;
+    bool cache_prefill_disk_seen = false;
+    bool legacy_prefix_slots_seen = false;
+    bool legacy_prefill_slots_seen = false;
+    bool legacy_kv_budget_seen = false;
+    int legacy_prefix_slots = 0;
+    int legacy_prefill_slots = 0;
+    size_t legacy_kv_budget_bytes = 0;
 
     // Track which thinking-budget tunables the operator set via CLI.
     // Those values win over the model card (spec §3.1: "Explicit CLI
@@ -407,10 +421,24 @@ int main(int argc, char ** argv) {
             bargs.fa_window = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--model-name") == 0 && i + 1 < argc) {
             sconfig.model_name = argv[++i];
+        } else if (std::strcmp(argv[i], "--cache-prefix-ram") == 0 && i + 1 < argc) {
+            if (!parse_cache_size_bytes(argv[++i], sconfig.prefix_cache_ram_bytes)) {
+                std::fprintf(stderr, "[server] bad --cache-prefix-ram size\n");
+                return 2;
+            }
+            cache_prefix_ram_seen = true;
+        } else if (std::strcmp(argv[i], "--cache-prefill-ram") == 0 && i + 1 < argc) {
+            if (!parse_cache_size_bytes(argv[++i], sconfig.prefill_cache_ram_bytes)) {
+                std::fprintf(stderr, "[server] bad --cache-prefill-ram size\n");
+                return 2;
+            }
+            cache_prefill_ram_seen = true;
         } else if (std::strcmp(argv[i], "--prefix-cache-slots") == 0 && i + 1 < argc) {
-            sconfig.prefix_cache_cap = std::atoi(argv[++i]);
+            legacy_prefix_slots = std::atoi(argv[++i]);
+            legacy_prefix_slots_seen = true;
         } else if (std::strcmp(argv[i], "--prefill-cache-slots") == 0 && i + 1 < argc) {
-            sconfig.prefill_cache_cap = std::atoi(argv[++i]);
+            legacy_prefill_slots = std::atoi(argv[++i]);
+            legacy_prefill_slots_seen = true;
         } else if (std::strcmp(argv[i], "--ddtree") == 0) {
             bargs.ddtree_mode = true;
             bargs.fast_rollback = true;
@@ -568,8 +596,22 @@ int main(int argc, char ** argv) {
             }
         } else if (std::strcmp(argv[i], "--kv-cache-dir") == 0 && i + 1 < argc) {
             sconfig.disk_cache_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--cache-prefix-disk") == 0 && i + 1 < argc) {
+            if (!parse_cache_size_bytes(argv[++i], sconfig.prefix_cache_disk_bytes)) {
+                std::fprintf(stderr, "[server] bad --cache-prefix-disk size\n");
+                return 2;
+            }
+            cache_prefix_disk_seen = true;
+        } else if (std::strcmp(argv[i], "--cache-prefill-disk") == 0 && i + 1 < argc) {
+            if (!parse_cache_size_bytes(argv[++i], sconfig.prefill_cache_disk_bytes)) {
+                std::fprintf(stderr, "[server] bad --cache-prefill-disk size\n");
+                return 2;
+            }
+            cache_prefill_disk_seen = true;
         } else if (std::strcmp(argv[i], "--kv-cache-budget") == 0 && i + 1 < argc) {
-            sconfig.disk_cache_budget_mb = (size_t)std::atoi(argv[++i]);
+            legacy_kv_budget_bytes =
+                (size_t)std::atoi(argv[++i]) * (size_t)(1024 * 1024);
+            legacy_kv_budget_seen = true;
         } else if (std::strcmp(argv[i], "--kv-cache-min-tokens") == 0 && i + 1 < argc) {
             sconfig.disk_cache_min_tokens = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--kv-cache-interval") == 0 && i + 1 < argc) {
@@ -595,6 +637,46 @@ int main(int argc, char ** argv) {
             print_usage(argv[0]);
             return 2;
         }
+    }
+
+    if (legacy_prefix_slots_seen && !cache_prefix_ram_seen) {
+        if (legacy_prefix_slots < 0) legacy_prefix_slots = 0;
+        sconfig.prefix_cache_ram_bytes =
+            (size_t)legacy_prefix_slots * kCacheRamSlotEstimateBytes;
+        sconfig.prefix_cache_cap = legacy_prefix_slots;
+    } else {
+        sconfig.prefix_cache_cap =
+            cache_slots_for_ram_budget(sconfig.prefix_cache_ram_bytes);
+    }
+    if (legacy_prefill_slots_seen && !cache_prefill_ram_seen) {
+        if (legacy_prefill_slots < 0) legacy_prefill_slots = 0;
+        sconfig.prefill_cache_ram_bytes =
+            (size_t)legacy_prefill_slots * kCacheRamSlotEstimateBytes;
+        sconfig.prefill_cache_cap = legacy_prefill_slots;
+    } else {
+        sconfig.prefill_cache_cap =
+            cache_slots_for_ram_budget(sconfig.prefill_cache_ram_bytes);
+    }
+    if (legacy_kv_budget_seen && !cache_prefix_disk_seen) {
+        sconfig.prefix_cache_disk_bytes = legacy_kv_budget_bytes;
+    }
+    (void)cache_prefill_disk_seen;
+
+    if (sconfig.prefix_cache_cap > kCacheMaxRamSlots) {
+        std::fprintf(stderr,
+            "[server] prefix RAM cache handle count clamped from %d to %d\n",
+            sconfig.prefix_cache_cap, kCacheMaxRamSlots);
+        sconfig.prefix_cache_cap = kCacheMaxRamSlots;
+    }
+    int remaining_cache_slots = kCacheMaxRamSlots - sconfig.prefix_cache_cap;
+    if (remaining_cache_slots < 0) remaining_cache_slots = 0;
+    if (sconfig.prefill_cache_cap > remaining_cache_slots) {
+        std::fprintf(stderr,
+            "[server] prefill RAM cache handle count clamped from %d to %d "
+            "(prefix uses %d)\n",
+            sconfig.prefill_cache_cap, remaining_cache_slots,
+            sconfig.prefix_cache_cap);
+        sconfig.prefill_cache_cap = remaining_cache_slots;
     }
 
     if (!validate_server_placement(bargs, sconfig)) return 2;
@@ -1021,8 +1103,18 @@ int main(int argc, char ** argv) {
     }
     std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
-    std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
-    std::fprintf(stderr, "[server] │  prefill_cache   = %d slots\n", sconfig.prefill_cache_cap);
+    std::fprintf(stderr, "[server] │  cache_prefix_ram= %s (%d handles)\n",
+                 format_cache_size(sconfig.prefix_cache_ram_bytes).c_str(),
+                 sconfig.prefix_cache_cap);
+    std::fprintf(stderr, "[server] │  cache_prefill_ram= %s (%d handles)\n",
+                 format_cache_size(sconfig.prefill_cache_ram_bytes).c_str(),
+                 sconfig.prefill_cache_cap);
+    if (!sconfig.disk_cache_dir.empty()) {
+        std::fprintf(stderr, "[server] │  cache_prefix_disk= %s\n",
+                     format_cache_size(sconfig.prefix_cache_disk_bytes).c_str());
+        std::fprintf(stderr, "[server] │  cache_prefill_disk= %s\n",
+                     format_cache_size(sconfig.prefill_cache_disk_bytes).c_str());
+    }
     std::fprintf(stderr, "[server] │  cors            = %s\n", sconfig.enable_cors ? "ON" : "off");
     std::fprintf(stderr, "[server] │  cache_type_k    = %s\n",
 #ifdef GGML_USE_HIP

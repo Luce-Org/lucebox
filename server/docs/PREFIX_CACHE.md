@@ -57,22 +57,21 @@ token sequences.
 
 ### Tier 2: Exact Prefill Cache
 
-Caches the **entire post-compression KV state** in RAM, keyed on the raw
+Caches the **entire post-compression KV state**, keyed on the raw
 (pre-compression) prompt. Hits skip both PFlash compression and prefill
 entirely -- the fastest path for repeated prompts.
 
 - Separate slot pool starting at `cap` (inline slots are `[0, cap)`).
 - Keyed on SHA-1 of the full raw prompt (not just a prefix).
 
-The two flags are intentionally separate:
+The two cache kinds are intentionally separate:
 
-- `--prefix-cache-slots` controls turn-boundary prefix snapshots.
-- `--prefill-cache-slots` controls exact full-prompt snapshots.
+- `prefix` controls turn-boundary prefix snapshots.
+- `prefill` controls exact full-prompt snapshots.
 
-The disk prefix cache is a separate persistence/overflow layer for token-keyed
-snapshots. Today it is integrated with the inline/effective-prompt path; exact
-prefill snapshots are kept in RAM unless a dedicated raw-prompt disk path is
-added.
+Each kind can have an independent RAM and disk budget. Snapshot handles are
+still used internally by the backend, but operators configure byte budgets
+rather than handle counts.
 
 ## Snapshot Memory Management
 
@@ -180,25 +179,49 @@ free_snapshot_backend(snap_backend_, compute_backend_);  // then backend
 
 | Server flag | Default | Description |
 |-------------|---------|-------------|
-| `--prefix-cache-slots N` | 32 | Max turn-boundary prefix cache slots |
-| `--prefill-cache-slots N` | 0 | Max exact full-prompt prefill cache slots |
+| `--cache-prefix-ram SIZE` | 2GiB | RAM budget for turn-boundary prefix snapshots |
+| `--cache-prefill-ram SIZE` | 0 | RAM budget for exact full-prompt snapshots |
+| `--kv-cache-dir PATH` | unset | Root directory for disk cache pools |
+| `--cache-prefix-disk SIZE` | 4GiB | Disk budget for turn-boundary prefix snapshots |
+| `--cache-prefill-disk SIZE` | 0 | Disk budget for exact full-prompt snapshots |
 | `--skip-park` | false | Skip parking draft model during compress |
 
-### Choosing `--prefix-cache-slots`
+Deprecated compatibility aliases:
+
+| Server flag | Replacement |
+|-------------|-------------|
+| `--prefix-cache-slots N` | `--cache-prefix-ram N*64MiB` |
+| `--prefill-cache-slots N` | `--cache-prefill-ram N*64MiB` |
+| `--kv-cache-budget N` | `--cache-prefix-disk NMiB` |
+
+### Choosing RAM Budgets
 
 With right-sized, CPU-resident snapshots the limiting resource is **system RAM**,
-not VRAM. Each slot costs approximately `cur_pos × 5 KB` (for Qwen3.5-27B Q8_0 KV),
-so 32 slots with an average prefix of 2000 tokens ≈ 320 MB of system RAM — negligible
-on most workstations.
+not VRAM. Cache budgets are enforced against the actual snapshot byte size
+reported by the backend after save. If a snapshot is larger than its configured
+pool, it is evicted immediately and the next identical request will not hit.
 
-| Scenario | Typical prefix length | Recommended cap |
-|----------|----------------------|-----------------|
-| Single-user chat | 200–2000 tokens | 16–32 |
-| Multi-session agent | 500–5000 tokens | 32–64 |
-| Batch / benchmark | N/A (cold starts) | 4 |
+Inline prefix snapshots are usually small because they are taken at turn
+boundaries. Exact prefill snapshots cover the full effective prompt and can be
+hundreds of MiB for multi-thousand-token Qwen3.6 prompts, so size the prefill
+pool for the largest repeated prompt you want to retain.
 
-The hard limit is `MAX_SLOTS = 64`. Beyond that, increase the constant in
-`prefix_cache.h` and `model_backend.h`.
+| Scenario | Typical prefix length | Recommended prefix RAM |
+|----------|----------------------|------------------------|
+| Single-user chat | 200–2000 tokens | 512MiB-2GiB |
+| Multi-session agent | 500–5000 tokens | 2GiB-4GiB |
+| Batch / benchmark | N/A (cold starts) | 256MiB |
+
+| Scenario | Typical full prompt | Recommended prefill RAM |
+|----------|---------------------|-------------------------|
+| Disabled exact-cache path | N/A | 0 |
+| Qwen3.6 repeated-prompt proof | ~5k tokens | 1GiB |
+| Large prompt replay | 10k+ tokens | 2GiB+ |
+
+The backend still has a finite snapshot-handle table. The server derives
+internal handle counts from RAM budgets using a conservative 64MiB-per-handle
+estimate, then enforces the configured byte budget with LRU eviction after
+snapshot save. Slot 63 is reserved for disk-cache staging.
 
 ## File Map
 

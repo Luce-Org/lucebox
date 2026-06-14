@@ -87,6 +87,20 @@ paths:
                       reasoning_supported: true
                       speculative_supported: true
                       tools_supported: true
+                    cache:
+                      prefix:
+                        ram_budget_bytes: 2147483648
+                        ram_capacity: 32
+                        ram_in_use: 0
+                        ram_bytes: 0
+                        disk_budget_bytes: 4294967296
+                      prefill:
+                        ram_budget_bytes: 0
+                        ram_capacity: 0
+                        ram_in_use: 0
+                        ram_bytes: 0
+                        disk_budget_bytes: 0
+                        disk_bytes: 0
                     daemon:
                       alive: true
                     default_generation_settings:
@@ -99,9 +113,12 @@ paths:
                     full_cache:
                       capacity: 0
                       disk_bytes: 0
+                      disk_budget_bytes: 0
                       enabled: false
                       in_use: 0
                       lifetime_hits: 0
+                      ram_budget_bytes: 0
+                      ram_bytes: 0
                     model:
                       arch: "qwen35"
                       draft_path: "/.../dflash-draft-3.6-q4_k_m.gguf"
@@ -191,6 +208,7 @@ components:
         - api
         - budget_envelope
         - build_info
+        - cache
         - capabilities
         - daemon
         - default_generation_settings
@@ -223,6 +241,8 @@ components:
           example: "luce-dflash v0.0.0+cpp props_schema=2"
         capabilities:
           $ref: "#/components/schemas/Capabilities"
+        cache:
+          $ref: "#/components/schemas/CachePools"
         daemon:
           $ref: "#/components/schemas/Daemon"
         default_generation_settings:
@@ -327,6 +347,61 @@ components:
             fields and emits `tool_calls` blocks.
           example: true
 
+    CachePools:
+      description: Unified cache configuration and runtime counters by cache kind.
+      type: object
+      required: [prefix, prefill]
+      properties:
+        prefix:
+          $ref: "#/components/schemas/CachePool"
+        prefill:
+          $ref: "#/components/schemas/CachePool"
+
+    CachePool:
+      description: One cache kind across RAM and disk tiers.
+      type: object
+      required:
+        - ram_budget_bytes
+        - ram_capacity
+        - ram_in_use
+        - ram_bytes
+        - disk_budget_bytes
+      properties:
+        ram_budget_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Configured RAM budget for this cache kind.
+          example: 2147483648
+        ram_capacity:
+          type: integer
+          minimum: 0
+          description: Derived internal snapshot-handle capacity.
+          example: 32
+        ram_in_use:
+          type: integer
+          minimum: 0
+          description: RAM snapshot handles currently occupied.
+          example: 0
+        ram_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Estimated RAM bytes held by active snapshots.
+          example: 0
+        disk_budget_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Configured disk budget for this cache kind.
+          example: 4294967296
+        disk_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Disk bytes currently used. Present for prefill; prefix disk usage is exposed through disk-cache logs.
+          example: 0
+
     Daemon:
       description: Daemon-thread liveness flag.
       type: object
@@ -394,21 +469,24 @@ components:
 
     FullCache:
       description: |
-        Full-prompt (disk-backed) cache state. Atomic-snapshot
+        Exact full-prompt prefill cache state. Atomic-snapshot
         counters; per-field tear-free but the set is not
         internally consistent. Not safe for control flow.
       type: object
       required:
         - capacity
         - disk_bytes
+        - disk_budget_bytes
         - enabled
         - in_use
         - lifetime_hits
+        - ram_budget_bytes
+        - ram_bytes
       properties:
         capacity:
           type: integer
           minimum: 0
-          description: Configured slot capacity. 0 when disabled.
+          description: Derived internal RAM snapshot-handle capacity. 0 when disabled.
           example: 0
         disk_bytes:
           type: integer
@@ -416,14 +494,32 @@ components:
           minimum: 0
           description: Bytes currently used on disk.
           example: 0
+        disk_budget_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Configured exact-prefill disk budget.
+          example: 0
         enabled:
           type: boolean
-          description: True when the disk-backed cache is configured.
+          description: True when the RAM exact-prefill cache is configured.
           example: false
         in_use:
           type: integer
           minimum: 0
           description: Slots currently occupied.
+          example: 0
+        ram_budget_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Configured exact-prefill RAM budget.
+          example: 0
+        ram_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Estimated RAM bytes held by exact-prefill snapshots.
           example: 0
         lifetime_hits:
           type: integer
@@ -687,18 +783,42 @@ components:
         non-strict snapshot; `capacity = 0` means the cache is
         disabled.
       type: object
-      required: [capacity, in_use, lifetime_hits]
+      required:
+        - capacity
+        - disk_budget_bytes
+        - in_use
+        - lifetime_hits
+        - ram_budget_bytes
+        - ram_bytes
       properties:
         capacity:
           type: integer
           minimum: 0
-          description: Configured slot count.
+          description: Derived internal RAM snapshot-handle capacity.
           example: 0
         in_use:
           type: integer
           minimum: 0
           description: Slots currently occupied.
           example: 0
+        ram_budget_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Configured prefix RAM budget.
+          example: 2147483648
+        ram_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Estimated RAM bytes held by prefix snapshots.
+          example: 0
+        disk_budget_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Configured prefix disk budget.
+          example: 4294967296
         lifetime_hits:
           type: integer
           format: int64

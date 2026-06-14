@@ -398,7 +398,8 @@ static std::string build_stall_tool_prefix(const json & tools,
 // Non-static so unit tests can call it directly (declared in http_server.h).
 json build_props_body(const ServerConfig & config,
                       const PrefixCache & prefix_cache,
-                      const ToolMemory & tool_memory) {
+                      const ToolMemory & tool_memory,
+                      size_t prefill_disk_bytes) {
     // arch-gated capabilities (mirrors Python _capabilities()).
     const bool is_qwen = (config.arch.rfind("qwen", 0) == 0);
     const bool reasoning_supported = is_qwen;
@@ -576,15 +577,38 @@ json build_props_body(const ServerConfig & config,
         {"prefix_cache", {
             {"capacity",      pcs.capacity},
             {"in_use",        pcs.in_use},
+            {"ram_budget_bytes", pcs.ram_budget_bytes},
+            {"ram_bytes",     pcs.ram_bytes},
+            {"disk_budget_bytes", (int64_t)config.prefix_cache_disk_bytes},
             {"lifetime_hits", pcs.lifetime_hits},
         }},
         {"full_cache", {
             {"enabled",       pcfs.enabled},
             {"capacity",      pcfs.capacity},
             {"in_use",        pcfs.in_use},
-            {"disk_bytes",    pcfs.disk_bytes},
+            {"ram_budget_bytes", pcfs.ram_budget_bytes},
+            {"ram_bytes",     pcfs.ram_bytes},
+            {"disk_budget_bytes", (int64_t)config.prefill_cache_disk_bytes},
+            {"disk_bytes",    (int64_t)prefill_disk_bytes},
             {"lifetime_hits", pcfs.lifetime_hits},
             {"disk_policy",   disk_prefix_cache_policy_name(config.disk_cache_policy)},
+        }},
+        {"cache", {
+            {"prefix", {
+                {"ram_budget_bytes", (int64_t)config.prefix_cache_ram_bytes},
+                {"ram_capacity", pcs.capacity},
+                {"ram_in_use", pcs.in_use},
+                {"ram_bytes", pcs.ram_bytes},
+                {"disk_budget_bytes", (int64_t)config.prefix_cache_disk_bytes},
+            }},
+            {"prefill", {
+                {"ram_budget_bytes", (int64_t)config.prefill_cache_ram_bytes},
+                {"ram_capacity", pcfs.capacity},
+                {"ram_in_use", pcfs.in_use},
+                {"ram_bytes", pcfs.ram_bytes},
+                {"disk_budget_bytes", (int64_t)config.prefill_cache_disk_bytes},
+                {"disk_bytes", (int64_t)prefill_disk_bytes},
+            }},
         }},
         {"tool_replay", {
             {"max_entries",     tms.max_entries},
@@ -790,6 +814,39 @@ static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg)
     return salt;
 }
 
+static DiskCacheConfig make_prefix_disk_cache_config(const ServerConfig & cfg) {
+    DiskCacheConfig out;
+    out.cache_dir = (cfg.prefix_cache_disk_bytes > 0) ? cfg.disk_cache_dir : "";
+    out.budget_bytes = cfg.prefix_cache_disk_bytes;
+    out.min_tokens = cfg.disk_cache_min_tokens;
+    out.continued_interval = cfg.disk_cache_continued_interval;
+    out.cold_max_tokens = cfg.disk_cache_cold_max_tokens;
+    return out;
+}
+
+static DiskCacheConfig make_prefill_disk_cache_config(const ServerConfig & cfg) {
+    DiskCacheConfig out;
+    out.cache_dir = (cfg.prefill_cache_disk_bytes > 0)
+        ? cache_subdir(cfg.disk_cache_dir, "prefill")
+        : "";
+    out.budget_bytes = cfg.prefill_cache_disk_bytes;
+    out.min_tokens = cfg.disk_cache_min_tokens;
+    out.continued_interval = cfg.disk_cache_continued_interval;
+    out.cold_max_tokens = cfg.disk_cache_cold_max_tokens;
+    return out;
+}
+
+static size_t snapshot_ram_bytes(ModelBackend & backend, int slot) {
+    auto ref = backend.snapshot_ref(slot);
+    if (!ref.ctx) return 0;
+    size_t bytes = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ref.ctx); t;
+         t = ggml_get_next_tensor(ref.ctx, t)) {
+        bytes += ggml_nbytes(t);
+    }
+    return bytes;
+}
+
 // ─── HttpServer ─────────────────────────────────────────────────────────
 
 HttpServer::HttpServer(ModelBackend & backend,
@@ -799,17 +856,16 @@ HttpServer::HttpServer(ModelBackend & backend,
     , tokenizer_(tokenizer)
     , config_(config)
     , chat_format_(ChatFormat::QWEN3)  // default, overridden by arch
-    , prefix_cache_(config.prefix_cache_cap, tokenizer)
-    , disk_cache_({config.disk_cache_dir,
-                   config.disk_cache_budget_mb * (size_t)(1024 * 1024),
-                   config.disk_cache_min_tokens,
-                   config.disk_cache_continued_interval,
-                   config.disk_cache_cold_max_tokens}, backend)
+    , prefix_cache_(config.prefix_cache_cap, tokenizer,
+                    config.prefix_cache_ram_bytes)
+    , disk_cache_(make_prefix_disk_cache_config(config), backend)
+    , prefill_disk_cache_(make_prefill_disk_cache_config(config), backend)
 {
     #ifdef DFLASH_HAS_CURL
     curl_global_init(CURL_GLOBAL_DEFAULT);
     #endif
-    prefix_cache_.init_full_cache(config.prefill_cache_cap);
+    prefix_cache_.init_full_cache(config.prefill_cache_cap,
+                                  config.prefill_cache_ram_bytes);
     // Fold model+config identity into the layout fingerprint BEFORE init()
     // so compute_layout_id sees it on every learn/verify call. Prevents stale
     // KV hits when the server restarts over the same --kv-cache-dir with a
@@ -818,6 +874,10 @@ HttpServer::HttpServer(ModelBackend & backend,
         disk_cache_.set_identity_salt(compute_disk_cache_salt(config));
     }
     disk_cache_.init();
+    if (!prefill_disk_cache_.disabled()) {
+        prefill_disk_cache_.set_identity_salt(compute_disk_cache_salt(config));
+    }
+    prefill_disk_cache_.init();
     status_html_path_ = resolve_status_html();
 }
 
@@ -1166,7 +1226,8 @@ void HttpServer::handle_client(int fd) {
 
     // Introspection: server config + cache stats + arch + capabilities.
     if (hr.method == "GET" && hr.path == "/props") {
-        json body = build_props_body(config_, prefix_cache_, tool_memory_);
+        json body = build_props_body(config_, prefix_cache_, tool_memory_,
+                                     prefill_disk_cache_.total_bytes());
         send_response(fd, 200, "application/json", body.dump() + "\n");
         ::close(fd);
         return;
@@ -2345,7 +2406,11 @@ void HttpServer::worker_loop() {
             gen_req.stall_skip_tokens = &stall_skip_tokens_storage;
         }
 
-        // Full-prompt cache: exact raw-prompt hit skips most/all prefill.
+        // Staging slot for disk loads. PrefixCache uses slots 0..62; slot 63
+        // is reserved here for disk adoption/restoration.
+        static constexpr int DISK_STAGING_SLOT = ModelBackend::kMaxSlots - 1;
+
+        // Full-prompt RAM cache: exact raw-prompt hit skips most/all prefill.
         int cache_slot = full_cache_hit_slot;
         int prefix_len = full_cache_hit_len;
         bool using_restore = (cache_slot >= 0);
@@ -2362,6 +2427,32 @@ void HttpServer::worker_loop() {
             }
         }
 
+        bool disk_hit = false;
+        if (!using_restore && !prefill_disk_cache_.disabled()) {
+            if (prefill_disk_cache_.lookup(req.prompt_tokens, DISK_STAGING_SLOT)) {
+                cache_slot = DISK_STAGING_SLOT;
+                prefix_len = backend_.snapshot_cur_pos(DISK_STAGING_SLOT);
+                if (prefix_len <= 0) {
+                    std::fprintf(stderr,
+                        "[prefill-disk] ignoring invalid hit pos=%d\n",
+                        prefix_len);
+                    backend_.snapshot_free(DISK_STAGING_SLOT);
+                    cache_slot = -1;
+                    prefix_len = 0;
+                } else {
+                    using_restore = true;
+                    disk_hit = true;
+                    if (pflash_compressed) {
+                        effective_prompt.assign((size_t)prefix_len, 0);
+                        gen_req.prompt = effective_prompt;
+                    }
+                    std::fprintf(stderr,
+                        "[prefill-disk] hit raw_len=%zu slot=%d pos=%d\n",
+                        req.prompt_tokens.size(), DISK_STAGING_SLOT, prefix_len);
+                }
+            }
+        }
+
         // Inline prefix cache: check for cached turn-boundary KV state if no
         // exact full-prompt cache was available.
         if (!using_restore) {
@@ -2372,11 +2463,6 @@ void HttpServer::worker_loop() {
         }
 
         // Disk prefix cache: try disk if memory missed.
-        // Staging slot is the last ModelBackend slot, reserved for disk loads.
-        // PrefixCache inline uses 0..cap-1 and full uses cap..cap+full_cap-1,
-        // so slot 63 is safe as long as total cache slots < 63.
-        static constexpr int DISK_STAGING_SLOT = ModelBackend::kMaxSlots - 1;
-        bool disk_hit = false;
         DiskPrefixCachePolicy disk_policy = req.disk_cache_policy;
         // system_end: first chat-marker boundary; FlowKV clamps disk cache to verbatim system prefix.
         int system_end = 0;
@@ -2528,6 +2614,9 @@ void HttpServer::worker_loop() {
                 std::fprintf(stderr,
                     "[pc] slot=%d snapshot pos=%d > prompt=%zu — treating as miss\n",
                     cache_slot, snap_len, effective_prompt.size());
+                if (disk_hit) {
+                    backend_.snapshot_free(cache_slot);
+                }
                 cache_slot = -1;
                 prefix_len = 0;
                 using_restore = false;
@@ -2578,8 +2667,13 @@ void HttpServer::worker_loop() {
         int full_snap_slot = -1;
         int full_snap_pos = 0;
         bool full_snap_prepared = false;
+        bool full_snap_disk_only = false;
         if (!using_restore) {
             full_snap_slot = prefix_cache_.prepare_full_snap(req.prompt_tokens);
+            if (full_snap_slot < 0 && !prefill_disk_cache_.disabled()) {
+                full_snap_slot = DISK_STAGING_SLOT;
+                full_snap_disk_only = true;
+            }
             if (full_snap_slot >= 0) {
                 full_snap_pos = (int)effective_prompt.size();
                 gen_req.snap_slot = full_snap_slot;
@@ -2607,7 +2701,8 @@ void HttpServer::worker_loop() {
         std::fprintf(stderr,
             "[server] chat CACHE %s restore=%s slot=%d prefix_len=%d "
             "effective_prompt=%zu pflash=%s disk_policy=%s disk_hit=%s "
-            "snap_slot=%d snap_pos=%d full_snap_slot=%d full_snap_pos=%d\n",
+            "snap_slot=%d snap_pos=%d full_snap_slot=%d full_snap_pos=%d "
+            "full_snap_disk_only=%s\n",
             req.response_id.c_str(),
             using_restore ? "true" : "false",
             cache_slot,
@@ -2619,7 +2714,8 @@ void HttpServer::worker_loop() {
             snap_slot,
             snap_cut,
             full_snap_slot,
-            full_snap_pos);
+            full_snap_pos,
+            full_snap_disk_only ? "true" : "false");
 
         // Update status page with cache/pflash/spec-decode flags.
         status_.set_flags(using_restore, pflash_compressed, !config_.draft_path.empty());
@@ -2790,13 +2886,27 @@ void HttpServer::worker_loop() {
                 backend_.snapshot_used(full_snap_slot)) {
                 int saved_pos = backend_.snapshot_cur_pos(full_snap_slot);
                 if (saved_pos > 0) {
-                    prefix_cache_.confirm_full_snap(full_snap_slot, req.prompt_tokens,
-                                                    saved_pos);
+                    if (!prefill_disk_cache_.disabled()) {
+                        prefill_disk_cache_.learn_layout(full_snap_slot);
+                        prefill_disk_cache_.save(full_snap_slot, req.prompt_tokens);
+                    }
+                    if (full_snap_disk_only) {
+                        backend_.snapshot_free(full_snap_slot);
+                    } else {
+                        size_t ram_bytes = snapshot_ram_bytes(backend_, full_snap_slot);
+                        auto evicted = prefix_cache_.confirm_full_snap(
+                            full_snap_slot, req.prompt_tokens, saved_pos, ram_bytes);
+                        for (int evicted_slot : evicted) {
+                            backend_.snapshot_free(evicted_slot);
+                        }
+                    }
                 } else {
-                    prefix_cache_.abort_full_snap(full_snap_slot);
+                    if (full_snap_disk_only) backend_.snapshot_free(full_snap_slot);
+                    else prefix_cache_.abort_full_snap(full_snap_slot);
                 }
             } else {
-                prefix_cache_.abort_full_snap(full_snap_slot);
+                if (full_snap_disk_only) backend_.snapshot_free(full_snap_slot);
+                else prefix_cache_.abort_full_snap(full_snap_slot);
             }
         }
 
@@ -2804,16 +2914,29 @@ void HttpServer::worker_loop() {
         if (snap_prepared) {
             if (completion_tokens > 0 && visible_output_seen && !client_disconnected &&
                 backend_.snapshot_used(snap_slot)) {
-                prefix_cache_.confirm_inline_snap(snap_slot, snap_cut, effective_prompt);
-                // Track for shutdown save.
-                slot_tokens_[snap_slot] = std::vector<int32_t>(
-                    effective_prompt.begin(), effective_prompt.begin() + snap_cut);
+                size_t ram_bytes = snapshot_ram_bytes(backend_, snap_slot);
+                auto evicted = prefix_cache_.confirm_inline_snap(
+                    snap_slot, snap_cut, effective_prompt, ram_bytes);
+                bool snap_evicted = false;
+                for (int evicted_slot : evicted) {
+                    if (evicted_slot == snap_slot) snap_evicted = true;
+                }
                 // Save to disk cache if threshold met.
                 if (!disk_cache_.disabled()) {
                     disk_cache_.learn_layout(snap_slot);
                     if (disk_policy.mode == DiskPrefixCacheMode::Full) {
                         disk_cache_.save(snap_slot, effective_prompt);
                     }
+                }
+                if (!snap_evicted) {
+                    // Track for shutdown save.
+                    slot_tokens_[snap_slot] = std::vector<int32_t>(
+                        effective_prompt.begin(), effective_prompt.begin() + snap_cut);
+                } else {
+                    slot_tokens_.erase(snap_slot);
+                }
+                for (int evicted_slot : evicted) {
+                    backend_.snapshot_free(evicted_slot);
                 }
             } else {
                 prefix_cache_.abort_inline_snap(snap_slot);

@@ -17,6 +17,7 @@
 #include "tool_memory.h"
 #include "prefix_cache.h"
 #include "disk_prefix_cache.h"
+#include "cache_config.h"
 #include "freeze_history.h"
 #include "api_types.h"
 #include "placement/draft_residency.h"
@@ -54,8 +55,14 @@ struct ServerConfig {
     int         max_ctx     = 0;        // 0 = use backend's DevicePlacement default (8192)
     bool        enable_cors = true;
     std::string model_name  = "dflash";
-    int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
-    int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
+    // Unified cache budgets. Operators configure bytes per cache kind/tier;
+    // slot counts below are derived/internal backend handles.
+    size_t      prefix_cache_ram_bytes   = kDefaultPrefixCacheRamBytes;
+    size_t      prefill_cache_ram_bytes  = 0;
+    size_t      prefix_cache_disk_bytes  = (size_t)4 * 1024 * 1024 * 1024;
+    size_t      prefill_cache_disk_bytes = 0;
+    int         prefix_cache_cap = 32;  // derived RAM snapshot handles (0 disables)
+    int         prefill_cache_cap = 0;  // derived RAM snapshot handles (0 disables)
 
     // Thinking-budget v2. Applied when a request opts in via
     // `thinking: {type: "enabled"}` or `reasoning: {effort: ...}`.
@@ -165,7 +172,6 @@ struct ServerConfig {
 
     // Disk prefix cache
     std::string disk_cache_dir;             // empty = disabled
-    size_t      disk_cache_budget_mb = 4096; // max disk usage in MB
     int         disk_cache_min_tokens = 512; // only persist >= this many tokens
     int         disk_cache_continued_interval = 10240; // continued checkpoint every N tokens
     int         disk_cache_cold_max_tokens = 10240;    // cold prefix for prompts longer than this
@@ -223,7 +229,8 @@ struct ParsedRequest {
 // docs/specs/props-endpoint.md for the wire contract.
 json build_props_body(const ServerConfig & config,
                       const PrefixCache & prefix_cache,
-                      const ToolMemory & tool_memory);
+                      const ToolMemory & tool_memory,
+                      size_t prefill_disk_bytes = 0);
 
 // ─── HTTP server ────────────────────────────────────────────────────────
 class HttpServer {
@@ -299,6 +306,7 @@ private:
     ToolMemory       tool_memory_;
     PrefixCache      prefix_cache_;
     DiskPrefixCache  disk_cache_;
+    DiskPrefixCache  prefill_disk_cache_;
 
     // Per-session adaptive keep_ratio bandit state.
     HttpServerSessions sessions_;

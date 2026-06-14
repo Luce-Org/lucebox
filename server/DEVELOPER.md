@@ -132,8 +132,8 @@ cd dflash
 | `--cache-type-v` / `--ctv` | auto | KV cache type for values |
 | `--fa-window` | auto | Sliding window size for flash attention (0 = full) |
 | `--tokenizer` | auto (from GGUF) | HuggingFace tokenizer ID |
-| `--prefix-cache-slots` | `4` | Number of prefix-cache slots |
-| `--prefill-cache-slots` | `4` | Number of prefill-cache slots |
+| `--cache-prefix-ram` | `2GiB` | RAM budget for turn-boundary prefix snapshots |
+| `--cache-prefill-ram` | `0` | RAM budget for exact full-prompt snapshots |
 | `--daemon` | off | Run as background daemon |
 
 ### API endpoints
