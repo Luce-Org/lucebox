@@ -45,8 +45,10 @@ def _normalize_math(s: str | None) -> str:
         s = s[1:]
     s = re.sub(r"\\text\s*\{([^}]*)\}", r"\1", s)
     s = re.sub(r"\\mathrm\s*\{([^}]*)\}", r"\1", s)
-    for cmd in [r"\left", r"\right", r"\displaystyle", r"\tfrac", r"\dfrac"]:
+    for cmd in [r"\left", r"\right", r"\displaystyle"]:
         s = s.replace(cmd, "")
+    s = s.replace(r"\tfrac", r"\frac")
+    s = s.replace(r"\dfrac", r"\frac")
     for unit in [
         " cm", " m", " km", " kg", " g", " s", " ms",
         " degrees", " degree", "\u00b0", " inches", " feet",
@@ -88,7 +90,7 @@ def _math_equiv(pred: str | None, gold: str | None) -> bool:
                     return True
             except (ValueError, ZeroDivisionError):
                 pass
-    frac_pat = re.compile(r"\\?frac\s*\{([^}]+)\}\s*\{([^}]+)\}")
+    frac_pat = re.compile(r"^\\frac\s*\{([^}]+)\}\s*\{([^}]+)\}$")
     for s, other in [(p, g), (g, p)]:
         m = frac_pat.search(s)
         if m:
