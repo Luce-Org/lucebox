@@ -68,6 +68,15 @@ deterministic) rounding lineage, not noise and not a correctness effect.
 | qwen35moe A3B all-GPU --ddtree full cache, 500 tok | 11.5% | 2.84 | coherent |
 | qwen35moe A3B all-GPU --ddtree KVFlash 2K, 500 tok | 10.4% | 2.66 | coherent |
 
+qwen35moe `--spark` hybrid expert offload spec decode (`do_hybrid_spec_decode`)
+runs on the pool: coherent at 69.2 tok/s (full cache) and 51.4 tok/s
+(KVFlash 2K), accept ~11%. An earlier CUDA illegal-access on this path
+(an F32 shared-expert gate hitting a missing cublasLt kernel, plus a
+missing DeltaNet snapshot/restore on the MoE rollback) is fixed in this
+branch; the converter fix that loads A3B DFlash drafts is what first made
+the path exercisable. All-GPU MoE spec decode (experts resident, no
+`--spark`) also works on the pool, see the rows above.
+
 ## Microbenchmarks
 
 - Memory at 128K-logical: attn-KV 2304 -> 18 MiB (99.2%) with a 1K pool;
@@ -104,16 +113,6 @@ untuned (follow-up: teacher-forced NIAH harness for non-qwen archs,
 tail-window/normalization tuning).
 
 ## Known limits
-
-- qwen35moe `--spark` (hybrid expert offload) speculative decode crashes
-  with a CUDA illegal-memory-access — a pre-existing bug in the hybrid
-  spec path (`do_hybrid_spec_decode`), independent of KVFlash (it crashes
-  with the full cache too). It was never exercisable before because no
-  A3B DFlash draft could be converted; the converter fix in this branch
-  now loads them, surfacing the crash. Tracked separately; `--spark`
-  spec falls back to pipelined AR under KVFlash. All-GPU MoE spec decode
-  (experts resident, no `--spark`) works on the pool — see the spec table.
-
 
 - The harness-only tree-verify graphs (test_dflash) are not pool-aware;
   the daemon's spec decode, including the --ddtree configuration (chain

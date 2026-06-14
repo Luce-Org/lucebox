@@ -155,8 +155,10 @@ The pool is wired into the qwen35 backend behind `--kvflash <tokens>`
   sites (verify, both replays, stall-prefix) route through this one
   function. Verified on the daemon: accept_rate 15.4-15.6% pooled vs
   15.3% pool-off (matched avg_commit 3.47 vs 3.45), coherent output
-  through a mid-generation pool wrap with live eviction. DDTree's
-  tree-verify is not pool-aware yet and falls back to AR.
+  through a mid-generation pool wrap with live eviction. The daemon's
+  --ddtree config (chain verify + fast rollback) also runs on the pool
+  (accept 14.6% pooled vs 13.9% off); only the harness-only tree-verify
+  graphs (test_dflash) remain not pool-aware.
 - LAYOUT TRAP (cost a day of debugging): kv_write_rows is
   [n_tokens, n_head_kv] ne0-major — element (token i, head h) lives at
   i + h*n_tokens (ggml_set_rows asserts b->ne[1] == c->ne[0]). A

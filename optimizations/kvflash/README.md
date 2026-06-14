@@ -13,7 +13,7 @@
   The attention KV cache lives in a fixed pool of slots; cold 64-token chunks page to host RAM, bit-exact and recallable.
   With pflash, its drafter doubles as a Memory Indexer that recalls the context the generation needs next.<br/>
   Qwen3.6-27B Q4_K_M on a single RTX 3090: <strong>native 256K context at 38.6 tok/s with 72 MiB of resident KV</strong>,
-  needle recall 88-100% at 6% residency, harness accuracy unchanged (32/32 vs full cache).
+  needle recall 88-100% at 6% residency, harness accuracy unchanged (36/36 vs full cache).
 </p>
 
 ---
@@ -38,10 +38,17 @@ does not fit at all.)
 ## Usage
 
 ```bash
-dflash_server model.gguf --max-ctx 32768 --kvflash auto           # one flag, LRU policy
+# recommended: drafter-scored residency, pool auto-sized from VRAM.
+# pass --prefill-drafter so the drafter is guaranteed (no silent LRU fallback).
 dflash_server model.gguf --max-ctx 32768 --kvflash auto \
-    --prefill-drafter qwen3-0.6b.gguf                             # drafter-scored residency
-dflash_server model.gguf --max-ctx 32768 --kvflash 8192           # explicit pool size
+    --prefill-drafter /opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf
+
+# drop the path to auto-probe (model dir, drafter/, draft/, /opt/lucebox/models/drafter/);
+# falls back to LRU if none is found, so check the banner reads policy=drafter
+dflash_server model.gguf --max-ctx 32768 --kvflash auto
+
+# explicit pool size, recency-only LRU
+dflash_server model.gguf --max-ctx 32768 --kvflash 8192 --kvflash-policy lru
 ```
 
 Drafter-scored residency is the DEFAULT policy on every model family:
@@ -84,7 +91,7 @@ conservative default and 6-9% is measured safe for retrieval workloads.
 | arch | models | decode path | policy | notes |
 |---|---|---|---|---|
 | qwen35 | Qwen3.5/3.6-27B | masked set_rows decode + slot-mapped spec verify | LRU or pflash drafter | reference integration; all RESULTS.md numbers |
-| qwen35moe | Qwen3.6-35B-A3B | pipelined hybrid decode (Spark) + all-GPU | LRU or pflash drafter | maskless pool span (zero-row approximation, same as production padding); hybrid spec falls back to AR |
+| qwen35moe | Qwen3.6-35B-A3B | pipelined hybrid decode (Spark) + all-GPU | LRU or pflash drafter | maskless pool span (zero-row approximation, same as production padding); hybrid spec decode runs on the pool |
 | laguna | Laguna-XS.2 | single-graph hybrid + all-GPU, slot-space full+SWA masks | LRU or drafter (cross-tok, untuned) | pager covers all 40 layers; protected tail >= sliding_window keeps SWA exact |
 | gemma4 | Gemma4 26B-A4B / 31B | masked decode + slot-mapped spec verify, slot-space full mask | LRU or drafter (cross-tok, untuned) | pools FULL-attention layers only (SWA layers already ring-buffer) |
 
@@ -117,7 +124,7 @@ Quality verdict (harness ground truth, base-vs-base control included):
 full results in [RESULTS.md](RESULTS.md). Outputs are not guaranteed
 byte-identical to the full cache on long generations (the masked kernel
 path rounds differently — a different deterministic lineage), but
-correctness is identical: 32/32 vs 32/32 across HumanEval, GSM, MATH, and
+correctness is identical: 36/36 vs 36/36 across HumanEval, GSM, MATH, and
 agent suites.
 
 ## Files
