@@ -34,10 +34,13 @@ PORT = int(os.environ.get("DFLASH_PREFILL_CACHE_TEST_PORT", "18185"))
 LOG_PATH = Path(os.environ.get("DFLASH_PREFILL_CACHE_TEST_LOG", "/tmp/test_prefill_cache_server.log"))
 
 
-def require_path(path: Path, label: str) -> None:
+def require_path(path: Path, label: str, *, executable: bool = False) -> None:
     if not path.exists():
         print(f"SKIP: {label} missing at {path}")
         sys.exit(0)
+    if executable and not os.access(path, os.X_OK):
+        print(f"ERROR: {label} is not executable at {path}", file=sys.stderr)
+        sys.exit(1)
 
 
 def post_json(path: str, payload: dict, timeout: int = 900) -> dict:
@@ -84,7 +87,7 @@ def wait_server(proc: subprocess.Popen, deadline_s: int = 240) -> None:
 
 
 def main() -> int:
-    require_path(SERVER_BIN, "dflash_server")
+    require_path(SERVER_BIN, "dflash_server", executable=True)
     require_path(TARGET, "target GGUF")
     require_path(DRAFT, "draft GGUF")
 
