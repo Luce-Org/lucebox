@@ -1362,7 +1362,12 @@ bool eval_moe_hot_only_batched(
     }
 
     // ── Fast path: use cached graph (avoids rebuild + realloc) ──
-    auto & cached = storage.hot_batched_graph;
+    // Per-n_tokens cache: spec-decode alternates verify (verify_width) and
+    // replay (commit_n) sizes; a single slot would rebuild all 40 layers' FFN
+    // graphs on every flip. Index by n_tokens so each size keeps its own graph.
+    auto & cached = (n_tokens > 0 && n_tokens < MoeHybridLayerStorage::kMaxBatchedCache)
+                  ? storage.hot_batched_mixed[n_tokens]
+                  : storage.hot_batched_graph;
     if (cached.n_tokens == n_tokens && cached.valid()) {
         // Reuse pre-built graph: just upload data and compute
         ggml_backend_tensor_set(cached.inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
