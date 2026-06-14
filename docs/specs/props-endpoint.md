@@ -22,7 +22,7 @@ tradition with structured capability advertising for:
   budgets)
 - Speculative-decode + tool-calling capability
 - The loaded model card and its derived settings
-- Prefix cache + full cache occupancy
+- Unified cache budget/usage plus legacy prefix/full cache occupancy
 - PFlash (speculative prefill compression) state
 - Default sampler params and context length
 
@@ -58,6 +58,7 @@ request will not delay a `/props` response.
   "budget_envelope":              { … },
   "build_info":                   "luce-dflash v<ver> props_schema=<n>",
   "capabilities":                 { … },
+  "cache":                        { … },
   "daemon":                       { "alive": true },
   "default_generation_settings":  { … },
   "full_cache":                   { … },
@@ -127,7 +128,7 @@ endpoints, embedding endpoints) appear here when implemented.
 
 The runtime-resolved budget knobs driving the thinking-budget
 envelope. These are always-present, even when no sidecar was loaded
-(see §4.10 `model_card`). They may differ from the authored card
+(see §4.11 `model_card`). They may differ from the authored card
 values because of CLI overrides (`--default-max-tokens`,
 `--think-max-tokens`, `--reasoning-effort-<tier>`) and the
 absolute-tier ceiling clamping (spec §3.5).
@@ -152,7 +153,7 @@ absolute-tier ceiling clamping (spec §3.5).
   because of that clamp.
 
 `budget_envelope` is the source of truth for what the server will
-actually do with a request; `model_card` (§4.10) is the source of
+actually do with a request; `model_card` (§4.11) is the source of
 truth for what the authored card says.
 
 ### 4.3 `build_info`
@@ -187,7 +188,51 @@ client capability:
   fields and emits `tool_calls` blocks. If `false`, those fields
   are ignored.
 
-### 4.5 `daemon`
+### 4.5 `cache`
+
+```json
+"cache": {
+  "prefix": {
+    "ram_budget_bytes": 2147483648,
+    "ram_capacity": 32,
+    "ram_in_use": 0,
+    "ram_bytes": 0,
+    "disk_budget_bytes": 4294967296
+  },
+  "prefill": {
+    "ram_budget_bytes": 0,
+    "ram_capacity": 0,
+    "ram_in_use": 0,
+    "ram_bytes": 0,
+    "disk_budget_bytes": 0,
+    "disk_bytes": 0
+  }
+}
+```
+
+Preferred cache configuration and runtime counters by cache kind.
+`cache.prefix` describes inline prefix snapshots (system-prompt KV
+reuse). `cache.prefill` describes exact full-prompt prefill
+snapshots. Each kind reports the configured RAM byte budget,
+derived RAM snapshot-handle capacity, current RAM handle usage,
+estimated RAM bytes, and configured disk byte budget.
+
+`cache.prefill.disk_bytes` reports bytes currently held in the
+exact-prefill disk cache. Prefix disk usage is maintained by the
+prefix disk-cache implementation and is not currently surfaced as a
+stable counter here.
+
+The `ram_capacity` fields are derived from byte budgets using the
+server's conservative per-snapshot handle estimate. They are useful
+for interpreting occupancy, but operators should configure budgets
+with byte-size flags.
+
+Counters use atomic loads (`std::memory_order_relaxed`); the
+snapshot is tear-free per field but the set of fields is not
+internally consistent. Acceptable for introspection; not safe for
+control-flow decisions.
+
+### 4.6 `daemon`
 
 ```json
 "daemon": { "alive": true }
@@ -198,7 +243,7 @@ client capability:
 crashed or is restarting. Healthchecks should treat `false` as a
 failure even if HTTP returns 200.
 
-### 4.6 `default_generation_settings`
+### 4.7 `default_generation_settings`
 
 ```json
 "default_generation_settings": {
@@ -228,21 +273,29 @@ field; `/props` only carries the server-wide knobs. To see the
 card's sampler values, read the sidecar JSON or the startup
 banner.
 
-### 4.7 `full_cache`
+### 4.8 `full_cache`
 
 ```json
 "full_cache": {
-  "capacity":      0,
-  "disk_bytes":    0,
-  "enabled":       false,
-  "in_use":        0,
-  "lifetime_hits": 0
+  "capacity":          0,
+  "disk_bytes":        0,
+  "disk_budget_bytes": 0,
+  "enabled":           false,
+  "in_use":            0,
+  "lifetime_hits":     0,
+  "ram_budget_bytes":  0,
+  "ram_bytes":         0
 }
 ```
 
-The full-prompt cache (disk-backed). When `enabled = false`,
-`capacity`, `in_use`, `lifetime_hits`, and `disk_bytes` are all
-zero and ignored.
+Legacy exact full-prompt prefill cache surface. New clients should
+prefer `cache.prefill` (§4.5) because it distinguishes RAM and disk
+budgets directly.
+
+`enabled` reflects whether the RAM exact-prefill cache is
+configured. Disk-only exact-prefill caching can be active with
+`enabled = false`; in that mode `disk_budget_bytes` and
+`disk_bytes` still describe the disk tier.
 
 Counters use atomic loads (`std::memory_order_relaxed`); the
 snapshot is tear-free per field but the set of fields is **not
@@ -250,7 +303,7 @@ internally consistent** — e.g. `in_use` and `lifetime_hits` may
 correspond to slightly different points in wall time. Acceptable
 for an introspection report; not safe for control-flow decisions.
 
-### 4.8 `model`
+### 4.9 `model`
 
 ```json
 "model": {
@@ -265,7 +318,7 @@ normalized. `draft_path` is the speculative-decode draft model
 path, or `null` when no draft is loaded. `tokenizer_id` is a
 best-effort tokenizer family hint from GGUF metadata.
 
-### 4.9 `model_alias` and `model_path`
+### 4.10 `model_alias` and `model_path`
 
 `model_alias` is the value clients should pass as the `model` field
 in chat/responses requests (defaults to `"dflash"`; override with
@@ -275,7 +328,7 @@ in chat/responses requests (defaults to `"dflash"`; override with
 GGUF. Useful for "which weights is this server actually serving"
 checks.
 
-### 4.10 `model_card`
+### 4.11 `model_card`
 
 ```json
 "model_card": {
@@ -331,7 +384,7 @@ apply, see `budget_envelope` (§4.2).
 See [`docs/specs/model-cards.md`](model-cards.md) for the sidecar
 format and resolution order.
 
-### 4.11 `pflash`
+### 4.12 `pflash`
 
 ```json
 "pflash": {
@@ -359,21 +412,25 @@ enabled, fields carry the runtime configuration:
 - `bsa_enabled` / `bsa_alpha` / `lm_head_fix` — backend-specific
   PFlash tunables
 
-### 4.12 `prefix_cache`
+### 4.13 `prefix_cache`
 
 ```json
 "prefix_cache": {
-  "capacity":      0,
-  "in_use":        0,
-  "lifetime_hits": 0
+  "capacity":          0,
+  "disk_budget_bytes": 0,
+  "in_use":            0,
+  "lifetime_hits":     0,
+  "ram_budget_bytes":  0,
+  "ram_bytes":         0
 }
 ```
 
-The inline prefix cache (system-prompt KV reuse). Same atomic /
-non-strictly-consistent semantics as `full_cache` (§4.7).
+Legacy inline prefix cache surface (system-prompt KV reuse). New
+clients should prefer `cache.prefix` (§4.5). Same atomic /
+non-strictly-consistent semantics as `full_cache` (§4.8).
 `capacity = 0` means the cache is disabled.
 
-### 4.13 `reasoning`
+### 4.14 `reasoning`
 
 ```json
 "reasoning": {
@@ -400,7 +457,7 @@ Reasoning capability:
 See [`docs/specs/thinking-budget.md`](thinking-budget.md) §4 for
 the per-tier semantics.
 
-### 4.14 `sampling.capabilities`
+### 4.15 `sampling.capabilities`
 
 ```json
 "sampling": {
@@ -421,9 +478,9 @@ confusion when behavior doesn't match the request.
 
 The `sampling` object intentionally nests `capabilities` for
 future expansion (e.g. `sampling.defaults`, though that lives in
-§4.6 today).
+§4.7 today).
 
-### 4.15 `speculative`
+### 4.16 `speculative`
 
 ```json
 "speculative": {
@@ -439,7 +496,7 @@ this section is omitted entirely.
 Future fields: `accept_rate`, `lookahead_depth`, `draft_model_id`
 — added as the speculative-decode surface grows.
 
-### 4.16 `runtime`
+### 4.17 `runtime`
 
 ```json
 "runtime": {
@@ -552,6 +609,23 @@ version increments.
     "speculative_supported": true,
     "tools_supported":       true
   },
+  "cache": {
+    "prefix": {
+      "ram_budget_bytes": 2147483648,
+      "ram_capacity": 32,
+      "ram_in_use": 0,
+      "ram_bytes": 0,
+      "disk_budget_bytes": 4294967296
+    },
+    "prefill": {
+      "ram_budget_bytes": 0,
+      "ram_capacity": 0,
+      "ram_in_use": 0,
+      "ram_bytes": 0,
+      "disk_budget_bytes": 0,
+      "disk_bytes": 0
+    }
+  },
   "daemon": { "alive": true },
   "default_generation_settings": {
     "min_p":          0.0,
@@ -562,11 +636,14 @@ version increments.
     "top_p":          0.95
   },
   "full_cache": {
-    "capacity":      0,
-    "disk_bytes":    0,
-    "enabled":       false,
-    "in_use":        0,
-    "lifetime_hits": 0
+    "capacity":          0,
+    "disk_bytes":        0,
+    "disk_budget_bytes": 0,
+    "enabled":           false,
+    "in_use":            0,
+    "lifetime_hits":     0,
+    "ram_budget_bytes":  0,
+    "ram_bytes":         0
   },
   "model": {
     "arch":         "qwen35",
@@ -609,9 +686,12 @@ version increments.
     "threshold":   null
   },
   "prefix_cache": {
-    "capacity":      0,
-    "in_use":        0,
-    "lifetime_hits": 0
+    "capacity":          0,
+    "disk_budget_bytes": 0,
+    "in_use":            0,
+    "lifetime_hits":     0,
+    "ram_budget_bytes":  0,
+    "ram_bytes":         0
   },
   "reasoning": {
     "default":           null,

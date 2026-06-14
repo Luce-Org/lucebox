@@ -45,7 +45,7 @@ paths:
         Returns a JSON document describing the server's HTTP
         endpoints, loaded model, model-card-derived budgets,
         reasoning / speculative / tools capabilities, sampler
-        capability flags, prefix-cache state, full-cache state,
+        capability flags, unified cache state, legacy prefix/full cache state,
         tool-replay state, and PFlash configuration. Never blocks
         on the worker thread; the response is a snapshot of
         atomic counters and config state.
@@ -156,8 +156,11 @@ paths:
                       threshold: null
                     prefix_cache:
                       capacity: 0
+                      disk_budget_bytes: 4294967296
                       in_use: 0
                       lifetime_hits: 0
+                      ram_budget_bytes: 2147483648
+                      ram_bytes: 0
                     reasoning:
                       default: null
                       supported: true
@@ -568,7 +571,7 @@ components:
         on) lives at `budget_envelope.model_card_source`.
 
         See `docs/specs/model-cards.md` for the sidecar format and
-        resolution order, and `docs/specs/props-endpoint.md` §4.10
+        resolution order, and `docs/specs/props-endpoint.md` §4.11
         for how this section is wired up at /props.
       type: object
       additionalProperties: false

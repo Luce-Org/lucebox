@@ -42,7 +42,7 @@ used). The runtime-resolved budget knobs the server will actually
 apply — which may differ from the authored card values due to CLI
 overrides or `max_ctx`-based effort-tier clamping — appear at
 `/props.budget_envelope`. See
-[`docs/specs/props-endpoint.md`](props-endpoint.md) §4.2 and §4.10
+[`docs/specs/props-endpoint.md`](props-endpoint.md) §4.2 and §4.11
 for the wire shape.
 
 ## 2. File location and lookup
