@@ -83,6 +83,32 @@ int cache_slots_for_ram_budget(size_t bytes, int max_slots) {
     return (int)slots;
 }
 
+CachePoolBudgets split_cache_budget(size_t total_bytes,
+                                    size_t default_prefix_bytes) {
+    CachePoolBudgets out;
+    out.prefix_bytes = std::min(total_bytes, default_prefix_bytes);
+    out.prefill_bytes = total_bytes - out.prefix_bytes;
+    return out;
+}
+
+CachePoolBudgets resolve_cache_pool_budgets(size_t total_bytes,
+                                            size_t default_prefix_bytes,
+                                            bool prefix_seen,
+                                            size_t prefix_bytes,
+                                            bool prefill_seen,
+                                            size_t prefill_bytes) {
+    if (prefix_seen && prefill_seen) {
+        return {prefix_bytes, prefill_bytes};
+    }
+    if (prefix_seen) {
+        return {prefix_bytes, total_bytes > prefix_bytes ? total_bytes - prefix_bytes : 0};
+    }
+    if (prefill_seen) {
+        return {total_bytes > prefill_bytes ? total_bytes - prefill_bytes : 0, prefill_bytes};
+    }
+    return split_cache_budget(total_bytes, default_prefix_bytes);
+}
+
 std::string cache_subdir(const std::string & root, const char * name) {
     if (root.empty()) return "";
     if (root.back() == '/') return root + name;

@@ -192,40 +192,46 @@ client capability:
 
 ```json
 "cache": {
+  "ram_budget_bytes": 1073741824,
+  "ram_bytes": 0,
+  "disk_budget_bytes": 17179869184,
   "prefix": {
-    "ram_budget_bytes": 2147483648,
-    "ram_capacity": 32,
+    "ram_budget_bytes": 268435456,
+    "ram_capacity": 4,
     "ram_in_use": 0,
     "ram_bytes": 0,
     "disk_budget_bytes": 4294967296
   },
   "prefill": {
-    "ram_budget_bytes": 0,
-    "ram_capacity": 0,
+    "ram_budget_bytes": 805306368,
+    "ram_capacity": 12,
     "ram_in_use": 0,
     "ram_bytes": 0,
-    "disk_budget_bytes": 0,
+    "disk_budget_bytes": 12884901888,
     "disk_bytes": 0
   }
 }
 ```
 
-Preferred cache configuration and runtime counters by cache kind.
-`cache.prefix` describes inline prefix snapshots (system-prompt KV
-reuse). `cache.prefill` describes exact full-prompt prefill
-snapshots. Each kind reports the configured RAM byte budget,
-derived RAM snapshot-handle capacity, current RAM handle usage,
-estimated RAM bytes, and configured disk byte budget.
+Preferred cache configuration and runtime counters. The top-level
+fields report the user-facing unified RAM/disk budgets and current
+RAM usage. `cache.prefix` describes inline prefix snapshots
+(system-prompt KV reuse). `cache.prefill` describes exact
+full-prompt prefill snapshots. Each kind reports the resolved RAM
+byte budget, derived RAM snapshot-handle capacity, current RAM
+handle usage, estimated RAM bytes, and resolved disk byte budget.
 
 `cache.prefill.disk_bytes` reports bytes currently held in the
 exact-prefill disk cache. Prefix disk usage is maintained by the
 prefix disk-cache implementation and is not currently surfaced as a
-stable counter here.
+stable counter here. Disk budget fields report effective budgets:
+they are zero unless a disk cache directory is configured.
 
 The `ram_capacity` fields are derived from byte budgets using the
 server's conservative per-snapshot handle estimate. They are useful
 for interpreting occupancy, but operators should configure budgets
-with byte-size flags.
+with `--cache-ram` and `--cache-disk` unless they are diagnosing an
+individual pool.
 
 Counters use atomic loads (`std::memory_order_relaxed`); the
 snapshot is tear-free per field but the set of fields is not
@@ -277,13 +283,13 @@ banner.
 
 ```json
 "full_cache": {
-  "capacity":          0,
+  "capacity":          12,
   "disk_bytes":        0,
-  "disk_budget_bytes": 0,
-  "enabled":           false,
+  "disk_budget_bytes": 12884901888,
+  "enabled":           true,
   "in_use":            0,
   "lifetime_hits":     0,
-  "ram_budget_bytes":  0,
+  "ram_budget_bytes":  805306368,
   "ram_bytes":         0
 }
 ```
@@ -416,11 +422,11 @@ enabled, fields carry the runtime configuration:
 
 ```json
 "prefix_cache": {
-  "capacity":          0,
-  "disk_budget_bytes": 0,
+  "capacity":          4,
+  "disk_budget_bytes": 4294967296,
   "in_use":            0,
   "lifetime_hits":     0,
-  "ram_budget_bytes":  0,
+  "ram_budget_bytes":  268435456,
   "ram_bytes":         0
 }
 ```
@@ -610,19 +616,22 @@ version increments.
     "tools_supported":       true
   },
   "cache": {
+    "ram_budget_bytes": 1073741824,
+    "ram_bytes": 0,
+    "disk_budget_bytes": 17179869184,
     "prefix": {
-      "ram_budget_bytes": 2147483648,
-      "ram_capacity": 32,
+      "ram_budget_bytes": 268435456,
+      "ram_capacity": 4,
       "ram_in_use": 0,
       "ram_bytes": 0,
       "disk_budget_bytes": 4294967296
     },
     "prefill": {
-      "ram_budget_bytes": 0,
-      "ram_capacity": 0,
+      "ram_budget_bytes": 805306368,
+      "ram_capacity": 12,
       "ram_in_use": 0,
       "ram_bytes": 0,
-      "disk_budget_bytes": 0,
+      "disk_budget_bytes": 12884901888,
       "disk_bytes": 0
     }
   },
@@ -636,13 +645,13 @@ version increments.
     "top_p":          0.95
   },
   "full_cache": {
-    "capacity":          0,
+    "capacity":          12,
     "disk_bytes":        0,
-    "disk_budget_bytes": 0,
-    "enabled":           false,
+    "disk_budget_bytes": 12884901888,
+    "enabled":           true,
     "in_use":            0,
     "lifetime_hits":     0,
-    "ram_budget_bytes":  0,
+    "ram_budget_bytes":  805306368,
     "ram_bytes":         0
   },
   "model": {

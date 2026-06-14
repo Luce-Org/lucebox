@@ -25,35 +25,35 @@ PROMPTS = [
 
 CONFIGS = {
     "baseline":         {  # everything off — reference run
-        "flags": ["--cache-prefix-ram", "0", "--prefill-compression", "off"],
+        "flags": ["--cache-ram", "0", "--prefill-compression", "off"],
         "env":   {"DFLASH_FP_USE_BSA": "0"},
     },
     "baseline_2":       {  # IDENTICAL to baseline — sanity check for determinism
-        "flags": ["--cache-prefix-ram", "0", "--prefill-compression", "off"],
+        "flags": ["--cache-ram", "0", "--prefill-compression", "off"],
         "env":   {"DFLASH_FP_USE_BSA": "0"},
     },
     "prefix_on":        {  # only prefix cache enabled (default tq3_0 K-cache)
-        "flags": ["--cache-prefix-ram", "256MiB", "--prefill-compression", "off"],
+        "flags": ["--cache-ram", "256MiB", "--cache-prefill-ram", "0", "--prefill-compression", "off"],
         "env":   {"DFLASH_FP_USE_BSA": "0"},
     },
     "baseline_f16":     {  # f16 K-cache, no caches — proper reference for prefix_on_f16
-        "flags": ["--cache-prefix-ram", "0", "--prefill-compression", "off", "--kv-f16"],
+        "flags": ["--cache-ram", "0", "--prefill-compression", "off", "--kv-f16"],
         "env":   {"DFLASH_FP_USE_BSA": "0"},
     },
     "prefix_on_f16":    {  # prefix cache + f16 K-cache (tests KV-quantization hypothesis)
-        "flags": ["--cache-prefix-ram", "256MiB", "--prefill-compression", "off", "--kv-f16"],
+        "flags": ["--cache-ram", "256MiB", "--cache-prefill-ram", "0", "--prefill-compression", "off", "--kv-f16"],
         "env":   {"DFLASH_FP_USE_BSA": "0"},
     },
     "compression_on":   {  # only pflash compression (no prefix cache, no BSA)
-        "flags": ["--cache-prefix-ram", "0", "--prefill-compression", "always"],
+        "flags": ["--cache-ram", "0", "--prefill-compression", "always"],
         "env":   {"DFLASH_FP_USE_BSA": "0"},
     },
     "bsa_on":           {  # only BSA in pflash (no prefix cache)
-        "flags": ["--cache-prefix-ram", "0", "--prefill-compression", "off"],
+        "flags": ["--cache-ram", "0", "--prefill-compression", "off"],
         "env":   {"DFLASH_FP_USE_BSA": "1"},
     },
     "all_on":           {  # prefix + pflash compression + BSA
-        "flags": ["--cache-prefix-ram", "256MiB", "--prefill-compression", "always"],
+        "flags": ["--cache-ram", "256MiB", "--cache-prefill-ram", "0", "--prefill-compression", "always"],
         "env":   {"DFLASH_FP_USE_BSA": "1"},
     },
 }

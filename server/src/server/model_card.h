@@ -92,7 +92,7 @@ struct ModelCard {
     // Raw parsed sidecar JSON, populated on successful sidecar load.
     // Null (`raw_json.is_null() == true`) when family fallback or hard
     // fallback was used. Exposed verbatim under `/props.model_card`
-    // (see docs/specs/props-endpoint.md §4.9).
+    // (see docs/specs/props-endpoint.md §4.11).
     nlohmann::json raw_json = nullptr;
 };
 

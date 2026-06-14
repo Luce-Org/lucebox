@@ -179,11 +179,13 @@ free_snapshot_backend(snap_backend_, compute_backend_);  // then backend
 
 | Server flag | Default | Description |
 |-------------|---------|-------------|
-| `--cache-prefix-ram SIZE` | 2GiB | RAM budget for turn-boundary prefix snapshots |
-| `--cache-prefill-ram SIZE` | 0 | RAM budget for exact full-prompt snapshots |
-| `--kv-cache-dir PATH` | unset | Root directory for disk cache pools |
-| `--cache-prefix-disk SIZE` | 4GiB | Disk budget for turn-boundary prefix snapshots |
-| `--cache-prefill-disk SIZE` | 0 | Disk budget for exact full-prompt snapshots |
+| `--cache-ram SIZE` | 1GiB | Unified RAM budget; split automatically between prefix and exact prefill pools |
+| `--kv-cache-dir PATH` / `--cache-dir PATH` | unset | Root directory for disk cache pools |
+| `--cache-disk SIZE` | 16GiB | Unified disk budget when a cache directory is set |
+| `--cache-prefix-ram SIZE` | auto | Advanced override for turn-boundary prefix RAM pool |
+| `--cache-prefill-ram SIZE` | auto | Advanced override for exact full-prompt RAM pool |
+| `--cache-prefix-disk SIZE` | auto | Advanced override for turn-boundary prefix disk pool |
+| `--cache-prefill-disk SIZE` | auto | Advanced override for exact full-prompt disk pool |
 | `--skip-park` | false | Skip parking draft model during compress |
 
 Deprecated compatibility aliases:
@@ -201,22 +203,39 @@ not VRAM. Cache budgets are enforced against the actual snapshot byte size
 reported by the backend after save. If a snapshot is larger than its configured
 pool, it is evicted immediately and the next identical request will not hit.
 
+Use `--cache-ram` for normal operation. The default `1GiB` split keeps prefix
+reuse cheap (`256MiB`) and gives the rest to exact repeated prompts, which is
+where whole-prompt benchmark and agent-loop speedups usually come from. Set
+`--cache-ram 0` to disable RAM snapshots completely. The split flags are for
+advanced experiments and diagnostics.
+
+These knobs do not reserve extra GPU KV capacity. They control RAM/disk
+snapshots; GPU VRAM pressure is mostly a function of context length, KV dtype,
+model placement, and draft residency.
+
 Inline prefix snapshots are usually small because they are taken at turn
 boundaries. Exact prefill snapshots cover the full effective prompt and can be
 hundreds of MiB for multi-thousand-token Qwen3.6 prompts, so size the prefill
 pool for the largest repeated prompt you want to retain.
 
-| Scenario | Typical prefix length | Recommended prefix RAM |
-|----------|----------------------|------------------------|
-| Single-user chat | 200–2000 tokens | 512MiB-2GiB |
-| Multi-session agent | 500–5000 tokens | 2GiB-4GiB |
-| Batch / benchmark | N/A (cold starts) | 256MiB |
+| Scenario | Recommended `--cache-ram` | Notes |
+|----------|---------------------------|-------|
+| Minimal RAM / no RAM snapshots | 0 | Disk cache can still be enabled with `--kv-cache-dir` |
+| Single-user chat | 512MiB-1GiB | Keeps a few prefix turns and one medium exact prompt |
+| Multi-session agent | 1GiB-4GiB | Default 1GiB is the low-RAM starting point |
+| Repeated long prompts | 2GiB+ | Exact prefill snapshots must fit in the resolved prefill pool |
 
-| Scenario | Typical full prompt | Recommended prefill RAM |
-|----------|---------------------|-------------------------|
-| Disabled exact-cache path | N/A | 0 |
-| Qwen3.6 repeated-prompt proof | ~5k tokens | 1GiB |
-| Large prompt replay | 10k+ tokens | 2GiB+ |
+When you need to isolate a pool for testing, use one split override with the
+unified total. For example, `--cache-ram 1GiB --cache-prefix-ram 0` gives the
+whole RAM budget to exact prefill, while
+`--cache-ram 256MiB --cache-prefill-ram 0` gives the whole RAM budget to
+turn-boundary prefix reuse.
+
+When both RAM pools are enabled, cold misses do not require the operator to
+choose a cache kind. The server alternates future snapshot targets between
+exact prefill and prefix snapshots whenever both are viable; exact repeated
+prompts get a full-prompt hit, while multi-turn chat/agent workloads still
+teach the prefix cache.
 
 The backend still has a finite snapshot-handle table. The server derives
 internal handle counts from RAM budgets using a conservative 64MiB-per-handle

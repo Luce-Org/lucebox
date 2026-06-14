@@ -409,6 +409,13 @@ json build_props_body(const ServerConfig & config,
     auto pcs  = prefix_cache.stats();
     auto pcfs = prefix_cache.full_stats();
     auto tms  = tool_memory.stats();
+    const bool disk_cache_enabled = !config.disk_cache_dir.empty();
+    const int64_t prefix_disk_budget =
+        disk_cache_enabled ? (int64_t)config.prefix_cache_disk_bytes : 0;
+    const int64_t prefill_disk_budget =
+        disk_cache_enabled ? (int64_t)config.prefill_cache_disk_bytes : 0;
+    const int64_t cache_disk_budget =
+        disk_cache_enabled ? (int64_t)config.cache_disk_bytes : 0;
 
     const bool pflash_enabled =
         (config.pflash_mode != ServerConfig::PflashMode::OFF);
@@ -537,7 +544,7 @@ json build_props_body(const ServerConfig & config,
         // loaded; null when family fallback or hard fallback was used.
         // Validates against share/model_cards/_schema.json. The `source`
         // field here is the upstream model-card URL (authored in the
-        // sidecar) — NOT a filepath. See spec §4.9.
+        // sidecar) — NOT a filepath. See spec §4.11.
         {"model_card", config.model_card_json.is_null()
                            ? json(nullptr)
                            : config.model_card_json},
@@ -579,7 +586,7 @@ json build_props_body(const ServerConfig & config,
             {"in_use",        pcs.in_use},
             {"ram_budget_bytes", pcs.ram_budget_bytes},
             {"ram_bytes",     pcs.ram_bytes},
-            {"disk_budget_bytes", (int64_t)config.prefix_cache_disk_bytes},
+            {"disk_budget_bytes", prefix_disk_budget},
             {"lifetime_hits", pcs.lifetime_hits},
         }},
         {"full_cache", {
@@ -588,25 +595,28 @@ json build_props_body(const ServerConfig & config,
             {"in_use",        pcfs.in_use},
             {"ram_budget_bytes", pcfs.ram_budget_bytes},
             {"ram_bytes",     pcfs.ram_bytes},
-            {"disk_budget_bytes", (int64_t)config.prefill_cache_disk_bytes},
+            {"disk_budget_bytes", prefill_disk_budget},
             {"disk_bytes",    (int64_t)prefill_disk_bytes},
             {"lifetime_hits", pcfs.lifetime_hits},
             {"disk_policy",   disk_prefix_cache_policy_name(config.disk_cache_policy)},
         }},
         {"cache", {
+            {"ram_budget_bytes", (int64_t)config.cache_ram_bytes},
+            {"ram_bytes", pcs.ram_bytes + pcfs.ram_bytes},
+            {"disk_budget_bytes", cache_disk_budget},
             {"prefix", {
                 {"ram_budget_bytes", (int64_t)config.prefix_cache_ram_bytes},
                 {"ram_capacity", pcs.capacity},
                 {"ram_in_use", pcs.in_use},
                 {"ram_bytes", pcs.ram_bytes},
-                {"disk_budget_bytes", (int64_t)config.prefix_cache_disk_bytes},
+                {"disk_budget_bytes", prefix_disk_budget},
             }},
             {"prefill", {
                 {"ram_budget_bytes", (int64_t)config.prefill_cache_ram_bytes},
                 {"ram_capacity", pcfs.capacity},
                 {"ram_in_use", pcfs.in_use},
                 {"ram_bytes", pcfs.ram_bytes},
-                {"disk_budget_bytes", (int64_t)config.prefill_cache_disk_bytes},
+                {"disk_budget_bytes", prefill_disk_budget},
                 {"disk_bytes", (int64_t)prefill_disk_bytes},
             }},
         }},
@@ -2663,39 +2673,61 @@ void HttpServer::worker_loop() {
             }
         }
 
-        // Prepare a full-prompt snapshot for exact prefill-cache hits.
+        // Prepare one future snapshot on cold miss. The backend accepts one
+        // snap target per generate call, so when both cache kinds are viable
+        // alternate the cold-miss target. This keeps exact repeated prompts
+        // fast while still teaching the prefix cache for multi-turn agents.
         int full_snap_slot = -1;
         int full_snap_pos = 0;
         bool full_snap_prepared = false;
         bool full_snap_disk_only = false;
-        if (!using_restore) {
-            full_snap_slot = prefix_cache_.prepare_full_snap(req.prompt_tokens);
-            if (full_snap_slot < 0 && !prefill_disk_cache_.disabled()) {
-                full_snap_slot = DISK_STAGING_SLOT;
-                full_snap_disk_only = true;
-            }
-            if (full_snap_slot >= 0) {
-                full_snap_pos = (int)effective_prompt.size();
-                gen_req.snap_slot = full_snap_slot;
-                gen_req.snap_pos = full_snap_pos;
-                full_snap_prepared = true;
-            }
-        }
-
-        // Prepare inline snapshot for future cache hits. GenerateRequest only
-        // carries one snapshot target, so exact full-prompt cache takes
-        // priority when enabled.
         int snap_slot = -1;
         int snap_cut = 0;
-        if (!full_snap_prepared) {
-            auto prepared = prefix_cache_.prepare_inline_snap(effective_prompt);
-            snap_slot = prepared.first;
-            snap_cut = prepared.second;
-        }
-        bool snap_prepared = (snap_slot >= 0);
-        if (snap_prepared) {
-            gen_req.snap_slot = snap_slot;
-            gen_req.snap_pos = snap_cut;
+        bool snap_prepared = false;
+        if (!using_restore) {
+            const bool full_candidate =
+                config_.prefill_cache_cap > 0 || !prefill_disk_cache_.disabled();
+            bool inline_candidate = false;
+            if (!prefix_cache_.disabled()) {
+                auto boundaries =
+                    find_all_boundaries(effective_prompt, prefix_cache_.chat_markers());
+                inline_candidate = !boundaries.empty();
+            }
+            const bool prefer_full =
+                full_candidate &&
+                (!inline_candidate || ((cold_snapshot_counter_++ & 1u) == 0u));
+
+            auto try_prepare_full = [&]() {
+                full_snap_slot = prefix_cache_.prepare_full_snap(req.prompt_tokens);
+                if (full_snap_slot < 0 && !prefill_disk_cache_.disabled()) {
+                    full_snap_slot = DISK_STAGING_SLOT;
+                    full_snap_disk_only = true;
+                }
+                if (full_snap_slot >= 0) {
+                    full_snap_pos = (int)effective_prompt.size();
+                    gen_req.snap_slot = full_snap_slot;
+                    gen_req.snap_pos = full_snap_pos;
+                    full_snap_prepared = true;
+                }
+            };
+            auto try_prepare_inline = [&]() {
+                auto prepared = prefix_cache_.prepare_inline_snap(effective_prompt);
+                snap_slot = prepared.first;
+                snap_cut = prepared.second;
+                if (snap_slot >= 0) {
+                    gen_req.snap_slot = snap_slot;
+                    gen_req.snap_pos = snap_cut;
+                    snap_prepared = true;
+                }
+            };
+
+            if (prefer_full) {
+                try_prepare_full();
+                if (!full_snap_prepared) try_prepare_inline();
+            } else {
+                try_prepare_inline();
+                if (!snap_prepared) try_prepare_full();
+            }
         }
 
         std::fprintf(stderr,

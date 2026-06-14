@@ -36,23 +36,23 @@ DATASET = PROJECT_ROOT / "dflash/eval/humaneval_plus/humanevalplus.jsonl"
 
 CONFIGS = {
     "baseline": {
-        "flags": ["--cache-prefix-ram", "0", "--prefill-compression", "off"],
+        "flags": ["--cache-ram", "0", "--prefill-compression", "off"],
         "env":   {"DFLASH_FP_USE_BSA": "0"},
     },
     "prefix_on": {
-        "flags": ["--cache-prefix-ram", "256MiB", "--prefill-compression", "off"],
+        "flags": ["--cache-ram", "256MiB", "--cache-prefill-ram", "0", "--prefill-compression", "off"],
         "env":   {"DFLASH_FP_USE_BSA": "0"},
     },
     "compression_on": {
-        "flags": ["--cache-prefix-ram", "0", "--prefill-compression", "always"],
+        "flags": ["--cache-ram", "0", "--prefill-compression", "always"],
         "env":   {"DFLASH_FP_USE_BSA": "0"},
     },
     "compression_auto": {
-        "flags": ["--cache-prefix-ram", "0", "--prefill-compression", "auto"],
+        "flags": ["--cache-ram", "0", "--prefill-compression", "auto"],
         "env":   {"DFLASH_FP_USE_BSA": "0"},
     },
     "all_on": {
-        "flags": ["--cache-prefix-ram", "256MiB", "--prefill-compression", "always"],
+        "flags": ["--cache-ram", "256MiB", "--cache-prefill-ram", "0", "--prefill-compression", "always"],
         "env":   {"DFLASH_FP_USE_BSA": "1"},
     },
 }

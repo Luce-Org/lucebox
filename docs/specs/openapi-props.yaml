@@ -88,18 +88,21 @@ paths:
                       speculative_supported: true
                       tools_supported: true
                     cache:
+                      ram_budget_bytes: 1073741824
+                      ram_bytes: 0
+                      disk_budget_bytes: 17179869184
                       prefix:
-                        ram_budget_bytes: 2147483648
-                        ram_capacity: 32
+                        ram_budget_bytes: 268435456
+                        ram_capacity: 4
                         ram_in_use: 0
                         ram_bytes: 0
                         disk_budget_bytes: 4294967296
                       prefill:
-                        ram_budget_bytes: 0
-                        ram_capacity: 0
+                        ram_budget_bytes: 805306368
+                        ram_capacity: 12
                         ram_in_use: 0
                         ram_bytes: 0
-                        disk_budget_bytes: 0
+                        disk_budget_bytes: 12884901888
                         disk_bytes: 0
                     daemon:
                       alive: true
@@ -111,13 +114,13 @@ paths:
                       top_k: 0
                       top_p: 1.0
                     full_cache:
-                      capacity: 0
+                      capacity: 12
                       disk_bytes: 0
-                      disk_budget_bytes: 0
-                      enabled: false
+                      disk_budget_bytes: 12884901888
+                      enabled: true
                       in_use: 0
                       lifetime_hits: 0
-                      ram_budget_bytes: 0
+                      ram_budget_bytes: 805306368
                       ram_bytes: 0
                     model:
                       arch: "qwen35"
@@ -155,11 +158,11 @@ paths:
                       skip_park: null
                       threshold: null
                     prefix_cache:
-                      capacity: 0
+                      capacity: 4
                       disk_budget_bytes: 4294967296
                       in_use: 0
                       lifetime_hits: 0
-                      ram_budget_bytes: 2147483648
+                      ram_budget_bytes: 268435456
                       ram_bytes: 0
                     reasoning:
                       default: null
@@ -351,10 +354,36 @@ components:
           example: true
 
     CachePools:
-      description: Unified cache configuration and runtime counters by cache kind.
+      description: |
+        Unified cache configuration and runtime counters. Top-level
+        fields mirror the user-facing total budgets; nested fields
+        show the resolved internal prefix/prefill pools.
       type: object
-      required: [prefix, prefill]
+      required:
+        - ram_budget_bytes
+        - ram_bytes
+        - disk_budget_bytes
+        - prefix
+        - prefill
       properties:
+        ram_budget_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: User-facing unified RAM cache budget.
+          example: 1073741824
+        ram_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Estimated RAM bytes held across cache pools.
+          example: 0
+        disk_budget_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: User-facing unified disk cache budget, or 0 when no cache directory is configured.
+          example: 17179869184
         prefix:
           $ref: "#/components/schemas/CachePool"
         prefill:
@@ -374,13 +403,13 @@ components:
           type: integer
           format: int64
           minimum: 0
-          description: Configured RAM budget for this cache kind.
-          example: 2147483648
+          description: Resolved RAM budget for this cache kind.
+          example: 268435456
         ram_capacity:
           type: integer
           minimum: 0
           description: Derived internal snapshot-handle capacity.
-          example: 32
+          example: 4
         ram_in_use:
           type: integer
           minimum: 0
@@ -396,7 +425,7 @@ components:
           type: integer
           format: int64
           minimum: 0
-          description: Configured disk budget for this cache kind.
+          description: Resolved disk budget for this cache kind, or 0 when no cache directory is configured.
           example: 4294967296
         disk_bytes:
           type: integer
@@ -490,7 +519,7 @@ components:
           type: integer
           minimum: 0
           description: Derived internal RAM snapshot-handle capacity. 0 when disabled.
-          example: 0
+          example: 12
         disk_bytes:
           type: integer
           format: int64
@@ -501,12 +530,12 @@ components:
           type: integer
           format: int64
           minimum: 0
-          description: Configured exact-prefill disk budget.
-          example: 0
+          description: Resolved exact-prefill disk budget, or 0 when no cache directory is configured.
+          example: 12884901888
         enabled:
           type: boolean
           description: True when the RAM exact-prefill cache is configured.
-          example: false
+          example: true
         in_use:
           type: integer
           minimum: 0
@@ -516,8 +545,8 @@ components:
           type: integer
           format: int64
           minimum: 0
-          description: Configured exact-prefill RAM budget.
-          example: 0
+          description: Resolved exact-prefill RAM budget.
+          example: 805306368
         ram_bytes:
           type: integer
           format: int64
@@ -808,8 +837,8 @@ components:
           type: integer
           format: int64
           minimum: 0
-          description: Configured prefix RAM budget.
-          example: 2147483648
+          description: Resolved prefix RAM budget.
+          example: 268435456
         ram_bytes:
           type: integer
           format: int64

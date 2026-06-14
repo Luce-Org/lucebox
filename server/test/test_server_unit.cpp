@@ -3313,6 +3313,9 @@ static void test_props_cache_budget_shape() {
     cfg.prefill_cache_ram_bytes = (size_t)256 * 1024 * 1024;
     cfg.prefix_cache_disk_bytes = (size_t)8 * 1024 * 1024 * 1024;
     cfg.prefill_cache_disk_bytes = (size_t)4 * 1024 * 1024 * 1024;
+    cfg.cache_ram_bytes = cfg.prefix_cache_ram_bytes + cfg.prefill_cache_ram_bytes;
+    cfg.cache_disk_bytes = cfg.prefix_cache_disk_bytes + cfg.prefill_cache_disk_bytes;
+    cfg.disk_cache_dir = "/tmp/dflash_props_cache_budget_shape";
 
     Tokenizer    tok;
     PrefixCache  pc(0, tok);
@@ -3320,6 +3323,10 @@ static void test_props_cache_budget_shape() {
     json body = build_props_body(cfg, pc, tm, 1234567);
 
     TEST_ASSERT(body.contains("cache"));
+    TEST_ASSERT(body["cache"]["ram_budget_bytes"].get<int64_t>() ==
+                (int64_t)cfg.cache_ram_bytes);
+    TEST_ASSERT(body["cache"]["disk_budget_bytes"].get<int64_t>() ==
+                (int64_t)cfg.cache_disk_bytes);
     TEST_ASSERT(body["cache"]["prefix"]["ram_budget_bytes"].get<int64_t>() ==
                 (int64_t)cfg.prefix_cache_ram_bytes);
     TEST_ASSERT(body["cache"]["prefill"]["ram_budget_bytes"].get<int64_t>() ==
@@ -3333,6 +3340,58 @@ static void test_props_cache_budget_shape() {
     TEST_ASSERT(body["full_cache"]["disk_budget_bytes"].get<int64_t>() ==
                 (int64_t)cfg.prefill_cache_disk_bytes);
     TEST_ASSERT(body["full_cache"]["disk_bytes"].get<int64_t>() == 1234567);
+
+    cfg.disk_cache_dir.clear();
+    body = build_props_body(cfg, pc, tm, 0);
+    TEST_ASSERT(body["cache"]["disk_budget_bytes"].get<int64_t>() == 0);
+    TEST_ASSERT(body["cache"]["prefix"]["disk_budget_bytes"].get<int64_t>() == 0);
+    TEST_ASSERT(body["cache"]["prefill"]["disk_budget_bytes"].get<int64_t>() == 0);
+}
+
+static void test_cache_budget_defaults_and_overrides() {
+    CachePoolBudgets b = split_cache_budget(kDefaultCacheRamBytes,
+                                            kDefaultCachePrefixRamBytes);
+    TEST_ASSERT(b.prefix_bytes == kDefaultCachePrefixRamBytes);
+    TEST_ASSERT(b.prefill_bytes == kDefaultCachePrefillRamBytes);
+
+    b = split_cache_budget((size_t)128 * 1024 * 1024,
+                           kDefaultCachePrefixRamBytes);
+    TEST_ASSERT(b.prefix_bytes == (size_t)128 * 1024 * 1024);
+    TEST_ASSERT(b.prefill_bytes == 0);
+
+    b = resolve_cache_pool_budgets((size_t)1024 * 1024 * 1024,
+                                   (size_t)256 * 1024 * 1024,
+                                   false, 0, false, 0);
+    TEST_ASSERT(b.prefix_bytes == (size_t)256 * 1024 * 1024);
+    TEST_ASSERT(b.prefill_bytes == (size_t)768 * 1024 * 1024);
+
+    b = resolve_cache_pool_budgets((size_t)1024 * 1024 * 1024,
+                                   (size_t)256 * 1024 * 1024,
+                                   true, (size_t)128 * 1024 * 1024,
+                                   false, 0);
+    TEST_ASSERT(b.prefix_bytes == (size_t)128 * 1024 * 1024);
+    TEST_ASSERT(b.prefill_bytes == (size_t)896 * 1024 * 1024);
+
+    b = resolve_cache_pool_budgets((size_t)1024 * 1024 * 1024,
+                                   (size_t)256 * 1024 * 1024,
+                                   false, 0,
+                                   true, (size_t)512 * 1024 * 1024);
+    TEST_ASSERT(b.prefix_bytes == (size_t)512 * 1024 * 1024);
+    TEST_ASSERT(b.prefill_bytes == (size_t)512 * 1024 * 1024);
+
+    b = resolve_cache_pool_budgets((size_t)1024 * 1024 * 1024,
+                                   (size_t)256 * 1024 * 1024,
+                                   true, (size_t)2 * 1024 * 1024 * 1024,
+                                   false, 0);
+    TEST_ASSERT(b.prefix_bytes == (size_t)2 * 1024 * 1024 * 1024);
+    TEST_ASSERT(b.prefill_bytes == 0);
+
+    b = resolve_cache_pool_budgets((size_t)1024 * 1024 * 1024,
+                                   (size_t)256 * 1024 * 1024,
+                                   true, (size_t)300 * 1024 * 1024,
+                                   true, (size_t)700 * 1024 * 1024);
+    TEST_ASSERT(b.prefix_bytes == (size_t)300 * 1024 * 1024);
+    TEST_ASSERT(b.prefill_bytes == (size_t)700 * 1024 * 1024);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4092,6 +4151,7 @@ int main() {
     RUN_TEST(test_props_budget_envelope_shape);
     RUN_TEST(test_props_runtime_shape);
     RUN_TEST(test_props_cache_budget_shape);
+    RUN_TEST(test_cache_budget_defaults_and_overrides);
 
     std::fprintf(stderr, "\n── usage.timings ──\n");
     RUN_TEST(test_usage_timings_openai_chat_streaming);

@@ -151,7 +151,7 @@ static bool load_sidecar(const std::string & path, ModelCard & out, std::string 
     }
 
     // Stash the parsed sidecar verbatim on the ModelCard so the HTTP
-    // server can re-emit it under /props.model_card. See spec §4.9.
+    // server can re-emit it under /props.model_card. See spec §4.11.
     out.raw_json = j;
 
     // Schema sanity check — the four required fields per

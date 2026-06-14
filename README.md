@@ -280,16 +280,22 @@ When compression is on, the request path picks one of three modes automatically,
 | `--cache-type-k <t>` / `--cache-type-v <t>` | env-driven | Per-side quant override: `f16,bf16,q4_0,q4_1,q5_0,q5_1,q8_0,tq3_0` |
 | `DFLASH27B_KV_TQ3=1` | (default) | Preset TQ3_0 K+V (3.5 bpv, fits 256K @ 24 GB) |
 | `DFLASH27B_KV_Q4=1` | off | Q4_0 K+V (4.5 bpv, legacy, ~128K ceiling) |
-| `--cache-prefix-ram <size>` | `2GiB` | RAM budget for turn-boundary prefix snapshots |
-| `--cache-prefill-ram <size>` | `0` | RAM budget for exact full-prompt snapshots |
-| `--kv-cache-dir <path>` | — | Persist prefix cache to disk |
-| `--cache-prefix-disk <size>` | `4GiB` | Disk budget for turn-boundary prefix snapshots |
-| `--cache-prefill-disk <size>` | `0` | Disk budget for exact full-prompt snapshots |
+| `--cache-ram <size>` / `DFLASH_CACHE_RAM` | `1GiB` | Unified RAM cache budget; split automatically between prefix and exact prefill pools |
+| `--kv-cache-dir <path>` / `--cache-dir <path>` | — | Enable disk cache pools |
+| `--cache-disk <size>` / `DFLASH_CACHE_DISK` | `16GiB` | Unified disk cache budget when a cache dir is set |
+| `--cache-prefix-ram <size>` | auto | Advanced override for turn-boundary prefix RAM pool |
+| `--cache-prefill-ram <size>` | auto | Advanced override for exact full-prompt RAM pool |
+| `--cache-prefix-disk <size>` | auto | Advanced override for turn-boundary prefix disk pool |
+| `--cache-prefill-disk <size>` | auto | Advanced override for exact full-prompt disk pool |
 
-Cache sizes are hard byte budgets. A snapshot larger than the configured RAM
-or disk pool is evicted immediately, so exact prefill caching needs a pool at
-least as large as the largest full prompt you expect to reuse; Qwen3.6
-benchmarks commonly use `--cache-prefill-ram 1GiB` or larger.
+Cache sizes are hard byte budgets. By default `--cache-ram 1GiB` reserves
+256MiB for turn-boundary prefix reuse and the remainder for exact repeated
+prompts; `--cache-disk 16GiB` reserves 4GiB for prefix snapshots and the
+remainder for exact prefill snapshots. A snapshot larger than its pool is
+evicted immediately. The request path chooses exact prefill, prefix, or disk
+reuse automatically. These budgets are for RAM/disk snapshots; GPU VRAM use is
+still governed mainly by context length, KV dtype, model placement, and draft
+residency.
 
 **Bounded KV residency (KVFlash)**
 

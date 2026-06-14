@@ -278,23 +278,15 @@ fi
 : "${DFLASH_BUDGET:=22}"
 : "${DFLASH_MAX_CTX:=16384}"
 : "${DFLASH_LAZY:=0}"
-if [ -z "${DFLASH_CACHE_PREFIX_RAM+x}" ]; then
-    if [ -n "${DFLASH_PREFIX_CACHE_SLOTS+x}" ]; then
-        DFLASH_CACHE_PREFIX_RAM="$(( ${DFLASH_PREFIX_CACHE_SLOTS:-0} * 64 ))MiB"
-    else
-        DFLASH_CACHE_PREFIX_RAM="2GiB"
-    fi
+: "${DFLASH_CACHE_RAM:=1GiB}"
+if [ -n "${DFLASH_PREFIX_CACHE_SLOTS+x}" ] && [ -z "${DFLASH_CACHE_PREFIX_RAM+x}" ]; then
+    DFLASH_CACHE_PREFIX_RAM="$(( ${DFLASH_PREFIX_CACHE_SLOTS:-0} * 64 ))MiB"
 fi
-if [ -z "${DFLASH_CACHE_PREFILL_RAM+x}" ]; then
-    if [ -n "${DFLASH_PREFILL_CACHE_SLOTS+x}" ]; then
-        DFLASH_CACHE_PREFILL_RAM="$(( ${DFLASH_PREFILL_CACHE_SLOTS:-0} * 64 ))MiB"
-    else
-        DFLASH_CACHE_PREFILL_RAM="0"
-    fi
+if [ -n "${DFLASH_PREFILL_CACHE_SLOTS+x}" ] && [ -z "${DFLASH_CACHE_PREFILL_RAM+x}" ]; then
+    DFLASH_CACHE_PREFILL_RAM="$(( ${DFLASH_PREFILL_CACHE_SLOTS:-0} * 64 ))MiB"
 fi
 : "${DFLASH_KV_CACHE_DIR:=}"
-: "${DFLASH_CACHE_PREFIX_DISK:=4GiB}"
-: "${DFLASH_CACHE_PREFILL_DISK:=0}"
+: "${DFLASH_CACHE_DISK:=16GiB}"
 : "${DFLASH_CACHE_TYPE_K:=}"
 : "${DFLASH_CACHE_TYPE_V:=}"
 : "${DFLASH_VERBOSE:=0}"
@@ -500,10 +492,11 @@ CMD=("$DFLASH_SERVER_BIN" "$DFLASH_TARGET"
      --host "$DFLASH_HOST"
      --port "$DFLASH_PORT"
      --max-ctx "$DFLASH_MAX_CTX"
-     --cache-prefix-ram "$DFLASH_CACHE_PREFIX_RAM"
-     --cache-prefill-ram "$DFLASH_CACHE_PREFILL_RAM"
+     --cache-ram "$DFLASH_CACHE_RAM"
      --think-max-tokens "$DFLASH_THINK_MAX")
 
+[ -n "${DFLASH_CACHE_PREFIX_RAM+x}" ]   && CMD+=(--cache-prefix-ram "$DFLASH_CACHE_PREFIX_RAM")
+[ -n "${DFLASH_CACHE_PREFILL_RAM+x}" ]  && CMD+=(--cache-prefill-ram "$DFLASH_CACHE_PREFILL_RAM")
 [ -n "$DRAFT_ARG" ]                && CMD+=(--draft "$DRAFT_ARG")
 [ -n "$DRAFT_ARG" ]                && CMD+=(--ddtree --ddtree-budget "$DFLASH_BUDGET")
 # `--lazy-draft` is silently dropped by the C++ server unless both
@@ -521,9 +514,11 @@ if [ "$DFLASH_LAZY" = "1" ]; then
 fi
 [ -n "$DFLASH_CACHE_TYPE_K" ]      && CMD+=(--cache-type-k "$DFLASH_CACHE_TYPE_K")
 [ -n "$DFLASH_CACHE_TYPE_V" ]      && CMD+=(--cache-type-v "$DFLASH_CACHE_TYPE_V")
-[ -n "$DFLASH_KV_CACHE_DIR" ]      && CMD+=(--kv-cache-dir "$DFLASH_KV_CACHE_DIR" \
-                                            --cache-prefix-disk "$DFLASH_CACHE_PREFIX_DISK" \
-                                            --cache-prefill-disk "$DFLASH_CACHE_PREFILL_DISK")
+if [ -n "$DFLASH_KV_CACHE_DIR" ]; then
+    CMD+=(--kv-cache-dir "$DFLASH_KV_CACHE_DIR" --cache-disk "$DFLASH_CACHE_DISK")
+    [ -n "${DFLASH_CACHE_PREFIX_DISK+x}" ]  && CMD+=(--cache-prefix-disk "$DFLASH_CACHE_PREFIX_DISK")
+    [ -n "${DFLASH_CACHE_PREFILL_DISK+x}" ] && CMD+=(--cache-prefill-disk "$DFLASH_CACHE_PREFILL_DISK")
+fi
 [ "$DFLASH_FA_WINDOW" -gt 0 ] 2>/dev/null && CMD+=(--fa-window "$DFLASH_FA_WINDOW")
 # Soft-close ratio: emit only when nonzero. The default-string compare
 # guards against the floating-point quirks of `[` numeric tests for
