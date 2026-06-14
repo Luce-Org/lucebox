@@ -66,6 +66,10 @@ static void add_step_tel(DeepSeek4StepTelemetry & dst, const DeepSeek4StepTeleme
     dst.ffn_cold_us += src.ffn_cold_us;
     dst.ffn_combine_us += src.ffn_combine_us;
     dst.ffn_partition_us += src.ffn_partition_us;
+    dst.ffn_hot_graph_builds += src.ffn_hot_graph_builds;
+    dst.ffn_hot_graph_hits += src.ffn_hot_graph_hits;
+    dst.ffn_cold_graph_builds += src.ffn_cold_graph_builds;
+    dst.ffn_cold_graph_hits += src.ffn_cold_graph_hits;
     dst.worker_us += src.worker_us;
     dst.worker_parent_write_us += src.worker_parent_write_us;
     dst.worker_parent_wait_us += src.worker_parent_wait_us;
@@ -77,6 +81,18 @@ static void add_step_tel(DeepSeek4StepTelemetry & dst, const DeepSeek4StepTeleme
     dst.worker_miss_eval_us += src.worker_miss_eval_us;
     dst.worker_request_bytes += src.worker_request_bytes;
     dst.worker_response_bytes += src.worker_response_bytes;
+    dst.worker_hot_graph_builds += src.worker_hot_graph_builds;
+    dst.worker_hot_graph_hits += src.worker_hot_graph_hits;
+    dst.worker_cold_graph_builds += src.worker_cold_graph_builds;
+    dst.worker_cold_graph_hits += src.worker_cold_graph_hits;
+    dst.worker_hot_graph_build_us += src.worker_hot_graph_build_us;
+    dst.worker_hot_input_us += src.worker_hot_input_us;
+    dst.worker_hot_compute_us += src.worker_hot_compute_us;
+    dst.worker_hot_read_us += src.worker_hot_read_us;
+    dst.worker_cold_graph_build_us += src.worker_cold_graph_build_us;
+    dst.worker_cold_input_us += src.worker_cold_input_us;
+    dst.worker_cold_compute_us += src.worker_cold_compute_us;
+    dst.worker_cold_read_us += src.worker_cold_read_us;
     dst.hc_post_ffn_us += src.hc_post_ffn_us;
     dst.output_us += src.output_us;
     dst.sample_us += src.sample_us;
@@ -100,8 +116,12 @@ static void log_step_tel(const char * phase,
         "step=%.1fms embed=%.1fms attn_build=%.1fms attn_compute=%.1fms attn_read=%.1fms "
         "route_build=%.1fms route_compute=%.1fms route_read=%.1fms route_select=%.1fms "
         "ffn=%.1fms hot=%.1fms cold=%.1fms combine=%.1fms partition=%.1fms worker=%.1fms "
+        "ffn_hot_graph_build=%llu ffn_hot_graph_hit=%llu ffn_cold_graph_build=%llu ffn_cold_graph_hit=%llu "
         "worker_write=%.1fms worker_wait=%.1fms worker_read=%.1fms worker_req_read=%.1fms "
         "worker_part=%.1fms worker_resident=%.1fms worker_miss_build=%.1fms worker_miss=%.1fms "
+        "worker_hot_graph_build=%llu worker_hot_graph_hit=%llu worker_cold_graph_build=%llu worker_cold_graph_hit=%llu "
+        "worker_hot_build=%.1fms worker_hot_input=%.1fms worker_hot_compute=%.1fms worker_hot_read=%.1fms "
+        "worker_cold_build=%.1fms worker_cold_input=%.1fms worker_cold_compute=%.1fms worker_cold_read=%.1fms "
         "worker_req_kib=%.1f worker_resp_kib=%.1f "
         "hc_pre=%.1fms hc_post=%.1fms output=%.1fms sample=%.1fms emit=%.1fms "
         "hot_sel=%d cold_sel=%d\n",
@@ -110,9 +130,17 @@ static void log_step_tel(const char * phase,
         ms(t.route_build_us), ms(t.route_compute_us), ms(t.route_read_us), ms(t.route_select_us),
         ms(t.ffn_eval_us), ms(t.ffn_hot_us), ms(t.ffn_cold_us), ms(t.ffn_combine_us),
         ms(t.ffn_partition_us), ms(t.worker_us),
+        (unsigned long long)t.ffn_hot_graph_builds, (unsigned long long)t.ffn_hot_graph_hits,
+        (unsigned long long)t.ffn_cold_graph_builds, (unsigned long long)t.ffn_cold_graph_hits,
         ms(t.worker_parent_write_us), ms(t.worker_parent_wait_us), ms(t.worker_parent_read_us),
         ms(t.worker_request_read_us), ms(t.worker_partition_us), ms(t.worker_resident_eval_us),
         ms(t.worker_miss_build_us), ms(t.worker_miss_eval_us),
+        (unsigned long long)t.worker_hot_graph_builds, (unsigned long long)t.worker_hot_graph_hits,
+        (unsigned long long)t.worker_cold_graph_builds, (unsigned long long)t.worker_cold_graph_hits,
+        ms(t.worker_hot_graph_build_us), ms(t.worker_hot_input_us),
+        ms(t.worker_hot_compute_us), ms(t.worker_hot_read_us),
+        ms(t.worker_cold_graph_build_us), ms(t.worker_cold_input_us),
+        ms(t.worker_cold_compute_us), ms(t.worker_cold_read_us),
         (double)t.worker_request_bytes / 1024.0,
         (double)t.worker_response_bytes / 1024.0,
         ms(t.hc_pre_attn_us + t.hc_pre_ffn_us),
@@ -309,6 +337,32 @@ static bool compute_worker_hot_placement_from_env(const DeepSeek4Weights & w,
     return true;
 }
 
+static bool load_ds4_placement_from_env(const DeepSeek4Weights & w,
+                                        const char * label,
+                                        MoeHybridPlacement & out,
+                                        std::string * err) {
+    const char * path = std::getenv("DFLASH_DS4_PLACEMENT_IN");
+    if (!path || !path[0]) return false;
+    MoeHybridPlacement placement;
+    if (!MoeHybridPlacement::load_json(path, placement, err)) {
+        return false;
+    }
+    if (!placement.matches(w.n_layer, w.n_expert, w.n_expert_used)) {
+        if (err) *err = "placement dimensions do not match DeepSeek4 model";
+        return false;
+    }
+    Ds4ExpertMemoryInfo placed_mem;
+    if (!compute_ds4_expert_memory_info(w, &placement, placed_mem, err)) {
+        return false;
+    }
+    std::fprintf(stderr,
+                 "[deepseek4] loaded placement: %s label=%s total_hot=%d\n",
+                 path, label ? label : "placement", placement.total_hot);
+    log_ds4_expert_memory_info(label ? label : "placement-in", placed_mem, w.n_layer);
+    out = std::move(placement);
+    return true;
+}
+
 }  // namespace
 
 DeepSeek4Backend::DeepSeek4Backend(const DeepSeek4BackendConfig & cfg)
@@ -463,7 +517,28 @@ bool DeepSeek4Backend::init_hybrid_model() {
     std::string err;
     const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
     const bool split_hip_hot_cpu_cold = env_ds4_hip_hot_cpu_cold_split();
-    if (split_hip_hot_cpu_cold) {
+    if (const char * stats_out = std::getenv("DFLASH_DS4_ROUTE_STATS_OUT")) {
+        if (stats_out[0]) {
+            routing_stats_ = std::make_shared<MoeHybridRoutingStats>();
+            if (!routing_stats_->init(w_.n_layer, w_.n_expert, w_.n_expert_used)) {
+                std::fprintf(stderr, "[deepseek4] failed to initialize routing stats\n");
+                return false;
+            }
+            routing_stats_out_path_ = stats_out;
+            std::fprintf(stderr, "[deepseek4] route stats output enabled: %s\n",
+                         routing_stats_out_path_.c_str());
+        }
+    }
+    if (const char * placement_in = std::getenv("DFLASH_DS4_PLACEMENT_IN");
+        placement_in && placement_in[0]) {
+        if (!load_ds4_placement_from_env(w_,
+                split_hip_hot_cpu_cold ? "split-worker-hot" : "placement",
+                moe_placement_, &err)) {
+            std::fprintf(stderr, "[deepseek4] failed to load placement: %s\n", err.c_str());
+            return false;
+        }
+        expert_worker_owns_hot_ids_ = split_hip_hot_cpu_cold;
+    } else if (split_hip_hot_cpu_cold) {
         if (!compute_worker_hot_placement_from_env(w_, moe_placement_, &err)) {
             std::fprintf(stderr, "[deepseek4] failed to compute split placement: %s\n", err.c_str());
             return false;
@@ -572,7 +647,8 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (!deepseek4_step(backend_, w_, cache_, embed.data(), n_tok, pos, logits,
                             moe_hybrid_.get(), tokens.data() + i, expert_worker_.get(),
                             expert_worker_owns_hot_ids_,
-                            timing ? &step_tel : nullptr)) {
+                            timing ? &step_tel : nullptr,
+                            routing_stats_.get())) {
             std::fprintf(stderr, "[deepseek4] prefill step failed at pos=%d\n", pos);
             return -1;
         }
@@ -633,7 +709,8 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
                                 pos, logits,
                                 moe_hybrid_.get(), &tok_to_eval, expert_worker_.get(),
                                 expert_worker_owns_hot_ids_,
-                                timing ? &step_tel : nullptr)) {
+                                timing ? &step_tel : nullptr,
+                                routing_stats_.get())) {
                 std::fprintf(stderr, "[deepseek4] decode step failed\n");
                 return false;
             }
@@ -688,6 +765,7 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
 
     if (req.n_gen <= 0) {
         result.ok = true;
+        maybe_save_routing_stats();
         return result;
     }
 
@@ -707,6 +785,7 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
     result.tokens = std::move(gen_tokens);
     result.decode_s = elapsed_s(t1);
     result.budget_forced_close = forced_close;
+    maybe_save_routing_stats();
     return result;
 }
 
@@ -751,13 +830,25 @@ void DeepSeek4Backend::free_drafter() {
     // No drafter in AR-only mode
 }
 
+void DeepSeek4Backend::maybe_save_routing_stats() {
+    if (!routing_stats_ || routing_stats_out_path_.empty()) return;
+    std::string err;
+    if (!routing_stats_->save_csv(routing_stats_out_path_, &err)) {
+        std::fprintf(stderr, "[deepseek4] failed to save routing stats %s: %s\n",
+                     routing_stats_out_path_.c_str(), err.c_str());
+    }
+}
+
 void DeepSeek4Backend::shutdown() {
+    maybe_save_routing_stats();
     for (int i = 0; i < PREFIX_SLOTS; i++) {
         free_deepseek4_snapshot(snapshots_[i]);
     }
     free_deepseek4_cache(cache_);
     expert_worker_.reset();
     moe_hybrid_.reset();
+    routing_stats_.reset();
+    routing_stats_out_path_.clear();
     moe_placement_ = {};
     free_deepseek4_weights(w_);
     if (snap_backend_) { ggml_backend_free(snap_backend_); snap_backend_ = nullptr; }

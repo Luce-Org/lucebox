@@ -29,6 +29,7 @@ namespace dflash::common {
 
 struct MoeHybridPlacement;
 struct MoeHybridConfig;
+struct MoeHybridRoutingStats;
 class DeepSeek4ExpertIpcClient;
 
 struct DeepSeek4StepTelemetry {
@@ -49,6 +50,10 @@ struct DeepSeek4StepTelemetry {
     uint64_t ffn_cold_us = 0;
     uint64_t ffn_combine_us = 0;
     uint64_t ffn_partition_us = 0;
+    uint64_t ffn_hot_graph_builds = 0;
+    uint64_t ffn_hot_graph_hits = 0;
+    uint64_t ffn_cold_graph_builds = 0;
+    uint64_t ffn_cold_graph_hits = 0;
     uint64_t worker_us = 0;
     uint64_t worker_parent_write_us = 0;
     uint64_t worker_parent_wait_us = 0;
@@ -60,6 +65,18 @@ struct DeepSeek4StepTelemetry {
     uint64_t worker_miss_eval_us = 0;
     uint64_t worker_request_bytes = 0;
     uint64_t worker_response_bytes = 0;
+    uint64_t worker_hot_graph_builds = 0;
+    uint64_t worker_hot_graph_hits = 0;
+    uint64_t worker_cold_graph_builds = 0;
+    uint64_t worker_cold_graph_hits = 0;
+    uint64_t worker_hot_graph_build_us = 0;
+    uint64_t worker_hot_input_us = 0;
+    uint64_t worker_hot_compute_us = 0;
+    uint64_t worker_hot_read_us = 0;
+    uint64_t worker_cold_graph_build_us = 0;
+    uint64_t worker_cold_input_us = 0;
+    uint64_t worker_cold_compute_us = 0;
+    uint64_t worker_cold_read_us = 0;
     uint64_t hc_post_ffn_us = 0;
     uint64_t output_us = 0;
     uint64_t sample_us = 0;
@@ -300,7 +317,8 @@ bool deepseek4_step(
     const int32_t *             token_ids = nullptr,
     DeepSeek4ExpertIpcClient *  expert_worker = nullptr,
     bool                        worker_owns_hot_ids = false,
-    DeepSeek4StepTelemetry *    telemetry = nullptr);
+    DeepSeek4StepTelemetry *    telemetry = nullptr,
+    MoeHybridRoutingStats *     routing_stats = nullptr);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,

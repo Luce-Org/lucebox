@@ -163,6 +163,8 @@ int main(int argc, char ** argv) {
     const char * placement_path = nullptr;
     const char * ds4_expert_budget_mb = nullptr;
     const char * ds4_expert_offset = nullptr;
+    const char * ds4_placement_in = nullptr;
+    bool ds4_fixed_slot_graphs = false;
     for (int i = arg_begin; i < argc; i++) {
         if (std::strncmp(argv[i], "--ring-cap=", 11) == 0) {
             if (!parse_nonnegative_int(argv[i] + 11, ring_cap)) return 2;
@@ -296,6 +298,12 @@ int main(int argc, char ** argv) {
             ds4_expert_offset = argv[i] + 16;
         } else if (std::strcmp(argv[i], "--expert-offset") == 0) {
             if (i + 1 < argc) ds4_expert_offset = argv[++i];
+        } else if (std::strncmp(argv[i], "--placement-in=", 15) == 0) {
+            ds4_placement_in = argv[i] + 15;
+        } else if (std::strcmp(argv[i], "--placement-in") == 0) {
+            if (i + 1 < argc) ds4_placement_in = argv[++i];
+        } else if (std::strcmp(argv[i], "--fixed-slot-graphs") == 0) {
+            ds4_fixed_slot_graphs = true;
         } else {
             std::fprintf(stderr, "[backend-ipc-daemon] unknown option: %s\n", argv[i]);
             return 2;
@@ -310,6 +318,12 @@ int main(int argc, char ** argv) {
     }
     if (ds4_expert_offset) {
         setenv("DFLASH_DS4_EXPERT_WORKER_OFFSET", ds4_expert_offset, 1);
+    }
+    if (ds4_placement_in) {
+        setenv("DFLASH_DS4_PLACEMENT_IN", ds4_placement_in, 1);
+    }
+    if (ds4_fixed_slot_graphs) {
+        setenv("DFLASH_MOE_FIXED_SLOT_GRAPHS", "1", 1);
     }
 
     switch (mode) {

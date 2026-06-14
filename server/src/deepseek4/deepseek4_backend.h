@@ -10,6 +10,7 @@
 #include "common/sampler.h"
 #include "../common/deepseek4_expert_ipc.h"
 #include "../common/moe_hybrid_placement.h"
+#include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_storage.h"
 #include "deepseek4_internal.h"
 
@@ -91,11 +92,14 @@ private:
                                           int max_ctx,
                                           MoeHybridPlacement & out,
                                           std::string * err) const;
+    void maybe_save_routing_stats();
 
     std::shared_ptr<MoeHybridStorage> moe_hybrid_;
     MoeHybridPlacement                moe_placement_;
     std::unique_ptr<DeepSeek4ExpertIpcClient> expert_worker_;
     bool                              expert_worker_owns_hot_ids_ = false;
+    std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
+    std::string                       routing_stats_out_path_;
 };
 
 }  // namespace dflash::common

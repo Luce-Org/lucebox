@@ -94,6 +94,18 @@ struct MoeHybridFfnTelemetry {
     uint64_t cold_us = 0;
     uint64_t shared_us = 0;
     uint64_t combine_us = 0;
+    uint64_t hot_graph_build_us = 0;
+    uint64_t hot_input_us = 0;
+    uint64_t hot_compute_us = 0;
+    uint64_t hot_read_us = 0;
+    uint64_t cold_graph_build_us = 0;
+    uint64_t cold_input_us = 0;
+    uint64_t cold_compute_us = 0;
+    uint64_t cold_read_us = 0;
+    uint64_t hot_graph_builds = 0;
+    uint64_t hot_graph_hits = 0;
+    uint64_t cold_graph_builds = 0;
+    uint64_t cold_graph_hits = 0;
     int hot_selected = 0;
     int cold_selected = 0;
 };
