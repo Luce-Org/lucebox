@@ -798,6 +798,7 @@ static ggml_tensor * build_delta_net_block(
                 ci_len, cap->conv_input->ne[1], cap->conv_input->ne[2],
                 cap->conv_input->nb[1], cap->conv_input->nb[2], 0);
         }
+        GGML_ASSERT(ggml_nelements(conv_input) == ggml_nelements(dst));
         ggml_build_forward_expand(gf, ggml_cpy(ctx, conv_input, dst));
     }
 
@@ -959,6 +960,7 @@ static ggml_tensor * build_delta_net_block(
             S_v * S_v * r_elt,
             S_v * S_v * H_v * r_elt,
             inter_offset);
+        GGML_ASSERT(ggml_nelements(inter_view) == ggml_nelements(cap->ssm_intermediate_states));
         ggml_build_forward_expand(gf,
             ggml_cpy(ctx, inter_view, cap->ssm_intermediate_states));
     }

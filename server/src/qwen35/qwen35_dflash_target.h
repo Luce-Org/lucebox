@@ -36,10 +36,13 @@ public:
     bool verify_batch(const std::vector<int32_t> & tokens,
                       int base_pos,
                       int & last_tok,
-                      std::vector<int32_t> * all_argmax = nullptr) override;
+                      std::vector<int32_t> * all_argmax = nullptr,
+                      bool capture_ssm_intermediates = false) override;
 
     bool snapshot_kv() override;
     bool restore_kv() override;
+    bool supports_fast_rollback() const override;
+    bool rollback_to(int base_pos, int commit_n) override;
 
     bool is_eos(int token) const override;
 
@@ -62,6 +65,10 @@ public:
     // Forces fa_window = 0 (logical windowing is meaningless in slot space).
     void set_kvflash_pager(KvFlashPager * pager) { pager_ = pager; }
 
+    // Enable fast-rollback mode: verify will capture per-step SSM intermediates
+    // so rollback_to() can restore recurrent state without replay.
+    void set_fast_rollback(bool enabled) { fast_rollback_ = enabled; }
+
 private:
     TargetWeights & w_;
     TargetCache & cache_;
@@ -70,6 +77,7 @@ private:
     int kq_stride_pad_;
     int fa_window_;
     KvFlashPager * pager_ = nullptr;
+    bool fast_rollback_ = false;
 
     // Cached vector form of capture layer IDs (built once in constructor).
     std::vector<int> capture_ids_;

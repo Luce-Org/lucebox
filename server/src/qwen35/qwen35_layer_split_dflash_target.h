@@ -39,7 +39,8 @@ public:
     bool verify_batch(const std::vector<int32_t> & tokens,
                       int base_pos,
                       int & last_tok,
-                      std::vector<int32_t> * all_argmax = nullptr) override;
+                      std::vector<int32_t> * all_argmax = nullptr,
+                      bool capture_ssm_intermediates = false) override;
 
     bool snapshot_kv() override;
     bool restore_kv() override;
