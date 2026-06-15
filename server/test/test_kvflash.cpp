@@ -18,7 +18,8 @@
 //
 // Usage:
 //   test_kvflash <qwen35.gguf> [--logical-ctx=N] [--pool-b=N] [--pool-c=N]
-//                 [--prompt=N] [--gen=N] [--skip-profile] [--no-mask]
+//                 [--prompt=N] [--gen=N] [--skip-profile] [--skip-indexer]
+//                 [--no-mask]
 //   modes: (default) verification suite A-F | --niah | --niah256 | --longab
 
 #include "dflash27b.h"
@@ -395,7 +396,8 @@ StepTimes summarize(std::vector<double> & ms) {
 int main(int argc, char ** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: %s <qwen35.gguf> [--logical-ctx=N] [--pool-b=N] "
-                             "[--pool-c=N] [--prompt=N] [--gen=N] [--skip-profile]\n", argv[0]);
+                             "[--pool-c=N] [--prompt=N] [--gen=N] "
+                             "[--skip-profile] [--skip-indexer]\n", argv[0]);
         return 2;
     }
     const int logical_ctx = arg_int(argc, argv, "--logical-ctx", 131072);
@@ -404,6 +406,7 @@ int main(int argc, char ** argv) {
     const int n_prompt    = arg_int(argc, argv, "--prompt", 512);
     const int n_gen       = arg_int(argc, argv, "--gen", 1200);
     const bool skip_prof  = arg_flag(argc, argv, "--skip-profile");
+    const bool skip_indexer = arg_flag(argc, argv, "--skip-indexer");
     // Explicit pool slot mask: exact exclusion of non-resident slots.
     // ON by default (requires the per-step re-upload in refresh_mask: the
     // mask input's compute-buffer region is clobbered by graph execution).
@@ -925,7 +928,7 @@ int main(int argc, char ** argv) {
     // indexer query), score_hook gets the fresh chunk scores, and
     // reselect() repages the pool. PASS requires at least one genuine
     // drafter-driven recall of a chunk evicted earlier.
-    {
+    if (!skip_indexer) {
         const char * drafter_path = kvflash_drafter_path();
         DrafterContext dctx;
         if (!load_drafter(drafter_path, 0, dctx)) {
@@ -998,6 +1001,8 @@ int main(int argc, char ** argv) {
             free_target_cache(cache);
             free_drafter(dctx);
         }
+    } else {
+        std::printf("SKIP indexer run (--skip-indexer)\n");
     }
 
     // ── Run E: performance profile ──────────────────────────────────
