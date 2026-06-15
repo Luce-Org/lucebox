@@ -175,6 +175,39 @@ struct ServerConfig {
     // the Anthropic tool_use envelope, e.g. froggeric Qwen3.6 template.
     std::string chat_template_src;          // literal Jinja source (loaded from file)
     std::string chat_template_path;         // path it was loaded from (logged at startup)
+
+    // ── /props identity payloads (filled by server_main at startup) ──
+    //
+    // `target_gguf` / `draft_gguf`: JSON blobs produced by reading the GGUF
+    // header + sha256 for each loaded model. Surface verbatim under
+    // /props.model.target / /props.model.draft so an operator can pin the
+    // exact weights + quant + sha from a single curl. Empty/null when
+    // not loaded; `draft_gguf` is null when --draft was not passed.
+    // See docs/specs/props-endpoint.md §4.8 and build_props_body().
+    nlohmann::json target_gguf = nullptr;
+    nlohmann::json draft_gguf  = nullptr;
+
+    // `image_info`: container/image identity read from /opt/lucebox-hub/
+    // IMAGE_INFO at server start. Three lines: git_sha, image_tag,
+    // build_time (ISO 8601). Object with three string fields or null
+    // when the file is missing (e.g. local non-Docker builds). Surfaced
+    // under /props.build as git_sha/image_tag/build_time. Path overridable
+    // via $DFLASH_IMAGE_INFO_PATH for tests.
+    nlohmann::json image_info = nullptr;
+
+    // `host_info`: host-identity facts read from /opt/lucebox-hub/HOST_INFO
+    // at server start. JSON object written by server/scripts/entrypoint.sh
+    // from the LUCEBOX_HOST_* env vars the host wrapper exports. Surfaced
+    // verbatim under /props.host so every benchmark snapshot can self-
+    // classify the rig it ran on (OS, kernel, WSL version, GPU list with
+    // per-GPU UUID/PCI/SM/VRAM/power, nvidia driver + CTK versions).
+    // Null when the file is missing (e.g. bare-metal dev or someone ran
+    // `docker run` without lucebox.sh — entrypoint still writes a stub
+    // {"source":"unknown",...} so this is null only on the bare-metal
+    // path that bypasses entrypoint entirely). Path overridable via
+    // $DFLASH_HOST_INFO_PATH for tests. See HOST_INFO doc at
+    // docs/specs/props-endpoint.md §4.10.
+    nlohmann::json host_info = nullptr;
 };
 
 // ─── Parsed request ─────────────────────────────────────────────────────
@@ -215,6 +248,12 @@ struct ParsedRequest {
     // Bandit: per-session adaptive keep_ratio opt-in
     std::string               session_id;
     DiskPrefixCachePolicy     disk_cache_policy;
+    // Set by the chat-template renderer when the rendered prompt suffix
+    // pre-opens a `<think>` block (Qwen3.6 / Laguna enable_thinking path).
+    // Drives the SseEmitter's initial mode so reasoning tokens emitted
+    // before any explicit `<think>` opener route to reasoning_content
+    // instead of leaking into content.
+    bool                      started_in_thinking = false;
 };
 
 // Build the /props response body. Exposed (non-static) so unit tests

@@ -27,6 +27,23 @@ enum class ChatFormat {
     GEMMA4,    // <bos><|turn>role\n...<turn|>\n
 };
 
+// Provenance for a rendered prompt. `text` is the byte string that gets
+// tokenized; `started_in_thinking` records whether the prompt suffix
+// pre-opens a `<think>` block (or equivalent reasoning-channel marker)
+// that the model is expected to continue into.
+//
+// Callers route this into the SseEmitter's initial mode and into
+// parse_reasoning()'s `started_in_thinking` argument so reasoning text
+// emitted before any explicit `<think>` opener is still attributed to
+// the reasoning channel. Without this plumbing, Qwen3.6 / Laguna
+// enable_thinking prompts (which pre-open `<think>\n` in the assistant
+// turn) cause the model to emit reasoning straight into the content
+// channel, leaving `reasoning_content` empty.
+struct PromptRenderResult {
+    std::string text;            // rendered prompt text, ready to tokenize
+    bool started_in_thinking;    // prompt suffix opens reasoning channel
+};
+
 // Render chat messages into the model-specific prompt string.
 // The result is plain text ready to be tokenized.
 //
@@ -40,7 +57,7 @@ enum class ChatFormat {
 // `tools_json` is an optional JSON string containing the tool definitions
 // array. When non-empty, the Qwen3/3.5 template injects a tool preamble
 // into the system message instructing the model how to emit <tool_call> tags.
-std::string render_chat_template(
+PromptRenderResult render_chat_template(
     const std::vector<ChatMessage> & messages,
     ChatFormat format,
     bool add_generation_prompt = true,
@@ -67,7 +84,7 @@ ChatFormat chat_format_for_arch(const std::string & arch);
 // Internally caches the most recently parsed program per thread (avoids
 // re-parsing the template on every request). Throws std::runtime_error on
 // lexer/parser/runtime failure (caller should surface a 500 response).
-std::string render_chat_template_jinja(
+PromptRenderResult render_chat_template_jinja(
     const std::string & template_src,
     const std::vector<ChatMessage> & messages,
     const std::string & bos_token,
