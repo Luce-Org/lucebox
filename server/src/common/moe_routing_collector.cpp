@@ -1,5 +1,6 @@
 #include "moe_routing_collector.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 
@@ -29,10 +30,20 @@ void MoeRoutingCollector::record(int layer_idx, const float * hidden, int n_embd
 
     int32_t li = layer_idx;
     int32_t ki = K;
-    std::fwrite(&li, sizeof(int32_t), 1, fd_);
-    std::fwrite(&ki, sizeof(int32_t), 1, fd_);
-    std::fwrite(hidden, sizeof(float), (size_t)n_embd, fd_);
-    std::fwrite(expert_ids, sizeof(int32_t), (size_t)K, fd_);
+    // A short write desyncs the fixed-layout binary stream: every subsequent
+    // record would be misaligned and the file silently unparseable. Treat any
+    // partial write as fatal for this file — stop writing and don't count the
+    // sample, rather than emitting corrupt training data with an inflated count.
+    if (std::fwrite(&li, sizeof(int32_t), 1, fd_) != 1 ||
+        std::fwrite(&ki, sizeof(int32_t), 1, fd_) != 1 ||
+        std::fwrite(hidden, sizeof(float), (size_t)n_embd, fd_) != (size_t)n_embd ||
+        std::fwrite(expert_ids, sizeof(int32_t), (size_t)K, fd_) != (size_t)K) {
+        std::fprintf(stderr, "[routing-collector] write error after %lld samples: %s\n",
+                     (long long)samples_, std::strerror(errno));
+        std::fclose(fd_);
+        fd_ = nullptr;
+        return;
+    }
     samples_++;
 }
 
@@ -41,7 +52,8 @@ void MoeRoutingCollector::close() {
     if (!fd_) return;
     std::fclose(fd_);
     fd_ = nullptr;
-    std::fprintf(stderr, "[routing-collector] closed, %d samples written\n", samples_);
+    std::fprintf(stderr, "[routing-collector] closed, %lld samples written\n",
+                 (long long)samples_);
 }
 
 }  // namespace dflash::common

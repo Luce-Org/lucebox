@@ -327,7 +327,16 @@ struct ModelBackend {
     // Set an external routing collector that the backend will call for each
     // token/layer during decode (hidden state + expert IDs). Used by
     // --collect-routing for predictor training data.
-    virtual void set_routing_collector(class MoeRoutingCollector *) {}
+    //
+    // Lifetime: the collector pointer is borrowed, not owned. The caller must
+    // keep it alive until set_routing_collector(nullptr) is called (or the
+    // backend is destroyed), and must not pass a collector to a backend that
+    // decodes on another thread without outliving that decode.
+    //
+    // Returns true if the backend supports routing collection (MoE backends).
+    // The default returns false so the server can detect unsupported backends
+    // and warn instead of silently collecting nothing.
+    virtual bool set_routing_collector(class MoeRoutingCollector *) { return false; }
 
     // Get the current routing stats (if tracked). Returns nullptr if the
     // backend does not support routing stats or they are not enabled.

@@ -71,11 +71,12 @@ Usage:
         --epochs 10 --lr 1e-4
 """
 
-import sys
-import struct
 import random
-import numpy as np
+import struct
+import sys
 from pathlib import Path
+
+import numpy as np
 
 HIDDEN_DIM = 2048   # Qwen3.6-35B-A3B default; override via --hidden-dim
 NUM_EXPERTS = 256   # Qwen3.6-35B-A3B default; override via --num-experts
@@ -111,10 +112,20 @@ def load_routing_data(path, hidden_dim):
         hiddens.append(h)
         experts.append(ei)
 
+    # Empty or fully-truncated file: return well-formed empty arrays rather
+    # than crashing in np.stack([]) / max([]).
+    if not experts:
+        return (np.array([], dtype=np.int32),
+                np.zeros((0, hidden_dim), dtype=np.float32),
+                np.zeros((0, 0), dtype=np.int32), 0)
+
     layers = np.array(layers, dtype=np.int32)
     hiddens = np.stack(hiddens)
     max_K = max(len(e) for e in experts)
-    experts_padded = np.zeros((len(experts), max_K), dtype=np.int32)
+    # Pad with -1 (not 0): 0 is a valid expert index, so a 0 sentinel would be
+    # indistinguishable from a real top-0 routing and corrupt labels/eval when
+    # K varies across records. Consumers filter out negative indices.
+    experts_padded = np.full((len(experts), max_K), -1, dtype=np.int32)
     for i, e in enumerate(experts):
         experts_padded[i, :len(e)] = e
 
@@ -139,6 +150,10 @@ def load_multiple_routing_files(paths, hidden_dim, num_layers, seed=42):
     for path in paths:
         layers, hiddens, experts, K = load_routing_data(path, hidden_dim=hidden_dim)
         n_records = len(layers)
+        if n_records == 0:
+            print(f"  WARNING: {Path(path).name}: no usable records (empty or "
+                  "truncated); skipping.")
+            continue
         if n_records % num_layers != 0:
             n_trunc = (n_records // num_layers) * num_layers
             print(f"  WARNING: {path}: {n_records} records not divisible by "
@@ -149,6 +164,12 @@ def load_multiple_routing_files(paths, hidden_dim, num_layers, seed=42):
             n_records = n_trunc
 
         n_tokens = n_records // num_layers
+        if n_tokens == 0:
+            # Fewer than one full token's worth of records after truncation:
+            # contributes no tokens, so don't let its K inflate the global pad
+            # width (which would force needless -1 padding on every other file).
+            print(f"  WARNING: {Path(path).name}: <1 token after truncation; skipping.")
+            continue
         max_K_global = max(max_K_global, K)
 
         for t in range(n_tokens):
@@ -159,9 +180,15 @@ def load_multiple_routing_files(paths, hidden_dim, num_layers, seed=42):
 
         print(f"  {Path(path).name}: {n_tokens} tokens ({n_records} records), K={K}")
 
-    # Pad all expert arrays to global max_K so they can be stacked
+    if not token_layers:
+        print("ERROR: no usable routing records loaded from any file.")
+        sys.exit(1)
+
+    # Pad all expert arrays to global max_K so they can be stacked. Pad with -1
+    # (not the np.pad default of 0): 0 is a valid expert index. Consumers filter
+    # out negative indices.
     token_experts = [
-        np.pad(e, ((0, 0), (0, max_K_global - e.shape[1])))
+        np.pad(e, ((0, 0), (0, max_K_global - e.shape[1])), constant_values=-1)
         if e.shape[1] < max_K_global else e
         for e in token_experts
     ]
@@ -197,6 +224,7 @@ def fp_threshold_loss(logits, targets, threshold=0.75, beta=5.0):
     beta controls the trade-off: higher beta → fewer FP above threshold, lower recall.
     """
     import math
+
     import torch.nn.functional as F
     t_star = math.log(threshold / (1.0 - threshold))
     bce = F.binary_cross_entropy_with_logits(logits, targets)
@@ -214,7 +242,6 @@ def eval_threshold_metrics(logits_np, E_test, threshold=0.75):
       fp_rate    — fraction of samples that contain ≥ 1 false positive above threshold
       n_pred     — total number of experts predicted above threshold
     """
-    import math
     probs = 1.0 / (1.0 + np.exp(-logits_np))   # sigmoid
     above = probs >= threshold                   # (N, num_experts) bool
 
@@ -249,7 +276,9 @@ def build_target_multilabel(expert_indices, num_experts):
     targets = np.zeros((N, num_experts), dtype=np.float32)
     for i in range(N):
         for j in range(expert_indices.shape[1]):
-            targets[i, expert_indices[i, j]] = 1.0
+            e = expert_indices[i, j]
+            if e >= 0:  # skip -1 padding (0 is a valid expert index)
+                targets[i, e] = 1.0
     return targets
 
 
@@ -392,8 +421,7 @@ def train_and_evaluate(layers, hiddens, experts, K, n_tokens,
     """
     try:
         import torch
-        import torch.nn as nn
-        from torch.utils.data import TensorDataset, DataLoader
+        from torch.utils.data import DataLoader, TensorDataset
     except ImportError:
         print("ERROR: pip install torch")
         sys.exit(1)
@@ -412,10 +440,10 @@ def train_and_evaluate(layers, hiddens, experts, K, n_tokens,
     temporal_total = 0
     for i in range(len(layers)):
         li = int(layers[i])
-        ei = set(experts[i].tolist())
+        ei = set(int(x) for x in experts[i] if x >= 0)  # drop -1 padding
         if li in prev_experts:
             temporal_hits += len(ei & prev_experts[li])
-            temporal_total += K
+            temporal_total += len(ei)  # real experts only, not padded K
         prev_experts[li] = ei
     if temporal_total > 0:
         print(f"  Temporal hit rate: {temporal_hits}/{temporal_total} = "
@@ -504,6 +532,12 @@ def train_and_evaluate(layers, hiddens, experts, K, n_tokens,
         E_test      = experts[test_idx]
         layers_test = layers[test_idx]
 
+    if len(train_idx) == 0 or len(test_idx) == 0:
+        print(f"ERROR: empty split (train={len(train_idx)}, test={len(test_idx)} "
+              f"samples). Need more data, fewer --skip-layers, or a different "
+              f"train/test ratio (n_tokens={n_tokens}).")
+        sys.exit(1)
+
     train_ds = TensorDataset(X_train, L_train, Y_train)
     train_dl = DataLoader(train_ds, batch_size=256, shuffle=True)
 
@@ -520,9 +554,13 @@ def train_and_evaluate(layers, hiddens, experts, K, n_tokens,
 
     def eval_hit_rate(logits_np, E, k):
         preds = np.argsort(-logits_np, axis=1)[:, :k]
-        hits = sum(len(set(E[i].tolist()) & set(preds[i].tolist()))
-                   for i in range(len(E)))
-        return hits, len(E) * K
+        hits = 0
+        total = 0
+        for i in range(len(E)):
+            actual = set(int(x) for x in E[i] if x >= 0)  # drop -1 padding
+            hits += len(actual & set(preds[i].tolist()))
+            total += len(actual)  # real experts only, not padded K
+        return hits, total
 
     def run_eval():
         model.eval()
@@ -597,8 +635,9 @@ def train_and_evaluate(layers, hiddens, experts, K, n_tokens,
     layer_total = np.zeros(num_layers)
     for i in range(len(E_test)):
         li = int(layers_test[i])
-        layer_hits[li]  += len(set(E_test[i].tolist()) & set(pred_indices[i].tolist()))
-        layer_total[li] += K
+        actual = set(int(x) for x in E_test[i] if x >= 0)  # drop -1 padding
+        layer_hits[li]  += len(actual & set(pred_indices[i].tolist()))
+        layer_total[li] += len(actual)  # real experts only, not padded K
 
     print(f"\nPer-layer top-{K_pred} hit rates:")
     for li in range(num_layers):
@@ -638,8 +677,9 @@ def train_and_evaluate(layers, hiddens, experts, K, n_tokens,
 
 
 if __name__ == '__main__':
-    import torch
     import argparse
+
+    import torch
 
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -658,12 +698,14 @@ if __name__ == '__main__':
                         help='Predictor architecture (default: mlp). '
                              'linear-cross = Fate cross-layer approach (recommended).')
     parser.add_argument('--hidden-dim', type=int, default=None,
-                        help='Hidden state dimension (default: 4096). '
+                        help=f'Hidden state dimension (default: {HIDDEN_DIM}). '
                              'Use 2048 for 35B, 3072 for 122B.')
     parser.add_argument('--num-experts', type=int, default=None,
-                        help='Number of experts (default: 512). Use 256 for 35B/122B.')
+                        help=f'Number of experts (default: {NUM_EXPERTS}). '
+                             'Use 256 for 35B/122B.')
     parser.add_argument('--num-layers', type=int, default=None,
-                        help='Number of layers (default: 60). Use 40 for 35B, 48 for 122B.')
+                        help=f'Number of layers (default: {NUM_LAYERS}). '
+                             'Use 40 for 35B, 48 for 122B.')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for token shuffle (default: 42).')
     parser.add_argument('--save-model', metavar='PATH',
@@ -687,6 +729,11 @@ if __name__ == '__main__':
                         help='Dropout rate applied after each hidden layer in MLP models '
                              '(default: 0.1). Set to 0 to disable.')
     args = parser.parse_args()
+
+    # --threshold feeds log(threshold / (1 - threshold)); guard the domain so
+    # values <= 0 or >= 1 fail fast instead of crashing mid-training.
+    if not 0.0 < args.threshold < 1.0:
+        parser.error(f"--threshold must be in the open interval (0, 1), got {args.threshold}")
 
     # Resolve model dimensions (CLI overrides > defaults)
     hidden_dim   = args.hidden_dim   if args.hidden_dim   is not None else HIDDEN_DIM

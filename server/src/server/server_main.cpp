@@ -641,9 +641,17 @@ int main(int argc, char ** argv) {
     // the backends already check. This ensures both laguna and qwen35moe
     // allocate their routing_stats_ so we can print freq analysis at shutdown.
     if (sconfig.freq_tracking || !sconfig.collect_routing_path.empty()) {
-        // Enable routing stats on all MoE backends (env vars are "no overwrite")
-        setenv("DFLASH_QWEN35MOE_RUNTIME_STATS_OUT", "/dev/null", 0);
-        setenv("DFLASH_LAGUNA_NEXT_PLACEMENT_OUT", "/dev/null", 0);
+        // Enable routing stats on all MoE backends. An explicit CLI flag must
+        // guarantee stats are allocated, but setenv(overwrite=0) would leave a
+        // pre-existing EMPTY env var in place — and the backends treat an empty
+        // path as "disabled", so --freq/--collect-routing would silently no-op.
+        // Force the value when unset or empty; preserve a non-empty user path.
+        auto ensure_stats_env = [](const char * name, const char * val) {
+            const char * cur = std::getenv(name);
+            if (!cur || cur[0] == '\0') setenv(name, val, 1);
+        };
+        ensure_stats_env("DFLASH_QWEN35MOE_RUNTIME_STATS_OUT", "/dev/null");
+        ensure_stats_env("DFLASH_LAGUNA_NEXT_PLACEMENT_OUT", "/dev/null");
     }
 
     // Explicit --cache-type-k/v override via env vars.
@@ -1186,7 +1194,12 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "[server] failed to open routing collector output\n");
             return 1;
         }
-        backend->set_routing_collector(&routing_collector);
+        if (!backend->set_routing_collector(&routing_collector)) {
+            std::fprintf(stderr, "[server] --collect-routing: this backend does not "
+                                 "support routing collection (model may not be MoE); "
+                                 "no data will be written\n");
+            routing_collector.close();
+        }
     }
 
     int ret = server.run();

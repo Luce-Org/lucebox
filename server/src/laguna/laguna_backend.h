@@ -74,7 +74,7 @@ public:
 
     void shutdown() override;
 
-    void set_routing_collector(MoeRoutingCollector * c) override { routing_collector_ = c; }
+    bool set_routing_collector(MoeRoutingCollector * c) override { routing_collector_ = c; return true; }
     const MoeHybridRoutingStats * get_routing_stats() const override { return routing_stats_.get(); }
 
 private:

@@ -38,12 +38,12 @@ public:
     // Close and flush the output file. Prints summary to stderr.
     void close();
 
-    bool is_open() const { return fd_ != nullptr; }
-    int  sample_count() const { return samples_; }
+    bool    is_open() const { return fd_ != nullptr; }
+    int64_t sample_count() const { return samples_; }
 
 private:
     std::FILE * fd_ = nullptr;
-    int samples_ = 0;
+    int64_t samples_ = 0;  // wide: collection runs can exceed 2^31 samples
     std::mutex mu_;
 };
 

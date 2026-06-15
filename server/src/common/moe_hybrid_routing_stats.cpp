@@ -164,6 +164,12 @@ void MoeHybridRoutingStats::print_freq_analysis() const {
             if (!n80 && cum * 100 >= tact * 80) n80 = ie + 1;
             if (!n90 && cum * 100 >= tact * 90) n90 = ie + 1;
         }
+        // If there are fewer experts than a bucket size, the ie==N-1 check
+        // never fires and topN stays 0, printing a bogus 0%. cum == tact here
+        // (all experts summed), so the bucket covers everything → 100%.
+        if (n_expert < 10) top10 = cum;
+        if (n_expert < 30) top30 = cum;
+        if (n_expert < 60) top60 = cum;
         std::fprintf(stderr, "Layer %2d: %3d unique, top-10 %.0f%%, top-30 %.0f%%, top-60 %.0f%% "
                              "(50%%@%d, 80%%@%d, 90%%@%d)\n",
                      il, unique,
