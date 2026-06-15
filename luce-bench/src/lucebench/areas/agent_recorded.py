@@ -91,6 +91,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent.parent
 FIXTURE_PATH = SCRIPT_DIR / "fixtures" / "agent_recorded" / "cases.json"
 MULTI_TURN_FIXTURE_PATH = SCRIPT_DIR / "fixtures" / "agent_recorded" / "multi_turn_cases.json"
 AGENT_RECORDED_REPLAY_MODES = ("sequential", "exact-repeat")
+_PREFILL_SPEEDUP_MIN_WARM_S = 0.001
 
 # ── v1 (legacy single-turn) constants — see module docstring. ────────
 #
@@ -438,8 +439,8 @@ def _prefill_speedup(cold_row: dict[str, Any], warm_row: dict[str, Any]) -> floa
     """Return cold/warm prefill speedup when both rows provide signal."""
     cold_pf = cold_row.get("prefill_s")
     warm_pf = warm_row.get("prefill_s")
-    if cold_pf is not None and warm_pf is not None and warm_pf > 0.001:
-        return round(cold_pf / warm_pf, 2)
+    if cold_pf is not None and warm_pf is not None:
+        return round(float(cold_pf) / max(float(warm_pf), _PREFILL_SPEEDUP_MIN_WARM_S), 2)
     return None
 
 
@@ -1090,13 +1091,34 @@ def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     eligible_turns = [turn for turn in all_turns if turn.get("cache_eligible")]
     hit_turns = [turn for turn in eligible_turns if turn.get("restore")]
     miss_turns = [turn for turn in eligible_turns if not turn.get("restore")]
+    exact_repeat_rows = [r for r in rows if r.get("replay_mode") == "exact-repeat"]
+    exact_eligible_rows = [
+        r.get("warm") or {}
+        for r in exact_repeat_rows
+        if int(r.get("cache_eligible_turns") or 0) > 0
+    ]
+    exact_hit_rows = [
+        r.get("warm") or {}
+        for r in exact_repeat_rows
+        if int(r.get("cache_hit_turns") or 0) > 0
+    ]
+    exact_miss_rows = [
+        r.get("warm") or {}
+        for r in exact_repeat_rows
+        if int(r.get("cache_eligible_turns") or 0) > 0
+        and int(r.get("cache_hit_turns") or 0) == 0
+    ]
     final_turns = [
         (r.get("warm") or r.get("cold") or {})
         for r in rows
         if r.get("replay_mode") == "sequential"
     ]
     modes = sorted({r.get("replay_mode") or "exact-repeat" for r in rows})
-    cache_hit_rate = (100.0 * len(hit_turns) / len(eligible_turns)) if eligible_turns else 0.0
+    cache_eligible_count = len(eligible_turns) + len(exact_eligible_rows)
+    cache_hit_count = len(hit_turns) + len(exact_hit_rows)
+    cache_hit_rate = (
+        100.0 * cache_hit_count / cache_eligible_count if cache_eligible_count else 0.0
+    )
 
     # Per-verdict counts so the operator can see suitable_match vs
     # divergent_but_valid vs off_track without re-parsing rows.
@@ -1119,23 +1141,43 @@ def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "cold_decode_p50": _percentile(cold_decodes, 50.0),
         "warm_decode_p50": _percentile(warm_decodes, 50.0),
         "turns_total": len(all_turns),
-        "cache_eligible_turns": len(eligible_turns),
-        "cache_hit_turns": len(hit_turns),
+        "cache_eligible_turns": cache_eligible_count,
+        "cache_hit_turns": cache_hit_count,
         "cache_hit_rate": round(cache_hit_rate, 2),
         "turn_prefill_p50": _percentile(
             [t.get("prefill_s") for t in all_turns if t.get("prefill_s") is not None], 50.0,
         ),
         "cache_eligible_prefill_p50": _percentile(
-            [t.get("prefill_s") for t in eligible_turns if t.get("prefill_s") is not None], 50.0,
+            [
+                t.get("prefill_s")
+                for t in [*eligible_turns, *exact_eligible_rows]
+                if t.get("prefill_s") is not None
+            ],
+            50.0,
         ),
         "cache_hit_prefill_p50": _percentile(
-            [t.get("prefill_s") for t in hit_turns if t.get("prefill_s") is not None], 50.0,
+            [
+                t.get("prefill_s")
+                for t in [*hit_turns, *exact_hit_rows]
+                if t.get("prefill_s") is not None
+            ],
+            50.0,
         ),
         "cache_miss_prefill_p50": _percentile(
-            [t.get("prefill_s") for t in miss_turns if t.get("prefill_s") is not None], 50.0,
+            [
+                t.get("prefill_s")
+                for t in [*miss_turns, *exact_miss_rows]
+                if t.get("prefill_s") is not None
+            ],
+            50.0,
         ),
         "prefix_len_p50": _percentile(
-            [t.get("prefix_len") for t in eligible_turns if t.get("prefix_len") is not None], 50.0,
+            [
+                t.get("prefix_len")
+                for t in [*eligible_turns, *exact_eligible_rows]
+                if t.get("prefix_len") is not None
+            ],
+            50.0,
         ),
         "final_prefill_p50": _percentile(
             [t.get("prefill_s") for t in final_turns if t.get("prefill_s") is not None], 50.0,

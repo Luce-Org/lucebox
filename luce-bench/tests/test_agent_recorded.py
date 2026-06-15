@@ -631,6 +631,17 @@ def test_multi_turn_runner_exact_repeat_mode_keeps_full_prompt_probe(tmp_path, m
     assert rows[0]["warm"]["restore"] is True
     assert summary["replay_mode"] == "exact-repeat"
     assert summary["cache_speedup_p50"] == 17.5
+    assert summary["cache_eligible_turns"] == 1
+    assert summary["cache_hit_turns"] == 1
+    assert summary["cache_hit_rate"] == 100.0
+    assert summary["cache_eligible_prefill_p50"] == 0.2
+    assert summary["cache_hit_prefill_p50"] == 0.2
+    assert summary["prefix_len_p50"] == 7950
+
+
+def test_prefill_speedup_uses_one_millisecond_floor_for_zero_warm_prefill():
+    """A fully restored prefill can round to 0ms; report a lower-bound speedup."""
+    assert agent_recorded._prefill_speedup({"prefill_s": 3.5}, {"prefill_s": 0.0}) == 3500.0
 
 
 def test_multi_turn_runner_marks_judge_pending_without_reference(tmp_path, monkeypatch):
