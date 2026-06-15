@@ -222,19 +222,32 @@ bool run_dflash_spec_decode(
             replay_tok[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
         }
 
+        bool fast_rolled_back = false;
         if (use_fast_rollback) {
             // Fast rollback: restore SSM from intermediates, skip replay.
             // Implicit bonus: deferred to next step as draft_tok[0].
+            // Respect the generation budget: accept_n can exceed the remaining
+            // budget (need_commit_budget). Committing accept_n would both
+            // overrun the budget and grow replay_tok with zero-initialised
+            // tokens (it was sized to the clamped commit_n above).
             bonus_tok = -1;
-            commit_n = accept_n;
+            commit_n = std::min(accept_n, need_commit_budget);
             replay_tok.resize(commit_n);
-            if (!target.rollback_to(committed, accept_n)) {
-                std::fprintf(stderr, "dflash-spec rollback_to failed\n");
-                return false;
+            if (target.rollback_to(committed, commit_n)) {
+                last_tok = target_tok[commit_n - 1];
+                fast_rolled_back = true;
+            } else {
+                // Rollback failed (e.g. CUDA error / unsupported state type).
+                // The pre-verify snapshot is still valid, so degrade to the
+                // legacy restore+replay path below instead of aborting.
+                std::fprintf(stderr, "dflash-spec rollback_to failed; "
+                                     "falling back to restore+replay\n");
             }
-            last_tok = target_tok[accept_n - 1];
-        } else {
+        }
+        if (!fast_rolled_back) {
             // Legacy path: restore SSM snapshot and replay accepted + bonus tokens.
+            // (When falling back from fast-rollback, bonus_tok is already -1 and
+            //  replay_tok/commit_n reflect the budget-clamped accepted set.)
             if (!target.restore_kv()) {
                 std::fprintf(stderr, "dflash-spec restore_kv failed\n");
                 return false;

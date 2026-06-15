@@ -680,7 +680,7 @@ DFlashTarget * Qwen35Backend::dflash_target() {
         if (kvflash_active()) {
             qt->set_kvflash_pager(&kvflash_pager_);
         }
-        qt->set_fast_rollback(true);
+        qt->set_fast_rollback(cfg_.fast_rollback);
     }
     return dflash_target_.get();
 }
@@ -1828,6 +1828,105 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
         draft_tok[0] = last_tok;
 
+        // ── DDTree tree-structured verify ────────────────────────────────
+        // When --ddtree is on and the target supports tree verify, build a
+        // draft tree from per-position top-K, verify all nodes in one
+        // ancestor-masked target forward, walk the verified path, then roll
+        // recurrent/KV state forward to the accepted path. Higher acceptance
+        // per step than chain verify. Local draft only; greedy bonus token
+        // (sampled tree-verify is a follow-up). On any failure we fall through
+        // is unsafe (draft graph already built for chain), so we bail to false.
+        // The tree path handles plain generation only. Requests using features
+        // the tree branch does not implement — thinking-budget forced close,
+        // tool-call hint injection, stall recovery, or the min-tokens floor
+        // region — fall through to the chain verify path below, which handles
+        // them. (Wiring these into the tree path is a follow-up.)
+        const bool tree_special_inactive =
+            !(budget_hook && !budget_hook->close_token_ids.empty()) &&
+            !(hint_tokens && n_generated < (int)hint_tokens->size()) &&
+            stall_tool_prefix_tokens == nullptr &&
+            (int)out_tokens.size() >= _min_floor;
+        if (cfg_.ddtree_mode && target->supports_tree_verify() &&
+            !use_remote_draft && q_len > 1 && tree_special_inactive) {
+            const int L = q_len - 1;
+            const int K = (cfg_.ddtree_budget > L) ? 8 : 1;
+            std::vector<float>   top_lp;
+            std::vector<int32_t> top_ids;
+            if (!target->project_hidden_to_topk(local_hidden.data(), q_len, K,
+                                                cfg_.ddtree_temp, top_lp, top_ids)) {
+                std::fprintf(stderr, "spec-decode: ddtree topk projection failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            // Tree depth L draws from draft rows 1..q_len-1 (row 0 = the seed).
+            DDTree tree = build_ddtree(top_lp.data() + (size_t)K, top_ids.data() + (size_t)K,
+                                       L, K, cfg_.ddtree_budget, cfg_.ddtree_chain_seed);
+            const int N = cfg_.ddtree_budget + 1;   // fixed alloc width
+
+            std::vector<int32_t> flat_tokens((size_t)N, 0);
+            flat_tokens[0] = last_tok;
+            for (int i = 0; i < tree.n_nodes; i++) flat_tokens[1 + i] = tree.token_ids[i];
+
+            std::vector<int32_t> posterior;
+            if (!target->verify_tree(committed, tree, flat_tokens, N, posterior, nullptr)) {
+                std::fprintf(stderr, "spec-decode: verify_tree failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+
+            int next_token = -1, bonus_node = 0;
+            std::vector<int> accepted =
+                follow_verified_tree(tree, posterior.data(), next_token, &bonus_node);
+
+            int commit_n = (int)accepted.size();          // root + accepted children
+            if (commit_n > need_commit_budget) commit_n = need_commit_budget;
+            if (commit_n <= 0) { step_graph_destroy(draft_sg); break; }
+
+            // Emit the accepted path: slot 0 = last_tok (pending from prev iter),
+            // each subsequent accepted node = its tree token.
+            bool hit_eos = false;
+            int emitted = 0;
+            for (int i = 0; i < commit_n; i++) {
+                const int dfs = accepted[i];
+                const int32_t tok = (dfs == 0) ? last_tok : tree.token_ids[dfs - 1];
+                out_tokens.push_back(tok);
+                io.emit(tok);
+                emitted++;
+                if (io.cancelled) { hit_eos = true; break; }
+                if (target->is_eos(tok)) { hit_eos = true; break; }
+            }
+            last_tok = next_token;
+
+            // Telemetry: accepted children (exclude the always-committed root).
+            n_accept_sum += std::max(0, emitted - 1);
+            n_draft_steps++;
+
+            if (hit_eos || last_tok < 0 || target->is_eos(last_tok)) {
+                committed   += emitted;
+                n_generated += emitted;
+                break;
+            }
+
+            // Roll recurrent + KV state forward to the committed accepted path.
+            std::vector<int> accepted_committed(accepted.begin(),
+                                                accepted.begin() + emitted);
+            if (!target->rollback_to_tree(committed, tree, accepted_committed)) {
+                std::fprintf(stderr, "spec-decode: rollback_to_tree failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+
+            // Sync draft-side feature mirror over the committed range.
+            if (feature_mirror_.target_feat && !draft_parked_) {
+                draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
+                                                feature_mirror_, committed, emitted);
+            }
+
+            committed   += emitted;
+            n_generated += emitted;
+            continue;
+        }
+
         // 3b. Tool call hint injection: override draft tokens with pre-known
         // structural tokens for near-100% acceptance.
         int hint_fill = 0;
@@ -1887,20 +1986,31 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             target->supports_fast_rollback() && (accept_n >= kFastRollbackThreshold);
 
         int replay_last_tok = -1;
+        bool fast_rolled_back = false;
         if (use_fast_rollback) {
             // Fast rollback: restore SSM from captured intermediates, skip replay.
-            // Implicit bonus: target_tok[accept_n-1] seeds next draft as draft_tok[0],
+            // Implicit bonus: target_tok[commit_n-1] seeds next draft as draft_tok[0],
             // always accepted on next step.
             bonus_tok = -1;
-            commit_n = accept_n;
-            if (!target->rollback_to(committed, accept_n)) {
-                std::fprintf(stderr, "spec-decode: rollback_to failed\n");
-                step_graph_destroy(draft_sg);
-                return false;
+            // Respect the generation budget: accept_n may exceed the remaining
+            // budget (need_commit_budget), so committing accept_n would emit
+            // more tokens than requested. commit_n was already clamped above.
+            commit_n = std::min(accept_n, need_commit_budget);
+            if (target->rollback_to(committed, commit_n)) {
+                replay_last_tok = target_tok[commit_n - 1];
+                fast_rolled_back = true;
+            } else {
+                // Rollback failed (CUDA error / unsupported state type). The
+                // pre-verify snapshot is still valid, so degrade to the legacy
+                // restore+replay path below instead of aborting the request.
+                std::fprintf(stderr, "spec-decode: rollback_to failed; "
+                                     "falling back to restore+replay\n");
             }
-            replay_last_tok = target_tok[accept_n - 1];
-        } else {
+        }
+        if (!fast_rolled_back) {
             // Legacy replay: restore SSM snapshot, replay accepted + bonus tokens.
+            // (When falling back from fast-rollback, bonus_tok is -1 and commit_n
+            //  is the budget-clamped accepted count.)
             if (!target->restore_kv()) {
                 step_graph_destroy(draft_sg);
                 return false;

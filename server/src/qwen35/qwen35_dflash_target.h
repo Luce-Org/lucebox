@@ -44,6 +44,17 @@ public:
     bool supports_fast_rollback() const override;
     bool rollback_to(int base_pos, int commit_n) override;
 
+    bool supports_tree_verify() const override;
+    bool verify_tree(int committed,
+                     const DDTree & tree,
+                     const std::vector<int32_t> & flat_tokens,
+                     int n_alloc,
+                     std::vector<int32_t> & posterior_out,
+                     std::vector<float> * logits_out = nullptr) override;
+    bool rollback_to_tree(int committed,
+                          const DDTree & tree,
+                          const std::vector<int> & accepted_dfs) override;
+
     bool is_eos(int token) const override;
 
     bool embed_tokens(const int32_t * tokens, int n,
@@ -52,6 +63,13 @@ public:
     bool project_hidden_to_tokens(const float * hidden,
                                   int n_tokens,
                                   std::vector<int32_t> & tokens_out) override;
+
+    bool project_hidden_to_topk(const float * hidden,
+                                int n_tokens,
+                                int K,
+                                float temperature,
+                                std::vector<float> & top_log_probs,
+                                std::vector<int32_t> & top_token_ids) override;
 
     int hidden_size() const override { return w_.n_embd; }
     int mask_token_id() const override;
