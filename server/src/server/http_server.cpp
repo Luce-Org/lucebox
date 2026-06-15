@@ -2826,7 +2826,11 @@ void HttpServer::worker_loop() {
         // `usage.timings` (OpenAI Chat usage chunk, Anthropic
         // message_delta usage, Responses response.completed usage).
         // See docs/specs/thinking-budget.md §6.3.
-        GenTimings gen_timings{ result.prefill_s, result.decode_s };
+        GenTimings gen_timings{
+            result.prefill_s,
+            result.decode_s,
+            using_restore ? prefix_len : 0,
+        };
 
         // Record performance for /status page.
         if (result.ok) {

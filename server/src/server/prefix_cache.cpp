@@ -95,9 +95,16 @@ std::vector<int> find_all_boundaries(const std::vector<int32_t> & ids,
                                      const ChatMarkers & markers) {
     std::vector<int> out;
     int sys_idx = find_first_seq(ids, markers.sys_role_prefix);
-    if (sys_idx < 0) return out;
+    int start_idx = sys_idx;
+    int start_len = (int)markers.sys_role_prefix.size();
+    if (start_idx < 0) {
+        auto first_start = find_first_seq_any(ids, markers.next_role_starts);
+        start_idx = first_start.first;
+        start_len = first_start.second;
+    }
+    if (start_idx < 0 || start_len <= 0) return out;
 
-    int cursor = sys_idx + (int)markers.sys_role_prefix.size();
+    int cursor = start_idx + start_len;
     while (true) {
         auto [end_idx, end_len] = find_first_seq_any(ids, markers.end_msg_seqs, cursor);
         if (end_idx < 0) break;

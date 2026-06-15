@@ -1224,6 +1224,43 @@ static void test_find_boundaries_empty() {
     TEST_ASSERT(bounds.empty());
 }
 
+static ChatMarkers make_qwen_boundary_markers_for_test() {
+    ChatMarkers markers;
+    markers.family = "qwen";
+    markers.sys_role_prefix = {100, 200};
+    markers.end_msg_seqs = {{101}};
+    markers.next_role_starts = {{100}};
+    return markers;
+}
+
+static void test_find_boundaries_qwen_system_first() {
+    auto markers = make_qwen_boundary_markers_for_test();
+    // <im_start> system ... <im_end> <im_start> user ...
+    std::vector<int32_t> ids = {
+        100, 200, 10, 11, 101,
+        100, 201, 12, 13, 101,
+        100, 202, 14,
+    };
+    auto bounds = find_all_boundaries(ids, markers);
+    TEST_ASSERT(bounds.size() == 2);
+    TEST_ASSERT(bounds[0] == 6);
+    TEST_ASSERT(bounds[1] == 11);
+}
+
+static void test_find_boundaries_qwen_user_first() {
+    auto markers = make_qwen_boundary_markers_for_test();
+    // <im_start> user ... <im_end> <im_start> assistant ...
+    std::vector<int32_t> ids = {
+        100, 201, 10, 11, 101,
+        100, 202, 12, 13, 101,
+        100, 201, 14,
+    };
+    auto bounds = find_all_boundaries(ids, markers);
+    TEST_ASSERT(bounds.size() == 2);
+    TEST_ASSERT(bounds[0] == 6);
+    TEST_ASSERT(bounds[1] == 11);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // PFlash config tests (model-free)
 // ═══════════════════════════════════════════════════════════════════════
@@ -3342,10 +3379,11 @@ static void test_usage_timings_responses_streaming() {
 static void test_usage_timings_zero_decode_no_div_by_zero() {
     // decode_s == 0 (prefill-only / no tokens generated path): emit
     // decode_tokens_per_sec = 0.0 without div-by-zero.
-    GenTimings t{0.123, 0.0};
+    GenTimings t{0.123, 0.0, 2048};
     json j = build_timings_json(t, /*completion_tokens*/ 42);
     TEST_ASSERT(j["prefill_ms"].get<double>() == 123.0);
     TEST_ASSERT(j["decode_ms"].get<double>() == 0.0);
+    TEST_ASSERT(j["prompt_n_cached"].get<int>() == 2048);
     TEST_ASSERT(j["decode_tokens_per_sec"].get<double>() == 0.0);
 
     // Also exercise via OpenAI streaming path — finite JSON output, no NaN/Inf.
@@ -3922,6 +3960,8 @@ int main() {
     RUN_TEST(test_hash_prefix_different_lengths);
     RUN_TEST(test_hash_prefix_empty);
     RUN_TEST(test_find_boundaries_empty);
+    RUN_TEST(test_find_boundaries_qwen_system_first);
+    RUN_TEST(test_find_boundaries_qwen_user_first);
 
     std::fprintf(stderr, "\n── PFlash config ──\n");
     RUN_TEST(test_pflash_config_defaults);

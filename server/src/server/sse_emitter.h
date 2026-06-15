@@ -39,13 +39,15 @@ enum class StreamMode { REASONING, CONTENT, TOOL_BUFFER };
 // & client side compute `decode_tokens_per_sec = completion_tokens /
 // decode_s` (server emits it pre-computed to avoid drift).
 struct GenTimings {
-    double prefill_s = 0.0;
-    double decode_s  = 0.0;
+    double prefill_s       = 0.0;
+    double decode_s        = 0.0;
+    int    prompt_n_cached = 0;
 };
 
 // Build the `timings` sub-object emitted under `usage`.
 //   prefill_ms              = prefill_s * 1000.0  (1 decimal)
 //   decode_ms               = decode_s  * 1000.0  (1 decimal)
+//   prompt_n_cached         = number of prompt tokens restored from cache
 //   decode_tokens_per_sec   = completion_tokens / decode_s (0.0 when
 //                              decode_s == 0 to avoid div-by-zero on
 //                              prefill-only / count_tokens responses)
