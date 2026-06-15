@@ -34,7 +34,7 @@ from typing import Any
 
 # Shared math-scoring helpers (canonical copy in harness/).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from math_scoring import _extract_boxed, _math_equiv, _normalize_math
+from math_scoring import _extract_boxed, _math_equiv
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_WORK_DIR = ROOT / ".harness-work"

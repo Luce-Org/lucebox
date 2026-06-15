@@ -22,7 +22,7 @@ from typing import Any
 
 # Shared math-scoring helpers (canonical copy in harness/).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from math_scoring import _extract_boxed, _math_equiv, _normalize_math
+from math_scoring import _extract_boxed, _math_equiv
 
 
 def load_cases(path: Path) -> list[dict[str, Any]]:
