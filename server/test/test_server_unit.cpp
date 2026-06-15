@@ -3361,12 +3361,14 @@ static void test_cache_budget_defaults_and_overrides() {
 
     b = resolve_cache_pool_budgets((size_t)1024 * 1024 * 1024,
                                    (size_t)256 * 1024 * 1024,
+                                   false,
                                    false, 0, false, 0);
     TEST_ASSERT(b.prefix_bytes == (size_t)256 * 1024 * 1024);
     TEST_ASSERT(b.prefill_bytes == (size_t)768 * 1024 * 1024);
 
     b = resolve_cache_pool_budgets((size_t)1024 * 1024 * 1024,
                                    (size_t)256 * 1024 * 1024,
+                                   true,
                                    true, (size_t)128 * 1024 * 1024,
                                    false, 0);
     TEST_ASSERT(b.prefix_bytes == (size_t)128 * 1024 * 1024);
@@ -3374,6 +3376,7 @@ static void test_cache_budget_defaults_and_overrides() {
 
     b = resolve_cache_pool_budgets((size_t)1024 * 1024 * 1024,
                                    (size_t)256 * 1024 * 1024,
+                                   true,
                                    false, 0,
                                    true, (size_t)512 * 1024 * 1024);
     TEST_ASSERT(b.prefix_bytes == (size_t)512 * 1024 * 1024);
@@ -3381,6 +3384,23 @@ static void test_cache_budget_defaults_and_overrides() {
 
     b = resolve_cache_pool_budgets((size_t)1024 * 1024 * 1024,
                                    (size_t)256 * 1024 * 1024,
+                                   false,
+                                   true, (size_t)2 * 1024 * 1024 * 1024,
+                                   false, 0);
+    TEST_ASSERT(b.prefix_bytes == (size_t)2 * 1024 * 1024 * 1024);
+    TEST_ASSERT(b.prefill_bytes == (size_t)768 * 1024 * 1024);
+
+    b = resolve_cache_pool_budgets((size_t)1024 * 1024 * 1024,
+                                   (size_t)256 * 1024 * 1024,
+                                   false,
+                                   false, 0,
+                                   true, (size_t)2 * 1024 * 1024 * 1024);
+    TEST_ASSERT(b.prefix_bytes == (size_t)256 * 1024 * 1024);
+    TEST_ASSERT(b.prefill_bytes == (size_t)2 * 1024 * 1024 * 1024);
+
+    b = resolve_cache_pool_budgets((size_t)1024 * 1024 * 1024,
+                                   (size_t)256 * 1024 * 1024,
+                                   true,
                                    true, (size_t)2 * 1024 * 1024 * 1024,
                                    false, 0);
     TEST_ASSERT(b.prefix_bytes == (size_t)2 * 1024 * 1024 * 1024);
@@ -3388,6 +3408,7 @@ static void test_cache_budget_defaults_and_overrides() {
 
     b = resolve_cache_pool_budgets((size_t)1024 * 1024 * 1024,
                                    (size_t)256 * 1024 * 1024,
+                                   true,
                                    true, (size_t)300 * 1024 * 1024,
                                    true, (size_t)700 * 1024 * 1024);
     TEST_ASSERT(b.prefix_bytes == (size_t)300 * 1024 * 1024);

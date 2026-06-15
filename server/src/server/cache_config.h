@@ -44,6 +44,7 @@ CachePoolBudgets split_cache_budget(size_t total_bytes,
                                     size_t default_prefix_bytes);
 CachePoolBudgets resolve_cache_pool_budgets(size_t total_bytes,
                                             size_t default_prefix_bytes,
+                                            bool total_seen,
                                             bool prefix_seen,
                                             size_t prefix_bytes,
                                             bool prefill_seen,

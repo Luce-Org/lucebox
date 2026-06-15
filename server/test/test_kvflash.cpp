@@ -63,6 +63,16 @@ size_t vram_used_now() {
     return total_b - free_b;
 }
 
+const char * kvflash_drafter_path() {
+    if (const char * env = std::getenv("DFLASH_KVFLASH_DRAFTER")) {
+        if (*env) return env;
+    }
+    if (const char * env = std::getenv("DFLASH_PREFILL_DRAFTER")) {
+        if (*env) return env;
+    }
+    return "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
+}
+
 // Single-token stepper over build_qwen35_graph with explicit control of:
 //   * kv_write_rows  — physical pool slot for the KV append
 //   * positions      — logical position (M-RoPE)
@@ -439,7 +449,7 @@ int main(int argc, char ** argv) {
             for (int mode = 0; mode < 2; mode++) {           // 0=baseline 1=pool
                 if (only_mode >= 0 && mode != only_mode) continue;
                 if (mode == 1 && !dctx.loaded &&
-                    !load_drafter("/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf", 0, dctx)) {
+                    !load_drafter(kvflash_drafter_path(), 0, dctx)) {
                     std::fprintf(stderr, "drafter load failed\n");
                     return 1;
                 }
@@ -527,7 +537,7 @@ int main(int argc, char ** argv) {
     // inside the recency window is the induction control (distance-free).
     if (arg_flag(argc, argv, "--niah256")) {
         DrafterContext dctx;
-        if (!load_drafter("/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf", 0, dctx)) {
+        if (!load_drafter(kvflash_drafter_path(), 0, dctx)) {
             std::fprintf(stderr, "drafter load failed\n");
             return 1;
         }
@@ -614,7 +624,7 @@ int main(int argc, char ** argv) {
     if (arg_flag(argc, argv, "--niah")) {
         DrafterContext dctx;
         const bool have_drafter =
-            load_drafter("/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf", 0, dctx);
+            load_drafter(kvflash_drafter_path(), 0, dctx);
         if (!have_drafter) std::printf("[niah] drafter unavailable, skipping drafter policy\n");
         KvFlashDrafterScorer scorer(&dctx);
         if (have_drafter) {
@@ -916,7 +926,7 @@ int main(int argc, char ** argv) {
     // reselect() repages the pool. PASS requires at least one genuine
     // drafter-driven recall of a chunk evicted earlier.
     {
-        const char * drafter_path = "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
+        const char * drafter_path = kvflash_drafter_path();
         DrafterContext dctx;
         if (!load_drafter(drafter_path, 0, dctx)) {
             std::printf("FAIL indexer run: drafter load failed (%s)\n", dflash27b_last_error());

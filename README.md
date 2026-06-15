@@ -297,6 +297,12 @@ reuse automatically. These budgets are for RAM/disk snapshots; GPU VRAM use is
 still governed mainly by context length, KV dtype, model placement, and draft
 residency.
 
+Advanced split overrides (`--cache-prefix-*`, `--cache-prefill-*`) can be used
+alone to resize one pool while keeping the other at its default slice, or with
+`--cache-ram` / `--cache-disk` to split a fixed total. Deprecated slot and
+disk-budget aliases preserve their legacy single-pool behavior when used by
+themselves.
+
 **Bounded KV residency (KVFlash)**
 
 Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token chunks live in host RAM, bit-exact and recallable. Decode speed stops depending on context length and resident KV stays pool-sized at any context. Off by default; works on every model family. Drafter-scored residency is the default on every family: the server finds the Qwen3-0.6B drafter next to the model (or via `--prefill-drafter`) and lazy-loads it as the relevance scorer that decides which chunks stay resident — non-qwen targets (laguna, gemma4) bridge the tokenizer gap by re-tokenizing the context text for the drafter. LRU is the fallback when no drafter is present, or the explicit choice via `--kvflash-policy lru`. Per-model numbers in [Luce KVFlash →](optimizations/kvflash/README.md).

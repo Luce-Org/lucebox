@@ -188,6 +188,13 @@ free_snapshot_backend(snap_backend_, compute_backend_);  // then backend
 | `--cache-prefill-disk SIZE` | auto | Advanced override for exact full-prompt disk pool |
 | `--prefill-skip-park` | false | Skip parking draft model during compress |
 
+Disk budgets are active only when `--kv-cache-dir` or `--cache-dir` is set.
+The server warns and reports disk budgets as disabled when disk-size flags are
+provided without a cache directory. Disk pool sizes follow the same total and
+split override rules as RAM: `--cache-disk` is the unified total, a single
+`--cache-prefix-disk` or `--cache-prefill-disk` keeps the other disk pool at
+its default slice, and setting both split pools makes their sum the total.
+
 Deprecated compatibility aliases:
 
 | Server flag | Replacement |
@@ -195,6 +202,13 @@ Deprecated compatibility aliases:
 | `--prefix-cache-slots N` | `--cache-prefix-ram N*64MiB` |
 | `--prefill-cache-slots N` | `--cache-prefill-ram N*64MiB` |
 | `--kv-cache-budget N` | `--cache-prefix-disk NMiB` |
+
+When one of these aliases is used by itself, the server preserves legacy
+behavior: `--prefix-cache-slots 0` disables RAM snapshots instead of moving the
+default budget to exact prefill, and `--kv-cache-budget N` caps the legacy
+prefix-disk pool without allocating an additional default prefill-disk pool.
+Combine aliases with the unified `--cache-ram` or `--cache-disk` total only
+when you want the sibling pool to receive the remaining budget.
 
 ### Choosing RAM Budgets
 
@@ -208,6 +222,13 @@ reuse cheap (`256MiB`) and gives the rest to exact repeated prompts, which is
 where whole-prompt benchmark and agent-loop speedups usually come from. Set
 `--cache-ram 0` to disable RAM snapshots completely. The split flags are for
 advanced experiments and diagnostics.
+
+A single split override without `--cache-ram` keeps the other pool at its
+default slice and grows or shrinks the total automatically. For example,
+`--cache-prefix-ram 2GiB` resolves to 2GiB prefix RAM plus the default 768MiB
+exact-prefill RAM. When `--cache-ram` is also set, the explicit total is a hard
+ceiling and the sibling pool receives only the remaining bytes. When both split
+pools are set, their sum is the total and `--cache-ram` is ignored.
 
 These knobs do not reserve extra GPU KV capacity. They control RAM/disk
 snapshots; GPU VRAM pressure is mostly a function of context length, KV dtype,
@@ -240,7 +261,8 @@ teach the prefix cache.
 The backend still has a finite snapshot-handle table. The server derives
 internal handle counts from RAM budgets using a conservative 64MiB-per-handle
 estimate, then enforces the configured byte budget with LRU eviction after
-snapshot save. Slot 63 is reserved for disk-cache staging.
+snapshot save. Slot 63 is reserved for disk-cache staging, so very large RAM
+budgets are capped by both bytes and the remaining 63 snapshot handles.
 
 ## File Map
 

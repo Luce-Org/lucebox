@@ -217,7 +217,11 @@ static void print_usage(const char * prog) {
         "                              (default: 1GiB; split 256MiB prefix,\n"
         "                              remainder exact-prefill)\n"
         "  --cache-prefix-ram <size>   Advanced: override turn-boundary prefix RAM pool\n"
+        "                              alone keeps default prefill; with --cache-ram\n"
+        "                              splits the explicit total\n"
         "  --cache-prefill-ram <size>  Advanced: override exact full-prompt RAM pool\n"
+        "                              alone keeps default prefix; with --cache-ram\n"
+        "                              splits the explicit total\n"
         "  --cache-dir <path>          Alias for --kv-cache-dir\n"
         "  --prefix-cache-slots <N>    Deprecated alias: N * 64MiB prefix RAM budget\n"
         "  --prefill-cache-slots <N>   Deprecated alias: N * 64MiB prefill RAM budget\n"
@@ -284,6 +288,7 @@ static void print_usage(const char * prog) {
         "                              remainder exact-prefill)\n"
         "  --cache-prefix-disk <size>  Advanced: override turn-boundary prefix disk pool\n"
         "  --cache-prefill-disk <size> Advanced: override exact full-prompt disk pool\n"
+        "                              split-disk overrides require --kv-cache-dir\n"
         "  --kv-cache-budget <MB>      Deprecated alias for --cache-prefix-disk\n"
         "  --kv-cache-min-tokens <N>   Min tokens to persist (default: 512)\n"
         "  --kv-cache-interval <N>     Continued checkpoint every N tokens (default: 10240)\n"
@@ -662,21 +667,42 @@ int main(int argc, char ** argv) {
         }
     }
 
+    bool legacy_prefix_slots_applied = false;
+    bool legacy_prefill_slots_applied = false;
+    bool legacy_kv_budget_applied = false;
     if (legacy_prefix_slots_seen && !cache_prefix_ram_seen) {
         if (legacy_prefix_slots < 0) legacy_prefix_slots = 0;
         sconfig.prefix_cache_ram_bytes =
             (size_t)legacy_prefix_slots * kCacheRamSlotEstimateBytes;
         cache_prefix_ram_seen = true;
+        legacy_prefix_slots_applied = true;
     }
     if (legacy_prefill_slots_seen && !cache_prefill_ram_seen) {
         if (legacy_prefill_slots < 0) legacy_prefill_slots = 0;
         sconfig.prefill_cache_ram_bytes =
             (size_t)legacy_prefill_slots * kCacheRamSlotEstimateBytes;
         cache_prefill_ram_seen = true;
+        legacy_prefill_slots_applied = true;
+    }
+    if (!cache_ram_seen) {
+        if (legacy_prefix_slots_applied && !cache_prefill_ram_seen) {
+            sconfig.prefill_cache_ram_bytes = 0;
+            cache_prefill_ram_seen = true;
+        }
+        if (legacy_prefill_slots_applied && !cache_prefix_ram_seen) {
+            sconfig.prefix_cache_ram_bytes = 0;
+            cache_prefix_ram_seen = true;
+        }
     }
     if (legacy_kv_budget_seen && !cache_prefix_disk_seen) {
         sconfig.prefix_cache_disk_bytes = legacy_kv_budget_bytes;
         cache_prefix_disk_seen = true;
+        legacy_kv_budget_applied = true;
+    }
+    if (legacy_kv_budget_applied && !cache_disk_seen &&
+        !cache_prefill_disk_seen) {
+        sconfig.prefill_cache_disk_bytes = 0;
+        cache_prefill_disk_seen = true;
     }
 
     if (cache_ram_seen && cache_prefix_ram_seen && cache_prefill_ram_seen) {
@@ -686,6 +712,7 @@ int main(int argc, char ** argv) {
     }
     CachePoolBudgets ram_budgets = resolve_cache_pool_budgets(
         sconfig.cache_ram_bytes, kDefaultCachePrefixRamBytes,
+        cache_ram_seen,
         cache_prefix_ram_seen, sconfig.prefix_cache_ram_bytes,
         cache_prefill_ram_seen, sconfig.prefill_cache_ram_bytes);
     sconfig.prefix_cache_ram_bytes = ram_budgets.prefix_bytes;
@@ -704,12 +731,21 @@ int main(int argc, char ** argv) {
     }
     CachePoolBudgets disk_budgets = resolve_cache_pool_budgets(
         sconfig.cache_disk_bytes, kDefaultCachePrefixDiskBytes,
+        cache_disk_seen,
         cache_prefix_disk_seen, sconfig.prefix_cache_disk_bytes,
         cache_prefill_disk_seen, sconfig.prefill_cache_disk_bytes);
     sconfig.prefix_cache_disk_bytes = disk_budgets.prefix_bytes;
     sconfig.prefill_cache_disk_bytes = disk_budgets.prefill_bytes;
     sconfig.cache_disk_bytes =
         sconfig.prefix_cache_disk_bytes + sconfig.prefill_cache_disk_bytes;
+    if (sconfig.disk_cache_dir.empty() &&
+        (cache_disk_seen || cache_prefix_disk_seen || cache_prefill_disk_seen ||
+         legacy_kv_budget_seen) &&
+        sconfig.cache_disk_bytes > 0) {
+        std::fprintf(stderr,
+            "[server] disk cache budgets ignored because no --kv-cache-dir/"
+            "--cache-dir was set\n");
+    }
 
     if (sconfig.prefix_cache_cap > kCacheMaxRamSlots) {
         std::fprintf(stderr,
@@ -1154,18 +1190,18 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
     std::fprintf(stderr, "[server] │  cache_ram       = %s\n",
                  format_cache_size(sconfig.cache_ram_bytes).c_str());
-    std::fprintf(stderr, "[server] │  cache_prefix_ram= %s (%d handles)\n",
+    std::fprintf(stderr, "[server] │  cache_prefix_ram = %s (%d handles)\n",
                  format_cache_size(sconfig.prefix_cache_ram_bytes).c_str(),
                  sconfig.prefix_cache_cap);
-    std::fprintf(stderr, "[server] │  cache_prefill_ram= %s (%d handles)\n",
+    std::fprintf(stderr, "[server] │  cache_prefill_ram = %s (%d handles)\n",
                  format_cache_size(sconfig.prefill_cache_ram_bytes).c_str(),
                  sconfig.prefill_cache_cap);
     if (!sconfig.disk_cache_dir.empty()) {
         std::fprintf(stderr, "[server] │  cache_disk      = %s\n",
                      format_cache_size(sconfig.cache_disk_bytes).c_str());
-        std::fprintf(stderr, "[server] │  cache_prefix_disk= %s\n",
+        std::fprintf(stderr, "[server] │  cache_prefix_disk = %s\n",
                      format_cache_size(sconfig.prefix_cache_disk_bytes).c_str());
-        std::fprintf(stderr, "[server] │  cache_prefill_disk= %s\n",
+        std::fprintf(stderr, "[server] │  cache_prefill_disk = %s\n",
                      format_cache_size(sconfig.prefill_cache_disk_bytes).c_str());
     }
     std::fprintf(stderr, "[server] │  cors            = %s\n", sconfig.enable_cors ? "ON" : "off");
