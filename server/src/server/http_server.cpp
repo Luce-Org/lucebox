@@ -1591,7 +1591,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             tools_json = req.tools.dump();
         }
 
-        std::string rendered;
+        PromptRenderResult render_result;
         if (!config_.chat_template_src.empty()) {
             // Jinja path: caller supplied a chat template file via
             // --chat-template-file. Override the hardcoded QWEN3/LAGUNA
@@ -1608,7 +1608,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                 ? tokenizer_.raw_token(tokenizer_.eos_id())
                 : std::string();
             try {
-                rendered = render_chat_template_jinja(
+                render_result = render_chat_template_jinja(
                     config_.chat_template_src,
                     chat_msgs,
                     bos_str,
@@ -1622,11 +1622,18 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                 return true;
             }
         } else {
-            rendered = render_chat_template(chat_msgs, chat_format_,
-                                            true, enable_thinking,
-                                            tools_json);
+            render_result = render_chat_template(chat_msgs, chat_format_,
+                                                 true, enable_thinking,
+                                                 tools_json);
         }
-        req.prompt_tokens = tokenizer_.encode(rendered);
+        // Propagate prompt provenance so the SseEmitter's initial mode
+        // matches the template's pre-opened reasoning channel (Qwen3.6 /
+        // Laguna enable_thinking case). Without this, reasoning text
+        // leaks into the content channel and `reasoning_content` stays
+        // empty — see fix(server): route Qwen3.6/Laguna think-mode
+        // reasoning to reasoning_content channel.
+        req.started_in_thinking = render_result.started_in_thinking;
+        req.prompt_tokens = tokenizer_.encode(render_result.text);
 
         // count_tokens: short-circuit after tokenization. Skip generation
         // entirely — Anthropic's contract is just `{"input_tokens": N}`.
@@ -1770,11 +1777,20 @@ void HttpServer::worker_loop() {
             }
         }
 
-        // Create SSE emitter for streaming state machine.
+        // Create SSE emitter for streaming state machine. `initial_mode`
+        // tracks whether the chat-template prompt pre-opened a `<think>`
+        // block (Qwen3.6 / Laguna enable_thinking path). When true, the
+        // emitter starts in REASONING so the model's first generated
+        // token routes to reasoning_content even though no explicit
+        // `<think>` opener appears in the token stream.
+        const StreamMode initial_mode = req.started_in_thinking
+            ? StreamMode::REASONING
+            : StreamMode::CONTENT;
         SseEmitter emitter(req.format, req.response_id, req.model,
                            (int)req.prompt_tokens.size(), req.tools,
                            &tool_memory_,
-                           req.stop_sequences);
+                           req.stop_sequences,
+                           initial_mode);
 
         // Emit initial SSE events (skip when proxying).
         if (req.stream && config_.pflash_upstream_base.empty()) {

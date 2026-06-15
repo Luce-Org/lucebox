@@ -1,0 +1,19 @@
+{
+  "name": "qwen3_enable_thinking_basic",
+  "description": "Qwen3.6 chat template pre-opens <think> when enable_thinking=true. Model emits reasoning directly, closes with </think>, then writes the answer.",
+  "match": {
+    "prompt_suffix": "What is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  "response": {
+    "finish_reason": "stop",
+    "tokens": [
+      "Let me compute. ",
+      "2",
+      "+",
+      "2",
+      " equals 4.",
+      { "text": "</think>", "special": true },
+      "\n\nThe answer is 4."
+    ]
+  }
+}

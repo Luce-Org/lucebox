@@ -54,13 +54,27 @@ nlohmann::json build_timings_json(const GenTimings & t, int completion_tokens);
 // Manages SSE streaming for a single request.
 class SseEmitter {
 public:
+    // `initial_mode` defaults to CONTENT for backward compatibility. Pass
+    // StreamMode::REASONING when the chat-template prompt suffix pre-opens
+    // a `<think>` block (Qwen3.6 / Laguna enable_thinking path): the
+    // model's first generated token is reasoning, never preceded by an
+    // explicit `<think>` opener in the stream. Without this hint the
+    // emitter would route reasoning text to the content channel and
+    // reasoning_content would stay empty.
+    //
+    // Note: the leading-`<think>` strip guard (`checked_think_prefix_`)
+    // remains active when we start in REASONING mode — if the model
+    // *does* emit a redundant `<think>` opener anyway, the guard still
+    // strips it. Pre-setting checked_think_prefix_=true here would let a
+    // duplicate `<think>` leak into reasoning_text in that edge case.
     SseEmitter(ApiFormat format,
                const std::string & request_id,
                const std::string & model_name,
                int prompt_tokens,
                const json & tools,
                ToolMemory * tool_memory,
-               const std::vector<std::string> & stop_sequences = {});
+               const std::vector<std::string> & stop_sequences = {},
+               StreamMode initial_mode = StreamMode::CONTENT);
 
     // Emit the initial SSE events (role delta, message_start, etc.)
     // Returns the formatted SSE strings to send.
