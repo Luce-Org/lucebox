@@ -1,11 +1,12 @@
 """End-to-end proof for exact prefill disk cache.
 
 Starts dflash_server with exact prefill RAM disabled and exact prefill disk
-enabled, sends the same long chat prompt three times, and asserts:
+enabled, sends one cold sampled request, restarts the server over the same
+cache directory, sends the same sampled request twice more, and asserts:
 
   - /props.cache.prefill reports a disk budget.
   - the first request saves an exact prefill snapshot to disk.
-  - requests 2 and 3 restore that disk snapshot.
+  - requests 2 and 3 restore that disk snapshot after restart.
   - warm prefill time is at least 5x faster than cold prefill.
 
 Environment overrides:
@@ -92,37 +93,52 @@ def main() -> int:
 
     cache_dir = Path(tempfile.mkdtemp(prefix="prefill-disk-cache-"))
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    log_f = LOG_PATH.open("w")
-    cmd = [
-        str(SERVER_BIN),
-        str(TARGET),
-        "--draft", str(DRAFT),
-        "--max-ctx", "16384",
-        "--port", str(PORT),
-        "--cache-ram", "0",
-        "--kv-cache-dir", str(cache_dir),
-        "--cache-disk", "1GiB",
-        "--cache-prefix-disk", "0",
-        "--ddtree",
-        "--ddtree-budget", "16",
-        "--cache-type-k", "tq3_0",
-        "--cache-type-v", "tq3_0",
-        "--fa-window", "0",
-    ]
-    proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, bufsize=1)
+    LOG_PATH.write_text("")
+    proc = None
+    log_f = None
 
-    def cleanup() -> None:
-        if proc.poll() is None:
+    def start_server() -> None:
+        nonlocal proc, log_f
+        log_f = LOG_PATH.open("a")
+        cmd = [
+            str(SERVER_BIN),
+            str(TARGET),
+            "--draft", str(DRAFT),
+            "--max-ctx", "16384",
+            "--port", str(PORT),
+            "--cache-ram", "0",
+            "--kv-cache-dir", str(cache_dir),
+            "--cache-disk", "1GiB",
+            "--cache-prefix-disk", "0",
+            "--ddtree",
+            "--ddtree-budget", "16",
+            "--cache-type-k", "tq3_0",
+            "--cache-type-v", "tq3_0",
+            "--fa-window", "0",
+        ]
+        proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, bufsize=1)
+        wait_server(proc)
+
+    def stop_server() -> None:
+        nonlocal proc, log_f
+        if proc is not None and proc.poll() is None:
             proc.send_signal(signal.SIGINT)
             try:
                 proc.wait(timeout=20)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        log_f.close()
+                proc.wait(timeout=20)
+        proc = None
+        if log_f is not None:
+            log_f.close()
+            log_f = None
+
+    def cleanup() -> None:
+        stop_server()
         shutil.rmtree(cache_dir, ignore_errors=True)
 
     atexit.register(cleanup)
-    wait_server(proc)
+    start_server()
 
     props = get_json("/props")
     prefill_pool = ((props.get("cache") or {}).get("prefill") or {})
@@ -141,12 +157,17 @@ def main() -> int:
         "model": "dflash",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 8,
-        "temperature": 0.0,
+        "temperature": 1.0,
+        "seed": 1234,
         "stream": False,
     }
 
     prefill = []
     for i in range(3):
+        if i == 1:
+            print("restarting server over existing disk cache", flush=True)
+            stop_server()
+            start_server()
         t0 = time.time()
         resp = post_json("/v1/chat/completions", payload)
         wall = time.time() - t0

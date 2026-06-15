@@ -235,6 +235,7 @@ private:
     // without deriving a chunk-local offset from absolute KV position.
     std::size_t     prefill_last_logits_offset_ = 0;
     bool            prefill_last_logits_valid_  = false;
+    std::vector<float> prefill_last_logits_;
 
     // ── DFlashTarget adapter (lazy-built) ────────────────────────────
     std::unique_ptr<DFlashTarget> dflash_target_;

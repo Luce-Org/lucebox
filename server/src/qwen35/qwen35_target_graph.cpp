@@ -1370,7 +1370,8 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
 bool snapshot_target_cache(const TargetWeights & w,
                            const TargetCache & cache,
                            ggml_backend_t backend,
-                           PrefixSnapshot & snap) {
+                           PrefixSnapshot & snap,
+                           bool include_prefill_logits) {
     const int n_full_attn = w.n_layer / w.full_attention_interval; // 16
     const int n_delta     = w.n_layer - n_full_attn;               // 48
     const int snap_pos    = cache.cur_pos;
@@ -1383,11 +1384,14 @@ bool snapshot_target_cache(const TargetWeights & w,
     // Reuse existing buffer if shapes match (same cur_pos); otherwise reallocate.
     // Right-sized KV tensors use [head_dim, cur_pos, n_head_kv] — orders of
     // magnitude smaller than [head_dim, max_ctx, n_head_kv] for short prefixes.
-    const bool needs_alloc = (snap.ctx == nullptr) || (snap.cur_pos != snap_pos);
+    const bool needs_alloc = (snap.ctx == nullptr) ||
+                             (snap.cur_pos != snap_pos) ||
+                             ((snap.prefill_logits_snap != nullptr) != include_prefill_logits);
     if (needs_alloc) {
         free_prefix_snapshot(snap);
 
-        const int total_tensors = 2 * n_full_attn + 2 * n_delta + 1; // 65
+        const int total_tensors =
+            2 * n_full_attn + 2 * n_delta + 1 + (include_prefill_logits ? 1 : 0);
         ggml_init_params ip{};
         ip.mem_size   = (size_t)(total_tensors + 16) * ggml_tensor_overhead();
         ip.mem_buffer = nullptr;
@@ -1438,6 +1442,19 @@ bool snapshot_target_cache(const TargetWeights & w,
             snap.target_feat_snap = nullptr;
         }
 
+        if (include_prefill_logits) {
+            snap.prefill_logits_snap =
+                ggml_new_tensor_1d(snap.ctx, GGML_TYPE_F32, w.n_vocab);
+            if (!snap.prefill_logits_snap) {
+                set_last_error("PrefixSnapshot prefill logits allocation failed");
+                free_prefix_snapshot(snap);
+                return false;
+            }
+            ggml_set_name(snap.prefill_logits_snap, "snap_prefill_logits");
+        } else {
+            snap.prefill_logits_snap = nullptr;
+        }
+
         snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, backend);
         if (!snap.buf) {
             set_last_error("ggml_backend_alloc_ctx_tensors failed for PrefixSnapshot");
@@ -1448,6 +1465,8 @@ bool snapshot_target_cache(const TargetWeights & w,
             snap.ssm_state_snap.clear();
             snap.conv_state_snap.clear();
             snap.target_feat_snap = nullptr;
+            snap.prefill_logits_snap = nullptr;
+            snap.prefill_last_logits.clear();
             return false;
         }
         std::fprintf(stderr, "[snap] alloc right-sized: cur_pos=%d buf=%.2f MiB backend=%s\n",
@@ -1498,6 +1517,9 @@ bool snapshot_target_cache(const TargetWeights & w,
     snap.kv_k_type       = cache.kv_k_type;
     snap.max_ctx         = cache.max_ctx;
     snap.target_feat_cap = cache.target_feat_cap;
+    if (!include_prefill_logits) {
+        snap.prefill_last_logits.clear();
+    }
 
     return true;
 }
@@ -1591,6 +1613,8 @@ void free_prefix_snapshot(PrefixSnapshot & snap) {
     snap.ssm_state_snap.clear();
     snap.conv_state_snap.clear();
     snap.target_feat_snap = nullptr;
+    snap.prefill_logits_snap = nullptr;
+    snap.prefill_last_logits.clear();
     snap.cur_pos         = 0;
     snap.kv_k_type       = GGML_TYPE_COUNT;
     snap.max_ctx         = 0;
