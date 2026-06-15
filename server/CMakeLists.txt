@@ -265,6 +265,7 @@ add_library(dflash_common STATIC
     src/common/moe_hybrid_stream.cpp
     src/common/cold_ffn_cpu.cpp
     src/common/moe_hybrid_swap_manager.cpp
+    src/common/moe_routing_collector.cpp
     src/qwen35/layer_split_forward.cpp
     src/qwen35/qwen35_target_shard_ipc.cpp
     src/qwen35/qwen35_target_shard_ipc_daemon.cpp

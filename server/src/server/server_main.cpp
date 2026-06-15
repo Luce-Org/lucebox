@@ -18,6 +18,8 @@
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
 #include "common/spark_corpus.h"
+#include "common/moe_routing_collector.h"
+#include "common/moe_hybrid_routing_stats.h"
 #include "common/peer_access.h"
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
@@ -290,6 +292,11 @@ static void print_usage(const char * prog) {
         "                               Overrides the hardcoded Qwen3/Laguna\n"
         "                               renderer. Empty or missing falls back\n"
         "                               to the hardcoded template.\n"
+        "\n"
+        "Expert routing analysis:\n"
+        "  --freq                       Enable expert frequency tracking + print analysis at shutdown\n"
+        "  --collect-routing <path>     Log binary routing data (hidden states + expert IDs)\n"
+        "                               for MLP predictor training (see scripts/train_predictor.py)\n"
         "\n", prog);
 }
 
@@ -587,6 +594,10 @@ int main(int argc, char ** argv) {
             cache_type_k = argv[++i];
         } else if (std::strcmp(argv[i], "--cache-type-v") == 0 && i + 1 < argc) {
             cache_type_v = argv[++i];
+        } else if (std::strcmp(argv[i], "--freq") == 0) {
+            sconfig.freq_tracking = true;
+        } else if (std::strcmp(argv[i], "--collect-routing") == 0 && i + 1 < argc) {
+            sconfig.collect_routing_path = argv[++i];
         } else {
             std::fprintf(stderr, "[server] unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -626,6 +637,15 @@ int main(int argc, char ** argv) {
     sconfig.pflash_remote = pflash_placement.remote;
 
     // ── Apply environment defaults ─────────────────────────────────────
+    // --freq / --collect-routing: enable routing stats via env vars that
+    // the backends already check. This ensures both laguna and qwen35moe
+    // allocate their routing_stats_ so we can print freq analysis at shutdown.
+    if (sconfig.freq_tracking || !sconfig.collect_routing_path.empty()) {
+        // Enable routing stats on all MoE backends (env vars are "no overwrite")
+        setenv("DFLASH_QWEN35MOE_RUNTIME_STATS_OUT", "/dev/null", 0);
+        setenv("DFLASH_LAGUNA_NEXT_PLACEMENT_OUT", "/dev/null", 0);
+    }
+
     // Explicit --cache-type-k/v override via env vars.
     if (!cache_type_k.empty()) {
         setenv("DFLASH27B_KV_K", cache_type_k.c_str(), 1);
@@ -1159,7 +1179,34 @@ int main(int argc, char ** argv) {
         backend->park("draft");
     }
 
+    // Set up routing data collector (--collect-routing)
+    MoeRoutingCollector routing_collector;
+    if (!sconfig.collect_routing_path.empty()) {
+        if (!routing_collector.open(sconfig.collect_routing_path)) {
+            std::fprintf(stderr, "[server] failed to open routing collector output\n");
+            return 1;
+        }
+        backend->set_routing_collector(&routing_collector);
+    }
+
     int ret = server.run();
+
+    // Print frequency analysis at shutdown (--freq)
+    if (sconfig.freq_tracking) {
+        const auto * stats = backend->get_routing_stats();
+        if (stats) {
+            stats->print_freq_analysis();
+        } else {
+            std::fprintf(stderr, "[server] --freq: no routing stats available "
+                                 "(model may not be MoE)\n");
+        }
+    }
+
+    // Close routing collector (prints summary)
+    if (routing_collector.is_open()) {
+        backend->set_routing_collector(nullptr);
+        routing_collector.close();
+    }
 
     // Cleanup.
     backend->shutdown();

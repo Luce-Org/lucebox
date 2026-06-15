@@ -175,6 +175,13 @@ struct ServerConfig {
     // the Anthropic tool_use envelope, e.g. froggeric Qwen3.6 template.
     std::string chat_template_src;          // literal Jinja source (loaded from file)
     std::string chat_template_path;         // path it was loaded from (logged at startup)
+
+    // Expert frequency tracking (--freq): print frequency analysis at shutdown.
+    bool        freq_tracking = false;
+
+    // Routing data collection (--collect-routing <path>): write binary per-token
+    // routing data (hidden states + expert selections) for predictor training.
+    std::string collect_routing_path;
 };
 
 // ─── Parsed request ─────────────────────────────────────────────────────

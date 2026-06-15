@@ -19,6 +19,7 @@
 #include "../common/moe_hybrid_storage.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_swap_manager.h"
+#include "../common/moe_routing_collector.h"
 #include "common/step_graph.h"
 
 #include "ggml-cuda.h"
@@ -1426,6 +1427,15 @@ bool LagunaBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
                 }
             }
 
+            // Collect routing data for predictor training
+            if (routing_collector_) {
+                std::vector<float> gate_input((size_t)w_.n_embd);
+                ggml_backend_tensor_get(layer_sg.ffn_post, gate_input.data(), 0,
+                                         sizeof(float) * (size_t)w_.n_embd);
+                routing_collector_->record(il, gate_input.data(), w_.n_embd,
+                                           selected.data(), (int)selected.size());
+            }
+
             // Hybrid FFN: hot on GPU, cold on CPU, combine on GPU
             auto & storage = moe_hybrid_->layers[(size_t)il];
             { int _lc=0; for (int _k=0;_k<(int)selected.size();++_k){ int _g=selected[(size_t)_k];
@@ -1658,6 +1668,18 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
                 if (routing_stats_) {
                     for (int i = 0; i < chunk_len; ++i) {
                         routing_stats_->observe(il, chunk_selected.data() + (size_t)i * (size_t)n_expert_used, n_expert_used);
+                    }
+                }
+
+                // Collect routing data for predictor training (prefill path)
+                if (routing_collector_) {
+                    for (int i = 0; i < chunk_len; ++i) {
+                        routing_collector_->record(
+                            il,
+                            chunk_post.data() + (size_t)i * (size_t)w_.n_embd,
+                            w_.n_embd,
+                            chunk_selected.data() + (size_t)i * (size_t)n_expert_used,
+                            n_expert_used);
                     }
                 }
 

@@ -38,6 +38,9 @@ struct MoeHybridRoutingStats {
     std::vector<int> ranked_experts(int layer_idx) const;
     std::vector<int> hot_experts(int layer_idx, int hot_count) const;
 
+    // Print StreamMoE-style frequency analysis to stderr.
+    void print_freq_analysis() const;
+
     bool save_csv(const std::string & path, std::string * err = nullptr) const;
     static bool load_csv(const std::string & path,
                          MoeHybridRoutingStats & out,

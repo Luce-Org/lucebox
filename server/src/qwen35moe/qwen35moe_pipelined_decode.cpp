@@ -372,6 +372,14 @@ bool pipelined_decode_one_token(
                                     sizeof(float) * (size_t)n_expert_used);
             const auto readback_t1 = PipelineClock::now();
 
+            // Record routing data for predictor training
+            if (state.routing_collector) {
+                ggml_backend_tensor_get(cpg.ffn_post, state.ffn_post_host_buf.data(), 0,
+                                        sizeof(float) * (size_t)n_embd);
+                state.routing_collector->record(il, state.ffn_post_host_buf.data(),
+                                                n_embd, global_ids, n_expert_used);
+            }
+
             // CPU-side local ID mapping + cold partition (trivial: 8 lookups)
             auto & storage = hybrid.layers[(size_t)il];
             int32_t local_ids[8];
@@ -613,6 +621,14 @@ bool pipelined_decode_one_token(
                                 sizeof(float) * (size_t)n_expert_used);
         ggml_backend_synchronize(backend);
         if (tel) tel->routing_readback_us += pipe_elapsed_us(routing_t0, PipelineClock::now());
+
+        // Record routing data for predictor training (second decode path)
+        if (state.routing_collector) {
+            ggml_backend_tensor_get(ffn_post_gpu, state.ffn_post_host_buf.data(), 0,
+                                    sizeof(float) * (size_t)n_embd);
+            state.routing_collector->record(il, state.ffn_post_host_buf.data(),
+                                            n_embd, state.routing_ids_buf.data(), n_expert_used);
+        }
 
         // ── FFN: use routed FFN (cold-masking) if graph available, else split path ──
         const auto ffn_t0 = PipelineClock::now();

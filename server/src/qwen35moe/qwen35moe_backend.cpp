@@ -394,6 +394,7 @@ bool Qwen35MoeBackend::ensure_pipe_state(int kv_start) {
         pipe_state_.reset();
         return false;
     }
+    pipe_state_->routing_collector = routing_collector_;
     return true;
 }
 
@@ -864,6 +865,18 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             if (routing_stats_) {
                 for (int i = 0; i < chunk_len; ++i) {
                     routing_stats_->observe(il, chunk_selected.data() + (size_t)i * (size_t)n_expert_used, n_expert_used);
+                }
+            }
+
+            // Collect routing data for predictor training (prefill path)
+            if (routing_collector_) {
+                for (int i = 0; i < chunk_len; ++i) {
+                    routing_collector_->record(
+                        il,
+                        chunk_post.data() + (size_t)i * (size_t)hidden,
+                        hidden,
+                        chunk_selected.data() + (size_t)i * (size_t)n_expert_used,
+                        n_expert_used);
                 }
             }
 
