@@ -20,6 +20,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+# Shared math-scoring helpers (canonical copy in harness/).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from math_scoring import _extract_boxed, _math_equiv
+
 
 def load_cases(path: Path) -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
@@ -50,73 +54,6 @@ def normalize_text(text: str) -> str:
 def approx_token_count(text: str) -> int:
     # Fallback only. Prefer server usage.completion_tokens when available.
     return max(1, len(re.findall(r"\S+", text)))
-
-
-def _extract_boxed(text: str) -> str | None:
-    """Extract the last \\boxed{...} from a string, handling nested braces."""
-    results = []
-    i = 0
-    while i < len(text):
-        idx = text.find("\\boxed{", i)
-        if idx == -1:
-            break
-        start = idx + len("\\boxed{")
-        depth = 1
-        j = start
-        while j < len(text) and depth > 0:
-            if text[j] == "{":
-                depth += 1
-            elif text[j] == "}":
-                depth -= 1
-            j += 1
-        if depth == 0:
-            results.append(text[start:j-1].strip())
-        i = j
-    return results[-1] if results else None
-
-
-def _normalize_math(s: str) -> str:
-    """Normalize a math answer string for comparison."""
-    if s is None:
-        return ""
-    s = s.strip()
-    if s.startswith("$") and s.endswith("$"):
-        s = s[1:-1].strip()
-    s = re.sub(r"\\text\s*\{([^}]*)\}", r"\1", s)
-    s = re.sub(r"\\mathrm\s*\{([^}]*)\}", r"\1", s)
-    for cmd in [r"\left", r"\right", r"\displaystyle", r"\tfrac", r"\dfrac"]:
-        s = s.replace(cmd, "")
-    s = re.sub(r"\s+", " ", s).strip()
-    s = s.rstrip(".,")
-    return s
-
-
-def _math_equiv(pred: str, gold: str) -> bool:
-    """Check if two math answers are equivalent."""
-    if pred is None or gold is None:
-        return False
-    p = _normalize_math(pred)
-    g = _normalize_math(gold)
-    if p == g:
-        return True
-    try:
-        pf = float(p.replace(",", ""))
-        gf = float(g.replace(",", ""))
-        return abs(pf - gf) < 1e-6
-    except (ValueError, TypeError):
-        pass
-    frac_pat = re.compile(r"\\?frac\s*\{([^}]+)\}\s*\{([^}]+)\}")
-    for s, other in [(p, g), (g, p)]:
-        m = frac_pat.search(s)
-        if m:
-            try:
-                val = float(m.group(1)) / float(m.group(2))
-                oval = float(other.replace(",", ""))
-                if abs(val - oval) < 1e-6:
-                    return True
-            except (ValueError, ZeroDivisionError):
-                pass
-    return False
 
 
 def _extract_numeric_answer(text: str) -> str | None:

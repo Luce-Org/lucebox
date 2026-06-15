@@ -39,7 +39,14 @@ import numpy as np
 import gguf
 
 # ──────────────────────────────────────────────────────────────────────
-# DFlash 27B draft architecture constants
+# DFlash draft architecture constants — DEFAULTS ONLY.
+#
+# These are the qwen35-27B draft's values; they are used as a fallback when
+# the source model has no config.json. Any other draft (A3B, gemma, ...) has
+# a different head/dim/layer config, so the real scalars are read from the
+# source config.json + derived from the tensor shapes in load_arch(). A
+# converter that hardcoded these silently produced GGUFs with correct
+# weights but 27B metadata, which the strict draft loader then rejected.
 # ──────────────────────────────────────────────────────────────────────
 
 ARCH                = "qwen35-dflash-draft"
@@ -50,12 +57,95 @@ N_HEAD_KV           = 8
 HEAD_DIM            = 128
 INTERMEDIATE        = 17408
 VOCAB               = 248320
-N_TARGET_LAYERS     = 5            # fc projects 5*hidden -> hidden
+N_TARGET_LAYERS     = 5            # fc projects N_TARGET_LAYERS*hidden -> hidden
 ROPE_THETA          = 1_000_000.0
 RMS_EPS             = 1e-6
 MASK_TOKEN_ID       = 248070
 BLOCK_SIZE          = 16
 CTX_LEN             = 32768
+
+
+def load_arch(safetensors: Path, header: dict) -> dict:
+    """Resolve the draft's architecture scalars. config.json (next to the
+    safetensors) is authoritative for the transformer hparams; the tensor
+    shapes are authoritative for the rest, so the result always matches the
+    weights even when config.json is partial or absent."""
+    a = dict(hidden=HIDDEN, n_layer=N_LAYER, n_head=N_HEAD, n_head_kv=N_HEAD_KV,
+             head_dim=HEAD_DIM, intermediate=INTERMEDIATE, vocab=VOCAB,
+             n_target_layers=N_TARGET_LAYERS, rope_theta=ROPE_THETA,
+             rms_eps=RMS_EPS, mask_token_id=MASK_TOKEN_ID, block_size=BLOCK_SIZE,
+             ctx_len=CTX_LEN)
+
+    cfg_path = safetensors.parent / "config.json"
+    if cfg_path.exists():
+        c = json.loads(cfg_path.read_text())
+        def pick(*keys):
+            for k in keys:
+                if k in c and c[k] is not None:
+                    return c[k]
+            return None
+        for dst, val in (
+            ("hidden",       pick("hidden_size")),
+            ("n_layer",      pick("num_hidden_layers")),
+            ("n_head",       pick("num_attention_heads")),
+            ("n_head_kv",    pick("num_key_value_heads")),
+            ("head_dim",     pick("head_dim")),
+            ("intermediate", pick("intermediate_size")),
+            ("vocab",        pick("vocab_size")),
+            ("rope_theta",   pick("rope_theta")),
+            ("rms_eps",      pick("rms_norm_eps")),
+            ("n_target_layers", pick("n_target_layers", "num_target_layers")),
+            ("mask_token_id",   pick("mask_token_id")),
+            ("block_size",      pick("block_size", "draft_block_size")),
+            ("ctx_len",         pick("max_position_embeddings")),
+        ):
+            if val is not None:
+                a[dst] = val
+        print(f"[info] read arch from {cfg_path}")
+    else:
+        print(f"[warn] no config.json next to safetensors; using 27B defaults")
+
+    # Weights are ground truth — derive/verify from tensor shapes.
+    def shape_of(st_name):
+        e = header.get(st_name)
+        return e["shape"] if e else None
+
+    # hidden absent in config: k-proj is [n_head_kv*head_dim, hidden] -> ne[1].
+    k0 = shape_of("layers.0.self_attn.k_proj.weight")
+    if (not cfg_path.exists()) and k0:
+        a["hidden"] = k0[1]
+    # head_dim absent in config: derive from k-proj (n_head_kv * head_dim).
+    if k0 and a["n_head_kv"]:
+        derived_hd = k0[0] // a["n_head_kv"]
+        if not cfg_path.exists() or "head_dim" not in json.loads(cfg_path.read_text() if cfg_path.exists() else "{}"):
+            a["head_dim"] = derived_hd
+    # intermediate: ffn gate/up is [intermediate, hidden] — ne[0].
+    g0 = shape_of("layers.0.mlp.gate_proj.weight")
+    if g0:
+        a["intermediate"] = g0[0]
+    # n_target_layers: fc.weight is [hidden, n_target*hidden]; ne[0] (the
+    # larger dim) / hidden is the capture count the loader checks.
+    fc = shape_of("fc.weight")
+    if fc and a["hidden"]:
+        a["n_target_layers"] = max(fc) // a["hidden"]
+    # n_layer: count the actual blocks present.
+    n_blocks = 1 + max((int(n.split(".")[1]) for n in header
+                        if n.startswith("layers.") and n.split(".")[1].isdigit()),
+                       default=a["n_layer"] - 1)
+    a["n_layer"] = n_blocks
+
+    # Consistency check against the k-proj weight.
+    if k0:
+        exp_kv = a["n_head_kv"] * a["head_dim"]
+        if exp_kv != k0[0]:
+            print(f"[error] config n_head_kv*head_dim={exp_kv} != "
+                  f"k_proj.weight dim {k0[0]}; fix config.json", file=sys.stderr)
+            sys.exit(1)
+    print(f"[info] arch: hidden={a['hidden']} n_layer={a['n_layer']} "
+          f"n_head={a['n_head']} n_head_kv={a['n_head_kv']} "
+          f"head_dim={a['head_dim']} ff={a['intermediate']} vocab={a['vocab']} "
+          f"n_target_layers={a['n_target_layers']}")
+    return a
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -155,29 +245,30 @@ def main():
     n_entries = sum(1 for k in header if k != "__metadata__")
     print(f"[info]   {n_entries} tensor entries")
 
+    a = load_arch(args.safetensors, header)
+
     writer = gguf.GGUFWriter(args.out_gguf, ARCH)
 
-    # Architecture metadata
-    writer.add_string("general.name", "Qwen3.5-27B-DFlash-Draft")
-    writer.add_uint32(f"{ARCH}.context_length",          CTX_LEN)
-    writer.add_uint32(f"{ARCH}.embedding_length",        HIDDEN)
-    writer.add_uint32(f"{ARCH}.block_count",             N_LAYER)
-    writer.add_uint32(f"{ARCH}.feed_forward_length",     INTERMEDIATE)
-    writer.add_uint32(f"{ARCH}.attention.head_count",    N_HEAD)
-    writer.add_uint32(f"{ARCH}.attention.head_count_kv", N_HEAD_KV)
-    # llama.cpp uses key_length / value_length to override the default
-    # n_embd_head = n_embd / n_head heuristic (DFlash has n_embd=5120
-    # but head_dim=128 so n_head*head_dim=4096 != n_embd).
-    writer.add_uint32(f"{ARCH}.attention.key_length",    HEAD_DIM)
-    writer.add_uint32(f"{ARCH}.attention.value_length",  HEAD_DIM)
-    writer.add_uint32(f"{ARCH}.vocab_size",              VOCAB)
-    writer.add_float32(f"{ARCH}.attention.layer_norm_rms_epsilon", RMS_EPS)
-    writer.add_float32(f"{ARCH}.rope.freq_base",         ROPE_THETA)
+    # Architecture metadata (resolved from config.json + tensor shapes)
+    writer.add_string("general.name", f"DFlash-Draft-{a['hidden']}h-{a['n_layer']}L")
+    writer.add_uint32(f"{ARCH}.context_length",          a["ctx_len"])
+    writer.add_uint32(f"{ARCH}.embedding_length",        a["hidden"])
+    writer.add_uint32(f"{ARCH}.block_count",             a["n_layer"])
+    writer.add_uint32(f"{ARCH}.feed_forward_length",     a["intermediate"])
+    writer.add_uint32(f"{ARCH}.attention.head_count",    a["n_head"])
+    writer.add_uint32(f"{ARCH}.attention.head_count_kv", a["n_head_kv"])
+    # key_length / value_length override the n_embd/n_head heuristic, which
+    # is wrong for DFlash drafts (n_head*head_dim != n_embd).
+    writer.add_uint32(f"{ARCH}.attention.key_length",    a["head_dim"])
+    writer.add_uint32(f"{ARCH}.attention.value_length",  a["head_dim"])
+    writer.add_uint32(f"{ARCH}.vocab_size",              a["vocab"])
+    writer.add_float32(f"{ARCH}.attention.layer_norm_rms_epsilon", a["rms_eps"])
+    writer.add_float32(f"{ARCH}.rope.freq_base",         a["rope_theta"])
 
     # DFlash-specific hyperparameters
-    writer.add_uint32(f"{ARCH}.dflash.n_target_layers", N_TARGET_LAYERS)
-    writer.add_uint32(f"{ARCH}.dflash.block_size",      BLOCK_SIZE)
-    writer.add_uint32(f"{ARCH}.dflash.mask_token_id",   MASK_TOKEN_ID)
+    writer.add_uint32(f"{ARCH}.dflash.n_target_layers", a["n_target_layers"])
+    writer.add_uint32(f"{ARCH}.dflash.block_size",      a["block_size"])
+    writer.add_uint32(f"{ARCH}.dflash.mask_token_id",   a["mask_token_id"])
 
     # Walk + add tensors. Sort: dflash.* singletons first, then output_*,
     # then per-layer in numeric order — keeps the on-disk layout stable.

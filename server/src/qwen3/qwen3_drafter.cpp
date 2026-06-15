@@ -18,6 +18,7 @@
 #include "qwen3/anchor_params.h"
 #include "common/backend_precision.h"
 #include "internal.h"
+#include "anchor_scan.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -63,6 +64,13 @@ static int env_int(const char * name, int fallback) {
         if (x >= 0) return x;
     }
     return fallback;
+}
+
+static float env_float(const char * name, float def) {
+    if (const char * v = std::getenv(name)) {
+        try { return std::stof(v); } catch (...) {}
+    }
+    return def;
 }
 
 static void force_chunk_neighborhood(std::vector<uint8_t> & forced, int n_chunks,
@@ -590,6 +598,7 @@ static std::vector<int32_t> qwen35_score_and_compress(
             }
         }
     }
+
     for (int c = 0; c < n_chunks; ++c) {
         if (forced[(size_t)c] && !selected[(size_t)c]) {
             selected[(size_t)c] = 1;

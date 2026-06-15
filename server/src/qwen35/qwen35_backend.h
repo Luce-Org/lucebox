@@ -21,6 +21,8 @@
 #include "dflash_feature_ring.h"
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights, PrefixSnapshot
 #include "qwen3/qwen3_drafter.h"  // DrafterContext, load_drafter, free_drafter, drafter_score_and_compress
+#include "kvflash_pager.h"         // bounded KV residency pool
+#include "kvflash_scorer.h"        // chunk-relevance policy interface
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -157,6 +159,40 @@ protected:
 
     // ── Configuration ────────────────────────────────────────────────
     Qwen35Config cfg_;
+
+    // ── kvflash (bounded KV residency, FlashMemory-style) ────────────
+    // Active when kvflash_tokens_ > 0 (env DFLASH_KVFLASH / --kvflash):
+    // attention KV tensors are allocated at pool capacity, logical
+    // positions map to pool slots via kvflash_pager_, cold chunks page to
+    // host. Policy-agnostic: with no scorer the pager is LRU; when the
+    // pflash drafter is loaded it becomes the reselect scorer (every
+    // kvflash_tau_ decoded tokens). Forces AR decode (no spec).
+    // Protected: the MoE subclass routes its pipelined decode loops and
+    // hybrid prefill through the same pager/history/reselect state.
+    KvFlashPager                   kvflash_pager_;
+    std::unique_ptr<KvFlashScorer> kvflash_scorer_;
+    std::vector<int32_t>           kvflash_history_;     // prompt + generated ids
+    std::vector<float>             kvflash_scores_;      // latest chunk scores
+    std::vector<uint16_t>          kvflash_mask_buf_;    // host mirror of slot mask
+    std::string                    kvflash_drafter_path_; // DFLASH_KVFLASH_DRAFTER
+    uint64_t                       kvflash_mask_epoch_ = (uint64_t)-1;
+    int  kvflash_tokens_ = 0;                       // 0 = off
+    int  kvflash_tau_    = 64;
+    bool kvflash_drafter_failed_ = false;           // don't retry a failed load
+    bool kvflash_active() const { return kvflash_tokens_ > 0; }
+    // Rebuild pager mapping after (re)prefill: positions [0, committed)
+    // occupy pool slots identity-mapped (prefill is contiguous).
+    void kvflash_sync_prefill(int committed, const std::vector<int32_t> & tokens,
+                              int kv_offset);
+    // Upload the slot-validity mask (host rebuild on epoch change, device
+    // upload every step — the input's buffer region is reused by compute).
+    void kvflash_upload_mask();
+    // Drafter rescore + reselect every kvflash_tau_ generated tokens.
+    void kvflash_maybe_reselect(int generated);
+    // Attach the drafter scorer if a drafter path is configured and the
+    // scorer is missing (lazy-loads the drafter on first need; also heals
+    // after a residency release frees it). No-op without a path.
+    void kvflash_ensure_scorer();
 
 private:
     // ── GPU backends ─────────────────────────────────────────────────

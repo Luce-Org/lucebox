@@ -76,10 +76,11 @@ bool create_target_cache(const TargetWeights & w,
                          int max_verify_tokens,
                          ggml_backend_t backend,
                          TargetCache & out,
-                         bool prefill_only) {
+                         bool prefill_only,
+                         int ctx_alloc) {
     return create_target_cache_partial(w, max_ctx, max_verify_tokens, backend,
                                        out, prefill_only,
-                                       0, w.n_layer, true);
+                                       0, w.n_layer, true, ctx_alloc);
 }
 
 bool create_target_cache_partial(const TargetWeights & w,
@@ -90,7 +91,8 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  bool prefill_only,
                                  int layer_begin,
                                  int layer_end,
-                                 bool allocate_target_feat) {
+                                 bool allocate_target_feat,
+                                 int ctx_alloc) {
     if (layer_begin < 0) layer_begin = 0;
     if (layer_end < 0 || layer_end > w.n_layer) layer_end = w.n_layer;
     if (layer_begin > layer_end) {
@@ -133,9 +135,14 @@ bool create_target_cache_partial(const TargetWeights & w,
 
     const bool needs_256_stride =
         kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0;
+    // kvflash mode: attention tensors are allocated at the (smaller)
+    // physical pool capacity; logical positions are mapped to pool slots
+    // by KvFlashPager. The 256-stride rounding applies to whichever capacity
+    // is in effect.
+    const int ctx_phys = (ctx_alloc > 0 && ctx_alloc < max_ctx) ? ctx_alloc : max_ctx;
     const int max_ctx_alloc = needs_256_stride
-        ? ((max_ctx + 255) / 256) * 256
-        : max_ctx;
+        ? ((ctx_phys + 255) / 256) * 256
+        : ctx_phys;
 
     // ── Base context: KV cache + SSM/conv state + target_feat ────────
     {
@@ -431,6 +438,67 @@ void restore_ssm_state(TargetCache & c) {
         if (!c.conv_state_snap[i] || !c.conv_state[i]) continue;
         ggml_backend_tensor_copy(c.conv_state_snap[i], c.conv_state[i]);
     }
+}
+
+// Allocate SSM/conv rollback snapshot tensors by mirroring the live recurrent
+// state tensors' shapes. The MoE hybrid spec-decode path sets up its DeltaNet
+// state in base_buf but never calls migrate_prefill_cache, so without this
+// snapshot_ssm_state/restore_ssm_state are silent no-ops (the _snap arrays are
+// empty/null) and rejected draft tokens leak permanently into the linear
+// recurrent state, collapsing generation. Idempotent: reuses an existing
+// rollback_ctx (from a prior request or migrate_prefill_cache).
+bool ensure_ssm_snapshot(TargetCache & c, ggml_backend_t backend) {
+    if (c.rollback_ctx) return true;
+    const size_t n = c.ssm_state.size();
+    if (n == 0) return true;
+    c.ssm_state_snap.assign(n, nullptr);
+    c.conv_state_snap.assign(n, nullptr);
+
+    size_t cnt = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (c.ssm_state[i]) cnt++;
+        if (i < c.conv_state.size() && c.conv_state[i]) cnt++;
+    }
+    if (cnt == 0) return true;
+
+    ggml_init_params ip{};
+    ip.mem_size   = (cnt + 8) * ggml_tensor_overhead();
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    c.rollback_ctx = ggml_init(ip);
+    if (!c.rollback_ctx) { set_last_error("ensure_ssm_snapshot ggml_init failed"); return false; }
+
+    for (size_t i = 0; i < n; i++) {
+        char name[64];
+        if (c.ssm_state[i]) {
+            ggml_tensor * t = c.ssm_state[i];
+            ggml_tensor * sn = ggml_new_tensor(c.rollback_ctx, t->type, ggml_n_dims(t), t->ne);
+            std::snprintf(name, sizeof(name), "ssm_state_snap_%zu", i);
+            ggml_set_name(sn, name);
+            c.ssm_state_snap[i] = sn;
+        }
+        if (i < c.conv_state.size() && c.conv_state[i]) {
+            ggml_tensor * t = c.conv_state[i];
+            ggml_tensor * cn = ggml_new_tensor(c.rollback_ctx, t->type, ggml_n_dims(t), t->ne);
+            std::snprintf(name, sizeof(name), "conv_state_snap_%zu", i);
+            ggml_set_name(cn, name);
+            c.conv_state_snap[i] = cn;
+        }
+    }
+
+    c.rollback_buf = ggml_backend_alloc_ctx_tensors(c.rollback_ctx, backend);
+    if (!c.rollback_buf) {
+        set_last_error("ensure_ssm_snapshot alloc_ctx_tensors failed");
+        // Null the snap pointers so a later snapshot/restore_ssm_state (which
+        // iterates ssm_state.size()) skips them instead of dereferencing
+        // tensors from the freed rollback_ctx.
+        for (auto & p : c.ssm_state_snap)  p = nullptr;
+        for (auto & p : c.conv_state_snap) p = nullptr;
+        ggml_free(c.rollback_ctx);
+        c.rollback_ctx = nullptr;
+        return false;
+    }
+    return true;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────

@@ -188,14 +188,19 @@ struct Gemma4Cache {
     ggml_backend_buffer_t feat_buf = nullptr;
 };
 
+// `ctx_alloc` (kvflash): when > 0 and < max_ctx, FULL-attention layers' K/V
+// tensors are allocated at ctx_alloc rows (the resident pool); SWA layers
+// keep their sliding-window ring buffers (already bounded). cache.max_ctx
+// stays the logical bound. 0 = allocate full layers at max_ctx (default).
 bool  create_gemma4_cache(ggml_backend_t backend, const Gemma4Weights & w,
-                           int max_ctx, Gemma4Cache & out);
+                           int max_ctx, Gemma4Cache & out, int ctx_alloc = 0);
 bool  create_gemma4_cache_partial(ggml_backend_t backend,
                                   const Gemma4Weights & w,
                                   int max_ctx,
                                   int layer_begin,
                                   int layer_end,
-                                  Gemma4Cache & out);
+                                  Gemma4Cache & out,
+                                  int ctx_alloc = 0);
 void  free_gemma4_cache(Gemma4Cache & c);
 
 // Allocate target_feat ring buffer (call after draft load determines n_capture_layers).
@@ -221,6 +226,12 @@ void free_gemma4_snapshot(Gemma4Snapshot & s);
 // Returns logits for last token.
 // token_ids: raw token IDs needed for per-layer embedding lookup (may be nullptr
 //            if the model has no per-layer embeddings).
+// `kvflash`: optional bounded-residency pager over the FULL-attention KV
+// (see common/kvflash_pager.h). When set, full-layer append rows come from
+// the pager's slot mapping and the full mask is built in SLOT space; SWA
+// ring buffers are untouched. The caller must have allocated slots for
+// [kv_start, kv_start + n_tokens) via slot_for() beforehand. Requires the
+// set_rows path (refused under DFLASH_GEMMA4_NO_KVPAD) and fa_window == 0.
 bool gemma4_step(
     ggml_backend_t          backend,
     const Gemma4Weights &   w,
@@ -229,10 +240,17 @@ bool gemma4_step(
     const int32_t *         token_ids,
     int                     n_tokens,
     int                     kv_start,
-    std::vector<float> &    out_logits);
+    std::vector<float> &    out_logits,
+    const class KvFlashPager * kvflash = nullptr);
 
 // Verify batch: run forward pass returning argmax for ALL positions.
 // Used by DFlash speculative decode target.
+// `kvflash`: optional bounded-residency pager (caller must alloc_span()
+// [kv_start, kv_start+n_tokens) first). Full-layer writes go to pool slots
+// via set_rows with a slot-space causal mask; SWA ring writes/masks are
+// unchanged. Rejected draft slots hold future positions, so the validity
+// rule excludes them until the next verify rewrites them (KV truncation
+// semantics, same as the full cache).
 bool gemma4_verify_batch(
     ggml_backend_t          backend,
     const Gemma4Weights &   w,
@@ -241,7 +259,8 @@ bool gemma4_verify_batch(
     const int32_t *         token_ids,
     int                     n_tokens,
     int                     kv_start,
-    std::vector<int32_t> &  out_argmax);
+    std::vector<int32_t> &  out_argmax,
+    const class KvFlashPager * kvflash = nullptr);
 
 // Project hidden states through lm_head (out_norm + output + softcap + argmax).
 // Used by DFlash draft to convert draft hidden states to token IDs.

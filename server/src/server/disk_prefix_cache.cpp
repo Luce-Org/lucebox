@@ -60,13 +60,16 @@ const char * disk_prefix_cache_mode_name(DiskPrefixCacheMode mode) {
 }
 
 std::string disk_prefix_cache_policy_name(const DiskPrefixCachePolicy & policy) {
+    std::string base;
     if (policy.mode == DiskPrefixCacheMode::Fixed) {
-        return "fixed:" + std::to_string(policy.fixed_tokens);
+        base = "fixed:" + std::to_string(policy.fixed_tokens);
+    } else if (policy.mode == DiskPrefixCacheMode::Auto) {
+        base = "auto:" + std::to_string(policy.auto_window);
+    } else {
+        base = disk_prefix_cache_mode_name(policy.mode);
     }
-    if (policy.mode == DiskPrefixCacheMode::Auto) {
-        return "auto:" + std::to_string(policy.auto_window);
-    }
-    return disk_prefix_cache_mode_name(policy.mode);
+    if (policy.compress) base += "+compress";
+    return base;
 }
 
 bool parse_disk_prefix_cache_policy(const std::string & value,
@@ -111,6 +114,18 @@ bool parse_disk_prefix_cache_policy(const std::string & value,
         return true;
     }
     return false;
+}
+
+bool apply_request_scope_override(DiskPrefixCachePolicy & server_policy,
+                                  const std::string & scope_str) {
+    DiskPrefixCachePolicy parsed;
+    if (!parse_disk_prefix_cache_policy(scope_str, parsed)) {
+        return false;
+    }
+    // Preserve server-level flags (e.g. compress) across the scope override.
+    parsed.compress = server_policy.compress;
+    server_policy = parsed;
+    return true;
 }
 
 static bool valid_boundary(int n, int full_len) {

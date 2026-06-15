@@ -39,8 +39,17 @@ static ggml_tensor * build_shared_expert_subgraph(
     ggml_tensor * shared = apply_scale2(ctx,
         ggml_mul_mat(ctx, desc.ffn_down_shexp, sh_gu), desc.ffn_down_shexp_s);
     if (desc.ffn_gate_inp_shexp) {
+        // The shared-expert gate is a single-row weight (M=1): out[0,n] = sum_k W[k]*inp[k,n].
+        // Computing it as ggml_mul_mat routes to cublas, and on the shipped CUDA 12.0
+        // cublasLt the M=1 heuristic selects a gemv/split-K reduce algorithm whose kernel
+        // is ABSENT from the library once N>1 (spec-decode verify/replay batches) — for
+        // BOTH F32 (cublasSgemm SSS) and F16 (cublasGemmEx HHH splitKreduce). That poisons
+        // the stream and surfaces as an illegal access in the next op. Compute the gate as
+        // broadcast elementwise-mul + sum_rows instead: identical math, ggml kernels only,
+        // no cublas. This is what unblocks single-pass full-batch verify.
+        ggml_tensor * gate_prod = ggml_mul(ctx, inp, desc.ffn_gate_inp_shexp);
         ggml_tensor * shared_gate = apply_scale2(ctx,
-            ggml_mul_mat(ctx, desc.ffn_gate_inp_shexp, inp), desc.ffn_gate_inp_shexp_s);
+            ggml_sum_rows(ctx, gate_prod), desc.ffn_gate_inp_shexp_s);
         shared_gate = ggml_sigmoid(ctx, shared_gate);
         shared = ggml_mul(ctx, shared, shared_gate);
     }
@@ -658,6 +667,57 @@ bool build_cached_hot_batched_graph(
     return true;
 }
 
+// Cached batched COLD routed graph (CPU backend, no shared expert). Mirror of
+// build_cached_hot_batched_graph for the cold expert stack; used by the mixed
+// batched path so spec-decode verify/replay reuse the graph instead of
+// rebuilding it every call.
+static bool build_cached_cold_batched_graph(
+    CachedHotBatchedGraph & out,
+    ggml_backend_t cpu_backend,
+    MoeHybridLayerStorage & storage,
+    const MoeLayerDesc & desc,
+    const MoeHybridConfig & cfg,
+    int n_tokens) {
+
+    out.free();
+    out.n_tokens = n_tokens;
+    const int n_embd = cfg.n_embd;
+    const int n_used = cfg.n_expert_used;
+    const int n_ff_exp = cfg.n_ff_exp;
+
+    ggml_init_params ip{};
+    ip.mem_size = 128 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc = true;
+    out.ctx = ggml_init(ip);
+    if (!out.ctx) return false;
+
+    out.inp = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_input(out.inp);
+    out.sel = ggml_new_tensor_2d(out.ctx, GGML_TYPE_I32, n_used, n_tokens);
+    ggml_set_input(out.sel);
+    out.wts = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, n_used, n_tokens);
+    ggml_set_input(out.wts);
+
+    ggml_tensor * routed = nullptr;
+    build_batched_routed_graph(out.ctx,
+        storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
+        desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
+        out.inp, out.sel, out.wts, n_embd, n_ff_exp, n_used, n_tokens, &routed);
+    if (!routed) { out.free(); return false; }
+    out.output = routed;
+
+    out.gf = ggml_new_graph_custom(out.ctx, 4096, false);
+    ggml_set_output(out.output);
+    ggml_build_forward_expand(out.gf, out.output);
+    out.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
+    if (!ggml_gallocr_alloc_graph(out.alloc, out.gf)) {
+        out.free();
+        return false;
+    }
+    return true;
+}
+
 bool eval_moe_hybrid_ffn_single(
     ggml_backend_t                  gpu_backend,
     const MoeHybridConfig &         cfg,
@@ -935,6 +995,25 @@ static bool mmq_full_batch_ok(const MoeHybridConfig & cfg, int n_tokens) {
     return cfg.mmq_safe_full_batch && n_tokens >= min_tokens;
 }
 
+// Sub-batch size for the reduced-hot-stack routed mul_mat_id. The MMQ path
+// (n_tokens > 8) illegal-accesses on a REDUCED expert stack for sparse/
+// imbalanced sub-64 batches (a genuine ggml-cuda MMQ mul_mat_id bug, observed
+// on sm_86 + gfx1151); the MMVQ-mmid path is stable. Q4_K MMVQ-mmid handles up
+// to 8 tokens on CUDA sm_80+ (MMVQ_MAX_BATCH_SIZE) and 4 on AMD. Earlier this
+// had to be 1 because the F32 shared-expert gate (cublasSgemm, M=1) also faulted
+// at N>1 on the shipped CUDA 12.0 cublasLt; that is now computed cublas-free
+// (mul + sum_rows), so sub-batch=8 is safe and validated on sm_86. Default to 8
+// on sm_80+ (CUDA), 1 elsewhere (proven single-token path on unvalidated archs);
+// env override tunes per arch without a rebuild.
+static int mmq_safe_sub_batch() {
+    static const int v = [](){
+        const char * e = std::getenv("DFLASH_MMQ_SUB_BATCH");
+        if (e) return std::max(1, std::atoi(e));
+        return (query_gpu_compute_sm() >= 80) ? 8 : 1;
+    }();
+    return v;
+}
+
 static bool eval_moe_hybrid_ffn_batched_core(
     ggml_backend_t                  gpu_backend,
     ggml_backend_t                  cpu_backend,
@@ -956,6 +1035,82 @@ static bool eval_moe_hybrid_ffn_batched_core(
     out.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
     if (n_tokens <= 0) return true;
 
+    // ── Fast path: cached hot+cold batched graphs (spec-decode verify/replay) ──
+    // Mixed layers used to rebuild+free their hot and cold ggml graphs on every
+    // call; that graph churn (not the matmul) dominated the verify FFN time.
+    // Reuse per-n_tokens cached graphs so steady-state rebuilds nothing. Large
+    // prefill batches (n_tokens >= kMaxBatchedCache) fall through to the inline
+    // path below.
+    if (n_tokens > 0 && n_tokens < MoeHybridLayerStorage::kMaxBatchedCache) {
+        const int total_slots = n_used * n_tokens;
+        const int n_hot_stack = storage.gate_up_hot ? (int)storage.gate_up_hot->ne[2]
+                              : storage.gate_hot    ? (int)storage.gate_hot->ne[2] : 1;
+        const int n_cold_stack = std::max(1, (int)(storage.down_cold ? storage.down_cold->ne[2] : 1));
+        std::vector<int32_t> hot_sel(total_slots);
+        std::vector<float>   hot_wts(total_slots, 0.0f);
+        std::vector<int32_t> cold_sel(total_slots);
+        std::vector<float>   cold_wts(total_slots, 0.0f);
+        // Dummy (unused) slots must point at INITIALIZED pinned experts, not
+        // uninitialized cache-ring spare slots (hot_active..n_hot_stack), whose
+        // garbage Q4_K scale bits could dequantize to NaN (x weight 0 = NaN).
+        const int n_hot_init = std::max(1, storage.hot_active);
+        for (int i = 0; i < total_slots; ++i) { hot_sel[i] = i % n_hot_init; cold_sel[i] = i % n_cold_stack; }
+        bool fp_has_cold = false;
+        for (int i = 0; i < total_slots; ++i) {
+            const int32_t gid = selected_ids[i];
+            if (gid < 0 || gid >= (int32_t)storage.hot_local_by_global.size()) continue;
+            const int32_t hl = storage.hot_local_by_global[(size_t)gid];
+            if (hl >= 0) { hot_sel[i] = hl; hot_wts[i] = selected_weights[i]; }
+            else {
+                const int32_t cl = storage.cold_local_by_global[(size_t)gid];
+                if (cl >= 0) { cold_sel[i] = cl; cold_wts[i] = selected_weights[i]; fp_has_cold = true; }
+            }
+        }
+
+        CachedHotBatchedGraph & hg = storage.hot_batched_mixed[n_tokens];
+        const bool hg_ok = (hg.valid() && hg.n_tokens == n_tokens)
+            || build_cached_hot_batched_graph(hg, gpu_backend, storage, desc, cfg, n_tokens);
+        CachedHotBatchedGraph * cg = nullptr;
+        bool cg_ok = true;
+        if (fp_has_cold) {
+            cg = &storage.cold_batched_mixed[n_tokens];
+            cg_ok = (cg->valid() && cg->n_tokens == n_tokens)
+                || build_cached_cold_batched_graph(*cg, cpu_backend, storage, desc, cfg, n_tokens);
+        }
+
+        if (hg_ok && cg_ok) {
+            // Hot (GPU, async): shared expert + routed hot (zero-weight dummy slots
+            // keep an all-cold batch's shared-expert contribution).
+            ggml_backend_tensor_set(hg.inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+            ggml_backend_tensor_set(hg.sel, hot_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
+            ggml_backend_tensor_set(hg.wts, hot_wts.data(), 0, sizeof(float) * (size_t)total_slots);
+            ggml_backend_graph_compute_async(gpu_backend, hg.gf);
+
+            std::vector<float> cold_partial;
+            if (cg) {
+                cold_partial.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
+                ggml_backend_tensor_set(cg->inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+                ggml_backend_tensor_set(cg->sel, cold_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
+                ggml_backend_tensor_set(cg->wts, cold_wts.data(), 0, sizeof(float) * (size_t)total_slots);
+                if (ggml_backend_graph_compute(cpu_backend, cg->gf) != GGML_STATUS_SUCCESS) {
+                    ggml_backend_synchronize(gpu_backend);
+                    if (err) *err = "batched cold cached compute failed";
+                    return false;
+                }
+                ggml_backend_tensor_get(cg->output, cold_partial.data(), 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+            }
+
+            ggml_backend_synchronize(gpu_backend);
+            ggml_backend_tensor_get(hg.output, out.data(), 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+            if (cg) {
+                const size_t ntot = (size_t)n_embd * (size_t)n_tokens;
+                for (size_t i = 0; i < ntot; ++i) out[i] += cold_partial[i];
+            }
+            return true;
+        }
+        // build failed -> fall through to the inline rebuild path
+    }
+
     // ── Step 1: Partition routing into hot and cold ──
     // Dummy slots use weight 0.0 and are distributed evenly across all experts
     // to avoid pathological routing imbalance that triggers OOB in MMQ stream-k.
@@ -964,7 +1119,9 @@ static bool eval_moe_hybrid_ffn_batched_core(
                           : storage.gate_hot    ? (int)storage.gate_hot->ne[2]
                           : 1;
     std::vector<int32_t> hot_sel(total_slots);
-    for (int i = 0; i < total_slots; ++i) hot_sel[i] = i % n_hot_stack;
+    // Dummy slots -> pinned (initialized) experts only; see note above.
+    const int n_hot_init = std::max(1, storage.hot_active);
+    for (int i = 0; i < total_slots; ++i) hot_sel[i] = i % n_hot_init;
     std::vector<float>   hot_wts(total_slots, 0.0f);
     std::vector<int32_t> cold_sel(total_slots);
     for (int i = 0; i < total_slots; ++i) cold_sel[i] = i % std::max(1, (int)(storage.down_cold ? storage.down_cold->ne[2] : 1));
@@ -1175,15 +1332,15 @@ bool eval_moe_hot_only_batched(
     out.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
     if (n_tokens <= 0) return true;
 
-    // Workaround for ggml-cuda MMQ mul_mat_id bug on sm_75/gfx1151: when the
-    // hot stack is smaller than n_expert, slice into <=4-token sub-batches to
-    // route through the stable MMVQ path. Skipped on sm_80+ where MMQ is safe.
+    // Workaround for the ggml-cuda MMQ mul_mat_id stream-k fault on a REDUCED
+    // hot stack (sm_75/gfx1151 AND sm_86): slice sub-64 batches to a size the
+    // MMVQ-mmid path handles. See mmq_safe_sub_batch().
     const int n_hot_stack = storage.gate_up_hot ? (int)storage.gate_up_hot->ne[2]
                           : storage.gate_hot    ? (int)storage.gate_hot->ne[2]
                           : 0;
-    static const int MMQ_SAFE_SUB_BATCH = 4;
+    const int MMQ_SAFE_SUB_BATCH = mmq_safe_sub_batch();
     if (!mmq_full_batch_ok(cfg, n_tokens)
-        && n_hot_stack > 0 && n_hot_stack < cfg.n_expert && n_tokens > MMQ_SAFE_SUB_BATCH) {
+        && n_hot_stack > 0 && n_tokens > MMQ_SAFE_SUB_BATCH) {
         std::vector<float> sub_out;
         for (int t0 = 0; t0 < n_tokens; t0 += MMQ_SAFE_SUB_BATCH) {
             const int tc = std::min(MMQ_SAFE_SUB_BATCH, n_tokens - t0);
@@ -1215,7 +1372,12 @@ bool eval_moe_hot_only_batched(
     }
 
     // ── Fast path: use cached graph (avoids rebuild + realloc) ──
-    auto & cached = storage.hot_batched_graph;
+    // Per-n_tokens cache: spec-decode alternates verify (verify_width) and
+    // replay (commit_n) sizes; a single slot would rebuild all 40 layers' FFN
+    // graphs on every flip. Index by n_tokens so each size keeps its own graph.
+    auto & cached = (n_tokens > 0 && n_tokens < MoeHybridLayerStorage::kMaxBatchedCache)
+                  ? storage.hot_batched_mixed[n_tokens]
+                  : storage.hot_batched_graph;
     if (cached.n_tokens == n_tokens && cached.valid()) {
         // Reuse pre-built graph: just upload data and compute
         ggml_backend_tensor_set(cached.inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
@@ -1234,7 +1396,7 @@ bool eval_moe_hot_only_batched(
     // ── Slow path: build graph (first call or size mismatch) ──
     // Try to build and cache for this n_tokens size.
     // Cache when: sub-batch size (legacy), full stack (all hot), or full-batch safe (sm_80+).
-    if (mmq_full_batch_ok(cfg, n_tokens) || n_tokens == MMQ_SAFE_SUB_BATCH
+    if (mmq_full_batch_ok(cfg, n_tokens) || n_tokens <= MMQ_SAFE_SUB_BATCH
         || (n_hot_stack == 0 || n_hot_stack >= cfg.n_expert)) {
         if (build_cached_hot_batched_graph(cached, gpu_backend, storage, desc, cfg, n_tokens)) {
             // Successfully cached — use it immediately
@@ -1350,9 +1512,9 @@ bool eval_moe_hybrid_ffn_batched(
     const int n_hot_stack = storage.gate_up_hot ? (int)storage.gate_up_hot->ne[2]
                           : storage.gate_hot    ? (int)storage.gate_hot->ne[2]
                           : 0;
-    static const int MMQ_SAFE_SUB_BATCH = 4;
+    const int MMQ_SAFE_SUB_BATCH = mmq_safe_sub_batch();
     if (!mmq_full_batch_ok(cfg, n_tokens)
-        && n_hot_stack > 0 && n_hot_stack < cfg.n_expert && n_tokens > MMQ_SAFE_SUB_BATCH) {
+        && n_hot_stack > 0 && n_tokens > MMQ_SAFE_SUB_BATCH) {
         const int n_embd = cfg.n_embd;
         const int n_used = cfg.n_expert_used;
         out.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);

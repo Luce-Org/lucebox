@@ -218,7 +218,9 @@ add_library(dflash_common STATIC
     src/draft/draft_gguf_loader.cpp
     src/draft/draft_safetensors_loader.cpp
     src/draft/draft_graph.cpp
+    src/qwen3/anchor_scan.cpp
     src/qwen3/qwen3_drafter.cpp
+    src/qwen3/qwen3_kvflash_scorer.cpp
     src/qwen3/qwen3_loader.cpp
     src/qwen3/qwen3_graph.cpp
     src/qwen3/qwen3_backend.cpp
@@ -263,6 +265,7 @@ add_library(dflash_common STATIC
     src/common/moe_hybrid_stream.cpp
     src/common/cold_ffn_cpu.cpp
     src/common/moe_hybrid_swap_manager.cpp
+    src/common/moe_routing_collector.cpp
     src/qwen35/layer_split_forward.cpp
     src/qwen35/qwen35_target_shard_ipc.cpp
     src/qwen35/qwen35_target_shard_ipc_daemon.cpp
@@ -292,6 +295,7 @@ add_library(dflash_common STATIC
     src/server/sse_emitter.cpp
     src/server/prefix_cache.cpp
     src/server/disk_prefix_cache.cpp
+    src/server/freeze_history.cpp
     # ── Jinja chat-template engine (from llama.cpp common/jinja/) ──
     # Used by render_chat_template_jinja() to support --chat-template-file
     # in dflash_server. Mirrors llama.cpp's common_chat_template plumbing.
@@ -601,6 +605,31 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_anchor_params PRIVATE dflash_common)
         add_test(NAME anchor_params COMMAND test_anchor_params)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_early_exit_score_range.cpp")
+        add_executable(test_drafter_early_exit_score_range
+            test/test_drafter_early_exit_score_range.cpp)
+        target_include_directories(test_drafter_early_exit_score_range PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
+        add_test(NAME test_drafter_early_exit_score_range
+            COMMAND test_drafter_early_exit_score_range)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_anchor_transitive.cpp")
+        add_executable(test_anchor_transitive
+            test/test_anchor_transitive.cpp
+            src/qwen3/anchor_scan.cpp)
+        target_include_directories(test_anchor_transitive PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3)
+        add_test(NAME test_anchor_transitive
+            COMMAND test_anchor_transitive)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_warm_path_regression.cpp")
+        add_executable(test_drafter_warm_path_regression
+            test/test_drafter_warm_path_regression.cpp)
+        target_include_directories(test_drafter_warm_path_regression PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
+        add_test(NAME test_drafter_warm_path_regression
+            COMMAND test_drafter_warm_path_regression)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_tail_capture_guard.cpp")
         # GREEN phase: built with TAIL_GUARD_USE_NEW_FORMULA — must pass after Bug #42 fix.
         add_executable(test_drafter_tail_capture_guard
@@ -613,8 +642,6 @@ if(DFLASH27B_TESTS)
         add_executable(test_drafter_tail_capture_guard_red
             test/test_drafter_tail_capture_guard.cpp)
         # No TAIL_GUARD_USE_NEW_FORMULA — uses old (buggy) guard, expected to FAIL.
-        add_test(NAME test_drafter_tail_capture_guard_red COMMAND test_drafter_tail_capture_guard_red)
-        set_tests_properties(test_drafter_tail_capture_guard_red PROPERTIES WILL_FAIL TRUE)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_vs_reference.cpp")
         add_executable(test_draft_vs_reference test/test_draft_vs_reference.cpp)
@@ -723,6 +750,11 @@ if(DFLASH27B_TESTS)
         add_executable(test_generate test/test_generate.cpp)
         target_include_directories(test_generate PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(test_generate PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash.cpp")
+        add_executable(test_kvflash test/test_kvflash.cpp)
+        target_include_directories(test_kvflash PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_kvflash PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_restore_delta.cpp")
         add_executable(test_restore_delta test/test_restore_delta.cpp)

@@ -18,6 +18,8 @@
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
 #include "common/spark_corpus.h"
+#include "common/moe_routing_collector.h"
+#include "common/moe_hybrid_routing_stats.h"
 #include "common/peer_access.h"
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
@@ -209,7 +211,9 @@ static void print_usage(const char * prog) {
         "  --target-layer-split <weights>  Reserved layer-split weights\n"
         "  --peer-access        Enable peer access for multi-GPU placement\n"
         "  --chunk <N>          Chunked-prefill chunk size (default: 512)\n"
-        "  --fa-window <N>     Flash-attention sliding window (default: 0=full)\n"
+        "  --fa-window <N>     Flash-attention sliding window (default: 0=full).\n"
+        "                       WARNING: >0 drops system prompt / tool definitions\n"
+        "                       from attention at long contexts. Use 0 for tools.\n"
         "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
         "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
         "  --ddtree             Enable DDTree speculative decode\n"
@@ -278,6 +282,9 @@ static void print_usage(const char * prog) {
         "                              auto compares recent requests to select a stable\n"
         "                              prefix; auto:N uses the last N requests.\n"
         "                              A plain N caches the first N prompt tokens.\n"
+        "  --disk-prefix-cache-compress Enable FlowKV aged-history compression composed\n"
+        "                              with the disk cache. Requires --pflash-drafter.\n"
+        "                              compress=false default is byte-identical to base.\n"
         "\n"
         "Chat template (optional, e.g. froggeric Qwen3.6 template for tool-using\n"
         "agents that need the Anthropic tool_use envelope):\n"
@@ -285,6 +292,11 @@ static void print_usage(const char * prog) {
         "                               Overrides the hardcoded Qwen3/Laguna\n"
         "                               renderer. Empty or missing falls back\n"
         "                               to the hardcoded template.\n"
+        "\n"
+        "Expert routing analysis:\n"
+        "  --freq                       Enable expert frequency tracking + print analysis at shutdown\n"
+        "  --collect-routing <path>     Log binary routing data (hidden states + expert IDs)\n"
+        "                               for MLP predictor training (see scripts/train_predictor.py)\n"
         "\n", prog);
 }
 
@@ -408,6 +420,33 @@ int main(int argc, char ** argv) {
             bargs.fast_rollback = true;
         } else if (std::strcmp(argv[i], "--ddtree-budget") == 0 && i + 1 < argc) {
             bargs.ddtree_budget = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--kvflash") == 0 && i + 1 < argc) {
+            // Bounded KV residency: attention KV lives in a fixed pool of N
+            // tokens; cold 64-token chunks page to host. Works with or
+            // without pflash (drafter becomes the reselect scorer when
+            // loaded; plain LRU otherwise). Forces AR decode.
+            ++i;
+            if (std::strcmp(argv[i], "auto") != 0 && std::atoi(argv[i]) <= 0) {
+                std::fprintf(stderr, "--kvflash expects a positive token count or "
+                                     "'auto', got '%s'\n", argv[i]);
+                return 1;
+            }
+            ::setenv("DFLASH_KVFLASH", argv[i], 1);
+        } else if (std::strcmp(argv[i], "--kvflash-policy") == 0 && i + 1 < argc) {
+            ++i;
+            if (std::strcmp(argv[i], "drafter") != 0 && std::strcmp(argv[i], "lru") != 0) {
+                std::fprintf(stderr, "--kvflash-policy expects 'drafter' or 'lru', got '%s'\n",
+                             argv[i]);
+                return 1;
+            }
+            ::setenv("DFLASH_KVFLASH_POLICY", argv[i], 1);
+        } else if (std::strcmp(argv[i], "--kvflash-tau") == 0 && i + 1 < argc) {
+            if (std::atoi(argv[++i]) <= 0) {
+                std::fprintf(stderr, "--kvflash-tau expects a positive interval, got '%s'\n",
+                             argv[i]);
+                return 1;
+            }
+            ::setenv("DFLASH_KVFLASH_TAU", argv[i], 1);
         } else if (std::strcmp(argv[i], "--spark") == 0) {
             spark_autotune = true;
         } else if (std::strcmp(argv[i], "--spark-slots") == 0 && i + 1 < argc) {
@@ -459,6 +498,9 @@ int main(int argc, char ** argv) {
             sconfig.pflash_keep_ratio = (float)std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--prefill-drafter") == 0 && i + 1 < argc) {
             sconfig.pflash_drafter_path = argv[++i];
+            // kvflash reads this to lazy-attach the drafter as its
+            // residency scorer even when prefill compression is off.
+            ::setenv("DFLASH_KVFLASH_DRAFTER", argv[i], 1);
         } else if (std::strcmp(argv[i], "--prefill-skip-park") == 0) {
             sconfig.pflash_skip_park = true;
         } else if (std::strcmp(argv[i], "--prefill-upstream-base") == 0 && i + 1 < argc) {
@@ -546,10 +588,16 @@ int main(int argc, char ** argv) {
                 return 2;
             }
             sconfig.disk_cache_policy = policy;
+        } else if (std::strcmp(argv[i], "--disk-prefix-cache-compress") == 0) {
+            sconfig.disk_cache_policy.compress = true;
         } else if (std::strcmp(argv[i], "--cache-type-k") == 0 && i + 1 < argc) {
             cache_type_k = argv[++i];
         } else if (std::strcmp(argv[i], "--cache-type-v") == 0 && i + 1 < argc) {
             cache_type_v = argv[++i];
+        } else if (std::strcmp(argv[i], "--freq") == 0) {
+            sconfig.freq_tracking = true;
+        } else if (std::strcmp(argv[i], "--collect-routing") == 0 && i + 1 < argc) {
+            sconfig.collect_routing_path = argv[++i];
         } else {
             std::fprintf(stderr, "[server] unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -589,6 +637,23 @@ int main(int argc, char ** argv) {
     sconfig.pflash_remote = pflash_placement.remote;
 
     // ── Apply environment defaults ─────────────────────────────────────
+    // --freq / --collect-routing: enable routing stats via env vars that
+    // the backends already check. This ensures both laguna and qwen35moe
+    // allocate their routing_stats_ so we can print freq analysis at shutdown.
+    if (sconfig.freq_tracking || !sconfig.collect_routing_path.empty()) {
+        // Enable routing stats on all MoE backends. An explicit CLI flag must
+        // guarantee stats are allocated, but setenv(overwrite=0) would leave a
+        // pre-existing EMPTY env var in place — and the backends treat an empty
+        // path as "disabled", so --freq/--collect-routing would silently no-op.
+        // Force the value when unset or empty; preserve a non-empty user path.
+        auto ensure_stats_env = [](const char * name, const char * val) {
+            const char * cur = std::getenv(name);
+            if (!cur || cur[0] == '\0') setenv(name, val, 1);
+        };
+        ensure_stats_env("DFLASH_QWEN35MOE_RUNTIME_STATS_OUT", "/dev/null");
+        ensure_stats_env("DFLASH_LAGUNA_NEXT_PLACEMENT_OUT", "/dev/null");
+    }
+
     // Explicit --cache-type-k/v override via env vars.
     if (!cache_type_k.empty()) {
         setenv("DFLASH27B_KV_K", cache_type_k.c_str(), 1);
@@ -974,6 +1039,11 @@ int main(int argc, char ** argv) {
                  bargs.device.peer_access ? "ON" : "off");
     std::fprintf(stderr, "[server] │  chunk           = %d\n", bargs.chunk);
     std::fprintf(stderr, "[server] │  fa_window       = %d\n", bargs.fa_window);
+    if (bargs.fa_window > 0) {
+        std::fprintf(stderr, "[server] │  ⚠  fa_window > 0 drops system prompt / "
+                             "tool definitions from attention at long contexts.\n"
+                             "[server] │     Use --fa-window 0 for tool-call workloads.\n");
+    }
     std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
@@ -1117,7 +1187,39 @@ int main(int argc, char ** argv) {
         backend->park("draft");
     }
 
+    // Set up routing data collector (--collect-routing)
+    MoeRoutingCollector routing_collector;
+    if (!sconfig.collect_routing_path.empty()) {
+        if (!routing_collector.open(sconfig.collect_routing_path)) {
+            std::fprintf(stderr, "[server] failed to open routing collector output\n");
+            return 1;
+        }
+        if (!backend->set_routing_collector(&routing_collector)) {
+            std::fprintf(stderr, "[server] --collect-routing: this backend does not "
+                                 "support routing collection (model may not be MoE); "
+                                 "no data will be written\n");
+            routing_collector.close();
+        }
+    }
+
     int ret = server.run();
+
+    // Print frequency analysis at shutdown (--freq)
+    if (sconfig.freq_tracking) {
+        const auto * stats = backend->get_routing_stats();
+        if (stats) {
+            stats->print_freq_analysis();
+        } else {
+            std::fprintf(stderr, "[server] --freq: no routing stats available "
+                                 "(model may not be MoE)\n");
+        }
+    }
+
+    // Close routing collector (prints summary)
+    if (routing_collector.is_open()) {
+        backend->set_routing_collector(nullptr);
+        routing_collector.close();
+    }
 
     // Cleanup.
     backend->shutdown();

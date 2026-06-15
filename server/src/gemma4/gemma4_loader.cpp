@@ -475,9 +475,10 @@ void free_gemma4_weights(Gemma4Weights & w) {
 // ── Cache ──────────────────────────────────────────────────────────────
 
 bool create_gemma4_cache(ggml_backend_t backend, const Gemma4Weights & w,
-                          int max_ctx, Gemma4Cache & out) {
+                          int max_ctx, Gemma4Cache & out, int ctx_alloc) {
     return create_gemma4_cache_partial(
-        backend, w, max_ctx, /*layer_begin=*/0, /*layer_end=*/w.n_layer, out);
+        backend, w, max_ctx, /*layer_begin=*/0, /*layer_end=*/w.n_layer, out,
+        ctx_alloc);
 }
 
 bool create_gemma4_cache_partial(ggml_backend_t backend,
@@ -485,7 +486,8 @@ bool create_gemma4_cache_partial(ggml_backend_t backend,
                                   int max_ctx,
                                   int layer_begin,
                                   int layer_end,
-                                  Gemma4Cache & out) {
+                                  Gemma4Cache & out,
+                                  int ctx_alloc) {
     if (layer_begin < 0) layer_begin = 0;
     if (layer_end < 0) layer_end = w.n_layer;
     if (layer_begin > layer_end || layer_end > w.n_layer) return false;
@@ -521,6 +523,10 @@ bool create_gemma4_cache_partial(ggml_backend_t backend,
     const int swa_size = (w.sliding_window > 0 && w.sliding_window < max_ctx)
                              ? w.sliding_window : max_ctx;
 
+    // kvflash: FULL-attention layers at pool capacity; SWA ring buffers are
+    // already bounded and stay at swa_size.
+    const int full_phys = (ctx_alloc > 0 && ctx_alloc < max_ctx) ? ctx_alloc : max_ctx;
+
     // Determine KV source for each layer
     int last_kv_layer = -1;
     for (int il = 0; il < w.n_layer; ++il) {
@@ -529,7 +535,7 @@ bool create_gemma4_cache_partial(ggml_backend_t backend,
             const int D  = gemma4_head_dim(w, il);
             const int Hk = gemma4_n_head_kv(w, il);
             const bool is_swa = gemma4_is_swa_layer(w, il);
-            const int cache_len = is_swa ? swa_size : max_ctx;
+            const int cache_len = is_swa ? swa_size : full_phys;
             if (owned_layer) {
                 out.k[il] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16, D, cache_len, Hk);
                 out.v[il] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16, D, cache_len, Hk);

@@ -19,6 +19,7 @@
 
 #include "laguna_internal.h"
 #include "../common/moe_hybrid_storage.h"
+#include "../common/kvflash_pager.h"
 #include "common/ggml_graph_precision.h"
 #include "internal.h"
 #include "dflash27b.h"
@@ -44,9 +45,11 @@ static constexpr float LAGUNA_EPS = 1e-6f;
 bool create_laguna_target_cache(const LagunaTargetWeights & w,
                                  int max_ctx,
                                  ggml_backend_t backend,
-                                 LagunaTargetCache & out) {
+                                 LagunaTargetCache & out,
+                                 int ctx_alloc) {
     return create_laguna_target_cache_partial(
-        w, max_ctx, backend, /*layer_begin=*/0, /*layer_end=*/w.n_layer, out);
+        w, max_ctx, backend, /*layer_begin=*/0, /*layer_end=*/w.n_layer, out,
+        ctx_alloc);
 }
 
 bool create_laguna_target_cache_partial(const LagunaTargetWeights & w,
@@ -54,13 +57,17 @@ bool create_laguna_target_cache_partial(const LagunaTargetWeights & w,
                                          ggml_backend_t backend,
                                          int layer_begin,
                                          int layer_end,
-                                         LagunaTargetCache & out) {
+                                         LagunaTargetCache & out,
+                                         int ctx_alloc) {
     if (layer_begin < 0) layer_begin = 0;
     if (layer_end < 0) layer_end = w.n_layer;
     if (layer_begin > layer_end || layer_end > w.n_layer) {
         set_last_error("laguna cache: invalid layer range");
         return false;
     }
+
+    // kvflash: tensors at pool capacity, logical bound stays max_ctx.
+    const int ctx_phys = (ctx_alloc > 0 && ctx_alloc < max_ctx) ? ctx_alloc : max_ctx;
 
     out.backend  = backend;
     out.max_ctx  = max_ctx;
@@ -88,10 +95,10 @@ bool create_laguna_target_cache_partial(const LagunaTargetWeights & w,
         if (il < layer_begin || il >= layer_end) continue;
         char nm[32];
         std::snprintf(nm, sizeof(nm), "k_l%d", il);
-        ggml_tensor * k = ggml_new_tensor_3d(out.base_ctx, k_type, w.head_dim, max_ctx, w.n_head_kv);
+        ggml_tensor * k = ggml_new_tensor_3d(out.base_ctx, k_type, w.head_dim, ctx_phys, w.n_head_kv);
         ggml_set_name(k, nm);
         std::snprintf(nm, sizeof(nm), "v_l%d", il);
-        ggml_tensor * v = ggml_new_tensor_3d(out.base_ctx, v_type, w.head_dim, max_ctx, w.n_head_kv);
+        ggml_tensor * v = ggml_new_tensor_3d(out.base_ctx, v_type, w.head_dim, ctx_phys, w.n_head_kv);
         ggml_set_name(v, nm);
         out.attn_k[il] = k;
         out.attn_v[il] = v;
@@ -978,8 +985,14 @@ bool laguna_step(
     int                         n_tok,
     int                         kv_start,
     bool                        no_mask,
-    std::vector<float> &        out_logits)
+    std::vector<float> &        out_logits,
+    const KvFlashPager *        kvflash)
 {
+    if (kvflash && no_mask) {
+        std::fprintf(stderr, "laguna_step: kvflash requires masks (slots are "
+                             "relocated; position-implicit masking is invalid)\n");
+        return false;
+    }
     // Same CUDA-graph-replay treatment as laguna_step_hybrid: persistent
     // arena (stable node addresses -> stable graph key), stride-padded KV
     // span, and set_rows K/V append (index is an input, so node properties
@@ -1056,6 +1069,25 @@ bool laguna_step(
     std::vector<int32_t> pos((size_t)n_tok);
     for (int i = 0; i < n_tok; ++i) pos[i] = kv_start + i;
     ggml_backend_tensor_set(pp, pos.data(), 0, ggml_nbytes(pp));
+
+    if (kvflash) {
+        if (!kvi) {
+            std::fprintf(stderr, "laguna_step: kvflash requires the kv_pad "
+                                 "set_rows path (NO_KVPAD / PAD_CPY are incompatible)\n");
+            ggml_free(ctx);
+            return false;
+        }
+        std::vector<int32_t> rows;
+        std::vector<float> mfull, mswa;
+        if (!kvflash_fill_rows_and_masks(*kvflash, kv_start, n_tok, mk_w,
+                                         w.sliding_window, rows, &mfull, &mswa)) {
+            ggml_free(ctx);
+            return false;
+        }
+        ggml_backend_tensor_set(kvi, rows.data(), 0, ggml_nbytes(kvi));
+        ggml_backend_tensor_set(mk_full, mfull.data(), 0, ggml_nbytes(mk_full));
+        ggml_backend_tensor_set(mk_swa, mswa.data(), 0, ggml_nbytes(mk_swa));
+    } else {
     if (kvi) {
         ggml_backend_tensor_set(kvi, pos.data(), 0, ggml_nbytes(kvi));
     }
@@ -1082,6 +1114,7 @@ bool laguna_step(
             }
         }
         ggml_backend_tensor_set(mk_swa, mswa.data(), 0, ggml_nbytes(mk_swa));
+    }
     }
 
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
@@ -1111,8 +1144,14 @@ bool laguna_step_hybrid(
     bool                        no_mask,
     const MoeHybridStorage &    hyb,
     std::vector<float> &        out_logits,
-    std::vector<int32_t> *      out_selected)
+    std::vector<int32_t> *      out_selected,
+    const KvFlashPager *        kvflash)
 {
+    if (kvflash && no_mask) {
+        std::fprintf(stderr, "laguna_step_hybrid: kvflash requires masks (slots "
+                             "are relocated; position-implicit masking is invalid)\n");
+        return false;
+    }
     // Persistent arena: rebuilt graphs land at IDENTICAL addresses every step.
     // The ggml-cuda CUDA-graph cache is keyed on nodes[0] and memcmps node
     // properties (incl. src data pointers); address stability across steps is
@@ -1209,6 +1248,25 @@ bool laguna_step_hybrid(
     std::vector<int32_t> pos((size_t)n_tok);
     for (int i = 0; i < n_tok; ++i) pos[i] = kv_start + i;
     ggml_backend_tensor_set(pp, pos.data(), 0, ggml_nbytes(pp));
+
+    if (kvflash) {
+        if (!kvi) {
+            std::fprintf(stderr, "laguna_step_hybrid: kvflash requires the kv_pad "
+                                 "set_rows path (NO_KVPAD / PAD_CPY are incompatible)\n");
+            ggml_free(ctx);
+            return false;
+        }
+        std::vector<int32_t> rows;
+        std::vector<float> mfull, mswa;
+        if (!kvflash_fill_rows_and_masks(*kvflash, kv_start, n_tok, mk_w,
+                                         w.sliding_window, rows, &mfull, &mswa)) {
+            ggml_free(ctx);
+            return false;
+        }
+        ggml_backend_tensor_set(kvi, rows.data(), 0, ggml_nbytes(kvi));
+        ggml_backend_tensor_set(mk_full, mfull.data(), 0, ggml_nbytes(mk_full));
+        ggml_backend_tensor_set(mk_swa, mswa.data(), 0, ggml_nbytes(mk_swa));
+    } else {
     if (kvi) {
         // set_rows row indices = absolute cache positions of this step's tokens
         ggml_backend_tensor_set(kvi, pos.data(), 0, ggml_nbytes(kvi));
@@ -1231,6 +1289,7 @@ bool laguna_step_hybrid(
             for (int k = lo; k <= abs_q && k < kv_len; ++k) mswa[(size_t)q * mk_w + k] = 0.0f;
         }
         ggml_backend_tensor_set(mk_swa, mswa.data(), 0, ggml_nbytes(mk_swa));
+    }
     }
 
     // Set ALL residency LUTs in two batched H2D copies from the hot stack mapping.

@@ -18,10 +18,12 @@ import argparse
 import itertools
 import json
 import os
+import re
 import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -29,6 +31,10 @@ import venv
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+# Shared math-scoring helpers (canonical copy in harness/).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from math_scoring import _extract_boxed, _math_equiv
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_WORK_DIR = ROOT / ".harness-work"
@@ -1357,101 +1363,6 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0 if payload["ok"] else 1
 
 
-# ── Math scoring helpers (ported from bench_llm.py) ─────────────────────────
-
-import re as _re
-
-
-def _extract_boxed(text: str) -> str | None:
-    """Extract the last \\boxed{...} from a string, handling nested braces."""
-    results = []
-    i = 0
-    while i < len(text):
-        idx = text.find("\\boxed{", i)
-        if idx == -1:
-            break
-        start = idx + len("\\boxed{")
-        depth = 1
-        j = start
-        while j < len(text) and depth > 0:
-            if text[j] == "{":
-                depth += 1
-            elif text[j] == "}":
-                depth -= 1
-            j += 1
-        if depth == 0:
-            results.append(text[start:j-1].strip())
-        i = j
-    return results[-1] if results else None
-
-
-def _normalize_math(s: str | None) -> str:
-    """Normalize a math answer string for comparison."""
-    if s is None:
-        return ""
-    s = s.strip()
-    if s.startswith("$") and s.endswith("$"):
-        s = s[1:-1].strip()
-    # Strip currency $ (e.g. "$18" → "18")
-    if _re.match(r'^\$\d', s):
-        s = s[1:]
-    s = _re.sub(r"\\text\s*\{([^}]*)\}", r"\1", s)
-    s = _re.sub(r"\\mathrm\s*\{([^}]*)\}", r"\1", s)
-    for cmd in [r"\left", r"\right", r"\displaystyle", r"\tfrac", r"\dfrac"]:
-        s = s.replace(cmd, "")
-    for unit in [" cm", " m", " km", " kg", " g", " s", " ms",
-                 " degrees", " degree", "\u00b0", " inches", " feet",
-                 " square units", " units", " dollars"]:
-        if s.lower().rstrip(".").endswith(unit):
-            s = s[:len(s) - len(unit) - (1 if s.endswith(".") else 0)]
-    s = _re.sub(r"\s+", " ", s).strip()
-    s = s.rstrip(".,")
-    return s
-
-
-def _math_equiv(pred: str | None, gold: str | None) -> bool:
-    """Check if two math answers are equivalent."""
-    if pred is None or gold is None:
-        return False
-    p = _normalize_math(pred)
-    g = _normalize_math(gold)
-    if p == g:
-        return True
-    p_c = _re.sub(r"\s*\\frac", r"\\frac", p)
-    g_c = _re.sub(r"\s*\\frac", r"\\frac", g)
-    if p_c == g_c:
-        return True
-    try:
-        pf = float(p.replace(",", ""))
-        gf = float(g.replace(",", ""))
-        return abs(pf - gf) < 1e-6
-    except (ValueError, TypeError):
-        pass
-    mixed_pat = _re.compile(r"^(\d+)\s*\\frac\s*\{(\d+)\}\s*\{(\d+)\}$")
-    for s, other in [(p, g), (g, p)]:
-        m = mixed_pat.match(s)
-        if m:
-            try:
-                val = float(m.group(1)) + float(m.group(2)) / float(m.group(3))
-                oval = float(other.replace(",", ""))
-                if abs(val - oval) < 1e-6:
-                    return True
-            except (ValueError, ZeroDivisionError):
-                pass
-    frac_pat = _re.compile(r"\\?frac\s*\{([^}]+)\}\s*\{([^}]+)\}")
-    for s, other in [(p, g), (g, p)]:
-        m = frac_pat.search(s)
-        if m:
-            try:
-                val = float(m.group(1)) / float(m.group(2))
-                oval = float(other.replace(",", ""))
-                if abs(val - oval) < 1e-6:
-                    return True
-            except (ValueError, ZeroDivisionError):
-                pass
-    return False
-
-
 def _score_math_response(text: str, gold_answer: str) -> tuple[bool, str]:
     """Score a Math500 response. Returns (correct, detail_str)."""
     think_end = text.rfind("</think>")
@@ -1461,16 +1372,16 @@ def _score_math_response(text: str, gold_answer: str) -> tuple[bool, str]:
 
     # Fallback: "the answer is **X**" patterns
     if pred is None:
-        bold_pattern = _re.compile(
+        bold_pattern = re.compile(
             r'(?:answer\s+is|there\s+are|result\s+is|equals?|=)\s*\*\*(.+?)\*\*',
-            _re.IGNORECASE)
+            re.IGNORECASE)
         m = bold_pattern.search(answer_text)
         if m:
             pred = m.group(1).strip().rstrip(".")
 
     # Fallback: last $...$ expression
     if pred is None:
-        matches = _re.findall(r'\$([^$]+)\$', answer_text)
+        matches = re.findall(r'\$([^$]+)\$', answer_text)
         if matches:
             pred = matches[-1].strip()
 
@@ -1497,32 +1408,32 @@ def _score_gsm_response(text: str, gold_answer: str) -> tuple[bool, str]:
     boxed = _extract_boxed(answer_text)
     if boxed:
         cleaned = boxed.replace(",", "").replace("$", "").strip()
-        if _re.match(r'^[+-]?\d+\.?\d*$', cleaned):
+        if re.match(r'^[+-]?\d+\.?\d*$', cleaned):
             pred = cleaned
 
     # #### <number>
     if pred is None:
-        m = _re.search(r'####\s*\$?([+-]?\d[\d,]*\.?\d*)', answer_text)
+        m = re.search(r'####\s*\$?([+-]?\d[\d,]*\.?\d*)', answer_text)
         if m:
             pred = m.group(1).replace(",", "")
 
     # "the answer is **X**"
     if pred is None:
-        m = _re.search(
+        m = re.search(
             r'(?:answer\s+is|result\s+is|equals?|there\s+are|we\s+get)\s*\*?\*?\$?([+-]?\d[\d,]*\.?\d*)',
-            answer_text, _re.IGNORECASE)
+            answer_text, re.IGNORECASE)
         if m:
             pred = m.group(1).replace(",", "")
 
     # **<number>** or **$<number>**
     if pred is None:
-        m = _re.search(r'\*\*\$?([+-]?\d[\d,]*\.?\d*)\*\*', answer_text)
+        m = re.search(r'\*\*\$?([+-]?\d[\d,]*\.?\d*)\*\*', answer_text)
         if m:
             pred = m.group(1).replace(",", "")
 
     # Last standalone number
     if pred is None:
-        nums = _re.findall(r'(?<![.\d])([+-]?\d[\d,]*\.?\d*)(?![.\d])', answer_text)
+        nums = re.findall(r'(?<![.\d])([+-]?\d[\d,]*\.?\d*)(?![.\d])', answer_text)
         if nums:
             pred = nums[-1].replace(",", "")
 
@@ -1555,13 +1466,13 @@ def _score_he_response(text: str, entry_point: str, gold_test: str) -> tuple[boo
 
     # Extract code block (```python ... ``` or ``` ... ```)
     code = None
-    m = _re.search(r'```(?:python)?\s*\n(.*?)```', answer_text, _re.DOTALL)
+    m = re.search(r'```(?:python)?\s*\n(.*?)```', answer_text, re.DOTALL)
     if m:
         code = m.group(1)
     else:
         # Try to find the function definition directly
-        m = _re.search(r'((?:from\s|import\s).*?\n)?(\s*def\s+' + _re.escape(entry_point) + r'\b.*)',
-                       answer_text, _re.DOTALL)
+        m = re.search(r'((?:from\s|import\s).*?\n)?(\s*def\s+' + re.escape(entry_point) + r'\b.*)',
+                       answer_text, re.DOTALL)
         if m:
             prefix = m.group(1) or ""
             code = prefix + m.group(2)

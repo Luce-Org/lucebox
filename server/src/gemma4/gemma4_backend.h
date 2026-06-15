@@ -12,6 +12,8 @@
 #include "gemma4_internal.h"
 #include "gemma4_dflash_target.h"
 #include "common/sampler.h"
+#include "../common/kvflash_pager.h"
+#include "../common/kvflash_scorer.h"
 #include "../qwen3/qwen3_drafter.h"
 
 #include "ggml.h"
@@ -99,6 +101,27 @@ private:
     static constexpr int PREFIX_SLOTS = 64;
     Gemma4Snapshot        snapshots_[PREFIX_SLOTS];
 
+    // ── kvflash (bounded KV residency; see common/kvflash_pager.h) ──
+    // Pools the FULL-attention layers only (SWA layers already ring-buffer).
+    // Drafter-scored residency by default via the cross-tokenizer bridge
+    // (KvFlashCrossTokScorer: gemma ids are detokenized and re-scored by
+    // the Qwen3-0.6B drafter); LRU is the fallback when no drafter is
+    // found or --kvflash-policy lru.
+    KvFlashPager                   kvflash_pager_;
+    std::unique_ptr<KvFlashScorer> kvflash_scorer_;
+    std::vector<float>             kvflash_scores_;
+    std::vector<int32_t>           kvflash_history_;   // prompt + generated ids
+    std::string                    kvflash_drafter_path_;
+    int          kvflash_tokens_ = 0;     // 0 = off
+    int          kvflash_tau_    = 64;
+    bool         kvflash_drafter_failed_ = false;
+    bool kvflash_active() const { return kvflash_tokens_ > 0; }
+    void kvflash_read_config();
+    bool kvflash_attach();
+    bool kvflash_alloc_span(int kv_start, int n_tok);
+    // Drafter rescore + repage every effective-tau generated tokens.
+    void kvflash_maybe_reselect(int generated);
+
     // Prefill prompt tokens in chunks, return absolute committed position.
     // kv_offset: starting KV cache position (0 for fresh prefill, snap_pos for restore).
     int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io,
@@ -126,7 +149,8 @@ private:
                         std::vector<int32_t> & out_tokens,
                         const DaemonIO & io,
                         const BudgetHook * budget_hook = nullptr,
-                        bool * forced_close_out = nullptr);
+                        bool * forced_close_out = nullptr,
+                        float * accept_rate_out = nullptr);
 
     bool load_decode_draft();
     void free_decode_draft();

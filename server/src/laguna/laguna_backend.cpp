@@ -8,6 +8,7 @@
 
 #include "laguna_backend.h"
 #include "laguna_internal.h"
+#include "qwen3/qwen3_kvflash_scorer.h"
 #include "dflash27b.h"
 
 #include <chrono>
@@ -18,6 +19,7 @@
 #include "../common/moe_hybrid_storage.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_swap_manager.h"
+#include "../common/moe_routing_collector.h"
 #include "common/step_graph.h"
 
 #include "ggml-cuda.h"
@@ -68,14 +70,128 @@ bool LagunaBackend::init() {
 
     cache_.kv_k_type = args_.kv_type;
     cache_.kv_v_type = args_.kv_type;
-    if (!create_laguna_target_cache(w_, args_.max_ctx, backend_, cache_)) {
+    kvflash_read_config();
+    if (!create_laguna_target_cache(w_, args_.max_ctx, backend_, cache_,
+                                    kvflash_tokens_)) {
         std::fprintf(stderr, "cache failed: %s\n", dflash27b_last_error());
         free_laguna_target_weights(w_);
         ggml_backend_free(backend_); backend_ = nullptr;
         return false;
     }
+    if (!kvflash_attach()) {
+        ggml_backend_free(backend_); backend_ = nullptr;
+        return false;
+    }
 
     return true;
+}
+
+// ── kvflash helpers ─────────────────────────────────────────────────────
+
+// Laguna's pager protections: the trailing sliding_window span (+1 chunk
+// for the partially filled head) must stay resident so SWA attention stays
+// exact under paging. This drives both the pool floor and the attach config.
+KvFlashConfig LagunaBackend::kvflash_config() const {
+    KvFlashConfig pc;
+    pc.tail_window_chunks =
+        std::max(4, (w_.sliding_window + pc.chunk_tokens - 1) / pc.chunk_tokens + 1);
+    return pc;
+}
+
+void LagunaBackend::kvflash_read_config() {
+    if (std::getenv("DFLASH_KVFLASH")) {
+        kvflash_drafter_path_ = kvflash_find_drafter(args_.target_path.c_str());
+    }
+    // "auto" sizes from the GPU (weights resident, cache not yet allocated):
+    // laguna pools ALL n_layer layers at the configured KV quant.
+    KvFlashAutoBudget kvf_budget;
+    {
+        size_t gpu_free = 0, gpu_total = 0;
+        if (ggml_backend_dev_t dev = ggml_backend_get_device(backend_)) {
+            ggml_backend_dev_memory(dev, &gpu_free, &gpu_total);
+        }
+        kvf_budget.free_bytes      = (int64_t)gpu_free;
+        kvf_budget.bytes_per_token = (int64_t)w_.n_layer * w_.n_head_kv * 2 *
+            (int64_t)ggml_row_size(args_.kv_type, w_.head_dim);
+        kvf_budget.reserve_bytes   = (int64_t)(1.5 * 1073741824.0) +
+            (kvflash_drafter_path_.empty() ? 0 : (int64_t)(1.7 * 1073741824.0));
+    }
+    kvflash_tokens_ = kvflash_pool_from_env(args_.max_ctx, kvflash_config(),
+                                            !kvflash_drafter_path_.empty(),
+                                            kvf_budget);
+    if (kvflash_tokens_ > 0) {
+        const char * tau = std::getenv("DFLASH_KVFLASH_TAU");
+        kvflash_tau_ = std::max(1, tau ? std::atoi(tau) : 64);
+    }
+}
+
+// Drafter rescore + repage (FlashMemory tau loop) with the cross-tokenizer
+// scorer: laguna ids are detokenized and re-scored through the Qwen3-0.6B
+// drafter (relevance is text-level, so the tokenizer gap is bridged by
+// re-tokenization). Lazy: the drafter + tokenizers load on the first
+// reselect that needs them, never on a request's first tokens.
+void LagunaBackend::kvflash_maybe_reselect(const std::vector<int32_t> & history,
+                                           int generated) {
+    if (!kvflash_active() || kvflash_tau_ <= 0) return;
+    const int tau = std::max<int>(kvflash_tau_, (int)(history.size() / 45));
+    if (generated % tau != 0) return;
+    if (!kvflash_scorer_) {
+        if (kvflash_drafter_path_.empty() || kvflash_drafter_failed_) return;
+        if (!drafter_loaded_) {
+            ggml_backend_synchronize(backend_);
+            std::fprintf(stderr, "[kvflash] loading drafter for residency scoring: %s\n",
+                         kvflash_drafter_path_.c_str());
+            if (!load_drafter(kvflash_drafter_path_, /*gpu_layers=*/999,
+                              args_.device.gpu, drafter_ctx_)) {
+                std::fprintf(stderr, "[kvflash] drafter load failed (%s); staying on "
+                                     "LRU residency\n", dflash27b_last_error());
+                kvflash_drafter_failed_ = true;
+                return;
+            }
+            drafter_loaded_ = true;
+        }
+        kvflash_scorer_ = std::make_unique<KvFlashCrossTokScorer>(
+            &drafter_ctx_, args_.target_path, kvflash_drafter_path_);
+        std::fprintf(stderr, "[kvflash] cross-tokenizer drafter scorer attached "
+                             "(tau=%d)\n", kvflash_tau_);
+    }
+    if (!kvflash_scorer_->score_chunks(history, kvflash_pager_.chunk_tokens(),
+                                       kvflash_scores_)) {
+        return;  // scorer failure -> keep LRU behavior this round
+    }
+    kvflash_pager_.score_hook = [this](int c) {
+        return c < (int)kvflash_scores_.size() ? kvflash_scores_[c] : 1e30f;
+    };
+    const int events = kvflash_pager_.reselect();
+    kvflash_pager_.score_hook = nullptr;
+    if (events > 0) {
+        std::fprintf(stderr, "[kvflash] reselect @gen=%d: %d page events\n",
+                     generated, events);
+    }
+}
+
+bool LagunaBackend::kvflash_attach() {
+    if (!kvflash_active()) return true;
+    KvFlashConfig pc = kvflash_config();
+    pc.pool_tokens = kvflash_tokens_;
+    if (!kvflash_pager_.attach(pc, cache_.attn_k, cache_.attn_v)) {
+        std::fprintf(stderr, "kvflash: pager attach failed (pool=%d)\n",
+                     kvflash_tokens_);
+        return false;
+    }
+    std::printf("[kvflash] resident pool %d tokens (logical max_ctx %d), "
+                "policy=%s, swa_tail=%d chunks\n",
+                kvflash_tokens_, args_.max_ctx,
+                !kvflash_drafter_path_.empty()
+                    ? "drafter/cross-tok (attaches on first reselect)"
+                    : "lru (recency-only: no Qwen3-0.6B drafter found)",
+                pc.tail_window_chunks);
+    std::fflush(stdout);
+    return true;
+}
+
+bool LagunaBackend::kvflash_alloc_span(int kv_start, int n_tok) {
+    return !kvflash_active() || kvflash_pager_.alloc_span(kv_start, n_tok);
 }
 
 void LagunaBackend::print_ready_banner() const {
@@ -107,10 +223,17 @@ bool LagunaBackend::unpark(const std::string & what) {
         }
         cache_.kv_k_type = args_.kv_type;
         cache_.kv_v_type = args_.kv_type;
-        if (!create_laguna_target_cache(w_, args_.max_ctx, backend_, cache_)) {
+        if (!create_laguna_target_cache(w_, args_.max_ctx, backend_, cache_,
+                                        kvflash_tokens_)) {
             std::fprintf(stderr, "[unpark] cache: %s\n", dflash27b_last_error());
             return false;
         }
+        if (!kvflash_attach()) {
+            free_laguna_target_cache(cache_);
+            free_laguna_target_weights(w_);
+            return false;          // still parked, resources released
+        }
+        kvflash_drafter_failed_ = false;   // fresh VRAM: allow a retry
         target_parked_ = false;
         std::printf("[unpark] target restored\n"); std::fflush(stdout);
     }
@@ -132,6 +255,13 @@ bool LagunaBackend::ensure_slot(int slot) {
 }
 
 bool LagunaBackend::snapshot_save(int slot) {
+    // kvflash: snapshots copy rows assuming identity layout, which breaks
+    // after the first page-out relocates a chunk.
+    if (kvflash_active() && !kvflash_pager_.is_identity()) {
+        std::fprintf(stderr, "[kvflash] snapshot skipped: pool has relocated "
+                             "chunks (page-table serialization not implemented)\n");
+        return false;
+    }
     if (!ensure_slot(slot)) return false;
     if (!laguna_snapshot_save(cache_, snap_backend_, w_.n_layer,
                                w_.n_head_kv, w_.head_dim, snapshots_[slot])) {
@@ -189,7 +319,19 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
         return result;
     }
 
+    // kvflash: prefill rows land identity-mapped, so the prompt must fit the
+    // pool with one chunk of decode headroom (decode then evicts LRU live).
+    if (kvflash_active() &&
+        N > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
+        std::fprintf(stderr, "[kvflash] prompt (%d) exceeds pool %d; raise "
+                             "--kvflash\n", N, kvflash_tokens_);
+        result.error = "kvflash: prompt exceeds resident pool";
+        return result;
+    }
+
     reset_laguna_target_cache(cache_);
+    if (kvflash_active()) kvflash_pager_.reset();
+    const KvFlashPager * kvf = kvflash_active() ? &kvflash_pager_ : nullptr;
 
     // ── Prefill ──
     std::vector<float> embed_pf((size_t)N * w_.n_embd);
@@ -205,15 +347,23 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
     for (int c = 0; c < n_chunks && ok; ++c) {
         const int kv_start = c * args_.chunk;
         const int n_tok    = std::min(args_.chunk, N - c * args_.chunk);
-        ok = laguna_step(backend_, w_, cache_,
+        ok = kvflash_alloc_span(kv_start, n_tok) &&
+             laguna_step(backend_, w_, cache_,
                           embed_pf.data() + (size_t)kv_start * w_.n_embd,
-                          n_tok, kv_start, no_mask, last_logits);
+                          n_tok, kv_start, no_mask, last_logits, kvf);
     }
     if (!ok) { result.error = "prefill"; return result; }
     auto t_pf1 = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_pf1 - t_pf0).count();
 
     // ── Inline snapshot (if requested) ──
+    // kvflash: snapshots copy rows [0, snap_pos) assuming identity layout,
+    // which holds until the first page-out relocates a chunk.
+    if (kvflash_active() && req.snap_slot >= 0 &&
+        !kvflash_pager_.is_identity()) {
+        std::fprintf(stderr, "[kvflash] snapshot skipped: pool has relocated "
+                             "chunks (page-table serialization not implemented)\n");
+    } else
     if (req.snap_slot >= 0 && req.snap_pos > 0 && req.snap_pos <= N) {
         if (ensure_slot(req.snap_slot) &&
             laguna_snapshot_save(cache_, snap_backend_, w_.n_layer,
@@ -303,8 +453,10 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
         }
         if (!w_.embedder.embed(&next_tok, 1, embed_step.data())) { ok = false; break; }
         std::vector<float> step_logits;
-        if (!laguna_step(backend_, w_, cache_, embed_step.data(), 1,
-                          cache_.cur_pos, no_mask, step_logits)) { ok = false; break; }
+        if (!kvflash_alloc_span(cache_.cur_pos, 1) ||
+            !laguna_step(backend_, w_, cache_, embed_step.data(), 1,
+                          cache_.cur_pos, no_mask, step_logits, kvf)) { ok = false; break; }
+        kvflash_maybe_reselect(history, s + 1);
         next_tok = pick(step_logits);
     }
     auto t_g1 = std::chrono::steady_clock::now();
@@ -342,6 +494,24 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
         return result;
     }
 
+    // kvflash: restore lands rows identity-mapped; the full prompt (prefix +
+    // diff) must fit the pool. Rebuild the pager mapping over the prefix.
+    if (kvflash_active() &&
+        N > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
+        std::fprintf(stderr, "[kvflash] restore prompt (%d) exceeds pool %d; "
+                             "raise --kvflash\n", N, kvflash_tokens_);
+        result.error = "kvflash: prompt exceeds resident pool";
+        return result;
+    }
+    if (kvflash_active()) {
+        kvflash_pager_.reset();
+        if (!kvflash_alloc_span(0, prefix_len)) {
+            result.error = "kvflash_slot";
+            return result;
+        }
+    }
+    const KvFlashPager * kvf = kvflash_active() ? &kvflash_pager_ : nullptr;
+
     // Re-prefill diff tokens (or last cached token when diff is empty).
     if (prefix_len == N) {
         if (prefix_len <= 0) { result.error = "empty_diff"; return result; }
@@ -363,9 +533,10 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
         const int off   = c * args_.chunk;
         const int n_tok = std::min(args_.chunk, diff_n - off);
         const int starts = kv_start + off;
-        ok = laguna_step(backend_, w_, cache_,
+        ok = kvflash_alloc_span(starts, n_tok) &&
+             laguna_step(backend_, w_, cache_,
                           embed_diff.data() + (size_t)off * w_.n_embd,
-                          n_tok, starts, no_mask, last_logits);
+                          n_tok, starts, no_mask, last_logits, kvf);
     }
     if (!ok) { result.error = "prefill"; return result; }
 
@@ -437,8 +608,10 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
         if (out_io.cancelled) break;
         if (!w_.embedder.embed(&next_tok, 1, embed_step.data())) { ok = false; break; }
         std::vector<float> step_logits;
-        if (!laguna_step(backend_, w_, cache_, embed_step.data(), 1,
-                          cache_.cur_pos, no_mask, step_logits)) { ok = false; break; }
+        if (!kvflash_alloc_span(cache_.cur_pos, 1) ||
+            !laguna_step(backend_, w_, cache_, embed_step.data(), 1,
+                          cache_.cur_pos, no_mask, step_logits, kvf)) { ok = false; break; }
+        kvflash_maybe_reselect(history, s + 1);
         next_tok = pick(step_logits);
     }
     auto t_g1 = std::chrono::steady_clock::now();
@@ -1085,8 +1258,10 @@ bool LagunaBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
         static const bool _nm = (std::getenv("DFLASH_NO_MASK") != nullptr);
         static std::vector<float> _sg_logits;
         static std::vector<int32_t> _sg_sel;
+        if (!kvflash_alloc_span(kv_pos, 1)) return false;
         if (!laguna_step_hybrid(backend_, w_, cache_, act_cur.data(), 1, kv_pos, _nm,
-                                *moe_hybrid_, _sg_logits, &_sg_sel))
+                                *moe_hybrid_, _sg_logits, &_sg_sel,
+                                kvflash_active() ? &kvflash_pager_ : nullptr))
             return false;
         // Reactive cache warm + routing observe, POST-compute (off the
         // single-graph critical path): make each selected expert resident
@@ -1128,6 +1303,14 @@ bool LagunaBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
 
     // GPU-resident state for MoE layers
     GpuResidentState gpu_state;
+    // The per-layer fallback writes KV at literal view offsets (no set_rows),
+    // which a kvflash pool cannot express once chunks relocate.
+    if (kvflash_active()) {
+        std::fprintf(stderr, "[kvflash] laguna per-layer hybrid decode is not "
+                             "pool-aware; unset DFLASH_LAGUNA_NO_SINGLE_GRAPH\n");
+        return false;
+    }
+
     if (!init_gpu_resident_state(gpu_state, backend_, hidden)) return false;
     ggml_backend_tensor_set(gpu_state.act_cur, act_cur.data(), 0, sizeof(float) * (size_t)hidden);
 
@@ -1244,6 +1427,15 @@ bool LagunaBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
                 }
             }
 
+            // Collect routing data for predictor training
+            if (routing_collector_) {
+                std::vector<float> gate_input((size_t)w_.n_embd);
+                ggml_backend_tensor_get(layer_sg.ffn_post, gate_input.data(), 0,
+                                         sizeof(float) * (size_t)w_.n_embd);
+                routing_collector_->record(il, gate_input.data(), w_.n_embd,
+                                           selected.data(), (int)selected.size());
+            }
+
             // Hybrid FFN: hot on GPU, cold on CPU, combine on GPU
             auto & storage = moe_hybrid_->layers[(size_t)il];
             { int _lc=0; for (int _k=0;_k<(int)selected.size();++_k){ int _g=selected[(size_t)_k];
@@ -1348,7 +1540,25 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
         return result;
     }
 
+    // kvflash: hybrid prefill writes rows identity-mapped (legacy per-layer
+    // views), so the prompt must fit the pool; the pager mapping is built up
+    // front and stays identity through prefill (no eviction can trigger).
+    if (kvflash_active() &&
+        N > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
+        std::fprintf(stderr, "[kvflash] hybrid prompt (%d) exceeds pool %d; "
+                             "raise --kvflash\n", N, kvflash_tokens_);
+        result.error = "kvflash: prompt exceeds resident pool";
+        return result;
+    }
+
     reset_laguna_target_cache(cache_);
+    if (kvflash_active()) {
+        kvflash_pager_.reset();
+        if (!kvflash_alloc_span(0, N)) {
+            result.error = "kvflash_slot";
+            return result;
+        }
+    }
 
     // ── Hybrid Prefill: layer-by-layer pre-FFN + batched hybrid FFN ──
     const int hidden = w_.n_embd;
@@ -1458,6 +1668,18 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
                 if (routing_stats_) {
                     for (int i = 0; i < chunk_len; ++i) {
                         routing_stats_->observe(il, chunk_selected.data() + (size_t)i * (size_t)n_expert_used, n_expert_used);
+                    }
+                }
+
+                // Collect routing data for predictor training (prefill path)
+                if (routing_collector_) {
+                    for (int i = 0; i < chunk_len; ++i) {
+                        routing_collector_->record(
+                            il,
+                            chunk_post.data() + (size_t)i * (size_t)w_.n_embd,
+                            w_.n_embd,
+                            chunk_selected.data() + (size_t)i * (size_t)n_expert_used,
+                            n_expert_used);
                     }
                 }
 
@@ -1652,6 +1874,7 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
             break;
         }
         cache_.cur_pos++;
+        kvflash_maybe_reselect(history, s + 1);
 
         if (req.do_sample) {
             // For sampling, we need full logits — project from act_cur

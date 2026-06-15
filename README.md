@@ -7,6 +7,7 @@
   <a href="https://huggingface.co/Lucebox"><img src="https://img.shields.io/badge/HuggingFace-f5c842?style=for-the-badge&logo=huggingface&logoColor=f5c842&labelColor=090909" alt="HuggingFace"></a>
   <a href="https://discord.gg/yHfswqZmJQ"><img src="https://img.shields.io/badge/Discord-f5c842?style=for-the-badge&logo=discord&logoColor=f5c842&labelColor=090909" alt="Discord"></a>
   <a href="https://lucebox.com/blog"><img src="https://img.shields.io/badge/Blog-f5c842?style=for-the-badge&logo=rss&logoColor=f5c842&labelColor=090909" alt="Blog"></a>
+  <a href="#tutorials"><img src="https://img.shields.io/badge/Tutorials-f5c842?style=for-the-badge&logo=youtube&logoColor=f5c842&labelColor=090909" alt="Tutorials"></a>
 </p>
 
 <p align="center">
@@ -37,6 +38,10 @@ Each one is self-contained with setup instructions and benchmark notes.
   <a href="optimizations/pflash/"><img src="assets/cards/pflash_card.png" alt="PFlash speculative prefill" width="46%"></a>
   &nbsp;&nbsp;
   <a href="optimizations/spark/"><img src="assets/cards/spark_card.png" alt="Luce Spark MoE expert offload" width="46%"></a>
+</p>
+
+<p align="center">
+  <a href="optimizations/kvflash/"><img src="assets/cards/kvflash_card.png" alt="Luce KVFlash paged KV cache" width="46%"></a>
 </p>
 
 ---
@@ -256,14 +261,17 @@ DFLASH27B_KV_TQ3=1 \
 | Flag / env | Default | Effect |
 |---|---|---|
 | `--prefill-compression {off,auto,always}` | `off` | When to score+compress the prompt |
-| `--prefill-threshold N` | `32000` | Token threshold for `auto` |
+| `--prefill-threshold N` | `32000` | In `auto`, the prompt-token count above which a single-shot prompt is compressed. Also the per-message minimum that an aged message must exceed before FlowKV compresses it on multi-turn requests. Lower it (e.g. `1024`) if you want FlowKV to act on shorter history. |
 | `--prefill-keep-ratio F` | `0.05` | Fraction of source tokens kept (0.02 @128K, 0.10 @32K) |
 | `--prefill-curve T:R [T:R ...]` | off (flat keep-ratio) | Piecewise keep-ratio curve, linear-interpolated over `(tokens, ratio)` breakpoints, e.g. `10000:0.5 40000:0.2 100000:0.1` (2× compression @10K, 5× @40K, 10× @100K+). Overrides `--prefill-keep-ratio`; per-session bandit override still wins. |
 | `--prefill-drafter <gguf>` | required if on | Drafter weights (Qwen3-0.6B BF16 GGUF) |
 | `--prefill-skip-park` | off | Keep drafter resident across requests (more VRAM, faster) |
+| `PFLASH_FREEZE_HOT_WINDOW=N` | `2` | FlowKV: how many of the most recent messages stay verbatim. Everything older than this window (but after the system prompt) is compressed once and cached. Larger = more recent context kept uncompressed. |
 | `DFLASH_FP_USE_BSA=1` | `0` | Dispatch sparse FA through BSA (sm_80+); required for headline 10.4× |
 | `DFLASH_FP_ALPHA=0.85` | `0.12` | Block-selection threshold; higher = stricter = fewer K-blocks |
 | `DFLASH_FP_PROFILE=1` | `0` | Per-stage timing log |
+
+When compression is on, the request path picks one of three modes automatically, so they never stack: the first turn is sent verbatim (the system prompt stays as a stable cache anchor), multi-turn continuations use **FlowKV** (only the aged history is compressed, recent turns kept verbatim, so the disk prefix cache from `--prefix-cache-slots` keeps hitting), and a single oversized prompt with no prior turns uses whole-prompt PFlash. With `--prefill-compression off` the request path is identical to a build without compression.
 
 **KV cache**
 
@@ -275,6 +283,18 @@ DFLASH27B_KV_TQ3=1 \
 | `--prefix-cache-slots N` | — | Live prefix-cache slot count |
 | `--kv-cache-dir <path>` | — | Persist prefix cache to disk |
 | `--kv-cache-budget N` | — | On-disk cache size cap |
+
+**Bounded KV residency (KVFlash)**
+
+Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token chunks live in host RAM, bit-exact and recallable. Decode speed stops depending on context length and resident KV stays pool-sized at any context. Off by default; works on every model family. Drafter-scored residency is the default on every family: the server finds the Qwen3-0.6B drafter next to the model (or via `--prefill-drafter`) and lazy-loads it as the relevance scorer that decides which chunks stay resident — non-qwen targets (laguna, gemma4) bridge the tokenizer gap by re-tokenizing the context text for the drafter. LRU is the fallback when no drafter is present, or the explicit choice via `--kvflash-policy lru`. Per-model numbers in [Luce KVFlash →](optimizations/kvflash/README.md).
+
+| Flag / env | Default | Effect |
+|---|---|---|
+| `--kvflash <tokens\|auto>` | off | Resident pool size. `auto` sizes from the GPU: half of free VRAM after weights and reserves, at the model's KV density, capped where decode speed stays near the flat optimum (default 16384, override `DFLASH_KVFLASH_MAX_POOL`) and at `--max-ctx`. Explicit values are rounded to 256, clamped to `--max-ctx`, floored at the protected minimum so eviction always has a victim. |
+| `--kvflash-policy {drafter,lru}` | `drafter` | Residency policy. `lru` opts out of the drafter probe/load (recency-only paging, no extra VRAM). |
+| `--kvflash-tau N` | `64` | Reselect interval floor (drafter policy only); the effective interval grows with history to cap rescore overhead. |
+| `DFLASH_KVFLASH=N` | off | Env equivalent of `--kvflash`. |
+| `DFLASH_KVFLASH_TAU=N` | `64` | Env equivalent of `--kvflash-tau`. |
 
 **Thinking budget**
 
@@ -338,6 +358,18 @@ uv run --directory megakernel python final_bench.py
 [Setup →](optimizations/megakernel/) · [Bench →](optimizations/megakernel/RESULTS.md) · [Blog →](https://lucebox.com/blog/megakernel)
 
 > **Blackwell (RTX 5090, DGX Spark / GB10):** auto-detected by setup; NVFP4 decode path lands ~194 tok/s on GB10. See [optimizations/megakernel/README.md#blackwell-sm_120--sm_121a](optimizations/megakernel/README.md).
+
+---
+
+## Tutorials
+
+Video tutorials for each optimization and the harness setup.
+
+|   |   |   |
+|:-:|:-:|:-:|
+| **Luce Spark**<br>[▶ YouTube](https://www.youtube.com/watch?v=LB1aVj9lNhg) | **Luce DFlash**<br>[▶ YouTube](https://www.youtube.com/watch?v=vbPGvvSB8IQ) | **Luce Turboquant**<br>[▶ YouTube](https://www.youtube.com/watch?v=uTOOrfhrnBk) |
+| **Luce Harness setup**<br>[▶ YouTube](https://www.youtube.com/watch?v=PysoxVGfvRE) | **Luce PFlash**<br>[▶ YouTube](https://www.youtube.com/watch?v=NWeKUL9Bc6Y) | **Luce Megakernel**<br>[▶ YouTube](https://www.youtube.com/watch?v=e6jY4goVIu0) |
+| **Luce KVFlash**<br>[▶ YouTube](https://www.youtube.com/watch?v=8rTVCRWvRDo) |   |   |
 
 ---
 

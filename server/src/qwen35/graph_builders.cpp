@@ -2,6 +2,7 @@
 
 #include "ggml-alloc.h"
 
+#include <algorithm>
 #include <cstdio>
 
 namespace dflash::common {
@@ -88,7 +89,9 @@ bool build_layer_prefn_step(
     int n_tokens,
     bool with_mask,
     int fa_window,
-    int kq_stride_pad) {
+    int kq_stride_pad,
+    bool kvflash) {
+    if (kvflash) with_mask = true;   // slot-space masking is mandatory on the pool
     step_graph_free(sg);
 
     ggml_init_params ip{};
@@ -109,12 +112,25 @@ bool build_layer_prefn_step(
         ggml_set_name(sg.positions, "positions");
         ggml_set_input(sg.positions);
         if (with_mask) {
-            const int max_win_len = cache.max_ctx + n_tokens;
+            // Mask width follows the PHYSICAL tensor capacity (pool-sized
+            // under kvflash) so it agrees with the FA span clamp inside
+            // build_full_attn_block.
+            int phys_ctx = cache.max_ctx;
+            for (ggml_tensor * t : cache.attn_k) {
+                if (t) { phys_ctx = std::min(phys_ctx, (int)t->ne[1]); break; }
+            }
+            const int max_win_len = phys_ctx + n_tokens;
             const int kv_pad = align_up(max_win_len, kq_stride_pad);
             const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
             sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
             ggml_set_name(sg.attn_mask, "attn_mask");
             ggml_set_input(sg.attn_mask);
+        }
+        if (kvflash) {
+            sg.kv_write_rows = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_I64,
+                                                  n_tokens, w.n_head_kv);
+            ggml_set_name(sg.kv_write_rows, "kv_write_rows");
+            ggml_set_input(sg.kv_write_rows);
         }
     }
 
@@ -122,7 +138,8 @@ bool build_layer_prefn_step(
     QwenLayerPrefnOutputs go = build_qwen35_layer_prefn(
         sg.ctx, sg.gf, w, cache, layer_idx,
         sg.inp_embed, sg.positions, sg.attn_mask,
-        kv_start, n_tokens, fa_window);
+        kv_start, n_tokens, fa_window,
+        sg.kv_write_rows);
     if (!go.residual || !go.post) return false;
     sg.ffn_residual = go.residual;
     sg.ffn_post = go.post;
@@ -236,7 +253,8 @@ bool build_target_step(
     int fa_window,
     bool last_token_logits_only,
     int kq_stride_pad,
-    bool capture_moe_router) {
+    bool capture_moe_router,
+    bool kvflash_mask) {
     step_graph_free(sg);
 
     // Persistent thread_local arena: rebuilt step graphs land at identical
@@ -266,7 +284,13 @@ bool build_target_step(
         // Use max_ctx for mask allocation so the gallocr buffer never needs to
         // grow as kv_start increases during generation.  The actual mask is
         // filled only up to kv_start + n_tokens; the excess is don't-care.
-        const int max_win_len = cache.max_ctx + n_tokens;
+        // kvflash mode: the physical span is the (smaller) pool capacity of
+        // the attention tensors, so size the mask from those instead.
+        int phys_ctx = cache.max_ctx;
+        for (auto * t : cache.attn_k) {
+            if (t) { phys_ctx = std::min(phys_ctx, (int)t->ne[1]); break; }
+        }
+        const int max_win_len = phys_ctx + n_tokens;
         const int kv_pad = align_up(max_win_len, kq_stride_pad);
         const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
         sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
@@ -280,8 +304,16 @@ bool build_target_step(
     // DFLASH_QWEN35_NO_KVPAD=1 restores the legacy cpy append + exact-length
     // FA span (per-step node properties -> no CUDA-graph replay).
     static const bool g_no_kvpad = (std::getenv("DFLASH_QWEN35_NO_KVPAD") != nullptr);
-    const bool use_kv_write_rows = (!g_no_kvpad && n_tokens == 1 && fa_window == 0 &&
-                                    !with_mask && !capture && !capture_delta_intermediate);
+    // kvflash_mask: kvflash mode. The mask carries pool slot validity
+    // (uploaded by the caller before EVERY compute — the input's buffer
+    // region is reused by graph execution) and set_rows carries per-token
+    // physical slots, so the slot-mapped write stays active for masked,
+    // multi-token, and feature-capturing forwards (decode AND spec verify).
+    const bool use_kv_write_rows =
+        !g_no_kvpad && !capture_delta_intermediate &&
+        (kvflash_mask
+             ? (fa_window == 0)
+             : (n_tokens == 1 && fa_window == 0 && !with_mask && !capture));
     if (use_kv_write_rows) {
         sg.kv_write_rows = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_I64,
                                               n_tokens, w.n_head_kv);

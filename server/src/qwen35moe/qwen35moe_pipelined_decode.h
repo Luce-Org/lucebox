@@ -12,6 +12,7 @@
 #include "internal.h"
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_storage.h"
+#include "../common/moe_routing_collector.h"
 #include "../common/cold_ffn_compute.h"
 #include "graph_builders.h"
 
@@ -137,6 +138,9 @@ struct PipelinedDecodeState {
     int n_expert_used = 0;
     int full_attention_interval = 0;
 
+    // Optional routing data collector (not owned, set from backend)
+    MoeRoutingCollector * routing_collector = nullptr;
+
     PipelinedDecodeState() = default;
     ~PipelinedDecodeState() { destroy(); }
     PipelinedDecodeState(const PipelinedDecodeState &) = delete;
@@ -197,14 +201,18 @@ bool init_pipelined_decode_state(
 // Run one full token through the pipelined decode loop (all n_layer layers).
 // On success, gpu_state.act_cur holds the final hidden state on GPU.
 // selected_ids_out / weights_out: optional per-layer routing capture for telemetry.
+// kv_slot: physical KV row to write (kvflash pool slot); -1 = kv_pos (identity,
+// no pool). The FA span clamps to the cache tensor's physical capacity, so
+// pool-sized tensors bound the cached-graph window automatically.
 bool pipelined_decode_one_token(
     PipelinedDecodeState & state,
     ggml_backend_t backend,
     const TargetWeights & w,
     TargetCache & cache,
     MoeHybridStorage & hybrid,
-    int kv_pos,              // current KV position
+    int kv_pos,              // current KV position (logical; drives RoPE)
     int kq_stride_pad,
-    PipelinedDecodeTelemetry * telemetry = nullptr);
+    PipelinedDecodeTelemetry * telemetry = nullptr,
+    int kv_slot = -1);
 
 }  // namespace dflash::common

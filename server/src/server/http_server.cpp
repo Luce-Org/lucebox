@@ -4,10 +4,12 @@
 // job queue, worker thread with SSE streaming and disconnect detection.
 
 #include "http_server.h"
+#include "admission.h"
 #include "sse_emitter.h"
 #include "prompt_normalize.h"
 #include "tool_hint.h"
 #include "common/sha1.h"
+#include "freeze_history.h"
 
 #ifdef DFLASH_HAS_CURL
 #include <curl/curl.h>
@@ -1372,14 +1374,12 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         if (body.contains("prefix_cache") && body["prefix_cache"].is_object()) {
             const auto & pc = body["prefix_cache"];
             if (pc.contains("scope") && pc["scope"].is_string()) {
-                DiskPrefixCachePolicy parsed_policy;
-                if (!parse_disk_prefix_cache_policy(pc["scope"].get<std::string>(),
-                                                    parsed_policy)) {
+                if (!apply_request_scope_override(req.disk_cache_policy,
+                                                  pc["scope"].get<std::string>())) {
                     send_error(fd, 400,
                         "prefix_cache.scope must be off, full, auto, auto:<window>, or a positive token count");
                     return true;
                 }
-                req.disk_cache_policy = parsed_policy;
             }
             if (pc.contains("window") && pc["window"].is_number_integer()) {
                 const int window = pc["window"].get<int>();
@@ -1641,10 +1641,19 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         return true;  // handled (with error)
     }
 
-    // Check context length.
-    if ((int)req.prompt_tokens.size() + req.max_output > config_.max_ctx) {
-        send_error(fd, 400, "prompt + max_tokens exceeds context window");
-        return true;
+    // Check context length; oversized + compression_enabled passes through — post-compress check is the real gate.
+    {
+        const int n_prompt = (int)req.prompt_tokens.size();
+        const bool pflash_will_run =
+            (config_.pflash_mode != ServerConfig::PflashMode::OFF) &&
+            (drafter_tokenizer_ != nullptr) &&
+            (config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
+             n_prompt >= config_.pflash_threshold);
+        if (should_reject_oversized(n_prompt, req.max_output,
+                                    config_.max_ctx, pflash_will_run)) {
+            send_error(fd, 400, "prompt + max_tokens exceeds context window");
+            return true;
+        }
     }
 
     std::fprintf(stderr,
@@ -1782,10 +1791,11 @@ void HttpServer::worker_loop() {
             }
         }
 
-        // ── PFlash speculative prefill compression ────────────────────
-        // If pflash is enabled and prompt exceeds threshold, compress.
+        // ── PFlash / FlowKV unified gate: FlowKV > WS1 skip > whole-prompt pFlash ──
         std::vector<int32_t> effective_prompt = req.prompt_tokens;
         bool pflash_compressed = false;
+        // Compressed token count served from pFlash full-cache (-1 = not a full-cache hit).
+        int pflash_full_cache_served_tokens = -1;
 
         if (config_.pflash_mode != ServerConfig::PflashMode::OFF &&
             drafter_tokenizer_ != nullptr)
@@ -1798,6 +1808,233 @@ void HttpServer::worker_loop() {
                 should_compress = (n_prompt >= config_.pflash_threshold);
             }
 
+            // Detect whether this is a multi-turn continuation.
+            bool is_continuation = false;
+            if (should_compress && req.messages.is_array()) {
+                for (const auto & _m : req.messages) {
+                    if (!_m.is_object()) continue;
+                    const std::string _role = _m.value("role", "");
+                    if (_role == "assistant") { is_continuation = true; break; }
+                    if (_m.contains("tool_calls")) {
+                        const auto & _tc = _m["tool_calls"];
+                        if (_tc.is_array() && !_tc.empty()) { is_continuation = true; break; }
+                    }
+                    if (_m.contains("content") && _m["content"].is_array()) {
+                        for (const auto & _b : _m["content"]) {
+                            if (_b.is_object() &&
+                                (_b.value("type", "") == "tool_result" ||
+                                 _b.value("type", "") == "tool_use")) {
+                                is_continuation = true; break;
+                            }
+                        }
+                    }
+                    const std::string _itype = _m.value("type", "");
+                    if (_itype == "function_call" || _itype == "function_call_output") {
+                        is_continuation = true; break;
+                    }
+                    if (is_continuation) break;
+                }
+            }
+
+            // FlowKV: compress aged msgs[1..n-hot_window) once per session; system + hot tail verbatim.
+            if (should_compress && is_continuation && req.disk_cache_policy.compress &&
+                req.messages.is_array())
+            {
+                int hot_window = 2;
+                {
+                    const char * hwe = std::getenv("PFLASH_FREEZE_HOT_WINDOW");
+                    if (hwe && *hwe) {
+                        int v = std::atoi(hwe);
+                        if (v > 0) hot_window = v;
+                    }
+                }
+                const int n_msgs = (int)req.messages.size();
+                if (n_msgs >= 2 + hot_window) {
+                    const int aged_begin = 1;
+                    const int aged_end   = n_msgs - hot_window;  // exclusive
+
+                    // Inert-guard: skip if aged band < 512 drafter tokens.
+                    int aged_token_estimate = 0;
+                    for (int mi = aged_begin; mi < aged_end; ++mi) {
+                        const auto & msg = req.messages[mi];
+                        if (!msg.is_object()) continue;
+                        std::string mc;
+                        if (msg.contains("content")) {
+                            const auto & c = msg["content"];
+                            if (c.is_string()) mc = c.get<std::string>();
+                            else if (c.is_array()) {
+                                for (const auto & part : c) {
+                                    if (!part.is_object()) continue;
+                                    const std::string pt = part.value("type", "");
+                                    if (pt == "text" || pt == "input_text" ||
+                                        pt == "output_text")
+                                        mc += part.value("text", "");
+                                }
+                            }
+                        }
+                        if (!mc.empty())
+                            aged_token_estimate += (int)drafter_tokenizer_->encode(mc).size();
+                    }
+                    static constexpr int kFkvInertMinTokens = 512;
+                    if (aged_token_estimate < kFkvInertMinTokens) {
+                        std::fprintf(stderr,
+                            "[flowkv] inert-guard: aged band %d toks < %d — skip\n",
+                            aged_token_estimate, kFkvInertMinTokens);
+                        should_compress = false;
+                    } else {
+                        json modified_messages = req.messages;
+                        bool any_compressed = false;
+                        int n_cache_hits = 0;
+
+                        for (int mi = aged_begin; mi < aged_end; ++mi) {
+                            auto & msg = modified_messages[mi];
+                            if (!msg.is_object()) continue;
+
+                            std::string msg_content;
+                            if (msg.contains("content")) {
+                                const auto & c = msg["content"];
+                                if (c.is_string()) {
+                                    msg_content = c.get<std::string>();
+                                } else if (c.is_array()) {
+                                    for (const auto & part : c) {
+                                        if (!part.is_object()) continue;
+                                        const std::string ptype = part.value("type", "");
+                                        if (ptype == "text" || ptype == "input_text" ||
+                                            ptype == "output_text")
+                                            msg_content += part.value("text", "");
+                                    }
+                                }
+                            }
+                            if (msg_content.empty()) continue;
+
+                            auto msg_drafter_ids = drafter_tokenizer_->encode(msg_content);
+                            if ((int)msg_drafter_ids.size() < config_.pflash_threshold) continue;
+
+                            const PrefixHash msg_key = frozen_block_key(
+                                msg_drafter_ids.data(), 0, (int)msg_drafter_ids.size());
+
+                            std::string compressed_text;
+                            auto cache_it = frozen_content_cache_.find(msg_key);
+                            if (cache_it != frozen_content_cache_.end()) {
+                                compressed_text = cache_it->second;
+                                ++n_cache_hits;
+                                std::fprintf(stderr,
+                                    "[flowkv] msg[%d] cache hit (%zu drafter toks)\n",
+                                    mi, msg_drafter_ids.size());
+                            } else {
+                                ModelBackend::CompressRequest creq;
+                                creq.input_ids    = std::move(msg_drafter_ids);
+                                creq.keep_ratio   = pflash_keep_ratio(config_, (int)creq.input_ids.size());
+                                creq.drafter_path = config_.pflash_drafter_path;
+                                creq.drafter_gpu  = config_.pflash_drafter_gpu;
+                                creq.skip_park    = config_.pflash_skip_park;
+                                creq.residency_action = resolve_draft_residency_action(
+                                    config_.draft_residency,
+                                    DraftResidencyContext{
+                                        DraftResidencyUse::PFlashCompress,
+                                        config_.lazy_draft,
+                                        !config_.draft_path.empty(),
+                                    });
+
+                                auto cresult = backend_.compress(creq);
+                                if (!cresult.ok || cresult.compressed_ids.empty()) {
+                                    std::fprintf(stderr,
+                                        "[flowkv] msg[%d] compress failed — kept verbatim\n", mi);
+                                    continue;
+                                }
+                                compressed_text = drafter_tokenizer_->decode(cresult.compressed_ids);
+                                std::fprintf(stderr,
+                                    "[flowkv] msg[%d] %zu → %zu drafter toks (keep=%.2f)\n",
+                                    mi, creq.input_ids.size(),
+                                    cresult.compressed_ids.size(), creq.keep_ratio);
+
+                                if (frozen_content_cache_.size() >= kFrozenCacheMax) {
+                                    std::fprintf(stderr,
+                                        "[flowkv] cache full (%zu entries) — clearing\n",
+                                        frozen_content_cache_.size());
+                                    frozen_content_cache_.clear();
+                                }
+                                frozen_content_cache_.emplace(msg_key, compressed_text);
+                            }
+
+                            msg["content"] = compressed_text;
+                            any_compressed = true;
+                        }
+
+                        if (any_compressed) {
+                            const bool   fkv_enable_thinking = req.thinking_enabled;
+                            std::string  fkv_tools_json;
+                            if (req.tools.is_array() && !req.tools.empty()) {
+                                fkv_tools_json = req.tools.dump();
+                            }
+                            std::vector<ChatMessage> fkv_chat_msgs =
+                                normalize_chat_messages(modified_messages, req.format,
+                                                        tool_memory_);
+                            std::string fkv_rendered;
+                            bool fkv_render_ok = true;
+                            if (!config_.chat_template_src.empty()) {
+                                const std::string & bos_str = (tokenizer_.bos_id() >= 0)
+                                    ? tokenizer_.raw_token(tokenizer_.bos_id())
+                                    : std::string();
+                                const std::string & eos_str = (tokenizer_.eos_id() >= 0)
+                                    ? tokenizer_.raw_token(tokenizer_.eos_id())
+                                    : std::string();
+                                try {
+                                    fkv_rendered = render_chat_template_jinja(
+                                        config_.chat_template_src,
+                                        fkv_chat_msgs,
+                                        bos_str, eos_str,
+                                        /*add_generation_prompt=*/true,
+                                        fkv_enable_thinking,
+                                        fkv_tools_json);
+                                } catch (const std::exception & e) {
+                                    std::fprintf(stderr,
+                                        "[flowkv] jinja re-render failed (%s) — skipping\n",
+                                        e.what());
+                                    fkv_render_ok = false;
+                                }
+                            } else {
+                                fkv_rendered = render_chat_template(
+                                    fkv_chat_msgs, chat_format_,
+                                    true, fkv_enable_thinking, fkv_tools_json);
+                            }
+                            if (fkv_render_ok) {
+                                const int n_before = (int)effective_prompt.size();
+                                effective_prompt  = tokenizer_.encode(fkv_rendered);
+                                pflash_compressed = true;
+                                std::fprintf(stderr,
+                                    "[flowkv] %d → %d target toks "
+                                    "(%d aged msgs, %d cache hits, hot_window=%d)\n",
+                                    n_before, (int)effective_prompt.size(),
+                                    aged_end - aged_begin, n_cache_hits, hot_window);
+                            }
+                            should_compress = false;
+                        } else {
+                            should_compress = false;
+                            std::fprintf(stderr,
+                                "[flowkv] no aged msgs above threshold — skip\n");
+                        }
+                    }
+                } else {
+                    should_compress = false;
+                    std::fprintf(stderr,
+                        "[flowkv] too few turns (n_msgs=%d hot_window=%d) — skip\n",
+                        n_msgs, hot_window);
+                }
+            } else if (should_compress && is_continuation) {
+                // Continuation without FlowKV: skip compression to preserve prefix KV cache (~22x).
+                should_compress = false;
+                std::fprintf(stderr,
+                    "[pflash] skip-compress (continuation: prior assistant/tool history)\n");
+            }
+
+            // WS1: turn-1 verbatim anchor — compressing would cold-poison turn-2 cache key.
+            if (should_compress && !is_continuation && req.disk_cache_policy.compress) {
+                should_compress = false;
+                std::fprintf(stderr,
+                    "[flowkv] turn-1 verbatim (system kept as cache anchor)\n");
+            }
+
             if (should_compress) {
                 // Check full-compress cache FIRST — if we've seen this exact
                 // raw prompt before, skip the expensive compress cycle entirely.
@@ -1807,6 +2044,8 @@ void HttpServer::worker_loop() {
                     pflash_compressed = true;
                     // effective_prompt stays as req.prompt_tokens — the cached KV
                     // state will be restored via cache_slot below.
+                    // Record the compressed size for the post-compress budget gate.
+                    pflash_full_cache_served_tokens = full_len;
                 } else {
                     std::string compression_error;
                     // 1. Decode prompt to text using target tokenizer
@@ -1932,6 +2171,16 @@ void HttpServer::worker_loop() {
                     }
                 }
             }
+        }
+
+        // Post-compress gate: reject if still oversized after FlowKV/pFlash.
+        // On a pFlash full-cache hit, use the cached compressed size (not the raw
+        // effective_prompt) — the KV was built from the compressed form.
+        if (effective_prompt_overflows((int)effective_prompt.size(),
+                                       pflash_full_cache_served_tokens,
+                                       req.max_output, config_.max_ctx)) {
+            fail_request(400, "effective prompt + max_tokens exceeds context window after compression");
+            continue;
         }
 
         // ── Upstream proxy: forward to remote server if configured ────
@@ -2112,10 +2361,26 @@ void HttpServer::worker_loop() {
         static constexpr int DISK_STAGING_SLOT = ModelBackend::kMaxSlots - 1;
         bool disk_hit = false;
         DiskPrefixCachePolicy disk_policy = req.disk_cache_policy;
-        if (pflash_compressed) {
-            // Auto/fixed boundaries are selected against the uncompressed
-            // request stream. Once PFlash rewrites effective_prompt, only
-            // exact full-cache restore remains well-defined.
+        // system_end: first chat-marker boundary; FlowKV clamps disk cache to verbatim system prefix.
+        int system_end = 0;
+        if (pflash_compressed && req.disk_cache_policy.compress) {
+            // FlowKV: cache only [0, system_end) — stable cross-session key, never compressed.
+            auto fkv_boundaries =
+                find_all_boundaries(effective_prompt, prefix_cache_.chat_markers());
+            system_end = fkv_boundaries.empty() ? 0 : fkv_boundaries[0];
+            if (system_end >= config_.disk_cache_min_tokens) {
+                disk_policy.mode = DiskPrefixCacheMode::Fixed;
+                disk_policy.fixed_tokens = system_end;
+                std::fprintf(stderr,
+                    "[flowkv] disk-clamp: boundary clamped to system_end=%d\n", system_end);
+            } else {
+                disk_policy.mode = DiskPrefixCacheMode::Off;
+                std::fprintf(stderr,
+                    "[flowkv] disk-clamp: system_end=%d < min=%d — disk off\n",
+                    system_end, config_.disk_cache_min_tokens);
+            }
+        } else if (pflash_compressed) {
+            // Standard PFlash (compress=false): effective_prompt is rewritten; only Full cache is safe.
             if (disk_policy.mode != DiskPrefixCacheMode::Full) {
                 disk_policy.mode = DiskPrefixCacheMode::Off;
             }
@@ -2522,8 +2787,14 @@ void HttpServer::worker_loop() {
             }
         }
 
-        if (!disk_cache_.disabled() && !pflash_compressed) {
-            recent_disk_prompts_.insert(recent_disk_prompts_.begin(), effective_prompt);
+        if (!disk_cache_.disabled()) {
+            if (!pflash_compressed) {
+                recent_disk_prompts_.insert(recent_disk_prompts_.begin(), effective_prompt);
+            } else if (req.disk_cache_policy.compress) {
+                // FlowKV: record verbatim prompt so Auto boundary lookups see stable content.
+                recent_disk_prompts_.insert(recent_disk_prompts_.begin(), req.prompt_tokens);
+            }
+            // pflash_compressed && !compress: skip (effective_prompt is rewritten).
             static constexpr size_t kMaxRecentDiskPrompts = 256;
             if (recent_disk_prompts_.size() > kMaxRecentDiskPrompts) {
                 recent_disk_prompts_.resize(kMaxRecentDiskPrompts);

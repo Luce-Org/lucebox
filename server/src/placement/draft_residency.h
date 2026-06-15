@@ -71,12 +71,8 @@ inline DraftResidencyAction resolve_draft_residency_action(
 
     switch (ctx.use) {
     case DraftResidencyUse::PFlashCompress:
-        // In auto mode, only release the PFlash drafter when the operator gave
-        // a low-VRAM hint. That preserves the existing fast resident path while
-        // allowing small-card setups to make room for decode draft/target state.
-        return ctx.low_vram_hint
-            ? DraftResidencyAction::ReleaseAfterUse
-            : DraftResidencyAction::KeepLoaded;
+        // Auto releases the pflash drafter after scoring: resident drafter starves target prefill on 24GB cards; lazy reload costs ~2s.
+        return DraftResidencyAction::ReleaseAfterUse;
     case DraftResidencyUse::DFlashDecode:
         // DFlash draft is latency-sensitive; keep it resident unless the
         // operator explicitly opted into the low-VRAM/request-scoped path.

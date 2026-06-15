@@ -45,12 +45,23 @@ struct DiskPrefixCachePolicy {
     DiskPrefixCacheMode mode = DiskPrefixCacheMode::Full;
     int fixed_tokens = 0;
     int auto_window = 30;
+    // When true: compose with FlowKV aged-history compression.
+    // compress=false (default) → byte-identical to pr364-base behaviour.
+    bool compress = false;
 };
 
 const char * disk_prefix_cache_mode_name(DiskPrefixCacheMode mode);
 std::string disk_prefix_cache_policy_name(const DiskPrefixCachePolicy & policy);
 bool parse_disk_prefix_cache_policy(const std::string & value,
                                     DiskPrefixCachePolicy & out);
+
+// Apply a request-level scope string on top of a server-level policy.
+// Parses scope_str into a new mode/window/fixed_tokens, then merges it with
+// server_policy so that server-level flags (e.g. compress) are preserved.
+// Returns false (and leaves server_policy unchanged) if scope_str is invalid.
+bool apply_request_scope_override(DiskPrefixCachePolicy & server_policy,
+                                  const std::string & scope_str);
+
 int disk_prefix_cache_fixed_boundary(const DiskPrefixCachePolicy & policy,
                                      int full_len,
                                      int min_tokens = 1);

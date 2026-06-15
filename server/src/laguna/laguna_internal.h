@@ -168,16 +168,21 @@ struct LagunaTargetCache {
     std::vector<ggml_tensor *> attn_v;
 };
 
+// `ctx_alloc` (kvflash): when > 0 and < max_ctx, the per-layer K/V tensors
+// are allocated at ctx_alloc rows (the resident pool) while cache.max_ctx
+// keeps the logical bound. 0 = allocate at max_ctx (default).
 bool create_laguna_target_cache(const LagunaTargetWeights & w,
                                  int max_ctx,
                                  ggml_backend_t backend,
-                                 LagunaTargetCache & out);
+                                 LagunaTargetCache & out,
+                                 int ctx_alloc = 0);
 bool create_laguna_target_cache_partial(const LagunaTargetWeights & w,
                                          int max_ctx,
                                          ggml_backend_t backend,
                                          int layer_begin,
                                          int layer_end,
-                                         LagunaTargetCache & out);
+                                         LagunaTargetCache & out,
+                                         int ctx_alloc = 0);
 void free_laguna_target_cache(LagunaTargetCache & c);
 void reset_laguna_target_cache(LagunaTargetCache & c);
 
@@ -280,6 +285,12 @@ LagunaGraphOutputs build_laguna_graph(
 // `out_logits` : on success, resized to vocab and filled with last-token
 //             logits when in.output_last_only == true (default in this
 //             helper).
+// `kvflash`: optional bounded-residency pager (see common/kvflash_pager.h).
+// When set, the K/V append rows come from the pager's slot mapping and both
+// masks are built in SLOT space (causal / sliding-window conditions evaluated
+// on the position each slot holds). The caller must have allocated slots for
+// [kv_start, kv_start + n_tok) via slot_for() beforehand. Requires the
+// kv_pad set_rows path (refused otherwise).
 bool laguna_step(
     ggml_backend_t              backend,
     const LagunaTargetWeights & w,
@@ -288,7 +299,8 @@ bool laguna_step(
     int                         n_tok,
     int                         kv_start,
     bool                        no_mask,
-    std::vector<float> &        out_logits);
+    std::vector<float> &        out_logits,
+    const class KvFlashPager *  kvflash = nullptr);
 
 // Forward decl (full definition in common/moe_hybrid_storage.h).
 struct MoeHybridStorage;
@@ -306,7 +318,8 @@ bool laguna_step_hybrid(
     bool                        no_mask,
     const MoeHybridStorage &    hyb,
     std::vector<float> &        out_logits,
-    std::vector<int32_t> *      out_selected = nullptr);
+    std::vector<int32_t> *      out_selected = nullptr,
+    const class KvFlashPager *  kvflash = nullptr);
 
 struct LagunaLayerStepGraph {
     ggml_context * ctx = nullptr;

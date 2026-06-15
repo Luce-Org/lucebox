@@ -10,11 +10,14 @@
 #include "laguna_internal.h"
 #include "placement/placement_config.h"
 #include "qwen3_drafter.h"
+#include "kvflash_pager.h"
+#include "kvflash_scorer.h"
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_storage.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_swap_manager.h"
 #include "../common/moe_hybrid_stream.h"
+#include "../common/moe_routing_collector.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -71,6 +74,9 @@ public:
 
     void shutdown() override;
 
+    bool set_routing_collector(MoeRoutingCollector * c) override { routing_collector_ = c; return true; }
+    const MoeHybridRoutingStats * get_routing_stats() const override { return routing_stats_.get(); }
+
 private:
     LagunaBackendArgs                           args_;
     ggml_backend_t                              backend_   = nullptr;
@@ -96,8 +102,37 @@ private:
     MoeHybridSwapPolicy                        swap_policy_;
     bool                                       hybrid_telemetry_ = false;
     MoeHybridStreamEngine                      stream_engine_;
+    MoeRoutingCollector *                       routing_collector_ = nullptr;
 
     bool ensure_slot(int slot);
+
+    // ── kvflash (bounded KV residency; see common/kvflash_pager.h) ──
+    // Drafter-scored residency by default: the Qwen3-0.6B drafter scores
+    // chunks through the cross-tokenizer bridge (KvFlashCrossTokScorer —
+    // relevance is text-level, so the target's ids are detokenized and
+    // re-tokenized for the drafter). LRU is the fallback when no drafter is
+    // found or --kvflash-policy lru. The pager covers ALL 40 layers; SWA
+    // exactness comes from a protected tail >= sliding_window.
+    KvFlashPager                   kvflash_pager_;
+    std::unique_ptr<KvFlashScorer> kvflash_scorer_;
+    std::vector<float>             kvflash_scores_;
+    std::string                    kvflash_drafter_path_;
+    int          kvflash_tokens_ = 0;     // 0 = off
+    int          kvflash_tau_    = 64;
+    bool         kvflash_drafter_failed_ = false;
+    bool kvflash_active() const { return kvflash_tokens_ > 0; }
+    // Drafter rescore + repage every effective-tau generated tokens
+    // (lazy-loads the drafter + cross-tokenizer scorer on first need).
+    void kvflash_maybe_reselect(const std::vector<int32_t> & history, int generated);
+    // Pager protections (SWA tail) shared by the floor and attach.
+    KvFlashConfig kvflash_config() const;
+    // Read DFLASH_KVFLASH and round/clamp; call before cache creation.
+    void kvflash_read_config();
+    // Attach the pager to the freshly created cache (init / unpark).
+    bool kvflash_attach();
+    // Allocate pool slots for [kv_start, kv_start+n_tok) (evicting LRU as
+    // needed) ahead of a laguna_step call. False if the pool is exhausted.
+    bool kvflash_alloc_span(int kv_start, int n_tok);
 
     // Hybrid mode helpers
     bool init_hybrid_mode();

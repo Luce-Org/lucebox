@@ -6,6 +6,7 @@
 
 #include "gemma4_backend.h"
 #include "dflash27b.h"
+#include "../qwen3/qwen3_kvflash_scorer.h"
 #include "common/sampler.h"
 #include "common/io_utils.h"
 #include "common/dflash_feature_ring.h"
@@ -49,11 +50,19 @@ bool Gemma4Backend::init() {
         return false;
     }
 
-    if (!create_gemma4_cache(backend_, w_, cfg_.device.max_ctx, cache_)) {
+    kvflash_read_config();
+    if (!create_gemma4_cache(backend_, w_, cfg_.device.max_ctx, cache_,
+                             kvflash_tokens_)) {
         std::fprintf(stderr, "[gemma4] cache alloc failed\n");
         return false;
     }
     cache_.fa_window = cfg_.fa_window;
+    if (kvflash_active() && cache_.fa_window > 0) {
+        std::fprintf(stderr, "[kvflash] --fa-window and --kvflash are mutually "
+                             "exclusive full-attention policies\n");
+        return false;
+    }
+    if (!kvflash_attach()) return false;
 
     // Load draft model for speculative decode.
     if (cfg_.draft_path && !load_decode_draft()) {
@@ -117,18 +126,22 @@ bool Gemma4Backend::unpark(const std::string & what) {
         }
 
         // Recreate KV cache
-        if (!create_gemma4_cache(backend_, w_, cfg_.device.max_ctx, cache_)) {
+        if (!create_gemma4_cache(backend_, w_, cfg_.device.max_ctx, cache_,
+                                 kvflash_tokens_)) {
             std::fprintf(stderr, "[gemma4] unpark: failed to recreate cache\n");
             free_gemma4_weights(w_);
             return false;
         }
         cache_.fa_window = cfg_.fa_window;
+        if (!kvflash_attach()) return false;
 
+        kvflash_drafter_failed_ = false;   // fresh VRAM: allow a retry
         parked_ = false;
         std::printf("[gemma4] unparked (VRAM restored)\n"); std::fflush(stdout);
         if (cfg_.draft_path && !draft_parked_ && draft_backend_) {
             delete dflash_target_;
             dflash_target_ = new Gemma4DFlashTarget(w_, cache_, backend_);
+        if (kvflash_active()) dflash_target_->set_kvflash_pager(&kvflash_pager_);
         }
     }
 
@@ -136,6 +149,118 @@ bool Gemma4Backend::unpark(const std::string & what) {
         if (!load_decode_draft()) return false;
     }
     return true;
+}
+
+// ── kvflash helpers ────────────────────────────────────────────────────
+
+void Gemma4Backend::kvflash_read_config() {
+    if (std::getenv("DFLASH_KVFLASH")) {
+        kvflash_drafter_path_ = kvflash_find_drafter(cfg_.model_path);
+    }
+    // "auto" sizes from the GPU (weights resident, cache not yet allocated):
+    // gemma4 pools the FULL-attention layers only (F16 cache); SWA rings are
+    // fixed-size and excluded from the density.
+    KvFlashAutoBudget kvf_budget;
+    {
+        size_t gpu_free = 0, gpu_total = 0;
+        if (ggml_backend_dev_t dev = ggml_backend_get_device(backend_)) {
+            ggml_backend_dev_memory(dev, &gpu_free, &gpu_total);
+        }
+        int64_t bpt = 0;
+        for (int il = 0; il < w_.n_layer; ++il) {
+            if (!gemma4_has_kv(w_, il) || gemma4_is_swa_layer(w_, il)) continue;
+            bpt += (int64_t)gemma4_n_head_kv(w_, il) * 2 *
+                   (int64_t)ggml_row_size(GGML_TYPE_F16, gemma4_head_dim(w_, il));
+        }
+        kvf_budget.free_bytes      = (int64_t)gpu_free;
+        kvf_budget.bytes_per_token = bpt;
+        kvf_budget.reserve_bytes   = (int64_t)(1.5 * 1073741824.0) +
+            (kvflash_drafter_path_.empty() ? 0 : (int64_t)(1.7 * 1073741824.0));
+    }
+    kvflash_tokens_ = kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{},
+                                            !kvflash_drafter_path_.empty(),
+                                            kvf_budget);
+    if (kvflash_tokens_ > 0) {
+        const char * tau = std::getenv("DFLASH_KVFLASH_TAU");
+        kvflash_tau_ = std::max(1, tau ? std::atoi(tau) : 64);
+    }
+}
+
+// Drafter rescore + repage (FlashMemory tau loop) with the cross-tokenizer
+// scorer: gemma ids are detokenized and re-scored through the Qwen3-0.6B
+// drafter. Lazy: the drafter + tokenizers load on the first reselect that
+// needs them, never on a request's first tokens.
+void Gemma4Backend::kvflash_maybe_reselect(int generated) {
+    if (!kvflash_active() || kvflash_tau_ <= 0) return;
+    const int tau = std::max<int>(kvflash_tau_, (int)(kvflash_history_.size() / 45));
+    if (generated % tau != 0) return;
+    if (!kvflash_scorer_) {
+        if (kvflash_drafter_path_.empty() || kvflash_drafter_failed_) return;
+        if (!drafter_loaded_) {
+            ggml_backend_synchronize(backend_);
+            std::fprintf(stderr, "[kvflash] loading drafter for residency scoring: %s\n",
+                         kvflash_drafter_path_.c_str());
+            if (!load_drafter(kvflash_drafter_path_, /*gpu_layers=*/999,
+                              cfg_.device.gpu, drafter_ctx_)) {
+                std::fprintf(stderr, "[kvflash] drafter load failed (%s); staying on "
+                                     "LRU residency\n", dflash27b_last_error());
+                kvflash_drafter_failed_ = true;
+                return;
+            }
+            drafter_loaded_ = true;
+        }
+        kvflash_scorer_ = std::make_unique<KvFlashCrossTokScorer>(
+            &drafter_ctx_, cfg_.model_path, kvflash_drafter_path_);
+        std::fprintf(stderr, "[kvflash] cross-tokenizer drafter scorer attached "
+                             "(tau=%d)\n", kvflash_tau_);
+    }
+    if (!kvflash_scorer_->score_chunks(kvflash_history_, kvflash_pager_.chunk_tokens(),
+                                       kvflash_scores_)) {
+        return;  // scorer failure -> keep LRU behavior this round
+    }
+    kvflash_pager_.score_hook = [this](int c) {
+        return c < (int)kvflash_scores_.size() ? kvflash_scores_[c] : 1e30f;
+    };
+    const int events = kvflash_pager_.reselect();
+    kvflash_pager_.score_hook = nullptr;
+    if (events > 0) {
+        std::fprintf(stderr, "[kvflash] reselect @gen=%d: %d page events\n",
+                     generated, events);
+    }
+}
+
+bool Gemma4Backend::kvflash_attach() {
+    if (!kvflash_active()) return true;
+    // Pool the FULL-attention layers only; SWA layers ring-buffer natively
+    // and KV-reuse layers share their source layer's tensors.
+    std::vector<ggml_tensor *> full_k, full_v;
+    for (int il = 0; il < w_.n_layer; ++il) {
+        if (cache_.k[(size_t)il] && !gemma4_is_swa_layer(w_, il)) {
+            full_k.push_back(cache_.k[(size_t)il]);
+            full_v.push_back(cache_.v[(size_t)il]);
+        }
+    }
+    KvFlashConfig pc;
+    pc.pool_tokens = kvflash_tokens_;
+    if (!kvflash_pager_.attach(pc, full_k, full_v)) {
+        std::fprintf(stderr, "kvflash: pager attach failed (pool=%d, "
+                             "full-attn layers=%zu)\n",
+                     kvflash_tokens_, full_k.size());
+        return false;
+    }
+    std::printf("[kvflash] resident pool %d tokens over %zu full-attn layers "
+                "(logical max_ctx %d, SWA ring %d), policy=%s\n",
+                kvflash_tokens_, full_k.size(), cfg_.device.max_ctx,
+                cache_.swa_size,
+                !kvflash_drafter_path_.empty()
+                    ? "drafter/cross-tok (attaches on first reselect)"
+                    : "lru (recency-only: no Qwen3-0.6B drafter found)");
+    std::fflush(stdout);
+    return true;
+}
+
+bool Gemma4Backend::kvflash_alloc_span(int kv_start, int n_tok) {
+    return !kvflash_active() || kvflash_pager_.alloc_span(kv_start, n_tok);
 }
 
 // ── Prefill ────────────────────────────────────────────────────────────
@@ -146,6 +271,19 @@ int Gemma4Backend::do_prefill(const std::vector<int32_t> & tokens,
     const int n = (int)tokens.size();
     const int hidden = w_.n_embd;
     const int chunk = cfg_.chunk;
+
+    if (kvflash_active()) {
+        // Fresh request: rebuild the pager mapping. Restore paths land the
+        // prefix identity-mapped and pre-allocate [0, kv_offset) themselves.
+        if (kv_offset == 0) kvflash_pager_.reset();
+        if (kv_offset + n > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
+            std::fprintf(stderr,
+                "[kvflash] prompt (%d @ offset %d) exceeds pool %d; raise "
+                "--kvflash or enable pflash compression\n",
+                n, kv_offset, kvflash_tokens_);
+            return -1;
+        }
+    }
 
     std::vector<float> embed(chunk * hidden);
     std::vector<float> logits;
@@ -168,8 +306,10 @@ int Gemma4Backend::do_prefill(const std::vector<int32_t> & tokens,
         for (int i = 0; i < len * hidden; ++i) embed[i] *= scale;
 
         const int kv_pos = kv_offset + pos;
-        if (!gemma4_step(backend_, w_, cache_, embed.data(),
-                         tokens.data() + pos, len, kv_pos, logits)) {
+        if (!kvflash_alloc_span(kv_pos, len) ||
+            !gemma4_step(backend_, w_, cache_, embed.data(),
+                         tokens.data() + pos, len, kv_pos, logits,
+                         kvflash_active() ? &kvflash_pager_ : nullptr)) {
             std::fprintf(stderr, "[gemma4] prefill step failed at pos=%d\n", kv_pos);
             return -1;
         }
@@ -191,6 +331,15 @@ int Gemma4Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (feature_mirror_.target_feat && cache_.target_feat && !draft_parked_) {
             draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
                                             feature_mirror_, kv_pos, len);
+        }
+    }
+
+    if (kvflash_active()) {
+        if (kv_offset == 0) {
+            kvflash_history_.assign(tokens.begin(), tokens.end());
+        } else {
+            kvflash_history_.resize((size_t)kv_offset, 0);  // restored prefix ids unknown
+            kvflash_history_.insert(kvflash_history_.end(), tokens.begin(), tokens.end());
         }
     }
 
@@ -285,8 +434,10 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
         float scale = std::sqrt((float)hidden);
         for (int j = 0; j < hidden; ++j) embed_buf[j] *= scale;
 
-        if (!gemma4_step(backend_, w_, cache_, embed_buf.data(),
-                         &tok, 1, committed, logits)) {
+        if (!kvflash_alloc_span(committed, 1) ||
+            !gemma4_step(backend_, w_, cache_, embed_buf.data(),
+                         &tok, 1, committed, logits,
+                         kvflash_active() ? &kvflash_pager_ : nullptr)) {
             return false;
         }
 
@@ -308,6 +459,10 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
         io.emit(next);
         committed++;
         cache_.cur_pos = committed;
+        if (kvflash_active()) {
+            kvflash_history_.push_back(next);
+            kvflash_maybe_reselect((int)out_tokens.size());
+        }
         if (io.cancelled) break;
 
         // Check EOS
@@ -323,7 +478,8 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io,
                                     const BudgetHook * budget_hook,
-                                    bool * forced_close_out) {
+                                    bool * forced_close_out,
+                                    float * accept_rate_out) {
     const int hidden = w_.n_embd;
     int32_t last_tok = cache_.last_tok;
 
@@ -553,6 +709,12 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
                  n_draft_steps, n_accept_sum, total_draft_pos, accept_pct,
                  n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0);
 
+    // Surface acceptance to the HTTP usage block (was silently 0.0, the
+    // same reporting-only gap as the layer-split path fixed in PR #321).
+    if (accept_rate_out) {
+        *accept_rate_out = (float)(n_accept_sum / (double)total_draft_pos);
+    }
+
     io.emit(-1);
     return true;
 }
@@ -607,7 +769,8 @@ GenerateResult Gemma4Backend::generate_impl(const GenerateRequest & req,
             result.spec_decode_ran = true;
             if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                                 &req.budget_hook,
-                                &result.budget_forced_close)) {
+                                &result.budget_forced_close,
+                                &result.accept_rate)) {
                 result.error = "spec_decode";
                 return result;
             }
@@ -624,7 +787,8 @@ GenerateResult Gemma4Backend::generate_impl(const GenerateRequest & req,
             for (int j = 0; j < hidden; ++j) embed_buf[j] *= scale;
 
             if (!gemma4_step(backend_, w_, cache_, embed_buf.data(),
-                             &last_tok, 1, committed - 1, logits)) {
+                             &last_tok, 1, committed - 1, logits,
+                             kvflash_active() ? &kvflash_pager_ : nullptr)) {
                 result.error = "first logits";
                 return result;
             }
@@ -725,6 +889,22 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
     cache_.cur_pos = snap_pos;
     cache_.last_tok = snap.last_tok;
 
+    // kvflash: the restored prefix is identity-mapped; rebuild the pager
+    // mapping over [0, snap_pos) before the delta prefill extends it.
+    if (kvflash_active()) {
+        if (snap_pos > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
+            std::fprintf(stderr, "[kvflash] restored prefix (%d) exceeds pool %d\n",
+                         snap_pos, kvflash_tokens_);
+            result.error = "kvflash: prompt exceeds resident pool";
+            return result;
+        }
+        kvflash_pager_.reset();
+        if (!kvflash_alloc_span(0, snap_pos)) {
+            result.error = "kvflash_slot";
+            return result;
+        }
+    }
+
     // Set up sampler
     sampler_ = req.sampler;
     if (req.do_sample && sampler_.seed != 0) {
@@ -795,7 +975,8 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
             result.spec_decode_ran = true;
             if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                                 &req.budget_hook,
-                                &result.budget_forced_close)) {
+                                &result.budget_forced_close,
+                                &result.accept_rate)) {
                 result.error = "spec_decode";
                 return result;
             }
@@ -812,7 +993,8 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
             for (int j = 0; j < hidden; ++j) embed_buf[j] *= scale;
 
             if (!gemma4_step(backend_, w_, cache_, embed_buf.data(),
-                             &last_tok, 1, committed - 1, logits)) {
+                             &last_tok, 1, committed - 1, logits,
+                             kvflash_active() ? &kvflash_pager_ : nullptr)) {
                 result.error = "first logits";
                 return result;
             }
@@ -867,6 +1049,13 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
 bool Gemma4Backend::snapshot_save(int slot) {
     if (parked_) return false;
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
+    // kvflash: snapshots copy rows [0, snap_pos) assuming identity layout,
+    // which breaks after the first page-out relocates a chunk.
+    if (kvflash_active() && !kvflash_pager_.is_identity()) {
+        std::fprintf(stderr, "[kvflash] snapshot skipped: pool has relocated "
+                             "chunks (page-table serialization not implemented)\n");
+        return false;
+    }
 
     auto & snap = snapshots_[slot];
     const int n_layer = cache_.n_layer;
@@ -1129,6 +1318,7 @@ bool Gemma4Backend::load_decode_draft() {
 
     delete dflash_target_;
     dflash_target_ = new Gemma4DFlashTarget(w_, cache_, backend_);
+        if (kvflash_active()) dflash_target_->set_kvflash_pager(&kvflash_pager_);
     draft_parked_ = false;
     std::printf("[gemma4] spec-decode ready: capture_layers=%d mirror_cap=%d\n",
                 n_capture, mirror_cap);

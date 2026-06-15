@@ -368,19 +368,34 @@ bool load_draft_gguf(const std::string & path,
             set_last_error(err);
             return false;
         }
-        // fc: [n_target_layers*n_embd, n_embd] — ne[0] = n_target_layers*n_embd.
+        // fc: [n_capture_layers*n_embd, n_embd] — ne[0] counts the CAPTURE
+        // layers the fc consumes. Some draft GGUFs (gemma4) store the
+        // TARGET's layer count in dflash.n_target_layers instead of the
+        // capture count; per this file's own philosophy the weights are
+        // ground truth, so when fc disagrees but is an exact multiple of
+        // n_embd, derive the count from the tensor and warn. Fail only on
+        // a genuinely inconsistent shape.
         if (out.n_target_layers > 0) {
             const int64_t derived_fc_in  = out.fc->ne[0];
             const int64_t expected_fc_in = (int64_t)out.n_target_layers * out.n_embd;
             if (derived_fc_in != expected_fc_in) {
-                char buf[256];
-                std::snprintf(buf, sizeof(buf),
-                    "GGUF shape mismatch: dflash.fc.weight->ne[0]=%lld "
-                    "!= n_target_layers*n_embd=%d*%d=%lld",
-                    (long long)derived_fc_in,
-                    out.n_target_layers, out.n_embd, (long long)expected_fc_in);
-                set_last_error(buf);
-                return false;
+                if (out.n_embd > 0 && derived_fc_in % out.n_embd == 0) {
+                    const int derived_layers = (int)(derived_fc_in / out.n_embd);
+                    std::fprintf(stderr,
+                        "[draft] dflash.n_target_layers metadata (%d) != "
+                        "fc-derived capture count (%d); using the weights\n",
+                        out.n_target_layers, derived_layers);
+                    out.n_target_layers = derived_layers;
+                } else {
+                    char buf[256];
+                    std::snprintf(buf, sizeof(buf),
+                        "GGUF shape mismatch: dflash.fc.weight->ne[0]=%lld "
+                        "!= n_target_layers*n_embd=%d*%d=%lld",
+                        (long long)derived_fc_in,
+                        out.n_target_layers, out.n_embd, (long long)expected_fc_in);
+                    set_last_error(buf);
+                    return false;
+                }
             }
         }
     }

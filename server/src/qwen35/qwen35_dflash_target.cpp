@@ -5,6 +5,8 @@
 #include "step_graph.h"
 #include "attn_masks.h"
 
+#include <cstring>
+
 namespace dflash::common {
 
 Qwen35DFlashTarget::~Qwen35DFlashTarget() {
@@ -33,17 +35,52 @@ bool Qwen35DFlashTarget::verify_batch(
     if (n_tokens <= 0) return false;
 
     const int hidden = w_.n_embd;
-    const bool need_mask = (kq_stride_pad_ > KQ_MASK_PAD) || (n_tokens > 1);
+    const bool pool = pager_ != nullptr;
+    const bool need_mask = pool || (kq_stride_pad_ > KQ_MASK_PAD) || (n_tokens > 1);
+
+    // kvflash: allocate slots for the verify block up front (may evict at
+    // a chunk boundary; protections keep sinks + the tail window safe).
+    std::vector<int> slots;
+    if (pool) {
+        slots.resize(n_tokens);
+        for (int i = 0; i < n_tokens; i++) {
+            slots[i] = pager_->slot_for(base_pos + i);
+            if (slots[i] < 0) {
+                std::fprintf(stderr, "verify_batch: pool slot alloc failed @%d\n", base_pos + i);
+                return false;
+            }
+        }
+    }
 
     if (!build_target_step(sg_, w_, cache_, backend_,
                            /*kv_start=*/base_pos, n_tokens,
                            need_mask, /*capture=*/true,
                            /*capture_delta_intermediate=*/false,
-                           fa_window_,
+                           pool ? 0 : fa_window_,
                            /*last_token_logits_only=*/false,
-                           kq_stride_pad_)) {
+                           kq_stride_pad_,
+                           /*capture_moe_router=*/false,
+                           /*kvflash_mask=*/pool)) {
         std::fprintf(stderr, "verify_batch: build_target_step failed (base=%d n=%d)\n", base_pos, n_tokens);
         return false;
+    }
+    if (pool && !sg_.kv_write_rows) {
+        std::fprintf(stderr, "verify_batch: kvflash requires set_rows path\n");
+        return false;
+    }
+    if (pool) {
+        // kv_write_rows is [n_tokens, n_head_kv] ne0-major: element
+        // (token i, head h) lives at i + h*n_tokens (set_rows asserts
+        // b->ne[1] == c->ne[0]). Getting this transposed scrambles
+        // per-head row targets for every multi-token write.
+        std::vector<int64_t> rows((size_t)n_tokens * w_.n_head_kv);
+        for (int h = 0; h < w_.n_head_kv; h++) {
+            for (int i = 0; i < n_tokens; i++) {
+                rows[(size_t)h * n_tokens + i] = slots[i];
+            }
+        }
+        ggml_backend_tensor_set(sg_.kv_write_rows, rows.data(), 0,
+                                sizeof(int64_t) * rows.size());
     }
 
     // Embed input tokens and fill positions.
@@ -66,8 +103,35 @@ bool Qwen35DFlashTarget::verify_batch(
     ggml_backend_tensor_set(sg_.positions, pos.data(), 0,
                             sizeof(int32_t) * pos.size());
 
-    // Fill causal attention mask when present.
-    if (sg_.attn_mask) {
+    // Fill the attention mask.
+    if (sg_.attn_mask && pool) {
+        // Slot-space mask: row q attends (a) slots of committed positions
+        // (pos < base_pos) of resident chunks — this exactly excludes
+        // slots holding rejected drafts from earlier rounds — and (b) the
+        // verify tokens' own slots, causally.
+        const size_t kvd = (size_t)sg_.attn_mask->ne[0];
+        const int q_pad = (int)sg_.attn_mask->ne[1];
+        std::vector<uint16_t> mask_buf((size_t)kvd * q_pad, F16_NEG_INF);
+        const int ct = pager_->chunk_tokens();
+        for (int c = 0; c < pager_->n_chunks(); c++) {
+            const int blk = pager_->block_of(c);
+            if (blk < 0) continue;
+            for (int i = 0; i < ct; i++) {
+                if ((int64_t)c * ct + i >= base_pos) break;
+                mask_buf[(size_t)blk * ct + i] = F16_ZERO;
+            }
+        }
+        for (int q = 1; q < n_tokens; q++) {
+            std::memcpy(mask_buf.data() + (size_t)q * kvd, mask_buf.data(), kvd * 2);
+        }
+        for (int q = 0; q < n_tokens; q++) {
+            for (int i = 0; i <= q; i++) {
+                mask_buf[(size_t)q * kvd + slots[i]] = F16_ZERO;
+            }
+        }
+        ggml_backend_tensor_set(sg_.attn_mask, mask_buf.data(), 0,
+                                sizeof(uint16_t) * mask_buf.size());
+    } else if (sg_.attn_mask) {
         const int win_start = (fa_window_ > 0 && base_pos > fa_window_)
                                   ? (base_pos - fa_window_) : 0;
         const int kv_len = base_pos + n_tokens - win_start;

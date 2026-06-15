@@ -40,6 +40,10 @@ bool build_layer_step(
     int fa_window = 0,
     int kq_stride_pad = KQ_MASK_PAD);
 
+// `kvflash`: pooled mode — KV rows go through a set_rows input
+// (sg.kv_write_rows, [n_tokens, n_head_kv] ne0-major slots) and the mask
+// (forced on) is sized to the PHYSICAL tensor capacity so the caller can
+// fill it in slot space. Caller allocates slots and fills rows + mask.
 bool build_layer_prefn_step(
     StepGraph & sg,
     const TargetWeights & w,
@@ -50,7 +54,8 @@ bool build_layer_prefn_step(
     int n_tokens,
     bool with_mask,
     int fa_window = 0,
-    int kq_stride_pad = KQ_MASK_PAD);
+    int kq_stride_pad = KQ_MASK_PAD,
+    bool kvflash = false);
 
 // Full layer graph for hybrid decode: pre-FFN + MoE FFN + shared + residual in one compute.
 // Output: sg.hidden_input = layer_output, sg.moe_selected = router selections.
@@ -67,6 +72,11 @@ bool build_hybrid_full_layer_step(
     int kq_stride_pad = KQ_MASK_PAD);
 
 // Full target forward: chain mode (all layers, logits + argmax output).
+//
+// `kvflash_mask`: kvflash pooled mode — keep the set_rows KV write active
+// even though a mask is requested (the mask carries pool-slot validity and
+// must be re-uploaded by the caller before every compute). Used by both
+// single-token decode and multi-token spec verify; requires fa_window == 0.
 bool build_target_step(
     StepGraph & sg,
     const TargetWeights & w,
@@ -80,7 +90,8 @@ bool build_target_step(
     int fa_window = 0,
     bool last_token_logits_only = false,
     int kq_stride_pad = KQ_MASK_PAD,
-    bool capture_moe_router = false);
+    bool capture_moe_router = false,
+    bool kvflash_mask = false);
 
 // Full target forward: DDTree tree-verify mode.
 bool build_target_step_tree(

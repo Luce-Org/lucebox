@@ -57,14 +57,13 @@ jobs:
             -DDFLASH27B_FA_ALL_QUANTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target \
-            test_dflash test_generate test_flash_attn_sparse \
+            test_dflash test_generate test_flash_attn_sparse test_server_unit \
             -j$(nproc)
 
-      # Server unit tests require libcurl-dev; skipped when CURL is absent.
-      # - name: Run C++ server unit tests
-      #   run: |
-      #     cd server/build
-      #     ctest --output-on-failure -R server_unit --no-tests=error
+      - name: Run C++ server unit tests
+        run: |
+          cd server/build
+          ctest --output-on-failure -R server_unit --no-tests=error
 
       - name: Populate venv with cu128 torch + setuptools
         # First pass: install the workspace's default deps. dflash declares
@@ -128,8 +127,8 @@ jobs:
     needs: [uv-workspace]
     runs-on: [self-hosted, gpu, sm86]
     timeout-minutes: 30
-    # The box has a single physical GPU: serialize GPU jobs across PRs instead
-    # of letting concurrent runs clobber each other.
+    # Serialize CUDA jobs across PRs (one RTX 3090). The ROCm job has its
+    # own group: different physical GPU, no contention.
     concurrency:
       group: lucebox3-gpu-runner
       cancel-in-progress: false
@@ -197,15 +196,51 @@ jobs:
     needs: [uv-workspace]
     runs-on: [self-hosted, rocm, gfx1151]
     timeout-minutes: 20
-    # Same single box as gpu-tests: serialize GPU jobs across PRs.
+    # Serialize across PRs per GPU. NOT the same group as the CUDA job:
+    # the combo box has two distinct GPUs (RTX 3090 + Strix iGPU), and a
+    # shared group only holds one waiting job, so the Radeon leg was
+    # chronically displaced ("higher priority waiting request") by every
+    # new CUDA job entering the queue.
     concurrency:
-      group: lucebox3-gpu-runner
+      group: lucebox3-rocm-runner
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
+      - name: KFD health (diagnose instead of hanging)
+        # rocminfo on a wedged KFD blocks in uninterruptible sleep and eats
+        # the whole 20-minute job timeout. Probe with a hard timeout first,
+        # and when it hangs, dump the evidence (D-state holders, dmesg) so
+        # the job fails in seconds with a diagnosis instead of silently.
+        run: |
+          # A wedged KFD puts rocminfo in UNINTERRUPTIBLE sleep: timeout(1)
+          # cannot kill it and a foreground wait blocks until the job
+          # timeout. Probe in the background (output to a file so no pipe
+          # keeps the step alive) and enforce the deadline in the shell.
+          /opt/rocm/bin/rocminfo > /tmp/rocminfo.out 2>&1 &
+          PROBE=$!
+          for i in $(seq 1 15); do
+            kill -0 $PROBE 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 $PROBE 2>/dev/null; then
+            echo "::error::rocminfo hung (likely D-state) — ROCm/KFD wedged; the box needs a reboot"
+            echo "--- probe state:"
+            ps -o pid,stat,wchan:32,comm -p $PROBE || true
+            echo "--- processes holding /dev/kfd:"
+            sudo fuser -v /dev/kfd 2>&1 || true
+            echo "--- D-state processes:"
+            ps -eo pid,user,stat,wchan:32,comm | awk '$3 ~ /D/' || true
+            echo "--- recent amdgpu/kfd dmesg:"
+            sudo dmesg 2>/dev/null | grep -iE "amdgpu|kfd" | tail -15 || true
+            kill -9 $PROBE 2>/dev/null || true
+            disown $PROBE 2>/dev/null || true
+            exit 1
+          fi
+          wait $PROBE && echo "KFD healthy" || { echo "::error::rocminfo exited non-zero"; cat /tmp/rocminfo.out | tail -5; exit 1; }
+
       - name: ROCm smoke (rocminfo sees gfx1151)
-        run: /opt/rocm/bin/rocminfo | grep -E "Name:|Marketing Name:" | grep -iE "gfx1151|Radeon 8060S"
+        run: cat /tmp/rocminfo.out | grep -E "Name:|Marketing Name:" | grep -iE "gfx1151|Radeon 8060S"
 
       - name: Build + run HIP vector-add on the Radeon 8060S
         # Self-contained HIP kernel correctness test (no model weights). This is

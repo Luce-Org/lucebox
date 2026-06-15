@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <numeric>
 
@@ -116,6 +117,75 @@ std::vector<int> MoeHybridRoutingStats::hot_experts(int layer_idx, int hot_count
         ranked.resize((size_t)hot_count);
     }
     return ranked;
+}
+
+void MoeHybridRoutingStats::print_freq_analysis() const {
+    if (n_layer <= 0 || n_expert <= 0 || counts.empty()) return;
+
+    uint64_t total_all = 0;
+    for (int il = 0; il < n_layer; ++il) total_all += layer_totals[(size_t)il];
+    if (total_all == 0) return;
+
+    // Estimate total tokens: layer_totals[0] / n_expert_used
+    uint64_t total_tokens = (n_expert_used > 0 && layer_totals[0] > 0)
+        ? layer_totals[0] / (uint64_t)n_expert_used : 0;
+    double avg_k = (n_layer > 0 && total_tokens > 0)
+        ? (double)total_all / ((double)n_layer * (double)total_tokens) : 0.0;
+
+    std::fprintf(stderr, "\n=== Expert Frequency Analysis ===\n");
+    std::fprintf(stderr, "Tokens tracked: %llu, avg-K=%.2f\n\n",
+                 (unsigned long long)total_tokens, avg_k);
+
+    int experts_for_80_total = 0;
+    std::vector<uint64_t> sorted((size_t)n_expert);
+
+    for (int il = 0; il < n_layer; ++il) {
+        uint64_t tact = layer_totals[(size_t)il];
+        if (tact == 0) {
+            std::fprintf(stderr, "Layer %2d:   0 unique\n", il);
+            continue;
+        }
+        for (int ie = 0; ie < n_expert; ++ie)
+            sorted[(size_t)ie] = counts[index_of(il, ie)];
+        std::sort(sorted.begin(), sorted.end(), std::greater<uint64_t>());
+
+        int unique = 0;
+        for (int ie = 0; ie < n_expert; ++ie) if (sorted[(size_t)ie] > 0) unique++;
+
+        uint64_t cum = 0;
+        uint64_t top10 = 0, top30 = 0, top60 = 0;
+        int n50 = 0, n80 = 0, n90 = 0;
+        for (int ie = 0; ie < n_expert; ++ie) {
+            cum += sorted[(size_t)ie];
+            if (ie == 9)  top10 = cum;
+            if (ie == 29) top30 = cum;
+            if (ie == 59) top60 = cum;
+            if (!n50 && cum * 100 >= tact * 50) n50 = ie + 1;
+            if (!n80 && cum * 100 >= tact * 80) n80 = ie + 1;
+            if (!n90 && cum * 100 >= tact * 90) n90 = ie + 1;
+        }
+        // If there are fewer experts than a bucket size, the ie==N-1 check
+        // never fires and topN stays 0, printing a bogus 0%. cum == tact here
+        // (all experts summed), so the bucket covers everything → 100%.
+        if (n_expert < 10) top10 = cum;
+        if (n_expert < 30) top30 = cum;
+        if (n_expert < 60) top60 = cum;
+        std::fprintf(stderr, "Layer %2d: %3d unique, top-10 %.0f%%, top-30 %.0f%%, top-60 %.0f%% "
+                             "(50%%@%d, 80%%@%d, 90%%@%d)\n",
+                     il, unique,
+                     100.0 * (double)top10 / (double)tact,
+                     100.0 * (double)top30 / (double)tact,
+                     100.0 * (double)top60 / (double)tact,
+                     n50, n80, n90);
+        experts_for_80_total += n80;
+    }
+
+    double avg80 = (n_layer > 0) ? (double)experts_for_80_total / n_layer : 0.0;
+    std::fprintf(stderr, "\n--- Overall Summary ---\n");
+    std::fprintf(stderr, "80%% hit rate: %d experts pinned (avg %.0f/layer)\n",
+                 experts_for_80_total, avg80);
+    std::fprintf(stderr, "Model: %d layers x %d experts, top-%d routing\n",
+                 n_layer, n_expert, n_expert_used);
 }
 
 bool MoeHybridRoutingStats::save_csv(const std::string & path, std::string * err) const {
