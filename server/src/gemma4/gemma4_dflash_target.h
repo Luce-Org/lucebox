@@ -30,7 +30,8 @@ public:
     bool verify_batch(const std::vector<int32_t> & tokens,
                       int base_pos,
                       int & last_tok,
-                      std::vector<int32_t> * all_argmax = nullptr) override;
+                      std::vector<int32_t> * all_argmax = nullptr,
+                      bool capture_ssm_intermediates = false) override;
 
     // kvflash: route verify writes through the pool (slots allocated here,
     // slot-space mask inside gemma4_verify_batch). Non-owning.

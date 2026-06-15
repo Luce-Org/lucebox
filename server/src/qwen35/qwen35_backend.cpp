@@ -676,10 +676,11 @@ DFlashTarget * Qwen35Backend::dflash_target() {
         dflash_target_ = std::make_unique<Qwen35DFlashTarget>(
             w_, cache_, target_backend_, sg_,
             cfg_.kq_stride_pad, cfg_.fa_window);
+        auto * qt = static_cast<Qwen35DFlashTarget *>(dflash_target_.get());
         if (kvflash_active()) {
-            static_cast<Qwen35DFlashTarget *>(dflash_target_.get())
-                ->set_kvflash_pager(&kvflash_pager_);
+            qt->set_kvflash_pager(&kvflash_pager_);
         }
+        qt->set_fast_rollback(true);
     }
     return dflash_target_.get();
 }
@@ -1850,7 +1851,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
 
         int verify_last_tok = -1;
-        if (!target->verify_batch(draft_tok, committed, verify_last_tok, &target_tok)) {
+        if (!target->verify_batch(draft_tok, committed, verify_last_tok, &target_tok,
+                                   /*capture_ssm_intermediates=*/true)) {
             std::fprintf(stderr, "spec-decode: verify failed\n");
             target->restore_kv();
             step_graph_destroy(draft_sg);
@@ -1875,21 +1877,49 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             if (commit_n <= accept_n) bonus_tok = -1;
         }
 
-        // 6. Replay: roll back KV and re-run only accepted tokens
-        if (!target->restore_kv()) {
-            step_graph_destroy(draft_sg);
-            return false;
+        // 6. Fix state: adaptive fast-rollback vs legacy replay.
+        //    Fast-rollback (implicit bonus, skip replay) is profitable when
+        //    accept_n is large enough that skipping the replay saves more compute
+        //    than the cost of deferring the bonus to the next step. Breakeven
+        //    is around accept_n ≈ 5. Below that, legacy replay is cheaper.
+        constexpr int kFastRollbackThreshold = 5;
+        const bool use_fast_rollback =
+            target->supports_fast_rollback() && (accept_n >= kFastRollbackThreshold);
+
+        int replay_last_tok = -1;
+        if (use_fast_rollback) {
+            // Fast rollback: restore SSM from captured intermediates, skip replay.
+            // Implicit bonus: target_tok[accept_n-1] seeds next draft as draft_tok[0],
+            // always accepted on next step.
+            bonus_tok = -1;
+            commit_n = accept_n;
+            if (!target->rollback_to(committed, accept_n)) {
+                std::fprintf(stderr, "spec-decode: rollback_to failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            replay_last_tok = target_tok[accept_n - 1];
+        } else {
+            // Legacy replay: restore SSM snapshot, replay accepted + bonus tokens.
+            if (!target->restore_kv()) {
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            std::vector<int32_t> replay_batch((size_t)commit_n);
+            for (int i = 0; i < commit_n; i++) {
+                replay_batch[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
+            }
+            if (!target->verify_batch(replay_batch, committed, replay_last_tok, nullptr)) {
+                std::fprintf(stderr, "spec-decode: replay failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
         }
 
+        // Build replay_tok for emitting committed tokens.
         std::vector<int32_t> replay_tok((size_t)commit_n);
         for (int i = 0; i < commit_n; i++) {
             replay_tok[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
-        }
-        int replay_last_tok = -1;
-        if (!target->verify_batch(replay_tok, committed, replay_last_tok, nullptr)) {
-            std::fprintf(stderr, "spec-decode: replay failed\n");
-            step_graph_destroy(draft_sg);
-            return false;
         }
 
         // 7. Sync features for replayed range to mirror (needed for next draft step)

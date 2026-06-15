@@ -959,8 +959,18 @@ static ggml_tensor * build_delta_net_block(
             S_v * S_v * r_elt,
             S_v * S_v * H_v * r_elt,
             inter_offset);
+        ggml_tensor * dst;
+        if (n_seq_tokens == (int)cap->ssm_intermediate_states->ne[3]) {
+            dst = cap->ssm_intermediate_states;
+        } else {
+            dst = ggml_view_4d(ctx, cap->ssm_intermediate_states,
+                S_v, S_v, H_v, n_seq_tokens,
+                cap->ssm_intermediate_states->nb[1],
+                cap->ssm_intermediate_states->nb[2],
+                cap->ssm_intermediate_states->nb[3], 0);
+        }
         ggml_build_forward_expand(gf,
-            ggml_cpy(ctx, inter_view, cap->ssm_intermediate_states));
+            ggml_cpy(ctx, inter_view, dst));
     }
     } // end of block started at `{` before `const int64_t S_v = head_v_dim;`
 

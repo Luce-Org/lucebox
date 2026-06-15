@@ -31,7 +31,8 @@ struct DFlashTarget {
     virtual bool verify_batch(const std::vector<int32_t> & tokens,
                               int base_pos,
                               int & last_tok,
-                              std::vector<int32_t> * all_argmax = nullptr) = 0;
+                              std::vector<int32_t> * all_argmax = nullptr,
+                              bool capture_ssm_intermediates = false) = 0;
 
     // ── KV state management ─────────────────────────────────────────
 
@@ -41,6 +42,19 @@ struct DFlashTarget {
 
     // Restore KV cache to the last snapshot (undo speculative forward).
     virtual bool restore_kv() = 0;
+
+    // Whether fast rollback is supported — uses per-step SSM intermediate
+    // states captured during verify to restore recurrent state without replay.
+    // When true, verify_batch captures intermediates and rollback_to() works.
+    virtual bool supports_fast_rollback() const { return false; }
+
+    // Roll back recurrent state to position `commit_n` within the last
+    // verify batch (0-indexed). Uses SSM intermediate states captured during
+    // verify. Also truncates KV to `base_pos + commit_n`. No replay needed.
+    // Only valid when supports_fast_rollback() returns true.
+    virtual bool rollback_to(int base_pos, int commit_n) {
+        (void)base_pos; (void)commit_n; return false;
+    }
 
     // ── Token utilities ─────────────────────────────────────────────
 

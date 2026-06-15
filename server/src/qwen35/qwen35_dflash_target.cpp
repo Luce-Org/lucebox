@@ -7,6 +7,11 @@
 
 #include <cstring>
 
+// ggml_get_to_fp32_cuda is not in any public header — it lives in
+// ggml-cuda/convert.cuh. Declare here so we can link against it.
+using to_fp32_cuda_t = void (*)(const void *, float *, int64_t, cudaStream_t);
+extern "C++" to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
+
 namespace dflash::common {
 
 Qwen35DFlashTarget::~Qwen35DFlashTarget() {
@@ -30,7 +35,8 @@ bool Qwen35DFlashTarget::verify_batch(
         const std::vector<int32_t> & tokens,
         int base_pos,
         int & last_tok,
-        std::vector<int32_t> * all_argmax) {
+        std::vector<int32_t> * all_argmax,
+        bool capture_ssm_intermediates) {
     const int n_tokens = (int)tokens.size();
     if (n_tokens <= 0) return false;
 
@@ -52,10 +58,12 @@ bool Qwen35DFlashTarget::verify_batch(
         }
     }
 
+    const bool do_capture = fast_rollback_ && capture_ssm_intermediates;
+
     if (!build_target_step(sg_, w_, cache_, backend_,
                            /*kv_start=*/base_pos, n_tokens,
                            need_mask, /*capture=*/true,
-                           /*capture_delta_intermediate=*/false,
+                           /*capture_delta_intermediate=*/do_capture,
                            pool ? 0 : fa_window_,
                            /*last_token_logits_only=*/false,
                            kq_stride_pad_,
@@ -170,6 +178,73 @@ bool Qwen35DFlashTarget::snapshot_kv() {
 
 bool Qwen35DFlashTarget::restore_kv() {
     restore_ssm_state(cache_);
+    return true;
+}
+
+bool Qwen35DFlashTarget::supports_fast_rollback() const {
+    return fast_rollback_;
+}
+
+bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
+    if (!fast_rollback_) return false;
+
+    const int n_delta = (int)sg_.delta_captures.size();
+    if (n_delta == 0) return false;
+
+    // If all tokens accepted, the SSM state after processing all q_len tokens
+    // is exactly what we want — no rollback needed, just fix cur_pos.
+    const int q_len = cache_.cur_pos - base_pos;
+    if (commit_n >= q_len) {
+        cache_.cur_pos = base_pos + commit_n;
+        return true;
+    }
+
+    const int rollback_idx = commit_n - 1;  // index into per-step intermediates
+    cudaStream_t stream = nullptr;
+
+    for (int il = 0; il < n_delta; il++) {
+        const DeltaNetCapture & cap = sg_.delta_captures[il];
+        if (!cap.ssm_intermediate_states || !cap.conv_input) {
+            std::fprintf(stderr, "rollback_to: missing capture at layer %d\n", il);
+            return false;
+        }
+
+        // SSM rollback: copy intermediate[rollback_idx] → cache.ssm_state[il]
+        const size_t ssm_elems =
+            (size_t)cache_.ssm_state[il]->ne[0] *
+            (size_t)cache_.ssm_state[il]->ne[1] *
+            (size_t)cache_.ssm_state[il]->ne[2];
+        const size_t ssm_src_offset =
+            (size_t)rollback_idx * cap.ssm_intermediate_states->nb[3];
+        const void * ssm_src =
+            (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
+        ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type)(
+            ssm_src, (float *)cache_.ssm_state[il]->data,
+            (int64_t)ssm_elems, stream);
+
+        // Conv rollback: copy conv_input[commit_n..commit_n+K-2, :, :]
+        // into cache.conv_state[il].
+        const int K_conv = 4;
+        const int row_cnt = (int)cap.conv_input->ne[1];
+        const size_t elt = ggml_element_size(cap.conv_input);
+        const size_t dpitch = (K_conv - 1) * elt;
+        const size_t spitch = cap.conv_input->nb[1];
+        const size_t width  = (K_conv - 1) * elt;
+        const void * conv_src =
+            (const char *)cap.conv_input->data + commit_n * elt;
+        cudaError_t ce = cudaMemcpy2DAsync(cache_.conv_state[il]->data, dpitch,
+                                           conv_src, spitch,
+                                           width, row_cnt,
+                                           cudaMemcpyDeviceToDevice, stream);
+        if (ce != cudaSuccess) {
+            std::fprintf(stderr, "rollback_to: cudaMemcpy2D conv il=%d: %s\n",
+                         il, cudaGetErrorString(ce));
+            return false;
+        }
+    }
+    cudaStreamSynchronize(stream);
+
+    cache_.cur_pos = base_pos + commit_n;
     return true;
 }
 
