@@ -99,6 +99,7 @@ struct MoeHybridFfnTelemetry {
 };
 
 int moe_hybrid_expert_compute_batch_limit();
+int moe_hybrid_expert_compute_ipc_batch_limit(int n_tokens);
 int moe_hybrid_prefill_hot_sub_batch_limit();
 
 // Single-token hybrid FFN: hot on GPU, cold on CPU, combine on host.

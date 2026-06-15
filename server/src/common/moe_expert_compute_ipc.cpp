@@ -11,6 +11,7 @@
 #include "moe_hybrid_ffn_eval.h"
 #include "moe_hybrid_placement.h"
 #include "moe_hybrid_storage.h"
+#include "ggml_graph_precision.h"
 #include "internal.h"
 #include "laguna_internal.h"
 #include "moe_hybrid_types_impl.h"
@@ -112,79 +113,19 @@ struct MoeExpertDaemonStats {
     uint64_t tensor_get_us = 0;
     uint64_t write_us = 0;
 
-    void maybe_print(bool force) const {
+    void maybe_print(bool force, const char * scope = "") const {
         if (!force && calls > 0 && calls % 128 != 0) return;
         if (calls == 0) return;
         std::fprintf(stderr,
-            "[moe-expert-compute-daemon] profile calls=%" PRIu64
+            "[moe-expert-compute-daemon] profile%s calls=%" PRIu64
             " payload_mib=%.3f builds=%" PRIu64
             " read_ms=%.3f unpack_ms=%.3f build_ms=%.3f set_ms=%.3f"
             " compute_ms=%.3f get_ms=%.3f write_ms=%.3f\n",
-            calls, payload_bytes / 1048576.0, graph_builds,
+            scope, calls, payload_bytes / 1048576.0, graph_builds,
             read_us / 1000.0, unpack_us / 1000.0,
             graph_build_us / 1000.0, tensor_set_us / 1000.0,
             compute_us / 1000.0, tensor_get_us / 1000.0,
             write_us / 1000.0);
-    }
-};
-
-struct MoeExpertRemapCacheEntry {
-    std::vector<int32_t> global_ids;
-    std::vector<int32_t> local_ids;
-};
-
-struct MoeExpertRemapCache {
-    std::unordered_map<uint64_t, MoeExpertRemapCacheEntry> entries;
-    std::vector<uint64_t> order;
-    size_t max_entries = 1024;
-
-    static uint64_t hash_step(uint64_t h, uint64_t v) {
-        h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-        return h;
-    }
-
-    uint64_t key(int layer_idx, const int32_t * global_ids, int n_selected) const {
-        uint64_t h = 1469598103934665603ULL;
-        h = hash_step(h, (uint64_t)(uint32_t)layer_idx);
-        h = hash_step(h, (uint64_t)(uint32_t)n_selected);
-        for (int i = 0; i < n_selected; ++i) {
-            h = hash_step(h, (uint64_t)(uint32_t)global_ids[i]);
-        }
-        return h;
-    }
-
-    const std::vector<int32_t> * find(uint64_t k,
-                                      const int32_t * global_ids,
-                                      int n_selected) const {
-        auto it = entries.find(k);
-        if (it == entries.end() ||
-            it->second.global_ids.size() != (size_t)n_selected ||
-            it->second.local_ids.size() != (size_t)n_selected) {
-            return nullptr;
-        }
-        for (int i = 0; i < n_selected; ++i) {
-            if (it->second.global_ids[(size_t)i] != global_ids[i]) {
-                return nullptr;
-            }
-        }
-        return &it->second.local_ids;
-    }
-
-    void insert(uint64_t k,
-                const int32_t * global_ids,
-                const int32_t * local_ids,
-                int n_selected) {
-        if (max_entries == 0) return;
-        auto & entry = entries[k];
-        if (entry.local_ids.empty()) {
-            order.push_back(k);
-        }
-        entry.global_ids.assign(global_ids, global_ids + n_selected);
-        entry.local_ids.assign(local_ids, local_ids + n_selected);
-        while (entries.size() > max_entries && !order.empty()) {
-            entries.erase(order.front());
-            order.erase(order.begin());
-        }
     }
 };
 
@@ -193,6 +134,8 @@ inline ggml_tensor * moe_expert_apply_scale2(ggml_context * ctx,
                                            float scale) {
     return scale == 1.0f ? mm_result : ggml_scale(ctx, mm_result, scale);
 }
+
+bool moe_expert_ipc_is_supported_input_type(ggml_type type);
 
 struct CachedBatchedMoeExpertGraph {
     ggml_context * ctx = nullptr;
@@ -204,6 +147,7 @@ struct CachedBatchedMoeExpertGraph {
     ggml_tensor * output = nullptr;
     int n_tokens = 0;
     int n_selected = 0;
+    ggml_type input_type = GGML_TYPE_F32;
 
     bool valid() const { return ctx && gf && alloc && output; }
 
@@ -217,6 +161,7 @@ struct CachedBatchedMoeExpertGraph {
         output = nullptr;
         n_tokens = 0;
         n_selected = 0;
+        input_type = GGML_TYPE_F32;
     }
 };
 
@@ -252,11 +197,13 @@ bool build_cached_batched_cold_graph(
     int n_embd,
     int n_ff_exp,
     int n_selected,
-    int n_tokens) {
+    int n_tokens,
+    ggml_type input_type = GGML_TYPE_F32) {
 
     out.free();
     if (n_embd <= 0 || n_ff_exp <= 0 || n_selected <= 0 || n_tokens <= 0 ||
-        !down_tensor || (!gate_up_tensor && (!gate_tensor || !up_tensor))) {
+        !down_tensor || (!gate_up_tensor && (!gate_tensor || !up_tensor)) ||
+        !moe_expert_ipc_is_supported_input_type(input_type)) {
         return false;
     }
 
@@ -267,14 +214,15 @@ bool build_cached_batched_cold_graph(
     out.ctx = ggml_init(ip);
     if (!out.ctx) return false;
 
-    out.inp = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    out.inp = ggml_new_tensor_2d(out.ctx, input_type, n_embd, n_tokens);
     ggml_set_input(out.inp);
     out.ids = ggml_new_tensor_2d(out.ctx, GGML_TYPE_I32, n_selected, n_tokens);
     ggml_set_input(out.ids);
     out.weights = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, n_selected, n_tokens);
     ggml_set_input(out.weights);
 
-    ggml_tensor * cur_3d = ggml_reshape_3d(out.ctx, out.inp, n_embd, 1, n_tokens);
+    ggml_tensor * cur_f32 = graph_tensor_f32(out.ctx, out.inp);
+    ggml_tensor * cur_3d = ggml_reshape_3d(out.ctx, cur_f32, n_embd, 1, n_tokens);
     ggml_tensor * gu = nullptr;
     if (gate_up_tensor) {
         ggml_tensor * gate_up_e = moe_expert_apply_scale2(out.ctx,
@@ -310,7 +258,6 @@ bool build_cached_batched_cold_graph(
         ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
     ggml_tensor * moe_sum = ggml_repeat_back(out.ctx, experts, sum_shape);
     out.output = ggml_reshape_2d(out.ctx, moe_sum, n_embd, n_tokens);
-
     out.gf = ggml_new_graph_custom(out.ctx, 4096, false);
     ggml_set_output(out.output);
     ggml_build_forward_expand(out.gf, out.output);
@@ -321,6 +268,7 @@ bool build_cached_batched_cold_graph(
     }
     out.n_tokens = n_tokens;
     out.n_selected = n_selected;
+    out.input_type = input_type;
     return true;
 }
 
@@ -336,6 +284,15 @@ bool emit_status(int stream_fd, int32_t status) {
 
 uint64_t moe_expert_compute_batch_graph_key(int n_tokens, int n_selected) {
     return ((uint64_t)(uint32_t)n_tokens << 32) | (uint32_t)n_selected;
+}
+
+uint64_t moe_expert_compute_batch_graph_key(int n_tokens,
+                                            int n_selected,
+                                            ggml_type input_type) {
+    uint64_t key = ((uint64_t)(uint32_t)n_tokens << 32) |
+                   ((uint64_t)(uint32_t)n_selected << 8) |
+                   (uint64_t)(uint8_t)input_type;
+    return key;
 }
 
 MoeHybridPlacement invert_moe_hybrid_placement(const MoeHybridPlacement & main) {
@@ -397,18 +354,90 @@ bool write_temp_remote_placement(const MoeHybridPlacement & main,
 BackendIpcPayloadTransport moe_expert_transport_from_env() {
     const char * raw = std::getenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_TRANSPORT");
     if (!raw || !*raw) {
-        return BackendIpcPayloadTransport::Stream;
+        return BackendIpcPayloadTransport::Auto;
     }
     BackendIpcPayloadTransport transport = BackendIpcPayloadTransport::Stream;
     if (!parse_backend_ipc_payload_transport(raw, transport)) {
-        return BackendIpcPayloadTransport::Stream;
+        return BackendIpcPayloadTransport::Auto;
     }
     return transport;
 }
 
+int moe_expert_ipc_shared_batch_capacity_from_env() {
+    const char * raw = std::getenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY");
+    if (!raw || !*raw) return 1024;
+    char * end = nullptr;
+    long value = std::strtol(raw, &end, 10);
+    if (end == raw || value <= 0) return 1024;
+    if (value > 4096) return 4096;
+    return (int)value;
+}
+
+ggml_type moe_expert_ipc_input_type_from_env() {
+    const char * raw = std::getenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_DTYPE");
+    if (!raw || !*raw || std::strcmp(raw, "f32") == 0 || std::strcmp(raw, "F32") == 0) {
+        return GGML_TYPE_F32;
+    }
+    if (std::strcmp(raw, "f16") == 0 || std::strcmp(raw, "F16") == 0) {
+        return GGML_TYPE_F16;
+    }
+    if (std::strcmp(raw, "bf16") == 0 || std::strcmp(raw, "BF16") == 0) {
+        return GGML_TYPE_BF16;
+    }
+    std::fprintf(stderr,
+                 "[moe-expert-compute-ipc] ignoring unsupported "
+                 "DFLASH_MOE_EXPERT_COMPUTE_IPC_DTYPE=%s\n",
+                 raw);
+    return GGML_TYPE_F32;
+}
+
+bool moe_expert_ipc_is_supported_input_type(ggml_type type) {
+    return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 ||
+           type == GGML_TYPE_BF16;
+}
+
+size_t moe_expert_ipc_input_row_size(ggml_type type, size_t n_embd) {
+    if (!moe_expert_ipc_is_supported_input_type(type) || n_embd == 0) {
+        return 0;
+    }
+    return ggml_row_size(type, (int64_t)n_embd);
+}
+
+bool moe_expert_convert_input_to_ipc_type(ggml_type type,
+                                          const float * src,
+                                          int n_tokens,
+                                          int n_embd,
+                                          std::vector<uint8_t> & scratch,
+                                          const void *& data,
+                                          size_t & bytes) {
+    data = src;
+    bytes = 0;
+    if (!src || n_tokens <= 0 || n_embd <= 0 ||
+        !moe_expert_ipc_is_supported_input_type(type)) {
+        return false;
+    }
+    const size_t elems = (size_t)n_tokens * (size_t)n_embd;
+    if (type == GGML_TYPE_F32) {
+        bytes = elems * sizeof(float);
+        return true;
+    }
+    bytes = ggml_row_size(type, (int64_t)n_embd) * (size_t)n_tokens;
+    scratch.resize(bytes);
+    if (type == GGML_TYPE_F16) {
+        ggml_fp32_to_fp16_row(src, reinterpret_cast<ggml_fp16_t *>(scratch.data()),
+                              (int64_t)elems);
+    } else {
+        ggml_fp32_to_bf16_row(src, reinterpret_cast<ggml_bf16_t *>(scratch.data()),
+                              (int64_t)elems);
+    }
+    data = scratch.data();
+    return true;
+}
+
 size_t moe_expert_required_shared_bytes(int n_embd,
                                       int n_expert_used,
-                                      int batch_limit) {
+                                      int batch_limit,
+                                      ggml_type input_type) {
     if (n_embd <= 0 || n_expert_used <= 0 || batch_limit <= 0) return 0;
     size_t input_bytes = 0;
     size_t ids_bytes = 0;
@@ -418,7 +447,10 @@ size_t moe_expert_required_shared_bytes(int n_embd,
     size_t selected_elems = 0;
     if (!moe_expert_compute_checked_mul_size((size_t)batch_limit, (size_t)n_embd, input_elems) ||
         !moe_expert_compute_checked_mul_size((size_t)batch_limit, (size_t)n_expert_used, selected_elems) ||
-        !moe_expert_compute_checked_mul_size(input_elems, sizeof(float), input_bytes) ||
+        !moe_expert_compute_checked_mul_size(
+            (size_t)batch_limit,
+            moe_expert_ipc_input_row_size(input_type, (size_t)n_embd),
+            input_bytes) ||
         !moe_expert_compute_checked_mul_size(selected_elems, sizeof(int32_t), ids_bytes) ||
         !moe_expert_compute_checked_mul_size(selected_elems, sizeof(float), weights_bytes) ||
         !backend_ipc_checked_add_size(input_bytes, ids_bytes, total) ||
@@ -668,6 +700,13 @@ bool commit_shared_payload_response(void * shared_payload,
     return true;
 }
 
+int remote_hot_expert_count(const MoeHybridLayerStorage & storage) {
+    if (storage.gate_up_hot) return (int)storage.gate_up_hot->ne[2];
+    if (storage.gate_hot) return (int)storage.gate_hot->ne[2];
+    if (storage.down_hot) return (int)storage.down_hot->ne[2];
+    return (int)storage.hot_expert_ids.size();
+}
+
 class MoeExpertComputeIpc : public MoeExpertCompute {
 public:
     explicit MoeExpertComputeIpc(int n_ff_max)
@@ -710,9 +749,13 @@ public:
         launch.payload_path = target_path;
         launch.work_dir = work_dir;
         launch.payload_transport = moe_expert_transport_from_env();
+        input_type_ = moe_expert_ipc_input_type_from_env();
+        const int shared_batch_capacity =
+            std::max(moe_hybrid_expert_compute_batch_limit(),
+                     moe_expert_ipc_shared_batch_capacity_from_env());
         launch.shared_payload_bytes = moe_expert_shared_bytes_from_env(
             moe_expert_required_shared_bytes(
-                n_embd, n_expert_used, moe_hybrid_expert_compute_batch_limit()));
+                n_embd, n_expert_used, shared_batch_capacity, GGML_TYPE_F32));
         launch.args.push_back("--target-gpu=" + std::to_string(std::max(0, target_gpu)));
         launch.args.push_back("--placement=" + placement_path_);
         if (!process_.start(launch)) {
@@ -725,8 +768,9 @@ public:
         n_embd_ = n_embd;
         n_expert_used_ = n_expert_used;
         profile_ = moe_expert_compute_profile_enabled();
-        std::printf("[moe-expert-compute-ipc] ready bin=%s gpu=%d work_dir=%s\n",
-                    bin.c_str(), target_gpu, process_.work_dir().c_str());
+        std::printf("[moe-expert-compute-ipc] ready bin=%s gpu=%d input_type=%s work_dir=%s\n",
+                    bin.c_str(), target_gpu,
+                    ggml_type_name(input_type_), process_.work_dir().c_str());
         return true;
 #endif
     }
@@ -749,17 +793,15 @@ public:
             return fallback_->compute(layer, input, ids, weights, n_cold, n_embd, n_ff, output);
         }
 
-        global_ids_.resize((size_t)n_cold);
         for (int i = 0; i < n_cold; ++i) {
             const int32_t local = ids[i];
             if (local < 0 || (size_t)local >= layer.cold_global_by_local.size()) {
                 if (required_) return false;
                 return fallback_->compute(layer, input, ids, weights, n_cold, n_embd, n_ff, output);
             }
-            global_ids_[(size_t)i] = layer.cold_global_by_local[(size_t)local];
         }
 
-        if (!compute_remote(layer.layer_idx, input, global_ids_.data(), weights,
+        if (!compute_remote(layer.layer_idx, input, ids, weights,
                             n_cold, n_embd, output)) {
             active_ = false;
             if (required_) {
@@ -795,7 +837,6 @@ public:
                                             n_embd, n_ff, output);
         }
 
-        global_ids_.resize((size_t)n_tokens * (size_t)n_selected);
         for (int t = 0; t < n_tokens; ++t) {
             for (int i = 0; i < n_selected; ++i) {
                 const size_t idx = (size_t)t * (size_t)n_selected + (size_t)i;
@@ -806,11 +847,10 @@ public:
                                                     n_tokens, n_selected,
                                                     n_embd, n_ff, output);
                 }
-                global_ids_[idx] = layer.cold_global_by_local[(size_t)local];
             }
         }
 
-        if (!compute_remote_batch(layer.layer_idx, input, global_ids_.data(),
+        if (!compute_remote_batch(layer.layer_idx, input, ids,
                                   weights, n_tokens,
                                   n_selected, n_embd, output)) {
             active_ = false;
@@ -833,13 +873,13 @@ public:
 private:
     bool compute_remote(int layer_idx,
                         const float * input,
-                        const int32_t * global_ids,
+                        const int32_t * local_ids,
                         const float * weights,
                         int n_selected,
                         int n_embd,
                         float * output) {
 #if defined(_WIN32)
-        (void)layer_idx; (void)input; (void)global_ids; (void)weights;
+        (void)layer_idx; (void)input; (void)local_ids; (void)weights;
         (void)n_selected; (void)n_embd; (void)output;
         return false;
 #else
@@ -847,12 +887,19 @@ private:
         const int stream_fd = process_.stream_fd();
         const int payload_fd = process_.payload_fd();
         if (!cmd || stream_fd < 0 || layer_idx < 0 || !input ||
-            !global_ids || !weights || n_selected <= 0 ||
+            !local_ids || !weights || n_selected <= 0 ||
             n_selected > n_expert_used_) {
             return false;
         }
 
-        const size_t input_bytes = (size_t)n_embd * sizeof(float);
+        const ggml_type request_input_type = GGML_TYPE_F32;
+        const void * ipc_input = nullptr;
+        size_t input_bytes = 0;
+        if (!moe_expert_convert_input_to_ipc_type(
+                request_input_type, input, 1, n_embd, input_scratch_,
+                ipc_input, input_bytes)) {
+            return false;
+        }
         const size_t ids_bytes = (size_t)n_selected * sizeof(int32_t);
         const size_t weights_bytes = (size_t)n_selected * sizeof(float);
         size_t payload_bytes = 0;
@@ -865,8 +912,8 @@ private:
         const auto pack_t0 = MoeExpertClock::now();
         uint64_t seq = 0;
         const BackendIpcPayloadSegment segments[] = {
-            {input, input_bytes},
-            {global_ids, ids_bytes},
+            {ipc_input, input_bytes},
+            {local_ids, ids_bytes},
             {weights, weights_bytes},
         };
         const auto pack_t1 = MoeExpertClock::now();
@@ -876,15 +923,27 @@ private:
             if (!process_.write_shared_payload_segments(segments, 3, seq)) {
                 return false;
             }
-            std::fprintf(cmd, "compute_shared %d %d %zu %" PRIu64 "\n",
-                         layer_idx, n_selected, payload_bytes, seq);
+            if (request_input_type == GGML_TYPE_F32) {
+                std::fprintf(cmd, "compute_local_shared %d %d %zu %" PRIu64 "\n",
+                             layer_idx, n_selected, payload_bytes, seq);
+            } else {
+                std::fprintf(cmd, "compute_local_shared_typed %d %d %d %zu %" PRIu64 "\n",
+                             layer_idx, n_selected, (int)request_input_type,
+                             payload_bytes, seq);
+            }
             std::fflush(cmd);
         } else if (payload_fd >= 0) {
-            std::fprintf(cmd, "compute_pipe %d %d %zu\n",
-                         layer_idx, n_selected, payload_bytes);
+            if (request_input_type == GGML_TYPE_F32) {
+                std::fprintf(cmd, "compute_local_pipe %d %d %zu\n",
+                             layer_idx, n_selected, payload_bytes);
+            } else {
+                std::fprintf(cmd, "compute_local_pipe_typed %d %d %d %zu\n",
+                             layer_idx, n_selected, (int)request_input_type,
+                             payload_bytes);
+            }
             std::fflush(cmd);
-            if (!write_exact_fd(payload_fd, input, input_bytes) ||
-                !write_exact_fd(payload_fd, global_ids, ids_bytes) ||
+            if (!write_exact_fd(payload_fd, ipc_input, input_bytes) ||
+                !write_exact_fd(payload_fd, local_ids, ids_bytes) ||
                 !write_exact_fd(payload_fd, weights, weights_bytes)) {
                 return false;
             }
@@ -920,14 +979,14 @@ private:
 
     bool compute_remote_batch(int layer_idx,
                               const float * input,
-                              const int32_t * global_ids,
+                              const int32_t * local_ids,
                               const float * weights,
                               int n_tokens,
                               int n_selected,
                               int n_embd,
                               float * output) {
 #if defined(_WIN32)
-        (void)layer_idx; (void)input; (void)global_ids; (void)weights;
+        (void)layer_idx; (void)input; (void)local_ids; (void)weights;
         (void)n_tokens; (void)n_selected; (void)n_embd; (void)output;
         return false;
 #else
@@ -935,13 +994,19 @@ private:
         const int stream_fd = process_.stream_fd();
         const int payload_fd = process_.payload_fd();
         if (!cmd || stream_fd < 0 || layer_idx < 0 || !input ||
-            !global_ids || !weights || n_tokens <= 0 || n_selected <= 0 ||
+            !local_ids || !weights || n_tokens <= 0 || n_selected <= 0 ||
             n_selected > n_expert_used_) {
             return false;
         }
 
-        const size_t input_bytes =
-            (size_t)n_tokens * (size_t)n_embd * sizeof(float);
+        const ggml_type request_input_type = input_type_;
+        const void * ipc_input = nullptr;
+        size_t input_bytes = 0;
+        if (!moe_expert_convert_input_to_ipc_type(
+                request_input_type, input, n_tokens, n_embd, input_scratch_,
+                ipc_input, input_bytes)) {
+            return false;
+        }
         const size_t ids_bytes =
             (size_t)n_tokens * (size_t)n_selected * sizeof(int32_t);
         const size_t weights_bytes =
@@ -956,8 +1021,8 @@ private:
         const auto pack_t0 = MoeExpertClock::now();
         uint64_t seq = 0;
         const BackendIpcPayloadSegment segments[] = {
-            {input, input_bytes},
-            {global_ids, ids_bytes},
+            {ipc_input, input_bytes},
+            {local_ids, ids_bytes},
             {weights, weights_bytes},
         };
         const auto pack_t1 = MoeExpertClock::now();
@@ -967,15 +1032,27 @@ private:
             if (!process_.write_shared_payload_segments(segments, 3, seq)) {
                 return false;
             }
-            std::fprintf(cmd, "compute_batch_shared %d %d %d %zu %" PRIu64 "\n",
-                         layer_idx, n_tokens, n_selected, payload_bytes, seq);
+            if (request_input_type == GGML_TYPE_F32) {
+                std::fprintf(cmd, "compute_batch_local_shared %d %d %d %zu %" PRIu64 "\n",
+                             layer_idx, n_tokens, n_selected, payload_bytes, seq);
+            } else {
+                std::fprintf(cmd, "compute_batch_local_shared_typed %d %d %d %d %zu %" PRIu64 "\n",
+                             layer_idx, n_tokens, n_selected, (int)request_input_type,
+                             payload_bytes, seq);
+            }
             std::fflush(cmd);
         } else if (payload_fd >= 0) {
-            std::fprintf(cmd, "compute_batch_pipe %d %d %d %zu\n",
-                         layer_idx, n_tokens, n_selected, payload_bytes);
+            if (request_input_type == GGML_TYPE_F32) {
+                std::fprintf(cmd, "compute_batch_local_pipe %d %d %d %zu\n",
+                             layer_idx, n_tokens, n_selected, payload_bytes);
+            } else {
+                std::fprintf(cmd, "compute_batch_local_pipe_typed %d %d %d %d %zu\n",
+                             layer_idx, n_tokens, n_selected, (int)request_input_type,
+                             payload_bytes);
+            }
             std::fflush(cmd);
-            if (!write_exact_fd(payload_fd, input, input_bytes) ||
-                !write_exact_fd(payload_fd, global_ids, ids_bytes) ||
+            if (!write_exact_fd(payload_fd, ipc_input, input_bytes) ||
+                !write_exact_fd(payload_fd, local_ids, ids_bytes) ||
                 !write_exact_fd(payload_fd, weights, weights_bytes)) {
                 return false;
             }
@@ -1013,10 +1090,11 @@ private:
     BackendIpcProcess process_;
     std::unique_ptr<MoeExpertCompute> fallback_;
     std::string placement_path_;
-    std::vector<int32_t> global_ids_;
+    std::vector<uint8_t> input_scratch_;
     MoeExpertIpcClientStats stats_;
     int n_embd_ = 0;
     int n_expert_used_ = 0;
+    ggml_type input_type_ = GGML_TYPE_F32;
     bool active_ = false;
     bool required_ = false;
     bool profile_ = false;
@@ -1172,15 +1250,16 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
         std::vector<CachedFfnGraph>((size_t)runtime.n_expert_used + 1));
     std::vector<std::unordered_map<uint64_t, CachedBatchedMoeExpertGraph>> batch_graphs(
         (size_t)runtime.n_layer);
-    std::vector<float> input((size_t)runtime.n_embd);
+    std::vector<uint8_t> input;
     std::vector<int32_t> local_ids((size_t)std::max(1, runtime.n_expert_used));
     std::vector<float> router_weights((size_t)std::max(1, runtime.n_expert_used));
     std::vector<float> output((size_t)runtime.n_embd);
     std::vector<int32_t> batch_local_ids;
-    std::vector<int32_t> payload_global_ids;
+    std::vector<int32_t> payload_ids;
     std::vector<float> payload_weights;
-    MoeExpertRemapCache remap_cache;
     MoeExpertDaemonStats profile_stats;
+    MoeExpertDaemonStats profile_stats_prefill;
+    MoeExpertDaemonStats profile_stats_decode;
     const bool profile = moe_expert_compute_profile_enabled();
     int warmup_builds = 0;
     std::fprintf(stderr,
@@ -1205,6 +1284,8 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
         bool payload_ok = false;
         bool pipe_payload = false;
         bool shared_payload_cmd = false;
+        bool ids_are_local = false;
+        ggml_type input_type = GGML_TYPE_F32;
         const auto read_t0 = MoeExpertClock::now();
         if (cmd == "compute_pipe") {
             iss >> layer_idx >> n_selected >> bytes;
@@ -1212,12 +1293,52 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
         } else if (cmd == "compute_shared") {
             iss >> layer_idx >> n_selected >> bytes >> shared_seq;
             shared_payload_cmd = true;
+        } else if (cmd == "compute_local_pipe") {
+            iss >> layer_idx >> n_selected >> bytes;
+            pipe_payload = true;
+            ids_are_local = true;
+        } else if (cmd == "compute_local_pipe_typed") {
+            int input_type_i = (int)GGML_TYPE_F32;
+            iss >> layer_idx >> n_selected >> input_type_i >> bytes;
+            pipe_payload = true;
+            ids_are_local = true;
+            input_type = (ggml_type)input_type_i;
+        } else if (cmd == "compute_local_shared") {
+            iss >> layer_idx >> n_selected >> bytes >> shared_seq;
+            shared_payload_cmd = true;
+            ids_are_local = true;
+        } else if (cmd == "compute_local_shared_typed") {
+            int input_type_i = (int)GGML_TYPE_F32;
+            iss >> layer_idx >> n_selected >> input_type_i >> bytes >> shared_seq;
+            shared_payload_cmd = true;
+            ids_are_local = true;
+            input_type = (ggml_type)input_type_i;
         } else if (cmd == "compute_batch_pipe") {
             iss >> layer_idx >> n_tokens >> n_selected >> bytes;
             pipe_payload = true;
         } else if (cmd == "compute_batch_shared") {
             iss >> layer_idx >> n_tokens >> n_selected >> bytes >> shared_seq;
             shared_payload_cmd = true;
+        } else if (cmd == "compute_batch_local_pipe") {
+            iss >> layer_idx >> n_tokens >> n_selected >> bytes;
+            pipe_payload = true;
+            ids_are_local = true;
+        } else if (cmd == "compute_batch_local_pipe_typed") {
+            int input_type_i = (int)GGML_TYPE_F32;
+            iss >> layer_idx >> n_tokens >> n_selected >> input_type_i >> bytes;
+            pipe_payload = true;
+            ids_are_local = true;
+            input_type = (ggml_type)input_type_i;
+        } else if (cmd == "compute_batch_local_shared") {
+            iss >> layer_idx >> n_tokens >> n_selected >> bytes >> shared_seq;
+            shared_payload_cmd = true;
+            ids_are_local = true;
+        } else if (cmd == "compute_batch_local_shared_typed") {
+            int input_type_i = (int)GGML_TYPE_F32;
+            iss >> layer_idx >> n_tokens >> n_selected >> input_type_i >> bytes >> shared_seq;
+            shared_payload_cmd = true;
+            ids_are_local = true;
+            input_type = (ggml_type)input_type_i;
         } else {
             emit_status(stream_fd, -1);
             continue;
@@ -1232,7 +1353,8 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
         bool header_ok = false;
         if (n_tokens > 0 && n_selected > 0 &&
             n_selected <= runtime.n_expert_used &&
-            layer_idx >= 0 && layer_idx < runtime.n_layer) {
+            layer_idx >= 0 && layer_idx < runtime.n_layer &&
+            moe_expert_ipc_is_supported_input_type(input_type)) {
             header_ok =
                 moe_expert_compute_checked_mul_size((size_t)n_tokens,
                                               (size_t)runtime.n_embd,
@@ -1240,7 +1362,10 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
                 moe_expert_compute_checked_mul_size((size_t)n_tokens,
                                               (size_t)n_selected,
                                               selected_elems) &&
-                moe_expert_compute_checked_mul_size(input_elems, sizeof(float),
+                moe_expert_compute_checked_mul_size((size_t)n_tokens,
+                                              moe_expert_ipc_input_row_size(
+                                                  input_type,
+                                                  (size_t)runtime.n_embd),
                                               input_bytes) &&
                 moe_expert_compute_checked_mul_size(selected_elems, sizeof(int32_t),
                                               ids_bytes) &&
@@ -1252,12 +1377,12 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
         }
 
         if (pipe_payload && header_ok) {
-            input.resize((size_t)n_tokens * (size_t)runtime.n_embd);
-            payload_global_ids.resize((size_t)n_tokens * (size_t)n_selected);
+            input.resize(input_bytes);
+            payload_ids.resize((size_t)n_tokens * (size_t)n_selected);
             payload_weights.resize((size_t)n_tokens * (size_t)n_selected);
             payload_ok = payload_fd >= 0 &&
                 read_exact_fd(payload_fd, input.data(), input_bytes) &&
-                read_exact_fd(payload_fd, payload_global_ids.data(), ids_bytes) &&
+                read_exact_fd(payload_fd, payload_ids.data(), ids_bytes) &&
                 read_exact_fd(payload_fd, payload_weights.data(), weights_bytes);
         } else if (pipe_payload) {
             payload_ok = payload_fd >= 0 &&
@@ -1279,25 +1404,26 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
         if (!shared_payload_cmd) {
             output.resize((size_t)n_tokens * (size_t)runtime.n_embd);
         }
-        const float * input_data = nullptr;
-        const int32_t * global_ids = nullptr;
+        const uint8_t * input_data = nullptr;
+        const int32_t * payload_id_data = nullptr;
         const float * in_weights = nullptr;
         if (pipe_payload) {
             input_data = input.data();
-            global_ids = payload_global_ids.data();
+            payload_id_data = payload_ids.data();
             in_weights = payload_weights.data();
         } else {
             const auto * payload_data =
                 static_cast<const uint8_t *>(shared_payload_data);
-            input_data = reinterpret_cast<const float *>(payload_data + off);
+            input_data = payload_data + off;
             off += input_bytes;
-            global_ids = reinterpret_cast<const int32_t *>(payload_data + off);
+            payload_id_data = reinterpret_cast<const int32_t *>(payload_data + off);
             off += ids_bytes;
             in_weights = reinterpret_cast<const float *>(payload_data + off);
         }
 
         MoeHybridLayerStorage & storage = runtime.hybrid.layers[(size_t)layer_idx];
         const auto unpack_t1 = MoeExpertClock::now();
+        const int remote_hot_count = remote_hot_expert_count(storage);
 
         auto & layer_graphs = graphs[(size_t)layer_idx];
         if ((size_t)n_selected >= layer_graphs.size()) {
@@ -1305,10 +1431,11 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
             continue;
         }
         const RemoteMoeLayerRuntime & L = runtime.layers[(size_t)layer_idx];
-        if (n_tokens > 1) {
+        if (n_tokens > 1 || input_type != GGML_TYPE_F32) {
             auto & layer_batch_graphs = batch_graphs[(size_t)layer_idx];
             const uint64_t graph_key =
-                moe_expert_compute_batch_graph_key(n_tokens, n_selected);
+                moe_expert_compute_batch_graph_key(n_tokens, n_selected,
+                                                   input_type);
             auto inserted = layer_batch_graphs.try_emplace(graph_key);
             CachedBatchedMoeExpertGraph & graph = inserted.first->second;
             if (!graph.valid() || graph.n_tokens != n_tokens ||
@@ -1321,33 +1448,42 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
                         L.gate_scale, L.up_scale,
                         L.down_scale, L.gate_up_scale,
                         runtime.n_embd, runtime.n_ff_exp,
-                        n_selected, n_tokens)) {
+                        n_selected, n_tokens, input_type)) {
                     emit_status(stream_fd, -1);
                     continue;
                 }
                 const auto build_t1 = MoeExpertClock::now();
                 if (profile) {
-                    profile_stats.graph_builds++;
-                    profile_stats.graph_build_us +=
+                    MoeExpertDaemonStats & scope_stats =
+                        n_tokens > 1 ? profile_stats_prefill : profile_stats_decode;
+                    scope_stats.graph_builds++;
+                    scope_stats.graph_build_us +=
                         moe_expert_compute_elapsed_us(build_t0, build_t1);
                 }
             }
 
             bool ids_ok = true;
-            batch_local_ids.resize((size_t)n_tokens * (size_t)n_selected);
+            const int32_t * graph_ids_data = payload_id_data;
+            if (!ids_are_local) {
+                batch_local_ids.resize((size_t)n_tokens * (size_t)n_selected);
+                graph_ids_data = batch_local_ids.data();
+            }
             for (int t = 0; t < n_tokens && ids_ok; ++t) {
                 for (int i = 0; i < n_selected; ++i) {
                     const size_t idx = (size_t)t * (size_t)n_selected +
                                        (size_t)i;
-                    const int32_t gid = global_ids[idx];
-                    const int32_t local =
-                        (gid >= 0 && gid < (int)storage.hot_local_by_global.size())
-                            ? storage.hot_local_by_global[(size_t)gid] : -1;
-                    if (local < 0) {
+                    const int32_t id = payload_id_data[idx];
+                    const int32_t local = ids_are_local
+                        ? id
+                        : ((id >= 0 && id < (int)storage.hot_local_by_global.size())
+                            ? storage.hot_local_by_global[(size_t)id] : -1);
+                    if (local < 0 || local >= remote_hot_count) {
                         ids_ok = false;
                         break;
                     }
-                    batch_local_ids[idx] = local;
+                    if (!ids_are_local) {
+                        batch_local_ids[idx] = local;
+                    }
                 }
             }
             if (!ids_ok) {
@@ -1357,10 +1493,8 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
 
             const auto set_one_t0 = MoeExpertClock::now();
             ggml_backend_tensor_set(graph.inp, input_data, 0, input_bytes);
-            ggml_backend_tensor_set(graph.ids, batch_local_ids.data(), 0,
-                                    ids_bytes);
-            ggml_backend_tensor_set(graph.weights, in_weights, 0,
-                                    weights_bytes);
+            ggml_backend_tensor_set(graph.ids, graph_ids_data, 0, ids_bytes);
+            ggml_backend_tensor_set(graph.weights, in_weights, 0, weights_bytes);
             const auto set_one_t1 = MoeExpertClock::now();
             auto st = ggml_backend_graph_compute(backend, graph.gf);
             const auto compute_one_t1 = MoeExpertClock::now();
@@ -1368,40 +1502,58 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
                 emit_status(stream_fd, -1);
                 continue;
             }
+            const size_t output_bytes =
+                (size_t)n_tokens * (size_t)runtime.n_embd * sizeof(float);
             void * response_data = shared_payload_cmd
                 ? shared_payload_data : static_cast<void *>(output.data());
             ggml_backend_tensor_get(graph.output, response_data, 0,
-                                    input_bytes);
+                                    output_bytes);
             const auto get_one_t1 = MoeExpertClock::now();
 
             const int32_t status = 0;
             if (shared_payload_cmd &&
                 !commit_shared_payload_response(shared_payload, shared_payload_data,
                                                 shared_payload_capacity,
-                                                input_bytes, shared_seq)) {
+                                                output_bytes, shared_seq)) {
                 emit_status(stream_fd, -1);
                 continue;
             }
             if (!write_exact_fd(stream_fd, &status, sizeof(status)) ||
                 (!shared_payload_cmd &&
-                 !write_exact_fd(stream_fd, output.data(), input_bytes))) {
+                 !write_exact_fd(stream_fd, output.data(), output_bytes))) {
                 break;
             }
             const auto write_t1 = MoeExpertClock::now();
             if (profile) {
-                profile_stats.calls++;
-                profile_stats.payload_bytes += bytes;
-                profile_stats.read_us += moe_expert_compute_elapsed_us(read_t0, read_t1);
-                profile_stats.unpack_us += moe_expert_compute_elapsed_us(read_t1, unpack_t1);
-                profile_stats.tensor_set_us +=
+                MoeExpertDaemonStats & scope_stats =
+                    n_tokens > 1 ? profile_stats_prefill : profile_stats_decode;
+                const uint64_t read_us =
+                    moe_expert_compute_elapsed_us(read_t0, read_t1);
+                const uint64_t unpack_us =
+                    moe_expert_compute_elapsed_us(read_t1, unpack_t1);
+                const uint64_t set_us =
                     moe_expert_compute_elapsed_us(set_one_t0, set_one_t1);
-                profile_stats.compute_us +=
+                const uint64_t compute_us =
                     moe_expert_compute_elapsed_us(set_one_t1, compute_one_t1);
-                profile_stats.tensor_get_us +=
+                const uint64_t get_us =
                     moe_expert_compute_elapsed_us(compute_one_t1, get_one_t1);
-                profile_stats.write_us +=
+                const uint64_t write_us =
                     moe_expert_compute_elapsed_us(get_one_t1, write_t1);
+                auto record_stats = [&](MoeExpertDaemonStats & stats) {
+                    stats.calls++;
+                    stats.payload_bytes += bytes;
+                    stats.read_us += read_us;
+                    stats.unpack_us += unpack_us;
+                    stats.tensor_set_us += set_us;
+                    stats.compute_us += compute_us;
+                    stats.tensor_get_us += get_us;
+                    stats.write_us += write_us;
+                };
+                record_stats(profile_stats);
+                record_stats(scope_stats);
                 profile_stats.maybe_print(false);
+                scope_stats.maybe_print(n_tokens > 1,
+                                        n_tokens > 1 ? "[prefill]" : "[decode]");
             }
             continue;
         }
@@ -1421,8 +1573,8 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
             }
             const auto build_t1 = MoeExpertClock::now();
             if (profile) {
-                profile_stats.graph_builds++;
-                profile_stats.graph_build_us +=
+                profile_stats_decode.graph_builds++;
+                profile_stats_decode.graph_build_us +=
                     moe_expert_compute_elapsed_us(build_t0, build_t1);
             }
         }
@@ -1437,32 +1589,24 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
         for (int t = 0; t < n_tokens; ++t) {
             bool ids_ok = true;
             const size_t token_off = (size_t)t * (size_t)n_selected;
-            const int32_t * token_global_ids = global_ids + token_off;
-            const uint64_t remap_key =
-                remap_cache.key(layer_idx, token_global_ids, n_selected);
-            if (const std::vector<int32_t> * cached =
-                    remap_cache.find(remap_key, token_global_ids, n_selected)) {
-                std::memcpy(local_ids.data(), cached->data(), one_ids_bytes);
-            } else {
-                for (int i = 0; i < n_selected; ++i) {
-                    const int32_t gid = token_global_ids[i];
-                    const int32_t local =
-                        (gid >= 0 && gid < (int)storage.hot_local_by_global.size())
-                            ? storage.hot_local_by_global[(size_t)gid] : -1;
-                    if (local < 0) {
-                        ids_ok = false;
-                        break;
-                    }
-                    local_ids[(size_t)i] = local;
-                }
-                if (ids_ok) {
-                    remap_cache.insert(remap_key, token_global_ids,
-                                       local_ids.data(), n_selected);
-                }
+            const int32_t * token_ids = payload_id_data + token_off;
+            const float * token_weights = in_weights + token_off;
+            const int32_t * graph_ids_data = token_ids;
+            if (!ids_are_local) {
+                graph_ids_data = local_ids.data();
             }
-            if (ids_ok) {
-                for (int i = 0; i < n_selected; ++i) {
-                    router_weights[(size_t)i] = in_weights[token_off + (size_t)i];
+            for (int i = 0; i < n_selected; ++i) {
+                const int32_t id = token_ids[i];
+                const int32_t local = ids_are_local
+                    ? id
+                    : ((id >= 0 && id < (int)storage.hot_local_by_global.size())
+                        ? storage.hot_local_by_global[(size_t)id] : -1);
+                if (local < 0 || local >= remote_hot_count) {
+                    ids_ok = false;
+                    break;
+                }
+                if (!ids_are_local) {
+                    local_ids[(size_t)i] = local;
                 }
             }
             if (!ids_ok) {
@@ -1471,12 +1615,12 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
             }
             const auto set_one_t0 = MoeExpertClock::now();
             ggml_backend_tensor_set(graph.inp,
-                                    input_data +
-                                        (size_t)t * (size_t)runtime.n_embd,
+                                    static_cast<const uint8_t *>(input_data) +
+                                        (size_t)t * one_input_bytes,
                                     0, one_input_bytes);
-            ggml_backend_tensor_set(graph.ids, local_ids.data(), 0,
+            ggml_backend_tensor_set(graph.ids, graph_ids_data, 0,
                                     one_ids_bytes);
-            ggml_backend_tensor_set(graph.weights, router_weights.data(), 0,
+            ggml_backend_tensor_set(graph.weights, token_weights, 0,
                                     one_weights_bytes);
             const auto set_one_t1 = MoeExpertClock::now();
             auto st = ggml_backend_graph_compute(backend, graph.gf);
@@ -1519,20 +1663,33 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
         }
         const auto write_t1 = MoeExpertClock::now();
         if (profile) {
-            profile_stats.calls++;
-            profile_stats.payload_bytes += bytes;
-            profile_stats.read_us += moe_expert_compute_elapsed_us(read_t0, read_t1);
-            profile_stats.unpack_us += moe_expert_compute_elapsed_us(read_t1, unpack_t1);
-            profile_stats.tensor_set_us += set_us_accum;
-            profile_stats.compute_us += compute_us_accum;
-            profile_stats.tensor_get_us += get_us_accum;
-            profile_stats.write_us += moe_expert_compute_elapsed_us(get_t1, write_t1);
+            const uint64_t read_us =
+                moe_expert_compute_elapsed_us(read_t0, read_t1);
+            const uint64_t unpack_us =
+                moe_expert_compute_elapsed_us(read_t1, unpack_t1);
+            const uint64_t write_us =
+                moe_expert_compute_elapsed_us(get_t1, write_t1);
+            auto record_stats = [&](MoeExpertDaemonStats & stats) {
+                stats.calls++;
+                stats.payload_bytes += bytes;
+                stats.read_us += read_us;
+                stats.unpack_us += unpack_us;
+                stats.tensor_set_us += set_us_accum;
+                stats.compute_us += compute_us_accum;
+                stats.tensor_get_us += get_us_accum;
+                stats.write_us += write_us;
+            };
+            record_stats(profile_stats);
+            record_stats(profile_stats_decode);
             profile_stats.maybe_print(false);
+            profile_stats_decode.maybe_print(false, "[decode]");
         }
     }
 
     if (profile) {
         profile_stats.maybe_print(true);
+        profile_stats_prefill.maybe_print(true, "[prefill]");
+        profile_stats_decode.maybe_print(true, "[decode]");
     }
     for (auto & per_layer : graphs) {
         for (auto & graph : per_layer) graph.free();

@@ -622,7 +622,7 @@ static void test_parse_call_verb_cleaned_text() {
 }
 
 static void test_parse_call_verb_intercept_inner_json() {
-    // Codex-requested: inner args of the form {"name": ..., "arguments": ...}
+    // Regression case: inner args of the form {"name": ..., "arguments": ...}
     // must NOT be picked up by pattern 6 (bare-JSON sweep) as a spurious
     // `inner` ToolCall. Exactly one ToolCall, named `outer`, with the
     // inner JSON intact in its arguments.
@@ -2943,6 +2943,25 @@ static void test_moe_hybrid_expert_compute_batch_default() {
     TEST_ASSERT(moe_hybrid_expert_compute_batch_limit() == 32);
 }
 
+static void test_moe_hybrid_expert_compute_ipc_mode_batch_limit() {
+    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE");
+    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY");
+    TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 1024);
+
+    dflash_setenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE", "auto");
+    dflash_setenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY", "512");
+    TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 512);
+
+    dflash_setenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE", "batched");
+    TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 512);
+
+    dflash_setenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE", "stream");
+    TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 32);
+
+    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE");
+    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY");
+}
+
 static void test_moe_hybrid_prefill_hot_sub_batch_limit() {
     dflash_unsetenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH");
     TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 4);
@@ -4139,6 +4158,7 @@ int main() {
     RUN_TEST(test_backend_ipc_shared_payload_map_sizing);
     RUN_TEST(test_backend_ipc_shared_payload_segment_contract);
     RUN_TEST(test_moe_hybrid_expert_compute_batch_default);
+    RUN_TEST(test_moe_hybrid_expert_compute_ipc_mode_batch_limit);
     RUN_TEST(test_moe_hybrid_prefill_hot_sub_batch_limit);
 
     std::fprintf(stderr, "\n── Jinja chat template ──\n");
