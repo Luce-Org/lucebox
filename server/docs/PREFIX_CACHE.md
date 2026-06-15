@@ -186,7 +186,7 @@ free_snapshot_backend(snap_backend_, compute_backend_);  // then backend
 | `--cache-prefill-ram SIZE` | auto | Advanced override for exact full-prompt RAM pool |
 | `--cache-prefix-disk SIZE` | auto | Advanced override for turn-boundary prefix disk pool |
 | `--cache-prefill-disk SIZE` | auto | Advanced override for exact full-prompt disk pool |
-| `--skip-park` | false | Skip parking draft model during compress |
+| `--prefill-skip-park` | false | Skip parking draft model during compress |
 
 Deprecated compatibility aliases:
 
