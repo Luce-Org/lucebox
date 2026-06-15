@@ -86,7 +86,7 @@ payload + timings (when surfaced by the server).
 | `code` | 10 (mid-function completion) | `ast.parse(prompt + completion)` | [openai/human-eval](https://github.com/openai/human-eval) (MIT) port |
 | `longctx` | 6 frontiers (2k → 64k tokens) | `^Risk:` prefix check | own ports |
 | `agent` | N codex-style prompts paired with coding tasks | code-fence / json-tool / apply_patch detect | own ports |
-| `agent_recorded` | 25 prompts mined from real local Claude Code + Codex sessions | three-bin tool-schema-coverage (expected tools + files named in reply) | own — mined via `scripts/extract-agentic-fixture.py` |
+| `agent_recorded` | 48 recorded Claude Code + Codex session prefixes replayed turn-by-turn | LLM judge on final turn + per-turn cache metrics | own — mined via `scripts/extract-agentic-fixture.py` |
 | `forge` | 7+ tool-calling scenarios | error_type == None | [antoinezambelli/forge](https://github.com/antoinezambelli/forge) 0.7.1 (MIT) |
 
 Each row in the result carries:

@@ -737,6 +737,7 @@ def _run_agent_recorded_to_dir(
     max_tokens: int | None,
     questions: int | None,
     restart_between_cases: bool = True,
+    replay_mode: str = "sequential",
     mock_judge: Any = None,
 ) -> tuple[dict[str, Any] | None, bool]:
     """Drive the multi-turn agent_recorded area + write ``<out_root>/agent_recorded.json``.
@@ -754,7 +755,7 @@ def _run_agent_recorded_to_dir(
     max_tokens_eff = max_tokens if max_tokens is not None else 512
     print(
         f"\n[lucebench] === area=agent_recorded max_tokens={max_tokens_eff} "
-        f"restart_between_cases={restart_between_cases} ===",
+        f"restart_between_cases={restart_between_cases} replay_mode={replay_mode} ===",
         flush=True,
     )
     try:
@@ -767,6 +768,7 @@ def _run_agent_recorded_to_dir(
             restart_between_cases=restart_between_cases,
             questions=questions,
             mock_judge=mock_judge,
+            replay_mode=replay_mode,
         )
     except JudgeUnavailable as exc:
         # Missing judge credentials are a configuration error, not a
@@ -806,13 +808,20 @@ def _run_agent_recorded_to_dir(
         f"[lucebench] area=agent_recorded pass_rate={summary.get('pass_rate', 0):.2f}% "
         f"({summary.get('n_pass', 0)}/{summary.get('n_judged', 0)}) "
         f"cache_speedup_p50={summary.get('cache_speedup_p50')} "
+        f"cache_hit_rate={summary.get('cache_hit_rate')}% "
         f"cold_prefill_p50={summary.get('cold_prefill_p50')}s "
-        f"warm_prefill_p50={summary.get('warm_prefill_p50')}s",
+        f"warm_prefill_p50={summary.get('warm_prefill_p50')}s "
+        f"final_prefill_p50={summary.get('final_prefill_p50')}s",
         flush=True,
     )
+    turn_walls = [
+        turn.get("wall_s") or 0
+        for r in rows
+        for turn in (r.get("turns") or [])
+    ]
     cold_walls = [r["cold"].get("wall_s") or 0 for r in rows]
     warm_walls = [r["warm"].get("wall_s") or 0 for r in rows]
-    walls = cold_walls + warm_walls
+    walls = turn_walls or (cold_walls + warm_walls)
     return {
         "area": "agent_recorded",
         "n": summary.get("n", 0),
@@ -1095,6 +1104,7 @@ def _run_sweep(args) -> int:
                 restart_between_cases=getattr(
                     args, "agent_recorded_restart", True
                 ),
+                replay_mode=getattr(args, "agent_recorded_replay_mode", "sequential"),
             )
             if aborted:
                 return 3
@@ -1352,8 +1362,17 @@ def main() -> int:
         help="Disable systemctl --user restart lucebox.service between "
         "cases in the agent_recorded area. Use on hosts without systemd "
         "(CI) or when the operator wants cache to accumulate across "
-        "cases. Without restarts the cache_speedup_x metric degrades to "
-        "warm-vs-warm (~1.0).",
+        "cases. Without restarts the first replay turn may already see "
+        "warm cache state.",
+    )
+    ap.add_argument(
+        "--agent-recorded-replay-mode",
+        choices=("sequential", "exact-repeat"),
+        default="sequential",
+        help="Replay semantics for the agent_recorded area. sequential "
+        "replays growing conversation prefixes and exercises prefix cache; "
+        "exact-repeat sends the same full prompt twice to probe full-prompt "
+        "prefill cache.",
     )
     ap.add_argument(
         "--parallel",
@@ -1584,27 +1603,39 @@ def main() -> int:
                 timeout_s=args.timeout,
                 restart_between_cases=getattr(args, "agent_recorded_restart", True),
                 questions=args.questions,
+                replay_mode=getattr(args, "agent_recorded_replay_mode", "sequential"),
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[lucebench] agent_recorded: {exc}", file=sys.stderr, flush=True)
             return 3
         for idx, r in enumerate(rows, start=1):
             verdict = "PASS" if r.get("pass") else "FAIL"
-            cold = r.get("cold", {}) or {}
-            warm = r.get("warm", {}) or {}
-            speedup = r.get("cache_speedup_x")
-            speedup_str = f"{speedup}x" if speedup is not None else "n/a"
-            print(
-                f"  {idx:3d} {verdict} agent_rec  {r['case_id']:60s} "
-                f"bucket={r['bucket_tokens']:>6} "
-                f"cold_pf={cold.get('prefill_s')}s warm_pf={warm.get('prefill_s')}s "
-                f"speedup={speedup_str} judge={r['judge'].get('verdict')}",
-                flush=True,
-            )
+            if r.get("replay_mode") == "sequential":
+                final = r.get("warm") or r.get("cold") or {}
+                print(
+                    f"  {idx:3d} {verdict} agent_rec  {r['case_id']:60s} "
+                    f"bucket={r['bucket_tokens']:>6} turns={len(r.get('turns') or [])} "
+                    f"cache_hits={r.get('cache_hit_turns', 0)}/{r.get('cache_eligible_turns', 0)} "
+                    f"final_pf={final.get('prefill_s')}s judge={r['judge'].get('verdict')}",
+                    flush=True,
+                )
+            else:
+                cold = r.get("cold", {}) or {}
+                warm = r.get("warm", {}) or {}
+                speedup = r.get("cache_speedup_x")
+                speedup_str = f"{speedup}x" if speedup is not None else "n/a"
+                print(
+                    f"  {idx:3d} {verdict} agent_rec  {r['case_id']:60s} "
+                    f"bucket={r['bucket_tokens']:>6} "
+                    f"cold_pf={cold.get('prefill_s')}s warm_pf={warm.get('prefill_s')}s "
+                    f"speedup={speedup_str} judge={r['judge'].get('verdict')}",
+                    flush=True,
+                )
         print(
             f"\n[lucebench] agent_recorded pass_rate={summary.get('pass_rate', 0):.2f}% "
             f"({summary.get('n_pass', 0)}/{summary.get('n_judged', 0)}) "
-            f"cache_speedup_p50={summary.get('cache_speedup_p50')}",
+            f"cache_speedup_p50={summary.get('cache_speedup_p50')} "
+            f"cache_hit_rate={summary.get('cache_hit_rate')}%",
             flush=True,
         )
         if args.json_out:

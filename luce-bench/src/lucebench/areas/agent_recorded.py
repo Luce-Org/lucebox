@@ -3,11 +3,12 @@ r"""Recorded-session agent probes for ``--areas agent_recorded``.
 This module ships **two** evaluation areas mined from real Claude Code
 and Codex sessions (see ``scripts/extract-agentic-fixture.py``):
 
-1. ``agent_recorded`` — **multi-turn replay with cache metrics + LLM
-   judge** (default). Replays full session prefixes against the server,
-   measures cold/warm prefill+decode timings, and grades the model's
-   response with a Claude Sonnet judge that compares against the
-   reference assistant response. Fixture:
+1. ``agent_recorded`` — **sequential multi-turn replay with cache
+   metrics + LLM judge** (default). Replays recorded sessions turn by
+   turn as growing conversation prefixes, measures prefill/decode/cache
+   timings for each request, and grades the final model response with a
+   Claude Sonnet judge that compares against the reference assistant
+   response. Fixture:
    ``fixtures/agent_recorded/multi_turn_cases.json`` (schema v1).
 
 2. ``agent_recorded_v1`` — **single-turn tool-schema coverage**
@@ -23,31 +24,34 @@ against models that solve the task with a different but valid approach
 the judge, with explicit license to mark "divergent but valid" as a
 pass. See :mod:`lucebench.grading.llm_judge`.
 
-Cost: one full pass over the 48-case fixture is roughly $0.30 -- $1.50
+Cost: one full pass over the 48-case fixture is roughly $0.15 -- $0.75
 in Anthropic billing (Sonnet 4.6 list pricing, ~5K input + ~150 output
-per judge call × 96 calls cold+warm). The judge cache zeroes-out re-runs
-with identical inputs (see ``~/.cache/luce-bench/judge/``).
+per judge call × 48 final-turn calls). The judge cache zeroes-out
+re-runs with identical inputs (see ``~/.cache/luce-bench/judge/``).
 
-Cold vs warm
+Replay modes
 ============
-Each case is sent twice in sequence:
+By default each case runs in ``sequential`` mode:
 
-* **Cold pass** — preceded by ``systemctl --user restart
-  lucebox.service`` and a ``/health`` wait. The server's prefix cache is
-  empty, so ``prefill_s`` is the full first-token latency for the
-  case's context.
-* **Warm pass** — immediately after, no restart. The same exact
-  ``messages`` are sent again; the server should now reuse its prefix
-  cache and ``prefill_s`` should drop sharply.
+* The service is optionally restarted once before a recorded session.
+* The first request sends messages through the first user turn.
+* Each later request sends the same conversation extended through the
+  next user turn, using the recorded assistant/tool transcript between
+  turns so the prefix is deterministic.
 
-The ratio ``cold.prefill_s / max(warm.prefill_s, ε)`` is the cache
-speedup the area surfaces. Quality grading runs on the cold response
-only — warm is purely about cache effectiveness.
+This matches long-running agent traffic where request N+1 shares most
+of request N as a stable prefix, and therefore exercises prefix-cache
+behavior. Rows include the per-turn timings under ``turns`` plus legacy
+``cold`` / ``warm`` aliases for first/final request compatibility.
+
+The ``exact-repeat`` mode is retained for full-prompt/prefill cache
+checks: it sends the same complete ``messages`` list twice and reports
+``cold.prefill_s / warm.prefill_s`` as ``cache_speedup_x``.
 
 If ``systemctl`` isn't available (CI, non-systemd hosts), the runner
-falls back to "warm both passes" mode and stamps a warning on the
-output; the area still runs, but the cache-speedup metric is degraded
-to a sanity check (warm-vs-warm should be ~1.0).
+prints a warning and runs without a cold restart. The sequential cache
+metrics still reflect growing-prompt reuse inside that run, but cache
+state may already be warm before the first turn.
 
 Constraints
 ===========
@@ -69,6 +73,7 @@ reference get ``judge_pending`` and don't contribute to the pass rate.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -85,6 +90,7 @@ GRADER_VERSION = 2
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 FIXTURE_PATH = SCRIPT_DIR / "fixtures" / "agent_recorded" / "cases.json"
 MULTI_TURN_FIXTURE_PATH = SCRIPT_DIR / "fixtures" / "agent_recorded" / "multi_turn_cases.json"
+AGENT_RECORDED_REPLAY_MODES = ("sequential", "exact-repeat")
 
 # ── v1 (legacy single-turn) constants — see module docstring. ────────
 #
@@ -367,6 +373,76 @@ def pick_multi_turn_case_for_budget(
     return max(fit, key=lambda c: c["context_tokens_approx"])
 
 
+def _content_to_text(content: Any) -> str:
+    """Normalize OpenAI message content to text for judge references."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    return json.dumps(content, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _estimate_messages_tokens_approx(messages: list[dict[str, Any]]) -> int:
+    """Cheap stable approximation for per-turn context growth metadata."""
+    blob = json.dumps(messages, ensure_ascii=False, sort_keys=True, default=str)
+    return max(1, len(blob) // 4)
+
+
+def _build_sequential_replay_turns(case: dict[str, Any]) -> list[dict[str, Any]]:
+    """Slice a recorded transcript into growing prompts ending on user turns.
+
+    The fixture stores one complete prompt ending on the user turn to be
+    judged. Earlier assistant turns inside ``messages`` are the recorded
+    transcript, so replaying prefixes ending at each user turn mirrors a
+    long-running agent session without depending on the candidate model
+    to regenerate byte-identical intermediate assistant messages.
+    """
+    messages = list(case.get("messages") or [])
+    if not messages:
+        return []
+
+    user_indices = [idx for idx, msg in enumerate(messages) if msg.get("role") == "user"]
+    if not user_indices:
+        return [
+            {
+                "turn_index": 1,
+                "message_index": len(messages) - 1,
+                "messages": messages,
+                "reference_response": case.get("reference_response"),
+                "is_final": True,
+            }
+        ]
+
+    last_user_index = user_indices[-1]
+    turns: list[dict[str, Any]] = []
+    for turn_index, message_index in enumerate(user_indices, start=1):
+        reference = case.get("reference_response") if message_index == last_user_index else None
+        if reference is None and message_index + 1 < len(messages):
+            next_msg = messages[message_index + 1]
+            if next_msg.get("role") == "assistant":
+                reference = _content_to_text(next_msg.get("content"))
+        prefix = messages[: message_index + 1]
+        turns.append(
+            {
+                "turn_index": turn_index,
+                "message_index": message_index,
+                "messages": prefix,
+                "reference_response": reference,
+                "is_final": message_index == last_user_index,
+            }
+        )
+    return turns
+
+
+def _prefill_speedup(cold_row: dict[str, Any], warm_row: dict[str, Any]) -> float | None:
+    """Return cold/warm prefill speedup when both rows provide signal."""
+    cold_pf = cold_row.get("prefill_s")
+    warm_pf = warm_row.get("prefill_s")
+    if cold_pf is not None and warm_pf is not None and warm_pf > 0.001:
+        return round(cold_pf / warm_pf, 2)
+    return None
+
+
 # ── Legacy prefill-and-decode grader. ────────────────────────────────
 
 
@@ -504,15 +580,16 @@ def _restart_lucebox_service(*, log_prefix: str = "[agent_recorded]") -> tuple[b
     """
     if shutil.which("systemctl") is None:
         return (False, "systemctl not on PATH")
+    timeout_s = float(os.environ.get("LUCEBENCH_AGENT_RECORDED_RESTART_TIMEOUT", "180"))
     try:
         result = subprocess.run(  # noqa: S603 - operator-approved invocation
             ["systemctl", "--user", "restart", "lucebox.service"],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=timeout_s,
         )
     except subprocess.TimeoutExpired:
-        return (False, "systemctl restart timed out (>30s)")
+        return (False, f"systemctl restart timed out (>{timeout_s:.0f}s)")
     except OSError as e:
         return (False, f"systemctl invocation failed: {e}")
     if result.returncode != 0:
@@ -526,7 +603,7 @@ def _restart_lucebox_service(*, log_prefix: str = "[agent_recorded]") -> tuple[b
 # ── Per-case cold/warm driver. ───────────────────────────────────────
 
 
-def _run_one_multi_turn_case(
+def _run_one_exact_repeat_case(
     *,
     case: dict[str, Any],
     url: str,
@@ -538,7 +615,7 @@ def _run_one_multi_turn_case(
     judge_fn: Any,
     log_prefix: str = "[agent_recorded]",
 ) -> dict[str, Any]:
-    """Run one case through cold-then-warm passes, judge the cold response.
+    """Run one case through cold-then-warm exact-repeat passes.
 
     ``judge_fn`` is the callable used to grade the cold response. The
     production path passes :func:`lucebench.grading.llm_judge.judge_response`;
@@ -613,15 +690,7 @@ def _run_one_multi_turn_case(
         except (urllib.error.URLError, OSError, TimeoutError) as e:
             error = f"warm transport: {type(e).__name__}: {e}"
 
-    # Cache speedup metric: cold.prefill / max(warm.prefill, ε). When
-    # either prefill is None we can't compute it; same when warm is
-    # zero or smaller than 1ms (server isn't reporting prefill at all
-    # in that case, treat as "no signal").
-    cache_speedup_x: float | None = None
-    cold_pf = cold_row.get("prefill_s")
-    warm_pf = warm_row.get("prefill_s")
-    if cold_pf is not None and warm_pf is not None and warm_pf > 0.001:
-        cache_speedup_x = round(cold_pf / warm_pf, 2)
+    cache_speedup_x = _prefill_speedup(cold_row, warm_row)
 
     # Judge the COLD response (not warm — warm is solely about cache
     # measurement; the model output should be identical bit-for-bit
@@ -675,6 +744,7 @@ def _run_one_multi_turn_case(
             }
 
     return {
+        "replay_mode": "exact-repeat",
         "case_id": case_id,
         "source": case.get("source"),
         "bucket_tokens": bucket,
@@ -683,12 +753,209 @@ def _run_one_multi_turn_case(
         "restart": {"status": restart_status, "reason": restart_reason},
         "cold": cold_row,
         "warm": warm_row,
+        "turns": [],
+        "cache_eligible_turns": 1 if warm_row else 0,
+        "cache_hit_turns": 1 if warm_row.get("restore") else 0,
         "cache_speedup_x": cache_speedup_x,
         "model_response_cold": cold_content,
+        "model_response_final": cold_content,
         "judge": judge_result,
         "pass": bool(judge_result.get("pass")),
         "error": error,
     }
+
+
+def _run_one_sequential_case(
+    *,
+    case: dict[str, Any],
+    url: str,
+    model: str,
+    max_tokens: int,
+    auth_header: str,
+    timeout_s: int,
+    restart_between_cases: bool,
+    judge_fn: Any,
+    log_prefix: str = "[agent_recorded]",
+) -> dict[str, Any]:
+    """Replay one recorded session as growing prompts, then judge final turn."""
+    case_id = case["id"]
+    bucket = case["target_bucket_tokens"]
+    turns = _build_sequential_replay_turns(case)
+
+    turn_rows: list[dict[str, Any]] = []
+    error: str | None = None
+    restart_status = "skipped"
+    restart_reason = "restart_between_cases=False"
+
+    if restart_between_cases:
+        ok, reason = _restart_lucebox_service(log_prefix=log_prefix)
+        restart_status = "ok" if ok else "failed"
+        restart_reason = reason
+        if ok:
+            if not _health_wait(url):
+                error = "service did not become healthy after restart"
+        else:
+            print(
+                f"{log_prefix} cold-restart not available ({reason}); "
+                f"running sequential replay against existing cache state for case {case_id}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    if error is None and not turns:
+        error = "case has no replayable messages"
+
+    if error is None:
+        for turn in turns:
+            turn_index = int(turn["turn_index"])
+            turn_messages = turn["messages"]
+            try:
+                raw, wall = _http_post_chat_completions(
+                    url=url,
+                    model=model,
+                    messages=turn_messages,
+                    max_tokens=max_tokens,
+                    auth_header=auth_header,
+                    timeout_s=timeout_s,
+                )
+                turn_row = _extract_row_from_response(raw, wall)
+                turn_row.update(
+                    {
+                        "turn_index": turn_index,
+                        "message_index": turn["message_index"],
+                        "n_messages": len(turn_messages),
+                        "context_tokens_approx": _estimate_messages_tokens_approx(turn_messages),
+                        "cache_eligible": turn_index > 1,
+                        "is_final": bool(turn.get("is_final")),
+                    }
+                )
+                turn_rows.append(turn_row)
+            except urllib.error.HTTPError as e:
+                try:
+                    body = e.read().decode("utf-8", errors="replace")[:300]
+                except Exception:  # noqa: BLE001
+                    body = ""
+                error = f"turn {turn_index} HTTP {e.code}: {body}"
+                break
+            except (urllib.error.URLError, OSError, TimeoutError) as e:
+                error = f"turn {turn_index} transport: {type(e).__name__}: {e}"
+                break
+
+    cold_row = turn_rows[0] if turn_rows else {}
+    final_row = next((row for row in reversed(turn_rows) if row.get("is_final")), None)
+    if final_row is None and turn_rows:
+        final_row = turn_rows[-1]
+    warm_row = final_row if final_row is not None and len(turn_rows) > 1 else {}
+
+    eligible_turns = [row for row in turn_rows if row.get("cache_eligible")]
+    cache_hit_turns = sum(1 for row in eligible_turns if row.get("restore"))
+
+    reference = case.get("reference_response")
+    final_messages = turns[-1]["messages"] if turns else case.get("messages", [])
+    final_content = ""
+    if final_row is not None:
+        final_content = (final_row.get("content") or "") + (final_row.get("reasoning_content") or "")
+
+    judge_result: dict[str, Any]
+    if error is not None:
+        judge_result = {
+            "pass": False,
+            "verdict": "off_track",
+            "rationale": f"transport error precluded judging: {error}",
+            "cached": False,
+            "model": None,
+            "error": error,
+        }
+    elif not reference:
+        judge_result = {
+            "pass": False,
+            "verdict": "judge_pending",
+            "rationale": "case has no reference_response (v0 fixture); judge skipped",
+            "cached": False,
+            "model": None,
+            "error": "no_reference",
+        }
+    else:
+        from lucebench.grading.llm_judge import JudgeUnavailable
+
+        try:
+            verdict = judge_fn(
+                case_id=case_id,
+                messages=final_messages,
+                reference_response=reference,
+                candidate_response=final_content,
+            )
+            judge_result = verdict.to_dict() if hasattr(verdict, "to_dict") else dict(verdict)
+        except JudgeUnavailable:
+            raise
+        except Exception as e:  # noqa: BLE001
+            judge_result = {
+                "pass": False,
+                "verdict": "judge_pending",
+                "rationale": f"judge invocation raised: {type(e).__name__}: {e}",
+                "cached": False,
+                "model": None,
+                "error": f"{type(e).__name__}: {e}",
+            }
+
+    return {
+        "replay_mode": "sequential",
+        "case_id": case_id,
+        "source": case.get("source"),
+        "bucket_tokens": bucket,
+        "n_messages": case.get("n_messages"),
+        "context_tokens_approx": case.get("context_tokens_approx"),
+        "restart": {"status": restart_status, "reason": restart_reason},
+        "cold": cold_row,
+        "warm": warm_row,
+        "turns": turn_rows,
+        "cache_eligible_turns": len(eligible_turns),
+        "cache_hit_turns": cache_hit_turns,
+        "cache_speedup_x": None,
+        "model_response_cold": final_content,
+        "model_response_final": final_content,
+        "judge": judge_result,
+        "pass": bool(judge_result.get("pass")),
+        "error": error,
+    }
+
+
+def _run_one_multi_turn_case(
+    *,
+    case: dict[str, Any],
+    url: str,
+    model: str,
+    max_tokens: int,
+    auth_header: str,
+    timeout_s: int,
+    restart_between_cases: bool,
+    judge_fn: Any,
+    replay_mode: str,
+    log_prefix: str = "[agent_recorded]",
+) -> dict[str, Any]:
+    if replay_mode == "exact-repeat":
+        return _run_one_exact_repeat_case(
+            case=case,
+            url=url,
+            model=model,
+            max_tokens=max_tokens,
+            auth_header=auth_header,
+            timeout_s=timeout_s,
+            restart_between_cases=restart_between_cases,
+            judge_fn=judge_fn,
+            log_prefix=log_prefix,
+        )
+    return _run_one_sequential_case(
+        case=case,
+        url=url,
+        model=model,
+        max_tokens=max_tokens,
+        auth_header=auth_header,
+        timeout_s=timeout_s,
+        restart_between_cases=restart_between_cases,
+        judge_fn=judge_fn,
+        log_prefix=log_prefix,
+    )
 
 
 def _resolve_judge_fn(*, mock_judge: Any = None) -> Any:
@@ -715,14 +982,21 @@ def run_agent_recorded_area(
     fixture_path: Path = MULTI_TURN_FIXTURE_PATH,
     questions: int | None = None,
     mock_judge: Any = None,
+    replay_mode: str = "sequential",
     log_prefix: str = "[agent_recorded]",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run the full multi-turn replay sweep and return (rows, summary).
 
-    Each row is shaped per the module docstring: cold/warm sub-blocks,
-    cache_speedup_x, judge verdict, pass flag. The summary aggregates
-    pass rate, p50/p90 cache speedup, and p50 prefill/decode.
+    In default ``sequential`` mode, each row carries per-turn sub-rows
+    under ``turns`` plus first/final aliases under ``cold`` / ``warm``.
+    In ``exact-repeat`` mode, each row keeps the historical cold/warm
+    duplicate-prompt shape. The summary aggregates pass rate and cache
+    metrics appropriate to the selected replay mode.
     """
+    if replay_mode not in AGENT_RECORDED_REPLAY_MODES:
+        raise ValueError(
+            f"replay_mode must be one of {AGENT_RECORDED_REPLAY_MODES}, got {replay_mode!r}"
+        )
     cases = load_agent_recorded_multi_turn_cases(fixture_path)
     if questions is not None:
         cases = cases[:questions]
@@ -746,20 +1020,33 @@ def run_agent_recorded_area(
             timeout_s=timeout_s,
             restart_between_cases=restart_between_cases,
             judge_fn=judge_fn,
+            replay_mode=replay_mode,
             log_prefix=log_prefix,
         )
         rows.append(row)
         # Brief per-row console line so the operator can watch progress.
-        cold = row["cold"]
-        warm = row["warm"]
         judge = row["judge"]
-        print(
-            f"{log_prefix}   cold prefill={cold.get('prefill_s')}s decode={cold.get('decode_s')}s "
-            f"tps={cold.get('tps_decode')}  warm prefill={warm.get('prefill_s')}s "
-            f"speedup={row['cache_speedup_x']}x  judge={judge.get('verdict')} "
-            f"pass={row['pass']}",
-            flush=True,
-        )
+        if row.get("replay_mode") == "sequential":
+            final = row.get("warm") or row.get("cold") or {}
+            eligible = row.get("cache_eligible_turns", 0) or 0
+            hit_rate = (100.0 * row.get("cache_hit_turns", 0) / eligible) if eligible else 0.0
+            print(
+                f"{log_prefix}   turns={len(row.get('turns') or [])} "
+                f"cache_hits={row.get('cache_hit_turns', 0)}/{eligible} ({hit_rate:.1f}%) "
+                f"final_prefill={final.get('prefill_s')}s final_prefix={final.get('prefix_len')} "
+                f"judge={judge.get('verdict')} pass={row['pass']}",
+                flush=True,
+            )
+        else:
+            cold = row["cold"]
+            warm = row["warm"]
+            print(
+                f"{log_prefix}   cold prefill={cold.get('prefill_s')}s decode={cold.get('decode_s')}s "
+                f"tps={cold.get('tps_decode')}  warm prefill={warm.get('prefill_s')}s "
+                f"speedup={row['cache_speedup_x']}x  judge={judge.get('verdict')} "
+                f"pass={row['pass']}",
+                flush=True,
+            )
 
     return rows, _summarize_rows(rows)
 
@@ -799,6 +1086,17 @@ def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     warm_prefills = [r["warm"].get("prefill_s") for r in rows if r["warm"].get("prefill_s") is not None]
     cold_decodes = [r["cold"].get("decode_s") for r in rows if r["cold"].get("decode_s") is not None]
     warm_decodes = [r["warm"].get("decode_s") for r in rows if r["warm"].get("decode_s") is not None]
+    all_turns = [turn for r in rows for turn in (r.get("turns") or [])]
+    eligible_turns = [turn for turn in all_turns if turn.get("cache_eligible")]
+    hit_turns = [turn for turn in eligible_turns if turn.get("restore")]
+    miss_turns = [turn for turn in eligible_turns if not turn.get("restore")]
+    final_turns = [
+        (r.get("warm") or r.get("cold") or {})
+        for r in rows
+        if r.get("replay_mode") == "sequential"
+    ]
+    modes = sorted({r.get("replay_mode") or "exact-repeat" for r in rows})
+    cache_hit_rate = (100.0 * len(hit_turns) / len(eligible_turns)) if eligible_turns else 0.0
 
     # Per-verdict counts so the operator can see suitable_match vs
     # divergent_but_valid vs off_track without re-parsing rows.
@@ -809,6 +1107,7 @@ def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         "area": "agent_recorded",
+        "replay_mode": modes[0] if len(modes) == 1 else ",".join(modes),
         "n": n_total,
         "n_judged": len(judged),
         "n_pass": n_pass,
@@ -819,6 +1118,34 @@ def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "warm_prefill_p50": _percentile(warm_prefills, 50.0),
         "cold_decode_p50": _percentile(cold_decodes, 50.0),
         "warm_decode_p50": _percentile(warm_decodes, 50.0),
+        "turns_total": len(all_turns),
+        "cache_eligible_turns": len(eligible_turns),
+        "cache_hit_turns": len(hit_turns),
+        "cache_hit_rate": round(cache_hit_rate, 2),
+        "turn_prefill_p50": _percentile(
+            [t.get("prefill_s") for t in all_turns if t.get("prefill_s") is not None], 50.0,
+        ),
+        "cache_eligible_prefill_p50": _percentile(
+            [t.get("prefill_s") for t in eligible_turns if t.get("prefill_s") is not None], 50.0,
+        ),
+        "cache_hit_prefill_p50": _percentile(
+            [t.get("prefill_s") for t in hit_turns if t.get("prefill_s") is not None], 50.0,
+        ),
+        "cache_miss_prefill_p50": _percentile(
+            [t.get("prefill_s") for t in miss_turns if t.get("prefill_s") is not None], 50.0,
+        ),
+        "prefix_len_p50": _percentile(
+            [t.get("prefix_len") for t in eligible_turns if t.get("prefix_len") is not None], 50.0,
+        ),
+        "final_prefill_p50": _percentile(
+            [t.get("prefill_s") for t in final_turns if t.get("prefill_s") is not None], 50.0,
+        ),
+        "turn_wall_p50": _percentile(
+            [t.get("wall_s") for t in all_turns if t.get("wall_s") is not None], 50.0,
+        ),
+        "cache_eligible_wall_p50": _percentile(
+            [t.get("wall_s") for t in eligible_turns if t.get("wall_s") is not None], 50.0,
+        ),
         "verdict_counts": verdict_counts,
         "median_wall_cold": _percentile(
             [r["cold"].get("wall_s") for r in rows if r["cold"].get("wall_s") is not None], 50.0,

@@ -223,6 +223,13 @@ def _run_areas(
                 flush=True,
             )
             continue
+        sampling: dict[str, Any] = {}
+        if temperature is not None:
+            sampling["temperature"] = temperature
+        if top_p is not None:
+            sampling["top_p"] = top_p
+        if top_k is not None:
+            sampling["top_k"] = top_k
         row, aborted = _run_standard_area_to_dir(
             area,
             out_root=out_root,
@@ -232,9 +239,8 @@ def _run_areas(
             timeout=timeout,
             max_tokens=max_tokens,
             think=think,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
+            sampling=sampling,
+            sampling_source="snapshot-cli" if sampling else "none",
             questions=n_cap,
             no_fail_fast=no_fail_fast,
             prompt_thinking_control=prompt_thinking_control,

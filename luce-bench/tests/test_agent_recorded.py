@@ -396,47 +396,59 @@ def test_grade_full_pass_with_call_verb_emission():
 
 def test_multi_turn_runner_with_mocked_judge_and_http(tmp_path, monkeypatch):
     """Drive run_agent_recorded_area end-to-end with both the HTTP call
-    and the judge stubbed. Verifies the cold/warm flow, the cache
-    speedup arithmetic, and the row schema the operator sees."""
+    and the judge stubbed. Verifies sequential growing-prefix replay,
+    cache-hit accounting, and the row schema the operator sees."""
     from lucebench.areas import agent_recorded as ar
     from lucebench.grading.llm_judge import JudgeVerdict
 
-    # Mock HTTP: first call returns a "cold" response (slow prefill),
-    # second returns a "warm" response (fast prefill, prefix_len > 0).
-    cold_response = {
-        "choices": [{"message": {"content": "Cold response, here's my plan: I'd start by reading the relevant config."}, "finish_reason": "stop"}],
-        "usage": {
-            "prompt_tokens": 8000,
-            "completion_tokens": 50,
-            "timings": {
-                "prefill_ms": 3500.0,
-                "decode_ms": 2400.0,
-                "decode_tokens_per_sec": 20.8,
-                "prompt_n_cached": 0,
+    responses = [
+        {
+            "choices": [{"message": {"content": "Turn one response."}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 3000,
+                "completion_tokens": 50,
+                "timings": {
+                    "prefill_ms": 3500.0,
+                    "decode_ms": 2400.0,
+                    "decode_tokens_per_sec": 20.8,
+                    "prompt_n_cached": 0,
+                },
             },
         },
-    }
-    warm_response = {
-        "choices": [{"message": {"content": "Warm response, same content."}, "finish_reason": "stop"}],
-        "usage": {
-            "prompt_tokens": 8000,
-            "completion_tokens": 50,
-            "timings": {
-                "prefill_ms": 200.0,
-                "decode_ms": 2400.0,
-                "decode_tokens_per_sec": 20.8,
-                "prompt_n_cached": 7950,
+        {
+            "choices": [{"message": {"content": "Turn two response."}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 5600,
+                "completion_tokens": 50,
+                "timings": {
+                    "prefill_ms": 500.0,
+                    "decode_ms": 2400.0,
+                    "decode_tokens_per_sec": 20.8,
+                    "prompt_n_cached": 5100,
+                },
             },
         },
-    }
+        {
+            "choices": [{"message": {"content": "Final response, here's my plan."}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 8000,
+                "completion_tokens": 50,
+                "timings": {
+                    "prefill_ms": 200.0,
+                    "decode_ms": 2400.0,
+                    "decode_tokens_per_sec": 20.8,
+                    "prompt_n_cached": 7950,
+                },
+            },
+        },
+    ]
 
-    call_count = {"n": 0}
+    seen_message_counts: list[int] = []
 
     def fake_post(*, url, model, messages, max_tokens, auth_header="", timeout_s=600):
-        call_count["n"] += 1
-        # Return cold then warm alternating.
-        raw = cold_response if call_count["n"] % 2 == 1 else warm_response
-        return raw, 5.9 if call_count["n"] % 2 == 1 else 2.6
+        seen_message_counts.append(len(messages))
+        raw = responses[len(seen_message_counts) - 1]
+        return raw, [5.9, 2.8, 2.6][len(seen_message_counts) - 1]
 
     monkeypatch.setattr(ar, "_http_post_chat_completions", fake_post)
     monkeypatch.setattr(ar, "_restart_lucebox_service", lambda **kw: (False, "test"))
@@ -472,8 +484,128 @@ def test_multi_turn_runner_with_mocked_judge_and_http(tmp_path, monkeypatch):
                     {"role": "user", "content": "Help me debug this"},
                     {"role": "assistant", "content": "Sure, what error?"},
                     {"role": "user", "content": "It crashes on startup"},
+                    {"role": "assistant", "content": "I would inspect the startup logs."},
+                    {"role": "user", "content": "The logs mention a missing config file."},
                 ],
                 "reference_response": "Let me look at the startup sequence and grep for any obvious crash paths.",
+                "context_tokens_approx": 7900,
+                "target_bucket_tokens": 8192,
+                "n_messages": 5,
+                "initial_state": {},
+                "verifier": {"type": "cache-and-quality"},
+            }
+        ],
+    }))
+
+    rows, summary = ar.run_agent_recorded_area(
+        url="http://test.invalid",
+        model="test-model",
+        max_tokens=128,
+        restart_between_cases=True,
+        fixture_path=fake_fixture,
+        mock_judge=fake_judge,
+    )
+
+    assert seen_message_counts == [1, 3, 5]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["replay_mode"] == "sequential"
+    assert row["case_id"] == "test-case-1"
+    assert row["bucket_tokens"] == 8192
+    assert row["restart"]["status"] == "ok"
+    assert len(row["turns"]) == 3
+    assert row["cold"]["prefill_s"] == 3.5
+    assert row["warm"]["prefill_s"] == 0.2  # final turn alias
+    assert row["turns"][1]["restore"] is True
+    assert row["turns"][2]["restore"] is True
+    assert row["cache_eligible_turns"] == 2
+    assert row["cache_hit_turns"] == 2
+    assert row["cache_speedup_x"] is None
+    assert row["judge"]["pass"] is True
+    assert row["judge"]["verdict"] == "suitable_match"
+    assert row["pass"] is True
+
+    assert summary["n"] == 1
+    assert summary["n_judged"] == 1
+    assert summary["n_pass"] == 1
+    assert summary["pass_rate"] == 100.0
+    assert summary["replay_mode"] == "sequential"
+    assert summary["cache_speedup_p50"] is None
+    assert summary["cache_hit_turns"] == 2
+    assert summary["cache_eligible_turns"] == 2
+    assert summary["cache_hit_rate"] == 100.0
+    assert summary["cache_eligible_prefill_p50"] == 0.35
+    assert summary["final_prefill_p50"] == 0.2
+
+
+def test_multi_turn_runner_exact_repeat_mode_keeps_full_prompt_probe(tmp_path, monkeypatch):
+    """The opt-in exact-repeat mode keeps the historical cold/warm probe."""
+    from lucebench.areas import agent_recorded as ar
+    from lucebench.grading.llm_judge import JudgeVerdict
+
+    cold_response = {
+        "choices": [{"message": {"content": "Cold response, here's my plan."}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": 8000,
+            "completion_tokens": 50,
+            "timings": {
+                "prefill_ms": 3500.0,
+                "decode_ms": 2400.0,
+                "decode_tokens_per_sec": 20.8,
+                "prompt_n_cached": 0,
+            },
+        },
+    }
+    warm_response = {
+        "choices": [{"message": {"content": "Warm response, same content."}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": 8000,
+            "completion_tokens": 50,
+            "timings": {
+                "prefill_ms": 200.0,
+                "decode_ms": 2400.0,
+                "decode_tokens_per_sec": 20.8,
+                "prompt_n_cached": 7950,
+            },
+        },
+    }
+
+    seen_message_counts: list[int] = []
+
+    def fake_post(*, url, model, messages, max_tokens, auth_header="", timeout_s=600):
+        seen_message_counts.append(len(messages))
+        raw = cold_response if len(seen_message_counts) == 1 else warm_response
+        return raw, 5.9 if len(seen_message_counts) == 1 else 2.6
+
+    monkeypatch.setattr(ar, "_http_post_chat_completions", fake_post)
+    monkeypatch.setattr(ar, "_restart_lucebox_service", lambda **kw: (True, "ok"))
+    monkeypatch.setattr(ar, "_health_wait", lambda url, timeout_s=120: True)
+
+    def fake_judge(*, case_id, messages, reference_response, candidate_response):
+        return JudgeVerdict(
+            passed=True,
+            verdict="suitable_match",
+            rationale="mocked",
+            cached=False,
+            model="mock",
+        )
+
+    fake_fixture = tmp_path / "multi_turn_cases.json"
+    import json
+    fake_fixture.write_text(json.dumps({
+        "schema": "lucebox-bench-agent-recorded-multi-turn-v1",
+        "buckets": [8192],
+        "cases": [
+            {
+                "id": "test-case-1",
+                "source": "claude-code",
+                "kind": "multi-turn-replay",
+                "messages": [
+                    {"role": "user", "content": "Help me debug this"},
+                    {"role": "assistant", "content": "Sure, what error?"},
+                    {"role": "user", "content": "It crashes on startup"},
+                ],
+                "reference_response": "Let me look at the startup sequence.",
                 "context_tokens_approx": 7900,
                 "target_bucket_tokens": 8192,
                 "n_messages": 3,
@@ -490,27 +622,14 @@ def test_multi_turn_runner_with_mocked_judge_and_http(tmp_path, monkeypatch):
         restart_between_cases=True,
         fixture_path=fake_fixture,
         mock_judge=fake_judge,
+        replay_mode="exact-repeat",
     )
 
-    assert len(rows) == 1
-    row = rows[0]
-    assert row["case_id"] == "test-case-1"
-    assert row["bucket_tokens"] == 8192
-    assert row["restart"]["status"] == "ok"
-    assert row["cold"]["prefill_s"] == 3.5
-    assert row["warm"]["prefill_s"] == 0.2
-    assert row["warm"]["restore"] is True
-    assert row["warm"]["prefix_len"] == 7950
-    # speedup = 3.5 / 0.2 = 17.5
-    assert row["cache_speedup_x"] == 17.5
-    assert row["judge"]["pass"] is True
-    assert row["judge"]["verdict"] == "suitable_match"
-    assert row["pass"] is True
-
-    assert summary["n"] == 1
-    assert summary["n_judged"] == 1
-    assert summary["n_pass"] == 1
-    assert summary["pass_rate"] == 100.0
+    assert seen_message_counts == [3, 3]
+    assert rows[0]["replay_mode"] == "exact-repeat"
+    assert rows[0]["cache_speedup_x"] == 17.5
+    assert rows[0]["warm"]["restore"] is True
+    assert summary["replay_mode"] == "exact-repeat"
     assert summary["cache_speedup_p50"] == 17.5
 
 
