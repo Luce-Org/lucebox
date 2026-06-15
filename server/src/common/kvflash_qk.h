@@ -37,12 +37,17 @@ struct KvFlashQkDims {
 // (their out[] entry is left at `missing_score`). Non-null entries hold
 // n_layers * n_kv_heads * head_dim floats, L2-normalized per (layer, head).
 // query: n_layers * n_q_heads * head_dim floats, unnormalized.
+//
+// missing_score defaults to -2.0f (below the [-1,1] cosine-mean floor) so an
+// unscorable chunk always ranks last in reselect — never above a real chunk
+// whose query correlation is negative. A neutral 0.0 would let a no-info
+// chunk evict a genuinely low-relevance one.
 inline void kvflash_qk_chunk_scores(
     const std::vector<const float *> & pooled_keys,
     const float * query,
     const KvFlashQkDims & d,
     std::vector<float> & out,
-    float missing_score = 0.0f) {
+    float missing_score = -2.0f) {
     const int group = d.n_q_heads / d.n_kv_heads;
     const int n_chunks = (int)pooled_keys.size();
     out.assign((size_t)n_chunks, missing_score);

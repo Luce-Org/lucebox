@@ -89,6 +89,12 @@ int main() {
     CHECK(out[1] > out[2] && out[2] > out[0], "ranking: aligned > partial > orthogonal");
     CHECK(near(out[5], out[1]), "identical chunks tie");
 
+    // Default missing_score is worst-case (< -1, below the cosine-mean floor)
+    // so a missing chunk never outranks a real chunk with negative correlation.
+    std::vector<float> out_def;
+    kvflash_qk_chunk_scores(pk, query.data(), d, out_def);   // default missing
+    CHECK(out_def[4] < -1.0f, "default missing_score ranks below any real cosine");
+
     // Cosine invariance: scaling the query must not change anything.
     std::vector<float> query_scaled(query);
     for (float & v : query_scaled) v *= 37.5f;
