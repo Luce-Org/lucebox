@@ -798,6 +798,7 @@ static ggml_tensor * build_delta_net_block(
                 ci_len, cap->conv_input->ne[1], cap->conv_input->ne[2],
                 cap->conv_input->nb[1], cap->conv_input->nb[2], 0);
         }
+        GGML_ASSERT(ggml_nelements(conv_input) == ggml_nelements(dst));
         ggml_build_forward_expand(gf, ggml_cpy(ctx, conv_input, dst));
     }
 
@@ -959,8 +960,22 @@ static ggml_tensor * build_delta_net_block(
             S_v * S_v * r_elt,
             S_v * S_v * H_v * r_elt,
             inter_offset);
+        // The cache buffer holds max_verify_tokens per-step slots, which can
+        // exceed this batch's n_seq_tokens (e.g. --ddtree sizes the buffer to
+        // the tree budget while a chain verify uses fewer tokens). Copy the
+        // produced states into the first n_seq_tokens slots via a destination
+        // view, rather than requiring an exact size match (the prior
+        // exact-equality assert aborted whenever n_seq_tokens != the buffer's
+        // allocated token count).
+        ggml_tensor * dst = cap->ssm_intermediate_states;
+        GGML_ASSERT(n_seq_tokens <= dst->ne[3]);
+        GGML_ASSERT(dst->ne[0] == S_v && dst->ne[1] == S_v && dst->ne[2] == H_v);
+        ggml_tensor * dst_view = ggml_view_4d(ctx, dst,
+            dst->ne[0], dst->ne[1], dst->ne[2], n_seq_tokens,
+            dst->nb[1], dst->nb[2], dst->nb[3], 0);
+        GGML_ASSERT(ggml_nelements(inter_view) == ggml_nelements(dst_view));
         ggml_build_forward_expand(gf,
-            ggml_cpy(ctx, inter_view, cap->ssm_intermediate_states));
+            ggml_cpy(ctx, inter_view, dst_view));
     }
     } // end of block started at `{` before `const int64_t S_v = head_v_dim;`
 

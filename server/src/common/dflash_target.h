@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "ddtree.h"
+
 namespace dflash::common {
 
 struct DFlashTarget {
@@ -31,7 +33,8 @@ struct DFlashTarget {
     virtual bool verify_batch(const std::vector<int32_t> & tokens,
                               int base_pos,
                               int & last_tok,
-                              std::vector<int32_t> * all_argmax = nullptr) = 0;
+                              std::vector<int32_t> * all_argmax = nullptr,
+                              bool capture_ssm_intermediates = false) = 0;
 
     // ── KV state management ─────────────────────────────────────────
 
@@ -41,6 +44,55 @@ struct DFlashTarget {
 
     // Restore KV cache to the last snapshot (undo speculative forward).
     virtual bool restore_kv() = 0;
+
+    // Whether fast rollback is supported — uses per-step SSM intermediate
+    // states captured during verify to restore recurrent state without replay.
+    // When true, verify_batch captures intermediates and rollback_to() works.
+    virtual bool supports_fast_rollback() const { return false; }
+
+    // Roll back recurrent state to position `commit_n` within the last
+    // verify batch (0-indexed). Uses SSM intermediate states captured during
+    // verify. Also truncates KV to `base_pos + commit_n`. No replay needed.
+    // Only valid when supports_fast_rollback() returns true.
+    virtual bool rollback_to(int base_pos, int commit_n) {
+        (void)base_pos; (void)commit_n; return false;
+    }
+
+    // ── DDTree tree-structured verify ───────────────────────────────
+    // Whether this target can verify a draft tree (ancestor-masked batched
+    // forward over DFS-ordered tree nodes). When false, callers fall back to
+    // chain verify. Requires fast_rollback support (tree rollback reuses the
+    // per-step SSM intermediate capture).
+    virtual bool supports_tree_verify() const { return false; }
+
+    // Verify a DDTree in one batched target forward. `flat_tokens` is the
+    // DFS-ordered tree (slot 0 = root = previous round's bonus token, slots
+    // 1..n_nodes = tree.token_ids), padded to `n_alloc` for graph reuse.
+    // `committed` is the KV position of the root. On success fills
+    // `posterior_out` (size 1+tree.n_nodes) with the target's argmax at each
+    // tree node, and—when `logits_out` is non-null—the full [n_actual x vocab]
+    // f32 logits (used to sample the bonus token at temperature > 0).
+    virtual bool verify_tree(int committed,
+                             const DDTree & tree,
+                             const std::vector<int32_t> & flat_tokens,
+                             int n_alloc,
+                             std::vector<int32_t> & posterior_out,
+                             std::vector<float> * logits_out = nullptr) {
+        (void)committed; (void)tree; (void)flat_tokens; (void)n_alloc;
+        (void)posterior_out; (void)logits_out;
+        return false;
+    }
+
+    // Roll recurrent + KV state forward to the accepted tree path. `accepted_dfs`
+    // is the list of DFS-tree indices of the committed nodes (from
+    // follow_verified_tree, including the root at index 0). Restores SSM/conv
+    // state to the deepest accepted node and compacts KV so the next round sees
+    // a contiguous prefix. Only valid when supports_tree_verify() is true.
+    virtual bool rollback_to_tree(int committed,
+                                  const DDTree & tree,
+                                  const std::vector<int> & accepted_dfs) {
+        (void)committed; (void)tree; (void)accepted_dfs; return false;
+    }
 
     // ── Token utilities ─────────────────────────────────────────────
 
@@ -60,6 +112,20 @@ struct DFlashTarget {
     virtual bool project_hidden_to_tokens(const float * hidden,
                                           int n_tokens,
                                           std::vector<int32_t> & tokens_out) = 0;
+
+    // Project draft hidden states through the target lm_head and return the
+    // per-position top-K log-probabilities + token ids (for DDTree building).
+    // Default false (unsupported); tree-verify targets override.
+    virtual bool project_hidden_to_topk(const float * hidden,
+                                        int n_tokens,
+                                        int K,
+                                        float temperature,
+                                        std::vector<float> & top_log_probs,
+                                        std::vector<int32_t> & top_token_ids) {
+        (void)hidden; (void)n_tokens; (void)K; (void)temperature;
+        (void)top_log_probs; (void)top_token_ids;
+        return false;
+    }
 
     // ── Configuration for draft model ───────────────────────────────
 
