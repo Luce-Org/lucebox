@@ -134,10 +134,15 @@ def test_sweep_smoke(mock_openai_server, tmp_path):
         data = json.loads(f.read_text())
         assert data["area"] == area
         assert data["n"] == 1
+    # Cost-containment guarantee: agent_recorded is OMITTED from --areas all
+    # because it bills real Anthropic API spend. It must never be swept.
+    assert not (snap / "agent_recorded.json").exists()
     # Combined summary files.
     assert (snap / "_summary.json").exists()
     summary = json.loads((snap / "_summary.json").read_text())
     assert summary["name"] == "ci-smoke"
+    # ...and it must not appear in the combined summary either.
+    assert all("agent_recorded" not in a.get("area", "") for a in summary["areas"])
     # Forge MAY be in here if [forge] extra is installed; check >= len-without-forge.
     assert len(summary["areas"]) >= len(expected_areas)
     assert (snap / "_summary.md").exists()

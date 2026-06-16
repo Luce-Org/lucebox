@@ -205,6 +205,13 @@ class CanonicalRow:
         return asdict(self)
 
 
+def _row_passed(row: CanonicalRow) -> bool:
+    """The shared pass rule: a row counts as a pass when its grader set
+    either ``pass`` or the legacy ``strict_pass`` flag. Centralised here so
+    report/regrade stay in lock-step on the definition."""
+    return bool(row.graded.get("pass") or row.graded.get("strict_pass"))
+
+
 @dataclass
 class CanonicalResult:
     """One canonical result file.

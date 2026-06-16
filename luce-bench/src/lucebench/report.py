@@ -42,7 +42,7 @@ from typing import Any
 
 from lucebench import __version__
 from lucebench.normalize import normalize_result
-from lucebench.schema import CanonicalResult, HostInfo
+from lucebench.schema import CanonicalResult, HostInfo, _row_passed
 
 
 def _row_stats(canon: CanonicalResult) -> dict[str, Any]:
@@ -71,11 +71,7 @@ def _row_stats(canon: CanonicalResult) -> dict[str, Any]:
             "decode_tps_median": 0,
             "budgeted": budgeted,
         }
-    passes = sum(
-        1
-        for r in rows
-        if r.graded.get("pass") or r.graded.get("strict_pass")
-    )
+    passes = sum(1 for r in rows if _row_passed(r))
     walls = [r.wall_seconds or 0 for r in rows]
     comp = [r.completion_tokens or 0 for r in rows]
     decode_tps = [r.decode_tokens_per_sec or 0 for r in rows]
@@ -135,11 +131,7 @@ def budgeted_mode_stats(rows: list[Any]) -> dict[str, Any]:
             continue
         graded_rows.append(r)
     graded = len(graded_rows)
-    passes = sum(
-        1
-        for r in graded_rows
-        if r.graded.get("pass") or r.graded.get("strict_pass")
-    )
+    passes = sum(1 for r in graded_rows if _row_passed(r))
     return {
         "total": total,
         "graded": graded,

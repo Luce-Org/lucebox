@@ -49,7 +49,7 @@ from lucebench.areas import (
     truthfulqa_mc1,
 )
 from lucebench.normalize import load_result
-from lucebench.schema import CanonicalResult, CanonicalRow
+from lucebench.schema import CanonicalResult, CanonicalRow, _row_passed
 
 # Map canonical area names → (module, grade_fn, case_id_field, case_lookup).
 # Each entry is what `regrade_result` needs to re-grade a row:
@@ -176,7 +176,7 @@ def regrade_result(canon: CanonicalResult) -> CanonicalResult:
         # that key on it keep working.
         new_row.graded.setdefault("strict_pass", new_row.graded.get("pass", False))
         new_rows.append(new_row)
-        if new_row.graded.get("pass") or new_row.graded.get("strict_pass"):
+        if _row_passed(new_row):
             strict_passes += 1
         if new_row.graded.get("format_pass"):
             format_passes += 1

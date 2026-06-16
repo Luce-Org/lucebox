@@ -601,6 +601,94 @@ def _restart_lucebox_service(*, log_prefix: str = "[agent_recorded]") -> tuple[b
     return (True, "ok")
 
 
+def _maybe_restart(
+    *,
+    url: str,
+    restart_between_cases: bool,
+    case_id: str,
+    fallback_note: str,
+    log_prefix: str = "[agent_recorded]",
+) -> tuple[str, str, str | None]:
+    """Optionally restart the service and wait for /health before a case.
+
+    Returns ``(restart_status, restart_reason, error)``. ``error`` is set
+    only when a requested restart succeeded but the service never became
+    healthy; a restart that can't run (no systemd, etc.) is a soft fallback
+    — ``fallback_note`` is the case-specific tail printed in that case.
+    """
+    if not restart_between_cases:
+        return "skipped", "restart_between_cases=False", None
+
+    ok, reason = _restart_lucebox_service(log_prefix=log_prefix)
+    if ok:
+        error = None if _health_wait(url) else "service did not become healthy after restart"
+        return "ok", reason, error
+
+    print(
+        f"{log_prefix} cold-restart not available ({reason}); {fallback_note} {case_id}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return "failed", reason, None
+
+
+def _judge_or_pending(
+    *,
+    error: str | None,
+    reference: Any,
+    judge_fn: Any,
+    case_id: str,
+    messages: list[dict[str, Any]],
+    candidate_response: str,
+) -> dict[str, Any]:
+    """Grade a candidate response, mapping the no-reference / error / judge-
+    failure cases to deterministic ``judge_pending``/``off_track`` results.
+
+    ``JudgeUnavailable`` (missing key / SDK) is re-raised so the area aborts
+    instead of masking every row as pending; any other judge exception
+    degrades that single row to ``judge_pending``.
+    """
+    if error is not None:
+        return {
+            "pass": False,
+            "verdict": "off_track",
+            "rationale": f"transport error precluded judging: {error}",
+            "cached": False,
+            "model": None,
+            "error": error,
+        }
+    if not reference:
+        return {
+            "pass": False,
+            "verdict": "judge_pending",
+            "rationale": "case has no reference_response (v0 fixture); judge skipped",
+            "cached": False,
+            "model": None,
+            "error": "no_reference",
+        }
+    from lucebench.grading.llm_judge import JudgeUnavailable
+
+    try:
+        verdict = judge_fn(
+            case_id=case_id,
+            messages=messages,
+            reference_response=reference,
+            candidate_response=candidate_response,
+        )
+        return verdict.to_dict() if hasattr(verdict, "to_dict") else dict(verdict)
+    except JudgeUnavailable:
+        raise
+    except Exception as e:  # noqa: BLE001 - one judge failure → pending, not abort
+        return {
+            "pass": False,
+            "verdict": "judge_pending",
+            "rationale": f"judge invocation raised: {type(e).__name__}: {e}",
+            "cached": False,
+            "model": None,
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+
 # ── Per-case cold/warm driver. ───────────────────────────────────────
 
 
@@ -630,24 +718,13 @@ def _run_one_exact_repeat_case(
 
     cold_row: dict[str, Any] = {}
     warm_row: dict[str, Any] = {}
-    error: str | None = None
-    restart_status = "skipped"
-    restart_reason = "restart_between_cases=False"
-
-    if restart_between_cases:
-        ok, reason = _restart_lucebox_service(log_prefix=log_prefix)
-        restart_status = "ok" if ok else "failed"
-        restart_reason = reason
-        if ok:
-            if not _health_wait(url):
-                error = "service did not become healthy after restart"
-        else:
-            print(
-                f"{log_prefix} cold-restart not available ({reason}); "
-                f"falling back to warm/warm for case {case_id}",
-                file=sys.stderr,
-                flush=True,
-            )
+    restart_status, restart_reason, error = _maybe_restart(
+        url=url,
+        restart_between_cases=restart_between_cases,
+        case_id=case_id,
+        fallback_note="falling back to warm/warm for case",
+        log_prefix=log_prefix,
+    )
 
     # Cold pass.
     if error is None:
@@ -697,52 +774,15 @@ def _run_one_exact_repeat_case(
     # measurement; the model output should be identical bit-for-bit
     # except for sampler RNG, but we judge the first sample for
     # deterministic accounting).
-    judge_result: dict[str, Any]
     cold_content = (cold_row.get("content") or "") + (cold_row.get("reasoning_content") or "")
-    if error is not None:
-        judge_result = {
-            "pass": False,
-            "verdict": "off_track",
-            "rationale": f"transport error precluded judging: {error}",
-            "cached": False,
-            "model": None,
-            "error": error,
-        }
-    elif not reference:
-        judge_result = {
-            "pass": False,
-            "verdict": "judge_pending",
-            "rationale": "case has no reference_response (v0 fixture); judge skipped",
-            "cached": False,
-            "model": None,
-            "error": "no_reference",
-        }
-    else:
-        # ``JudgeUnavailable`` (missing API key / SDK) is a configuration
-        # failure rather than a per-call hiccup — let it propagate so the
-        # area aborts on the first case instead of silently masking every
-        # row as ``judge_pending``. See module docstring.
-        from lucebench.grading.llm_judge import JudgeUnavailable
-
-        try:
-            verdict = judge_fn(
-                case_id=case_id,
-                messages=messages,
-                reference_response=reference,
-                candidate_response=cold_content,
-            )
-            judge_result = verdict.to_dict() if hasattr(verdict, "to_dict") else dict(verdict)
-        except JudgeUnavailable:
-            raise
-        except Exception as e:  # noqa: BLE001 - one judge failure → pending, not abort
-            judge_result = {
-                "pass": False,
-                "verdict": "judge_pending",
-                "rationale": f"judge invocation raised: {type(e).__name__}: {e}",
-                "cached": False,
-                "model": None,
-                "error": f"{type(e).__name__}: {e}",
-            }
+    judge_result = _judge_or_pending(
+        error=error,
+        reference=reference,
+        judge_fn=judge_fn,
+        case_id=case_id,
+        messages=messages,
+        candidate_response=cold_content,
+    )
 
     return {
         "replay_mode": "exact-repeat",
@@ -784,24 +824,13 @@ def _run_one_sequential_case(
     turns = _build_sequential_replay_turns(case)
 
     turn_rows: list[dict[str, Any]] = []
-    error: str | None = None
-    restart_status = "skipped"
-    restart_reason = "restart_between_cases=False"
-
-    if restart_between_cases:
-        ok, reason = _restart_lucebox_service(log_prefix=log_prefix)
-        restart_status = "ok" if ok else "failed"
-        restart_reason = reason
-        if ok:
-            if not _health_wait(url):
-                error = "service did not become healthy after restart"
-        else:
-            print(
-                f"{log_prefix} cold-restart not available ({reason}); "
-                f"running sequential replay against existing cache state for case {case_id}",
-                file=sys.stderr,
-                flush=True,
-            )
+    restart_status, restart_reason, error = _maybe_restart(
+        url=url,
+        restart_between_cases=restart_between_cases,
+        case_id=case_id,
+        fallback_note="running sequential replay against existing cache state for case",
+        log_prefix=log_prefix,
+    )
 
     if error is None and not turns:
         error = "case has no replayable messages"
@@ -857,47 +886,14 @@ def _run_one_sequential_case(
     if final_row is not None:
         final_content = (final_row.get("content") or "") + (final_row.get("reasoning_content") or "")
 
-    judge_result: dict[str, Any]
-    if error is not None:
-        judge_result = {
-            "pass": False,
-            "verdict": "off_track",
-            "rationale": f"transport error precluded judging: {error}",
-            "cached": False,
-            "model": None,
-            "error": error,
-        }
-    elif not reference:
-        judge_result = {
-            "pass": False,
-            "verdict": "judge_pending",
-            "rationale": "case has no reference_response (v0 fixture); judge skipped",
-            "cached": False,
-            "model": None,
-            "error": "no_reference",
-        }
-    else:
-        from lucebench.grading.llm_judge import JudgeUnavailable
-
-        try:
-            verdict = judge_fn(
-                case_id=case_id,
-                messages=final_messages,
-                reference_response=reference,
-                candidate_response=final_content,
-            )
-            judge_result = verdict.to_dict() if hasattr(verdict, "to_dict") else dict(verdict)
-        except JudgeUnavailable:
-            raise
-        except Exception as e:  # noqa: BLE001
-            judge_result = {
-                "pass": False,
-                "verdict": "judge_pending",
-                "rationale": f"judge invocation raised: {type(e).__name__}: {e}",
-                "cached": False,
-                "model": None,
-                "error": f"{type(e).__name__}: {e}",
-            }
+    judge_result = _judge_or_pending(
+        error=error,
+        reference=reference,
+        judge_fn=judge_fn,
+        case_id=case_id,
+        messages=final_messages,
+        candidate_response=final_content,
+    )
 
     return {
         "replay_mode": "sequential",
@@ -919,44 +915,6 @@ def _run_one_sequential_case(
         "pass": bool(judge_result.get("pass")),
         "error": error,
     }
-
-
-def _run_one_multi_turn_case(
-    *,
-    case: dict[str, Any],
-    url: str,
-    model: str,
-    max_tokens: int,
-    auth_header: str,
-    timeout_s: int,
-    restart_between_cases: bool,
-    judge_fn: Any,
-    replay_mode: str,
-    log_prefix: str = "[agent_recorded]",
-) -> dict[str, Any]:
-    if replay_mode == "exact-repeat":
-        return _run_one_exact_repeat_case(
-            case=case,
-            url=url,
-            model=model,
-            max_tokens=max_tokens,
-            auth_header=auth_header,
-            timeout_s=timeout_s,
-            restart_between_cases=restart_between_cases,
-            judge_fn=judge_fn,
-            log_prefix=log_prefix,
-        )
-    return _run_one_sequential_case(
-        case=case,
-        url=url,
-        model=model,
-        max_tokens=max_tokens,
-        auth_header=auth_header,
-        timeout_s=timeout_s,
-        restart_between_cases=restart_between_cases,
-        judge_fn=judge_fn,
-        log_prefix=log_prefix,
-    )
 
 
 def _resolve_judge_fn(*, mock_judge: Any = None) -> Any:
@@ -1012,7 +970,12 @@ def run_agent_recorded_area(
             f"bucket={case['target_bucket_tokens']} ctx≈{case['context_tokens_approx']}",
             flush=True,
         )
-        row = _run_one_multi_turn_case(
+        run_one = (
+            _run_one_exact_repeat_case
+            if replay_mode == "exact-repeat"
+            else _run_one_sequential_case
+        )
+        row = run_one(
             case=case,
             url=url,
             model=model,
@@ -1021,7 +984,6 @@ def run_agent_recorded_area(
             timeout_s=timeout_s,
             restart_between_cases=restart_between_cases,
             judge_fn=judge_fn,
-            replay_mode=replay_mode,
             log_prefix=log_prefix,
         )
         rows.append(row)

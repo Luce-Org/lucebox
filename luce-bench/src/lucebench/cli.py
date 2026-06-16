@@ -13,12 +13,16 @@ import json
 import os
 import statistics
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any
 
 from lucebench import __version__
+from lucebench._display import format_row
+from lucebench._preflight import (
+    _preflight,
+    list_models,
+    resolve_model,  # noqa: F401  re-exported for back-compat (tests import from cli)
+)
 from lucebench._thinking import verify_thinking_control
 from lucebench.areas import (
     agent,
@@ -38,6 +42,77 @@ from lucebench.model_cards import (
     resolve_card,
 )
 from lucebench.runner import run_case
+
+_AUTH_ENV_EMPTY_MSG = "--auth-env {name}: env var is empty or unset"
+
+
+class _AuthEnvEmpty(Exception):
+    """Raised by :func:`_resolve_auth_header` when an --auth-env var is empty.
+
+    Carries the formatted, user-facing message so each call site can route it
+    through its own error path (``ap.error`` vs ``print + return 2``).
+    """
+
+
+def _resolve_auth_header(args, *, on_empty: str = "error") -> str:
+    """Build the ``Bearer <token>`` auth header from ``args.auth_env``.
+
+    Returns ``""`` when ``--auth-env`` is unset. When it is set but the env var
+    is empty:
+
+    * ``on_empty="error"`` raises :class:`_AuthEnvEmpty` with a ready-made
+      message (caller decides how to surface it / which exit code to use).
+    * ``on_empty="ignore"`` tolerates the empty value and returns ``""`` (used
+      by read-only probes like --list-models / preflight).
+    """
+    if not args.auth_env:
+        return ""
+    token = os.environ.get(args.auth_env, "")
+    if not token:
+        if on_empty == "ignore":
+            return ""
+        raise _AuthEnvEmpty(_AUTH_ENV_EMPTY_MSG.format(name=args.auth_env))
+    return f"Bearer {token}"
+
+
+_TERSE_DROP_KEYS = frozenset({"_response", "_thinking_injection"})
+
+
+def _terse_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Strip the heavy per-row keys (raw ``_response`` blob, repeated
+    ``_thinking_injection`` echo) before serializing to JSON-out, keeping
+    file size sane. Returns fresh dicts; inputs are not mutated."""
+    return [{k: v for k, v in r.items() if k not in _TERSE_DROP_KEYS} for r in rows]
+
+
+def _write_area_json(
+    out_path: Path,
+    *,
+    area: str,
+    url: str,
+    model: str,
+    summary: dict[str, Any],
+    rows: list[dict[str, Any]],
+) -> None:
+    """Write the standard ``**summary``-style per-area JSON envelope.
+
+    Used by areas (forge, agent_recorded) whose summary dict is spliced
+    in wholesale; areas with a fixed-key envelope build theirs inline.
+    """
+    out_path.write_text(
+        json.dumps(
+            {
+                "lucebench_version": __version__,
+                "area": area,
+                "url": url,
+                "model": model,
+                **summary,
+                "rows": rows,
+            },
+            indent=2,
+            default=str,
+        )
+    )
 
 
 def _summarize_injection(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -119,69 +194,6 @@ def resolve_sampling(
     else:
         source = "none"
     return sampling, source
-
-
-# Threshold below which we'll auto-pick the first model and surface the
-# full list. Gateways with hundreds of models still need an explicit
-# --model — silently picking from a long list masks user mistakes.
-_SMALL_MODEL_LIST_THRESHOLD = 5
-
-
-def resolve_model(url: str, auth_header: str = "", timeout_s: int = 10) -> str | None:
-    """Pick a model id by probing the server's /v1/models endpoint.
-
-    Returns:
-      * the single model id if the server exposes exactly one
-      * the first model id if the server exposes 2..4 (small list —
-        likely a single-model server with aliases). The full list is
-        printed by the caller via :func:`list_models` so the choice
-        is visible.
-      * None if the server exposes zero, 5+, or doesn't speak the
-        OpenAI /v1/models shape.
-    """
-    chosen, _ = _list_models(url, auth_header=auth_header, timeout_s=timeout_s)
-    return chosen
-
-
-def list_models(
-    url: str, auth_header: str = "", timeout_s: int = 10
-) -> tuple[str | None, list[str]]:
-    """Same as :func:`resolve_model` but also returns the full model id
-    list (or an empty list on probe failure). Callers use this to surface
-    the available models alongside the auto-pick.
-    """
-    return _list_models(url, auth_header=auth_header, timeout_s=timeout_s)
-
-
-def _list_models(
-    url: str, auth_header: str = "", timeout_s: int = 10
-) -> tuple[str | None, list[str]]:
-    req = urllib.request.Request(
-        url.rstrip("/") + "/v1/models", headers={"Accept": "application/json"}
-    )
-    if auth_header:
-        req.add_header("Authorization", auth_header)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            data = json.loads(resp.read())
-    except (urllib.error.URLError, OSError, ValueError):
-        return None, []
-    models = data.get("data") if isinstance(data, dict) else None
-    if not isinstance(models, list):
-        return None, []
-    ids: list[str] = []
-    for entry in models:
-        if isinstance(entry, dict):
-            mid = entry.get("id")
-            if isinstance(mid, str) and mid:
-                ids.append(mid)
-    if not ids:
-        return None, []
-    # Auto-pick when the list is short enough to be useful — gateways
-    # with 5+ models still require an explicit --model.
-    if len(ids) < _SMALL_MODEL_LIST_THRESHOLD:
-        return ids[0], ids
-    return None, ids
 
 
 AREAS = {
@@ -286,124 +298,6 @@ def select_cases(
     return out
 
 
-def format_row(idx: int, row: dict, graded: dict) -> str:
-    src = row.get("source") or "?"
-    cid = row.get("case_id") or "?"
-    verdict = "PASS" if graded.get("pass") else "FAIL"
-    given = graded.get("given") or "?"
-    correct = graded.get("correct") or "?"
-    wall = row.get("wall_seconds") or 0
-    timings = row.get("timings") or {}
-    if not isinstance(timings, dict):
-        timings = {}
-
-    # ── Throughput. Prefer the server-reported decode rate (lucebox /
-    # llama.cpp populate `decode_tokens_per_sec`); fall back to a wall-
-    # clock estimate so OpenRouter / vLLM (which don't surface decode_tps)
-    # don't always read "0tps". The fallback rolls prefill into the rate,
-    # so mark it with a trailing `*` to keep the distinction visible.
-    #
-    # Two display refinements that prevent the noisy-but-useless "0tps*"
-    # case (e.g. OpenRouter, smoke prompts emitting only 2 tokens — the
-    # rate is then dominated by routing/first-token latency, not decode):
-    #   1) When the fallback completion count is below 8 tokens, skip the
-    #      rate entirely and show `out=N` only — the math measures
-    #      router overhead, not decode.
-    #   2) Sub-10tps values render with one decimal so 0.3 doesn't round
-    #      down to 0.
-    def _fmt_tps(v: float) -> str:
-        if v < 10:
-            return f"{v:.1f}"
-        return f"{v:.0f}"
-
-    tps_val = timings.get("decode_tokens_per_sec")
-    completion_tokens = row.get("completion_tokens")
-    _FALLBACK_MIN_TOKENS = 8
-    if tps_val:
-        tps_str = f"{_fmt_tps(tps_val)}tps"
-    elif (
-        completion_tokens
-        and isinstance(completion_tokens, int)
-        and completion_tokens >= _FALLBACK_MIN_TOKENS
-        and wall
-        and wall > 0
-    ):
-        tps_str = f"{_fmt_tps(completion_tokens / wall)}tps*"
-    else:
-        # Either no usable count or too few tokens to be meaningful — leave
-        # the rate column off rather than print a number dominated by
-        # prefill/router latency.
-        tps_str = ""
-
-    # ── Prefill / decode split. lucebox-server surfaces both in
-    # `usage.timings` (prefill_ms + decode_ms); OpenRouter / vLLM
-    # typically surface neither. Render whichever pair is available; if
-    # both are missing fall back to the plain wall time.
-    prefill_ms = timings.get("prefill_ms")
-    decode_ms = timings.get("decode_ms")
-
-    def _fmt_ms(ms: float) -> str:
-        # Sub-second renders as e.g. "210ms"; >=1s as "3.5s" to keep the line tight.
-        if ms < 1000:
-            return f"{ms:.0f}ms"
-        return f"{ms / 1000:.1f}s"
-
-    # ── Time-to-first-token. Server-reported `prefill_ms` is the gold
-    # standard (no network RTT, no SSE framing overhead). Streaming runs
-    # also capture a wall-clock TTFT — useful for OpenRouter / vLLM where
-    # the server doesn't ship prefill_ms. When both are present prefer
-    # the server value and drop the wall-clock duplicate; when only the
-    # streaming measurement is available mark it with `*` (same convention
-    # as the tps fallback above).
-    ttft_seconds = row.get("ttft_seconds")
-    ttft_ms: float | None = ttft_seconds * 1000 if isinstance(ttft_seconds, int | float) else None
-
-    time_parts: list[str] = []
-    if prefill_ms is not None and decode_ms is not None:
-        time_parts.append(f"prefill={_fmt_ms(prefill_ms)}")
-        time_parts.append(f"decode={_fmt_ms(decode_ms)}")
-    elif prefill_ms is not None:
-        time_parts.append(f"prefill={_fmt_ms(prefill_ms)} wall={wall:.2f}s")
-    elif ttft_ms is not None and decode_ms is not None:
-        time_parts.append(f"ttft={_fmt_ms(ttft_ms)}* decode={_fmt_ms(decode_ms)}")
-    elif ttft_ms is not None:
-        time_parts.append(f"ttft={_fmt_ms(ttft_ms)}* wall={wall:.2f}s")
-    elif decode_ms is not None:
-        time_parts.append(f"decode={_fmt_ms(decode_ms)} wall={wall:.2f}s")
-    else:
-        time_parts.append(f"wall={wall:.2f}s")
-    time_str = " ".join(time_parts)
-
-    # ── Token breakdown: input / thinking / non-thinking. `reasoning_tokens`
-    # is captured by runner.run_case from `usage.completion_tokens_details`
-    # (OpenAI/OR) or the deprecated top-level `usage.reasoning_tokens`. We
-    # do NOT count tokens ourselves — no tokenizer dep — so when the server
-    # only ships `reasoning_content` text we leave `think` out and show `out`
-    # as the full completion_tokens count.
-    prompt_tokens = row.get("prompt_tokens")
-    reasoning_tokens = row.get("reasoning_tokens")
-    tok_bits: list[str] = []
-    if prompt_tokens is not None:
-        tok_bits.append(f"in={prompt_tokens}")
-    if isinstance(reasoning_tokens, int) and isinstance(completion_tokens, int):
-        non_thinking = max(completion_tokens - reasoning_tokens, 0)
-        tok_bits.append(f"think={reasoning_tokens}")
-        tok_bits.append(f"out={non_thinking}")
-    elif completion_tokens is not None:
-        tok_bits.append(f"out={completion_tokens}")
-    tok_str = " ".join(tok_bits)
-
-    tail_bits = [time_str]
-    if tps_str:
-        tail_bits.append(tps_str)
-    if tok_str:
-        tail_bits.append(tok_str)
-    return (
-        f"  {idx:3d} {verdict} {src:14s} {cid:24s} "
-        f"given={given:20s} correct={correct:20s} " + " ".join(tail_bits)
-    )
-
-
 # Substrings in row["error"] that mean the server is unreachable — fail-fast
 # triggers on the first row matching any of these unless --no-fail-fast is set.
 _UNREACHABLE_ERRORS = (
@@ -428,222 +322,6 @@ def _row_is_unreachable(row: dict) -> bool:
     return any(marker in err for marker in _UNREACHABLE_ERRORS)
 
 
-def _format_models_inline(ids: list[str], selected: str, budget: int = 62) -> str:
-    """Render a comma-separated `/v1/models` listing for the preflight grid.
-
-    Marks the chosen id with a `*` prefix. If the full list fits in
-    `budget` characters, it's shown verbatim. Otherwise the layout is:
-    first model, then the selected model (if different), then sequential
-    fillers until the budget is hit, ending with `… (+N more)`.
-    """
-    if not ids:
-        return "(none)"
-
-    def render(picked_idx: list[int], remaining: int) -> str:
-        parts = [(f"*{ids[i]}" if ids[i] == selected else ids[i]) for i in picked_idx]
-        s = ", ".join(parts)
-        if remaining:
-            s += f", … (+{remaining} more)"
-        return s
-
-    full = render(list(range(len(ids))), 0)
-    if len(full) <= budget:
-        return full
-
-    picked = [0]
-    if selected in ids and ids[0] != selected:
-        picked.append(ids.index(selected))
-    for i in range(1, len(ids)):
-        if i in picked:
-            continue
-        candidate = sorted(picked + [i])
-        remaining = len(ids) - len(candidate)
-        if len(render(candidate, remaining)) > budget:
-            break
-        picked = candidate
-    remaining = len(ids) - len(picked)
-    return render(sorted(picked), remaining)
-
-
-def _preflight(
-    url: str,
-    *,
-    auth_header: str = "",
-    timeout_s: int = 5,
-    requested_model: str | None = None,
-) -> tuple[bool, list[str], bool, dict[str, Any] | None]:
-    """Probe the server's liveness + OpenAI shape + lucebox /props endpoint.
-
-    Returns ``(ok, lines, server_honors_api_flags, props_model_card)`` where
-    ``lines`` is the printed grid (already formatted, one check per line),
-    ``ok`` is False iff a HARD check failed — which is "liveness" or
-    "/v1/models doesn't return a data list" — ``server_honors_api_flags`` is
-    True iff the server's /props response surfaces ``model_card_source`` (the
-    marker that this is a lucebox stack which enforces thinking control
-    server-side), and ``props_model_card`` is the verbatim ``/props.model_card``
-    dict (the authoritative card the server loaded) or None when /props is
-    absent / carries no card. The /props check is lucebox-specific:
-    missing/404 prints a warning line but does NOT fail (OpenRouter, vLLM,
-    stock ds4_server don't expose /props), and in those cases
-    ``server_honors_api_flags`` defaults to False so the client-side
-    injection can take over.
-
-    Designed to run before any case fires so a typo'd --url surfaces in
-    ~50ms instead of after 92 timeouts. The CLI gates this behind
-    ``--no-preflight`` for the rare case where preflight gets in the way
-    (e.g. CI testing against a deliberately-flaky endpoint).
-    """
-    import time as _time
-
-    base = url.rstrip("/")
-    lines: list[str] = [f"[lucebench] preflight {url}"]
-
-    def _line(name: str, ok: bool, detail: str) -> str:
-        mark = "✓" if ok else "✗"  # ✓ / ✗
-        return f"  {name:12s} {mark}  {detail}"
-
-    # 1. Liveness — GET /v1/models with a tight timeout. Reusing the
-    # /v1/models endpoint (rather than a bare TCP connect) gives us a
-    # cheap two-for-one: if it returns JSON we already know the server
-    # speaks the OpenAI shape, so check #2 reuses the response.
-    req = urllib.request.Request(base + "/v1/models", headers={"Accept": "application/json"})
-    if auth_header:
-        req.add_header("Authorization", auth_header)
-    t0 = _time.perf_counter()
-    models_payload: Any = None
-    liveness_ok = False
-    liveness_detail = ""
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            body = resp.read()
-        liveness_ok = True
-        liveness_detail = f"reached in {_time.perf_counter() - t0:.2f}s"
-        try:
-            models_payload = json.loads(body)
-        except ValueError:
-            models_payload = None
-    except urllib.error.URLError as e:
-        reason = getattr(e, "reason", e)
-        liveness_detail = (
-            f"connection refused ({reason})" if "refused" in str(reason).lower() else str(reason)
-        )
-    except OSError as e:
-        liveness_detail = f"{type(e).__name__}: {e}"
-    except Exception as e:  # last-resort guard so preflight never raises
-        liveness_detail = f"{type(e).__name__}: {e}"
-    lines.append(_line("liveness", liveness_ok, liveness_detail))
-    if not liveness_ok:
-        return False, lines, False, None
-
-    # 2. /v1/models shape — OpenAI-compat servers return {"data": [...]}.
-    models_ok = False
-    models_detail = ""
-    if isinstance(models_payload, dict):
-        data = models_payload.get("data")
-        if isinstance(data, list):
-            ids = [
-                m.get("id") for m in data if isinstance(m, dict) and isinstance(m.get("id"), str)
-            ]
-            if not ids:
-                models_detail = "0 models exposed"
-            else:
-                models_ok = True
-                # Selected = explicit --model if in the list; else first.
-                # The `*` marker visualizes what the bench would send.
-                if requested_model and requested_model != "default" and requested_model in ids:
-                    selected = requested_model
-                else:
-                    selected = ids[0]
-                models_detail = _format_models_inline(ids, selected)
-        else:
-            models_detail = "response missing 'data' list"
-    else:
-        models_detail = "response was not JSON"
-    lines.append(_line("/v1/models", models_ok, models_detail))
-    if not models_ok:
-        return False, lines, False, None
-
-    # 3. /props — lucebox-specific. Soft check: warn if absent, surface
-    # the image identity + target GGUF basename + model_card_source when
-    # the server is new enough to expose them (props_schema >= 3); fall
-    # back to the schema-2 model_card + reply_budget display on older
-    # servers.
-    props_req = urllib.request.Request(base + "/props", headers={"Accept": "application/json"})
-    if auth_header:
-        props_req.add_header("Authorization", auth_header)
-    try:
-        with urllib.request.urlopen(props_req, timeout=timeout_s) as resp:
-            props = json.loads(resp.read())
-    except Exception:
-        # Not a hard failure — OpenRouter, vLLM, ds4_server don't expose this.
-        # ``server_honors_api_flags=False`` here is what flips the auto-mode
-        # client-side thinking injection on by default for these stacks.
-        lines.append(_line("/props", True, "absent (non-lucebox server) — skipped"))
-        return True, lines, False, None
-
-    bits: list[str] = []
-
-    # `build` (schema 3+): image_tag + short git_sha → "image=<tag>@<sha7>"
-    # so an operator scanning a bench log can pin the exact prebuilt image.
-    # Fall back gracefully when the server is pre-schema-3 (no `build`
-    # block) or when the fields are null (bare-metal / non-Docker builds).
-    if isinstance(props, dict):
-        build = props.get("build")
-        if isinstance(build, dict):
-            tag = build.get("image_tag")
-            git_sha = build.get("git_sha")
-            short_sha = git_sha[:7] if isinstance(git_sha, str) and git_sha else None
-            if tag and short_sha:
-                bits.append(f"image={tag}@{short_sha}")
-            elif tag:
-                bits.append(f"image={tag}")
-            elif short_sha:
-                bits.append(f"image=@{short_sha}")
-
-        # `model.target` (schema 3+): GGUF basename + quant tag. Strips
-        # the `.gguf` suffix so the line stays narrow.
-        model = props.get("model")
-        if isinstance(model, dict):
-            target = model.get("target")
-            if isinstance(target, dict):
-                path = target.get("path")
-                if isinstance(path, str) and path:
-                    stem = path.rsplit("/", 1)[-1]
-                    if stem.endswith(".gguf"):
-                        stem = stem[: -len(".gguf")]
-                    bits.append(f"target={stem}")
-
-    # `budget_envelope` (schema 2+): card lookup hit + reply budget. Kept
-    # in the line even when the schema-3 fields are present — operators
-    # debugging budget-envelope bugs find this faster than digging through
-    # the full `/props` body.
-    env = props.get("budget_envelope") if isinstance(props, dict) else None
-    env = env if isinstance(env, dict) else {}
-    card = env.get("model_card_source") or (
-        props.get("model_card_source") if isinstance(props, dict) else None
-    )
-    reply = env.get("hard_limit_reply_budget")
-    if card:
-        bits.append(f"model_card={card}")
-    if reply is not None:
-        bits.append(f"reply_budget={reply}")
-
-    detail = "  ".join(bits) if bits else "present (no envelope fields)"
-    lines.append(_line("/props", True, detail))
-    # ``model_card_source`` is the lucebox-stack tell: a server that surfaces
-    # which sidecar card it loaded is enforcing thinking control + reply
-    # budget server-side via the chat template, so the auto-mode client-side
-    # injection should stand down.
-    server_honors = bool(card)
-    # `/props.model_card` (props_schema 2+) is the verbatim sidecar JSON the
-    # server loaded — the authoritative card. Capture it so the CLI can pass
-    # it into the thinking resolver ahead of the bundled registry.
-    props_model_card = props.get("model_card") if isinstance(props, dict) else None
-    if not isinstance(props_model_card, dict):
-        props_model_card = None
-    return True, lines, server_honors, props_model_card
-
-
 def _forge_available() -> tuple[bool, str | None]:
     """Probe whether the `[forge]` extra is installed without importing it eagerly.
 
@@ -657,501 +335,6 @@ def _forge_available() -> tuple[bool, str | None]:
         return True, None
     except ImportError:
         return False, "anthropic SDK not installed — `pip install 'luce-bench[forge]'`"
-
-
-def _run_forge_area_to_dir(
-    *,
-    out_root: Path,
-    url: str,
-    model: str,
-    auth_header: str,
-    timeout: int,
-    max_tokens: int | None,
-    questions: int | None,
-) -> dict[str, Any] | None:
-    """Drive the forge area + write ``<out_root>/forge.json``.
-
-    Returns the per-area summary row (the dict appended to
-    ``summary_areas``) or ``None`` if the forge runner raised
-    ``SystemExit`` (e.g. no anthropic SDK installed).
-    """
-    from lucebench.areas.forge import run_forge_area
-
-    max_tokens_forge = max_tokens if max_tokens is not None else 4096
-    print(
-        f"\n[lucebench] === area=forge max_tokens={max_tokens_forge} ===",
-        flush=True,
-    )
-    try:
-        forge_rows, forge_summary = run_forge_area(
-            url=url,
-            model=model,
-            max_tokens=max_tokens_forge,
-            timeout_s=timeout,
-            auth_header=auth_header,
-            questions=questions,
-        )
-    except SystemExit as exc:
-        print(f"[lucebench] forge: {exc}", file=sys.stderr, flush=True)
-        return None
-    (out_root / "forge.json").write_text(
-        json.dumps(
-            {
-                "lucebench_version": __version__,
-                "area": "forge",
-                "url": url,
-                "model": model,
-                **forge_summary,
-                "rows": forge_rows,
-            },
-            indent=2,
-            default=str,
-        )
-    )
-    print(
-        f"[lucebench] area=forge pass_rate={forge_summary.get('pass_rate', 0):.2f}% "
-        f"({forge_summary.get('n_pass', 0)}/{forge_summary.get('n_scenarios', 0)})",
-        flush=True,
-    )
-    return {
-        "area": "forge",
-        "n": forge_summary.get("n_scenarios", 0),
-        "pass": forge_summary.get("n_pass", 0),
-        "rate": forge_summary.get("pass_rate", 0.0),
-        "wall_total": sum(r.get("wall_seconds") or 0 for r in forge_rows),
-        "wall_median": (
-            statistics.median([r.get("wall_seconds") or 0 for r in forge_rows])
-            if forge_rows
-            else 0
-        ),
-    }
-
-
-def _run_agent_recorded_to_dir(
-    *,
-    out_root: Path,
-    url: str,
-    model: str,
-    auth_header: str,
-    timeout: int,
-    max_tokens: int | None,
-    questions: int | None,
-    restart_between_cases: bool = True,
-    replay_mode: str = "sequential",
-    mock_judge: Any = None,
-) -> tuple[dict[str, Any] | None, bool]:
-    """Drive the multi-turn agent_recorded area + write ``<out_root>/agent_recorded.json``.
-
-    Mirrors ``_run_standard_area_to_dir`` — the area owns its own
-    cold/warm loop and judge invocation, so the standard ``run_case``
-    path doesn't fit. Returns ``(row, aborted)`` where ``aborted`` is
-    True for hard configuration failures (e.g. missing ANTHROPIC_API_KEY
-    → ``JudgeUnavailable``) that should fail the sweep instead of being
-    silently dropped from the summary.
-    """
-    from lucebench.areas.agent_recorded import run_agent_recorded_area
-    from lucebench.grading.llm_judge import JudgeUnavailable
-
-    max_tokens_eff = max_tokens if max_tokens is not None else 512
-    print(
-        f"\n[lucebench] === area=agent_recorded max_tokens={max_tokens_eff} "
-        f"restart_between_cases={restart_between_cases} replay_mode={replay_mode} ===",
-        flush=True,
-    )
-    try:
-        rows, summary = run_agent_recorded_area(
-            url=url,
-            model=model,
-            max_tokens=max_tokens_eff,
-            auth_header=auth_header,
-            timeout_s=timeout,
-            restart_between_cases=restart_between_cases,
-            questions=questions,
-            mock_judge=mock_judge,
-            replay_mode=replay_mode,
-        )
-    except JudgeUnavailable as exc:
-        # Missing judge credentials are a configuration error, not a
-        # per-case hiccup — abort the sweep rather than reporting success
-        # with the area silently missing from the summary.
-        print(
-            f"[lucebench] agent_recorded aborted: {exc}",
-            file=sys.stderr,
-            flush=True,
-        )
-        return None, True
-    except Exception as exc:  # noqa: BLE001
-        # Any other unexpected failure also aborts — letting the sweep
-        # exit 0 with agent_recorded missing was hiding real breakage.
-        print(
-            f"[lucebench] agent_recorded aborted: {type(exc).__name__}: {exc}",
-            file=sys.stderr,
-            flush=True,
-        )
-        return None, True
-
-    (out_root / "agent_recorded.json").write_text(
-        json.dumps(
-            {
-                "lucebench_version": __version__,
-                "area": "agent_recorded",
-                "url": url,
-                "model": model,
-                **summary,
-                "rows": rows,
-            },
-            indent=2,
-            default=str,
-        )
-    )
-    print(
-        f"[lucebench] area=agent_recorded pass_rate={summary.get('pass_rate', 0):.2f}% "
-        f"({summary.get('n_pass', 0)}/{summary.get('n_judged', 0)}) "
-        f"cache_speedup_p50={summary.get('cache_speedup_p50')} "
-        f"cache_hit_rate={summary.get('cache_hit_rate')}% "
-        f"cold_prefill_p50={summary.get('cold_prefill_p50')}s "
-        f"warm_prefill_p50={summary.get('warm_prefill_p50')}s "
-        f"final_prefill_p50={summary.get('final_prefill_p50')}s",
-        flush=True,
-    )
-    turn_walls = [
-        turn.get("wall_s") or 0
-        for r in rows
-        for turn in (r.get("turns") or [])
-    ]
-    cold_walls = [r["cold"].get("wall_s") or 0 for r in rows]
-    warm_walls = [r["warm"].get("wall_s") or 0 for r in rows]
-    walls = turn_walls or (cold_walls + warm_walls)
-    return {
-        "area": "agent_recorded",
-        "n": summary.get("n", 0),
-        "pass": summary.get("n_pass", 0),
-        "rate": summary.get("pass_rate", 0.0),
-        "wall_total": sum(walls),
-        "wall_median": statistics.median(walls) if walls else 0,
-    }, False
-
-
-def _run_standard_area_to_dir(
-    area: str,
-    *,
-    out_root: Path,
-    url: str,
-    model: str,
-    auth_header: str,
-    timeout: int,
-    max_tokens: int | None,
-    think: bool | None,
-    sampling: dict[str, Any] | None,
-    sampling_source: str | None,
-    questions: int | None,
-    no_fail_fast: bool,
-    prompt_thinking_control: str,
-    server_honors_api_flags: bool,
-    reasoning_effort: str = "high",
-    thinking_budget_tokens: int | None = None,
-    client_thinking_budget: int | None = None,
-    model_card: dict[str, Any] | None = None,
-    card_source: str | None = None,
-    card_stem: str | None = None,
-) -> tuple[dict[str, Any] | None, bool]:
-    """Drive a single stdlib area into ``<out_root>/<area>.json``.
-
-    Returns ``(summary_row, aborted)`` where ``aborted`` is ``True`` when
-    the fail-fast guard tripped on the first case (server unreachable).
-    """
-    cfg = AREAS[area]
-    cases = cfg["load"]()
-    cases = select_cases(cases, questions=questions)
-    chosen_max_tokens = max_tokens if max_tokens is not None else cfg["default_max_tokens"]
-    chosen_think = think if think is not None else cfg["default_thinking"]
-    print(
-        f"\n[lucebench] === area={area} cases={len(cases)} think={chosen_think} "
-        f"max_tokens={chosen_max_tokens} ===",
-        flush=True,
-    )
-
-    # Capability gate (see single-area path): only inject think/nothink
-    # tokens for a thinking-capable card; otherwise force the flag off so
-    # neither the card nor the family-map fallback injects.
-    effective_thinking_control = (
-        prompt_thinking_control if card_is_thinking_capable(model_card) else "off"
-    )
-
-    sampling = sampling or {}
-    rows: list[dict[str, Any]] = []
-    for idx, case in enumerate(cases, start=1):
-        row = run_case(
-            url=url,
-            case=case,
-            timeout_s=timeout,
-            max_tokens=chosen_max_tokens,
-            think=chosen_think,
-            model=model,
-            auth_header=auth_header,
-            temperature=sampling.get("temperature"),
-            top_p=sampling.get("top_p"),
-            top_k=sampling.get("top_k"),
-            min_p=sampling.get("min_p"),
-            presence_penalty=sampling.get("presence_penalty"),
-            repetition_penalty=sampling.get("repetition_penalty"),
-            sampling_source=sampling_source,
-            thinking_control_flag=effective_thinking_control,
-            server_honors_api_flags=server_honors_api_flags,
-            reasoning_effort=reasoning_effort,
-            thinking_budget_tokens=thinking_budget_tokens,
-            client_thinking_budget=client_thinking_budget,
-            model_card=model_card,
-            card_source=card_source,
-            card_stem=card_stem,
-        )
-        graded = cfg["grade"](case, row)
-        row["pass"] = graded.get("pass", False)
-        row["graded"] = graded
-        rows.append(row)
-        print(format_row(idx, row, graded), flush=True)
-        if idx == 1 and not no_fail_fast and _row_is_unreachable(row):
-            print(
-                f"\n[lucebench] sweep aborted — server at {url} appears "
-                f"unreachable (case 1 raised {row.get('error')!r}). "
-                "Pass --no-fail-fast to keep going anyway.",
-                file=sys.stderr,
-                flush=True,
-            )
-            return None, True
-
-    pass_n = sum(1 for r in rows if r["pass"])
-    rate = 100 * pass_n / len(rows) if rows else 0
-    walls = [r.get("wall_seconds") or 0 for r in rows]
-    wall_total = sum(walls)
-    wall_median = statistics.median(walls) if walls else 0
-    print(
-        f"[lucebench] area={area} pass_rate={rate:.2f}% "
-        f"({pass_n}/{len(rows)}) wall_total={wall_total:.0f}s",
-        flush=True,
-    )
-
-    requested_mode = "think" if chosen_think else "nothink"
-    honored, contradicting = verify_thinking_control(rows, requested_mode)
-    injection_summary = _summarize_injection(rows)
-    if not honored:
-        host = url.split("://", 1)[1].split("/", 1)[0] if "://" in url else url
-        print(
-            f"[lucebench] WARNING: thinking control not honored at {host} — "
-            f"{contradicting}/{len(rows)} rows in {requested_mode} mode have "
-            f"non-empty reasoning. Consider --prompt-thinking-control=on or "
-            f"pick a model card with an explicit thinking_control block.",
-            file=sys.stderr,
-            flush=True,
-        )
-
-    terse = [
-        {k: v for k, v in r.items() if k not in {"_response", "_thinking_injection"}}
-        for r in rows
-    ]
-    (out_root / f"{area}.json").write_text(
-        json.dumps(
-            {
-                "lucebench_version": __version__,
-                "area": area,
-                "url": url,
-                "model": model,
-                "think": chosen_think,
-                "max_tokens": chosen_max_tokens,
-                "n": len(rows),
-                "pass": pass_n,
-                "pass_rate": rate,
-                "wall_total": wall_total,
-                "wall_median": wall_median,
-                "thinking_control_requested": requested_mode,
-                "thinking_control_honored": honored,
-                "contradicting_rows": contradicting,
-                "thinking_control_injection": injection_summary,
-                "rows": terse,
-            },
-            indent=2,
-        )
-    )
-    return (
-        {
-            "area": area,
-            "n": len(rows),
-            "pass": pass_n,
-            "rate": rate,
-            "wall_total": wall_total,
-            "wall_median": wall_median,
-        },
-        False,
-    )
-
-
-def write_sweep_summary(
-    out_root: Path,
-    *,
-    name: str,
-    url: str,
-    model: str,
-    summary_areas: list[dict[str, Any]],
-    extra: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Write ``_summary.json`` + ``_summary.md`` to ``out_root`` and return the JSON payload.
-
-    ``extra`` is shallow-merged into the JSON payload — used by the
-    snapshot subcommand to record ``level`` next to the area roll-up so
-    downstream tools (``submit-baseline``) can validate the snapshot
-    against the requested tier.
-    """
-    summary: dict[str, Any] = {
-        "lucebench_version": __version__,
-        "name": name,
-        "url": url,
-        "model": model,
-        "areas": summary_areas,
-    }
-    if extra:
-        summary.update(extra)
-    (out_root / "_summary.json").write_text(json.dumps(summary, indent=2))
-
-    md_lines = [
-        f"# luce-bench sweep — {name}",
-        "",
-        f"- url:   `{url}`",
-        f"- model: `{model}`",
-        f"- lucebench v{__version__}",
-        "",
-        "| area | n | pass | rate | wall_total | wall_median |",
-        "|------|---|------|------|------------|-------------|",
-    ]
-    for a in summary_areas:
-        md_lines.append(
-            f"| {a['area']} | {a['n']} | {a['pass']} | "
-            f"{a['rate']:.1f}% | {a['wall_total']:.0f}s | {a['wall_median']:.1f}s |"
-        )
-    (out_root / "_summary.md").write_text("\n".join(md_lines) + "\n")
-    return summary
-
-
-def _run_sweep(args) -> int:
-    """Run every stdlib area in sequence, write per-area + combined JSON.
-
-    Layout:
-        <out_dir>/<name>/
-            ds4-eval.json
-            code.json
-            longctx.json
-            agent.json
-            forge.json       # only when [forge] is installed; skipped with a hint otherwise
-            _summary.json    # {areas: [{area, n, pass, rate, wall_s}, ...]}
-            _summary.md
-    """
-    import datetime as _dt
-
-    name = args.name or _dt.date.today().isoformat() + "-sweep"
-    out_root = args.out_dir / name
-    out_root.mkdir(parents=True, exist_ok=True)
-
-    # The set of areas to run is supplied by main() in args.areas_list
-    # (computed from --areas, with back-compat for --area).
-    sweep_areas = list(args.areas_list)
-    forge_ok, forge_reason = _forge_available()
-    auth_header = ""
-    if args.auth_env:
-        token = os.environ.get(args.auth_env, "")
-        if not token:
-            print(f"--auth-env {args.auth_env}: env var is empty or unset", file=sys.stderr)
-            return 2
-        auth_header = f"Bearer {token}"
-
-    print(
-        f"[lucebench] sweep name={name} "
-        f"areas={','.join(sweep_areas)} url={args.url} model={args.model} "
-        f"out={out_root}",
-        flush=True,
-    )
-
-    if "forge" in sweep_areas and not forge_ok:
-        print(
-            f"[lucebench] forge: skipped — {forge_reason}",
-            file=sys.stderr,
-            flush=True,
-        )
-        sweep_areas = [a for a in sweep_areas if a != "forge"]
-
-    summary_areas: list[dict[str, Any]] = []
-    for area in sweep_areas:
-        if area == "forge":
-            row = _run_forge_area_to_dir(
-                out_root=out_root,
-                url=args.url,
-                model=args.model,
-                auth_header=auth_header,
-                timeout=args.timeout,
-                max_tokens=args.max_tokens,
-                questions=args.questions,
-            )
-            if row is not None:
-                summary_areas.append(row)
-            continue
-        if area == "agent_recorded":
-            row, aborted = _run_agent_recorded_to_dir(
-                out_root=out_root,
-                url=args.url,
-                model=args.model,
-                auth_header=auth_header,
-                timeout=args.timeout,
-                max_tokens=args.max_tokens,
-                questions=args.questions,
-                restart_between_cases=getattr(
-                    args, "agent_recorded_restart", True
-                ),
-                replay_mode=getattr(args, "agent_recorded_replay_mode", "sequential"),
-            )
-            if aborted:
-                return 3
-            if row is not None:
-                summary_areas.append(row)
-            continue
-
-        row, aborted = _run_standard_area_to_dir(
-            area,
-            out_root=out_root,
-            url=args.url,
-            model=args.model,
-            auth_header=auth_header,
-            timeout=args.timeout,
-            max_tokens=args.max_tokens,
-            think=args.think,
-            sampling=getattr(args, "sampling", {}),
-            sampling_source=getattr(args, "sampling_source", "none"),
-            questions=args.questions,
-            no_fail_fast=args.no_fail_fast,
-            prompt_thinking_control=getattr(args, "prompt_thinking_control", "off"),
-            server_honors_api_flags=getattr(args, "server_honors_api_flags", False),
-            reasoning_effort=getattr(args, "reasoning_effort", "high"),
-            thinking_budget_tokens=getattr(args, "thinking_budget_tokens", None),
-            client_thinking_budget=getattr(args, "client_thinking_budget", None),
-            model_card=getattr(args, "resolved_card", None),
-            card_source=getattr(args, "card_source", None),
-            card_stem=getattr(args, "card_stem", None),
-        )
-        if aborted:
-            return 3
-        if row is not None:
-            summary_areas.append(row)
-
-    summary = write_sweep_summary(
-        out_root,
-        name=name,
-        url=args.url,
-        model=args.model,
-        summary_areas=summary_areas,
-    )
-
-    md_text = (out_root / "_summary.md").read_text()
-    print(f"\n[lucebench] sweep complete → {out_root}", flush=True)
-    print(md_text.rstrip(), flush=True)
-    del summary  # silence "assigned but never used" for the JSON payload
-    return 0
 
 
 def main() -> int:
@@ -1394,11 +577,7 @@ def main() -> int:
     # safe to pipe (`lucebench --list-models | head -5`). Exits 0 when
     # one or more ids came back, 1 when /v1/models was empty / malformed.
     if args.list_models:
-        auth_header = ""
-        if args.auth_env:
-            token = os.environ.get(args.auth_env, "")
-            if token:
-                auth_header = f"Bearer {token}"
+        auth_header = _resolve_auth_header(args, on_empty="ignore")
         _chosen, models = list_models(args.url, auth_header=auth_header)
         if not models:
             print(
@@ -1470,11 +649,7 @@ def main() -> int:
     # per-case loop and burn ~92 timeouts on a typo'd --url; preflight
     # surfaces "connection refused" in ~50ms with a one-line diagnostic.
     # Skip when --no-preflight is set (chaos tests, intentional-failure CI).
-    auth_for_probe = ""
-    if args.auth_env:
-        token = os.environ.get(args.auth_env, "")
-        if token:
-            auth_for_probe = f"Bearer {token}"
+    auth_for_probe = _resolve_auth_header(args, on_empty="ignore")
 
     server_honors_api_flags = False
     props_model_card: dict[str, Any] | None = None
@@ -1575,6 +750,8 @@ def main() -> int:
     # summary under <out-dir>/<name>/. Single-area runs use the slimmer
     # in-place path below (single JSON-out, no snapshot dir).
     if len(args.areas_list) > 1:
+        from lucebench._orchestrate import _run_sweep
+
         return _run_sweep(args)
 
     # Single area from here on — alias into args.area so the existing
@@ -1588,12 +765,10 @@ def main() -> int:
         from lucebench.areas.agent_recorded import run_agent_recorded_area
 
         max_tokens_eff = args.max_tokens if args.max_tokens is not None else 512
-        auth_header = ""
-        if args.auth_env:
-            token = os.environ.get(args.auth_env, "")
-            if not token:
-                ap.error(f"--auth-env {args.auth_env}: env var is empty or unset")
-            auth_header = f"Bearer {token}"
+        try:
+            auth_header = _resolve_auth_header(args, on_empty="error")
+        except _AuthEnvEmpty as e:
+            ap.error(str(e))
         try:
             rows, summary = run_agent_recorded_area(
                 url=args.url,
@@ -1640,19 +815,13 @@ def main() -> int:
         )
         if args.json_out:
             args.json_out.parent.mkdir(parents=True, exist_ok=True)
-            args.json_out.write_text(
-                json.dumps(
-                    {
-                        "lucebench_version": __version__,
-                        "area": "agent_recorded",
-                        "url": args.url,
-                        "model": args.model,
-                        **summary,
-                        "rows": rows,
-                    },
-                    indent=2,
-                    default=str,
-                )
+            _write_area_json(
+                args.json_out,
+                area="agent_recorded",
+                url=args.url,
+                model=args.model,
+                summary=summary,
+                rows=rows,
             )
             print(f"[lucebench] wrote {len(rows)} rows to {args.json_out}", flush=True)
         return 0
@@ -1664,12 +833,10 @@ def main() -> int:
         from lucebench.areas.forge import run_forge_area
 
         max_tokens = args.max_tokens if args.max_tokens is not None else 4096
-        auth_header = ""
-        if args.auth_env:
-            token = os.environ.get(args.auth_env, "")
-            if not token:
-                ap.error(f"--auth-env {args.auth_env}: env var is empty or unset")
-            auth_header = f"Bearer {token}"
+        try:
+            auth_header = _resolve_auth_header(args, on_empty="error")
+        except _AuthEnvEmpty as e:
+            ap.error(str(e))
         rows, summary = run_forge_area(
             url=args.url,
             model=args.model,
@@ -1695,19 +862,13 @@ def main() -> int:
         )
         if args.json_out:
             args.json_out.parent.mkdir(parents=True, exist_ok=True)
-            args.json_out.write_text(
-                json.dumps(
-                    {
-                        "lucebench_version": __version__,
-                        "area": "forge",
-                        "url": args.url,
-                        "model": args.model,
-                        **summary,
-                        "rows": rows,
-                    },
-                    indent=2,
-                    default=str,
-                )
+            _write_area_json(
+                args.json_out,
+                area="forge",
+                url=args.url,
+                model=args.model,
+                summary=summary,
+                rows=rows,
             )
             print(f"[lucebench] wrote {len(rows)} rows to {args.json_out}", flush=True)
         return 0
@@ -1728,12 +889,10 @@ def main() -> int:
     max_tokens = args.max_tokens if args.max_tokens is not None else cfg["default_max_tokens"]
     think = args.think if args.think is not None else cfg["default_thinking"]
 
-    auth_header = ""
-    if args.auth_env:
-        token = os.environ.get(args.auth_env, "")
-        if not token:
-            ap.error(f"--auth-env {args.auth_env}: env var is empty or unset")
-        auth_header = f"Bearer {token}"
+    try:
+        auth_header = _resolve_auth_header(args, on_empty="error")
+    except _AuthEnvEmpty as e:
+        ap.error(str(e))
 
     print(
         f"[lucebench] area={args.area} cases={len(selected)} "
@@ -1844,10 +1003,7 @@ def main() -> int:
         # Drop the raw _response blob + the per-row _thinking_injection
         # echo (it's the same on every row; the top-level summary is what
         # consumers read) from JSON-out by default to keep file size sane.
-        terse = [
-            {k: v for k, v in r.items() if k not in {"_response", "_thinking_injection"}}
-            for r in rows
-        ]
+        terse = _terse_rows(rows)
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(
             json.dumps(
@@ -1873,6 +1029,32 @@ def main() -> int:
         print(f"[lucebench] wrote {len(rows)} rows to {args.json_out}", flush=True)
 
     return 0 if pass_n == len(rows) or os.environ.get("LUCEBENCH_PASS_RATE_GATE") is None else 1
+
+
+# Run-orchestration functions live in lucebench._orchestrate to keep this
+# module focused on arg-parse + dispatch. They depend on the shared helpers
+# defined above, so _orchestrate imports back from cli — a two-way
+# dependency. To avoid a circular import at module load we resolve the names
+# lazily via PEP 562 __getattr__: ``from lucebench.cli import _run_sweep``
+# (snapshot.py, tests, main()) still works, but the _orchestrate module is
+# only pulled in on first access, after cli has finished initialising.
+_ORCHESTRATION_EXPORTS = frozenset(
+    {
+        "_run_forge_area_to_dir",
+        "_run_agent_recorded_to_dir",
+        "_run_standard_area_to_dir",
+        "write_sweep_summary",
+        "_run_sweep",
+    }
+)
+
+
+def __getattr__(name: str) -> Any:
+    if name in _ORCHESTRATION_EXPORTS:
+        import lucebench._orchestrate as _orch
+
+        return getattr(_orch, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 if __name__ == "__main__":

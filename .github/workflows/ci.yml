@@ -37,6 +37,12 @@ jobs:
       - name: Verify bundled model cards match share/ (drift guard)
         run: bash scripts/check_card_bundle_drift.sh
 
+      - name: Unit-test luce-bench harness
+        # luce-bench is a standalone package (not a workspace member) with its
+        # own dev extra and lockfile. The suite mocks the OpenAI/Anthropic
+        # surfaces, so it needs no model, server, or API key.
+        run: uv run --directory luce-bench --frozen --extra dev pytest -q
+
   build:
     name: Build (cmake + uv sync --extra megakernel)
     runs-on: ubuntu-latest

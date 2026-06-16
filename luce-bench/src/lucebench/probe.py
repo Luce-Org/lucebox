@@ -257,7 +257,10 @@ def main() -> int:
         "case_id": args.case_id,
         "model": args.model,
         "url": args.url,
-        "run_at": _dt.datetime.utcnow().isoformat() + "Z",
+        # tz-aware UTC, rendered naive + "Z" to match the prior utcnow() output
+        # (utcnow() is deprecated as of 3.12).
+        "run_at": _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None).isoformat()
+        + "Z",
         "rows": rows,
     }
     (out / "_summary.json").write_text(json.dumps(summary, indent=2))
