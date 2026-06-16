@@ -113,6 +113,9 @@ bool Qwen35LayerSplitAdapter::init() {
     disk_snapshot_buffers_.assign(PREFIX_SLOTS, nullptr);
     disk_snapshot_backends_.assign(PREFIX_SLOTS, nullptr);
     draft_feature_snapshots_.resize(PREFIX_SLOTS);
+    if (kvflash_active()) {
+        kvflash_history_snapshots_.resize(PREFIX_SLOTS);
+    }
 
     return true;
 }
@@ -203,7 +206,7 @@ bool Qwen35LayerSplitAdapter::kvflash_attach() {
 
 bool Qwen35LayerSplitAdapter::kvflash_sync_identity(int committed) {
     if (!kvflash_active()) return true;
-    if (committed > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
+    if (committed > kvflash_tokens_) {
         std::fprintf(stderr,
             "[target-split][kvflash] prefix (%d) exceeds resident pool %d\n",
             committed, kvflash_tokens_);
@@ -968,7 +971,7 @@ bool Qwen35LayerSplitAdapter::snapshot_adopt(int slot,
     }
     if (!mixed_target_split && kvflash_active() &&
         kvflash_history_snapshots_.size() != (size_t)PREFIX_SLOTS) {
-        return false;
+        kvflash_history_snapshots_.resize(PREFIX_SLOTS);
     }
 
     ggml_tensor * logits_tensor = nullptr;

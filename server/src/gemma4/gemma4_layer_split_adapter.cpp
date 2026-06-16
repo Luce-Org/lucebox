@@ -65,9 +65,11 @@ static bool gemma4_align_split_for_kv_sharing(
     const int kv_source_layer = kv_sharing_start - 1;
     if (kv_source_layer <= 0) return true;
     for (size_t i = 0; i + 1 < shards.size(); ++i) {
-        if (shards[i].layer_end > kv_source_layer) {
+        if (shards[i].layer_begin < kv_source_layer &&
+            shards[i].layer_end > kv_source_layer) {
             shards[i].layer_end = kv_source_layer;
             shards[i + 1].layer_begin = kv_source_layer;
+            break;
         }
     }
     for (const auto & shard : shards) {
@@ -260,7 +262,7 @@ bool Gemma4LayerSplitAdapter::kvflash_attach() {
 
 bool Gemma4LayerSplitAdapter::kvflash_sync_identity(int committed) {
     if (!kvflash_active()) return true;
-    if (committed > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
+    if (committed > kvflash_tokens_) {
         std::fprintf(stderr,
             "[gemma4-target-split][kvflash] prefix (%d) exceeds resident pool %d\n",
             committed, kvflash_tokens_);
