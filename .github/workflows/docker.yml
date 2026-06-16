@@ -196,6 +196,13 @@ jobs:
           # until someone can test them.
           DFLASH_HIP_ARCHES: ${{ github.event_name == 'pull_request' && 'gfx1151' || 'gfx1151;gfx1100;gfx1200' }}
         with:
+          # bake-action v6+ defaults `source` to the remote git context, which
+          # makes the local metadata-action bake-file (written to the runner
+          # temp dir) unresolvable: bake fails with
+          # `lstat .../docker-metadata-action-bake.json: no such file`.
+          # Pin source to the checked-out workspace so the local
+          # `${{ steps.meta.outputs.bake-file }}` path resolves under v7+.
+          source: .
           files: |
             docker-bake.hcl
             ${{ steps.meta.outputs.bake-file }}
