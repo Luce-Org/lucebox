@@ -262,7 +262,7 @@ bool Gemma4LayerSplitAdapter::kvflash_attach() {
 
 bool Gemma4LayerSplitAdapter::kvflash_sync_identity(int committed) {
     if (!kvflash_active()) return true;
-    if (committed > kvflash_tokens_) {
+    if (committed > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
         std::fprintf(stderr,
             "[gemma4-target-split][kvflash] prefix (%d) exceeds resident pool %d\n",
             committed, kvflash_tokens_);
