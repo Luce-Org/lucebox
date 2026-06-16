@@ -269,6 +269,7 @@ using dflash::common::free_qwen35_layer_split_shards;
 // ─── Speculative decode — generic loop in common/, qwen35 layer-split adapter.
 #include "qwen35_layer_split_dflash_target.h"
 #include "common/dflash_spec_decode.h"
+#include "common/gguf_mmap.h"
 using dflash::common::is_eos_tok;
 
 // ─── Layer-split daemon — extracted to src/qwen35/layer_split_daemon.{h,cpp} ─
@@ -1619,19 +1620,14 @@ int main(int argc, char ** argv) {
                 if (!gctx) {
                     std::fprintf(stderr, "[time-breakdown] failed to re-open GGUF for hybrid\n");
                 } else {
-                    int fd = ::open(target_path, O_RDONLY);
-                    struct stat st_buf;
-                    bool mmap_ok = (fd >= 0 && ::fstat(fd, &st_buf) == 0);
-                    void * mmap_addr = mmap_ok
-                        ? ::mmap(nullptr, (size_t)st_buf.st_size, PROT_READ, MAP_PRIVATE, fd, 0)
-                        : MAP_FAILED;
-                    if (fd >= 0) ::close(fd);
-
-                    if (mmap_addr == MAP_FAILED) {
-                        std::fprintf(stderr, "[time-breakdown] mmap failed for hybrid\n");
+                    dflash::common::GgufMmap _mf;
+                    std::string _mferr;
+                    if (!_mf.open(target_path, _mferr)) {
+                        std::fprintf(stderr, "[time-breakdown] mmap failed for hybrid: %s\n", _mferr.c_str());
                         gguf_free(gctx);
                     } else {
-                        const size_t file_size = (size_t)st_buf.st_size;
+                        const size_t file_size = _mf.size();
+                        const void * mmap_addr = _mf.data();
                         const size_t data_start = gguf_get_data_offset(gctx);
                         const auto * file_bytes = (const uint8_t *)mmap_addr;
 
@@ -1973,7 +1969,6 @@ int main(int argc, char ** argv) {
                             }
                         }
 
-                        ::munmap(mmap_addr, file_size);
                         gguf_free(gctx);
                     }
                 }

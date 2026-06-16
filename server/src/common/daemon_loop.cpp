@@ -8,9 +8,12 @@
 #include "sampler.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -65,23 +68,45 @@ ModelBackend::CompressResult ModelBackend::compress(const CompressRequest & req)
     if (req.input_ids.empty()) return result;
 
     // Write input IDs to temp file (handle_compress reads from file)
-    char tmp_path[] = "/tmp/pflash_XXXXXX.bin";
-    int tmp_fd = mkstemps(tmp_path, 4);
-    if (tmp_fd < 0) return result;
     const size_t to_write = req.input_ids.size() * sizeof(int32_t);
-    const char *src = reinterpret_cast<const char *>(req.input_ids.data());
-    size_t remaining = to_write;
-    while (remaining > 0) {
-        ssize_t n = ::write(tmp_fd, src, remaining);
-        if (n <= 0) {
-            ::close(tmp_fd);
-            ::unlink(tmp_path);
-            return result;
-        }
-        src += n;
-        remaining -= (size_t)n;
+    std::string tmp_path;
+#if defined(_WIN32)
+    {
+        static std::atomic<unsigned long long> ctr{0};
+        const auto uniq =
+            std::to_string((unsigned long long)
+                std::chrono::steady_clock::now().time_since_epoch().count()) +
+            "_" + std::to_string(ctr++);
+        std::filesystem::path p =
+            std::filesystem::temp_directory_path() / ("pflash_" + uniq + ".bin");
+        tmp_path = p.string();
+        FILE * f = std::fopen(tmp_path.c_str(), "wb");
+        if (!f) return result;
+        const size_t w = std::fwrite(req.input_ids.data(), 1, to_write, f);
+        std::fclose(f);
+        if (w != to_write) { std::remove(tmp_path.c_str()); return result; }
     }
-    ::close(tmp_fd);
+#else
+    {
+        char tmpl[] = "/tmp/pflash_XXXXXX.bin";
+        int tmp_fd = mkstemps(tmpl, 4);
+        if (tmp_fd < 0) return result;
+        tmp_path = tmpl;
+        const char *src = reinterpret_cast<const char *>(req.input_ids.data());
+        size_t remaining = to_write;
+        while (remaining > 0) {
+            ssize_t n = ::write(tmp_fd, src, remaining);
+            if (n <= 0) {
+                ::close(tmp_fd);
+                ::unlink(tmp_path.c_str());
+                return result;
+            }
+            src += n;
+            remaining -= (size_t)n;
+        }
+        ::close(tmp_fd);
+    }
+#endif
 
     // Build collecting DaemonIO
     DaemonIO io;
@@ -98,7 +123,7 @@ ModelBackend::CompressResult ModelBackend::compress(const CompressRequest & req)
     if (req.skip_park) cmd += " nopark";
 
     result.ok = handle_compress(cmd, io) && !result.compressed_ids.empty();
-    ::unlink(tmp_path);
+    std::remove(tmp_path.c_str());
     return result;
 }
 
