@@ -201,7 +201,7 @@ bool LagunaLayerSplitAdapter::kvflash_attach() {
 
 bool LagunaLayerSplitAdapter::kvflash_sync_identity(int committed) {
     if (!kvflash_active()) return true;
-    if (committed > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
+    if (committed > kvflash_tokens_) {
         std::fprintf(stderr,
             "[laguna-target-split][kvflash] prefix (%d) exceeds resident pool %d\n",
             committed, kvflash_tokens_);
