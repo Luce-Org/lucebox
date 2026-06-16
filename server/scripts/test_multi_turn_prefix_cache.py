@@ -53,7 +53,7 @@ def spawn_server():
         [str(server_bin), str(target),
          "--draft", str(draft),
          "--max-ctx", "8192", "--port", str(port),
-         "--prefix-cache-slots", "4"],
+         "--cache-ram", "256MiB", "--cache-prefill-ram", "0"],
         stdout=log, stderr=subprocess.STDOUT, bufsize=1,
     )
 

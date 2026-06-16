@@ -29,7 +29,7 @@ Request 2: [system + user1 + assistant1 + user2 + assistant2 + user3]
 │  • detect chat boundaries via ChatMarkers               │
 │  • SHA-1 hash prefix at each boundary                   │
 │  • LRU eviction when cap is reached                     │
-│  • Two tiers: inline prefix + full-compress             │
+│  • Two RAM pools: inline prefix + exact prefill         │
 └────────────────────────┬────────────────────────────────┘
                          │ snapshot_save / restore_and_generate
                          ▼
@@ -41,7 +41,7 @@ Request 2: [system + user1 + assistant1 + user2 + assistant2 + user3]
 └─────────────────────────────────────────────────────────┘
 ```
 
-## Two-Tier Caching
+## Cache Pools
 
 ### Tier 1: Inline Prefix Cache
 
@@ -55,14 +55,23 @@ token sequences.
 - **confirm_inline_snap()**: Commits the entry after successful save.
 - LRU eviction: oldest entry's slot is reused when capacity is reached.
 
-### Tier 2: Full-Compress Cache
+### Tier 2: Exact Prefill Cache
 
 Caches the **entire post-compression KV state**, keyed on the raw
 (pre-compression) prompt. Hits skip both PFlash compression and prefill
-entirely — the fastest path.
+entirely -- the fastest path for repeated prompts.
 
 - Separate slot pool starting at `cap` (inline slots are `[0, cap)`).
 - Keyed on SHA-1 of the full raw prompt (not just a prefix).
+
+The two cache kinds are intentionally separate:
+
+- `prefix` controls turn-boundary prefix snapshots.
+- `prefill` controls exact full-prompt snapshots.
+
+Each kind can have an independent RAM and disk budget. Snapshot handles are
+still used internally by the backend, but operators configure byte budgets
+rather than handle counts.
 
 ## Snapshot Memory Management
 
@@ -170,25 +179,90 @@ free_snapshot_backend(snap_backend_, compute_backend_);  // then backend
 
 | Server flag | Default | Description |
 |-------------|---------|-------------|
-| `--prefix-cache-cap N` | 32 | Max inline prefix cache slots |
-| `--prefix-cache-full N` | 0 | Max full-compress cache slots |
-| `--skip-park` | false | Skip parking draft model during compress |
+| `--cache-ram SIZE` | 1GiB | Unified RAM budget; split automatically between prefix and exact prefill pools |
+| `--kv-cache-dir PATH` / `--cache-dir PATH` | unset | Root directory for disk cache pools |
+| `--cache-disk SIZE` | 16GiB | Unified disk budget when a cache directory is set |
+| `--cache-prefix-ram SIZE` | auto | Advanced override for turn-boundary prefix RAM pool |
+| `--cache-prefill-ram SIZE` | auto | Advanced override for exact full-prompt RAM pool |
+| `--cache-prefix-disk SIZE` | auto | Advanced override for turn-boundary prefix disk pool |
+| `--cache-prefill-disk SIZE` | auto | Advanced override for exact full-prompt disk pool |
+| `--prefill-skip-park` | false | Skip parking draft model during compress |
 
-### Choosing `--prefix-cache-cap`
+Disk budgets are active only when `--kv-cache-dir` or `--cache-dir` is set.
+The server warns and reports disk budgets as disabled when disk-size flags are
+provided without a cache directory. Disk pool sizes follow the same total and
+split override rules as RAM: `--cache-disk` is the unified total, a single
+`--cache-prefix-disk` or `--cache-prefill-disk` keeps the other disk pool at
+its default slice, and setting both split pools makes their sum the total.
+
+Deprecated compatibility aliases:
+
+| Server flag | Replacement |
+|-------------|-------------|
+| `--prefix-cache-slots N` | `--cache-prefix-ram N*64MiB` |
+| `--prefill-cache-slots N` | `--cache-prefill-ram N*64MiB` |
+| `--kv-cache-budget N` | `--cache-prefix-disk NMiB` |
+
+When one of these aliases is used by itself, the server preserves legacy
+behavior: `--prefix-cache-slots 0` disables RAM snapshots instead of moving the
+default budget to exact prefill, and `--kv-cache-budget N` caps the legacy
+prefix-disk pool without allocating an additional default prefill-disk pool.
+Combine aliases with the unified `--cache-ram` or `--cache-disk` total only
+when you want the sibling pool to receive the remaining budget.
+
+### Choosing RAM Budgets
 
 With right-sized, CPU-resident snapshots the limiting resource is **system RAM**,
-not VRAM. Each slot costs approximately `cur_pos × 5 KB` (for Qwen3.5-27B Q8_0 KV),
-so 32 slots with an average prefix of 2000 tokens ≈ 320 MB of system RAM — negligible
-on most workstations.
+not VRAM. Cache budgets are enforced against the actual snapshot byte size
+reported by the backend after save. If a snapshot is larger than its configured
+pool, it is evicted immediately and the next identical request will not hit.
 
-| Scenario | Typical prefix length | Recommended cap |
-|----------|----------------------|-----------------|
-| Single-user chat | 200–2000 tokens | 16–32 |
-| Multi-session agent | 500–5000 tokens | 32–64 |
-| Batch / benchmark | N/A (cold starts) | 4 |
+Use `--cache-ram` for normal operation. The default `1GiB` split keeps prefix
+reuse cheap (`256MiB`) and gives the rest to exact repeated prompts, which is
+where whole-prompt benchmark and agent-loop speedups usually come from. Set
+`--cache-ram 0` to disable RAM snapshots completely. The split flags are for
+advanced experiments and diagnostics.
 
-The hard limit is `MAX_SLOTS = 64`. Beyond that, increase the constant in
-`prefix_cache.h` and `model_backend.h`.
+A single split override without `--cache-ram` keeps the other pool at its
+default slice and grows or shrinks the total automatically. For example,
+`--cache-prefix-ram 2GiB` resolves to 2GiB prefix RAM plus the default 768MiB
+exact-prefill RAM. When `--cache-ram` is also set, the explicit total is a hard
+ceiling and the sibling pool receives only the remaining bytes. When both split
+pools are set, their sum is the total and `--cache-ram` is ignored.
+
+These knobs do not reserve extra GPU KV capacity. They control RAM/disk
+snapshots; GPU VRAM pressure is mostly a function of context length, KV dtype,
+model placement, and draft residency.
+
+Inline prefix snapshots are usually small because they are taken at turn
+boundaries. Exact prefill snapshots cover the full effective prompt and can be
+hundreds of MiB for multi-thousand-token Qwen3.6 prompts, so size the prefill
+pool for the largest repeated prompt you want to retain.
+
+| Scenario | Recommended `--cache-ram` | Notes |
+|----------|---------------------------|-------|
+| Minimal RAM / no RAM snapshots | 0 | Disk cache can still be enabled with `--kv-cache-dir` |
+| Single-user chat | 512MiB-1GiB | Keeps a few prefix turns and one medium exact prompt |
+| Multi-session agent | 1GiB-4GiB | Default 1GiB is the low-RAM starting point |
+| Repeated long prompts | 2GiB+ | Exact prefill snapshots must fit in the resolved prefill pool |
+
+When you need to isolate a pool for testing, use one split override with the
+unified total. For example, `--cache-ram 1GiB --cache-prefix-ram 0` gives the
+whole RAM budget to exact prefill, while
+`--cache-ram 256MiB --cache-prefill-ram 0` gives the whole RAM budget to
+turn-boundary prefix reuse.
+
+When both RAM pools are enabled, cold misses do not require the operator to
+choose a cache kind. The server alternates future snapshot targets between
+exact prefill and prefix snapshots whenever both are viable; exact repeated
+prompts get a full-prompt hit, while multi-turn chat/agent workloads still
+teach the prefix cache.
+
+The backend still has a finite snapshot-handle table. The server derives
+internal handle counts from RAM budgets using a conservative 64MiB-per-handle
+estimate, then enforces the configured byte budget with LRU eviction after
+snapshot save. Slot 63 is reserved for disk-cache staging, so very large RAM
+budgets are capped by both bytes and the remaining 63 snapshot handles.
 
 ## File Map
 

@@ -271,7 +271,7 @@ DFLASH27B_KV_TQ3=1 \
 | `DFLASH_FP_ALPHA=0.85` | `0.12` | Block-selection threshold; higher = stricter = fewer K-blocks |
 | `DFLASH_FP_PROFILE=1` | `0` | Per-stage timing log |
 
-When compression is on, the request path picks one of three modes automatically, so they never stack: the first turn is sent verbatim (the system prompt stays as a stable cache anchor), multi-turn continuations use **FlowKV** (only the aged history is compressed, recent turns kept verbatim, so the disk prefix cache from `--prefix-cache-slots` keeps hitting), and a single oversized prompt with no prior turns uses whole-prompt PFlash. With `--prefill-compression off` the request path is identical to a build without compression.
+When compression is on, the request path picks one of three modes automatically, so they never stack: the first turn is sent verbatim (the system prompt stays as a stable cache anchor), multi-turn continuations use **FlowKV** (only the aged history is compressed, recent turns kept verbatim, so the prefix cache keeps hitting), and a single oversized prompt with no prior turns uses whole-prompt PFlash. With `--prefill-compression off` the request path is identical to a build without compression.
 
 **KV cache**
 
@@ -280,9 +280,28 @@ When compression is on, the request path picks one of three modes automatically,
 | `--cache-type-k <t>` / `--cache-type-v <t>` | env-driven | Per-side quant override: `f16,bf16,q4_0,q4_1,q5_0,q5_1,q8_0,tq3_0` |
 | `DFLASH27B_KV_TQ3=1` | (default) | Preset TQ3_0 K+V (3.5 bpv, fits 256K @ 24 GB) |
 | `DFLASH27B_KV_Q4=1` | off | Q4_0 K+V (4.5 bpv, legacy, ~128K ceiling) |
-| `--prefix-cache-slots N` | — | Live prefix-cache slot count |
-| `--kv-cache-dir <path>` | — | Persist prefix cache to disk |
-| `--kv-cache-budget N` | — | On-disk cache size cap |
+| `--cache-ram <size>` / `DFLASH_CACHE_RAM` | `1GiB` | Unified RAM cache budget; split automatically between prefix and exact prefill pools |
+| `--kv-cache-dir <path>` / `--cache-dir <path>` | — | Enable disk cache pools |
+| `--cache-disk <size>` / `DFLASH_CACHE_DISK` | `16GiB` | Unified disk cache budget when a cache dir is set |
+| `--cache-prefix-ram <size>` | auto | Advanced override for turn-boundary prefix RAM pool |
+| `--cache-prefill-ram <size>` | auto | Advanced override for exact full-prompt RAM pool |
+| `--cache-prefix-disk <size>` | auto | Advanced override for turn-boundary prefix disk pool |
+| `--cache-prefill-disk <size>` | auto | Advanced override for exact full-prompt disk pool |
+
+Cache sizes are hard byte budgets. By default `--cache-ram 1GiB` reserves
+256MiB for turn-boundary prefix reuse and the remainder for exact repeated
+prompts; `--cache-disk 16GiB` reserves 4GiB for prefix snapshots and the
+remainder for exact prefill snapshots. A snapshot larger than its pool is
+evicted immediately. The request path chooses exact prefill, prefix, or disk
+reuse automatically. These budgets are for RAM/disk snapshots; GPU VRAM use is
+still governed mainly by context length, KV dtype, model placement, and draft
+residency.
+
+Advanced split overrides (`--cache-prefix-*`, `--cache-prefill-*`) can be used
+alone to resize one pool while keeping the other at its default slice, or with
+`--cache-ram` / `--cache-disk` to split a fixed total. Deprecated slot and
+disk-budget aliases preserve their legacy single-pool behavior when used by
+themselves.
 
 **Bounded KV residency (KVFlash)**
 

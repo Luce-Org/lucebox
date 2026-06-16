@@ -2499,6 +2499,28 @@ static void test_disk_cache_budget_enforcement_scoring() {
     TEST_ASSERT(score_b_ancient > score_a);
 }
 
+static void test_cache_size_parse_units() {
+    size_t out = 0;
+    TEST_ASSERT(parse_cache_size_bytes("0", out) && out == 0);
+    TEST_ASSERT(parse_cache_size_bytes("128MiB", out) &&
+                out == (size_t)128 * 1024 * 1024);
+    TEST_ASSERT(parse_cache_size_bytes("1.5GiB", out) &&
+                out == (size_t)1536 * 1024 * 1024);
+    TEST_ASSERT(parse_cache_size_bytes("64mb", out) &&
+                out == (size_t)64 * 1024 * 1024);
+    TEST_ASSERT(!parse_cache_size_bytes("-1GiB", out));
+    TEST_ASSERT(!parse_cache_size_bytes("12parsecs", out));
+}
+
+static void test_cache_slots_from_budget() {
+    TEST_ASSERT(cache_slots_for_ram_budget(0) == 0);
+    TEST_ASSERT(cache_slots_for_ram_budget(1) == 1);
+    TEST_ASSERT(cache_slots_for_ram_budget(kCacheRamSlotEstimateBytes) == 1);
+    TEST_ASSERT(cache_slots_for_ram_budget(kCacheRamSlotEstimateBytes + 1) == 2);
+    TEST_ASSERT(cache_slots_for_ram_budget((size_t)4096 * 1024 * 1024) ==
+                kCacheMaxRamSlots);
+}
+
 static void test_disk_cache_lookup_miss_no_layout() {
     // Lookup with no layout known should return false.
     MockBackend backend;
@@ -3280,6 +3302,119 @@ static void test_props_runtime_shape() {
     TEST_ASSERT(body["runtime"]["draft_device"].is_null());
 }
 
+static void test_props_cache_budget_shape() {
+    ServerConfig cfg = make_props_config_with_sidecar(json{
+        {"name", "Qwen3.6 27B"},
+        {"source", "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens", 32768},
+    });
+    cfg.prefix_cache_ram_bytes = (size_t)512 * 1024 * 1024;
+    cfg.prefill_cache_ram_bytes = (size_t)256 * 1024 * 1024;
+    cfg.prefix_cache_disk_bytes = (size_t)8 * 1024 * 1024 * 1024;
+    cfg.prefill_cache_disk_bytes = (size_t)4 * 1024 * 1024 * 1024;
+    cfg.cache_ram_bytes = cfg.prefix_cache_ram_bytes + cfg.prefill_cache_ram_bytes;
+    cfg.cache_disk_bytes = cfg.prefix_cache_disk_bytes + cfg.prefill_cache_disk_bytes;
+    cfg.disk_cache_dir = "/tmp/dflash_props_cache_budget_shape";
+
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+    json body = build_props_body(cfg, pc, tm, 1234567);
+
+    TEST_ASSERT(body.contains("cache"));
+    TEST_ASSERT(body["cache"]["ram_budget_bytes"].get<int64_t>() ==
+                (int64_t)cfg.cache_ram_bytes);
+    TEST_ASSERT(body["cache"]["disk_budget_bytes"].get<int64_t>() ==
+                (int64_t)cfg.cache_disk_bytes);
+    TEST_ASSERT(body["cache"]["prefix"]["ram_budget_bytes"].get<int64_t>() ==
+                (int64_t)cfg.prefix_cache_ram_bytes);
+    TEST_ASSERT(body["cache"]["prefill"]["ram_budget_bytes"].get<int64_t>() ==
+                (int64_t)cfg.prefill_cache_ram_bytes);
+    TEST_ASSERT(body["cache"]["prefix"]["disk_budget_bytes"].get<int64_t>() ==
+                (int64_t)cfg.prefix_cache_disk_bytes);
+    TEST_ASSERT(body["cache"]["prefill"]["disk_budget_bytes"].get<int64_t>() ==
+                (int64_t)cfg.prefill_cache_disk_bytes);
+    TEST_ASSERT(body["cache"]["prefill"]["disk_bytes"].get<int64_t>() == 1234567);
+    TEST_ASSERT(body["prefix_cache"]["ram_budget_bytes"].is_number_integer());
+    TEST_ASSERT(body["full_cache"]["disk_budget_bytes"].get<int64_t>() ==
+                (int64_t)cfg.prefill_cache_disk_bytes);
+    TEST_ASSERT(body["full_cache"]["disk_bytes"].get<int64_t>() == 1234567);
+
+    cfg.disk_cache_dir.clear();
+    body = build_props_body(cfg, pc, tm, 0);
+    TEST_ASSERT(body["cache"]["disk_budget_bytes"].get<int64_t>() == 0);
+    TEST_ASSERT(body["cache"]["prefix"]["disk_budget_bytes"].get<int64_t>() == 0);
+    TEST_ASSERT(body["cache"]["prefill"]["disk_budget_bytes"].get<int64_t>() == 0);
+}
+
+static void test_cache_budget_defaults_and_overrides() {
+    CachePoolBudgets b = split_cache_budget(kDefaultCacheRamBytes,
+                                            kDefaultCachePrefixRamBytes);
+    TEST_ASSERT(b.prefix_bytes == kDefaultCachePrefixRamBytes);
+    TEST_ASSERT(b.prefill_bytes == kDefaultCachePrefillRamBytes);
+
+    b = split_cache_budget((size_t)128 * 1024 * 1024,
+                           kDefaultCachePrefixRamBytes);
+    TEST_ASSERT(b.prefix_bytes == (size_t)128 * 1024 * 1024);
+    TEST_ASSERT(b.prefill_bytes == 0);
+
+    b = resolve_cache_pool_budgets((size_t)1024 * 1024 * 1024,
+                                   (size_t)256 * 1024 * 1024,
+                                   false,
+                                   false, 0, false, 0);
+    TEST_ASSERT(b.prefix_bytes == (size_t)256 * 1024 * 1024);
+    TEST_ASSERT(b.prefill_bytes == (size_t)768 * 1024 * 1024);
+
+    b = resolve_cache_pool_budgets((size_t)1024 * 1024 * 1024,
+                                   (size_t)256 * 1024 * 1024,
+                                   true,
+                                   true, (size_t)128 * 1024 * 1024,
+                                   false, 0);
+    TEST_ASSERT(b.prefix_bytes == (size_t)128 * 1024 * 1024);
+    TEST_ASSERT(b.prefill_bytes == (size_t)896 * 1024 * 1024);
+
+    b = resolve_cache_pool_budgets((size_t)1024 * 1024 * 1024,
+                                   (size_t)256 * 1024 * 1024,
+                                   true,
+                                   false, 0,
+                                   true, (size_t)512 * 1024 * 1024);
+    TEST_ASSERT(b.prefix_bytes == (size_t)512 * 1024 * 1024);
+    TEST_ASSERT(b.prefill_bytes == (size_t)512 * 1024 * 1024);
+
+    b = resolve_cache_pool_budgets((size_t)1024 * 1024 * 1024,
+                                   (size_t)256 * 1024 * 1024,
+                                   false,
+                                   true, (size_t)2 * 1024 * 1024 * 1024,
+                                   false, 0);
+    TEST_ASSERT(b.prefix_bytes == (size_t)2 * 1024 * 1024 * 1024);
+    TEST_ASSERT(b.prefill_bytes == (size_t)768 * 1024 * 1024);
+
+    b = resolve_cache_pool_budgets((size_t)1024 * 1024 * 1024,
+                                   (size_t)256 * 1024 * 1024,
+                                   false,
+                                   false, 0,
+                                   true, (size_t)2 * 1024 * 1024 * 1024);
+    TEST_ASSERT(b.prefix_bytes == (size_t)256 * 1024 * 1024);
+    TEST_ASSERT(b.prefill_bytes == (size_t)2 * 1024 * 1024 * 1024);
+
+    b = resolve_cache_pool_budgets((size_t)1024 * 1024 * 1024,
+                                   (size_t)256 * 1024 * 1024,
+                                   true,
+                                   true, (size_t)2 * 1024 * 1024 * 1024,
+                                   false, 0);
+    TEST_ASSERT(b.prefix_bytes == (size_t)2 * 1024 * 1024 * 1024);
+    TEST_ASSERT(b.prefill_bytes == 0);
+
+    b = resolve_cache_pool_budgets((size_t)1024 * 1024 * 1024,
+                                   (size_t)256 * 1024 * 1024,
+                                   true,
+                                   true, (size_t)300 * 1024 * 1024,
+                                   true, (size_t)700 * 1024 * 1024);
+    TEST_ASSERT(b.prefix_bytes == (size_t)300 * 1024 * 1024);
+    TEST_ASSERT(b.prefill_bytes == (size_t)700 * 1024 * 1024);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // usage.timings — per-request prefill / decode wall-clock breakdown
 // surfaced under usage.timings (spec §6.3). Tests cover all three
@@ -3923,6 +4058,10 @@ int main() {
     RUN_TEST(test_hash_prefix_empty);
     RUN_TEST(test_find_boundaries_empty);
 
+    std::fprintf(stderr, "\n── Unified cache config ──\n");
+    RUN_TEST(test_cache_size_parse_units);
+    RUN_TEST(test_cache_slots_from_budget);
+
     std::fprintf(stderr, "\n── PFlash config ──\n");
     RUN_TEST(test_pflash_config_defaults);
     RUN_TEST(test_pflash_config_modes);
@@ -4032,6 +4171,8 @@ int main() {
     RUN_TEST(test_props_model_card_null_on_family_fallback);
     RUN_TEST(test_props_budget_envelope_shape);
     RUN_TEST(test_props_runtime_shape);
+    RUN_TEST(test_props_cache_budget_shape);
+    RUN_TEST(test_cache_budget_defaults_and_overrides);
 
     std::fprintf(stderr, "\n── usage.timings ──\n");
     RUN_TEST(test_usage_timings_openai_chat_streaming);

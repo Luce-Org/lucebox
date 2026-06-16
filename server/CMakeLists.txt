@@ -293,6 +293,7 @@ add_library(dflash_common STATIC
     src/server/reasoning.cpp
     src/server/tool_memory.cpp
     src/server/sse_emitter.cpp
+    src/server/cache_config.cpp
     src/server/prefix_cache.cpp
     src/server/disk_prefix_cache.cpp
     src/server/freeze_history.cpp

@@ -56,6 +56,18 @@ h1 { color: #58a6ff; margin-bottom: 16px; font-size: 1.5em; }
 .connected { background: #3fb95033; color: #3fb950; }
 .disconnected { background: #f8514933; color: #f85149; }
 .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.cache-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+                 gap: 12px; margin-top: 8px; }
+.cache-meter { background: #0d1117; border: 1px solid #30363d; border-radius: 4px;
+               padding: 10px 12px; }
+.cache-meter-label { color: #8b949e; font-size: 0.72em; text-transform: uppercase; }
+.cache-meter-value { color: #f0f6fc; font-size: 1.25em; font-weight: 700; margin-top: 2px; }
+.cache-meter-sub { color: #8b949e; font-size: 0.78em; margin-top: 3px; }
+.cache-pools { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.85em; }
+.cache-pools th { color: #8b949e; font-size: 0.72em; text-align: left;
+                  text-transform: uppercase; border-bottom: 1px solid #30363d; padding: 6px; }
+.cache-pools td { border-bottom: 1px solid #30363d; padding: 7px 6px; }
+.cache-pools tr:last-child td { border-bottom: 0; }
 @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -96,6 +108,37 @@ h1 { color: #58a6ff; margin-bottom: 16px; font-size: 1.5em; }
     <div class="params-grid" id="cur-params"></div>
     <div class="tokens-box" id="cur-draft-tokens"></div>
   </div>
+</div>
+
+<div class="card">
+  <h2>Cache</h2>
+  <div class="cache-summary">
+    <div class="cache-meter">
+      <div class="cache-meter-label">RAM</div>
+      <div class="cache-meter-value" id="cache-ram">-</div>
+      <div class="cache-meter-sub" id="cache-ram-sub">waiting for /props</div>
+    </div>
+    <div class="cache-meter">
+      <div class="cache-meter-label">Disk</div>
+      <div class="cache-meter-value" id="cache-disk">-</div>
+      <div class="cache-meter-sub" id="cache-disk-sub">waiting for /props</div>
+    </div>
+  </div>
+  <table class="cache-pools">
+    <thead>
+      <tr>
+        <th>Pool</th>
+        <th>RAM Budget</th>
+        <th>RAM Used</th>
+        <th>RAM Slots</th>
+        <th>Disk Budget</th>
+        <th>Disk Used</th>
+      </tr>
+    </thead>
+    <tbody id="cache-pools">
+      <tr><td colspan="6" style="color:#484f58">waiting for /props</td></tr>
+    </tbody>
+  </table>
 </div>
 
 <div class="two-col" id="req-resp-section" style="display:none;">
@@ -169,6 +212,77 @@ function drawChart(containerId, datasets, yMax) {
 
 function escapeHtml(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  const digits = value >= 10 || unit === 0 ? 0 : 1;
+  return value.toFixed(digits) + ' ' + units[unit];
+}
+
+function poolRow(label, pool) {
+  pool = pool || {};
+  const ramBudget = pool.ram_budget_bytes || 0;
+  const ramBytes = pool.ram_bytes || 0;
+  const diskBudget = pool.disk_budget_bytes || 0;
+  const diskBytes = pool.disk_bytes || 0;
+  const slots = (pool.ram_in_use || 0) + ' / ' + (pool.ram_capacity || 0);
+  return '<tr>' +
+    '<td>' + escapeHtml(label) + '</td>' +
+    '<td>' + formatBytes(ramBudget) + '</td>' +
+    '<td>' + formatBytes(ramBytes) + '</td>' +
+    '<td>' + escapeHtml(slots) + '</td>' +
+    '<td>' + formatBytes(diskBudget) + '</td>' +
+    '<td>' + formatBytes(diskBytes) + '</td>' +
+    '</tr>';
+}
+
+function updateCachePanel(props) {
+  const cache = props && props.cache ? props.cache : null;
+  if (!cache) {
+    document.getElementById('cache-ram').textContent = '-';
+    document.getElementById('cache-ram-sub').textContent = 'unavailable';
+    document.getElementById('cache-disk').textContent = '-';
+    document.getElementById('cache-disk-sub').textContent = 'unavailable';
+    document.getElementById('cache-pools').innerHTML =
+      '<tr><td colspan="6" style="color:#484f58">unavailable</td></tr>';
+    return;
+  }
+
+  const ramBudget = cache.ram_budget_bytes || 0;
+  const ramBytes = cache.ram_bytes || 0;
+  const diskBudget = cache.disk_budget_bytes || 0;
+  const prefix = cache.prefix || {};
+  const prefill = cache.prefill || {};
+  const diskBytes = (prefix.disk_bytes || 0) + (prefill.disk_bytes || 0);
+
+  document.getElementById('cache-ram').textContent =
+    formatBytes(ramBytes) + ' / ' + formatBytes(ramBudget);
+  document.getElementById('cache-ram-sub').textContent =
+    ramBudget > 0 ? 'unified RAM cache budget' : 'RAM cache disabled';
+  document.getElementById('cache-disk').textContent =
+    formatBytes(diskBytes) + ' / ' + formatBytes(diskBudget);
+  document.getElementById('cache-disk-sub').textContent =
+    diskBudget > 0 ? 'persistent disk cache budget' : 'disk cache disabled';
+  document.getElementById('cache-pools').innerHTML =
+    poolRow('Prefix reuse', prefix) + poolRow('Exact prefill', prefill);
+}
+
+async function refreshProps() {
+  try {
+    const resp = await fetch('/props', {cache: 'no-store'});
+    if (!resp.ok) throw new Error('props ' + resp.status);
+    updateCachePanel(await resp.json());
+  } catch (err) {
+    updateCachePanel(null);
+  }
 }
 
 function formatMessages(messagesStr) {
@@ -338,6 +452,8 @@ function connectSSE() {
 }
 
 connectSSE();
+refreshProps();
+setInterval(refreshProps, 5000);
 </script>
 </body>
 </html>

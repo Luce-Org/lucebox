@@ -17,6 +17,7 @@
 #include "tool_memory.h"
 #include "prefix_cache.h"
 #include "disk_prefix_cache.h"
+#include "cache_config.h"
 #include "freeze_history.h"
 #include "api_types.h"
 #include "placement/draft_residency.h"
@@ -54,7 +55,17 @@ struct ServerConfig {
     int         max_ctx     = 0;        // 0 = use backend's DevicePlacement default (8192)
     bool        enable_cors = true;
     std::string model_name  = "dflash";
-    int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
+    // Unified cache budgets. Operators should normally configure total RAM
+    // and disk budgets; startup resolves those totals into prefix/prefill
+    // pools. Slot counts below are derived/internal backend handles.
+    size_t      cache_ram_bytes          = kDefaultCacheRamBytes;
+    size_t      cache_disk_bytes         = kDefaultCacheDiskBytes;
+    size_t      prefix_cache_ram_bytes   = kDefaultCachePrefixRamBytes;
+    size_t      prefill_cache_ram_bytes  = kDefaultCachePrefillRamBytes;
+    size_t      prefix_cache_disk_bytes  = kDefaultCachePrefixDiskBytes;
+    size_t      prefill_cache_disk_bytes = kDefaultCachePrefillDiskBytes;
+    int         prefix_cache_cap = 4;   // derived RAM snapshot handles (0 disables)
+    int         prefill_cache_cap = 12; // derived RAM snapshot handles (0 disables)
 
     // Thinking-budget v2. Applied when a request opts in via
     // `thinking: {type: "enabled"}` or `reasoning: {effort: ...}`.
@@ -114,7 +125,7 @@ struct ServerConfig {
     // (`.is_null()` returns true) when family or hard fallback was used.
     // Exposed verbatim under /props.model_card; validates against
     // share/model_cards/_schema.json. See docs/specs/props-endpoint.md
-    // §4.9 and docs/specs/model-cards.md.
+    // §4.11 and docs/specs/model-cards.md.
     nlohmann::json model_card_json = nullptr;
 
     // /props introspection inputs — captured at startup by server_main so
@@ -134,7 +145,7 @@ struct ServerConfig {
     // bench/snapshot tooling can capture the full server config — needed
     // because pre-c35a8a4 snapshots had no /props capture and post-hoc
     // forensics on which chunk was used are otherwise impossible. See
-    // dflash/docs/specs/props-endpoint.md §4.5.
+    // dflash/docs/specs/props-endpoint.md §4.17.
     int         chunk               = 0;
     // Resolved device placement strings (e.g. "auto:0", "cuda:0"). Sourced
     // from placement_device_name(bargs.device / bargs.draft_device) in
@@ -164,7 +175,6 @@ struct ServerConfig {
 
     // Disk prefix cache
     std::string disk_cache_dir;             // empty = disabled
-    size_t      disk_cache_budget_mb = 4096; // max disk usage in MB
     int         disk_cache_min_tokens = 512; // only persist >= this many tokens
     int         disk_cache_continued_interval = 10240; // continued checkpoint every N tokens
     int         disk_cache_cold_max_tokens = 10240;    // cold prefix for prompts longer than this
@@ -229,7 +239,8 @@ struct ParsedRequest {
 // docs/specs/props-endpoint.md for the wire contract.
 json build_props_body(const ServerConfig & config,
                       const PrefixCache & prefix_cache,
-                      const ToolMemory & tool_memory);
+                      const ToolMemory & tool_memory,
+                      size_t prefill_disk_bytes = 0);
 
 // ─── HTTP server ────────────────────────────────────────────────────────
 class HttpServer {
@@ -305,6 +316,7 @@ private:
     ToolMemory       tool_memory_;
     PrefixCache      prefix_cache_;
     DiskPrefixCache  disk_cache_;
+    DiskPrefixCache  prefill_disk_cache_;
 
     // Per-session adaptive keep_ratio bandit state.
     HttpServerSessions sessions_;
@@ -332,6 +344,7 @@ private:
     // Track prompt tokens for each snapshot slot (for shutdown save).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
     std::vector<std::vector<int32_t>> recent_disk_prompts_;
+    uint64_t cold_snapshot_counter_ = 0;
 
     // FlowKV freeze-history: per-message compression cache.
     // Key: SHA-1 hash of the drafter-token slice for an aged message.

@@ -18,7 +18,8 @@
 //
 // Usage:
 //   test_kvflash <qwen35.gguf> [--logical-ctx=N] [--pool-b=N] [--pool-c=N]
-//                 [--prompt=N] [--gen=N] [--skip-profile] [--no-mask]
+//                 [--prompt=N] [--gen=N] [--skip-profile] [--skip-indexer]
+//                 [--no-mask]
 //   modes: (default) verification suite A-F | --niah | --niah256 | --longab
 
 #include "dflash27b.h"
@@ -61,6 +62,16 @@ size_t vram_used_now() {
     size_t free_b = 0, total_b = 0;
     ggml_backend_cuda_get_device_memory(0, &free_b, &total_b);
     return total_b - free_b;
+}
+
+const char * kvflash_drafter_path() {
+    if (const char * env = std::getenv("DFLASH_KVFLASH_DRAFTER")) {
+        if (*env) return env;
+    }
+    if (const char * env = std::getenv("DFLASH_PREFILL_DRAFTER")) {
+        if (*env) return env;
+    }
+    return "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
 }
 
 // Single-token stepper over build_qwen35_graph with explicit control of:
@@ -385,7 +396,8 @@ StepTimes summarize(std::vector<double> & ms) {
 int main(int argc, char ** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: %s <qwen35.gguf> [--logical-ctx=N] [--pool-b=N] "
-                             "[--pool-c=N] [--prompt=N] [--gen=N] [--skip-profile]\n", argv[0]);
+                             "[--pool-c=N] [--prompt=N] [--gen=N] "
+                             "[--skip-profile] [--skip-indexer]\n", argv[0]);
         return 2;
     }
     const int logical_ctx = arg_int(argc, argv, "--logical-ctx", 131072);
@@ -394,6 +406,7 @@ int main(int argc, char ** argv) {
     const int n_prompt    = arg_int(argc, argv, "--prompt", 512);
     const int n_gen       = arg_int(argc, argv, "--gen", 1200);
     const bool skip_prof  = arg_flag(argc, argv, "--skip-profile");
+    const bool skip_indexer = arg_flag(argc, argv, "--skip-indexer");
     // Explicit pool slot mask: exact exclusion of non-resident slots.
     // ON by default (requires the per-step re-upload in refresh_mask: the
     // mask input's compute-buffer region is clobbered by graph execution).
@@ -439,7 +452,7 @@ int main(int argc, char ** argv) {
             for (int mode = 0; mode < 2; mode++) {           // 0=baseline 1=pool
                 if (only_mode >= 0 && mode != only_mode) continue;
                 if (mode == 1 && !dctx.loaded &&
-                    !load_drafter("/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf", 0, dctx)) {
+                    !load_drafter(kvflash_drafter_path(), 0, dctx)) {
                     std::fprintf(stderr, "drafter load failed\n");
                     return 1;
                 }
@@ -527,7 +540,7 @@ int main(int argc, char ** argv) {
     // inside the recency window is the induction control (distance-free).
     if (arg_flag(argc, argv, "--niah256")) {
         DrafterContext dctx;
-        if (!load_drafter("/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf", 0, dctx)) {
+        if (!load_drafter(kvflash_drafter_path(), 0, dctx)) {
             std::fprintf(stderr, "drafter load failed\n");
             return 1;
         }
@@ -614,7 +627,7 @@ int main(int argc, char ** argv) {
     if (arg_flag(argc, argv, "--niah")) {
         DrafterContext dctx;
         const bool have_drafter =
-            load_drafter("/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf", 0, dctx);
+            load_drafter(kvflash_drafter_path(), 0, dctx);
         if (!have_drafter) std::printf("[niah] drafter unavailable, skipping drafter policy\n");
         KvFlashDrafterScorer scorer(&dctx);
         if (have_drafter) {
@@ -915,8 +928,8 @@ int main(int argc, char ** argv) {
     // indexer query), score_hook gets the fresh chunk scores, and
     // reselect() repages the pool. PASS requires at least one genuine
     // drafter-driven recall of a chunk evicted earlier.
-    {
-        const char * drafter_path = "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
+    if (!skip_indexer) {
+        const char * drafter_path = kvflash_drafter_path();
         DrafterContext dctx;
         if (!load_drafter(drafter_path, 0, dctx)) {
             std::printf("FAIL indexer run: drafter load failed (%s)\n", dflash27b_last_error());
@@ -988,6 +1001,8 @@ int main(int argc, char ** argv) {
             free_target_cache(cache);
             free_drafter(dctx);
         }
+    } else {
+        std::printf("SKIP indexer run (--skip-indexer)\n");
     }
 
     // ── Run E: performance profile ──────────────────────────────────

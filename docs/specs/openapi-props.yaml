@@ -45,7 +45,7 @@ paths:
         Returns a JSON document describing the server's HTTP
         endpoints, loaded model, model-card-derived budgets,
         reasoning / speculative / tools capabilities, sampler
-        capability flags, prefix-cache state, full-cache state,
+        capability flags, unified cache state, legacy prefix/full cache state,
         tool-replay state, and PFlash configuration. Never blocks
         on the worker thread; the response is a snapshot of
         atomic counters and config state.
@@ -87,6 +87,23 @@ paths:
                       reasoning_supported: true
                       speculative_supported: true
                       tools_supported: true
+                    cache:
+                      ram_budget_bytes: 1073741824
+                      ram_bytes: 0
+                      disk_budget_bytes: 17179869184
+                      prefix:
+                        ram_budget_bytes: 268435456
+                        ram_capacity: 4
+                        ram_in_use: 0
+                        ram_bytes: 0
+                        disk_budget_bytes: 4294967296
+                      prefill:
+                        ram_budget_bytes: 805306368
+                        ram_capacity: 12
+                        ram_in_use: 0
+                        ram_bytes: 0
+                        disk_budget_bytes: 12884901888
+                        disk_bytes: 0
                     daemon:
                       alive: true
                     default_generation_settings:
@@ -97,11 +114,14 @@ paths:
                       top_k: 0
                       top_p: 1.0
                     full_cache:
-                      capacity: 0
+                      capacity: 12
                       disk_bytes: 0
-                      enabled: false
+                      disk_budget_bytes: 12884901888
+                      enabled: true
                       in_use: 0
                       lifetime_hits: 0
+                      ram_budget_bytes: 805306368
+                      ram_bytes: 0
                     model:
                       arch: "qwen35"
                       draft_path: "/.../dflash-draft-3.6-q4_k_m.gguf"
@@ -138,9 +158,12 @@ paths:
                       skip_park: null
                       threshold: null
                     prefix_cache:
-                      capacity: 0
+                      capacity: 4
+                      disk_budget_bytes: 4294967296
                       in_use: 0
                       lifetime_hits: 0
+                      ram_budget_bytes: 268435456
+                      ram_bytes: 0
                     reasoning:
                       default: null
                       supported: true
@@ -191,6 +214,7 @@ components:
         - api
         - budget_envelope
         - build_info
+        - cache
         - capabilities
         - daemon
         - default_generation_settings
@@ -223,6 +247,8 @@ components:
           example: "luce-dflash v0.0.0+cpp props_schema=2"
         capabilities:
           $ref: "#/components/schemas/Capabilities"
+        cache:
+          $ref: "#/components/schemas/CachePools"
         daemon:
           $ref: "#/components/schemas/Daemon"
         default_generation_settings:
@@ -327,6 +353,87 @@ components:
             fields and emits `tool_calls` blocks.
           example: true
 
+    CachePools:
+      description: |
+        Unified cache configuration and runtime counters. Top-level
+        fields mirror the user-facing total budgets; nested fields
+        show the resolved internal prefix/prefill pools.
+      type: object
+      required:
+        - ram_budget_bytes
+        - ram_bytes
+        - disk_budget_bytes
+        - prefix
+        - prefill
+      properties:
+        ram_budget_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: User-facing unified RAM cache budget.
+          example: 1073741824
+        ram_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Estimated RAM bytes held across cache pools.
+          example: 0
+        disk_budget_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: User-facing unified disk cache budget, or 0 when no cache directory is configured.
+          example: 17179869184
+        prefix:
+          $ref: "#/components/schemas/CachePool"
+        prefill:
+          $ref: "#/components/schemas/CachePool"
+
+    CachePool:
+      description: One cache kind across RAM and disk tiers.
+      type: object
+      required:
+        - ram_budget_bytes
+        - ram_capacity
+        - ram_in_use
+        - ram_bytes
+        - disk_budget_bytes
+      properties:
+        ram_budget_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Resolved RAM budget for this cache kind.
+          example: 268435456
+        ram_capacity:
+          type: integer
+          minimum: 0
+          description: Derived internal snapshot-handle capacity.
+          example: 4
+        ram_in_use:
+          type: integer
+          minimum: 0
+          description: RAM snapshot handles currently occupied.
+          example: 0
+        ram_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Estimated RAM bytes held by active snapshots.
+          example: 0
+        disk_budget_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Resolved disk budget for this cache kind, or 0 when no cache directory is configured.
+          example: 4294967296
+        disk_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Disk bytes currently used. Present for prefill; prefix disk usage is exposed through disk-cache logs.
+          example: 0
+
     Daemon:
       description: Daemon-thread liveness flag.
       type: object
@@ -394,36 +501,57 @@ components:
 
     FullCache:
       description: |
-        Full-prompt (disk-backed) cache state. Atomic-snapshot
+        Exact full-prompt prefill cache state. Atomic-snapshot
         counters; per-field tear-free but the set is not
         internally consistent. Not safe for control flow.
       type: object
       required:
         - capacity
         - disk_bytes
+        - disk_budget_bytes
         - enabled
         - in_use
         - lifetime_hits
+        - ram_budget_bytes
+        - ram_bytes
       properties:
         capacity:
           type: integer
           minimum: 0
-          description: Configured slot capacity. 0 when disabled.
-          example: 0
+          description: Derived internal RAM snapshot-handle capacity. 0 when disabled.
+          example: 12
         disk_bytes:
           type: integer
           format: int64
           minimum: 0
           description: Bytes currently used on disk.
           example: 0
+        disk_budget_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Resolved exact-prefill disk budget, or 0 when no cache directory is configured.
+          example: 12884901888
         enabled:
           type: boolean
-          description: True when the disk-backed cache is configured.
-          example: false
+          description: True when the RAM exact-prefill cache is configured.
+          example: true
         in_use:
           type: integer
           minimum: 0
           description: Slots currently occupied.
+          example: 0
+        ram_budget_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Resolved exact-prefill RAM budget.
+          example: 805306368
+        ram_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Estimated RAM bytes held by exact-prefill snapshots.
           example: 0
         lifetime_hits:
           type: integer
@@ -472,7 +600,7 @@ components:
         on) lives at `budget_envelope.model_card_source`.
 
         See `docs/specs/model-cards.md` for the sidecar format and
-        resolution order, and `docs/specs/props-endpoint.md` §4.10
+        resolution order, and `docs/specs/props-endpoint.md` §4.11
         for how this section is wired up at /props.
       type: object
       additionalProperties: false
@@ -687,18 +815,42 @@ components:
         non-strict snapshot; `capacity = 0` means the cache is
         disabled.
       type: object
-      required: [capacity, in_use, lifetime_hits]
+      required:
+        - capacity
+        - disk_budget_bytes
+        - in_use
+        - lifetime_hits
+        - ram_budget_bytes
+        - ram_bytes
       properties:
         capacity:
           type: integer
           minimum: 0
-          description: Configured slot count.
+          description: Derived internal RAM snapshot-handle capacity.
           example: 0
         in_use:
           type: integer
           minimum: 0
           description: Slots currently occupied.
           example: 0
+        ram_budget_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Resolved prefix RAM budget.
+          example: 268435456
+        ram_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Estimated RAM bytes held by prefix snapshots.
+          example: 0
+        disk_budget_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Configured prefix disk budget.
+          example: 4294967296
         lifetime_hits:
           type: integer
           format: int64

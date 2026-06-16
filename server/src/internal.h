@@ -410,6 +410,8 @@ struct PrefixSnapshot {
     std::vector<ggml_tensor *> ssm_state_snap;  // size n_delta (48)
     std::vector<ggml_tensor *> conv_state_snap;
     ggml_tensor *               target_feat_snap = nullptr;
+    ggml_tensor *               prefill_logits_snap = nullptr;
+    std::vector<float>          prefill_last_logits;
 
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
@@ -433,7 +435,8 @@ struct PrefixSnapshot {
 bool snapshot_target_cache(const TargetWeights & w,
                            const TargetCache & cache,
                            ggml_backend_t backend,
-                           PrefixSnapshot & snap);
+                           PrefixSnapshot & snap,
+                           bool include_prefill_logits = false);
 
 // Restore `cache` from `snap`. cache must already exist (created via
 // create_target_cache) and have matching shapes. Sets cache.cur_pos =

@@ -16,6 +16,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -52,6 +53,7 @@ struct FullCacheEntry {
     std::string cur_bin_path;
     int         cur_ids_len = 0;
     int         raw_prompt_len = 0;
+    size_t      ram_bytes = 0;
     int64_t     last_used_ns = 0;
     int         hits = 0;
 };
@@ -60,10 +62,11 @@ struct FullCacheEntry {
 
 class PrefixCache {
 public:
-    static constexpr int MAX_SLOTS = 64;
+    static constexpr int MAX_SLOTS = 63;
 
-    // cap = number of prefix-cache slots (0 disables).
-    PrefixCache(int cap, const Tokenizer & tokenizer);
+    // cap = number of internal prefix-cache snapshot handles (0 disables).
+    PrefixCache(int cap, const Tokenizer & tokenizer,
+                size_t ram_budget_bytes = 0);
 
     bool disabled() const { return disabled_; }
 
@@ -79,8 +82,9 @@ public:
     std::pair<int, int> prepare_inline_snap(const std::vector<int32_t> & prompt_ids);
 
     // Confirm after daemon successfully saved the snapshot.
-    void confirm_inline_snap(int slot, int target_cut,
-                             const std::vector<int32_t> & prompt_ids);
+    std::vector<int> confirm_inline_snap(int slot, int target_cut,
+                                         const std::vector<int32_t> & prompt_ids,
+                                         size_t ram_bytes = 0);
 
     // Abort if the snapshot failed.
     void abort_inline_snap(int slot);
@@ -91,7 +95,7 @@ public:
     // ── Full-compress cache ─────────────────────────────────────────
 
     // Initialize the full-cache pool. full_cap slots start at cap.
-    void init_full_cache(int full_cap);
+    void init_full_cache(int full_cap, size_t ram_budget_bytes = 0);
 
     // Exact-match lookup. Returns (slot, cur_ids_len) or (-1, 0).
     std::pair<int, int> lookup_full(const std::vector<int32_t> & prompt_ids);
@@ -100,8 +104,8 @@ public:
     int prepare_full_snap(const std::vector<int32_t> & prompt_ids);
 
     // Confirm after successful snapshot save.
-    void confirm_full_snap(int slot, const std::vector<int32_t> & prompt_ids,
-                           int cur_ids_len);
+    std::vector<int> confirm_full_snap(int slot, const std::vector<int32_t> & prompt_ids,
+                                       int cur_ids_len, size_t ram_bytes = 0);
 
     // Abort reservation.
     void abort_full_snap(int slot);
@@ -111,18 +115,21 @@ public:
     struct InlineStats {
         int capacity;
         int in_use;
+        int64_t ram_budget_bytes;
+        int64_t ram_bytes;
         int64_t lifetime_hits;
     };
     struct FullStats {
         bool enabled;
         int capacity;
         int in_use;
-        int64_t disk_bytes;
+        int64_t ram_budget_bytes;
+        int64_t ram_bytes;
         int64_t lifetime_hits;
     };
 
     // Lockless snapshot for /props. Every published field — hit
-    // counters, disk-bytes, AND the two in-use counts — is mirrored to
+    // counters, RAM bytes, AND the two in-use counts — is mirrored to
     // an std::atomic that the daemon thread updates alongside the
     // backing vector. /props reads those atomics with
     // memory_order_relaxed, so the cross-thread read is well-defined
@@ -134,6 +141,7 @@ public:
 private:
     bool disabled_ = true;
     int cap_ = 0;
+    size_t ram_budget_bytes_ = 0;
     ChatMarkers markers_;
 
     // LRU for inline prefix cache: ordered map of hash → slot.
@@ -141,6 +149,7 @@ private:
     struct LruEntry {
         PrefixHash hash;
         int        slot;
+        size_t     ram_bytes;
     };
     std::vector<LruEntry> entries_;
     int next_slot_ = 0;
@@ -152,6 +161,7 @@ private:
     int  full_cap_ = 0;
     int  full_slot_base_ = 0;
     int  full_next_slot_ = 0;
+    size_t full_ram_budget_bytes_ = 0;
 
     struct FullLruEntry {
         PrefixHash     hash;
@@ -165,7 +175,8 @@ private:
     // is sufficient — no synchronization with other state required.
     std::atomic<int64_t> lifetime_hits_{0};       // inline cache hits
     std::atomic<int64_t> full_lifetime_hits_{0};  // full-compress cache hits
-    std::atomic<int64_t> full_disk_bytes_{0};     // best-effort snapshot of disk usage
+    std::atomic<int64_t> entries_ram_bytes_{0};
+    std::atomic<int64_t> full_entries_ram_bytes_{0};
     // Atomic mirrors of `entries_.size()` and `full_entries_.size()`.
     // The vectors themselves are mutated only on the daemon thread
     // under the daemon's serialised request loop, but `/props` reads
@@ -181,6 +192,8 @@ private:
     void move_to_end(int idx);
     int find_full_entry(const PrefixHash & h) const;
     void move_full_to_end(int idx);
+    std::vector<int> enforce_inline_budget();
+    std::vector<int> enforce_full_budget();
 };
 
 }  // namespace dflash::common

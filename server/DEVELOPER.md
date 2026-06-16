@@ -132,8 +132,9 @@ cd dflash
 | `--cache-type-v` / `--ctv` | auto | KV cache type for values |
 | `--fa-window` | auto | Sliding window size for flash attention (0 = full) |
 | `--tokenizer` | auto (from GGUF) | HuggingFace tokenizer ID |
-| `--prefix-cache-slots` | `4` | Number of prefix-cache slots |
-| `--prefill-cache-slots` | `4` | Number of prefill-cache slots |
+| `--cache-ram` | `1GiB` | Unified RAM cache budget; startup splits it between prefix and exact prefill pools |
+| `--cache-disk` | `16GiB` | Unified disk cache budget when `--kv-cache-dir` / `--cache-dir` is set |
+| `--cache-prefix-ram` / `--cache-prefill-ram` | auto | Advanced per-pool RAM overrides |
 | `--daemon` | off | Run as background daemon |
 
 ### API endpoints

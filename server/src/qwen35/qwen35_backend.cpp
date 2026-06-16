@@ -414,7 +414,26 @@ bool Qwen35Backend::snapshot_save(int slot) {
         return false;
     }
     PrefixSnapshot & snap = prefix_snapshots_[slot];
-    return snapshot_target_cache(w_, cache_, snap_backend_, snap);
+    const bool include_logits =
+        prefill_last_logits_valid_ &&
+        prefill_last_logits_.size() == (size_t)w_.n_vocab;
+    if (!snapshot_target_cache(w_, cache_, snap_backend_, snap, include_logits)) {
+        return false;
+    }
+    if (!include_logits) {
+        snap.prefill_last_logits.clear();
+        return true;
+    }
+    snap.prefill_last_logits = prefill_last_logits_;
+    if (!snap.prefill_logits_snap) {
+        snap.prefill_last_logits.clear();
+        return false;
+    }
+    ggml_backend_tensor_set(snap.prefill_logits_snap,
+                            snap.prefill_last_logits.data(),
+                            0,
+                            sizeof(float) * snap.prefill_last_logits.size());
+    return true;
 }
 
 void Qwen35Backend::snapshot_free(int slot) {
@@ -466,6 +485,8 @@ bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
     snap.ssm_state_snap.assign(n_delta, nullptr);
     snap.conv_state_snap.assign(n_delta, nullptr);
     snap.target_feat_snap = nullptr;
+    snap.prefill_logits_snap = nullptr;
+    snap.prefill_last_logits.clear();
 
     // Rebind tensors by name.
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
@@ -481,6 +502,8 @@ bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
             snap.conv_state_snap[idx] = t;
         } else if (std::strcmp(t->name, "snap_target_feat") == 0) {
             snap.target_feat_snap = t;
+        } else if (std::strcmp(t->name, "snap_prefill_logits") == 0) {
+            snap.prefill_logits_snap = t;
         }
     }
 
@@ -490,6 +513,8 @@ bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
             snap.attn_k_snap.clear(); snap.attn_v_snap.clear();
             snap.ssm_state_snap.clear(); snap.conv_state_snap.clear();
             snap.target_feat_snap = nullptr;
+            snap.prefill_logits_snap = nullptr;
+            snap.prefill_last_logits.clear();
             return false;
         }
     }
@@ -498,13 +523,33 @@ bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
             snap.attn_k_snap.clear(); snap.attn_v_snap.clear();
             snap.ssm_state_snap.clear(); snap.conv_state_snap.clear();
             snap.target_feat_snap = nullptr;
+            snap.prefill_logits_snap = nullptr;
+            snap.prefill_last_logits.clear();
             return false;
         }
     }
     if (!snap.target_feat_snap) {
         snap.attn_k_snap.clear(); snap.attn_v_snap.clear();
         snap.ssm_state_snap.clear(); snap.conv_state_snap.clear();
+        snap.prefill_logits_snap = nullptr;
+        snap.prefill_last_logits.clear();
         return false;
+    }
+    if (snap.prefill_logits_snap) {
+        const size_t logits_n = ggml_nelements(snap.prefill_logits_snap);
+        if (logits_n != (size_t)w_.n_vocab) {
+            snap.attn_k_snap.clear(); snap.attn_v_snap.clear();
+            snap.ssm_state_snap.clear(); snap.conv_state_snap.clear();
+            snap.target_feat_snap = nullptr;
+            snap.prefill_logits_snap = nullptr;
+            snap.prefill_last_logits.clear();
+            return false;
+        }
+        snap.prefill_last_logits.assign(logits_n, 0.0f);
+        ggml_backend_tensor_get(snap.prefill_logits_snap,
+                                snap.prefill_last_logits.data(),
+                                0,
+                                sizeof(float) * logits_n);
     }
 
     snap.ctx     = ctx;
@@ -839,6 +884,10 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
 
     const int snap_pos = prefix_snapshots_[slot].cur_pos;
     cache_.cur_pos = snap_pos;
+    prefill_last_logits_ = prefix_snapshots_[slot].prefill_last_logits;
+    prefill_last_logits_valid_ =
+        prefill_last_logits_.size() == (size_t)w_.n_vocab;
+    prefill_last_logits_offset_ = 0;
 
     // FIX(prefix-cache + spec-decode): restore_target_cache brings back KV /
     // recurrent state / target_feat, but the draft-side feature mirror is left
@@ -882,6 +931,25 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         std::fprintf(stderr,
             "[pc] snapshot longer than prompt (snap=%d > prompt=%d) — "
             "fresh prefill fallback\n", snap_pos, prompt_len);
+        reset_recurrent_state(cache_);
+        cache_.cur_pos = 0;
+        auto t_prefill_start = std::chrono::steady_clock::now();
+        committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
+        if (committed < 0) {
+            result.error = "prefill";
+            return result;
+        }
+        result.prefill_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_prefill_start).count();
+    } else if (prompt_len == snap_pos && req.sampler.needs_logit_processing() &&
+               !prefill_last_logits_valid_) {
+        // Older disk snapshots, and prefix-boundary snapshots captured before
+        // the final prefill chunk, do not contain the final logits needed to
+        // sample the first generated token. Recompute instead of attempting a
+        // restore-only sampled decode with stale graph tensors.
+        std::fprintf(stderr,
+            "[pc] snapshot lacks prefill logits for sampling (snap=%d) - "
+            "fresh prefill fallback\n", snap_pos);
         reset_recurrent_state(cache_);
         cache_.cur_pos = 0;
         auto t_prefill_start = std::chrono::steady_clock::now();
@@ -957,6 +1025,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     }
     const int prompt_len = (int)tokens.size();
     prefill_last_logits_valid_ = false;
+    prefill_last_logits_.clear();
 
     // kvflash: a prompt that fits the pool prefills contiguously (identity
     // mapping, normal chunking). A LARGER prompt switches to POOLED CHUNKED
@@ -1154,7 +1223,19 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         cache_.last_tok = last_tok;
         if (is_final_chunk) {
             prefill_last_logits_offset_ = (size_t)(n_tokens - 1) * (size_t)vocab * sizeof(float);
-            prefill_last_logits_valid_ = true;
+            const size_t logits_bytes = sizeof(float) * (size_t)vocab;
+            if (sg_.logits &&
+                ggml_nbytes(sg_.logits) >= prefill_last_logits_offset_ + logits_bytes) {
+                prefill_last_logits_.assign((size_t)vocab, 0.0f);
+                ggml_backend_tensor_get(sg_.logits,
+                                        prefill_last_logits_.data(),
+                                        prefill_last_logits_offset_,
+                                        logits_bytes);
+                prefill_last_logits_valid_ = true;
+            } else {
+                prefill_last_logits_valid_ = false;
+                prefill_last_logits_.clear();
+            }
         }
 
         committed = kv_pos + n_tokens;
@@ -1418,10 +1499,11 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     if (initial_emitted == 1) {
         int32_t first_tok;
         if (sampler_.needs_logit_processing()) {
-            if (!prefill_last_logits_valid_) return false;
-            ggml_backend_tensor_get(sg_.logits, logits_buf.data(), prefill_last_logits_offset_,
-                                    sizeof(float) * vocab);
-            first_tok = sample_logits(logits_buf.data(), vocab, sampler_,
+            if (!prefill_last_logits_valid_ ||
+                prefill_last_logits_.size() != (size_t)vocab) {
+                return false;
+            }
+            first_tok = sample_logits(prefill_last_logits_.data(), vocab, sampler_,
                                       out_tokens, sampler_rng_);
         } else {
             first_tok = cache_.last_tok;
@@ -1439,11 +1521,6 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     for (int i = initial_emitted; i < n_gen; i++) {
         int32_t tok = out_tokens.back();
 
-        if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;
-        ggml_backend_tensor_set(sg_.inp_embed, embed_buf, 0, sizeof(float) * hidden);
-        int32_t pos4[4] = {committed, committed, committed, 0};
-        ggml_backend_tensor_set(sg_.positions, pos4, 0, sizeof(int32_t) * 4);
-
         // kvflash: graph carries a slot-validity mask alongside the
         // step-invariant set_rows write; the FA span clamps to the pool.
         const bool pool = kvflash_active();
@@ -1458,6 +1535,11 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                /*kvflash_mask=*/pool)) {
             return false;
         }
+
+        if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;
+        ggml_backend_tensor_set(sg_.inp_embed, embed_buf, 0, sizeof(float) * hidden);
+        int32_t pos4[4] = {committed, committed, committed, 0};
+        ggml_backend_tensor_set(sg_.positions, pos4, 0, sizeof(int32_t) * 4);
 
         // Fill kv_write_rows with this step's cache slot for set_rows:
         // the logical position directly, or its pool slot in kvflash mode.
