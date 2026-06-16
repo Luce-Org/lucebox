@@ -790,6 +790,7 @@ void laguna_layer_step_graph_free(LagunaLayerStepGraph & sg) {
     sg.positions = nullptr;
     sg.attn_mask = nullptr;
     sg.attn_mask_swa = nullptr;
+    sg.kv_idx = nullptr;
 }
 
 void laguna_layer_step_graph_destroy(LagunaLayerStepGraph & sg) {
@@ -810,10 +811,12 @@ bool build_laguna_layer_step(
     ggml_tensor * act_out,
     int chunk_start,
     int n_tokens,
-    int kv_start) {
+    int kv_start,
+    const KvFlashPager * kvflash) {
     laguna_layer_step_graph_free(sg);
     if (layer_idx < 0 || layer_idx >= w.n_layer) return false;
     if (!cache.attn_k[layer_idx] || !cache.attn_v[layer_idx]) return false;
+    if (kvflash && std::getenv("DFLASH_LAGUNA_NO_KVPAD")) return false;
 
     ggml_init_params ip{};
     ip.mem_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() + 16 * 1024 * 1024;
@@ -831,17 +834,25 @@ bool build_laguna_layer_step(
     ggml_set_input(sg.positions);
 
     const int kv_len = kv_start + n_tokens;
-    sg.attn_mask = ggml_new_tensor_4d(sg.ctx, GGML_TYPE_F32, kv_len, n_tokens, 1, 1);
+    const int kv_cap = cache.attn_k[(size_t)layer_idx]
+        ? (int)cache.attn_k[(size_t)layer_idx]->ne[1] : cache.max_ctx;
+    const int kv_pad = std::min((kv_len + 255) & ~255, kv_cap);
+    const int mk_w = kvflash ? kv_pad : kv_len;
+    sg.attn_mask = ggml_new_tensor_4d(sg.ctx, GGML_TYPE_F32, mk_w, n_tokens, 1, 1);
     ggml_set_input(sg.attn_mask);
     ggml_tensor * mask_full_f16 = ggml_cast(sg.ctx, sg.attn_mask, GGML_TYPE_F16);
 
-    sg.attn_mask_swa = ggml_new_tensor_4d(sg.ctx, GGML_TYPE_F32, kv_len, n_tokens, 1, 1);
+    sg.attn_mask_swa = ggml_new_tensor_4d(sg.ctx, GGML_TYPE_F32, mk_w, n_tokens, 1, 1);
     ggml_set_input(sg.attn_mask_swa);
     ggml_tensor * mask_swa_f16 = ggml_cast(sg.ctx, sg.attn_mask_swa, GGML_TYPE_F16);
 
+    sg.kv_idx = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(sg.kv_idx);
+
     ggml_tensor * layer_out = build_laguna_layer(
         sg.ctx, sg.gf, w, cache, layer_idx, inp, sg.positions,
-        mask_full_f16, kv_start, n_tokens, mask_swa_f16);
+        mask_full_f16, kv_start, n_tokens, mask_swa_f16,
+        /*hyb=*/nullptr, kvflash ? kv_pad : 0, sg.kv_idx);
     if (!layer_out) return false;
 
     ggml_tensor * out_view = ggml_view_2d(

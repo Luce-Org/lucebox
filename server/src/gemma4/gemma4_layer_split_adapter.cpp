@@ -8,6 +8,7 @@
 #include "common/layer_split_utils.h"
 #include "common/layer_split_runtime.h"
 #include "dflash27b.h"
+#include "qwen3/qwen3_kvflash_scorer.h"
 
 #include "ggml-cuda.h"
 
@@ -15,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 
 namespace dflash::common {
 
@@ -22,6 +24,62 @@ namespace {
 
 static bool tensor_ready(const ggml_tensor * t) {
     return t && t->buffer;
+}
+
+static bool gemma4_align_split_for_kv_sharing(
+        const char * target_path,
+        std::vector<Gemma4LayerSplitShard> & shards) {
+    if (shards.size() <= 1 || !target_path) return true;
+
+    ggml_context * meta_ctx = nullptr;
+    gguf_init_params gip{};
+    gip.no_alloc = true;
+    gip.ctx      = &meta_ctx;
+    gguf_context * gctx = gguf_init_from_file(target_path, gip);
+    if (!gctx) return true;
+
+    int64_t arch_id = gguf_find_key(gctx, "general.architecture");
+    if (arch_id < 0 || std::string(gguf_get_val_str(gctx, arch_id)) != "gemma4") {
+        gguf_free(gctx);
+        if (meta_ctx) ggml_free(meta_ctx);
+        return true;
+    }
+
+    auto get_u32 = [&](const char * key, uint32_t def) {
+        int64_t id = gguf_find_key(gctx, key);
+        if (id < 0) return def;
+        if (gguf_get_kv_type(gctx, id) == GGUF_TYPE_ARRAY) {
+            if (gguf_get_arr_n(gctx, id) == 0) return def;
+            return ((const uint32_t *)gguf_get_arr_data(gctx, id))[0];
+        }
+        return gguf_get_val_u32(gctx, id);
+    };
+
+    const int n_layer = (int)get_u32("gemma4.block_count", 0);
+    const int shared_kv = (int)get_u32("gemma4.attention.shared_kv_layers", 0);
+    gguf_free(gctx);
+    if (meta_ctx) ggml_free(meta_ctx);
+    if (n_layer <= 0 || shared_kv <= 0 || shared_kv >= n_layer) return true;
+
+    const int kv_sharing_start = n_layer - shared_kv;
+    const int kv_source_layer = kv_sharing_start - 1;
+    if (kv_source_layer <= 0) return true;
+    for (size_t i = 0; i + 1 < shards.size(); ++i) {
+        if (shards[i].layer_end > kv_source_layer) {
+            shards[i].layer_end = kv_source_layer;
+            shards[i + 1].layer_begin = kv_source_layer;
+        }
+    }
+    for (const auto & shard : shards) {
+        if (shard.layer_begin >= shard.layer_end) {
+            std::fprintf(stderr,
+                "[gemma4-target-split] KV-sharing boundary alignment produced "
+                "empty shard [%d,%d); adjust --target-layer-split\n",
+                shard.layer_begin, shard.layer_end);
+            return false;
+        }
+    }
+    return true;
 }
 
 }  // namespace
@@ -45,6 +103,9 @@ bool Gemma4LayerSplitAdapter::init() {
         "gemma4-target-split",
     };
     if (!init_layer_split_runtime(runtime_cfg, shards_, snapshot_backends_)) {
+        return false;
+    }
+    if (!gemma4_align_split_for_kv_sharing(cfg_.target_path, shards_)) {
         return false;
     }
 
@@ -72,13 +133,29 @@ bool Gemma4LayerSplitAdapter::init() {
             make_layer_split_load_plan<TargetLoadPlan>(
                 shard, i + 1 == shards_.size());
         if (!load_gemma4_gguf_partial(cfg_.target_path, shard.backend,
-                                      plan, shard.weights) ||
-            !create_gemma4_cache_partial(shard.backend, shard.weights,
+                                      plan, shard.weights)) {
+            std::fprintf(stderr,
+                "[gemma4-target-split] load gpu=%d: %s\n",
+                shard.gpu, dflash27b_last_error());
+            return false;
+        }
+    }
+
+    kvflash_read_config();
+    if (kvflash_active() && cfg_.fa_window > 0) {
+        std::fprintf(stderr,
+            "[gemma4-target-split][kvflash] fa_window is incompatible with "
+            "pooled full-attention slots\n");
+        return false;
+    }
+
+    for (auto & shard : shards_) {
+        if (!create_gemma4_cache_partial(shard.backend, shard.weights,
                                          cfg_.device.max_ctx,
                                          shard.layer_begin, shard.layer_end,
-                                         shard.cache)) {
+                                         shard.cache, kvflash_tokens_)) {
             std::fprintf(stderr,
-                "[gemma4-target-split] load/cache gpu=%d: %s\n",
+                "[gemma4-target-split] cache gpu=%d: %s\n",
                 shard.gpu, dflash27b_last_error());
             return false;
         }
@@ -86,12 +163,172 @@ bool Gemma4LayerSplitAdapter::init() {
         std::fprintf(stderr, "[gemma4-target-split] gpu=%d layers=[%d,%d)\n",
                      shard.gpu, shard.layer_begin, shard.layer_end);
     }
+    if (!kvflash_attach()) return false;
+
     snapshots_.resize(PREFIX_SLOTS);
     for (auto & slot : snapshots_) {
         slot.shards.resize(shards_.size());
     }
+    kvflash_history_snapshots_.resize(PREFIX_SLOTS);
 
     return true;
+}
+
+void Gemma4LayerSplitAdapter::kvflash_read_config() {
+    if (!std::getenv("DFLASH_KVFLASH") || shards_.empty()) return;
+    kvflash_drafter_path_ = kvflash_find_drafter(cfg_.target_path);
+
+    int64_t min_free = std::numeric_limits<int64_t>::max();
+    int64_t max_bytes_per_token = 0;
+    for (const auto & shard : shards_) {
+        size_t gpu_free = 0, gpu_total = 0;
+        if (ggml_backend_dev_t dev = ggml_backend_get_device(shard.backend)) {
+            ggml_backend_dev_memory(dev, &gpu_free, &gpu_total);
+        }
+        min_free = std::min<int64_t>(min_free, (int64_t)gpu_free);
+
+        int64_t bpt = 0;
+        for (int il = shard.layer_begin; il < shard.layer_end; ++il) {
+            if (!gemma4_has_kv(shard.weights, il) ||
+                gemma4_is_swa_layer(shard.weights, il)) {
+                continue;
+            }
+            bpt += (int64_t)gemma4_n_head_kv(shard.weights, il) * 2 *
+                   (int64_t)ggml_row_size(GGML_TYPE_F16,
+                                          gemma4_head_dim(shard.weights, il));
+        }
+        max_bytes_per_token = std::max<int64_t>(max_bytes_per_token, bpt);
+    }
+    if (min_free == std::numeric_limits<int64_t>::max()) min_free = 0;
+
+    KvFlashAutoBudget budget;
+    budget.free_bytes = min_free;
+    budget.bytes_per_token = max_bytes_per_token;
+    budget.reserve_bytes = (int64_t)(1.5 * 1073741824.0) +
+        (kvflash_drafter_path_.empty() ? 0 : (int64_t)(1.7 * 1073741824.0));
+    kvflash_tokens_ = kvflash_pool_from_env(
+        cfg_.device.max_ctx, KvFlashConfig{},
+        !kvflash_drafter_path_.empty(), budget);
+    if (kvflash_tokens_ > 0) {
+        const char * tau = std::getenv("DFLASH_KVFLASH_TAU");
+        kvflash_tau_ = std::max(1, tau ? std::atoi(tau) : 64);
+    }
+}
+
+bool Gemma4LayerSplitAdapter::kvflash_attach() {
+    if (!kvflash_active()) return true;
+    std::vector<ggml_tensor *> full_k;
+    std::vector<ggml_tensor *> full_v;
+    const int n_layer = shards_.empty() ? 0 : shards_.front().weights.n_layer;
+    for (int il = 0; il < n_layer; ++il) {
+        if (!gemma4_has_kv(shards_.front().weights, il) ||
+            gemma4_is_swa_layer(shards_.front().weights, il)) {
+            continue;
+        }
+        ggml_tensor * k = nullptr;
+        ggml_tensor * v = nullptr;
+        for (auto & shard : shards_) {
+            if (il < (int)shard.cache.k.size() && shard.cache.k[(size_t)il]) {
+                k = shard.cache.k[(size_t)il];
+                v = shard.cache.v[(size_t)il];
+                break;
+            }
+        }
+        if (k && v) {
+            full_k.push_back(k);
+            full_v.push_back(v);
+        }
+    }
+    KvFlashConfig pc;
+    pc.pool_tokens = kvflash_tokens_;
+    if (!kvflash_pager_.attach(pc, full_k, full_v)) {
+        std::fprintf(stderr,
+            "[gemma4-target-split][kvflash] pager attach failed pool=%d layers=%zu\n",
+            kvflash_tokens_, full_k.size());
+        return false;
+    }
+    std::printf("[gemma4-target-split][kvflash] resident pool %d tokens over "
+                "%zu full-attn layers (logical max_ctx %d), tau=%d, policy=%s\n",
+                kvflash_tokens_, full_k.size(), cfg_.device.max_ctx,
+                kvflash_tau_,
+                !kvflash_drafter_path_.empty()
+                    ? "drafter/cross-tok (attaches on first reselect)"
+                    : "lru (recency-only: no Qwen3-0.6B drafter found)");
+    std::fflush(stdout);
+    return true;
+}
+
+bool Gemma4LayerSplitAdapter::kvflash_sync_identity(int committed) {
+    if (!kvflash_active()) return true;
+    if (committed > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
+        std::fprintf(stderr,
+            "[gemma4-target-split][kvflash] prefix (%d) exceeds resident pool %d\n",
+            committed, kvflash_tokens_);
+        return false;
+    }
+    kvflash_pager_.reset();
+    if (!kvflash_pager_.alloc_span(0, committed)) return false;
+    kvflash_pager_.zero_free_blocks();
+    return true;
+}
+
+void Gemma4LayerSplitAdapter::kvflash_sync_history(
+        const std::vector<int32_t> & tokens, int base_pos) {
+    if (!kvflash_active()) return;
+    if (base_pos == 0) {
+        kvflash_history_.assign(tokens.begin(), tokens.end());
+        return;
+    }
+    if ((int)kvflash_history_.size() > base_pos) {
+        kvflash_history_.resize((size_t)base_pos);
+    } else if ((int)kvflash_history_.size() < base_pos) {
+        kvflash_history_.resize((size_t)base_pos, 0);
+    }
+    kvflash_history_.insert(kvflash_history_.end(), tokens.begin(), tokens.end());
+}
+
+void Gemma4LayerSplitAdapter::kvflash_maybe_reselect(int generated) {
+    if (!kvflash_active() || kvflash_tau_ <= 0) return;
+    const int tau = std::max<int>(kvflash_tau_, (int)(kvflash_history_.size() / 45));
+    if (generated % tau != 0) return;
+    if (!kvflash_scorer_) {
+        if (kvflash_drafter_path_.empty() || kvflash_drafter_failed_) return;
+        if (!kvflash_drafter_loaded_) {
+            for (auto & shard : shards_) ggml_backend_synchronize(shard.backend);
+            std::fprintf(stderr,
+                "[gemma4-target-split][kvflash] loading residency drafter: %s\n",
+                kvflash_drafter_path_.c_str());
+            if (!load_drafter(kvflash_drafter_path_, /*gpu_layers=*/999,
+                              shards_.front().gpu, kvflash_drafter_)) {
+                std::fprintf(stderr,
+                    "[gemma4-target-split][kvflash] drafter load failed (%s); "
+                    "staying on LRU residency\n",
+                    dflash27b_last_error());
+                kvflash_drafter_failed_ = true;
+                return;
+            }
+            kvflash_drafter_loaded_ = true;
+        }
+        kvflash_scorer_ = std::make_unique<KvFlashCrossTokScorer>(
+            &kvflash_drafter_, cfg_.target_path, kvflash_drafter_path_);
+        std::fprintf(stderr,
+            "[gemma4-target-split][kvflash] cross-tokenizer drafter scorer "
+            "attached (tau=%d)\n", kvflash_tau_);
+    }
+    if (!kvflash_scorer_->score_chunks(
+            kvflash_history_, kvflash_pager_.chunk_tokens(), kvflash_scores_)) {
+        return;
+    }
+    kvflash_pager_.score_hook = [this](int c) {
+        return c < (int)kvflash_scores_.size() ? kvflash_scores_[(size_t)c] : 1e30f;
+    };
+    const int events = kvflash_pager_.reselect();
+    kvflash_pager_.score_hook = nullptr;
+    if (events > 0) {
+        std::fprintf(stderr,
+            "[gemma4-target-split][kvflash] reselect @gen=%d: %d page events\n",
+            generated, events);
+    }
 }
 
 void Gemma4LayerSplitAdapter::begin_request(const GenerateRequest & req) {
@@ -105,6 +342,12 @@ void Gemma4LayerSplitAdapter::reset_request_state() {
     for (auto & shard : shards_) {
         shard.cache.cur_pos = 0;
         shard.cache.last_tok = -1;
+    }
+    if (kvflash_active()) {
+        kvflash_pager_.reset();
+        kvflash_history_.clear();
+        kvflash_scores_.clear();
+        kvflash_pager_.score_hook = nullptr;
     }
     prefill_last_logits_.clear();
 }
@@ -223,10 +466,18 @@ bool Gemma4LayerSplitAdapter::run_forward(
                     shard->cache.swa_size - (kv_start % shard->cache.swa_size);
                 n = std::min(n, swa_remaining);
             }
+            const bool use_kvflash =
+                kvflash_active() && !gemma4_is_swa_layer(ref, il);
+            if (use_kvflash && !kvflash_pager_.alloc_span(kv_start, n)) {
+                activation_buffer_free(orig);
+                activation_pair_free(acts);
+                return false;
+            }
             if (!build_gemma4_layer_step(
                     shard->layer_graph, shard->weights, shard->cache,
                     shard->backend, il, act_in, orig.tensor, act_out,
-                    start, n, kv_start)) {
+                    start, n, kv_start,
+                    use_kvflash ? &kvflash_pager_ : nullptr)) {
                 std::fprintf(stderr,
                     "[gemma4-target-split] build layer=%d @%d gpu=%d\n",
                     il, start, shard->gpu);
@@ -253,16 +504,40 @@ bool Gemma4LayerSplitAdapter::run_forward(
                                         sizeof(int32_t) * (size_t)n);
             }
 
-            const int kv_len_raw = kv_start + n;
-            const int kv_len_padded = (kv_len_raw + 255) & ~255;
-            std::vector<float> mfull((size_t)kv_len_padded * n, -INFINITY);
-            for (int q = 0; q < n; ++q) {
-                const int abs_q = kv_start + q;
-                for (int k = 0; k <= abs_q && k < kv_len_raw; ++k) {
-                    mfull[(size_t)q * kv_len_padded + k] = 0.0f;
+            if (tensor_ready(shard->layer_graph.kv_idx_full)) {
+                if (use_kvflash) {
+                    std::vector<int32_t> rows;
+                    std::vector<float> mfull;
+                    if (!kvflash_fill_rows_and_masks(
+                            kvflash_pager_, kv_start, n,
+                            (int)shard->layer_graph.attn_mask_full->ne[0],
+                            /*swa_window=*/0, rows, &mfull, nullptr)) {
+                        activation_buffer_free(orig);
+                        activation_pair_free(acts);
+                        return false;
+                    }
+                    ggml_backend_tensor_set(shard->layer_graph.kv_idx_full,
+                                            rows.data(), 0,
+                                            ggml_nbytes(shard->layer_graph.kv_idx_full));
+                    ggml_backend_tensor_set(shard->layer_graph.attn_mask_full,
+                                            mfull.data(), 0,
+                                            ggml_nbytes(shard->layer_graph.attn_mask_full));
+                } else {
+                    ggml_backend_tensor_set(shard->layer_graph.kv_idx_full,
+                                            pos.data(), 0,
+                                            ggml_nbytes(shard->layer_graph.kv_idx_full));
                 }
             }
-            if (tensor_ready(shard->layer_graph.attn_mask_full)) {
+            if (!use_kvflash && tensor_ready(shard->layer_graph.attn_mask_full)) {
+                const int kv_len_raw = kv_start + n;
+                const int kv_len_padded = (int)shard->layer_graph.attn_mask_full->ne[0];
+                std::vector<float> mfull((size_t)kv_len_padded * n, -INFINITY);
+                for (int q = 0; q < n; ++q) {
+                    const int abs_q = kv_start + q;
+                    for (int k = 0; k <= abs_q && k < kv_len_raw && k < kv_len_padded; ++k) {
+                        mfull[(size_t)q * kv_len_padded + k] = 0.0f;
+                    }
+                }
                 ggml_backend_tensor_set(shard->layer_graph.attn_mask_full,
                                         mfull.data(), 0,
                                         ggml_nbytes(shard->layer_graph.attn_mask_full));
@@ -270,7 +545,16 @@ bool Gemma4LayerSplitAdapter::run_forward(
 
             const int swa_size = shard->cache.swa_size;
             const int swa_len_raw = std::min(kv_start + n, swa_size);
-            const int swa_len_padded = (swa_len_raw + 255) & ~255;
+            const int swa_len_padded = tensor_ready(shard->layer_graph.attn_mask_swa)
+                ? (int)shard->layer_graph.attn_mask_swa->ne[0]
+                : ((swa_len_raw + 255) & ~255);
+            if (tensor_ready(shard->layer_graph.kv_idx_swa)) {
+                std::vector<int32_t> ring((size_t)n);
+                for (int i = 0; i < n; ++i) ring[(size_t)i] = (kv_start + i) % swa_size;
+                ggml_backend_tensor_set(shard->layer_graph.kv_idx_swa,
+                                        ring.data(), 0,
+                                        ggml_nbytes(shard->layer_graph.kv_idx_swa));
+            }
             std::vector<float> mswa((size_t)swa_len_padded * n, -INFINITY);
             for (int q = 0; q < n; ++q) {
                 const int abs_q = kv_start + q;
@@ -322,7 +606,12 @@ bool Gemma4LayerSplitAdapter::run_forward(
 bool Gemma4LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
                                       int base_pos,
                                       int & last_tok) {
-    return run_forward(prompt, base_pos, last_tok, &prefill_last_logits_);
+    const bool ok = run_forward(prompt, base_pos, last_tok, &prefill_last_logits_);
+    if (ok && kvflash_active()) {
+        kvflash_sync_history(prompt, base_pos);
+        kvflash_pager_.zero_free_blocks();
+    }
+    return ok;
 }
 
 bool Gemma4LayerSplitAdapter::decode_ar(
@@ -336,7 +625,7 @@ bool Gemma4LayerSplitAdapter::decode_ar(
 
     const auto & w = shards_.front().weights;
     const int vocab = w.n_vocab;
-    return run_layer_split_ar_decode(
+    const bool ok = run_layer_split_ar_decode(
         last_tok, committed, n_gen, vocab, prefill_last_logits_, sampler_,
         sampler_rng_,
         [&](const std::vector<int32_t> & one, int pos, int & next_tok,
@@ -345,6 +634,11 @@ bool Gemma4LayerSplitAdapter::decode_ar(
         },
         [&](int tok) { return tok == w.eos_id || tok == w.eos_chat_id; },
         out_tokens, io);
+    if (ok && kvflash_active()) {
+        kvflash_sync_history(out_tokens, committed);
+        kvflash_maybe_reselect((int)out_tokens.size());
+    }
+    return ok;
 }
 
 bool Gemma4LayerSplitAdapter::snapshot_save(int slot) {
@@ -353,6 +647,17 @@ bool Gemma4LayerSplitAdapter::snapshot_save(int slot) {
     auto & snap = snapshots_[(size_t)slot];
     const int snap_pos = shards_.front().cache.cur_pos;
     if (snap_pos <= 0) return false;
+    if (kvflash_active() &&
+        (snap_pos > kvflash_tokens_ || !kvflash_pager_.is_identity())) {
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr,
+                "[gemma4-target-split][kvflash] snapshot skipped: pooled "
+                "layout needs page-table serialization\n");
+            warned = true;
+        }
+        return false;
+    }
 
     snapshot_free(slot);
     if (snap.shards.size() != shards_.size()) snap.shards.resize(shards_.size());
@@ -410,6 +715,16 @@ bool Gemma4LayerSplitAdapter::snapshot_save(int slot) {
     snap.cur_pos = snap_pos;
     snap.last_tok = shards_.front().cache.last_tok;
     snap.prefill_last_logits = prefill_last_logits_;
+    if (kvflash_active() &&
+        kvflash_history_snapshots_.size() == (size_t)PREFIX_SLOTS) {
+        auto & history_snap = kvflash_history_snapshots_[(size_t)slot];
+        history_snap.clear();
+        const size_t keep = (size_t)std::min(snap_pos, (int)kvflash_history_.size());
+        history_snap.assign(kvflash_history_.begin(), kvflash_history_.begin() + keep);
+        if ((int)history_snap.size() < snap_pos) {
+            history_snap.resize((size_t)snap_pos, 0);
+        }
+    }
     return true;
 }
 
@@ -422,6 +737,9 @@ void Gemma4LayerSplitAdapter::snapshot_free(int slot) {
     snap.cur_pos = 0;
     snap.last_tok = -1;
     snap.prefill_last_logits.clear();
+    if (kvflash_history_snapshots_.size() == (size_t)PREFIX_SLOTS) {
+        kvflash_history_snapshots_[(size_t)slot].clear();
+    }
     if (snap.shards.size() != shards_.size()) snap.shards.resize(shards_.size());
 }
 
@@ -473,6 +791,20 @@ bool Gemma4LayerSplitAdapter::snapshot_restore(int slot) {
         shards_[i].cache.last_tok = snap.last_tok;
     }
     prefill_last_logits_ = snap.prefill_last_logits;
+    if (kvflash_active()) {
+        if (!kvflash_sync_identity(snap.cur_pos)) return false;
+        if (kvflash_history_snapshots_.size() == (size_t)PREFIX_SLOTS &&
+            !kvflash_history_snapshots_[(size_t)slot].empty()) {
+            kvflash_history_ = kvflash_history_snapshots_[(size_t)slot];
+        } else {
+            kvflash_history_.clear();
+        }
+        if ((int)kvflash_history_.size() > snap.cur_pos) {
+            kvflash_history_.resize((size_t)snap.cur_pos);
+        } else if ((int)kvflash_history_.size() < snap.cur_pos) {
+            kvflash_history_.resize((size_t)snap.cur_pos, 0);
+        }
+    }
     return true;
 }
 
@@ -482,7 +814,13 @@ int Gemma4LayerSplitAdapter::current_last_token() const {
 }
 
 void Gemma4LayerSplitAdapter::shutdown() {
+    kvflash_scorer_.reset();
+    if (kvflash_drafter_loaded_) {
+        dflash::common::free_drafter(kvflash_drafter_);
+        kvflash_drafter_loaded_ = false;
+    }
     for (int i = 0; i < PREFIX_SLOTS; ++i) snapshot_free(i);
+    kvflash_history_snapshots_.clear();
     auto shard_metas = layer_split_shard_metas(shards_);
     free_layer_split_snapshot_backends(shard_metas, snapshot_backends_);
     free_gemma4_layer_split_shards(shards_);

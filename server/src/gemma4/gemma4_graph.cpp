@@ -460,6 +460,8 @@ void gemma4_layer_step_graph_free(Gemma4LayerStepGraph & sg) {
     sg.token_ids = nullptr;
     sg.attn_mask_full = nullptr;
     sg.attn_mask_swa = nullptr;
+    sg.kv_idx_full = nullptr;
+    sg.kv_idx_swa = nullptr;
 }
 
 void gemma4_layer_step_graph_destroy(Gemma4LayerStepGraph & sg) {
@@ -481,9 +483,11 @@ bool build_gemma4_layer_step(
     ggml_tensor *          act_out,
     int                    chunk_start,
     int                    n_tokens,
-    int                    kv_start) {
+    int                    kv_start,
+    const KvFlashPager *   kvflash) {
     gemma4_layer_step_graph_free(sg);
     if (layer_idx < 0 || layer_idx >= w.n_layer) return false;
+    if (kvflash && cache.fa_window > 0) return false;
 
     ggml_init_params ip{};
     ip.mem_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() + 16 * 1024 * 1024;
@@ -508,8 +512,15 @@ bool build_gemma4_layer_step(
     sg.token_ids = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
     ggml_set_input(sg.token_ids);
 
+    int full_cap = cache.max_ctx;
+    for (int il = 0; il < (int)cache.k.size(); ++il) {
+        if (cache.k[(size_t)il] && !gemma4_is_swa_layer(w, il)) {
+            full_cap = (int)cache.k[(size_t)il]->ne[1];
+            break;
+        }
+    }
     const int kv_len_raw = kv_start + n_tokens;
-    const int kv_len_padded = (kv_len_raw + 255) & ~255;
+    const int kv_len_padded = std::min((kv_len_raw + 255) & ~255, full_cap);
     sg.attn_mask_full = ggml_new_tensor_4d(
         sg.ctx, GGML_TYPE_F32, kv_len_padded, n_tokens, 1, 1);
     ggml_set_input(sg.attn_mask_full);
@@ -524,11 +535,17 @@ bool build_gemma4_layer_step(
     ggml_set_input(sg.attn_mask_swa);
     ggml_tensor * mask_swa_f16 = ggml_cast(sg.ctx, sg.attn_mask_swa, GGML_TYPE_F16);
 
+    sg.kv_idx_full = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(sg.kv_idx_full);
+    sg.kv_idx_swa = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(sg.kv_idx_swa);
+
     ggml_tensor * pl_input = build_gemma4_per_layer_input(
         sg.ctx, w, embed, sg.token_ids, n_tokens, layer_idx);
     ggml_tensor * layer_out = build_gemma4_layer(
         sg.ctx, sg.gf, w, cache, layer_idx, inp, sg.positions,
-        mask_full_f16, mask_swa_f16, pl_input, kv_start, n_tokens);
+        mask_full_f16, mask_swa_f16, pl_input, kv_start, n_tokens,
+        /*capture_idx=*/-1, sg.kv_idx_full, sg.kv_idx_swa);
     if (!layer_out) return false;
 
     ggml_tensor * out_view = ggml_view_2d(

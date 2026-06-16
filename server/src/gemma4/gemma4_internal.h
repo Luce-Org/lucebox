@@ -280,6 +280,8 @@ struct Gemma4LayerStepGraph {
     ggml_tensor * token_ids = nullptr;
     ggml_tensor * attn_mask_full = nullptr;
     ggml_tensor * attn_mask_swa = nullptr;
+    ggml_tensor * kv_idx_full = nullptr;
+    ggml_tensor * kv_idx_swa = nullptr;
 };
 
 void gemma4_layer_step_graph_free(Gemma4LayerStepGraph & sg);
@@ -296,7 +298,8 @@ bool build_gemma4_layer_step(
     ggml_tensor *          act_out,
     int                    chunk_start,
     int                    n_tokens,
-    int                    kv_start);
+    int                    kv_start,
+    const class KvFlashPager * kvflash = nullptr);
 
 bool compute_gemma4_split_argmax(
     ggml_backend_t          backend,

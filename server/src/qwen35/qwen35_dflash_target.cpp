@@ -1,6 +1,7 @@
 // Qwen35DFlashTarget — DFlashTarget adapter for qwen35 hybrid models.
 
 #include "qwen35_dflash_target.h"
+#include "common/gpu_runtime_compat.h"
 #include "graph_builders.h"
 #include "step_graph.h"
 #include "attn_masks.h"

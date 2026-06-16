@@ -9,6 +9,7 @@
 #include "common/sampler.h"
 #include "common/layer_split_runtime.h"
 #include "dflash27b.h"
+#include "qwen3/qwen3_kvflash_scorer.h"
 
 #include "ggml-cuda.h"
 #include "ggml-cpu.h"
@@ -18,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -71,18 +73,31 @@ bool LagunaLayerSplitAdapter::init() {
         const TargetLoadPlan plan =
             make_layer_split_load_plan<TargetLoadPlan>(shard, i + 1 == shards_.size());
         if (!load_target_gguf_laguna_partial(
-                cfg_.target_path, shard.backend, plan, shard.weights) ||
-            !create_laguna_target_cache_partial(
-                shard.weights, cfg_.device.max_ctx, shard.backend,
-                shard.layer_begin, shard.layer_end, shard.cache)) {
+                cfg_.target_path, shard.backend, plan, shard.weights)) {
             std::fprintf(stderr,
-                "[laguna-target-split] load/cache gpu=%d: %s\n",
+                "[laguna-target-split] load gpu=%d: %s\n",
+                shard.gpu, dflash27b_last_error());
+            return false;
+        }
+    }
+
+    kvflash_read_config();
+
+    for (size_t i = 0; i < shards_.size(); ++i) {
+        auto & shard = shards_[i];
+        if (!create_laguna_target_cache_partial(
+                shard.weights, cfg_.device.max_ctx, shard.backend,
+                shard.layer_begin, shard.layer_end, shard.cache,
+                kvflash_tokens_)) {
+            std::fprintf(stderr,
+                "[laguna-target-split] cache gpu=%d: %s\n",
                 shard.gpu, dflash27b_last_error());
             return false;
         }
         std::fprintf(stderr, "[laguna-target-split] gpu=%d layers=[%d,%d)\n",
                      shard.gpu, shard.layer_begin, shard.layer_end);
     }
+    if (!kvflash_attach()) return false;
 
     snapshots_.resize(PREFIX_SLOTS);
     for (auto & slot : snapshots_) {
@@ -92,7 +107,169 @@ bool LagunaLayerSplitAdapter::init() {
     disk_snapshot_contexts_.assign(PREFIX_SLOTS, nullptr);
     disk_snapshot_buffers_.assign(PREFIX_SLOTS, nullptr);
     disk_snapshot_backends_.assign(PREFIX_SLOTS, nullptr);
+    kvflash_history_snapshots_.resize(PREFIX_SLOTS);
     return true;
+}
+
+KvFlashConfig LagunaLayerSplitAdapter::kvflash_config() const {
+    KvFlashConfig pc;
+    if (!shards_.empty() && shards_.front().weights.sliding_window > 0) {
+        pc.tail_window_chunks =
+            std::max(4, (shards_.front().weights.sliding_window +
+                         pc.chunk_tokens - 1) / pc.chunk_tokens + 1);
+    }
+    return pc;
+}
+
+void LagunaLayerSplitAdapter::kvflash_read_config() {
+    if (!std::getenv("DFLASH_KVFLASH") || shards_.empty()) return;
+    kvflash_drafter_path_ = kvflash_find_drafter(cfg_.target_path);
+
+    int64_t min_free = std::numeric_limits<int64_t>::max();
+    int64_t max_bytes_per_token = 0;
+    const LagunaTargetWeights & ref = shards_.front().weights;
+    for (const auto & shard : shards_) {
+        size_t gpu_free = 0, gpu_total = 0;
+        if (ggml_backend_dev_t dev = ggml_backend_get_device(shard.backend)) {
+            ggml_backend_dev_memory(dev, &gpu_free, &gpu_total);
+        }
+        min_free = std::min<int64_t>(min_free, (int64_t)gpu_free);
+
+        const int owned_layers =
+            std::max(0, shard.layer_end - shard.layer_begin);
+        const int64_t bpt = (int64_t)owned_layers * ref.n_head_kv * 2 *
+            (int64_t)ggml_row_size(GGML_TYPE_Q8_0, ref.head_dim);
+        max_bytes_per_token = std::max<int64_t>(max_bytes_per_token, bpt);
+    }
+    if (min_free == std::numeric_limits<int64_t>::max()) min_free = 0;
+
+    KvFlashAutoBudget budget;
+    budget.free_bytes = min_free;
+    budget.bytes_per_token = max_bytes_per_token;
+    budget.reserve_bytes = (int64_t)(1.5 * 1073741824.0) +
+        (kvflash_drafter_path_.empty() ? 0 : (int64_t)(1.7 * 1073741824.0));
+    kvflash_tokens_ = kvflash_pool_from_env(
+        cfg_.device.max_ctx, kvflash_config(),
+        !kvflash_drafter_path_.empty(), budget);
+    if (kvflash_tokens_ > 0) {
+        const char * tau = std::getenv("DFLASH_KVFLASH_TAU");
+        kvflash_tau_ = std::max(1, tau ? std::atoi(tau) : 64);
+    }
+}
+
+bool LagunaLayerSplitAdapter::kvflash_attach() {
+    if (!kvflash_active()) return true;
+    std::vector<ggml_tensor *> all_k;
+    std::vector<ggml_tensor *> all_v;
+    const int n_layer = shards_.empty() ? 0 : shards_.front().weights.n_layer;
+    for (int il = 0; il < n_layer; ++il) {
+        ggml_tensor * k = nullptr;
+        ggml_tensor * v = nullptr;
+        for (auto & shard : shards_) {
+            if (il < (int)shard.cache.attn_k.size() &&
+                shard.cache.attn_k[(size_t)il]) {
+                k = shard.cache.attn_k[(size_t)il];
+                v = shard.cache.attn_v[(size_t)il];
+                break;
+            }
+        }
+        if (k && v) {
+            all_k.push_back(k);
+            all_v.push_back(v);
+        }
+    }
+    KvFlashConfig pc = kvflash_config();
+    pc.pool_tokens = kvflash_tokens_;
+    if (!kvflash_pager_.attach(pc, all_k, all_v)) {
+        std::fprintf(stderr,
+            "[laguna-target-split][kvflash] pager attach failed pool=%d layers=%zu\n",
+            kvflash_tokens_, all_k.size());
+        return false;
+    }
+    std::printf("[laguna-target-split][kvflash] resident pool %d tokens over "
+                "%zu layers (logical max_ctx %d), tau=%d, policy=%s, "
+                "swa_tail=%d chunks\n",
+                kvflash_tokens_, all_k.size(), cfg_.device.max_ctx,
+                kvflash_tau_,
+                !kvflash_drafter_path_.empty()
+                    ? "drafter/cross-tok (attaches on first reselect)"
+                    : "lru (recency-only: no Qwen3-0.6B drafter found)",
+                pc.tail_window_chunks);
+    std::fflush(stdout);
+    return true;
+}
+
+bool LagunaLayerSplitAdapter::kvflash_sync_identity(int committed) {
+    if (!kvflash_active()) return true;
+    if (committed > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
+        std::fprintf(stderr,
+            "[laguna-target-split][kvflash] prefix (%d) exceeds resident pool %d\n",
+            committed, kvflash_tokens_);
+        return false;
+    }
+    kvflash_pager_.reset();
+    if (!kvflash_pager_.alloc_span(0, committed)) return false;
+    kvflash_pager_.zero_free_blocks();
+    return true;
+}
+
+void LagunaLayerSplitAdapter::kvflash_sync_history(
+        const std::vector<int32_t> & tokens, int base_pos) {
+    if (!kvflash_active()) return;
+    if (base_pos == 0) {
+        kvflash_history_.assign(tokens.begin(), tokens.end());
+        return;
+    }
+    if ((int)kvflash_history_.size() > base_pos) {
+        kvflash_history_.resize((size_t)base_pos);
+    } else if ((int)kvflash_history_.size() < base_pos) {
+        kvflash_history_.resize((size_t)base_pos, 0);
+    }
+    kvflash_history_.insert(kvflash_history_.end(), tokens.begin(), tokens.end());
+}
+
+void LagunaLayerSplitAdapter::kvflash_maybe_reselect(int generated) {
+    if (!kvflash_active() || kvflash_tau_ <= 0) return;
+    const int tau = std::max<int>(kvflash_tau_, (int)(kvflash_history_.size() / 45));
+    if (generated % tau != 0) return;
+    if (!kvflash_scorer_) {
+        if (kvflash_drafter_path_.empty() || kvflash_drafter_failed_) return;
+        if (!kvflash_drafter_loaded_) {
+            for (auto & shard : shards_) ggml_backend_synchronize(shard.backend);
+            std::fprintf(stderr,
+                "[laguna-target-split][kvflash] loading residency drafter: %s\n",
+                kvflash_drafter_path_.c_str());
+            if (!load_drafter(kvflash_drafter_path_, /*gpu_layers=*/999,
+                              shards_.front().gpu, kvflash_drafter_)) {
+                std::fprintf(stderr,
+                    "[laguna-target-split][kvflash] drafter load failed (%s); "
+                    "staying on LRU residency\n",
+                    dflash27b_last_error());
+                kvflash_drafter_failed_ = true;
+                return;
+            }
+            kvflash_drafter_loaded_ = true;
+        }
+        kvflash_scorer_ = std::make_unique<KvFlashCrossTokScorer>(
+            &kvflash_drafter_, cfg_.target_path, kvflash_drafter_path_);
+        std::fprintf(stderr,
+            "[laguna-target-split][kvflash] cross-tokenizer drafter scorer "
+            "attached (tau=%d)\n", kvflash_tau_);
+    }
+    if (!kvflash_scorer_->score_chunks(
+            kvflash_history_, kvflash_pager_.chunk_tokens(), kvflash_scores_)) {
+        return;
+    }
+    kvflash_pager_.score_hook = [this](int c) {
+        return c < (int)kvflash_scores_.size() ? kvflash_scores_[(size_t)c] : 1e30f;
+    };
+    const int events = kvflash_pager_.reselect();
+    kvflash_pager_.score_hook = nullptr;
+    if (events > 0) {
+        std::fprintf(stderr,
+            "[laguna-target-split][kvflash] reselect @gen=%d: %d page events\n",
+            generated, events);
+    }
 }
 
 void LagunaLayerSplitAdapter::begin_request(const GenerateRequest & req) {
@@ -105,6 +282,12 @@ void LagunaLayerSplitAdapter::begin_request(const GenerateRequest & req) {
 void LagunaLayerSplitAdapter::reset_request_state() {
     for (auto & shard : shards_) {
         reset_laguna_target_cache(shard.cache);
+    }
+    if (kvflash_active()) {
+        kvflash_pager_.reset();
+        kvflash_history_.clear();
+        kvflash_scores_.clear();
+        kvflash_pager_.score_hook = nullptr;
     }
     prefill_last_logits_.clear();
 }
@@ -191,9 +374,14 @@ bool LagunaLayerSplitAdapter::run_forward(
         for (int start = 0; start < n_tokens_total;) {
             const int n = std::min(ubatch, n_tokens_total - start);
             const int kv_start = base_pos + start;
+            if (kvflash_active() && !kvflash_pager_.alloc_span(kv_start, n)) {
+                activation_pair_free(acts);
+                return false;
+            }
             if (!build_laguna_layer_step(
                     shard->layer_graph, shard->weights, shard->cache,
-                    shard->backend, il, act_in, act_out, start, n, kv_start)) {
+                    shard->backend, il, act_in, act_out, start, n, kv_start,
+                    kvflash_active() ? &kvflash_pager_ : nullptr)) {
                 std::fprintf(stderr,
                     "[laguna-target-split] build layer=%d @%d gpu=%d\n",
                     il, start, shard->gpu);
@@ -210,33 +398,73 @@ bool LagunaLayerSplitAdapter::run_forward(
             ggml_backend_tensor_set(shard->layer_graph.positions, pos.data(), 0,
                                     sizeof(int32_t) * pos.size());
 
-            const int kv_len = kv_start + n;
-            std::vector<float> mfull((size_t)kv_len * n, -INFINITY);
-            for (int q = 0; q < n; ++q) {
-                const int abs_q = kv_start + q;
-                for (int k = 0; k <= abs_q && k < kv_len; ++k) {
-                    mfull[(size_t)q * kv_len + k] = 0.0f;
+            if (kvflash_active()) {
+                std::vector<int32_t> rows;
+                std::vector<float> mfull;
+                std::vector<float> mswa;
+                const ggml_tensor * mask_ref =
+                    shard->layer_graph.attn_mask ? shard->layer_graph.attn_mask
+                                                 : shard->layer_graph.attn_mask_swa;
+                if (!mask_ref) {
+                    activation_pair_free(acts);
+                    return false;
                 }
-            }
-            if (tensor_ready(shard->layer_graph.attn_mask)) {
-                ggml_backend_tensor_set(shard->layer_graph.attn_mask,
-                                        mfull.data(), 0,
-                                        ggml_nbytes(shard->layer_graph.attn_mask));
-            }
+                if (!kvflash_fill_rows_and_masks(
+                        kvflash_pager_, kv_start, n,
+                        (int)mask_ref->ne[0],
+                        ref.sliding_window, rows, &mfull, &mswa)) {
+                    activation_pair_free(acts);
+                    return false;
+                }
+                if (tensor_ready(shard->layer_graph.kv_idx)) {
+                    ggml_backend_tensor_set(shard->layer_graph.kv_idx,
+                                            rows.data(), 0,
+                                            ggml_nbytes(shard->layer_graph.kv_idx));
+                }
+                if (tensor_ready(shard->layer_graph.attn_mask)) {
+                    ggml_backend_tensor_set(shard->layer_graph.attn_mask,
+                                            mfull.data(), 0,
+                                            ggml_nbytes(shard->layer_graph.attn_mask));
+                }
+                if (tensor_ready(shard->layer_graph.attn_mask_swa)) {
+                    ggml_backend_tensor_set(shard->layer_graph.attn_mask_swa,
+                                            mswa.data(), 0,
+                                            ggml_nbytes(shard->layer_graph.attn_mask_swa));
+                }
+            } else {
+                const int kv_len = kv_start + n;
+                std::vector<float> mfull((size_t)kv_len * n, -INFINITY);
+                for (int q = 0; q < n; ++q) {
+                    const int abs_q = kv_start + q;
+                    for (int k = 0; k <= abs_q && k < kv_len; ++k) {
+                        mfull[(size_t)q * kv_len + k] = 0.0f;
+                    }
+                }
+                if (tensor_ready(shard->layer_graph.kv_idx)) {
+                    ggml_backend_tensor_set(shard->layer_graph.kv_idx,
+                                            pos.data(), 0,
+                                            ggml_nbytes(shard->layer_graph.kv_idx));
+                }
+                if (tensor_ready(shard->layer_graph.attn_mask)) {
+                    ggml_backend_tensor_set(shard->layer_graph.attn_mask,
+                                            mfull.data(), 0,
+                                            ggml_nbytes(shard->layer_graph.attn_mask));
+                }
 
-            std::vector<float> mswa((size_t)kv_len * n, -INFINITY);
-            const int W = ref.sliding_window;
-            for (int q = 0; q < n; ++q) {
-                const int abs_q = kv_start + q;
-                const int win_lo = std::max(0, abs_q - W + 1);
-                for (int k = win_lo; k <= abs_q && k < kv_len; ++k) {
-                    mswa[(size_t)q * kv_len + k] = 0.0f;
+                std::vector<float> mswa((size_t)kv_len * n, -INFINITY);
+                const int W = ref.sliding_window;
+                for (int q = 0; q < n; ++q) {
+                    const int abs_q = kv_start + q;
+                    const int win_lo = std::max(0, abs_q - W + 1);
+                    for (int k = win_lo; k <= abs_q && k < kv_len; ++k) {
+                        mswa[(size_t)q * kv_len + k] = 0.0f;
+                    }
                 }
-            }
-            if (tensor_ready(shard->layer_graph.attn_mask_swa)) {
-                ggml_backend_tensor_set(shard->layer_graph.attn_mask_swa,
-                                        mswa.data(), 0,
-                                        ggml_nbytes(shard->layer_graph.attn_mask_swa));
+                if (tensor_ready(shard->layer_graph.attn_mask_swa)) {
+                    ggml_backend_tensor_set(shard->layer_graph.attn_mask_swa,
+                                            mswa.data(), 0,
+                                            ggml_nbytes(shard->layer_graph.attn_mask_swa));
+                }
             }
 
             auto st = ggml_backend_graph_compute(shard->backend,
@@ -271,7 +499,12 @@ bool LagunaLayerSplitAdapter::run_forward(
 bool LagunaLayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
                                       int base_pos,
                                       int & last_tok) {
-    return run_forward(prompt, base_pos, last_tok, &prefill_last_logits_);
+    const bool ok = run_forward(prompt, base_pos, last_tok, &prefill_last_logits_);
+    if (ok && kvflash_active()) {
+        kvflash_sync_history(prompt, base_pos);
+        kvflash_pager_.zero_free_blocks();
+    }
+    return ok;
 }
 
 bool LagunaLayerSplitAdapter::decode_ar(
@@ -285,7 +518,7 @@ bool LagunaLayerSplitAdapter::decode_ar(
 
     const auto & w = shards_.front().weights;
     const int vocab = (int)w.embedder.n_vocab;
-    return run_layer_split_ar_decode(
+    const bool ok = run_layer_split_ar_decode(
         last_tok, committed, n_gen, vocab, prefill_last_logits_, sampler_,
         sampler_rng_,
         [&](const std::vector<int32_t> & one, int pos, int & next_tok,
@@ -294,6 +527,11 @@ bool LagunaLayerSplitAdapter::decode_ar(
         },
         [&](int tok) { return tok == w.eos_id || tok == w.eos_chat_id; },
         out_tokens, io);
+    if (ok && kvflash_active()) {
+        kvflash_sync_history(out_tokens, committed);
+        kvflash_maybe_reselect((int)out_tokens.size());
+    }
+    return ok;
 }
 
 bool LagunaLayerSplitAdapter::snapshot_save(int slot) {
@@ -302,6 +540,17 @@ bool LagunaLayerSplitAdapter::snapshot_save(int slot) {
     auto & snap = snapshots_[(size_t)slot];
     const int snap_pos = shards_.front().cache.cur_pos;
     if (snap_pos <= 0) return false;
+    if (kvflash_active() &&
+        (snap_pos > kvflash_tokens_ || !kvflash_pager_.is_identity())) {
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr,
+                "[laguna-target-split][kvflash] snapshot skipped: pooled "
+                "layout needs page-table serialization\n");
+            warned = true;
+        }
+        return false;
+    }
 
     snapshot_free(slot);
     if (snap.shards.size() != shards_.size()) snap.shards.resize(shards_.size());
@@ -318,6 +567,16 @@ bool LagunaLayerSplitAdapter::snapshot_save(int slot) {
     snap.cur_pos = snap_pos;
     snap.last_tok = shards_.front().cache.last_tok;
     snap.prefill_last_logits = prefill_last_logits_;
+    if (kvflash_active() &&
+        kvflash_history_snapshots_.size() == (size_t)PREFIX_SLOTS) {
+        auto & history_snap = kvflash_history_snapshots_[(size_t)slot];
+        history_snap.clear();
+        const size_t keep = (size_t)std::min(snap_pos, (int)kvflash_history_.size());
+        history_snap.assign(kvflash_history_.begin(), kvflash_history_.begin() + keep);
+        if ((int)history_snap.size() < snap_pos) {
+            history_snap.resize((size_t)snap_pos, 0);
+        }
+    }
     if (!rebuild_disk_snapshot(slot)) {
         snapshot_free(slot);
         return false;
@@ -357,6 +616,9 @@ void LagunaLayerSplitAdapter::snapshot_free(int slot) {
     if (snapshot_prefill_logit_tensors_.size() == (size_t)PREFIX_SLOTS) {
         snapshot_prefill_logit_tensors_[(size_t)slot].clear();
     }
+    if (kvflash_history_snapshots_.size() == (size_t)PREFIX_SLOTS) {
+        kvflash_history_snapshots_[(size_t)slot].clear();
+    }
     if (snap.shards.size() != shards_.size()) snap.shards.resize(shards_.size());
 }
 
@@ -389,6 +651,20 @@ bool LagunaLayerSplitAdapter::snapshot_restore(int slot) {
         shards_[i].cache.last_tok = snap.last_tok;
     }
     prefill_last_logits_ = snap.prefill_last_logits;
+    if (kvflash_active()) {
+        if (!kvflash_sync_identity(snap.cur_pos)) return false;
+        if (kvflash_history_snapshots_.size() == (size_t)PREFIX_SLOTS &&
+            !kvflash_history_snapshots_[(size_t)slot].empty()) {
+            kvflash_history_ = kvflash_history_snapshots_[(size_t)slot];
+        } else {
+            kvflash_history_.clear();
+        }
+        if ((int)kvflash_history_.size() > snap.cur_pos) {
+            kvflash_history_.resize((size_t)snap.cur_pos);
+        } else if ((int)kvflash_history_.size() < snap.cur_pos) {
+            kvflash_history_.resize((size_t)snap.cur_pos, 0);
+        }
+    }
     return true;
 }
 
@@ -595,7 +871,13 @@ int LagunaLayerSplitAdapter::current_last_token() const {
 }
 
 void LagunaLayerSplitAdapter::shutdown() {
+    kvflash_scorer_.reset();
+    if (kvflash_drafter_loaded_) {
+        dflash::common::free_drafter(kvflash_drafter_);
+        kvflash_drafter_loaded_ = false;
+    }
     for (int i = 0; i < PREFIX_SLOTS; ++i) snapshot_free(i);
+    kvflash_history_snapshots_.clear();
     auto shard_metas = layer_split_shard_metas(shards_);
     free_layer_split_snapshot_backends(shard_metas, snapshot_backends_);
     free_laguna_layer_split_shards(shards_);
