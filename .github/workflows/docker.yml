@@ -171,7 +171,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Build and push
-        uses: docker/bake-action@4a9a8d494466d37134e2bfca2d3a8de8fb2681ad # v5
+        uses: docker/bake-action@6614cfa25eff9a0b2b2697efb0b6159e7680d584 # v7.2.0
         env:
           # Wire identity into docker-bake.hcl's GIT_SHA / IMAGE_TAG /
           # BUILD_TIME variables. IMAGE_TAG is `${{ steps.meta.outputs.
