@@ -14,7 +14,7 @@ dependencies = [
 
 [project.optional-dependencies]
 megakernel = ["qwen35-megakernel-bf16"]
-dev = ["pytest>=8", "mypy>=1.10,<2", "ruff>=0.14,<1"]
+dev = ["pytest>=9.1.0", "mypy>=1.10,<2", "ruff>=0.14,<1"]
 
 [tool.ruff]
 target-version = "py312"
