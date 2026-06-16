@@ -156,7 +156,11 @@ public:
         }
         for (auto & st : chunks_) {
             if (st.host_data) {
-                cudaFreeHost(st.host_data);
+                cudaError_t err = cudaFreeHost(st.host_data);
+                if (err != cudaSuccess) {
+                    std::fprintf(stderr, "[kvflash] cudaFreeHost failed: %s\n",
+                                 cudaGetErrorString(err));
+                }
                 st.host_data = nullptr;
             }
         }
@@ -258,7 +262,12 @@ public:
         ChunkState & st = chunks_[c];
         if (!st.on_host) {
 #ifdef KVFLASH_HAS_ASYNC_DMA
-            cudaMallocHost(&st.host_data, chunk_bytes_);
+            cudaError_t err = cudaMallocHost(&st.host_data, chunk_bytes_);
+            if (err != cudaSuccess) {
+                std::fprintf(stderr, "[kvflash] cudaMallocHost failed: %s\n",
+                             cudaGetErrorString(err));
+                return false;
+            }
 #else
             st.host_data.resize(chunk_bytes_);
 #endif
@@ -435,12 +444,17 @@ private:
                         (size_t)h * t->nb[2];
                     void * host_ptr = (uint8_t *)st.host_data + host_off;
                     void * dev_ptr  = (uint8_t *)t->data + dev_off;
+                    cudaError_t err;
                     if (to_host)
-                        cudaMemcpyAsync(host_ptr, dev_ptr, seg,
+                        err = cudaMemcpyAsync(host_ptr, dev_ptr, seg,
                                         cudaMemcpyDeviceToHost, page_stream_);
                     else
-                        cudaMemcpyAsync(dev_ptr, host_ptr, seg,
+                        err = cudaMemcpyAsync(dev_ptr, host_ptr, seg,
                                         cudaMemcpyHostToDevice, page_stream_);
+                    if (err != cudaSuccess) {
+                        std::fprintf(stderr, "[kvflash] cudaMemcpyAsync(%s) failed: %s\n",
+                                     to_host ? "D2H" : "H2D", cudaGetErrorString(err));
+                    }
                     host_off += seg;
                 }
             }
@@ -474,7 +488,11 @@ private:
                 for (int h = 0; h < n_head_kv_; h++) {
                     const size_t off = (size_t)block * cfg_.chunk_tokens * t->nb[1] + (size_t)h * t->nb[2];
 #ifdef KVFLASH_HAS_ASYNC_DMA
-                    cudaMemsetAsync((uint8_t *)t->data + off, 0, seg, page_stream_);
+                    cudaError_t err = cudaMemsetAsync((uint8_t *)t->data + off, 0, seg, page_stream_);
+                    if (err != cudaSuccess) {
+                        std::fprintf(stderr, "[kvflash] cudaMemsetAsync failed: %s\n",
+                                     cudaGetErrorString(err));
+                    }
 #else
                     ggml_backend_tensor_set(t, zero_buf_.data(), off, seg);
 #endif
@@ -483,15 +501,21 @@ private:
         }
     }
 
-    // Release page_stream_, all pinned host_data buffers, and pool state.
+    // Release page_stream_ and all pinned host_data buffers.
     // Safe to call on a never-attached or already-cleaned-up instance.
+    // Does NOT touch pool state (chunks_, free_blocks_) — that is the
+    // caller's responsibility (reset() or destructor via caller).
     void cleanup_() {
 #ifdef KVFLASH_HAS_ASYNC_DMA
         if (page_stream_) {
             cudaStreamSynchronize(page_stream_);
             for (auto & st : chunks_) {
                 if (st.host_data) {
-                    cudaFreeHost(st.host_data);
+                    cudaError_t err = cudaFreeHost(st.host_data);
+                    if (err != cudaSuccess) {
+                        std::fprintf(stderr, "[kvflash] cudaFreeHost failed: %s\n",
+                                     cudaGetErrorString(err));
+                    }
                     st.host_data = nullptr;
                 }
             }
@@ -499,9 +523,6 @@ private:
             page_stream_ = nullptr;
         }
 #endif
-        chunks_.clear();
-        free_blocks_.clear();
-        n_blocks_ = 0;
         has_pending_page_in_ = false;
     }
 
