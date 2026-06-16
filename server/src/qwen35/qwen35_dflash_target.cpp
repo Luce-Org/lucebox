@@ -4,6 +4,11 @@
 #include "graph_builders.h"
 #include "step_graph.h"
 #include "attn_masks.h"
+// gpu_runtime_compat.h maps the raw cudaStream_t / cudaMemcpy* symbols used
+// below (rollback_to / rollback_to_tree) onto their HIP equivalents. Without
+// it the file only compiles on CUDA via a transitive <cuda_runtime.h>; HIP
+// builds (e.g. gfx1151) fail with "cudaStream_t undeclared".
+#include "common/gpu_runtime_compat.h"
 
 #include <cstring>
 
