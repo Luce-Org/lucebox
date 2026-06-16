@@ -172,6 +172,15 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash_is_consumer_blackwell)
     set(GGML_CUDA_BLACKWELL_CONSUMER ON CACHE BOOL
         "Skip sm_12X→sm_12Xa for consumer Blackwell (no FP4)" FORCE)
 endif()
+
+if(WIN32)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "Static ggml on Windows (internal CUDA symbols not dllexported)" FORCE)
+endif()
+
+if(WIN32 AND NOT CMAKE_ASM_COMPILER)
+    set(CMAKE_ASM_COMPILER "${CMAKE_CXX_COMPILER}" CACHE FILEPATH "" FORCE)
+endif()
+
 # Use only the ggml subtree of llama.cpp (skip libllama).
 add_subdirectory(deps/llama.cpp/ggml EXCLUDE_FROM_ALL)
 
@@ -561,6 +570,7 @@ endif()
 # ─── Tests (numerics vs oracle) ────────────────────────────────────
 
 option(DFLASH27B_TESTS "Build numerics tests" ON)
+option(DFLASH27B_SERVER "Build dflash_server + backend_ipc_daemon" ON)
 if(DFLASH27B_TESTS)
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash_cuda_min_sm GREATER_EQUAL 80 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
         add_executable(test_flashprefill_kernels test/test_flashprefill_kernels.cpp)
@@ -749,79 +759,6 @@ if(DFLASH27B_TESTS)
         endif()
     endif()
 
-    # ─── dflash_server: native C++ HTTP server ─────────────────────────
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/server/server_main.cpp")
-        find_package(CURL QUIET)
-        if(NOT CURL_FOUND)
-            message(WARNING "CURL not found — building dflash_server without passthrough proxy")
-        endif()
-        add_executable(dflash_server
-            src/server/server_main.cpp
-            src/server/http_server.cpp
-            src/server/model_card.cpp
-            src/server/prompt_normalize.cpp
-        )
-        target_include_directories(dflash_server PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
-            target_compile_definitions(dflash_server PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
-        else()
-            target_compile_definitions(dflash_server PRIVATE
-                DFLASH27B_BACKEND_CUDA=1
-                DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
-        endif()
-        if(NOT WIN32)
-            target_link_libraries(dflash_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread)
-        else()
-            target_link_libraries(dflash_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} ws2_32)
-        endif()
-        if(CURL_FOUND)
-            target_compile_definitions(dflash_server PRIVATE DFLASH_HAS_CURL=1)
-            target_link_libraries(dflash_server PRIVATE CURL::libcurl)
-        endif()
-        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-            find_package(CUDAToolkit REQUIRED)
-            target_link_libraries(dflash_server PRIVATE CUDA::cudart)
-        else()
-            target_link_libraries(dflash_server PRIVATE hip::host)
-        endif()
-
-        # Copy share/status.html next to the binary so it can be found at runtime.
-        if(TARGET dflash_server)
-            add_custom_command(TARGET dflash_server POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E make_directory
-                    "$<TARGET_FILE_DIR:dflash_server>/share"
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${CMAKE_CURRENT_SOURCE_DIR}/share/status.html"
-                    "$<TARGET_FILE_DIR:dflash_server>/share/status.html"
-                COMMENT "Copying status.html to build/share/"
-            )
-            install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/share/status.html"
-                    DESTINATION share)
-        endif()
-    endif()
-
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc/backend_ipc_main.cpp")
-        add_executable(backend_ipc_daemon
-            src/ipc/backend_ipc_main.cpp
-            src/common/pflash_drafter_ipc_daemon.cpp
-        )
-        target_include_directories(backend_ipc_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
-            target_compile_definitions(backend_ipc_daemon PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
-        else()
-            target_compile_definitions(backend_ipc_daemon PRIVATE
-                DFLASH27B_BACKEND_CUDA=1
-                DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
-        endif()
-        target_link_libraries(backend_ipc_daemon PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread)
-        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-            find_package(CUDAToolkit REQUIRED)
-            target_link_libraries(backend_ipc_daemon PRIVATE CUDA::cudart)
-        else()
-            target_link_libraries(backend_ipc_daemon PRIVATE hip::host)
-        endif()
-    endif()
-
     # Tokenizer test harness (no GPU needed — links static lib for tokenizer + GGUF reader)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_tokenizer_harness.cpp")
         add_executable(test_tokenizer_harness test/test_tokenizer_harness.cpp)
@@ -925,5 +862,85 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${DFLASH27B_SRC_INCLUDE_DIRS})
     endif()
+    endif()
+endif()
+
+if(DFLASH27B_SERVER)
+
+    # ─── dflash_server: native C++ HTTP server ─────────────────────────
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/server/server_main.cpp")
+        find_package(CURL QUIET)
+        if(NOT CURL_FOUND)
+            message(WARNING "CURL not found — building dflash_server without passthrough proxy")
+        endif()
+        add_executable(dflash_server
+            src/server/server_main.cpp
+            src/server/http_server.cpp
+            src/server/model_card.cpp
+            src/server/prompt_normalize.cpp
+        )
+        target_include_directories(dflash_server PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(dflash_server PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        else()
+            target_compile_definitions(dflash_server PRIVATE
+                DFLASH27B_BACKEND_CUDA=1
+                DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
+        endif()
+        if(NOT WIN32)
+            target_link_libraries(dflash_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread)
+        else()
+            target_link_libraries(dflash_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} ws2_32)
+        endif()
+        if(CURL_FOUND)
+            target_compile_definitions(dflash_server PRIVATE DFLASH_HAS_CURL=1)
+            target_link_libraries(dflash_server PRIVATE CURL::libcurl)
+        endif()
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(dflash_server PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(dflash_server PRIVATE hip::host)
+        endif()
+
+        # Copy share/status.html next to the binary so it can be found at runtime.
+        if(TARGET dflash_server)
+            add_custom_command(TARGET dflash_server POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory
+                    "$<TARGET_FILE_DIR:dflash_server>/share"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${CMAKE_CURRENT_SOURCE_DIR}/share/status.html"
+                    "$<TARGET_FILE_DIR:dflash_server>/share/status.html"
+                COMMENT "Copying status.html to build/share/"
+            )
+            install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/share/status.html"
+                    DESTINATION share)
+        endif()
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc/backend_ipc_main.cpp")
+        add_executable(backend_ipc_daemon
+            src/ipc/backend_ipc_main.cpp
+            src/common/pflash_drafter_ipc_daemon.cpp
+        )
+        target_include_directories(backend_ipc_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(backend_ipc_daemon PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        else()
+            target_compile_definitions(backend_ipc_daemon PRIVATE
+                DFLASH27B_BACKEND_CUDA=1
+                DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
+        endif()
+        if(NOT WIN32)
+            target_link_libraries(backend_ipc_daemon PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread)
+        else()
+            target_link_libraries(backend_ipc_daemon PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} ws2_32)
+        endif()
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(backend_ipc_daemon PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(backend_ipc_daemon PRIVATE hip::host)
+        endif()
     endif()
 endif()
