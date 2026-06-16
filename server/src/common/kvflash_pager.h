@@ -31,6 +31,18 @@
 //
 // Scope: full-attention layers only. DeltaNet/conv recurrent state is
 // fixed-size, position-dependent in-place state and is never paged.
+//
+// Async DMA (KVFLASH_HAS_ASYNC_DMA):
+//  When built with a CUDA or HIP backend, page-out (D2H) and page-in
+//  (H2D) transfers run on a dedicated page_stream_ rather than blocking
+//  the decode thread via ggml_backend_tensor_get/set.  Host backing
+//  buffers are cudaMallocHost-pinned for maximum PCIe throughput.
+//  alloc_span() synchronises page_stream_ only if a page-in was issued
+//  (H2D must complete before the next attention forward); page-outs fire
+//  and are forgotten—the DMA completes during the subsequent forward
+//  pass.  On the same stream, page-out D2H always precedes the slot
+//  zero (cudaMemsetAsync), which in turn precedes any page-in H2D, so
+//  host_data is coherent by the time it is read back.
 
 #pragma once
 
@@ -46,6 +58,14 @@
 #include <functional>
 #include <string>
 #include <vector>
+
+// Async DMA via a dedicated copy stream — enabled when a GPU runtime is
+// available.  gpu_runtime_compat.h maps cuda* → hip* on HIP builds and
+// pulls in <cuda_runtime.h> on CUDA builds.
+#if defined(DFLASH27B_BACKEND_CUDA) || defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#include "gpu_runtime_compat.h"
+#define KVFLASH_HAS_ASYNC_DMA 1
+#endif
 
 namespace dflash::common {
 
@@ -76,6 +96,8 @@ public:
         return (cfg.sink_chunks + cfg.tail_window_chunks + 2) * cfg.chunk_tokens;
     }
 
+    ~KvFlashPager() { cleanup_(); }
+
     bool attach(const KvFlashConfig & cfg,
                 const std::vector<ggml_tensor *> & attn_k,
                 const std::vector<ggml_tensor *> & attn_v) {
@@ -89,6 +111,9 @@ public:
             return false;
         }
         if (attn_k.empty() || attn_k.size() != attn_v.size()) return false;
+
+        cleanup_();   // release pinned buffers + stream from any prior attach
+
         cfg_ = cfg;
         attn_k_ = attn_k;
         attn_v_ = attn_v;
@@ -108,6 +133,11 @@ public:
         chunks_.clear();
         stats_ = {};
         clock_ = 0;
+        has_pending_page_in_ = false;
+
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        cudaStreamCreate(&page_stream_);
+#endif
         return true;
     }
 
@@ -120,12 +150,24 @@ public:
     // Drop all mappings and host backing (new request / cache reset).
     // Cumulative stats are kept; the epoch advances so cached masks refill.
     void reset() {
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        if (page_stream_) {
+            cudaStreamSynchronize(page_stream_);
+        }
+        for (auto & st : chunks_) {
+            if (st.host_data) {
+                cudaFreeHost(st.host_data);
+                st.host_data = nullptr;
+            }
+        }
+#endif
         chunks_.clear();
         free_blocks_.clear();
         for (int b = n_blocks_ - 1; b >= 0; b--) free_blocks_.push_back(b);
         stats_.host_bytes = 0;
         cur_chunk_ = 0;
         epoch_++;
+        has_pending_page_in_ = false;
     }
 
     // Zero every currently-free block. reset() drops mappings but leaves the
@@ -135,6 +177,11 @@ public:
     // don't need this but it is cheap (pool-sized memset, sub-ms).
     void zero_free_blocks() {
         for (int b : free_blocks_) zero_block(b);
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        if (page_stream_) {
+            cudaStreamSynchronize(page_stream_);
+        }
+#endif
     }
 
     bool attached() const { return n_blocks_ > 0; }
@@ -147,6 +194,11 @@ public:
     // Allocate slots for [kv_start, kv_start + n_tok) ahead of a forward
     // step (evicting LRU/low-score chunks as needed). False — with a
     // diagnostic — if the pool has no evictable block left.
+    //
+    // When KVFLASH_HAS_ASYNC_DMA: page-out D2H and slot-zero transfers are
+    // queued on page_stream_ and left running.  If any page-in (H2D) was
+    // issued, page_stream_ is synchronised here so that recalled KV data is
+    // resident before the next attention forward.
     bool alloc_span(int kv_start, int n_tok) {
         for (int i = 0; i < n_tok; ++i) {
             if (slot_for(kv_start + i) < 0) {
@@ -156,6 +208,12 @@ public:
                 return false;
             }
         }
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        if (has_pending_page_in_ && page_stream_) {
+            cudaStreamSynchronize(page_stream_);
+            has_pending_page_in_ = false;
+        }
+#endif
         return true;
     }
 
@@ -185,6 +243,9 @@ public:
                 copy_chunk(c, st.block, /*to_host=*/false);
                 stats_.page_ins++;
                 stats_.moved_bytes += chunk_bytes_;
+#ifdef KVFLASH_HAS_ASYNC_DMA
+                has_pending_page_in_ = true;
+#endif
             }
         }
         st.last_use = ++clock_;
@@ -196,7 +257,11 @@ public:
         if (c >= (int)chunks_.size() || chunks_[c].block < 0) return false;
         ChunkState & st = chunks_[c];
         if (!st.on_host) {
+#ifdef KVFLASH_HAS_ASYNC_DMA
+            cudaMallocHost(&st.host_data, chunk_bytes_);
+#else
             st.host_data.resize(chunk_bytes_);
+#endif
             stats_.host_bytes += (int64_t)chunk_bytes_;
         }
         copy_chunk(c, st.block, /*to_host=*/true);
@@ -308,15 +373,25 @@ public:
                 if (page_in(c)) events++;
             }
         }
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        if (has_pending_page_in_ && page_stream_) {
+            cudaStreamSynchronize(page_stream_);
+            has_pending_page_in_ = false;
+        }
+#endif
         return events;
     }
 
 private:
     struct ChunkState {
-        int      block = -1;       // pool block index, -1 = not resident
-        bool     on_host = false;  // backing store holds valid bytes
+        int      block    = -1;       // pool block index, -1 = not resident
+        bool     on_host  = false;    // backing store holds valid bytes
         uint64_t last_use = 0;
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        void *   host_data = nullptr; // cudaMallocHost-pinned; allocated on first page_out
+#else
         std::vector<uint8_t> host_data;
+#endif
     };
 
     bool ensure_free_block() {
@@ -340,11 +415,38 @@ private:
         return victim >= 0 && page_out(victim);
     }
 
-    // Move one chunk between pool slots and host backing. Segment order is
-    // fixed (layer-major, K then V, head-minor) so offsets are stable.
+    // Move one chunk between pool slots and host backing.
+    // Segment order is fixed (layer-major, K then V, head-minor).
+    // When KVFLASH_HAS_ASYNC_DMA: transfers are issued on page_stream_
+    // (async); the caller is responsible for synchronising before the data
+    // is consumed.  The stream serialises D2H and H2D within a single
+    // alloc_span(), so host_data is coherent before any H2D read starts.
     void copy_chunk(int c, int block, bool to_host) {
         ChunkState & st = chunks_[c];
-        uint8_t * p = st.host_data.data();
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        size_t host_off = 0;
+        for (size_t l = 0; l < attn_k_.size(); l++) {
+            for (int kv = 0; kv < 2; kv++) {
+                ggml_tensor * t = kv == 0 ? attn_k_[l] : attn_v_[l];
+                const size_t seg = kv == 0 ? k_seg_bytes_ : v_seg_bytes_;
+                for (int h = 0; h < n_head_kv_; h++) {
+                    const size_t dev_off =
+                        (size_t)block * cfg_.chunk_tokens * t->nb[1] +
+                        (size_t)h * t->nb[2];
+                    void * host_ptr = (uint8_t *)st.host_data + host_off;
+                    void * dev_ptr  = (uint8_t *)t->data + dev_off;
+                    if (to_host)
+                        cudaMemcpyAsync(host_ptr, dev_ptr, seg,
+                                        cudaMemcpyDeviceToHost, page_stream_);
+                    else
+                        cudaMemcpyAsync(dev_ptr, host_ptr, seg,
+                                        cudaMemcpyHostToDevice, page_stream_);
+                    host_off += seg;
+                }
+            }
+        }
+#else
+        uint8_t * p = (uint8_t *)st.host_data.data();
         for (size_t l = 0; l < attn_k_.size(); l++) {
             for (int kv = 0; kv < 2; kv++) {
                 ggml_tensor * t = kv == 0 ? attn_k_[l] : attn_v_[l];
@@ -357,8 +459,13 @@ private:
                 }
             }
         }
+#endif
     }
 
+    // Zero one pool block (defense-in-depth: stale K rows → exp(−max) ≈ 0
+    // in maskless mode).  On CUDA/HIP builds, the memset is async on
+    // page_stream_ so it is serialised after any preceding D2H for the same
+    // block and before any subsequent H2D that reuses the slot.
     void zero_block(int block) {
         for (size_t l = 0; l < attn_k_.size(); l++) {
             for (int kv = 0; kv < 2; kv++) {
@@ -366,22 +473,53 @@ private:
                 const size_t seg = kv == 0 ? k_seg_bytes_ : v_seg_bytes_;
                 for (int h = 0; h < n_head_kv_; h++) {
                     const size_t off = (size_t)block * cfg_.chunk_tokens * t->nb[1] + (size_t)h * t->nb[2];
+#ifdef KVFLASH_HAS_ASYNC_DMA
+                    cudaMemsetAsync((uint8_t *)t->data + off, 0, seg, page_stream_);
+#else
                     ggml_backend_tensor_set(t, zero_buf_.data(), off, seg);
+#endif
                 }
             }
         }
+    }
+
+    // Release page_stream_, all pinned host_data buffers, and pool state.
+    // Safe to call on a never-attached or already-cleaned-up instance.
+    void cleanup_() {
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        if (page_stream_) {
+            cudaStreamSynchronize(page_stream_);
+            for (auto & st : chunks_) {
+                if (st.host_data) {
+                    cudaFreeHost(st.host_data);
+                    st.host_data = nullptr;
+                }
+            }
+            cudaStreamDestroy(page_stream_);
+            page_stream_ = nullptr;
+        }
+#endif
+        chunks_.clear();
+        free_blocks_.clear();
+        n_blocks_ = 0;
+        has_pending_page_in_ = false;
     }
 
     KvFlashConfig cfg_;
     std::vector<ggml_tensor *> attn_k_, attn_v_;
     std::vector<ChunkState> chunks_;
     std::vector<int> free_blocks_;
-    std::vector<uint8_t> zero_buf_;
+    std::vector<uint8_t> zero_buf_;   // used by zero_block() in non-CUDA builds
     KvFlashStats stats_;
     size_t k_seg_bytes_ = 0, v_seg_bytes_ = 0, chunk_bytes_ = 0;
     int n_blocks_ = 0, n_head_kv_ = 0, cur_chunk_ = 0;
     uint64_t clock_ = 0;
     uint64_t epoch_ = 0;
+
+#ifdef KVFLASH_HAS_ASYNC_DMA
+    cudaStream_t page_stream_ = nullptr;
+#endif
+    bool has_pending_page_in_ = false;
 };
 
 // ── Shared backend helpers ─────────────────────────────────────────────
