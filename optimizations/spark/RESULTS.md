@@ -96,3 +96,15 @@ post-attention hidden. Clean prefetch wants ~95%+ recall at small K. A
 fitted-from-traces predictor does not get there. Reaching it means relocating
 and fine-tuning the model's gate (Pre-gated MoE), for which these traces are the
 dataset. The placement + cache results above need no model change.
+
+The table above trains with per-expert binary cross-entropy. recall@K is a
+ranking metric, so `spark/train_pregate.py` now defaults to a ranking-aware
+objective (`--loss listnet|ranknet`) that optimizes the *order* of the expert
+scores instead of each expert independently (ListNet, Cao et al. 2007; RankNet,
+Burges et al. 2005; ranking-aware pre-gating, arXiv:2511.10676). `--loss all`
+trains every objective on the same split and init and prints the recall@K
+comparison. The ranking objective is the right one for top-K prefetch, but it
+cannot supply the post-attention information the pre-attention input lacks, so it
+does not move the **fundamental** cap — it tightens the surrogate, not the
+ceiling. Re-measure on the full trace with `--loss all` to quantify the delta
+over the BCE baseline.
