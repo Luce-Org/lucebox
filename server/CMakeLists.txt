@@ -764,6 +764,11 @@ if(DFLASH27B_TESTS)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash.cpp")
         add_executable(test_kvflash test/test_kvflash.cpp)
         target_include_directories(test_kvflash PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        # Default --qkbench filler: a bundled real-token stream, tiled to the
+        # requested length. Keeps the qk gate valid out of the box (uniform-
+        # random filler has no Q/K contrast and collapses qk recall to ~LRU).
+        target_compile_definitions(test_kvflash PRIVATE
+            QKBENCH_FILLER_PATH="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/qkbench_filler.i32")
         target_link_libraries(test_kvflash PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
         if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             target_link_libraries(test_kvflash PRIVATE CUDA::cudart)

@@ -397,12 +397,31 @@ std::vector<int32_t> load_token_stream(const char * path, int n, int vocab) {
     for (auto & t : out) {
         if (t < 0 || t >= 100000) t = 1000 + (t < 0 ? -t : t) % 99000;
     }
-    if ((int)out.size() < n) {
+    if ((int)out.size() < n && real_n > 0) {
+        // Tile the real tokens up to the requested length. Repeating a real
+        // stream keeps the language-like K manifold the qk policy needs:
+        // uniform-random padding has no target-Q vs pooled-K contrast and
+        // collapses qk recall to ~LRU (needle 0/16), which misreads as a
+        // broken feature rather than an invalid run.
+        const std::vector<int32_t> base(out.begin(), out.begin() + (long)real_n);
+        while ((int)out.size() < n) {
+            const size_t take = std::min((size_t)n - out.size(), base.size());
+            out.insert(out.end(), base.begin(), base.begin() + (long)take);
+        }
+    } else if ((int)out.size() < n) {
+        // No fixture at all: last-resort synthetic filler. qk recall is not
+        // meaningful here, so make the degenerate case loud rather than silent.
         auto pad = make_prompt(n - (int)out.size(), vocab);
         out.insert(out.end(), pad.begin(), pad.end());
+        std::fprintf(stderr,
+            "\n[qkbench] WARNING: '%s' was unreadable/empty, so the filler is 100%% "
+            "uniform-random.\n          The qk policy needs real-token context for Q/K "
+            "contrast; under random filler it\n          collapses to ~LRU (needle 0/16) and "
+            "its numbers are NOT representative.\n          Pass --qk-tokens=<real i32 stream> "
+            "or restore the bundled fixture.\n\n", path);
     }
-    std::printf("[qkbench] filler: %zu real tokens from %s + %d synthetic\n",
-                real_n, path, n - (int)real_n);
+    std::printf("[qkbench] filler: %zu real tokens from %s, tiled to %d\n",
+                real_n, path, n);
     return out;
 }
 
@@ -473,7 +492,11 @@ int main(int argc, char ** argv) {
         const int  pool = arg_int(argc, argv, "--qk-pool", 4096);
         const char * arm = arg_str(argc, argv, "--qk-arm", "qk");   // lru|drafter|qk
         const char * tok_path = arg_str(argc, argv, "--qk-tokens",
+#ifdef QKBENCH_FILLER_PATH
+            QKBENCH_FILLER_PATH);
+#else
             "/tmp/lsa-msa-64k/goldgate_xl.turn10.65536.tokens.i32");
+#endif
         const bool is_drafter = std::strcmp(arm, "drafter") == 0;
         const bool is_qk      = std::strcmp(arm, "qk") == 0;
 
