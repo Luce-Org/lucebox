@@ -1918,9 +1918,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // draft tree from per-position top-K, verify all nodes in one
         // ancestor-masked target forward, walk the verified path, then roll
         // recurrent/KV state forward to the accepted path. Higher acceptance
-        // per step than chain verify. Local draft only; greedy bonus token
-        // (sampled tree-verify is a follow-up). On any failure we fall through
-        // is unsafe (draft graph already built for chain), so we bail to false.
+        // per step than chain verify. Local draft only. On any failure we
+        // fall through is unsafe (draft graph already built for chain), so we
+        // bail to false.
         // The tree path handles plain generation only. Requests using features
         // the tree branch does not implement — thinking-budget forced close,
         // tool-call hint injection, stall recovery, or the min-tokens floor
@@ -1932,10 +1932,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             stall_tool_prefix_tokens == nullptr &&
             (int)out_tokens.size() >= _min_floor;
         if (cfg_.ddtree_mode && target->supports_tree_verify() &&
-            !use_remote_draft && q_len > 1 && tree_special_inactive &&
-            !sampled_verify) {  // tree walk is greedy-only; sampled requests use
-                                // chain sampled-verify instead (a greedy tree accept
-                                // would corrupt the target sampling distribution)
+            !use_remote_draft && q_len > 1 && tree_special_inactive) {
             const int L = q_len - 1;
             const int K = (cfg_.ddtree_budget > L) ? 8 : 1;
             std::vector<float>   top_lp;
@@ -1947,6 +1944,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 return false;
             }
             // Tree depth L draws from draft rows 1..q_len-1 (row 0 = the seed).
+            // Known limitation: branch descendants beyond depth 1 still come
+            // from one spine-conditioned block-draft forward, so a confident
+            // draft may not beat the chain.
             DDTree tree = build_ddtree(top_lp.data() + (size_t)K, top_ids.data() + (size_t)K,
                                        L, K, cfg_.ddtree_budget, cfg_.ddtree_chain_seed);
             const int N = cfg_.ddtree_budget + 1;   // fixed alloc width
@@ -1956,7 +1956,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             for (int i = 0; i < tree.n_nodes; i++) flat_tokens[1 + i] = tree.token_ids[i];
 
             std::vector<int32_t> posterior;
-            if (!target->verify_tree(committed, tree, flat_tokens, N, posterior, nullptr)) {
+            std::vector<float>   node_logits;
+            if (!target->verify_tree(committed, tree, flat_tokens, N, posterior,
+                                     sampled_verify ? &node_logits : nullptr)) {
                 std::fprintf(stderr, "spec-decode: verify_tree failed\n");
                 step_graph_destroy(draft_sg);
                 return false;
@@ -1964,8 +1966,30 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             target_forwards++;
 
             int next_token = -1, bonus_node = 0;
-            std::vector<int> accepted =
-                follow_verified_tree(tree, posterior.data(), next_token, &bonus_node);
+            std::vector<int> accepted;
+            if (!sampled_verify) {
+                accepted =
+                    follow_verified_tree(tree, posterior.data(), next_token, &bonus_node);
+            } else {
+                accepted.reserve((size_t)tree.n_nodes + 1);
+                accepted.push_back(0);
+                std::vector<int32_t> hist = out_tokens;
+                hist.push_back(last_tok);
+                const int vocab = w_.n_vocab;
+                int cur = 0;
+                int stok = sample_logits(node_logits.data() + (size_t)cur * vocab,
+                                         vocab, sampler_, hist, sampler_rng_);
+                while (true) {
+                    auto it = tree.child_maps[cur].find(stok);
+                    if (it == tree.child_maps[cur].end()) break;
+                    cur = it->second;
+                    accepted.push_back(cur);
+                    hist.push_back(stok);
+                    stok = sample_logits(node_logits.data() + (size_t)cur * vocab,
+                                         vocab, sampler_, hist, sampler_rng_);
+                }
+                next_token = stok;
+            }
 
             int accepted_n = (int)accepted.size();        // root + accepted children
             if (accepted_n > need_commit_budget) accepted_n = need_commit_budget;
