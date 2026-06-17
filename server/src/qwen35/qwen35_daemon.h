@@ -27,7 +27,7 @@ struct Qwen35DaemonArgs {
     int          draft_ctx_max    = 4096;
 
     // Speculative decode strategy
-    bool         fast_rollback     = false;
+    bool         fast_rollback     = true;
     bool         seq_verify        = false;
     bool         ddtree_mode       = false;
     int          ddtree_budget     = 22;

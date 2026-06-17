@@ -996,11 +996,16 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     // already migrated when the snapshot was taken; re-running migrate would
     // clobber the restored state.
     if (kv_offset == 0) {
-        migrate_prefill_cache(w_, cfg_.device.max_ctx,
-                              cfg_.ddtree_mode
-                                  ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
-                                  : dw_.block_size,
-                              target_backend_, cache_);
+        const int max_verify_tokens = cfg_.ddtree_mode
+            ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
+            : dw_.block_size;
+        if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
+                                   max_verify_tokens,
+                                   target_backend_, cache_)) {
+            std::fprintf(stderr, "prefill: rollback cache migration failed: %s\n",
+                         dflash27b_last_error());
+            return -1;
+        }
     }
 
     // Chunked prefill
@@ -1762,6 +1767,18 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     DFlashTarget * target = dflash_target();
     const bool use_remote_draft = cfg_.remote_draft.enabled() && remote_draft_.active();
     const int q_len = dw_.block_size > 0 ? dw_.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
+    const int max_verify_tokens = cfg_.ddtree_mode
+        ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
+        : dw_.block_size;
+    if ((cfg_.fast_rollback || cfg_.ddtree_mode) && !cache_.rollback_ctx) {
+        if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
+                                   max_verify_tokens,
+                                   target_backend_, cache_)) {
+            std::fprintf(stderr, "spec-decode: rollback cache migration failed: %s\n",
+                         dflash27b_last_error());
+            return false;
+        }
+    }
 
     StepGraph draft_sg;
 
@@ -1780,6 +1797,14 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     int n_accept_sum    = 0;
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
+    int target_forwards = 0;
+
+    auto log_target_forward_stats = [&]() {
+        std::fprintf(stderr, "[spec-decode] target_forwards=%d forwards_per_token=%.6f forwards_per_step=%.3f\n",
+                     target_forwards,
+                     n_generated > 0 ? (double)target_forwards / n_generated : 0.0,
+                     n_draft_steps > 0 ? (double)target_forwards / n_draft_steps : 0.0);
+    };
 
     auto t_dec0 = std::chrono::steady_clock::now();
 
@@ -1800,6 +1825,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             cache_.last_tok = out_tokens.back();
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
+                log_target_forward_stats();
                 io.emit(-1);
                 return true;
             }
@@ -1807,6 +1833,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
                                     tail_hook, forced_close_out,
                                     degenerate_close_out);
+            log_target_forward_stats();
             io.emit(-1);
             return ok;
         }
@@ -1934,57 +1961,120 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 step_graph_destroy(draft_sg);
                 return false;
             }
+            target_forwards++;
 
             int next_token = -1, bonus_node = 0;
             std::vector<int> accepted =
                 follow_verified_tree(tree, posterior.data(), next_token, &bonus_node);
 
-            int commit_n = (int)accepted.size();          // root + accepted children
-            if (commit_n > need_commit_budget) commit_n = need_commit_budget;
-            if (commit_n <= 0) { step_graph_destroy(draft_sg); break; }
+            int accepted_n = (int)accepted.size();        // root + accepted children
+            if (accepted_n > need_commit_budget) accepted_n = need_commit_budget;
+            if (accepted_n <= 0) { step_graph_destroy(draft_sg); break; }
 
             // Emit the accepted path: slot 0 = last_tok (pending from prev iter),
             // each subsequent accepted node = its tree token.
             bool hit_eos = false;
-            int emitted = 0;
-            for (int i = 0; i < commit_n; i++) {
+            int accepted_emitted = 0;
+            for (int i = 0; i < accepted_n; i++) {
                 const int dfs = accepted[i];
                 const int32_t tok = (dfs == 0) ? last_tok : tree.token_ids[dfs - 1];
                 out_tokens.push_back(tok);
                 io.emit(tok);
-                emitted++;
+                accepted_emitted++;
                 if (io.cancelled) { hit_eos = true; break; }
                 if (target->is_eos(tok)) { hit_eos = true; break; }
             }
-            last_tok = next_token;
 
             // Telemetry: accepted children (exclude the always-committed root).
-            n_accept_sum += std::max(0, emitted - 1);
-            n_draft_steps++;
+            n_accept_sum += std::max(0, accepted_emitted - 1);
 
-            if (hit_eos || last_tok < 0 || target->is_eos(last_tok)) {
-                committed   += emitted;
-                n_generated += emitted;
-                break;
-            }
+            if (accepted_emitted <= 0) { step_graph_destroy(draft_sg); break; }
 
             // Roll recurrent + KV state forward to the committed accepted path.
             std::vector<int> accepted_committed(accepted.begin(),
-                                                accepted.begin() + emitted);
+                                                accepted.begin() + accepted_emitted);
             if (!target->rollback_to_tree(committed, tree, accepted_committed)) {
                 std::fprintf(stderr, "spec-decode: rollback_to_tree failed\n");
                 step_graph_destroy(draft_sg);
                 return false;
             }
 
-            // Sync draft-side feature mirror over the committed range.
-            if (feature_mirror_.target_feat && !draft_parked_) {
-                draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
-                                                feature_mirror_, committed, emitted);
+            if (!sampled_verify) {
+                last_tok = next_token;
+
+                // Greedy production path: defer the bonus as next step's root.
+                // No extra target forward and no feature sync beyond accepted path.
+                if (feature_mirror_.target_feat && !draft_parked_) {
+                    draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
+                                                    feature_mirror_, committed, accepted_emitted);
+                }
+
+                committed   += accepted_emitted;
+                cache_.cur_pos = committed;
+                n_generated += accepted_emitted;
+                n_draft_steps++;
+                if (hit_eos || io.cancelled || n_generated >= n_gen ||
+                    last_tok < 0 || target->is_eos(last_tok)) {
+                    break;
+                }
+                continue;
             }
 
-            committed   += emitted;
-            n_generated += emitted;
+            int total_emitted = accepted_emitted;
+            int bonus_last_tok = -1;
+            std::vector<float> bonus_logits;
+            const bool can_commit_bonus =
+                !hit_eos && !io.cancelled && next_token >= 0 &&
+                total_emitted < need_commit_budget;
+            if (can_commit_bonus) {
+                const int bonus_pos = committed + total_emitted;
+                std::vector<int32_t> bonus_vec(1, next_token);
+                if (!target->verify_batch(bonus_vec, bonus_pos, bonus_last_tok, nullptr)) {
+                    std::fprintf(stderr, "spec-decode: tree bonus replay failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                target_forwards++;
+                if (!target->read_verify_logits(1, bonus_logits)) {
+                    std::fprintf(stderr, "spec-decode: tree bonus logits read failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                if (bonus_logits.empty()) {
+                    std::fprintf(stderr, "spec-decode: tree bonus logits empty\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+
+                out_tokens.push_back(next_token);
+                io.emit(next_token);
+                total_emitted++;
+                if (io.cancelled) {
+                    hit_eos = true;
+                } else if (target->is_eos(next_token)) {
+                    hit_eos = true;
+                }
+
+                const int vocab_v = (int)bonus_logits.size();
+                last_tok = sample_logits(bonus_logits.data(), vocab_v,
+                                         sampler_, out_tokens, sampler_rng_);
+            } else {
+                last_tok = next_token;
+            }
+
+            // Sampled path commits the bonus in-step, so sync accepted+bonus.
+            if (feature_mirror_.target_feat && !draft_parked_) {
+                draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
+                                                feature_mirror_, committed, total_emitted);
+            }
+
+            committed   += total_emitted;
+            cache_.cur_pos = committed;
+            n_generated += total_emitted;
+            n_draft_steps++;
+            if (hit_eos || io.cancelled || n_generated >= n_gen || last_tok < 0) {
+                break;
+            }
             continue;
         }
 
@@ -2018,6 +2108,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             step_graph_destroy(draft_sg);
             return false;
         }
+        target_forwards++;
 
         // 5. Acceptance. Greedy: longest matching prefix between draft and
         // target argmax. Sampled-verify: walk the chain drawing each next
@@ -2153,6 +2244,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 step_graph_destroy(draft_sg);
                 return false;
             }
+            target_forwards++;
         }
 
         // Build replay_tok for emitting committed tokens.
@@ -2263,6 +2355,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     step_graph_destroy(draft_sg);
                     return false;
                 }
+                target_forwards++;
             }
             committed += emitted;
             cache_.cur_pos = committed;
@@ -2274,6 +2367,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     step_graph_destroy(draft_sg);
                     return false;
                 }
+                target_forwards++;
                 for (int32_t tok : *stall_tool_prefix_tokens) {
                     out_tokens.push_back(tok);
                     io.emit(tok);
@@ -2325,6 +2419,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 (float)((double)n_accept_sum / (double)total_draft_pos);
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
+                log_target_forward_stats();
                 io.emit(-1);
                 return true;
             }
@@ -2332,6 +2427,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
                                     tail_hook, forced_close_out,
                                     degenerate_close_out);
+            log_target_forward_stats();
             io.emit(-1);
             return ok;
         }
@@ -2355,6 +2451,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     step_graph_destroy(draft_sg);
                     return false;
                 }
+                target_forwards++;
             }
             committed += emitted;
             cache_.cur_pos = committed;
@@ -2365,6 +2462,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 (float)((double)n_accept_sum / (double)total_draft_pos);
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
+                log_target_forward_stats();
                 io.emit(-1);
                 return true;
             }
@@ -2373,6 +2471,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
                                     tail_hook, forced_close_out,
                                     degenerate_close_out);
+            log_target_forward_stats();
             io.emit(-1);
             return ok;
         }
@@ -2392,6 +2491,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                  n_generated > 0 ? n_generated / decode_s : 0.0,
                  n_draft_steps, n_accept_sum, total_draft_pos, accept_pct,
                  n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0);
+    log_target_forward_stats();
     if (n_hint_proposed > 0) {
         std::fprintf(stderr, "[spec-decode] hint tokens: %d/%d accepted (%.1f%%)\n",
                      n_hint_accepted, n_hint_proposed,

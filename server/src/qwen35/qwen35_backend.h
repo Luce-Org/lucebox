@@ -59,7 +59,7 @@ struct Qwen35Config {
     int          draft_yarn_orig_ctx  = 4096;
 
     // Speculative decode strategy
-    bool         fast_rollback   = false;
+    bool         fast_rollback   = true;
     bool         seq_verify      = false;
     bool         ddtree_mode     = false;
     int          ddtree_budget   = 22;
