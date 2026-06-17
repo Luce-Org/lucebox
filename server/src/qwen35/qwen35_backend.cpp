@@ -1955,6 +1955,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             flat_tokens[0] = last_tok;
             for (int i = 0; i < tree.n_nodes; i++) flat_tokens[1 + i] = tree.token_ids[i];
 
+            if (!sampled_verify && !target->snapshot_kv()) {
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+
             std::vector<int32_t> posterior;
             std::vector<float>   node_logits;
             if (!target->verify_tree(committed, tree, flat_tokens, N, posterior,
@@ -2014,34 +2019,105 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
             if (accepted_emitted <= 0) { step_graph_destroy(draft_sg); break; }
 
-            // Roll recurrent + KV state forward to the committed accepted path.
-            std::vector<int> accepted_committed(accepted.begin(),
-                                                accepted.begin() + accepted_emitted);
-            if (!target->rollback_to_tree(committed, tree, accepted_committed)) {
-                std::fprintf(stderr, "spec-decode: rollback_to_tree failed\n");
-                step_graph_destroy(draft_sg);
-                return false;
-            }
-
             if (!sampled_verify) {
-                last_tok = next_token;
+                const int root_last_tok = last_tok;
+                constexpr int kFastRollbackThreshold = 5;
+                const bool use_tree_fast_rollback =
+                    target->supports_fast_rollback() &&
+                    accepted_emitted >= kFastRollbackThreshold;
 
-                // Greedy production path: defer the bonus as next step's root.
-                // No extra target forward and no feature sync beyond accepted path.
-                if (feature_mirror_.target_feat && !draft_parked_) {
-                    draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
-                                                    feature_mirror_, committed, accepted_emitted);
+                if (use_tree_fast_rollback) {
+                    // Fast greedy production path: restore to the accepted path
+                    // from tree captures and defer the bonus as next step's root.
+                    std::vector<int> accepted_committed(accepted.begin(),
+                                                        accepted.begin() + accepted_emitted);
+                    if (!target->rollback_to_tree(committed, tree, accepted_committed)) {
+                        std::fprintf(stderr, "spec-decode: rollback_to_tree failed\n");
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
+                    last_tok = next_token;
+
+                    if (feature_mirror_.target_feat && !draft_parked_) {
+                        draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
+                                                        feature_mirror_, committed, accepted_emitted);
+                    }
+
+                    committed   += accepted_emitted;
+                    cache_.cur_pos = committed;
+                    n_generated += accepted_emitted;
+                    n_draft_steps++;
+                    if (hit_eos || io.cancelled || n_generated >= n_gen ||
+                        last_tok < 0 || target->is_eos(last_tok)) {
+                        break;
+                    }
+                    continue;
                 }
 
-                committed   += accepted_emitted;
+                // Low-accept greedy path: mirror the chain's exact replay so the
+                // next step starts from replayed F32 recurrent state. The accepted
+                // path has already been emitted above; only emit the bonus here.
+                int total_emitted = accepted_emitted;
+                const bool can_commit_bonus =
+                    !hit_eos && !io.cancelled && next_token >= 0 &&
+                    total_emitted < need_commit_budget;
+
+                std::vector<int32_t> replay_batch;
+                replay_batch.reserve((size_t)accepted_emitted + (can_commit_bonus ? 1 : 0));
+                for (int i = 0; i < accepted_emitted; i++) {
+                    const int dfs = accepted[i];
+                    replay_batch.push_back((dfs == 0) ? root_last_tok : tree.token_ids[dfs - 1]);
+                }
+                if (can_commit_bonus) replay_batch.push_back(next_token);
+
+                if (!target->restore_kv()) {
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                int replay_last_tok = -1;
+                if (!target->verify_batch(replay_batch, committed, replay_last_tok, nullptr)) {
+                    std::fprintf(stderr, "spec-decode: tree replay failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                target_forwards++;
+
+                if (can_commit_bonus) {
+                    out_tokens.push_back(next_token);
+                    io.emit(next_token);
+                    total_emitted++;
+                    if (io.cancelled) {
+                        hit_eos = true;
+                    } else if (target->is_eos(next_token)) {
+                        hit_eos = true;
+                    }
+                }
+
+                last_tok = replay_last_tok;
+                if (feature_mirror_.target_feat && !draft_parked_) {
+                    draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
+                                                    feature_mirror_, committed, total_emitted);
+                }
+
+                committed   += total_emitted;
                 cache_.cur_pos = committed;
-                n_generated += accepted_emitted;
+                n_generated += total_emitted;
                 n_draft_steps++;
                 if (hit_eos || io.cancelled || n_generated >= n_gen ||
                     last_tok < 0 || target->is_eos(last_tok)) {
                     break;
                 }
                 continue;
+            }
+
+            // Sampled path keeps the distribution-preserving bonus replay but
+            // still needs tree rollback for the accepted prefix first.
+            std::vector<int> accepted_committed(accepted.begin(),
+                                                accepted.begin() + accepted_emitted);
+            if (!target->rollback_to_tree(committed, tree, accepted_committed)) {
+                std::fprintf(stderr, "spec-decode: rollback_to_tree failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
             }
 
             int total_emitted = accepted_emitted;
