@@ -1905,7 +1905,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             stall_tool_prefix_tokens == nullptr &&
             (int)out_tokens.size() >= _min_floor;
         if (cfg_.ddtree_mode && target->supports_tree_verify() &&
-            !use_remote_draft && q_len > 1 && tree_special_inactive) {
+            !use_remote_draft && q_len > 1 && tree_special_inactive &&
+            !sampled_verify) {  // tree walk is greedy-only; sampled requests use
+                                // chain sampled-verify instead (a greedy tree accept
+                                // would corrupt the target sampling distribution)
             const int L = q_len - 1;
             const int K = (cfg_.ddtree_budget > L) ? 8 : 1;
             std::vector<float>   top_lp;

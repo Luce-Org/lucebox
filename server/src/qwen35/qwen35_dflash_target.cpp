@@ -63,7 +63,10 @@ bool Qwen35DFlashTarget::verify_batch(
         }
     }
 
-    const bool do_capture = fast_rollback_ && capture_ssm_intermediates;
+    // kvflash's set_rows KV-write is mutually exclusive with delta-intermediate
+    // capture (graph_builders gates use_kv_write_rows on !capture_delta_intermediate);
+    // skip capture under the pager so --ddtree + --kvflash doesn't fail verify.
+    const bool do_capture = fast_rollback_ && capture_ssm_intermediates && pager_ == nullptr;
 
     if (!build_target_step(sg_, w_, cache_, backend_,
                            /*kv_start=*/base_pos, n_tokens,
