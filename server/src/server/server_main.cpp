@@ -427,8 +427,9 @@ int main(int argc, char ** argv) {
             ::setenv("DFLASH_KVFLASH", argv[i], 1);
         } else if (std::strcmp(argv[i], "--kvflash-policy") == 0 && i + 1 < argc) {
             ++i;
-            if (std::strcmp(argv[i], "drafter") != 0 && std::strcmp(argv[i], "lru") != 0) {
-                std::fprintf(stderr, "--kvflash-policy expects 'drafter' or 'lru', got '%s'\n",
+            if (std::strcmp(argv[i], "drafter") != 0 && std::strcmp(argv[i], "lru") != 0 &&
+                std::strcmp(argv[i], "qk") != 0) {
+                std::fprintf(stderr, "--kvflash-policy expects 'drafter', 'lru', or 'qk', got '%s'\n",
                              argv[i]);
                 return 1;
             }
