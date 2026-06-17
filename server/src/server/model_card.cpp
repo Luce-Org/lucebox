@@ -10,15 +10,25 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
+#if defined(_WIN32)
+#if !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <unistd.h>
 #include <sys/stat.h>
+#endif
 
 namespace dflash::common {
 
 using json = nlohmann::json;
+
+namespace fs = std::filesystem;
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -42,11 +52,20 @@ std::string normalize_model_card_stem(const std::string & general_name) {
 }
 
 static bool file_exists(const std::string & path) {
-    struct stat st{};
-    return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+    std::error_code ec;
+    return fs::is_regular_file(path, ec);
 }
 
 static std::string self_bin_dir() {
+#if defined(_WIN32)
+    char buf[MAX_PATH];
+    DWORD n = GetModuleFileNameA(nullptr, buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return {};
+    std::string path(buf, n);
+    auto slash = path.find_last_of("/\\");
+    if (slash == std::string::npos) return {};
+    return path.substr(0, slash);
+#else
     char buf[4096];
     ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
     if (n <= 0) return {};
@@ -55,6 +74,7 @@ static std::string self_bin_dir() {
     auto slash = path.find_last_of('/');
     if (slash == std::string::npos) return {};
     return path.substr(0, slash);
+#endif
 }
 
 // Find share/model_cards/ directory. Search order (spec §1 implementation note):
@@ -82,8 +102,8 @@ static std::string find_model_cards_dir(const std::string & repo_root_hint) {
     }
 
     for (const auto & c : candidates) {
-        struct stat st{};
-        if (::stat(c.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+        std::error_code ec;
+        if (fs::is_directory(c, ec)) {
             std::fprintf(stderr, "[model_card] using cards dir: %s\n", c.c_str());
             return c;
         }
@@ -330,10 +350,10 @@ ModelCard resolve_model_card(const std::string & gguf_path,
 
     // Derive think_max_tokens and missing tier values.
     if (card.hard_limit_reply_budget < 0) card.hard_limit_reply_budget = 0;
-    card.think_max_tokens = std::max(0, card.max_tokens - card.hard_limit_reply_budget);
+    card.think_max_tokens = (std::max)(0, card.max_tokens - card.hard_limit_reply_budget);
 
     int complex_think_max = card.complex_problem_max_tokens > 0
-        ? std::max(0, card.complex_problem_max_tokens - card.hard_limit_reply_budget)
+        ? (std::max)(0, card.complex_problem_max_tokens - card.hard_limit_reply_budget)
         : card.think_max_tokens;
 
     // For each tier not explicitly set, fill via §3.3 formula.

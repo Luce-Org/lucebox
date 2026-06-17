@@ -1,0 +1,18 @@
+version: 2
+updates:
+  # Only GitHub Actions version updates are tracked here (supply-chain hygiene,
+  # low risk). Python and Docker base-image *version* churn is intentionally NOT
+  # tracked: ML/runtime deps are pinned for reproducibility and bumping them
+  # breaks custom CUDA/HIP builds more often than it helps. Python CVEs are still
+  # covered by Dependabot security updates (enabled at the repo level), which run
+  # independently of these scheduled version updates.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "ci"]
+    groups:
+      # Collapse all action bumps into a single weekly PR instead of one per action.
+      github-actions:
+        patterns:
+          - "*"

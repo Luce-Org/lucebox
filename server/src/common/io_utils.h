@@ -123,6 +123,36 @@ static inline bool write_exact_fd(int fd, const void * data, size_t bytes) {
     }
     return true;
 }
+#else
+#include <io.h>
+static inline bool read_exact_fd(int fd, void * data, size_t bytes) {
+    char * p = (char *)data;
+    size_t done = 0;
+    while (done < bytes) {
+        int n = _read(fd, p + done, (unsigned int)(bytes - done > UINT_MAX ? UINT_MAX : bytes - done));
+        if (n == 0) return false;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        done += (size_t)n;
+    }
+    return true;
+}
+
+static inline bool write_exact_fd(int fd, const void * data, size_t bytes) {
+    const char * p = (const char *)data;
+    size_t done = 0;
+    while (done < bytes) {
+        int n = _write(fd, p + done, (unsigned int)(bytes - done > UINT_MAX ? UINT_MAX : bytes - done));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        done += (size_t)n;
+    }
+    return true;
+}
 #endif
 
 // ── Numeric helpers ─────────────────────────────────────────────────

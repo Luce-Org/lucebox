@@ -36,7 +36,8 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
         const std::vector<int32_t> & tokens,
         int base_pos,
         int & last_tok,
-        std::vector<int32_t> * all_argmax) {
+        std::vector<int32_t> * all_argmax,
+        bool capture_ssm_intermediates) {
     if (shards_.empty()) return false;
     if (remote_target_shard_ && remote_target_shard_->active()) {
         return run_qwen35_mixed_layer_split_forward(
