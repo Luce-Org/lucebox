@@ -8,6 +8,9 @@
 
 #include "model_backend.h"
 #include "laguna_internal.h"
+#include "laguna_dflash_target.h"
+#include "common/dflash_feature_ring.h"
+#include "common/dflash_draft_graph.h"
 #include "placement/placement_config.h"
 #include "qwen3_drafter.h"
 #include "kvflash_pager.h"
@@ -32,6 +35,12 @@ namespace dflash::common {
 
 struct LagunaBackendArgs {
     std::string target_path;
+    std::string draft_path;
+    int         draft_gpu = -1;
+    int         draft_ctx_max = 2048;
+    bool        ddtree_mode = false;
+    int         ddtree_budget = 22;
+    float       ddtree_temp = 1.0f;
     DevicePlacement device;
     int         max_ctx   = 16384;
     int         chunk     = 2048;
@@ -84,8 +93,16 @@ private:
     LagunaTargetWeights                         w_;
     LagunaTargetCache                           cache_;
     std::array<LagunaCacheSnapshot, kMaxSlots>  snapshots_{};
+    SamplerCfg                                  sampler_;
     std::mt19937_64                             sampler_rng_{std::random_device{}()};
     bool                                        target_parked_ = false;
+
+    // DFlash speculative decode
+    ggml_backend_t                              draft_backend_ = nullptr;
+    DraftWeights                                dw_{};
+    DraftFeatureMirror                          feature_mirror_{};
+    LagunaDFlashTarget *                        dflash_target_ = nullptr;
+    bool                                        draft_parked_ = false;
 
     // PFlash drafter (lazy-loaded on first compress command).
     DrafterContext                              drafter_ctx_{};
@@ -147,6 +164,16 @@ private:
                                   std::vector<float> & act_cur,
                                   int32_t & argmax_out);
     void maybe_post_request_swap();
+
+    bool load_decode_draft();
+    void free_decode_draft();
+    bool do_spec_decode(int committed, int n_gen,
+                        std::vector<int32_t> & out_tokens,
+                        const DaemonIO & io,
+                        const BudgetHook * budget_hook = nullptr,
+                        bool * forced_close_out = nullptr,
+                        float * accept_rate_out = nullptr,
+                        const std::vector<int32_t> * sample_history_prefix = nullptr);
 };
 
 }  // namespace dflash::common
