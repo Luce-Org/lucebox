@@ -251,6 +251,8 @@ add_library(dflash_common STATIC
     src/laguna/laguna_backend.cpp
     src/laguna/laguna_layer_split_adapter.cpp
     src/common/backend_ipc.cpp
+    src/common/target_shard_ipc.cpp
+    src/common/target_shard_ipc_daemon.cpp
     src/common/dflash_feature_ring.cpp
     src/common/dflash_capture.cpp
     src/common/dflash_draft_ipc.cpp
@@ -351,6 +353,12 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     # hip_compat shim is needed by ALL dflash_common sources (peer_access.cpp,
     # dflash_feature_ring.cpp, flashprefill.cpp), not just the SM80_EQUIV path.
     target_include_directories(dflash_common PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
+endif()
+
+if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+    target_link_libraries(dflash_common PUBLIC CUDA::cudart)
+elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+    target_link_libraries(dflash_common PUBLIC hip::host)
 endif()
 
 # FlashPrefill custom kernels.

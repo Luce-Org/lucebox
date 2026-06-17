@@ -27,6 +27,11 @@ struct LayerSplitShardMeta {
     ggml_backend_t backend = nullptr;
 };
 
+struct MixedLayerSplitPlan {
+    size_t remote_begin = 0;
+    PlacementBackend remote_backend = PlacementBackend::Auto;
+};
+
 template <typename LoadPlan>
 inline LoadPlan make_layer_split_load_plan(
         const LayerSplitShardMeta & shard,
@@ -67,6 +72,18 @@ std::vector<LayerSplitRange> compute_layer_ranges(
     int n_layer,
     int n_gpus,
     const std::vector<double> & weights);
+
+bool compute_mixed_layer_split_plan(
+    const DevicePlacement & device,
+    PlacementBackend local_backend,
+    MixedLayerSplitPlan & out,
+    const char * log_prefix);
+
+bool compute_target_shard_layer_split_plan(
+    const DevicePlacement & device,
+    PlacementBackend local_backend,
+    MixedLayerSplitPlan & out,
+    const char * log_prefix);
 
 bool init_layer_split_shard_metas(
     std::vector<LayerSplitShardMeta *> shards,

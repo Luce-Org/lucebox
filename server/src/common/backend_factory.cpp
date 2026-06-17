@@ -131,6 +131,7 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
             LagunaLayerSplitAdapterConfig cfg;
             cfg.target_path = args.model_path;
             cfg.device      = args.device;
+            cfg.remote_target_shard = args.remote_target_shard;
             cfg.chunk       = args.chunk;
 
             auto adapter = std::make_unique<LagunaLayerSplitAdapter>(cfg);
@@ -175,6 +176,7 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
             Gemma4LayerSplitAdapterConfig cfg;
             cfg.target_path = args.model_path;
             cfg.device      = args.device;
+            cfg.remote_target_shard = args.remote_target_shard;
             cfg.chunk       = args.chunk;
             cfg.fa_window   = args.fa_window;
 

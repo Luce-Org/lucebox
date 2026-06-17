@@ -252,6 +252,14 @@ bool LayerSplitBackend::supports_remote_draft() const {
     return adapter_ && adapter_->supports_remote_draft();
 }
 
+bool LayerSplitBackend::supports_kvflash() const {
+    return adapter_ && adapter_->supports_kvflash();
+}
+
+bool LayerSplitBackend::supports_mixed_backend_layer_split() const {
+    return adapter_ && adapter_->supports_mixed_backend_layer_split();
+}
+
 void LayerSplitBackend::shutdown() {
     if (shutdown_done_) return;
     shutdown_done_ = true;

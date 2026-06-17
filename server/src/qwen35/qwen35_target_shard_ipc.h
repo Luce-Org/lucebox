@@ -2,7 +2,7 @@
 
 #pragma once
 
-#include "common/backend_ipc.h"
+#include "common/target_shard_ipc.h"
 #include "ggml-backend.h"
 
 #include <cstdint>
@@ -54,7 +54,8 @@ public:
                int vocab,
                int max_tokens,
                const std::string & work_dir,
-               bool enable_dflash);
+               bool enable_dflash,
+               int kvflash_pool_tokens = 0);
 
     bool forward(int base_pos,
                  int n_tokens,
@@ -63,7 +64,8 @@ public:
                  int & last_tok,
                  std::vector<int32_t> * argmax_out,
                  std::vector<float> * logits_out,
-                 std::vector<Qwen35TargetCaptureSlice> * captures_out = nullptr);
+                 std::vector<Qwen35TargetCaptureSlice> * captures_out = nullptr,
+                 int ubatch = 0);
 
     bool project_hidden_to_tokens(const float * hidden,
                                   int n_tokens,
@@ -72,28 +74,21 @@ public:
     bool snapshot_kv();
     bool restore_kv();
     bool reset_request_state();
+    bool kvflash_sync_identity(int committed);
     bool snapshot_save(int slot);
     void snapshot_free(int slot);
     bool snapshot_restore(int slot);
     bool snapshot_export(int slot, Qwen35TargetShardSnapshotData & out);
     bool snapshot_import(int slot, const Qwen35TargetShardSnapshotData & data);
 
-    bool active() const { return active_; }
+    bool active() const { return session_.active(); }
     void close();
 
 private:
-    BackendIpcProcess process_;
-    bool active_ = false;
+    TargetShardIpcSession session_;
     int hidden_ = 0;
     int vocab_ = 0;
 };
-
-bool copy_activation_to_host(const ggml_tensor * act,
-                             ggml_backend_t src_backend,
-                             int token_offset,
-                             int n_tokens,
-                             int hidden,
-                             std::vector<float> & out);
 
 int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                                        const std::vector<int> & gpus,
@@ -107,6 +102,7 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                                        int payload_fd = -1,
                                        int shared_payload_fd = -1,
                                        size_t shared_payload_bytes = 0,
-                                       bool enable_dflash = false);
+                                       bool enable_dflash = false,
+                                       int kvflash_pool_tokens = 0);
 
 }  // namespace dflash::common

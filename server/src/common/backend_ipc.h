@@ -24,6 +24,8 @@ enum class BackendIpcMode {
     DFlashDraft,
     PFlashCompress,
     Qwen35TargetShard,
+    Gemma4TargetShard,
+    LagunaTargetShard,
 };
 
 const char * backend_ipc_mode_name(BackendIpcMode mode);

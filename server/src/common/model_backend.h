@@ -323,6 +323,11 @@ struct ModelBackend {
     // the server before startup.
     virtual bool supports_remote_draft() const { return false; }
 
+    // Layer-split capability introspection. Non layer-split backends keep the
+    // default false; LayerSplitBackend proxies model-adapter support.
+    virtual bool supports_kvflash() const { return false; }
+    virtual bool supports_mixed_backend_layer_split() const { return false; }
+
     // ── Routing data collection ──────────────────────────────────────
     // Set an external routing collector that the backend will call for each
     // token/layer during decode (hidden state + expert IDs). Used by

@@ -24,7 +24,9 @@
 #include "common/io_utils.h"
 #include "placement/placement_config.h"
 #include "common/layer_split_backend.h"
+#include "common/layer_split_kvflash.h"
 #include "common/layer_split_utils.h"
+#include "common/kvflash_pager.h"
 #include "placement/draft_residency.h"
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
@@ -1749,6 +1751,100 @@ static void test_validate_layer_split_weights_shape() {
     TEST_ASSERT(validate_device_placement(placement, -1).empty());
 }
 
+static void test_target_shard_plan_same_backend_split() {
+    DevicePlacement placement;
+    TEST_ASSERT(parse_placement_device_list("cuda:0,cuda:1,cuda:2", placement));
+
+    MixedLayerSplitPlan plan;
+    TEST_ASSERT(compute_target_shard_layer_split_plan(
+        placement, PlacementBackend::Cuda, plan, "test-target-shard"));
+    TEST_ASSERT(plan.remote_begin == 1);
+    TEST_ASSERT(plan.remote_backend == PlacementBackend::Cuda);
+}
+
+static void test_target_shard_plan_mixed_backend_split() {
+    DevicePlacement placement;
+    TEST_ASSERT(parse_placement_device_list("cuda:0,cuda:1,hip:0,hip:1", placement));
+
+    MixedLayerSplitPlan plan;
+    TEST_ASSERT(compute_target_shard_layer_split_plan(
+        placement, PlacementBackend::Cuda, plan, "test-target-shard"));
+    TEST_ASSERT(plan.remote_begin == 2);
+    TEST_ASSERT(plan.remote_backend == PlacementBackend::Hip);
+}
+
+static void test_target_shard_plan_rejects_bad_local_backend() {
+    DevicePlacement placement;
+    TEST_ASSERT(parse_placement_device_list("cuda:0,hip:0", placement));
+
+    MixedLayerSplitPlan plan;
+    TEST_ASSERT(!compute_target_shard_layer_split_plan(
+        placement, PlacementBackend::Hip, plan, "test-target-shard"));
+}
+
+static bool kvflash_test_sync_identity(KvFlashPager & pager, int committed) {
+    return layer_split_kvflash_sync_identity(
+        pager, committed, pager.pool_tokens(), "test-target-split");
+}
+
+static void test_kvflash_pager_identity_sync_contract() {
+    KvFlashConfig cfg;
+    cfg.pool_tokens = 512;
+
+    KvFlashPager local;
+    KvFlashPager remote;
+    TEST_ASSERT(local.attach(cfg, {}, {}));
+    TEST_ASSERT(remote.attach(cfg, {}, {}));
+
+    TEST_ASSERT(kvflash_test_sync_identity(local, 256));
+    TEST_ASSERT(kvflash_test_sync_identity(remote, 256));
+    TEST_ASSERT(local.slot_of(255) == remote.slot_of(255));
+
+    TEST_ASSERT(kvflash_test_sync_identity(local, cfg.pool_tokens));
+    TEST_ASSERT(local.slot_of(cfg.pool_tokens - 1) == cfg.pool_tokens - 1);
+    TEST_ASSERT(local.is_identity());
+
+    const int relocated = local.slot_for(cfg.pool_tokens);
+    TEST_ASSERT(relocated >= 0);
+    TEST_ASSERT(relocated != cfg.pool_tokens);
+    TEST_ASSERT(!local.is_identity());
+
+    TEST_ASSERT(kvflash_test_sync_identity(local, 128));
+    TEST_ASSERT(local.slot_of(127) == 127);
+}
+
+static void test_layer_split_kvflash_history_contract() {
+    std::vector<int32_t> history;
+    layer_split_kvflash_sync_history(history, {1, 2, 3}, 0);
+    TEST_ASSERT((history == std::vector<int32_t>{1, 2, 3}));
+
+    layer_split_kvflash_sync_history(history, {4, 5}, 3);
+    TEST_ASSERT((history == std::vector<int32_t>{1, 2, 3, 4, 5}));
+
+    layer_split_kvflash_sync_history(history, {9}, 2);
+    TEST_ASSERT((history == std::vector<int32_t>{1, 2, 9}));
+
+    layer_split_kvflash_sync_history(history, {7}, 5);
+    TEST_ASSERT(history.size() == 6);
+    TEST_ASSERT(history[0] == 1);
+    TEST_ASSERT(history[1] == 2);
+    TEST_ASSERT(history[2] == 9);
+    TEST_ASSERT(history[3] == 0);
+    TEST_ASSERT(history[4] == 0);
+    TEST_ASSERT(history[5] == 7);
+
+    std::vector<std::vector<int32_t>> snapshots(2);
+    layer_split_kvflash_save_history_snapshot(history, 4, snapshots[1]);
+    TEST_ASSERT((snapshots[1] == std::vector<int32_t>{1, 2, 9, 0}));
+
+    history = {8, 8, 8};
+    layer_split_kvflash_restore_history(history, snapshots, 1, 6);
+    TEST_ASSERT((history == std::vector<int32_t>{1, 2, 9, 0, 0, 0}));
+
+    layer_split_kvflash_restore_history(history, snapshots, 0, 3);
+    TEST_ASSERT((history == std::vector<int32_t>{0, 0, 0}));
+}
+
 static void test_backend_precision_cuda_sm_policy() {
     TEST_ASSERT(select_cuda_backend_precision_type_for_sm(90) == GGML_TYPE_BF16);
     TEST_ASSERT(select_cuda_backend_precision_type_for_sm(80) == GGML_TYPE_BF16);
@@ -1796,6 +1892,8 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     bool dflash_enabled = false;
     bool dflash_called = false;
     bool sampling_enabled = false;
+    bool kvflash_enabled = false;
+    bool mixed_backend_enabled = false;
     int shutdown_calls = 0;
     ModelBackend::CompressRequest last_compress_req;
     int prefill_chunk = 0;
@@ -1833,6 +1931,10 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     }
     bool can_dflash_decode() const override { return dflash_enabled; }
     bool supports_cpu_sampling() const override { return sampling_enabled; }
+    bool supports_kvflash() const override { return kvflash_enabled; }
+    bool supports_mixed_backend_layer_split() const override {
+        return mixed_backend_enabled;
+    }
     bool decode_dflash(const std::vector<int32_t> & prompt, int base_pos,
                        int last_tok, int n_gen, std::vector<int32_t> & out_tokens,
                        const DaemonIO & io, float & accept_rate_out) override {
@@ -2028,6 +2130,19 @@ static void test_layer_split_backend_shutdown_is_idempotent() {
     backend.shutdown();
     backend.shutdown();
     TEST_ASSERT(raw->shutdown_calls == 1);
+}
+
+static void test_layer_split_backend_capability_proxy() {
+    auto * raw = new MockLayerSplitAdapter();
+    LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
+
+    TEST_ASSERT(!backend.supports_kvflash());
+    TEST_ASSERT(!backend.supports_mixed_backend_layer_split());
+
+    raw->kvflash_enabled = true;
+    raw->mixed_backend_enabled = true;
+    TEST_ASSERT(backend.supports_kvflash());
+    TEST_ASSERT(backend.supports_mixed_backend_layer_split());
 }
 
 // Disk Prefix Cache Tests
@@ -3973,6 +4088,11 @@ int main() {
     RUN_TEST(test_parse_target_device_list_mixed_backend_multi_remote);
     RUN_TEST(test_parse_target_device_list_single_gpu_is_not_layer_split);
     RUN_TEST(test_validate_layer_split_weights_shape);
+    RUN_TEST(test_target_shard_plan_same_backend_split);
+    RUN_TEST(test_target_shard_plan_mixed_backend_split);
+    RUN_TEST(test_target_shard_plan_rejects_bad_local_backend);
+    RUN_TEST(test_kvflash_pager_identity_sync_contract);
+    RUN_TEST(test_layer_split_kvflash_history_contract);
     RUN_TEST(test_backend_precision_cuda_sm_policy);
     RUN_TEST(test_backend_precision_hip_arch_policy);
     RUN_TEST(test_backend_precision_activation_type_combine);
@@ -3982,6 +4102,7 @@ int main() {
     RUN_TEST(test_layer_split_compress_nopark_uses_default_drafter_path);
     RUN_TEST(test_layer_split_compress_rejects_bad_keep_ratio);
     RUN_TEST(test_layer_split_backend_shutdown_is_idempotent);
+    RUN_TEST(test_layer_split_backend_capability_proxy);
 
     std::fprintf(stderr, "\n── Disk prefix cache ──\n");
     RUN_TEST(test_disk_cache_config_defaults);
