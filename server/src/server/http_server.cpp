@@ -1401,8 +1401,11 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         // the model card's sampling defaults (spec §3.3); when the card
         // doesn't supply one either, use the hard-coded default.
         const auto & sd = config_.sampler_defaults;
-        req.sampler.temp = body.value("temperature",
-                                      sd.has_temperature ? sd.temperature : 0.0f);
+        // Default to greedy (temp=0) when the request omits temperature: highest
+        // spec-decode acceptance and a deterministic, fast first impression. An
+        // explicit temperature > 0 still samples, and the card top_p/top_k fill
+        // unset fields there.
+        req.sampler.temp = body.value("temperature", 0.0f);
         req.sampler.top_p = body.value("top_p",
                                        sd.has_top_p ? sd.top_p : 1.0f);
         req.sampler.top_k = body.value("top_k",
