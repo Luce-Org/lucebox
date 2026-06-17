@@ -109,9 +109,6 @@ bool compute_target_shard_layer_split_plan(
     if (device.is_mixed_layer_split()) {
         return compute_mixed_layer_split_plan(device, local_backend, out, prefix);
     }
-    if (device.layer_split_backends.size() < 2) {
-        return false;
-    }
     out.remote_begin = 1;
     out.remote_backend = local_backend;
     return true;

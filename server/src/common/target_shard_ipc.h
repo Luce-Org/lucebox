@@ -15,7 +15,7 @@
 namespace dflash::common {
 
 struct TargetShardIpcLaunchConfig {
-    BackendIpcMode mode = BackendIpcMode::Qwen35TargetShard;
+    BackendIpcMode mode = BackendIpcMode::Invalid;
     std::string bin;
     std::string target_path;
     std::vector<int> gpus;
@@ -83,7 +83,7 @@ public:
 
 private:
     BackendIpcProcess process_;
-    BackendIpcMode mode_ = BackendIpcMode::DFlashDraft;
+    BackendIpcMode mode_ = BackendIpcMode::Invalid;
     bool active_ = false;
     int hidden_ = 0;
     int vocab_ = 0;

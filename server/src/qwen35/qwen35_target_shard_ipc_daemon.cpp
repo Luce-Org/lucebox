@@ -577,6 +577,14 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                 bool ok = kvflash_pool_tokens > 0 && committed >= 0 &&
                           committed <= kvflash_pool_tokens;
                 if (ok) {
+                    int min_cur_pos = std::numeric_limits<int>::max();
+                    for (const auto & shard : shards) {
+                        min_cur_pos = std::min(min_cur_pos, shard.cache.cur_pos);
+                    }
+                    ok = min_cur_pos != std::numeric_limits<int>::max() &&
+                         committed <= min_cur_pos;
+                }
+                if (ok) {
                     kvflash_pager.reset();
                     for (int p = 0; p < committed; ++p) {
                         const int slot = kvflash_pager.slot_for(p);

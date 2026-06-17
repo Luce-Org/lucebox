@@ -21,6 +21,7 @@
 namespace dflash::common {
 
 enum class BackendIpcMode {
+    Invalid,
     DFlashDraft,
     PFlashCompress,
     Qwen35TargetShard,

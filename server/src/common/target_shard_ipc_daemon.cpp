@@ -43,6 +43,7 @@ bool stream_daemon_status(const TargetShardDaemonCallbacks & callbacks,
 
 int run_target_shard_ipc_daemon_loop(
         int hidden,
+        int vocab,
         int stream_fd,
         int payload_fd,
         int shared_payload_fd,
@@ -50,6 +51,7 @@ int run_target_shard_ipc_daemon_loop(
         TargetShardDaemonCallbacks callbacks) {
 #if defined(_WIN32)
     (void)hidden;
+    (void)vocab;
     (void)stream_fd;
     (void)payload_fd;
     (void)shared_payload_fd;
@@ -59,7 +61,7 @@ int run_target_shard_ipc_daemon_loop(
     return 2;
 #else
     const char * prefix = daemon_prefix(callbacks);
-    if (hidden <= 0 || stream_fd < 0 || !callbacks.forward) {
+    if (hidden <= 0 || vocab <= 0 || stream_fd < 0 || !callbacks.forward) {
         std::fprintf(stderr, "[%s] bad daemon configuration\n", prefix);
         if (stream_fd >= 0) stream_daemon_status(callbacks, stream_fd, -1);
         return 2;
@@ -230,7 +232,10 @@ int run_target_shard_ipc_daemon_loop(
             }
         }
         if (want_logits) {
-            if (resp.logits.empty() ||
+            const int logits_tokens = want_argmax ? n_tokens : 1;
+            const size_t expected_logits =
+                (size_t)logits_tokens * (size_t)vocab;
+            if (resp.logits.size() != expected_logits ||
                 !write_exact_fd(stream_fd, resp.logits.data(),
                                 sizeof(float) * resp.logits.size())) {
                 break;

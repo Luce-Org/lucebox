@@ -127,6 +127,12 @@ bool TargetShardIpcSession::start(const TargetShardIpcLaunchConfig & cfg) {
     return false;
 #else
     close();
+    if (cfg.mode != BackendIpcMode::Qwen35TargetShard &&
+        cfg.mode != BackendIpcMode::Gemma4TargetShard &&
+        cfg.mode != BackendIpcMode::LagunaTargetShard) {
+        std::fprintf(stderr, "target shard IPC requires an explicit target-shard mode\n");
+        return false;
+    }
     if (cfg.bin.empty() || cfg.target_path.empty() || cfg.gpus.empty() ||
         cfg.gpus.size() != cfg.layer_begins.size() ||
         cfg.gpus.size() != cfg.layer_ends.size() ||
@@ -219,6 +225,8 @@ bool TargetShardIpcSession::forward(
     const size_t expected = (size_t)n_tokens * (size_t)hidden_;
     if (boundary_activation.size() != expected) return false;
     if (token_ids && (int)token_ids->size() != n_tokens) return false;
+    if (req.want_argmax != (resp.argmax_out != nullptr)) return false;
+    if (req.want_logits != (resp.logits_out != nullptr)) return false;
     const size_t bytes = boundary_activation.size() * sizeof(float);
     const int want_argmax = req.want_argmax ? 1 : 0;
     const int want_logits = req.want_logits ? 1 : 0;
@@ -263,7 +271,7 @@ bool TargetShardIpcSession::forward(
     }
     resp.last_tok = remote_last_tok;
 
-    if (resp.argmax_out) {
+    if (req.want_argmax) {
         resp.argmax_out->assign((size_t)n_tokens, 0);
         if (!read_exact_fd(stream_fd, resp.argmax_out->data(),
                            sizeof(int32_t) * (size_t)n_tokens)) {
@@ -271,8 +279,7 @@ bool TargetShardIpcSession::forward(
         }
     }
     if (req.want_logits) {
-        if (!resp.logits_out) return false;
-        const int logits_tokens = resp.argmax_out ? n_tokens : 1;
+        const int logits_tokens = req.want_argmax ? n_tokens : 1;
         resp.logits_out->assign((size_t)vocab_ * (size_t)logits_tokens, 0.0f);
         if (!read_exact_fd(stream_fd, resp.logits_out->data(),
                            sizeof(float) * resp.logits_out->size())) {
@@ -361,6 +368,7 @@ void TargetShardIpcSession::close() {
     active_ = false;
     hidden_ = 0;
     vocab_ = 0;
+    mode_ = BackendIpcMode::Invalid;
 }
 
 }  // namespace dflash::common

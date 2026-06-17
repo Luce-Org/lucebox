@@ -26,6 +26,7 @@ namespace dflash::common {
 
 const char * backend_ipc_mode_name(BackendIpcMode mode) {
     switch (mode) {
+        case BackendIpcMode::Invalid: return "invalid";
         case BackendIpcMode::DFlashDraft: return "dflash-draft";
         case BackendIpcMode::PFlashCompress: return "pflash-compress";
         case BackendIpcMode::Qwen35TargetShard: return "qwen35-target-shard";

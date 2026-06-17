@@ -1642,6 +1642,13 @@ int run_gemma4_target_shard_ipc_daemon(const char * target_path,
         }
         const int snap_pos = shards.empty() ? 0 : shards.front().cache.cur_pos;
         if (snap_pos <= 0) return false;
+        if (kvflash_pool_tokens > 0 &&
+            (snap_pos > kvflash_pool_tokens || !kvflash_pager.is_identity())) {
+            std::fprintf(stderr,
+                "[gemma4-target-shard-daemon][kvflash] cannot snapshot non-identity pool at pos=%d pool=%d\n",
+                snap_pos, kvflash_pool_tokens);
+            return false;
+        }
         free_slot(slot);
         auto & snap = snapshots[(size_t)slot];
         if (snap.shards.size() != shards.size()) snap.shards.resize(shards.size());
@@ -1746,7 +1753,7 @@ int run_gemma4_target_shard_ipc_daemon(const char * target_path,
         "[gemma4-target-shard-daemon] ready shards=%zu layers=[%d,%d)\n",
         shards.size(), shards.front().layer_begin, shards.back().layer_end);
     const int rc = run_target_shard_ipc_daemon_loop(
-        hidden, stream_fd, payload_fd, shared_payload_fd,
+        hidden, shards.front().weights.n_vocab, stream_fd, payload_fd, shared_payload_fd,
         shared_payload_bytes, std::move(callbacks));
     for (int slot = 0; slot < ModelBackend::kMaxSlots; ++slot) free_slot(slot);
     auto metas = layer_split_shard_metas(shards);

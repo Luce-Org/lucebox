@@ -122,7 +122,9 @@ bool Qwen35LayerSplitAdapter::init() {
 
 void Qwen35LayerSplitAdapter::kvflash_read_config() {
     if (!std::getenv("DFLASH_KVFLASH") || shards_.empty()) return;
-    kvflash_drafter_path_ = cfg_.device.is_mixed_layer_split()
+    const bool target_shard_split =
+        cfg_.device.is_layer_split() && cfg_.remote_target_shard.enabled();
+    kvflash_drafter_path_ = target_shard_split
         ? std::string{}
         : kvflash_find_drafter(cfg_.target_path);
 

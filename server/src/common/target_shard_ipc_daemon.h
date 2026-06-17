@@ -39,6 +39,7 @@ struct TargetShardDaemonCallbacks {
 
 int run_target_shard_ipc_daemon_loop(
     int hidden,
+    int vocab,
     int stream_fd,
     int payload_fd,
     int shared_payload_fd,

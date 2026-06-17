@@ -284,6 +284,8 @@ int main(int argc, char ** argv) {
     (void)target_max_tokens;
 
     switch (mode) {
+        case BackendIpcMode::Invalid:
+            break;
         case BackendIpcMode::DFlashDraft:
             return run_dflash_draft_ipc_daemon(payload_path, ring_cap, draft_gpu,
                                                stream_fd, payload_fd,

@@ -834,8 +834,7 @@ bool build_laguna_layer_step(
     ggml_set_input(sg.positions);
 
     const int kv_len = kv_start + n_tokens;
-    const int kv_cap = cache.attn_k[(size_t)layer_idx]
-        ? (int)cache.attn_k[(size_t)layer_idx]->ne[1] : cache.max_ctx;
+    const int kv_cap = (int)cache.attn_k[(size_t)layer_idx]->ne[1];
     const int kv_pad = std::min((kv_len + 255) & ~255, kv_cap);
     const int mk_w = kvflash ? kv_pad : kv_len;
     sg.attn_mask = ggml_new_tensor_4d(sg.ctx, GGML_TYPE_F32, mk_w, n_tokens, 1, 1);

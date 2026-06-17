@@ -1597,7 +1597,8 @@ int run_laguna_target_shard_ipc_daemon(const char * target_path,
         "[laguna-target-shard-daemon] ready shards=%zu layers=[%d,%d)\n",
         shards.size(), shards.front().layer_begin, shards.back().layer_end);
     const int rc = run_target_shard_ipc_daemon_loop(
-        hidden, stream_fd, payload_fd, shared_payload_fd,
+        hidden, (int)shards.front().weights.embedder.n_vocab,
+        stream_fd, payload_fd, shared_payload_fd,
         shared_payload_bytes, std::move(callbacks));
     for (int slot = 0; slot < ModelBackend::kMaxSlots; ++slot) free_slot(slot);
     auto metas = layer_split_shard_metas(shards);
