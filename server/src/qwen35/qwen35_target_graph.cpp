@@ -1027,7 +1027,8 @@ static ggml_tensor * build_single_layer(
     int                   fa_window = 0,
     ggml_tensor *         q_tail_capture = nullptr,
     int                   q_tail_start = 0,
-    ggml_tensor **        moe_selected_out = nullptr)
+    ggml_tensor **        moe_selected_out = nullptr,
+    ggml_tensor *         kv_write_rows = nullptr)
 {
     const int hidden = w.n_embd;
     const float eps   = w.rms_eps;
@@ -1052,7 +1053,8 @@ static ggml_tensor * build_single_layer(
                                     cache.kv_k_type, cache.kv_v_type,
                                     cache.kv_k_rotated,
                                     fa_window,
-                                    q_tail_capture, q_tail_start);
+                                    q_tail_capture, q_tail_start,
+                                    kv_write_rows);
     } else {
         int dn_idx = 0;
         for (int il = 0; il < layer_idx; il++) {
@@ -1295,11 +1297,13 @@ ggml_tensor * build_qwen35_layer(
     bool                  capture,
     int                   fa_window,
     ggml_tensor *         q_tail_capture,
-    int                   q_tail_start)
+    int                   q_tail_start,
+    ggml_tensor *         kv_write_rows)
 {
     return build_single_layer(ctx, gf, w, cache, layer_idx, inp, positions,
                               attn_mask, kv_start, n_tokens, capture, fa_window,
-                              q_tail_capture, q_tail_start, nullptr);
+                              q_tail_capture, q_tail_start, nullptr,
+                              kv_write_rows);
 }
 
 ggml_tensor * build_qwen35_layer(
@@ -1317,11 +1321,13 @@ ggml_tensor * build_qwen35_layer(
     int                   fa_window,
     ggml_tensor *         q_tail_capture,
     int                   q_tail_start,
-    ggml_tensor **        moe_selected_out)
+    ggml_tensor **        moe_selected_out,
+    ggml_tensor *         kv_write_rows)
 {
     return build_single_layer(ctx, gf, w, cache, layer_idx, inp, positions,
                               attn_mask, kv_start, n_tokens, capture, fa_window,
-                              q_tail_capture, q_tail_start, moe_selected_out);
+                              q_tail_capture, q_tail_start, moe_selected_out,
+                              kv_write_rows);
 }
 
 QwenLayerPrefnOutputs build_qwen35_layer_prefn(

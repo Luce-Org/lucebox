@@ -599,7 +599,8 @@ ggml_tensor * build_qwen35_layer(
     bool                  capture,
     int                   fa_window = 0,
     ggml_tensor *         q_tail_capture = nullptr,
-    int                   q_tail_start = 0);
+    int                   q_tail_start = 0,
+    ggml_tensor *         kv_write_rows = nullptr);
 
 // Overload that also exposes the MoE router selection tensor (if MoE layer).
 ggml_tensor * build_qwen35_layer(
@@ -617,7 +618,8 @@ ggml_tensor * build_qwen35_layer(
     int                   fa_window,
     ggml_tensor *         q_tail_capture,
     int                   q_tail_start,
-    ggml_tensor **        moe_selected_out);
+    ggml_tensor **        moe_selected_out,
+    ggml_tensor *         kv_write_rows = nullptr);
 
 QwenLayerPrefnOutputs build_qwen35_layer_prefn(
     ggml_context *        ctx,

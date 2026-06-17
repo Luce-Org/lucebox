@@ -328,6 +328,7 @@ struct LagunaLayerStepGraph {
     ggml_tensor * positions = nullptr;
     ggml_tensor * attn_mask = nullptr;
     ggml_tensor * attn_mask_swa = nullptr;
+    ggml_tensor * kv_idx = nullptr;
 };
 
 void laguna_layer_step_graph_free(LagunaLayerStepGraph & sg);
@@ -343,7 +344,8 @@ bool build_laguna_layer_step(
     ggml_tensor * act_out,
     int chunk_start,
     int n_tokens,
-    int kv_start);
+    int kv_start,
+    const class KvFlashPager * kvflash = nullptr);
 
 bool compute_laguna_split_argmax(
     ggml_backend_t backend,

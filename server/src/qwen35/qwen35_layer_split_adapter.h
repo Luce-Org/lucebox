@@ -3,6 +3,8 @@
 #pragma once
 
 #include "common/dflash_draft_ipc.h"
+#include "common/kvflash_pager.h"
+#include "common/kvflash_scorer.h"
 #include "common/layer_split_backend.h"
 #include "dflash_feature_ring.h"
 #include "layer_split_types.h"
@@ -92,6 +94,12 @@ public:
 private:
     bool load_draft();
     bool init_mixed_target_split();
+    void kvflash_read_config();
+    bool kvflash_attach();
+    bool kvflash_active() const { return kvflash_tokens_ > 0; }
+    bool kvflash_sync_identity(int committed);
+    void kvflash_sync_history(const std::vector<int32_t> & tokens, int base_pos);
+    void kvflash_maybe_reselect(int generated);
     bool use_mixed_target_split() const {
         return remote_target_shard_.active() && !shards_.empty();
     }
@@ -114,10 +122,21 @@ private:
     ggml_type activation_type_ = GGML_TYPE_F32;
     DrafterContext pflash_drafter_;
     bool pflash_drafter_loaded_ = false;
+    KvFlashPager kvflash_pager_;
+    std::unique_ptr<KvFlashScorer> kvflash_scorer_;
+    DrafterContext kvflash_drafter_;
+    std::vector<int32_t> kvflash_history_;
+    std::vector<float> kvflash_scores_;
+    std::string kvflash_drafter_path_;
+    int kvflash_tokens_ = 0;
+    int kvflash_tau_ = 64;
+    bool kvflash_drafter_loaded_ = false;
+    bool kvflash_drafter_failed_ = false;
     static constexpr int PREFIX_SLOTS = ModelBackend::kMaxSlots;
     std::vector<std::vector<PrefixSnapshot>> prefix_snapshots_;
     std::vector<std::vector<float>> snapshot_prefill_logits_;
     std::vector<std::vector<ggml_tensor *>> snapshot_prefill_logit_tensors_;
+    std::vector<std::vector<int32_t>> kvflash_history_snapshots_;
     std::vector<ggml_context *> disk_snapshot_contexts_;
     std::vector<ggml_backend_buffer_t> disk_snapshot_buffers_;
     std::vector<ggml_backend_t> disk_snapshot_backends_;
