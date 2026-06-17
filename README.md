@@ -213,7 +213,7 @@ Then hit `:8000/v1/chat/completions` (OpenAI-compatible).
 
 ## Run the Server
 
-Default: Qwen 3.6-27B Q4_K_M target + Lucebox Q4_K_M DFlash drafter on RTX 3090. DDTree budget=22, TQ3_0 KV cache, sliding FA window 2048. OpenAI-compatible HTTP on `:8000`.
+Default: Qwen 3.6-27B Q4_K_M target + Lucebox Q4_K_M DFlash drafter on RTX 3090. DDTree budget=22, TQ3_0 KV cache, full attention. OpenAI-compatible HTTP on `:8000`.
 
 ```bash
 # build (CUDA 12+, CMake 3.18+)
@@ -229,8 +229,24 @@ hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf --local
 DFLASH27B_KV_TQ3=1 \
 ./server/build/dflash_server server/models/Qwen3.6-27B-Q4_K_M.gguf \
   --draft server/models/draft/dflash-draft-3.6-q4_k_m.gguf \
-  --ddtree --ddtree-budget 22 --fa-window 2048 --port 8000
+  --ddtree --ddtree-budget 22 --port 8000
 ```
+
+### Making requests
+
+For the fastest, deterministic responses send `temperature: 0` (greedy decoding gives the
+highest spec-decode acceptance):
+
+```bash
+curl :8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "dflash",
+  "messages": [{"role": "user", "content": "Write quicksort in Python."}],
+  "temperature": 0
+}'
+```
+
+Requests that omit `temperature` use the model card's sampling (Qwen3.6: `temperature: 1.0`,
+`top_p: 0.95`, `top_k: 20`).
 
 ### Server flags
 
@@ -252,7 +268,7 @@ DFLASH27B_KV_TQ3=1 \
 |---|---|---|
 | `--ddtree` | off (chain) | Enable tree verify |
 | `--ddtree-budget N` | `22` | Tree size. 22 on 3090 (default), 40 on 5090, re-sweep on GB10 |
-| `--fa-window N` | `2048` | Sliding FA window; `0` = full attention |
+| `--fa-window N` | `0` (full attention) | Sliding FA window. Leave at 0: a finite window breaks tool calls on Qwen3.6 (the full-attention layers lose the system prompt/tools). Advanced / long-context only. |
 | `--draft-residency {auto,persistent,request-scoped}` | `auto` | When draft weights are evicted from VRAM. `request-scoped` parks/frees them after each request's draft work (frees VRAM for the target on tight GPUs); `persistent` keeps them resident across requests; `auto` preserves current behavior while honoring the low-VRAM / `--lazy-draft` hint. Reported at `/props.runtime.draft_residency`. |
 | `--lazy-draft` | off | Legacy alias for `--draft-residency=request-scoped` (defer draft load until first request, release after) |
 
