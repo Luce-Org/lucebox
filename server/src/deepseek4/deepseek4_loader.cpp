@@ -27,6 +27,12 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <thread>
+#include <atomic>
+#include <unistd.h>
+#include <fcntl.h>
+
+extern "C" bool ggml_backend_cuda_buffer_is_managed(ggml_backend_buffer_t buffer);
 
 #if !defined(_WIN32)
 #include <cerrno>
@@ -389,10 +395,49 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         return false;
     }
 
-    for (auto & a : allocs) {
-        if (!a.upload_to_backend) continue;
-        const void * src_data = (const char *)mmap.addr + a.file_offset;
-        ggml_backend_tensor_set(a.tensor, src_data, 0, a.file_size);
+    bool fast_managed = (buf != nullptr) && ggml_backend_cuda_buffer_is_managed(buf) && (getenv("DFLASH_NO_PREAD") == nullptr);
+    if (fast_managed) {
+        // Unified/managed buffer: read weights straight off disk into it in parallel at
+        // disk bandwidth, instead of mmap page-faults (~5x slower). Drop the cached file
+        // pages afterward so the page cache does not double a near-RAM-size model.
+        unsigned nth = std::thread::hardware_concurrency();
+        if (nth == 0) nth = 4;
+        if (nth > 8)  nth = 8;
+        std::atomic<size_t> next{0};
+        std::atomic<bool> read_ok{true};
+        auto worker = [&]() {
+            size_t i;
+            while ((i = next.fetch_add(1)) < allocs.size()) {
+                auto & a = allocs[i];
+                if (!a.upload_to_backend) continue;
+                char * dst = (char *) a.tensor->data;
+                size_t done = 0;
+                while (done < a.file_size) {
+                    ssize_t r = pread(mmap.fd, dst + done, a.file_size - done,
+                                      (off_t) (a.file_offset + done));
+                    if (r <= 0) { read_ok = false; return; }
+                    done += (size_t) r;
+                }
+            }
+        };
+        std::vector<std::thread> pool;
+        for (unsigned t = 0; t < nth; t++) pool.emplace_back(worker);
+        for (auto & th : pool) th.join();
+        posix_fadvise(mmap.fd, 0, (off_t) mmap.len, POSIX_FADV_DONTNEED);
+        ggml_backend_synchronize(backend);  // make CPU-written managed pages visible to GPU
+        if (!read_ok) {
+            set_last_error("parallel weight read failed");
+            mmap.close_map();
+            ggml_backend_buffer_free(buf); out.buf = nullptr;
+            gguf_free(gctx);
+            return false;
+        }
+    } else {
+        for (auto & a : allocs) {
+            if (!a.upload_to_backend) continue;
+            const void * src_data = (const char *)mmap.addr + a.file_offset;
+            ggml_backend_tensor_set(a.tensor, src_data, 0, a.file_size);
+        }
     }
     mmap.close_map();
 
