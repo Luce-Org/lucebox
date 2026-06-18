@@ -202,6 +202,11 @@ struct LagunaCacheSnapshot {
     std::vector<ggml_tensor *> attn_k;  // size = n_layer
     std::vector<ggml_tensor *> attn_v;  // size = n_layer
     int                   cur_pos = 0;
+    // Last committed token id (the token at cur_pos-1). Recorded at save so the
+    // exact-hit restore can re-embed the real last token even when the caller
+    // hands us a zero-filled restore-only prompt (pflash full-cache hit). -1 =
+    // not recorded (older/inline snapshots) -> restore falls back to req.prompt.
+    int                   last_tok = -1;
     bool                  used    = false;
 };
 
