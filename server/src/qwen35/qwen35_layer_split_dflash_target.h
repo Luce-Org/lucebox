@@ -24,6 +24,8 @@
 
 namespace dflash::common {
 
+class KvFlashPager;
+
 class Qwen35LayerSplitDFlashTarget : public DFlashTarget {
 public:
     // All references/pointers are non-owning; caller controls lifetime.
@@ -32,14 +34,16 @@ public:
                                  int kq_stride_pad,
                                  int fa_window,
                                  DFlashDraftIpcClient * remote_draft = nullptr,
-                                 Qwen35TargetShardIpcClient * remote_target_shard = nullptr);
+                                 Qwen35TargetShardIpcClient * remote_target_shard = nullptr,
+                                 KvFlashPager * kvflash = nullptr);
 
     ~Qwen35LayerSplitDFlashTarget() override;
 
     bool verify_batch(const std::vector<int32_t> & tokens,
                       int base_pos,
                       int & last_tok,
-                      std::vector<int32_t> * all_argmax = nullptr) override;
+                      std::vector<int32_t> * all_argmax = nullptr,
+                      bool capture_ssm_intermediates = false) override;
 
     bool snapshot_kv() override;
     bool restore_kv() override;
@@ -64,6 +68,7 @@ private:
     int                                  fa_window_;
     DFlashDraftIpcClient *               remote_draft_;
     Qwen35TargetShardIpcClient *         remote_target_shard_;
+    KvFlashPager *                       kvflash_;
 
     std::vector<int> capture_ids_;
     StepGraph        proj_sg_;

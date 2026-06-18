@@ -3,15 +3,27 @@ name: CI
 on:
   pull_request:
     branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - 'server/**'
+      - 'harness/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/ci.yml'
   workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   uv-workspace:
     name: uv workspace (lock + sync + import smoke)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           version: "0.11.x"
       - name: Verify uv lockfile and workspace sync
@@ -26,12 +38,12 @@ jobs:
     name: Build (cmake + uv sync --extra megakernel)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
 
-      - uses: Jimver/cuda-toolkit@v0.2.35
+      - uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
         with:
           # Keep the existing upstream CUDA toolkit version; the uv workspace
           # only replaces Python environment setup.
@@ -42,7 +54,7 @@ jobs:
           sub-packages: '["nvcc", "cudart-dev", "thrust", "driver-dev"]'
           non-cuda-sub-packages: '["libcublas-dev"]'
 
-      - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           version: "0.11.x"
           # uv reads .python-version (3.12, matching the previous CI) and downloads the matching
@@ -57,14 +69,13 @@ jobs:
             -DDFLASH27B_FA_ALL_QUANTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target \
-            test_dflash test_generate test_flash_attn_sparse \
+            test_dflash test_generate test_flash_attn_sparse test_server_unit \
             -j$(nproc)
 
-      # Server unit tests require libcurl-dev; skipped when CURL is absent.
-      # - name: Run C++ server unit tests
-      #   run: |
-      #     cd server/build
-      #     ctest --output-on-failure -R server_unit --no-tests=error
+      - name: Run C++ server unit tests
+        run: |
+          cd server/build
+          ctest --output-on-failure -R server_unit --no-tests=error
 
       - name: Populate venv with cu128 torch + setuptools
         # First pass: install the workspace's default deps. dflash declares
@@ -134,7 +145,7 @@ jobs:
       group: lucebox3-gpu-runner
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: recursive
           token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
@@ -209,7 +220,7 @@ jobs:
       group: lucebox3-rocm-runner
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: KFD health (diagnose instead of hanging)
         # rocminfo on a wedged KFD blocks in uninterruptible sleep and eats

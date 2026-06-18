@@ -23,7 +23,9 @@ bool build_layer_step(
     bool with_mask,
     bool capture,
     int fa_window,
-    int kq_stride_pad) {
+    int kq_stride_pad,
+    bool kvflash) {
+    if (kvflash) with_mask = true;
     step_graph_free(sg);
 
     const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
@@ -49,14 +51,26 @@ bool build_layer_step(
         ggml_set_input(sg.positions);
 
         if (with_mask) {
-            // Use max_ctx for allocation so gallocr buffer doesn't grow
-            // as kv_start advances during chunked prefill.
-            const int max_win_len = cache.max_ctx + n_tokens;
+            int phys_ctx = cache.max_ctx;
+            if (kvflash) {
+                for (ggml_tensor * t : cache.attn_k) {
+                    if (t) { phys_ctx = std::min(phys_ctx, (int)t->ne[1]); break; }
+                }
+            }
+            // Size from the fixed physical capacity so gallocr doesn't grow
+            // as kv_start advances. Under kvflash this is the resident pool.
+            const int max_win_len = phys_ctx + n_tokens;
             const int kv_pad = align_up(max_win_len, kq_stride_pad);
             const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
             sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
             ggml_set_name(sg.attn_mask, "attn_mask");
             ggml_set_input(sg.attn_mask);
+        }
+        if (kvflash) {
+            sg.kv_write_rows = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_I64,
+                                                  n_tokens, w.n_head_kv);
+            ggml_set_name(sg.kv_write_rows, "kv_write_rows");
+            ggml_set_input(sg.kv_write_rows);
         }
     }
 
@@ -65,7 +79,9 @@ bool build_layer_step(
     ggml_tensor * layer_out = build_qwen35_layer(
         sg.ctx, sg.gf, w, cache, layer_idx,
         sg.inp_embed, sg.positions, sg.attn_mask,
-        kv_start, n_tokens, capture, fa_window);
+        kv_start, n_tokens, capture, fa_window,
+        /*q_tail_capture=*/nullptr, /*q_tail_start=*/0,
+        sg.kv_write_rows);
     if (!layer_out) return false;
 
     ggml_tensor * out_view = ggml_view_2d(sg.ctx, act_out,
@@ -254,7 +270,8 @@ bool build_target_step(
     bool last_token_logits_only,
     int kq_stride_pad,
     bool capture_moe_router,
-    bool kvflash_mask) {
+    bool kvflash_mask,
+    bool capture_qk) {
     step_graph_free(sg);
 
     // Persistent thread_local arena: rebuilt step graphs land at identical
@@ -333,6 +350,7 @@ bool build_target_step(
     gi.fa_window                  = fa_window;
     gi.last_token_logits_only     = last_token_logits_only;
     gi.kv_write_rows              = sg.kv_write_rows;
+    gi.q_capture                  = capture_qk;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;

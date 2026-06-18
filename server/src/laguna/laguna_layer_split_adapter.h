@@ -4,12 +4,17 @@
 
 #include "common/layer_split_backend.h"
 #include "common/layer_split_utils.h"
+#include "common/kvflash_pager.h"
+#include "common/kvflash_scorer.h"
 #include "laguna_internal.h"
 #include "placement/placement_config.h"
+#include "qwen3/qwen3_drafter.h"
 
 #include "ggml-backend.h"
 
+#include <memory>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace dflash::common {
@@ -74,6 +79,13 @@ private:
                      int & last_tok,
                      std::vector<float> * logits_out = nullptr);
     bool rebuild_disk_snapshot(int slot);
+    KvFlashConfig kvflash_config() const;
+    void kvflash_read_config();
+    bool kvflash_attach();
+    bool kvflash_active() const { return kvflash_tokens_ > 0; }
+    bool kvflash_sync_identity(int committed);
+    void kvflash_sync_history(const std::vector<int32_t> & tokens, int base_pos);
+    void kvflash_maybe_reselect(int generated);
 
     LagunaLayerSplitAdapterConfig cfg_;
     std::vector<LagunaLayerSplitShard> shards_;
@@ -84,6 +96,17 @@ private:
     std::vector<ggml_backend_buffer_t> disk_snapshot_buffers_;
     std::vector<ggml_backend_t> disk_snapshot_backends_;
     ggml_type activation_type_ = GGML_TYPE_F32;
+    KvFlashPager kvflash_pager_;
+    std::unique_ptr<KvFlashScorer> kvflash_scorer_;
+    DrafterContext kvflash_drafter_;
+    std::vector<int32_t> kvflash_history_;
+    std::vector<std::vector<int32_t>> kvflash_history_snapshots_;
+    std::vector<float> kvflash_scores_;
+    std::string kvflash_drafter_path_;
+    int kvflash_tokens_ = 0;
+    int kvflash_tau_ = 64;
+    bool kvflash_drafter_loaded_ = false;
+    bool kvflash_drafter_failed_ = false;
     static constexpr int PREFIX_SLOTS = ModelBackend::kMaxSlots;
     SamplerCfg sampler_;
     std::mt19937_64 sampler_rng_{std::random_device{}()};

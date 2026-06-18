@@ -3,6 +3,19 @@
 // Core infrastructure: socket listen/accept, client threads, HTTP parsing,
 // job queue, worker thread with SSE streaming and disconnect detection.
 
+// On Windows, winsock2.h must be included BEFORE windows.h (which comes
+// transitively via internal.h → http_server.h). Classic MSVC ordering.
+#if defined(_WIN32)
+#if !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+#if !defined(WIN32_LEAN_AND_MEAN)
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
 #include "http_server.h"
 #include "admission.h"
 #include "sse_emitter.h"
@@ -27,15 +40,49 @@
 #include <fstream>
 #include <sstream>
 
-#include <arpa/inet.h>
+#if defined(_WIN32)
+#include <io.h>
+#include <sys/stat.h>
+typedef long ssize_t;
+#define MSG_NOSIGNAL   0
+#define MSG_DONTWAIT   0
+#define SHUT_RDWR      SD_BOTH
+#define socklen_t      int
+#define poll(fds,nfds,timeout)  WSAPoll(fds,nfds,timeout)
+#define SOCK_FD(fd)    ((SOCKET)(fd))
+// Replace fcntl(F_GETFL) / fcntl(F_SETFL, O_NONBLOCK) with ioctlsocket
+static inline int sock_get_flags(int fd) { (void)fd; return 0; /* stub */ }
+static inline void sock_set_nonblock(int fd) { u_long m = 1; ioctlsocket(SOCK_FD(fd), FIONBIO, &m); }
+static inline void sock_set_block(int fd) { u_long m = 0; ioctlsocket(SOCK_FD(fd), FIONBIO, &m); }
+static inline void socket_close(int fd) { closesocket(SOCK_FD(fd)); }
+#define SETSOCKOPT_CAST (const char *)
+static inline const char* sock_strerror() {
+    static thread_local char buf[64];
+    // On Windows, use FormatMessage for WSA errors
+    snprintf(buf, sizeof(buf), "WSA error %d", WSAGetLastError());
+    return buf;
+}
+#else
 #include <fcntl.h>
+#include <sys/stat.h>
+#define SOCK_FD(fd)    (fd)
+static inline int sock_get_flags(int fd) { return fcntl(fd, F_GETFL, 0); }
+static inline void sock_set_nonblock(int fd) { int f = fcntl(fd, F_GETFL, 0); if (f >= 0) fcntl(fd, F_SETFL, f | O_NONBLOCK); }
+static inline void sock_set_block(int fd) { int f = fcntl(fd, F_GETFL, 0); if (f >= 0) fcntl(fd, F_SETFL, f & ~O_NONBLOCK); }
+static inline void socket_close(int fd) { ::close(fd); }
+#define SETSOCKOPT_CAST  /* empty on POSIX */
+#include <unistd.h>
+static inline const char* sock_strerror() { return strerror(errno); }
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace dflash::common {
 
@@ -829,15 +876,28 @@ std::string HttpServer::resolve_status_html() {
         struct stat st;
         if (::stat(path.c_str(), &st) == 0) return path;
     }
-    // 2. share/ relative to /proc/self/exe (build dir or installed prefix)
+    // 2. share/ relative to exe path (build dir or installed prefix)
+    {
+    std::string exe_dir;
+#if defined(_WIN32)
+    char exe_buf[MAX_PATH] = {};
+    DWORD n = GetModuleFileNameA(nullptr, exe_buf, sizeof(exe_buf));
+    if (n > 0 && n < sizeof(exe_buf)) {
+        exe_dir = std::string(exe_buf, n);
+        auto slash = exe_dir.find_last_of("/\\");
+        if (slash != std::string::npos) exe_dir = exe_dir.substr(0, slash);
+    }
+#else
     char exe_buf[1024] = {};
     ssize_t len = ::readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
     if (len > 0) {
         exe_buf[len] = '\0';
-        std::string exe_dir(exe_buf);
+        exe_dir = exe_buf;
         auto slash = exe_dir.rfind('/');
-        if (slash != std::string::npos) {
-            exe_dir = exe_dir.substr(0, slash);
+        if (slash != std::string::npos) exe_dir = exe_dir.substr(0, slash);
+    }
+#endif
+    if (!exe_dir.empty()) {
             // 2a. <exe_dir>/share/status.html  (build directory layout)
             {
                 std::string path = exe_dir + "/share/status.html";
@@ -871,10 +931,10 @@ static bool sse_try_send(int fd, const void * data, size_t len) {
             deadline - std::chrono::steady_clock::now()).count();
         if (remaining <= 0) return false;
 
-        struct pollfd pfd = {fd, POLLOUT, 0};
+        struct pollfd pfd = {SOCK_FD(fd), POLLOUT, 0};
         int ret;
         do {
-            ret = poll(&pfd, 1, static_cast<int>(std::min(remaining, (long)50)));
+            ret = poll(&pfd, 1, (int)(remaining < 50 ? remaining : 50));
         } while (ret < 0 && errno == EINTR);
         if (ret < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
         if (ret == 0) continue;
@@ -900,7 +960,7 @@ void HttpServer::broadcast_status() {
         }
     }
     for (int fd : dead) {
-        ::close(fd);
+        socket_close(fd);
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
     }
@@ -923,7 +983,7 @@ void HttpServer::broadcast_token(const std::string & text) {
         }
     }
     for (int fd : dead) {
-        ::close(fd);
+        socket_close(fd);
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
     }
@@ -944,7 +1004,7 @@ void HttpServer::sse_heartbeat() {
         }
     }
     for (int fd : dead) {
-        ::close(fd);
+        socket_close(fd);
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
     }
@@ -962,7 +1022,7 @@ void HttpServer::shutdown() {
     stopping_.store(true);
     queue_cv_.notify_all();
     if (listen_fd_ >= 0) {
-        ::close(listen_fd_);
+        socket_close(listen_fd_);
         listen_fd_ = -1;
     }
     if (worker_thread_.joinable()) {
@@ -972,7 +1032,7 @@ void HttpServer::shutdown() {
     // Close SSE client connections.
     {
         std::lock_guard<std::mutex> lk(sse_mu_);
-        for (int fd : sse_fds_) ::close(fd);
+        for (int fd : sse_fds_) socket_close(fd);
         sse_fds_.clear();
     }
 
@@ -1006,40 +1066,42 @@ void HttpServer::shutdown() {
 }
 
 int HttpServer::run() {
+#if !defined(_WIN32)
     // Ignore SIGPIPE so send() returns EPIPE instead of killing the process.
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     // Create listen socket.
     listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) {
-        std::fprintf(stderr, "[server] socket() failed: %s\n", strerror(errno));
+        std::fprintf(stderr, "[server] socket() failed: %s\n", sock_strerror());
         return 1;
     }
 
     int yes = 1;
-    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    setsockopt(SOCK_FD(listen_fd_), SOL_SOCKET, SO_REUSEADDR, SETSOCKOPT_CAST &yes, sizeof(yes));
 
     struct sockaddr_in sa{};
     sa.sin_family = AF_INET;
     sa.sin_port = htons((uint16_t)config_.port);
     if (inet_pton(AF_INET, config_.host.c_str(), &sa.sin_addr) != 1) {
         std::fprintf(stderr, "[server] invalid host address: %s\n", config_.host.c_str());
-        ::close(listen_fd_);
+        socket_close(listen_fd_);
         listen_fd_ = -1;
         return 1;
     }
 
     if (bind(listen_fd_, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         std::fprintf(stderr, "[server] bind(%s:%d) failed: %s\n",
-                     config_.host.c_str(), config_.port, strerror(errno));
-        ::close(listen_fd_);
+                     config_.host.c_str(), config_.port, sock_strerror());
+        socket_close(listen_fd_);
         listen_fd_ = -1;
         return 1;
     }
 
     if (listen(listen_fd_, 128) < 0) {
-        std::fprintf(stderr, "[server] listen() failed: %s\n", strerror(errno));
-        ::close(listen_fd_);
+        std::fprintf(stderr, "[server] listen() failed: %s\n", sock_strerror());
+        socket_close(listen_fd_);
         listen_fd_ = -1;
         return 1;
     }
@@ -1048,10 +1110,12 @@ int HttpServer::run() {
     // timeout. This guarantees the loop exits on SIGTERM/SIGINT regardless of
     // which thread the signal handler runs on (it only sets the atomic flag).
     {
-        int fl = fcntl(listen_fd_, F_GETFL, 0);
-        if (fl < 0 || fcntl(listen_fd_, F_SETFL, fl | O_NONBLOCK) < 0) {
-            std::fprintf(stderr, "[server] fcntl(O_NONBLOCK) failed: %s\n", strerror(errno));
-            ::close(listen_fd_);
+        int fl = sock_get_flags(listen_fd_);
+        if (fl < 0) { /* Windows: ioctlsocket sets non-block directly */ }
+        sock_set_nonblock(listen_fd_);
+        if (false) {
+            std::fprintf(stderr, "[server] fcntl(O_NONBLOCK) failed: %s\n", "n/a");
+            socket_close(listen_fd_);
             listen_fd_ = -1;
             return 1;
         }
@@ -1065,12 +1129,12 @@ int HttpServer::run() {
 
     // Accept loop.
     while (!stopping_.load()) {
-        struct pollfd pfd{listen_fd_, POLLIN, 0};
+        struct pollfd pfd{SOCK_FD(listen_fd_), POLLIN, 0};
         int pr = poll(&pfd, 1, 200 /* ms */);
         if (pr <= 0) {
             // 0 = timeout (re-check stopping_); <0 with EINTR = signal. Both loop.
             if (pr < 0 && errno != EINTR) {
-                std::fprintf(stderr, "[server] poll() error: %s\n", strerror(errno));
+                std::fprintf(stderr, "[server] poll() error: %s\n", sock_strerror());
             }
             continue;
         }
@@ -1081,13 +1145,13 @@ int HttpServer::run() {
         if (client_fd < 0) {
             if (stopping_.load()) break;
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
-            std::fprintf(stderr, "[server] accept() error: %s\n", strerror(errno));
+            std::fprintf(stderr, "[server] accept() error: %s\n", sock_strerror());
             continue;
         }
 
         // Disable Nagle for low-latency SSE streaming.
         int flag = 1;
-        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+        setsockopt(SOCK_FD(client_fd), IPPROTO_TCP, TCP_NODELAY, SETSOCKOPT_CAST &flag, sizeof(flag));
 
         // Spawn client thread (detached — client_main owns the fd).
         active_clients_.fetch_add(1);
@@ -1146,21 +1210,21 @@ void HttpServer::handle_client(int fd) {
     HttpRequest hr;
     if (!read_http_request(fd, hr)) {
         send_error(fd, 400, "bad HTTP request");
-        ::close(fd);
+        socket_close(fd);
         return;
     }
 
     // CORS preflight.
     if (hr.method == "OPTIONS") {
         send_response(fd, 204, "", "");
-        ::close(fd);
+        socket_close(fd);
         return;
     }
 
     // Health check.
     if (hr.method == "GET" && (hr.path == "/health" || hr.path == "/")) {
         send_response(fd, 200, "application/json", "{\"status\":\"ok\"}\n");
-        ::close(fd);
+        socket_close(fd);
         return;
     }
 
@@ -1168,7 +1232,7 @@ void HttpServer::handle_client(int fd) {
     if (hr.method == "GET" && hr.path == "/props") {
         json body = build_props_body(config_, prefix_cache_, tool_memory_);
         send_response(fd, 200, "application/json", body.dump() + "\n");
-        ::close(fd);
+        socket_close(fd);
         return;
     }
 
@@ -1177,19 +1241,19 @@ void HttpServer::handle_client(int fd) {
         if (status_html_path_.empty()) {
             send_error(fd, 404,
                 "status.html not found. Set DFLASH_SHARE_DIR or place it in share/status.html");
-            ::close(fd);
+            socket_close(fd);
             return;
         }
         std::ifstream ifs(status_html_path_);
         if (!ifs.is_open()) {
             send_error(fd, 500, "failed to open status.html");
-            ::close(fd);
+            socket_close(fd);
             return;
         }
         std::ostringstream oss;
         oss << ifs.rdbuf();
         send_response(fd, 200, "text/html; charset=utf-8", oss.str());
-        ::close(fd);
+        socket_close(fd);
         return;
     }
 
@@ -1197,7 +1261,7 @@ void HttpServer::handle_client(int fd) {
     if (hr.method == "GET" && hr.path == "/status/json") {
         send_response(fd, 200, "application/json",
             status_.to_json().dump(-1, ' ', false, json::error_handler_t::replace) + "\n");
-        ::close(fd);
+        socket_close(fd);
         return;
     }
 
@@ -1212,7 +1276,7 @@ void HttpServer::handle_client(int fd) {
             "Access-Control-Allow-Origin: *\r\n"
             "\r\n";
         if (!send_all(fd, headers, std::strlen(headers))) {
-            ::close(fd);
+            socket_close(fd);
             return;
         }
         // Send initial state immediately.
@@ -1273,7 +1337,7 @@ void HttpServer::handle_client(int fd) {
                 })}
             };
             send_response(fd, 200, "application/json", codex_models.dump() + "\n");
-            ::close(fd);
+            socket_close(fd);
             return;
         }
         json models = {
@@ -1288,7 +1352,7 @@ void HttpServer::handle_client(int fd) {
             })}
         };
         send_response(fd, 200, "application/json", models.dump() + "\n");
-        ::close(fd);
+        socket_close(fd);
         return;
     }
 
@@ -1296,7 +1360,7 @@ void HttpServer::handle_client(int fd) {
     if (!route_request(fd, hr)) {
         send_error(fd, 404, "unknown endpoint");
     }
-    ::close(fd);
+    socket_close(fd);
 }
 
 bool HttpServer::route_request(int fd, const HttpRequest & hr) {
@@ -1539,7 +1603,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         //   thinking.budget_tokens (if set) wins over reasoning.effort.
         //   Either is clamped to think_max_tokens.
         if (request_budget_tokens >= 0) {
-            int eff = std::min(request_budget_tokens, config_.think_max_tokens);
+            int eff = (std::min)(request_budget_tokens, config_.think_max_tokens);
             if (request_budget_tokens > config_.think_max_tokens) {
                 std::fprintf(stderr,
                     "[server] thinking.budget_tokens=%d clamped to "
@@ -1554,9 +1618,9 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             // exceed default_max_tokens (e.g. Qwen3.6 max=81408 with
             // default=32768) — clients that want that full budget must pass
             // an explicit max_tokens. Otherwise we narrow silently to fit.
-            const int max_output_phase1_room = std::max(0,
+            const int max_output_phase1_room = (std::max)(0,
                 req.max_output - config_.hard_limit_reply_budget);
-            int eff = std::min(effort_phase1_cap, max_output_phase1_room);
+            int eff = (std::min)(effort_phase1_cap, max_output_phase1_room);
             if (effort_phase1_cap > max_output_phase1_room) {
                 // Info-level: this is normal when clients use a tier name but
                 // don't pass an explicit max_tokens. Not a warning.
@@ -1571,7 +1635,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         }
         // Reply budget:
         if (request_reply_budget >= 0) {
-            int eff = std::min(request_reply_budget, config_.hard_limit_reply_budget);
+            int eff = (std::min)(request_reply_budget, config_.hard_limit_reply_budget);
             if (request_reply_budget > config_.hard_limit_reply_budget) {
                 std::fprintf(stderr,
                     "[server] thinking.reply_budget=%d clamped to "
@@ -1673,8 +1737,8 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         req.model.c_str());
 
     // Set socket non-blocking for send() stall detection during streaming.
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    int flags = sock_get_flags(fd);
+    if (flags >= 0) sock_set_nonblock(fd);
 
     // Enqueue job and wait for worker.
     ServerJob job;
@@ -1707,7 +1771,7 @@ void HttpServer::worker_loop() {
         std::string prompt_excerpt;
         if (!req.prompt_tokens.empty()) {
             // Decode first ~40 tokens as a prompt excerpt (cheap, bounded).
-            const int excerpt_len = std::min((int)req.prompt_tokens.size(), 40);
+            const int excerpt_len = (std::min)((int)req.prompt_tokens.size(), 40);
             std::vector<int32_t> excerpt_toks(req.prompt_tokens.begin(),
                                                req.prompt_tokens.begin() + excerpt_len);
             prompt_excerpt = tokenizer_.decode(excerpt_toks);
@@ -2144,7 +2208,7 @@ void HttpServer::worker_loop() {
                                         }
                                     }
                                 }
-                                float survival = (float)query_kept / std::max(1, (int)query_ids.size());
+                                float survival = (float)query_kept / (std::max)(1, (int)query_ids.size());
                                 std::fprintf(stderr, "[pflash] query survival: %d/%d (%.0f%%)\n",
                                              query_kept, (int)query_ids.size(), survival * 100.0f);
                                 if (survival < 0.80f && (int)query_ids.size() < 1000) {
@@ -2271,7 +2335,7 @@ void HttpServer::worker_loop() {
             ? req.per_req_reply_budget
             : config_.hard_limit_reply_budget;
         const int n_gen_cap = budget_active
-            ? std::min(effective_think_ceiling + eff_reply_for_n_gen, req.max_output)
+            ? (std::min)(effective_think_ceiling + eff_reply_for_n_gen, req.max_output)
             : req.max_output;
 
         GenerateRequest gen_req;
@@ -2884,7 +2948,7 @@ void HttpServer::worker_loop() {
             // prefills the delta beyond the cached prefix, so dividing the full
             // prompt size by delta time would be wrong.
             const int prefill_tokens = using_restore
-                ? std::max(0, (int)effective_prompt.size() - prefix_len)
+                ? (std::max)(0, (int)effective_prompt.size() - prefix_len)
                 : (int)effective_prompt.size();
             perf.prefill_tok_s = (result.prefill_s > 0.0)
                 ? (double)prefill_tokens / result.prefill_s : 0.0;
@@ -3165,8 +3229,8 @@ void HttpServer::worker_loop() {
                 resp = {{"text", emitter.accumulated_text()}};
             }
             // Set socket back to blocking for the final send.
-            int flags = fcntl(fd, F_GETFL, 0);
-            if (flags >= 0) fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+            int flags = sock_get_flags(fd);
+            if (flags >= 0) sock_set_block(fd);
             send_response(fd, 200, "application/json", resp.dump() + "\n");
         }
 
@@ -3180,7 +3244,7 @@ void HttpServer::worker_loop() {
         const double elapsed_s =
             std::chrono::duration<double>(done_at - started_at).count();
         const int result_tokens = (int)result.tokens.size();
-        const int out_tokens = std::max(completion_tokens, result_tokens);
+        const int out_tokens = (std::max)(completion_tokens, result_tokens);
         const double tok_s = elapsed_s > 0.0 ? out_tokens / elapsed_s : 0.0;
         const double decode_tok_s =
             result.decode_s > 0.0 ? out_tokens / result.decode_s : 0.0;
@@ -3346,7 +3410,7 @@ bool HttpServer::send_all(int fd, const void * data, size_t len) {
             deadline - std::chrono::steady_clock::now()).count();
         if (remaining <= 0) return false;  // stall timeout
 
-        struct pollfd pfd = {fd, POLLOUT, 0};
+        struct pollfd pfd = {SOCK_FD(fd), POLLOUT, 0};
         int timeout = remaining > 50 ? 50 : (int)remaining;
         int ret;
         do {

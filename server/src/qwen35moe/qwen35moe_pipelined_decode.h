@@ -12,6 +12,7 @@
 #include "internal.h"
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_storage.h"
+#include "../common/moe_routing_collector.h"
 #include "../common/cold_ffn_compute.h"
 #include "graph_builders.h"
 
@@ -136,6 +137,9 @@ struct PipelinedDecodeState {
     int n_embd = 0;
     int n_expert_used = 0;
     int full_attention_interval = 0;
+
+    // Optional routing data collector (not owned, set from backend)
+    MoeRoutingCollector * routing_collector = nullptr;
 
     PipelinedDecodeState() = default;
     ~PipelinedDecodeState() { destroy(); }

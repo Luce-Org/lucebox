@@ -19,6 +19,7 @@
 #include "../common/moe_hybrid_storage.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_swap_manager.h"
+#include "../common/moe_routing_collector.h"
 #include "common/step_graph.h"
 
 #include "ggml-cuda.h"
@@ -32,10 +33,7 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
+#include "common/gguf_mmap.h"
 
 namespace dflash::common {
 
@@ -1426,6 +1424,15 @@ bool LagunaBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
                 }
             }
 
+            // Collect routing data for predictor training
+            if (routing_collector_) {
+                std::vector<float> gate_input((size_t)w_.n_embd);
+                ggml_backend_tensor_get(layer_sg.ffn_post, gate_input.data(), 0,
+                                         sizeof(float) * (size_t)w_.n_embd);
+                routing_collector_->record(il, gate_input.data(), w_.n_embd,
+                                           selected.data(), (int)selected.size());
+            }
+
             // Hybrid FFN: hot on GPU, cold on CPU, combine on GPU
             auto & storage = moe_hybrid_->layers[(size_t)il];
             { int _lc=0; for (int _k=0;_k<(int)selected.size();++_k){ int _g=selected[(size_t)_k];
@@ -1658,6 +1665,18 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
                 if (routing_stats_) {
                     for (int i = 0; i < chunk_len; ++i) {
                         routing_stats_->observe(il, chunk_selected.data() + (size_t)i * (size_t)n_expert_used, n_expert_used);
+                    }
+                }
+
+                // Collect routing data for predictor training (prefill path)
+                if (routing_collector_) {
+                    for (int i = 0; i < chunk_len; ++i) {
+                        routing_collector_->record(
+                            il,
+                            chunk_post.data() + (size_t)i * (size_t)w_.n_embd,
+                            w_.n_embd,
+                            chunk_selected.data() + (size_t)i * (size_t)n_expert_used,
+                            n_expert_used);
                     }
                 }
 
@@ -1904,14 +1923,23 @@ bool LagunaBackend::build_hybrid_storage_from_file(
     gguf_context * gctx = gguf_init_from_file(args_.target_path.c_str(), gip);
     if (!gctx) { err = "failed to re-open GGUF for expert loading"; return false; }
 
-    int fd = ::open(args_.target_path.c_str(), O_RDONLY);
-    if (fd < 0) { gguf_free(gctx); err = "open failed for mmap"; return false; }
-    struct stat st;
-    if (::fstat(fd, &st) < 0) { ::close(fd); gguf_free(gctx); err = "fstat failed"; return false; }
-    const size_t file_size = (size_t)st.st_size;
-    void * mmap_addr = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if (mmap_addr == MAP_FAILED) { gguf_free(gctx); err = "mmap failed"; return false; }
+    GgufMmap _mf;
+    std::string _mferr;
+    if (!_mf.open(args_.target_path, _mferr)) {
+        gguf_free(gctx);
+        err = "mmap failed: " + _mferr;
+        return false;
+    }
+    const size_t file_size = _mf.size();
+    // Transfer mmap ownership out of the RAII wrapper: the hybrid storage keeps
+    // the mapping alive and unmaps it in ~MoeHybridStorage. On POSIX the fd can
+    // be closed now (the mapping stays valid); on Windows release() already
+    // closed the mapping handle.
+    GgufMmap::OwnedRegion _region = _mf.release();
+    const void * mmap_addr = _region.data;
+#if !defined(_WIN32)
+    if (_region.fd >= 0) ::close(_region.fd);
+#endif
 
     const size_t data_start = gguf_get_data_offset(gctx);
     const auto * file_bytes = (const uint8_t *)mmap_addr;
@@ -1948,10 +1976,14 @@ bool LagunaBackend::build_hybrid_storage_from_file(
                                                             mmap_addr, file_size, *hybrid, &err, cache_slots);
     gguf_free(gctx);
     if (!ok) {
-        ::munmap(mmap_addr, file_size);
+#if defined(_WIN32)
+        UnmapViewOfFile(const_cast<void *>(mmap_addr));
+#else
+        ::munmap(const_cast<void *>(mmap_addr), file_size);
+#endif
         return false;
     }
-    // mmap ownership transferred to the storage (munmapped in ~MoeHybridStorage)
+    // mmap ownership transferred to the storage (unmapped in ~MoeHybridStorage)
     out_storage = std::move(hybrid);
     return true;
 }

@@ -372,6 +372,16 @@ bool pipelined_decode_one_token(
                                     sizeof(float) * (size_t)n_expert_used);
             const auto readback_t1 = PipelineClock::now();
 
+            // Record routing data for predictor training
+            bool ffn_post_on_host = false;
+            if (state.routing_collector) {
+                ggml_backend_tensor_get(cpg.ffn_post, state.ffn_post_host_buf.data(), 0,
+                                        sizeof(float) * (size_t)n_embd);
+                ffn_post_on_host = true;
+                state.routing_collector->record(il, state.ffn_post_host_buf.data(),
+                                                n_embd, global_ids, n_expert_used);
+            }
+
             // CPU-side local ID mapping + cold partition (trivial: 8 lookups)
             auto & storage = hybrid.layers[(size_t)il];
             int32_t local_ids[8];
@@ -410,8 +420,10 @@ bool pipelined_decode_one_token(
             const bool has_cold_selected = (n_cold > 0);
             const auto remap_t1 = PipelineClock::now();
 
-            // D2H ffn_post for cold compute (GPU already synced, data is ready)
-            if (has_cold_selected) {
+            // D2H ffn_post for cold compute (GPU already synced, data is ready).
+            // Skip if the routing collector already pulled the same synced tensor
+            // into this host buffer above — avoids a duplicate D2H in the hot loop.
+            if (has_cold_selected && !ffn_post_on_host) {
                 ggml_backend_tensor_get(cpg.ffn_post, state.ffn_post_host_buf.data(), 0,
                                         sizeof(float) * (size_t)n_embd);
             }
@@ -614,6 +626,16 @@ bool pipelined_decode_one_token(
         ggml_backend_synchronize(backend);
         if (tel) tel->routing_readback_us += pipe_elapsed_us(routing_t0, PipelineClock::now());
 
+        // Record routing data for predictor training (second decode path)
+        bool ffn_post_on_host = false;
+        if (state.routing_collector) {
+            ggml_backend_tensor_get(ffn_post_gpu, state.ffn_post_host_buf.data(), 0,
+                                    sizeof(float) * (size_t)n_embd);
+            ffn_post_on_host = true;
+            state.routing_collector->record(il, state.ffn_post_host_buf.data(),
+                                            n_embd, state.routing_ids_buf.data(), n_expert_used);
+        }
+
         // ── FFN: use routed FFN (cold-masking) if graph available, else split path ──
         const auto ffn_t0 = PipelineClock::now();
         auto & storage = hybrid.layers[(size_t)il];
@@ -657,8 +679,9 @@ bool pipelined_decode_one_token(
             }
             const bool has_cold_selected = (n_cold > 0);
 
-            // D2H ffn_post for cold compute (GPU already synced after routing readback)
-            if (has_cold_selected) {
+            // D2H ffn_post for cold compute (GPU already synced after routing readback).
+            // Skip if the routing collector already pulled the same tensor above.
+            if (has_cold_selected && !ffn_post_on_host) {
                 ggml_backend_tensor_get(ffn_post_gpu, state.ffn_post_host_buf.data(), 0,
                                         sizeof(float) * (size_t)n_embd);
             }
@@ -753,8 +776,9 @@ bool pipelined_decode_one_token(
         // ── Read ffn_post to CPU NOW (before hot launch) ──
         // The routing readback above already synced the GPU stream, so ffn_post
         // is guaranteed ready. Reading it here avoids a sync AFTER hot launch.
+        // Skip if the routing collector already pulled the same tensor above.
         const auto tensor_io_t0 = PipelineClock::now();
-        if (has_cold) {
+        if (has_cold && !ffn_post_on_host) {
             ggml_backend_tensor_get(ffn_post_gpu, state.ffn_post_host_buf.data(), 0,
                                     sizeof(float) * (size_t)n_embd);
         }

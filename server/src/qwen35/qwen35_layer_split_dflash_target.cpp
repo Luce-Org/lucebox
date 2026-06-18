@@ -5,6 +5,7 @@
 #include "internal.h"
 #include "graph_builders.h"
 #include "step_graph.h"
+#include "common/kvflash_pager.h"
 
 namespace dflash::common {
 
@@ -18,13 +19,15 @@ Qwen35LayerSplitDFlashTarget::Qwen35LayerSplitDFlashTarget(
         int kq_stride_pad,
         int fa_window,
         DFlashDraftIpcClient * remote_draft,
-        Qwen35TargetShardIpcClient * remote_target_shard)
+        Qwen35TargetShardIpcClient * remote_target_shard,
+        KvFlashPager * kvflash)
     : shards_(shards),
       feature_ring_(feature_ring),
       kq_stride_pad_(kq_stride_pad),
       fa_window_(fa_window),
       remote_draft_(remote_draft),
-      remote_target_shard_(remote_target_shard) {
+      remote_target_shard_(remote_target_shard),
+      kvflash_(kvflash) {
     if (!shards_.empty()) {
         const TargetWeights & w = shards_.front().weights;
         capture_ids_.assign(w.capture_layer_ids,
@@ -36,7 +39,8 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
         const std::vector<int32_t> & tokens,
         int base_pos,
         int & last_tok,
-        std::vector<int32_t> * all_argmax) {
+        std::vector<int32_t> * all_argmax,
+        bool capture_ssm_intermediates) {
     if (shards_.empty()) return false;
     if (remote_target_shard_ && remote_target_shard_->active()) {
         return run_qwen35_mixed_layer_split_forward(
@@ -48,7 +52,8 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
         shards_, shards_.front().weights, tokens, base_pos, (int)tokens.size(),
         last_tok, kq_stride_pad_, fa_window_,
         feature_ring_,
-        all_argmax, /*logits_out=*/nullptr, remote_draft_);
+        all_argmax, /*logits_out=*/nullptr, remote_draft_,
+        /*activation_type=*/GGML_TYPE_F32, kvflash_);
 }
 
 bool Qwen35LayerSplitDFlashTarget::snapshot_kv() {

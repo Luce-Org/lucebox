@@ -17,6 +17,7 @@
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_swap_manager.h"
 #include "../common/moe_hybrid_stream.h"
+#include "../common/moe_routing_collector.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -73,6 +74,9 @@ public:
 
     void shutdown() override;
 
+    bool set_routing_collector(MoeRoutingCollector * c) override { routing_collector_ = c; return true; }
+    const MoeHybridRoutingStats * get_routing_stats() const override { return routing_stats_.get(); }
+
 private:
     LagunaBackendArgs                           args_;
     ggml_backend_t                              backend_   = nullptr;
@@ -98,6 +102,7 @@ private:
     MoeHybridSwapPolicy                        swap_policy_;
     bool                                       hybrid_telemetry_ = false;
     MoeHybridStreamEngine                      stream_engine_;
+    MoeRoutingCollector *                       routing_collector_ = nullptr;
 
     bool ensure_slot(int slot);
 

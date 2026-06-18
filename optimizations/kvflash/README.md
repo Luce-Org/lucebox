@@ -127,10 +127,26 @@ path rounds differently — a different deterministic lineage), but
 correctness is identical: 36/36 vs 36/36 across HumanEval, GSM, MATH, and
 agent suites.
 
+## Target-QK residency policy (`--kvflash-policy qk`)
+
+A third, drafter-free policy: chunks are scored with the target model's own
+attention geometry — mean-pooled post-RoPE K per 64-token chunk per kv-head
+(pooled at chunk-seal time from the KV write path, L2-normalized) against
+the current decode query (per-layer post-RoPE Q captured from the decode
+graph), cosine, max over the GQA group's q-heads, mean over the 16
+full-attention layers. This is the Phase-0-validated scorer from
+`optimizations/msa-sm86/` (oracle-relative recall 87-92% @20% keep;
+2x the drafter scorer's recall on identical shards). Costs no drafter
+VRAM and rescores in ~0.2 s where the drafter pays 3-70 s.
+Env: `DFLASH_KVFLASH_POLICY=qk`. Bench: `test_kvflash --qkbench`.
+
 ## Files
 
 - `server/src/common/kvflash_pager.h` — pool, page table, host store, reselect
 - `server/src/common/kvflash_scorer.h` — chunk-relevance policy interface
+- `server/src/common/kvflash_qk.h` — target-QK scorer: pure scoring math
+  (unit-tested in `server/test/test_kvflash_qk.cpp`), seal-time key pooling,
+  `KvFlashTargetQkScorer`
 - `server/src/qwen3/qwen3_kvflash_scorer.{h,cpp}` — pflash-drafter scorer
   (tail attention; bisects on allocation pressure)
 - `server/src/qwen35/*` — cache `ctx_alloc`, masked pooled decode, slot-mapped

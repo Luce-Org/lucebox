@@ -10,6 +10,7 @@
 #include "../common/moe_hybrid_stream.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_swap_manager.h"
+#include "../common/moe_routing_collector.h"
 
 #include <memory>
 #include <string>
@@ -27,6 +28,9 @@ public:
                                              const GenerateRequest & req,
                                              const DaemonIO & io) override;
     bool supports_dflash_spec_decode() const override { return !target_weights().moe_hybrid; }
+
+    bool set_routing_collector(MoeRoutingCollector * c) override { routing_collector_ = c; return true; }
+    const MoeHybridRoutingStats * get_routing_stats() const override { return routing_stats_.get(); }
 
 protected:
     bool load_target_model(ggml_backend_t backend, TargetWeights & out) override;
@@ -49,6 +53,7 @@ private:
     MoeHybridSwapPolicy swap_policy_;
     bool hybrid_telemetry_ = false;
     MoeHybridStreamEngine stream_engine_;
+    MoeRoutingCollector * routing_collector_ = nullptr;
 
     void maybe_post_request_swap();
     bool load_dynamic_placement(const char * hotness_path,
