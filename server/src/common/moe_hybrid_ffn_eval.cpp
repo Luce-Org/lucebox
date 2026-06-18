@@ -114,13 +114,22 @@ static ggml_tensor * build_shared_expert_subgraph(
     return shared;
 }
 
-static bool fixed_slot_graphs_enabled() {
-    static const bool enabled = [] {
+static int fixed_slot_graphs_mode() {
+    static const int mode = [] {
         const char * env = std::getenv("DFLASH_MOE_FIXED_SLOT_GRAPHS");
-        return env && env[0] && std::strcmp(env, "0") != 0;
+        if (!env || !env[0] || std::strcmp(env, "0") == 0) return 0;
+        if (std::strcmp(env, "adaptive") == 0) return 2;
+        return 1;
     }();
-    return enabled;
+    return mode;
 }
+
+static int fixed_slot_max() {
+    static const int max_slots = [] {
+        const char * env = std::getenv("DFLASH_MOE_FIXED_SLOT_MAX");
+        return env ? std::max(0, std::atoi(env)) : 0;
+    }();
+    return max_slots;
 }
 
 // Run routed expert subset on a given backend (GPU or CPU).
@@ -844,10 +853,19 @@ bool eval_moe_hybrid_ffn_single(
     const bool has_shared = (desc.ffn_up_shexp && desc.ffn_gate_shexp && desc.ffn_down_shexp);
     const bool has_cold = !cold_ids.empty();
     const int n_cold = (int)cold_ids.size();
-    const bool fixed_slot_graphs = fixed_slot_graphs_enabled();
-    const int fixed_slots = std::max(1, cfg.n_expert_used);
-    const int n_hot_graph = (fixed_slot_graphs && has_hot) ? std::max(n_hot, fixed_slots) : n_hot;
-    const int n_cold_graph = (fixed_slot_graphs && has_cold) ? std::max(n_cold, fixed_slots) : n_cold;
+    const int fixed_slot_mode = fixed_slot_graphs_mode();
+    const int fixed_slot_max_val = fixed_slot_max();
+    const int fixed_slot_limit = std::max(1, std::min(
+        fixed_slot_max_val > 0 ? fixed_slot_max_val : cfg.n_expert_used, cfg.n_expert_used));
+    const int min_adaptive_slots = std::min(cfg.n_expert_used, 3);
+    const int n_hot_graph =
+        (fixed_slot_mode == 1 && has_hot) ? std::max(n_hot, fixed_slot_limit) :
+        (fixed_slot_mode == 2 && has_hot) ? std::max(n_hot, min_adaptive_slots) :
+        n_hot;
+    const int n_cold_graph =
+        (fixed_slot_mode == 1 && has_cold) ? std::max(n_cold, fixed_slot_limit) :
+        (fixed_slot_mode == 2 && has_cold) ? std::max(n_cold, min_adaptive_slots) :
+        n_cold;
     ggml_backend_t cold_backend = storage.cold_backend ? storage.cold_backend : cpu_backend;
     const bool cold_on_gpu = has_cold &&
                              storage.cold_backend_kind == MoeHybridColdBackend::Gpu &&

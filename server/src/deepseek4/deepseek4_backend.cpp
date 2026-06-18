@@ -43,6 +43,12 @@ static int env_int(const char * name, int fallback) {
     return std::atoi(value);
 }
 
+static double env_double(const char * name, double fallback) {
+    const char * value = std::getenv(name);
+    if (!value || !value[0]) return fallback;
+    return std::atof(value);
+}
+
 static const char * env_str(const char * name, const char * fallback) {
     const char * value = std::getenv(name);
     return (value && value[0]) ? value : fallback;
@@ -168,6 +174,18 @@ struct Ds4ExpertMemoryInfo {
     int total_cold = 0;
 };
 
+struct Ds4HybridBudgetInfo {
+    Ds4ExpertMemoryInfo mem;
+    size_t gpu_free = 0;
+    size_t gpu_total = 0;
+    uint64_t core_bytes = 0;
+    uint64_t kv_bytes = 0;
+    uint64_t warm_bytes = 256ULL * 1024 * 1024;
+    uint64_t safety_bytes = 512ULL * 1024 * 1024;
+    uint64_t expert_budget = 0;
+    int max_hot_per_layer = 0;
+};
+
 static bool compute_ds4_expert_memory_info(const DeepSeek4Weights & w,
                                            const MoeHybridPlacement * placement,
                                            Ds4ExpertMemoryInfo & out,
@@ -247,6 +265,108 @@ static uint64_t estimate_ds4_cache_bytes(const DeepSeek4Weights & w, int max_ctx
 
     total_bytes += (size_t) w.n_hc * (size_t) w.n_embd * sizeof(float);
     return total_bytes;
+}
+
+static void fill_prefix_hot_placement(const DeepSeek4Weights & w,
+                                      int hot_per_layer,
+                                      MoeHybridPlacement & out) {
+    out = {};
+    out.n_layer = w.n_layer;
+    out.n_expert = w.n_expert;
+    out.n_expert_used = w.n_expert_used;
+    out.hot_counts.assign((size_t) w.n_layer, hot_per_layer);
+    out.hot_expert_ids.resize((size_t) w.n_layer);
+    out.total_hot = hot_per_layer * w.n_layer;
+    for (int il = 0; il < w.n_layer; ++il) {
+        auto & ids = out.hot_expert_ids[(size_t) il];
+        ids.reserve((size_t) hot_per_layer);
+        for (int ie = 0; ie < hot_per_layer; ++ie) {
+            ids.push_back((int32_t) ie);
+        }
+    }
+}
+
+static bool compute_ds4_hybrid_budget_info(const DeepSeek4Weights & w,
+                                           int gpu,
+                                           int max_ctx,
+                                           Ds4HybridBudgetInfo & out,
+                                           std::string * err) {
+    out = {};
+    ggml_backend_cuda_get_device_memory(gpu, &out.gpu_free, &out.gpu_total);
+    if (out.gpu_total == 0) {
+        if (err) *err = "could not query GPU memory";
+        return false;
+    }
+
+    if (!compute_ds4_expert_memory_info(w, nullptr, out.mem, err)) {
+        return false;
+    }
+
+    out.core_bytes = out.gpu_total - out.gpu_free;
+    out.kv_bytes = estimate_ds4_cache_bytes(w, max_ctx);
+
+    if (out.gpu_total > out.core_bytes + out.kv_bytes + out.warm_bytes + out.safety_bytes) {
+        out.expert_budget = out.gpu_total - out.core_bytes - out.kv_bytes - out.warm_bytes - out.safety_bytes;
+    }
+    if (out.expert_budget > out.mem.total_expert_bytes) {
+        out.expert_budget = out.mem.total_expert_bytes;
+    }
+    if (const char * cap_env = std::getenv("DFLASH_EXPERT_BUDGET_MB")) {
+        const uint64_t cap_bytes = (uint64_t) std::max(0, std::atoi(cap_env)) * 1024ULL * 1024ULL;
+        if (cap_bytes > 0 && cap_bytes < out.expert_budget) {
+            out.expert_budget = cap_bytes;
+        }
+    }
+    if (out.expert_budget == 0) {
+        if (err) *err = "no VRAM budget available for DS4 experts";
+        return false;
+    }
+
+    out.max_hot_per_layer = std::min(w.n_expert, (int) (out.expert_budget / out.mem.bytes_per_uniform_round));
+    if (out.max_hot_per_layer <= 0) {
+        if (err) *err = "expert budget is smaller than one uniform expert round";
+        return false;
+    }
+    return true;
+}
+
+static bool compute_adaptive_hybrid_placement(const DeepSeek4Weights & w,
+                                              int gpu,
+                                              int max_ctx,
+                                              MoeHybridPlacement & out,
+                                              std::string * err) {
+    Ds4HybridBudgetInfo budget;
+    if (!compute_ds4_hybrid_budget_info(w, gpu, max_ctx, budget, err)) {
+        return false;
+    }
+
+    double target_ratio = env_double("DFLASH_DS4_ADAPTIVE_HOT_TARGET_RATIO", 0.5);
+    if (target_ratio < 0.0) target_ratio = 0.0;
+    if (target_ratio > 1.0) target_ratio = 1.0;
+
+    int requested_hot_per_layer = (int) (w.n_expert * target_ratio);
+    if (target_ratio > 0.0 && requested_hot_per_layer == 0) {
+        requested_hot_per_layer = 1;
+    }
+    const int hot_per_layer = std::min(budget.max_hot_per_layer,
+                                       std::min(w.n_expert, requested_hot_per_layer));
+    if (hot_per_layer <= 0) {
+        if (err) *err = "adaptive hot target ratio selects zero experts";
+        return false;
+    }
+
+    fill_prefix_hot_placement(w, hot_per_layer, out);
+
+    Ds4ExpertMemoryInfo placed_mem;
+    if (!compute_ds4_expert_memory_info(w, &out, placed_mem, err)) {
+        return false;
+    }
+
+    std::fprintf(stderr,
+                 "[deepseek4] adaptive placement: target_ratio=%.2f hot/layer=%d (budget allows up to %d)\n",
+                 target_ratio, hot_per_layer, budget.max_hot_per_layer);
+    log_ds4_expert_memory_info("placement", placed_mem, w.n_layer);
+    return true;
 }
 
 static MoeHybridConfig make_ds4_parent_worker_cfg(const DeepSeek4Weights & w) {
@@ -428,62 +548,17 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
                                                        int max_ctx,
                                                        MoeHybridPlacement & out,
                                                        std::string * err) const {
-    size_t gpu_free = 0;
-    size_t gpu_total = 0;
-    ggml_backend_cuda_get_device_memory(cfg_.device.gpu, &gpu_free, &gpu_total);
-    if (gpu_total == 0) {
-        if (err) *err = "could not query GPU memory";
+    if (env_flag_enabled("DFLASH_DS4_ADAPTIVE_HOT")) {
+        return compute_adaptive_hybrid_placement(w, cfg_.device.gpu, max_ctx, out, err);
+    }
+
+    Ds4HybridBudgetInfo budget;
+    if (!compute_ds4_hybrid_budget_info(w, cfg_.device.gpu, max_ctx, budget, err)) {
         return false;
     }
 
-    Ds4ExpertMemoryInfo mem;
-    if (!compute_ds4_expert_memory_info(w, nullptr, mem, err)) {
-        return false;
-    }
-
-    const uint64_t core_bytes = gpu_total - gpu_free;
-    const uint64_t kv_bytes = estimate_ds4_cache_bytes(w, max_ctx);
-    const uint64_t warm_bytes = 256ULL * 1024 * 1024;
-    const uint64_t safety_bytes = 512ULL * 1024 * 1024;
-
-    uint64_t expert_budget = 0;
-    if (gpu_total > core_bytes + kv_bytes + warm_bytes + safety_bytes) {
-        expert_budget = gpu_total - core_bytes - kv_bytes - warm_bytes - safety_bytes;
-    }
-    if (expert_budget > mem.total_expert_bytes) {
-        expert_budget = mem.total_expert_bytes;
-    }
-    if (const char * cap_env = std::getenv("DFLASH_EXPERT_BUDGET_MB")) {
-        const uint64_t cap_bytes = (uint64_t) std::max(0, std::atoi(cap_env)) * 1024ULL * 1024ULL;
-        if (cap_bytes > 0 && cap_bytes < expert_budget) {
-            expert_budget = cap_bytes;
-        }
-    }
-    if (expert_budget == 0) {
-        if (err) *err = "no VRAM budget available for DS4 experts";
-        return false;
-    }
-
-    const int hot_per_layer = std::min(w.n_expert, (int) (expert_budget / mem.bytes_per_uniform_round));
-    if (hot_per_layer <= 0) {
-        if (err) *err = "expert budget is smaller than one uniform expert round";
-        return false;
-    }
-
-    out = {};
-    out.n_layer = w.n_layer;
-    out.n_expert = w.n_expert;
-    out.n_expert_used = w.n_expert_used;
-    out.hot_counts.assign((size_t) w.n_layer, hot_per_layer);
-    out.hot_expert_ids.resize((size_t) w.n_layer);
-    out.total_hot = hot_per_layer * w.n_layer;
-    for (int il = 0; il < w.n_layer; ++il) {
-        auto & ids = out.hot_expert_ids[(size_t) il];
-        ids.reserve((size_t) hot_per_layer);
-        for (int ie = 0; ie < hot_per_layer; ++ie) {
-            ids.push_back((int32_t) ie);
-        }
-    }
+    const int hot_per_layer = budget.max_hot_per_layer;
+    fill_prefix_hot_placement(w, hot_per_layer, out);
 
     Ds4ExpertMemoryInfo placed_mem;
     if (!compute_ds4_expert_memory_info(w, &out, placed_mem, err)) {
@@ -492,13 +567,13 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
 
     std::fprintf(stderr,
                  "[deepseek4] hybrid placement: gpu_total=%.2f GiB gpu_free=%.2f GiB core=%.2f GiB kv=%.2f GiB warm=%.2f GiB safety=%.2f GiB expert_budget=%.2f GiB hot/layer=%d\n",
-                 gib((uint64_t) gpu_total),
-                 gib((uint64_t) gpu_free),
-                 gib(core_bytes),
-                 gib(kv_bytes),
-                 gib(warm_bytes),
-                 gib(safety_bytes),
-                 gib(expert_budget),
+                 gib((uint64_t) budget.gpu_total),
+                 gib((uint64_t) budget.gpu_free),
+                 gib(budget.core_bytes),
+                 gib(budget.kv_bytes),
+                 gib(budget.warm_bytes),
+                 gib(budget.safety_bytes),
+                 gib(budget.expert_budget),
                  hot_per_layer);
     log_ds4_expert_memory_info("placement", placed_mem, w.n_layer);
     return true;
@@ -517,6 +592,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
     std::string err;
     const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
     const bool split_hip_hot_cpu_cold = env_ds4_hip_hot_cpu_cold_split();
+    const bool adaptive_hot = env_flag_enabled("DFLASH_DS4_ADAPTIVE_HOT");
     if (const char * stats_out = std::getenv("DFLASH_DS4_ROUTE_STATS_OUT")) {
         if (stats_out[0]) {
             routing_stats_ = std::make_shared<MoeHybridRoutingStats>();
@@ -544,6 +620,11 @@ bool DeepSeek4Backend::init_hybrid_model() {
             return false;
         }
         expert_worker_owns_hot_ids_ = true;
+    } else if (adaptive_hot) {
+        if (!compute_adaptive_hybrid_placement(w_, cfg_.device.gpu, max_ctx, moe_placement_, &err)) {
+            std::fprintf(stderr, "[deepseek4] failed to compute adaptive hybrid placement: %s\n", err.c_str());
+            return false;
+        }
     } else if (!compute_uniform_hybrid_placement(w_, max_ctx, moe_placement_, &err)) {
         std::fprintf(stderr, "[deepseek4] failed to compute hybrid placement: %s\n", err.c_str());
         return false;
