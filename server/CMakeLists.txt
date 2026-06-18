@@ -964,9 +964,13 @@ if(DFLASH27B_TESTS)
 
     # 'make check' — builds test targets then runs ctest
     if(TARGET test_server_unit)
+        set(_check_deps test_server_unit)
+        if(TARGET test_deepseek4_unit)
+            list(APPEND _check_deps test_deepseek4_unit)
+        endif()
         add_custom_target(check
             COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-            DEPENDS test_server_unit
+            DEPENDS ${_check_deps}
             COMMENT "Building and running unit tests"
         )
     else()
