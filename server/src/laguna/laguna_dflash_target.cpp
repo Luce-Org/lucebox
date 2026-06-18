@@ -246,6 +246,18 @@ bool LagunaDFlashTarget::verify_tree(
 
     LagunaGraphOutputs go = build_laguna_graph(ctx, gf, w_, cache_, gi);
 
+    // Greedy tree-verify only needs the per-node argmax. Compute it on-GPU
+    // (like the chain path) and read back N_actual int32 indices instead of
+    // copying the full vocab*N_actual logits to host and arg-maxing on the CPU.
+    // The full-logits readback path is kept only when the caller wants logits
+    // (sampled tree-verify).
+    ggml_tensor * argmax_t = nullptr;
+    if (!logits_out) {
+        argmax_t = ggml_argmax(ctx, go.logits);
+        ggml_set_output(argmax_t);
+        ggml_build_forward_expand(gf, argmax_t);
+    }
+
     static ggml_gallocr_t galloc_tree = nullptr;
     if (!galloc_tree) {
         galloc_tree = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
@@ -319,17 +331,21 @@ bool LagunaDFlashTarget::verify_tree(
         return false;
     }
 
-    const int vocab = (int)w_.embedder.n_vocab;
-    std::vector<float> logits((size_t)vocab * (size_t)N_actual);
-    ggml_backend_tensor_get(go.logits, logits.data(), 0,
-                            sizeof(float) * logits.size());
-
     posterior_out.resize((size_t)N_actual);
-    for (int i = 0; i < N_actual; ++i) {
-        posterior_out[(size_t)i] =
-            laguna_argmax_row(logits.data() + (size_t)i * (size_t)vocab, vocab);
-    }
-    if (logits_out) {
+    if (argmax_t) {
+        // On-GPU argmax: read back only N_actual indices.
+        ggml_backend_tensor_get(argmax_t, posterior_out.data(), 0,
+                                sizeof(int32_t) * (size_t)N_actual);
+    } else {
+        // Caller wants the logits (sampled tree-verify): full readback + CPU argmax.
+        const int vocab = (int)w_.embedder.n_vocab;
+        std::vector<float> logits((size_t)vocab * (size_t)N_actual);
+        ggml_backend_tensor_get(go.logits, logits.data(), 0,
+                                sizeof(float) * logits.size());
+        for (int i = 0; i < N_actual; ++i) {
+            posterior_out[(size_t)i] =
+                laguna_argmax_row(logits.data() + (size_t)i * (size_t)vocab, vocab);
+        }
         *logits_out = std::move(logits);
     }
     cache_.cur_pos = committed + N_actual;
