@@ -93,6 +93,3 @@ dflash/docs/tuning-snapshots/
 # Workdir editor backup suffixes
 *.git-head
 *.pre-pflash-rename
-
-# Copilot session state (instructions file stays in .github/)
-.github/copilot-instructions.md

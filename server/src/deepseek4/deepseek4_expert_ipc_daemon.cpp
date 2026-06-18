@@ -317,9 +317,6 @@ static bool eval_worker_token(Ds4ExpertWorker & worker,
         return false;
     }
     if (timing) timing->worker_miss_build_us += worker_elapsed_us(miss_build_t0, WorkerClock::now());
-    std::fprintf(stderr,
-                 "[expert-ipc-daemon] file-backed miss layer=%d experts=%zu\n",
-                 layer, miss_ids.size());
     const auto miss_eval_t0 = WorkerClock::now();
     ffn_tel = {};
     if (!eval_worker_selected(worker.backend, worker.cfg, desc,
