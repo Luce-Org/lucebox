@@ -86,6 +86,15 @@ static inline const char* sock_strerror() { return strerror(errno); }
 
 namespace dflash::common {
 
+static std::string context_overflow_message(int max_ctx, int prompt_tokens, int max_output) {
+    const int requested_tokens = prompt_tokens + max_output;
+    return "This model's maximum context length is " + std::to_string(max_ctx) +
+           " tokens. However, you requested " + std::to_string(requested_tokens) +
+           " tokens (" + std::to_string(prompt_tokens) + " in the messages, " +
+           std::to_string(max_output) +
+           " in the completion). Please reduce the length of the messages or completion.";
+}
+
 // ─── piecewise keep-ratio curve ─────────────────────────────────────────
 
 static float pflash_keep_ratio(const ServerConfig & cfg, int n_tokens) {
@@ -1715,7 +1724,9 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
              n_prompt >= config_.pflash_threshold);
         if (should_reject_oversized(n_prompt, req.max_output,
                                     config_.max_ctx, pflash_will_run)) {
-            send_error(fd, 400, "prompt + max_tokens exceeds context window");
+            send_error(fd, 400,
+                       context_overflow_message(config_.max_ctx, n_prompt,
+                                                req.max_output));
             return true;
         }
     }
@@ -2243,7 +2254,11 @@ void HttpServer::worker_loop() {
         if (effective_prompt_overflows((int)effective_prompt.size(),
                                        pflash_full_cache_served_tokens,
                                        req.max_output, config_.max_ctx)) {
-            fail_request(400, "effective prompt + max_tokens exceeds context window after compression");
+            const int prompt_len = pflash_full_cache_served_tokens >= 0
+                ? pflash_full_cache_served_tokens
+                : (int)effective_prompt.size();
+            fail_request(400, context_overflow_message(config_.max_ctx, prompt_len,
+                                                       req.max_output));
             continue;
         }
 
