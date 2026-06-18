@@ -3073,6 +3073,37 @@ int main(int argc, char ** argv) {
         return ok;
     };
 
+    // ── top-k LM-head calibration (DFLASH_TOPK_CALIB=1) ──────────────────
+    // Premise test for the candidate-restricted LM head: at each chain verify
+    // position, record the rank of the target's full-vocab greedy argmax token
+    // within the draft's ranked candidate list for the SAME position (draft row
+    // i+1 predicts the token that target_tok[i] predicts). coverage@k = fraction
+    // of positions whose target greedy token falls in the draft's top-k. Chain
+    // path only (exact position alignment); run WITHOUT --ddtree.
+    static const bool g_topk_calib = [](){
+        const char * e = std::getenv("DFLASH_TOPK_CALIB");
+        return e != nullptr && std::strcmp(e, "0") != 0;
+    }();
+    std::vector<int64_t> calib_hist;          // greedy: rank (0 = top-1) -> count
+    int64_t calib_total = 0, calib_rank_sum = 0;
+    int calib_max_rank = 0;
+    // Sampling-coverage: histogram of the MAX draft-rank over the target's
+    // top-Ks set (and top-p=0.95 nucleus). coverage@M = fraction of positions
+    // whose entire target top-Ks / nucleus is within draft top-M. With the
+    // top_k -> softmax -> top_p chain order, draft-top-M ⊇ target-top-Ks makes
+    // top_k(+top_p) sampling exact under the restricted head.
+    std::vector<int64_t> samp_hist_k8, samp_hist_k20, samp_hist_p95;
+    // M grid for coverage curves (also the cap MCAP = last entry = max rank we
+    // resolve; tokens beyond MCAP count as "not covered" for every M).
+    static const std::vector<int> calib_Mgrid = {
+        1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
+    const int calib_MCAP = calib_Mgrid.back();
+    // top-p=0.95 nucleus MASS coverage: per-M sum of (covered nucleus prob mass)
+    // and count of positions where covered mass < 0.99 (the quality-relevant
+    // metric: missing a low-prob nucleus token barely distorts sampling).
+    std::vector<double>  massp95_sum(calib_Mgrid.size(), 0.0);
+    std::vector<int64_t> massp95_bad(calib_Mgrid.size(), 0);
+
     while (n_generated < n_gen) {
         const int need_commit_budget = n_gen - n_generated;
 
@@ -3242,6 +3273,15 @@ int main(int argc, char ** argv) {
         // the input there is the unmasked last_tok. Pin it back so verify and
         // replay see the correct prefix.
         draft_tok[0] = last_tok;
+
+        // Calibration: the chain fast path leaves draft_logits_buf unpopulated
+        // (it reads GPU argmax). Pull the draft's full per-position logits so we
+        // can rank the target's greedy token against them after verify. The
+        // bridge path already filled draft_logits_buf above.
+        if (g_topk_calib && !draft_hidden_bridge) {
+            ggml_backend_tensor_get(draft_sg.logits, draft_logits_buf.data(), 0,
+                                    sizeof(float) * (size_t)vocab * q_len);
+        }
 
         // DDTree top-K extraction. Positions 1..q_len-1 of the draft output
         // are the per-position distributions for the block-diffusion tree
@@ -3745,6 +3785,14 @@ int main(int argc, char ** argv) {
 
             ggml_backend_tensor_get(sg.argmax_tokens, target_tok.data(), 0,
                                     sizeof(int32_t) * q_len);
+            // Calibration: the batched path normally reads only the GPU argmax.
+            // Pull the full target logits so we can find the target's top-K_s /
+            // top-p nucleus for the sampling-coverage metric. (seq_verify path
+            // already fills verify_logits_buf per position.)
+            if (g_topk_calib) {
+                ggml_backend_tensor_get(sg.logits, verify_logits_buf.data(), 0,
+                                        sizeof(float) * (size_t)vocab * q_len);
+            }
         } else {
             // Sequential verify: q_len independent single-token decodes.
             // Each call writes K/V at slot committed+i and advances SSM by 1.
@@ -3784,6 +3832,101 @@ int main(int argc, char ** argv) {
         }
         auto T_verify_logits = sync_us();
         tt_verify_logits += std::chrono::duration<double, std::micro>(T_verify_logits - T_verify_compute).count();
+
+        // Calibration: for each chain verify position, rank the target's tokens
+        // within draft row (i+1)'s ranked logits (rank 0 == draft top-1).
+        //   - greedy   : rank of the target argmax  -> calib_hist
+        //   - sampling : MAX draft-rank over the target's top-Ks / top-p nucleus
+        //                -> samp_hist_*  (the M needed so draft-top-M covers it)
+        if (g_topk_calib) {
+            // Stamped top-MCAP ranking avoids an O(vocab log vocab) full sort per
+            // position: nth_element+sort only the top-MCAP, and a per-token stamp
+            // marks validity so we never O(vocab)-reset draft_rank. Tokens beyond
+            // MCAP are treated as rank == MCAP (uncovered for every M in the grid).
+            static std::vector<int>     draft_rank, d_idx, t_idx;
+            static std::vector<int64_t> draft_stamp;
+            static int64_t calib_stamp = 0;
+            if ((int)draft_rank.size() != vocab) {
+                draft_rank.assign(vocab, 0); draft_stamp.assign(vocab, 0);
+                d_idx.resize(vocab); t_idx.resize(vocab);
+            }
+            const int mcap = std::min(calib_MCAP, vocab);
+            auto bump = [](std::vector<int64_t> & h, int r) {
+                if ((int)h.size() <= r) h.resize(r + 1, 0);
+                h[r]++;
+            };
+            static std::vector<std::pair<int,double>> nucleus;  // (draft_rank, prob)
+            for (int i = 0; i < q_len - 1; i++) {
+                const float * drow = draft_logits_buf.data()  + (size_t)(i + 1) * vocab;
+                const float * trow = verify_logits_buf.data() + (size_t)i * vocab;
+
+                // ── draft top-MCAP ranks (stamped) ──
+                for (int v = 0; v < vocab; v++) d_idx[v] = v;
+                if (mcap < vocab)
+                    std::nth_element(d_idx.begin(), d_idx.begin() + mcap, d_idx.end(),
+                                     [&](int a, int b){ return drow[a] > drow[b]; });
+                std::sort(d_idx.begin(), d_idx.begin() + mcap,
+                          [&](int a, int b){ return drow[a] > drow[b]; });
+                ++calib_stamp;
+                for (int r = 0; r < mcap; r++) {
+                    draft_rank[d_idx[r]] = r; draft_stamp[d_idx[r]] = calib_stamp;
+                }
+                auto rank_of = [&](int tok)->int {
+                    return (draft_stamp[tok] == calib_stamp) ? draft_rank[tok] : calib_MCAP;
+                };
+
+                // ── greedy: rank of target argmax ──
+                const int grank = rank_of(target_tok[i]);
+                bump(calib_hist, grank);
+                calib_total++; calib_rank_sum += grank;
+                if (grank > calib_max_rank) calib_max_rank = grank;
+
+                // ── target softmax(temp=1) over full vocab + sorted top-MCAP ──
+                double maxz = trow[0];
+                for (int v = 1; v < vocab; v++) if (trow[v] > maxz) maxz = trow[v];
+                double Z = 0.0;
+                for (int v = 0; v < vocab; v++) Z += std::exp((double)trow[v] - maxz);
+                for (int v = 0; v < vocab; v++) t_idx[v] = v;
+                if (mcap < vocab)
+                    std::nth_element(t_idx.begin(), t_idx.begin() + mcap, t_idx.end(),
+                                     [&](int a, int b){ return trow[a] > trow[b]; });
+                std::sort(t_idx.begin(), t_idx.begin() + mcap,
+                          [&](int a, int b){ return trow[a] > trow[b]; });
+
+                // ── top-k set coverage (max draft-rank over target top-Ks) ──
+                int mr8 = 0, mr20 = 0;
+                for (int j = 0; j < 20 && j < mcap; j++) {
+                    const int dr = rank_of(t_idx[j]);
+                    if (j < 8 && dr > mr8) mr8 = dr;
+                    if (dr > mr20) mr20 = dr;
+                }
+                bump(samp_hist_k8,  mr8);
+                bump(samp_hist_k20, mr20);
+
+                // ── top-p=0.95 nucleus: set coverage + MASS coverage per M ──
+                nucleus.clear();
+                double cum = 0.0; int mrp = 0;
+                for (int j = 0; j < mcap; j++) {
+                    const int    tok  = t_idx[j];
+                    const double prob = std::exp((double)trow[tok] - maxz) / Z;
+                    const int    dr   = rank_of(tok);
+                    nucleus.emplace_back(dr, prob);
+                    if (dr > mrp) mrp = dr;
+                    cum += prob;
+                    if (cum >= 0.95) break;
+                }
+                bump(samp_hist_p95, mrp);
+                const double tot = cum > 0 ? cum : 1.0;
+                for (size_t mi = 0; mi < calib_Mgrid.size(); mi++) {
+                    const int M = calib_Mgrid[mi];
+                    double covered = 0.0;
+                    for (const auto & nt : nucleus) if (nt.first < M) covered += nt.second;
+                    const double frac = covered / tot;
+                    massp95_sum[mi] += frac;
+                    if (frac < 0.99) massp95_bad[mi]++;
+                }
+            }
+        }
 
         std::printf("[step %d] committed=%d last_tok=%d\n", n_draft_steps, committed, last_tok);
 
@@ -4025,6 +4168,38 @@ int main(int argc, char ** argv) {
         n_generated  += commit_n;
         n_accept_sum += accept_n;
         n_draft_steps++;
+    }
+
+    if (g_topk_calib && calib_total > 0) {
+        std::printf("\n[topk-calib] positions=%lld  mean_rank=%.3f  max_rank=%d  (vocab=%d)\n",
+                    (long long)calib_total,
+                    (double)calib_rank_sum / (double)calib_total,
+                    calib_max_rank, vocab);
+        // Set-coverage: fraction of positions whose ENTIRE set is within draft top-M.
+        auto cov = [&](const char * label, const std::vector<int64_t> & h) {
+            std::printf("[topk-calib] --- %s: set-coverage (entire set in draft top-M) ---\n", label);
+            for (int k : calib_Mgrid) {
+                int64_t c = 0;
+                for (int r = 0; r < k && r < (int)h.size(); r++) c += h[r];
+                std::printf("[topk-calib]   coverage@M=%-6d : %8.4f%%\n",
+                            k, 100.0 * (double)c / (double)calib_total);
+            }
+        };
+        cov("greedy (target argmax)",       calib_hist);
+        cov("sampling top_k=8",             samp_hist_k8);
+        cov("sampling top_k=20 (Qwen def)", samp_hist_k20);
+        cov("sampling top_p=0.95 nucleus",  samp_hist_p95);
+        // Mass-coverage: mean fraction of the top-p=0.95 nucleus PROBABILITY MASS
+        // captured by draft top-M (the quality-relevant metric for sampling — a
+        // missed low-prob nucleus token barely distorts the draw), plus the count
+        // of positions where <99% of the mass is covered.
+        std::printf("[topk-calib] --- top_p=0.95 nucleus: MASS coverage (mean over positions) ---\n");
+        for (size_t mi = 0; mi < calib_Mgrid.size(); mi++) {
+            std::printf("[topk-calib]   mass@M=%-6d : %8.4f%%   (positions <99%% covered: %lld/%lld)\n",
+                        calib_Mgrid[mi],
+                        100.0 * massp95_sum[mi] / (double)calib_total,
+                        (long long)massp95_bad[mi], (long long)calib_total);
+        }
     }
 
     auto t_gen1 = std::chrono::steady_clock::now();
