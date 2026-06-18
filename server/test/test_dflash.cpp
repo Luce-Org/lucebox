@@ -2074,7 +2074,8 @@ int main(int argc, char ** argv) {
                 ggml_backend_tensor_set(psg.positions, pf_pos.data(), 0,
                                         sizeof(int32_t) * pf_pos.size());
                 if (with_m) {
-                    build_causal_mask(pf_mask, kv_len_p, nt, start, g_kq_stride_pad);
+                    build_causal_mask(pf_mask, kv_len_p, nt, start, g_kq_stride_pad,
+                                      /*win_start=*/0, /*kv_pad_override=*/(int)psg.attn_mask->ne[0]);
                     ggml_backend_tensor_set(psg.attn_mask, pf_mask.data(), 0,
                                             sizeof(uint16_t) * pf_mask.size());
                 }
@@ -2730,7 +2731,8 @@ int main(int argc, char ** argv) {
 
                 if (is_attn && with_mask && lsg.attn_mask) {
                     std::vector<uint16_t> mask_buf;
-                    build_causal_mask(mask_buf, kv_len, n_tokens, /*kv_start=*/start, g_kq_stride_pad);
+                    build_causal_mask(mask_buf, kv_len, n_tokens, /*kv_start=*/start, g_kq_stride_pad,
+                                      /*win_start=*/0, /*kv_pad_override=*/(int)lsg.attn_mask->ne[0]);
                     ggml_backend_tensor_set(lsg.attn_mask, mask_buf.data(), 0,
                                             sizeof(uint16_t) * mask_buf.size());
                 }
@@ -2936,7 +2938,8 @@ int main(int argc, char ** argv) {
                                          ? (start - g_fa_window) : 0;
             const int pf_win_len = kv_len - pf_win_start;
             build_causal_mask(pf_mask_buf, pf_win_len, n_tokens,
-                              /*kv_start=*/start, g_kq_stride_pad, /*win_start=*/pf_win_start);
+                              /*kv_start=*/start, g_kq_stride_pad, /*win_start=*/pf_win_start,
+                              /*kv_pad_override=*/(int)sg.attn_mask->ne[0]);
             ggml_backend_tensor_set(sg.attn_mask, pf_mask_buf.data(), 0,
                                     sizeof(uint16_t) * pf_mask_buf.size());
         }
