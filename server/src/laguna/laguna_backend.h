@@ -41,6 +41,7 @@ struct LagunaBackendArgs {
     bool        ddtree_mode = false;
     int         ddtree_budget = 22;
     float       ddtree_temp = 1.0f;
+    int         verify_width = 0;   // chain verify width; 0 = adaptive (AUTO)
     DevicePlacement device;
     int         max_ctx   = 16384;
     int         chunk     = 2048;
@@ -103,6 +104,9 @@ private:
     DraftFeatureMirror                          feature_mirror_{};
     LagunaDFlashTarget *                        dflash_target_ = nullptr;
     bool                                        draft_parked_ = false;
+    // [TAG_LAGUNA_VERIFY_WIDTH] EWMA of the accepted block length, persisted
+    // across requests. Drives the AUTO chain verify width (seeded for width 3).
+    double                                      spec_ewma_accept_ = 1.5;
 
     // PFlash drafter (lazy-loaded on first compress command).
     DrafterContext                              drafter_ctx_{};

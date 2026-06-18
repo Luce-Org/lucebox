@@ -346,7 +346,30 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     if (last_tok < 0) return false;
 
     DFlashTarget * target = dflash_target_;
-    const int q_len = dw_.block_size;
+    const int block_size = dw_.block_size;
+    // [TAG_LAGUNA_VERIFY_WIDTH] Speculative verify width (chain). On this MoE
+    // target the batched verify forward's cost grows with the verify width: it
+    // reads the union of experts the batch routes to (bandwidth-bound), and above
+    // mmvq_mmid_max (8 for Q4_K/Q5_K on sm_86+) it also drops off the ggml
+    // CUDA-graph path (ggml-cuda.cu [TAG_MUL_MAT_ID_CUDA_GRAPHS]). The draft
+    // proposes block_size tokens but avg_commit is ~2.9, so verifying the whole
+    // block is wasteful. Measured (laguna-xs2 Q4_K_M, RTX 3090): width 8 -> 110
+    // tok/s, 4 -> 138, 3 -> 150 (== AR). We verify only the first q_len of the
+    // drafted block; the accept rule is unchanged, so this stays lossless. AUTO
+    // tracks an EWMA of the accepted length (held constant per request so the
+    // verify graph stays CUDA-graph-stable); --verify-width forces a fixed width.
+    int verify_width = args_.verify_width;
+    if (const char * e = std::getenv("DFLASH_LAGUNA_VERIFY_WIDTH")) {
+        const int w = std::atoi(e);
+        if (w > 0) verify_width = w;
+    }
+    const bool adaptive_width = (verify_width <= 0);
+    int chain_w = adaptive_width ? (int)spec_ewma_accept_ + 2 : verify_width;
+    if (chain_w < 2) chain_w = 2;
+    if (chain_w > std::min(block_size, 8)) chain_w = std::min(block_size, 8);
+    // DDTree sizes its batch via its budget; chain uses the width chosen above.
+    const int q_len = args_.ddtree_mode ? block_size : chain_w;
+
     const bool ignore_eos = (std::getenv("DFLASH_IGNORE_EOS") != nullptr);
     const bool sampled_verify = laguna_sampled_verify_enabled(sampler_, true);
     if (dflash_target_) {
@@ -355,13 +378,15 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
 
     StepGraph draft_sg;
 
-    std::vector<float>   noise_embed((size_t)hidden * (size_t)q_len);
-    std::vector<int32_t> noise_ids((size_t)q_len);
+    // The draft graph is always block_size-wide (build_draft_step uses
+    // dw_.block_size); chain reads/verifies only its first q_len outputs.
+    std::vector<float>   noise_embed((size_t)hidden * (size_t)block_size);
+    std::vector<int32_t> noise_ids((size_t)block_size);
     std::vector<int32_t> draft_tok((size_t)q_len);
     std::vector<int32_t> target_tok((size_t)q_len);
     std::vector<float>   verify_logits;
     std::vector<int32_t> verify_history;
-    std::vector<int32_t> pos_q((size_t)q_len);
+    std::vector<int32_t> pos_q((size_t)block_size);
     std::vector<int32_t> pos_k;
     std::vector<float>   local_hidden;
     std::vector<int32_t> sample_history =
@@ -489,8 +514,8 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         }
 
         noise_ids[0] = last_tok;
-        for (int i = 1; i < q_len; i++) noise_ids[(size_t)i] = target->mask_token_id();
-        if (!target->embed_tokens(noise_ids.data(), q_len, noise_embed.data())) {
+        for (int i = 1; i < block_size; i++) noise_ids[(size_t)i] = target->mask_token_id();
+        if (!target->embed_tokens(noise_ids.data(), block_size, noise_embed.data())) {
             std::fprintf(stderr, "[laguna-spec] noise embed failed\n");
             step_graph_destroy(draft_sg);
             return false;
@@ -523,9 +548,9 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
 
         ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
                                 sizeof(float) * noise_embed.size());
-        pos_k.resize((size_t)draft_ctx + (size_t)q_len);
-        for (int i = 0; i < q_len; i++) pos_q[(size_t)i] = draft_ctx + i;
-        for (int i = 0; i < draft_ctx + q_len; i++) pos_k[(size_t)i] = i;
+        pos_k.resize((size_t)draft_ctx + (size_t)block_size);
+        for (int i = 0; i < block_size; i++) pos_q[(size_t)i] = draft_ctx + i;
+        for (int i = 0; i < draft_ctx + block_size; i++) pos_k[(size_t)i] = i;
         ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
                                 sizeof(int32_t) * pos_q.size());
         ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
@@ -773,6 +798,14 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
 
     if (accept_rate_out) {
         *accept_rate_out = (float)(n_accept_sum / (double)total_draft_pos);
+    }
+
+    // [TAG_LAGUNA_VERIFY_WIDTH] Update the persisted accepted-length EWMA so the
+    // AUTO width converges to the throughput optimum for the active draft (chain
+    // only; DDTree sizes via its budget and accounts accepts differently).
+    if (adaptive_width && !args_.ddtree_mode && n_draft_steps > 0) {
+        const double mean_accept = (double)n_accept_sum / (double)n_draft_steps;
+        spec_ewma_accept_ = 0.7 * spec_ewma_accept_ + 0.3 * mean_accept;
     }
 
     if (dflash_target_) {
