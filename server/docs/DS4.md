@@ -190,7 +190,10 @@ The `eval_begin()`/`eval_end()` split enables async overlap without protocol cha
 | `DFLASH_DS4_EXPERT_WORKER_OFFSET` | Uniform placement first expert offset |
 | `DFLASH_DS4_TIMING=1` | Enable timing telemetry |
 | `DFLASH_DS4_ASYNC_WORKER=1` | Async worker overlap |
-| `DFLASH_MOE_FIXED_SLOT_GRAPHS=1` | Fixed-slot cached FFN graphs |
+| `DFLASH_DS4_ADAPTIVE_HOT=1` | Use adaptive hot count (target_ratio-based) |
+| `DFLASH_DS4_ADAPTIVE_HOT_TARGET_RATIO` | Fraction of experts to place hot (default 0.5) |
+| `DFLASH_MOE_FIXED_SLOT_GRAPHS=1\|adaptive` | Fixed-slot cached FFN graphs (adaptive=pad to max(n,3)) |
+| `DFLASH_MOE_FIXED_SLOT_MAX` | Cap fixed-slot padding (default=n_expert_used) |
 | `DFLASH_DS4_ROUTE_STATS_OUT` | Write routing stats CSV |
 | `DFLASH_DS4_PLACEMENT_IN` | Load placement JSON |
 | `DFLASH_DS4_PLACEMENT_OUT` | Export computed placement JSON |
