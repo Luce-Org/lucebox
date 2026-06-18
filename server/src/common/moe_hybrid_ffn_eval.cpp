@@ -725,11 +725,11 @@ bool build_cached_hot_batched_graph(
     build_batched_routed_graph(out.ctx,
         storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
         desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-        out.inp, out.sel, out.wts, n_embd, n_ff_exp, n_used, n_tokens, &routed);
+        out.inp, out.sel, out.wts, n_embd, n_ff_exp, n_used, n_tokens, cfg.swiglu_clamp, &routed);
 
     // Shared expert (always on GPU)
     ggml_tensor * combined = routed;
-    ggml_tensor * shared = build_shared_expert_subgraph(out.ctx, desc, out.inp, swiglu_clamp);
+    ggml_tensor * shared = build_shared_expert_subgraph(out.ctx, desc, out.inp, cfg.swiglu_clamp);
     if (shared) {
         combined = combined ? ggml_add(out.ctx, combined, shared) : shared;
     }
@@ -784,7 +784,7 @@ static bool build_cached_cold_batched_graph(
     build_batched_routed_graph(out.ctx,
         storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
         desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-        out.inp, out.sel, out.wts, n_embd, n_ff_exp, n_used, n_tokens, &routed);
+        out.inp, out.sel, out.wts, n_embd, n_ff_exp, n_used, n_tokens, cfg.swiglu_clamp, &routed);
     if (!routed) { out.free(); return false; }
     out.output = routed;
 
@@ -1848,7 +1848,7 @@ bool eval_moe_hot_only_batched(
     build_batched_routed_graph(ctx,
         storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
         desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-        inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens, &routed);
+        inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens, cfg.swiglu_clamp, &routed);
 
     // Shared expert (always on GPU)
     ggml_tensor * combined = routed;
