@@ -290,6 +290,9 @@ fi
 : "${DFLASH_PREFILL_KEEP:=0.05}"
 : "${DFLASH_PREFILL_THRESHOLD:=32000}"
 : "${DFLASH_PREFILL_DRAFTER:=}"
+# Optional server default for requests that omit max_tokens. When unset,
+# the C++ server uses the model-card default.
+: "${DFLASH_DEFAULT_MAX_TOKENS:=}"
 # Phase-1 (thinking) cap when a request opts into thinking. Default mirrors
 # antirez/ds4 ds4_eval.c: think_max_tokens = max_tokens(16000) - hard_limit
 # reply budget(512) = 15488. The server's own hardcoded default is 10000;
@@ -491,6 +494,7 @@ CMD=("$DFLASH_SERVER_BIN" "$DFLASH_TARGET"
 
 [ -n "$DRAFT_ARG" ]                && CMD+=(--draft "$DRAFT_ARG")
 [ -n "$DRAFT_ARG" ]                && CMD+=(--ddtree --ddtree-budget "$DFLASH_BUDGET")
+[ -n "$DFLASH_DEFAULT_MAX_TOKENS" ] && CMD+=(--default-max-tokens "$DFLASH_DEFAULT_MAX_TOKENS")
 # `--lazy-draft` is silently dropped by the C++ server unless both
 # `--prefill-drafter` and `--draft` are present (look for the runtime
 # warning `--lazy-draft ignored: requires both --prefill-drafter and
