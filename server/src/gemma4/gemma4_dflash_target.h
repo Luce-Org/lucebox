@@ -31,7 +31,8 @@ public:
                       int base_pos,
                       int & last_tok,
                       std::vector<int32_t> * all_argmax = nullptr,
-                      bool capture_ssm_intermediates = false) override;
+                      bool capture_ssm_intermediates = false,
+                      int pad_to = 0) override;
 
     // kvflash: route verify writes through the pool (slots allocated here,
     // slot-space mask inside gemma4_verify_batch). Non-owning.

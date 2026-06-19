@@ -37,7 +37,8 @@ public:
                       int base_pos,
                       int & last_tok,
                       std::vector<int32_t> * all_argmax = nullptr,
-                      bool capture_ssm_intermediates = false) override;
+                      bool capture_ssm_intermediates = false,
+                      int pad_to = 0) override;
 
     bool read_verify_logits(int n_tokens, std::vector<float> & out) override;
 

@@ -38,8 +38,10 @@ bool Gemma4DFlashTarget::verify_batch(
         int base_pos,
         int & last_tok,
         std::vector<int32_t> * all_argmax,
-        bool capture_ssm_intermediates) {
+        bool capture_ssm_intermediates,
+        int pad_to) {
     (void)capture_ssm_intermediates; // Gemma4 is pure-attention, no SSM state
+    (void)pad_to;                     // fixed-width verify not implemented here
     const int n_tokens = (int)tokens.size();
     if (n_tokens <= 0) return false;
 

@@ -43,7 +43,8 @@ public:
                       int base_pos,
                       int & last_tok,
                       std::vector<int32_t> * all_argmax = nullptr,
-                      bool capture_ssm_intermediates = false) override;
+                      bool capture_ssm_intermediates = false,
+                      int pad_to = 0) override;
 
     bool snapshot_kv() override;
     bool restore_kv() override;

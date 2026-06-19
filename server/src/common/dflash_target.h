@@ -30,11 +30,21 @@ struct DFlashTarget {
     // During forward, the target MUST capture intermediate activations at
     // the layers specified by capture_layer_ids() and store them in the
     // draft's feature ring (how this happens is implementation-defined).
+    //
+    // `pad_to`, when greater than tokens.size(), asks the implementation to
+    // build the forward graph at a fixed width of `pad_to` tokens (padding rows
+    // are masked out and never read) so the graph's node dimensions stay
+    // constant across decode steps and the CUDA-graph cache can replay instead
+    // of recapturing. The consumed result for the first tokens.size() positions
+    // is identical to an unpadded call. Implementations may ignore it (the
+    // default 0 preserves today's variable-width behavior); callers must only
+    // pad within a window whose KV slots are already resident.
     virtual bool verify_batch(const std::vector<int32_t> & tokens,
                               int base_pos,
                               int & last_tok,
                               std::vector<int32_t> * all_argmax = nullptr,
-                              bool capture_ssm_intermediates = false) = 0;
+                              bool capture_ssm_intermediates = false,
+                              int pad_to = 0) = 0;
 
     // Read the full [n_tokens x vocab] f32 logits produced by the most
     // recent verify_batch call. Used by sampled-verify (spec decode with

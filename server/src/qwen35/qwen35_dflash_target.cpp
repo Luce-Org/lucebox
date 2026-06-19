@@ -43,9 +43,21 @@ bool Qwen35DFlashTarget::verify_batch(
         int base_pos,
         int & last_tok,
         std::vector<int32_t> * all_argmax,
-        bool capture_ssm_intermediates) {
-    const int n_tokens = (int)tokens.size();
-    if (n_tokens <= 0) return false;
+        bool capture_ssm_intermediates,
+        int pad_to) {
+    const int n_real = (int)tokens.size();
+    if (n_real <= 0) return false;
+
+    // Fixed-width verify: pad the graph to `pad_to` tokens so its node
+    // dimensions stay constant across decode steps and the ggml-cuda CUDA-graph
+    // cache can replay instead of recapturing every step. Padding rows are never
+    // consumed: real rows (0..n_real-1) attend only to committed positions and
+    // their own causal slots, so causality/masking excludes every padded column
+    // and the argmax for rows 0..n_real-1 is bit-identical to an unpadded call.
+    // The caller must only pad within a window whose slots are already resident
+    // (e.g. the same round's main verify), so this allocates no new pool slots
+    // and triggers no eviction.
+    const int n_tokens = (pad_to > n_real) ? pad_to : n_real;
 
     const int hidden = w_.n_embd;
     const bool pool = pager_ != nullptr;
@@ -102,9 +114,10 @@ bool Qwen35DFlashTarget::verify_batch(
     }
 
     // Embed input tokens and fill positions.
-    std::vector<float> embed((size_t)n_tokens * hidden);
-    if (!w_.embedder.embed(tokens.data(), n_tokens, embed.data())) {
-        std::fprintf(stderr, "verify_batch: embed failed (n=%d)\n", n_tokens);
+    // Padding rows keep a zero embedding; they are masked out and never read.
+    std::vector<float> embed((size_t)n_tokens * hidden, 0.0f);
+    if (!w_.embedder.embed(tokens.data(), n_real, embed.data())) {
+        std::fprintf(stderr, "verify_batch: embed failed (n=%d)\n", n_real);
         return false;
     }
     ggml_backend_tensor_set(sg_.inp_embed, embed.data(), 0,
@@ -167,17 +180,17 @@ bool Qwen35DFlashTarget::verify_batch(
         return false;
     }
 
-    // Read argmax results from GPU.
-    std::vector<int32_t> argmax_buf(n_tokens);
+    // Read argmax results from GPU — only the real (unpadded) positions.
+    std::vector<int32_t> argmax_buf(n_real);
     ggml_backend_tensor_get(sg_.argmax_tokens, argmax_buf.data(), 0,
-                            sizeof(int32_t) * n_tokens);
-    last_tok = argmax_buf[n_tokens - 1];
+                            sizeof(int32_t) * n_real);
+    last_tok = argmax_buf[n_real - 1];
 
     if (all_argmax) {
         *all_argmax = std::move(argmax_buf);
     }
 
-    cache_.cur_pos = base_pos + n_tokens;
+    cache_.cur_pos = base_pos + n_real;
     return true;
 }
 

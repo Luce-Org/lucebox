@@ -40,7 +40,9 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
         int base_pos,
         int & last_tok,
         std::vector<int32_t> * all_argmax,
-        bool capture_ssm_intermediates) {
+        bool capture_ssm_intermediates,
+        int pad_to) {
+    (void)pad_to;  // fixed-width verify not implemented for the layer-split path
     if (shards_.empty()) return false;
     if (remote_target_shard_ && remote_target_shard_->active()) {
         return run_qwen35_mixed_layer_split_forward(

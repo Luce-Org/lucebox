@@ -1846,6 +1846,14 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     const int max_verify_tokens = cfg_.ddtree_mode
         ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
         : dw_.block_size;
+    // Opt-in: pad the post-accept replay verify to the same width as the main
+    // verify (q_len) so both share one ggml-cuda captured graph instead of
+    // forcing a recapture each low-acceptance step. Off by default — it only
+    // helps when the verify graph is CUDA-graph-eligible (q_len within the MoE
+    // mul_mat_id batch limit), and otherwise just adds padded compute.
+    static const bool g_fixed_verify_width =
+        (std::getenv("DFLASH_QWEN35_FIXED_VERIFY") != nullptr);
+    const int replay_pad_to = g_fixed_verify_width ? q_len : 0;
     if ((cfg_.fast_rollback || cfg_.ddtree_mode) && !cache_.rollback_ctx) {
         if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
                                    max_verify_tokens,
@@ -2415,7 +2423,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             for (int i = 0; i < commit_n; i++) {
                 replay_batch[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
             }
-            if (!target->verify_batch(replay_batch, committed, replay_last_tok, nullptr)) {
+            if (!target->verify_batch(replay_batch, committed, replay_last_tok, nullptr,
+                                      /*capture_ssm_intermediates=*/false, replay_pad_to)) {
                 std::fprintf(stderr, "spec-decode: replay failed\n");
                 step_graph_destroy(draft_sg);
                 return false;
