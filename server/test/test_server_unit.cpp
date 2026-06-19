@@ -18,6 +18,11 @@
 #include "server/http_server.h"
 #include "server/chat_template.h"
 #include "common/sampler.h"
+#ifdef DFLASH27B_HAVE_GPU_SAMPLER
+#include "common/sampler_cuda.h"
+#include <cuda_runtime.h>
+#include <chrono>
+#endif
 #include "common/backend_precision.h"
 #include "common/backend_ipc.h"
 #include "placement/pflash_placement.h"
@@ -3089,6 +3094,257 @@ static void test_sampler_needs_logit_processing() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// GPU sampler (sampler_cuda.cu) — compared against the CPU chain.
+// All tests self-skip when the build has no GPU sampler or no CUDA device.
+// ═══════════════════════════════════════════════════════════════════════
+#ifdef DFLASH27B_HAVE_GPU_SAMPLER
+
+static bool gpu_sampler_test_available() {
+    int n = 0;
+    if (cudaGetDeviceCount(&n) != cudaSuccess) { cudaGetLastError(); return false; }
+    return n > 0;
+}
+
+// Deterministic logits: a smooth but non-monotonic spread over the vocab so the
+// argmax is unambiguous and the softmax has spread-out mass.
+static std::vector<float> gpu_test_logits(int vocab, uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    std::uniform_real_distribution<float> u(-6.0f, 6.0f);
+    std::vector<float> v(vocab);
+    for (auto & x : v) x = u(rng);
+    return v;
+}
+
+// Analytic softmax over `logits` at temperature `temp`.
+static std::vector<double> cpu_softmax(const std::vector<float> & logits, float temp) {
+    const double inv_t = 1.0 / std::max(1e-3f, temp);
+    double mx = -1e300;
+    for (float l : logits) mx = std::max(mx, (double)l * inv_t);
+    std::vector<double> p(logits.size());
+    double z = 0.0;
+    for (size_t i = 0; i < logits.size(); i++) { p[i] = std::exp((double)logits[i] * inv_t - mx); z += p[i]; }
+    for (auto & x : p) x /= z;
+    return p;
+}
+
+// Analytic nucleus (top_p) distribution: keep highest-prob tokens until the
+// cumulative reaches top_p (inclusive of the crossing token), renormalize.
+static std::vector<double> cpu_nucleus(std::vector<double> p, float top_p) {
+    std::vector<int> idx(p.size());
+    for (size_t i = 0; i < p.size(); i++) idx[i] = (int)i;
+    std::sort(idx.begin(), idx.end(), [&](int a, int b){ return p[a] > p[b]; });
+    std::vector<double> q(p.size(), 0.0);
+    double cum = 0.0, keep = 0.0;
+    for (int i : idx) {
+        q[i] = p[i]; keep += p[i]; cum += p[i];
+        if (cum >= top_p) break;
+    }
+    for (auto & x : q) x /= keep;
+    return q;
+}
+
+// Greedy (temp=0): GPU must pick exactly the same token as the CPU chain, with
+// and without penalties active.
+static void test_gpu_sampler_greedy_matches_cpu() {
+    if (!gpu_sampler_test_available()) { std::fprintf(stderr, " (skip: no CUDA) "); return; }
+    const int vocab = 257;  // not a multiple of the block size on purpose
+    for (uint64_t seed = 1; seed <= 6; seed++) {
+        auto logits = gpu_test_logits(vocab, seed);
+        SamplerCfg cfg;  // temp=0 → greedy
+        std::vector<int32_t> history;
+        std::mt19937_64 rng(seed);
+        const int cpu_tok = sample_logits(logits.data(), vocab, cfg, history, rng);
+        const int gpu_tok = sample_logits_cuda(logits.data(), vocab, cfg, history,
+                                               0.0, /*on_device=*/false);
+        TEST_ASSERT_MSG(gpu_tok == cpu_tok, "greedy GPU token must equal CPU argmax");
+    }
+}
+
+static void test_gpu_sampler_greedy_penalties_match_cpu() {
+    if (!gpu_sampler_test_available()) { std::fprintf(stderr, " (skip: no CUDA) "); return; }
+    const int vocab = 200;
+    auto logits = gpu_test_logits(vocab, 99);
+    // A history that makes penalties bite on what would otherwise be the argmax.
+    std::vector<int32_t> history = {3, 3, 7, 12, 7, 50, 50, 50, 100};
+    struct { float rep, freq, pres; } cases[] = {
+        {1.5f, 0.0f, 0.0f},
+        {1.0f, 0.8f, 0.0f},
+        {1.0f, 0.0f, 1.2f},
+        {1.3f, 0.5f, 0.7f},
+    };
+    for (auto c : cases) {
+        SamplerCfg cfg;  // temp=0 → greedy after penalties
+        cfg.rep_pen = c.rep; cfg.freq_pen = c.freq; cfg.pres_pen = c.pres;
+        std::mt19937_64 rng(7);
+        const int cpu_tok = sample_logits(logits.data(), vocab, cfg, history, rng);
+        const int gpu_tok = sample_logits_cuda(logits.data(), vocab, cfg, history,
+                                               0.0, /*on_device=*/false);
+        TEST_ASSERT_MSG(gpu_tok == cpu_tok, "greedy+penalties GPU token must equal CPU");
+    }
+}
+
+// top_k>0 is intentionally CPU-only: the GPU entry must signal fallback (-1).
+static void test_gpu_sampler_top_k_falls_back() {
+    if (!gpu_sampler_test_available()) { std::fprintf(stderr, " (skip: no CUDA) "); return; }
+    const int vocab = 128;
+    auto logits = gpu_test_logits(vocab, 5);
+    SamplerCfg cfg; cfg.temp = 1.0f; cfg.top_k = 10;
+    std::vector<int32_t> history;
+    const int gpu_tok = sample_logits_cuda(logits.data(), vocab, cfg, history,
+                                           0.3, /*on_device=*/false);
+    TEST_ASSERT_MSG(gpu_tok == -1, "top_k>0 must return -1 (CPU fallback)");
+}
+
+// L1 distance between an empirical histogram of GPU draws and the analytic
+// distribution. Pulls the uniform from the same RNG family the CPU path uses.
+static double gpu_empirical_l1(const std::vector<float> & logits, const SamplerCfg & cfg,
+                               const std::vector<double> & analytic, int n_draws) {
+    std::mt19937_64 rng(1234);
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    std::vector<int> hist(logits.size(), 0);
+    std::vector<int32_t> history;
+    int valid = 0;
+    for (int i = 0; i < n_draws; i++) {
+        const int tok = sample_logits_cuda(logits.data(), (int)logits.size(), cfg,
+                                           history, u(rng), /*on_device=*/false);
+        if (tok >= 0 && tok < (int)logits.size()) { hist[tok]++; valid++; }
+    }
+    if (valid == 0) return 1e9;
+    double l1 = 0.0;
+    for (size_t k = 0; k < logits.size(); k++)
+        l1 += std::fabs((double)hist[k] / valid - analytic[k]);
+    return l1;
+}
+
+// Temperature sampling (no truncation): the GPU draw distribution must match the
+// analytic softmax — i.e. the same distribution the CPU multinomial samples.
+static void test_gpu_sampler_temperature_distribution() {
+    if (!gpu_sampler_test_available()) { std::fprintf(stderr, " (skip: no CUDA) "); return; }
+    const int vocab = 24;
+    auto logits = gpu_test_logits(vocab, 42);
+    SamplerCfg cfg; cfg.temp = 1.0f;  // full vocab
+    auto analytic = cpu_softmax(logits, cfg.temp);
+    const double l1 = gpu_empirical_l1(logits, cfg, analytic, 120000);
+    TEST_ASSERT_MSG(l1 < 0.03, "GPU temp-sample dist must match analytic softmax (L1<0.03)");
+}
+
+// Nucleus sampling: GPU draws must (a) never fall outside the analytic nucleus
+// and (b) match the renormalized nucleus distribution the CPU path produces.
+static void test_gpu_sampler_top_p_distribution() {
+    if (!gpu_sampler_test_available()) { std::fprintf(stderr, " (skip: no CUDA) "); return; }
+    const int vocab = 24;
+    auto logits = gpu_test_logits(vocab, 7);
+    SamplerCfg cfg; cfg.temp = 1.0f; cfg.top_p = 0.8f;
+    auto p = cpu_softmax(logits, cfg.temp);
+    auto nucleus = cpu_nucleus(p, cfg.top_p);
+
+    std::mt19937_64 rng(2024);
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    std::vector<int> hist(vocab, 0);
+    std::vector<int32_t> history;
+    const int n = 120000;
+    int valid = 0, out_of_nucleus = 0;
+    for (int i = 0; i < n; i++) {
+        const int tok = sample_logits_cuda(logits.data(), vocab, cfg, history, u(rng), false);
+        if (tok < 0 || tok >= vocab) continue;
+        valid++; hist[tok]++;
+        if (nucleus[tok] == 0.0) out_of_nucleus++;
+    }
+    TEST_ASSERT_MSG(valid > 0, "GPU nucleus sampling produced draws");
+    // Allow a tiny boundary leak from the continuous threshold bisection.
+    TEST_ASSERT_MSG(out_of_nucleus < n / 500, "GPU draws stay within the analytic nucleus");
+    double l1 = 0.0;
+    for (int k = 0; k < vocab; k++) l1 += std::fabs((double)hist[k] / valid - nucleus[k]);
+    TEST_ASSERT_MSG(l1 < 0.04, "GPU nucleus dist must match CPU analytic nucleus (L1<0.04)");
+}
+
+// Direct CPU-vs-GPU agreement on the same draws is not bit-exact (different
+// inverse-CDF orderings), but both must agree on the *argmax* of their empirical
+// histograms — the most-likely token — under temperature sampling.
+static void test_gpu_sampler_modal_token_matches_cpu() {
+    if (!gpu_sampler_test_available()) { std::fprintf(stderr, " (skip: no CUDA) "); return; }
+    const int vocab = 32;
+    auto logits = gpu_test_logits(vocab, 11);
+    SamplerCfg cfg; cfg.temp = 0.9f;
+    std::vector<int32_t> history;
+
+    auto modal = [&](bool gpu) {
+        std::mt19937_64 rng(555);
+        std::uniform_real_distribution<double> u(0.0, 1.0);
+        std::vector<int> hist(vocab, 0);
+        for (int i = 0; i < 60000; i++) {
+            const int tok = gpu
+                ? sample_logits_cuda(logits.data(), vocab, cfg, history, u(rng), false)
+                : sample_logits(logits.data(), vocab, cfg, history, rng);
+            if (tok >= 0 && tok < vocab) hist[tok]++;
+        }
+        return (int)(std::max_element(hist.begin(), hist.end()) - hist.begin());
+    };
+    TEST_ASSERT_MSG(modal(true) == modal(false), "GPU and CPU agree on the modal token");
+}
+
+// Per-call latency microbench (gated by env DFLASH_SAMPLER_BENCH=1). Isolates
+// the three regimes that explain the end-to-end numbers: the CPU chain, the GPU
+// path fed host logits (pays a full-vocab H2D every call), and the GPU path fed
+// a device pointer (the integrated path that skips the copy).
+static void gpu_sampler_microbench() {
+    if (!gpu_sampler_test_available()) { std::fprintf(stderr, "[microbench] no CUDA device\n"); return; }
+    const int vocab = 151936;          // Qwen3 vocab
+    const int iters = 1000;
+    auto logits = gpu_test_logits(vocab, 1);
+    std::vector<int32_t> history;
+
+    auto now = []{ return std::chrono::steady_clock::now(); };
+    auto us  = [](auto a, auto b){ return std::chrono::duration<double, std::micro>(b - a).count(); };
+
+    // Persistent device copy for the device-pointer regime (no per-call H2D).
+    float * d_logits = nullptr;
+    bool have_dev = cudaMalloc(&d_logits, (size_t)vocab * sizeof(float)) == cudaSuccess &&
+                    cudaMemcpy(d_logits, logits.data(), (size_t)vocab * sizeof(float),
+                               cudaMemcpyHostToDevice) == cudaSuccess;
+
+    volatile long sink = 0;
+    auto bench = [&](const char * label, const SamplerCfg & cfg) {
+        std::mt19937_64 rng(1);
+        std::uniform_real_distribution<double> u(0.0, 1.0);
+        for (int i = 0; i < 30; i++) sink += sample_logits(logits.data(), vocab, cfg, history, rng);
+        for (int i = 0; i < 30; i++) sink += sample_logits_cuda(logits.data(), vocab, cfg, history, u(rng), false);
+        auto t0 = now();
+        for (int i = 0; i < iters; i++) sink += sample_logits(logits.data(), vocab, cfg, history, rng);
+        auto t1 = now();
+        for (int i = 0; i < iters; i++) sink += sample_logits_cuda(logits.data(), vocab, cfg, history, u(rng), false);
+        auto t2 = now();
+        double dev_us = -1.0;
+        if (have_dev) {
+            for (int i = 0; i < 30; i++) sink += sample_logits_cuda(d_logits, vocab, cfg, history, u(rng), true);
+            auto t3 = now();
+            for (int i = 0; i < iters; i++) sink += sample_logits_cuda(d_logits, vocab, cfg, history, u(rng), true);
+            auto t4 = now();
+            dev_us = us(t3, t4) / iters;
+        }
+        const double cpu_us  = us(t0, t1) / iters;
+        const double gpuh_us = us(t1, t2) / iters;
+        std::fprintf(stderr,
+            "  %-22s CPU %8.2f us | GPU+H2D %8.2f us (%.2fx) | GPU devptr %8.2f us (%.2fx)\n",
+            label, cpu_us, gpuh_us, cpu_us / gpuh_us,
+            dev_us, dev_us > 0 ? cpu_us / dev_us : 0.0);
+    };
+
+    std::fprintf(stderr, "[microbench] vocab=%d iters=%d (per call; >1.0x = GPU faster)\n", vocab, iters);
+    { SamplerCfg c;                                   bench("greedy (temp=0)", c); }
+    { SamplerCfg c; c.temp = 0.8f;                    bench("temp=0.8 (full vocab)", c); }
+    { SamplerCfg c; c.temp = 0.8f; c.top_p = 0.95f;   bench("temp=0.8 top_p=0.95", c); }
+    { SamplerCfg c; c.temp = 0.8f; c.rep_pen = 1.2f;
+      std::vector<int32_t> h; for (int i = 0; i < 200; i++) h.push_back(i * 7 % vocab);
+      history = h; bench("temp=0.8 rep_pen=1.2", c); history.clear(); }
+
+    if (have_dev) cudaFree(d_logits);
+    (void)sink;
+}
+
+#endif  // DFLASH27B_HAVE_GPU_SAMPLER
+
+// ═══════════════════════════════════════════════════════════════════════
 // /props body shape tests (model-free)
 //
 // Verify build_props_body's new wholesale-sidecar `model_card` + new
@@ -3830,6 +4086,13 @@ int main() {
     std::fprintf(stderr, " Server Unit Tests\n");
     std::fprintf(stderr, "══════════════════════════════════════════\n");
 
+#ifdef DFLASH27B_HAVE_GPU_SAMPLER
+    if (const char * b = std::getenv("DFLASH_SAMPLER_BENCH"); b && b[0] == '1') {
+        gpu_sampler_microbench();
+        return 0;
+    }
+#endif
+
     std::fprintf(stderr, "\n── UTF-8 utilities ──\n");
     RUN_TEST(test_utf8_safe_len_ascii);
     RUN_TEST(test_utf8_safe_len_partial_2byte);
@@ -4026,6 +4289,15 @@ int main() {
     RUN_TEST(test_parse_sampler_token_no_samp);
     RUN_TEST(test_sampler_temp_zero_with_penalties_uses_argmax);
     RUN_TEST(test_sampler_needs_logit_processing);
+#ifdef DFLASH27B_HAVE_GPU_SAMPLER
+    std::fprintf(stderr, "\n── GPU sampler (CUDA) vs CPU ──\n");
+    RUN_TEST(test_gpu_sampler_greedy_matches_cpu);
+    RUN_TEST(test_gpu_sampler_greedy_penalties_match_cpu);
+    RUN_TEST(test_gpu_sampler_top_k_falls_back);
+    RUN_TEST(test_gpu_sampler_temperature_distribution);
+    RUN_TEST(test_gpu_sampler_top_p_distribution);
+    RUN_TEST(test_gpu_sampler_modal_token_matches_cpu);
+#endif
 
     std::fprintf(stderr, "\n── /props body shape ──\n");
     RUN_TEST(test_props_model_card_wholesale_sidecar);

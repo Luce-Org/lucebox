@@ -8,6 +8,10 @@
 #include "peer_access.h"
 #include "attn_masks.h"
 #include "common/sampler.h"
+#ifdef DFLASH27B_HAVE_GPU_SAMPLER
+#include "common/sampler_cuda.h"
+#include <random>
+#endif
 #include "common/io_utils.h"
 #include "common/restore_delta.h"
 #include "qwen3/qwen3_drafter.h"
@@ -1578,10 +1582,32 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         }();
         int32_t next_tok;
         if (sampler_.needs_logit_processing()) {
-            ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
-                                    sizeof(float) * vocab);
-            next_tok = sample_logits(logits_buf.data(), vocab, sampler_,
-                                      out_tokens, sampler_rng_);
+#ifdef DFLASH27B_HAVE_GPU_SAMPLER
+            // GPU sample straight from the device logits tensor, skipping the
+            // full ~vocab-wide D2H copy (the same payoff DFLASH_GPU_ARGMAX gets
+            // for greedy). Falls back to the CPU chain on -1.
+            int g_tok = -1;
+            if (gpu_sampler_enabled() && gpu_sampler_supports(sampler_) &&
+                sg_.logits && sg_.logits->data) {
+                double r = 0.0;
+                if (sampler_.temp > 0.0f) {
+                    std::uniform_real_distribution<double> u(0.0, 1.0);
+                    r = u(sampler_rng_);
+                }
+                g_tok = sample_logits_cuda(
+                    static_cast<const float *>(sg_.logits->data), vocab, sampler_,
+                    out_tokens, r, /*logits_on_device=*/true);
+            }
+            if (g_tok >= 0) {
+                next_tok = g_tok;
+            } else
+#endif
+            {
+                ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
+                                        sizeof(float) * vocab);
+                next_tok = sample_logits(logits_buf.data(), vocab, sampler_,
+                                          out_tokens, sampler_rng_);
+            }
         } else if (kGpuArgmaxAR && sg_.argmax_tokens) {
             int32_t tok_i = 0;
             ggml_backend_tensor_get(sg_.argmax_tokens, &tok_i, 0, sizeof(int32_t));

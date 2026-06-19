@@ -400,6 +400,16 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     # PUBLIC so consumers (e.g. the test_dflash executable) also see the macro
     # and take the GPU draft top-K path instead of the CPU fallback.
     target_compile_definitions(dflash_common PUBLIC DFLASH27B_HAVE_DRAFT_TOPK_CUDA=1)
+    # GPU port of the sample_logits chain. Compiled in by default; the path is
+    # then opted into at runtime via the DFLASH_GPU_SAMPLE env var. Turn the
+    # whole thing off at configure time with -DDFLASH_GPU_SAMPLER=OFF.
+    option(DFLASH_GPU_SAMPLER "Build the CUDA sample_logits path" ON)
+    if(DFLASH_GPU_SAMPLER)
+        target_sources(dflash_common PRIVATE src/common/sampler_cuda.cu)
+        # PUBLIC so the backends and test executables that call sample_logits()
+        # also compile their GPU dispatch branch.
+        target_compile_definitions(dflash_common PUBLIC DFLASH27B_HAVE_GPU_SAMPLER=1)
+    endif()
     # Multi-arch: scan all resolved arches and compile every applicable
     # flashprefill kernel variant.  This lets a single binary run on mixed
     # GPUs (e.g. Volta sm_70 + Pascal sm_61) without "no kernel image" errors.

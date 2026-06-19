@@ -9,6 +9,10 @@
 #include <unordered_set>
 #include <utility>
 
+#ifdef DFLASH27B_HAVE_GPU_SAMPLER
+#include "sampler_cuda.h"
+#endif
+
 namespace dflash::common {
 
 int sample_logits(const float * logits_in,
@@ -16,6 +20,21 @@ int sample_logits(const float * logits_in,
                   const SamplerCfg & cfg,
                   const std::vector<int32_t> & history,
                   std::mt19937_64 & rng) {
+#ifdef DFLASH27B_HAVE_GPU_SAMPLER
+    // GPU path (opt-in via DFLASH_GPU_SAMPLE). top_k>0 and any CUDA error return
+    // -1 and fall through to the CPU chain below. The single uniform draw is made
+    // here on the host so the RNG stream advances identically to the CPU path.
+    if (gpu_sampler_enabled() && gpu_sampler_supports(cfg)) {
+        double r = 0.0;
+        if (cfg.temp > 0.0f) {
+            std::uniform_real_distribution<double> u(0.0, 1.0);
+            r = u(rng);
+        }
+        const int g = sample_logits_cuda(logits_in, vocab, cfg, history, r,
+                                         /*logits_on_device=*/false);
+        if (g >= 0) return g;
+    }
+#endif
     std::vector<std::pair<float, int>> cand(vocab);
     for (int i = 0; i < vocab; i++) cand[i] = {logits_in[i], i};
 

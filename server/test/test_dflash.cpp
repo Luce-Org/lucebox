@@ -901,6 +901,15 @@ int main(int argc, char ** argv) {
         else if (std::strncmp(argv[i], "--max-ctx=", 10) == 0) {
             g_max_ctx_override = std::atoi(argv[i] + 10);
         }
+        // Sampler params for the positional (non-daemon) path, so benchmarks can
+        // exercise the sample_logits chain (and its GPU port). Same field order
+        // as the daemon ` samp=` tail: temp,top_p,top_k,rep_pen,seed[,freq,pres].
+        else if (std::strncmp(argv[i], "--samp=", 7) == 0) {
+            std::string fake = std::string(" samp=") + (argv[i] + 7);
+            if (parse_sampler_token(fake, g_sampler) && g_sampler.seed != 0) {
+                g_sampler_rng.seed(g_sampler.seed);
+            }
+        }
         // KV cache type flags (mirror llama-cli -ctk / -ctv).
         // Set the env var before resolve_kv_types() reads it inside create_target_cache.
         else if (std::strcmp(argv[i], "--cache-type-k") == 0 || std::strcmp(argv[i], "-ctk") == 0) {
