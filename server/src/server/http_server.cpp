@@ -856,6 +856,7 @@ HttpServer::HttpServer(ModelBackend & backend,
     #ifdef DFLASH_HAS_CURL
     curl_global_init(CURL_GLOBAL_DEFAULT);
     #endif
+    prefix_cache_.init_full_cache(config.prefill_cache_cap);
     // Fold model+config identity into the layout fingerprint BEFORE init()
     // so compute_layout_id sees it on every learn/verify call. Prevents stale
     // KV hits when the server restarts over the same --kv-cache-dir with a
@@ -1860,6 +1861,8 @@ void HttpServer::worker_loop() {
         bool pflash_compressed = false;
         // Compressed token count served from pFlash full-cache (-1 = not a full-cache hit).
         int pflash_full_cache_served_tokens = -1;
+        int full_cache_hit_slot = -1;
+        int full_cache_hit_len = 0;
 
         if (config_.pflash_mode != ServerConfig::PflashMode::OFF &&
             drafter_tokenizer_ != nullptr)
@@ -2106,8 +2109,12 @@ void HttpServer::worker_loop() {
                 if (full_slot >= 0) {
                     std::fprintf(stderr, "[pflash] full-cache hit slot=%d — skipping compress\n", full_slot);
                     pflash_compressed = true;
-                    // effective_prompt stays as req.prompt_tokens — the cached KV
-                    // state will be restored via cache_slot below.
+                    full_cache_hit_slot = full_slot;
+                    full_cache_hit_len = full_len;
+                    // Restore-only path: the prompt bytes are irrelevant as
+                    // long as restore_and_generate sees prompt_len == snap_pos
+                    // and therefore does not prefill a suffix.
+                    effective_prompt.assign((size_t)full_len, 0);
                     // Record the compressed size for the post-compress budget gate.
                     pflash_full_cache_served_tokens = full_len;
                 } else {
@@ -2402,20 +2409,30 @@ void HttpServer::worker_loop() {
             gen_req.stall_skip_tokens = &stall_skip_tokens_storage;
         }
 
-        // Prefix cache: check for cached KV state.
-        auto [cache_slot, prefix_len] = prefix_cache_.lookup(effective_prompt);
+        // Full-prompt cache: exact raw-prompt hit skips most/all prefill.
+        int cache_slot = full_cache_hit_slot;
+        int prefix_len = full_cache_hit_len;
         bool using_restore = (cache_slot >= 0);
-
-        // Full-compress cache: if we compressed, check for cached KV.
-        if (pflash_compressed) {
+        if (!using_restore) {
             auto [full_slot, full_len] = prefix_cache_.lookup_full(req.prompt_tokens);
             if (full_slot >= 0) {
-                // Exact-match hit on the raw (uncompressed) prompt — skip compression.
                 cache_slot = full_slot;
                 prefix_len = full_len;
                 using_restore = true;
-                std::fprintf(stderr, "[pflash] full-cache hit slot=%d\n", full_slot);
+                if (pflash_compressed) {
+                    effective_prompt.assign((size_t)full_len, 0);
+                    gen_req.prompt = effective_prompt;
+                }
             }
+        }
+
+        // Inline prefix cache: check for cached turn-boundary KV state if no
+        // exact full-prompt cache was available.
+        if (!using_restore) {
+            auto [inline_slot, inline_len] = prefix_cache_.lookup(effective_prompt);
+            cache_slot = inline_slot;
+            prefix_len = inline_len;
+            using_restore = (cache_slot >= 0);
         }
 
         // Disk prefix cache: try disk if memory missed.
@@ -2621,8 +2638,30 @@ void HttpServer::worker_loop() {
             }
         }
 
-        // Prepare inline snapshot for future cache hits.
-        auto [snap_slot, snap_cut] = prefix_cache_.prepare_inline_snap(effective_prompt);
+        // Prepare a full-prompt snapshot for exact prefill-cache hits.
+        int full_snap_slot = -1;
+        int full_snap_pos = 0;
+        bool full_snap_prepared = false;
+        if (!using_restore) {
+            full_snap_slot = prefix_cache_.prepare_full_snap(req.prompt_tokens);
+            if (full_snap_slot >= 0) {
+                full_snap_pos = (int)effective_prompt.size();
+                gen_req.snap_slot = full_snap_slot;
+                gen_req.snap_pos = full_snap_pos;
+                full_snap_prepared = true;
+            }
+        }
+
+        // Prepare inline snapshot for future cache hits. GenerateRequest only
+        // carries one snapshot target, so exact full-prompt cache takes
+        // priority when enabled.
+        int snap_slot = -1;
+        int snap_cut = 0;
+        if (!full_snap_prepared) {
+            auto prepared = prefix_cache_.prepare_inline_snap(effective_prompt);
+            snap_slot = prepared.first;
+            snap_cut = prepared.second;
+        }
         bool snap_prepared = (snap_slot >= 0);
         if (snap_prepared) {
             gen_req.snap_slot = snap_slot;
@@ -2632,7 +2671,7 @@ void HttpServer::worker_loop() {
         std::fprintf(stderr,
             "[server] chat CACHE %s restore=%s slot=%d prefix_len=%d "
             "effective_prompt=%zu pflash=%s disk_policy=%s disk_hit=%s "
-            "snap_slot=%d snap_pos=%d\n",
+            "snap_slot=%d snap_pos=%d full_snap_slot=%d full_snap_pos=%d\n",
             req.response_id.c_str(),
             using_restore ? "true" : "false",
             cache_slot,
@@ -2642,7 +2681,9 @@ void HttpServer::worker_loop() {
             disk_prefix_cache_policy_name(disk_policy).c_str(),
             disk_hit ? "true" : "false",
             snap_slot,
-            snap_cut);
+            snap_cut,
+            full_snap_slot,
+            full_snap_pos);
 
         // Update status page with cache/pflash/spec-decode flags.
         status_.set_flags(using_restore, pflash_compressed, !config_.draft_path.empty());
@@ -2807,6 +2848,22 @@ void HttpServer::worker_loop() {
         }
 
 
+        // Confirm or abort the full-prompt snapshot.
+        if (full_snap_prepared) {
+            if (completion_tokens > 0 && visible_output_seen && !client_disconnected &&
+                backend_.snapshot_used(full_snap_slot)) {
+                int saved_pos = backend_.snapshot_cur_pos(full_snap_slot);
+                if (saved_pos > 0) {
+                    prefix_cache_.confirm_full_snap(full_snap_slot, req.prompt_tokens,
+                                                    saved_pos);
+                } else {
+                    prefix_cache_.abort_full_snap(full_snap_slot);
+                }
+            } else {
+                prefix_cache_.abort_full_snap(full_snap_slot);
+            }
+        }
+
         // Confirm or abort the inline snapshot.
         if (snap_prepared) {
             if (completion_tokens > 0 && visible_output_seen && !client_disconnected &&
@@ -2862,16 +2919,6 @@ void HttpServer::worker_loop() {
             static constexpr size_t kMaxRecentDiskPrompts = 256;
             if (recent_disk_prompts_.size() > kMaxRecentDiskPrompts) {
                 recent_disk_prompts_.resize(kMaxRecentDiskPrompts);
-            }
-        }
-
-        // Full-compress cache: reserve + confirm after successful generation.
-        if (pflash_compressed && completion_tokens > 0 &&
-            visible_output_seen && !client_disconnected) {
-            int full_slot = prefix_cache_.prepare_full_snap(req.prompt_tokens);
-            if (full_slot >= 0) {
-                prefix_cache_.confirm_full_snap(full_slot, req.prompt_tokens,
-                                                (int)effective_prompt.size());
             }
         }
 

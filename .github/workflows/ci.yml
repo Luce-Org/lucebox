@@ -201,11 +201,14 @@ jobs:
     #
     # SECURITY: same model as gpu-tests - fork PRs run only after a maintainer
     # approves the workflow run (approval_policy=all_external_contributors).
-    # Gate only on the 1-minute workspace check, NOT the ~18-minute hosted
-    # CPU build: the GPU job compiles the same tree itself in ~2 minutes on
-    # real hardware, so serializing it behind the cloud build only delayed
-    # the strongest signal this CI produces.
-    needs: [uv-workspace]
+    # Gate only on the 1-minute workspace check and the NVIDIA GPU job, NOT the
+    # ~18-minute hosted CPU build: the GPU job compiles the same tree itself in
+    # ~2 minutes on real hardware. The NVIDIA dependency keeps the two
+    # self-hosted GPU jobs from entering the same concurrency group
+    # simultaneously; GitHub cancels older pending jobs in a group even when
+    # cancel-in-progress is false.
+    needs: [uv-workspace, gpu-tests]
+    if: ${{ always() && needs['uv-workspace'].result == 'success' }}
     runs-on: [self-hosted, rocm, gfx1151]
     timeout-minutes: 20
     # Serialize across PRs per GPU. NOT the same group as the CUDA job:

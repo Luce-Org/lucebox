@@ -915,6 +915,27 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         }
         result.prefill_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_prefill_start).count();
+    } else {
+        // Exact full-prompt cache hit (prompt_len == snap_pos): no prefill ran,
+        // so the per-request decode step-graph sg_ was never (re)built. The
+        // first decode step (do_ar_decode / do_spec_decode) writes sg_.inp_embed
+        // BEFORE its own build_target_step, so a null/freed graph tensor aborts
+        // in ggml_backend_tensor_set. Build a single-token decode step graph at
+        // the restored position now, mirroring do_ar_decode's per-step build.
+        const bool pool = kvflash_active();
+        if (!build_target_step(sg_, w_, cache_, target_backend_,
+                               /*kv_start=*/cache_.cur_pos, /*n_tokens=*/1,
+                               /*with_mask=*/pool, /*capture=*/false,
+                               /*capture_delta_intermediate=*/false,
+                               /*fa_window=*/0,
+                               /*last_token_logits_only=*/false,
+                               cfg_.kq_stride_pad,
+                               should_capture_moe_router(),
+                               /*kvflash_mask=*/pool,
+                               /*capture_qk=*/pool && kvflash_qk_policy_)) {
+            result.error = "restore step-graph build";
+            return result;
+        }
     }
 
     // Decode

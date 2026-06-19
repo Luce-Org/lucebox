@@ -57,6 +57,7 @@ struct ServerConfig {
     bool        enable_cors = true;
     std::string model_name  = "dflash";
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
+    int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
 
     // Thinking-budget v2. Applied when a request opts in via
     // `thinking: {type: "enabled"}` or `reasoning: {effort: ...}`.
