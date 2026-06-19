@@ -144,7 +144,11 @@ public:
         has_pending_page_in_ = false;
 
 #ifdef KVFLASH_HAS_ASYNC_DMA
-        cudaStreamCreate(&page_stream_);
+        if (cudaStreamCreate(&page_stream_) != cudaSuccess) {
+            std::fprintf(stderr, "[kvflash] cudaStreamCreate failed; paging "
+                         "falls back to the (blocking) default stream\n");
+            page_stream_ = nullptr;
+        }
 #endif
         return true;
     }
@@ -220,12 +224,7 @@ public:
                 return false;
             }
         }
-#ifdef KVFLASH_HAS_ASYNC_DMA
-        if (has_pending_page_in_ && page_stream_) {
-            cudaStreamSynchronize(page_stream_);
-            has_pending_page_in_ = false;
-        }
-#endif
+        if (has_pending_page_in_) synchronize_paging();
         return true;
     }
 
@@ -296,6 +295,17 @@ public:
     bool page_in(int c) {
         if (c >= (int)chunks_.size() || !chunks_[c].on_host || chunks_[c].block >= 0) return false;
         return slot_for((int64_t)c * cfg_.chunk_tokens) >= 0;
+    }
+
+    // Block until queued page DMA on page_stream_ completes. Hot paths
+    // (alloc_span/reselect) batch this internally after their recalls; callers
+    // that issue page_in()/page_out() directly and then read device KV (tests,
+    // tools) must call this first. No-op when async DMA is compiled out.
+    void synchronize_paging() {
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        cudaStreamSynchronize(page_stream_);  // page_stream_==nullptr syncs the default stream
+#endif
+        has_pending_page_in_ = false;
     }
 
     bool is_resident(int c) const {
@@ -390,12 +400,7 @@ public:
                 if (page_in(c)) events++;
             }
         }
-#ifdef KVFLASH_HAS_ASYNC_DMA
-        if (has_pending_page_in_ && page_stream_) {
-            cudaStreamSynchronize(page_stream_);
-            has_pending_page_in_ = false;
-        }
-#endif
+        if (has_pending_page_in_) synchronize_paging();
         return events;
     }
 
@@ -517,20 +522,22 @@ private:
     // caller's responsibility (reset() or destructor via caller).
     void cleanup_() {
 #ifdef KVFLASH_HAS_ASYNC_DMA
+        cudaStreamSynchronize(page_stream_);  // real stream, or default stream if create failed
         if (page_stream_) {
-            cudaStreamSynchronize(page_stream_);
-            for (auto & st : chunks_) {
-                if (st.host_data) {
-                    cudaError_t err = cudaFreeHost(st.host_data);
-                    if (err != cudaSuccess) {
-                        std::fprintf(stderr, "[kvflash] cudaFreeHost failed: %s\n",
-                                     cudaGetErrorString(err));
-                    }
-                    st.host_data = nullptr;
-                }
-            }
             cudaStreamDestroy(page_stream_);
             page_stream_ = nullptr;
+        }
+        // Free pinned host buffers unconditionally: page_out() may have
+        // allocated them even when stream creation failed (default-stream path).
+        for (auto & st : chunks_) {
+            if (st.host_data) {
+                cudaError_t err = cudaFreeHost(st.host_data);
+                if (err != cudaSuccess) {
+                    std::fprintf(stderr, "[kvflash] cudaFreeHost failed: %s\n",
+                                 cudaGetErrorString(err));
+                }
+                st.host_data = nullptr;
+            }
         }
 #endif
         has_pending_page_in_ = false;
