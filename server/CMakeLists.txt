@@ -396,6 +396,15 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     target_sources(dflash_common PRIVATE
         src/flashprefill_select.cpp
         src/flashprefill.cpp)
+    # Candidate-restricted greedy LM head (top-M extractor + fused Q6_K head).
+    target_sources(dflash_common PRIVATE
+        src/common/topm_extract_cuda.cu
+        src/common/restricted_lm_head_cuda.cu)
+    set_source_files_properties(
+        src/common/topm_extract_cuda.cu
+        src/common/restricted_lm_head_cuda.cu
+        PROPERTIES LANGUAGE CUDA)
+    target_compile_definitions(dflash_common PUBLIC DFLASH27B_HAVE_TOPK_HEAD=1)
     # Multi-arch: scan all resolved arches and compile every applicable
     # flashprefill kernel variant.  This lets a single binary run on mixed
     # GPUs (e.g. Volta sm_70 + Pascal sm_61) without "no kernel image" errors.
