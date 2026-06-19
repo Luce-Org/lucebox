@@ -23,6 +23,7 @@
 #include "qwen3/qwen3_drafter.h"  // DrafterContext, load_drafter, free_drafter, drafter_score_and_compress
 #include "kvflash_pager.h"         // bounded KV residency pool
 #include "kvflash_scorer.h"        // chunk-relevance policy interface
+#include "kvflash_qk.h"            // target-QK scorer (pooled keys + query)
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -59,7 +60,7 @@ struct Qwen35Config {
     int          draft_yarn_orig_ctx  = 4096;
 
     // Speculative decode strategy
-    bool         fast_rollback   = false;
+    bool         fast_rollback   = true;
     bool         seq_verify      = false;
     bool         ddtree_mode     = false;
     int          ddtree_budget   = 22;
@@ -180,6 +181,16 @@ protected:
     int  kvflash_tau_    = 64;
     bool kvflash_drafter_failed_ = false;           // don't retry a failed load
     bool kvflash_active() const { return kvflash_tokens_ > 0; }
+    // Target-QK policy (--kvflash-policy qk): residency scored with the
+    // target's own pooled post-RoPE keys vs the current decode query
+    // (kvflash_qk.h); no drafter. Keys pool at chunk-seal time; the query
+    // comes from cache_.q_cap (graph capture_qk).
+    bool                    kvflash_qk_policy_ = false;
+    KvFlashQkPool           kvflash_qk_pool_;
+    KvFlashTargetQkScorer * kvflash_qk_scorer_ = nullptr;  // owned by kvflash_scorer_
+    int                     kvflash_qk_pooled_upto_ = 0;   // chunks pooled so far
+    // Pool keys for every chunk sealed before `committed` not pooled yet.
+    void kvflash_qk_pool_to(int committed);
     // Rebuild pager mapping after (re)prefill: positions [0, committed)
     // occupy pool slots identity-mapped (prefill is contiguous).
     void kvflash_sync_prefill(int committed, const std::vector<int32_t> & tokens,

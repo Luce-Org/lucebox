@@ -110,7 +110,7 @@ public:
                 cfg.sink_chunks, cfg.tail_window_chunks);
             return false;
         }
-        if (attn_k.empty() || attn_k.size() != attn_v.size()) return false;
+        if (attn_k.size() != attn_v.size()) return false;
 
         cleanup_();   // release pinned buffers + stream from any prior attach
 
@@ -118,15 +118,23 @@ public:
         attn_k_ = attn_k;
         attn_v_ = attn_v;
         n_blocks_ = cfg.pool_tokens / cfg.chunk_tokens;
-        const ggml_tensor * K0 = attn_k[0];
-        if ((int)K0->ne[1] < cfg.pool_tokens) return false;
-        n_head_kv_ = (int)K0->ne[2];
+        if (!attn_k.empty()) {
+            const ggml_tensor * K0 = attn_k[0];
+            if ((int)K0->ne[1] < cfg.pool_tokens) return false;
+            n_head_kv_ = (int)K0->ne[2];
 
-        // Per-(tensor, head) contiguous segment of chunk_tokens rows.
-        k_seg_bytes_ = (size_t)cfg.chunk_tokens * K0->nb[1];
-        v_seg_bytes_ = (size_t)cfg.chunk_tokens * attn_v[0]->nb[1];
-        chunk_bytes_ = (k_seg_bytes_ + v_seg_bytes_) * (size_t)n_head_kv_ * attn_k.size();
-        zero_buf_.assign(std::max(k_seg_bytes_, v_seg_bytes_), 0);
+            // Per-(tensor, head) contiguous segment of chunk_tokens rows.
+            k_seg_bytes_ = (size_t)cfg.chunk_tokens * K0->nb[1];
+            v_seg_bytes_ = (size_t)cfg.chunk_tokens * attn_v[0]->nb[1];
+            chunk_bytes_ = (k_seg_bytes_ + v_seg_bytes_) * (size_t)n_head_kv_ * attn_k.size();
+            zero_buf_.assign(std::max(k_seg_bytes_, v_seg_bytes_), 0);
+        } else {
+            n_head_kv_ = 0;
+            k_seg_bytes_ = 0;
+            v_seg_bytes_ = 0;
+            chunk_bytes_ = 0;
+            zero_buf_.clear();
+        }
 
         free_blocks_.clear();
         for (int b = n_blocks_ - 1; b >= 0; b--) free_blocks_.push_back(b);
@@ -260,7 +268,7 @@ public:
     bool page_out(int c) {
         if (c >= (int)chunks_.size() || chunks_[c].block < 0) return false;
         ChunkState & st = chunks_[c];
-        if (!st.on_host) {
+        if (has_tensor_storage() && !st.on_host) {
 #ifdef KVFLASH_HAS_ASYNC_DMA
             cudaError_t err = cudaMallocHost(&st.host_data, chunk_bytes_);
             if (err != cudaSuccess) {
@@ -431,6 +439,7 @@ private:
     // is consumed.  The stream serialises D2H and H2D within a single
     // alloc_span(), so host_data is coherent before any H2D read starts.
     void copy_chunk(int c, int block, bool to_host) {
+        if (!has_tensor_storage()) return;
         ChunkState & st = chunks_[c];
 #ifdef KVFLASH_HAS_ASYNC_DMA
         size_t host_off = 0;
@@ -481,6 +490,7 @@ private:
     // page_stream_ so it is serialised after any preceding D2H for the same
     // block and before any subsequent H2D that reuses the slot.
     void zero_block(int block) {
+        if (!has_tensor_storage()) return;
         for (size_t l = 0; l < attn_k_.size(); l++) {
             for (int kv = 0; kv < 2; kv++) {
                 ggml_tensor * t = kv == 0 ? attn_k_[l] : attn_v_[l];
@@ -524,6 +534,10 @@ private:
         }
 #endif
         has_pending_page_in_ = false;
+    }
+
+    bool has_tensor_storage() const {
+        return !attn_k_.empty() && chunk_bytes_ > 0;
     }
 
     KvFlashConfig cfg_;
@@ -635,6 +649,13 @@ inline int kvflash_pool_from_env(int max_ctx, const KvFlashConfig & cfg = {},
 inline bool kvflash_policy_is_lru() {
     const char * env = std::getenv("DFLASH_KVFLASH_POLICY");
     return env && std::strcmp(env, "lru") == 0;
+}
+
+// "qk": target-QK residency scoring (kvflash_qk.h) — pooled post-RoPE keys
+// vs the current decode query, no drafter involved.
+inline bool kvflash_policy_is_qk() {
+    const char * env = std::getenv("DFLASH_KVFLASH_POLICY");
+    return env && std::strcmp(env, "qk") == 0;
 }
 
 // Locate the Qwen3-0.6B residency drafter: the explicit override

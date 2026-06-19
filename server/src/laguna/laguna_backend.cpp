@@ -366,6 +366,9 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
             laguna_snapshot_save(cache_, snap_backend_, w_.n_layer,
                                   w_.n_head_kv, w_.head_dim, snapshots_[req.snap_slot])) {
             snapshots_[req.snap_slot].cur_pos = req.snap_pos;
+            // Record the last committed token so an exact-hit restore can
+            // re-embed it even when handed a zero-filled restore-only prompt.
+            snapshots_[req.snap_slot].last_tok = req.prompt[req.snap_pos - 1];
             std::printf("[snap] inline slot=%d cur_pos=%d\n",
                          req.snap_slot, req.snap_pos);
             std::fflush(stdout);
@@ -510,15 +513,29 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
     const KvFlashPager * kvf = kvflash_active() ? &kvflash_pager_ : nullptr;
 
     // Re-prefill diff tokens (or last cached token when diff is empty).
+    bool restore_only = false;
     if (prefix_len == N) {
         if (prefix_len <= 0) { result.error = "empty_diff"; return result; }
         cache_.cur_pos = prefix_len - 1;
+        restore_only = true;
     }
     const int kv_start = cache_.cur_pos;
     const int diff_n   = N - kv_start;
 
+    // On an exact full-prompt hit (restore_only, diff_n == 1) the caller may
+    // hand us a zero-filled restore-only prompt (pflash full-cache hit, where
+    // effective_prompt is a dummy buffer sized to the cached/compressed length).
+    // req.prompt[kv_start] would then be token 0, corrupting the final logits.
+    // Re-embed the real last committed token recorded in the snapshot instead.
+    std::vector<int32_t> diff_ids;
+    const int32_t * diff_src = req.prompt.data() + kv_start;
+    if (restore_only && snapshots_[slot].last_tok >= 0) {
+        diff_ids.assign(1, snapshots_[slot].last_tok);
+        diff_src = diff_ids.data();
+    }
+
     std::vector<float> embed_diff((size_t)diff_n * w_.n_embd);
-    if (!w_.embedder.embed(req.prompt.data() + kv_start, diff_n, embed_diff.data())) {
+    if (!w_.embedder.embed(diff_src, diff_n, embed_diff.data())) {
         result.error = "embed_prefill";
         return result;
     }

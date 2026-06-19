@@ -251,6 +251,8 @@ add_library(dflash_common STATIC
     src/laguna/laguna_backend.cpp
     src/laguna/laguna_layer_split_adapter.cpp
     src/common/backend_ipc.cpp
+    src/common/target_shard_ipc.cpp
+    src/common/target_shard_ipc_daemon.cpp
     src/common/dflash_feature_ring.cpp
     src/common/dflash_capture.cpp
     src/common/dflash_draft_ipc.cpp
@@ -351,6 +353,12 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     # hip_compat shim is needed by ALL dflash_common sources (peer_access.cpp,
     # dflash_feature_ring.cpp, flashprefill.cpp), not just the SM80_EQUIV path.
     target_include_directories(dflash_common PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
+endif()
+
+if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+    target_link_libraries(dflash_common PUBLIC CUDA::cudart)
+elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+    target_link_libraries(dflash_common PUBLIC hip::host)
 endif()
 
 # FlashPrefill custom kernels.
@@ -764,7 +772,20 @@ if(DFLASH27B_TESTS)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash.cpp")
         add_executable(test_kvflash test/test_kvflash.cpp)
         target_include_directories(test_kvflash PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        # Default --qkbench filler: a bundled real-token stream, tiled to the
+        # requested length. Keeps the qk gate valid out of the box (uniform-
+        # random filler has no Q/K contrast and collapses qk recall to ~LRU).
+        target_compile_definitions(test_kvflash PRIVATE
+            QKBENCH_FILLER_PATH="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/qkbench_filler.i32")
         target_link_libraries(test_kvflash PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(test_kvflash PRIVATE CUDA::cudart)
+        endif()
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash_qk.cpp")
+        # Pure-math unit test (KVFLASH_QK_PURE_ONLY): no ggml, no GPU.
+        add_executable(test_kvflash_qk test/test_kvflash_qk.cpp)
+        target_include_directories(test_kvflash_qk PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_restore_delta.cpp")
         add_executable(test_restore_delta test/test_restore_delta.cpp)

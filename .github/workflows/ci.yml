@@ -54,6 +54,15 @@ jobs:
           sub-packages: '["nvcc", "cudart-dev", "thrust", "driver-dev"]'
           non-cuda-sub-packages: '["libcublas-dev"]'
 
+      - name: Provide CUDA driver stub for hosted tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/cuda-stubs"
+          ln -sf "$CUDA_PATH/targets/x86_64-linux/lib/stubs/libcuda.so" \
+            "$RUNNER_TEMP/cuda-stubs/libcuda.so.1"
+          {
+            echo "LD_LIBRARY_PATH=$RUNNER_TEMP/cuda-stubs:/usr/local/cuda-12.8/targets/x86_64-linux/lib/stubs:/usr/local/cuda-12.8/lib64"
+          } >> "$GITHUB_ENV"
+
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           version: "0.11.x"
@@ -201,11 +210,14 @@ jobs:
     #
     # SECURITY: same model as gpu-tests - fork PRs run only after a maintainer
     # approves the workflow run (approval_policy=all_external_contributors).
-    # Gate only on the 1-minute workspace check, NOT the ~18-minute hosted
-    # CPU build: the GPU job compiles the same tree itself in ~2 minutes on
-    # real hardware, so serializing it behind the cloud build only delayed
-    # the strongest signal this CI produces.
-    needs: [uv-workspace]
+    # Gate only on the 1-minute workspace check and the NVIDIA GPU job, NOT the
+    # ~18-minute hosted CPU build: the GPU job compiles the same tree itself in
+    # ~2 minutes on real hardware. The NVIDIA dependency keeps the two
+    # self-hosted GPU jobs from entering the same concurrency group
+    # simultaneously; GitHub cancels older pending jobs in a group even when
+    # cancel-in-progress is false.
+    needs: [uv-workspace, gpu-tests]
+    if: ${{ always() && needs['uv-workspace'].result == 'success' }}
     runs-on: [self-hosted, rocm, gfx1151]
     timeout-minutes: 20
     # Serialize across PRs per GPU. NOT the same group as the CUDA job:

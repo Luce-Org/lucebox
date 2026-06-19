@@ -36,6 +36,15 @@ struct DFlashTarget {
                               std::vector<int32_t> * all_argmax = nullptr,
                               bool capture_ssm_intermediates = false) = 0;
 
+    // Read the full [n_tokens x vocab] f32 logits produced by the most
+    // recent verify_batch call. Used by sampled-verify (spec decode with
+    // temperature). Returns false when the implementation does not keep
+    // verify logits around.
+    virtual bool read_verify_logits(int n_tokens, std::vector<float> & out) {
+        (void)n_tokens; (void)out;
+        return false;
+    }
+
     // ── KV state management ─────────────────────────────────────────
 
     // Snapshot KV cache state before speculative verify, so it can be

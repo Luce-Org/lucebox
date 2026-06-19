@@ -221,6 +221,9 @@ static void print_usage(const char * prog) {
         "                       from attention at long contexts. Use 0 for tools.\n"
         "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
         "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
+        "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
+        "  --fast-rollback     Enable speculative fast rollback (default: on)\n"
+        "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
         "  --ddtree             Enable DDTree speculative decode\n"
         "  --ddtree-budget <N>  DDTree budget (default: 22)\n"
         "  --no-cors            Disable CORS headers\n"
@@ -322,6 +325,7 @@ int main(int argc, char ** argv) {
     std::string cache_type_v;  // explicit --cache-type-v override
     bool target_device_seen = false;
     bool target_devices_seen = false;
+    bool fast_rollback_forced_off = false;
 
     // Track which thinking-budget tunables the operator set via CLI.
     // Those values win over the model card (spec §3.1: "Explicit CLI
@@ -420,11 +424,18 @@ int main(int argc, char ** argv) {
             sconfig.model_name = argv[++i];
         } else if (std::strcmp(argv[i], "--prefix-cache-slots") == 0 && i + 1 < argc) {
             sconfig.prefix_cache_cap = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--prefill-cache-slots") == 0 && i + 1 < argc) {
+            sconfig.prefill_cache_cap = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--fast-rollback") == 0) {
+            bargs.fast_rollback = true;
         } else if (std::strcmp(argv[i], "--ddtree") == 0) {
             bargs.ddtree_mode = true;
             bargs.fast_rollback = true;
         } else if (std::strcmp(argv[i], "--ddtree-budget") == 0 && i + 1 < argc) {
             bargs.ddtree_budget = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--no-fast-rollback") == 0) {
+            fast_rollback_forced_off = true;
+            bargs.fast_rollback = false;
         } else if (std::strcmp(argv[i], "--kvflash") == 0 && i + 1 < argc) {
             // Bounded KV residency: attention KV lives in a fixed pool of N
             // tokens; cold 64-token chunks page to host. Works with or
@@ -439,8 +450,9 @@ int main(int argc, char ** argv) {
             ::setenv("DFLASH_KVFLASH", argv[i], 1);
         } else if (std::strcmp(argv[i], "--kvflash-policy") == 0 && i + 1 < argc) {
             ++i;
-            if (std::strcmp(argv[i], "drafter") != 0 && std::strcmp(argv[i], "lru") != 0) {
-                std::fprintf(stderr, "--kvflash-policy expects 'drafter' or 'lru', got '%s'\n",
+            if (std::strcmp(argv[i], "drafter") != 0 && std::strcmp(argv[i], "lru") != 0 &&
+                std::strcmp(argv[i], "qk") != 0) {
+                std::fprintf(stderr, "--kvflash-policy expects 'drafter', 'lru', or 'qk', got '%s'\n",
                              argv[i]);
                 return 1;
             }
@@ -609,6 +621,7 @@ int main(int argc, char ** argv) {
             return 2;
         }
     }
+    if (fast_rollback_forced_off) bargs.fast_rollback = false;
 
     if (!validate_server_placement(bargs, sconfig)) return 2;
 
@@ -1050,8 +1063,10 @@ int main(int argc, char ** argv) {
                              "[server] │     Use --fa-window 0 for tool-call workloads.\n");
     }
     std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");
+    std::fprintf(stderr, "[server] │  fast_rollback   = %s\n", bargs.fast_rollback ? "ON" : "off");
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
+    std::fprintf(stderr, "[server] │  prefill_cache   = %d slots\n", sconfig.prefill_cache_cap);
     std::fprintf(stderr, "[server] │  cors            = %s\n", sconfig.enable_cors ? "ON" : "off");
     std::fprintf(stderr, "[server] │  cache_type_k    = %s\n",
 #ifdef GGML_USE_HIP

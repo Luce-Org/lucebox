@@ -7,6 +7,7 @@
 #include "dflash_feature_ring.h"
 #include "dflash_capture.h"
 #include "attn_masks.h"
+#include "common/kvflash_pager.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -14,8 +15,68 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 
 namespace dflash::common {
+
+namespace {
+
+bool fill_qwen35_kvflash_inputs(
+        StepGraph & sg,
+        const TargetWeights & w,
+        const KvFlashPager & pager,
+        int kv_start,
+        int n_tokens) {
+    if (!sg.kv_write_rows) {
+        std::fprintf(stderr, "target-split kvflash requires set_rows path\n");
+        return false;
+    }
+    std::vector<int64_t> rows((size_t)n_tokens * w.n_head_kv);
+    for (int i = 0; i < n_tokens; ++i) {
+        const int slot = pager.slot_of(kv_start + i);
+        if (slot < 0) {
+            std::fprintf(stderr,
+                "target-split kvflash slot missing @%d (alloc_span not called?)\n",
+                kv_start + i);
+            return false;
+        }
+        for (int h = 0; h < w.n_head_kv; ++h) {
+            rows[(size_t)h * n_tokens + i] = slot;
+        }
+    }
+    ggml_backend_tensor_set(sg.kv_write_rows, rows.data(), 0,
+                            sizeof(int64_t) * rows.size());
+
+    if (!sg.attn_mask) return true;
+    const size_t kvd = (size_t)sg.attn_mask->ne[0];
+    const int q_pad = (int)sg.attn_mask->ne[1];
+    std::vector<int32_t> slot_pos((size_t)pager.pool_tokens(), -1);
+    pager.fill_slot_pos(slot_pos.data());
+    std::vector<uint16_t> mask((size_t)kvd * q_pad, F16_NEG_INF);
+    const int s_hi = std::min((int)kvd, (int)slot_pos.size());
+    for (int s = 0; s < s_hi; ++s) {
+        const int p = slot_pos[(size_t)s];
+        if (p >= 0 && p < kv_start) {
+            mask[(size_t)s] = F16_ZERO;
+        }
+    }
+    for (int q = 1; q < n_tokens; ++q) {
+        std::memcpy(mask.data() + (size_t)q * kvd, mask.data(), kvd * sizeof(uint16_t));
+    }
+    for (int q = 0; q < n_tokens; ++q) {
+        for (int i = 0; i <= q; ++i) {
+            const int slot = pager.slot_of(kv_start + i);
+            if (slot >= 0 && slot < (int)kvd) {
+                mask[(size_t)q * kvd + (size_t)slot] = F16_ZERO;
+            }
+        }
+    }
+    ggml_backend_tensor_set(sg.attn_mask, mask.data(), 0,
+                            sizeof(uint16_t) * mask.size());
+    return true;
+}
+
+}  // namespace
 
 bool compute_target_split_projection(
         StepGraph & sg,
@@ -103,12 +164,18 @@ bool run_qwen35_layer_split_forward(
         std::vector<int32_t> * argmax_out,
         std::vector<float> * logits_out,
         DFlashDraftIpcClient * remote_draft,
-        ggml_type activation_type) {
+        ggml_type activation_type,
+        KvFlashPager * kvflash) {
     if (shards.empty() || tokens.empty()) return false;
     const int hidden = shards.front().weights.n_embd;
     const int vocab = shards.front().weights.n_vocab;
     const int n_tokens_total = (int)tokens.size();
     ubatch = std::max(1, ubatch);
+    if (kvflash && fa_window > 0) {
+        std::fprintf(stderr,
+            "target-split kvflash requires full attention (fa_window=0)\n");
+        return false;
+    }
     if ((feature_ring || remote_draft) && activation_type != GGML_TYPE_F32) {
         std::fprintf(stderr,
             "target-split capture requires F32 activation; got %s\n",
@@ -182,11 +249,17 @@ bool run_qwen35_layer_split_forward(
             const int n = std::min(ubatch, n_tokens_total - start);
             const int kv_start = base_pos + start;
             const int kv_len = kv_start + n;
-            const bool with_mask = (kq_stride_pad > KQ_MASK_PAD) || (n > 1);
+            const bool with_mask = kvflash ||
+                (kq_stride_pad > KQ_MASK_PAD) || (n > 1);
+            if (is_attn && kvflash && !kvflash->alloc_span(kv_start, n)) {
+                activation_pair_free(acts);
+                return false;
+            }
             if (!build_layer_step(shard->layer_graph, shard->weights, shard->cache,
                                   shard->backend, il, act_in, act_out,
                                   start, n, kv_start, with_mask,
-                                  /*capture=*/false, fa_window, kq_stride_pad)) {
+                                  /*capture=*/false, fa_window, kq_stride_pad,
+                                  kvflash != nullptr)) {
                 std::fprintf(stderr, "target-split build layer=%d @%d gpu=%d\n",
                              il, start, shard->gpu);
                 activation_pair_free(acts);
@@ -204,7 +277,14 @@ bool run_qwen35_layer_split_forward(
                 ggml_backend_tensor_set(shard->layer_graph.positions, pos_buf.data(), 0,
                                         sizeof(int32_t) * pos_buf.size());
             }
-            if (is_attn && with_mask && shard->layer_graph.attn_mask) {
+            if (is_attn && kvflash) {
+                if (!fill_qwen35_kvflash_inputs(
+                        shard->layer_graph, shard->weights, *kvflash,
+                        kv_start, n)) {
+                    activation_pair_free(acts);
+                    return false;
+                }
+            } else if (is_attn && with_mask && shard->layer_graph.attn_mask) {
                 const int win_start_l = (fa_window > 0 && kv_start > fa_window)
                                             ? (kv_start - fa_window) : 0;
                 const int win_len_l = kv_len - win_start_l;
@@ -280,8 +360,15 @@ bool run_qwen35_layer_split_layers_from_activation(
         int fa_window,
         std::vector<Qwen35TargetCaptureSlice> * captures_out,
         DraftFeatureMirror * feature_ring,
-        DFlashDraftIpcClient * remote_draft) {
+        DFlashDraftIpcClient * remote_draft,
+        KvFlashPager * kvflash,
+        bool kvflash_preallocated = false) {
     if (shards.empty() || !acts.a || !acts.b || n_tokens_total <= 0) return false;
+    if (kvflash && fa_window > 0) {
+        std::fprintf(stderr,
+            "target-split kvflash requires full attention (fa_window=0)\n");
+        return false;
+    }
     const int hidden = shards.front().weights.n_embd;
     ubatch = std::max(1, ubatch);
 
@@ -321,11 +408,17 @@ bool run_qwen35_layer_split_layers_from_activation(
             const int n = std::min(ubatch, n_tokens_total - start);
             const int kv_start = base_pos + start;
             const int kv_len = kv_start + n;
-            const bool with_mask = (kq_stride_pad > KQ_MASK_PAD) || (n > 1);
+            const bool with_mask = kvflash ||
+                (kq_stride_pad > KQ_MASK_PAD) || (n > 1);
+            if (is_attn && kvflash && !kvflash_preallocated &&
+                !kvflash->alloc_span(kv_start, n)) {
+                return false;
+            }
             if (!build_layer_step(shard->layer_graph, shard->weights, shard->cache,
                                   shard->backend, il, act_in, act_out,
                                   start, n, kv_start, with_mask,
-                                  /*capture=*/false, fa_window, kq_stride_pad)) {
+                                  /*capture=*/false, fa_window, kq_stride_pad,
+                                  kvflash != nullptr)) {
                 std::fprintf(stderr, "target-split build layer=%d @%d gpu=%d\n",
                              il, start, shard->gpu);
                 return false;
@@ -342,7 +435,13 @@ bool run_qwen35_layer_split_layers_from_activation(
                 ggml_backend_tensor_set(shard->layer_graph.positions, pos_buf.data(), 0,
                                         sizeof(int32_t) * pos_buf.size());
             }
-            if (is_attn && with_mask && shard->layer_graph.attn_mask) {
+            if (is_attn && kvflash) {
+                if (!fill_qwen35_kvflash_inputs(
+                        shard->layer_graph, shard->weights, *kvflash,
+                        kv_start, n)) {
+                    return false;
+                }
+            } else if (is_attn && with_mask && shard->layer_graph.attn_mask) {
                 const int win_start_l = (fa_window > 0 && kv_start > fa_window)
                                             ? (kv_start - fa_window) : 0;
                 const int win_len_l = kv_len - win_start_l;
@@ -415,10 +514,13 @@ bool run_qwen35_layer_split_forward_from_activation(
         int fa_window,
         std::vector<int32_t> * argmax_out,
         std::vector<float> * logits_out,
-        std::vector<Qwen35TargetCaptureSlice> * captures_out) {
+        std::vector<Qwen35TargetCaptureSlice> * captures_out,
+        KvFlashPager * kvflash,
+        bool kvflash_preallocated) {
     if (!run_qwen35_layer_split_layers_from_activation(
             shards, acts, base_pos, n_tokens_total, ubatch, kq_stride_pad,
-            fa_window, captures_out, nullptr, nullptr)) {
+            fa_window, captures_out, nullptr, nullptr, kvflash,
+            kvflash_preallocated)) {
         return false;
     }
 
@@ -458,7 +560,8 @@ bool run_qwen35_mixed_layer_split_forward(
         std::vector<int32_t> * argmax_out,
         std::vector<float> * logits_out,
         DraftFeatureMirror * feature_ring,
-        DFlashDraftIpcClient * remote_draft) {
+        DFlashDraftIpcClient * remote_draft,
+        KvFlashPager * kvflash) {
     if (!remote_shard.active() || tokens.empty() ||
         local_shards.empty() || local_shards.front().layer_begin != 0 ||
         local_shards.back().layer_end <= 0) {
@@ -467,6 +570,19 @@ bool run_qwen35_mixed_layer_split_forward(
     const int hidden = local_shards.front().weights.n_embd;
     const int n_tokens_total = (int)tokens.size();
     ubatch = std::max(1, ubatch);
+    if (kvflash && fa_window > 0) {
+        std::fprintf(stderr,
+            "mixed target-split kvflash requires full attention (fa_window=0)\n");
+        return false;
+    }
+    if (kvflash) {
+        for (int start = 0; start < n_tokens_total; start += ubatch) {
+            const int n = std::min(ubatch, n_tokens_total - start);
+            if (!kvflash->alloc_span(base_pos + start, n)) {
+                return false;
+            }
+        }
+    }
 
     ActivationPair acts;
     if (!activation_pair_init(acts, local_shards.front().backend, hidden, n_tokens_total)) {
@@ -494,7 +610,8 @@ bool run_qwen35_mixed_layer_split_forward(
 
     if (!run_qwen35_layer_split_layers_from_activation(
             local_shards, acts, base_pos, n_tokens_total, ubatch,
-            kq_stride_pad, fa_window, nullptr, feature_ring, remote_draft)) {
+            kq_stride_pad, fa_window, nullptr, feature_ring, remote_draft,
+            kvflash, kvflash != nullptr)) {
         activation_pair_free(acts);
         return false;
     }
@@ -513,7 +630,8 @@ bool run_qwen35_mixed_layer_split_forward(
         (feature_ring || remote_draft) ? &remote_captures : nullptr;
     if (!remote_shard.forward(base_pos, n_tokens_total, boundary,
                               logits_out != nullptr, last_tok,
-                              argmax_out, logits_out, remote_captures_out)) {
+                              argmax_out, logits_out, remote_captures_out,
+                              ubatch)) {
         return false;
     }
     for (const auto & capture : remote_captures) {

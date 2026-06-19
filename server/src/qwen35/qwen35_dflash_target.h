@@ -39,6 +39,8 @@ public:
                       std::vector<int32_t> * all_argmax = nullptr,
                       bool capture_ssm_intermediates = false) override;
 
+    bool read_verify_logits(int n_tokens, std::vector<float> & out) override;
+
     bool snapshot_kv() override;
     bool restore_kv() override;
     bool supports_fast_rollback() const override;

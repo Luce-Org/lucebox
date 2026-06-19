@@ -26,9 +26,12 @@ namespace dflash::common {
 
 const char * backend_ipc_mode_name(BackendIpcMode mode) {
     switch (mode) {
+        case BackendIpcMode::Invalid: return "invalid";
         case BackendIpcMode::DFlashDraft: return "dflash-draft";
         case BackendIpcMode::PFlashCompress: return "pflash-compress";
         case BackendIpcMode::Qwen35TargetShard: return "qwen35-target-shard";
+        case BackendIpcMode::Gemma4TargetShard: return "gemma4-target-shard";
+        case BackendIpcMode::LagunaTargetShard: return "laguna-target-shard";
     }
     return "unknown";
 }
@@ -44,6 +47,14 @@ bool parse_backend_ipc_mode(const std::string & value, BackendIpcMode & out) {
     }
     if (value == "qwen35-target-shard") {
         out = BackendIpcMode::Qwen35TargetShard;
+        return true;
+    }
+    if (value == "gemma4-target-shard") {
+        out = BackendIpcMode::Gemma4TargetShard;
+        return true;
+    }
+    if (value == "laguna-target-shard") {
+        out = BackendIpcMode::LagunaTargetShard;
         return true;
     }
     return false;

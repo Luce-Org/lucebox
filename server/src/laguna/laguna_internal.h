@@ -202,6 +202,11 @@ struct LagunaCacheSnapshot {
     std::vector<ggml_tensor *> attn_k;  // size = n_layer
     std::vector<ggml_tensor *> attn_v;  // size = n_layer
     int                   cur_pos = 0;
+    // Last committed token id (the token at cur_pos-1). Recorded at save so the
+    // exact-hit restore can re-embed the real last token even when the caller
+    // hands us a zero-filled restore-only prompt (pflash full-cache hit). -1 =
+    // not recorded (older/inline snapshots) -> restore falls back to req.prompt.
+    int                   last_tok = -1;
     bool                  used    = false;
 };
 
@@ -328,6 +333,7 @@ struct LagunaLayerStepGraph {
     ggml_tensor * positions = nullptr;
     ggml_tensor * attn_mask = nullptr;
     ggml_tensor * attn_mask_swa = nullptr;
+    ggml_tensor * kv_idx = nullptr;
 };
 
 void laguna_layer_step_graph_free(LagunaLayerStepGraph & sg);
@@ -343,7 +349,8 @@ bool build_laguna_layer_step(
     ggml_tensor * act_out,
     int chunk_start,
     int n_tokens,
-    int kv_start);
+    int kv_start,
+    const class KvFlashPager * kvflash = nullptr);
 
 bool compute_laguna_split_argmax(
     ggml_backend_t backend,

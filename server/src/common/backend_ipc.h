@@ -21,9 +21,12 @@
 namespace dflash::common {
 
 enum class BackendIpcMode {
+    Invalid,
     DFlashDraft,
     PFlashCompress,
     Qwen35TargetShard,
+    Gemma4TargetShard,
+    LagunaTargetShard,
 };
 
 const char * backend_ipc_mode_name(BackendIpcMode mode);

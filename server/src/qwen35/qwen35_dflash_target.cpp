@@ -1,6 +1,7 @@
 // Qwen35DFlashTarget — DFlashTarget adapter for qwen35 hybrid models.
 
 #include "qwen35_dflash_target.h"
+#include "common/gpu_runtime_compat.h"
 #include "graph_builders.h"
 #include "step_graph.h"
 #include "attn_masks.h"
@@ -10,6 +11,7 @@
 // builds (e.g. gfx1151) fail with "cudaStream_t undeclared".
 #include "common/gpu_runtime_compat.h"
 
+#include <cstdlib>
 #include <cstring>
 
 // ggml_get_to_fp32_cuda is not in any public header — it lives in
@@ -63,7 +65,10 @@ bool Qwen35DFlashTarget::verify_batch(
         }
     }
 
-    const bool do_capture = fast_rollback_ && capture_ssm_intermediates;
+    // kvflash's set_rows KV-write is mutually exclusive with delta-intermediate
+    // capture (graph_builders gates use_kv_write_rows on !capture_delta_intermediate);
+    // skip capture under the pager so --ddtree + --kvflash doesn't fail verify.
+    const bool do_capture = fast_rollback_ && capture_ssm_intermediates && pager_ == nullptr;
 
     if (!build_target_step(sg_, w_, cache_, backend_,
                            /*kv_start=*/base_pos, n_tokens,
@@ -173,6 +178,16 @@ bool Qwen35DFlashTarget::verify_batch(
     }
 
     cache_.cur_pos = base_pos + n_tokens;
+    return true;
+}
+
+bool Qwen35DFlashTarget::read_verify_logits(int n_tokens, std::vector<float> & out) {
+    if (!sg_.logits || n_tokens <= 0) return false;
+    const int64_t vocab = sg_.logits->ne[0];
+    if (n_tokens > (int)sg_.logits->ne[1]) return false;
+    out.resize((size_t)n_tokens * (size_t)vocab);
+    ggml_backend_tensor_get(sg_.logits, out.data(), 0,
+                            sizeof(float) * out.size());
     return true;
 }
 
@@ -434,21 +449,42 @@ bool Qwen35DFlashTarget::restore_kv() {
 }
 
 bool Qwen35DFlashTarget::supports_fast_rollback() const {
-    return fast_rollback_;
+    return fast_rollback_ && pager_ == nullptr;
 }
 
 bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
-    if (!fast_rollback_) return false;
+    static const bool kFastRollbackDiag = []() {
+        const char * e = std::getenv("FAST_ROLLBACK_DIAG");
+        return e != nullptr && std::strcmp(e, "0") != 0;
+    }();
+
+    if (!fast_rollback_) {
+        if (kFastRollbackDiag) {
+            std::fprintf(stderr, "rollback_to: fast_rollback disabled\n");
+        }
+        return false;
+    }
 
     // commit_n must be a positive count. `commit_n - 1` below indexes the
     // per-step intermediates; a non-positive value underflows to a huge
     // size_t byte offset and triggers an out-of-bounds GPU read. A zero/neg
     // commit means "nothing to keep" — signal failure so the caller falls
     // back to the full restore_kv path.
-    if (commit_n <= 0) return false;
+    if (commit_n <= 0) {
+        if (kFastRollbackDiag) {
+            std::fprintf(stderr, "rollback_to: commit_n <= 0 commit_n=%d\n",
+                         commit_n);
+        }
+        return false;
+    }
 
     const int n_delta = (int)sg_.delta_captures.size();
-    if (n_delta == 0) return false;
+    if (n_delta == 0) {
+        if (kFastRollbackDiag) {
+            std::fprintf(stderr, "rollback_to: no delta_captures\n");
+        }
+        return false;
+    }
 
     // If all tokens accepted, the SSM state after processing all q_len tokens
     // is exactly what we want — no rollback needed, just fix cur_pos.
@@ -463,8 +499,26 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
 
     for (int il = 0; il < n_delta; il++) {
         const DeltaNetCapture & cap = sg_.delta_captures[il];
-        if (!cap.ssm_intermediate_states || !cap.conv_input) {
-            std::fprintf(stderr, "rollback_to: missing capture at layer %d\n", il);
+        if (!cap.ssm_intermediate_states) {
+            if (kFastRollbackDiag) {
+                std::fprintf(stderr, "rollback_to: null ssm_intermediate_states layer=%d\n",
+                             il);
+            }
+            return false;
+        }
+        if (!cap.conv_input) {
+            if (kFastRollbackDiag) {
+                std::fprintf(stderr, "rollback_to: null conv_input layer=%d\n",
+                             il);
+            }
+            return false;
+        }
+        if (rollback_idx >= (int)cap.ssm_intermediate_states->ne[3]) {
+            if (kFastRollbackDiag) {
+                std::fprintf(stderr,
+                             "rollback_to: rollback_idx OOB rollback_idx=%d slots=%d layer=%d\n",
+                             rollback_idx, (int)cap.ssm_intermediate_states->ne[3], il);
+            }
             return false;
         }
 
@@ -479,8 +533,10 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
             (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
         const auto to_fp32 = ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type);
         if (!to_fp32) {
-            std::fprintf(stderr, "rollback_to: no fp32 converter for ssm type %d (layer %d)\n",
-                         (int)cap.ssm_intermediate_states->type, il);
+            if (kFastRollbackDiag) {
+                std::fprintf(stderr, "rollback_to: no fp32 converter type=%d layer=%d\n",
+                             (int)cap.ssm_intermediate_states->type, il);
+            }
             return false;
         }
         to_fp32(ssm_src, (float *)cache_.ssm_state[il]->data,
@@ -489,6 +545,15 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
         // Conv rollback: copy conv_input[commit_n..commit_n+K-2, :, :]
         // into cache.conv_state[il].
         const int K_conv = 4;
+        if (commit_n + K_conv - 1 > (int)cap.conv_input->ne[0]) {
+            if (kFastRollbackDiag) {
+                std::fprintf(stderr,
+                             "rollback_to: conv_input OOB commit_n=%d needed=%d slots=%d layer=%d\n",
+                             commit_n, commit_n + K_conv - 1,
+                             (int)cap.conv_input->ne[0], il);
+            }
+            return false;
+        }
         const int row_cnt = (int)cap.conv_input->ne[1];
         const size_t elt = ggml_element_size(cap.conv_input);
         const size_t dpitch = (K_conv - 1) * elt;
@@ -501,8 +566,10 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
                                            width, row_cnt,
                                            cudaMemcpyDeviceToDevice, stream);
         if (ce != cudaSuccess) {
-            std::fprintf(stderr, "rollback_to: cudaMemcpy2D conv il=%d: %s\n",
-                         il, cudaGetErrorString(ce));
+            if (kFastRollbackDiag) {
+                std::fprintf(stderr, "rollback_to: cudaMemcpy2D conv layer=%d: %s\n",
+                             il, cudaGetErrorString(ce));
+            }
             return false;
         }
     }

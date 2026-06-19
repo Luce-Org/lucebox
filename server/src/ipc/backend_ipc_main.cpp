@@ -2,6 +2,8 @@
 
 #include "backend_ipc.h"
 #include "dflash_draft_ipc.h"
+#include "gemma4/gemma4_layer_split_adapter.h"
+#include "laguna/laguna_layer_split_adapter.h"
 #include "pflash_drafter_ipc.h"
 #include "qwen35_target_shard_ipc.h"
 
@@ -113,7 +115,17 @@ int main(int argc, char ** argv) {
             "--stream-fd=FD [--draft-gpu=N]\n"
             "   or: %s --backend-ipc-mode=qwen35-target-shard <target.gguf> "
             "--stream-fd=FD --target-gpu=N --layer-begin=N --layer-end=N "
-            "--max-ctx=N\n",
+            "--max-ctx=N [--hidden=N --vocab=N --max-tokens=N]\n"
+            "   or: %s --backend-ipc-mode=gemma4-target-shard <target.gguf> "
+            "--stream-fd=FD --target-gpus=N[,N...] --layer-begins=N[,N...] "
+            "--layer-ends=N[,N...] --max-ctx=N "
+            "[--hidden=N --vocab=N --max-tokens=N]\n"
+            "   or: %s --backend-ipc-mode=laguna-target-shard <target.gguf> "
+            "--stream-fd=FD --target-gpus=N[,N...] --layer-begins=N[,N...] "
+            "--layer-ends=N[,N...] --max-ctx=N "
+            "[--hidden=N --vocab=N --max-tokens=N]\n",
+            argv[0],
+            argv[0],
             argv[0],
             argv[0],
             argv[0]);
@@ -130,6 +142,9 @@ int main(int argc, char ** argv) {
     int layer_end = -1;
     int max_ctx = 8192;
     int max_verify_tokens = DFLASH27B_DRAFT_BLOCK_SIZE;
+    int target_hidden = 0;
+    int target_vocab = 0;
+    int target_max_tokens = 0;
     int kq_stride_pad = 32;
     int fa_window = 0;
     int payload_fd = -1;
@@ -137,6 +152,7 @@ int main(int argc, char ** argv) {
     int shared_payload_fd = -1;
     size_t shared_payload_bytes = 0;
     bool enable_dflash = false;
+    int kvflash_pool_tokens = 0;
     for (int i = arg_begin; i < argc; i++) {
         if (std::strncmp(argv[i], "--ring-cap=", 11) == 0) {
             if (!parse_nonnegative_int(argv[i] + 11, ring_cap)) return 2;
@@ -200,6 +216,24 @@ int main(int argc, char ** argv) {
             max_verify_tokens = std::atoi(argv[i] + 20);
         } else if (std::strcmp(argv[i], "--max-verify-tokens") == 0) {
             if (i + 1 < argc) max_verify_tokens = std::atoi(argv[++i]);
+        } else if (std::strncmp(argv[i], "--hidden=", 9) == 0) {
+            if (!parse_nonnegative_int(argv[i] + 9, target_hidden)) return 2;
+        } else if (std::strcmp(argv[i], "--hidden") == 0) {
+            const char * value = nullptr;
+            if (!require_value(i, argc, argv, "--hidden", value) ||
+                !parse_nonnegative_int(value, target_hidden)) return 2;
+        } else if (std::strncmp(argv[i], "--vocab=", 8) == 0) {
+            if (!parse_nonnegative_int(argv[i] + 8, target_vocab)) return 2;
+        } else if (std::strcmp(argv[i], "--vocab") == 0) {
+            const char * value = nullptr;
+            if (!require_value(i, argc, argv, "--vocab", value) ||
+                !parse_nonnegative_int(value, target_vocab)) return 2;
+        } else if (std::strncmp(argv[i], "--max-tokens=", 13) == 0) {
+            if (!parse_nonnegative_int(argv[i] + 13, target_max_tokens)) return 2;
+        } else if (std::strcmp(argv[i], "--max-tokens") == 0) {
+            const char * value = nullptr;
+            if (!require_value(i, argc, argv, "--max-tokens", value) ||
+                !parse_nonnegative_int(value, target_max_tokens)) return 2;
         } else if (std::strncmp(argv[i], "--kq-stride-pad=", 16) == 0) {
             kq_stride_pad = std::atoi(argv[i] + 16);
         } else if (std::strcmp(argv[i], "--kq-stride-pad") == 0) {
@@ -234,13 +268,24 @@ int main(int argc, char ** argv) {
                 !parse_size_arg(value, shared_payload_bytes)) return 2;
         } else if (std::strcmp(argv[i], "--enable-dflash") == 0) {
             enable_dflash = true;
+        } else if (std::strncmp(argv[i], "--kvflash-pool=", 15) == 0) {
+            if (!parse_nonnegative_int(argv[i] + 15, kvflash_pool_tokens)) return 2;
+        } else if (std::strcmp(argv[i], "--kvflash-pool") == 0) {
+            const char * value = nullptr;
+            if (!require_value(i, argc, argv, "--kvflash-pool", value)) return 2;
+            if (!parse_nonnegative_int(value, kvflash_pool_tokens)) return 2;
         } else {
             std::fprintf(stderr, "[backend-ipc-daemon] unknown option: %s\n", argv[i]);
             return 2;
         }
     }
+    (void)target_hidden;
+    (void)target_vocab;
+    (void)target_max_tokens;
 
     switch (mode) {
+        case BackendIpcMode::Invalid:
+            break;
         case BackendIpcMode::DFlashDraft:
             return run_dflash_draft_ipc_daemon(payload_path, ring_cap, draft_gpu,
                                                stream_fd, payload_fd,
@@ -256,7 +301,23 @@ int main(int argc, char ** argv) {
                 payload_path, target_gpus, layer_begins, layer_ends, max_ctx,
                 max_verify_tokens, kq_stride_pad, fa_window, stream_fd,
                 payload_fd, shared_payload_fd, shared_payload_bytes,
-                enable_dflash);
+                enable_dflash, kvflash_pool_tokens);
+        case BackendIpcMode::Gemma4TargetShard:
+            if (target_gpus.empty()) target_gpus.push_back(target_gpu);
+            if (layer_begins.empty()) layer_begins.push_back(layer_begin);
+            if (layer_ends.empty()) layer_ends.push_back(layer_end);
+            return run_gemma4_target_shard_ipc_daemon(
+                payload_path, target_gpus, layer_begins, layer_ends, max_ctx,
+                fa_window, stream_fd, payload_fd, shared_payload_fd,
+                shared_payload_bytes, kvflash_pool_tokens);
+        case BackendIpcMode::LagunaTargetShard:
+            if (target_gpus.empty()) target_gpus.push_back(target_gpu);
+            if (layer_begins.empty()) layer_begins.push_back(layer_begin);
+            if (layer_ends.empty()) layer_ends.push_back(layer_end);
+            return run_laguna_target_shard_ipc_daemon(
+                payload_path, target_gpus, layer_begins, layer_ends, max_ctx,
+                stream_fd, payload_fd, shared_payload_fd, shared_payload_bytes,
+                kvflash_pool_tokens);
     }
     std::fprintf(stderr, "[backend-ipc-daemon] unsupported mode\n");
     return 2;

@@ -38,7 +38,8 @@ bool build_layer_step(
     bool with_mask,
     bool capture,
     int fa_window = 0,
-    int kq_stride_pad = KQ_MASK_PAD);
+    int kq_stride_pad = KQ_MASK_PAD,
+    bool kvflash = false);
 
 // `kvflash`: pooled mode — KV rows go through a set_rows input
 // (sg.kv_write_rows, [n_tokens, n_head_kv] ne0-major slots) and the mask
@@ -91,7 +92,8 @@ bool build_target_step(
     bool last_token_logits_only = false,
     int kq_stride_pad = KQ_MASK_PAD,
     bool capture_moe_router = false,
-    bool kvflash_mask = false);
+    bool kvflash_mask = false,
+    bool capture_qk = false);
 
 // Full target forward: DDTree tree-verify mode.
 bool build_target_step_tree(
