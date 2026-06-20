@@ -451,6 +451,11 @@ struct PrefixSnapshot {
     //     [HEAD_DIM, kv_end-kv_start, N_HEAD_KV] (smaller than cache).
     //   - ssm_state_snap, conv_state_snap, target_feat_snap are NOT
     //     allocated (THIN snapshots are KV-only).
+
+    // Phase C: pooled snapshots (kvflash evicted state).
+    // attn_k_snap/attn_v_snap are NOT allocated; KV lives in kvflash_blob.
+    bool                 is_pooled    = false;
+    std::vector<uint8_t> kvflash_blob;  // pager-serialized KV; valid iff is_pooled
 };
 
 // Snapshot the slim state of `cache` into `snap`. KV tensors are RIGHT-SIZED
@@ -461,13 +466,17 @@ struct PrefixSnapshot {
 bool snapshot_target_cache(const TargetWeights & w,
                            const TargetCache & cache,
                            ggml_backend_t backend,
-                           PrefixSnapshot & snap);
+                           PrefixSnapshot & snap,
+                           bool skip_kv = false,
+                           const std::vector<uint8_t> * kvflash_blob = nullptr);
 
 // Restore `cache` from `snap`. cache must already exist (created via
 // create_target_cache) and have matching shapes. Sets cache.cur_pos =
 // snap.cur_pos. Does NOT touch ssm_intermediate / conv_input_cache —
 // those will be repopulated by the first decode step's verify forward.
-bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache);
+// skip_kv=true: skip restoring attn_k/attn_v rows (pooled restore path).
+bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache,
+                          bool skip_kv = false);
 
 // Free the snapshot's GPU buffers.
 void free_prefix_snapshot(PrefixSnapshot & snap);

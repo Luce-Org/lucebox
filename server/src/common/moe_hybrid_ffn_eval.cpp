@@ -1009,7 +1009,7 @@ static int mmq_safe_sub_batch() {
     static const int v = [](){
         const char * e = std::getenv("DFLASH_MMQ_SUB_BATCH");
         if (e) return std::max(1, std::atoi(e));
-        return (query_gpu_compute_sm() >= 80) ? 8 : 1;
+        return (query_gpu_compute_sm() >= 80) ? 4 : 1; // Q4_K MMVQ cap=4 on sm_86
     }();
     return v;
 }
@@ -1064,6 +1064,19 @@ static bool eval_moe_hybrid_ffn_batched_core(
             else {
                 const int32_t cl = storage.cold_local_by_global[(size_t)gid];
                 if (cl >= 0) { cold_sel[i] = cl; cold_wts[i] = selected_weights[i]; fp_has_cold = true; }
+            }
+        }
+        // Dummy slots (wts==0) may alias a real hot expert's local ID per token →
+        // ids_to_sorted_host drops entries → ASSERT in slow ggml_mul_mat_id path.
+        for (int t = 0; t < n_tokens; ++t) {
+            const int base = t * n_used;
+            int32_t next = 0;
+            for (int s = 0; s < n_used; ++s) {
+                if (hot_wts[base + s] > 0.0f) continue;
+                while ([&]{ for (int k=0; k<n_used; ++k) if (k!=s && hot_sel[base+k]==next) return true; return false; }())
+                    if (++next >= n_hot_init) next = 0;
+                hot_sel[base + s] = next++;
+                if (next >= n_hot_init) next = 0;
             }
         }
 
@@ -1143,6 +1156,19 @@ static bool eval_moe_hybrid_ffn_batched_core(
                 cold_wts[i] = selected_weights[i];
                 has_cold = true;
             }
+        }
+    }
+    // Dummy slots (wts==0) may alias a real hot expert's local ID per token →
+    // ids_to_sorted_host drops entries → ASSERT in slow ggml_mul_mat_id path.
+    for (int t = 0; t < n_tokens; ++t) {
+        const int base = t * n_used;
+        int32_t next = 0;
+        for (int s = 0; s < n_used; ++s) {
+            if (hot_wts[base + s] > 0.0f) continue;
+            while ([&]{ for (int k=0; k<n_used; ++k) if (k!=s && hot_sel[base+k]==next) return true; return false; }())
+                if (++next >= n_hot_init) next = 0;
+            hot_sel[base + s] = next++;
+            if (next >= n_hot_init) next = 0;
         }
     }
 

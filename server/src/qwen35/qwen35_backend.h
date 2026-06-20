@@ -129,13 +129,15 @@ public:
 
 protected:
     virtual bool load_target_model(ggml_backend_t backend, TargetWeights & out);
+    // Called after kvflash_tokens_ / kvflash_tau_ / pager are initialized.
+    // Subclasses may zero kvflash_tokens_ here to gate the pool off when it
+    // is not needed (e.g. all-hot MoE + full KV fits without the pool).
+    // Must return true; returning false aborts init().
+    virtual bool post_kvflash_init_gate() { return true; }
     virtual bool run_ar_decode_path(int committed, int n_gen,
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io);
     virtual bool should_capture_moe_router() const { return false; }
-    // Hook after kvflash pool sizing, before create_target_cache: a subclass
-    // may disable the pool (kvflash_tokens_=0) when it is redundant. Default no-op.
-    virtual bool post_kvflash_init_gate() { return true; }
     virtual void after_target_compute(StepGraph &,
                                       int /*kv_start*/,
                                       int /*n_tokens*/) {}
@@ -152,6 +154,8 @@ protected:
     bool prefill_logits_valid() const { return prefill_last_logits_valid_; }
     std::size_t prefill_logits_offset() const { return prefill_last_logits_offset_; }
     bool restore_target_cache_from_snapshot(int slot);
+    bool snapshot_is_pooled(int slot) const;
+    const std::vector<uint8_t> & snapshot_kvflash_blob(int slot) const;
 
     // Accessors for draft/spec-decode state (needed by hybrid spec-decode in subclass)
     DraftWeights & draft_weights() { return dw_; }
@@ -179,11 +183,16 @@ protected:
     std::vector<float>             kvflash_scores_;      // latest chunk scores
     std::vector<uint16_t>          kvflash_mask_buf_;    // host mirror of slot mask
     std::string                    kvflash_drafter_path_; // DFLASH_KVFLASH_DRAFTER
+    // Token spans to pin (DFLASH_KVFLASH_PIN_SPANS="lo:hi,lo:hi" format).
+    // Empty when env is unset — no pins, byte-identical to prior behaviour.
+    std::vector<std::pair<int,int>> kvflash_pin_spans_;
     uint64_t                       kvflash_mask_epoch_ = (uint64_t)-1;
     int  kvflash_tokens_ = 0;                       // 0 = off
     int  kvflash_tau_    = 64;
     bool kvflash_drafter_failed_ = false;           // don't retry a failed load
     bool kvflash_active() const { return kvflash_tokens_ > 0; }
+    // Budget snapshot stashed by init() for post_kvflash_init_gate() subclasses.
+    KvFlashAutoBudget kvf_budget_{};
     // Pool sizing inputs — shared so MoE placement reserves exactly the pool
     // runtime allocates (else placement over-reserves KV and starves experts).
     bool kvflash_scorer_expected() const {
@@ -213,6 +222,10 @@ protected:
     // scorer is missing (lazy-loads the drafter on first need; also heals
     // after a residency release frees it). No-op without a path.
     void kvflash_ensure_scorer();
+    // Re-apply all configured pin spans to the pager.  Call after every
+    // pager rebuild (reset()+alloc_span or deserialize) so critical chunks
+    // survive the next eviction cycle. No-op when kvflash_pin_spans_ is empty.
+    void apply_kvflash_pins();
 
 private:
     // ── GPU backends ─────────────────────────────────────────────────
