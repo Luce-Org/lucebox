@@ -874,26 +874,16 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                     "(%d-token chunks, evicting)\n",
                     prompt_len, kvflash_pager_.chunk_tokens());
         std::fflush(stdout);
-        const int ct = kvflash_pager_.chunk_tokens();
-        std::vector<int32_t> chunk_argmax;
-        for (int start = 0; start < prompt_len; start += ct) {
-            const int n = std::min(ct, prompt_len - start);
-            if (!hybrid_forward_batch(req.prompt.data() + start, n, start,
-                                      act_cur, chunk_argmax,
-                                      /*capture_features=*/true)) {
-                result.error = "kvf_paged_prefill";
-                cleanup_graphs();
-                return result;
-            }
-            target_cache().cur_pos = start + n;
-            target_cache().last_tok = chunk_argmax.back();
+        if (!chunked_prefill(req.prompt.data(), 0, prompt_len, act_cur, committed)) {
+            result.error = "kvf_paged_prefill";
+            cleanup_graphs();
+            return result;
         }
         kvflash_history_.assign(req.prompt.begin(), req.prompt.end());
         kvflash_pager_.zero_free_blocks();
         kvflash_mask_epoch_ = (uint64_t)-1;
         // Re-apply pins (zero_free_blocks doesn't touch pinned_ but be explicit)
         apply_kvflash_pins();
-        committed = prompt_len;
     } else {
 
     // Embed all prompt tokens
@@ -1551,47 +1541,12 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
     std::vector<float> act_cur((size_t)hidden);
     if (prompt_len > snap_pos) {
         auto t_prefill_start = std::chrono::steady_clock::now();
-        if (snap_pooled && kvflash_active()) {
-            // Pooled restore: route residual [snap_pos, prompt_len) through the
-            // same chunked hybrid_forward_batch path used by generate_impl's
-            // kvf_paged branch.  alloc_span + slot_of happen inside the call so
-            // the page table is correctly populated for decode's slot_for().
-            const int ct = kvflash_pager_.chunk_tokens();
-            std::vector<int32_t> chunk_argmax;
-            for (int start = snap_pos; start < prompt_len; start += ct) {
-                const int n = std::min(ct, prompt_len - start);
-                if (!hybrid_forward_batch(req.prompt.data() + start, n, start,
-                                          act_cur, chunk_argmax,
-                                          /*capture_features=*/true)) {
-                    result.error = "prefill_delta";
-                    return result;
-                }
-                committed = start + n;
-                target_cache().cur_pos = committed;
-                target_cache().last_tok = chunk_argmax.back();
-            }
-        } else {
-            // Identity-mapped restore: use the same chunked hybrid_forward_batch
-            // path as the pooled branch.  alloc_span(snap_pos, n) maps the delta
-            // slots; [0, snap_pos) are already mapped by alloc_span(0, snap_pos)
-            // above.  Per-token hybrid_forward_one_token runs at ~50 tok/s for a
-            // ~1700-token delta (34 s); batched runs in <1 s.
-            const int ct = kvflash_active()
-                ? kvflash_pager_.chunk_tokens()
-                : std::min(128, prompt_len - snap_pos);
-            std::vector<int32_t> chunk_argmax;
-            for (int start = snap_pos; start < prompt_len; start += ct) {
-                const int n = std::min(ct, prompt_len - start);
-                if (!hybrid_forward_batch(req.prompt.data() + start, n, start,
-                                          act_cur, chunk_argmax,
-                                          /*capture_features=*/true)) {
-                    result.error = "prefill_delta";
-                    return result;
-                }
-                committed = start + n;
-                target_cache().cur_pos = committed;
-                target_cache().last_tok = chunk_argmax.back();
-            }
+        // Residual delta-prefill [snap_pos, prompt_len): batched (~1 s vs ~34 s
+        // per-token).  hybrid_forward_batch's alloc_span/slot_of populate the
+        // page table for decode; [0, snap_pos) is already mapped above.
+        if (!chunked_prefill(req.prompt.data(), snap_pos, prompt_len, act_cur, committed)) {
+            result.error = "prefill_delta";
+            return result;
         }
         result.prefill_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_prefill_start).count();
@@ -1759,6 +1714,29 @@ bool Qwen35MoeBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
             best = logits_buf[(size_t)j];
             argmax_out = j;
         }
+    }
+    return true;
+}
+
+// Chunked prefill of tokens[start, end) via hybrid_forward_batch slices.
+// Advances committed / cur_pos / last_tok. Returns false on forward failure
+// (caller owns result.error + any cleanup). Shared by generate_impl's
+// kvf_paged branch and restore_and_generate_impl's residual delta.
+bool Qwen35MoeBackend::chunked_prefill(const int32_t * tokens, int start_pos,
+                                       int end_pos, std::vector<float> & act_cur,
+                                       int & committed) {
+    const int ct = kvflash_active()
+        ? kvflash_pager_.chunk_tokens()
+        : std::min(128, end_pos - start_pos);
+    std::vector<int32_t> chunk_argmax;
+    for (int start = start_pos; start < end_pos; start += ct) {
+        const int n = std::min(ct, end_pos - start);
+        if (!hybrid_forward_batch(tokens + start, n, start, act_cur, chunk_argmax,
+                                  /*capture_features=*/true))
+            return false;
+        committed = start + n;
+        target_cache().cur_pos = committed;
+        target_cache().last_tok = chunk_argmax.back();
     }
     return true;
 }

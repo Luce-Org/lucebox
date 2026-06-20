@@ -456,7 +456,8 @@ public:
 
     // Snapshot all resident+paged-out chunks into a flat byte blob.
     // Layout: 8-byte magic, header fields (6×uint32), then for each logical
-    // chunk c in [0, n_chunks): chunk_bytes_ bytes in for_each_segment order.
+    // chunk c in [0, n_chunks): chunk_bytes_ bytes in fixed segment order
+    // (layer-major, K then V, head-minor) — matching copy_chunk.
     std::vector<uint8_t> serialize() const {
         static constexpr uint64_t kMagic = 0x4b56464c41534800ULL; // "KVFLASH\0"
         const int nc = (int)chunks_.size();
@@ -476,12 +477,21 @@ public:
             uint8_t * dst = out.data() + hdr + (size_t)c * chunk_bytes_;
             const ChunkState & st = chunks_[c];
             if (st.block >= 0) {
-                // Resident: gather from pool tensors.
+                // Resident: gather from pool tensors in fixed segment order
+                // (layer-major, K then V, head-minor) — matching copy_chunk.
                 uint8_t * q = dst;
-                for_each_segment(st.block, [&](ggml_tensor * t, size_t off, size_t seg) {
-                    ggml_backend_tensor_get(t, q, off, seg);
-                    q += seg;
-                });
+                for (size_t l = 0; l < attn_k_.size(); ++l) {
+                    for (int kv = 0; kv < 2; ++kv) {
+                        ggml_tensor * t = kv == 0 ? attn_k_[l] : attn_v_[l];
+                        const size_t seg = kv == 0 ? k_seg_bytes_ : v_seg_bytes_;
+                        for (int h = 0; h < n_head_kv_; ++h) {
+                            const size_t off = (size_t)st.block * cfg_.chunk_tokens * t->nb[1]
+                                             + (size_t)h * t->nb[2];
+                            ggml_backend_tensor_get(t, q, off, seg);
+                            q += seg;
+                        }
+                    }
+                }
             } else if (st.on_host) {
                 // Host-backed: copy verbatim. host_data is a raw pinned pointer
                 // under async DMA, a std::vector otherwise.
@@ -581,24 +591,6 @@ private:
             }
         }
         return victim >= 0 && page_out(victim);
-    }
-
-    // Walk every (tensor, head) segment for `block` in the fixed layout order
-    // (layer-major, K then V, head-minor). fn(tensor, byte_offset, seg_bytes).
-    // Used by serialize/deserialize (synchronous); copy_chunk has its own
-    // async-DMA path below.
-    template<typename Fn>
-    void for_each_segment(int block, Fn&& fn) const {
-        for (size_t l = 0; l < attn_k_.size(); ++l) {
-            for (int kv = 0; kv < 2; ++kv) {
-                ggml_tensor * t = kv == 0 ? attn_k_[l] : attn_v_[l];
-                const size_t seg = kv == 0 ? k_seg_bytes_ : v_seg_bytes_;
-                for (int h = 0; h < n_head_kv_; ++h) {
-                    const size_t off = (size_t)block * cfg_.chunk_tokens * t->nb[1] + (size_t)h * t->nb[2];
-                    fn(t, off, seg);
-                }
-            }
-        }
     }
 
     // Move one chunk between pool slots and host backing.
