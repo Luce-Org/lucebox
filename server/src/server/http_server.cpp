@@ -1569,28 +1569,45 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         int  effort_phase1_cap       = -1;  // from reasoning.effort lookup
         bool effort_set              = false;
 
+        auto apply_reasoning_effort = [&](const std::string & effort) {
+            if (effort == "none") {
+                enable_thinking = false;
+                return;
+            }
+
+            // Five-tier vocabulary (spec §4.2). Unknown → high.
+            int tier_value = config_.effort_tiers.high;
+            if      (effort == "minimal") tier_value = config_.effort_tiers.low;
+            else if (effort == "low")     tier_value = config_.effort_tiers.low;
+            else if (effort == "medium")  tier_value = config_.effort_tiers.medium;
+            else if (effort == "high")    tier_value = config_.effort_tiers.high;
+            else if (effort == "x-high")  tier_value = config_.effort_tiers.x_high;
+            else if (effort == "max")     tier_value = config_.effort_tiers.max;
+            // else: unknown tier → fall back to high (no error).
+
+            effort_phase1_cap = tier_value;
+            effort_set = true;
+            enable_thinking = true;
+            // Spec §4.2: reasoning effort activates the budget envelope.
+            req.thinking_opt_in = true;
+        };
+
         // OpenAI Responses API: "reasoning" field. Spec §4.2.
         if (body.contains("reasoning")) {
             auto & r = body["reasoning"];
             if (r.contains("effort")) {
-                std::string effort = r.value("effort", "high");
-                // Five-tier vocabulary (spec §4.2). Unknown → high.
-                int tier_value = config_.effort_tiers.high;
-                if      (effort == "low")    tier_value = config_.effort_tiers.low;
-                else if (effort == "medium") tier_value = config_.effort_tiers.medium;
-                else if (effort == "high")   tier_value = config_.effort_tiers.high;
-                else if (effort == "x-high") tier_value = config_.effort_tiers.x_high;
-                else if (effort == "max")    tier_value = config_.effort_tiers.max;
-                // else: unknown tier → fall back to high (no error).
-
-                effort_phase1_cap = tier_value;
-                effort_set = true;
-                enable_thinking = true;
-                // Spec §4.2: reasoning.effort activates the budget envelope.
-                req.thinking_opt_in = true;
+                apply_reasoning_effort(r.value("effort", "high"));
             } else {
                 enable_thinking = true;
             }
+        }
+        // OpenAI Chat Completions compatibility: some clients send a
+        // top-level reasoning_effort instead of Responses-style
+        // reasoning.effort. Treat it as the same tier selector unless the
+        // structured field already provided one.
+        if (!effort_set && body.contains("reasoning_effort") &&
+            body["reasoning_effort"].is_string()) {
+            apply_reasoning_effort(body["reasoning_effort"].get<std::string>());
         }
         // Anthropic-style: "thinking" field. Presence-as-opt-in: any
         // request that sends this field has opted in to the thinking-budget
