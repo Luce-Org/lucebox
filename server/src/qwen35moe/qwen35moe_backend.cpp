@@ -32,10 +32,45 @@ static uint64_t elapsed_us(HybridClock::time_point start, HybridClock::time_poin
     return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 }
 
+static bool hybrid_spec_profile_enabled() {
+    static const bool enabled = []() {
+        const char * v = std::getenv("DFLASH_QWEN35MOE_SPEC_PROFILE");
+        return v && std::atoi(v) != 0;
+    }();
+    return enabled;
+}
+
+static bool hybrid_spec_microbench_enabled() {
+    static const bool enabled = []() {
+        const char * v = std::getenv("DFLASH_QWEN35MOE_SPEC_MICROBENCH");
+        return v && std::atoi(v) != 0;
+    }();
+    return enabled;
+}
+
 } // namespace
+
+struct Qwen35MoeBackend::HybridSpecBatchProfile {
+    uint64_t total_us = 0;
+    uint64_t prefn_graph_build_us = 0;
+    uint64_t prefn_compute_us = 0;
+    uint64_t prefn_ssm_compute_us = 0;
+    uint64_t prefn_attn_compute_us = 0;
+    uint64_t position_build_us = 0;
+    uint64_t mask_build_us = 0;
+    uint64_t routing_readback_us = 0;
+    uint64_t moe_ffn_us = 0;
+    uint64_t feature_capture_us = 0;
+    uint64_t lm_head_graph_build_us = 0;
+    uint64_t lm_head_compute_us = 0;
+};
+
+struct Qwen35MoeBackend::HybridSpecGraphCache {};
 
 Qwen35MoeBackend::Qwen35MoeBackend(const Qwen35Config & cfg)
     : Qwen35Backend(cfg) {}
+
+Qwen35MoeBackend::~Qwen35MoeBackend() = default;
 
 bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights & out) {
     // Phase 1: Load core model (non-expert tensors) to GPU.
@@ -71,12 +106,13 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
         ? std::string("hotness:") + hotness_path
         : std::string("uniform");
 
-    // If all experts fit on GPU, reload with experts included
+    // If all experts fit on GPU, reload with experts included.
+    // Record the placement result so post_kvflash_init_gate() can disable
+    // the kvflash pool — moe_hybrid will be null on this path (no cold storage
+    // needed), so the gate cannot detect all-hot from the hybrid pointer alone.
     if (placement.total_hot >= out.n_layer * out.n_expert) {
         std::printf("[qwen35moe] all experts fit in VRAM, loading fully to GPU\n");
         std::fflush(stdout);
-        // Record the placement result so post_kvflash_init_gate() can disable
-        // the KVFlash pool (moe_hybrid is null on this all-hot path).
         placement_all_hot_ = true;
         free_target_weights(out);
         return load_target_gguf(cfg_.target_path, backend, out);
@@ -334,22 +370,41 @@ bool Qwen35MoeBackend::spark_bootstrap_finalize(const std::string & profile_path
 
 bool Qwen35MoeBackend::post_kvflash_init_gate() {
     // Gate: disable the KVFlash pool when dynamic placement confirmed all experts
-    // fit hot even with the FULL max_ctx KV reservation — the pool then reserves
-    // nothing useful (pure slot-map overhead).  placement_all_hot_full_kv_ is set
-    // in load_dynamic_placement().  When the pool is what KEEPS experts hot
-    // (placement_all_hot_ true but _full_kv_ false), we must NOT disable it.
+    // are hot (0 cold experts).  When all-hot, load_target_model takes the
+    // early-return path (load_target_gguf, no moe_hybrid), so moe_hybrid is null.
+    // The old byte-math fit check cannot fire on that path — it bails on
+    // !moe_hybrid.  Instead we use placement_all_hot_, set by load_target_model
+    // exactly when placement.total_hot >= n_layer * n_expert.
+    //
+    // Secondary path: if moe_hybrid IS set (partial cold), count actual cold
+    // experts.  If somehow 0 cold made it through (shouldn't happen, but be safe),
+    // also gate off.
     if (!kvflash_active()) return true;
 
     bool should_disable = false;
+
     if (placement_all_hot_full_kv_) {
+        // KVFlash genuinely redundant: all experts fit hot even with the FULL
+        // max_ctx KV reservation, so the pool reserves nothing useful — disable
+        // it (pool would be pure slot-map overhead).  NOTE: placement_all_hot_
+        // (without _full_kv_) can be true because the POOL freed the VRAM that
+        // kept experts hot — in that case we must KEEP kvflash, hence the check
+        // on _full_kv_ here, not placement_all_hot_.
         should_disable = true;
     } else if (target_weights().moe_hybrid) {
+        // Partial placement: count actual cold experts from the hybrid storage.
         int total_cold = 0;
         for (const auto & ls : target_weights().moe_hybrid->layers) {
             total_cold += (int)ls.cold_expert_ids.size();
         }
-        if (total_cold == 0) should_disable = true;  // hybrid built but 0 cold
+        if (total_cold == 0) {
+            // Hybrid storage built but no cold experts — pool not needed.
+            should_disable = true;
+        }
+        // else: genuine cold experts present → kvflash stays active.
     }
+    // else: moe_hybrid null AND placement_all_hot_ false → dense model (no MoE);
+    //       the base class gate is a no-op for dense, leave kvflash as-is.
 
     if (should_disable) {
         std::printf("[kvflash] disabled: placement all-hot at max_ctx %d, pool not needed\n",
@@ -358,6 +413,7 @@ bool Qwen35MoeBackend::post_kvflash_init_gate() {
         kvflash_tokens_ = 0;
         kvflash_tau_    = 64;
         kvflash_drafter_path_.clear();
+        kvflash_pin_spans_.clear();
     }
     return true;
 }
@@ -448,8 +504,15 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
 
     // Persistent logits graph (built once, reused per token).
     // Precision policy (#310): keep the rms-norm input and out_norm in f32.
+    // GPU argmax: for temp==0 greedy path, argmax is computed on GPU so only
+    // 4 bytes (token id) are read back instead of the full ~150K-float vocab.
+    // Escape hatch: DFLASH_GPU_ARGMAX=0 disables and falls back to full D2H.
+    static const bool kGpuArgmaxMoe = []() {
+        const char * v = std::getenv("DFLASH_GPU_ARGMAX");
+        return v == nullptr || v[0] != '0';
+    }();
     StepGraph logits_sg;
-    auto project_logits = [&]() -> bool {
+    auto project_logits = [&](bool need_full_logits) -> bool {
         if (!logits_sg.ctx) {
             ggml_init_params ip{};
             ip.mem_size = 64 * 1024 * 1024;
@@ -469,6 +532,11 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
             logits_sg.logits = ggml_mul_mat(logits_sg.ctx, target_weights().output, normed);
             ggml_set_output(logits_sg.logits);
             ggml_build_forward_expand(logits_sg.gf, logits_sg.logits);
+            // GPU-side argmax: reduces vocab→1 int32 on GPU, avoids 150K-float D2H.
+            logits_sg.argmax_tokens = ggml_argmax(logits_sg.ctx, logits_sg.logits);
+            ggml_set_name(logits_sg.argmax_tokens, "moe_ar_argmax");
+            ggml_set_output(logits_sg.argmax_tokens);
+            ggml_build_forward_expand(logits_sg.gf, logits_sg.argmax_tokens);
             logits_sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(target_backend()));
             if (!ggml_gallocr_alloc_graph(logits_sg.alloc, logits_sg.gf)) {
                 step_graph_destroy(logits_sg);
@@ -480,7 +548,9 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
                                        pipe_state_->gpu_state.act_cur, logits_sg.hidden_input);
         auto st = ggml_backend_graph_compute(target_backend(), logits_sg.gf);
         if (st != GGML_STATUS_SUCCESS) return false;
-        ggml_backend_tensor_get(logits_sg.logits, logits_buf.data(), 0, sizeof(float) * (size_t)vocab);
+        if (need_full_logits) {
+            ggml_backend_tensor_get(logits_sg.logits, logits_buf.data(), 0, sizeof(float) * (size_t)vocab);
+        }
         return true;
     };
 
@@ -488,9 +558,17 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
     {
         int32_t first_tok;
         if (sampler_config().temp > 0) {
-            if (!prefill_logits_valid()) return false;
-            ggml_backend_tensor_get(target_step_graph().logits, logits_buf.data(),
-                                    prefill_logits_offset(), sizeof(float) * (size_t)vocab);
+            // MoE restore path: pipe_state_ holds valid act_cur on GPU from the last
+            // forward (delta prefill or exact-hit priming). Use project_logits to sample.
+            // Dense path (pipe_state_ == nullptr): fall back to dense step-graph logits.
+            if (pipe_state_) {
+                if (!project_logits(/*need_full_logits=*/true)) return false;
+            } else if (prefill_logits_valid()) {
+                ggml_backend_tensor_get(target_step_graph().logits, logits_buf.data(),
+                                        prefill_logits_offset(), sizeof(float) * (size_t)vocab);
+            } else {
+                return false;
+            }
             first_tok = sample_logits(logits_buf.data(), vocab, sampler_config(),
                                      out_tokens, sampler_rng_engine());
         } else {
@@ -541,18 +619,28 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
         }
         const auto layers_done = DecodeClock::now();
 
-        // act_cur stays on GPU — project_logits reads it via GPU→GPU copy
-        if (!project_logits()) {
+        // act_cur stays on GPU — project_logits reads it via GPU→GPU copy.
+        // For greedy/temp==0, pass need_full_logits=false: full D2H is skipped,
+        // only the 4-byte GPU argmax result is read back below.
+        const bool need_full = sampler_config().needs_logit_processing();
+        if (!project_logits(need_full)) {
             step_graph_destroy(logits_sg);
             return false;
         }
         const auto logits_done = DecodeClock::now();
 
         int32_t next_tok;
-        if (sampler_config().temp > 0) {
+        if (need_full) {
             next_tok = sample_logits(logits_buf.data(), vocab, sampler_config(),
                                     out_tokens, sampler_rng_engine());
+        } else if (kGpuArgmaxMoe && logits_sg.argmax_tokens) {
+            // GPU argmax: read 4 bytes instead of ~600 KB vocab logits D2H.
+            int32_t tok_i = 0;
+            ggml_backend_tensor_get(logits_sg.argmax_tokens, &tok_i, 0, sizeof(int32_t));
+            next_tok = tok_i;
         } else {
+            // Fallback: full D2H + CPU argmax (should not reach with GPU argmax enabled).
+            ggml_backend_tensor_get(logits_sg.logits, logits_buf.data(), 0, sizeof(float) * (size_t)vocab);
             next_tok = 0;
             float best = logits_buf[0];
             for (int j = 1; j < vocab; ++j) {
@@ -770,18 +858,43 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
     const int prompt_len = (int)req.prompt.size();
     const int prefill_chunk = std::min(128, prompt_len); // batch size per GPU compute
 
-    // kvflash: hybrid prefill writes rows identity-mapped, so the prompt must
-    // fit the pool with one chunk of decode headroom (same contract as the
-    // base do_prefill).
-    if (kvflash_active() &&
-        prompt_len > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
-        std::fprintf(stderr,
-            "[kvflash] hybrid prompt (%d) exceeds pool %d; raise --kvflash "
-            "or enable pflash compression\n", prompt_len, kvflash_tokens_);
-        result.error = "kvflash: prompt exceeds resident pool";
-        cleanup_graphs();
-        return result;
-    }
+    // kvflash: if the prompt fits the pool, prefill is identity-mapped (normal).
+    // If it exceeds the pool, switch to pooled chunked prefill: loop
+    // hybrid_forward_batch over chunk_tokens-sized slices with live eviction.
+    // Restore + pooled prefill is refused (same contract as the dense do_prefill).
+    int committed = 0;
+    const bool kvf_paged = kvflash_active() &&
+        prompt_len > kvflash_tokens_ - kvflash_pager_.chunk_tokens();
+    if (kvf_paged) {
+        kvflash_pager_.reset();
+        // Apply pins BEFORE the eviction loop so pinned chunks survive
+        // paging from the very first chunk allocation.
+        apply_kvflash_pins();
+        std::printf("[kvflash] hybrid pooled prefill: %d tokens "
+                    "(%d-token chunks, evicting)\n",
+                    prompt_len, kvflash_pager_.chunk_tokens());
+        std::fflush(stdout);
+        const int ct = kvflash_pager_.chunk_tokens();
+        std::vector<int32_t> chunk_argmax;
+        for (int start = 0; start < prompt_len; start += ct) {
+            const int n = std::min(ct, prompt_len - start);
+            if (!hybrid_forward_batch(req.prompt.data() + start, n, start,
+                                      act_cur, chunk_argmax,
+                                      /*capture_features=*/true)) {
+                result.error = "kvf_paged_prefill";
+                cleanup_graphs();
+                return result;
+            }
+            target_cache().cur_pos = start + n;
+            target_cache().last_tok = chunk_argmax.back();
+        }
+        kvflash_history_.assign(req.prompt.begin(), req.prompt.end());
+        kvflash_pager_.zero_free_blocks();
+        kvflash_mask_epoch_ = (uint64_t)-1;
+        // Re-apply pins (zero_free_blocks doesn't touch pinned_ but be explicit)
+        apply_kvflash_pins();
+        committed = prompt_len;
+    } else {
 
     // Embed all prompt tokens
     const int n_expert_used = target_weights().n_expert_used;
@@ -830,11 +943,13 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             // Set positions if attention layer
             if (prefill_sg.positions) {
                 std::vector<int32_t> pos_data((size_t)chunk_len * 4);
+                // planar layout: pos[i2], pos[i2+ne2], pos[i2+ne2*2], pos[i2+ne2*3]
                 for (int i = 0; i < chunk_len; ++i) {
-                    pos_data[(size_t)i * 4 + 0] = chunk_start + i;
-                    pos_data[(size_t)i * 4 + 1] = chunk_start + i;
-                    pos_data[(size_t)i * 4 + 2] = chunk_start + i;
-                    pos_data[(size_t)i * 4 + 3] = 0;
+                    const int pos = chunk_start + i;
+                    pos_data[(size_t)0 * chunk_len + i] = pos;
+                    pos_data[(size_t)1 * chunk_len + i] = pos;
+                    pos_data[(size_t)2 * chunk_len + i] = pos;
+                    pos_data[(size_t)3 * chunk_len + i] = 0;
                 }
                 ggml_backend_tensor_set(prefill_sg.positions, pos_data.data(), 0, sizeof(int32_t) * pos_data.size());
             }
@@ -1029,11 +1144,12 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
     std::memcpy(act_cur.data(), embed_all.data() + (size_t)(prompt_len - 1) * (size_t)hidden,
                 sizeof(float) * (size_t)hidden);
 
-    int committed = prompt_len;
+    committed = prompt_len;
     target_cache().cur_pos = committed;
     if (kvflash_active()) {
         kvflash_sync_prefill(committed, req.prompt, /*kv_offset=*/0);
     }
+    } // end else (non-paged prefill)
     auto t_prefill_end = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_prefill_end - t_prefill_start).count();
 
@@ -1358,15 +1474,21 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
         return result;
     }
 
+    // Only the delta case (prompt_len > snap_pos) is served by the fast restore
+    // path: the residual prefill below replays the new tokens and leaves valid
+    // first-token logits at the correct position for any temperature. When there
+    // is no delta (prompt_len <= snap_pos: an exact-hit turn that adds no tokens,
+    // or a snapshot longer than the prompt) the snapshot carries no first-token
+    // logits, and priming by re-forwarding would double-advance the DeltaNet
+    // recurrent state (off-by-one corruption). These cases are rare; serve them
+    // with a correct full generate instead.
+    if ((int)req.prompt.size() <= snapshot_cur_pos(slot)) {
+        return generate_impl(req, io);
+    }
+
     sampler_config() = req.sampler;
     if (req.do_sample && sampler_config().seed != 0) {
         sampler_rng_engine().seed(sampler_config().seed);
-    }
-
-    if (req.n_gen > 0 && sampler_config().temp > 0) {
-        std::fprintf(stderr,
-                     "[qwen35moe] hybrid snapshot restore falls back to full generate for temp sampling\n");
-        return generate_impl(req, io);
     }
 
     pipe_state_.reset();
@@ -1381,6 +1503,7 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
         return result;
     }
 
+    const bool snap_pooled = snapshot_is_pooled(slot);
     const int snap_pos = snapshot_cur_pos(slot);
     int committed = snap_pos;
     target_cache().cur_pos = committed;
@@ -1392,60 +1515,108 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
         return result;
     }
 
-    // kvflash: the restored prefix + delta prefill land identity-mapped, so
-    // the full prompt must fit the pool (snapshots past the pool are never
-    // saved, but the delta can still overflow it).
-    if (kvflash_active() &&
-        prompt_len > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
-        std::fprintf(stderr,
-            "[kvflash] hybrid restore prompt (%d) exceeds pool %d; raise "
-            "--kvflash\n", prompt_len, kvflash_tokens_);
-        result.error = "kvflash: prompt exceeds resident pool";
-        out_io.emit(-1);
-        return result;
-    }
-
-    // kvflash: the delta prefill below runs the maskless pipelined forward
-    // over the padded pool span; map the restored prefix identity-style and
-    // zero stale free slots BEFORE any forward reads them.
     if (kvflash_active()) {
-        kvflash_pager_.reset();
-        if (!kvflash_pager_.alloc_span(0, snap_pos)) {
-            result.error = "kvflash_slot";
-            out_io.emit(-1);
-            return result;
+        if (snap_pooled) {
+            // Pooled restore: deserialize rebuilds the full page table (page-in
+            // on demand via slot_for); no reset()+alloc_span needed.
+            const auto & blob = snapshot_kvflash_blob(slot);
+            if (!kvflash_pager_.deserialize(blob.data(), blob.size())) {
+                result.error = "kvflash: pager deserialize failed";
+                out_io.emit(-1);
+                return result;
+            }
+            apply_kvflash_pins();
+        } else {
+            // Identity-mapped restore: the prefix fits the pool contiguously.
+            if (prompt_len > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
+                std::fprintf(stderr,
+                    "[kvflash] hybrid restore prompt (%d) exceeds pool %d; raise "
+                    "--kvflash\n", prompt_len, kvflash_tokens_);
+                result.error = "kvflash: prompt exceeds resident pool";
+                out_io.emit(-1);
+                return result;
+            }
+            kvflash_pager_.reset();
+            if (!kvflash_pager_.alloc_span(0, snap_pos)) {
+                result.error = "kvflash_slot";
+                out_io.emit(-1);
+                return result;
+            }
+            kvflash_pager_.zero_free_blocks();
+            apply_kvflash_pins();
         }
-        kvflash_pager_.zero_free_blocks();
     }
 
     const int hidden = target_weights().n_embd;
     std::vector<float> act_cur((size_t)hidden);
     if (prompt_len > snap_pos) {
         auto t_prefill_start = std::chrono::steady_clock::now();
-        for (int i = snap_pos; i < prompt_len; ++i) {
-            int32_t argmax = -1;
-            if (!hybrid_forward_one_token(req.prompt[(size_t)i], committed,
-                                          act_cur, argmax)) {
-                result.error = "prefill_delta";
-                return result;
+        if (snap_pooled && kvflash_active()) {
+            // Pooled restore: route residual [snap_pos, prompt_len) through the
+            // same chunked hybrid_forward_batch path used by generate_impl's
+            // kvf_paged branch.  alloc_span + slot_of happen inside the call so
+            // the page table is correctly populated for decode's slot_for().
+            const int ct = kvflash_pager_.chunk_tokens();
+            std::vector<int32_t> chunk_argmax;
+            for (int start = snap_pos; start < prompt_len; start += ct) {
+                const int n = std::min(ct, prompt_len - start);
+                if (!hybrid_forward_batch(req.prompt.data() + start, n, start,
+                                          act_cur, chunk_argmax,
+                                          /*capture_features=*/true)) {
+                    result.error = "prefill_delta";
+                    return result;
+                }
+                committed = start + n;
+                target_cache().cur_pos = committed;
+                target_cache().last_tok = chunk_argmax.back();
             }
-            committed++;
-            target_cache().cur_pos = committed;
-            target_cache().last_tok = argmax;
+        } else {
+            // Identity-mapped restore: use the same chunked hybrid_forward_batch
+            // path as the pooled branch.  alloc_span(snap_pos, n) maps the delta
+            // slots; [0, snap_pos) are already mapped by alloc_span(0, snap_pos)
+            // above.  Per-token hybrid_forward_one_token runs at ~50 tok/s for a
+            // ~1700-token delta (34 s); batched runs in <1 s.
+            const int ct = kvflash_active()
+                ? kvflash_pager_.chunk_tokens()
+                : std::min(128, prompt_len - snap_pos);
+            std::vector<int32_t> chunk_argmax;
+            for (int start = snap_pos; start < prompt_len; start += ct) {
+                const int n = std::min(ct, prompt_len - start);
+                if (!hybrid_forward_batch(req.prompt.data() + start, n, start,
+                                          act_cur, chunk_argmax,
+                                          /*capture_features=*/true)) {
+                    result.error = "prefill_delta";
+                    return result;
+                }
+                committed = start + n;
+                target_cache().cur_pos = committed;
+                target_cache().last_tok = chunk_argmax.back();
+            }
         }
         result.prefill_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_prefill_start).count();
     }
 
-    if (kvflash_active()) {
+    if (kvflash_active() && !snap_pooled) {
         // Rebuild the pager mapping over the identity-mapped [0, committed).
-        // With the full prompt available the history carries real ids;
-        // restore-only generates keep an unknown-prefix history.
+        // Pooled restore: pager state already correct from deserialize; sync
+        // would reset() and clobber the page table, so skip it.
         if (prompt_len == committed) {
             kvflash_sync_prefill(committed, req.prompt, /*kv_offset=*/0);
         } else {
             kvflash_sync_prefill(committed, {}, /*kv_offset=*/committed);
         }
+    }
+
+    // Re-sync the draft feature mirror so spec-decode after restore sees valid features.
+    // Mirrors what generate_impl does before entering the spec-decode branch.
+    if (!is_draft_parked() && feature_mirror().target_feat && target_cache().target_feat) {
+        const int ring_cap = feature_mirror().cap;
+        const int n = std::min(committed, ring_cap);
+        const int start = std::max(0, committed - n);
+        draft_feature_mirror_sync_range(target_cache().target_feat,
+                                        target_cache().target_feat_cap,
+                                        feature_mirror(), start, n);
     }
 
     if (req.n_gen > 0) {
@@ -1455,9 +1626,35 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
             return generate_impl(req, io);
         }
         auto t_decode_start = std::chrono::steady_clock::now();
-        if (!run_pipelined_decode_path(committed, req.n_gen, result.tokens, out_io)) {
-            result.error = "decode";
-            return result;
+
+        // Note: the no-delta (prompt_len == snap_pos) case is handled by the
+        // early full-generate fallback above, so here prompt_len > snap_pos and
+        // the residual prefill loop has left pipe_state_ valid + act_cur populated
+        // from the last delta token — correct first-token logits for any temp.
+
+        // Dispatch: spec-decode for temp==0 + draft, AR pipelined otherwise.
+        // Mirrors generate_impl's can_hybrid_spec condition exactly.
+        const bool can_hybrid_spec = !req.force_ar_decode
+            && cfg_.draft_path
+            && !is_draft_parked()
+            && feature_mirror().target_feat
+            && sampler_config().temp == 0.0f
+            && draft_weights().block_size > 0;
+
+        if (can_hybrid_spec) {
+            result.spec_decode_ran = true;
+            // last_tok is already set from snapshot (or delta loop); do_hybrid_spec_decode
+            // uses it as the anchor for drafting. No compute_logits() call needed.
+            if (!do_hybrid_spec_decode(committed, req.n_gen, result.tokens, out_io,
+                                       &result.accept_rate)) {
+                result.error = "hybrid_spec_decode";
+                return result;
+            }
+        } else {
+            if (!run_pipelined_decode_path(committed, req.n_gen, result.tokens, out_io)) {
+                result.error = "decode";
+                return result;
+            }
         }
         result.decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_decode_start).count();
@@ -1581,6 +1778,8 @@ bool Qwen35MoeBackend::hybrid_forward_batch(
     const int hidden = target_weights().n_embd;
     const int n_layer = target_weights().n_layer;
     const int n_expert_used = target_weights().n_expert_used;
+    HybridSpecBatchProfile prof{};
+    const auto batch_t0 = HybridClock::now();
 
     // Embed all tokens
     std::vector<float> embed_all((size_t)n_tokens * (size_t)hidden);
@@ -1619,15 +1818,21 @@ bool Qwen35MoeBackend::hybrid_forward_batch(
     ggml_gallocr_t ffn_hot_alloc = nullptr;
 
     MoeHybridConfig chunk_cfg = make_moe_hybrid_config(target_weights());
+    std::vector<float> chunk_residuals((size_t)n_tokens * (size_t)hidden);
+    std::vector<float> chunk_post((size_t)n_tokens * (size_t)hidden);
+    std::vector<int32_t> chunk_selected((size_t)n_tokens * (size_t)n_expert_used);
+    std::vector<float> chunk_weights((size_t)n_tokens * (size_t)n_expert_used);
 
     for (int il = 0; il < n_layer; ++il) {
         auto & storage = target_weights().moe_hybrid->layers[(size_t)il];
+        const bool is_attn = (((il + 1) % target_weights().full_attention_interval) == 0);
 
         const bool with_mask = kvf ||
             (cfg_.kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
 
         // Build pre-FFN graph (DeltaNet/attention + router) for all tokens
         step_graph_free(prefn_sg);
+        const auto prefn_build_t0 = HybridClock::now();
         if (!build_layer_prefn_step(prefn_sg, target_weights(), target_cache(), target_backend(),
                                     il, /*kv_start=*/base_pos, n_tokens,
                                     with_mask, /*fa_window=*/0, cfg_.kq_stride_pad,
@@ -1636,6 +1841,7 @@ bool Qwen35MoeBackend::hybrid_forward_batch(
             if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
             return false;
         }
+        prof.prefn_graph_build_us += elapsed_us(prefn_build_t0, HybridClock::now());
         if (prefn_sg.kv_write_rows) {
             ggml_backend_tensor_set(prefn_sg.kv_write_rows, kvf_rows.data(), 0,
                                     sizeof(int64_t) * kvf_rows.size());
@@ -1647,19 +1853,24 @@ bool Qwen35MoeBackend::hybrid_forward_batch(
 
         // Set positions for attention layers
         if (prefn_sg.positions) {
+            const auto pos_t0 = HybridClock::now();
             std::vector<int32_t> pos_data((size_t)n_tokens * 4);
+            // planar layout: pos[i2], pos[i2+ne2], pos[i2+ne2*2], pos[i2+ne2*3]
             for (int i = 0; i < n_tokens; ++i) {
-                pos_data[(size_t)i * 4 + 0] = base_pos + i;
-                pos_data[(size_t)i * 4 + 1] = base_pos + i;
-                pos_data[(size_t)i * 4 + 2] = base_pos + i;
-                pos_data[(size_t)i * 4 + 3] = 0;
+                const int pos = base_pos + i;
+                pos_data[(size_t)0 * n_tokens + i] = pos;
+                pos_data[(size_t)1 * n_tokens + i] = pos;
+                pos_data[(size_t)2 * n_tokens + i] = pos;
+                pos_data[(size_t)3 * n_tokens + i] = 0;
             }
             ggml_backend_tensor_set(prefn_sg.positions, pos_data.data(), 0,
                                     sizeof(int32_t) * pos_data.size());
+            prof.position_build_us += elapsed_us(pos_t0, HybridClock::now());
         }
 
         // Set causal mask
         if (prefn_sg.attn_mask && kvf) {
+            const auto mask_t0 = HybridClock::now();
             // Slot-space mask (verify_batch recipe): committed resident
             // positions (< base_pos) plus this block's own slots, causal.
             // Built once, reused for every layer's graph.
@@ -1688,7 +1899,9 @@ bool Qwen35MoeBackend::hybrid_forward_batch(
             }
             ggml_backend_tensor_set(prefn_sg.attn_mask, kvf_mask.data(), 0,
                                     sizeof(uint16_t) * kvf_mask.size());
+            prof.mask_build_us += elapsed_us(mask_t0, HybridClock::now());
         } else if (prefn_sg.attn_mask) {
+            const auto mask_t0 = HybridClock::now();
             const int kv_len = base_pos + n_tokens;
             const int kv_pad_override = (int)prefn_sg.attn_mask->ne[0];
             std::vector<uint16_t> mask_buf;
@@ -1696,22 +1909,24 @@ bool Qwen35MoeBackend::hybrid_forward_batch(
                               cfg_.kq_stride_pad, /*win_start=*/0, kv_pad_override);
             ggml_backend_tensor_set(prefn_sg.attn_mask, mask_buf.data(), 0,
                                     sizeof(uint16_t) * mask_buf.size());
+            prof.mask_build_us += elapsed_us(mask_t0, HybridClock::now());
         }
 
         // Compute pre-FFN (DeltaNet + router for all tokens in one dispatch)
+        const auto prefn_compute_t0 = HybridClock::now();
         auto st = ggml_backend_graph_compute(target_backend(), prefn_sg.gf);
         if (st != GGML_STATUS_SUCCESS) {
             step_graph_destroy(prefn_sg);
             if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
             return false;
         }
+        const uint64_t prefn_compute_us = elapsed_us(prefn_compute_t0, HybridClock::now());
+        prof.prefn_compute_us += prefn_compute_us;
+        if (is_attn) prof.prefn_attn_compute_us += prefn_compute_us;
+        else prof.prefn_ssm_compute_us += prefn_compute_us;
 
         // Readback results
-        std::vector<float> chunk_residuals((size_t)n_tokens * (size_t)hidden);
-        std::vector<float> chunk_post((size_t)n_tokens * (size_t)hidden);
-        std::vector<int32_t> chunk_selected((size_t)n_tokens * (size_t)n_expert_used);
-        std::vector<float> chunk_weights((size_t)n_tokens * (size_t)n_expert_used);
-
+        const auto routing_t0 = HybridClock::now();
         ggml_backend_tensor_get(prefn_sg.ffn_residual, chunk_residuals.data(), 0,
                                 sizeof(float) * chunk_residuals.size());
         ggml_backend_tensor_get(prefn_sg.ffn_post, chunk_post.data(), 0,
@@ -1728,11 +1943,13 @@ bool Qwen35MoeBackend::hybrid_forward_batch(
                                 sizeof(int32_t) * chunk_selected.size());
         ggml_backend_tensor_get(prefn_sg.moe_weights, chunk_weights.data(), 0,
                                 sizeof(float) * chunk_weights.size());
+        prof.routing_readback_us += elapsed_us(routing_t0, HybridClock::now());
 
         // MoE FFN — batched
         MoeLayerDesc chunk_desc = make_moe_layer_desc(target_weights().layers[(size_t)il]);
         std::vector<float> ffn_batch_out;
         bool ffn_ok = false;
+        const auto moe_t0 = HybridClock::now();
 
         // Spark expert cache: pull the verify batch's selected cold experts into
         // spare GPU slots (LRU) so the batched FFN serves them on-die — the SAME
@@ -1782,6 +1999,7 @@ bool Qwen35MoeBackend::hybrid_forward_batch(
                             single_out.data(), sizeof(float) * (size_t)hidden);
             }
         }
+        prof.moe_ffn_us += elapsed_us(moe_t0, HybridClock::now());
 
         // Combine FFN + residual → embed_all for next layer
         for (int i = 0; i < n_tokens; ++i) {
@@ -1794,6 +2012,7 @@ bool Qwen35MoeBackend::hybrid_forward_batch(
 
             // Feature capture at capture layers
             if (capture_features && target_cache().target_feat && cfg_.draft_path) {
+                const auto feat_t0 = HybridClock::now();
                 int capture_idx = -1;
                 for (int k = 0; k < target_weights().n_capture_layers; k++) {
                     if (target_weights().capture_layer_ids[k] == il) {
@@ -1814,6 +2033,7 @@ bool Qwen35MoeBackend::hybrid_forward_batch(
                     ggml_backend_tensor_set(target_cache().target_feat, bf16_tmp.data(),
                                             offset, (size_t)hidden * elt);
                 }
+                prof.feature_capture_us += elapsed_us(feat_t0, HybridClock::now());
             }
         }
     }
@@ -1830,11 +2050,14 @@ bool Qwen35MoeBackend::hybrid_forward_batch(
     // replay forwards (vocab ~152k x n_tokens x 4B, twice per spec step).
     argmax_out.resize(n_tokens);
     StepGraph proj_sg;
+    const auto lm_build_t0 = HybridClock::now();
     if (!build_lm_head_projection_step(proj_sg, target_weights(), target_backend(), n_tokens)) {
         return false;
     }
+    prof.lm_head_graph_build_us += elapsed_us(lm_build_t0, HybridClock::now());
     ggml_backend_tensor_set(proj_sg.hidden_input, embed_all.data(), 0,
                             sizeof(float) * (size_t)n_tokens * (size_t)hidden);
+    const auto lm_compute_t0 = HybridClock::now();
     auto proj_st = ggml_backend_graph_compute(target_backend(), proj_sg.gf);
     if (proj_st != GGML_STATUS_SUCCESS) {
         step_graph_destroy(proj_sg);
@@ -1842,7 +2065,31 @@ bool Qwen35MoeBackend::hybrid_forward_batch(
     }
     ggml_backend_tensor_get(proj_sg.argmax_tokens, argmax_out.data(), 0,
                             sizeof(int32_t) * (size_t)n_tokens);
+    prof.lm_head_compute_us += elapsed_us(lm_compute_t0, HybridClock::now());
     step_graph_destroy(proj_sg);
+    prof.total_us = elapsed_us(batch_t0, HybridClock::now());
+
+    if (hybrid_spec_profile_enabled()) {
+        std::fprintf(stderr,
+                     "[hybrid-spec-prof][batch] n_tokens=%d total=%.3fms prefn_build=%.3fms "
+                     "prefn_compute=%.3fms ssm_prefn=%.3fms attn_prefn=%.3fms "
+                     "positions=%.3fms masks=%.3fms routing_readback=%.3fms "
+                     "moe_ffn=%.3fms feature_capture=%.3fms lm_head_build=%.3fms "
+                     "lm_head_compute=%.3fms\n",
+                     n_tokens,
+                     prof.total_us / 1000.0,
+                     prof.prefn_graph_build_us / 1000.0,
+                     prof.prefn_compute_us / 1000.0,
+                     prof.prefn_ssm_compute_us / 1000.0,
+                     prof.prefn_attn_compute_us / 1000.0,
+                     prof.position_build_us / 1000.0,
+                     prof.mask_build_us / 1000.0,
+                     prof.routing_readback_us / 1000.0,
+                     prof.moe_ffn_us / 1000.0,
+                     prof.feature_capture_us / 1000.0,
+                     prof.lm_head_graph_build_us / 1000.0,
+                     prof.lm_head_compute_us / 1000.0);
+    }
     return true;
 }
 
@@ -1984,18 +2231,28 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         }
         draft_tok[0] = last_tok;
 
-        // 4. Verify: snapshot recurrent state, then run ALL draft tokens batched
+        // 4. Verify: snapshot recurrent state, then run draft tokens via pipelined AR path.
+        // Sequential single-token pipelined forward (~0.9ms/tok) vs batched hybrid (~4.5ms/tok).
+        // Feature capture suppressed during verify (positions would overwrite valid prefill cache).
         snapshot_ssm_state(target_cache());
 
         target_tok.resize(verify_width);
-        bool verify_ok = hybrid_forward_batch(
-            draft_tok.data(), verify_width, committed,
-            act_cur, target_tok, /*capture_features=*/false);
-        if (!verify_ok) {
-            std::fprintf(stderr, "[hybrid-spec] verify failed\n");
-            restore_ssm_state(target_cache());
-            step_graph_destroy(draft_sg);
-            return false;
+        {
+            ggml_tensor * saved_feat = target_cache().target_feat;
+            target_cache().target_feat = nullptr;  // suppress feature capture during verify
+            bool verify_ok = true;
+            for (int i = 0; i < verify_width && verify_ok; i++) {
+                int32_t argmax;
+                verify_ok = hybrid_forward_one_token(draft_tok[i], committed + i, act_cur, argmax);
+                if (verify_ok) target_tok[i] = argmax;
+            }
+            target_cache().target_feat = saved_feat;
+            if (!verify_ok) {
+                std::fprintf(stderr, "[hybrid-spec] verify failed\n");
+                restore_ssm_state(target_cache());
+                step_graph_destroy(draft_sg);
+                return false;
+            }
         }
 
         // 5. Acceptance: longest matching prefix
@@ -2012,7 +2269,9 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
             if (commit_n <= accept_n) bonus_tok = -1;
         }
 
-        // 6. Restore and replay accepted tokens
+        // 6. Restore SSM state and replay accepted tokens via pipelined path.
+        // Replay overwrites KV at committed..committed+commit_n-1 with correct values
+        // and captures features for the next draft step.
         restore_ssm_state(target_cache());
 
         std::vector<int32_t> replay_tok((size_t)commit_n);
@@ -2020,15 +2279,17 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
             replay_tok[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
         }
 
-        // Replay tokens through batched hybrid forward (captures features for next draft step)
-        std::vector<int32_t> replay_argmax;
-        if (!hybrid_forward_batch(replay_tok.data(), commit_n, committed,
-                                  act_cur, replay_argmax, /*capture_features=*/true)) {
-            std::fprintf(stderr, "[hybrid-spec] replay failed\n");
-            step_graph_destroy(draft_sg);
-            return false;
+        {
+            int32_t last_argmax = last_tok;
+            for (int i = 0; i < commit_n; i++) {
+                if (!hybrid_forward_one_token(replay_tok[i], committed + i, act_cur, last_argmax)) {
+                    std::fprintf(stderr, "[hybrid-spec] replay failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+            }
+            last_tok = last_argmax;
         }
-        last_tok = replay_argmax[commit_n - 1];
 
         // 7. Sync features to mirror for next draft step
         if (feature_mirror().target_feat && target_cache().target_feat) {

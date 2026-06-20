@@ -1421,7 +1421,9 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
 bool snapshot_target_cache(const TargetWeights & w,
                            const TargetCache & cache,
                            ggml_backend_t backend,
-                           PrefixSnapshot & snap) {
+                           PrefixSnapshot & snap,
+                           bool skip_kv,
+                           const std::vector<uint8_t> * kvflash_blob) {
     const int n_full_attn = w.n_layer / w.full_attention_interval; // 16
     const int n_delta     = w.n_layer - n_full_attn;               // 48
     const int snap_pos    = cache.cur_pos;
@@ -1434,11 +1436,14 @@ bool snapshot_target_cache(const TargetWeights & w,
     // Reuse existing buffer if shapes match (same cur_pos); otherwise reallocate.
     // Right-sized KV tensors use [head_dim, cur_pos, n_head_kv] — orders of
     // magnitude smaller than [head_dim, max_ctx, n_head_kv] for short prefixes.
+    // skip_kv: pooled path — KV lives in the pager blob; omit attn_k/v tensors.
     const bool needs_alloc = (snap.ctx == nullptr) || (snap.cur_pos != snap_pos);
     if (needs_alloc) {
         free_prefix_snapshot(snap);
 
-        const int total_tensors = 2 * n_full_attn + 2 * n_delta + 1; // 65
+        const int kv_tensors   = skip_kv ? 0 : 2 * n_full_attn;
+        const bool has_blob    = (kvflash_blob != nullptr && !kvflash_blob->empty());
+        const int total_tensors = kv_tensors + 2 * n_delta + 1 + (has_blob ? 1 : 0);
         ggml_init_params ip{};
         ip.mem_size   = (size_t)(total_tensors + 16) * ggml_tensor_overhead();
         ip.mem_buffer = nullptr;
@@ -1446,23 +1451,25 @@ bool snapshot_target_cache(const TargetWeights & w,
         snap.ctx = ggml_init(ip);
         if (!snap.ctx) { set_last_error("PrefixSnapshot ggml_init failed"); return false; }
 
-        snap.attn_k_snap.assign(n_full_attn, nullptr);
-        snap.attn_v_snap.assign(n_full_attn, nullptr);
         snap.ssm_state_snap.assign(n_delta, nullptr);
         snap.conv_state_snap.assign(n_delta, nullptr);
 
-        // Right-sized KV: [head_dim, snap_pos, n_head_kv]
-        for (int i = 0; i < n_full_attn; i++) {
-            ggml_tensor * sk = cache.attn_k[i];
-            ggml_tensor * sv = cache.attn_v[i];
-            if (!sk || !sv) continue;
-            ggml_tensor * K = ggml_new_tensor_3d(snap.ctx, sk->type, sk->ne[0], snap_pos, sk->ne[2]);
-            ggml_tensor * V = ggml_new_tensor_3d(snap.ctx, sv->type, sv->ne[0], snap_pos, sv->ne[2]);
-            char name[64];
-            std::snprintf(name, sizeof(name), "snap_cache_k_%d", i); ggml_set_name(K, name);
-            std::snprintf(name, sizeof(name), "snap_cache_v_%d", i); ggml_set_name(V, name);
-            snap.attn_k_snap[i] = K;
-            snap.attn_v_snap[i] = V;
+        if (!skip_kv) {
+            snap.attn_k_snap.assign(n_full_attn, nullptr);
+            snap.attn_v_snap.assign(n_full_attn, nullptr);
+            // Right-sized KV: [head_dim, snap_pos, n_head_kv]
+            for (int i = 0; i < n_full_attn; i++) {
+                ggml_tensor * sk = cache.attn_k[i];
+                ggml_tensor * sv = cache.attn_v[i];
+                if (!sk || !sv) continue;
+                ggml_tensor * K = ggml_new_tensor_3d(snap.ctx, sk->type, sk->ne[0], snap_pos, sk->ne[2]);
+                ggml_tensor * V = ggml_new_tensor_3d(snap.ctx, sv->type, sv->ne[0], snap_pos, sv->ne[2]);
+                char name[64];
+                std::snprintf(name, sizeof(name), "snap_cache_k_%d", i); ggml_set_name(K, name);
+                std::snprintf(name, sizeof(name), "snap_cache_v_%d", i); ggml_set_name(V, name);
+                snap.attn_k_snap[i] = K;
+                snap.attn_v_snap[i] = V;
+            }
         }
 
         // SSM / conv: full-size (position-independent recurrent state).
@@ -1489,6 +1496,14 @@ bool snapshot_target_cache(const TargetWeights & w,
             snap.target_feat_snap = nullptr;
         }
 
+        // Pooled blob: stash pager-serialized KV as a named I8 tensor so the
+        // disk cache round-trips it without any DiskCacheHeader changes.
+        ggml_tensor * blob_t = nullptr;
+        if (has_blob) {
+            blob_t = ggml_new_tensor_1d(snap.ctx, GGML_TYPE_I8, (int64_t)kvflash_blob->size());
+            ggml_set_name(blob_t, "snap_kvflash_blob");
+        }
+
         snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, backend);
         if (!snap.buf) {
             set_last_error("ggml_backend_alloc_ctx_tensors failed for PrefixSnapshot");
@@ -1501,30 +1516,39 @@ bool snapshot_target_cache(const TargetWeights & w,
             snap.target_feat_snap = nullptr;
             return false;
         }
-        std::fprintf(stderr, "[snap] alloc right-sized: cur_pos=%d buf=%.2f MiB backend=%s\n",
+        std::fprintf(stderr, "[snap] alloc right-sized: cur_pos=%d buf=%.2f MiB backend=%s skip_kv=%d blob=%zu\n",
                      snap_pos,
                      (double)ggml_backend_buffer_get_size(snap.buf) / 1024.0 / 1024.0,
-                     ggml_backend_name(backend));
+                     ggml_backend_name(backend), (int)skip_kv,
+                     has_blob ? kvflash_blob->size() : (size_t)0);
+
+        // Upload blob bytes into the allocated tensor.
+        if (has_blob && blob_t) {
+            ggml_backend_tensor_set(blob_t, kvflash_blob->data(), 0, kvflash_blob->size());
+        }
     }
 
     // Copy KV strip-by-strip (right-sized snapshot is smaller than cache).
-    for (int i = 0; i < n_full_attn; i++) {
-        ggml_tensor * sk = cache.attn_k[i];
-        ggml_tensor * dk = snap.attn_k_snap[i];
-        ggml_tensor * sv = cache.attn_v[i];
-        ggml_tensor * dv = snap.attn_v_snap[i];
-        if (!sk || !dk || !sv || !dv) continue;
-        const size_t k_strip = (size_t)snap_pos * sk->nb[1];
-        const size_t v_strip = (size_t)snap_pos * sv->nb[1];
-        for (int kh = 0; kh < (int)sk->ne[2]; kh++) {
-            size_t src_off = (size_t)kh * sk->nb[2];
-            size_t dst_off = (size_t)kh * dk->nb[2];
-            ggml_backend_tensor_get(sk, (char *)dk->data + dst_off, src_off, k_strip);
-        }
-        for (int kh = 0; kh < (int)sv->ne[2]; kh++) {
-            size_t src_off = (size_t)kh * sv->nb[2];
-            size_t dst_off = (size_t)kh * dv->nb[2];
-            ggml_backend_tensor_get(sv, (char *)dv->data + dst_off, src_off, v_strip);
+    // skip_kv=true: KV serialized externally via pager; skip the D2H copy here.
+    if (!skip_kv) {
+        for (int i = 0; i < n_full_attn; i++) {
+            ggml_tensor * sk = cache.attn_k[i];
+            ggml_tensor * dk = snap.attn_k_snap[i];
+            ggml_tensor * sv = cache.attn_v[i];
+            ggml_tensor * dv = snap.attn_v_snap[i];
+            if (!sk || !dk || !sv || !dv) continue;
+            const size_t k_strip = (size_t)snap_pos * sk->nb[1];
+            const size_t v_strip = (size_t)snap_pos * sv->nb[1];
+            for (int kh = 0; kh < (int)sk->ne[2]; kh++) {
+                size_t src_off = (size_t)kh * sk->nb[2];
+                size_t dst_off = (size_t)kh * dk->nb[2];
+                ggml_backend_tensor_get(sk, (char *)dk->data + dst_off, src_off, k_strip);
+            }
+            for (int kh = 0; kh < (int)sv->ne[2]; kh++) {
+                size_t src_off = (size_t)kh * sv->nb[2];
+                size_t dst_off = (size_t)kh * dv->nb[2];
+                ggml_backend_tensor_get(sv, (char *)dv->data + dst_off, src_off, v_strip);
+            }
         }
     }
 
@@ -1544,6 +1568,16 @@ bool snapshot_target_cache(const TargetWeights & w,
         ggml_backend_tensor_get(cache.target_feat, snap.target_feat_snap->data, 0, feat_nbytes);
     }
 
+    // Blob refresh on reuse path (same cur_pos, alloc skipped, blob content may differ).
+    if (kvflash_blob && !kvflash_blob->empty()) {
+        for (ggml_tensor * t = ggml_get_first_tensor(snap.ctx); t; t = ggml_get_next_tensor(snap.ctx, t)) {
+            if (std::strcmp(t->name, "snap_kvflash_blob") == 0) {
+                ggml_backend_tensor_set(t, kvflash_blob->data(), 0, kvflash_blob->size());
+                break;
+            }
+        }
+    }
+
     snap.cur_pos         = snap_pos;
     snap.last_tok        = cache.last_tok;
     snap.kv_k_type       = cache.kv_k_type;
@@ -1553,7 +1587,8 @@ bool snapshot_target_cache(const TargetWeights & w,
     return true;
 }
 
-bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache) {
+bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache,
+                          bool skip_kv) {
     if (snap.kv_k_type != cache.kv_k_type) {
         set_last_error("restore_target_cache: kv_k_type mismatch");
         return false;
@@ -1562,48 +1597,54 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache) {
         set_last_error("restore_target_cache: max_ctx mismatch");
         return false;
     }
-    // Topology: snapshot must describe the same model layout the cache was
-    // allocated against. A mismatch (stale snapshot from a different daemon
-    // run, or a snap captured before a model swap) would index past
-    // cache.attn_k / .ssm_state / .conv_state and silently corrupt memory.
-    if (snap.attn_k_snap.size() != cache.attn_k.size() ||
-        snap.attn_v_snap.size() != cache.attn_v.size() ||
-        snap.ssm_state_snap.size()  != cache.ssm_state.size() ||
+    // Topology check for non-KV vectors (always present).
+    if (snap.ssm_state_snap.size()  != cache.ssm_state.size() ||
         snap.conv_state_snap.size() != cache.conv_state.size()) {
         set_last_error("restore_target_cache: layer-count mismatch (stale snapshot?)");
         return false;
+    }
+    if (!skip_kv) {
+        // KV vectors must also match when we intend to restore them.
+        if (snap.attn_k_snap.size() != cache.attn_k.size() ||
+            snap.attn_v_snap.size() != cache.attn_v.size()) {
+            set_last_error("restore_target_cache: KV layer-count mismatch (stale snapshot?)");
+            return false;
+        }
     }
     if (snap.cur_pos < 0 || snap.cur_pos > cache.max_ctx) {
         set_last_error("restore_target_cache: snap.cur_pos out of range");
         return false;
     }
 
-    const int n_full_attn = (int)snap.attn_k_snap.size();
-    const int n_delta     = (int)snap.ssm_state_snap.size();
-    const int snap_pos    = snap.cur_pos;
+    const int n_delta  = (int)snap.ssm_state_snap.size();
+    const int snap_pos = snap.cur_pos;
 
     // KV: strip-by-strip copy from right-sized snapshot into full-size cache.
-    for (int i = 0; i < n_full_attn; i++) {
-        ggml_tensor * sk = snap.attn_k_snap[i];
-        ggml_tensor * dk = cache.attn_k[i];
-        ggml_tensor * sv = snap.attn_v_snap[i];
-        ggml_tensor * dv = cache.attn_v[i];
-        if ((!sk || !sv) != (!dk || !dv)) {
-            set_last_error("restore_target_cache: KV shard layout mismatch");
-            return false;
-        }
-        if (!sk || !dk || !sv || !dv) continue;
-        const size_t k_strip = (size_t)snap_pos * sk->nb[1];
-        const size_t v_strip = (size_t)snap_pos * sv->nb[1];
-        for (int kh = 0; kh < (int)sk->ne[2]; kh++) {
-            size_t src_off = (size_t)kh * sk->nb[2];
-            size_t dst_off = (size_t)kh * dk->nb[2];
-            ggml_backend_tensor_set(dk, (const char *)sk->data + src_off, dst_off, k_strip);
-        }
-        for (int kh = 0; kh < (int)sv->ne[2]; kh++) {
-            size_t src_off = (size_t)kh * sv->nb[2];
-            size_t dst_off = (size_t)kh * dv->nb[2];
-            ggml_backend_tensor_set(dv, (const char *)sv->data + src_off, dst_off, v_strip);
+    // skip_kv=true: KV is restored separately via pager deserialize.
+    if (!skip_kv) {
+        const int n_full_attn = (int)snap.attn_k_snap.size();
+        for (int i = 0; i < n_full_attn; i++) {
+            ggml_tensor * sk = snap.attn_k_snap[i];
+            ggml_tensor * dk = cache.attn_k[i];
+            ggml_tensor * sv = snap.attn_v_snap[i];
+            ggml_tensor * dv = cache.attn_v[i];
+            if ((!sk || !sv) != (!dk || !dv)) {
+                set_last_error("restore_target_cache: KV shard layout mismatch");
+                return false;
+            }
+            if (!sk || !dk || !sv || !dv) continue;
+            const size_t k_strip = (size_t)snap_pos * sk->nb[1];
+            const size_t v_strip = (size_t)snap_pos * sv->nb[1];
+            for (int kh = 0; kh < (int)sk->ne[2]; kh++) {
+                size_t src_off = (size_t)kh * sk->nb[2];
+                size_t dst_off = (size_t)kh * dk->nb[2];
+                ggml_backend_tensor_set(dk, (const char *)sk->data + src_off, dst_off, k_strip);
+            }
+            for (int kh = 0; kh < (int)sv->ne[2]; kh++) {
+                size_t src_off = (size_t)kh * sv->nb[2];
+                size_t dst_off = (size_t)kh * dv->nb[2];
+                ggml_backend_tensor_set(dv, (const char *)sv->data + src_off, dst_off, v_strip);
+            }
         }
     }
 
@@ -1649,6 +1690,9 @@ void free_prefix_snapshot(PrefixSnapshot & snap) {
     snap.is_thin         = false;
     snap.kv_start        = 0;
     snap.kv_end          = 0;
+    snap.is_pooled       = false;
+    snap.kvflash_blob.clear();
+    snap.kvflash_blob.shrink_to_fit();
 }
 
 bool snapshot_target_cache_thin(const TargetWeights & w,
