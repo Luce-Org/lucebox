@@ -36,7 +36,7 @@ Usage
       --out-json profile.json --out-md profile.md
 """
 from __future__ import annotations
-import argparse, csv, datetime, json, os, re, shutil, statistics, struct, subprocess, sys, tempfile
+import argparse, atexit, csv, datetime, json, os, re, shutil, statistics, struct, subprocess, sys, tempfile
 from pathlib import Path
 
 # --------------------------------------------------------------------------------------
@@ -400,6 +400,7 @@ def main():
         prompts = [json.loads(l) for l in Path(cfg.prompts).read_text().splitlines() if l.strip()]
 
     tmp = Path(tempfile.mkdtemp(prefix="lucebox_profile_"))  # unique per run (no concurrent-run collisions)
+    atexit.register(shutil.rmtree, tmp, ignore_errors=True)  # clean up on exit (success or crash) -> no /tmp growth
     runs = []
     for p in prompts:
         pbin = tmp / f"{p['name']}.bin"
