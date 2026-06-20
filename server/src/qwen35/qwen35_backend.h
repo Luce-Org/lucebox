@@ -133,6 +133,9 @@ protected:
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io);
     virtual bool should_capture_moe_router() const { return false; }
+    // Hook after kvflash pool sizing, before create_target_cache: a subclass
+    // may disable the pool (kvflash_tokens_=0) when it is redundant. Default no-op.
+    virtual bool post_kvflash_init_gate() { return true; }
     virtual void after_target_compute(StepGraph &,
                                       int /*kv_start*/,
                                       int /*n_tokens*/) {}

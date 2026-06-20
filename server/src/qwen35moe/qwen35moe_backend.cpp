@@ -4,6 +4,7 @@
 #include "../common/moe_hybrid_stream.h"
 #include "../common/moe_hybrid_types.h"
 #include "../common/moe_hybrid_types_impl.h"
+#include "../common/kvflash_placement.h"
 #include "common/ggml_graph_precision.h"
 #include "common/sampler.h"
 #include "common/dflash_spec_decode.h"
@@ -74,6 +75,9 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
     if (placement.total_hot >= out.n_layer * out.n_expert) {
         std::printf("[qwen35moe] all experts fit in VRAM, loading fully to GPU\n");
         std::fflush(stdout);
+        // Record the placement result so post_kvflash_init_gate() can disable
+        // the KVFlash pool (moe_hybrid is null on this all-hot path).
+        placement_all_hot_ = true;
         free_target_weights(out);
         return load_target_gguf(cfg_.target_path, backend, out);
     }
@@ -324,6 +328,36 @@ bool Qwen35MoeBackend::spark_bootstrap_finalize(const std::string & profile_path
     if (!rebuild_hybrid_from_placement(placement, err)) {
         std::fprintf(stderr, "[spark] bootstrap storage rebuild failed: %s\n", err.c_str());
         return false;
+    }
+    return true;
+}
+
+bool Qwen35MoeBackend::post_kvflash_init_gate() {
+    // Gate: disable the KVFlash pool when dynamic placement confirmed all experts
+    // fit hot even with the FULL max_ctx KV reservation — the pool then reserves
+    // nothing useful (pure slot-map overhead).  placement_all_hot_full_kv_ is set
+    // in load_dynamic_placement().  When the pool is what KEEPS experts hot
+    // (placement_all_hot_ true but _full_kv_ false), we must NOT disable it.
+    if (!kvflash_active()) return true;
+
+    bool should_disable = false;
+    if (placement_all_hot_full_kv_) {
+        should_disable = true;
+    } else if (target_weights().moe_hybrid) {
+        int total_cold = 0;
+        for (const auto & ls : target_weights().moe_hybrid->layers) {
+            total_cold += (int)ls.cold_expert_ids.size();
+        }
+        if (total_cold == 0) should_disable = true;  // hybrid built but 0 cold
+    }
+
+    if (should_disable) {
+        std::printf("[kvflash] disabled: placement all-hot at max_ctx %d, pool not needed\n",
+                    cfg_.device.max_ctx);
+        std::fflush(stdout);
+        kvflash_tokens_ = 0;
+        kvflash_tau_    = 64;
+        kvflash_drafter_path_.clear();
     }
     return true;
 }
@@ -2132,7 +2166,7 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
     // KV cache: n_layer × 2 (K+V) × n_head_kv × head_dim × sizeof(fp16) × max_context
     const uint64_t kv_bytes_per_tok = (uint64_t)w.n_layer * 2 *
         (uint64_t)w.n_head_kv * (uint64_t)w.n_embd_head_k * 2;
-    const uint64_t kv_total = kv_bytes_per_tok * (uint64_t)max_context;
+    const int      kvf_pool      = kvflash_pool_from_env(max_context);
 
     const uint64_t warm_cache_bytes = 200ULL * 1024 * 1024;  // 200 MB warm/staging
     uint64_t safety_bytes = 512ULL * 1024 * 1024;      // 512 MB safety margin
@@ -2148,6 +2182,24 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
     // Core model bytes = what's already used on GPU (non-expert tensors).
     const uint64_t core_bytes =
         moe_hybrid_core_bytes_from_memory("qwen35moe", gpu_free, gpu_total);
+
+    // KVFlash reserves a fixed resident pool, not max_ctx, of KV.  When active
+    // and the full reservation would force experts cold, reserve for the pool so
+    // experts stay hot (decouples max_ctx from the expert-placement cliff).  The
+    // rule is centralised in kvflash_placement_decision() so future MoE backends
+    // (DeepSeek-V4, ...) inherit it instead of re-deriving the byte math.
+    const auto kvf_dec = dflash::common::kvflash_placement_decision(
+        kv_bytes_per_tok, max_context, kvf_pool,
+        gpu_total, core_bytes, total_expert_bytes,
+        warm_cache_bytes, safety_bytes, draft_reserve_bytes);
+    const uint64_t kv_total   = kvf_dec.kv_total;
+    const int      kv_ctx_log = kvf_dec.kv_ctx;
+    placement_all_hot_full_kv_ = kvf_dec.all_hot_full_kv;
+    if (kvf_dec.pool_reduced) {
+        std::printf("[kvflash] placement reserves pool KV (%d tokens, not max_ctx %d) "
+                    "-> experts stay hot\n", kvf_pool, max_context);
+        std::fflush(stdout);
+    }
 
     uint64_t expert_budget = 0;
     if (gpu_total > core_bytes + kv_total + warm_cache_bytes + safety_bytes + draft_reserve_bytes) {
@@ -2187,7 +2239,7 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
                 gpu_total / 1024.0 / 1024.0 / 1024.0,
                 core_bytes / 1024.0 / 1024.0 / 1024.0,
                 kv_total / 1024.0 / 1024.0 / 1024.0,
-                max_context,
+                kv_ctx_log,
                 warm_cache_bytes / 1024.0 / 1024.0,
                 safety_bytes / 1024.0 / 1024.0,
                 expert_budget / 1024.0 / 1024.0 / 1024.0,
