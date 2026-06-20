@@ -161,6 +161,7 @@ public:
 
     // Drop all mappings and host backing (new request / cache reset).
     // Cumulative stats are kept; the epoch advances so cached masks refill.
+    // Pins are cleared: the caller (backend) re-applies them after rebuild.
     void reset() {
 #ifdef KVFLASH_HAS_ASYNC_DMA
         if (page_stream_) {
@@ -183,6 +184,7 @@ public:
         stats_.host_bytes = 0;
         cur_chunk_ = 0;
         epoch_++;
+        std::fill(pinned_.begin(), pinned_.end(), 0);
         has_pending_page_in_ = false;
     }
 
@@ -206,6 +208,53 @@ public:
 
     // Optional external relevance score; higher = keep. Falls back to LRU.
     std::function<float(int /*chunk*/)> score_hook;
+
+    // ── Critical-chunk pinning ──────────────────────────────────────────
+    // Pinned chunks are never chosen as eviction victims (OR-ed on top of the
+    // sink/tail protections). Empty by default → byte-identical non-pin path.
+    // Pins are cleared by reset() and re-applied by the backend after each
+    // prefill/restore rebuild via apply_kvflash_pins().
+
+    // Pin logical token range [tok_lo, tok_hi) (inclusive of chunk boundaries).
+    // Maps to chunk range [tok_lo/chunk_tokens, tok_hi/chunk_tokens] inclusive.
+    // Best-effort deadlock guard: if (sink+tail+n_pinned+2) > n_blocks_ the
+    // span is refused with a one-line warning and the function returns without
+    // setting any pin.
+    void pin_range(int64_t tok_lo, int64_t tok_hi) {
+        if (!attached() || tok_lo > tok_hi) return;
+        const int c_lo = (int)(tok_lo / cfg_.chunk_tokens);
+        const int c_hi = (int)(tok_hi / cfg_.chunk_tokens);
+        if (c_lo > c_hi || c_lo < 0) return;
+        // Count currently-pinned chunks + the new ones.
+        int currently_pinned = 0;
+        for (int c = 0; c < (int)pinned_.size(); c++) {
+            if (pinned_[c]) currently_pinned++;
+        }
+        int new_pins = 0;
+        for (int c = c_lo; c <= c_hi; c++) {
+            if (c >= (int)pinned_.size() || !pinned_[c]) new_pins++;
+        }
+        // Deadlock guard: fixed protections + pinned + 2 (one evictable victim +
+        // one append-head) must fit in the pool.
+        if (cfg_.sink_chunks + cfg_.tail_window_chunks + currently_pinned + new_pins + 2 > n_blocks_) {
+            std::fprintf(stderr,
+                "[kvflash] pin_range [%lld,%lld] refused: "
+                "sink=%d tail=%d pinned=%d new=%d pool_blocks=%d — would deadlock eviction\n",
+                (long long)tok_lo, (long long)tok_hi,
+                cfg_.sink_chunks, cfg_.tail_window_chunks,
+                currently_pinned, new_pins, n_blocks_);
+            return;
+        }
+        if (c_hi + 1 > (int)pinned_.size()) pinned_.resize((size_t)c_hi + 1, 0);
+        for (int c = c_lo; c <= c_hi; c++) pinned_[(size_t)c] = 1;
+    }
+
+    bool is_pinned(int c) const {
+        return c >= 0 && c < (int)pinned_.size() && pinned_[(size_t)c];
+    }
+
+    // Clear all pins (also called by reset()).
+    void unpin_all() { std::fill(pinned_.begin(), pinned_.end(), 0); }
 
     // Allocate slots for [kv_start, kv_start + n_tok) ahead of a forward
     // step (evicting LRU/low-score chunks as needed). False — with a
@@ -383,7 +432,8 @@ public:
             const ChunkState & st = chunks_[c];
             if (st.block < 0 && !st.on_host) continue;     // never materialized
             const bool prot = c < cfg_.sink_chunks ||
-                              c > cur_chunk_ - 1 - cfg_.tail_window_chunks;
+                              c > cur_chunk_ - 1 - cfg_.tail_window_chunks ||
+                              is_pinned(c);
             cands.push_back({c, prot ? 3.4e38f : score_hook(c)});
         }
         std::sort(cands.begin(), cands.end(),
@@ -402,6 +452,101 @@ public:
         }
         if (has_pending_page_in_) synchronize_paging();
         return events;
+    }
+
+    // Snapshot all resident+paged-out chunks into a flat byte blob.
+    // Layout: 8-byte magic, header fields (6×uint32), then for each logical
+    // chunk c in [0, n_chunks): chunk_bytes_ bytes in for_each_segment order.
+    std::vector<uint8_t> serialize() const {
+        static constexpr uint64_t kMagic = 0x4b56464c41534800ULL; // "KVFLASH\0"
+        const int nc = (int)chunks_.size();
+        const size_t hdr = sizeof(uint64_t) + 6 * sizeof(uint32_t);
+        std::vector<uint8_t> out;
+        out.resize(hdr + (size_t)nc * chunk_bytes_, 0);
+        uint8_t * p = out.data();
+        std::memcpy(p, &kMagic, 8); p += 8;
+        auto w32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
+        w32((uint32_t)nc);
+        w32((uint32_t)cfg_.chunk_tokens);
+        w32((uint32_t)n_head_kv_);
+        w32((uint32_t)k_seg_bytes_);
+        w32((uint32_t)v_seg_bytes_);
+        w32((uint32_t)chunk_bytes_);
+        for (int c = 0; c < nc; ++c) {
+            uint8_t * dst = out.data() + hdr + (size_t)c * chunk_bytes_;
+            const ChunkState & st = chunks_[c];
+            if (st.block >= 0) {
+                // Resident: gather from pool tensors.
+                uint8_t * q = dst;
+                for_each_segment(st.block, [&](ggml_tensor * t, size_t off, size_t seg) {
+                    ggml_backend_tensor_get(t, q, off, seg);
+                    q += seg;
+                });
+            } else if (st.on_host) {
+                // Host-backed: copy verbatim. host_data is a raw pinned pointer
+                // under async DMA, a std::vector otherwise.
+#ifdef KVFLASH_HAS_ASYNC_DMA
+                std::memcpy(dst, st.host_data, chunk_bytes_);
+#else
+                std::memcpy(dst, st.host_data.data(), chunk_bytes_);
+#endif
+            }
+            // else: never written — stays zero-filled from the resize above.
+        }
+        return out;
+    }
+
+    // Restore state from a blob produced by serialize(). Returns false on
+    // header mismatch (layout drift guard). Callers must rebuild slot masks.
+    //
+    // Ordering: pre-size chunks_ so each entry exists before slot_for() runs.
+    // We set host_data + on_host=true, THEN call slot_for(). slot_for's recall
+    // branch sees on_host==true and calls copy_chunk(to_host=false) itself —
+    // no extra copy_chunk needed (that would double-write).
+    bool deserialize(const uint8_t * data, size_t n) {
+        static constexpr uint64_t kMagic = 0x4b56464c41534800ULL;
+        const size_t hdr = sizeof(uint64_t) + 6 * sizeof(uint32_t);
+        if (n < hdr) return false;
+        const uint8_t * p = data;
+        uint64_t magic = 0; std::memcpy(&magic, p, 8); p += 8;
+        if (magic != kMagic) return false;
+        auto r32 = [&]() { uint32_t v = 0; std::memcpy(&v, p, 4); p += 4; return v; };
+        const int nc      = (int)r32();
+        const int ct      = (int)r32();
+        const int nhkv    = (int)r32();
+        const size_t kseg = (size_t)r32();
+        const size_t vseg = (size_t)r32();
+        const size_t cb   = (size_t)r32();
+        if (ct != cfg_.chunk_tokens || nhkv != n_head_kv_ ||
+            kseg != k_seg_bytes_ || vseg != v_seg_bytes_ || cb != chunk_bytes_) {
+            return false;
+        }
+        if (n < hdr + (size_t)nc * chunk_bytes_) return false;
+        reset();
+        chunks_.resize(nc);          // pre-size so slot_for doesn't resize again
+        for (int c = 0; c < nc; ++c) {
+            const uint8_t * src = data + hdr + (size_t)c * chunk_bytes_;
+            ChunkState & st = chunks_[c];
+            // Park bytes in host_data; slot_for's recall branch copies to pool.
+            // host_data is a raw pinned pointer under async DMA, a vector otherwise.
+#ifdef KVFLASH_HAS_ASYNC_DMA
+            if (!st.host_data) {
+                if (cudaMallocHost(&st.host_data, chunk_bytes_) != cudaSuccess) return false;
+                stats_.host_bytes += (int64_t)chunk_bytes_;
+            }
+            std::memcpy(st.host_data, src, chunk_bytes_);
+#else
+            st.host_data.assign(src, src + chunk_bytes_);
+#endif
+            st.on_host = true;
+            // slot_for assigns a block and auto-recalls via copy_chunk(to_host=false).
+            slot_for((int64_t)c * cfg_.chunk_tokens);
+        }
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        // Recalls above are async on page_stream_; settle before the pool is read.
+        if (has_pending_page_in_) synchronize_paging();
+#endif
+        return true;
     }
 
 private:
@@ -427,6 +572,7 @@ private:
             if (chunks_[c].block < 0) continue;
             if (c < cfg_.sink_chunks) continue;
             if (c > cur_chunk_ - 1 - cfg_.tail_window_chunks) continue;
+            if (is_pinned(c)) continue;
             if (score_hook) {
                 const float s = score_hook(c);
                 if (victim < 0 || s < v_score) { victim = c; v_score = s; }
@@ -435,6 +581,24 @@ private:
             }
         }
         return victim >= 0 && page_out(victim);
+    }
+
+    // Walk every (tensor, head) segment for `block` in the fixed layout order
+    // (layer-major, K then V, head-minor). fn(tensor, byte_offset, seg_bytes).
+    // Used by serialize/deserialize (synchronous); copy_chunk has its own
+    // async-DMA path below.
+    template<typename Fn>
+    void for_each_segment(int block, Fn&& fn) const {
+        for (size_t l = 0; l < attn_k_.size(); ++l) {
+            for (int kv = 0; kv < 2; ++kv) {
+                ggml_tensor * t = kv == 0 ? attn_k_[l] : attn_v_[l];
+                const size_t seg = kv == 0 ? k_seg_bytes_ : v_seg_bytes_;
+                for (int h = 0; h < n_head_kv_; ++h) {
+                    const size_t off = (size_t)block * cfg_.chunk_tokens * t->nb[1] + (size_t)h * t->nb[2];
+                    fn(t, off, seg);
+                }
+            }
+        }
     }
 
     // Move one chunk between pool slots and host backing.
@@ -552,6 +716,7 @@ private:
     std::vector<ChunkState> chunks_;
     std::vector<int> free_blocks_;
     std::vector<uint8_t> zero_buf_;   // used by zero_block() in non-CUDA builds
+    std::vector<uint8_t> pinned_;    // per-chunk pin flag; empty = no pins
     KvFlashStats stats_;
     size_t k_seg_bytes_ = 0, v_seg_bytes_ = 0, chunk_bytes_ = 0;
     int n_blocks_ = 0, n_head_kv_ = 0, cur_chunk_ = 0;
