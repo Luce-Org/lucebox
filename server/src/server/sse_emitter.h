@@ -60,7 +60,8 @@ public:
                int prompt_tokens,
                const json & tools,
                ToolMemory * tool_memory,
-               const std::vector<std::string> & stop_sequences = {});
+               const std::vector<std::string> & stop_sequences = {},
+               bool started_in_thinking = false);
 
     // Emit the initial SSE events (role delta, message_start, etc.)
     // Returns the formatted SSE strings to send.

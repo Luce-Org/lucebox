@@ -114,9 +114,10 @@ static json weather_tools() {
     });
 }
 
-static SseEmitter make_emitter(ApiFormat fmt, json tools = json::array()) {
+static SseEmitter make_emitter(ApiFormat fmt, json tools = json::array(),
+                               bool started_in_thinking = false) {
     return SseEmitter(fmt, "test_id_001", "test-model", 10,
-                      tools, nullptr);
+                      tools, nullptr, {}, started_in_thinking);
 }
 
 // Concatenate all SSE chunks into a single string.
@@ -208,6 +209,21 @@ static void test_reasoning_started_in_thinking() {
     TEST_ASSERT(r.has_reasoning);
     TEST_ASSERT(r.reasoning == "thinking body");
     TEST_ASSERT(r.content == "content here");
+}
+
+static void test_emitter_started_in_thinking_without_open_tag() {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), true);
+    auto chunks = em.emit_token("Thinking Process: calculate 9 + 6.");
+    auto close = em.emit_token("</think>");
+    auto answer = em.emit_token("15");
+    em.emit_finish(3);
+
+    std::string all = concat(chunks) + concat(close) + concat(answer);
+    TEST_ASSERT(em.reasoning_text().find("Thinking Process") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text() == "15");
+    TEST_ASSERT(em.first_content_token_index() == 2);
+    TEST_ASSERT(all.find("reasoning_content") != std::string::npos);
+    TEST_ASSERT(all.find("\"content\":\"Thinking Process") == std::string::npos);
 }
 
 static void test_reasoning_unclosed_think() {
@@ -3958,6 +3974,7 @@ int main() {
     RUN_TEST(test_reasoning_basic);
     RUN_TEST(test_reasoning_no_tags);
     RUN_TEST(test_reasoning_started_in_thinking);
+    RUN_TEST(test_emitter_started_in_thinking_without_open_tag);
     RUN_TEST(test_reasoning_unclosed_think);
     RUN_TEST(test_reasoning_empty_thinking);
     RUN_TEST(test_reasoning_whitespace_in_think);

@@ -76,15 +76,16 @@ SseEmitter::SseEmitter(ApiFormat format,
                        int prompt_tokens,
                        const json & tools,
                        ToolMemory * tool_memory,
-                       const std::vector<std::string> & stop_sequences)
+                       const std::vector<std::string> & stop_sequences,
+                       bool started_in_thinking)
     : format_(format)
     , request_id_(request_id)
     , model_name_(model_name)
     , prompt_tokens_(prompt_tokens)
     , tools_(tools)
     , tool_memory_(tool_memory)
-    , mode_(StreamMode::CONTENT)
-    , active_kind_("text")
+    , mode_(started_in_thinking ? StreamMode::REASONING : StreamMode::CONTENT)
+    , active_kind_(started_in_thinking ? "thinking" : "text")
     , stop_sequences_(stop_sequences)
     , created_at_(unix_timestamp())
     , msg_item_id_(gen_item_id())

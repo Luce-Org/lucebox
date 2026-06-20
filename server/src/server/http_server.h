@@ -208,6 +208,7 @@ struct ParsedRequest {
     std::string               response_id;
     // Thinking/reasoning state
     bool                      thinking_enabled = true;
+    bool                      started_in_thinking = false;
     // True when the request opted in to the thinking-budget envelope via
     // `thinking: {type: "enabled"}`. Distinct from thinking_enabled (which
     // can be set via the chat template kwarg alone). When true, the response
