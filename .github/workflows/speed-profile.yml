@@ -1,0 +1,92 @@
+name: Speed Profile
+
+# Report-only speed profile for the inference engine. Runs on the self-hosted
+# RTX 3090 (lucebox3) on PRs that touch the engine or the optimizations, and on
+# manual dispatch. It NEVER blocks a PR (continue-on-error: true) — it publishes a
+# report to the run summary + uploads the JSON / markdown / nsys trace as artifacts.
+#
+# Why report-only: perf has run-to-run variance (thermals, clocks, scheduling).
+# Gating a merge on a noisy absolute number produces false failures. We surface the
+# trend first; a soft threshold can come later once a baseline + variance band exist.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'server/**'
+      - 'optimizations/**'
+      - '.github/workflows/speed-profile.yml'
+  workflow_dispatch:
+
+# Share the single physical 3090 with the existing gpu-tests job so two runs never
+# fight over the GPU. cancel-in-progress=false: let a queued profile finish rather
+# than killing it mid-measurement.
+concurrency:
+  group: lucebox3-gpu-runner
+  cancel-in-progress: false
+
+jobs:
+  speed-profile:
+    name: Speed profile (self-hosted RTX 3090, sm_86)
+    runs-on: [self-hosted, gpu, sm86]
+    timeout-minutes: 30
+    continue-on-error: true   # report-only: a slow/failed profile must not block the PR
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: GPU info (and pin clocks to cut variance, if permitted)
+        run: |
+          nvidia-smi --query-gpu=name,driver_version,memory.total,power.limit --format=csv
+          # Locking clocks makes the numbers comparable run-to-run. Safe to skip if the
+          # runner user can't run nvidia-smi -lgc; the profiler still records the power cap.
+          sudo nvidia-smi -lgc 1395 2>/dev/null || echo "clock lock not permitted; continuing"
+
+      - name: Build engine binaries (sm_86, Release)
+        run: |
+          cd server
+          cmake -B build \
+            -DCMAKE_CUDA_ARCHITECTURES="86" \
+            -DDFLASH27B_ENABLE_BSA=OFF \
+            -DDFLASH27B_FA_ALL_QUANTS=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target test_dflash test_generate -j"$(nproc)"
+
+      - name: Run speed profiler
+        env:
+          MODELS: ${{ vars.LUCEBOX_MODELS_DIR || '/opt/models' }}
+        run: |
+          cd server
+          # Keep n_gen small: the 3090 is serialized across PRs. The nsys pass adds a
+          # separate short profiled run; tok/s is measured on clean passes.
+          python3 scripts/profile.py \
+            --target "$MODELS/Qwen3.5-27B-Q4_K_M.gguf" \
+            --draft  "$MODELS/draft/qwen35_dflash/model.safetensors" \
+            --tokenizer "Qwen/Qwen3.5-27B" \
+            --n-gen 48 --budget 22 --reps 3 \
+            --nsys --check-lossless \
+            --out-json profile.json --out-md profile.md
+
+      - name: Publish report to the run summary
+        if: always()
+        run: |
+          {
+            echo "## 🏎️ Speed profile"
+            echo ""
+            cat server/profile.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts (json + markdown + nsys trace)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: speed-profile-${{ github.run_id }}
+          path: |
+            server/profile.json
+            server/profile.md
+            /tmp/lucebox_profile/profile.nsys-rep
+          if-no-files-found: warn
+          retention-days: 30
