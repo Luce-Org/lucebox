@@ -265,6 +265,9 @@ bool Qwen35Backend::init() {
     if (kvflash_tokens_ > 0) {
         kvflash_tau_ = std::max(1, env_int_or_default("DFLASH_KVFLASH_TAU", 64));
     }
+    // Subclass gate (e.g. MoE all-hot): may zero kvflash_tokens_ before the KV
+    // cache is sized, so create_target_cache allocates full max_ctx KV.
+    if (!post_kvflash_init_gate()) return false;
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true, /*ctx_alloc=*/kvflash_tokens_)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
