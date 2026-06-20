@@ -253,7 +253,6 @@ add_library(dflash_common STATIC
     src/laguna/laguna_layer_split_adapter.cpp
     src/laguna/laguna_dflash_target.cpp
     src/common/backend_ipc.cpp
-    src/common/domino_head.cpp
     src/common/target_shard_ipc.cpp
     src/common/target_shard_ipc_daemon.cpp
     src/common/dflash_feature_ring.cpp
@@ -619,6 +618,12 @@ if(DFLASH27B_TESTS)
         target_include_directories(test_kvflash_placement PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         add_test(NAME kvflash_placement COMMAND test_kvflash_placement)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash_pager.cpp")
+        add_executable(test_kvflash_pager test/test_kvflash_pager.cpp)
+        target_include_directories(test_kvflash_pager PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_kvflash_pager PRIVATE dflash_common)
+        add_test(NAME kvflash_pager COMMAND test_kvflash_pager)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_bandit_integration.cpp")
         add_executable(test_bandit_integration test/test_bandit_integration.cpp)
         target_include_directories(test_bandit_integration PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
@@ -796,17 +801,29 @@ if(DFLASH27B_TESTS)
         target_include_directories(test_kvflash_qk PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash_pool_sizing.cpp")
-        # Pure unit test for kvflash_pool_from_env: ggml headers only, no ggml link, no GPU.
+        # Pure unit test for kvflash_pool_from_env: no ggml link, no GPU.
+        # kvflash_pager.h includes ggml.h for tensor types used by the pager
+        # (not by pool_from_env itself), so the ggml include path is required
+        # even though no ggml symbols are linked.
         add_executable(test_kvflash_pool_sizing test/test_kvflash_pool_sizing.cpp)
         target_include_directories(test_kvflash_pool_sizing PRIVATE
             ${DFLASH27B_SRC_INCLUDE_DIRS}
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
         add_test(NAME kvflash_pool_sizing COMMAND test_kvflash_pool_sizing)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_restore_delta.cpp")
         add_executable(test_restore_delta test/test_restore_delta.cpp)
         target_include_directories(test_restore_delta PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_warm_prefill.cpp")
+        add_executable(test_warm_prefill test/test_warm_prefill.cpp)
+        target_include_directories(test_warm_prefill PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        add_test(NAME warm_prefill COMMAND test_warm_prefill)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_spec_gate.cpp")
+        add_executable(test_spec_gate test/test_spec_gate.cpp)
+        target_include_directories(test_spec_gate PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        add_test(NAME spec_gate COMMAND test_spec_gate)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_dflash.cpp")
         add_executable(test_dflash test/test_dflash.cpp)
