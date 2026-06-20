@@ -73,11 +73,15 @@ jobs:
       - name: Publish report to the run summary
         if: always()
         run: |
-          {
-            echo "## 🏎️ Speed profile"
-            echo ""
-            cat server/profile.md
-          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -f server/profile.md ]; then
+            { echo "## 🏎️ Speed profile"; echo ""; cat server/profile.md; } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Profiler produced no report (the run failed earlier — see logs)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Reset GPU clocks
+        if: always()
+        run: sudo nvidia-smi -rgc 2>/dev/null || true
 
       - name: Upload artifacts (json + markdown + nsys trace)
         if: always()
@@ -87,6 +91,6 @@ jobs:
           path: |
             server/profile.json
             server/profile.md
-            /tmp/lucebox_profile/profile.nsys-rep
+            server/profile.nsys-rep
           if-no-files-found: warn
           retention-days: 30
