@@ -36,7 +36,7 @@ Usage
       --out-json profile.json --out-md profile.md
 """
 from __future__ import annotations
-import argparse, csv, datetime, json, os, re, statistics, struct, subprocess, sys
+import argparse, csv, datetime, json, os, re, shutil, statistics, struct, subprocess, sys, tempfile
 from pathlib import Path
 
 # --------------------------------------------------------------------------------------
@@ -293,10 +293,13 @@ def render_md(doc: dict) -> str:
 
     if "lossless" in doc:
         ll = doc["lossless"]
-        verdict = "PASS — bit-identical to greedy AR" if ll["lossless"] else \
-                  f"FAIL — diverges at generated token #{ll['first_divergence']}"
+        if ll["lossless"]:
+            verdict = f"PASS — all {ll['prompts_checked']} prompts bit-identical to greedy AR"
+        else:
+            verdict = (f"FAIL — {len(ll['prompts_failed'])}/{ll['prompts_checked']} prompts diverge "
+                       f"({', '.join(ll['prompts_failed'])}); first at token #{ll['first_divergence']}")
         L.append("## Correctness (losslessness gate)\n")
-        L.append(f"- **{verdict}** (compared {ll['compared_tokens']} tokens)\n")
+        L.append(f"- **{verdict}**\n")
 
     L.append("## Per-step phase breakdown (engine timers, ms/step)\n")
     L.append("| phase | ms/step | % of step |")
@@ -396,7 +399,7 @@ def main():
     if cfg.prompts:
         prompts = [json.loads(l) for l in Path(cfg.prompts).read_text().splitlines() if l.strip()]
 
-    tmp = Path("/tmp/lucebox_profile"); tmp.mkdir(exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="lucebox_profile_"))  # unique per run (no concurrent-run collisions)
     runs = []
     for p in prompts:
         pbin = tmp / f"{p['name']}.bin"
@@ -432,8 +435,17 @@ def main():
         else:
             pbin = tmp / f"{prompts[0]['name']}.bin"
             rep = tmp / "profile.nsys-rep"
-            if nsys_profile(dflash_cmd(cfg, pbin, tmp / "df_nsys.bin", cfg.n_gen), rep):
-                nsys = summarize_nsys(rep, cfg.n_gen)
+            nbin = tmp / "df_nsys.bin"
+            if nsys_profile(dflash_cmd(cfg, pbin, nbin, cfg.n_gen), rep):
+                # normalize per-token metrics by ACTUAL generated tokens, not requested
+                # n_gen (generation can stop early at EOS), then summarize.
+                actual_gen = max(1, len(read_i32(nbin)) - len(read_i32(pbin)))
+                nsys = summarize_nsys(rep, actual_gen)
+                # copy the trace next to the JSON report so CI can upload a deterministic path
+                try:
+                    shutil.copy(rep, Path(cfg.out_json).with_suffix(".nsys-rep"))
+                except Exception:
+                    pass
 
     # ---- aggregate summary across prompts ----
     def col(k): return [r[k] for r in runs if k in r]
@@ -465,8 +477,17 @@ def main():
         "runs": runs,
         "summary": summary,
     }
-    if cfg.check_lossless and runs and "lossless" in runs[0]:
-        doc["lossless"] = runs[0]["lossless"]  # representative
+    if cfg.check_lossless:
+        ll_runs = [(r["prompt"], r["lossless"]) for r in runs if "lossless" in r]
+        if ll_runs:
+            failed = [(name, ll) for name, ll in ll_runs if not ll["lossless"]]
+            doc["lossless"] = {
+                "lossless": not failed,                       # FAIL if ANY prompt diverges
+                "prompts_checked": len(ll_runs),
+                "prompts_failed": [name for name, _ in failed],
+                "first_divergence": failed[0][1]["first_divergence"] if failed else None,
+                "per_prompt": {name: ll for name, ll in ll_runs},
+            }
 
     # baseline delta
     if cfg.baseline and Path(cfg.baseline).exists():
