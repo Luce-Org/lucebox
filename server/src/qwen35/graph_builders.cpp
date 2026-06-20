@@ -448,10 +448,23 @@ bool build_lm_head_projection_step(
     const TargetWeights & w,
     ggml_backend_t backend,
     int n_tokens) {
+    // Persistent reuse: the lm-head projection graph (mul_mat + argmax)
+    // depends only on n_tokens, which is constant across spec-decode steps
+    // (q_len is fixed by block_size). If a graph for this n_tokens is already
+    // alive, skip the rebuild — the caller refreshes hidden_input data each
+    // step. Centralises the per-call-site guards already present in the
+    // layer-split target, the MoE hybrid path, and the test harness, and
+    // covers the base Qwen35DFlashTarget path (project_hidden_to_tokens /
+    // project_hidden_to_topk) which rebuilt unconditionally every step.
+    if (sg.ctx && sg.gf && sg.hidden_input &&
+        sg.hidden_input->ne[1] == n_tokens && sg.logits && sg.argmax_tokens) {
+        return true;
+    }
+
     step_graph_free(sg);
 
     ggml_init_params ip{};
-    ip.mem_size   = 64 * 1024 * 1024;
+    ip.mem_size   = 4 * 1024 * 1024;  // 4MB (was 64MB — only 3 ops in this graph)
     ip.mem_buffer = nullptr;
     ip.no_alloc   = true;
     sg.ctx = ggml_init(ip);

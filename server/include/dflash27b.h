@@ -36,6 +36,10 @@ extern "C" {
 #define DFLASH27B_DRAFT_BLOCK_SIZE     16
 #define DFLASH27B_DRAFT_N_TARGET_LAYERS 5  // fc projects 5*hidden -> hidden
 #define DFLASH27B_DRAFT_MASK_TOKEN_ID  248070
+// Maximum capture layers the target-side array can hold. Newer DFlash
+// drafters (Qwen3.6) use 8 taps; this ceiling is generous enough for any
+// plausible drafter without wasting stack space.
+#define DFLASH_MAX_CAPTURE_LAYERS      16
 
 // target_layer_ids = {1, 16, 31, 46, 61}  (0-indexed into target layers)
 // We capture the OUTPUT of each, which is HF hidden_states[lid + 1].

@@ -199,8 +199,10 @@ struct TargetWeights {
     // Target layer IDs captured for the DFlash draft model.
     // Computed from n_layer at load time: step = (n_layer - 2) / (N - 1),
     // ids[k] = 1 + k * step.  E.g. 27B→{1,16,31,46,61}, 9B→{1,8,15,22,29}.
+    // For newer drafters (8 taps), the exact IDs come from the drafter GGUF's
+    // dflash.target_layer_ids via the backend's early-read sync.
     int n_capture_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;
-    int capture_layer_ids[DFLASH27B_DRAFT_N_TARGET_LAYERS] = {1, 16, 31, 46, 61};
+    int capture_layer_ids[DFLASH_MAX_CAPTURE_LAYERS] = {1, 16, 31, 46, 61};
 };
 
 // Check if a token is an end-of-sequence marker for the given target weights.
@@ -316,6 +318,15 @@ bool load_draft_gguf(const std::string & path,
                      ggml_backend_t backend,
                      DraftWeights & out,
                      const TargetWeights * target = nullptr);
+
+// Metadata-only read of the drafter's capture-layer config (n_target_layers
+// + target_layer_ids). Called BEFORE load_target_model so the target's
+// target_feat tensor is allocated with the correct fc_in dimension.
+// Returns true if n_capture was resolved (>0).
+bool read_draft_capture_config(const std::string & path,
+                               int & n_capture,
+                               int * capture_ids,
+                               int max_ids);
 
 void free_draft_weights(DraftWeights & w);
 

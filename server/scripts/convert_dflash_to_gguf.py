@@ -74,12 +74,24 @@ def load_arch(safetensors: Path, header: dict) -> dict:
              head_dim=HEAD_DIM, intermediate=INTERMEDIATE, vocab=VOCAB,
              n_target_layers=N_TARGET_LAYERS, rope_theta=ROPE_THETA,
              rms_eps=RMS_EPS, mask_token_id=MASK_TOKEN_ID, block_size=BLOCK_SIZE,
-             ctx_len=CTX_LEN)
+             ctx_len=CTX_LEN,
+             sliding_window=0, sliding_window_pattern=[])
 
     cfg_path = safetensors.parent / "config.json"
     if cfg_path.exists():
         c = json.loads(cfg_path.read_text())
+        dc = c.get("dflash_config", {})  # nested DFlash config (Qwen3.6 repos)
         def pick(*keys):
+            for k in keys:
+                if k in c and c[k] is not None:
+                    return c[k]
+            return None
+        # DFlash-specific keys live under dflash_config in newer repos;
+        # older repos put them at the top level. Check nested first.
+        def pick_dflash(*keys):
+            for k in keys:
+                if k in dc and dc[k] is not None:
+                    return dc[k]
             for k in keys:
                 if k in c and c[k] is not None:
                     return c[k]
@@ -94,18 +106,28 @@ def load_arch(safetensors: Path, header: dict) -> dict:
             ("vocab",        pick("vocab_size")),
             ("rope_theta",   pick("rope_theta")),
             ("rms_eps",      pick("rms_norm_eps")),
-            ("n_target_layers", pick("n_target_layers", "num_target_layers")),
-            ("mask_token_id",   pick("mask_token_id")),
-            ("block_size",      pick("block_size", "draft_block_size")),
+            ("n_target_layers", pick_dflash("n_target_layers", "num_target_layers")),
+            ("mask_token_id",   pick_dflash("mask_token_id")),
+            ("block_size",      pick_dflash("block_size", "draft_block_size")),
             ("ctx_len",         pick("max_position_embeddings")),
         ):
             if val is not None:
                 a[dst] = val
-        dfc = c.get("dflash_config") or {}
-        _tli = (dfc.get("target_layer_ids") or c.get("target_layer_ids")
+        # target_layer_ids: exact target layers to capture hidden states from.
+        # Older repos: top-level target_layer_ids / aux_hidden_state_layer_ids.
+        # Newer repos: nested under dflash_config. pick_dflash checks both.
+        _tli = (pick_dflash("target_layer_ids")
                 or c.get("aux_hidden_state_layer_ids"))
         if _tli:
             a["capture_layer_ids"] = [int(x) for x in _tli]
+        # Sliding-window attention (Qwen3.6 pattern: 5 sliding + 1 full).
+        # layer_types is a list of "sliding_attention" / "full_attention".
+        sw = pick("sliding_window")
+        if sw is not None:
+            a["sliding_window"] = sw
+        layer_types = pick("layer_types")
+        if layer_types:
+            a["sliding_window_pattern"] = [lt == "sliding_attention" for lt in layer_types]
         print(f"[info] read arch from {cfg_path}")
     else:
         print(f"[warn] no config.json next to safetensors; using 27B defaults")
@@ -146,10 +168,12 @@ def load_arch(safetensors: Path, header: dict) -> dict:
             print(f"[error] config n_head_kv*head_dim={exp_kv} != "
                   f"k_proj.weight dim {k0[0]}; fix config.json", file=sys.stderr)
             sys.exit(1)
+    swa_n = sum(1 for x in a.get("sliding_window_pattern", []) if x)
     print(f"[info] arch: hidden={a['hidden']} n_layer={a['n_layer']} "
           f"n_head={a['n_head']} n_head_kv={a['n_head_kv']} "
           f"head_dim={a['head_dim']} ff={a['intermediate']} vocab={a['vocab']} "
-          f"n_target_layers={a['n_target_layers']}")
+          f"n_target_layers={a['n_target_layers']} "
+          f"swa={swa_n}/{a['n_layer']} window={a.get('sliding_window', 0)}")
     return a
 
 
@@ -203,19 +227,13 @@ def read_tensor_bytes(path: Path, header_size: int, info: dict) -> bytes:
 
 def bytes_to_np(raw: bytes, dtype: str, shape: list[int]) -> np.ndarray:
     if dtype == "BF16":
-        # Convert BF16 -> F16 on the host. Several ggml-cuda ops (mul,
-        # binbcast) only accept F32 / F16 inputs, and llama.cpp's
-        # build_norm path multiplies normalised activations by the norm
-        # weight tensor. Storing the draft as F16 throughout sidesteps
-        # the unsupported BF16 path entirely. Quality impact ~0 for
-        # weight tensors (BF16 -> F16 keeps 10/8 mantissa bits anyway
-        # after the implicit cast).
+        # Keep BF16 raw bytes — do NOT narrow to F16. The sm86 RTX 3090 has
+        # native BF16 tensor core support, and ggml_mul_mat handles BF16
+        # weights directly. Narrowing to F16 loses mantissa precision which
+        # measurably degrades DFlash drafter acceptance (19% → target 30%+).
         u16 = np.frombuffer(raw, dtype=np.uint16).reshape(shape)
-        # bf16 = sign(1) + exp(8) + mantissa(7); reinterpret as f32 by
-        # putting it in the high half, then narrow to f16.
-        u32 = (u16.astype(np.uint32) << 16)
-        f32 = u32.view("<f4").reshape(shape)
-        return f32.astype("<f2")
+        # Return as uint16 — the caller will write with raw_dtype=BF16.
+        return u16
     if dtype == "F16":
         return np.frombuffer(raw, dtype="<f2").reshape(shape)
     if dtype == "F32":
@@ -226,8 +244,8 @@ def bytes_to_np(raw: bytes, dtype: str, shape: list[int]) -> np.ndarray:
 SAFETENSORS_DTYPE_TO_GGUF = {
     "F32":  gguf.GGMLQuantizationType.F32,
     "F16":  gguf.GGMLQuantizationType.F16,
-    # BF16 in safetensors -> we narrow to F16 in bytes_to_np above.
-    "BF16": gguf.GGMLQuantizationType.F16,
+    # BF16 preserved as-is for sm80+ native tensor core support.
+    "BF16": gguf.GGMLQuantizationType.BF16,
 }
 
 
@@ -351,6 +369,14 @@ def main():
         print(f"[warn] capture_layer_ids len {len(_cap_ids)} != n_target_layers "
               f"{a['n_target_layers']}; not embedding ids", file=sys.stderr)
 
+    # Sliding-window attention metadata (consumed by draft_gguf_loader.cpp).
+    # Qwen3.6 DFlash pattern: 5 sliding_attention + 1 full_attention, window=4096.
+    if a.get("sliding_window"):
+        writer.add_uint32(f"{ARCH}.attention.sliding_window", a["sliding_window"])
+    if a.get("sliding_window_pattern"):
+        writer.add_array(f"{ARCH}.attention.sliding_window_pattern",
+                         a["sliding_window_pattern"])
+
     # Walk + add tensors. Sort: dflash.* singletons first, then output_*,
     # then per-layer in numeric order — keeps the on-disk layout stable.
     pending = []
@@ -391,7 +417,13 @@ def main():
             gguf_name == "dflash.hidden_norm.weight"
         )
         if is_norm:
-            arr = arr.astype("<f4")
+            # Norms must be F32 (ggml-cuda elementwise mul asserts on BF16/F16 src1).
+            # Convert properly from source dtype.
+            if st_dtype == "BF16":
+                u32 = (arr.astype(np.uint32) << 16)
+                arr = u32.view("<f4").reshape(shape).copy()
+            else:
+                arr = arr.astype("<f4")
             raw_dtype = gguf.GGMLQuantizationType.F32
         writer.add_tensor(gguf_name, arr, raw_dtype=raw_dtype)
         print(f"[tensor] {gguf_name:50s} {st_dtype:4s}->{raw_dtype.name:4s} {tuple(shape)}")

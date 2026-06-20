@@ -640,6 +640,15 @@ bool Qwen35DFlashTarget::project_hidden_to_tokens(
     tokens_out.resize(n_tokens);
     ggml_backend_tensor_get(proj_sg_.argmax_tokens, tokens_out.data(), 0,
                             sizeof(int32_t) * n_tokens);
+    // Guard against invalid token IDs: at long context, NaN/Inf in the drafter's
+    // hidden states can produce garbage argmax results (negative or >= vocab).
+    // Clamp to valid range so verify_batch's embedder doesn't crash. The verify
+    // will simply reject the bad proposal (target argmax won't match).
+    for (int i = 0; i < n_tokens; i++) {
+        if (tokens_out[i] < 0 || tokens_out[i] >= w_.n_vocab) {
+            tokens_out[i] = 0;  // padding token — verify rejects, spec degrades gracefully
+        }
+    }
     return true;
 }
 

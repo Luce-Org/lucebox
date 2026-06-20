@@ -71,6 +71,10 @@ struct PipelinedDecodeTelemetry {
     uint64_t total_us = 0;
     uint64_t prefn_graph_build_us = 0;
     uint64_t prefn_compute_us = 0;
+    // prefn_compute split by layer type. WARNING: full routed-block wall span incl. MoE
+    // cold-expert CPU, NOT pure DeltaNet GPU — see thoughts/fused_deltanet_kernel_phase0_findings.md.
+    uint64_t prefn_ssm_us = 0;   // SSM/DeltaNet layers' routed-block span
+    uint64_t prefn_attn_us = 0;  // full-attn layers' routed-block span
     uint64_t routing_readback_us = 0;
     uint64_t ffn_us = 0;
     uint64_t ffn_allhot_us = 0;

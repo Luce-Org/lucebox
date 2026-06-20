@@ -463,12 +463,41 @@ bool load_target_gguf_partial(const std::string & path,
         std::printf("[loader] eos_id=%d eos_chat_id=%d\n", out.eos_id, out.eos_chat_id);
     }
 
-    // Compute capture layer IDs: evenly spaced through the target layers.
-    // step = (n_layer - 2) / (N - 1), ids[k] = 1 + k * step.
+    // Capture layer IDs: use exact IDs from the drafter's config if the
+    // early-read sync set them (from dflash.target_layer_ids in the drafter
+    // GGUF). Otherwise fall back to evenly-spaced heuristic.
+    // The drafter's fc projection was trained against specific target layers;
+    // an off-by-one in even one tap degrades acceptance significantly.
     {
         const int N = out.n_capture_layers;
-        const int step = ((int)n_layer - 2) / (N - 1);
-        for (int k = 0; k < N; k++) out.capture_layer_ids[k] = 1 + k * step;
+        bool ids_valid = (N > 0 && N <= DFLASH_MAX_CAPTURE_LAYERS);
+        if (ids_valid) {
+            // Check if early-read set non-default values (i.e., not the
+            // old 5-layer default {1,16,31,46,61}).
+            // If N changed from default 5, the IDs were definitely set by
+            // early-read and should be respected.
+            const bool was_early_read = (N != DFLASH27B_DRAFT_N_TARGET_LAYERS);
+            if (was_early_read) {
+                std::printf("[loader] using drafter-specified capture layers (%d)\n", N);
+            } else {
+                // Even for N==5, check if IDs differ from default heuristic.
+                const int step = ((int)n_layer - 2) / (N - 1);
+                bool matches_heuristic = true;
+                for (int k = 0; k < N; k++) {
+                    if (out.capture_layer_ids[k] != 1 + k * step) {
+                        matches_heuristic = false;
+                        break;
+                    }
+                }
+                if (!matches_heuristic) {
+                    std::printf("[loader] using drafter-specified capture layers (non-default)\n");
+                } else {
+                    // Matches heuristic — recompute for consistency.
+                    for (int k = 0; k < N; k++)
+                        out.capture_layer_ids[k] = 1 + k * step;
+                }
+            }
+        }
     }
 
     out.layers.assign((size_t)n_layer, TargetLayer{});

@@ -507,6 +507,72 @@ static float read_rope_theta_from_config(const std::string & st_path) {
     return val;
 }
 
+// Read DFlash-specific config from config.json next to the safetensors:
+//   dflash_config.mask_token_id, sliding_window, layer_types (SWA pattern).
+// These are essential for Qwen3.6 drafters (mask=248077, 5 SWA + 1 full).
+static void read_dflash_config_from_json(const std::string & st_path, DraftWeights & out) {
+    std::string dir = st_path;
+    const size_t slash = dir.find_last_of("/\\");
+    if (slash != std::string::npos) dir.resize(slash + 1); else dir = "./";
+    const std::string cfg_path = dir + "config.json";
+
+    FILE * f = std::fopen(cfg_path.c_str(), "r");
+    if (!f) return;
+    std::string buf;
+    char tmp[4096];
+    while (std::fgets(tmp, sizeof(tmp), f)) buf += tmp;
+    std::fclose(f);
+
+    // mask_token_id: look under dflash_config first, then top level.
+    auto find_int = [&](const std::string & key) -> long long {
+        size_t pos = buf.find("\"" + key + "\"");
+        if (pos == std::string::npos) return LLONG_MIN;
+        pos += key.size() + 3;  // skip "key"
+        while (pos < buf.size() && (buf[pos] == ' ' || buf[pos] == ':' || buf[pos] == '\t')) pos++;
+        return std::strtoll(buf.c_str() + pos, nullptr, 10);
+    };
+
+    long long mask = find_int("mask_token_id");
+    if (mask > 0 && mask < INT32_MAX) {
+        out.mask_token_id = (int32_t)mask;
+        std::fprintf(stderr, "[draft-st] mask_token_id=%d (from config.json)\n", out.mask_token_id);
+    }
+
+    long long sw = find_int("sliding_window");
+    if (sw > 0) {
+        out.swa_window = (int)sw;
+        std::fprintf(stderr, "[draft-st] sliding_window=%d (from config.json)\n", out.swa_window);
+    }
+
+    // layer_types: set is_swa per layer. "sliding_attention" = true, "full_attention" = false.
+    // Scan for the array and assign in order.
+    size_t lt_pos = buf.find("\"layer_types\"");
+    if (lt_pos != std::string::npos) {
+        size_t arr_start = buf.find('[', lt_pos);
+        size_t arr_end   = buf.find(']', arr_start);
+        if (arr_start != std::string::npos && arr_end != std::string::npos) {
+            std::string arr = buf.substr(arr_start, arr_end - arr_start);
+            int layer_idx = 0;
+            size_t s = 0;
+            while (layer_idx < out.n_layer) {
+                size_t q1 = arr.find('"', s);
+                if (q1 == std::string::npos) break;
+                size_t q2 = arr.find('"', q1 + 1);
+                if (q2 == std::string::npos) break;
+                std::string lt = arr.substr(q1 + 1, q2 - q1 - 1);
+                out.layers[layer_idx].is_swa = (lt == "sliding_attention");
+                layer_idx++;
+                s = q2 + 1;
+            }
+            int n_swa = 0;
+            for (int i = 0; i < out.n_layer; i++) if (out.layers[i].is_swa) n_swa++;
+            if (n_swa > 0)
+                std::fprintf(stderr, "[draft-st] SWA layers: %d/%d (window=%d)\n",
+                             n_swa, out.n_layer, out.swa_window);
+        }
+    }
+}
+
 } // namespace
 
 bool load_draft_safetensors(const std::string & path,
@@ -535,9 +601,24 @@ bool load_draft_safetensors(const std::string & path,
     const uint8_t * blob = (const uint8_t *)mm.addr + 8 + header_len;
     const size_t    blob_len = mm.len - 8 - header_len;
 
-    // ── 3. Allocate ggml context big enough for 5 layers × 11 + 3 top ─
-    const int n_layers    = DFLASH27B_DRAFT_LAYERS;
-    const int n_tensors   = 3 + 11 * n_layers;  // with some headroom below
+    // ── 3. Allocate ggml context — count actual layers from header ──
+    // Each layer has 11 tensors (attn_norm, ffn_norm, wq, wk, wv, wo, q_norm,
+    // k_norm, w_gate, w_up, w_down). Count by scanning for layers.N. prefixes.
+    int n_layers = DFLASH27B_DRAFT_LAYERS;
+    {
+        int max_layer = -1;
+        for (const auto & [name, _] : st) {
+            if (name.substr(0, 7) == "layers.") {
+                size_t dot = name.find('.', 7);
+                if (dot != std::string::npos) {
+                    int li = std::atoi(name.c_str() + 7);
+                    if (li > max_layer) max_layer = li;
+                }
+            }
+        }
+        if (max_layer >= 0) n_layers = max_layer + 1;
+    }
+    const int n_tensors   = 3 + 11 * n_layers + 16;  // headroom
     ggml_init_params ip{};
     ip.mem_size   = (size_t)(n_tensors + 16) * ggml_tensor_overhead();
     ip.mem_buffer = nullptr;
@@ -559,7 +640,11 @@ bool load_draft_safetensors(const std::string & path,
         return false;
     }
     if (target) {
-        out.mask_token_id = target->mask_token_id;
+        // Only inherit target's mask_token_id if our config.json didn't set one.
+        // (read_dflash_config_from_json below may override this.)
+        if (out.mask_token_id == DFLASH27B_DRAFT_MASK_TOKEN_ID) {
+            out.mask_token_id = target->mask_token_id;
+        }
         if (out.n_embd != target->n_embd) {
             char buf[256];
             std::snprintf(buf, sizeof(buf),
@@ -578,6 +663,11 @@ bool load_draft_safetensors(const std::string & path,
         }
     }
     out.layers.assign(n_layers, DraftLayer{});
+
+    // Read mask_token_id and SWA config from config.json (Qwen3.6 drafters
+    // use mask_token_id=248077 and 5 sliding + 1 full attention layers).
+    // Must be called AFTER out.layers.assign() since it sets is_swa per layer.
+    read_dflash_config_from_json(path, out);
 
     const int64_t HIDDEN  = out.n_embd;
     const int64_t Q_DIM   = out.n_head * out.head_dim;

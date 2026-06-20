@@ -477,7 +477,9 @@ bool pipelined_decode_one_token(
             ggml_backend_tensor_copy_async(backend, backend, state.gpu_state.combine.output, state.gpu_state.act_cur);
 
             if (tel) {
-                tel->prefn_compute_us += pipe_elapsed_us(prefn_compute_t0, PipelineClock::now());
+                const uint64_t _dt = pipe_elapsed_us(prefn_compute_t0, PipelineClock::now());
+                tel->prefn_compute_us += _dt;
+                (is_attn ? tel->prefn_attn_us : tel->prefn_ssm_us) += _dt;
                 tel->routed_prefn_us += pipe_elapsed_us(prefn_compute_t0, sync_t0);
                 tel->routed_sync_us += pipe_elapsed_us(sync_t0, sync_t1);
                 tel->routed_readback_us += pipe_elapsed_us(sync_t1, readback_t1);
@@ -549,7 +551,9 @@ bool pipelined_decode_one_token(
             const auto prefn_compute_t0 = PipelineClock::now();
             auto st = ggml_backend_graph_compute(backend, cpg.gf);
             if (st != GGML_STATUS_SUCCESS) return false;
-            if (tel) tel->prefn_compute_us += pipe_elapsed_us(prefn_compute_t0, PipelineClock::now());
+            if (tel) { const uint64_t _dt = pipe_elapsed_us(prefn_compute_t0, PipelineClock::now());
+                       tel->prefn_compute_us += _dt;
+                       (is_attn ? tel->prefn_attn_us : tel->prefn_ssm_us) += _dt; }
 
             ffn_post_gpu = cpg.ffn_post;
             ffn_residual_gpu = cpg.ffn_residual;
@@ -588,7 +592,9 @@ bool pipelined_decode_one_token(
                 step_graph_destroy(dyn_sg);
                 return false;
             }
-            if (tel) tel->prefn_compute_us += pipe_elapsed_us(prefn_compute_t0, PipelineClock::now());
+            if (tel) { const uint64_t _dt = pipe_elapsed_us(prefn_compute_t0, PipelineClock::now());
+                       tel->prefn_compute_us += _dt;
+                       (is_attn ? tel->prefn_attn_us : tel->prefn_ssm_us) += _dt; }
 
             ffn_post_gpu = dyn_sg.ffn_post;
             ffn_residual_gpu = dyn_sg.ffn_residual;
@@ -606,7 +612,9 @@ bool pipelined_decode_one_token(
             const auto prefn_compute_t0 = PipelineClock::now();
             auto st = ggml_backend_graph_compute(backend, cpg.gf);
             if (st != GGML_STATUS_SUCCESS) return false;
-            if (tel) tel->prefn_compute_us += pipe_elapsed_us(prefn_compute_t0, PipelineClock::now());
+            if (tel) { const uint64_t _dt = pipe_elapsed_us(prefn_compute_t0, PipelineClock::now());
+                       tel->prefn_compute_us += _dt;
+                       (is_attn ? tel->prefn_attn_us : tel->prefn_ssm_us) += _dt; }
 
             ffn_post_gpu = cpg.ffn_post;
             ffn_residual_gpu = cpg.ffn_residual;

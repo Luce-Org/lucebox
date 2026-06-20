@@ -34,7 +34,7 @@ static bool build_draft_graph_internal(
     bool mirror_view) {
 
     ggml_init_params ip{};
-    ip.mem_size   = 256 * 1024 * 1024;
+    ip.mem_size   = 4 * 1024 * 1024;  // 4MB (was 256MB — wildly oversized for 6-layer draft)
     ip.mem_buffer = nullptr;
     ip.no_alloc   = true;
     sg.ctx = ggml_init(ip);
@@ -124,23 +124,36 @@ bool build_draft_step(
     const DraftFeatureMirror * mirror,
     int committed,
     int /*ctx_len_max*/) {
+    int mirror_slot0 = 0;
+    const bool use_view = mirror &&
+        draft_feature_mirror_can_view(*mirror, committed, ctx_len, mirror_slot0);
+
+    // Reuse guard: once committed exceeds the draft context cap, ctx_len is
+    // constant across steps and — since the mirror view is almost never
+    // available in steady state (it requires committed % cap == 0) — the graph
+    // is built non-view with identical topology every step. Skip the rebuild
+    // and let the caller refresh inp_embed / target_hidden_cat / positions;
+    // the attn_mask depends only on ctx_len and is already populated. Views are
+    // never reused: their baked-in ggml_view_3d offset slides with `committed`,
+    // so a reused view would point at the wrong ring slot. Disable with
+    // DFLASH_DRAFT_GRAPH_REUSE=0 for A/B comparison.
+    static const bool kReuseEnabled = []() {
+        const char * e = std::getenv("DFLASH_DRAFT_GRAPH_REUSE");
+        return e == nullptr || std::string(e) != "0";
+    }();
+    if (kReuseEnabled && sg.ctx && sg.graph_ctx_len == ctx_len &&
+        !use_view && !sg.graph_used_view) {
+        return true;
+    }
+
     step_graph_free(sg);
 
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     }
 
-    int mirror_slot0 = 0;
-    const bool use_view = mirror &&
-        draft_feature_mirror_can_view(*mirror, committed, ctx_len, mirror_slot0);
-
-    // If ctx_len exceeds our cached reserve, re-reserve at next 64 boundary.
-    // This makes all subsequent alloc_graph calls within the 64-token window
-    // a no-op (no CUDA free+alloc).
     const int ctx_padded = (ctx_len + 63) & ~63;
     if (ctx_padded > sg.alloc_reserved_ctx) {
-        // Build a dummy graph at ctx_padded just for sizing.
-        // Use non-view path for reserve (view tensors don't need allocation).
         if (!build_draft_graph_internal(sg, dw, lm_head, ctx_padded,
                                         nullptr, 0, false)) {
             return false;
@@ -150,7 +163,6 @@ bool build_draft_step(
         step_graph_free(sg);
     }
 
-    // Build real graph at ctx_len for actual computation.
     if (!build_draft_graph_internal(sg, dw, lm_head, ctx_len,
                                     mirror, mirror_slot0, use_view)) {
         return false;
@@ -160,7 +172,6 @@ bool build_draft_step(
         return false;
     }
 
-    // Fill causal mask data for SWA layers (after allocation gives memory to the tensor).
     if (sg.attn_mask) {
         const int q_len = dw.block_size;
         const bool swa_active = dw.swa_window > 0 && ctx_len > dw.swa_window;
@@ -168,9 +179,6 @@ bool build_draft_step(
         const int eff_total_k = eff_ctx + q_len;
         const int kv_pad = mask_align_up(eff_total_k, MASK_KV_PAD);
 
-        // Build causal mask in F16 directly (same pattern as attn_masks.h):
-        // Context keys (k < eff_ctx): always visible.
-        // Noise keys (k = eff_ctx + j): visible if j <= q (causal).
         static constexpr uint16_t ZERO = 0x0000;
         static constexpr uint16_t NEG_INF = 0xFC00;
         std::vector<uint16_t> mask_data((size_t)kv_pad * q_len, NEG_INF);
@@ -184,6 +192,8 @@ bool build_draft_step(
                                 sizeof(uint16_t) * mask_data.size());
     }
 
+    sg.graph_ctx_len   = ctx_len;
+    sg.graph_used_view = use_view;
     return true;
 }
 

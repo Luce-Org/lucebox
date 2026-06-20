@@ -44,6 +44,17 @@ protected:
     void after_target_compute(StepGraph & sg, int kv_start, int n_tokens) override;
 
 private:
+    struct HybridSpecBatchProfile;
+    struct HybridSpecGraphCache;
+
+    // Persistent spec-decode graph containers (avoid per-step rebuild).
+    StepGraph moe_draft_sg_;
+    StepGraph moe_proj_sg_;
+    // Persistent logits graph for hybrid_forward_one_token (verify + replay).
+    // Without this, every token in the 8-token verify + 2-token replay builds
+    // and destroys a 64MB StepGraph (~10ms/token of pure overhead).
+    StepGraph moe_hybrid_logits_sg_;
+
     // All-hot placement signal for post_kvflash_init_gate(): set when
     // load_target_model takes the all-hot early-return (moe_hybrid null).
     bool placement_all_hot_ = false;
@@ -51,6 +62,7 @@ private:
     // (KVFlash redundant). When false but placement_all_hot_ is true, the pool
     // is what kept experts hot — the gate must NOT disable KVFlash.
     bool placement_all_hot_full_kv_ = false;
+
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string routing_stats_out_path_;
     std::string placement_out_path_;
