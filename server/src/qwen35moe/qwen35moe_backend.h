@@ -47,6 +47,14 @@ private:
     struct HybridSpecBatchProfile;
     struct HybridSpecGraphCache;
 
+    // Persistent spec-decode graph containers (avoid per-step rebuild).
+    StepGraph moe_draft_sg_;
+    StepGraph moe_proj_sg_;
+    // Persistent logits graph for hybrid_forward_one_token (verify + replay).
+    // Without this, every token in the 8-token verify + 2-token replay builds
+    // and destroys a 64MB StepGraph (~10ms/token of pure overhead).
+    StepGraph moe_hybrid_logits_sg_;
+
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string routing_stats_out_path_;
     std::string placement_out_path_;

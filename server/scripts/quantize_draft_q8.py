@@ -8,6 +8,8 @@ to Q8_0 (~50% size reduction vs BF16).  Norm weights stay F32
 
 The output GGUF uses the same arch and tensor naming as
 convert_dflash_to_gguf.py so draft_gguf_loader.cpp can load it.
+Architecture is resolved dynamically from config.json + tensor shapes
+via the shared load_arch() — no hardcoded constants.
 
 Usage:
     python3 scripts/quantize_draft_q8.py \
@@ -16,84 +18,20 @@ Usage:
 """
 
 import argparse
-import json
-import struct
 import sys
 from pathlib import Path
 
 import numpy as np
 import gguf
 
-# ──────────────────────────────────────────────────────────────────────
-# DFlash 27B draft architecture constants (must match dflash27b.h)
-# ──────────────────────────────────────────────────────────────────────
+# Share arch resolution, tensor-name mapping, and safetensors I/O with
+# the F16 converter so both produce structurally identical GGUF metadata.
+from convert_dflash_to_gguf import (
+    ARCH, load_arch, map_name, is_norm_tensor,
+    load_safetensors_header,
+)
 
-ARCH                = "qwen35-dflash-draft"
-HIDDEN              = 5120
-N_LAYER             = 5
-N_HEAD              = 32
-N_HEAD_KV           = 8
-HEAD_DIM            = 128
-INTERMEDIATE        = 17408
-VOCAB               = 248320
-N_TARGET_LAYERS     = 5
-ROPE_THETA          = 1_000_000.0
-RMS_EPS             = 1e-6
-MASK_TOKEN_ID       = 248070
-BLOCK_SIZE          = 16
-CTX_LEN             = 32768
-
-Q8_0_BLOCK_SIZE     = 32   # elements per Q8_0 block
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Tensor name mapping  —  DFlash safetensors -> llama.cpp GGUF
-# (Identical to convert_dflash_to_gguf.py)
-# ──────────────────────────────────────────────────────────────────────
-
-def map_name(name: str) -> str | None:
-    if name == "fc.weight":          return "dflash.fc.weight"
-    if name == "hidden_norm.weight": return "dflash.hidden_norm.weight"
-    if name == "norm.weight":        return "output_norm.weight"
-    if name.startswith("layers."):
-        parts = name.split(".", 2)
-        if len(parts) < 3: return None
-        i = int(parts[1])
-        rest = parts[2]
-        layer_map = {
-            "input_layernorm.weight":          f"blk.{i}.attn_norm.weight",
-            "post_attention_layernorm.weight": f"blk.{i}.ffn_norm.weight",
-            "self_attn.q_proj.weight":         f"blk.{i}.attn_q.weight",
-            "self_attn.k_proj.weight":         f"blk.{i}.attn_k.weight",
-            "self_attn.v_proj.weight":         f"blk.{i}.attn_v.weight",
-            "self_attn.o_proj.weight":         f"blk.{i}.attn_output.weight",
-            "self_attn.q_norm.weight":         f"blk.{i}.attn_q_norm.weight",
-            "self_attn.k_norm.weight":         f"blk.{i}.attn_k_norm.weight",
-            "mlp.gate_proj.weight":            f"blk.{i}.ffn_gate.weight",
-            "mlp.up_proj.weight":              f"blk.{i}.ffn_up.weight",
-            "mlp.down_proj.weight":            f"blk.{i}.ffn_down.weight",
-        }
-        return layer_map.get(rest)
-    return None
-
-
-def is_norm_tensor(gguf_name: str) -> bool:
-    return (
-        gguf_name.endswith("_norm.weight") or
-        gguf_name == "output_norm.weight" or
-        gguf_name == "dflash.hidden_norm.weight"
-    )
-
-
-# ──────────────────────────────────────────────────────────────────────
-# safetensors reader
-# ──────────────────────────────────────────────────────────────────────
-
-def load_safetensors_header(path: Path):
-    with open(path, "rb") as f:
-        header_size = struct.unpack("<Q", f.read(8))[0]
-        header_json = f.read(header_size).decode("utf-8")
-        return header_size, json.loads(header_json)
+Q8_0_BLOCK_SIZE = 32   # elements per Q8_0 block
 
 
 def read_tensor_bytes(path: Path, header_size: int, info: dict) -> bytes:
@@ -107,6 +45,14 @@ def bf16_bytes_to_f32(raw: bytes, shape: list[int]) -> np.ndarray:
     u16 = np.frombuffer(raw, dtype=np.uint16).reshape(shape)
     u32 = (u16.astype(np.uint32) << 16)
     return u32.view("<f4").reshape(shape)
+
+
+def is_norm_tensor(gguf_name: str) -> bool:
+    return (
+        gguf_name.endswith("_norm.weight") or
+        gguf_name == "output_norm.weight" or
+        gguf_name == "dflash.hidden_norm.weight"
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -131,27 +77,36 @@ def main():
     n_entries = sum(1 for k in header if k != "__metadata__")
     print(f"[info]   {n_entries} tensor entries")
 
+    a = load_arch(args.safetensors, header)
+
     writer = gguf.GGUFWriter(args.out_gguf, ARCH)
 
-    # Architecture metadata (identical to convert_dflash_to_gguf.py)
-    writer.add_string("general.name", "Qwen3.5-27B-DFlash-Draft-Q8_0")
+    # Architecture metadata (resolved from config.json + tensor shapes)
+    writer.add_string("general.name", f"DFlash-Draft-{a['hidden']}h-{a['n_layer']}L-Q8_0")
     writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
-    writer.add_uint32(f"{ARCH}.context_length",          CTX_LEN)
-    writer.add_uint32(f"{ARCH}.embedding_length",        HIDDEN)
-    writer.add_uint32(f"{ARCH}.block_count",             N_LAYER)
-    writer.add_uint32(f"{ARCH}.feed_forward_length",     INTERMEDIATE)
-    writer.add_uint32(f"{ARCH}.attention.head_count",    N_HEAD)
-    writer.add_uint32(f"{ARCH}.attention.head_count_kv", N_HEAD_KV)
-    writer.add_uint32(f"{ARCH}.attention.key_length",    HEAD_DIM)
-    writer.add_uint32(f"{ARCH}.attention.value_length",  HEAD_DIM)
-    writer.add_uint32(f"{ARCH}.vocab_size",              VOCAB)
-    writer.add_float32(f"{ARCH}.attention.layer_norm_rms_epsilon", RMS_EPS)
-    writer.add_float32(f"{ARCH}.rope.freq_base",         ROPE_THETA)
+    writer.add_uint32(f"{ARCH}.context_length",          a["ctx_len"])
+    writer.add_uint32(f"{ARCH}.embedding_length",        a["hidden"])
+    writer.add_uint32(f"{ARCH}.block_count",             a["n_layer"])
+    writer.add_uint32(f"{ARCH}.feed_forward_length",     a["intermediate"])
+    writer.add_uint32(f"{ARCH}.attention.head_count",    a["n_head"])
+    writer.add_uint32(f"{ARCH}.attention.head_count_kv", a["n_head_kv"])
+    writer.add_uint32(f"{ARCH}.attention.key_length",    a["head_dim"])
+    writer.add_uint32(f"{ARCH}.attention.value_length",  a["head_dim"])
+    writer.add_uint32(f"{ARCH}.vocab_size",              a["vocab"])
+    writer.add_float32(f"{ARCH}.attention.layer_norm_rms_epsilon", a["rms_eps"])
+    writer.add_float32(f"{ARCH}.rope.freq_base",         a["rope_theta"])
 
     # DFlash-specific hyperparameters
-    writer.add_uint32(f"{ARCH}.dflash.n_target_layers", N_TARGET_LAYERS)
-    writer.add_uint32(f"{ARCH}.dflash.block_size",      BLOCK_SIZE)
-    writer.add_uint32(f"{ARCH}.dflash.mask_token_id",   MASK_TOKEN_ID)
+    writer.add_uint32(f"{ARCH}.dflash.n_target_layers", a["n_target_layers"])
+    writer.add_uint32(f"{ARCH}.dflash.block_size",      a["block_size"])
+    writer.add_uint32(f"{ARCH}.dflash.mask_token_id",   a["mask_token_id"])
+
+    # Sliding-window attention metadata (consumed by draft_gguf_loader.cpp).
+    if a.get("sliding_window"):
+        writer.add_uint32(f"{ARCH}.attention.sliding_window", a["sliding_window"])
+    if a.get("sliding_window_pattern"):
+        writer.add_array(f"{ARCH}.attention.sliding_window_pattern",
+                         a["sliding_window_pattern"])
 
     # Collect and sort tensors (same order as convert_dflash_to_gguf.py)
     pending = []

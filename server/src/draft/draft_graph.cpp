@@ -49,6 +49,23 @@ DraftGraphOutputs build_draft_graph(
     const float eps    = DFLASH27B_RMS_EPS;
     const float rope_base = w.rope_theta;
 
+    // Early-exit: stop the draft forward after N layers (env override).
+    // The new 6-layer DFlash drafter is deep enough that layers 5-6 contribute
+    // marginally to proposal quality. Exiting at layer 3-4 saves ~33-50% of
+    // the drafter forward wall time. Acceptance drops slightly but the
+    // throughput gain dominates.
+    const int full_n_layer = w.n_layer;
+    const int early_exit_n = []() -> int {
+        const char * e = std::getenv("DFLASH_DRAFT_EARLY_EXIT_N");
+        if (e) {
+            int v = std::atoi(e);
+            if (v > 0) return v;
+        }
+        return 0;  // 0 = sentinel for "use all layers"
+    }();
+    const int fwd_layer_limit = (early_exit_n > 0 && early_exit_n < full_n_layer)
+        ? early_exit_n : full_n_layer;
+
     // ── 1. Feature fusion: target_feat = rms_norm(fc @ target_hidden_cat, hidden_norm)
     //    fc:                [5*hidden, hidden]  (ggml: ne[0]=5*hidden, ne[1]=hidden)
     //    target_hidden_cat: [5*hidden, ctx_len, 1]
@@ -61,7 +78,7 @@ DraftGraphOutputs build_draft_graph(
     // ── 2. Decoder layers
     ggml_tensor * h = in.noise_embed;  // [hidden, q_len, 1]
 
-    for (int il = 0; il < w.n_layer; il++) {
+    for (int il = 0; il < fwd_layer_limit; il++) {
         const DraftLayer & L = w.layers[il];
 
         // ── SWA: determine effective context for this layer

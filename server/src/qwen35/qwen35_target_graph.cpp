@@ -190,8 +190,14 @@ bool create_target_cache_partial(const TargetWeights & w,
             }
         }
 
-        constexpr int TARGET_FEAT_CAP_DEFAULT = 4096;
-        out.target_feat_cap = std::min(max_ctx, TARGET_FEAT_CAP_DEFAULT);
+        // Feature ring cap. The drafter needs the last `cap` target hidden states
+        // as context. 4096 is enough for short prompts but acceptance collapses
+        // at exactly 4096 (ring wrap). Override with DFLASH_FEAT_RING_CAP env.
+        int target_feat_cap_default = 4096;
+        if (const char * e = std::getenv("DFLASH_FEAT_RING_CAP")) {
+            target_feat_cap_default = std::atoi(e);
+        }
+        out.target_feat_cap = std::min(max_ctx, target_feat_cap_default);
         if (allocate_target_feat) {
             const int fc_in = w.n_capture_layers * w.n_embd;
             out.target_feat = ggml_new_tensor_2d(out.base_ctx, GGML_TYPE_BF16, fc_in, out.target_feat_cap);

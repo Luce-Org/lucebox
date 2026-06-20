@@ -117,6 +117,65 @@ int count_swa_layers(const DraftWeights & w) {
 
 } // namespace
 
+// Lightweight metadata-only read of the drafter's capture-layer config.
+// Opens the GGUF header (no tensor data loaded), extracts n_target_layers
+// and target_layer_ids, and returns them. Called by the backend BEFORE
+// load_target_model so that target_feat is allocated with the correct
+// fc_in = n_capture_layers * n_embd dimension.
+bool read_draft_capture_config(const std::string & path,
+                               int & n_capture,
+                               int * capture_ids,
+                               int max_ids) {
+    n_capture = 0;
+    gguf_init_params gip{};
+    gip.no_alloc = true;
+    gip.ctx      = nullptr;  // metadata-only: no tensor context
+    gguf_context * gctx = gguf_init_from_file(path.c_str(), gip);
+    if (!gctx) return false;
+
+    // Resolve the arch prefix for key building.
+    std::string A = "qwen35-dflash-draft";
+    {
+        int64_t arch_id = gguf_find_key(gctx, "general.architecture");
+        if (arch_id >= 0) {
+            const char * arch = gguf_get_val_str(gctx, arch_id);
+            if (arch) A = arch;
+        }
+    }
+
+    char key[128];
+
+    // Read n_target_layers.
+    std::snprintf(key, sizeof(key), "%s.%s", A.c_str(), "dflash.n_target_layers");
+    int64_t ntl_id = gguf_find_key(gctx, key);
+    if (ntl_id >= 0) {
+        n_capture = (int)gguf_get_val_u32(gctx, ntl_id);
+    }
+
+    // Read target_layer_ids array (exact capture positions from training).
+    std::snprintf(key, sizeof(key), "%s.%s", A.c_str(), "dflash.target_layer_ids");
+    int64_t tli_id = gguf_find_key(gctx, key);
+    if (tli_id >= 0 && gguf_get_kv_type(gctx, tli_id) == GGUF_TYPE_ARRAY) {
+        const size_t n = std::min((size_t)gguf_get_arr_n(gctx, tli_id),
+                                  (size_t)max_ids);
+        const int32_t * ids = static_cast<const int32_t *>(gguf_get_arr_data(gctx, tli_id));
+        for (size_t k = 0; k < n; k++) {
+            capture_ids[k] = (int)ids[k];
+        }
+        if (n > 0) n_capture = (int)n;
+    }
+
+    gguf_free(gctx);
+
+    if (n_capture > 0) {
+        std::fprintf(stderr, "[draft-cfg] early-read: n_capture=%d ids=", n_capture);
+        for (int k = 0; k < n_capture && k < max_ids; k++)
+            std::fprintf(stderr, "%s%d", k ? "," : "[", capture_ids[k]);
+        std::fprintf(stderr, "]\n");
+    }
+    return n_capture > 0;
+}
+
 bool load_draft_gguf(const std::string & path,
                      ggml_backend_t       backend,
                      DraftWeights &       out,
@@ -206,11 +265,30 @@ bool load_draft_gguf(const std::string & path,
 
     // Store GGUF-declared config into DraftWeights (replaces hardcoded defaults).
     out.block_size = (int)block_sz;
+    // Env override: DFLASH_DRAFT_BLOCK_SIZE allows serving with a smaller
+    // block than the model was trained with (e.g. 8 instead of 16). The model
+    // card shows block=8 gives similar throughput with lower per-step cost.
+    if (const char * bs_env = std::getenv("DFLASH_DRAFT_BLOCK_SIZE")) {
+        int bs = std::atoi(bs_env);
+        if (bs >= 4 && bs <= 32) {
+            out.block_size = bs;
+            std::fprintf(stderr, "[draft] block_size override: %d (from env)\n", bs);
+        }
+    }
     out.n_target_layers = (int)n_tgt_lay;
 
-    // Propagate target model properties if available.
-    if (target) {
-        out.mask_token_id = target->mask_token_id;
+    // Read mask_token_id from GGUF metadata. Each DFlash drafter is trained
+    // with a specific MASK token from the target's vocabulary (e.g. Qwen3.5
+    // uses 248070, Qwen3.6 uses 248077). The GGUF carries the correct value
+    // via dflash.mask_token_id. Only fall back to the target's value (which
+    // defaults to the old Qwen3.5 constant) if the GGUF doesn't declare it.
+    {
+        const uint32_t gguf_mask = read_u32("dflash.mask_token_id", 0xFFFFFFFFu);
+        if (gguf_mask != 0xFFFFFFFFu) {
+            out.mask_token_id = (int32_t)gguf_mask;
+        } else if (target) {
+            out.mask_token_id = target->mask_token_id;
+        }
     }
 
     // Upper bounds on hparams. Guards against malformed/hostile GGUFs that

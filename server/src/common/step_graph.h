@@ -25,6 +25,14 @@ struct StepGraph {
     // When the real ctx_len fits within this, alloc_graph is a no-op.
     int alloc_reserved_ctx = 0;
 
+    // Draft-graph reuse guard: the ctx_len and view-mode the current draft
+    // graph was built for. When the next step requests the same ctx_len with a
+    // non-view build, the topology is identical and build_draft_step skips the
+    // rebuild (the caller refreshes input tensors). Views aren't reused because
+    // their offset slides each step with `committed`.
+    int  graph_ctx_len   = 0;
+    bool graph_used_view = false;
+
     // Named inputs
     ggml_tensor *   inp_embed = nullptr;
     ggml_tensor *   positions = nullptr;
@@ -73,6 +81,8 @@ inline void step_graph_free(StepGraph & sg) {
     sg.valid_lut = nullptr;
     sg.delta_captures.clear();
     sg.moe_selected.clear();
+    sg.graph_ctx_len = 0;
+    sg.graph_used_view = false;
 }
 
 // Full cleanup: release the persistent gallocr + its CUDA buffer.
