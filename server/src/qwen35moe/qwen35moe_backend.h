@@ -20,7 +20,7 @@ namespace dflash::common {
 class Qwen35MoeBackend : public Qwen35Backend {
 public:
     explicit Qwen35MoeBackend(const Qwen35Config & cfg);
-    ~Qwen35MoeBackend() override = default;
+    ~Qwen35MoeBackend() override;
 
     GenerateResult generate_impl(const GenerateRequest & req,
                                  const DaemonIO & io) override;
@@ -44,13 +44,9 @@ protected:
     void after_target_compute(StepGraph & sg, int kv_start, int n_tokens) override;
 
 private:
-    // All-hot placement signal for post_kvflash_init_gate(): set when
-    // load_target_model takes the all-hot early-return (moe_hybrid null).
-    bool placement_all_hot_ = false;
-    // True iff all experts fit hot with the FULL max_ctx KV reservation
-    // (KVFlash redundant). When false but placement_all_hot_ is true, the pool
-    // is what kept experts hot — the gate must NOT disable KVFlash.
-    bool placement_all_hot_full_kv_ = false;
+    struct HybridSpecBatchProfile;
+    struct HybridSpecGraphCache;
+
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string routing_stats_out_path_;
     std::string placement_out_path_;
@@ -62,6 +58,15 @@ private:
     bool hybrid_telemetry_ = false;
     MoeHybridStreamEngine stream_engine_;
     MoeRoutingCollector * routing_collector_ = nullptr;
+    // Set when load_target_model's dynamic placement fit ALL experts on GPU
+    // (the all-hot early-return path).  post_kvflash_init_gate() uses this
+    // as the authoritative placement signal instead of the byte-math fit check,
+    // since moe_hybrid is null on that path (no cold storage needed).
+    bool placement_all_hot_ = false;
+    // True iff all experts fit hot with the FULL max_ctx KV reservation (i.e.
+    // KVFlash is redundant). When false but placement_all_hot_ is true, the
+    // pool is what kept experts hot — the gate must NOT disable KVFlash.
+    bool placement_all_hot_full_kv_ = false;
 
     void maybe_post_request_swap();
     bool load_dynamic_placement(const char * hotness_path,
@@ -98,6 +103,8 @@ private:
 
     // Persistent pipelined state (initialized once, reused across requests)
     std::unique_ptr<struct PipelinedDecodeState> pipe_state_;
+    std::unique_ptr<HybridSpecGraphCache> hybrid_spec_graph_cache_;
+    bool spec_microbench_done_ = false;
     bool ensure_pipe_state(int kv_start);
 };
 

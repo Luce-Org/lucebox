@@ -534,7 +534,8 @@ bool DiskPrefixCache::maybe_store_continued(int slot,
 
 int DiskPrefixCache::cold_prefix_boundary(const std::vector<int32_t> & prompt_ids,
                                           const std::vector<int> & boundaries) {
-    if (disabled() || !layout_known_) return 0;
+    if (disabled()) return 0;
+    // layout_known_ is bootstrapped by save() internally; don't block cold-save on empty cache.
 
     const int prompt_len = (int)prompt_ids.size();
     if (prompt_len <= config_.cold_max_tokens) return 0;

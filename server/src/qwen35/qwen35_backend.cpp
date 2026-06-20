@@ -237,6 +237,28 @@ bool Qwen35Backend::init() {
     kvflash_qk_policy_ = kvflash_policy_is_qk();
     if (std::getenv("DFLASH_KVFLASH") && !kvflash_qk_policy_) {
         kvflash_drafter_path_ = kvflash_find_drafter(cfg_.target_path);
+        // Parse DFLASH_KVFLASH_PIN_SPANS="lo:hi,lo:hi" token ranges.
+        if (const char * ps = std::getenv("DFLASH_KVFLASH_PIN_SPANS")) {
+            const char * p = ps;
+            while (*p) {
+                long lo = 0, hi = 0;
+                char * end = nullptr;
+                lo = std::strtol(p, &end, 10);
+                if (end == p || *end != ':') break;
+                p = end + 1;
+                hi = std::strtol(p, &end, 10);
+                if (end == p) break;
+                if (lo >= 0 && hi >= lo) {
+                    kvflash_pin_spans_.push_back({(int)lo, (int)hi});
+                }
+                p = end;
+                if (*p == ',') p++;
+            }
+            if (!kvflash_pin_spans_.empty()) {
+                std::fprintf(stderr, "[kvflash] pin spans: %d range(s) configured\n",
+                             (int)kvflash_pin_spans_.size());
+            }
+        }
     }
     // "auto" sizes the pool from the GPU: weights are resident at this
     // point and the cache is not yet allocated, so device-free minus a
@@ -265,8 +287,12 @@ bool Qwen35Backend::init() {
     if (kvflash_tokens_ > 0) {
         kvflash_tau_ = std::max(1, env_int_or_default("DFLASH_KVFLASH_TAU", 64));
     }
-    // Subclass gate (e.g. MoE all-hot): may zero kvflash_tokens_ before the KV
-    // cache is sized, so create_target_cache allocates full max_ctx KV.
+    // Subclass gate (e.g. MoE all-hot fit check): may zero kvflash_tokens_ to
+    // disable the pool when it is not needed.  Called before create_target_cache
+    // so the cache is allocated at the right size.
+    // Stash the budget so the gate can reuse the bytes_per_token/free_bytes without
+    // re-querying GPU memory.
+    kvf_budget_ = kvf_budget;
     if (!post_kvflash_init_gate()) return false;
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true, /*ctx_alloc=*/kvflash_tokens_)) {
@@ -422,23 +448,17 @@ bool Qwen35Backend::unpark(const std::string & what) {
 
 bool Qwen35Backend::snapshot_save(int slot) {
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
-    // kvflash: snapshots right-size to cur_pos, which is a LOGICAL position
-    // that can exceed the physical pool once decode has paged, and they copy
-    // rows assuming the identity layout, which pooled prefill / eviction
-    // breaks. Snapshots of pooled state need page-table serialization
-    // (follow-up); identity-mapped prefill-time snapshots remain valid.
-    if (kvflash_active() &&
-        (cache_.cur_pos > kvflash_tokens_ || !kvflash_pager_.is_identity())) {
-        static bool warned = false;
-        if (!warned) {
-            std::fprintf(stderr, "[kvflash] snapshot skipped: cur_pos %d exceeds "
-                                 "pool %d (pooled snapshots are a follow-up)\n",
-                         cache_.cur_pos, kvflash_tokens_);
-            warned = true;
-        }
-        return false;
-    }
+    const bool pooled = kvflash_active() &&
+        (cache_.cur_pos > kvflash_tokens_ || !kvflash_pager_.is_identity());
     PrefixSnapshot & snap = prefix_snapshots_[slot];
+    if (pooled) {
+        std::vector<uint8_t> blob = kvflash_pager_.serialize();
+        if (!snapshot_target_cache(w_, cache_, snap_backend_, snap, /*skip_kv=*/true, &blob)) return false;
+        snap.is_pooled    = true;
+        snap.kvflash_blob = std::move(blob);   // keep for same-request restore
+        return true;
+    }
+    snap.is_pooled = false;
     return snapshot_target_cache(w_, cache_, snap_backend_, snap);
 }
 
@@ -454,7 +474,19 @@ bool Qwen35Backend::snapshot_used(int slot) const {
 
 bool Qwen35Backend::restore_target_cache_from_snapshot(int slot) {
     if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) return false;
-    return restore_target_cache(prefix_snapshots_[slot], cache_);
+    const PrefixSnapshot & snap = prefix_snapshots_[slot];
+    return restore_target_cache(snap, cache_, snap.is_pooled);
+}
+
+bool Qwen35Backend::snapshot_is_pooled(int slot) const {
+    if (slot < 0 || slot >= PREFIX_SLOTS) return false;
+    return prefix_snapshots_[slot].is_pooled;
+}
+
+static const std::vector<uint8_t> s_empty_blob;
+const std::vector<uint8_t> & Qwen35Backend::snapshot_kvflash_blob(int slot) const {
+    if (slot < 0 || slot >= PREFIX_SLOTS) return s_empty_blob;
+    return prefix_snapshots_[slot].kvflash_blob;
 }
 
 int Qwen35Backend::snapshot_cur_pos(int slot) const {
@@ -506,16 +538,23 @@ bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
             snap.conv_state_snap[idx] = t;
         } else if (std::strcmp(t->name, "snap_target_feat") == 0) {
             snap.target_feat_snap = t;
+        } else if (std::strcmp(t->name, "snap_kvflash_blob") == 0) {
+            snap.is_pooled = true;
+            snap.kvflash_blob.resize(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, snap.kvflash_blob.data(), 0, ggml_nbytes(t));
         }
     }
 
     // Validate all required tensors are present.
-    for (int i = 0; i < n_full_attn; ++i) {
-        if (!snap.attn_k_snap[i] || !snap.attn_v_snap[i]) {
-            snap.attn_k_snap.clear(); snap.attn_v_snap.clear();
-            snap.ssm_state_snap.clear(); snap.conv_state_snap.clear();
-            snap.target_feat_snap = nullptr;
-            return false;
+    // Pooled snapshots have no attn_k/v (KV lives in kvflash_blob); skip that check.
+    if (!snap.is_pooled) {
+        for (int i = 0; i < n_full_attn; ++i) {
+            if (!snap.attn_k_snap[i] || !snap.attn_v_snap[i]) {
+                snap.attn_k_snap.clear(); snap.attn_v_snap.clear();
+                snap.ssm_state_snap.clear(); snap.conv_state_snap.clear();
+                snap.target_feat_snap = nullptr;
+                return false;
+            }
         }
     }
     for (int i = 0; i < n_delta; ++i) {
@@ -854,8 +893,21 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
     // not leftovers from the previous request. cudaMemset is ~0.2ms.
     if (cache_.base_buf) ggml_backend_buffer_clear(cache_.base_buf, 0);
 
-    // Restore snapshot
-    restore_target_cache(prefix_snapshots_[slot], cache_);
+    // Restore snapshot (skip KV copy when pooled; pager handles KV separately).
+    const PrefixSnapshot & snap_ref = prefix_snapshots_[slot];
+    const bool snap_pooled = snap_ref.is_pooled;
+    restore_target_cache(snap_ref, cache_, snap_pooled);
+
+    // Pooled restore: rebuild pager from blob so KV rows are accessible.
+    if (snap_pooled && kvflash_active()) {
+        if (!kvflash_pager_.deserialize(snap_ref.kvflash_blob.data(),
+                                        snap_ref.kvflash_blob.size())) {
+            result.error = "kvflash: pager deserialize failed";
+            out_io.emit(-1);
+            return result;
+        }
+        apply_kvflash_pins();
+    }
 
     // Now generate from restored state
     sampler_ = req.sampler;
@@ -863,7 +915,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         sampler_rng_.seed(sampler_.seed);
     }
 
-    const int snap_pos = prefix_snapshots_[slot].cur_pos;
+    const int snap_pos = snap_ref.cur_pos;
     cache_.cur_pos = snap_pos;
 
     // FIX(prefix-cache + spec-decode): restore_target_cache brings back KV /
@@ -888,12 +940,20 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
 
     // Daemon receives the FULL prompt; slice off the cached prefix and prefill
     // only the delta at KV positions [snap_pos, snap_pos + delta.size()).
+    // Pooled snapshots: do_prefill with kv_offset != 0 is unsupported when
+    // the pool is already full; fall back to full re-prefill from position 0.
     int committed = snap_pos;
     const int prompt_len = (int)req.prompt.size();
     if (prompt_len > snap_pos) {
         auto t_prefill_start = std::chrono::steady_clock::now();
-        std::vector<int32_t> delta = restore_prompt_delta(req.prompt, snap_pos);
-        committed = do_prefill(delta, out_io, req.snap_pos, req.snap_slot, /*kv_offset=*/snap_pos);
+        if (snap_pooled && kvflash_active()) {
+            reset_recurrent_state(cache_);
+            cache_.cur_pos = 0;
+            committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
+        } else {
+            std::vector<int32_t> delta = restore_prompt_delta(req.prompt, snap_pos);
+            committed = do_prefill(delta, out_io, req.snap_pos, req.snap_slot, /*kv_offset=*/snap_pos);
+        }
         if (committed < 0) {
             result.error = "prefill";
             return result;
@@ -1241,6 +1301,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         } else {
             kvflash_sync_prefill(committed, tokens, kv_offset);
         }
+        apply_kvflash_pins();
     }
 
     // End-of-prefill snapshot: scoped disk-cache saves (auto/fixed policy)
@@ -1325,6 +1386,13 @@ void Qwen35Backend::kvflash_upload_mask() {
                             need * sizeof(uint16_t));
 }
 
+void Qwen35Backend::apply_kvflash_pins() {
+    if (kvflash_pin_spans_.empty()) return;
+    for (const auto & span : kvflash_pin_spans_) {
+        kvflash_pager_.pin_range((int64_t)span.first, (int64_t)span.second);
+    }
+}
+
 // Attach the drafter as the residency scorer outside the pflash compress
 // path: with `--kvflash --prefill-drafter <gguf>` but compression off, the
 // drafter would otherwise never load and the pool would silently run
@@ -1358,7 +1426,15 @@ void Qwen35Backend::kvflash_maybe_reselect(int generated) {
     // re-prefill; measured 0.9 s @8K, ~46 s bisected @256K), while decode
     // produces ~30 tok/s. Capping rescore overhead at ~15% of decode time
     // gives tau ~= history/45. The configured tau is the floor.
-    const int tau = std::max<int>(kvflash_tau_, (int)(kvflash_history_.size() / 45));
+    // DFLASH_KVFLASH_TAU_EXACT=1 bypasses adaptive scaling so the configured
+    // value is used exactly (useful for testing / short-decode validation).
+    static const bool tau_exact = [] {
+        const char * e = std::getenv("DFLASH_KVFLASH_TAU_EXACT");
+        return e && std::strcmp(e, "0") != 0;
+    }();
+    const int tau = tau_exact
+        ? kvflash_tau_
+        : std::max<int>(kvflash_tau_, (int)(kvflash_history_.size() / 45));
     if (generated % tau != 0) return;
     // Lazy-load the drafter only when a rescore is actually due, so the
     // first tokens of the first request never pay the load.
