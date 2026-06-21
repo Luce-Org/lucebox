@@ -21,6 +21,7 @@ if(NOT nlohmann_json_FOUND)
     include(FetchContent)
     FetchContent_Declare(json
         URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
         URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
     )
     FetchContent_MakeAvailable(json)
