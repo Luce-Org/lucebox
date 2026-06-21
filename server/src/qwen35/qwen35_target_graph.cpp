@@ -191,9 +191,11 @@ bool create_target_cache_partial(const TargetWeights & w,
         }
 
         // Feature ring cap. The drafter needs the last `cap` target hidden states
-        // as context. 4096 is enough for short prompts but acceptance collapses
-        // at exactly 4096 (ring wrap). Override with DFLASH_FEAT_RING_CAP env.
-        int target_feat_cap_default = 4096;
+        // as context. A cap smaller than the context makes the ring WRAP and the
+        // drafter reads stale features → acceptance collapses (0.1% at 27K with the
+        // old 4096 default). Default to the full reserved context so the ring never
+        // wraps; lower via DFLASH_FEAT_RING_CAP to save VRAM (ring = cap*fc_in*2B).
+        int target_feat_cap_default = max_ctx;
         if (const char * e = std::getenv("DFLASH_FEAT_RING_CAP")) {
             target_feat_cap_default = std::atoi(e);
         }

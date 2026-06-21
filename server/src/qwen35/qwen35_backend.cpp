@@ -249,6 +249,16 @@ bool Qwen35Backend::init() {
             std::printf("[draft]  SWA layers: %d/%d (window=%d)\n",
                         dw_.n_layer - 1, dw_.n_layer, dw_.swa_window);
         }
+
+        // Align drafter RoPE freq_base to the target. The bf16-reconv 6-layer
+        // drafter GGUF baked rope.freq_base=1M (converter bug); its training
+        // config.json and the target are both 10M. A mismatch desyncs drafter
+        // positions from the target and collapses spec-decode acceptance.
+        if (dw_.rope_theta != w_.rope_theta && w_.rope_theta > 0.0f) {
+            std::printf("[draft]  rope_theta %.0f -> %.0f (align to target)\n",
+                        dw_.rope_theta, w_.rope_theta);
+            dw_.rope_theta = w_.rope_theta;
+        }
     }
 
     // Create KV cache
@@ -454,7 +464,11 @@ bool Qwen35Backend::unpark(const std::string & what) {
                 std::fprintf(stderr, "[unpark] draft: %s\n", dflash27b_last_error());
                 return false;
             }
-            // Re-apply rope overrides after reload.
+            // Re-apply rope overrides after reload. Align drafter rope_theta to
+            // the target for every drafter: the 6-layer bf16-reconv GGUF baked
+            // 1M (converter bug) but trains/serves at the target's 10M, and the
+            // 8-layer YaRN drafter likewise needs the target base. A mismatch
+            // desyncs positions and collapses spec-decode acceptance.
             if (dw_.rope_theta != w_.rope_theta && w_.rope_theta > 0.0f)
                 dw_.rope_theta = w_.rope_theta;
             if (dw_.rope_ext_factor == 0.0f && dw_.n_layer == 8 && dw_.n_embd == 2048) {

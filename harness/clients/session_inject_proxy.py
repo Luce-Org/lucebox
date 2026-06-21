@@ -27,6 +27,9 @@ from urllib.parse import urlparse
 class Handler(BaseHTTPRequestHandler):
     upstream: str = ""
     session_id: str = ""
+    force_temperature: float | None = None
+    dump_path: str = ""
+    think_budget: int = 0
 
     def log_message(self, fmt, *args):
         print("[session-proxy] %s" % (fmt % args), flush=True)
@@ -99,14 +102,28 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_body()
         path = self.path
 
-        # Inject session_id only on /v1/messages
-        if self.session_id and path.startswith("/v1/messages"):
+        if self.dump_path and path.startswith("/v1/"):
+            try:
+                with open(self.dump_path, "a") as fh:
+                    fh.write(f"\n===== POST {path} ({len(body)} bytes) =====\n")
+                    fh.write(body.decode("utf-8", "replace"))
+                    fh.write("\n")
+            except Exception:
+                pass
+
+        is_api_path = path.startswith("/v1/messages") or path.startswith("/v1/chat/completions")
+        if is_api_path and (self.session_id or self.force_temperature is not None or self.think_budget):
             try:
                 obj = json.loads(body.decode("utf-8"))
-                if "extra_body" not in obj:
-                    obj["extra_body"] = {}
-                if "session_id" not in obj["extra_body"]:
-                    obj["extra_body"]["session_id"] = self.session_id
+                if self.session_id:
+                    if "extra_body" not in obj:
+                        obj["extra_body"] = {}
+                    if "session_id" not in obj["extra_body"]:
+                        obj["extra_body"]["session_id"] = self.session_id
+                if self.force_temperature is not None:
+                    obj["temperature"] = self.force_temperature
+                if self.think_budget and path.startswith("/v1/messages"):
+                    obj["thinking"] = {"type": "enabled", "budget_tokens": self.think_budget}
                 body = json.dumps(obj).encode("utf-8")
             except Exception as exc:
                 print(f"[session-proxy] JSON parse error, forwarding raw: {exc}", flush=True)
@@ -120,19 +137,23 @@ def main():
     ap.add_argument("--port", type=int, default=18081)
     ap.add_argument("--upstream", default="http://127.0.0.1:18080")
     ap.add_argument("--session-id", default=os.environ.get("PFLASH_SESSION_ID", ""))
+    ap.add_argument("--force-temperature", type=float, default=None)
     args = ap.parse_args()
 
-    if not args.session_id:
-        print("[session-proxy] WARNING: no session_id set; proxy is pass-through only", flush=True)
+    if not args.session_id and args.force_temperature is None:
+        print("[session-proxy] WARNING: no session_id or force_temperature set; proxy is pass-through only", flush=True)
 
     Handler.upstream = args.upstream.rstrip("/")
     Handler.session_id = args.session_id
+    Handler.force_temperature = args.force_temperature
+    Handler.dump_path = os.environ.get("PROXY_DUMP", "")
+    Handler.think_budget = int(os.environ.get("THINK_BUDGET", "0") or "0")
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(
         f"[session-proxy] listening on http://{args.host}:{args.port} "
         f"-> {Handler.upstream} "
-        f"(session_id={Handler.session_id!r})",
+        f"(session_id={Handler.session_id!r} force_temperature={Handler.force_temperature!r})",
         flush=True,
     )
     srv.serve_forever()

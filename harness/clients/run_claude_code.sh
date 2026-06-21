@@ -28,14 +28,17 @@ wait_lucebox_server
 # cannot inject extra_body natively, so the proxy does it transparently.
 PROXY_PID=""
 CLIENT_BASE_URL="$BASE_URL"
-if [[ -n "${PFLASH_SESSION_ID:-}" ]]; then
+if [[ -n "${PFLASH_SESSION_ID:-}" || -n "${FORCE_TEMPERATURE:-}" ]]; then
   PROXY_PORT="${PFLASH_PROXY_PORT:-18082}"
-  python3 "$SCRIPT_DIR/session_inject_proxy.py" \
-    --host "$HOST" \
-    --port "$PROXY_PORT" \
-    --upstream "$BASE_URL" \
-    --session-id "$PFLASH_SESSION_ID" \
-    >> "$LOG_DIR/proxy.log" 2>&1 &
+  proxy_cmd=(python3 "$SCRIPT_DIR/session_inject_proxy.py"
+    --host "$HOST"
+    --port "$PROXY_PORT"
+    --upstream "$BASE_URL"
+    --session-id "${PFLASH_SESSION_ID:-}")
+  if [[ -n "${FORCE_TEMPERATURE:-}" ]]; then
+    proxy_cmd+=(--force-temperature "$FORCE_TEMPERATURE")
+  fi
+  "${proxy_cmd[@]}" >> "$LOG_DIR/proxy.log" 2>&1 &
   PROXY_PID=$!
   _proxy_ready=0
   for _i in $(seq 1 10); do
@@ -54,8 +57,12 @@ if [[ -n "${PFLASH_SESSION_ID:-}" ]]; then
     exit 1
   fi
   CLIENT_BASE_URL="http://$HOST:$PROXY_PORT"
-  echo "[run_claude_code] session-inject proxy up on $CLIENT_BASE_URL (session=$PFLASH_SESSION_ID)"
+  echo "[run_claude_code] session-inject proxy up on $CLIENT_BASE_URL (session=${PFLASH_SESSION_ID:-} force_temp=${FORCE_TEMPERATURE:-})"
 fi
+
+CLAUDE_EXTRA=()
+[[ -n "${CLAUDE_APPEND_SYS:-}" ]] && CLAUDE_EXTRA+=(--append-system-prompt "$CLAUDE_APPEND_SYS")
+[[ -n "${CLAUDE_MAX_TURNS:-}" ]] && CLAUDE_EXTRA+=(--max-turns "$CLAUDE_MAX_TURNS")
 
 set +e
 HOME="$HOME_DIR" \
@@ -69,9 +76,9 @@ timeout "${CLAUDE_TIMEOUT}s" "$CLAUDE_BIN" \
   --print \
   --output-format json \
   --model "$MODEL_ID" \
-  --tools "$CLAUDE_TOOLS" \
-  --permission-mode dontAsk \
+  --dangerously-skip-permissions \
   --no-session-persistence \
+  "${CLAUDE_EXTRA[@]}" \
   "$PROMPT" \
   < /dev/null > "$CLIENT_OUT" 2>&1
 RC=$?
