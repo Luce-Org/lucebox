@@ -2705,7 +2705,8 @@ bool LagunaBackend::load_decode_draft() {
     constexpr int TARGET_FEAT_CAP = 4096;
     const int feat_cap = std::min(args_.max_ctx, TARGET_FEAT_CAP);
     if (!cache_.target_feat &&
-        !create_laguna_target_feat(backend_, cache_, n_capture, w_.n_embd, feat_cap)) {
+        !create_laguna_target_feat(backend_, cache_, n_capture, w_.n_embd, feat_cap,
+                                   dw_.capture_layer_ids)) {
         std::fprintf(stderr, "[laguna] target_feat alloc failed\n");
         free_decode_draft();
         return false;

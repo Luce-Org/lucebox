@@ -177,12 +177,20 @@ bool load_draft_gguf(const std::string & path,
     const uint32_t head_dim  = read_u32("attention.key_length",    0);
     const uint32_t block_sz  = read_u32("dflash.block_size",       0);
     uint32_t n_tgt_lay       = read_u32("dflash.n_target_layers",  0);
-    if (n_tgt_lay == 0) {
+    // Explicit captured target-layer ids (data-driven). Lets any DFlash drafter
+    // load without a hardcoded per-arch set; the array length also backstops
+    // n_target_layers when the scalar KV is absent.
+    {
         std::snprintf(key, sizeof(key), "%s.%s", A, "dflash.target_layer_ids");
         const int64_t target_ids_id = gguf_find_key(gctx, key);
         if (target_ids_id >= 0 &&
-            gguf_get_kv_type(gctx, target_ids_id) == GGUF_TYPE_ARRAY) {
-            n_tgt_lay = (uint32_t)gguf_get_arr_n(gctx, target_ids_id);
+            gguf_get_kv_type(gctx, target_ids_id) == GGUF_TYPE_ARRAY &&
+            gguf_get_arr_type(gctx, target_ids_id) == GGUF_TYPE_INT32) {
+            const uint32_t n = (uint32_t)gguf_get_arr_n(gctx, target_ids_id);
+            const int32_t * vals =
+                (const int32_t *)gguf_get_arr_data(gctx, target_ids_id);
+            out.capture_layer_ids.assign(vals, vals + n);
+            if (n_tgt_lay == 0) n_tgt_lay = n;
         }
     }
     if (n_tgt_lay == 0 && n_embd != 0) {

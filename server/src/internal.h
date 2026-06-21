@@ -277,6 +277,7 @@ struct DraftWeights {
     // DFlash draft-specific config (populated by loader or set by caller).
     int block_size      = DFLASH27B_DRAFT_BLOCK_SIZE;       // tokens per draft step (16 or 10)
     int n_target_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;  // captured target layers (5)
+    std::vector<int> capture_layer_ids;                     // explicit captured target-layer ids (GGUF dflash.target_layer_ids); empty = derive from count
     int mask_token_id   = DFLASH27B_DRAFT_MASK_TOKEN_ID;    // noise mask token
 };
 

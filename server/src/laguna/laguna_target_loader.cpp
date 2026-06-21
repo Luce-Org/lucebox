@@ -592,7 +592,8 @@ bool create_laguna_target_feat(ggml_backend_t backend,
                                 LagunaTargetCache & cache,
                                 int n_capture_layers,
                                 int hidden_size,
-                                int cap) {
+                                int cap,
+                                const std::vector<int> & explicit_ids) {
     if (n_capture_layers <= 0 || hidden_size <= 0 || cap <= 0) return false;
 
     free_laguna_target_feat(cache);
@@ -618,12 +619,20 @@ bool create_laguna_target_feat(ggml_backend_t backend,
     cache.target_feat_cap = cap;
     cache.n_capture_layers = n_capture_layers;
 
-    if (n_capture_layers == 5) {
+    if ((int)explicit_ids.size() == n_capture_layers) {
+        // Data-driven: ids shipped in the draft GGUF (dflash.target_layer_ids),
+        // copied by the converter from the drafter's config.json. Works for any
+        // drafter without a hardcoded per-arch set.
+        cache.capture_layer_ids = explicit_ids;
+    } else if (n_capture_layers == 5) {
+        // Legacy fallback for GGUFs converted before target_layer_ids was
+        // emitted (poolside Laguna-XS.2 speculator: {1,9,17,36,39}).
         cache.capture_layer_ids = {1, 9, 17, 36, 39};
     } else {
         std::fprintf(stderr,
-            "[laguna] warning: DFlash draft has %d capture layers; falling back "
-            "to linspace capture ids (Laguna speculator expects 5: 1 9 17 36 39)\n",
+            "[laguna] warning: DFlash draft has %d capture layers and no "
+            "dflash.target_layer_ids in the GGUF; falling back to linspace ids "
+            "(reconvert the drafter to embed its trained capture ids)\n",
             n_capture_layers);
         cache.capture_layer_ids.resize((size_t)n_capture_layers);
         const int n_layer = !cache.attn_k.empty() ? (int)cache.attn_k.size() : 40;

@@ -199,7 +199,8 @@ bool create_laguna_target_feat(ggml_backend_t backend,
                                 LagunaTargetCache & cache,
                                 int n_capture_layers,
                                 int hidden_size,
-                                int cap);
+                                int cap,
+                                const std::vector<int> & explicit_ids = {});
 
 // ----------------------------------------------------------------------------
 // Cache snapshots for prefix-cache slots (PrefixCache).

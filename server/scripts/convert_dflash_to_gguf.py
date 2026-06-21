@@ -101,6 +101,11 @@ def load_arch(safetensors: Path, header: dict) -> dict:
         ):
             if val is not None:
                 a[dst] = val
+        dfc = c.get("dflash_config") or {}
+        _tli = (dfc.get("target_layer_ids") or c.get("target_layer_ids")
+                or c.get("aux_hidden_state_layer_ids"))
+        if _tli:
+            a["capture_layer_ids"] = [int(x) for x in _tli]
         print(f"[info] read arch from {cfg_path}")
     else:
         print(f"[warn] no config.json next to safetensors; using 27B defaults")
@@ -269,6 +274,15 @@ def main():
     writer.add_uint32(f"{ARCH}.dflash.n_target_layers", a["n_target_layers"])
     writer.add_uint32(f"{ARCH}.dflash.block_size",      a["block_size"])
     writer.add_uint32(f"{ARCH}.dflash.mask_token_id",   a["mask_token_id"])
+    # Explicit captured target-layer ids (from the drafter's config.json). Travels
+    # with the model so the server reads which target layers to capture instead of
+    # hardcoding a per-arch set. Emitted only when it matches the fc-derived count.
+    _cap_ids = a.get("capture_layer_ids")
+    if _cap_ids and len(_cap_ids) == a["n_target_layers"]:
+        writer.add_array(f"{ARCH}.dflash.target_layer_ids", [int(x) for x in _cap_ids])
+    elif _cap_ids:
+        print(f"[warn] capture_layer_ids len {len(_cap_ids)} != n_target_layers "
+              f"{a['n_target_layers']}; not embedding ids", file=sys.stderr)
 
     # Walk + add tensors. Sort: dflash.* singletons first, then output_*,
     # then per-layer in numeric order — keeps the on-disk layout stable.
