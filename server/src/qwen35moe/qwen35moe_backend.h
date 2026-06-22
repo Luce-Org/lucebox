@@ -119,6 +119,9 @@ private:
     std::unique_ptr<HybridSpecGraphCache> hybrid_spec_graph_cache_;
     bool spec_microbench_done_ = false;
     bool ensure_pipe_state(int kv_start);
+    // Build moe_hybrid_logits_sg_ if not already built. Called from both
+    // hybrid_forward_one_token and do_hybrid_spec_decode (entropy gate).
+    bool ensure_moe_hybrid_logits_sg();
 };
 
 }  // namespace dflash::common

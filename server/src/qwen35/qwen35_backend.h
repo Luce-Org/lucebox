@@ -165,6 +165,13 @@ protected:
     const DraftFeatureMirror & feature_mirror() const { return feature_mirror_; }
     bool is_draft_parked() const { return draft_parked_; }
 
+    // ── Spec-decode gate: cached AR per-token time ───────────────────
+    // Measured once on the first decode call, reused on all subsequent
+    // turns so the 3-token AR warmup (~0.3s/turn) is paid only once.
+    // 0.0 means not yet measured. Protected so the MoE subclass
+    // (do_hybrid_spec_decode) can read/write it directly.
+    double gate_t_ar_ = 0.0;
+
     // ── Configuration ────────────────────────────────────────────────
     Qwen35Config cfg_;
 

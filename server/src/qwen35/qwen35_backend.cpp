@@ -1859,18 +1859,6 @@ bool Qwen35Backend::sync_remote_draft_features(int start_pos, int n_tokens) {
     return true;
 }
 
-// ── Entropy gate helper ─────────────────────────────────────────────────
-
-// Numerically stable softmax top-1 probability = 1 / sum(exp(l_i - l_max)).
-// Used as a cheap per-token entropy proxy: high p1 ⇒ low entropy ⇒ drafter hits.
-static double target_top1_prob(const float * logits, int n_vocab) {
-    float lmax = logits[0];
-    for (int i = 1; i < n_vocab; i++) if (logits[i] > lmax) lmax = logits[i];
-    double sum = 0.0;
-    for (int i = 0; i < n_vocab; i++) sum += std::exp((double)(logits[i] - lmax));
-    return 1.0 / sum;
-}
-
 // ── DFlash speculative decode loop ─────────────────────────────────────
 
 bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
@@ -1950,30 +1938,6 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     out_spec_ran = true;
 
-    // Sampled-verify: cache_.last_tok is do_prefill's argmax, and the spec
-    // loop commits it verbatim as the first generated token. The first token
-    // is the highest-entropy decision of the whole generation (e.g. "answer
-    // with text" vs "open a tool call"), so it must be sampled like every
-    // other committed token — mirror do_ar_decode's first-token sampling.
-    if (sampled_verify && out_tokens.empty() && prefill_last_logits_valid_) {
-        std::vector<float> first_logits(w_.n_vocab);
-        ggml_backend_tensor_get(sg_.logits, first_logits.data(),
-                                prefill_last_logits_offset_,
-                                sizeof(float) * (size_t)w_.n_vocab);
-        if (std::getenv("DFLASH_SV_DEBUG")) {
-            int am = 0; float best = first_logits[0];
-            for (int v = 1; v < w_.n_vocab; v++)
-                if (first_logits[v] > best) { best = first_logits[v]; am = v; }
-            std::fprintf(stderr,
-                "[sv-debug] first-token: logits_argmax=%d cache_last_tok=%d "
-                "(match=%d) top_logit=%.3f\n",
-                am, cache_.last_tok, am == cache_.last_tok, best);
-        }
-        last_tok = sample_logits(first_logits.data(), w_.n_vocab, sampler_,
-                                 out_tokens, sampler_rng_);
-        cache_.last_tok = last_tok;
-    }
-
     const int _min_floor = dflash_min_tokens_floor();
 
     // ── DFlash spec-decode: draft → verify → accept → replay ──────────
@@ -1994,33 +1958,35 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
     }
 
-    // ── Entropy gate config (read once) ──────────────────────────────────
-    static const bool kEntropyGate = []() {
-        const char * e = std::getenv("DFLASH_ENTROPY_GATE");
+    // ── Realized-speedup gate config (read once) ─────────────────────────
+    // Replaces the old p1-entropy gate with a self-calibrating timing gate:
+    // measure actual AR per-token wall time, then floor to AR whenever the
+    // EMA of (spec tok/s / AR tok/s) stays below kGateMargin for
+    // kGateSustain consecutive steps. No per-model threshold tuning needed.
+    static const bool kSpecGate = []() {
+        // Accept old name DFLASH_ENTROPY_GATE as alias for compatibility.
+        const char * e = std::getenv("DFLASH_SPEC_GATE");
+        if (!e) e = std::getenv("DFLASH_ENTROPY_GATE");
         return e ? std::atoi(e) != 0 : true;
     }();
-    static const double kEntropyArP1 = []() {
-        const char * e = std::getenv("DFLASH_ENTROPY_AR_P1");
-        return e ? std::atof(e) : 0.90;
+    static const double kGateMargin = []() {
+        const char * e = std::getenv("DFLASH_SPEC_GATE_MARGIN");
+        return e ? std::atof(e) : 1.0;
     }();
-    // Near-tie immediate floor: if top-1 prob drops below this threshold the
-    // argmax is ambiguous and spec-decode is not useful — floor immediately.
-    static const double kEntropyTieP1 = []() {
-        const char * e = std::getenv("DFLASH_ENTROPY_TIE_P1");
-        return e ? std::atof(e) : 0.45;
+    static const int kGateSustain = []() {
+        const char * e = std::getenv("DFLASH_SPEC_GATE_SUSTAIN");
+        return e ? std::atoi(e) : 3;
     }();
-    // Hysteresis: require this many consecutive sub-threshold EMA steps before
-    // flooring on sustained-low utilization (holds block-16 through transient dips).
-    static const int kEntropySustain = []() {
-        const char * e = std::getenv("DFLASH_ENTROPY_SUSTAIN");
+    static const int kGateWarmup = []() {
+        const char * e = std::getenv("DFLASH_SPEC_GATE_WARMUP");
         return e ? std::atoi(e) : 2;
     }();
-    static const bool kEntropyDbg = []() {
-        return std::getenv("DFLASH_ENTROPY_DEBUG") != nullptr;
+    static const bool kGateDbg = []() {
+        return std::getenv("DFLASH_SPEC_GATE_DEBUG") != nullptr;
     }();
     // Gate disabled for sampled_verify: the acceptance walk is distribution-
-    // preserving and entropy routing would change the sampled distribution.
-    const bool gate_active = kEntropyGate && !sampled_verify;
+    // preserving and timing routing would change the sampled distribution.
+    const bool gate_active = kSpecGate && !sampled_verify;
 
     std::vector<float>   noise_embed((size_t)hidden * q_len);
     std::vector<int32_t> noise_ids(q_len);
@@ -2032,21 +1998,6 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     std::vector<int32_t> pos_k;
     std::vector<float>   local_hidden;
 
-    // Entropy gate: holds the target's next-token logits at the current decision point.
-    // Populated from prefill logits (step 0) and from verify logits (after each spec block).
-    // For gate-AR tokens it is refreshed via verify_batch(n=1) + read_verify_logits.
-    std::vector<float> eg_cur_logits;
-    bool               eg_logits_valid = false;
-
-    // Load step-0 logits from prefill (not available in all paths; gate falls back to spec).
-    if (gate_active && prefill_last_logits_valid_) {
-        eg_cur_logits.resize((size_t)w_.n_vocab);
-        ggml_backend_tensor_get(sg_.logits, eg_cur_logits.data(),
-                                prefill_last_logits_offset_,
-                                sizeof(float) * (size_t)w_.n_vocab);
-        eg_logits_valid = true;
-    }
-
     int n_generated      = 0;
     int n_draft_steps    = 0;
     int n_spec_positions = 0;  // cumulative step_block sum for accept-rate denominator
@@ -2055,13 +2006,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     int n_hint_accepted  = 0;
     int target_forwards  = 0;
 
-    // Entropy gate telemetry
-    int    eg_ar_tokens  = 0;
+    // Realized-speedup gate state
+    int    eg_ar_tokens   = 0;
     int    eg_spec_tokens = 0;
     int    eg_spec_steps  = 0;
-    double eg_p1_sum      = 0.0;
-    double eg_ema_p1      = 1.0;  // EMA of top-1 prob; init optimistic so first step is spec
-    int    eg_low_streak  = 0;    // consecutive steps where eg_ema_p1 < kEntropyArP1
+    double t_ar           = 0.0;   // measured AR per-token time (seconds)
+    double ema_ratio      = 2.0;   // EMA of realized speedup; init optimistic
+    int    gate_low_streak = 0;
 
     auto log_target_forward_stats = [&]() {
         std::fprintf(stderr, "[spec-decode] target_forwards=%d forwards_per_token=%.6f forwards_per_step=%.3f\n",
@@ -2069,6 +2020,52 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                      n_generated > 0 ? (double)target_forwards / n_generated : 0.0,
                      n_draft_steps > 0 ? (double)target_forwards / n_draft_steps : 0.0);
     };
+
+    // ── AR warmup / t_ar cache ───────────────────────────────────────────
+    // t_ar is a backend property (scales with KV size, not prompt content).
+    // We measure it once on the FIRST decode call and cache it on the backend
+    // so all subsequent turns skip the warmup entirely.
+    //
+    // Turn 1 (gate_t_ar_ == 0.0): emit the first 3 tokens via AR to measure
+    //   t_ar, cache it in gate_t_ar_, and enter the spec loop at n_generated=3.
+    // Turn 2+ (gate_t_ar_ > 0.0): skip the warmup; spec loop starts at
+    //   n_generated=0 with last_tok=cache_.last_tok (same as pre-gate behavior).
+    //
+    // Skip warmup and entire spec loop if only 3 or fewer tokens requested.
+    if (n_gen <= 3) {
+        bool ok = do_ar_decode(committed, n_gen, out_tokens, io,
+                               budget_hook ? *budget_hook : BudgetHook{},
+                               forced_close_out, degenerate_close_out);
+        log_target_forward_stats();
+        io.emit(-1);
+        return ok;
+    }
+    if (gate_t_ar_ > 0.0) {
+        // Cached: skip warmup. Use previously measured t_ar; spec loop starts
+        // from n_generated=0 with last_tok already set from cache_.last_tok above.
+        t_ar = gate_t_ar_;
+        // n_generated stays 0; committed and last_tok are already initialized.
+    } else {
+        // First call: run the 3-token AR warmup to measure t_ar.
+        // Token 1: free (prefill logits already ready), untimed.
+        bool ok1 = do_ar_decode(committed, 1, out_tokens, io, BudgetHook{}, nullptr, nullptr);
+        if (!ok1) { io.emit(-1); return false; }
+        committed = cache_.cur_pos;
+        last_tok  = out_tokens.back();
+        n_generated = 1;
+        // Tokens 2-3: real forwards, timed.
+        auto t_ar0 = std::chrono::steady_clock::now();
+        bool ok2 = do_ar_decode(committed, 2, out_tokens, io, BudgetHook{}, nullptr, nullptr);
+        auto t_ar1 = std::chrono::steady_clock::now();
+        if (!ok2) { io.emit(-1); return false; }
+        t_ar = std::chrono::duration<double>(t_ar1 - t_ar0).count() / 2.0;
+        // Sanity clamp: guard against implausibly small values (e.g. tiny model).
+        if (t_ar < 0.0005) t_ar = 0.005;
+        gate_t_ar_ = t_ar;  // cache for all future turns
+        committed = cache_.cur_pos;
+        last_tok  = out_tokens.back();
+        n_generated = 3;
+    }
 
     auto t_dec0 = std::chrono::steady_clock::now();
 
@@ -2102,71 +2099,43 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             return ok;
         }
 
-        // ── Entropy gate ──────────────────────────────────────────────────
-        // Update EMA of top-1 probability from last verified logits.
-        // When EMA drops below kEntropyArP1 and we have done at least one
-        // spec step (1-step probe so we don't floor on a first-token blip),
-        // hand the remainder of this turn to do_ar_decode (~100 tok/s vs
-        // ~58 tok/s for the old per-token gate-AR verify_batch path).
-        // KV correctness: the gate fires at the TOP of the loop, before any
-        // draft or verify work for this iteration, so cache_.cur_pos ==
-        // committed with no pending half-verify.  No restore_kv needed.
+        // ── Realized-speedup gate ────────────────────────────────────────
+        // Updated at the TOP of each loop iteration (before draft/verify work)
+        // so cache_.cur_pos == committed and no KV restore is needed on floor.
+        // The gate state (ema_ratio, gate_low_streak) was updated at the END
+        // of the previous iteration (after commit_n is known); on the first
+        // iteration both remain at their init values so the warmup probe runs.
         const int step_block = q_len;  // always full block; gate decides spec vs floor, not block size
-        if (gate_active && eg_logits_valid) {
-            const double p1 = target_top1_prob(eg_cur_logits.data(), w_.n_vocab);
-            eg_ema_p1 = 0.5 * eg_ema_p1 + 0.5 * p1;
-            eg_p1_sum += p1;
-            // Sustained-low streak tracking (reset on healthy step).
-            if (eg_ema_p1 < kEntropyArP1) eg_low_streak++; else eg_low_streak = 0;
-            // Near-tie flag: argmax ambiguous this step.
-            const bool is_tie = (p1 < kEntropyTieP1);
-            // Floor condition: near-tie (immediate) OR sustained low utilization.
-            const bool floor_now = n_draft_steps >= 1 &&
-                (is_tie || eg_low_streak >= kEntropySustain);
-            if (kEntropyDbg) {
-                std::fprintf(stderr,
-                    "[entropy] step=%d p1=%.3f ema_p1=%.3f streak=%d tie=%d action=%s\n",
-                    n_draft_steps, p1, eg_ema_p1, eg_low_streak, (int)is_tie,
-                    floor_now ? "FLOOR" : "SPEC");
-            }
-            if (floor_now) {
-                // Floor: hand rest of turn to do_ar_decode.
-                // KV is already at committed (top of loop, no draft/verify done).
-                // cache_.last_tok must reflect the last committed token so
-                // do_ar_decode's first step decodes from the right position.
-                const char * floor_reason = is_tie ? "tie" : "sustained";
-                step_graph_destroy(draft_sg_);
-                cache_.cur_pos  = committed;
-                cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
-                const int total_draft_pos = std::max(1, n_spec_positions);
-                out_accept_rate = (float)((double)n_accept_sum / (double)total_draft_pos);
-                eg_ar_tokens = n_gen - n_generated;  // all remaining tokens go to AR
-                if (gate_active && (eg_spec_steps + (n_draft_steps > 0 ? 1 : 0)) > 0) {
-                    const int gate_decisions = n_draft_steps;  // p1 samples taken so far
-                    std::fprintf(stderr,
-                        "[entropy-gate] floor-to-ar at step=%d ema_p1=%.3f reason=%s "
-                        "ar_tokens=%d spec_tokens=%d spec_steps=%d mean_p1=%.3f\n",
-                        n_draft_steps, eg_ema_p1, floor_reason,
-                        eg_ar_tokens, eg_spec_tokens, eg_spec_steps,
-                        gate_decisions > 0 ? eg_p1_sum / gate_decisions : 0.0);
-                }
-                const int ar_n_gen = n_gen - n_generated;
-                if (ar_n_gen <= 0) {
-                    log_target_forward_stats();
-                    io.emit(-1);
-                    return true;
-                }
-                BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
-                bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
-                                       tail_hook, forced_close_out,
-                                       degenerate_close_out);
+        if (gate_active && n_draft_steps >= kGateWarmup && gate_low_streak >= kGateSustain) {
+            // Floor: hand rest of turn to do_ar_decode.
+            // KV is already at committed (top of loop, no draft/verify done).
+            step_graph_destroy(draft_sg_);
+            cache_.cur_pos  = committed;
+            cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
+            const int total_draft_pos = std::max(1, n_spec_positions);
+            out_accept_rate = (float)((double)n_accept_sum / (double)total_draft_pos);
+            eg_ar_tokens = n_gen - n_generated;
+            std::fprintf(stderr,
+                "[spec-gate] floor reason=slow ema_ratio=%.2f t_ar=%.4f "
+                "ar_tokens=%d spec_tokens=%d spec_steps=%d\n",
+                ema_ratio, t_ar, eg_ar_tokens, eg_spec_tokens, eg_spec_steps);
+            const int ar_n_gen = n_gen - n_generated;
+            if (ar_n_gen <= 0) {
                 log_target_forward_stats();
                 io.emit(-1);
-                return ok;
+                return true;
             }
-            eg_spec_steps++;
+            BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
+            bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
+                                   tail_hook, forced_close_out,
+                                   degenerate_close_out);
+            log_target_forward_stats();
+            io.emit(-1);
+            return ok;
         }
-        // ── End entropy gate ──────────────────────────────────────────────
+        // ── End realized-speedup gate ─────────────────────────────────────
+
+        auto t_step0 = std::chrono::steady_clock::now();
 
         // 1. Build noise input for draft
         noise_ids[0] = last_tok;
@@ -2179,10 +2148,22 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
 
         // 2. Draft compute
+        // The block-diffusion drafter's prediction collapses when it self-attends
+        // more than ~2048 tokens (measured: 93% accept at draft_ctx<=2048 vs 6%
+        // at 4096, independent of total context). Cap its self-attention window at
+        // 2048 so spec-decode keeps working at long context for recent-derived
+        // output. DFLASH_DRAFT_CTX_MAX overrides for drafters with a larger limit.
         constexpr int DRAFT_CTX_MAX_DEFAULT = 2048;
+        static const int kDraftCtxCap = []() {
+            if (const char * e = std::getenv("DFLASH_DRAFT_CTX_MAX")) {
+                int v = std::atoi(e);
+                if (v > 0) return v;
+            }
+            return -1; // sentinel: use the default cap
+        }();
         const int ring_cap = use_remote_draft ? remote_draft_.ring_cap() : feature_mirror_.cap;
-        const int draft_ctx = std::min(committed,
-            std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)));
+        const int draft_ctx_cap = (kDraftCtxCap > 0) ? kDraftCtxCap : DRAFT_CTX_MAX_DEFAULT;
+        const int draft_ctx = std::min(committed, std::min(ring_cap, draft_ctx_cap));
         const int draft_start = committed - draft_ctx;
         int mirror_slot0 = 0;
         const bool use_mirror_view =
@@ -2200,7 +2181,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             if (!build_draft_step(draft_sg_, dw_, /*lm_head=*/nullptr, draft_backend_,
                                   draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
                                   committed,
-                                  /*ctx_len_max=*/std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)))) {
+                                  /*ctx_len_max=*/std::min(ring_cap, draft_ctx_cap))) {
                 std::fprintf(stderr, "spec-decode: draft build failed\n");
                 step_graph_destroy(draft_sg_);
                 return false;
@@ -2836,17 +2817,6 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     vocab_v, sampler_, out_tokens, sampler_rng_);
             } else {
                 last_tok = replay_last_tok;
-                // Entropy gate: fetch last-position logits for next step's gate decision.
-                if (gate_active) {
-                    std::vector<float> next_lg;
-                    if (target->read_verify_logits(commit_n, next_lg) && !next_lg.empty()) {
-                        const size_t vocab_sz = (size_t)(next_lg.size() / commit_n);
-                        eg_cur_logits.assign(next_lg.end() - (ptrdiff_t)vocab_sz, next_lg.end());
-                        eg_logits_valid = true;
-                    } else {
-                        eg_logits_valid = false;
-                    }
-                }
             }
             committed += emitted;
         }
@@ -2856,6 +2826,24 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         n_accept_sum += std::min(accept_n, emitted);
         n_draft_steps++;
         n_spec_positions += step_block;
+        eg_spec_steps++;
+
+        // ── Per-step speedup EMA update ───────────────────────────────────
+        {
+            const double step_wall = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_step0).count();
+            const int commit_n_this = emitted + injected;
+            const double ratio = (t_ar > 0.0 && step_wall > 0.0)
+                ? ((double)commit_n_this * t_ar / step_wall) : 2.0;
+            ema_ratio = 0.5 * ema_ratio + 0.5 * ratio;
+            if (ema_ratio < kGateMargin) gate_low_streak++;
+            else gate_low_streak = 0;
+            if (kGateDbg) {
+                std::fprintf(stderr,
+                    "[spec-gate] step=%d commit=%d step_wall=%.4f ratio=%.2f ema=%.2f streak=%d\n",
+                    n_draft_steps - 1, commit_n_this, step_wall, ratio, ema_ratio, gate_low_streak);
+            }
+        }
 
         // Notify observer with accepted tokens for this step.
         if (io.observer) {
@@ -2937,11 +2925,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     const int total_draft_pos = std::max(1, n_spec_positions);
     const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
     out_accept_rate = (float)((double)n_accept_sum / (double)total_draft_pos);
-    if (gate_active && (eg_ar_tokens + eg_spec_steps) > 0) {
-        const int gate_decisions = eg_ar_tokens + eg_spec_steps;
-        std::fprintf(stderr, "[entropy-gate] ar_tokens=%d spec_tokens=%d spec_steps=%d mean_p1=%.3f\n",
-                     eg_ar_tokens, eg_spec_tokens, eg_spec_steps,
-                     gate_decisions > 0 ? eg_p1_sum / gate_decisions : 0.0);
+    if (gate_active) {
+        std::fprintf(stderr, "[spec-gate] held spec_steps=%d ema_ratio=%.2f\n",
+                     eg_spec_steps, ema_ratio);
     }
     std::fprintf(stderr, "[spec-decode] tokens=%d time=%.3f s speed=%.2f tok/s "
                  "steps=%d accepted=%d/%d (%.1f%%) avg_commit=%.2f\n",
