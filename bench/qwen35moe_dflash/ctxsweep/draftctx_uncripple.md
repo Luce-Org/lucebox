@@ -1,3 +1,5 @@
+> ⚠️ SUPERSEDED (2026-06-22): these runs varied `DFLASH_DRAFT_CTX_MAX` (IGNORED on the MoE path — draft_ctx is pinned at 4096) and/or used sequential requests (warm-EMA inflated accept). Treat the draft_ctx columns and any >77% accept as artifacts. Authoritative cold numbers: `clean_rebaseline.md`. The surviving real levers are `FEAT_RING_CAP=max_ctx` and f32 mirror.
+
 # Draft-ctx VRAM Ceiling — Full KV Quant Grid
 
 **Config**: Q3_K_XL target + BF16 drafter, max_ctx=40960, DFLASH_FEAT_RING_CAP=40960,

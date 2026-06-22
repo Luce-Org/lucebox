@@ -1,0 +1,98 @@
+[
+  {
+    "n": 0,
+    "dc": 16384,
+    "prompt": "needle_12k",
+    "status": "OK",
+    "accept": 42.1875,
+    "avg_commit": null,
+    "tps": 47.8,
+    "recalled": true,
+    "oom": false,
+    "floor_reason": "slow"
+  },
+  {
+    "n": 0,
+    "dc": 16384,
+    "prompt": "ctx_8192",
+    "status": "OK",
+    "accept": 92.7,
+    "avg_commit": 14.83,
+    "tps": 109.2,
+    "recalled": true,
+    "oom": false,
+    "floor_reason": "slow"
+  },
+  {
+    "n": 5,
+    "dc": 16384,
+    "prompt": "needle_12k",
+    "status": "OK",
+    "accept": 7.8125,
+    "avg_commit": null,
+    "tps": 57.6,
+    "recalled": true,
+    "oom": false,
+    "floor_reason": "slow"
+  },
+  {
+    "n": 5,
+    "dc": 16384,
+    "prompt": "ctx_8192",
+    "status": "OK",
+    "accept": 7.8125,
+    "avg_commit": null,
+    "tps": 71.1,
+    "recalled": true,
+    "oom": false,
+    "floor_reason": "slow"
+  },
+  {
+    "n": 4,
+    "dc": 16384,
+    "prompt": "needle_12k",
+    "status": "OK",
+    "accept": 7.8125,
+    "avg_commit": null,
+    "tps": 56.6,
+    "recalled": true,
+    "oom": false,
+    "floor_reason": "slow"
+  },
+  {
+    "n": 4,
+    "dc": 16384,
+    "prompt": "ctx_8192",
+    "status": "OK",
+    "accept": 6.25,
+    "avg_commit": null,
+    "tps": 71.7,
+    "recalled": true,
+    "oom": false,
+    "floor_reason": "slow"
+  },
+  {
+    "n": 3,
+    "dc": 16384,
+    "prompt": "needle_12k",
+    "status": "OK",
+    "accept": 7.8125,
+    "avg_commit": null,
+    "tps": 58.3,
+    "recalled": true,
+    "oom": false,
+    "floor_reason": "slow"
+  },
+  {
+    "n": 3,
+    "dc": 16384,
+    "prompt": "ctx_8192",
+    "status": "OK",
+    "accept": 6.25,
+    "avg_commit": null,
+    "tps": 71.8,
+    "recalled": true,
+    "oom": false,
+    "floor_reason": "slow"
+  }
+]
