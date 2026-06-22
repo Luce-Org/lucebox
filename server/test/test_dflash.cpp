@@ -270,7 +270,7 @@ using dflash::common::free_qwen35_layer_split_shards;
 #include "qwen35_layer_split_dflash_target.h"
 #include "common/dflash_spec_decode.h"
 #include "common/gguf_mmap.h"
-#include "common/draft_topk_cuda.h"
+#include "common/geometric_draft_topk_cuda.h"
 using dflash::common::is_eos_tok;
 
 // ─── Layer-split daemon — extracted to src/qwen35/layer_split_daemon.{h,cpp} ─
@@ -3281,7 +3281,7 @@ int main(int argc, char ** argv) {
                     return v == nullptr || v[0] != '0';
                 }();
                 if (kGpuDraftTopk && !draft_hidden_bridge) {
-                    topk_done = dflash::common::extract_draft_topk_cuda(
+                    topk_done = dflash::common::geometric_extract_draft_topk_cuda(
                         (const float *)draft_sg.logits->data + (size_t)vocab,
                         L, vocab, ddtree_K,
                         ddtree_top_log_probs.data(),

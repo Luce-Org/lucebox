@@ -1,4 +1,4 @@
-// Correctness test for extract_draft_topk_cuda (GPU) vs extract_draft_topk (CPU).
+// Correctness test for geometric_extract_draft_topk_cuda (GPU) vs extract_draft_topk (CPU).
 //
 // The GPU kernel in src/common/draft_topk_cuda.cu is a drop-in replacement for
 // the CPU top-K + online-logsumexp path in ddtree.cpp. This test feeds the same
@@ -14,7 +14,7 @@
 // Build: registered in server/CMakeLists.txt under DFLASH27B_TESTS (CUDA only).
 // Run:   ./test_draft_topk_cuda   (exit 0 = pass, non-zero = fail)
 
-#include "../src/common/draft_topk_cuda.h"
+#include "../src/common/geometric_draft_topk_cuda.h"
 #include "../src/common/ddtree.h"
 
 #include <cuda_runtime.h>
@@ -26,7 +26,7 @@
 #include <vector>
 
 using dflash::common::extract_draft_topk;
-using dflash::common::extract_draft_topk_cuda;
+using dflash::common::geometric_extract_draft_topk_cuda;
 
 namespace {
 
@@ -70,12 +70,12 @@ bool run_case(const Case & c, unsigned seed) {
 
     std::vector<float>   gpu_lp(n_out);
     std::vector<int32_t> gpu_ids(n_out);
-    bool ok = extract_draft_topk_cuda(d_logits, c.n, c.vocab, c.K,
+    bool ok = geometric_extract_draft_topk_cuda(d_logits, c.n, c.vocab, c.K,
                                       gpu_lp.data(), gpu_ids.data(), c.temp);
     cudaFree(d_logits);
 
     if (!ok) {
-        printf("  FAIL: extract_draft_topk_cuda returned false\n");
+        printf("  FAIL: geometric_extract_draft_topk_cuda returned false\n");
         return false;
     }
 
@@ -157,7 +157,7 @@ int main() {
             cudaMemcpy(d, h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice);
             std::vector<float>   lp(n * big_K);
             std::vector<int32_t> ids(n * big_K);
-            bool ret = extract_draft_topk_cuda(d, n, vocab, big_K,
+            bool ret = geometric_extract_draft_topk_cuda(d, n, vocab, big_K,
                                                lp.data(), ids.data(), 1.0f);
             cudaFree(d);
             const bool pass = !ret;  // expect false

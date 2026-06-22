@@ -405,7 +405,7 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     target_sources(dflash_common PRIVATE
         src/flashprefill_select.cpp
         src/flashprefill.cpp
-        src/common/draft_topk_cuda.cu)
+        src/common/geometric_draft_topk_cuda.cu)
     # PUBLIC so consumers (e.g. the test_dflash executable) also see the macro
     # and take the GPU draft top-K path instead of the CPU fallback.
     target_compile_definitions(dflash_common PUBLIC DFLASH27B_HAVE_DRAFT_TOPK_CUDA=1)
@@ -596,7 +596,7 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_flashprefill_kernels PRIVATE dflash_common CUDA::cudart)
     endif()
     # GPU draft top-K kernel vs CPU reference (extract_draft_topk). CUDA only:
-    # draft_topk_cuda.cu is compiled into dflash_common solely on the cuda backend.
+    # geometric_draft_topk_cuda.cu is compiled into dflash_common solely on the cuda backend.
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_topk_cuda.cpp")
         add_executable(test_draft_topk_cuda test/test_draft_topk_cuda.cpp)
         target_include_directories(test_draft_topk_cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

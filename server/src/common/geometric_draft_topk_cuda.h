@@ -25,7 +25,7 @@ namespace dflash::common {
 // d_logits: device pointer to row-major [n_positions][vocab] f32 logits (the
 //           position stride is `vocab` floats — pass an offset pointer to skip
 //           leading positions). out_* are HOST buffers of size n_positions*K.
-bool extract_draft_topk_cuda(const void * d_logits,
+bool geometric_extract_draft_topk_cuda(const void * d_logits,
                              int n_positions, int vocab, int K,
                              float * out_log_probs,
                              int32_t * out_token_ids,

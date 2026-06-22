@@ -1,7 +1,7 @@
 // GPU top-K + log-prob extraction for DDTree draft distributions.
-// See draft_topk_cuda.h for the contract. Mirrors extract_draft_topk (ddtree.cpp).
+// See geometric_draft_topk_cuda.h for the contract. Mirrors extract_draft_topk (ddtree.cpp).
 
-#include "draft_topk_cuda.h"
+#include "geometric_draft_topk_cuda.h"
 
 #include <cuda_runtime.h>
 #include <cfloat>
@@ -80,7 +80,7 @@ __device__ __forceinline__ void merge_topk(const float * av, const int * ai,
 // only used when every row's base pointer is 16-byte aligned (vocab % 4 == 0
 // and an aligned tensor); otherwise the scalar path is used.
 template <int K, bool VEC>
-__global__ void draft_topk_partial(const float * __restrict__ logits,
+__global__ void geometric_draft_topk_partial(const float * __restrict__ logits,
                                    int vocab, float inv_t, int split,
                                    float * __restrict__ part_max,
                                    float * __restrict__ part_sum,
@@ -182,7 +182,7 @@ __global__ void draft_topk_partial(const float * __restrict__ logits,
 // loads partial t (or an identity when t >= split), then a shared-memory tree
 // reduction merges all partials. log_prob[k] = top_v[k] - log_z.
 template <int K>
-__global__ void draft_topk_combine(const float * __restrict__ part_max,
+__global__ void geometric_draft_topk_combine(const float * __restrict__ part_max,
                                    const float * __restrict__ part_sum,
                                    const float * __restrict__ part_v,
                                    const int32_t * __restrict__ part_i,
@@ -326,7 +326,7 @@ int pick_split(int vocab, int n_positions) {
 
 }  // namespace
 
-bool extract_draft_topk_cuda(const void * d_logits,
+bool geometric_extract_draft_topk_cuda(const void * d_logits,
                              int n_positions, int vocab, int K,
                              float * out_log_probs,
                              int32_t * out_token_ids,
@@ -366,10 +366,10 @@ bool extract_draft_topk_cuda(const void * d_logits,
         // so the per-thread/per-partial top-K stays register-resident; dispatch
         // the runtime K to its instantiation. K>kMaxK is already rejected above.
 #define DFLASH_TOPK_LAUNCH(KV, VEC)                                                             \
-            draft_topk_partial<KV, VEC><<<grid1, kBlock>>>(                                     \
+            geometric_draft_topk_partial<KV, VEC><<<grid1, kBlock>>>(                                     \
                 lp_in, vocab, inv_t, split,                                                     \
                 g_scratch.d_pmax, g_scratch.d_psum, g_scratch.d_pv, g_scratch.d_pi);           \
-            draft_topk_combine<KV><<<n_positions, comb_block>>>(                                \
+            geometric_draft_topk_combine<KV><<<n_positions, comb_block>>>(                                \
                 g_scratch.d_pmax, g_scratch.d_psum, g_scratch.d_pv, g_scratch.d_pi,            \
                 split, g_scratch.d_lp, g_scratch.d_ids);
 #define DFLASH_TOPK_CASE(KV)                                                                    \

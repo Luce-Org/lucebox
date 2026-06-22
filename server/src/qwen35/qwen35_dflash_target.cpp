@@ -5,7 +5,7 @@
 #include "graph_builders.h"
 #include "step_graph.h"
 #include "attn_masks.h"
-#include "common/draft_topk_cuda.h"
+#include "common/geometric_draft_topk_cuda.h"
 // gpu_runtime_compat.h maps the raw cudaStream_t / cudaMemcpy* symbols used
 // below (rollback_to / rollback_to_tree) onto their HIP equivalents. Without
 // it the file only compiles on CUDA via a transitive <cuda_runtime.h>; HIP
@@ -669,7 +669,7 @@ bool Qwen35DFlashTarget::project_hidden_to_topk(
         return v == nullptr || v[0] != '0';
     }();
     if (kGpuDraftTopk &&
-        extract_draft_topk_cuda(proj_sg_.logits->data, n_tokens, vocab, K,
+        geometric_extract_draft_topk_cuda(proj_sg_.logits->data, n_tokens, vocab, K,
                                 top_log_probs.data(), top_token_ids.data(),
                                 temperature)) {
         return true;
