@@ -156,6 +156,11 @@ protected:
     bool restore_target_cache_from_snapshot(int slot);
     bool snapshot_is_pooled(int slot) const;
     const std::vector<uint8_t> & snapshot_kvflash_blob(int slot) const;
+    // Save a pooled snapshot covering only chunks [0, snap_boundary/chunk_tokens).
+    // Used by subclasses (e.g. MoE) that complete the full prefill before seeing
+    // the snap boundary, but still want to cache the prefix up to that boundary.
+    // Returns true if the snapshot was committed successfully.
+    bool snapshot_save_pooled_at(int slot, int snap_boundary);
 
     // Accessors for draft/spec-decode state (needed by hybrid spec-decode in subclass)
     DraftWeights & draft_weights() { return dw_; }

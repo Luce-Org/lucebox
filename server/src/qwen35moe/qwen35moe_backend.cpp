@@ -1178,6 +1178,26 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             std::fprintf(stderr, "[snap] hybrid boundary logits failed at cur_pos=%d\n",
                          committed);
         }
+    } else if (req.snap_slot >= 0 && req.snap_pos > 0 &&
+               kvf_paged && req.snap_pos <= committed) {
+        // Pooled prefill: the full prompt has been committed (committed == prompt_len),
+        // but snap_pos is a chat-marker boundary inside the prompt. Serialize only
+        // the chunks [0, floor(snap_pos,chunk_tokens)/chunk_tokens) via the
+        // inherited helper, then restore cur_pos to committed so decode can continue.
+        const int cfg_chunk = kvflash_pager_.chunk_tokens();
+        const int snap_boundary = (req.snap_pos / cfg_chunk) * cfg_chunk;
+        if (snapshot_save_pooled_at(req.snap_slot, snap_boundary)) {
+            std::printf("[snap] hybrid pooled boundary slot=%d cur_pos=%d "
+                        "(req snap_pos=%d)\n",
+                        req.snap_slot, snap_boundary, req.snap_pos);
+            std::fflush(stdout);
+        } else {
+            std::fprintf(stderr,
+                "[snap] hybrid pooled boundary save failed at snap_boundary=%d\n",
+                snap_boundary);
+        }
+        // Restore cur_pos to committed so decode sees the full prefilled context.
+        target_cache().cur_pos = committed;
     } else if (req.snap_slot >= 0 && req.snap_pos > 0) {
         std::fprintf(stderr,
                      "[snap] hybrid skip unsafe boundary slot=%d req_snap_pos=%d cur_pos=%d\n",

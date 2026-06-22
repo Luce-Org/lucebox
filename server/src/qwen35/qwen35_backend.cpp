@@ -493,6 +493,25 @@ bool Qwen35Backend::unpark(const std::string & what) {
 
 // ── Snapshots ───────────────────────────────────────────────────────────
 
+bool Qwen35Backend::snapshot_save_pooled_at(int slot, int snap_boundary) {
+    if (slot < 0 || slot >= PREFIX_SLOTS || snap_boundary <= 0) return false;
+    if (!kvflash_active()) return false;
+    const int cfg_chunk = kvflash_pager_.chunk_tokens();
+    const int max_chunks = snap_boundary / cfg_chunk;
+    if (max_chunks <= 0) return false;
+    const int saved_cur_pos = cache_.cur_pos;
+    cache_.cur_pos = snap_boundary;
+    std::vector<uint8_t> blob = kvflash_pager_.serialize(max_chunks);
+    PrefixSnapshot & snap = prefix_snapshots_[slot];
+    if (!snapshot_target_cache(w_, cache_, snap_backend_, snap, /*skip_kv=*/true, &blob)) {
+        cache_.cur_pos = saved_cur_pos;
+        return false;
+    }
+    snap.is_pooled    = true;
+    snap.kvflash_blob = std::move(blob);
+    return true;
+}
+
 bool Qwen35Backend::snapshot_save(int slot) {
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
     const bool pooled = kvflash_active() &&
@@ -1185,9 +1204,22 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                 snap_slot, kv_pos, snap_pos);
                     std::fflush(stdout);
                 }
-            } else if (kvf_paged) {
-                std::fprintf(stderr, "[kvflash] boundary snapshot skipped: pooled "
-                                     "prefill relocates chunks\n");
+            } else if (kvf_paged && kv_pos > kv_offset) {
+                // kv_pos is always chunk-aligned here (prefill_ubatch == chunk_tokens
+                // in pooled path). Serialize only chunks [0, kv_pos/chunk_tokens).
+                const int cfg_chunk = kvflash_pager_.chunk_tokens();
+                const int max_chunks = kv_pos / cfg_chunk;
+                if (max_chunks > 0) {
+                    if (snapshot_save_pooled_at(snap_slot, kv_pos)) {
+                        std::printf("[snap] pooled boundary slot=%d cur_pos=%d "
+                                    "(req snap_pos=%d max_chunks=%d)\n",
+                                    snap_slot, kv_pos, snap_pos, max_chunks);
+                        std::fflush(stdout);
+                    } else {
+                        std::fprintf(stderr, "[kvflash] pooled boundary snapshot failed"
+                                             " at kv_pos=%d\n", kv_pos);
+                    }
+                }
             }
             snap_pos = -1;
             snap_slot = -1;
