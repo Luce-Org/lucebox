@@ -1882,6 +1882,15 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                      n_draft_steps > 0 ? (double)target_forwards / n_draft_steps : 0.0);
     };
 
+    // kvflash: an in-pool prompt prefills contiguously without registering
+    // chunks in the pager. Map the prefix now so the pager stays consistent
+    // with the tree path's direct writes and hands off cleanly to slot-mapped
+    // paging once the context outgrows the pool. (A >pool prompt already paged
+    // during prefill, leaving the pager non-identity, so this is skipped.)
+    if (kvflash_active() && kvflash_pager_.is_identity()) {
+        (void)kvflash_pager_.alloc_span(0, committed);
+    }
+
     auto t_dec0 = std::chrono::steady_clock::now();
 
     while (n_generated < n_gen) {
@@ -2007,7 +2016,17 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             !(hint_tokens && n_generated < (int)hint_tokens->size()) &&
             stall_tool_prefix_tokens == nullptr &&
             (int)out_tokens.size() >= _min_floor;
-        if (cfg_.ddtree_mode && target->supports_tree_verify() &&
+        // kvflash: only take the non-paged tree path while the read prefix
+        // [0, committed) is identity-resident and the write span (+FA padding)
+        // fits the resident pool. Full-attention only (windowed FA padding could
+        // index past the pool). Otherwise the slot-mapped chain verify handles
+        // it. Non-kvflash is unaffected.
+        const bool kvflash_tree_ok =
+            !kvflash_active() ||
+            (cfg_.fa_window == 0 &&
+             committed + cfg_.ddtree_budget + 1 + cfg_.kq_stride_pad <= kvflash_tokens_ &&
+             kvflash_pager_.identity_prefix_covers(committed));
+        if (cfg_.ddtree_mode && target->supports_tree_verify() && kvflash_tree_ok &&
             !use_remote_draft && q_len > 1 && tree_special_inactive) {
             const int L = q_len - 1;
             const int K = (cfg_.ddtree_budget > L) ? 8 : 1;

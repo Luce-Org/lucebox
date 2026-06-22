@@ -323,6 +323,20 @@ public:
         }
         return true;
     }
+
+    // True iff every chunk intersecting [0, n_tok) is resident in its identity
+    // block (block_of(c) == c). Expresses "the logical prefix [0, n_tok) is a
+    // contiguous, identity-mapped, materialized span" — the exact precondition
+    // the non-paged tree-verify graph relies on. Stronger than is_identity(),
+    // which is also true for an empty / not-yet-materialized pager.
+    bool identity_prefix_covers(int n_tok) const {
+        if (n_tok <= 0) return true;
+        const int nc = (n_tok + cfg_.chunk_tokens - 1) / cfg_.chunk_tokens;
+        if (nc > (int)chunks_.size()) return false;
+        for (int c = 0; c < nc; c++)
+            if (chunks_[c].block != c) return false;
+        return true;
+    }
     int block_of(int c) const {
         return c < (int)chunks_.size() ? chunks_[c].block : -1;
     }
