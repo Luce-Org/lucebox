@@ -2,6 +2,7 @@
 
 #include "laguna_dflash_target.h"
 #include "../common/kvflash_pager.h"
+#include "../common/ddtree.h"
 
 #include "ggml-alloc.h"
 
@@ -154,10 +155,12 @@ bool LagunaDFlashTarget::restore_kv() {
 }
 
 bool LagunaDFlashTarget::supports_tree_verify() const {
-    // Laguna tree verify is a logical-position, non-paged pure-attention graph.
-    // The kvflash pager uses relocated slot-space masks, so keep tree verify
-    // disabled under paging until a slot-space tree mask is implemented.
-    return pager_ == nullptr;
+    // Laguna tree verify is a logical-position, non-paged pure-attention graph
+    // (physical row == logical position). It is bit-correct while the kvflash
+    // pager is identity (slot == position); the call site bounds the step to the
+    // resident pool and verify_tree re-checks the identity prefix defensively.
+    // Past the pool, chain verify takes over.
+    return pager_ == nullptr || pager_->is_identity();
 }
 
 bool LagunaDFlashTarget::verify_tree(
@@ -174,7 +177,14 @@ bool LagunaDFlashTarget::verify_tree(
         tree.visibility.size() < (size_t)N_actual * (size_t)N_actual) {
         return false;
     }
-    if (pager_ != nullptr) return false;
+    // kvflash: this graph is position-indexed (physical row == logical
+    // position), so it is valid only while the pager is identity and the span
+    // fits the pool. do_spec_decode gates on this; bail cleanly otherwise.
+    if (pager_ != nullptr &&
+        (committed + N > pager_->pool_tokens() ||
+         !pager_->identity_prefix_covers(committed))) {
+        return false;
+    }
 
     int kv_cap = 0;
     for (ggml_tensor * k : cache_.attn_k) {
@@ -369,6 +379,7 @@ bool LagunaDFlashTarget::rollback_to_tree(
         }
     }
     if (contiguous_prefix) {
+        if (pager_) (void)pager_->alloc_span(committed, commit_n);
         cache_.cur_pos = committed + commit_n;
         cache_.last_tok = -1;
         return true;
@@ -469,6 +480,10 @@ bool LagunaDFlashTarget::rollback_to_tree(
         return false;
     }
 
+    // kvflash: register the tree-committed (identity) positions so the pager
+    // tracks this path's position-indexed writes (chain/AR self-register via
+    // kvflash_alloc_span; this is the only path that writes KV directly).
+    if (pager_) (void)pager_->alloc_span(committed, commit_n);
     cache_.cur_pos = committed + commit_n;
     cache_.last_tok = -1;
     ggml_free(ctx);
@@ -510,17 +525,8 @@ bool LagunaDFlashTarget::project_hidden_to_topk(
     ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w_.n_embd, n_tokens);
     ggml_set_input(inp);
     ggml_tensor * logits = ggml_mul_mat(ctx, w_.output, inp);
-    const float inv_t = 1.0f / std::max(1e-3f, temperature);
-    ggml_tensor * scaled = (inv_t != 1.0f) ? ggml_scale(ctx, logits, inv_t) : logits;
-    ggml_tensor * top_ids = ggml_top_k(ctx, scaled, K);
-    ggml_tensor * probs = ggml_soft_max(ctx, scaled);
-    ggml_tensor * probs_3d = ggml_reshape_3d(ctx, probs, 1, w_.embedder.n_vocab, n_tokens);
-    ggml_tensor * top_probs = ggml_get_rows(ctx, probs_3d, top_ids);
-    top_probs = ggml_cont(ctx, top_probs);
-    ggml_set_output(top_ids);
-    ggml_set_output(top_probs);
-    ggml_build_forward_expand(gf, top_ids);
-    ggml_build_forward_expand(gf, top_probs);
+    ggml_set_output(logits);
+    ggml_build_forward_expand(gf, logits);
 
     static ggml_gallocr_t galloc_topk = nullptr;
     if (!galloc_topk) {
@@ -540,16 +546,19 @@ bool LagunaDFlashTarget::project_hidden_to_topk(
         return false;
     }
 
+    // CPU top-K via extract_draft_topk (shared with qwen35). The GPU ggml_top_k
+    // path bitonic-argsorts the full vocab, whose shared memory exceeds HIP
+    // shared-mem-per-block on gfx1151 (argsort.cu GGML_ASSERT). extract_draft_topk
+    // applies the temperature + log-softmax on host.
+    const int vocab = (int)logits->ne[0];
+    std::vector<float> logits_host((size_t)vocab * (size_t)n_tokens);
+    ggml_backend_tensor_get(logits, logits_host.data(), 0,
+                            sizeof(float) * logits_host.size());
+
     top_log_probs.assign((size_t)n_tokens * (size_t)K, 0.0f);
     top_token_ids.assign((size_t)n_tokens * (size_t)K, 0);
-    std::vector<float> top_probs_host((size_t)n_tokens * (size_t)K);
-    ggml_backend_tensor_get(top_ids, top_token_ids.data(), 0,
-                            sizeof(int32_t) * top_token_ids.size());
-    ggml_backend_tensor_get(top_probs, top_probs_host.data(), 0,
-                            sizeof(float) * top_probs_host.size());
-    for (size_t i = 0; i < top_probs_host.size(); ++i) {
-        top_log_probs[i] = std::log(std::max(top_probs_host[i], 1e-30f));
-    }
+    extract_draft_topk(logits_host.data(), n_tokens, vocab, K,
+                       top_log_probs.data(), top_token_ids.data(), temperature);
 
     ggml_free(ctx);
     return true;

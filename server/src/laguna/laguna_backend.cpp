@@ -484,6 +484,12 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         return true;
     };
 
+    // kvflash: register the prompt prefix so the pager tracks the tree path's
+    // position-indexed writes consistently (idempotent if prefill already did).
+    if (kvflash_active() && kvflash_pager_.is_identity()) {
+        (void)kvflash_alloc_span(0, committed);
+    }
+
     auto t_dec0 = std::chrono::steady_clock::now();
 
     while (n_generated < n_gen) {
@@ -575,7 +581,14 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
 
         const bool tree_special_inactive =
             !(budget_hook && !budget_hook->close_token_ids.empty());
-        if (args_.ddtree_mode && target->supports_tree_verify() &&
+        // kvflash: the tree graph is position-indexed, so only take it while
+        // the pager is identity and the step fits the resident pool; otherwise
+        // the slot-mapped chain verify below handles it.
+        const bool kvflash_tree_ok =
+            !kvflash_active() ||
+            (kvflash_pager_.is_identity() &&
+             committed + args_.ddtree_budget + 1 <= kvflash_tokens_);
+        if (args_.ddtree_mode && target->supports_tree_verify() && kvflash_tree_ok &&
             q_len > 1 && tree_special_inactive && !sampled_verify) {
             const int L = q_len - 1;
             const int K = (args_.ddtree_budget > L) ? 8 : 1;
