@@ -798,6 +798,17 @@ if(DFLASH27B_TESTS)
         add_executable(test_kvflash_qk test/test_kvflash_qk.cpp)
         target_include_directories(test_kvflash_qk PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash_pool_sizing.cpp")
+        # Pure unit test for kvflash_pool_from_env: no ggml link, no GPU.
+        # kvflash_pager.h includes ggml.h for tensor types used by the pager
+        # (not by pool_from_env itself), so the ggml include path is required
+        # even though no ggml symbols are linked.
+        add_executable(test_kvflash_pool_sizing test/test_kvflash_pool_sizing.cpp)
+        target_include_directories(test_kvflash_pool_sizing PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        add_test(NAME kvflash_pool_sizing COMMAND test_kvflash_pool_sizing)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_restore_delta.cpp")
         add_executable(test_restore_delta test/test_restore_delta.cpp)
         target_include_directories(test_restore_delta PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})

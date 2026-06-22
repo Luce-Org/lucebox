@@ -205,6 +205,12 @@ protected:
     bool kvflash_active() const { return kvflash_tokens_ > 0; }
     // Budget snapshot stashed by init() for post_kvflash_init_gate() subclasses.
     KvFlashAutoBudget kvf_budget_{};
+    // Pool sizing inputs — shared so MoE placement reserves exactly the pool
+    // runtime allocates (else placement over-reserves KV and starves experts).
+    bool kvflash_scorer_expected() const {
+        return !kvflash_drafter_path_.empty() || kvflash_qk_policy_;
+    }
+    KvFlashAutoBudget make_kvflash_budget(const TargetWeights & w, int64_t gpu_free) const;
     // Target-QK policy (--kvflash-policy qk): residency scored with the
     // target's own pooled post-RoPE keys vs the current decode query
     // (kvflash_qk.h); no drafter. Keys pool at chunk-seal time; the query

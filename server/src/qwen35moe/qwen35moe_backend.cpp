@@ -2580,7 +2580,12 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
     // KV cache: n_layer × 2 (K+V) × n_head_kv × head_dim × sizeof(fp16) × max_context
     const uint64_t kv_bytes_per_tok = (uint64_t)w.n_layer * 2 *
         (uint64_t)w.n_head_kv * (uint64_t)w.n_embd_head_k * 2;
-    const int      kvf_pool      = kvflash_pool_from_env(max_context);
+    // Size the reservation with the SAME inputs runtime uses (scorer policy +
+    // VRAM budget); the bare-max_context call took the no-budget fallback
+    // (max_ctx/2) and over-reserved KV, starving experts of hot placement.
+    const int      kvf_pool      = kvflash_pool_from_env(
+        max_context, KvFlashConfig{}, kvflash_scorer_expected(),
+        make_kvflash_budget(w, (int64_t)gpu_free));
 
     const uint64_t warm_cache_bytes = 200ULL * 1024 * 1024;  // 200 MB warm/staging
     uint64_t safety_bytes = 512ULL * 1024 * 1024;      // 512 MB safety margin
