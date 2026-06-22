@@ -45,6 +45,18 @@ std::vector<int> find_all_boundaries(const std::vector<int32_t> & ids,
 using PrefixHash = std::array<uint8_t, 16>;
 PrefixHash hash_prefix(const int32_t * ids, int count);
 
+// Prefix-aware inline eviction policy. Given the cached prefixes in LRU order
+// (index 0 = oldest), return the index of the eviction victim: the oldest entry
+// whose ids are NOT a strict prefix of any other entry's ids (a "leaf"). Keeping
+// shared ancestor prefixes resident avoids re-prefilling them for later branches.
+// Returns 0 (pure-LRU fallback) when ids_lru is empty or, impossibly, no leaf
+// is found. Pure and model-free so it can be unit-tested without a PrefixCache.
+// The pointer overload is the core (the caller passes pointers into its own
+// entries so no token vectors are copied); the value overload is a convenience
+// wrapper for tests.
+int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> & ids_lru);
+int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru);
+
 // ─── Prefix cache entry ─────────────────────────────────────────────────
 
 struct FullCacheEntry {
@@ -139,8 +151,9 @@ private:
     // LRU for inline prefix cache: ordered map of hash → slot.
     // We use a vector to maintain insertion order (front = oldest).
     struct LruEntry {
-        PrefixHash hash;
-        int        slot;
+        PrefixHash           hash;
+        int                  slot;
+        std::vector<int32_t> ids;  // prefix tokens [0, target_cut) for prefix-aware eviction
     };
     std::vector<LruEntry> entries_;
     int next_slot_ = 0;

@@ -1242,6 +1242,40 @@ static void test_find_boundaries_empty() {
     TEST_ASSERT(bounds.empty());
 }
 
+// ── Prefix-aware eviction policy (model-free) ───────────────────────────
+
+static void test_evict_empty_is_zero() {
+    std::vector<std::vector<int32_t>> ids;
+    TEST_ASSERT(select_inline_evict_victim(ids) == 0);
+}
+
+static void test_evict_single_is_zero() {
+    std::vector<std::vector<int32_t>> ids = {{1, 2, 3}};
+    TEST_ASSERT(select_inline_evict_victim(ids) == 0);
+}
+
+static void test_evict_chain_keeps_ancestors() {
+    // Oldest-first chain: [s] < [s,a] < [s,a,b]. Only the longest is a leaf, so
+    // the short shared ancestors are kept and the victim is the deepest entry.
+    std::vector<std::vector<int32_t>> ids = {{9}, {9, 1}, {9, 1, 2}};
+    TEST_ASSERT(select_inline_evict_victim(ids) == 2);
+}
+
+static void test_evict_unrelated_falls_back_to_lru() {
+    // No prefix relation: all are leaves, so evict the oldest (index 0).
+    std::vector<std::vector<int32_t>> ids = {{1, 1}, {2, 2}, {3, 3}};
+    TEST_ASSERT(select_inline_evict_victim(ids) == 0);
+}
+
+static void test_evict_branch_spares_shared_root() {
+    // [s] is an ancestor of both branches, so it is never the victim; the oldest
+    // leaf ([s,a] at index 1) is evicted instead.
+    std::vector<std::vector<int32_t>> ids = {{9}, {9, 1}, {9, 2}};
+    int v = select_inline_evict_victim(ids);
+    TEST_ASSERT(v == 1);
+    TEST_ASSERT(v != 0);  // the shared root must be spared
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // PFlash config tests (model-free)
 // ═══════════════════════════════════════════════════════════════════════
@@ -4054,6 +4088,11 @@ int main() {
     RUN_TEST(test_hash_prefix_different_lengths);
     RUN_TEST(test_hash_prefix_empty);
     RUN_TEST(test_find_boundaries_empty);
+    RUN_TEST(test_evict_empty_is_zero);
+    RUN_TEST(test_evict_single_is_zero);
+    RUN_TEST(test_evict_chain_keeps_ancestors);
+    RUN_TEST(test_evict_unrelated_falls_back_to_lru);
+    RUN_TEST(test_evict_branch_spares_shared_root);
 
     std::fprintf(stderr, "\n── PFlash config ──\n");
     RUN_TEST(test_pflash_config_defaults);
