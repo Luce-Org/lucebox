@@ -32,6 +32,12 @@ jobs:
     timeout-minutes: 30
     continue-on-error: true   # report-only: a slow/failed profile must not block the PR
 
+    env:
+      MODELS_DIR: ${{ vars.LUCEBOX_MODELS_DIR || '/opt/models' }}
+      TARGET_MODEL: ${{ vars.LUCEBOX_SPEED_PROFILE_TARGET || 'Qwen3.6-27B-Q4_K_M.gguf' }}
+      DRAFT_MODEL: ${{ vars.LUCEBOX_SPEED_PROFILE_DRAFT || 'draft/qwen35_dflash/model.safetensors' }}
+      TOKENIZER_ID: ${{ vars.LUCEBOX_SPEED_PROFILE_TOKENIZER || 'Qwen/Qwen3.6-27B' }}
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -60,22 +66,47 @@ jobs:
           cd server
           # The profiler only needs a tokenizer, so we use a tiny isolated venv
           # rather than installing into the shared runner's Python or pulling the
-          # full project env (torch, datasets, ...). Matches the deps validated locally.
+          # full project env (torch, datasets, ...). Keep versions pinned so
+          # benchmark setup is reproducible and resilient to upstream releases.
           python3 -m venv .profiler-venv
-          .profiler-venv/bin/pip install --quiet --upgrade pip
-          .profiler-venv/bin/pip install --quiet transformers tokenizers sentencepiece tiktoken protobuf
+          .profiler-venv/bin/pip install --quiet --upgrade pip==25.1.1
+          .profiler-venv/bin/pip install --quiet \
+            transformers==4.52.4 \
+            tokenizers==0.21.1 \
+            sentencepiece==0.2.0 \
+            tiktoken==0.9.0 \
+            protobuf==6.31.1
+
+      - name: Validate profiler model inputs
+        run: |
+          target="$MODELS_DIR/$TARGET_MODEL"
+          draft="$MODELS_DIR/$DRAFT_MODEL"
+
+          if [ ! -f "$target" ]; then
+            echo "Missing speed-profile target model: $target" >&2
+            echo "Set LUCEBOX_SPEED_PROFILE_TARGET to a GGUF under $MODELS_DIR, or restore the expected model." >&2
+            echo "Available GGUF files in $MODELS_DIR:" >&2
+            find "$MODELS_DIR" -maxdepth 3 -type f -name '*.gguf' -print 2>/dev/null | sort >&2 || true
+            exit 1
+          fi
+
+          if [ ! -f "$draft" ]; then
+            echo "Missing speed-profile draft model: $draft" >&2
+            echo "Set LUCEBOX_SPEED_PROFILE_DRAFT to a safetensors file under $MODELS_DIR, or restore the expected model." >&2
+            echo "Available safetensors files in $MODELS_DIR:" >&2
+            find "$MODELS_DIR" -maxdepth 4 -type f -name '*.safetensors' -print 2>/dev/null | sort >&2 || true
+            exit 1
+          fi
 
       - name: Run speed profiler
-        env:
-          MODELS: ${{ vars.LUCEBOX_MODELS_DIR || '/opt/models' }}
         run: |
           cd server
           # Keep n_gen small: the 3090 is serialized across PRs. The nsys pass adds a
           # separate short profiled run; tok/s is measured on clean passes.
           .profiler-venv/bin/python scripts/profile.py \
-            --target "$MODELS/Qwen3.5-27B-Q4_K_M.gguf" \
-            --draft  "$MODELS/draft/qwen35_dflash/model.safetensors" \
-            --tokenizer "Qwen/Qwen3.5-27B" \
+            --target "$MODELS_DIR/$TARGET_MODEL" \
+            --draft  "$MODELS_DIR/$DRAFT_MODEL" \
+            --tokenizer "$TOKENIZER_ID" \
             --n-gen 48 --budget 22 --reps 3 \
             --nsys --check-lossless \
             --out-json profile.json --out-md profile.md
