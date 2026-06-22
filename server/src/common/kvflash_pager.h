@@ -474,22 +474,31 @@ public:
         return events;
     }
 
-    // Snapshot resident+paged-out chunks into a flat byte blob.
+    // Snapshot resident+paged-out chunks into a flat byte blob (v1 format).
     // max_chunks: if >= 0, serialize only chunks [0, max_chunks); the blob's
     // nc header field encodes max_chunks so deserialize restores exactly that
     // many chunks with the correct cur_pos.  Pass -1 (default) to serialize
     // all chunks.
-    // Layout: 8-byte magic, header fields (6×uint32), then for each logical
-    // chunk c in [0, nc): chunk_bytes_ bytes in fixed segment order
-    // (layer-major, K then V, head-minor) — matching copy_chunk.
+    //
+    // Layout (v1 / magic "KVFLASH1"):
+    //   8-byte magic
+    //   8×uint32 header: nc, chunk_tokens, n_head_kv, k_seg_bytes, v_seg_bytes,
+    //                    chunk_bytes, kv_k_type_u32, has_ledger(=1)
+    //   nc × chunk_bytes_  — raw KV bytes (unchanged from v0)
+    //   nc × 8 bytes       — ledger section (has_ledger==1):
+    //       uint8  was_resident  (1 if chunk was in pool at serialize time)
+    //       uint8  _pad[3]
+    //       float  score         (qk_score; -INF if not set)
     std::vector<uint8_t> serialize(int max_chunks = -1) const {
-        static constexpr uint64_t kMagic = 0x4b56464c41534800ULL; // "KVFLASH\0"
+        static constexpr uint64_t kMagic = 0x4b56464c41534831ULL; // "KVFLASH1"
         const int nc = (max_chunks >= 0 && max_chunks < (int)chunks_.size())
                        ? max_chunks
                        : (int)chunks_.size();
-        const size_t hdr = sizeof(uint64_t) + 6 * sizeof(uint32_t);
+        const size_t hdr = sizeof(uint64_t) + 8 * sizeof(uint32_t);
+        const size_t ledger_entry = 8; // uint8 was_resident + 3 pad + float score
+        const size_t total = hdr + (size_t)nc * chunk_bytes_ + (size_t)nc * ledger_entry;
         std::vector<uint8_t> out;
-        out.resize(hdr + (size_t)nc * chunk_bytes_, 0);
+        out.resize(total, 0);
         uint8_t * p = out.data();
         std::memcpy(p, &kMagic, 8); p += 8;
         auto w32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
@@ -499,6 +508,13 @@ public:
         w32((uint32_t)k_seg_bytes_);
         w32((uint32_t)v_seg_bytes_);
         w32((uint32_t)chunk_bytes_);
+        // dtype guard: record the ggml_type enum for the K cache tensor
+        const uint32_t kv_k_type = (!attn_k_.empty() && attn_k_[0])
+                                   ? (uint32_t)attn_k_[0]->type
+                                   : (uint32_t)GGML_TYPE_F16;
+        w32(kv_k_type);
+        w32(1u); // has_ledger = 1 always in v1 format
+        // KV bytes section
         for (int c = 0; c < nc; ++c) {
             uint8_t * dst = out.data() + hdr + (size_t)c * chunk_bytes_;
             const ChunkState & st = chunks_[c];
@@ -519,8 +535,7 @@ public:
                     }
                 }
             } else if (st.on_host) {
-                // Host-backed: copy verbatim. host_data is a raw pinned pointer
-                // under async DMA, a std::vector otherwise.
+                // Host-backed: copy verbatim.
 #ifdef KVFLASH_HAS_ASYNC_DMA
                 std::memcpy(dst, st.host_data, chunk_bytes_);
 #else
@@ -529,42 +544,79 @@ public:
             }
             // else: never written — stays zero-filled from the resize above.
         }
+        // Ledger section: was_resident + score per chunk
+        uint8_t * lp = out.data() + hdr + (size_t)nc * chunk_bytes_;
+        for (int c = 0; c < nc; ++c) {
+            const ChunkState & st = chunks_[c];
+            const uint8_t was_res = (st.block >= 0) ? 1u : 0u;
+            std::memcpy(lp, &was_res, 1); lp += 4; // 1 byte + 3 pad (out already zero)
+            std::memcpy(lp, &st.score, 4); lp += 4;
+        }
         return out;
     }
 
     // Restore state from a blob produced by serialize(). Returns false on
     // header mismatch (layout drift guard). Callers must rebuild slot masks.
     //
+    // v1 blobs (magic "KVFLASH1"): ledger section is read back — was_resident
+    // controls whether a chunk gets a pool slot (resident) or stays host-backed
+    // (on_host only). Scores are restored into ChunkState.score.
+    //
     // Ordering: pre-size chunks_ so each entry exists before slot_for() runs.
-    // We set host_data + on_host=true, THEN call slot_for(). slot_for's recall
-    // branch sees on_host==true and calls copy_chunk(to_host=false) itself —
-    // no extra copy_chunk needed (that would double-write).
+    // For resident chunks: set host_data + on_host=true, then call slot_for().
+    // slot_for's recall branch sees on_host==true and calls copy_chunk(to_host=false).
+    // For non-resident chunks: set host_data + on_host=true, skip slot_for() so
+    // the chunk stays host-backed only (mirrors the original page-out state).
     bool deserialize(const uint8_t * data, size_t n) {
-        static constexpr uint64_t kMagic = 0x4b56464c41534800ULL;
-        const size_t hdr = sizeof(uint64_t) + 6 * sizeof(uint32_t);
+        static constexpr uint64_t kMagic = 0x4b56464c41534831ULL; // "KVFLASH1"
+        const size_t hdr = sizeof(uint64_t) + 8 * sizeof(uint32_t);
         if (n < hdr) return false;
         const uint8_t * p = data;
         uint64_t magic = 0; std::memcpy(&magic, p, 8); p += 8;
         if (magic != kMagic) return false;
         auto r32 = [&]() { uint32_t v = 0; std::memcpy(&v, p, 4); p += 4; return v; };
-        const int nc      = (int)r32();
-        const int ct      = (int)r32();
-        const int nhkv    = (int)r32();
-        const size_t kseg = (size_t)r32();
-        const size_t vseg = (size_t)r32();
-        const size_t cb   = (size_t)r32();
+        const int nc           = (int)r32();
+        const int ct           = (int)r32();
+        const int nhkv         = (int)r32();
+        const size_t kseg      = (size_t)r32();
+        const size_t vseg      = (size_t)r32();
+        const size_t cb        = (size_t)r32();
+        const uint32_t k_type  = r32(); // kv_k_type_u32
+        const uint32_t has_led = r32(); // has_ledger
+        // Dimension guard (same as before) + dtype guard.
         if (ct != cfg_.chunk_tokens || nhkv != n_head_kv_ ||
             kseg != k_seg_bytes_ || vseg != v_seg_bytes_ || cb != chunk_bytes_) {
             return false;
         }
-        if (n < hdr + (size_t)nc * chunk_bytes_) return false;
+        // Dtype guard: refuse blobs whose KV dtype enum differs from the live cache.
+        const uint32_t live_k_type = (!attn_k_.empty() && attn_k_[0])
+                                     ? (uint32_t)attn_k_[0]->type
+                                     : (uint32_t)GGML_TYPE_F16;
+        if (k_type != live_k_type) return false;
+
+        const size_t ledger_entry = 8;
+        const size_t kv_section = (size_t)nc * chunk_bytes_;
+        const size_t expected = hdr + kv_section + (has_led ? (size_t)nc * ledger_entry : 0);
+        if (n < expected) return false;
+
+        // Read ledger into a temp buffer before reset() clears state.
+        std::vector<uint8_t>  ledger_was_res(nc, 1u); // default: treat as resident
+        std::vector<float>    ledger_scores(nc, -std::numeric_limits<float>::infinity());
+        if (has_led) {
+            const uint8_t * lp = data + hdr + kv_section;
+            for (int c = 0; c < nc; ++c) {
+                std::memcpy(&ledger_was_res[c], lp, 1); lp += 4; // 1 byte + 3 pad
+                std::memcpy(&ledger_scores[c],  lp, 4); lp += 4;
+            }
+        }
+
         reset();
+        last_serialized_kv_k_type_ = k_type;
         chunks_.resize(nc);          // pre-size so slot_for doesn't resize again
         for (int c = 0; c < nc; ++c) {
             const uint8_t * src = data + hdr + (size_t)c * chunk_bytes_;
             ChunkState & st = chunks_[c];
             // Park bytes in host_data; slot_for's recall branch copies to pool.
-            // host_data is a raw pinned pointer under async DMA, a vector otherwise.
 #ifdef KVFLASH_HAS_ASYNC_DMA
             if (!st.host_data) {
                 if (cudaMallocHost(&st.host_data, chunk_bytes_) != cudaSuccess) return false;
@@ -575,8 +627,12 @@ public:
             st.host_data.assign(src, src + chunk_bytes_);
 #endif
             st.on_host = true;
-            // slot_for assigns a block and auto-recalls via copy_chunk(to_host=false).
-            slot_for((int64_t)c * cfg_.chunk_tokens);
+            st.score   = ledger_scores[c];
+            if (ledger_was_res[c]) {
+                // slot_for assigns a block and auto-recalls via copy_chunk.
+                slot_for((int64_t)c * cfg_.chunk_tokens);
+            }
+            // else: stays host-backed (on_host=true, block=-1), matching page_out state.
         }
 #ifdef KVFLASH_HAS_ASYNC_DMA
         // Recalls above are async on page_stream_; settle before the pool is read.
@@ -585,11 +641,29 @@ public:
         return true;
     }
 
+    // ── Per-chunk score accessors (QK ledger) ─────────────────────────────
+    // set_chunk_score / chunk_score allow callers (the QK scorer wiring in
+    // qwen35_backend.cpp) to push per-chunk relevance scores into the pager's
+    // ledger before snapshot_save so they round-trip through serialize().
+    void set_chunk_score(int c, float s) {
+        if (c >= 0 && c < (int)chunks_.size()) chunks_[(size_t)c].score = s;
+    }
+    float chunk_score(int c) const {
+        if (c >= 0 && c < (int)chunks_.size()) return chunks_[(size_t)c].score;
+        return -std::numeric_limits<float>::infinity();
+    }
+
+    // The kv_k dtype enum read from the most-recently-deserialized blob.
+    // Useful for callers that want to confirm the restored dtype after
+    // deserialize() returns (e.g., Phase 2 QK pool rebuild).
+    uint32_t serialized_kv_k_type() const { return last_serialized_kv_k_type_; }
+
 private:
     struct ChunkState {
         int      block    = -1;       // pool block index, -1 = not resident
         bool     on_host  = false;    // backing store holds valid bytes
         uint64_t last_use = 0;
+        float    score    = -std::numeric_limits<float>::infinity(); // QK relevance ledger
 #ifdef KVFLASH_HAS_ASYNC_DMA
         void *   host_data = nullptr; // cudaMallocHost-pinned; allocated on first page_out
 #else
@@ -740,6 +814,7 @@ private:
     int n_blocks_ = 0, n_head_kv_ = 0, cur_chunk_ = 0;
     uint64_t clock_ = 0;
     uint64_t epoch_ = 0;
+    uint32_t last_serialized_kv_k_type_ = (uint32_t)GGML_TYPE_F16; // from most-recent deserialize
 
 #ifdef KVFLASH_HAS_ASYNC_DMA
     cudaStream_t page_stream_ = nullptr;

@@ -42,12 +42,20 @@ struct KvFlashQkDims {
 // unscorable chunk always ranks last in reselect — never above a real chunk
 // whose query correlation is negative. A neutral 0.0 would let a no-info
 // chunk evict a genuinely low-relevance one.
+//
+// seeded: optional per-chunk fallback scores (n_chunks floats) from a
+// prior turn's ledger.  When pooled_keys[c] == nullptr and seeded != nullptr
+// and seeded[c] != seeded_sentinel, seeded[c] is used instead of
+// missing_score.  Chunks with pooled keys always use the cosine path.
+// seeded_sentinel defaults to -INF (the pager's unset-score marker).
 inline void kvflash_qk_chunk_scores(
     const std::vector<const float *> & pooled_keys,
     const float * query,
     const KvFlashQkDims & d,
     std::vector<float> & out,
-    float missing_score = -2.0f) {
+    float missing_score = -2.0f,
+    const float * seeded = nullptr,
+    float seeded_sentinel = -std::numeric_limits<float>::infinity()) {
     const int group = d.n_q_heads / d.n_kv_heads;
     const int n_chunks = (int)pooled_keys.size();
     out.assign((size_t)n_chunks, missing_score);
@@ -83,6 +91,15 @@ inline void kvflash_qk_chunk_scores(
         }
         out[(size_t)c] = acc * inv_layers;            // layer-MEAN (Phase-0 config)
     }
+    // Seeded fallback: for chunks with no pooled key, use the ledger score from
+    // a prior turn if it is not the sentinel (i.e. it was actually scored).
+    if (seeded) {
+        for (int c = 0; c < n_chunks; c++) {
+            if (!pooled_keys[(size_t)c] && seeded[c] != seeded_sentinel) {
+                out[(size_t)c] = seeded[c];
+            }
+        }
+    }
 }
 
 } // namespace dflash::common
@@ -103,6 +120,7 @@ public:
     void reset(const KvFlashQkDims & d) {
         dims_ = d;
         keys_.clear();
+        seeded_scores_.clear();
     }
     const KvFlashQkDims & dims() const { return dims_; }
     bool has(int c) const {
@@ -161,9 +179,35 @@ public:
         return true;
     }
 
+    // Seed per-chunk fallback scores from the pager's ledger (Phase 2 restore).
+    // Called after KvFlashPager::deserialize() so the scorer can report prior-
+    // turn scores for restored chunks before the first re-pool pass.
+    // scores[c] == -INF means "never scored on the previous turn" (pager sentinel).
+    void seed_scores(const std::vector<float> & scores) {
+        seeded_scores_ = scores;
+    }
+
+    // Expose the seeded array (nc floats) for the scorer; nullptr if not seeded.
+    const float * seeded_scores_ptr() const {
+        return seeded_scores_.empty() ? nullptr : seeded_scores_.data();
+    }
+
+    // Rebuild seeded scores from a KvFlashPager after deserialize().
+    // KvFlashPager accessors used: n_chunks(), chunk_score(c).
+    // Templated on pager type to avoid a hard dependency on kvflash_pager.h
+    // in this header (and to keep the pure test linkable).
+    template <typename Pager>
+    void rebuild_pool_from_ledger(const Pager & pager) {
+        const int nc = pager.n_chunks();
+        std::vector<float> scores((size_t)nc);
+        for (int c = 0; c < nc; c++) scores[(size_t)c] = pager.chunk_score(c);
+        seed_scores(scores);
+    }
+
 private:
     KvFlashQkDims dims_;
-    std::vector<std::vector<float>> keys_;   // [chunk][L*Hkv*D], empty = missing
+    std::vector<std::vector<float>> keys_;          // [chunk][L*Hkv*D], empty = missing
+    std::vector<float>              seeded_scores_; // per-chunk ledger scores post-restore
 };
 
 // KvFlashScorer adapter: scores from the QkPool + the latest captured query
@@ -186,7 +230,11 @@ public:
         const int n_chunks = ((int)ids.size() + chunk_tokens - 1) / chunk_tokens;
         std::vector<const float *> pk((size_t)n_chunks, nullptr);
         for (int c = 0; c < n_chunks; c++) pk[(size_t)c] = pool_->data(c);
-        kvflash_qk_chunk_scores(pk, query_.data(), d, out);
+        // Pass seeded scores from the restore ledger as fallback for chunks
+        // whose pooled keys have not been rebuilt yet (Phase 2 restore path).
+        kvflash_qk_chunk_scores(pk, query_.data(), d, out,
+                                /*missing_score=*/-2.0f,
+                                pool_->seeded_scores_ptr());
         return true;
     }
 
