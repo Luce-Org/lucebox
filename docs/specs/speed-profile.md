@@ -22,43 +22,67 @@ Three layers, coarse to fine:
    token** (kernel-fusion signal), **host↔device copy time per token** (CPU/GPU-overlap
    signal), and sync-heavy CUDA APIs (CPU-stall signal). Tells you *why* a phase is slow.
 
-It also includes an optional **losslessness gate**: greedy speculative decode must
-produce the exact same token stream as greedy autoregressive decode. A mismatch means
-the "fast" path is changing the model's output, which a lossless-spec-decode claim
-should never do.
+## Parameters (and why they are fixed defaults)
+
+The defaults mirror the **shipping config** so the numbers are production-representative,
+and they stay fixed so every run is comparable over time:
+
+- **`--budget 22`** — DDTree speculation budget = how many draft positions are verified
+  per target pass. 22 is the `dflash_server` default. Bigger = a bigger bet (higher
+  potential acceptance length) but more draft+verify cost; tuning it is a separate sweep,
+  not the CI job.
+- **`--n-gen 48`** — tokens generated per prompt. Long enough to be past warmup, short
+  enough to keep the shared 3090 fast. (Very short n_gen under-counts spec-decode because
+  fixed startup costs aren't amortized.)
+- **`--reps 3`** — repeats the decode and takes the **median** tok/s to absorb run-to-run
+  GPU variance (thermals, clock boosting, scheduler jitter).
+
+**Rule:** keep these consistent. A delta vs the baseline is only a valid regression
+signal if both runs used the same config — if you ever change a parameter, re-seed the
+baseline (you cannot compare across configs).
+
+## Losslessness gate (and why a bit-exact compare is too strict on its own)
+
+The gate checks that greedy speculative decode produces the same token stream as
+greedy autoregressive (AR) decode — a lossless-spec-decode claim should never change
+the model's output.
+
+A naive bit-exact compare **flags false failures**, and the engine itself explains
+why: the target sees draft tokens as a *batch* in the verify step but one-at-a-time in
+AR decode, and different GEMM shapes reduce in a different order. IEEE FP is
+non-associative, so when the top-2 logits sit within epsilon the argmax tie can flip —
+one token diverges and everything after it follows. See
+`server/src/qwen35/qwen35_backend.cpp` ("different GPU batch sizes → FP-nondeterministic
+state divergence → different greedy output") and `server/eval/README.md`, which runs an
+identical `baseline_2` config precisely because "cache-induced divergence and intrinsic
+noise are indistinguishable."
+
+So the gate runs a **determinism control**: a second, identical-config AR pass (reusing
+the AR baseline run — no extra GPU cost). For each prompt:
+
+| AR vs AR (control) | DFlash vs AR | verdict |
+|---|---|---|
+| identical | identical | **PASS** |
+| identical | diverges | **FAIL** — output changed and it is not run-to-run noise (triage needed) |
+| diverges | (either) | **inconclusive** — engine is intrinsically nondeterministic here, can't judge |
+
+The gate fails **only** on the middle row, which answers "real bug or too-strict check?":
+it no longer flags run-to-run noise (that becomes *inconclusive*). A FAIL means the fast
+path genuinely changed the output — but that is still not proven a logic bug: it can be
+the batched-verify FP effect above (verify scores draft tokens as a batch vs AR
+one-at-a-time). Classifying a FAIL as bug-vs-FP needs the **logit gap** at the first
+mismatch (near-tie = FP, clear gap = bug) — a follow-up the binaries don't emit yet. CI
+surfaces a FAIL as a non-blocking `::warning::` for triage; it stays report-only.
 
 ## Run it locally
 
 ```bash
 cd server
 python3 scripts/profile.py \
-  --target /opt/models/Qwen3.5-27B-Q4_K_M.gguf \
-  --draft  /opt/models/draft/qwen35_dflash/model.safetensors \
+  --target /opt/models/Qwen3.6-27B-Q4_K_M.gguf \
+  --draft  /opt/models/draft/dflash-draft-3.6-q4_k_m.gguf \
+  --tokenizer Qwen/Qwen3.6-27B \
   --n-gen 48 --budget 22 --reps 3 \
   --nsys --check-lossless \
+  --baseline scripts/speed-baseline.json --regress-pct 0.10 \
   --out-json profile.json --out-md profile.md
-```
-
-Requirements: `transformers` (tokenizer), built `test_dflash` + `test_generate`,
-and `nsys` on PATH for the kernel layer (the profiler degrades gracefully without it).
-
-Regression view: pass `--baseline path/to/previous/profile.json` to print the delta
-vs a stored run (e.g. the latest `main`).
-
-## CI
-
-`.github/workflows/speed-profile.yml` runs on the self-hosted RTX 3090 for PRs that
-touch `server/**` or `optimizations/**`. It is **report-only** (`continue-on-error`)
-— it publishes the report to the Actions run summary and uploads `profile.json`,
-`profile.md`, and the `.nsys-rep` trace as artifacts. It never blocks a merge.
-
-To wire it into the existing `ci.yml` instead of a standalone workflow, drop the
-`speed-profile` job into that file (it already has the matching `[self-hosted, gpu,
-sm86]` runner and `lucebox3-gpu-runner` concurrency group).
-
-## Scope (MVP)
-
-Starts with one path — Qwen3.5-27B Q4_K_M + DFlash/DDTree. The runner is parametrized
-by `--target/--draft/--budget`, so the same tool extends to Qwen3.6-27B, the MoE target,
-and the pflash / kvflash paths by changing flags. Per-PR runs can be gated to only the
-path the PR touches.
