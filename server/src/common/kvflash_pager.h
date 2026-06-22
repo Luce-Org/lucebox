@@ -69,6 +69,12 @@
 
 namespace dflash::common {
 
+// Largest multiple of chunk_tokens that is <= pos.
+// Used by the pooled-prefill snapshot path to align the save boundary.
+inline int floor_to_chunk(int pos, int chunk_tokens) {
+    return (pos / chunk_tokens) * chunk_tokens;
+}
+
 struct KvFlashConfig {
     int chunk_tokens       = 64;  // logical tokens per page
     int pool_tokens        = 0;   // resident pool capacity (multiple of chunk_tokens)
@@ -468,13 +474,19 @@ public:
         return events;
     }
 
-    // Snapshot all resident+paged-out chunks into a flat byte blob.
+    // Snapshot resident+paged-out chunks into a flat byte blob.
+    // max_chunks: if >= 0, serialize only chunks [0, max_chunks); the blob's
+    // nc header field encodes max_chunks so deserialize restores exactly that
+    // many chunks with the correct cur_pos.  Pass -1 (default) to serialize
+    // all chunks.
     // Layout: 8-byte magic, header fields (6×uint32), then for each logical
-    // chunk c in [0, n_chunks): chunk_bytes_ bytes in fixed segment order
+    // chunk c in [0, nc): chunk_bytes_ bytes in fixed segment order
     // (layer-major, K then V, head-minor) — matching copy_chunk.
-    std::vector<uint8_t> serialize() const {
+    std::vector<uint8_t> serialize(int max_chunks = -1) const {
         static constexpr uint64_t kMagic = 0x4b56464c41534800ULL; // "KVFLASH\0"
-        const int nc = (int)chunks_.size();
+        const int nc = (max_chunks >= 0 && max_chunks < (int)chunks_.size())
+                       ? max_chunks
+                       : (int)chunks_.size();
         const size_t hdr = sizeof(uint64_t) + 6 * sizeof(uint32_t);
         std::vector<uint8_t> out;
         out.resize(hdr + (size_t)nc * chunk_bytes_, 0);
