@@ -175,6 +175,104 @@ static void test_serialize_partial() {
     std::printf("ok: serialize(max_chunks=%d) partial round-trip\n", k);
 }
 
+// ── Ledger round-trip test (Phase 1: was_resident + qk_score + dtype_enum) ──
+//
+// RED before implementation: serialize() drops the ledger → round-trip
+// asserts on score/residency fields will fail.
+static void test_ledger_roundtrip() {
+    const int head_dim = 4, pool = 512, nkv = 2, nlayer = 1, chunk = 64;
+    // 8 blocks total (512/64). We'll fill 6 chunks, page-out 2 of them, and
+    // set distinct per-chunk scores so we can verify the score field round-trips.
+    Harness A(head_dim, pool, nkv, nlayer);
+    KvFlashPager pa;
+    KvFlashConfig cfg = A.cfg(pool, chunk);
+    expect(pa.attach(cfg, A.k, A.v), "ledger: attach A");
+
+    // Allocate 6 chunks (0..5) — stays within the 8-block pool.
+    expect(pa.alloc_span(0, 6 * chunk), "ledger: alloc 6 chunks");
+
+    // Stamp recognizable bytes.
+    const size_t kbytes = ggml_nbytes(A.k[0]);
+    std::vector<uint8_t> ramp(kbytes);
+    for (size_t i = 0; i < kbytes; i++) ramp[i] = (uint8_t)(i * 17 + 3);
+    ggml_backend_tensor_set(A.k[0], ramp.data(), 0, kbytes);
+    ggml_backend_tensor_set(A.v[0], ramp.data(), 0, kbytes);
+
+    // Assign per-chunk scores via the public score field on ChunkState.
+    // The pager exposes set_chunk_score() / chunk_score() for ledger access.
+    const float scores[6] = {1.0f, 0.5f, -0.25f, 2.0f, 0.0f, -1.0f};
+    for (int c = 0; c < 6; c++) pa.set_chunk_score(c, scores[c]);
+
+    // Page out chunk 1 and chunk 4 so they are host-backed (was_resident==false).
+    pa.page_out(1);
+    pa.page_out(4);
+    // After page_out, chunks 0,2,3,5 resident; 1,4 on_host.
+
+    // Serialize all 6 chunks.
+    std::vector<uint8_t> blob = pa.serialize(6);
+    expect(!blob.empty(), "ledger: serialize produces blob");
+
+    // Deserialize into a fresh pager.
+    Harness B(head_dim, pool, nkv, nlayer);
+    KvFlashPager pb;
+    expect(pb.attach(B.cfg(pool, chunk), B.k, B.v), "ledger: attach B");
+    expect(pb.deserialize(blob.data(), blob.size()), "ledger: deserialize succeeds");
+
+    // --- dtype_enum guard ---
+    // The blob must record the dtype and the deserialized pager must expose it.
+    // For the harness we use GGML_TYPE_F16; serialize must record it.
+    expect(pb.serialized_kv_k_type() == (uint32_t)GGML_TYPE_F16,
+           "ledger: dtype_enum round-trips (F16)");
+
+    // --- was_resident round-trip ---
+    // Chunks 0,2,3,5 were resident → must be resident after restore.
+    // Chunks 1,4 were host-backed → must NOT be resident (just on_host) after restore.
+    expect( pb.is_resident(0), "ledger: chunk 0 resident after restore");
+    expect(!pb.is_resident(1), "ledger: chunk 1 NOT resident after restore (was paged out)");
+    expect( pb.is_resident(2), "ledger: chunk 2 resident after restore");
+    expect( pb.is_resident(3), "ledger: chunk 3 resident after restore");
+    expect(!pb.is_resident(4), "ledger: chunk 4 NOT resident after restore (was paged out)");
+    expect( pb.is_resident(5), "ledger: chunk 5 resident after restore");
+
+    // --- qk_score round-trip ---
+    for (int c = 0; c < 6; c++) {
+        float got = pb.chunk_score(c);
+        expect(got == scores[c], "ledger: qk_score round-trips for chunk");
+    }
+
+    // --- KV bytes still round-trip for resident chunks ---
+    // Chunks 0,2,3,5 were resident when serialized (gathered from pool tensors).
+    // After restore they are resident again. Check a sample region.
+    std::vector<uint8_t> kb(kbytes, 0);
+    ggml_backend_tensor_get(B.k[0], kb.data(), 0, kbytes);
+    // Chunk 0 occupies block 0 in a fresh pager (identity slot assignment).
+    // Verify first chunk's row bytes match the ramp.
+    const size_t row_bytes = (size_t)head_dim * 2;  // F16
+    const size_t head_stride = (size_t)pool * row_bytes;
+    bool bytes_ok = true;
+    for (int h = 0; h < nkv && bytes_ok; h++) {
+        for (int r = 0; r < chunk && bytes_ok; r++) {
+            const size_t off = (size_t)h * head_stride + (size_t)r * row_bytes;
+            for (size_t b = 0; b < row_bytes && bytes_ok; b++) {
+                if (kb[off + b] != ramp[off + b]) bytes_ok = false;
+            }
+        }
+    }
+    expect(bytes_ok, "ledger: chunk 0 KV bytes round-trip with new format");
+
+    // --- old-magic blob must be rejected ---
+    // Corrupt the first byte of the blob to simulate the old magic.
+    std::vector<uint8_t> old_blob = blob;
+    old_blob[7] ^= 0x01; // flip the last byte of the magic field
+    Harness C(head_dim, pool, nkv, nlayer);
+    KvFlashPager pc;
+    expect(pc.attach(C.cfg(pool, chunk), C.k, C.v), "ledger: attach C");
+    expect(!pc.deserialize(old_blob.data(), old_blob.size()),
+           "ledger: old/corrupted magic rejected");
+
+    std::printf("ok: ledger round-trip (was_resident + qk_score + dtype_enum)\n");
+}
+
 static void test_pinning() {
     const int head_dim = 4, pool = 512, nkv = 2, nlayer = 1, chunk = 64;
     Harness H(head_dim, pool, nkv, nlayer);
@@ -214,6 +312,7 @@ int main() {
     test_pinning();
     test_floor_to_chunk();
     test_serialize_partial();
-    std::printf("PASS: kvflash pager (serde + pinning + partial-serialize)\n");
+    test_ledger_roundtrip();
+    std::printf("PASS: kvflash pager (serde + pinning + partial-serialize + ledger)\n");
     return 0;
 }
