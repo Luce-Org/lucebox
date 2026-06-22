@@ -126,6 +126,18 @@ jobs:
         if: steps.models.outputs.present == 'true'
         run: |
           cd server
+          # Use a committed baseline if one is staged so the report can flag a
+          # regression. Seed it once from a green `main` run's profile.json artifact
+          # (see docs/specs/speed-profile.md); without it the delta is simply skipped.
+          # The path is overridable so the runner owner can point elsewhere.
+          baseline="${LUCEBOX_SPEED_BASELINE:-scripts/speed-baseline.json}"
+          baseline_arg=""
+          if [ -f "$baseline" ]; then
+            baseline_arg="--baseline $baseline --regress-pct ${LUCEBOX_SPEED_REGRESS_PCT:-0.10}"
+            echo "Regression check against baseline: $baseline"
+          else
+            echo "No baseline at $baseline — regression flagging disabled this run."
+          fi
           # Keep n_gen small: the 3090 is serialized across PRs. The nsys pass adds a
           # separate short profiled run; tok/s is measured on clean passes.
           .profiler-venv/bin/python scripts/profile.py \
@@ -134,7 +146,11 @@ jobs:
             --tokenizer "$TOKENIZER" \
             --n-gen 48 --budget 22 --reps 3 \
             --nsys --check-lossless \
+            $baseline_arg \
             --out-json profile.json --out-md profile.md
+        env:
+          LUCEBOX_SPEED_BASELINE: ${{ vars.LUCEBOX_SPEED_BASELINE || '' }}
+          LUCEBOX_SPEED_REGRESS_PCT: ${{ vars.LUCEBOX_SPEED_REGRESS_PCT || '' }}
 
       - name: Publish report to the run summary
         if: always() && steps.models.outputs.present == 'true'
@@ -144,6 +160,27 @@ jobs:
           else
             echo "Profiler produced no report (the run failed earlier — see logs)." >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Flag losslessness / regressions (annotations, non-blocking)
+        if: always() && steps.models.outputs.present == 'true'
+        run: |
+          [ -f server/profile.json ] || exit 0
+          # Report-only: emit warnings, never fail. A losslessness FAIL means the fast
+          # path changed the output and it is NOT run-to-run noise (AR agreed with
+          # itself) — worth triaging (real bug vs batched-verify FP). Inconclusive
+          # prompts (engine intrinsically nondeterministic) are NOT failures.
+          python3 - <<'PY'
+          import json
+          d = json.load(open("server/profile.json"))
+          ll, reg = d.get("lossless", {}), d.get("regression", {})
+          if ll and not ll.get("lossless", True):
+              print(f"::warning title=Losslessness::spec-decode output differs from greedy AR on "
+                    f"{','.join(ll.get('prompts_failed', []))} (first token #{ll.get('first_divergence')}); "
+                    f"not run-to-run noise — triage bug vs batched-verify FP.")
+          if reg.get("regressed"):
+              print(f"::warning title=Speed regression::{','.join(reg.get('metrics', []))} moved past "
+                    f"±{reg.get('threshold_pct',0)*100:.0f}% vs baseline {reg.get('baseline_commit','?')}.")
+          PY
 
       - name: Reset GPU clocks
         if: always()
