@@ -55,6 +55,16 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target test_dflash test_generate -j"$(nproc)"
 
+      - name: Install profiler Python deps (isolated venv)
+        run: |
+          cd server
+          # The profiler only needs a tokenizer, so we use a tiny isolated venv
+          # rather than installing into the shared runner's Python or pulling the
+          # full project env (torch, datasets, ...). Matches the deps validated locally.
+          python3 -m venv .profiler-venv
+          .profiler-venv/bin/pip install --quiet --upgrade pip
+          .profiler-venv/bin/pip install --quiet transformers tokenizers sentencepiece tiktoken protobuf
+
       - name: Run speed profiler
         env:
           MODELS: ${{ vars.LUCEBOX_MODELS_DIR || '/opt/models' }}
@@ -62,7 +72,7 @@ jobs:
           cd server
           # Keep n_gen small: the 3090 is serialized across PRs. The nsys pass adds a
           # separate short profiled run; tok/s is measured on clean passes.
-          python3 scripts/profile.py \
+          .profiler-venv/bin/python scripts/profile.py \
             --target "$MODELS/Qwen3.5-27B-Q4_K_M.gguf" \
             --draft  "$MODELS/draft/qwen35_dflash/model.safetensors" \
             --tokenizer "Qwen/Qwen3.5-27B" \
