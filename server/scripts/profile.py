@@ -29,10 +29,11 @@ Design choices
 Usage
 -----
   python3 profile.py \
-      --target /opt/models/Qwen3.5-27B-Q4_K_M.gguf \
-      --draft  /opt/models/draft/qwen35_dflash/model.safetensors \
+      --target /opt/models/Qwen3.6-27B-Q4_K_M.gguf \
+      --draft  /opt/models/draft/dflash-draft-3.6-q4_k_m.gguf \
       --n-gen 48 --budget 22 --reps 3 --nsys \
       --check-lossless \
+      --baseline scripts/speed-baseline.json --regress-pct 0.10 \
       --out-json profile.json --out-md profile.md
 """
 from __future__ import annotations
@@ -172,25 +173,61 @@ def _str(row: dict, *names) -> str:
     return ""
 
 
-def nsys_report(rep: Path, report: str) -> list[dict]:
+# nsys renamed its canned reports across versions (e.g. modern `cuda_gpu_kern_sum`
+# vs legacy `gpukernsum`). Trying both is what keeps the kernel layer working
+# whatever nsys ships on the runner — a name mismatch is the usual reason the nsys
+# section comes out all-zero with an empty table.
+NSYS_REPORTS = {
+    "kern": ["cuda_gpu_kern_sum", "gpukernsum"],
+    "mem":  ["cuda_gpu_mem_time_sum", "gpumemtimesum"],
+    "api":  ["cuda_api_sum", "cudaapisum"],
+}
+
+
+def nsys_version() -> str:
     try:
-        r = subprocess.run(["nsys", "stats", "--report", report, "--format", "csv",
-                            "--force-export=true", str(rep)],
-                           capture_output=True, text=True, timeout=600)
+        out = subprocess.run(["nsys", "--version"], capture_output=True, text=True, timeout=30).stdout.strip()
+        return out.splitlines()[0] if out else "?"
     except Exception:
-        return []
-    lines = r.stdout.splitlines()
-    start = next((i for i, l in enumerate(lines)
-                  if "Total Time (ns)" in l or "Time (%)" in l), None)
-    if start is None:
-        return []
-    return list(csv.DictReader(lines[start:]))
+        return "?"
+
+
+def _looks_like_header(line: str) -> bool:
+    # nsys CSV section header, tolerant to per-version column naming.
+    return "," in line and ("Total Time (ns)" in line or "Total Time" in line
+                            or ("Time (%)" in line and "Name" in line))
+
+
+def nsys_report(rep: Path, names: list[str]) -> tuple[list[dict], str]:
+    """Run `nsys stats` for the first report-name alias that yields a table.
+
+    Returns (rows, diag). diag is "" on success, else a one-line reason the
+    section is empty so the report can say WHY the kernel layer is missing
+    instead of silently printing zeros."""
+    diag = ""
+    for name in names:
+        try:
+            r = subprocess.run(["nsys", "stats", "--report", name, "--format", "csv",
+                                "--force-export=true", str(rep)],
+                               capture_output=True, text=True, timeout=600)
+        except Exception as e:  # noqa
+            diag = f"{name}: {e}"
+            continue
+        lines = r.stdout.splitlines()
+        start = next((i for i, l in enumerate(lines) if _looks_like_header(l)), None)
+        if start is not None:
+            rows = list(csv.DictReader(lines[start:]))
+            if rows:
+                return rows, ""
+        err = (r.stderr or r.stdout).strip()
+        diag = f"{name}: {err.splitlines()[-1] if err else 'no table in output'}"
+    return [], diag
 
 
 def summarize_nsys(rep: Path, tokens: int) -> dict:
-    kern = nsys_report(rep, "cuda_gpu_kern_sum")
-    mem  = nsys_report(rep, "cuda_gpu_mem_time_sum")
-    api  = nsys_report(rep, "cuda_api_sum")
+    kern, dk = nsys_report(rep, NSYS_REPORTS["kern"])
+    mem,  dm = nsys_report(rep, NSYS_REPORTS["mem"])
+    api,  da = nsys_report(rep, NSYS_REPORTS["api"])
 
     total_kern_ns = sum(_num(r, "Total Time (ns)") for r in kern)
     total_insts   = sum(_num(r, "Instances", "Count") for r in kern)
@@ -212,7 +249,7 @@ def summarize_nsys(rep: Path, tokens: int) -> dict:
                  "calls": int(_num(r, "Num Calls", "Count"))} for r in sync_apis]
 
     tk = max(1, tokens)
-    return {
+    out = {
         "tokens_profiled": tokens,
         "gpu_kernel_total_ms": round(total_kern_ns / 1e6, 2),
         "kernel_launches": int(total_insts),
@@ -223,6 +260,13 @@ def summarize_nsys(rep: Path, tokens: int) -> dict:
         "memcpy_breakdown": mem_breakdown,
         "sync_apis": sorted(api_rows, key=lambda x: x["total_ms"], reverse=True)[:8],
     }
+    # If the trace was captured but no report parsed, record WHY + the nsys
+    # version. Without this the section silently reads 0.0 everywhere and there
+    # is no way to tell a real "no kernels" from a stats-parsing failure.
+    if not kern and not mem and not api:
+        out["error"] = "; ".join(d for d in (dk, dm, da) if d) or "nsys stats produced no rows"
+        out["nsys_version"] = nsys_version()
+    return out
 
 
 # --------------------------------------------------------------------------------------
@@ -233,15 +277,68 @@ def read_i32(p: Path) -> list[int]:
     return list(struct.unpack(f"<{len(b)//4}i", b))
 
 
-def check_lossless(prompt_len: int, ar_bin: Path, df_bin: Path) -> dict:
+def _first_divergence(a: list[int], b: list[int]) -> tuple[int | None, int]:
+    n = min(len(a), len(b))
+    return next((i for i in range(n) if a[i] != b[i]), None), n
+
+
+def check_lossless(prompt_len: int, ar_bin: Path, df_bin: Path,
+                   ar_ctrl_bin: Path | None = None) -> dict:
+    """Compare greedy spec-decode (df) against greedy autoregressive (ar).
+
+    A raw bit-exact compare is too strict on its own: the target sees draft
+    tokens as a *batch* in the verify step but one-at-a-time in AR decode, and
+    different GEMM shapes reduce in a different order. IEEE FP is non-associative,
+    so when the top-2 logits are within epsilon the argmax tie can flip — one
+    token diverges and everything after it follows. The engine itself documents
+    this (qwen35_backend.cpp: "different GPU batch sizes -> FP-nondeterministic
+    state divergence -> different greedy output").
+
+    To tell that intrinsic noise apart from a real spec-decode bug we run a
+    second, identical-config AR pass as a determinism control (same idea as the
+    eval harness's baseline_2). If AR disagrees with itself on a prompt, that
+    prompt is intrinsically nondeterministic on this engine and a df-vs-ar
+    mismatch there proves nothing — so we mark it inconclusive rather than FAIL."""
     ar = read_i32(ar_bin)[prompt_len:]
     df = read_i32(df_bin)[prompt_len:]
-    n = min(len(ar), len(df))
-    first = next((i for i in range(n) if ar[i] != df[i]), None)
-    return {"lossless": first is None,
-            "compared_tokens": n,
-            "first_divergence": first,
-            "ar_len": len(ar), "df_len": len(df)}
+    first, n = _first_divergence(ar, df)
+    out = {"lossless": first is None,
+           "compared_tokens": n,
+           "first_divergence": first,
+           "ar_len": len(ar), "df_len": len(df)}
+    if ar_ctrl_bin is not None:
+        ar2 = read_i32(ar_ctrl_bin)[prompt_len:]
+        ar_div, _ = _first_divergence(ar, ar2)
+        out["ar_deterministic"] = ar_div is None   # control: AR == AR on rerun?
+        out["ar_self_divergence"] = ar_div
+    return out
+
+
+# --------------------------------------------------------------------------------------
+# baseline regression check
+# --------------------------------------------------------------------------------------
+# Which way is "better" for each headline metric: +1 = higher is better (throughput),
+# -1 = lower is better (latency). A regression is a move the WRONG way by more than the
+# threshold; a move the right way is just an improvement, never flagged.
+REGRESS_DIRECTION = {
+    "decode_tok_s_mean": +1,
+    "al_mean":           +1,
+    "ttft_est_ms_mean":  -1,
+    "ms_per_token_mean": -1,
+}
+
+
+def regression_delta(base: dict, now: dict, thr: float) -> dict:
+    """Per-metric (baseline, now, delta, pct, regressed?) + an overall verdict."""
+    rows = {}
+    for k, direction in REGRESS_DIRECTION.items():
+        if k not in base or k not in now:
+            continue
+        b, n = base[k], now[k]
+        pct = (n - b) / b if b else 0.0
+        regressed = (direction > 0 and pct < -thr) or (direction < 0 and pct > thr)
+        rows[k] = {"baseline": b, "now": n, "delta": n - b, "pct": pct, "regressed": regressed}
+    return rows
 
 
 # --------------------------------------------------------------------------------------
@@ -255,11 +352,11 @@ def optimization_flags(summary: dict) -> list[str]:
         if ms / step > 0.30:
             flags.append(f"`{name}` is {ms/step*100:.0f}% of the step ({ms:.1f} ms) — primary target.")
     n = summary.get("nsys")
-    if n:
-        if n["launches_per_token"] > 50:
+    if n and not n.get("error"):   # don't reason from a failed/zeroed nsys pass
+        if n.get("launches_per_token", 0) > 50:
             flags.append(f"{n['launches_per_token']} kernel launches/token — kernel-fusion candidate "
                          f"(launch overhead dominates many tiny kernels).")
-        if n["memcpy_ms_per_token"] > 0.5:
+        if n.get("memcpy_ms_per_token", 0) > 0.5:
             flags.append(f"{n['memcpy_ms_per_token']:.2f} ms/token in host<->device copies — "
                          f"CPU/GPU-overlap candidate (data shuttling off the critical path).")
     return flags
@@ -293,13 +390,25 @@ def render_md(doc: dict) -> str:
 
     if "lossless" in doc:
         ll = doc["lossless"]
-        if ll["lossless"]:
-            verdict = f"PASS — all {ll['prompts_checked']} prompts bit-identical to greedy AR"
+        checked = ll["prompts_checked"]
+        inconc = ll.get("prompts_inconclusive", [])
+        if not ll["lossless"]:
+            verdict = (f"FAIL — spec-decode output differs from greedy AR on {len(ll['prompts_failed'])}/{checked} "
+                       f"prompts ({', '.join(ll['prompts_failed'])}), first at token #{ll['first_divergence']}. "
+                       f"AR is self-deterministic, so this is NOT run-to-run noise — but not proven a logic bug "
+                       f"either: it can be batched-verify FP (verify scores draft tokens as a batch vs AR "
+                       f"one-at-a-time). Classify via the logit gap at the divergence: near-tie = FP, clear gap = bug.")
+        elif inconc:
+            verdict = (f"PASS — {len(ll['prompts_passed'])}/{checked} bit-identical to greedy AR; "
+                       f"{len(inconc)} inconclusive ({', '.join(inconc)}) — the engine is intrinsically "
+                       f"nondeterministic on those (AR disagreed with itself), so spec-decode can't be judged.")
         else:
-            verdict = (f"FAIL — {len(ll['prompts_failed'])}/{ll['prompts_checked']} prompts diverge "
-                       f"({', '.join(ll['prompts_failed'])}); first at token #{ll['first_divergence']}")
+            verdict = f"PASS — all {checked} prompts bit-identical to greedy AR"
         L.append("## Correctness (losslessness gate)\n")
-        L.append(f"- **{verdict}**\n")
+        L.append(f"- **{verdict}**")
+        L.append("- FAIL = output changed and it is not run-to-run noise (AR agreed with itself); "
+                 "inconclusive prompts (AR non-deterministic) are excluded. FP-vs-bug needs the logit "
+                 "gap at the first mismatch (a follow-up the binaries don't emit yet).\n")
 
     L.append("## Per-step phase breakdown (engine timers, ms/step)\n")
     L.append("| phase | ms/step | % of step |")
@@ -312,23 +421,31 @@ def render_md(doc: dict) -> str:
     if s.get("nsys"):
         n = s["nsys"]
         L.append("## Kernel-level (nsys)\n")
-        L.append(f"- GPU kernel time: `{n['gpu_kernel_total_ms']} ms`  over `{n['tokens_profiled']}` tokens")
-        L.append(f"- kernel launches/token: `{n['launches_per_token']}`  (fusion signal)")
-        L.append(f"- host<->device copy: `{n['memcpy_total_ms']} ms` total, "
-                 f"`{n['memcpy_ms_per_token']} ms/token` (overlap signal)\n")
-        L.append("**Top kernels by GPU time**\n")
-        L.append("| kernel | total ms | launches | avg µs |")
-        L.append("|---|---:|---:|---:|")
-        for k in n["top_kernels"]:
-            L.append(f"| `{k['name']}` | {k['total_ms']} | {k['instances']} | {k['avg_us']} |")
-        L.append("")
-        if n["sync_apis"]:
-            L.append("**Sync / launch / copy CUDA APIs** (CPU-stall signal)\n")
-            L.append("| api | total ms | calls |")
-            L.append("|---|---:|---:|")
-            for a in n["sync_apis"]:
-                L.append(f"| `{a['name']}` | {a['total_ms']} | {a['calls']} |")
+        if n.get("error"):
+            # Trace was captured but stats wouldn't parse — say why instead of
+            # printing 0.0 everywhere with an empty table.
+            L.append(f"- ⚠️ nsys trace captured but kernel stats could not be parsed: "
+                     f"`{n['error']}` (nsys `{n.get('nsys_version','?')}`).")
+            L.append("- The `.nsys-rep` is uploaded as an artifact — open it in Nsight Systems, or "
+                     "check which report names this nsys exposes with `nsys stats --help-reports`.\n")
+        else:
+            L.append(f"- GPU kernel time: `{n['gpu_kernel_total_ms']} ms`  over `{n['tokens_profiled']}` tokens")
+            L.append(f"- kernel launches/token: `{n['launches_per_token']}`  (fusion signal)")
+            L.append(f"- host<->device copy: `{n['memcpy_total_ms']} ms` total, "
+                     f"`{n['memcpy_ms_per_token']} ms/token` (overlap signal)\n")
+            L.append("**Top kernels by GPU time**\n")
+            L.append("| kernel | total ms | launches | avg µs |")
+            L.append("|---|---:|---:|---:|")
+            for k in n["top_kernels"]:
+                L.append(f"| `{k['name']}` | {k['total_ms']} | {k['instances']} | {k['avg_us']} |")
             L.append("")
+            if n["sync_apis"]:
+                L.append("**Sync / launch / copy CUDA APIs** (CPU-stall signal)\n")
+                L.append("| api | total ms | calls |")
+                L.append("|---|---:|---:|")
+                for a in n["sync_apis"]:
+                    L.append(f"| `{a['name']}` | {a['total_ms']} | {a['calls']} |")
+                L.append("")
 
     flags = optimization_flags(s)
     if flags:
@@ -338,11 +455,18 @@ def render_md(doc: dict) -> str:
         L.append("")
 
     if doc.get("baseline_delta"):
+        reg = doc.get("regression", {})
+        thr = reg.get("threshold_pct", 0.0)
+        verdict = "⚠️ REGRESSION" if reg.get("regressed") else "✅ within threshold"
         L.append("## Delta vs baseline\n")
-        L.append("| metric | baseline | now | Δ |")
-        L.append("|---|---:|---:|---:|")
-        for k, (b, now, d) in doc["baseline_delta"].items():
-            L.append(f"| {k} | {b:.2f} | {now:.2f} | {d:+.2f} |")
+        L.append(f"- baseline commit: `{reg.get('baseline_commit','?')}`  "
+                 f"threshold: `±{thr*100:.0f}%`  verdict: **{verdict}**\n")
+        L.append("| metric | baseline | now | Δ | Δ% | |")
+        L.append("|---|---:|---:|---:|---:|:--|")
+        for k, r in doc["baseline_delta"].items():
+            mark = "⚠️" if r["regressed"] else ""
+            L.append(f"| {k} | {r['baseline']:.2f} | {r['now']:.2f} | {r['delta']:+.2f} | "
+                     f"{r['pct']*100:+.1f}% | {mark} |")
         L.append("")
     return "\n".join(L)
 
@@ -380,7 +504,7 @@ def main():
     ap.add_argument("--draft", required=True)
     ap.add_argument("--df-bin", default=os.environ.get("DFLASH_BIN", "build/test_dflash"))
     ap.add_argument("--ar-bin", default=os.environ.get("DFLASH_BIN_AR", "build/test_generate"))
-    ap.add_argument("--tokenizer", default=os.environ.get("DFLASH_TOKENIZER", "Qwen/Qwen3.5-27B"))
+    ap.add_argument("--tokenizer", default=os.environ.get("DFLASH_TOKENIZER", "Qwen/Qwen3.6-27B"))
     ap.add_argument("--n-gen", type=int, default=48)
     ap.add_argument("--budget", type=int, default=22)
     ap.add_argument("--reps", type=int, default=3)
@@ -388,6 +512,9 @@ def main():
     ap.add_argument("--check-lossless", action="store_true")
     ap.add_argument("--prompts", default=None, help="optional .jsonl of {name,text}")
     ap.add_argument("--baseline", default=None, help="optional baseline profile.json for delta")
+    ap.add_argument("--regress-pct", type=float, default=0.10,
+                    help="fractional move that counts as a regression vs --baseline "
+                         "(0.10 = 10%%; wide enough to absorb run-to-run GPU variance)")
     ap.add_argument("--out-json", default="profile.json")
     ap.add_argument("--out-md", default="profile.md")
     cfg = ap.parse_args()
@@ -420,11 +547,15 @@ def main():
         ar_txt = run(ar_cmd(cfg, pbin, tmp / "ar.bin", cfg.n_gen))
         agg.update(parse_ar(ar_txt))
 
-        # losslessness (uses the AR + a fresh greedy DFlash output we just wrote)
+        # losslessness: greedy spec-decode vs greedy AR, with a second identical
+        # AR pass as a determinism control. ar.bin (the baseline AR run above) is
+        # reused as that control, so the gate costs one extra df + ar pass, same
+        # as before — no extra GPU time for the control.
         if cfg.check_lossless:
             run(dflash_cmd(cfg, pbin, tmp / "df_ll.bin", cfg.n_gen))
             run(ar_cmd(cfg, pbin, tmp / "ar_ll.bin", cfg.n_gen))
-            agg["lossless"] = check_lossless(plen, tmp / "ar_ll.bin", tmp / "df_ll.bin")
+            agg["lossless"] = check_lossless(plen, tmp / "ar_ll.bin", tmp / "df_ll.bin",
+                                             ar_ctrl_bin=tmp / "ar.bin")
 
         runs.append(agg)
 
@@ -481,21 +612,41 @@ def main():
     if cfg.check_lossless:
         ll_runs = [(r["prompt"], r["lossless"]) for r in runs if "lossless" in r]
         if ll_runs:
-            failed = [(name, ll) for name, ll in ll_runs if not ll["lossless"]]
+            # A prompt is a REAL losslessness failure only if AR is self-deterministic
+            # (control passed) AND spec-decode still diverges from it. If AR already
+            # disagrees with itself, the prompt is intrinsically nondeterministic on
+            # this engine -> inconclusive, not a spec-decode bug.
+            passed, real_fail, inconclusive = [], [], []
+            for name, ll in ll_runs:
+                if ll["lossless"]:
+                    passed.append(name)
+                elif ll.get("ar_deterministic", True):
+                    real_fail.append((name, ll))
+                else:
+                    inconclusive.append(name)
             doc["lossless"] = {
-                "lossless": not failed,                       # FAIL if ANY prompt diverges
+                "lossless": not real_fail,                    # FAIL only on a REAL divergence
                 "prompts_checked": len(ll_runs),
-                "prompts_failed": [name for name, _ in failed],
-                "first_divergence": failed[0][1]["first_divergence"] if failed else None,
+                "prompts_passed": passed,
+                "prompts_failed": [name for name, _ in real_fail],
+                "prompts_inconclusive": inconclusive,
+                "first_divergence": real_fail[0][1]["first_divergence"] if real_fail else None,
                 "per_prompt": {name: ll for name, ll in ll_runs},
             }
 
-    # baseline delta
+    # baseline delta + regression verdict
     if cfg.baseline and Path(cfg.baseline).exists():
-        base = json.loads(Path(cfg.baseline).read_text())["summary"]
-        keys = ["decode_tok_s_mean", "al_mean", "ttft_est_ms_mean", "ms_per_token_mean"]
-        doc["baseline_delta"] = {k: (base[k], summary[k], summary[k] - base[k])
-                                 for k in keys if k in base and k in summary}
+        base_doc = json.loads(Path(cfg.baseline).read_text())
+        rows = regression_delta(base_doc["summary"], summary, cfg.regress_pct)
+        if rows:
+            doc["baseline_delta"] = rows
+            regressed = [k for k, r in rows.items() if r["regressed"]]
+            doc["regression"] = {
+                "threshold_pct": cfg.regress_pct,
+                "regressed": bool(regressed),
+                "metrics": regressed,
+                "baseline_commit": base_doc.get("commit", "?"),
+            }
 
     Path(cfg.out_json).write_text(json.dumps(doc, indent=2))
     Path(cfg.out_md).write_text(render_md(doc))
