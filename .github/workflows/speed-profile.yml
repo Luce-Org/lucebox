@@ -32,11 +32,16 @@ jobs:
     timeout-minutes: 30
     continue-on-error: true   # report-only: a slow/failed profile must not block the PR
 
+    # Model paths live on the runner, not in the repo (multi-GB weights). They are
+    # overridable via repo variables so the runner owner can point at whatever is
+    # staged without editing this workflow. Prefer the repo-documented Qwen3.6 GGUF
+    # draft path; keep the older LUCEBOX_SPEED_PROFILE_* variable names as aliases
+    # so existing repo settings continue to work.
     env:
-      MODELS_DIR: ${{ vars.LUCEBOX_MODELS_DIR || '/opt/models' }}
-      TARGET_MODEL: ${{ vars.LUCEBOX_SPEED_PROFILE_TARGET || 'Qwen3.6-27B-Q4_K_M.gguf' }}
-      DRAFT_MODEL: ${{ vars.LUCEBOX_SPEED_PROFILE_DRAFT || 'draft/qwen35_dflash/model.safetensors' }}
-      TOKENIZER_ID: ${{ vars.LUCEBOX_SPEED_PROFILE_TOKENIZER || 'Qwen/Qwen3.6-27B' }}
+      MODELS: ${{ vars.LUCEBOX_MODELS_DIR || '/opt/models' }}
+      TARGET_MODEL: ${{ vars.LUCEBOX_TARGET_MODEL || vars.LUCEBOX_SPEED_PROFILE_TARGET || 'Qwen3.6-27B-Q4_K_M.gguf' }}
+      DRAFT_MODEL: ${{ vars.LUCEBOX_DRAFT_MODEL || vars.LUCEBOX_SPEED_PROFILE_DRAFT || 'draft/dflash-draft-3.6-q4_k_m.gguf' }}
+      TOKENIZER: ${{ vars.LUCEBOX_TOKENIZER || vars.LUCEBOX_SPEED_PROFILE_TOKENIZER || 'Qwen/Qwen3.6-27B' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -51,7 +56,46 @@ jobs:
           # runner user can't run nvidia-smi -lgc; the profiler still records the power cap.
           sudo nvidia-smi -lgc 1395 2>/dev/null || echo "clock lock not permitted; continuing"
 
+      - name: Check model weights are staged on the runner
+        id: models
+        run: |
+          # The weights are staged on the self-hosted runner out of band. If they are
+          # absent the engine binary aborts with a cryptic gguf "No such file" error, so
+          # check up front and SKIP cleanly instead — this job is report-only, and a
+          # missing model on the runner is an environment issue, not a PR defect.
+          target="$MODELS/$TARGET_MODEL"
+          draft="$MODELS/$DRAFT_MODEL"
+          present=true
+          missing_list=""
+          for f in "$target" "$draft"; do
+            if [ ! -f "$f" ]; then
+              present=false
+              missing_list="${missing_list}  - \`$f\`"$'\n'
+            fi
+          done
+          echo "present=$present" >> "$GITHUB_OUTPUT"
+          if [ "$present" = "false" ]; then
+            {
+              echo "## 🏎️ Speed profile — skipped (model weights not on runner)"
+              echo ""
+              echo "The profiler needs the target + draft weights staged on the self-hosted"
+              echo "runner, but these file(s) were not found:"
+              echo ""
+              printf '%s' "$missing_list"
+              echo ""
+              echo "Stage the weights at those paths, or set the repo variables"
+              echo "\`LUCEBOX_MODELS_DIR\` / \`LUCEBOX_TARGET_MODEL\` / \`LUCEBOX_DRAFT_MODEL\`"
+              echo "to point at where they live. Legacy \`LUCEBOX_SPEED_PROFILE_*\` variables also work."
+              echo "This job is report-only, so the PR is not blocked."
+              echo ""
+              echo "Available draft candidates under \`$MODELS\`:"
+              find "$MODELS" -maxdepth 4 -type f \( -name '*.gguf' -o -name '*.safetensors' \) -print 2>/dev/null | sort | sed 's/^/  - /' || true
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=Speed profile skipped::Model weights not found under $MODELS — see the run summary."
+          fi
+
       - name: Build engine binaries (sm_86, Release)
+        if: steps.models.outputs.present == 'true'
         run: |
           cd server
           cmake -B build \
@@ -61,7 +105,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target test_dflash test_generate -j"$(nproc)"
 
-      - name: Install profiler Python deps (isolated venv)
+      - name: Install profiler Python deps (isolated, pinned venv)
+        if: steps.models.outputs.present == 'true'
         run: |
           cd server
           # The profiler only needs a tokenizer, so we use a tiny isolated venv
@@ -70,49 +115,29 @@ jobs:
           # benchmark setup is reproducible and resilient to upstream releases.
           python3 -m venv .profiler-venv
           .profiler-venv/bin/pip install --quiet --upgrade pip==25.1.1
-          .profiler-venv/bin/pip install --quiet \
+          .profiler-venv/bin/pip install --quiet --require-virtualenv \
             transformers==4.52.4 \
             tokenizers==0.21.1 \
             sentencepiece==0.2.0 \
             tiktoken==0.9.0 \
             protobuf==6.31.1
 
-      - name: Validate profiler model inputs
-        run: |
-          target="$MODELS_DIR/$TARGET_MODEL"
-          draft="$MODELS_DIR/$DRAFT_MODEL"
-
-          if [ ! -f "$target" ]; then
-            echo "Missing speed-profile target model: $target" >&2
-            echo "Set LUCEBOX_SPEED_PROFILE_TARGET to a GGUF under $MODELS_DIR, or restore the expected model." >&2
-            echo "Available GGUF files in $MODELS_DIR:" >&2
-            find "$MODELS_DIR" -maxdepth 3 -type f -name '*.gguf' -print 2>/dev/null | sort >&2 || true
-            exit 1
-          fi
-
-          if [ ! -f "$draft" ]; then
-            echo "Missing speed-profile draft model: $draft" >&2
-            echo "Set LUCEBOX_SPEED_PROFILE_DRAFT to a safetensors file under $MODELS_DIR, or restore the expected model." >&2
-            echo "Available safetensors files in $MODELS_DIR:" >&2
-            find "$MODELS_DIR" -maxdepth 4 -type f -name '*.safetensors' -print 2>/dev/null | sort >&2 || true
-            exit 1
-          fi
-
       - name: Run speed profiler
+        if: steps.models.outputs.present == 'true'
         run: |
           cd server
           # Keep n_gen small: the 3090 is serialized across PRs. The nsys pass adds a
           # separate short profiled run; tok/s is measured on clean passes.
           .profiler-venv/bin/python scripts/profile.py \
-            --target "$MODELS_DIR/$TARGET_MODEL" \
-            --draft  "$MODELS_DIR/$DRAFT_MODEL" \
-            --tokenizer "$TOKENIZER_ID" \
+            --target "$MODELS/$TARGET_MODEL" \
+            --draft  "$MODELS/$DRAFT_MODEL" \
+            --tokenizer "$TOKENIZER" \
             --n-gen 48 --budget 22 --reps 3 \
             --nsys --check-lossless \
             --out-json profile.json --out-md profile.md
 
       - name: Publish report to the run summary
-        if: always()
+        if: always() && steps.models.outputs.present == 'true'
         run: |
           if [ -f server/profile.md ]; then
             { echo "## 🏎️ Speed profile"; echo ""; cat server/profile.md; } >> "$GITHUB_STEP_SUMMARY"
