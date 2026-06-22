@@ -1202,9 +1202,12 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             result.spec_decode_ran = true;
             // Sync prefill features to mirror before spec-decode
             if (target_cache().target_feat) {
+                // bound to last cap features; raw committed no-ops when committed>cap
+                const int sync_n     = std::min(committed, feature_mirror().cap);
+                const int sync_start = std::max(0, committed - sync_n);
                 draft_feature_mirror_sync_range(target_cache().target_feat,
                                                 target_cache().target_feat_cap,
-                                                feature_mirror(), 0, committed);
+                                                feature_mirror(), sync_start, sync_n);
             }
 
             // Get argmax from last prefill position for last_tok

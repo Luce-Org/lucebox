@@ -1,0 +1,5 @@
+KV=f16 | kv_cache=3.12 GiB | prefill=18.0s decode=0.5s(174.5tok/s) | accepted=86/112 (76.8%) avg_commit=12.86
+KV=q8_0 | kv_cache=3.12 GiB | prefill=18.1s decode=0.6s(143.5tok/s) | accepted=85/128 (66.4%) avg_commit=11.25
+KV=q4_0 | kv_cache=3.12 GiB | prefill=18.0s decode=0.5s(166.8tok/s) | accepted=86/112 (76.8%) avg_commit=12.86
+KV=tq3_0 | kv_cache=3.12 GiB | prefill=23.6s decode=0.8s(109.3tok/s) | accepted=86/112 (76.8%) avg_commit=12.86
+KVSWEEP DONE

@@ -1,0 +1,76 @@
+{
+  "step1": [
+    {
+      "draft_ctx": 8192,
+      "status": "OK",
+      "accept": 0.7678571343421936,
+      "commit": null,
+      "decode_tps": null,
+      "prompt_tokens": 18043,
+      "completion_tokens": 90
+    },
+    {
+      "draft_ctx": 16384,
+      "status": "REQUEST_OOM",
+      "error": "Remote end closed connection without response",
+      "oom_pattern": "out of memory"
+    },
+    {
+      "draft_ctx": 24576,
+      "status": "REQUEST_OOM",
+      "error": "Remote end closed connection without response",
+      "oom_pattern": "out of memory"
+    }
+  ],
+  "step2": [
+    {
+      "draft_ctx": 8192,
+      "needle": "06k",
+      "marker_dist_from_end": 2593,
+      "status": "OK",
+      "accept": 0.7678571343421936,
+      "commit": null,
+      "decode_tps": null,
+      "recalled": true,
+      "prompt_tokens": 6593,
+      "completion_tokens": 90,
+      "elapsed_s": 4.2
+    },
+    {
+      "draft_ctx": 8192,
+      "needle": "08k",
+      "marker_dist_from_end": 4854,
+      "status": "OK",
+      "accept": 0.4479166567325592,
+      "commit": null,
+      "decode_tps": null,
+      "recalled": true,
+      "prompt_tokens": 8854,
+      "completion_tokens": 89,
+      "elapsed_s": 5.4
+    },
+    {
+      "draft_ctx": 8192,
+      "needle": "12k",
+      "marker_dist_from_end": 7987,
+      "status": "OK",
+      "accept": 0.34166666865348816,
+      "commit": null,
+      "decode_tps": null,
+      "recalled": true,
+      "prompt_tokens": 13072,
+      "completion_tokens": 89,
+      "elapsed_s": 7.5
+    }
+  ],
+  "step3": {
+    "draft_ctx": 16384,
+    "dtype": "f16",
+    "status": "OK",
+    "accept": 0.0625,
+    "commit": null,
+    "decode_tps": null
+  },
+  "max_fitting_ctx": 8192,
+  "first_oom_ctx": 16384
+}

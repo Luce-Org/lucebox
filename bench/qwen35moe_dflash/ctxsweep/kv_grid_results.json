@@ -1,0 +1,309 @@
+{
+  "f16": {
+    "max_fitting_draft_ctx": 32768,
+    "first_oom_draft_ctx": null,
+    "step_a": [
+      {
+        "draft_ctx": 8192,
+        "status": "OK",
+        "accept_pct": 76.8,
+        "avg_commit": 12.86,
+        "decode_tps": 126.7,
+        "kv_cache_gib": 3.12,
+        "prompt_tokens": 18043,
+        "completion_tokens": 90,
+        "elapsed_s": 10.0
+      },
+      {
+        "draft_ctx": 16384,
+        "status": "OK",
+        "accept_pct": 76.8,
+        "avg_commit": 12.86,
+        "decode_tps": 35.8,
+        "kv_cache_gib": 3.12,
+        "prompt_tokens": 18043,
+        "completion_tokens": 90,
+        "elapsed_s": 13.7
+      },
+      {
+        "draft_ctx": 24576,
+        "status": "OK",
+        "accept_pct": null,
+        "avg_commit": null,
+        "decode_tps": 38.9,
+        "kv_cache_gib": 3.12,
+        "prompt_tokens": 18043,
+        "completion_tokens": 90,
+        "elapsed_s": 11.3
+      },
+      {
+        "draft_ctx": 32768,
+        "status": "OK",
+        "accept_pct": null,
+        "avg_commit": null,
+        "decode_tps": 38.9,
+        "kv_cache_gib": 3.12,
+        "prompt_tokens": 18043,
+        "completion_tokens": 90,
+        "elapsed_s": 11.2
+      }
+    ],
+    "step_b": [
+      {
+        "needle": "06k",
+        "marker_dist": 2593,
+        "status": "OK",
+        "accept_pct": 76.8,
+        "avg_commit": 12.86,
+        "decode_tps": 146.4,
+        "recalled": true,
+        "prompt_tokens": 6593,
+        "completion_tokens": 90,
+        "elapsed_s": 4.1
+      },
+      {
+        "needle": "08k",
+        "marker_dist": 4854,
+        "status": "OK",
+        "accept_pct": 41.3,
+        "avg_commit": 6.85,
+        "decode_tps": 90.4,
+        "recalled": true,
+        "prompt_tokens": 8854,
+        "completion_tokens": 89,
+        "elapsed_s": 7.5
+      },
+      {
+        "needle": "12k",
+        "marker_dist": 7987,
+        "status": "OK",
+        "accept_pct": 44.8,
+        "avg_commit": 7.42,
+        "decode_tps": 63.0,
+        "recalled": true,
+        "prompt_tokens": 13072,
+        "completion_tokens": 89,
+        "elapsed_s": 7.8
+      }
+    ]
+  },
+  "q8_0": {
+    "max_fitting_draft_ctx": 8192,
+    "first_oom_draft_ctx": 16384,
+    "step_a": [
+      {
+        "draft_ctx": 8192,
+        "status": "OK",
+        "accept_pct": 76.8,
+        "avg_commit": 12.86,
+        "decode_tps": 141.8,
+        "kv_cache_gib": 3.12,
+        "prompt_tokens": 18043,
+        "completion_tokens": 90,
+        "elapsed_s": 9.7
+      },
+      {
+        "draft_ctx": 16384,
+        "status": "SERVE_OOM",
+        "error": "Remote end closed connection without response",
+        "oom_pattern": "out of memory"
+      },
+      {
+        "draft_ctx": 24576,
+        "status": "SERVE_OOM",
+        "error": "Remote end closed connection without response",
+        "oom_pattern": "out of memory"
+      },
+      {
+        "draft_ctx": 32768,
+        "status": "SERVE_OOM",
+        "error": "Remote end closed connection without response",
+        "oom_pattern": "out of memory"
+      }
+    ],
+    "step_b": [
+      {
+        "needle": "06k",
+        "marker_dist": 2593,
+        "status": "OK",
+        "accept_pct": 76.8,
+        "avg_commit": 12.86,
+        "decode_tps": 147.6,
+        "recalled": true,
+        "prompt_tokens": 6593,
+        "completion_tokens": 90,
+        "elapsed_s": 4.1
+      },
+      {
+        "needle": "08k",
+        "marker_dist": 4854,
+        "status": "OK",
+        "accept_pct": 44.8,
+        "avg_commit": 7.42,
+        "decode_tps": 101.2,
+        "recalled": true,
+        "prompt_tokens": 8854,
+        "completion_tokens": 89,
+        "elapsed_s": 5.2
+      },
+      {
+        "needle": "12k",
+        "marker_dist": 7987,
+        "status": "OK",
+        "accept_pct": 34.2,
+        "avg_commit": 5.93,
+        "decode_tps": 78.0,
+        "recalled": true,
+        "prompt_tokens": 13072,
+        "completion_tokens": 89,
+        "elapsed_s": 7.3
+      }
+    ]
+  },
+  "q4_0": {
+    "max_fitting_draft_ctx": 8192,
+    "first_oom_draft_ctx": 16384,
+    "step_a": [
+      {
+        "draft_ctx": 8192,
+        "status": "OK",
+        "accept_pct": 76.8,
+        "avg_commit": 12.86,
+        "decode_tps": 138.4,
+        "kv_cache_gib": 3.12,
+        "prompt_tokens": 18043,
+        "completion_tokens": 90,
+        "elapsed_s": 11.8
+      },
+      {
+        "draft_ctx": 16384,
+        "status": "SERVE_OOM",
+        "error": "Remote end closed connection without response",
+        "oom_pattern": "out of memory"
+      },
+      {
+        "draft_ctx": 24576,
+        "status": "SERVE_OOM",
+        "error": "Remote end closed connection without response",
+        "oom_pattern": "out of memory"
+      },
+      {
+        "draft_ctx": 32768,
+        "status": "SERVE_OOM",
+        "error": "Remote end closed connection without response",
+        "oom_pattern": "out of memory"
+      }
+    ],
+    "step_b": [
+      {
+        "needle": "06k",
+        "marker_dist": 2593,
+        "status": "OK",
+        "accept_pct": 76.8,
+        "avg_commit": 12.86,
+        "decode_tps": 144.9,
+        "recalled": true,
+        "prompt_tokens": 6593,
+        "completion_tokens": 90,
+        "elapsed_s": 4.1
+      },
+      {
+        "needle": "08k",
+        "marker_dist": 4854,
+        "status": "OK",
+        "accept_pct": 44.8,
+        "avg_commit": 7.42,
+        "decode_tps": 100.9,
+        "recalled": true,
+        "prompt_tokens": 8854,
+        "completion_tokens": 89,
+        "elapsed_s": 5.2
+      },
+      {
+        "needle": "12k",
+        "marker_dist": 7987,
+        "status": "OK",
+        "accept_pct": 34.2,
+        "avg_commit": 5.93,
+        "decode_tps": 76.5,
+        "recalled": true,
+        "prompt_tokens": 13072,
+        "completion_tokens": 89,
+        "elapsed_s": 7.4
+      }
+    ]
+  },
+  "tq3_0": {
+    "max_fitting_draft_ctx": 8192,
+    "first_oom_draft_ctx": 16384,
+    "step_a": [
+      {
+        "draft_ctx": 8192,
+        "status": "OK",
+        "accept_pct": 76.8,
+        "avg_commit": 12.86,
+        "decode_tps": 115.6,
+        "kv_cache_gib": 3.12,
+        "prompt_tokens": 18043,
+        "completion_tokens": 90,
+        "elapsed_s": 11.3
+      },
+      {
+        "draft_ctx": 16384,
+        "status": "SERVE_OOM",
+        "error": "Remote end closed connection without response",
+        "oom_pattern": "out of memory"
+      },
+      {
+        "draft_ctx": 24576,
+        "status": "SERVE_OOM",
+        "error": "Remote end closed connection without response",
+        "oom_pattern": "out of memory"
+      },
+      {
+        "draft_ctx": 32768,
+        "status": "SERVE_OOM",
+        "error": "Remote end closed connection without response",
+        "oom_pattern": "out of memory"
+      }
+    ],
+    "step_b": [
+      {
+        "needle": "06k",
+        "marker_dist": 2593,
+        "status": "OK",
+        "accept_pct": 76.8,
+        "avg_commit": 12.86,
+        "decode_tps": 132.1,
+        "recalled": true,
+        "prompt_tokens": 6593,
+        "completion_tokens": 90,
+        "elapsed_s": 4.3
+      },
+      {
+        "needle": "08k",
+        "marker_dist": 4854,
+        "status": "OK",
+        "accept_pct": 41.3,
+        "avg_commit": 6.85,
+        "decode_tps": 83.3,
+        "recalled": true,
+        "prompt_tokens": 8854,
+        "completion_tokens": 89,
+        "elapsed_s": 5.7
+      },
+      {
+        "needle": "12k",
+        "marker_dist": 7987,
+        "status": "OK",
+        "accept_pct": 37.1,
+        "avg_commit": 6.36,
+        "decode_tps": 69.1,
+        "recalled": true,
+        "prompt_tokens": 13072,
+        "completion_tokens": 89,
+        "elapsed_s": 8.5
+      }
+    ]
+  }
+}
