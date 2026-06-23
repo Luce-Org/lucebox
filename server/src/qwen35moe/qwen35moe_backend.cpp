@@ -2145,8 +2145,9 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
         safety_bytes = 256ULL * 1024 * 1024;  // can reduce safety when draft accounts for it
     }
 
-    // Core model bytes = what's already used on GPU (non-expert tensors)
-    const uint64_t core_bytes = gpu_total - gpu_free;
+    // Core model bytes = what's already used on GPU (non-expert tensors).
+    const uint64_t core_bytes =
+        moe_hybrid_core_bytes_from_memory("qwen35moe", gpu_free, gpu_total);
 
     uint64_t expert_budget = 0;
     if (gpu_total > core_bytes + kv_total + warm_cache_bytes + safety_bytes + draft_reserve_bytes) {

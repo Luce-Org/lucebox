@@ -1432,7 +1432,8 @@ bool LagunaBackend::init_hybrid_mode() {
 
     const uint64_t warm_cache_bytes = 200ULL * 1024 * 1024;
     const uint64_t safety_bytes = 512ULL * 1024 * 1024;
-    const uint64_t core_bytes = gpu_total - gpu_free;
+    const uint64_t core_bytes =
+        moe_hybrid_core_bytes_from_memory("laguna", gpu_free, gpu_total);
 
     uint64_t expert_budget = 0;
     if (gpu_total > core_bytes + kv_total + warm_cache_bytes + safety_bytes) {
