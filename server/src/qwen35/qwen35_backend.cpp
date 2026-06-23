@@ -1031,7 +1031,9 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
     //     → same batch shapes → bit-identical greedy output (the Phase-3 gate).
     static const bool kv_restore_consume = []() {
         const char * e = std::getenv("KVFLASH_RESTORE_CONSUME");
-        return e && e[0] == '1';
+        // Default ON: skip full re-prefill, consume the deserialized prefix KV.
+        // Set KVFLASH_RESTORE_CONSUME=0 to force re-prefill (diagnostic / golden).
+        return !(e && e[0] == '0');
     }();
     int committed = snap_pos;
     const int prompt_len = (int)req.prompt.size();
@@ -1048,7 +1050,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                 std::fflush(stderr);
                 std::vector<int32_t> suffix = restore_prompt_delta(req.prompt, snap_pos);
                 committed = do_prefill(suffix, out_io, req.snap_pos, req.snap_slot,
-                                       /*kv_offset=*/snap_pos);
+                                       /*kv_offset=*/snap_pos, /*full_prompt=*/&req.prompt);
             } else {
                 // Legacy path: discard deserialized KV, re-prefill from token 0.
                 reset_recurrent_state(cache_);
@@ -1057,7 +1059,8 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             }
         } else {
             std::vector<int32_t> delta = restore_prompt_delta(req.prompt, snap_pos);
-            committed = do_prefill(delta, out_io, req.snap_pos, req.snap_slot, /*kv_offset=*/snap_pos);
+            committed = do_prefill(delta, out_io, req.snap_pos, req.snap_slot,
+                                   /*kv_offset=*/snap_pos, /*full_prompt=*/&req.prompt);
         }
         if (committed < 0) {
             result.error = "prefill";
@@ -1158,7 +1161,8 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
 int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                const DaemonIO & io,
                                int snap_pos, int snap_slot,
-                               int kv_offset) {
+                               int kv_offset,
+                               const std::vector<int32_t> * full_prompt) {
     (void)io;
 
     const int hidden = w_.n_embd;
@@ -1431,7 +1435,16 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
             if (kvf_restore_suffix) {
                 // Restore-consume: tokens is the suffix; rebuild full history
                 // so chunk-count computed from history matches committed.
-                kvflash_history_.resize((size_t)kv_offset, 0); // prefix ids unknown
+                // Use full_prompt for the prefix when available so the drafter
+                // residency scorer (score_chunks) sees real token IDs instead
+                // of zeros — zeros alias to the BOS/pad embedding and produce
+                // wrong tail-attention scores for the restored prefix chunks.
+                if (full_prompt && (int)full_prompt->size() >= kv_offset) {
+                    kvflash_history_.assign(full_prompt->begin(),
+                                            full_prompt->begin() + kv_offset);
+                } else {
+                    kvflash_history_.resize((size_t)kv_offset, 0); // prefix ids unknown
+                }
                 kvflash_history_.insert(kvflash_history_.end(), tokens.begin(), tokens.end());
             } else {
                 kvflash_history_.assign(tokens.begin(), tokens.end());
@@ -1439,7 +1452,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
             kvflash_pager_.zero_free_blocks();
             kvflash_mask_epoch_ = (uint64_t)-1;
         } else {
-            kvflash_sync_prefill(committed, tokens, kv_offset);
+            kvflash_sync_prefill(committed, tokens, kv_offset, full_prompt);
         }
         apply_kvflash_pins();
     }
@@ -1464,7 +1477,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
 
 void Qwen35Backend::kvflash_sync_prefill(int committed,
                                          const std::vector<int32_t> & tokens,
-                                         int kv_offset) {
+                                         int kv_offset,
+                                         const std::vector<int32_t> * full_prompt) {
     // Prefill (and snapshot restore) place rows physically contiguous at
     // [0, committed): rebuild the pager mapping identity-style and reset
     // the token history to match.
@@ -1481,7 +1495,14 @@ void Qwen35Backend::kvflash_sync_prefill(int committed,
     if (kv_offset == 0) {
         kvflash_history_.assign(tokens.begin(), tokens.end());
     } else {
-        kvflash_history_.resize((size_t)kv_offset, 0);  // restored prefix ids unknown
+        // Reconstruct the prefix from full_prompt when available so the drafter
+        // scorer sees real token IDs, not zero-padding which aliases to BOS/pad.
+        if (full_prompt && (int)full_prompt->size() >= kv_offset) {
+            kvflash_history_.assign(full_prompt->begin(),
+                                    full_prompt->begin() + kv_offset);
+        } else {
+            kvflash_history_.resize((size_t)kv_offset, 0);  // prefix ids unknown
+        }
         kvflash_history_.insert(kvflash_history_.end(), tokens.begin(), tokens.end());
     }
     // Slots past the prompt still hold the previous request's rows; the

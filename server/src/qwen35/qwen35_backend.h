@@ -223,8 +223,11 @@ protected:
     void kvflash_qk_pool_to(int committed);
     // Rebuild pager mapping after (re)prefill: positions [0, committed)
     // occupy pool slots identity-mapped (prefill is contiguous).
+    // full_prompt: when kv_offset > 0, provides the real token IDs for the
+    // restored prefix [0, kv_offset) so kvflash_history_ is accurate.
     void kvflash_sync_prefill(int committed, const std::vector<int32_t> & tokens,
-                              int kv_offset);
+                              int kv_offset,
+                              const std::vector<int32_t> * full_prompt = nullptr);
     // Upload the slot-validity mask (host rebuild on epoch change, device
     // upload every step — the input's buffer region is reused by compute).
     void kvflash_upload_mask();
@@ -288,10 +291,15 @@ private:
     // Prefill a prompt and return the number of tokens committed to KV.
     // kv_offset > 0 resumes from a restored snapshot: tokens are placed at
     // KV positions [kv_offset, kv_offset + tokens.size()) instead of [0, N).
+    // full_prompt: when kv_offset > 0 and this is the restore-consume path,
+    // pass the complete original prompt so kvflash_history_[0, kv_offset) can
+    // be reconstructed with real token IDs instead of zeros, keeping the
+    // drafter residency scorer accurate for the restored prefix.
     int do_prefill(const std::vector<int32_t> & tokens,
                    const DaemonIO & io,
                    int snap_pos = -1, int snap_slot = -1,
-                   int kv_offset = 0);
+                   int kv_offset = 0,
+                   const std::vector<int32_t> * full_prompt = nullptr);
 
     // Speculative decode loop: draft → verify → accept until EOS/max.
     // When budget_hook is non-null and (n_gen - generated) drops to the
