@@ -8,6 +8,7 @@
 #include "common/ggml_graph_precision.h"
 #include "common/sampler.h"
 #include "common/dflash_spec_decode.h"
+#include "common/spec_gate.h"
 #include "dflash_draft_graph.h"
 #include "dflash_feature_ring.h"
 #include "graph_builders.h"
@@ -2174,34 +2175,31 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         return false;
     }
 
-    // ── Realized-speedup gate config (mirrors qwen35_backend.cpp) ───────────
-    static const bool kSpecGate = []() {
-        const char * e = std::getenv("DFLASH_SPEC_GATE");
-        if (!e) e = std::getenv("DFLASH_ENTROPY_GATE");
-        return e ? std::atoi(e) != 0 : true;
-    }();
-    static const double kGateMargin = []() {
-        const char * e = std::getenv("DFLASH_SPEC_GATE_MARGIN");
-        return e ? std::atof(e) : 1.0;
-    }();
-    static const int kGateSustain = []() {
-        const char * e = std::getenv("DFLASH_SPEC_GATE_SUSTAIN");
-        return e ? std::atoi(e) : 3;
-    }();
-    static const int kGateWarmup = []() {
-        const char * e = std::getenv("DFLASH_SPEC_GATE_WARMUP");
-        return e ? std::atoi(e) : 2;
+    // ── Realized-speedup gate config (shared with qwen35_backend via spec_gate.h) ──
+    static const dflash::common::SpecGateConfig kGateCfg = []() {
+        const char * e_en = std::getenv("DFLASH_SPEC_GATE");
+        if (!e_en) e_en = std::getenv("DFLASH_ENTROPY_GATE");
+        const char * e_mg = std::getenv("DFLASH_SPEC_GATE_MARGIN");
+        const char * e_su = std::getenv("DFLASH_SPEC_GATE_SUSTAIN");
+        const char * e_wu = std::getenv("DFLASH_SPEC_GATE_WARMUP");
+        return dflash::common::SpecGateConfig{
+            e_en ? std::atoi(e_en) != 0 : true,
+            e_mg ? std::atof(e_mg) : 1.0,
+            e_su ? std::atoi(e_su) : 3,
+            e_wu ? std::atoi(e_wu) : 2,
+        };
     }();
     static const bool kGateDbg = []() {
         return std::getenv("DFLASH_SPEC_GATE_DEBUG") != nullptr;
     }();
 
-    const bool gate_active = kSpecGate;
+    // qwen35moe has no sampled_verify mode; gate_active is the loop-invariant
+    // enabled flag only — per-step EMA check uses spec_gate_active().
+    const bool gate_active = kGateCfg.enabled;
 
     // Realized-speedup gate state
-    double t_ar           = 0.0;   // measured AR per-token time (seconds)
-    double ema_ratio      = 2.0;   // EMA of realized speedup; init optimistic
-    int    gate_low_streak = 0;
+    double t_ar        = 0.0;   // measured AR per-token time (seconds)
+    dflash::common::SpecGateState gate_st;  // ema_ratio=2.0, gate_low_streak=0
     int    eg_ar_tokens   = 0;
     int    eg_spec_steps  = 0;
 
@@ -2248,7 +2246,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         const int need_commit_budget = n_gen - n_generated;
 
         // ── Realized-speedup gate ────────────────────────────────────────
-        if (gate_active && n_draft_steps >= kGateWarmup && gate_low_streak >= kGateSustain) {
+        if (dflash::common::spec_gate_active(kGateCfg, gate_st, n_draft_steps, /*sampled_verify=*/false)) {
             step_graph_destroy(moe_draft_sg_);
             target_cache().cur_pos  = committed;
             target_cache().last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
@@ -2256,7 +2254,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
             std::fprintf(stderr,
                 "[spec-gate] floor reason=slow ema_ratio=%.2f t_ar=%.4f "
                 "ar_tokens=%d spec_tokens=%d spec_steps=%d\n",
-                ema_ratio, t_ar, eg_ar_tokens, n_generated - 1, eg_spec_steps);
+                gate_st.ema_ratio, t_ar, eg_ar_tokens, n_generated - 1, eg_spec_steps);
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
                 io.emit(-1);
@@ -2457,15 +2455,15 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         {
             const double step_wall = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - t_step0).count();
-            const double ratio = (t_ar > 0.0 && step_wall > 0.0)
-                ? ((double)emitted * t_ar / step_wall) : 2.0;
-            ema_ratio = 0.5 * ema_ratio + 0.5 * ratio;
-            if (ema_ratio < kGateMargin) gate_low_streak++;
-            else gate_low_streak = 0;
+            // commit_n = emitted only (no tool-prefix injection in qwen35moe)
+            dflash::common::spec_gate_ema_update(kGateCfg, gate_st, emitted, step_wall, t_ar);
             if (kGateDbg) {
+                const double ratio = (t_ar > 0.0 && step_wall > 0.0)
+                    ? ((double)emitted * t_ar / step_wall) : 2.0;
                 std::fprintf(stderr,
                     "[spec-gate] step=%d commit=%d step_wall=%.4f ratio=%.2f ema=%.2f streak=%d\n",
-                    n_draft_steps - 1, emitted, step_wall, ratio, ema_ratio, gate_low_streak);
+                    n_draft_steps - 1, emitted, step_wall, ratio,
+                    gate_st.ema_ratio, gate_st.gate_low_streak);
             }
         }
 
@@ -2485,7 +2483,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
     }
     if (gate_active) {
         std::fprintf(stderr, "[spec-gate] held spec_steps=%d ema_ratio=%.2f\n",
-                     eg_spec_steps, ema_ratio);
+                     eg_spec_steps, gate_st.ema_ratio);
     }
     std::fprintf(stderr, "[hybrid-spec] tokens=%d time=%.3f s speed=%.2f tok/s "
                  "steps=%d accepted=%d/%d (%.1f%%) avg_commit=%.2f AL=%.2f\n",

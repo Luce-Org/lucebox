@@ -10,6 +10,8 @@
 #include "common/sampler.h"
 #include "common/io_utils.h"
 #include "common/restore_delta.h"
+#include "common/warm_prefill.h"
+#include "common/spec_gate.h"
 #include "qwen3/qwen3_drafter.h"
 #include "qwen3/qwen3_kvflash_scorer.h"
 
@@ -1493,17 +1495,21 @@ void Qwen35Backend::kvflash_sync_prefill(int committed,
         }
     }
     if (kv_offset == 0) {
-        kvflash_history_.assign(tokens.begin(), tokens.end());
+        // Cold start: full_prompt is not provided; tokens IS the full prompt.
+        const dflash::common::WarmPrefillPlan plan =
+            dflash::common::plan_warm_prefill(tokens, 0);
+        kvflash_history_ = plan.drafter_history;
     } else {
-        // Reconstruct the prefix from full_prompt when available so the drafter
-        // scorer sees real token IDs, not zero-padding which aliases to BOS/pad.
+        // Warm start: reconstruct history from full_prompt (real IDs, not
+        // zero-padding) + suffix tokens via the shared planner.
         if (full_prompt && (int)full_prompt->size() >= kv_offset) {
-            kvflash_history_.assign(full_prompt->begin(),
-                                    full_prompt->begin() + kv_offset);
+            const dflash::common::WarmPrefillPlan plan =
+                dflash::common::plan_warm_prefill(*full_prompt, kv_offset);
+            kvflash_history_ = plan.drafter_history;
         } else {
             kvflash_history_.resize((size_t)kv_offset, 0);  // prefix ids unknown
+            kvflash_history_.insert(kvflash_history_.end(), tokens.begin(), tokens.end());
         }
-        kvflash_history_.insert(kvflash_history_.end(), tokens.begin(), tokens.end());
     }
     // Slots past the prompt still hold the previous request's rows; the
     // maskless qwen35moe pipelined decode reads the whole padded pool span.
@@ -2077,30 +2083,28 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // measure actual AR per-token wall time, then floor to AR whenever the
     // EMA of (spec tok/s / AR tok/s) stays below kGateMargin for
     // kGateSustain consecutive steps. No per-model threshold tuning needed.
-    static const bool kSpecGate = []() {
+    static const dflash::common::SpecGateConfig kGateCfg = []() {
         // Accept old name DFLASH_ENTROPY_GATE as alias for compatibility.
-        const char * e = std::getenv("DFLASH_SPEC_GATE");
-        if (!e) e = std::getenv("DFLASH_ENTROPY_GATE");
-        return e ? std::atoi(e) != 0 : true;
-    }();
-    static const double kGateMargin = []() {
-        const char * e = std::getenv("DFLASH_SPEC_GATE_MARGIN");
-        return e ? std::atof(e) : 1.0;
-    }();
-    static const int kGateSustain = []() {
-        const char * e = std::getenv("DFLASH_SPEC_GATE_SUSTAIN");
-        return e ? std::atoi(e) : 3;
-    }();
-    static const int kGateWarmup = []() {
-        const char * e = std::getenv("DFLASH_SPEC_GATE_WARMUP");
-        return e ? std::atoi(e) : 2;
+        const char * e_en = std::getenv("DFLASH_SPEC_GATE");
+        if (!e_en) e_en = std::getenv("DFLASH_ENTROPY_GATE");
+        const char * e_mg = std::getenv("DFLASH_SPEC_GATE_MARGIN");
+        const char * e_su = std::getenv("DFLASH_SPEC_GATE_SUSTAIN");
+        const char * e_wu = std::getenv("DFLASH_SPEC_GATE_WARMUP");
+        return dflash::common::SpecGateConfig{
+            e_en ? std::atoi(e_en) != 0 : true,
+            e_mg ? std::atof(e_mg) : 1.0,
+            e_su ? std::atoi(e_su) : 3,
+            e_wu ? std::atoi(e_wu) : 2,
+        };
     }();
     static const bool kGateDbg = []() {
         return std::getenv("DFLASH_SPEC_GATE_DEBUG") != nullptr;
     }();
     // Gate disabled for sampled_verify: the acceptance walk is distribution-
     // preserving and timing routing would change the sampled distribution.
-    const bool gate_active = kSpecGate && !sampled_verify;
+    // gate_active captures the loop-invariant part; per-step EMA check is done
+    // via spec_gate_active() at the top of each iteration.
+    const bool gate_active = kGateCfg.enabled && !sampled_verify;
 
     std::vector<float>   noise_embed((size_t)hidden * q_len);
     std::vector<int32_t> noise_ids(q_len);
@@ -2125,8 +2129,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     int    eg_spec_tokens = 0;
     int    eg_spec_steps  = 0;
     double t_ar           = 0.0;   // measured AR per-token time (seconds)
-    double ema_ratio      = 2.0;   // EMA of realized speedup; init optimistic
-    int    gate_low_streak = 0;
+    dflash::common::SpecGateState gate_st;  // ema_ratio=2.0, gate_low_streak=0
 
     auto log_target_forward_stats = [&]() {
         std::fprintf(stderr, "[spec-decode] target_forwards=%d forwards_per_token=%.6f forwards_per_step=%.3f\n",
@@ -2216,11 +2219,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // ── Realized-speedup gate ────────────────────────────────────────
         // Updated at the TOP of each loop iteration (before draft/verify work)
         // so cache_.cur_pos == committed and no KV restore is needed on floor.
-        // The gate state (ema_ratio, gate_low_streak) was updated at the END
-        // of the previous iteration (after commit_n is known); on the first
-        // iteration both remain at their init values so the warmup probe runs.
+        // The gate state (gate_st) was updated at the END of the previous
+        // iteration (after commit_n is known); on the first iteration it holds
+        // init values so the warmup probe runs.
         const int step_block = q_len;  // always full block; gate decides spec vs floor, not block size
-        if (gate_active && n_draft_steps >= kGateWarmup && gate_low_streak >= kGateSustain) {
+        if (dflash::common::spec_gate_active(kGateCfg, gate_st, n_draft_steps, sampled_verify)) {
             // Floor: hand rest of turn to do_ar_decode.
             // KV is already at committed (top of loop, no draft/verify done).
             step_graph_destroy(draft_sg_);
@@ -2232,7 +2235,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             std::fprintf(stderr,
                 "[spec-gate] floor reason=slow ema_ratio=%.2f t_ar=%.4f "
                 "ar_tokens=%d spec_tokens=%d spec_steps=%d\n",
-                ema_ratio, t_ar, eg_ar_tokens, eg_spec_tokens, eg_spec_steps);
+                gate_st.ema_ratio, t_ar, eg_ar_tokens, eg_spec_tokens, eg_spec_steps);
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
                 log_target_forward_stats();
@@ -2947,15 +2950,14 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             const double step_wall = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - t_step0).count();
             const int commit_n_this = emitted + injected;
-            const double ratio = (t_ar > 0.0 && step_wall > 0.0)
-                ? ((double)commit_n_this * t_ar / step_wall) : 2.0;
-            ema_ratio = 0.5 * ema_ratio + 0.5 * ratio;
-            if (ema_ratio < kGateMargin) gate_low_streak++;
-            else gate_low_streak = 0;
+            dflash::common::spec_gate_ema_update(kGateCfg, gate_st, commit_n_this, step_wall, t_ar);
             if (kGateDbg) {
+                const double ratio = (t_ar > 0.0 && step_wall > 0.0)
+                    ? ((double)commit_n_this * t_ar / step_wall) : 2.0;
                 std::fprintf(stderr,
                     "[spec-gate] step=%d commit=%d step_wall=%.4f ratio=%.2f ema=%.2f streak=%d\n",
-                    n_draft_steps - 1, commit_n_this, step_wall, ratio, ema_ratio, gate_low_streak);
+                    n_draft_steps - 1, commit_n_this, step_wall, ratio,
+                    gate_st.ema_ratio, gate_st.gate_low_streak);
             }
         }
 
@@ -3041,7 +3043,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     out_accept_rate = (float)((double)n_accept_sum / (double)total_draft_pos);
     if (gate_active) {
         std::fprintf(stderr, "[spec-gate] held spec_steps=%d ema_ratio=%.2f\n",
-                     eg_spec_steps, ema_ratio);
+                     eg_spec_steps, gate_st.ema_ratio);
     }
     std::fprintf(stderr, "[spec-decode] tokens=%d time=%.3f s speed=%.2f tok/s "
                  "steps=%d accepted=%d/%d (%.1f%%) avg_commit=%.2f\n",
