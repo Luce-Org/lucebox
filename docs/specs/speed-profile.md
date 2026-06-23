@@ -86,3 +86,4 @@ python3 scripts/profile.py \
   --nsys --check-lossless \
   --baseline scripts/speed-baseline.json --regress-pct 0.10 \
   --out-json profile.json --out-md profile.md
+```
