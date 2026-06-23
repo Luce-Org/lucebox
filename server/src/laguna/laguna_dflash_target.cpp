@@ -379,7 +379,16 @@ bool LagunaDFlashTarget::rollback_to_tree(
         }
     }
     if (contiguous_prefix) {
-        if (pager_) (void)pager_->alloc_span(committed, commit_n);
+        // A failed alloc must abort: returning true with unmapped slots would
+        // make the next step read stale/unmapped KV (silent corruption). The
+        // call-site guard bounds the span to the resident pool so this never
+        // evicts in practice.
+        if (pager_ && !pager_->alloc_span(committed, commit_n)) {
+            std::fprintf(stderr,
+                "rollback_to_tree: kvflash alloc_span failed (committed=%d commit_n=%d)\n",
+                committed, commit_n);
+            return false;
+        }
         cache_.cur_pos = committed + commit_n;
         cache_.last_tok = -1;
         return true;
@@ -482,8 +491,16 @@ bool LagunaDFlashTarget::rollback_to_tree(
 
     // kvflash: register the tree-committed (identity) positions so the pager
     // tracks this path's position-indexed writes (chain/AR self-register via
-    // kvflash_alloc_span; this is the only path that writes KV directly).
-    if (pager_) (void)pager_->alloc_span(committed, commit_n);
+    // kvflash_alloc_span; this is the only path that writes KV directly). A
+    // failed alloc must abort: returning true with unmapped slots would make the
+    // next step read stale/unmapped KV (silent corruption).
+    if (pager_ && !pager_->alloc_span(committed, commit_n)) {
+        std::fprintf(stderr,
+            "rollback_to_tree: kvflash alloc_span failed (committed=%d commit_n=%d)\n",
+            committed, commit_n);
+        ggml_free(ctx);
+        return false;
+    }
     cache_.cur_pos = committed + commit_n;
     cache_.last_tok = -1;
     ggml_free(ctx);

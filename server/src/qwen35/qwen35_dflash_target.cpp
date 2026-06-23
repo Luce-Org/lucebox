@@ -452,8 +452,16 @@ bool Qwen35DFlashTarget::rollback_to_tree(
     // kvflash: the tree graph writes KV directly (not slot-mapped), so this is
     // the single owning point that advances the pager for tree-committed
     // positions. Covers both the greedy and sampled tree fast paths; chain
-    // paths self-register through verify_batch()'s slot_for().
-    if (pager_) (void)pager_->alloc_span(committed, commit_n);
+    // paths self-register through verify_batch()'s slot_for(). The call-site
+    // guard bounds the span to the resident identity pool so this never evicts,
+    // but a failed alloc must abort: returning true with unmapped slots would
+    // make the next step read stale/unmapped KV (silent corruption).
+    if (pager_ && !pager_->alloc_span(committed, commit_n)) {
+        std::fprintf(stderr,
+            "rollback_to_tree: kvflash alloc_span failed (committed=%d commit_n=%d)\n",
+            committed, commit_n);
+        return false;
+    }
     cache_.cur_pos = committed + commit_n;
     return true;
 }
