@@ -979,6 +979,15 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             return result;
         }
         apply_kvflash_pins();
+        // Phase 2: seed the QK scorer from the restored ledger scores so chunks
+        // that were relevant on the previous turn keep their ranking immediately,
+        // without waiting for a re-prefill or re-pool pass.  kvflash_qk_pool_to
+        // will overwrite entries with freshly-computed cosine scores as chunks
+        // are re-sealed during the upcoming prefill.
+        if (kvflash_qk_policy_) {
+            kvflash_qk_pool_.rebuild_pool_from_ledger(kvflash_pager_);
+            kvflash_qk_pooled_upto_ = 0;
+        }
     }
 
     // Now generate from restored state
@@ -1012,16 +1021,40 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
 
     // Daemon receives the FULL prompt; slice off the cached prefix and prefill
     // only the delta at KV positions [snap_pos, snap_pos + delta.size()).
-    // Pooled snapshots: do_prefill with kv_offset != 0 is unsupported when
-    // the pool is already full; fall back to full re-prefill from position 0.
+    // Pooled snapshots:
+    //   KVFLASH_RESTORE_CONSUME=0 (default): full re-prefill from position 0
+    //     (original "clobber" path — bit-identical golden for identity check).
+    //   KVFLASH_RESTORE_CONSUME=1: consume the deserialized KV for [0,snap_pos)
+    //     and prefill only the suffix [snap_pos,prompt_len). The snapshot
+    //     boundary is chunk-aligned (enforced by snapshot_save_pooled_at), so
+    //     the suffix chunks start at the same alignment as the full-prompt path
+    //     → same batch shapes → bit-identical greedy output (the Phase-3 gate).
+    static const bool kv_restore_consume = []() {
+        const char * e = std::getenv("KVFLASH_RESTORE_CONSUME");
+        return e && e[0] == '1';
+    }();
     int committed = snap_pos;
     const int prompt_len = (int)req.prompt.size();
     if (prompt_len > snap_pos) {
         auto t_prefill_start = std::chrono::steady_clock::now();
         if (snap_pooled && kvflash_active()) {
-            reset_recurrent_state(cache_);
-            cache_.cur_pos = 0;
-            committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
+            if (kv_restore_consume) {
+                // Phase 3: consume path — pager already holds deserialized KV
+                // for [0, snap_pos). Prefill only the suffix; do NOT reset pager
+                // or recurrent state (restored by restore_target_cache above).
+                std::fprintf(stderr,
+                    "[kvflash] restore-consume: snap_pos=%d prompt=%d "
+                    "(suffix prefill only)\n", snap_pos, prompt_len);
+                std::fflush(stderr);
+                std::vector<int32_t> suffix = restore_prompt_delta(req.prompt, snap_pos);
+                committed = do_prefill(suffix, out_io, req.snap_pos, req.snap_slot,
+                                       /*kv_offset=*/snap_pos);
+            } else {
+                // Legacy path: discard deserialized KV, re-prefill from token 0.
+                reset_recurrent_state(cache_);
+                cache_.cur_pos = 0;
+                committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
+            }
         } else {
             std::vector<int32_t> delta = restore_prompt_delta(req.prompt, snap_pos);
             committed = do_prefill(delta, out_io, req.snap_pos, req.snap_slot, /*kv_offset=*/snap_pos);
@@ -1141,20 +1174,35 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     // mapping, normal chunking). A LARGER prompt switches to POOLED CHUNKED
     // PREFILL: pager-chunk-sized batches whose KV rows are slot-mapped via
     // set_rows, with a slot-space mask per chunk and live eviction as the
-    // pool fills (constant VRAM, linear time). Restore offsets are not
-    // supported in the pooled path (a relocated prefix cannot be restored
-    // identity-style in the first place).
+    // pool fills (constant VRAM, linear time).
+    //
+    // Restore-consume (KVFLASH_RESTORE_CONSUME=1): kv_offset == snap_pos
+    // (chunk-aligned); the pager already holds the deserialized prefix KV.
+    // Treat this as a suffix-only pooled prefill — do NOT reset the pager.
+    // For the legacy re-prefill path or cold starts, kv_offset is always 0.
     const bool kvf_paged = kvflash_active() &&
         kv_offset + prompt_len > kvflash_tokens_ - kvflash_pager_.chunk_tokens();
-    if (kvf_paged && kv_offset != 0) {
-        std::fprintf(stderr,
-            "[kvflash] restored prefix (%d) + prompt (%d) exceeds pool %d; "
-            "pooled prefill requires a fresh request\n",
-            kv_offset, prompt_len, kvflash_tokens_);
-        set_last_error("kvflash: restore + pooled prefill unsupported");
-        return -1;
-    }
-    if (kvf_paged) {
+    // restore-consume: kv_offset != 0 means the caller passed a suffix after
+    // deserializing the prefix KV; allow it in the pooled path without reset.
+    const bool kvf_restore_suffix = kvf_paged && kv_offset != 0;
+    if (kvf_restore_suffix) {
+        // Suffix pooled prefill: pager was seeded by deserialize(); just set
+        // ubatch size and skip reset. Log to distinguish from the cold path.
+        prefill_ubatch = kvflash_pager_.chunk_tokens();
+        // Verify kv_offset is chunk-aligned (snapshot boundary contract).
+        if (kv_offset % prefill_ubatch != 0) {
+            std::fprintf(stderr,
+                "[kvflash] restore-consume: kv_offset=%d not chunk-aligned "
+                "(chunk_tokens=%d) — falling back to re-prefill\n",
+                kv_offset, prefill_ubatch);
+            set_last_error("kvflash: restore-consume misaligned offset");
+            return -1;
+        }
+        std::printf("[kvflash] restore-consume suffix: offset=%d suffix=%d "
+                    "pool=%d chunk=%d\n",
+                    kv_offset, prompt_len, kvflash_tokens_, prefill_ubatch);
+        std::fflush(stdout);
+    } else if (kvf_paged) {
         prefill_ubatch = kvflash_pager_.chunk_tokens();
         kvflash_pager_.reset();
         if (kvflash_qk_policy_) {
@@ -1380,7 +1428,14 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (kvf_paged) {
             // The pager mapping was built live during the pooled prefill;
             // only the history / hygiene parts of the sync apply.
-            kvflash_history_.assign(tokens.begin(), tokens.end());
+            if (kvf_restore_suffix) {
+                // Restore-consume: tokens is the suffix; rebuild full history
+                // so chunk-count computed from history matches committed.
+                kvflash_history_.resize((size_t)kv_offset, 0); // prefix ids unknown
+                kvflash_history_.insert(kvflash_history_.end(), tokens.begin(), tokens.end());
+            } else {
+                kvflash_history_.assign(tokens.begin(), tokens.end());
+            }
             kvflash_pager_.zero_free_blocks();
             kvflash_mask_epoch_ = (uint64_t)-1;
         } else {
