@@ -131,9 +131,9 @@ jobs:
           # (see docs/specs/speed-profile.md); without it the delta is simply skipped.
           # The path is overridable so the runner owner can point elsewhere.
           baseline="${LUCEBOX_SPEED_BASELINE:-scripts/speed-baseline.json}"
-          baseline_arg=""
+          baseline_arg=()
           if [ -f "$baseline" ]; then
-            baseline_arg="--baseline $baseline --regress-pct ${LUCEBOX_SPEED_REGRESS_PCT:-0.10}"
+            baseline_arg=(--baseline "$baseline" --regress-pct "${LUCEBOX_SPEED_REGRESS_PCT:-0.10}")
             echo "Regression check against baseline: $baseline"
           else
             echo "No baseline at $baseline — regression flagging disabled this run."
@@ -146,7 +146,7 @@ jobs:
             --tokenizer "$TOKENIZER" \
             --n-gen 48 --budget 22 --reps 3 \
             --nsys --check-lossless \
-            $baseline_arg \
+            "${baseline_arg[@]}" \
             --out-json profile.json --out-md profile.md
         env:
           LUCEBOX_SPEED_BASELINE: ${{ vars.LUCEBOX_SPEED_BASELINE || '' }}

@@ -260,11 +260,25 @@ def summarize_nsys(rep: Path, tokens: int) -> dict:
         "memcpy_breakdown": mem_breakdown,
         "sync_apis": sorted(api_rows, key=lambda x: x["total_ms"], reverse=True)[:8],
     }
-    # If the trace was captured but no report parsed, record WHY + the nsys
-    # version. Without this the section silently reads 0.0 everywhere and there
-    # is no way to tell a real "no kernels" from a stats-parsing failure.
-    if not kern and not mem and not api:
-        out["error"] = "; ".join(d for d in (dk, dm, da) if d) or "nsys stats produced no rows"
+    diagnostics = {
+        "kern": dk if not kern and dk else "",
+        "mem": dm if not mem and dm else "",
+        "api": da if not api and da else "",
+    }
+    missing = {section: diag for section, diag in diagnostics.items() if diag}
+
+    # If the critical kernel report failed to parse, the launch/fusion metrics are
+    # not measurements. Treat that as an nsys error even when secondary reports
+    # (memcpy/API) produced rows, instead of rendering zero kernel metrics as real.
+    if diagnostics["kern"]:
+        out["error"] = f"kernel report unavailable: {diagnostics['kern']}"
+        if any((dm, da)):
+            out["warnings"] = [f"{section}: {diag}" for section, diag in missing.items()]
+        out["nsys_version"] = nsys_version()
+    elif missing:
+        # Non-kernel sections are useful but not required for the fusion signal.
+        # Surface their diagnostics while still rendering the valid kernel data.
+        out["warnings"] = [f"{section}: {diag}" for section, diag in missing.items()]
         out["nsys_version"] = nsys_version()
     return out
 
@@ -421,6 +435,10 @@ def render_md(doc: dict) -> str:
     if s.get("nsys"):
         n = s["nsys"]
         L.append("## Kernel-level (nsys)\n")
+        for warning in n.get("warnings", []):
+            L.append(f"- ⚠️ nsys stats warning: `{warning}` (nsys `{n.get('nsys_version','?')}`).")
+        if n.get("warnings"):
+            L.append("")
         if n.get("error"):
             # Trace was captured but stats wouldn't parse — say why instead of
             # printing 0.0 everywhere with an empty table.
