@@ -435,6 +435,10 @@ def render_md(doc: dict) -> str:
     if s.get("nsys"):
         n = s["nsys"]
         L.append("## Kernel-level (nsys)\n")
+        for warning in n.get("warnings", []):
+            L.append(f"- ⚠️ nsys stats warning: `{warning}` (nsys `{n.get('nsys_version','?')}`).")
+        if n.get("warnings"):
+            L.append("")
         if n.get("error"):
             # Trace was captured but stats wouldn't parse — say why instead of
             # printing 0.0 everywhere with an empty table.
