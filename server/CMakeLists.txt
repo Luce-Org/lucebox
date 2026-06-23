@@ -21,6 +21,7 @@ if(NOT nlohmann_json_FOUND)
     include(FetchContent)
     FetchContent_Declare(json
         URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
         URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
     )
     FetchContent_MakeAvailable(json)
@@ -250,6 +251,7 @@ add_library(dflash_common STATIC
     src/laguna/laguna_daemon.cpp
     src/laguna/laguna_backend.cpp
     src/laguna/laguna_layer_split_adapter.cpp
+    src/laguna/laguna_dflash_target.cpp
     src/common/backend_ipc.cpp
     src/common/target_shard_ipc.cpp
     src/common/target_shard_ipc_daemon.cpp

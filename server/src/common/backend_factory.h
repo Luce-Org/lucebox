@@ -54,6 +54,7 @@ struct BackendArgs {
     int             ddtree_budget    = 22;
     float           ddtree_temp      = 1.0f;
     bool            ddtree_chain_seed = true;
+    int             verify_width     = 0;  // chain spec verify width; 0 = adaptive
     bool            use_feature_mirror = false;
 };
 

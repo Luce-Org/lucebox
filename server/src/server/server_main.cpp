@@ -226,6 +226,7 @@ static void print_usage(const char * prog) {
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
         "  --ddtree             Enable DDTree speculative decode\n"
         "  --ddtree-budget <N>  DDTree budget (default: 22)\n"
+        "  --verify-width <N>   laguna chain spec verify width (0=auto; default 0)\n"
         "  --no-cors            Disable CORS headers\n"
         "  --think-max-tokens <N>     Phase-1 reasoning cap when a request opts in\n"
         "                             via thinking:{type:enabled} (default: 15488 =\n"
@@ -433,6 +434,8 @@ int main(int argc, char ** argv) {
             bargs.fast_rollback = true;
         } else if (std::strcmp(argv[i], "--ddtree-budget") == 0 && i + 1 < argc) {
             bargs.ddtree_budget = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--verify-width") == 0 && i + 1 < argc) {
+            bargs.verify_width = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--no-fast-rollback") == 0) {
             fast_rollback_forced_off = true;
             bargs.fast_rollback = false;

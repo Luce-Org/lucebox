@@ -43,6 +43,7 @@
 
 #include <cinttypes>
 #include <climits>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -576,6 +577,76 @@ void free_laguna_target_weights(LagunaTargetWeights & w) {
     w.tok_embd = nullptr;
     w.out_norm = nullptr;
     w.output   = nullptr;
+}
+
+void free_laguna_target_feat(LagunaTargetCache & c) {
+    if (c.feat_buf) { ggml_backend_buffer_free(c.feat_buf); c.feat_buf = nullptr; }
+    if (c.feat_ctx) { ggml_free(c.feat_ctx); c.feat_ctx = nullptr; }
+    c.target_feat = nullptr;
+    c.target_feat_cap = 0;
+    c.n_capture_layers = 0;
+    c.capture_layer_ids.clear();
+}
+
+bool create_laguna_target_feat(ggml_backend_t backend,
+                                LagunaTargetCache & cache,
+                                int n_capture_layers,
+                                int hidden_size,
+                                int cap,
+                                const std::vector<int> & explicit_ids) {
+    if (n_capture_layers <= 0 || hidden_size <= 0 || cap <= 0) return false;
+
+    free_laguna_target_feat(cache);
+
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 4 + 4096;
+    ip.no_alloc = true;
+    cache.feat_ctx = ggml_init(ip);
+    if (!cache.feat_ctx) return false;
+
+    const int fc_in = n_capture_layers * hidden_size;
+    cache.target_feat = ggml_new_tensor_2d(cache.feat_ctx, GGML_TYPE_BF16, fc_in, cap);
+    ggml_set_name(cache.target_feat, "laguna_target_feat");
+
+    cache.feat_buf = ggml_backend_alloc_ctx_tensors(cache.feat_ctx, backend);
+    if (!cache.feat_buf) {
+        ggml_free(cache.feat_ctx);
+        cache.feat_ctx = nullptr;
+        cache.target_feat = nullptr;
+        return false;
+    }
+
+    cache.target_feat_cap = cap;
+    cache.n_capture_layers = n_capture_layers;
+
+    if ((int)explicit_ids.size() == n_capture_layers) {
+        // Data-driven: ids shipped in the draft GGUF (dflash.target_layer_ids),
+        // copied by the converter from the drafter's config.json. Works for any
+        // drafter without a hardcoded per-arch set.
+        cache.capture_layer_ids = explicit_ids;
+    } else if (n_capture_layers == 5) {
+        // Legacy fallback for GGUFs converted before target_layer_ids was
+        // emitted (poolside Laguna-XS.2 speculator: {1,9,17,36,39}).
+        cache.capture_layer_ids = {1, 9, 17, 36, 39};
+    } else {
+        std::fprintf(stderr,
+            "[laguna] warning: DFlash draft has %d capture layers and no "
+            "dflash.target_layer_ids in the GGUF; falling back to linspace ids "
+            "(reconvert the drafter to embed its trained capture ids)\n",
+            n_capture_layers);
+        cache.capture_layer_ids.resize((size_t)n_capture_layers);
+        const int n_layer = !cache.attn_k.empty() ? (int)cache.attn_k.size() : 40;
+        if (n_capture_layers == 1) {
+            cache.capture_layer_ids[0] = 1;
+        } else {
+            for (int k = 0; k < n_capture_layers; k++) {
+                cache.capture_layer_ids[(size_t)k] = (int)std::round(
+                    1.0 + k * (double)(n_layer - 4) / (n_capture_layers - 1));
+            }
+        }
+    }
+
+    return true;
 }
 
 // ── Partial loader (hybrid mode) ────────────────────────────────────────
