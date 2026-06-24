@@ -349,6 +349,13 @@ bool Qwen35MoeBackend::rebuild_hybrid_from_placement(const MoeHybridPlacement & 
     return true;
 }
 
+bool Qwen35MoeBackend::park(const std::string & what) {
+    // Delegate to base class. The hybrid-logits step-graph is created inline
+    // (not cached persistently) in this branch, so no additional teardown is
+    // needed here to avoid use-after-free on unpark.
+    return Qwen35Backend::park(what);
+}
+
 bool Qwen35MoeBackend::spark_bootstrap_finalize(const std::string & profile_path) {
     if (!spark_wants_bootstrap()) return false;
     std::string err;

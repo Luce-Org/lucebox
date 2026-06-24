@@ -140,6 +140,76 @@ bool check_shape_2d(const ggml_tensor * t, int64_t ne0, int64_t ne1,
 
 } // namespace
 
+// Lightweight metadata-only read of the drafter's capture-layer config.
+// Opens the GGUF header (no tensor data loaded), extracts n_target_layers
+// and target_layer_ids, and returns them. Called by the backend BEFORE
+// load_target_model so that target_feat is allocated with the correct
+// fc_in = n_capture_layers * n_embd dimension.
+bool read_draft_capture_config(const std::string & path,
+                               int & n_capture,
+                               int * capture_ids,
+                               int max_ids) {
+    n_capture = 0;
+    gguf_init_params gip{};
+    gip.no_alloc = true;
+    gip.ctx      = nullptr;  // metadata-only: no tensor context
+    gguf_context * gctx = gguf_init_from_file(path.c_str(), gip);
+    if (!gctx) return false;
+
+    // Resolve the arch prefix for key building.
+    std::string A = "qwen35-dflash-draft";
+    {
+        int64_t arch_id = gguf_find_key(gctx, "general.architecture");
+        if (arch_id >= 0) {
+            const char * arch = gguf_get_val_str(gctx, arch_id);
+            if (arch) A = arch;
+        }
+    }
+
+    char key[128];
+
+    // Read n_target_layers.
+    std::snprintf(key, sizeof(key), "%s.%s", A.c_str(), "dflash.n_target_layers");
+    int64_t ntl_id = gguf_find_key(gctx, key);
+    if (ntl_id >= 0) {
+        n_capture = (int)gguf_get_val_u32(gctx, ntl_id);
+    }
+
+    // Zero-initialize the output array so callers get safe values even when
+    // target_layer_ids is absent (P1-G: uninitialized capture IDs).
+    for (int k = 0; k < max_ids; k++) capture_ids[k] = 0;
+
+    // Read target_layer_ids array (exact capture positions from training).
+    std::snprintf(key, sizeof(key), "%s.%s", A.c_str(), "dflash.target_layer_ids");
+    int64_t tli_id = gguf_find_key(gctx, key);
+    if (tli_id >= 0 && gguf_get_kv_type(gctx, tli_id) == GGUF_TYPE_ARRAY) {
+        // P2-2: verify element type is INT32 before casting (array may be INT64).
+        if (gguf_get_arr_type(gctx, tli_id) != GGUF_TYPE_INT32) {
+            std::fprintf(stderr,
+                "[draft-cfg] target_layer_ids array type is not INT32; skipping\n");
+        } else {
+            const size_t n = std::min((size_t)gguf_get_arr_n(gctx, tli_id),
+                                      (size_t)max_ids);
+            const int32_t * ids = static_cast<const int32_t *>(gguf_get_arr_data(gctx, tli_id));
+            for (size_t k = 0; k < n; k++) {
+                capture_ids[k] = (int)ids[k];
+            }
+            if (n > 0) n_capture = (int)n;
+        }
+    }
+
+    gguf_free(gctx);
+
+    if (n_capture > 0) {
+        std::fprintf(stderr, "[draft-cfg] early-read: n_capture=%d ids=", n_capture);
+        for (int k = 0; k < n_capture && k < max_ids; k++)
+            std::fprintf(stderr, "%s%d", k ? "," : "[", capture_ids[k]);
+        std::fprintf(stderr, "]\n");
+    }
+    return n_capture > 0;
+}
+
+
 bool load_draft_gguf(const std::string & path,
                      ggml_backend_t       backend,
                      DraftWeights &       out,

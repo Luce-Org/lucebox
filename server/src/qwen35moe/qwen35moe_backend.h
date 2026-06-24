@@ -39,6 +39,7 @@ protected:
                             std::vector<int32_t> & out_tokens,
                             const DaemonIO & io) override;
     bool should_capture_moe_router() const override { return routing_stats_ != nullptr; }
+    bool park(const std::string & what) override;
     bool spark_wants_bootstrap() const override;
     bool spark_bootstrap_finalize(const std::string & profile_path) override;
     void after_target_compute(StepGraph & sg, int kv_start, int n_tokens) override;

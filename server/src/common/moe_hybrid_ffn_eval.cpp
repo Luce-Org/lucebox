@@ -1073,8 +1073,16 @@ static bool eval_moe_hybrid_ffn_batched_core(
             int32_t next = 0;
             for (int s = 0; s < n_used; ++s) {
                 if (hot_wts[base + s] > 0.0f) continue;
-                while ([&]{ for (int k=0; k<n_used; ++k) if (k!=s && hot_sel[base+k]==next) return true; return false; }())
+                // Bounded search: at most n_hot_init probes. If every ID in
+                // [0, n_hot_init) is already taken by another slot we break and
+                // keep `next` as-is (duplicate), which is safe — the zero-weight
+                // slot is ignored by ids_to_sorted_host anyway.
+                int tries = 0;
+                while (tries < n_hot_init &&
+                       [&]{ for (int k=0; k<n_used; ++k) if (k!=s && hot_sel[base+k]==next) return true; return false; }()) {
                     if (++next >= n_hot_init) next = 0;
+                    ++tries;
+                }
                 hot_sel[base + s] = next++;
                 if (next >= n_hot_init) next = 0;
             }
@@ -1165,8 +1173,12 @@ static bool eval_moe_hybrid_ffn_batched_core(
         int32_t next = 0;
         for (int s = 0; s < n_used; ++s) {
             if (hot_wts[base + s] > 0.0f) continue;
-            while ([&]{ for (int k=0; k<n_used; ++k) if (k!=s && hot_sel[base+k]==next) return true; return false; }())
+            int tries = 0;
+            while (tries < n_hot_init &&
+                   [&]{ for (int k=0; k<n_used; ++k) if (k!=s && hot_sel[base+k]==next) return true; return false; }()) {
                 if (++next >= n_hot_init) next = 0;
+                ++tries;
+            }
             hot_sel[base + s] = next++;
             if (next >= n_hot_init) next = 0;
         }
