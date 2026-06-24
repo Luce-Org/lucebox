@@ -19,11 +19,15 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(nlohmann_json CONFIG QUIET)
 if(NOT nlohmann_json_FOUND)
     include(FetchContent)
-    FetchContent_Declare(json
+    set(_dflash_json_fetch_args
         URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
         URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
     )
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
+        list(APPEND _dflash_json_fetch_args DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    endif()
+    FetchContent_Declare(json ${_dflash_json_fetch_args})
+    unset(_dflash_json_fetch_args)
     FetchContent_MakeAvailable(json)
 endif()
 
