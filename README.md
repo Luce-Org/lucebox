@@ -335,6 +335,7 @@ Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token ch
 | `--no-cors` | CORS on | Disable CORS headers |
 | `DFLASH_TARGET_GPU=N` | `0` | Env var equivalent of `--target-gpu` |
 | `DFLASH_DRAFT_GPU=N` | same as target | Env var equivalent of `--draft-gpu` |
+| `DFLASH_MODEL_NAME=<name>` | `dflash` | Env var equivalent of `--model-name`; sets the `/v1/models` id and selects the matching `share/model_cards/<name>.json` |
 
 **MoE expert offload (Spark)**
 
