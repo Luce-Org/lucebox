@@ -55,7 +55,8 @@ inline void kvflash_qk_chunk_scores(
     std::vector<float> & out,
     float missing_score = -2.0f,
     const float * seeded = nullptr,
-    float seeded_sentinel = -std::numeric_limits<float>::infinity()) {
+    float seeded_sentinel = -std::numeric_limits<float>::infinity(),
+    int seeded_n = -1) {
     const int group = d.n_q_heads / d.n_kv_heads;
     const int n_chunks = (int)pooled_keys.size();
     out.assign((size_t)n_chunks, missing_score);
@@ -93,9 +94,13 @@ inline void kvflash_qk_chunk_scores(
     }
     // Seeded fallback: for chunks with no pooled key, use the ledger score from
     // a prior turn if it is not the sentinel (i.e. it was actually scored).
+    // seeded_n bounds the valid range of the seeded array; chunks beyond it
+    // (n_chunks > seeded array length) fall back to missing_score safely.
     if (seeded) {
+        const int seeded_limit = (seeded_n >= 0) ? seeded_n : n_chunks;
         for (int c = 0; c < n_chunks; c++) {
-            if (!pooled_keys[(size_t)c] && seeded[c] != seeded_sentinel) {
+            if (!pooled_keys[(size_t)c] && c < seeded_limit &&
+                seeded[c] != seeded_sentinel) {
                 out[(size_t)c] = seeded[c];
             }
         }
@@ -232,9 +237,13 @@ public:
         for (int c = 0; c < n_chunks; c++) pk[(size_t)c] = pool_->data(c);
         // Pass seeded scores from the restore ledger as fallback for chunks
         // whose pooled keys have not been rebuilt yet (Phase 2 restore path).
+        // seeded_scores_ has pool_->n_chunks() entries; n_chunks (from ids)
+        // may be larger — pass the length to prevent OOB read.
         kvflash_qk_chunk_scores(pk, query_.data(), d, out,
                                 /*missing_score=*/-2.0f,
-                                pool_->seeded_scores_ptr());
+                                pool_->seeded_scores_ptr(),
+                                /*seeded_sentinel=*/-std::numeric_limits<float>::infinity(),
+                                pool_->n_chunks());
         return true;
     }
 
