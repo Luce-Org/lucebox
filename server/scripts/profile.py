@@ -585,6 +585,30 @@ def rel_stddev(mean_value: float, stddev_value: float) -> float:
     return abs(stddev_value / mean_value) if mean_value else 0.0
 
 
+def pooled_within_stddev(runs, key):
+    """Run-to-run (within-prompt) stddev, pooled across prompts.
+
+    The headline ± must reflect measurement *noise* — how much a single prompt's
+    number wobbles between identical reps — NOT how much different prompts differ
+    from each other. Pooling every raw sample across prompts would fold the
+    (large, real, repeatable) prompt-to-prompt spread into the stddev and badly
+    overstate the noise. We instead pool only the per-prompt deviations:
+
+        sqrt( Σ_prompt Σ_rep (x - prompt_mean)^2 / Σ_prompt (n_rep - 1) )
+
+    i.e. the standard pooled within-group standard deviation. Prompt-to-prompt
+    spread stays visible via the min–max line and the per-prompt table.
+    """
+    num, den = 0.0, 0
+    for r in runs:
+        s = [x for x in r.get("samples", {}).get(key, []) if x is not None]
+        if len(s) > 1:
+            m = statistics.mean(s)
+            num += sum((x - m) ** 2 for x in s)
+            den += len(s) - 1
+    return (num / den) ** 0.5 if den > 0 else 0.0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", required=True)
@@ -688,23 +712,34 @@ def main():
 
     # ---- aggregate summary across prompts ----
     def col(k): return [r[k] for r in runs if k in r]
+    # Headline ± is the run-to-run (within-prompt) stddev, pooled across prompts.
+    # Prompt-to-prompt spread is reported separately (min–max + per-prompt table)
+    # so it never masquerades as measurement noise. See pooled_within_stddev().
+    decode_mean = statistics.mean(col("decode_tok_s"))
+    decode_sd = pooled_within_stddev(runs, "decode_tok_s")
+    mspt_mean = statistics.mean(col("ms_per_token"))
+    mspt_sd = pooled_within_stddev(runs, "ms_per_token")
+    al_mean = statistics.mean(col("al"))
+    al_sd = pooled_within_stddev(runs, "al")
+    ttft_mean = statistics.mean(col("ttft_est_ms")) if col("ttft_est_ms") else 0.0
+    ttft_sd = pooled_within_stddev(runs, "ttft_est_ms")
     summary = {
-        "decode_tok_s_mean": statistics.mean(col("decode_tok_s")),
+        "decode_tok_s_mean": decode_mean,
         "decode_tok_s_min": min(col("decode_tok_s")),
         "decode_tok_s_max": max(col("decode_tok_s")),
-        "decode_tok_s_stddev": stddev([x for r in runs for x in r.get("samples", {}).get("decode_tok_s", [])]),
-        "decode_tok_s_rsd": rel_stddev(statistics.mean(col("decode_tok_s")), stddev([x for r in runs for x in r.get("samples", {}).get("decode_tok_s", [])])),
-        "ms_per_token_mean": statistics.mean(col("ms_per_token")),
-        "ms_per_token_stddev": stddev([x for r in runs for x in r.get("samples", {}).get("ms_per_token", [])]),
-        "ms_per_token_rsd": rel_stddev(statistics.mean(col("ms_per_token")), stddev([x for r in runs for x in r.get("samples", {}).get("ms_per_token", [])])),
-        "al_mean": statistics.mean(col("al")),
-        "al_stddev": stddev([x for r in runs for x in r.get("samples", {}).get("al", [])]),
-        "al_rsd": rel_stddev(statistics.mean(col("al")), stddev([x for r in runs for x in r.get("samples", {}).get("al", [])])),
+        "decode_tok_s_stddev": decode_sd,
+        "decode_tok_s_rsd": rel_stddev(decode_mean, decode_sd),
+        "ms_per_token_mean": mspt_mean,
+        "ms_per_token_stddev": mspt_sd,
+        "ms_per_token_rsd": rel_stddev(mspt_mean, mspt_sd),
+        "al_mean": al_mean,
+        "al_stddev": al_sd,
+        "al_rsd": rel_stddev(al_mean, al_sd),
         "accept_pct_mean": statistics.mean(col("accept_pct")) if col("accept_pct") else 0.0,
         "prefill_ms_mean": statistics.mean([x * 1000 for x in col("prefill_s")]) if col("prefill_s") else 0.0,
-        "ttft_est_ms_mean": statistics.mean(col("ttft_est_ms")) if col("ttft_est_ms") else 0.0,
-        "ttft_est_ms_stddev": stddev([x for r in runs for x in r.get("samples", {}).get("ttft_est_ms", [])]),
-        "ttft_est_ms_rsd": rel_stddev(statistics.mean(col("ttft_est_ms")) if col("ttft_est_ms") else 0.0, stddev([x for r in runs for x in r.get("samples", {}).get("ttft_est_ms", [])])),
+        "ttft_est_ms_mean": ttft_mean,
+        "ttft_est_ms_stddev": ttft_sd,
+        "ttft_est_ms_rsd": rel_stddev(ttft_mean, ttft_sd),
         "phase_sum_ms_mean": statistics.mean(col("phase_sum_ms")) if col("phase_sum_ms") else 0.0,
     }
     if col("ar_tok_s"):
