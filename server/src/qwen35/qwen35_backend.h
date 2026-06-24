@@ -24,6 +24,7 @@
 #include "kvflash_pager.h"         // bounded KV residency pool
 #include "kvflash_scorer.h"        // chunk-relevance policy interface
 #include "kvflash_qk.h"            // target-QK scorer (pooled keys + query)
+#include "common/spec_gate.h"      // SpecGateState (persistent across turns)
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -170,12 +171,12 @@ protected:
     const DraftFeatureMirror & feature_mirror() const { return feature_mirror_; }
     bool is_draft_parked() const { return draft_parked_; }
 
-    // ── Spec-decode gate: cached AR per-token time ───────────────────
-    // Measured once on the first decode call, reused on all subsequent
-    // turns so the 3-token AR warmup (~0.3s/turn) is paid only once.
-    // 0.0 means not yet measured. Protected so the MoE subclass
-    // (do_hybrid_spec_decode) can read/write it directly.
+    // ── Spec-decode gate: cached AR per-token time + persistent EMA state ──
+    // gate_t_ar_: measured once, reused on all turns (0.0 = not yet measured).
+    // spec_gate_st_: EMA persists across turns so the gate accumulates evidence.
+    // Both protected so the MoE subclass can access them directly.
     double gate_t_ar_ = 0.0;
+    dflash::common::SpecGateState spec_gate_st_;
 
     // ── Configuration ────────────────────────────────────────────────
     Qwen35Config cfg_;

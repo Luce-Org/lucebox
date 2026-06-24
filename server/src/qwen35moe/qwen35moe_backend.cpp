@@ -2199,42 +2199,42 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
 
     // Realized-speedup gate state
     double t_ar        = 0.0;   // measured AR per-token time (seconds)
-    dflash::common::SpecGateState gate_st;  // ema_ratio=2.0, gate_low_streak=0
+    dflash::common::SpecGateState & gate_st = spec_gate_st_;  // persists across turns
     int    eg_ar_tokens   = 0;
     int    eg_spec_steps  = 0;
 
-    // ── AR warmup / t_ar cache ───────────────────────────────────────────
-    // t_ar is a backend property; measured once, cached in gate_t_ar_ so
-    // all subsequent turns skip the warmup. See qwen35_backend.cpp for rationale.
+    // ── AR warmup (every turn): warm graph allocator, then measure t_ar ────
+    // sg_.alloc is freed between requests (release_scratch), so the first
+    // build_target_step each turn pays graph-alloc overhead. Run 2 untimed
+    // tokens to warm the allocator, then 1 timed token to measure the actual
+    // warm AR speed at the CURRENT context length.
     //
-    // Skip warmup and spec loop entirely if only 3 or fewer tokens requested.
+    // Skip warmup + spec loop entirely if only 3 or fewer tokens requested.
     if (n_gen <= 3) {
         bool ok = run_ar_decode_path(committed, n_gen, out_tokens, io);
         io.emit(-1);
         return ok;
     }
     int n_generated;
-    if (gate_t_ar_ > 0.0) {
-        // Cached: skip warmup. Spec loop starts at n_generated=0 with
-        // last_tok=target_cache().last_tok already set above.
-        t_ar = gate_t_ar_;
-        n_generated = 0;
-    } else {
-        // First call: run the 3-token AR warmup to measure t_ar.
-        // Token 1: free (prefill logits already ready), untimed.
+    {
+        // Token 1: free (prefill logits ready), untimed — primes graph alloc.
         bool ok1 = run_ar_decode_path(committed, 1, out_tokens, io);
         if (!ok1) { io.emit(-1); return false; }
         committed = target_cache().cur_pos;
         last_tok  = out_tokens.back();
-        // Tokens 2-3: real forwards, timed.
-        auto t_ar0 = std::chrono::steady_clock::now();
-        bool ok2 = run_ar_decode_path(committed, 2, out_tokens, io);
-        auto t_ar1 = std::chrono::steady_clock::now();
+        // Token 2: untimed — graph alloc now fully warm.
+        bool ok2 = run_ar_decode_path(committed, 1, out_tokens, io);
         if (!ok2) { io.emit(-1); return false; }
-        t_ar = std::chrono::duration<double>(t_ar1 - t_ar0).count() / 2.0;
-        // Sanity clamp: guard against implausibly small values (e.g. tiny model).
+        committed = target_cache().cur_pos;
+        last_tok  = out_tokens.back();
+        // Token 3: timed on warm graph = honest AR at current ctx.
+        auto t_ar0 = std::chrono::steady_clock::now();
+        bool ok3 = run_ar_decode_path(committed, 1, out_tokens, io);
+        auto t_ar1 = std::chrono::steady_clock::now();
+        if (!ok3) { io.emit(-1); return false; }
+        t_ar = std::chrono::duration<double>(t_ar1 - t_ar0).count();
         if (t_ar < 0.0005) t_ar = 0.005;
-        gate_t_ar_ = t_ar;  // cache for all future turns
+        gate_t_ar_ = (gate_t_ar_ > 0.0) ? (0.7 * gate_t_ar_ + 0.3 * t_ar) : t_ar;
         committed = target_cache().cur_pos;
         last_tok  = out_tokens.back();
         n_generated = 3;

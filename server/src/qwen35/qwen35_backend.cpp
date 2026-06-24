@@ -2129,7 +2129,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     int    eg_spec_tokens = 0;
     int    eg_spec_steps  = 0;
     double t_ar           = 0.0;   // measured AR per-token time (seconds)
-    dflash::common::SpecGateState gate_st;  // ema_ratio=2.0, gate_low_streak=0
+    dflash::common::SpecGateState & gate_st = spec_gate_st_;  // persists across turns
 
     auto log_target_forward_stats = [&]() {
         std::fprintf(stderr, "[spec-decode] target_forwards=%d forwards_per_token=%.6f forwards_per_step=%.3f\n",
@@ -2138,17 +2138,14 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                      n_draft_steps > 0 ? (double)target_forwards / n_draft_steps : 0.0);
     };
 
-    // ── AR warmup / t_ar cache ───────────────────────────────────────────
-    // t_ar is a backend property (scales with KV size, not prompt content).
-    // We measure it once on the FIRST decode call and cache it on the backend
-    // so all subsequent turns skip the warmup entirely.
+    // ── AR warmup (every turn): warm graph allocator, then measure t_ar ────
+    // sg_.alloc is freed between requests (release_scratch), so the first
+    // build_target_step each turn pays graph-alloc overhead. Run 2 untimed
+    // tokens to warm the allocator, then 1 timed token to measure the actual
+    // warm AR speed at the CURRENT context length. AR speed varies with ctx
+    // (~125 tok/s at small ctx, ~66 tok/s at 34K), so we re-measure per turn.
     //
-    // Turn 1 (gate_t_ar_ == 0.0): emit the first 3 tokens via AR to measure
-    //   t_ar, cache it in gate_t_ar_, and enter the spec loop at n_generated=3.
-    // Turn 2+ (gate_t_ar_ > 0.0): skip the warmup; spec loop starts at
-    //   n_generated=0 with last_tok=cache_.last_tok (same as pre-gate behavior).
-    //
-    // Skip warmup and entire spec loop if only 3 or fewer tokens requested.
+    // Skip warmup + spec loop entirely if only 3 or fewer tokens requested.
     if (n_gen <= 3) {
         bool ok = do_ar_decode(committed, n_gen, out_tokens, io,
                                budget_hook ? *budget_hook : BudgetHook{},
@@ -2157,28 +2154,28 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         io.emit(-1);
         return ok;
     }
-    if (gate_t_ar_ > 0.0) {
-        // Cached: skip warmup. Use previously measured t_ar; spec loop starts
-        // from n_generated=0 with last_tok already set from cache_.last_tok above.
-        t_ar = gate_t_ar_;
-        // n_generated stays 0; committed and last_tok are already initialized.
-    } else {
-        // First call: run the 3-token AR warmup to measure t_ar.
-        // Token 1: free (prefill logits already ready), untimed.
+    {
+        // Token 1: free (prefill logits ready), untimed — primes graph alloc.
         bool ok1 = do_ar_decode(committed, 1, out_tokens, io, BudgetHook{}, nullptr, nullptr);
         if (!ok1) { io.emit(-1); return false; }
         committed = cache_.cur_pos;
         last_tok  = out_tokens.back();
         n_generated = 1;
-        // Tokens 2-3: real forwards, timed.
-        auto t_ar0 = std::chrono::steady_clock::now();
-        bool ok2 = do_ar_decode(committed, 2, out_tokens, io, BudgetHook{}, nullptr, nullptr);
-        auto t_ar1 = std::chrono::steady_clock::now();
+        // Token 2: untimed — graph alloc now fully warm.
+        bool ok2 = do_ar_decode(committed, 1, out_tokens, io, BudgetHook{}, nullptr, nullptr);
         if (!ok2) { io.emit(-1); return false; }
-        t_ar = std::chrono::duration<double>(t_ar1 - t_ar0).count() / 2.0;
-        // Sanity clamp: guard against implausibly small values (e.g. tiny model).
+        committed = cache_.cur_pos;
+        last_tok  = out_tokens.back();
+        n_generated = 2;
+        // Token 3: timed on warm graph = honest AR at current ctx.
+        auto t_ar0 = std::chrono::steady_clock::now();
+        bool ok3 = do_ar_decode(committed, 1, out_tokens, io, BudgetHook{}, nullptr, nullptr);
+        auto t_ar1 = std::chrono::steady_clock::now();
+        if (!ok3) { io.emit(-1); return false; }
+        t_ar = std::chrono::duration<double>(t_ar1 - t_ar0).count();
         if (t_ar < 0.0005) t_ar = 0.005;
-        gate_t_ar_ = t_ar;  // cache for all future turns
+        // EMA into gate_t_ar_ for reference logging; t_ar is the live per-turn value.
+        gate_t_ar_ = (gate_t_ar_ > 0.0) ? (0.7 * gate_t_ar_ + 0.3 * t_ar) : t_ar;
         committed = cache_.cur_pos;
         last_tok  = out_tokens.back();
         n_generated = 3;
@@ -2476,6 +2473,18 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     n_generated += accepted_emitted;
                     n_draft_steps++;
                     n_spec_positions += q_len;
+                    eg_spec_tokens += accepted_emitted;
+                    eg_spec_steps++;
+                    {
+                        const double sw = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - t_step0).count();
+                        dflash::common::spec_gate_ema_update(kGateCfg, gate_st, accepted_emitted, sw, t_ar);
+                        if (kGateDbg) {
+                            std::fprintf(stderr,
+                                "[spec-gate] ddtree-fast step=%d commit=%d sw=%.4f ema=%.2f\n",
+                                n_draft_steps - 1, accepted_emitted, sw, gate_st.ema_ratio);
+                        }
+                    }
                     if (hit_eos || io.cancelled || n_generated >= n_gen ||
                         last_tok < 0 || target->is_eos(last_tok)) {
                         break;
@@ -2533,6 +2542,18 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 n_generated += total_emitted;
                 n_draft_steps++;
                 n_spec_positions += q_len;
+                eg_spec_tokens += total_emitted;
+                eg_spec_steps++;
+                {
+                    const double sw = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - t_step0).count();
+                    dflash::common::spec_gate_ema_update(kGateCfg, gate_st, total_emitted, sw, t_ar);
+                    if (kGateDbg) {
+                        std::fprintf(stderr,
+                            "[spec-gate] ddtree-greedy step=%d commit=%d sw=%.4f ema=%.2f\n",
+                            n_draft_steps - 1, total_emitted, sw, gate_st.ema_ratio);
+                    }
+                }
                 if (hit_eos || io.cancelled || n_generated >= n_gen ||
                     last_tok < 0 || target->is_eos(last_tok)) {
                     break;
@@ -2603,6 +2624,18 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             n_generated += total_emitted;
             n_draft_steps++;
             n_spec_positions += q_len;
+            eg_spec_tokens += total_emitted;
+            eg_spec_steps++;
+            {
+                const double sw = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t_step0).count();
+                dflash::common::spec_gate_ema_update(kGateCfg, gate_st, total_emitted, sw, t_ar);
+                if (kGateDbg) {
+                    std::fprintf(stderr,
+                        "[spec-gate] ddtree-sampled step=%d commit=%d sw=%.4f ema=%.2f\n",
+                        n_draft_steps - 1, total_emitted, sw, gate_st.ema_ratio);
+                }
+            }
             if (hit_eos || io.cancelled || n_generated >= n_gen || last_tok < 0) {
                 break;
             }

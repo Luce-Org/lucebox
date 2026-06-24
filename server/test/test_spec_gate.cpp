@@ -61,14 +61,16 @@ int main() {
               "warmup n=2: gate fires (== kGateWarmup=2)");
     }
 
-    // ── Sustain: streak must reach kGateSustain ──────────────────────────────
+    // ── Sustain: streak path fires at kGateSustain (borderline ema) ─────────
+    // Use ema_ratio=0.75: below margin=1.0 (losing) but above hard-floor at
+    // 0.5*margin=0.5, so only the streak path can trigger the gate.
     {
         SpecGateState st;
-        st.ema_ratio = 0.1;
+        st.ema_ratio = 0.75;
 
         st.gate_low_streak = 2;
         check(!spec_gate_active(cfg_on, st, /*n_draft_steps=*/5, /*sampled_verify=*/false),
-              "streak=2 < sustain=3: gate inactive");
+              "streak=2 < sustain=3, borderline ema: gate inactive");
 
         st.gate_low_streak = 3;
         check(spec_gate_active(cfg_on, st, /*n_draft_steps=*/5, /*sampled_verify=*/false),
@@ -77,6 +79,24 @@ int main() {
         st.gate_low_streak = 10;
         check(spec_gate_active(cfg_on, st, /*n_draft_steps=*/5, /*sampled_verify=*/false),
               "streak=10 > sustain=3: gate fires");
+    }
+
+    // ── Hard floor: ema_ratio below 0.5*margin floors after n_ema_updates>=warmup
+    {
+        SpecGateState st;
+        st.ema_ratio       = 0.1;  // clear 2×-slower loser
+        st.gate_low_streak = 0;    // streak not yet built
+        st.n_ema_updates   = cfg_on.warmup;  // warmup updates accumulated
+        check(spec_gate_active(cfg_on, st, /*n_draft_steps=*/5, /*sampled_verify=*/false),
+              "hard floor: ema=0.1 < 0.5*margin floors after warmup updates");
+        // Not enough ema updates yet — hard floor must stay silent.
+        st.n_ema_updates = cfg_on.warmup - 1;
+        check(!spec_gate_active(cfg_on, st, /*n_draft_steps=*/5, /*sampled_verify=*/false),
+              "hard floor: silent before n_ema_updates reaches warmup");
+        // n_draft_steps < warmup — still silent regardless.
+        st.n_ema_updates = cfg_on.warmup;
+        check(!spec_gate_active(cfg_on, st, /*n_draft_steps=*/1, /*sampled_verify=*/false),
+              "hard floor: still silent during warmup window (n_draft_steps<2)");
     }
 
     // ── EMA above margin: streak resets, gate does not fire ─────────────────
@@ -150,6 +170,40 @@ int main() {
         st.gate_low_streak = 0;
         spec_gate_ema_update(cfg_on, st, 1, /*step_wall=*/0.0, /*t_ar=*/0.1);
         check(st.gate_low_streak == 0, "step_wall=0: ratio defaults to 2.0, streak stays 0");
+    }
+
+    // ── Test A: 2x-slower spec floors by end of warmup ──────────────────────
+    // MoE scenario: t_ar=0.008 (125 tok/s AR), spec step commits 3 tokens
+    // but takes 0.054s → ratio = 3*0.008/0.054 ≈ 0.44 (spec ~2× slower than AR).
+    // After `warmup` such steps the gate MUST floor (ema_ratio << margin).
+    {
+        const SpecGateConfig cfg { /*enabled=*/true, /*margin=*/1.0, /*sustain=*/3, /*warmup=*/2 };
+        SpecGateState st;
+        double t_ar    = 0.008;
+        double t_step  = 0.054;
+        int    commit  = 3;
+        for (int i = 0; i < cfg.warmup; ++i) {
+            spec_gate_ema_update(cfg, st, commit, t_step, t_ar);
+        }
+        check(spec_gate_active(cfg, st, cfg.warmup, /*sampled_verify=*/false),
+              "Test A: 2x-slower MoE spec must floor by end of warmup");
+    }
+
+    // ── Test B: high-accept spec never floors (no-regression guard) ─────────
+    // Dense scenario: t_ar=0.008, spec step commits 12 tokens in 0.010s
+    // → ratio = 12*0.008/0.010 = 9.6 (spec clearly wins).
+    // After many steps the gate must NOT floor (ema_ratio >> margin).
+    {
+        const SpecGateConfig cfg { /*enabled=*/true, /*margin=*/1.0, /*sustain=*/3, /*warmup=*/2 };
+        SpecGateState st;
+        double t_ar   = 0.008;
+        double t_step = 0.010;
+        int    commit = 12;
+        for (int i = 0; i < 20; ++i) {
+            spec_gate_ema_update(cfg, st, commit, t_step, t_ar);
+        }
+        check(!spec_gate_active(cfg, st, 20, /*sampled_verify=*/false),
+              "Test B: high-accept spec (ratio~9.6) must never floor");
     }
 
     if (failures == 0) {

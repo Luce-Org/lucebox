@@ -17,11 +17,11 @@ struct SpecGateConfig {
     int    warmup;   // DFLASH_SPEC_GATE_WARMUP,  default 2
 };
 
-// Mutable per-turn EMA state.  Backends declare these as local variables;
-// spec_gate_ema_update() updates them in-place each step.
+// Mutable EMA state.  Promoted to backend member so state persists across turns.
 struct SpecGateState {
-    double ema_ratio      = 2.0; // EMA of realized speedup; init optimistic
+    double ema_ratio      = 0.0; // EMA of realized speedup; pessimistic init (gates fast on losers)
     int    gate_low_streak = 0;
+    int    n_ema_updates   = 0;  // total updates; gates hard-floor until warmup complete
 };
 
 // Returns true when the gate decides to floor to AR decode.
@@ -30,14 +30,18 @@ struct SpecGateState {
 //   distribution-preserving so timing routing would change the distribution.
 // n_draft_steps  — number of spec steps completed so far (gate is silent
 //   during the warmup window, i.e. when n_draft_steps < cfg.warmup).
+//
+// Two floor paths:
+//   streak path  — ema_ratio < margin for sustain consecutive steps (borderline)
+//   hard path    — ema_ratio < 0.5 * margin after warmup steps (clear 2×-slower loser)
 inline bool spec_gate_active(const SpecGateConfig & cfg,
                              const SpecGateState  & st,
                              int                    n_draft_steps,
                              bool                   sampled_verify) {
-    return cfg.enabled
-        && !sampled_verify
-        && n_draft_steps >= cfg.warmup
-        && st.gate_low_streak >= cfg.sustain;
+    if (!cfg.enabled || sampled_verify || n_draft_steps < cfg.warmup) return false;
+    if (st.gate_low_streak >= cfg.sustain)                              return true;  // streak path
+    if (st.n_ema_updates >= cfg.warmup && st.ema_ratio < 0.5 * cfg.margin) return true;  // hard path
+    return false;
 }
 
 // Update EMA and low-streak counter after each spec step.
@@ -52,8 +56,9 @@ inline void spec_gate_ema_update(const SpecGateConfig & cfg,
                                  double                 t_ar) {
     const double ratio = (t_ar > 0.0 && step_wall > 0.0)
         ? ((double)commit_n * t_ar / step_wall)
-        : 2.0;
+        : 1.0;  // neutral when timing unavailable
     st.ema_ratio = 0.5 * st.ema_ratio + 0.5 * ratio;
+    st.n_ema_updates++;
     if (st.ema_ratio < cfg.margin) st.gate_low_streak++;
     else                           st.gate_low_streak = 0;
 }
