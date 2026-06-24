@@ -17,6 +17,7 @@ What it captures
         - host<->device memcpy time per token   -> CPU/GPU-OVERLAP signal
         - sync-heavy CUDA APIs                   -> CPU-stall signal
   * optional losslessness gate: greedy spec-decode must equal greedy AR token-for-token
+  * repeated-run mean/stddev and report-only noise warnings
   * optional delta vs a stored baseline (regression view)
 
 Design choices
@@ -24,14 +25,15 @@ Design choices
   * Wraps the binaries directly (no HTTP) so the numbers reflect compute, not server noise.
   * The nsys pass is SEPARATE from the timing pass: nsys adds overhead, so tok/s is
     measured on a clean pass and the kernel breakdown on its own short pass.
-  * Built to run on the self-hosted RTX 3090 CI runner; keep --n-gen small in CI.
+  * Built to run on the self-hosted RTX 3090 CI runner; --n-gen controls the
+    requested generated tokens per prompt, so keep it representative but bounded.
 
 Usage
 -----
   python3 profile.py \
       --target /opt/models/Qwen3.6-27B-Q4_K_M.gguf \
       --draft  /opt/models/draft/dflash-draft-3.6-q4_k_m.gguf \
-      --n-gen 48 --budget 22 --reps 3 --nsys \
+      --n-gen 128 --budget 22 --reps 5 --nsys \
       --check-lossless \
       --baseline scripts/speed-baseline.json --regress-pct 0.10 \
       --out-json profile.json --out-md profile.md
@@ -341,6 +343,17 @@ REGRESS_DIRECTION = {
     "ms_per_token_mean": -1,
 }
 
+REGRESS_STD_KEYS = {
+    "decode_tok_s_mean": "decode_tok_s_stddev",
+    "al_mean": "al_stddev",
+    "ttft_est_ms_mean": "ttft_est_ms_stddev",
+    "ms_per_token_mean": "ms_per_token_stddev",
+}
+
+
+def _overlap_1sigma(base_mean: float, base_std: float, now_mean: float, now_std: float) -> bool:
+    return max(base_mean - base_std, now_mean - now_std) <= min(base_mean + base_std, now_mean + now_std)
+
 
 def regression_delta(base: dict, now: dict, thr: float) -> dict:
     """Per-metric (baseline, now, delta, pct, regressed?) + an overall verdict."""
@@ -351,7 +364,16 @@ def regression_delta(base: dict, now: dict, thr: float) -> dict:
         b, n = base[k], now[k]
         pct = (n - b) / b if b else 0.0
         regressed = (direction > 0 and pct < -thr) or (direction < 0 and pct > thr)
-        rows[k] = {"baseline": b, "now": n, "delta": n - b, "pct": pct, "regressed": regressed}
+        std_key = REGRESS_STD_KEYS.get(k)
+        base_std = float(base.get(std_key, 0.0)) if std_key else 0.0
+        now_std = float(now.get(std_key, 0.0)) if std_key else 0.0
+        overlap = _overlap_1sigma(b, base_std, n, now_std) if (base_std or now_std) else False
+        below_detection = overlap and abs(pct) < thr
+        rows[k] = {
+            "baseline": b, "now": n, "delta": n - b, "pct": pct, "regressed": regressed,
+            "baseline_stddev": base_std, "now_stddev": now_std,
+            "overlap_1sigma": overlap, "below_detection_threshold": below_detection,
+        }
     return rows
 
 
@@ -393,14 +415,39 @@ def render_md(doc: dict) -> str:
     L.append("| metric | value |")
     L.append("|---|---:|")
     if "ar_tok_s_mean" in s:    L.append(f"| AR decode (tok/s) | {s['ar_tok_s_mean']:.2f} |")
-    L.append(f"| DFlash decode (tok/s) | {s['decode_tok_s_mean']:.2f} |")
+    L.append(f"| DFlash decode (tok/s) | {s['decode_tok_s_mean']:.2f} ± {s.get('decode_tok_s_stddev', 0.0):.2f} |")
     if "speedup" in s:          L.append(f"| speedup vs AR | {s['speedup']:.2f}x |")
-    L.append(f"| ms / token | {s['ms_per_token_mean']:.2f} |")
-    L.append(f"| TTFT estimate (ms) | {s['ttft_est_ms_mean']:.1f} |")
+    L.append(f"| ms / token | {s['ms_per_token_mean']:.2f} ± {s.get('ms_per_token_stddev', 0.0):.2f} |")
+    L.append(f"| TTFT estimate (ms) | {s['ttft_est_ms_mean']:.1f} ± {s.get('ttft_est_ms_stddev', 0.0):.1f} |")
     L.append(f"| prefill (ms) | {s['prefill_ms_mean']:.1f} |")
-    L.append(f"| acceptance length (AL) | {s['al_mean']:.2f} |")
+    L.append(f"| acceptance length (AL) | {s['al_mean']:.2f} ± {s.get('al_stddev', 0.0):.2f} |")
     L.append(f"| accept % / step | {s['accept_pct_mean']:.1f} |")
     L.append(f"| decode tok/s spread (min–max) | {s['decode_tok_s_min']:.1f}–{s['decode_tok_s_max']:.1f} |\n")
+
+    noise = s.get("noise", {})
+    if noise:
+        threshold = noise.get("threshold_rsd", 0.0)
+        if noise.get("noisy"):
+            L.append("## Noise / detection threshold\n")
+            L.append(f"- ⚠️ **NOISY** — relative stddev exceeded `{threshold*100:.1f}%` for "
+                     f"{', '.join(noise.get('metrics', []))}. Treat small deltas as below detection threshold.")
+            L.append("- This profiler remains report-only: noise warnings do not fail the run.\n")
+        else:
+            L.append("## Noise / detection threshold\n")
+            L.append(f"- ✅ **stable** — all tracked relative stddevs are at or below `{threshold*100:.1f}%`.\n")
+
+
+    if doc.get("runs"):
+        L.append("## Repeated-run samples by prompt\n")
+        L.append("| prompt | decode tok/s | ms/token | AL | TTFT ms |")
+        L.append("|---|---:|---:|---:|---:|")
+        for r in doc["runs"]:
+            L.append(f"| `{r.get('prompt', '?')}` | "
+                     f"{r.get('decode_tok_s', 0.0):.2f} ± {r.get('decode_tok_s_stddev', 0.0):.2f} | "
+                     f"{r.get('ms_per_token', 0.0):.2f} ± {r.get('ms_per_token_stddev', 0.0):.2f} | "
+                     f"{r.get('al', 0.0):.2f} ± {r.get('al_stddev', 0.0):.2f} | "
+                     f"{r.get('ttft_est_ms', 0.0):.1f} ± {r.get('ttft_est_ms_stddev', 0.0):.1f} |")
+        L.append("")
 
     if "lossless" in doc:
         ll = doc["lossless"]
@@ -486,8 +533,12 @@ def render_md(doc: dict) -> str:
         L.append("| metric | baseline | now | Δ | Δ% | |")
         L.append("|---|---:|---:|---:|---:|:--|")
         for k, r in doc["baseline_delta"].items():
-            mark = "⚠️" if r["regressed"] else ""
-            L.append(f"| {k} | {r['baseline']:.2f} | {r['now']:.2f} | {r['delta']:+.2f} | "
+            if r.get("below_detection_threshold"):
+                mark = "⚠️ noisy / overlap"
+            else:
+                mark = "⚠️" if r["regressed"] else ""
+            L.append(f"| {k} | {r['baseline']:.2f} ± {r.get('baseline_stddev', 0.0):.2f} | "
+                     f"{r['now']:.2f} ± {r.get('now_stddev', 0.0):.2f} | {r['delta']:+.2f} | "
                      f"{r['pct']*100:+.1f}% | {mark} |")
         L.append("")
     return "\n".join(L)
@@ -520,6 +571,44 @@ def median(xs):  # tolerant
     return statistics.median(xs) if xs else 0.0
 
 
+def mean(xs):
+    xs = [x for x in xs if x is not None]
+    return statistics.mean(xs) if xs else 0.0
+
+
+def stddev(xs):
+    xs = [x for x in xs if x is not None]
+    return statistics.stdev(xs) if len(xs) > 1 else 0.0
+
+
+def rel_stddev(mean_value: float, stddev_value: float) -> float:
+    return abs(stddev_value / mean_value) if mean_value else 0.0
+
+
+def pooled_within_stddev(runs, key):
+    """Run-to-run (within-prompt) stddev, pooled across prompts.
+
+    The headline ± must reflect measurement *noise* — how much a single prompt's
+    number wobbles between identical reps — NOT how much different prompts differ
+    from each other. Pooling every raw sample across prompts would fold the
+    (large, real, repeatable) prompt-to-prompt spread into the stddev and badly
+    overstate the noise. We instead pool only the per-prompt deviations:
+
+        sqrt( Σ_prompt Σ_rep (x - prompt_mean)^2 / Σ_prompt (n_rep - 1) )
+
+    i.e. the standard pooled within-group standard deviation. Prompt-to-prompt
+    spread stays visible via the min–max line and the per-prompt table.
+    """
+    num, den = 0.0, 0
+    for r in runs:
+        s = [x for x in r.get("samples", {}).get(key, []) if x is not None]
+        if len(s) > 1:
+            m = statistics.mean(s)
+            num += sum((x - m) ** 2 for x in s)
+            den += len(s) - 1
+    return (num / den) ** 0.5 if den > 0 else 0.0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", required=True)
@@ -527,9 +616,13 @@ def main():
     ap.add_argument("--df-bin", default=os.environ.get("DFLASH_BIN", "build/test_dflash"))
     ap.add_argument("--ar-bin", default=os.environ.get("DFLASH_BIN_AR", "build/test_generate"))
     ap.add_argument("--tokenizer", default=os.environ.get("DFLASH_TOKENIZER", "Qwen/Qwen3.6-27B"))
-    ap.add_argument("--n-gen", type=int, default=48)
+    ap.add_argument("--n-gen", type=int, default=128,
+                    help="requested generated tokens per benchmark prompt")
     ap.add_argument("--budget", type=int, default=22)
-    ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--reps", type=int, default=5,
+                    help="timing repetitions per prompt; use 3-5+ to expose run-to-run jitter")
+    ap.add_argument("--noise-rsd-pct", type=float, default=0.05,
+                    help="report-only noisy-run threshold as relative stddev (0.05 = 5%%)")
     ap.add_argument("--nsys", action="store_true")
     ap.add_argument("--check-lossless", action="store_true")
     ap.add_argument("--prompts", default=None, help="optional .jsonl of {name,text}")
@@ -555,14 +648,30 @@ def main():
         pbin = tmp / f"{p['name']}.bin"
         plen = tokenize(p["text"], tok, pbin)
 
-        # clean timing passes (median over reps)
+        # clean timing passes (mean/stddev over reps)
         reps = []
         for _ in range(cfg.reps):
             txt = run(dflash_cmd(cfg, pbin, tmp / "df.bin", cfg.n_gen))
             reps.append(parse_dflash(txt))
         agg = dict(reps[-1])  # keep phases from last
-        agg["decode_tok_s"] = median([r.get("decode_tok_s") for r in reps])
-        agg["al"]           = median([r.get("al") for r in reps])
+        decode_samples = [r.get("decode_tok_s") for r in reps if r.get("decode_tok_s") is not None]
+        al_samples = [r.get("al") for r in reps if r.get("al") is not None]
+        mspt_samples = [1000.0 / x for x in decode_samples if x]
+        ttft_samples = [r.get("ttft_est_ms") for r in reps if r.get("ttft_est_ms") is not None]
+        agg["samples"] = {
+            "decode_tok_s": decode_samples,
+            "ms_per_token": mspt_samples,
+            "al": al_samples,
+            "ttft_est_ms": ttft_samples,
+        }
+        agg["decode_tok_s"] = mean(decode_samples)
+        agg["decode_tok_s_stddev"] = stddev(decode_samples)
+        agg["ms_per_token"] = mean(mspt_samples)
+        agg["ms_per_token_stddev"] = stddev(mspt_samples)
+        agg["al"] = mean(al_samples)
+        agg["al_stddev"] = stddev(al_samples)
+        agg["ttft_est_ms"] = mean(ttft_samples)
+        agg["ttft_est_ms_stddev"] = stddev(ttft_samples)
         agg["prompt"] = p["name"]; agg["prompt_len"] = plen
 
         # AR baseline (single pass — it is deterministic)
@@ -603,15 +712,34 @@ def main():
 
     # ---- aggregate summary across prompts ----
     def col(k): return [r[k] for r in runs if k in r]
+    # Headline ± is the run-to-run (within-prompt) stddev, pooled across prompts.
+    # Prompt-to-prompt spread is reported separately (min–max + per-prompt table)
+    # so it never masquerades as measurement noise. See pooled_within_stddev().
+    decode_mean = statistics.mean(col("decode_tok_s"))
+    decode_sd = pooled_within_stddev(runs, "decode_tok_s")
+    mspt_mean = statistics.mean(col("ms_per_token"))
+    mspt_sd = pooled_within_stddev(runs, "ms_per_token")
+    al_mean = statistics.mean(col("al"))
+    al_sd = pooled_within_stddev(runs, "al")
+    ttft_mean = statistics.mean(col("ttft_est_ms")) if col("ttft_est_ms") else 0.0
+    ttft_sd = pooled_within_stddev(runs, "ttft_est_ms")
     summary = {
-        "decode_tok_s_mean": statistics.mean(col("decode_tok_s")),
+        "decode_tok_s_mean": decode_mean,
         "decode_tok_s_min": min(col("decode_tok_s")),
         "decode_tok_s_max": max(col("decode_tok_s")),
-        "ms_per_token_mean": statistics.mean([1000.0 / x for x in col("decode_tok_s")]),
-        "al_mean": statistics.mean(col("al")),
+        "decode_tok_s_stddev": decode_sd,
+        "decode_tok_s_rsd": rel_stddev(decode_mean, decode_sd),
+        "ms_per_token_mean": mspt_mean,
+        "ms_per_token_stddev": mspt_sd,
+        "ms_per_token_rsd": rel_stddev(mspt_mean, mspt_sd),
+        "al_mean": al_mean,
+        "al_stddev": al_sd,
+        "al_rsd": rel_stddev(al_mean, al_sd),
         "accept_pct_mean": statistics.mean(col("accept_pct")) if col("accept_pct") else 0.0,
         "prefill_ms_mean": statistics.mean([x * 1000 for x in col("prefill_s")]) if col("prefill_s") else 0.0,
-        "ttft_est_ms_mean": statistics.mean(col("ttft_est_ms")) if col("ttft_est_ms") else 0.0,
+        "ttft_est_ms_mean": ttft_mean,
+        "ttft_est_ms_stddev": ttft_sd,
+        "ttft_est_ms_rsd": rel_stddev(ttft_mean, ttft_sd),
         "phase_sum_ms_mean": statistics.mean(col("phase_sum_ms")) if col("phase_sum_ms") else 0.0,
     }
     if col("ar_tok_s"):
@@ -621,6 +749,20 @@ def main():
     pkeys = set().union(*[set(r.get("phases", {})) for r in runs]) if runs else set()
     summary["phases_mean"] = {k: statistics.mean([r["phases"][k] for r in runs if k in r.get("phases", {})])
                               for k in pkeys}
+    per_prompt_rsd = {}
+    for k in ("decode_tok_s", "ms_per_token", "al", "ttft_est_ms"):
+        values = []
+        for r in runs:
+            values.append(rel_stddev(r.get(k, 0.0), r.get(f"{k}_stddev", 0.0)))
+        per_prompt_rsd[k] = max(values) if values else 0.0
+    noisy_metrics = [k for k, rsd in per_prompt_rsd.items() if rsd > cfg.noise_rsd_pct]
+    summary["noise"] = {
+        "threshold_rsd": cfg.noise_rsd_pct,
+        "noisy": bool(noisy_metrics),
+        "metrics": noisy_metrics,
+        "per_prompt_max_rsd": per_prompt_rsd,
+        "status": "noisy" if noisy_metrics else "stable",
+    }
     if nsys:
         summary["nsys"] = nsys
 

@@ -138,19 +138,27 @@ jobs:
           else
             echo "No baseline at $baseline — regression flagging disabled this run."
           fi
-          # Keep n_gen small: the 3090 is serialized across PRs. The nsys pass adds a
-          # separate short profiled run; tok/s is measured on clean passes.
+          # Use 128 generated tokens per prompt by default: long enough to reduce
+          # startup/noise effects while keeping the serialized 3090 queue bounded.
+          # The nsys pass adds a separate short profiled run; tok/s is measured on clean passes. Run 5
+          # timing reps by default so the report can distinguish real deltas from
+          # thermal/clock jitter; repo variables can trim this for temporary smoke runs.
           .profiler-venv/bin/python scripts/profile.py \
             --target "$MODELS/$TARGET_MODEL" \
             --draft  "$MODELS/$DRAFT_MODEL" \
             --tokenizer "$TOKENIZER" \
-            --n-gen 48 --budget 22 --reps 3 \
+            --n-gen "${LUCEBOX_SPEED_N_GEN:-128}" --budget 22 \
+            --reps "${LUCEBOX_SPEED_REPS:-5}" \
+            --noise-rsd-pct "${LUCEBOX_SPEED_NOISE_RSD_PCT:-0.05}" \
             --nsys --check-lossless \
             "${baseline_arg[@]}" \
             --out-json profile.json --out-md profile.md
         env:
           LUCEBOX_SPEED_BASELINE: ${{ vars.LUCEBOX_SPEED_BASELINE || '' }}
           LUCEBOX_SPEED_REGRESS_PCT: ${{ vars.LUCEBOX_SPEED_REGRESS_PCT || '' }}
+          LUCEBOX_SPEED_N_GEN: ${{ vars.LUCEBOX_SPEED_N_GEN || '' }}
+          LUCEBOX_SPEED_REPS: ${{ vars.LUCEBOX_SPEED_REPS || '' }}
+          LUCEBOX_SPEED_NOISE_RSD_PCT: ${{ vars.LUCEBOX_SPEED_NOISE_RSD_PCT || '' }}
 
       - name: Publish report to the run summary
         if: always() && steps.models.outputs.present == 'true'
@@ -172,7 +180,7 @@ jobs:
           python3 - <<'PY'
           import json
           d = json.load(open("server/profile.json"))
-          ll, reg = d.get("lossless", {}), d.get("regression", {})
+          ll, reg, noise = d.get("lossless", {}), d.get("regression", {}), d.get("summary", {}).get("noise", {})
           if ll and not ll.get("lossless", True):
               print(f"::warning title=Losslessness::spec-decode output differs from greedy AR on "
                     f"{','.join(ll.get('prompts_failed', []))} (first token #{ll.get('first_divergence')}); "
@@ -180,6 +188,10 @@ jobs:
           if reg.get("regressed"):
               print(f"::warning title=Speed regression::{','.join(reg.get('metrics', []))} moved past "
                     f"±{reg.get('threshold_pct',0)*100:.0f}% vs baseline {reg.get('baseline_commit','?')}.")
+          if noise.get("noisy"):
+              print(f"::warning title=Noisy speed profile::{','.join(noise.get('metrics', []))} exceeded "
+                    f"the relative stddev threshold ({noise.get('threshold_rsd', 0)*100:.1f}%). "
+                    "Treat small deltas as below the profiler detection threshold.")
           PY
 
       - name: Reset GPU clocks
