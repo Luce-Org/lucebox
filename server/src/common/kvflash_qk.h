@@ -47,7 +47,10 @@ inline void kvflash_qk_chunk_scores(
     const float * query,
     const KvFlashQkDims & d,
     std::vector<float> & out,
-    float missing_score = -2.0f) {
+    float missing_score = -2.0f,
+    const float * seeded = nullptr,
+    float seeded_sentinel = -std::numeric_limits<float>::infinity(),
+    int seeded_n = -1) {
     const int group = d.n_q_heads / d.n_kv_heads;
     const int n_chunks = (int)pooled_keys.size();
     out.assign((size_t)n_chunks, missing_score);
@@ -82,6 +85,19 @@ inline void kvflash_qk_chunk_scores(
             acc += lmax;
         }
         out[(size_t)c] = acc * inv_layers;            // layer-MEAN (Phase-0 config)
+    }
+    // Seeded fallback: for chunks with no pooled key, use the ledger score from
+    // a prior turn if it is not the sentinel (i.e. it was actually scored).
+    // seeded_n bounds the valid range of the seeded array; chunks beyond it
+    // (n_chunks > seeded array length) fall back to missing_score safely.
+    if (seeded) {
+        const int seeded_limit = (seeded_n >= 0) ? seeded_n : n_chunks;
+        for (int c = 0; c < n_chunks; c++) {
+            if (!pooled_keys[(size_t)c] && c < seeded_limit &&
+                seeded[c] != seeded_sentinel) {
+                out[(size_t)c] = seeded[c];
+            }
+        }
     }
 }
 

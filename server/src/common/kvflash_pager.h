@@ -215,15 +215,17 @@ public:
     // Pins are cleared by reset() and re-applied by the backend after each
     // prefill/restore rebuild via apply_kvflash_pins().
 
-    // Pin logical token range [tok_lo, tok_hi) (inclusive of chunk boundaries).
-    // Maps to chunk range [tok_lo/chunk_tokens, tok_hi/chunk_tokens] inclusive.
+    // Pin logical token range [tok_lo, tok_hi) half-open.
+    // Maps to chunk range [c_lo, c_hi] inclusive where c_hi covers the last
+    // token in the range (tok_hi - 1), not tok_hi itself, so an exact boundary
+    // at tok_hi does not pin the next chunk beyond the range.
     // Best-effort deadlock guard: if (sink+tail+n_pinned+2) > n_blocks_ the
     // span is refused with a one-line warning and the function returns without
     // setting any pin.
     void pin_range(int64_t tok_lo, int64_t tok_hi) {
-        if (!attached() || tok_lo > tok_hi) return;
+        if (!attached() || tok_lo >= tok_hi) return;
         const int c_lo = (int)(tok_lo / cfg_.chunk_tokens);
-        const int c_hi = (int)(tok_hi / cfg_.chunk_tokens);
+        const int c_hi = (int)((tok_hi - 1) / cfg_.chunk_tokens);
         if (c_lo > c_hi || c_lo < 0) return;
         // Count currently-pinned chunks + the new ones.
         int currently_pinned = 0;

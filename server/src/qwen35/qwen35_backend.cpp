@@ -1020,15 +1020,38 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     // identity-style in the first place).
     const bool kvf_paged = kvflash_active() &&
         kv_offset + prompt_len > kvflash_tokens_ - kvflash_pager_.chunk_tokens();
-    if (kvf_paged && kv_offset != 0) {
-        std::fprintf(stderr,
-            "[kvflash] restored prefix (%d) + prompt (%d) exceeds pool %d; "
-            "pooled prefill requires a fresh request\n",
-            kv_offset, prompt_len, kvflash_tokens_);
-        set_last_error("kvflash: restore + pooled prefill unsupported");
-        return -1;
-    }
-    if (kvf_paged) {
+    // restore-consume: kv_offset != 0 means the caller passed a suffix after
+    // deserializing the prefix KV; allow it in the pooled path without reset.
+    const bool kvf_restore_suffix = kvf_paged && kv_offset != 0;
+    if (kvf_restore_suffix) {
+        // Suffix pooled prefill: pager was seeded by deserialize(); just set
+        // ubatch size and skip reset. Log to distinguish from the cold path.
+        prefill_ubatch = kvflash_pager_.chunk_tokens();
+        // Verify kv_offset is chunk-aligned (snapshot boundary contract).
+        // On misalignment, fall back to a full cold re-prefill rather than
+        // aborting the request — the KV restored from the snapshot is stale.
+        if (kv_offset % prefill_ubatch != 0) {
+            std::fprintf(stderr,
+                "[kvflash] restore-consume: kv_offset=%d not chunk-aligned "
+                "(chunk_tokens=%d) — falling back to full re-prefill\n",
+                kv_offset, prefill_ubatch);
+            kv_offset = 0;
+            kvflash_pager_.reset();
+            if (kvflash_qk_policy_) {
+                kvflash_qk_pool_.reset(kvflash_qk_pool_.dims());
+                kvflash_qk_pooled_upto_ = 0;
+            }
+            std::printf("[kvflash] pooled prefill (fallback): %d tokens through a %d-token pool "
+                        "(%d-token chunks, evicting)\n",
+                        prompt_len, kvflash_tokens_, prefill_ubatch);
+            std::fflush(stdout);
+        } else {
+            std::printf("[kvflash] restore-consume suffix: offset=%d suffix=%d "
+                        "pool=%d chunk=%d\n",
+                        kv_offset, prompt_len, kvflash_tokens_, prefill_ubatch);
+            std::fflush(stdout);
+        }
+    } else if (kvf_paged) {
         prefill_ubatch = kvflash_pager_.chunk_tokens();
         kvflash_pager_.reset();
         if (kvflash_qk_policy_) {
