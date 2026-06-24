@@ -14,7 +14,9 @@ Three layers, coarse to fine:
 
 1. **Headline latency/throughput** — prefill time, model-side TTFT estimate, decode
    tok/s, ms/token, plus the speculative-decoding **acceptance length (AL)** and
-   accept %. (`AL` is how many tokens the target commits per draft+verify step; decode
+   accept %. Repeated timing passes report **mean ± stddev**, not a single-point
+   estimate, so reviewers can tell whether a small delta is real or just jitter.
+   (`AL` is how many tokens the target commits per draft+verify step; decode
    throughput ≈ `AL / step_time`.)
 2. **Per-step phase breakdown** — `draft_compute`, `draft_logits`, `verify_compute`,
    … from the engine's own timers. Tells you *which phase* dominates a step.
@@ -31,15 +33,26 @@ and they stay fixed so every run is comparable over time:
   per target pass. 22 is the `dflash_server` default. Bigger = a bigger bet (higher
   potential acceptance length) but more draft+verify cost; tuning it is a separate sweep,
   not the CI job.
-- **`--n-gen 48`** — tokens generated per prompt. Long enough to be past warmup, short
-  enough to keep the shared 3090 fast. (Very short n_gen under-counts spec-decode because
-  fixed startup costs aren't amortized.)
-- **`--reps 3`** — repeats the decode and takes the **median** tok/s to absorb run-to-run
-  GPU variance (thermals, clock boosting, scheduler jitter).
+- **`--n-gen 128`** — requested generated tokens per prompt. This is long enough
+  to amortize startup costs and reduce very-short-generation bias, while still
+  keeping the shared 3090 CI queue bounded. The argument is passed as `<n_gen>`
+  to both `test_dflash` and `test_generate`, where it controls the response length
+  generated for each benchmark prompt.
+- **`--reps 5`** — repeats each prompt enough times to expose run-to-run GPU
+  variance (thermals, clock boosting, scheduler jitter), then reports mean and
+  stddev for the headline metrics. Use `--reps 3` for a faster smoke profile when
+  needed, but PR comparisons should prefer 5+.
+- **`--noise-rsd-pct 0.05`** — report-only noise threshold. If any tracked
+  headline metric has relative stddev above 5%, the markdown calls the profile
+  **NOISY** and tells reviewers to treat small deltas as below the profiler
+  detection threshold.
 
 **Rule:** keep these consistent. A delta vs the baseline is only a valid regression
 signal if both runs used the same config — if you ever change a parameter, re-seed the
-baseline (you cannot compare across configs).
+baseline (you cannot compare across configs). When baseline and current 1σ intervals
+overlap and the delta is smaller than `--regress-pct`, the report marks that row as
+**noisy / overlap** instead of inviting reviewers to chase a ghost regression. All of
+these states are warnings only; the profiler remains report-only.
 
 ## Losslessness gate (and why a bit-exact compare is too strict on its own)
 
@@ -74,6 +87,14 @@ one-at-a-time). Classifying a FAIL as bug-vs-FP needs the **logit gap** at the f
 mismatch (near-tie = FP, clear gap = bug) — a follow-up the binaries don't emit yet. CI
 surfaces a FAIL as a non-blocking `::warning::` for triage; it stays report-only.
 
+## CI settings
+
+The `Speed Profile` workflow uses the same profiler defaults as the local recipe:
+`--n-gen 128`, `--reps 5`, and `--noise-rsd-pct 0.05`. Runner owners can
+temporarily override those values with repo variables `LUCEBOX_SPEED_N_GEN`,
+`LUCEBOX_SPEED_REPS`, and `LUCEBOX_SPEED_NOISE_RSD_PCT`, but PR-to-PR comparisons
+should keep them fixed.
+
 ## Run it locally
 
 ```bash
@@ -82,7 +103,7 @@ python3 scripts/profile.py \
   --target /opt/models/Qwen3.6-27B-Q4_K_M.gguf \
   --draft  /opt/models/draft/dflash-draft-3.6-q4_k_m.gguf \
   --tokenizer Qwen/Qwen3.6-27B \
-  --n-gen 48 --budget 22 --reps 3 \
+  --n-gen 128 --budget 22 --reps 5 --noise-rsd-pct 0.05 \
   --nsys --check-lossless \
   --baseline scripts/speed-baseline.json --regress-pct 0.10 \
   --out-json profile.json --out-md profile.md
