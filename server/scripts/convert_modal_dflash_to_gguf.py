@@ -33,7 +33,8 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import gguf
+# gguf is imported lazily inside main() so that resolve_rope_theta() and its
+# tests remain importable without gguf installed (offline / pure-unit-test use).
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -74,7 +75,9 @@ def resolve_rope_theta(config_dict: dict) -> float:
     """
     c = config_dict
     rp = c.get("rope_parameters", {})
-    if rp.get("rope_theta") is not None:
+    # Guard: rope_parameters may be present but null or a non-dict scalar;
+    # calling .get() on a non-dict would raise AttributeError.
+    if isinstance(rp, dict) and rp.get("rope_theta") is not None:
         return float(rp["rope_theta"])
     if c.get("rope_theta") is not None:
         return float(c["rope_theta"])
@@ -176,10 +179,10 @@ def load_arch(safetensors: Path, header: dict) -> dict:
 
         print(f"[info] read arch from {cfg_path}")
     else:
-        print("[warn] no config.json next to safetensors; using 27B defaults")
         print(
-            "[error] cannot resolve rope_theta: no config.json found. "
-            "Provide a config.json with rope_theta or rope_parameters.rope_theta.",
+            "[error] no config.json found next to safetensors — cannot resolve "
+            "rope_theta. Provide a config.json with rope_theta or "
+            "rope_parameters.rope_theta.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -302,6 +305,8 @@ def to_f32(raw: bytes, dtype: str, shape: list[int]) -> np.ndarray:
 # ──────────────────────────────────────────────────────────────────────
 
 def main():
+    import gguf  # lazy import so pure helpers (resolve_rope_theta) work offline
+
     ap = argparse.ArgumentParser(
         description="Convert DFlash draft BF16 safetensors to Q4_K_M GGUF"
     )

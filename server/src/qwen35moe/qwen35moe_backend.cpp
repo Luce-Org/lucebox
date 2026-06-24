@@ -32,7 +32,32 @@ static uint64_t elapsed_us(HybridClock::time_point start, HybridClock::time_poin
     return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 }
 
+static bool hybrid_spec_profile_enabled() {
+    static const bool enabled = []() {
+        const char * v = std::getenv("DFLASH_QWEN35MOE_SPEC_PROFILE");
+        return v && std::atoi(v) != 0;
+    }();
+    return enabled;
+}
+
 } // namespace
+
+struct Qwen35MoeBackend::HybridSpecBatchProfile {
+    uint64_t total_us = 0;
+    uint64_t prefn_graph_build_us = 0;
+    uint64_t prefn_compute_us = 0;
+    uint64_t prefn_ssm_compute_us = 0;
+    uint64_t prefn_attn_compute_us = 0;
+    uint64_t position_build_us = 0;
+    uint64_t mask_build_us = 0;
+    uint64_t routing_readback_us = 0;
+    uint64_t moe_ffn_us = 0;
+    uint64_t feature_capture_us = 0;
+    uint64_t lm_head_graph_build_us = 0;
+    uint64_t lm_head_compute_us = 0;
+};
+
+struct Qwen35MoeBackend::HybridSpecGraphCache {};
 
 Qwen35MoeBackend::Qwen35MoeBackend(const Qwen35Config & cfg)
     : Qwen35Backend(cfg) {}
@@ -330,6 +355,17 @@ bool Qwen35MoeBackend::rebuild_hybrid_from_placement(const MoeHybridPlacement & 
     if (!ok) return false;
     out.moe_hybrid = std::move(hybrid);
     return true;
+}
+
+bool Qwen35MoeBackend::park(const std::string & what) {
+    // Invalidate the persistent hybrid logits step-graph before freeing weights
+    // so that ensure_moe_hybrid_logits_sg() rebuilds it after unpark. Without
+    // this, the cached graph retains stale pointers to freed weight tensors.
+    const bool want_target = (what.empty() || what == "all" || what == "target");
+    if (want_target) {
+        step_graph_destroy(moe_hybrid_logits_sg_);
+    }
+    return Qwen35Backend::park(what);
 }
 
 bool Qwen35MoeBackend::spark_bootstrap_finalize(const std::string & profile_path) {
@@ -1612,6 +1648,9 @@ bool Qwen35MoeBackend::hybrid_forward_batch(
     std::vector<float> & act_cur,
     std::vector<int32_t> & argmax_out,
     bool capture_features) {
+
+    HybridSpecBatchProfile prof{};
+    const auto batch_t0 = HybridClock::now();
 
     const int hidden = target_weights().n_embd;
     const int n_layer = target_weights().n_layer;

@@ -195,7 +195,15 @@ bool create_target_cache_partial(const TargetWeights & w,
         // at exactly 4096 (ring wrap). Override with DFLASH_FEAT_RING_CAP env.
         int target_feat_cap_default = 4096;
         if (const char * e = std::getenv("DFLASH_FEAT_RING_CAP")) {
-            target_feat_cap_default = std::atoi(e);
+            char * endp = nullptr;
+            long v = std::strtol(e, &endp, 10);
+            if (endp == e || *endp != '\0' || v <= 0) {
+                std::fprintf(stderr,
+                    "[dflash] DFLASH_FEAT_RING_CAP='%s' is invalid or non-positive; "
+                    "using default max_ctx=%d\n", e, max_ctx);
+            } else {
+                target_feat_cap_default = (int)std::min(v, (long)max_ctx);
+            }
         }
         out.target_feat_cap = std::min(max_ctx, target_feat_cap_default);
         if (allocate_target_feat) {
@@ -1437,7 +1445,7 @@ bool snapshot_target_cache(const TargetWeights & w,
         return false;
     }
 
-    // Reuse existing buffer if shapes match (same cur_pos); otherwise reallocate.
+    // Reuse existing buffer if shapes match (same cur_pos AND same pooled mode).
     // Right-sized KV tensors use [head_dim, cur_pos, n_head_kv] — orders of
     // magnitude smaller than [head_dim, max_ctx, n_head_kv] for short prefixes.
     const bool needs_alloc = (snap.ctx == nullptr) || (snap.cur_pos != snap_pos);

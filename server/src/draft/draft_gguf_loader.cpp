@@ -175,17 +175,27 @@ bool read_draft_capture_config(const std::string & path,
         n_capture = (int)gguf_get_val_u32(gctx, ntl_id);
     }
 
+    // Zero-initialize the output array so callers get safe values even when
+    // target_layer_ids is absent (P1-G: uninitialized capture IDs).
+    for (int k = 0; k < max_ids; k++) capture_ids[k] = 0;
+
     // Read target_layer_ids array (exact capture positions from training).
     std::snprintf(key, sizeof(key), "%s.%s", A.c_str(), "dflash.target_layer_ids");
     int64_t tli_id = gguf_find_key(gctx, key);
     if (tli_id >= 0 && gguf_get_kv_type(gctx, tli_id) == GGUF_TYPE_ARRAY) {
-        const size_t n = std::min((size_t)gguf_get_arr_n(gctx, tli_id),
-                                  (size_t)max_ids);
-        const int32_t * ids = static_cast<const int32_t *>(gguf_get_arr_data(gctx, tli_id));
-        for (size_t k = 0; k < n; k++) {
-            capture_ids[k] = (int)ids[k];
+        // P2-2: verify element type is INT32 before casting (array may be INT64).
+        if (gguf_get_arr_type(gctx, tli_id) != GGUF_TYPE_INT32) {
+            std::fprintf(stderr,
+                "[draft-cfg] target_layer_ids array type is not INT32; skipping\n");
+        } else {
+            const size_t n = std::min((size_t)gguf_get_arr_n(gctx, tli_id),
+                                      (size_t)max_ids);
+            const int32_t * ids = static_cast<const int32_t *>(gguf_get_arr_data(gctx, tli_id));
+            for (size_t k = 0; k < n; k++) {
+                capture_ids[k] = (int)ids[k];
+            }
+            if (n > 0) n_capture = (int)n;
         }
-        if (n > 0) n_capture = (int)n;
     }
 
     gguf_free(gctx);

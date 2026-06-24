@@ -1066,6 +1066,27 @@ static bool eval_moe_hybrid_ffn_batched_core(
                 if (cl >= 0) { cold_sel[i] = cl; cold_wts[i] = selected_weights[i]; fp_has_cold = true; }
             }
         }
+        // Dummy slots (wts==0) may alias a real hot expert's local ID per token →
+        // ids_to_sorted_host drops entries → ASSERT in slow ggml_mul_mat_id path.
+        for (int t = 0; t < n_tokens; ++t) {
+            const int base = t * n_used;
+            int32_t next = 0;
+            for (int s = 0; s < n_used; ++s) {
+                if (hot_wts[base + s] > 0.0f) continue;
+                // Bounded search: at most n_hot_init probes. If every ID in
+                // [0, n_hot_init) is already taken by another slot we break and
+                // keep `next` as-is (duplicate), which is safe — the zero-weight
+                // slot is ignored by ids_to_sorted_host anyway.
+                int tries = 0;
+                while (tries < n_hot_init &&
+                       [&]{ for (int k=0; k<n_used; ++k) if (k!=s && hot_sel[base+k]==next) return true; return false; }()) {
+                    if (++next >= n_hot_init) next = 0;
+                    ++tries;
+                }
+                hot_sel[base + s] = next++;
+                if (next >= n_hot_init) next = 0;
+            }
+        }
 
         CachedHotBatchedGraph & hg = storage.hot_batched_mixed[n_tokens];
         const bool hg_ok = (hg.valid() && hg.n_tokens == n_tokens)
@@ -1143,6 +1164,23 @@ static bool eval_moe_hybrid_ffn_batched_core(
                 cold_wts[i] = selected_weights[i];
                 has_cold = true;
             }
+        }
+    }
+    // Dummy slots (wts==0) may alias a real hot expert's local ID per token →
+    // ids_to_sorted_host drops entries → ASSERT in slow ggml_mul_mat_id path.
+    for (int t = 0; t < n_tokens; ++t) {
+        const int base = t * n_used;
+        int32_t next = 0;
+        for (int s = 0; s < n_used; ++s) {
+            if (hot_wts[base + s] > 0.0f) continue;
+            int tries = 0;
+            while (tries < n_hot_init &&
+                   [&]{ for (int k=0; k<n_used; ++k) if (k!=s && hot_sel[base+k]==next) return true; return false; }()) {
+                if (++next >= n_hot_init) next = 0;
+                ++tries;
+            }
+            hot_sel[base + s] = next++;
+            if (next >= n_hot_init) next = 0;
         }
     }
 
