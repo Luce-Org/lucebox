@@ -64,6 +64,7 @@ json build_timings_json(const GenTimings & t, int completion_tokens) {
     return json{
         {"prefill_ms",            prefill_ms},
         {"decode_ms",             decode_ms},
+        {"prompt_n_cached",       std::max(0, t.prompt_n_cached)},
         {"decode_tokens_per_sec", tps}
     };
 }
