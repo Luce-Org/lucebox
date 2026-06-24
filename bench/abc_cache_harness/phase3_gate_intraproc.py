@@ -174,7 +174,12 @@ def main():
 
     # Acquire GPU lock
     gpu_lock_fd = open("/tmp/lucebox_gpu.lock","w")
-    fcntl.flock(gpu_lock_fd, fcntl.LOCK_EX)
+    try:
+        fcntl.flock(gpu_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit("[bench] /tmp/lucebox_gpu.lock is already held — another GPU bench is "
+                 "running, or this script was wrapped in an outer `flock` (double-lock). "
+                 "Never nest flock on this file. Aborting.")
 
     try:
         # AR-only gate (no draft = no spec decode = feature-mirror-independent)
