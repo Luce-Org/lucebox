@@ -349,6 +349,17 @@ bool Qwen35MoeBackend::rebuild_hybrid_from_placement(const MoeHybridPlacement & 
     return true;
 }
 
+bool Qwen35MoeBackend::park(const std::string & what) {
+    // Invalidate the persistent hybrid logits step-graph before freeing weights
+    // so that ensure_moe_hybrid_logits_sg() rebuilds it after unpark. Without
+    // this, the cached graph retains stale pointers to freed weight tensors.
+    const bool want_target = (what.empty() || what == "all" || what == "target");
+    if (want_target) {
+        step_graph_destroy(moe_hybrid_logits_sg_);
+    }
+    return Qwen35Backend::park(what);
+}
+
 bool Qwen35MoeBackend::spark_bootstrap_finalize(const std::string & profile_path) {
     if (!spark_wants_bootstrap()) return false;
     std::string err;

@@ -196,6 +196,12 @@ protected:
     int  kvflash_tau_    = 64;
     bool kvflash_drafter_failed_ = false;           // don't retry a failed load
     bool kvflash_active() const { return kvflash_tokens_ > 0; }
+    // Pool sizing inputs — shared so MoE placement reserves exactly the pool
+    // runtime allocates (else placement over-reserves KV and starves experts).
+    bool kvflash_scorer_expected() const {
+        return !kvflash_drafter_path_.empty() || kvflash_qk_policy_;
+    }
+    KvFlashAutoBudget make_kvflash_budget(const TargetWeights & w, int64_t gpu_free) const;
     // Budget snapshot stashed by init() for post_kvflash_init_gate() subclasses.
     KvFlashAutoBudget kvf_budget_{};
     // Target-QK policy (--kvflash-policy qk): residency scored with the

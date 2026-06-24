@@ -39,6 +39,7 @@ protected:
                             std::vector<int32_t> & out_tokens,
                             const DaemonIO & io) override;
     bool should_capture_moe_router() const override { return routing_stats_ != nullptr; }
+    bool park(const std::string & what) override;
     bool spark_wants_bootstrap() const override;
     bool spark_bootstrap_finalize(const std::string & profile_path) override;
     void after_target_compute(StepGraph & sg, int kv_start, int n_tokens) override;
@@ -46,6 +47,14 @@ protected:
 private:
     struct HybridSpecBatchProfile;
     struct HybridSpecGraphCache;
+
+    // Persistent spec-decode graph containers (avoid per-step rebuild).
+    StepGraph moe_draft_sg_;
+    StepGraph moe_proj_sg_;
+    // Persistent logits graph for hybrid_forward_one_token (verify + replay).
+    // Without this, every token in the 8-token verify + 2-token replay builds
+    // and destroys a 64MB StepGraph (~10ms/token of pure overhead).
+    StepGraph moe_hybrid_logits_sg_;
 
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string routing_stats_out_path_;
@@ -111,6 +120,9 @@ private:
     std::unique_ptr<HybridSpecGraphCache> hybrid_spec_graph_cache_;
     bool spec_microbench_done_ = false;
     bool ensure_pipe_state(int kv_start);
+    // Build moe_hybrid_logits_sg_ if not already built. Called from both
+    // hybrid_forward_one_token and do_hybrid_spec_decode (entropy gate).
+    bool ensure_moe_hybrid_logits_sg();
 };
 
 }  // namespace dflash::common
