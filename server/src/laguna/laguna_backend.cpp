@@ -11,6 +11,7 @@
 #include "qwen3/qwen3_kvflash_scorer.h"
 #include "dflash27b.h"
 #include "common/ddtree.h"
+#include "common/domino_head.h"
 #include "common/dflash_feature_ring.h"
 #include "common/dflash_draft_graph.h"
 
@@ -30,6 +31,7 @@
 #include "common/snapshot_backend.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -572,12 +574,36 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
                                 sizeof(float) * local_hidden.size());
 
-        if (!target->project_hidden_to_tokens(local_hidden.data(), q_len, draft_tok)) {
-            std::fprintf(stderr, "[laguna-spec] projection failed\n");
-            step_graph_destroy(draft_sg);
-            return false;
+        bool used_domino = false;
+        if (dw_.domino.enabled && q_len > 1 && !sampled_verify && !args_.ddtree_mode) {
+            static std::atomic<bool> s_domino_logged{false};
+            if (!s_domino_logged.exchange(true)) {
+                std::fprintf(stderr,
+                    "[laguna-spec] Domino GRU head active for greedy chain decode "
+                    "(H=%d E=%d)\n",
+                    dw_.domino.gru_hidden_dim, dw_.domino.emb_dim);
+            }
+            if (domino_correct_greedy_chain(dw_, draft_backend_, *target,
+                                            local_hidden.data(), q_len,
+                                            last_tok, draft_tok)) {
+                used_domino = true;
+            } else {
+                static std::atomic<bool> s_domino_warned{false};
+                if (!s_domino_warned.exchange(true)) {
+                    std::fprintf(stderr,
+                        "[laguna-spec] Domino GRU head failed; falling back to base "
+                        "DFlash projection\n");
+                }
+            }
         }
-        draft_tok[0] = last_tok;
+        if (!used_domino) {
+            if (!target->project_hidden_to_tokens(local_hidden.data(), q_len, draft_tok)) {
+                std::fprintf(stderr, "[laguna-spec] projection failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            draft_tok[0] = last_tok;
+        }
 
         const bool tree_special_inactive =
             !(budget_hook && !budget_hook->close_token_ids.empty());

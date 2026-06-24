@@ -246,6 +246,23 @@ struct DraftLayer {
     bool is_swa = false;  // true for SWA layers (Qwen3.6 pattern)
 };
 
+struct DraftDominoWeights {
+    bool enabled = false;
+    int  gru_hidden_dim = 0;
+    int  emb_dim = 0;
+    int  vocab_size = 0;
+
+    ggml_tensor * start       = nullptr;  // [gru_hidden_dim] f32
+    ggml_tensor * gru_w_ih    = nullptr;  // [n_embd, 3*gru_hidden_dim]
+    ggml_tensor * gru_w_hh    = nullptr;  // [gru_hidden_dim, 3*gru_hidden_dim]
+    ggml_tensor * gru_b_ih    = nullptr;  // [3*gru_hidden_dim] f32
+    ggml_tensor * gru_b_hh    = nullptr;  // [3*gru_hidden_dim] f32
+    ggml_tensor * head_w1     = nullptr;  // [n_embd+gru_hidden_dim, emb_dim]
+    ggml_tensor * head_b1     = nullptr;  // [emb_dim] f32
+    ggml_tensor * head_w2     = nullptr;  // [emb_dim, vocab_size]
+    ggml_tensor * head_b2     = nullptr;  // [vocab_size] f32
+};
+
 struct DraftWeights {
     ggml_context *    ctx = nullptr;
     ggml_backend_t    backend = nullptr;
@@ -279,6 +296,11 @@ struct DraftWeights {
     int n_target_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;  // captured target layers (5)
     std::vector<int> capture_layer_ids;                     // explicit captured target-layer ids (GGUF dflash.target_layer_ids); empty = derive from count
     int mask_token_id   = DFLASH27B_DRAFT_MASK_TOKEN_ID;    // noise mask token
+
+    // Optional Domino causal correction head. When present, greedy chain
+    // speculative decode corrects each draft token with a lightweight GRU
+    // conditioned on the realized prefix before target verification.
+    DraftDominoWeights domino;
 };
 
 bool load_draft_safetensors(const std::string & path,

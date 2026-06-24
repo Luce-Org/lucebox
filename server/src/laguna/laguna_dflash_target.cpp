@@ -523,6 +523,51 @@ bool LagunaDFlashTarget::project_hidden_to_tokens(
     return laguna_project_hidden(backend_, w_, hidden, n_tokens, tokens_out);
 }
 
+bool LagunaDFlashTarget::project_hidden_to_logits(
+        const float * hidden,
+        int n_tokens,
+        std::vector<float> & logits_out) {
+    if (n_tokens <= 0) return false;
+
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * 64 + ggml_graph_overhead() + 1024 * 1024;
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+
+    ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w_.n_embd, n_tokens);
+    ggml_set_input(inp);
+    ggml_tensor * logits = ggml_mul_mat(ctx, w_.output, inp);
+    ggml_set_output(logits);
+    ggml_build_forward_expand(gf, logits);
+
+    static ggml_gallocr_t galloc_logits = nullptr;
+    if (!galloc_logits) {
+        galloc_logits = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+    }
+    if (!ggml_gallocr_alloc_graph(galloc_logits, gf)) {
+        std::fprintf(stderr, "laguna_project_hidden_to_logits: gallocr_alloc_graph failed\n");
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_set(inp, hidden, 0,
+                            sizeof(float) * (size_t)n_tokens * (size_t)w_.n_embd);
+    if (ggml_backend_graph_compute(backend_, gf) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "laguna_project_hidden_to_logits: graph_compute failed\n");
+        ggml_free(ctx);
+        return false;
+    }
+
+    const int vocab = (int)w_.embedder.n_vocab;
+    logits_out.resize((size_t)n_tokens * (size_t)vocab);
+    ggml_backend_tensor_get(logits, logits_out.data(), 0,
+                            sizeof(float) * logits_out.size());
+    ggml_free(ctx);
+    return true;
+}
+
 bool LagunaDFlashTarget::project_hidden_to_topk(
         const float * hidden,
         int n_tokens,

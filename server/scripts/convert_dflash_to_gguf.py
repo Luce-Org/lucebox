@@ -231,6 +231,69 @@ SAFETENSORS_DTYPE_TO_GGUF = {
 }
 
 
+DOMINO_TENSOR_MAP = {
+    "domino_start":               ("dflash.domino.start",         gguf.GGMLQuantizationType.F32),
+    "domino_gru.weight_ih_l0":    ("dflash.domino.gru.weight_ih", gguf.GGMLQuantizationType.F16),
+    "domino_gru.weight_hh_l0":    ("dflash.domino.gru.weight_hh", gguf.GGMLQuantizationType.F16),
+    "domino_gru.bias_ih_l0":      ("dflash.domino.gru.bias_ih",   gguf.GGMLQuantizationType.F32),
+    "domino_gru.bias_hh_l0":      ("dflash.domino.gru.bias_hh",   gguf.GGMLQuantizationType.F32),
+    "domino_head.W1.weight":      ("dflash.domino.head.w1",       gguf.GGMLQuantizationType.F16),
+    "domino_head.W1.bias":        ("dflash.domino.head.b1",       gguf.GGMLQuantizationType.F32),
+    "domino_head.W2.weight":      ("dflash.domino.head.w2",       gguf.GGMLQuantizationType.F16),
+    "domino_head.W2.bias":        ("dflash.domino.head.b2",       gguf.GGMLQuantizationType.F32),
+}
+
+
+def add_domino_aux_heads(writer, arch: str, aux_path: Path | None):
+    if aux_path is None:
+        return
+    if not aux_path.exists():
+        print(f"[warn] Domino aux heads not found: {aux_path}")
+        return
+
+    try:
+        import torch
+    except ImportError as exc:
+        print(f"[error] --aux-heads requires torch: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[info] reading Domino aux heads from {aux_path}")
+    state = torch.load(aux_path, map_location="cpu")
+    if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
+        state = state["state_dict"]
+    if not isinstance(state, dict):
+        print(f"[error] Domino aux heads file is not a tensor dict: {aux_path}", file=sys.stderr)
+        sys.exit(1)
+
+    missing = [k for k in DOMINO_TENSOR_MAP if k not in state]
+    if missing:
+        print(f"[warn] incomplete Domino aux heads; missing {missing}; skipping Domino tensors")
+        return
+
+    w_hh = state["domino_gru.weight_hh_l0"]
+    w1 = state["domino_head.W1.weight"]
+    w2 = state["domino_head.W2.weight"]
+    gru_hidden_dim = int(w_hh.shape[1])
+    emb_dim = int(w1.shape[0])
+    vocab = int(w2.shape[0])
+    writer.add_uint32(f"{arch}.dflash.domino.enabled", 1)
+    writer.add_uint32(f"{arch}.dflash.domino.gru_hidden_dim", gru_hidden_dim)
+    writer.add_uint32(f"{arch}.dflash.domino.emb_dim", emb_dim)
+    writer.add_uint32(f"{arch}.dflash.domino.vocab_size", vocab)
+
+    for st_name, (gguf_name, raw_dtype) in DOMINO_TENSOR_MAP.items():
+        t = state[st_name]
+        if hasattr(t, "detach"):
+            t = t.detach().cpu()
+        arr = t.float().numpy()
+        if raw_dtype == gguf.GGMLQuantizationType.F16:
+            arr = arr.astype("<f2")
+        else:
+            arr = arr.astype("<f4")
+        writer.add_tensor(gguf_name, arr, raw_dtype=raw_dtype)
+        print(f"[tensor] {gguf_name:50s} aux ->{raw_dtype.name:4s} {tuple(arr.shape)}")
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────
@@ -239,6 +302,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("safetensors", type=Path)
     ap.add_argument("out_gguf",     type=Path)
+    ap.add_argument("--aux-heads", type=Path, default=None,
+                    help="optional Domino aux-head .pt file; defaults to dflash_aux_heads.pt next to the safetensors")
+    ap.add_argument("--no-aux-heads", action="store_true",
+                    help="do not auto-embed Domino aux-head tensors")
     args = ap.parse_args()
 
     if not args.safetensors.exists():
@@ -328,6 +395,11 @@ def main():
             raw_dtype = gguf.GGMLQuantizationType.F32
         writer.add_tensor(gguf_name, arr, raw_dtype=raw_dtype)
         print(f"[tensor] {gguf_name:50s} {st_dtype:4s}->{raw_dtype.name:4s} {tuple(shape)}")
+
+    aux_path = None
+    if not args.no_aux_heads:
+        aux_path = args.aux_heads if args.aux_heads is not None else args.safetensors.parent / "dflash_aux_heads.pt"
+    add_domino_aux_heads(writer, ARCH, aux_path)
 
     print(f"[info] writing {args.out_gguf}")
     writer.write_header_to_file()

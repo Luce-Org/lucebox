@@ -57,6 +57,10 @@ public:
                                   int n_tokens,
                                   std::vector<int32_t> & tokens_out) override;
 
+    bool project_hidden_to_logits(const float * hidden,
+                                  int n_tokens,
+                                  std::vector<float> & logits_out) override;
+
     bool project_hidden_to_topk(const float * hidden,
                                 int n_tokens,
                                 int K,

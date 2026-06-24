@@ -115,6 +115,29 @@ int count_swa_layers(const DraftWeights & w) {
     return n_swa;
 }
 
+bool check_shape_1d(const ggml_tensor * t, int64_t ne0, const char * name, char * buf, size_t buf_sz) {
+    if (!t || t->ne[0] != ne0) {
+        std::snprintf(buf, buf_sz, "draft GGUF: Domino tensor %s shape mismatch: got [%lld], expected [%lld]",
+                      name, t ? (long long)t->ne[0] : -1LL, (long long)ne0);
+        return false;
+    }
+    return true;
+}
+
+bool check_shape_2d(const ggml_tensor * t, int64_t ne0, int64_t ne1,
+                    const char * name, char * buf, size_t buf_sz) {
+    if (!t || t->ne[0] != ne0 || t->ne[1] != ne1) {
+        std::snprintf(buf, buf_sz,
+                      "draft GGUF: Domino tensor %s shape mismatch: got [%lld,%lld], expected [%lld,%lld]",
+                      name,
+                      t ? (long long)t->ne[0] : -1LL,
+                      t ? (long long)t->ne[1] : -1LL,
+                      (long long)ne0, (long long)ne1);
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 bool load_draft_gguf(const std::string & path,
@@ -177,6 +200,10 @@ bool load_draft_gguf(const std::string & path,
     const uint32_t head_dim  = read_u32("attention.key_length",    0);
     const uint32_t block_sz  = read_u32("dflash.block_size",       0);
     uint32_t n_tgt_lay       = read_u32("dflash.n_target_layers",  0);
+    const uint32_t domino_meta_enabled = read_u32("dflash.domino.enabled", 0);
+    const uint32_t domino_meta_gru     = read_u32("dflash.domino.gru_hidden_dim", 0);
+    const uint32_t domino_meta_emb     = read_u32("dflash.domino.emb_dim", 0);
+    const uint32_t domino_meta_vocab   = read_u32("dflash.domino.vocab_size", 0);
     // Explicit captured target-layer ids (data-driven). Lets any DFlash drafter
     // load without a hardcoded per-arch set; the array length also backstops
     // n_target_layers when the scalar KV is absent.
@@ -303,6 +330,64 @@ bool load_draft_gguf(const std::string & path,
             gguf_free(gctx);
             return false;
         }
+    }
+
+    out.domino = DraftDominoWeights{};
+    out.domino.start    = g("dflash.domino.start");
+    out.domino.gru_w_ih = g("dflash.domino.gru.weight_ih");
+    out.domino.gru_w_hh = g("dflash.domino.gru.weight_hh");
+    out.domino.gru_b_ih = g("dflash.domino.gru.bias_ih");
+    out.domino.gru_b_hh = g("dflash.domino.gru.bias_hh");
+    out.domino.head_w1  = g("dflash.domino.head.w1");
+    out.domino.head_b1  = g("dflash.domino.head.b1");
+    out.domino.head_w2  = g("dflash.domino.head.w2");
+    out.domino.head_b2  = g("dflash.domino.head.b2");
+
+    const bool domino_any =
+        out.domino.start || out.domino.gru_w_ih || out.domino.gru_w_hh ||
+        out.domino.gru_b_ih || out.domino.gru_b_hh || out.domino.head_w1 ||
+        out.domino.head_b1 || out.domino.head_w2 || out.domino.head_b2 ||
+        domino_meta_enabled != 0;
+    if (domino_any) {
+        const bool domino_all =
+            out.domino.start && out.domino.gru_w_ih && out.domino.gru_w_hh &&
+            out.domino.gru_b_ih && out.domino.gru_b_hh && out.domino.head_w1 &&
+            out.domino.head_b1 && out.domino.head_w2 && out.domino.head_b2;
+        if (!domino_all) {
+            set_last_error("draft GGUF: incomplete Domino aux-head tensors");
+            gguf_free(gctx);
+            return false;
+        }
+
+        out.domino.gru_hidden_dim =
+            domino_meta_gru != 0 ? (int)domino_meta_gru : (int)out.domino.gru_w_hh->ne[0];
+        out.domino.emb_dim =
+            domino_meta_emb != 0 ? (int)domino_meta_emb : (int)out.domino.head_w1->ne[1];
+        out.domino.vocab_size =
+            domino_meta_vocab != 0 ? (int)domino_meta_vocab : (int)out.domino.head_w2->ne[1];
+
+        const int64_t H = out.domino.gru_hidden_dim;
+        const int64_t E = out.domino.emb_dim;
+        const int64_t V = out.domino.vocab_size;
+        char shape_err[320];
+        if (!check_shape_1d(out.domino.start, H, "start", shape_err, sizeof(shape_err)) ||
+            !check_shape_2d(out.domino.gru_w_ih, out.n_embd, 3 * H, "gru.weight_ih", shape_err, sizeof(shape_err)) ||
+            !check_shape_2d(out.domino.gru_w_hh, H, 3 * H, "gru.weight_hh", shape_err, sizeof(shape_err)) ||
+            !check_shape_1d(out.domino.gru_b_ih, 3 * H, "gru.bias_ih", shape_err, sizeof(shape_err)) ||
+            !check_shape_1d(out.domino.gru_b_hh, 3 * H, "gru.bias_hh", shape_err, sizeof(shape_err)) ||
+            !check_shape_2d(out.domino.head_w1, out.n_embd + H, E, "head.w1", shape_err, sizeof(shape_err)) ||
+            !check_shape_1d(out.domino.head_b1, E, "head.b1", shape_err, sizeof(shape_err)) ||
+            !check_shape_2d(out.domino.head_w2, E, V, "head.w2", shape_err, sizeof(shape_err)) ||
+            !check_shape_1d(out.domino.head_b2, V, "head.b2", shape_err, sizeof(shape_err))) {
+            set_last_error(shape_err);
+            gguf_free(gctx);
+            return false;
+        }
+
+        out.domino.enabled = true;
+        std::fprintf(stderr, "[draft GGUF] Domino GRU head enabled: H=%d E=%d vocab=%d\n",
+                     out.domino.gru_hidden_dim, out.domino.emb_dim,
+                     out.domino.vocab_size);
     }
 
     // GGUF Qwen3.6 drafters carry SWA metadata emitted by the converter:
