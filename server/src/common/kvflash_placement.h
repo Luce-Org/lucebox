@@ -3,7 +3,7 @@
 // Any MoE / weight-offload backend that places experts against a VRAM budget
 // must decide how much KV to reserve.  Reserving for `max_ctx` forces experts
 // cold at high max_ctx even when KVFlash bounds the *resident* KV to a fixed
-// pool.  This helper centralises the rule so every backend (qwen35moe today,
+// pool.  This helper centralises the rule so every backend (qwen35moe, laguna,
 // DeepSeek-V4 / future MoE next) inherits the "pool bounds the expert-placement
 // cliff" win without re-deriving the byte math.
 #pragma once

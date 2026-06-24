@@ -80,6 +80,18 @@ int main() {
         expect(d.kv_ctx == 32768,  "C5: keeps full ctx");
     }
 
-    std::printf("PASS: kvflash placement decision (5 cases)\n");
+    // Case 6 — laguna/poolside-style no-draft placement: same pool rule, no
+    // drafter reserve. This keeps the shared helper covered for both current
+    // backends that use it.
+    {
+        auto d = kvflash_placement_decision(kv_per_tok, 131072, /*pool=*/16384,
+                                            gpu, core, experts, warm, safety,
+                                            /*draft_bytes=*/0);
+        expect(!d.all_hot_full_kv, "C6: full KV still forces experts cold");
+        expect(d.kv_ctx == 16384,  "C6: laguna reserves POOL ctx");
+        expect(d.pool_reduced,     "C6: laguna pool reduction engaged");
+    }
+
+    std::printf("PASS: kvflash placement decision (6 cases)\n");
     return 0;
 }

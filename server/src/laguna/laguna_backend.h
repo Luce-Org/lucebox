@@ -142,11 +142,19 @@ private:
     int          kvflash_tau_    = 64;
     bool         kvflash_drafter_failed_ = false;
     bool kvflash_active() const { return kvflash_tokens_ > 0; }
+    // True iff hybrid placement showed all experts fit hot with the FULL
+    // max_ctx KV reservation. In that case KVFlash is redundant and can be
+    // disabled before cache creation.
+    bool placement_all_hot_full_kv_ = false;
     // Drafter rescore + repage every effective-tau generated tokens
     // (lazy-loads the drafter + cross-tokenizer scorer on first need).
     void kvflash_maybe_reselect(const std::vector<int32_t> & history, int generated);
     // Pager protections (SWA tail) shared by the floor and attach.
     KvFlashConfig kvflash_config() const;
+    // Shared pool sizing inputs for placement and runtime allocation.
+    void kvflash_resolve_drafter();
+    bool kvflash_scorer_expected() const { return !kvflash_drafter_path_.empty(); }
+    KvFlashAutoBudget make_kvflash_budget(int64_t gpu_free) const;
     // Read DFLASH_KVFLASH and round/clamp; call before cache creation.
     void kvflash_read_config();
     // Attach the pager to the freshly created cache (init / unpark).
