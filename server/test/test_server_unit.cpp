@@ -2592,15 +2592,10 @@ static void test_disk_cache_cold_prefix_finds_boundary() {
     cfg.min_tokens = 512;
     DiskPrefixCache cache(cfg, backend);
     cache.init();
-    // Manually mark layout as known (hack for testing without real snapshots).
-    // Since cold_prefix_boundary checks layout_known_, and we can't easily
-    // set it without a real snapshot, the function will return 0.
-    // This tests that short prompts / bad boundaries correctly return 0.
     std::vector<int32_t> prompt(10000, 1);
     std::vector<int> boundaries = {1000, 2000, 3000, 4000, 6000, 8000};
-    // Without layout_known_, returns 0.
     int result = cache.cold_prefix_boundary(prompt, boundaries);
-    TEST_ASSERT(result == 0);  // layout not known yet
+    TEST_ASSERT(result == 4000);  // best eligible boundary, no entry cached yet
 
     rm_rf(dir);
 }
