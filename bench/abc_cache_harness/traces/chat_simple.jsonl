@@ -1,0 +1,5 @@
+{"model": "luce-dflash", "messages": [{"role": "user", "content": "Explain what a mutex is in two sentences."}], "max_tokens": 256, "temperature": 0, "stream": false}
+{"model": "luce-dflash", "messages": [{"role": "user", "content": "What is the difference between a process and a thread? Keep it to two sentences."}], "max_tokens": 256, "temperature": 0, "stream": false}
+{"model": "luce-dflash", "messages": [{"role": "user", "content": "Describe what a hash table is and why it has O(1) average-case lookup."}], "max_tokens": 256, "temperature": 0, "stream": false}
+{"model": "luce-dflash", "messages": [{"role": "user", "content": "What does GPU memory bandwidth mean and why does it matter for LLM inference?"}], "max_tokens": 256, "temperature": 0, "stream": false}
+{"model": "luce-dflash", "messages": [{"role": "user", "content": "Explain speculative decoding in one short paragraph."}], "max_tokens": 256, "temperature": 0, "stream": false}

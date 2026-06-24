@@ -6,15 +6,19 @@ Usage:
     python3 replay_harness.py --arm A_baseline --trace traces/goldgate_fix.jsonl --smoke
     python3 replay_harness.py --arm C_always   --trace traces/goldgate_fix.jsonl
     python3 replay_harness.py --arm C_threshold --trace traces/goldgate_fix.jsonl
+    python3 replay_harness.py --selftest
 
 Smoke gate (--smoke): runs first 3 turns only, N=1.
 Full run: all turns, N=3.
 
 Arms:
-  A_baseline   : dFlash decode + prefix cache, NO pFlash, NO stochastic
-  A_stochastic : dFlash decode + prefix cache + DFLASH_STOCHASTIC, NO pFlash
-  C_always     : pFlash always + dFlash decode  (ATTN_PRIMARY, stochastic)
-  C_threshold  : pFlash auto/32K threshold + dFlash decode
+  A_baseline      : dFlash decode + prefix cache, NO pFlash, NO stochastic
+  A_stochastic    : dFlash decode + prefix cache + DFLASH_STOCHASTIC, NO pFlash
+  C_always        : pFlash always + dFlash decode  (ATTN_PRIMARY, stochastic)
+  C_threshold     : pFlash auto/32K threshold + dFlash decode
+  lucebox         : dFlash 35B-A3B Q4_K_M + dFlash drafter + spec-gate
+  llama_cpp_mtp   : llama.cpp b9781 + MTP bundled GGUF + --spec-type draft-mtp
+  llama_cpp_ar    : llama.cpp b9781 + autoregressive (no speculation)
 
 Port: 19099 (NEVER 18099)
 Max-ctx: 65536
@@ -23,6 +27,7 @@ Max-ctx: 65536
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -52,10 +57,19 @@ TMPL = Path("/home/peppi/models/qwen3-coder-chat-template.jinja")
 
 HOST = "127.0.0.1"
 PORT = 19099
-MAX_CTX = 65536
+MAX_CTX = 40960
 TEMP = 0.7
 
 FORBIDDEN_PORT = 18099  # user's live server — never touch
+
+# 3-way H2H model paths
+TGT_35B   = Path("/home/peppi/models/qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf")
+DD_35B    = Path("/home/peppi/models/qwen3.6-35b-a3b-dflash-new/qwen3.6-35b-a3b-dflash-new-bf16-reconv.gguf")
+MTP_GGUF  = Path("/home/peppi/models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf")
+LLAMA_BIN     = Path("/home/peppi/llama.cpp/build-cuda/bin/llama-server")
+LLAMA_CUDA_LIB = Path("/home/peppi/llama.cpp/build-cuda/bin")
+
+GPU_LOCK_FILE = "/tmp/lucebox_gpu.lock"
 
 # ---------------------------------------------------------------------------
 # Arm definitions
@@ -399,6 +413,167 @@ ARMS: dict[str, dict] = {
             "DFLASH_KVFLASH_POLICY": "qk",
         },
     },
+
+    # ── Context-size bench arms (ring-cap=65536, gated dFlash, temp=0) ────
+    # BENCH_35B: 35B-A3B Q3_K_XL all-hot + Modal drafter.
+    #   Past-best config with DFLASH_FEAT_RING_CAP=65536 to avoid ring-wrap at 34K.
+    #   DFLASH_SPEC_GATE=1 explicit (it's the default-on; belt-and-suspenders).
+    #   fa_window=0 is the server default (full attention); no --fa-window needed.
+    #   No --spark/--kvflash: all-hot MoE.
+    "BENCH_35B": {
+        "description": "35B-A3B Q3_K_XL all-hot + Modal BF16 drafter; ring=65536 gated spec-decode temp=0",
+        "model_target":  Path("/home/peppi/models/qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf"),
+        "model_draft":   Path("/home/peppi/models/qwen3.6-35b-a3b-dflash-new/qwen3.6-35b-a3b-dflash-new-bf16-reconv.gguf"),
+        "temperature": 0.0,
+        "kv_cache_types": ("f16", "f16"),
+        "extra_args": [
+            "--draft", str(Path("/home/peppi/models/qwen3.6-35b-a3b-dflash-new/qwen3.6-35b-a3b-dflash-new-bf16-reconv.gguf")),
+            "--draft-swa", "2048",
+        ],
+        "env": {
+            "DFLASH_FEAT_RING_CAP": "65536",
+            "DFLASH_SPEC_GATE": "1",
+            "DFLASH_DRAFT_CTX_MAX": "2048",
+        },
+    },
+
+    # BENCH_27B: 27B dense Q4_K_M + Lucebox BF16 drafter.
+    #   ring=16384: 27B uses fc_in=25600; ring=65536 would allocate 6.7 GB and OOM.
+    #   16384*25600*4 = 1.7 GB (same cap as A_baseline default, proven-working config).
+    #   gate=1, temp=0.
+    "BENCH_27B": {
+        "description": "27B Q4_K_M dense + Lucebox drafter; q4_0 KV, cap=2048 cliff fix, ring=4096, gated temp=0",
+        "model_target":  Path("/home/peppi/models/qwen3.6-27b-q4km/Qwen3.6-27B-Q4_K_M.gguf"),
+        "model_draft":   Path("/home/peppi/models/qwen3.6-27b-dflash/dflash-draft-3.6-bf16-reconverted.gguf"),
+        "temperature": 0.0,
+        "kv_cache_types": ("q4_0", "q4_0"),
+        "extra_args": [
+            "--draft", str(Path("/home/peppi/models/qwen3.6-27b-dflash/dflash-draft-3.6-bf16-reconverted.gguf")),
+            "--draft-swa", "2048",
+        ],
+        "env": {
+            # draft_ctx capped at 2048 (cliff fix) -> ring only needs ~4096, not max_ctx.
+            # 4096*25600*2(bf16) = 0.2 GB (was 16384 -> 1.7 GB); dodges the 27B ring-OOM.
+            "DFLASH_FEAT_RING_CAP": "4096",
+            "DFLASH_SPEC_GATE": "1",
+            "DFLASH_DRAFT_CTX_MAX": "2048",
+        },
+    },
+
+    # ── 3-way H2H arms ──────────────────────────────────────────────────────
+    # lucebox: dFlash server + 35B-A3B Q4_K_M (trunk-only) target + dFlash drafter.
+    #   Validated 192117 config: restore-consume snapshot win + ddtree speculation.
+    #   GGML_CUDA_NO_VMM in env is idempotent with the dflash launch-path default.
+    "lucebox": {
+        "description": "dFlash 35B-A3B Q4_K_M + dFlash drafter; spec-gate, kvflash=8192, ring=131072, ddtree",
+        "server": "dflash",
+        "model_target": TGT_35B,
+        "model_draft":  DD_35B,
+        "kv_cache_types": ("q4_0", "q4_0"),
+        "extra_args": [
+            "--draft", str(DD_35B),
+            "--draft-swa", "2048",
+            "--kvflash", "8192",
+            "--ddtree", "--ddtree-budget", "16",
+        ],
+        "env": {
+            "GGML_CUDA_NO_VMM": "1",
+            "KVFLASH_RESTORE_CONSUME": "1",
+            "DFLASH_SPEC_GATE": "1",
+            "DFLASH_FEAT_RING_CAP": "131072",
+            "DFLASH_DRAFT_CTX_MAX": "2048",
+        },
+    },
+
+    # lucebox_ddtree22: identical to lucebox EXCEPT --ddtree-budget is 22 (sweep).
+    #   Controlled ddtree-budget sweep: 16 vs 22, everything else identical.
+    "lucebox_ddtree22": {
+        "description": "dFlash 35B-A3B Q4_K_M + dFlash drafter; spec-gate, kvflash=8192, ring=131072, ddtree budget=22",
+        "server": "dflash",
+        "model_target": TGT_35B,
+        "model_draft":  DD_35B,
+        "kv_cache_types": ("q4_0", "q4_0"),
+        "extra_args": [
+            "--draft", str(DD_35B),
+            "--draft-swa", "2048",
+            "--kvflash", "8192",
+            "--ddtree", "--ddtree-budget", "22",
+        ],
+        "env": {
+            "GGML_CUDA_NO_VMM": "1",
+            "KVFLASH_RESTORE_CONSUME": "1",
+            "DFLASH_SPEC_GATE": "1",
+            "DFLASH_FEAT_RING_CAP": "131072",
+            "DFLASH_DRAFT_CTX_MAX": "2048",
+        },
+    },
+
+    # lucebox_no_ddtree: identical to lucebox EXCEPT ddtree is removed.
+    #   Controlled ddtree A/B: same target, drafter, kvflash=8192,
+    #   KVFLASH_RESTORE_CONSUME=1, DFLASH_SPEC_GATE=1, ring=131072, q4_0 KV.
+    #   Differs ONLY by absence of --ddtree --ddtree-budget 16.
+    "lucebox_no_ddtree": {
+        "description": "dFlash 35B-A3B Q4_K_M + dFlash drafter; spec-gate, kvflash=8192, ring=131072, NO ddtree",
+        "server": "dflash",
+        "model_target": TGT_35B,
+        "model_draft":  DD_35B,
+        "kv_cache_types": ("q4_0", "q4_0"),
+        "extra_args": [
+            "--draft", str(DD_35B),
+            "--draft-swa", "2048",
+            "--kvflash", "8192",
+        ],
+        "env": {
+            "GGML_CUDA_NO_VMM": "1",
+            "KVFLASH_RESTORE_CONSUME": "1",
+            "DFLASH_SPEC_GATE": "1",
+            "DFLASH_FEAT_RING_CAP": "131072",
+            "DFLASH_DRAFT_CTX_MAX": "2048",
+        },
+    },
+
+    # llama_cpp_mtp: llama.cpp b9781 + MTP bundled GGUF (NextN head embedded).
+    #   Speculation via --spec-type draft-mtp, draft-n-max 2.
+    "llama_cpp_mtp": {
+        "description": "llama.cpp b9781 MTP spec-decode (draft-mtp, n-max=2); q4_0 KV",
+        "server": "llama_cpp",
+        "binary": str(LLAMA_BIN),
+        "model":  str(MTP_GGUF),
+        "kv_cache_types": ("q4_0", "q4_0"),
+        "extra_args": [
+            "--spec-type", "draft-mtp",
+            "--spec-draft-n-max", "2",
+        ],
+        "env": {},
+    },
+
+    # llama_cpp_ar: llama.cpp b9781 plain autoregressive baseline (no speculation).
+    #   MTP GGUF used so weight match is exact vs llama_cpp_mtp; NextN head unused.
+    "llama_cpp_ar": {
+        "description": "llama.cpp b9781 autoregressive baseline (no speculation); q4_0 KV",
+        "server": "llama_cpp",
+        "binary": str(LLAMA_BIN),
+        "model":  str(MTP_GGUF),
+        "kv_cache_types": ("q4_0", "q4_0"),
+        "extra_args": [],
+        "env": {},
+    },
+
+    # lucebox_ar: dflash_server pure autoregressive baseline.
+    #   Same model+KV as the lucebox family (35B-A3B Q4_K_M, q4_0 KV) but with
+    #   NO drafter, NO kvflash, NO ddtree, NO spec env vars.
+    #   env={} — the launcher unconditionally injects GGML_CUDA_NO_VMM=1; all
+    #   DFLASH_SPEC_GATE / FEAT_RING_CAP / DRAFT_CTX_MAX / RESTORE_CONSUME dropped.
+    #   Isolates dflash_server's raw AR decode speed on the same model+KV+ctx
+    #   so we can compare directly to llama_cpp_ar (139.8 tok/s on stock b9781).
+    "lucebox_ar": {
+        "description": "dflash_server 35B-A3B Q4_K_M pure AR (no draft/spec/kvflash); q4_0 KV",
+        "server": "dflash",
+        "model_target": TGT_35B,
+        "kv_cache_types": ("q4_0", "q4_0"),
+        "extra_args": [],
+        "env": {},
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -441,6 +616,12 @@ PFLASH_KEPT_RE = re.compile(
 # [pflash] query survival: A/B (P%)
 SURVIVAL_RE = re.compile(
     r'\[pflash\] query survival: (\d+)/(\d+) \(([\d.]+)%\)'
+)
+
+# llama.cpp MTP per-slot acceptance line (stderr):
+#   I slot print_timing: id N | task N | draft acceptance = 0.91176 (   31 accepted /    34 generated), ...
+LLAMA_MTP_RE = re.compile(
+    r'slot print_timing:.*?draft acceptance\s*=\s*([\d.]+)\s*\(\s*(\d+)\s*accepted\s*/\s*(\d+)\s*generated\)'
 )
 
 
@@ -495,8 +676,128 @@ def wait_for_server(port: int, timeout: int = 360) -> bool:
     return False
 
 
-def launch_server(arm_name: str, arm_cfg: dict, log_path: Path) -> tuple:
-    """Start server for given arm. Returns (proc, log_file_handle)."""
+def build_llama_cpp_cmd(arm_cfg: dict, port: int, max_ctx: int) -> list[str]:
+    """Build the CLI for a llama_cpp arm. Pure function — testable without GPU."""
+    binary = arm_cfg.get("binary", str(LLAMA_BIN))
+    model  = arm_cfg.get("model",  str(MTP_GGUF))
+    ctk, ctv = arm_cfg.get("kv_cache_types", ("q4_0", "q4_0"))
+    return [
+        binary,
+        "-m", model,
+        "--host", HOST,
+        "--port", str(port),
+        "-c", str(max_ctx),
+        "-ngl", "999",
+        "--cache-type-k", ctk,
+        "--cache-type-v", ctv,
+        "--chat-template-file", str(TMPL),
+        "--jinja",
+    ] + arm_cfg.get("extra_args", [])
+
+
+def parse_llama_cpp_timings(timings: dict) -> dict:
+    """Extract prefill/decode metrics from llama.cpp timings dict. Pure function."""
+    m: dict = {}
+    pn  = timings.get("prompt_n", 0)
+    pms = timings.get("prompt_ms", 0.0)
+    dn  = timings.get("predicted_n", 0)
+    dms = timings.get("predicted_ms", 0.0)
+    if pms > 0:
+        m["prefill_s"]   = pms / 1000.0
+        m["prompt_tokens"] = pn
+        if pn > 0:
+            m["prefill_tps"] = round(pn / (pms / 1000.0), 1)
+    if dms > 0:
+        m["decode_s"]   = dms / 1000.0
+        m["out_tokens"] = dn
+        if dn > 0:
+            m["decode_tps"] = round(dn / (dms / 1000.0), 1)
+    return m
+
+
+def parse_llama_cpp_accept(
+    log_text: str,
+    mtp_offset: int,
+    extra_args: list,
+) -> tuple[dict, int]:
+    """Parse llama.cpp MTP draft-acceptance from server stderr log.
+
+    Returns (metrics_dict, new_mtp_offset).
+
+    If --spec-type draft-mtp is present in extra_args and the log contains a
+    matching line, returns accept_rate (0-100 float), spec_engaged=True, and
+    decode_mode='spec'.  If spec-type args present but no log line yet found,
+    returns spec_engaged=True with accept_rate=None (not 0.0 — avoids false neg).
+    If spec-type args absent, returns {} (AR arm, no speculation).
+    """
+    has_mtp = "--spec-type" in extra_args and "draft-mtp" in extra_args
+    if not has_mtp:
+        return {}, mtp_offset
+
+    all_matches = LLAMA_MTP_RE.findall(log_text)
+    new_matches = all_matches[mtp_offset:]
+
+    if not new_matches:
+        # MTP arm but log line not yet found — mark as spec_engaged but rate unknown
+        return {"spec_engaged": True, "decode_mode": "spec"}, mtp_offset
+
+    m_frac, m_acc, m_gen = new_matches[0]
+    accept_rate = round(float(m_frac) * 100.0, 2)
+    accepted    = int(m_acc)
+    generated   = int(m_gen)
+    return {
+        "spec_engaged": True,
+        "decode_mode": "spec",
+        "accept_rate": accept_rate,
+        "draft_accepted": accepted,
+        "draft_generated": generated,
+    }, mtp_offset + 1
+
+
+_gpu_lock_fd: Optional[int] = None
+
+
+def acquire_gpu_lock() -> None:
+    global _gpu_lock_fd
+    _gpu_lock_fd = open(GPU_LOCK_FILE, "w")
+    fcntl.flock(_gpu_lock_fd, fcntl.LOCK_EX)
+    print("[gpu-lock] acquired GPU lock")
+
+
+def release_gpu_lock() -> None:
+    global _gpu_lock_fd
+    if _gpu_lock_fd is not None:
+        fcntl.flock(_gpu_lock_fd, fcntl.LOCK_UN)
+        _gpu_lock_fd.close()
+        _gpu_lock_fd = None
+        print("[gpu-lock] released GPU lock")
+
+
+def launch_server(arm_name: str, arm_cfg: dict, log_path: Path, max_ctx: int = MAX_CTX) -> tuple:
+    """Start server for given arm. Returns (proc, log_file_handle).
+
+    Branches on arm_cfg.get('server', 'dflash'):
+      'dflash'    — existing dflash_server path (unchanged).
+      'llama_cpp' — llama.cpp llama-server, OpenAI-compat API.
+    """
+    server_type = arm_cfg.get("server", "dflash")
+
+    if server_type == "llama_cpp":
+        cmd = build_llama_cpp_cmd(arm_cfg, PORT, max_ctx)
+        env = dict(os.environ)
+        # Inject CUDA .so directory so the binary finds libggml-cuda.so etc.
+        cuda_lib_dir = str(LLAMA_CUDA_LIB)
+        existing_ld = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = f"{cuda_lib_dir}:{existing_ld}" if existing_ld else cuda_lib_dir
+        # No DFLASH_* / GGML_CUDA_NO_VMM for llama_cpp arms
+        print(f"[server] Launching {arm_name} (llama_cpp): {' '.join(cmd)}")
+        print(f"[server] LD_LIBRARY_PATH={env['LD_LIBRARY_PATH']}")
+        log_f = log_path.open("w")
+        proc = subprocess.Popen(cmd, env=env, stdout=log_f, stderr=log_f)
+        print(f"[server] PID={proc.pid}  log={log_path}")
+        return proc, log_f
+
+    # --- dflash path (unchanged) ---
     env = dict(os.environ)
     env["GGML_CUDA_NO_VMM"] = "1"
     # DFlash decode optimizations (from dFlash drafter integration session):
@@ -506,13 +807,16 @@ def launch_server(arm_name: str, arm_cfg: dict, log_path: Path) -> tuple:
     env["DFLASH_FEAT_RING_CAP"] = "16384"
     env.update(arm_cfg["env"])
 
+    # Per-arm model override (used by BENCH_35B / BENCH_27B / lucebox arms)
+    target_model = arm_cfg.get("model_target", TGT)
+
     ctk, ctv = arm_cfg.get("kv_cache_types", ("tq3_0", "tq3_0"))
     cmd = [
         str(SERVER_BIN),
-        str(TGT),
+        str(target_model),
         "--host", HOST,
         "--port", str(PORT),
-        "--max-ctx", str(MAX_CTX),
+        "--max-ctx", str(max_ctx),
         "--cache-type-k", ctk,
         "--cache-type-v", ctv,
         "--chat-template-file", str(TMPL),
@@ -679,8 +983,77 @@ def check_tool_call(body: dict) -> tuple[bool, str]:
 # Send one request
 # ---------------------------------------------------------------------------
 
-def send_request(req_body: dict, port: int) -> tuple[dict, float, Optional[str]]:
-    """POST to /v1/messages. Returns (response_body, wall_s, error_str)."""
+def _anthropic_to_openai_tools(tools: list) -> list:
+    """Best-effort remap Anthropic tool defs to OpenAI function format."""
+    out = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        fn: dict = {
+            "name": t.get("name", ""),
+            "description": t.get("description", ""),
+            "parameters": t.get("input_schema", {}),
+        }
+        out.append({"type": "function", "function": fn})
+    return out
+
+
+def send_request(
+    req_body: dict,
+    port: int,
+    server_type: str = "dflash",
+) -> tuple[dict, float, Optional[str]]:
+    """POST request to server. Returns (response_body, wall_s, error_str).
+
+    server_type='dflash'    -> POST /v1/messages  (Anthropic format)
+    server_type='llama_cpp' -> POST /v1/chat/completions  (OpenAI format)
+    """
+    if server_type == "llama_cpp":
+        # Convert Anthropic trace format -> OpenAI messages format
+        sys_prompt = req_body.get("system")
+        messages: list = []
+        if sys_prompt:
+            messages.append({"role": "system", "content": sys_prompt})
+        for msg in req_body.get("messages", []):
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                # flatten content blocks to text (tool_use blocks skipped for S1)
+                text_parts = [
+                    b.get("text", "") for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                ]
+                content = " ".join(text_parts)
+            messages.append({"role": msg["role"], "content": content})
+
+        body_out: dict = {
+            "messages": messages,
+            "temperature": req_body.get("temperature", 0),
+            "max_tokens": req_body.get("max_tokens", 1024),
+            "stream": False,
+        }
+        raw_tools = req_body.get("tools")
+        if raw_tools:
+            try:
+                body_out["tools"] = _anthropic_to_openai_tools(raw_tools)
+            except Exception:
+                pass  # best-effort; S1 trace has no tools
+
+        url = f"http://{HOST}:{port}/v1/chat/completions"
+        payload = json.dumps(body_out, ensure_ascii=False).encode("utf-8")
+        http_req = urllib.request.Request(
+            url, data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        t0 = time.time()
+        try:
+            with urllib.request.urlopen(http_req, timeout=900) as r:
+                resp = json.loads(r.read())
+            return resp, time.time() - t0, None
+        except Exception as ex:
+            return {}, time.time() - t0, str(ex)
+
+    # --- dflash / Anthropic path (unchanged) ---
     payload = json.dumps(req_body, ensure_ascii=False).encode("utf-8")
     http_req = urllib.request.Request(
         f"http://{HOST}:{port}/v1/messages",
@@ -708,6 +1081,7 @@ def run_trace_repeat(
     arm_name: str,
     smoke: bool = False,
     repeat_idx: int = 0,
+    arm_cfg: Optional[dict] = None,
 ) -> list[dict]:
     """Run all turns in the trace; parse server log per turn.
 
@@ -715,12 +1089,18 @@ def run_trace_repeat(
     """
     turns_to_run = turns[:3] if smoke else turns
 
-    # Wait for log file to exist and server to be settled
-    deadline = time.time() + 300
-    while not log_path.exists() and time.time() < deadline:
-        time.sleep(1)
+    arm_temp    = arm_cfg.get("temperature") if arm_cfg else None
+    server_type = arm_cfg.get("server", "dflash") if arm_cfg else "dflash"
+    is_dflash   = server_type == "dflash"
+
+    # Wait for log file to exist and server to be settled (dflash only)
+    if is_dflash:
+        deadline = time.time() + 300
+        while not log_path.exists() and time.time() < deadline:
+            time.sleep(1)
 
     cache_off = done_off = spec_off = ar_off = pflash_off = survival_off = 0
+    llama_mtp_off = 0
 
     results = []
     for turn_idx, req_body in enumerate(turns_to_run):
@@ -728,9 +1108,11 @@ def run_trace_repeat(
         print(f"  [{arm_name} repeat={repeat_idx+1}] turn {turn_num}/{len(turns_to_run)} "
               f"(~{len(json.dumps(req_body))//3:,} est_tok) ...", end=" ", flush=True)
 
-        t_send = time.time()
-        resp_body, wall_s, err = send_request(req_body, port)
-        t_done = time.time()
+        if arm_temp is not None:
+            req_body = dict(req_body)
+            req_body["temperature"] = arm_temp
+
+        resp_body, wall_s, err = send_request(req_body, port, server_type=server_type)
 
         if err:
             print(f"ERROR: {err}")
@@ -745,16 +1127,33 @@ def run_trace_repeat(
         # Give the server a moment to flush the log lines
         time.sleep(0.3)
 
-        # Parse log
-        try:
-            log_text = log_path.read_text(errors="replace")
-        except Exception:
-            log_text = ""
+        if is_dflash:
+            try:
+                log_text = log_path.read_text(errors="replace")
+            except Exception:
+                log_text = ""
 
-        metrics, cache_off, done_off, spec_off, ar_off, pflash_off, survival_off = \
-            parse_log_for_request(
-                log_text, cache_off, done_off, spec_off, ar_off, pflash_off, survival_off
-            )
+            metrics, cache_off, done_off, spec_off, ar_off, pflash_off, survival_off = \
+                parse_log_for_request(
+                    log_text, cache_off, done_off, spec_off, ar_off, pflash_off, survival_off
+                )
+        else:
+            # llama_cpp: parse timings from response body
+            timings = resp_body.get("timings")
+            if timings:
+                metrics = parse_llama_cpp_timings(timings)
+            else:
+                metrics = {}
+                print("[warn] no timings in llama_cpp response", end=" ")
+
+            # Parse MTP draft-acceptance from server log (guarded: llama_cpp arms only)
+            extra_args = arm_cfg.get("extra_args", []) if arm_cfg else []
+            try:
+                log_text = log_path.read_text(errors="replace")
+            except Exception:
+                log_text = ""
+            accept_m, llama_mtp_off = parse_llama_cpp_accept(log_text, llama_mtp_off, extra_args)
+            metrics.update(accept_m)
 
         # Check tool_call validity
         tool_valid, tool_detail = check_tool_call(resp_body)
@@ -1104,9 +1503,134 @@ def run_trace_restart_per_turn(
 # Main
 # ---------------------------------------------------------------------------
 
+def run_selftest() -> None:
+    """No-GPU self-check. Verifies pure functions and trace file correctness."""
+    print("=== SELFTEST ===")
+    failures = []
+
+    # (a) build_llama_cpp_cmd for llama_cpp_mtp
+    arm = ARMS["llama_cpp_mtp"]
+    cmd = build_llama_cpp_cmd(arm, PORT, MAX_CTX)
+    assert "--spec-type" in cmd and "draft-mtp" in cmd, "missing --spec-type draft-mtp"
+    assert "-m" in cmd, "missing -m"
+    m_idx = cmd.index("-m")
+    assert str(MTP_GGUF) in cmd[m_idx + 1], f"wrong model: {cmd[m_idx+1]}"
+    assert "--cache-type-k" in cmd, "missing --cache-type-k"
+    k_idx = cmd.index("--cache-type-k")
+    assert cmd[k_idx + 1] == "q4_0", f"expected q4_0 cache-type-k, got {cmd[k_idx+1]}"
+    print(f"  (a) build_llama_cpp_cmd: PASS  cmd={cmd}")
+
+    # (b) parse_llama_cpp_timings
+    sample = {"prompt_n": 100, "prompt_ms": 500.0, "predicted_n": 40, "predicted_ms": 800.0}
+    t = parse_llama_cpp_timings(sample)
+    assert t["prefill_tps"] == 200.0, f"prefill_tps expected 200.0 got {t['prefill_tps']}"
+    assert t["decode_tps"]  ==  50.0, f"decode_tps expected 50.0 got {t['decode_tps']}"
+    print(f"  (b) parse_llama_cpp_timings: PASS  prefill_tps={t['prefill_tps']} decode_tps={t['decode_tps']}")
+
+    # (b2) parse_llama_cpp_accept — MTP log line extraction
+    mtp_log_line = (
+        "0.38.538.542 I slot print_timing: id  3 | task 0 | "
+        "draft acceptance = 0.91176 (   31 accepted /    34 generated), "
+        "mean acceptance length =  2.82, acceptance rate per position = (1.000, 0.824)"
+    )
+    mtp_args = ["--spec-type", "draft-mtp", "--spec-draft-n-max", "2"]
+    am, new_off = parse_llama_cpp_accept(mtp_log_line, 0, mtp_args)
+    assert am.get("spec_engaged") is True, f"expected spec_engaged=True, got {am}"
+    assert am.get("decode_mode") == "spec", f"expected decode_mode=spec, got {am}"
+    assert abs(am.get("accept_rate", 0) - 91.18) < 0.1, f"accept_rate wrong: {am}"
+    assert am.get("draft_accepted") == 31, f"draft_accepted wrong: {am}"
+    assert am.get("draft_generated") == 34, f"draft_generated wrong: {am}"
+    assert new_off == 1, f"offset should advance to 1, got {new_off}"
+    # AR arm (no --spec-type): should return empty dict
+    ar_m, ar_off = parse_llama_cpp_accept("some log", 0, [])
+    assert ar_m == {}, f"AR arm should return empty dict, got {ar_m}"
+    # MTP arm with no log line yet: spec_engaged=True, accept_rate absent
+    no_log_m, no_log_off = parse_llama_cpp_accept("no matching line here", 0, mtp_args)
+    assert no_log_m.get("spec_engaged") is True, f"expected spec_engaged=True even without log line"
+    assert "accept_rate" not in no_log_m, f"accept_rate should be absent when log line not found"
+    assert no_log_off == 0, f"offset should not advance when no log line"
+    print(f"  (b2) parse_llama_cpp_accept: PASS  {am}")
+
+    # (b3) LLAMA_BIN points to build-cuda path
+    assert "build-cuda" in str(LLAMA_BIN), f"LLAMA_BIN must point to build-cuda, got {LLAMA_BIN}"
+    assert "build-cuda" in str(LLAMA_CUDA_LIB), f"LLAMA_CUDA_LIB must point to build-cuda, got {LLAMA_CUDA_LIB}"
+    print(f"  (b3) LLAMA_BIN CUDA path: PASS  {LLAMA_BIN}")
+
+    # (b4) lucebox family: lucebox / lucebox_ddtree22 / lucebox_no_ddtree
+    assert "lucebox_no_ddtree" in ARMS, "lucebox_no_ddtree arm missing from ARMS"
+    assert "lucebox_ddtree22" in ARMS, "lucebox_ddtree22 arm missing from ARMS"
+    lb      = ARMS["lucebox"]
+    lb_d22  = ARMS["lucebox_ddtree22"]
+    lb_nod  = ARMS["lucebox_no_ddtree"]
+    # ddtree flags
+    assert "--ddtree" in lb["extra_args"], "lucebox must have --ddtree in extra_args"
+    assert "--ddtree-budget" in lb["extra_args"], "lucebox must have --ddtree-budget"
+    bud_idx = lb["extra_args"].index("--ddtree-budget")
+    assert lb["extra_args"][bud_idx + 1] == "16", f"lucebox ddtree-budget must be 16, got {lb['extra_args'][bud_idx+1]}"
+    assert "--ddtree" in lb_d22["extra_args"], "lucebox_ddtree22 must have --ddtree"
+    assert "--ddtree-budget" in lb_d22["extra_args"], "lucebox_ddtree22 must have --ddtree-budget"
+    bud22_idx = lb_d22["extra_args"].index("--ddtree-budget")
+    assert lb_d22["extra_args"][bud22_idx + 1] == "22", f"lucebox_ddtree22 budget must be 22, got {lb_d22['extra_args'][bud22_idx+1]}"
+    assert "22" in lb_d22["extra_args"], "lucebox_ddtree22 extra_args must contain '22'"
+    assert "--ddtree" not in lb_nod["extra_args"], "lucebox_no_ddtree must NOT have --ddtree"
+    # All three share the same env keys and kv type
+    assert lb["env"].keys() == lb_d22["env"].keys(), "lucebox_ddtree22 env keys must match lucebox"
+    assert lb["env"].keys() == lb_nod["env"].keys(), "lucebox_no_ddtree env keys must match lucebox"
+    assert lb.get("kv_cache_types") == lb_d22.get("kv_cache_types"), "lucebox_ddtree22 kv_cache_types must match lucebox"
+    assert lb.get("kv_cache_types") == lb_nod.get("kv_cache_types"), "lucebox_no_ddtree kv_cache_types must match lucebox"
+    import json as _json
+    print(f"  (b4) lucebox arm dict:")
+    print(f"       {_json.dumps(lb, indent=6, default=str)}")
+    print(f"  (b4) lucebox_ddtree22 arm dict:")
+    print(f"       {_json.dumps(lb_d22, indent=6, default=str)}")
+    print(f"  (b4) lucebox_no_ddtree arm dict:")
+    print(f"       {_json.dumps(lb_nod, indent=6, default=str)}")
+    print(f"  (b4) ddtree family (16/22/no) arm check: PASS")
+
+    # (b5) lucebox_ar: pure AR dflash arm — no draft, no spec env vars
+    assert "lucebox_ar" in ARMS, "lucebox_ar arm missing from ARMS"
+    lb_ar = ARMS["lucebox_ar"]
+    assert lb_ar.get("server") == "dflash", "lucebox_ar must use dflash server"
+    assert lb_ar.get("model_target") == TGT_35B, "lucebox_ar model_target must be TGT_35B"
+    assert lb_ar.get("kv_cache_types") == ("q4_0", "q4_0"), "lucebox_ar must use q4_0 KV"
+    assert lb_ar.get("extra_args") == [], "lucebox_ar extra_args must be empty (no --draft)"
+    assert lb_ar.get("env") == {}, "lucebox_ar env must be empty (no spec env vars)"
+    # Confirm no spec-triggering flags leak into the arm
+    for forbidden in ("--draft", "--kvflash", "--ddtree", "--prefill-drafter"):
+        assert forbidden not in lb_ar.get("extra_args", []), \
+            f"lucebox_ar must NOT have {forbidden} in extra_args"
+    for forbidden_env in ("DFLASH_SPEC_GATE", "DFLASH_FEAT_RING_CAP",
+                          "DFLASH_DRAFT_CTX_MAX", "KVFLASH_RESTORE_CONSUME"):
+        assert forbidden_env not in lb_ar.get("env", {}), \
+            f"lucebox_ar env must NOT contain {forbidden_env}"
+    print(f"  (b5) lucebox_ar arm dict:")
+    print(f"       {_json.dumps(lb_ar, indent=6, default=str)}")
+    print(f"  (b5) lucebox_ar pure-AR check: PASS")
+
+    # (c) chat_simple.jsonl — 5 lines, valid JSON each
+    trace = BENCH_DIR / "traces" / "chat_simple.jsonl"
+    if not trace.exists():
+        failures.append(f"chat_simple.jsonl missing: {trace}")
+        print(f"  (c) chat_simple.jsonl: FAIL — file not found")
+    else:
+        lines = [l for l in trace.read_text().splitlines() if l.strip()]
+        assert len(lines) == 5, f"expected 5 lines, got {len(lines)}"
+        for i, ln in enumerate(lines):
+            obj = json.loads(ln)
+            assert "messages" in obj, f"line {i} missing messages"
+        print(f"  (c) chat_simple.jsonl: PASS  ({len(lines)} lines)")
+
+    if failures:
+        print("\nSELFTEST FAILED:")
+        for f in failures:
+            print(f"  {f}")
+        sys.exit(1)
+    print("=== SELFTEST PASS ===")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="ABC cache composition harness")
-    ap.add_argument("--arm", required=True, choices=sorted(ARMS.keys()),
+    ap.add_argument("--arm", required=False, choices=sorted(ARMS.keys()),
                     help="Which arm to run")
     ap.add_argument("--trace", default=str(BENCH_DIR / "traces" / "goldgate_fix.jsonl"),
                     help="Path to trace JSONL")
@@ -1114,10 +1638,14 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=42,
                     help="Sampling seed (noted in provenance; server may not support)")
     ap.add_argument("--port", type=int, default=PORT, help="Server port (default 19099)")
+    ap.add_argument("--max-ctx", type=int, default=MAX_CTX,
+                    help=f"Context ceiling for server (default {MAX_CTX})")
     ap.add_argument("--binary", default=None,
                     help="Explicit dflash_server binary path (overrides default build-dir path)")
     ap.add_argument("--smoke", action="store_true",
                     help="Smoke gate: first 3 turns only, N=1")
+    ap.add_argument("--selftest", action="store_true",
+                    help="Run no-GPU self-check and exit")
     ap.add_argument("--restart-per-turn", action="store_true",
                     help=(
                         "Per-turn server restart mode: for each turn, launch a fresh "
@@ -1128,6 +1656,13 @@ def main() -> None:
                         "claude-code-reconnects-each-turn / cross-session disk-hit scenario."
                     ))
     args = ap.parse_args()
+
+    if args.selftest:
+        run_selftest()
+        return
+
+    if not args.arm:
+        ap.error("--arm is required (or use --selftest)")
 
     if args.port == FORBIDDEN_PORT:
         print(f"ERROR: port {FORBIDDEN_PORT} is the user's live server. Forbidden.", file=sys.stderr)
@@ -1140,18 +1675,29 @@ def main() -> None:
         print(f"[binary] override: {SERVER_BIN}")
 
     arm_cfg = ARMS[args.arm]
+    server_type = arm_cfg.get("server", "dflash")
     n_repeats = 1 if args.smoke else args.n
     port = args.port
+    max_ctx = args.max_ctx
     restart_per_turn = args.restart_per_turn
 
-    # Verify binary
-    if not SERVER_BIN.exists():
-        print(f"ERROR: server binary not found: {SERVER_BIN}", file=sys.stderr)
-        sys.exit(1)
-    bin_sha = sha256_file(SERVER_BIN)
-    KNOWN_SHAS = {"92ee2985", "eef74aa0", "47212487", "5c659610", "fc27fff4", "ab9af0a7", "bab0c1dd"}
-    if not any(bin_sha.startswith(s) for s in KNOWN_SHAS):
-        print(f"WARNING: binary sha {bin_sha[:16]}... not a known PR274 head SHA")
+    # Verify binary (dflash arms only; llama_cpp arms use arm_cfg["binary"])
+    if server_type == "dflash":
+        if not SERVER_BIN.exists():
+            print(f"ERROR: server binary not found: {SERVER_BIN}", file=sys.stderr)
+            sys.exit(1)
+        bin_sha = sha256_file(SERVER_BIN)
+        KNOWN_SHAS = {"92ee2985", "eef74aa0", "47212487", "5c659610", "fc27fff4", "ab9af0a7", "bab0c1dd"}
+        if not any(bin_sha.startswith(s) for s in KNOWN_SHAS):
+            print(f"WARNING: binary sha {bin_sha[:16]}... not a known PR274 head SHA")
+    else:
+        # llama_cpp arm: verify the arm's binary exists
+        llama_bin = Path(arm_cfg.get("binary", str(LLAMA_BIN)))
+        if not llama_bin.exists():
+            print(f"ERROR: llama-server binary not found: {llama_bin}", file=sys.stderr)
+            sys.exit(1)
+        bin_sha = sha256_file(llama_bin)
+        print(f"[binary] llama_cpp binary sha: {bin_sha[:16]}...")
 
     # Load trace
     trace_path = Path(args.trace)
@@ -1160,25 +1706,29 @@ def main() -> None:
 
     # Provenance
     git = git_info(REPO_DIR)
+    _arm_tgt  = arm_cfg.get("model_target",  TGT)
+    _arm_dd   = arm_cfg.get("model_draft",   DD)
+    _arm_temp = arm_cfg.get("temperature",   TEMP)
+
     provenance = {
-        "binary": str(SERVER_BIN),
+        "binary": str(SERVER_BIN) if server_type == "dflash" else arm_cfg.get("binary", str(LLAMA_BIN)),
         "binary_sha256": bin_sha,
         "git_branch": git["branch"],
         "git_commit": git["commit"],
         "arm": args.arm,
         "arm_description": arm_cfg["description"],
         "arm_extra_args": arm_cfg["extra_args"],
-        "arm_env": arm_cfg["env"],
-        "model_target": str(TGT),
-        "model_draft_decode": str(DD),
+        "arm_env": arm_cfg.get("env", {}),
+        "server_type": server_type,
+        "model_target": str(arm_cfg.get("model", _arm_tgt)),
+        "model_draft_decode": str(_arm_dd),
         "model_draft_prefill": str(PD),
         "chat_template": str(TMPL),
-        "max_ctx": MAX_CTX,
-        "cache_type_k": "tq3_0",
-        "cache_type_v": "tq3_0",
-        "temperature": TEMP,
+        "max_ctx": max_ctx,
+        "cache_type_k": arm_cfg.get("kv_cache_types", ("tq3_0",))[0],
+        "cache_type_v": arm_cfg.get("kv_cache_types", ("tq3_0", "tq3_0"))[1],
+        "temperature": _arm_temp,
         "seed_requested": args.seed,
-        "seed_pluggable": "UNKNOWN - dflash_server may not support --seed; noted in provenance only",
         "n_repeats": n_repeats,
         "smoke": args.smoke,
         "restart_per_turn": restart_per_turn,
@@ -1189,7 +1739,7 @@ def main() -> None:
     }
 
     print("=" * 72)
-    print(f"ARM: {args.arm} — {arm_cfg['description']}")
+    print(f"ARM: {args.arm} — {arm_cfg['description']}  [{server_type}]")
     print(f"Binary SHA: {bin_sha[:16]}...")
     print(f"Branch: {git['branch']} @ {git['commit'][:12]}")
     mode_str = "SMOKE (turns 1-3, N=1)" if args.smoke else f"FULL ({n_repeats} repeats)"
@@ -1210,8 +1760,6 @@ def main() -> None:
     vram_pre, vram_total = nvidia_smi_vram()
     print(f"VRAM before load: {vram_pre}/{vram_total} MiB")
 
-    # Fresh, empty disk KV cache dir per arm (rm -rf before run; persists across the
-    # 7 turns WITHIN this arm — that's the disk-reuse point we're measuring).
     kv_dir = arm_cfg.get("kv_cache_dir")
     if kv_dir:
         import shutil
@@ -1223,11 +1771,12 @@ def main() -> None:
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     all_records: list[dict] = []
 
-    if not restart_per_turn:
+    acquire_gpu_lock()
+    try:
+      if not restart_per_turn:
         # ── single-session mode (default) ────────────────────────────────────
-        # One server process handles all turns; in-RAM KV cache serves reuse.
         log_path = BENCH_DIR / f"srv_{args.arm}_{ts_str}.log"
-        proc, log_f = launch_server(args.arm, arm_cfg, log_path)
+        proc, log_f = launch_server(args.arm, arm_cfg, log_path, max_ctx=max_ctx)
 
         try:
             print(f"Waiting for server on port {port}...", end=" ", flush=True)
@@ -1253,20 +1802,19 @@ def main() -> None:
                 recs = run_trace_repeat(
                     turns, port, log_path, args.arm,
                     smoke=args.smoke, repeat_idx=rep,
+                    arm_cfg=arm_cfg,
                 )
                 all_records.extend(recs)
 
         finally:
             print(f"\nKilling server PID={proc.pid}...")
             kill_server(proc, log_f, wait_s=15)
-            time.sleep(5)  # brief VRAM drain
+            time.sleep(5)
             vram_after, _ = nvidia_smi_vram()
             print(f"VRAM after kill: {vram_after}/{vram_total} MiB")
 
-    else:
+      else:
         # ── restart-per-turn mode ─────────────────────────────────────────────
-        # Fresh server per turn; the --kv-cache-dir (already wiped above) is the
-        # ONLY cross-turn reuse path.  Measures cross-session disk-cache value.
         log_dir = BENCH_DIR / f"srv_{args.arm}_{ts_str}_turns"
         log_dir.mkdir(exist_ok=True)
         print(f"[restart-per-turn] Per-turn logs dir: {log_dir}")
@@ -1279,9 +1827,11 @@ def main() -> None:
             )
             all_records.extend(recs)
 
-        # Final VRAM reading after all per-turn servers have been killed.
         vram_after, _ = nvidia_smi_vram()
         print(f"VRAM after all per-turn servers killed: {vram_after}/{vram_total} MiB")
+
+    finally:
+        release_gpu_lock()
 
     # Aggregate
     n_turns_ran = min(3, len(turns)) if args.smoke else len(turns)
@@ -1318,7 +1868,6 @@ def main() -> None:
     print(f"tool_call_valid_rate      : {arm_agg.get('tool_call_valid_rate')}")
     print(f"\nRaw:    {raw_path}")
     print(f"Report: {report_path}")
-    print(f"Log:    {log_path}")
 
     # Smoke-specific check
     if args.smoke:
