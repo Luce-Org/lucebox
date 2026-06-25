@@ -1006,12 +1006,12 @@ after_delta_net:
         ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, s));
     }
 
-    // ── Gated output norm: rms_norm(output) * silu(z_4d)
+    // ── Gated output norm: rms_norm(output) * weight * silu(z_4d)
+    // fused: swiglu_split(z_4d, normed) = silu(z_4d) * normed  (1 GLU kernel vs 2)
     ggml_tensor * z_4d = ggml_reshape_4d(ctx, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
     ggml_tensor * output_n = ggml_rms_norm(ctx, rms_norm_input_f32(ctx, output), w.rms_eps);
     output_n = ggml_mul(ctx, output_n, L.ssm_norm);
-    ggml_tensor * z_silu  = ggml_silu(ctx, z_4d);
-    output_n = ggml_mul(ctx, output_n, z_silu);
+    output_n = ggml_swiglu_split(ctx, z_4d, output_n);
 
     // Reshape to [d_inner, n_tokens]
     ggml_tensor * flat = ggml_reshape_3d(ctx, output_n,
