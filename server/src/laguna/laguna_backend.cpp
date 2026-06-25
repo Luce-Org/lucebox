@@ -318,16 +318,37 @@ bool LagunaBackend::ensure_slot(int slot) {
 }
 
 bool LagunaBackend::snapshot_save(int slot) {
-    // kvflash: snapshots copy rows assuming identity layout, which breaks
-    // after the first page-out relocates a chunk.
-    if (kvflash_active() && !kvflash_pager_.is_identity()) {
-        std::fprintf(stderr, "[kvflash] snapshot skipped: pool has relocated "
-                             "chunks (page-table serialization not implemented)\n");
-        return false;
-    }
     if (!ensure_slot(slot)) return false;
+    LagunaCacheSnapshot & snap = snapshots_[slot];
+    // kvflash: when the pool has relocated chunks (is_identity() == false) the
+    // GPU-tensor copy path silently captures wrong rows.  Serialize the pager
+    // blob instead — it carries every chunk's raw bytes regardless of pool slot.
+    const bool use_blob = kvflash_active() &&
+        (cache_.cur_pos > kvflash_tokens_ || !kvflash_pager_.is_identity());
+    if (use_blob) {
+        std::vector<uint8_t> blob = kvflash_pager_.serialize();
+        // Save non-KV state (recurrent state if any, cur_pos, last_tok) via the
+        // existing helper with skip_kv semantics: pass an empty dummy attn list
+        // by temporarily zeroing the cache attn vectors then restoring.
+        // Simpler: just save the scalar fields ourselves and call the helper with
+        // skip_kv so it doesn't touch attn tensors.
+        // laguna_snapshot_save does not have a skip_kv flag, so we fall through
+        // to save non-KV scalars (cur_pos, last_tok) directly on the snapshot.
+        snap.kvflash_blob = std::move(blob);
+        snap.is_pooled    = true;
+        snap.cur_pos      = cache_.cur_pos;
+        snap.last_tok     = cache_.last_tok;
+        snap.used         = true;
+        std::fprintf(stderr, "[kvflash] snapshot_save slot=%d pooled blob=%zu B "
+                             "cur_pos=%d\n", slot,
+                             snap.kvflash_blob.size(), snap.cur_pos);
+        return true;
+    }
+    // Identity layout: GPU-tensor copy is safe.
+    snap.is_pooled = false;
+    snap.kvflash_blob.clear();
     if (!laguna_snapshot_save(cache_, snap_backend_, w_.n_layer,
-                               w_.n_head_kv, w_.head_dim, snapshots_[slot])) {
+                               w_.n_head_kv, w_.head_dim, snap)) {
         std::fprintf(stderr, "[snap] save slot=%d: %s\n",
                       slot, dflash27b_last_error());
         return false;
@@ -945,23 +966,35 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
     result.prefill_s = std::chrono::duration<double>(t_pf1 - t_pf0).count();
 
     // ── Inline snapshot (if requested) ──
-    // kvflash: snapshots copy rows [0, snap_pos) assuming identity layout,
-    // which holds until the first page-out relocates a chunk.
-    if (kvflash_active() && req.snap_slot >= 0 &&
-        !kvflash_pager_.is_identity()) {
-        std::fprintf(stderr, "[kvflash] snapshot skipped: pool has relocated "
-                             "chunks (page-table serialization not implemented)\n");
-    } else
     if (req.snap_slot >= 0 && req.snap_pos > 0 && req.snap_pos <= N) {
-        if (ensure_slot(req.snap_slot) &&
-            laguna_snapshot_save(cache_, snap_backend_, w_.n_layer,
-                                  w_.n_head_kv, w_.head_dim, snapshots_[req.snap_slot])) {
-            snapshots_[req.snap_slot].cur_pos = req.snap_pos;
-            // Record the last committed token so an exact-hit restore can
-            // re-embed it even when handed a zero-filled restore-only prompt.
-            snapshots_[req.snap_slot].last_tok = req.prompt[req.snap_pos - 1];
-            std::printf("[snap] inline slot=%d cur_pos=%d\n",
-                         req.snap_slot, req.snap_pos);
+        if (ensure_slot(req.snap_slot)) {
+            const int snap_tok = req.prompt[req.snap_pos - 1];
+            LagunaCacheSnapshot & snap_dst = snapshots_[req.snap_slot];
+            const bool pool_relocated = kvflash_active() &&
+                (cache_.cur_pos > kvflash_tokens_ || !kvflash_pager_.is_identity());
+            if (pool_relocated) {
+                // Serialize pager blob up to the snap boundary (chunk-aligned).
+                const int cfg_chunk  = kvflash_pager_.chunk_tokens();
+                const int max_chunks = req.snap_pos / cfg_chunk;
+                std::vector<uint8_t> blob = kvflash_pager_.serialize(max_chunks > 0 ? max_chunks : -1);
+                snap_dst.kvflash_blob = std::move(blob);
+                snap_dst.is_pooled    = true;
+                snap_dst.cur_pos      = req.snap_pos;
+                snap_dst.last_tok     = snap_tok;
+                snap_dst.used         = true;
+                std::printf("[snap] inline pooled slot=%d cur_pos=%d blob=%zu B\n",
+                             req.snap_slot, req.snap_pos, snap_dst.kvflash_blob.size());
+            } else {
+                snap_dst.is_pooled    = false;
+                snap_dst.kvflash_blob.clear();
+                if (laguna_snapshot_save(cache_, snap_backend_, w_.n_layer,
+                                          w_.n_head_kv, w_.head_dim, snap_dst)) {
+                    snap_dst.cur_pos  = req.snap_pos;
+                    snap_dst.last_tok = snap_tok;
+                    std::printf("[snap] inline slot=%d cur_pos=%d\n",
+                                 req.snap_slot, req.snap_pos);
+                }
+            }
             std::fflush(stdout);
         }
     }
@@ -1111,15 +1144,38 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
         sampler_rng_.seed(sampler_.seed);
     }
 
-    if (!laguna_snapshot_restore(snapshots_[slot], cache_)) {
-        std::fprintf(stderr, "[snap] RESTORE slot=%d: %s\n",
-                      slot, dflash27b_last_error());
-        result.error = "restore";
-        return result;
+    const LagunaCacheSnapshot & snap_ref = snapshots_[slot];
+    const bool snap_pooled = snap_ref.is_pooled;
+    const int N = (int)req.prompt.size();
+
+    if (snap_pooled) {
+        // Pager-blob restore: the GPU-tensor snapshot was NOT taken (attn_k/v
+        // are stale/nullptr for pooled saves). Restore only the scalar fields
+        // (cur_pos, last_tok) from the snapshot and rebuild the pager from the
+        // serialized blob so KV rows are accessible without re-prefill.
+        cache_.cur_pos  = snap_ref.cur_pos;
+        cache_.last_tok = snap_ref.last_tok;
+        if (!kvflash_active()) {
+            // Pooled save requires kvflash; if it disappeared between save and
+            // restore, fall through to an error rather than silently misbehave.
+            result.error = "kvflash: pooled snapshot requires kvflash active";
+            return result;
+        }
+        if (!kvflash_pager_.deserialize(snap_ref.kvflash_blob.data(),
+                                        snap_ref.kvflash_blob.size())) {
+            result.error = "kvflash: pager deserialize failed";
+            return result;
+        }
+    } else {
+        if (!laguna_snapshot_restore(snap_ref, cache_)) {
+            std::fprintf(stderr, "[snap] RESTORE slot=%d: %s\n",
+                          slot, dflash27b_last_error());
+            result.error = "restore";
+            return result;
+        }
     }
 
     const int prefix_len = cache_.cur_pos;
-    const int N = (int)req.prompt.size();
     if (N < prefix_len) {
         std::fprintf(stderr, "[snap] RESTORE prompt shorter than cached prefix (%d < %d)\n",
                       N, prefix_len);
@@ -1127,16 +1183,8 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
         return result;
     }
 
-    // kvflash: restore lands rows identity-mapped; the full prompt (prefix +
-    // diff) must fit the pool. Rebuild the pager mapping over the prefix.
-    if (kvflash_active() &&
-        N > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
-        std::fprintf(stderr, "[kvflash] restore prompt (%d) exceeds pool %d; "
-                             "raise --kvflash\n", N, kvflash_tokens_);
-        result.error = "kvflash: prompt exceeds resident pool";
-        return result;
-    }
-    if (kvflash_active()) {
+    // Non-pooled: rebuild pager over the prefix (identity layout, rows intact).
+    if (!snap_pooled && kvflash_active()) {
         kvflash_pager_.reset();
         if (!kvflash_alloc_span(0, prefix_len)) {
             result.error = "kvflash_slot";
@@ -1145,46 +1193,93 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
     }
     const KvFlashPager * kvf = kvflash_active() ? &kvflash_pager_ : nullptr;
 
-    // Re-prefill diff tokens (or last cached token when diff is empty).
-    bool restore_only = false;
-    if (prefix_len == N) {
-        if (prefix_len <= 0) { result.error = "empty_diff"; return result; }
-        cache_.cur_pos = prefix_len - 1;
-        restore_only = true;
-    }
-    const int kv_start = cache_.cur_pos;
-    const int diff_n   = N - kv_start;
-
-    // On an exact full-prompt hit (restore_only, diff_n == 1) the caller may
-    // hand us a zero-filled restore-only prompt (pflash full-cache hit, where
-    // effective_prompt is a dummy buffer sized to the cached/compressed length).
-    // req.prompt[kv_start] would then be token 0, corrupting the final logits.
-    // Re-embed the real last committed token recorded in the snapshot instead.
-    std::vector<int32_t> diff_ids;
-    const int32_t * diff_src = req.prompt.data() + kv_start;
-    if (restore_only && snapshots_[slot].last_tok >= 0) {
-        diff_ids.assign(1, snapshots_[slot].last_tok);
-        diff_src = diff_ids.data();
-    }
-
-    std::vector<float> embed_diff((size_t)diff_n * w_.n_embd);
-    if (!w_.embedder.embed(diff_src, diff_n, embed_diff.data())) {
-        result.error = "embed_prefill";
-        return result;
-    }
-
     std::vector<float> last_logits;
     bool ok = true;
-    const int n_chunks = (diff_n + args_.chunk - 1) / args_.chunk;
-    for (int c = 0; c < n_chunks && ok; ++c) {
-        const int off   = c * args_.chunk;
-        const int n_tok = std::min(args_.chunk, diff_n - off);
-        const int starts = kv_start + off;
-        ok = kvflash_alloc_span(starts, n_tok) &&
-             laguna_step(backend_, w_, cache_,
-                          embed_diff.data() + (size_t)off * w_.n_embd,
-                          n_tok, starts, no_mask, last_logits, kvf,
-                          /*capture=*/true);
+
+    if (snap_pooled && kvflash_active()) {
+        // Restore-consume path: pager already holds the deserialized prefix KV
+        // for [0, prefix_len). Prefill only the suffix [prefix_len, N).
+        // This is the warm-restore win — no re-prefill of the cached prefix.
+        std::fprintf(stderr,
+            "[kvflash] laguna restore-consume: snap_pos=%d prompt=%d "
+            "(suffix prefill only)\n", prefix_len, N);
+        std::fflush(stderr);
+
+        if (N > prefix_len) {
+            // Suffix prefill: embed tokens [prefix_len, N) and step from prefix_len.
+            const int suffix_n = N - prefix_len;
+            std::vector<float> embed_sfx((size_t)suffix_n * w_.n_embd);
+            if (!w_.embedder.embed(req.prompt.data() + prefix_len, suffix_n,
+                                   embed_sfx.data())) {
+                result.error = "embed_prefill";
+                return result;
+            }
+            cache_.cur_pos = prefix_len;   // pager already seeded; do NOT reset
+            const int n_sfx_chunks = (suffix_n + args_.chunk - 1) / args_.chunk;
+            for (int c = 0; c < n_sfx_chunks && ok; ++c) {
+                const int off    = c * args_.chunk;
+                const int n_tok  = std::min(args_.chunk, suffix_n - off);
+                const int starts = prefix_len + off;
+                ok = kvflash_alloc_span(starts, n_tok) &&
+                     laguna_step(backend_, w_, cache_,
+                                  embed_sfx.data() + (size_t)off * w_.n_embd,
+                                  n_tok, starts, no_mask, last_logits, kvf,
+                                  /*capture=*/true);
+            }
+        } else {
+            // Exact cache hit (N == prefix_len): re-embed last token to get fresh
+            // logits. Use the recorded last_tok if the prompt is zero-filled.
+            int32_t last_id = (snap_ref.last_tok >= 0) ? snap_ref.last_tok
+                                                        : req.prompt[prefix_len - 1];
+            std::vector<float> embed_last((size_t)w_.n_embd);
+            if (!w_.embedder.embed(&last_id, 1, embed_last.data())) {
+                result.error = "embed_prefill";
+                return result;
+            }
+            cache_.cur_pos = prefix_len - 1;
+            ok = kvflash_alloc_span(cache_.cur_pos, 1) &&
+                 laguna_step(backend_, w_, cache_,
+                              embed_last.data(), 1, cache_.cur_pos,
+                              no_mask, last_logits, kvf, /*capture=*/true);
+        }
+    } else {
+        // Non-pooled (or kvflash disabled): re-prefill diff tokens as before.
+        bool restore_only = false;
+        if (prefix_len == N) {
+            if (prefix_len <= 0) { result.error = "empty_diff"; return result; }
+            cache_.cur_pos = prefix_len - 1;
+            restore_only = true;
+        }
+        const int kv_start = cache_.cur_pos;
+        const int diff_n   = N - kv_start;
+
+        // On an exact full-prompt hit (restore_only, diff_n == 1) the caller may
+        // hand us a zero-filled restore-only prompt (pflash full-cache hit, where
+        // effective_prompt is a dummy buffer sized to the cached/compressed length).
+        std::vector<int32_t> diff_ids;
+        const int32_t * diff_src = req.prompt.data() + kv_start;
+        if (restore_only && snap_ref.last_tok >= 0) {
+            diff_ids.assign(1, snap_ref.last_tok);
+            diff_src = diff_ids.data();
+        }
+
+        std::vector<float> embed_diff((size_t)diff_n * w_.n_embd);
+        if (!w_.embedder.embed(diff_src, diff_n, embed_diff.data())) {
+            result.error = "embed_prefill";
+            return result;
+        }
+
+        const int n_chunks = (diff_n + args_.chunk - 1) / args_.chunk;
+        for (int c = 0; c < n_chunks && ok; ++c) {
+            const int off   = c * args_.chunk;
+            const int n_tok = std::min(args_.chunk, diff_n - off);
+            const int starts = kv_start + off;
+            ok = kvflash_alloc_span(starts, n_tok) &&
+                 laguna_step(backend_, w_, cache_,
+                              embed_diff.data() + (size_t)off * w_.n_embd,
+                              n_tok, starts, no_mask, last_logits, kvf,
+                              /*capture=*/true);
+        }
     }
     if (!ok) { result.error = "prefill"; return result; }
 

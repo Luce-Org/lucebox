@@ -226,6 +226,14 @@ struct LagunaCacheSnapshot {
     // not recorded (older/inline snapshots) -> restore falls back to req.prompt.
     int                   last_tok = -1;
     bool                  used    = false;
+    // Pager-blob snapshot: when is_pooled=true the KV cache rows are NOT copied
+    // into attn_k/attn_v (skip_kv path); instead the full pager state is
+    // serialized to kvflash_blob via KvFlashPager::serialize(). On restore,
+    // deserialize() rebuilds the resident pool and restore-consume skips
+    // re-prefilling the already-snapped prefix. This survives eviction-relocation
+    // because the blob carries every chunk's raw bytes regardless of pool slot.
+    bool                         is_pooled    = false;
+    std::vector<uint8_t>         kvflash_blob;  // pager-serialized KV; valid iff is_pooled
 };
 
 bool laguna_snapshot_alloc(const LagunaTargetCache & cache,
