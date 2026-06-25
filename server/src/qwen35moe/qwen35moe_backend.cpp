@@ -2203,11 +2203,15 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
     int    eg_ar_tokens   = 0;
     int    eg_spec_steps  = 0;
 
-    // ── AR warmup (every turn): warm graph allocator, then measure t_ar ────
-    // sg_.alloc is freed between requests (release_scratch), so the first
-    // build_target_step each turn pays graph-alloc overhead. Run 2 untimed
-    // tokens to warm the allocator, then 1 timed token to measure the actual
-    // warm AR speed at the CURRENT context length.
+    // ── AR warmup / t_ar cache ───────────────────────────────────────────
+    // t_ar is a backend property; measure ONCE per server lifetime and cache
+    // in gate_t_ar_ so subsequent turns skip the warmup. 05bebe70 made the
+    // 3-token AR warmup run every request: on multi-turn that injects 3 AR
+    // tokens + a path-switch graph rebuild per turn (~0.3s/turn) and shifts
+    // where spec resumes. Caching restores the proven 42278139 behavior:
+    // spec resumes at the prefill end with no per-turn warmup tax. The
+    // floor-to-AR gate (spec_gate_st_, persistent EMA) is unaffected — it
+    // still floors genuinely-slow turns inside the spec loop below.
     //
     // Skip warmup + spec loop entirely if only 3 or fewer tokens requested.
     if (n_gen <= 3) {
@@ -2216,7 +2220,13 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         return ok;
     }
     int n_generated;
-    {
+    if (gate_t_ar_ > 0.0) {
+        // Cached: skip warmup. Spec loop starts at n_generated=0 with
+        // last_tok=target_cache().last_tok already set above. No context shift.
+        t_ar = gate_t_ar_;
+        n_generated = 0;
+    } else {
+        // First call only: run the 3-token AR warmup to measure t_ar warm.
         // Token 1: free (prefill logits ready), untimed — primes graph alloc.
         bool ok1 = run_ar_decode_path(committed, 1, out_tokens, io);
         if (!ok1) { io.emit(-1); return false; }
@@ -2234,7 +2244,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         if (!ok3) { io.emit(-1); return false; }
         t_ar = std::chrono::duration<double>(t_ar1 - t_ar0).count();
         if (t_ar < 0.0005) t_ar = 0.005;
-        gate_t_ar_ = (gate_t_ar_ > 0.0) ? (0.7 * gate_t_ar_ + 0.3 * t_ar) : t_ar;
+        gate_t_ar_ = t_ar;  // cache for all future turns
         committed = target_cache().cur_pos;
         last_tok  = out_tokens.back();
         n_generated = 3;
@@ -2282,10 +2292,16 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         }
 
         // 2. Draft compute
-        constexpr int DRAFT_CTX_MAX_DEFAULT = 2048;
-        const int ring_cap = feature_mirror().cap;
-        const int draft_ctx = std::min(committed,
-            std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)));
+        // BUG-FIX: removed the DRAFT_CTX_MAX_DEFAULT=2048 floor that was the binding
+        // constraint at deep context. draft_ctx is now min(committed, ring_cap) — the full
+        // layer attends all of draft_ctx; SWA layers window within it (draft_graph.cpp:85-86).
+        const int ring_cap  = feature_mirror().cap;
+        const int draft_ctx = std::min(committed, ring_cap);
+        // Compute full-layer eff_ctx: the non-SWA (last) layer sees all of draft_ctx.
+        const int full_eff  = draft_ctx;
+        // Per-request instrumentation: prove the cap actually moved.
+        std::fprintf(stderr, "[draft-ctx] committed=%d mirror_cap=%d draft_ctx=%d full_eff=%d\n",
+                     committed, ring_cap, draft_ctx, full_eff);
         const int draft_start = committed - draft_ctx;
         int mirror_slot0 = 0;
         const bool use_mirror_view =
@@ -2294,7 +2310,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         if (!build_draft_step(moe_draft_sg_, draft_weights(), /*lm_head=*/nullptr, draft_backend(),
                               draft_ctx, use_mirror_view ? &feature_mirror() : nullptr,
                               committed,
-                              std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)))) {
+                              ring_cap)) {
             std::fprintf(stderr, "[hybrid-spec] draft build failed\n");
             step_graph_destroy(moe_draft_sg_);
             return false;

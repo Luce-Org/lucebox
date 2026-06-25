@@ -2262,22 +2262,17 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
 
         // 2. Draft compute
-        // The block-diffusion drafter's prediction collapses when it self-attends
-        // more than ~2048 tokens (measured: 93% accept at draft_ctx<=2048 vs 6%
-        // at 4096, independent of total context). Cap its self-attention window at
-        // 2048 so spec-decode keeps working at long context for recent-derived
-        // output. DFLASH_DRAFT_CTX_MAX overrides for drafters with a larger limit.
-        constexpr int DRAFT_CTX_MAX_DEFAULT = 2048;
-        static const int kDraftCtxCap = []() {
-            if (const char * e = std::getenv("DFLASH_DRAFT_CTX_MAX")) {
-                int v = std::atoi(e);
-                if (v > 0) return v;
-            }
-            return -1; // sentinel: use the default cap
-        }();
+        // BUG-FIX: removed the 2048-floor cap. draft_ctx = min(committed, ring_cap).
+        // The full (non-SWA) layer attends all of draft_ctx; SWA layers window within
+        // it per-layer (draft_graph.cpp:85-86). The old comment "93% at <=2048 vs 6%
+        // at 4096" was measured with the WRONG rope theta (1e6 vs trained 1e7) — that
+        // was the actual cause of the collapse, not the context length.
         const int ring_cap = use_remote_draft ? remote_draft_.ring_cap() : feature_mirror_.cap;
-        const int draft_ctx_cap = (kDraftCtxCap > 0) ? kDraftCtxCap : DRAFT_CTX_MAX_DEFAULT;
-        const int draft_ctx = std::min(committed, std::min(ring_cap, draft_ctx_cap));
+        const int draft_ctx = std::min(committed, ring_cap);
+        // Instrumentation: log resolved caps per request (proves the cap moved).
+        const int full_eff = draft_ctx;  // non-SWA layer sees all of draft_ctx
+        std::fprintf(stderr, "[draft-ctx] committed=%d mirror_cap=%d draft_ctx=%d full_eff=%d\n",
+                     committed, ring_cap, draft_ctx, full_eff);
         const int draft_start = committed - draft_ctx;
         int mirror_slot0 = 0;
         const bool use_mirror_view =
@@ -2295,7 +2290,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             if (!build_draft_step(draft_sg_, dw_, /*lm_head=*/nullptr, draft_backend_,
                                   draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
                                   committed,
-                                  /*ctx_len_max=*/std::min(ring_cap, draft_ctx_cap))) {
+                                  /*ctx_len_max=*/ring_cap)) {
                 std::fprintf(stderr, "spec-decode: draft build failed\n");
                 step_graph_destroy(draft_sg_);
                 return false;
