@@ -184,6 +184,46 @@ public:
         return true;
     }
 
+    // Pool chunk `c` from a contiguous host K/V blob (layout: layer-major,
+    // K-part then V-part, head-minor — matches KvFlashPager::serialize()).
+    // `layer_types[l]` is the ggml_type of layer l's K tensor (for to_float).
+    // k_seg_bytes = chunk_tokens * nb1 per head; v_seg_bytes skips the V-part.
+    // Used on warm-restore to rebuild evicted-chunk pooled-K without re-prefill.
+    bool pool_chunk_host(const uint8_t * host, int chunk_tokens, int c,
+                         const std::vector<ggml_type> & layer_types,
+                         size_t k_seg_bytes, size_t v_seg_bytes) {
+        if ((int)layer_types.size() != dims_.n_layers || !host) return false;
+        if ((int)keys_.size() <= c) keys_.resize((size_t)c + 1);
+        std::vector<float> & dst = keys_[(size_t)c];
+        dst.assign((size_t)dims_.n_layers * dims_.n_kv_heads * dims_.head_dim, 0.0f);
+        std::vector<float> rows((size_t)chunk_tokens * dims_.head_dim);
+        const size_t layer_stride = (size_t)dims_.n_kv_heads * (k_seg_bytes + v_seg_bytes);
+        for (int l = 0; l < dims_.n_layers; l++) {
+            const auto * tt = ggml_get_type_traits(layer_types[(size_t)l]);
+            const uint8_t * kbase = host + (size_t)l * layer_stride;  // K-part of layer l
+            for (int h = 0; h < dims_.n_kv_heads; h++) {
+                const uint8_t * src = kbase + (size_t)h * k_seg_bytes;
+                if (layer_types[(size_t)l] == GGML_TYPE_F32) {
+                    std::memcpy(rows.data(), src, k_seg_bytes);
+                } else {
+                    tt->to_float(src, rows.data(), (int64_t)chunk_tokens * dims_.head_dim);
+                }
+                float * pk = dst.data() + ((size_t)l * dims_.n_kv_heads + h) * dims_.head_dim;
+                for (int tok = 0; tok < chunk_tokens; tok++) {
+                    const float * r = rows.data() + (size_t)tok * dims_.head_dim;
+                    for (int i = 0; i < dims_.head_dim; i++) pk[i] += r[i];
+                }
+                double ss = 0.0;
+                for (int i = 0; i < dims_.head_dim; i++) ss += (double)pk[i] * pk[i];
+                const float inv = 1.0f / ((float)std::sqrt(ss) + 1e-6f);
+                bool finite = true;
+                for (int i = 0; i < dims_.head_dim; i++) { pk[i] *= inv; if (!std::isfinite(pk[i])) finite = false; }
+                if (!finite) { dst.clear(); return false; }
+            }
+        }
+        return true;
+    }
+
     // Seed per-chunk fallback scores from the pager's ledger (Phase 2 restore).
     // Called after KvFlashPager::deserialize() so the scorer can report prior-
     // turn scores for restored chunks before the first re-pool pass.

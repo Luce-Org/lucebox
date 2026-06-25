@@ -660,6 +660,20 @@ public:
     // deserialize() returns (e.g., Phase 2 QK pool rebuild).
     uint32_t serialized_kv_k_type() const { return last_serialized_kv_k_type_; }
 
+    // Host-resident chunk bytes after deserialize() (pinned; layout per serialize()).
+    // Returns nullptr if chunk c has no host backing.
+    const uint8_t * chunk_host_ptr(int c) const {
+        if (c < 0 || c >= (int)chunks_.size()) return nullptr;
+#ifdef KVFLASH_HAS_ASYNC_DMA
+        return (const uint8_t *)chunks_[(size_t)c].host_data;
+#else
+        return chunks_[(size_t)c].host_data.empty() ? nullptr : chunks_[(size_t)c].host_data.data();
+#endif
+    }
+    size_t k_seg_bytes() const { return k_seg_bytes_; }
+    size_t v_seg_bytes() const { return v_seg_bytes_; }
+    int    n_head_kv()   const { return n_head_kv_; }
+
 private:
     struct ChunkState {
         int      block    = -1;       // pool block index, -1 = not resident

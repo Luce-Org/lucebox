@@ -939,7 +939,27 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         // are re-sealed during the upcoming prefill.
         if (kvflash_qk_policy_) {
             kvflash_qk_pool_.rebuild_pool_from_ledger(kvflash_pager_);
-            kvflash_qk_pooled_upto_ = 0;
+            // Reconstruct cosine pooled-K from the deserialized host K bytes so
+            // evicted prefix chunks score identically to the golden re-prefill
+            // (no re-prefill, no live-K re-pool of non-resident chunks).
+            const int ct = kvflash_pager_.chunk_tokens();
+            const int restored_sealed = snap_ref.cur_pos / ct;
+            std::vector<ggml_type> layer_types(cache_.attn_k.size());
+            for (size_t l = 0; l < cache_.attn_k.size(); l++)
+                layer_types[l] = cache_.attn_k[l]->type;
+            int reseed_fail = 0;
+            for (int c = 0; c < restored_sealed; c++) {
+                const uint8_t * host = kvflash_pager_.chunk_host_ptr(c);
+                if (!host || !kvflash_qk_pool_.pool_chunk_host(
+                        host, ct, c, layer_types,
+                        kvflash_pager_.k_seg_bytes(), kvflash_pager_.v_seg_bytes())) {
+                    reseed_fail++;  // falls back to seeded ledger score
+                }
+            }
+            if (reseed_fail)
+                std::fprintf(stderr, "[kvflash-qk] restore: %d/%d chunks fell back to seeded score\n",
+                             reseed_fail, restored_sealed);
+            kvflash_qk_pooled_upto_ = restored_sealed;
         }
     }
 
@@ -1488,6 +1508,7 @@ void Qwen35Backend::kvflash_qk_pool_to(int committed) {
     const int ct = kvflash_pager_.chunk_tokens();
     const int sealed = committed / ct;
     for (int c = kvflash_qk_pooled_upto_; c < sealed; c++) {
+        if (kvflash_qk_pool_.has(c)) continue;  // keep restored/host-pooled keys
         const int blk = kvflash_pager_.block_of(c);
         if (blk < 0 || !kvflash_qk_pool_.pool_chunk(cache_.attn_k, blk, ct, c)) {
             std::fprintf(stderr, "[kvflash-qk] pool_chunk failed for chunk %d "
