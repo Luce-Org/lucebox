@@ -11,6 +11,7 @@
 #include "dflash_draft_graph.h"
 #include "dflash_feature_ring.h"
 #include "graph_builders.h"
+#include "kv_quant.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -2163,9 +2164,16 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
     int max_context = ctx_env ? std::atoi(ctx_env) : cfg_.device.max_ctx;
     if (max_context <= 0) max_context = 8192;
 
-    // KV cache: n_layer × 2 (K+V) × n_head_kv × head_dim × sizeof(fp16) × max_context
-    const uint64_t kv_bytes_per_tok = (uint64_t)w.n_layer * 2 *
-        (uint64_t)w.n_head_kv * (uint64_t)w.n_embd_head_k * 2;
+    // KV reservation: only full-attention layers carry KV (the rest are O(1)-state
+    // SSM/DeltaNet), and honor the resolved cache type. The old n_layer × hardcoded
+    // -f16 form over-reserved ~14× at deep ctx (25 GiB vs 1.76 GiB @131K), forcing
+    // experts cold → the slow hybrid spec path. Shared helper / single source of
+    // truth with the dense backend — see kv_quant.h.
+    ggml_type kv_k_t = GGML_TYPE_Q8_0, kv_v_t = GGML_TYPE_Q8_0;
+    dflash::resolve_kv_types(kv_k_t, kv_v_t);
+    const uint64_t kv_bytes_per_tok = dflash::kv_reservation_bytes_per_token(
+        w.n_layer, w.full_attention_interval, w.n_head_kv,
+        kv_k_t, w.n_embd_head_k, kv_v_t, w.n_embd_head_v);
     // Size the reservation with the SAME inputs runtime uses (scorer policy +
     // VRAM budget); the bare-max_context call took the no-budget fallback
     // (max_ctx/2) and over-reserved KV, starving experts of hot placement.
