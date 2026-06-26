@@ -5,8 +5,11 @@ speed on one GPU and produces a report that shows **where the time goes**, so a
 reviewer can see at a glance whether a PR moved the needle and where the next
 optimization margin is.
 
-It runs the engine **binaries directly** (no HTTP) so the numbers reflect compute,
-not server/network noise.
+It runs the engine **binaries directly** — `test_dflash` (the speculative / DFlash
+decode path) and `test_generate` (the plain autoregressive baseline) — with **no
+HTTP**, so the numbers reflect compute, not server/network noise. Both are CMake
+build targets under `server/build/` and can be overridden with `--df-bin` /
+`--ar-bin` (or the `DFLASH_BIN` / `DFLASH_BIN_AR` environment variables).
 
 ## What it reports
 
@@ -108,3 +111,37 @@ python3 scripts/profile.py \
   --baseline scripts/speed-baseline.json --regress-pct 0.10 \
   --out-json profile.json --out-md profile.md
 ```
+
+## Comparing against a baseline
+
+The profiler is **report-only**, but it can diff the current run against a saved
+profile so reviewers see a single regression table instead of two separate reports.
+The comparison is a JSON round-trip:
+
+1. **Capture a baseline.** Run the profiler on the reference commit and keep its
+   JSON output:
+
+   ```bash
+   python3 scripts/profile.py ... --out-json scripts/speed-baseline.json
+   ```
+
+   Commit `scripts/speed-baseline.json` so every later run compares against the same
+   reference. Re-seed it whenever you change a profiler parameter (`--budget`,
+   `--n-gen`, `--reps`, …): you cannot compare across configs.
+
+2. **Compare a later run.** Point `--baseline` at that file and set the regression
+   threshold:
+
+   ```bash
+   python3 scripts/profile.py ... \
+     --baseline scripts/speed-baseline.json --regress-pct 0.10
+   ```
+
+3. **Read the delta.** The report adds a **"Delta vs baseline"** table with, per
+   headline metric, `baseline ± σ`, `now ± σ`, the absolute Δ and Δ%. A row is
+   flagged as a regression only when the move exceeds `--regress-pct` **and** the
+   baseline/current 1σ intervals do **not** overlap — a delta inside the noise band
+   is marked **noisy / overlap** instead, so reviewers don't chase jitter.
+
+Both runs must use the same parameters for the delta to be a valid signal (see the
+**Rule** under *Parameters* above).
