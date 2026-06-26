@@ -377,13 +377,10 @@ bool Qwen35Backend::init() {
     // Init feature mirror when draft model is available (needed for spec decode).
     // On single-GPU, this is an F32 conversion buffer; on split-GPU, a cross-device mirror.
     if (cfg_.draft_path && !use_remote_draft) {
-        // Honor DFLASH_FEAT_RING_CAP for the mirror cap as well (not just target_feat).
-        int effective_draft_ctx_max = cfg_.draft_ctx_max;
-        if (const char * e = std::getenv("DFLASH_FEAT_RING_CAP")) {
-            effective_draft_ctx_max = std::max(cfg_.draft_ctx_max, std::atoi(e));
-        }
-        const int mirror_cap = std::min({effective_draft_ctx_max, cfg_.device.max_ctx,
-                                         cache_.target_feat_cap > 0 ? cache_.target_feat_cap : cfg_.device.max_ctx});
+        // ponytail: cap at drafter's trained 40960 window, not a 4096 floor;
+        // ideally read from drafter GGUF (context_length is a placeholder today).
+        static constexpr int kDrafterTrainedCtx = 40960;
+        const int mirror_cap = std::min(cfg_.device.max_ctx, kDrafterTrainedCtx);
         if (!draft_feature_mirror_init(feature_mirror_, draft_backend_,
                                        cfg_.draft_gpu, cfg_.device.gpu, mirror_cap,
                                        w_.n_capture_layers,

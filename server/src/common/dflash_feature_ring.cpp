@@ -41,7 +41,11 @@ static bool ensure_staging(DraftFeatureMirror & mirror, size_t bytes) {
 
 static ggml_type parse_feature_dtype() {
     const char * s = std::getenv("DFLASH_FEATURE_DTYPE");
-    if (!s || !s[0] || std::strcmp(s, "f32") == 0 || std::strcmp(s, "F32") == 0) {
+    // ponytail: q4_0 default — accept-neutral, makes the deep ring affordable.
+    if (!s || !s[0]) {
+        return GGML_TYPE_Q4_0;
+    }
+    if (std::strcmp(s, "f32") == 0 || std::strcmp(s, "F32") == 0) {
         return GGML_TYPE_F32;
     }
     if (std::strcmp(s, "f16") == 0 || std::strcmp(s, "F16") == 0) {
