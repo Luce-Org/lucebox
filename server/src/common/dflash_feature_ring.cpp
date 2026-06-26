@@ -54,6 +54,9 @@ static ggml_type parse_feature_dtype() {
         std::strcmp(s, "q8") == 0 || std::strcmp(s, "Q8") == 0) {
         return GGML_TYPE_Q8_0;
     }
+    if (std::strcmp(s, "q4_0") == 0 || std::strcmp(s, "Q4_0") == 0) {
+        return GGML_TYPE_Q4_0; // 4-bit, 32-elem blocks; ~7.6× ring capacity vs f32
+    }
     std::fprintf(stderr, "[dflash-feature] ignoring unsupported DFLASH_FEATURE_DTYPE=%s\n", s);
     return GGML_TYPE_F32;
 }
