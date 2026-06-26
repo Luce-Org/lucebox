@@ -272,6 +272,17 @@ Requests that omit `temperature` use the model card's sampling (Qwen3.6: `temper
 | `--draft-residency {auto,persistent,request-scoped}` | `auto` | When draft weights are evicted from VRAM. `request-scoped` parks/frees them after each request's draft work (frees VRAM for the target on tight GPUs); `persistent` keeps them resident across requests; `auto` preserves current behavior while honoring the low-VRAM / `--lazy-draft` hint. Reported at `/props.runtime.draft_residency`. |
 | `--lazy-draft` | off | Legacy alias for `--draft-residency=request-scoped` (defer draft load until first request, release after) |
 
+**GPU draft top-K & verify-argmax (DFlash)**
+
+The draft-token top-K extraction and the per-step verify argmax used to run on the CPU, each requiring a full `vocab × n_tokens` logits copy from device to host (D2H) every speculation step. These two env flags move both onto the GPU, reading the logits in place on the device buffer and skipping the bulk D2H. Both are **on by default** and only take effect on **CUDA builds** (the kernel is CUDA-only — on HIP/ROCm builds the flags are no-ops and the CPU path always runs). Each path validates its result and **falls back to the legacy CPU computation automatically** on any failure (e.g. an out-of-range index), so disabling them is only needed for debugging or A/B comparison.
+
+| Env | Default | Effect |
+|---|---|---|
+| `DFLASH_GPU_DRAFT_TOPK=1` | `1` (on) | Compute the draft model's top-K vocab indices (K in 1–8) and log-sum-exp directly on the logits device buffer. `=0` forces the legacy CPU top-K (full-vocab D2H + CPU heap extract). Use `=0` to isolate the kernel when debugging or to baseline its speedup. |
+| `DFLASH_GPU_VERIFY_ARGMAX` | on (server) / `0` (test harness) | Per-step verify argmax. In the server it is on by default and a simple on/off; `=0` forces the legacy CPU path. In `test_dflash` it is a tri-state with these values: <br>• `0` — legacy CPU path: full `vocab × N` D2H + CPU argmax (default in the test harness). <br>• `1` — GPU fast-path: read the in-graph batched GPU argmax (N int32s), no bulk D2H. <br>• `2` — run **both** the CPU and GPU paths and report any per-step mismatches (validation mode; guards against the historical tree-verify `-1`/tie regression). |
+
+To reproduce the benchmark: baseline `DFLASH_GPU_DRAFT_TOPK=0 DFLASH_GPU_VERIFY_ARGMAX=0`, optimized `DFLASH_GPU_DRAFT_TOPK=1 DFLASH_GPU_VERIFY_ARGMAX=1`, both via `python server/scripts/bench_llm.py --bench HumanEval`.
+
 **Prefill compression (PFlash)**
 
 | Flag / env | Default | Effect |

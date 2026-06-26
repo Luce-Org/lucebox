@@ -35,7 +35,7 @@ _LOCAL_DRAFT_ROOT = ROOT / "models" / "draft"
 DRAFT = None
 TEST_DFLASH = os.environ.get("DFLASH_BIN", str(ROOT / "build" / f"test_dflash{BIN_SUFFIX}"))
 TEST_GENERATE = os.environ.get("DFLASH_BIN_AR", str(ROOT / "build" / f"test_generate{BIN_SUFFIX}"))
-TOKENIZER = os.environ.get("DFLASH_TOKENIZER", "Qwen/Qwen3.5-27B")
+TOKENIZER = os.environ.get("DFLASH_TOKENIZER", "Qwen/Qwen3.6-27B")
 TMPDIR = Path(tempfile.gettempdir()) / "dflash_bench"
 TMPDIR.mkdir(parents=True, exist_ok=True)
 
@@ -53,8 +53,8 @@ def _gsm_gold(x):
 
 
 BENCHES = [
-    ("HumanEval", "openai_humaneval", None, "test", lambda x: x["prompt"], None, N_GEN),
-    ("GSM8K", "gsm8k", "main", "test", lambda x: f"Question: {x['question']}\nAnswer: ", _gsm_gold, 1024),
+    ("HumanEval", "openai/openai_humaneval", None, "test", lambda x: x["prompt"], None, N_GEN),
+    ("GSM8K", "openai/gsm8k", "main", "test", lambda x: f"Question: {x['question']}\nAnswer: ", _gsm_gold, 1024),
     ("Math500", "HuggingFaceH4/MATH-500", None, "test", lambda x: f"Problem: {x['problem']}\nSolution: Put your final answer in \\boxed{{}}.\n", lambda x: x["answer"], 2048),
 ]
 
