@@ -383,9 +383,16 @@ bool build_target_step_tree(
     int kq_stride_pad) {
     step_graph_free(sg);
 
+    // ponytail: fuse tree-verify into the AR CUDA-graph replay lane by reusing a
+    // persistent thread_local arena (same trick as build_target_step). The fixed
+    // tree width N=ddtree_budget+1 is step-invariant within a request, so rebuilt
+    // graphs land at identical addresses -> ggml-cuda graph key (nodes[0]) stable
+    // -> the captured graph replays instead of re-launching every kernel host-side.
     ggml_init_params ip{};
     ip.mem_size   = 512 * 1024 * 1024;
-    ip.mem_buffer = nullptr;
+    static thread_local std::vector<uint8_t> g_tree_arena;
+    if (g_tree_arena.size() < ip.mem_size) g_tree_arena.resize(ip.mem_size);
+    ip.mem_buffer = g_tree_arena.data();
     ip.no_alloc   = true;
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
