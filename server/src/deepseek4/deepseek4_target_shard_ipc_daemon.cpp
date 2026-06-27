@@ -98,6 +98,8 @@ int run_deepseek4_target_shard_ipc_daemon(
         // Run the layer range using the full-model step function.
         // The weights struct has layers [layer_begin..layer_end) populated,
         // and deepseek4_step_layer_range handles routing to the correct layers.
+        std::fprintf(stderr, "[deepseek4-target-shard] forward: n_tokens=%d base_pos=%d layers=[%d,%d)\n",
+                     n_tokens, req.base_pos, plan.layer_begin, plan.layer_end);
         std::vector<float> logits;
         bool ok = deepseek4_step_layer_range(
             backend, weights, cache, hc_state,

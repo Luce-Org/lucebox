@@ -1921,6 +1921,9 @@ bool deepseek4_step_layer_range(
         hc_loaded_n_layer = w.n_layer;
     }
 
+    std::fprintf(stderr, "[deepseek4-lr] HC weights loaded, starting per-layer loop [%d,%d)\n",
+                 layer_begin, layer_end);
+
     // Per-layer execution with CPU-side HC
     for (int il = layer_begin; il < layer_end; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t)il];
@@ -1944,6 +1947,7 @@ bool deepseek4_step_layer_range(
         }
 
         // ── Build & run attention graph ─────────────────────────────
+        std::fprintf(stderr, "[deepseek4-lr] layer %d: building attn graph\n", il);
         {
             const size_t ctx_size = 48 * 1024 * 1024;
             ggml_init_params params{};
@@ -2021,6 +2025,7 @@ bool deepseek4_step_layer_range(
         }
 
         // ── Build & run FFN graph ───────────────────────────────────
+        std::fprintf(stderr, "[deepseek4-lr] layer %d: building ffn graph\n", il);
         {
             const size_t ctx_size = 48 * 1024 * 1024;
             ggml_init_params params{};
