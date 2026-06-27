@@ -19,6 +19,7 @@
 
 #include "laguna_internal.h"
 #include "../common/moe_hybrid_storage.h"
+#include "../common/moe_router_graph.h"
 #include "../common/kvflash_pager.h"
 #include "common/ggml_graph_precision.h"
 #include "internal.h"
@@ -66,15 +67,20 @@ bool create_laguna_target_cache_partial(const LagunaTargetWeights & w,
         return false;
     }
 
-    // kvflash: tensors at pool capacity, logical bound stays max_ctx.
-    const int ctx_phys = (ctx_alloc > 0 && ctx_alloc < max_ctx) ? ctx_alloc : max_ctx;
+    // Keep the physical KV span 256-aligned for ggml-cuda FA GQA kernels.
+    // The logical bound remains max_ctx; extra rows are masked and zero-filled.
+    constexpr int kKvFaPad = 256;
+    const int ctx_phys_raw = (ctx_alloc > 0 && ctx_alloc < max_ctx) ? ctx_alloc : max_ctx;
+    const int ctx_phys = std::max(ctx_phys_raw, ((ctx_phys_raw + kKvFaPad - 1) / kKvFaPad) * kKvFaPad);
 
     out.backend  = backend;
     out.max_ctx  = max_ctx;
     out.cur_pos  = 0;
     out.last_tok = -1;
+    out.kv_head_major = std::getenv("DFLASH_LAGUNA_KV_HEAD_MAJOR") != nullptr;
     // KV cache: per-layer, ALL 40 layers (full + SWA). Layout matches qwen35:
-    //   [head_dim, max_ctx, n_head_kv]
+    //   legacy:     [head_dim, max_ctx, n_head_kv]
+    //   head-major: [head_dim*n_head_kv, max_ctx]
     // dtype Q8_0 to halve VRAM vs F16.
     const ggml_type k_type = out.kv_k_type;
     const ggml_type v_type = out.kv_v_type;
@@ -95,10 +101,14 @@ bool create_laguna_target_cache_partial(const LagunaTargetWeights & w,
         if (il < layer_begin || il >= layer_end) continue;
         char nm[32];
         std::snprintf(nm, sizeof(nm), "k_l%d", il);
-        ggml_tensor * k = ggml_new_tensor_3d(out.base_ctx, k_type, w.head_dim, ctx_phys, w.n_head_kv);
+        ggml_tensor * k = out.kv_head_major
+            ? ggml_new_tensor_2d(out.base_ctx, k_type, w.head_dim * w.n_head_kv, ctx_phys)
+            : ggml_new_tensor_3d(out.base_ctx, k_type, w.head_dim, ctx_phys, w.n_head_kv);
         ggml_set_name(k, nm);
         std::snprintf(nm, sizeof(nm), "v_l%d", il);
-        ggml_tensor * v = ggml_new_tensor_3d(out.base_ctx, v_type, w.head_dim, ctx_phys, w.n_head_kv);
+        ggml_tensor * v = out.kv_head_major
+            ? ggml_new_tensor_2d(out.base_ctx, v_type, w.head_dim * w.n_head_kv, ctx_phys)
+            : ggml_new_tensor_3d(out.base_ctx, v_type, w.head_dim, ctx_phys, w.n_head_kv);
         ggml_set_name(v, nm);
         out.attn_k[il] = k;
         out.attn_v[il] = v;
@@ -151,11 +161,14 @@ bool laguna_snapshot_alloc(const LagunaTargetCache & cache,
         if (!cache.attn_k[il] || !cache.attn_v[il]) continue;
         char nm[32];
         std::snprintf(nm, sizeof(nm), "snap_k_l%d", il);
-        // Right-sized: [head_dim, snap_pos, n_head_kv]
-        ggml_tensor * k = ggml_new_tensor_3d(out.ctx, cache.kv_k_type, head_dim, snap_pos, n_head_kv);
+        ggml_tensor * k = cache.kv_head_major
+            ? ggml_new_tensor_2d(out.ctx, cache.kv_k_type, head_dim * n_head_kv, snap_pos)
+            : ggml_new_tensor_3d(out.ctx, cache.kv_k_type, head_dim, snap_pos, n_head_kv);
         ggml_set_name(k, nm);
         std::snprintf(nm, sizeof(nm), "snap_v_l%d", il);
-        ggml_tensor * v = ggml_new_tensor_3d(out.ctx, cache.kv_v_type, head_dim, snap_pos, n_head_kv);
+        ggml_tensor * v = cache.kv_head_major
+            ? ggml_new_tensor_2d(out.ctx, cache.kv_v_type, head_dim * n_head_kv, snap_pos)
+            : ggml_new_tensor_3d(out.ctx, cache.kv_v_type, head_dim, snap_pos, n_head_kv);
         ggml_set_name(v, nm);
         out.attn_k[il] = k;
         out.attn_v[il] = v;
@@ -218,13 +231,22 @@ bool laguna_snapshot_save(const LagunaTargetCache & cache,
         }
     }
 
-    // Copy KV strip-by-strip (right-sized snapshot, position dim = ne[1]).
+    // Copy KV strip-by-strip for legacy layout. Head-major layout stores each
+    // position as one contiguous row [head_dim*n_head_kv], so one contiguous
+    // prefix copy is enough.
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * sk = cache.attn_k[il];
         ggml_tensor * dk = snap.attn_k[il];
         ggml_tensor * sv = cache.attn_v[il];
         ggml_tensor * dv = snap.attn_v[il];
         if (!sk || !dk || !sv || !dv) continue;
+        if (cache.kv_head_major) {
+            const size_t k_bytes = (size_t)snap_pos * sk->nb[1];
+            const size_t v_bytes = (size_t)snap_pos * sv->nb[1];
+            ggml_backend_tensor_get(sk, dk->data, 0, k_bytes);
+            ggml_backend_tensor_get(sv, dv->data, 0, v_bytes);
+            continue;
+        }
         const size_t k_strip = (size_t)snap_pos * sk->nb[1];
         const size_t v_strip = (size_t)snap_pos * sv->nb[1];
         for (int kh = 0; kh < n_head_kv; kh++) {
@@ -255,13 +277,20 @@ bool laguna_snapshot_restore(const LagunaCacheSnapshot & snap,
         return false;
     }
     const int snap_pos = snap.cur_pos;
-    // Copy right-sized snapshot back into full-size cache, strip-by-strip.
+    // Copy right-sized snapshot back into full-size cache.
     for (size_t il = 0; il < cache.attn_k.size(); ++il) {
         ggml_tensor * sk = snap.attn_k[il];
         ggml_tensor * dk = cache.attn_k[il];
         ggml_tensor * sv = snap.attn_v[il];
         ggml_tensor * dv = cache.attn_v[il];
         if (!sk || !dk || !sv || !dv) continue;
+        if (cache.kv_head_major) {
+            const size_t k_bytes = (size_t)snap_pos * sk->nb[1];
+            const size_t v_bytes = (size_t)snap_pos * sv->nb[1];
+            ggml_backend_tensor_set(dk, sk->data, 0, k_bytes);
+            ggml_backend_tensor_set(dv, sv->data, 0, v_bytes);
+            continue;
+        }
         const size_t k_strip = (size_t)snap_pos * sk->nb[1];
         const size_t v_strip = (size_t)snap_pos * sv->nb[1];
         for (int kh = 0; kh < (int)sk->ne[2]; kh++) {
@@ -337,7 +366,7 @@ static ggml_tensor * build_laguna_dense_ffn(ggml_context * ctx, ggml_tensor * cu
 }
 
 // Forward decl for the full MoE block (defined further down).
-static ggml_tensor * build_laguna_moe_block_full(ggml_context * ctx, ggml_tensor * cur,
+static ggml_tensor * build_laguna_moe_block_full(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * cur,
                                                   const LagunaTargetWeights & w,
                                                   const LagunaTargetLayer & L);
 // Forward decl for the hybrid (offload) MoE block (defined further down).
@@ -376,45 +405,32 @@ static ggml_tensor * build_laguna_moe_block(ggml_context * ctx, ggml_cgraph * gf
             hyb->storage->layers[(size_t)il], hyb->lut_all, hyb->vld_all, hyb->sel_all,
             il - hyb->dense_lead);
     }
-    return build_laguna_moe_block_full(ctx, cur, w, L);
+    return build_laguna_moe_block_full(ctx, gf, cur, w, L);
 }
 
 // Phase 2.1: full MoE dispatch (sigmoid + score-correction bias + sum-norm +
 // scale 2.5 + always-on shared expert). Mirrors llama.cpp's build_moe_ffn for
 // the SIGMOID + WEIGHTS_NORM + EXP_PROBS_B configuration that Laguna uses.
-static ggml_tensor * build_laguna_moe_block_full(ggml_context * ctx, ggml_tensor * cur,
+static ggml_tensor * build_laguna_moe_block_full(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * cur,
                                                   const LagunaTargetWeights & w,
                                                   const LagunaTargetLayer & L) {
     const int n_tokens = (int)cur->ne[1];
     const int n_expert = w.n_expert;
     const int n_used   = w.n_expert_used;
     const int n_embd   = w.n_embd;
+    static const bool fused_combine = []() {
+        const char * e = std::getenv("DFLASH_LAGUNA_MOE_FUSED_COMBINE");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
 
-    // Router logits + sigmoid
     ggml_tensor * logits = ggml_mul_mat(ctx, L.ffn_gate_inp, cur);  // [n_expert, n_tokens]
-    ggml_tensor * probs  = ggml_sigmoid(ctx, logits);
-
-    // Add score-correction bias for SELECTION (not for combine weights).
-    ggml_tensor * scores_sel = ggml_add(ctx, probs, L.ffn_exp_probs_b);
-
-    // Top-k selection: indices [n_used, n_tokens] i32.
-    ggml_tensor * selected = ggml_top_k(ctx, scores_sel, n_used);
-
-    // Gather ORIGINAL probs (no bias) at the selected indices for combine weights.
-    // Trick: reshape probs to [1, n_expert, n_tokens] so ggml_get_rows treats
-    // the expert axis as the row axis. Output shape [1, n_used, n_tokens].
-    ggml_tensor * probs_3d = ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens);
-    ggml_tensor * weights  = ggml_get_rows(ctx, probs_3d, selected);
-    weights = ggml_reshape_2d(ctx, weights, n_used, n_tokens);
-
-    // Sum-normalize selected weights (Laguna sets expert_weights_norm=true).
-    ggml_tensor * w_sum = ggml_sum_rows(ctx, weights);  // [1, n_tokens]
-    weights = ggml_div(ctx, weights, w_sum);
-
-    // Scale routed combine.
-    if (w.expert_weights_scale != 1.0f) {
-        weights = ggml_scale(ctx, weights, w.expert_weights_scale);
-    }
+    TopKMoeRouterResult router = build_sigmoid_topk_moe_router(
+        ctx, gf, logits, L.ffn_exp_probs_b, n_expert, n_used, n_tokens,
+        /*normalize_weights=*/true, w.expert_weights_scale,
+        /*expand_weights=*/true);
+    ggml_tensor * selected   = router.selected;
+    ggml_tensor * weights_2d = router.weights_2d;
+    ggml_tensor * weights_3d = router.weights_3d;
 
     // Per-expert SwiGLU via mul_mat_id.
     //   ffn_gate_exps: [n_embd, n_ff_exp, n_expert]
@@ -432,21 +448,21 @@ static ggml_tensor * build_laguna_moe_block_full(ggml_context * ctx, ggml_tensor
     //   experts out:   [n_embd, n_used, n_tokens]
     ggml_tensor * experts = ggml_mul_mat_id(ctx, L.ffn_down_exps, gu, selected);
 
-    // Multiply per-expert outputs by their routing weights.
-    //   experts: [n_embd, n_used, n_tokens]
-    //   weights: [n_used, n_tokens] -> view as [1, n_used, n_tokens] for broadcast
-    ggml_tensor * w_view = ggml_reshape_3d(ctx, weights, 1, n_used, n_tokens);
-    experts = ggml_mul(ctx, experts, w_view);
-
-    // Sum across the n_used axis: explicit slice + add loop (matches llama.cpp
-    // pattern; ggml_sum_rows would sum over dim 0 which is n_embd, wrong).
     ggml_tensor * routed = nullptr;
-    for (int i = 0; i < n_used; ++i) {
-        ggml_tensor * slice = ggml_view_2d(ctx, experts,
-            n_embd, n_tokens,
-            experts->nb[2],
-            (size_t)i * experts->nb[1]);
-        routed = (i == 0) ? slice : ggml_add(ctx, routed, slice);
+    if (fused_combine) {
+        routed = ggml_laguna_moe_combine(ctx, experts, weights_2d);
+    } else {
+        experts = ggml_mul(ctx, experts, weights_3d);
+
+        // Sum across the n_used axis: explicit slice + add loop (matches llama.cpp
+        // pattern; ggml_sum_rows would sum over dim 0 which is n_embd, wrong).
+        for (int i = 0; i < n_used; ++i) {
+            ggml_tensor * slice = ggml_view_2d(ctx, experts,
+                n_embd, n_tokens,
+                experts->nb[2],
+                (size_t)i * experts->nb[1]);
+            routed = (i == 0) ? slice : ggml_add(ctx, routed, slice);
+        }
     }
 
     // Always-on shared expert (SwiGLU).
@@ -477,23 +493,18 @@ static ggml_tensor * build_laguna_moe_block_hybrid(ggml_context * ctx, ggml_cgra
     const int n_embd   = w.n_embd;
 
     ggml_tensor * logits = ggml_mul_mat(ctx, L.ffn_gate_inp, cur);
-    ggml_tensor * probs  = ggml_sigmoid(ctx, logits);
-    ggml_tensor * scores_sel = ggml_add(ctx, probs, L.ffn_exp_probs_b);
-    ggml_tensor * selected = ggml_top_k(ctx, scores_sel, n_used);  // [n_used, n_tokens] global ids
+    TopKMoeRouterResult router = build_sigmoid_topk_moe_router(
+        ctx, gf, logits, L.ffn_exp_probs_b, n_expert, n_used, n_tokens,
+        /*normalize_weights=*/true, w.expert_weights_scale,
+        /*expand_weights=*/false);
+    ggml_tensor * selected = router.selected;  // [n_used, n_tokens] global ids
     {   // batched readback: write this layer's selection into column moe_idx of sel_all
         ggml_tensor * sel_col = ggml_view_2d(ctx, sel_all, n_used, n_tokens,
                                              sel_all->nb[1], (size_t)moe_idx * sel_all->nb[1]);
         ggml_build_forward_expand(gf, ggml_cpy(ctx, selected, sel_col));
     }
 
-    ggml_tensor * probs_3d = ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens);
-    ggml_tensor * weights  = ggml_get_rows(ctx, probs_3d, selected);
-    weights = ggml_reshape_2d(ctx, weights, n_used, n_tokens);
-    ggml_tensor * w_sum = ggml_sum_rows(ctx, weights);
-    weights = ggml_div(ctx, weights, w_sum);
-    if (w.expert_weights_scale != 1.0f) {
-        weights = ggml_scale(ctx, weights, w.expert_weights_scale);
-    }
+    ggml_tensor * weights = router.weights_2d;
 
     // Per-layer residency LUT/valid = column moe_idx of the shared input tensors.
     ggml_tensor * lut = ggml_reshape_2d(ctx, ggml_view_1d(ctx, lut_all, n_expert, (size_t)moe_idx * lut_all->nb[1]), 1, n_expert);
@@ -691,8 +702,27 @@ static ggml_tensor * build_laguna_attn_block(
     // entries via the windowed view below. Per-layer-size optimization (SWA
     // ring buffer to halve KV memory) requires careful chunk sizing and is
     // deferred (see git history for an in-progress version).
-    ggml_tensor * Kcur_T = ggml_permute(ctx, Kcur, 0, 2, 1, 3);
-    ggml_tensor * Vcur_T = ggml_permute(ctx, Vcur, 0, 2, 1, 3);
+    const bool cache_head_major = cache_k && cache_k->ne[0] == head_dim * n_head_kv;
+    ggml_tensor * Kcur_rows = nullptr;
+    ggml_tensor * Vcur_rows = nullptr;
+    if (cache_head_major) {
+        const int64_t n_embd_kv = (int64_t)head_dim * n_head_kv;
+        const bool k_merge_view =
+            (size_t)Kcur->nb[1] == ggml_row_size(Kcur->type, head_dim) &&
+            (size_t)Kcur->nb[2] == ggml_row_size(Kcur->type, n_embd_kv);
+        const bool v_merge_view =
+            (size_t)Vcur->nb[1] == ggml_row_size(Vcur->type, head_dim) &&
+            (size_t)Vcur->nb[2] == ggml_row_size(Vcur->type, n_embd_kv);
+        Kcur_rows = k_merge_view
+            ? ggml_view_2d(ctx, Kcur, n_embd_kv, n_tokens, Kcur->nb[2], 0)
+            : ggml_cont_2d(ctx, Kcur, n_embd_kv, n_tokens);
+        Vcur_rows = v_merge_view
+            ? ggml_view_2d(ctx, Vcur, n_embd_kv, n_tokens, Vcur->nb[2], 0)
+            : ggml_cont_2d(ctx, Vcur, n_embd_kv, n_tokens);
+    } else {
+        Kcur_rows = ggml_permute(ctx, Kcur, 0, 2, 1, 3);
+        Vcur_rows = ggml_permute(ctx, Vcur, 0, 2, 1, 3);
+    }
 
     if (kv_idx) {
         // CUDA-graph-stable append: the destination is the WHOLE cache tensor
@@ -700,23 +730,34 @@ static ggml_tensor * build_laguna_attn_block(
         // changes per step but whose pointer doesn't. A kv_start-offset view
         // (below) changes node properties every step, which resets the
         // ggml-cuda CUDA-graph warmup and forfeits replay.
-        // kv_idx [n_tokens] broadcasts over the n_head_kv dim (ggml_set_rows
-        // requires b->ne[2] % c->ne[1] == 0).
-        ggml_tensor * Krows = ggml_cont(ctx, Kcur_T);  // set_rows needs contiguous rows
-        ggml_tensor * Vrows = ggml_cont(ctx, Vcur_T);
+        // Legacy layout broadcasts kv_idx over n_head_kv. Head-major layout
+        // stores all KV heads for a token in one row [head_dim*n_head_kv].
+        ggml_tensor * Krows = cache_head_major ? Kcur_rows : ggml_cont(ctx, Kcur_rows);
+        ggml_tensor * Vrows = cache_head_major ? Vcur_rows : ggml_cont(ctx, Vcur_rows);
         ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_k, Krows, kv_idx));
         ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_v, Vrows, kv_idx));
     } else {
-        ggml_tensor * k_slot = ggml_view_3d(ctx, cache_k,
-            head_dim, n_tokens, n_head_kv,
-            cache_k->nb[1], cache_k->nb[2],
-            cache_k->nb[1] * (size_t)kv_start);
-        ggml_tensor * v_slot = ggml_view_3d(ctx, cache_v,
-            head_dim, n_tokens, n_head_kv,
-            cache_v->nb[1], cache_v->nb[2],
-            cache_v->nb[1] * (size_t)kv_start);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_T, k_slot));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
+        if (cache_head_major) {
+            ggml_tensor * k_slot = ggml_view_2d(ctx, cache_k,
+                head_dim * n_head_kv, n_tokens,
+                cache_k->nb[1], cache_k->nb[1] * (size_t)kv_start);
+            ggml_tensor * v_slot = ggml_view_2d(ctx, cache_v,
+                head_dim * n_head_kv, n_tokens,
+                cache_v->nb[1], cache_v->nb[1] * (size_t)kv_start);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_rows, k_slot));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_rows, v_slot));
+        } else {
+            ggml_tensor * k_slot = ggml_view_3d(ctx, cache_k,
+                head_dim, n_tokens, n_head_kv,
+                cache_k->nb[1], cache_k->nb[2],
+                cache_k->nb[1] * (size_t)kv_start);
+            ggml_tensor * v_slot = ggml_view_3d(ctx, cache_v,
+                head_dim, n_tokens, n_head_kv,
+                cache_v->nb[1], cache_v->nb[2],
+                cache_v->nb[1] * (size_t)kv_start);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_rows, k_slot));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_rows, v_slot));
+        }
     }
 
     // ---- Flash attention ---
@@ -736,12 +777,27 @@ static ggml_tensor * build_laguna_attn_block(
     ggml_tensor * Qfa = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
     Qfa = ggml_cont(ctx, Qfa);
 
-    ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
-        head_dim, win_len, n_head_kv,
-        cache_k->nb[1], cache_k->nb[2], cache_k->nb[1] * (size_t)win_start);
-    ggml_tensor * Vfa = ggml_view_3d(ctx, cache_v,
-        head_dim, win_len, n_head_kv,
-        cache_v->nb[1], cache_v->nb[2], cache_v->nb[1] * (size_t)win_start);
+    ggml_tensor * Kfa = nullptr;
+    ggml_tensor * Vfa = nullptr;
+    if (cache_head_major) {
+        ggml_tensor * Kview = ggml_view_3d(ctx, cache_k,
+            head_dim, n_head_kv, win_len,
+            ggml_row_size(cache_k->type, head_dim), cache_k->nb[1],
+            cache_k->nb[1] * (size_t)win_start);
+        ggml_tensor * Vview = ggml_view_3d(ctx, cache_v,
+            head_dim, n_head_kv, win_len,
+            ggml_row_size(cache_v->type, head_dim), cache_v->nb[1],
+            cache_v->nb[1] * (size_t)win_start);
+        Kfa = ggml_permute(ctx, Kview, 0, 2, 1, 3);
+        Vfa = ggml_permute(ctx, Vview, 0, 2, 1, 3);
+    } else {
+        Kfa = ggml_view_3d(ctx, cache_k,
+            head_dim, win_len, n_head_kv,
+            cache_k->nb[1], cache_k->nb[2], cache_k->nb[1] * (size_t)win_start);
+        Vfa = ggml_view_3d(ctx, cache_v,
+            head_dim, win_len, n_head_kv,
+            cache_v->nb[1], cache_v->nb[2], cache_v->nb[1] * (size_t)win_start);
+    }
 
     const float kq_scale = 1.0f / std::sqrt((float)head_dim);
     // FULL -> attn_mask (causal). SWA -> attn_mask_swa (causal + sliding-window).
