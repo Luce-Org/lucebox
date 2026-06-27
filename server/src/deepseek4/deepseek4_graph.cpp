@@ -1742,8 +1742,8 @@ bool deepseek4_step(
     const int n_embd = w.n_embd;
     const int n_layer = w.n_layer;
 
-    // Create compute graph context
-    const size_t ctx_size = ggml_tensor_overhead() * 4096 + 1024 * 1024;
+    // Create compute graph context — need large budget for MoE layers
+    const size_t ctx_size = ggml_tensor_overhead() * 65536 + 16 * 1024 * 1024;
     ggml_init_params params{};
     params.mem_size = ctx_size;
     params.mem_buffer = nullptr;
@@ -1757,7 +1757,7 @@ bool deepseek4_step(
     ggml_set_input(inp);
 
     ggml_tensor * cur = inp;
-    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 32768, false);
     std::vector<DeepSeek4I32InputBinding> i32_inputs;
     std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
 
@@ -1890,8 +1890,8 @@ bool deepseek4_step_layer_range(
     const int n_embd = w.n_embd;
     const bool is_last_shard = (layer_end >= w.n_layer);
 
-    // Create compute graph context
-    const size_t ctx_size = ggml_tensor_overhead() * 4096 + 1024 * 1024;
+    // Create compute graph context — need large budget for MoE layers
+    const size_t ctx_size = ggml_tensor_overhead() * 65536 + 16 * 1024 * 1024;
     ggml_init_params params{};
     params.mem_size = ctx_size;
     params.mem_buffer = nullptr;
@@ -1905,7 +1905,7 @@ bool deepseek4_step_layer_range(
     ggml_set_input(inp);
 
     ggml_tensor * cur = inp;
-    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 32768, false);
     std::vector<DeepSeek4I32InputBinding> i32_inputs;
     std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
 
