@@ -44,8 +44,10 @@ DeepSeek4LayerSplitAdapter::~DeepSeek4LayerSplitAdapter() {
 
 int DeepSeek4LayerSplitAdapter::estimate_cuda_layers_from_free_bytes(
         size_t free_bytes) {
-    const uint64_t fixed_overhead = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
-    const uint64_t per_layer_bytes = 500ULL * 1024 * 1024;      // ~500 MiB
+    const uint64_t fixed_overhead = 2ULL * 1024 * 1024 * 1024;  // 2 GiB for KV cache + overhead
+    // Estimate per-layer size from the model file. DS4 has 43 layers + embed/output.
+    // Use file size if available, otherwise use conservative 1.9 GiB estimate.
+    uint64_t per_layer_bytes = 1900ULL * 1024 * 1024;  // ~1.9 GiB default
 
     if ((uint64_t) free_bytes <= fixed_overhead) {
         return 1;
@@ -88,12 +90,11 @@ int DeepSeek4LayerSplitAdapter::compute_auto_split_layers() const {
 #endif
 
     // DS4 layer memory estimation:
-    // Per layer (approximate, FP8/Q4 mixed):
-    //   Attention: q_a(4096×1024) + q_b(1024×32768) + kv(4096×512) + output_a + output_b
-    //     ~ 40MB in FP8
-    //   MoE experts: 3 × (4096 × 2048 × 256) = 3 × 2GB raw, ~400MB in FP4/FP8
-    //   Shared expert + HC + router + compressor ~ 50MB
-    //   Total per layer ~ 500MB (heavily quantized)
+    // Per layer (for IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8 quantization):
+    //   MoE experts: 256 experts × 3 matrices × (4096 × 2048) in IQ2_XXS ~ 1.5GB
+    //   Attention (MLA): Q/KV projections + output in Q8 ~ 200MB
+    //   Shared expert + HC + router + compressor ~ 100MB
+    //   Total per layer ~ 1.9 GiB
     //
     // Plus fixed costs:
     //   Embedding: ~500MB
