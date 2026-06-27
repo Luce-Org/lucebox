@@ -223,7 +223,9 @@ bool DeepSeek4LayerSplitAdapter::init_mixed_target_split_full(const DevicePlacem
     TargetLoadPlan plan;
     plan.layer_begin = local_shard.layer_begin;
     plan.layer_end = local_shard.layer_end;
-    plan.load_output = false;  // Output head on remote shard
+    // load_output=true so we get token_embd (needed for embedding on first shard).
+    // output_norm/output weights are loaded but unused — small cost relative to layers.
+    plan.load_output = (local_shard.layer_begin == 0);
 
     if (!load_deepseek4_gguf_partial(cfg_.target_path, local_shard.backend, plan, local_shard.weights)) {
         std::fprintf(stderr, "[deepseek4-split] failed to load local shard layers [%d,%d)\n",
