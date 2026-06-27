@@ -1874,8 +1874,6 @@ bool deepseek4_step_layer_range(
         std::vector<float> * out_logits,
         const int32_t * token_ids,
         DeepSeek4StepTelemetry * telemetry) {
-    (void) hc_state;
-    (void) token_ids;
     (void) telemetry;
 
     // Full-model fast path: delegate to the original step function
@@ -1886,115 +1884,268 @@ bool deepseek4_step_layer_range(
                               nullptr, token_ids, nullptr, false, telemetry, nullptr);
     }
 
-    // ── Partial layer-range forward ─────────────────────────────────────
+    // ── Partial layer-range forward with HC ─────────────────────────────
     const int n_embd = w.n_embd;
+    const int n_hc = w.n_hc;
+    const int hc_dim = n_hc * n_embd;
     const bool is_last_shard = (layer_end >= w.n_layer);
 
-    // Create compute graph context — need large budget for MoE layers
-    const size_t ctx_size = ggml_tensor_overhead() * 65536 + 16 * 1024 * 1024;
-    ggml_init_params params{};
-    params.mem_size = ctx_size;
-    params.mem_buffer = nullptr;
-    params.no_alloc = true;
-    ggml_context * ctx = ggml_init(params);
-    if (!ctx) return false;
-
-    // Input: hidden state from previous shard (n_embd * n_tokens)
-    ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
-    ggml_set_name(inp, "inp_hidden");
-    ggml_set_input(inp);
-
-    ggml_tensor * cur = inp;
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 32768, false);
-    std::vector<DeepSeek4I32InputBinding> i32_inputs;
-    std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
-
-    // Layer loop for [layer_begin, layer_end)
-    for (int il = layer_begin; il < layer_end; il++) {
-        const DeepSeek4Layer & L = w.layers[il];
-        DeepSeek4LayerCache & lc = cache.layers[il];
-
-        // ── Attention norm
-        ggml_tensor * normed = build_rms_norm(ctx, cur, L.attn_norm, w.rms_eps);
-
-        // ── MLA attention
-        ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc,
-                                                      il, kv_start, n_tokens,
-                                                      i32_inputs, i32_array_inputs);
-
-        // ── Residual
-        cur = ggml_add(ctx, cur, attn_out);
-
-        // ── FFN norm
-        ggml_tensor * ffn_normed = build_rms_norm(ctx, cur, L.ffn_norm, w.rms_eps);
-
-        // ── MoE FFN
-        ggml_tensor * ffn_out = build_moe_ffn(ctx, ffn_normed, w, L, il, n_tokens);
-
-        // ── Residual
-        cur = ggml_add(ctx, cur, ffn_out);
+    // Initialize HC state from embedding: replicate embed into n_hc streams
+    if (hc_state.size() != (size_t)hc_dim * (size_t)n_tokens) {
+        hc_state.resize((size_t)hc_dim * (size_t)n_tokens);
     }
-
-    // Output: either logits (last shard) or hidden state (intermediate shard)
-    ggml_tensor * output_tensor;
-    if (is_last_shard) {
-        cur = build_rms_norm(ctx, cur, w.out_norm, w.rms_eps);
-        output_tensor = ggml_mul_mat(ctx, w.output, cur);
-        ggml_set_name(output_tensor, "logits");
-    } else {
-        output_tensor = cur;
-        ggml_set_name(output_tensor, "hidden_out");
-    }
-    ggml_set_output(output_tensor);
-
-    // Build and run graph
-    ggml_build_forward_expand(gf, output_tensor);
-
-    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    if (!ggml_gallocr_alloc_graph(alloc, gf)) {
-        std::fprintf(stderr, "[deepseek4] partial graph allocation failed for [%d,%d)\n",
-                     layer_begin, layer_end);
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx);
-        return false;
-    }
-
-    // Set input data
-    ggml_backend_tensor_set(inp, embed, 0, (size_t)n_embd * n_tokens * sizeof(float));
-    for (const DeepSeek4I32InputBinding & binding : i32_inputs) {
-        ggml_backend_tensor_set(binding.tensor, &binding.value, 0, sizeof(binding.value));
-    }
-    for (const DeepSeek4I32ArrayBinding & binding : i32_array_inputs) {
-        ggml_backend_tensor_set(binding.tensor, binding.values.data(), 0,
-                                sizeof(int32_t) * binding.values.size());
-    }
-
-    // Compute
-    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
-        std::fprintf(stderr, "[deepseek4] partial graph compute failed for [%d,%d)\n",
-                     layer_begin, layer_end);
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx);
-        return false;
-    }
-
-    // Read output
-    if (out_logits) {
-        if (is_last_shard) {
-            out_logits->resize(w.n_vocab);
-            const size_t logits_offset = (size_t)(n_tokens - 1) * w.n_vocab * sizeof(float);
-            ggml_backend_tensor_get(output_tensor, out_logits->data(), logits_offset,
-                                    w.n_vocab * sizeof(float));
-        } else {
-            // Return hidden state for next shard
-            out_logits->resize((size_t)n_embd * n_tokens);
-            ggml_backend_tensor_get(output_tensor, out_logits->data(), 0,
-                                    (size_t)n_embd * n_tokens * sizeof(float));
+    for (int t = 0; t < n_tokens; t++) {
+        for (int h = 0; h < n_hc; h++) {
+            memcpy(hc_state.data() + (size_t)t * hc_dim + (size_t)h * n_embd,
+                   embed + (size_t)t * n_embd, (size_t)n_embd * sizeof(float));
         }
     }
 
-    ggml_gallocr_free(alloc);
-    ggml_free(ctx);
+    // Lazy-load per-layer HC weights on CPU (static to avoid reloading)
+    static std::vector<HcLayerWeightsCpu> hc_layer_weights_range;
+    static HcWeightsCpu hc_output_weights_range;
+    static std::vector<HashRoutingTableCpu> hash_routing_tables_range;
+    static int hc_loaded_n_layer = 0;
+    if (hc_loaded_n_layer != w.n_layer) {
+        hc_layer_weights_range.resize((size_t)w.n_layer);
+        hash_routing_tables_range.resize((size_t)w.n_layer);
+        for (int il = 0; il < w.n_layer; il++) {
+            const DeepSeek4Layer & L = w.layers[(size_t)il];
+            load_hc_weights_cpu(hc_layer_weights_range[il].attn, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base);
+            load_hc_weights_cpu(hc_layer_weights_range[il].ffn, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base);
+            if (il < w.n_hash_layer && L.ffn_gate_tid2eid) {
+                load_hash_routing_cpu(hash_routing_tables_range[(size_t)il], L.ffn_gate_tid2eid);
+            }
+        }
+        load_hc_weights_cpu(hc_output_weights_range, w.output_hc_fn, w.output_hc_scale, w.output_hc_base);
+        hc_loaded_n_layer = w.n_layer;
+    }
+
+    // Per-layer execution with CPU-side HC
+    for (int il = layer_begin; il < layer_end; ++il) {
+        const DeepSeek4Layer & L = w.layers[(size_t)il];
+        DeepSeek4LayerCache & lc = cache.layers[(size_t)il];
+        const HcLayerWeightsCpu & hc_lw = hc_layer_weights_range[(size_t)il];
+
+        // ── HC pre (attention) ──────────────────────────────────────
+        std::vector<float> cur((size_t)n_embd * (size_t)n_tokens);
+        HcPreResult hc_attn_result;
+        if (hc_lw.attn.loaded && n_tokens == 1) {
+            hc_attn_result = hc_pre_auto(hc_state.data(), hc_lw.attn, L.hc_attn_fn,
+                                         n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
+            memcpy(cur.data(), hc_attn_result.working.data(), (size_t)n_embd * sizeof(float));
+        } else {
+            // Prefill fallback: use first HC stream
+            for (int t = 0; t < n_tokens; t++) {
+                memcpy(cur.data() + (size_t)t * n_embd,
+                       hc_state.data() + (size_t)t * hc_dim,
+                       (size_t)n_embd * sizeof(float));
+            }
+        }
+
+        // ── Build & run attention graph ─────────────────────────────
+        {
+            const size_t ctx_size = 48 * 1024 * 1024;
+            ggml_init_params params{};
+            params.mem_size = ctx_size;
+            params.mem_buffer = nullptr;
+            params.no_alloc = true;
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) return false;
+
+            ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_input(inp);
+            std::vector<DeepSeek4I32InputBinding> i32_inputs;
+            std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
+            ggml_cgraph * gf = ggml_new_graph_custom(ctx, 2048, false);
+
+            ggml_tensor * normed = build_rms_norm(ctx, inp, L.attn_norm, w.rms_eps);
+            ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
+                                                         kv_start, n_tokens, i32_inputs,
+                                                         i32_array_inputs);
+            ggml_set_output(attn_out);
+            ggml_build_forward_expand(gf, attn_out);
+
+            ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            if (!ggml_gallocr_alloc_graph(alloc, gf)) {
+                std::fprintf(stderr, "[deepseek4] attn graph alloc failed layer %d\n", il);
+                ggml_gallocr_free(alloc); ggml_free(ctx);
+                return false;
+            }
+            ggml_backend_tensor_set(inp, cur.data(), 0, sizeof(float) * cur.size());
+            for (const auto & b : i32_inputs)
+                ggml_backend_tensor_set(b.tensor, &b.value, 0, sizeof(b.value));
+            for (const auto & b : i32_array_inputs)
+                ggml_backend_tensor_set(b.tensor, b.values.data(), 0, sizeof(int32_t) * b.values.size());
+
+            if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "[deepseek4] attn compute failed layer %d\n", il);
+                ggml_gallocr_free(alloc); ggml_free(ctx);
+                return false;
+            }
+
+            std::vector<float> attn_out_host((size_t)n_embd * (size_t)n_tokens);
+            ggml_backend_tensor_get(attn_out, attn_out_host.data(), 0, sizeof(float) * attn_out_host.size());
+            ggml_gallocr_free(alloc);
+            ggml_free(ctx);
+
+            // ── HC post (attention) ─────────────────────────────────
+            if (hc_lw.attn.loaded && n_tokens == 1) {
+                std::vector<float> new_hc((size_t)hc_dim);
+                cpu_hc_post(new_hc.data(), attn_out_host.data(), hc_state.data(),
+                            hc_attn_result.post, hc_attn_result.comb, n_embd, n_hc);
+                memcpy(hc_state.data(), new_hc.data(), (size_t)hc_dim * sizeof(float));
+            } else {
+                // Prefill fallback: add attn_out to first stream
+                for (int t = 0; t < n_tokens; t++) {
+                    float * s = hc_state.data() + (size_t)t * hc_dim;
+                    const float * a = attn_out_host.data() + (size_t)t * n_embd;
+                    for (int d = 0; d < n_embd; d++) s[d] += a[d];
+                }
+            }
+        }
+
+        // ── HC pre (FFN) ────────────────────────────────────────────
+        std::vector<float> ffn_working((size_t)n_embd * (size_t)n_tokens);
+        HcPreResult hc_ffn_result;
+        if (hc_lw.ffn.loaded && n_tokens == 1) {
+            hc_ffn_result = hc_pre_auto(hc_state.data(), hc_lw.ffn, L.hc_ffn_fn,
+                                        n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
+            memcpy(ffn_working.data(), hc_ffn_result.working.data(), (size_t)n_embd * sizeof(float));
+        } else {
+            for (int t = 0; t < n_tokens; t++) {
+                memcpy(ffn_working.data() + (size_t)t * n_embd,
+                       hc_state.data() + (size_t)t * hc_dim,
+                       (size_t)n_embd * sizeof(float));
+            }
+        }
+
+        // ── Build & run FFN graph ───────────────────────────────────
+        {
+            const size_t ctx_size = 48 * 1024 * 1024;
+            ggml_init_params params{};
+            params.mem_size = ctx_size;
+            params.mem_buffer = nullptr;
+            params.no_alloc = true;
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) return false;
+
+            ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_input(inp);
+            ggml_cgraph * gf = ggml_new_graph_custom(ctx, 2048, false);
+
+            ggml_tensor * ffn_normed = build_rms_norm(ctx, inp, L.ffn_norm, w.rms_eps);
+            ggml_tensor * ffn_out = build_moe_ffn(ctx, ffn_normed, w, L, il, n_tokens);
+            ggml_set_output(ffn_out);
+            ggml_build_forward_expand(gf, ffn_out);
+
+            ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            if (!ggml_gallocr_alloc_graph(alloc, gf)) {
+                std::fprintf(stderr, "[deepseek4] ffn graph alloc failed layer %d\n", il);
+                ggml_gallocr_free(alloc); ggml_free(ctx);
+                return false;
+            }
+            ggml_backend_tensor_set(inp, ffn_working.data(), 0, sizeof(float) * ffn_working.size());
+
+            if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "[deepseek4] ffn compute failed layer %d\n", il);
+                ggml_gallocr_free(alloc); ggml_free(ctx);
+                return false;
+            }
+
+            std::vector<float> ffn_out_host((size_t)n_embd * (size_t)n_tokens);
+            ggml_backend_tensor_get(ffn_out, ffn_out_host.data(), 0, sizeof(float) * ffn_out_host.size());
+            ggml_gallocr_free(alloc);
+            ggml_free(ctx);
+
+            // ── HC post (FFN) ───────────────────────────────────────
+            if (hc_lw.ffn.loaded && n_tokens == 1) {
+                std::vector<float> new_hc((size_t)hc_dim);
+                cpu_hc_post(new_hc.data(), ffn_out_host.data(), hc_state.data(),
+                            hc_ffn_result.post, hc_ffn_result.comb, n_embd, n_hc);
+                memcpy(hc_state.data(), new_hc.data(), (size_t)hc_dim * sizeof(float));
+            } else {
+                for (int t = 0; t < n_tokens; t++) {
+                    float * s = hc_state.data() + (size_t)t * hc_dim;
+                    const float * f = ffn_out_host.data() + (size_t)t * n_embd;
+                    for (int d = 0; d < n_embd; d++) s[d] += f[d];
+                }
+            }
+        }
+    }
+
+    // ── Output: HC pre → norm → lm_head (or return hidden state) ────────
+    if (is_last_shard && out_logits) {
+        // Final HC pre for output
+        std::vector<float> final_embd((size_t)n_embd * (size_t)n_tokens);
+        if (hc_output_weights_range.loaded && n_tokens == 1) {
+            std::vector<float> flat((size_t)hc_dim);
+            cpu_rms_norm(flat.data(), hc_state.data(), hc_dim, w.hc_eps);
+            std::vector<float> pre(n_hc);
+            cpu_matvec_f16(pre.data(), hc_output_weights_range.fn_data.data(), flat.data(), n_hc, hc_dim);
+            float hc_weights[4];
+            for (int i = 0; i < n_hc; i++) {
+                const float z = pre[i] * hc_output_weights_range.scale_data[0] + hc_output_weights_range.base_data[i];
+                hc_weights[i] = 1.0f / (1.0f + expf(-z)) + 1.0e-6f;
+            }
+            for (int d = 0; d < n_embd; d++) {
+                float acc = 0.0f;
+                for (int h = 0; h < n_hc; h++) {
+                    acc += hc_weights[h] * hc_state[(size_t)h * n_embd + d];
+                }
+                final_embd[d] = acc;
+            }
+        } else {
+            for (int t = 0; t < n_tokens; t++) {
+                memcpy(final_embd.data() + (size_t)t * n_embd,
+                       hc_state.data() + (size_t)t * hc_dim,
+                       (size_t)n_embd * sizeof(float));
+            }
+        }
+
+        // Build norm + lm_head graph
+        const size_t ctx_size = 16 * 1024 * 1024;
+        ggml_init_params params{};
+        params.mem_size = ctx_size;
+        params.mem_buffer = nullptr;
+        params.no_alloc = true;
+        ggml_context * ctx = ggml_init(params);
+        if (!ctx) return false;
+
+        ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp);
+        ggml_tensor * normed = build_rms_norm(ctx, inp, w.out_norm, w.rms_eps);
+        ggml_tensor * logits = ggml_mul_mat(ctx, w.output, normed);
+        ggml_set_output(logits);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 1024, false);
+        ggml_build_forward_expand(gf, logits);
+
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!ggml_gallocr_alloc_graph(alloc, gf)) {
+            ggml_gallocr_free(alloc); ggml_free(ctx);
+            return false;
+        }
+        ggml_backend_tensor_set(inp, final_embd.data(), 0, sizeof(float) * final_embd.size());
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            ggml_gallocr_free(alloc); ggml_free(ctx);
+            return false;
+        }
+
+        out_logits->resize((size_t)w.n_vocab);
+        const size_t logits_offset = (size_t)(n_tokens - 1) * (size_t)w.n_vocab * sizeof(float);
+        ggml_backend_tensor_get(logits, out_logits->data(), logits_offset,
+                                sizeof(float) * (size_t)w.n_vocab);
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+    } else if (out_logits) {
+        // Return hidden state for next shard (first HC stream)
+        out_logits->resize((size_t)n_embd * n_tokens);
+        for (int t = 0; t < n_tokens; t++) {
+            memcpy(out_logits->data() + (size_t)t * n_embd,
+                   hc_state.data() + (size_t)t * hc_dim,
+                   (size_t)n_embd * sizeof(float));
+        }
+    }
 
     // Update compressor state
     const int next_pos = kv_start + n_tokens;
