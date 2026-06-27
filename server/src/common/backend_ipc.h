@@ -28,6 +28,7 @@ enum class BackendIpcMode {
     Gemma4TargetShard,
     LagunaTargetShard,
     MoeExpertCompute,
+    DeepSeek4TargetShard,
     MoeExpert,
 };
 

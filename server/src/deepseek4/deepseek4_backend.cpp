@@ -523,19 +523,9 @@ bool DeepSeek4Backend::init() {
         return false;
     }
 
-    if (moe_hybrid_ && (env_flag_enabled("DFLASH_DS4_EXPERT_IPC") || expert_worker_owns_hot_ids_)) {
-        const std::string bin = env_str("DFLASH_DS4_EXPERT_IPC_BIN", "backend_ipc_daemon");
-        const std::string model = env_str("DFLASH_DS4_EXPERT_IPC_MODEL", cfg_.model_path);
-        const std::string work_dir = env_str("DFLASH_DS4_EXPERT_IPC_WORK_DIR", "");
-        const int worker_gpu = env_int("DFLASH_DS4_EXPERT_IPC_GPU", 0);
-        expert_worker_ = std::make_unique<ExpertIpcClient>();
-        if (!expert_worker_->start(bin, model, worker_gpu, work_dir)) {
-            std::fprintf(stderr, "[deepseek4] failed to start expert IPC worker: bin=%s model=%s gpu=%d\n",
-                         bin.c_str(), model.c_str(), worker_gpu);
-            return false;
-        }
-        std::fprintf(stderr, "[deepseek4] expert IPC worker ready: bin=%s gpu=%d\n",
-                     bin.c_str(), worker_gpu);
+    if (moe_hybrid_) {
+        // Expert IPC removed — layer split replaces expert split.
+        // The DeepSeek4Backend single-GPU path now runs all experts locally.
     }
 
     std::fprintf(stderr, "[deepseek4] initialized: %d layers, ctx=%d, %d experts (%d used)%s\n",
@@ -580,7 +570,7 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
 }
 
 bool DeepSeek4Backend::init_hybrid_model() {
-    expert_worker_owns_hot_ids_ = false;
+    bool expert_worker_owns_hot_ids = false;
     TargetLoadPlan plan;
     plan.skip_expert_tensors = true;
     if (!load_deepseek4_gguf_partial(cfg_.model_path, backend_, plan, w_)) {
@@ -613,13 +603,13 @@ bool DeepSeek4Backend::init_hybrid_model() {
             std::fprintf(stderr, "[deepseek4] failed to load placement: %s\n", err.c_str());
             return false;
         }
-        expert_worker_owns_hot_ids_ = split_hip_hot_cpu_cold;
+        expert_worker_owns_hot_ids = split_hip_hot_cpu_cold;
     } else if (split_hip_hot_cpu_cold) {
         if (!compute_worker_hot_placement_from_env(w_, moe_placement_, &err)) {
             std::fprintf(stderr, "[deepseek4] failed to compute split placement: %s\n", err.c_str());
             return false;
         }
-        expert_worker_owns_hot_ids_ = true;
+        expert_worker_owns_hot_ids = true;
     } else if (adaptive_hot) {
         if (!compute_adaptive_hybrid_placement(w_, cfg_.device.gpu, max_ctx, moe_placement_, &err)) {
             std::fprintf(stderr, "[deepseek4] failed to compute adaptive hybrid placement: %s\n", err.c_str());
@@ -674,7 +664,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
         moe_hybrid_->cold_backend_kind == MoeHybridColdBackend::Gpu ? "gpu" : "cpu";
     std::fprintf(stderr, "[deepseek4] hybrid experts ready: hot=%d cold=%d cold_backend=%s%s\n",
                  moe_placement_.total_hot, total_cold, cold_backend,
-                 expert_worker_owns_hot_ids_ ? " [worker-hot/cpu-cold]" : "");
+                 expert_worker_owns_hot_ids ? " [worker-hot/cpu-cold]" : "");
     return true;
 }
 
@@ -726,8 +716,8 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         // Run forward pass
         std::vector<float> logits;
         if (!deepseek4_step(backend_, w_, cache_, embed.data(), n_tok, pos, logits,
-                            moe_hybrid_.get(), tokens.data() + i, expert_worker_.get(),
-                            expert_worker_owns_hot_ids_,
+                            moe_hybrid_.get(), tokens.data() + i, nullptr,
+                            false,
                             timing ? &step_tel : nullptr,
                             routing_stats_.get())) {
             std::fprintf(stderr, "[deepseek4] prefill step failed at pos=%d\n", pos);
@@ -788,8 +778,8 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             const int pos = std::max(0, committed + generated - 1);
             if (!deepseek4_step(backend_, w_, cache_, embed.data(), 1,
                                 pos, logits,
-                                moe_hybrid_.get(), &tok_to_eval, expert_worker_.get(),
-                                expert_worker_owns_hot_ids_,
+                                moe_hybrid_.get(), &tok_to_eval, nullptr,
+                                false,
                                 timing ? &step_tel : nullptr,
                                 routing_stats_.get())) {
                 std::fprintf(stderr, "[deepseek4] decode step failed\n");
@@ -926,7 +916,6 @@ void DeepSeek4Backend::shutdown() {
         free_deepseek4_snapshot(snapshots_[i]);
     }
     free_deepseek4_cache(cache_);
-    expert_worker_.reset();
     moe_hybrid_.reset();
     routing_stats_.reset();
     routing_stats_out_path_.clear();

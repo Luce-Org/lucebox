@@ -4,6 +4,7 @@
 #include "moe_expert_compute.h"
 #include "expert_ipc.h"
 #include "dflash_draft_ipc.h"
+#include "deepseek4/deepseek4_layer_split_adapter.h"
 #include "gemma4/gemma4_layer_split_adapter.h"
 #include "laguna/laguna_layer_split_adapter.h"
 #include "pflash_drafter_ipc.h"
@@ -126,10 +127,14 @@ int main(int argc, char ** argv) {
             "--stream-fd=FD --target-gpus=N[,N...] --layer-begins=N[,N...] "
             "--layer-ends=N[,N...] --max-ctx=N "
             "[--hidden=N --vocab=N --max-tokens=N]\n"
+            "   or: %s --backend-ipc-mode=deepseek4-target-shard <target.gguf> "
+            "--stream-fd=FD --target-gpus=N[,N...] --layer-begins=N[,N...] "
+            "--layer-ends=N[,N...] --max-ctx=N\n"
             "   or: %s --backend-ipc-mode=moe-expert-compute <target.gguf> "
             "--stream-fd=FD --target-gpu=N --placement=PATH\n"
             "   or: %s --backend-ipc-mode=moe-expert <model.gguf> "
             "--stream-fd=FD [--payload-fd=FD] [--draft-gpu=N]\n",
+            argv[0],
             argv[0],
             argv[0],
             argv[0],
@@ -366,6 +371,13 @@ int main(int argc, char ** argv) {
                                                      target_gpu, stream_fd,
                                                      payload_fd, shared_payload_fd,
                                                      shared_payload_bytes);
+        case BackendIpcMode::DeepSeek4TargetShard:
+            if (target_gpus.empty()) target_gpus.push_back(target_gpu);
+            if (layer_begins.empty()) layer_begins.push_back(layer_begin);
+            if (layer_ends.empty()) layer_ends.push_back(layer_end);
+            return run_deepseek4_target_shard_ipc_daemon(
+                payload_path, target_gpus, layer_begins, layer_ends, max_ctx,
+                stream_fd, payload_fd);
         case BackendIpcMode::MoeExpert:
             return run_expert_ipc_daemon(payload_path, draft_gpu,
                                          stream_fd, payload_fd);

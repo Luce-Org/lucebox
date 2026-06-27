@@ -227,7 +227,7 @@ struct DeepSeek4Weights {
     // SwiGLU
     float swiglu_clamp_exp = 10.0f;
 
-    // MoE hybrid placement (for hot/cold expert split)
+    // MoE hybrid placement (deprecated — layer split replaces expert split)
     bool moe_hybrid       = false;
 };
 
