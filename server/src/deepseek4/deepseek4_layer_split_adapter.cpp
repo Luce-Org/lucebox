@@ -7,7 +7,9 @@
 #include "deepseek4_layer_split_adapter.h"
 #include "deepseek4_internal.h"
 #include "common/layer_split_runtime.h"
+#include "common/gguf_inspect.h"
 
+#include "ggml-cuda.h"
 #if defined(GGML_USE_CUDA)
 #include <cuda_runtime.h>
 #endif
@@ -125,11 +127,18 @@ bool DeepSeek4LayerSplitAdapter::init() {
     if (!device.is_layer_split()) {
         // Auto-compute split: CUDA gets first N layers, Halo gets the rest
         int cuda_layers = compute_auto_split_layers();
-        device.layer_split_gpus = {device.gpu, 1};  // GPU 0 = CUDA, GPU 1 = Halo
+        int local_gpu = device.gpu >= 0 ? device.gpu : 0;
+        device.layer_split_gpus = {local_gpu, 0};  // GPU 0 = local CUDA, remote GPU 0 on Halo
         device.layer_split_weights = {(double)cuda_layers, (double)(43 - cuda_layers)};
     }
 
-    // Use common layer split runtime to initialize shards
+    // When remote_target_shard is configured, use mixed (IPC) path:
+    // only the first shard is local, the rest run via IPC daemon on Halo.
+    if (cfg_.remote_target_shard.enabled()) {
+        return init_mixed_target_split_full(device);
+    }
+
+    // Multi-GPU local path (multiple CUDA GPUs available)
     LayerSplitRuntimeInit runtime_cfg;
     runtime_cfg.target_path = cfg_.target_path;
     runtime_cfg.device = &device;
@@ -172,41 +181,112 @@ bool DeepSeek4LayerSplitAdapter::init() {
         hc_state_.resize(hc_state_elements(shards_[0].weights), 0.0f);
     }
 
-    // Initialize mixed target split if configured
-    if (cfg_.remote_target_shard.enabled()) {
-        if (!init_mixed_target_split()) {
-            std::fprintf(stderr, "[deepseek4-split] mixed target split init failed\n");
-            return false;
-        }
+    std::fprintf(stderr, "[deepseek4-split] initialized with %zu local shards\n", shards_.size());
+    return true;
+}
+
+bool DeepSeek4LayerSplitAdapter::init_mixed_target_split_full(const DevicePlacement & device) {
+    // Mixed target split: local CUDA shard + remote Halo shard via IPC daemon.
+    // Only the first shard runs locally; remaining layers handled by remote daemon.
+
+    const auto info = inspect_gguf_model_info(cfg_.target_path);
+    const int n_layer = info.n_layer;
+    if (n_layer <= 0) {
+        std::fprintf(stderr, "[deepseek4-split] failed to inspect target layer count\n");
+        return false;
     }
 
-    std::fprintf(stderr, "[deepseek4-split] initialized with %zu shards\n", shards_.size());
+    const auto ranges = compute_layer_ranges(
+        n_layer, (int)device.layer_split_gpus.size(),
+        device.layer_split_weights);
+    if (ranges.size() != device.layer_split_gpus.size()) {
+        std::fprintf(stderr, "[deepseek4-split] bad layer split\n");
+        return false;
+    }
+
+    // Initialize only the local (first) shard
+    shards_.resize(1);
+    auto & local_shard = shards_[0];
+    local_shard.gpu = device.layer_split_gpus[0];
+    local_shard.layer_begin = ranges[0].begin;
+    local_shard.layer_end = ranges[0].end;
+    local_shard.backend = ggml_backend_cuda_init(local_shard.gpu);
+    if (!local_shard.backend) {
+        std::fprintf(stderr, "[deepseek4-split] local backend init failed gpu=%d\n",
+                     local_shard.gpu);
+        return false;
+    }
+
+    // Load weights for local shard
+    const int max_ctx = device.max_ctx > 0 ? device.max_ctx : 8192;
+    TargetLoadPlan plan;
+    plan.layer_begin = local_shard.layer_begin;
+    plan.layer_end = local_shard.layer_end;
+    plan.load_output = false;  // Output head on remote shard
+
+    if (!load_deepseek4_gguf_partial(cfg_.target_path, local_shard.backend, plan, local_shard.weights)) {
+        std::fprintf(stderr, "[deepseek4-split] failed to load local shard layers [%d,%d)\n",
+                     local_shard.layer_begin, local_shard.layer_end);
+        return false;
+    }
+
+    if (!create_deepseek4_cache(local_shard.backend, local_shard.weights, max_ctx, local_shard.cache)) {
+        std::fprintf(stderr, "[deepseek4-split] failed to create local cache\n");
+        return false;
+    }
+
+    std::fprintf(stderr, "[deepseek4-split] local shard: gpu=%d layers=[%d,%d)\n",
+                 local_shard.gpu, local_shard.layer_begin, local_shard.layer_end);
+
+    // Initialize HC state
+    hc_state_.resize(hc_state_elements(local_shard.weights), 0.0f);
+
+    // Launch remote IPC daemon for remaining layers
+    std::vector<int> remote_gpus;
+    std::vector<int> remote_layer_begins;
+    std::vector<int> remote_layer_ends;
+    for (size_t i = 1; i < device.layer_split_gpus.size(); ++i) {
+        remote_gpus.push_back(device.layer_split_gpus[i]);
+        remote_layer_begins.push_back(ranges[i].begin);
+        remote_layer_ends.push_back(ranges[i].end);
+    }
+
+    TargetShardIpcLaunchConfig launch_cfg;
+    launch_cfg.mode = BackendIpcMode::DeepSeek4TargetShard;
+    launch_cfg.bin = cfg_.remote_target_shard.ipc_bin;
+    launch_cfg.target_path = cfg_.target_path;
+    launch_cfg.gpus = remote_gpus;
+    launch_cfg.layer_begins = remote_layer_begins;
+    launch_cfg.layer_ends = remote_layer_ends;
+    launch_cfg.max_ctx = max_ctx;
+    launch_cfg.hidden = local_shard.weights.n_embd;
+    launch_cfg.vocab = local_shard.weights.n_vocab;
+    launch_cfg.work_dir = cfg_.remote_target_shard.work_dir;
+
+    if (!remote_target_shard_.start(launch_cfg)) {
+        std::fprintf(stderr, "[deepseek4-split] failed to start remote target shard layers=[%d,%d)\n",
+                     remote_layer_begins.front(), remote_layer_ends.back());
+        return false;
+    }
+
+    std::fprintf(stderr, "[deepseek4-split] remote shard: layers=[%d,%d) via IPC daemon\n",
+                 remote_layer_begins.front(), remote_layer_ends.back());
+
+    // Snapshot backends for local shard only
+    auto shard_metas = layer_split_shard_metas(shards_);
+    if (!init_layer_split_snapshot_backends(shard_metas, snapshot_backends_, "deepseek4-split")) {
+        return false;
+    }
+
+    std::fprintf(stderr, "[deepseek4-split] initialized mixed split: %d local + %d remote layers\n",
+                 local_shard.layer_end - local_shard.layer_begin,
+                 remote_layer_ends.back() - remote_layer_begins.front());
     return true;
 }
 
 bool DeepSeek4LayerSplitAdapter::init_mixed_target_split() {
-    if (shards_.size() < 2) return false;
-
-    // The remote shard runs on the Halo GPU
-    const auto & remote_shard = shards_.back();
-    TargetShardIpcLaunchConfig launch_cfg;
-    launch_cfg.mode = BackendIpcMode::LagunaTargetShard;  // TODO: add DeepSeek4TargetShard mode
-    launch_cfg.bin = cfg_.remote_target_shard.ipc_bin;
-    launch_cfg.target_path = cfg_.target_path;
-    launch_cfg.gpus = {remote_shard.gpu};
-    launch_cfg.layer_begins = {remote_shard.layer_begin};
-    launch_cfg.layer_ends = {remote_shard.layer_end};
-    launch_cfg.max_ctx = cfg_.device.max_ctx > 0 ? cfg_.device.max_ctx : 8192;
-    launch_cfg.hidden = shards_[0].weights.n_embd;
-    launch_cfg.vocab = shards_[0].weights.n_vocab;
-    launch_cfg.work_dir = cfg_.remote_target_shard.work_dir;
-
-    if (!remote_target_shard_.start(launch_cfg)) {
-        std::fprintf(stderr, "[deepseek4-split] failed to start remote target shard\n");
-        return false;
-    }
-
-    return true;
+    // Legacy — unused now, mixed init is done via init_mixed_target_split_full()
+    return false;
 }
 
 void DeepSeek4LayerSplitAdapter::begin_request(const GenerateRequest & req) {

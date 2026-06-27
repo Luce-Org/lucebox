@@ -74,6 +74,7 @@ private:
     bool run_forward(const std::vector<int32_t> & tokens, int base_pos,
                      int & last_tok, std::vector<float> * logits_out = nullptr);
     bool init_mixed_target_split();
+    bool init_mixed_target_split_full(const DevicePlacement & device);
     bool run_mixed_forward(const std::vector<int32_t> & tokens, int base_pos,
                            int & last_tok, std::vector<float> * logits_out);
     bool use_mixed_target_split() const {
