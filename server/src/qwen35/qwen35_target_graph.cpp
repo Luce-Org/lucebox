@@ -864,9 +864,14 @@ static ggml_tensor * build_delta_net_block(
     q_c = ggml_l2_norm(ctx, q_c, w.rms_eps);
     k_c = ggml_l2_norm(ctx, k_c, w.rms_eps);
 
-    // Repeat Q and K from num_k_heads to num_v_heads so they match V's layout
-    // (only needed if not using the fused op's broadcast support).
-    if (num_k_heads != num_v_heads) {
+    // Repeat Q and K from num_k_heads to num_v_heads so they match V's layout.
+    // In pure AR (cap==nullptr, parent_ids==nullptr) the kernel's fastmodulo
+    // broadcast handles the head mismatch natively — skip the repeat to save
+    // one tensor allocation and a memory-bandwidth copy per SSM layer per step.
+    // In tree/capture mode keep the repeat: the DFS parent-reload in the kernel
+    // indexes intermediate states by h_idx (v-head), so Q/K must already be
+    // in the expanded [num_v_heads] layout before the kernel runs.
+    if (num_k_heads != num_v_heads && (cap != nullptr || parent_ids != nullptr)) {
         q_c = ggml_repeat_4d(ctx, q_c, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
         k_c = ggml_repeat_4d(ctx, k_c, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
     }
