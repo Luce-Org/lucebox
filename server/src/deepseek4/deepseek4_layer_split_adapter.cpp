@@ -9,7 +9,6 @@
 #include "common/layer_split_runtime.h"
 
 #if defined(GGML_USE_CUDA)
-#include "ggml-cuda.h"
 #include <cuda_runtime.h>
 #endif
 

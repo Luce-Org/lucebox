@@ -41,6 +41,7 @@ using cudaDeviceProp        = hipDeviceProp_t;
 #define cudaMemcpyPeerAsync         hipMemcpyPeerAsync
 #define cudaMemset                  hipMemset
 #define cudaMemsetAsync             hipMemsetAsync
+#define cudaMemGetInfo              hipMemGetInfo
 
 // Stream functions
 #define cudaStreamCreate            hipStreamCreate
