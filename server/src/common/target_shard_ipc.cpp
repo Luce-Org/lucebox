@@ -129,7 +129,8 @@ bool TargetShardIpcSession::start(const TargetShardIpcLaunchConfig & cfg) {
     close();
     if (cfg.mode != BackendIpcMode::Qwen35TargetShard &&
         cfg.mode != BackendIpcMode::Gemma4TargetShard &&
-        cfg.mode != BackendIpcMode::LagunaTargetShard) {
+        cfg.mode != BackendIpcMode::LagunaTargetShard &&
+        cfg.mode != BackendIpcMode::DeepSeek4TargetShard) {
         std::fprintf(stderr, "target shard IPC requires an explicit target-shard mode\n");
         return false;
     }
