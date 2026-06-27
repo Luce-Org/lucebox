@@ -397,21 +397,23 @@ bool DeepSeek4LayerSplitAdapter::run_mixed_forward(
         return false;
     }
 
-    std::vector<float> out_logits;
-    if (!deepseek4_step(local_shard.backend, local_shard.weights, local_shard.cache,
-                        embed.data(), n_tokens, base_pos, out_logits,
-                        nullptr, tokens.data(), nullptr, false, nullptr, nullptr)) {
+    // Run only the local shard's layer range, getting hidden state output
+    std::vector<float> hidden_out;
+    std::vector<float> hc_state;  // unused for now
+    if (!deepseek4_step_layer_range(local_shard.backend, local_shard.weights,
+                                     local_shard.cache, hc_state,
+                                     embed.data(), n_tokens, base_pos,
+                                     local_shard.layer_begin, local_shard.layer_end,
+                                     &hidden_out, tokens.data(), nullptr)) {
         std::fprintf(stderr, "[deepseek4-split] local shard forward failed\n");
         return false;
     }
 
-    // Send boundary activation to remote shard
-    // The boundary activation is the HC state + last hidden state
-    // For now, use the TargetShardIpcSession to forward to remote
+    // Send boundary activation (hidden state) to remote shard
     TargetShardForwardRequest req;
     req.base_pos = base_pos;
     req.n_tokens = n_tokens;
-    req.boundary_activation = &out_logits;  // TODO: pass hidden state, not logits
+    req.boundary_activation = &hidden_out;
     req.token_ids = &tokens;
     req.want_logits = (logits_out != nullptr);
 
