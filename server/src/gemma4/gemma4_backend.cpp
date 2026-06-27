@@ -411,6 +411,68 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
         }
     };
 
+    // Soft-close: fires when close-token logit is within soft_close_min_ratio
+    // of the chosen-token logit, injecting the close sequence early rather
+    // than waiting for the hard think_max boundary. Mirrors qwen35's
+    // maybe_soft_close lambda — same BudgetHook fields, same soft_close::
+    // should_fire predicate from model_backend.h.
+    //
+    // PROBE vs INJECT split (matches qwen35; see model_backend.h):
+    //   - probe0 is the token id we PEEK for the fire decision (the short
+    //     close marker token, configured via soft_close_probe_ids).
+    //   - inject0 is the first token of the close sequence we WRITE when
+    //     the comparator fires (close_token_ids.front()).
+    // When soft_close_probe_ids is empty, soft_close_probe_token() falls
+    // back to close_token_ids.front() (legacy single-marker behavior).
+    auto maybe_soft_close = [&](int32_t & tok,
+                                const float * logits_row,
+                                int committed_now) {
+        if (budget_close_started) return;
+        if (budget_hook.close_token_ids.empty()) return;
+        const int32_t probe0  = budget_hook.soft_close_probe_token();
+        const int32_t inject0 = budget_hook.close_token_ids.front();
+        if (budget_hook.debug_thinking_logits) {
+            const int generated = committed_now - committed_at_entry;
+            const float diff = logits_row[probe0] - logits_row[tok];
+            const float ratio = (diff > 50.0f) ? std::exp(50.0f) : std::exp(diff);
+            std::fprintf(stderr,
+                "[soft-trace] gemma4 step=%d committed=%d chosen=%d close0=%d "
+                "logit_close=%.4f logit_chosen=%.4f diff=%.4f prob_ratio=%.6g\n",
+                generated, committed_now, tok, probe0,
+                logits_row[probe0], logits_row[tok], diff, ratio);
+        }
+        if (budget_hook.soft_close_min_ratio <= 0.0f) return;
+        // Minimum-thinking-tokens floor: false-positive guard. When set,
+        // suppress fire until the segment has committed at least this
+        // many tokens. 0 = floor disabled (default). Mirrors qwen35.
+        const int generated_so_far = committed_now - committed_at_entry;
+        if (generated_so_far < budget_hook.soft_close_min_tokens) return;
+        if (!soft_close::should_fire(logits_row, tok, probe0,
+                                     budget_hook.soft_close_min_ratio)) return;
+        const int generated = committed_now - committed_at_entry;
+        const int remaining = n_gen - generated;
+        std::fprintf(stderr,
+            "[budget-hook] gemma4 soft-close at committed=%d/%d "
+            "(remaining=%d, min_ratio=%.4f, logit[probe0=%d]=%.3f "
+            "logit[chosen]=%.3f diff=%.3f): overriding token %d with "
+            "inject[0]=%d (inject seq len %zu)\n",
+            committed_now, n_gen, remaining,
+            budget_hook.soft_close_min_ratio,
+            probe0, logits_row[probe0], logits_row[tok],
+            logits_row[probe0] - logits_row[tok],
+            tok, inject0, budget_hook.close_token_ids.size());
+        tok = inject0;
+        budget_close_started = true;
+        // close_inject_pos = 0 (NOT 1) so maybe_force_close's continuation
+        // in the same AR step picks up close_token_ids[0] and emits it
+        // as-is (then advances to 1 for the next step). Setting it to 1
+        // here would cause the continuation to overwrite tok with
+        // close_token_ids[1], skipping the first close token. See cubic
+        // PR #339 comment 1 (same bug exists symmetrically in qwen35).
+        close_inject_pos = 0;
+        if (forced_close_out) *forced_close_out = true;
+    };
+
     for (int i = 0; i < n_gen; ++i) {
         // Seed for this iteration's embed step:
         //  - Normal case: previous iteration just pushed a sampled
@@ -453,6 +515,7 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
                 if (logits[j] > best) { best = logits[j]; next = j; }
             }
         }
+        maybe_soft_close(next, logits.data(), committed);
         maybe_force_close(next, committed);
 
         out_tokens.push_back(next);

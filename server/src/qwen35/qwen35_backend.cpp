@@ -799,21 +799,22 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     auto t_prefill_end = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_prefill_end - t_prefill_start).count();
 
-    // Decode (speculative)
+    // Decode (speculative or AR)
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
-        // Pass the budget hook into spec-decode. When token count nears
-        // the budget edge, do_spec_decode breaks out and tails off via
-        // AR with the hook still active — force-close fires correctly
-        // without sacrificing spec-decode throughput for the bulk of
-        // generation. Most requests never hit the tail because the
-        // model closes </think> naturally well before the budget edge.
+        // AR decode fires when the upper layer retried after an empty
+        // spec-decode (force_ar_decode, PR #314 from origin/main).
+        // Otherwise spec decode. The budget hook flows into both paths;
+        // do_spec_decode breaks out and tails off via AR with the hook
+        // still active so force-close fires correctly without sacrificing
+        // spec-decode throughput for the bulk of generation.
         bool decode_ok = false;
         if (req.force_ar_decode) {
             decode_ok = do_ar_decode(committed, req.n_gen, result.tokens, out_io,
                                      req.budget_hook,
                                      &result.budget_forced_close,
-                                     &result.degenerate_decode_close);
+                                     &result.degenerate_decode_close,
+                                     &result.soft_forced_close);
             out_io.emit(-1);
         } else {
             decode_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
@@ -824,7 +825,8 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                                        req.stall_skip_tokens,
                                        &req.budget_hook,
                                        &result.budget_forced_close,
-                                       &result.degenerate_decode_close);
+                                       &result.degenerate_decode_close,
+                                       &result.soft_forced_close);
             if (decode_ok) {
                 result.empty_visible_output =
                     qwen35_empty_visible_output(result.tokens, w_);
@@ -961,7 +963,8 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             decode_ok = do_ar_decode(committed, req.n_gen, result.tokens, out_io,
                                      req.budget_hook,
                                      &result.budget_forced_close,
-                                     &result.degenerate_decode_close);
+                                     &result.degenerate_decode_close,
+                                     &result.soft_forced_close);
             out_io.emit(-1);
         } else {
             decode_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
@@ -972,7 +975,8 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                                        req.stall_skip_tokens,
                                        &req.budget_hook,
                                        &result.budget_forced_close,
-                                       &result.degenerate_decode_close);
+                                       &result.degenerate_decode_close,
+                                       &result.soft_forced_close);
             if (decode_ok) {
                 result.empty_visible_output =
                     qwen35_empty_visible_output(result.tokens, w_);
@@ -1398,27 +1402,14 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                   const DaemonIO & io,
                                   const BudgetHook & budget_hook,
                                   bool * forced_close_out,
-                                  bool * degenerate_close_out) {
-    // Budget hook state.
-    //   - budget_close_started: true once we've begun injecting the close
-    //     sequence. Prevents re-triggering on continued forward generation.
-    //   - close_inject_pos: index into budget_hook.close_token_ids for the
-    //     NEXT token to inject. While < close_token_ids.size(), each
-    //     iteration overrides the sampled token with the corresponding
-    //     close-sequence token (single-token close = 1 override and done;
-    //     multi-token close like DeepSeek/laguna [1718,37947,32] = 3
-    //     consecutive overrides). Once equal to close_token_ids.size(),
-    //     normal sampling resumes (model writes visible answer).
+                                  bool * degenerate_close_out,
+                                  bool * soft_forced_close_out) {
+    // budget_close_started: prevents re-triggering; close_inject_pos: next
+    // token index to inject from close_token_ids. See docs/specs/thinking-budget.md.
     bool budget_close_started = false;
     int  close_inject_pos     = 0;
-    // Capture entry KV position so the budget check is in the
-    // "generated since entry" frame, not the absolute KV frame.
-    // n_gen is the gen-only count (or the remaining-budget remap done by
-    // spec-decode tail-off); subtracting committed_now (absolute KV =
-    // prompt_len + tokens generated this call) directly would treat
-    // prompt-length tokens as if they were generated output, firing
-    // force-close prompt_len tokens early on prompted requests and
-    // potentially going negative after spec-decode tail-off.
+    // committed_at_entry: anchors budget check to "generated since entry" frame,
+    // not absolute KV (avoids firing prompt_len tokens early).
     const int committed_at_entry = committed;
     auto maybe_force_close = [&](int32_t & tok, int committed_now) {
         if (budget_hook.close_token_ids.empty()) return;
@@ -1480,6 +1471,86 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             if (forced_close_out) *forced_close_out = true;
         }
     };
+
+    // Soft-close (logit-ratio peek). Fires BEFORE the hard-cap check so a
+    // soft trigger on the same step as a hard trigger is reported as
+    // close_kind="soft" (the more informative signal — the model agreed it
+    // was time to close, even if the budget was also about to run out).
+    // Once this lambda starts the close sequence, the maybe_force_close
+    // continuation branch handles steps 2..N of a multi-token close.
+    // Zero-cost-when-disabled invariant: when soft_close_min_ratio == 0
+    // the outer guard short-circuits and we do not even read logits_buf.
+    // See docs/experiments/soft-close-thinking-termination-plan.md §3.
+    auto maybe_soft_close = [&](int32_t & tok,
+                                const float * logits_row,
+                                int committed_now) {
+        if (budget_close_started) return;                       // sequence already in progress
+        if (budget_hook.close_token_ids.empty()) return;        // hook disabled
+
+        // PROBE vs INJECT split:
+        //   - probe0 is the token id we PEEK to decide whether to fire
+        //     (the short close marker, e.g. `</think>` = 248069 on Qwen3.6).
+        //   - inject0 / inject sequence is what we WRITE when it fires
+        //     (the full trained-hint directive).
+        // Fall back to close_token_ids.front() when no separate probe is
+        // configured (legacy / single-token-marker models). See
+        // BudgetHook::soft_close_probe_token().
+        const int32_t probe0  = budget_hook.soft_close_probe_token();
+        const int32_t inject0 = budget_hook.close_token_ids.front();
+
+        // Diagnostic trajectory log. Fires every AR step (gated on the
+        // operator flag) regardless of soft_close_min_ratio, so we can
+        // record close-vs-chosen logit curves even when the dial is off.
+        // close0 reports the PROBE token id (what the comparator uses).
+        if (budget_hook.debug_thinking_logits) {
+            const int generated = committed_now - committed_at_entry;
+            const float diff = logits_row[probe0] - logits_row[tok];
+            const float ratio = (diff > 50.0f) ? std::exp(50.0f) : std::exp(diff);
+            std::fprintf(stderr,
+                "[soft-trace] step=%d committed=%d chosen=%d close0=%d "
+                "logit_close=%.4f logit_chosen=%.4f diff=%.4f prob_ratio=%.6g\n",
+                generated, committed_now, tok, probe0,
+                logits_row[probe0], logits_row[tok], diff, ratio);
+        }
+
+        if (budget_hook.soft_close_min_ratio <= 0.0f) return;   // dial disabled
+
+        // Minimum-thinking-tokens floor: false-positive guard. When set,
+        // suppress fire until the segment has committed at least this
+        // many tokens. 0 = floor disabled (default).
+        const int generated_so_far = committed_now - committed_at_entry;
+        if (generated_so_far < budget_hook.soft_close_min_tokens) return;
+
+        if (!soft_close::should_fire(logits_row, tok, probe0,
+                                     budget_hook.soft_close_min_ratio)) {
+            return;
+        }
+        const int generated = committed_now - committed_at_entry;
+        const int remaining = n_gen - generated;
+        std::fprintf(stderr,
+            "[budget-hook] soft-close at committed=%d/%d (remaining=%d, "
+            "min_ratio=%.4f, logit[probe0=%d]=%.3f logit[chosen]=%.3f "
+            "diff=%.3f log_ratio=%.3f): overriding sampled token %d with "
+            "inject[0]=%d (inject seq len %zu)\n",
+            committed_now, n_gen, remaining,
+            budget_hook.soft_close_min_ratio,
+            probe0, logits_row[probe0], logits_row[tok],
+            logits_row[probe0] - logits_row[tok],
+            std::log(budget_hook.soft_close_min_ratio),
+            tok, inject0, budget_hook.close_token_ids.size());
+        tok = inject0;
+        budget_close_started = true;
+        // close_inject_pos = 0 (NOT 1) so that maybe_force_close's
+        // continuation branch, which runs immediately after this lambda
+        // in the same AR step, picks up close_token_ids[0] and emits
+        // inject[0] as-is (and advances close_inject_pos to 1 for the
+        // next step). If we set it to 1 here, the continuation would
+        // overwrite tok=inject[0] with close_token_ids[1], skipping
+        // the first close token entirely. See cubic PR #339 comment 1.
+        close_inject_pos = 0;
+        if (soft_forced_close_out) *soft_forced_close_out = true;
+    };
+
     if (n_gen <= 0) return true;
 
     auto t_dec0_ar = std::chrono::steady_clock::now();
@@ -1513,12 +1584,33 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     const int initial_emitted = out_tokens.empty() ? 1 : 0;
     if (initial_emitted == 1) {
         int32_t first_tok;
-        if (sampler_.needs_logit_processing()) {
-            if (!prefill_last_logits_valid_) return false;
-            ggml_backend_tensor_get(sg_.logits, logits_buf.data(), prefill_last_logits_offset_,
-                                    sizeof(float) * vocab);
-            first_tok = sample_logits(logits_buf.data(), vocab, sampler_,
-                                      out_tokens, sampler_rng_);
+        // Soft-close needs the logits row for the comparator; greedy
+        // (argmax-only) path normally skips the logits read. Pull the
+        // prefill's last logits row to CPU when soft is enabled so the
+        // first AR step participates in the comparator. Zero-cost when
+        // disabled: only fetched when soft_close_min_ratio > 0.
+        const bool need_logits =
+            sampler_.needs_logit_processing() ||
+            budget_hook.soft_close_min_ratio > 0.0f ||
+            budget_hook.debug_thinking_logits;
+        if (need_logits) {
+            if (!prefill_last_logits_valid_) {
+                if (sampler_.needs_logit_processing()) return false;
+                // Soft-close wanted logits but prefill didn't keep them.
+                // Skip soft check on this single token rather than error.
+                first_tok = cache_.last_tok;
+            } else {
+                ggml_backend_tensor_get(sg_.logits, logits_buf.data(),
+                                        prefill_last_logits_offset_,
+                                        sizeof(float) * vocab);
+                if (sampler_.needs_logit_processing()) {
+                    first_tok = sample_logits(logits_buf.data(), vocab, sampler_,
+                                              out_tokens, sampler_rng_);
+                } else {
+                    first_tok = cache_.last_tok;
+                }
+                maybe_soft_close(first_tok, logits_buf.data(), committed);
+            }
         } else {
             first_tok = cache_.last_tok;
         }
@@ -1629,6 +1721,30 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             }
         }
 
+        // Soft check runs BEFORE hard-cap check. If soft fires, it sets
+        // budget_close_started=true so maybe_force_close's continuation
+        // branch handles steps 2..N of a multi-token close (and the
+        // remaining-check branch is skipped because the sequence is
+        // already started). If soft does not fire (disabled or threshold
+        // not met), maybe_force_close proceeds as today.
+        //
+        // GPU-argmax path: when soft-close or its diagnostic is enabled,
+        // pull the logits row to CPU before the comparator runs — the
+        // GPU-argmax branch above only reads 4 bytes (the argmax token id)
+        // and leaves logits_buf with stale data from the previous step.
+        // Without this fetch, maybe_soft_close would compare against stale
+        // logits and could misfire / emit invalid trajectory traces.
+        // Zero-cost when soft-close is disabled (dial == 0 and no debug
+        // flag): we skip the D2H copy entirely. See cubic PR #339 comment 3.
+        if (!sampler_.needs_logit_processing() &&
+            kGpuArgmaxAR && sg_.argmax_tokens &&
+            (budget_hook.soft_close_min_ratio > 0.0f ||
+             budget_hook.debug_thinking_logits))
+        {
+            ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
+                                    sizeof(float) * vocab);
+        }
+        maybe_soft_close(next_tok, logits_buf.data(), committed);
         maybe_force_close(next_tok, committed);
 
         out_tokens.push_back(next_tok);
@@ -1755,7 +1871,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     const std::vector<int32_t> * stall_skip_tokens,
                                     const BudgetHook * budget_hook,
                                     bool * forced_close_out,
-                                    bool * degenerate_close_out) {
+                                    bool * degenerate_close_out,
+                                    bool * soft_forced_close_out) {
     out_accept_rate = 0.0f;
     out_spec_ran    = false;
     const int hidden = w_.n_embd;
@@ -1811,10 +1928,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     if (!can_spec) {
         // AR fallback consumes the final prefill position itself, then advances
         // one token at a time. Pass the budget hook through so force-close
-        // still fires when spec-decode is unavailable.
+        // still fires when spec-decode is unavailable. Soft-close pointer
+        // also forwards so close_kind="soft" can be attributed correctly
+        // even on the AR fallback path.
         bool ok = do_ar_decode(committed, n_gen, out_tokens, io,
                                 budget_hook ? *budget_hook : BudgetHook{},
-                                forced_close_out, degenerate_close_out);
+                                forced_close_out, degenerate_close_out,
+                                soft_forced_close_out);
         io.emit(-1);
         return ok;
     }

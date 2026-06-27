@@ -3990,6 +3990,520 @@ static void test_flowkv_T5_inert_guard_token_count() {
     TEST_ASSERT(1024 >= kFkvInertMinTokens);
 }
 
+// ─── Soft-close comparator + state machine ─────────────────────────────
+//
+// Tests the logit-ratio peek that lets the AR loop force </think> early
+// once the close-token logit comes within a configured probability ratio
+// of the chosen-token logit. Default disabled. See
+// docs/experiments/soft-close-thinking-termination-plan.md.
+//
+// We test two layers:
+//   1. The pure comparator (`soft_close::should_fire`) — math-only.
+//   2. A small state-machine helper that mimics the AR loop's
+//      precedence (soft first, then hard) so we can exercise the
+//      multi-token inject path and the soft/hard tie-break without a
+//      GPU.
+
+// Mirror of qwen35_backend.cpp's close-injection state for unit testing.
+struct CloseState {
+    bool started     = false;
+    int  inject_pos  = 0;
+    bool soft_fired  = false;
+    bool hard_fired  = false;
+};
+
+// Returns the (possibly overridden) token for this step, advancing
+// CloseState. Mirrors the soft-then-hard ordering in the real loop.
+// committed_now / committed_at_entry / n_gen track the budget arithmetic
+// for the hard check identically to qwen35_backend.cpp:909-944.
+static int32_t step_close_state(int32_t                       chosen_tok,
+                                 const float *                 logits,
+                                 const dflash::common::BudgetHook & hook,
+                                 int                           committed_now,
+                                 int                           committed_at_entry,
+                                 int                           n_gen,
+                                 CloseState &                  state) {
+    // Continue an in-progress close sequence.
+    if (state.started &&
+        state.inject_pos < (int)hook.close_token_ids.size())
+    {
+        int32_t inj = hook.close_token_ids[state.inject_pos];
+        state.inject_pos++;
+        return inj;
+    }
+    if (state.started) return chosen_tok;  // sequence already complete
+
+    // Soft check (BEFORE hard, per plan §4).
+    // Probe-vs-inject split: peek hook.soft_close_probe_token(), write
+    // hook.close_token_ids.front() on fire.
+    // Min-tokens floor: suppress fire until generated_so_far >=
+    // hook.soft_close_min_tokens. Mirrors qwen35_backend.cpp gate.
+    const int generated_so_far = committed_now - committed_at_entry;
+    if (!hook.close_token_ids.empty() &&
+        hook.soft_close_min_ratio > 0.0f &&
+        generated_so_far >= hook.soft_close_min_tokens &&
+        dflash::common::soft_close::should_fire(
+            logits, chosen_tok,
+            hook.soft_close_probe_token(),
+            hook.soft_close_min_ratio))
+    {
+        state.started    = true;
+        state.inject_pos = 1;
+        state.soft_fired = true;
+        return hook.close_token_ids.front();  // INJECT, not probe
+    }
+
+    // Hard check: remaining <= hard_limit_remaining.
+    if (!hook.close_token_ids.empty()) {
+        const int generated = committed_now - committed_at_entry;
+        const int remaining = n_gen - generated;
+        if (remaining <= hook.hard_limit_remaining) {
+            int32_t close0 = hook.close_token_ids.front();
+            if (chosen_tok == close0) {
+                // Model self-closed at boundary; consume as first of seq.
+                state.started    = true;
+                state.inject_pos = 1;
+                return chosen_tok;
+            }
+            state.started    = true;
+            state.inject_pos = 1;
+            state.hard_fired = true;
+            return close0;
+        }
+    }
+    return chosen_tok;
+}
+
+// Build a logits row where the chosen-token gets logit `l_chosen` and the
+// close token gets logit `l_close`; all other vocab tokens are far below.
+static std::vector<float> make_logits(int vocab, int chosen_tok,
+                                        int close_tok,
+                                        float l_chosen, float l_close) {
+    std::vector<float> row(vocab, -100.0f);
+    row[chosen_tok] = l_chosen;
+    if (close_tok != chosen_tok) row[close_tok] = l_close;
+    return row;
+}
+
+static void test_soft_close_disabled_default() {
+    // min_ratio=0 → never fires, regardless of logit configuration.
+    auto logits = make_logits(64, /*chosen=*/3, /*close=*/7,
+                              /*l_chosen=*/2.0f, /*l_close=*/10.0f);
+    bool fired = dflash::common::soft_close::should_fire(
+        logits.data(), /*chosen=*/3, /*close0=*/7, /*min_ratio=*/0.0f);
+    TEST_ASSERT(fired == false);
+    // Even with close as argmax, disabled means false.
+    fired = dflash::common::soft_close::should_fire(
+        logits.data(), /*chosen=*/3, /*close0=*/3, /*min_ratio=*/0.0f);
+    TEST_ASSERT(fired == false);
+}
+
+static void test_soft_close_strict_ratio_one() {
+    // min_ratio=1.0 → fires only when logit[close] >= logit[chosen]
+    // (i.e. close is the argmax or tied). chosen!=close already guarded.
+    auto eq = make_logits(64, 3, 7, /*l_chosen=*/5.0f, /*l_close=*/5.0f);
+    TEST_ASSERT(dflash::common::soft_close::should_fire(
+        eq.data(), 3, 7, 1.0f) == true);
+
+    auto below = make_logits(64, 3, 7, /*l_chosen=*/5.001f, /*l_close=*/5.0f);
+    TEST_ASSERT(dflash::common::soft_close::should_fire(
+        below.data(), 3, 7, 1.0f) == false);
+
+    auto above = make_logits(64, 3, 7, /*l_chosen=*/4.0f, /*l_close=*/5.0f);
+    TEST_ASSERT(dflash::common::soft_close::should_fire(
+        above.data(), 3, 7, 1.0f) == true);
+}
+
+static void test_soft_close_aggressive_half_prob() {
+    // min_ratio=0.5 — prob[close]/prob[chosen] >= 0.5 ⟺
+    //   logit_diff >= log(0.5) ≈ -0.6931.
+    const float ln_half = std::log(0.5f);
+
+    // Boundary inclusive: diff exactly log(0.5).
+    auto boundary = make_logits(64, 3, 7,
+                                 /*l_chosen=*/5.0f,
+                                 /*l_close=*/5.0f + ln_half);
+    TEST_ASSERT(dflash::common::soft_close::should_fire(
+        boundary.data(), 3, 7, 0.5f) == true);
+
+    // Just below: diff slightly less than log(0.5) (further negative).
+    auto below = make_logits(64, 3, 7,
+                              /*l_chosen=*/5.0f,
+                              /*l_close=*/5.0f + ln_half - 0.001f);
+    TEST_ASSERT(dflash::common::soft_close::should_fire(
+        below.data(), 3, 7, 0.5f) == false);
+
+    // Way above: close strongly favoured (but not argmax).
+    auto strong = make_logits(64, 3, 7,
+                               /*l_chosen=*/5.0f,
+                               /*l_close=*/4.9f);
+    TEST_ASSERT(dflash::common::soft_close::should_fire(
+        strong.data(), 3, 7, 0.5f) == true);
+}
+
+static void test_soft_close_below_threshold() {
+    // min_ratio=0.5, prob_ratio≈0.3 (well below) → no fire.
+    const float ln_03 = std::log(0.3f);
+    auto row = make_logits(64, 3, 7,
+                            /*l_chosen=*/5.0f,
+                            /*l_close=*/5.0f + ln_03);
+    TEST_ASSERT(dflash::common::soft_close::should_fire(
+        row.data(), 3, 7, 0.5f) == false);
+}
+
+static void test_soft_close_chosen_is_close() {
+    // When the sampler already picks the close token, soft check never
+    // fires — natural-close path handles it.
+    auto row = make_logits(64, 7, 7, /*l_chosen=*/10.0f, /*l_close=*/10.0f);
+    TEST_ASSERT(dflash::common::soft_close::should_fire(
+        row.data(), /*chosen=*/7, /*close0=*/7, /*min_ratio=*/0.5f) == false);
+    TEST_ASSERT(dflash::common::soft_close::should_fire(
+        row.data(), /*chosen=*/7, /*close0=*/7, /*min_ratio=*/1.0f) == false);
+}
+
+static void test_soft_close_tiny_ratio_numerical() {
+    // min_ratio = 1e-6 ⇒ log_ratio ≈ -13.8155. Verify no NaN, threshold
+    // triggers when diff >= -13.8.
+    auto on   = make_logits(64, 3, 7, /*l_chosen=*/5.0f, /*l_close=*/-8.5f);
+    auto off  = make_logits(64, 3, 7, /*l_chosen=*/5.0f, /*l_close=*/-9.0f);
+    TEST_ASSERT(dflash::common::soft_close::should_fire(
+        on.data(), 3, 7, 1e-6f) == true);
+    TEST_ASSERT(dflash::common::soft_close::should_fire(
+        off.data(), 3, 7, 1e-6f) == false);
+}
+
+// ── State-machine integration: soft + hard precedence ─────────────────
+
+static void test_soft_close_single_token_inject() {
+    using namespace dflash::common;
+    BudgetHook hook;
+    hook.close_token_ids = { 248069 };   // Qwen3.6 single-token </think>
+    hook.hard_limit_remaining = 16;
+    hook.soft_close_min_ratio = 0.1f;
+
+    CloseState state;
+    // Step where soft should fire: close logit within 10% of chosen.
+    // log(0.1) ≈ -2.3026.
+    auto row = make_logits(/*vocab=*/250000, /*chosen=*/100, /*close=*/248069,
+                           /*l_chosen=*/5.0f, /*l_close=*/3.0f);
+    int32_t out = step_close_state(
+        /*chosen=*/100, row.data(),
+        hook,
+        /*committed_now=*/100, /*committed_at_entry=*/50, /*n_gen=*/200,
+        state);
+    TEST_ASSERT(out == 248069);
+    TEST_ASSERT(state.started == true);
+    TEST_ASSERT(state.soft_fired == true);
+    TEST_ASSERT(state.hard_fired == false);
+    TEST_ASSERT(state.inject_pos == 1);
+
+    // Next step: sequence is complete (single-token close); returns chosen.
+    auto row2 = make_logits(/*vocab=*/250000, /*chosen=*/200, /*close=*/248069,
+                            /*l_chosen=*/5.0f, /*l_close=*/-50.0f);
+    out = step_close_state(
+        /*chosen=*/200, row2.data(),
+        hook,
+        /*committed_now=*/101, /*committed_at_entry=*/50, /*n_gen=*/200,
+        state);
+    TEST_ASSERT(out == 200);
+    TEST_ASSERT(state.soft_fired == true);  // sticky
+}
+
+static void test_soft_close_multi_token_inject() {
+    using namespace dflash::common;
+    BudgetHook hook;
+    hook.close_token_ids = { 1718, 37947, 32 };  // Laguna-style multi-token </think>
+    hook.hard_limit_remaining = 16;
+    hook.soft_close_min_ratio = 0.1f;
+
+    CloseState state;
+    auto row = make_logits(/*vocab=*/250000, /*chosen=*/100, /*close=*/1718,
+                           /*l_chosen=*/5.0f, /*l_close=*/3.0f);
+    int32_t out = step_close_state(
+        /*chosen=*/100, row.data(),
+        hook,
+        /*committed_now=*/100, /*committed_at_entry=*/50, /*n_gen=*/200,
+        state);
+    TEST_ASSERT(out == 1718);
+    TEST_ASSERT(state.soft_fired == true);
+    TEST_ASSERT(state.inject_pos == 1);
+
+    // Step 2: inject 37947 regardless of chosen_tok.
+    auto row2 = make_logits(/*vocab=*/250000, /*chosen=*/300, /*close=*/1718,
+                            /*l_chosen=*/5.0f, /*l_close=*/-50.0f);
+    out = step_close_state(
+        /*chosen=*/300, row2.data(),
+        hook,
+        /*committed_now=*/101, 50, 200, state);
+    TEST_ASSERT(out == 37947);
+    TEST_ASSERT(state.inject_pos == 2);
+
+    // Step 3: inject 32.
+    out = step_close_state(
+        /*chosen=*/400, row2.data(),
+        hook,
+        /*committed_now=*/102, 50, 200, state);
+    TEST_ASSERT(out == 32);
+    TEST_ASSERT(state.inject_pos == 3);
+
+    // Step 4: sequence complete, returns chosen.
+    out = step_close_state(
+        /*chosen=*/500, row2.data(),
+        hook,
+        /*committed_now=*/103, 50, 200, state);
+    TEST_ASSERT(out == 500);
+}
+
+static void test_soft_close_then_hard_would_fire() {
+    // Soft fires at step 100; hard remaining-check would fire at
+    // committed_now=190 (remaining=10 <= hard_limit=16). Hard path
+    // skipped because state.started is already true. Telemetry:
+    // close_kind="soft".
+    using namespace dflash::common;
+    BudgetHook hook;
+    hook.close_token_ids = { 248069 };
+    hook.hard_limit_remaining = 16;
+    hook.soft_close_min_ratio = 0.1f;
+
+    CloseState state;
+    // Soft trigger at committed_now=100.
+    auto soft_row = make_logits(/*vocab=*/250000, 100, 248069, 5.0f, 3.0f);
+    (void)step_close_state(100, soft_row.data(), hook,
+                            /*committed_now=*/100,
+                            /*committed_at_entry=*/50,
+                            /*n_gen=*/200, state);
+    TEST_ASSERT(state.soft_fired == true);
+    TEST_ASSERT(state.hard_fired == false);
+
+    // Now jump to committed_now=190 (remaining=10) — hard would have
+    // fired here but state.started=true so it's skipped.
+    auto far_row = make_logits(/*vocab=*/250000, 999, 248069, 5.0f, -100.0f);
+    int32_t out = step_close_state(999, far_row.data(), hook,
+                                    /*committed_now=*/190,
+                                    /*committed_at_entry=*/50,
+                                    /*n_gen=*/200, state);
+    // Single-token close already complete; returns chosen.
+    TEST_ASSERT(out == 999);
+    TEST_ASSERT(state.soft_fired == true);
+    TEST_ASSERT(state.hard_fired == false);
+}
+
+static void test_soft_close_disabled_hard_still_fires() {
+    // min_ratio=0 (disabled): hard cap should still fire at the budget
+    // edge. Existing behavior preserved.
+    using namespace dflash::common;
+    BudgetHook hook;
+    hook.close_token_ids = { 248069 };
+    hook.hard_limit_remaining = 16;
+    hook.soft_close_min_ratio = 0.0f;  // disabled
+
+    CloseState state;
+    // Big gap between chosen and close — would fire soft if enabled.
+    auto row = make_logits(/*vocab=*/250000, 100, 248069, 5.0f, 4.99f);
+    int32_t out = step_close_state(100, row.data(), hook,
+                                    /*committed_now=*/100, 50, 200, state);
+    // Soft disabled: chosen passes through, not yet at hard boundary.
+    TEST_ASSERT(out == 100);
+    TEST_ASSERT(state.started == false);
+
+    // At hard boundary: committed_now-entry=184 → remaining=16 ≤ hard.
+    // (entry=50, n_gen=200, hard_limit=16 ⇒ trigger at committed_now=234.)
+    out = step_close_state(100, row.data(), hook,
+                            /*committed_now=*/234, 50, 200, state);
+    TEST_ASSERT(out == 248069);
+    TEST_ASSERT(state.hard_fired == true);
+    TEST_ASSERT(state.soft_fired == false);
+}
+
+static void test_soft_close_natural_at_boundary() {
+    // Model picks close on its own (chosen == close0). Soft check skips
+    // (chosen==close0 guard); hard check also skips because the model
+    // self-emitted close. Neither flag set; close_kind would be
+    // "natural" downstream.
+    using namespace dflash::common;
+    BudgetHook hook;
+    hook.close_token_ids = { 248069 };
+    hook.hard_limit_remaining = 16;
+    hook.soft_close_min_ratio = 0.5f;
+
+    CloseState state;
+    auto row = make_logits(/*vocab=*/250000, 248069, 248069, 5.0f, 5.0f);
+    // Far from hard boundary; chosen == close.
+    int32_t out = step_close_state(248069, row.data(), hook,
+                                    /*committed_now=*/100, 50, 200, state);
+    TEST_ASSERT(out == 248069);
+    TEST_ASSERT(state.soft_fired == false);
+    TEST_ASSERT(state.hard_fired == false);
+}
+
+// Probe-vs-inject split. When soft_close_probe_ids is set, the
+// comparator MUST peek the probe[0] logit, NOT inject[0]. Otherwise
+// trained-hint sidecars (inject[0] = content lead-in token) keep
+// the dial pinned at zero.
+static void test_soft_close_probe_uses_probe_ids_not_inject_ids() {
+    using namespace dflash::common;
+    BudgetHook hook;
+    // Multi-token inject (mirrors a trained-hint sidecar).
+    hook.close_token_ids = { 99, 100, 101 };
+    // Distinct single-token probe (the close marker).
+    hook.soft_close_probe_ids = { 42 };
+    hook.soft_close_min_ratio = 0.5f;
+
+    std::vector<float> row(250000, -100.0f);
+    row[300] = 11.0f;     // chosen
+    row[42]  = 10.0f;     // probe — within ratio 0.5 (exp(10-11)=0.37 < 0.5? no, 0.367)
+    row[42]  = 10.31f;    // exp(10.31-11) ≈ 0.502 — JUST fires at 0.5
+    row[99]  = -50.0f;    // inject[0] far below — must not influence fire
+
+    CloseState state;
+    int32_t out = step_close_state(/*chosen=*/300, row.data(), hook,
+                                    /*committed_now=*/200, 50, 500, state);
+    TEST_ASSERT(state.soft_fired == true);
+    TEST_ASSERT(out == 99);   // wrote inject[0], not probe[0]
+    TEST_ASSERT(state.inject_pos == 1);
+}
+
+// Empty soft_close_probe_ids ⇒ legacy fallback: peek close_token_ids
+// front. Guarantees zero churn for any caller that doesn't set the
+// new probe field.
+static void test_soft_close_probe_ids_empty_falls_back_to_close_token_ids() {
+    using namespace dflash::common;
+    BudgetHook hook;
+    hook.close_token_ids = { 248069 };
+    // hook.soft_close_probe_ids left empty (legacy).
+    hook.soft_close_min_ratio = 0.5f;
+
+    std::vector<float> row(250000, -100.0f);
+    row[300]    = 11.0f;
+    row[248069] = 10.31f;  // close_token_ids[0]'s logit — same as before
+
+    CloseState state;
+    int32_t out = step_close_state(/*chosen=*/300, row.data(), hook,
+                                    /*committed_now=*/200, 50, 500, state);
+    TEST_ASSERT(state.soft_fired == true);
+    TEST_ASSERT(out == 248069);
+    // Sanity: soft_close_probe_token() returns inject[0] when probe is empty.
+    TEST_ASSERT(hook.soft_close_probe_token() == 248069);
+}
+
+// When soft-close fires, the WRITTEN sequence MUST be close_token_ids
+// (the full inject), regardless of what soft_close_probe_ids contains.
+// The probe is read-only — never appears in the output stream.
+static void test_soft_close_inject_sequence_unchanged_when_fires() {
+    using namespace dflash::common;
+    BudgetHook hook;
+    hook.close_token_ids = { 1718, 37947, 32 };
+    hook.soft_close_probe_ids = { 42 };
+    hook.soft_close_min_ratio = 0.1f;
+
+    std::vector<float> row(250000, -100.0f);
+    row[300] = 5.0f;
+    row[42]  = 3.0f;        // probe within ratio 0.1
+    row[1718] = -80.0f;     // inject[0] far below — must not matter
+
+    CloseState state;
+    int32_t out = step_close_state(/*chosen=*/300, row.data(), hook,
+                                    /*committed_now=*/100, 50, 200, state);
+    TEST_ASSERT(state.soft_fired == true);
+    TEST_ASSERT(out == 1718);
+
+    std::vector<float> row2(250000, -100.0f);
+    row2[999] = 5.0f;
+    out = step_close_state(/*chosen=*/999, row2.data(), hook,
+                            /*committed_now=*/101, 50, 200, state);
+    TEST_ASSERT(out == 37947);
+    out = step_close_state(/*chosen=*/999, row2.data(), hook,
+                            /*committed_now=*/102, 50, 200, state);
+    TEST_ASSERT(out == 32);
+    out = step_close_state(/*chosen=*/999, row2.data(), hook,
+                            /*committed_now=*/103, 50, 200, state);
+    TEST_ASSERT(out == 999);
+}
+
+// min_thinking_tokens floor: when set, fire is suppressed until
+// generated_so_far >= soft_close_min_tokens.
+static void test_soft_close_min_tokens_blocks_early_fire() {
+    using namespace dflash::common;
+    BudgetHook hook;
+    hook.close_token_ids = { 1718 };
+    hook.soft_close_probe_ids = { 42 };
+    hook.soft_close_min_ratio = 0.5f;
+    hook.soft_close_min_tokens = 100;
+
+    std::vector<float> row(250000, -100.0f);
+    row[300] = 5.0f;
+    row[42]  = 5.0f;   // prob_ratio = 1.0 ≫ 0.5
+
+    // Below floor: generated_so_far = 90 - 50 = 40 < 100 ⇒ no fire.
+    CloseState state_early;
+    int32_t out = step_close_state(/*chosen=*/300, row.data(), hook,
+                                    /*committed_now=*/90, 50, 500,
+                                    state_early);
+    TEST_ASSERT(state_early.soft_fired == false);
+    TEST_ASSERT(out == 300);
+
+    // Above floor: generated_so_far = 200 - 50 = 150 >= 100 ⇒ fires.
+    CloseState state_late;
+    out = step_close_state(/*chosen=*/300, row.data(), hook,
+                            /*committed_now=*/200, 50, 500,
+                            state_late);
+    TEST_ASSERT(state_late.soft_fired == true);
+    TEST_ASSERT(out == 1718);
+}
+
+// Default soft_close_min_tokens=0 ⇒ no floor ⇒ fire as soon as
+// qualifying logits show up. Confirms the floor is opt-in.
+static void test_soft_close_min_tokens_default_zero_unchanged_behavior() {
+    using namespace dflash::common;
+    BudgetHook hook;
+    hook.close_token_ids = { 1718 };
+    hook.soft_close_probe_ids = { 42 };
+    hook.soft_close_min_ratio = 0.5f;
+    // soft_close_min_tokens left at default 0.
+
+    std::vector<float> row(250000, -100.0f);
+    row[300] = 5.0f;
+    row[42]  = 5.0f;
+
+    CloseState state;
+    int32_t out = step_close_state(/*chosen=*/300, row.data(), hook,
+                                    /*committed_now=*/1, 0, 500, state);
+    TEST_ASSERT(state.soft_fired == true);
+    TEST_ASSERT(out == 1718);
+}
+
+static void test_soft_close_determinism_when_disabled() {
+    // Byte-identical generation invariant: with min_ratio=0, the
+    // override token MUST equal the chosen token for every step, for
+    // any logit configuration. This is the "zero-cost-when-disabled"
+    // generation determinism guarantee from plan §3.6.
+    using namespace dflash::common;
+    BudgetHook hook;
+    hook.close_token_ids = { 248069 };
+    hook.hard_limit_remaining = 0;          // disable hard too
+    hook.soft_close_min_ratio = 0.0f;       // disabled
+
+    CloseState state;
+    std::mt19937 rng(12345);
+    for (int step = 0; step < 100; step++) {
+        int32_t chosen = (int32_t)(rng() % 1000);
+        float l_chosen = (float)(rng() % 100) / 10.0f - 5.0f;
+        float l_close  = (float)(rng() % 100) / 10.0f - 5.0f;
+        // vocab=250000 covers close_tok=248069. Pre-existing OOB on the
+        // 1000-element row was silently passing in Release builds; new
+        // tests perturbing heap layout could turn it into a crash.
+        auto row = make_logits(/*vocab=*/250000, chosen, /*close=*/248069,
+                                l_chosen, l_close);
+        int32_t out = step_close_state(chosen, row.data(), hook,
+                                        /*committed_now=*/step, 0, 200,
+                                        state);
+        TEST_ASSERT(out == chosen);
+    }
+    TEST_ASSERT(state.soft_fired == false);
+    TEST_ASSERT(state.hard_fired == false);
+}
+
+
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
     std::fprintf(stderr, " Server Unit Tests\n");
@@ -4252,6 +4766,25 @@ int main() {
     RUN_TEST(test_flowkv_T3_ws1_continuation_json_shape);
     RUN_TEST(test_flowkv_T1_system_end_boundary_first);
     RUN_TEST(test_flowkv_T5_inert_guard_token_count);
+
+    std::fprintf(stderr, "\n── Soft-close comparator + state machine ──\n");
+    RUN_TEST(test_soft_close_disabled_default);
+    RUN_TEST(test_soft_close_strict_ratio_one);
+    RUN_TEST(test_soft_close_aggressive_half_prob);
+    RUN_TEST(test_soft_close_below_threshold);
+    RUN_TEST(test_soft_close_chosen_is_close);
+    RUN_TEST(test_soft_close_tiny_ratio_numerical);
+    RUN_TEST(test_soft_close_single_token_inject);
+    RUN_TEST(test_soft_close_multi_token_inject);
+    RUN_TEST(test_soft_close_then_hard_would_fire);
+    RUN_TEST(test_soft_close_disabled_hard_still_fires);
+    RUN_TEST(test_soft_close_natural_at_boundary);
+    RUN_TEST(test_soft_close_probe_uses_probe_ids_not_inject_ids);
+    RUN_TEST(test_soft_close_probe_ids_empty_falls_back_to_close_token_ids);
+    RUN_TEST(test_soft_close_inject_sequence_unchanged_when_fires);
+    RUN_TEST(test_soft_close_min_tokens_blocks_early_fire);
+    RUN_TEST(test_soft_close_min_tokens_default_zero_unchanged_behavior);
+    RUN_TEST(test_soft_close_determinism_when_disabled);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",
