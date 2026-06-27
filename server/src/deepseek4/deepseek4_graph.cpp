@@ -944,6 +944,9 @@ static ggml_tensor * build_moe_ffn(
 
         ggml_tensor * weights_3d = ggml_reshape_3d(ctx, routing.weights, 1, n_used, n_tokens);
         routed_out = ggml_mul(ctx, down_e, weights_3d);
+        // Sum over dim-1 (n_used experts): permute [n_embd,n_used,n_tokens] -> [n_used,n_embd,n_tokens],
+        // then sum_rows reduces dim-0, yielding [1,n_embd,n_tokens], reshape to [n_embd,n_tokens].
+        routed_out = ggml_cont(ctx, ggml_permute(ctx, routed_out, 1, 0, 2, 3));
         routed_out = ggml_sum_rows(ctx, routed_out);
         routed_out = ggml_reshape_2d(ctx, routed_out, n_embd, n_tokens);
     }
