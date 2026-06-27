@@ -1982,11 +1982,15 @@ bool deepseek4_step_layer_range(
             for (const auto & b : i32_array_inputs)
                 ggml_backend_tensor_set(b.tensor, b.values.data(), 0, sizeof(int32_t) * b.values.size());
 
+            std::fprintf(stderr, "[deepseek4-lr] layer %d: computing attn\n", il);
+            fflush(stderr);
             if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "[deepseek4] attn compute failed layer %d\n", il);
                 ggml_gallocr_free(alloc); ggml_free(ctx);
                 return false;
             }
+            std::fprintf(stderr, "[deepseek4-lr] layer %d: attn compute done\n", il);
+            fflush(stderr);
 
             std::vector<float> attn_out_host((size_t)n_embd * (size_t)n_tokens);
             ggml_backend_tensor_get(attn_out, attn_out_host.data(), 0, sizeof(float) * attn_out_host.size());
@@ -2052,7 +2056,12 @@ bool deepseek4_step_layer_range(
             }
             ggml_backend_tensor_set(inp, ffn_working.data(), 0, sizeof(float) * ffn_working.size());
 
-            if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "[deepseek4-lr] layer %d: computing ffn\n", il);
+            fflush(stderr);
+            auto status = ggml_backend_graph_compute(backend, gf);
+            std::fprintf(stderr, "[deepseek4-lr] layer %d: ffn compute done status=%d\n", il, (int)status);
+            fflush(stderr);
+            if (status != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "[deepseek4] ffn compute failed layer %d\n", il);
                 ggml_gallocr_free(alloc); ggml_free(ctx);
                 return false;
@@ -2131,10 +2140,16 @@ bool deepseek4_step_layer_range(
             return false;
         }
         ggml_backend_tensor_set(inp, final_embd.data(), 0, sizeof(float) * final_embd.size());
+        std::fprintf(stderr, "[deepseek4-lr] computing lm_head (vocab=%d)\n", w.n_vocab);
+        fflush(stderr);
         if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "[deepseek4-lr] lm_head compute failed\n");
+            fflush(stderr);
             ggml_gallocr_free(alloc); ggml_free(ctx);
             return false;
         }
+        std::fprintf(stderr, "[deepseek4-lr] lm_head compute done\n");
+        fflush(stderr);
 
         out_logits->resize((size_t)w.n_vocab);
         const size_t logits_offset = (size_t)(n_tokens - 1) * (size_t)w.n_vocab * sizeof(float);

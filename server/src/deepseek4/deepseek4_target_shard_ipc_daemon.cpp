@@ -113,10 +113,11 @@ int run_deepseek4_target_shard_ipc_daemon(
         }
 
         // Compute argmax from last token's logits
+        // Note: deepseek4_step_layer_range returns only last token's logits (size = vocab)
         if (!logits.empty()) {
             resp.logits = std::move(logits);
             const int vocab = weights.n_vocab;
-            const float * last_logits = resp.logits.data() + (size_t)(n_tokens - 1) * vocab;
+            const float * last_logits = resp.logits.data();
             int32_t best = 0;
             float best_val = last_logits[0];
             for (int i = 1; i < vocab; ++i) {
