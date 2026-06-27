@@ -1326,7 +1326,7 @@ void Qwen35Backend::kvflash_upload_mask() {
     const size_t need = (size_t)sg_.attn_mask->ne[0] * sg_.attn_mask->ne[1];
     if (kvflash_mask_buf_.size() != need || kvflash_pager_.epoch() != kvflash_mask_epoch_) {
         kvflash_mask_buf_.assign(need, F16_NEG_INF);
-        kvflash_pager_.fill_slot_mask(kvflash_mask_buf_.data());   // q row 0
+        kvflash_pager_.fill_slot_mask_cached(kvflash_mask_buf_.data());  // q row 0; pager caches
         kvflash_mask_epoch_ = kvflash_pager_.epoch();
     }
     // Upload before EVERY compute: the input tensor's buffer region is
@@ -1536,6 +1536,17 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     }
 
     // AR decode loop for remaining tokens
+    //
+    // Graph reuse: build_target_step rebuilds the ggml cgraph every step,
+    // which resets the ggml-cuda CUDA-graph warmup counter and prevents
+    // replay. The only shape that varies across steps is the FA view window
+    // (win_len_padded = round_up(committed+1, 256)), which only advances
+    // every 256 decode steps. So we rebuild only when committed/256 crosses
+    // a boundary; within a bucket we reuse the cached graph and just update
+    // the mutable input tensors.
+    const bool ar_graph_reuse = std::getenv("DFLASH_AR_NO_REUSE") == nullptr;
+    ar_decode_fa_bucket_ = -1;  // force first-step build
+
     for (int i = initial_emitted; i < n_gen; i++) {
         int32_t tok = out_tokens.back();
 
@@ -1547,17 +1558,23 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         // kvflash: graph carries a slot-validity mask alongside the
         // step-invariant set_rows write; the FA span clamps to the pool.
         const bool pool = kvflash_active();
-        if (!build_target_step(sg_, w_, cache_, target_backend_,
-                               /*kv_start=*/committed, /*n_tokens=*/1,
-                               /*with_mask=*/pool, /*capture=*/false,
-                               /*capture_delta_intermediate=*/false,
-                               /*fa_window=*/0,
-                               /*last_token_logits_only=*/false,
-                               cfg_.kq_stride_pad,
-                               should_capture_moe_router(),
-                               /*kvflash_mask=*/pool,
-                               /*capture_qk=*/pool && kvflash_qk_policy_)) {
-            return false;
+
+        const int fa_bucket = committed >> 8;  // committed / 256
+        const bool need_rebuild = !ar_graph_reuse || (fa_bucket != ar_decode_fa_bucket_);
+        if (need_rebuild) {
+            if (!build_target_step(sg_, w_, cache_, target_backend_,
+                                   /*kv_start=*/committed, /*n_tokens=*/1,
+                                   /*with_mask=*/pool, /*capture=*/false,
+                                   /*capture_delta_intermediate=*/false,
+                                   /*fa_window=*/0,
+                                   /*last_token_logits_only=*/false,
+                                   cfg_.kq_stride_pad,
+                                   should_capture_moe_router(),
+                                   /*kvflash_mask=*/pool,
+                                   /*capture_qk=*/pool && kvflash_qk_policy_)) {
+                return false;
+            }
+            ar_decode_fa_bucket_ = fa_bucket;
         }
 
         // Fill kv_write_rows with this step's cache slot for set_rows:

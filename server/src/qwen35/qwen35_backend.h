@@ -231,6 +231,9 @@ private:
     StepGraph      draft_sg_;    // draft forward
     StepGraph      proj_sg_;     // lm-head projection (remote-lm-head mode)
 
+    int ar_decode_fa_bucket_ = -1;
+    static const bool ar_graph_reuse;
+
     // ── Draft feature mirror (cross-GPU feature transfer) ────────────
     DraftFeatureMirror feature_mirror_;
     DFlashDraftIpcClient remote_draft_;
