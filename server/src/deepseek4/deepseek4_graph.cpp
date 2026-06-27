@@ -1872,19 +1872,141 @@ bool deepseek4_step_layer_range(
         const int32_t * token_ids,
         DeepSeek4StepTelemetry * telemetry) {
     (void) hc_state;
+    (void) token_ids;
+    (void) telemetry;
 
-    if (layer_begin != 0 || layer_end != w.n_layer) {
-        std::fprintf(stderr,
-                     "[deepseek4] partial layer-range forward is not implemented "
-                     "for [%d,%d) of %d layers\n",
-                     layer_begin, layer_end, w.n_layer);
+    // Full-model fast path: delegate to the original step function
+    if (layer_begin == 0 && layer_end == w.n_layer) {
+        std::vector<float> sink;
+        std::vector<float> & logits = out_logits ? *out_logits : sink;
+        return deepseek4_step(backend, w, cache, embed, n_tokens, kv_start, logits,
+                              nullptr, token_ids, nullptr, false, telemetry, nullptr);
+    }
+
+    // ── Partial layer-range forward ─────────────────────────────────────
+    const int n_embd = w.n_embd;
+    const bool is_last_shard = (layer_end >= w.n_layer);
+
+    // Create compute graph context
+    const size_t ctx_size = ggml_tensor_overhead() * 4096 + 1024 * 1024;
+    ggml_init_params params{};
+    params.mem_size = ctx_size;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+
+    // Input: hidden state from previous shard (n_embd * n_tokens)
+    ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_name(inp, "inp_hidden");
+    ggml_set_input(inp);
+
+    ggml_tensor * cur = inp;
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    std::vector<DeepSeek4I32InputBinding> i32_inputs;
+    std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
+
+    // Layer loop for [layer_begin, layer_end)
+    for (int il = layer_begin; il < layer_end; il++) {
+        const DeepSeek4Layer & L = w.layers[il];
+        DeepSeek4LayerCache & lc = cache.layers[il];
+
+        // ── Attention norm
+        ggml_tensor * normed = build_rms_norm(ctx, cur, L.attn_norm, w.rms_eps);
+
+        // ── MLA attention
+        ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc,
+                                                      il, kv_start, n_tokens,
+                                                      i32_inputs, i32_array_inputs);
+
+        // ── Residual
+        cur = ggml_add(ctx, cur, attn_out);
+
+        // ── FFN norm
+        ggml_tensor * ffn_normed = build_rms_norm(ctx, cur, L.ffn_norm, w.rms_eps);
+
+        // ── MoE FFN
+        ggml_tensor * ffn_out = build_moe_ffn(ctx, ffn_normed, w, L, il, n_tokens);
+
+        // ── Residual
+        cur = ggml_add(ctx, cur, ffn_out);
+    }
+
+    // Output: either logits (last shard) or hidden state (intermediate shard)
+    ggml_tensor * output_tensor;
+    if (is_last_shard) {
+        cur = build_rms_norm(ctx, cur, w.out_norm, w.rms_eps);
+        output_tensor = ggml_mul_mat(ctx, w.output, cur);
+        ggml_set_name(output_tensor, "logits");
+    } else {
+        output_tensor = cur;
+        ggml_set_name(output_tensor, "hidden_out");
+    }
+    ggml_set_output(output_tensor);
+
+    // Build and run graph
+    ggml_build_forward_expand(gf, output_tensor);
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(alloc, gf)) {
+        std::fprintf(stderr, "[deepseek4] partial graph allocation failed for [%d,%d)\n",
+                     layer_begin, layer_end);
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
         return false;
     }
 
-    std::vector<float> sink;
-    std::vector<float> & logits = out_logits ? *out_logits : sink;
-    return deepseek4_step(backend, w, cache, embed, n_tokens, kv_start, logits,
-                          nullptr, token_ids, nullptr, false, telemetry, nullptr);
+    // Set input data
+    ggml_backend_tensor_set(inp, embed, 0, (size_t)n_embd * n_tokens * sizeof(float));
+    for (const DeepSeek4I32InputBinding & binding : i32_inputs) {
+        ggml_backend_tensor_set(binding.tensor, &binding.value, 0, sizeof(binding.value));
+    }
+    for (const DeepSeek4I32ArrayBinding & binding : i32_array_inputs) {
+        ggml_backend_tensor_set(binding.tensor, binding.values.data(), 0,
+                                sizeof(int32_t) * binding.values.size());
+    }
+
+    // Compute
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "[deepseek4] partial graph compute failed for [%d,%d)\n",
+                     layer_begin, layer_end);
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        return false;
+    }
+
+    // Read output
+    if (out_logits) {
+        if (is_last_shard) {
+            out_logits->resize(w.n_vocab);
+            const size_t logits_offset = (size_t)(n_tokens - 1) * w.n_vocab * sizeof(float);
+            ggml_backend_tensor_get(output_tensor, out_logits->data(), logits_offset,
+                                    w.n_vocab * sizeof(float));
+        } else {
+            // Return hidden state for next shard
+            out_logits->resize((size_t)n_embd * n_tokens);
+            ggml_backend_tensor_get(output_tensor, out_logits->data(), 0,
+                                    (size_t)n_embd * n_tokens * sizeof(float));
+        }
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+
+    // Update compressor state
+    const int next_pos = kv_start + n_tokens;
+    for (int il = layer_begin; il < layer_end; ++il) {
+        const uint32_t ratio = w.compress_ratios[il];
+        if (ratio <= 0 || (next_pos % (int)ratio) != 0) continue;
+        cache.layers[il].n_comp = std::max(cache.layers[il].n_comp, next_pos / (int)ratio);
+        if (ratio == 4) {
+            cache.layers[il].n_index_comp = std::max(cache.layers[il].n_index_comp,
+                                                     next_pos / (int)ratio);
+        }
+    }
+
+    cache.cur_pos = next_pos;
+    return true;
 }
 
 // ─── Cache management ───────────────────────────────────────────────────
