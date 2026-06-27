@@ -791,7 +791,7 @@ static ggml_tensor * build_delta_net_block(
     // [n_tokens, conv_channels, n_seqs] to concat on dim 0.
     ggml_tensor * qkv_T = ggml_transpose(ctx, qkv_mixed);
 
-    ggml_tensor * conv_input = ggml_concat(ctx, conv_states_r, qkv_T, 0);
+    ggml_tensor * conv_input = ggml_concat(ctx, ggml_cont(ctx, conv_states_r), ggml_cont(ctx, qkv_T), 0);
     // conv_input: [kernel-1 + n_tokens, conv_channels, n_seqs]
 
     // For spec-decode rollback: copy the full conv_input into the persistent
