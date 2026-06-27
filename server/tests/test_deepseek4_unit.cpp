@@ -3,6 +3,13 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#include "common/backend_ipc.h"
+#include "common/layer_split_utils.h"
+
+#include <memory>
+#include <random>
+#include <string>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -11,6 +18,12 @@
 #include <limits>
 #include <numeric>
 #include <vector>
+
+#define private public
+#include "deepseek4/deepseek4_layer_split_adapter.h"
+#undef private
+
+using namespace dflash::common;
 
 static int g_failures = 0;
 
@@ -328,6 +341,194 @@ static void test_hash_routing_lookup() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+struct ScopedEnvVar {
+    explicit ScopedEnvVar(const char * name)
+        : name(name ? name : ""),
+          had_value(std::getenv(this->name.c_str()) != nullptr),
+          old_value(had_value ? std::getenv(this->name.c_str()) : "") {}
+
+    ~ScopedEnvVar() {
+        if (had_value) {
+            setenv(name.c_str(), old_value.c_str(), 1);
+        } else {
+            unsetenv(name.c_str());
+        }
+    }
+
+    std::string name;
+    bool had_value = false;
+    std::string old_value;
+};
+
+static DeepSeek4LayerSplitAdapter make_test_adapter() {
+    DeepSeek4LayerSplitAdapterConfig cfg;
+    cfg.device.gpu = 0;
+    cfg.device.max_ctx = 8192;
+    return DeepSeek4LayerSplitAdapter(cfg);
+}
+
+static void test_auto_split_computation() {
+    std::fprintf(stderr, "  test_auto_split_computation ...");
+
+    ScopedEnvVar env_guard("DFLASH_DS4_CUDA_LAYERS");
+    auto adapter = make_test_adapter();
+
+    setenv("DFLASH_DS4_CUDA_LAYERS", "17", 1);
+    TEST_ASSERT(adapter.compute_auto_split_layers() == 17);
+
+    unsetenv("DFLASH_DS4_CUDA_LAYERS");
+    const int estimated =
+        DeepSeek4LayerSplitAdapter::estimate_cuda_layers_from_free_bytes(
+            20ULL * 1024 * 1024 * 1024);
+    TEST_ASSERT(estimated >= 1 && estimated <= 42);
+    TEST_ASSERT(estimated == 36);
+
+    const int computed = adapter.compute_auto_split_layers();
+    TEST_ASSERT(computed >= 1 && computed <= 42);
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_layer_range_validation() {
+    std::fprintf(stderr, "  test_layer_range_validation ...");
+
+    const auto equal = compute_layer_ranges(43, 2, {1.0, 1.0});
+    TEST_ASSERT(equal.size() == 2);
+    if (equal.size() == 2) {
+        TEST_ASSERT(equal[0].begin == 0 && equal[0].end == 22);
+        TEST_ASSERT(equal[1].begin == 22 && equal[1].end == 43);
+    }
+
+    const auto front_heavy = compute_layer_ranges(43, 2, {2.0, 1.0});
+    TEST_ASSERT(front_heavy.size() == 2);
+    if (front_heavy.size() == 2) {
+        TEST_ASSERT(front_heavy[0].begin == 0 && front_heavy[0].end == 29);
+        TEST_ASSERT(front_heavy[1].begin == 29 && front_heavy[1].end == 43);
+    }
+
+    const auto back_heavy = compute_layer_ranges(43, 2, {1.0, 2.0});
+    TEST_ASSERT(back_heavy.size() == 2);
+    if (back_heavy.size() == 2) {
+        TEST_ASSERT(back_heavy[0].begin == 0 && back_heavy[0].end == 14);
+        TEST_ASSERT(back_heavy[1].begin == 14 && back_heavy[1].end == 43);
+    }
+
+    const auto three_way = compute_layer_ranges(43, 3, {1.0, 1.0, 1.0});
+    TEST_ASSERT(three_way.size() == 3);
+    if (three_way.size() == 3) {
+        TEST_ASSERT(three_way[0].begin == 0 && three_way[0].end == 14);
+        TEST_ASSERT(three_way[1].begin == 14 && three_way[1].end == 29);
+        TEST_ASSERT(three_way[2].begin == 29 && three_way[2].end == 43);
+    }
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_hc_state_dimensions() {
+    std::fprintf(stderr, "  test_hc_state_dimensions ...");
+
+    DeepSeek4Weights weights;
+    TEST_ASSERT(weights.n_hc == 4);
+    TEST_ASSERT(weights.n_embd == 4096);
+    TEST_ASSERT(DeepSeek4LayerSplitAdapter::hc_state_elements(weights) == 16384);
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_snapshot_save_restore() {
+    std::fprintf(stderr, "  test_snapshot_save_restore ...");
+
+    auto adapter = make_test_adapter();
+    adapter.cur_pos_ = 23;
+    adapter.last_tok_ = 4242;
+    adapter.hc_state_ = {1.0f, 2.0f, 3.0f, 4.0f};
+
+    TEST_ASSERT(adapter.snapshot_save(0));
+    TEST_ASSERT(adapter.snapshot_used(0));
+    TEST_ASSERT(adapter.snapshot_cur_pos(0) == 23);
+
+    adapter.cur_pos_ = 0;
+    adapter.last_tok_ = -1;
+    adapter.hc_state_.assign(4, 0.0f);
+
+    TEST_ASSERT(adapter.snapshot_restore(0));
+    TEST_ASSERT(adapter.cur_pos_ == 23);
+    TEST_ASSERT(adapter.last_tok_ == 4242);
+    TEST_ASSERT(adapter.hc_state_.size() == 4);
+    if (adapter.hc_state_.size() == 4) {
+        TEST_ASSERT(adapter.hc_state_[0] == 1.0f);
+        TEST_ASSERT(adapter.hc_state_[3] == 4.0f);
+    }
+
+    adapter.snapshot_free(0);
+    TEST_ASSERT(!adapter.snapshot_used(0));
+    TEST_ASSERT(adapter.snapshots_[0].hc_state.empty());
+    TEST_ASSERT(!adapter.snapshot_restore(0));
+    TEST_ASSERT(!adapter.snapshot_save(-1));
+    TEST_ASSERT(!adapter.snapshot_save(ModelBackend::kMaxSlots));
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_reset_request_state() {
+    std::fprintf(stderr, "  test_reset_request_state ...");
+
+    auto adapter = make_test_adapter();
+    adapter.cur_pos_ = 9;
+    adapter.last_tok_ = 77;
+    adapter.hc_state_.assign(8, 5.0f);
+    adapter.shards_.resize(2);
+    for (auto & shard : adapter.shards_) {
+        shard.cache.cur_pos = 11;
+        shard.cache.layers.resize(3);
+        for (auto & layer : shard.cache.layers) {
+            layer.n_comp = 4;
+            layer.n_index_comp = 6;
+        }
+    }
+
+    adapter.reset_request_state();
+    TEST_ASSERT(adapter.cur_pos_ == 0);
+    TEST_ASSERT(adapter.last_tok_ == -1);
+    for (float v : adapter.hc_state_) {
+        TEST_ASSERT(v == 0.0f);
+    }
+    for (const auto & shard : adapter.shards_) {
+        TEST_ASSERT(shard.cache.cur_pos == 0);
+        for (const auto & layer : shard.cache.layers) {
+            TEST_ASSERT(layer.n_comp == 0);
+            TEST_ASSERT(layer.n_index_comp == 0);
+        }
+    }
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_adapter_guard_paths() {
+    std::fprintf(stderr, "  test_adapter_guard_paths ...");
+
+    auto adapter = make_test_adapter();
+    TEST_ASSERT(!adapter.init());
+
+    int last_tok = -1;
+    TEST_ASSERT(!adapter.prefill({1, 2, 3}, 0, last_tok));
+
+    std::vector<int32_t> out_tokens;
+    TEST_ASSERT(!adapter.decode_ar(1, 0, 1, out_tokens, DaemonIO{}));
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_ipc_mode_registration() {
+    std::fprintf(stderr, "  test_ipc_mode_registration ...");
+
+    BackendIpcMode mode = BackendIpcMode::Invalid;
+    TEST_ASSERT(parse_backend_ipc_mode("deepseek4-target-shard", mode));
+    TEST_ASSERT(mode == BackendIpcMode::DeepSeek4TargetShard);
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 int main() {
     ggml_backend_t backend = ggml_backend_cpu_init();
     if (!backend) {
@@ -340,6 +541,13 @@ int main() {
     test_rmsnorm_correctness(backend);
     test_grouped_output_projection_shape();
     test_hash_routing_lookup();
+    test_auto_split_computation();
+    test_layer_range_validation();
+    test_hc_state_dimensions();
+    test_snapshot_save_restore();
+    test_reset_request_state();
+    test_adapter_guard_paths();
+    test_ipc_mode_registration();
 
     ggml_backend_free(backend);
 

@@ -10,11 +10,16 @@
 #include "common/target_shard_ipc_daemon.h"
 
 #include "ggml-backend.h"
+#include "ggml-cuda.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 namespace dflash::common {
 

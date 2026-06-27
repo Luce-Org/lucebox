@@ -80,6 +80,8 @@ private:
         return remote_target_shard_.active() && !shards_.empty();
     }
     int compute_auto_split_layers() const;
+    static int estimate_cuda_layers_from_free_bytes(size_t free_bytes);
+    static size_t hc_state_elements(const DeepSeek4Weights & weights);
 
     DeepSeek4LayerSplitAdapterConfig cfg_;
     std::vector<DeepSeek4LayerSplitShard> shards_;

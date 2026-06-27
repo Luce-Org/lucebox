@@ -38,6 +38,25 @@ DeepSeek4LayerSplitAdapter::~DeepSeek4LayerSplitAdapter() {
     shutdown();
 }
 
+int DeepSeek4LayerSplitAdapter::estimate_cuda_layers_from_free_bytes(
+        size_t free_bytes) {
+    const uint64_t fixed_overhead = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
+    const uint64_t per_layer_bytes = 500ULL * 1024 * 1024;      // ~500 MiB
+
+    if ((uint64_t) free_bytes <= fixed_overhead) {
+        return 1;
+    }
+
+    const uint64_t available = (uint64_t) free_bytes - fixed_overhead;
+    const int max_layers = (int) (available / per_layer_bytes);
+    return std::max(1, std::min(max_layers, 42));
+}
+
+size_t DeepSeek4LayerSplitAdapter::hc_state_elements(
+        const DeepSeek4Weights & weights) {
+    return (size_t) weights.n_hc * (size_t) weights.n_embd;
+}
+
 int DeepSeek4LayerSplitAdapter::compute_auto_split_layers() const {
     // Check env override first
     int override_layers = env_int("DFLASH_DS4_CUDA_LAYERS", -1);
@@ -45,15 +64,19 @@ int DeepSeek4LayerSplitAdapter::compute_auto_split_layers() const {
         return override_layers;
     }
 
-    // Query CUDA free memory
     size_t free_bytes = 0, total_bytes = 0;
 #if defined(GGML_USE_CUDA)
-    // Use ggml CUDA info if available
     int gpu = cfg_.device.gpu;
     if (gpu < 0) gpu = 0;
-    // cudaSetDevice + cudaMemGetInfo
-    cudaSetDevice(gpu);
-    cudaMemGetInfo(&free_bytes, &total_bytes);
+    const cudaError_t set_device_err = cudaSetDevice(gpu);
+    const cudaError_t mem_info_err =
+        set_device_err == cudaSuccess
+            ? cudaMemGetInfo(&free_bytes, &total_bytes)
+            : set_device_err;
+    if (mem_info_err != cudaSuccess) {
+        free_bytes = 20ULL * 1024 * 1024 * 1024;
+        total_bytes = 24ULL * 1024 * 1024 * 1024;
+    }
 #else
     // Fallback: assume 24GB GPU, 80% usable
     free_bytes = 20ULL * 1024 * 1024 * 1024;
@@ -74,18 +97,13 @@ int DeepSeek4LayerSplitAdapter::compute_auto_split_layers() const {
     //   KV cache per layer: ~2MB at 8K ctx
     //   Safety margin: 1GB
 
-    const uint64_t fixed_overhead = 2ULL * 1024 * 1024 * 1024;  // 2 GB
-    const uint64_t per_layer_bytes = 500ULL * 1024 * 1024;       // ~500 MB
-
-    if (free_bytes <= fixed_overhead) {
+    if ((uint64_t) free_bytes <= 2ULL * 1024 * 1024 * 1024) {
         std::fprintf(stderr, "[deepseek4-split] insufficient CUDA memory (%.1f GiB free)\n",
                      (double)free_bytes / (1024.0 * 1024.0 * 1024.0));
         return 1;  // Minimum 1 layer on CUDA
     }
 
-    uint64_t available = free_bytes - fixed_overhead;
-    int max_layers = (int)(available / per_layer_bytes);
-    max_layers = std::max(1, std::min(max_layers, 42));  // At least 1 on each GPU
+    const int max_layers = estimate_cuda_layers_from_free_bytes(free_bytes);
 
     std::fprintf(stderr, "[deepseek4-split] auto-split: CUDA free=%.1f GiB, "
                  "estimated %d layers on CUDA, %d on Halo\n",
@@ -149,9 +167,7 @@ bool DeepSeek4LayerSplitAdapter::init() {
 
     // Initialize HC state (4 streams × n_embd)
     if (!shards_.empty()) {
-        const int n_hc = shards_[0].weights.n_hc;
-        const int n_embd = shards_[0].weights.n_embd;
-        hc_state_.resize((size_t)n_hc * n_embd, 0.0f);
+        hc_state_.resize(hc_state_elements(shards_[0].weights), 0.0f);
     }
 
     // Initialize mixed target split if configured
@@ -230,9 +246,9 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
     // Embed tokens on first shard
     auto & first_shard = shards_[0];
     std::vector<float> embed((size_t)n_embd * n_tokens);
-    for (int ti = 0; ti < n_tokens; ++ti) {
-        first_shard.weights.embedder.embed(tokens[ti],
-            embed.data() + (size_t)ti * n_embd);
+    if (!first_shard.weights.embedder.embed(tokens.data(), n_tokens, embed.data())) {
+        std::fprintf(stderr, "[deepseek4-split] embedding failed on first shard\n");
+        return false;
     }
 
     // Initialize HC state from embedding for new sequences
@@ -292,9 +308,9 @@ bool DeepSeek4LayerSplitAdapter::run_mixed_forward(
     // Run local shard (first N layers on CUDA)
     auto & local_shard = shards_[0];
     std::vector<float> embed((size_t)n_embd * n_tokens);
-    for (int ti = 0; ti < n_tokens; ++ti) {
-        local_shard.weights.embedder.embed(tokens[ti],
-            embed.data() + (size_t)ti * n_embd);
+    if (!local_shard.weights.embedder.embed(tokens.data(), n_tokens, embed.data())) {
+        std::fprintf(stderr, "[deepseek4-split] embedding failed on local shard\n");
+        return false;
     }
 
     std::vector<float> out_logits;

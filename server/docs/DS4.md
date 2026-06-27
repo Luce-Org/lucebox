@@ -1,6 +1,6 @@
 # DeepSeek V4 Flash — DFlash Integration
 
-This document describes the DeepSeek V4 Flash model backend in DFlash, covering the architecture mapping, the hot/cold MoE expert split, and the IPC worker protocol.
+This document describes the DeepSeek V4 Flash model backend in DFlash, covering the architecture mapping, the CUDA/Halo layer split, and the target-shard IPC path.
 
 ## Model Architecture
 
@@ -23,208 +23,117 @@ DeepSeek V4 Flash is a 43-layer MoE model with:
 
 | Area | Files |
 |------|-------|
-| Backend lifecycle and init | `src/deepseek4/deepseek4_backend.cpp`, `.h` |
-| Forward graph, routing, hybrid step | `src/deepseek4/deepseek4_graph.cpp` |
-| Model weights and metadata | `src/deepseek4/deepseek4_internal.h`, `deepseek4_loader.cpp` |
+| Backend selection / init | `src/common/backend_factory.cpp`, `src/deepseek4/deepseek4_layer_split_adapter.{h,cpp}` |
+| Per-shard forward graph | `src/deepseek4/deepseek4_graph.cpp` |
+| Model weights and metadata | `src/deepseek4/deepseek4_internal.h`, `src/deepseek4/deepseek4_loader.cpp` |
 | HC pre/post CUDA kernel | `src/deepseek4/deepseek4_hc_cuda.cu`, `.h` |
-| Expert IPC client | `src/common/expert_ipc.cpp`, `.h` |
-| Expert IPC daemon (worker) | `src/deepseek4/deepseek4_expert_ipc_daemon.cpp` |
-| Hybrid expert storage | `src/common/moe_hybrid_storage.*` |
-| Hybrid FFN evaluation | `src/common/moe_hybrid_ffn_eval.*` |
-| MoE types and config | `src/common/moe_hybrid_types.h` |
+| Remote target-shard daemon | `src/deepseek4/deepseek4_target_shard_ipc_daemon.cpp` |
+| Shared target-shard IPC infrastructure | `src/common/target_shard_ipc.*`, `src/placement/remote_target_shard_config.h` |
 | Backend IPC CLI entry | `src/ipc/backend_ipc_main.cpp` |
 
-## Forward Pass (Hybrid Path)
+## Forward Pass (Layer-Split Path)
 
-`deepseek4_step_hybrid()` drives per-layer execution:
+`deepseek4_step_layer_range()` drives per-shard execution over a contiguous layer range:
 
-1. **HC pre (attention)** — Sinkhorn-normalize the 4 HC streams, produce a working vector. Uses a CUDA kernel (`deepseek4_cuda_hc_pre_mix`) for decode or CPU fallback for prefill.
-2. **MLA attention** — Low-rank Q projection → RoPE → KV cache write → scaled dot-product over raw SWA + compressed KV + indexed KV → grouped low-rank output projection.
-3. **HC post (attention)** — Update HC streams from attention output.
-4. **HC pre (FFN)** — Same Sinkhorn mix for FFN sublayer.
-5. **RMSNorm + Router** — Normalize, compute router logits, select top-6 experts (or hash-route for layers 0–2).
-6. **Hybrid/Worker FFN** — `eval_ds4_hybrid_or_worker()` dispatches expert compute.
-7. **HC post (FFN)** — Update HC streams from FFN output.
-8. **Output HC + lm_head** — Final HC merge → RMSNorm → vocabulary projection.
+1. **Embedding + HC init** — The first shard embeds tokens and initializes the HC state for new sequences.
+2. **Per-layer forward** — Each layer still runs the normal DS4 sequence: HC pre (attention) → MLA attention → HC post (attention) → HC pre (FFN) → RMSNorm + router → MoE FFN → HC post (FFN).
+3. **Shard boundary handoff** — At the split point, the parent sends the current hidden activation plus HC state to the next shard.
+4. **Tail shard completion** — The last shard resumes at its `layer_begin`, runs the remaining layers, then performs the final HC merge, RMSNorm, and `lm_head` projection.
+
+The MoE computation stays local to the shard that owns each layer. DeepSeek4 no longer partitions experts into hot/cold or forwards per-token expert work to a separate worker.
 
 ## Execution Modes
 
-### Full CUDA
+### Local layer split
 
-All weights including experts on GPU. Only viable on ≥80 GB VRAM; automatically attempted first and falls back on OOM.
+DeepSeek4 always runs through `LayerSplitBackend`. When the server is configured with an explicit target layer split, the adapter loads each contiguous shard locally and executes them in order.
 
-### Hybrid (Hot GPU / Cold CPU)
+### CUDA parent + Halo target-shard split
 
-Non-expert weights on CUDA, experts split by placement:
-
-- **Hot experts** — subset loaded into GPU VRAM, evaluated via cached ggml graphs.
-- **Cold experts** — remaining experts in CPU memory, evaluated on a CPU backend.
-- Results are summed on the parent.
-
-Triggered by: `DFLASH_DS4_HYBRID=1` or automatic OOM fallback.
-
-### CUDA Parent + HIP Worker Split (`hip_hot_cpu_cold`)
-
-The primary multi-device mode for heterogeneous setups (e.g., RTX 3090 CUDA + Radeon 8060S HIP):
+For heterogeneous setups, the CUDA-built server can keep the prefix layers on the CUDA GPU and launch the suffix shard on the Halo/HIP build through the existing target-shard IPC path:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  CUDA Parent (RTX 3090)                                     │
-│  - Non-expert weights (MLA, HC, embeddings, lm_head)        │
-│  - Attention, HC mix, routing, RMSNorm                      │
-│  - Cold expert tail (CPU memory, evaluated locally)          │
+│  CUDA Parent                                                │
+│  - Token embedding                                          │
+│  - Layers [0, split)                                        │
+│  - Maintains local KV/cache state for its layer range       │
 ├─────────────────────────────────────────────────────────────┤
-│  HIP Worker (Radeon 8060S via IPC daemon)                   │
-│  - Hot experts loaded into HIP VRAM                         │
-│  - Receives activations + selected IDs over IPC             │
-│  - Returns weighted FFN output                              │
+│  Halo Target Shard (IPC daemon)                             │
+│  - Layers [split, 43)                                       │
+│  - Final HC merge, RMSNorm, lm_head                         │
+│  - Returns logits / sampled token to the parent             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-Enabled by:
-```bash
-DFLASH_DS4_EXPERT_SPLIT=hip_hot_cpu_cold
-DFLASH_DS4_EXPERT_IPC=1
-DFLASH_DS4_EXPERT_IPC_BIN=<path to HIP backend_ipc_daemon>
-DFLASH_DS4_EXPERT_IPC_MODEL=<GGUF path>
-DFLASH_DS4_EXPERT_WORKER_BUDGET_MB=61000
-```
+This path uses `TargetShardIpcSession`, `deepseek4_target_shard_ipc_daemon.cpp`, and `BackendIpcMode::DeepSeek4TargetShard` rather than the old expert-worker protocol.
 
-## Hot/Cold Expert Handling
+## Shard Boundary State
 
-### Placement Computation
+The shard boundary transfers model state at the layer split, not per-expert routing payloads:
 
-Placement determines which experts are "hot" (on the accelerator) vs "cold" (on CPU):
+- **Hidden activation** — current `[n_tokens × n_embd]` activation at the split point.
+- **HC state** — persistent `[n_hc × n_embd]` controller state shared across all layers.
+  For DeepSeek4 this is `4 × 4096` floats, about 64 KiB.
+- **Sequence position / token metadata** — enough information for the tail shard to continue its cache updates and finish the forward pass.
 
-1. **Uniform placement** (default) — First N experts per layer up to the memory budget. Simple, avoids any profiling dependency.
-2. **Route-stat placement** — Top-N by observed routing frequency (`DFLASH_DS4_ROUTE_STATS_OUT` to collect, `DFLASH_DS4_PLACEMENT_IN` to load). Maximizes hit rate but can overload the worker.
-3. **Explicit JSON** — `DFLASH_DS4_PLACEMENT_IN=<file>` loads a pre-computed placement (shared between parent and worker).
+KV cache tensors remain owned by the shard that owns the corresponding layer range.
 
-The `MoeHybridPlacement` struct records per-layer hot expert IDs and counts.
+## Auto-Split Behavior
 
-### Partitioning at Inference Time
+If DeepSeek4 is started without an explicit target layer split, `DeepSeek4LayerSplitAdapter` computes the CUDA prefix automatically:
 
-In `eval_ds4_hybrid_or_worker()`, for each token the top-6 selected expert IDs are classified:
+1. Read `DFLASH_DS4_CUDA_LAYERS`. If it is set to a positive value, that value becomes the number of prefix layers kept on CUDA.
+2. Otherwise, query CUDA free memory.
+3. Reserve fixed overhead for embeddings, output head, cache growth, and safety margin.
+4. Estimate roughly 500 MiB per DeepSeek4 layer.
+5. Clamp the result so at least one layer remains on each side (`1..42`), then assign the remaining `43 - N` layers to Halo.
 
-```
-for each selected expert ID:
-    if hot_local_by_global[id] >= 0  →  expert is "hot"
-    else                              →  expert is "cold"
-
-if worker_owns_hot_ids:
-    local  = cold IDs  (evaluated on CPU by parent)
-    remote = hot IDs   (sent to HIP worker)
-else:
-    local  = hot IDs   (evaluated on GPU by parent)
-    remote = cold IDs  (sent to worker)
-```
-
-The `worker_owns_hot_ids` flag inverts ownership semantics for the split mode where hot experts live on the HIP worker rather than the CUDA parent.
-
-### FFN Evaluation Paths
-
-| Function | Purpose |
-|----------|---------|
-| `eval_moe_hybrid_ffn_single()` | Single-token: hot on GPU + cold on CPU, cached graphs |
-| `eval_moe_hybrid_ffn_batched()` | Batched prefill: hot GPU + cold CPU concurrently |
-| `eval_moe_hot_only_batched()` | All-hot batched (when full GPU fit) |
-| `eval_moe_hybrid_ffn_gpu_resident()` | GPU-resident decode (data stays on GPU, only router IDs read to CPU) |
-
-Graph caching: per-layer cached ggml graphs keyed by selected expert count avoid rebuild overhead. Fixed-slot mode (`DFLASH_MOE_FIXED_SLOT_GRAPHS=1`) pads to `n_expert_used` slots with zero-weighted dummies.
-
-### Async Worker Overlap
-
-`DFLASH_DS4_ASYNC_WORKER=1` enables pipelining:
-
-1. Partition selected IDs into local and remote sets.
-2. `eval_begin()` — send request to HIP worker (non-blocking write).
-3. Evaluate local CPU cold + shared expert work.
-4. `eval_end()` — block until worker responds.
-5. Sum local + remote outputs.
-
-This hides part of the HIP compute behind CPU cold work.
-
-## Expert IPC Protocol
-
-Communication uses temp-file payloads with stdin/stdout command framing:
-
-**Request** (parent → worker):
-- Write binary file: `ExpertIpcRequestHeader` + activation `[n_tokens × n_embd]` + selected IDs `[n_tokens × n_selected]` + weights `[n_tokens × n_selected]`.
-- Send `eval <path>` command on the IPC stream.
-
-**Response** (worker → parent):
-- `ExpertIpcResponseHeader` (version 2) — status, dimensions, worker-side timing.
-- Optional `ExpertIpcGraphTiming` extension (version 3, if `EXPERT_IPC_FLAG_GRAPH_TIMING` set) — per-graph build/compute/read breakdown.
-- Output activation payload `[n_tokens × n_embd]`.
-
-The `eval_begin()`/`eval_end()` split enables async overlap without protocol changes.
-
-## Telemetry
-
-`DFLASH_DS4_TIMING=1` emits `[deepseek4-timing]` aggregate logs per request:
-
-| Field | Meaning |
-|-------|---------|
-| `ffn`, `hot`, `cold`, `combine`, `partition` | Parent-side hybrid FFN phases |
-| `worker` | Parent-observed worker wall time |
-| `worker_write`, `worker_wait`, `worker_read` | Parent IPC phases |
-| `worker_req_read`, `worker_part`, `worker_resident`, `worker_miss_build`, `worker_miss` | Worker-side phases |
-| `worker_req_kib`, `worker_resp_kib` | Payload volume |
-| `ffn_hot_graph_build/hit`, `ffn_cold_graph_build/hit` | Parent graph cache |
-| `worker_hot_graph_build/hit` | Worker graph cache |
-| `hot_sel`, `cold_sel` | Routed expert counts by ownership |
+The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 
 ## Environment Variables
 
 | Variable | Purpose |
 |----------|---------|
-| `DFLASH_DS4_HYBRID=1` | Force hybrid mode (skip full-load attempt) |
-| `DFLASH_DS4_EXPERT_SPLIT=hip_hot_cpu_cold` | Enable CUDA + HIP + CPU three-way split |
-| `DFLASH_DS4_EXPERT_IPC=1` | Use IPC worker for expert eval |
-| `DFLASH_DS4_EXPERT_IPC_BIN` | Path to `backend_ipc_daemon` binary |
-| `DFLASH_DS4_EXPERT_IPC_MODEL` | Worker GGUF model path |
-| `DFLASH_DS4_EXPERT_IPC_GPU` | Worker GPU index |
-| `DFLASH_DS4_EXPERT_IPC_SUDO=1` | Launch worker via sudo (for HIP access) |
-| `DFLASH_DS4_EXPERT_WORKER_BUDGET_MB` | Worker hot expert memory budget |
-| `DFLASH_DS4_HIP_HOT_PER_LAYER` | Override hot experts per layer |
-| `DFLASH_DS4_EXPERT_WORKER_OFFSET` | Uniform placement first expert offset |
-| `DFLASH_DS4_TIMING=1` | Enable timing telemetry |
-| `DFLASH_DS4_ASYNC_WORKER=1` | Async worker overlap |
-| `DFLASH_DS4_ADAPTIVE_HOT=1` | Use adaptive hot count (target_ratio-based) |
-| `DFLASH_DS4_ADAPTIVE_HOT_TARGET_RATIO` | Fraction of experts to place hot (default 0.5) |
-| `DFLASH_MOE_FIXED_SLOT_GRAPHS=1\|adaptive` | Fixed-slot cached FFN graphs (adaptive=pad to max(n,3)) |
-| `DFLASH_MOE_FIXED_SLOT_MAX` | Cap fixed-slot padding (default=n_expert_used) |
-| `DFLASH_DS4_ROUTE_STATS_OUT` | Write routing stats CSV |
-| `DFLASH_DS4_PLACEMENT_IN` | Load placement JSON |
-| `DFLASH_DS4_PLACEMENT_OUT` | Export computed placement JSON |
-| `DFLASH_DS4_PLACEMENT_ONLY` | Compute and save placement, then exit |
+| `DFLASH_DS4_CUDA_LAYERS` | Override the auto-split heuristic and pin the first `N` DeepSeek4 layers to CUDA. The remaining `43 - N` layers run on the Halo shard. |
 
-## Example: CUDA + HIP Split
+DeepSeek4 no longer uses the old expert-split environment variables or expert-worker tuning knobs.
+
+## Example: CUDA + Halo Layer Split
+
+Automatic split (CUDA prefix chosen from free memory, optional manual override via `DFLASH_DS4_CUDA_LAYERS`):
 
 ```bash
-export DFLASH_DS4_EXPERT_SPLIT=hip_hot_cpu_cold
-export DFLASH_DS4_EXPERT_IPC=1
-export DFLASH_DS4_EXPERT_IPC_SUDO=1
-export DFLASH_DS4_EXPERT_IPC_BIN=$PWD/server/build-hip/backend_ipc_daemon
-export DFLASH_DS4_EXPERT_IPC_MODEL=/opt/models/DeepSeek-V4-Flash.gguf
-export DFLASH_DS4_EXPERT_WORKER_BUDGET_MB=61000
-export DFLASH_DS4_TIMING=1
-export DFLASH_DS4_ASYNC_WORKER=1
+export DFLASH_DS4_CUDA_LAYERS=24   # optional
 
-./server/build/dflash_server /opt/models/DeepSeek-V4-Flash.gguf --port 8213
+./server/build-cuda/dflash_server /opt/models/DeepSeek-V4-Flash.gguf \
+  --target-device cuda:0 \
+  --target-shard-ipc-bin $PWD/server/build-hip/backend_ipc_daemon \
+  --target-shard-ipc-work-dir $PWD/server/target_shard_ipc \
+  --port 8213
+```
+
+Explicit mixed-backend split using the generic target-shard flags:
+
+```bash
+./server/build-cuda/dflash_server /opt/models/DeepSeek-V4-Flash.gguf \
+  --target-devices cuda:0,hip:0 \
+  --target-layer-split 24,19 \
+  --target-shard-ipc-bin $PWD/server/build-hip/backend_ipc_daemon \
+  --target-shard-ipc-work-dir $PWD/server/target_shard_ipc \
+  --port 8213
 ```
 
 ## Performance Notes
 
-- **CPU cold tail is often cheaper than HIP hot**: Naive route-stat placement that maximizes HIP coverage can regress throughput because HIP FFN compute is the bottleneck, not CPU cold misses.
-- **Async overlap is safe**: Hides ~3–4s of HIP latency behind CPU cold work with no correctness impact.
-- **Fixed-slot graphs**: Eliminates graph rebuilds but increases per-token expert compute; keep opt-in.
-- **Current bottleneck**: HIP resident FFN compute dominates worker-side cost. Future work should target HIP kernel optimization or cost-aware placement.
+- **Split granularity is coarse and stable**: the boundary moves by whole layers, so execution avoids per-token expert ownership checks and per-request expert placement decisions.
+- **Boundary traffic is small**: the HC state is only about 64 KiB, so the split cost is dominated by the hidden activation transfer and the tail-shard compute.
+- **Auto-split is meant as a starting point**: override `DFLASH_DS4_CUDA_LAYERS` when you want a reproducible split or when empirical throughput differs from the simple memory estimate.
 
 ## Build Targets
 
 | Target | Backend | Purpose |
 |--------|---------|---------|
-| `dflash_server` | CUDA | Production server (parent) |
-| `backend_ipc_daemon` | HIP | Expert worker for split mode |
+| `dflash_server` | CUDA | Production server / CUDA parent |
+| `backend_ipc_daemon` | HIP | Remote Halo target shard for mixed-backend layer split |
 | `test_deepseek4_unit` | CUDA | Unit tests (no model files needed) |

@@ -320,6 +320,20 @@ bool deepseek4_step(
     DeepSeek4StepTelemetry *    telemetry = nullptr,
     MoeHybridRoutingStats *     routing_stats = nullptr);
 
+bool deepseek4_step_layer_range(
+    ggml_backend_t              backend,
+    const DeepSeek4Weights &    w,
+    DeepSeek4Cache &            cache,
+    std::vector<float> &        hc_state,
+    const float *               embed,
+    int                         n_tokens,
+    int                         kv_start,
+    int                         layer_begin,
+    int                         layer_end,
+    std::vector<float> *        out_logits,
+    const int32_t *             token_ids = nullptr,
+    DeepSeek4StepTelemetry *    telemetry = nullptr);
+
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,
     ggml_backend_t              backend,

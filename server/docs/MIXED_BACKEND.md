@@ -91,6 +91,8 @@ validation runs.
 
 ## Mixed-backend target layer split
 
+Supported target architectures: `qwen35`, `gemma4`, `laguna`, and `deepseek4`.
+
 `dflash_server` can split the target across two backends in a single decode:
 the local process (this binary's compiled backend) runs the first contiguous
 layer group, then hands the boundary activation to a remote `backend_ipc_daemon`
