@@ -278,6 +278,7 @@ struct LagunaGraphInputs {
     int           kv_pad = 0;             // 0 = legacy exact-length views + cpy append
     ggml_tensor * kv_idx = nullptr;       // [n_tokens] I32 cache row indices (graph input)
     bool          output_logits = true;
+    bool          logits_are_output = true;
     bool          output_hidden_states = false;
     bool          capture_features = false;
     ggml_tensor * target_feat_rows = nullptr;  // optional [n_tokens] I32 ring rows for replay-stable capture
