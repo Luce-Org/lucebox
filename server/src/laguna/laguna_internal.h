@@ -329,7 +329,9 @@ bool laguna_step(
     bool                        no_mask,
     std::vector<float> &        out_logits,
     const class KvFlashPager *  kvflash = nullptr,
-    bool                        capture = false);
+    bool                        capture = false,
+    int32_t *                   out_argmax = nullptr,
+    bool                        read_logits = true);
 
 bool laguna_verify_batch(
     ggml_backend_t              backend,

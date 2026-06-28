@@ -72,6 +72,14 @@ static bool laguna_auto_head_major_enabled() {
     return enabled;
 }
 
+static bool laguna_gpu_argmax_enabled() {
+    static const bool enabled = []() {
+        const char * e = std::getenv("DFLASH_LAGUNA_GPU_ARGMAX");
+        return e == nullptr || e[0] != '0';
+    }();
+    return enabled;
+}
+
 }  // namespace
 
 static bool laguna_sampled_verify_enabled(const SamplerCfg & sampler, bool do_sample) {
@@ -1129,11 +1137,16 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
         }
         if (!w_.embedder.embed(&next_tok, 1, embed_step.data())) { ok = false; break; }
         std::vector<float> step_logits;
+        int32_t step_argmax = -1;
+        const bool use_gpu_argmax = !req.do_sample && laguna_gpu_argmax_enabled();
         if (!kvflash_alloc_span(cache_.cur_pos, 1) ||
             !laguna_step(backend_, w_, cache_, embed_step.data(), 1,
-                          cache_.cur_pos, no_mask, step_logits, kvf)) { ok = false; break; }
+                          cache_.cur_pos, no_mask, step_logits, kvf,
+                          /*capture=*/false,
+                          use_gpu_argmax ? &step_argmax : nullptr,
+                          /*read_logits=*/!use_gpu_argmax)) { ok = false; break; }
         kvflash_maybe_reselect(history, s + 1);
-        next_tok = pick(step_logits);
+        next_tok = use_gpu_argmax ? step_argmax : pick(step_logits);
     }
     auto t_g1 = std::chrono::steady_clock::now();
     result.decode_s = std::chrono::duration<double>(t_g1 - t_g0).count();
@@ -1343,11 +1356,16 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
         if (out_io.cancelled) break;
         if (!w_.embedder.embed(&next_tok, 1, embed_step.data())) { ok = false; break; }
         std::vector<float> step_logits;
+        int32_t step_argmax = -1;
+        const bool use_gpu_argmax = !req.do_sample && laguna_gpu_argmax_enabled();
         if (!kvflash_alloc_span(cache_.cur_pos, 1) ||
             !laguna_step(backend_, w_, cache_, embed_step.data(), 1,
-                          cache_.cur_pos, no_mask, step_logits, kvf)) { ok = false; break; }
+                          cache_.cur_pos, no_mask, step_logits, kvf,
+                          /*capture=*/false,
+                          use_gpu_argmax ? &step_argmax : nullptr,
+                          /*read_logits=*/!use_gpu_argmax)) { ok = false; break; }
         kvflash_maybe_reselect(history, s + 1);
-        next_tok = pick(step_logits);
+        next_tok = use_gpu_argmax ? step_argmax : pick(step_logits);
     }
     auto t_g1 = std::chrono::steady_clock::now();
     result.decode_s = std::chrono::duration<double>(t_g1 - t_g0).count();

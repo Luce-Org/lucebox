@@ -766,13 +766,13 @@ static ggml_tensor * build_laguna_attn_block(
     // by attn_mask_swa (built by the caller). This is correct for the early-
     // token rows (which need to see KV positions [0..p+1)) and the late-token
     // rows (which need [p-sw+1..p+1)).
-    const int kv_len   = kv_start + n_tokens;
-    const int win_start = 0;
+    const int kv_len = kv_start + n_tokens;
     // kv_pad > 0: read a stride-rounded fixed span so the view shape (and thus
     // every downstream FA node's properties) stays constant across decode
     // steps; the mask carries -inf for [kv_len, kv_pad) and the cache buffer
     // is zero-initialised, so the padded tail contributes exactly nothing.
-    const int win_len   = kv_pad > 0 ? kv_pad : kv_len;
+    const int win_start = 0;
+    const int win_len = kv_pad > 0 ? kv_pad : kv_len;
 
     ggml_tensor * Qfa = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
     Qfa = ggml_cont(ctx, Qfa);
@@ -1137,7 +1137,8 @@ LagunaGraphOutputs build_laguna_graph(
 //
 // Allocates a fresh ggml_context + cgraph each call (cheap relative to the
 // CUDA forward), wires the FULL + SWA causal masks, runs the backend graph,
-// and returns last-token logits on the host. Updates cache.cur_pos.
+// and returns last-token logits and/or a GPU-computed argmax on the host.
+// Updates cache.cur_pos.
 //
 // Reuses a single static gallocr across calls so the per-step allocation
 // overhead amortises after the first warmup.
@@ -1151,7 +1152,9 @@ bool laguna_step(
     bool                        no_mask,
     std::vector<float> &        out_logits,
     const KvFlashPager *        kvflash,
-    bool                        capture)
+    bool                        capture,
+    int32_t *                   out_argmax,
+    bool                        read_logits)
 {
     if (kvflash && no_mask) {
         std::fprintf(stderr, "laguna_step: kvflash requires masks (slots are "
@@ -1219,9 +1222,16 @@ bool laguna_step(
     gi.kv_idx        = kvi;
     gi.capture_features = capture;
     gi.output_last_only = true;
+    gi.output_logits = read_logits || out_argmax;
+    gi.output_hidden_states = !gi.output_logits;
 
     LagunaGraphOutputs go = build_laguna_graph(ctx, gf, w, cache, gi);
-    ggml_set_output(go.logits);
+    ggml_tensor * argmax = nullptr;
+    if (out_argmax) {
+        argmax = ggml_argmax(ctx, go.logits);
+        ggml_set_output(argmax);
+        ggml_build_forward_expand(gf, argmax);
+    }
 
     static ggml_gallocr_t galloc = nullptr;
     if (!galloc) galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -1254,33 +1264,33 @@ bool laguna_step(
         ggml_backend_tensor_set(mk_full, mfull.data(), 0, ggml_nbytes(mk_full));
         ggml_backend_tensor_set(mk_swa, mswa.data(), 0, ggml_nbytes(mk_swa));
     } else {
-    if (kvi) {
-        ggml_backend_tensor_set(kvi, pos.data(), 0, ggml_nbytes(kvi));
-    }
-
-    if (!no_mask) {
-        // Width mk_w (= kv_pad when padding): [kv_len, mk_w) stays -inf so the
-        // zero-initialised padded cache tail contributes nothing.
-        std::vector<float> mfull((size_t)mk_w * n_tok, -INFINITY);
-        for (int q = 0; q < n_tok; ++q) {
-            const int abs_q = kv_start + q;
-            for (int k = 0; k <= abs_q && k < kv_len; ++k) {
-                mfull[(size_t)q * mk_w + k] = 0.0f;
-            }
+        if (kvi) {
+            ggml_backend_tensor_set(kvi, pos.data(), 0, ggml_nbytes(kvi));
         }
-        ggml_backend_tensor_set(mk_full, mfull.data(), 0, ggml_nbytes(mk_full));
 
-        std::vector<float> mswa((size_t)mk_w * n_tok, -INFINITY);
-        const int W = w.sliding_window;
-        for (int q = 0; q < n_tok; ++q) {
-            const int abs_q = kv_start + q;
-            const int win_lo = std::max(0, abs_q - W + 1);
-            for (int k = win_lo; k <= abs_q && k < kv_len; ++k) {
-                mswa[(size_t)q * mk_w + k] = 0.0f;
+        if (!no_mask) {
+            // Width mk_w (= kv_pad when padding): [kv_len, mk_w) stays -inf so
+            // the zero-initialised padded cache tail contributes nothing.
+            std::vector<float> mfull((size_t)mk_w * n_tok, -INFINITY);
+            for (int q = 0; q < n_tok; ++q) {
+                const int abs_q = kv_start + q;
+                for (int k = 0; k <= abs_q && k < kv_len; ++k) {
+                    mfull[(size_t)q * mk_w + k] = 0.0f;
+                }
             }
+            ggml_backend_tensor_set(mk_full, mfull.data(), 0, ggml_nbytes(mk_full));
+
+            std::vector<float> mswa((size_t)mk_w * n_tok, -INFINITY);
+            const int W = w.sliding_window;
+            for (int q = 0; q < n_tok; ++q) {
+                const int abs_q = kv_start + q;
+                const int win_lo = std::max(0, abs_q - W + 1);
+                for (int k = win_lo; k <= abs_q && k < kv_len; ++k) {
+                    mswa[(size_t)q * mk_w + k] = 0.0f;
+                }
+            }
+            ggml_backend_tensor_set(mk_swa, mswa.data(), 0, ggml_nbytes(mk_swa));
         }
-        ggml_backend_tensor_set(mk_swa, mswa.data(), 0, ggml_nbytes(mk_swa));
-    }
     }
 
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
@@ -1289,11 +1299,19 @@ bool laguna_step(
         return false;
     }
 
-    out_logits.resize((size_t)w.embedder.n_vocab);
-    ggml_backend_tensor_get(go.logits, out_logits.data(), 0,
-                             out_logits.size() * sizeof(float));
+    if (out_argmax) {
+        ggml_backend_tensor_get(argmax, out_argmax, 0, sizeof(int32_t));
+    }
+    if (read_logits) {
+        out_logits.resize((size_t)w.embedder.n_vocab);
+        ggml_backend_tensor_get(go.logits, out_logits.data(), 0,
+                                out_logits.size() * sizeof(float));
+    } else {
+        out_logits.clear();
+    }
 
     cache.cur_pos = kv_len;
+    if (out_argmax) cache.last_tok = *out_argmax;
     ggml_free(ctx);
     return true;
 }
