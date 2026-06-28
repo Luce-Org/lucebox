@@ -71,9 +71,9 @@ int run_deepseek4_target_shard_ipc_daemon(
     std::fprintf(stderr, "[deepseek4-target-shard] loaded: layers=[%d,%d) on GPU %d\n",
                  layer_begins[0], layer_ends[0], gpus[0]);
 
-    const int hidden = weights.n_embd * weights.n_hc;  // full HC state dimension
+    const int hidden = weights.n_embd * weights.n_hc;  // full HC state dimension (hc_dim)
     const int n_hc = weights.n_hc;
-    std::vector<float> hc_state((size_t)n_hc * hidden, 0.0f);
+    std::vector<float> hc_state((size_t)hidden, 0.0f);  // single-token HC state
 
     // Set up daemon callbacks
     TargetShardDaemonCallbacks callbacks;

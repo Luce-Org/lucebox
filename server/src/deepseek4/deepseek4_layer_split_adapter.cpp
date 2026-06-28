@@ -159,7 +159,9 @@ bool DeepSeek4LayerSplitAdapter::init() {
         TargetLoadPlan plan;
         plan.layer_begin = shard.layer_begin;
         plan.layer_end = shard.layer_end;
-        plan.load_output = is_last;
+        // First shard needs tok_embd for embedding; last shard needs output head.
+        // load_output loads all global tensors; tok_embd stays on CPU anyway.
+        plan.load_output = (i == 0 || is_last);
 
         if (!load_deepseek4_gguf_partial(cfg_.target_path, shard.backend, plan, shard.weights)) {
             std::fprintf(stderr, "[deepseek4-split] failed to load shard %zu (layers %d-%d)\n",
@@ -401,9 +403,8 @@ bool DeepSeek4LayerSplitAdapter::run_mixed_forward(
 
     // Run only the local shard's layer range, getting hidden state output
     std::vector<float> hidden_out;
-    std::vector<float> hc_state;  // unused for now
     if (!deepseek4_step_layer_range(local_shard.backend, local_shard.weights,
-                                     local_shard.cache, hc_state,
+                                     local_shard.cache, hc_state_,
                                      embed.data(), n_tokens, base_pos,
                                      local_shard.layer_begin, local_shard.layer_end,
                                      &hidden_out, tokens.data(), nullptr)) {
