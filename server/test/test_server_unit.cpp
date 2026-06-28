@@ -28,6 +28,7 @@
 #include "common/layer_split_utils.h"
 #include "common/kvflash_pager.h"
 #include "placement/draft_residency.h"
+#include "common/gguf_bounds.h"
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
 #include "qwen3_drafter_model.h"
@@ -4108,6 +4109,75 @@ static void test_qwen3_drafter_rejects_truncated_gguf() {
     unlink(path.c_str());
 }
 
+// ─── GGUF tensor bounds (gguf_tensor_in_file / gguf_bounds_error) ───────
+//
+// The shared overflow-safe bounds check used by every GGUF loader
+// (draft/target/laguna) to reject truncated/corrupt files before a copy reads
+// past the mapping (#438), without wrongly rejecting valid files (#318). These
+// tests pin the boundary and, critically, the size_t overflow behaviour that a
+// naive `data_off + tensor_off + tensor_sz > file_size` test gets wrong.
+static void test_gguf_tensor_in_file_bounds() {
+    // Typical layout: 100-byte header/kv, 900-byte data section, 1000-byte file.
+    const size_t data_off = 100;
+    const size_t file     = 1000;
+
+    // Fully inside, including the exact end-of-file boundary.
+    TEST_ASSERT(gguf_tensor_in_file(data_off, 0,   900, file));   // fills the data section
+    TEST_ASSERT(gguf_tensor_in_file(data_off, 0,   0,   file));   // zero-size tensor
+    TEST_ASSERT(gguf_tensor_in_file(data_off, 899, 1,   file));   // last byte
+    TEST_ASSERT(gguf_tensor_in_file(data_off, 900, 0,   file));   // zero-size at EOF
+
+    // One byte past EOF must be rejected.
+    TEST_ASSERT(!gguf_tensor_in_file(data_off, 0,   901, file));
+    TEST_ASSERT(!gguf_tensor_in_file(data_off, 900, 1,   file));
+
+    // Data section offset itself past EOF (corrupt header).
+    TEST_ASSERT(!gguf_tensor_in_file(2000, 0, 0, file));
+    // data_off == file: only a zero-size tensor at offset 0 fits.
+    TEST_ASSERT(gguf_tensor_in_file(file, 0, 0, file));
+    TEST_ASSERT(!gguf_tensor_in_file(file, 0, 1, file));
+
+    // Whole-file data section (data_off == 0), valid full read.
+    TEST_ASSERT(gguf_tensor_in_file(0, 0, file, file));
+    TEST_ASSERT(!gguf_tensor_in_file(0, 0, file + 1, file));
+
+    // Overflow safety: a malformed offset/size must not wrap and slip through.
+    const size_t kMax = std::numeric_limits<size_t>::max();
+    TEST_ASSERT(!gguf_tensor_in_file(data_off, kMax, 10, file));   // huge tensor_off
+    TEST_ASSERT(!gguf_tensor_in_file(data_off, 0, kMax, file));    // huge tensor_sz
+    // The case a naive `off + sz > file` check fails: off + sz wraps below file.
+    // off = kMax - 10, sz = 20  →  off + sz == 9 (< file) would FALSE-PASS.
+    TEST_ASSERT(!gguf_tensor_in_file(0, kMax - 10, 20, file));
+    TEST_ASSERT(!gguf_tensor_in_file(kMax, 10, 10, file));         // huge data_off
+}
+
+static void test_gguf_bounds_error_reports_operands() {
+    // A normal (non-overflowing) rejection: the message must surface every
+    // operand so a false positive on a valid file (#318) is diagnosable.
+    const std::string e = gguf_bounds_error("target GGUF", "blk.56.ssm_out.weight",
+                                            "q5_K", 100, 5000, 200, 1000);
+    TEST_ASSERT(e.find("blk.56.ssm_out.weight") != std::string::npos);
+    TEST_ASSERT(e.find("q5_K") != std::string::npos);
+    TEST_ASSERT(e.find("data_off=100") != std::string::npos);
+    TEST_ASSERT(e.find("tensor_off=5000") != std::string::npos);
+    TEST_ASSERT(e.find("size=200") != std::string::npos);
+    TEST_ASSERT(e.find("5300") != std::string::npos);      // 100 + 5000 + 200
+    TEST_ASSERT(e.find("1000") != std::string::npos);      // file size
+
+    // Null name/type must not crash and must produce placeholders.
+    const std::string n = gguf_bounds_error("draft GGUF", nullptr, nullptr,
+                                            0, 0, 1, 0);
+    TEST_ASSERT(n.find("(null)") != std::string::npos);
+    TEST_ASSERT(n.find("(unknown)") != std::string::npos);
+
+    // When the end offset itself overflows size_t, report "overflow" rather
+    // than a wrapped number.
+    const size_t kMax = std::numeric_limits<size_t>::max();
+    const std::string o = gguf_bounds_error("target GGUF", "t", "f32",
+                                            kMax, 10, 10, 100);
+    TEST_ASSERT(o.find("overflow") != std::string::npos);
+}
+
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
     std::fprintf(stderr, " Server Unit Tests\n");
@@ -4373,6 +4443,10 @@ int main() {
 
     std::fprintf(stderr, "\n── Qwen3-0.6B drafter loader (bug #438) ──\n");
     RUN_TEST(test_qwen3_drafter_rejects_truncated_gguf);
+
+    std::fprintf(stderr, "\n── GGUF tensor bounds ──\n");
+    RUN_TEST(test_gguf_tensor_in_file_bounds);
+    RUN_TEST(test_gguf_bounds_error_reports_operands);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",
