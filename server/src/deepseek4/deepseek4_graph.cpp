@@ -1876,13 +1876,8 @@ bool deepseek4_step_layer_range(
         DeepSeek4StepTelemetry * telemetry) {
     (void) telemetry;
 
-    // Full-model fast path: delegate to the original step function
-    if (layer_begin == 0 && layer_end == w.n_layer) {
-        std::vector<float> sink;
-        std::vector<float> & logits = out_logits ? *out_logits : sink;
-        return deepseek4_step(backend, w, cache, embed, n_tokens, kv_start, logits,
-                              nullptr, token_ids, nullptr, false, telemetry, nullptr);
-    }
+    // NOTE: The old deepseek4_step() lacks HC implementation.
+    // Always use the HC-enabled layer_range path below.
 
     // ── Partial layer-range forward with HC ─────────────────────────────
     const int n_embd = w.n_embd;
