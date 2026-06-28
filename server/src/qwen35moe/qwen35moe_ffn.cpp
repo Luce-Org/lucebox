@@ -2,6 +2,7 @@
 
 #include "qwen35_ops.h"
 
+#include <cstdlib>
 #include <cmath>
 
 namespace dflash::common {
@@ -27,7 +28,16 @@ Qwen35MoeRouterOutputs build_qwen35moe_router(
             break;
     }
 
-    ggml_tensor * selected = ggml_top_k(ctx, probs, n_used);
+    // ggml_argsort_top_k emits GGML_OP_ARGSORT (+view), which ggml-cuda's
+    // topk-moe fusion (ggml_cuda_topk_moe_fusion) recognizes and fuses the whole
+    // softmax->topk->get_rows->norm router into ~1 kernel. ggml_top_k emits
+    // GGML_OP_TOP_K, which the fusion does NOT match -> 6-7 separate kernels/layer
+    // x30 MoE layers (the launch-bound decode gap vs llama, which uses argsort_top_k).
+    // Same top-k selection -> bit-identical. DFLASH_NO_MOE_ROUTER_FUSE=1 = old path.
+    static const bool router_fuse = (std::getenv("DFLASH_NO_MOE_ROUTER_FUSE") == nullptr);
+    ggml_tensor * selected = router_fuse
+        ? ggml_argsort_top_k(ctx, probs, n_used)
+        : ggml_top_k(ctx, probs, n_used);
 
     ggml_tensor * probs_3d = ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens);
     ggml_tensor * weights  = ggml_get_rows(ctx, probs_3d, selected);
@@ -72,19 +82,29 @@ ggml_tensor * build_qwen35moe_ffn(
 
     ggml_tensor * cur_3d = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
     ggml_tensor * gu = nullptr;
+    // Combined gate_up: split + swiglu in ONE op. ggml_swiglu reads gate from
+    // [0,nc) and up from [nc,2nc) of the same buffer, so the two ggml_cont copies
+    // that materialised the strided halves are eliminated — 2 extra copy kernels
+    // per layer x 30 MoE layers that llama's qwen3moe graph never emits.
+    // DFLASH_NO_MOE_SWIGLU_FUSE=1 restores the view+cont+split path (bit-id gate).
+    static const bool moe_swiglu_fuse = (std::getenv("DFLASH_NO_MOE_SWIGLU_FUSE") == nullptr);
     if (L.ffn_gate_up_exps) {
         ggml_tensor * gate_up_e = apply_scale2(
             ctx, ggml_mul_mat_id(ctx, L.ffn_gate_up_exps, cur_3d, selected), L.ffn_gate_up_exps_s);
-        ggml_tensor * gate_e = ggml_view_3d(ctx, gate_up_e,
-            n_ff_exp, gate_up_e->ne[1], gate_up_e->ne[2],
-            gate_up_e->nb[1], gate_up_e->nb[2], 0);
-        ggml_tensor * up_e = ggml_view_3d(ctx, gate_up_e,
-            n_ff_exp, gate_up_e->ne[1], gate_up_e->ne[2],
-            gate_up_e->nb[1], gate_up_e->nb[2],
-            (size_t)n_ff_exp * ggml_element_size(gate_up_e));
-        gate_e = ggml_cont(ctx, gate_e);
-        up_e   = ggml_cont(ctx, up_e);
-        gu = ggml_swiglu_split(ctx, gate_e, up_e);
+        if (moe_swiglu_fuse) {
+            gu = ggml_swiglu(ctx, gate_up_e);   // silu(gate) * up, no views/conts
+        } else {
+            ggml_tensor * gate_e = ggml_view_3d(ctx, gate_up_e,
+                n_ff_exp, gate_up_e->ne[1], gate_up_e->ne[2],
+                gate_up_e->nb[1], gate_up_e->nb[2], 0);
+            ggml_tensor * up_e = ggml_view_3d(ctx, gate_up_e,
+                n_ff_exp, gate_up_e->ne[1], gate_up_e->ne[2],
+                gate_up_e->nb[1], gate_up_e->nb[2],
+                (size_t)n_ff_exp * ggml_element_size(gate_up_e));
+            gate_e = ggml_cont(ctx, gate_e);
+            up_e   = ggml_cont(ctx, up_e);
+            gu = ggml_swiglu_split(ctx, gate_e, up_e);
+        }
     } else {
         ggml_tensor * gate_e = apply_scale2(
             ctx, ggml_mul_mat_id(ctx, L.ffn_gate_exps, cur_3d, selected), L.ffn_gate_exps_s);
