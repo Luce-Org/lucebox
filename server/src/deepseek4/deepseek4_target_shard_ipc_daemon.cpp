@@ -71,7 +71,7 @@ int run_deepseek4_target_shard_ipc_daemon(
     std::fprintf(stderr, "[deepseek4-target-shard] loaded: layers=[%d,%d) on GPU %d\n",
                  layer_begins[0], layer_ends[0], gpus[0]);
 
-    const int hidden = weights.n_embd;
+    const int hidden = weights.n_embd * weights.n_hc;  // full HC state dimension
     const int n_hc = weights.n_hc;
     std::vector<float> hc_state((size_t)n_hc * hidden, 0.0f);
 
@@ -84,8 +84,8 @@ int run_deepseek4_target_shard_ipc_daemon(
         const int n_tokens = req.n_tokens;
         if (n_tokens <= 0) return false;
 
-        // The boundary activation from the CUDA shard is the hidden state
-        // for this shard's input (n_embd * n_tokens floats).
+        // The boundary activation from the CUDA shard is the full HC state
+        // (n_hc * n_embd * n_tokens floats).
         const float * input_embed = nullptr;
         if (req.boundary_activation && !req.boundary_activation->empty()) {
             input_embed = req.boundary_activation->data();

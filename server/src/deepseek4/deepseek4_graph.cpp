@@ -1890,15 +1890,24 @@ bool deepseek4_step_layer_range(
     const int hc_dim = n_hc * n_embd;
     const bool is_last_shard = (layer_end >= w.n_layer);
 
-    // Initialize HC state from embedding: replicate embed into n_hc streams
+    // Initialize HC state.
+    // First shard (layer_begin=0): embed is token embeddings [n_embd × n_tokens],
+    //   replicate into n_hc streams.
+    // Later shards: embed is full HC state [hc_dim × n_tokens] from previous shard.
     if (hc_state.size() != (size_t)hc_dim * (size_t)n_tokens) {
         hc_state.resize((size_t)hc_dim * (size_t)n_tokens);
     }
-    for (int t = 0; t < n_tokens; t++) {
-        for (int h = 0; h < n_hc; h++) {
-            memcpy(hc_state.data() + (size_t)t * hc_dim + (size_t)h * n_embd,
-                   embed + (size_t)t * n_embd, (size_t)n_embd * sizeof(float));
+    if (layer_begin == 0) {
+        // First shard: replicate embedding into all HC streams
+        for (int t = 0; t < n_tokens; t++) {
+            for (int h = 0; h < n_hc; h++) {
+                memcpy(hc_state.data() + (size_t)t * hc_dim + (size_t)h * n_embd,
+                       embed + (size_t)t * n_embd, (size_t)n_embd * sizeof(float));
+            }
         }
+    } else {
+        // Later shard: embed contains full HC state from previous shard
+        memcpy(hc_state.data(), embed, sizeof(float) * (size_t)hc_dim * (size_t)n_tokens);
     }
 
     // Lazy-load per-layer HC weights on CPU (static to avoid reloading)
@@ -2044,7 +2053,70 @@ bool deepseek4_step_layer_range(
             ggml_cgraph * gf = ggml_new_graph_custom(ctx, 2048, false);
 
             ggml_tensor * ffn_normed = build_rms_norm(ctx, inp, L.ffn_norm, w.rms_eps);
-            ggml_tensor * ffn_out = build_moe_ffn(ctx, ffn_normed, w, L, il, n_tokens);
+
+            // Hash-routed layers: use pre-computed expert IDs from hash table
+            // instead of zeroing out routed_out as build_moe_ffn does.
+            ggml_tensor * hash_ids_inp = nullptr;
+            std::vector<int32_t> hash_expert_ids_host;
+            if (il < w.n_hash_layer && L.ffn_gate_tid2eid && token_ids &&
+                hash_routing_tables_range[(size_t)il].loaded) {
+                const auto & ht = hash_routing_tables_range[(size_t)il].ids;
+                const int n_used = w.n_expert_used;
+                hash_expert_ids_host.resize((size_t)n_used * (size_t)n_tokens);
+                for (int ti = 0; ti < n_tokens; ti++) {
+                    const int32_t tok = token_ids[ti];
+                    const int32_t * row = ht.data() + (size_t)tok * (size_t)n_used;
+                    memcpy(hash_expert_ids_host.data() + (size_t)ti * n_used,
+                           row, (size_t)n_used * sizeof(int32_t));
+                }
+                hash_ids_inp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+                ggml_set_input(hash_ids_inp);
+            }
+
+            ggml_tensor * ffn_out;
+            if (hash_ids_inp) {
+                // Hash-routed MoE: shared FFN + routed experts with hash selection
+                ggml_tensor * shared_out = build_shared_ffn(ctx, ffn_normed, w, L);
+
+                // Router probs for expert weights (same formula as regular MoE)
+                ggml_tensor * logits = ggml_mul_mat(ctx, L.ffn_gate_inp, ffn_normed);
+                ggml_tensor * probs = ggml_sqrt(ctx, ggml_softplus(ctx, logits));
+
+                // Expert computation with hash-selected IDs
+                const int n_used = w.n_expert_used;
+                const int n_ff_exp = w.n_ff_exp;
+                ggml_tensor * cur_3d = ggml_reshape_3d(ctx, ffn_normed, n_embd, 1, n_tokens);
+                ggml_tensor * gate_e = ggml_mul_mat_id(ctx, L.ffn_gate_exps, cur_3d, hash_ids_inp);
+                ggml_tensor * up_e = ggml_mul_mat_id(ctx, L.ffn_up_exps, cur_3d, hash_ids_inp);
+                gate_e = ggml_reshape_3d(ctx, gate_e, n_ff_exp, n_used, n_tokens);
+                up_e = ggml_reshape_3d(ctx, up_e, n_ff_exp, n_used, n_tokens);
+                ggml_tensor * mid_e = build_clamped_swiglu(ctx, gate_e, up_e, w.swiglu_clamp_exp);
+                ggml_tensor * down_e = ggml_mul_mat_id(ctx, L.ffn_down_exps, mid_e, hash_ids_inp);
+                down_e = ggml_reshape_3d(ctx, down_e, n_embd, n_used, n_tokens);
+
+                // Gather weights from router probs using hash-selected expert IDs
+                ggml_tensor * probs_3d = ggml_reshape_3d(ctx, probs, 1, w.n_expert, n_tokens);
+                ggml_tensor * weights = ggml_get_rows(ctx, probs_3d, hash_ids_inp);
+                weights = ggml_reshape_2d(ctx, weights, n_used, n_tokens);
+                ggml_tensor * w_sum = ggml_sum_rows(ctx, weights);
+                w_sum = ggml_clamp(ctx, w_sum, 6.103515625e-5f, INFINITY);
+                weights = ggml_div(ctx, weights, w_sum);
+                if (w.expert_weight_scale != 1.0f) {
+                    weights = ggml_scale(ctx, weights, w.expert_weight_scale);
+                }
+
+                // Weighted sum of expert outputs
+                ggml_tensor * weights_3d = ggml_reshape_3d(ctx, weights, 1, n_used, n_tokens);
+                ggml_tensor * routed_out = ggml_mul(ctx, down_e, weights_3d);
+                routed_out = ggml_cont(ctx, ggml_permute(ctx, routed_out, 1, 0, 2, 3));
+                routed_out = ggml_sum_rows(ctx, routed_out);
+                routed_out = ggml_reshape_2d(ctx, routed_out, n_embd, n_tokens);
+
+                ffn_out = ggml_add(ctx, shared_out, routed_out);
+            } else {
+                ffn_out = build_moe_ffn(ctx, ffn_normed, w, L, il, n_tokens);
+            }
+
             ggml_set_output(ffn_out);
             ggml_build_forward_expand(gf, ffn_out);
 
@@ -2055,6 +2127,10 @@ bool deepseek4_step_layer_range(
                 return false;
             }
             ggml_backend_tensor_set(inp, ffn_working.data(), 0, sizeof(float) * ffn_working.size());
+            if (hash_ids_inp) {
+                ggml_backend_tensor_set(hash_ids_inp, hash_expert_ids_host.data(), 0,
+                                        sizeof(int32_t) * hash_expert_ids_host.size());
+            }
 
             std::fprintf(stderr, "[deepseek4-lr] layer %d: computing ffn\n", il);
             fflush(stderr);
@@ -2158,13 +2234,9 @@ bool deepseek4_step_layer_range(
         ggml_gallocr_free(alloc);
         ggml_free(ctx);
     } else if (out_logits) {
-        // Return hidden state for next shard (first HC stream)
-        out_logits->resize((size_t)n_embd * n_tokens);
-        for (int t = 0; t < n_tokens; t++) {
-            memcpy(out_logits->data() + (size_t)t * n_embd,
-                   hc_state.data() + (size_t)t * hc_dim,
-                   (size_t)n_embd * sizeof(float));
-        }
+        // Return full HC state for next shard (all n_hc streams)
+        out_logits->resize((size_t)hc_dim * n_tokens);
+        memcpy(out_logits->data(), hc_state.data(), sizeof(float) * hc_dim * n_tokens);
     }
 
     // Update compressor state

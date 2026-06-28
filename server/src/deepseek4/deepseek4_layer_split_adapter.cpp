@@ -262,7 +262,7 @@ bool DeepSeek4LayerSplitAdapter::init_mixed_target_split_full(const DevicePlacem
     launch_cfg.layer_begins = remote_layer_begins;
     launch_cfg.layer_ends = remote_layer_ends;
     launch_cfg.max_ctx = max_ctx;
-    launch_cfg.hidden = local_shard.weights.n_embd;
+    launch_cfg.hidden = local_shard.weights.n_embd * local_shard.weights.n_hc;  // full HC state
     launch_cfg.vocab = local_shard.weights.n_vocab;
     launch_cfg.max_tokens = std::max(1, max_ctx);
     launch_cfg.work_dir = cfg_.remote_target_shard.work_dir;
