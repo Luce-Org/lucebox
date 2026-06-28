@@ -228,13 +228,16 @@ bool load_qwen3_drafter_model(const std::string & path,
     // Validate that every tensor's data region lies within the mapped file
     // before any H2D copy. A truncated or corrupt GGUF would otherwise make
     // copy_tensor_from_file read past the end of the mapping and fault inside
-    // the device copy (bug #438).
+    // the device copy (bug #438). The comparisons are written to avoid size_t
+    // overflow on malformed offsets/sizes: a wrapped data_off + off + sz could
+    // otherwise slip past a naive "off + sz > file_size" test.
+    const size_t data_avail = data_off <= file_size ? file_size - data_off : 0;
     for (int64_t i = 0; i < gguf_get_n_tensors(gctx); ++i) {
-        const size_t off = data_off + gguf_get_tensor_offset(gctx, i);
+        const size_t off = gguf_get_tensor_offset(gctx, i);  // relative to data_off
         const size_t sz  = gguf_get_tensor_size(gctx, i);
-        if (off + sz > file_size) {
+        if (data_off > file_size || off > data_avail || sz > data_avail - off) {
             set_last_error(std::string("Qwen3-0.6B drafter GGUF is truncated or corrupt: tensor '")
-                + gguf_get_tensor_name(gctx, i) + "' data ends at " + std::to_string(off + sz)
+                + gguf_get_tensor_name(gctx, i) + "' data ends at " + std::to_string(data_off + off + sz)
                 + " but file is only " + std::to_string(file_size)
                 + " bytes. Re-download the drafter model (" + path + ").");
             gguf_free(gctx);
