@@ -30,6 +30,9 @@
 #include "placement/draft_residency.h"
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
+#include "qwen3_drafter_model.h"
+#include "dflash27b.h"
+#include "gguf.h"
 #include <nlohmann/json.hpp>
 
 #include <cmath>
@@ -3990,6 +3993,121 @@ static void test_flowkv_T5_inert_guard_token_count() {
     TEST_ASSERT(1024 >= kFkvInertMinTokens);
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Qwen3-0.6B drafter loader: truncated GGUF guard (bug #438)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Builds a minimal but structurally valid Qwen3-0.6B-style GGUF on disk, then
+// verifies that load_qwen3_drafter_model:
+//   (1) loads the full, untruncated file successfully (positive control), and
+//   (2) fails cleanly with a "truncated or corrupt" error when the tensor-data
+//       section is truncated — instead of letting the H2D copy read past the
+//       end of the mmap and SIGSEGV inside the device copy.
+
+// Write a tiny valid drafter GGUF and return its path. The loader fixes
+// n_vocab at 151936 (Qwen3DrafterWeights default), so token_embd stays the
+// largest tensor (~2.4 MB BF16) while every other tensor is minimal.
+static std::string write_qwen3_drafter_fixture_gguf() {
+    const int n_embd    = 8;
+    const int n_head    = 2;
+    const int head_dim  = 4;
+    const int n_head_kv = 1;
+    const int n_ff      = 16;
+    const int n_layer   = 1;
+    const int n_vocab   = 151936;                // must match the loader default
+    const int q_dim     = n_head * head_dim;     // 8
+    const int kv_dim    = n_head_kv * head_dim;  // 4
+
+    ggml_init_params ip{};
+    ip.mem_size   = (size_t)16 * 1024 * 1024;    // headroom for token_embd + 13 tensors
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = false;
+    ggml_context * ctx = ggml_init(ip);
+
+    gguf_context * g = gguf_init_empty();
+    gguf_set_val_u32(g, "qwen3.embedding_length",        (uint32_t)n_embd);
+    gguf_set_val_u32(g, "qwen3.feed_forward_length",     (uint32_t)n_ff);
+    gguf_set_val_u32(g, "qwen3.attention.head_count",    (uint32_t)n_head);
+    gguf_set_val_u32(g, "qwen3.attention.head_count_kv", (uint32_t)n_head_kv);
+    gguf_set_val_u32(g, "qwen3.block_count",             (uint32_t)n_layer);
+    gguf_set_val_u32(g, "qwen3.context_length",          (uint32_t)64);
+    gguf_set_val_u32(g, "qwen3.attention.key_length",    (uint32_t)head_dim);
+    gguf_set_val_f32(g, "qwen3.rope.freq_base",          1000000.0f);
+
+    auto add_tensor = [&](const char * name, ggml_type t, int n_dims,
+                          int64_t ne0, int64_t ne1) {
+        ggml_tensor * w = (n_dims == 1)
+            ? ggml_new_tensor_1d(ctx, t, ne0)
+            : ggml_new_tensor_2d(ctx, t, ne0, ne1);
+        ggml_set_name(w, name);
+        std::memset(w->data, 0, ggml_nbytes(w));
+        gguf_add_tensor(g, w);
+    };
+
+    // Top-level tensors. output.weight is intentionally omitted so the loader
+    // exercises its tied-weights path (and the fixture stays small).
+    add_tensor("token_embd.weight",  GGML_TYPE_BF16, 2, n_embd, n_vocab);
+    add_tensor("output_norm.weight", GGML_TYPE_F32,  1, n_embd, 0);
+
+    // The single transformer block: the 11 per-layer tensors the loader copies.
+    add_tensor("blk.0.attn_norm.weight",   GGML_TYPE_F32,  1, n_embd,   0);
+    add_tensor("blk.0.attn_q.weight",      GGML_TYPE_BF16, 2, n_embd,   q_dim);
+    add_tensor("blk.0.attn_k.weight",      GGML_TYPE_BF16, 2, n_embd,   kv_dim);
+    add_tensor("blk.0.attn_v.weight",      GGML_TYPE_BF16, 2, n_embd,   kv_dim);
+    add_tensor("blk.0.attn_output.weight", GGML_TYPE_BF16, 2, q_dim,    n_embd);
+    add_tensor("blk.0.attn_q_norm.weight", GGML_TYPE_F32,  1, head_dim, 0);
+    add_tensor("blk.0.attn_k_norm.weight", GGML_TYPE_F32,  1, head_dim, 0);
+    add_tensor("blk.0.ffn_norm.weight",    GGML_TYPE_F32,  1, n_embd,   0);
+    add_tensor("blk.0.ffn_gate.weight",    GGML_TYPE_BF16, 2, n_embd,   n_ff);
+    add_tensor("blk.0.ffn_up.weight",      GGML_TYPE_BF16, 2, n_embd,   n_ff);
+    add_tensor("blk.0.ffn_down.weight",    GGML_TYPE_BF16, 2, n_ff,     n_embd);
+
+    const std::string path = "/tmp/dflash_test_qwen3_drafter_438.gguf";
+    gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
+
+    gguf_free(g);
+    ggml_free(ctx);
+    return path;
+}
+
+static void test_qwen3_drafter_rejects_truncated_gguf() {
+    const std::string path = write_qwen3_drafter_fixture_gguf();
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    TEST_ASSERT(backend != nullptr);
+
+    // Positive control: the full, untruncated file loads cleanly.
+    {
+        Qwen3DrafterWeights w;
+        bool ok = load_qwen3_drafter_model(path, backend, w);
+        TEST_ASSERT_MSG(ok, dflash27b_last_error());
+        free_qwen3_drafter_model(w);
+    }
+
+    // Truncate inside the tensor-data section. The header, kv block, and tensor
+    // info table all live before the data offset, so gguf_init_from_file still
+    // succeeds and we reach the EOF guard rather than a parse failure.
+    struct stat st{};
+    TEST_ASSERT(stat(path.c_str(), &st) == 0);
+    const off_t truncated_size = (off_t)st.st_size - 4096;
+    TEST_ASSERT(truncated_size > 0);
+    TEST_ASSERT(truncate(path.c_str(), truncated_size) == 0);
+
+    // The loader must fail cleanly (no SIGSEGV) with a descriptive error.
+    {
+        Qwen3DrafterWeights w;
+        bool ok = load_qwen3_drafter_model(path, backend, w);
+        TEST_ASSERT(!ok);
+        const std::string err = dflash27b_last_error();
+        TEST_ASSERT_MSG(err.find("truncated or corrupt") != std::string::npos,
+                        err.c_str());
+        free_qwen3_drafter_model(w);
+    }
+
+    ggml_backend_free(backend);
+    unlink(path.c_str());
+}
+
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
     std::fprintf(stderr, " Server Unit Tests\n");
@@ -4252,6 +4370,9 @@ int main() {
     RUN_TEST(test_flowkv_T3_ws1_continuation_json_shape);
     RUN_TEST(test_flowkv_T1_system_end_boundary_first);
     RUN_TEST(test_flowkv_T5_inert_guard_token_count);
+
+    std::fprintf(stderr, "\n── Qwen3-0.6B drafter loader (bug #438) ──\n");
+    RUN_TEST(test_qwen3_drafter_rejects_truncated_gguf);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",
