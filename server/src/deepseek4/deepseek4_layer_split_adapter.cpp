@@ -129,14 +129,52 @@ bool DeepSeek4LayerSplitAdapter::init() {
         // Auto-compute split: CUDA gets first N layers, Halo gets the rest
         int cuda_layers = compute_auto_split_layers();
         int local_gpu = device.gpu >= 0 ? device.gpu : 0;
-        device.layer_split_gpus = {local_gpu, 0};  // GPU 0 = local CUDA, remote GPU 0 on Halo
-        device.layer_split_weights = {(double)cuda_layers, (double)(43 - cuda_layers)};
+        if (cuda_layers >= 43) {
+            // All layers on CUDA — single shard, no split needed
+            device.layer_split_gpus = {local_gpu};
+            device.layer_split_weights = {1.0};
+        } else {
+            device.layer_split_gpus = {local_gpu, 0};
+            device.layer_split_weights = {(double)cuda_layers, (double)(43 - cuda_layers)};
+        }
     }
 
     // When remote_target_shard is configured, use mixed (IPC) path:
     // only the first shard is local, the rest run via IPC daemon on Halo.
     if (cfg_.remote_target_shard.enabled()) {
         return init_mixed_target_split_full(device);
+    }
+
+    // Single-shard path: all layers on one GPU (monolithic)
+    if (device.layer_split_gpus.size() <= 1) {
+        shards_.resize(1);
+        auto & shard = shards_[0];
+        shard.gpu = device.layer_split_gpus.empty() ? 0 : device.layer_split_gpus[0];
+        shard.layer_begin = 0;
+        shard.layer_end = 43;
+        shard.backend = ggml_backend_cuda_init(shard.gpu);
+        if (!shard.backend) {
+            std::fprintf(stderr, "[deepseek4-split] CUDA backend init failed gpu=%d\n", shard.gpu);
+            return false;
+        }
+
+        const int max_ctx = device.max_ctx > 0 ? device.max_ctx : 8192;
+        TargetLoadPlan plan;
+        plan.layer_begin = 0;
+        plan.layer_end = 43;
+        plan.load_output = true;
+
+        if (!load_deepseek4_gguf_partial(cfg_.target_path, shard.backend, plan, shard.weights)) {
+            std::fprintf(stderr, "[deepseek4-split] failed to load single shard\n");
+            return false;
+        }
+        if (!create_deepseek4_cache(shard.backend, shard.weights, max_ctx, shard.cache)) {
+            std::fprintf(stderr, "[deepseek4-split] failed to create cache\n");
+            return false;
+        }
+        hc_state_.resize(hc_state_elements(shard.weights), 0.0f);
+        std::fprintf(stderr, "[deepseek4-split] single shard: gpu=%d layers=[0,43) (+output)\n", shard.gpu);
+        return true;
     }
 
     // Multi-GPU local path (multiple CUDA GPUs available)
