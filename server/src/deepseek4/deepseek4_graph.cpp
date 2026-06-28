@@ -1213,6 +1213,42 @@ static HcPreResult hc_pre_auto(const float * hc_state,
                       n_embd, n_hc, sinkhorn_iters, hc_eps);
 }
 
+static void hc_pre_batch(std::vector<float> & working,
+                         std::vector<float> & post,
+                         std::vector<float> & comb,
+                         const float * hc_state,
+                         const HcWeightsCpu & weights,
+                         ggml_tensor * fn_tensor,
+                         int n_tokens,
+                         int n_embd,
+                         int n_hc,
+                         int sinkhorn_iters,
+                         float hc_eps) {
+    const size_t hc_dim = (size_t)n_embd * (size_t)n_hc;
+    working.resize((size_t)n_tokens * (size_t)n_embd);
+    post.resize((size_t)n_tokens * (size_t)n_hc);
+    comb.resize((size_t)n_tokens * (size_t)n_hc * (size_t)n_hc);
+
+    for (int t = 0; t < n_tokens; ++t) {
+        const HcPreResult result = hc_pre_auto(hc_state + (size_t)t * hc_dim,
+                                               weights,
+                                               fn_tensor,
+                                               n_embd,
+                                               n_hc,
+                                               sinkhorn_iters,
+                                               hc_eps);
+        std::memcpy(working.data() + (size_t)t * n_embd,
+                    result.working.data(),
+                    (size_t)n_embd * sizeof(float));
+        std::memcpy(post.data() + (size_t)t * n_hc,
+                    result.post,
+                    (size_t)n_hc * sizeof(float));
+        std::memcpy(comb.data() + (size_t)t * n_hc * (size_t)n_hc,
+                    result.comb,
+                    (size_t)n_hc * (size_t)n_hc * sizeof(float));
+    }
+}
+
 static void cpu_hc_post(float * out_hc, const float * block_out,
                          const float * residual_hc, const float * post,
                          const float * comb, int n_embd, int n_hc) {
@@ -1224,6 +1260,27 @@ static void cpu_hc_post(float * out_hc, const float * block_out,
             }
             out_hc[(size_t)dst * n_embd + d] = acc;
         }
+    }
+}
+
+static void hc_post_batch(std::vector<float> & out_hc,
+                          const float * block_out,
+                          const float * residual_hc,
+                          const float * post,
+                          const float * comb,
+                          int n_tokens,
+                          int n_embd,
+                          int n_hc) {
+    const size_t hc_dim = (size_t)n_embd * (size_t)n_hc;
+    out_hc.resize((size_t)n_tokens * hc_dim);
+    for (int t = 0; t < n_tokens; ++t) {
+        cpu_hc_post(out_hc.data() + (size_t)t * hc_dim,
+                    block_out + (size_t)t * n_embd,
+                    residual_hc + (size_t)t * hc_dim,
+                    post + (size_t)t * n_hc,
+                    comb + (size_t)t * n_hc * (size_t)n_hc,
+                    n_embd,
+                    n_hc);
     }
 }
 
@@ -1925,33 +1982,25 @@ bool deepseek4_step_layer_range(
         hc_loaded_n_layer = w.n_layer;
     }
 
-    std::fprintf(stderr, "[deepseek4-lr] HC weights loaded, starting per-layer loop [%d,%d)\n",
-                 layer_begin, layer_end);
-
     // Per-layer execution with CPU-side HC
+    std::vector<float> cur;
+    std::vector<float> ffn_working;
+    std::vector<float> hc_post;
+    std::vector<float> hc_comb;
+    std::vector<float> next_hc;
+    std::vector<float> attn_out_host;
+    std::vector<float> ffn_out_host;
     for (int il = layer_begin; il < layer_end; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t)il];
         DeepSeek4LayerCache & lc = cache.layers[(size_t)il];
         const HcLayerWeightsCpu & hc_lw = hc_layer_weights_range[(size_t)il];
 
         // ── HC pre (attention) ──────────────────────────────────────
-        std::vector<float> cur((size_t)n_embd * (size_t)n_tokens);
-        HcPreResult hc_attn_result;
-        if (hc_lw.attn.loaded && n_tokens == 1) {
-            hc_attn_result = hc_pre_auto(hc_state.data(), hc_lw.attn, L.hc_attn_fn,
-                                         n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
-            memcpy(cur.data(), hc_attn_result.working.data(), (size_t)n_embd * sizeof(float));
-        } else {
-            // Prefill fallback: use first HC stream
-            for (int t = 0; t < n_tokens; t++) {
-                memcpy(cur.data() + (size_t)t * n_embd,
-                       hc_state.data() + (size_t)t * hc_dim,
-                       (size_t)n_embd * sizeof(float));
-            }
-        }
+        hc_pre_batch(cur, hc_post, hc_comb,
+                     hc_state.data(), hc_lw.attn, L.hc_attn_fn,
+                     n_tokens, n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
 
         // ── Build & run attention graph ─────────────────────────────
-        std::fprintf(stderr, "[deepseek4-lr] layer %d: building attn graph\n", il);
         {
             const size_t ctx_size = 48 * 1024 * 1024;
             ggml_init_params params{};
@@ -1986,54 +2035,34 @@ bool deepseek4_step_layer_range(
             for (const auto & b : i32_array_inputs)
                 ggml_backend_tensor_set(b.tensor, b.values.data(), 0, sizeof(int32_t) * b.values.size());
 
-            std::fprintf(stderr, "[deepseek4-lr] layer %d: computing attn\n", il);
-            fflush(stderr);
             if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "[deepseek4] attn compute failed layer %d\n", il);
                 ggml_gallocr_free(alloc); ggml_free(ctx);
                 return false;
             }
-            std::fprintf(stderr, "[deepseek4-lr] layer %d: attn compute done\n", il);
-            fflush(stderr);
-
-            std::vector<float> attn_out_host((size_t)n_embd * (size_t)n_tokens);
+            attn_out_host.resize((size_t)n_embd * (size_t)n_tokens);
             ggml_backend_tensor_get(attn_out, attn_out_host.data(), 0, sizeof(float) * attn_out_host.size());
             ggml_gallocr_free(alloc);
             ggml_free(ctx);
 
             // ── HC post (attention) ─────────────────────────────────
-            if (hc_lw.attn.loaded && n_tokens == 1) {
-                std::vector<float> new_hc((size_t)hc_dim);
-                cpu_hc_post(new_hc.data(), attn_out_host.data(), hc_state.data(),
-                            hc_attn_result.post, hc_attn_result.comb, n_embd, n_hc);
-                memcpy(hc_state.data(), new_hc.data(), (size_t)hc_dim * sizeof(float));
-            } else {
-                // Prefill fallback: add attn_out to first stream
-                for (int t = 0; t < n_tokens; t++) {
-                    float * s = hc_state.data() + (size_t)t * hc_dim;
-                    const float * a = attn_out_host.data() + (size_t)t * n_embd;
-                    for (int d = 0; d < n_embd; d++) s[d] += a[d];
-                }
-            }
+            hc_post_batch(next_hc,
+                          attn_out_host.data(),
+                          hc_state.data(),
+                          hc_post.data(),
+                          hc_comb.data(),
+                          n_tokens,
+                          n_embd,
+                          n_hc);
+            std::memcpy(hc_state.data(), next_hc.data(), next_hc.size() * sizeof(float));
         }
 
         // ── HC pre (FFN) ────────────────────────────────────────────
-        std::vector<float> ffn_working((size_t)n_embd * (size_t)n_tokens);
-        HcPreResult hc_ffn_result;
-        if (hc_lw.ffn.loaded && n_tokens == 1) {
-            hc_ffn_result = hc_pre_auto(hc_state.data(), hc_lw.ffn, L.hc_ffn_fn,
-                                        n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
-            memcpy(ffn_working.data(), hc_ffn_result.working.data(), (size_t)n_embd * sizeof(float));
-        } else {
-            for (int t = 0; t < n_tokens; t++) {
-                memcpy(ffn_working.data() + (size_t)t * n_embd,
-                       hc_state.data() + (size_t)t * hc_dim,
-                       (size_t)n_embd * sizeof(float));
-            }
-        }
+        hc_pre_batch(ffn_working, hc_post, hc_comb,
+                     hc_state.data(), hc_lw.ffn, L.hc_ffn_fn,
+                     n_tokens, n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
 
         // ── Build & run FFN graph ───────────────────────────────────
-        std::fprintf(stderr, "[deepseek4-lr] layer %d: building ffn graph\n", il);
         {
             const size_t ctx_size = 48 * 1024 * 1024;
             ggml_init_params params{};
@@ -2127,35 +2156,28 @@ bool deepseek4_step_layer_range(
                                         sizeof(int32_t) * hash_expert_ids_host.size());
             }
 
-            std::fprintf(stderr, "[deepseek4-lr] layer %d: computing ffn\n", il);
-            fflush(stderr);
             auto status = ggml_backend_graph_compute(backend, gf);
-            std::fprintf(stderr, "[deepseek4-lr] layer %d: ffn compute done status=%d\n", il, (int)status);
-            fflush(stderr);
             if (status != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "[deepseek4] ffn compute failed layer %d\n", il);
                 ggml_gallocr_free(alloc); ggml_free(ctx);
                 return false;
             }
 
-            std::vector<float> ffn_out_host((size_t)n_embd * (size_t)n_tokens);
+            ffn_out_host.resize((size_t)n_embd * (size_t)n_tokens);
             ggml_backend_tensor_get(ffn_out, ffn_out_host.data(), 0, sizeof(float) * ffn_out_host.size());
             ggml_gallocr_free(alloc);
             ggml_free(ctx);
 
             // ── HC post (FFN) ───────────────────────────────────────
-            if (hc_lw.ffn.loaded && n_tokens == 1) {
-                std::vector<float> new_hc((size_t)hc_dim);
-                cpu_hc_post(new_hc.data(), ffn_out_host.data(), hc_state.data(),
-                            hc_ffn_result.post, hc_ffn_result.comb, n_embd, n_hc);
-                memcpy(hc_state.data(), new_hc.data(), (size_t)hc_dim * sizeof(float));
-            } else {
-                for (int t = 0; t < n_tokens; t++) {
-                    float * s = hc_state.data() + (size_t)t * hc_dim;
-                    const float * f = ffn_out_host.data() + (size_t)t * n_embd;
-                    for (int d = 0; d < n_embd; d++) s[d] += f[d];
-                }
-            }
+            hc_post_batch(next_hc,
+                          ffn_out_host.data(),
+                          hc_state.data(),
+                          hc_post.data(),
+                          hc_comb.data(),
+                          n_tokens,
+                          n_embd,
+                          n_hc);
+            std::memcpy(hc_state.data(), next_hc.data(), next_hc.size() * sizeof(float));
         }
     }
 
@@ -2163,28 +2185,24 @@ bool deepseek4_step_layer_range(
     if (is_last_shard && out_logits) {
         // Final HC pre for output
         std::vector<float> final_embd((size_t)n_embd * (size_t)n_tokens);
-        if (hc_output_weights_range.loaded && n_tokens == 1) {
-            std::vector<float> flat((size_t)hc_dim);
-            cpu_rms_norm(flat.data(), hc_state.data(), hc_dim, w.hc_eps);
-            std::vector<float> pre(n_hc);
+        std::vector<float> flat((size_t)hc_dim);
+        std::vector<float> pre((size_t)n_hc);
+        std::vector<float> hc_weights((size_t)n_hc);
+        for (int t = 0; t < n_tokens; ++t) {
+            const float * token_hc = hc_state.data() + (size_t)t * hc_dim;
+            cpu_rms_norm(flat.data(), token_hc, hc_dim, w.hc_eps);
             cpu_matvec_f16(pre.data(), hc_output_weights_range.fn_data.data(), flat.data(), n_hc, hc_dim);
-            float hc_weights[4];
-            for (int i = 0; i < n_hc; i++) {
-                const float z = pre[i] * hc_output_weights_range.scale_data[0] + hc_output_weights_range.base_data[i];
-                hc_weights[i] = 1.0f / (1.0f + expf(-z)) + 1.0e-6f;
+            for (int i = 0; i < n_hc; ++i) {
+                const float z = pre[(size_t)i] * hc_output_weights_range.scale_data[0] +
+                                hc_output_weights_range.base_data[(size_t)i];
+                hc_weights[(size_t)i] = 1.0f / (1.0f + expf(-z)) + 1.0e-6f;
             }
-            for (int d = 0; d < n_embd; d++) {
+            for (int d = 0; d < n_embd; ++d) {
                 float acc = 0.0f;
-                for (int h = 0; h < n_hc; h++) {
-                    acc += hc_weights[h] * hc_state[(size_t)h * n_embd + d];
+                for (int h = 0; h < n_hc; ++h) {
+                    acc += hc_weights[(size_t)h] * token_hc[(size_t)h * n_embd + d];
                 }
-                final_embd[d] = acc;
-            }
-        } else {
-            for (int t = 0; t < n_tokens; t++) {
-                memcpy(final_embd.data() + (size_t)t * n_embd,
-                       hc_state.data() + (size_t)t * hc_dim,
-                       (size_t)n_embd * sizeof(float));
+                final_embd[(size_t)t * n_embd + d] = acc;
             }
         }
 
@@ -2211,16 +2229,10 @@ bool deepseek4_step_layer_range(
             return false;
         }
         ggml_backend_tensor_set(inp, final_embd.data(), 0, sizeof(float) * final_embd.size());
-        std::fprintf(stderr, "[deepseek4-lr] computing lm_head (vocab=%d)\n", w.n_vocab);
-        fflush(stderr);
         if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
-            std::fprintf(stderr, "[deepseek4-lr] lm_head compute failed\n");
-            fflush(stderr);
             ggml_gallocr_free(alloc); ggml_free(ctx);
             return false;
         }
-        std::fprintf(stderr, "[deepseek4-lr] lm_head compute done\n");
-        fflush(stderr);
 
         out_logits->resize((size_t)w.n_vocab);
         const size_t logits_offset = (size_t)(n_tokens - 1) * (size_t)w.n_vocab * sizeof(float);
