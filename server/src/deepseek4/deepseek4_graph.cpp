@@ -1931,7 +1931,7 @@ bool deepseek4_step_layer_range(
         std::vector<float> * out_logits,
         const int32_t * token_ids,
         DeepSeek4StepTelemetry * telemetry) {
-    (void) telemetry;
+    const auto step_t0 = Ds4TimingClock::now();
 
     // NOTE: The old deepseek4_step() lacks HC implementation.
     // Always use the HC-enabled layer_range path below.
@@ -1996,12 +1996,15 @@ bool deepseek4_step_layer_range(
         const HcLayerWeightsCpu & hc_lw = hc_layer_weights_range[(size_t)il];
 
         // ── HC pre (attention) ──────────────────────────────────────
+        const auto hc_pre_attn_t0 = Ds4TimingClock::now();
         hc_pre_batch(cur, hc_post, hc_comb,
                      hc_state.data(), hc_lw.attn, L.hc_attn_fn,
                      n_tokens, n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
+        if (telemetry) telemetry->hc_pre_attn_us += ds4_elapsed_us(hc_pre_attn_t0, Ds4TimingClock::now());
 
         // ── Build & run attention graph ─────────────────────────────
         {
+            const auto attn_build_t0 = Ds4TimingClock::now();
             const size_t ctx_size = 48 * 1024 * 1024;
             ggml_init_params params{};
             params.mem_size = ctx_size;
@@ -2029,23 +2032,29 @@ bool deepseek4_step_layer_range(
                 ggml_gallocr_free(alloc); ggml_free(ctx);
                 return false;
             }
+            if (telemetry) telemetry->attn_build_us += ds4_elapsed_us(attn_build_t0, Ds4TimingClock::now());
             ggml_backend_tensor_set(inp, cur.data(), 0, sizeof(float) * cur.size());
             for (const auto & b : i32_inputs)
                 ggml_backend_tensor_set(b.tensor, &b.value, 0, sizeof(b.value));
             for (const auto & b : i32_array_inputs)
                 ggml_backend_tensor_set(b.tensor, b.values.data(), 0, sizeof(int32_t) * b.values.size());
 
+            const auto attn_compute_t0 = Ds4TimingClock::now();
             if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "[deepseek4] attn compute failed layer %d\n", il);
                 ggml_gallocr_free(alloc); ggml_free(ctx);
                 return false;
             }
+            if (telemetry) telemetry->attn_compute_us += ds4_elapsed_us(attn_compute_t0, Ds4TimingClock::now());
             attn_out_host.resize((size_t)n_embd * (size_t)n_tokens);
+            const auto attn_read_t0 = Ds4TimingClock::now();
             ggml_backend_tensor_get(attn_out, attn_out_host.data(), 0, sizeof(float) * attn_out_host.size());
+            if (telemetry) telemetry->attn_read_us += ds4_elapsed_us(attn_read_t0, Ds4TimingClock::now());
             ggml_gallocr_free(alloc);
             ggml_free(ctx);
 
             // ── HC post (attention) ─────────────────────────────────
+            const auto hc_post_attn_t0 = Ds4TimingClock::now();
             hc_post_batch(next_hc,
                           attn_out_host.data(),
                           hc_state.data(),
@@ -2055,15 +2064,19 @@ bool deepseek4_step_layer_range(
                           n_embd,
                           n_hc);
             std::memcpy(hc_state.data(), next_hc.data(), next_hc.size() * sizeof(float));
+            if (telemetry) telemetry->hc_post_attn_us += ds4_elapsed_us(hc_post_attn_t0, Ds4TimingClock::now());
         }
 
         // ── HC pre (FFN) ────────────────────────────────────────────
+        const auto hc_pre_ffn_t0 = Ds4TimingClock::now();
         hc_pre_batch(ffn_working, hc_post, hc_comb,
                      hc_state.data(), hc_lw.ffn, L.hc_ffn_fn,
                      n_tokens, n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
+        if (telemetry) telemetry->hc_pre_ffn_us += ds4_elapsed_us(hc_pre_ffn_t0, Ds4TimingClock::now());
 
         // ── Build & run FFN graph ───────────────────────────────────
         {
+            const auto ffn_build_t0 = Ds4TimingClock::now();
             const size_t ctx_size = 48 * 1024 * 1024;
             ggml_init_params params{};
             params.mem_size = ctx_size;
@@ -2150,13 +2163,16 @@ bool deepseek4_step_layer_range(
                 ggml_gallocr_free(alloc); ggml_free(ctx);
                 return false;
             }
+            if (telemetry) telemetry->ffn_build_us += ds4_elapsed_us(ffn_build_t0, Ds4TimingClock::now());
             ggml_backend_tensor_set(inp, ffn_working.data(), 0, sizeof(float) * ffn_working.size());
             if (hash_ids_inp) {
                 ggml_backend_tensor_set(hash_ids_inp, hash_expert_ids_host.data(), 0,
                                         sizeof(int32_t) * hash_expert_ids_host.size());
             }
 
+            const auto ffn_compute_t0 = Ds4TimingClock::now();
             auto status = ggml_backend_graph_compute(backend, gf);
+            if (telemetry) telemetry->ffn_compute_us += ds4_elapsed_us(ffn_compute_t0, Ds4TimingClock::now());
             if (status != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "[deepseek4] ffn compute failed layer %d\n", il);
                 ggml_gallocr_free(alloc); ggml_free(ctx);
@@ -2164,11 +2180,14 @@ bool deepseek4_step_layer_range(
             }
 
             ffn_out_host.resize((size_t)n_embd * (size_t)n_tokens);
+            const auto ffn_read_t0 = Ds4TimingClock::now();
             ggml_backend_tensor_get(ffn_out, ffn_out_host.data(), 0, sizeof(float) * ffn_out_host.size());
+            if (telemetry) telemetry->ffn_read_us += ds4_elapsed_us(ffn_read_t0, Ds4TimingClock::now());
             ggml_gallocr_free(alloc);
             ggml_free(ctx);
 
             // ── HC post (FFN) ───────────────────────────────────────
+            const auto hc_post_ffn_t0 = Ds4TimingClock::now();
             hc_post_batch(next_hc,
                           ffn_out_host.data(),
                           hc_state.data(),
@@ -2178,12 +2197,14 @@ bool deepseek4_step_layer_range(
                           n_embd,
                           n_hc);
             std::memcpy(hc_state.data(), next_hc.data(), next_hc.size() * sizeof(float));
+            if (telemetry) telemetry->hc_post_ffn_us += ds4_elapsed_us(hc_post_ffn_t0, Ds4TimingClock::now());
         }
     }
 
     // ── Output: HC pre → norm → lm_head (or return hidden state) ────────
     if (is_last_shard && out_logits) {
         // Final HC pre for output
+        const auto output_t0 = Ds4TimingClock::now();
         std::vector<float> final_embd((size_t)n_embd * (size_t)n_tokens);
         std::vector<float> flat((size_t)hc_dim);
         std::vector<float> pre((size_t)n_hc);
@@ -2240,6 +2261,7 @@ bool deepseek4_step_layer_range(
                                 sizeof(float) * (size_t)w.n_vocab);
         ggml_gallocr_free(alloc);
         ggml_free(ctx);
+        if (telemetry) telemetry->output_us += ds4_elapsed_us(output_t0, Ds4TimingClock::now());
     } else if (out_logits) {
         // Return full HC state for next shard (all n_hc streams)
         out_logits->resize((size_t)hc_dim * n_tokens);
@@ -2259,6 +2281,7 @@ bool deepseek4_step_layer_range(
     }
 
     cache.cur_pos = next_pos;
+    if (telemetry) telemetry->total_us += ds4_elapsed_us(step_t0, Ds4TimingClock::now());
     return true;
 }
 

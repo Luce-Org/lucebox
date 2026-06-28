@@ -24,10 +24,64 @@ namespace dflash::common {
 
 namespace {
 
+using SplitClock = std::chrono::steady_clock;
+
+static uint64_t split_elapsed_us(SplitClock::time_point start,
+                                 SplitClock::time_point end) {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+}
+
+static bool env_flag_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value && value[0] && std::strcmp(value, "0") != 0;
+}
+
 static int env_int(const char * name, int fallback) {
     const char * value = std::getenv(name);
     if (!value || !value[0]) return fallback;
     return std::atoi(value);
+}
+
+static double split_ms(uint64_t us) {
+    return (double)us / 1000.0;
+}
+
+static void add_step_tel(DeepSeek4StepTelemetry & dst, const DeepSeek4StepTelemetry & src) {
+    dst.total_us += src.total_us;
+    dst.embed_us += src.embed_us;
+    dst.hc_pre_attn_us += src.hc_pre_attn_us;
+    dst.attn_build_us += src.attn_build_us;
+    dst.attn_compute_us += src.attn_compute_us;
+    dst.attn_read_us += src.attn_read_us;
+    dst.hc_post_attn_us += src.hc_post_attn_us;
+    dst.hc_pre_ffn_us += src.hc_pre_ffn_us;
+    dst.ffn_build_us += src.ffn_build_us;
+    dst.ffn_compute_us += src.ffn_compute_us;
+    dst.ffn_read_us += src.ffn_read_us;
+    dst.hc_post_ffn_us += src.hc_post_ffn_us;
+    dst.output_us += src.output_us;
+}
+
+static void log_split_tel(const char * phase,
+                          int n_tokens,
+                          const DeepSeek4StepTelemetry & local_tel,
+                          uint64_t remote_forward_us,
+                          uint64_t total_us) {
+    std::fprintf(stderr,
+        "[deepseek4-split-timing] %s tokens=%d total=%.1fms local=%.1fms remote=%.1fms "
+        "embed=%.1fms hc_pre=%.1fms attn_build=%.1fms attn_compute=%.1fms attn_read=%.1fms "
+        "ffn_build=%.1fms ffn_compute=%.1fms ffn_read=%.1fms hc_post=%.1fms output=%.1fms\n",
+        phase, n_tokens, split_ms(total_us), split_ms(local_tel.total_us), split_ms(remote_forward_us),
+        split_ms(local_tel.embed_us),
+        split_ms(local_tel.hc_pre_attn_us + local_tel.hc_pre_ffn_us),
+        split_ms(local_tel.attn_build_us),
+        split_ms(local_tel.attn_compute_us),
+        split_ms(local_tel.attn_read_us),
+        split_ms(local_tel.ffn_build_us),
+        split_ms(local_tel.ffn_compute_us),
+        split_ms(local_tel.ffn_read_us),
+        split_ms(local_tel.hc_post_attn_us + local_tel.hc_post_ffn_us),
+        split_ms(local_tel.output_us));
 }
 
 } // namespace
@@ -365,6 +419,8 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
         std::vector<float> * logits_out) {
     if (shards_.empty()) return false;
 
+    const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
+    const auto forward_t0 = SplitClock::now();
     const int n_tokens = (int)tokens.size();
     const int n_embd = shards_[0].weights.n_embd;
     const int n_hc = shards_[0].weights.n_hc;
@@ -372,10 +428,13 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
     // Embed tokens on first shard
     auto & first_shard = shards_[0];
     std::vector<float> embed((size_t)n_embd * n_tokens);
+    const auto embed_t0 = SplitClock::now();
     if (!first_shard.weights.embedder.embed(tokens.data(), n_tokens, embed.data())) {
         std::fprintf(stderr, "[deepseek4-split] embedding failed on first shard\n");
         return false;
     }
+    DeepSeek4StepTelemetry tel_acc;
+    if (timing) tel_acc.embed_us = split_elapsed_us(embed_t0, SplitClock::now());
 
     // Initialize HC state from embedding for new sequences
     if (base_pos == 0 && cur_pos_ == 0) {
@@ -399,15 +458,17 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
         auto & shard = shards_[si];
         const bool is_last = (si == shards_.size() - 1);
         std::vector<float> * shard_logits = is_last ? logits_out : nullptr;
+        DeepSeek4StepTelemetry step_tel;
 
         if (!deepseek4_step_layer_range(
                 shard.backend, shard.weights, shard.cache,
                 hc_state_, embed.data(), n_tokens, base_pos,
                 shard.layer_begin, shard.layer_end,
-                shard_logits, tokens.data(), nullptr)) {
+                shard_logits, tokens.data(), timing ? &step_tel : nullptr)) {
             std::fprintf(stderr, "[deepseek4-split] forward failed on shard %zu\n", si);
             return false;
         }
+        if (timing) add_step_tel(tel_acc, step_tel);
     }
 
     cur_pos_ = base_pos + n_tokens;
@@ -418,6 +479,10 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
         prefill_last_logits_ = *logits_out;
     }
 
+    if (timing) {
+        const uint64_t total_us = split_elapsed_us(forward_t0, SplitClock::now());
+        log_split_tel("local-forward", n_tokens, tel_acc, 0, total_us);
+    }
     return true;
 }
 
@@ -428,16 +493,21 @@ bool DeepSeek4LayerSplitAdapter::run_mixed_forward(
         std::vector<float> * logits_out) {
     if (shards_.empty() || !remote_target_shard_.active()) return false;
 
+    const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
+    const auto forward_t0 = SplitClock::now();
     const int n_tokens = (int)tokens.size();
     const int n_embd = shards_[0].weights.n_embd;
 
     // Run local shard (first N layers on CUDA)
     auto & local_shard = shards_[0];
     std::vector<float> embed((size_t)n_embd * n_tokens);
+    const auto embed_t0 = SplitClock::now();
     if (!local_shard.weights.embedder.embed(tokens.data(), n_tokens, embed.data())) {
         std::fprintf(stderr, "[deepseek4-split] embedding failed on local shard\n");
         return false;
     }
+    DeepSeek4StepTelemetry local_tel;
+    if (timing) local_tel.embed_us = split_elapsed_us(embed_t0, SplitClock::now());
 
     // Run only the local shard's layer range, getting hidden state output
     std::vector<float> hidden_out;
@@ -445,7 +515,7 @@ bool DeepSeek4LayerSplitAdapter::run_mixed_forward(
                                      local_shard.cache, hc_state_,
                                      embed.data(), n_tokens, base_pos,
                                      local_shard.layer_begin, local_shard.layer_end,
-                                     &hidden_out, tokens.data(), nullptr)) {
+                                     &hidden_out, tokens.data(), timing ? &local_tel : nullptr)) {
         std::fprintf(stderr, "[deepseek4-split] local shard forward failed\n");
         return false;
     }
@@ -462,10 +532,12 @@ bool DeepSeek4LayerSplitAdapter::run_mixed_forward(
     std::vector<float> remote_logits;
     if (logits_out) resp.logits_out = &remote_logits;
 
+    const auto remote_t0 = SplitClock::now();
     if (!remote_target_shard_.forward(req, resp)) {
         std::fprintf(stderr, "[deepseek4-split] remote shard forward failed\n");
         return false;
     }
+    const uint64_t remote_forward_us = split_elapsed_us(remote_t0, SplitClock::now());
 
     cur_pos_ = base_pos + n_tokens;
     last_tok = resp.last_tok >= 0 ? resp.last_tok : tokens.back();
@@ -476,6 +548,10 @@ bool DeepSeek4LayerSplitAdapter::run_mixed_forward(
         prefill_last_logits_ = *logits_out;
     }
 
+    if (timing) {
+        const uint64_t total_us = split_elapsed_us(forward_t0, SplitClock::now());
+        log_split_tel("mixed-forward", n_tokens, local_tel, remote_forward_us, total_us);
+    }
     return true;
 }
 

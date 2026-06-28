@@ -12,6 +12,7 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -22,6 +23,45 @@
 #endif
 
 namespace dflash::common {
+
+namespace {
+using TargetShardClock = std::chrono::steady_clock;
+
+static uint64_t target_shard_elapsed_us(TargetShardClock::time_point start,
+                                        TargetShardClock::time_point end) {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+}
+
+static bool target_shard_timing_enabled() {
+    const char * value = std::getenv("DFLASH_DS4_TIMING");
+    return value && value[0] && std::strcmp(value, "0") != 0;
+}
+
+static double target_shard_ms(uint64_t us) {
+    return (double)us / 1000.0;
+}
+
+static void log_target_shard_timing(int n_tokens,
+                                    int layer_begin,
+                                    int layer_end,
+                                    const DeepSeek4StepTelemetry & tel) {
+    std::fprintf(stderr,
+        "[deepseek4-target-timing] tokens=%d layers=[%d,%d) total=%.1fms "
+        "hc_pre=%.1fms attn_build=%.1fms attn_compute=%.1fms attn_read=%.1fms "
+        "ffn_build=%.1fms ffn_compute=%.1fms ffn_read=%.1fms hc_post=%.1fms output=%.1fms\n",
+        n_tokens, layer_begin, layer_end,
+        target_shard_ms(tel.total_us),
+        target_shard_ms(tel.hc_pre_attn_us + tel.hc_pre_ffn_us),
+        target_shard_ms(tel.attn_build_us),
+        target_shard_ms(tel.attn_compute_us),
+        target_shard_ms(tel.attn_read_us),
+        target_shard_ms(tel.ffn_build_us),
+        target_shard_ms(tel.ffn_compute_us),
+        target_shard_ms(tel.ffn_read_us),
+        target_shard_ms(tel.hc_post_attn_us + tel.hc_post_ffn_us),
+        target_shard_ms(tel.output_us));
+}
+} // namespace
 
 int run_deepseek4_target_shard_ipc_daemon(
         const char * target_path,
@@ -83,6 +123,7 @@ int run_deepseek4_target_shard_ipc_daemon(
                             TargetShardDaemonForwardResponse & resp) -> bool {
         const int n_tokens = req.n_tokens;
         if (n_tokens <= 0) return false;
+        const bool timing = target_shard_timing_enabled();
 
         // The boundary activation from the CUDA shard is the full HC state
         // (n_hc * n_embd * n_tokens floats).
@@ -101,15 +142,22 @@ int run_deepseek4_target_shard_ipc_daemon(
         std::fprintf(stderr, "[deepseek4-target-shard] forward: n_tokens=%d base_pos=%d layers=[%d,%d)\n",
                      n_tokens, req.base_pos, plan.layer_begin, plan.layer_end);
         std::vector<float> logits;
+        DeepSeek4StepTelemetry tel;
+        const auto forward_t0 = TargetShardClock::now();
         bool ok = deepseek4_step_layer_range(
             backend, weights, cache, hc_state,
             input_embed, n_tokens, req.base_pos,
             plan.layer_begin, plan.layer_end,
-            &logits, nullptr, nullptr);
+            &logits, nullptr, timing ? &tel : nullptr);
 
         if (!ok) {
             std::fprintf(stderr, "[deepseek4-target-shard] forward failed\n");
             return false;
+        }
+        if (timing) {
+            const uint64_t wall_us = target_shard_elapsed_us(forward_t0, TargetShardClock::now());
+            if (wall_us > tel.total_us) tel.total_us = wall_us;
+            log_target_shard_timing(n_tokens, plan.layer_begin, plan.layer_end, tel);
         }
 
         // Compute argmax from last token's logits
