@@ -479,6 +479,10 @@ bool load_draft_gguf(const std::string & path,
     const uint32_t domino_meta_gru     = read_u32("dflash.domino.gru_hidden_dim", 0);
     const uint32_t domino_meta_emb     = read_u32("dflash.domino.emb_dim", 0);
     const uint32_t domino_meta_vocab   = read_u32("dflash.domino.vocab_size", 0);
+    const uint32_t dspark_meta_enabled = read_u32("dflash.dspark.enabled", 0);
+    const uint32_t dspark_meta_rank    = read_u32("dflash.dspark.markov_rank", 0);
+    const uint32_t dspark_meta_vocab   = read_u32("dflash.dspark.vocab_size", 0);
+    const uint32_t dspark_meta_conf    = read_u32("dflash.dspark.confidence_dim", 0);
     // Explicit captured target-layer ids (data-driven). Lets any DFlash drafter
     // load without a hardcoded per-arch set; the array length also backstops
     // n_target_layers when the scalar KV is absent.
@@ -663,6 +667,61 @@ bool load_draft_gguf(const std::string & path,
         std::fprintf(stderr, "[draft GGUF] Domino GRU head enabled: H=%d E=%d vocab=%d\n",
                      out.domino.gru_hidden_dim, out.domino.emb_dim,
                      out.domino.vocab_size);
+    }
+
+    out.dspark = DraftDSparkWeights{};
+    out.dspark.markov_w1    = g("dflash.dspark.markov.w1");
+    out.dspark.markov_w2    = g("dflash.dspark.markov.w2");
+    out.dspark.confidence_w = g("dflash.dspark.confidence.weight");
+    out.dspark.confidence_b = g("dflash.dspark.confidence.bias");
+
+    const bool dspark_any =
+        out.dspark.markov_w1 || out.dspark.markov_w2 ||
+        out.dspark.confidence_w || out.dspark.confidence_b ||
+        dspark_meta_enabled != 0;
+    if (dspark_any) {
+        if (!out.dspark.markov_w1 || !out.dspark.markov_w2) {
+            set_last_error("draft GGUF: incomplete DSpark Markov tensors");
+            gguf_free(gctx);
+            return false;
+        }
+        out.dspark.markov_rank =
+            dspark_meta_rank != 0 ? (int)dspark_meta_rank : (int)out.dspark.markov_w1->ne[0];
+        out.dspark.vocab_size =
+            dspark_meta_vocab != 0 ? (int)dspark_meta_vocab : (int)out.dspark.markov_w1->ne[1];
+
+        const int64_t R = out.dspark.markov_rank;
+        const int64_t V = out.dspark.vocab_size;
+        char shape_err[320];
+        if (!check_shape_2d(out.dspark.markov_w1, R, V, "dspark.markov.w1", shape_err, sizeof(shape_err)) ||
+            !check_shape_2d(out.dspark.markov_w2, R, V, "dspark.markov.w2", shape_err, sizeof(shape_err))) {
+            set_last_error(shape_err);
+            gguf_free(gctx);
+            return false;
+        }
+
+        const bool conf_any = out.dspark.confidence_w || out.dspark.confidence_b || dspark_meta_conf != 0;
+        if (conf_any) {
+            if (!out.dspark.confidence_w || !out.dspark.confidence_b) {
+                set_last_error("draft GGUF: incomplete DSpark confidence tensors");
+                gguf_free(gctx);
+                return false;
+            }
+            out.dspark.confidence_dim =
+                dspark_meta_conf != 0 ? (int)dspark_meta_conf : (int)out.dspark.confidence_w->ne[0];
+            const int64_t C = out.dspark.confidence_dim;
+            if (!check_shape_2d(out.dspark.confidence_w, C, 1, "dspark.confidence.weight", shape_err, sizeof(shape_err)) ||
+                !check_shape_1d(out.dspark.confidence_b, 1, "dspark.confidence.bias", shape_err, sizeof(shape_err))) {
+                set_last_error(shape_err);
+                gguf_free(gctx);
+                return false;
+            }
+        }
+
+        out.dspark.enabled = true;
+        std::fprintf(stderr, "[draft GGUF] DSpark Markov head enabled: rank=%d vocab=%d confidence_dim=%d\n",
+                     out.dspark.markov_rank, out.dspark.vocab_size,
+                     out.dspark.confidence_dim);
     }
 
     // GGUF Qwen3.6 drafters carry SWA metadata emitted by the converter:

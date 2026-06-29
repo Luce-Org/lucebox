@@ -244,6 +244,17 @@ DOMINO_TENSOR_MAP = {
 }
 
 
+DSPARK_TENSOR_MAP = {
+    "dspark_markov_head.markov_w1.weight": ("dflash.dspark.markov.w1", gguf.GGMLQuantizationType.F16),
+    "dspark_markov_head.markov_w2.weight": ("dflash.dspark.markov.w2", gguf.GGMLQuantizationType.F16),
+}
+
+DSPARK_CONFIDENCE_TENSOR_MAP = {
+    "dspark_confidence_head.weight": ("dflash.dspark.confidence.weight", gguf.GGMLQuantizationType.F16),
+    "dspark_confidence_head.bias": ("dflash.dspark.confidence.bias", gguf.GGMLQuantizationType.F32),
+}
+
+
 def add_domino_aux_heads(writer, arch: str, aux_path: Path | None):
     if aux_path is None:
         return
@@ -265,6 +276,9 @@ def add_domino_aux_heads(writer, arch: str, aux_path: Path | None):
         print(f"[error] Domino aux heads file is not a tensor dict: {aux_path}", file=sys.stderr)
         sys.exit(1)
 
+    if not any(k in state for k in DOMINO_TENSOR_MAP):
+        return
+
     missing = [k for k in DOMINO_TENSOR_MAP if k not in state]
     if missing:
         print(f"[warn] incomplete Domino aux heads; missing {missing}; skipping Domino tensors")
@@ -282,6 +296,79 @@ def add_domino_aux_heads(writer, arch: str, aux_path: Path | None):
     writer.add_uint32(f"{arch}.dflash.domino.vocab_size", vocab)
 
     for st_name, (gguf_name, raw_dtype) in DOMINO_TENSOR_MAP.items():
+        t = state[st_name]
+        if hasattr(t, "detach"):
+            t = t.detach().cpu()
+        arr = t.float().numpy()
+        if raw_dtype == gguf.GGMLQuantizationType.F16:
+            arr = arr.astype("<f2")
+        else:
+            arr = arr.astype("<f4")
+        writer.add_tensor(gguf_name, arr, raw_dtype=raw_dtype)
+        print(f"[tensor] {gguf_name:50s} aux ->{raw_dtype.name:4s} {tuple(arr.shape)}")
+
+
+def add_dspark_aux_heads(writer, arch: str, aux_path: Path | None):
+    if aux_path is None:
+        return
+    if not aux_path.exists():
+        return
+
+    try:
+        import torch
+    except ImportError as exc:
+        print(f"[error] --aux-heads requires torch: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    state = torch.load(aux_path, map_location="cpu")
+    if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
+        state = state["state_dict"]
+    if not isinstance(state, dict):
+        print(f"[error] DSpark aux heads file is not a tensor dict: {aux_path}", file=sys.stderr)
+        sys.exit(1)
+
+    missing = [k for k in DSPARK_TENSOR_MAP if k not in state]
+    if missing:
+        return
+
+    print(f"[info] reading DSpark aux heads from {aux_path}")
+    w1 = state["dspark_markov_head.markov_w1.weight"]
+    w2 = state["dspark_markov_head.markov_w2.weight"]
+    vocab = int(w1.shape[0])
+    rank = int(w1.shape[1])
+    if tuple(w2.shape) != (vocab, rank):
+        print(f"[error] DSpark markov_w2 shape {tuple(w2.shape)} != {(vocab, rank)}", file=sys.stderr)
+        sys.exit(1)
+
+    writer.add_uint32(f"{arch}.dflash.dspark.enabled", 1)
+    writer.add_uint32(f"{arch}.dflash.dspark.markov_rank", rank)
+    writer.add_uint32(f"{arch}.dflash.dspark.vocab_size", vocab)
+
+    for st_name, (gguf_name, raw_dtype) in DSPARK_TENSOR_MAP.items():
+        t = state[st_name]
+        if hasattr(t, "detach"):
+            t = t.detach().cpu()
+        arr = t.float().numpy().astype("<f2")
+        writer.add_tensor(gguf_name, arr, raw_dtype=raw_dtype)
+        print(f"[tensor] {gguf_name:50s} aux ->{raw_dtype.name:4s} {tuple(arr.shape)}")
+
+    conf_missing = [k for k in DSPARK_CONFIDENCE_TENSOR_MAP if k not in state]
+    if conf_missing:
+        print(f"[warn] incomplete DSpark confidence head; missing {conf_missing}; Markov head will still load")
+        return
+
+    conf_w = state["dspark_confidence_head.weight"]
+    conf_b = state["dspark_confidence_head.bias"]
+    confidence_dim = int(conf_w.shape[1])
+    if int(conf_w.shape[0]) != 1 or tuple(conf_b.shape) != (1,):
+        print(
+            f"[error] DSpark confidence shapes weight={tuple(conf_w.shape)} bias={tuple(conf_b.shape)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    writer.add_uint32(f"{arch}.dflash.dspark.confidence_dim", confidence_dim)
+    writer.add_uint32(f"{arch}.dflash.dspark.confidence.enabled", 1)
+    for st_name, (gguf_name, raw_dtype) in DSPARK_CONFIDENCE_TENSOR_MAP.items():
         t = state[st_name]
         if hasattr(t, "detach"):
             t = t.detach().cpu()
@@ -400,6 +487,7 @@ def main():
     if not args.no_aux_heads:
         aux_path = args.aux_heads if args.aux_heads is not None else args.safetensors.parent / "dflash_aux_heads.pt"
     add_domino_aux_heads(writer, ARCH, aux_path)
+    add_dspark_aux_heads(writer, ARCH, aux_path)
 
     print(f"[info] writing {args.out_gguf}")
     writer.write_header_to_file()

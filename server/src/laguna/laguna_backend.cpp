@@ -12,6 +12,7 @@
 #include "dflash27b.h"
 #include "common/ddtree.h"
 #include "common/domino_head.h"
+#include "common/dspark_head.h"
 #include "common/dflash_feature_ring.h"
 #include "common/dflash_draft_graph.h"
 
@@ -49,6 +50,26 @@ static bool laguna_sampled_verify_enabled(const SamplerCfg & sampler, bool do_sa
         return e != nullptr && std::string(e) == "1";
     }();
     return kSampledVerify && do_sample && sampler.needs_logit_processing();
+}
+
+static bool laguna_dspark_enabled() {
+    static const bool kEnabled = []() {
+        const char * e = std::getenv("DFLASH_LAGUNA_DSPARK");
+        return e == nullptr || std::string(e) != "0";
+    }();
+    return kEnabled;
+}
+
+static float laguna_dspark_confidence_threshold() {
+    static const float kThreshold = []() {
+        const char * e = std::getenv("DFLASH_LAGUNA_DSPARK_CONFIDENCE_THRESHOLD");
+        if (!e) return 0.0f;
+        float threshold = std::atof(e);
+        if (threshold < 0.0f) threshold = 0.0f;
+        if (threshold > 1.0f) threshold = 1.0f;
+        return threshold;
+    }();
+    return kThreshold;
 }
 
 // ── Construction / initialisation ───────────────────────────────────────
@@ -390,7 +411,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     if (chain_w < 2) chain_w = 2;
     if (chain_w > std::min(block_size, 8)) chain_w = std::min(block_size, 8);
     // DDTree sizes its batch via its budget; chain uses the width chosen above.
-    const int q_len = args_.ddtree_mode ? block_size : chain_w;
+    const int base_q_len = args_.ddtree_mode ? block_size : chain_w;
 
     const bool ignore_eos = (std::getenv("DFLASH_IGNORE_EOS") != nullptr);
     const bool sampled_verify = laguna_sampled_verify_enabled(sampler_, true);
@@ -404,8 +425,8 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     // dw.block_size); chain reads/verifies only its first q_len outputs.
     std::vector<float>   noise_embed((size_t)hidden * (size_t)block_size);
     std::vector<int32_t> noise_ids((size_t)block_size);
-    std::vector<int32_t> draft_tok((size_t)q_len);
-    std::vector<int32_t> target_tok((size_t)q_len);
+    std::vector<int32_t> draft_tok((size_t)base_q_len);
+    std::vector<int32_t> target_tok((size_t)base_q_len);
     std::vector<float>   verify_logits;
     std::vector<int32_t> verify_history;
     std::vector<int32_t> pos_q((size_t)block_size);
@@ -417,6 +438,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     int n_generated   = 0;
     int n_draft_steps = 0;
     int n_accept_sum  = 0;
+    int n_draft_pos_sum = 0;
 
     auto argmax_logits = [](const std::vector<float> & ll) {
         int best = 0;
@@ -515,6 +537,9 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     auto t_dec0 = std::chrono::steady_clock::now();
 
     while (n_generated < n_gen) {
+        int q_len = base_q_len;
+        draft_tok.resize((size_t)q_len);
+        target_tok.resize((size_t)q_len);
         const int need_commit_budget = n_gen - n_generated;
 
         if (budget_hook && !budget_hook->close_token_ids.empty()) {
@@ -528,7 +553,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                 const bool ok = run_ar_tail(need_commit_budget);
                 auto t_dec1 = std::chrono::steady_clock::now();
                 const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-                const int total_draft_pos = std::max(1, n_draft_steps * q_len);
+                const int total_draft_pos = std::max(1, n_draft_pos_sum);
                 const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
                 std::fprintf(stderr,
                     "[laguna-spec] tail-off-stats tokens=%d time=%.3f s speed=%.2f tok/s "
@@ -616,7 +641,34 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                 }
             }
         }
-        if (!used_domino) {
+        bool used_dspark = false;
+        if (!used_domino && laguna_dspark_enabled() && dw.dspark.enabled &&
+            q_len > 1 && !sampled_verify && !args_.ddtree_mode) {
+            static std::atomic<bool> s_dspark_logged{false};
+            if (!s_dspark_logged.exchange(true)) {
+                std::fprintf(stderr,
+                    "[laguna-spec] DSpark Markov head active for greedy chain decode "
+                    "(rank=%d vocab=%d confidence_dim=%d)\n",
+                    dw.dspark.markov_rank, dw.dspark.vocab_size, dw.dspark.confidence_dim);
+            }
+            if (dspark_markov_correct_greedy_chain(dw, draft_backend_, *target,
+                                                   local_hidden.data(), q_len,
+                                                   last_tok,
+                                                   laguna_dspark_confidence_threshold(),
+                                                   draft_tok)) {
+                used_dspark = true;
+                q_len = (int)draft_tok.size();
+                target_tok.resize((size_t)q_len);
+            } else {
+                static std::atomic<bool> s_dspark_warned{false};
+                if (!s_dspark_warned.exchange(true)) {
+                    std::fprintf(stderr,
+                        "[laguna-spec] DSpark Markov head failed; falling back to base "
+                        "DFlash projection\n");
+                }
+            }
+        }
+        if (!used_domino && !used_dspark) {
             if (!target->project_hidden_to_tokens(local_hidden.data(), q_len, draft_tok)) {
                 std::fprintf(stderr, "[laguna-spec] projection failed\n");
                 step_graph_destroy(draft_sg);
@@ -693,6 +745,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
 
             n_accept_sum += std::max(0, emitted - 1);
             n_draft_steps++;
+            n_draft_pos_sum += q_len;
             if (io.cancelled || hit_eos || emitted <= 0 || next_token < 0 ||
                 (!ignore_eos && target->is_eos(next_token))) {
                 committed += emitted;
@@ -838,6 +891,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         n_generated += emitted;
         n_accept_sum += std::min(accept_n, emitted);
         n_draft_steps++;
+        n_draft_pos_sum += q_len;
         if (io.cancelled) break;
         if (hit_eos) break;
     }
@@ -846,7 +900,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
 
     auto t_dec1 = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    const int total_draft_pos = std::max(1, n_draft_steps * q_len);
+    const int total_draft_pos = std::max(1, n_draft_pos_sum);
     const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
     std::fprintf(stderr, "[laguna-spec] tokens=%d time=%.3f s speed=%.2f tok/s "
                  "steps=%d accepted=%d/%d (%.1f%%) avg_commit=%.2f\n",
