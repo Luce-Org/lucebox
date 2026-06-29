@@ -1020,7 +1020,7 @@ static ggml_tensor * build_mla_attention(
     ggml_tensor * scores = ggml_mul_mat(ctx, kv_f32, q_flat);
     scores = ggml_scale(ctx, scores, kq_scale);
     if (cached_inputs && cached_inputs->score_mask) {
-        scores = ggml_add(ctx, scores, ggml_repeat(ctx, cached_inputs->score_mask, scores));
+        scores = ggml_add(ctx, scores, cached_inputs->score_mask);
     }
 
     // Sink-aware softmax: DS4 adds one learned per-head sink logit to the
@@ -1131,7 +1131,7 @@ static bool build_cached_decode_attn_graph(
     ggml_set_input(out.inputs.neg_pos);
 
     out.inputs.raw_kv_rows = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_I64, 1, 1);
-    out.inputs.score_mask = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_F32, raw_attn_count + comp_attn_count, 1);
+    out.inputs.score_mask = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_F32, raw_attn_count + comp_attn_count, w.n_head);
     out.inputs.decode_raw_attn_count = raw_attn_count;
     out.inputs.decode_comp_attn_count = comp_attn_count;
     ggml_set_input(out.inputs.raw_kv_rows);
@@ -2764,15 +2764,20 @@ bool deepseek4_step_layer_range(
                 const int64_t raw_row = kv_start % w.n_swa;
                 const int32_t rope_pos = kv_start;
                 const int32_t neg_pos = -kv_start;
-                std::vector<float> score_mask((size_t)(cached_attn->n_raw + cached_attn->n_comp_attn), -1.0e9f);
+                std::vector<float> score_mask((size_t)(cached_attn->n_raw + cached_attn->n_comp_attn) * (size_t)w.n_head, -1.0e9f);
+                auto set_mask_row = [&](int row, float value) {
+                    for (int h = 0; h < w.n_head; ++h) {
+                        score_mask[(size_t)row + (size_t)h * (size_t)(cached_attn->n_raw + cached_attn->n_comp_attn)] = value;
+                    }
+                };
                 const int valid_prev_raw = std::max(0, n_raw - 1);
                 for (int i = 0; i < valid_prev_raw; ++i) {
-                    score_mask[(size_t)i] = 0.0f;
+                    set_mask_row(i, 0.0f);
                 }
-                score_mask[(size_t)(cached_attn->n_raw - 1)] = 0.0f;
+                set_mask_row(cached_attn->n_raw - 1, 0.0f);
                 const int comp_base = cached_attn->n_raw;
                 for (int i = 0; i < n_comp_attn; ++i) {
-                    score_mask[(size_t)(comp_base + i)] = 0.0f;
+                    set_mask_row(comp_base + i, 0.0f);
                 }
                 ggml_backend_tensor_set(cached_attn->sg.inp_embed, cur.data(), 0, sizeof(float) * cur.size());
                 ggml_backend_tensor_set(cached_attn->inputs.rope_pos, &rope_pos, 0, sizeof(rope_pos));
