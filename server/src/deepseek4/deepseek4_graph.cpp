@@ -991,22 +991,14 @@ static ggml_tensor * build_mla_attention(
     ggml_tensor * kv_f32 = nullptr;
     if (n_tokens == 1) {
         ggml_tensor * cur_kv_f32 = ggml_cast(ctx, kv, GGML_TYPE_F32);
-        const int n_prev_valid = std::max(0, n_raw_actual - 1);
-        if (n_prev_valid > 0) {
+        if (n_raw > 1) {
             ggml_tensor * prev_f32 = ggml_cast(ctx,
-                ggml_view_2d(ctx, lc.raw_kv, head_dim, n_prev_valid,
+                ggml_view_2d(ctx, lc.raw_kv, head_dim, n_raw - 1,
                              lc.raw_kv->nb[1], 0),
                 GGML_TYPE_F32);
             kv_f32 = ggml_concat(ctx, prev_f32, cur_kv_f32, 1);
         } else {
             kv_f32 = cur_kv_f32;
-        }
-        if (n_raw > n_raw_actual) {
-            ggml_tensor * pad_f32 = ggml_cast(ctx,
-                ggml_view_2d(ctx, lc.raw_kv, head_dim, n_raw - n_raw_actual,
-                             lc.raw_kv->nb[1], (size_t) n_prev_valid * lc.raw_kv->nb[1]),
-                GGML_TYPE_F32);
-            kv_f32 = ggml_concat(ctx, kv_f32, pad_f32, 1);
         }
     } else {
         kv_f32 = ggml_cast(ctx, ggml_view_2d(ctx, lc.raw_kv, head_dim, n_raw,
@@ -2773,10 +2765,11 @@ bool deepseek4_step_layer_range(
                 const int32_t rope_pos = kv_start;
                 const int32_t neg_pos = -kv_start;
                 std::vector<float> score_mask((size_t)(cached_attn->n_raw + cached_attn->n_comp_attn), -1.0e9f);
-                const int valid_raw = n_raw;
-                for (int i = 0; i < valid_raw; ++i) {
+                const int valid_prev_raw = std::max(0, n_raw - 1);
+                for (int i = 0; i < valid_prev_raw; ++i) {
                     score_mask[(size_t)i] = 0.0f;
                 }
+                score_mask[(size_t)(cached_attn->n_raw - 1)] = 0.0f;
                 const int comp_base = cached_attn->n_raw;
                 for (int i = 0; i < n_comp_attn; ++i) {
                     score_mask[(size_t)(comp_base + i)] = 0.0f;
