@@ -1221,7 +1221,7 @@ static bool build_cached_prefill_attn_graph(
 
     out.inputs.rope_pos = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, n_tokens);
     out.inputs.neg_pos = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, n_tokens);
-    out.inputs.raw_kv_rows = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I64, n_tokens);
+    out.inputs.raw_kv_rows = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_I64, 1, n_tokens);
     ggml_set_input(out.inputs.rope_pos);
     ggml_set_input(out.inputs.neg_pos);
     ggml_set_input(out.inputs.raw_kv_rows);
@@ -1229,8 +1229,8 @@ static bool build_cached_prefill_attn_graph(
     if (ratio > 0) {
         out.inputs.attn_ape_row = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
         out.inputs.attn_comp_pos = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
-        out.inputs.attn_state_rows = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I64, 1);
-        out.inputs.attn_comp_rows = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I64, 1);
+        out.inputs.attn_state_rows = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_I64, 1, 1);
+        out.inputs.attn_comp_rows = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_I64, 1, 1);
         ggml_set_input(out.inputs.attn_ape_row);
         ggml_set_input(out.inputs.attn_comp_pos);
         ggml_set_input(out.inputs.attn_state_rows);
@@ -1239,8 +1239,8 @@ static bool build_cached_prefill_attn_graph(
     if (ratio == 4) {
         out.inputs.index_ape_row = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
         out.inputs.index_comp_pos = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
-        out.inputs.index_state_rows = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I64, 1);
-        out.inputs.index_comp_rows = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I64, 1);
+        out.inputs.index_state_rows = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_I64, 1, 1);
+        out.inputs.index_comp_rows = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_I64, 1, 1);
         ggml_set_input(out.inputs.index_ape_row);
         ggml_set_input(out.inputs.index_comp_pos);
         ggml_set_input(out.inputs.index_state_rows);
