@@ -2567,7 +2567,6 @@ bool deepseek4_step_layer_range(
     static HcWeightsCpu hc_output_weights_range;
     static std::vector<HashRoutingTableCpu> hash_routing_tables_range;
     static std::vector<DeepSeek4CachedLayerAlloc> cached_attn_allocs;
-    static std::vector<DeepSeek4CachedLayerAlloc> cached_dynamic_ffn_allocs;
     static std::vector<DeepSeek4CachedDecodeAttnGraph> cached_decode_attn_graphs;
     static std::vector<DeepSeek4CachedDecodeFfnGraph> cached_decode_ffn_graphs;
     static DeepSeek4CachedDecodeOutputGraph cached_decode_output_graph;
@@ -2580,10 +2579,6 @@ bool deepseek4_step_layer_range(
             alloc.free();
         }
         cached_attn_allocs.assign((size_t)w.n_layer, {});
-        for (auto & alloc : cached_dynamic_ffn_allocs) {
-            alloc.free();
-        }
-        cached_dynamic_ffn_allocs.assign((size_t)w.n_layer, {});
         for (auto & g : cached_decode_attn_graphs) {
             g.free();
         }
@@ -2789,140 +2784,41 @@ bool deepseek4_step_layer_range(
                 }
             }
 
-            ggml_tensor * ffn_out = nullptr;
-            if (reuse_decode_graphs) {
-                auto & cached = cached_decode_ffn_graphs[(size_t)il];
-                if (!cached.valid() ||
-                    cached.owner_ctx != w.ctx ||
-                    cached.backend != backend ||
-                    cached.layer_idx != il ||
-                    cached.n_tokens != n_tokens ||
-                    cached.hash_routed != hash_routed) {
-                    const auto ffn_build_t0 = Ds4TimingClock::now();
-                    if (!build_cached_decode_ffn_graph(cached, backend, w, L, il, n_tokens, hash_routed)) {
-                        std::fprintf(stderr, "[deepseek4] cached ffn graph alloc failed layer %d\n", il);
-                        return false;
-                    }
-                    if (telemetry) telemetry->ffn_build_us += ds4_elapsed_us(ffn_build_t0, Ds4TimingClock::now());
-                }
-                ffn_out = cached.sg.hidden_states;
-                ggml_backend_tensor_set(cached.sg.inp_embed, ffn_working.data(), 0,
-                                        sizeof(float) * ffn_working.size());
-                if (cached.hash_ids) {
-                    ggml_backend_tensor_set(cached.hash_ids, hash_expert_ids_host.data(), 0,
-                                            sizeof(int32_t) * hash_expert_ids_host.size());
-                }
-
-                const auto ffn_compute_t0 = Ds4TimingClock::now();
-                auto status = ggml_backend_graph_compute(backend, cached.sg.gf);
-                if (telemetry) telemetry->ffn_compute_us += ds4_elapsed_us(ffn_compute_t0, Ds4TimingClock::now());
-                if (status != GGML_STATUS_SUCCESS) {
-                    std::fprintf(stderr, "[deepseek4] cached ffn compute failed layer %d\n", il);
-                    return false;
-                }
-            } else {
+            auto & cached = cached_decode_ffn_graphs[(size_t)il];
+            if (!cached.valid() ||
+                cached.owner_ctx != w.ctx ||
+                cached.backend != backend ||
+                cached.layer_idx != il ||
+                cached.n_tokens != n_tokens ||
+                cached.hash_routed != hash_routed) {
                 const auto ffn_build_t0 = Ds4TimingClock::now();
-                const size_t ctx_size = 48 * 1024 * 1024;
-                ggml_init_params params{};
-                params.mem_size = ctx_size;
-                params.mem_buffer = nullptr;
-                params.no_alloc = true;
-                ggml_context * ctx = ggml_init(params);
-                if (!ctx) return false;
-
-                ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
-                ggml_set_input(inp);
-                ggml_cgraph * gf = ggml_new_graph_custom(ctx, 2048, false);
-
-                ggml_tensor * ffn_normed = build_rms_norm(ctx, inp, L.ffn_norm, w.rms_eps);
-                ggml_tensor * hash_ids_inp = nullptr;
-                if (hash_routed) {
-                    hash_ids_inp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, w.n_expert_used, n_tokens);
-                    ggml_set_input(hash_ids_inp);
-                }
-
-                if (hash_ids_inp) {
-                    ggml_tensor * shared_out = build_shared_ffn(ctx, ffn_normed, w, L);
-                    ggml_tensor * logits = ggml_mul_mat(ctx, L.ffn_gate_inp, ffn_normed);
-                    ggml_tensor * probs = ggml_sqrt(ctx, ggml_softplus(ctx, logits));
-
-                    const int n_used = w.n_expert_used;
-                    const int n_ff_exp = w.n_ff_exp;
-                    ggml_tensor * cur_3d = ggml_reshape_3d(ctx, ffn_normed, n_embd, 1, n_tokens);
-                    ggml_tensor * gate_e = ggml_mul_mat_id(ctx, L.ffn_gate_exps, cur_3d, hash_ids_inp);
-                    ggml_tensor * up_e = ggml_mul_mat_id(ctx, L.ffn_up_exps, cur_3d, hash_ids_inp);
-                    gate_e = ggml_reshape_3d(ctx, gate_e, n_ff_exp, n_used, n_tokens);
-                    up_e = ggml_reshape_3d(ctx, up_e, n_ff_exp, n_used, n_tokens);
-                    ggml_tensor * mid_e = build_clamped_swiglu(ctx, gate_e, up_e, w.swiglu_clamp_exp);
-                    ggml_tensor * down_e = ggml_mul_mat_id(ctx, L.ffn_down_exps, mid_e, hash_ids_inp);
-                    down_e = ggml_reshape_3d(ctx, down_e, n_embd, n_used, n_tokens);
-
-                    ggml_tensor * probs_3d = ggml_reshape_3d(ctx, probs, 1, w.n_expert, n_tokens);
-                    ggml_tensor * weights = ggml_get_rows(ctx, probs_3d, hash_ids_inp);
-                    weights = ggml_reshape_2d(ctx, weights, n_used, n_tokens);
-                    ggml_tensor * w_sum = ggml_sum_rows(ctx, weights);
-                    w_sum = ggml_clamp(ctx, w_sum, 6.103515625e-5f, INFINITY);
-                    weights = ggml_div(ctx, weights, w_sum);
-                    if (w.expert_weight_scale != 1.0f) {
-                        weights = ggml_scale(ctx, weights, w.expert_weight_scale);
-                    }
-
-                    ggml_tensor * weights_3d = ggml_reshape_3d(ctx, weights, 1, n_used, n_tokens);
-                    ggml_tensor * routed_out = ggml_mul(ctx, down_e, weights_3d);
-                    routed_out = ggml_cont(ctx, ggml_permute(ctx, routed_out, 1, 0, 2, 3));
-                    routed_out = ggml_sum_rows(ctx, routed_out);
-                    routed_out = ggml_reshape_2d(ctx, routed_out, n_embd, n_tokens);
-
-                    ffn_out = ggml_add(ctx, shared_out, routed_out);
-                } else {
-                    ffn_out = build_moe_ffn(ctx, ffn_normed, w, L, il, n_tokens);
-                }
-
-                ggml_set_output(ffn_out);
-                ggml_build_forward_expand(gf, ffn_out);
-
-                auto & ffn_alloc = cached_dynamic_ffn_allocs[(size_t)il];
-                if (!ffn_alloc.valid() || ffn_alloc.owner_ctx != w.ctx || ffn_alloc.backend != backend) {
-                    ffn_alloc.free();
-                    ffn_alloc.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-                    ffn_alloc.owner_ctx = w.ctx;
-                    ffn_alloc.backend = backend;
-                }
-                if (!ffn_alloc.alloc || !ggml_gallocr_alloc_graph(ffn_alloc.alloc, gf)) {
-                    std::fprintf(stderr, "[deepseek4] ffn graph alloc failed layer %d\n", il);
-                    ggml_free(ctx);
+                if (!build_cached_decode_ffn_graph(cached, backend, w, L, il, n_tokens, hash_routed)) {
+                    std::fprintf(stderr, "[deepseek4] cached ffn graph alloc failed layer %d\n", il);
                     return false;
                 }
                 if (telemetry) telemetry->ffn_build_us += ds4_elapsed_us(ffn_build_t0, Ds4TimingClock::now());
-                ggml_backend_tensor_set(inp, ffn_working.data(), 0, sizeof(float) * ffn_working.size());
-                if (hash_ids_inp) {
-                    ggml_backend_tensor_set(hash_ids_inp, hash_expert_ids_host.data(), 0,
-                                            sizeof(int32_t) * hash_expert_ids_host.size());
-                }
-
-                const auto ffn_compute_t0 = Ds4TimingClock::now();
-                auto status = ggml_backend_graph_compute(backend, gf);
-                if (telemetry) telemetry->ffn_compute_us += ds4_elapsed_us(ffn_compute_t0, Ds4TimingClock::now());
-                if (status != GGML_STATUS_SUCCESS) {
-                    std::fprintf(stderr, "[deepseek4] ffn compute failed layer %d\n", il);
-                    ggml_free(ctx);
-                    return false;
-                }
-
-                const auto ffn_read_t0 = Ds4TimingClock::now();
-                ffn_out_host.resize((size_t)n_embd * (size_t)n_tokens);
-                ggml_backend_tensor_get(ffn_out, ffn_out_host.data(), 0, sizeof(float) * ffn_out_host.size());
-                if (telemetry) telemetry->ffn_read_us += ds4_elapsed_us(ffn_read_t0, Ds4TimingClock::now());
-                ggml_free(ctx);
-                ffn_out = nullptr;
             }
 
-            if (reuse_decode_graphs) {
-                ffn_out_host.resize((size_t)n_embd * (size_t)n_tokens);
-                const auto ffn_read_t0 = Ds4TimingClock::now();
-                ggml_backend_tensor_get(ffn_out, ffn_out_host.data(), 0, sizeof(float) * ffn_out_host.size());
-                if (telemetry) telemetry->ffn_read_us += ds4_elapsed_us(ffn_read_t0, Ds4TimingClock::now());
+            ggml_tensor * ffn_out = cached.sg.hidden_states;
+            ggml_backend_tensor_set(cached.sg.inp_embed, ffn_working.data(), 0,
+                                    sizeof(float) * ffn_working.size());
+            if (cached.hash_ids) {
+                ggml_backend_tensor_set(cached.hash_ids, hash_expert_ids_host.data(), 0,
+                                        sizeof(int32_t) * hash_expert_ids_host.size());
             }
+
+            const auto ffn_compute_t0 = Ds4TimingClock::now();
+            auto status = ggml_backend_graph_compute(backend, cached.sg.gf);
+            if (telemetry) telemetry->ffn_compute_us += ds4_elapsed_us(ffn_compute_t0, Ds4TimingClock::now());
+            if (status != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "[deepseek4] cached ffn compute failed layer %d\n", il);
+                return false;
+            }
+
+            ffn_out_host.resize((size_t)n_embd * (size_t)n_tokens);
+            const auto ffn_read_t0 = Ds4TimingClock::now();
+            ggml_backend_tensor_get(ffn_out, ffn_out_host.data(), 0, sizeof(float) * ffn_out_host.size());
+            if (telemetry) telemetry->ffn_read_us += ds4_elapsed_us(ffn_read_t0, Ds4TimingClock::now());
 
             // ── HC post (FFN) ───────────────────────────────────────
             const auto hc_post_ffn_t0 = Ds4TimingClock::now();
