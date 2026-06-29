@@ -563,7 +563,7 @@ static void build_compressor_step(
     }
 
     if (comp_rows_inp) {
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx, comp_cache, pooled_f16, comp_rows_inp));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, comp_cache, pooled, comp_rows_inp));
     } else {
         ggml_tensor * comp_slot = ggml_view_2d(
             ctx, comp_cache, head_dim, 1, comp_cache->nb[1],
@@ -808,9 +808,8 @@ static ggml_tensor * build_mla_attention(
     // ── Store ALL KV rows in the raw SWA ring ─────────────────────
     // For decode (n_tokens=1): write single row. For prefill: write all rows.
     if (cached_inputs && cached_inputs->raw_kv_rows) {
-        ggml_tensor * kv_f16 = ggml_cast(ctx, kv, GGML_TYPE_F16);
-        kv_f16 = ggml_is_contiguous(kv_f16) ? kv_f16 : ggml_cont(ctx, kv_f16);
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx, lc.raw_kv, kv_f16, cached_inputs->raw_kv_rows));
+        ggml_tensor * kv_f32 = ggml_is_contiguous(kv) ? kv : ggml_cont(ctx, kv);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, lc.raw_kv, kv_f32, cached_inputs->raw_kv_rows));
     } else {
         for (int ti = 0; ti < n_tokens; ti++) {
             const int pos_ti = kv_start + ti;
