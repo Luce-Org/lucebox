@@ -2512,7 +2512,8 @@ bool deepseek4_step_layer_range(
                 std::vector<DeepSeek4I32InputBinding> i32_inputs;
                 std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
                 std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
-                gf = ggml_new_graph_custom(ctx, 2048, false);
+                const size_t graph_size = n_tokens > 1 ? 32768 : 2048;
+                gf = ggml_new_graph_custom(ctx, graph_size, false);
 
                 ggml_tensor * normed = build_rms_norm(ctx, inp, L.attn_norm, w.rms_eps);
                 attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
