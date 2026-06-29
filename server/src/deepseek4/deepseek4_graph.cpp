@@ -71,6 +71,11 @@ struct DeepSeek4I32ArrayBinding {
     std::vector<int32_t>   values;
 };
 
+struct DeepSeek4I64ArrayBinding {
+    ggml_tensor *          tensor = nullptr;
+    std::vector<int64_t>   values;
+};
+
 static ggml_tensor * build_rms_norm(ggml_context * ctx, ggml_tensor * x,
                                      ggml_tensor * weight, float eps);
 static ggml_tensor * build_clamped_swiglu(ggml_context * ctx,
@@ -130,6 +135,53 @@ struct DeepSeek4CachedDecodeOutputGraph {
         owner_ctx = nullptr;
         backend = nullptr;
         n_tokens = 0;
+    }
+};
+
+struct DeepSeek4AttentionGraphInputs {
+    ggml_tensor * rope_pos = nullptr;
+    ggml_tensor * neg_pos = nullptr;
+    ggml_tensor * raw_kv_rows = nullptr;
+    ggml_tensor * attn_state_rows = nullptr;
+    ggml_tensor * attn_comp_rows = nullptr;
+    ggml_tensor * attn_comp_pos = nullptr;
+    ggml_tensor * index_state_rows = nullptr;
+    ggml_tensor * index_comp_rows = nullptr;
+    ggml_tensor * index_comp_pos = nullptr;
+};
+
+struct DeepSeek4CachedDecodeAttnGraph {
+    const ggml_context * owner_ctx = nullptr;
+    ggml_backend_t backend = nullptr;
+    int layer_idx = -1;
+    int n_tokens = 0;
+    int n_raw = 0;
+    int n_comp_attn = 0;
+    int n_index_comp = 0;
+    int pos_mod = -1;
+    StepGraph sg;
+    DeepSeek4AttentionGraphInputs inputs;
+
+    bool valid() const {
+        return owner_ctx && backend && layer_idx >= 0 && n_tokens == 1 &&
+               n_raw > 0 && n_comp_attn >= 0 && n_index_comp >= 0 && pos_mod >= 0 &&
+               sg.ctx && sg.gf && sg.alloc && sg.inp_embed && sg.hidden_states &&
+               inputs.rope_pos && inputs.neg_pos && inputs.raw_kv_rows &&
+               inputs.attn_state_rows && inputs.attn_comp_rows && inputs.attn_comp_pos &&
+               inputs.index_state_rows && inputs.index_comp_rows && inputs.index_comp_pos;
+    }
+
+    void free() {
+        step_graph_destroy(sg);
+        inputs = {};
+        owner_ctx = nullptr;
+        backend = nullptr;
+        layer_idx = -1;
+        n_tokens = 0;
+        n_raw = 0;
+        n_comp_attn = 0;
+        n_index_comp = 0;
+        pos_mod = -1;
     }
 };
 
@@ -385,6 +437,10 @@ static void build_compressor_step(
         float rope_yarn_beta_fast,
         float rope_yarn_beta_slow,
         int rope_orig_ctx,
+        ggml_tensor * state_rows_inp,
+        ggml_tensor * comp_rows_inp,
+        ggml_tensor * comp_pos_inp,
+        std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs,
         std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs) {
     if (!gf || !cur_last || !ape || !kv_proj || !gate_proj || !norm_weight ||
         !state.state_kv || !state.state_score || !comp_cache || ratio <= 0) {
@@ -407,14 +463,19 @@ static void build_compressor_step(
     ape_col = ggml_cast(ctx, ape_col, GGML_TYPE_F32);
     sc_cur = ggml_add(ctx, sc_cur, ape_col);
 
-    ggml_tensor * kv_slot = ggml_view_2d(
-        ctx, state.state_kv, comp_width, 1, state.state_kv->nb[1],
-        (size_t)row * state.state_kv->nb[1]);
-    ggml_tensor * sc_slot = ggml_view_2d(
-        ctx, state.state_score, comp_width, 1, state.state_score->nb[1],
-        (size_t)row * state.state_score->nb[1]);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, kv_cur, kv_slot));
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, sc_cur, sc_slot));
+    if (state_rows_inp) {
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, state.state_kv, kv_cur, state_rows_inp));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, state.state_score, sc_cur, state_rows_inp));
+    } else {
+        ggml_tensor * kv_slot = ggml_view_2d(
+            ctx, state.state_kv, comp_width, 1, state.state_kv->nb[1],
+            (size_t)row * state.state_kv->nb[1]);
+        ggml_tensor * sc_slot = ggml_view_2d(
+            ctx, state.state_score, comp_width, 1, state.state_score->nb[1],
+            (size_t)row * state.state_score->nb[1]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, kv_cur, kv_slot));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, sc_cur, sc_slot));
+    }
 
     if (((token_pos + 1) % ratio) != 0) {
         return;
@@ -470,9 +531,12 @@ static void build_compressor_step(
     pooled = build_rms_norm(ctx, pooled, norm_weight, rms_eps);
     pooled = ggml_reshape_2d(ctx, pooled, head_dim, 1);
 
-    ggml_tensor * comp_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-    ggml_set_input(comp_pos);
-    i32_array_inputs.push_back({comp_pos, {token_pos + 1 - ratio}});
+    ggml_tensor * comp_pos = comp_pos_inp;
+    if (!comp_pos) {
+        comp_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_input(comp_pos);
+        i32_array_inputs.push_back({comp_pos, {token_pos + 1 - ratio}});
+    }
     const float rope_scale = rope_scale_factor > 0.0f ? (1.0f / rope_scale_factor) : 1.0f;
     float rope_attn = 1.0f;
     if (rope_scale > 0.0f) {
@@ -488,10 +552,14 @@ static void build_compressor_step(
         return;
     }
 
-    ggml_tensor * comp_slot = ggml_view_2d(
-        ctx, comp_cache, head_dim, 1, comp_cache->nb[1],
-        (size_t)comp_row * comp_cache->nb[1]);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, pooled_f16, comp_slot));
+    if (comp_rows_inp) {
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, comp_cache, pooled_f16, comp_rows_inp));
+    } else {
+        ggml_tensor * comp_slot = ggml_view_2d(
+            ctx, comp_cache, head_dim, 1, comp_cache->nb[1],
+            (size_t)comp_row * comp_cache->nb[1]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, pooled_f16, comp_slot));
+    }
 
     if (ratio == 4) {
         for (int r = 0; r < ratio; ++r) {
@@ -529,6 +597,10 @@ static void build_indexer_compressor_step(
         const DeepSeek4Layer & L,
         DeepSeek4LayerCache & lc,
         int token_pos,
+        ggml_tensor * state_rows_inp,
+        ggml_tensor * comp_rows_inp,
+        ggml_tensor * comp_pos_inp,
+        std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs,
         std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs) {
     build_compressor_step(ctx, gf, cur_last,
                           L.indexer_compressor_ape,
@@ -547,6 +619,10 @@ static void build_indexer_compressor_step(
                           w.rope_yarn_beta_fast,
                           w.rope_yarn_beta_slow,
                           (int)w.rope_orig_ctx,
+                          state_rows_inp,
+                          comp_rows_inp,
+                          comp_pos_inp,
+                          i64_array_inputs,
                           i32_array_inputs);
 }
 
@@ -654,8 +730,10 @@ static ggml_tensor * build_mla_attention(
         int layer_idx,
         int kv_start,
         int n_tokens,
+        const DeepSeek4AttentionGraphInputs * cached_inputs,
         std::vector<DeepSeek4I32InputBinding> & i32_inputs,
-        std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs) {
+        std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs,
+        std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs) {
 
     const int n_embd    = w.n_embd;
     const int head_dim  = w.head_dim;
@@ -696,9 +774,10 @@ static ggml_tensor * build_mla_attention(
     }
 
     // Position tensor for this token batch
-    ggml_tensor * rope_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
-    ggml_set_input(rope_pos);
-    {
+    ggml_tensor * rope_pos = cached_inputs ? cached_inputs->rope_pos : nullptr;
+    if (!rope_pos) {
+        rope_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(rope_pos);
         std::vector<int32_t> pos_vals(n_tokens);
         for (int i = 0; i < n_tokens; i++) pos_vals[i] = kv_start + i;
         i32_array_inputs.push_back({rope_pos, std::move(pos_vals)});
@@ -716,14 +795,20 @@ static ggml_tensor * build_mla_attention(
 
     // ── Store ALL KV rows in the raw SWA ring ─────────────────────
     // For decode (n_tokens=1): write single row. For prefill: write all rows.
-    for (int ti = 0; ti < n_tokens; ti++) {
-        const int pos_ti = kv_start + ti;
-        ggml_tensor * kv_row = ggml_view_2d(
-            ctx, kv, head_dim, 1, kv->nb[1], (size_t)ti * kv->nb[1]);
-        ggml_tensor * kv_slot = ggml_view_2d(
-            ctx, lc.raw_kv, head_dim, 1, lc.raw_kv->nb[1],
-            (size_t)(pos_ti % w.n_swa) * lc.raw_kv->nb[1]);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_cast(ctx, kv_row, GGML_TYPE_F16), kv_slot));
+    if (cached_inputs && cached_inputs->raw_kv_rows) {
+        ggml_tensor * kv_f16 = ggml_cast(ctx, kv, GGML_TYPE_F16);
+        kv_f16 = ggml_is_contiguous(kv_f16) ? kv_f16 : ggml_cont(ctx, kv_f16);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, lc.raw_kv, kv_f16, cached_inputs->raw_kv_rows));
+    } else {
+        for (int ti = 0; ti < n_tokens; ti++) {
+            const int pos_ti = kv_start + ti;
+            ggml_tensor * kv_row = ggml_view_2d(
+                ctx, kv, head_dim, 1, kv->nb[1], (size_t)ti * kv->nb[1]);
+            ggml_tensor * kv_slot = ggml_view_2d(
+                ctx, lc.raw_kv, head_dim, 1, lc.raw_kv->nb[1],
+                (size_t)(pos_ti % w.n_swa) * lc.raw_kv->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_cast(ctx, kv_row, GGML_TYPE_F16), kv_slot));
+        }
     }
     const int token_pos = kv_start + n_tokens - 1;
 
@@ -750,11 +835,20 @@ static ggml_tensor * build_mla_attention(
                               w.rope_yarn_beta_fast,
                               w.rope_yarn_beta_slow,
                               (int)w.rope_orig_ctx,
+                              cached_inputs ? cached_inputs->attn_state_rows : nullptr,
+                              cached_inputs ? cached_inputs->attn_comp_rows : nullptr,
+                              cached_inputs ? cached_inputs->attn_comp_pos : nullptr,
+                              i64_array_inputs,
                               i32_array_inputs);
     }
 
     if (ratio == 4 && L.indexer_compressor_kv) {
-        build_indexer_compressor_step(ctx, gf, cur_last, w, L, lc, token_pos, i32_array_inputs);
+        build_indexer_compressor_step(ctx, gf, cur_last, w, L, lc, token_pos,
+                                      cached_inputs ? cached_inputs->index_state_rows : nullptr,
+                                      cached_inputs ? cached_inputs->index_comp_rows : nullptr,
+                                      cached_inputs ? cached_inputs->index_comp_pos : nullptr,
+                                      i64_array_inputs,
+                                      i32_array_inputs);
         (void)build_indexer_score(ctx, qr_last, cur_last, w, L, lc, token_pos, i32_inputs);
     }
 
@@ -831,9 +925,10 @@ static ggml_tensor * build_mla_attention(
     context = ggml_reshape_3d(ctx, context, head_dim, n_head, n_tokens);
 
     // ── Inverse tail RoPE on attention output ───────────────────────
-    ggml_tensor * neg_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
-    ggml_set_input(neg_pos);
-    {
+    ggml_tensor * neg_pos = cached_inputs ? cached_inputs->neg_pos : nullptr;
+    if (!neg_pos) {
+        neg_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(neg_pos);
         std::vector<int32_t> neg_vals(n_tokens);
         for (int i = 0; i < n_tokens; i++) neg_vals[i] = -(kv_start + i);
         i32_array_inputs.push_back({neg_pos, std::move(neg_vals)});
@@ -867,6 +962,84 @@ static ggml_tensor * build_mla_attention(
     ggml_tensor * out = ggml_mul_mat(ctx, L.attn_output_b, attn_low);
 
     return out;
+}
+
+static bool build_cached_decode_attn_graph(
+        DeepSeek4CachedDecodeAttnGraph & out,
+        ggml_backend_t backend,
+        const DeepSeek4Weights & w,
+        const DeepSeek4Layer & L,
+        DeepSeek4LayerCache & lc,
+        int layer_idx,
+        int kv_start) {
+    out.free();
+
+    const size_t ctx_size = 48 * 1024 * 1024;
+    ggml_init_params params{};
+    params.mem_size = ctx_size;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    out.sg.ctx = ggml_init(params);
+    if (!out.sg.ctx) {
+        return false;
+    }
+
+    const int ratio = w.compress_ratios[layer_idx];
+    const int token_pos = kv_start;
+    out.n_tokens = 1;
+    out.n_raw = std::min(kv_start + 1, w.n_swa);
+    out.n_comp_attn = (ratio > 0) ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos) : 0;
+    out.n_index_comp = (ratio == 4) ? ds4_comp_rows_used(lc.index_comp_kv, lc.n_index_comp, 4, token_pos) : 0;
+    out.pos_mod = token_pos % ratio;
+
+    out.sg.inp_embed = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_F32, w.n_embd, 1);
+    ggml_set_input(out.sg.inp_embed);
+    out.sg.gf = ggml_new_graph_custom(out.sg.ctx, 2048, false);
+
+    out.inputs.rope_pos = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
+    out.inputs.neg_pos = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
+    out.inputs.attn_comp_pos = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
+    out.inputs.index_comp_pos = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
+    ggml_set_input(out.inputs.rope_pos);
+    ggml_set_input(out.inputs.neg_pos);
+    ggml_set_input(out.inputs.attn_comp_pos);
+    ggml_set_input(out.inputs.index_comp_pos);
+
+    out.inputs.raw_kv_rows = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_I64, 1, 1);
+    out.inputs.attn_state_rows = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_I64, 1, 1);
+    out.inputs.attn_comp_rows = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_I64, 1, 1);
+    out.inputs.index_state_rows = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_I64, 1, 1);
+    out.inputs.index_comp_rows = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_I64, 1, 1);
+    ggml_set_input(out.inputs.raw_kv_rows);
+    ggml_set_input(out.inputs.attn_state_rows);
+    ggml_set_input(out.inputs.attn_comp_rows);
+    ggml_set_input(out.inputs.index_state_rows);
+    ggml_set_input(out.inputs.index_comp_rows);
+
+    std::vector<DeepSeek4I32InputBinding> i32_inputs;
+    std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
+    std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
+    ggml_tensor * normed = build_rms_norm(out.sg.ctx, out.sg.inp_embed, L.attn_norm, w.rms_eps);
+    out.sg.hidden_states = build_mla_attention(out.sg.ctx, out.sg.gf, normed, w, L, lc, layer_idx,
+                                               kv_start, 1, &out.inputs,
+                                               i32_inputs, i32_array_inputs, i64_array_inputs);
+    if (!out.sg.hidden_states) {
+        out.free();
+        return false;
+    }
+    ggml_set_output(out.sg.hidden_states);
+    ggml_build_forward_expand(out.sg.gf, out.sg.hidden_states);
+
+    out.sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(out.sg.alloc, out.sg.gf)) {
+        out.free();
+        return false;
+    }
+
+    out.owner_ctx = w.ctx;
+    out.backend = backend;
+    out.layer_idx = layer_idx;
+    return true;
 }
 
 // ─── MoE FFN Block ──────────────────────────────────────────────────────
@@ -1601,12 +1774,14 @@ static bool deepseek4_step_hybrid(
         ggml_set_input(inp);
         std::vector<DeepSeek4I32InputBinding> i32_inputs;
         std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
+        std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
         ggml_cgraph * gf = ggml_new_graph(ctx);
 
         ggml_tensor * normed = build_rms_norm(ctx, inp, L.attn_norm, w.rms_eps);
         ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
-                                                     kv_start, n_tokens, i32_inputs,
-                                                     i32_array_inputs);
+                                                     kv_start, n_tokens, nullptr,
+                                                     i32_inputs, i32_array_inputs,
+                                                     i64_array_inputs);
         // Output just attn_out (HC post handles the residual mixing)
         ggml_build_forward_expand(gf, attn_out);
         ggml_gallocr_t attn_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -1625,6 +1800,10 @@ static bool deepseek4_step_hybrid(
         for (const DeepSeek4I32ArrayBinding & binding : i32_array_inputs) {
             ggml_backend_tensor_set(binding.tensor, binding.values.data(), 0,
                                     sizeof(int32_t) * binding.values.size());
+        }
+        for (const DeepSeek4I64ArrayBinding & binding : i64_array_inputs) {
+            ggml_backend_tensor_set(binding.tensor, binding.values.data(), 0,
+                                    sizeof(int64_t) * binding.values.size());
         }
         const auto attn_compute_t0 = Ds4TimingClock::now();
         bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
@@ -2025,6 +2204,7 @@ bool deepseek4_step(
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 32768, false);
     std::vector<DeepSeek4I32InputBinding> i32_inputs;
     std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
+    std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
 
     // Layer loop
     for (int il = 0; il < n_layer; il++) {
@@ -2041,7 +2221,8 @@ bool deepseek4_step(
         // ── MLA attention ───────────────────────────────────────────
         ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc,
                                                       il, kv_start, n_tokens,
-                                                      i32_inputs, i32_array_inputs);
+                                                      nullptr, i32_inputs, i32_array_inputs,
+                                                      i64_array_inputs);
 
         // ── Residual ────────────────────────────────────────────────
         cur = ggml_add(ctx, cur, attn_out);
@@ -2090,6 +2271,10 @@ bool deepseek4_step(
     for (const DeepSeek4I32ArrayBinding & binding : i32_array_inputs) {
         ggml_backend_tensor_set(binding.tensor, binding.values.data(), 0,
                                 sizeof(int32_t) * binding.values.size());
+    }
+    for (const DeepSeek4I64ArrayBinding & binding : i64_array_inputs) {
+        ggml_backend_tensor_set(binding.tensor, binding.values.data(), 0,
+                                sizeof(int64_t) * binding.values.size());
     }
 
     // Compute
@@ -2176,6 +2361,7 @@ bool deepseek4_step_layer_range(
     static std::vector<HashRoutingTableCpu> hash_routing_tables_range;
     static std::vector<DeepSeek4CachedLayerAlloc> cached_attn_allocs;
     static std::vector<DeepSeek4CachedLayerAlloc> cached_dynamic_ffn_allocs;
+    static std::vector<DeepSeek4CachedDecodeAttnGraph> cached_decode_attn_graphs;
     static std::vector<DeepSeek4CachedDecodeFfnGraph> cached_decode_ffn_graphs;
     static DeepSeek4CachedDecodeOutputGraph cached_decode_output_graph;
     static DeepSeek4CachedLayerAlloc cached_dynamic_output_alloc;
@@ -2191,6 +2377,10 @@ bool deepseek4_step_layer_range(
             alloc.free();
         }
         cached_dynamic_ffn_allocs.assign((size_t)w.n_layer, {});
+        for (auto & g : cached_decode_attn_graphs) {
+            g.free();
+        }
+        cached_decode_attn_graphs.assign((size_t)w.n_layer, {});
         for (auto & g : cached_decode_ffn_graphs) {
             g.free();
         }
@@ -2232,51 +2422,106 @@ bool deepseek4_step_layer_range(
 
         // ── Build & run attention graph ─────────────────────────────
         {
-            const auto attn_build_t0 = Ds4TimingClock::now();
-            const size_t ctx_size = 48 * 1024 * 1024;
-            ggml_init_params params{};
-            params.mem_size = ctx_size;
-            params.mem_buffer = nullptr;
-            params.no_alloc = true;
-            ggml_context * ctx = ggml_init(params);
-            if (!ctx) return false;
+            const int ratio = w.compress_ratios[il];
+            const int token_pos = kv_start + n_tokens - 1;
+            const bool reuse_decode_attn = n_tokens == 1 && ratio == 4;
+            ggml_tensor * attn_out = nullptr;
+            ggml_cgraph * gf = nullptr;
+            ggml_context * ctx = nullptr;
+            DeepSeek4CachedDecodeAttnGraph * cached_attn = nullptr;
 
-            ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
-            ggml_set_input(inp);
-            std::vector<DeepSeek4I32InputBinding> i32_inputs;
-            std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
-            ggml_cgraph * gf = ggml_new_graph_custom(ctx, 2048, false);
+            if (reuse_decode_attn) {
+                const int n_raw = std::min(kv_start + 1, w.n_swa);
+                const int n_comp_attn = ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos);
+                const int n_index_comp = ds4_comp_rows_used(lc.index_comp_kv, lc.n_index_comp, 4, token_pos);
+                const int pos_mod = token_pos % ratio;
+                auto & candidate = cached_decode_attn_graphs[(size_t)il];
+                if (!candidate.valid() ||
+                    candidate.owner_ctx != w.ctx ||
+                    candidate.backend != backend ||
+                    candidate.layer_idx != il ||
+                    candidate.n_raw != n_raw ||
+                    candidate.n_comp_attn != n_comp_attn ||
+                    candidate.n_index_comp != n_index_comp ||
+                    candidate.pos_mod != pos_mod) {
+                    const auto attn_build_t0 = Ds4TimingClock::now();
+                    if (!build_cached_decode_attn_graph(candidate, backend, w, L, lc, il, kv_start)) {
+                        std::fprintf(stderr, "[deepseek4] cached attn graph alloc failed layer %d\n", il);
+                        return false;
+                    }
+                    if (telemetry) telemetry->attn_build_us += ds4_elapsed_us(attn_build_t0, Ds4TimingClock::now());
+                }
+                cached_attn = &candidate;
+                gf = cached_attn->sg.gf;
+                attn_out = cached_attn->sg.hidden_states;
 
-            ggml_tensor * normed = build_rms_norm(ctx, inp, L.attn_norm, w.rms_eps);
-            ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
-                                                         kv_start, n_tokens, i32_inputs,
-                                                         i32_array_inputs);
-            ggml_set_output(attn_out);
-            ggml_build_forward_expand(gf, attn_out);
+                const int64_t raw_row = kv_start % w.n_swa;
+                const int64_t state_row = ratio + pos_mod;
+                const int64_t comp_row = token_pos / ratio;
+                const int32_t rope_pos = kv_start;
+                const int32_t neg_pos = -kv_start;
+                const int32_t comp_pos = token_pos + 1 - ratio;
+                ggml_backend_tensor_set(cached_attn->sg.inp_embed, cur.data(), 0, sizeof(float) * cur.size());
+                ggml_backend_tensor_set(cached_attn->inputs.rope_pos, &rope_pos, 0, sizeof(rope_pos));
+                ggml_backend_tensor_set(cached_attn->inputs.neg_pos, &neg_pos, 0, sizeof(neg_pos));
+                ggml_backend_tensor_set(cached_attn->inputs.raw_kv_rows, &raw_row, 0, sizeof(raw_row));
+                ggml_backend_tensor_set(cached_attn->inputs.attn_state_rows, &state_row, 0, sizeof(state_row));
+                ggml_backend_tensor_set(cached_attn->inputs.attn_comp_rows, &comp_row, 0, sizeof(comp_row));
+                ggml_backend_tensor_set(cached_attn->inputs.attn_comp_pos, &comp_pos, 0, sizeof(comp_pos));
+                ggml_backend_tensor_set(cached_attn->inputs.index_state_rows, &state_row, 0, sizeof(state_row));
+                ggml_backend_tensor_set(cached_attn->inputs.index_comp_rows, &comp_row, 0, sizeof(comp_row));
+                ggml_backend_tensor_set(cached_attn->inputs.index_comp_pos, &comp_pos, 0, sizeof(comp_pos));
+            } else {
+                const auto attn_build_t0 = Ds4TimingClock::now();
+                const size_t ctx_size = 48 * 1024 * 1024;
+                ggml_init_params params{};
+                params.mem_size = ctx_size;
+                params.mem_buffer = nullptr;
+                params.no_alloc = true;
+                ctx = ggml_init(params);
+                if (!ctx) return false;
 
-            auto & attn_alloc = cached_attn_allocs[(size_t)il];
-            if (!attn_alloc.valid() || attn_alloc.owner_ctx != w.ctx || attn_alloc.backend != backend) {
-                attn_alloc.free();
-                attn_alloc.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-                attn_alloc.owner_ctx = w.ctx;
-                attn_alloc.backend = backend;
+                ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+                ggml_set_input(inp);
+                std::vector<DeepSeek4I32InputBinding> i32_inputs;
+                std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
+                std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
+                gf = ggml_new_graph_custom(ctx, 2048, false);
+
+                ggml_tensor * normed = build_rms_norm(ctx, inp, L.attn_norm, w.rms_eps);
+                attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
+                                               kv_start, n_tokens, nullptr,
+                                               i32_inputs, i32_array_inputs,
+                                               i64_array_inputs);
+                ggml_set_output(attn_out);
+                ggml_build_forward_expand(gf, attn_out);
+
+                auto & attn_alloc = cached_attn_allocs[(size_t)il];
+                if (!attn_alloc.valid() || attn_alloc.owner_ctx != w.ctx || attn_alloc.backend != backend) {
+                    attn_alloc.free();
+                    attn_alloc.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+                    attn_alloc.owner_ctx = w.ctx;
+                    attn_alloc.backend = backend;
+                }
+                if (!attn_alloc.alloc || !ggml_gallocr_alloc_graph(attn_alloc.alloc, gf)) {
+                    std::fprintf(stderr, "[deepseek4] attn graph alloc failed layer %d\n", il);
+                    ggml_free(ctx);
+                    return false;
+                }
+                if (telemetry) telemetry->attn_build_us += ds4_elapsed_us(attn_build_t0, Ds4TimingClock::now());
+                ggml_backend_tensor_set(inp, cur.data(), 0, sizeof(float) * cur.size());
+                for (const auto & b : i32_inputs)
+                    ggml_backend_tensor_set(b.tensor, &b.value, 0, sizeof(b.value));
+                for (const auto & b : i32_array_inputs)
+                    ggml_backend_tensor_set(b.tensor, b.values.data(), 0, sizeof(int32_t) * b.values.size());
+                for (const auto & b : i64_array_inputs)
+                    ggml_backend_tensor_set(b.tensor, b.values.data(), 0, sizeof(int64_t) * b.values.size());
             }
-            if (!attn_alloc.alloc || !ggml_gallocr_alloc_graph(attn_alloc.alloc, gf)) {
-                std::fprintf(stderr, "[deepseek4] attn graph alloc failed layer %d\n", il);
-                ggml_free(ctx);
-                return false;
-            }
-            if (telemetry) telemetry->attn_build_us += ds4_elapsed_us(attn_build_t0, Ds4TimingClock::now());
-            ggml_backend_tensor_set(inp, cur.data(), 0, sizeof(float) * cur.size());
-            for (const auto & b : i32_inputs)
-                ggml_backend_tensor_set(b.tensor, &b.value, 0, sizeof(b.value));
-            for (const auto & b : i32_array_inputs)
-                ggml_backend_tensor_set(b.tensor, b.values.data(), 0, sizeof(int32_t) * b.values.size());
 
             const auto attn_compute_t0 = Ds4TimingClock::now();
             if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "[deepseek4] attn compute failed layer %d\n", il);
-                ggml_free(ctx);
+                if (ctx) ggml_free(ctx);
                 return false;
             }
             if (telemetry) telemetry->attn_compute_us += ds4_elapsed_us(attn_compute_t0, Ds4TimingClock::now());
@@ -2284,7 +2529,7 @@ bool deepseek4_step_layer_range(
             const auto attn_read_t0 = Ds4TimingClock::now();
             ggml_backend_tensor_get(attn_out, attn_out_host.data(), 0, sizeof(float) * attn_out_host.size());
             if (telemetry) telemetry->attn_read_us += ds4_elapsed_us(attn_read_t0, Ds4TimingClock::now());
-            ggml_free(ctx);
+            if (ctx) ggml_free(ctx);
 
             // ── HC post (attention) ─────────────────────────────────
             const auto hc_post_attn_t0 = Ds4TimingClock::now();
