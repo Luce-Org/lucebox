@@ -22,11 +22,13 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace dflash::common {
@@ -42,6 +44,42 @@ static uint64_t ds4_elapsed_us(Ds4TimingClock::time_point start,
 static bool ds4_env_flag(const char * name) {
     const char * value = std::getenv(name);
     return value && value[0] && std::strcmp(value, "0") != 0;
+}
+
+template <typename Fn>
+static void ds4_parallel_for_tokens(int n_tokens, int min_parallel_tokens, Fn && fn) {
+    if (n_tokens <= min_parallel_tokens) {
+        fn(0, n_tokens);
+        return;
+    }
+
+    unsigned nth = std::thread::hardware_concurrency();
+    if (nth == 0) nth = 4;
+    if (nth > 8) nth = 8;
+    if ((int)nth <= 1) {
+        fn(0, n_tokens);
+        return;
+    }
+
+    const int chunk = std::max(1, (n_tokens + (int)nth - 1) / (int)nth);
+    std::atomic<int> next{0};
+    std::vector<std::thread> pool;
+    pool.reserve(nth);
+    for (unsigned i = 0; i < nth; ++i) {
+        pool.emplace_back([&]() {
+            for (;;) {
+                const int begin = next.fetch_add(chunk);
+                if (begin >= n_tokens) {
+                    break;
+                }
+                const int end = std::min(begin + chunk, n_tokens);
+                fn(begin, end);
+            }
+        });
+    }
+    for (auto & th : pool) {
+        th.join();
+    }
 }
 
 static void add_ffn_telemetry(DeepSeek4StepTelemetry * dst,
@@ -1627,24 +1665,26 @@ static void hc_pre_batch(std::vector<float> & working,
     post.resize((size_t)n_tokens * (size_t)n_hc);
     comb.resize((size_t)n_tokens * (size_t)n_hc * (size_t)n_hc);
 
-    for (int t = 0; t < n_tokens; ++t) {
-        const HcPreResult result = hc_pre_auto(hc_state + (size_t)t * hc_dim,
-                                               weights,
-                                               fn_tensor,
-                                               n_embd,
-                                               n_hc,
-                                               sinkhorn_iters,
-                                               hc_eps);
-        std::memcpy(working.data() + (size_t)t * n_embd,
-                    result.working.data(),
-                    (size_t)n_embd * sizeof(float));
-        std::memcpy(post.data() + (size_t)t * n_hc,
-                    result.post,
-                    (size_t)n_hc * sizeof(float));
-        std::memcpy(comb.data() + (size_t)t * n_hc * (size_t)n_hc,
-                    result.comb,
-                    (size_t)n_hc * (size_t)n_hc * sizeof(float));
-    }
+    ds4_parallel_for_tokens(n_tokens, 8, [&](int t0, int t1) {
+        for (int t = t0; t < t1; ++t) {
+            const HcPreResult result = hc_pre_auto(hc_state + (size_t)t * hc_dim,
+                                                   weights,
+                                                   fn_tensor,
+                                                   n_embd,
+                                                   n_hc,
+                                                   sinkhorn_iters,
+                                                   hc_eps);
+            std::memcpy(working.data() + (size_t)t * n_embd,
+                        result.working.data(),
+                        (size_t)n_embd * sizeof(float));
+            std::memcpy(post.data() + (size_t)t * n_hc,
+                        result.post,
+                        (size_t)n_hc * sizeof(float));
+            std::memcpy(comb.data() + (size_t)t * n_hc * (size_t)n_hc,
+                        result.comb,
+                        (size_t)n_hc * (size_t)n_hc * sizeof(float));
+        }
+    });
 }
 
 static void cpu_hc_post(float * out_hc, const float * block_out,
@@ -1671,15 +1711,17 @@ static void hc_post_batch(std::vector<float> & out_hc,
                           int n_hc) {
     const size_t hc_dim = (size_t)n_embd * (size_t)n_hc;
     out_hc.resize((size_t)n_tokens * hc_dim);
-    for (int t = 0; t < n_tokens; ++t) {
-        cpu_hc_post(out_hc.data() + (size_t)t * hc_dim,
-                    block_out + (size_t)t * n_embd,
-                    residual_hc + (size_t)t * hc_dim,
-                    post + (size_t)t * n_hc,
-                    comb + (size_t)t * n_hc * (size_t)n_hc,
-                    n_embd,
-                    n_hc);
-    }
+    ds4_parallel_for_tokens(n_tokens, 8, [&](int t0, int t1) {
+        for (int t = t0; t < t1; ++t) {
+            cpu_hc_post(out_hc.data() + (size_t)t * hc_dim,
+                        block_out + (size_t)t * n_embd,
+                        residual_hc + (size_t)t * hc_dim,
+                        post + (size_t)t * n_hc,
+                        comb + (size_t)t * n_hc * (size_t)n_hc,
+                        n_embd,
+                        n_hc);
+        }
+    });
 }
 
 static void load_hc_weights_cpu(HcWeightsCpu & dst, ggml_tensor * fn,
