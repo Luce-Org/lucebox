@@ -1838,6 +1838,40 @@ static void hc_post_batch(std::vector<float> & out_hc,
     });
 }
 
+static void hc_output_batch(std::vector<float> & final_embd,
+                            const float * hc_state,
+                            const HcWeightsCpu & weights,
+                            int n_tokens,
+                            int n_embd,
+                            int n_hc,
+                            float hc_eps) {
+    const size_t hc_dim = (size_t)n_embd * (size_t)n_hc;
+    final_embd.resize((size_t)n_tokens * (size_t)n_embd);
+    ds4_parallel_for_tokens(n_tokens, 8, [&](int t0, int t1) {
+        std::vector<float> flat(hc_dim);
+        std::vector<float> pre((size_t)n_hc);
+        std::vector<float> hc_weights((size_t)n_hc);
+        for (int t = t0; t < t1; ++t) {
+            const float * token_hc = hc_state + (size_t)t * hc_dim;
+            float * out = final_embd.data() + (size_t)t * n_embd;
+            cpu_rms_norm(flat.data(), token_hc, (int)hc_dim, hc_eps);
+            cpu_matvec_f16_serial(pre.data(), weights.fn_data.data(), flat.data(), n_hc, (int)hc_dim);
+            for (int i = 0; i < n_hc; ++i) {
+                const float z = pre[(size_t)i] * weights.scale_data[0] +
+                                weights.base_data[(size_t)i];
+                hc_weights[(size_t)i] = 1.0f / (1.0f + expf(-z)) + 1.0e-6f;
+            }
+            for (int d = 0; d < n_embd; ++d) {
+                float acc = 0.0f;
+                for (int h = 0; h < n_hc; ++h) {
+                    acc += hc_weights[(size_t)h] * token_hc[(size_t)h * n_embd + d];
+                }
+                out[(size_t)d] = acc;
+            }
+        }
+    });
+}
+
 static void load_hc_weights_cpu(HcWeightsCpu & dst, ggml_tensor * fn,
                                  ggml_tensor * scale, ggml_tensor * base) {
     if (!fn || !scale || !base || dst.loaded) return;
@@ -2909,27 +2943,14 @@ bool deepseek4_step_layer_range(
     if (is_last_shard && out_logits) {
         // Final HC pre for output
         const auto output_t0 = Ds4TimingClock::now();
-        std::vector<float> final_embd((size_t)n_embd * (size_t)n_tokens);
-        std::vector<float> flat((size_t)hc_dim);
-        std::vector<float> pre((size_t)n_hc);
-        std::vector<float> hc_weights((size_t)n_hc);
-        for (int t = 0; t < n_tokens; ++t) {
-            const float * token_hc = hc_state.data() + (size_t)t * hc_dim;
-            cpu_rms_norm(flat.data(), token_hc, hc_dim, w.hc_eps);
-            cpu_matvec_f16(pre.data(), hc_output_weights_range.fn_data.data(), flat.data(), n_hc, hc_dim);
-            for (int i = 0; i < n_hc; ++i) {
-                const float z = pre[(size_t)i] * hc_output_weights_range.scale_data[0] +
-                                hc_output_weights_range.base_data[(size_t)i];
-                hc_weights[(size_t)i] = 1.0f / (1.0f + expf(-z)) + 1.0e-6f;
-            }
-            for (int d = 0; d < n_embd; ++d) {
-                float acc = 0.0f;
-                for (int h = 0; h < n_hc; ++h) {
-                    acc += hc_weights[(size_t)h] * token_hc[(size_t)h * n_embd + d];
-                }
-                final_embd[(size_t)t * n_embd + d] = acc;
-            }
-        }
+        std::vector<float> final_embd;
+        hc_output_batch(final_embd,
+                        hc_state.data(),
+                        hc_output_weights_range,
+                        n_tokens,
+                        n_embd,
+                        n_hc,
+                        w.hc_eps);
 
         if (reuse_decode_graphs) {
             if (!cached_decode_output_graph.valid() ||
