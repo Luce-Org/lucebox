@@ -1457,17 +1457,32 @@ static void cpu_rms_norm(float * out, const float * x, int n, float eps) {
     for (int i = 0; i < n; i++) out[i] = x[i] * scale;
 }
 
-static void cpu_matvec_f16(float * out, const uint16_t * mat, const float * x, int rows, int cols) {
+static float cpu_dot_f16_row(const uint16_t * row, const float * x, int cols) {
+    float acc = 0.0f;
+    for (int c = 0; c < cols; c++) {
+        acc += ggml_fp16_to_fp32(row[c]) * x[c];
+    }
+    return acc;
+}
+
+static void cpu_matvec_f16_serial(float * out, const uint16_t * mat, const float * x, int rows, int cols) {
     // mat: [cols, rows] in row-major F16 (ggml layout: ne[0]=cols, ne[1]=rows)
     // out[r] = dot(mat_row_r, x) for r in [0, rows)
     for (int r = 0; r < rows; r++) {
-        float acc = 0.0f;
         const uint16_t * row = mat + (size_t)r * cols;
-        for (int c = 0; c < cols; c++) {
-            acc += ggml_fp16_to_fp32(row[c]) * x[c];
-        }
-        out[r] = acc;
+        out[r] = cpu_dot_f16_row(row, x, cols);
     }
+}
+
+static void cpu_matvec_f16(float * out, const uint16_t * mat, const float * x, int rows, int cols) {
+    const int64_t ops = (int64_t)rows * (int64_t)cols;
+    const int min_parallel_rows = ops >= 262144 ? 1 : 512;
+    ds4_parallel_for_tokens(rows, min_parallel_rows, [&](int r0, int r1) {
+        for (int r = r0; r < r1; ++r) {
+            const uint16_t * row = mat + (size_t)r * cols;
+            out[r] = cpu_dot_f16_row(row, x, cols);
+        }
+    });
 }
 
 static void cpu_hc_sinkhorn(float * out, const float * mix, const float * scale,
@@ -1587,7 +1602,8 @@ static void cpu_hc_pre_into(float * working,
                             int sinkhorn_iters,
                             float hc_eps,
                             float * flat,
-                            float * mix) {
+                            float * mix,
+                            bool serial_fn) {
     const int hc_dim = n_hc * n_embd;
     const int mix_dim = 2 * n_hc + n_hc * n_hc;
 
@@ -1596,7 +1612,11 @@ static void cpu_hc_pre_into(float * working,
 
     // Matmul: fn^T @ flat → mix[mix_dim]
     // fn is [hc_dim, mix_dim] F16 (ggml layout: ne[0]=hc_dim, ne[1]=mix_dim)
-    cpu_matvec_f16(mix, fn_data, flat, mix_dim, hc_dim);
+    if (serial_fn) {
+        cpu_matvec_f16_serial(mix, fn_data, flat, mix_dim, hc_dim);
+    } else {
+        cpu_matvec_f16(mix, fn_data, flat, mix_dim, hc_dim);
+    }
     finish_hc_pre_from_mix_into(working, post, comb, hc_state, mix,
                                 scale_data, base_data,
                                 n_embd, n_hc, sinkhorn_iters);
@@ -1611,7 +1631,7 @@ static HcPreResult cpu_hc_pre(const float * hc_state, const uint16_t * fn_data,
     float mix[24];
     cpu_hc_pre_into(result.working.data(), result.post, result.comb,
                     hc_state, fn_data, scale_data, base_data,
-                    n_embd, n_hc, sinkhorn_iters, hc_eps, flat.data(), mix);
+                    n_embd, n_hc, sinkhorn_iters, hc_eps, flat.data(), mix, false);
     return result;
 }
 
@@ -1742,7 +1762,7 @@ static void hc_pre_auto_into(float * working,
     cpu_hc_pre_into(working, post, comb,
                     hc_state, weights.fn_data.data(),
                     weights.scale_data.data(), weights.base_data.data(),
-                    n_embd, n_hc, sinkhorn_iters, hc_eps, flat, mix_scratch);
+                    n_embd, n_hc, sinkhorn_iters, hc_eps, flat, mix_scratch, true);
 }
 
 static void hc_pre_batch(std::vector<float> & working,
