@@ -180,6 +180,7 @@ struct DeepSeek4AttentionGraphInputs {
     ggml_tensor * rope_pos = nullptr;
     ggml_tensor * neg_pos = nullptr;
     ggml_tensor * raw_kv_rows = nullptr;
+    ggml_tensor * score_mask = nullptr;
     ggml_tensor * attn_ape_row = nullptr;
     ggml_tensor * attn_state_rows = nullptr;
     ggml_tensor * attn_comp_rows = nullptr;
@@ -188,6 +189,8 @@ struct DeepSeek4AttentionGraphInputs {
     ggml_tensor * index_state_rows = nullptr;
     ggml_tensor * index_comp_rows = nullptr;
     ggml_tensor * index_comp_pos = nullptr;
+    int decode_raw_attn_count = 0;
+    int decode_comp_attn_count = 0;
 };
 
 struct DeepSeek4CachedDecodeAttnGraph {
@@ -207,7 +210,7 @@ struct DeepSeek4CachedDecodeAttnGraph {
         return owner_ctx && backend && layer_idx >= 0 && n_tokens == 1 &&
                n_raw > 0 && n_comp_attn >= 0 && n_index_comp >= 0 &&
                sg.ctx && sg.gf && sg.alloc && sg.inp_embed && sg.hidden_states &&
-               inputs.rope_pos && inputs.neg_pos && inputs.raw_kv_rows &&
+               inputs.rope_pos && inputs.neg_pos && inputs.raw_kv_rows && inputs.score_mask &&
                (!compressed || (inputs.attn_ape_row &&
                                 inputs.attn_state_rows && inputs.attn_comp_rows && inputs.attn_comp_pos)) &&
                (!indexed || (inputs.index_ape_row &&
@@ -228,6 +231,27 @@ struct DeepSeek4CachedDecodeAttnGraph {
         indexed = false;
     }
 };
+
+static int ds4_decode_attn_raw_bucket(int n_raw, int n_swa) {
+    if (n_raw <= 0) {
+        return 0;
+    }
+    if (n_raw >= n_swa) {
+        return n_swa;
+    }
+    const int granularity = n_raw <= 64 ? 16 : 32;
+    return std::min(n_swa, ((n_raw + granularity - 1) / granularity) * granularity);
+}
+
+static int ds4_decode_attn_comp_bucket(int n_comp, int ratio, int cap) {
+    if (n_comp <= 0 || cap <= 0) {
+        return 0;
+    }
+    if (ratio != 4) {
+        return n_comp;
+    }
+    return std::min(cap, ((n_comp + 7) / 8) * 8);
+}
 
 struct DeepSeek4CachedLayerAlloc {
     const ggml_context * owner_ctx = nullptr;
@@ -950,8 +974,14 @@ static ggml_tensor * build_mla_attention(
     // raw_kv: [head_dim, n_swa] F16 persistent ring buffer (single KV head, shared)
     // comp_kv: [head_dim, comp_cap] F16 compressed rows.
     // n_raw = min(kv_start + n_tokens, n_swa)
-    const int n_raw = std::min(kv_start + n_tokens, w.n_swa);
-    const int n_comp_attn = (ratio > 0) ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos) : 0;
+    const int n_raw_actual = std::min(kv_start + n_tokens, w.n_swa);
+    const int n_comp_attn_actual = (ratio > 0) ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos) : 0;
+    const int n_raw = (cached_inputs && cached_inputs->decode_raw_attn_count > 0)
+        ? cached_inputs->decode_raw_attn_count
+        : n_raw_actual;
+    const int n_comp_attn = (cached_inputs && cached_inputs->decode_comp_attn_count >= 0)
+        ? std::max(cached_inputs->decode_comp_attn_count, n_comp_attn_actual)
+        : n_comp_attn_actual;
     const int n_attn = n_raw + n_comp_attn;
     const float kq_scale = 1.0f / sqrtf((float)head_dim);
 
@@ -961,14 +991,22 @@ static ggml_tensor * build_mla_attention(
     ggml_tensor * kv_f32 = nullptr;
     if (n_tokens == 1) {
         ggml_tensor * cur_kv_f32 = ggml_cast(ctx, kv, GGML_TYPE_F32);
-        if (n_raw > 1) {
+        const int n_prev_valid = std::max(0, n_raw_actual - 1);
+        if (n_prev_valid > 0) {
             ggml_tensor * prev_f32 = ggml_cast(ctx,
-                ggml_view_2d(ctx, lc.raw_kv, head_dim, n_raw - 1,
+                ggml_view_2d(ctx, lc.raw_kv, head_dim, n_prev_valid,
                              lc.raw_kv->nb[1], 0),
                 GGML_TYPE_F32);
             kv_f32 = ggml_concat(ctx, prev_f32, cur_kv_f32, 1);
         } else {
             kv_f32 = cur_kv_f32;
+        }
+        if (n_raw > n_raw_actual) {
+            ggml_tensor * pad_f32 = ggml_cast(ctx,
+                ggml_view_2d(ctx, lc.raw_kv, head_dim, n_raw - n_raw_actual,
+                             lc.raw_kv->nb[1], (size_t) n_prev_valid * lc.raw_kv->nb[1]),
+                GGML_TYPE_F32);
+            kv_f32 = ggml_concat(ctx, kv_f32, pad_f32, 1);
         }
     } else {
         kv_f32 = ggml_cast(ctx, ggml_view_2d(ctx, lc.raw_kv, head_dim, n_raw,
@@ -989,6 +1027,9 @@ static ggml_tensor * build_mla_attention(
     //       → [n_attn, n_head*n_tokens]
     ggml_tensor * scores = ggml_mul_mat(ctx, kv_f32, q_flat);
     scores = ggml_scale(ctx, scores, kq_scale);
+    if (cached_inputs && cached_inputs->score_mask) {
+        scores = ggml_add(ctx, scores, ggml_repeat(ctx, cached_inputs->score_mask, scores));
+    }
 
     // Sink-aware softmax: DS4 adds one learned per-head sink logit to the
     // denominator, but the sink contributes no value vector.
@@ -1064,7 +1105,10 @@ static bool build_cached_decode_attn_graph(
         const DeepSeek4Layer & L,
         DeepSeek4LayerCache & lc,
         int layer_idx,
-        int kv_start) {
+        int kv_start,
+        int raw_attn_count,
+        int comp_attn_count,
+        int index_comp_count) {
     out.free();
 
     const size_t ctx_size = 48 * 1024 * 1024;
@@ -1078,11 +1122,10 @@ static bool build_cached_decode_attn_graph(
     }
 
     const int ratio = w.compress_ratios[layer_idx];
-    const int token_pos = kv_start;
     out.n_tokens = 1;
-    out.n_raw = std::min(kv_start + 1, w.n_swa);
-    out.n_comp_attn = (ratio > 0) ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos) : 0;
-    out.n_index_comp = (ratio == 4) ? ds4_comp_rows_used(lc.index_comp_kv, lc.n_index_comp, 4, token_pos) : 0;
+    out.n_raw = raw_attn_count;
+    out.n_comp_attn = comp_attn_count;
+    out.n_index_comp = index_comp_count;
     out.compressed = ratio > 0;
     out.indexed = ratio == 4;
 
@@ -1096,7 +1139,11 @@ static bool build_cached_decode_attn_graph(
     ggml_set_input(out.inputs.neg_pos);
 
     out.inputs.raw_kv_rows = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_I64, 1, 1);
+    out.inputs.score_mask = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_F32, raw_attn_count + comp_attn_count, 1);
+    out.inputs.decode_raw_attn_count = raw_attn_count;
+    out.inputs.decode_comp_attn_count = comp_attn_count;
     ggml_set_input(out.inputs.raw_kv_rows);
+    ggml_set_input(out.inputs.score_mask);
     if (ratio > 0) {
         out.inputs.attn_ape_row = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
         out.inputs.attn_comp_pos = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
@@ -2614,7 +2661,7 @@ bool deepseek4_step_layer_range(
     static HcWeightsCpu hc_output_weights_range;
     static std::vector<HashRoutingTableCpu> hash_routing_tables_range;
     static std::vector<DeepSeek4CachedLayerAlloc> cached_attn_allocs;
-    static std::vector<DeepSeek4CachedDecodeAttnGraph> cached_decode_attn_graphs;
+    static std::vector<std::vector<DeepSeek4CachedDecodeAttnGraph>> cached_decode_attn_graphs;
     static std::vector<DeepSeek4CachedDecodeFfnGraph> cached_decode_ffn_graphs;
     static DeepSeek4CachedDecodeOutputGraph cached_decode_output_graph;
     static DeepSeek4CachedLayerAlloc cached_dynamic_output_alloc;
@@ -2626,8 +2673,10 @@ bool deepseek4_step_layer_range(
             alloc.free();
         }
         cached_attn_allocs.assign((size_t)w.n_layer, {});
-        for (auto & g : cached_decode_attn_graphs) {
-            g.free();
+        for (auto & per_layer : cached_decode_attn_graphs) {
+            for (auto & g : per_layer) {
+                g.free();
+            }
         }
         cached_decode_attn_graphs.assign((size_t)w.n_layer, {});
         for (auto & g : cached_decode_ffn_graphs) {
@@ -2686,32 +2735,58 @@ bool deepseek4_step_layer_range(
                 const int n_raw = std::min(kv_start + 1, w.n_swa);
                 const int n_comp_attn = (ratio > 0) ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos) : 0;
                 const int n_index_comp = (ratio == 4) ? ds4_comp_rows_used(lc.index_comp_kv, lc.n_index_comp, 4, token_pos) : 0;
-                auto & candidate = cached_decode_attn_graphs[(size_t)il];
-                if (!candidate.valid() ||
-                    candidate.owner_ctx != w.ctx ||
-                    candidate.backend != backend ||
-                    candidate.layer_idx != il ||
-                    candidate.n_raw != n_raw ||
-                    candidate.n_comp_attn != n_comp_attn ||
-                    candidate.n_index_comp != n_index_comp) {
+                const int raw_bucket = (ratio > 0) ? ds4_decode_attn_raw_bucket(n_raw, w.n_swa) : n_raw;
+                const int comp_bucket = ds4_decode_attn_comp_bucket(n_comp_attn, ratio, lc.comp_kv ? (int) lc.comp_kv->ne[1] : 0);
+                const int index_bucket = ds4_decode_attn_comp_bucket(n_index_comp, 4, lc.index_comp_kv ? (int) lc.index_comp_kv->ne[1] : 0);
+                auto & per_layer = cached_decode_attn_graphs[(size_t)il];
+                auto it = std::find_if(per_layer.begin(), per_layer.end(),
+                    [&](const DeepSeek4CachedDecodeAttnGraph & candidate) {
+                        return candidate.valid() &&
+                               candidate.owner_ctx == w.ctx &&
+                               candidate.backend == backend &&
+                               candidate.layer_idx == il &&
+                               candidate.n_raw == raw_bucket &&
+                               candidate.n_comp_attn == comp_bucket &&
+                               candidate.n_index_comp == index_bucket;
+                    });
+                if (it == per_layer.end()) {
+                    if (per_layer.size() >= 12) {
+                        per_layer.front().free();
+                        per_layer.erase(per_layer.begin());
+                    }
+                    per_layer.emplace_back();
+                    auto & candidate = per_layer.back();
                     const auto attn_build_t0 = Ds4TimingClock::now();
-                    if (!build_cached_decode_attn_graph(candidate, backend, w, L, lc, il, kv_start)) {
+                    if (!build_cached_decode_attn_graph(candidate, backend, w, L, lc, il, kv_start,
+                                                        raw_bucket, comp_bucket, index_bucket)) {
                         std::fprintf(stderr, "[deepseek4] cached attn graph alloc failed layer %d\n", il);
                         return false;
                     }
                     if (telemetry) telemetry->attn_build_us += ds4_elapsed_us(attn_build_t0, Ds4TimingClock::now());
+                    it = std::prev(per_layer.end());
                 }
-                cached_attn = &candidate;
+                cached_attn = &*it;
                 gf = cached_attn->sg.gf;
                 attn_out = cached_attn->sg.hidden_states;
 
                 const int64_t raw_row = kv_start % w.n_swa;
                 const int32_t rope_pos = kv_start;
                 const int32_t neg_pos = -kv_start;
+                std::vector<float> score_mask((size_t)(cached_attn->n_raw + cached_attn->n_comp_attn), -1.0e9f);
+                const int valid_raw = n_raw;
+                for (int i = 0; i < valid_raw; ++i) {
+                    score_mask[(size_t)i] = 0.0f;
+                }
+                const int comp_base = cached_attn->n_raw;
+                for (int i = 0; i < n_comp_attn; ++i) {
+                    score_mask[(size_t)(comp_base + i)] = 0.0f;
+                }
                 ggml_backend_tensor_set(cached_attn->sg.inp_embed, cur.data(), 0, sizeof(float) * cur.size());
                 ggml_backend_tensor_set(cached_attn->inputs.rope_pos, &rope_pos, 0, sizeof(rope_pos));
                 ggml_backend_tensor_set(cached_attn->inputs.neg_pos, &neg_pos, 0, sizeof(neg_pos));
                 ggml_backend_tensor_set(cached_attn->inputs.raw_kv_rows, &raw_row, 0, sizeof(raw_row));
+                ggml_backend_tensor_set(cached_attn->inputs.score_mask,
+                                        score_mask.data(), 0, sizeof(float) * score_mask.size());
                 if (ratio > 0) {
                     const int pos_mod = token_pos % ratio;
                     const int32_t ape_row = pos_mod;
