@@ -33,6 +33,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -195,7 +196,10 @@ static void print_usage(const char * prog) {
         "Usage: %s <model.gguf> [options]\n"
         "\n"
         "Options:\n"
-        "  --draft <path>       Draft model for speculative decode (qwen35 only)\n"
+        "  --draft <path>       Draft model for speculative decode\n"
+        "  --draft-lora <path|name=path>\n"
+        "                       LoRA GGUF adapter merged into a switchable draft variant\n"
+        "                       Request selects a named variant with extra_body.draft_lora\n"
         "  --port <N>           Listen port (default: 8080)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
         "  --max-ctx <N>        Max context length (default: 131072)\n"
@@ -309,6 +313,20 @@ static void print_usage(const char * prog) {
         "\n", prog);
 }
 
+static DraftLoraSpec parse_draft_lora_spec(const char * arg) {
+    DraftLoraSpec spec;
+    std::string s = arg ? arg : "";
+    const size_t eq = s.find('=');
+    if (eq != std::string::npos) {
+        spec.name = s.substr(0, eq);
+        spec.path = s.substr(eq + 1);
+    } else {
+        spec.path = std::move(s);
+    }
+    spec.scale = 1.0f;
+    return spec;
+}
+
 int main(int argc, char ** argv) {
     if (argc < 2 || argv[1][0] == '-') {
         print_usage(argv[0]);
@@ -354,6 +372,8 @@ int main(int argc, char ** argv) {
     for (int i = 2; i < argc; i++) {
         if (std::strcmp(argv[i], "--draft") == 0 && i + 1 < argc) {
             bargs.draft_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--draft-lora") == 0 && i + 1 < argc) {
+            bargs.draft_loras.push_back(parse_draft_lora_spec(argv[++i]));
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             sconfig.port = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
@@ -627,6 +647,26 @@ int main(int argc, char ** argv) {
     if (fast_rollback_forced_off) bargs.fast_rollback = false;
 
     if (!validate_server_placement(bargs, sconfig)) return 2;
+
+    if (!bargs.draft_loras.empty() && !bargs.draft_path) {
+        std::fprintf(stderr, "[server] --draft-lora requires --draft\n");
+        return 2;
+    }
+    if (!bargs.draft_loras.empty() && bargs.remote_draft.enabled()) {
+        std::fprintf(stderr,
+            "[server] --draft-lora is not supported with --draft-ipc-bin yet\n");
+        return 2;
+    }
+    for (const DraftLoraSpec & spec : bargs.draft_loras) {
+        if (spec.path.empty()) {
+            std::fprintf(stderr, "[server] --draft-lora path must not be empty\n");
+            return 2;
+        }
+        if (spec.name == "base") {
+            std::fprintf(stderr, "[server] draft LoRA name 'base' is reserved\n");
+            return 2;
+        }
+    }
 
     if (bargs.remote_draft.enabled() && bargs.draft_path) {
         const std::string arch = detect_arch(bargs.model_path);
@@ -995,6 +1035,17 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  port            = %d\n", sconfig.port);
     std::fprintf(stderr, "[server] │  model           = %s\n", bargs.model_path);
     std::fprintf(stderr, "[server] │  draft           = %s\n", bargs.draft_path ? bargs.draft_path : "(none)");
+    if (!bargs.draft_loras.empty()) {
+        for (size_t i = 0; i < bargs.draft_loras.size(); ++i) {
+            std::fprintf(stderr, "[server] │  draft_lora[%zu]  = %s%s%s\n",
+                         i,
+                         bargs.draft_loras[i].name.empty()
+                             ? ""
+                             : bargs.draft_loras[i].name.c_str(),
+                         bargs.draft_loras[i].name.empty() ? "" : "=",
+                         bargs.draft_loras[i].path.c_str());
+        }
+    }
     std::fprintf(stderr, "[server] │  model_name      = %s\n", sconfig.model_name.c_str());
     std::fprintf(stderr, "[server] │  max_ctx         = %d\n", sconfig.max_ctx);
     // max_tokens default for requests that omit the field. The request
