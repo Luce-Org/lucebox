@@ -1533,16 +1533,16 @@ static void cpu_hc_sinkhorn(float * out, const float * mix, const float * scale,
     for (int i = 0; i < n_hc * n_hc; i++) out[2 * n_hc + i] = c[i];
 }
 
-static HcPreResult finish_hc_pre_from_mix(const float * hc_state,
-                                          const float * mix,
-                                          const float * scale_data,
-                                          const float * base_data,
-                                          int n_embd,
-                                          int n_hc,
-                                          int sinkhorn_iters) {
-    HcPreResult result;
-    result.working.resize(n_embd);
-
+static void finish_hc_pre_from_mix_into(float * working,
+                                        float * post,
+                                        float * comb,
+                                        const float * hc_state,
+                                        const float * mix,
+                                        const float * scale_data,
+                                        const float * base_data,
+                                        int n_embd,
+                                        int n_hc,
+                                        int sinkhorn_iters) {
     // Sinkhorn split
     float split[24];  // 2*4 + 4*4 = 24
     cpu_hc_sinkhorn(split, mix, scale_data, base_data, n_hc, sinkhorn_iters, 1.0e-6f);
@@ -1553,30 +1553,66 @@ static HcPreResult finish_hc_pre_from_mix(const float * hc_state,
         for (int h = 0; h < n_hc; h++) {
             acc += split[h] * hc_state[(size_t)h * n_embd + d];
         }
-        result.working[d] = acc;
+        working[d] = acc;
     }
 
-    memcpy(result.post, split + n_hc, (size_t)n_hc * sizeof(float));
-    memcpy(result.comb, split + 2 * n_hc, (size_t)n_hc * n_hc * sizeof(float));
+    memcpy(post, split + n_hc, (size_t)n_hc * sizeof(float));
+    memcpy(comb, split + 2 * n_hc, (size_t)n_hc * n_hc * sizeof(float));
+}
+
+static HcPreResult finish_hc_pre_from_mix(const float * hc_state,
+                                          const float * mix,
+                                          const float * scale_data,
+                                          const float * base_data,
+                                          int n_embd,
+                                          int n_hc,
+                                          int sinkhorn_iters) {
+    HcPreResult result;
+    result.working.resize(n_embd);
+    finish_hc_pre_from_mix_into(result.working.data(), result.post, result.comb,
+                                hc_state, mix, scale_data, base_data,
+                                n_embd, n_hc, sinkhorn_iters);
     return result;
+}
+
+static void cpu_hc_pre_into(float * working,
+                            float * post,
+                            float * comb,
+                            const float * hc_state,
+                            const uint16_t * fn_data,
+                            const float * scale_data,
+                            const float * base_data,
+                            int n_embd,
+                            int n_hc,
+                            int sinkhorn_iters,
+                            float hc_eps,
+                            float * flat,
+                            float * mix) {
+    const int hc_dim = n_hc * n_embd;
+    const int mix_dim = 2 * n_hc + n_hc * n_hc;
+
+    // RMSNorm over full HC state
+    cpu_rms_norm(flat, hc_state, hc_dim, hc_eps);
+
+    // Matmul: fn^T @ flat → mix[mix_dim]
+    // fn is [hc_dim, mix_dim] F16 (ggml layout: ne[0]=hc_dim, ne[1]=mix_dim)
+    cpu_matvec_f16(mix, fn_data, flat, mix_dim, hc_dim);
+    finish_hc_pre_from_mix_into(working, post, comb, hc_state, mix,
+                                scale_data, base_data,
+                                n_embd, n_hc, sinkhorn_iters);
 }
 
 static HcPreResult cpu_hc_pre(const float * hc_state, const uint16_t * fn_data,
                                const float * scale_data, const float * base_data,
                                int n_embd, int n_hc, int sinkhorn_iters, float hc_eps) {
-    const int hc_dim = n_hc * n_embd;
-    const int mix_dim = 2 * n_hc + n_hc * n_hc;  // 24 for n_hc=4
-
-    // RMSNorm over full HC state
-    std::vector<float> flat(hc_dim);
-    cpu_rms_norm(flat.data(), hc_state, hc_dim, hc_eps);
-
-    // Matmul: fn^T @ flat → mix[mix_dim]
-    // fn is [hc_dim, mix_dim] F16 (ggml layout: ne[0]=hc_dim, ne[1]=mix_dim)
-    std::vector<float> mix(mix_dim);
-    cpu_matvec_f16(mix.data(), fn_data, flat.data(), mix_dim, hc_dim);
-    return finish_hc_pre_from_mix(hc_state, mix.data(), scale_data, base_data,
-                                  n_embd, n_hc, sinkhorn_iters);
+    HcPreResult result;
+    result.working.resize(n_embd);
+    std::vector<float> flat((size_t)n_hc * (size_t)n_embd);
+    float mix[24];
+    cpu_hc_pre_into(result.working.data(), result.post, result.comb,
+                    hc_state, fn_data, scale_data, base_data,
+                    n_embd, n_hc, sinkhorn_iters, hc_eps, flat.data(), mix);
+    return result;
 }
 
 static bool ds4_hc_cuda_enabled() {
@@ -1649,6 +1685,66 @@ static HcPreResult hc_pre_auto(const float * hc_state,
                       n_embd, n_hc, sinkhorn_iters, hc_eps);
 }
 
+static void hc_pre_auto_into(float * working,
+                             float * post,
+                             float * comb,
+                             const float * hc_state,
+                             const HcWeightsCpu & weights,
+                             ggml_tensor * fn_tensor,
+                             int n_embd,
+                             int n_hc,
+                             int sinkhorn_iters,
+                             float hc_eps,
+                             float * flat,
+                             float * mix_scratch) {
+#if defined(DFLASH27B_BACKEND_CUDA)
+    if (ds4_hc_cuda_enabled() && fn_tensor && fn_tensor->data) {
+        float mix[24];
+        if (deepseek4_cuda_hc_pre_mix(hc_state, fn_tensor->data,
+                                      n_embd, n_hc, hc_eps, mix)) {
+            finish_hc_pre_from_mix_into(working, post, comb, hc_state, mix,
+                                        weights.scale_data.data(),
+                                        weights.base_data.data(),
+                                        n_embd, n_hc, sinkhorn_iters);
+            if (ds4_hc_compare_enabled()) {
+                static int compare_logs = 0;
+                HcPreResult cpu_result = cpu_hc_pre(hc_state, weights.fn_data.data(),
+                                                    weights.scale_data.data(),
+                                                    weights.base_data.data(),
+                                                    n_embd, n_hc, sinkhorn_iters, hc_eps);
+                float max_working = 0.0f;
+                for (int i = 0; i < n_embd; ++i) {
+                    max_working = std::max(max_working,
+                                           std::fabs(working[(size_t)i] -
+                                                     cpu_result.working[(size_t)i]));
+                }
+                float max_post = 0.0f;
+                for (int i = 0; i < n_hc; ++i) {
+                    max_post = std::max(max_post, std::fabs(post[i] - cpu_result.post[i]));
+                }
+                float max_comb = 0.0f;
+                for (int i = 0; i < n_hc * n_hc; ++i) {
+                    max_comb = std::max(max_comb, std::fabs(comb[i] - cpu_result.comb[i]));
+                }
+                if (compare_logs < 16) {
+                    std::fprintf(stderr,
+                                 "[deepseek4-hc-compare] max_abs working=%.8g post=%.8g comb=%.8g\n",
+                                 max_working, max_post, max_comb);
+                    compare_logs++;
+                }
+            }
+            return;
+        }
+    }
+#else
+    (void)fn_tensor;
+#endif
+    cpu_hc_pre_into(working, post, comb,
+                    hc_state, weights.fn_data.data(),
+                    weights.scale_data.data(), weights.base_data.data(),
+                    n_embd, n_hc, sinkhorn_iters, hc_eps, flat, mix_scratch);
+}
+
 static void hc_pre_batch(std::vector<float> & working,
                          std::vector<float> & post,
                          std::vector<float> & comb,
@@ -1666,23 +1762,21 @@ static void hc_pre_batch(std::vector<float> & working,
     comb.resize((size_t)n_tokens * (size_t)n_hc * (size_t)n_hc);
 
     ds4_parallel_for_tokens(n_tokens, 8, [&](int t0, int t1) {
+        std::vector<float> flat(hc_dim);
+        float mix[24];
         for (int t = t0; t < t1; ++t) {
-            const HcPreResult result = hc_pre_auto(hc_state + (size_t)t * hc_dim,
-                                                   weights,
-                                                   fn_tensor,
-                                                   n_embd,
-                                                   n_hc,
-                                                   sinkhorn_iters,
-                                                   hc_eps);
-            std::memcpy(working.data() + (size_t)t * n_embd,
-                        result.working.data(),
-                        (size_t)n_embd * sizeof(float));
-            std::memcpy(post.data() + (size_t)t * n_hc,
-                        result.post,
-                        (size_t)n_hc * sizeof(float));
-            std::memcpy(comb.data() + (size_t)t * n_hc * (size_t)n_hc,
-                        result.comb,
-                        (size_t)n_hc * (size_t)n_hc * sizeof(float));
+            hc_pre_auto_into(working.data() + (size_t)t * n_embd,
+                             post.data() + (size_t)t * n_hc,
+                             comb.data() + (size_t)t * n_hc * (size_t)n_hc,
+                             hc_state + (size_t)t * hc_dim,
+                             weights,
+                             fn_tensor,
+                             n_embd,
+                             n_hc,
+                             sinkhorn_iters,
+                             hc_eps,
+                             flat.data(),
+                             mix);
         }
     });
 }
