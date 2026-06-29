@@ -246,6 +246,46 @@ struct DeepSeek4CachedLayerAlloc {
     }
 };
 
+struct DeepSeek4LayerRangeScratch {
+    const ggml_context * owner_ctx = nullptr;
+    int n_tokens = 0;
+    int n_embd = 0;
+    int n_hc = 0;
+    int n_expert_used = 0;
+    std::vector<float> cur;
+    std::vector<float> ffn_working;
+    std::vector<float> hc_post;
+    std::vector<float> hc_comb;
+    std::vector<float> next_hc;
+    std::vector<float> attn_out_host;
+    std::vector<float> ffn_out_host;
+    std::vector<float> final_embd;
+    std::vector<int32_t> hash_expert_ids;
+
+    void ensure(const ggml_context * ctx,
+                int tokens,
+                int embd,
+                int hc,
+                int expert_used) {
+        owner_ctx = ctx;
+        n_tokens = tokens;
+        n_embd = embd;
+        n_hc = hc;
+        n_expert_used = expert_used;
+        const size_t embd_count = (size_t) tokens * (size_t) embd;
+        const size_t hc_count = embd_count * (size_t) hc;
+        cur.resize(embd_count);
+        ffn_working.resize(embd_count);
+        hc_post.resize((size_t) tokens * (size_t) hc);
+        hc_comb.resize((size_t) tokens * (size_t) hc * (size_t) hc);
+        next_hc.resize(hc_count);
+        attn_out_host.resize(embd_count);
+        ffn_out_host.resize(embd_count);
+        final_embd.resize(embd_count);
+        hash_expert_ids.resize((size_t) tokens * (size_t) expert_used);
+    }
+};
+
 static bool build_cached_decode_ffn_graph(
         DeepSeek4CachedDecodeFfnGraph & out,
         ggml_backend_t backend,
@@ -2602,13 +2642,16 @@ bool deepseek4_step_layer_range(
     }
 
     // Per-layer execution with CPU-side HC
-    std::vector<float> cur;
-    std::vector<float> ffn_working;
-    std::vector<float> hc_post;
-    std::vector<float> hc_comb;
-    std::vector<float> next_hc;
-    std::vector<float> attn_out_host;
-    std::vector<float> ffn_out_host;
+    static thread_local DeepSeek4LayerRangeScratch scratch;
+    scratch.ensure(w.ctx, n_tokens, n_embd, n_hc, w.n_expert_used);
+    std::vector<float> & cur = scratch.cur;
+    std::vector<float> & ffn_working = scratch.ffn_working;
+    std::vector<float> & hc_post = scratch.hc_post;
+    std::vector<float> & hc_comb = scratch.hc_comb;
+    std::vector<float> & next_hc = scratch.next_hc;
+    std::vector<float> & attn_out_host = scratch.attn_out_host;
+    std::vector<float> & ffn_out_host = scratch.ffn_out_host;
+    std::vector<int32_t> & hash_expert_ids_host = scratch.hash_expert_ids;
     const bool reuse_decode_graphs = (n_tokens == 1);
     for (int il = layer_begin; il < layer_end; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t)il];
@@ -2737,7 +2780,6 @@ bool deepseek4_step_layer_range(
                 return false;
             }
             if (telemetry) telemetry->attn_compute_us += ds4_elapsed_us(attn_compute_t0, Ds4TimingClock::now());
-            attn_out_host.resize((size_t)n_embd * (size_t)n_tokens);
             const auto attn_read_t0 = Ds4TimingClock::now();
             ggml_backend_tensor_get(attn_out, attn_out_host.data(), 0, sizeof(float) * attn_out_host.size());
             if (telemetry) telemetry->attn_read_us += ds4_elapsed_us(attn_read_t0, Ds4TimingClock::now());
@@ -2768,7 +2810,6 @@ bool deepseek4_step_layer_range(
         {
             // Hash-routed layers: use pre-computed expert IDs from hash table
             // instead of zeroing out routed_out as build_moe_ffn does.
-            std::vector<int32_t> hash_expert_ids_host;
             const bool hash_routed =
                     il < w.n_hash_layer && L.ffn_gate_tid2eid && token_ids &&
                     hash_routing_tables_range[(size_t)il].loaded;
@@ -2815,7 +2856,6 @@ bool deepseek4_step_layer_range(
                 return false;
             }
 
-            ffn_out_host.resize((size_t)n_embd * (size_t)n_tokens);
             const auto ffn_read_t0 = Ds4TimingClock::now();
             ggml_backend_tensor_get(ffn_out, ffn_out_host.data(), 0, sizeof(float) * ffn_out_host.size());
             if (telemetry) telemetry->ffn_read_us += ds4_elapsed_us(ffn_read_t0, Ds4TimingClock::now());
@@ -2839,7 +2879,7 @@ bool deepseek4_step_layer_range(
     if (is_last_shard && out_logits) {
         // Final HC pre for output
         const auto output_t0 = Ds4TimingClock::now();
-        std::vector<float> final_embd;
+        std::vector<float> & final_embd = scratch.final_embd;
         hc_output_batch(final_embd,
                         hc_state.data(),
                         hc_output_weights_range,
