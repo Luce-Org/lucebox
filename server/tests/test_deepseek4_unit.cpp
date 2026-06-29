@@ -11,6 +11,7 @@
 #include <string>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -45,6 +46,12 @@ static bool nearly_equal(float a, float b, float atol = 1.0e-5f, float rtol = 1.
     const float diff = std::fabs(a - b);
     const float scale = std::max(std::fabs(a), std::fabs(b));
     return diff <= atol + rtol * scale;
+}
+
+using TestClock = std::chrono::steady_clock;
+
+static double elapsed_ms(TestClock::time_point t0, TestClock::time_point t1) {
+    return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
 static ggml_context * make_test_context(size_t mem_size = 1u << 20) {
@@ -529,6 +536,305 @@ static void test_ipc_mode_registration() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_ffn_graph_reuse_microbench(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_ffn_graph_reuse_microbench ...");
+
+    constexpr int n_embd = 64;
+    constexpr int n_ff = 96;
+    constexpr int n_tokens = 64;
+    constexpr int iters = 8;
+    const size_t out_size = (size_t) n_embd * n_tokens;
+
+    std::vector<float> inp((size_t) n_embd * n_tokens);
+    std::vector<float> norm_w((size_t) n_embd);
+    std::vector<float> shared_gate_w((size_t) n_embd * n_ff);
+    std::vector<float> shared_up_w((size_t) n_embd * n_ff);
+    std::vector<float> shared_down_w((size_t) n_ff * n_embd);
+    std::vector<float> routed_gate_w((size_t) n_embd * n_ff);
+    std::vector<float> routed_up_w((size_t) n_embd * n_ff);
+    std::vector<float> routed_down_w((size_t) n_ff * n_embd);
+    std::vector<float> rebuild_out(out_size);
+    std::vector<float> cached_out(out_size);
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-0.25f, 0.25f);
+    auto fill = [&](std::vector<float> & v) {
+        for (float & x : v) x = dist(rng);
+    };
+    fill(inp);
+    fill(norm_w);
+    fill(shared_gate_w);
+    fill(shared_up_w);
+    fill(shared_down_w);
+    fill(routed_gate_w);
+    fill(routed_up_w);
+    fill(routed_down_w);
+
+    auto build_and_run = [&](std::vector<float> & out) {
+        ggml_context * ctx = make_test_context(8u << 20);
+        TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+        if (!ctx) return false;
+
+        ggml_tensor * inp_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * norm_w_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_tensor * shared_gate_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_ff);
+        ggml_tensor * shared_up_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_ff);
+        ggml_tensor * shared_down_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff, n_embd);
+        ggml_tensor * routed_gate_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_ff);
+        ggml_tensor * routed_up_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_ff);
+        ggml_tensor * routed_down_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff, n_embd);
+        ggml_set_input(inp_t);
+        ggml_set_input(norm_w_t);
+        ggml_set_input(shared_gate_t);
+        ggml_set_input(shared_up_t);
+        ggml_set_input(shared_down_t);
+        ggml_set_input(routed_gate_t);
+        ggml_set_input(routed_up_t);
+        ggml_set_input(routed_down_t);
+
+        ggml_tensor * norm = ggml_mul(ctx, ggml_rms_norm(ctx, inp_t, 1.0e-6f), norm_w_t);
+        ggml_tensor * shared_gate = ggml_softplus(ctx, ggml_mul_mat(ctx, shared_gate_t, norm));
+        ggml_tensor * shared_up = ggml_mul_mat(ctx, shared_up_t, norm);
+        ggml_tensor * shared_mid = ggml_mul(ctx, shared_gate, shared_up);
+        ggml_tensor * shared_out = ggml_mul_mat(ctx, shared_down_t, shared_mid);
+
+        ggml_tensor * routed_gate = ggml_softplus(ctx, ggml_mul_mat(ctx, routed_gate_t, norm));
+        ggml_tensor * routed_up = ggml_mul_mat(ctx, routed_up_t, norm);
+        ggml_tensor * routed_mid = ggml_mul(ctx, routed_gate, routed_up);
+        ggml_tensor * routed_out = ggml_mul_mat(ctx, routed_down_t, routed_mid);
+        ggml_tensor * out_t = ggml_add(ctx, shared_out, routed_out);
+        ggml_set_output(out_t);
+
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 256, false);
+        ggml_build_forward_expand(gf, out_t);
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+        bool ok = ggml_gallocr_alloc_graph(alloc, gf);
+        TEST_ASSERT(ok);
+        if (ok) {
+            ggml_backend_tensor_set(inp_t, inp.data(), 0, inp.size() * sizeof(float));
+            ggml_backend_tensor_set(norm_w_t, norm_w.data(), 0, norm_w.size() * sizeof(float));
+            ggml_backend_tensor_set(shared_gate_t, shared_gate_w.data(), 0, shared_gate_w.size() * sizeof(float));
+            ggml_backend_tensor_set(shared_up_t, shared_up_w.data(), 0, shared_up_w.size() * sizeof(float));
+            ggml_backend_tensor_set(shared_down_t, shared_down_w.data(), 0, shared_down_w.size() * sizeof(float));
+            ggml_backend_tensor_set(routed_gate_t, routed_gate_w.data(), 0, routed_gate_w.size() * sizeof(float));
+            ggml_backend_tensor_set(routed_up_t, routed_up_w.data(), 0, routed_up_w.size() * sizeof(float));
+            ggml_backend_tensor_set(routed_down_t, routed_down_w.data(), 0, routed_down_w.size() * sizeof(float));
+            ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+            TEST_ASSERT(ok);
+            if (ok) {
+                ggml_backend_tensor_get(out_t, out.data(), 0, out.size() * sizeof(float));
+            }
+        }
+
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        return ok;
+    };
+
+    double rebuild_total_ms = 0.0;
+    for (int iter = 0; iter < iters; ++iter) {
+        const auto t0 = TestClock::now();
+        bool ok = build_and_run(rebuild_out);
+        const auto t1 = TestClock::now();
+        TEST_ASSERT(ok);
+        rebuild_total_ms += elapsed_ms(t0, t1);
+    }
+
+    ggml_context * ctx = make_test_context(8u << 20);
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) {
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+    ggml_tensor * inp_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * norm_w_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+    ggml_tensor * shared_gate_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_ff);
+    ggml_tensor * shared_up_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_ff);
+    ggml_tensor * shared_down_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff, n_embd);
+    ggml_tensor * routed_gate_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_ff);
+    ggml_tensor * routed_up_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_ff);
+    ggml_tensor * routed_down_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff, n_embd);
+    ggml_set_input(inp_t);
+    ggml_set_input(norm_w_t);
+    ggml_set_input(shared_gate_t);
+    ggml_set_input(shared_up_t);
+    ggml_set_input(shared_down_t);
+    ggml_set_input(routed_gate_t);
+    ggml_set_input(routed_up_t);
+    ggml_set_input(routed_down_t);
+
+    ggml_tensor * norm = ggml_mul(ctx, ggml_rms_norm(ctx, inp_t, 1.0e-6f), norm_w_t);
+    ggml_tensor * shared_gate = ggml_softplus(ctx, ggml_mul_mat(ctx, shared_gate_t, norm));
+    ggml_tensor * shared_up = ggml_mul_mat(ctx, shared_up_t, norm);
+    ggml_tensor * shared_mid = ggml_mul(ctx, shared_gate, shared_up);
+    ggml_tensor * shared_out = ggml_mul_mat(ctx, shared_down_t, shared_mid);
+    ggml_tensor * routed_gate = ggml_softplus(ctx, ggml_mul_mat(ctx, routed_gate_t, norm));
+    ggml_tensor * routed_up = ggml_mul_mat(ctx, routed_up_t, norm);
+    ggml_tensor * routed_mid = ggml_mul(ctx, routed_gate, routed_up);
+    ggml_tensor * routed_out = ggml_mul_mat(ctx, routed_down_t, routed_mid);
+    ggml_tensor * out_t = ggml_add(ctx, shared_out, routed_out);
+    ggml_set_output(out_t);
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 256, false);
+    ggml_build_forward_expand(gf, out_t);
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    bool alloc_ok = ggml_gallocr_alloc_graph(alloc, gf);
+    TEST_ASSERT(alloc_ok);
+    if (!alloc_ok) {
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+    ggml_backend_tensor_set(norm_w_t, norm_w.data(), 0, norm_w.size() * sizeof(float));
+    ggml_backend_tensor_set(shared_gate_t, shared_gate_w.data(), 0, shared_gate_w.size() * sizeof(float));
+    ggml_backend_tensor_set(shared_up_t, shared_up_w.data(), 0, shared_up_w.size() * sizeof(float));
+    ggml_backend_tensor_set(shared_down_t, shared_down_w.data(), 0, shared_down_w.size() * sizeof(float));
+    ggml_backend_tensor_set(routed_gate_t, routed_gate_w.data(), 0, routed_gate_w.size() * sizeof(float));
+    ggml_backend_tensor_set(routed_up_t, routed_up_w.data(), 0, routed_up_w.size() * sizeof(float));
+    ggml_backend_tensor_set(routed_down_t, routed_down_w.data(), 0, routed_down_w.size() * sizeof(float));
+
+    double cached_total_ms = 0.0;
+    for (int iter = 0; iter < iters; ++iter) {
+        const auto t0 = TestClock::now();
+        ggml_backend_tensor_set(inp_t, inp.data(), 0, inp.size() * sizeof(float));
+        bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+        const auto t1 = TestClock::now();
+        TEST_ASSERT(ok);
+        if (ok) {
+            ggml_backend_tensor_get(out_t, cached_out.data(), 0, cached_out.size() * sizeof(float));
+        }
+        cached_total_ms += elapsed_ms(t0, t1);
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+
+    for (size_t i = 0; i < cached_out.size(); ++i) {
+        TEST_ASSERT_MSG(std::isfinite(cached_out[i]), "cached FFN output must be finite");
+        TEST_ASSERT_MSG(std::isfinite(rebuild_out[i]), "rebuilt FFN output must be finite");
+    }
+
+    std::fprintf(stderr, " rebuild_avg=%.3fms cached_avg=%.3fms\n",
+                 rebuild_total_ms / iters, cached_total_ms / iters);
+}
+
+static void test_output_graph_reuse_microbench(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_output_graph_reuse_microbench ...");
+
+    constexpr int n_embd = 64;
+    constexpr int n_vocab = 256;
+    constexpr int n_tokens = 64;
+    constexpr int iters = 8;
+    std::vector<float> inp((size_t) n_embd * n_tokens);
+    std::vector<float> norm_w((size_t) n_embd);
+    std::vector<float> lm_head((size_t) n_embd * n_vocab);
+    std::vector<float> rebuild_logits((size_t) n_vocab * n_tokens);
+    std::vector<float> cached_logits((size_t) n_vocab * n_tokens);
+
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> dist(-0.2f, 0.2f);
+    for (float & x : inp) x = dist(rng);
+    for (float & x : norm_w) x = 1.0f + dist(rng);
+    for (float & x : lm_head) x = dist(rng);
+
+    auto build_and_run = [&](std::vector<float> & out) {
+        ggml_context * ctx = make_test_context(4u << 20);
+        TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+        if (!ctx) return false;
+
+        ggml_tensor * inp_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * norm_w_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_tensor * lm_head_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_vocab);
+        ggml_set_input(inp_t);
+        ggml_set_input(norm_w_t);
+        ggml_set_input(lm_head_t);
+        ggml_tensor * norm = ggml_mul(ctx, ggml_rms_norm(ctx, inp_t, 1.0e-6f), norm_w_t);
+        ggml_tensor * logits = ggml_mul_mat(ctx, lm_head_t, norm);
+        ggml_set_output(logits);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 128, false);
+        ggml_build_forward_expand(gf, logits);
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+        bool ok = ggml_gallocr_alloc_graph(alloc, gf);
+        TEST_ASSERT(ok);
+        if (ok) {
+            ggml_backend_tensor_set(inp_t, inp.data(), 0, inp.size() * sizeof(float));
+            ggml_backend_tensor_set(norm_w_t, norm_w.data(), 0, norm_w.size() * sizeof(float));
+            ggml_backend_tensor_set(lm_head_t, lm_head.data(), 0, lm_head.size() * sizeof(float));
+            ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+            TEST_ASSERT(ok);
+            if (ok) {
+                ggml_backend_tensor_get(logits, out.data(), 0, out.size() * sizeof(float));
+            }
+        }
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        return ok;
+    };
+
+    double rebuild_total_ms = 0.0;
+    for (int iter = 0; iter < iters; ++iter) {
+        const auto t0 = TestClock::now();
+        bool ok = build_and_run(rebuild_logits);
+        const auto t1 = TestClock::now();
+        TEST_ASSERT(ok);
+        rebuild_total_ms += elapsed_ms(t0, t1);
+    }
+
+    ggml_context * ctx = make_test_context(4u << 20);
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) {
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+    ggml_tensor * inp_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * norm_w_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+    ggml_tensor * lm_head_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_vocab);
+    ggml_set_input(inp_t);
+    ggml_set_input(norm_w_t);
+    ggml_set_input(lm_head_t);
+    ggml_tensor * norm = ggml_mul(ctx, ggml_rms_norm(ctx, inp_t, 1.0e-6f), norm_w_t);
+    ggml_tensor * logits = ggml_mul_mat(ctx, lm_head_t, norm);
+    ggml_set_output(logits);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 128, false);
+    ggml_build_forward_expand(gf, logits);
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    bool alloc_ok = ggml_gallocr_alloc_graph(alloc, gf);
+    TEST_ASSERT(alloc_ok);
+    if (!alloc_ok) {
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+    ggml_backend_tensor_set(norm_w_t, norm_w.data(), 0, norm_w.size() * sizeof(float));
+    ggml_backend_tensor_set(lm_head_t, lm_head.data(), 0, lm_head.size() * sizeof(float));
+
+    double cached_total_ms = 0.0;
+    for (int iter = 0; iter < iters; ++iter) {
+        const auto t0 = TestClock::now();
+        ggml_backend_tensor_set(inp_t, inp.data(), 0, inp.size() * sizeof(float));
+        bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+        const auto t1 = TestClock::now();
+        TEST_ASSERT(ok);
+        if (ok) {
+            ggml_backend_tensor_get(logits, cached_logits.data(), 0, cached_logits.size() * sizeof(float));
+        }
+        cached_total_ms += elapsed_ms(t0, t1);
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+
+    for (size_t i = 0; i < cached_logits.size(); ++i) {
+        TEST_ASSERT_MSG(std::isfinite(cached_logits[i]), "cached output logits must be finite");
+        TEST_ASSERT_MSG(std::isfinite(rebuild_logits[i]), "rebuilt output logits must be finite");
+    }
+
+    std::fprintf(stderr, " rebuild_avg=%.3fms cached_avg=%.3fms\n",
+                 rebuild_total_ms / iters, cached_total_ms / iters);
+}
+
 int main() {
     ggml_backend_t backend = ggml_backend_cpu_init();
     if (!backend) {
@@ -548,6 +854,8 @@ int main() {
     test_reset_request_state();
     test_adapter_guard_paths();
     test_ipc_mode_registration();
+    test_ffn_graph_reuse_microbench(backend);
+    test_output_graph_reuse_microbench(backend);
 
     ggml_backend_free(backend);
 
