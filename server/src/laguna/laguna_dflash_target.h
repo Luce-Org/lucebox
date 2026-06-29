@@ -68,6 +68,26 @@ public:
                                 std::vector<float> & top_log_probs,
                                 std::vector<int32_t> & top_token_ids) override;
 
+    bool project_device_hidden_to_tokens(ggml_tensor * hidden,
+                                         int n_tokens,
+                                         std::vector<int32_t> & tokens_out);
+
+    bool project_device_hidden_to_topk(ggml_tensor * hidden,
+                                       int n_tokens,
+                                       int K,
+                                       float temperature,
+                                       std::vector<float> & top_log_probs,
+                                       std::vector<int32_t> & top_token_ids);
+
+    bool project_device_logits_to_topk(ggml_tensor * logits,
+                                       int n_tokens,
+                                       int K,
+                                       float temperature,
+                                       std::vector<float> & top_log_probs,
+                                       std::vector<int32_t> & top_token_ids);
+
+    ggml_tensor * output_weight() const { return w_.output; }
+
     int hidden_size() const override { return w_.n_embd; }
     int mask_token_id() const override { return 12; }
     const std::vector<int> & capture_layer_ids() const override;

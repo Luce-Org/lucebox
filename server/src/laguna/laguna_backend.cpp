@@ -449,6 +449,17 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     if (dflash_target_) {
         dflash_target_->set_keep_verify_logits(sampled_verify);
     }
+    static const bool g_device_draft_proj_disabled =
+        (std::getenv("DFLASH_LAGUNA_DEVICE_DRAFT_PROJ_DISABLE") != nullptr);
+    const bool can_project_draft_on_device =
+        !g_device_draft_proj_disabled && dflash_target_ &&
+        draft_backend_ == backend_;
+    static const bool g_chain_device_draft_proj =
+        (std::getenv("DFLASH_LAGUNA_CHAIN_DEVICE_DRAFT_PROJ") != nullptr);
+    static const bool g_fused_draft_lm_head_disabled =
+        (std::getenv("DFLASH_LAGUNA_FUSED_DRAFT_LM_HEAD_DISABLE") != nullptr);
+    static const bool g_chain_fused_draft_lm_head =
+        (std::getenv("DFLASH_LAGUNA_CHAIN_FUSED_DRAFT_LM_HEAD") != nullptr);
 
     StepGraph draft_sg;
 
@@ -610,7 +621,25 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         const bool use_mirror_view =
             draft_feature_mirror_can_view(feature_mirror_, committed, draft_ctx, mirror_slot0);
 
-        if (!build_draft_step(draft_sg, dw_, /*lm_head=*/nullptr, draft_backend_,
+        const bool tree_special_inactive =
+            !(budget_hook && !budget_hook->close_token_ids.empty());
+        // kvflash: the tree graph is position-indexed, so only take it while
+        // the pager is identity and the step fits the resident pool; otherwise
+        // the slot-mapped chain verify below handles it.
+        const bool kvflash_tree_ok =
+            !kvflash_active() ||
+            (kvflash_pager_.is_identity() &&
+             committed + args_.ddtree_budget + 1 <= kvflash_tokens_);
+        const bool try_ddtree =
+            args_.ddtree_mode && target->supports_tree_verify() && kvflash_tree_ok &&
+            q_len > 1 && tree_special_inactive && !sampled_verify;
+        const bool use_fused_draft_lm_head =
+            can_project_draft_on_device && !g_fused_draft_lm_head_disabled &&
+            (try_ddtree || g_chain_fused_draft_lm_head);
+        ggml_tensor * draft_lm_head = use_fused_draft_lm_head
+            ? dflash_target_->output_weight() : nullptr;
+
+        if (!build_draft_step(draft_sg, dw_, draft_lm_head, draft_backend_,
                               draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
                               committed,
                               std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, args_.draft_ctx_max)))) {
@@ -642,12 +671,23 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             return false;
         }
 
-        local_hidden.resize((size_t)hidden * (size_t)q_len);
-        ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
-                                sizeof(float) * local_hidden.size());
+        bool local_hidden_valid = false;
+        auto ensure_local_hidden = [&]() -> bool {
+            const size_t want = (size_t)hidden * (size_t)q_len;
+            if (local_hidden_valid && local_hidden.size() == want) return true;
+            local_hidden.resize(want);
+            ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
+                                    sizeof(float) * local_hidden.size());
+            local_hidden_valid = true;
+            return true;
+        };
 
         bool used_domino = false;
-        if (dw_.domino.enabled && q_len > 1 && !sampled_verify && !args_.ddtree_mode) {
+        if (!try_ddtree && dw_.domino.enabled && q_len > 1 && !sampled_verify && !args_.ddtree_mode) {
+            if (!ensure_local_hidden()) {
+                step_graph_destroy(draft_sg);
+                return false;
+            }
             static std::atomic<bool> s_domino_logged{false};
             if (!s_domino_logged.exchange(true)) {
                 std::fprintf(stderr,
@@ -668,8 +708,29 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                 }
             }
         }
-        if (!used_domino) {
-            if (!target->project_hidden_to_tokens(local_hidden.data(), q_len, draft_tok)) {
+
+        if (!try_ddtree && !used_domino) {
+            bool projected = false;
+            if (g_chain_fused_draft_lm_head && draft_sg.argmax_tokens) {
+                draft_tok.resize((size_t)q_len);
+                ggml_backend_tensor_get(draft_sg.argmax_tokens, draft_tok.data(), 0,
+                                        sizeof(int32_t) * (size_t)q_len);
+                projected = true;
+            }
+            if (g_chain_device_draft_proj && can_project_draft_on_device &&
+                dflash_target_->project_device_hidden_to_tokens(
+                    draft_sg.hidden_states, q_len, draft_tok)) {
+                projected = true;
+            }
+            if (!projected) {
+                if (!ensure_local_hidden() ||
+                    !target->project_hidden_to_tokens(local_hidden.data(), q_len, draft_tok)) {
+                    std::fprintf(stderr, "[laguna-spec] projection failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+            }
+            if ((int)draft_tok.size() < q_len) {
                 std::fprintf(stderr, "[laguna-spec] projection failed\n");
                 step_graph_destroy(draft_sg);
                 return false;
@@ -677,23 +738,26 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             draft_tok[0] = last_tok;
         }
 
-        const bool tree_special_inactive =
-            !(budget_hook && !budget_hook->close_token_ids.empty());
-        // kvflash: the tree graph is position-indexed, so only take it while
-        // the pager is identity and the step fits the resident pool; otherwise
-        // the slot-mapped chain verify below handles it.
-        const bool kvflash_tree_ok =
-            !kvflash_active() ||
-            (kvflash_pager_.is_identity() &&
-             committed + args_.ddtree_budget + 1 <= kvflash_tokens_);
-        if (args_.ddtree_mode && target->supports_tree_verify() && kvflash_tree_ok &&
-            q_len > 1 && tree_special_inactive && !sampled_verify) {
+        if (try_ddtree) {
             const int L = q_len - 1;
             const int K = (args_.ddtree_budget > L) ? 8 : 1;
             std::vector<float> top_lp;
             std::vector<int32_t> top_ids;
-            if (!target->project_hidden_to_topk(local_hidden.data(), q_len, K,
-                                                args_.ddtree_temp, top_lp, top_ids)) {
+            bool topk_ok = false;
+            if (draft_sg.logits) {
+                topk_ok = dflash_target_->project_device_logits_to_topk(
+                    draft_sg.logits, q_len, K, args_.ddtree_temp,
+                    top_lp, top_ids);
+            }
+            if (!topk_ok && can_project_draft_on_device) {
+                topk_ok = dflash_target_->project_device_hidden_to_topk(
+                    draft_sg.hidden_states, q_len, K, args_.ddtree_temp,
+                    top_lp, top_ids);
+            }
+            if (!topk_ok &&
+                (!ensure_local_hidden() ||
+                 !target->project_hidden_to_topk(local_hidden.data(), q_len, K,
+                                                 args_.ddtree_temp, top_lp, top_ids))) {
                 std::fprintf(stderr, "[laguna-spec] ddtree topk projection failed\n");
                 step_graph_destroy(draft_sg);
                 return false;
@@ -703,6 +767,83 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                                        top_ids.data() + (size_t)K,
                                        L, K, args_.ddtree_budget,
                                        /*chain_seed=*/true);
+
+            static const bool g_lazy_ddtree =
+                (std::getenv("DFLASH_LAGUNA_DDTREE_LAZY") != nullptr);
+            if (g_lazy_ddtree) {
+                std::vector<int> accepted;
+                accepted.reserve((size_t)q_len + 1);
+                accepted.push_back(0);
+
+                int current_index = 0;
+                int next_token = -1;
+                int cursor_pos = committed;
+                int32_t verify_tok = last_tok;
+                while (true) {
+                    std::vector<int32_t> one_tok = { verify_tok };
+                    int pred = -1;
+                    if (!target->verify_batch(one_tok, cursor_pos, pred, nullptr)) {
+                        std::fprintf(stderr, "[laguna-spec] lazy verify_tree step failed\n");
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
+                    next_token = pred;
+                    cursor_pos++;
+
+                    if ((int)accepted.size() >= need_commit_budget) break;
+                    const auto & children = tree.child_maps[(size_t)current_index];
+                    auto it = children.find(next_token);
+                    if (it == children.end()) break;
+                    current_index = it->second;
+                    accepted.push_back(current_index);
+                    verify_tok = next_token;
+                }
+                if (next_token < 0) {
+                    std::fprintf(stderr, "[laguna-spec] lazy verify_tree produced no posterior\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+
+                int commit_n = (int)accepted.size();
+                if (commit_n > need_commit_budget) commit_n = need_commit_budget;
+                if (commit_n <= 0) {
+                    step_graph_destroy(draft_sg);
+                    break;
+                }
+
+                bool hit_eos = false;
+                int emitted = 0;
+                for (int i = 0; i < commit_n; ++i) {
+                    const int dfs = accepted[(size_t)i];
+                    const int32_t tok = (dfs == 0) ? last_tok : tree.token_ids[(size_t)dfs - 1];
+                    if (!ignore_eos && target->is_eos(tok)) { hit_eos = true; break; }
+                    out_tokens.push_back(tok);
+                    sample_history.push_back(tok);
+                    io.emit(tok);
+                    emitted++;
+                    if (io.cancelled) break;
+                }
+
+                n_accept_sum += std::max(0, emitted - 1);
+                n_draft_steps++;
+
+                if (feature_mirror_.target_feat && cache_.target_feat && emitted > 0) {
+                    draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
+                                                    feature_mirror_, committed, emitted);
+                }
+
+                committed += emitted;
+                cache_.cur_pos = committed;
+                n_generated += emitted;
+                last_tok = next_token;
+                cache_.last_tok = last_tok;
+                if (io.cancelled || hit_eos || emitted <= 0 ||
+                    (!ignore_eos && target->is_eos(next_token))) {
+                    break;
+                }
+                continue;
+            }
+
             const int N = args_.ddtree_budget + 1;
             std::vector<int32_t> flat_tokens((size_t)N, 0);
             flat_tokens[0] = last_tok;

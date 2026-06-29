@@ -277,6 +277,7 @@ struct LagunaGraphInputs {
     // CUDA-graph cache replays instead of re-launching every kernel.
     int           kv_pad = 0;             // 0 = legacy exact-length views + cpy append
     ggml_tensor * kv_idx = nullptr;       // [n_tokens] I32 cache row indices (graph input)
+    ggml_tensor * tree_parent_ids = nullptr;  // optional [n_tokens] I32, enables tree-attn carrier
     bool          output_logits = true;
     bool          logits_are_output = true;
     bool          output_hidden_states = false;
