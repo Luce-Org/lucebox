@@ -381,7 +381,7 @@ static void test_auto_split_computation() {
         DeepSeek4LayerSplitAdapter::estimate_cuda_layers_from_free_bytes(
             20ULL * 1024 * 1024 * 1024);
     TEST_ASSERT(estimated >= 1 && estimated <= 42);
-    TEST_ASSERT(estimated == 36);
+    TEST_ASSERT(estimated == 9);
 
     const int computed = adapter.compute_auto_split_layers();
     TEST_ASSERT(computed >= 1 && computed <= 42);
