@@ -227,6 +227,54 @@ struct DeepSeek4CachedDecodeAttnGraph {
     }
 };
 
+struct DeepSeek4CachedPrefillAttnGraph {
+    const ggml_context * owner_ctx = nullptr;
+    ggml_backend_t backend = nullptr;
+    int layer_idx = -1;
+    int n_tokens = 0;
+    int n_raw = 0;
+    int n_comp_attn = 0;
+    int n_index_comp = 0;
+    bool compressed = false;
+    bool indexed = false;
+    StepGraph sg;
+    DeepSeek4AttentionGraphInputs inputs;
+
+    bool valid() const {
+        if (!(owner_ctx && backend && layer_idx >= 0 && n_tokens > 1 &&
+              n_raw > 0 && n_comp_attn >= 0 && n_index_comp >= 0 &&
+              sg.ctx && sg.gf && sg.alloc && sg.inp_embed && sg.hidden_states &&
+              inputs.rope_pos && inputs.neg_pos && inputs.raw_kv_rows)) {
+            return false;
+        }
+        if (compressed &&
+            !(inputs.attn_ape_row && inputs.attn_state_rows &&
+              inputs.attn_comp_rows && inputs.attn_comp_pos)) {
+            return false;
+        }
+        if (indexed &&
+            !(inputs.index_ape_row && inputs.index_state_rows &&
+              inputs.index_comp_rows && inputs.index_comp_pos)) {
+            return false;
+        }
+        return true;
+    }
+
+    void free() {
+        step_graph_destroy(sg);
+        inputs = {};
+        owner_ctx = nullptr;
+        backend = nullptr;
+        layer_idx = -1;
+        n_tokens = 0;
+        n_raw = 0;
+        n_comp_attn = 0;
+        n_index_comp = 0;
+        compressed = false;
+        indexed = false;
+    }
+};
+
 struct DeepSeek4CachedLayerAlloc {
     const ggml_context * owner_ctx = nullptr;
     ggml_backend_t backend = nullptr;
@@ -1117,6 +1165,94 @@ static bool build_cached_decode_attn_graph(
     ggml_tensor * normed = build_rms_norm(out.sg.ctx, out.sg.inp_embed, L.attn_norm, w.rms_eps);
     out.sg.hidden_states = build_mla_attention(out.sg.ctx, out.sg.gf, normed, w, L, lc, layer_idx,
                                                kv_start, 1, &out.inputs,
+                                               i32_inputs, i32_array_inputs, i64_array_inputs);
+    if (!out.sg.hidden_states) {
+        out.free();
+        return false;
+    }
+    ggml_set_output(out.sg.hidden_states);
+    ggml_build_forward_expand(out.sg.gf, out.sg.hidden_states);
+
+    out.sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(out.sg.alloc, out.sg.gf)) {
+        out.free();
+        return false;
+    }
+
+    out.owner_ctx = w.ctx;
+    out.backend = backend;
+    out.layer_idx = layer_idx;
+    return true;
+}
+
+static bool build_cached_prefill_attn_graph(
+        DeepSeek4CachedPrefillAttnGraph & out,
+        ggml_backend_t backend,
+        const DeepSeek4Weights & w,
+        const DeepSeek4Layer & L,
+        DeepSeek4LayerCache & lc,
+        int layer_idx,
+        int kv_start,
+        int n_tokens) {
+    out.free();
+
+    const size_t ctx_size = 48 * 1024 * 1024;
+    ggml_init_params params{};
+    params.mem_size = ctx_size;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    out.sg.ctx = ggml_init(params);
+    if (!out.sg.ctx) {
+        return false;
+    }
+
+    const int ratio = w.compress_ratios[layer_idx];
+    const int token_pos = kv_start + n_tokens - 1;
+    out.n_tokens = n_tokens;
+    out.n_raw = std::min(kv_start + n_tokens, w.n_swa);
+    out.n_comp_attn = (ratio > 0) ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos) : 0;
+    out.n_index_comp = (ratio == 4) ? ds4_comp_rows_used(lc.index_comp_kv, lc.n_index_comp, 4, token_pos) : 0;
+    out.compressed = ratio > 0;
+    out.indexed = ratio == 4;
+
+    out.sg.inp_embed = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_F32, w.n_embd, n_tokens);
+    ggml_set_input(out.sg.inp_embed);
+    out.sg.gf = ggml_new_graph_custom(out.sg.ctx, 32768, false);
+
+    out.inputs.rope_pos = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, n_tokens);
+    out.inputs.neg_pos = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, n_tokens);
+    out.inputs.raw_kv_rows = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_I64, 1, n_tokens);
+    ggml_set_input(out.inputs.rope_pos);
+    ggml_set_input(out.inputs.neg_pos);
+    ggml_set_input(out.inputs.raw_kv_rows);
+
+    if (ratio > 0) {
+        out.inputs.attn_ape_row = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
+        out.inputs.attn_comp_pos = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
+        out.inputs.attn_state_rows = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_I64, 1, 1);
+        out.inputs.attn_comp_rows = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_I64, 1, 1);
+        ggml_set_input(out.inputs.attn_ape_row);
+        ggml_set_input(out.inputs.attn_comp_pos);
+        ggml_set_input(out.inputs.attn_state_rows);
+        ggml_set_input(out.inputs.attn_comp_rows);
+    }
+    if (ratio == 4) {
+        out.inputs.index_ape_row = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
+        out.inputs.index_comp_pos = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
+        out.inputs.index_state_rows = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_I64, 1, 1);
+        out.inputs.index_comp_rows = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_I64, 1, 1);
+        ggml_set_input(out.inputs.index_ape_row);
+        ggml_set_input(out.inputs.index_comp_pos);
+        ggml_set_input(out.inputs.index_state_rows);
+        ggml_set_input(out.inputs.index_comp_rows);
+    }
+
+    std::vector<DeepSeek4I32InputBinding> i32_inputs;
+    std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
+    std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
+    ggml_tensor * normed = build_rms_norm(out.sg.ctx, out.sg.inp_embed, L.attn_norm, w.rms_eps);
+    out.sg.hidden_states = build_mla_attention(out.sg.ctx, out.sg.gf, normed, w, L, lc, layer_idx,
+                                               kv_start, n_tokens, &out.inputs,
                                                i32_inputs, i32_array_inputs, i64_array_inputs);
     if (!out.sg.hidden_states) {
         out.free();
@@ -2608,6 +2744,7 @@ bool deepseek4_step_layer_range(
     static std::vector<HashRoutingTableCpu> hash_routing_tables_range;
     static std::vector<DeepSeek4CachedLayerAlloc> cached_attn_allocs;
     static std::vector<DeepSeek4CachedDecodeAttnGraph> cached_decode_attn_graphs;
+    static std::vector<DeepSeek4CachedPrefillAttnGraph> cached_prefill_attn_graphs;
     static std::vector<DeepSeek4CachedDecodeFfnGraph> cached_decode_ffn_graphs;
     static DeepSeek4CachedDecodeOutputGraph cached_decode_output_graph;
     static DeepSeek4CachedLayerAlloc cached_dynamic_output_alloc;
@@ -2623,6 +2760,10 @@ bool deepseek4_step_layer_range(
             g.free();
         }
         cached_decode_attn_graphs.assign((size_t)w.n_layer, {});
+        for (auto & g : cached_prefill_attn_graphs) {
+            g.free();
+        }
+        cached_prefill_attn_graphs.assign((size_t)w.n_layer, {});
         for (auto & g : cached_decode_ffn_graphs) {
             g.free();
         }
@@ -2670,10 +2811,12 @@ bool deepseek4_step_layer_range(
             const int ratio = w.compress_ratios[il];
             const int token_pos = kv_start + n_tokens - 1;
             const bool reuse_decode_attn = n_tokens == 1 && ratio > 0;
+            const bool reuse_prefill_attn = n_tokens > 1;
             ggml_tensor * attn_out = nullptr;
             ggml_cgraph * gf = nullptr;
             ggml_context * ctx = nullptr;
             DeepSeek4CachedDecodeAttnGraph * cached_attn = nullptr;
+            DeepSeek4CachedPrefillAttnGraph * cached_prefill_attn = nullptr;
 
             if (reuse_decode_attn) {
                 const int n_raw = std::min(kv_start + 1, w.n_swa);
@@ -2723,6 +2866,66 @@ bool deepseek4_step_layer_range(
                     if (flush_boundary) {
                         ggml_backend_tensor_set(cached_attn->inputs.index_comp_rows, &comp_row, 0, sizeof(comp_row));
                         ggml_backend_tensor_set(cached_attn->inputs.index_comp_pos, &comp_pos, 0, sizeof(comp_pos));
+                    }
+                }
+            } else if (reuse_prefill_attn) {
+                const int n_raw = std::min(kv_start + n_tokens, w.n_swa);
+                const int n_comp_attn = (ratio > 0) ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos) : 0;
+                const int n_index_comp = (ratio == 4) ? ds4_comp_rows_used(lc.index_comp_kv, lc.n_index_comp, 4, token_pos) : 0;
+                auto & candidate = cached_prefill_attn_graphs[(size_t)il];
+                if (!candidate.valid() ||
+                    candidate.owner_ctx != w.ctx ||
+                    candidate.backend != backend ||
+                    candidate.layer_idx != il ||
+                    candidate.n_tokens != n_tokens ||
+                    candidate.n_raw != n_raw ||
+                    candidate.n_comp_attn != n_comp_attn ||
+                    candidate.n_index_comp != n_index_comp) {
+                    const auto attn_build_t0 = Ds4TimingClock::now();
+                    if (!build_cached_prefill_attn_graph(candidate, backend, w, L, lc, il, kv_start, n_tokens)) {
+                        std::fprintf(stderr, "[deepseek4] cached prefill attn graph alloc failed layer %d\n", il);
+                        return false;
+                    }
+                    if (telemetry) telemetry->attn_build_us += ds4_elapsed_us(attn_build_t0, Ds4TimingClock::now());
+                }
+                cached_prefill_attn = &candidate;
+                gf = cached_prefill_attn->sg.gf;
+                attn_out = cached_prefill_attn->sg.hidden_states;
+
+                std::vector<int32_t> rope_pos_vals((size_t)n_tokens);
+                std::vector<int32_t> neg_pos_vals((size_t)n_tokens);
+                std::vector<int64_t> raw_rows((size_t)n_tokens);
+                for (int ti = 0; ti < n_tokens; ++ti) {
+                    const int pos_ti = kv_start + ti;
+                    rope_pos_vals[(size_t)ti] = pos_ti;
+                    neg_pos_vals[(size_t)ti] = -pos_ti;
+                    raw_rows[(size_t)ti] = pos_ti % w.n_swa;
+                }
+                ggml_backend_tensor_set(cached_prefill_attn->sg.inp_embed, cur.data(), 0, sizeof(float) * cur.size());
+                ggml_backend_tensor_set(cached_prefill_attn->inputs.rope_pos,
+                                        rope_pos_vals.data(), 0, sizeof(int32_t) * rope_pos_vals.size());
+                ggml_backend_tensor_set(cached_prefill_attn->inputs.neg_pos,
+                                        neg_pos_vals.data(), 0, sizeof(int32_t) * neg_pos_vals.size());
+                ggml_backend_tensor_set(cached_prefill_attn->inputs.raw_kv_rows,
+                                        raw_rows.data(), 0, sizeof(int64_t) * raw_rows.size());
+                if (ratio > 0) {
+                    const int32_t ape_row = token_pos % ratio;
+                    const int64_t state_row = ratio + (token_pos % ratio);
+                    const int64_t comp_row = token_pos / ratio;
+                    const int32_t comp_pos = token_pos + 1 - ratio;
+                    ggml_backend_tensor_set(cached_prefill_attn->inputs.attn_ape_row, &ape_row, 0, sizeof(ape_row));
+                    ggml_backend_tensor_set(cached_prefill_attn->inputs.attn_state_rows, &state_row, 0, sizeof(state_row));
+                    if (((token_pos + 1) % ratio) == 0) {
+                        ggml_backend_tensor_set(cached_prefill_attn->inputs.attn_comp_rows, &comp_row, 0, sizeof(comp_row));
+                        ggml_backend_tensor_set(cached_prefill_attn->inputs.attn_comp_pos, &comp_pos, 0, sizeof(comp_pos));
+                    }
+                    if (ratio == 4) {
+                        ggml_backend_tensor_set(cached_prefill_attn->inputs.index_ape_row, &ape_row, 0, sizeof(ape_row));
+                        ggml_backend_tensor_set(cached_prefill_attn->inputs.index_state_rows, &state_row, 0, sizeof(state_row));
+                        if (((token_pos + 1) % ratio) == 0) {
+                            ggml_backend_tensor_set(cached_prefill_attn->inputs.index_comp_rows, &comp_row, 0, sizeof(comp_row));
+                            ggml_backend_tensor_set(cached_prefill_attn->inputs.index_comp_pos, &comp_pos, 0, sizeof(comp_pos));
+                        }
                     }
                 }
             } else {
