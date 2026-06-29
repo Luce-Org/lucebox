@@ -142,9 +142,11 @@ struct DeepSeek4AttentionGraphInputs {
     ggml_tensor * rope_pos = nullptr;
     ggml_tensor * neg_pos = nullptr;
     ggml_tensor * raw_kv_rows = nullptr;
+    ggml_tensor * attn_ape_row = nullptr;
     ggml_tensor * attn_state_rows = nullptr;
     ggml_tensor * attn_comp_rows = nullptr;
     ggml_tensor * attn_comp_pos = nullptr;
+    ggml_tensor * index_ape_row = nullptr;
     ggml_tensor * index_state_rows = nullptr;
     ggml_tensor * index_comp_rows = nullptr;
     ggml_tensor * index_comp_pos = nullptr;
@@ -167,7 +169,9 @@ struct DeepSeek4CachedDecodeAttnGraph {
                n_raw > 0 && n_comp_attn >= 0 && n_index_comp >= 0 && pos_mod >= 0 &&
                sg.ctx && sg.gf && sg.alloc && sg.inp_embed && sg.hidden_states &&
                inputs.rope_pos && inputs.neg_pos && inputs.raw_kv_rows &&
+               inputs.attn_ape_row &&
                inputs.attn_state_rows && inputs.attn_comp_rows && inputs.attn_comp_pos &&
+               inputs.index_ape_row &&
                inputs.index_state_rows && inputs.index_comp_rows && inputs.index_comp_pos;
     }
 
@@ -437,6 +441,7 @@ static void build_compressor_step(
         float rope_yarn_beta_fast,
         float rope_yarn_beta_slow,
         int rope_orig_ctx,
+        ggml_tensor * ape_row_inp,
         ggml_tensor * state_rows_inp,
         ggml_tensor * comp_rows_inp,
         ggml_tensor * comp_pos_inp,
@@ -457,10 +462,15 @@ static void build_compressor_step(
     ggml_tensor * kv_cur = ggml_mul_mat(ctx, kv_proj, cur_last);
     ggml_tensor * sc_cur = ggml_mul_mat(ctx, gate_proj, cur_last);
 
-    ggml_tensor * ape_col = ggml_view_2d(
-        ctx, ape, comp_width, 1, ape->nb[1], (size_t)pos_mod * ape->nb[1]);
-    // APE is F16 in the GGUF; cast to F32 for the add
-    ape_col = ggml_cast(ctx, ape_col, GGML_TYPE_F32);
+    ggml_tensor * ape_col = nullptr;
+    if (ape_row_inp) {
+        ape_col = ggml_get_rows(ctx, ape, ape_row_inp);
+        ape_col = ggml_reshape_2d(ctx, ape_col, comp_width, 1);
+    } else {
+        ape_col = ggml_view_2d(
+            ctx, ape, comp_width, 1, ape->nb[1], (size_t)pos_mod * ape->nb[1]);
+        ape_col = ggml_cast(ctx, ape_col, GGML_TYPE_F32);
+    }
     sc_cur = ggml_add(ctx, sc_cur, ape_col);
 
     if (state_rows_inp) {
@@ -597,6 +607,7 @@ static void build_indexer_compressor_step(
         const DeepSeek4Layer & L,
         DeepSeek4LayerCache & lc,
         int token_pos,
+        ggml_tensor * ape_row_inp,
         ggml_tensor * state_rows_inp,
         ggml_tensor * comp_rows_inp,
         ggml_tensor * comp_pos_inp,
@@ -619,6 +630,7 @@ static void build_indexer_compressor_step(
                           w.rope_yarn_beta_fast,
                           w.rope_yarn_beta_slow,
                           (int)w.rope_orig_ctx,
+                          ape_row_inp,
                           state_rows_inp,
                           comp_rows_inp,
                           comp_pos_inp,
@@ -835,6 +847,7 @@ static ggml_tensor * build_mla_attention(
                               w.rope_yarn_beta_fast,
                               w.rope_yarn_beta_slow,
                               (int)w.rope_orig_ctx,
+                              cached_inputs ? cached_inputs->attn_ape_row : nullptr,
                               cached_inputs ? cached_inputs->attn_state_rows : nullptr,
                               cached_inputs ? cached_inputs->attn_comp_rows : nullptr,
                               cached_inputs ? cached_inputs->attn_comp_pos : nullptr,
@@ -844,6 +857,7 @@ static ggml_tensor * build_mla_attention(
 
     if (ratio == 4 && L.indexer_compressor_kv) {
         build_indexer_compressor_step(ctx, gf, cur_last, w, L, lc, token_pos,
+                                      cached_inputs ? cached_inputs->index_ape_row : nullptr,
                                       cached_inputs ? cached_inputs->index_state_rows : nullptr,
                                       cached_inputs ? cached_inputs->index_comp_rows : nullptr,
                                       cached_inputs ? cached_inputs->index_comp_pos : nullptr,
@@ -998,11 +1012,15 @@ static bool build_cached_decode_attn_graph(
 
     out.inputs.rope_pos = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
     out.inputs.neg_pos = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
+    out.inputs.attn_ape_row = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
     out.inputs.attn_comp_pos = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
+    out.inputs.index_ape_row = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
     out.inputs.index_comp_pos = ggml_new_tensor_1d(out.sg.ctx, GGML_TYPE_I32, 1);
     ggml_set_input(out.inputs.rope_pos);
     ggml_set_input(out.inputs.neg_pos);
+    ggml_set_input(out.inputs.attn_ape_row);
     ggml_set_input(out.inputs.attn_comp_pos);
+    ggml_set_input(out.inputs.index_ape_row);
     ggml_set_input(out.inputs.index_comp_pos);
 
     out.inputs.raw_kv_rows = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_I64, 1, 1);
@@ -2424,7 +2442,7 @@ bool deepseek4_step_layer_range(
         {
             const int ratio = w.compress_ratios[il];
             const int token_pos = kv_start + n_tokens - 1;
-            const bool reuse_decode_attn = n_tokens == 1 && ratio == 4;
+            const bool reuse_decode_attn = n_tokens == 1 && ratio > 0;
             ggml_tensor * attn_out = nullptr;
             ggml_cgraph * gf = nullptr;
             ggml_context * ctx = nullptr;
@@ -2442,8 +2460,7 @@ bool deepseek4_step_layer_range(
                     candidate.layer_idx != il ||
                     candidate.n_raw != n_raw ||
                     candidate.n_comp_attn != n_comp_attn ||
-                    candidate.n_index_comp != n_index_comp ||
-                    candidate.pos_mod != pos_mod) {
+                    candidate.n_index_comp != n_index_comp) {
                     const auto attn_build_t0 = Ds4TimingClock::now();
                     if (!build_cached_decode_attn_graph(candidate, backend, w, L, lc, il, kv_start)) {
                         std::fprintf(stderr, "[deepseek4] cached attn graph alloc failed layer %d\n", il);
@@ -2456,6 +2473,7 @@ bool deepseek4_step_layer_range(
                 attn_out = cached_attn->sg.hidden_states;
 
                 const int64_t raw_row = kv_start % w.n_swa;
+                const int32_t ape_row = token_pos % ratio;
                 const int64_t state_row = ratio + pos_mod;
                 const int64_t comp_row = token_pos / ratio;
                 const int32_t rope_pos = kv_start;
@@ -2465,9 +2483,11 @@ bool deepseek4_step_layer_range(
                 ggml_backend_tensor_set(cached_attn->inputs.rope_pos, &rope_pos, 0, sizeof(rope_pos));
                 ggml_backend_tensor_set(cached_attn->inputs.neg_pos, &neg_pos, 0, sizeof(neg_pos));
                 ggml_backend_tensor_set(cached_attn->inputs.raw_kv_rows, &raw_row, 0, sizeof(raw_row));
+                ggml_backend_tensor_set(cached_attn->inputs.attn_ape_row, &ape_row, 0, sizeof(ape_row));
                 ggml_backend_tensor_set(cached_attn->inputs.attn_state_rows, &state_row, 0, sizeof(state_row));
                 ggml_backend_tensor_set(cached_attn->inputs.attn_comp_rows, &comp_row, 0, sizeof(comp_row));
                 ggml_backend_tensor_set(cached_attn->inputs.attn_comp_pos, &comp_pos, 0, sizeof(comp_pos));
+                ggml_backend_tensor_set(cached_attn->inputs.index_ape_row, &ape_row, 0, sizeof(ape_row));
                 ggml_backend_tensor_set(cached_attn->inputs.index_state_rows, &state_row, 0, sizeof(state_row));
                 ggml_backend_tensor_set(cached_attn->inputs.index_comp_rows, &comp_row, 0, sizeof(comp_row));
                 ggml_backend_tensor_set(cached_attn->inputs.index_comp_pos, &comp_pos, 0, sizeof(comp_pos));
