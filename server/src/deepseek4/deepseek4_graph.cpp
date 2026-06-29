@@ -298,7 +298,7 @@ static bool build_cached_decode_ffn_graph(
         bool hash_routed) {
     out.free();
 
-    const size_t ctx_size = 48 * 1024 * 1024;
+    const size_t ctx_size = 16 * 1024 * 1024;
     ggml_init_params params{};
     params.mem_size = ctx_size;
     params.mem_buffer = nullptr;
@@ -2702,7 +2702,7 @@ bool deepseek4_step_layer_range(
                                candidate.n_index_comp == n_index_comp;
                     });
                 if (it == per_layer.end()) {
-                    if (per_layer.size() >= 12) {
+                    if (per_layer.size() >= 20) {
                         per_layer.front().free();
                         per_layer.erase(per_layer.begin());
                     }
