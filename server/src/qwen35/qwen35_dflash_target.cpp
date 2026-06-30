@@ -5,6 +5,7 @@
 #include "graph_builders.h"
 #include "step_graph.h"
 #include "attn_masks.h"
+#include "common/geometric_draft_topk_cuda.h"
 // gpu_runtime_compat.h maps the raw cudaStream_t / cudaMemcpy* symbols used
 // below (rollback_to / rollback_to_tree) onto their HIP equivalents. Without
 // it the file only compiles on CUDA via a transitive <cuda_runtime.h>; HIP
@@ -293,13 +294,38 @@ bool Qwen35DFlashTarget::verify_tree(
         return false;
     }
 
-    // Posterior = per-node target argmax. Tree-shaped graphs can return -1 from
-    // the GPU argmax shortcut, so compute argmax on CPU from full logits.
+    // Posterior = per-node target argmax.
+    //
+    // The verify graph already computes a batched per-node GPU argmax
+    // (sg_.argmax_tokens, built by build_target_step_tree). When the caller does
+    // not need the full logits (greedy decode, logits_out == nullptr) we read
+    // those N_actual int32s directly and skip the vocab×N_actual D2H + CPU
+    // argmax entirely — eliminates the verify-logits transfer hotspot.
+    //
+    // Historically the GPU argmax shortcut has returned -1 for tree-shaped
+    // verify graphs on some builds; guard against that by validating every row
+    // and falling back to the CPU path for the step if any index is bad.
+    // Escape hatch: DFLASH_GPU_VERIFY_ARGMAX=0 forces the legacy CPU path.
+    static const bool kGpuVerifyArgmax = []() {
+        const char * v = std::getenv("DFLASH_GPU_VERIFY_ARGMAX");
+        return v == nullptr || v[0] != '0';
+    }();
     const int vocab = (int)sg_.logits->ne[0];
+    posterior_out.resize(N_actual);
+
+    if (kGpuVerifyArgmax && !logits_out && sg_.argmax_tokens) {
+        ggml_backend_tensor_get(sg_.argmax_tokens, posterior_out.data(), 0,
+                                sizeof(int32_t) * N_actual);
+        bool ok = true;
+        for (int i = 0; i < N_actual; i++) {
+            if (posterior_out[i] < 0 || posterior_out[i] >= vocab) { ok = false; break; }
+        }
+        if (ok) return true;  // fast path; otherwise fall through to CPU argmax
+    }
+
     std::vector<float> logits((size_t)vocab * N_actual);
     ggml_backend_tensor_get(sg_.logits, logits.data(), 0,
                             sizeof(float) * (size_t)vocab * N_actual);
-    posterior_out.resize(N_actual);
     for (int i = 0; i < N_actual; i++) {
         const float * row = logits.data() + (size_t)i * vocab;
         int am = 0; float best = row[0];
@@ -663,12 +689,28 @@ bool Qwen35DFlashTarget::project_hidden_to_topk(
     if (st != GGML_STATUS_SUCCESS) return false;
 
     const int vocab = (int)proj_sg_.logits->ne[0];
+    top_log_probs.assign((size_t)n_tokens * K, 0.0f);
+    top_token_ids.assign((size_t)n_tokens * K, 0);
+
+#ifdef DFLASH27B_HAVE_DRAFT_TOPK_CUDA
+    // GPU path: top-K + logsumexp directly on the logits device buffer, skipping
+    // the vocab×n_tokens D2H and the CPU heap extract. Falls back to the CPU path
+    // on any failure. Escape hatch: DFLASH_GPU_DRAFT_TOPK=0.
+    static const bool kGpuDraftTopk = []() {
+        const char * v = std::getenv("DFLASH_GPU_DRAFT_TOPK");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (kGpuDraftTopk &&
+        geometric_extract_draft_topk_cuda(proj_sg_.logits->data, n_tokens, vocab, K,
+                                top_log_probs.data(), top_token_ids.data(),
+                                temperature)) {
+        return true;
+    }
+#endif
+
     std::vector<float> logits((size_t)vocab * n_tokens);
     ggml_backend_tensor_get(proj_sg_.logits, logits.data(), 0,
                             sizeof(float) * (size_t)vocab * n_tokens);
-
-    top_log_probs.assign((size_t)n_tokens * K, 0.0f);
-    top_token_ids.assign((size_t)n_tokens * K, 0);
     extract_draft_topk(logits.data(), n_tokens, vocab, K,
                        top_log_probs.data(), top_token_ids.data(), temperature);
     return true;

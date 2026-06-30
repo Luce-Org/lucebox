@@ -14,11 +14,13 @@
 #include "common/domino_head.h"
 #include "common/dflash_feature_ring.h"
 #include "common/dflash_draft_graph.h"
+#include "kv_quant.h"
 
 #include <chrono>
 #include "../common/moe_hybrid_types.h"
 #include "../common/moe_hybrid_types_impl.h"
 #include "../common/moe_hybrid_placement.h"
+#include "../common/kvflash_placement.h"
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_storage.h"
 #include "../common/moe_hybrid_routing_stats.h"
@@ -41,6 +43,44 @@
 #include "common/gguf_mmap.h"
 
 namespace dflash::common {
+
+namespace {
+
+static bool laguna_kv_type_env_present() {
+    return std::getenv("DFLASH27B_KV_K") ||
+           std::getenv("DFLASH27B_KV_V") ||
+           std::getenv("DFLASH27B_KV_F16") ||
+           std::getenv("DFLASH27B_KV_Q4") ||
+           std::getenv("DFLASH27B_KV_TQ3");
+}
+
+static void resolve_laguna_kv_types(const LagunaBackendArgs & args,
+                                    ggml_type & k_type,
+                                    ggml_type & v_type) {
+    k_type = args.kv_type;
+    v_type = args.kv_type;
+    if (laguna_kv_type_env_present()) {
+        dflash::resolve_kv_types(k_type, v_type);
+    }
+}
+
+static bool laguna_auto_head_major_enabled() {
+    static const bool enabled = []() {
+        const char * e = std::getenv("DFLASH_LAGUNA_AUTO_HEAD_MAJOR");
+        return !(e && std::string(e) == "0");
+    }();
+    return enabled;
+}
+
+static bool laguna_gpu_argmax_enabled() {
+    static const bool enabled = []() {
+        const char * e = std::getenv("DFLASH_LAGUNA_GPU_ARGMAX");
+        return e == nullptr || e[0] != '0';
+    }();
+    return enabled;
+}
+
+}  // namespace
 
 static bool laguna_sampled_verify_enabled(const SamplerCfg & sampler, bool do_sample) {
     static const bool kSampledVerify = []() {
@@ -87,9 +127,17 @@ bool LagunaBackend::init() {
         }
     }
 
-    cache_.kv_k_type = args_.kv_type;
-    cache_.kv_v_type = args_.kv_type;
+    resolve_laguna_kv_types(args_, cache_.kv_k_type, cache_.kv_v_type);
     kvflash_read_config();
+    if (laguna_auto_head_major_enabled() &&
+        !std::getenv("DFLASH_LAGUNA_KV_HEAD_MAJOR") &&
+        kvflash_tokens_ <= 0 &&
+        !args_.ddtree_mode) {
+        setenv("DFLASH_LAGUNA_KV_HEAD_MAJOR", "1", 0);
+        std::fprintf(stderr,
+                     "[laguna] auto-enabled head-major KV layout "
+                     "(disable with DFLASH_LAGUNA_AUTO_HEAD_MAJOR=0)\n");
+    }
     if (!create_laguna_target_cache(w_, args_.max_ctx, backend_, cache_,
                                     kvflash_tokens_)) {
         std::fprintf(stderr, "cache failed: %s\n", dflash27b_last_error());
@@ -121,27 +169,42 @@ KvFlashConfig LagunaBackend::kvflash_config() const {
     return pc;
 }
 
-void LagunaBackend::kvflash_read_config() {
+void LagunaBackend::kvflash_resolve_drafter() {
     if (std::getenv("DFLASH_KVFLASH")) {
         kvflash_drafter_path_ = kvflash_find_drafter(args_.target_path.c_str());
     }
+}
+
+KvFlashAutoBudget LagunaBackend::make_kvflash_budget(int64_t gpu_free) const {
+    KvFlashAutoBudget b;
+    b.free_bytes      = gpu_free;
+    b.bytes_per_token = (int64_t)w_.n_layer * w_.n_head_kv * 2 *
+        (int64_t)ggml_row_size(args_.kv_type, w_.head_dim);
+    b.reserve_bytes   = (int64_t)(1.5 * 1073741824.0) +
+        (kvflash_drafter_path_.empty() ? 0 : (int64_t)(1.7 * 1073741824.0));
+    return b;
+}
+
+void LagunaBackend::kvflash_read_config() {
+    kvflash_resolve_drafter();
     // "auto" sizes from the GPU (weights resident, cache not yet allocated):
     // laguna pools ALL n_layer layers at the configured KV quant.
-    KvFlashAutoBudget kvf_budget;
-    {
-        size_t gpu_free = 0, gpu_total = 0;
-        if (ggml_backend_dev_t dev = ggml_backend_get_device(backend_)) {
-            ggml_backend_dev_memory(dev, &gpu_free, &gpu_total);
-        }
-        kvf_budget.free_bytes      = (int64_t)gpu_free;
-        kvf_budget.bytes_per_token = (int64_t)w_.n_layer * w_.n_head_kv * 2 *
-            (int64_t)ggml_row_size(args_.kv_type, w_.head_dim);
-        kvf_budget.reserve_bytes   = (int64_t)(1.5 * 1073741824.0) +
-            (kvflash_drafter_path_.empty() ? 0 : (int64_t)(1.7 * 1073741824.0));
+    size_t gpu_free = 0, gpu_total = 0;
+    if (ggml_backend_dev_t dev = ggml_backend_get_device(backend_)) {
+        ggml_backend_dev_memory(dev, &gpu_free, &gpu_total);
     }
+    KvFlashAutoBudget kvf_budget = make_kvflash_budget((int64_t)gpu_free);
     kvflash_tokens_ = kvflash_pool_from_env(args_.max_ctx, kvflash_config(),
-                                            !kvflash_drafter_path_.empty(),
+                                            kvflash_scorer_expected(),
                                             kvf_budget);
+    if (kvflash_tokens_ > 0 && placement_all_hot_full_kv_) {
+        std::printf("[laguna][kvflash] disabled: placement all-hot at max_ctx %d, "
+                    "pool not needed\n", args_.max_ctx);
+        std::fflush(stdout);
+        kvflash_tokens_ = 0;
+        kvflash_tau_ = 64;
+        kvflash_drafter_path_.clear();
+    }
     if (kvflash_tokens_ > 0) {
         const char * tau = std::getenv("DFLASH_KVFLASH_TAU");
         kvflash_tau_ = std::max(1, tau ? std::atoi(tau) : 64);
@@ -264,8 +327,17 @@ bool LagunaBackend::unpark(const std::string & what) {
                 return false;
             }
         }
-        cache_.kv_k_type = args_.kv_type;
-        cache_.kv_v_type = args_.kv_type;
+        resolve_laguna_kv_types(args_, cache_.kv_k_type, cache_.kv_v_type);
+        kvflash_read_config();
+        if (laguna_auto_head_major_enabled() &&
+            !std::getenv("DFLASH_LAGUNA_KV_HEAD_MAJOR") &&
+            kvflash_tokens_ <= 0 &&
+            !args_.ddtree_mode) {
+            setenv("DFLASH_LAGUNA_KV_HEAD_MAJOR", "1", 0);
+            std::fprintf(stderr,
+                         "[laguna] auto-enabled head-major KV layout "
+                         "(disable with DFLASH_LAGUNA_AUTO_HEAD_MAJOR=0)\n");
+        }
         if (!create_laguna_target_cache(w_, args_.max_ctx, backend_, cache_,
                                         kvflash_tokens_)) {
             std::fprintf(stderr, "[unpark] cache: %s\n", dflash27b_last_error());
@@ -1065,11 +1137,16 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
         }
         if (!w_.embedder.embed(&next_tok, 1, embed_step.data())) { ok = false; break; }
         std::vector<float> step_logits;
+        int32_t step_argmax = -1;
+        const bool use_gpu_argmax = !req.do_sample && laguna_gpu_argmax_enabled();
         if (!kvflash_alloc_span(cache_.cur_pos, 1) ||
             !laguna_step(backend_, w_, cache_, embed_step.data(), 1,
-                          cache_.cur_pos, no_mask, step_logits, kvf)) { ok = false; break; }
+                          cache_.cur_pos, no_mask, step_logits, kvf,
+                          /*capture=*/false,
+                          use_gpu_argmax ? &step_argmax : nullptr,
+                          /*read_logits=*/!use_gpu_argmax)) { ok = false; break; }
         kvflash_maybe_reselect(history, s + 1);
-        next_tok = pick(step_logits);
+        next_tok = use_gpu_argmax ? step_argmax : pick(step_logits);
     }
     auto t_g1 = std::chrono::steady_clock::now();
     result.decode_s = std::chrono::duration<double>(t_g1 - t_g0).count();
@@ -1279,11 +1356,16 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
         if (out_io.cancelled) break;
         if (!w_.embedder.embed(&next_tok, 1, embed_step.data())) { ok = false; break; }
         std::vector<float> step_logits;
+        int32_t step_argmax = -1;
+        const bool use_gpu_argmax = !req.do_sample && laguna_gpu_argmax_enabled();
         if (!kvflash_alloc_span(cache_.cur_pos, 1) ||
             !laguna_step(backend_, w_, cache_, embed_step.data(), 1,
-                          cache_.cur_pos, no_mask, step_logits, kvf)) { ok = false; break; }
+                          cache_.cur_pos, no_mask, step_logits, kvf,
+                          /*capture=*/false,
+                          use_gpu_argmax ? &step_argmax : nullptr,
+                          /*read_logits=*/!use_gpu_argmax)) { ok = false; break; }
         kvflash_maybe_reselect(history, s + 1);
-        next_tok = pick(step_logits);
+        next_tok = use_gpu_argmax ? step_argmax : pick(step_logits);
     }
     auto t_g1 = std::chrono::steady_clock::now();
     result.decode_s = std::chrono::duration<double>(t_g1 - t_g0).count();
@@ -1382,6 +1464,7 @@ static inline uint64_t elapsed_us(HybridClock::time_point t0, HybridClock::time_
 
 bool LagunaBackend::init_hybrid_mode() {
     const char * hotness_path = std::getenv("DFLASH_LAGUNA_HOTNESS");
+    placement_all_hot_full_kv_ = false;
 
     // Step 1: Load model WITHOUT expert data to GPU (partial load)
     TargetLoadPlan _hybrid_plan;
@@ -1454,12 +1537,28 @@ bool LagunaBackend::init_hybrid_mode() {
 
     const uint64_t kv_bytes_per_tok = (uint64_t)w_.n_layer * 2 *
         (uint64_t)w_.n_head_kv * (uint64_t)w_.head_dim * 2;
-    const uint64_t kv_total = kv_bytes_per_tok * (uint64_t)max_context;
 
     const uint64_t warm_cache_bytes = 200ULL * 1024 * 1024;
     const uint64_t safety_bytes = 512ULL * 1024 * 1024;
     const uint64_t core_bytes =
         moe_hybrid_core_bytes_from_memory("laguna", gpu_free, gpu_total);
+
+    kvflash_resolve_drafter();
+    const int kvf_pool = kvflash_pool_from_env(
+        max_context, kvflash_config(), kvflash_scorer_expected(),
+        make_kvflash_budget((int64_t)gpu_free));
+    const auto kvf_dec = dflash::common::kvflash_placement_decision(
+        kv_bytes_per_tok, max_context, kvf_pool,
+        gpu_total, core_bytes, total_expert_bytes,
+        warm_cache_bytes, safety_bytes, /*draft_bytes=*/0);
+    const uint64_t kv_total = kvf_dec.kv_total;
+    const int kv_ctx_log = kvf_dec.kv_ctx;
+    placement_all_hot_full_kv_ = kvf_dec.all_hot_full_kv;
+    if (kvf_dec.pool_reduced) {
+        std::printf("[laguna][kvflash] placement reserves pool KV (%d tokens, "
+                    "not max_ctx %d) -> experts stay hot\n", kvf_pool, max_context);
+        std::fflush(stdout);
+    }
 
     uint64_t expert_budget = 0;
     if (gpu_total > core_bytes + kv_total + warm_cache_bytes + safety_bytes) {
@@ -1511,7 +1610,7 @@ bool LagunaBackend::init_hybrid_mode() {
                 gpu_total / 1024.0 / 1024.0 / 1024.0,
                 core_bytes / 1024.0 / 1024.0 / 1024.0,
                 kv_total / 1024.0 / 1024.0 / 1024.0,
-                max_context,
+                kv_ctx_log,
                 warm_cache_bytes / 1024.0 / 1024.0,
                 safety_bytes / 1024.0 / 1024.0,
                 expert_budget / 1024.0 / 1024.0 / 1024.0,

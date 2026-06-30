@@ -47,9 +47,11 @@ variable "DFLASH_CUDA_ARCHES" { default = "75;80;86;89;90;120" }
 # Fat-binary HIP/gfx arch list for the rocm variant (semicolon-separated).
 # Default is gfx1151 (Strix Halo, the lucebox appliance iGPU) only, to keep the
 # build tractable. Widen for a broadly-runnable released image, e.g.:
-#   DFLASH_HIP_ARCHES="gfx1151;gfx1100;gfx1200;gfx942;gfx90a" docker buildx bake rocm
-# (gfx1151 Strix Halo, gfx1100 RX7900/RDNA3, gfx1200 RDNA4, gfx942 MI300,
-# gfx90a MI200.)
+#   DFLASH_HIP_ARCHES="gfx1151;gfx1100;gfx1200;gfx1201;gfx942;gfx90a" docker buildx bake rocm
+# (gfx1151 Strix Halo, gfx1100 RX7900/RDNA3, gfx1200 RDNA4 RX9060,
+# gfx1201 RDNA4 RX9070/Radeon AI PRO R9700, gfx942 MI300, gfx90a MI200.)
+# Note: gfx1200 and gfx1201 are NOT code-object compatible — the R9700 needs
+# gfx1201 explicitly.
 variable "DFLASH_HIP_ARCHES" { default = "gfx1151" }
 
 # ROCm base-image tag for the rocm variant. gfx1151 needs >= 6.4.1. Default

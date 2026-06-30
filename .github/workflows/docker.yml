@@ -191,10 +191,11 @@ jobs:
           DFLASH_CUDA_ARCHES: ${{ github.event_name == 'pull_request' && '86' || '75;80;86;89;90;120' }}
           # Same split for HIP: PR builds compile gfx1151 only (the verified
           # reference, Strix Halo); main / release builds widen to consumer
-          # RDNA so the published :rocm runs on RX 7900 (gfx1100) and RDNA4
-          # (gfx1200) too. CDNA datacenter parts (gfx90a/gfx942) stay out
-          # until someone can test them.
-          DFLASH_HIP_ARCHES: ${{ github.event_name == 'pull_request' && 'gfx1151' || 'gfx1151;gfx1100;gfx1200' }}
+          # RDNA so the published :rocm runs on RX 7900 (gfx1100) and both RDNA4
+          # code objects — gfx1200 (RX 9060) and gfx1201 (RX 9070 / Radeon AI
+          # PRO R9700), which are NOT binary-compatible with each other. CDNA
+          # datacenter parts (gfx90a/gfx942) stay out until someone can test them.
+          DFLASH_HIP_ARCHES: ${{ github.event_name == 'pull_request' && 'gfx1151' || 'gfx1151;gfx1100;gfx1200;gfx1201' }}
         with:
           # bake-action v6+ defaults `source` to the remote git context, which
           # makes the local metadata-action bake-file (written to the runner

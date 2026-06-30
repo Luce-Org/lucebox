@@ -25,6 +25,8 @@
 
 #include "internal.h"
 #include "common/derived_scalars.h"
+#include "common/gguf_mmap.h"
+#include "common/gguf_bounds.h"
 
 #include <cinttypes>
 #include <cstdint>
@@ -43,63 +45,6 @@
 namespace dflash::common {
 
 namespace {
-
-struct Mmap {
-    void *  addr = nullptr;
-    size_t  len  = 0;
-#if defined(_WIN32)
-    HANDLE  hFile = INVALID_HANDLE_VALUE;
-    HANDLE  hMap  = nullptr;
-#else
-    int     fd   = -1;
-#endif
-
-    bool open_ro(const std::string & path, std::string & err) {
-#if defined(_WIN32)
-        hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hFile == INVALID_HANDLE_VALUE) {
-            err = "CreateFileA: " + path + ": error " + std::to_string(GetLastError());
-            return false;
-        }
-        LARGE_INTEGER sz;
-        if (!GetFileSizeEx(hFile, &sz)) {
-            err = "GetFileSizeEx: error " + std::to_string(GetLastError());
-            return false;
-        }
-        len = (size_t)sz.QuadPart;
-        hMap = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
-        if (!hMap) {
-            err = "CreateFileMappingA: error " + std::to_string(GetLastError());
-            return false;
-        }
-        addr = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
-        if (!addr) {
-            err = "MapViewOfFile: error " + std::to_string(GetLastError());
-            return false;
-        }
-#else
-        fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) { err = "open: " + path + ": " + std::strerror(errno); return false; }
-        struct stat st;
-        if (::fstat(fd, &st) < 0) { err = "fstat: " + std::string(std::strerror(errno)); return false; }
-        len = (size_t)st.st_size;
-        addr = ::mmap(nullptr, len, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (addr == MAP_FAILED) { err = "mmap: " + std::string(std::strerror(errno)); addr = nullptr; return false; }
-#endif
-        return true;
-    }
-    ~Mmap() {
-#if defined(_WIN32)
-        if (addr)                        UnmapViewOfFile(addr);
-        if (hMap)                        CloseHandle(hMap);
-        if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
-#else
-        if (addr) ::munmap(addr, len);
-        if (fd >= 0) ::close(fd);
-#endif
-    }
-};
 
 uint32_t get_u32_or(const gguf_context * g, const char * key, uint32_t fallback) {
     int64_t id = gguf_find_key(g, key);
@@ -420,8 +365,10 @@ bool load_draft_gguf(const std::string & path,
 
     // ── 4. mmap file and copy tensor bytes to CUDA ───────────────────────
     std::string err;
-    Mmap mm;
-    if (!mm.open_ro(path, err)) { set_last_error(err); gguf_free(gctx); return false; }
+    GgufMmap mm;
+    if (!mm.open(path, err)) { set_last_error(err); gguf_free(gctx); return false; }
+    const uint8_t * mm_addr = (const uint8_t *)mm.data();
+    const size_t    mm_len  = mm.size();
     const size_t data_start = gguf_get_data_offset(gctx);
     const int64_t n_tensors = gguf_get_n_tensors(gctx);
 
@@ -430,14 +377,16 @@ bool load_draft_gguf(const std::string & path,
         const char * tname = gguf_get_tensor_name(gctx, tid);
         ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
         if (!t) continue;
-        const size_t off = data_start + gguf_get_tensor_offset(gctx, tid);
-        const size_t sz  = gguf_get_tensor_size(gctx, tid);
-        if (off + sz > mm.len) {
-            set_last_error(std::string("draft GGUF: tensor '") + tname + "' overflows file");
+        const size_t rel_off = gguf_get_tensor_offset(gctx, tid);
+        const size_t sz      = gguf_get_tensor_size(gctx, tid);
+        if (!gguf_tensor_in_file(data_start, rel_off, sz, mm_len)) {
+            set_last_error(gguf_bounds_error("draft GGUF", tname,
+                ggml_type_name(gguf_get_tensor_type(gctx, tid)),
+                data_start, rel_off, sz, mm_len));
             gguf_free(gctx);
             return false;
         }
-        ggml_backend_tensor_set(t, (const uint8_t *)mm.addr + off, 0, sz);
+        ggml_backend_tensor_set(t, mm_addr + data_start + rel_off, 0, sz);
         total += sz;
     }
 

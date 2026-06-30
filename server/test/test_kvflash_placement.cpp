@@ -80,7 +80,19 @@ int main() {
         expect(d.kv_ctx == 32768,  "C5: keeps full ctx");
     }
 
-    // Case 6 — the MoE gate must trust actual hybrid placement over the
+    // Case 6 — laguna/poolside-style no-draft placement: same pool rule, no
+    // drafter reserve. This keeps the shared helper covered for both current
+    // backends that use it.
+    {
+        auto d = kvflash_placement_decision(kv_per_tok, 131072, /*pool=*/16384,
+                                            gpu, core, experts, warm, safety,
+                                            /*draft_bytes=*/0);
+        expect(!d.all_hot_full_kv, "C6: full KV still forces experts cold");
+        expect(d.kv_ctx == 16384,  "C6: laguna reserves POOL ctx");
+        expect(d.pool_reduced,     "C6: laguna pool reduction engaged");
+    }
+
+    // Case 7 — the MoE gate must trust actual hybrid placement over the
     // pre-cap full-KV flag. DFLASH_EXPERT_BUDGET_MB can force cold experts
     // after all_hot_full_kv was computed; disabling KVFlash here makes the
     // paged warm-restore path unreachable and the snapshot-chain gate invalid.
@@ -90,22 +102,22 @@ int main() {
                    /*all_hot_full_kv=*/true,
                    /*has_hybrid=*/true,
                    /*total_cold_experts=*/2518),
-               "C6: actual cold hybrid experts keep kvflash active");
+               "C7: actual cold hybrid experts keep kvflash active");
         expect(kvflash_moe_should_disable_pool(
                    /*kvflash_active=*/true,
                    /*all_hot_full_kv=*/true,
                    /*has_hybrid=*/true,
                    /*total_cold_experts=*/0),
-               "C6: hybrid with zero cold experts disables redundant kvflash");
+               "C7: hybrid with zero cold experts disables redundant kvflash");
         expect(kvflash_moe_should_disable_pool(
                    /*kvflash_active=*/true,
                    /*all_hot_full_kv=*/true,
                    /*has_hybrid=*/false,
                    /*total_cold_experts=*/0),
-               "C6: all-hot full-KV early return disables redundant kvflash");
+               "C7: all-hot full-KV early return disables redundant kvflash");
     }
 
-    // Case 7 — an explicit force mode must keep the pool alive even when the
+    // Case 8 — an explicit force mode must keep the pool alive even when the
     // automatic MoE gate would consider it redundant. This gives us a deliberate
     // all-hot KVFlash control arm without changing default production behavior.
     {
@@ -115,16 +127,16 @@ int main() {
                    /*has_hybrid=*/true,
                    /*total_cold_experts=*/0,
                    /*force_pool=*/true),
-               "C7: forced all-hot hybrid keeps kvflash active");
+               "C8: forced all-hot hybrid keeps kvflash active");
         expect(!kvflash_moe_should_disable_pool(
                    /*kvflash_active=*/true,
                    /*all_hot_full_kv=*/true,
                    /*has_hybrid=*/false,
                    /*total_cold_experts=*/0,
                    /*force_pool=*/true),
-               "C7: forced all-hot early return keeps kvflash active");
+               "C8: forced all-hot early return keeps kvflash active");
     }
 
-    std::printf("PASS: kvflash placement decision (7 cases)\n");
+    std::printf("PASS: kvflash placement decision (8 cases)\n");
     return 0;
 }

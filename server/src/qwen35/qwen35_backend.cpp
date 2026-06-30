@@ -156,12 +156,12 @@ KvFlashAutoBudget Qwen35Backend::make_kvflash_budget(const TargetWeights & w,
                                                      int64_t gpu_free) const {
     ggml_type kv_k = GGML_TYPE_Q8_0, kv_v = GGML_TYPE_Q8_0;
     dflash::resolve_kv_types(kv_k, kv_v);
-    const int n_full = w.n_layer / w.full_attention_interval;
     KvFlashAutoBudget b;
     b.free_bytes      = gpu_free;
-    b.bytes_per_token = (int64_t)n_full * w.n_head_kv *
-        (int64_t)(ggml_row_size(kv_k, w.n_embd_head_k) +
-                  ggml_row_size(kv_v, w.n_embd_head_v));
+    // Single source of truth with the qwen35moe placement path — see kv_quant.h.
+    b.bytes_per_token = (int64_t)dflash::kv_reservation_bytes_per_token(
+        w.n_layer, w.full_attention_interval, w.n_head_kv,
+        kv_k, w.n_embd_head_k, kv_v, w.n_embd_head_v);
     b.reserve_bytes   = (int64_t)(1.5 * 1073741824.0) +
         (kvflash_drafter_path_.empty() ? 0 : (int64_t)(1.7 * 1073741824.0));
     return b;
