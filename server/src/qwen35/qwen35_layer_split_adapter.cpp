@@ -530,7 +530,7 @@ bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
             base_pos, (size_t)base_pos + prompt.size(), cfg_.device.max_ctx);
         return false;
     }
-    int ubatch = prompt.size() > 2048 ? 384 : 16;
+    int ubatch = cfg_.chunk > 0 ? cfg_.chunk : 512;
     if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
         ubatch = std::max(1, std::atoi(s));
     }
