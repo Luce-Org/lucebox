@@ -55,7 +55,8 @@ inline void kvflash_qk_chunk_scores(
     std::vector<float> & out,
     float missing_score = -2.0f,
     const float * seeded = nullptr,
-    float seeded_sentinel = -std::numeric_limits<float>::infinity()) {
+    float seeded_sentinel = -std::numeric_limits<float>::infinity(),
+    int seeded_n = 0) {
     const int group = d.n_q_heads / d.n_kv_heads;
     const int n_chunks = (int)pooled_keys.size();
     out.assign((size_t)n_chunks, missing_score);
@@ -93,9 +94,13 @@ inline void kvflash_qk_chunk_scores(
     }
     // Seeded fallback: for chunks with no pooled key, use the ledger score from
     // a prior turn if it is not the sentinel (i.e. it was actually scored).
-    if (seeded) {
+    // seeded_n bounds the valid range of the seeded array; a restored ledger
+    // can be shorter than the current n_chunks (pool grew after restore), so
+    // chunks at/above seeded_n fall back to missing_score instead of reading
+    // past the buffer.
+    if (seeded && seeded_n > 0) {
         for (int c = 0; c < n_chunks; c++) {
-            if (!pooled_keys[(size_t)c] && seeded[c] != seeded_sentinel) {
+            if (c < seeded_n && !pooled_keys[(size_t)c] && seeded[c] != seeded_sentinel) {
                 out[(size_t)c] = seeded[c];
             }
         }
@@ -191,6 +196,9 @@ public:
     const float * seeded_scores_ptr() const {
         return seeded_scores_.empty() ? nullptr : seeded_scores_.data();
     }
+    // Number of valid entries in the seeded array (ledger chunk count at restore
+    // time). May be less than the current pool n_chunks after restore+growth.
+    int seeded_scores_n() const { return (int)seeded_scores_.size(); }
 
     // Rebuild seeded scores from a KvFlashPager after deserialize().
     // KvFlashPager accessors used: n_chunks(), chunk_score(c).
@@ -234,7 +242,9 @@ public:
         // whose pooled keys have not been rebuilt yet (Phase 2 restore path).
         kvflash_qk_chunk_scores(pk, query_.data(), d, out,
                                 /*missing_score=*/-2.0f,
-                                pool_->seeded_scores_ptr());
+                                pool_->seeded_scores_ptr(),
+                                /*seeded_sentinel=*/-std::numeric_limits<float>::infinity(),
+                                /*seeded_n=*/pool_->seeded_scores_n());
         return true;
     }
 

@@ -176,7 +176,8 @@ int main() {
         std::vector<float> out2;
         kvflash_qk_chunk_scores(pk2, q2.data(), d2, out2,
                                 /*missing_score=*/-2.0f,
-                                seeded.data(), kSentinel);
+                                seeded.data(), kSentinel,
+                                /*seeded_n=*/(int)seeded.size());
 
         CHECK(out2.size() == 4, "phase2: output size == 4");
         CHECK(near(out2[0], 1.0f),  "phase2: c0 pooled key -> cosine 1.0 (seeded ignored)");
@@ -189,7 +190,8 @@ int main() {
         std::vector<float> out3;
         kvflash_qk_chunk_scores(pk2, q2.data(), d2, out3,
                                 /*missing_score=*/-2.0f,
-                                all_sentinel.data(), kSentinel);
+                                all_sentinel.data(), kSentinel,
+                                /*seeded_n=*/(int)all_sentinel.size());
         CHECK(near(out3[1], -2.0f), "phase2: seeded=sentinel -> missing_score");
         CHECK(near(out3[3], -2.0f), "phase2: seeded=sentinel -> missing_score (c3)");
 
@@ -197,8 +199,33 @@ int main() {
         std::vector<float> out4;
         kvflash_qk_chunk_scores(pk2, q2.data(), d2, out4,
                                 /*missing_score=*/-2.0f,
-                                /*seeded=*/nullptr, kSentinel);
+                                /*seeded=*/nullptr, kSentinel,
+                                /*seeded_n=*/0);
         CHECK(near(out4[1], -2.0f), "phase2: null seeded ptr -> missing_score");
+
+        // ── Phase 2b (P1 fix): seeded_n bounds the seeded read ──────────────
+        // A restored ledger can be SHORTER than the current n_chunks (pool grew
+        // after restore). seeded_n must clamp the read so chunks at/above
+        // seeded_n fall back to missing_score instead of reading past the buffer.
+        // RED (pre-fix): no seeded_n → reads seeded[3..5] out of bounds → UB.
+        // GREEN (post-fix): out[3..5] == missing_score.
+        {
+            // 6 chunks, none pooled; ledger only covered the first 3.
+            std::vector<float> seeded_short = { 0.5f, 0.6f, 0.7f }; // length 3
+            std::vector<const float *> pk6(6, nullptr);
+            std::vector<float> out6;
+            kvflash_qk_chunk_scores(pk6, q2.data(), d2, out6,
+                                    /*missing_score=*/-2.0f,
+                                    seeded_short.data(), kSentinel,
+                                    /*seeded_n=*/(int)seeded_short.size());
+            CHECK(out6.size() == 6, "phase2b: output size == 6");
+            CHECK(near(out6[0], 0.5f), "phase2b: c0 seeded 0.5");
+            CHECK(near(out6[1], 0.6f), "phase2b: c1 seeded 0.6");
+            CHECK(near(out6[2], 0.7f), "phase2b: c2 seeded 0.7");
+            CHECK(near(out6[3], -2.0f), "phase2b: c3 beyond seeded_n -> missing_score (no OOB)");
+            CHECK(near(out6[4], -2.0f), "phase2b: c4 beyond seeded_n -> missing_score (no OOB)");
+            CHECK(near(out6[5], -2.0f), "phase2b: c5 beyond seeded_n -> missing_score (no OOB)");
+        }
     }
 
     std::printf("%s (%d failures)\n", g_fail == 0 ? "ALL PASS" : "FAILED", g_fail);
