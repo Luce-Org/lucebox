@@ -326,21 +326,39 @@ MoeHybridPlacement invert_moe_hybrid_placement(const MoeHybridPlacement & main) 
 }
 
 bool write_temp_remote_placement(const MoeHybridPlacement & main,
+                                 const std::string & work_dir,
                                  std::string & path_out,
                                  std::string * err) {
 #if defined(_WIN32)
-    (void)main; (void)path_out;
+    (void)main; (void)work_dir; (void)path_out;
     if (err) *err = "remote MoE expert compute IPC is POSIX-only";
     return false;
 #else
-    char templ[] = "/tmp/lucebox_moe_cold_placement_XXXXXX";
-    int fd = ::mkstemp(templ);
+    std::string dir = work_dir;
+    if (dir.empty()) {
+        const char * tmp = std::getenv("TMPDIR");
+        dir = (tmp && *tmp) ? tmp : "/tmp";
+    }
+    if (::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) {
+        if (err) *err = std::string("mkdir failed for remote placement dir: ") +
+                        dir + ": " + std::strerror(errno);
+        return false;
+    }
+    struct stat st {};
+    if (::stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+        if (err) *err = "remote placement dir is not a directory: " + dir;
+        return false;
+    }
+    std::string templ = dir + "/lucebox_moe_cold_placement_XXXXXX";
+    std::vector<char> templ_buf(templ.begin(), templ.end());
+    templ_buf.push_back('\0');
+    int fd = ::mkstemp(templ_buf.data());
     if (fd < 0) {
         if (err) *err = std::string("mkstemp failed: ") + std::strerror(errno);
         return false;
     }
     ::close(fd);
-    path_out = templ;
+    path_out = templ_buf.data();
     const MoeHybridPlacement remote = invert_moe_hybrid_placement(main);
     if (!remote.save_json(path_out, "moe_remote_expert_compute", err)) {
         ::unlink(path_out.c_str());
@@ -737,7 +755,7 @@ public:
         return false;
 #else
         std::string err;
-        if (!write_temp_remote_placement(main_placement, placement_path_, &err)) {
+        if (!write_temp_remote_placement(main_placement, work_dir, placement_path_, &err)) {
             std::fprintf(stderr, "[moe-expert-compute-ipc] placement write failed: %s\n",
                          err.c_str());
             return false;
