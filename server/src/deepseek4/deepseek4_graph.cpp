@@ -1285,37 +1285,36 @@ static bool ds4_try_gpu_hc_pre_device(ggml_tensor * working,
                                       ggml_tensor * comb,
                                       ggml_tensor * hc_state,
                                       ggml_tensor * fn_tensor,
-                                      ggml_tensor * scale_tensor,
-                                      ggml_tensor * base_tensor,
+                                      const float * scale_data,
+                                      const float * base_data,
                                       int n_embd,
                                       int n_hc,
                                       int sinkhorn_iters,
                                       float hc_eps) {
 #if defined(DFLASH27B_BACKEND_CUDA) || defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
-    if (!working || !post || !comb || !hc_state || !fn_tensor || !scale_tensor || !base_tensor ||
-        !working->data || !post->data || !comb->data || !hc_state->data ||
-        !fn_tensor->data || !scale_tensor->data || !base_tensor->data) {
+    if (!working || !post || !comb || !hc_state || !fn_tensor || !scale_data || !base_data ||
+        !working->data || !post->data || !comb->data || !hc_state->data || !fn_tensor->data) {
         return false;
     }
-    return deepseek4_cuda_hc_pre_device(hc_state->data,
-                                        fn_tensor->data,
-                                        scale_tensor->data,
-                                        base_tensor->data,
-                                        n_embd,
-                                        n_hc,
-                                        sinkhorn_iters,
-                                        hc_eps,
-                                        working->data,
-                                        post->data,
-                                        comb->data);
+    return deepseek4_cuda_hc_pre_device_params(hc_state->data,
+                                               fn_tensor->data,
+                                               scale_data,
+                                               base_data,
+                                               n_embd,
+                                               n_hc,
+                                               sinkhorn_iters,
+                                               hc_eps,
+                                               working->data,
+                                               post->data,
+                                               comb->data);
 #else
     (void) working;
     (void) post;
     (void) comb;
     (void) hc_state;
     (void) fn_tensor;
-    (void) scale_tensor;
-    (void) base_tensor;
+    (void) scale_data;
+    (void) base_data;
     (void) n_embd;
     (void) n_hc;
     (void) sinkhorn_iters;
@@ -3052,8 +3051,8 @@ bool deepseek4_step_layer_range(
                                            cached.comb,
                                            cached_decode_hc_post_graph.residual_hc,
                                            L.hc_attn_fn,
-                                           L.hc_attn_scale,
-                                           L.hc_attn_base,
+                                           hc_lw.attn.scale_data.data(),
+                                           hc_lw.attn.base_data.data(),
                                            n_embd,
                                            n_hc,
                                            w.n_hc_sinkhorn_iter,
@@ -3315,8 +3314,8 @@ bool deepseek4_step_layer_range(
                                            cached.comb,
                                            cached_decode_hc_post_graph.residual_hc,
                                            L.hc_ffn_fn,
-                                           L.hc_ffn_scale,
-                                           L.hc_ffn_base,
+                                           hc_lw.ffn.scale_data.data(),
+                                           hc_lw.ffn.base_data.data(),
                                            n_embd,
                                            n_hc,
                                            w.n_hc_sinkhorn_iter,

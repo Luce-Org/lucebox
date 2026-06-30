@@ -403,4 +403,64 @@ bool deepseek4_cuda_hc_pre_device(const void * hc_state_device,
     return cudaDeviceSynchronize() == cudaSuccess;
 }
 
+bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
+                                         const void * fn_device,
+                                         const float * scale_host,
+                                         const float * base_host,
+                                         int           n_embd,
+                                         int           n_hc,
+                                         int           sinkhorn_iters,
+                                         float         eps,
+                                         void *        working_device,
+                                         void *        post_device,
+                                         void *        comb_device) {
+    if (!hc_state_device || !fn_device || !scale_host || !base_host ||
+        !working_device || !post_device || !comb_device ||
+        n_embd <= 0 || n_hc <= 0 || n_hc > kMaxHc) {
+        return false;
+    }
+    const int hc_dim = n_embd * n_hc;
+    const int mix_dim = 2 * n_hc + n_hc * n_hc;
+    if (mix_dim > kMaxMixDim) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!g_scratch.ensure((size_t) hc_dim, (size_t) n_embd, (size_t) n_hc)) {
+        return false;
+    }
+    if (cudaMemcpy(g_scratch.d_scale, scale_host, sizeof(float) * (size_t) mix_dim,
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        return false;
+    }
+    if (cudaMemcpy(g_scratch.d_base, base_host, sizeof(float) * (size_t) mix_dim,
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        return false;
+    }
+
+    hc_mix_norm_kernel<<<mix_dim, kThreads>>>(
+        static_cast<const float *>(hc_state_device),
+        static_cast<const __half *>(fn_device),
+        hc_dim,
+        mix_dim,
+        eps,
+        g_scratch.d_mix);
+    if (cudaGetLastError() != cudaSuccess) return false;
+
+    hc_finish_kernel<<<1, kThreads>>>(
+        static_cast<const float *>(hc_state_device),
+        g_scratch.d_mix,
+        g_scratch.d_scale,
+        g_scratch.d_base,
+        n_embd,
+        n_hc,
+        sinkhorn_iters,
+        static_cast<float *>(working_device),
+        static_cast<float *>(post_device),
+        static_cast<float *>(comb_device));
+    if (cudaGetLastError() != cudaSuccess) return false;
+
+    return cudaDeviceSynchronize() == cudaSuccess;
+}
+
 } // namespace dflash::common
