@@ -6,6 +6,11 @@
 //      aligned in both
 //   4. cosine: query/key magnitudes do not change scores
 //   5. missing pooled keys keep the missing_score sentinel
+//
+// Phase 2 (snapshot×ledger): seeded fallback scores
+//   6. after restore, chunks with no pooled keys but a ledger score use that
+//      score (not missing_score=-2.0); chunks WITH pooled keys still use the
+//      cosine path; sentinel-valued seeded entries keep missing_score.
 
 #define KVFLASH_QK_PURE_ONLY
 #include "kvflash_qk.h"
@@ -119,6 +124,81 @@ int main() {
         kvflash_qk_chunk_scores(pk1, query.data(), d, o1);
         CHECK(near(o1[0], (float)(1.0 / std::sqrt(2.0))),
               "fractional cosine propagates exactly");
+    }
+
+    // ── Phase 2: seeded fallback scores (restore×ledger) ──────────────────
+    // After a snapshot restore the QK pool has no entries: pk[c] == nullptr
+    // for every chunk.  The seeded[] fallback array carries the per-chunk scores
+    // that were live at serialize time.  For chunks without pooled keys, the
+    // scorer must use seeded[c] (when it is not the sentinel) instead of
+    // missing_score=-2.0.  Chunks WITH pooled keys still go through the cosine
+    // path and seeded[] is ignored for them.
+    {
+        // 4 chunks, 2 have pooled keys (c0, c2), 2 are restore-only (c1, c3).
+        // Seeded scores: c1=0.7, c3=-0.3, c0/c2 sentinel (cosine path wins).
+        const float kSentinel = -std::numeric_limits<float>::infinity();
+        std::vector<float> seeded(4, kSentinel);
+        seeded[1] = 0.7f;
+        seeded[3] = -0.3f;
+
+        // c0: fully aligned key (cosine=1.0 with the query below)
+        // c2: half-aligned (cosine ~0.5)
+        KvFlashQkDims d2;
+        d2.n_layers = 2; d2.n_q_heads = 2; d2.n_kv_heads = 2; d2.head_dim = 4;
+        const size_t kstride2 = (size_t)d2.n_layers * d2.n_kv_heads * d2.head_dim;
+        const size_t qsize2   = (size_t)d2.n_layers * d2.n_q_heads * d2.head_dim;
+
+        // Query: all heads / layers point at basis e0
+        std::vector<float> q2(qsize2, 0.0f);
+        for (size_t i = 0; i < (size_t)d2.n_layers * d2.n_q_heads; i++) {
+            q2[i * d2.head_dim + 0] = 1.0f;
+        }
+
+        // c0: L2-normalized key e0 in both layers/heads -> cosine=1.0
+        std::vector<float> k0(kstride2, 0.0f);
+        for (int l = 0; l < d2.n_layers; l++)
+            for (int h = 0; h < d2.n_kv_heads; h++)
+                k0[((size_t)l * d2.n_kv_heads + h) * d2.head_dim + 0] = 1.0f;
+
+        // c2: L2-normalized key e0 layer0 only, e2 layer1 -> cosine=0.5
+        std::vector<float> k2(kstride2, 0.0f);
+        k2[((size_t)0 * d2.n_kv_heads + 0) * d2.head_dim + 0] = 1.0f;
+        k2[((size_t)0 * d2.n_kv_heads + 1) * d2.head_dim + 0] = 1.0f;
+        k2[((size_t)1 * d2.n_kv_heads + 0) * d2.head_dim + 2] = 1.0f;
+        k2[((size_t)1 * d2.n_kv_heads + 1) * d2.head_dim + 2] = 1.0f;
+
+        std::vector<const float *> pk2(4, nullptr);
+        pk2[0] = k0.data();  // c0: pooled key present
+        // c1: no pooled key → seeded fallback 0.7
+        pk2[2] = k2.data();  // c2: pooled key present
+        // c3: no pooled key → seeded fallback -0.3
+
+        std::vector<float> out2;
+        kvflash_qk_chunk_scores(pk2, q2.data(), d2, out2,
+                                /*missing_score=*/-2.0f,
+                                seeded.data(), kSentinel);
+
+        CHECK(out2.size() == 4, "phase2: output size == 4");
+        CHECK(near(out2[0], 1.0f),  "phase2: c0 pooled key -> cosine 1.0 (seeded ignored)");
+        CHECK(near(out2[1], 0.7f),  "phase2: c1 no pooled key -> seeded 0.7 (not -2.0)");
+        CHECK(near(out2[2], 0.5f),  "phase2: c2 pooled key -> cosine 0.5 (seeded ignored)");
+        CHECK(near(out2[3], -0.3f), "phase2: c3 no pooled key -> seeded -0.3 (not -2.0)");
+
+        // A seeded sentinel must fall through to missing_score.
+        std::vector<float> all_sentinel(4, kSentinel);
+        std::vector<float> out3;
+        kvflash_qk_chunk_scores(pk2, q2.data(), d2, out3,
+                                /*missing_score=*/-2.0f,
+                                all_sentinel.data(), kSentinel);
+        CHECK(near(out3[1], -2.0f), "phase2: seeded=sentinel -> missing_score");
+        CHECK(near(out3[3], -2.0f), "phase2: seeded=sentinel -> missing_score (c3)");
+
+        // Null seeded ptr must behave like the original (missing_score).
+        std::vector<float> out4;
+        kvflash_qk_chunk_scores(pk2, q2.data(), d2, out4,
+                                /*missing_score=*/-2.0f,
+                                /*seeded=*/nullptr, kSentinel);
+        CHECK(near(out4[1], -2.0f), "phase2: null seeded ptr -> missing_score");
     }
 
     std::printf("%s (%d failures)\n", g_fail == 0 ? "ALL PASS" : "FAILED", g_fail);
