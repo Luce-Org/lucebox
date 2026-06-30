@@ -3024,7 +3024,8 @@ bool deepseek4_step_layer_range(
         DeepSeek4LayerCache & lc = cache.layers[(size_t)il];
         const HcLayerWeightsCpu & hc_lw = hc_layer_weights_range[(size_t)il];
         const bool use_backend_decode_hc_pre = use_backend_decode_hc;
-        const bool use_backend_decode_hc_direct = use_backend_decode_hc && ds4_hc_gpu_direct_enabled();
+        const bool use_backend_decode_hc_direct =
+            use_backend_decode_hc && ds4_hc_gpu_direct_enabled() && ds4_backend_is_hip(backend);
         const ggml_tensor * attn_in_backend = nullptr;
         const ggml_tensor * ffn_in_backend = nullptr;
         const ggml_tensor * attn_post_backend = nullptr;
