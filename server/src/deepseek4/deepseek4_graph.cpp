@@ -1214,13 +1214,28 @@ static bool ds4_backend_is_hip(ggml_backend_t backend) {
     return name && std::strstr(name, "HIP") != nullptr;
 }
 
-static bool ds4_hc_hip_decode_enabled() {
-    const char * value = std::getenv("DFLASH_DS4_HC_HIP_DECODE");
+static bool ds4_backend_is_cuda(ggml_backend_t backend) {
+    const char * name = ggml_backend_name(backend);
+    return name && std::strstr(name, "CUDA") != nullptr;
+}
+
+static bool ds4_backend_is_gpu(ggml_backend_t backend) {
+    return ds4_backend_is_hip(backend) || ds4_backend_is_cuda(backend);
+}
+
+static bool ds4_hc_gpu_decode_enabled() {
+    const char * value = std::getenv("DFLASH_DS4_HC_GPU_DECODE");
+    if (!value || !value[0]) {
+        value = std::getenv("DFLASH_DS4_HC_HIP_DECODE");
+    }
     return !value || !value[0] || std::strcmp(value, "0") != 0;
 }
 
-static bool ds4_hc_hip_direct_enabled() {
-    const char * value = std::getenv("DFLASH_DS4_HC_HIP_DIRECT");
+static bool ds4_hc_gpu_direct_enabled() {
+    const char * value = std::getenv("DFLASH_DS4_HC_GPU_DIRECT");
+    if (!value || !value[0]) {
+        value = std::getenv("DFLASH_DS4_HC_HIP_DIRECT");
+    }
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
@@ -2941,8 +2956,8 @@ bool deepseek4_step_layer_range(
     std::vector<int32_t> & hash_expert_ids_host = scratch.hash_expert_ids;
     const bool reuse_decode_graphs = (n_tokens == 1);
     const bool use_backend_decode_hc =
-        reuse_decode_graphs && ds4_backend_is_hip(backend) && ds4_hc_hip_decode_enabled();
-    const bool use_backend_decode_hc_graph = use_backend_decode_hc && !ds4_hc_hip_direct_enabled();
+        reuse_decode_graphs && ds4_backend_is_gpu(backend) && ds4_hc_gpu_decode_enabled();
+    const bool use_backend_decode_hc_graph = use_backend_decode_hc && !ds4_hc_gpu_direct_enabled();
     const ggml_tensor * hc_state_backend = nullptr;
     if (use_backend_decode_hc_graph) {
         if (!cached_decode_hc_post_graph.valid() ||
@@ -2991,7 +3006,7 @@ bool deepseek4_step_layer_range(
             attn_post_backend = cached.post;
             attn_comb_backend = cached.comb;
         } else if (use_backend_decode_hc_pre &&
-            ds4_hc_hip_direct_enabled() &&
+            ds4_hc_gpu_direct_enabled() &&
             ds4_try_gpu_hc_pre(cur.data(), hc_post.data(), hc_comb.data(),
                                hc_state.data(), hc_lw.attn.scale_data.data(), hc_lw.attn.base_data.data(), L.hc_attn_fn,
                                n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps)) {
@@ -3226,7 +3241,7 @@ bool deepseek4_step_layer_range(
             ffn_post_backend = cached.post;
             ffn_comb_backend = cached.comb;
         } else if (use_backend_decode_hc_pre &&
-            ds4_hc_hip_direct_enabled() &&
+            ds4_hc_gpu_direct_enabled() &&
             ds4_try_gpu_hc_pre(ffn_working.data(), hc_post.data(), hc_comb.data(),
                                hc_state.data(), hc_lw.ffn.scale_data.data(), hc_lw.ffn.base_data.data(), L.hc_ffn_fn,
                                n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps)) {
