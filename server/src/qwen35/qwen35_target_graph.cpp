@@ -922,6 +922,9 @@ static ggml_tensor * build_delta_net_block(
             : (parent_ids
                 ? ggml_gated_delta_net_tree(ctx, q_c, k_c, v_c, g_tensor, beta, s, parent_ids)
                 : ggml_gated_delta_net     (ctx, q_c, k_c, v_c, g_tensor, beta, s));
+    if (!parent_ids && !cap) {
+        ggml_gated_delta_net_set_skip_intermediate(result, true);
+    }
 
     // Slice output and new_state out of the packed result
     {
