@@ -76,6 +76,7 @@ public:
 
     // cap = number of prefix-cache slots (0 disables).
     PrefixCache(int cap, const Tokenizer & tokenizer);
+    PrefixCache(int cap, ChatMarkers markers);
 
     bool disabled() const { return disabled_; }
 
