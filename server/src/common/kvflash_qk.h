@@ -88,10 +88,13 @@ inline void kvflash_qk_chunk_scores(
     }
     // Seeded fallback: for chunks with no pooled key, use the ledger score from
     // a prior turn if it is not the sentinel (i.e. it was actually scored).
-    // seeded_n bounds the valid range of the seeded array; chunks beyond it
-    // (n_chunks > seeded array length) fall back to missing_score safely.
+    // seeded_n bounds the valid range of the seeded array. A negative seeded_n
+    // (the default) means "no safe length is known" → seeded_limit=0 so we never
+    // read past the caller's buffer; callers passing a `seeded` array MUST set
+    // seeded_n explicitly. (When seeded==nullptr the block below is skipped
+    // entirely, so the limit is irrelevant for the common no-seed path.)
     if (seeded) {
-        const int seeded_limit = (seeded_n >= 0) ? seeded_n : n_chunks;
+        const int seeded_limit = (seeded_n >= 0) ? seeded_n : 0;
         for (int c = 0; c < n_chunks; c++) {
             if (!pooled_keys[(size_t)c] && c < seeded_limit &&
                 seeded[c] != seeded_sentinel) {

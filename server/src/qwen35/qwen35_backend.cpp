@@ -902,7 +902,11 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
     // Restore snapshot (skip KV copy when pooled; pager handles KV separately).
     const PrefixSnapshot & snap_ref = prefix_snapshots_[slot];
     const bool snap_pooled = snap_ref.is_pooled;
-    restore_target_cache(snap_ref, cache_, snap_pooled);
+    if (!restore_target_cache(snap_ref, cache_, snap_pooled)) {
+        result.error = "restore_target_cache failed";
+        out_io.emit(-1);
+        return result;
+    }
 
     // Pooled restore: rebuild pager from blob so KV rows are accessible.
     if (snap_pooled && kvflash_active()) {

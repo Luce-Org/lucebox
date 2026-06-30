@@ -109,8 +109,6 @@ private:
 
     // Persistent pipelined state (initialized once, reused across requests)
     std::unique_ptr<struct PipelinedDecodeState> pipe_state_;
-    std::unique_ptr<HybridSpecGraphCache> hybrid_spec_graph_cache_;
-    bool spec_microbench_done_ = false;
     bool ensure_pipe_state(int kv_start);
 };
 

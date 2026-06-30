@@ -137,7 +137,15 @@ bool read_draft_capture_config(const std::string & path,
                                       (size_t)max_ids);
             const int32_t * ids = static_cast<const int32_t *>(gguf_get_arr_data(gctx, tli_id));
             for (size_t k = 0; k < n; k++) {
-                capture_ids[k] = (int)ids[k];
+                const int lid = (int)ids[k];
+                if (lid < 0) {
+                    std::fprintf(stderr,
+                        "[draft-cfg] target_layer_ids[%zu]=%d is negative; clamping to 0\n",
+                        k, lid);
+                    capture_ids[k] = 0;
+                } else {
+                    capture_ids[k] = lid;
+                }
             }
             if (n > 0) n_capture = (int)n;
         }

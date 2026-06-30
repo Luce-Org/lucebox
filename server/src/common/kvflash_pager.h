@@ -547,6 +547,12 @@ public:
             kseg != k_seg_bytes_ || vseg != v_seg_bytes_ || cb != chunk_bytes_) {
             return false;
         }
+        // Overflow-safe sanity cap on the blob-provided chunk count before it is
+        // used for allocation/resize. The size check below already bounds nc
+        // implicitly (nc*chunk_bytes_ <= n-hdr), but reject absurd values up
+        // front so a corrupted magic-matching blob can't drive a giant resize or
+        // overflow-prone arithmetic. 1<<24 chunks is far beyond any real ctx.
+        if (nc < 0 || nc > (1 << 24)) return false;
         if (n < hdr + (size_t)nc * chunk_bytes_) return false;
         reset();
         chunks_.resize(nc);          // pre-size so slot_for doesn't resize again

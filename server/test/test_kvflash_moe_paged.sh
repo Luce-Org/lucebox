@@ -58,14 +58,15 @@ generate() {
         kill -0 "$pid" 2>/dev/null || break
         sleep 2
     done
+    local req_rc=0
     curl -fsS "http://$HOST:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
         --data @"$REQ" 2>/dev/null \
         | python3 -c 'import sys,json; print(json.load(sys.stdin)["choices"][0]["message"]["content"])' \
-          >"$out" 2>/dev/null || true
+          >"$out" 2>/dev/null || req_rc=$?
     pkill -9 -f "$SERVER_BIN .*--port $PORT" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
     grep -qE 'result: [0-9]+ hot experts, [1-9][0-9]* cold experts' "$log" \
-        || { cat "$log" >&2; fail "cold experts absent (pool=$pool): chunk loop not exercised"; }
+        || { cat "$log" >&2; fail "cold experts absent (pool=$pool, req_rc=$req_rc): chunk loop not exercised"; }
     grep -qE 'pooled prefill' "$log" \
         || { cat "$log" >&2; fail "pooled prefill not engaged (pool=$pool): prompt did not exceed pool"; }
     cat "$out"; rm -f "$log" "$out"
