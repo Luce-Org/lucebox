@@ -698,6 +698,7 @@ void free_draft_weights(DraftWeights & w) {
     w.fc = nullptr;
     w.hidden_norm = nullptr;
     w.out_norm = nullptr;
+    w.domino = DraftDominoWeights{};
 }
 
 } // namespace dflash::common

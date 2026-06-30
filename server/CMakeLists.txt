@@ -19,10 +19,15 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(nlohmann_json CONFIG QUIET)
 if(NOT nlohmann_json_FOUND)
     include(FetchContent)
-    FetchContent_Declare(json
+    set(_dflash_json_fetch_args
         URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
         URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
     )
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
+        list(APPEND _dflash_json_fetch_args DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    endif()
+    FetchContent_Declare(json ${_dflash_json_fetch_args})
+    unset(_dflash_json_fetch_args)
     FetchContent_MakeAvailable(json)
 endif()
 
@@ -250,7 +255,11 @@ add_library(dflash_common STATIC
     src/laguna/laguna_daemon.cpp
     src/laguna/laguna_backend.cpp
     src/laguna/laguna_layer_split_adapter.cpp
+    src/laguna/laguna_dflash_target.cpp
     src/common/backend_ipc.cpp
+    src/common/domino_head.cpp
+    src/common/target_shard_ipc.cpp
+    src/common/target_shard_ipc_daemon.cpp
     src/common/dflash_feature_ring.cpp
     src/common/dflash_capture.cpp
     src/common/dflash_draft_ipc.cpp
@@ -353,6 +362,12 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     target_include_directories(dflash_common PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
 endif()
 
+if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+    target_link_libraries(dflash_common PUBLIC CUDA::cudart)
+elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+    target_link_libraries(dflash_common PUBLIC hip::host)
+endif()
+
 # FlashPrefill custom kernels.
 #   - CUDA sm_80+: BF16 WMMA (m16n16k16) + cp.async — flashprefill_kernels.cu
 #   - CUDA sm_70–sm_79 (Volta/Turing): F16 WMMA (m16n8k16), cooperative loads — flashprefill_f16.cu
@@ -410,6 +425,10 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
         # also compile their GPU dispatch branch.
         target_compile_definitions(dflash_common PUBLIC DFLASH27B_HAVE_GPU_SAMPLER=1)
     endif()
+        src/common/geometric_draft_topk_cuda.cu)
+    # PUBLIC so consumers (e.g. the test_dflash executable) also see the macro
+    # and take the GPU draft top-K path instead of the CPU fallback.
+    target_compile_definitions(dflash_common PUBLIC DFLASH27B_HAVE_DRAFT_TOPK_CUDA=1)
     # Multi-arch: scan all resolved arches and compile every applicable
     # flashprefill kernel variant.  This lets a single binary run on mixed
     # GPUs (e.g. Volta sm_70 + Pascal sm_61) without "no kernel image" errors.
@@ -595,6 +614,29 @@ if(DFLASH27B_TESTS)
         set_target_properties(test_flashprefill_kernels PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
         target_include_directories(test_flashprefill_kernels PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(test_flashprefill_kernels PRIVATE dflash_common CUDA::cudart)
+    elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND DFLASH27B_HIP_SM80_EQUIV AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
+        # HIP build of the rocWMMA flashprefill numerics test. The test source is
+        # written in CUDA spellings; the hip_compat/ shim maps cuda_runtime.h /
+        # cuda_bf16.h and the cuda* APIs onto HIP, exactly as the kernel sources
+        # do. Only meaningful when Phase 2 (rocWMMA) is enabled, since that is
+        # what provides the launch_*_bf16 symbols in dflash_common. Lets the
+        # rocWMMA path be validated on AMD (gfx1100 / gfx1151 / gfx12xx incl.
+        # the R9700) instead of CUDA-only.
+        add_executable(test_flashprefill_kernels test/test_flashprefill_kernels.cpp)
+        set_source_files_properties(test/test_flashprefill_kernels.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_flashprefill_kernels PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_include_directories(test_flashprefill_kernels PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
+        target_link_libraries(test_flashprefill_kernels PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
+    endif()
+    # GPU draft top-K kernel vs CPU reference (extract_draft_topk). CUDA only:
+    # geometric_draft_topk_cuda.cu is compiled into dflash_common solely on the cuda backend.
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_topk_cuda.cpp")
+        add_executable(test_draft_topk_cuda test/test_draft_topk_cuda.cpp)
+        target_include_directories(test_draft_topk_cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(test_draft_topk_cuda PRIVATE dflash_common CUDA::cudart)
+        add_test(NAME draft_topk_cuda COMMAND test_draft_topk_cuda)
     endif()
     # GPU draft top-K kernel vs CPU reference (extract_draft_topk). CUDA only:
     # draft_topk_cuda.cu is compiled into dflash_common solely on the cuda backend.
@@ -624,6 +666,11 @@ if(DFLASH27B_TESTS)
         add_executable(test_derived_scalars test/test_derived_scalars.cpp)
         target_include_directories(test_derived_scalars PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         add_test(NAME derived_scalars COMMAND test_derived_scalars)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash_placement.cpp")
+        add_executable(test_kvflash_placement test/test_kvflash_placement.cpp)
+        target_include_directories(test_kvflash_placement PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        add_test(NAME kvflash_placement COMMAND test_kvflash_placement)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_bandit_integration.cpp")
         add_executable(test_bandit_integration test/test_bandit_integration.cpp)
@@ -800,6 +847,15 @@ if(DFLASH27B_TESTS)
         # Pure-math unit test (KVFLASH_QK_PURE_ONLY): no ggml, no GPU.
         add_executable(test_kvflash_qk test/test_kvflash_qk.cpp)
         target_include_directories(test_kvflash_qk PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash_pool_sizing.cpp")
+        # Pure unit test for kvflash_pool_from_env: ggml headers only, no ggml link, no GPU.
+        add_executable(test_kvflash_pool_sizing test/test_kvflash_pool_sizing.cpp)
+        target_include_directories(test_kvflash_pool_sizing PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        add_test(NAME kvflash_pool_sizing COMMAND test_kvflash_pool_sizing)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_restore_delta.cpp")
         add_executable(test_restore_delta test/test_restore_delta.cpp)

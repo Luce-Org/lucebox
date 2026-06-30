@@ -34,7 +34,7 @@ Qwen35LayerSplitAdapter::Qwen35LayerSplitAdapter(
 Qwen35LayerSplitAdapter::~Qwen35LayerSplitAdapter() { shutdown(); }
 
 bool Qwen35LayerSplitAdapter::init() {
-    if (cfg_.device.is_mixed_layer_split()) {
+    if (cfg_.device.is_layer_split() && cfg_.remote_target_shard.enabled()) {
         return init_mixed_target_split();
     }
 
@@ -122,7 +122,11 @@ bool Qwen35LayerSplitAdapter::init() {
 
 void Qwen35LayerSplitAdapter::kvflash_read_config() {
     if (!std::getenv("DFLASH_KVFLASH") || shards_.empty()) return;
-    kvflash_drafter_path_ = kvflash_find_drafter(cfg_.target_path);
+    const bool target_shard_split =
+        cfg_.device.is_layer_split() && cfg_.remote_target_shard.enabled();
+    kvflash_drafter_path_ = target_shard_split
+        ? std::string{}
+        : kvflash_find_drafter(cfg_.target_path);
 
     ggml_type kv_k = GGML_TYPE_Q8_0;
     ggml_type kv_v = GGML_TYPE_Q8_0;
@@ -206,39 +210,24 @@ bool Qwen35LayerSplitAdapter::kvflash_attach() {
 
 bool Qwen35LayerSplitAdapter::kvflash_sync_identity(int committed) {
     if (!kvflash_active()) return true;
-    if (committed > kvflash_tokens_) {
-        std::fprintf(stderr,
-            "[target-split][kvflash] prefix (%d) exceeds resident pool %d\n",
-            committed, kvflash_tokens_);
+    if (!layer_split_kvflash_sync_identity(
+            kvflash_pager_, committed, kvflash_tokens_, "target-split")) {
         return false;
     }
-    kvflash_pager_.reset();
-    for (int p = 0; p < committed; ++p) {
-        const int slot = kvflash_pager_.slot_for(p);
-        if (slot != p) {
-            std::fprintf(stderr,
-                "[target-split][kvflash] identity slot mismatch %d != %d\n",
-                slot, p);
-            return false;
-        }
+    if (use_mixed_target_split() &&
+        !remote_target_shard_.kvflash_sync_identity(committed)) {
+        std::fprintf(stderr,
+            "[target-split][kvflash] remote identity sync failed pos=%d\n",
+            committed);
+        return false;
     }
-    kvflash_pager_.zero_free_blocks();
     return true;
 }
 
 void Qwen35LayerSplitAdapter::kvflash_sync_history(
         const std::vector<int32_t> & tokens, int base_pos) {
     if (!kvflash_active()) return;
-    if (base_pos == 0) {
-        kvflash_history_.assign(tokens.begin(), tokens.end());
-        return;
-    }
-    if ((int)kvflash_history_.size() > base_pos) {
-        kvflash_history_.resize((size_t)base_pos);
-    } else if ((int)kvflash_history_.size() < base_pos) {
-        kvflash_history_.resize((size_t)base_pos, 0);
-    }
-    kvflash_history_.insert(kvflash_history_.end(), tokens.begin(), tokens.end());
+    layer_split_kvflash_sync_history(kvflash_history_, tokens, base_pos);
 }
 
 void Qwen35LayerSplitAdapter::kvflash_maybe_reselect(int generated) {
@@ -293,30 +282,14 @@ bool Qwen35LayerSplitAdapter::init_mixed_target_split() {
             "remote target shard IPC\n");
         return false;
     }
-    if (cfg_.device.layer_split_backend(0) != compiled_placement_backend()) {
-        std::fprintf(stderr,
-            "[target-split] first mixed shard must match compiled backend\n");
+    MixedLayerSplitPlan mixed_plan;
+    if (!compute_target_shard_layer_split_plan(
+            cfg_.device, compiled_placement_backend(), mixed_plan,
+            "target-split")) {
         return false;
     }
-    size_t remote_begin = 0;
-    while (remote_begin < cfg_.device.layer_split_gpus.size() &&
-           cfg_.device.layer_split_backend(remote_begin) == compiled_placement_backend()) {
-        ++remote_begin;
-    }
-    if (remote_begin == 0 || remote_begin >= cfg_.device.layer_split_gpus.size()) {
-        std::fprintf(stderr,
-            "[target-split] mixed target split requires one local backend group "
-            "followed by one remote backend group\n");
-        return false;
-    }
-    const PlacementBackend remote_backend = cfg_.device.layer_split_backend(remote_begin);
-    for (size_t i = remote_begin; i < cfg_.device.layer_split_gpus.size(); ++i) {
-        if (cfg_.device.layer_split_backend(i) != remote_backend) {
-            std::fprintf(stderr,
-                "[target-split] mixed target split supports one backend boundary only\n");
-            return false;
-        }
-    }
+    const size_t remote_begin = mixed_plan.remote_begin;
+    const PlacementBackend remote_backend = mixed_plan.remote_backend;
 
     const auto info = inspect_gguf_model_info(cfg_.target_path);
     const int n_layer = info.n_layer;
@@ -360,18 +333,28 @@ bool Qwen35LayerSplitAdapter::init_mixed_target_split() {
         }
     }
 
+    kvflash_read_config();
+    if (kvflash_active() && cfg_.fa_window > 0) {
+        std::fprintf(stderr,
+            "[target-split][kvflash] fa_window must be 0 because pool slots "
+            "need full slot-space masks\n");
+        return false;
+    }
+
     for (auto & local : shards_) {
         if (!create_target_cache_partial(local.weights, cfg_.device.max_ctx,
                                          cfg_.max_verify_tokens, local.backend,
                                          local.cache,
                                          /*prefill_only=*/!cfg_.run_dflash,
                                          local.layer_begin, local.layer_end,
-                                         /*allocate_target_feat=*/false)) {
+                                         /*allocate_target_feat=*/false,
+                                         kvflash_tokens_)) {
             std::fprintf(stderr, "[target-split] mixed local cache gpu=%d: %s\n",
                          local.gpu, dflash27b_last_error());
             return false;
         }
     }
+    if (!kvflash_attach()) return false;
 
     std::vector<int> remote_gpus;
     std::vector<int> remote_layer_begins;
@@ -388,7 +371,8 @@ bool Qwen35LayerSplitAdapter::init_mixed_target_split() {
             shards_.front().weights.n_embd, shards_.front().weights.n_vocab,
             std::max(1, cfg_.device.max_ctx),
             cfg_.remote_target_shard.work_dir,
-            cfg_.run_dflash)) {
+            cfg_.run_dflash,
+            kvflash_tokens_)) {
         std::fprintf(stderr,
             "[target-split] remote target shard start failed layers=[%d,%d)\n",
             remote_layer_begins.front(), remote_layer_ends.back());
@@ -430,6 +414,9 @@ bool Qwen35LayerSplitAdapter::init_mixed_target_split() {
     disk_snapshot_buffers_.assign(PREFIX_SLOTS, nullptr);
     disk_snapshot_backends_.assign(PREFIX_SLOTS, nullptr);
     draft_feature_snapshots_.resize(PREFIX_SLOTS);
+    if (kvflash_active()) {
+        kvflash_history_snapshots_.resize(PREFIX_SLOTS);
+    }
     return true;
 }
 
@@ -513,7 +500,7 @@ void Qwen35LayerSplitAdapter::begin_request(const GenerateRequest & req) {
 
 void Qwen35LayerSplitAdapter::reset_request_state() {
     for (auto & shard : shards_) reset_target_cache(shard.cache);
-    if (!use_mixed_target_split() && kvflash_active()) {
+    if (kvflash_active()) {
         kvflash_pager_.reset();
         kvflash_history_.clear();
         kvflash_scores_.clear();
@@ -528,7 +515,7 @@ void Qwen35LayerSplitAdapter::reset_request_state() {
 }
 
 int Qwen35LayerSplitAdapter::prefill_chunk_tokens() const {
-    if (!use_mixed_target_split() && kvflash_active()) {
+    if (kvflash_active()) {
         return kvflash_pager_.chunk_tokens();
     }
     return cfg_.chunk > 0 ? cfg_.chunk : 0;
@@ -555,7 +542,12 @@ bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
             /*argmax_out=*/nullptr,
             &prefill_last_logits_,
             (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
-            remote_draft_.active() ? &remote_draft_ : nullptr);
+            remote_draft_.active() ? &remote_draft_ : nullptr,
+            kvflash_active() ? &kvflash_pager_ : nullptr);
+        if (ok && kvflash_active()) {
+            kvflash_sync_history(prompt, base_pos);
+            kvflash_pager_.zero_free_blocks();
+        }
         return ok;
     }
     const bool ok = run_qwen35_layer_split_forward(
@@ -584,7 +576,7 @@ bool Qwen35LayerSplitAdapter::snapshot_save(int slot) {
     if (!snapshot_slot_valid(slot)) return false;
     if (snapshot_backends_.size() != shards_.size()) return false;
     const int cur_pos = shards_.empty() ? 0 : shards_.front().cache.cur_pos;
-    if (!use_mixed_target_split() && kvflash_active() &&
+    if (kvflash_active() &&
         (cur_pos > kvflash_tokens_ || !kvflash_pager_.is_identity())) {
         static bool warned = false;
         if (!warned) {
@@ -613,15 +605,10 @@ bool Qwen35LayerSplitAdapter::snapshot_save(int slot) {
     }
     if (snapshot_prefill_logits_.size() != (size_t)PREFIX_SLOTS) return false;
     snapshot_prefill_logits_[(size_t)slot] = prefill_last_logits_;
-    if (!use_mixed_target_split() && kvflash_active() &&
+    if (kvflash_active() &&
         kvflash_history_snapshots_.size() == (size_t)PREFIX_SLOTS) {
-        auto & history_snap = kvflash_history_snapshots_[(size_t)slot];
-        history_snap.clear();
-        const size_t keep = (size_t)std::min(cur_pos, (int)kvflash_history_.size());
-        history_snap.assign(kvflash_history_.begin(), kvflash_history_.begin() + keep);
-        if ((int)history_snap.size() < cur_pos) {
-            history_snap.resize((size_t)cur_pos, 0);
-        }
+        layer_split_kvflash_save_history_snapshot(
+            kvflash_history_, cur_pos, kvflash_history_snapshots_[(size_t)slot]);
     }
     if (!snapshot_draft_features(slot)) {
         snapshot_free(slot);
@@ -717,19 +704,10 @@ bool Qwen35LayerSplitAdapter::snapshot_restore(int slot) {
     }
     if (snapshot_prefill_logits_.size() != (size_t)PREFIX_SLOTS) return false;
     prefill_last_logits_ = snapshot_prefill_logits_[(size_t)slot];
-    if (!use_mixed_target_split() && kvflash_active()) {
+    if (kvflash_active()) {
         if (!kvflash_sync_identity(cur_pos)) return false;
-        if (kvflash_history_snapshots_.size() == (size_t)PREFIX_SLOTS &&
-            !kvflash_history_snapshots_[(size_t)slot].empty()) {
-            kvflash_history_ = kvflash_history_snapshots_[(size_t)slot];
-        } else {
-            kvflash_history_.clear();
-        }
-        if ((int)kvflash_history_.size() > cur_pos) {
-            kvflash_history_.resize((size_t)cur_pos);
-        } else if ((int)kvflash_history_.size() < cur_pos) {
-            kvflash_history_.resize((size_t)cur_pos, 0);
-        }
+        layer_split_kvflash_restore_history(
+            kvflash_history_, kvflash_history_snapshots_, slot, cur_pos);
     }
     if (!restore_draft_features(slot)) return false;
     return true;
@@ -969,7 +947,7 @@ bool Qwen35LayerSplitAdapter::snapshot_adopt(int slot,
         disk_snapshot_backends_.size() != (size_t)PREFIX_SLOTS) {
         return false;
     }
-    if (!mixed_target_split && kvflash_active() &&
+    if (kvflash_active() &&
         kvflash_history_snapshots_.size() != (size_t)PREFIX_SLOTS) {
         kvflash_history_snapshots_.resize(PREFIX_SLOTS);
     }
@@ -1179,7 +1157,7 @@ bool Qwen35LayerSplitAdapter::snapshot_adopt(int slot,
     } else {
         free_draft_feature_snapshot(slot);
     }
-    if (!mixed_target_split && kvflash_active()) {
+    if (kvflash_active()) {
         kvflash_history_snapshots_[(size_t)slot].assign((size_t)cur_pos, 0);
     }
 
@@ -1310,7 +1288,8 @@ bool Qwen35LayerSplitAdapter::decode_ar(
                     /*argmax_out=*/nullptr,
                     logits_out,
                     (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
-                    remote_draft_.active() ? &remote_draft_ : nullptr);
+                    remote_draft_.active() ? &remote_draft_ : nullptr,
+                    kvflash_active() ? &kvflash_pager_ : nullptr);
             }
             return run_qwen35_layer_split_forward(
                 shards_, shards_.front().weights, one, pos, 1, next_tok,
@@ -1324,7 +1303,7 @@ bool Qwen35LayerSplitAdapter::decode_ar(
         },
         [&](int tok) { return is_eos_tok(tok, w); },
         out_tokens, io);
-    if (ok && !use_mixed_target_split() && kvflash_active()) {
+    if (ok && kvflash_active()) {
         kvflash_sync_history(out_tokens, committed);
         kvflash_maybe_reselect((int)out_tokens.size());
     }
@@ -1346,7 +1325,7 @@ bool Qwen35LayerSplitAdapter::decode_dflash(
         cfg_.kq_stride_pad, cfg_.fa_window,
         use_remote_draft ? &remote_draft_ : nullptr,
         use_mixed_target_split() ? &remote_target_shard_ : nullptr,
-        (!use_mixed_target_split() && kvflash_active()) ? &kvflash_pager_ : nullptr);
+        kvflash_active() ? &kvflash_pager_ : nullptr);
     DaemonIO collect_io = io.with_token_callback([&](int32_t tok) -> bool {
         out_tokens.push_back(tok);
         return true;
@@ -1358,7 +1337,7 @@ bool Qwen35LayerSplitAdapter::decode_dflash(
         use_remote_draft ? &remote_draft_ : nullptr, /*hint_tokens=*/nullptr, base_pos,
         &accept_rate);
     accept_rate_out = (float)accept_rate;
-    if (ok && !use_mixed_target_split() && kvflash_active()) {
+    if (ok && kvflash_active()) {
         kvflash_sync_history(out_tokens, base_pos + (int)prompt.size());
         kvflash_maybe_reselect((int)out_tokens.size());
     }
@@ -1424,7 +1403,7 @@ DFlashTarget * Qwen35LayerSplitAdapter::dflash_target() {
             cfg_.kq_stride_pad, cfg_.fa_window,
             remote_draft_.active() ? &remote_draft_ : nullptr,
             use_mixed_target_split() ? &remote_target_shard_ : nullptr,
-            (!use_mixed_target_split() && kvflash_active()) ? &kvflash_pager_ : nullptr);
+            kvflash_active() ? &kvflash_pager_ : nullptr);
     }
     return dflash_target_.get();
 }

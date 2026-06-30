@@ -57,11 +57,10 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 | Model | Speedup |
 |-------|:-------:|
 | Qwen 3.5-0.8B (Megakernel) | **~2×** |
-| Qwen 3.5-27B + DDTree | **3.43×** |
 | Qwen 3.6-27B + PFlash | **~5.6×** |
 | Qwen 3.6-27B + DDTree | **4.84×** |
 | Laguna-XS.2 33B + PFlash | **5.4×** @128K |
-| Qwen 3.5-27B HIP | **~2.6×** |
+| Qwen 3.6-27B HIP | **~2.6×** |
 | Gemma-4-26B-A4B | **1.31×** |
 
 </td>
@@ -93,6 +92,7 @@ Reference target: **RTX 3090 (Ampere sm_86)** — all headline numbers. Other NV
 | <img src="assets/gpus/v100.png" width="750" /> | Volta `sm_70` / Pascal `sm_61` | V100, P40 | CUDA 12.0 | 🟡 fallback paths, unbenched | — |
 | <img src="assets/gpus/ryze395.png" width="750" /> | RDNA3.5 `gfx1151` | Ryzen AI MAX+ 395 / Strix Halo | ROCm 6+ | ✅ 37 tok/s HIP | [↗](server/README.md#amd-hip-backend-strix-halo-rx-7900-xtx) |
 | <img src="assets/gpus/7900xtx.png" width="750" /> | RDNA3 `gfx1100` | Radeon RX 7900 XTX | ROCm 6+ | ✅ 50 tok/s HIP | [↗](server/README.md#amd-hip-backend-strix-halo-rx-7900-xtx) |
+| — | RDNA4 `gfx1201` | Radeon AI PRO R9700 | ROCm 6.4+ | ✅ 55 tok/s HIP | [↗](server/README.md#amd-hip-backend-strix-halo-rx-7900-xtx) |
 
 `server/` (DFlash) builds with CMake 3.18+ and `--recurse-submodules` for `Luce-Org/llama.cpp@luce-dflash` — no PyTorch needed. `optimizations/megakernel/` is the only component requiring PyTorch 2.0+ (CUDAExtension links against torch C++ libs). Power-tune: `sudo nvidia-smi -pl 220` (3090 sweet spot, re-sweep for other cards).
 
@@ -272,6 +272,17 @@ Requests that omit `temperature` use the model card's sampling (Qwen3.6: `temper
 | `--draft-residency {auto,persistent,request-scoped}` | `auto` | When draft weights are evicted from VRAM. `request-scoped` parks/frees them after each request's draft work (frees VRAM for the target on tight GPUs); `persistent` keeps them resident across requests; `auto` preserves current behavior while honoring the low-VRAM / `--lazy-draft` hint. Reported at `/props.runtime.draft_residency`. |
 | `--lazy-draft` | off | Legacy alias for `--draft-residency=request-scoped` (defer draft load until first request, release after) |
 
+**GPU draft top-K & verify-argmax (DFlash)**
+
+The draft-token top-K extraction and the per-step verify argmax used to run on the CPU, each requiring a full `vocab × n_tokens` logits copy from device to host (D2H) every speculation step. These two env flags move both onto the GPU, reading the logits in place on the device buffer and skipping the bulk D2H. Both are **on by default** and only take effect on **CUDA builds** (the kernel is CUDA-only — on HIP/ROCm builds the flags are no-ops and the CPU path always runs). Each path validates its result and **falls back to the legacy CPU computation automatically** on any failure (e.g. an out-of-range index), so disabling them is only needed for debugging or A/B comparison.
+
+| Env | Default | Effect |
+|---|---|---|
+| `DFLASH_GPU_DRAFT_TOPK=1` | `1` (on) | Compute the draft model's top-K vocab indices (K in 1–8) and log-sum-exp directly on the logits device buffer. `=0` forces the legacy CPU top-K (full-vocab D2H + CPU heap extract). Use `=0` to isolate the kernel when debugging or to baseline its speedup. |
+| `DFLASH_GPU_VERIFY_ARGMAX` | on (server) / `0` (test harness) | Per-step verify argmax. In the server it is on by default and a simple on/off; `=0` forces the legacy CPU path. In `test_dflash` it is a tri-state with these values: <br>• `0` — legacy CPU path: full `vocab × N` D2H + CPU argmax (default in the test harness). <br>• `1` — GPU fast-path: read the in-graph batched GPU argmax (N int32s), no bulk D2H. <br>• `2` — run **both** the CPU and GPU paths and report any per-step mismatches (validation mode; guards against the historical tree-verify `-1`/tie regression). |
+
+To reproduce the benchmark: baseline `DFLASH_GPU_DRAFT_TOPK=0 DFLASH_GPU_VERIFY_ARGMAX=0`, optimized `DFLASH_GPU_DRAFT_TOPK=1 DFLASH_GPU_VERIFY_ARGMAX=1`, both via `python server/scripts/bench_llm.py --bench HumanEval`.
+
 **Prefill compression (PFlash)**
 
 | Flag / env | Default | Effect |
@@ -336,6 +347,7 @@ Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token ch
 | `--no-cors` | CORS on | Disable CORS headers |
 | `DFLASH_TARGET_GPU=N` | `0` | Env var equivalent of `--target-gpu` |
 | `DFLASH_DRAFT_GPU=N` | same as target | Env var equivalent of `--draft-gpu` |
+| `DFLASH_MODEL_NAME=<name>` | `dflash` | Env var equivalent of `--model-name`; sets the `/v1/models` id and selects the matching `share/model_cards/<name>.json` |
 
 **MoE expert offload (Spark)**
 

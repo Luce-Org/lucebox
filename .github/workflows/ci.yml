@@ -54,6 +54,15 @@ jobs:
           sub-packages: '["nvcc", "cudart-dev", "thrust", "driver-dev"]'
           non-cuda-sub-packages: '["libcublas-dev"]'
 
+      - name: Provide CUDA driver stub for hosted tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/cuda-stubs"
+          ln -sf "$CUDA_PATH/targets/x86_64-linux/lib/stubs/libcuda.so" \
+            "$RUNNER_TEMP/cuda-stubs/libcuda.so.1"
+          {
+            echo "LD_LIBRARY_PATH=$RUNNER_TEMP/cuda-stubs:/usr/local/cuda-12.8/targets/x86_64-linux/lib/stubs:/usr/local/cuda-12.8/lib64"
+          } >> "$GITHUB_ENV"
+
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           version: "0.11.x"

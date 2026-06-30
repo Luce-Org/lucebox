@@ -25,6 +25,8 @@
 
 #include "internal.h"
 #include "common/derived_scalars.h"
+#include "common/gguf_mmap.h"
+#include "common/gguf_bounds.h"
 
 #include <cinttypes>
 #include <cstdint>
@@ -44,63 +46,6 @@ namespace dflash::common {
 
 namespace {
 
-struct Mmap {
-    void *  addr = nullptr;
-    size_t  len  = 0;
-#if defined(_WIN32)
-    HANDLE  hFile = INVALID_HANDLE_VALUE;
-    HANDLE  hMap  = nullptr;
-#else
-    int     fd   = -1;
-#endif
-
-    bool open_ro(const std::string & path, std::string & err) {
-#if defined(_WIN32)
-        hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hFile == INVALID_HANDLE_VALUE) {
-            err = "CreateFileA: " + path + ": error " + std::to_string(GetLastError());
-            return false;
-        }
-        LARGE_INTEGER sz;
-        if (!GetFileSizeEx(hFile, &sz)) {
-            err = "GetFileSizeEx: error " + std::to_string(GetLastError());
-            return false;
-        }
-        len = (size_t)sz.QuadPart;
-        hMap = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
-        if (!hMap) {
-            err = "CreateFileMappingA: error " + std::to_string(GetLastError());
-            return false;
-        }
-        addr = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
-        if (!addr) {
-            err = "MapViewOfFile: error " + std::to_string(GetLastError());
-            return false;
-        }
-#else
-        fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) { err = "open: " + path + ": " + std::strerror(errno); return false; }
-        struct stat st;
-        if (::fstat(fd, &st) < 0) { err = "fstat: " + std::string(std::strerror(errno)); return false; }
-        len = (size_t)st.st_size;
-        addr = ::mmap(nullptr, len, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (addr == MAP_FAILED) { err = "mmap: " + std::string(std::strerror(errno)); addr = nullptr; return false; }
-#endif
-        return true;
-    }
-    ~Mmap() {
-#if defined(_WIN32)
-        if (addr)                        UnmapViewOfFile(addr);
-        if (hMap)                        CloseHandle(hMap);
-        if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
-#else
-        if (addr) ::munmap(addr, len);
-        if (fd >= 0) ::close(fd);
-#endif
-    }
-};
-
 uint32_t get_u32_or(const gguf_context * g, const char * key, uint32_t fallback) {
     int64_t id = gguf_find_key(g, key);
     if (id < 0) return fallback;
@@ -113,6 +58,29 @@ int count_swa_layers(const DraftWeights & w) {
         if (layer.is_swa) n_swa++;
     }
     return n_swa;
+}
+
+bool check_shape_1d(const ggml_tensor * t, int64_t ne0, const char * name, char * buf, size_t buf_sz) {
+    if (!t || t->ne[0] != ne0) {
+        std::snprintf(buf, buf_sz, "draft GGUF: Domino tensor %s shape mismatch: got [%lld], expected [%lld]",
+                      name, t ? (long long)t->ne[0] : -1LL, (long long)ne0);
+        return false;
+    }
+    return true;
+}
+
+bool check_shape_2d(const ggml_tensor * t, int64_t ne0, int64_t ne1,
+                    const char * name, char * buf, size_t buf_sz) {
+    if (!t || t->ne[0] != ne0 || t->ne[1] != ne1) {
+        std::snprintf(buf, buf_sz,
+                      "draft GGUF: Domino tensor %s shape mismatch: got [%lld,%lld], expected [%lld,%lld]",
+                      name,
+                      t ? (long long)t->ne[0] : -1LL,
+                      t ? (long long)t->ne[1] : -1LL,
+                      (long long)ne0, (long long)ne1);
+        return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -177,12 +145,24 @@ bool load_draft_gguf(const std::string & path,
     const uint32_t head_dim  = read_u32("attention.key_length",    0);
     const uint32_t block_sz  = read_u32("dflash.block_size",       0);
     uint32_t n_tgt_lay       = read_u32("dflash.n_target_layers",  0);
-    if (n_tgt_lay == 0) {
+    const uint32_t domino_meta_enabled = read_u32("dflash.domino.enabled", 0);
+    const uint32_t domino_meta_gru     = read_u32("dflash.domino.gru_hidden_dim", 0);
+    const uint32_t domino_meta_emb     = read_u32("dflash.domino.emb_dim", 0);
+    const uint32_t domino_meta_vocab   = read_u32("dflash.domino.vocab_size", 0);
+    // Explicit captured target-layer ids (data-driven). Lets any DFlash drafter
+    // load without a hardcoded per-arch set; the array length also backstops
+    // n_target_layers when the scalar KV is absent.
+    {
         std::snprintf(key, sizeof(key), "%s.%s", A, "dflash.target_layer_ids");
         const int64_t target_ids_id = gguf_find_key(gctx, key);
         if (target_ids_id >= 0 &&
-            gguf_get_kv_type(gctx, target_ids_id) == GGUF_TYPE_ARRAY) {
-            n_tgt_lay = (uint32_t)gguf_get_arr_n(gctx, target_ids_id);
+            gguf_get_kv_type(gctx, target_ids_id) == GGUF_TYPE_ARRAY &&
+            gguf_get_arr_type(gctx, target_ids_id) == GGUF_TYPE_INT32) {
+            const uint32_t n = (uint32_t)gguf_get_arr_n(gctx, target_ids_id);
+            const int32_t * vals =
+                (const int32_t *)gguf_get_arr_data(gctx, target_ids_id);
+            out.capture_layer_ids.assign(vals, vals + n);
+            if (n_tgt_lay == 0) n_tgt_lay = n;
         }
     }
     if (n_tgt_lay == 0 && n_embd != 0) {
@@ -297,6 +277,64 @@ bool load_draft_gguf(const std::string & path,
         }
     }
 
+    out.domino = DraftDominoWeights{};
+    out.domino.start    = g("dflash.domino.start");
+    out.domino.gru_w_ih = g("dflash.domino.gru.weight_ih");
+    out.domino.gru_w_hh = g("dflash.domino.gru.weight_hh");
+    out.domino.gru_b_ih = g("dflash.domino.gru.bias_ih");
+    out.domino.gru_b_hh = g("dflash.domino.gru.bias_hh");
+    out.domino.head_w1  = g("dflash.domino.head.w1");
+    out.domino.head_b1  = g("dflash.domino.head.b1");
+    out.domino.head_w2  = g("dflash.domino.head.w2");
+    out.domino.head_b2  = g("dflash.domino.head.b2");
+
+    const bool domino_any =
+        out.domino.start || out.domino.gru_w_ih || out.domino.gru_w_hh ||
+        out.domino.gru_b_ih || out.domino.gru_b_hh || out.domino.head_w1 ||
+        out.domino.head_b1 || out.domino.head_w2 || out.domino.head_b2 ||
+        domino_meta_enabled != 0;
+    if (domino_any) {
+        const bool domino_all =
+            out.domino.start && out.domino.gru_w_ih && out.domino.gru_w_hh &&
+            out.domino.gru_b_ih && out.domino.gru_b_hh && out.domino.head_w1 &&
+            out.domino.head_b1 && out.domino.head_w2 && out.domino.head_b2;
+        if (!domino_all) {
+            set_last_error("draft GGUF: incomplete Domino aux-head tensors");
+            gguf_free(gctx);
+            return false;
+        }
+
+        out.domino.gru_hidden_dim =
+            domino_meta_gru != 0 ? (int)domino_meta_gru : (int)out.domino.gru_w_hh->ne[0];
+        out.domino.emb_dim =
+            domino_meta_emb != 0 ? (int)domino_meta_emb : (int)out.domino.head_w1->ne[1];
+        out.domino.vocab_size =
+            domino_meta_vocab != 0 ? (int)domino_meta_vocab : (int)out.domino.head_w2->ne[1];
+
+        const int64_t H = out.domino.gru_hidden_dim;
+        const int64_t E = out.domino.emb_dim;
+        const int64_t V = out.domino.vocab_size;
+        char shape_err[320];
+        if (!check_shape_1d(out.domino.start, H, "start", shape_err, sizeof(shape_err)) ||
+            !check_shape_2d(out.domino.gru_w_ih, out.n_embd, 3 * H, "gru.weight_ih", shape_err, sizeof(shape_err)) ||
+            !check_shape_2d(out.domino.gru_w_hh, H, 3 * H, "gru.weight_hh", shape_err, sizeof(shape_err)) ||
+            !check_shape_1d(out.domino.gru_b_ih, 3 * H, "gru.bias_ih", shape_err, sizeof(shape_err)) ||
+            !check_shape_1d(out.domino.gru_b_hh, 3 * H, "gru.bias_hh", shape_err, sizeof(shape_err)) ||
+            !check_shape_2d(out.domino.head_w1, out.n_embd + H, E, "head.w1", shape_err, sizeof(shape_err)) ||
+            !check_shape_1d(out.domino.head_b1, E, "head.b1", shape_err, sizeof(shape_err)) ||
+            !check_shape_2d(out.domino.head_w2, E, V, "head.w2", shape_err, sizeof(shape_err)) ||
+            !check_shape_1d(out.domino.head_b2, V, "head.b2", shape_err, sizeof(shape_err))) {
+            set_last_error(shape_err);
+            gguf_free(gctx);
+            return false;
+        }
+
+        out.domino.enabled = true;
+        std::fprintf(stderr, "[draft GGUF] Domino GRU head enabled: H=%d E=%d vocab=%d\n",
+                     out.domino.gru_hidden_dim, out.domino.emb_dim,
+                     out.domino.vocab_size);
+    }
+
     // GGUF Qwen3.6 drafters carry SWA metadata emitted by the converter:
     //   dflash-draft.attention.sliding_window = 2048
     //   dflash-draft.attention.sliding_window_pattern = [true,true,true,true,false]
@@ -327,8 +365,10 @@ bool load_draft_gguf(const std::string & path,
 
     // ── 4. mmap file and copy tensor bytes to CUDA ───────────────────────
     std::string err;
-    Mmap mm;
-    if (!mm.open_ro(path, err)) { set_last_error(err); gguf_free(gctx); return false; }
+    GgufMmap mm;
+    if (!mm.open(path, err)) { set_last_error(err); gguf_free(gctx); return false; }
+    const uint8_t * mm_addr = (const uint8_t *)mm.data();
+    const size_t    mm_len  = mm.size();
     const size_t data_start = gguf_get_data_offset(gctx);
     const int64_t n_tensors = gguf_get_n_tensors(gctx);
 
@@ -337,14 +377,16 @@ bool load_draft_gguf(const std::string & path,
         const char * tname = gguf_get_tensor_name(gctx, tid);
         ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
         if (!t) continue;
-        const size_t off = data_start + gguf_get_tensor_offset(gctx, tid);
-        const size_t sz  = gguf_get_tensor_size(gctx, tid);
-        if (off + sz > mm.len) {
-            set_last_error(std::string("draft GGUF: tensor '") + tname + "' overflows file");
+        const size_t rel_off = gguf_get_tensor_offset(gctx, tid);
+        const size_t sz      = gguf_get_tensor_size(gctx, tid);
+        if (!gguf_tensor_in_file(data_start, rel_off, sz, mm_len)) {
+            set_last_error(gguf_bounds_error("draft GGUF", tname,
+                ggml_type_name(gguf_get_tensor_type(gctx, tid)),
+                data_start, rel_off, sz, mm_len));
             gguf_free(gctx);
             return false;
         }
-        ggml_backend_tensor_set(t, (const uint8_t *)mm.addr + off, 0, sz);
+        ggml_backend_tensor_set(t, mm_addr + data_start + rel_off, 0, sz);
         total += sz;
     }
 

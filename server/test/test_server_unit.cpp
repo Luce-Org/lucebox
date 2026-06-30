@@ -29,10 +29,16 @@
 #include "common/io_utils.h"
 #include "placement/placement_config.h"
 #include "common/layer_split_backend.h"
+#include "common/layer_split_kvflash.h"
 #include "common/layer_split_utils.h"
+#include "common/kvflash_pager.h"
 #include "placement/draft_residency.h"
+#include "common/gguf_bounds.h"
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
+#include "qwen3_drafter_model.h"
+#include "dflash27b.h"
+#include "gguf.h"
 #include <nlohmann/json.hpp>
 
 #include <cmath>
@@ -117,9 +123,10 @@ static json weather_tools() {
     });
 }
 
-static SseEmitter make_emitter(ApiFormat fmt, json tools = json::array()) {
+static SseEmitter make_emitter(ApiFormat fmt, json tools = json::array(),
+                               bool started_in_thinking = false) {
     return SseEmitter(fmt, "test_id_001", "test-model", 10,
-                      tools, nullptr);
+                      tools, nullptr, {}, started_in_thinking);
 }
 
 // Concatenate all SSE chunks into a single string.
@@ -211,6 +218,21 @@ static void test_reasoning_started_in_thinking() {
     TEST_ASSERT(r.has_reasoning);
     TEST_ASSERT(r.reasoning == "thinking body");
     TEST_ASSERT(r.content == "content here");
+}
+
+static void test_emitter_started_in_thinking_without_open_tag() {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), true);
+    auto chunks = em.emit_token("Thinking Process: calculate 9 + 6.");
+    auto close = em.emit_token("</think>");
+    auto answer = em.emit_token("15");
+    em.emit_finish(3);
+
+    std::string all = concat(chunks) + concat(close) + concat(answer);
+    TEST_ASSERT(em.reasoning_text().find("Thinking Process") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text() == "15");
+    TEST_ASSERT(em.first_content_token_index() == 2);
+    TEST_ASSERT(all.find("reasoning_content") != std::string::npos);
+    TEST_ASSERT(all.find("\"content\":\"Thinking Process") == std::string::npos);
 }
 
 static void test_reasoning_unclosed_think() {
@@ -1229,6 +1251,40 @@ static void test_find_boundaries_empty() {
     TEST_ASSERT(bounds.empty());
 }
 
+// ── Prefix-aware eviction policy (model-free) ───────────────────────────
+
+static void test_evict_empty_is_zero() {
+    std::vector<std::vector<int32_t>> ids;
+    TEST_ASSERT(select_inline_evict_victim(ids) == 0);
+}
+
+static void test_evict_single_is_zero() {
+    std::vector<std::vector<int32_t>> ids = {{1, 2, 3}};
+    TEST_ASSERT(select_inline_evict_victim(ids) == 0);
+}
+
+static void test_evict_chain_keeps_ancestors() {
+    // Oldest-first chain: [s] < [s,a] < [s,a,b]. Only the longest is a leaf, so
+    // the short shared ancestors are kept and the victim is the deepest entry.
+    std::vector<std::vector<int32_t>> ids = {{9}, {9, 1}, {9, 1, 2}};
+    TEST_ASSERT(select_inline_evict_victim(ids) == 2);
+}
+
+static void test_evict_unrelated_falls_back_to_lru() {
+    // No prefix relation: all are leaves, so evict the oldest (index 0).
+    std::vector<std::vector<int32_t>> ids = {{1, 1}, {2, 2}, {3, 3}};
+    TEST_ASSERT(select_inline_evict_victim(ids) == 0);
+}
+
+static void test_evict_branch_spares_shared_root() {
+    // [s] is an ancestor of both branches, so it is never the victim; the oldest
+    // leaf ([s,a] at index 1) is evicted instead.
+    std::vector<std::vector<int32_t>> ids = {{9}, {9, 1}, {9, 2}};
+    int v = select_inline_evict_victim(ids);
+    TEST_ASSERT(v == 1);
+    TEST_ASSERT(v != 0);  // the shared root must be spared
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // PFlash config tests (model-free)
 // ═══════════════════════════════════════════════════════════════════════
@@ -1754,6 +1810,100 @@ static void test_validate_layer_split_weights_shape() {
     TEST_ASSERT(validate_device_placement(placement, -1).empty());
 }
 
+static void test_target_shard_plan_same_backend_split() {
+    DevicePlacement placement;
+    TEST_ASSERT(parse_placement_device_list("cuda:0,cuda:1,cuda:2", placement));
+
+    MixedLayerSplitPlan plan;
+    TEST_ASSERT(compute_target_shard_layer_split_plan(
+        placement, PlacementBackend::Cuda, plan, "test-target-shard"));
+    TEST_ASSERT(plan.remote_begin == 1);
+    TEST_ASSERT(plan.remote_backend == PlacementBackend::Cuda);
+}
+
+static void test_target_shard_plan_mixed_backend_split() {
+    DevicePlacement placement;
+    TEST_ASSERT(parse_placement_device_list("cuda:0,cuda:1,hip:0,hip:1", placement));
+
+    MixedLayerSplitPlan plan;
+    TEST_ASSERT(compute_target_shard_layer_split_plan(
+        placement, PlacementBackend::Cuda, plan, "test-target-shard"));
+    TEST_ASSERT(plan.remote_begin == 2);
+    TEST_ASSERT(plan.remote_backend == PlacementBackend::Hip);
+}
+
+static void test_target_shard_plan_rejects_bad_local_backend() {
+    DevicePlacement placement;
+    TEST_ASSERT(parse_placement_device_list("cuda:0,hip:0", placement));
+
+    MixedLayerSplitPlan plan;
+    TEST_ASSERT(!compute_target_shard_layer_split_plan(
+        placement, PlacementBackend::Hip, plan, "test-target-shard"));
+}
+
+static bool kvflash_test_sync_identity(KvFlashPager & pager, int committed) {
+    return layer_split_kvflash_sync_identity(
+        pager, committed, pager.pool_tokens(), "test-target-split");
+}
+
+static void test_kvflash_pager_identity_sync_contract() {
+    KvFlashConfig cfg;
+    cfg.pool_tokens = 512;
+
+    KvFlashPager local;
+    KvFlashPager remote;
+    TEST_ASSERT(local.attach(cfg, {}, {}));
+    TEST_ASSERT(remote.attach(cfg, {}, {}));
+
+    TEST_ASSERT(kvflash_test_sync_identity(local, 256));
+    TEST_ASSERT(kvflash_test_sync_identity(remote, 256));
+    TEST_ASSERT(local.slot_of(255) == remote.slot_of(255));
+
+    TEST_ASSERT(kvflash_test_sync_identity(local, cfg.pool_tokens));
+    TEST_ASSERT(local.slot_of(cfg.pool_tokens - 1) == cfg.pool_tokens - 1);
+    TEST_ASSERT(local.is_identity());
+
+    const int relocated = local.slot_for(cfg.pool_tokens);
+    TEST_ASSERT(relocated >= 0);
+    TEST_ASSERT(relocated != cfg.pool_tokens);
+    TEST_ASSERT(!local.is_identity());
+
+    TEST_ASSERT(kvflash_test_sync_identity(local, 128));
+    TEST_ASSERT(local.slot_of(127) == 127);
+}
+
+static void test_layer_split_kvflash_history_contract() {
+    std::vector<int32_t> history;
+    layer_split_kvflash_sync_history(history, {1, 2, 3}, 0);
+    TEST_ASSERT((history == std::vector<int32_t>{1, 2, 3}));
+
+    layer_split_kvflash_sync_history(history, {4, 5}, 3);
+    TEST_ASSERT((history == std::vector<int32_t>{1, 2, 3, 4, 5}));
+
+    layer_split_kvflash_sync_history(history, {9}, 2);
+    TEST_ASSERT((history == std::vector<int32_t>{1, 2, 9}));
+
+    layer_split_kvflash_sync_history(history, {7}, 5);
+    TEST_ASSERT(history.size() == 6);
+    TEST_ASSERT(history[0] == 1);
+    TEST_ASSERT(history[1] == 2);
+    TEST_ASSERT(history[2] == 9);
+    TEST_ASSERT(history[3] == 0);
+    TEST_ASSERT(history[4] == 0);
+    TEST_ASSERT(history[5] == 7);
+
+    std::vector<std::vector<int32_t>> snapshots(2);
+    layer_split_kvflash_save_history_snapshot(history, 4, snapshots[1]);
+    TEST_ASSERT((snapshots[1] == std::vector<int32_t>{1, 2, 9, 0}));
+
+    history = {8, 8, 8};
+    layer_split_kvflash_restore_history(history, snapshots, 1, 6);
+    TEST_ASSERT((history == std::vector<int32_t>{1, 2, 9, 0, 0, 0}));
+
+    layer_split_kvflash_restore_history(history, snapshots, 0, 3);
+    TEST_ASSERT((history == std::vector<int32_t>{0, 0, 0}));
+}
+
 static void test_backend_precision_cuda_sm_policy() {
     TEST_ASSERT(select_cuda_backend_precision_type_for_sm(90) == GGML_TYPE_BF16);
     TEST_ASSERT(select_cuda_backend_precision_type_for_sm(80) == GGML_TYPE_BF16);
@@ -1801,6 +1951,8 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     bool dflash_enabled = false;
     bool dflash_called = false;
     bool sampling_enabled = false;
+    bool kvflash_enabled = false;
+    bool mixed_backend_enabled = false;
     int shutdown_calls = 0;
     ModelBackend::CompressRequest last_compress_req;
     int prefill_chunk = 0;
@@ -1838,6 +1990,10 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     }
     bool can_dflash_decode() const override { return dflash_enabled; }
     bool supports_cpu_sampling() const override { return sampling_enabled; }
+    bool supports_kvflash() const override { return kvflash_enabled; }
+    bool supports_mixed_backend_layer_split() const override {
+        return mixed_backend_enabled;
+    }
     bool decode_dflash(const std::vector<int32_t> & prompt, int base_pos,
                        int last_tok, int n_gen, std::vector<int32_t> & out_tokens,
                        const DaemonIO & io, float & accept_rate_out) override {
@@ -2033,6 +2189,19 @@ static void test_layer_split_backend_shutdown_is_idempotent() {
     backend.shutdown();
     backend.shutdown();
     TEST_ASSERT(raw->shutdown_calls == 1);
+}
+
+static void test_layer_split_backend_capability_proxy() {
+    auto * raw = new MockLayerSplitAdapter();
+    LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
+
+    TEST_ASSERT(!backend.supports_kvflash());
+    TEST_ASSERT(!backend.supports_mixed_backend_layer_split());
+
+    raw->kvflash_enabled = true;
+    raw->mixed_backend_enabled = true;
+    TEST_ASSERT(backend.supports_kvflash());
+    TEST_ASSERT(backend.supports_mixed_backend_layer_split());
 }
 
 // Disk Prefix Cache Tests
@@ -4081,6 +4250,190 @@ static void test_flowkv_T5_inert_guard_token_count() {
     TEST_ASSERT(1024 >= kFkvInertMinTokens);
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Qwen3-0.6B drafter loader: truncated GGUF guard (bug #438)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Builds a minimal but structurally valid Qwen3-0.6B-style GGUF on disk, then
+// verifies that load_qwen3_drafter_model:
+//   (1) loads the full, untruncated file successfully (positive control), and
+//   (2) fails cleanly with a "truncated or corrupt" error when the tensor-data
+//       section is truncated — instead of letting the H2D copy read past the
+//       end of the mmap and SIGSEGV inside the device copy.
+
+// Write a tiny valid drafter GGUF and return its path. The loader fixes
+// n_vocab at 151936 (Qwen3DrafterWeights default), so token_embd stays the
+// largest tensor (~2.4 MB BF16) while every other tensor is minimal.
+static std::string write_qwen3_drafter_fixture_gguf() {
+    const int n_embd    = 8;
+    const int n_head    = 2;
+    const int head_dim  = 4;
+    const int n_head_kv = 1;
+    const int n_ff      = 16;
+    const int n_layer   = 1;
+    const int n_vocab   = 151936;                // must match the loader default
+    const int q_dim     = n_head * head_dim;     // 8
+    const int kv_dim    = n_head_kv * head_dim;  // 4
+
+    ggml_init_params ip{};
+    ip.mem_size   = (size_t)16 * 1024 * 1024;    // headroom for token_embd + 13 tensors
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = false;
+    ggml_context * ctx = ggml_init(ip);
+
+    gguf_context * g = gguf_init_empty();
+    gguf_set_val_u32(g, "qwen3.embedding_length",        (uint32_t)n_embd);
+    gguf_set_val_u32(g, "qwen3.feed_forward_length",     (uint32_t)n_ff);
+    gguf_set_val_u32(g, "qwen3.attention.head_count",    (uint32_t)n_head);
+    gguf_set_val_u32(g, "qwen3.attention.head_count_kv", (uint32_t)n_head_kv);
+    gguf_set_val_u32(g, "qwen3.block_count",             (uint32_t)n_layer);
+    gguf_set_val_u32(g, "qwen3.context_length",          (uint32_t)64);
+    gguf_set_val_u32(g, "qwen3.attention.key_length",    (uint32_t)head_dim);
+    gguf_set_val_f32(g, "qwen3.rope.freq_base",          1000000.0f);
+
+    auto add_tensor = [&](const char * name, ggml_type t, int n_dims,
+                          int64_t ne0, int64_t ne1) {
+        ggml_tensor * w = (n_dims == 1)
+            ? ggml_new_tensor_1d(ctx, t, ne0)
+            : ggml_new_tensor_2d(ctx, t, ne0, ne1);
+        ggml_set_name(w, name);
+        std::memset(w->data, 0, ggml_nbytes(w));
+        gguf_add_tensor(g, w);
+    };
+
+    // Top-level tensors. output.weight is intentionally omitted so the loader
+    // exercises its tied-weights path (and the fixture stays small).
+    add_tensor("token_embd.weight",  GGML_TYPE_BF16, 2, n_embd, n_vocab);
+    add_tensor("output_norm.weight", GGML_TYPE_F32,  1, n_embd, 0);
+
+    // The single transformer block: the 11 per-layer tensors the loader copies.
+    add_tensor("blk.0.attn_norm.weight",   GGML_TYPE_F32,  1, n_embd,   0);
+    add_tensor("blk.0.attn_q.weight",      GGML_TYPE_BF16, 2, n_embd,   q_dim);
+    add_tensor("blk.0.attn_k.weight",      GGML_TYPE_BF16, 2, n_embd,   kv_dim);
+    add_tensor("blk.0.attn_v.weight",      GGML_TYPE_BF16, 2, n_embd,   kv_dim);
+    add_tensor("blk.0.attn_output.weight", GGML_TYPE_BF16, 2, q_dim,    n_embd);
+    add_tensor("blk.0.attn_q_norm.weight", GGML_TYPE_F32,  1, head_dim, 0);
+    add_tensor("blk.0.attn_k_norm.weight", GGML_TYPE_F32,  1, head_dim, 0);
+    add_tensor("blk.0.ffn_norm.weight",    GGML_TYPE_F32,  1, n_embd,   0);
+    add_tensor("blk.0.ffn_gate.weight",    GGML_TYPE_BF16, 2, n_embd,   n_ff);
+    add_tensor("blk.0.ffn_up.weight",      GGML_TYPE_BF16, 2, n_embd,   n_ff);
+    add_tensor("blk.0.ffn_down.weight",    GGML_TYPE_BF16, 2, n_ff,     n_embd);
+
+    const std::string path = "/tmp/dflash_test_qwen3_drafter_438.gguf";
+    gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
+
+    gguf_free(g);
+    ggml_free(ctx);
+    return path;
+}
+
+static void test_qwen3_drafter_rejects_truncated_gguf() {
+    const std::string path = write_qwen3_drafter_fixture_gguf();
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    TEST_ASSERT(backend != nullptr);
+
+    // Positive control: the full, untruncated file loads cleanly.
+    {
+        Qwen3DrafterWeights w;
+        bool ok = load_qwen3_drafter_model(path, backend, w);
+        TEST_ASSERT_MSG(ok, dflash27b_last_error());
+        free_qwen3_drafter_model(w);
+    }
+
+    // Truncate inside the tensor-data section. The header, kv block, and tensor
+    // info table all live before the data offset, so gguf_init_from_file still
+    // succeeds and we reach the EOF guard rather than a parse failure.
+    struct stat st{};
+    TEST_ASSERT(stat(path.c_str(), &st) == 0);
+    const off_t truncated_size = (off_t)st.st_size - 4096;
+    TEST_ASSERT(truncated_size > 0);
+    TEST_ASSERT(truncate(path.c_str(), truncated_size) == 0);
+
+    // The loader must fail cleanly (no SIGSEGV) with a descriptive error.
+    {
+        Qwen3DrafterWeights w;
+        bool ok = load_qwen3_drafter_model(path, backend, w);
+        TEST_ASSERT(!ok);
+        const std::string err = dflash27b_last_error();
+        TEST_ASSERT_MSG(err.find("truncated or corrupt") != std::string::npos,
+                        err.c_str());
+        free_qwen3_drafter_model(w);
+    }
+
+    ggml_backend_free(backend);
+    unlink(path.c_str());
+}
+
+// ─── GGUF tensor bounds (gguf_tensor_in_file / gguf_bounds_error) ───────
+//
+// The shared overflow-safe bounds check used by every GGUF loader
+// (draft/target/laguna) to reject truncated/corrupt files before a copy reads
+// past the mapping (#438), without wrongly rejecting valid files (#318). These
+// tests pin the boundary and, critically, the size_t overflow behaviour that a
+// naive `data_off + tensor_off + tensor_sz > file_size` test gets wrong.
+static void test_gguf_tensor_in_file_bounds() {
+    // Typical layout: 100-byte header/kv, 900-byte data section, 1000-byte file.
+    const size_t data_off = 100;
+    const size_t file     = 1000;
+
+    // Fully inside, including the exact end-of-file boundary.
+    TEST_ASSERT(gguf_tensor_in_file(data_off, 0,   900, file));   // fills the data section
+    TEST_ASSERT(gguf_tensor_in_file(data_off, 0,   0,   file));   // zero-size tensor
+    TEST_ASSERT(gguf_tensor_in_file(data_off, 899, 1,   file));   // last byte
+    TEST_ASSERT(gguf_tensor_in_file(data_off, 900, 0,   file));   // zero-size at EOF
+
+    // One byte past EOF must be rejected.
+    TEST_ASSERT(!gguf_tensor_in_file(data_off, 0,   901, file));
+    TEST_ASSERT(!gguf_tensor_in_file(data_off, 900, 1,   file));
+
+    // Data section offset itself past EOF (corrupt header).
+    TEST_ASSERT(!gguf_tensor_in_file(2000, 0, 0, file));
+    // data_off == file: only a zero-size tensor at offset 0 fits.
+    TEST_ASSERT(gguf_tensor_in_file(file, 0, 0, file));
+    TEST_ASSERT(!gguf_tensor_in_file(file, 0, 1, file));
+
+    // Whole-file data section (data_off == 0), valid full read.
+    TEST_ASSERT(gguf_tensor_in_file(0, 0, file, file));
+    TEST_ASSERT(!gguf_tensor_in_file(0, 0, file + 1, file));
+
+    // Overflow safety: a malformed offset/size must not wrap and slip through.
+    const size_t kMax = std::numeric_limits<size_t>::max();
+    TEST_ASSERT(!gguf_tensor_in_file(data_off, kMax, 10, file));   // huge tensor_off
+    TEST_ASSERT(!gguf_tensor_in_file(data_off, 0, kMax, file));    // huge tensor_sz
+    // The case a naive `off + sz > file` check fails: off + sz wraps below file.
+    // off = kMax - 10, sz = 20  →  off + sz == 9 (< file) would FALSE-PASS.
+    TEST_ASSERT(!gguf_tensor_in_file(0, kMax - 10, 20, file));
+    TEST_ASSERT(!gguf_tensor_in_file(kMax, 10, 10, file));         // huge data_off
+}
+
+static void test_gguf_bounds_error_reports_operands() {
+    // A normal (non-overflowing) rejection: the message must surface every
+    // operand so a false positive on a valid file (#318) is diagnosable.
+    const std::string e = gguf_bounds_error("target GGUF", "blk.56.ssm_out.weight",
+                                            "q5_K", 100, 5000, 200, 1000);
+    TEST_ASSERT(e.find("blk.56.ssm_out.weight") != std::string::npos);
+    TEST_ASSERT(e.find("q5_K") != std::string::npos);
+    TEST_ASSERT(e.find("data_off=100") != std::string::npos);
+    TEST_ASSERT(e.find("tensor_off=5000") != std::string::npos);
+    TEST_ASSERT(e.find("size=200") != std::string::npos);
+    TEST_ASSERT(e.find("5300") != std::string::npos);      // 100 + 5000 + 200
+    TEST_ASSERT(e.find("1000") != std::string::npos);      // file size
+
+    // Null name/type must not crash and must produce placeholders.
+    const std::string n = gguf_bounds_error("draft GGUF", nullptr, nullptr,
+                                            0, 0, 1, 0);
+    TEST_ASSERT(n.find("(null)") != std::string::npos);
+    TEST_ASSERT(n.find("(unknown)") != std::string::npos);
+
+    // When the end offset itself overflows size_t, report "overflow" rather
+    // than a wrapped number.
+    const size_t kMax = std::numeric_limits<size_t>::max();
+    const std::string o = gguf_bounds_error("target GGUF", "t", "f32",
+                                            kMax, 10, 10, 100);
+    TEST_ASSERT(o.find("overflow") != std::string::npos);
+}
+
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
     std::fprintf(stderr, " Server Unit Tests\n");
@@ -4106,6 +4459,7 @@ int main() {
     RUN_TEST(test_reasoning_basic);
     RUN_TEST(test_reasoning_no_tags);
     RUN_TEST(test_reasoning_started_in_thinking);
+    RUN_TEST(test_emitter_started_in_thinking_without_open_tag);
     RUN_TEST(test_reasoning_unclosed_think);
     RUN_TEST(test_reasoning_empty_thinking);
     RUN_TEST(test_reasoning_whitespace_in_think);
@@ -4185,6 +4539,11 @@ int main() {
     RUN_TEST(test_hash_prefix_different_lengths);
     RUN_TEST(test_hash_prefix_empty);
     RUN_TEST(test_find_boundaries_empty);
+    RUN_TEST(test_evict_empty_is_zero);
+    RUN_TEST(test_evict_single_is_zero);
+    RUN_TEST(test_evict_chain_keeps_ancestors);
+    RUN_TEST(test_evict_unrelated_falls_back_to_lru);
+    RUN_TEST(test_evict_branch_spares_shared_root);
 
     std::fprintf(stderr, "\n── PFlash config ──\n");
     RUN_TEST(test_pflash_config_defaults);
@@ -4236,6 +4595,11 @@ int main() {
     RUN_TEST(test_parse_target_device_list_mixed_backend_multi_remote);
     RUN_TEST(test_parse_target_device_list_single_gpu_is_not_layer_split);
     RUN_TEST(test_validate_layer_split_weights_shape);
+    RUN_TEST(test_target_shard_plan_same_backend_split);
+    RUN_TEST(test_target_shard_plan_mixed_backend_split);
+    RUN_TEST(test_target_shard_plan_rejects_bad_local_backend);
+    RUN_TEST(test_kvflash_pager_identity_sync_contract);
+    RUN_TEST(test_layer_split_kvflash_history_contract);
     RUN_TEST(test_backend_precision_cuda_sm_policy);
     RUN_TEST(test_backend_precision_hip_arch_policy);
     RUN_TEST(test_backend_precision_activation_type_combine);
@@ -4245,6 +4609,7 @@ int main() {
     RUN_TEST(test_layer_split_compress_nopark_uses_default_drafter_path);
     RUN_TEST(test_layer_split_compress_rejects_bad_keep_ratio);
     RUN_TEST(test_layer_split_backend_shutdown_is_idempotent);
+    RUN_TEST(test_layer_split_backend_capability_proxy);
 
     std::fprintf(stderr, "\n── Disk prefix cache ──\n");
     RUN_TEST(test_disk_cache_config_defaults);
@@ -4347,6 +4712,13 @@ int main() {
     RUN_TEST(test_flowkv_T3_ws1_continuation_json_shape);
     RUN_TEST(test_flowkv_T1_system_end_boundary_first);
     RUN_TEST(test_flowkv_T5_inert_guard_token_count);
+
+    std::fprintf(stderr, "\n── Qwen3-0.6B drafter loader (bug #438) ──\n");
+    RUN_TEST(test_qwen3_drafter_rejects_truncated_gguf);
+
+    std::fprintf(stderr, "\n── GGUF tensor bounds ──\n");
+    RUN_TEST(test_gguf_tensor_in_file_bounds);
+    RUN_TEST(test_gguf_bounds_error_reports_operands);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",

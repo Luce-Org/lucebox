@@ -34,6 +34,7 @@ public:
 
 protected:
     bool load_target_model(ggml_backend_t backend, TargetWeights & out) override;
+    bool post_kvflash_init_gate() override;
     bool run_ar_decode_path(int committed, int n_gen,
                             std::vector<int32_t> & out_tokens,
                             const DaemonIO & io) override;
@@ -43,6 +44,13 @@ protected:
     void after_target_compute(StepGraph & sg, int kv_start, int n_tokens) override;
 
 private:
+    // All-hot placement signal for post_kvflash_init_gate(): set when
+    // load_target_model takes the all-hot early-return (moe_hybrid null).
+    bool placement_all_hot_ = false;
+    // True iff all experts fit hot with the FULL max_ctx KV reservation
+    // (KVFlash redundant). When false but placement_all_hot_ is true, the pool
+    // is what kept experts hot — the gate must NOT disable KVFlash.
+    bool placement_all_hot_full_kv_ = false;
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string routing_stats_out_path_;
     std::string placement_out_path_;

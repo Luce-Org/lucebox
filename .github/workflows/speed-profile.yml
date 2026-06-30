@@ -1,0 +1,211 @@
+name: Speed Profile
+
+# Report-only speed profile for the inference engine. Runs on the self-hosted
+# RTX 3090 (lucebox3) on PRs that touch the engine or the optimizations, and on
+# manual dispatch. It NEVER blocks a PR (continue-on-error: true) — it publishes a
+# report to the run summary + uploads the JSON / markdown / nsys trace as artifacts.
+#
+# Why report-only: perf has run-to-run variance (thermals, clocks, scheduling).
+# Gating a merge on a noisy absolute number produces false failures. We surface the
+# trend first; a soft threshold can come later once a baseline + variance band exist.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'server/**'
+      - 'optimizations/**'
+      - '.github/workflows/speed-profile.yml'
+  workflow_dispatch:
+
+# Share the single physical 3090 with the existing gpu-tests job so two runs never
+# fight over the GPU. cancel-in-progress=false: let a queued profile finish rather
+# than killing it mid-measurement.
+concurrency:
+  group: lucebox3-gpu-runner
+  cancel-in-progress: false
+
+jobs:
+  speed-profile:
+    name: Speed profile (self-hosted RTX 3090, sm_86)
+    runs-on: [self-hosted, gpu, sm86]
+    timeout-minutes: 30
+    continue-on-error: true   # report-only: a slow/failed profile must not block the PR
+
+    # Model paths live on the runner, not in the repo (multi-GB weights). They are
+    # overridable via repo variables so the runner owner can point at whatever is
+    # staged without editing this workflow. Prefer the repo-documented Qwen3.6 GGUF
+    # draft path; keep the older LUCEBOX_SPEED_PROFILE_* variable names as aliases
+    # so existing repo settings continue to work.
+    env:
+      MODELS: ${{ vars.LUCEBOX_MODELS_DIR || '/opt/models' }}
+      TARGET_MODEL: ${{ vars.LUCEBOX_TARGET_MODEL || vars.LUCEBOX_SPEED_PROFILE_TARGET || 'Qwen3.6-27B-Q4_K_M.gguf' }}
+      DRAFT_MODEL: ${{ vars.LUCEBOX_DRAFT_MODEL || vars.LUCEBOX_SPEED_PROFILE_DRAFT || 'draft/dflash-draft-3.6-q4_k_m.gguf' }}
+      TOKENIZER: ${{ vars.LUCEBOX_TOKENIZER || vars.LUCEBOX_SPEED_PROFILE_TOKENIZER || 'Qwen/Qwen3.6-27B' }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: GPU info (and pin clocks to cut variance, if permitted)
+        run: |
+          nvidia-smi --query-gpu=name,driver_version,memory.total,power.limit --format=csv
+          # Locking clocks makes the numbers comparable run-to-run. Safe to skip if the
+          # runner user can't run nvidia-smi -lgc; the profiler still records the power cap.
+          sudo nvidia-smi -lgc 1395 2>/dev/null || echo "clock lock not permitted; continuing"
+
+      - name: Check model weights are staged on the runner
+        id: models
+        run: |
+          # The weights are staged on the self-hosted runner out of band. If they are
+          # absent the engine binary aborts with a cryptic gguf "No such file" error, so
+          # check up front and SKIP cleanly instead — this job is report-only, and a
+          # missing model on the runner is an environment issue, not a PR defect.
+          target="$MODELS/$TARGET_MODEL"
+          draft="$MODELS/$DRAFT_MODEL"
+          present=true
+          missing_list=""
+          for f in "$target" "$draft"; do
+            if [ ! -f "$f" ]; then
+              present=false
+              missing_list="${missing_list}  - \`$f\`"$'\n'
+            fi
+          done
+          echo "present=$present" >> "$GITHUB_OUTPUT"
+          if [ "$present" = "false" ]; then
+            {
+              echo "## 🏎️ Speed profile — skipped (model weights not on runner)"
+              echo ""
+              echo "The profiler needs the target + draft weights staged on the self-hosted"
+              echo "runner, but these file(s) were not found:"
+              echo ""
+              printf '%s' "$missing_list"
+              echo ""
+              echo "Stage the weights at those paths, or set the repo variables"
+              echo "\`LUCEBOX_MODELS_DIR\` / \`LUCEBOX_TARGET_MODEL\` / \`LUCEBOX_DRAFT_MODEL\`"
+              echo "to point at where they live. Legacy \`LUCEBOX_SPEED_PROFILE_*\` variables also work."
+              echo "This job is report-only, so the PR is not blocked."
+              echo ""
+              echo "Available draft candidates under \`$MODELS\`:"
+              find "$MODELS" -maxdepth 4 -type f \( -name '*.gguf' -o -name '*.safetensors' \) -print 2>/dev/null | sort | sed 's/^/  - /' || true
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=Speed profile skipped::Model weights not found under $MODELS — see the run summary."
+          fi
+
+      - name: Build engine binaries (sm_86, Release)
+        if: steps.models.outputs.present == 'true'
+        run: |
+          cd server
+          cmake -B build \
+            -DCMAKE_CUDA_ARCHITECTURES="86" \
+            -DDFLASH27B_ENABLE_BSA=OFF \
+            -DDFLASH27B_FA_ALL_QUANTS=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target test_dflash test_generate -j"$(nproc)"
+
+      - name: Install profiler Python deps (isolated, pinned venv)
+        if: steps.models.outputs.present == 'true'
+        run: |
+          cd server
+          # The profiler only needs a tokenizer, so we use a tiny isolated venv
+          # rather than installing into the shared runner's Python or pulling the
+          # full project env (torch, datasets, ...). Keep versions pinned so
+          # benchmark setup is reproducible and resilient to upstream releases.
+          python3 -m venv .profiler-venv
+          .profiler-venv/bin/pip install --quiet --upgrade pip==25.1.1
+          .profiler-venv/bin/pip install --quiet --require-virtualenv \
+            transformers==4.52.4 \
+            tokenizers==0.21.1 \
+            sentencepiece==0.2.0 \
+            tiktoken==0.9.0 \
+            protobuf==6.31.1
+
+      - name: Run speed profiler
+        if: steps.models.outputs.present == 'true'
+        run: |
+          cd server
+          # Use a committed baseline if one is staged so the report can flag a
+          # regression. Seed it once from a green `main` run's profile.json artifact
+          # (see docs/specs/speed-profile.md); without it the delta is simply skipped.
+          # The path is overridable so the runner owner can point elsewhere.
+          baseline="${LUCEBOX_SPEED_BASELINE:-scripts/speed-baseline.json}"
+          baseline_arg=()
+          if [ -f "$baseline" ]; then
+            baseline_arg=(--baseline "$baseline" --regress-pct "${LUCEBOX_SPEED_REGRESS_PCT:-0.10}")
+            echo "Regression check against baseline: $baseline"
+          else
+            echo "No baseline at $baseline — regression flagging disabled this run."
+          fi
+          # Use 128 generated tokens per prompt by default: long enough to reduce
+          # startup/noise effects while keeping the serialized 3090 queue bounded.
+          # The nsys pass adds a separate short profiled run; tok/s is measured on clean passes. Run 5
+          # timing reps by default so the report can distinguish real deltas from
+          # thermal/clock jitter; repo variables can trim this for temporary smoke runs.
+          .profiler-venv/bin/python scripts/profile.py \
+            --target "$MODELS/$TARGET_MODEL" \
+            --draft  "$MODELS/$DRAFT_MODEL" \
+            --tokenizer "$TOKENIZER" \
+            --n-gen "${LUCEBOX_SPEED_N_GEN:-128}" --budget 22 \
+            --reps "${LUCEBOX_SPEED_REPS:-5}" \
+            --noise-rsd-pct "${LUCEBOX_SPEED_NOISE_RSD_PCT:-0.05}" \
+            --nsys --check-lossless \
+            "${baseline_arg[@]}" \
+            --out-json profile.json --out-md profile.md
+        env:
+          LUCEBOX_SPEED_BASELINE: ${{ vars.LUCEBOX_SPEED_BASELINE || '' }}
+          LUCEBOX_SPEED_REGRESS_PCT: ${{ vars.LUCEBOX_SPEED_REGRESS_PCT || '' }}
+          LUCEBOX_SPEED_N_GEN: ${{ vars.LUCEBOX_SPEED_N_GEN || '' }}
+          LUCEBOX_SPEED_REPS: ${{ vars.LUCEBOX_SPEED_REPS || '' }}
+          LUCEBOX_SPEED_NOISE_RSD_PCT: ${{ vars.LUCEBOX_SPEED_NOISE_RSD_PCT || '' }}
+
+      - name: Publish report to the run summary
+        if: always() && steps.models.outputs.present == 'true'
+        run: |
+          if [ -f server/profile.md ]; then
+            { echo "## 🏎️ Speed profile"; echo ""; cat server/profile.md; } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Profiler produced no report (the run failed earlier — see logs)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Flag losslessness / regressions (annotations, non-blocking)
+        if: always() && steps.models.outputs.present == 'true'
+        run: |
+          [ -f server/profile.json ] || exit 0
+          # Report-only: emit warnings, never fail. A losslessness FAIL means the fast
+          # path changed the output and it is NOT run-to-run noise (AR agreed with
+          # itself) — worth triaging (real bug vs batched-verify FP). Inconclusive
+          # prompts (engine intrinsically nondeterministic) are NOT failures.
+          python3 - <<'PY'
+          import json
+          d = json.load(open("server/profile.json"))
+          ll, reg, noise = d.get("lossless", {}), d.get("regression", {}), d.get("summary", {}).get("noise", {})
+          if ll and not ll.get("lossless", True):
+              print(f"::warning title=Losslessness::spec-decode output differs from greedy AR on "
+                    f"{','.join(ll.get('prompts_failed', []))} (first token #{ll.get('first_divergence')}); "
+                    f"not run-to-run noise — triage bug vs batched-verify FP.")
+          if reg.get("regressed"):
+              print(f"::warning title=Speed regression::{','.join(reg.get('metrics', []))} moved past "
+                    f"±{reg.get('threshold_pct',0)*100:.0f}% vs baseline {reg.get('baseline_commit','?')}.")
+          if noise.get("noisy"):
+              print(f"::warning title=Noisy speed profile::{','.join(noise.get('metrics', []))} exceeded "
+                    f"the relative stddev threshold ({noise.get('threshold_rsd', 0)*100:.1f}%). "
+                    "Treat small deltas as below the profiler detection threshold.")
+          PY
+
+      - name: Reset GPU clocks
+        if: always()
+        run: sudo nvidia-smi -rgc 2>/dev/null || true
+
+      - name: Upload artifacts (json + markdown + nsys trace)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: speed-profile-${{ github.run_id }}
+          path: |
+            server/profile.json
+            server/profile.md
+            server/profile.nsys-rep
+          if-no-files-found: warn
+          retention-days: 30

@@ -122,6 +122,16 @@ struct DFlashTarget {
                                           int n_tokens,
                                           std::vector<int32_t> & tokens_out) = 0;
 
+    // Project draft hidden states through the target lm_head and return full
+    // f32 logits with vocab as the fastest-changing dimension.
+    // Default false (unsupported); Domino-capable targets override.
+    virtual bool project_hidden_to_logits(const float * hidden,
+                                          int n_tokens,
+                                          std::vector<float> & logits_out) {
+        (void)hidden; (void)n_tokens; (void)logits_out;
+        return false;
+    }
+
     // Project draft hidden states through the target lm_head and return the
     // per-position top-K log-probabilities + token ids (for DDTree building).
     // Default false (unsupported); tree-verify targets override.

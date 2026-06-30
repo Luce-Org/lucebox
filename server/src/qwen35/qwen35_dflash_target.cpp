@@ -5,7 +5,7 @@
 #include "graph_builders.h"
 #include "step_graph.h"
 #include "attn_masks.h"
-#include "common/draft_topk_cuda.h"
+#include "common/geometric_draft_topk_cuda.h"
 // gpu_runtime_compat.h maps the raw cudaStream_t / cudaMemcpy* symbols used
 // below (rollback_to / rollback_to_tree) onto their HIP equivalents. Without
 // it the file only compiles on CUDA via a transitive <cuda_runtime.h>; HIP
@@ -193,10 +193,11 @@ bool Qwen35DFlashTarget::read_verify_logits(int n_tokens, std::vector<float> & o
 }
 
 bool Qwen35DFlashTarget::supports_tree_verify() const {
-    // Tree verify reuses the fast-rollback SSM-intermediate capture, and builds
-    // the non-paged tree graph + logical attention mask. It is NOT slot-mapped,
-    // so it is incompatible with the kvflash pager — gate it off when paging.
-    return fast_rollback_ && pager_ == nullptr;
+    // Tree verify reuses the fast-rollback SSM-intermediate capture and builds a
+    // non-paged, contiguous tree graph. Pure capability here; the kvflash
+    // identity/pool precondition is enforced at the call site in do_spec_decode
+    // and re-checked defensively in verify_tree() below.
+    return fast_rollback_;
 }
 
 bool Qwen35DFlashTarget::verify_tree(
@@ -210,6 +211,20 @@ bool Qwen35DFlashTarget::verify_tree(
     const int N        = n_alloc;                 // fixed alloc width (budget+1)
     const int N_actual = 1 + tree.n_nodes;        // real tree size incl. root
     if (N_actual <= 0 || N_actual > N || (int)flat_tokens.size() < N) return false;
+    // kvflash: the tree graph reads the prefix [0, committed) contiguously and
+    // writes rows [committed, committed+N). Only valid while that prefix is
+    // identity-resident and the write span fits the pool. do_spec_decode gates
+    // on this; reaching here otherwise is a bug — fail cleanly, never read past
+    // the pool.
+    if (pager_ &&
+        (committed + N > pager_->pool_tokens() ||
+         !pager_->identity_prefix_covers(committed))) {
+        std::fprintf(stderr,
+            "verify_tree: kvflash layout not identity-contiguous "
+            "(committed=%d N=%d pool=%d)\n",
+            committed, N, pager_->pool_tokens());
+        return false;
+    }
     const int hidden = w_.n_embd;
 
     // Tree-verify graph: ancestor-masked batched forward over DFS-ordered nodes.
@@ -460,6 +475,19 @@ bool Qwen35DFlashTarget::rollback_to_tree(
     }
 
     cudaStreamSynchronize(stream);
+    // kvflash: the tree graph writes KV directly (not slot-mapped), so this is
+    // the single owning point that advances the pager for tree-committed
+    // positions. Covers both the greedy and sampled tree fast paths; chain
+    // paths self-register through verify_batch()'s slot_for(). The call-site
+    // guard bounds the span to the resident identity pool so this never evicts,
+    // but a failed alloc must abort: returning true with unmapped slots would
+    // make the next step read stale/unmapped KV (silent corruption).
+    if (pager_ && !pager_->alloc_span(committed, commit_n)) {
+        std::fprintf(stderr,
+            "rollback_to_tree: kvflash alloc_span failed (committed=%d commit_n=%d)\n",
+            committed, commit_n);
+        return false;
+    }
     cache_.cur_pos = committed + commit_n;
     return true;
 }
@@ -475,7 +503,11 @@ bool Qwen35DFlashTarget::restore_kv() {
 }
 
 bool Qwen35DFlashTarget::supports_fast_rollback() const {
-    return fast_rollback_ && pager_ == nullptr;
+    // Pure capability. Fast-rollback only restores recurrent SSM/conv state and
+    // defers the bonus token, so it is pager-safe even while paging: committed
+    // KV rows are written slot-mapped by verify_batch(), and the deferred bonus
+    // is re-fed at the next committed position on the following step.
+    return fast_rollback_;
 }
 
 bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
@@ -669,7 +701,7 @@ bool Qwen35DFlashTarget::project_hidden_to_topk(
         return v == nullptr || v[0] != '0';
     }();
     if (kGpuDraftTopk &&
-        extract_draft_topk_cuda(proj_sg_.logits->data, n_tokens, vocab, K,
+        geometric_extract_draft_topk_cuda(proj_sg_.logits->data, n_tokens, vocab, K,
                                 top_log_probs.data(), top_token_ids.data(),
                                 temperature)) {
         return true;

@@ -11,35 +11,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <inttypes.h>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace dflash::common {
 
 namespace {
-
-bool checked_mul_size(size_t a, size_t b, size_t & out) {
-    if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
-        return false;
-    }
-    out = a * b;
-    return true;
-}
-
-BackendIpcPayloadTransport target_shard_ipc_transport_from_env() {
-    const char * raw = std::getenv("DFLASH_TARGET_SHARD_IPC_TRANSPORT");
-    if (!raw || !*raw) {
-        return BackendIpcPayloadTransport::Stream;
-    }
-    BackendIpcPayloadTransport transport = BackendIpcPayloadTransport::Stream;
-    if (!parse_backend_ipc_payload_transport(raw, transport)) {
-        return BackendIpcPayloadTransport::Stream;
-    }
-    return transport;
-}
 
 bool write_snapshot_tensor_header_fd(int fd,
                                      const Qwen35TargetShardSnapshotTensor & t) {
@@ -87,63 +67,7 @@ bool read_snapshot_tensor_header_fd(int fd,
     return true;
 }
 
-size_t target_shard_required_shared_bytes(int hidden, int max_tokens) {
-    if (hidden <= 0 || max_tokens <= 0) return 0;
-    size_t elements = 0;
-    size_t bytes = 0;
-    if (!checked_mul_size((size_t)hidden, (size_t)max_tokens, elements) ||
-        !checked_mul_size(elements, sizeof(float), bytes)) {
-        return 0;
-    }
-    return bytes;
-}
-
-size_t target_shard_shared_bytes_from_env(size_t required_bytes) {
-    const char * raw = std::getenv("DFLASH_TARGET_SHARD_IPC_SHARED_BYTES");
-    if (!raw || !*raw) {
-        return required_bytes;
-    }
-    if (raw[0] == '-') {
-        return required_bytes;
-    }
-    char * end = nullptr;
-    const unsigned long long parsed = std::strtoull(raw, &end, 10);
-    if (end == raw || *end != '\0' ||
-        parsed > (unsigned long long)std::numeric_limits<size_t>::max()) {
-        return required_bytes;
-    }
-    return std::max((size_t)parsed, required_bytes);
-}
-
 }  // namespace
-
-bool copy_activation_to_host(const ggml_tensor * act,
-                             ggml_backend_t src_backend,
-                             int token_offset,
-                             int n_tokens,
-                             int hidden,
-                             std::vector<float> & out) {
-    if (!act || !src_backend || token_offset < 0 || n_tokens <= 0 || hidden <= 0) {
-        return false;
-    }
-    const size_t row_bytes = (size_t)hidden * sizeof(float);
-    const size_t src_stride = act->nb[1];
-    out.assign((size_t)n_tokens * (size_t)hidden, 0.0f);
-    ggml_backend_synchronize(src_backend);
-    if (src_stride == row_bytes) {
-        ggml_backend_tensor_get(act, out.data(),
-                                (size_t)token_offset * src_stride,
-                                row_bytes * (size_t)n_tokens);
-    } else {
-        for (int i = 0; i < n_tokens; i++) {
-            ggml_backend_tensor_get(act,
-                                    out.data() + (size_t)i * (size_t)hidden,
-                                    (size_t)(token_offset + i) * src_stride,
-                                    row_bytes);
-        }
-    }
-    return true;
-}
 
 bool Qwen35TargetShardIpcClient::start(
         const std::string & bin,
@@ -159,73 +83,50 @@ bool Qwen35TargetShardIpcClient::start(
         int vocab,
         int max_tokens,
         const std::string & work_dir,
-        bool enable_dflash) {
+        bool enable_dflash,
+        int kvflash_pool_tokens) {
 #if defined(_WIN32)
     (void)bin; (void)target_path; (void)gpus; (void)layer_begins; (void)layer_ends;
     (void)max_ctx; (void)max_verify_tokens; (void)kq_stride_pad; (void)fa_window;
     (void)hidden; (void)vocab; (void)max_tokens; (void)work_dir; (void)enable_dflash;
+    (void)kvflash_pool_tokens;
     std::fprintf(stderr, "Qwen35 target shard IPC is only implemented on POSIX hosts\n");
     return false;
 #else
-    close();
+    session_.close();
     if (bin.empty() || target_path.empty() || gpus.empty() ||
         gpus.size() != layer_begins.size() || gpus.size() != layer_ends.size() ||
-        max_ctx <= 0 || hidden <= 0 ||
-        vocab <= 0 || max_tokens <= 0) {
+        max_ctx <= 0 || hidden <= 0 || vocab <= 0 || max_tokens <= 0) {
         return false;
     }
-    for (size_t i = 0; i < gpus.size(); ++i) {
-        if (gpus[i] < 0 || layer_begins[i] < 0 ||
-            layer_ends[i] <= layer_begins[i]) {
-            return false;
-        }
-        if (i > 0 && layer_begins[i] != layer_ends[i - 1]) {
-            return false;
-        }
-    }
 
-    BackendIpcLaunchConfig launch;
-    launch.bin = bin;
+    TargetShardIpcLaunchConfig launch;
     launch.mode = BackendIpcMode::Qwen35TargetShard;
-    launch.payload_path = target_path;
+    launch.bin = bin;
+    launch.target_path = target_path;
+    launch.gpus = gpus;
+    launch.layer_begins = layer_begins;
+    launch.layer_ends = layer_ends;
+    launch.max_ctx = max_ctx;
+    launch.hidden = hidden;
+    launch.vocab = vocab;
+    launch.max_tokens = max_tokens;
     launch.work_dir = work_dir;
-    launch.payload_transport = target_shard_ipc_transport_from_env();
-    launch.shared_payload_bytes = target_shard_shared_bytes_from_env(
-        target_shard_required_shared_bytes(hidden, max_tokens));
-    std::string gpu_list;
-    std::string layer_begin_list;
-    std::string layer_end_list;
-    for (size_t i = 0; i < gpus.size(); ++i) {
-        if (i > 0) {
-            gpu_list += ",";
-            layer_begin_list += ",";
-            layer_end_list += ",";
-        }
-        gpu_list += std::to_string(gpus[i]);
-        layer_begin_list += std::to_string(layer_begins[i]);
-        layer_end_list += std::to_string(layer_ends[i]);
-    }
-    launch.args.push_back("--target-gpus=" + gpu_list);
-    launch.args.push_back("--layer-begins=" + layer_begin_list);
-    launch.args.push_back("--layer-ends=" + layer_end_list);
-    launch.args.push_back("--max-ctx=" + std::to_string(max_ctx));
-    launch.args.push_back("--max-verify-tokens=" + std::to_string(max_verify_tokens));
-    launch.args.push_back("--kq-stride-pad=" + std::to_string(kq_stride_pad));
-    launch.args.push_back("--fa-window=" + std::to_string(fa_window));
-    if (enable_dflash) {
-        launch.args.push_back("--enable-dflash");
-    }
-    if (!process_.start(launch)) {
+    launch.fa_window = fa_window;
+    launch.kvflash_pool_tokens = kvflash_pool_tokens;
+    launch.model_args.push_back("--max-verify-tokens=" + std::to_string(max_verify_tokens));
+    launch.model_args.push_back("--kq-stride-pad=" + std::to_string(kq_stride_pad));
+    if (enable_dflash) launch.model_args.push_back("--enable-dflash");
+    if (!session_.start(launch)) {
         std::fprintf(stderr, "qwen35-target-shard backend process start failed\n");
         return false;
     }
 
     hidden_ = hidden;
     vocab_ = vocab;
-    active_ = true;
     std::printf("[qwen35-target-shard-ipc] ready bin=%s shards=%zu layers=[%d,%d) work_dir=%s\n",
                 bin.c_str(), gpus.size(), layer_begins.front(), layer_ends.back(),
-                process_.work_dir().c_str());
+                session_.work_dir().c_str());
     return true;
 #endif
 }
@@ -238,16 +139,18 @@ bool Qwen35TargetShardIpcClient::forward(
         int & last_tok,
         std::vector<int32_t> * argmax_out,
         std::vector<float> * logits_out,
-        std::vector<Qwen35TargetCaptureSlice> * captures_out) {
+        std::vector<Qwen35TargetCaptureSlice> * captures_out,
+        int ubatch) {
 #if defined(_WIN32)
     (void)base_pos; (void)n_tokens; (void)boundary_activation; (void)need_logits;
     (void)last_tok; (void)argmax_out; (void)logits_out; (void)captures_out;
+    (void)ubatch;
     return false;
 #else
-    FILE * cmd = process_.command_stream();
-    const int stream_fd = process_.stream_fd();
-    const int payload_fd = process_.payload_fd();
-    if (!active_ || !cmd || stream_fd < 0 || base_pos < 0 ||
+    FILE * cmd = session_.command_stream();
+    const int stream_fd = session_.stream_fd();
+    const int payload_fd = session_.payload_fd();
+    if (!session_.active() || !cmd || stream_fd < 0 || base_pos < 0 ||
         n_tokens <= 0 || hidden_ <= 0 || vocab_ <= 0) {
         return false;
     }
@@ -257,24 +160,25 @@ bool Qwen35TargetShardIpcClient::forward(
     const int want_argmax = argmax_out ? 1 : 0;
     const int want_logits = need_logits ? 1 : 0;
     const int want_captures = captures_out ? 1 : 0;
+    const int forward_ubatch = ubatch > 0 ? ubatch : n_tokens;
     if (captures_out) captures_out->clear();
 
-    if (process_.resolved_payload_transport() == BackendIpcPayloadTransport::Shared) {
+    if (session_.resolved_payload_transport() == BackendIpcPayloadTransport::Shared) {
         uint64_t seq = 0;
-        if (!process_.write_shared_payload(boundary_activation.data(), bytes, seq)) {
+        if (!session_.write_shared_payload(boundary_activation.data(), bytes, seq)) {
             std::fprintf(stderr,
                          "qwen35-target-shard shared payload too large bytes=%zu capacity=%zu\n",
-                         bytes, process_.shared_payload_capacity());
+                         bytes, session_.shared_payload_capacity());
             return false;
         }
-        std::fprintf(cmd, "forward_shared %d %d %d %d %zu %" PRIu64 " %d\n",
+        std::fprintf(cmd, "forward_shared %d %d %d %d %zu %" PRIu64 " %d %d\n",
                      base_pos, n_tokens, want_argmax, want_logits, bytes, seq,
-                     want_captures);
+                     want_captures, forward_ubatch);
         std::fflush(cmd);
     } else if (payload_fd >= 0) {
-        std::fprintf(cmd, "forward_pipe %d %d %d %d %zu %d\n",
+        std::fprintf(cmd, "forward_pipe %d %d %d %d %zu %d %d\n",
                      base_pos, n_tokens, want_argmax, want_logits, bytes,
-                     want_captures);
+                     want_captures, forward_ubatch);
         std::fflush(cmd);
         if (!write_exact_fd(payload_fd, boundary_activation.data(), bytes)) {
             std::fprintf(stderr, "qwen35-target-shard payload write failed\n");
@@ -352,10 +256,10 @@ bool Qwen35TargetShardIpcClient::project_hidden_to_tokens(
     (void)hidden; (void)n_tokens; (void)tokens_out;
     return false;
 #else
-    FILE * cmd = process_.command_stream();
-    const int stream_fd = process_.stream_fd();
-    const int payload_fd = process_.payload_fd();
-    if (!active_ || !cmd || !hidden || stream_fd < 0 || payload_fd < 0 ||
+    FILE * cmd = session_.command_stream();
+    const int stream_fd = session_.stream_fd();
+    const int payload_fd = session_.payload_fd();
+    if (!session_.active() || !cmd || !hidden || stream_fd < 0 || payload_fd < 0 ||
         n_tokens <= 0 || hidden_ <= 0) {
         return false;
     }
@@ -380,9 +284,9 @@ bool Qwen35TargetShardIpcClient::snapshot_kv() {
 #if defined(_WIN32)
     return false;
 #else
-    FILE * cmd = process_.command_stream();
-    const int stream_fd = process_.stream_fd();
-    if (!active_ || !cmd || stream_fd < 0) return false;
+    FILE * cmd = session_.command_stream();
+    const int stream_fd = session_.stream_fd();
+    if (!session_.active() || !cmd || stream_fd < 0) return false;
     std::fprintf(cmd, "snapshot\n");
     std::fflush(cmd);
     int32_t status = -1;
@@ -394,9 +298,9 @@ bool Qwen35TargetShardIpcClient::restore_kv() {
 #if defined(_WIN32)
     return false;
 #else
-    FILE * cmd = process_.command_stream();
-    const int stream_fd = process_.stream_fd();
-    if (!active_ || !cmd || stream_fd < 0) return false;
+    FILE * cmd = session_.command_stream();
+    const int stream_fd = session_.stream_fd();
+    if (!session_.active() || !cmd || stream_fd < 0) return false;
     std::fprintf(cmd, "restore\n");
     std::fflush(cmd);
     int32_t status = -1;
@@ -405,61 +309,23 @@ bool Qwen35TargetShardIpcClient::restore_kv() {
 }
 
 bool Qwen35TargetShardIpcClient::reset_request_state() {
-#if defined(_WIN32)
-    return false;
-#else
-    FILE * cmd = process_.command_stream();
-    const int stream_fd = process_.stream_fd();
-    if (!active_ || !cmd || stream_fd < 0) return false;
-    std::fprintf(cmd, "reset_request_state\n");
-    std::fflush(cmd);
-    int32_t status = -1;
-    return read_exact_fd(stream_fd, &status, sizeof(status)) && status == 0;
-#endif
+    return session_.reset_request_state();
+}
+
+bool Qwen35TargetShardIpcClient::kvflash_sync_identity(int committed) {
+    return session_.kvflash_sync_identity(committed);
 }
 
 bool Qwen35TargetShardIpcClient::snapshot_save(int slot) {
-#if defined(_WIN32)
-    (void)slot;
-    return false;
-#else
-    FILE * cmd = process_.command_stream();
-    const int stream_fd = process_.stream_fd();
-    if (!active_ || !cmd || stream_fd < 0 || slot < 0) return false;
-    std::fprintf(cmd, "prefix_snapshot_save %d\n", slot);
-    std::fflush(cmd);
-    int32_t status = -1;
-    return read_exact_fd(stream_fd, &status, sizeof(status)) && status == 0;
-#endif
+    return session_.snapshot_save(slot);
 }
 
 void Qwen35TargetShardIpcClient::snapshot_free(int slot) {
-#if defined(_WIN32)
-    (void)slot;
-#else
-    FILE * cmd = process_.command_stream();
-    const int stream_fd = process_.stream_fd();
-    if (!active_ || !cmd || stream_fd < 0 || slot < 0) return;
-    std::fprintf(cmd, "prefix_snapshot_free %d\n", slot);
-    std::fflush(cmd);
-    int32_t status = -1;
-    (void)read_exact_fd(stream_fd, &status, sizeof(status));
-#endif
+    session_.snapshot_free(slot);
 }
 
 bool Qwen35TargetShardIpcClient::snapshot_restore(int slot) {
-#if defined(_WIN32)
-    (void)slot;
-    return false;
-#else
-    FILE * cmd = process_.command_stream();
-    const int stream_fd = process_.stream_fd();
-    if (!active_ || !cmd || stream_fd < 0 || slot < 0) return false;
-    std::fprintf(cmd, "prefix_snapshot_restore %d\n", slot);
-    std::fflush(cmd);
-    int32_t status = -1;
-    return read_exact_fd(stream_fd, &status, sizeof(status)) && status == 0;
-#endif
+    return session_.snapshot_restore(slot);
 }
 
 bool Qwen35TargetShardIpcClient::snapshot_export(
@@ -469,9 +335,9 @@ bool Qwen35TargetShardIpcClient::snapshot_export(
     (void)slot; (void)out;
     return false;
 #else
-    FILE * cmd = process_.command_stream();
-    const int stream_fd = process_.stream_fd();
-    if (!active_ || !cmd || stream_fd < 0 || slot < 0) return false;
+    FILE * cmd = session_.command_stream();
+    const int stream_fd = session_.stream_fd();
+    if (!session_.active() || !cmd || stream_fd < 0 || slot < 0) return false;
     out = Qwen35TargetShardSnapshotData{};
     std::fprintf(cmd, "prefix_snapshot_export %d\n", slot);
     std::fflush(cmd);
@@ -522,10 +388,10 @@ bool Qwen35TargetShardIpcClient::snapshot_import(
     (void)slot; (void)data;
     return false;
 #else
-    FILE * cmd = process_.command_stream();
-    const int stream_fd = process_.stream_fd();
-    const int payload_fd = process_.payload_fd();
-    if (!active_ || !cmd || stream_fd < 0 || payload_fd < 0 || slot < 0 ||
+    FILE * cmd = session_.command_stream();
+    const int stream_fd = session_.stream_fd();
+    const int payload_fd = session_.payload_fd();
+    if (!session_.active() || !cmd || stream_fd < 0 || payload_fd < 0 || slot < 0 ||
         data.shard_count <= 0 || data.cur_pos <= 0 ||
         data.tensors.empty() || data.logits.empty() ||
         data.tensors.size() > (size_t)std::numeric_limits<int32_t>::max() ||
@@ -575,8 +441,7 @@ bool Qwen35TargetShardIpcClient::snapshot_import(
 }
 
 void Qwen35TargetShardIpcClient::close() {
-    process_.close();
-    active_ = false;
+    session_.close();
     hidden_ = 0;
     vocab_ = 0;
 }

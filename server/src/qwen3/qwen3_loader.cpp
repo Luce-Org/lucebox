@@ -24,6 +24,7 @@
 
 #include "qwen3_drafter_model.h"
 #include "common/backend_precision.h"
+#include "common/gguf_mmap.h"
 #include "internal.h"
 
 #include <cstdio>
@@ -211,51 +212,42 @@ bool load_qwen3_drafter_model(const std::string & path,
         precision.reason.c_str());
     std::fflush(stderr);
 
-    // mmap the GGUF data section.
+    // mmap the GGUF data section via the shared RAII wrapper (checks
+    // open/fstat, reports errors, and unmaps in its destructor).
     const size_t data_off = gguf_get_data_offset(gctx);
-#if defined(_WIN32)
-    std::wstring wpath;
-    {
-        const int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-        if (wlen <= 0) {
-            set_last_error("MultiByteToWideChar failed for " + path);
+    GgufMmap mmap;
+    std::string mmap_err;
+    if (!mmap.open(path, mmap_err)) {
+        set_last_error(mmap_err);
+        gguf_free(gctx);
+        return false;
+    }
+    const void * mm        = mmap.data();
+    const size_t file_size = mmap.size();
+
+    // Validate that every tensor's data region lies within the mapped file
+    // before any H2D copy. A truncated or corrupt GGUF would otherwise make
+    // copy_tensor_from_file read past the end of the mapping and fault inside
+    // the device copy (bug #438). The comparisons are written to avoid size_t
+    // overflow on malformed offsets/sizes: a wrapped data_off + off + sz could
+    // otherwise slip past a naive "off + sz > file_size" test.
+    const size_t data_avail = data_off <= file_size ? file_size - data_off : 0;
+    for (int64_t i = 0; i < gguf_get_n_tensors(gctx); ++i) {
+        const size_t off = gguf_get_tensor_offset(gctx, i);  // relative to data_off
+        const size_t sz  = gguf_get_tensor_size(gctx, i);
+        if (data_off > file_size || off > data_avail || sz > data_avail - off) {
+            set_last_error(std::string("Qwen3-0.6B drafter GGUF is truncated or corrupt: tensor '")
+                + gguf_get_tensor_name(gctx, i) + "' data ends at " + std::to_string(data_off + off + sz)
+                + " but file is only " + std::to_string(file_size)
+                + " bytes. Re-download the drafter model (" + path + ").");
             gguf_free(gctx);
+            ggml_backend_buffer_free(out.buf);
+            ggml_free(out.ctx);
+            out.buf = nullptr;
+            out.ctx = nullptr;
             return false;
         }
-        wpath.resize(wlen - 1);
-        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
     }
-    HANDLE hFile = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        set_last_error("CreateFileW failed for " + path);
-        gguf_free(gctx);
-        return false;
-    }
-    HANDLE hMapping = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
-    CloseHandle(hFile);
-    if (!hMapping) {
-        set_last_error("CreateFileMappingA failed for " + path);
-        gguf_free(gctx);
-        return false;
-    }
-    void * mm = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
-    CloseHandle(hMapping);
-    if (!mm) {
-        set_last_error("MapViewOfFile failed for " + path);
-        gguf_free(gctx);
-        return false;
-    }
-#else
-    int fd = ::open(path.c_str(), O_RDONLY);
-    struct stat st; ::fstat(fd, &st);
-    void * mm = ::mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if (mm == MAP_FAILED) {
-        set_last_error("mmap failed for " + path);
-        gguf_free(gctx);
-        return false;
-    }
-#endif
 
     bool ok = true;
     ok &= copy_tensor_from_file(gctx, "token_embd.weight", mm, data_off, out.tok_embd);
@@ -285,11 +277,6 @@ bool load_qwen3_drafter_model(const std::string & path,
         std::snprintf(nm, sizeof(nm), "blk.%d.ffn_up.weight",      il); ok &= copy_tensor_from_file(gctx, nm, mm, data_off, L.ffn_up);
         std::snprintf(nm, sizeof(nm), "blk.%d.ffn_down.weight",    il); ok &= copy_tensor_from_file(gctx, nm, mm, data_off, L.ffn_down);
     }
-#if defined(_WIN32)
-    UnmapViewOfFile(mm);
-#else
-    ::munmap(mm, st.st_size);
-#endif
     gguf_free(gctx);
 
     if (!ok) {
