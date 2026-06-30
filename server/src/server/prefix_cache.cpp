@@ -140,6 +140,38 @@ PrefixHash hash_prefix(const int32_t * ids, int count) {
     return h;
 }
 
+// ─── Prefix-aware eviction ──────────────────────────────────────────────
+
+static bool is_strict_prefix(const std::vector<int32_t> & a,
+                             const std::vector<int32_t> & b) {
+    // True iff `a` is a strict (shorter) prefix of `b`.
+    if (a.size() >= b.size()) return false;
+    return std::equal(a.begin(), a.end(), b.begin());
+}
+
+int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> & ids_lru) {
+    const int n = (int)ids_lru.size();
+    if (n <= 0) return 0;
+    // Oldest-first scan: evict the first entry that is not a strict prefix of any
+    // other entry (a leaf). Shared ancestor prefixes are thereby kept resident.
+    for (int i = 0; i < n; i++) {
+        bool is_ancestor = false;
+        for (int j = 0; j < n; j++) {
+            if (j == i) continue;
+            if (is_strict_prefix(*ids_lru[i], *ids_lru[j])) { is_ancestor = true; break; }
+        }
+        if (!is_ancestor) return i;  // oldest leaf
+    }
+    return 0;  // unreachable (the longest entry is always a leaf); pure-LRU fallback
+}
+
+int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru) {
+    std::vector<const std::vector<int32_t> *> ptrs;
+    ptrs.reserve(ids_lru.size());
+    for (const auto & v : ids_lru) ptrs.push_back(&v);
+    return select_inline_evict_victim(ptrs);
+}
+
 // ─── PrefixCache ────────────────────────────────────────────────────────
 
 PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer)
@@ -171,9 +203,9 @@ int PrefixCache::find_entry(const PrefixHash & h) const {
 
 void PrefixCache::move_to_end(int idx) {
     if (idx < 0 || idx >= (int)entries_.size()) return;
-    auto e = entries_[idx];
+    auto e = std::move(entries_[idx]);
     entries_.erase(entries_.begin() + idx);
-    entries_.push_back(e);
+    entries_.push_back(std::move(e));
 }
 
 int PrefixCache::find_full_entry(const PrefixHash & h) const {
@@ -235,10 +267,22 @@ std::pair<int, int> PrefixCache::prepare_inline_snap(
 
     int slot;
     if ((int)entries_.size() >= cap_) {
-        // At capacity — reserve the LRU slot without evicting yet.
-        pending_evict_key_ = entries_.front().hash;
+        // At capacity — reserve a slot without evicting yet. Prefix-aware: prefer
+        // the oldest leaf so shared ancestor prefixes (reused by later branches)
+        // stay resident. entries_ is already in LRU order (front = oldest).
+        std::vector<const std::vector<int32_t> *> ids_lru;
+        ids_lru.reserve(entries_.size());
+        for (const auto & e : entries_) ids_lru.push_back(&e.ids);
+        int victim = select_inline_evict_victim(ids_lru);
+        pending_evict_key_ = entries_[victim].hash;
         has_pending_evict_ = true;
-        slot = entries_.front().slot;
+        slot = entries_[victim].slot;
+        if (victim != 0) {
+            std::fprintf(stderr,
+                "[pc] prefix-aware evict: victim idx=%d (len=%zu) kept oldest "
+                "ancestor (len=%zu)\n",
+                victim, entries_[victim].ids.size(), entries_.front().ids.size());
+        }
     } else {
         slot = next_slot_;
         next_slot_ = (next_slot_ + 1) % cap_;
@@ -278,7 +322,8 @@ void PrefixCache::confirm_inline_snap(int slot, int target_cut,
     }
 
     auto key = hash_prefix(prompt_ids.data(), target_cut);
-    entries_.push_back({key, slot});
+    std::vector<int32_t> ids(prompt_ids.begin(), prompt_ids.begin() + target_cut);
+    entries_.push_back({key, slot, std::move(ids)});
     entries_size_count_.fetch_add(1, std::memory_order_relaxed);
     std::fprintf(stderr, "[pc] inline-snap committed slot=%d prefix_len=%d\n",
                  slot, target_cut);

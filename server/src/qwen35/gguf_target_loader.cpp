@@ -46,6 +46,8 @@
 #include "internal.h"
 #include "common/derived_scalars.h"
 #include "common/layer_split_utils.h"
+#include "common/gguf_mmap.h"
+#include "common/gguf_bounds.h"
 
 #include <cinttypes>
 #include <cstdint>
@@ -91,77 +93,6 @@ bool CpuEmbedder::embed(const int32_t * ids, int n, float * out_f32) const {
 }
 
 namespace {
-
-// Local Mmap used only during load (separate from the one kept alive inside
-// TargetWeights::embedder). We don't call munmap on this one when we want
-// to hand ownership to the CpuEmbedder — see end of load_target_gguf.
-struct Mmap {
-    void *  addr = nullptr;
-    size_t  len  = 0;
-#if defined(_WIN32)
-    HANDLE  hFile = INVALID_HANDLE_VALUE;
-    HANDLE  hMap  = nullptr;
-#else
-    int     fd   = -1;
-#endif
-
-    bool open_ro(const std::string & path, std::string & err) {
-#if defined(_WIN32)
-        hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hFile == INVALID_HANDLE_VALUE) {
-            err = "CreateFileA: " + path + ": error " + std::to_string(GetLastError());
-            return false;
-        }
-        LARGE_INTEGER sz;
-        if (!GetFileSizeEx(hFile, &sz)) {
-            err = "GetFileSizeEx: error " + std::to_string(GetLastError());
-            return false;
-        }
-        len = (size_t)sz.QuadPart;
-        hMap = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
-        if (!hMap) {
-            err = "CreateFileMappingA: error " + std::to_string(GetLastError());
-            return false;
-        }
-        addr = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
-        if (!addr) {
-            err = "MapViewOfFile: error " + std::to_string(GetLastError());
-            return false;
-        }
-#else
-        fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) { err = "open: " + path + ": " + std::strerror(errno); return false; }
-        struct stat st;
-        if (::fstat(fd, &st) < 0) { err = "fstat: " + std::string(std::strerror(errno)); return false; }
-        len = (size_t)st.st_size;
-        addr = ::mmap(nullptr, len, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (addr == MAP_FAILED) { err = "mmap: " + std::string(std::strerror(errno)); addr = nullptr; return false; }
-#endif
-        return true;
-    }
-    // Ownership transfer: release handles without unmapping.
-    void release() {
-        addr = nullptr;
-        len  = 0;
-#if defined(_WIN32)
-        hFile = INVALID_HANDLE_VALUE;
-        hMap  = nullptr;
-#else
-        fd = -1;
-#endif
-    }
-    ~Mmap() {
-#if defined(_WIN32)
-        if (addr)                        UnmapViewOfFile(addr);
-        if (hMap)                        CloseHandle(hMap);
-        if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
-#else
-        if (addr) ::munmap(addr, len);
-        if (fd >= 0) ::close(fd);
-#endif
-    }
-};
 
 // Required uint32 metadata key → bound check. Aborts load on mismatch.
 bool expect_u32(const gguf_context * g, const char * key, uint32_t expected, std::string & err) {
@@ -676,15 +607,18 @@ bool load_target_gguf_partial(const std::string & path,
     // ── 4. mmap the file and copy tensor bytes to CUDA ────────────────
     //
     // SKIP uploading token_embd.weight — it stays on CPU for embedding
-    // lookup (CUDA get_rows doesn't support k-quants). We hand the mmap
-    // ownership to TargetWeights::embedder at the end.
-    Mmap mm;
-    if (!mm.open_ro(path, err)) {
+    // lookup (CUDA get_rows doesn't support k-quants). Its bytes are copied
+    // into owned host memory below (step 5), so the mmap is released when this
+    // local goes out of scope.
+    GgufMmap mm;
+    if (!mm.open(path, err)) {
         set_last_error(err);
         release_out_buffer();
         gguf_free(gctx);
         return false;
     }
+    const uint8_t * mm_addr = (const uint8_t *)mm.data();
+    const size_t    mm_len  = mm.size();
 
     size_t total = 0;
     size_t tok_embd_off = 0, tok_embd_sz = 0;
@@ -693,10 +627,13 @@ bool load_target_gguf_partial(const std::string & path,
         const char * tname = gguf_get_tensor_name(gctx, tid);
         ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
         if (!t) continue;
-        const size_t off = data_start + gguf_get_tensor_offset(gctx, tid);
+        const size_t rel_off = gguf_get_tensor_offset(gctx, tid);
+        const size_t off = data_start + rel_off;
         const size_t sz  = gguf_get_tensor_size(gctx, tid);
-        if (off + sz > mm.len) {
-            set_last_error(std::string("tensor '") + tname + "' overflows file");
+        if (!gguf_tensor_in_file(data_start, rel_off, sz, mm_len)) {
+            set_last_error(gguf_bounds_error("target GGUF", tname,
+                ggml_type_name(gguf_get_tensor_type(gctx, tid)),
+                data_start, rel_off, sz, mm_len));
             release_out_buffer();
             gguf_free(gctx);
             return false;
@@ -711,7 +648,7 @@ bool load_target_gguf_partial(const std::string & path,
         if (!should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, plan.skip_expert_tensors)) {
             continue;
         }
-        ggml_backend_tensor_set(t, (const uint8_t *)mm.addr + off, 0, sz);
+        ggml_backend_tensor_set(t, mm_addr + off, 0, sz);
         total += sz;
     }
 
@@ -737,10 +674,10 @@ bool load_target_gguf_partial(const std::string & path,
                 stid = gguf_find_tensor(gctx, sname);
             }
             if (stid < 0) return 1.0f;
-            const size_t soff = data_start + gguf_get_tensor_offset(gctx, stid);
-            if (soff + sizeof(float) > mm.len) return 1.0f;
+            const size_t srel = gguf_get_tensor_offset(gctx, stid);
+            if (!gguf_tensor_in_file(data_start, srel, sizeof(float), mm_len)) return 1.0f;
             float val;
-            std::memcpy(&val, (const uint8_t *)mm.addr + soff, sizeof(float));
+            std::memcpy(&val, mm_addr + data_start + srel, sizeof(float));
             return val;
         };
 
@@ -828,7 +765,7 @@ bool load_target_gguf_partial(const std::string & path,
     }
     out.embedder.tok_embd_owned.resize(tok_embd_sz);
     std::memcpy(out.embedder.tok_embd_owned.data(),
-                (const uint8_t *)mm.addr + tok_embd_off,
+                mm_addr + tok_embd_off,
                 tok_embd_sz);
     out.embedder.tok_embd_bytes = out.embedder.tok_embd_owned.data();
     out.embedder.tok_embd_type  = tok_embd_type;

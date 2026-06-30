@@ -163,7 +163,10 @@ struct LagunaTargetCache {
     ggml_type kv_v_type = GGML_TYPE_Q8_0;
 
     // Per-layer KV cache. ALL 40 layers have KV (both full + swa).
-    // Layout: [head_dim, max_ctx, n_head_kv] f16/q8_0, contiguous per layer.
+    // Default layout: [head_dim, max_ctx, n_head_kv].
+    // With DFLASH_LAGUNA_KV_HEAD_MAJOR=1: [head_dim*n_head_kv, max_ctx],
+    // viewed as [head_dim, n_head_kv, max_ctx] for attention.
+    bool kv_head_major = false;
     std::vector<ggml_tensor *> attn_k;   // size = n_layer
     std::vector<ggml_tensor *> attn_v;
 
@@ -275,6 +278,7 @@ struct LagunaGraphInputs {
     int           kv_pad = 0;             // 0 = legacy exact-length views + cpy append
     ggml_tensor * kv_idx = nullptr;       // [n_tokens] I32 cache row indices (graph input)
     bool          output_logits = true;
+    bool          logits_are_output = true;
     bool          output_hidden_states = false;
     bool          capture_features = false;
     ggml_tensor * target_feat_rows = nullptr;  // optional [n_tokens] I32 ring rows for replay-stable capture
@@ -326,7 +330,9 @@ bool laguna_step(
     bool                        no_mask,
     std::vector<float> &        out_logits,
     const class KvFlashPager *  kvflash = nullptr,
-    bool                        capture = false);
+    bool                        capture = false,
+    int32_t *                   out_argmax = nullptr,
+    bool                        read_logits = true);
 
 bool laguna_verify_batch(
     ggml_backend_t              backend,

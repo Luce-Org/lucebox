@@ -133,6 +133,9 @@ protected:
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io);
     virtual bool should_capture_moe_router() const { return false; }
+    // Hook after kvflash pool sizing, before create_target_cache: a subclass
+    // may disable the pool (kvflash_tokens_=0) when it is redundant. Default no-op.
+    virtual bool post_kvflash_init_gate() { return true; }
     virtual void after_target_compute(StepGraph &,
                                       int /*kv_start*/,
                                       int /*n_tokens*/) {}
@@ -181,6 +184,12 @@ protected:
     int  kvflash_tau_    = 64;
     bool kvflash_drafter_failed_ = false;           // don't retry a failed load
     bool kvflash_active() const { return kvflash_tokens_ > 0; }
+    // Pool sizing inputs — shared so MoE placement reserves exactly the pool
+    // runtime allocates (else placement over-reserves KV and starves experts).
+    bool kvflash_scorer_expected() const {
+        return !kvflash_drafter_path_.empty() || kvflash_qk_policy_;
+    }
+    KvFlashAutoBudget make_kvflash_budget(const TargetWeights & w, int64_t gpu_free) const;
     // Target-QK policy (--kvflash-policy qk): residency scored with the
     // target's own pooled post-RoPE keys vs the current decode query
     // (kvflash_qk.h); no drafter. Keys pool at chunk-seal time; the query

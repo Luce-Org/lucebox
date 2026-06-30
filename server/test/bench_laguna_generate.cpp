@@ -9,6 +9,10 @@
 // uses a fake bos id for prefill seeding.
 //
 // Usage: bench_laguna_generate <laguna.gguf> [prompt_N=128] [n_gen=64]
+//
+// Set DFLASH_LAGUNA_BENCH_NO_LOGITS=1 to match llama-bench tg semantics:
+// decode one token at a time without computing lm_head/argmax, then feed a
+// fixed synthetic token into the next step.
 
 #include "laguna_internal.h"
 #include "internal.h"
@@ -38,6 +42,7 @@ int main(int argc, char ** argv) {
     const int prompt_N = (argc >= 3) ? std::atoi(argv[2]) : 128;
     const int n_gen    = (argc >= 4) ? std::atoi(argv[3]) : 64;
     const bool no_mask = (std::getenv("DFLASH_NO_MASK") != nullptr);
+    const bool no_logits = (std::getenv("DFLASH_LAGUNA_BENCH_NO_LOGITS") != nullptr);
 
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) { std::fprintf(stderr, "cuda init failed\n"); return 1; }
@@ -110,11 +115,15 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "embed step %d (id=%d) failed\n", s, next_tok); break;
         }
         std::vector<float> step_logits;
-        if (!laguna_step(backend, w, cache, embed_step.data(), 1, cache.cur_pos,
-                          no_mask, step_logits)) {
+        int32_t step_argmax = -1;
+        if (!laguna_step(backend, w, cache, embed_step.data(), 1,
+                          cache.cur_pos, no_mask, step_logits, nullptr,
+                          /*capture=*/false,
+                          no_logits ? nullptr : &step_argmax,
+                          /*read_logits=*/false)) {
             std::fprintf(stderr, "decode step %d failed\n", s); break;
         }
-        next_tok = argmax(step_logits);
+        next_tok = no_logits ? fake_id : step_argmax;
         ++n_decoded;
     }
     auto t_g1 = std::chrono::steady_clock::now();

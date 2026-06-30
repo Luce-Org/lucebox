@@ -270,6 +270,7 @@ using dflash::common::free_qwen35_layer_split_shards;
 #include "qwen35_layer_split_dflash_target.h"
 #include "common/dflash_spec_decode.h"
 #include "common/gguf_mmap.h"
+#include "common/geometric_draft_topk_cuda.h"
 using dflash::common::is_eos_tok;
 
 // ─── Layer-split daemon — extracted to src/qwen35/layer_split_daemon.{h,cpp} ─
@@ -3273,16 +3274,35 @@ int main(int argc, char ** argv) {
                 }
             } else {
                 // DDTree K>1: need real log-probs for best-first tree scoring.
-                // Transfer full logits for positions 1..q_len-1.
-                if (!draft_hidden_bridge) {
-                    ggml_backend_tensor_get(draft_sg.logits, draft_logits_buf.data(), 0,
-                                            sizeof(float) * vocab * q_len);
+                bool topk_done = false;
+#ifdef DFLASH27B_HAVE_DRAFT_TOPK_CUDA
+                // GPU path: top-K + logsumexp on the draft logits device buffer
+                // (positions 1..q_len-1), no full-vocab D2H. Escape: DFLASH_GPU_DRAFT_TOPK=0.
+                static const bool kGpuDraftTopk = [](){
+                    const char * v = std::getenv("DFLASH_GPU_DRAFT_TOPK");
+                    return v == nullptr || v[0] != '0';
+                }();
+                if (kGpuDraftTopk && !draft_hidden_bridge) {
+                    topk_done = dflash::common::geometric_extract_draft_topk_cuda(
+                        (const float *)draft_sg.logits->data + (size_t)vocab,
+                        L, vocab, ddtree_K,
+                        ddtree_top_log_probs.data(),
+                        ddtree_top_token_ids.data(),
+                        ddtree_temp);
                 }
-                extract_draft_topk(draft_logits_buf.data() + (size_t)vocab,
-                                   L, vocab, ddtree_K,
-                                   ddtree_top_log_probs.data(),
-                                   ddtree_top_token_ids.data(),
-                                   ddtree_temp);
+#endif
+                if (!topk_done) {
+                    // Transfer full logits for positions 1..q_len-1, extract on CPU.
+                    if (!draft_hidden_bridge) {
+                        ggml_backend_tensor_get(draft_sg.logits, draft_logits_buf.data(), 0,
+                                                sizeof(float) * vocab * q_len);
+                    }
+                    extract_draft_topk(draft_logits_buf.data() + (size_t)vocab,
+                                       L, vocab, ddtree_K,
+                                       ddtree_top_log_probs.data(),
+                                       ddtree_top_token_ids.data(),
+                                       ddtree_temp);
+                }
             }
         }
         auto T_draft_logits = sync_us();
@@ -3422,16 +3442,40 @@ int main(int argc, char ** argv) {
             T_verify_compute = sync_us();
             tt_verify_compute += std::chrono::duration<double, std::micro>(T_verify_compute - T_verify_set).count();
 
-            // DDTree test mode reads full logits and computes posterior on
-            // CPU. The GPU argmax shortcut has returned -1 for tree-shaped
-            // verify graphs on some builds, which makes the harness stop
-            // after the root even though logits are valid. This is test-only;
-            // server decode paths are unaffected.
+            // DDTree posterior: per-node argmax over the verify logits.
+            //   default        : full vocab×N D2H + CPU argmax (legacy).
+            //   GPU_VERIFY_ARGMAX=1: read the in-graph batched GPU argmax
+            //                        (tree_verify_argmax) — N int32s, no bulk D2H.
+            //   GPU_VERIFY_ARGMAX=2: run BOTH and report per-step mismatches
+            //                        (validates the historical "-1 / tie" concern).
+            static const int kGpuVerifyArgmax = [](){
+                const char * v = std::getenv("DFLASH_GPU_VERIFY_ARGMAX");
+                return v ? std::atoi(v) : 0;
+            }();
             std::vector<int32_t> posterior(N_actual);
-            ggml_backend_tensor_get(sg.logits, verify_logits_buf.data(), 0,
-                                    sizeof(float) * (size_t)vocab * N_actual);
-            for (int i = 0; i < N_actual; i++) {
-                posterior[i] = argmax_f32(verify_logits_buf.data() + (size_t)i * vocab, vocab);
+            bool logits_resident = false;  // verify_logits_buf populated this step?
+            if (kGpuVerifyArgmax == 1 && sg.argmax_tokens) {
+                ggml_backend_tensor_get(sg.argmax_tokens, posterior.data(), 0,
+                                        sizeof(int32_t) * N_actual);
+            } else {
+                ggml_backend_tensor_get(sg.logits, verify_logits_buf.data(), 0,
+                                        sizeof(float) * (size_t)vocab * N_actual);
+                logits_resident = true;
+                for (int i = 0; i < N_actual; i++) {
+                    posterior[i] = argmax_f32(verify_logits_buf.data() + (size_t)i * vocab, vocab);
+                }
+                if (kGpuVerifyArgmax == 2 && sg.argmax_tokens) {
+                    std::vector<int32_t> gpu_post(N_actual);
+                    ggml_backend_tensor_get(sg.argmax_tokens, gpu_post.data(), 0,
+                                            sizeof(int32_t) * N_actual);
+                    int mism = 0, first = -1;
+                    for (int i = 0; i < N_actual; i++)
+                        if (gpu_post[i] != posterior[i]) { mism++; if (first < 0) first = i; }
+                    if (mism)
+                        std::fprintf(stderr, "[verify_argmax cmp] step=%d N=%d mismatches=%d "
+                                     "first@%d gpu=%d cpu=%d\n", n_draft_steps, N_actual, mism,
+                                     first, gpu_post[first], posterior[first]);
+                }
             }
             auto T_verify_logits_ddtree = sync_us();
             tt_verify_logits += std::chrono::duration<double, std::micro>(
@@ -3442,10 +3486,18 @@ int main(int argc, char ** argv) {
             int bonus_node_idx = 0;
             std::vector<int> accepted = follow_verified_tree(tree, posterior.data(), next_token, &bonus_node_idx);
             if (g_sampler.temp > 0.0f) {
+                // Sampling needs the bonus node's full logit row. If we took the
+                // GPU-argmax path we skipped the bulk D2H, so fetch just that row.
                 std::vector<float> bonus_logits(vocab);
-                std::memcpy(bonus_logits.data(),
-                            verify_logits_buf.data() + (size_t)bonus_node_idx * vocab,
-                            (size_t)vocab * sizeof(float));
+                if (logits_resident) {
+                    std::memcpy(bonus_logits.data(),
+                                verify_logits_buf.data() + (size_t)bonus_node_idx * vocab,
+                                (size_t)vocab * sizeof(float));
+                } else {
+                    ggml_backend_tensor_get(sg.logits, bonus_logits.data(),
+                                            (size_t)bonus_node_idx * vocab * sizeof(float),
+                                            (size_t)vocab * sizeof(float));
+                }
                 next_token = sample_logits(bonus_logits.data(), vocab, g_sampler, out_all, g_sampler_rng);
             }
             const int accept_depth = (int)accepted.size();  // includes root

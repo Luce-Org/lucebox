@@ -149,6 +149,24 @@ Qwen35Backend::Qwen35Backend(const Qwen35Config & cfg) : cfg_(cfg) {}
 
 Qwen35Backend::~Qwen35Backend() { shutdown(); }
 
+// "auto" pool budget: device-free minus a reserve (compute buffers + drafter
+// when expected), converted at this model's pooled-KV density. Shared with MoE
+// placement so reservation and runtime allocation size the pool identically.
+KvFlashAutoBudget Qwen35Backend::make_kvflash_budget(const TargetWeights & w,
+                                                     int64_t gpu_free) const {
+    ggml_type kv_k = GGML_TYPE_Q8_0, kv_v = GGML_TYPE_Q8_0;
+    dflash::resolve_kv_types(kv_k, kv_v);
+    KvFlashAutoBudget b;
+    b.free_bytes      = gpu_free;
+    // Single source of truth with the qwen35moe placement path — see kv_quant.h.
+    b.bytes_per_token = (int64_t)dflash::kv_reservation_bytes_per_token(
+        w.n_layer, w.full_attention_interval, w.n_head_kv,
+        kv_k, w.n_embd_head_k, kv_v, w.n_embd_head_v);
+    b.reserve_bytes   = (int64_t)(1.5 * 1073741824.0) +
+        (kvflash_drafter_path_.empty() ? 0 : (int64_t)(1.7 * 1073741824.0));
+    return b;
+}
+
 // ── init() ──────────────────────────────────────────────────────────────
 
 bool Qwen35Backend::init() {
@@ -242,29 +260,20 @@ bool Qwen35Backend::init() {
     // point and the cache is not yet allocated, so device-free minus a
     // reserve (compute buffers + the drafter when expected) is what the
     // pool can really use, converted at this model's pooled-KV density.
-    KvFlashAutoBudget kvf_budget;
-    {
-        size_t gpu_free = 0, gpu_total = 0;
-        if (ggml_backend_dev_t dev = ggml_backend_get_device(target_backend_)) {
-            ggml_backend_dev_memory(dev, &gpu_free, &gpu_total);
-        }
-        ggml_type kv_k = GGML_TYPE_Q8_0, kv_v = GGML_TYPE_Q8_0;
-        dflash::resolve_kv_types(kv_k, kv_v);
-        const int n_full = w_.n_layer / w_.full_attention_interval;
-        kvf_budget.free_bytes      = (int64_t)gpu_free;
-        kvf_budget.bytes_per_token = (int64_t)n_full * w_.n_head_kv *
-            (int64_t)(ggml_row_size(kv_k, w_.n_embd_head_k) +
-                      ggml_row_size(kv_v, w_.n_embd_head_v));
-        kvf_budget.reserve_bytes   = (int64_t)(1.5 * 1073741824.0) +
-            (kvflash_drafter_path_.empty() ? 0 : (int64_t)(1.7 * 1073741824.0));
+    size_t gpu_free = 0, gpu_total = 0;
+    if (ggml_backend_dev_t dev = ggml_backend_get_device(target_backend_)) {
+        ggml_backend_dev_memory(dev, &gpu_free, &gpu_total);
     }
+    KvFlashAutoBudget kvf_budget = make_kvflash_budget(w_, (int64_t)gpu_free);
     kvflash_tokens_ = kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{},
-                                            !kvflash_drafter_path_.empty() ||
-                                            kvflash_qk_policy_,
+                                            kvflash_scorer_expected(),
                                             kvf_budget);
     if (kvflash_tokens_ > 0) {
         kvflash_tau_ = std::max(1, env_int_or_default("DFLASH_KVFLASH_TAU", 64));
     }
+    // Subclass gate (e.g. MoE all-hot): may zero kvflash_tokens_ before the KV
+    // cache is sized, so create_target_cache allocates full max_ctx KV.
+    if (!post_kvflash_init_gate()) return false;
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true, /*ctx_alloc=*/kvflash_tokens_)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
