@@ -268,7 +268,7 @@ bool deepseek4_cuda_hc_pre_mix(const float * hc_state_host,
     }
     float ss = 0.0f;
     for (float v : sums) ss += v;
-    const float inv_rms = rsqrtf(ss / (float)hc_dim + eps);
+    const float inv_rms = 1.0f / std::sqrt(ss / (float)hc_dim + eps);
     hc_mix_kernel<<<kMixDim, kThreads>>>(g_scratch.d_state,
                                          static_cast<const __half *>(fn_device),
                                          hc_dim,
