@@ -1188,6 +1188,11 @@ static bool ds4_backend_is_hip(ggml_backend_t backend) {
     return name && std::strstr(name, "HIP") != nullptr;
 }
 
+static bool ds4_hc_hip_decode_enabled() {
+    const char * value = std::getenv("DFLASH_DS4_HC_HIP_DECODE");
+    return value && value[0] && std::strcmp(value, "0") != 0;
+}
+
 static bool ds4_try_gpu_hc_pre(float * working,
                                float * post,
                                float * comb,
@@ -2856,7 +2861,8 @@ bool deepseek4_step_layer_range(
         const DeepSeek4Layer & L = w.layers[(size_t)il];
         DeepSeek4LayerCache & lc = cache.layers[(size_t)il];
         const HcLayerWeightsCpu & hc_lw = hc_layer_weights_range[(size_t)il];
-        const bool use_backend_decode_hc_pre = reuse_decode_graphs && ds4_backend_is_hip(backend);
+        const bool use_backend_decode_hc_pre =
+            reuse_decode_graphs && ds4_backend_is_hip(backend) && ds4_hc_hip_decode_enabled();
 
         // ── HC pre (attention) ──────────────────────────────────────
         const auto hc_pre_attn_t0 = Ds4TimingClock::now();
