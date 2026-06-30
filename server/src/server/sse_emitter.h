@@ -146,6 +146,7 @@ private:
     StreamMode   mode_;
     std::string  window_;           // holdback buffer
     std::string  tool_buffer_;      // accumulated tool text
+    bool         tool_buffer_fallback_to_content_ = false;
     std::string  accumulated_content_;
     std::string  accumulated_raw_;  // all raw text for tool memory
     std::string  reasoning_text_;

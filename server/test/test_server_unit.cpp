@@ -118,6 +118,26 @@ static json weather_tools() {
     });
 }
 
+static json shell_tools() {
+    return json::array({
+        {
+            {"name", "shell"},
+            {"description", "Run one read-only shell command in the repository."},
+            {"input_schema", {
+                {"type", "object"},
+                {"properties", {
+                    {"command", {
+                        {"type", "string"},
+                        {"description", "The shell command to run."}
+                    }}
+                }},
+                {"required", json::array({"command"})},
+                {"additionalProperties", false}
+            }}
+        }
+    });
+}
+
 static SseEmitter make_emitter(ApiFormat fmt, json tools = json::array(),
                                bool started_in_thinking = false) {
     return SseEmitter(fmt, "test_id_001", "test-model", 10,
@@ -310,6 +330,35 @@ static void test_parse_json_tool_call() {
         auto args = json::parse(result.tool_calls[0].arguments);
         TEST_ASSERT(args["query"] == "hello world");
     }
+}
+
+static void test_parse_single_tool_bare_json_args() {
+    std::string text =
+        "{\n"
+        "  \"command\": \"git branch --show-current\"\n"
+        "}";
+    auto result = parse_tool_calls(text, shell_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "shell");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "git branch --show-current");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+static void test_parse_single_tool_bare_json_args_rejects_prose() {
+    std::string text = "The command is {\"command\": \"git status\"}.";
+    auto result = parse_tool_calls(text, shell_tools());
+    TEST_ASSERT(result.tool_calls.empty());
+    TEST_ASSERT(result.cleaned_text == text);
+}
+
+static void test_parse_single_tool_bare_json_args_rejects_ambiguous_tools() {
+    std::string text = "{\"command\": \"git status\"}";
+    auto result = parse_tool_calls(text, weather_tools());
+    TEST_ASSERT(result.tool_calls.empty());
+    TEST_ASSERT(result.cleaned_text == text);
 }
 
 static void test_parse_no_tools() {
@@ -886,6 +935,23 @@ static void test_emitter_anthropic_tool_use_blocks() {
         n_stop++; pos++;
     }
     TEST_ASSERT(n_stop >= 2);
+}
+
+static void test_emitter_single_tool_bare_json_args() {
+    auto em = make_emitter(ApiFormat::ANTHROPIC, shell_tools());
+    em.emit_start();
+    em.emit_token("{\n");
+    em.emit_token("  \"command\": \"git branch --show-current\"\n");
+    em.emit_token("}");
+    em.emit_finish(16);
+
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "shell");
+        auto args = json::parse(em.tool_calls()[0].arguments);
+        TEST_ASSERT(args["command"] == "git branch --show-current");
+    }
+    TEST_ASSERT(em.accumulated_text().empty());
 }
 
 static void test_emitter_bare_function_tool_buffer_detection() {
@@ -4206,6 +4272,9 @@ int main() {
     RUN_TEST(test_parse_tool_call_xml);
     RUN_TEST(test_parse_bare_function_xml);
     RUN_TEST(test_parse_json_tool_call);
+    RUN_TEST(test_parse_single_tool_bare_json_args);
+    RUN_TEST(test_parse_single_tool_bare_json_args_rejects_prose);
+    RUN_TEST(test_parse_single_tool_bare_json_args_rejects_ambiguous_tools);
     RUN_TEST(test_parse_no_tools);
     RUN_TEST(test_parse_tool_code_wrapper);
     RUN_TEST(test_parse_tool_allowed_filter);
@@ -4247,6 +4316,7 @@ int main() {
     RUN_TEST(test_emitter_content_only_no_thinking);
     RUN_TEST(test_emitter_tool_buffer_detection);
     RUN_TEST(test_emitter_anthropic_tool_use_blocks);
+    RUN_TEST(test_emitter_single_tool_bare_json_args);
     RUN_TEST(test_emitter_bare_function_tool_buffer_detection);
     RUN_TEST(test_emitter_does_not_leak_malformed_tool_xml);
     RUN_TEST(test_emitter_parses_tool_call_missing_outer_close);
