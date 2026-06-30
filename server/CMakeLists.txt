@@ -370,6 +370,8 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
         DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm}
         DFLASH27B_MIN_SM=${_dflash_cuda_min_sm})
 elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+    target_sources(dflash_common PRIVATE src/deepseek4/deepseek4_hc_cuda.cu)
+    set_source_files_properties(src/deepseek4/deepseek4_hc_cuda.cu PROPERTIES LANGUAGE HIP)
     set_target_properties(dflash_common PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
     target_compile_definitions(dflash_common PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
     # hip_compat shim is needed by ALL dflash_common sources (peer_access.cpp,

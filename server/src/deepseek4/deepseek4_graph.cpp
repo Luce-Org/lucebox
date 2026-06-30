@@ -1188,6 +1188,47 @@ static bool ds4_backend_is_hip(ggml_backend_t backend) {
     return name && std::strstr(name, "HIP") != nullptr;
 }
 
+static bool ds4_try_gpu_hc_pre(float * working,
+                               float * post,
+                               float * comb,
+                               const float * hc_state,
+                               const float * scale_data,
+                               const float * base_data,
+                               ggml_tensor * fn_tensor,
+                               int n_embd,
+                               int n_hc,
+                               int sinkhorn_iters,
+                               float hc_eps) {
+#if defined(DFLASH27B_BACKEND_CUDA) || defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    if (!fn_tensor || !fn_tensor->data) {
+        return false;
+    }
+    return deepseek4_cuda_hc_pre(hc_state,
+                                 fn_tensor->data,
+                                 scale_data,
+                                 base_data,
+                                 n_embd,
+                                 n_hc,
+                                 sinkhorn_iters,
+                                 hc_eps,
+                                 working,
+                                 post,
+                                 comb);
+#else
+    (void) working;
+    (void) post;
+    (void) comb;
+    (void) hc_state;
+    (void) weights;
+    (void) fn_tensor;
+    (void) n_embd;
+    (void) n_hc;
+    (void) sinkhorn_iters;
+    (void) hc_eps;
+    return false;
+#endif
+}
+
 static bool build_cached_decode_hc_pre_graph(
         DeepSeek4CachedDecodeHcPreGraph & out,
         ggml_backend_t backend,
@@ -2819,7 +2860,11 @@ bool deepseek4_step_layer_range(
 
         // ── HC pre (attention) ──────────────────────────────────────
         const auto hc_pre_attn_t0 = Ds4TimingClock::now();
-        if (use_backend_decode_hc_pre) {
+        if (use_backend_decode_hc_pre &&
+            ds4_try_gpu_hc_pre(cur.data(), hc_post.data(), hc_comb.data(),
+                               hc_state.data(), hc_lw.attn.scale_data.data(), hc_lw.attn.base_data.data(), L.hc_attn_fn,
+                               n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps)) {
+        } else if (use_backend_decode_hc_pre) {
             auto & cached = cached_decode_attn_hc_pre_graphs[(size_t)il];
             if (!cached.valid() ||
                 cached.owner_ctx != w.ctx ||
@@ -3002,7 +3047,11 @@ bool deepseek4_step_layer_range(
 
         // ── HC pre (FFN) ────────────────────────────────────────────
         const auto hc_pre_ffn_t0 = Ds4TimingClock::now();
-        if (use_backend_decode_hc_pre) {
+        if (use_backend_decode_hc_pre &&
+            ds4_try_gpu_hc_pre(ffn_working.data(), hc_post.data(), hc_comb.data(),
+                               hc_state.data(), hc_lw.ffn.scale_data.data(), hc_lw.ffn.base_data.data(), L.hc_ffn_fn,
+                               n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps)) {
+        } else if (use_backend_decode_hc_pre) {
             auto & cached = cached_decode_ffn_hc_pre_graphs[(size_t)il];
             if (!cached.valid() ||
                 cached.owner_ctx != w.ctx ||
