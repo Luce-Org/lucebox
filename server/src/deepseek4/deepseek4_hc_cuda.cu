@@ -320,28 +320,20 @@ bool deepseek4_cuda_hc_pre(const float * hc_state_host,
                    cudaMemcpyHostToDevice) != cudaSuccess) {
         return false;
     }
-
-    hc_mix_norm_kernel<<<mix_dim, kThreads>>>(
-        g_scratch.d_state,
-        static_cast<const __half *>(fn_device),
-        hc_dim,
-        mix_dim,
-        eps,
-        g_scratch.d_mix);
-    if (cudaGetLastError() != cudaSuccess) return false;
-
-    hc_finish_kernel<<<1, kThreads>>>(
-        g_scratch.d_state,
-        g_scratch.d_mix,
-        g_scratch.d_scale,
-        g_scratch.d_base,
-        n_embd,
-        n_hc,
-        sinkhorn_iters,
-        g_scratch.d_working,
-        g_scratch.d_post,
-        g_scratch.d_comb);
-    if (cudaGetLastError() != cudaSuccess) return false;
+    if (!deepseek4_cuda_hc_pre_device(
+            g_scratch.d_state,
+            fn_device,
+            g_scratch.d_scale,
+            g_scratch.d_base,
+            n_embd,
+            n_hc,
+            sinkhorn_iters,
+            eps,
+            g_scratch.d_working,
+            g_scratch.d_post,
+            g_scratch.d_comb)) {
+        return false;
+    }
 
     if (cudaMemcpy(working_host, g_scratch.d_working, sizeof(float) * (size_t) n_embd,
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
@@ -355,6 +347,58 @@ bool deepseek4_cuda_hc_pre(const float * hc_state_host,
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
+
+    return cudaDeviceSynchronize() == cudaSuccess;
+}
+
+bool deepseek4_cuda_hc_pre_device(const void * hc_state_device,
+                                  const void * fn_device,
+                                  const void * scale_device,
+                                  const void * base_device,
+                                  int          n_embd,
+                                  int          n_hc,
+                                  int          sinkhorn_iters,
+                                  float        eps,
+                                  void *       working_device,
+                                  void *       post_device,
+                                  void *       comb_device) {
+    if (!hc_state_device || !fn_device || !scale_device || !base_device ||
+        !working_device || !post_device || !comb_device ||
+        n_embd <= 0 || n_hc <= 0 || n_hc > kMaxHc) {
+        return false;
+    }
+    const int hc_dim = n_embd * n_hc;
+    const int mix_dim = 2 * n_hc + n_hc * n_hc;
+    if (mix_dim > kMaxMixDim) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!g_scratch.ensure((size_t) hc_dim, (size_t) n_embd, (size_t) n_hc)) {
+        return false;
+    }
+
+    hc_mix_norm_kernel<<<mix_dim, kThreads>>>(
+        static_cast<const float *>(hc_state_device),
+        static_cast<const __half *>(fn_device),
+        hc_dim,
+        mix_dim,
+        eps,
+        g_scratch.d_mix);
+    if (cudaGetLastError() != cudaSuccess) return false;
+
+    hc_finish_kernel<<<1, kThreads>>>(
+        static_cast<const float *>(hc_state_device),
+        g_scratch.d_mix,
+        static_cast<const float *>(scale_device),
+        static_cast<const float *>(base_device),
+        n_embd,
+        n_hc,
+        sinkhorn_iters,
+        static_cast<float *>(working_device),
+        static_cast<float *>(post_device),
+        static_cast<float *>(comb_device));
+    if (cudaGetLastError() != cudaSuccess) return false;
 
     return cudaDeviceSynchronize() == cudaSuccess;
 }

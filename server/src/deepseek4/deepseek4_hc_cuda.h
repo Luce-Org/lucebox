@@ -23,4 +23,16 @@ bool deepseek4_cuda_hc_pre(const float * hc_state_host,
                            float *       post_host,
                            float *       comb_host);
 
+bool deepseek4_cuda_hc_pre_device(const void * hc_state_device,
+                                  const void * fn_device,
+                                  const void * scale_device,
+                                  const void * base_device,
+                                  int          n_embd,
+                                  int          n_hc,
+                                  int          sinkhorn_iters,
+                                  float        eps,
+                                  void *       working_device,
+                                  void *       post_device,
+                                  void *       comb_device);
+
 } // namespace dflash::common
