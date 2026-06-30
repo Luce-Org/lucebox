@@ -886,7 +886,16 @@ static ggml_tensor * build_delta_net_block(
     // tree_persist writes directly to the intermediate buffer. It only supports
     // F32/F16 output; for Q8_0 intermediates, fall back to the legacy ggml_cpy
     // path which handles F32→Q8_0 quantization automatically.
-    ggml_tensor * persist_inter = (parent_ids && cap && cap->ssm_intermediate_states
+    // persist_inter: when capture is requested, route the kernel's per-token
+    // intermediate-state writes DIRECTLY into the persistent cache buffer via
+    // src[7], avoiding the legacy result-region cpy. Works for BOTH tree and
+    // non-tree (chain-verify) capture — the kernel checks src[7] regardless of
+    // tree mode, and write_inter is forced true whenever src[7] is non-null.
+    // This is required for non-tree capture once the GDN op defaults to K=1
+    // (no embedded intermediate region): the legacy cpy would read OOB.
+    // Q8_0 intermediates fall through (persist requires F32/F16); the legacy
+    // cpy path below handles F32→Q8_0 quantization for that case (guarded).
+    ggml_tensor * persist_inter = (cap && cap->ssm_intermediate_states
                                    && (cap->ssm_intermediate_states->type == GGML_TYPE_F32
                                        || cap->ssm_intermediate_states->type == GGML_TYPE_F16))
         ? cap->ssm_intermediate_states
@@ -918,12 +927,22 @@ static ggml_tensor * build_delta_net_block(
     }
 
     ggml_tensor * result;
-    result =
-        persist_inter
+    if (parent_ids) {
+        // Tree verify: _tree_persist wires src[7] internally.
+        result = persist_inter
             ? ggml_gated_delta_net_tree_persist(ctx, q_c, k_c, v_c, g_tensor, beta, s, parent_ids, persist_inter)
-            : (parent_ids
-                ? ggml_gated_delta_net_tree(ctx, q_c, k_c, v_c, g_tensor, beta, s, parent_ids)
-                : ggml_gated_delta_net     (ctx, q_c, k_c, v_c, g_tensor, beta, s));
+            : ggml_gated_delta_net_tree(ctx, q_c, k_c, v_c, g_tensor, beta, s, parent_ids);
+    } else {
+        // Non-tree (chain/prefill). When capture is requested, set src[7] so
+        // the kernel writes per-token intermediates directly to the persistent
+        // cache buffer — same mechanism as _tree_persist, but without tree
+        // parent_ids. Avoids the legacy result-region cpy (and the OOB it
+        // would cause under a K=1 GDN default with no embedded inter region).
+        result = ggml_gated_delta_net(ctx, q_c, k_c, v_c, g_tensor, beta, s);
+        if (persist_inter) {
+            result->src[7] = persist_inter;
+        }
+    }
     if (can_skip_gdn_intermediate) {
         ggml_gated_delta_net_set_skip_intermediate(result, true);
     }
@@ -964,13 +983,19 @@ static ggml_tensor * build_delta_net_block(
     // persistent cache, so verify_build stays cheap. Matches SGLang's
     // mamba_caches.intermediate_ssm pattern.
     if (cap && cap->ssm_intermediate_states && !persist_inter) {
-        // Legacy cpy path: only used when the kernel wrote intermediates into
-        // its own result region (i.e. when we did NOT use _tree_persist).
-        // The _tree_persist variant writes directly to the cache buffer and
-        // this cpy becomes redundant, saving ~5-10 ms per verify step.
+        // Legacy cpy path: only reached when persist routing was not used
+        // (Q8_0 intermediates, or a GDN default that still embeds the region).
+        // Guard: if the result has no embedded intermediate region (K=1 default),
+        // the view+cpy below would read out of bounds — skip and warn.
         const size_t inter_offset =
             S_v * H_v * n_seq_tokens * n_seqs * r_elt        // attn output region
           + S_v * S_v * H_v * n_seqs * r_elt;                // final-state region
+        const size_t inter_bytes = S_v * S_v * H_v * (size_t)n_seq_tokens * (size_t)n_seqs * r_elt;
+        if (inter_offset + inter_bytes > ggml_nbytes(result)) {
+            std::fprintf(stderr,
+                "[delta-net] WARN: non-tree intermediate capture skipped — result has no "
+                "intermediate region (K=1 GDN default). Fast-rollback falls back to 2-forward.\n");
+        } else {
         ggml_tensor * inter_view = ggml_view_4d(ctx, result,
             S_v, S_v, H_v, n_seq_tokens,
             S_v * r_elt,
@@ -993,6 +1018,7 @@ static ggml_tensor * build_delta_net_block(
         GGML_ASSERT(ggml_nelements(inter_view) == ggml_nelements(dst_view));
         ggml_build_forward_expand(gf,
             ggml_cpy(ctx, inter_view, dst_view));
+        }
     }
     } // end of block started at `{` before `const int64_t S_v = head_v_dim;`
 
