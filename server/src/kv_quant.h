@@ -1,5 +1,6 @@
 #pragma once
 #include "ggml.h"
+#include <cstdint>
 #include <string>
 
 namespace dflash {
@@ -26,5 +27,22 @@ bool is_supported_kv_pair(ggml_type k, ggml_type v);
 // On invalid input or unsupported (K,V) pair, prints an explanatory message
 // and calls std::abort(). Returns the resolved pair via out params.
 void resolve_kv_types(ggml_type & k_out, ggml_type & v_out);
+
+// KV reservation bytes per token for a hybrid attention/SSM model. Single source
+// of truth for both qwen35 (dense) and qwen35moe expert-placement budgeting.
+// Only the full-attention layers carry a KV cache — the rest are O(1)-state
+// SSM/DeltaNet — so count n_full = n_layer / full_attention_interval, and honor
+// the resolved cache element type (q4_0 ≪ f16). Using n_layer or a hardcoded f16
+// over-reserves KV and falsely forces experts cold (the qwen35moe:2595 bug).
+inline uint64_t kv_reservation_bytes_per_token(
+        int n_layer, int full_attention_interval, int n_head_kv,
+        ggml_type kv_k, int n_embd_head_k,
+        ggml_type kv_v, int n_embd_head_v) {
+    const int n_full = (full_attention_interval > 0)
+        ? (n_layer / full_attention_interval) : n_layer;
+    return (uint64_t)n_full * (uint64_t)n_head_kv *
+        (uint64_t)(ggml_row_size(kv_k, n_embd_head_k) +
+                   ggml_row_size(kv_v, n_embd_head_v));
+}
 
 }  // namespace dflash

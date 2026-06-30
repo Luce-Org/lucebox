@@ -250,6 +250,7 @@ bool LagunaDFlashTarget::verify_tree(
     gi.kv_idx           = kvi;
     gi.output_last_only = false;
     gi.output_logits    = true;
+    gi.logits_are_output = logits_out != nullptr;
     gi.capture_features = feat_rows != nullptr;
     gi.target_feat_rows = feat_rows;
     gi.hybrid           = nullptr;

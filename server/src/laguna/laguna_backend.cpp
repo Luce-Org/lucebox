@@ -14,6 +14,7 @@
 #include "common/domino_head.h"
 #include "common/dflash_feature_ring.h"
 #include "common/dflash_draft_graph.h"
+#include "kv_quant.h"
 
 #include <chrono>
 #include "../common/moe_hybrid_types.h"
@@ -42,6 +43,44 @@
 #include "common/gguf_mmap.h"
 
 namespace dflash::common {
+
+namespace {
+
+static bool laguna_kv_type_env_present() {
+    return std::getenv("DFLASH27B_KV_K") ||
+           std::getenv("DFLASH27B_KV_V") ||
+           std::getenv("DFLASH27B_KV_F16") ||
+           std::getenv("DFLASH27B_KV_Q4") ||
+           std::getenv("DFLASH27B_KV_TQ3");
+}
+
+static void resolve_laguna_kv_types(const LagunaBackendArgs & args,
+                                    ggml_type & k_type,
+                                    ggml_type & v_type) {
+    k_type = args.kv_type;
+    v_type = args.kv_type;
+    if (laguna_kv_type_env_present()) {
+        dflash::resolve_kv_types(k_type, v_type);
+    }
+}
+
+static bool laguna_auto_head_major_enabled() {
+    static const bool enabled = []() {
+        const char * e = std::getenv("DFLASH_LAGUNA_AUTO_HEAD_MAJOR");
+        return !(e && std::string(e) == "0");
+    }();
+    return enabled;
+}
+
+static bool laguna_gpu_argmax_enabled() {
+    static const bool enabled = []() {
+        const char * e = std::getenv("DFLASH_LAGUNA_GPU_ARGMAX");
+        return e == nullptr || e[0] != '0';
+    }();
+    return enabled;
+}
+
+}  // namespace
 
 static bool laguna_sampled_verify_enabled(const SamplerCfg & sampler, bool do_sample) {
     static const bool kSampledVerify = []() {
@@ -88,9 +127,17 @@ bool LagunaBackend::init() {
         }
     }
 
-    cache_.kv_k_type = args_.kv_type;
-    cache_.kv_v_type = args_.kv_type;
+    resolve_laguna_kv_types(args_, cache_.kv_k_type, cache_.kv_v_type);
     kvflash_read_config();
+    if (laguna_auto_head_major_enabled() &&
+        !std::getenv("DFLASH_LAGUNA_KV_HEAD_MAJOR") &&
+        kvflash_tokens_ <= 0 &&
+        !args_.ddtree_mode) {
+        setenv("DFLASH_LAGUNA_KV_HEAD_MAJOR", "1", 0);
+        std::fprintf(stderr,
+                     "[laguna] auto-enabled head-major KV layout "
+                     "(disable with DFLASH_LAGUNA_AUTO_HEAD_MAJOR=0)\n");
+    }
     if (!create_laguna_target_cache(w_, args_.max_ctx, backend_, cache_,
                                     kvflash_tokens_)) {
         std::fprintf(stderr, "cache failed: %s\n", dflash27b_last_error());
@@ -280,9 +327,17 @@ bool LagunaBackend::unpark(const std::string & what) {
                 return false;
             }
         }
-        cache_.kv_k_type = args_.kv_type;
-        cache_.kv_v_type = args_.kv_type;
+        resolve_laguna_kv_types(args_, cache_.kv_k_type, cache_.kv_v_type);
         kvflash_read_config();
+        if (laguna_auto_head_major_enabled() &&
+            !std::getenv("DFLASH_LAGUNA_KV_HEAD_MAJOR") &&
+            kvflash_tokens_ <= 0 &&
+            !args_.ddtree_mode) {
+            setenv("DFLASH_LAGUNA_KV_HEAD_MAJOR", "1", 0);
+            std::fprintf(stderr,
+                         "[laguna] auto-enabled head-major KV layout "
+                         "(disable with DFLASH_LAGUNA_AUTO_HEAD_MAJOR=0)\n");
+        }
         if (!create_laguna_target_cache(w_, args_.max_ctx, backend_, cache_,
                                         kvflash_tokens_)) {
             std::fprintf(stderr, "[unpark] cache: %s\n", dflash27b_last_error());
@@ -1082,11 +1137,16 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
         }
         if (!w_.embedder.embed(&next_tok, 1, embed_step.data())) { ok = false; break; }
         std::vector<float> step_logits;
+        int32_t step_argmax = -1;
+        const bool use_gpu_argmax = !req.do_sample && laguna_gpu_argmax_enabled();
         if (!kvflash_alloc_span(cache_.cur_pos, 1) ||
             !laguna_step(backend_, w_, cache_, embed_step.data(), 1,
-                          cache_.cur_pos, no_mask, step_logits, kvf)) { ok = false; break; }
+                          cache_.cur_pos, no_mask, step_logits, kvf,
+                          /*capture=*/false,
+                          use_gpu_argmax ? &step_argmax : nullptr,
+                          /*read_logits=*/!use_gpu_argmax)) { ok = false; break; }
         kvflash_maybe_reselect(history, s + 1);
-        next_tok = pick(step_logits);
+        next_tok = use_gpu_argmax ? step_argmax : pick(step_logits);
     }
     auto t_g1 = std::chrono::steady_clock::now();
     result.decode_s = std::chrono::duration<double>(t_g1 - t_g0).count();
@@ -1296,11 +1356,16 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
         if (out_io.cancelled) break;
         if (!w_.embedder.embed(&next_tok, 1, embed_step.data())) { ok = false; break; }
         std::vector<float> step_logits;
+        int32_t step_argmax = -1;
+        const bool use_gpu_argmax = !req.do_sample && laguna_gpu_argmax_enabled();
         if (!kvflash_alloc_span(cache_.cur_pos, 1) ||
             !laguna_step(backend_, w_, cache_, embed_step.data(), 1,
-                          cache_.cur_pos, no_mask, step_logits, kvf)) { ok = false; break; }
+                          cache_.cur_pos, no_mask, step_logits, kvf,
+                          /*capture=*/false,
+                          use_gpu_argmax ? &step_argmax : nullptr,
+                          /*read_logits=*/!use_gpu_argmax)) { ok = false; break; }
         kvflash_maybe_reselect(history, s + 1);
-        next_tok = pick(step_logits);
+        next_tok = use_gpu_argmax ? step_argmax : pick(step_logits);
     }
     auto t_g1 = std::chrono::steady_clock::now();
     result.decode_s = std::chrono::duration<double>(t_g1 - t_g0).count();
