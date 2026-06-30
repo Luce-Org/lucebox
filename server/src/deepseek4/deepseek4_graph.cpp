@@ -1083,6 +1083,32 @@ struct DeepSeek4CachedDecodeHcPreGraph {
     }
 };
 
+struct DeepSeek4CachedDecodeHcPostGraph {
+    const ggml_context * owner_ctx = nullptr;
+    ggml_backend_t backend = nullptr;
+    StepGraph sg;
+    ggml_tensor * residual_hc = nullptr;
+    ggml_tensor * block_out = nullptr;
+    ggml_tensor * post = nullptr;
+    ggml_tensor * comb = nullptr;
+
+    bool valid() const {
+        return owner_ctx && backend &&
+               sg.ctx && sg.gf && sg.alloc && sg.hidden_states &&
+               residual_hc && block_out && post && comb;
+    }
+
+    void free() {
+        step_graph_destroy(sg);
+        owner_ctx = nullptr;
+        backend = nullptr;
+        residual_hc = nullptr;
+        block_out = nullptr;
+        post = nullptr;
+        comb = nullptr;
+    }
+};
+
 static bool build_cached_decode_attn_graph(
         DeepSeek4CachedDecodeAttnGraph & out,
         ggml_backend_t backend,
@@ -1331,6 +1357,56 @@ static bool build_cached_decode_hc_pre_graph(
     out.backend = backend;
     out.layer_idx = layer_idx;
     out.ffn = ffn;
+    return true;
+}
+
+static bool build_cached_decode_hc_post_graph(
+        DeepSeek4CachedDecodeHcPostGraph & out,
+        ggml_backend_t backend,
+        const DeepSeek4Weights & w) {
+    out.free();
+
+    const size_t ctx_size = 2 * 1024 * 1024;
+    ggml_init_params params{};
+    params.mem_size = ctx_size;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    out.sg.ctx = ggml_init(params);
+    if (!out.sg.ctx) {
+        return false;
+    }
+
+    out.residual_hc = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_F32, w.n_embd, w.n_hc);
+    out.block_out = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_F32, w.n_embd, 1);
+    out.post = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_F32, w.n_hc, 1);
+    out.comb = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_F32, w.n_hc, w.n_hc);
+    ggml_set_input(out.residual_hc);
+    ggml_set_input(out.block_out);
+    ggml_set_input(out.post);
+    ggml_set_input(out.comb);
+
+    out.sg.gf = ggml_new_graph_custom(out.sg.ctx, 256, false);
+
+    ggml_tensor * residual_t = ggml_cont(out.sg.ctx, ggml_transpose(out.sg.ctx, out.residual_hc));
+    ggml_tensor * comb_t = ggml_cont(out.sg.ctx, ggml_transpose(out.sg.ctx, out.comb));
+    ggml_tensor * mixed_t = ggml_mul_mat(out.sg.ctx, comb_t, residual_t);
+    ggml_tensor * mixed = ggml_cont(out.sg.ctx, ggml_transpose(out.sg.ctx, mixed_t));
+    ggml_tensor * post_t = ggml_cont(out.sg.ctx, ggml_transpose(out.sg.ctx, out.post));
+    ggml_tensor * block_rep = ggml_repeat(out.sg.ctx, out.block_out, mixed);
+    ggml_tensor * post_rep = ggml_repeat(out.sg.ctx, post_t, mixed);
+    out.sg.hidden_states = ggml_add(out.sg.ctx, mixed, ggml_mul(out.sg.ctx, block_rep, post_rep));
+
+    ggml_set_output(out.sg.hidden_states);
+    ggml_build_forward_expand(out.sg.gf, out.sg.hidden_states);
+
+    out.sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(out.sg.alloc, out.sg.gf)) {
+        out.free();
+        return false;
+    }
+
+    out.owner_ctx = w.ctx;
+    out.backend = backend;
     return true;
 }
 
@@ -2806,6 +2882,7 @@ bool deepseek4_step_layer_range(
     static std::vector<DeepSeek4CachedLayerAlloc> cached_attn_allocs;
     static std::vector<DeepSeek4CachedDecodeHcPreGraph> cached_decode_attn_hc_pre_graphs;
     static std::vector<DeepSeek4CachedDecodeHcPreGraph> cached_decode_ffn_hc_pre_graphs;
+    static DeepSeek4CachedDecodeHcPostGraph cached_decode_hc_post_graph;
     static std::vector<std::vector<DeepSeek4CachedDecodeAttnGraph>> cached_decode_attn_graphs;
     static std::vector<DeepSeek4CachedDecodeFfnGraph> cached_decode_ffn_graphs;
     static DeepSeek4CachedDecodeOutputGraph cached_decode_output_graph;
@@ -2826,6 +2903,7 @@ bool deepseek4_step_layer_range(
             g.free();
         }
         cached_decode_ffn_hc_pre_graphs.assign((size_t)w.n_layer, {});
+        cached_decode_hc_post_graph.free();
         for (auto & per_layer : cached_decode_attn_graphs) {
             for (auto & g : per_layer) {
                 g.free();
@@ -2862,18 +2940,57 @@ bool deepseek4_step_layer_range(
     std::vector<float> & ffn_out_host = scratch.ffn_out_host;
     std::vector<int32_t> & hash_expert_ids_host = scratch.hash_expert_ids;
     const bool reuse_decode_graphs = (n_tokens == 1);
+    const bool use_backend_decode_hc =
+        reuse_decode_graphs && ds4_backend_is_hip(backend) && ds4_hc_hip_decode_enabled();
+    const bool use_backend_decode_hc_graph = use_backend_decode_hc && !ds4_hc_hip_direct_enabled();
+    const ggml_tensor * hc_state_backend = nullptr;
+    if (use_backend_decode_hc_graph) {
+        if (!cached_decode_hc_post_graph.valid() ||
+            cached_decode_hc_post_graph.owner_ctx != w.ctx ||
+            cached_decode_hc_post_graph.backend != backend) {
+            if (!build_cached_decode_hc_post_graph(cached_decode_hc_post_graph, backend, w)) {
+                return false;
+            }
+        }
+        ggml_backend_tensor_set(cached_decode_hc_post_graph.residual_hc,
+                                hc_state.data(), 0, sizeof(float) * hc_state.size());
+        hc_state_backend = cached_decode_hc_post_graph.residual_hc;
+    }
     for (int il = layer_begin; il < layer_end; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t)il];
         DeepSeek4LayerCache & lc = cache.layers[(size_t)il];
         const HcLayerWeightsCpu & hc_lw = hc_layer_weights_range[(size_t)il];
-        const bool use_backend_decode_hc_pre =
-            reuse_decode_graphs && ds4_backend_is_hip(backend) && ds4_hc_hip_decode_enabled();
+        const bool use_backend_decode_hc_pre = use_backend_decode_hc;
         const ggml_tensor * attn_in_backend = nullptr;
         const ggml_tensor * ffn_in_backend = nullptr;
+        const ggml_tensor * attn_post_backend = nullptr;
+        const ggml_tensor * attn_comb_backend = nullptr;
+        const ggml_tensor * ffn_post_backend = nullptr;
+        const ggml_tensor * ffn_comb_backend = nullptr;
 
         // ── HC pre (attention) ──────────────────────────────────────
         const auto hc_pre_attn_t0 = Ds4TimingClock::now();
-        if (use_backend_decode_hc_pre &&
+        if (use_backend_decode_hc_graph) {
+            auto & cached = cached_decode_attn_hc_pre_graphs[(size_t)il];
+            if (!cached.valid() ||
+                cached.owner_ctx != w.ctx ||
+                cached.backend != backend ||
+                cached.layer_idx != il ||
+                cached.ffn) {
+                if (!build_cached_decode_hc_pre_graph(cached, backend, w, L, hc_lw.attn.scale_data.data(), il, false)) {
+                    std::fprintf(stderr, "[deepseek4] cached hc-pre graph alloc failed layer %d attn\n", il);
+                    return false;
+                }
+            }
+            ggml_backend_tensor_copy(hc_state_backend, cached.sg.inp_embed);
+            if (ggml_backend_graph_compute(backend, cached.sg.gf) != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "[deepseek4] cached hc-pre compute failed layer %d attn\n", il);
+                return false;
+            }
+            attn_in_backend = cached.sg.hidden_states;
+            attn_post_backend = cached.post;
+            attn_comb_backend = cached.comb;
+        } else if (use_backend_decode_hc_pre &&
             ds4_hc_hip_direct_enabled() &&
             ds4_try_gpu_hc_pre(cur.data(), hc_post.data(), hc_comb.data(),
                                hc_state.data(), hc_lw.attn.scale_data.data(), hc_lw.attn.base_data.data(), L.hc_attn_fn,
@@ -3048,28 +3165,67 @@ bool deepseek4_step_layer_range(
                 return false;
             }
             if (telemetry) telemetry->attn_compute_us += ds4_elapsed_us(attn_compute_t0, Ds4TimingClock::now());
-            const auto attn_read_t0 = Ds4TimingClock::now();
-            ggml_backend_tensor_get(attn_out, attn_out_host.data(), 0, sizeof(float) * attn_out_host.size());
-            if (telemetry) telemetry->attn_read_us += ds4_elapsed_us(attn_read_t0, Ds4TimingClock::now());
+            if (use_backend_decode_hc_graph) {
+                if (hc_state_backend != cached_decode_hc_post_graph.residual_hc) {
+                    ggml_backend_tensor_copy(hc_state_backend, cached_decode_hc_post_graph.residual_hc);
+                }
+                ggml_backend_tensor_copy(attn_out, cached_decode_hc_post_graph.block_out);
+                ggml_backend_tensor_copy(attn_post_backend, cached_decode_hc_post_graph.post);
+                ggml_backend_tensor_copy(attn_comb_backend, cached_decode_hc_post_graph.comb);
+                const auto hc_post_attn_t0 = Ds4TimingClock::now();
+                if (ggml_backend_graph_compute(backend, cached_decode_hc_post_graph.sg.gf) != GGML_STATUS_SUCCESS) {
+                    std::fprintf(stderr, "[deepseek4] cached hc-post compute failed layer %d attn\n", il);
+                    if (ctx) ggml_free(ctx);
+                    return false;
+                }
+                hc_state_backend = cached_decode_hc_post_graph.sg.hidden_states;
+                if (telemetry) telemetry->hc_post_attn_us += ds4_elapsed_us(hc_post_attn_t0, Ds4TimingClock::now());
+            } else {
+                const auto attn_read_t0 = Ds4TimingClock::now();
+                ggml_backend_tensor_get(attn_out, attn_out_host.data(), 0, sizeof(float) * attn_out_host.size());
+                if (telemetry) telemetry->attn_read_us += ds4_elapsed_us(attn_read_t0, Ds4TimingClock::now());
+            }
             if (ctx) ggml_free(ctx);
 
             // ── HC post (attention) ─────────────────────────────────
-            const auto hc_post_attn_t0 = Ds4TimingClock::now();
-            hc_post_batch(next_hc,
-                          attn_out_host.data(),
-                          hc_state.data(),
-                          hc_post.data(),
-                          hc_comb.data(),
-                          n_tokens,
-                          n_embd,
-                          n_hc);
-            std::memcpy(hc_state.data(), next_hc.data(), next_hc.size() * sizeof(float));
-            if (telemetry) telemetry->hc_post_attn_us += ds4_elapsed_us(hc_post_attn_t0, Ds4TimingClock::now());
+            if (!use_backend_decode_hc_graph) {
+                const auto hc_post_attn_t0 = Ds4TimingClock::now();
+                hc_post_batch(next_hc,
+                              attn_out_host.data(),
+                              hc_state.data(),
+                              hc_post.data(),
+                              hc_comb.data(),
+                              n_tokens,
+                              n_embd,
+                              n_hc);
+                std::memcpy(hc_state.data(), next_hc.data(), next_hc.size() * sizeof(float));
+                if (telemetry) telemetry->hc_post_attn_us += ds4_elapsed_us(hc_post_attn_t0, Ds4TimingClock::now());
+            }
         }
 
         // ── HC pre (FFN) ────────────────────────────────────────────
         const auto hc_pre_ffn_t0 = Ds4TimingClock::now();
-        if (use_backend_decode_hc_pre &&
+        if (use_backend_decode_hc_graph) {
+            auto & cached = cached_decode_ffn_hc_pre_graphs[(size_t)il];
+            if (!cached.valid() ||
+                cached.owner_ctx != w.ctx ||
+                cached.backend != backend ||
+                cached.layer_idx != il ||
+                !cached.ffn) {
+                if (!build_cached_decode_hc_pre_graph(cached, backend, w, L, hc_lw.ffn.scale_data.data(), il, true)) {
+                    std::fprintf(stderr, "[deepseek4] cached hc-pre graph alloc failed layer %d ffn\n", il);
+                    return false;
+                }
+            }
+            ggml_backend_tensor_copy(hc_state_backend, cached.sg.inp_embed);
+            if (ggml_backend_graph_compute(backend, cached.sg.gf) != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "[deepseek4] cached hc-pre compute failed layer %d ffn\n", il);
+                return false;
+            }
+            ffn_in_backend = cached.sg.hidden_states;
+            ffn_post_backend = cached.post;
+            ffn_comb_backend = cached.comb;
+        } else if (use_backend_decode_hc_pre &&
             ds4_hc_hip_direct_enabled() &&
             ds4_try_gpu_hc_pre(ffn_working.data(), hc_post.data(), hc_comb.data(),
                                hc_state.data(), hc_lw.ffn.scale_data.data(), hc_lw.ffn.base_data.data(), L.hc_ffn_fn,
@@ -3155,23 +3311,45 @@ bool deepseek4_step_layer_range(
                 return false;
             }
 
-            const auto ffn_read_t0 = Ds4TimingClock::now();
-            ggml_backend_tensor_get(ffn_out, ffn_out_host.data(), 0, sizeof(float) * ffn_out_host.size());
-            if (telemetry) telemetry->ffn_read_us += ds4_elapsed_us(ffn_read_t0, Ds4TimingClock::now());
+            if (use_backend_decode_hc_graph) {
+                if (hc_state_backend != cached_decode_hc_post_graph.residual_hc) {
+                    ggml_backend_tensor_copy(hc_state_backend, cached_decode_hc_post_graph.residual_hc);
+                }
+                ggml_backend_tensor_copy(ffn_out, cached_decode_hc_post_graph.block_out);
+                ggml_backend_tensor_copy(ffn_post_backend, cached_decode_hc_post_graph.post);
+                ggml_backend_tensor_copy(ffn_comb_backend, cached_decode_hc_post_graph.comb);
+                const auto hc_post_ffn_t0 = Ds4TimingClock::now();
+                if (ggml_backend_graph_compute(backend, cached_decode_hc_post_graph.sg.gf) != GGML_STATUS_SUCCESS) {
+                    std::fprintf(stderr, "[deepseek4] cached hc-post compute failed layer %d ffn\n", il);
+                    return false;
+                }
+                hc_state_backend = cached_decode_hc_post_graph.sg.hidden_states;
+                if (telemetry) telemetry->hc_post_ffn_us += ds4_elapsed_us(hc_post_ffn_t0, Ds4TimingClock::now());
+            } else {
+                const auto ffn_read_t0 = Ds4TimingClock::now();
+                ggml_backend_tensor_get(ffn_out, ffn_out_host.data(), 0, sizeof(float) * ffn_out_host.size());
+                if (telemetry) telemetry->ffn_read_us += ds4_elapsed_us(ffn_read_t0, Ds4TimingClock::now());
+            }
 
             // ── HC post (FFN) ───────────────────────────────────────
-            const auto hc_post_ffn_t0 = Ds4TimingClock::now();
-            hc_post_batch(next_hc,
-                          ffn_out_host.data(),
-                          hc_state.data(),
-                          hc_post.data(),
-                          hc_comb.data(),
-                          n_tokens,
-                          n_embd,
-                          n_hc);
-            std::memcpy(hc_state.data(), next_hc.data(), next_hc.size() * sizeof(float));
-            if (telemetry) telemetry->hc_post_ffn_us += ds4_elapsed_us(hc_post_ffn_t0, Ds4TimingClock::now());
+            if (!use_backend_decode_hc_graph) {
+                const auto hc_post_ffn_t0 = Ds4TimingClock::now();
+                hc_post_batch(next_hc,
+                              ffn_out_host.data(),
+                              hc_state.data(),
+                              hc_post.data(),
+                              hc_comb.data(),
+                              n_tokens,
+                              n_embd,
+                              n_hc);
+                std::memcpy(hc_state.data(), next_hc.data(), next_hc.size() * sizeof(float));
+                if (telemetry) telemetry->hc_post_ffn_us += ds4_elapsed_us(hc_post_ffn_t0, Ds4TimingClock::now());
+            }
         }
+    }
+
+    if (use_backend_decode_hc_graph && hc_state_backend) {
+        ggml_backend_tensor_get(hc_state_backend, hc_state.data(), 0, sizeof(float) * hc_state.size());
     }
 
     // ── Output: HC pre → norm → lm_head (or return hidden state) ────────
