@@ -64,6 +64,12 @@ struct HcCudaScratch {
 std::mutex g_mu;
 HcCudaScratch g_scratch;
 
+void hc_log_cuda_error(const char * label, cudaError_t err) {
+    if (err != cudaSuccess) {
+        std::fprintf(stderr, "[deepseek4-hc-direct] %s: %s\n", label, cudaGetErrorString(err));
+    }
+}
+
 __global__ void hc_sumsq_kernel(const float * x, int n, float * sums) {
     __shared__ float smem[kThreads];
     const int tid = threadIdx.x;
@@ -427,14 +433,17 @@ bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
 
     std::lock_guard<std::mutex> lock(g_mu);
     if (!g_scratch.ensure((size_t) hc_dim, (size_t) n_embd, (size_t) n_hc)) {
+        std::fprintf(stderr, "[deepseek4-hc-direct] ensure failed\n");
         return false;
     }
     if (cudaMemcpy(g_scratch.d_scale, scale_host, sizeof(float) * (size_t) mix_dim,
                    cudaMemcpyHostToDevice) != cudaSuccess) {
+        hc_log_cuda_error("copy scale", cudaGetLastError());
         return false;
     }
     if (cudaMemcpy(g_scratch.d_base, base_host, sizeof(float) * (size_t) mix_dim,
                    cudaMemcpyHostToDevice) != cudaSuccess) {
+        hc_log_cuda_error("copy base", cudaGetLastError());
         return false;
     }
 
@@ -445,7 +454,11 @@ bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
         mix_dim,
         eps,
         g_scratch.d_mix);
-    if (cudaGetLastError() != cudaSuccess) return false;
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        hc_log_cuda_error("mix kernel", err);
+        return false;
+    }
 
     hc_finish_kernel<<<1, kThreads>>>(
         static_cast<const float *>(hc_state_device),
@@ -458,9 +471,18 @@ bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
         static_cast<float *>(working_device),
         static_cast<float *>(post_device),
         static_cast<float *>(comb_device));
-    if (cudaGetLastError() != cudaSuccess) return false;
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        hc_log_cuda_error("finish kernel", err);
+        return false;
+    }
 
-    return cudaDeviceSynchronize() == cudaSuccess;
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        hc_log_cuda_error("device sync", err);
+        return false;
+    }
+    return true;
 }
 
 } // namespace dflash::common
