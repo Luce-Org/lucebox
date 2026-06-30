@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cmath>
 #include <mutex>
 #include <vector>
