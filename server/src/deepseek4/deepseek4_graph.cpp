@@ -1190,6 +1190,11 @@ static bool ds4_backend_is_hip(ggml_backend_t backend) {
 
 static bool ds4_hc_hip_decode_enabled() {
     const char * value = std::getenv("DFLASH_DS4_HC_HIP_DECODE");
+    return !value || !value[0] || std::strcmp(value, "0") != 0;
+}
+
+static bool ds4_hc_hip_direct_enabled() {
+    const char * value = std::getenv("DFLASH_DS4_HC_HIP_DIRECT");
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
@@ -2869,6 +2874,7 @@ bool deepseek4_step_layer_range(
         // ── HC pre (attention) ──────────────────────────────────────
         const auto hc_pre_attn_t0 = Ds4TimingClock::now();
         if (use_backend_decode_hc_pre &&
+            ds4_hc_hip_direct_enabled() &&
             ds4_try_gpu_hc_pre(cur.data(), hc_post.data(), hc_comb.data(),
                                hc_state.data(), hc_lw.attn.scale_data.data(), hc_lw.attn.base_data.data(), L.hc_attn_fn,
                                n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps)) {
@@ -3064,6 +3070,7 @@ bool deepseek4_step_layer_range(
         // ── HC pre (FFN) ────────────────────────────────────────────
         const auto hc_pre_ffn_t0 = Ds4TimingClock::now();
         if (use_backend_decode_hc_pre &&
+            ds4_hc_hip_direct_enabled() &&
             ds4_try_gpu_hc_pre(ffn_working.data(), hc_post.data(), hc_comb.data(),
                                hc_state.data(), hc_lw.ffn.scale_data.data(), hc_lw.ffn.base_data.data(), L.hc_ffn_fn,
                                n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps)) {
