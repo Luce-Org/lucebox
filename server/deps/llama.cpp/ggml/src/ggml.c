@@ -6262,6 +6262,7 @@ struct ggml_tensor * ggml_gated_delta_net(
     // roll back SSM state to the accepted prefix without a full replay forward pass.
     const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + S_v * n_seqs + S_v * n_tokens * n_seqs, 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    ggml_set_op_params_i32(result, 1, 0);
 
     result->op     = GGML_OP_GATED_DELTA_NET;
     result->src[0] = q;
@@ -6271,6 +6272,19 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[4] = beta;
     result->src[5] = state;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state) {
+    struct ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, g, beta, state);
+    ggml_set_op_params_i32(result, 1, 1);
     return result;
 }
 
