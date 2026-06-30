@@ -380,42 +380,27 @@ bool Qwen35MoeBackend::spark_bootstrap_finalize(const std::string & profile_path
 }
 
 bool Qwen35MoeBackend::post_kvflash_init_gate() {
-    // Gate: disable the KVFlash pool when dynamic placement confirmed all experts
-    // are hot (0 cold experts).  When all-hot, load_target_model takes the
-    // early-return path (load_target_gguf, no moe_hybrid), so moe_hybrid is null.
-    // The old byte-math fit check cannot fire on that path — it bails on
-    // !moe_hybrid.  Instead we use placement_all_hot_, set by load_target_model
-    // exactly when placement.total_hot >= n_layer * n_expert.
-    //
-    // Secondary path: if moe_hybrid IS set (partial cold), count actual cold
-    // experts.  If somehow 0 cold made it through (shouldn't happen, but be safe),
-    // also gate off.
+    // Disable KVFlash only when the final placement proves it is redundant. If
+    // hybrid storage exists, its actual cold count wins over the pre-cap
+    // all_hot_full_kv flag; DFLASH_EXPERT_BUDGET_MB is applied after that flag.
     if (!kvflash_active()) return true;
 
-    bool should_disable = false;
-
-    if (placement_all_hot_full_kv_) {
-        // KVFlash genuinely redundant: all experts fit hot even with the FULL
-        // max_ctx KV reservation, so the pool reserves nothing useful — disable
-        // it (pool would be pure slot-map overhead).  NOTE: placement_all_hot_
-        // (without _full_kv_) can be true because the POOL freed the VRAM that
-        // kept experts hot — in that case we must KEEP kvflash, hence the check
-        // on _full_kv_ here, not placement_all_hot_.
-        should_disable = true;
-    } else if (target_weights().moe_hybrid) {
-        // Partial placement: count actual cold experts from the hybrid storage.
-        int total_cold = 0;
+    const bool has_hybrid = (bool)target_weights().moe_hybrid;
+    int total_cold = 0;
+    if (has_hybrid) {
         for (const auto & ls : target_weights().moe_hybrid->layers) {
             total_cold += (int)ls.cold_expert_ids.size();
         }
-        if (total_cold == 0) {
-            // Hybrid storage built but no cold experts — pool not needed.
-            should_disable = true;
-        }
-        // else: genuine cold experts present → kvflash stays active.
     }
-    // else: moe_hybrid null AND placement_all_hot_ false → dense model (no MoE);
-    //       the base class gate is a no-op for dense, leave kvflash as-is.
+    const char * force_env = std::getenv("DFLASH_KVFLASH_FORCE");
+    const bool force_pool = force_env && std::atoi(force_env) != 0;
+
+    const bool should_disable = dflash::common::kvflash_moe_should_disable_pool(
+        /*kvflash_active=*/true,
+        placement_all_hot_full_kv_,
+        has_hybrid,
+        total_cold,
+        force_pool);
 
     if (should_disable) {
         std::printf("[kvflash] disabled: placement all-hot at max_ctx %d, pool not needed\n",
@@ -425,6 +410,9 @@ bool Qwen35MoeBackend::post_kvflash_init_gate() {
         kvflash_tau_    = 64;
         kvflash_drafter_path_.clear();
         kvflash_pin_spans_.clear();
+    } else if (force_pool && placement_all_hot_full_kv_ && total_cold == 0) {
+        std::printf("[kvflash] force: keeping all-hot pool active for control gate\n");
+        std::fflush(stdout);
     }
     return true;
 }
@@ -876,6 +864,8 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
     int committed = 0;
     const bool kvf_paged = kvflash_active() &&
         prompt_len > kvflash_tokens_ - kvflash_pager_.chunk_tokens();
+    int pooled_snap_boundary = -1;
+    bool pooled_snap_saved = false;
     if (kvf_paged) {
         kvflash_pager_.reset();
         // Apply pins BEFORE the eviction loop so pinned chunks survive
@@ -885,10 +875,22 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                     "(%d-token chunks, evicting)\n",
                     prompt_len, kvflash_pager_.chunk_tokens());
         std::fflush(stdout);
-        if (!chunked_prefill(req.prompt.data(), 0, prompt_len, act_cur, committed)) {
+        if (req.snap_slot >= 0 && req.snap_pos > 0 && req.snap_pos < prompt_len) {
+            const int cfg_chunk = kvflash_pager_.chunk_tokens();
+            pooled_snap_boundary = (req.snap_pos / cfg_chunk) * cfg_chunk;
+            if (pooled_snap_boundary <= 0) pooled_snap_boundary = -1;
+        }
+        if (!chunked_prefill(req.prompt.data(), 0, prompt_len, act_cur, committed,
+                             req.snap_slot, pooled_snap_boundary,
+                             &pooled_snap_saved)) {
             result.error = "kvf_paged_prefill";
             cleanup_graphs();
             return result;
+        }
+        if (pooled_snap_boundary > 0 && !pooled_snap_saved) {
+            std::fprintf(stderr,
+                "[snap] hybrid pooled boundary save failed at snap_boundary=%d\n",
+                pooled_snap_boundary);
         }
         kvflash_history_.assign(req.prompt.begin(), req.prompt.end());
         kvflash_pager_.zero_free_blocks();
@@ -1172,32 +1174,14 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             }
         } else {
             std::fprintf(stderr, "[snap] hybrid boundary logits failed at cur_pos=%d\n",
-                         committed);
+                     committed);
         }
-    } else if (req.snap_slot >= 0 && req.snap_pos > 0 &&
-               kvf_paged && req.snap_pos <= committed) {
-        // Pooled prefill: the full prompt has been committed (committed == prompt_len),
-        // but snap_pos is a chat-marker boundary inside the prompt. Serialize only
-        // the chunks [0, floor(snap_pos,chunk_tokens)/chunk_tokens) via the
-        // inherited helper, then restore cur_pos to committed so decode can continue.
-        const int cfg_chunk = kvflash_pager_.chunk_tokens();
-        const int snap_boundary = (req.snap_pos / cfg_chunk) * cfg_chunk;
-        if (snapshot_save_pooled_at(req.snap_slot, snap_boundary)) {
-            std::printf("[snap] hybrid pooled boundary slot=%d cur_pos=%d "
-                        "(req snap_pos=%d)\n",
-                        req.snap_slot, snap_boundary, req.snap_pos);
-            std::fflush(stdout);
-        } else {
-            std::fprintf(stderr,
-                "[snap] hybrid pooled boundary save failed at snap_boundary=%d\n",
-                snap_boundary);
-        }
-        // Restore cur_pos to committed so decode sees the full prefilled context.
-        target_cache().cur_pos = committed;
     } else if (req.snap_slot >= 0 && req.snap_pos > 0) {
-        std::fprintf(stderr,
-                     "[snap] hybrid skip unsafe boundary slot=%d req_snap_pos=%d cur_pos=%d\n",
-                     req.snap_slot, req.snap_pos, committed);
+        if (!pooled_snap_saved) {
+            std::fprintf(stderr,
+                         "[snap] hybrid skip unsafe boundary slot=%d req_snap_pos=%d cur_pos=%d\n",
+                         req.snap_slot, req.snap_pos, committed);
+        }
     }
 
     // ── Hybrid Decode ──
@@ -1575,7 +1559,25 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
         // Residual delta-prefill [snap_pos, prompt_len): batched (~1 s vs ~34 s
         // per-token).  hybrid_forward_batch's alloc_span/slot_of populate the
         // page table for decode; [0, snap_pos) is already mapped above.
-        if (!chunked_prefill(req.prompt.data(), snap_pos, prompt_len, act_cur, committed)) {
+        // FIX(snapshot-chain): re-snapshot the GROWN prefix for the NEXT turn.
+        // The cold path (generate_impl) passes snap_slot/boundary so chunked_prefill
+        // snapshots AT the chunk boundary (cur_pos==boundary -> recurrent state
+        // correct); the restore path historically omitted them, so after turn 1 no
+        // new snapshot was committed (snap=MISSING) and the warm-restore chain died.
+        // The boundary must fall in the suffix (snap_pos, prompt_len) to be hit by
+        // the chunk loop; it is chunk-aligned to match the loop stride.
+        int  resnap_boundary = -1;
+        bool resnap_saved    = false;
+        if (kvflash_active() && req.snap_slot >= 0) {
+            const int cfg_chunk = kvflash_pager_.chunk_tokens();
+            if (cfg_chunk > 0) {
+                resnap_boundary = (req.snap_pos / cfg_chunk) * cfg_chunk;
+                if (resnap_boundary <= snap_pos || resnap_boundary >= prompt_len)
+                    resnap_boundary = -1;
+            }
+        }
+        if (!chunked_prefill(req.prompt.data(), snap_pos, prompt_len, act_cur, committed,
+                             req.snap_slot, resnap_boundary, &resnap_saved)) {
             result.error = "prefill_delta";
             return result;
         }
@@ -1755,13 +1757,32 @@ bool Qwen35MoeBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
 // kvf_paged branch and restore_and_generate_impl's residual delta.
 bool Qwen35MoeBackend::chunked_prefill(const int32_t * tokens, int start_pos,
                                        int end_pos, std::vector<float> & act_cur,
-                                       int & committed) {
+                                       int & committed,
+                                       int snap_slot, int snap_boundary,
+                                       bool * snap_saved) {
+    if (snap_saved) *snap_saved = false;
     const int ct = kvflash_active()
         ? kvflash_pager_.chunk_tokens()
         : std::min(128, end_pos - start_pos);
     std::vector<int32_t> chunk_argmax;
     for (int start = start_pos; start < end_pos; start += ct) {
         const int n = std::min(ct, end_pos - start);
+        if (snap_slot >= 0 && snap_boundary > 0 && start == snap_boundary) {
+            target_cache().cur_pos = start;
+            if (snapshot_save_pooled_at(snap_slot, snap_boundary)) {
+                if (snap_saved) *snap_saved = true;
+                std::printf("[snap] hybrid pooled boundary slot=%d cur_pos=%d "
+                            "(chunk start)\n",
+                            snap_slot, snap_boundary);
+                std::fflush(stdout);
+            } else {
+                std::fprintf(stderr,
+                    "[snap] hybrid pooled boundary save failed at snap_boundary=%d\n",
+                    snap_boundary);
+            }
+            snap_slot = -1;
+            snap_boundary = -1;
+        }
         if (!hybrid_forward_batch(tokens + start, n, start, act_cur, chunk_argmax,
                                   /*capture_features=*/true))
             return false;

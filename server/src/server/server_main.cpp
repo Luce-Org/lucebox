@@ -222,6 +222,8 @@ static void print_usage(const char * prog) {
         "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
         "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
+        "  --kvflash <N|auto>  Enable bounded KV residency pool\n"
+        "  --kvflash-force     Keep KVFlash active even when MoE placement is all-hot\n"
         "  --fast-rollback     Enable speculative fast rollback (default: on)\n"
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
         "  --ddtree             Enable DDTree speculative decode\n"
@@ -451,6 +453,8 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             ::setenv("DFLASH_KVFLASH", argv[i], 1);
+        } else if (std::strcmp(argv[i], "--kvflash-force") == 0) {
+            ::setenv("DFLASH_KVFLASH_FORCE", "1", 1);
         } else if (std::strcmp(argv[i], "--kvflash-policy") == 0 && i + 1 < argc) {
             ++i;
             if (std::strcmp(argv[i], "drafter") != 0 && std::strcmp(argv[i], "lru") != 0 &&

@@ -2898,8 +2898,9 @@ void HttpServer::worker_loop() {
 
         // Confirm or abort the full-prompt snapshot.
         if (full_snap_prepared) {
-            if (completion_tokens > 0 && visible_output_seen && !client_disconnected &&
-                backend_.snapshot_used(full_snap_slot)) {
+            if (prefix_cache_should_commit_snapshot(
+                    result.ok, completion_tokens, client_disconnected,
+                    backend_.snapshot_used(full_snap_slot))) {
                 int saved_pos = backend_.snapshot_cur_pos(full_snap_slot);
                 if (saved_pos > 0) {
                     prefix_cache_.confirm_full_snap(full_snap_slot, req.prompt_tokens,
@@ -2914,8 +2915,9 @@ void HttpServer::worker_loop() {
 
         // Confirm or abort the inline snapshot.
         if (snap_prepared) {
-            if (completion_tokens > 0 && visible_output_seen && !client_disconnected &&
-                backend_.snapshot_used(snap_slot)) {
+            if (prefix_cache_should_commit_snapshot(
+                    result.ok, completion_tokens, client_disconnected,
+                    backend_.snapshot_used(snap_slot))) {
                 prefix_cache_.confirm_inline_snap(snap_slot, snap_cut, effective_prompt);
                 // Track for shutdown save.
                 slot_tokens_[snap_slot] = std::vector<int32_t>(

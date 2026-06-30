@@ -108,7 +108,9 @@ private:
     // Chunked prefill of tokens[start_pos, end_pos) via hybrid_forward_batch
     // slices; advances committed/cur_pos/last_tok. False on forward failure.
     bool chunked_prefill(const int32_t * tokens, int start_pos, int end_pos,
-                         std::vector<float> & act_cur, int & committed);
+                         std::vector<float> & act_cur, int & committed,
+                         int snap_slot = -1, int snap_boundary = -1,
+                         bool * snap_saved = nullptr);
 
     // Pipelined decode: uses cached DeltaNet graphs + optimized FFN loop
     bool run_pipelined_decode_path(int committed, int n_gen,

@@ -51,4 +51,23 @@ inline KvfPlacementDecision kvflash_placement_decision(
     return d;
 }
 
+// MoE KVFlash post-init gate.
+//
+// If hybrid storage exists, the actual hot/cold split is authoritative. Manual
+// expert-budget caps are applied after all_hot_full_kv is computed, so the flag
+// can be stale while real cold experts exist. In that case KVFlash must stay on
+// or the paged warm-restore path is unreachable.
+// force_pool keeps the pool alive for explicit all-hot control gates while
+// preserving the default "disable redundant pool" production behavior.
+inline bool kvflash_moe_should_disable_pool(
+    bool kvflash_active, bool all_hot_full_kv,
+    bool has_hybrid, int total_cold_experts,
+    bool force_pool = false)
+{
+    if (!kvflash_active) return false;
+    if (force_pool) return false;
+    if (has_hybrid) return total_cold_experts <= 0;
+    return all_hot_full_kv;
+}
+
 } // namespace dflash::common

@@ -2332,6 +2332,34 @@ static void test_scope_override_preserves_compress() {
     TEST_ASSERT(server4.mode == DiskPrefixCacheMode::Full);
 }
 
+static void test_prefix_cache_commit_allows_invisible_completion() {
+    TEST_ASSERT(prefix_cache_should_commit_snapshot(
+        /*result_ok=*/true,
+        /*completion_tokens=*/1,
+        /*client_disconnected=*/false,
+        /*snapshot_used=*/true));
+    TEST_ASSERT(!prefix_cache_should_commit_snapshot(
+        /*result_ok=*/false,
+        /*completion_tokens=*/1,
+        /*client_disconnected=*/false,
+        /*snapshot_used=*/true));
+    TEST_ASSERT(!prefix_cache_should_commit_snapshot(
+        /*result_ok=*/true,
+        /*completion_tokens=*/0,
+        /*client_disconnected=*/false,
+        /*snapshot_used=*/true));
+    TEST_ASSERT(!prefix_cache_should_commit_snapshot(
+        /*result_ok=*/true,
+        /*completion_tokens=*/1,
+        /*client_disconnected=*/true,
+        /*snapshot_used=*/true));
+    TEST_ASSERT(!prefix_cache_should_commit_snapshot(
+        /*result_ok=*/true,
+        /*completion_tokens=*/1,
+        /*client_disconnected=*/false,
+        /*snapshot_used=*/false));
+}
+
 static void test_disk_cache_fixed_boundary() {
     DiskPrefixCachePolicy policy;
     TEST_ASSERT(parse_disk_prefix_cache_policy("1000", policy));
@@ -4120,6 +4148,7 @@ int main() {
     RUN_TEST(test_disk_cache_config_defaults);
     RUN_TEST(test_disk_cache_policy_parse);
     RUN_TEST(test_scope_override_preserves_compress);
+    RUN_TEST(test_prefix_cache_commit_allows_invisible_completion);
     RUN_TEST(test_disk_cache_fixed_boundary);
     RUN_TEST(test_disk_cache_auto_boundary_lcp);
     RUN_TEST(test_disk_cache_auto_window_limits_history);

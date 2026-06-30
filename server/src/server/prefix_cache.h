@@ -45,6 +45,19 @@ std::vector<int> find_all_boundaries(const std::vector<int32_t> & ids,
 using PrefixHash = std::array<uint8_t, 16>;
 PrefixHash hash_prefix(const int32_t * ids, int count);
 
+// A prompt snapshot is valid if the request completed, produced at least one
+// token, the client stayed connected, and the backend actually saved the slot.
+// Visibility is not part of this predicate: the snapshot captures the prompt
+// boundary before decode, so special-only or otherwise hidden completions still
+// leave a correct reusable prefix.
+inline bool prefix_cache_should_commit_snapshot(
+    bool result_ok, int completion_tokens,
+    bool client_disconnected, bool snapshot_used)
+{
+    return result_ok && completion_tokens > 0 &&
+        !client_disconnected && snapshot_used;
+}
+
 // ─── Prefix cache entry ─────────────────────────────────────────────────
 
 struct FullCacheEntry {

@@ -157,8 +157,8 @@ protected:
     bool snapshot_is_pooled(int slot) const;
     const std::vector<uint8_t> & snapshot_kvflash_blob(int slot) const;
     // Save a pooled snapshot covering only chunks [0, snap_boundary/chunk_tokens).
-    // Used by subclasses (e.g. MoE) that complete the full prefill before seeing
-    // the snap boundary, but still want to cache the prefix up to that boundary.
+    // The live recurrent state must already correspond to snap_boundary; this
+    // helper only limits the serialized KV pager range.
     // Returns true if the snapshot was committed successfully.
     bool snapshot_save_pooled_at(int slot, int snap_boundary);
 

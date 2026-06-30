@@ -458,12 +458,15 @@ bool Qwen35Backend::snapshot_save_pooled_at(int slot, int snap_boundary) {
     const int cfg_chunk = kvflash_pager_.chunk_tokens();
     const int max_chunks = snap_boundary / cfg_chunk;
     if (max_chunks <= 0) return false;
-    const int saved_cur_pos = cache_.cur_pos;
-    cache_.cur_pos = snap_boundary;
+    if (cache_.cur_pos != snap_boundary) {
+        std::fprintf(stderr,
+            "[snap] pooled boundary mismatch: cur_pos=%d snap_boundary=%d\n",
+            cache_.cur_pos, snap_boundary);
+        return false;
+    }
     std::vector<uint8_t> blob = kvflash_pager_.serialize(max_chunks);
     PrefixSnapshot & snap = prefix_snapshots_[slot];
     if (!snapshot_target_cache(w_, cache_, snap_backend_, snap, /*skip_kv=*/true, &blob)) {
-        cache_.cur_pos = saved_cur_pos;
         return false;
     }
     snap.is_pooled    = true;
