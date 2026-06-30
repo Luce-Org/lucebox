@@ -918,6 +918,7 @@ static ggml_tensor * build_delta_net_block(
 
     ggml_tensor * output = nullptr;
     ggml_tensor * new_state = nullptr;
+    const bool pure_ar = !use_chunked && parent_ids == nullptr && cap == nullptr && persist_inter == nullptr;
 
     if (use_chunked) {
         auto r = build_delta_net_chunked(ctx, q_c, k_c, v_c, g_tensor, beta, s);
@@ -933,12 +934,12 @@ static ggml_tensor * build_delta_net_block(
             ? ggml_gated_delta_net_tree_persist(ctx, q_c, k_c, v_c, g_tensor, beta, s, parent_ids, persist_inter)
             : ggml_gated_delta_net_tree(ctx, q_c, k_c, v_c, g_tensor, beta, s, parent_ids);
     } else {
-        // Non-tree (chain/prefill). When capture is requested, set src[7] so
-        // the kernel writes per-token intermediates directly to the persistent
-        // cache buffer — same mechanism as _tree_persist, but without tree
-        // parent_ids. Avoids the legacy result-region cpy (and the OOB it
-        // could cause if the result tensor has no embedded intermediate region).
-        result = ggml_gated_delta_net(ctx, q_c, k_c, v_c, g_tensor, beta, s);
+        // Non-tree (chain/prefill). Pure AR writes the final recurrent state
+        // in-place; capture paths keep the regular op and attach src[7] so the
+        // kernel writes per-token intermediates directly to persistent cache.
+        result = pure_ar
+            ? ggml_gated_delta_net_inplace(ctx, q_c, k_c, v_c, g_tensor, beta, s)
+            : ggml_gated_delta_net(ctx, q_c, k_c, v_c, g_tensor, beta, s);
         if (persist_inter) {
             result->src[7] = persist_inter;
         }
@@ -965,8 +966,11 @@ static ggml_tensor * build_delta_net_block(
         S_v * S_v * H_v * r_elt,
         S_v * H_v * n_seq_tokens * n_seqs * r_elt);
 
-    // Persist new_state back to cache
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, ssm_state));
+    // In pure AR, ggml_gated_delta_net_inplace writes the final recurrent state
+    // directly into ssm_state, so the explicit copy is redundant.
+    if (!pure_ar) {
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, ssm_state));
+    }
 
     // Expose per-step intermediate states for spec-decode rollback. The patched
     // ggml_gated_delta_net kernel appends an intermediate-states region to the
