@@ -155,7 +155,8 @@ bool build_layer_prefn_step(
         sg.ctx, sg.gf, w, cache, layer_idx,
         sg.inp_embed, sg.positions, sg.attn_mask,
         kv_start, n_tokens, fa_window,
-        sg.kv_write_rows);
+        sg.kv_write_rows,
+        /*skip_gdn_intermediate=*/true);
     if (!go.residual || !go.post) return false;
     sg.ffn_residual = go.residual;
     sg.ffn_post = go.post;
