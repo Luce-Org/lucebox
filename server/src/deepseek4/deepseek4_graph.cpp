@@ -2863,6 +2863,8 @@ bool deepseek4_step_layer_range(
         const HcLayerWeightsCpu & hc_lw = hc_layer_weights_range[(size_t)il];
         const bool use_backend_decode_hc_pre =
             reuse_decode_graphs && ds4_backend_is_hip(backend) && ds4_hc_hip_decode_enabled();
+        const ggml_tensor * attn_in_backend = nullptr;
+        const ggml_tensor * ffn_in_backend = nullptr;
 
         // ── HC pre (attention) ──────────────────────────────────────
         const auto hc_pre_attn_t0 = Ds4TimingClock::now();
@@ -2887,7 +2889,7 @@ bool deepseek4_step_layer_range(
                 std::fprintf(stderr, "[deepseek4] cached hc-pre compute failed layer %d attn\n", il);
                 return false;
             }
-            ggml_backend_tensor_get(cached.sg.hidden_states, cur.data(), 0, sizeof(float) * (size_t)n_embd);
+            attn_in_backend = cached.sg.hidden_states;
             ggml_backend_tensor_get(cached.post, hc_post.data(), 0, sizeof(float) * (size_t)n_hc);
             ggml_backend_tensor_get(cached.comb, hc_comb.data(), 0, sizeof(float) * (size_t)n_hc * (size_t)n_hc);
         } else {
@@ -2945,7 +2947,11 @@ bool deepseek4_step_layer_range(
                 const int64_t raw_row = kv_start % w.n_swa;
                 const int32_t rope_pos = kv_start;
                 const int32_t neg_pos = -kv_start;
-                ggml_backend_tensor_set(cached_attn->sg.inp_embed, cur.data(), 0, sizeof(float) * cur.size());
+                if (attn_in_backend) {
+                    ggml_backend_tensor_copy(attn_in_backend, cached_attn->sg.inp_embed);
+                } else {
+                    ggml_backend_tensor_set(cached_attn->sg.inp_embed, cur.data(), 0, sizeof(float) * cur.size());
+                }
                 ggml_backend_tensor_set(cached_attn->inputs.rope_pos, &rope_pos, 0, sizeof(rope_pos));
                 ggml_backend_tensor_set(cached_attn->inputs.neg_pos, &neg_pos, 0, sizeof(neg_pos));
                 ggml_backend_tensor_set(cached_attn->inputs.raw_kv_rows, &raw_row, 0, sizeof(raw_row));
@@ -3016,7 +3022,11 @@ bool deepseek4_step_layer_range(
                     return false;
                 }
                 if (telemetry) telemetry->attn_build_us += ds4_elapsed_us(attn_build_t0, Ds4TimingClock::now());
-                ggml_backend_tensor_set(inp, cur.data(), 0, sizeof(float) * cur.size());
+                if (attn_in_backend) {
+                    ggml_backend_tensor_copy(attn_in_backend, inp);
+                } else {
+                    ggml_backend_tensor_set(inp, cur.data(), 0, sizeof(float) * cur.size());
+                }
                 for (const auto & b : i32_inputs)
                     ggml_backend_tensor_set(b.tensor, &b.value, 0, sizeof(b.value));
                 for (const auto & b : i32_array_inputs)
@@ -3074,7 +3084,7 @@ bool deepseek4_step_layer_range(
                 std::fprintf(stderr, "[deepseek4] cached hc-pre compute failed layer %d ffn\n", il);
                 return false;
             }
-            ggml_backend_tensor_get(cached.sg.hidden_states, ffn_working.data(), 0, sizeof(float) * (size_t)n_embd);
+            ffn_in_backend = cached.sg.hidden_states;
             ggml_backend_tensor_get(cached.post, hc_post.data(), 0, sizeof(float) * (size_t)n_hc);
             ggml_backend_tensor_get(cached.comb, hc_comb.data(), 0, sizeof(float) * (size_t)n_hc * (size_t)n_hc);
         } else {
@@ -3119,8 +3129,12 @@ bool deepseek4_step_layer_range(
             }
 
             ggml_tensor * ffn_out = cached.sg.hidden_states;
-            ggml_backend_tensor_set(cached.sg.inp_embed, ffn_working.data(), 0,
-                                    sizeof(float) * ffn_working.size());
+            if (ffn_in_backend) {
+                ggml_backend_tensor_copy(ffn_in_backend, cached.sg.inp_embed);
+            } else {
+                ggml_backend_tensor_set(cached.sg.inp_embed, ffn_working.data(), 0,
+                                        sizeof(float) * ffn_working.size());
+            }
             if (cached.hash_ids) {
                 ggml_backend_tensor_set(cached.hash_ids, hash_expert_ids_host.data(), 0,
                                         sizeof(int32_t) * hash_expert_ids_host.size());
