@@ -1391,7 +1391,8 @@ static bool build_cached_decode_hc_post_graph(
         return false;
     }
 
-    out.residual_hc = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_F32, w.n_embd, w.n_hc);
+    const int hc_dim = w.n_embd * w.n_hc;
+    out.residual_hc = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_F32, hc_dim, 1);
     out.block_out = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_F32, w.n_embd, 1);
     out.post = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_F32, w.n_hc, 1);
     out.comb = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_F32, w.n_hc, w.n_hc);
@@ -1402,14 +1403,18 @@ static bool build_cached_decode_hc_post_graph(
 
     out.sg.gf = ggml_new_graph_custom(out.sg.ctx, 256, false);
 
-    ggml_tensor * residual_t = ggml_cont(out.sg.ctx, ggml_transpose(out.sg.ctx, out.residual_hc));
+    ggml_tensor * residual_2d = ggml_reshape_2d(out.sg.ctx, out.residual_hc, w.n_embd, w.n_hc);
+    ggml_tensor * residual_t = ggml_cont(out.sg.ctx, ggml_transpose(out.sg.ctx, residual_2d));
     ggml_tensor * comb_t = ggml_cont(out.sg.ctx, ggml_transpose(out.sg.ctx, out.comb));
     ggml_tensor * mixed_t = ggml_mul_mat(out.sg.ctx, comb_t, residual_t);
     ggml_tensor * mixed = ggml_cont(out.sg.ctx, ggml_transpose(out.sg.ctx, mixed_t));
     ggml_tensor * post_t = ggml_cont(out.sg.ctx, ggml_transpose(out.sg.ctx, out.post));
     ggml_tensor * block_rep = ggml_repeat(out.sg.ctx, out.block_out, mixed);
     ggml_tensor * post_rep = ggml_repeat(out.sg.ctx, post_t, mixed);
-    out.sg.hidden_states = ggml_add(out.sg.ctx, mixed, ggml_mul(out.sg.ctx, block_rep, post_rep));
+    out.sg.hidden_states = ggml_reshape_2d(
+        out.sg.ctx,
+        ggml_add(out.sg.ctx, mixed, ggml_mul(out.sg.ctx, block_rep, post_rep)),
+        hc_dim, 1);
 
     ggml_set_output(out.sg.hidden_states);
     ggml_build_forward_expand(out.sg.gf, out.sg.hidden_states);
