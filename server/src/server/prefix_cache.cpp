@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <chrono>
+#include <utility>
 
 namespace dflash::common {
 
@@ -115,7 +116,10 @@ std::vector<int> find_all_boundaries(const std::vector<int32_t> & ids,
             }
         }
         found:
-        if (next_match < 0) break;
+        if (next_match < 0) {
+            cursor = end_idx + 1;
+            continue;
+        }
         int boundary = next_match + next_len;
         out.push_back(boundary);
         cursor = boundary;
@@ -192,6 +196,17 @@ PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer)
     std::fprintf(stderr, "[pc] enabled: cap=%d family=%s\n", cap_, markers_.family.c_str());
 }
 
+PrefixCache::PrefixCache(int cap, ChatMarkers markers)
+    : cap_(std::min(cap, MAX_SLOTS)), markers_(std::move(markers))
+{
+    if (cap_ <= 0) {
+        disabled_ = true;
+        cap_ = 0;
+        return;
+    }
+    disabled_ = false;
+}
+
 // ── LRU helpers ─────────────────────────────────────────────────────────
 
 int PrefixCache::find_entry(const PrefixHash & h) const {
@@ -257,10 +272,9 @@ std::pair<int, int> PrefixCache::prepare_inline_snap(
     auto candidates = find_all_boundaries(prompt_ids, markers_);
     if (candidates.empty()) return {-1, 0};
 
-    // Best cache point: second-to-last boundary (last completed assistant turn).
-    int target_cut = candidates.size() >= 2
-        ? candidates[candidates.size() - 2]
-        : candidates.back();
+    // Snapshot the newest completed boundary so replay-style conversations keep
+    // growing the cached prefix instead of reusing a stale ancestor forever.
+    int target_cut = candidates.back();
 
     auto key = hash_prefix(prompt_ids.data(), target_cut);
     if (find_entry(key) >= 0) return {-1, 0};  // already cached
