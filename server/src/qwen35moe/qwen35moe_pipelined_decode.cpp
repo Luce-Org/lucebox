@@ -68,7 +68,9 @@ static bool build_cached_deltanet_prefn(
     QwenLayerPrefnOutputs go = build_qwen35_layer_prefn(
         out.ctx, out.gf, w, cache, layer_idx,
         out.inp_embed, /*positions=*/nullptr, /*attn_mask=*/nullptr,
-        kv_start, /*n_tokens=*/1, /*fa_window=*/0);
+        kv_start, /*n_tokens=*/1, /*fa_window=*/0,
+        /*kv_write_rows=*/nullptr,
+        /*skip_gdn_intermediate=*/true);
     if (!go.residual || !go.post) { out.free(); return false; }
 
     out.ffn_residual = go.residual;
@@ -144,7 +146,8 @@ static bool build_cached_attn_prefn(
         out.ctx, out.gf, w, cache, layer_idx,
         out.inp_embed, out.positions, /*attn_mask=*/nullptr,
         /*kv_start=*/kv_win - 1, /*n_tokens=*/1, /*fa_window=*/0,
-        out.kv_write_rows);
+        out.kv_write_rows,
+        /*skip_gdn_intermediate=*/true);
     if (!go.residual || !go.post) { out.free(); return false; }
 
     out.ffn_residual = go.residual;

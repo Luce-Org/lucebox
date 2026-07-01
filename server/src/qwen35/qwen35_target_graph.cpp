@@ -747,7 +747,8 @@ static ggml_tensor * build_delta_net_block(
     ggml_tensor * ssm_state,      // [head_v_dim, head_v_dim, num_v_heads] persistent
     int n_tokens,
     DeltaNetCapture * cap,        // optional: populated on capture_delta_intermediate
-    ggml_tensor * parent_ids      // optional [n_tokens] i32; tree mode when non-null
+    ggml_tensor * parent_ids,     // optional [n_tokens] i32; tree mode when non-null
+    bool skip_gdn_intermediate
 ) {
     const int head_k_dim   = w.ssm_d_state;
     const int num_k_heads  = w.ssm_n_group;
@@ -756,6 +757,7 @@ static ggml_tensor * build_delta_net_block(
     const int conv_channels = w.ssm_d_inner + 2 * w.ssm_n_group * w.ssm_d_state;
     const int n_seqs       = 1;
     const int n_seq_tokens = n_tokens;
+    const bool can_skip_gdn_intermediate = skip_gdn_intermediate && !parent_ids && !cap;
 
     // ── qkv_mixed = wqkv @ cur         [10240, n_tokens]
     ggml_tensor * qkv_mixed = apply_scale2(ctx, ggml_mul_mat(ctx, L.wqkv, cur), L.wqkv_s);
@@ -899,7 +901,7 @@ static ggml_tensor * build_delta_net_block(
     // causing AL degradation and loopy output. Set DFLASH27B_CHUNKED=1 to
     // opt in for A/B testing while debugging.
     bool use_chunked = false;
-    if (!parent_ids && !cap && n_seq_tokens > 1) {
+    if (can_skip_gdn_intermediate && n_seq_tokens > 1) {
         if (const char * s_env = std::getenv("DFLASH27B_CHUNKED")) {
             use_chunked = (std::atoi(s_env) != 0);
         }
@@ -922,6 +924,9 @@ static ggml_tensor * build_delta_net_block(
             : (parent_ids
                 ? ggml_gated_delta_net_tree(ctx, q_c, k_c, v_c, g_tensor, beta, s, parent_ids)
                 : ggml_gated_delta_net     (ctx, q_c, k_c, v_c, g_tensor, beta, s));
+    if (can_skip_gdn_intermediate) {
+        ggml_gated_delta_net_set_skip_intermediate(result, true);
+    }
 
     // Slice output and new_state out of the packed result
     {
@@ -1074,7 +1079,8 @@ static ggml_tensor * build_single_layer(
         }
         cur = build_delta_net_block(ctx, gf, w, L, cur,
                                     cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
-                                    n_tokens, nullptr, nullptr);
+                                    n_tokens, nullptr, nullptr,
+                                    /*skip_gdn_intermediate=*/true);
     }
 
     cur = ggml_add(ctx, cur, inpSA);
@@ -1217,7 +1223,8 @@ QwenGraphOutputs build_qwen35_graph(
             }
             cur = build_delta_net_block(ctx, gf, w, L, cur,
                                         cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
-                                        n_tokens, cap_ptr, in.parent_ids);
+                                        n_tokens, cap_ptr, in.parent_ids,
+                                        /*skip_gdn_intermediate=*/true);
             dn_idx++;
         }
 
@@ -1372,7 +1379,8 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
     int                   kv_start,
     int                   n_tokens,
     int                   fa_window,
-    ggml_tensor *         kv_write_rows) {
+    ggml_tensor *         kv_write_rows,
+    bool                  skip_gdn_intermediate) {
     QwenLayerPrefnOutputs out{};
     const float eps = w.rms_eps;
     const TargetLayer & L = w.layers[layer_idx];
@@ -1402,7 +1410,8 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
         }
         cur = build_delta_net_block(ctx, gf, w, L, cur,
                                     cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
-                                    n_tokens, nullptr, nullptr);
+                                    n_tokens, nullptr, nullptr,
+                                    skip_gdn_intermediate);
     }
 
     cur = ggml_add(ctx, cur, inpSA);
