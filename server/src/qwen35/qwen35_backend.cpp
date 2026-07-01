@@ -1322,7 +1322,7 @@ void Qwen35Backend::kvflash_upload_mask() {
     const size_t need = (size_t)sg_.attn_mask->ne[0] * sg_.attn_mask->ne[1];
     if (kvflash_mask_buf_.size() != need || kvflash_pager_.epoch() != kvflash_mask_epoch_) {
         kvflash_mask_buf_.assign(need, F16_NEG_INF);
-        kvflash_pager_.fill_slot_mask_cached(kvflash_mask_buf_.data());  // q row 0; pager caches
+        kvflash_pager_.fill_slot_mask(kvflash_mask_buf_.data());  // q row 0; pager caches
         kvflash_mask_epoch_ = kvflash_pager_.epoch();
     }
     // Upload before EVERY compute: the input tensor's buffer region is
