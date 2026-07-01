@@ -2158,6 +2158,98 @@ static void test_kvflash_pager_identity_sync_contract() {
     TEST_ASSERT(local.slot_of(127) == 127);
 }
 
+static void test_kvflash_alloc_span_preserves_pending_suffix_chunks() {
+    KvFlashConfig cfg;
+    cfg.chunk_tokens = 4;
+    cfg.pool_tokens = 10 * cfg.chunk_tokens;
+    cfg.sink_chunks = 1;
+    cfg.tail_window_chunks = 4;
+
+    KvFlashPager pager;
+    TEST_ASSERT(pager.attach(cfg, {}, {}));
+    TEST_ASSERT(pager.alloc_span(0, cfg.pool_tokens));
+
+    pager.score_hook = [](int c) {
+        return c < 10 ? 1000.0f - (float)c : (float)c;
+    };
+
+    const int suffix_start = cfg.pool_tokens;
+    const int suffix_tokens =
+        (10 - cfg.sink_chunks - cfg.tail_window_chunks) * cfg.chunk_tokens;
+    TEST_ASSERT(pager.alloc_span(suffix_start, suffix_tokens));
+    for (int p = suffix_start; p < suffix_start + suffix_tokens; ++p) {
+        TEST_ASSERT_MSG(pager.slot_of(p) >= 0, "suffix position stayed resident");
+    }
+}
+
+static void test_kvflash_append_reservation_nested_release_keeps_live_span() {
+    KvFlashConfig cfg;
+    cfg.chunk_tokens = 4;
+    cfg.pool_tokens = 6 * cfg.chunk_tokens;
+    cfg.sink_chunks = 1;
+    cfg.tail_window_chunks = 0;
+
+    KvFlashPager pager;
+    TEST_ASSERT(pager.attach(cfg, {}, {}));
+    TEST_ASSERT(pager.alloc_span(0, cfg.pool_tokens));
+
+    auto first = pager.reserve_append_span(cfg.pool_tokens, 2 * cfg.chunk_tokens);
+    TEST_ASSERT(first.ok());
+    auto second = pager.reserve_append_span(cfg.pool_tokens + 2 * cfg.chunk_tokens,
+                                            2 * cfg.chunk_tokens);
+    TEST_ASSERT(second.ok());
+
+    first = KvFlashPager::AppendReservation{};
+
+    pager.score_hook = [](int c) {
+        return (c == 8 || c == 9) ? -1000.0f : 1000.0f + (float)c;
+    };
+    TEST_ASSERT(pager.reselect() >= 0);
+    for (int p = second.kv_start(); p < second.kv_start() + second.n_tokens(); ++p) {
+        TEST_ASSERT_MSG(pager.slot_of(p) >= 0, "live reservation stayed resident");
+    }
+}
+
+static void test_kvflash_pooled_suffix_prefill_plan_slot_mask() {
+    KvFlashConfig cfg;
+    cfg.chunk_tokens = 4;
+    cfg.pool_tokens = 10 * cfg.chunk_tokens;
+    cfg.sink_chunks = 1;
+    cfg.tail_window_chunks = 4;
+
+    KvFlashPager pager;
+    TEST_ASSERT(pager.attach(cfg, {}, {}));
+    TEST_ASSERT(pager.alloc_span(0, cfg.pool_tokens));
+
+    const int kv_start = cfg.pool_tokens;
+    const int n_tok = 12;
+    const int n_head_kv = 3;
+    const int mask_kv_dim = cfg.pool_tokens + 8;
+    auto plan = kvflash_prepare_pooled_suffix_prefill(
+        pager, kv_start, n_tok, n_head_kv,
+        mask_kv_dim, 32);
+    TEST_ASSERT(plan.ok());
+
+    TEST_ASSERT(plan.rows.size() == (size_t)n_tok * n_head_kv);
+    for (int h = 0; h < n_head_kv; ++h) {
+        for (int i = 0; i < n_tok; ++i) {
+            TEST_ASSERT(plan.rows[(size_t)h * n_tok + i] == pager.slot_of(kv_start + i));
+        }
+    }
+
+    std::vector<int32_t> slot_pos((size_t)cfg.pool_tokens, -1);
+    pager.fill_slot_pos(slot_pos.data());
+    constexpr uint16_t F16_ZERO = 0x0000, F16_NEG_INF = 0xFC00;
+    for (int q = 0; q < n_tok; ++q) {
+        const int abs_q = kv_start + q;
+        for (int s = 0; s < cfg.pool_tokens; ++s) {
+            const uint16_t got = plan.mask[(size_t)q * mask_kv_dim + s];
+            const bool want_open = slot_pos[(size_t)s] >= 0 && slot_pos[(size_t)s] <= abs_q;
+            TEST_ASSERT(got == (want_open ? F16_ZERO : F16_NEG_INF));
+        }
+    }
+}
+
 static void test_layer_split_kvflash_history_contract() {
     std::vector<int32_t> history;
     layer_split_kvflash_sync_history(history, {1, 2, 3}, 0);
@@ -4703,6 +4795,9 @@ int main() {
     RUN_TEST(test_target_shard_plan_mixed_backend_split);
     RUN_TEST(test_target_shard_plan_rejects_bad_local_backend);
     RUN_TEST(test_kvflash_pager_identity_sync_contract);
+    RUN_TEST(test_kvflash_alloc_span_preserves_pending_suffix_chunks);
+    RUN_TEST(test_kvflash_append_reservation_nested_release_keeps_live_span);
+    RUN_TEST(test_kvflash_pooled_suffix_prefill_plan_slot_mask);
     RUN_TEST(test_layer_split_kvflash_history_contract);
     RUN_TEST(test_backend_precision_cuda_sm_policy);
     RUN_TEST(test_backend_precision_hip_arch_policy);

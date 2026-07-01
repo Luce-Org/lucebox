@@ -84,6 +84,12 @@ struct KvFlashStats {
 };
 
 class KvFlashPager {
+    struct AppendProtectRange {
+        uint64_t id = 0;
+        int begin = -1;
+        int end = -1;
+    };
+
 public:
     // `attn_k` / `attn_v` are the per-full-attention-layer cache tensors,
     // each [head_dim, pool_tokens, n_head_kv]. All must share dims/types
@@ -184,6 +190,7 @@ public:
         cur_chunk_ = 0;
         epoch_++;
         has_pending_page_in_ = false;
+        append_protect_ranges_.clear();
     }
 
     // Zero every currently-free block. reset() drops mappings but leaves the
@@ -207,6 +214,94 @@ public:
     // Optional external relevance score; higher = keep. Falls back to LRU.
     std::function<float(int /*chunk*/)> score_hook;
 
+    class AppendReservation {
+    public:
+        AppendReservation() = default;
+        AppendReservation(const AppendReservation &) = delete;
+        AppendReservation & operator=(const AppendReservation &) = delete;
+        AppendReservation(AppendReservation && other) noexcept { move_from(other); }
+        AppendReservation & operator=(AppendReservation && other) noexcept {
+            if (this != &other) {
+                release();
+                move_from(other);
+            }
+            return *this;
+        }
+        ~AppendReservation() { release(); }
+
+        bool ok() const { return ok_; }
+        int kv_start() const { return kv_start_; }
+        int n_tokens() const { return n_tok_; }
+        int slot(int i) const {
+            return i >= 0 && i < (int)slots_.size() ? slots_[(size_t)i] : -1;
+        }
+
+    private:
+        friend class KvFlashPager;
+        AppendReservation(KvFlashPager & pager, int kv_start, int n_tok)
+            : pager_(&pager),
+              kv_start_(kv_start),
+              n_tok_(n_tok) {
+            if (n_tok <= 0 || pager.cfg_.chunk_tokens <= 0) {
+                pager_ = nullptr;
+                return;
+            }
+            protect_id_ = ++pager.append_protect_next_id_;
+            pager.append_protect_ranges_.push_back({
+                protect_id_,
+                kv_start / pager.cfg_.chunk_tokens,
+                (kv_start + n_tok - 1) / pager.cfg_.chunk_tokens,
+            });
+            slots_.resize((size_t)n_tok, -1);
+            for (int i = 0; i < n_tok; ++i) {
+                const int slot = pager.slot_for(kv_start + i);
+                if (slot < 0) {
+                    std::fprintf(stderr, "[kvflash] no pool slot at pos %d "
+                                         "(pool %d exhausted)\n",
+                                 kv_start + i, pager.cfg_.pool_tokens);
+                    release();
+                    return;
+                }
+                slots_[(size_t)i] = slot;
+            }
+            if (pager.has_pending_page_in_) pager.synchronize_paging();
+            ok_ = true;
+        }
+
+        void release() {
+            if (!pager_) return;
+            if (protect_id_ != 0) {
+                auto & ranges = pager_->append_protect_ranges_;
+                ranges.erase(std::remove_if(ranges.begin(), ranges.end(),
+                    [&](const AppendProtectRange & r) {
+                        return r.id == protect_id_;
+                    }), ranges.end());
+            }
+            pager_ = nullptr;
+            protect_id_ = 0;
+            ok_ = false;
+        }
+
+        void move_from(AppendReservation & other) {
+            pager_ = other.pager_;
+            kv_start_ = other.kv_start_;
+            n_tok_ = other.n_tok_;
+            protect_id_ = other.protect_id_;
+            slots_ = std::move(other.slots_);
+            ok_ = other.ok_;
+            other.pager_ = nullptr;
+            other.protect_id_ = 0;
+            other.ok_ = false;
+        }
+
+        KvFlashPager * pager_ = nullptr;
+        int kv_start_ = 0;
+        int n_tok_ = 0;
+        uint64_t protect_id_ = 0;
+        std::vector<int> slots_;
+        bool ok_ = false;
+    };
+
     // Allocate slots for [kv_start, kv_start + n_tok) ahead of a forward
     // step (evicting LRU/low-score chunks as needed). False — with a
     // diagnostic — if the pool has no evictable block left.
@@ -216,16 +311,12 @@ public:
     // issued, page_stream_ is synchronised here so that recalled KV data is
     // resident before the next attention forward.
     bool alloc_span(int kv_start, int n_tok) {
-        for (int i = 0; i < n_tok; ++i) {
-            if (slot_for(kv_start + i) < 0) {
-                std::fprintf(stderr, "[kvflash] no pool slot at pos %d "
-                                     "(pool %d exhausted)\n",
-                             kv_start + i, cfg_.pool_tokens);
-                return false;
-            }
-        }
-        if (has_pending_page_in_) synchronize_paging();
-        return true;
+        if (n_tok <= 0) return true;
+        return reserve_append_span(kv_start, n_tok).ok();
+    }
+
+    AppendReservation reserve_append_span(int kv_start, int n_tok) {
+        return AppendReservation(*this, kv_start, n_tok);
     }
 
     // Physical pool slot for logical position `pos`. Allocates (and, when
@@ -366,6 +457,10 @@ public:
     const KvFlashStats & stats() const { return stats_; }
     int resident_blocks() const { return n_blocks_ - (int)free_blocks_.size(); }
     int n_chunks() const { return (int)chunks_.size(); }
+    int max_append_tokens() const {
+        const int chunks = n_blocks_ - cfg_.sink_chunks - cfg_.tail_window_chunks;
+        return std::max(1, chunks) * cfg_.chunk_tokens;
+    }
 
     // Bumped on every residency change (alloc / page_out / page_in).
     // Callers cache the slot mask and refill only when the epoch moves.
@@ -393,17 +488,26 @@ public:
         if (!score_hook) return 0;
         struct Cand { int c; float s; };
         std::vector<Cand> cands;
+        std::vector<uint8_t> want(chunks_.size(), 0);
+        int kept = 0;
         for (int c = 0; c < (int)chunks_.size(); c++) {
             const ChunkState & st = chunks_[c];
             if (st.block < 0 && !st.on_host) continue;     // never materialized
             const bool prot = c < cfg_.sink_chunks ||
-                              c > cur_chunk_ - 1 - cfg_.tail_window_chunks;
-            cands.push_back({c, prot ? 3.4e38f : score_hook(c)});
+                              c > cur_chunk_ - 1 - cfg_.tail_window_chunks ||
+                              append_protected(c);
+            if (prot) {
+                want[(size_t)c] = 1;
+                kept++;
+                continue;
+            }
+            cands.push_back({c, score_hook(c)});
         }
         std::sort(cands.begin(), cands.end(),
                   [](const Cand & a, const Cand & b) { return a.s > b.s; });
-        std::vector<uint8_t> want(chunks_.size(), 0);
-        for (int i = 0; i < (int)cands.size() && i < n_blocks_; i++) want[cands[i].c] = 1;
+        for (int i = 0; i < (int)cands.size() && kept < n_blocks_; i++, kept++) {
+            want[(size_t)cands[(size_t)i].c] = 1;
+        }
 
         int events = 0;
         for (int c = 0; c < (int)chunks_.size(); c++) {       // out first: frees blocks
@@ -430,6 +534,13 @@ private:
 #endif
     };
 
+    bool append_protected(int c) const {
+        for (const AppendProtectRange & r : append_protect_ranges_) {
+            if (c >= r.begin && c <= r.end) return true;
+        }
+        return false;
+    }
+
     bool ensure_free_block() {
         if (!free_blocks_.empty()) return true;
         // Victim: unprotected resident chunk with the lowest score
@@ -441,6 +552,7 @@ private:
             if (chunks_[c].block < 0) continue;
             if (c < cfg_.sink_chunks) continue;
             if (c > cur_chunk_ - 1 - cfg_.tail_window_chunks) continue;
+            if (append_protected(c)) continue;
             if (score_hook) {
                 const float s = score_hook(c);
                 if (victim < 0 || s < v_score) { victim = c; v_score = s; }
@@ -571,6 +683,8 @@ private:
     int n_blocks_ = 0, n_head_kv_ = 0, cur_chunk_ = 0;
     uint64_t clock_ = 0;
     uint64_t epoch_ = 0;
+    uint64_t append_protect_next_id_ = 0;
+    std::vector<AppendProtectRange> append_protect_ranges_;
 
 #ifdef KVFLASH_HAS_ASYNC_DMA
     cudaStream_t page_stream_ = nullptr;
@@ -744,6 +858,63 @@ inline bool kvflash_fill_rows_and_masks(
         }
     }
     return true;
+}
+
+struct KvFlashPooledPrefillPlan {
+    KvFlashPager::AppendReservation reservation;
+    std::vector<int64_t> rows;
+    std::vector<uint16_t> mask;
+    bool ok() const { return reservation.ok(); }
+};
+
+inline KvFlashPooledPrefillPlan kvflash_prepare_pooled_suffix_prefill(
+    KvFlashPager & pager,
+    int kv_start, int n_tok, int n_head_kv,
+    int mask_kv_dim, int mask_q_dim) {
+    constexpr uint16_t F16_ZERO = 0x0000, F16_NEG_INF = 0xFC00;
+    KvFlashPooledPrefillPlan plan;
+    if (n_tok <= 0 || n_head_kv <= 0 ||
+        mask_kv_dim < pager.pool_tokens() || mask_q_dim < n_tok) {
+        std::fprintf(stderr,
+            "[kvflash] invalid pooled prefill plan kv_start=%d n_tok=%d "
+            "heads=%d mask=%dx%d pool=%d\n",
+            kv_start, n_tok, n_head_kv, mask_kv_dim, mask_q_dim,
+            pager.pool_tokens());
+        return plan;
+    }
+    plan.reservation = pager.reserve_append_span(kv_start, n_tok);
+    if (!plan.reservation.ok()) return plan;
+
+    plan.rows.resize((size_t)n_tok * n_head_kv);
+    for (int i = 0; i < n_tok; ++i) {
+        const int slot = plan.reservation.slot(i);
+        if (slot < 0 || slot >= mask_kv_dim) {
+            std::fprintf(stderr,
+                "[kvflash] pooled prefill slot missing pos=%d slot=%d mask_kv=%d\n",
+                kv_start + i, slot, mask_kv_dim);
+            plan.reservation = KvFlashPager::AppendReservation{};
+            plan.rows.clear();
+            plan.mask.clear();
+            return plan;
+        }
+        for (int h = 0; h < n_head_kv; ++h) {
+            plan.rows[(size_t)h * n_tok + i] = slot;
+        }
+    }
+
+    std::vector<int32_t> slot_pos((size_t)pager.pool_tokens(), -1);
+    pager.fill_slot_pos(slot_pos.data());
+    plan.mask.assign((size_t)mask_kv_dim * mask_q_dim, F16_NEG_INF);
+    const int slots = std::min(mask_kv_dim, pager.pool_tokens());
+    for (int q = 0; q < n_tok; ++q) {
+        const int abs_q = kv_start + q;
+        uint16_t * row = plan.mask.data() + (size_t)q * mask_kv_dim;
+        for (int s = 0; s < slots; ++s) {
+            const int p = slot_pos[(size_t)s];
+            if (p >= 0 && p <= abs_q) row[s] = F16_ZERO;
+        }
+    }
+    return plan;
 }
 
 } // namespace dflash::common

@@ -1012,12 +1012,11 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     prefill_last_logits_valid_ = false;
 
     // kvflash: a prompt that fits the pool prefills contiguously (identity
-    // mapping, normal chunking). A LARGER prompt switches to POOLED CHUNKED
-    // PREFILL: pager-chunk-sized batches whose KV rows are slot-mapped via
-    // set_rows, with a slot-space mask per chunk and live eviction as the
-    // pool fills (constant VRAM, linear time). Restore offsets are not
-    // supported in the pooled path (a relocated prefix cannot be restored
-    // identity-style in the first place).
+    // mapping, normal chunking). A LARGER prompt switches to POOLED SUFFIX
+    // PREFILL: large batches whose KV rows are slot-mapped via set_rows, with
+    // a slot-space causal mask and live eviction as the pool fills (constant
+    // VRAM, linear time). Restore offsets are not supported in the pooled path
+    // until snapshots serialize pager state.
     const bool kvf_paged = kvflash_active() &&
         kv_offset + prompt_len > kvflash_tokens_ - kvflash_pager_.chunk_tokens();
     if (kvf_paged && kv_offset != 0) {
@@ -1029,15 +1028,21 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         return -1;
     }
     if (kvf_paged) {
-        prefill_ubatch = kvflash_pager_.chunk_tokens();
+        prefill_ubatch = std::min(prefill_ubatch, kvflash_pager_.max_append_tokens());
+        const int kvf_chunk = kvflash_pager_.chunk_tokens();
+        if (kvf_chunk > 0 && prefill_ubatch > kvf_chunk) {
+            prefill_ubatch = (prefill_ubatch / kvf_chunk) * kvf_chunk;
+        }
+        prefill_ubatch = std::max(prefill_ubatch, kvf_chunk);
         kvflash_pager_.reset();
         if (kvflash_qk_policy_) {
             kvflash_qk_pool_.reset(kvflash_qk_pool_.dims());
             kvflash_qk_pooled_upto_ = 0;
         }
         std::printf("[kvflash] pooled prefill: %d tokens through a %d-token pool "
-                    "(%d-token chunks, evicting)\n",
-                    prompt_len, kvflash_tokens_, prefill_ubatch);
+                    "(ubatch=%d, chunk=%d, evicting)\n",
+                    prompt_len, kvflash_tokens_, prefill_ubatch,
+                    kvflash_pager_.chunk_tokens());
         std::fflush(stdout);
     }
 
@@ -1110,22 +1115,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         const bool with_mask = kvf_paged ||
             (cfg_.kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
 
-        // kvflash pooled prefill: allocate this chunk's slots up front
-        // (evicting the lowest-priority resident chunk once the pool fills).
-        std::vector<int> kvf_slots;
-        if (kvf_paged) {
-            kvf_slots.resize((size_t)n_tokens);
-            bool ok = true;
-            for (int i = 0; i < n_tokens; i++) {
-                kvf_slots[(size_t)i] = kvflash_pager_.slot_for(kv_pos + i);
-                if (kvf_slots[(size_t)i] < 0) { ok = false; break; }
-            }
-            if (!ok) {
-                std::fprintf(stderr, "[kvflash] pooled prefill: slot alloc failed @%d\n", kv_pos);
-                set_last_error("kvflash: no evictable pool block");
-                return -1;
-            }
-        }
+        KvFlashPooledPrefillPlan kvf_plan;
 
         // Prefill always uses full attention (fa_window=0) so that all
         // positions encode the complete context — critical for tool
@@ -1148,15 +1138,21 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                 std::fprintf(stderr, "[kvflash] pooled prefill requires the set_rows path\n");
                 return -1;
             }
-            // [n_tokens, n_head_kv] ne0-major (see verify_batch).
-            std::vector<int64_t> rows((size_t)n_tokens * w_.n_head_kv);
-            for (int h = 0; h < w_.n_head_kv; h++) {
-                for (int i = 0; i < n_tokens; i++) {
-                    rows[(size_t)h * n_tokens + i] = kvf_slots[(size_t)i];
-                }
+            if (!sg_.attn_mask) {
+                std::fprintf(stderr, "[kvflash] pooled prefill requires a slot mask\n");
+                set_last_error("kvflash: pooled prefill mask missing");
+                return -1;
             }
-            ggml_backend_tensor_set(sg_.kv_write_rows, rows.data(), 0,
-                                    sizeof(int64_t) * rows.size());
+            kvf_plan = kvflash_prepare_pooled_suffix_prefill(
+                kvflash_pager_, kv_pos, n_tokens, w_.n_head_kv,
+                (int)sg_.attn_mask->ne[0], (int)sg_.attn_mask->ne[1]);
+            if (!kvf_plan.ok()) {
+                std::fprintf(stderr, "[kvflash] pooled prefill: plan failed @%d\n", kv_pos);
+                set_last_error("kvflash: pooled prefill plan failed");
+                return -1;
+            }
+            ggml_backend_tensor_set(sg_.kv_write_rows, kvf_plan.rows.data(), 0,
+                                    sizeof(int64_t) * kvf_plan.rows.size());
         }
 
         // Embed
@@ -1180,32 +1176,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
 
         // Mask — full attention during prefill (no windowing)
         if (sg_.attn_mask && kvf_paged) {
-            // Slot-space mask (same recipe as verify_batch): row q attends
-            // (a) the slots of resident chunks holding positions < kv_pos
-            // and (b) this chunk's own slots, causally.
-            constexpr uint16_t F16_ZERO = 0x0000, F16_NEG_INF = 0xFC00;
-            const size_t kvd = (size_t)sg_.attn_mask->ne[0];
-            const int q_pad = (int)sg_.attn_mask->ne[1];
-            std::vector<uint16_t> mask_buf((size_t)kvd * q_pad, F16_NEG_INF);
-            const int ct = kvflash_pager_.chunk_tokens();
-            for (int c = 0; c < kvflash_pager_.n_chunks(); c++) {
-                const int blk = kvflash_pager_.block_of(c);
-                if (blk < 0) continue;
-                for (int i = 0; i < ct; i++) {
-                    if ((int64_t)c * ct + i >= kv_pos) break;
-                    mask_buf[(size_t)blk * ct + i] = F16_ZERO;
-                }
-            }
-            for (int q = 1; q < n_tokens; q++) {
-                std::memcpy(mask_buf.data() + (size_t)q * kvd, mask_buf.data(), kvd * 2);
-            }
-            for (int q = 0; q < n_tokens; q++) {
-                for (int i = 0; i <= q; i++) {
-                    mask_buf[(size_t)q * kvd + kvf_slots[(size_t)i]] = F16_ZERO;
-                }
-            }
-            ggml_backend_tensor_set(sg_.attn_mask, mask_buf.data(), 0,
-                                    sizeof(uint16_t) * mask_buf.size());
+            ggml_backend_tensor_set(sg_.attn_mask, kvf_plan.mask.data(), 0,
+                                    sizeof(uint16_t) * kvf_plan.mask.size());
         } else if (sg_.attn_mask) {
             const int win_start = 0;
             const int kv_len = kv_pos + n_tokens - win_start;
