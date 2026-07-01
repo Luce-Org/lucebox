@@ -2,6 +2,10 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
+#include "ggml-cuda.h"
+#include "deepseek4/deepseek4_hc_cuda.h"
+#endif
 
 #include "common/backend_ipc.h"
 #include "common/layer_split_utils.h"
@@ -835,6 +839,247 @@ static void test_output_graph_reuse_microbench(ggml_backend_t backend) {
                  rebuild_total_ms / iters, cached_total_ms / iters);
 }
 
+#if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
+static void test_cpu_hc_sinkhorn_ref(float * out, const float * mix, const float * scale,
+                                     const float * base, int n_hc, int iters, float eps) {
+    const float pre_scale = scale[0];
+    const float post_scale = scale[1];
+    const float comb_scale = scale[2];
+
+    for (int i = 0; i < n_hc; ++i) {
+        const float z = mix[i] * pre_scale + base[i];
+        out[i] = 1.0f / (1.0f + std::exp(-z)) + eps;
+    }
+    for (int i = 0; i < n_hc; ++i) {
+        const float z = mix[n_hc + i] * post_scale + base[n_hc + i];
+        out[n_hc + i] = 2.0f / (1.0f + std::exp(-z));
+    }
+
+    float c[16];
+    for (int dst = 0; dst < n_hc; ++dst) {
+        float row_max = -1.0e30f;
+        for (int src = 0; src < n_hc; ++src) {
+            const int idx = src + dst * n_hc;
+            const float v = mix[2 * n_hc + idx] * comb_scale + base[2 * n_hc + idx];
+            c[idx] = v;
+            row_max = std::max(row_max, v);
+        }
+        float row_sum = 0.0f;
+        for (int src = 0; src < n_hc; ++src) {
+            const int idx = src + dst * n_hc;
+            c[idx] = std::exp(c[idx] - row_max);
+            row_sum += c[idx];
+        }
+        const float inv = 1.0f / row_sum;
+        for (int src = 0; src < n_hc; ++src) {
+            c[src + dst * n_hc] = c[src + dst * n_hc] * inv + eps;
+        }
+    }
+    for (int src = 0; src < n_hc; ++src) {
+        float sum = 0.0f;
+        for (int dst = 0; dst < n_hc; ++dst) sum += c[src + dst * n_hc];
+        const float inv = 1.0f / (sum + eps);
+        for (int dst = 0; dst < n_hc; ++dst) c[src + dst * n_hc] *= inv;
+    }
+    for (int iter = 1; iter < iters; ++iter) {
+        for (int dst = 0; dst < n_hc; ++dst) {
+            float sum = 0.0f;
+            for (int src = 0; src < n_hc; ++src) sum += c[src + dst * n_hc];
+            const float inv = 1.0f / (sum + eps);
+            for (int src = 0; src < n_hc; ++src) c[src + dst * n_hc] *= inv;
+        }
+        for (int src = 0; src < n_hc; ++src) {
+            float sum = 0.0f;
+            for (int dst = 0; dst < n_hc; ++dst) sum += c[src + dst * n_hc];
+            const float inv = 1.0f / (sum + eps);
+            for (int dst = 0; dst < n_hc; ++dst) c[src + dst * n_hc] *= inv;
+        }
+    }
+    for (int i = 0; i < n_hc * n_hc; ++i) {
+        out[2 * n_hc + i] = c[i];
+    }
+}
+
+static void test_reference_hc_pre(const std::vector<float> & hc_state,
+                                  const std::vector<ggml_fp16_t> & fn_f16,
+                                  const std::vector<float> & scale,
+                                  const std::vector<float> & base,
+                                  int n_embd,
+                                  int n_hc,
+                                  int sinkhorn_iters,
+                                  float hc_eps,
+                                  std::vector<float> & working,
+                                  std::vector<float> & post,
+                                  std::vector<float> & comb) {
+    const int hc_dim = n_embd * n_hc;
+    const int mix_dim = 2 * n_hc + n_hc * n_hc;
+    std::vector<float> flat((size_t) hc_dim);
+    std::vector<float> mix((size_t) mix_dim, 0.0f);
+    float sumsq = 0.0f;
+    for (float v : hc_state) sumsq += v * v;
+    const float inv_rms = 1.0f / std::sqrt(sumsq / (float) hc_dim + hc_eps);
+    for (int i = 0; i < hc_dim; ++i) flat[(size_t) i] = hc_state[(size_t) i] * inv_rms;
+    for (int row = 0; row < mix_dim; ++row) {
+        float acc = 0.0f;
+        for (int c = 0; c < hc_dim; ++c) {
+            acc += ggml_fp16_to_fp32(fn_f16[(size_t) row * hc_dim + c]) * flat[(size_t) c];
+        }
+        mix[(size_t) row] = acc;
+    }
+    std::vector<float> split((size_t) mix_dim);
+    test_cpu_hc_sinkhorn_ref(split.data(), mix.data(), scale.data(), base.data(), n_hc, sinkhorn_iters, 1.0e-6f);
+
+    working.assign((size_t) n_embd, 0.0f);
+    post.assign((size_t) n_hc, 0.0f);
+    comb.assign((size_t) n_hc * (size_t) n_hc, 0.0f);
+    for (int d = 0; d < n_embd; ++d) {
+        float acc = 0.0f;
+        for (int h = 0; h < n_hc; ++h) {
+            acc += split[h] * hc_state[(size_t) h * n_embd + d];
+        }
+        working[(size_t) d] = acc;
+    }
+    for (int i = 0; i < n_hc; ++i) post[(size_t) i] = split[n_hc + i];
+    for (int i = 0; i < n_hc * n_hc; ++i) comb[(size_t) i] = split[2 * n_hc + i];
+}
+
+static void test_hc_pre_kernel_gpu() {
+    std::fprintf(stderr, "  test_hc_pre_kernel_gpu ...");
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        std::fprintf(stderr, " skipped (no GPU backend)\n");
+        return;
+    }
+
+    constexpr int n_embd = 128;
+    constexpr int n_hc = 4;
+    constexpr int sinkhorn_iters = 6;
+    constexpr float hc_eps = 1.0e-6f;
+    constexpr int mix_dim = 2 * n_hc + n_hc * n_hc;
+    const int hc_dim = n_embd * n_hc;
+
+    std::mt19937 rng(123);
+    std::uniform_real_distribution<float> dist(-0.2f, 0.2f);
+    std::vector<float> hc_state((size_t) hc_dim);
+    std::vector<float> fn((size_t) mix_dim * (size_t) hc_dim);
+    std::vector<ggml_fp16_t> fn_f16(fn.size());
+    std::vector<float> scale((size_t) mix_dim);
+    std::vector<float> base((size_t) mix_dim);
+    for (float & v : hc_state) v = dist(rng);
+    for (float & v : fn) v = dist(rng);
+    for (size_t i = 0; i < fn.size(); ++i) fn_f16[i] = ggml_fp32_to_fp16(fn[i]);
+    scale[0] = 0.85f;
+    scale[1] = 1.10f;
+    scale[2] = 0.95f;
+    for (int i = 3; i < mix_dim; ++i) scale[(size_t) i] = 0.0f;
+    for (float & v : base) v = 0.15f * dist(rng);
+
+    std::vector<float> ref_working;
+    std::vector<float> ref_post;
+    std::vector<float> ref_comb;
+    test_reference_hc_pre(hc_state, fn_f16, scale, base, n_embd, n_hc, sinkhorn_iters, hc_eps,
+                          ref_working, ref_post, ref_comb);
+
+    ggml_context * ctx = make_test_context(1u << 20);
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) {
+        ggml_backend_free(backend);
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    ggml_tensor * state_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, 1);
+    ggml_tensor * fn_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hc_dim, mix_dim);
+    ggml_tensor * scale_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, mix_dim);
+    ggml_tensor * base_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, mix_dim);
+    ggml_tensor * working_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+    ggml_tensor * post_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_hc, 1);
+    ggml_tensor * comb_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_hc, n_hc);
+    ggml_tensor * working_devparam_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+    ggml_tensor * post_devparam_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_hc, 1);
+    ggml_tensor * comb_devparam_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_hc, n_hc);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    TEST_ASSERT_MSG(buf != nullptr, "ggml backend buffer alloc failed");
+    if (!buf) {
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    ggml_backend_tensor_set(state_t, hc_state.data(), 0, hc_state.size() * sizeof(float));
+    ggml_backend_tensor_set(fn_t, fn_f16.data(), 0, fn_f16.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(scale_t, scale.data(), 0, scale.size() * sizeof(float));
+    ggml_backend_tensor_set(base_t, base.data(), 0, base.size() * sizeof(float));
+
+    std::vector<float> gpu_working((size_t) n_embd);
+    std::vector<float> gpu_post((size_t) n_hc);
+    std::vector<float> gpu_comb((size_t) n_hc * (size_t) n_hc);
+    std::vector<float> gpu_working_devparam((size_t) n_embd);
+    std::vector<float> gpu_post_devparam((size_t) n_hc);
+    std::vector<float> gpu_comb_devparam((size_t) n_hc * (size_t) n_hc);
+
+    bool ok = deepseek4_cuda_hc_pre_device_params(state_t->data,
+                                                  fn_t->data,
+                                                  scale.data(),
+                                                  base.data(),
+                                                  n_embd,
+                                                  n_hc,
+                                                  sinkhorn_iters,
+                                                  hc_eps,
+                                                  working_t->data,
+                                                  post_t->data,
+                                                  comb_t->data);
+    TEST_ASSERT_MSG(ok, "direct HC-pre kernel call failed");
+    if (ok) {
+        ggml_backend_tensor_get(working_t, gpu_working.data(), 0, gpu_working.size() * sizeof(float));
+        ggml_backend_tensor_get(post_t, gpu_post.data(), 0, gpu_post.size() * sizeof(float));
+        ggml_backend_tensor_get(comb_t, gpu_comb.data(), 0, gpu_comb.size() * sizeof(float));
+    }
+
+    ok = deepseek4_cuda_hc_pre_device(state_t->data,
+                                      fn_t->data,
+                                      scale_t->data,
+                                      base_t->data,
+                                      n_embd,
+                                      n_hc,
+                                      sinkhorn_iters,
+                                      hc_eps,
+                                      working_devparam_t->data,
+                                      post_devparam_t->data,
+                                      comb_devparam_t->data);
+    TEST_ASSERT_MSG(ok, "device-param HC-pre kernel call failed");
+    if (ok) {
+        ggml_backend_tensor_get(working_devparam_t, gpu_working_devparam.data(), 0, gpu_working_devparam.size() * sizeof(float));
+        ggml_backend_tensor_get(post_devparam_t, gpu_post_devparam.data(), 0, gpu_post_devparam.size() * sizeof(float));
+        ggml_backend_tensor_get(comb_devparam_t, gpu_comb_devparam.data(), 0, gpu_comb_devparam.size() * sizeof(float));
+    }
+
+    for (int i = 0; i < n_embd; ++i) {
+        TEST_ASSERT_MSG(nearly_equal(gpu_working[(size_t) i], ref_working[(size_t) i], 2.0e-4f, 2.0e-4f),
+                        "working mismatch");
+        TEST_ASSERT_MSG(nearly_equal(gpu_working_devparam[(size_t) i], ref_working[(size_t) i], 2.0e-4f, 2.0e-4f),
+                        "working devparam mismatch");
+    }
+    for (int i = 0; i < n_hc; ++i) {
+        TEST_ASSERT_MSG(nearly_equal(gpu_post[(size_t) i], ref_post[(size_t) i], 2.0e-4f, 2.0e-4f),
+                        "post mismatch");
+        TEST_ASSERT_MSG(nearly_equal(gpu_post_devparam[(size_t) i], ref_post[(size_t) i], 2.0e-4f, 2.0e-4f),
+                        "post devparam mismatch");
+    }
+    for (int i = 0; i < n_hc * n_hc; ++i) {
+        TEST_ASSERT_MSG(nearly_equal(gpu_comb[(size_t) i], ref_comb[(size_t) i], 2.0e-4f, 2.0e-4f),
+                        "comb mismatch");
+        TEST_ASSERT_MSG(nearly_equal(gpu_comb_devparam[(size_t) i], ref_comb[(size_t) i], 2.0e-4f, 2.0e-4f),
+                        "comb devparam mismatch");
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+}
+#endif
+
 int main() {
     ggml_backend_t backend = ggml_backend_cpu_init();
     if (!backend) {
@@ -856,6 +1101,9 @@ int main() {
     test_ipc_mode_registration();
     test_ffn_graph_reuse_microbench(backend);
     test_output_graph_reuse_microbench(backend);
+#if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
+    test_hc_pre_kernel_gpu();
+#endif
 
     ggml_backend_free(backend);
 

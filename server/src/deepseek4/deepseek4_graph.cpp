@@ -1211,7 +1211,9 @@ static ggml_tensor * ds4_hc_col_normalize(ggml_context * ctx, ggml_tensor * x) {
 
 static bool ds4_backend_is_hip(ggml_backend_t backend) {
     const char * name = ggml_backend_name(backend);
-    return name && std::strstr(name, "HIP") != nullptr;
+    return name &&
+        (std::strstr(name, "HIP") != nullptr ||
+         std::strstr(name, "ROCm") != nullptr);
 }
 
 static bool ds4_backend_is_cuda(ggml_backend_t backend) {
@@ -1221,22 +1223,6 @@ static bool ds4_backend_is_cuda(ggml_backend_t backend) {
 
 static bool ds4_backend_is_gpu(ggml_backend_t backend) {
     return ds4_backend_is_hip(backend) || ds4_backend_is_cuda(backend);
-}
-
-static bool ds4_hc_gpu_decode_enabled() {
-    const char * value = std::getenv("DFLASH_DS4_HC_GPU_DECODE");
-    if (!value || !value[0]) {
-        value = std::getenv("DFLASH_DS4_HC_HIP_DECODE");
-    }
-    return !value || !value[0] || std::strcmp(value, "0") != 0;
-}
-
-static bool ds4_hc_gpu_direct_enabled() {
-    const char * value = std::getenv("DFLASH_DS4_HC_GPU_DIRECT");
-    if (!value || !value[0]) {
-        value = std::getenv("DFLASH_DS4_HC_HIP_DIRECT");
-    }
-    return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
 static bool ds4_try_gpu_hc_pre(float * working,
@@ -1270,7 +1256,8 @@ static bool ds4_try_gpu_hc_pre(float * working,
     (void) post;
     (void) comb;
     (void) hc_state;
-    (void) weights;
+    (void) scale_data;
+    (void) base_data;
     (void) fn_tensor;
     (void) n_embd;
     (void) n_hc;
@@ -1283,8 +1270,13 @@ static bool ds4_try_gpu_hc_pre(float * working,
 static bool ds4_try_gpu_hc_pre_device(ggml_tensor * working,
                                       ggml_tensor * post,
                                       ggml_tensor * comb,
+                                      ggml_backend_t backend,
+                                      int layer_idx,
+                                      bool ffn,
                                       ggml_tensor * hc_state,
                                       ggml_tensor * fn_tensor,
+                                      ggml_tensor * scale_tensor,
+                                      ggml_tensor * base_tensor,
                                       const float * scale_data,
                                       const float * base_data,
                                       int n_embd,
@@ -1295,6 +1287,26 @@ static bool ds4_try_gpu_hc_pre_device(ggml_tensor * working,
     if (!working || !post || !comb || !hc_state || !fn_tensor || !scale_data || !base_data ||
         !working->data || !post->data || !comb->data || !hc_state->data || !fn_tensor->data) {
         return false;
+    }
+    const bool can_use_device_params =
+        ds4_backend_is_cuda(backend) &&
+        scale_tensor && base_tensor &&
+        scale_tensor->data && base_tensor->data &&
+        scale_tensor->buffer && base_tensor->buffer &&
+        !ggml_backend_buffer_is_host(scale_tensor->buffer) &&
+        !ggml_backend_buffer_is_host(base_tensor->buffer);
+    if (can_use_device_params) {
+        return deepseek4_cuda_hc_pre_device(hc_state->data,
+                                            fn_tensor->data,
+                                            scale_tensor->data,
+                                            base_tensor->data,
+                                            n_embd,
+                                            n_hc,
+                                            sinkhorn_iters,
+                                            hc_eps,
+                                            working->data,
+                                            post->data,
+                                            comb->data);
     }
     return deepseek4_cuda_hc_pre_device_params(hc_state->data,
                                                fn_tensor->data,
@@ -1311,8 +1323,13 @@ static bool ds4_try_gpu_hc_pre_device(ggml_tensor * working,
     (void) working;
     (void) post;
     (void) comb;
+    (void) backend;
+    (void) layer_idx;
+    (void) ffn;
     (void) hc_state;
     (void) fn_tensor;
+    (void) scale_tensor;
+    (void) base_tensor;
     (void) scale_data;
     (void) base_data;
     (void) n_embd;
@@ -2013,18 +2030,10 @@ static HcPreResult cpu_hc_pre(const float * hc_state, const uint16_t * fn_data,
 
 static bool ds4_hc_cuda_enabled() {
 #if defined(DFLASH27B_BACKEND_CUDA)
-    const char * value = std::getenv("DFLASH_DS4_HC_BACKEND");
-    if (value && std::strcmp(value, "cpu") == 0) return false;
-    if (value && std::strcmp(value, "cuda") == 0) return true;
     return true;
 #else
     return false;
 #endif
-}
-
-static bool ds4_hc_compare_enabled() {
-    const char * value = std::getenv("DFLASH_DS4_HC_COMPARE");
-    return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
 static HcPreResult hc_pre_auto(const float * hc_state,
@@ -2039,38 +2048,10 @@ static HcPreResult hc_pre_auto(const float * hc_state,
         float mix[24];
         if (deepseek4_cuda_hc_pre_mix(hc_state, fn_tensor->data,
                                       n_embd, n_hc, hc_eps, mix)) {
-            HcPreResult cuda_result = finish_hc_pre_from_mix(hc_state, mix,
-                                                             weights.scale_data.data(),
-                                                             weights.base_data.data(),
-                                                             n_embd, n_hc, sinkhorn_iters);
-            if (ds4_hc_compare_enabled()) {
-                static int compare_logs = 0;
-                HcPreResult cpu_result = cpu_hc_pre(hc_state, weights.fn_data.data(),
-                                                    weights.scale_data.data(),
-                                                    weights.base_data.data(),
-                                                    n_embd, n_hc, sinkhorn_iters, hc_eps);
-                float max_working = 0.0f;
-                for (int i = 0; i < n_embd; ++i) {
-                    max_working = std::max(max_working,
-                                           std::fabs(cuda_result.working[(size_t)i] -
-                                                     cpu_result.working[(size_t)i]));
-                }
-                float max_post = 0.0f;
-                for (int i = 0; i < n_hc; ++i) {
-                    max_post = std::max(max_post, std::fabs(cuda_result.post[i] - cpu_result.post[i]));
-                }
-                float max_comb = 0.0f;
-                for (int i = 0; i < n_hc * n_hc; ++i) {
-                    max_comb = std::max(max_comb, std::fabs(cuda_result.comb[i] - cpu_result.comb[i]));
-                }
-                if (compare_logs < 16) {
-                    std::fprintf(stderr,
-                                 "[deepseek4-hc-compare] max_abs working=%.8g post=%.8g comb=%.8g\n",
-                                 max_working, max_post, max_comb);
-                    compare_logs++;
-                }
-            }
-            return cuda_result;
+            return finish_hc_pre_from_mix(hc_state, mix,
+                                          weights.scale_data.data(),
+                                          weights.base_data.data(),
+                                          n_embd, n_hc, sinkhorn_iters);
         }
     }
 #else
@@ -2102,33 +2083,6 @@ static void hc_pre_auto_into(float * working,
                                         weights.scale_data.data(),
                                         weights.base_data.data(),
                                         n_embd, n_hc, sinkhorn_iters);
-            if (ds4_hc_compare_enabled()) {
-                static int compare_logs = 0;
-                HcPreResult cpu_result = cpu_hc_pre(hc_state, weights.fn_data.data(),
-                                                    weights.scale_data.data(),
-                                                    weights.base_data.data(),
-                                                    n_embd, n_hc, sinkhorn_iters, hc_eps);
-                float max_working = 0.0f;
-                for (int i = 0; i < n_embd; ++i) {
-                    max_working = std::max(max_working,
-                                           std::fabs(working[(size_t)i] -
-                                                     cpu_result.working[(size_t)i]));
-                }
-                float max_post = 0.0f;
-                for (int i = 0; i < n_hc; ++i) {
-                    max_post = std::max(max_post, std::fabs(post[i] - cpu_result.post[i]));
-                }
-                float max_comb = 0.0f;
-                for (int i = 0; i < n_hc * n_hc; ++i) {
-                    max_comb = std::max(max_comb, std::fabs(comb[i] - cpu_result.comb[i]));
-                }
-                if (compare_logs < 16) {
-                    std::fprintf(stderr,
-                                 "[deepseek4-hc-compare] max_abs working=%.8g post=%.8g comb=%.8g\n",
-                                 max_working, max_post, max_comb);
-                    compare_logs++;
-                }
-            }
             return;
         }
     }
@@ -3003,11 +2957,12 @@ bool deepseek4_step_layer_range(
     std::vector<float> & ffn_out_host = scratch.ffn_out_host;
     std::vector<int32_t> & hash_expert_ids_host = scratch.hash_expert_ids;
     const bool reuse_decode_graphs = (n_tokens == 1);
-    const bool use_backend_decode_hc =
-        reuse_decode_graphs && ds4_backend_is_gpu(backend) && ds4_hc_gpu_decode_enabled();
-    const bool use_backend_decode_hc_graph = use_backend_decode_hc && !ds4_hc_gpu_direct_enabled();
+    const bool use_backend_decode_hc = reuse_decode_graphs && ds4_backend_is_gpu(backend);
+    const bool use_backend_decode_hc_direct = use_backend_decode_hc && ds4_backend_is_hip(backend);
+    const bool use_backend_decode_hc_graph =
+        use_backend_decode_hc && !use_backend_decode_hc_direct;
     const ggml_tensor * hc_state_backend = nullptr;
-    if (use_backend_decode_hc_graph) {
+    if (use_backend_decode_hc_graph || use_backend_decode_hc_direct) {
         if (!cached_decode_hc_post_graph.valid() ||
             cached_decode_hc_post_graph.owner_ctx != w.ctx ||
             cached_decode_hc_post_graph.backend != backend) {
@@ -3023,9 +2978,8 @@ bool deepseek4_step_layer_range(
         const DeepSeek4Layer & L = w.layers[(size_t)il];
         DeepSeek4LayerCache & lc = cache.layers[(size_t)il];
         const HcLayerWeightsCpu & hc_lw = hc_layer_weights_range[(size_t)il];
-        const bool use_backend_decode_hc_pre = use_backend_decode_hc;
-        const bool use_backend_decode_hc_direct =
-            use_backend_decode_hc && ds4_hc_gpu_direct_enabled() && ds4_backend_is_hip(backend);
+        const int ratio = (int)w.compress_ratios[il];
+        bool hash_routed = false;
         const ggml_tensor * attn_in_backend = nullptr;
         const ggml_tensor * ffn_in_backend = nullptr;
         const ggml_tensor * attn_post_backend = nullptr;
@@ -3036,6 +2990,8 @@ bool deepseek4_step_layer_range(
         // ── HC pre (attention) ──────────────────────────────────────
         const auto hc_pre_attn_t0 = Ds4TimingClock::now();
         if (use_backend_decode_hc_direct) {
+            ggml_backend_tensor_set(cached_decode_hc_post_graph.residual_hc,
+                                    hc_state.data(), 0, sizeof(float) * hc_state.size());
             auto & cached = cached_decode_attn_hc_pre_graphs[(size_t)il];
             if (!cached.valid() ||
                 cached.owner_ctx != w.ctx ||
@@ -3050,8 +3006,13 @@ bool deepseek4_step_layer_range(
             if (!ds4_try_gpu_hc_pre_device(cached.sg.hidden_states,
                                            cached.post,
                                            cached.comb,
+                                           backend,
+                                           il,
+                                           false,
                                            cached_decode_hc_post_graph.residual_hc,
                                            L.hc_attn_fn,
+                                           L.hc_attn_scale,
+                                           L.hc_attn_base,
                                            hc_lw.attn.scale_data.data(),
                                            hc_lw.attn.base_data.data(),
                                            n_embd,
@@ -3084,30 +3045,6 @@ bool deepseek4_step_layer_range(
             attn_in_backend = cached.sg.hidden_states;
             attn_post_backend = cached.post;
             attn_comb_backend = cached.comb;
-        } else if (use_backend_decode_hc_pre &&
-            ds4_try_gpu_hc_pre(cur.data(), hc_post.data(), hc_comb.data(),
-                               hc_state.data(), hc_lw.attn.scale_data.data(), hc_lw.attn.base_data.data(), L.hc_attn_fn,
-                               n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps)) {
-        } else if (use_backend_decode_hc_pre) {
-            auto & cached = cached_decode_attn_hc_pre_graphs[(size_t)il];
-            if (!cached.valid() ||
-                cached.owner_ctx != w.ctx ||
-                cached.backend != backend ||
-                cached.layer_idx != il ||
-                cached.ffn) {
-                if (!build_cached_decode_hc_pre_graph(cached, backend, w, L, hc_lw.attn.scale_data.data(), il, false)) {
-                    std::fprintf(stderr, "[deepseek4] cached hc-pre graph alloc failed layer %d attn\n", il);
-                    return false;
-                }
-            }
-            ggml_backend_tensor_set(cached.sg.inp_embed, hc_state.data(), 0, sizeof(float) * (size_t)hc_dim);
-            if (ggml_backend_graph_compute(backend, cached.sg.gf) != GGML_STATUS_SUCCESS) {
-                std::fprintf(stderr, "[deepseek4] cached hc-pre compute failed layer %d attn\n", il);
-                return false;
-            }
-            attn_in_backend = cached.sg.hidden_states;
-            ggml_backend_tensor_get(cached.post, hc_post.data(), 0, sizeof(float) * (size_t)n_hc);
-            ggml_backend_tensor_get(cached.comb, hc_comb.data(), 0, sizeof(float) * (size_t)n_hc * (size_t)n_hc);
         } else {
             hc_pre_batch(cur, hc_post, hc_comb,
                          hc_state.data(), hc_lw.attn, L.hc_attn_fn,
@@ -3117,7 +3054,6 @@ bool deepseek4_step_layer_range(
 
         // ── Build & run attention graph ─────────────────────────────
         {
-            const int ratio = w.compress_ratios[il];
             const int token_pos = kv_start + n_tokens - 1;
             const bool reuse_decode_attn = n_tokens == 1;
             ggml_tensor * attn_out = nullptr;
@@ -3299,6 +3235,8 @@ bool deepseek4_step_layer_range(
         // ── HC pre (FFN) ────────────────────────────────────────────
         const auto hc_pre_ffn_t0 = Ds4TimingClock::now();
         if (use_backend_decode_hc_direct) {
+            ggml_backend_tensor_set(cached_decode_hc_post_graph.residual_hc,
+                                    hc_state.data(), 0, sizeof(float) * hc_state.size());
             auto & cached = cached_decode_ffn_hc_pre_graphs[(size_t)il];
             if (!cached.valid() ||
                 cached.owner_ctx != w.ctx ||
@@ -3313,8 +3251,13 @@ bool deepseek4_step_layer_range(
             if (!ds4_try_gpu_hc_pre_device(cached.sg.hidden_states,
                                            cached.post,
                                            cached.comb,
+                                           backend,
+                                           il,
+                                           true,
                                            cached_decode_hc_post_graph.residual_hc,
                                            L.hc_ffn_fn,
+                                           L.hc_ffn_scale,
+                                           L.hc_ffn_base,
                                            hc_lw.ffn.scale_data.data(),
                                            hc_lw.ffn.base_data.data(),
                                            n_embd,
@@ -3347,30 +3290,6 @@ bool deepseek4_step_layer_range(
             ffn_in_backend = cached.sg.hidden_states;
             ffn_post_backend = cached.post;
             ffn_comb_backend = cached.comb;
-        } else if (use_backend_decode_hc_pre &&
-            ds4_try_gpu_hc_pre(ffn_working.data(), hc_post.data(), hc_comb.data(),
-                               hc_state.data(), hc_lw.ffn.scale_data.data(), hc_lw.ffn.base_data.data(), L.hc_ffn_fn,
-                               n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps)) {
-        } else if (use_backend_decode_hc_pre) {
-            auto & cached = cached_decode_ffn_hc_pre_graphs[(size_t)il];
-            if (!cached.valid() ||
-                cached.owner_ctx != w.ctx ||
-                cached.backend != backend ||
-                cached.layer_idx != il ||
-                !cached.ffn) {
-                if (!build_cached_decode_hc_pre_graph(cached, backend, w, L, hc_lw.ffn.scale_data.data(), il, true)) {
-                    std::fprintf(stderr, "[deepseek4] cached hc-pre graph alloc failed layer %d ffn\n", il);
-                    return false;
-                }
-            }
-            ggml_backend_tensor_set(cached.sg.inp_embed, hc_state.data(), 0, sizeof(float) * (size_t)hc_dim);
-            if (ggml_backend_graph_compute(backend, cached.sg.gf) != GGML_STATUS_SUCCESS) {
-                std::fprintf(stderr, "[deepseek4] cached hc-pre compute failed layer %d ffn\n", il);
-                return false;
-            }
-            ffn_in_backend = cached.sg.hidden_states;
-            ggml_backend_tensor_get(cached.post, hc_post.data(), 0, sizeof(float) * (size_t)n_hc);
-            ggml_backend_tensor_get(cached.comb, hc_comb.data(), 0, sizeof(float) * (size_t)n_hc * (size_t)n_hc);
         } else {
             hc_pre_batch(ffn_working, hc_post, hc_comb,
                          hc_state.data(), hc_lw.ffn, L.hc_ffn_fn,
@@ -3382,9 +3301,9 @@ bool deepseek4_step_layer_range(
         {
             // Hash-routed layers: use pre-computed expert IDs from hash table
             // instead of zeroing out routed_out as build_moe_ffn does.
-            const bool hash_routed =
-                    il < w.n_hash_layer && L.ffn_gate_tid2eid && token_ids &&
-                    hash_routing_tables_range[(size_t)il].loaded;
+            hash_routed =
+                il < w.n_hash_layer && L.ffn_gate_tid2eid && token_ids &&
+                hash_routing_tables_range[(size_t)il].loaded;
             if (hash_routed) {
                 const auto & ht = hash_routing_tables_range[(size_t)il].ids;
                 const int n_used = w.n_expert_used;

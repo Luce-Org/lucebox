@@ -286,7 +286,7 @@ bool deepseek4_cuda_hc_pre_mix(const float * hc_state_host,
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
-    return cudaDeviceSynchronize() == cudaSuccess;
+    return true;
 }
 
 bool deepseek4_cuda_hc_pre(const float * hc_state_host,
@@ -355,7 +355,7 @@ bool deepseek4_cuda_hc_pre(const float * hc_state_host,
         return false;
     }
 
-    return cudaDeviceSynchronize() == cudaSuccess;
+    return true;
 }
 
 bool deepseek4_cuda_hc_pre_device(const void * hc_state_device,
@@ -411,21 +411,33 @@ bool deepseek4_cuda_hc_pre_device(const void * hc_state_device,
         g_scratch.d_post,
         g_scratch.d_comb);
     if (cudaGetLastError() != cudaSuccess) return false;
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    cudaError_t pre_copy_err = cudaDeviceSynchronize();
+    if (pre_copy_err != cudaSuccess) {
+        return false;
+    }
+#endif
 
-    if (cudaDeviceSynchronize() != cudaSuccess) return false;
-    if (cudaMemcpy(working_device, g_scratch.d_working, sizeof(float) * (size_t) n_embd,
+    if (working_device != g_scratch.d_working &&
+        cudaMemcpy(working_device, g_scratch.d_working, sizeof(float) * (size_t) n_embd,
                    cudaMemcpyDeviceToDevice) != cudaSuccess) {
         return false;
     }
-    if (cudaMemcpy(post_device, g_scratch.d_post, sizeof(float) * (size_t) n_hc,
+    if (post_device != g_scratch.d_post &&
+        cudaMemcpy(post_device, g_scratch.d_post, sizeof(float) * (size_t) n_hc,
                    cudaMemcpyDeviceToDevice) != cudaSuccess) {
         return false;
     }
-    if (cudaMemcpy(comb_device, g_scratch.d_comb, sizeof(float) * (size_t) n_hc * (size_t) n_hc,
+    if (comb_device != g_scratch.d_comb &&
+        cudaMemcpy(comb_device, g_scratch.d_comb, sizeof(float) * (size_t) n_hc * (size_t) n_hc,
                    cudaMemcpyDeviceToDevice) != cudaSuccess) {
-        return false;
+                   return false;
     }
-    return cudaDeviceSynchronize() == cudaSuccess;
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+                   return false;
+    }
+    return true;
 }
 
 bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
@@ -500,23 +512,27 @@ bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
         hc_log_cuda_error("finish kernel", err);
         return false;
     }
-
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
     err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
         hc_log_cuda_error("device sync", err);
         return false;
     }
-    if (cudaMemcpy(working_device, g_scratch.d_working, sizeof(float) * (size_t) n_embd,
+#endif
+    if (working_device != g_scratch.d_working &&
+        cudaMemcpy(working_device, g_scratch.d_working, sizeof(float) * (size_t) n_embd,
                    cudaMemcpyDeviceToDevice) != cudaSuccess) {
         hc_log_cuda_error("copy working d2d", cudaGetLastError());
         return false;
     }
-    if (cudaMemcpy(post_device, g_scratch.d_post, sizeof(float) * (size_t) n_hc,
+    if (post_device != g_scratch.d_post &&
+        cudaMemcpy(post_device, g_scratch.d_post, sizeof(float) * (size_t) n_hc,
                    cudaMemcpyDeviceToDevice) != cudaSuccess) {
         hc_log_cuda_error("copy post d2d", cudaGetLastError());
         return false;
     }
-    if (cudaMemcpy(comb_device, g_scratch.d_comb, sizeof(float) * (size_t) n_hc * (size_t) n_hc,
+    if (comb_device != g_scratch.d_comb &&
+        cudaMemcpy(comb_device, g_scratch.d_comb, sizeof(float) * (size_t) n_hc * (size_t) n_hc,
                    cudaMemcpyDeviceToDevice) != cudaSuccess) {
         hc_log_cuda_error("copy comb d2d", cudaGetLastError());
         return false;

@@ -18,6 +18,7 @@
 #include "dflash27b.h"
 #include "../common/moe_hybrid_storage.h"
 #include "../common/moe_hybrid_types.h"
+#include "ggml-cuda.h"
 
 #include <algorithm>
 #include <cinttypes>

@@ -29,6 +29,7 @@
 #define cudaMemcpyKind hipMemcpyKind
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
 #define cudaMemset hipMemset
+#define cudaMemGetInfo hipMemGetInfo
 #define cudaSetDevice hipSetDevice
 #define cudaStreamSynchronize hipStreamSynchronize
 #define cudaStream_t hipStream_t
