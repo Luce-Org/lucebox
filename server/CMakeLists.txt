@@ -272,6 +272,7 @@ add_library(dflash_common STATIC
     src/qwen35/graph_builders.cpp
     src/qwen35moe/qwen35moe_ffn.cpp
     src/qwen35moe/qwen35moe_backend.cpp
+    src/qwen35moe/qwen35moe_layer_split_adapter.cpp
     src/qwen35moe/qwen35moe_daemon.cpp
     src/qwen35moe/qwen35moe_pipelined_decode.cpp
     # ── Common MoE hybrid infrastructure ──

@@ -41,6 +41,26 @@ bool build_layer_step(
     int kq_stride_pad = KQ_MASK_PAD,
     bool kvflash = false);
 
+// Layer-segmented prefill: process a contiguous layer range in one graph.
+// This keeps simple layer-split semantics but avoids rebuilding/computing one
+// ggml graph per layer when no per-layer feature capture is required.
+bool build_layer_range_step(
+    StepGraph & sg,
+    const TargetWeights & w,
+    TargetCache & cache,
+    ggml_backend_t backend,
+    int layer_begin,
+    int layer_end,
+    ggml_tensor * act_in,
+    ggml_tensor * act_out,
+    int chunk_start,
+    int n_tokens,
+    int kv_start,
+    bool with_mask,
+    int fa_window = 0,
+    int kq_stride_pad = KQ_MASK_PAD,
+    bool kvflash = false);
+
 // `kvflash`: pooled mode — KV rows go through a set_rows input
 // (sg.kv_write_rows, [n_tokens, n_head_kv] ne0-major slots) and the mask
 // (forced on) is sized to the PHYSICAL tensor capacity so the caller can
