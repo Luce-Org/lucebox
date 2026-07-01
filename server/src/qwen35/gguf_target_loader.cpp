@@ -71,10 +71,18 @@ CpuEmbedder::~CpuEmbedder() {
     if (mmap_addr)                         UnmapViewOfFile(mmap_addr);
     if (mmap_hmap)                         CloseHandle(mmap_hmap);
     if (mmap_hfile != INVALID_HANDLE_VALUE) CloseHandle(mmap_hfile);
+    mmap_addr = nullptr;
+    mmap_len = 0;
+    mmap_hfile = INVALID_HANDLE_VALUE;
+    mmap_hmap = nullptr;
 #else
     if (mmap_addr) ::munmap(mmap_addr, mmap_len);
     if (mmap_fd >= 0) ::close(mmap_fd);
+    mmap_addr = nullptr;
+    mmap_len = 0;
+    mmap_fd = -1;
 #endif
+    tok_embd_bytes = nullptr;
 }
 
 bool CpuEmbedder::embed(const int32_t * ids, int n, float * out_f32) const {

@@ -3057,6 +3057,15 @@ void LagunaBackend::shutdown() {
         drafter_loaded_ = false;
     }
     free_decode_draft();
+    kvflash_pager_.detach();
+    kvflash_scorer_.reset();
+    kvflash_scores_.clear();
+    stream_engine_.destroy();
+    moe_hybrid_.reset();
+    routing_stats_.reset();
+    layer_expert_bytes_.clear();
+    routing_stats_out_path_.clear();
+    kvflash_drafter_path_.clear();
     if (!target_parked_) {
         free_laguna_target_cache(cache_);
         free_laguna_target_weights(w_);

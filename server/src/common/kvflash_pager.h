@@ -144,10 +144,13 @@ public:
         has_pending_page_in_ = false;
 
 #ifdef KVFLASH_HAS_ASYNC_DMA
-        if (cudaStreamCreate(&page_stream_) != cudaSuccess) {
+        cudaStream_t stream = nullptr;
+        if (cudaStreamCreate(&stream) != cudaSuccess) {
             std::fprintf(stderr, "[kvflash] cudaStreamCreate failed; paging "
                          "falls back to the (blocking) default stream\n");
             page_stream_ = nullptr;
+        } else {
+            page_stream_ = stream;
         }
 #endif
         return true;
@@ -164,7 +167,7 @@ public:
     void reset() {
 #ifdef KVFLASH_HAS_ASYNC_DMA
         if (page_stream_) {
-            cudaStreamSynchronize(page_stream_);
+            cudaStreamSynchronize((cudaStream_t)page_stream_);
         }
         for (auto & st : chunks_) {
             if (st.host_data) {
@@ -195,7 +198,7 @@ public:
         for (int b : free_blocks_) zero_block(b);
 #ifdef KVFLASH_HAS_ASYNC_DMA
         if (page_stream_) {
-            cudaStreamSynchronize(page_stream_);
+            cudaStreamSynchronize((cudaStream_t)page_stream_);
         }
 #endif
     }
@@ -303,7 +306,7 @@ public:
     // tools) must call this first. No-op when async DMA is compiled out.
     void synchronize_paging() {
 #ifdef KVFLASH_HAS_ASYNC_DMA
-        cudaStreamSynchronize(page_stream_);  // page_stream_==nullptr syncs the default stream
+        cudaStreamSynchronize((cudaStream_t)page_stream_);  // nullptr syncs the default stream
 #endif
         has_pending_page_in_ = false;
     }
@@ -366,6 +369,29 @@ public:
     const KvFlashStats & stats() const { return stats_; }
     int resident_blocks() const { return n_blocks_ - (int)free_blocks_.size(); }
     int n_chunks() const { return (int)chunks_.size(); }
+
+    // Fully detach from backend-owned KV tensors. Use during backend shutdown
+    // before the cache/backend are freed; the destructor then becomes a no-op.
+    void detach() {
+        cleanup_();
+        attn_k_.clear();
+        attn_v_.clear();
+        chunks_.clear();
+        free_blocks_.clear();
+        zero_buf_.clear();
+        score_hook = nullptr;
+        cfg_ = {};
+        stats_ = {};
+        k_seg_bytes_ = 0;
+        v_seg_bytes_ = 0;
+        chunk_bytes_ = 0;
+        n_blocks_ = 0;
+        n_head_kv_ = 0;
+        cur_chunk_ = 0;
+        clock_ = 0;
+        epoch_ = 0;
+        has_pending_page_in_ = false;
+    }
 
     // Bumped on every residency change (alloc / page_out / page_in).
     // Callers cache the slot mask and refill only when the epoch moves.
@@ -475,10 +501,10 @@ private:
                     cudaError_t err;
                     if (to_host)
                         err = cudaMemcpyAsync(host_ptr, dev_ptr, seg,
-                                        cudaMemcpyDeviceToHost, page_stream_);
+                                        cudaMemcpyDeviceToHost, (cudaStream_t)page_stream_);
                     else
                         err = cudaMemcpyAsync(dev_ptr, host_ptr, seg,
-                                        cudaMemcpyHostToDevice, page_stream_);
+                                        cudaMemcpyHostToDevice, (cudaStream_t)page_stream_);
                     if (err != cudaSuccess) {
                         std::fprintf(stderr, "[kvflash] cudaMemcpyAsync(%s) failed: %s\n",
                                      to_host ? "D2H" : "H2D", cudaGetErrorString(err));
@@ -517,7 +543,8 @@ private:
                 for (int h = 0; h < n_head_kv_; h++) {
                     const size_t off = (size_t)block * cfg_.chunk_tokens * t->nb[1] + (size_t)h * t->nb[2];
 #ifdef KVFLASH_HAS_ASYNC_DMA
-                    cudaError_t err = cudaMemsetAsync((uint8_t *)t->data + off, 0, seg, page_stream_);
+                    cudaError_t err = cudaMemsetAsync((uint8_t *)t->data + off, 0, seg,
+                                                      (cudaStream_t)page_stream_);
                     if (err != cudaSuccess) {
                         std::fprintf(stderr, "[kvflash] cudaMemsetAsync failed: %s\n",
                                      cudaGetErrorString(err));
@@ -536,9 +563,9 @@ private:
     // caller's responsibility (reset() or destructor via caller).
     void cleanup_() {
 #ifdef KVFLASH_HAS_ASYNC_DMA
-        cudaStreamSynchronize(page_stream_);  // real stream, or default stream if create failed
+        cudaStreamSynchronize((cudaStream_t)page_stream_);  // real stream, or default stream if create failed
         if (page_stream_) {
-            cudaStreamDestroy(page_stream_);
+            cudaStreamDestroy((cudaStream_t)page_stream_);
             page_stream_ = nullptr;
         }
         // Free pinned host buffers unconditionally: page_out() may have
@@ -572,9 +599,11 @@ private:
     uint64_t clock_ = 0;
     uint64_t epoch_ = 0;
 
-#ifdef KVFLASH_HAS_ASYNC_DMA
-    cudaStream_t page_stream_ = nullptr;
-#endif
+    // Keep class layout independent of DFLASH27B_BACKEND_CUDA. LagunaBackend is
+    // instantiated by non-CUDA benchmark/server TUs but constructed in CUDA
+    // dflash_common TUs; a conditional member here changes sizeof(LagunaBackend)
+    // across TUs and corrupts the object at construction.
+    void * page_stream_ = nullptr;
     bool has_pending_page_in_ = false;
 };
 
