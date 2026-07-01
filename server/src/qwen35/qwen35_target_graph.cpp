@@ -33,6 +33,7 @@
 #include "internal.h"
 #include "delta_net_chunked.h"
 #include "kv_quant.h"
+#include "qwen35/qwen35_graph_options.h"
 #include "qwen35_ops.h"
 #include "qwen35moe_ffn.h"
 
@@ -128,10 +129,10 @@ bool create_target_cache_partial(const TargetWeights & w,
     out.kv_k_type = kv_k_type;
     out.kv_v_type = kv_v_type;
 
-    // Graph-level FWHT K-rotation (TurboQuant-style outlier spreading with
-    // standard quant types that keep fast FA kernel paths on all arches).
-    // Skip for TQ3_0 K cache — that type already applies WHT during quantization.
-    out.kv_k_rotated = (kv_k_type != GGML_TYPE_TQ3_0);
+    // Graph-level FWHT K-rotation (TurboQuant-style outlier spreading).
+    // q4_0 on Ampere skips it by default for parity with llama.cpp's leaner
+    // q4_0 path; DFLASH_FORCE_WHT=1 restores the old graph-level rotation.
+    out.kv_k_rotated = qwen35_should_use_graph_wht_k_rotation(kv_k_type);
 
     const bool needs_256_stride =
         kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0;
