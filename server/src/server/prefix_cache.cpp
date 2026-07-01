@@ -346,23 +346,27 @@ void PrefixCache::move_full_to_end(int idx) {
 PrefixCache::InlineLookup PrefixCache::lookup(const std::vector<int32_t> & prompt_ids) {
     if (disabled_) return {};
 
-    auto boundaries = find_all_boundaries(prompt_ids, markers_);
     InlineLookup best;
+    int best_idx = -1;
 
-    for (int cut : boundaries) {
-        auto key = hash_prefix(prompt_ids.data(), cut);
-        int idx = find_entry(key);
-        if (idx >= 0) {
-            if (cut > best.key_len) {
-                best.slot = entries_[idx].slot;
-                best.key_len = cut;
-                best.snapshot_len = entries_[idx].snapshot_len;
-            }
-            move_to_end(idx);
+    // Entries are stored only for exact physical snapshot lengths. Most are
+    // chat-boundary prefixes, but KVFlash may save at the previous pool chunk
+    // boundary. Restoring that exact shorter prefix and prefilling the suffix is
+    // still correct, so lookup must consider stored prefixes directly.
+    for (int idx = 0; idx < (int)entries_.size(); ++idx) {
+        const auto & e = entries_[(size_t)idx];
+        const int key_len = (int)e.ids.size();
+        if (key_len <= best.key_len || key_len > (int)prompt_ids.size()) continue;
+        if (std::equal(e.ids.begin(), e.ids.end(), prompt_ids.begin())) {
+            best.slot = e.slot;
+            best.key_len = key_len;
+            best.snapshot_len = e.snapshot_len;
+            best_idx = idx;
         }
     }
 
     if (best.slot >= 0) {
+        move_to_end(best_idx);
         lifetime_hits_.fetch_add(1, std::memory_order_relaxed);
         std::fprintf(stderr,
             "[pc] lookup hit slot=%d key_len=%d snapshot_len=%d (of %zu total)\n",
@@ -424,15 +428,33 @@ std::pair<int, int> PrefixCache::prepare_inline_snap(
 void PrefixCache::confirm_inline_snap(int slot, int target_cut, int snapshot_len,
                                       const std::vector<int32_t> & prompt_ids) {
     if (disabled_) return;
+    if (slot < 0 || target_cut <= 0 || snapshot_len <= 0 ||
+        target_cut > (int)prompt_ids.size() ||
+        snapshot_len > target_cut || snapshot_len > (int)prompt_ids.size()) {
+        std::fprintf(stderr,
+            "[pc] refusing inline-snap slot=%d key_len=%d snapshot_len=%d prompt=%zu\n",
+            slot, target_cut, snapshot_len, prompt_ids.size());
+        abort_inline_snap(slot);
+        return;
+    }
 
     // Evict the reserved entry (if any).
     evict_pending_inline();
 
-    insert_inline_entry(slot, target_cut, snapshot_len, prompt_ids,
-                        /*replace_slot_entries=*/true);
-    std::fprintf(stderr,
-        "[pc] inline-snap committed slot=%d key_len=%d snapshot_len=%d\n",
-        slot, target_cut, snapshot_len);
+    if (snapshot_len == target_cut) {
+        insert_inline_entry(slot, target_cut, snapshot_len, prompt_ids,
+                            /*replace_slot_entries=*/true);
+        std::fprintf(stderr,
+            "[pc] inline-snap committed slot=%d key_len=%d snapshot_len=%d\n",
+            slot, target_cut, snapshot_len);
+    } else {
+        insert_inline_entry(slot, snapshot_len, snapshot_len, prompt_ids,
+                            /*replace_slot_entries=*/true);
+        std::fprintf(stderr,
+            "[pc] inline-snap committed slot=%d key_len=%d snapshot_len=%d "
+            "(requested_key_len=%d)\n",
+            slot, snapshot_len, snapshot_len, target_cut);
+    }
 }
 
 void PrefixCache::alias_inline_snap(int slot, int target_cut, int snapshot_len,
@@ -440,14 +462,22 @@ void PrefixCache::alias_inline_snap(int slot, int target_cut, int snapshot_len,
     if (disabled_) return;
 
     // A failed prepared snap may have reserved an eviction victim. Release that
-    // reservation before publishing a logical alias to an existing snapshot.
+    // reservation. Do not publish the longer logical key for a shorter physical
+    // snapshot: restore must materialize exactly the key length by construction.
     evict_pending_inline();
-
-    insert_inline_entry(slot, target_cut, snapshot_len, prompt_ids,
-                        /*replace_slot_entries=*/false);
-    std::fprintf(stderr,
-        "[pc] inline-snap aliased slot=%d key_len=%d snapshot_len=%d\n",
-        slot, target_cut, snapshot_len);
+    if (slot >= 0 && snapshot_len > 0 && snapshot_len <= target_cut &&
+        snapshot_len <= (int)prompt_ids.size()) {
+        insert_inline_entry(slot, snapshot_len, snapshot_len, prompt_ids,
+                            /*replace_slot_entries=*/false);
+        std::fprintf(stderr,
+            "[pc] inline-snap alias committed slot=%d key_len=%d snapshot_len=%d "
+            "(requested_key_len=%d)\n",
+            slot, snapshot_len, snapshot_len, target_cut);
+    } else {
+        std::fprintf(stderr,
+            "[pc] inline-snap alias skipped slot=%d key_len=%d snapshot_len=%d\n",
+            slot, target_cut, snapshot_len);
+    }
 }
 
 void PrefixCache::abort_inline_snap(int /*slot*/) {

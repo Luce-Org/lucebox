@@ -4,8 +4,18 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 
 namespace dflash::common {
+
+static int qwen35_non_pooled_kvpad_max_row() {
+    const char * env = std::getenv("DFLASH_QWEN35_KVPAD_MAX_ROW");
+    if (env) return std::atoi(env);
+    // q4_0 full-cache SET_ROWS is not reliable in the full long-context Qwen
+    // AR graph near 89k rows on CUDA. Keep the fast path below the observed
+    // cliff and use the exact legacy copy graph above it.
+    return 88000;
+}
 
 // ── build_layer_step ────────────────────────────────────────────
 
@@ -156,6 +166,7 @@ bool build_layer_prefn_step(
         sg.inp_embed, sg.positions, sg.attn_mask,
         kv_start, n_tokens, fa_window,
         sg.kv_write_rows,
+        sg.kv_write_row_base,
         /*skip_gdn_intermediate=*/true);
     if (!go.residual || !go.post) return false;
     sg.ffn_residual = go.residual;
@@ -327,16 +338,37 @@ bool build_target_step(
     // region is reused by graph execution) and set_rows carries per-token
     // physical slots, so the slot-mapped write stays active for masked,
     // multi-token, and feature-capturing forwards (decode AND spec verify).
+    const bool non_pooled_step_kv_write =
+        n_tokens == 1 && fa_window == 0 && !with_mask && !capture;
+    const bool q4_full_cache_kv =
+        !kvflash_mask &&
+        (cache.kv_k_type == GGML_TYPE_Q4_0 || cache.kv_v_type == GGML_TYPE_Q4_0);
+    const int non_pooled_kvpad_max_row = qwen35_non_pooled_kvpad_max_row();
+    const bool non_pooled_step_kv_write_safe =
+        !q4_full_cache_kv || non_pooled_kvpad_max_row <= 0 ||
+        kv_start < non_pooled_kvpad_max_row;
+    static bool s_logged_q4_guard = false;
+    if (non_pooled_step_kv_write && q4_full_cache_kv &&
+        !non_pooled_step_kv_write_safe && !s_logged_q4_guard) {
+        std::fprintf(stderr,
+            "[qwen35] q4_0 non-pooled KV write fallback at row=%d "
+            "(DFLASH_QWEN35_KVPAD_MAX_ROW=%d)\n",
+            kv_start, non_pooled_kvpad_max_row);
+        s_logged_q4_guard = true;
+    }
     const bool use_kv_write_rows =
         !g_no_kvpad && !capture_delta_intermediate &&
         (kvflash_mask
              ? (fa_window == 0)
-             : (n_tokens == 1 && fa_window == 0 && !with_mask && !capture));
+             : (non_pooled_step_kv_write && non_pooled_step_kv_write_safe));
     if (use_kv_write_rows) {
         sg.kv_write_rows = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_I64,
                                               n_tokens, w.n_head_kv);
         ggml_set_name(sg.kv_write_rows, "kv_write_rows");
         ggml_set_input(sg.kv_write_rows);
+        sg.kv_write_row_base = (!kvflash_mask && non_pooled_step_kv_write)
+                                    ? (kv_start & ~255)
+                                    : 0;
     }
 
     QwenGraphInputs gi{};
@@ -351,6 +383,7 @@ bool build_target_step(
     gi.fa_window                  = fa_window;
     gi.last_token_logits_only     = last_token_logits_only;
     gi.kv_write_rows              = sg.kv_write_rows;
+    gi.kv_write_row_base          = sg.kv_write_row_base;
     gi.q_capture                  = capture_qk;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);

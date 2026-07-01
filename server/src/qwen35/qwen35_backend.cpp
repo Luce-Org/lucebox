@@ -1571,16 +1571,25 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         }
 
         // Fill kv_write_rows with this step's cache slot for set_rows:
-        // the logical position directly, or its pool slot in kvflash mode.
+        // a pooled physical slot, or a bucket-local logical row in non-pool mode.
         if (sg_.kv_write_rows) {
             const int n_head_kv = w_.n_head_kv;
-            const int64_t slot = pool ? (int64_t)kvflash_pager_.slot_for(committed)
-                                      : (int64_t)committed;
-            if (pool && slot < 0) {
-                std::fprintf(stderr, "[kvflash] no pool slot at pos %d "
-                                     "(pool %d exhausted)\n",
-                             committed, kvflash_tokens_);
-                set_last_error("kvflash: no evictable pool block");
+            const int64_t slot = pool
+                ? (int64_t)kvflash_pager_.slot_for(committed)
+                : (int64_t)committed - (int64_t)sg_.kv_write_row_base;
+            if (slot < 0 || (!pool && slot >= 256)) {
+                if (pool) {
+                    std::fprintf(stderr, "[kvflash] no pool slot at pos %d "
+                                         "(pool %d exhausted)\n",
+                                 committed, kvflash_tokens_);
+                } else {
+                    std::fprintf(stderr, "[qwen35] invalid bucket-local KV row "
+                                         "(pos=%d base=%d row=%lld)\n",
+                                 committed, sg_.kv_write_row_base,
+                                 (long long)slot);
+                }
+                set_last_error(pool ? "kvflash: no evictable pool block"
+                                    : "qwen35: invalid bucket-local KV row");
                 return false;
             }
             std::vector<int64_t> row_vals(n_head_kv, slot);

@@ -2958,7 +2958,9 @@ void HttpServer::worker_loop() {
                     } else {
                         prefix_cache_.confirm_inline_snap(snap_slot, snap_cut, saved_pos,
                                                           effective_prompt);
-                        // Track for shutdown save.
+                        // Track the exact physical snapshot prefix for shutdown
+                        // saves. Shorter pooled snapshots are published only
+                        // under their saved length, never as the later boundary.
                         slot_tokens_[snap_slot] = std::vector<int32_t>(
                             effective_prompt.begin(), effective_prompt.begin() + saved_pos);
                         // Do not persist alias-style entries as if the slot
