@@ -572,7 +572,29 @@ bool load_target_gguf_laguna_partial(const std::string & path,
 void free_laguna_target_weights(LagunaTargetWeights & w) {
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     if (w.ctx) { ggml_free(w.ctx);                w.ctx = nullptr; }
-    // CpuEmbedder destructor handles mmap.
+    // Release the CPU embedding mmap now so repeated free/reload cycles and
+    // later member destruction cannot touch stale ownership fields.
+#if defined(_WIN32)
+    if (w.embedder.mmap_addr)                         UnmapViewOfFile(w.embedder.mmap_addr);
+    if (w.embedder.mmap_hmap)                         CloseHandle(w.embedder.mmap_hmap);
+    if (w.embedder.mmap_hfile != INVALID_HANDLE_VALUE) CloseHandle(w.embedder.mmap_hfile);
+    w.embedder.mmap_addr = nullptr;
+    w.embedder.mmap_len = 0;
+    w.embedder.mmap_hfile = INVALID_HANDLE_VALUE;
+    w.embedder.mmap_hmap = nullptr;
+#else
+    if (w.embedder.mmap_addr) ::munmap(w.embedder.mmap_addr, w.embedder.mmap_len);
+    if (w.embedder.mmap_fd >= 0) ::close(w.embedder.mmap_fd);
+    w.embedder.mmap_addr = nullptr;
+    w.embedder.mmap_len = 0;
+    w.embedder.mmap_fd = -1;
+#endif
+    w.embedder.tok_embd_bytes = nullptr;
+    w.embedder.tok_embd_type = GGML_TYPE_COUNT;
+    w.embedder.n_embd = 0;
+    w.embedder.n_vocab = 0;
+    w.embedder.row_bytes = 0;
+    w.embedder.tok_embd_owned.clear();
     w.layers.clear();
     w.tok_embd = nullptr;
     w.out_norm = nullptr;
