@@ -125,6 +125,13 @@ bool build_layer_range_step(
     if (!sg.ctx) return false;
 
     const int hidden = w.n_embd;
+    bool has_attn = false;
+    for (int il = layer_begin; il < layer_end; ++il) {
+        if (((il + 1) % w.full_attention_interval) == 0) {
+            has_attn = true;
+            break;
+        }
+    }
 
     sg.inp_embed = ggml_view_2d(sg.ctx, act_in,
         hidden, n_tokens,
@@ -132,29 +139,31 @@ bool build_layer_range_step(
     ggml_set_name(sg.inp_embed, "inp_embed");
     ggml_set_input(sg.inp_embed);
 
-    sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
-    ggml_set_name(sg.positions, "positions");
-    ggml_set_input(sg.positions);
+    if (has_attn) {
+        sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
+        ggml_set_name(sg.positions, "positions");
+        ggml_set_input(sg.positions);
 
-    if (with_mask) {
-        int phys_ctx = cache.max_ctx;
-        if (kvflash) {
-            for (ggml_tensor * t : cache.attn_k) {
-                if (t) { phys_ctx = std::min(phys_ctx, (int)t->ne[1]); break; }
+        if (with_mask) {
+            int phys_ctx = cache.max_ctx;
+            if (kvflash) {
+                for (ggml_tensor * t : cache.attn_k) {
+                    if (t) { phys_ctx = std::min(phys_ctx, (int)t->ne[1]); break; }
+                }
             }
+            const int max_win_len = phys_ctx + n_tokens;
+            const int kv_pad = align_up(max_win_len, kq_stride_pad);
+            const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
+            sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
+            ggml_set_name(sg.attn_mask, "attn_mask");
+            ggml_set_input(sg.attn_mask);
         }
-        const int max_win_len = phys_ctx + n_tokens;
-        const int kv_pad = align_up(max_win_len, kq_stride_pad);
-        const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
-        sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
-        ggml_set_name(sg.attn_mask, "attn_mask");
-        ggml_set_input(sg.attn_mask);
-    }
-    if (kvflash) {
-        sg.kv_write_rows = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_I64,
-                                              n_tokens, w.n_head_kv);
-        ggml_set_name(sg.kv_write_rows, "kv_write_rows");
-        ggml_set_input(sg.kv_write_rows);
+        if (kvflash) {
+            sg.kv_write_rows = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_I64,
+                                                  n_tokens, w.n_head_kv);
+            ggml_set_name(sg.kv_write_rows, "kv_write_rows");
+            ggml_set_input(sg.kv_write_rows);
+        }
     }
 
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
