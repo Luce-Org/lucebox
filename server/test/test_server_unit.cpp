@@ -138,6 +138,12 @@ static json shell_tools() {
     });
 }
 
+static json optional_shell_tools() {
+    json tools = shell_tools();
+    tools[0]["input_schema"].erase("required");
+    return tools;
+}
+
 static SseEmitter make_emitter(ApiFormat fmt, json tools = json::array(),
                                bool started_in_thinking = false) {
     return SseEmitter(fmt, "test_id_001", "test-model", 10,
@@ -343,6 +349,18 @@ static void test_parse_single_tool_bare_json_args() {
         TEST_ASSERT(result.tool_calls[0].name == "shell");
         auto args = json::parse(result.tool_calls[0].arguments);
         TEST_ASSERT(args["command"] == "git branch --show-current");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+static void test_parse_single_tool_bare_json_args_allows_empty_optional_object() {
+    auto result = parse_tool_calls("{}", optional_shell_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "shell");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args.is_object());
+        TEST_ASSERT(args.empty());
     }
     TEST_ASSERT(result.cleaned_text.empty());
 }
@@ -952,6 +970,20 @@ static void test_emitter_single_tool_bare_json_args() {
         TEST_ASSERT(args["command"] == "git branch --show-current");
     }
     TEST_ASSERT(em.accumulated_text().empty());
+}
+
+static void test_emitter_bare_json_args_do_not_trigger_after_content() {
+    auto em = make_emitter(ApiFormat::ANTHROPIC, shell_tools());
+    em.emit_start();
+    em.emit_token("This answer already emitted visible prose before JSON appears.");
+    em.emit_token("                    ");
+    em.emit_token("{\"command\":\"git status\"}");
+    em.emit_finish(16);
+
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text().find("visible prose") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("\"command\":\"git status\"") !=
+                std::string::npos);
 }
 
 static void test_emitter_bare_function_tool_buffer_detection() {
@@ -4273,6 +4305,7 @@ int main() {
     RUN_TEST(test_parse_bare_function_xml);
     RUN_TEST(test_parse_json_tool_call);
     RUN_TEST(test_parse_single_tool_bare_json_args);
+    RUN_TEST(test_parse_single_tool_bare_json_args_allows_empty_optional_object);
     RUN_TEST(test_parse_single_tool_bare_json_args_rejects_prose);
     RUN_TEST(test_parse_single_tool_bare_json_args_rejects_ambiguous_tools);
     RUN_TEST(test_parse_no_tools);
@@ -4317,6 +4350,7 @@ int main() {
     RUN_TEST(test_emitter_tool_buffer_detection);
     RUN_TEST(test_emitter_anthropic_tool_use_blocks);
     RUN_TEST(test_emitter_single_tool_bare_json_args);
+    RUN_TEST(test_emitter_bare_json_args_do_not_trigger_after_content);
     RUN_TEST(test_emitter_bare_function_tool_buffer_detection);
     RUN_TEST(test_emitter_does_not_leak_malformed_tool_xml);
     RUN_TEST(test_emitter_parses_tool_call_missing_outer_close);

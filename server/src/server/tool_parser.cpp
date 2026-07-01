@@ -481,7 +481,8 @@ static bool object_matches_tool_schema(const json & obj, const json * schema) {
         }
     }
 
-    return has_required || saw_declared_key || props == nullptr || props->empty();
+    return has_required || saw_declared_key || obj.empty() ||
+           props == nullptr || props->empty();
 }
 
 static bool parse_single_tool_arg_object(const json & obj, const json & tools,

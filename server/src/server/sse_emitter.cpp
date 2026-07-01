@@ -429,7 +429,8 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
             continue;
         }
 
-        if (starts_with_potential_bare_json_tool(window_, tools_)) {
+        if (accumulated_content_.find_first_not_of(" \t\n\r") == std::string::npos &&
+            starts_with_potential_bare_json_tool(window_, tools_)) {
             tool_buffer_ = window_;
             tool_buffer_fallback_to_content_ = true;
             window_.clear();
