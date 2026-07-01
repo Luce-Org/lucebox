@@ -174,7 +174,7 @@ private:
     };
     std::vector<LruEntry> entries_;
     int next_slot_ = 0;
-    PrefixHash pending_evict_key_{};
+    int pending_evict_slot_ = -1;
     bool has_pending_evict_ = false;
 
     // Full-cache state
@@ -203,14 +203,20 @@ private:
     // data race per the C++ memory model. Bump these alongside every
     // push_back / erase / clear so the public introspection counters
     // stay well-defined. (Codex r1 P2 follow-up.)
-    std::atomic<int64_t> entries_size_count_{0};       // mirrors entries_.size()
+    std::atomic<int64_t> entries_size_count_{0};       // mirrors logical entries_.size()
+    std::atomic<int64_t> inline_slot_count_{0};        // mirrors distinct physical inline slots
     std::atomic<int64_t> full_entries_size_count_{0};  // mirrors full_entries_.size()
 
     // Helpers
     int find_entry(const PrefixHash & h) const;
     void move_to_end(int idx);
     void erase_inline_at(int idx);
+    void erase_inline_slot(int slot);
     void evict_pending_inline();
+    bool inline_slot_in_use(int slot) const;
+    int count_inline_slots() const;
+    int select_inline_evict_slot() const;
+    void publish_inline_counts();
     void insert_inline_entry(int slot, int target_cut, int snapshot_len,
                              const std::vector<int32_t> & prompt_ids,
                              bool replace_slot_entries);

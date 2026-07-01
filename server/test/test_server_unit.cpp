@@ -1447,6 +1447,39 @@ static void test_prefix_cache_aliases_new_boundary_to_restored_snapshot() {
     TEST_ASSERT(base_hit.snapshot_len == 4);
 }
 
+static void test_prefix_cache_alias_eviction_preserves_shared_ancestor_slot() {
+    auto markers = synthetic_chat_markers();
+    PrefixCache cache(2, markers);
+    std::vector<int32_t> base = {1, 100, 2, 3, 200};
+
+    auto base_prep = cache.prepare_inline_snap(base);
+    TEST_ASSERT(base_prep.first == 0);
+    TEST_ASSERT(base_prep.second == 4);
+    cache.confirm_inline_snap(base_prep.first, base_prep.second,
+                              base_prep.second, base);
+
+    std::vector<int32_t> branch_a = {1, 100, 2, 3, 200, 2, 3, 300};
+    cache.alias_inline_snap(base_prep.first, 7, 4, branch_a);
+
+    std::vector<int32_t> branch_b = {1, 100, 2, 3, 201, 2, 3, 301};
+    auto branch_b_prep = cache.prepare_inline_snap(branch_b);
+    TEST_ASSERT(branch_b_prep.first == 1);
+    TEST_ASSERT(branch_b_prep.second == 7);
+    cache.confirm_inline_snap(branch_b_prep.first, branch_b_prep.second,
+                              branch_b_prep.second, branch_b);
+
+    std::vector<int32_t> branch_c = {1, 100, 2, 3, 202, 2, 3, 302};
+    auto branch_c_prep = cache.prepare_inline_snap(branch_c);
+    TEST_ASSERT(branch_c_prep.first == branch_b_prep.first);
+    TEST_ASSERT(branch_c_prep.first != base_prep.first);
+    cache.abort_inline_snap(branch_c_prep.first);
+
+    auto base_hit = cache.lookup(base);
+    TEST_ASSERT(base_hit.slot == base_prep.first);
+    TEST_ASSERT(base_hit.key_len == 4);
+    TEST_ASSERT(base_hit.snapshot_len == 4);
+}
+
 // ── Prefix-aware eviction policy (model-free) ───────────────────────────
 
 static void test_evict_empty_is_zero() {
@@ -4552,6 +4585,7 @@ int main() {
     RUN_TEST(test_prefix_cache_prepares_newest_boundary);
     RUN_TEST(test_prefix_cache_lookup_grows_chain_from_exact_prefix);
     RUN_TEST(test_prefix_cache_aliases_new_boundary_to_restored_snapshot);
+    RUN_TEST(test_prefix_cache_alias_eviction_preserves_shared_ancestor_slot);
     RUN_TEST(test_evict_empty_is_zero);
     RUN_TEST(test_evict_single_is_zero);
     RUN_TEST(test_evict_chain_keeps_ancestors);
