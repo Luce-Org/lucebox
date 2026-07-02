@@ -5,6 +5,7 @@
 
 #include "qwen35_backend.h"
 #include "qwen35moe_backend.h"
+#include "qwen35moe_layer_split_adapter.h"
 #include "laguna_backend.h"
 #include "laguna_layer_split_adapter.h"
 #include "qwen3_backend.h"
@@ -24,7 +25,7 @@ std::string detect_arch(const char * model_path) {
 }
 
 bool arch_supports_remote_draft(const std::string & arch) {
-    return arch == "qwen35";
+    return arch == "qwen35" || arch == "qwen35moe";
 }
 
 bool arch_supports_pflash_compression(const std::string & arch) {
@@ -101,11 +102,39 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         return backend;
 
     } else if (arch == "qwen35moe") {
+        if (args.device.is_layer_split()) {
+            Qwen35MoeLayerSplitAdapterConfig cfg;
+            cfg.target_path        = args.model_path;
+            cfg.draft_path         = args.draft_path;
+            cfg.device             = args.device;
+            cfg.draft_gpu          = args.draft_device.gpu;
+            cfg.remote_draft       = args.remote_draft;
+            cfg.remote_target_shard = args.remote_target_shard;
+            cfg.fa_window          = args.fa_window;
+            cfg.kq_stride_pad      = args.kq_stride_pad;
+            cfg.draft_swa_window   = args.draft_swa_window;
+            cfg.draft_ctx_max      = args.draft_ctx_max;
+            cfg.chunk              = args.chunk;
+            cfg.max_verify_tokens  = args.ddtree_mode
+                ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, args.ddtree_budget + 1)
+                : DFLASH27B_DRAFT_BLOCK_SIZE;
+            cfg.run_dflash         = args.draft_path != nullptr;
+
+            auto adapter = std::make_unique<Qwen35MoeLayerSplitAdapter>(cfg);
+            auto backend = std::make_unique<LayerSplitBackend>(std::move(adapter));
+            if (!backend->init()) {
+                std::fprintf(stderr, "[backend_factory] LayerSplitBackend(qwen35moe) init failed\n");
+                return nullptr;
+            }
+            return backend;
+        }
+
         Qwen35Config cfg;
         cfg.target_path        = args.model_path;
         cfg.draft_path         = args.draft_path;
         cfg.device             = args.device;
         cfg.draft_gpu          = args.draft_device.gpu;
+        cfg.remote_draft       = args.remote_draft;
         cfg.stream_fd          = args.stream_fd;
         cfg.fa_window          = args.fa_window;
         cfg.kq_stride_pad      = args.kq_stride_pad;

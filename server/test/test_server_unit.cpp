@@ -20,6 +20,8 @@
 #include "common/sampler.h"
 #include "common/backend_precision.h"
 #include "common/backend_ipc.h"
+#include "common/backend_factory.h"
+#include "common/moe_hybrid_ffn_eval.h"
 #include "placement/pflash_placement.h"
 #include "common/io_utils.h"
 #include "placement/placement_config.h"
@@ -188,6 +190,13 @@ static void test_utf8_sanitize_replaces_invalid() {
 
 static void test_utf8_sanitize_empty() {
     TEST_ASSERT(utf8_sanitize("") == "");
+}
+
+static void test_arch_supports_remote_draft() {
+    TEST_ASSERT(arch_supports_remote_draft("qwen35"));
+    TEST_ASSERT(arch_supports_remote_draft("qwen35moe"));
+    TEST_ASSERT(!arch_supports_remote_draft("laguna"));
+    TEST_ASSERT(!arch_supports_remote_draft("gemma4"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4340,6 +4349,7 @@ int main() {
     RUN_TEST(test_backend_precision_cuda_sm_policy);
     RUN_TEST(test_backend_precision_hip_arch_policy);
     RUN_TEST(test_backend_precision_activation_type_combine);
+    RUN_TEST(test_arch_supports_remote_draft);
     RUN_TEST(test_layer_split_backend_inline_snapshot_and_restore_delta);
     RUN_TEST(test_layer_split_backend_sampling_capability_gate);
     RUN_TEST(test_layer_split_backend_chunks_prefill_by_adapter_limit);

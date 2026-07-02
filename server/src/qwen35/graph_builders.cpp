@@ -95,6 +95,101 @@ bool build_layer_step(
     return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
 }
 
+bool build_layer_range_step(
+    StepGraph & sg,
+    const TargetWeights & w,
+    TargetCache & cache,
+    ggml_backend_t backend,
+    int layer_begin,
+    int layer_end,
+    ggml_tensor * act_in,
+    ggml_tensor * act_out,
+    int chunk_start,
+    int n_tokens,
+    int kv_start,
+    bool with_mask,
+    int fa_window,
+    int kq_stride_pad,
+    bool kvflash) {
+    if (kvflash) with_mask = true;
+    if (layer_begin < 0 || layer_end > w.n_layer || layer_begin >= layer_end) {
+        return false;
+    }
+    step_graph_free(sg);
+
+    ggml_init_params ip{};
+    ip.mem_size   = 512 * 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    sg.ctx = ggml_init(ip);
+    if (!sg.ctx) return false;
+
+    const int hidden = w.n_embd;
+    bool has_attn = false;
+    for (int il = layer_begin; il < layer_end; ++il) {
+        if (((il + 1) % w.full_attention_interval) == 0) {
+            has_attn = true;
+            break;
+        }
+    }
+
+    sg.inp_embed = ggml_view_2d(sg.ctx, act_in,
+        hidden, n_tokens,
+        act_in->nb[1], (size_t)chunk_start * act_in->nb[1]);
+    ggml_set_name(sg.inp_embed, "inp_embed");
+    ggml_set_input(sg.inp_embed);
+
+    if (has_attn) {
+        sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
+        ggml_set_name(sg.positions, "positions");
+        ggml_set_input(sg.positions);
+
+        if (with_mask) {
+            int phys_ctx = cache.max_ctx;
+            if (kvflash) {
+                for (ggml_tensor * t : cache.attn_k) {
+                    if (t) { phys_ctx = std::min(phys_ctx, (int)t->ne[1]); break; }
+                }
+            }
+            const int max_win_len = phys_ctx + n_tokens;
+            const int kv_pad = align_up(max_win_len, kq_stride_pad);
+            const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
+            sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
+            ggml_set_name(sg.attn_mask, "attn_mask");
+            ggml_set_input(sg.attn_mask);
+        }
+        if (kvflash) {
+            sg.kv_write_rows = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_I64,
+                                                  n_tokens, w.n_head_kv);
+            ggml_set_name(sg.kv_write_rows, "kv_write_rows");
+            ggml_set_input(sg.kv_write_rows);
+        }
+    }
+
+    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+
+    ggml_tensor * cur = sg.inp_embed;
+    for (int il = layer_begin; il < layer_end; ++il) {
+        cur = build_qwen35_layer(
+            sg.ctx, sg.gf, w, cache, il,
+            cur, sg.positions, sg.attn_mask,
+            kv_start, n_tokens, /*capture=*/false, fa_window,
+            /*q_tail_capture=*/nullptr, /*q_tail_start=*/0,
+            nullptr, sg.kv_write_rows);
+        if (!cur) return false;
+    }
+
+    ggml_tensor * out_view = ggml_view_2d(sg.ctx, act_out,
+        hidden, n_tokens,
+        act_out->nb[1], (size_t)chunk_start * act_out->nb[1]);
+    ggml_build_forward_expand(sg.gf, ggml_cpy(sg.ctx, cur, out_view));
+
+    if (!sg.alloc) {
+        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+}
+
 bool build_layer_prefn_step(
     StepGraph & sg,
     const TargetWeights & w,
