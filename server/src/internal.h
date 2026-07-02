@@ -263,6 +263,18 @@ struct DraftDominoWeights {
     ggml_tensor * head_b2     = nullptr;  // [vocab_size] f32
 };
 
+struct DraftDSparkWeights {
+    bool enabled = false;
+    int  markov_rank = 0;
+    int  vocab_size = 0;
+    int  confidence_dim = 0;
+
+    ggml_tensor * markov_w1    = nullptr;  // [markov_rank, vocab_size]
+    ggml_tensor * markov_w2    = nullptr;  // [markov_rank, vocab_size]
+    ggml_tensor * confidence_w = nullptr;  // [confidence_dim, 1]
+    ggml_tensor * confidence_b = nullptr;  // [1] f32
+};
+
 struct DraftWeights {
     ggml_context *    ctx = nullptr;
     ggml_backend_t    backend = nullptr;
@@ -301,6 +313,22 @@ struct DraftWeights {
     // speculative decode corrects each draft token with a lightweight GRU
     // conditioned on the realized prefix before target verification.
     DraftDominoWeights domino;
+
+    // Optional DSpark/DeepSpec-style Markov correction head. When present,
+    // greedy chain decode adds a low-rank previous-token bias before argmax.
+    DraftDSparkWeights dspark;
+};
+
+struct DraftLoraSpec {
+    // Empty name means this spec belongs to the default LoRA stack. Named
+    // specs create switchable request-selectable variants.
+    std::string name;
+    std::string path;
+    float       scale = 1.0f;
+};
+
+struct DraftLoadOptions {
+    std::vector<DraftLoraSpec> loras;
 };
 
 bool load_draft_safetensors(const std::string & path,
@@ -315,7 +343,8 @@ bool load_draft_safetensors(const std::string & path,
 bool load_draft_gguf(const std::string & path,
                      ggml_backend_t backend,
                      DraftWeights & out,
-                     const TargetWeights * target = nullptr);
+                     const TargetWeights * target = nullptr,
+                     const DraftLoadOptions * options = nullptr);
 
 void free_draft_weights(DraftWeights & w);
 

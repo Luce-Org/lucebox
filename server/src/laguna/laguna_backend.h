@@ -36,6 +36,7 @@ namespace dflash::common {
 struct LagunaBackendArgs {
     std::string target_path;
     std::string draft_path;
+    std::vector<DraftLoraSpec> draft_loras;
     int         draft_gpu = -1;
     int         draft_ctx_max = 2048;
     bool        ddtree_mode = false;
@@ -46,6 +47,12 @@ struct LagunaBackendArgs {
     int         max_ctx   = 16384;
     int         chunk     = 2048;
     ggml_type   kv_type   = GGML_TYPE_Q8_0;
+};
+
+struct LagunaDraftVariant {
+    std::string                name;
+    std::vector<DraftLoraSpec> loras;
+    DraftWeights               weights;
 };
 
 class LagunaBackend : public ModelBackend {
@@ -100,7 +107,10 @@ private:
 
     // DFlash speculative decode
     ggml_backend_t                              draft_backend_ = nullptr;
-    DraftWeights                                dw_{};
+    std::vector<LagunaDraftVariant>             draft_variants_;
+    DraftWeights *                              active_dw_ = nullptr;
+    std::string                                 active_draft_lora_;
+    std::string                                 default_draft_lora_ = "base";
     DraftFeatureMirror                          feature_mirror_{};
     LagunaDFlashTarget *                        dflash_target_ = nullptr;
     bool                                        draft_parked_ = false;
@@ -178,6 +188,7 @@ private:
     void maybe_post_request_swap();
 
     bool load_decode_draft();
+    bool select_decode_draft(const std::string & name);
     void free_decode_draft();
     bool do_spec_decode(int committed, int n_gen,
                         std::vector<int32_t> & out_tokens,
