@@ -118,8 +118,11 @@ bool read_lora_tensor_f32(const DraftLoraAdapter & adapter,
         err = "missing LoRA tensor";
         return false;
     }
-    if (adapter.data_start + ref.offset + ref.size > adapter.mmap.size()) {
-        err = "LoRA tensor overflows file: " + std::string(ref.tensor->name);
+    if (!gguf_tensor_in_file(adapter.data_start, ref.offset, ref.size, adapter.mmap.size())) {
+        err = gguf_bounds_error("draft LoRA", ref.tensor->name,
+                                ggml_type_name(ref.tensor->type),
+                                adapter.data_start, ref.offset, ref.size,
+                                adapter.mmap.size());
         return false;
     }
     const int64_t n = ggml_nelements(ref.tensor);
@@ -127,31 +130,33 @@ bool read_lora_tensor_f32(const DraftLoraAdapter & adapter,
         err = "LoRA tensor has invalid element count: " + std::string(ref.tensor->name);
         return false;
     }
-    out.resize((size_t)n);
-    const uint8_t * src = (const uint8_t *)adapter.mmap.data() + adapter.data_start + ref.offset;
-    if (ref.tensor->type == GGML_TYPE_F32) {
-        if (ref.size != (size_t)n * sizeof(float)) {
-            err = "LoRA F32 tensor byte size mismatch: " + std::string(ref.tensor->name);
+    size_t elt_size = 0;
+    switch (ref.tensor->type) {
+        case GGML_TYPE_F32: elt_size = sizeof(float);       break;
+        case GGML_TYPE_F16: elt_size = sizeof(ggml_fp16_t); break;
+        default:
+            err = "unsupported LoRA tensor type for " + std::string(ref.tensor->name) +
+                  ": " + ggml_type_name(ref.tensor->type);
             return false;
-        }
+    }
+    // n comes from file metadata; reject on the (bounds-checked) byte size
+    // before resizing so a corrupt element count cannot force an allocation.
+    if (ref.size % elt_size != 0 || (uint64_t)n != ref.size / elt_size) {
+        err = "LoRA tensor byte size mismatch: " + std::string(ref.tensor->name);
+        return false;
+    }
+    const uint8_t * src = (const uint8_t *)adapter.mmap.data() + adapter.data_start + ref.offset;
+    out.resize((size_t)n);
+    if (ref.tensor->type == GGML_TYPE_F32) {
         const float * p = reinterpret_cast<const float *>(src);
         std::copy(p, p + n, out.begin());
-        return true;
-    }
-    if (ref.tensor->type == GGML_TYPE_F16) {
-        if (ref.size != (size_t)n * sizeof(ggml_fp16_t)) {
-            err = "LoRA F16 tensor byte size mismatch: " + std::string(ref.tensor->name);
-            return false;
-        }
+    } else {
         const ggml_fp16_t * p = reinterpret_cast<const ggml_fp16_t *>(src);
         for (int64_t i = 0; i < n; ++i) {
             out[(size_t)i] = ggml_fp16_to_fp32(p[i]);
         }
-        return true;
     }
-    err = "unsupported LoRA tensor type for " + std::string(ref.tensor->name) +
-          ": " + ggml_type_name(ref.tensor->type);
-    return false;
+    return true;
 }
 
 bool load_draft_lora_adapter(const DraftLoraSpec & spec,

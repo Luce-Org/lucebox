@@ -109,7 +109,6 @@ private:
     ggml_backend_t                              draft_backend_ = nullptr;
     std::vector<LagunaDraftVariant>             draft_variants_;
     DraftWeights *                              active_dw_ = nullptr;
-    std::string                                 active_draft_lora_;
     std::string                                 default_draft_lora_ = "base";
     DraftFeatureMirror                          feature_mirror_{};
     LagunaDFlashTarget *                        dflash_target_ = nullptr;

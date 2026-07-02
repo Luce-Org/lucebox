@@ -667,6 +667,22 @@ int main(int argc, char ** argv) {
             return 2;
         }
     }
+    if (!bargs.draft_loras.empty()) {
+        // Only LagunaBackend consumes draft_loras; anywhere else the flag
+        // would be silently ignored, so reject it up front.
+        const std::string arch = detect_arch(bargs.model_path);
+        if (arch != "laguna") {
+            std::fprintf(stderr,
+                "[server] --draft-lora is only supported for laguna targets "
+                "(model architecture is '%s')\n", arch.c_str());
+            return 2;
+        }
+        if (bargs.device.is_layer_split()) {
+            std::fprintf(stderr,
+                "[server] --draft-lora is not supported with layer-split placement\n");
+            return 2;
+        }
+    }
 
     if (bargs.remote_draft.enabled() && bargs.draft_path) {
         const std::string arch = detect_arch(bargs.model_path);

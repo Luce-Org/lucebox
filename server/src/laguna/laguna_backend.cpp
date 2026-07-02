@@ -3116,7 +3116,6 @@ bool LagunaBackend::select_decode_draft(const std::string & name) {
                              variant.name.c_str());
             }
             active_dw_ = &variant.weights;
-            active_draft_lora_ = variant.name;
             return true;
         }
     }
@@ -3137,7 +3136,6 @@ void LagunaBackend::free_decode_draft() {
     }
     draft_variants_.clear();
     active_dw_ = nullptr;
-    active_draft_lora_.clear();
     default_draft_lora_ = "base";
     if (draft_backend_ && draft_backend_ != backend_) {
         ggml_backend_free(draft_backend_);

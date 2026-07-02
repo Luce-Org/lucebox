@@ -1563,12 +1563,22 @@ bool laguna_verify_batch(
         ggml_tensor *argmax = nullptr, *logits = nullptr;
         int n_tokens = 0, mk_w = 0, kv_pad = 0, kv_cap = 0;
         bool feat = false, want_logits = false;
+        // Identity the graph was built against - never reuse across a
+        // different backend, weight set, or cache instance.
+        ggml_backend_t              backend_id = nullptr;
+        const LagunaTargetWeights * w_id = nullptr;
+        const LagunaTargetCache *   cache_id = nullptr;
     };
     static thread_local VerifySlot g_slot_block, g_slot_bonus;
     VerifySlot & S = (n_tokens == 1) ? g_slot_bonus : g_slot_block;
     const bool want_logits = out_logits != nullptr;
     const bool want_feat = cache.target_feat && cache.target_feat_cap > 0;
-    const bool reuse = g_persist && S.ctx != nullptr &&
+    // Reuse requires the kv_idx input path (kv_pad > 0, no PAD_CPY): those
+    // graphs take the kv position purely as input data. The NO_KVPAD and
+    // PAD_CPY fallbacks bake kv_start into the graph structure, so a reused
+    // graph would read/write KV at stale offsets.
+    const bool reuse = g_persist && (kv_pad > 0 && !g_pad_cpy) && S.ctx != nullptr &&
+        S.backend_id == backend && S.w_id == &w && S.cache_id == &cache &&
         S.n_tokens == n_tokens && S.mk_w == mk_w && S.kv_pad == kv_pad &&
         S.kv_cap == kv_cap && S.feat == want_feat && S.want_logits == want_logits;
 
@@ -1628,6 +1638,10 @@ bool laguna_verify_batch(
         ggml_set_output(argmax);
         ggml_build_forward_expand(gf, argmax);
 
+        if (S.galloc && S.backend_id != backend) {
+            ggml_gallocr_free(S.galloc);
+            S.galloc = nullptr;
+        }
         if (!S.galloc) S.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
         if (!ggml_gallocr_alloc_graph(S.galloc, gf)) {
             std::fprintf(stderr, "laguna_verify_batch: gallocr_alloc_graph failed\n");
@@ -1640,6 +1654,7 @@ bool laguna_verify_batch(
         S.argmax = argmax; S.logits = go.logits;
         S.n_tokens = n_tokens; S.mk_w = mk_w; S.kv_pad = kv_pad; S.kv_cap = kv_cap;
         S.feat = want_feat; S.want_logits = want_logits;
+        S.backend_id = backend; S.w_id = &w; S.cache_id = &cache;
     }
 
     ggml_cgraph * gf = S.gf;

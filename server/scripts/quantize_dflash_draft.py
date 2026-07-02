@@ -50,7 +50,7 @@ def copy_metadata(r: GGUFReader, w: GGUFWriter) -> None:
             if sub == T.STRING:
                 w.add_array(f.name, [bytes(v).decode() for v in vals])
             else:
-                w.add_array(f.name, [v[0].item() for v in vals])
+                w.add_array(f.name, [np.asarray(v)[0].item() for v in vals])
         elif ftype == T.BOOL:
             w.add_bool(f.name, bool(val[0]))
         elif ftype == T.FLOAT32:
