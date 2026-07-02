@@ -1,6 +1,8 @@
 #include "../src/common/expert_split_plan.h"
 #include "../src/common/expert_split_compute_runtime.h"
+#include "../src/common/expert_split_materialization.h"
 #include "../src/common/expert_split_runtime.h"
+#include "../src/common/expert_split_state.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -229,6 +231,128 @@ static void test_compute_runtime_fingerprint_changes_with_assignment() {
     expect(fp_a != fp_b, "compute runtime fingerprint changes when placement changes");
 }
 
+static void test_materialization_builds_ordered_cold_union() {
+    const ExpertSplitPlan plan = build_sample_plan();
+    ExpertSplitRuntime runtime;
+    std::string err;
+    expect(build_expert_split_runtime(plan, runtime, &err), err.c_str());
+
+    ExpertSplitMaterialization materialization;
+    expect(build_expert_split_materialization(runtime, /*n_expert_used=*/2,
+                                              materialization, &err),
+           err.c_str());
+
+    expect(materialization.matches(2, 4, 2), "materialization dims");
+    expect(materialization.ordered_cold_union, "ordered union enabled");
+    expect(materialization.targets.size() == 3, "targets include cpu fallback");
+    expect(materialization.primary_placement.total_hot == 4, "primary hot total");
+
+    const auto & l0_hot = materialization.primary_placement.hot_expert_ids[0];
+    const auto & l1_hot = materialization.primary_placement.hot_expert_ids[1];
+    expect(l0_hot.size() == 4, "layer0 primary hot count");
+    expect(l1_hot.empty(), "layer1 primary hot empty");
+    expect(l0_hot[0] == 0 && l0_hot[1] == 1 && l0_hot[2] == 2 && l0_hot[3] == 3,
+           "layer0 primary hot order");
+
+    const auto & l0_cold = materialization.cold_expert_ids_by_layer[0];
+    const auto & l1_cold = materialization.cold_expert_ids_by_layer[1];
+    expect(l0_cold.empty(), "layer0 cold empty");
+    expect(l1_cold.size() == 4, "layer1 cold count");
+    expect(l1_cold[0] == 0 && l1_cold[1] == 1 && l1_cold[2] == 2 &&
+           l1_cold[3] == 3, "layer1 cold preserves target order");
+}
+
+static void test_materialization_single_explicit_gpu_keeps_single_primary_shape() {
+    ExpertSplitConfig cfg;
+    cfg.n_layer = 1;
+    cfg.n_expert = 4;
+
+    const std::vector<ExpertSplitTarget> targets = {
+        {"cuda:0", "cuda", 0, 2, 0, false},
+    };
+    const std::vector<ExpertSplitUnit> units = {
+        {0, 0, 1, 40.0}, {0, 1, 1, 30.0}, {0, 2, 1, 20.0}, {0, 3, 1, 10.0},
+    };
+
+    ExpertSplitPlan plan;
+    std::string err;
+    expect(build_expert_split_plan(cfg, targets, units, plan, &err), err.c_str());
+
+    ExpertSplitRuntime runtime;
+    expect(build_expert_split_runtime(plan, runtime, &err), err.c_str());
+
+    ExpertSplitMaterialization materialization;
+    expect(build_expert_split_materialization(runtime, /*n_expert_used=*/2,
+                                              materialization, &err),
+           err.c_str());
+    expect(materialization.matches(1, 4, 2), "single-primary materialization dims");
+    expect(!materialization.ordered_cold_union, "single-primary path keeps existing cold order");
+    expect(materialization.cold_expert_ids_by_layer.empty(), "no cold override");
+}
+
+static void test_builds_shared_expert_split_state_components() {
+    ExpertSplitConfig cfg;
+    cfg.n_layer = 2;
+    cfg.n_expert = 3;
+
+    const std::vector<ExpertSplitTarget> targets = {
+        {"cuda:0", "cuda", 0, 3, 0, false},
+        {"hip:0", "hip", 0, 1, 0, false},
+    };
+    const std::vector<ExpertSplitUnit> units = {
+        {0, 0, 1, 100.0},
+        {0, 1, 1, 90.0},
+        {0, 2, 1, 80.0},
+        {1, 0, 1, 70.0},
+        {1, 1, 1, 60.0},
+        {1, 2, 1, 50.0},
+    };
+
+    ExpertSplitStateComponents state;
+    std::string err;
+    expect(build_expert_split_state(cfg, targets, units, /*n_expert_used=*/2,
+                                    state, &err),
+           err.c_str());
+    expect(state.matches(2, 3, 2), "shared state matches dims");
+    expect(state.plan.at(0, 0).target_index == 0, "plan target lookup");
+    expect(state.runtime.target_index(1, 2) == 2, "runtime includes cpu fallback");
+    expect(state.compute_runtime.local_index(1, 2) == 1, "compute runtime local id");
+    expect(state.materialization.ordered_cold_union, "materialization ordered cold union");
+}
+
+static void test_builds_generic_layer_mapping() {
+    ExpertSplitLayerMapping mapping;
+    std::string err;
+    expect(build_expert_split_layer_mapping(
+               /*n_total_layer=*/5, {1, 3}, mapping, &err),
+           err.c_str());
+    expect(mapping.n_total_layer == 5, "mapping total layers");
+    expect(mapping.split_layer_count() == 2, "mapping split count");
+    expect(mapping.physical_layer_by_split_layer[0] == 1, "mapping split0");
+    expect(mapping.physical_layer_by_split_layer[1] == 3, "mapping split1");
+    expect(mapping.split_layer_for_physical(1) == 0, "mapping reverse 1");
+    expect(mapping.split_layer_for_physical(3) == 1, "mapping reverse 3");
+    expect(mapping.split_layer_for_physical(0) == -1, "mapping dense lead");
+    expect(mapping.is_split_layer(3), "mapping is split layer");
+    expect(!mapping.is_split_layer(4), "mapping rejects dense layer");
+}
+
+static void test_builds_contiguous_layer_mapping() {
+    ExpertSplitLayerMapping mapping;
+    std::string err;
+    expect(build_contiguous_expert_split_layer_mapping(
+               /*n_total_layer=*/4, /*first_split_layer=*/1,
+               /*n_split_layer=*/3, mapping, &err),
+           err.c_str());
+    expect(mapping.physical_layer_by_split_layer.size() == 3, "contiguous mapping size");
+    expect(mapping.physical_layer_by_split_layer[0] == 1, "contiguous split0");
+    expect(mapping.physical_layer_by_split_layer[1] == 2, "contiguous split1");
+    expect(mapping.physical_layer_by_split_layer[2] == 3, "contiguous split2");
+    expect(mapping.split_layer_for_physical(1) == 0, "contiguous reverse1");
+    expect(mapping.split_layer_for_physical(2) == 1, "contiguous reverse2");
+    expect(mapping.split_layer_for_physical(3) == 2, "contiguous reverse3");
+}
+
 static void test_runtime_rejects_invalid_plan() {
     ExpertSplitPlan plan;
     plan.n_layer = 1;
@@ -251,6 +375,11 @@ int main() {
     test_compute_runtime_materializes_target_views();
     test_compute_runtime_preserves_target_local_order();
     test_compute_runtime_fingerprint_changes_with_assignment();
+    test_materialization_builds_ordered_cold_union();
+    test_materialization_single_explicit_gpu_keeps_single_primary_shape();
+    test_builds_shared_expert_split_state_components();
+    test_builds_generic_layer_mapping();
+    test_builds_contiguous_layer_mapping();
     test_runtime_rejects_invalid_plan();
     std::printf("OK\n");
     return 0;
