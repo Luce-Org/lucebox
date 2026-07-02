@@ -20,6 +20,66 @@ static uint64_t pipe_elapsed_us(PipelineClock::time_point s, PipelineClock::time
     return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(e - s).count();
 }
 
+static bool prepare_unique_decode_hot_slots(
+    const MoeHybridLayerStorage & storage,
+    const int32_t * global_ids,
+    const float * router_weights,
+    int n_expert_used,
+    std::vector<int32_t> & hot_ids,
+    std::vector<float> & hot_weights,
+    std::vector<int32_t> & cold_ids,
+    std::vector<float> & cold_weights,
+    int & n_cold) {
+    const int n_hot_init = std::max(1, storage.hot_active);
+    std::vector<uint8_t> used((size_t)n_hot_init, 0);
+    n_cold = 0;
+
+    for (int i = 0; i < n_expert_used; ++i) {
+        hot_ids[(size_t)i] = -1;
+        hot_weights[(size_t)i] = 0.0f;
+        const int32_t gid = global_ids[(size_t)i];
+        const int32_t hot_local =
+            (gid >= 0 && gid < (int)storage.hot_local_by_global.size())
+                ? storage.hot_local_by_global[(size_t)gid]
+                : -1;
+        if (hot_local >= 0) {
+            if (hot_local >= n_hot_init || used[(size_t)hot_local]) {
+                return false;
+            }
+            hot_ids[(size_t)i] = hot_local;
+            hot_weights[(size_t)i] = router_weights[(size_t)i];
+            used[(size_t)hot_local] = 1;
+            continue;
+        }
+        if (gid >= 0 && gid < (int)storage.cold_local_by_global.size()) {
+            const int32_t cold_local = storage.cold_local_by_global[(size_t)gid];
+            if (cold_local >= 0 && n_cold < (int)cold_ids.size() &&
+                n_cold < (int)cold_weights.size()) {
+                cold_ids[(size_t)n_cold] = cold_local;
+                cold_weights[(size_t)n_cold] = router_weights[(size_t)i];
+                ++n_cold;
+            }
+        }
+    }
+
+    int next_dummy = 0;
+    for (int i = 0; i < n_expert_used; ++i) {
+        if (hot_ids[(size_t)i] >= 0) continue;
+        while (next_dummy < n_hot_init && used[(size_t)next_dummy]) {
+            ++next_dummy;
+        }
+        if (next_dummy >= n_hot_init) {
+            return false;
+        }
+        hot_ids[(size_t)i] = next_dummy;
+        hot_weights[(size_t)i] = 0.0f;
+        used[(size_t)next_dummy] = 1;
+        ++next_dummy;
+    }
+
+    return true;
+}
+
 // ─── CachedPrefnGraph ─────────────────────────────────────────────────────────
 
 void CachedPrefnGraph::free() {
@@ -68,9 +128,7 @@ static bool build_cached_deltanet_prefn(
     QwenLayerPrefnOutputs go = build_qwen35_layer_prefn(
         out.ctx, out.gf, w, cache, layer_idx,
         out.inp_embed, /*positions=*/nullptr, /*attn_mask=*/nullptr,
-        kv_start, /*n_tokens=*/1, /*fa_window=*/0,
-        /*kv_write_rows=*/nullptr,
-        /*skip_gdn_intermediate=*/true);
+        kv_start, /*n_tokens=*/1, /*fa_window=*/0);
     if (!go.residual || !go.post) { out.free(); return false; }
 
     out.ffn_residual = go.residual;
@@ -146,8 +204,7 @@ static bool build_cached_attn_prefn(
         out.ctx, out.gf, w, cache, layer_idx,
         out.inp_embed, out.positions, /*attn_mask=*/nullptr,
         /*kv_start=*/kv_win - 1, /*n_tokens=*/1, /*fa_window=*/0,
-        out.kv_write_rows,
-        /*skip_gdn_intermediate=*/true);
+        out.kv_write_rows);
     if (!go.residual || !go.post) { out.free(); return false; }
 
     out.ffn_residual = go.residual;
@@ -190,6 +247,15 @@ void PipelinedDecodeState::destroy() {
     routing_ids_buf.clear();
     routing_weights_buf.clear();
     ffn_post_host_buf.clear();
+    hot_ids_buf.clear();
+    hot_weights_buf.clear();
+    cold_ids_buf.clear();
+    cold_weights_buf.clear();
+    moe_expert_layers.clear();
+    moe_expert_output_buf.clear();
+    moe_expert_runtime.reset();
+    moe_multi_target_expert_runtime.reset();
+    moe_expert_compute = nullptr;
     cold_in_zeroed = false;
     n_layer = 0;
 }
@@ -197,9 +263,11 @@ void PipelinedDecodeState::destroy() {
 bool init_pipelined_decode_state(
     PipelinedDecodeState & out,
     ggml_backend_t backend,
+    const std::string & target_path,
     const TargetWeights & w,
     TargetCache & cache,
     MoeHybridStorage & hybrid,
+    const ExpertSplitComputeRuntime * split_runtime,
     int kv_start,
     int kq_stride_pad) {
 
@@ -219,6 +287,10 @@ bool init_pipelined_decode_state(
     out.routing_ids_buf.resize((size_t)w.n_expert_used);
     out.routing_weights_buf.resize((size_t)w.n_expert_used);
     out.ffn_post_host_buf.resize((size_t)w.n_embd);
+    out.hot_ids_buf.resize((size_t)w.n_expert_used);
+    out.hot_weights_buf.resize((size_t)w.n_expert_used);
+    out.cold_ids_buf.resize((size_t)w.n_expert_used);
+    out.cold_weights_buf.resize((size_t)w.n_expert_used);
 
     // Check if routed FFN pipeline is disabled
     const bool routed_disabled = (std::getenv("DFLASH_QWEN35MOE_NO_ROUTED") != nullptr);
@@ -231,7 +303,7 @@ bool init_pipelined_decode_state(
     out.cached_prefn.resize((size_t)w.n_layer);
     int cached_prefn_count = 0;
     for (int il = 0; il < w.n_layer; ++il) {
-        const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
+        const bool is_attn = qwen35_layer_is_full_attention(w, il);
         if (!is_attn) {
             if (!build_cached_deltanet_prefn(
                     out.cached_prefn[(size_t)il], backend, w, cache, il, kv_start, kq_stride_pad)) {
@@ -270,37 +342,53 @@ bool init_pipelined_decode_state(
                  cached_prefn_count, routed_count,
                  out.cold_compute ? "" : " (drop_cold=lossy)");
 
-    // Initialize fused cold FFN compute (bypasses ggml graph dispatch)
-    if (out.cold_compute) {
-        out.cold_ffn_compute = make_cpu_cold_ffn_compute(w.n_ff_exp);
-        out.cold_ffn_layers.resize((size_t)w.n_layer);
-        out.cold_output_buf.resize((size_t)w.n_embd);
-        for (int il = 0; il < w.n_layer && (size_t)il < hybrid.layers.size(); ++il) {
-            auto & storage = hybrid.layers[(size_t)il];
-            const TargetLayer & L = w.layers[(size_t)il];
-            auto & cl = out.cold_ffn_layers[(size_t)il];
-            cl.fused_gate_up = (storage.gate_up_cold != nullptr);
-            if (cl.fused_gate_up) {
-                cl.gate_up_data = storage.gate_up_cold ? storage.gate_up_cold->data : nullptr;
-                cl.gate_up_stride = storage.gate_up_cold ? storage.gate_up_cold->nb[2] : 0;
-                cl.gate_up_type = storage.gate_up_cold ? storage.gate_up_cold->type : GGML_TYPE_Q4_K;
-                cl.gate_up_scale = L.ffn_gate_up_exps_s;
-            } else {
-                cl.gate_data = storage.gate_cold ? storage.gate_cold->data : nullptr;
-                cl.up_data = storage.up_cold ? storage.up_cold->data : nullptr;
-                cl.gate_stride = storage.gate_cold ? storage.gate_cold->nb[2] : 0;
-                cl.up_stride = storage.up_cold ? storage.up_cold->nb[2] : 0;
-                cl.gate_type = storage.gate_cold ? storage.gate_cold->type : GGML_TYPE_Q4_K;
-                cl.up_type = storage.up_cold ? storage.up_cold->type : GGML_TYPE_Q4_K;
-                cl.gate_scale = L.ffn_gate_exps_s;
-                cl.up_scale = L.ffn_up_exps_s;
-            }
-            cl.down_data = storage.down_cold ? storage.down_cold->data : nullptr;
-            cl.down_stride = storage.down_cold ? storage.down_cold->nb[2] : 0;
-            cl.down_type = storage.down_cold ? storage.down_cold->type : GGML_TYPE_Q4_K;
-            cl.down_scale = L.ffn_down_exps_s;
+    MoeExpertComputeRuntimeConfig runtime_cfg;
+    runtime_cfg.target_path = target_path;
+    runtime_cfg.n_layer = w.n_layer;
+    runtime_cfg.n_expert = w.n_expert;
+    runtime_cfg.n_expert_used = w.n_expert_used;
+    runtime_cfg.n_embd = w.n_embd;
+    runtime_cfg.n_ff_exp = w.n_ff_exp;
+    runtime_cfg.enabled = out.cold_compute;
+    runtime_cfg.log_prefix = "[pipelined]";
+
+    std::vector<MoeLayerDesc> layer_descs((size_t)w.n_layer);
+    for (int il = 0; il < w.n_layer; ++il) {
+        layer_descs[(size_t)il] = make_moe_layer_desc(w.layers[(size_t)il]);
+    }
+
+    std::string expert_err;
+    bool multi_target_enabled = false;
+    if (split_runtime && split_runtime->matches(w.n_layer, w.n_expert, w.n_expert_used)) {
+        if (!ensure_multi_target_moe_expert_compute_runtime(
+                out.moe_multi_target_expert_runtime, runtime_cfg, *split_runtime,
+                hybrid, layer_descs, &expert_err)) {
+            std::fprintf(stderr, "[pipelined] multi-target MoE expert runtime init failed: %s\n",
+                         expert_err.c_str());
+            return false;
         }
-        std::fprintf(stderr, "[pipelined] cold FFN: fused kernel (bypasses ggml graph)\n");
+        multi_target_enabled = out.moe_multi_target_expert_runtime.enabled &&
+                               out.moe_multi_target_expert_runtime.compute_ptr() != nullptr;
+    }
+    if (!multi_target_enabled &&
+        !ensure_moe_expert_compute_runtime(out.moe_expert_runtime, runtime_cfg,
+                                           hybrid, layer_descs, &expert_err)) {
+        std::fprintf(stderr, "[pipelined] MoE expert runtime init failed: %s\n",
+                     expert_err.c_str());
+        return false;
+    }
+    out.moe_expert_compute = multi_target_enabled
+        ? out.moe_multi_target_expert_runtime.compute_ptr()
+        : out.moe_expert_runtime.compute_ptr();
+    out.moe_expert_layers = multi_target_enabled
+        ? out.moe_multi_target_expert_runtime.layers
+        : out.moe_expert_runtime.layers;
+    out.moe_expert_output_buf.resize((size_t)w.n_embd);
+    if (out.moe_expert_compute) {
+        std::fprintf(stderr, "[pipelined] MoE expert compute ready: %s\n",
+                     multi_target_enabled
+                         ? out.moe_multi_target_expert_runtime.runtime_key.c_str()
+                         : out.moe_expert_runtime.runtime_key.c_str());
     }
 
     out.cold_in_zeroed = true;
@@ -332,11 +420,23 @@ bool pipelined_decode_one_token(
         *tel = PipelinedDecodeTelemetry{};
     }
 
+    if (state.routing_ids_buf.size() < (size_t)n_expert_used ||
+        state.routing_weights_buf.size() < (size_t)n_expert_used ||
+        state.hot_ids_buf.size() < (size_t)n_expert_used ||
+        state.hot_weights_buf.size() < (size_t)n_expert_used ||
+        state.cold_ids_buf.size() < (size_t)n_expert_used ||
+        state.cold_weights_buf.size() < (size_t)n_expert_used) {
+        std::fprintf(stderr,
+                     "[pipelined] routing scratch under-sized for n_expert_used=%d\n",
+                     n_expert_used);
+        return false;
+    }
+
     const auto tok_t0 = PipelineClock::now();
     StepGraph dyn_sg;  // for attention layers (rebuilt per-token)
 
     for (int il = 0; il < n_layer; ++il) {
-        const bool is_attn = (((il + 1) % state.full_attention_interval) == 0);
+        const bool is_attn = qwen35_layer_is_full_attention(w, il);
         const auto prefn_build_t0 = PipelineClock::now();
 
         // ══════════════════════════════════════════════════════════════════════
@@ -367,11 +467,11 @@ bool pipelined_decode_one_token(
             const auto sync_t1 = PipelineClock::now();
 
             // Read routing decisions from GPU
-            int32_t global_ids[8];
-            float   router_weights[8];
-            ggml_backend_tensor_get(cpg.moe_selected, global_ids, 0,
+            auto & global_ids = state.routing_ids_buf;
+            auto & router_weights = state.routing_weights_buf;
+            ggml_backend_tensor_get(cpg.moe_selected, global_ids.data(), 0,
                                     sizeof(int32_t) * (size_t)n_expert_used);
-            ggml_backend_tensor_get(cpg.moe_weights, router_weights, 0,
+            ggml_backend_tensor_get(cpg.moe_weights, router_weights.data(), 0,
                                     sizeof(float) * (size_t)n_expert_used);
             const auto readback_t1 = PipelineClock::now();
 
@@ -382,44 +482,32 @@ bool pipelined_decode_one_token(
                                         sizeof(float) * (size_t)n_embd);
                 ffn_post_on_host = true;
                 state.routing_collector->record(il, state.ffn_post_host_buf.data(),
-                                                n_embd, global_ids, n_expert_used);
+                                                n_embd, global_ids.data(), n_expert_used);
             }
 
             // CPU-side local ID mapping + cold partition (trivial: 8 lookups)
             auto & storage = hybrid.layers[(size_t)il];
-            int32_t local_ids[8];
-            float   masked_weights[8];
-            int32_t cold_ids[8];
-            float   cold_weights[8];
+            auto & local_ids = state.hot_ids_buf;
+            auto & masked_weights = state.hot_weights_buf;
+            auto & cold_ids = state.cold_ids_buf;
+            auto & cold_weights = state.cold_weights_buf;
             int n_cold = 0;
             int layer_cold_hits = 0;
             // Spark expert cache: pull selected cold experts into spare GPU slots
             // (LRU) so the lookup below serves them on-GPU; after warmup cold->0.
             if (storage.cache_slots > 0)
                 for (int i = 0; i < n_expert_used; ++i)
-                    dflash::common::moe_hybrid_cache_swap_in(storage, global_ids[i], backend);
-            for (int i = 0; i < n_expert_used; ++i) {
-                int32_t gid = global_ids[i];
-                int32_t lid = (gid >= 0 && gid < (int)storage.hot_local_by_global.size())
-                              ? storage.hot_local_by_global[(size_t)gid] : -1;
-                if (lid >= 0) {
-                    local_ids[i] = lid;
-                    masked_weights[i] = router_weights[i];
-                } else {
-                    local_ids[i] = 0;       // safe: maps to expert 0 (result zeroed by weight)
-                    masked_weights[i] = 0.0f; // cold expert contributes nothing to hot path
-                    layer_cold_hits++;
-                    // Record for cold compute
-                    if (state.cold_ffn_compute && gid >= 0 && gid < (int)storage.cold_local_by_global.size()) {
-                        int32_t cold_local = storage.cold_local_by_global[(size_t)gid];
-                        if (cold_local >= 0) {
-                            cold_ids[n_cold] = cold_local;
-                            cold_weights[n_cold] = router_weights[i];
-                            n_cold++;
-                        }
-                    }
-                }
+                    dflash::common::moe_hybrid_cache_swap_in(storage, global_ids[(size_t)i], backend);
+            if (!prepare_unique_decode_hot_slots(
+                    storage, global_ids.data(), router_weights.data(),
+                    n_expert_used, local_ids, masked_weights,
+                    cold_ids, cold_weights, n_cold)) {
+                std::fprintf(stderr,
+                             "[pipelined] invalid hot/cold routed selection in layer %d\n",
+                             il);
+                return false;
             }
+            layer_cold_hits = n_cold;
             const bool has_cold_selected = (n_cold > 0);
             const auto remap_t1 = PipelineClock::now();
 
@@ -432,9 +520,9 @@ bool pipelined_decode_one_token(
             }
 
             // Upload pre-computed inputs to rffn graph (H→D async on compute stream)
-            ggml_backend_tensor_set_async(backend, rffn.ids, local_ids, 0,
+            ggml_backend_tensor_set_async(backend, rffn.ids, local_ids.data(), 0,
                                           sizeof(int32_t) * (size_t)n_expert_used);
-            ggml_backend_tensor_set_async(backend, rffn.weights, masked_weights, 0,
+            ggml_backend_tensor_set_async(backend, rffn.weights, masked_weights.data(), 0,
                                           sizeof(float) * (size_t)n_expert_used);
             // Copy ffn_post from prefn output → rffn input (GPU→GPU, already synced)
             ggml_backend_tensor_copy_async(backend, backend, cpg.ffn_post, rffn.inp);
@@ -448,12 +536,14 @@ bool pipelined_decode_one_token(
             // 6. Cold compute on CPU (parallel with GPU rffn above)
             const auto cold_t0 = PipelineClock::now();
             if (has_cold_selected) {
-                state.cold_ffn_compute->compute(
-                    state.cold_ffn_layers[(size_t)il],
+                if (!state.moe_expert_compute->compute(
+                    state.moe_expert_layers[(size_t)il],
                     state.ffn_post_host_buf.data(),
-                    cold_ids, cold_weights, n_cold,
+                    cold_ids.data(), cold_weights.data(), n_cold,
                     n_embd, w.n_ff_exp,
-                    state.cold_output_buf.data());
+                    state.moe_expert_output_buf.data())) {
+                    return false;
+                }
             }
             if (tel && has_cold_selected) tel->cold_compute_us += pipe_elapsed_us(cold_t0, PipelineClock::now());
 
@@ -463,7 +553,7 @@ bool pipelined_decode_one_token(
             // 8. Upload cold result or ensure cold_in is zero
             if (has_cold_selected) {
                 ggml_backend_tensor_set_async(backend, state.gpu_state.combine.cold_in,
-                                              state.cold_output_buf.data(), 0,
+                                              state.moe_expert_output_buf.data(), 0,
                                               sizeof(float) * (size_t)n_embd);
                 state.cold_in_zeroed = false;
             } else if (!state.cold_in_zeroed) {
@@ -649,37 +739,26 @@ bool pipelined_decode_one_token(
         auto & rffn = state.cached_routed_ffn[(size_t)il];
         if (rffn.valid()) {
             // Partition hot/cold: remap global→local, zero cold weights for hot path
-            int32_t local_ids[8];
-            float   masked_weights[8];
-            int32_t cold_ids[8];
-            float   cold_weights[8];
+            auto & local_ids = state.hot_ids_buf;
+            auto & masked_weights = state.hot_weights_buf;
+            auto & cold_ids = state.cold_ids_buf;
+            auto & cold_weights = state.cold_weights_buf;
             int n_cold = 0;
             int layer_cold_hits = 0;
             // Spark expert cache: pull selected cold experts into spare GPU slots.
             if (storage.cache_slots > 0)
                 for (int i = 0; i < n_expert_used; ++i)
                     dflash::common::moe_hybrid_cache_swap_in(storage, state.routing_ids_buf[(size_t)i], backend);
-            for (int i = 0; i < n_expert_used; ++i) {
-                int32_t gid = state.routing_ids_buf[(size_t)i];
-                int32_t lid = (gid >= 0 && gid < (int)storage.hot_local_by_global.size())
-                              ? storage.hot_local_by_global[(size_t)gid] : -1;
-                if (lid >= 0) {
-                    local_ids[i] = lid;
-                    masked_weights[i] = state.routing_weights_buf[(size_t)i];
-                } else {
-                    local_ids[i] = 0;
-                    masked_weights[i] = 0.0f;
-                    layer_cold_hits++;
-                    if (state.cold_ffn_compute && gid >= 0 && gid < (int)storage.cold_local_by_global.size()) {
-                        int32_t cold_local = storage.cold_local_by_global[(size_t)gid];
-                        if (cold_local >= 0) {
-                            cold_ids[n_cold] = cold_local;
-                            cold_weights[n_cold] = state.routing_weights_buf[(size_t)i];
-                            n_cold++;
-                        }
-                    }
-                }
+            if (!prepare_unique_decode_hot_slots(
+                    storage, state.routing_ids_buf.data(), state.routing_weights_buf.data(),
+                    n_expert_used, local_ids, masked_weights,
+                    cold_ids, cold_weights, n_cold)) {
+                std::fprintf(stderr,
+                             "[pipelined] invalid hot/cold routed selection in layer %d\n",
+                             il);
+                return false;
             }
+            layer_cold_hits = n_cold;
             const bool has_cold_selected = (n_cold > 0);
 
             // D2H ffn_post for cold compute (GPU already synced after routing readback).
@@ -690,9 +769,9 @@ bool pipelined_decode_one_token(
             }
 
             // Upload IDs + weights, copy inputs, dispatch rffn (all async)
-            ggml_backend_tensor_set_async(backend, rffn.ids, local_ids, 0,
+            ggml_backend_tensor_set_async(backend, rffn.ids, local_ids.data(), 0,
                                           sizeof(int32_t) * (size_t)n_expert_used);
-            ggml_backend_tensor_set_async(backend, rffn.weights, masked_weights, 0,
+            ggml_backend_tensor_set_async(backend, rffn.weights, masked_weights.data(), 0,
                                           sizeof(float) * (size_t)n_expert_used);
             ggml_backend_tensor_copy_async(backend, backend, ffn_post_gpu, rffn.inp);
             ggml_backend_tensor_copy_async(backend, backend, ffn_residual_gpu, state.gpu_state.combine.residual_in);
@@ -701,12 +780,14 @@ bool pipelined_decode_one_token(
             // Cold compute on CPU (parallel with GPU rffn above)
             const auto cold_t0 = PipelineClock::now();
             if (has_cold_selected) {
-                state.cold_ffn_compute->compute(
-                    state.cold_ffn_layers[(size_t)il],
+                if (!state.moe_expert_compute->compute(
+                    state.moe_expert_layers[(size_t)il],
                     state.ffn_post_host_buf.data(),
-                    cold_ids, cold_weights, n_cold,
+                    cold_ids.data(), cold_weights.data(), n_cold,
                     n_embd, w.n_ff_exp,
-                    state.cold_output_buf.data());
+                    state.moe_expert_output_buf.data())) {
+                    return false;
+                }
             }
             if (tel && has_cold_selected) tel->cold_compute_us += pipe_elapsed_us(cold_t0, PipelineClock::now());
 
@@ -716,7 +797,7 @@ bool pipelined_decode_one_token(
             // Upload cold result or ensure cold_in is zero
             if (has_cold_selected) {
                 ggml_backend_tensor_set_async(backend, state.gpu_state.combine.cold_in,
-                                              state.cold_output_buf.data(), 0,
+                                              state.moe_expert_output_buf.data(), 0,
                                               sizeof(float) * (size_t)n_embd);
                 state.cold_in_zeroed = false;
             } else if (!state.cold_in_zeroed) {
@@ -751,22 +832,24 @@ bool pipelined_decode_one_token(
 
         // Partition into hot/cold (fast: just a lookup table scan, ~8 iterations)
         int n_hot = 0, n_cold = 0;
-        int32_t hot_ids[8], cold_ids[8];
-        float hot_weights[8], cold_weights[8];
+        auto & hot_ids = state.hot_ids_buf;
+        auto & hot_weights = state.hot_weights_buf;
+        auto & cold_ids = state.cold_ids_buf;
+        auto & cold_weights = state.cold_weights_buf;
 
         for (int i = 0; i < n_expert_used; ++i) {
             const int32_t gid = state.routing_ids_buf[(size_t)i];
             if (gid < 0 || gid >= (int32_t)storage.hot_local_by_global.size()) return false;
             const int32_t hot_local = storage.hot_local_by_global[(size_t)gid];
             if (hot_local >= 0) {
-                hot_ids[n_hot] = hot_local;
-                hot_weights[n_hot] = state.routing_weights_buf[(size_t)i];
+                hot_ids[(size_t)n_hot] = hot_local;
+                hot_weights[(size_t)n_hot] = state.routing_weights_buf[(size_t)i];
                 n_hot++;
             } else {
                 const int32_t cold_local = storage.cold_local_by_global[(size_t)gid];
                 if (cold_local >= 0) {
-                    cold_ids[n_cold] = cold_local;
-                    cold_weights[n_cold] = state.routing_weights_buf[(size_t)i];
+                    cold_ids[(size_t)n_cold] = cold_local;
+                    cold_weights[(size_t)n_cold] = state.routing_weights_buf[(size_t)i];
                     n_cold++;
                 }
             }
@@ -806,11 +889,11 @@ bool pipelined_decode_one_token(
                 // All setup on compute stream — no per-op cudaStreamSynchronize
                 ggml_backend_tensor_copy_async(backend, backend, ffn_post_gpu, storage.hot_graph.inp);
                 if (storage.hot_graph.ids && has_hot) {
-                    ggml_backend_tensor_set_async(backend, storage.hot_graph.ids, hot_ids, 0,
+                    ggml_backend_tensor_set_async(backend, storage.hot_graph.ids, hot_ids.data(), 0,
                                                   sizeof(int32_t) * (size_t)n_hot);
                 }
                 if (storage.hot_graph.weights && has_hot) {
-                    ggml_backend_tensor_set_async(backend, storage.hot_graph.weights, hot_weights, 0,
+                    ggml_backend_tensor_set_async(backend, storage.hot_graph.weights, hot_weights.data(), 0,
                                                   sizeof(float) * (size_t)n_hot);
                 }
                 // Launch hot GPU async — queued after copies on same stream
@@ -825,15 +908,18 @@ bool pipelined_decode_one_token(
         if (has_cold) {
             // ffn_post already read above (before hot launch) — no GPU sync here!
             const auto cold_compute_t0 = PipelineClock::now();
-            if (state.cold_ffn_compute) {
-                // Fused kernel: bypass ggml graph dispatch entirely
-                state.cold_ffn_compute->compute(
-                    state.cold_ffn_layers[(size_t)il],
+            if (state.moe_expert_compute) {
+                // Fused compute: bypass ggml graph dispatch entirely.
+                if (!state.moe_expert_compute->compute(
+                    state.moe_expert_layers[(size_t)il],
                     state.ffn_post_host_buf.data(),
-                    cold_ids,
-                    cold_weights,
+                    cold_ids.data(),
+                    cold_weights.data(),
                     n_cold, n_embd, w.n_ff_exp,
-                    state.cold_output_buf.data());
+                    state.moe_expert_output_buf.data())) {
+                    if (hot_async_launched) ggml_backend_synchronize(backend);
+                    return false;
+                }
             } else {
                 // Fallback: ggml cold graph (legacy path)
                 if (!storage.cold_graph.valid() || storage.cold_graph.n_hot != n_cold) {
@@ -845,9 +931,9 @@ bool pipelined_decode_one_token(
                 if (storage.cold_graph.valid() && storage.cold_graph.n_hot == n_cold) {
                     ggml_backend_tensor_set(storage.cold_graph.inp, state.ffn_post_host_buf.data(), 0,
                                             sizeof(float) * (size_t)n_embd);
-                    ggml_backend_tensor_set(storage.cold_graph.ids, cold_ids, 0,
+                    ggml_backend_tensor_set(storage.cold_graph.ids, cold_ids.data(), 0,
                                             sizeof(int32_t) * (size_t)n_cold);
-                    ggml_backend_tensor_set(storage.cold_graph.weights, cold_weights, 0,
+                    ggml_backend_tensor_set(storage.cold_graph.weights, cold_weights.data(), 0,
                                             sizeof(float) * (size_t)n_cold);
                     auto cst = ggml_backend_graph_compute(cpu_be, storage.cold_graph.gf);
                     if (cst != GGML_STATUS_SUCCESS) {
@@ -875,8 +961,8 @@ bool pipelined_decode_one_token(
         }
 
         if (has_cold) {
-            const float * cold_result = state.cold_ffn_compute
-                ? state.cold_output_buf.data()
+            const float * cold_result = state.moe_expert_compute
+                ? state.moe_expert_output_buf.data()
                 : nullptr;
             if (!cold_result) {
                 // Legacy path: read from ggml tensor

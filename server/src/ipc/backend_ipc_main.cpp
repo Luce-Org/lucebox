@@ -1,6 +1,7 @@
 // Standalone backend IPC daemon entry point.
 
 #include "backend_ipc.h"
+#include "moe_expert_compute.h"
 #include "dflash_draft_ipc.h"
 #include "gemma4/gemma4_layer_split_adapter.h"
 #include "laguna/laguna_layer_split_adapter.h"
@@ -123,7 +124,10 @@ int main(int argc, char ** argv) {
             "   or: %s --backend-ipc-mode=laguna-target-shard <target.gguf> "
             "--stream-fd=FD --target-gpus=N[,N...] --layer-begins=N[,N...] "
             "--layer-ends=N[,N...] --max-ctx=N "
-            "[--hidden=N --vocab=N --max-tokens=N]\n",
+            "[--hidden=N --vocab=N --max-tokens=N]\n"
+            "   or: %s --backend-ipc-mode=moe-expert-compute <target.gguf> "
+            "--stream-fd=FD --target-gpu=N --placement=PATH\n",
+            argv[0],
             argv[0],
             argv[0],
             argv[0],
@@ -153,6 +157,7 @@ int main(int argc, char ** argv) {
     size_t shared_payload_bytes = 0;
     bool enable_dflash = false;
     int kvflash_pool_tokens = 0;
+    const char * placement_path = nullptr;
     for (int i = arg_begin; i < argc; i++) {
         if (std::strncmp(argv[i], "--ring-cap=", 11) == 0) {
             if (!parse_nonnegative_int(argv[i] + 11, ring_cap)) return 2;
@@ -274,6 +279,10 @@ int main(int argc, char ** argv) {
             const char * value = nullptr;
             if (!require_value(i, argc, argv, "--kvflash-pool", value)) return 2;
             if (!parse_nonnegative_int(value, kvflash_pool_tokens)) return 2;
+        } else if (std::strncmp(argv[i], "--placement=", 12) == 0) {
+            placement_path = argv[i] + 12;
+        } else if (std::strcmp(argv[i], "--placement") == 0) {
+            if (!require_value(i, argc, argv, "--placement", placement_path)) return 2;
         } else {
             std::fprintf(stderr, "[backend-ipc-daemon] unknown option: %s\n", argv[i]);
             return 2;
@@ -318,6 +327,11 @@ int main(int argc, char ** argv) {
                 payload_path, target_gpus, layer_begins, layer_ends, max_ctx,
                 stream_fd, payload_fd, shared_payload_fd, shared_payload_bytes,
                 kvflash_pool_tokens);
+        case BackendIpcMode::MoeExpertCompute:
+            return run_moe_expert_compute_ipc_daemon(payload_path, placement_path,
+                                                     target_gpu, stream_fd,
+                                                     payload_fd, shared_payload_fd,
+                                                     shared_payload_bytes);
     }
     std::fprintf(stderr, "[backend-ipc-daemon] unsupported mode\n");
     return 2;

@@ -13,7 +13,7 @@
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_storage.h"
 #include "../common/moe_routing_collector.h"
-#include "../common/cold_ffn_compute.h"
+#include "../common/moe_expert_compute.h"
 #include "graph_builders.h"
 
 #include "ggml-backend.h"
@@ -118,6 +118,10 @@ struct PipelinedDecodeState {
     std::vector<int32_t> routing_ids_buf;
     std::vector<float> routing_weights_buf;
     std::vector<float> ffn_post_host_buf;
+    std::vector<int32_t> hot_ids_buf;
+    std::vector<float> hot_weights_buf;
+    std::vector<int32_t> cold_ids_buf;
+    std::vector<float> cold_weights_buf;
 
     // Persistent zero buffer for cold_in (set once at init)
     bool cold_in_zeroed = false;
@@ -127,10 +131,14 @@ struct PipelinedDecodeState {
     // Set DFLASH_DROP_COLD=1 to disable (fast but lossy).
     bool cold_compute = true;
 
-    // Fused cold FFN compute (bypasses ggml graph dispatch overhead)
-    std::unique_ptr<ColdFfnCompute> cold_ffn_compute;
-    std::vector<ColdFfnLayer> cold_ffn_layers;   // per-layer cold weight metadata
-    std::vector<float> cold_output_buf;           // [n_embd] scratch for cold FFN output
+    // Shared expert runtime: CPU fallback or remote IPC daemon.
+    MoeExpertComputeRuntime moe_expert_runtime;
+    MoeMultiTargetExpertRuntime moe_multi_target_expert_runtime;
+
+    // Fused selected-expert compute (non-owning view into the active runtime).
+    MoeExpertCompute * moe_expert_compute = nullptr;
+    std::vector<MoeExpertLayer> moe_expert_layers; // per-layer expert weight metadata
+    std::vector<float> moe_expert_output_buf;      // [n_embd] scratch for expert output
 
     // Tracking
     int n_layer = 0;
@@ -152,11 +160,20 @@ struct PipelinedDecodeState {
           routing_ids_buf(std::move(o.routing_ids_buf)),
           routing_weights_buf(std::move(o.routing_weights_buf)),
           ffn_post_host_buf(std::move(o.ffn_post_host_buf)),
+          hot_ids_buf(std::move(o.hot_ids_buf)),
+          hot_weights_buf(std::move(o.hot_weights_buf)),
+          cold_ids_buf(std::move(o.cold_ids_buf)),
+          cold_weights_buf(std::move(o.cold_weights_buf)),
           cold_in_zeroed(o.cold_in_zeroed),
           cold_compute(o.cold_compute),
-          cold_ffn_compute(std::move(o.cold_ffn_compute)),
-          cold_ffn_layers(std::move(o.cold_ffn_layers)),
-          cold_output_buf(std::move(o.cold_output_buf)),
+          moe_expert_runtime(std::move(o.moe_expert_runtime)),
+          moe_multi_target_expert_runtime(std::move(o.moe_multi_target_expert_runtime)),
+          moe_expert_compute(
+              moe_multi_target_expert_runtime.compute_ptr()
+                  ? moe_multi_target_expert_runtime.compute_ptr()
+                  : moe_expert_runtime.compute_ptr()),
+          moe_expert_layers(std::move(o.moe_expert_layers)),
+          moe_expert_output_buf(std::move(o.moe_expert_output_buf)),
           n_layer(o.n_layer), n_embd(o.n_embd),
           n_expert_used(o.n_expert_used),
           full_attention_interval(o.full_attention_interval) {
@@ -171,11 +188,21 @@ struct PipelinedDecodeState {
             routing_ids_buf = std::move(o.routing_ids_buf);
             routing_weights_buf = std::move(o.routing_weights_buf);
             ffn_post_host_buf = std::move(o.ffn_post_host_buf);
+            hot_ids_buf = std::move(o.hot_ids_buf);
+            hot_weights_buf = std::move(o.hot_weights_buf);
+            cold_ids_buf = std::move(o.cold_ids_buf);
+            cold_weights_buf = std::move(o.cold_weights_buf);
             cold_in_zeroed = o.cold_in_zeroed;
             cold_compute = o.cold_compute;
-            cold_ffn_compute = std::move(o.cold_ffn_compute);
-            cold_ffn_layers = std::move(o.cold_ffn_layers);
-            cold_output_buf = std::move(o.cold_output_buf);
+            moe_expert_runtime = std::move(o.moe_expert_runtime);
+            moe_multi_target_expert_runtime =
+                std::move(o.moe_multi_target_expert_runtime);
+            moe_expert_compute =
+                moe_multi_target_expert_runtime.compute_ptr()
+                    ? moe_multi_target_expert_runtime.compute_ptr()
+                    : moe_expert_runtime.compute_ptr();
+            moe_expert_layers = std::move(o.moe_expert_layers);
+            moe_expert_output_buf = std::move(o.moe_expert_output_buf);
             n_layer = o.n_layer; n_embd = o.n_embd;
             n_expert_used = o.n_expert_used;
             full_attention_interval = o.full_attention_interval;
@@ -192,9 +219,11 @@ struct PipelinedDecodeState {
 bool init_pipelined_decode_state(
     PipelinedDecodeState & out,
     ggml_backend_t backend,
+    const std::string & target_path,
     const TargetWeights & w,
     TargetCache & cache,
     MoeHybridStorage & hybrid,
+    const ExpertSplitComputeRuntime * split_runtime,
     int kv_start,           // initial KV position for graph caching
     int kq_stride_pad);
 

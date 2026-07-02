@@ -6,9 +6,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <mutex>
+#include <thread>
 
 namespace dflash::common {
 
@@ -23,6 +28,391 @@ using HybridClock = std::chrono::steady_clock;
 
 static uint64_t elapsed_us(HybridClock::time_point start, HybridClock::time_point end) {
     return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+}
+
+struct MixedRoutingScratch {
+    std::vector<int32_t> hot_sel;
+    std::vector<float> hot_wts;
+    std::vector<int32_t> cold_sel;
+    std::vector<float> cold_wts;
+    std::vector<int32_t> lut;
+    std::vector<float> vlut;
+
+    void ensure(int total_slots, int n_expert) {
+        if (total_slots > 0) {
+            hot_sel.resize((size_t)total_slots);
+            hot_wts.resize((size_t)total_slots);
+            cold_sel.resize((size_t)total_slots);
+            cold_wts.resize((size_t)total_slots);
+        }
+        if (n_expert > 0) {
+            lut.resize((size_t)n_expert);
+            vlut.resize((size_t)n_expert);
+        }
+    }
+};
+
+static thread_local MixedRoutingScratch g_mixed_routing_scratch;
+
+struct RemoteColdBatchScratch {
+    std::vector<int> cold_counts;
+    std::vector<int32_t> cold_sel;
+    std::vector<float> cold_wts;
+    std::vector<std::vector<int>> token_groups;
+    std::vector<int> active_groups;
+    std::vector<float> group_input;
+    std::vector<float> group_output;
+    std::vector<int32_t> group_ids;
+    std::vector<float> group_wts;
+
+    void ensure(int n_tokens, int n_used, int n_embd, int max_cold_selected) {
+        if (n_tokens > 0) {
+            cold_counts.resize((size_t)n_tokens);
+        }
+        if (n_tokens > 0 && n_used > 0) {
+            cold_sel.resize((size_t)n_tokens * (size_t)n_used);
+            cold_wts.resize((size_t)n_tokens * (size_t)n_used);
+        }
+        if (n_embd > 0 && n_tokens > 0) {
+            group_input.reserve((size_t)n_embd * (size_t)n_tokens);
+            group_output.reserve((size_t)n_embd * (size_t)n_tokens);
+        }
+        if (max_cold_selected > 0 && n_tokens > 0) {
+            group_ids.reserve((size_t)n_tokens * (size_t)max_cold_selected);
+            group_wts.reserve((size_t)n_tokens * (size_t)max_cold_selected);
+        }
+    }
+};
+
+static thread_local RemoteColdBatchScratch g_remote_cold_batch_scratch;
+
+struct HybridSplitScratch {
+    std::vector<float> cold_partial;
+    std::vector<float> hot_out;
+};
+
+static thread_local HybridSplitScratch g_hybrid_split_scratch;
+
+static bool prepare_unique_hot_local_slots(
+    const MoeHybridLayerStorage & storage,
+    const int32_t * selected_ids,
+    const float * selected_weights,
+    int n_tokens,
+    int n_used,
+    std::vector<int32_t> & out_ids,
+    std::vector<float> & out_weights,
+    bool * out_has_hot,
+    bool * out_has_cold,
+    std::string * err) {
+    const int n_hot_init = std::max(1, storage.hot_active);
+    std::vector<uint8_t> used((size_t) n_hot_init, 0);
+    bool has_hot = false;
+    bool has_cold = false;
+
+    for (int t = 0; t < n_tokens; ++t) {
+        std::fill(used.begin(), used.end(), 0);
+        int next_dummy = 0;
+        for (int i = 0; i < n_used; ++i) {
+            const size_t idx = (size_t) t * (size_t) n_used + (size_t) i;
+            out_ids[idx] = -1;
+            out_weights[idx] = 0.0f;
+
+            const int32_t gid = selected_ids[idx];
+            if (gid < 0 || gid >= (int32_t) storage.hot_local_by_global.size()) {
+                continue;
+            }
+            const int32_t hot_local = storage.hot_local_by_global[(size_t) gid];
+            if (hot_local >= 0) {
+                if (hot_local >= n_hot_init) {
+                    if (err) *err = "hot local id exceeds initialized hot stack";
+                    return false;
+                }
+                if (used[(size_t) hot_local]) {
+                    if (err) *err = "duplicate hot local id in routed selection";
+                    return false;
+                }
+                out_ids[idx] = hot_local;
+                out_weights[idx] = selected_weights[idx];
+                used[(size_t) hot_local] = 1;
+                has_hot = true;
+                continue;
+            }
+            if ((size_t) gid < storage.cold_local_by_global.size() &&
+                storage.cold_local_by_global[(size_t) gid] >= 0) {
+                has_cold = true;
+            }
+        }
+
+        for (int i = 0; i < n_used; ++i) {
+            const size_t idx = (size_t) t * (size_t) n_used + (size_t) i;
+            if (out_ids[idx] >= 0) continue;
+            while (next_dummy < n_hot_init && used[(size_t) next_dummy]) {
+                ++next_dummy;
+            }
+            if (next_dummy >= n_hot_init) {
+                if (err) *err = "insufficient initialized hot experts for unique padded routing";
+                return false;
+            }
+            out_ids[idx] = next_dummy;
+            used[(size_t) next_dummy] = 1;
+            ++next_dummy;
+        }
+    }
+
+    if (out_has_hot) *out_has_hot = has_hot;
+    if (out_has_cold) *out_has_cold = has_cold;
+    return true;
+}
+
+static bool prepare_unique_cold_local_slots(
+    const MoeHybridLayerStorage & storage,
+    const int32_t * selected_ids,
+    const float * selected_weights,
+    int n_tokens,
+    int n_used,
+    std::vector<int32_t> & out_ids,
+    std::vector<float> & out_weights,
+    bool * out_has_cold,
+    std::string * err) {
+    const int n_cold_stack =
+        std::max(1, (int) (storage.down_cold ? storage.down_cold->ne[2] : 0));
+    std::vector<uint8_t> used((size_t) n_cold_stack, 0);
+    bool has_cold = false;
+
+    for (int t = 0; t < n_tokens; ++t) {
+        std::fill(used.begin(), used.end(), 0);
+        int next_dummy = 0;
+        for (int i = 0; i < n_used; ++i) {
+            const size_t idx = (size_t) t * (size_t) n_used + (size_t) i;
+            out_ids[idx] = -1;
+            out_weights[idx] = 0.0f;
+
+            const int32_t gid = selected_ids[idx];
+            if (gid < 0 || gid >= (int32_t) storage.hot_local_by_global.size()) {
+                continue;
+            }
+            if (storage.hot_local_by_global[(size_t) gid] >= 0) {
+                continue;
+            }
+            const int32_t cold_local = storage.cold_local_by_global[(size_t) gid];
+            if (cold_local < 0) {
+                continue;
+            }
+            if (cold_local >= n_cold_stack) {
+                if (err) *err = "cold local id exceeds initialized cold stack";
+                return false;
+            }
+            if (used[(size_t) cold_local]) {
+                if (err) *err = "duplicate cold local id in routed selection";
+                return false;
+            }
+            out_ids[idx] = cold_local;
+            out_weights[idx] = selected_weights[idx];
+            used[(size_t) cold_local] = 1;
+            has_cold = true;
+        }
+
+        for (int i = 0; i < n_used; ++i) {
+            const size_t idx = (size_t) t * (size_t) n_used + (size_t) i;
+            if (out_ids[idx] >= 0) continue;
+            while (next_dummy < n_cold_stack && used[(size_t) next_dummy]) {
+                ++next_dummy;
+            }
+            if (next_dummy >= n_cold_stack) {
+                if (err) *err = "insufficient cold experts for unique padded routing";
+                return false;
+            }
+            out_ids[idx] = next_dummy;
+            used[(size_t) next_dummy] = 1;
+            ++next_dummy;
+        }
+    }
+
+    if (out_has_cold) *out_has_cold = has_cold;
+    return true;
+}
+
+static bool prepare_unique_hot_global_slots(
+    const MoeHybridLayerStorage & storage,
+    const int32_t * selected_ids,
+    const float * selected_weights,
+    int n_tokens,
+    int n_used,
+    std::vector<int32_t> & out_global_ids,
+    std::vector<float> & out_weights,
+    std::string * err) {
+    const int n_hot_init = std::max(1, storage.hot_active);
+    std::vector<int32_t> hot_global_by_local((size_t) n_hot_init, -1);
+    for (size_t global = 0; global < storage.hot_local_by_global.size(); ++global) {
+        const int32_t local = storage.hot_local_by_global[global];
+        if (local >= 0 && local < n_hot_init) {
+            hot_global_by_local[(size_t) local] = (int32_t) global;
+        }
+    }
+
+    std::vector<uint8_t> used((size_t) n_hot_init, 0);
+    for (int t = 0; t < n_tokens; ++t) {
+        std::fill(used.begin(), used.end(), 0);
+        int next_dummy = 0;
+        for (int i = 0; i < n_used; ++i) {
+            const size_t idx = (size_t) t * (size_t) n_used + (size_t) i;
+            out_global_ids[idx] = -1;
+            out_weights[idx] = 0.0f;
+
+            const int32_t gid = selected_ids[idx];
+            if (gid < 0 || gid >= (int32_t) storage.hot_local_by_global.size()) {
+                continue;
+            }
+            const int32_t hot_local = storage.hot_local_by_global[(size_t) gid];
+            if (hot_local < 0) {
+                continue;
+            }
+            if (hot_local >= n_hot_init) {
+                if (err) *err = "hot local id exceeds initialized hot stack";
+                return false;
+            }
+            if (used[(size_t) hot_local]) {
+                if (err) *err = "duplicate hot local id in routed selection";
+                return false;
+            }
+            out_global_ids[idx] = gid;
+            out_weights[idx] = selected_weights[idx];
+            used[(size_t) hot_local] = 1;
+        }
+
+        for (int i = 0; i < n_used; ++i) {
+            const size_t idx = (size_t) t * (size_t) n_used + (size_t) i;
+            if (out_global_ids[idx] >= 0) continue;
+            while (next_dummy < n_hot_init &&
+                   (used[(size_t) next_dummy] ||
+                    hot_global_by_local[(size_t) next_dummy] < 0)) {
+                ++next_dummy;
+            }
+            if (next_dummy >= n_hot_init) {
+                if (err) *err = "insufficient initialized hot experts for unique remapped routing";
+                return false;
+            }
+            out_global_ids[idx] = hot_global_by_local[(size_t) next_dummy];
+            used[(size_t) next_dummy] = 1;
+            ++next_dummy;
+        }
+    }
+
+    return true;
+}
+
+class HybridColdWorker {
+public:
+    HybridColdWorker() = default;
+    ~HybridColdWorker() {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            stopping_ = true;
+        }
+        task_cv_.notify_one();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    HybridColdWorker(const HybridColdWorker &) = delete;
+    HybridColdWorker & operator=(const HybridColdWorker &) = delete;
+
+    void submit(std::function<void()> task) {
+        ensure_started();
+        {
+            std::unique_lock<std::mutex> lock(mu_);
+            done_cv_.wait(lock, [this]() { return done_ && !has_task_; });
+            task_ = std::move(task);
+            has_task_ = true;
+            done_ = false;
+        }
+        task_cv_.notify_one();
+    }
+
+    void wait() {
+        std::unique_lock<std::mutex> lock(mu_);
+        done_cv_.wait(lock, [this]() { return done_; });
+    }
+
+private:
+    void ensure_started() {
+        if (worker_.joinable()) return;
+        worker_ = std::thread([this]() { loop(); });
+    }
+
+    void loop() {
+        for (;;) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(mu_);
+                task_cv_.wait(lock, [this]() { return stopping_ || has_task_; });
+                if (stopping_ && !has_task_) {
+                    return;
+                }
+                task = std::move(task_);
+                has_task_ = false;
+            }
+
+            task();
+
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                done_ = true;
+            }
+            done_cv_.notify_one();
+        }
+    }
+
+    std::thread worker_;
+    std::mutex mu_;
+    std::condition_variable task_cv_;
+    std::condition_variable done_cv_;
+    std::function<void()> task_;
+    bool has_task_ = false;
+    bool done_ = true;
+    bool stopping_ = false;
+};
+
+static thread_local HybridColdWorker g_hybrid_cold_worker;
+
+static bool moe_hybrid_batched_profile_enabled() {
+    const char * raw = std::getenv("DFLASH_MOE_BATCHED_PROFILE");
+    return raw && *raw && std::strcmp(raw, "0") != 0 &&
+        std::strcmp(raw, "false") != 0 && std::strcmp(raw, "off") != 0;
+}
+
+struct MoeHybridBatchedProfile {
+    uint64_t calls = 0;
+    uint64_t tokens = 0;
+    uint64_t partition_us = 0;
+    uint64_t remote_cold_us = 0;
+    uint64_t overlap_us = 0;
+    uint64_t hot_calls = 0;
+    uint64_t hot_tokens = 0;
+    uint64_t hot_us = 0;
+    uint64_t merge_us = 0;
+    uint64_t total_us = 0;
+
+    void maybe_print(bool force) const {
+        if (calls == 0) return;
+        if (!force && calls % 64 != 0) return;
+        std::fprintf(stderr,
+            "[hybrid-ffn-batched] profile calls=%" PRIu64
+            " tokens=%" PRIu64 " hot_calls=%" PRIu64
+            " hot_tokens=%" PRIu64
+            " partition_ms=%.3f remote_cold_ms=%.3f hot_ms=%.3f"
+            " overlap_ms=%.3f merge_ms=%.3f total_ms=%.3f\n",
+            calls, tokens, hot_calls, hot_tokens,
+            partition_us / 1000.0, remote_cold_us / 1000.0,
+            hot_us / 1000.0, overlap_us / 1000.0,
+            merge_us / 1000.0, total_us / 1000.0);
+    }
+};
+
+static MoeHybridBatchedProfile & moe_hybrid_batched_profile() {
+    static MoeHybridBatchedProfile profile;
+    return profile;
 }
 
 // Build the shared-expert FFN subgraph onto an existing ggml_context.
@@ -617,10 +1007,12 @@ bool build_cached_hot_batched_graph(
     MoeHybridLayerStorage & storage,
     const MoeLayerDesc & desc,
     const MoeHybridConfig & cfg,
-    int n_tokens) {
+    int n_tokens,
+    bool gpu_remap) {
 
     out.free();
     out.n_tokens = n_tokens;
+    out.gpu_remap = gpu_remap;
 
     const int n_embd = cfg.n_embd;
     const int n_used = cfg.n_expert_used;
@@ -639,6 +1031,26 @@ bool build_cached_hot_batched_graph(
     ggml_set_input(out.sel);
     out.wts = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, n_used, n_tokens);
     ggml_set_input(out.wts);
+
+    if (gpu_remap) {
+        const int total_slots = n_used * n_tokens;
+        out.global_ids = ggml_new_tensor_2d(out.ctx, GGML_TYPE_I32, total_slots, 1);
+        ggml_set_input(out.global_ids);
+        out.raw_weights = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, total_slots, 1);
+        ggml_set_input(out.raw_weights);
+        out.hot_local_lut = ggml_new_tensor_2d(out.ctx, GGML_TYPE_I32, 1, cfg.n_expert);
+        ggml_set_input(out.hot_local_lut);
+        out.valid_lut = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, 1, cfg.n_expert);
+        ggml_set_input(out.valid_lut);
+
+        ggml_tensor * lid = ggml_get_rows(out.ctx, out.hot_local_lut, out.global_ids);
+        out.sel = ggml_cont(out.ctx, ggml_reshape_2d(out.ctx, lid, n_used, n_tokens));
+        ggml_tensor * vm = ggml_get_rows(out.ctx, out.valid_lut, out.global_ids);
+        vm = ggml_reshape_2d(out.ctx, vm, n_used, n_tokens);
+        ggml_tensor * raw_wts = ggml_reshape_2d(out.ctx, out.raw_weights,
+                                                n_used, n_tokens);
+        out.wts = ggml_mul(out.ctx, raw_wts, vm);
+    }
 
     ggml_tensor * routed = nullptr;
     build_batched_routed_graph(out.ctx,
@@ -1009,10 +1421,26 @@ static int mmq_safe_sub_batch() {
     static const int v = [](){
         const char * e = std::getenv("DFLASH_MMQ_SUB_BATCH");
         if (e) return std::max(1, std::atoi(e));
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+        return 4;
+#else
         return (query_gpu_compute_sm() >= 80) ? 8 : 1;
+#endif
     }();
     return v;
 }
+
+static bool eval_moe_hybrid_remote_cold_batched(
+    const MoeHybridConfig &         cfg,
+    const MoeHybridLayerStorage &   storage,
+    const float *                   cur_host,
+    const int32_t *                 selected_ids,
+    const float *                   selected_weights,
+    int                             n_tokens,
+    std::vector<float> &            out,
+    std::string *                   err,
+    MoeExpertCompute *              expert_compute,
+    const MoeExpertLayer *          expert_layer);
 
 static bool eval_moe_hybrid_ffn_batched_core(
     ggml_backend_t                  gpu_backend,
@@ -1027,7 +1455,9 @@ static bool eval_moe_hybrid_ffn_batched_core(
     std::vector<float> &            out,
     std::string *                   err,
     ggml_gallocr_t *                p_hot_alloc,
-    ggml_gallocr_t *                p_cold_alloc) {
+    ggml_gallocr_t *                p_cold_alloc,
+    MoeExpertCompute *              expert_compute,
+    const MoeExpertLayer *          expert_layer) {
 
     const int n_embd = cfg.n_embd;
     const int n_used = cfg.n_expert_used;
@@ -1043,36 +1473,34 @@ static bool eval_moe_hybrid_ffn_batched_core(
     // path below.
     if (n_tokens > 0 && n_tokens < MoeHybridLayerStorage::kMaxBatchedCache) {
         const int total_slots = n_used * n_tokens;
-        const int n_hot_stack = storage.gate_up_hot ? (int)storage.gate_up_hot->ne[2]
-                              : storage.gate_hot    ? (int)storage.gate_hot->ne[2] : 1;
-        const int n_cold_stack = std::max(1, (int)(storage.down_cold ? storage.down_cold->ne[2] : 1));
-        std::vector<int32_t> hot_sel(total_slots);
-        std::vector<float>   hot_wts(total_slots, 0.0f);
-        std::vector<int32_t> cold_sel(total_slots);
-        std::vector<float>   cold_wts(total_slots, 0.0f);
-        // Dummy (unused) slots must point at INITIALIZED pinned experts, not
-        // uninitialized cache-ring spare slots (hot_active..n_hot_stack), whose
-        // garbage Q4_K scale bits could dequantize to NaN (x weight 0 = NaN).
-        const int n_hot_init = std::max(1, storage.hot_active);
-        for (int i = 0; i < total_slots; ++i) { hot_sel[i] = i % n_hot_init; cold_sel[i] = i % n_cold_stack; }
+        auto & scratch = g_mixed_routing_scratch;
+        scratch.ensure(total_slots, cfg.n_expert);
+        auto & hot_sel = scratch.hot_sel;
+        auto & hot_wts = scratch.hot_wts;
+        auto & cold_sel = scratch.cold_sel;
+        auto & cold_wts = scratch.cold_wts;
         bool fp_has_cold = false;
-        for (int i = 0; i < total_slots; ++i) {
-            const int32_t gid = selected_ids[i];
-            if (gid < 0 || gid >= (int32_t)storage.hot_local_by_global.size()) continue;
-            const int32_t hl = storage.hot_local_by_global[(size_t)gid];
-            if (hl >= 0) { hot_sel[i] = hl; hot_wts[i] = selected_weights[i]; }
-            else {
-                const int32_t cl = storage.cold_local_by_global[(size_t)gid];
-                if (cl >= 0) { cold_sel[i] = cl; cold_wts[i] = selected_weights[i]; fp_has_cold = true; }
-            }
+        bool fp_has_hot = false;
+        if (!prepare_unique_hot_local_slots(
+                storage, selected_ids, selected_weights,
+                n_tokens, n_used, hot_sel, hot_wts,
+                &fp_has_hot, &fp_has_cold, err)) {
+            return false;
+        }
+        if (fp_has_cold && !prepare_unique_cold_local_slots(
+                               storage, selected_ids, selected_weights,
+                               n_tokens, n_used, cold_sel, cold_wts,
+                               nullptr, err)) {
+            return false;
         }
 
         CachedHotBatchedGraph & hg = storage.hot_batched_mixed[n_tokens];
-        const bool hg_ok = (hg.valid() && hg.n_tokens == n_tokens)
+        const bool hg_ok = (hg.valid() && hg.n_tokens == n_tokens && !hg.gpu_remap)
             || build_cached_hot_batched_graph(hg, gpu_backend, storage, desc, cfg, n_tokens);
+        const bool use_remote_cold = fp_has_cold && expert_compute && expert_layer;
         CachedHotBatchedGraph * cg = nullptr;
         bool cg_ok = true;
-        if (fp_has_cold) {
+        if (fp_has_cold && !use_remote_cold) {
             cg = &storage.cold_batched_mixed[n_tokens];
             cg_ok = (cg->valid() && cg->n_tokens == n_tokens)
                 || build_cached_cold_batched_graph(*cg, cpu_backend, storage, desc, cfg, n_tokens);
@@ -1087,22 +1515,33 @@ static bool eval_moe_hybrid_ffn_batched_core(
             ggml_backend_graph_compute_async(gpu_backend, hg.gf);
 
             std::vector<float> cold_partial;
-            if (cg) {
+            if (fp_has_cold) {
                 cold_partial.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
-                ggml_backend_tensor_set(cg->inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
-                ggml_backend_tensor_set(cg->sel, cold_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
-                ggml_backend_tensor_set(cg->wts, cold_wts.data(), 0, sizeof(float) * (size_t)total_slots);
-                if (ggml_backend_graph_compute(cpu_backend, cg->gf) != GGML_STATUS_SUCCESS) {
-                    ggml_backend_synchronize(gpu_backend);
-                    if (err) *err = "batched cold cached compute failed";
-                    return false;
+                if (use_remote_cold) {
+                    if (!eval_moe_hybrid_remote_cold_batched(
+                            cfg, storage, cur_host, selected_ids,
+                            selected_weights, n_tokens, cold_partial, err,
+                            expert_compute, expert_layer)) {
+                        ggml_backend_synchronize(gpu_backend);
+                        if (err && err->empty()) *err = "batched remote cold compute failed";
+                        return false;
+                    }
+                } else {
+                    ggml_backend_tensor_set(cg->inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+                    ggml_backend_tensor_set(cg->sel, cold_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
+                    ggml_backend_tensor_set(cg->wts, cold_wts.data(), 0, sizeof(float) * (size_t)total_slots);
+                    if (ggml_backend_graph_compute(cpu_backend, cg->gf) != GGML_STATUS_SUCCESS) {
+                        ggml_backend_synchronize(gpu_backend);
+                        if (err) *err = "batched cold cached compute failed";
+                        return false;
+                    }
+                    ggml_backend_tensor_get(cg->output, cold_partial.data(), 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
                 }
-                ggml_backend_tensor_get(cg->output, cold_partial.data(), 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
             }
 
             ggml_backend_synchronize(gpu_backend);
             ggml_backend_tensor_get(hg.output, out.data(), 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
-            if (cg) {
+            if (fp_has_cold) {
                 const size_t ntot = (size_t)n_embd * (size_t)n_tokens;
                 for (size_t i = 0; i < ntot; ++i) out[i] += cold_partial[i];
             }
@@ -1115,35 +1554,24 @@ static bool eval_moe_hybrid_ffn_batched_core(
     // Dummy slots use weight 0.0 and are distributed evenly across all experts
     // to avoid pathological routing imbalance that triggers OOB in MMQ stream-k.
     const int total_slots = n_used * n_tokens;
-    const int n_hot_stack = storage.gate_up_hot ? (int)storage.gate_up_hot->ne[2]
-                          : storage.gate_hot    ? (int)storage.gate_hot->ne[2]
-                          : 1;
-    std::vector<int32_t> hot_sel(total_slots);
-    // Dummy slots -> pinned (initialized) experts only; see note above.
-    const int n_hot_init = std::max(1, storage.hot_active);
-    for (int i = 0; i < total_slots; ++i) hot_sel[i] = i % n_hot_init;
-    std::vector<float>   hot_wts(total_slots, 0.0f);
-    std::vector<int32_t> cold_sel(total_slots);
-    for (int i = 0; i < total_slots; ++i) cold_sel[i] = i % std::max(1, (int)(storage.down_cold ? storage.down_cold->ne[2] : 1));
-    std::vector<float>   cold_wts(total_slots, 0.0f);
+    auto & scratch = g_mixed_routing_scratch;
+    scratch.ensure(total_slots, cfg.n_expert);
+    auto & hot_sel = scratch.hot_sel;
+    auto & hot_wts = scratch.hot_wts;
+    auto & cold_sel = scratch.cold_sel;
+    auto & cold_wts = scratch.cold_wts;
     bool has_hot = false, has_cold = false;
-
-    for (int i = 0; i < total_slots; ++i) {
-        const int32_t gid = selected_ids[i];
-        if (gid < 0 || gid >= (int32_t)storage.hot_local_by_global.size()) continue;
-        const int32_t hot_lid = storage.hot_local_by_global[(size_t)gid];
-        if (hot_lid >= 0) {
-            hot_sel[i] = hot_lid;
-            hot_wts[i] = selected_weights[i];
-            has_hot = true;
-        } else {
-            const int32_t cold_lid = storage.cold_local_by_global[(size_t)gid];
-            if (cold_lid >= 0) {
-                cold_sel[i] = cold_lid;
-                cold_wts[i] = selected_weights[i];
-                has_cold = true;
-            }
-        }
+    if (!prepare_unique_hot_local_slots(
+            storage, selected_ids, selected_weights,
+            n_tokens, n_used, hot_sel, hot_wts,
+            &has_hot, &has_cold, err)) {
+        return false;
+    }
+    if (has_cold && !prepare_unique_cold_local_slots(
+                        storage, selected_ids, selected_weights,
+                        n_tokens, n_used, cold_sel, cold_wts,
+                        nullptr, err)) {
+        return false;
     }
 
     // ── Step 2: Build and run hot GPU graph (includes shared expert always) ──
@@ -1219,76 +1647,89 @@ static bool eval_moe_hybrid_ffn_batched_core(
     }
 
     // ── Step 3: Build and run cold CPU graph (overlaps with GPU) ──
-    std::vector<float> cold_partial((size_t)n_embd * (size_t)n_tokens, 0.0f);
+    auto & split_scratch = g_hybrid_split_scratch;
+    auto & cold_partial = split_scratch.cold_partial;
+    cold_partial.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
 
     if (has_cold) {
-        ggml_init_params ip{};
-        ip.mem_size = 128 * 1024 * 1024;
-        ip.mem_buffer = nullptr;
-        ip.no_alloc = true;
-        ggml_context * cold_ctx = ggml_init(ip);
-        if (!cold_ctx) {
-            if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
-            if (hot_alloc) ggml_gallocr_free(hot_alloc);
-            if (hot_ctx) ggml_free(hot_ctx);
-            if (err) *err = "cold ggml_init failed";
-            return false;
-        }
-
-        ggml_tensor * inp = ggml_new_tensor_2d(cold_ctx, GGML_TYPE_F32, n_embd, n_tokens);
-        ggml_set_input(inp);
-        ggml_tensor * sel = ggml_new_tensor_2d(cold_ctx, GGML_TYPE_I32, n_used, n_tokens);
-        ggml_set_input(sel);
-        ggml_tensor * wts = ggml_new_tensor_2d(cold_ctx, GGML_TYPE_F32, n_used, n_tokens);
-        ggml_set_input(wts);
-
-        ggml_tensor * cold_routed = nullptr;
-        build_batched_routed_graph(cold_ctx,
-            storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
-            desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-            inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens, &cold_routed);
-
-        ggml_cgraph * cold_gf = ggml_new_graph_custom(cold_ctx, 4096, false);
-        ggml_set_output(cold_routed);
-        ggml_build_forward_expand(cold_gf, cold_routed);
-        ggml_gallocr_t cold_alloc;
-        if (p_cold_alloc) {
-            if (!*p_cold_alloc)
-                *p_cold_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
-            cold_alloc = *p_cold_alloc;
+        if (expert_compute && expert_layer) {
+            if (!eval_moe_hybrid_remote_cold_batched(
+                    cfg, storage, cur_host, selected_ids, selected_weights,
+                    n_tokens, cold_partial, err, expert_compute, expert_layer)) {
+                if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
+                if (!p_hot_alloc && hot_alloc) ggml_gallocr_free(hot_alloc);
+                if (hot_ctx) ggml_free(hot_ctx);
+                if (err && err->empty()) *err = "hybrid batched remote cold compute failed";
+                return false;
+            }
         } else {
-            cold_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
-        }
-        if (!ggml_gallocr_alloc_graph(cold_alloc, cold_gf)) {
-            if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
-            if (!p_hot_alloc && hot_alloc) ggml_gallocr_free(hot_alloc);
-            if (hot_ctx) ggml_free(hot_ctx);
+            ggml_init_params ip{};
+            ip.mem_size = 128 * 1024 * 1024;
+            ip.mem_buffer = nullptr;
+            ip.no_alloc = true;
+            ggml_context * cold_ctx = ggml_init(ip);
+            if (!cold_ctx) {
+                if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
+                if (!p_hot_alloc && hot_alloc) ggml_gallocr_free(hot_alloc);
+                if (hot_ctx) ggml_free(hot_ctx);
+                if (err) *err = "cold ggml_init failed";
+                return false;
+            }
+
+            ggml_tensor * inp = ggml_new_tensor_2d(cold_ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_input(inp);
+            ggml_tensor * sel = ggml_new_tensor_2d(cold_ctx, GGML_TYPE_I32, n_used, n_tokens);
+            ggml_set_input(sel);
+            ggml_tensor * wts = ggml_new_tensor_2d(cold_ctx, GGML_TYPE_F32, n_used, n_tokens);
+            ggml_set_input(wts);
+
+            ggml_tensor * cold_routed = nullptr;
+            build_batched_routed_graph(cold_ctx,
+                storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
+                desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
+                inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens, &cold_routed);
+
+            ggml_cgraph * cold_gf = ggml_new_graph_custom(cold_ctx, 4096, false);
+            ggml_set_output(cold_routed);
+            ggml_build_forward_expand(cold_gf, cold_routed);
+            ggml_gallocr_t cold_alloc;
+            if (p_cold_alloc) {
+                if (!*p_cold_alloc)
+                    *p_cold_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
+                cold_alloc = *p_cold_alloc;
+            } else {
+                cold_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
+            }
+            if (!ggml_gallocr_alloc_graph(cold_alloc, cold_gf)) {
+                if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
+                if (!p_hot_alloc && hot_alloc) ggml_gallocr_free(hot_alloc);
+                if (hot_ctx) ggml_free(hot_ctx);
+                if (!p_cold_alloc) ggml_gallocr_free(cold_alloc);
+                ggml_free(cold_ctx);
+                if (err) *err = "hybrid batched cold gallocr failed";
+                return false;
+            }
+
+            ggml_backend_tensor_set(inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+            ggml_backend_tensor_set(sel, cold_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
+            ggml_backend_tensor_set(wts, cold_wts.data(), 0, sizeof(float) * (size_t)total_slots);
+
+            auto st = ggml_backend_graph_compute(cpu_backend, cold_gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
+                if (!p_hot_alloc && hot_alloc) ggml_gallocr_free(hot_alloc);
+                if (hot_ctx) ggml_free(hot_ctx);
+                if (!p_cold_alloc) ggml_gallocr_free(cold_alloc);
+                ggml_free(cold_ctx);
+                if (err) *err = "hybrid batched cold compute failed";
+                return false;
+            }
+
+            ggml_backend_tensor_get(cold_routed, cold_partial.data(), 0,
+                sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
             if (!p_cold_alloc) ggml_gallocr_free(cold_alloc);
             ggml_free(cold_ctx);
-            if (err) *err = "hybrid batched cold gallocr failed";
-            return false;
         }
-
-        ggml_backend_tensor_set(inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
-        ggml_backend_tensor_set(sel, cold_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
-        ggml_backend_tensor_set(wts, cold_wts.data(), 0, sizeof(float) * (size_t)total_slots);
-
-        // Run CPU synchronously (overlaps with GPU async)
-        auto st = ggml_backend_graph_compute(cpu_backend, cold_gf);
-        if (st != GGML_STATUS_SUCCESS) {
-            if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
-            if (!p_hot_alloc && hot_alloc) ggml_gallocr_free(hot_alloc);
-            if (hot_ctx) ggml_free(hot_ctx);
-            if (!p_cold_alloc) ggml_gallocr_free(cold_alloc);
-            ggml_free(cold_ctx);
-            if (err) *err = "hybrid batched cold compute failed";
-            return false;
-        }
-
-        ggml_backend_tensor_get(cold_routed, cold_partial.data(), 0,
-            sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
-        if (!p_cold_alloc) ggml_gallocr_free(cold_alloc);
-        ggml_free(cold_ctx);
     }
 
     // ── Step 4: Sync GPU and read hot result ──
@@ -1306,6 +1747,407 @@ static bool eval_moe_hybrid_ffn_batched_core(
         out[i] = hot_partial[i] + cold_partial[i];
     }
 
+    return true;
+}
+
+static bool eval_moe_hybrid_remote_cold_batched(
+    const MoeHybridConfig &         cfg,
+    const MoeHybridLayerStorage &   storage,
+    const float *                   cur_host,
+    const int32_t *                 selected_ids,
+    const float *                   selected_weights,
+    int                             n_tokens,
+    std::vector<float> &            out,
+    std::string *                   err,
+    MoeExpertCompute *              expert_compute,
+    const MoeExpertLayer *          expert_layer) {
+    const int n_embd = cfg.n_embd;
+    const int n_used = cfg.n_expert_used;
+    const int n_ff_exp = cfg.n_ff_exp;
+    out.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
+    if (n_tokens <= 0) return true;
+    if (!expert_compute || !expert_layer) return true;
+
+    auto & scratch = g_remote_cold_batch_scratch;
+    scratch.ensure(n_tokens, n_used, n_embd, n_used);
+    auto & cold_counts = scratch.cold_counts;
+    auto & cold_sel = scratch.cold_sel;
+    auto & cold_wts = scratch.cold_wts;
+    int max_cold_selected = 0;
+
+    for (int t = 0; t < n_tokens; ++t) {
+        int count = 0;
+        for (int i = 0; i < n_used; ++i) {
+            const size_t src = (size_t)t * (size_t)n_used + (size_t)i;
+            const int32_t gid = selected_ids[src];
+            if (gid < 0 || gid >= (int32_t)storage.hot_local_by_global.size()) {
+                continue;
+            }
+            if (storage.hot_local_by_global[(size_t)gid] >= 0) {
+                continue;
+            }
+            const int32_t cold_lid = storage.cold_local_by_global[(size_t)gid];
+            if (cold_lid >= 0) {
+                const size_t dst = (size_t)t * (size_t)n_used + (size_t)count;
+                cold_sel[dst] = cold_lid;
+                cold_wts[dst] = selected_weights[src];
+                count++;
+            }
+        }
+        cold_counts[(size_t)t] = count;
+        max_cold_selected = std::max(max_cold_selected, count);
+    }
+
+    if (max_cold_selected == 0) return true;
+    if (expert_layer->cold_global_by_local.empty()) {
+        if (err) *err = "hybrid batched remote cold layer has no cold experts";
+        return false;
+    }
+    auto & group_ids = scratch.group_ids;
+    auto & group_wts = scratch.group_wts;
+    if (group_ids.capacity() < (size_t)n_tokens * (size_t)max_cold_selected) {
+        group_ids.reserve((size_t)n_tokens * (size_t)max_cold_selected);
+    }
+    if (group_wts.capacity() < (size_t)n_tokens * (size_t)max_cold_selected) {
+        group_wts.reserve((size_t)n_tokens * (size_t)max_cold_selected);
+    }
+
+    const char * pack_env = std::getenv("DFLASH_MOE_REMOTE_COLD_PACK");
+    const bool pack_env_set = pack_env && *pack_env;
+    const bool padded_pack = pack_env_set
+        ? (std::strcmp(pack_env, "padded") == 0 ||
+           std::strcmp(pack_env, "single") == 0)
+        : expert_compute->prefers_padded_batch();
+    if (padded_pack) {
+        const int cold_stack = (int)expert_layer->cold_global_by_local.size();
+        if (cold_stack < max_cold_selected) {
+            if (err) *err = "hybrid batched remote cold padded pack exceeds cold stack";
+            return false;
+        }
+        group_ids.resize((size_t)n_tokens * (size_t)max_cold_selected);
+        group_wts.resize((size_t)n_tokens * (size_t)max_cold_selected);
+        std::vector<uint8_t> used((size_t)cold_stack, 0);
+        for (int t = 0; t < n_tokens; ++t) {
+            const int count = cold_counts[(size_t)t];
+            std::fill(used.begin(), used.end(), 0);
+            int next_dummy = 0;
+            for (int i = 0; i < max_cold_selected; ++i) {
+                const size_t dst = (size_t)t * (size_t)max_cold_selected + (size_t)i;
+                if (i < count) {
+                    const size_t src = (size_t)t * (size_t)n_used + (size_t)i;
+                    const int32_t cold_local = cold_sel[src];
+                    if (cold_local < 0 || cold_local >= cold_stack) {
+                        if (err) *err = "hybrid batched remote cold local id out of range";
+                        return false;
+                    }
+                    if (used[(size_t)cold_local]) {
+                        if (err) *err = "hybrid batched remote cold duplicate local id";
+                        return false;
+                    }
+                    group_ids[dst] = cold_local;
+                    group_wts[dst] = cold_wts[src];
+                    used[(size_t)cold_local] = 1;
+                } else {
+                    while (next_dummy < cold_stack && used[(size_t)next_dummy]) {
+                        ++next_dummy;
+                    }
+                    if (next_dummy >= cold_stack) {
+                        if (err) *err = "hybrid batched remote cold lacks unique padded ids";
+                        return false;
+                    }
+                    group_ids[dst] = next_dummy;
+                    group_wts[dst] = 0.0f;
+                    used[(size_t)next_dummy] = 1;
+                    ++next_dummy;
+                }
+            }
+        }
+        if (!expert_compute->compute_batch(*expert_layer,
+                                           cur_host,
+                                           group_ids.data(),
+                                           group_wts.data(),
+                                           n_tokens,
+                                           max_cold_selected,
+                                           n_embd, n_ff_exp,
+                                           out.data())) {
+            if (err) *err = "hybrid batched remote cold padded compute failed";
+            return false;
+        }
+        return true;
+    }
+
+    auto & token_groups = scratch.token_groups;
+    if (token_groups.size() < (size_t)max_cold_selected + 1) {
+        token_groups.resize((size_t)max_cold_selected + 1);
+    }
+    auto & active_groups = scratch.active_groups;
+    for (int n_cold : active_groups) {
+        if (n_cold >= 0 && (size_t)n_cold < token_groups.size()) {
+            token_groups[(size_t)n_cold].clear();
+        }
+    }
+    active_groups.clear();
+    for (int t = 0; t < n_tokens; ++t) {
+        const int count = cold_counts[(size_t)t];
+        if (count > 0) {
+            auto & bucket = token_groups[(size_t)count];
+            if (bucket.empty()) {
+                active_groups.push_back(count);
+            }
+            bucket.push_back(t);
+        }
+    }
+
+    auto & group_input = scratch.group_input;
+    auto & group_output = scratch.group_output;
+    if (group_input.capacity() < (size_t)n_embd * (size_t)n_tokens) {
+        group_input.reserve((size_t)n_embd * (size_t)n_tokens);
+    }
+    if (group_output.capacity() < (size_t)n_embd * (size_t)n_tokens) {
+        group_output.reserve((size_t)n_embd * (size_t)n_tokens);
+    }
+    for (int n_cold : active_groups) {
+        const auto & token_group = token_groups[(size_t)n_cold];
+        if (token_group.empty()) continue;
+        const size_t group_limit = (size_t)std::max(
+            1, std::min(
+                   moe_expert_compute_batch_limit_from_env(),
+                   (int)token_group.size()));
+        for (size_t base = 0; base < token_group.size(); base += group_limit) {
+            const int tc = (int)std::min(group_limit, token_group.size() - base);
+            bool contiguous_tokens = true;
+            for (int gi = 1; gi < tc; ++gi) {
+                if (token_group[base + (size_t)gi] != token_group[base] + gi) {
+                    contiguous_tokens = false;
+                    break;
+                }
+            }
+
+            const int first_token = token_group[base];
+            const float * compute_input = contiguous_tokens
+                ? cur_host + (size_t)first_token * (size_t)n_embd
+                : nullptr;
+            float * compute_output = contiguous_tokens
+                ? out.data() + (size_t)first_token * (size_t)n_embd
+                : nullptr;
+            if (!contiguous_tokens) {
+                group_input.resize((size_t)tc * (size_t)n_embd);
+                group_output.resize((size_t)tc * (size_t)n_embd);
+                compute_input = group_input.data();
+                compute_output = group_output.data();
+            }
+
+            group_ids.resize((size_t)tc * (size_t)n_cold);
+            group_wts.resize((size_t)tc * (size_t)n_cold);
+            for (int gi = 0; gi < tc; ++gi) {
+                const int t = token_group[base + (size_t)gi];
+                if (!contiguous_tokens) {
+                    std::memcpy(group_input.data() + (size_t)gi * (size_t)n_embd,
+                                cur_host + (size_t)t * (size_t)n_embd,
+                                sizeof(float) * (size_t)n_embd);
+                }
+                for (int i = 0; i < n_cold; ++i) {
+                    const size_t src = (size_t)t * (size_t)n_used + (size_t)i;
+                    const size_t dst = (size_t)gi * (size_t)n_cold + (size_t)i;
+                    group_ids[dst] = cold_sel[src];
+                    group_wts[dst] = cold_wts[src];
+                }
+            }
+
+            if (!expert_compute->compute_batch(*expert_layer,
+                                               compute_input,
+                                               group_ids.data(),
+                                               group_wts.data(),
+                                               tc, n_cold,
+                                               n_embd, n_ff_exp,
+                                               compute_output)) {
+                if (err) *err = "hybrid batched remote cold compute failed";
+                return false;
+            }
+
+            if (!contiguous_tokens) {
+                for (int gi = 0; gi < tc; ++gi) {
+                    const int t = token_group[base + (size_t)gi];
+                    std::memcpy(out.data() + (size_t)t * (size_t)n_embd,
+                                group_output.data() + (size_t)gi * (size_t)n_embd,
+                                sizeof(float) * (size_t)n_embd);
+                }
+            }
+        }
+        token_groups[(size_t)n_cold].clear();
+    }
+    return true;
+}
+
+static bool eval_moe_hot_remap_batched(
+    ggml_backend_t                  gpu_backend,
+    const MoeHybridConfig &         cfg,
+    const MoeLayerDesc &            desc,
+    MoeHybridLayerStorage &         storage,
+    const float *                   cur_host,
+    const int32_t *                 selected_ids,
+    const float *                   selected_weights,
+    int                             n_tokens,
+    std::vector<float> &            out,
+    std::string *                   err) {
+    const int n_embd = cfg.n_embd;
+    const int n_used = cfg.n_expert_used;
+    const int total_slots = n_used * n_tokens;
+    out.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
+    if (n_tokens <= 0) return true;
+    if (!cur_host || !selected_ids || !selected_weights) return false;
+    if ((int)storage.hot_local_by_global.size() < cfg.n_expert) {
+        if (err) *err = "hot-remap batched graph lacks hot-local LUT";
+        return false;
+    }
+
+    auto & cached = (n_tokens > 0 && n_tokens < MoeHybridLayerStorage::kMaxBatchedCache)
+                  ? storage.hot_batched_mixed[n_tokens]
+                  : storage.hot_batched_graph;
+    if (!cached.valid() || cached.n_tokens != n_tokens || !cached.gpu_remap ||
+        !cached.global_ids || !cached.raw_weights ||
+        !cached.hot_local_lut || !cached.valid_lut) {
+        if (!build_cached_hot_batched_graph(cached, gpu_backend, storage,
+                                            desc, cfg, n_tokens,
+                                            /*gpu_remap=*/true)) {
+            if (err) *err = "hot-remap batched graph build failed";
+            return false;
+        }
+    }
+
+    auto & scratch = g_mixed_routing_scratch;
+    scratch.ensure(total_slots, cfg.n_expert);
+    auto & lut = scratch.lut;
+    auto & vlut = scratch.vlut;
+    for (int expert = 0; expert < cfg.n_expert; ++expert) {
+        const int32_t local = storage.hot_local_by_global[(size_t)expert];
+        if (local >= 0) {
+            lut[(size_t)expert] = local;
+            vlut[(size_t)expert] = 1.0f;
+        } else {
+            lut[(size_t)expert] = 0;
+            vlut[(size_t)expert] = 0.0f;
+        }
+    }
+
+    ggml_backend_tensor_set(cached.inp, cur_host, 0,
+        sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+    ggml_backend_tensor_set(cached.hot_local_lut, lut.data(), 0,
+        sizeof(int32_t) * (size_t)cfg.n_expert);
+    ggml_backend_tensor_set(cached.valid_lut, vlut.data(), 0,
+        sizeof(float) * (size_t)cfg.n_expert);
+    ggml_backend_tensor_set(cached.global_ids, selected_ids, 0,
+        sizeof(int32_t) * (size_t)total_slots);
+    ggml_backend_tensor_set(cached.raw_weights, selected_weights, 0,
+        sizeof(float) * (size_t)total_slots);
+
+    if (ggml_backend_graph_compute(gpu_backend, cached.gf) != GGML_STATUS_SUCCESS) {
+        if (err) *err = "hot-remap batched graph compute failed";
+        return false;
+    }
+    ggml_backend_tensor_get(cached.output, out.data(), 0,
+        sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+    return true;
+}
+
+static bool eval_moe_hybrid_ffn_split_hot_remote_cold(
+    ggml_backend_t                  gpu_backend,
+    const MoeHybridConfig &         cfg,
+    const MoeLayerDesc &            desc,
+    MoeHybridLayerStorage &         storage,
+    const float *                   cur_host,
+    const int32_t *                 selected_ids,
+    const float *                   selected_weights,
+    int                             n_tokens,
+    int                             hot_sub_batch,
+    std::vector<float> &            out,
+    std::string *                   err,
+    ggml_gallocr_t *                p_hot_alloc,
+    MoeExpertCompute *              expert_compute,
+    const MoeExpertLayer *          expert_layer) {
+    const int n_embd = cfg.n_embd;
+    const int n_used = cfg.n_expert_used;
+    std::fprintf(stderr,
+                 "[hybrid-ffn] split_hot_remote_cold n_used=%d n_tokens=%d hot_sub_batch=%d\n",
+                 n_used, n_tokens, hot_sub_batch);
+    out.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
+    const bool profile_enabled = moe_hybrid_batched_profile_enabled();
+    const auto total_t0 = profile_enabled ? HybridClock::now() : HybridClock::time_point{};
+
+    auto & split_scratch = g_hybrid_split_scratch;
+    auto & cold_partial = split_scratch.cold_partial;
+    cold_partial.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
+    const auto cold_t0 = profile_enabled ? HybridClock::now() : HybridClock::time_point{};
+    bool cold_ok = false;
+    std::string cold_err;
+    g_hybrid_cold_worker.submit([&]() {
+        cold_ok = eval_moe_hybrid_remote_cold_batched(
+            cfg, storage, cur_host, selected_ids, selected_weights,
+            n_tokens, cold_partial, &cold_err, expert_compute, expert_layer);
+    });
+
+    auto & hot_out = split_scratch.hot_out;
+    bool hot_ok = true;
+    std::string hot_err;
+    uint64_t local_hot_calls = 0;
+    uint64_t local_hot_tokens = 0;
+    uint64_t local_hot_us = 0;
+    for (int t0 = 0; t0 < n_tokens; t0 += hot_sub_batch) {
+        const int tc = std::min(hot_sub_batch, n_tokens - t0);
+        const auto hot_t0 = profile_enabled ? HybridClock::now() : HybridClock::time_point{};
+        if (!eval_moe_hot_remap_batched(
+                gpu_backend, cfg, desc, storage,
+                cur_host + (size_t)t0 * (size_t)n_embd,
+                selected_ids + (size_t)t0 * (size_t)n_used,
+                selected_weights + (size_t)t0 * (size_t)n_used,
+                tc, hot_out, &hot_err)) {
+            hot_ok = false;
+            break;
+        }
+        const auto hot_t1 = profile_enabled ? HybridClock::now() : HybridClock::time_point{};
+        if (profile_enabled) {
+            local_hot_calls++;
+            local_hot_tokens += (uint64_t)tc;
+            local_hot_us += elapsed_us(hot_t0, hot_t1);
+        }
+        std::memcpy(out.data() + (size_t)t0 * (size_t)n_embd,
+                    hot_out.data(),
+                    sizeof(float) * (size_t)n_embd * (size_t)tc);
+    }
+
+    const auto overlap_wait_t0 = profile_enabled ? HybridClock::now() : HybridClock::time_point{};
+    g_hybrid_cold_worker.wait();
+    const auto overlap_wait_t1 = profile_enabled ? HybridClock::now() : HybridClock::time_point{};
+    const auto cold_t1 = profile_enabled ? HybridClock::now() : HybridClock::time_point{};
+    if (!hot_ok) {
+        if (err) *err = hot_err.empty() ? "hybrid batched hot compute failed" : hot_err;
+        return false;
+    }
+    if (!cold_ok) {
+        if (err) *err = cold_err.empty() ? "hybrid batched remote cold compute failed" : cold_err;
+        return false;
+    }
+
+    const auto merge_t0 = profile_enabled ? HybridClock::now() : HybridClock::time_point{};
+    const size_t total_floats = (size_t)n_embd * (size_t)n_tokens;
+    for (size_t i = 0; i < total_floats; ++i) {
+        out[i] += cold_partial[i];
+    }
+    const auto merge_t1 = profile_enabled ? HybridClock::now() : HybridClock::time_point{};
+    if (profile_enabled) {
+        const auto total_t1 = HybridClock::now();
+        auto & prof = moe_hybrid_batched_profile();
+        prof.calls++;
+        prof.tokens += (uint64_t)n_tokens;
+        prof.remote_cold_us += elapsed_us(cold_t0, cold_t1);
+        prof.hot_calls += local_hot_calls;
+        prof.hot_tokens += local_hot_tokens;
+        prof.hot_us += local_hot_us;
+        prof.overlap_us += elapsed_us(overlap_wait_t0, overlap_wait_t1);
+        prof.merge_us += elapsed_us(merge_t0, merge_t1);
+        prof.total_us += elapsed_us(total_t0, total_t1);
+        prof.maybe_print(false);
+    }
     return true;
 }
 
@@ -1331,6 +2173,18 @@ bool eval_moe_hot_only_batched(
     const int n_ff_exp = cfg.n_ff_exp;
     out.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
     if (n_tokens <= 0) return true;
+
+    // The batched hot-only fast path has only been validated on the legacy
+    // top-k<=8 shapes. Larger routed top-k values, such as Ornith's
+    // n_expert_used=10, should stay on the hybrid path until their mul_mat_id
+    // shapes are explicitly verified.
+    if (n_used > 8) {
+        std::fprintf(stderr,
+                     "[hybrid-ffn] reject hot_only batched path n_used=%d n_tokens=%d\n",
+                     n_used, n_tokens);
+        if (err) *err = "hot_only batched fast path disabled for n_expert_used > 8";
+        return false;
+    }
 
     // Workaround for the ggml-cuda MMQ mul_mat_id stream-k fault on a REDUCED
     // hot stack (sm_75/gfx1151 AND sm_86): slice sub-64 batches to a size the
@@ -1359,18 +2213,6 @@ bool eval_moe_hot_only_batched(
         return true;
     }
 
-    // Remap global expert IDs → hot-local IDs
-    const int total_slots = n_used * n_tokens;
-    std::vector<int32_t> hot_sel(total_slots);
-    for (int i = 0; i < total_slots; ++i) {
-        const int32_t gid = selected_ids[i];
-        if (gid < 0 || gid >= (int32_t)storage.hot_local_by_global.size()) {
-            hot_sel[i] = 0;
-        } else {
-            hot_sel[i] = storage.hot_local_by_global[(size_t)gid];
-        }
-    }
-
     // ── Fast path: use cached graph (avoids rebuild + realloc) ──
     // Per-n_tokens cache: spec-decode alternates verify (verify_width) and
     // replay (commit_n) sizes; a single slot would rebuild all 40 layers' FFN
@@ -1378,11 +2220,67 @@ bool eval_moe_hot_only_batched(
     auto & cached = (n_tokens > 0 && n_tokens < MoeHybridLayerStorage::kMaxBatchedCache)
                   ? storage.hot_batched_mixed[n_tokens]
                   : storage.hot_batched_graph;
-    if (cached.n_tokens == n_tokens && cached.valid()) {
+    const bool use_remap = cached.valid() && cached.gpu_remap;
+    if (cached.n_tokens == n_tokens && cached.valid() && use_remap) {
+        const int total_slots = n_used * n_tokens;
+        auto & scratch = g_mixed_routing_scratch;
+        scratch.ensure(total_slots, cfg.n_expert);
+        auto & lut = scratch.lut;
+        auto & vlut = scratch.vlut;
+        auto & hot_sel = scratch.hot_sel;
+        auto & hot_wts = scratch.hot_wts;
+        for (int expert = 0; expert < cfg.n_expert; ++expert) {
+            const int32_t local = storage.hot_local_by_global[(size_t)expert];
+            if (local >= 0) {
+                lut[(size_t)expert] = local;
+                vlut[(size_t)expert] = 1.0f;
+            } else {
+                lut[(size_t)expert] = 0;
+                vlut[(size_t)expert] = 0.0f;
+            }
+        }
+        ggml_backend_tensor_set(cached.inp, cur_host, 0,
+            sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+        ggml_backend_tensor_set(cached.hot_local_lut, lut.data(), 0,
+            sizeof(int32_t) * (size_t)cfg.n_expert);
+        ggml_backend_tensor_set(cached.valid_lut, vlut.data(), 0,
+            sizeof(float) * (size_t)cfg.n_expert);
+        if (!prepare_unique_hot_global_slots(
+                storage, selected_ids, selected_weights,
+                n_tokens, n_used, hot_sel, hot_wts, err)) {
+            return false;
+        }
+        ggml_backend_tensor_set(cached.global_ids, hot_sel.data(), 0,
+            sizeof(int32_t) * (size_t)total_slots);
+        ggml_backend_tensor_set(cached.raw_weights, hot_wts.data(), 0,
+            sizeof(float) * (size_t)total_slots);
+        auto st = ggml_backend_graph_compute(gpu_backend, cached.gf);
+        if (st != GGML_STATUS_SUCCESS) {
+            if (err) *err = "hot_only remap cached compute failed";
+            return false;
+        }
+        ggml_backend_tensor_get(cached.output, out.data(), 0,
+            sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+        return true;
+    }
+    if (cached.n_tokens == n_tokens && cached.valid() && !cached.gpu_remap) {
         // Reuse pre-built graph: just upload data and compute
+        const int total_slots = n_used * n_tokens;
+        auto & scratch = g_mixed_routing_scratch;
+        scratch.ensure(total_slots, cfg.n_expert);
+        auto & hot_sel = scratch.hot_sel;
+        auto & hot_wts = scratch.hot_wts;
+        bool has_hot = false;
+        bool has_cold = false;
+        if (!prepare_unique_hot_local_slots(
+                storage, selected_ids, selected_weights,
+                n_tokens, n_used, hot_sel, hot_wts,
+                &has_hot, &has_cold, err)) {
+            return false;
+        }
         ggml_backend_tensor_set(cached.inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
         ggml_backend_tensor_set(cached.sel, hot_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
-        ggml_backend_tensor_set(cached.wts, selected_weights, 0, sizeof(float) * (size_t)total_slots);
+        ggml_backend_tensor_set(cached.wts, hot_wts.data(), 0, sizeof(float) * (size_t)total_slots);
 
         auto st = ggml_backend_graph_compute(gpu_backend, cached.gf);
         if (st != GGML_STATUS_SUCCESS) {
@@ -1398,19 +2296,13 @@ bool eval_moe_hot_only_batched(
     // Cache when: sub-batch size (legacy), full stack (all hot), or full-batch safe (sm_80+).
     if (mmq_full_batch_ok(cfg, n_tokens) || n_tokens <= MMQ_SAFE_SUB_BATCH
         || (n_hot_stack == 0 || n_hot_stack >= cfg.n_expert)) {
-        if (build_cached_hot_batched_graph(cached, gpu_backend, storage, desc, cfg, n_tokens)) {
+        if (build_cached_hot_batched_graph(cached, gpu_backend, storage, desc, cfg, n_tokens,
+                                           /*gpu_remap=*/true)) {
             // Successfully cached — use it immediately
-            ggml_backend_tensor_set(cached.inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
-            ggml_backend_tensor_set(cached.sel, hot_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
-            ggml_backend_tensor_set(cached.wts, selected_weights, 0, sizeof(float) * (size_t)total_slots);
-
-            auto st = ggml_backend_graph_compute(gpu_backend, cached.gf);
-            if (st != GGML_STATUS_SUCCESS) {
-                if (err) *err = "hot_only cached compute failed (first)";
-                return false;
-            }
-            ggml_backend_tensor_get(cached.output, out.data(), 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
-            return true;
+            return eval_moe_hot_remap_batched(gpu_backend, cfg, desc, storage,
+                                              cur_host, selected_ids,
+                                              selected_weights, n_tokens,
+                                              out, err);
         }
         // Fall through to uncached path if build fails
     }
@@ -1469,8 +2361,30 @@ bool eval_moe_hot_only_batched(
     }
 
     ggml_backend_tensor_set(inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
-    ggml_backend_tensor_set(sel, hot_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
-    ggml_backend_tensor_set(wts, selected_weights, 0, sizeof(float) * (size_t)total_slots);
+    if (!cached.gpu_remap) {
+        const int total_slots = n_used * n_tokens;
+        auto & scratch = g_mixed_routing_scratch;
+        scratch.ensure(total_slots, cfg.n_expert);
+        auto & hot_sel = scratch.hot_sel;
+        auto & hot_wts = scratch.hot_wts;
+        bool has_hot = false;
+        bool has_cold = false;
+        if (!prepare_unique_hot_local_slots(
+                storage, selected_ids, selected_weights,
+                n_tokens, n_used, hot_sel, hot_wts,
+                &has_hot, &has_cold, err)) {
+            if (!p_hot_alloc) ggml_gallocr_free(alloc);
+            ggml_free(ctx);
+            return false;
+        }
+        ggml_backend_tensor_set(sel, hot_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
+        ggml_backend_tensor_set(wts, hot_wts.data(), 0, sizeof(float) * (size_t)total_slots);
+    } else {
+        if (err) *err = "hot_only remap cached graph should be handled before uncached fallback";
+        if (!p_hot_alloc) ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        return false;
+    }
 
     auto st = ggml_backend_graph_compute(gpu_backend, gf);
     if (st != GGML_STATUS_SUCCESS) {
@@ -1508,13 +2422,33 @@ bool eval_moe_hybrid_ffn_batched(
     std::vector<float> &            out,
     std::string *                   err,
     ggml_gallocr_t *                p_hot_alloc,
-    ggml_gallocr_t *                p_cold_alloc) {
+    ggml_gallocr_t *                p_cold_alloc,
+    MoeExpertCompute *              expert_compute,
+    const MoeExpertLayer *          expert_layer) {
+    if (cfg.n_expert_used > 8) {
+        std::fprintf(stderr,
+                     "[hybrid-ffn] disable batched path for n_used=%d n_tokens=%d\n",
+                     cfg.n_expert_used, n_tokens);
+        if (err) *err = "hybrid batched path disabled for n_expert_used > 8";
+        return false;
+    }
     const int n_hot_stack = storage.gate_up_hot ? (int)storage.gate_up_hot->ne[2]
                           : storage.gate_hot    ? (int)storage.gate_hot->ne[2]
                           : 0;
     const int MMQ_SAFE_SUB_BATCH = mmq_safe_sub_batch();
+    std::fprintf(stderr,
+                 "[hybrid-ffn] batched entry n_used=%d n_tokens=%d n_hot_stack=%d mmq_safe=%d remote_cold=%d\n",
+                 cfg.n_expert_used, n_tokens, n_hot_stack, MMQ_SAFE_SUB_BATCH,
+                 (expert_compute && expert_layer) ? 1 : 0);
     if (!mmq_full_batch_ok(cfg, n_tokens)
         && n_hot_stack > 0 && n_tokens > MMQ_SAFE_SUB_BATCH) {
+        if (expert_compute && expert_layer) {
+            return eval_moe_hybrid_ffn_split_hot_remote_cold(
+                gpu_backend, cfg, desc, storage,
+                cur_host, selected_ids, selected_weights,
+                n_tokens, MMQ_SAFE_SUB_BATCH, out, err, p_hot_alloc,
+                expert_compute, expert_layer);
+        }
         const int n_embd = cfg.n_embd;
         const int n_used = cfg.n_expert_used;
         out.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
@@ -1526,7 +2460,8 @@ bool eval_moe_hybrid_ffn_batched(
                     cur_host + (size_t)t0 * (size_t)n_embd,
                     selected_ids + (size_t)t0 * (size_t)n_used,
                     selected_weights + (size_t)t0 * (size_t)n_used,
-                    tc, sub_out, err, p_hot_alloc, p_cold_alloc)) {
+                    tc, sub_out, err, p_hot_alloc, p_cold_alloc,
+                    expert_compute, expert_layer)) {
                 return false;
             }
             std::memcpy(out.data() + (size_t)t0 * (size_t)n_embd,
@@ -1538,7 +2473,7 @@ bool eval_moe_hybrid_ffn_batched(
     return eval_moe_hybrid_ffn_batched_core(
         gpu_backend, cpu_backend, cfg, desc, storage,
         cur_host, selected_ids, selected_weights, n_tokens, out, err,
-        p_hot_alloc, p_cold_alloc);
+        p_hot_alloc, p_cold_alloc, expert_compute, expert_layer);
 }
 
 void ResidualCombineGraph::free() {
@@ -1710,8 +2645,10 @@ bool eval_moe_hybrid_ffn_gpu_resident(
             return false;
         }
         {
-            std::vector<int32_t> lut((size_t)cfg.n_expert);
-            std::vector<float>   vlut((size_t)cfg.n_expert);
+            auto & scratch = g_mixed_routing_scratch;
+            scratch.ensure(n_selected, cfg.n_expert);
+            auto & lut = scratch.lut;
+            auto & vlut = scratch.vlut;
             for (int e = 0; e < cfg.n_expert; ++e) {
                 const int32_t l = storage.hot_local_by_global[(size_t)e];
                 lut[(size_t)e]  = (l >= 0) ? l : 0;

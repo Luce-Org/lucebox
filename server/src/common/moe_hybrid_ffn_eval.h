@@ -4,6 +4,7 @@
 
 #include "moe_hybrid_types.h"
 #include "moe_hybrid_storage.h"
+#include "moe_expert_compute.h"
 
 #include "ggml-backend.h"
 
@@ -138,7 +139,9 @@ bool eval_moe_hybrid_ffn_batched(
     std::vector<float> &            out,
     std::string *                   err = nullptr,
     ggml_gallocr_t *                p_hot_alloc = nullptr,
-    ggml_gallocr_t *                p_cold_alloc = nullptr);
+    ggml_gallocr_t *                p_cold_alloc = nullptr,
+    MoeExpertCompute *              expert_compute = nullptr,
+    const MoeExpertLayer *          expert_layer = nullptr);
 
 // Hot-only batched prefill: all selected experts are in VRAM.
 // Skips cold graph build, CPU compute, and merge — pure GPU path.
@@ -212,6 +215,7 @@ bool build_cached_hot_batched_graph(
     MoeHybridLayerStorage & storage,
     const MoeLayerDesc & desc,
     const MoeHybridConfig & cfg,
-    int n_tokens);
+    int n_tokens,
+    bool gpu_remap = false);
 
 }  // namespace dflash::common

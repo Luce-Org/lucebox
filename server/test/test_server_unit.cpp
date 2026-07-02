@@ -20,6 +20,7 @@
 #include "common/sampler.h"
 #include "common/backend_precision.h"
 #include "common/backend_ipc.h"
+#include "common/moe_expert_compute.h"
 #include "placement/pflash_placement.h"
 #include "common/io_utils.h"
 #include "placement/placement_config.h"
@@ -3040,6 +3041,44 @@ static void test_backend_ipc_shared_payload_map_sizing() {
         std::numeric_limits<size_t>::max(), map_bytes));
 }
 
+static void test_moe_expert_compute_prepare_batch_default_is_opt_in() {
+    unsetenv("DFLASH_MOE_EXPERT_COMPUTE_PREPARE_BATCH");
+    unsetenv("DFLASH_MOE_EXPERT_COMPUTE_PREPARE_SELECTED");
+    TEST_ASSERT(moe_expert_compute_prepare_batch_limit_from_env() == 0);
+    TEST_ASSERT(moe_expert_compute_prepare_selected_limit_from_env() == 0);
+
+    setenv("DFLASH_MOE_EXPERT_COMPUTE_PREPARE_BATCH", "8", 1);
+    setenv("DFLASH_MOE_EXPERT_COMPUTE_PREPARE_SELECTED", "3", 1);
+    TEST_ASSERT(moe_expert_compute_prepare_batch_limit_from_env() == 8);
+    TEST_ASSERT(moe_expert_compute_prepare_selected_limit_from_env() == 3);
+
+    setenv("DFLASH_MOE_EXPERT_COMPUTE_PREPARE_BATCH", "99999", 1);
+    setenv("DFLASH_MOE_EXPERT_COMPUTE_PREPARE_SELECTED", "99999", 1);
+    TEST_ASSERT(moe_expert_compute_prepare_batch_limit_from_env() == 4096);
+    TEST_ASSERT(moe_expert_compute_prepare_selected_limit_from_env() == 4096);
+
+    setenv("DFLASH_MOE_EXPERT_COMPUTE_PREPARE_BATCH", "0", 1);
+    setenv("DFLASH_MOE_EXPERT_COMPUTE_PREPARE_SELECTED", "0", 1);
+    TEST_ASSERT(moe_expert_compute_prepare_batch_limit_from_env() == 0);
+    TEST_ASSERT(moe_expert_compute_prepare_selected_limit_from_env() == 0);
+}
+
+static void test_moe_hybrid_all_routed_are_hot_handles_expert_ids_over_255() {
+    MoeHybridLayerStorage storage;
+    storage.hot_local_by_global.assign(512, -1);
+
+    storage.hot_local_by_global[42] = 0;
+    storage.hot_local_by_global[300] = 1;
+
+    const int32_t all_hot[] = {42, 300};
+    TEST_ASSERT_MSG(storage.all_routed_are_hot(all_hot, 2),
+                    "residency check must treat >255 expert ids as hot when mapped");
+
+    storage.hot_local_by_global[300] = -1;
+    TEST_ASSERT_MSG(!storage.all_routed_are_hot(all_hot, 2),
+                    "residency check must reject >255 expert ids when not mapped hot");
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Sampler tests (model-independent, CPU-only)
 // ═══════════════════════════════════════════════════════════════════════
@@ -4419,6 +4458,8 @@ int main() {
     RUN_TEST(test_backend_ipc_payload_transport_parse);
     RUN_TEST(test_backend_ipc_payload_bounds);
     RUN_TEST(test_backend_ipc_shared_payload_map_sizing);
+    RUN_TEST(test_moe_expert_compute_prepare_batch_default_is_opt_in);
+    RUN_TEST(test_moe_hybrid_all_routed_are_hot_handles_expert_ids_over_255);
 
     std::fprintf(stderr, "\n── Jinja chat template ──\n");
     RUN_TEST(test_jinja_render_basic);

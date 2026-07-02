@@ -58,7 +58,13 @@ void CachedHotBatchedGraph::free() {
     sel = nullptr;
     wts = nullptr;
     output = nullptr;
+    global_ids = nullptr;
+    raw_weights = nullptr;
+    hot_local_lut = nullptr;
+    valid_lut = nullptr;
+    residual_in = nullptr;
     n_tokens = 0;
+    gpu_remap = false;
 }
 
 namespace {
@@ -113,7 +119,16 @@ static bool validate_expert_tensor(ggml_tensor * tensor, int n_expert, size_t * 
         return true;
     }
     if (tensor->ne[2] != n_expert) {
-        if (err) *err = "tensor expert dimension mismatch";
+        if (err) {
+            char msg[256];
+            std::snprintf(msg, sizeof(msg),
+                          "tensor expert dimension mismatch: %s ne=[%lld,%lld,%lld,%lld] expected experts=%d",
+                          tensor->name,
+                          (long long)tensor->ne[0], (long long)tensor->ne[1],
+                          (long long)tensor->ne[2], (long long)tensor->ne[3],
+                          n_expert);
+            *err = msg;
+        }
         return false;
     }
     if ((int64_t)tensor->nb[2] <= 0) {
@@ -128,6 +143,83 @@ static ggml_tensor * new_like_with_expert_count(ggml_context * ctx, ggml_tensor 
     if (!src || hot_count <= 0) return nullptr;
     const int64_t ne[4] = { src->ne[0], src->ne[1], hot_count, 1 };
     return ggml_new_tensor(ctx, src->type, 4, ne);
+}
+
+static bool build_layer_expert_residency(
+        const MoeHybridConfig & cfg,
+        const std::vector<int32_t> & hot_expert_ids,
+        const std::vector<int32_t> * cold_expert_order,
+        std::vector<int32_t> & hot_local_by_global,
+        std::vector<int32_t> & cold_local_by_global,
+        std::vector<int32_t> & cold_expert_ids,
+        uint64_t expert_vram_mask[4],
+        std::string * err) {
+    hot_local_by_global.assign((size_t)cfg.n_expert, -1);
+    cold_local_by_global.assign((size_t)cfg.n_expert, -1);
+    cold_expert_ids.clear();
+    std::memset(expert_vram_mask, 0, sizeof(uint64_t) * 4);
+
+    std::vector<uint8_t> hot_seen((size_t)cfg.n_expert, 0);
+    for (size_t i = 0; i < hot_expert_ids.size(); ++i) {
+        const int32_t expert = hot_expert_ids[i];
+        if (expert < 0 || expert >= cfg.n_expert) {
+            if (err) *err = "hot expert id out of range";
+            return false;
+        }
+        if (hot_seen[(size_t)expert]) {
+            if (err) *err = "duplicate hot expert id";
+            return false;
+        }
+        hot_local_by_global[(size_t)expert] = (int32_t)i;
+        hot_seen[(size_t)expert] = 1;
+        if (expert < 256) {
+            expert_vram_mask[expert >> 6] |= (1ULL << (expert & 63));
+        }
+    }
+
+    if (!cold_expert_order) {
+        for (int expert = 0; expert < cfg.n_expert; ++expert) {
+            if (!hot_seen[(size_t)expert]) {
+                cold_local_by_global[(size_t)expert] =
+                    (int32_t)cold_expert_ids.size();
+                cold_expert_ids.push_back((int32_t)expert);
+            }
+        }
+        return true;
+    }
+
+    std::vector<uint8_t> cold_seen((size_t)cfg.n_expert, 0);
+    cold_expert_ids.reserve(cold_expert_order->size());
+    for (int32_t expert : *cold_expert_order) {
+        if (expert < 0 || expert >= cfg.n_expert) {
+            if (err) *err = "cold expert override id out of range";
+            return false;
+        }
+        if (hot_seen[(size_t)expert]) {
+            if (err) *err = "cold expert override includes a hot expert";
+            return false;
+        }
+        if (cold_seen[(size_t)expert]) {
+            if (err) *err = "cold expert override contains duplicates";
+            return false;
+        }
+        cold_seen[(size_t)expert] = 1;
+        cold_local_by_global[(size_t)expert] = (int32_t)cold_expert_ids.size();
+        cold_expert_ids.push_back(expert);
+    }
+
+    const size_t expected_cold = (size_t)cfg.n_expert - hot_expert_ids.size();
+    if (cold_expert_ids.size() != expected_cold) {
+        if (err) *err = "cold expert override count mismatch";
+        return false;
+    }
+    for (int expert = 0; expert < cfg.n_expert; ++expert) {
+        if (!hot_seen[(size_t)expert] && !cold_seen[(size_t)expert]) {
+            if (err) *err = "cold expert override is missing experts";
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace
@@ -194,13 +286,19 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
                               const MoeHybridPlacement & placement,
                               const std::vector<MoeLayerDesc> & layer_descs,
                               MoeHybridStorage & out,
-                              std::string * err) {
+                              std::string * err,
+                              const std::vector<std::vector<int32_t>> * cold_expert_order_by_layer) {
     if (!placement.matches(cfg)) {
         if (err) *err = "placement does not match config";
         return false;
     }
     if ((int)layer_descs.size() != cfg.n_layer) {
         if (err) *err = "layer_descs size does not match n_layer";
+        return false;
+    }
+    if (cold_expert_order_by_layer &&
+        (int)cold_expert_order_by_layer->size() != cfg.n_layer) {
+        if (err) *err = "cold expert override does not match n_layer";
         return false;
     }
 
@@ -223,31 +321,15 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
         }
 
         dst.hot_expert_ids = placement.hot_expert_ids[(size_t)il];
-        dst.hot_local_by_global.assign((size_t)cfg.n_expert, -1);
-        dst.cold_local_by_global.assign((size_t)cfg.n_expert, -1);
-
-        std::vector<uint8_t> is_hot((size_t)cfg.n_expert, 0);
-        for (size_t i = 0; i < dst.hot_expert_ids.size(); ++i) {
-            const int32_t expert = dst.hot_expert_ids[i];
-            if (expert < 0 || expert >= cfg.n_expert) {
-                if (err) *err = "hot expert id out of range";
-                return false;
-            }
-            dst.hot_local_by_global[(size_t)expert] = (int32_t)i;
-            is_hot[(size_t)expert] = 1;
-        }
-        for (int expert = 0; expert < cfg.n_expert; ++expert) {
-            if (!is_hot[(size_t)expert]) {
-                dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
-                dst.cold_expert_ids.push_back((int32_t)expert);
-            }
-        }
-
-        // Populate VRAM bitmask from hot expert IDs
-        std::memset(dst.expert_vram_mask, 0, sizeof(dst.expert_vram_mask));
-        for (int32_t eid : dst.hot_expert_ids) {
-            if (eid >= 0 && eid < 256)
-                dst.expert_vram_mask[eid >> 6] |= (1ULL << (eid & 63));
+        const std::vector<int32_t> * cold_override =
+            cold_expert_order_by_layer
+                ? &(*cold_expert_order_by_layer)[(size_t)il]
+                : nullptr;
+        if (!build_layer_expert_residency(
+                cfg, dst.hot_expert_ids, cold_override,
+                dst.hot_local_by_global, dst.cold_local_by_global,
+                dst.cold_expert_ids, dst.expert_vram_mask, err)) {
+            return false;
         }
 
         dst.fused_gate_up = desc.has_fused_gate_up();
@@ -375,7 +457,9 @@ bool build_moe_hybrid_storage_from_file(
     const std::vector<LayerExpertFileData> & file_data,
     MoeHybridStorage & out,
     std::string * err,
-    int cache_slots) {
+    int cache_slots,
+    bool load_cold_tensors,
+    const std::vector<std::vector<int32_t>> * cold_expert_order_by_layer) {
 
     if (!placement.matches(cfg)) {
         if (err) *err = "placement does not match config";
@@ -383,6 +467,11 @@ bool build_moe_hybrid_storage_from_file(
     }
     if ((int)layer_descs.size() != cfg.n_layer || (int)file_data.size() != cfg.n_layer) {
         if (err) *err = "layer_descs/file_data size does not match n_layer";
+        return false;
+    }
+    if (cold_expert_order_by_layer &&
+        (int)cold_expert_order_by_layer->size() != cfg.n_layer) {
+        if (err) *err = "cold expert override does not match n_layer";
         return false;
     }
 
@@ -406,31 +495,15 @@ bool build_moe_hybrid_storage_from_file(
         }
 
         dst.hot_expert_ids = placement.hot_expert_ids[(size_t)il];
-        dst.hot_local_by_global.assign((size_t)cfg.n_expert, -1);
-        dst.cold_local_by_global.assign((size_t)cfg.n_expert, -1);
-
-        std::vector<uint8_t> is_hot((size_t)cfg.n_expert, 0);
-        for (size_t i = 0; i < dst.hot_expert_ids.size(); ++i) {
-            const int32_t expert = dst.hot_expert_ids[i];
-            if (expert < 0 || expert >= cfg.n_expert) {
-                if (err) *err = "hot expert id out of range";
-                return false;
-            }
-            dst.hot_local_by_global[(size_t)expert] = (int32_t)i;
-            is_hot[(size_t)expert] = 1;
-        }
-        for (int expert = 0; expert < cfg.n_expert; ++expert) {
-            if (!is_hot[(size_t)expert]) {
-                dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
-                dst.cold_expert_ids.push_back((int32_t)expert);
-            }
-        }
-
-        // Populate VRAM bitmask from hot expert IDs
-        std::memset(dst.expert_vram_mask, 0, sizeof(dst.expert_vram_mask));
-        for (int32_t eid : dst.hot_expert_ids) {
-            if (eid >= 0 && eid < 256)
-                dst.expert_vram_mask[eid >> 6] |= (1ULL << (eid & 63));
+        const std::vector<int32_t> * cold_override =
+            cold_expert_order_by_layer
+                ? &(*cold_expert_order_by_layer)[(size_t)il]
+                : nullptr;
+        if (!build_layer_expert_residency(
+                cfg, dst.hot_expert_ids, cold_override,
+                dst.hot_local_by_global, dst.cold_local_by_global,
+                dst.cold_expert_ids, dst.expert_vram_mask, err)) {
+            return false;
         }
 
         dst.fused_gate_up = desc.has_fused_gate_up();
@@ -506,7 +579,7 @@ bool build_moe_hybrid_storage_from_file(
         }
 
         // Allocate cold expert tensors on CPU
-        if (cold_count > 0) {
+        if (cold_count > 0 && load_cold_tensors) {
             ggml_init_params ip{};
             ip.mem_size   = 16 * ggml_tensor_overhead();
             ip.mem_buffer = nullptr;
@@ -651,10 +724,14 @@ bool build_moe_hybrid_storage_from_file_with_mmap(
     size_t mmap_total_size,
     MoeHybridStorage & out,
     std::string * err,
-    int cache_slots) {
+    int cache_slots,
+    const std::vector<std::vector<int32_t>> * cold_expert_order_by_layer) {
 
     // First build storage normally (hot GPU + cold CPU buffers).
-    if (!build_moe_hybrid_storage_from_file(cfg, gpu_backend, placement, layer_descs, file_data, out, err, cache_slots)) {
+    if (!build_moe_hybrid_storage_from_file(
+            cfg, gpu_backend, placement, layer_descs, file_data, out,
+            err, cache_slots, /*load_cold_tensors=*/true,
+            cold_expert_order_by_layer)) {
         return false;
     }
 

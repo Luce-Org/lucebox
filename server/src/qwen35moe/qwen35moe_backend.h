@@ -10,6 +10,12 @@
 #include "../common/moe_hybrid_stream.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_swap_manager.h"
+#include "../common/expert_split_plan.h"
+#include "../common/expert_split_runtime.h"
+#include "../common/expert_split_compute_runtime.h"
+#include "../common/expert_split_materialization.h"
+#include "../common/expert_split_state.h"
+#include "../common/expert_split_target_config.h"
 #include "../common/moe_routing_collector.h"
 
 #include <memory>
@@ -27,7 +33,7 @@ public:
     GenerateResult restore_and_generate_impl(int slot,
                                              const GenerateRequest & req,
                                              const DaemonIO & io) override;
-    bool supports_dflash_spec_decode() const override { return !target_weights().moe_hybrid; }
+    bool supports_dflash_spec_decode() const override;
 
     bool set_routing_collector(MoeRoutingCollector * c) override { routing_collector_ = c; return true; }
     const MoeHybridRoutingStats * get_routing_stats() const override { return routing_stats_.get(); }
@@ -44,12 +50,9 @@ protected:
     void after_target_compute(StepGraph & sg, int kv_start, int n_tokens) override;
 
 private:
-    // All-hot placement signal for post_kvflash_init_gate(): set when
-    // load_target_model takes the all-hot early-return (moe_hybrid null).
-    bool placement_all_hot_ = false;
     // True iff all experts fit hot with the FULL max_ctx KV reservation
-    // (KVFlash redundant). When false but placement_all_hot_ is true, the pool
-    // is what kept experts hot — the gate must NOT disable KVFlash.
+    // (KVFlash redundant). When false, the pool is what kept experts hot —
+    // the gate must NOT disable KVFlash.
     bool placement_all_hot_full_kv_ = false;
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string routing_stats_out_path_;
@@ -57,13 +60,25 @@ private:
     int cache_slots_ = -1;  // Spark auto-sized (-1=unset)
     uint64_t spark_expert_budget_ = 0;      // hot budget, for the bootstrap rebuild
     std::vector<uint64_t> layer_expert_bytes_;
-    bool rebuild_hybrid_from_placement(const MoeHybridPlacement & placement, std::string & err);
+    ExpertSplitStateComponents last_expert_split_state_;
+    bool rebuild_hybrid_from_placement(const MoeHybridPlacement & placement,
+                                       const ExpertSplitMaterialization * materialization,
+                                       std::string & err);
     MoeHybridSwapPolicy swap_policy_;
     bool hybrid_telemetry_ = false;
     MoeHybridStreamEngine stream_engine_;
     MoeRoutingCollector * routing_collector_ = nullptr;
 
     void maybe_post_request_swap();
+    bool build_expert_split_plan_from_stats(const MoeHybridRoutingStats & hotness,
+                                            uint64_t expert_budget_bytes,
+                                            const TargetWeights & w,
+                                            ExpertSplitPlan & out,
+                                            std::string * err) const;
+    bool build_expert_split_state_from_stats(const MoeHybridRoutingStats & hotness,
+                                             uint64_t expert_budget_bytes,
+                                             const TargetWeights & w,
+                                             std::string * err);
     bool load_dynamic_placement(const char * hotness_path,
                                 ggml_backend_t backend,
                                 const TargetWeights & w,

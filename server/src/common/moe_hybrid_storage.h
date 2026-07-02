@@ -64,7 +64,13 @@ struct CachedHotBatchedGraph {
     ggml_tensor * sel = nullptr;        // [n_used, n_tokens] I32 hot-local IDs
     ggml_tensor * wts = nullptr;        // [n_used, n_tokens] F32 expert weights
     ggml_tensor * output = nullptr;     // [n_embd, n_tokens] F32 output
+    ggml_tensor * global_ids = nullptr; // [n_used, n_tokens] I32 global expert ids
+    ggml_tensor * raw_weights = nullptr; // [n_used, n_tokens] F32 router weights
+    ggml_tensor * hot_local_lut = nullptr; // [1,n_expert] I32 global->local hot id
+    ggml_tensor * valid_lut = nullptr;   // [1,n_expert] F32 1=hot 0=cold
+    ggml_tensor * residual_in = nullptr; // [n_embd, n_tokens] F32 residual (gpu-remap)
     int n_tokens = 0;
+    bool gpu_remap = false;
 
     bool valid() const { return ctx && gf && alloc && output; }
     void free();
@@ -100,7 +106,8 @@ struct MoeHybridLayerStorage {
     std::vector<uint64_t> spare_lru;    // [cache_slots] last-use tick
     uint64_t lru_clock = 0;
 
-    // Bitmask: bit set = expert is in VRAM (hot). Supports up to 256 experts.
+    // Bitmask: bit set = expert is in VRAM (hot). Fast-path cache for the first
+    // 256 expert ids; correctness must still come from hot_local_by_global.
     uint64_t expert_vram_mask[4] = {};
 
     // Fast check: are ALL routed experts in VRAM for this batch?
@@ -108,9 +115,12 @@ struct MoeHybridLayerStorage {
     bool all_routed_are_hot(const int32_t * selected_ids, int n_slots) const {
         for (int i = 0; i < n_slots; ++i) {
             const int g = selected_ids[i];
-            if (g < 0 || g >= 256) continue;
-            if (!((expert_vram_mask[g >> 6] >> (g & 63)) & 1ULL))
+            if (g < 0 || g >= (int)hot_local_by_global.size()) {
                 return false;
+            }
+            if (hot_local_by_global[(size_t)g] < 0) {
+                return false;
+            }
         }
         return true;
     }
@@ -192,7 +202,8 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
                               const MoeHybridPlacement & placement,
                               const std::vector<MoeLayerDesc> & layer_descs,
                               MoeHybridStorage & out,
-                              std::string * err = nullptr);
+                              std::string * err = nullptr,
+                              const std::vector<std::vector<int32_t>> * cold_expert_order_by_layer = nullptr);
 
 // Swap a cold expert into a spare GPU cache slot (LRU evict). Returns the new
 // hot-local index, or -1 on failure. No-op (returns existing) if already hot.
@@ -208,7 +219,9 @@ bool build_moe_hybrid_storage_from_file(
     const std::vector<LayerExpertFileData> & file_data,
     MoeHybridStorage & out,
     std::string * err = nullptr,
-    int cache_slots = 0);
+    int cache_slots = 0,
+    bool load_cold_tensors = true,
+    const std::vector<std::vector<int32_t>> * cold_expert_order_by_layer = nullptr);
 
 // Spark: split a VRAM budget into a pinned-hot tier + an auto-sized expert
 // cache ring. target_bytes==0 keeps the current budget (use the card);
@@ -233,6 +246,7 @@ bool build_moe_hybrid_storage_from_file_with_mmap(
     size_t mmap_total_size,
     MoeHybridStorage & out,
     std::string * err = nullptr,
-    int cache_slots = 0);
+    int cache_slots = 0,
+    const std::vector<std::vector<int32_t>> * cold_expert_order_by_layer = nullptr);
 
 }  // namespace dflash::common

@@ -269,6 +269,13 @@ add_library(dflash_common STATIC
     src/common/dflash_spec_decode.cpp
     src/common/layer_split_backend.cpp
     src/common/layer_split_runtime.cpp
+    src/common/expert_split_plan.cpp
+    src/common/expert_split_state.cpp
+    src/common/expert_split_runtime.cpp
+    src/common/expert_split_compute_runtime.cpp
+    src/common/expert_split_materialization.cpp
+    src/common/expert_split_target_config.cpp
+    src/common/gguf_tensor_data.cpp
     src/qwen35/graph_builders.cpp
     src/qwen35moe/qwen35moe_ffn.cpp
     src/qwen35moe/qwen35moe_backend.cpp
@@ -281,7 +288,9 @@ add_library(dflash_common STATIC
     src/common/spark_corpus.cpp
     src/common/moe_hybrid_ffn_eval.cpp
     src/common/moe_hybrid_stream.cpp
-    src/common/cold_ffn_cpu.cpp
+    src/common/moe_expert_compute.cpp
+    src/common/moe_expert_compute_cpu.cpp
+    src/common/moe_expert_compute_ipc.cpp
     src/common/moe_hybrid_swap_manager.cpp
     src/common/moe_routing_collector.cpp
     src/qwen35/layer_split_forward.cpp
@@ -727,6 +736,38 @@ if(DFLASH27B_TESTS)
             target_include_directories(test_qwen35moe_swap_manager PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
         endif()
         target_link_libraries(test_qwen35moe_swap_manager PRIVATE dflash_common)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_expert_split_plan.cpp")
+        add_executable(test_expert_split_plan test/test_expert_split_plan.cpp)
+        target_include_directories(test_expert_split_plan PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_include_directories(test_expert_split_plan PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        endif()
+        target_link_libraries(test_expert_split_plan PRIVATE dflash_common)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_expert_split_runtime.cpp")
+        add_executable(test_expert_split_runtime test/test_expert_split_runtime.cpp)
+        target_include_directories(test_expert_split_runtime PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_include_directories(test_expert_split_runtime PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        endif()
+        target_link_libraries(test_expert_split_runtime PRIVATE dflash_common)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_expert_split_target_config.cpp")
+        add_executable(test_expert_split_target_config test/test_expert_split_target_config.cpp)
+        target_include_directories(test_expert_split_target_config PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_include_directories(test_expert_split_target_config PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        endif()
+        target_link_libraries(test_expert_split_target_config PRIVATE dflash_common)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_expert_compute_multi_target.cpp")
+        add_executable(test_moe_expert_compute_multi_target test/test_moe_expert_compute_multi_target.cpp)
+        target_include_directories(test_moe_expert_compute_multi_target PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_include_directories(test_moe_expert_compute_multi_target PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        endif()
+        target_link_libraries(test_moe_expert_compute_multi_target PRIVATE dflash_common)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_draft.cpp")
         add_executable(smoke_load_draft test/smoke_load_draft.cpp)

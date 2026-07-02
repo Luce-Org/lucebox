@@ -45,9 +45,8 @@
 
 #include "internal.h"
 #include "common/derived_scalars.h"
+#include "common/gguf_tensor_data.h"
 #include "common/layer_split_utils.h"
-#include "common/gguf_mmap.h"
-#include "common/gguf_bounds.h"
 
 #include <cinttypes>
 #include <cstdint>
@@ -58,10 +57,7 @@
 #include <vector>
 
 #if !defined(_WIN32)
-#include <cerrno>
-#include <fcntl.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -177,8 +173,6 @@ static bool should_load_target_tensor(const char * name,
 
 struct TargetTensorAlloc {
     ggml_tensor * tensor = nullptr;
-    size_t file_offset = 0;
-    size_t file_size = 0;
     size_t buffer_offset = 0;
 };
 
@@ -202,13 +196,16 @@ bool load_target_gguf_partial(const std::string & path,
                               TargetWeights &      out) {
 
     // ── 1. Parse metadata + create a ggml_context holding tensor descriptors ─
-    ggml_context * meta_ctx = nullptr;
-    gguf_init_params gip{};
-    gip.no_alloc = true;
-    gip.ctx      = &meta_ctx;
-    gguf_context * gctx = gguf_init_from_file(path.c_str(), gip);
-    if (!gctx) {
-        set_last_error("gguf_init_from_file failed: " + path);
+    std::string err;
+    GgufTensorDataReader gguf_reader;
+    if (!gguf_reader.open(path, /*build_merged_tensor_context=*/true, err)) {
+        set_last_error(err);
+        return false;
+    }
+    ggml_context * meta_ctx = gguf_reader.merged_context();
+    const gguf_context * gctx = gguf_reader.primary_context();
+    if (!meta_ctx || !gctx) {
+        set_last_error("GGUF tensor reader did not initialize metadata");
         return false;
     }
 
@@ -219,7 +216,6 @@ bool load_target_gguf_partial(const std::string & path,
         int64_t arch_id = gguf_find_key(gctx, "general.architecture");
         if (arch_id < 0) {
             set_last_error("missing general.architecture");
-            gguf_free(gctx);
             return false;
         }
         const char * arch = gguf_get_val_str(gctx, arch_id);
@@ -228,12 +224,10 @@ bool load_target_gguf_partial(const std::string & path,
         if (arch_str != "qwen35" && arch_str != "qwen35moe") {
             set_last_error(std::string("unexpected arch: ") + arch_str +
                            " (expected qwen35 or qwen35moe)");
-            gguf_free(gctx);
             return false;
         }
     }
 
-    std::string err;
     auto key = [&](const char * suffix) {
         return arch_str + "." + suffix;
     };
@@ -279,20 +273,21 @@ bool load_target_gguf_partial(const std::string & path,
             n_ff_exp, n_ff_shexp, n_expert, n_expert_used,
             fai, ssm_conv, ssm_inner, ssm_state, ssm_dt, ssm_grp);
             set_last_error(buf);
-            gguf_free(gctx);
             return false;
     }
 
     // Structural invariants required by the graph builder.
     if (kl != vl) {
         set_last_error("key_length != value_length not supported");
-        gguf_free(gctx); return false;
+        return false;
     }
-    if (n_layer % fai != 0) {
+    if (fai > n_layer) {
         char buf[128];
-        std::snprintf(buf, sizeof(buf), "block_count=%u not divisible by full_attention_interval=%u", n_layer, fai);
+        std::snprintf(buf, sizeof(buf),
+                      "full_attention_interval=%u exceeds block_count=%u",
+                      fai, n_layer);
         set_last_error(buf);
-        gguf_free(gctx); return false;
+        return false;
     }
 
     // rope dimension_sections (array of 4 uint32)
@@ -302,12 +297,12 @@ bool load_target_gguf_partial(const std::string & path,
         int64_t rid = gguf_find_key(gctx, rope_sections_key.c_str());
         if (rid < 0) {
             set_last_error("missing rope.dimension_sections");
-            gguf_free(gctx); return false;
+            return false;
         }
         size_t n = gguf_get_arr_n(gctx, rid);
         if (n < 4) {
             set_last_error("qwen35.rope.dimension_sections has < 4 entries");
-            gguf_free(gctx); return false;
+            return false;
         }
         const int32_t * arr = (const int32_t *)gguf_get_arr_data(gctx, rid);
         for (int k = 0; k < 4; k++) rope_sections[k] = arr[k];
@@ -324,7 +319,7 @@ bool load_target_gguf_partial(const std::string & path,
                 std::snprintf(buf, sizeof(buf),
                     "rope_sections[%d]=%d is negative", k, rope_sections[k]);
                 set_last_error(buf);
-                gguf_free(gctx); return false;
+                return false;
             }
             sum += rope_sections[k];
         }
@@ -336,7 +331,7 @@ bool load_target_gguf_partial(const std::string & path,
                 rope_sections[0], rope_sections[1], rope_sections[2], rope_sections[3],
                 n_rot, kl);
             set_last_error(buf);
-            gguf_free(gctx); return false;
+            return false;
         }
     }
 
@@ -350,11 +345,10 @@ bool load_target_gguf_partial(const std::string & path,
             "invalid target load layer range [%d,%d) for n_layer=%u",
             plan.layer_begin, plan.layer_end, n_layer);
         set_last_error(buf);
-        gguf_free(gctx);
         return false;
     }
 
-    out.ctx     = meta_ctx;
+    out.ctx     = nullptr;
     out.backend = backend;
     out.n_layer = (int)n_layer;
     out.n_embd  = (int)n_embd;
@@ -403,6 +397,7 @@ bool load_target_gguf_partial(const std::string & path,
     }
 
     out.layers.assign((size_t)n_layer, TargetLayer{});
+    out.full_attention_layers.assign((size_t)n_layer, 0);
 
     // ── 2. Wire our layer pointers to tensors inside meta_ctx ─────────
     auto g = [&](const char * name) -> ggml_tensor * {
@@ -413,7 +408,6 @@ bool load_target_gguf_partial(const std::string & path,
     out.output   = g("output.weight");
     if (!out.tok_embd || !out.out_norm || !out.output) {
         set_last_error("missing top-level tensors (token_embd/output_norm/output)");
-        gguf_free(gctx);
         return false;
     }
     out.n_vocab = (int)out.tok_embd->ne[1];
@@ -433,7 +427,6 @@ bool load_target_gguf_partial(const std::string & path,
             char b[128];
             std::snprintf(b, sizeof(b), "layer %d: missing shared norm tensor", il);
             set_last_error(b);
-            gguf_free(gctx);
             return false;
         }
         if (is_moe) {
@@ -454,7 +447,6 @@ bool load_target_gguf_partial(const std::string & path,
                 char b[128];
                 std::snprintf(b, sizeof(b), "layer %d: missing dense FFN tensor", il);
                 set_last_error(b);
-                gguf_free(gctx);
                 return false;
             }
         }
@@ -482,23 +474,18 @@ bool load_target_gguf_partial(const std::string & path,
         // NVFP4 per-tensor weight scales are read after the mmap is loaded (below).
 
         // Sanity: each layer must be EITHER full-attn OR deltanet, not both, not neither.
+        // The common qwen35 pattern is modulo-based, but larger qwen35moe
+        // GGUFs can have special tail layers. Use actual tensor presence as
+        // the source of truth for downstream cache and graph layout.
         const bool has_attn = L.wq && L.wk && L.wv && L.wo && L.q_norm && L.k_norm;
         const bool has_ssm  = L.wqkv && L.wqkv_gate && L.ssm_conv1d && L.ssm_out;
-        const bool is_full_attn_layer = (((il + 1) % out.full_attention_interval) == 0);
-        if (is_full_attn_layer && !has_attn) {
+        if (has_attn == has_ssm) {
             char b[128];
-            std::snprintf(b, sizeof(b), "layer %d expected full-attn, missing tensors", il);
+            std::snprintf(b, sizeof(b), "layer %d has ambiguous attention/ssm tensors", il);
             set_last_error(b);
-            gguf_free(gctx);
             return false;
         }
-        if (!is_full_attn_layer && !has_ssm) {
-            char b[128];
-            std::snprintf(b, sizeof(b), "layer %d expected deltanet, missing tensors", il);
-            set_last_error(b);
-            gguf_free(gctx);
-            return false;
-        }
+        out.full_attention_layers[(size_t)il] = has_attn ? 1 : 0;
         if (is_moe) {
             const bool has_routed =
                 L.ffn_gate_inp && L.ffn_down_exps &&
@@ -511,7 +498,6 @@ bool load_target_gguf_partial(const std::string & path,
                 char b[160];
                 std::snprintf(b, sizeof(b), "layer %d expected moe FFN tensors", il);
                 set_last_error(b);
-                gguf_free(gctx);
                 return false;
             }
         }
@@ -522,32 +508,33 @@ bool load_target_gguf_partial(const std::string & path,
     const size_t alignment = ggml_backend_buft_get_alignment(buft);
     std::vector<TargetTensorAlloc> allocs;
     size_t alloc_total = 0;
-    const int64_t n_tensors = gguf_get_n_tensors(gctx);
-    for (int64_t tid = 0; tid < n_tensors; tid++) {
-        const char * tname = gguf_get_tensor_name(gctx, tid);
-        ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
-        if (!t || !should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, plan.skip_expert_tensors)) {
-            continue;
+    for (int si = 0; si < gguf_reader.shard_count(); ++si) {
+        const gguf_context * shard_gctx = gguf_reader.shard_context(si);
+        const int64_t n_tensors = gguf_get_n_tensors(shard_gctx);
+        for (int64_t tid = 0; tid < n_tensors; tid++) {
+            const char * tname = gguf_get_tensor_name(shard_gctx, tid);
+            ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
+            if (!t || !should_load_target_tensor(tname, plan.layer_begin,
+                                                 plan.layer_end, plan.load_output,
+                                                 plan.skip_expert_tensors)) {
+                continue;
+            }
+            alloc_total = align_up_size(alloc_total, alignment);
+            TargetTensorAlloc a;
+            a.tensor = t;
+            a.buffer_offset = alloc_total;
+            alloc_total += ggml_backend_buft_get_alloc_size(buft, t);
+            allocs.push_back(a);
         }
-        alloc_total = align_up_size(alloc_total, alignment);
-        TargetTensorAlloc a;
-        a.tensor = t;
-        a.file_offset = gguf_get_data_offset(gctx) + gguf_get_tensor_offset(gctx, tid);
-        a.file_size = gguf_get_tensor_size(gctx, tid);
-        a.buffer_offset = alloc_total;
-        alloc_total += ggml_backend_buft_get_alloc_size(buft, t);
-        allocs.push_back(a);
     }
     if (allocs.empty()) {
         set_last_error("target load plan selected no GPU tensors");
-        gguf_free(gctx);
         return false;
     }
 
     out.buf = ggml_backend_alloc_buffer(backend, alloc_total);
     if (!out.buf) {
         set_last_error("ggml_backend_alloc_ctx_tensors failed (target)");
-        gguf_free(gctx);
         return false;
     }
     ggml_backend_buffer_set_usage(out.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -556,52 +543,49 @@ bool load_target_gguf_partial(const std::string & path,
     for (const TargetTensorAlloc & a : allocs) {
         if (ggml_backend_tensor_alloc(out.buf, a.tensor, base + a.buffer_offset) != GGML_STATUS_SUCCESS) {
             set_last_error("ggml_backend_tensor_alloc failed (target)");
-            gguf_free(gctx);
             return false;
         }
     }
 
-    // ── 4. mmap the file and copy tensor bytes to CUDA ────────────────
+    // ── 4. mmap the file(s) and copy tensor bytes to CUDA ─────────────
     //
     // SKIP uploading token_embd.weight — it stays on CPU for embedding
-    // lookup (CUDA get_rows doesn't support k-quants). Its bytes are copied
-    // into owned host memory below (step 5), so the mmap is released when this
-    // local goes out of scope.
-    GgufMmap mm;
-    if (!mm.open(path, err)) { set_last_error(err); gguf_free(gctx); return false; }
-    const uint8_t * mm_addr = (const uint8_t *)mm.data();
-    const size_t    mm_len  = mm.size();
-    const size_t data_start = gguf_get_data_offset(gctx);
+    // lookup (CUDA get_rows doesn't support k-quants). Split GGUF shards are
+    // supported by resolving each tensor to its owning shard mmap.
+    if (!gguf_reader.open_mmaps(err)) {
+        set_last_error(err);
+        return false;
+    }
 
     size_t total = 0;
-    size_t tok_embd_off = 0, tok_embd_sz = 0;
+    const uint8_t * tok_embd_data = nullptr;
+    size_t tok_embd_sz = 0;
     ggml_type tok_embd_type = GGML_TYPE_COUNT;
-    for (int64_t tid = 0; tid < n_tensors; tid++) {
-        const char * tname = gguf_get_tensor_name(gctx, tid);
-        ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
-        if (!t) continue;
-        const size_t rel_off = gguf_get_tensor_offset(gctx, tid);
-        const size_t off = data_start + rel_off;
-        const size_t sz  = gguf_get_tensor_size(gctx, tid);
-        if (!gguf_tensor_in_file(data_start, rel_off, sz, mm_len)) {
-            set_last_error(gguf_bounds_error("target GGUF", tname,
-                ggml_type_name(gguf_get_tensor_type(gctx, tid)),
-                data_start, rel_off, sz, mm_len));
-            gguf_free(gctx);
-            return false;
+    for (int si = 0; si < gguf_reader.shard_count(); ++si) {
+        const gguf_context * shard_gctx = gguf_reader.shard_context(si);
+        const int64_t n_tensors = gguf_get_n_tensors(shard_gctx);
+        for (int64_t tid = 0; tid < n_tensors; tid++) {
+            const char * tname = gguf_get_tensor_name(shard_gctx, tid);
+            GgufTensorRef ref;
+            if (!gguf_reader.find_tensor(tname, ref) || !ref.data) {
+                set_last_error(std::string("tensor '") + tname + "' has no mapped data");
+                return false;
+            }
+            ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
+            if (!t) continue;
+            if (std::string(tname) == "token_embd.weight") {
+                tok_embd_data = ref.data;
+                tok_embd_sz = ref.size;
+                tok_embd_type = ref.type;
+                continue;
+            }
+            if (!should_load_target_tensor(tname, plan.layer_begin, plan.layer_end,
+                                           plan.load_output, plan.skip_expert_tensors)) {
+                continue;
+            }
+            ggml_backend_tensor_set(t, ref.data, 0, ref.size);
+            total += ref.size;
         }
-        if (std::string(tname) == "token_embd.weight") {
-            // Remember offset + size for the CPU embedder; don't upload to GPU.
-            tok_embd_off  = off;
-            tok_embd_sz   = sz;
-            tok_embd_type = gguf_get_tensor_type(gctx, tid);
-            continue;
-        }
-        if (!should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, plan.skip_expert_tensors)) {
-            continue;
-        }
-        ggml_backend_tensor_set(t, mm_addr + off, 0, sz);
-        total += sz;
     }
 
     // ── 4b. Read NVFP4 per-tensor weight scales (optional; 1.0 for non-NVFP4).
@@ -618,18 +602,17 @@ bool load_target_gguf_partial(const std::string & path,
     {
         auto read_scale = [&](int il, const char * base) -> float {
             char sname[128];
+            GgufTensorRef ref;
             // Try "base.scale" first (LibertAI), then "base.weight.scale" (heretic)
             std::snprintf(sname, sizeof(sname), "blk.%d.%s.scale", il, base);
-            int64_t stid = gguf_find_tensor(gctx, sname);
-            if (stid < 0) {
+            bool found = gguf_reader.find_tensor(sname, ref);
+            if (!found) {
                 std::snprintf(sname, sizeof(sname), "blk.%d.%s.weight.scale", il, base);
-                stid = gguf_find_tensor(gctx, sname);
+                found = gguf_reader.find_tensor(sname, ref);
             }
-            if (stid < 0) return 1.0f;
-            const size_t srel = gguf_get_tensor_offset(gctx, stid);
-            if (!gguf_tensor_in_file(data_start, srel, sizeof(float), mm_len)) return 1.0f;
+            if (!found || !ref.data || ref.size < sizeof(float)) return 1.0f;
             float val;
-            std::memcpy(&val, mm_addr + data_start + srel, sizeof(float));
+            std::memcpy(&val, ref.data, sizeof(float));
             return val;
         };
 
@@ -674,15 +657,23 @@ bool load_target_gguf_partial(const std::string & path,
         }
     }
 
-    gguf_free(gctx);
-
     // Structural defense: derive head_dim / n_head / n_head_kv from weight
     // tensor shapes and assert against GGUF-declared metadata.
     // Uses the first full-attention layer; deltanet layers don't carry wq/wk.
     // wq packs Q+gate: ne[1] = n_head * n_embd_head_k * 2.
     // wk: ne[1] = n_head_kv * n_embd_head_k.  wq: ne[0] = n_embd.
     {
-        const int fa_il = out.full_attention_interval - 1;
+        int fa_il = -1;
+        for (int il = 0; il < out.n_layer; ++il) {
+            if (qwen35_layer_is_full_attention(out, il)) {
+                fa_il = il;
+                break;
+            }
+        }
+        if (fa_il < 0) {
+            set_last_error("no full-attention layer found");
+            return false;
+        }
         const TargetLayer & fa = out.layers[(size_t)fa_il];
         if (fa.wq && fa.wk) {
             const int64_t exp_q_dim  = (int64_t)out.n_head    * out.n_embd_head_k * 2;
@@ -701,7 +692,7 @@ bool load_target_gguf_partial(const std::string & path,
         }
     }
 
-    if (tok_embd_off == 0 || tok_embd_type == GGML_TYPE_COUNT) {
+    if (!tok_embd_data || tok_embd_sz == 0 || tok_embd_type == GGML_TYPE_COUNT) {
         set_last_error("token_embd.weight not found or invalid type");
         return false;
     }
@@ -713,9 +704,7 @@ bool load_target_gguf_partial(const std::string & path,
         return false;
     }
     out.embedder.tok_embd_owned.resize(tok_embd_sz);
-    std::memcpy(out.embedder.tok_embd_owned.data(),
-                mm_addr + tok_embd_off,
-                tok_embd_sz);
+    std::memcpy(out.embedder.tok_embd_owned.data(), tok_embd_data, tok_embd_sz);
     out.embedder.tok_embd_bytes = out.embedder.tok_embd_owned.data();
     out.embedder.tok_embd_type  = tok_embd_type;
     out.embedder.n_embd         = out.n_embd;
@@ -731,6 +720,7 @@ bool load_target_gguf_partial(const std::string & path,
         tok_embd_sz / (1024.0 * 1024.0), ggml_type_name(tok_embd_type));
     set_last_error(summary);
 
+    out.ctx = gguf_reader.release_merged_context();
     return true;
 }
 
