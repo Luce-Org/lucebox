@@ -16,6 +16,9 @@
 
 #include "ddtree.h"
 
+struct ggml_tensor;
+struct ggml_backend;
+
 namespace dflash::common {
 
 struct DFlashTarget {
@@ -110,6 +113,12 @@ struct DFlashTarget {
 
     // Embed token IDs using the target's embedding table.
     // Output: `out` must have space for `n * hidden_size()` floats.
+    // Optional GPU handles for the fused domino draft head. A target that
+    // returns non-null for all three enables the single-graph draft-side path.
+    virtual ggml_tensor *  lm_head_tensor()  { return nullptr; }
+    virtual ggml_tensor *  gpu_embd_table()  { return nullptr; }
+    virtual ggml_backend * fused_head_backend() { return nullptr; }
+
     virtual bool embed_tokens(const int32_t * tokens, int n,
                               float * out) const = 0;
 

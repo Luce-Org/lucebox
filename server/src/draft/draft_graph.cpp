@@ -137,7 +137,9 @@ DraftGraphOutputs build_draft_graph(
 
         // ── 2f. Attention: causal for SWA layers, non-causal for full layers.
         const float scale = 1.0f / std::sqrt((float)head_dim);
-        ggml_tensor * mask = (L.is_swa && in.causal_mask_swa) ? in.causal_mask_swa : nullptr;
+        ggml_tensor * mask = L.is_swa
+            ? (in.causal_mask_swa ? in.causal_mask_swa : nullptr)
+            : in.pad_mask_full;
         ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q, K, V, mask,
                                                  scale, /*max_bias=*/0.0f,
                                                  /*logit_softcap=*/0.0f);
