@@ -432,6 +432,65 @@ bool load_target_gguf_laguna_partial(const std::string & path,
         alloc_total += ggml_backend_buft_get_alloc_size(buft, t);
         allocs.push_back(a);
     }
+
+    // Lay attn_q|attn_k and ffn_gate_shexp|ffn_up_shexp adjacently in the
+    // weight buffer so one fused tensor can view both regions (saves one
+    // matmul launch + one activation quantization per pair per forward).
+    static const bool fuse_qk_env = []() {
+        const char * e = getenv("DFLASH_LAGUNA_FUSED_QK");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    if (fuse_qk_env) {
+        // For each fusable pair, `first` must land before `second` in the
+        // buffer regardless of GGUF order (attn_k typically precedes attn_q).
+        auto rename_sub = [](const std::string & s, const char * from, const char * to) {
+            std::string p = s;
+            const size_t pos = p.find(from);
+            if (pos == std::string::npos) return std::string();
+            p.replace(pos, std::string(from).size(), to);
+            return p;
+        };
+        std::vector<LagunaTensorAlloc> arranged;
+        arranged.reserve(allocs.size());
+        std::vector<char> used(allocs.size(), 0);
+        auto idx_of = [&](const std::string & nm) -> int {
+            if (nm.empty()) return -1;
+            for (size_t j = 0; j < allocs.size(); ++j) {
+                if (!used[j] && nm == ggml_get_name(allocs[j].tensor)) return (int)j;
+            }
+            return -1;
+        };
+        for (size_t i = 0; i < allocs.size(); ++i) {
+            if (used[i]) continue;
+            const std::string nm = ggml_get_name(allocs[i].tensor);
+            std::string first, second;
+            if (nm.find("attn_q.weight") != std::string::npos) {
+                first = nm; second = rename_sub(nm, "attn_q.weight", "attn_k.weight");
+            } else if (nm.find("attn_k.weight") != std::string::npos) {
+                first = rename_sub(nm, "attn_k.weight", "attn_q.weight"); second = nm;
+            } else if (nm.find("ffn_gate_shexp.weight") != std::string::npos) {
+                first = nm; second = rename_sub(nm, "ffn_gate_shexp.weight", "ffn_up_shexp.weight");
+            } else if (nm.find("ffn_up_shexp.weight") != std::string::npos) {
+                first = rename_sub(nm, "ffn_up_shexp.weight", "ffn_gate_shexp.weight"); second = nm;
+            } else {
+                used[i] = 1;
+                arranged.push_back(allocs[i]);
+                continue;
+            }
+            const int fi = idx_of(first);
+            const int si = idx_of(second);
+            if (fi >= 0) { used[fi] = 1; arranged.push_back(allocs[fi]); }
+            if (si >= 0) { used[si] = 1; arranged.push_back(allocs[si]); }
+        }
+        allocs.swap(arranged);
+        alloc_total = 0;
+        for (LagunaTensorAlloc & a : allocs) {
+            alloc_total = align_up_size(alloc_total, alignment);
+            a.buffer_offset = alloc_total;
+            alloc_total += ggml_backend_buft_get_alloc_size(buft, a.tensor);
+        }
+    }
+
     if (allocs.empty()) {
         set_last_error("laguna: load plan selected no GPU tensors");
         gguf_free(gctx);
@@ -455,6 +514,48 @@ bool load_target_gguf_laguna_partial(const std::string & path,
             gguf_free(gctx);
             return false;
         }
+    }
+
+    // Bind fused-view tensors over adjacent pairs. The fused tensor shares
+    // the pair's bytes (no copy); wq/wk stay valid for all other paths.
+    if (fuse_qk_env) {
+        ggml_init_params fip{};
+        fip.mem_size = ggml_tensor_overhead() * (size_t)(2 * n_layer + 8);
+        fip.no_alloc = true;
+        out.fuse_ctx = ggml_init(fip);
+    }
+    int n_fused_qk = 0, n_fused_gu = 0;
+    if (out.fuse_ctx) {
+        auto adjacent = [&](ggml_tensor * a, ggml_tensor * b) {
+            return a && b && a->type == b->type && a->ne[0] == b->ne[0] &&
+                   a->data && b->data &&
+                   (char *) b->data == (char *) a->data + ggml_nbytes(a) &&
+                   ggml_backend_buft_get_alloc_size(buft, a) == ggml_nbytes(a);
+        };
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            LagunaTargetLayer & L = out.layers[il];
+            if (adjacent(L.wq, L.wk)) {
+                ggml_tensor * t = ggml_new_tensor_2d(out.fuse_ctx, L.wq->type,
+                                                     L.wq->ne[0], L.wq->ne[1] + L.wk->ne[1]);
+                ggml_format_name(t, "blk.%u.attn_qk_fused", il);
+                if (ggml_backend_tensor_alloc(out.buf, t, L.wq->data) == GGML_STATUS_SUCCESS) {
+                    L.wqk = t;
+                    n_fused_qk++;
+                }
+            }
+            if (adjacent(L.ffn_gate_shexp, L.ffn_up_shexp)) {
+                ggml_tensor * t = ggml_new_tensor_2d(out.fuse_ctx, L.ffn_gate_shexp->type,
+                                                     L.ffn_gate_shexp->ne[0],
+                                                     L.ffn_gate_shexp->ne[1] + L.ffn_up_shexp->ne[1]);
+                ggml_format_name(t, "blk.%u.ffn_shexp_gu_fused", il);
+                if (ggml_backend_tensor_alloc(out.buf, t, L.ffn_gate_shexp->data) == GGML_STATUS_SUCCESS) {
+                    L.shexp_gu = t;
+                    n_fused_gu++;
+                }
+            }
+        }
+        std::printf("[laguna-loader] fused adjacent weights: qk=%d shexp_gu=%d layers\n",
+                    n_fused_qk, n_fused_gu);
     }
 
     // ── 4. Copy selected tensor bytes to GPU; remember tok_embd for embedder ─
@@ -483,6 +584,57 @@ bool load_target_gguf_laguna_partial(const std::string & path,
         if (!should_load_laguna_tensor(tname, plan)) continue;
         ggml_backend_tensor_set(t, mm_addr + off, 0, sz);
         total += sz;
+    }
+
+    // Fused per-head q/k norm weights: [head_dim, n_head+n_head_kv] f32 with
+    // q_norm replicated over the query heads and k_norm over the kv heads.
+    // Lets the fused-QK path run ONE rms_norm+mul+rope over all heads
+    // (bit-identical: every op is per-row/per-head independent).
+    if (n_fused_qk > 0) {
+        ggml_init_params nip{};
+        nip.mem_size = ggml_tensor_overhead() * (size_t)(n_layer + 4);
+        nip.no_alloc = true;
+        out.fuse_norm_ctx = ggml_init(nip);
+        const int hd  = out.head_dim;
+        const int nkv = out.n_head_kv;
+        if (out.fuse_norm_ctx) {
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                LagunaTargetLayer & L = out.layers[il];
+                if (!L.wqk || !L.q_norm || !L.k_norm ||
+                    L.q_norm->type != GGML_TYPE_F32 || L.k_norm->type != GGML_TYPE_F32 ||
+                    L.q_norm->ne[0] != hd || L.k_norm->ne[0] != hd) {
+                    L.wqk = nullptr;  // fused path needs the fused norm too
+                    continue;
+                }
+                ggml_tensor * t = ggml_new_tensor_2d(out.fuse_norm_ctx, GGML_TYPE_F32,
+                                                     hd, out.n_head_arr[il] + nkv);
+                ggml_format_name(t, "blk.%u.qk_norm_fused", il);
+                L.qk_norm_f = t;
+            }
+            out.fuse_norm_buf = ggml_backend_alloc_ctx_tensors(out.fuse_norm_ctx, backend);
+            if (out.fuse_norm_buf) {
+                std::vector<float> qn((size_t)hd), kn((size_t)hd), fused;
+                for (uint32_t il = 0; il < n_layer; ++il) {
+                    LagunaTargetLayer & L = out.layers[il];
+                    if (!L.wqk || !L.qk_norm_f) continue;
+                    const int nh = out.n_head_arr[il];
+                    ggml_backend_tensor_get(L.q_norm, qn.data(), 0, sizeof(float) * hd);
+                    ggml_backend_tensor_get(L.k_norm, kn.data(), 0, sizeof(float) * hd);
+                    fused.resize((size_t)hd * (size_t)(nh + nkv));
+                    for (int h = 0; h < nh + nkv; ++h) {
+                        const float * src = h < nh ? qn.data() : kn.data();
+                        std::memcpy(fused.data() + (size_t)h * hd, src, sizeof(float) * hd);
+                    }
+                    ggml_backend_tensor_set(L.qk_norm_f, fused.data(), 0,
+                                            sizeof(float) * fused.size());
+                }
+            } else {
+                for (uint32_t il = 0; il < n_layer; ++il) {
+                    out.layers[il].wqk = nullptr;
+                    out.layers[il].qk_norm_f = nullptr;
+                }
+            }
+        }
     }
 
     gguf_free(gctx);
@@ -524,6 +676,9 @@ bool load_target_gguf_laguna_partial(const std::string & path,
 }
 
 void free_laguna_target_weights(LagunaTargetWeights & w) {
+    if (w.fuse_norm_buf) { ggml_backend_buffer_free(w.fuse_norm_buf); w.fuse_norm_buf = nullptr; }
+    if (w.fuse_norm_ctx) { ggml_free(w.fuse_norm_ctx); w.fuse_norm_ctx = nullptr; }
+    if (w.fuse_ctx)      { ggml_free(w.fuse_ctx);      w.fuse_ctx = nullptr; }
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     if (w.ctx) { ggml_free(w.ctx);                w.ctx = nullptr; }
     // CpuEmbedder destructor handles mmap.

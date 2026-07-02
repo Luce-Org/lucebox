@@ -356,6 +356,25 @@ static ggml_tensor * laguna_rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
     return ggml_mul(ctx, n, weight);
 }
 
+// Shared-expert SwiGLU. With the loader's fused gate|up weight this is one
+// matmul + one in-place split-activation (bit-identical to the two-matmul
+// form: every output row is the same independent dot product, and
+// ggml_swiglu(x) == swiglu_split(first half, second half)).
+static ggml_tensor * laguna_shexp_ffn(ggml_context * ctx, const LagunaTargetLayer & L,
+                                      ggml_tensor * cur) {
+    // Decode widths only (see the fused-QK note: MMQ prefill is not
+    // bit-identical under row-concat, MMVQ decode is).
+    if (L.shexp_gu && cur->ne[1] <= 8) {
+        ggml_tensor * gu  = ggml_mul_mat(ctx, L.shexp_gu, cur);  // [2*ff_shexp, T]
+        ggml_tensor * act = ggml_swiglu(ctx, gu);                // silu(gate) * up
+        return ggml_mul_mat(ctx, L.ffn_down_shexp, act);
+    }
+    ggml_tensor * sh_gate = ggml_mul_mat(ctx, L.ffn_gate_shexp, cur);
+    ggml_tensor * sh_up   = ggml_mul_mat(ctx, L.ffn_up_shexp,   cur);
+    ggml_tensor * sh_gu   = ggml_swiglu_split(ctx, sh_gate, sh_up);
+    return ggml_mul_mat(ctx, L.ffn_down_shexp, sh_gu);
+}
+
 static ggml_tensor * build_laguna_dense_ffn(ggml_context * ctx, ggml_tensor * cur,
                                               const LagunaTargetLayer & L) {
     // SwiGLU: down( silu(gate(x)) * up(x) )
@@ -395,10 +414,7 @@ static ggml_tensor * build_laguna_moe_block(ggml_context * ctx, ggml_cgraph * gf
                                              const LagunaHybridMoe * hyb = nullptr, int il = 0) {
     static const bool stub = (std::getenv("DFLASH_LAGUNA_MOE_STUB") != nullptr);
     if (stub) {
-        ggml_tensor * sh_gate = ggml_mul_mat(ctx, L.ffn_gate_shexp, cur);
-        ggml_tensor * sh_up   = ggml_mul_mat(ctx, L.ffn_up_shexp,   cur);
-        ggml_tensor * sh_gu   = ggml_swiglu_split(ctx, sh_gate, sh_up);
-        return ggml_mul_mat(ctx, L.ffn_down_shexp, sh_gu);
+        return laguna_shexp_ffn(ctx, L, cur);
     }
     if (hyb && hyb->storage) {
         return build_laguna_moe_block_hybrid(ctx, gf, cur, w, L,
@@ -466,10 +482,7 @@ static ggml_tensor * build_laguna_moe_block_full(ggml_context * ctx, ggml_cgraph
     }
 
     // Always-on shared expert (SwiGLU).
-    ggml_tensor * sh_gate = ggml_mul_mat(ctx, L.ffn_gate_shexp, cur);
-    ggml_tensor * sh_up   = ggml_mul_mat(ctx, L.ffn_up_shexp,   cur);
-    ggml_tensor * sh_gu   = ggml_swiglu_split(ctx, sh_gate, sh_up);
-    ggml_tensor * shared  = ggml_mul_mat(ctx, L.ffn_down_shexp, sh_gu);
+    ggml_tensor * shared  = laguna_shexp_ffn(ctx, L, cur);
 
     return ggml_add(ctx, routed, shared);
 }
@@ -532,10 +545,7 @@ static ggml_tensor * build_laguna_moe_block_hybrid(ggml_context * ctx, ggml_cgra
         routed = (i == 0) ? slice : ggml_add(ctx, routed, slice);
     }
 
-    ggml_tensor * sh_gate = ggml_mul_mat(ctx, L.ffn_gate_shexp, cur);
-    ggml_tensor * sh_up   = ggml_mul_mat(ctx, L.ffn_up_shexp,   cur);
-    ggml_tensor * sh_gu   = ggml_swiglu_split(ctx, sh_gate, sh_up);
-    ggml_tensor * shared  = ggml_mul_mat(ctx, L.ffn_down_shexp, sh_gu);
+    ggml_tensor * shared  = laguna_shexp_ffn(ctx, L, cur);
 
     return ggml_add(ctx, routed, shared);
 }
@@ -616,10 +626,7 @@ static ggml_tensor * build_laguna_moe_block_legacy(ggml_context * ctx, ggml_tens
     routed = ggml_reshape_2d(ctx, routed, w.n_embd, ggml_nelements(routed) / w.n_embd);
 
     // Shared expert (always on).
-    ggml_tensor * sh_gate = ggml_mul_mat(ctx, L.ffn_gate_shexp, cur);
-    ggml_tensor * sh_up   = ggml_mul_mat(ctx, L.ffn_up_shexp,   cur);
-    ggml_tensor * sh_gu   = ggml_swiglu_split(ctx, sh_gate, sh_up);
-    ggml_tensor * shared  = ggml_mul_mat(ctx, L.ffn_down_shexp, sh_gu);
+    ggml_tensor * shared  = laguna_shexp_ffn(ctx, L, cur);
 
     return ggml_add(ctx, routed, shared);
 }
@@ -656,17 +663,62 @@ static ggml_tensor * build_laguna_attn_block(
     const int q_dim      = n_head * head_dim;
 
     // ---- Q/K/V projections ---
-    ggml_tensor * Qcur = ggml_mul_mat(ctx, L.wq, cur);  // [q_dim, n_tokens]
-    ggml_tensor * Kcur = ggml_mul_mat(ctx, L.wk, cur);  // [n_head_kv*head_dim, n_tokens]
+    // Fused path: ONE matmul for Q|K (loader-fused adjacent weights), then a
+    // single per-head rms_norm+mul+rope over all n_head+n_head_kv heads with
+    // the fused norm weight. Bit-identical to the split path: matmul rows,
+    // rms_norm rows, the weight mul and rope are all per-head independent.
+    static const int qk_fuse_mode = []() {
+        const char * e = getenv("LUCE_QK_FUSE_MODE");
+        return e ? atoi(e) : 3;
+    }();
+    static const int qk_fuse_layers = []() {
+        const char * e = getenv("LUCE_QK_FUSE_LAYERS");
+        return e ? atoi(e) : 1000;
+    }();
+    // Fused weights are used ONLY at decode widths (MMVQ, n_tokens <= 8):
+    // per-row dot products are bit-identical under row-concat there. MMQ
+    // (prefill) partitions work by total row count, so concat changes the
+    // partial-sum order (~1e-5); prefill keeps the split weights.
+    const bool qk_layer_on = il < qk_fuse_layers && n_tokens <= 8;
+    ggml_tensor * Qcur = nullptr;
+    ggml_tensor * Kcur = nullptr;
+    ggml_tensor * qk_fused = nullptr;
+    if (L.wqk && L.qk_norm_f && qk_layer_on && qk_fuse_mode == 1) {
+        // matmul-only fusion: split + cont right after the projection, then the
+        // legacy norm/rope path
+        ggml_tensor * qkmm = ggml_mul_mat(ctx, L.wqk, cur);
+        const int64_t qd = (int64_t)n_head * head_dim;
+        const int64_t kd = (int64_t)n_head_kv * head_dim;
+        Qcur = ggml_cont(ctx, ggml_view_2d(ctx, qkmm, qd, n_tokens, qkmm->nb[1], 0));
+        Kcur = ggml_cont(ctx, ggml_view_2d(ctx, qkmm, kd, n_tokens, qkmm->nb[1], (size_t)qd * sizeof(float)));
+        Qcur = ggml_reshape_3d(ctx, Qcur, head_dim, n_head,    n_tokens);
+        Kcur = ggml_reshape_3d(ctx, Kcur, head_dim, n_head_kv, n_tokens);
+        Qcur = laguna_rms_norm_mul(ctx, Qcur, L.q_norm);
+        Kcur = laguna_rms_norm_mul(ctx, Kcur, L.k_norm);
+    } else if (L.wqk && L.qk_norm_f && qk_layer_on && qk_fuse_mode == 2) {
+        // matmul + fused norm; split + cont before rope (legacy rope path)
+        ggml_tensor * qkn = ggml_mul_mat(ctx, L.wqk, cur);
+        qkn = ggml_reshape_3d(ctx, qkn, head_dim, n_head + n_head_kv, n_tokens);
+        qkn = laguna_rms_norm_mul(ctx, qkn, L.qk_norm_f);
+        Qcur = ggml_cont(ctx, ggml_view_3d(ctx, qkn, head_dim, n_head, n_tokens,
+                                           qkn->nb[1], qkn->nb[2], 0));
+        Kcur = ggml_cont(ctx, ggml_view_3d(ctx, qkn, head_dim, n_head_kv, n_tokens,
+                                           qkn->nb[1], qkn->nb[2], (size_t)n_head * qkn->nb[1]));
+    } else if (L.wqk && L.qk_norm_f && qk_layer_on && qk_fuse_mode >= 3) {
+        qk_fused = ggml_mul_mat(ctx, L.wqk, cur);  // [(n_head+n_head_kv)*head_dim, n_tokens]
+        qk_fused = ggml_reshape_3d(ctx, qk_fused, head_dim, n_head + n_head_kv, n_tokens);
+        qk_fused = laguna_rms_norm_mul(ctx, qk_fused, L.qk_norm_f);
+    } else {
+        Qcur = ggml_mul_mat(ctx, L.wq, cur);  // [q_dim, n_tokens]
+        Kcur = ggml_mul_mat(ctx, L.wk, cur);  // [n_head_kv*head_dim, n_tokens]
+        Qcur = ggml_reshape_3d(ctx, Qcur, head_dim, n_head,    n_tokens);
+        Kcur = ggml_reshape_3d(ctx, Kcur, head_dim, n_head_kv, n_tokens);
+        // ---- Per-head Q/K RMSNorm (norm over head_dim) ---
+        Qcur = laguna_rms_norm_mul(ctx, Qcur, L.q_norm);
+        Kcur = laguna_rms_norm_mul(ctx, Kcur, L.k_norm);
+    }
     ggml_tensor * Vcur = ggml_mul_mat(ctx, L.wv, cur);
-
-    Qcur = ggml_reshape_3d(ctx, Qcur, head_dim, n_head,    n_tokens);
-    Kcur = ggml_reshape_3d(ctx, Kcur, head_dim, n_head_kv, n_tokens);
     Vcur = ggml_reshape_3d(ctx, Vcur, head_dim, n_head_kv, n_tokens);
-
-    // ---- Per-head Q/K RMSNorm (norm over head_dim) ---
-    Qcur = laguna_rms_norm_mul(ctx, Qcur, L.q_norm);
-    Kcur = laguna_rms_norm_mul(ctx, Kcur, L.k_norm);
 
     // ---- Per-head softplus attention gate ---
     // wqkv_gate : [n_embd, n_head]; gate_proj output [n_head, n_tokens] f32.
@@ -687,14 +739,28 @@ static ggml_tensor * build_laguna_attn_block(
     const int   n_ctx_orig  = is_full ? w.yarn_orig_ctx  : 0;
     const float freq_scale  = is_full ? (1.0f / w.yarn_factor) : 1.0f;
 
-    Qcur = ggml_rope_ext(ctx, Qcur, positions, /*freq_factors=*/nullptr,
-                          n_rot, /*mode=*/GGML_ROPE_TYPE_NEOX,
-                          n_ctx_orig, rope_th, freq_scale,
-                          ext_factor, attn_factor, beta_fast, beta_slow);
-    Kcur = ggml_rope_ext(ctx, Kcur, positions, nullptr,
-                          n_rot, GGML_ROPE_TYPE_NEOX,
-                          n_ctx_orig, rope_th, freq_scale,
-                          ext_factor, attn_factor, beta_fast, beta_slow);
+    if (qk_fused) {
+        // Q and K use IDENTICAL rope parameters, so rope the fused tensor once
+        // (rope is per-head independent) and split with views afterwards.
+        qk_fused = ggml_rope_ext(ctx, qk_fused, positions, /*freq_factors=*/nullptr,
+                                 n_rot, /*mode=*/GGML_ROPE_TYPE_NEOX,
+                                 n_ctx_orig, rope_th, freq_scale,
+                                 ext_factor, attn_factor, beta_fast, beta_slow);
+        Qcur = ggml_view_3d(ctx, qk_fused, head_dim, n_head, n_tokens,
+                            qk_fused->nb[1], qk_fused->nb[2], 0);
+        Kcur = ggml_view_3d(ctx, qk_fused, head_dim, n_head_kv, n_tokens,
+                            qk_fused->nb[1], qk_fused->nb[2],
+                            (size_t)n_head * qk_fused->nb[1]);
+    } else {
+        Qcur = ggml_rope_ext(ctx, Qcur, positions, /*freq_factors=*/nullptr,
+                             n_rot, /*mode=*/GGML_ROPE_TYPE_NEOX,
+                             n_ctx_orig, rope_th, freq_scale,
+                             ext_factor, attn_factor, beta_fast, beta_slow);
+        Kcur = ggml_rope_ext(ctx, Kcur, positions, nullptr,
+                             n_rot, GGML_ROPE_TYPE_NEOX,
+                             n_ctx_orig, rope_th, freq_scale,
+                             ext_factor, attn_factor, beta_fast, beta_slow);
+    }
 
     // ---- Write K/V to cache slot ---
     // All layers (full + SWA) use a uniform max_ctx-sized cache. SWA layers
