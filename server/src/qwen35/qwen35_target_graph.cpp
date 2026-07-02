@@ -886,7 +886,16 @@ static ggml_tensor * build_delta_net_block(
     // tree_persist writes directly to the intermediate buffer. It only supports
     // F32/F16 output; for Q8_0 intermediates, fall back to the legacy ggml_cpy
     // path which handles F32→Q8_0 quantization automatically.
-    ggml_tensor * persist_inter = (parent_ids && cap && cap->ssm_intermediate_states
+    // persist_inter: when capture is requested, route the kernel's per-token
+    // intermediate-state writes DIRECTLY into the persistent cache buffer via
+    // src[7], avoiding the legacy result-region cpy. Works for BOTH tree and
+    // non-tree (chain-verify) capture — the kernel checks src[7] regardless of
+    // tree mode, and write_inter is forced true whenever src[7] is non-null.
+    // This also keeps non-tree capture safe if the result tensor is compacted
+    // and no longer embeds per-token intermediate states.
+    // Q8_0 intermediates fall through (persist requires F32/F16); the legacy
+    // cpy path below handles F32→Q8_0 quantization for that case (guarded).
+    ggml_tensor * persist_inter = (cap && cap->ssm_intermediate_states
                                    && (cap->ssm_intermediate_states->type == GGML_TYPE_F32
                                        || cap->ssm_intermediate_states->type == GGML_TYPE_F16))
         ? cap->ssm_intermediate_states
@@ -918,12 +927,22 @@ static ggml_tensor * build_delta_net_block(
     }
 
     ggml_tensor * result;
-    result =
-        persist_inter
+    if (parent_ids) {
+        // Tree verify: _tree_persist wires src[7] internally.
+        result = persist_inter
             ? ggml_gated_delta_net_tree_persist(ctx, q_c, k_c, v_c, g_tensor, beta, s, parent_ids, persist_inter)
-            : (parent_ids
-                ? ggml_gated_delta_net_tree(ctx, q_c, k_c, v_c, g_tensor, beta, s, parent_ids)
-                : ggml_gated_delta_net     (ctx, q_c, k_c, v_c, g_tensor, beta, s));
+            : ggml_gated_delta_net_tree(ctx, q_c, k_c, v_c, g_tensor, beta, s, parent_ids);
+    } else {
+        // Non-tree (chain/prefill). When capture is requested, set src[7] so
+        // the kernel writes per-token intermediates directly to the persistent
+        // cache buffer — same mechanism as _tree_persist, but without tree
+        // parent_ids. Avoids the legacy result-region cpy (and the OOB it
+        // could cause if the result tensor has no embedded intermediate region).
+        result = ggml_gated_delta_net(ctx, q_c, k_c, v_c, g_tensor, beta, s);
+        if (persist_inter) {
+            result->src[7] = persist_inter;
+        }
+    }
     if (can_skip_gdn_intermediate) {
         ggml_gated_delta_net_set_skip_intermediate(result, true);
     }
@@ -964,35 +983,15 @@ static ggml_tensor * build_delta_net_block(
     // persistent cache, so verify_build stays cheap. Matches SGLang's
     // mamba_caches.intermediate_ssm pattern.
     if (cap && cap->ssm_intermediate_states && !persist_inter) {
-        // Legacy cpy path: only used when the kernel wrote intermediates into
-        // its own result region (i.e. when we did NOT use _tree_persist).
-        // The _tree_persist variant writes directly to the cache buffer and
-        // this cpy becomes redundant, saving ~5-10 ms per verify step.
-        const size_t inter_offset =
-            S_v * H_v * n_seq_tokens * n_seqs * r_elt        // attn output region
-          + S_v * S_v * H_v * n_seqs * r_elt;                // final-state region
-        ggml_tensor * inter_view = ggml_view_4d(ctx, result,
-            S_v, S_v, H_v, n_seq_tokens,
-            S_v * r_elt,
-            S_v * S_v * r_elt,
-            S_v * S_v * H_v * r_elt,
-            inter_offset);
-        // The cache buffer holds max_verify_tokens per-step slots, which can
-        // exceed this batch's n_seq_tokens (e.g. --ddtree sizes the buffer to
-        // the tree budget while a chain verify uses fewer tokens). Copy the
-        // produced states into the first n_seq_tokens slots via a destination
-        // view, rather than requiring an exact size match (the prior
-        // exact-equality assert aborted whenever n_seq_tokens != the buffer's
-        // allocated token count).
-        ggml_tensor * dst = cap->ssm_intermediate_states;
-        GGML_ASSERT(n_seq_tokens <= dst->ne[3]);
-        GGML_ASSERT(dst->ne[0] == S_v && dst->ne[1] == S_v && dst->ne[2] == H_v);
-        ggml_tensor * dst_view = ggml_view_4d(ctx, dst,
-            dst->ne[0], dst->ne[1], dst->ne[2], n_seq_tokens,
-            dst->nb[1], dst->nb[2], dst->nb[3], 0);
-        GGML_ASSERT(ggml_nelements(inter_view) == ggml_nelements(dst_view));
-        ggml_build_forward_expand(gf,
-            ggml_cpy(ctx, inter_view, dst_view));
+        // This path is only reachable when the intermediate buffer is a type
+        // persist routing can't handle (persist requires F32/F16; the cache
+        // allocates F16, so this is normally dead). If the result tensor has no
+        // embedded intermediate region, the legacy cpy would read OOB. Fail
+        // loudly rather than silently leaving the rollback buffer stale.
+        GGML_ABORT(
+            "non-tree GDN intermediate capture requires an F32/F16 persist buffer "
+            "(got type %d); use F16 intermediates (the default) or the tree-verify path.",
+            (int)cap->ssm_intermediate_states->type);
     }
     } // end of block started at `{` before `const int64_t S_v = head_v_dim;`
 
