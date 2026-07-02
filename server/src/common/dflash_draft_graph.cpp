@@ -224,8 +224,10 @@ bool build_draft_step(
             for (int j = 0; j < q_len; j++)
                 mask_data[(size_t)q * kv_pad + (ctx_alloc + j)] = ZERO;
         }
-        ggml_backend_tensor_set(sg.pad_mask_full, mask_data.data(), 0,
-                                sizeof(uint16_t) * mask_data.size());
+        if (sg.pad_mask_full) {
+            ggml_backend_tensor_set(sg.pad_mask_full, mask_data.data(), 0,
+                                    sizeof(uint16_t) * mask_data.size());
+        }
 
         // The pad rows of the ctx features must be FINITE (they are masked
         // out, but NaN/Inf would still poison flash-attn). Zero them.

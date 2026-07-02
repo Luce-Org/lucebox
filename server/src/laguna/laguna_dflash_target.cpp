@@ -42,6 +42,10 @@ LagunaDFlashTarget::LagunaDFlashTarget(
 
 LagunaDFlashTarget::~LagunaDFlashTarget() {
     laguna_snapshot_free(verify_snap_);
+    if (embd_gpu_buf_) { ggml_backend_buffer_free(embd_gpu_buf_); embd_gpu_buf_ = nullptr; }
+    if (embd_gpu_ctx_) { ggml_free(embd_gpu_ctx_); embd_gpu_ctx_ = nullptr; }
+    embd_gpu_ = nullptr;
+    if (fused_backend_) { ggml_backend_free(fused_backend_); fused_backend_ = nullptr; }
 }
 
 bool LagunaDFlashTarget::verify_batch(

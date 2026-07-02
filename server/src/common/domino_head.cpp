@@ -197,6 +197,16 @@ bool domino_correct_greedy_chain_fused(const DraftWeights & dw,
     const int n_cand = q_len - 1;
     const int vocab  = (int)lm_head->ne[1];
     if (hidden <= 0 || H <= 0 || E <= 0 || vocab <= 0) return false;
+    if (dw.domino.vocab_size > 0 && vocab != dw.domino.vocab_size) {
+        static bool s_vocab_warned = false;
+        if (!s_vocab_warned) {
+            s_vocab_warned = true;
+            std::fprintf(stderr,
+                "domino_fused: vocab mismatch lm_head=%d domino=%d; falling back\n",
+                vocab, dw.domino.vocab_size);
+        }
+        return false;
+    }
 
     static const bool zero_start = std::getenv("DFLASH_DOMINO_ZERO_START") != nullptr;
 

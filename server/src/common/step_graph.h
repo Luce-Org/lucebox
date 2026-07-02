@@ -91,6 +91,9 @@ inline void step_graph_free(StepGraph & sg) {
 inline void step_graph_destroy(StepGraph & sg) {
     if (sg.alloc) { ggml_gallocr_free(sg.alloc); sg.alloc = nullptr; }
     step_graph_free(sg);
+    sg.meta_arena.clear();
+    sg.meta_arena.shrink_to_fit();
+    sg.alloc_reserved_ctx = 0;
 }
 
 }  // namespace dflash::common
