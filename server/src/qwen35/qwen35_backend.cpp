@@ -489,8 +489,8 @@ bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
     auto & snap = prefix_snapshots_[slot];
 
     // Count expected tensor layout from weights.
-    const int n_full_attn = w_.n_layer / w_.full_attention_interval;
-    const int n_delta     = w_.n_layer - n_full_attn;
+    const int n_full_attn = qwen35_count_full_attention_layers(w_);
+    const int n_delta     = qwen35_count_deltanet_layers(w_);
 
     snap.attn_k_snap.assign(n_full_attn, nullptr);
     snap.attn_v_snap.assign(n_full_attn, nullptr);

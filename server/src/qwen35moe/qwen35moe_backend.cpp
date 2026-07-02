@@ -21,7 +21,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include "common/gguf_mmap.h"
+#include "common/gguf_tensor_data.h"
 
 namespace dflash::common {
 
@@ -33,10 +35,48 @@ static uint64_t elapsed_us(HybridClock::time_point start, HybridClock::time_poin
     return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 }
 
+static PlacementBackend resolved_device_backend(const DevicePlacement & device) {
+    return device.backend == PlacementBackend::Auto
+        ? compiled_placement_backend()
+        : device.backend;
+}
+
+static bool resolve_expert_split_targets_from_env(
+        uint64_t primary_capacity_bytes,
+        std::vector<ExpertSplitTarget> & out,
+        std::string * err) {
+    return dflash::common::resolve_expert_split_targets_from_env(
+        "DFLASH_QWEN35MOE_EXPERT_TARGETS",
+        "DFLASH_QWEN35MOE_EXPERT_TARGET_CAPS",
+        primary_capacity_bytes,
+        out,
+        err);
+}
+
+static bool same_placement(const MoeHybridPlacement & lhs,
+                           const MoeHybridPlacement & rhs) {
+    return lhs.n_layer == rhs.n_layer &&
+           lhs.n_expert == rhs.n_expert &&
+           lhs.n_expert_used == rhs.n_expert_used &&
+           lhs.total_hot == rhs.total_hot &&
+           lhs.hot_counts == rhs.hot_counts &&
+           lhs.hot_expert_ids == rhs.hot_expert_ids;
+}
+
 } // namespace
 
 Qwen35MoeBackend::Qwen35MoeBackend(const Qwen35Config & cfg)
     : Qwen35Backend(cfg) {}
+
+bool Qwen35MoeBackend::supports_dflash_spec_decode() const {
+    if (!target_weights().moe_hybrid) {
+        return true;
+    }
+    for (const auto & layer : target_weights().moe_hybrid->layers) {
+        if (!layer.cold_expert_ids.empty()) return false;
+    }
+    return true;
+}
 
 bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights & out) {
     // Phase 1: Load core model (non-expert tensors) to GPU.
@@ -72,15 +112,11 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
         ? std::string("hotness:") + hotness_path
         : std::string("uniform");
 
-    // If all experts fit on GPU, reload with experts included
+    // If all experts fit on GPU, keep the hybrid path but note that KVFlash may
+    // be redundant only when the FULL max_ctx KV reservation still leaves room.
     if (placement.total_hot >= out.n_layer * out.n_expert) {
-        std::printf("[qwen35moe] all experts fit in VRAM, loading fully to GPU\n");
+        std::printf("[qwen35moe] all experts fit in VRAM, staying on hybrid path (all-hot)\n");
         std::fflush(stdout);
-        // Record the placement result so post_kvflash_init_gate() can disable
-        // the KVFlash pool (moe_hybrid is null on this all-hot path).
-        placement_all_hot_ = true;
-        free_target_weights(out);
-        return load_target_gguf(cfg_.target_path, backend, out);
     }
 
     if (const char * telemetry = std::getenv("DFLASH_QWEN35MOE_TELEMETRY")) {
@@ -88,59 +124,21 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
     }
 
     // Phase 3: Load expert data from GGUF mmap directly into split hot/cold buffers.
-    // Open GGUF again to get tensor file offsets and mmap the data.
+    // Split GGUF shards are supported by resolving each expert tensor to its
+    // owning shard. Streaming mmap is retained only for single-file GGUFs.
     {
-        ggml_context * expert_meta = nullptr;
-        gguf_init_params gip{};
-        gip.no_alloc = true;
-        gip.ctx = &expert_meta;
-        gguf_context * gctx = gguf_init_from_file(cfg_.target_path, gip);
-        if (!gctx) {
-            set_last_error("failed to re-open GGUF for expert loading");
+        GgufTensorDataReader expert_reader;
+        if (!expert_reader.open(cfg_.target_path,
+                                /*build_merged_tensor_context=*/false, err)) {
+            set_last_error("failed to open GGUF expert shards: " + err);
             return false;
         }
-
-        // Mmap the file
-        GgufMmap _mf;
-        std::string _mferr;
-        if (!_mf.open(cfg_.target_path, _mferr)) {
-            set_last_error("mmap failed on GGUF: " + _mferr);
-            gguf_free(gctx);
+        if (!expert_reader.open_mmaps(err)) {
+            set_last_error("mmap failed on GGUF expert shards: " + err);
             return false;
         }
-        const size_t file_size = _mf.size();
-        // Transfer mmap ownership out of the RAII wrapper: the hybrid storage
-        // keeps the mapping alive for streaming prefill and unmaps it in
-        // ~MoeHybridStorage. On POSIX the fd can be closed now (the mapping
-        // stays valid); on Windows release() already closed the mapping handle.
-        GgufMmap::OwnedRegion _region = _mf.release();
-        const void * mmap_addr = _region.data;
-#if !defined(_WIN32)
-        if (_region.fd >= 0) ::close(_region.fd);
-#endif
-
-        const size_t data_start = gguf_get_data_offset(gctx);
-        const auto * file_bytes = (const uint8_t *)mmap_addr;
-
-        // Build per-layer expert file data
-        std::vector<LayerExpertFileData> layer_file_data((size_t)out.n_layer);
-        for (int il = 0; il < out.n_layer; ++il) {
-            char name[128];
-            auto find_tensor_data = [&](const char * suffix) -> ExpertTensorFileData {
-                std::snprintf(name, sizeof(name), "blk.%d.%s.weight", il, suffix);
-                int64_t tid = gguf_find_tensor(gctx, name);
-                if (tid < 0) return {};
-                size_t off = data_start + gguf_get_tensor_offset(gctx, tid);
-                size_t sz = gguf_get_tensor_size(gctx, tid);
-                if (off + sz > file_size) return {};
-                return { file_bytes + off, sz };
-            };
-
-            layer_file_data[(size_t)il].gate_exps    = find_tensor_data("ffn_gate_exps");
-            layer_file_data[(size_t)il].up_exps      = find_tensor_data("ffn_up_exps");
-            layer_file_data[(size_t)il].down_exps    = find_tensor_data("ffn_down_exps");
-            layer_file_data[(size_t)il].gate_up_exps = find_tensor_data("ffn_gate_up_exps");
-        }
+        const auto layer_file_data =
+            make_layer_expert_file_data(expert_reader, out.n_layer);
 
         auto hybrid = std::make_shared<MoeHybridStorage>();
         MoeHybridConfig hybrid_cfg = make_moe_hybrid_config(out);
@@ -155,20 +153,51 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
         int cache_slots = 0;
     if (const char * cs = std::getenv("DFLASH_QWEN35MOE_CACHE_SLOTS")) cache_slots = std::max(0, std::atoi(cs));
     else if (cache_slots_ >= 0) cache_slots = cache_slots_;
-    if (!build_moe_hybrid_storage_from_file_with_mmap(hybrid_cfg, backend, placement, layer_descs, layer_file_data, mmap_addr, file_size, *hybrid, &err, cache_slots)) {
+    const std::vector<std::vector<int32_t>> * cold_order_by_layer =
+        last_expert_split_state_.materialization.ordered_cold_union
+            ? &last_expert_split_state_.materialization.cold_expert_ids_by_layer
+            : nullptr;
+    bool storage_ok = false;
+    if (expert_reader.shard_count() == 1) {
+        const void * mmap_addr = nullptr;
+        size_t file_size = 0;
+        int mmap_fd = -1;
+        std::string mmap_err;
+        if (!expert_reader.release_single_mmap(mmap_addr, file_size,
+                                               mmap_fd, mmap_err)) {
+            set_last_error("single GGUF mmap release failed: " + mmap_err);
+            return false;
+        }
+#if !defined(_WIN32)
+        if (mmap_fd >= 0) ::close(mmap_fd);
+#endif
+        storage_ok = build_moe_hybrid_storage_from_file_with_mmap(
+            hybrid_cfg, backend, placement, layer_descs, layer_file_data,
+            mmap_addr, file_size, *hybrid, &err, cache_slots,
+            cold_order_by_layer);
+        if (!storage_ok) {
 #if defined(_WIN32)
             UnmapViewOfFile(const_cast<void *>(mmap_addr));
 #else
             ::munmap(const_cast<void *>(mmap_addr), file_size);
 #endif
-            gguf_free(gctx);
-            set_last_error(std::string("qwen35moe hybrid storage build failed: ") + err);
-            return false;
         }
-
-        // Keep mmap open for streaming prefill — do NOT munmap here.
-        // The mmap_data/mmap_size are stored in hybrid storage for lifetime management.
-        gguf_free(gctx);
+    } else {
+        storage_ok = build_moe_hybrid_storage_from_file(
+            hybrid_cfg, backend, placement, layer_descs, layer_file_data,
+            *hybrid, &err, cache_slots, /*load_cold_tensors=*/true,
+            cold_order_by_layer);
+        if (storage_ok) {
+            std::fprintf(stderr,
+                         "[qwen35moe] split GGUF expert load: %d shards, "
+                         "streaming mmap disabled\n",
+                         expert_reader.shard_count());
+        }
+    }
+    if (!storage_ok) {
+        set_last_error(std::string("qwen35moe hybrid storage build failed: ") + err);
+        return false;
+    }
 
         out.moe_hybrid = std::move(hybrid);
     }
@@ -255,43 +284,25 @@ bool Qwen35MoeBackend::spark_wants_bootstrap() const {
 
 // Re-mmap the GGUF and rebuild the hot/cold storage for a new placement. Used by
 // the Spark bootstrap to apply the calibrated placement in-process.
-bool Qwen35MoeBackend::rebuild_hybrid_from_placement(const MoeHybridPlacement & placement,
-                                                     std::string & err) {
+bool Qwen35MoeBackend::rebuild_hybrid_from_placement(
+        const MoeHybridPlacement & placement,
+        const ExpertSplitMaterialization * materialization,
+        std::string & err) {
     TargetWeights & out = target_weights();
     ggml_backend_t backend = target_backend();
 
-    gguf_init_params gip{};
-    gguf_context * gctx = gguf_init_from_file(cfg_.target_path, gip);
-    if (!gctx) { err = "gguf reinit failed"; return false; }
-    GgufMmap _mf;
-    std::string _mferr;
-    if (!_mf.open(cfg_.target_path, _mferr)) {
-        gguf_free(gctx);
-        err = "mmap failed: " + _mferr;
+    GgufTensorDataReader expert_reader;
+    if (!expert_reader.open(cfg_.target_path,
+                            /*build_merged_tensor_context=*/false, err)) {
+        err = "gguf expert shard open failed: " + err;
         return false;
     }
-    const size_t file_size = _mf.size();
-    const void * mmap_addr = _mf.data();
-
-    const size_t data_start = gguf_get_data_offset(gctx);
-    const auto * file_bytes = (const uint8_t *)mmap_addr;
-    std::vector<LayerExpertFileData> layer_file_data((size_t)out.n_layer);
-    for (int il = 0; il < out.n_layer; ++il) {
-        char name[128];
-        auto find_tensor_data = [&](const char * suffix) -> ExpertTensorFileData {
-            std::snprintf(name, sizeof(name), "blk.%d.%s.weight", il, suffix);
-            int64_t tid = gguf_find_tensor(gctx, name);
-            if (tid < 0) return {};
-            size_t off = data_start + gguf_get_tensor_offset(gctx, tid);
-            size_t sz = gguf_get_tensor_size(gctx, tid);
-            if (off + sz > file_size) return {};
-            return { file_bytes + off, sz };
-        };
-        layer_file_data[(size_t)il].gate_exps    = find_tensor_data("ffn_gate_exps");
-        layer_file_data[(size_t)il].up_exps      = find_tensor_data("ffn_up_exps");
-        layer_file_data[(size_t)il].down_exps    = find_tensor_data("ffn_down_exps");
-        layer_file_data[(size_t)il].gate_up_exps = find_tensor_data("ffn_gate_up_exps");
+    if (!expert_reader.open_mmaps(err)) {
+        err = "mmap failed: " + err;
+        return false;
     }
+    const auto layer_file_data =
+        make_layer_expert_file_data(expert_reader, out.n_layer);
 
     // Free the current hot/cold buffers before allocating the new ones so the
     // rebuild fits in VRAM (no transient 2x). Safe: bootstrap runs at startup
@@ -305,12 +316,139 @@ bool Qwen35MoeBackend::rebuild_hybrid_from_placement(const MoeHybridPlacement & 
     for (int il = 0; il < out.n_layer; ++il)
         layer_descs[(size_t)il] = make_moe_layer_desc(out.layers[(size_t)il]);
     const int cache_slots = cache_slots_ >= 0 ? cache_slots_ : 0;
+    const std::vector<std::vector<int32_t>> * cold_order_by_layer = nullptr;
+    if (materialization && materialization->ordered_cold_union) {
+        if (!materialization->matches(out.n_layer, out.n_expert, out.n_expert_used) ||
+            !same_placement(materialization->primary_placement, placement)) {
+            err = "expert split materialization does not match rebuild placement";
+            return false;
+        }
+        cold_order_by_layer = &materialization->cold_expert_ids_by_layer;
+    }
 
-    const bool ok = build_moe_hybrid_storage_from_file(hybrid_cfg, backend, placement, layer_descs,
-                                                       layer_file_data, *hybrid, &err, cache_slots);
-    gguf_free(gctx);
+    const bool ok = build_moe_hybrid_storage_from_file(
+        hybrid_cfg, backend, placement, layer_descs, layer_file_data, *hybrid,
+        &err, cache_slots, /*load_cold_tensors=*/true, cold_order_by_layer);
     if (!ok) return false;
     out.moe_hybrid = std::move(hybrid);
+    return true;
+}
+
+bool Qwen35MoeBackend::build_expert_split_plan_from_stats(
+        const MoeHybridRoutingStats & hotness,
+        uint64_t expert_budget_bytes,
+        const TargetWeights & w,
+        ExpertSplitPlan & out,
+        std::string * err) const {
+    if ((int) layer_expert_bytes_.size() != w.n_layer) {
+        if (err) *err = "layer expert bytes not initialized";
+        return false;
+    }
+    if (expert_budget_bytes == 0) {
+        if (err) *err = "expert budget must be > 0";
+        return false;
+    }
+
+    ExpertSplitConfig cfg;
+    cfg.n_layer = w.n_layer;
+    cfg.n_expert = w.n_expert;
+    cfg.allow_implicit_cpu_fallback = true;
+    cfg.require_full_grid = true;
+    cfg.min_per_layer_by_target = {std::min(w.n_expert_used, w.n_expert)};
+
+    std::vector<ExpertSplitTarget> targets;
+    if (!resolve_expert_split_targets_from_env(expert_budget_bytes, targets, err)) {
+        return false;
+    }
+    if (targets.empty()) {
+        const PlacementBackend backend = resolved_device_backend(cfg_.device);
+        targets = {
+            {std::string(placement_backend_name(backend)) + ":" + std::to_string(cfg_.device.gpu),
+             placement_backend_name(backend), cfg_.device.gpu, expert_budget_bytes, 0, false},
+        };
+    }
+    if (targets.size() > 1) {
+        cfg.min_per_layer_by_target.assign(targets.size(), 0);
+        cfg.min_per_layer_by_target[0] = std::min(w.n_expert_used, w.n_expert);
+    }
+
+    std::vector<ExpertSplitUnit> units;
+    units.reserve((size_t) w.n_layer * (size_t) w.n_expert);
+    for (int il = 0; il < w.n_layer; ++il) {
+        for (int ie = 0; ie < w.n_expert; ++ie) {
+            units.push_back(ExpertSplitUnit{
+                il,
+                ie,
+                layer_expert_bytes_[(size_t) il],
+                (double) hotness.count(il, ie),
+            });
+        }
+    }
+
+    return build_expert_split_plan(cfg, targets, units, out, err);
+}
+
+bool Qwen35MoeBackend::build_expert_split_state_from_stats(
+        const MoeHybridRoutingStats & hotness,
+        uint64_t expert_budget_bytes,
+        const TargetWeights & w,
+        std::string * err) {
+    if ((int) layer_expert_bytes_.size() != w.n_layer) {
+        if (err) *err = "layer expert bytes not initialized";
+        return false;
+    }
+    if (expert_budget_bytes == 0) {
+        if (err) *err = "expert budget must be > 0";
+        return false;
+    }
+
+    ExpertSplitConfig cfg;
+    cfg.n_layer = w.n_layer;
+    cfg.n_expert = w.n_expert;
+    cfg.allow_implicit_cpu_fallback = true;
+    cfg.require_full_grid = true;
+    cfg.min_per_layer_by_target = {std::min(w.n_expert_used, w.n_expert)};
+
+    std::vector<ExpertSplitTarget> targets;
+    if (!resolve_expert_split_targets_from_env(expert_budget_bytes, targets, err)) {
+        return false;
+    }
+    if (targets.empty()) {
+        const PlacementBackend backend = resolved_device_backend(cfg_.device);
+        targets = {
+            {std::string(placement_backend_name(backend)) + ":" + std::to_string(cfg_.device.gpu),
+             placement_backend_name(backend), cfg_.device.gpu, expert_budget_bytes, 0, false},
+        };
+    }
+    if (targets.size() > 1) {
+        cfg.min_per_layer_by_target.assign(targets.size(), 0);
+        cfg.min_per_layer_by_target[0] = std::min(w.n_expert_used, w.n_expert);
+    }
+
+    std::vector<ExpertSplitUnit> units;
+    units.reserve((size_t) w.n_layer * (size_t) w.n_expert);
+    for (int il = 0; il < w.n_layer; ++il) {
+        for (int ie = 0; ie < w.n_expert; ++ie) {
+            units.push_back(ExpertSplitUnit{
+                il,
+                ie,
+                layer_expert_bytes_[(size_t) il],
+                (double) hotness.count(il, ie),
+            });
+        }
+    }
+
+    ExpertSplitStateComponents state;
+    if (!build_expert_split_state(cfg, targets, units,
+                                  w.n_expert_used, state, err)) {
+        return false;
+    }
+    if (!validate_primary_expert_split_target(state.plan.targets,
+                                              resolved_device_backend(cfg_.device),
+                                              cfg_.device.gpu, err)) {
+        return false;
+    }
+    last_expert_split_state_ = std::move(state);
     return true;
 }
 
@@ -319,14 +457,14 @@ bool Qwen35MoeBackend::spark_bootstrap_finalize(const std::string & profile_path
     std::string err;
     routing_stats_->save_csv(profile_path, &err);  // persist the observed routing
     const TargetWeights & w = target_weights();
-    MoeHybridPlacement placement;
-    if (!MoeHybridPlacement::build_from_stats_with_layer_bytes(
-            *routing_stats_, layer_expert_bytes_, spark_expert_budget_,
-            std::min(w.n_expert_used, w.n_expert), placement, &err)) {
+    if (!build_expert_split_state_from_stats(*routing_stats_, spark_expert_budget_,
+                                             w, &err)) {
         std::fprintf(stderr, "[spark] bootstrap placement build failed: %s\n", err.c_str());
         return false;
     }
-    if (!rebuild_hybrid_from_placement(placement, err)) {
+    if (!rebuild_hybrid_from_placement(
+            last_expert_split_state_.materialization.primary_placement,
+            &last_expert_split_state_.materialization, err)) {
         std::fprintf(stderr, "[spark] bootstrap storage rebuild failed: %s\n", err.c_str());
         return false;
     }
@@ -342,14 +480,14 @@ bool Qwen35MoeBackend::post_kvflash_init_gate() {
     if (!kvflash_active()) return true;
 
     bool should_disable = false;
-    if (placement_all_hot_full_kv_) {
-        should_disable = true;
-    } else if (target_weights().moe_hybrid) {
+    if (target_weights().moe_hybrid) {
         int total_cold = 0;
         for (const auto & ls : target_weights().moe_hybrid->layers) {
             total_cold += (int)ls.cold_expert_ids.size();
         }
-        if (total_cold == 0) should_disable = true;  // hybrid built but 0 cold
+        if (total_cold == 0 && placement_all_hot_full_kv_) {
+            should_disable = true;
+        }
     }
 
     if (should_disable) {
@@ -420,8 +558,10 @@ bool Qwen35MoeBackend::run_ar_decode_path(int committed, int n_gen,
 bool Qwen35MoeBackend::ensure_pipe_state(int kv_start) {
     if (pipe_state_ && pipe_state_->valid()) return true;
     pipe_state_ = std::make_unique<PipelinedDecodeState>();
-    if (!init_pipelined_decode_state(*pipe_state_, target_backend(), target_weights(),
+    if (!init_pipelined_decode_state(*pipe_state_, target_backend(), cfg_.target_path,
+                                     target_weights(),
                                      target_cache(), *target_weights().moe_hybrid,
+                                     &last_expert_split_state_.compute_runtime,
                                      kv_start, cfg_.kq_stride_pad)) {
         pipe_state_.reset();
         return false;
@@ -771,6 +911,12 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
     const int prompt_len = (int)req.prompt.size();
     const int prefill_chunk = std::min(128, prompt_len); // batch size per GPU compute
 
+    if (!ensure_pipe_state(/*kv_start=*/0)) {
+        result.error = "pipe_state_init";
+        cleanup_graphs();
+        return result;
+    }
+
     // kvflash: hybrid prefill writes rows identity-mapped, so the prompt must
     // fit the pool with one chunk of decode headroom (same contract as the
     // base do_prefill).
@@ -927,7 +1073,9 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                         chunk_selected.data(),
                         chunk_weights.data(),
                         chunk_len, ffn_batch_out, &result.error,
-                        &ffn_hot_alloc, &ffn_cold_alloc);
+                        &ffn_hot_alloc, &ffn_cold_alloc,
+                        pipe_state_ ? pipe_state_->moe_expert_compute : nullptr,
+                        pipe_state_ ? pipe_state_->moe_expert_layers.data() + (size_t)il : nullptr);
             } else if (storage.all_routed_are_hot(chunk_selected.data(),
                                                    chunk_len * n_expert_used)) {
                 // All selected experts happen to be in VRAM — pure GPU, no CPU
@@ -959,7 +1107,9 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                         chunk_selected.data(),
                         chunk_weights.data(),
                         chunk_len, ffn_batch_out, &result.error,
-                        &ffn_hot_alloc, &ffn_cold_alloc);
+                        &ffn_hot_alloc, &ffn_cold_alloc,
+                        pipe_state_ ? pipe_state_->moe_expert_compute : nullptr,
+                        pipe_state_ ? pipe_state_->moe_expert_layers.data() + (size_t)il : nullptr);
             }
             if (!ffn_ok) {
                 // Per-token fallback (avoids sm_75 mul_mat_id assertion with cold experts)
@@ -1760,7 +1910,9 @@ bool Qwen35MoeBackend::hybrid_forward_batch(
                 target_backend(), target_weights().moe_hybrid->cpu_backend,
                 chunk_cfg, chunk_desc, storage,
                 chunk_post.data(), chunk_selected.data(), chunk_weights.data(),
-                n_tokens, ffn_batch_out, nullptr, &ffn_hot_alloc, nullptr);
+                n_tokens, ffn_batch_out, nullptr, &ffn_hot_alloc, nullptr,
+                pipe_state_ ? pipe_state_->moe_expert_compute : nullptr,
+                pipe_state_ ? pipe_state_->moe_expert_layers.data() + (size_t)il : nullptr);
         }
 
         if (!ffn_ok) {
@@ -2268,12 +2420,10 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
     layer_expert_bytes_  = layer_expert_bytes;
 
     // Build placement using greedy knapsack with byte budget
-    if (!MoeHybridPlacement::build_from_stats_with_layer_bytes(
-            hotness, layer_expert_bytes, expert_budget,
-            /*min_hot_per_layer=*/std::min(w.n_expert_used, w.n_expert),
-            out, err)) {
+    if (!build_expert_split_state_from_stats(hotness, expert_budget, w, err)) {
         return false;
     }
+    out = last_expert_split_state_.materialization.primary_placement;
 
     std::printf("[qwen35moe] dynamic placement result: %d hot experts, %d cold experts\n",
                 out.total_hot, w.n_layer * w.n_expert - out.total_hot);

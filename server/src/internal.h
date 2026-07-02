@@ -160,6 +160,10 @@ struct TargetWeights {
 
     // Metadata from GGUF (validated at load time)
     int full_attention_interval = 4;
+    // Per-layer structural type derived from tensor presence. This preserves
+    // the historical modulo pattern for older qwen35 models while supporting
+    // layouts such as 49-layer qwen35moe with consecutive tail attention.
+    std::vector<uint8_t> full_attention_layers;
     int rope_sections[4]        = {11, 11, 10, 0};
     int n_embd_head_k           = 256;  // key_length
     int n_embd_head_v           = 256;  // value_length
@@ -202,6 +206,46 @@ struct TargetWeights {
     int n_capture_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;
     int capture_layer_ids[DFLASH27B_DRAFT_N_TARGET_LAYERS] = {1, 16, 31, 46, 61};
 };
+
+inline bool qwen35_layer_is_full_attention(const TargetWeights & w, int layer_idx) {
+    if (layer_idx < 0 || layer_idx >= w.n_layer) return false;
+    if ((int)w.full_attention_layers.size() == w.n_layer) {
+        return w.full_attention_layers[(size_t)layer_idx] != 0;
+    }
+    return w.full_attention_interval > 0 &&
+        (((layer_idx + 1) % w.full_attention_interval) == 0);
+}
+
+inline int qwen35_count_full_attention_layers(const TargetWeights & w) {
+    if ((int)w.full_attention_layers.size() == w.n_layer) {
+        int count = 0;
+        for (uint8_t v : w.full_attention_layers) {
+            if (v) ++count;
+        }
+        return count;
+    }
+    return w.full_attention_interval > 0 ? w.n_layer / w.full_attention_interval : 0;
+}
+
+inline int qwen35_count_deltanet_layers(const TargetWeights & w) {
+    return w.n_layer - qwen35_count_full_attention_layers(w);
+}
+
+inline int qwen35_full_attention_index(const TargetWeights & w, int layer_idx) {
+    int index = 0;
+    for (int il = 0; il < layer_idx; ++il) {
+        if (qwen35_layer_is_full_attention(w, il)) ++index;
+    }
+    return index;
+}
+
+inline int qwen35_deltanet_index(const TargetWeights & w, int layer_idx) {
+    int index = 0;
+    for (int il = 0; il < layer_idx; ++il) {
+        if (!qwen35_layer_is_full_attention(w, il)) ++index;
+    }
+    return index;
+}
 
 // Check if a token is an end-of-sequence marker for the given target weights.
 inline bool is_eos_tok(int tok, const TargetWeights & w) {

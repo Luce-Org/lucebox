@@ -106,8 +106,8 @@ bool create_target_cache_partial(const TargetWeights & w,
         max_verify_tokens = DFLASH27B_DRAFT_BLOCK_SIZE;
     }
 
-    const int n_full_attn = w.n_layer / w.full_attention_interval; // 16
-    const int n_delta     = w.n_layer - n_full_attn;               // 48
+    const int n_full_attn = qwen35_count_full_attention_layers(w);
+    const int n_delta     = qwen35_count_deltanet_layers(w);
     const int head_dim    = w.n_embd_head_k;
     const int head_v_dim  = w.ssm_d_inner / w.ssm_dt_rank;
     const int conv_ch     = w.ssm_d_inner + 2 * w.ssm_n_group * w.ssm_d_state;
@@ -156,7 +156,7 @@ bool create_target_cache_partial(const TargetWeights & w,
 
         int fa_idx = 0, dn_idx = 0;
         for (int il = 0; il < w.n_layer; il++) {
-            const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
+            const bool is_attn = qwen35_layer_is_full_attention(w, il);
             const bool owns_layer = il >= layer_begin && il < layer_end;
             if (is_attn) {
                 if (!owns_layer) { fa_idx++; continue; }
@@ -227,7 +227,7 @@ bool create_target_cache_partial(const TargetWeights & w,
 
         int dn_idx = 0;
         for (int il = 0; il < w.n_layer; il++) {
-            if (((il + 1) % w.full_attention_interval) != 0) {
+            if (!qwen35_layer_is_full_attention(w, il)) {
                 const bool owns_layer = il >= layer_begin && il < layer_end;
                 if (!owns_layer) { dn_idx++; continue; }
                 ggml_tensor * Sn = ggml_new_tensor_3d(out.rollback_ctx, GGML_TYPE_F32,
@@ -379,7 +379,7 @@ bool migrate_prefill_cache(const TargetWeights & w,
 
     int dn_idx = 0;
     for (int il = 0; il < w.n_layer; il++) {
-        if (((il + 1) % w.full_attention_interval) != 0) {
+        if (!qwen35_layer_is_full_attention(w, il)) {
             ggml_tensor * Sn = ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,
                                                    head_v_dim, head_v_dim, w.ssm_dt_rank);
             ggml_tensor * Cn = ggml_new_tensor_2d(cache.rollback_ctx, GGML_TYPE_F32,
@@ -1050,7 +1050,7 @@ static ggml_tensor * build_single_layer(
     const int hidden = w.n_embd;
     const float eps   = w.rms_eps;
     const TargetLayer & L = w.layers[layer_idx];
-    const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
+    const bool is_attn = qwen35_layer_is_full_attention(w, layer_idx);
 
     const int * CAPTURE_LAYERS = w.capture_layer_ids;
     const int N_CAPTURE = w.n_capture_layers;
@@ -1060,10 +1060,7 @@ static ggml_tensor * build_single_layer(
     ggml_tensor * cur   = rms_norm_mul(ctx, inp_f32, L.attn_norm, eps);
 
     if (is_attn) {
-        int fa_idx = 0;
-        for (int il = 0; il < layer_idx; il++) {
-            if (((il + 1) % w.full_attention_interval) == 0) fa_idx++;
-        }
+        const int fa_idx = qwen35_full_attention_index(w, layer_idx);
         cur = build_full_attn_block(ctx, gf, w, L, cur, positions, w.rope_sections,
                                     cache.attn_k[fa_idx], cache.attn_v[fa_idx],
                                     attn_mask, kv_start, n_tokens,
@@ -1073,10 +1070,7 @@ static ggml_tensor * build_single_layer(
                                     q_tail_capture, q_tail_start,
                                     kv_write_rows);
     } else {
-        int dn_idx = 0;
-        for (int il = 0; il < layer_idx; il++) {
-            if (((il + 1) % w.full_attention_interval) != 0) dn_idx++;
-        }
+        const int dn_idx = qwen35_deltanet_index(w, layer_idx);
         cur = build_delta_net_block(ctx, gf, w, L, cur,
                                     cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
                                     n_tokens, nullptr, nullptr,
@@ -1155,8 +1149,7 @@ QwenGraphOutputs build_qwen35_graph(
     // net layer count so we can index by dn_idx as we iterate the layers.
     QwenGraphOutputs og_early{};
     if (in.capture_delta_intermediate) {
-        const int n_full_attn = w.n_layer / w.full_attention_interval;
-        const int n_delta     = w.n_layer - n_full_attn;
+        const int n_delta = qwen35_count_deltanet_layers(w);
         og_early.delta_captures.resize(n_delta);
     }
     if (in.capture_moe_router && w.is_moe) {
@@ -1172,7 +1165,7 @@ QwenGraphOutputs build_qwen35_graph(
 
     for (int il = 0; il < w.n_layer; il++) {
         const TargetLayer & L = w.layers[il];
-        const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
+        const bool is_attn = qwen35_layer_is_full_attention(w, il);
 
         ggml_tensor * inp_f32 = graph_tensor_f32(ctx, inpL);
         ggml_tensor * inpSA = inp_f32;
@@ -1384,17 +1377,14 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
     QwenLayerPrefnOutputs out{};
     const float eps = w.rms_eps;
     const TargetLayer & L = w.layers[layer_idx];
-    const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
+    const bool is_attn = qwen35_layer_is_full_attention(w, layer_idx);
 
     ggml_tensor * inp_f32 = graph_tensor_f32(ctx, inp);
     ggml_tensor * inpSA = inp_f32;
     ggml_tensor * cur   = rms_norm_mul(ctx, inp_f32, L.attn_norm, eps);
 
     if (is_attn) {
-        int fa_idx = 0;
-        for (int il = 0; il < layer_idx; il++) {
-            if (((il + 1) % w.full_attention_interval) == 0) fa_idx++;
-        }
+        const int fa_idx = qwen35_full_attention_index(w, layer_idx);
         cur = build_full_attn_block(ctx, gf, w, L, cur, positions, w.rope_sections,
                                     cache.attn_k[fa_idx], cache.attn_v[fa_idx],
                                     attn_mask, kv_start, n_tokens,
@@ -1404,10 +1394,7 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
                                     /*q_tail_capture=*/nullptr, /*q_tail_start=*/0,
                                     kv_write_rows);
     } else {
-        int dn_idx = 0;
-        for (int il = 0; il < layer_idx; il++) {
-            if (((il + 1) % w.full_attention_interval) != 0) dn_idx++;
-        }
+        const int dn_idx = qwen35_deltanet_index(w, layer_idx);
         cur = build_delta_net_block(ctx, gf, w, L, cur,
                                     cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
                                     n_tokens, nullptr, nullptr,
@@ -1431,8 +1418,8 @@ bool snapshot_target_cache(const TargetWeights & w,
                            const TargetCache & cache,
                            ggml_backend_t backend,
                            PrefixSnapshot & snap) {
-    const int n_full_attn = w.n_layer / w.full_attention_interval; // 16
-    const int n_delta     = w.n_layer - n_full_attn;               // 48
+    const int n_full_attn = qwen35_count_full_attention_layers(w);
+    const int n_delta     = qwen35_count_deltanet_layers(w);
     const int snap_pos    = cache.cur_pos;
 
     if (snap_pos <= 0) {
@@ -1676,7 +1663,7 @@ bool snapshot_target_cache_thin(const TargetWeights & w,
         set_last_error("snapshot_thin: kv_end exceeds cache.cur_pos (would capture uninitialized KV)");
         return false;
     }
-    const int n_full_attn = w.n_layer / w.full_attention_interval;
+    const int n_full_attn = qwen35_count_full_attention_layers(w);
     const int block_size  = kv_end - kv_start;
 
     // Lazy alloc; if snap was already a THIN with same range, reuse.

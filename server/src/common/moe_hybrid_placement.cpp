@@ -1,4 +1,5 @@
 #include "moe_hybrid_placement.h"
+#include "expert_split_plan.h"
 #include "moe_hybrid_routing_stats.h"
 
 #include <nlohmann/json.hpp>
@@ -8,6 +9,57 @@
 #include <numeric>
 
 namespace dflash::common {
+
+namespace {
+
+bool build_plan_from_stats_with_layer_bytes(
+    const MoeHybridRoutingStats & stats,
+    const std::vector<uint64_t> & layer_expert_bytes,
+    uint64_t total_hot_budget_bytes,
+    int min_hot_per_layer,
+    ExpertSplitPlan & out,
+    std::string * err) {
+    if (stats.empty() || stats.n_layer <= 0 || stats.n_expert <= 0) {
+        if (err) *err = "stats not initialized";
+        return false;
+    }
+    if ((int) layer_expert_bytes.size() != stats.n_layer) {
+        if (err) *err = "layer_expert_bytes size mismatch";
+        return false;
+    }
+    if (total_hot_budget_bytes == 0) {
+        if (err) *err = "total_hot_budget_bytes must be > 0";
+        return false;
+    }
+
+    ExpertSplitConfig cfg;
+    cfg.n_layer = stats.n_layer;
+    cfg.n_expert = stats.n_expert;
+    cfg.allow_implicit_cpu_fallback = true;
+    cfg.require_full_grid = true;
+    cfg.min_per_layer_by_target = {std::max(0, std::min(min_hot_per_layer, stats.n_expert))};
+
+    std::vector<ExpertSplitTarget> targets = {
+        {"hot", "gpu", 0, total_hot_budget_bytes, 0, false},
+    };
+
+    std::vector<ExpertSplitUnit> units;
+    units.reserve((size_t) stats.n_layer * (size_t) stats.n_expert);
+    for (int il = 0; il < stats.n_layer; ++il) {
+        for (int ie = 0; ie < stats.n_expert; ++ie) {
+            units.push_back(ExpertSplitUnit{
+                il,
+                ie,
+                layer_expert_bytes[(size_t) il],
+                (double) stats.count(il, ie),
+            });
+        }
+    }
+
+    return build_expert_split_plan(cfg, targets, units, out, err);
+}
+
+}  // namespace
 
 bool MoeHybridPlacement::matches(int n_layer_, int n_expert_, int n_expert_used_) const {
     return n_layer == n_layer_ &&
@@ -182,80 +234,46 @@ bool MoeHybridPlacement::build_from_stats_with_layer_bytes(
     int min_hot_per_layer,
     MoeHybridPlacement & out,
     std::string * err) {
-    if (stats.empty() || stats.n_layer <= 0 || stats.n_expert <= 0) {
-        if (err) *err = "stats not initialized";
-        return false;
-    }
-    if ((int)layer_expert_bytes.size() != stats.n_layer) {
-        if (err) *err = "layer_expert_bytes size mismatch";
-        return false;
-    }
     if (min_hot_per_layer < 0) min_hot_per_layer = 0;
-    if (total_hot_budget_bytes == 0) {
-        if (err) *err = "total_hot_budget_bytes must be > 0";
+
+    ExpertSplitPlan plan;
+    if (!build_plan_from_stats_with_layer_bytes(
+            stats, layer_expert_bytes, total_hot_budget_bytes,
+            min_hot_per_layer, plan, err)) {
         return false;
     }
 
-    const int per_layer_floor = std::min(min_hot_per_layer, stats.n_expert);
-    uint64_t floor_bytes = 0;
-    for (int il = 0; il < stats.n_layer; ++il) {
-        if (layer_expert_bytes[(size_t)il] > 0)
-            floor_bytes += (uint64_t)per_layer_floor * layer_expert_bytes[(size_t)il];
-    }
-    if (floor_bytes > total_hot_budget_bytes) {
-        if (err) *err = "min_hot_per_layer exceeds byte budget";
-        return false;
-    }
-
+    const int hot_target_index = 0;
     MoeHybridPlacement tmp;
     tmp.n_layer = stats.n_layer;
     tmp.n_expert = stats.n_expert;
     tmp.n_expert_used = stats.n_expert_used;
-    tmp.hot_counts.resize((size_t)tmp.n_layer);
-    for (int il = 0; il < tmp.n_layer; ++il) {
-        tmp.hot_counts[(size_t)il] = (layer_expert_bytes[(size_t)il] > 0) ? per_layer_floor : 0;
-    }
+    tmp.hot_counts.assign((size_t) tmp.n_layer, 0);
+    tmp.hot_expert_ids.resize((size_t) tmp.n_layer);
 
-    std::vector<std::vector<int>> ranked((size_t)tmp.n_layer);
     for (int il = 0; il < tmp.n_layer; ++il) {
-        ranked[(size_t)il] = stats.ranked_experts(il);
-    }
-
-    uint64_t remaining = total_hot_budget_bytes - floor_bytes;
-    while (true) {
-        int best_layer = -1;
-        double best_value = -1.0;
-        uint64_t best_gain = 0;
-        for (int il = 0; il < tmp.n_layer; ++il) {
-            const int cur_hot = tmp.hot_counts[(size_t)il];
-            if (cur_hot >= tmp.n_expert) continue;
-            const uint64_t bytes = layer_expert_bytes[(size_t)il];
-            if (bytes == 0 || bytes > remaining) continue;
-            const int next_expert = ranked[(size_t)il][(size_t)cur_hot];
-            const uint64_t gain = stats.count(il, next_expert);
-            const double value = (double)gain / (double)bytes;
-            if (best_layer < 0 || value > best_value ||
-                (value == best_value && gain > best_gain)) {
-                best_layer = il;
-                best_value = value;
-                best_gain = gain;
+        std::vector<int> layer_hot;
+        layer_hot.reserve((size_t) tmp.n_expert);
+        for (int ie = 0; ie < tmp.n_expert; ++ie) {
+            if (plan.at(il, ie).target_index == hot_target_index) {
+                layer_hot.push_back(ie);
             }
         }
-        if (best_layer < 0) break;
-        tmp.hot_counts[(size_t)best_layer]++;
-        remaining -= layer_expert_bytes[(size_t)best_layer];
-    }
-
-    tmp.total_hot = std::accumulate(tmp.hot_counts.begin(), tmp.hot_counts.end(), 0);
-    tmp.hot_expert_ids.resize((size_t)tmp.n_layer);
-    for (int il = 0; il < tmp.n_layer; ++il) {
-        const int hot_n = tmp.hot_counts[(size_t)il];
-        auto & hot = tmp.hot_expert_ids[(size_t)il];
-        hot.reserve((size_t)hot_n);
-        for (int i = 0; i < hot_n; ++i) {
-            hot.push_back((int32_t)ranked[(size_t)il][(size_t)i]);
+        std::stable_sort(layer_hot.begin(), layer_hot.end(),
+            [&](int lhs, int rhs) {
+                const uint64_t lc = stats.count(il, lhs);
+                const uint64_t rc = stats.count(il, rhs);
+                if (lc != rc) return lc > rc;
+                return lhs < rhs;
+            });
+        tmp.hot_counts[(size_t) il] = (int) layer_hot.size();
+        auto & hot = tmp.hot_expert_ids[(size_t) il];
+        hot.reserve(layer_hot.size());
+        for (int expert : layer_hot) {
+            hot.push_back((int32_t) expert);
         }
     }
+    tmp.total_hot = std::accumulate(tmp.hot_counts.begin(), tmp.hot_counts.end(), 0);
 
     out = std::move(tmp);
     return true;
