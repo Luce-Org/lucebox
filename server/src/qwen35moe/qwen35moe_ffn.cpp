@@ -11,7 +11,8 @@ Qwen35MoeRouterOutputs build_qwen35moe_router(
     ggml_context *        ctx,
     ggml_tensor *         cur,
     const TargetWeights & w,
-    const TargetLayer &   L) {
+    const TargetLayer &   L,
+    bool                  allow_fused_router) {
     const int n_tokens = (int)cur->ne[1];
     const int n_expert = w.n_expert;
     const int n_used   = w.n_expert_used;
@@ -35,7 +36,7 @@ Qwen35MoeRouterOutputs build_qwen35moe_router(
     // x30 MoE layers (the launch-bound decode gap vs llama, which uses argsort_top_k).
     // Same top-k selection -> bit-identical. DFLASH_NO_MOE_ROUTER_FUSE=1 = old path.
     static const bool router_fuse = (std::getenv("DFLASH_NO_MOE_ROUTER_FUSE") == nullptr);
-    ggml_tensor * selected = router_fuse
+    ggml_tensor * selected = (router_fuse && allow_fused_router)
         ? ggml_argsort_top_k(ctx, probs, n_used)
         : ggml_top_k(ctx, probs, n_used);
 

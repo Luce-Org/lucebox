@@ -1417,7 +1417,13 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
     out.residual = cur;
     out.post = rms_norm_mul(ctx, cur, L.attn_post_norm, eps);
     if (w.is_moe) {
-        Qwen35MoeRouterOutputs router = build_qwen35moe_router(ctx, out.post, w, L);
+        // selected/weights are read back by the host (hybrid hot/cold expert
+        // compute), not consumed in-graph. argsort_top_k yields a strided view
+        // whose raw packed readback returns garbage ids for tokens > 0 (crash
+        // in expert dispatch on the first multi-token prefill); top_k is
+        // contiguous, and cheaper than a full argsort here.
+        Qwen35MoeRouterOutputs router = build_qwen35moe_router(
+            ctx, out.post, w, L, /*allow_fused_router=*/false);
         out.moe_selected = router.selected;
         out.moe_weights = router.weights;
     }
