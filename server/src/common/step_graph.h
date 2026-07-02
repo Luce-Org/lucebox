@@ -21,6 +21,12 @@ struct StepGraph {
     ggml_cgraph *   gf  = nullptr;
     ggml_gallocr_t  alloc = nullptr;
 
+    // Persistent metadata arena for the draft graph. Reusing the same arena
+    // across rebuilds keeps every ggml_tensor at a stable address, which is
+    // what the ggml-cuda graph cache keys on (nodes[0] pointer + src tensor
+    // pointers). A fresh malloc per step would defeat CUDA-graph replay.
+    std::vector<uint8_t> meta_arena;
+
     // The ctx_len last used for ggml_gallocr_reserve (draft only).
     // When the real ctx_len fits within this, alloc_graph is a no-op.
     int alloc_reserved_ctx = 0;
@@ -32,6 +38,10 @@ struct StepGraph {
     ggml_tensor *   parent_ids = nullptr;    // DDTree tree-mode; null for chain mode
     ggml_tensor *   target_hidden_cat = nullptr;  // draft only
     ggml_tensor *   positions_k = nullptr;        // draft only
+    ggml_tensor *   pad_mask_full = nullptr;      // draft only; padded-ctx mask
+    // When >0, the draft graph was built with the ctx dimension padded to this
+    // size (stable topology for CUDA-graph replay); noise keys start here.
+    int             ctx_alloc = 0;
     ggml_tensor *   hidden_input = nullptr;        // lm-head projection only
     // [n_tokens,n_head_kv] i64; step-invariant KV write (carries kv_start). Null on non-graph paths.
     ggml_tensor *   kv_write_rows = nullptr;
@@ -59,6 +69,8 @@ inline void step_graph_free(StepGraph & sg) {
     sg.gf = nullptr;
     sg.inp_embed = sg.positions = sg.attn_mask = nullptr;
     sg.target_hidden_cat = sg.positions_k = nullptr;
+    sg.pad_mask_full = nullptr;
+    sg.ctx_alloc = 0;
     sg.hidden_input = nullptr;
     sg.parent_ids = nullptr;
     sg.kv_write_rows = nullptr;
@@ -79,6 +91,9 @@ inline void step_graph_free(StepGraph & sg) {
 inline void step_graph_destroy(StepGraph & sg) {
     if (sg.alloc) { ggml_gallocr_free(sg.alloc); sg.alloc = nullptr; }
     step_graph_free(sg);
+    sg.meta_arena.clear();
+    sg.meta_arena.shrink_to_fit();
+    sg.alloc_reserved_ctx = 0;
 }
 
 }  // namespace dflash::common

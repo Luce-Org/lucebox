@@ -1,12 +1,13 @@
 // Tool call parser implementation.
 //
-// Six detection patterns, tried in order:
+// Seven detection patterns, tried in order:
 // 1. <tool_call><function=NAME>...<parameter=K>V</parameter>...</function></tool_call>
 // 2. <function=NAME>...params...</function>  (bare, outside tool_call)
 // 3. <function=NAME(k="v", ...)></function>  (function-signature style)
 // 4. <tool_code>{JSON}</tool_code>
 // 5. call:<ns>?<verb>{relaxed-JSON args}    (gemma plain-text emissions)
 // 6. Bare JSON objects with name+arguments fields
+// 7. Whole-response JSON args for exactly one declared tool
 //
 // Pattern 5 runs *before* pattern 6 so that args like
 //   call:outer{"name": "inner", "arguments": {}}
@@ -381,6 +382,120 @@ static bool parse_json_tool_call(const json & obj, std::string & out_name, json 
     return true;
 }
 
+static bool is_ws(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+static bool span_covers_non_ws(const std::string & text, size_t start, size_t end) {
+    for (size_t i = 0; i < start; i++) {
+        if (!is_ws(text[i])) return false;
+    }
+    for (size_t i = end; i < text.size(); i++) {
+        if (!is_ws(text[i])) return false;
+    }
+    return true;
+}
+
+static const json * single_tool_function(const json & tools) {
+    if (!tools.is_array() || tools.size() != 1) return nullptr;
+    const auto & t = tools[0];
+    if (!t.is_object()) return nullptr;
+    if (t.contains("function") && t["function"].is_object()) return &t["function"];
+    return &t;
+}
+
+static const json * tool_input_schema(const json & fn) {
+    if (fn.contains("parameters") && fn["parameters"].is_object()) {
+        return &fn["parameters"];
+    }
+    if (fn.contains("input_schema") && fn["input_schema"].is_object()) {
+        return &fn["input_schema"];
+    }
+    return nullptr;
+}
+
+static bool value_matches_type(const json & value, const std::string & type) {
+    if (type == "string" || type == "str") return value.is_string();
+    if (type == "integer" || type == "int") return value.is_number_integer();
+    if (type == "number" || type == "float") return value.is_number();
+    if (type == "boolean" || type == "bool") return value.is_boolean();
+    if (type == "object") return value.is_object();
+    if (type == "array") return value.is_array();
+    if (type == "null") return value.is_null();
+    return true;
+}
+
+static bool value_matches_type_spec(const json & value, const json & spec) {
+    if (spec.is_string()) return value_matches_type(value, spec.get<std::string>());
+    if (spec.is_array()) {
+        for (const auto & t : spec) {
+            if (t.is_string() && value_matches_type(value, t.get<std::string>())) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool object_matches_tool_schema(const json & obj, const json * schema) {
+    if (!obj.is_object()) return false;
+    if (!schema) return !obj.empty();
+    if (schema->contains("type") &&
+        !value_matches_type_spec(obj, (*schema)["type"])) {
+        return false;
+    }
+
+    const json * props = nullptr;
+    if (schema->contains("properties") && (*schema)["properties"].is_object()) {
+        props = &(*schema)["properties"];
+    }
+
+    bool has_required = false;
+    if (schema->contains("required") && (*schema)["required"].is_array()) {
+        for (const auto & key_json : (*schema)["required"]) {
+            if (!key_json.is_string()) continue;
+            has_required = true;
+            std::string key = key_json.get<std::string>();
+            if (!obj.contains(key)) return false;
+        }
+    }
+
+    const bool additional_forbidden =
+        schema->contains("additionalProperties") &&
+        (*schema)["additionalProperties"].is_boolean() &&
+        !(*schema)["additionalProperties"].get<bool>();
+
+    bool saw_declared_key = false;
+    for (auto it = obj.begin(); it != obj.end(); ++it) {
+        const bool declared = props && props->contains(it.key());
+        if (!declared) {
+            if (additional_forbidden) return false;
+            continue;
+        }
+        saw_declared_key = true;
+        const auto & prop_schema = (*props)[it.key()];
+        if (prop_schema.is_object() && prop_schema.contains("type") &&
+            !value_matches_type_spec(it.value(), prop_schema["type"])) {
+            return false;
+        }
+    }
+
+    return has_required || saw_declared_key || obj.empty() ||
+           props == nullptr || props->empty();
+}
+
+static bool parse_single_tool_arg_object(const json & obj, const json & tools,
+                                         std::string & out_name, json & out_args) {
+    const json * fn = single_tool_function(tools);
+    if (!fn || !fn->contains("name") || !(*fn)["name"].is_string()) return false;
+    const json * schema = tool_input_schema(*fn);
+    if (!object_matches_tool_schema(obj, schema)) return false;
+    out_name = (*fn)["name"].get<std::string>();
+    out_args = obj;
+    return true;
+}
+
 // ─── Function signature parser ──────────────────────────────────────────
 
 // Parse key=value pairs from `<function=name(k="v", k2=123)></function>`.
@@ -627,6 +742,9 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             std::string name;
             json args;
             if (parse_json_tool_call(obj2, name, args)) {
+                add_call(name, args, start, end_pos);
+            } else if (span_covers_non_ws(text, start, end_pos) &&
+                       parse_single_tool_arg_object(obj2, tools, name, args)) {
                 add_call(name, args, start, end_pos);
             }
             cursor = end_pos;

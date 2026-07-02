@@ -68,6 +68,14 @@ struct LagunaTargetLayer {
     ggml_tensor * ffn_gate_shexp   = nullptr;  // [n_embd, n_ff_shexp]    shared expert gate
     ggml_tensor * ffn_up_shexp     = nullptr;  // [n_embd, n_ff_shexp]    shared expert up
     ggml_tensor * ffn_down_shexp   = nullptr;  // [n_ff_shexp, n_embd]    shared expert down
+
+    // Fused views over ADJACENT weight pairs (the loader lays q|k and
+    // gate_shexp|up_shexp out back-to-back and binds one tensor over both
+    // regions; zero extra VRAM). Null when the pair could not be fused
+    // (type mismatch / DFLASH_LAGUNA_FUSED_QK=0). Same data as wq/wk etc.
+    ggml_tensor * wqk       = nullptr;  // [n_embd, (n_head+n_head_kv)*head_dim]
+    ggml_tensor * shexp_gu  = nullptr;  // [n_embd, 2*n_ff_shexp]  gate rows then up rows
+    ggml_tensor * qk_norm_f = nullptr;  // [head_dim, n_head+n_head_kv] f32, q_norm|k_norm per head
 };
 
 struct LagunaTargetWeights {
@@ -83,6 +91,11 @@ struct LagunaTargetWeights {
     std::vector<LagunaTargetLayer> layers;   // size = n_layer
     ggml_tensor * out_norm = nullptr;        // [n_embd]
     ggml_tensor * output   = nullptr;        // [n_embd, n_vocab]  (lm_head)
+
+    // Metadata contexts/buffer for the fused-weight views (see LagunaTargetLayer).
+    ggml_context *        fuse_ctx      = nullptr;
+    ggml_context *        fuse_norm_ctx = nullptr;
+    ggml_backend_buffer_t fuse_norm_buf = nullptr;
 
     // Architecture metadata (validated at load time).
     int  n_layer              = 40;

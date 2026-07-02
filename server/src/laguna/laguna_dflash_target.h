@@ -50,6 +50,10 @@ public:
 
     bool is_eos(int token) const override;
 
+    ggml_tensor *  lm_head_tensor() override;
+    ggml_tensor *  gpu_embd_table() override;
+    ggml_backend_t fused_head_backend() override;
+
     bool embed_tokens(const int32_t * tokens, int n,
                       float * out) const override;
 
@@ -77,6 +81,15 @@ private:
     LagunaTargetCache & cache_;
     ggml_backend_t backend_;
     class KvFlashPager * pager_ = nullptr;
+
+    // Lazily-built f16 GPU copy of the token embedding table + a dedicated
+    // CUDA backend instance for the fused domino head (own instance so the
+    // ggml-cuda graph cache is not shared with the verify graphs).
+    ggml_context *         embd_gpu_ctx_ = nullptr;
+    ggml_backend_buffer_t  embd_gpu_buf_ = nullptr;
+    ggml_tensor *          embd_gpu_     = nullptr;
+    bool                   embd_gpu_failed_ = false;
+    ggml_backend_t         fused_backend_   = nullptr;
     std::vector<int> capture_ids_;
     LagunaCacheSnapshot verify_snap_;
     bool keep_verify_logits_ = false;

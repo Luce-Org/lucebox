@@ -179,4 +179,144 @@ bool domino_correct_greedy_chain(const DraftWeights & dw,
     return true;
 }
 
+bool domino_correct_greedy_chain_fused(const DraftWeights & dw,
+                                       ggml_backend_t backend,
+                                       ggml_tensor * lm_head,
+                                       ggml_tensor * embd_table,
+                                       const float * local_hidden,
+                                       int q_len,
+                                       int32_t last_tok,
+                                       std::vector<int32_t> & draft_tok) {
+    if (!dw.domino.enabled || q_len <= 1 || !local_hidden ||
+        !backend || !lm_head || !embd_table) {
+        return false;
+    }
+    const int hidden = dw.n_embd;
+    const int H      = dw.domino.gru_hidden_dim;
+    const int E      = dw.domino.emb_dim;
+    const int n_cand = q_len - 1;
+    const int vocab  = (int)lm_head->ne[1];
+    if (hidden <= 0 || H <= 0 || E <= 0 || vocab <= 0) return false;
+    if (dw.domino.vocab_size > 0 && vocab != dw.domino.vocab_size) {
+        static bool s_vocab_warned = false;
+        if (!s_vocab_warned) {
+            s_vocab_warned = true;
+            std::fprintf(stderr,
+                "domino_fused: vocab mismatch lm_head=%d domino=%d; falling back\n",
+                vocab, dw.domino.vocab_size);
+        }
+        return false;
+    }
+
+    static const bool zero_start = std::getenv("DFLASH_DOMINO_ZERO_START") != nullptr;
+
+    const size_t arena_size = ggml_tensor_overhead() * (size_t)(96 + 48 * n_cand) +
+                              ggml_graph_overhead_custom(1024, false) + 4 * 1024 * 1024;
+    static thread_local std::vector<uint8_t> g_arena_fused;
+    if (g_arena_fused.size() < arena_size) g_arena_fused.resize(arena_size);
+
+    ggml_init_params ip{};
+    ip.mem_size   = g_arena_fused.size();
+    ip.mem_buffer = g_arena_fused.data();
+    ip.no_alloc   = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 1024, false);
+
+    ggml_tensor * inp_hidden = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, n_cand);
+    ggml_tensor * inp_seed   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_input(inp_hidden);
+    ggml_set_input(inp_seed);
+
+    // Base logits for every candidate in one matmul: [vocab, n_cand].
+    ggml_tensor * base = ggml_mul_mat(ctx, lm_head, inp_hidden);
+
+    ggml_tensor * state = ggml_reshape_2d(ctx, dw.domino.start, H, 1);
+    if (zero_start) state = ggml_scale(ctx, state, 0.0f);
+    ggml_tensor * prev_embed = ggml_get_rows(ctx, embd_table, inp_seed);  // [hidden,1] f32
+    ggml_set_name(prev_embed, "dom_embed_seed");
+
+    std::vector<ggml_tensor *> toks((size_t)n_cand, nullptr);
+    for (int i = 0; i < n_cand; ++i) {
+        ggml_tensor * gi = ggml_mul_mat(ctx, dw.domino.gru_w_ih, prev_embed);
+        gi = ggml_add(ctx, gi, ggml_reshape_2d(ctx, dw.domino.gru_b_ih, 3 * H, 1));
+        ggml_tensor * gh = ggml_mul_mat(ctx, dw.domino.gru_w_hh, state);
+        gh = ggml_add(ctx, gh, ggml_reshape_2d(ctx, dw.domino.gru_b_hh, 3 * H, 1));
+
+        const size_t gate_bytes = (size_t)H * ggml_element_size(gi);
+        ggml_tensor * i_r = ggml_view_2d(ctx, gi, H, 1, gi->nb[1], 0);
+        ggml_tensor * i_z = ggml_view_2d(ctx, gi, H, 1, gi->nb[1], gate_bytes);
+        ggml_tensor * i_n = ggml_view_2d(ctx, gi, H, 1, gi->nb[1], 2 * gate_bytes);
+        ggml_tensor * h_r = ggml_view_2d(ctx, gh, H, 1, gh->nb[1], 0);
+        ggml_tensor * h_z = ggml_view_2d(ctx, gh, H, 1, gh->nb[1], gate_bytes);
+        ggml_tensor * h_n = ggml_view_2d(ctx, gh, H, 1, gh->nb[1], 2 * gate_bytes);
+
+        ggml_tensor * reset  = ggml_sigmoid(ctx, ggml_add(ctx, i_r, h_r));
+        ggml_tensor * update = ggml_sigmoid(ctx, ggml_add(ctx, i_z, h_z));
+        ggml_tensor * cand   = ggml_tanh(ctx, ggml_add(ctx, i_n, ggml_mul(ctx, reset, h_n)));
+        ggml_tensor * h_new  = ggml_add(ctx, cand,
+                                        ggml_mul(ctx, update,
+                                                 ggml_sub(ctx, state, cand)));
+
+        ggml_tensor * hid_i = ggml_view_2d(ctx, inp_hidden, hidden, 1,
+                                           inp_hidden->nb[1],
+                                           (size_t)i * inp_hidden->nb[1]);
+        ggml_tensor * zcat = ggml_concat(ctx, hid_i, h_new, 0);
+        ggml_tensor * bias = ggml_mul_mat(ctx, dw.domino.head_w1, zcat);
+        bias = ggml_add(ctx, bias, ggml_reshape_2d(ctx, dw.domino.head_b1, E, 1));
+        bias = ggml_silu(ctx, bias);
+        bias = ggml_mul_mat(ctx, dw.domino.head_w2, bias);
+        bias = ggml_add(ctx, bias, ggml_reshape_2d(ctx, dw.domino.head_b2, vocab, 1));
+
+        ggml_tensor * base_i = ggml_view_2d(ctx, base, vocab, 1,
+                                            base->nb[1], (size_t)i * base->nb[1]);
+        ggml_tensor * corrected = ggml_add(ctx, base_i, bias);
+        ggml_tensor * tok = ggml_argmax(ctx, corrected);
+        ggml_set_output(tok);
+        ggml_build_forward_expand(gf, tok);
+        toks[(size_t)i] = tok;
+
+        if (i + 1 < n_cand) {
+            prev_embed = ggml_get_rows(ctx, embd_table, tok);
+            ggml_set_name(prev_embed, "dom_embed_tok");
+        }
+        state = h_new;
+    }
+
+    static thread_local ggml_gallocr_t galloc_fused = nullptr;
+    if (!galloc_fused) {
+        galloc_fused = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    if (!ggml_gallocr_alloc_graph(galloc_fused, gf)) {
+        std::fprintf(stderr, "domino_fused: gallocr_alloc_graph failed\n");
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_set(inp_hidden, local_hidden + (size_t)hidden, 0,
+                            sizeof(float) * (size_t)hidden * (size_t)n_cand);
+    ggml_backend_tensor_set(inp_seed, &last_tok, 0, sizeof(int32_t));
+
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "domino_fused: graph_compute failed\n");
+        ggml_free(ctx);
+        return false;
+    }
+
+    draft_tok.assign((size_t)q_len, 0);
+    draft_tok[0] = last_tok;
+    // One synchronize instead of n_cand blocking readbacks.
+    int32_t t_out[16];
+    const int n_get = n_cand < 16 ? n_cand : 16;
+    for (int i = 0; i < n_get; ++i) {
+        ggml_backend_tensor_get_async(backend, toks[(size_t)i], &t_out[i], 0, sizeof(int32_t));
+    }
+    ggml_backend_synchronize(backend);
+    for (int i = 0; i < n_get; ++i) {
+        draft_tok[(size_t)i + 1] = t_out[i];
+    }
+    ggml_free(ctx);
+    return true;
+}
+
 }  // namespace dflash::common

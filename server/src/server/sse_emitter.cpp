@@ -23,6 +23,17 @@ static bool has_request_tools(const json & tools) {
     return tools.is_array() && !tools.empty();
 }
 
+static bool has_single_request_tool(const json & tools) {
+    return tools.is_array() && tools.size() == 1 && tools[0].is_object();
+}
+
+static bool starts_with_potential_bare_json_tool(const std::string & text,
+                                                 const json & tools) {
+    if (!has_single_request_tool(tools)) return false;
+    size_t first = text.find_first_not_of(" \t\n\r");
+    return first != std::string::npos && text[first] == '{';
+}
+
 static bool find_tool_start(const std::string & text, size_t & pos) {
     size_t idx = text.find('<');
     while (idx != std::string::npos) {
@@ -418,6 +429,15 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
             continue;
         }
 
+        if (accumulated_content_.find_first_not_of(" \t\n\r") == std::string::npos &&
+            starts_with_potential_bare_json_tool(window_, tools_)) {
+            tool_buffer_ = window_;
+            tool_buffer_fallback_to_content_ = true;
+            window_.clear();
+            mode_ = StreamMode::TOOL_BUFFER;
+            continue;
+        }
+
         // No tags found — emit safe prefix
         if (window_.size() > std::max(BASE_HOLDBACK, stop_holdback_)) {
             size_t cut = utf8_safe_len(window_, window_.size() - std::max(BASE_HOLDBACK, stop_holdback_));
@@ -601,6 +621,9 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                 break;
             default: break;
             }
+        } else if (tool_buffer_fallback_to_content_) {
+            accumulated_content_ += tool_buffer_;
+            emit_content_delta(out, tool_buffer_);
         } else {
             // Tool syntax was detected but no valid call parsed. Do not leak
             // malformed/incomplete XML back to the user as assistant text.

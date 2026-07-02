@@ -21,6 +21,10 @@ struct DraftGraphInputs {
     // Optional: causal mask for SWA layers [kv_pad, q_len] F16.
     // nullptr = all layers non-causal.
     ggml_tensor * causal_mask_swa = nullptr;
+    // Optional: mask for NON-SWA layers [kv_pad, q_len] F16. Used when the
+    // context is padded to a stable allocation size for CUDA-graph replay:
+    // real keys are 0, pad keys are -inf. nullptr = no mask (legacy).
+    ggml_tensor * pad_mask_full = nullptr;
 };
 
 struct DraftGraphOutputs {

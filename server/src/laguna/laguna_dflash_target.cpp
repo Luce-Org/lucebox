@@ -42,6 +42,10 @@ LagunaDFlashTarget::LagunaDFlashTarget(
 
 LagunaDFlashTarget::~LagunaDFlashTarget() {
     laguna_snapshot_free(verify_snap_);
+    if (embd_gpu_buf_) { ggml_backend_buffer_free(embd_gpu_buf_); embd_gpu_buf_ = nullptr; }
+    if (embd_gpu_ctx_) { ggml_free(embd_gpu_ctx_); embd_gpu_ctx_ = nullptr; }
+    embd_gpu_ = nullptr;
+    if (fused_backend_) { ggml_backend_free(fused_backend_); fused_backend_ = nullptr; }
 }
 
 bool LagunaDFlashTarget::verify_batch(
@@ -510,6 +514,68 @@ bool LagunaDFlashTarget::rollback_to_tree(
 
 bool LagunaDFlashTarget::is_eos(int token) const {
     return token == w_.eos_id || token == w_.eos_chat_id;
+}
+
+ggml_tensor * LagunaDFlashTarget::lm_head_tensor() {
+    return w_.output;
+}
+
+ggml_backend_t LagunaDFlashTarget::fused_head_backend() {
+    if (!fused_backend_) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend_);
+        if (dev) fused_backend_ = ggml_backend_dev_init(dev, nullptr);
+    }
+    return fused_backend_ ? fused_backend_ : backend_;
+}
+
+ggml_tensor * LagunaDFlashTarget::gpu_embd_table() {
+    if (embd_gpu_) return embd_gpu_;
+    if (embd_gpu_failed_) return nullptr;
+    const int64_t nv = w_.embedder.n_vocab;
+    const int64_t ne = w_.n_embd;
+    if (nv <= 0 || ne <= 0) { embd_gpu_failed_ = true; return nullptr; }
+
+    ggml_init_params ip{};
+    ip.mem_size   = 2 * ggml_tensor_overhead();
+    ip.no_alloc   = true;
+    embd_gpu_ctx_ = ggml_init(ip);
+    if (!embd_gpu_ctx_) { embd_gpu_failed_ = true; return nullptr; }
+    ggml_tensor * t = ggml_new_tensor_2d(embd_gpu_ctx_, GGML_TYPE_F16, ne, nv);
+    embd_gpu_buf_ = ggml_backend_alloc_ctx_tensors(embd_gpu_ctx_, backend_);
+    if (!embd_gpu_buf_) {
+        std::fprintf(stderr,
+            "[laguna-spec] gpu_embd_table: VRAM alloc failed (%.0f MiB), fused domino disabled\n",
+            (double)nv * (double)ne * 2.0 / (1024.0 * 1024.0));
+        ggml_free(embd_gpu_ctx_); embd_gpu_ctx_ = nullptr;
+        embd_gpu_failed_ = true;
+        return nullptr;
+    }
+
+    const int64_t CH = 4096;
+    std::vector<int32_t>     ids((size_t)CH);
+    std::vector<float>       rows_f32((size_t)CH * (size_t)ne);
+    std::vector<ggml_fp16_t> rows_f16((size_t)CH * (size_t)ne);
+    for (int64_t v0 = 0; v0 < nv; v0 += CH) {
+        const int n = (int)((nv - v0 < CH) ? (nv - v0) : CH);
+        for (int i = 0; i < n; ++i) ids[(size_t)i] = (int32_t)(v0 + i);
+        if (!w_.embedder.embed(ids.data(), n, rows_f32.data())) {
+            std::fprintf(stderr, "[laguna-spec] gpu_embd_table: embed failed\n");
+            ggml_backend_buffer_free(embd_gpu_buf_); embd_gpu_buf_ = nullptr;
+            ggml_free(embd_gpu_ctx_); embd_gpu_ctx_ = nullptr;
+            embd_gpu_failed_ = true;
+            return nullptr;
+        }
+        ggml_fp32_to_fp16_row(rows_f32.data(), rows_f16.data(), (size_t)n * (size_t)ne);
+        ggml_backend_tensor_set(t, rows_f16.data(),
+                                (size_t)v0 * (size_t)ne * sizeof(ggml_fp16_t),
+                                (size_t)n * (size_t)ne * sizeof(ggml_fp16_t));
+    }
+    std::fprintf(stderr,
+        "[laguna-spec] gpu_embd_table: uploaded f16 embedding table (%lld x %lld, %.0f MiB)\n",
+        (long long)nv, (long long)ne,
+        (double)nv * (double)ne * 2.0 / (1024.0 * 1024.0));
+    embd_gpu_ = t;
+    return embd_gpu_;
 }
 
 bool LagunaDFlashTarget::embed_tokens(const int32_t * tokens, int n,

@@ -438,7 +438,19 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         if (w > 0) verify_width = w;
     }
     const bool adaptive_width = (verify_width <= 0);
-    int chain_w = adaptive_width ? (int)spec_ewma_accept_ + 2 : verify_width;
+    // AUTO width: on RTX 3090 with XS2-class drafters a marginal verify
+    // position costs ~2.3ms while its marginal commit is <0.3 tokens beyond
+    // width 3, so width 3 dominates for accept lengths in the 1.5-3 range
+    // (HumanEval: w3 188 tok/s vs w4 173 vs old AUTO 172). Follow the accept
+    // EWMA but cap at DFLASH_LAGUNA_VERIFY_WIDTH_MAX (default 3).
+    static const int auto_w_max = []() {
+        const char * e = std::getenv("DFLASH_LAGUNA_VERIFY_WIDTH_MAX");
+        const int v = e ? std::atoi(e) : 3;
+        return v > 0 ? v : 3;
+    }();
+    int chain_w = adaptive_width
+        ? std::min((int)(spec_ewma_accept_ + 0.5) + 1, auto_w_max)
+        : verify_width;
     if (chain_w < 2) chain_w = 2;
     if (chain_w > std::min(block_size, 8)) chain_w = std::min(block_size, 8);
     // DDTree sizes its batch via its budget; chain uses the width chosen above.
@@ -610,10 +622,15 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         const bool use_mirror_view =
             draft_feature_mirror_can_view(feature_mirror_, committed, draft_ctx, mirror_slot0);
 
+        static const bool draft_pad = []() {
+            const char * e = std::getenv("DFLASH_LAGUNA_DRAFT_PAD");
+            return !(e && e[0] == '0' && e[1] == '\0');
+        }();
         if (!build_draft_step(draft_sg, dw_, /*lm_head=*/nullptr, draft_backend_,
                               draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
                               committed,
-                              std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, args_.draft_ctx_max)))) {
+                              std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, args_.draft_ctx_max)),
+                              draft_pad)) {
             std::fprintf(stderr, "[laguna-spec] draft build failed\n");
             step_graph_destroy(draft_sg);
             return false;
@@ -628,9 +645,11 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
 
         ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
                                 sizeof(float) * noise_embed.size());
-        pos_k.resize((size_t)draft_ctx + (size_t)block_size);
+        const int kctx = (draft_sg.ctx_alloc > 0) ? draft_sg.ctx_alloc : draft_ctx;
+        pos_k.resize((size_t)kctx + (size_t)block_size);
         for (int i = 0; i < block_size; i++) pos_q[(size_t)i] = draft_ctx + i;
-        for (int i = 0; i < draft_ctx + block_size; i++) pos_k[(size_t)i] = i;
+        for (int i = 0; i < kctx; i++) pos_k[(size_t)i] = (i < draft_ctx) ? i : 0;
+        for (int j = 0; j < block_size; j++) pos_k[(size_t)kctx + j] = draft_ctx + j;
         ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
                                 sizeof(int32_t) * pos_q.size());
         ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
@@ -655,7 +674,23 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                     "(H=%d E=%d)\n",
                     dw_.domino.gru_hidden_dim, dw_.domino.emb_dim);
             }
-            if (domino_correct_greedy_chain(dw_, draft_backend_, *target,
+            static const bool fused_domino = []() {
+                const char * e = std::getenv("DFLASH_LAGUNA_FUSED_DOMINO");
+                return !(e && e[0] == '0' && e[1] == '\0');
+            }();
+            if (fused_domino) {
+                // Run on the draft backend: same stream as the draft forward,
+                // second graph key in the multi-key CUDA-graph cache.
+                if (domino_correct_greedy_chain_fused(
+                        dw_, draft_backend_, target->lm_head_tensor(),
+                        target->gpu_embd_table(), local_hidden.data(), q_len,
+                        last_tok, draft_tok)) {
+                    used_domino = true;
+                }
+            }
+            if (used_domino) {
+                // fused path done
+            } else if (domino_correct_greedy_chain(dw_, draft_backend_, *target,
                                             local_hidden.data(), q_len,
                                             last_tok, draft_tok)) {
                 used_domino = true;
@@ -831,7 +866,25 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
 
         cache_.cur_pos = committed + accept_n;
 
-        if (bonus_tok >= 0) {
+        const bool bonus_is_stop = bonus_tok >= 0 && !ignore_eos && target->is_eos(bonus_tok);
+        bool bonus_deferred = false;
+        if (bonus_tok >= 0 && !sampled_verify && !bonus_is_stop) {
+            // Fold the bonus token into the next verify batch instead of
+            // running a dedicated 1-token target forward for it. The bonus
+            // becomes the next iteration's seed (draft_tok[0]); the next
+            // verify_batch writes its KV row and feature-ring entry, exactly
+            // like the DDTree path's next_token contract. This removes one of
+            // the two target forwards per chain step.
+            commit_n = accept_n;
+            replay_tok.resize((size_t)commit_n);
+            last_tok = bonus_tok;
+            bonus_deferred = true;
+        }
+        if (bonus_tok >= 0 && bonus_is_stop && !sampled_verify) {
+            // Generation stops at the bonus token: no KV row is ever needed
+            // for it, so skip the bonus forward and let the emit loop hit EOS.
+            last_tok = bonus_tok;
+        } else if (bonus_tok >= 0 && !bonus_deferred) {
             std::vector<int32_t> bonus_vec = { bonus_tok };
             int bonus_last = -1;
             if (!target->verify_batch(bonus_vec, committed + accept_n, bonus_last, nullptr)) {
@@ -851,7 +904,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             } else {
                 last_tok = bonus_last;
             }
-        } else {
+        } else if (bonus_tok < 0) {
             if (sampled_verify && commit_n > 0) {
                 if (verify_vocab <= 0) {
                     std::fprintf(stderr, "[laguna-spec] invalid sampled verify vocab\n");
