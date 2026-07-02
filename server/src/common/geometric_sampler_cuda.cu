@@ -225,9 +225,19 @@ __global__ void geometric_sample_kernel(float * __restrict__ work, int vocab,
     apply_penalties_inplace(work, pen_ids, pen_add, pen_m, rep_pen, rep_active);
     if (pen_m > 0) __syncthreads();
 
-    const int chunk = (vocab + nthreads - 1) / nthreads;
-    const int begin = t * chunk;
-    const int end   = min(begin + chunk, vocab);
+    // Vectorized, coalesced grid-stride layout over the row. Every O(vocab)
+    // pass below walks `work` as float4: thread t reads groups v = t, t+nthreads,
+    // ... so consecutive threads touch consecutive 16-byte groups (a coalesced
+    // warp transaction).
+    // `work` is g_scratch.d_work, a cudaMalloc allocation (>=256-byte aligned),
+    // so the float4 reinterpret is safe. `nvec` full groups cover [0, tail); the
+    // <=3 leftover ids in [tail, vocab) are handled by a scalar grid-stride tail.
+    // Within a thread, group ids ascend (v grows, and x<y<z<w within a group)
+    // and the tail's ids are all >= tail, so the strict-'>' argmax below keeps
+    // the lowest id on ties without an explicit index compare.
+    const int      nvec = vocab >> 2;
+    const int      tail = nvec << 2;
+    const float4 * __restrict__ w4 = reinterpret_cast<const float4 *>(work);
 
     float * sh    = reinterpret_cast<float *>(geometric_smem);
     float * s_off = sh + nthreads;
@@ -244,9 +254,17 @@ __global__ void geometric_sample_kernel(float * __restrict__ work, int vocab,
     // helper just to drop the index).
     float lmax    = -FLT_MAX;
     int   largmax = vocab;  // sentinel so a real id always wins
-    for (int i = begin; i < end; i++) {
+    for (int v = t; v < nvec; v += nthreads) {
+        const float4 f    = w4[v];
+        const int    base = v << 2;
+        if (f.x > lmax) { lmax = f.x; largmax = base;     }
+        if (f.y > lmax) { lmax = f.y; largmax = base + 1; }
+        if (f.z > lmax) { lmax = f.z; largmax = base + 2; }
+        if (f.w > lmax) { lmax = f.w; largmax = base + 3; }
+    }
+    for (int i = tail + t; i < vocab; i += nthreads) {
         const float v = work[i];
-        if (v > lmax || (v == lmax && i < largmax)) { lmax = v; largmax = i; }
+        if (v > lmax) { lmax = v; largmax = i; }
     }
     block_reduce_argmax(lmax, largmax, s_val_scratch, s_idx_scratch);
     const float xmax   = lmax * inv_t;
@@ -263,27 +281,47 @@ __global__ void geometric_sample_kernel(float * __restrict__ work, int vocab,
     // small fraction of FP32. The sums are ~vocab terms in (0,1], and float32
     // error is negligible for a stochastic sampling draw.
     float lz = 0.0f;
-    for (int i = begin; i < end; i++)
+    for (int v = t; v < nvec; v += nthreads) {
+        const float4 f = w4[v];
+        lz += expf(f.x * inv_t - xmax) + expf(f.y * inv_t - xmax)
+            + expf(f.z * inv_t - xmax) + expf(f.w * inv_t - xmax);
+    }
+    for (int i = tail + t; i < vocab; i += nthreads)
         lz += expf(work[i] * inv_t - xmax);
     const float Z = block_reduce_sum(lz, s_val_scratch);
 
     if (mode == kModeEmitProbs) {
-        for (int i = begin; i < end; i++)
-            out_probs[i] = expf(work[i] * inv_t - xmax) / Z;
+        float4 * __restrict__ o4 = reinterpret_cast<float4 *>(out_probs);
+        const float inv_z = 1.0f / Z;
+        for (int v = t; v < nvec; v += nthreads) {
+            const float4 f = w4[v];
+            float4 o;
+            o.x = expf(f.x * inv_t - xmax) * inv_z;
+            o.y = expf(f.y * inv_t - xmax) * inv_z;
+            o.z = expf(f.z * inv_t - xmax) * inv_z;
+            o.w = expf(f.w * inv_t - xmax) * inv_z;
+            o4[v] = o;
+        }
+        for (int i = tail + t; i < vocab; i += nthreads)
+            out_probs[i] = expf(work[i] * inv_t - xmax) * inv_z;
         return;
     }
 
     // ---- kModeSample: multinomial inverse-CDF draw over the full distribution
-    // Each thread owns a contiguous id chunk, so ascending-id order is exactly
-    // thread 0's chunk, then thread 1's, ... A serial exclusive scan over the
-    // nthreads per-thread masses gives each thread its CDF offset; the one whose
-    // [offset, offset+mass) straddles the target re-scans its chunk for the id.
-    // (This per-thread array can't be collapsed into the warp-shuffle
-    // reductions above — thread 0 needs every individual chunk mass, not just
-    // their sum, to compute the prefix offsets.)
-    // Each thread's chunk mass is exactly the partial sum it already accumulated
-    // for Z in pass 2 — block_reduce_sum takes `lz` by value, so it is still
-    // intact here. Reuse it instead of a second O(vocab) expf pass over the row.
+    // The cumulative distribution is laid out as thread 0's ids (in its
+    // grid-stride order), then thread 1's, ... — a fixed permutation of the pmf,
+    // which is all inverse-CDF sampling needs (each id still occupies an interval
+    // of width p_id, so target ~ U(0,Z) lands in it with probability p_id/Z; the
+    // GPU draw need not be bit-identical to the CPU's contiguous ordering — see
+    // test_gpu_sampler_cuda.cpp). A serial exclusive scan over the nthreads
+    // per-thread masses gives each thread its CDF offset; the one whose
+    // [offset, offset+mass) straddles the target re-scans its own ids, in the
+    // same grid-stride order, for the crossing id. (This per-thread array can't
+    // be collapsed into the warp-shuffle reductions above — thread 0 needs every
+    // individual chunk mass, not just their sum, to compute the prefix offsets.)
+    // Each thread's mass is exactly the partial sum it already accumulated for Z
+    // in pass 2 — block_reduce_sum takes `lz` by value, so it is still intact
+    // here. Reuse it instead of a second O(vocab) expf pass over the row.
     const float pm = lz;
     sh[t] = pm;
     __syncthreads();
@@ -302,10 +340,19 @@ __global__ void geometric_sample_kernel(float * __restrict__ work, int vocab,
     const double targetv = r_uniform * (double)Z;
     if (targetv >= (double)s_off[t] && targetv < (double)s_off[t] + pm) {
         float acc = s_off[t];
-        for (int i = begin; i < end; i++) {
-            acc += expf(work[i] * inv_t - xmax);
-            if (targetv < acc) { *out_token = i; break; }
+        for (int v = t; v < nvec; v += nthreads) {
+            const float4 f    = w4[v];
+            const int    base = v << 2;
+            acc += expf(f.x * inv_t - xmax); if (targetv < acc) { *out_token = base;     goto done; }
+            acc += expf(f.y * inv_t - xmax); if (targetv < acc) { *out_token = base + 1; goto done; }
+            acc += expf(f.z * inv_t - xmax); if (targetv < acc) { *out_token = base + 2; goto done; }
+            acc += expf(f.w * inv_t - xmax); if (targetv < acc) { *out_token = base + 3; goto done; }
         }
+        for (int i = tail + t; i < vocab; i += nthreads) {
+            acc += expf(work[i] * inv_t - xmax);
+            if (targetv < acc) { *out_token = i; goto done; }
+        }
+        done:;
     }
 }
 
