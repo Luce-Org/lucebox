@@ -561,6 +561,22 @@ static void test_ipc_mode_registration() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_target_shard_daemon_validation() {
+    std::fprintf(stderr, "  test_target_shard_daemon_validation ...");
+
+    TEST_ASSERT(run_deepseek4_target_shard_ipc_daemon(
+                    "dummy.gguf", {0, -1}, {0, 10}, {10, 20},
+                    128, 0, -1) == 2);
+    TEST_ASSERT(run_deepseek4_target_shard_ipc_daemon(
+                    "dummy.gguf", {0, 1}, {0, 11}, {10, 20},
+                    128, 0, -1) == 2);
+    TEST_ASSERT(run_deepseek4_target_shard_ipc_daemon(
+                    "dummy.gguf", {0, 1}, {0}, {10, 20},
+                    128, 0, -1) == 2);
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_ffn_graph_reuse_microbench(ggml_backend_t backend) {
     std::fprintf(stderr, "  test_ffn_graph_reuse_microbench ...");
 
@@ -1217,6 +1233,7 @@ int main() {
     test_reset_request_state();
     test_adapter_guard_paths();
     test_ipc_mode_registration();
+    test_target_shard_daemon_validation();
     test_ffn_graph_reuse_microbench(backend);
     test_output_graph_reuse_microbench(backend);
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
