@@ -52,6 +52,17 @@ static bool nearly_equal(float a, float b, float atol = 1.0e-5f, float rtol = 1.
     return diff <= atol + rtol * scale;
 }
 
+static ggml_tensor * test_hc_row_normalize(ggml_context * ctx, ggml_tensor * x) {
+    ggml_tensor * sums = ggml_sum_rows(ctx, x);
+    return ggml_div(ctx, x, ggml_repeat(ctx, sums, x));
+}
+
+static ggml_tensor * test_hc_col_normalize(ggml_context * ctx, ggml_tensor * x) {
+    ggml_tensor * xt = ggml_cont(ctx, ggml_transpose(ctx, x));
+    xt = test_hc_row_normalize(ctx, xt);
+    return ggml_cont(ctx, ggml_transpose(ctx, xt));
+}
+
 using TestClock = std::chrono::steady_clock;
 
 static double elapsed_ms(TestClock::time_point t0, TestClock::time_point t1) {
@@ -1018,6 +1029,59 @@ static void test_hc_pre_kernel_gpu() {
     std::vector<float> gpu_working_devparam((size_t) n_embd);
     std::vector<float> gpu_post_devparam((size_t) n_hc);
     std::vector<float> gpu_comb_devparam((size_t) n_hc * (size_t) n_hc);
+    std::vector<float> graph_working((size_t) n_embd);
+    std::vector<float> graph_post((size_t) n_hc);
+    std::vector<float> graph_comb((size_t) n_hc * (size_t) n_hc);
+
+    ggml_tensor * flat = ggml_rms_norm(ctx, state_t, hc_eps);
+    ggml_tensor * mix = ggml_mul_mat(ctx, fn_t, flat);
+
+    ggml_tensor * pre_mix = ggml_reshape_2d(ctx,
+        ggml_view_1d(ctx, mix, n_hc, 0), n_hc, 1);
+    ggml_tensor * post_mix = ggml_reshape_2d(ctx,
+        ggml_view_1d(ctx, mix, n_hc, (size_t) n_hc * mix->nb[0]), n_hc, 1);
+    ggml_tensor * comb_mix = ggml_reshape_2d(ctx,
+        ggml_view_1d(ctx, mix, n_hc * n_hc, (size_t) (2 * n_hc) * mix->nb[0]),
+        n_hc, n_hc);
+
+    ggml_tensor * pre_base = ggml_reshape_2d(ctx,
+        ggml_view_1d(ctx, base_t, n_hc, 0), n_hc, 1);
+    ggml_tensor * post_base = ggml_reshape_2d(ctx,
+        ggml_view_1d(ctx, base_t, n_hc, (size_t) n_hc * base_t->nb[0]), n_hc, 1);
+    ggml_tensor * comb_base = ggml_reshape_2d(ctx,
+        ggml_view_1d(ctx, base_t, n_hc * n_hc, (size_t) (2 * n_hc) * base_t->nb[0]),
+        n_hc, n_hc);
+
+    ggml_tensor * graph_pre = ggml_sigmoid(ctx,
+        ggml_add(ctx, ggml_scale(ctx, pre_mix, scale[0]), pre_base));
+    ggml_tensor * graph_post_t = ggml_scale(ctx,
+        ggml_sigmoid(ctx, ggml_add(ctx, ggml_scale(ctx, post_mix, scale[1]), post_base)),
+        2.0f);
+    ggml_tensor * graph_comb_t = ggml_add(ctx, ggml_scale(ctx, comb_mix, scale[2]), comb_base);
+    graph_comb_t = ggml_soft_max(ctx, graph_comb_t);
+    graph_comb_t = test_hc_col_normalize(ctx, graph_comb_t);
+    for (int iter = 1; iter < sinkhorn_iters; ++iter) {
+        graph_comb_t = test_hc_row_normalize(ctx, graph_comb_t);
+        graph_comb_t = test_hc_col_normalize(ctx, graph_comb_t);
+    }
+
+    ggml_tensor * hc_state_2d = ggml_reshape_2d(ctx, state_t, n_embd, n_hc);
+    ggml_tensor * hc_state_t = ggml_cont(ctx, ggml_transpose(ctx, hc_state_2d));
+    ggml_tensor * graph_working_t = ggml_mul_mat(ctx, hc_state_t, graph_pre);
+    ggml_set_output(graph_working_t);
+    ggml_set_output(graph_post_t);
+    ggml_set_output(graph_comb_t);
+    ggml_cgraph * graph_ref = ggml_new_graph_custom(ctx, 512, false);
+    ggml_build_forward_expand(graph_ref, graph_working_t);
+    ggml_build_forward_expand(graph_ref, graph_post_t);
+    ggml_build_forward_expand(graph_ref, graph_comb_t);
+    ggml_gallocr_t graph_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    TEST_ASSERT_MSG(ggml_gallocr_alloc_graph(graph_alloc, graph_ref), "graph HC-pre alloc failed");
+    TEST_ASSERT_MSG(ggml_backend_graph_compute(backend, graph_ref) == GGML_STATUS_SUCCESS,
+                    "graph HC-pre compute failed");
+    ggml_backend_tensor_get(graph_working_t, graph_working.data(), 0, graph_working.size() * sizeof(float));
+    ggml_backend_tensor_get(graph_post_t, graph_post.data(), 0, graph_post.size() * sizeof(float));
+    ggml_backend_tensor_get(graph_comb_t, graph_comb.data(), 0, graph_comb.size() * sizeof(float));
 
     bool ok = deepseek4_cuda_hc_pre_device_params(state_t->data,
                                                   fn_t->data,
@@ -1074,7 +1138,29 @@ static void test_hc_pre_kernel_gpu() {
                         "comb devparam mismatch");
     }
 
+    constexpr float graph_atol = 5.0e-4f;
+    constexpr float graph_rtol = 5.0e-4f;
+    for (int i = 0; i < n_embd; ++i) {
+        TEST_ASSERT_MSG(nearly_equal(gpu_working[(size_t) i], graph_working[(size_t) i], graph_atol, graph_rtol),
+                        "working graph mismatch");
+        TEST_ASSERT_MSG(nearly_equal(gpu_working_devparam[(size_t) i], graph_working[(size_t) i], graph_atol, graph_rtol),
+                        "working devparam graph mismatch");
+    }
+    for (int i = 0; i < n_hc; ++i) {
+        TEST_ASSERT_MSG(nearly_equal(gpu_post[(size_t) i], graph_post[(size_t) i], graph_atol, graph_rtol),
+                        "post graph mismatch");
+        TEST_ASSERT_MSG(nearly_equal(gpu_post_devparam[(size_t) i], graph_post[(size_t) i], graph_atol, graph_rtol),
+                        "post devparam graph mismatch");
+    }
+    for (int i = 0; i < n_hc * n_hc; ++i) {
+        TEST_ASSERT_MSG(nearly_equal(gpu_comb[(size_t) i], graph_comb[(size_t) i], graph_atol, graph_rtol),
+                        "comb graph mismatch");
+        TEST_ASSERT_MSG(nearly_equal(gpu_comb_devparam[(size_t) i], graph_comb[(size_t) i], graph_atol, graph_rtol),
+                        "comb devparam graph mismatch");
+    }
+
     ggml_backend_buffer_free(buf);
+    ggml_gallocr_free(graph_alloc);
     ggml_free(ctx);
     ggml_backend_free(backend);
 }

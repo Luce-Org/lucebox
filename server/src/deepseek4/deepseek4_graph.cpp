@@ -3212,6 +3212,10 @@ bool deepseek4_step_layer_range(
             } else {
                 const auto attn_read_t0 = Ds4TimingClock::now();
                 ggml_backend_tensor_get(attn_out, attn_out_host.data(), 0, sizeof(float) * attn_out_host.size());
+                if (use_backend_decode_hc_direct) {
+                    ggml_backend_tensor_get(attn_post_backend, hc_post.data(), 0, sizeof(float) * hc_post.size());
+                    ggml_backend_tensor_get(attn_comb_backend, hc_comb.data(), 0, sizeof(float) * hc_comb.size());
+                }
                 if (telemetry) telemetry->attn_read_us += ds4_elapsed_us(attn_read_t0, Ds4TimingClock::now());
             }
             if (ctx) ggml_free(ctx);
@@ -3368,6 +3372,10 @@ bool deepseek4_step_layer_range(
             } else {
                 const auto ffn_read_t0 = Ds4TimingClock::now();
                 ggml_backend_tensor_get(ffn_out, ffn_out_host.data(), 0, sizeof(float) * ffn_out_host.size());
+                if (use_backend_decode_hc_direct) {
+                    ggml_backend_tensor_get(ffn_post_backend, hc_post.data(), 0, sizeof(float) * hc_post.size());
+                    ggml_backend_tensor_get(ffn_comb_backend, hc_comb.data(), 0, sizeof(float) * hc_comb.size());
+                }
                 if (telemetry) telemetry->ffn_read_us += ds4_elapsed_us(ffn_read_t0, Ds4TimingClock::now());
             }
 
