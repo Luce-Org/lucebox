@@ -234,6 +234,17 @@ std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids)
         auto key = hash_prefix(prompt_ids.data(), cut);
         int idx = find_entry(key);
         if (idx >= 0) {
+            const int committed = (int)entries_[idx].ids.size();
+            if (committed != cut) {
+                // Slot was refreshed in-place at a deeper boundary; a shallow
+                // hash→slot entry would restore the wrong cur_pos.
+                std::fprintf(stderr,
+                    "[pc] lookup stale slot=%d key_cut=%d committed=%d — evicting\n",
+                    entries_[idx].slot, cut, committed);
+                entries_.erase(entries_.begin() + idx);
+                entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
+                continue;
+            }
             if (cut > best_len) {
                 best_slot = entries_[idx].slot;
                 best_len = cut;

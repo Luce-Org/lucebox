@@ -2538,6 +2538,15 @@ int main(int argc, char ** argv) {
                     stream_emit(-1);
                     continue;
                 }
+                // Optional inline-snap suffix (same as RESTORE / bare prompt):
+                // snap=<pos>:<slot_id>
+                if (const char * sp = std::strstr(line.c_str(), "snap=")) {
+                    if (std::sscanf(sp, "snap=%d:%d", &snap_pos, &snap_slot) != 2
+                        || snap_slot < 0 || snap_slot >= PREFIX_CACHE_SLOTS) {
+                        std::fprintf(stderr, "[snap] bad inline-snap arg\n");
+                        snap_pos = -1; snap_slot = -1;
+                    }
+                }
                 n_gen                    = n_gen_local;
                 prompt_file_str          = ppath;
                 prompt_path              = prompt_file_str.c_str();

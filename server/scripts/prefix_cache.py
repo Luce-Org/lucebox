@@ -1,0 +1,992 @@
+"""Phase A: single-point prefix cache.
+
+Auto-detects the system-prompt boundary in token id streams via Qwen chat
+template markers, hashes prefixes, and maintains an LRU map of hash → daemon
+slot id. Daemon owns slot buffers; Python is the index.
+
+Usage:
+    bus = DaemonStdoutBus(daemon_proc.stdout)
+    bus.start(loop)
+
+    pc = PrefixCache(
+        daemon_stdin=daemon_proc.stdin,
+        await_reply=bus.await_reply,
+        daemon_lock=lock,
+        tokenizer=tokenizer,
+        cap=4,
+    )
+    await pc.startup_sync()  # free orphaned slots from a previous daemon run
+
+    # Per request (caller holds daemon_lock):
+    hit = pc.lookup(prompt_ids, kv_k_type, fa_window)   # (slot_id, prefix_len) or None
+    if hit:
+        slot, prefix_len = hit
+        # send "RESTORE <slot> <prompt_bin> <n_gen>" instead of bare line
+        ...
+    else:
+        # send bare "<prompt_bin> <n_gen>"
+        ...
+        # after daemon finishes, snapshot for future cache hits:
+        await pc.maybe_snapshot(prompt_ids, kv_k_type, fa_window)
+
+Option 3 — full-compress-result cache:
+    When pFlash compression is enabled, the prefix-cache path above silently
+    no-ops because compressed tokens lack Qwen chat-template markers.  The
+    full-cache path caches the compressed cur_bin keyed on the ORIGINAL raw
+    prompt token IDs, so that an identical long prompt sent a second time skips
+    BOTH the drafter compression dance AND the target prefill.
+
+    full_hit = pc.lookup_full(prompt_ids)
+    if full_hit:
+        slot, cached_cur_bin, cur_ids_len = full_hit
+        cmd_line = f"RESTORE {slot} {cached_cur_bin} {gen_len}\\n"
+    else:
+        cur_bin, cur_ids = _maybe_compress(...)
+        if cur_bin != prompt_bin:          # compression actually fired
+            prep = pc.prepare_full_snap(prompt_ids)
+            if prep:
+                slot, _ = prep
+                cmd_line = f"{cur_bin} {gen_len} snap={len(cur_ids)}:{slot}\\n"
+        # ...after response completes:
+        pc.confirm_full_snap(slot, prompt_ids, cur_bin, len(cur_ids))
+        # on exception:
+        pc.abort_full_snap(slot)
+"""
+import asyncio
+import hashlib
+import os
+import re
+import shutil
+import struct
+from collections import OrderedDict
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# DaemonStdoutBus
+# ---------------------------------------------------------------------------
+
+class DaemonStdoutBus:
+    """Owns the read loop on daemon stdout.
+
+    Lines that start with a registered prefix are routed to the waiting
+    coroutine; everything else is printed as a log (with noise filtering).
+    """
+
+    # Prefixes that are too spammy to print in normal operation.
+    _SUPPRESS_PREFIXES = (
+        "[step ", "[timing]", "[dflash]", "[prompt]",
+        "[prefill]", "[migrate]", "[dbg ", "  ",
+    )
+
+    _PREFILL_TIMING_RE = re.compile(
+        r"\[prefill\](?: layer-seg)? (\d+) tokens in ([\d.]+) s"
+    )
+    _DFLASH_TIMING_RE = re.compile(
+        r"\[dflash\] generated (\d+) tokens in ([\d.]+) s\s+->\s+([\d.]+) tok/s"
+    )
+
+    def __init__(self, stdout):
+        self.stdout = stdout
+        self._waiters: list[tuple[str, asyncio.Future]] = []
+        self._task: asyncio.Task | None = None
+        self._request_inline_slot: int | None = None
+        self._timings: dict[str, float | int] = {}
+
+    def begin_request(self) -> None:
+        """Reset per-request daemon telemetry (inline snap ack, timings, etc.)."""
+        self._request_inline_slot = None
+        self._timings = {}
+
+    def inline_snap_slot(self) -> int | None:
+        """Slot id if daemon emitted ``[snap] inline slot=N`` this request."""
+        return self._request_inline_slot
+
+    def request_timings(self) -> dict[str, float | int]:
+        """Daemon-reported prefill/decode timings for the active request."""
+        return dict(self._timings)
+
+    def _parse_timing_line(self, decoded: str) -> None:
+        m = self._PREFILL_TIMING_RE.search(decoded)
+        if m:
+            self._timings["prefill_tokens"] = int(m.group(1))
+            self._timings["prefill_ms"] = round(float(m.group(2)) * 1000.0, 2)
+            return
+        m = self._DFLASH_TIMING_RE.search(decoded)
+        if m:
+            self._timings["completion_tokens"] = int(m.group(1))
+            gen_s = float(m.group(2))
+            self._timings["decode_ms"] = round(gen_s * 1000.0, 2)
+            self._timings["decode_tokens_per_sec"] = round(float(m.group(3)), 2)
+
+    def start(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._task = loop.create_task(self._run())
+
+    async def _run(self) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            line = await loop.run_in_executor(None, self.stdout.readline)
+            if not line:
+                # Daemon exited — wake all waiters with an error.
+                for _, fut in self._waiters:
+                    if not fut.done():
+                        fut.set_exception(EOFError("daemon stdout closed"))
+                self._waiters.clear()
+                return
+            decoded = line.decode("utf-8", errors="replace").rstrip()
+
+            self._parse_timing_line(decoded)
+
+            if decoded.startswith("[snap] inline slot="):
+                try:
+                    slot_s = decoded.split("slot=", 1)[1].split()[0]
+                    self._request_inline_slot = int(slot_s)
+                except (IndexError, ValueError):
+                    pass
+
+            # Try to satisfy a waiter first.
+            matched = False
+            for i, (prefix, fut) in enumerate(self._waiters):
+                if decoded.startswith(prefix) and not fut.done():
+                    fut.set_result(decoded)
+                    self._waiters.pop(i)
+                    matched = True
+                    break
+
+            if not matched:
+                # Log line — suppress very noisy prefixes.
+                if decoded and not any(decoded.startswith(p) for p in self._SUPPRESS_PREFIXES):
+                    print(f"  [daemon] {decoded}", flush=True)
+
+    async def drain_timings(self, timeout: float = 3.0) -> None:
+        """Wait until daemon emits prefill + decode timing lines (or timeout)."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            has_prefill = self._timings.get("prefill_ms") is not None
+            has_decode = (
+                self._timings.get("decode_ms") is not None
+                or self._timings.get("decode_tokens_per_sec") is not None
+            )
+            if has_prefill and has_decode:
+                return
+            await asyncio.sleep(0.005)
+
+    async def drain_inline_snap(self, timeout: float = 10.0) -> int | None:
+        """Wait until the read loop consumes ``[snap] inline slot=N`` (or timeout)."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            if self._request_inline_slot is not None:
+                return self._request_inline_slot
+            await asyncio.sleep(0.005)
+        return self._request_inline_slot
+
+    async def await_reply(self, prefix: str, timeout: float = 10.0) -> str:
+        """Block until daemon emits a line starting with *prefix*."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[str] = loop.create_future()
+        entry = (prefix, fut)
+        self._waiters.append(entry)
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            # On timeout / cancellation the matcher loop never popped us;
+            # remove ourselves so _waiters doesn't grow without bound.
+            try: self._waiters.remove(entry)
+            except ValueError: pass
+
+
+# ---------------------------------------------------------------------------
+# Qwen chat template helpers
+# ---------------------------------------------------------------------------
+
+def _qwen_marker_ids(tokenizer):
+    """Resolve <|im_end|>, <|im_start|>, and 'system' token ids."""
+    im_end = tokenizer.encode("<|im_end|>", add_special_tokens=False)
+    im_start = tokenizer.encode("<|im_start|>", add_special_tokens=False)
+    system_t = tokenizer.encode("system", add_special_tokens=False)
+    if len(im_end) != 1 or len(im_start) != 1:
+        raise ValueError(
+            f"Expected single-token chat markers; got "
+            f"im_end={im_end} im_start={im_start}"
+        )
+    return im_end[0], im_start[0], system_t[0] if len(system_t) == 1 else None
+
+
+def _resolve_chat_markers(tokenizer):
+    """Return a marker spec for the prefix-cache boundary detector.
+
+    Supports two chat-template families used by the dflash daemon:
+
+      - Qwen3.x: single-token ``<|im_end|>`` / ``<|im_start|>`` markers,
+        ``system`` role keyword. Used by Qwen3.5/3.6-27B target.
+      - Laguna-XS.2 (Poolside): XML-style ``<system>`` / ``</system>`` /
+        ``<user>`` / ``</user>`` / ``<assistant>`` / ``</assistant>``
+        markers. Each tokenizes to a 4-6 token sequence under byte-level
+        BPE.
+
+    Returns a dict with token-sequence patterns:
+      family            : str
+      sys_role_prefix   : tuple[int]    pattern that opens the system role
+      end_msg_seqs      : list[tuple]   any of these closes a message
+      next_role_starts  : list[tuple]   any of these opens the next role
+    """
+    qe = tokenizer.encode("<|im_end|>", add_special_tokens=False)
+    qs = tokenizer.encode("<|im_start|>", add_special_tokens=False)
+    if len(qe) == 1 and len(qs) == 1:
+        sys_t = tokenizer.encode("system", add_special_tokens=False)
+        sys_seq = tuple(qs) + (tuple(sys_t) if len(sys_t) == 1 else ())
+        return {
+            "family": "qwen",
+            "sys_role_prefix": sys_seq,
+            "end_msg_seqs":   [tuple(qe)],
+            "next_role_starts": [tuple(qs)],
+        }
+
+    lstart_sys = tokenizer.encode("<system>",      add_special_tokens=False)
+    lend_sys   = tokenizer.encode("</system>",     add_special_tokens=False)
+    lstart_usr = tokenizer.encode("<user>",        add_special_tokens=False)
+    lend_usr   = tokenizer.encode("</user>",       add_special_tokens=False)
+    lstart_ast = tokenizer.encode("<assistant>",   add_special_tokens=False)
+    lend_ast   = tokenizer.encode("</assistant>",  add_special_tokens=False)
+    if all(x for x in (lstart_sys, lend_sys, lstart_usr, lend_usr,
+                        lstart_ast, lend_ast)):
+        return {
+            "family": "laguna",
+            "sys_role_prefix": tuple(lstart_sys),
+            "end_msg_seqs":   [tuple(lend_sys), tuple(lend_usr), tuple(lend_ast)],
+            "next_role_starts": [tuple(lstart_usr), tuple(lstart_ast),
+                                  tuple(lstart_sys)],
+        }
+
+    raise ValueError(
+        f"Could not resolve chat markers for this tokenizer: "
+        f"qwen im_end={qe} im_start={qs}; laguna seqs missing"
+    )
+
+
+def _seq_at(ids, idx, seq):
+    """Return True iff ids[idx:idx+len(seq)] == seq (and bounds OK)."""
+    if idx < 0 or idx + len(seq) > len(ids):
+        return False
+    for k, t in enumerate(seq):
+        if ids[idx + k] != t:
+            return False
+    return True
+
+
+def _find_first_seq(ids, seq, start=0):
+    """Index of first occurrence of `seq` in ids[start:], or -1."""
+    if not seq:
+        return -1
+    head = seq[0]
+    n = len(ids); m = len(seq)
+    i = start
+    while i + m <= n:
+        if ids[i] == head and _seq_at(ids, i, seq):
+            return i
+        i += 1
+    return -1
+
+
+def _find_first_seq_any(ids, seqs, start=0):
+    """Position of the earliest match among `seqs` in ids[start:], or (-1, None)."""
+    best_idx = -1
+    best_seq = None
+    for s in seqs:
+        idx = _find_first_seq(ids, s, start)
+        if idx >= 0 and (best_idx < 0 or idx < best_idx):
+            best_idx = idx
+            best_seq = s
+    return best_idx, best_seq
+
+
+def find_prefix_boundary_markers(ids, markers):
+    """Multi-token-sequence variant of find_prefix_boundary().
+
+    `markers` is the dict returned by _resolve_chat_markers. The boundary
+    is the index right after the FIRST next-role start sequence that
+    follows the system message: i.e., ids[:boundary] = system header.
+
+    Returns -1 if the system role isn'́t found.
+    """
+    sys_seq = markers["sys_role_prefix"]
+    end_seqs = markers["end_msg_seqs"]
+    next_seqs = markers["next_role_starts"]
+
+    sys_idx = _find_first_seq(ids, sys_seq)
+    if sys_idx < 0:
+        return -1
+    after_sys = sys_idx + len(sys_seq)
+
+    end_idx, end_seq = _find_first_seq_any(ids, end_seqs, after_sys)
+    if end_idx < 0:
+        return -1
+    after_end = end_idx + len(end_seq)
+
+    # Allow up to 4 separator tokens (whitespace) between message-end and
+    # the next role-start sequence.
+    for skip in range(0, 5):
+        probe = after_end + skip
+        for s in next_seqs:
+            if _seq_at(ids, probe, s):
+                return probe + len(s)
+    return -1
+
+
+def find_all_boundaries_markers(ids, markers):
+    """Multi-token-sequence variant of find_all_boundaries()."""
+    sys_seq = markers["sys_role_prefix"]
+    end_seqs = markers["end_msg_seqs"]
+    next_seqs = markers["next_role_starts"]
+
+    out = []
+    sys_idx = _find_first_seq(ids, sys_seq)
+    if sys_idx < 0:
+        return out
+
+    cursor = sys_idx + len(sys_seq)
+    while True:
+        end_idx, end_seq = _find_first_seq_any(ids, end_seqs, cursor)
+        if end_idx < 0:
+            break
+        after_end = end_idx + len(end_seq)
+        next_match = -1
+        next_len   = 0
+        for skip in range(0, 5):
+            probe = after_end + skip
+            for s in next_seqs:
+                if _seq_at(ids, probe, s):
+                    next_match = probe
+                    next_len   = len(s)
+                    break
+            if next_match >= 0:
+                break
+        if next_match < 0:
+            break
+        boundary = next_match + next_len
+        out.append(boundary)
+        cursor = boundary
+    return out
+
+
+def find_prefix_boundary(ids, im_end_id, im_start_id, system_token_id):
+    """Return the index AFTER the FIRST end-of-system-message marker, or -1.
+
+    Qwen's chat template renders to:
+
+        <|im_start|>system\\nCONTENT<|im_end|>\\n<|im_start|>user\\n...
+
+    so a `\\n` token sits BETWEEN ``<|im_end|>`` and the next ``<|im_start|>``.
+    We allow up to 2 intervening tokens (covers `\\n` and similar separators).
+
+    The cacheable prefix is the SYSTEM message: from index 0 through and
+    including the ``<|im_start|>`` that begins the next role. Subsequent turns
+    sharing this system message hash to the same key.
+
+    Returns the index right after that ``<|im_start|>``, so ``ids[:boundary]``
+    is the cached state and ``ids[boundary:]`` is the per-request suffix.
+    Returns -1 if there is no recognizable system message.
+    """
+    # Find the first <|im_start|>system sequence.
+    sys_idx = -1
+    for i in range(len(ids) - 1):
+        if ids[i] == im_start_id:
+            if system_token_id is None or ids[i + 1] == system_token_id:
+                sys_idx = i
+                break
+    if sys_idx < 0:
+        return -1
+
+    # Find the FIRST <|im_end|> after sys_idx, then locate the next <|im_start|>
+    # within a small lookahead (handles a single-token newline separator).
+    for i in range(sys_idx + 1, len(ids)):
+        if ids[i] == im_end_id:
+            for j in range(i + 1, min(i + 3, len(ids))):
+                if ids[j] == im_start_id:
+                    return j + 1   # boundary is one past <|im_start|>
+            return -1   # malformed — im_end without subsequent im_start
+    return -1
+
+
+def find_all_boundaries(ids, im_end_id, im_start_id, system_token_id):
+    """Return ascending list of candidate cut points for multi-slot caching.
+
+    Each cut point is the index AFTER an ``<|im_start|>`` that begins a new
+    role's content. The first cut is the system-prompt boundary (same as
+    ``find_prefix_boundary``); subsequent cuts are at every following
+    ``<|im_end|>`` + ``<|im_start|>`` pair.
+
+    Returns an empty list if no recognizable system message is found.
+    """
+    boundaries = []
+
+    # Locate the opening <|im_start|>system token.
+    sys_idx = -1
+    for i in range(len(ids) - 1):
+        if ids[i] == im_start_id:
+            if system_token_id is None or ids[i + 1] == system_token_id:
+                sys_idx = i
+                break
+    if sys_idx < 0:
+        return boundaries
+
+    # Walk forward from sys_idx: every time we see <|im_end|> followed
+    # (within 2 tokens) by <|im_start|>, record the position just after
+    # that <|im_start|> as a cache cut-point.
+    i = sys_idx + 1
+    while i < len(ids):
+        if ids[i] == im_end_id:
+            found_start = False
+            for j in range(i + 1, min(i + 3, len(ids))):
+                if ids[j] == im_start_id:
+                    boundaries.append(j + 1)
+                    i = j + 1
+                    found_start = True
+                    break
+            if not found_start:
+                break
+        else:
+            i += 1
+    return boundaries
+
+
+def hash_prefix(prefix_ids, kv_k_type, fa_window):
+    """Stable SHA-1 (truncated 16 B) of (token ids, kv type, fa window)."""
+    h = hashlib.sha1()
+    h.update(struct.pack("<I", len(prefix_ids)))
+    h.update(struct.pack(f"<{len(prefix_ids)}i", *prefix_ids))
+    h.update(str(kv_k_type).encode())
+    h.update(b"\x00")
+    h.update(struct.pack("<I", fa_window or 0))
+    return h.digest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# PrefixCache
+# ---------------------------------------------------------------------------
+
+class PrefixCache:
+    """LRU prefix cache.  Daemon owns the GPU slots; Python tracks hash→slot.
+
+    Parameters
+    ----------
+    daemon_stdin:
+        The ``stdin`` pipe of the daemon subprocess (``subprocess.Popen.stdin``).
+    await_reply:
+        Async callable ``(prefix: str, timeout: float) -> str`` — provided by
+        ``DaemonStdoutBus.await_reply``.
+    daemon_lock:
+        ``asyncio.Lock`` that serialises all stdin writes + stdout reads.
+        Callers must acquire it before calling ``lookup`` and hold it through
+        any subsequent ``RESTORE`` / ``SNAPSHOT`` IPC.
+    tokenizer:
+        HuggingFace tokenizer (used only to resolve Qwen chat marker ids).
+    cap:
+        Maximum number of snapshot slots.  0 disables the cache entirely.
+    log_prefix:
+        String prepended to cache-hit/miss log lines.
+    """
+
+    # Daemon-side hard cap (PREFIX_CACHE_SLOTS in test_dflash.cpp). Any
+    # configured cap > this is silently clamped down — exceeding it would
+    # cause silent SNAPSHOT failures on slots ≥ 8.
+    DAEMON_MAX_SLOTS = 8
+
+    def __init__(self, *, daemon_stdin, await_reply, daemon_lock,
+                 tokenizer, kv_k_type: str, fa_window: int,
+                 cap: int = 4, log_prefix: str = "[pc]"):
+        self.stdin = daemon_stdin
+        self._await_reply = await_reply
+        self.lock = daemon_lock
+        self.log_prefix = log_prefix
+        # Cache key fields — fixed at daemon spawn (env vars passed through).
+        # Mismatched values across turns are not possible within one server
+        # process, but they're still part of the hash so a daemon restart
+        # with different flags doesn't return stale state.
+        self.kv_k_type = kv_k_type
+        self.fa_window = fa_window
+
+        if cap > self.DAEMON_MAX_SLOTS:
+            print(f"{log_prefix} cap={cap} exceeds daemon limit "
+                  f"({self.DAEMON_MAX_SLOTS}); clamping", flush=True)
+            cap = self.DAEMON_MAX_SLOTS
+        self.cap = cap
+
+        if cap <= 0:
+            self.disabled = True
+            return
+        self.disabled = False
+
+        self.entries: OrderedDict[bytes, int] = OrderedDict()  # hash → slot_id
+        self._slot_prefix_len: dict[int, int] = {}  # slot → committed cut depth
+        self.next_slot = 0
+        try:
+            self.markers = _resolve_chat_markers(tokenizer)
+        except ValueError as e:
+            print(f"{log_prefix} disabling: {e}", flush=True)
+            self.disabled = True
+            self.cap     = 0
+            return
+        print(f"{log_prefix} chat markers: family={self.markers['family']} "
+              f"sys_seq={list(self.markers['sys_role_prefix'])[:6]}… "
+              f"end_seqs={[list(s)[:4] for s in self.markers['end_msg_seqs']]} "
+              f"next_seqs={[list(s)[:4] for s in self.markers['next_role_starts']]}",
+              flush=True)
+        # Pending eviction: set by prepare_inline_snap when at cap; the old
+        # entry is NOT removed until confirm_inline_snap succeeds.  This ensures
+        # that if the request aborts before confirm runs, the old entry survives
+        # and the daemon slot count stays consistent.
+        self._pending_evict_key: bytes | None = None
+        # Slots known to hold KV in the daemon (inline snap ack or full snap).
+        self._populated_slots: set[int] = set()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def boundary(self, ids: list[int]) -> int:
+        """Return first boundary (system-prompt end), or -1. Legacy helper."""
+        if self.disabled:
+            return -1
+        return find_prefix_boundary_markers(ids, self.markers)
+
+    def _all_boundaries(self, ids: list[int]) -> list[int]:
+        """Return all candidate cache cut-points in ascending order."""
+        return find_all_boundaries_markers(ids, self.markers)
+
+    def lookup(self, prompt_ids: list[int]) -> tuple[int, int] | None:
+        """Return ``(slot_id, prefix_len)`` for the LONGEST cached prefix, or ``None``.
+
+        Iterates all block-aligned turn boundaries in ``prompt_ids``, checks
+        each against the LRU index, and returns the deepest (longest) match.
+
+        The caller must already hold ``daemon_lock`` before inspecting the
+        returned slot, since the slot id may be evicted by a concurrent
+        request otherwise.
+        """
+        if self.disabled:
+            return None
+        candidates = self._all_boundaries(prompt_ids)
+        best: tuple[int, int] | None = None   # (slot_id, prefix_len)
+        for cut in candidates:
+            key = hash_prefix(prompt_ids[:cut], self.kv_k_type, self.fa_window)
+            if key not in self.entries:
+                continue
+            slot = self.entries[key]
+            committed = self._slot_prefix_len.get(slot)
+            if committed is not None and committed != cut:
+                # Slot was refreshed in-place at a deeper boundary; an older
+                # shallow hash→slot mapping would restore the wrong cur_pos.
+                print(f"{self.log_prefix} lookup stale slot={slot} "
+                      f"key_cut={cut} committed={committed} — evicting",
+                      flush=True)
+                del self.entries[key]
+                continue
+            if best is None or cut > best[1]:
+                best = (slot, cut)
+            self.entries.move_to_end(key)   # mark fresh
+        if best is not None and best[0] not in self._populated_slots:
+            print(f"{self.log_prefix} lookup skip slot={best[0]} "
+                  f"(not populated in daemon)", flush=True)
+            best = None
+        if best is not None:
+            print(f"{self.log_prefix} lookup hit slot={best[0]} prefix_len={best[1]} "
+                  f"(of {len(prompt_ids)} total)", flush=True)
+        return best
+
+    def slot_populated(self, slot: int) -> bool:
+        return slot in self._populated_slots
+
+    def mark_slot_populated(self, slot: int) -> None:
+        self._populated_slots.add(slot)
+
+    def finish_inline_snap(
+        self,
+        snap_prep: tuple[int, int] | None,
+        prompt_ids: list[int],
+        *,
+        inline_slot: int | None,
+    ) -> None:
+        """Confirm or abort an inline snap reservation based on daemon ack."""
+        if not snap_prep:
+            return
+        slot, target_cut = snap_prep
+        if inline_slot == slot:
+            self.confirm_inline_snap(slot, target_cut, prompt_ids)
+        else:
+            self.abort_inline_snap(slot)
+
+    def prepare_inline_snap(
+        self,
+        prompt_ids: list[int],
+        *,
+        reuse_slot: int | None = None,
+    ) -> tuple[int, int] | None:
+        """Pick a target boundary + slot for inline snapshot during the next
+        request. Returns ``(slot_id, target_cut)`` or ``None`` if no
+        snapshot is needed (e.g. boundary already cached).
+
+        Caller must:
+          1. Append ``snap=<target_cut>:<slot_id>`` to the daemon command
+             that runs the actual response (bare prompt OR ``RESTORE``).
+          2. After the daemon emits ``[snap] inline slot=N cur_pos=M``
+             during prefill, call ``confirm_inline_snap(slot_id, target_cut,
+             prompt_ids)`` to register the entry in the LRU.
+
+        For an agent loop that monotonically grows conversation history, the
+        most valuable cache point is "end of the most recent completed
+        assistant message" — i.e., the second-to-last `<|im_start|>`
+        boundary. The LAST boundary is the current turn's opening, whose
+        content hasn't been generated yet.
+        """
+        if self.disabled:
+            return None
+        candidates = self._all_boundaries(prompt_ids)
+        if not candidates:
+            return None
+        target_cut = candidates[-2] if len(candidates) >= 2 else candidates[-1]
+
+        target_key = hash_prefix(prompt_ids[:target_cut],
+                                  self.kv_k_type, self.fa_window)
+        if target_key in self.entries:
+            self.entries.move_to_end(target_key)
+            return None   # already cached
+
+        # Pick slot: when at cap, reserve the LRU slot WITHOUT evicting yet.
+        # The actual eviction is deferred to confirm_inline_snap so that if the
+        # request aborts before confirm runs, the old entry survives and the
+        # daemon slot count stays consistent.
+        if reuse_slot is not None and reuse_slot in self._populated_slots:
+            slot = reuse_slot
+            self._pending_evict_key = None
+        elif not self._populated_slots:
+            # First successful snap always lands in slot 0 so later turns
+            # refresh in-place (no second full PrefixSnapshot alloc).
+            slot = 0
+            self._pending_evict_key = None
+        elif len(self.entries) >= self.cap:
+            # Peek at LRU without removing.
+            old_key = next(iter(self.entries))
+            slot = self.entries[old_key]
+            self._pending_evict_key = old_key
+        else:
+            slot = self.next_slot
+            self.next_slot = (self.next_slot + 1) % self.cap
+            self._pending_evict_key = None
+
+        return (slot, target_cut)
+
+    def confirm_inline_snap(self, slot: int, target_cut: int,
+                             prompt_ids: list[int]) -> None:
+        """Register an inline snapshot in the LRU after the daemon has
+        successfully fired ``[snap] inline``. Called from the caller after
+        the actual response stream completes.
+
+        If prepare_inline_snap reserved a slot by displacing an LRU entry,
+        the eviction happens HERE (atomically with the insert), so an aborted
+        request that never reaches confirm leaves the old entry intact.
+        """
+        if self.disabled:
+            return
+        # Atomically evict the reserved old entry (if any) and insert the new one.
+        if self._pending_evict_key is not None:
+            self.entries.pop(self._pending_evict_key, None)
+            self._pending_evict_key = None
+        key = hash_prefix(prompt_ids[:target_cut],
+                          self.kv_k_type, self.fa_window)
+        # In-place slot refresh leaves stale shallow hash→slot entries; drop them.
+        stale_keys = [k for k, s in self.entries.items()
+                      if s == slot and k != key]
+        for k in stale_keys:
+            del self.entries[k]
+        self.entries[key] = slot
+        self._slot_prefix_len[slot] = target_cut
+        self._populated_slots.add(slot)
+        print(f"{self.log_prefix} inline-snap committed slot={slot} "
+              f"prefix_len={target_cut}", flush=True)
+
+    def abort_inline_snap(self, slot: int) -> None:
+        """Release the reservation made by prepare_inline_snap.
+
+        At-cap case: prepare_inline_snap peeked at the LRU (old_key -> slot)
+        and stashed old_key in _pending_evict_key WITHOUT removing it. We
+        cannot tell from here whether the daemon already committed the
+        snapshot to ``slot`` before the failure was observed:
+          - If it didn't: old_key -> slot is still semantically valid and
+            we should keep it.
+          - If it did:    slot now holds the NEW prompt's KV, so old_key
+            -> slot is stale and a future lookup would return data that
+            doesn't match the key.
+        Without daemon-side query we conservatively assume the worst and
+        drop old_key from the LRU. We accept losing one valid cache entry
+        in exchange for never returning a wrong-KV restore. Callers that
+        know the daemon did NOT process the snap (e.g. early validation
+        failure before any send) should evict only the pending key — but
+        in practice, every failure path that calls this happens AFTER the
+        daemon command was issued, so the conservative drop is correct.
+        """
+        if self.disabled:
+            return
+        if self._pending_evict_key is not None:
+            self.entries.pop(self._pending_evict_key, None)
+            self._pending_evict_key = None
+
+    # ------------------------------------------------------------------
+    # Option 3: full-compress-result cache
+    # ------------------------------------------------------------------
+    # When pFlash compression is enabled the existing prefix-cache path above
+    # silently no-ops (compressed tokens lack Qwen chat-template markers so
+    # find_all_boundaries returns []).  The full-cache path solves this by
+    # caching the compressed cur_bin keyed on the ORIGINAL raw prompt_ids so
+    # that an identical long prompt sent a second time skips BOTH the drafter
+    # dance AND the target prefill.
+    #
+    # Slot allocation: prefix-cache uses slots [0, cap); full-cache uses slots
+    # [cap, cap + full_cap).  Both are initialised at PrefixCache construction
+    # time; the daemon cap (8) is shared, so prefix_cap + full_cap <= 8.
+    # ------------------------------------------------------------------
+
+    def init_full_cache(self, full_cap: int,
+                        cache_dir: str | None = None) -> None:
+        """Initialise the full-cache pool.  Must be called once after __init__
+        if you want Option 3 to be active.  Idempotent if called again with
+        the same parameters.
+
+        Parameters
+        ----------
+        full_cap:
+            Number of daemon slots reserved for full-cache entries.
+            prefix_cap (self.cap) + full_cap must not exceed DAEMON_MAX_SLOTS.
+        cache_dir:
+            Directory to persist cur_bin files across requests.
+            Defaults to /tmp/dflash-pflash-cache/.
+        """
+        if self.disabled or full_cap <= 0:
+            self._full_cap = 0
+            self._full_disabled = True
+            return
+
+        # Idempotency guard: a second call would otherwise reset full_entries +
+        # slot allocator and orphan any cur_bin files already on disk.
+        if not getattr(self, "_full_disabled", True):
+            return
+
+        remaining = self.DAEMON_MAX_SLOTS - self.cap
+        if full_cap > remaining:
+            print(f"{self.log_prefix} full-cache cap={full_cap} would exceed "
+                  f"daemon limit (prefix uses {self.cap}); clamping to {remaining}",
+                  flush=True)
+            full_cap = remaining
+        if full_cap <= 0:
+            self._full_cap = 0
+            self._full_disabled = True
+            return
+
+        self._full_cap = full_cap
+        self._full_disabled = False
+        # Slots used by the full-cache start AFTER the prefix-cache slots.
+        self._full_slot_base = self.cap
+        self._full_next_slot = 0  # relative; absolute = _full_slot_base + _full_next_slot
+        # LRU map: prompt_ids_hash -> (absolute_slot, cached_cur_bin_path, cur_ids_len)
+        self.full_entries: OrderedDict[bytes, tuple[int, str, int]] = OrderedDict()
+        # Pending eviction: the LRU entry reserved for the next confirm.
+        self._full_pending_evict_key: bytes | None = None
+        self._full_pending_evict_path: str | None = None
+
+        cache_dir_path = Path(cache_dir) if cache_dir else Path("/tmp/dflash-pflash-cache")
+        cache_dir_path.mkdir(parents=True, exist_ok=True)
+        self._full_cache_dir = cache_dir_path
+        print(f"{self.log_prefix} full-cache enabled: cap={full_cap} "
+              f"slots=[{self._full_slot_base},{self._full_slot_base + full_cap}) "
+              f"dir={cache_dir_path}", flush=True)
+
+    def lookup_full(self, prompt_ids: list[int]) -> tuple[int, str, int] | None:
+        """Exact-match on full prompt_ids hash (keyed on raw, pre-compression ids).
+
+        Returns ``(slot, cached_cur_bin_path, cur_ids_len)`` on hit, else None.
+        The cur_bin_path points to a file in the persistent cache dir that the
+        caller passes directly to the daemon as a RESTORE command's second arg.
+
+        Caller must hold daemon_lock before inspecting the returned slot.
+        """
+        if getattr(self, "_full_disabled", True):
+            return None
+        key = hash_prefix(prompt_ids, self.kv_k_type, self.fa_window)
+        entry = self.full_entries.get(key)
+        if entry is None:
+            return None
+        slot, cur_bin_path, cur_ids_len = entry
+        # Verify the cached file still exists (could have been deleted externally).
+        if not Path(cur_bin_path).exists():
+            self.full_entries.pop(key, None)
+            return None
+        self.full_entries.move_to_end(key)  # mark fresh in LRU
+        print(f"{self.log_prefix} full-cache hit slot={slot} "
+              f"cur_ids_len={cur_ids_len} key={key.hex()[:8]}", flush=True)
+        return slot, cur_bin_path, cur_ids_len
+
+    def prepare_full_snap(self, prompt_ids: list[int]) -> tuple[int, int] | None:
+        """Reserve a daemon slot for the full-prefill snapshot.
+
+        Returns ``(absolute_slot, 0)`` — the second element is a placeholder;
+        the real target_pos (== len(cur_ids)) is supplied by the caller to
+        ``confirm_full_snap``.  Returns None if full-cache is disabled or the
+        prompt is already cached.
+        """
+        if getattr(self, "_full_disabled", True):
+            return None
+        key = hash_prefix(prompt_ids, self.kv_k_type, self.fa_window)
+        if key in self.full_entries:
+            self.full_entries.move_to_end(key)
+            return None  # already cached
+
+        # Pick a slot, deferring eviction until confirm succeeds.
+        if len(self.full_entries) >= self._full_cap:
+            old_key = next(iter(self.full_entries))
+            old_slot, old_path, _ = self.full_entries[old_key]
+            self._full_pending_evict_key = old_key
+            self._full_pending_evict_path = old_path
+            abs_slot = old_slot
+        else:
+            abs_slot = self._full_slot_base + self._full_next_slot
+            self._full_next_slot = (self._full_next_slot + 1) % self._full_cap
+            self._full_pending_evict_key = None
+            self._full_pending_evict_path = None
+
+        return abs_slot, 0  # 0 is a placeholder; real pos passed to confirm
+
+    def confirm_full_snap(self, slot: int, prompt_ids: list[int],
+                          cur_bin_src: str | Path, cur_ids_len: int) -> None:
+        """Persist cur_bin_src into the cache dir and register the entry.
+
+        ``cur_bin_src`` is the path to the tempfile written by _maybe_compress;
+        its content is copied (not moved, to keep the original available for the
+        daemon) into the persistent cache dir before registering.
+
+        Atomically evicts the LRU entry (and its on-disk file) if one was
+        reserved by prepare_full_snap.
+        """
+        if getattr(self, "_full_disabled", True):
+            return
+
+        key = hash_prefix(prompt_ids, self.kv_k_type, self.fa_window)
+        dest = self._full_cache_dir / (key.hex() + ".bin")
+
+        try:
+            shutil.copy2(str(cur_bin_src), str(dest))
+        except OSError as exc:
+            print(f"{self.log_prefix} full-cache: failed to copy cur_bin "
+                  f"({cur_bin_src} -> {dest}): {exc}", flush=True)
+            # Don't evict the old entry — leave cache consistent.
+            self._full_pending_evict_key = None
+            self._full_pending_evict_path = None
+            return
+
+        # Atomically evict the reserved entry (if any) and insert new one.
+        if self._full_pending_evict_key is not None:
+            evicted_path = self._full_pending_evict_path
+            self.full_entries.pop(self._full_pending_evict_key, None)
+            if evicted_path:
+                Path(evicted_path).unlink(missing_ok=True)
+            self._full_pending_evict_key = None
+            self._full_pending_evict_path = None
+
+        self.full_entries[key] = (slot, str(dest), cur_ids_len)
+        print(f"{self.log_prefix} full-cache committed slot={slot} "
+              f"cur_ids_len={cur_ids_len} key={key.hex()[:8]}", flush=True)
+
+    def abort_full_snap(self, slot: int) -> None:
+        """Cancel a prepare_full_snap reservation without registering anything.
+
+        Clears the pending eviction so the old LRU entry is not evicted.
+        """
+        if getattr(self, "_full_disabled", True):
+            return
+        self._full_pending_evict_key = None
+        self._full_pending_evict_path = None
+
+    # Legacy out-of-band snapshot (kept for backward-compatibility tests
+    # that call it directly; new code uses prepare_inline_snap +
+    # confirm_inline_snap so the snapshot rides on the actual response).
+    async def maybe_snapshot(self, prompt_ids: list[int],
+                              token_stream_consumer=None) -> None:
+        if self.disabled:
+            return
+        prep = self.prepare_inline_snap(prompt_ids)
+        if prep is None:
+            return
+        slot, cut = prep
+
+        import os, struct, tempfile
+        fd, tmp_path = tempfile.mkstemp(suffix="_prefix.bin")
+        with os.fdopen(fd, "wb") as f:
+            for t in prompt_ids[:cut]:
+                f.write(struct.pack("<i", int(t)))
+        confirmed = False
+        try:
+            self._send(f"{tmp_path} 0\n")
+            if token_stream_consumer is not None:
+                await token_stream_consumer()
+            self._send(f"SNAPSHOT {slot}\n")
+            await self._await_reply("[snap] slot=")
+            self.confirm_inline_snap(slot, cut, prompt_ids)
+            confirmed = True
+        finally:
+            try: os.unlink(tmp_path)
+            except OSError: pass
+            if not confirmed:
+                # The SNAPSHOT command may already have been processed on the
+                # daemon (the slot now holds new-prompt KV) even though we
+                # didn't observe the ack. To keep daemon and Python state
+                # consistent: free the slot daemon-side (best effort), then
+                # drop the at-cap LRU mapping in abort_inline_snap.
+                try:
+                    self._send(f"FREE_SNAPSHOT {slot}\n")
+                    await self._await_reply("[snap] freed slot=", timeout=2.0)
+                except Exception:
+                    # If the daemon doesn't ack the free either, the slot may
+                    # leak in the daemon until next startup_sync — but that's
+                    # bounded and recoverable, while a stale hash->slot
+                    # mapping in Python would cause silent KV corruption on
+                    # the next lookup.
+                    pass
+                self.abort_inline_snap(slot)
+
+    async def startup_sync(self, timeout: float = 120.0) -> None:
+        """Query the daemon for existing slots and free them all.
+
+        Called once at server startup to ensure Python's hash table is
+        consistent with the daemon's slot state (both empty after this).
+
+        The default ``timeout`` is intentionally generous (120s) because
+        first-boot CUDA kernel JIT compilation can dominate startup wall
+        time on architectures whose kernels aren't pre-compiled (notably
+        consumer Blackwell sm_120, where the megakernel + DFlash kernels
+        compile from scratch on first launch).
+        """
+        if self.disabled:
+            return
+        self._populated_slots.clear()
+        self._slot_prefix_len.clear()
+        async with self.lock:
+            self._send("LIST_SLOTS\n")
+            reply = await self._await_reply("[snap] slots=", timeout=timeout)
+            slots_str = reply.split("[snap] slots=", 1)[1].strip()
+            if not slots_str:
+                return
+            orphans = [s.strip() for s in slots_str.split(",") if s.strip()]
+            for s in orphans:
+                self._send(f"FREE_SNAPSHOT {s}\n")
+                await self._await_reply("[snap] freed slot=", timeout=timeout)
+            print(f"{self.log_prefix} freed {len(orphans)} orphaned daemon slots",
+                  flush=True)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _send(self, line: str) -> None:
+        self.stdin.write(line.encode("utf-8"))
+        self.stdin.flush()
