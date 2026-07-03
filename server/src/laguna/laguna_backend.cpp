@@ -47,21 +47,34 @@ namespace dflash::common {
 
 namespace {
 
-static bool laguna_kv_type_env_present() {
-    return std::getenv("DFLASH27B_KV_K") ||
-           std::getenv("DFLASH27B_KV_V") ||
-           std::getenv("DFLASH27B_KV_F16") ||
-           std::getenv("DFLASH27B_KV_Q4") ||
-           std::getenv("DFLASH27B_KV_TQ3");
-}
-
+// Laguna honors only the explicit per-axis --cache-type-k/v overrides.
+// The DFLASH27B_KV_F16/_Q4/_TQ3 shorthands are qwen-family toggles - the
+// server auto-sets _KV_TQ3 for max_ctx > 6144 - and must not displace
+// laguna's Q8_0 default (a TQ3_0/Q4_0 KV cache garbles laguna output).
 static void resolve_laguna_kv_types(const LagunaBackendArgs & args,
                                     ggml_type & k_type,
                                     ggml_type & v_type) {
     k_type = args.kv_type;
     v_type = args.kv_type;
-    if (laguna_kv_type_env_present()) {
-        dflash::resolve_kv_types(k_type, v_type);
+    if (const char * s = std::getenv("DFLASH27B_KV_K")) {
+        const ggml_type parsed = dflash::parse_kv_type(s);
+        if (parsed == GGML_TYPE_COUNT) {
+            std::fprintf(stderr, "[laguna] Unknown KV K type: \"%s\"\n", s);
+            std::abort();
+        }
+        k_type = parsed;
+    }
+    if (const char * s = std::getenv("DFLASH27B_KV_V")) {
+        const ggml_type parsed = dflash::parse_kv_type(s);
+        if (parsed == GGML_TYPE_COUNT) {
+            std::fprintf(stderr, "[laguna] Unknown KV V type: \"%s\"\n", s);
+            std::abort();
+        }
+        v_type = parsed;
+    }
+    if (k_type != args.kv_type || v_type != args.kv_type) {
+        std::fprintf(stderr, "[laguna] KV cache types overridden: K=%s V=%s\n",
+                     dflash::kv_type_name(k_type), dflash::kv_type_name(v_type));
     }
 }
 
