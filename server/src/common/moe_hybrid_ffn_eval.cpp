@@ -1470,6 +1470,7 @@ static bool eval_moe_hybrid_ffn_batched_core(
 
     // ── Step 3: Build and run cold graph on selected backend ──
     std::vector<float> cold_partial((size_t)n_embd * (size_t)n_tokens, 0.0f);
+    const auto cold_t0 = HybridClock::now();
 
     if (has_cold && skip_cold) {
         // Used by reduced-stack prefill: hot/shared must be sliced for MMVQ
@@ -1948,6 +1949,7 @@ bool eval_moe_hybrid_ffn_batched(
             std::vector<float> hot_partial((size_t)n_embd * (size_t)n_tokens, 0.0f);
             std::vector<float> cold_partial;
             std::string cold_err;
+            const auto cold_t0 = HybridClock::now();
             auto cold_future = std::async(std::launch::async, [&]() {
                 return eval_moe_hybrid_remote_cold_batched(
                     cfg, storage, cur_host, selected_ids, selected_weights,
@@ -1965,7 +1967,7 @@ bool eval_moe_hybrid_ffn_batched(
                         selected_ids + (size_t)t0 * (size_t)n_used,
                         selected_weights + (size_t)t0 * (size_t)n_used,
                         tc, sub_out, err, p_hot_alloc, p_cold_alloc,
-                        expert_compute, expert_layer, /*skip_cold=*/true)) {
+                        expert_compute, expert_layer, nullptr, /*skip_cold=*/true)) {
                     hot_ok = false;
                     break;
                 }
@@ -1980,6 +1982,7 @@ bool eval_moe_hybrid_ffn_batched(
                 if (err && !cold_err.empty()) *err = cold_err;
                 return false;
             }
+            if (telemetry) telemetry->cold_us += elapsed_us(cold_t0, HybridClock::now());
             const size_t total_floats = (size_t)n_embd * (size_t)n_tokens;
             for (size_t i = 0; i < total_floats; ++i) {
                 out[i] = hot_partial[i] + cold_partial[i];
@@ -1987,9 +1990,6 @@ bool eval_moe_hybrid_ffn_batched(
             return true;
         }
         std::vector<float> sub_out;
-        for (int t0 = 0; t0 < n_tokens; t0 += hot_sub_batch) {
-            const int tc = std::min(hot_sub_batch, n_tokens - t0);
-            MoeHybridFfnTelemetry sub_tel;
         for (int t0 = 0; t0 < n_tokens; t0 += hot_sub_batch) {
             const int tc = std::min(hot_sub_batch, n_tokens - t0);
             MoeHybridFfnTelemetry sub_tel;
@@ -2009,6 +2009,18 @@ bool eval_moe_hybrid_ffn_batched(
                 telemetry->hot_us += sub_tel.hot_us;
                 telemetry->cold_us += sub_tel.cold_us;
                 telemetry->combine_us += sub_tel.combine_us;
+                telemetry->hot_graph_build_us += sub_tel.hot_graph_build_us;
+                telemetry->hot_input_us += sub_tel.hot_input_us;
+                telemetry->hot_compute_us += sub_tel.hot_compute_us;
+                telemetry->hot_read_us += sub_tel.hot_read_us;
+                telemetry->cold_graph_build_us += sub_tel.cold_graph_build_us;
+                telemetry->cold_input_us += sub_tel.cold_input_us;
+                telemetry->cold_compute_us += sub_tel.cold_compute_us;
+                telemetry->cold_read_us += sub_tel.cold_read_us;
+                telemetry->hot_graph_builds += sub_tel.hot_graph_builds;
+                telemetry->hot_graph_hits += sub_tel.hot_graph_hits;
+                telemetry->cold_graph_builds += sub_tel.cold_graph_builds;
+                telemetry->cold_graph_hits += sub_tel.cold_graph_hits;
                 telemetry->hot_selected += sub_tel.hot_selected;
                 telemetry->cold_selected += sub_tel.cold_selected;
             }
