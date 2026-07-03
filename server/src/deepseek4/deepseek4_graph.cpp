@@ -1562,6 +1562,7 @@ static bool eval_ds4_hybrid_or_worker(
             backend, cpu_backend, hybrid_cfg, desc, storage,
             ffn_normed_host, selected_host, weights_host,
             n_tokens, ffn_out_host, nullptr, hot_alloc, cold_alloc,
+            nullptr, nullptr,
             step_tel ? &ffn_tel : nullptr);
         if (ffn_ok) {
             if (step_tel) {
