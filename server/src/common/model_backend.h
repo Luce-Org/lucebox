@@ -124,9 +124,6 @@ struct GenerateRequest {
     // path returns success but emits no tokens, so each backend can route the
     // retry through its existing AR path without copying retry policy.
     bool                       force_ar_decode = false;
-    // Optional request-selected DFlash draft LoRA variant. Empty uses the
-    // backend default; "base" selects the unadapted draft when available.
-    std::string                draft_lora;
 };
 
 struct GenerateResult {

@@ -1688,7 +1688,6 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
 
         // Bandit: parse session_id from extra_body (opt-in adaptive keep_ratio)
         req.session_id = parse_session_id_from_body(body);
-        req.draft_lora = parse_draft_lora_from_body(body);
 
         // Serialize tools JSON for template injection.
         std::string tools_json;
@@ -2393,7 +2392,6 @@ void HttpServer::worker_loop() {
         gen_req.sampler = req.sampler;
         gen_req.do_sample = req.sampler.needs_logit_processing();
         gen_req.stream = false;  // we handle streaming via on_token callback
-        gen_req.draft_lora = req.draft_lora;
 
         // Level 2 force-close: when thinking is opted in, the server is
         // configured with a hard-limit reply budget, and we resolved the

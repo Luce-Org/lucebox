@@ -225,8 +225,6 @@ struct ParsedRequest {
     std::vector<std::string>  stop_sequences;
     // Bandit: per-session adaptive keep_ratio opt-in
     std::string               session_id;
-    // Optional DFlash drafter LoRA variant selected by extra_body.draft_lora.
-    std::string               draft_lora;
     DiskPrefixCachePolicy     disk_cache_policy;
 };
 
@@ -397,20 +395,6 @@ inline std::string parse_session_id_from_body(const json & body) {
     }
     if (body.contains("session_id") && body["session_id"].is_string()) {
         return body["session_id"].get<std::string>();
-    }
-    return {};
-}
-
-inline std::string parse_draft_lora_from_body(const json & body) {
-    if (body.contains("extra_body")) {
-        const auto & eb = body["extra_body"];
-        if (eb.is_object() && eb.contains("draft_lora") &&
-            eb["draft_lora"].is_string()) {
-            return eb["draft_lora"].get<std::string>();
-        }
-    }
-    if (body.contains("draft_lora") && body["draft_lora"].is_string()) {
-        return body["draft_lora"].get<std::string>();
     }
     return {};
 }

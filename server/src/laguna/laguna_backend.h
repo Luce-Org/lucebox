@@ -36,7 +36,6 @@ namespace dflash::common {
 struct LagunaBackendArgs {
     std::string target_path;
     std::string draft_path;
-    std::vector<DraftLoraSpec> draft_loras;
     int         draft_gpu = -1;
     int         draft_ctx_max = 2048;
     bool        ddtree_mode = false;
@@ -51,7 +50,6 @@ struct LagunaBackendArgs {
 
 struct LagunaDraftVariant {
     std::string                name;
-    std::vector<DraftLoraSpec> loras;
     DraftWeights               weights;
 };
 
@@ -109,7 +107,7 @@ private:
     ggml_backend_t                              draft_backend_ = nullptr;
     std::vector<LagunaDraftVariant>             draft_variants_;
     DraftWeights *                              active_dw_ = nullptr;
-    std::string                                 default_draft_lora_ = "base";
+    std::string                                 default_draft_variant_ = "base";
     DraftFeatureMirror                          feature_mirror_{};
     LagunaDFlashTarget *                        dflash_target_ = nullptr;
     bool                                        draft_parked_ = false;

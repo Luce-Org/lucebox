@@ -1222,18 +1222,11 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
     cache_.last_tok = argmax(last_logits);
     result.tokens.reserve(req.n_gen);
     const bool sampled_verify = laguna_sampled_verify_enabled(sampler_, req.do_sample);
-    if (!req.draft_lora.empty() &&
-        (args_.draft_path.empty() || !dflash_target_ ||
-         !select_decode_draft(req.draft_lora))) {
-        result.error = "draft_lora";
-        return result;
-    }
-
     const bool can_spec = req.n_gen > 0
         && !req.force_ar_decode
         && !args_.draft_path.empty()
         && dflash_target_
-        && select_decode_draft(req.draft_lora)
+        && select_decode_draft(std::string())
         && !draft_parked_
         && feature_mirror_.target_feat
         && cache_.target_feat
@@ -1453,18 +1446,11 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
     cache_.last_tok = argmax(last_logits);
     result.tokens.reserve(req.n_gen);
     const bool sampled_verify = laguna_sampled_verify_enabled(sampler_, req.do_sample);
-    if (!req.draft_lora.empty() &&
-        (args_.draft_path.empty() || !dflash_target_ ||
-         !select_decode_draft(req.draft_lora))) {
-        result.error = "draft_lora";
-        return result;
-    }
-
     const bool can_spec = req.n_gen > 0
         && !req.force_ar_decode
         && !args_.draft_path.empty()
         && dflash_target_
-        && select_decode_draft(req.draft_lora)
+        && select_decode_draft(std::string())
         && !draft_parked_
         && feature_mirror_.target_feat
         && cache_.target_feat
@@ -3010,29 +2996,13 @@ bool LagunaBackend::load_decode_draft() {
     draft_variants_.push_back(LagunaDraftVariant{});
     draft_variants_.back().name = "base";
 
-    for (const DraftLoraSpec & spec : args_.draft_loras) {
-        const std::string name = spec.name.empty() ? "default" : spec.name;
-        auto it = std::find_if(draft_variants_.begin(), draft_variants_.end(),
-            [&](const LagunaDraftVariant & v) { return v.name == name; });
-        if (it == draft_variants_.end()) {
-            draft_variants_.push_back(LagunaDraftVariant{});
-            draft_variants_.back().name = name;
-            it = draft_variants_.end() - 1;
-        }
-        it->loras.push_back(spec);
-    }
-
     int base_fc_in = 0;
     int base_draft_hidden = 0;
     int base_n_capture = 0;
 
     for (LagunaDraftVariant & variant : draft_variants_) {
-        DraftLoadOptions load_options;
-        load_options.loras = variant.loras;
-        const DraftLoadOptions * options =
-            load_options.loras.empty() ? nullptr : &load_options;
         if (!load_draft_gguf(args_.draft_path, draft_backend_, variant.weights,
-                             nullptr, options)) {
+                             nullptr)) {
             std::fprintf(stderr, "[laguna] draft load failed for variant '%s': %s\n",
                          variant.name.c_str(), dflash27b_last_error());
             free_decode_draft();
@@ -3080,7 +3050,7 @@ bool LagunaBackend::load_decode_draft() {
         } else if (fc_in != base_fc_in || draft_hidden != base_draft_hidden ||
                    n_capture != base_n_capture) {
             std::fprintf(stderr,
-                "[laguna] draft LoRA variant '%s' changed draft dimensions "
+                "[laguna] draft variant '%s' changed draft dimensions "
                 "(fc_in=%d hidden=%d capture=%d, base fc_in=%d hidden=%d capture=%d)\n",
                 variant.name.c_str(), fc_in, draft_hidden, n_capture,
                 base_fc_in, base_draft_hidden, base_n_capture);
@@ -3088,9 +3058,9 @@ bool LagunaBackend::load_decode_draft() {
             return false;
         }
 
-        std::printf("[laguna] draft variant loaded: name=%s loras=%zu fc_in=%d "
+        std::printf("[laguna] draft variant loaded: name=%s fc_in=%d "
                     "target_hidden=%d draft_hidden=%d n_capture_layers=%d swa=%d\n",
-                    variant.name.c_str(), variant.loras.size(), fc_in, w_.n_embd,
+                    variant.name.c_str(), fc_in, w_.n_embd,
                     draft_hidden, n_capture, dw.swa_window);
     }
 
@@ -3115,12 +3085,8 @@ bool LagunaBackend::load_decode_draft() {
         return false;
     }
 
-    const bool only_default_loras =
-        !args_.draft_loras.empty() &&
-        std::all_of(args_.draft_loras.begin(), args_.draft_loras.end(),
-                    [](const DraftLoraSpec & s) { return s.name.empty(); });
-    default_draft_lora_ = only_default_loras ? "default" : "base";
-    if (!select_decode_draft(default_draft_lora_)) {
+    default_draft_variant_ = "base";
+    if (!select_decode_draft(default_draft_variant_)) {
         free_decode_draft();
         return false;
     }
@@ -3144,19 +3110,19 @@ bool LagunaBackend::load_decode_draft() {
 bool LagunaBackend::select_decode_draft(const std::string & name) {
     std::string wanted = name;
     if (wanted.empty()) {
-        wanted = default_draft_lora_;
+        wanted = default_draft_variant_;
     }
     for (LagunaDraftVariant & variant : draft_variants_) {
         if (variant.name == wanted) {
             if (active_dw_ != &variant.weights) {
-                std::fprintf(stderr, "[laguna] selected draft LoRA variant: %s\n",
+                std::fprintf(stderr, "[laguna] selected draft variant: %s\n",
                              variant.name.c_str());
             }
             active_dw_ = &variant.weights;
             return true;
         }
     }
-    std::fprintf(stderr, "[laguna] unknown draft LoRA variant '%s'\n",
+    std::fprintf(stderr, "[laguna] unknown draft variant '%s'\n",
                  wanted.c_str());
     return false;
 }
@@ -3173,7 +3139,7 @@ void LagunaBackend::free_decode_draft() {
     }
     draft_variants_.clear();
     active_dw_ = nullptr;
-    default_draft_lora_ = "base";
+    default_draft_variant_ = "base";
     if (draft_backend_ && draft_backend_ != backend_) {
         ggml_backend_free(draft_backend_);
     }

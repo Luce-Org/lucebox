@@ -64,281 +64,6 @@ int count_swa_layers(const DraftWeights & w) {
     return n_swa;
 }
 
-float get_f32_or(const gguf_context * g, const char * key, float fallback) {
-    int64_t id = gguf_find_key(g, key);
-    if (id < 0 || gguf_get_kv_type(g, id) != GGUF_TYPE_FLOAT32) return fallback;
-    return gguf_get_val_f32(g, id);
-}
-
-std::string get_str_or_empty(const gguf_context * g, const char * key) {
-    int64_t id = gguf_find_key(g, key);
-    if (id < 0 || gguf_get_kv_type(g, id) != GGUF_TYPE_STRING) return {};
-    const char * value = gguf_get_val_str(g, id);
-    return value ? std::string(value) : std::string();
-}
-
-bool ends_with(const std::string & value, const char * suffix) {
-    const size_t n = std::strlen(suffix);
-    return value.size() >= n && value.compare(value.size() - n, n, suffix) == 0;
-}
-
-struct DraftLoraTensorRef {
-    ggml_tensor * tensor = nullptr;
-    size_t        offset = 0;
-    size_t        size   = 0;
-};
-
-struct DraftLoraPair {
-    DraftLoraTensorRef a;
-    DraftLoraTensorRef b;
-    bool               applied = false;
-};
-
-struct DraftLoraAdapter {
-    std::string path;
-    float       scale = 1.0f;
-    float       alpha = 1.0f;
-    size_t      data_start = 0;
-    GgufMmap    mmap;
-    gguf_context * gctx = nullptr;
-    ggml_context * meta_ctx = nullptr;
-    std::unordered_map<std::string, DraftLoraPair> pairs;
-
-    ~DraftLoraAdapter() {
-        if (gctx) gguf_free(gctx);
-        if (meta_ctx) ggml_free(meta_ctx);
-    }
-};
-
-bool read_lora_tensor_f32(const DraftLoraAdapter & adapter,
-                          const DraftLoraTensorRef & ref,
-                          std::vector<float> & out,
-                          std::string & err) {
-    if (!ref.tensor) {
-        err = "missing LoRA tensor";
-        return false;
-    }
-    if (!gguf_tensor_in_file(adapter.data_start, ref.offset, ref.size, adapter.mmap.size())) {
-        err = gguf_bounds_error("draft LoRA", ref.tensor->name,
-                                ggml_type_name(ref.tensor->type),
-                                adapter.data_start, ref.offset, ref.size,
-                                adapter.mmap.size());
-        return false;
-    }
-    const int64_t n = ggml_nelements(ref.tensor);
-    if (n <= 0) {
-        err = "LoRA tensor has invalid element count: " + std::string(ref.tensor->name);
-        return false;
-    }
-    size_t elt_size = 0;
-    switch (ref.tensor->type) {
-        case GGML_TYPE_F32: elt_size = sizeof(float);       break;
-        case GGML_TYPE_F16: elt_size = sizeof(ggml_fp16_t); break;
-        default:
-            err = "unsupported LoRA tensor type for " + std::string(ref.tensor->name) +
-                  ": " + ggml_type_name(ref.tensor->type);
-            return false;
-    }
-    // n comes from file metadata; reject on the (bounds-checked) byte size
-    // before resizing so a corrupt element count cannot force an allocation.
-    if (ref.size % elt_size != 0 || (uint64_t)n != ref.size / elt_size) {
-        err = "LoRA tensor byte size mismatch: " + std::string(ref.tensor->name);
-        return false;
-    }
-    const uint8_t * src = (const uint8_t *)adapter.mmap.data() + adapter.data_start + ref.offset;
-    out.resize((size_t)n);
-    if (ref.tensor->type == GGML_TYPE_F32) {
-        const float * p = reinterpret_cast<const float *>(src);
-        std::copy(p, p + n, out.begin());
-    } else {
-        const ggml_fp16_t * p = reinterpret_cast<const ggml_fp16_t *>(src);
-        for (int64_t i = 0; i < n; ++i) {
-            out[(size_t)i] = ggml_fp16_to_fp32(p[i]);
-        }
-    }
-    return true;
-}
-
-bool load_draft_lora_adapter(const DraftLoraSpec & spec,
-                             std::unique_ptr<DraftLoraAdapter> & out,
-                             std::string & err) {
-    auto adapter = std::make_unique<DraftLoraAdapter>();
-    adapter->path = spec.path;
-    adapter->scale = spec.scale;
-
-    gguf_init_params gip{};
-    gip.no_alloc = true;
-    gip.ctx = &adapter->meta_ctx;
-    adapter->gctx = gguf_init_from_file(spec.path.c_str(), gip);
-    if (!adapter->gctx) {
-        err = "gguf_init_from_file failed for draft LoRA: " + spec.path;
-        return false;
-    }
-
-    const std::string general_type = get_str_or_empty(adapter->gctx, "general.type");
-    const std::string adapter_type = get_str_or_empty(adapter->gctx, "adapter.type");
-    if (!general_type.empty() && general_type != "adapter") {
-        err = "draft LoRA general.type must be 'adapter', got: " + general_type;
-        return false;
-    }
-    if (!adapter_type.empty() && adapter_type != "lora") {
-        err = "draft LoRA adapter.type must be 'lora', got: " + adapter_type;
-        return false;
-    }
-    adapter->alpha = get_f32_or(adapter->gctx, "adapter.lora.alpha", 1.0f);
-
-    if (!adapter->mmap.open(spec.path, err)) {
-        return false;
-    }
-    adapter->data_start = gguf_get_data_offset(adapter->gctx);
-
-    const int64_t n_tensors = gguf_get_n_tensors(adapter->gctx);
-    for (int64_t tid = 0; tid < n_tensors; ++tid) {
-        const char * raw_name = gguf_get_tensor_name(adapter->gctx, tid);
-        if (!raw_name) continue;
-        std::string name(raw_name);
-        const bool is_a = ends_with(name, ".lora_a");
-        const bool is_b = ends_with(name, ".lora_b");
-        if (!is_a && !is_b) {
-            if (ends_with(name, "_norm.weight")) continue;
-            err = "unexpected draft LoRA tensor suffix: " + name;
-            return false;
-        }
-
-        const char * suffix = is_a ? ".lora_a" : ".lora_b";
-        std::string base = name.substr(0, name.size() - std::strlen(suffix));
-        ggml_tensor * t = ggml_get_tensor(adapter->meta_ctx, raw_name);
-        if (!t) {
-            err = "draft LoRA tensor descriptor missing: " + name;
-            return false;
-        }
-
-        DraftLoraTensorRef ref;
-        ref.tensor = t;
-        ref.offset = gguf_get_tensor_offset(adapter->gctx, tid);
-        ref.size = gguf_get_tensor_size(adapter->gctx, tid);
-        DraftLoraPair & pair = adapter->pairs[base];
-        if (is_a) pair.a = ref;
-        else pair.b = ref;
-    }
-
-    for (const auto & it : adapter->pairs) {
-        if (!it.second.a.tensor || !it.second.b.tensor) {
-            err = "draft LoRA tensor pair is incomplete for base tensor: " + it.first;
-            return false;
-        }
-    }
-    if (adapter->pairs.empty()) {
-        err = "draft LoRA contained no lora_a/lora_b tensor pairs: " + spec.path;
-        return false;
-    }
-
-    out = std::move(adapter);
-    return true;
-}
-
-bool merge_lora_into_tensor_bytes(
-        const char * tname,
-        const ggml_tensor * base,
-        const uint8_t * base_bytes,
-        size_t base_size,
-        std::vector<std::unique_ptr<DraftLoraAdapter>> & adapters,
-        std::vector<uint8_t> & merged_bytes,
-        std::string & err) {
-    std::vector<DraftLoraAdapter *> matching;
-    for (auto & adapter : adapters) {
-        if (adapter->pairs.find(tname) != adapter->pairs.end()) {
-            matching.push_back(adapter.get());
-        }
-    }
-    if (matching.empty()) return false;
-
-    if (base->type != GGML_TYPE_F16 && base->type != GGML_TYPE_F32) {
-        err = "draft LoRA merge only supports F16/F32 base tensors; tensor " +
-              std::string(tname) + " has type " + ggml_type_name(base->type);
-        return false;
-    }
-    if (base->ne[0] <= 0 || base->ne[1] <= 0 || base->ne[2] != 1 || base->ne[3] != 1) {
-        err = "draft LoRA merge expects a 2D base tensor: " + std::string(tname);
-        return false;
-    }
-
-    const int64_t in_dim = base->ne[0];
-    const int64_t out_dim = base->ne[1];
-    const int64_t n = in_dim * out_dim;
-    std::vector<float> merged((size_t)n);
-    if (base->type == GGML_TYPE_F32) {
-        if (base_size != (size_t)n * sizeof(float)) {
-            err = "draft LoRA base F32 byte size mismatch: " + std::string(tname);
-            return false;
-        }
-        const float * p = reinterpret_cast<const float *>(base_bytes);
-        std::copy(p, p + n, merged.begin());
-    } else {
-        if (base_size != (size_t)n * sizeof(ggml_fp16_t)) {
-            err = "draft LoRA base F16 byte size mismatch: " + std::string(tname);
-            return false;
-        }
-        const ggml_fp16_t * p = reinterpret_cast<const ggml_fp16_t *>(base_bytes);
-        for (int64_t i = 0; i < n; ++i) {
-            merged[(size_t)i] = ggml_fp16_to_fp32(p[i]);
-        }
-    }
-
-    std::vector<float> a;
-    std::vector<float> b;
-    for (DraftLoraAdapter * adapter : matching) {
-        DraftLoraPair & pair = adapter->pairs[tname];
-        if (pair.a.tensor->ne[0] != in_dim ||
-            pair.b.tensor->ne[1] != out_dim ||
-            pair.a.tensor->ne[1] != pair.b.tensor->ne[0]) {
-            char buf[384];
-            std::snprintf(buf, sizeof(buf),
-                "draft LoRA shape mismatch for %s: base=[%lld,%lld] "
-                "lora_a=[%lld,%lld] lora_b=[%lld,%lld]",
-                tname,
-                (long long)in_dim, (long long)out_dim,
-                (long long)pair.a.tensor->ne[0], (long long)pair.a.tensor->ne[1],
-                (long long)pair.b.tensor->ne[0], (long long)pair.b.tensor->ne[1]);
-            err = buf;
-            return false;
-        }
-        if (!read_lora_tensor_f32(*adapter, pair.a, a, err) ||
-            !read_lora_tensor_f32(*adapter, pair.b, b, err)) {
-            return false;
-        }
-
-        const int64_t rank = pair.a.tensor->ne[1];
-        if (rank <= 0) {
-            err = "draft LoRA rank must be positive for tensor: " + std::string(tname);
-            return false;
-        }
-        const float factor = adapter->scale * adapter->alpha / (float)rank;
-        for (int64_t o = 0; o < out_dim; ++o) {
-            float * dst_col = merged.data() + o * in_dim;
-            for (int64_t r = 0; r < rank; ++r) {
-                const float br = b[(size_t)(r + o * rank)] * factor;
-                const float * a_col = a.data() + r * in_dim;
-                for (int64_t i = 0; i < in_dim; ++i) {
-                    dst_col[i] += a_col[i] * br;
-                }
-            }
-        }
-        pair.applied = true;
-    }
-
-    merged_bytes.resize(base_size);
-    if (base->type == GGML_TYPE_F32) {
-        std::memcpy(merged_bytes.data(), merged.data(), base_size);
-    } else {
-        ggml_fp16_t * p = reinterpret_cast<ggml_fp16_t *>(merged_bytes.data());
-        for (int64_t i = 0; i < n; ++i) {
-            p[i] = ggml_fp32_to_fp16(merged[(size_t)i]);
-        }
-    }
-    return true;
-}
-
 bool check_shape_1d(const ggml_tensor * t, int64_t ne0, const char * name, char * buf, size_t buf_sz) {
     if (!t || t->ne[0] != ne0) {
         std::snprintf(buf, buf_sz, "draft GGUF: Domino tensor %s shape mismatch: got [%lld], expected [%lld]",
@@ -367,8 +92,7 @@ bool check_shape_2d(const ggml_tensor * t, int64_t ne0, int64_t ne1,
 bool load_draft_gguf(const std::string & path,
                      ggml_backend_t       backend,
                      DraftWeights &       out,
-                     const TargetWeights * target,
-                     const DraftLoadOptions * options) {
+                     const TargetWeights * target) {
 
     // ── 1. Parse metadata + create ggml_context with tensor descriptors ──
     ggml_context * meta_ctx = nullptr;
@@ -694,25 +418,6 @@ bool load_draft_gguf(const std::string & path,
                      n_swa, out.n_layer, out.swa_window);
     }
 
-    std::vector<std::unique_ptr<DraftLoraAdapter>> lora_adapters;
-    if (options && !options->loras.empty()) {
-        lora_adapters.reserve(options->loras.size());
-        for (const DraftLoraSpec & spec : options->loras) {
-            if (spec.path.empty()) continue;
-            std::unique_ptr<DraftLoraAdapter> adapter;
-            std::string lora_err;
-            if (!load_draft_lora_adapter(spec, adapter, lora_err)) {
-                set_last_error(lora_err);
-                gguf_free(gctx);
-                return false;
-            }
-            std::fprintf(stderr,
-                "[draft GGUF] loaded LoRA adapter: %s (pairs=%zu scale=%.3f alpha=%.3f)\n",
-                spec.path.c_str(), adapter->pairs.size(), adapter->scale, adapter->alpha);
-            lora_adapters.emplace_back(std::move(adapter));
-        }
-    }
-
     // ── 3. Allocate CUDA buffer for all tensors ──────────────────────────
     out.buf = ggml_backend_alloc_ctx_tensors(meta_ctx, backend);
     if (!out.buf) {
@@ -731,8 +436,6 @@ bool load_draft_gguf(const std::string & path,
     const int64_t n_tensors = gguf_get_n_tensors(gctx);
 
     size_t total = 0;
-    size_t merged_lora_tensors = 0;
-    std::vector<uint8_t> merged_bytes;
     for (int64_t tid = 0; tid < n_tensors; tid++) {
         const char * tname = gguf_get_tensor_name(gctx, tid);
         ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
@@ -747,36 +450,8 @@ bool load_draft_gguf(const std::string & path,
             return false;
         }
         const uint8_t * tensor_bytes = mm_addr + data_start + rel_off;
-        if (!lora_adapters.empty()) {
-            std::string merge_err;
-            const bool merged = merge_lora_into_tensor_bytes(
-                tname, t, tensor_bytes, sz, lora_adapters, merged_bytes, merge_err);
-            if (!merge_err.empty()) {
-                set_last_error(merge_err);
-                gguf_free(gctx);
-                return false;
-            }
-            if (merged) {
-                ggml_backend_tensor_set(t, merged_bytes.data(), 0, merged_bytes.size());
-                merged_lora_tensors++;
-            } else {
-                ggml_backend_tensor_set(t, tensor_bytes, 0, sz);
-            }
-        } else {
-            ggml_backend_tensor_set(t, tensor_bytes, 0, sz);
-        }
+        ggml_backend_tensor_set(t, tensor_bytes, 0, sz);
         total += sz;
-    }
-
-    for (const auto & adapter : lora_adapters) {
-        for (const auto & it : adapter->pairs) {
-            if (!it.second.applied) {
-                set_last_error("draft LoRA tensor did not match any draft base tensor: " +
-                               it.first + " from " + adapter->path);
-                gguf_free(gctx);
-                return false;
-            }
-        }
     }
 
     gguf_free(gctx);
@@ -833,8 +508,8 @@ bool load_draft_gguf(const std::string & path,
 
     char summary[192];
     std::snprintf(summary, sizeof(summary),
-        "draft GGUF loaded: %" PRId64 " tensors, %.2f GiB on GPU, LoRA merged tensors=%zu",
-        n_tensors, total / (1024.0 * 1024.0 * 1024.0), merged_lora_tensors);
+        "draft GGUF loaded: %" PRId64 " tensors, %.2f GiB on GPU",
+        n_tensors, total / (1024.0 * 1024.0 * 1024.0));
     set_last_error(summary);
 
     return true;

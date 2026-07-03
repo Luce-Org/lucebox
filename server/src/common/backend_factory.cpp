@@ -146,7 +146,6 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         LagunaBackendArgs lcfg;
         lcfg.target_path = args.model_path;
         lcfg.draft_path  = args.draft_path ? args.draft_path : "";
-        lcfg.draft_loras = args.draft_loras;
         lcfg.draft_gpu   = args.draft_device.gpu;
         lcfg.draft_ctx_max = args.draft_ctx_max;
         lcfg.ddtree_mode = args.ddtree_mode;

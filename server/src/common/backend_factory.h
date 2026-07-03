@@ -31,7 +31,6 @@ struct BackendArgs {
 
     // Optional: speculative decode draft model (qwen35 only)
     const char *    draft_path   = nullptr;
-    std::vector<DraftLoraSpec> draft_loras;
 
     // Device placement
     DevicePlacement device;

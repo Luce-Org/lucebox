@@ -319,18 +319,6 @@ struct DraftWeights {
     DraftDSparkWeights dspark;
 };
 
-struct DraftLoraSpec {
-    // Empty name means this spec belongs to the default LoRA stack. Named
-    // specs create switchable request-selectable variants.
-    std::string name;
-    std::string path;
-    float       scale = 1.0f;
-};
-
-struct DraftLoadOptions {
-    std::vector<DraftLoraSpec> loras;
-};
-
 bool load_draft_safetensors(const std::string & path,
                             ggml_backend_t backend,
                             DraftWeights & out,
@@ -343,8 +331,7 @@ bool load_draft_safetensors(const std::string & path,
 bool load_draft_gguf(const std::string & path,
                      ggml_backend_t backend,
                      DraftWeights & out,
-                     const TargetWeights * target = nullptr,
-                     const DraftLoadOptions * options = nullptr);
+                     const TargetWeights * target = nullptr);
 
 void free_draft_weights(DraftWeights & w);
 
