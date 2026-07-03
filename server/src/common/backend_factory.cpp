@@ -10,7 +10,6 @@
 #include "qwen3_backend.h"
 #include "gemma4_backend.h"
 #include "gemma4_layer_split_adapter.h"
-#include "deepseek4_backend.h"
 #include "deepseek4_layer_split_adapter.h"
 #include "layer_split_backend.h"
 #include "qwen35_layer_split_adapter.h"
