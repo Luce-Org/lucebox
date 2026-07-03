@@ -534,6 +534,16 @@ static void test_adapter_guard_paths() {
 
     int last_tok = -1;
     TEST_ASSERT(!adapter.prefill({1, 2, 3}, 0, last_tok));
+    TEST_ASSERT(!adapter.run_forward({}, 0, last_tok, nullptr));
+
+    adapter.shards_.resize(1);
+    TEST_ASSERT(!adapter.run_forward({}, 0, last_tok, nullptr));
+
+    adapter.remote_target_shard_.active_ = true;
+    TEST_ASSERT(!adapter.run_mixed_forward({}, 0, last_tok, nullptr));
+
+    adapter.shards_.clear();
+    adapter.remote_target_shard_.active_ = false;
 
     std::vector<int32_t> out_tokens;
     TEST_ASSERT(!adapter.decode_ar(1, 0, 1, out_tokens, DaemonIO{}));
@@ -1026,6 +1036,9 @@ static void test_hc_pre_kernel_gpu() {
     std::vector<float> gpu_working((size_t) n_embd);
     std::vector<float> gpu_post((size_t) n_hc);
     std::vector<float> gpu_comb((size_t) n_hc * (size_t) n_hc);
+    std::vector<float> host_working((size_t) n_embd);
+    std::vector<float> host_post((size_t) n_hc);
+    std::vector<float> host_comb((size_t) n_hc * (size_t) n_hc);
     std::vector<float> gpu_working_devparam((size_t) n_embd);
     std::vector<float> gpu_post_devparam((size_t) n_hc);
     std::vector<float> gpu_comb_devparam((size_t) n_hc * (size_t) n_hc);
@@ -1083,17 +1096,30 @@ static void test_hc_pre_kernel_gpu() {
     ggml_backend_tensor_get(graph_post_t, graph_post.data(), 0, graph_post.size() * sizeof(float));
     ggml_backend_tensor_get(graph_comb_t, graph_comb.data(), 0, graph_comb.size() * sizeof(float));
 
-    bool ok = deepseek4_cuda_hc_pre_device_params(state_t->data,
-                                                  fn_t->data,
-                                                  scale.data(),
-                                                  base.data(),
-                                                  n_embd,
-                                                  n_hc,
-                                                  sinkhorn_iters,
-                                                  hc_eps,
-                                                  working_t->data,
-                                                  post_t->data,
-                                                  comb_t->data);
+    bool ok = deepseek4_cuda_hc_pre(hc_state.data(),
+                                    fn_t->data,
+                                    scale.data(),
+                                    base.data(),
+                                    n_embd,
+                                    n_hc,
+                                    sinkhorn_iters,
+                                    hc_eps,
+                                    host_working.data(),
+                                    host_post.data(),
+                                    host_comb.data());
+    TEST_ASSERT_MSG(ok, "host HC-pre kernel call failed");
+
+    ok = deepseek4_cuda_hc_pre_device_params(state_t->data,
+                                             fn_t->data,
+                                             scale.data(),
+                                             base.data(),
+                                             n_embd,
+                                             n_hc,
+                                             sinkhorn_iters,
+                                             hc_eps,
+                                             working_t->data,
+                                             post_t->data,
+                                             comb_t->data);
     TEST_ASSERT_MSG(ok, "direct HC-pre kernel call failed");
     if (ok) {
         ggml_backend_tensor_get(working_t, gpu_working.data(), 0, gpu_working.size() * sizeof(float));
@@ -1120,18 +1146,24 @@ static void test_hc_pre_kernel_gpu() {
     }
 
     for (int i = 0; i < n_embd; ++i) {
+        TEST_ASSERT_MSG(nearly_equal(host_working[(size_t) i], ref_working[(size_t) i], 2.0e-4f, 2.0e-4f),
+                        "host working mismatch");
         TEST_ASSERT_MSG(nearly_equal(gpu_working[(size_t) i], ref_working[(size_t) i], 2.0e-4f, 2.0e-4f),
                         "working mismatch");
         TEST_ASSERT_MSG(nearly_equal(gpu_working_devparam[(size_t) i], ref_working[(size_t) i], 2.0e-4f, 2.0e-4f),
                         "working devparam mismatch");
     }
     for (int i = 0; i < n_hc; ++i) {
+        TEST_ASSERT_MSG(nearly_equal(host_post[(size_t) i], ref_post[(size_t) i], 2.0e-4f, 2.0e-4f),
+                        "host post mismatch");
         TEST_ASSERT_MSG(nearly_equal(gpu_post[(size_t) i], ref_post[(size_t) i], 2.0e-4f, 2.0e-4f),
                         "post mismatch");
         TEST_ASSERT_MSG(nearly_equal(gpu_post_devparam[(size_t) i], ref_post[(size_t) i], 2.0e-4f, 2.0e-4f),
                         "post devparam mismatch");
     }
     for (int i = 0; i < n_hc * n_hc; ++i) {
+        TEST_ASSERT_MSG(nearly_equal(host_comb[(size_t) i], ref_comb[(size_t) i], 2.0e-4f, 2.0e-4f),
+                        "host comb mismatch");
         TEST_ASSERT_MSG(nearly_equal(gpu_comb[(size_t) i], ref_comb[(size_t) i], 2.0e-4f, 2.0e-4f),
                         "comb mismatch");
         TEST_ASSERT_MSG(nearly_equal(gpu_comb_devparam[(size_t) i], ref_comb[(size_t) i], 2.0e-4f, 2.0e-4f),

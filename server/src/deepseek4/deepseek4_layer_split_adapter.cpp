@@ -424,7 +424,7 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
         int base_pos,
         int & last_tok,
         std::vector<float> * logits_out) {
-    if (shards_.empty()) return false;
+    if (shards_.empty() || tokens.empty()) return false;
 
     const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
     const auto forward_t0 = SplitClock::now();
@@ -498,7 +498,7 @@ bool DeepSeek4LayerSplitAdapter::run_mixed_forward(
         int base_pos,
         int & last_tok,
         std::vector<float> * logits_out) {
-    if (shards_.empty() || !remote_target_shard_.active()) return false;
+    if (!use_mixed_target_split() || tokens.empty()) return false;
 
     const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
     const auto forward_t0 = SplitClock::now();
