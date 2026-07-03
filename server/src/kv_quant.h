@@ -19,6 +19,10 @@ const char * kv_type_name(ggml_type t);
 // GGML_CUDA_FA_ALL_QUANTS=ON, which is now forced ON in dflash/CMakeLists.txt).
 bool is_supported_kv_pair(ggml_type k, ggml_type v);
 
+// Aborts with the supported-pairs listing when (k, v) is not supported by
+// the compiled fattn kernels. `who` is the log prefix (e.g. "[laguna]").
+void validate_kv_pair_or_abort(ggml_type k, ggml_type v, const char * who);
+
 // Resolves K and V types from environment variables.
 // Precedence (high -> low):
 //   1. DFLASH27B_KV_K=<type> / DFLASH27B_KV_V=<type>  (independent override)

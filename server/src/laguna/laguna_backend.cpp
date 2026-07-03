@@ -73,6 +73,7 @@ static void resolve_laguna_kv_types(const LagunaBackendArgs & args,
         v_type = parsed;
     }
     if (k_type != args.kv_type || v_type != args.kv_type) {
+        dflash::validate_kv_pair_or_abort(k_type, v_type, "[laguna]");
         std::fprintf(stderr, "[laguna] KV cache types overridden: K=%s V=%s\n",
                      dflash::kv_type_name(k_type), dflash::kv_type_name(v_type));
     }
