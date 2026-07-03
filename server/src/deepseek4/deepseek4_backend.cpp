@@ -376,8 +376,22 @@ bool DeepSeek4Backend::init() {
 
     snap_backend_ = ggml_backend_init_by_name("cpu", nullptr);
 
-    // Try full load first; if GPU OOM, fall back to hybrid mode automatically.
-    if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
+    const PlacementBackend target_backend =
+        cfg_.device.backend == PlacementBackend::Auto
+            ? compiled_placement_backend()
+            : cfg_.device.backend;
+
+    // HIP single-device launches should avoid the monolithic full-model load:
+    // a managed ~80 GiB allocation can stall or be killed on integrated UMA
+    // systems before we ever reach the existing OOM fallback path.
+    if (target_backend == PlacementBackend::Hip) {
+        std::fprintf(stderr,
+                     "[deepseek4] HIP target detected; using hybrid expert load path\n");
+        if (!init_hybrid_model()) {
+            std::fprintf(stderr, "[deepseek4] hybrid mode failed: %s\n", cfg_.model_path);
+            return false;
+        }
+    } else if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
         std::fprintf(stderr, "[deepseek4] full model load failed, trying hybrid mode...\n");
         if (!init_hybrid_model()) {
             std::fprintf(stderr, "[deepseek4] hybrid mode also failed: %s\n", cfg_.model_path);
