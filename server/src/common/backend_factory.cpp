@@ -10,6 +10,7 @@
 #include "qwen3_backend.h"
 #include "gemma4_backend.h"
 #include "gemma4_layer_split_adapter.h"
+#include "deepseek4_backend.h"
 #include "deepseek4_layer_split_adapter.h"
 #include "layer_split_backend.h"
 #include "qwen35_layer_split_adapter.h"
@@ -214,7 +215,29 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         return backend;
 
     } else if (arch == "deepseek4") {
-        // DeepSeek4 always uses layer-split between CUDA and Halo
+        // HIP-only builds cannot rely on the CUDA/Halo auto-split path; use the
+        // single-backend loader, which can fall back to hybrid expert placement
+        // when a full monolithic load does not fit.
+#if defined(GGML_USE_HIP) && !defined(GGML_USE_CUDA)
+        if (!args.device.is_layer_split() && !args.remote_target_shard.enabled()) {
+            DeepSeek4BackendConfig cfg;
+            cfg.model_path = args.model_path;
+            cfg.device     = args.device;
+            cfg.stream_fd  = args.stream_fd;
+            cfg.max_ctx    = args.device.max_ctx;
+            cfg.chunk      = args.chunk;
+
+            auto backend = std::make_unique<DeepSeek4Backend>(cfg);
+            if (!backend->init()) {
+                std::fprintf(stderr, "[backend_factory] DeepSeek4Backend init failed\n");
+                return nullptr;
+            }
+            return backend;
+        }
+#endif
+
+        // CUDA builds keep the layer-split backend so they can auto-split
+        // across CUDA and remote HIP target shards.
         DeepSeek4LayerSplitAdapterConfig cfg;
         cfg.target_path        = args.model_path;
         cfg.device             = args.device;
