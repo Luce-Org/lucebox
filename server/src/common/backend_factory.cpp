@@ -215,11 +215,17 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         return backend;
 
     } else if (arch == "deepseek4") {
-        // HIP-only builds cannot rely on the CUDA/Halo auto-split path; use the
-        // single-backend loader, which can fall back to hybrid expert placement
-        // when a full monolithic load does not fit.
-#if defined(GGML_USE_HIP) && !defined(GGML_USE_CUDA)
-        if (!args.device.is_layer_split() && !args.remote_target_shard.enabled()) {
+        const PlacementBackend target_backend =
+            args.device.backend == PlacementBackend::Auto
+                ? compiled_placement_backend()
+                : args.device.backend;
+
+        // HIP single-device launches cannot rely on the CUDA/Halo auto-split
+        // path; use the single-backend loader, which can fall back to hybrid
+        // expert placement when a full monolithic load does not fit.
+        if (target_backend == PlacementBackend::Hip &&
+            !args.device.is_layer_split() &&
+            !args.remote_target_shard.enabled()) {
             DeepSeek4BackendConfig cfg;
             cfg.model_path = args.model_path;
             cfg.device     = args.device;
@@ -234,7 +240,6 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
             }
             return backend;
         }
-#endif
 
         // CUDA builds keep the layer-split backend so they can auto-split
         // across CUDA and remote HIP target shards.
