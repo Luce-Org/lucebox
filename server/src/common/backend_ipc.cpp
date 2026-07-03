@@ -171,35 +171,17 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
         if (cmd_pipe[0] != STDIN_FILENO) ::close(cmd_pipe[0]);
         ::close(cmd_pipe[1]);
         ::close(payload_pipe[1]);
-        if (cfg.run_with_sudo) {
-            ::close(payload_pipe[0]);
-        }
         ::close(stream_pipe[0]);
-        if (cfg.stream_on_stdout) {
-            if (stream_pipe[1] != STDOUT_FILENO && ::dup2(stream_pipe[1], STDOUT_FILENO) < 0) {
-                std::fprintf(stderr, "backend-ipc dup2 stream failed: %s\n", std::strerror(errno));
-                _exit(127);
-            }
-            if (stream_pipe[1] != STDOUT_FILENO) ::close(stream_pipe[1]);
-        }
 
         std::vector<std::string> argv_storage;
-        argv_storage.reserve(cfg.args.size() + 9);
-        const std::string exec_bin = cfg.run_with_sudo ? "/usr/bin/sudo" : cfg.bin;
-        if (cfg.run_with_sudo) {
-            argv_storage.emplace_back(exec_bin);
-            argv_storage.emplace_back("-n");
-            argv_storage.emplace_back(cfg.bin);
-        } else {
-            argv_storage.emplace_back(cfg.bin);
-        }
+        argv_storage.reserve(cfg.args.size() + 7);
+        const std::string & exec_bin = cfg.bin;
+        argv_storage.emplace_back(cfg.bin);
         argv_storage.emplace_back(
             std::string("--backend-ipc-mode=") + backend_ipc_mode_name(cfg.mode));
         argv_storage.emplace_back(cfg.payload_path);
         for (const std::string & arg : cfg.args) argv_storage.emplace_back(arg);
-        if (!cfg.run_with_sudo) {
-            argv_storage.emplace_back("--payload-fd=" + std::to_string(payload_pipe[0]));
-        }
+        argv_storage.emplace_back("--payload-fd=" + std::to_string(payload_pipe[0]));
         if (has_shared_payload()) {
             argv_storage.emplace_back("--shared-payload-fd=" +
                                       std::to_string(shared_payload_fd_));
@@ -207,7 +189,7 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
                                       std::to_string(shared_payload_capacity_));
         }
         argv_storage.emplace_back("--stream-fd=" +
-                                  std::to_string(cfg.stream_on_stdout ? STDOUT_FILENO : stream_pipe[1]));
+                                  std::to_string(stream_pipe[1]));
 
         std::vector<char *> argv;
         argv.reserve(argv_storage.size() + 1);
@@ -222,12 +204,7 @@ bool BackendIpcProcess::start(const BackendIpcLaunchConfig & cfg) {
     ::close(cmd_pipe[0]);
     ::close(payload_pipe[0]);
     ::close(stream_pipe[1]);
-    if (cfg.run_with_sudo) {
-        ::close(payload_pipe[1]);
-        payload_fd_ = -1;
-    } else {
-        payload_fd_ = payload_pipe[1];
-    }
+    payload_fd_ = payload_pipe[1];
     stream_fd_ = stream_pipe[0];
     cmd_ = ::fdopen(cmd_pipe[1], "w");
     if (!cmd_) {

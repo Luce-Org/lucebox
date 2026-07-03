@@ -532,6 +532,11 @@ bool load_deepseek4_gguf_partial(const std::string & path,
                     std::memcpy(out.embedder.tok_embd_owned.data(),
                                 (const char *)emb_mmap.addr + a.file_offset, a.file_size);
                     emb_mmap.close_map();
+                } else {
+                    set_last_error("embedder mmap: " + emb_err);
+                    free_deepseek4_weights(out);
+                    gguf_free(gctx);
+                    return false;
                 }
                 out.embedder.tok_embd_bytes = out.embedder.tok_embd_owned.data();
                 out.embedder.tok_embd_type  = a.tensor->type;
