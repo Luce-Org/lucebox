@@ -1209,7 +1209,7 @@ LagunaGraphOutputs build_laguna_graph(
 // kernels, dominated step wall time. Staging in pinned memory and uploading
 // with tensor_set_async on the backend stream leaves the single sync inside
 // ggml_backend_graph_compute() as the only per-step synchronization.
-static uint8_t * laguna_host_stage(ggml_backend_t backend,
+uint8_t * laguna_host_stage(ggml_backend_t backend,
                                    ggml_backend_buffer_t & buf,
                                    size_t need) {
     if (buf && ggml_backend_buffer_get_size(buf) >= need) {

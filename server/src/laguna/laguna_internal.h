@@ -333,6 +333,18 @@ LagunaGraphOutputs build_laguna_graph(
 // on the position each slot holds). The caller must have allocated slots for
 // [kv_start, kv_start + n_tok) via slot_for() beforehand. Requires the
 // kv_pad set_rows path (refused otherwise).
+// Pinned host staging for per-step graph inputs; `buf` grows as needed and is
+// owned by the caller (free with ggml_backend_buffer_free).
+uint8_t * laguna_host_stage(ggml_backend_t backend,
+                            ggml_backend_buffer_t & buf,
+                            size_t need);
+
+// Pinned host staging for per-step graph inputs; `buf` grows as needed and is
+// owned by the caller (free with ggml_backend_buffer_free).
+uint8_t * laguna_host_stage(ggml_backend_t backend,
+                            ggml_backend_buffer_t & buf,
+                            size_t need);
+
 bool laguna_step(
     ggml_backend_t              backend,
     const LagunaTargetWeights & w,

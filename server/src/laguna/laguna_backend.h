@@ -109,6 +109,7 @@ private:
     DraftWeights *                              active_dw_ = nullptr;
     std::string                                 default_draft_variant_ = "base";
     DraftFeatureMirror                          feature_mirror_{};
+    ggml_backend_buffer_t                       spec_stage_ = nullptr;
     LagunaDFlashTarget *                        dflash_target_ = nullptr;
     bool                                        draft_parked_ = false;
     // [TAG_LAGUNA_VERIFY_WIDTH] EWMA of the accepted block length, persisted

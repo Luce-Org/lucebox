@@ -510,9 +510,11 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     std::vector<int32_t> target_tok((size_t)base_q_len);
     std::vector<float>   verify_logits;
     std::vector<int32_t> verify_history;
-    std::vector<int32_t> pos_q((size_t)block_size);
-    std::vector<int32_t> pos_k;
-    std::vector<float>   local_hidden;
+    // Draft-step inputs/outputs live in pinned staging (laguna_host_stage):
+    // async position uploads on the draft stream, fast D2H hidden readback.
+    int32_t * st_pos_q  = nullptr;
+    int32_t * st_pos_k  = nullptr;
+    float   * st_hidden = nullptr;
     std::vector<int32_t> sample_history =
         sample_history_prefix ? *sample_history_prefix : std::vector<int32_t>{};
 
@@ -697,15 +699,27 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
                                 sizeof(float) * noise_embed.size());
         const int kctx = (draft_sg.ctx_alloc > 0) ? draft_sg.ctx_alloc : draft_ctx;
-        pos_k.resize((size_t)kctx + (size_t)block_size);
-        for (int i = 0; i < block_size; i++) pos_q[(size_t)i] = draft_ctx + i;
-        for (int i = 0; i < kctx; i++) pos_k[(size_t)i] = (i < draft_ctx) ? i : 0;
-        for (int j = 0; j < block_size; j++) pos_k[(size_t)kctx + j] = draft_ctx + j;
+        const size_t pos_q_n = (size_t)block_size;
+        const size_t pos_k_n = (size_t)kctx + (size_t)block_size;
+        uint8_t * st = laguna_host_stage(draft_backend_, spec_stage_,
+                                         (pos_q_n + pos_k_n) * sizeof(int32_t) +
+                                         (size_t)hidden * (size_t)block_size * sizeof(float));
+        if (!st) {
+            std::fprintf(stderr, "[laguna-spec] host stage alloc failed\n");
+            step_graph_destroy(draft_sg);
+            return false;
+        }
+        st_pos_q  = (int32_t *) st;
+        st_pos_k  = st_pos_q + pos_q_n;
+        st_hidden = (float *) (st + (pos_q_n + pos_k_n) * sizeof(int32_t));
+        for (int i = 0; i < block_size; i++) st_pos_q[(size_t)i] = draft_ctx + i;
+        for (int i = 0; i < kctx; i++) st_pos_k[(size_t)i] = (i < draft_ctx) ? i : 0;
+        for (int j = 0; j < block_size; j++) st_pos_k[(size_t)kctx + j] = draft_ctx + j;
         if (step_prof) prof_lap();
-        ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
-                                sizeof(int32_t) * pos_q.size());
-        ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
-                                sizeof(int32_t) * pos_k.size());
+        ggml_backend_tensor_set_async(draft_backend_, draft_sg.positions, st_pos_q, 0,
+                                      sizeof(int32_t) * pos_q_n);
+        ggml_backend_tensor_set_async(draft_backend_, draft_sg.positions_k, st_pos_k, 0,
+                                      sizeof(int32_t) * pos_k_n);
 
         if (ggml_backend_graph_compute(draft_backend_, draft_sg.gf) != GGML_STATUS_SUCCESS) {
             std::fprintf(stderr, "[laguna-spec] draft compute failed\n");
@@ -713,9 +727,8 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             return false;
         }
 
-        local_hidden.resize((size_t)hidden * (size_t)q_len);
-        ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
-                                sizeof(float) * local_hidden.size());
+        ggml_backend_tensor_get(draft_sg.hidden_states, st_hidden, 0,
+                                sizeof(float) * (size_t)hidden * (size_t)q_len);
         if (step_prof) prof_draft_ms += prof_lap();
 
         bool used_domino = false;
@@ -736,7 +749,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                 // second graph key in the multi-key CUDA-graph cache.
                 if (domino_correct_greedy_chain_fused(
                         dw, draft_backend_, target->lm_head_tensor(),
-                        target->gpu_embd_table(), local_hidden.data(), q_len,
+                        target->gpu_embd_table(), st_hidden, q_len,
                         last_tok, draft_tok)) {
                     used_domino = true;
                 }
@@ -744,7 +757,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             if (used_domino) {
                 // fused path done
             } else if (domino_correct_greedy_chain(dw, draft_backend_, *target,
-                                            local_hidden.data(), q_len,
+                                            st_hidden, q_len,
                                             last_tok, draft_tok)) {
                 used_domino = true;
             } else {
@@ -776,11 +789,11 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                 // in-graph argmax; no host logits round-trip.
                 ds_ok = dspark_markov_correct_greedy_chain_fused(
                     dw, draft_backend_, target->lm_head_tensor(),
-                    local_hidden.data(), q_len, last_tok, draft_tok);
+                    st_hidden, q_len, last_tok, draft_tok);
             }
             if (!ds_ok) {
                 ds_ok = dspark_markov_correct_greedy_chain(dw, draft_backend_, *target,
-                                                   local_hidden.data(), q_len,
+                                                   st_hidden, q_len,
                                                    last_tok,
                                                    laguna_dspark_confidence_threshold(),
                                                    draft_tok);
@@ -799,7 +812,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             }
         }
         if (!used_domino && !used_dspark) {
-            if (!target->project_hidden_to_tokens(local_hidden.data(), q_len, draft_tok)) {
+            if (!target->project_hidden_to_tokens(st_hidden, q_len, draft_tok)) {
                 std::fprintf(stderr, "[laguna-spec] projection failed\n");
                 step_graph_destroy(draft_sg);
                 return false;
@@ -836,12 +849,12 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                 }
                 topk_ok = dspark_markov_project_topk(dw, draft_backend_,
                                                      target->lm_head_tensor(),
-                                                     local_hidden.data(), q_len, K,
+                                                     st_hidden, q_len, K,
                                                      args_.ddtree_temp, last_tok,
                                                      top_lp, top_ids);
             }
             if (!topk_ok &&
-                !target->project_hidden_to_topk(local_hidden.data(), q_len, K,
+                !target->project_hidden_to_topk(st_hidden, q_len, K,
                                                 args_.ddtree_temp, top_lp, top_ids)) {
                 std::fprintf(stderr, "[laguna-spec] ddtree topk projection failed\n");
                 step_graph_destroy(draft_sg);
@@ -3137,6 +3150,7 @@ void LagunaBackend::free_decode_draft() {
             free_draft_weights(variant.weights);
         }
     }
+    if (spec_stage_) { ggml_backend_buffer_free(spec_stage_); spec_stage_ = nullptr; }
     draft_variants_.clear();
     active_dw_ = nullptr;
     default_draft_variant_ = "base";
