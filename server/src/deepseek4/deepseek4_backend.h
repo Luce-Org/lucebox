@@ -11,6 +11,7 @@
 #include "../common/moe_hybrid_placement.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_storage.h"
+#include "../common/moe_hybrid_stream.h"
 #include "deepseek4_internal.h"
 
 #include "ggml.h"
@@ -95,6 +96,7 @@ private:
 
     std::shared_ptr<MoeHybridStorage> moe_hybrid_;
     MoeHybridPlacement                moe_placement_;
+    MoeHybridStreamEngine             stream_engine_;
     // Expert IPC removed — layer split replaces expert split.
     // Kept for compilation compatibility; init_hybrid_model() is no longer called
     // from the layer-split path.

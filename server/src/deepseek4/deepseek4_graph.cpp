@@ -15,6 +15,7 @@
 #include "../common/step_graph.h"
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_routing_stats.h"
+#include "../common/moe_hybrid_stream.h"
 #include "../common/moe_hybrid_types.h"
 
 #include "ggml.h"
@@ -1539,7 +1540,9 @@ static bool eval_ds4_hybrid_or_worker(
         ggml_backend_t cpu_backend,
         const MoeHybridConfig & hybrid_cfg,
         const MoeLayerDesc & desc,
+        const MoeHybridStorage * hybrid_owner,
         MoeHybridLayerStorage & storage,
+        MoeHybridStreamEngine * stream_engine,
         ExpertIpcClient * expert_worker,
         int layer,
         int n_embd,
@@ -1556,6 +1559,87 @@ static bool eval_ds4_hybrid_or_worker(
     const auto ffn_t0 = Ds4TimingClock::now();
     const bool use_worker = expert_worker && expert_worker->active() &&
         (worker_owns_hot_ids || (!storage.down_cold && !storage.gate_up_cold));
+    if (!use_worker && !storage.down_cold && !storage.gate_up_cold) {
+        if (!hybrid_owner || !stream_engine || !stream_engine->is_ready() ||
+            !hybrid_owner->has_mmap() ||
+            layer < 0 || layer >= (int) hybrid_owner->layer_regions.size()) {
+            std::fprintf(stderr,
+                         "[deepseek4] layer %d requires cold-expert streaming but it is unavailable\n",
+                         layer);
+            return false;
+        }
+
+        const LayerExpertRegions & regions = hybrid_owner->layer_regions[(size_t) layer];
+        ffn_out_host.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
+        std::vector<int32_t> hot_selected;
+        std::vector<float> hot_weights;
+        std::vector<float> hot_out;
+        std::vector<float> cold_out;
+        for (int ti = 0; ti < n_tokens; ++ti) {
+            const float * token_inp = ffn_normed_host + (size_t)ti * (size_t)n_embd;
+            const int32_t * token_selected = selected_host + (size_t)ti * (size_t)n_expert_used;
+            const float * token_weights = weights_host + (size_t)ti * (size_t)n_expert_used;
+            hot_selected.clear();
+            hot_weights.clear();
+            bool has_cold = false;
+            for (int ei = 0; ei < n_expert_used; ++ei) {
+                const int32_t gid = token_selected[ei];
+                if (gid < 0 || gid >= (int32_t) storage.hot_local_by_global.size()) {
+                    std::fprintf(stderr,
+                                 "[deepseek4] layer %d selected expert id out of range: %d\n",
+                                 layer, (int) gid);
+                    return false;
+                }
+                if (storage.hot_local_by_global[(size_t)gid] >= 0) {
+                    hot_selected.push_back(gid);
+                    hot_weights.push_back(token_weights[ei]);
+                } else {
+                    has_cold = true;
+                }
+            }
+
+            std::string err;
+            MoeHybridFfnTelemetry single_tel;
+            if (!eval_moe_hybrid_ffn_single(
+                    backend, hybrid_cfg, desc, storage, cpu_backend,
+                    token_inp,
+                    hot_selected.empty() ? nullptr : hot_selected.data(),
+                    hot_weights.empty() ? nullptr : hot_weights.data(),
+                    (int) hot_selected.size(),
+                    hot_out,
+                    step_tel ? &single_tel : nullptr,
+                    &err)) {
+                std::fprintf(stderr,
+                             "[deepseek4] layer %d hot/shared eval failed: %s\n",
+                             layer, err.c_str());
+                return false;
+            }
+            add_ffn_telemetry(step_tel, single_tel);
+
+            cold_out.assign((size_t)n_embd, 0.0f);
+            if (has_cold) {
+                if (!eval_moe_cold_experts_streaming(
+                        *stream_engine, backend,
+                        hybrid_owner->mmap_data, hybrid_owner->mmap_size,
+                        hybrid_cfg, desc, regions, storage,
+                        token_inp, token_selected, token_weights, 1,
+                        cold_out, &err)) {
+                    std::fprintf(stderr,
+                                 "[deepseek4] layer %d cold streaming eval failed: %s\n",
+                                 layer, err.c_str());
+                    return false;
+                }
+            }
+
+            float * dst = ffn_out_host.data() + (size_t)ti * (size_t)n_embd;
+            for (int i = 0; i < n_embd; ++i) {
+                dst[i] = hot_out[(size_t)i] + cold_out[(size_t)i];
+            }
+        }
+        if (step_tel) step_tel->ffn_eval_us += ds4_elapsed_us(ffn_t0, Ds4TimingClock::now());
+        return true;
+    }
+
     if (!use_worker) {
         MoeHybridFfnTelemetry ffn_tel;
         bool ffn_ok = eval_moe_hybrid_ffn_batched(
@@ -2236,6 +2320,7 @@ static bool deepseek4_step_hybrid(
         const int32_t * token_ids,
         ExpertIpcClient * expert_worker,
         bool worker_owns_hot_ids,
+        MoeHybridStreamEngine * stream_engine,
         DeepSeek4StepTelemetry * telemetry,
         MoeHybridRoutingStats * routing_stats) {
     const auto step_t0 = Ds4TimingClock::now();
@@ -2489,7 +2574,7 @@ static bool deepseek4_step_hybrid(
             MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
             auto & storage = moe_hybrid.layers[(size_t) il];
             if (!eval_ds4_hybrid_or_worker(
-                    backend, cpu_backend, hybrid_cfg, desc, storage, expert_worker,
+                    backend, cpu_backend, hybrid_cfg, desc, &moe_hybrid, storage, stream_engine, expert_worker,
                     il, n_embd, w.n_expert_used,
                     ffn_normed_host.data(), selected_host.data(), weights_host.data(),
                     n_tokens, ffn_out_host, &hot_alloc, &cold_alloc,
@@ -2604,7 +2689,7 @@ static bool deepseek4_step_hybrid(
             MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
             auto & storage = moe_hybrid.layers[(size_t) il];
             if (!eval_ds4_hybrid_or_worker(
-                    backend, cpu_backend, hybrid_cfg, desc, storage, expert_worker,
+                    backend, cpu_backend, hybrid_cfg, desc, &moe_hybrid, storage, stream_engine, expert_worker,
                     il, n_embd, w.n_expert_used,
                     ffn_normed_host.data(), selected_host.data(), weights_host.data(),
                     n_tokens, ffn_out_host, &hot_alloc, &cold_alloc,
@@ -2711,6 +2796,7 @@ bool deepseek4_step(
         const int32_t * token_ids,
         ExpertIpcClient * expert_worker,
         bool worker_owns_hot_ids,
+        MoeHybridStreamEngine * stream_engine,
         DeepSeek4StepTelemetry * telemetry,
         MoeHybridRoutingStats * routing_stats) {
 
@@ -2718,7 +2804,7 @@ bool deepseek4_step(
         return deepseek4_step_hybrid(backend, w, cache, *moe_hybrid,
                                      embed, n_tokens, kv_start, out_logits,
                                      token_ids, expert_worker, worker_owns_hot_ids,
-                                     telemetry, routing_stats);
+                                     stream_engine, telemetry, routing_stats);
     }
 
     const int n_embd = w.n_embd;

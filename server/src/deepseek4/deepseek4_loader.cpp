@@ -660,6 +660,79 @@ bool build_deepseek4_moe_hybrid_storage_from_file(
     return ok;
 }
 
+bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
+        const std::string & path,
+        ggml_backend_t backend,
+        const DeepSeek4Weights & w,
+        const MoeHybridPlacement & placement,
+        const MoeHybridConfig * cfg_override,
+        MoeHybridStorage & out,
+        std::string * err) {
+    ggml_context * expert_meta = nullptr;
+    gguf_init_params gip{};
+    gip.no_alloc = true;
+    gip.ctx = &expert_meta;
+    gguf_context * gctx = gguf_init_from_file(path.c_str(), gip);
+    if (!gctx) {
+        if (err) *err = "failed to re-open GGUF for expert loading";
+        return false;
+    }
+
+    DS4Mmap mmap;
+    std::string mmap_err;
+    if (!mmap.open_ro(path, mmap_err)) {
+        gguf_free(gctx);
+        if (expert_meta) ggml_free(expert_meta);
+        if (err) *err = mmap_err;
+        return false;
+    }
+    if (mmap.fd >= 0) {
+        ::close(mmap.fd);
+        mmap.fd = -1;
+    }
+
+    const size_t data_start = gguf_get_data_offset(gctx);
+    const auto * file_bytes = static_cast<const uint8_t *>(mmap.addr);
+    std::vector<LayerExpertFileData> layer_file_data((size_t)w.n_layer);
+
+    for (int il = 0; il < w.n_layer; ++il) {
+        char name[128];
+        auto find_tensor_data = [&](const char * suffix) -> ExpertTensorFileData {
+            std::snprintf(name, sizeof(name), "blk.%d.%s.weight", il, suffix);
+            int64_t tid = gguf_find_tensor(gctx, name);
+            if (tid < 0) return {};
+            const size_t off = data_start + gguf_get_tensor_offset(gctx, tid);
+            const size_t sz = gguf_get_tensor_size(gctx, tid);
+            if (off + sz > mmap.len) return {};
+            return { file_bytes + off, sz };
+        };
+
+        layer_file_data[(size_t)il].gate_exps = find_tensor_data("ffn_gate_exps");
+        layer_file_data[(size_t)il].up_exps = find_tensor_data("ffn_up_exps");
+        layer_file_data[(size_t)il].down_exps = find_tensor_data("ffn_down_exps");
+    }
+
+    std::vector<MoeLayerDesc> layer_descs((size_t)w.n_layer);
+    for (int il = 0; il < w.n_layer; ++il) {
+        layer_descs[(size_t)il] = make_ds4_moe_layer_desc(w.layers[(size_t)il]);
+    }
+
+    const MoeHybridConfig cfg = cfg_override ? *cfg_override : make_ds4_moe_hybrid_config(w);
+    const bool ok = build_moe_hybrid_storage_from_file_with_mmap(
+        cfg, backend, placement, layer_descs, layer_file_data,
+        mmap.addr, mmap.len, out, err);
+
+    if (!ok) {
+        mmap.close_map();
+    } else {
+        mmap.addr = nullptr;
+        mmap.len = 0;
+    }
+    gguf_free(gctx);
+    if (expert_meta) ggml_free(expert_meta);
+    return ok;
+}
+
 bool build_deepseek4_moe_hybrid_storage_from_file(
         const std::string & path,
         ggml_backend_t backend,

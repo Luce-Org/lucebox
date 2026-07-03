@@ -474,9 +474,34 @@ bool DeepSeek4Backend::init_hybrid_model() {
     }
 
     auto hybrid = std::make_shared<MoeHybridStorage>();
-    if (!build_deepseek4_moe_hybrid_storage_from_file(cfg_.model_path, backend_, w_, moe_placement_, nullptr, *hybrid, &err)) {
+    const MoeHybridConfig hybrid_cfg = make_ds4_parent_worker_cfg(w_);
+    if (!build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
+            cfg_.model_path, backend_, w_, moe_placement_, &hybrid_cfg, *hybrid, &err)) {
         std::fprintf(stderr, "[deepseek4] failed to build hybrid expert storage: %s\n", err.c_str());
         return false;
+    }
+
+    if (hybrid->has_mmap() && !hybrid->materialized_cold_experts) {
+        size_t max_expert_bytes = 0;
+        for (const auto & layer : hybrid->layers) {
+            const size_t per_expert_bytes = layer.fused_gate_up
+                ? layer.gate_up_expert_bytes + layer.down_expert_bytes
+                : layer.gate_expert_bytes + layer.up_expert_bytes + layer.down_expert_bytes;
+            max_expert_bytes = std::max(max_expert_bytes, per_expert_bytes);
+        }
+        if (max_expert_bytes == 0) {
+            std::fprintf(stderr, "[deepseek4] failed to compute streaming expert size\n");
+            return false;
+        }
+        if (!stream_engine_.init(backend_, max_expert_bytes, &err)) {
+            std::fprintf(stderr, "[deepseek4] failed to init cold-expert stream engine: %s\n",
+                         err.c_str());
+            return false;
+        }
+        std::fprintf(stderr,
+                     "[deepseek4] cold-expert stream engine ready: pinned=%.1f MiB scratch=%.1f MiB\n",
+                     stream_engine_.pinned_bytes() / 1024.0 / 1024.0,
+                     stream_engine_.scratch_bytes() / 1024.0 / 1024.0);
     }
 
     moe_hybrid_ = std::move(hybrid);
@@ -539,6 +564,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (!deepseek4_step(backend_, w_, cache_, embed.data(), n_tok, pos, logits,
                             moe_hybrid_.get(), tokens.data() + i, nullptr,
                             false,
+                            moe_hybrid_ ? &stream_engine_ : nullptr,
                             timing ? &step_tel : nullptr,
                             routing_stats_.get())) {
             std::fprintf(stderr, "[deepseek4] prefill step failed at pos=%d\n", pos);
@@ -601,6 +627,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
                                 pos, logits,
                                 moe_hybrid_.get(), &tok_to_eval, nullptr,
                                 false,
+                                moe_hybrid_ ? &stream_engine_ : nullptr,
                                 timing ? &step_tel : nullptr,
                                 routing_stats_.get())) {
                 std::fprintf(stderr, "[deepseek4] decode step failed\n");
@@ -737,6 +764,7 @@ void DeepSeek4Backend::shutdown() {
         free_deepseek4_snapshot(snapshots_[i]);
     }
     free_deepseek4_cache(cache_);
+    stream_engine_.destroy();
     moe_hybrid_.reset();
     routing_stats_.reset();
     routing_stats_out_path_.clear();

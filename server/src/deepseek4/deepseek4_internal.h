@@ -30,6 +30,7 @@ namespace dflash::common {
 struct MoeHybridPlacement;
 struct MoeHybridConfig;
 struct MoeHybridRoutingStats;
+class MoeHybridStreamEngine;
 class ExpertIpcClient;
 
 struct DeepSeek4StepTelemetry {
@@ -323,6 +324,7 @@ bool deepseek4_step(
     const int32_t *             token_ids = nullptr,
     ExpertIpcClient *  expert_worker = nullptr,
     bool                        worker_owns_hot_ids = false,
+    MoeHybridStreamEngine *     stream_engine = nullptr,
     DeepSeek4StepTelemetry *    telemetry = nullptr,
     MoeHybridRoutingStats *     routing_stats = nullptr);
 
@@ -354,6 +356,15 @@ bool build_deepseek4_moe_hybrid_storage_from_file(
     ggml_backend_t              backend,
     const DeepSeek4Weights &    w,
     const MoeHybridPlacement &  placement,
+    MoeHybridStorage &          out,
+    std::string *               err = nullptr);
+
+bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
+    const std::string &         path,
+    ggml_backend_t              backend,
+    const DeepSeek4Weights &    w,
+    const MoeHybridPlacement &  placement,
+    const MoeHybridConfig *     cfg_override,
     MoeHybridStorage &          out,
     std::string *               err = nullptr);
 
