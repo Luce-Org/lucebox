@@ -74,6 +74,9 @@ struct LagunaTargetLayer {
     // regions; zero extra VRAM). Null when the pair could not be fused
     // (type mismatch / DFLASH_LAGUNA_FUSED_QK=0). Same data as wq/wk etc.
     ggml_tensor * wqk       = nullptr;  // [n_embd, (n_head+n_head_kv)*head_dim]
+    ggml_tensor * wqkv      = nullptr;  // [n_embd, (n_head+2*n_head_kv)*head_dim]; only
+                                        // when q/k/v share one quant type (V is Q6_K in
+                                        // half the Q4_K_M layers, which fuse as qk+v)
     ggml_tensor * shexp_gu  = nullptr;  // [n_embd, 2*n_ff_shexp]  gate rows then up rows
     ggml_tensor * qk_norm_f = nullptr;  // [head_dim, n_head+n_head_kv] f32, q_norm|k_norm per head
 };

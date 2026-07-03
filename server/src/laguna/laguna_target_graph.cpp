@@ -682,8 +682,21 @@ static ggml_tensor * build_laguna_attn_block(
     const bool qk_layer_on = il < qk_fuse_layers && n_tokens <= 8;
     ggml_tensor * Qcur = nullptr;
     ggml_tensor * Kcur = nullptr;
+    ggml_tensor * Vcur = nullptr;
     ggml_tensor * qk_fused = nullptr;
-    if (L.wqk && L.qk_norm_f && qk_layer_on && qk_fuse_mode == 1) {
+    if (L.wqkv && L.qk_norm_f && qk_layer_on && qk_fuse_mode >= 3) {
+        // QKV fusion (layers where V shares the q/k quant type): one matmul;
+        // the fused norm and rope touch only the leading q|k heads, V is a
+        // strided view of the projection (downstream cache write conts it).
+        ggml_tensor * qkv = ggml_mul_mat(ctx, L.wqkv, cur);
+        qkv = ggml_reshape_3d(ctx, qkv, head_dim, n_head + 2 * n_head_kv, n_tokens);
+        qk_fused = ggml_view_3d(ctx, qkv, head_dim, n_head + n_head_kv,
+                                n_tokens, qkv->nb[1], qkv->nb[2], 0);
+        qk_fused = laguna_rms_norm_mul(ctx, qk_fused, L.qk_norm_f);
+        Vcur = ggml_view_3d(ctx, qkv, head_dim, n_head_kv, n_tokens,
+                            qkv->nb[1], qkv->nb[2],
+                            (size_t)(n_head + n_head_kv) * qkv->nb[1]);
+    } else if (L.wqk && L.qk_norm_f && qk_layer_on && qk_fuse_mode == 1) {
         // matmul-only fusion: split + cont right after the projection, then the
         // legacy norm/rope path
         ggml_tensor * qkmm = ggml_mul_mat(ctx, L.wqk, cur);
@@ -717,8 +730,10 @@ static ggml_tensor * build_laguna_attn_block(
         Qcur = laguna_rms_norm_mul(ctx, Qcur, L.q_norm);
         Kcur = laguna_rms_norm_mul(ctx, Kcur, L.k_norm);
     }
-    ggml_tensor * Vcur = ggml_mul_mat(ctx, L.wv, cur);
-    Vcur = ggml_reshape_3d(ctx, Vcur, head_dim, n_head_kv, n_tokens);
+    if (!Vcur) {
+        Vcur = ggml_mul_mat(ctx, L.wv, cur);
+        Vcur = ggml_reshape_3d(ctx, Vcur, head_dim, n_head_kv, n_tokens);
+    }
 
     // ---- Per-head softplus attention gate ---
     // wqkv_gate : [n_embd, n_head]; gate_proj output [n_head, n_tokens] f32.

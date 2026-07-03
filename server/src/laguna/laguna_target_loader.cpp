@@ -464,10 +464,17 @@ bool load_target_gguf_laguna_partial(const std::string & path,
             if (used[i]) continue;
             const std::string nm = ggml_get_name(allocs[i].tensor);
             std::string first, second;
+            std::string third;
             if (nm.find("attn_q.weight") != std::string::npos) {
                 first = nm; second = rename_sub(nm, "attn_q.weight", "attn_k.weight");
+                third = rename_sub(nm, "attn_q.weight", "attn_v.weight");
             } else if (nm.find("attn_k.weight") != std::string::npos) {
                 first = rename_sub(nm, "attn_k.weight", "attn_q.weight"); second = nm;
+                third = rename_sub(nm, "attn_k.weight", "attn_v.weight");
+            } else if (nm.find("attn_v.weight") != std::string::npos) {
+                first = rename_sub(nm, "attn_v.weight", "attn_q.weight");
+                second = rename_sub(nm, "attn_v.weight", "attn_k.weight");
+                third = nm;
             } else if (nm.find("ffn_gate_shexp.weight") != std::string::npos) {
                 first = nm; second = rename_sub(nm, "ffn_gate_shexp.weight", "ffn_up_shexp.weight");
             } else if (nm.find("ffn_up_shexp.weight") != std::string::npos) {
@@ -479,8 +486,10 @@ bool load_target_gguf_laguna_partial(const std::string & path,
             }
             const int fi = idx_of(first);
             const int si = idx_of(second);
+            const int ti = idx_of(third);
             if (fi >= 0) { used[fi] = 1; arranged.push_back(allocs[fi]); }
             if (si >= 0) { used[si] = 1; arranged.push_back(allocs[si]); }
+            if (ti >= 0) { used[ti] = 1; arranged.push_back(allocs[ti]); }
         }
         allocs.swap(arranged);
         alloc_total = 0;
@@ -520,11 +529,11 @@ bool load_target_gguf_laguna_partial(const std::string & path,
     // the pair's bytes (no copy); wq/wk stay valid for all other paths.
     if (fuse_qk_env) {
         ggml_init_params fip{};
-        fip.mem_size = ggml_tensor_overhead() * (size_t)(2 * n_layer + 8);
+        fip.mem_size = ggml_tensor_overhead() * (size_t)(3 * n_layer + 8);
         fip.no_alloc = true;
         out.fuse_ctx = ggml_init(fip);
     }
-    int n_fused_qk = 0, n_fused_gu = 0;
+    int n_fused_qk = 0, n_fused_gu = 0, n_fused_qkv = 0;
     if (out.fuse_ctx) {
         auto adjacent = [&](ggml_tensor * a, ggml_tensor * b) {
             return a && b && a->type == b->type && a->ne[0] == b->ne[0] &&
@@ -542,6 +551,18 @@ bool load_target_gguf_laguna_partial(const std::string & path,
                     L.wqk = t;
                     n_fused_qk++;
                 }
+                // V joins the fusion only where it shares the q/k quant type
+                // (adjacent() rejects the Q6_K attn_v layers of a Q4_K_M mix).
+                if (adjacent(L.wk, L.wv)) {
+                    ggml_tensor * t3 = ggml_new_tensor_2d(out.fuse_ctx, L.wq->type,
+                                                          L.wq->ne[0],
+                                                          L.wq->ne[1] + L.wk->ne[1] + L.wv->ne[1]);
+                    ggml_format_name(t3, "blk.%u.attn_qkv_fused", il);
+                    if (ggml_backend_tensor_alloc(out.buf, t3, L.wq->data) == GGML_STATUS_SUCCESS) {
+                        L.wqkv = t3;
+                        n_fused_qkv++;
+                    }
+                }
             }
             if (adjacent(L.ffn_gate_shexp, L.ffn_up_shexp)) {
                 ggml_tensor * t = ggml_new_tensor_2d(out.fuse_ctx, L.ffn_gate_shexp->type,
@@ -554,8 +575,8 @@ bool load_target_gguf_laguna_partial(const std::string & path,
                 }
             }
         }
-        std::printf("[laguna-loader] fused adjacent weights: qk=%d shexp_gu=%d layers\n",
-                    n_fused_qk, n_fused_gu);
+        std::printf("[laguna-loader] fused adjacent weights: qk=%d qkv=%d shexp_gu=%d layers\n",
+                    n_fused_qk, n_fused_qkv, n_fused_gu);
     }
 
     // ── 4. Copy selected tensor bytes to GPU; remember tok_embd for embedder ─
