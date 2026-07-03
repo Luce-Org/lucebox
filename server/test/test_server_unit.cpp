@@ -30,6 +30,7 @@
 #include "common/kvflash_pager.h"
 #include "placement/draft_residency.h"
 #include "common/gguf_bounds.h"
+#include "qwen35/qwen35_graph_options.h"
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
 #include "qwen3_drafter_model.h"
@@ -2306,6 +2307,27 @@ static void test_layer_split_backend_capability_proxy() {
     TEST_ASSERT(backend.supports_mixed_backend_layer_split());
 }
 
+// FWHT K-rotation opt-in tests
+// ═══════════════════════════════════════════════════════════════════════
+
+static void test_qwen35_q4_0_k_cache_rotates_by_default() {
+    unsetenv("DFLASH_SKIP_WHT");
+
+    TEST_ASSERT(qwen35_should_use_graph_wht_k_rotation(GGML_TYPE_Q4_0));
+}
+
+static void test_qwen35_skip_wht_opt_in_disables_rotation_for_q4_0() {
+    setenv("DFLASH_SKIP_WHT", "1", 1);
+
+    TEST_ASSERT(!qwen35_should_use_graph_wht_k_rotation(GGML_TYPE_Q4_0));
+
+    unsetenv("DFLASH_SKIP_WHT");
+}
+
+static void test_qwen35_tq3_0_never_rotates() {
+    TEST_ASSERT(!qwen35_should_use_graph_wht_k_rotation(GGML_TYPE_TQ3_0));
+}
+
 // Disk Prefix Cache Tests
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -4523,6 +4545,9 @@ int main() {
     RUN_TEST(test_layer_split_compress_rejects_bad_keep_ratio);
     RUN_TEST(test_layer_split_backend_shutdown_is_idempotent);
     RUN_TEST(test_layer_split_backend_capability_proxy);
+    RUN_TEST(test_qwen35_q4_0_k_cache_rotates_by_default);
+    RUN_TEST(test_qwen35_skip_wht_opt_in_disables_rotation_for_q4_0);
+    RUN_TEST(test_qwen35_tq3_0_never_rotates);
 
     std::fprintf(stderr, "\n── Disk prefix cache ──\n");
     RUN_TEST(test_disk_cache_config_defaults);
