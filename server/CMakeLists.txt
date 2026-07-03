@@ -133,6 +133,11 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             list(APPEND _dflash_archs "121")
         endif()
     endif()
+    # Keep the vendored ggml-cuda build aligned with the resolved dflash arch list.
+    # Otherwise ggml may inherit CMake's compiler-default arch (for example sm_52),
+    # which triggers massive first-request PTX JIT on newer GPUs even though
+    # dflash_common itself is compiled for the intended arch set.
+    set(CMAKE_CUDA_ARCHITECTURES "${_dflash_archs}" CACHE STRING "" FORCE)
 elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     # User override precedence: -DDFLASH27B_HIP_ARCHITECTURES → -DAMDGPU_TARGETS
     # → gfx1151 default (Strix Halo).
