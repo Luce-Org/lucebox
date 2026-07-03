@@ -47,11 +47,15 @@ static void log_target_shard_timing(int n_tokens,
                                     const DeepSeek4StepTelemetry & tel) {
     std::fprintf(stderr,
         "[deepseek4-target-timing] tokens=%d layers=[%d,%d) total=%.1fms "
-        "hc_pre=%.1fms attn_build=%.1fms attn_compute=%.1fms attn_read=%.1fms "
+        "hc_pre=%.1fms hc_pre_build=%.1fms hc_pre_input=%.1fms hc_pre_compute=%.1fms "
+        "attn_build=%.1fms attn_compute=%.1fms attn_read=%.1fms "
         "ffn_build=%.1fms ffn_compute=%.1fms ffn_read=%.1fms hc_post=%.1fms output=%.1fms\n",
         n_tokens, layer_begin, layer_end,
         target_shard_ms(tel.total_us),
         target_shard_ms(tel.hc_pre_attn_us + tel.hc_pre_ffn_us),
+        target_shard_ms(tel.hc_pre_build_us),
+        target_shard_ms(tel.hc_pre_input_us),
+        target_shard_ms(tel.hc_pre_compute_us),
         target_shard_ms(tel.attn_build_us),
         target_shard_ms(tel.attn_compute_us),
         target_shard_ms(tel.attn_read_us),

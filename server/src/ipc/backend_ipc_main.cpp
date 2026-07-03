@@ -166,9 +166,6 @@ int main(int argc, char ** argv) {
     bool enable_dflash = false;
     int kvflash_pool_tokens = 0;
     const char * placement_path = nullptr;
-    const char * ds4_expert_budget_mb = nullptr;
-    const char * ds4_expert_offset = nullptr;
-    const char * ds4_placement_in = nullptr;
     bool ds4_fixed_slot_graphs = false;
     for (int i = arg_begin; i < argc; i++) {
         if (std::strncmp(argv[i], "--ring-cap=", 11) == 0) {
@@ -295,18 +292,6 @@ int main(int argc, char ** argv) {
             placement_path = argv[i] + 12;
         } else if (std::strcmp(argv[i], "--placement") == 0) {
             if (!require_value(i, argc, argv, "--placement", placement_path)) return 2;
-        } else if (std::strncmp(argv[i], "--expert-budget-mb=", 19) == 0) {
-            ds4_expert_budget_mb = argv[i] + 19;
-        } else if (std::strcmp(argv[i], "--expert-budget-mb") == 0) {
-            if (i + 1 < argc) ds4_expert_budget_mb = argv[++i];
-        } else if (std::strncmp(argv[i], "--expert-offset=", 16) == 0) {
-            ds4_expert_offset = argv[i] + 16;
-        } else if (std::strcmp(argv[i], "--expert-offset") == 0) {
-            if (i + 1 < argc) ds4_expert_offset = argv[++i];
-        } else if (std::strncmp(argv[i], "--placement-in=", 15) == 0) {
-            ds4_placement_in = argv[i] + 15;
-        } else if (std::strcmp(argv[i], "--placement-in") == 0) {
-            if (i + 1 < argc) ds4_placement_in = argv[++i];
         } else if (std::strcmp(argv[i], "--fixed-slot-graphs") == 0) {
             ds4_fixed_slot_graphs = true;
         } else {
@@ -318,15 +303,6 @@ int main(int argc, char ** argv) {
     (void)target_vocab;
     (void)target_max_tokens;
 
-    if (ds4_expert_budget_mb) {
-        setenv("DFLASH_DS4_EXPERT_WORKER_BUDGET_MB", ds4_expert_budget_mb, 1);
-    }
-    if (ds4_expert_offset) {
-        setenv("DFLASH_DS4_EXPERT_WORKER_OFFSET", ds4_expert_offset, 1);
-    }
-    if (ds4_placement_in) {
-        setenv("DFLASH_DS4_PLACEMENT_IN", ds4_placement_in, 1);
-    }
     if (ds4_fixed_slot_graphs) {
         setenv("DFLASH_MOE_FIXED_SLOT_GRAPHS", "1", 1);
     }

@@ -97,24 +97,6 @@ static bool build_worker_placement(const DeepSeek4Weights & w,
                                    int worker_gpu,
                                    MoeHybridPlacement & out,
                                    std::string & err) {
-    if (const char * placement_in = std::getenv("DFLASH_DS4_PLACEMENT_IN")) {
-        if (placement_in[0]) {
-            MoeHybridPlacement placement;
-            if (!MoeHybridPlacement::load_json(placement_in, placement, &err)) {
-                return false;
-            }
-            if (!placement.matches(w.n_layer, w.n_expert, w.n_expert_used)) {
-                err = "worker placement dimensions do not match DeepSeek4 model";
-                return false;
-            }
-            out = std::move(placement);
-            std::fprintf(stderr,
-                         "[expert-ipc-daemon] loaded placement=%s total_hot=%d\n",
-                         placement_in, out.total_hot);
-            return true;
-        }
-    }
-
     size_t gpu_free = 0;
     size_t gpu_total = 0;
     ggml_backend_cuda_get_device_memory(worker_gpu, &gpu_free, &gpu_total);
@@ -136,10 +118,7 @@ static bool build_worker_placement(const DeepSeek4Weights & w,
 
     uint64_t budget = gpu_free > (768ULL << 20) ? gpu_free - (768ULL << 20) : 0;
     if (budget > total_expert_bytes) budget = total_expert_bytes;
-    if (const char * env = std::getenv("DFLASH_DS4_EXPERT_WORKER_BUDGET_MB")) {
-        const uint64_t cap = (uint64_t)std::max(0, std::atoi(env)) << 20;
-        if (cap > 0 && cap < budget) budget = cap;
-    } else if (const char * env = std::getenv("DFLASH_EXPERT_BUDGET_MB")) {
+    if (const char * env = std::getenv("DFLASH_EXPERT_BUDGET_MB")) {
         const uint64_t cap = (uint64_t)std::max(0, std::atoi(env)) << 20;
         if (cap > 0 && cap < budget) budget = cap;
     }
@@ -149,9 +128,6 @@ static bool build_worker_placement(const DeepSeek4Weights & w,
         return false;
     }
     int first_expert = 0;
-    if (const char * env = std::getenv("DFLASH_DS4_EXPERT_WORKER_OFFSET")) {
-        first_expert = std::max(0, std::atoi(env));
-    }
     if (first_expert >= w.n_expert) first_expert = 0;
     const int resident_per_layer = std::min(hot_per_layer, w.n_expert - first_expert);
     if (resident_per_layer <= 0) {

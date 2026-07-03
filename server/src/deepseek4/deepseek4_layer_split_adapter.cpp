@@ -50,6 +50,9 @@ static void add_step_tel(DeepSeek4StepTelemetry & dst, const DeepSeek4StepTeleme
     dst.total_us += src.total_us;
     dst.embed_us += src.embed_us;
     dst.hc_pre_attn_us += src.hc_pre_attn_us;
+    dst.hc_pre_build_us += src.hc_pre_build_us;
+    dst.hc_pre_input_us += src.hc_pre_input_us;
+    dst.hc_pre_compute_us += src.hc_pre_compute_us;
     dst.attn_build_us += src.attn_build_us;
     dst.attn_compute_us += src.attn_compute_us;
     dst.attn_read_us += src.attn_read_us;
@@ -69,11 +72,15 @@ static void log_split_tel(const char * phase,
                           uint64_t total_us) {
     std::fprintf(stderr,
         "[deepseek4-split-timing] %s tokens=%d total=%.1fms local=%.1fms remote=%.1fms "
-        "embed=%.1fms hc_pre=%.1fms attn_build=%.1fms attn_compute=%.1fms attn_read=%.1fms "
+        "embed=%.1fms hc_pre=%.1fms hc_pre_build=%.1fms hc_pre_input=%.1fms hc_pre_compute=%.1fms "
+        "attn_build=%.1fms attn_compute=%.1fms attn_read=%.1fms "
         "ffn_build=%.1fms ffn_compute=%.1fms ffn_read=%.1fms hc_post=%.1fms output=%.1fms\n",
         phase, n_tokens, split_ms(total_us), split_ms(local_tel.total_us), split_ms(remote_forward_us),
         split_ms(local_tel.embed_us),
         split_ms(local_tel.hc_pre_attn_us + local_tel.hc_pre_ffn_us),
+        split_ms(local_tel.hc_pre_build_us),
+        split_ms(local_tel.hc_pre_input_us),
+        split_ms(local_tel.hc_pre_compute_us),
         split_ms(local_tel.attn_build_us),
         split_ms(local_tel.attn_compute_us),
         split_ms(local_tel.attn_read_us),

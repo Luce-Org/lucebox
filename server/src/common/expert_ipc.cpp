@@ -37,24 +37,9 @@ bool ExpertIpcClient::start(const std::string & bin,
     launch.payload_path = model_path;
     launch.work_dir = work_dir;
     launch.args.push_back("--draft-gpu=" + std::to_string(std::max(0, worker_gpu)));
-    if (const char * budget_mb = std::getenv("DFLASH_DS4_EXPERT_WORKER_BUDGET_MB")) {
-        if (budget_mb[0]) launch.args.push_back(std::string("--expert-budget-mb=") + budget_mb);
-    }
-    if (const char * offset = std::getenv("DFLASH_DS4_EXPERT_WORKER_OFFSET")) {
-        if (offset[0]) launch.args.push_back(std::string("--expert-offset=") + offset);
-    }
-    if (const char * placement = std::getenv("DFLASH_DS4_PLACEMENT_IN")) {
-        if (placement[0]) launch.args.push_back(std::string("--placement-in=") + placement);
-    }
     if (const char * fixed_slot = std::getenv("DFLASH_MOE_FIXED_SLOT_GRAPHS")) {
         if (fixed_slot[0] && std::strcmp(fixed_slot, "0") != 0) {
             launch.args.push_back("--fixed-slot-graphs");
-        }
-    }
-    if (const char * sudo_env = std::getenv("DFLASH_DS4_EXPERT_IPC_SUDO")) {
-        if (sudo_env[0] && std::strcmp(sudo_env, "0") != 0) {
-            launch.run_with_sudo = true;
-            launch.stream_on_stdout = true;
         }
     }
     if (!process_.start(launch)) {

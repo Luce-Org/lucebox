@@ -1599,7 +1599,7 @@ static bool eval_ds4_hybrid_or_worker(
     std::vector<float> local_weights;
     std::vector<int32_t> remote_ids;
     std::vector<float> remote_weights;
-    const bool async_worker = expert_worker && ds4_env_flag("DFLASH_DS4_ASYNC_WORKER");
+    const bool async_worker = false;
     for (int ti = 0; ti < n_tokens; ++ti) {
         local_ids.clear();
         local_weights.clear();
@@ -2990,19 +2990,24 @@ bool deepseek4_step_layer_range(
         // ── HC pre (attention) ──────────────────────────────────────
         const auto hc_pre_attn_t0 = Ds4TimingClock::now();
         if (use_backend_decode_hc_direct) {
+            const auto hc_pre_attn_input_t0 = Ds4TimingClock::now();
             ggml_backend_tensor_set(cached_decode_hc_post_graph.residual_hc,
                                     hc_state.data(), 0, sizeof(float) * hc_state.size());
+            if (telemetry) telemetry->hc_pre_input_us += ds4_elapsed_us(hc_pre_attn_input_t0, Ds4TimingClock::now());
             auto & cached = cached_decode_attn_hc_pre_graphs[(size_t)il];
             if (!cached.valid() ||
                 cached.owner_ctx != w.ctx ||
                 cached.backend != backend ||
                 cached.layer_idx != il ||
                 cached.ffn) {
+                const auto hc_pre_attn_build_t0 = Ds4TimingClock::now();
                 if (!build_cached_decode_hc_pre_graph(cached, backend, w, L, hc_lw.attn.scale_data.data(), il, false)) {
                     std::fprintf(stderr, "[deepseek4] cached hc-pre graph alloc failed layer %d attn\n", il);
                     return false;
                 }
+                if (telemetry) telemetry->hc_pre_build_us += ds4_elapsed_us(hc_pre_attn_build_t0, Ds4TimingClock::now());
             }
+            const auto hc_pre_attn_compute_t0 = Ds4TimingClock::now();
             if (!ds4_try_gpu_hc_pre_device(cached.sg.hidden_states,
                                            cached.post,
                                            cached.comb,
@@ -3022,6 +3027,7 @@ bool deepseek4_step_layer_range(
                 std::fprintf(stderr, "[deepseek4] direct hc-pre compute failed layer %d attn\n", il);
                 return false;
             }
+            if (telemetry) telemetry->hc_pre_compute_us += ds4_elapsed_us(hc_pre_attn_compute_t0, Ds4TimingClock::now());
             attn_in_backend = cached.sg.hidden_states;
             attn_post_backend = cached.post;
             attn_comb_backend = cached.comb;
@@ -3032,16 +3038,22 @@ bool deepseek4_step_layer_range(
                 cached.backend != backend ||
                 cached.layer_idx != il ||
                 cached.ffn) {
+                const auto hc_pre_attn_build_t0 = Ds4TimingClock::now();
                 if (!build_cached_decode_hc_pre_graph(cached, backend, w, L, hc_lw.attn.scale_data.data(), il, false)) {
                     std::fprintf(stderr, "[deepseek4] cached hc-pre graph alloc failed layer %d attn\n", il);
                     return false;
                 }
+                if (telemetry) telemetry->hc_pre_build_us += ds4_elapsed_us(hc_pre_attn_build_t0, Ds4TimingClock::now());
             }
+            const auto hc_pre_attn_input_t0 = Ds4TimingClock::now();
             ggml_backend_tensor_copy(hc_state_backend, cached.sg.inp_embed);
+            if (telemetry) telemetry->hc_pre_input_us += ds4_elapsed_us(hc_pre_attn_input_t0, Ds4TimingClock::now());
+            const auto hc_pre_attn_compute_t0 = Ds4TimingClock::now();
             if (ggml_backend_graph_compute(backend, cached.sg.gf) != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "[deepseek4] cached hc-pre compute failed layer %d attn\n", il);
                 return false;
             }
+            if (telemetry) telemetry->hc_pre_compute_us += ds4_elapsed_us(hc_pre_attn_compute_t0, Ds4TimingClock::now());
             attn_in_backend = cached.sg.hidden_states;
             attn_post_backend = cached.post;
             attn_comb_backend = cached.comb;
@@ -3239,19 +3251,24 @@ bool deepseek4_step_layer_range(
         // ── HC pre (FFN) ────────────────────────────────────────────
         const auto hc_pre_ffn_t0 = Ds4TimingClock::now();
         if (use_backend_decode_hc_direct) {
+            const auto hc_pre_ffn_input_t0 = Ds4TimingClock::now();
             ggml_backend_tensor_set(cached_decode_hc_post_graph.residual_hc,
                                     hc_state.data(), 0, sizeof(float) * hc_state.size());
+            if (telemetry) telemetry->hc_pre_input_us += ds4_elapsed_us(hc_pre_ffn_input_t0, Ds4TimingClock::now());
             auto & cached = cached_decode_ffn_hc_pre_graphs[(size_t)il];
             if (!cached.valid() ||
                 cached.owner_ctx != w.ctx ||
                 cached.backend != backend ||
                 cached.layer_idx != il ||
                 !cached.ffn) {
+                const auto hc_pre_ffn_build_t0 = Ds4TimingClock::now();
                 if (!build_cached_decode_hc_pre_graph(cached, backend, w, L, hc_lw.ffn.scale_data.data(), il, true)) {
                     std::fprintf(stderr, "[deepseek4] cached hc-pre graph alloc failed layer %d ffn\n", il);
                     return false;
                 }
+                if (telemetry) telemetry->hc_pre_build_us += ds4_elapsed_us(hc_pre_ffn_build_t0, Ds4TimingClock::now());
             }
+            const auto hc_pre_ffn_compute_t0 = Ds4TimingClock::now();
             if (!ds4_try_gpu_hc_pre_device(cached.sg.hidden_states,
                                            cached.post,
                                            cached.comb,
@@ -3271,6 +3288,7 @@ bool deepseek4_step_layer_range(
                 std::fprintf(stderr, "[deepseek4] direct hc-pre compute failed layer %d ffn\n", il);
                 return false;
             }
+            if (telemetry) telemetry->hc_pre_compute_us += ds4_elapsed_us(hc_pre_ffn_compute_t0, Ds4TimingClock::now());
             ffn_in_backend = cached.sg.hidden_states;
             ffn_post_backend = cached.post;
             ffn_comb_backend = cached.comb;
@@ -3281,16 +3299,22 @@ bool deepseek4_step_layer_range(
                 cached.backend != backend ||
                 cached.layer_idx != il ||
                 !cached.ffn) {
+                const auto hc_pre_ffn_build_t0 = Ds4TimingClock::now();
                 if (!build_cached_decode_hc_pre_graph(cached, backend, w, L, hc_lw.ffn.scale_data.data(), il, true)) {
                     std::fprintf(stderr, "[deepseek4] cached hc-pre graph alloc failed layer %d ffn\n", il);
                     return false;
                 }
+                if (telemetry) telemetry->hc_pre_build_us += ds4_elapsed_us(hc_pre_ffn_build_t0, Ds4TimingClock::now());
             }
+            const auto hc_pre_ffn_input_t0 = Ds4TimingClock::now();
             ggml_backend_tensor_copy(hc_state_backend, cached.sg.inp_embed);
+            if (telemetry) telemetry->hc_pre_input_us += ds4_elapsed_us(hc_pre_ffn_input_t0, Ds4TimingClock::now());
+            const auto hc_pre_ffn_compute_t0 = Ds4TimingClock::now();
             if (ggml_backend_graph_compute(backend, cached.sg.gf) != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "[deepseek4] cached hc-pre compute failed layer %d ffn\n", il);
                 return false;
             }
+            if (telemetry) telemetry->hc_pre_compute_us += ds4_elapsed_us(hc_pre_ffn_compute_t0, Ds4TimingClock::now());
             ffn_in_backend = cached.sg.hidden_states;
             ffn_post_backend = cached.post;
             ffn_comb_backend = cached.comb;

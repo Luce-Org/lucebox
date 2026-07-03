@@ -36,6 +36,9 @@ struct DeepSeek4StepTelemetry {
     uint64_t total_us = 0;
     uint64_t embed_us = 0;
     uint64_t hc_pre_attn_us = 0;
+    uint64_t hc_pre_build_us = 0;
+    uint64_t hc_pre_input_us = 0;
+    uint64_t hc_pre_compute_us = 0;
     uint64_t attn_build_us = 0;
     uint64_t attn_compute_us = 0;
     uint64_t attn_read_us = 0;

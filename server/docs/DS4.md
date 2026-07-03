@@ -1,6 +1,6 @@
 # DeepSeek V4 Flash — DFlash Integration
 
-This document describes the DeepSeek V4 Flash model backend in DFlash, covering the architecture mapping, the CUDA/Halo layer split, and the target-shard IPC path.
+This document describes the current DeepSeek V4 Flash implementation in DFlash. Today DeepSeek4 runs through the layer-split path: a local CUDA prefix shard plus either a local follow-on shard or a remote Halo/HIP target shard.
 
 ## Model Architecture
 
@@ -35,18 +35,23 @@ DeepSeek V4 Flash is a 43-layer MoE model with:
 
 `deepseek4_step_layer_range()` drives per-shard execution over a contiguous layer range:
 
-1. **Embedding + HC init** — The first shard embeds tokens and initializes the HC state for new sequences.
-2. **Per-layer forward** — Each layer still runs the normal DS4 sequence: HC pre (attention) → MLA attention → HC post (attention) → HC pre (FFN) → RMSNorm + router → MoE FFN → HC post (FFN).
-3. **Shard boundary handoff** — At the split point, the parent sends the current hidden activation plus HC state to the next shard.
-4. **Tail shard completion** — The last shard resumes at its `layer_begin`, runs the remaining layers, then performs the final HC merge, RMSNorm, and `lm_head` projection.
+1. **Embedding + HC init** — On the first shard (`layer_begin == 0`), token embeddings are replicated into all HC streams to initialize the per-token HC state.
+2. **Per-layer forward** — Each layer runs the HC-enabled sequence: HC pre (attention) → MLA attention → HC post (attention) → HC pre (FFN) → router + MoE FFN → HC post (FFN).
+3. **Decode HC fast path** — For single-token decode (`n_tokens == 1`), the runtime reuses cached decode graphs. CUDA decode uses the cached backend HC graph path; HIP decode uses the direct HC-pre helper plus refreshed HC-post weights.
+4. **Shard boundary handoff** — Non-final shards return the updated **full HC state tensor** (`n_tokens × n_hc × n_embd`) to the next shard.
+5. **Tail shard completion** — The last shard resumes at its `layer_begin`, runs the remaining layers, then performs the final HC merge, RMSNorm, and `lm_head` projection to produce logits.
 
-The MoE computation stays local to the shard that owns each layer. DeepSeek4 no longer partitions experts into hot/cold or forwards per-token expert work to a separate worker.
+The production DeepSeek4 path does **not** use the retired per-expert worker split. The MoE computation stays inside the shard that owns each layer.
 
 ## Execution Modes
 
-### Local layer split
+### Local single-shard
 
-DeepSeek4 always runs through `LayerSplitBackend`. When the server is configured with an explicit target layer split, the adapter loads each contiguous shard locally and executes them in order.
+If the adapter decides all 43 layers fit on one CUDA GPU, it loads a single shard locally and no IPC daemon is involved.
+
+### Local multi-shard
+
+When the server is configured with an explicit local layer split across multiple GPUs, the adapter loads each contiguous shard locally and executes them in order.
 
 ### CUDA parent + Halo target-shard split
 
@@ -58,9 +63,11 @@ For heterogeneous setups, the CUDA-built server can keep the prefix layers on th
 │  - Token embedding                                          │
 │  - Layers [0, split)                                        │
 │  - Maintains local KV/cache state for its layer range       │
+│  - Emits updated HC-state tensor at the shard boundary      │
 ├─────────────────────────────────────────────────────────────┤
 │  Halo Target Shard (IPC daemon)                             │
 │  - Layers [split, 43)                                       │
+│  - Resumes from boundary HC state                           │
 │  - Final HC merge, RMSNorm, lm_head                         │
 │  - Returns logits / sampled token to the parent             │
 └─────────────────────────────────────────────────────────────┘
@@ -70,12 +77,10 @@ This path uses `TargetShardIpcSession`, `deepseek4_target_shard_ipc_daemon.cpp`,
 
 ## Shard Boundary State
 
-The shard boundary transfers model state at the layer split, not per-expert routing payloads:
+The shard boundary transfers the **full HC state tensor**, not a separate expert-routing payload:
 
-- **Hidden activation** — current `[n_tokens × n_embd]` activation at the split point.
-- **HC state** — persistent `[n_hc × n_embd]` controller state shared across all layers.
-  For DeepSeek4 this is `4 × 4096` floats, about 64 KiB.
-- **Sequence position / token metadata** — enough information for the tail shard to continue its cache updates and finish the forward pass.
+- **Boundary activation / HC state** — `[n_tokens × n_hc × n_embd]` floats. DeepSeek4 uses `n_hc = 4`, so the per-token boundary payload is `4 × 4096` floats.
+- **Sequence position / token metadata** — enough information for the tail shard to continue cache updates and finish the forward pass.
 
 KV cache tensors remain owned by the shard that owns the corresponding layer range.
 
@@ -85,8 +90,8 @@ If DeepSeek4 is started without an explicit target layer split, `DeepSeek4LayerS
 
 1. Read `DFLASH_DS4_CUDA_LAYERS`. If it is set to a positive value, that value becomes the number of prefix layers kept on CUDA.
 2. Otherwise, query CUDA free memory.
-3. Reserve fixed overhead for embeddings, output head, cache growth, and safety margin.
-4. Estimate roughly 500 MiB per DeepSeek4 layer.
+3. Reserve a fixed **2 GiB** overhead for caches and safety margin.
+4. Estimate roughly **1.9 GiB per DeepSeek4 layer**.
 5. Clamp the result so at least one layer remains on each side (`1..42`), then assign the remaining `43 - N` layers to Halo.
 
 The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
@@ -96,8 +101,14 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | Variable | Purpose |
 |----------|---------|
 | `DFLASH_DS4_CUDA_LAYERS` | Override the auto-split heuristic and pin the first `N` DeepSeek4 layers to CUDA. The remaining `43 - N` layers run on the Halo shard. |
+| `DFLASH_DS4_TIMING` | Enable DS4 timing logs for the layer-split parent and target-shard daemon. Useful for profiling prefill/decode breakdowns; leave unset for normal runs. |
 
-DeepSeek4 no longer uses the old expert-split environment variables or expert-worker tuning knobs.
+`DFLASH_DS4_TIMING` enables the existing timing banners:
+
+- parent / local shard: `[deepseek4-split-timing]`
+- remote Halo shard: `[deepseek4-target-timing]`
+
+DeepSeek4 no longer uses the old expert-split environment variables or expert-worker tuning knobs. Those retired knobs were removed from the codebase rather than left behind as unsupported debug switches.
 
 ## Example: CUDA + Halo Layer Split
 
@@ -126,9 +137,12 @@ Explicit mixed-backend split using the generic target-shard flags:
 
 ## Performance Notes
 
-- **Split granularity is coarse and stable**: the boundary moves by whole layers, so execution avoids per-token expert ownership checks and per-request expert placement decisions.
-- **Boundary traffic is small**: the HC state is only about 64 KiB, so the split cost is dominated by the hidden activation transfer and the tail-shard compute.
-- **Auto-split is meant as a starting point**: override `DFLASH_DS4_CUDA_LAYERS` when you want a reproducible split or when empirical throughput differs from the simple memory estimate.
+- **Split granularity is coarse and stable**: the boundary moves by whole layers.
+- **Boundary traffic is HC-state traffic**: the remote handoff is the full HC-state tensor for the current token batch.
+- **Decode has backend-specific HC paths**:
+  - CUDA decode uses cached backend HC graphs.
+  - HIP decode uses the direct HC-pre helper plus host-refreshed HC-post weights.
+- **Auto-split is only a heuristic**: override `DFLASH_DS4_CUDA_LAYERS` when you want a reproducible split or when empirical throughput differs from the simple memory estimate.
 
 ## Build Targets
 
