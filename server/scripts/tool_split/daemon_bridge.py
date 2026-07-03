@@ -37,6 +37,7 @@ async def commit_pending_tool_snap(
     kv_end: int,
 ) -> None:
     if kv_end <= 0:
+        orchestrator.tool_slots.release_reservation(fingerprint, slot)
         return
     ok = await snapshot_thin(
         daemon_stdin=daemon_stdin,
@@ -50,5 +51,13 @@ async def commit_pending_tool_snap(
         print(
             f"[tool-split] tool KV pinned slot={slot} len={kv_end} "
             f"fp={fingerprint[:12]}…",
+            flush=True,
+        )
+    else:
+        # Reservation must not look like a populated hit on the next request.
+        orchestrator.tool_slots.release_reservation(fingerprint, slot)
+        print(
+            f"[tool-split] SNAPSHOT_THIN failed; released reservation "
+            f"slot={slot} fp={fingerprint[:12]}…",
             flush=True,
         )

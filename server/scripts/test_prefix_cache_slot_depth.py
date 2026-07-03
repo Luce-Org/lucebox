@@ -6,7 +6,16 @@ from prefix_cache import PrefixCache, hash_prefix
 
 
 class _FakeTokenizer:
-  pass
+    """Minimal Qwen-style markers so PrefixCache enables itself."""
+
+    _MARKERS = {
+        "<|im_end|>": [1],
+        "<|im_start|>": [2],
+        "system": [3],
+    }
+
+    def encode(self, text, add_special_tokens=False):
+        return list(self._MARKERS.get(text, [ord(c) for c in text]))
 
 
 class PrefixCacheSlotDepthTests(unittest.TestCase):

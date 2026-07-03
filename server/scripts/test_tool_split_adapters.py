@@ -110,6 +110,69 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(adapter.profile_name, "qwen3")
 
 
+class TestToolSlotCache(unittest.TestCase):
+    def test_reserve_reuses_evicted_slot_within_range(self):
+        from tool_split.orchestrator import ToolSlotCache
+
+        cache = ToolSlotCache(pinned_slots=2, slot_base=3)
+        s0 = cache.reserve("a")
+        s1 = cache.reserve("b")
+        self.assertEqual({s0, s1}, {3, 4})
+        # Evict LRU ("a") and reuse its slot for "c".
+        s2 = cache.reserve("c")
+        self.assertEqual(s2, s0)
+        self.assertEqual(cache.lookup("a"), None)
+        self.assertEqual(cache.lookup("c"), s0)
+        self.assertEqual(cache.lookup("b"), s1)
+        # All live slots stay in [3, 5).
+        self.assertTrue(all(3 <= s < 5 for s in cache._entries.values()))
+
+    def test_release_reservation_frees_slot(self):
+        from tool_split.orchestrator import ToolSlotCache
+
+        cache = ToolSlotCache(pinned_slots=2, slot_base=6)
+        slot = cache.reserve("fp")
+        cache.release_reservation("fp", slot)
+        self.assertIsNone(cache.lookup("fp"))
+        # Freed slot is reusable.
+        self.assertEqual(cache.reserve("other"), slot)
+
+
+class TestCommitPendingToolSnap(unittest.IsolatedAsyncioTestCase):
+    async def test_releases_reservation_on_snapshot_failure(self):
+        import asyncio
+
+        from tool_split.daemon_bridge import commit_pending_tool_snap
+        from tool_split.orchestrator import ToolSlotCache
+
+        class _Orch:
+            def __init__(self):
+                self.tool_slots = ToolSlotCache(pinned_slots=2, slot_base=3)
+
+        orch = _Orch()
+        slot = orch.tool_slots.reserve("fp")
+
+        async def _fail_reply(prefix, timeout=30.0):
+            raise asyncio.TimeoutError("daemon timeout")
+
+        class _Stdin:
+            def write(self, data):
+                return None
+
+            def flush(self):
+                return None
+
+        await commit_pending_tool_snap(
+            orchestrator=orch,
+            daemon_stdin=_Stdin(),
+            await_reply=_fail_reply,
+            fingerprint="fp",
+            slot=slot,
+            kv_end=10,
+        )
+        self.assertIsNone(orch.tool_slots.lookup("fp"))
+
+
 class TestOrchestratorDaemonCmd(unittest.TestCase):
     def setUp(self):
         from tool_split.config import ToolSplitConfig

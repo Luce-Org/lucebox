@@ -56,13 +56,16 @@ def _tools_for_adapter(tools: Sequence[Any] | None) -> list[dict[str, Any]] | No
 
 
 class ToolSlotCache:
-    """LRU index: tools fingerprint → daemon thin-snapshot slot (pinned range)."""
+    """LRU index: tools fingerprint → daemon thin-snapshot slot (pinned range).
+
+    Slot IDs stay in ``[slot_base, slot_base + pinned_slots)``. Eviction reuses
+    the LRU entry's slot so RESTORE_CHAIN never references out-of-range IDs.
+    """
 
     def __init__(self, *, pinned_slots: int, slot_base: int = 0):
         self.pinned_slots = max(0, pinned_slots)
         self.slot_base = slot_base
         self._entries: OrderedDict[str, int] = OrderedDict()
-        self._next = slot_base
 
     def lookup(self, fingerprint: str) -> int | None:
         if fingerprint in self._entries:
@@ -71,15 +74,21 @@ class ToolSlotCache:
         return None
 
     def reserve(self, fingerprint: str) -> int:
+        if self.pinned_slots <= 0:
+            raise ValueError("ToolSlotCache.reserve requires pinned_slots > 0")
         if fingerprint in self._entries:
             self._entries.move_to_end(fingerprint)
             return self._entries[fingerprint]
-        if self.pinned_slots > 0 and len(self._entries) >= self.pinned_slots:
-            self._entries.popitem(last=False)
-        slot = self._next
-        self._next += 1
-        if self.pinned_slots > 0:
-            self._entries[fingerprint] = slot
+        if len(self._entries) >= self.pinned_slots:
+            # Reuse the LRU slot so IDs stay in [slot_base, slot_base+pinned_slots).
+            _, slot = self._entries.popitem(last=False)
+        else:
+            used = set(self._entries.values())
+            slot = next(
+                s for s in range(self.slot_base, self.slot_base + self.pinned_slots)
+                if s not in used
+            )
+        self._entries[fingerprint] = slot
         return slot
 
     def confirm(self, fingerprint: str, slot: int) -> None:

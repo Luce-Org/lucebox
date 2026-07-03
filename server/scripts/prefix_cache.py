@@ -309,7 +309,7 @@ def find_prefix_boundary_markers(ids, markers):
     is the index right after the FIRST next-role start sequence that
     follows the system message: i.e., ids[:boundary] = system header.
 
-    Returns -1 if the system role isn'́t found.
+    Returns -1 if the system role isn't found.
     """
     sys_seq = markers["sys_role_prefix"]
     end_seqs = markers["end_msg_seqs"]
