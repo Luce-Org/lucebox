@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -81,6 +82,10 @@ struct BackendIpcLaunchConfig {
     std::string work_dir;
     BackendIpcPayloadTransport payload_transport = BackendIpcPayloadTransport::Auto;
     size_t shared_payload_bytes = 0;
+    // Extra environment variables to set in the child *before* exec (e.g. to pin
+    // the daemon to a subset of GPUs via ROCR_VISIBLE_DEVICES/CUDA_VISIBLE_DEVICES).
+    // Empty by default: the child inherits the parent environment unchanged.
+    std::vector<std::pair<std::string, std::string>> child_env;
 };
 
 struct BackendIpcPayloadSegment {
