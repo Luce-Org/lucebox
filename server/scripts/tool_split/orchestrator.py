@@ -1,6 +1,7 @@
 """Orchestrate split tool KV cache + conversation PFlash."""
 from __future__ import annotations
 
+import json
 import os
 import struct
 import tempfile
@@ -20,11 +21,35 @@ def _ids_to_bin(ids: list[int]) -> Path:
     return Path(path)
 
 
+def _tool_call_args_to_obj(args: Any) -> Any:
+    # Qwen chat templates iterate arguments with `| items`, which requires a
+    # mapping. OpenAI-shaped requests carry arguments as a JSON string.
+    if isinstance(args, str):
+        try:
+            return json.loads(args)
+        except (json.JSONDecodeError, ValueError):
+            return {"_raw": args}
+    return args
+
+
 def _messages_for_adapter(messages: Sequence[Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for m in messages:
         if isinstance(m, dict):
-            out.append(dict(m))
+            d = dict(m)
+            if d.get("tool_calls"):
+                d["tool_calls"] = [
+                    {
+                        **tc,
+                        "function": {
+                            **(tc.get("function") or {}),
+                            "arguments": _tool_call_args_to_obj(
+                                (tc.get("function") or {}).get("arguments")),
+                        },
+                    }
+                    for tc in d["tool_calls"]
+                ]
+            out.append(d)
             continue
         d: dict[str, Any] = {"role": m.role}
         if m.content is not None:
@@ -40,7 +65,7 @@ def _messages_for_adapter(messages: Sequence[Any]) -> list[dict[str, Any]]:
                     "type": tc.type,
                     "function": {
                         "name": tc.function.name,
-                        "arguments": tc.function.arguments,
+                        "arguments": _tool_call_args_to_obj(tc.function.arguments),
                     },
                 }
                 for tc in m.tool_calls

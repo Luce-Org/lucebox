@@ -1132,7 +1132,19 @@ int main(int argc, char ** argv) {
     // ---- Single-GPU qwen35-family daemon: dispatch to the dedicated daemon -----
     // This avoids the duplicated 1800-line inline loop below. The inline
     // loop remains for one-shot, test-window, and profile-scaling modes.
-    if (daemon_mode && target_gpus.size() <= 1) {
+    //
+    // DFLASH_LEGACY_DAEMON=1 keeps the inline loop for daemon mode too: the
+    // tool-split orchestrator (server_tools.py) speaks the legacy protocol —
+    // SNAPSHOT_THIN <slot> <kv_start> <kv_end>, RESTORE_CHAIN, and the
+    // "[snap] inline slot=" ack — which run_qwen35_daemon does not implement.
+    const char * legacy_env = std::getenv("DFLASH_LEGACY_DAEMON");
+    const bool legacy_daemon = legacy_env && std::atoi(legacy_env) != 0;
+    if (daemon_mode && legacy_daemon) {
+        std::fprintf(stderr,
+            "[test_dflash] DFLASH_LEGACY_DAEMON=1 -> using legacy inline daemon loop "
+            "(tool-split protocol)\n");
+    }
+    if (daemon_mode && !legacy_daemon && target_gpus.size() <= 1) {
         const int max_ctx_eff = g_max_ctx_override > 0 ? g_max_ctx_override : 4096;
         dflash::common::Qwen35DaemonArgs qargs;
         qargs.target_path       = target_path;
