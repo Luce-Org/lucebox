@@ -1615,15 +1615,11 @@ def main():
         adapter = resolve_tool_split_adapter(
             tool_split_cfg, arch=arch, tokenizer_id=tokenizer_id)
         if adapter is not None:
-            # One conv prefix slot (updated in-place) + thin tool pins fits
-            # 2×24GB; multiple thick snapshots OOM and disable cache speedups.
-            if tool_split_cfg.pinned_tool_slots > 0 and args.prefix_cache_slots > 1:
-                print(
-                    f"  [cfg] tool-split: clamping prefix_cache_slots "
-                    f"{args.prefix_cache_slots} → 1 (VRAM)",
-                    flush=True,
-                )
-                args.prefix_cache_slots = 1
+            # Thick prefix snapshots live in system RAM (CPU snapshot backend),
+            # so multiple conversation slots coexist with thin tool pins even
+            # on 24GB cards. Agent stacks (Hermes) interleave 2+ prompt
+            # families per turn — a single thick slot would thrash on every
+            # request. No VRAM clamp needed anymore.
             if tool_split_cfg.pinned_tool_slots > 0:
                 total_slots = (
                     args.prefix_cache_slots
