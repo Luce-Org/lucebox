@@ -11,7 +11,6 @@
 #include "deepseek4_internal.h"
 #include "deepseek4_hc_cuda.h"
 #include "internal.h"
-#include "expert_ipc.h"
 #include "../common/step_graph.h"
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_routing_stats.h"
@@ -1535,7 +1534,7 @@ static ggml_tensor * build_shared_ffn(
     return ggml_mul_mat(ctx, L.ffn_down_shexp, mid_sh);
 }
 
-static bool eval_ds4_hybrid_or_worker(
+static bool eval_ds4_hybrid(
         ggml_backend_t backend,
         ggml_backend_t cpu_backend,
         const MoeHybridConfig & hybrid_cfg,
@@ -1543,7 +1542,6 @@ static bool eval_ds4_hybrid_or_worker(
         const MoeHybridStorage * hybrid_owner,
         MoeHybridLayerStorage & storage,
         MoeHybridStreamEngine * stream_engine,
-        ExpertIpcClient * expert_worker,
         int layer,
         int n_embd,
         int n_expert_used,
@@ -1554,12 +1552,9 @@ static bool eval_ds4_hybrid_or_worker(
         std::vector<float> & ffn_out_host,
         ggml_gallocr_t * hot_alloc,
         ggml_gallocr_t * cold_alloc,
-        bool worker_owns_hot_ids,
         DeepSeek4StepTelemetry * step_tel) {
     const auto ffn_t0 = Ds4TimingClock::now();
-    const bool use_worker = expert_worker && expert_worker->active() &&
-        (worker_owns_hot_ids || (!storage.down_cold && !storage.gate_up_cold));
-    if (!use_worker && !storage.down_cold && !storage.gate_up_cold) {
+    if (!storage.down_cold && !storage.gate_up_cold) {
         if (!hybrid_owner || !stream_engine || !stream_engine->is_ready() ||
             !hybrid_owner->has_mmap() ||
             layer < 0 || layer >= (int) hybrid_owner->layer_regions.size()) {
@@ -1640,156 +1635,37 @@ static bool eval_ds4_hybrid_or_worker(
         return true;
     }
 
-    if (!use_worker) {
-        MoeHybridFfnTelemetry ffn_tel;
-        bool ffn_ok = eval_moe_hybrid_ffn_batched(
-            backend, cpu_backend, hybrid_cfg, desc, storage,
-            ffn_normed_host, selected_host, weights_host,
-            n_tokens, ffn_out_host, nullptr, hot_alloc, cold_alloc,
-            nullptr, nullptr,
-            step_tel ? &ffn_tel : nullptr);
-        if (ffn_ok) {
-            if (step_tel) {
-                step_tel->ffn_eval_us += ds4_elapsed_us(ffn_t0, Ds4TimingClock::now());
-                add_ffn_telemetry(step_tel, ffn_tel);
-            }
-            return true;
+    MoeHybridFfnTelemetry ffn_tel;
+    bool ffn_ok = eval_moe_hybrid_ffn_batched(
+        backend, cpu_backend, hybrid_cfg, desc, storage,
+        ffn_normed_host, selected_host, weights_host,
+        n_tokens, ffn_out_host, nullptr, hot_alloc, cold_alloc,
+        nullptr, nullptr,
+        step_tel ? &ffn_tel : nullptr);
+    if (ffn_ok) {
+        if (step_tel) {
+            step_tel->ffn_eval_us += ds4_elapsed_us(ffn_t0, Ds4TimingClock::now());
+            add_ffn_telemetry(step_tel, ffn_tel);
         }
-
-        ffn_out_host.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
-        std::vector<float> single_out;
-        for (int ti = 0; ti < n_tokens; ++ti) {
-            MoeHybridFfnTelemetry single_tel;
-            if (!eval_moe_hybrid_ffn_single(
-                    backend, hybrid_cfg, desc, storage, cpu_backend,
-                    ffn_normed_host + (size_t)ti * (size_t)n_embd,
-                    selected_host + (size_t)ti * (size_t)n_expert_used,
-                    weights_host + (size_t)ti * (size_t)n_expert_used,
-                    n_expert_used, single_out,
-                    step_tel ? &single_tel : nullptr)) {
-                return false;
-            }
-            add_ffn_telemetry(step_tel, single_tel);
-            std::memcpy(ffn_out_host.data() + (size_t)ti * (size_t)n_embd,
-                        single_out.data(), sizeof(float) * (size_t)n_embd);
-        }
-        if (step_tel) step_tel->ffn_eval_us += ds4_elapsed_us(ffn_t0, Ds4TimingClock::now());
         return true;
     }
 
     ffn_out_host.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
     std::vector<float> single_out;
-    std::vector<float> worker_out;
-    std::vector<int32_t> local_ids;
-    std::vector<float> local_weights;
-    std::vector<int32_t> remote_ids;
-    std::vector<float> remote_weights;
-    const bool async_worker = false;
     for (int ti = 0; ti < n_tokens; ++ti) {
-        local_ids.clear();
-        local_weights.clear();
-        remote_ids.clear();
-        remote_weights.clear();
-        const int32_t * ids = selected_host + (size_t)ti * (size_t)n_expert_used;
-        const float * weights = weights_host + (size_t)ti * (size_t)n_expert_used;
-        for (int ei = 0; ei < n_expert_used; ++ei) {
-            const int32_t gid = ids[ei];
-            if (gid < 0 || gid >= (int32_t)storage.hot_local_by_global.size()) return false;
-            const bool is_hot_id = storage.hot_local_by_global[(size_t)gid] >= 0;
-            if (worker_owns_hot_ids ? !is_hot_id : is_hot_id) {
-                local_ids.push_back(gid);
-                local_weights.push_back(weights[ei]);
-            } else {
-                remote_ids.push_back(gid);
-                remote_weights.push_back(weights[ei]);
-            }
-        }
-
-        float * dst = ffn_out_host.data() + (size_t)ti * (size_t)n_embd;
-        MoeHybridFfnTelemetry local_tel;
-        ExpertIpcTiming ipc_timing;
-        ExpertIpcClient::PendingEval pending;
-        bool worker_pending = false;
-        Ds4TimingClock::time_point worker_t0{};
-        if (!remote_ids.empty() && async_worker) {
-            worker_t0 = Ds4TimingClock::now();
-            if (!expert_worker->eval_begin(layer, 1, n_embd, (int)remote_ids.size(),
-                                          ffn_normed_host + (size_t)ti * (size_t)n_embd,
-                                          remote_ids.data(), remote_weights.data(),
-                                          pending, step_tel ? &ipc_timing : nullptr)) {
-                return false;
-            }
-            worker_pending = true;
-        }
-
-        const bool local_ok = eval_moe_hybrid_ffn_single(
+        MoeHybridFfnTelemetry single_tel;
+        if (!eval_moe_hybrid_ffn_single(
                 backend, hybrid_cfg, desc, storage, cpu_backend,
                 ffn_normed_host + (size_t)ti * (size_t)n_embd,
-                local_ids.data(), local_weights.data(), (int)local_ids.size(),
-                single_out, step_tel ? &local_tel : nullptr);
-        if (!local_ok) {
-            if (worker_pending) {
-                std::vector<float> discard;
-                expert_worker->eval_end(pending, discard, step_tel ? &ipc_timing : nullptr);
-            }
+                selected_host + (size_t)ti * (size_t)n_expert_used,
+                weights_host + (size_t)ti * (size_t)n_expert_used,
+                n_expert_used, single_out,
+                step_tel ? &single_tel : nullptr)) {
             return false;
         }
-        add_ffn_telemetry(step_tel, local_tel);
-        std::memcpy(dst, single_out.data(), sizeof(float) * (size_t)n_embd);
-        if (!remote_ids.empty()) {
-            bool worker_ok = false;
-            if (worker_pending) {
-                worker_ok = expert_worker->eval_end(pending, worker_out, step_tel ? &ipc_timing : nullptr);
-            } else {
-                worker_t0 = Ds4TimingClock::now();
-                worker_ok = expert_worker->eval(layer, 1, n_embd, (int)remote_ids.size(),
-                                                ffn_normed_host + (size_t)ti * (size_t)n_embd,
-                                                remote_ids.data(), remote_weights.data(),
-                                                worker_out, step_tel ? &ipc_timing : nullptr);
-            }
-            if (!worker_ok) return false;
-            if (step_tel) {
-                if (worker_pending) {
-                    step_tel->worker_us += ipc_timing.parent_write_us +
-                                           ipc_timing.parent_wait_us +
-                                           ipc_timing.parent_read_us;
-                } else {
-                    step_tel->worker_us += ds4_elapsed_us(worker_t0, Ds4TimingClock::now());
-                }
-            }
-            if (step_tel) {
-                step_tel->worker_parent_write_us += ipc_timing.parent_write_us;
-                step_tel->worker_parent_wait_us += ipc_timing.parent_wait_us;
-                step_tel->worker_parent_read_us += ipc_timing.parent_read_us;
-                step_tel->worker_request_read_us += ipc_timing.worker_request_read_us;
-                step_tel->worker_partition_us += ipc_timing.worker_partition_us;
-                step_tel->worker_resident_eval_us += ipc_timing.worker_resident_eval_us;
-                step_tel->worker_miss_build_us += ipc_timing.worker_miss_build_us;
-                step_tel->worker_miss_eval_us += ipc_timing.worker_miss_eval_us;
-                step_tel->worker_request_bytes += ipc_timing.request_bytes;
-                step_tel->worker_response_bytes += ipc_timing.response_bytes;
-                step_tel->worker_hot_graph_builds += ipc_timing.worker_hot_graph_builds;
-                step_tel->worker_hot_graph_hits += ipc_timing.worker_hot_graph_hits;
-                step_tel->worker_cold_graph_builds += ipc_timing.worker_cold_graph_builds;
-                step_tel->worker_cold_graph_hits += ipc_timing.worker_cold_graph_hits;
-                step_tel->worker_hot_graph_build_us += ipc_timing.worker_hot_graph_build_us;
-                step_tel->worker_hot_input_us += ipc_timing.worker_hot_input_us;
-                step_tel->worker_hot_compute_us += ipc_timing.worker_hot_compute_us;
-                step_tel->worker_hot_read_us += ipc_timing.worker_hot_read_us;
-                step_tel->worker_cold_graph_build_us += ipc_timing.worker_cold_graph_build_us;
-                step_tel->worker_cold_input_us += ipc_timing.worker_cold_input_us;
-                step_tel->worker_cold_compute_us += ipc_timing.worker_cold_compute_us;
-                step_tel->worker_cold_read_us += ipc_timing.worker_cold_read_us;
-                if (worker_owns_hot_ids) {
-                    step_tel->hot_selected += (int)remote_ids.size();
-                } else {
-                    step_tel->cold_selected += (int)remote_ids.size();
-                }
-            }
-            for (int i = 0; i < n_embd; ++i) {
-                dst[i] += worker_out[(size_t)i];
-            }
-        }
+        add_ffn_telemetry(step_tel, single_tel);
+        std::memcpy(ffn_out_host.data() + (size_t)ti * (size_t)n_embd,
+                    single_out.data(), sizeof(float) * (size_t)n_embd);
     }
     if (step_tel) step_tel->ffn_eval_us += ds4_elapsed_us(ffn_t0, Ds4TimingClock::now());
     return true;
@@ -2318,8 +2194,6 @@ static bool deepseek4_step_hybrid(
         int kv_start,
         std::vector<float> & out_logits,
         const int32_t * token_ids,
-        ExpertIpcClient * expert_worker,
-        bool worker_owns_hot_ids,
         MoeHybridStreamEngine * stream_engine,
         DeepSeek4StepTelemetry * telemetry,
         MoeHybridRoutingStats * routing_stats) {
@@ -2573,12 +2447,11 @@ static bool deepseek4_step_hybrid(
             MoeHybridConfig hybrid_cfg = make_ds4_moe_hybrid_config(w);
             MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
             auto & storage = moe_hybrid.layers[(size_t) il];
-            if (!eval_ds4_hybrid_or_worker(
-                    backend, cpu_backend, hybrid_cfg, desc, &moe_hybrid, storage, stream_engine, expert_worker,
+            if (!eval_ds4_hybrid(
+                    backend, cpu_backend, hybrid_cfg, desc, &moe_hybrid, storage, stream_engine,
                     il, n_embd, w.n_expert_used,
                     ffn_normed_host.data(), selected_host.data(), weights_host.data(),
-                    n_tokens, ffn_out_host, &hot_alloc, &cold_alloc,
-                    worker_owns_hot_ids, telemetry)) {
+                    n_tokens, ffn_out_host, &hot_alloc, &cold_alloc, telemetry)) {
                 if (hot_alloc) ggml_gallocr_free(hot_alloc);
                 if (cold_alloc) ggml_gallocr_free(cold_alloc);
                 return false;
@@ -2688,12 +2561,11 @@ static bool deepseek4_step_hybrid(
             MoeHybridConfig hybrid_cfg = make_ds4_moe_hybrid_config(w);
             MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
             auto & storage = moe_hybrid.layers[(size_t) il];
-            if (!eval_ds4_hybrid_or_worker(
-                    backend, cpu_backend, hybrid_cfg, desc, &moe_hybrid, storage, stream_engine, expert_worker,
+            if (!eval_ds4_hybrid(
+                    backend, cpu_backend, hybrid_cfg, desc, &moe_hybrid, storage, stream_engine,
                     il, n_embd, w.n_expert_used,
                     ffn_normed_host.data(), selected_host.data(), weights_host.data(),
-                    n_tokens, ffn_out_host, &hot_alloc, &cold_alloc,
-                    worker_owns_hot_ids, telemetry)) {
+                    n_tokens, ffn_out_host, &hot_alloc, &cold_alloc, telemetry)) {
                 if (hot_alloc) ggml_gallocr_free(hot_alloc);
                 if (cold_alloc) ggml_gallocr_free(cold_alloc);
                 return false;
@@ -2794,8 +2666,6 @@ bool deepseek4_step(
         std::vector<float> & out_logits,
         MoeHybridStorage * moe_hybrid,
         const int32_t * token_ids,
-        ExpertIpcClient * expert_worker,
-        bool worker_owns_hot_ids,
         MoeHybridStreamEngine * stream_engine,
         DeepSeek4StepTelemetry * telemetry,
         MoeHybridRoutingStats * routing_stats) {
@@ -2803,8 +2673,7 @@ bool deepseek4_step(
     if (w.moe_hybrid && moe_hybrid != nullptr) {
         return deepseek4_step_hybrid(backend, w, cache, *moe_hybrid,
                                      embed, n_tokens, kv_start, out_logits,
-                                     token_ids, expert_worker, worker_owns_hot_ids,
-                                     stream_engine, telemetry, routing_stats);
+                                     token_ids, stream_engine, telemetry, routing_stats);
     }
 
     const int n_embd = w.n_embd;

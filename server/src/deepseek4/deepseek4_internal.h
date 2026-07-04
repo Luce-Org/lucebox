@@ -31,7 +31,6 @@ struct MoeHybridPlacement;
 struct MoeHybridConfig;
 struct MoeHybridRoutingStats;
 class MoeHybridStreamEngine;
-class ExpertIpcClient;
 
 struct DeepSeek4StepTelemetry {
     uint64_t total_us = 0;
@@ -61,29 +60,6 @@ struct DeepSeek4StepTelemetry {
     uint64_t ffn_hot_graph_hits = 0;
     uint64_t ffn_cold_graph_builds = 0;
     uint64_t ffn_cold_graph_hits = 0;
-    uint64_t worker_us = 0;
-    uint64_t worker_parent_write_us = 0;
-    uint64_t worker_parent_wait_us = 0;
-    uint64_t worker_parent_read_us = 0;
-    uint64_t worker_request_read_us = 0;
-    uint64_t worker_partition_us = 0;
-    uint64_t worker_resident_eval_us = 0;
-    uint64_t worker_miss_build_us = 0;
-    uint64_t worker_miss_eval_us = 0;
-    uint64_t worker_request_bytes = 0;
-    uint64_t worker_response_bytes = 0;
-    uint64_t worker_hot_graph_builds = 0;
-    uint64_t worker_hot_graph_hits = 0;
-    uint64_t worker_cold_graph_builds = 0;
-    uint64_t worker_cold_graph_hits = 0;
-    uint64_t worker_hot_graph_build_us = 0;
-    uint64_t worker_hot_input_us = 0;
-    uint64_t worker_hot_compute_us = 0;
-    uint64_t worker_hot_read_us = 0;
-    uint64_t worker_cold_graph_build_us = 0;
-    uint64_t worker_cold_input_us = 0;
-    uint64_t worker_cold_compute_us = 0;
-    uint64_t worker_cold_read_us = 0;
     uint64_t hc_post_ffn_us = 0;
     uint64_t output_us = 0;
     uint64_t sample_us = 0;
@@ -322,8 +298,6 @@ bool deepseek4_step(
     std::vector<float> &        out_logits,
     MoeHybridStorage *          moe_hybrid = nullptr,
     const int32_t *             token_ids = nullptr,
-    ExpertIpcClient *  expert_worker = nullptr,
-    bool                        worker_owns_hot_ids = false,
     MoeHybridStreamEngine *     stream_engine = nullptr,
     DeepSeek4StepTelemetry *    telemetry = nullptr,
     MoeHybridRoutingStats *     routing_stats = nullptr);

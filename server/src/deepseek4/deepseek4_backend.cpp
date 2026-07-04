@@ -37,23 +37,6 @@ static double gib(uint64_t bytes) {
     return (double) bytes / 1024.0 / 1024.0 / 1024.0;
 }
 
-static int env_int(const char * name, int fallback) {
-    const char * value = std::getenv(name);
-    if (!value || !value[0]) return fallback;
-    return std::atoi(value);
-}
-
-static double env_double(const char * name, double fallback) {
-    const char * value = std::getenv(name);
-    if (!value || !value[0]) return fallback;
-    return std::atof(value);
-}
-
-static const char * env_str(const char * name, const char * fallback) {
-    const char * value = std::getenv(name);
-    return (value && value[0]) ? value : fallback;
-}
-
 static void add_step_tel(DeepSeek4StepTelemetry & dst, const DeepSeek4StepTelemetry & src) {
     dst.total_us += src.total_us;
     dst.embed_us += src.embed_us;
@@ -82,29 +65,6 @@ static void add_step_tel(DeepSeek4StepTelemetry & dst, const DeepSeek4StepTeleme
     dst.ffn_hot_graph_hits += src.ffn_hot_graph_hits;
     dst.ffn_cold_graph_builds += src.ffn_cold_graph_builds;
     dst.ffn_cold_graph_hits += src.ffn_cold_graph_hits;
-    dst.worker_us += src.worker_us;
-    dst.worker_parent_write_us += src.worker_parent_write_us;
-    dst.worker_parent_wait_us += src.worker_parent_wait_us;
-    dst.worker_parent_read_us += src.worker_parent_read_us;
-    dst.worker_request_read_us += src.worker_request_read_us;
-    dst.worker_partition_us += src.worker_partition_us;
-    dst.worker_resident_eval_us += src.worker_resident_eval_us;
-    dst.worker_miss_build_us += src.worker_miss_build_us;
-    dst.worker_miss_eval_us += src.worker_miss_eval_us;
-    dst.worker_request_bytes += src.worker_request_bytes;
-    dst.worker_response_bytes += src.worker_response_bytes;
-    dst.worker_hot_graph_builds += src.worker_hot_graph_builds;
-    dst.worker_hot_graph_hits += src.worker_hot_graph_hits;
-    dst.worker_cold_graph_builds += src.worker_cold_graph_builds;
-    dst.worker_cold_graph_hits += src.worker_cold_graph_hits;
-    dst.worker_hot_graph_build_us += src.worker_hot_graph_build_us;
-    dst.worker_hot_input_us += src.worker_hot_input_us;
-    dst.worker_hot_compute_us += src.worker_hot_compute_us;
-    dst.worker_hot_read_us += src.worker_hot_read_us;
-    dst.worker_cold_graph_build_us += src.worker_cold_graph_build_us;
-    dst.worker_cold_input_us += src.worker_cold_input_us;
-    dst.worker_cold_compute_us += src.worker_cold_compute_us;
-    dst.worker_cold_read_us += src.worker_cold_read_us;
     dst.hc_post_ffn_us += src.hc_post_ffn_us;
     dst.output_us += src.output_us;
     dst.sample_us += src.sample_us;
@@ -128,14 +88,8 @@ static void log_step_tel(const char * phase,
         "step=%.1fms embed=%.1fms attn_build=%.1fms attn_compute=%.1fms attn_read=%.1fms "
         "ffn_build=%.1fms ffn_compute=%.1fms ffn_read=%.1fms "
         "route_build=%.1fms route_compute=%.1fms route_read=%.1fms route_select=%.1fms "
-        "ffn=%.1fms hot=%.1fms cold=%.1fms combine=%.1fms partition=%.1fms worker=%.1fms "
+        "ffn=%.1fms hot=%.1fms cold=%.1fms combine=%.1fms partition=%.1fms "
         "ffn_hot_graph_build=%llu ffn_hot_graph_hit=%llu ffn_cold_graph_build=%llu ffn_cold_graph_hit=%llu "
-        "worker_write=%.1fms worker_wait=%.1fms worker_read=%.1fms worker_req_read=%.1fms "
-        "worker_part=%.1fms worker_resident=%.1fms worker_miss_build=%.1fms worker_miss=%.1fms "
-        "worker_hot_graph_build=%llu worker_hot_graph_hit=%llu worker_cold_graph_build=%llu worker_cold_graph_hit=%llu "
-        "worker_hot_build=%.1fms worker_hot_input=%.1fms worker_hot_compute=%.1fms worker_hot_read=%.1fms "
-        "worker_cold_build=%.1fms worker_cold_input=%.1fms worker_cold_compute=%.1fms worker_cold_read=%.1fms "
-        "worker_req_kib=%.1f worker_resp_kib=%.1f "
         "hc_pre=%.1fms hc_pre_build=%.1fms hc_pre_input=%.1fms hc_pre_compute=%.1fms "
         "hc_post=%.1fms output=%.1fms sample=%.1fms emit=%.1fms "
         "hot_sel=%d cold_sel=%d\n",
@@ -144,20 +98,9 @@ static void log_step_tel(const char * phase,
         ms(t.ffn_build_us), ms(t.ffn_compute_us), ms(t.ffn_read_us),
         ms(t.route_build_us), ms(t.route_compute_us), ms(t.route_read_us), ms(t.route_select_us),
         ms(t.ffn_eval_us), ms(t.ffn_hot_us), ms(t.ffn_cold_us), ms(t.ffn_combine_us),
-        ms(t.ffn_partition_us), ms(t.worker_us),
+        ms(t.ffn_partition_us),
         (unsigned long long)t.ffn_hot_graph_builds, (unsigned long long)t.ffn_hot_graph_hits,
         (unsigned long long)t.ffn_cold_graph_builds, (unsigned long long)t.ffn_cold_graph_hits,
-        ms(t.worker_parent_write_us), ms(t.worker_parent_wait_us), ms(t.worker_parent_read_us),
-        ms(t.worker_request_read_us), ms(t.worker_partition_us), ms(t.worker_resident_eval_us),
-        ms(t.worker_miss_build_us), ms(t.worker_miss_eval_us),
-        (unsigned long long)t.worker_hot_graph_builds, (unsigned long long)t.worker_hot_graph_hits,
-        (unsigned long long)t.worker_cold_graph_builds, (unsigned long long)t.worker_cold_graph_hits,
-        ms(t.worker_hot_graph_build_us), ms(t.worker_hot_input_us),
-        ms(t.worker_hot_compute_us), ms(t.worker_hot_read_us),
-        ms(t.worker_cold_graph_build_us), ms(t.worker_cold_input_us),
-        ms(t.worker_cold_compute_us), ms(t.worker_cold_read_us),
-        (double)t.worker_request_bytes / 1024.0,
-        (double)t.worker_response_bytes / 1024.0,
         ms(t.hc_pre_attn_us + t.hc_pre_ffn_us),
         ms(t.hc_pre_build_us),
         ms(t.hc_pre_input_us),
@@ -562,8 +505,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         // Run forward pass
         std::vector<float> logits;
         if (!deepseek4_step(backend_, w_, cache_, embed.data(), n_tok, pos, logits,
-                            moe_hybrid_.get(), tokens.data() + i, nullptr,
-                            false,
+                            moe_hybrid_.get(), tokens.data() + i,
                             moe_hybrid_ ? &stream_engine_ : nullptr,
                             timing ? &step_tel : nullptr,
                             routing_stats_.get())) {
@@ -625,8 +567,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             const int pos = std::max(0, committed + generated - 1);
             if (!deepseek4_step(backend_, w_, cache_, embed.data(), 1,
                                 pos, logits,
-                                moe_hybrid_.get(), &tok_to_eval, nullptr,
-                                false,
+                                moe_hybrid_.get(), &tok_to_eval,
                                 moe_hybrid_ ? &stream_engine_ : nullptr,
                                 timing ? &step_tel : nullptr,
                                 routing_stats_.get())) {

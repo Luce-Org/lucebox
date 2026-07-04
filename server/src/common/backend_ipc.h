@@ -29,7 +29,6 @@ enum class BackendIpcMode {
     LagunaTargetShard,
     MoeExpertCompute,
     DeepSeek4TargetShard,
-    MoeExpert,
 };
 
 const char * backend_ipc_mode_name(BackendIpcMode mode);
