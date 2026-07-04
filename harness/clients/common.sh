@@ -175,8 +175,9 @@ start_dflash_native_server() {
 start_llamacpp_server() {
   if [[ ! -x "$LLAMA_SERVER_BIN" ]]; then
     echo "llama-server not found or not executable: $LLAMA_SERVER_BIN" >&2
-    echo "Build it first, for example:" >&2
-    echo "  cmake -S $REPO_DIR/server/deps/llama.cpp -B $LLAMA_BUILD_DIR -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF" >&2
+    echo "Build it from an external llama.cpp checkout or set LLAMA_SERVER_BIN to an existing binary." >&2
+    echo "For example:" >&2
+    echo "  cmake -S /path/to/llama.cpp -B $LLAMA_BUILD_DIR -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF" >&2
     echo "  cmake --build $LLAMA_BUILD_DIR --target llama-server -j2" >&2
     return 1
   fi

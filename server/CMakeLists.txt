@@ -58,9 +58,9 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
-# ─── ggml (from the llama.cpp submodule) ─────────────────────────────
+# ─── ggml (vendored from llama.cpp) ──────────────────────────────────
 #
-# We use only ggml from the vendored llama.cpp submodule. The drafter is
+# We use only ggml from the vendored llama.cpp snapshot. The drafter is
 # loaded via our own custom Qwen3-0.6B forward
 # (src/qwen3/qwen3_loader.cpp + src/qwen3/qwen3_graph.cpp)
 # rather than libllama, so libllama is not built.
@@ -92,8 +92,8 @@ set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/CMakeLists.txt")
     message(FATAL_ERROR
-        "deps/llama.cpp submodule missing. Run: "
-        "git submodule update --init --recursive")
+        "Vendored ggml sources missing at deps/llama.cpp/ggml. "
+        "Restore them from the repository checkout.")
 endif()
 # Asymmetric KV-quant (Q4_0 K with Q8_0 V etc) needs all fattn quant pairs.
 # Build time grows ~3x. Set DFLASH27B_FA_ALL_QUANTS=OFF if you only run
@@ -191,8 +191,8 @@ add_subdirectory(deps/llama.cpp/ggml EXCLUDE_FROM_ALL)
 
 if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     # The vendored ggml HIP shim still uses a few CUDA spellings that are not
-    # mapped in this submodule snapshot. Keep the compatibility layer in this
-    # repo so the parent PR is reproducible without a dirty submodule checkout.
+    # mapped in this upstream snapshot. Keep the compatibility layer in this
+    # repo so the build stays reproducible from a clean checkout.
     target_compile_definitions(ggml-hip PRIVATE
         cublasSgemmStridedBatched=hipblasSgemmStridedBatched
         cudaStreamCaptureStatus=hipStreamCaptureStatus
@@ -317,7 +317,7 @@ add_library(dflash_common STATIC
     src/server/prefix_cache.cpp
     src/server/disk_prefix_cache.cpp
     src/server/freeze_history.cpp
-    # ── Jinja chat-template engine (from llama.cpp common/jinja/) ──
+    # ── Jinja chat-template engine (vendored under deps/llama.cpp/common/) ──
     # Used by render_chat_template_jinja() to support --chat-template-file
     # in dflash_server. Mirrors llama.cpp's common_chat_template plumbing.
     # unicode.cpp supplies common_parse_utf8_codepoint() used by jinja's
@@ -531,7 +531,7 @@ target_include_directories(dflash_common
         ${DFLASH27B_SRC_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
         # Jinja chat-template engine (lexer/parser/runtime/value/string/caps)
-        # pulled from llama.cpp/common/jinja for --chat-template-file support.
+        # vendored under llama.cpp/common for --chat-template-file support.
         # nlohmann_json is already linked PUBLIC (used by jinja/value.cpp).
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/common
 )

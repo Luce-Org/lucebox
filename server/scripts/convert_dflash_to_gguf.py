@@ -3,9 +3,10 @@
 Convert the z-lab DFlash draft (safetensors, bf16) to a GGUF that
 llama.cpp can load.
 
-Uses llama.cpp's own gguf-py (deps/llama.cpp/gguf-py) — no hand-rolled
-binary writer. The library handles header layout, alignment, BF16
-storage, and tensor info offsets correctly.
+Uses the vendored `deps/llama.cpp/gguf-py` package — the same GGUF tooling lineage
+used by llama.cpp — with no hand-rolled binary writer. The library
+handles header layout, alignment, BF16 storage, and tensor info offsets
+correctly.
 
 DFlash draft is a 5-layer Qwen-style transformer with two extra
 model-level singletons specific to the spec-decode block-diffusion
@@ -21,7 +22,7 @@ via a custom arch loader without colliding with any upstream tensor
 name.
 
 Usage:
-  PYTHONPATH=../../dflash_ggml/deps/llama.cpp/gguf-py python convert_dflash_to_gguf.py \
+  python convert_dflash_to_gguf.py \
     models/draft/model.safetensors \
     qwen3.5-27b-dflash-draft.gguf
 """
@@ -34,7 +35,10 @@ from pathlib import Path
 
 import numpy as np
 
-# Use llama.cpp's own GGUF writer — adds bf16 / metadata / alignment
+# Keep the converter self-contained: use the vendored gguf-py copy instead of
+# requiring a separately installed Python package.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "deps" / "llama.cpp" / "gguf-py"))
+# Use the vendored GGUF Python package — adds bf16 / metadata / alignment
 # correctness without any hand-rolled code.
 import gguf
 

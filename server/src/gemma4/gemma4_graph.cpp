@@ -1,6 +1,6 @@
 // Gemma4 forward graph builder + step function.
 //
-// Architecture (from deps/llama.cpp/src/models/gemma4-iswa.cpp):
+// Architecture mirrored from the upstream llama.cpp Gemma4 implementation:
 //   - Scale input embeddings by sqrt(n_embd)
 //   - For each layer:
 //     a. Pre-attn RMSNorm

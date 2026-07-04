@@ -15,11 +15,12 @@ f16 236.6 tok/s -> q8_0 241.3 -> q4-mix 249.6, acceptance unchanged.
 """
 import argparse
 import sys
+
 from pathlib import Path
+import numpy as np  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "deps" / "llama.cpp" / "gguf-py"))
 
-import numpy as np  # noqa: E402
 import gguf  # noqa: E402
 from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType  # noqa: E402
 from gguf.quants import quantize  # noqa: E402

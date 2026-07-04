@@ -76,11 +76,11 @@ COPY server/deps /src/server/deps
 # build/share/. Without this COPY the build links then dies on the missing file.
 COPY server/share /src/server/share
 
-# Submodules must be populated on the host before `docker build` (.git/ is
-# .dockerignore'd so they cannot be fetched inside the image).
+# Vendored ggml sources must already be present on the host before
+# `docker build` (.git/ is .dockerignore'd so submodules cannot be fetched
+# inside the image).
 RUN test -f /src/server/deps/llama.cpp/ggml/CMakeLists.txt \
-    || (echo "ERROR: server/deps/llama.cpp submodule not initialised. Run on host:" >&2 \
-        && echo "       git submodule update --init --recursive" >&2 \
+    || (echo "ERROR: missing vendored ggml sources at server/deps/llama.cpp/ggml in the docker build context." >&2 \
         && exit 1)
 
 # Configure + build for HIP. DFLASH27B_GPU_BACKEND=hip selects the ggml-hip
