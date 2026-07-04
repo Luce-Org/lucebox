@@ -37,6 +37,7 @@
 #include "qwen35_layer_split.h" // multi-GPU layer-split daemon args
 #include "layer_split_daemon_loop.h" // extracted layer-split daemon loop
 #include "qwen3_daemon.h"   // arch dispatch - qwen3 (0.6B standalone)
+#include "../src/common/snapshot_backend.h" // CPU-RAM prefix snapshot storage
 #include "gemma4_daemon.h"  // arch dispatch - gemma4 (iSWA + MoE)
 #include "sampler.h"        // shared CPU sampler chain (SamplerCfg /
                             // sample_logits / parse_sampler_token) used by
@@ -1181,6 +1182,15 @@ int main(int argc, char ** argv) {
         }
     }
     ggml_backend_t backend = target_backend; // legacy target-side alias
+
+    // Prefix snapshots live in system RAM on discrete GPUs (CPU backend) so
+    // they never compete with model weights / KV cache for VRAM. Matches the
+    // qwen35_backend / shard-IPC / layer-split daemons.
+    ggml_backend_t snap_backend = dflash::common::create_snapshot_backend(target_backend);
+    if (!snap_backend) {
+        std::fprintf(stderr, "snapshot backend init failed\n");
+        return 1;
+    }
 
     TargetWeights w;
     if (!load_target_gguf(target_path, target_backend, w)) {
@@ -2427,7 +2437,7 @@ int main(int argc, char ** argv) {
                     std::fprintf(stderr, "[snap] SNAPSHOT_THIN bad args\n");
                     continue;
                 }
-                if (!snapshot_target_cache_thin(w, cache, backend, kv_start, kv_end,
+                if (!snapshot_target_cache_thin(w, cache, snap_backend, kv_start, kv_end,
                                                  prefix_snapshots[slot])) {
                     std::fprintf(stderr, "[snap] thin failed slot=%d: %s\n", slot,
                                  dflash27b_last_error());
@@ -2444,7 +2454,7 @@ int main(int argc, char ** argv) {
                     std::fprintf(stderr, "[snap] invalid slot %d\n", slot);
                     continue;
                 }
-                if (!snapshot_target_cache(w, cache, backend, prefix_snapshots[slot])) {
+                if (!snapshot_target_cache(w, cache, snap_backend, prefix_snapshots[slot])) {
                     std::fprintf(stderr, "[snap] failed slot=%d: %s\n", slot, dflash27b_last_error());
                     continue;
                 }
@@ -2880,7 +2890,7 @@ int main(int argc, char ** argv) {
         if (snap_pos >= 0 && snap_pos == start) {
             cache.cur_pos = start;
             if (snap_slot >= 0) {
-                if (snapshot_target_cache(w, cache, backend, prefix_snapshots[snap_slot])) {
+                if (snapshot_target_cache(w, cache, snap_backend, prefix_snapshots[snap_slot])) {
                     std::printf("[snap] inline slot=%d cur_pos=%d\n", snap_slot, start);
                     std::fflush(stdout);
                 } else {
@@ -2977,7 +2987,7 @@ int main(int argc, char ** argv) {
             cache.cur_pos  = committed;
             cache.last_tok = last_tok;
             if (snap_slot >= 0) {
-                if (snapshot_target_cache(w, cache, backend, prefix_snapshots[snap_slot])) {
+                if (snapshot_target_cache(w, cache, snap_backend, prefix_snapshots[snap_slot])) {
                     std::printf("[snap] inline slot=%d cur_pos=%d\n", snap_slot, committed);
                     std::fflush(stdout);
                 } else {
@@ -4158,6 +4168,7 @@ int main(int argc, char ** argv) {
     if (daemon_mode) {
         for (int i = 0; i < PREFIX_CACHE_SLOTS; i++) free_prefix_snapshot(prefix_snapshots[i]);
     }
+    dflash::common::free_snapshot_backend(snap_backend, target_backend);
     step_graph_destroy(sg);
     free_target_cache(cache);
     free_draft_weights(dw);
