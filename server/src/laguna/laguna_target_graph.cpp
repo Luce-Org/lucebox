@@ -308,7 +308,7 @@ static ggml_tensor * build_laguna_dense_ffn(ggml_context * ctx, ggml_tensor * cu
 }
 
 // Forward decl for the full MoE block (defined further down).
-static ggml_tensor * build_laguna_moe_block_full(ggml_context * ctx, ggml_tensor * cur,
+static ggml_tensor * build_laguna_moe_block_full(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * cur,
                                                   const LagunaTargetWeights & w,
                                                   const LagunaTargetLayer & L);
 // Forward decl for the hybrid (offload) MoE block (defined further down).
@@ -347,13 +347,13 @@ static ggml_tensor * build_laguna_moe_block(ggml_context * ctx, ggml_cgraph * gf
             hyb->storage->layers[(size_t)il], hyb->lut_all, hyb->vld_all, hyb->sel_all,
             il - hyb->dense_lead);
     }
-    return build_laguna_moe_block_full(ctx, cur, w, L);
+    return build_laguna_moe_block_full(ctx, gf, cur, w, L);
 }
 
 // Phase 2.1: full MoE dispatch (sigmoid + score-correction bias + sum-norm +
 // scale 2.5 + always-on shared expert). Mirrors llama.cpp's build_moe_ffn for
 // the SIGMOID + WEIGHTS_NORM + EXP_PROBS_B configuration that Laguna uses.
-static ggml_tensor * build_laguna_moe_block_full(ggml_context * ctx, ggml_tensor * cur,
+static ggml_tensor * build_laguna_moe_block_full(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * cur,
                                                   const LagunaTargetWeights & w,
                                                   const LagunaTargetLayer & L) {
     const int n_tokens = (int)cur->ne[1];
@@ -368,8 +368,14 @@ static ggml_tensor * build_laguna_moe_block_full(ggml_context * ctx, ggml_tensor
     // Add score-correction bias for SELECTION (not for combine weights).
     ggml_tensor * scores_sel = ggml_add(ctx, probs, L.ffn_exp_probs_b);
 
-    // Top-k selection: indices [n_used, n_tokens] i32.
-    ggml_tensor * selected = ggml_top_k(ctx, scores_sel, n_used);
+    // Top-k selection: argsort_top_k (GGML_OP_ARGSORT+view) lets ggml-cuda's
+    // topk-moe fusion recognize the router; ggml_top_k (GGML_OP_TOP_K) does not,
+    // costing 6-7 separate kernels/layer x39 MoE layers. Same selection ->
+    // bit-identical. DFLASH_NO_MOE_ROUTER_FUSE=1 = old path. (Ports PR #472.)
+    static const bool laguna_router_fuse = (std::getenv("DFLASH_NO_MOE_ROUTER_FUSE") == nullptr);
+    ggml_tensor * selected = laguna_router_fuse
+        ? ggml_argsort_top_k(ctx, scores_sel, n_used)
+        : ggml_top_k(ctx, scores_sel, n_used);
 
     // Gather ORIGINAL probs (no bias) at the selected indices for combine weights.
     // Trick: reshape probs to [1, n_expert, n_tokens] so ggml_get_rows treats
@@ -385,6 +391,21 @@ static ggml_tensor * build_laguna_moe_block_full(ggml_context * ctx, ggml_tensor
     // Scale routed combine.
     if (w.expert_weights_scale != 1.0f) {
         weights = ggml_scale(ctx, weights, w.expert_weights_scale);
+    }
+
+    // Expand the router outputs (selection + weights) NOW, before the expert
+    // matmuls, so the router subgraph linearizes as a contiguous prefix that
+    // ggml-cuda's topk-moe fusion can match. Without this the experts linearize
+    // first and the fusion is missed. Mirrors qwen35moe pipelined decode's early
+    // ggml_build_forward_expand(gf, moe_selected/moe_weights).
+    if (laguna_router_fuse) {
+        // Expand WEIGHTS first: the DFS from `weights` reaches get_rows->src[0]=
+        // reshape(probs)->sigmoid before get_rows->src[1]=argsort(add(probs,bias)),
+        // producing the exact SIGMOID->RESHAPE->ADD->ARGSORT->VIEW->GET_ROWS order the
+        // topk-moe matcher requires (reshape must be node i+1, before the bias add).
+        // Expanding `selected` first would push the reshape after argsort and miss it.
+        ggml_build_forward_expand(gf, weights);
+        ggml_build_forward_expand(gf, selected);
     }
 
     // Per-expert SwiGLU via mul_mat_id.
@@ -450,7 +471,10 @@ static ggml_tensor * build_laguna_moe_block_hybrid(ggml_context * ctx, ggml_cgra
     ggml_tensor * logits = ggml_mul_mat(ctx, L.ffn_gate_inp, cur);
     ggml_tensor * probs  = ggml_sigmoid(ctx, logits);
     ggml_tensor * scores_sel = ggml_add(ctx, probs, L.ffn_exp_probs_b);
-    ggml_tensor * selected = ggml_top_k(ctx, scores_sel, n_used);  // [n_used, n_tokens] global ids
+    static const bool laguna_router_fuse_h = (std::getenv("DFLASH_NO_MOE_ROUTER_FUSE") == nullptr);
+    ggml_tensor * selected = laguna_router_fuse_h
+        ? ggml_argsort_top_k(ctx, scores_sel, n_used)
+        : ggml_top_k(ctx, scores_sel, n_used);  // [n_used, n_tokens] global ids
     {   // batched readback: write this layer's selection into column moe_idx of sel_all
         ggml_tensor * sel_col = ggml_view_2d(ctx, sel_all, n_used, n_tokens,
                                              sel_all->nb[1], (size_t)moe_idx * sel_all->nb[1]);
@@ -535,7 +559,10 @@ static ggml_tensor * build_laguna_moe_block_legacy(ggml_context * ctx, ggml_tens
 
     // Top-k indices: [n_expert_used, n_tokens] i32.
     // ggml_top_k returns argmax indices into the n_expert axis.
-    ggml_tensor * selected = ggml_top_k(ctx, scores_for_sel, w.n_expert_used);
+    static const bool laguna_router_fuse_l = (std::getenv("DFLASH_NO_MOE_ROUTER_FUSE") == nullptr);
+    ggml_tensor * selected = laguna_router_fuse_l
+        ? ggml_argsort_top_k(ctx, scores_for_sel, w.n_expert_used)
+        : ggml_top_k(ctx, scores_for_sel, w.n_expert_used);
 
     // Gather the ORIGINAL probs at the selected indices for combine weights.
     // ggml_get_rows would treat probs's first dim as rows; here we want to
