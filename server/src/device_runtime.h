@@ -10,8 +10,21 @@ using __nv_bfloat16 = __hip_bfloat16;
 #ifndef cudaEventElapsedTime
 #define cudaEventElapsedTime hipEventElapsedTime
 #endif
+// HIP has no masked ballot. __ballot(p) ballots every active lane of the
+// wavefront and returns a 64-bit mask (wavefronts are 64 lanes wide on
+// GCN/CDNA), whereas CUDA's __ballot_sync(mask, p) returns a 32-bit mask over
+// only the lanes in `mask`. Two porting hazards follow:
+//   1. Width: the result must be stored in a 64-bit sink on wave64 archs, or
+//      lanes 32..63 are truncated away. We cast to unsigned long long so the
+//      full width is explicit at the shim boundary; call sites that assign to a
+//      32-bit type still truncate and are only correct on wave32 (e.g. the
+//      rocWMMA flashprefill kernel, which is gated wave32-only).
+//   2. Mask: the CUDA active-lane mask is dropped. That is only equivalent when
+//      every lane in `mask` is active, which holds at all current call sites
+//      (they pass a full 0xffffffff mask).
 #ifndef __ballot_sync
-#define __ballot_sync(mask, predicate) __ballot(predicate)
+#define __ballot_sync(mask, predicate) \
+    (static_cast<unsigned long long>(__ballot(predicate)))
 #endif
 #else
 #include <hip/hip_runtime.h>

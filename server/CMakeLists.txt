@@ -648,6 +648,20 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
         target_link_libraries(test_flashprefill_kernels PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
+    # RMSNorm HIP kernel vs CPU reference. HIP only, and on ANY HIP build:
+    # rms_norm_hip.cu is compiled into dflash_common regardless of SM80_EQUIV
+    # (it feeds the HIP chunk-B graph path). Validates the wavefront-generalized
+    # reduction against the device's actual wave width.
+    if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rms_norm_hip.cpp")
+        add_executable(test_rms_norm_hip test/test_rms_norm_hip.cpp)
+        set_source_files_properties(test/test_rms_norm_hip.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_rms_norm_hip PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_include_directories(test_rms_norm_hip PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
+        target_link_libraries(test_rms_norm_hip PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
+        add_test(NAME rms_norm_hip COMMAND test_rms_norm_hip)
+    endif()
     # GPU draft top-K kernel vs CPU reference (extract_draft_topk). CUDA only:
     # geometric_draft_topk_cuda.cu is compiled into dflash_common solely on the cuda backend.
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_topk_cuda.cpp")
