@@ -3,6 +3,7 @@
 #include "ggml-alloc.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 
@@ -91,7 +92,8 @@ bool build_layer_step(
         sg.inp_embed, sg.positions, sg.attn_mask,
         kv_start, n_tokens, capture, fa_window,
         /*q_tail_capture=*/nullptr, /*q_tail_start=*/0,
-        sg.kv_write_rows);
+        sg.kv_write_rows,
+        sg.kv_write_row_base);
     if (!layer_out) return false;
 
     ggml_tensor * out_view = ggml_view_2d(sg.ctx, act_out,
@@ -245,7 +247,9 @@ bool build_hybrid_full_layer_step(
         sg.inp_embed, sg.positions, sg.attn_mask,
         kv_start, n_tokens, /*capture=*/false, fa_window,
         /*q_tail_capture=*/nullptr, /*q_tail_start=*/0,
-        &moe_selected);
+        &moe_selected,
+        /*kv_write_rows=*/nullptr,
+        /*kv_write_row_base=*/0);
     if (!layer_out) return false;
 
     // Use hidden_input as the layer output tensor (repurpose field)
@@ -347,14 +351,14 @@ bool build_target_step(
     const bool non_pooled_step_kv_write_safe =
         !q4_full_cache_kv || non_pooled_kvpad_max_row <= 0 ||
         kv_start < non_pooled_kvpad_max_row;
-    static bool s_logged_q4_guard = false;
+    static std::atomic<bool> s_logged_q4_guard{false};
     if (non_pooled_step_kv_write && q4_full_cache_kv &&
-        !non_pooled_step_kv_write_safe && !s_logged_q4_guard) {
+        !non_pooled_step_kv_write_safe &&
+        !s_logged_q4_guard.exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,
             "[qwen35] q4_0 non-pooled KV write fallback at row=%d "
             "(DFLASH_QWEN35_KVPAD_MAX_ROW=%d)\n",
             kv_start, non_pooled_kvpad_max_row);
-        s_logged_q4_guard = true;
     }
     const bool use_kv_write_rows =
         !g_no_kvpad && !capture_delta_intermediate &&
