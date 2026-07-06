@@ -1699,6 +1699,32 @@ static const char MINI_JINJA_TEMPLATE[] =
     "<|assistant|>"
     "{%- endif -%}";
 
+static void test_deepseek4_render_system_only_gen_prompt() {
+    std::vector<ChatMessage> msgs = {
+        {"system", "sys only", ""},
+    };
+    const std::string out = render_chat_template(
+        msgs, ChatFormat::DEEPSEEK4,
+        /*add_generation_prompt=*/true,
+        /*enable_thinking=*/false,
+        /*tools_json=*/"");
+    const std::string expected =
+        "<｜begin▁of▁sentence｜>sys only<｜Assistant｜></think>";
+    TEST_ASSERT(out == expected);
+}
+
+static void test_deepseek4_render_empty_chat_gen_prompt() {
+    std::vector<ChatMessage> msgs;
+    const std::string out = render_chat_template(
+        msgs, ChatFormat::DEEPSEEK4,
+        /*add_generation_prompt=*/true,
+        /*enable_thinking=*/false,
+        /*tools_json=*/"");
+    const std::string expected =
+        "<｜begin▁of▁sentence｜><｜Assistant｜></think>";
+    TEST_ASSERT(out == expected);
+}
+
 static void test_jinja_render_basic() {
     std::vector<ChatMessage> msgs = {
         {"system", "you are helpful", ""},
@@ -4493,6 +4519,8 @@ int main() {
     RUN_TEST(test_moe_hybrid_prefill_hot_sub_batch_limit);
 
     std::fprintf(stderr, "\n── Jinja chat template ──\n");
+    RUN_TEST(test_deepseek4_render_system_only_gen_prompt);
+    RUN_TEST(test_deepseek4_render_empty_chat_gen_prompt);
     RUN_TEST(test_jinja_render_basic);
     RUN_TEST(test_jinja_render_no_gen_prompt);
     RUN_TEST(test_jinja_render_tools_injected);

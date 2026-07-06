@@ -367,7 +367,7 @@ std::string render_chat_template(
             }
         }
 
-        if (add_generation_prompt && pending_assistant) {
+        if (add_generation_prompt) {
             result += "<｜Assistant｜>";
             result += enable_thinking ? "<think>" : "</think>";
         }
