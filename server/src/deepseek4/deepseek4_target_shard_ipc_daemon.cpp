@@ -235,26 +235,29 @@ int run_deepseek4_target_shard_ipc_daemon(
             shard_input = hc_state.data();
         }
 
-        // Compute argmax from last token's logits
-        // Note: deepseek4_step_layer_range returns only last token's logits (size = vocab)
-        if (!logits.empty()) {
-            const int vocab = shards.back().weights.n_vocab;
-            const float * last_logits = logits.data();
-            int32_t best = 0;
-            float best_val = last_logits[0];
-            for (int i = 1; i < vocab; ++i) {
-                if (last_logits[i] > best_val) {
-                    best_val = last_logits[i];
-                    best = i;
-                }
-            }
-            resp.last_tok = best;
-            if (req.want_logits) {
-                resp.logits = std::move(logits);
-            }
+        const int vocab = shards.back().weights.n_vocab;
+        if (vocab <= 0 || logits.size() != (size_t)vocab) {
+            std::fprintf(stderr,
+                         "[deepseek4-target-shard] invalid logits payload: expected=%d got=%zu\n",
+                         vocab, logits.size());
+            return false;
         }
 
-        return !logits.empty();
+        const float * last_logits = logits.data();
+        int32_t best = 0;
+        float best_val = last_logits[0];
+        for (int i = 1; i < vocab; ++i) {
+            if (last_logits[i] > best_val) {
+                best_val = last_logits[i];
+                best = i;
+            }
+        }
+        resp.last_tok = best;
+        if (req.want_logits) {
+            resp.logits = std::move(logits);
+        }
+
+        return true;
     };
 
     callbacks.reset_request_state = [&]() -> bool {
