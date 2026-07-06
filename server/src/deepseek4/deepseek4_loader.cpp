@@ -98,17 +98,41 @@ float get_f32_or(gguf_context * g, const char * key, float def) {
     return gguf_get_val_f32(g, id);
 }
 
-std::vector<uint32_t> get_u32_arr(gguf_context * g, const char * key) {
+bool get_u32_arr(gguf_context * g, const char * key, std::vector<uint32_t> & out,
+                 std::string * err = nullptr) {
+    out.clear();
     int64_t id = gguf_find_key(g, key);
-    if (id < 0 || gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY) return {};
-    const size_t n = gguf_get_arr_n(g, id);
-    // Handle both i32 and u32 element types (values are positive either way)
-    const void * raw = gguf_get_arr_data(g, id);
-    std::vector<uint32_t> out(n);
-    for (size_t i = 0; i < n; ++i) {
-        out[i] = (uint32_t)((const int32_t *)raw)[i];
+    if (id < 0) return true;
+    if (gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY) {
+        if (err) *err = std::string(key) + " must be an array";
+        return false;
     }
-    return out;
+    const enum gguf_type arr_type = gguf_get_arr_type(g, id);
+    if (arr_type != GGUF_TYPE_INT32 && arr_type != GGUF_TYPE_UINT32) {
+        if (err) {
+            *err = std::string(key) + " array element type must be i32 or u32";
+        }
+        return false;
+    }
+
+    const size_t n = gguf_get_arr_n(g, id);
+    const void * raw = gguf_get_arr_data(g, id);
+    out.resize(n);
+    if (arr_type == GGUF_TYPE_INT32) {
+        const int32_t * vals = static_cast<const int32_t *>(raw);
+        for (size_t i = 0; i < n; ++i) {
+            if (vals[i] < 0) {
+                if (err) *err = std::string(key) + " array values must be non-negative";
+                out.clear();
+                return false;
+            }
+            out[i] = (uint32_t)vals[i];
+        }
+    } else {
+        const uint32_t * vals = static_cast<const uint32_t *>(raw);
+        out.assign(vals, vals + n);
+    }
+    return true;
 }
 
 ggml_tensor * find_tensor(ggml_context * ctx, const char * name) {
@@ -227,6 +251,37 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         }
     }
 
+    static const char * kRequiredU32Keys[] = {
+        "deepseek4.block_count",
+        "deepseek4.embedding_length",
+        "deepseek4.vocab_size",
+        "deepseek4.attention.head_count",
+        "deepseek4.attention.head_count_kv",
+        "deepseek4.attention.key_length",
+        "deepseek4.rope.dimension_count",
+        "deepseek4.attention.q_lora_rank",
+        "deepseek4.attention.output_lora_rank",
+        "deepseek4.attention.output_group_count",
+        "deepseek4.expert_count",
+        "deepseek4.expert_used_count",
+        "deepseek4.expert_shared_count",
+        "deepseek4.expert_feed_forward_length",
+        "deepseek4.hash_layer_count",
+        "deepseek4.attention.sliding_window",
+        "deepseek4.attention.indexer.head_count",
+        "deepseek4.attention.indexer.key_length",
+        "deepseek4.attention.indexer.top_k",
+        "deepseek4.hyper_connection.count",
+        "deepseek4.hyper_connection.sinkhorn_iterations",
+    };
+    for (const char * key : kRequiredU32Keys) {
+        if (gguf_find_key(gctx, key) < 0) {
+            set_last_error(std::string("missing required key: ") + key);
+            gguf_free(gctx);
+            return false;
+        }
+    }
+
     // ── Read hyperparameters ────────────────────────────────────────────
     const uint32_t n_layer        = get_u32_or(gctx, "deepseek4.block_count", 43);
     const uint32_t n_embd         = get_u32_or(gctx, "deepseek4.embedding_length", 4096);
@@ -264,14 +319,31 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     const float expert_weight_scale = get_f32_or(gctx, "deepseek4.expert_weights_scale", 1.5f);
     const float swiglu_clamp      = get_f32_or(gctx, "deepseek4.swiglu_clamp_exp", 10.0f);
 
+    if (n_vocab == 0) {
+        set_last_error("deepseek4.vocab_size must be > 0");
+        gguf_free(gctx);
+        return false;
+    }
+
     // Compression ratios from metadata (or compute default)
-    std::vector<uint32_t> compress_ratios_meta = get_u32_arr(gctx, "deepseek4.attention.compress_ratios");
+    std::vector<uint32_t> compress_ratios_meta;
+    std::string compress_ratios_err;
+    if (!get_u32_arr(gctx, "deepseek4.attention.compress_ratios",
+                     compress_ratios_meta, &compress_ratios_err)) {
+        set_last_error(compress_ratios_err);
+        gguf_free(gctx);
+        return false;
+    }
     std::vector<uint32_t> compress_ratios;
     if (compress_ratios_meta.size() == n_layer) {
         compress_ratios = compress_ratios_meta;
     } else {
         compress_ratios = compute_compress_ratios((int)n_layer);
     }
+
+    const uint32_t kMissingSpecial = 0xFFFFFFFFu;
+    const uint32_t raw_eos = get_u32_or(gctx, "tokenizer.ggml.eos_token_id", kMissingSpecial);
+    const uint32_t raw_eot = get_u32_or(gctx, "tokenizer.ggml.eot_token_id", kMissingSpecial);
 
     std::fprintf(stderr, "[deepseek4] model: layers=%u embd=%u heads=%u head_dim=%u "
                  "lora_q=%u lora_o=%u out_groups=%u\n",
@@ -314,6 +386,8 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     out.rms_eps         = rms_eps;
     out.hc_eps          = hc_eps;
     out.swiglu_clamp_exp = swiglu_clamp;
+    out.eos_id          = (raw_eos == kMissingSpecial) ? -1 : (int32_t)raw_eos;
+    out.eos_chat_id     = (raw_eot == kMissingSpecial) ? -1 : (int32_t)raw_eot;
 
     out.layers.resize(n_layer);
     out.backend = backend;

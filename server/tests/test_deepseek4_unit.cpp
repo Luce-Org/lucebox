@@ -23,6 +23,7 @@
 #include <limits>
 #include <numeric>
 #include <vector>
+#include <unistd.h>
 
 #define private public
 #include "deepseek4/deepseek4_layer_split_adapter.h"
@@ -67,6 +68,89 @@ using TestClock = std::chrono::steady_clock;
 
 static double elapsed_ms(TestClock::time_point t0, TestClock::time_point t1) {
     return std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+
+struct DeepSeek4FixtureOptions {
+    bool include_vocab_size = true;
+    uint32_t vocab_size = 128;
+    bool write_compress_ratios = false;
+    gguf_type compress_ratios_type = GGUF_TYPE_UINT32;
+    int32_t eos_id = -1;
+    int32_t eot_id = -1;
+};
+
+static std::string make_temp_gguf_path(const char * prefix) {
+    char path[] = "/tmp/deepseek4-loader-XXXXXX";
+    const int fd = mkstemp(path);
+    if (fd >= 0) {
+        close(fd);
+        unlink(path);
+    }
+    return std::string(path) + "-" + prefix + ".gguf";
+}
+
+static std::string write_deepseek4_loader_fixture(const DeepSeek4FixtureOptions & opts) {
+    gguf_context * g = gguf_init_empty();
+    gguf_set_val_str(g, "general.architecture", "deepseek4");
+    gguf_set_val_u32(g, "deepseek4.block_count", 43);
+    gguf_set_val_u32(g, "deepseek4.embedding_length", 4096);
+    if (opts.include_vocab_size) {
+        gguf_set_val_u32(g, "deepseek4.vocab_size", opts.vocab_size);
+    }
+    gguf_set_val_u32(g, "deepseek4.attention.head_count", 64);
+    gguf_set_val_u32(g, "deepseek4.attention.head_count_kv", 1);
+    gguf_set_val_u32(g, "deepseek4.attention.key_length", 512);
+    gguf_set_val_u32(g, "deepseek4.rope.dimension_count", 64);
+    gguf_set_val_u32(g, "deepseek4.attention.q_lora_rank", 1024);
+    gguf_set_val_u32(g, "deepseek4.attention.output_lora_rank", 1024);
+    gguf_set_val_u32(g, "deepseek4.attention.output_group_count", 8);
+    gguf_set_val_u32(g, "deepseek4.expert_count", 256);
+    gguf_set_val_u32(g, "deepseek4.expert_used_count", 6);
+    gguf_set_val_u32(g, "deepseek4.expert_shared_count", 1);
+    gguf_set_val_u32(g, "deepseek4.expert_feed_forward_length", 2048);
+    gguf_set_val_u32(g, "deepseek4.hash_layer_count", 3);
+    gguf_set_val_u32(g, "deepseek4.attention.sliding_window", 128);
+    gguf_set_val_u32(g, "deepseek4.attention.indexer.head_count", 64);
+    gguf_set_val_u32(g, "deepseek4.attention.indexer.key_length", 128);
+    gguf_set_val_u32(g, "deepseek4.attention.indexer.top_k", 512);
+    gguf_set_val_u32(g, "deepseek4.hyper_connection.count", 4);
+    gguf_set_val_u32(g, "deepseek4.hyper_connection.sinkhorn_iterations", 20);
+
+    if (opts.write_compress_ratios) {
+        std::vector<uint32_t> ratios(43, 4);
+        ratios[0] = 0;
+        ratios[1] = 0;
+        switch (opts.compress_ratios_type) {
+        case GGUF_TYPE_UINT32:
+            gguf_set_arr_data(g, "deepseek4.attention.compress_ratios",
+                              GGUF_TYPE_UINT32, ratios.data(), ratios.size());
+            break;
+        case GGUF_TYPE_INT32: {
+            std::vector<int32_t> vals(ratios.begin(), ratios.end());
+            gguf_set_arr_data(g, "deepseek4.attention.compress_ratios",
+                              GGUF_TYPE_INT32, vals.data(), vals.size());
+            break;
+        }
+        default: {
+            std::vector<int16_t> vals(ratios.begin(), ratios.end());
+            gguf_set_arr_data(g, "deepseek4.attention.compress_ratios",
+                              opts.compress_ratios_type, vals.data(), vals.size());
+            break;
+        }
+        }
+    }
+
+    if (opts.eos_id >= 0) {
+        gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", (uint32_t)opts.eos_id);
+    }
+    if (opts.eot_id >= 0) {
+        gguf_set_val_u32(g, "tokenizer.ggml.eot_token_id", (uint32_t)opts.eot_id);
+    }
+
+    const std::string path = make_temp_gguf_path("fixture");
+    gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
+    gguf_free(g);
+    return path;
 }
 
 static ggml_context * make_test_context(size_t mem_size = 1u << 20) {
@@ -453,6 +537,81 @@ static void test_hc_state_dimensions() {
     TEST_ASSERT(weights.n_hc == 4);
     TEST_ASSERT(weights.n_embd == 4096);
     TEST_ASSERT(DeepSeek4LayerSplitAdapter::hc_state_elements(weights) == 16384);
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_loader_rejects_missing_required_metadata(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_loader_rejects_missing_required_metadata ...");
+
+    DeepSeek4FixtureOptions opts;
+    opts.include_vocab_size = false;
+    const std::string path = write_deepseek4_loader_fixture(opts);
+    DeepSeek4Weights weights;
+    const bool ok = load_deepseek4_gguf(path, backend, weights);
+    TEST_ASSERT(!ok);
+    TEST_ASSERT_MSG(std::string(dflash27b_last_error()).find(
+                        "missing required key: deepseek4.vocab_size") != std::string::npos,
+                    dflash27b_last_error());
+    free_deepseek4_weights(weights);
+    unlink(path.c_str());
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_loader_rejects_invalid_compress_ratio_type(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_loader_rejects_invalid_compress_ratio_type ...");
+
+    DeepSeek4FixtureOptions opts;
+    opts.write_compress_ratios = true;
+    opts.compress_ratios_type = GGUF_TYPE_INT16;
+    const std::string path = write_deepseek4_loader_fixture(opts);
+    DeepSeek4Weights weights;
+    const bool ok = load_deepseek4_gguf(path, backend, weights);
+    TEST_ASSERT(!ok);
+    TEST_ASSERT_MSG(std::string(dflash27b_last_error()).find(
+                        "deepseek4.attention.compress_ratios array element type must be i32 or u32") != std::string::npos,
+                    dflash27b_last_error());
+    free_deepseek4_weights(weights);
+    unlink(path.c_str());
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_loader_rejects_zero_vocab_size(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_loader_rejects_zero_vocab_size ...");
+
+    DeepSeek4FixtureOptions opts;
+    opts.vocab_size = 0;
+    const std::string path = write_deepseek4_loader_fixture(opts);
+    DeepSeek4Weights weights;
+    const bool ok = load_deepseek4_gguf(path, backend, weights);
+    TEST_ASSERT(!ok);
+    TEST_ASSERT_MSG(std::string(dflash27b_last_error()).find(
+                        "deepseek4.vocab_size must be > 0") != std::string::npos,
+                    dflash27b_last_error());
+    free_deepseek4_weights(weights);
+    unlink(path.c_str());
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_loader_reads_tokenizer_special_ids(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_loader_reads_tokenizer_special_ids ...");
+
+    DeepSeek4FixtureOptions opts;
+    opts.eos_id = 151645;
+    opts.eot_id = 151643;
+    const std::string path = write_deepseek4_loader_fixture(opts);
+    DeepSeek4Weights weights;
+    const bool ok = load_deepseek4_gguf(path, backend, weights);
+    TEST_ASSERT_MSG(ok, dflash27b_last_error());
+    if (ok) {
+        TEST_ASSERT(weights.eos_id == 151645);
+        TEST_ASSERT(weights.eos_chat_id == 151643);
+    }
+    free_deepseek4_weights(weights);
+    unlink(path.c_str());
 
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
@@ -1229,6 +1388,10 @@ int main() {
     test_auto_split_computation();
     test_layer_range_validation();
     test_hc_state_dimensions();
+    test_loader_rejects_missing_required_metadata(backend);
+    test_loader_rejects_invalid_compress_ratio_type(backend);
+    test_loader_rejects_zero_vocab_size(backend);
+    test_loader_reads_tokenizer_special_ids(backend);
     test_snapshot_save_restore();
     test_reset_request_state();
     test_adapter_guard_paths();

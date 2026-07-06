@@ -210,6 +210,10 @@ struct DeepSeek4Weights {
     // SwiGLU
     float swiglu_clamp_exp = 10.0f;
 
+    // Tokenizer special tokens from GGUF metadata.
+    int32_t eos_id      = -1;
+    int32_t eos_chat_id = -1;
+
     // MoE hybrid placement (deprecated — layer split replaces expert split)
     bool moe_hybrid       = false;
 };
