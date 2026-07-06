@@ -192,6 +192,12 @@ bool eval_moe_hybrid_ffn_gpu_resident(
     MoeExpertCompute *                expert_compute = nullptr,
     const MoeExpertLayer *            expert_layer = nullptr);
 
+struct CachedHotGraphOptions {
+    float swiglu_clamp = 0.0f;
+    bool gpu_remap = false;
+    int n_expert = 0;
+};
+
 // Build/rebuild cached hot FFN graph.
 bool build_cached_hot_graph(
     CachedFfnGraph & out,
@@ -208,9 +214,7 @@ bool build_cached_hot_graph(
     int n_embd,
     int n_ff_exp,
     int n_hot,
-    float swiglu_clamp = 0.0f,
-    bool gpu_remap = false,
-    int n_expert = 0);
+    CachedHotGraphOptions options = {});
 
 // Build/rebuild cached MoE expert compute graph.
 bool build_cached_cold_graph(

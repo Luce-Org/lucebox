@@ -513,9 +513,11 @@ bool build_cached_hot_graph(
     int n_embd,
     int n_ff_exp,
     int n_hot,
-    float swiglu_clamp,
-    bool gpu_remap,
-    int n_expert) {
+    CachedHotGraphOptions options) {
+
+    const float swiglu_clamp = options.swiglu_clamp;
+    const bool gpu_remap = options.gpu_remap;
+    const int n_expert = options.n_expert;
 
     out.free();
     out.n_hot = n_hot;
@@ -901,7 +903,8 @@ bool eval_moe_hybrid_ffn_single(
             build_cached_hot_graph(storage.hot_graph, gpu_backend,
                                    storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
                                    desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-                                   desc, cfg.n_embd, cfg.n_ff_exp, n_hot_graph, cfg.swiglu_clamp);
+                                   desc, cfg.n_embd, cfg.n_ff_exp, n_hot_graph,
+                                   CachedHotGraphOptions{cfg.swiglu_clamp});
             if (telemetry) telemetry->hot_graph_build_us += elapsed_us(graph_build_t0, HybridClock::now());
         } else if (telemetry) {
             telemetry->hot_graph_hits++;
@@ -2199,7 +2202,7 @@ bool eval_moe_hybrid_ffn_gpu_resident(
                                    storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
                                    desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
                                    desc, n_embd, cfg.n_ff_exp, n_selected,
-                                   /*gpu_remap=*/true, cfg.n_expert);
+                                   CachedHotGraphOptions{cfg.swiglu_clamp, true, cfg.n_expert});
         }
         if (!storage.hot_graph.valid() || !storage.hot_graph.global_ids ||
             !storage.hot_graph.hot_local_lut || !storage.hot_graph.valid_lut ||
@@ -2273,7 +2276,8 @@ bool eval_moe_hybrid_ffn_gpu_resident(
             build_cached_hot_graph(storage.hot_graph, gpu_backend,
                                    storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
                                    desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-                                   desc, n_embd, cfg.n_ff_exp, n_hot, cfg.swiglu_clamp);
+                                   desc, n_embd, cfg.n_ff_exp, n_hot,
+                                   CachedHotGraphOptions{cfg.swiglu_clamp});
         }
         if (storage.hot_graph.valid() && storage.hot_graph.n_hot == n_hot) {
             // GPU→GPU copy: ffn_post → hot_graph.inp (no PCIe!)
