@@ -17,11 +17,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <numeric>
+#include <sys/stat.h>
 #include <vector>
 #include <unistd.h>
 
@@ -150,6 +152,49 @@ static std::string write_deepseek4_loader_fixture(const DeepSeek4FixtureOptions 
     const std::string path = make_temp_gguf_path("fixture");
     gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
     gguf_free(g);
+    return path;
+}
+
+static std::string write_deepseek4_tensor_fixture() {
+    ggml_init_params ip{};
+    ip.mem_size = 1u << 20;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc = false;
+    ggml_context * ctx = ggml_init(ip);
+    gguf_context * g = gguf_init_empty();
+
+    gguf_set_val_str(g, "general.architecture", "deepseek4");
+    gguf_set_val_u32(g, "deepseek4.block_count", 1);
+    gguf_set_val_u32(g, "deepseek4.embedding_length", 4);
+    gguf_set_val_u32(g, "deepseek4.vocab_size", 8);
+    gguf_set_val_u32(g, "deepseek4.attention.head_count", 1);
+    gguf_set_val_u32(g, "deepseek4.attention.head_count_kv", 1);
+    gguf_set_val_u32(g, "deepseek4.attention.key_length", 4);
+    gguf_set_val_u32(g, "deepseek4.rope.dimension_count", 4);
+    gguf_set_val_u32(g, "deepseek4.attention.q_lora_rank", 4);
+    gguf_set_val_u32(g, "deepseek4.attention.output_lora_rank", 4);
+    gguf_set_val_u32(g, "deepseek4.attention.output_group_count", 1);
+    gguf_set_val_u32(g, "deepseek4.expert_count", 1);
+    gguf_set_val_u32(g, "deepseek4.expert_used_count", 1);
+    gguf_set_val_u32(g, "deepseek4.expert_shared_count", 1);
+    gguf_set_val_u32(g, "deepseek4.expert_feed_forward_length", 8);
+    gguf_set_val_u32(g, "deepseek4.hash_layer_count", 0);
+    gguf_set_val_u32(g, "deepseek4.attention.sliding_window", 8);
+    gguf_set_val_u32(g, "deepseek4.attention.indexer.head_count", 1);
+    gguf_set_val_u32(g, "deepseek4.attention.indexer.key_length", 4);
+    gguf_set_val_u32(g, "deepseek4.attention.indexer.top_k", 1);
+    gguf_set_val_u32(g, "deepseek4.hyper_connection.count", 1);
+    gguf_set_val_u32(g, "deepseek4.hyper_connection.sinkhorn_iterations", 1);
+
+    ggml_tensor * tok = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 8);
+    ggml_set_name(tok, "token_embd.weight");
+    std::memset(tok->data, 0, ggml_nbytes(tok));
+    gguf_add_tensor(g, tok);
+
+    const std::string path = make_temp_gguf_path("tensor");
+    gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
+    gguf_free(g);
+    ggml_free(ctx);
     return path;
 }
 
@@ -611,6 +656,37 @@ static void test_loader_reads_tokenizer_special_ids(ggml_backend_t backend) {
         TEST_ASSERT(weights.eos_chat_id == 151643);
     }
     free_deepseek4_weights(weights);
+    unlink(path.c_str());
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_loader_rejects_truncated_tensor_data(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_loader_rejects_truncated_tensor_data ...");
+
+    const std::string path = write_deepseek4_tensor_fixture();
+    {
+        DeepSeek4Weights weights;
+        const bool ok = load_deepseek4_gguf(path, backend, weights);
+        TEST_ASSERT_MSG(ok, dflash27b_last_error());
+        free_deepseek4_weights(weights);
+    }
+
+    struct stat st{};
+    TEST_ASSERT(stat(path.c_str(), &st) == 0);
+    const off_t truncated_size = (off_t)st.st_size - 8;
+    TEST_ASSERT(truncated_size > 0);
+    TEST_ASSERT(truncate(path.c_str(), truncated_size) == 0);
+
+    {
+        DeepSeek4Weights weights;
+        const bool ok = load_deepseek4_gguf(path, backend, weights);
+        TEST_ASSERT(!ok);
+        TEST_ASSERT_MSG(std::string(dflash27b_last_error()).find(
+                            "truncated or corrupt") != std::string::npos,
+                        dflash27b_last_error());
+        free_deepseek4_weights(weights);
+    }
     unlink(path.c_str());
 
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
@@ -1392,6 +1468,7 @@ int main() {
     test_loader_rejects_invalid_compress_ratio_type(backend);
     test_loader_rejects_zero_vocab_size(backend);
     test_loader_reads_tokenizer_special_ids(backend);
+    test_loader_rejects_truncated_tensor_data(backend);
     test_snapshot_save_restore();
     test_reset_request_state();
     test_adapter_guard_paths();

@@ -16,6 +16,7 @@
 #include "deepseek4_internal.h"
 #include "internal.h"
 #include "dflash27b.h"
+#include "common/gguf_bounds.h"
 #include "../common/moe_hybrid_storage.h"
 #include "../common/moe_hybrid_types.h"
 #include "ggml-cuda.h"
@@ -199,6 +200,7 @@ static bool should_upload_ds4_tensor(const char * name,
 
 struct DS4TensorAlloc {
     ggml_tensor * tensor = nullptr;
+    size_t tensor_offset = 0;
     size_t file_offset = 0;
     size_t file_size = 0;
     size_t buffer_offset = 0;
@@ -428,12 +430,12 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         ggml_tensor * t = find_tensor(meta_ctx, tname);
         if (!t) continue;
 
-        const size_t offset = data_offset + gguf_get_tensor_offset(gctx, ti);
+        const size_t tensor_offset = gguf_get_tensor_offset(gctx, ti);
         const bool upload_to_backend = should_upload_ds4_tensor(tname, plan);
 
         DS4TensorAlloc a;
         a.tensor = t;
-        a.file_offset = offset;
+        a.tensor_offset = tensor_offset;
         a.file_size = gguf_get_tensor_size(gctx, ti);
         a.upload_to_backend = upload_to_backend;
         if (upload_to_backend) {
@@ -483,6 +485,23 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         gguf_free(gctx);
         ggml_free(meta_ctx);
         return false;
+    }
+    for (auto & a : allocs) {
+        if (!gguf_tensor_in_file(data_offset, a.tensor_offset, a.file_size, mmap.len)) {
+            set_last_error(gguf_bounds_error("deepseek4 GGUF",
+                                             ggml_get_name(a.tensor),
+                                             ggml_type_name(a.tensor->type),
+                                             data_offset,
+                                             a.tensor_offset,
+                                             a.file_size,
+                                             mmap.len));
+            mmap.close_map();
+            if (buf) ggml_backend_buffer_free(buf);
+            gguf_free(gctx);
+            ggml_free(meta_ctx);
+            return false;
+        }
+        a.file_offset = data_offset + a.tensor_offset;
     }
 
     bool fast_managed = (buf != nullptr) && ggml_backend_cuda_buffer_is_managed(buf) && (getenv("DFLASH_NO_PREAD") == nullptr);
@@ -715,6 +734,8 @@ bool build_deepseek4_moe_hybrid_storage_from_file(
     const size_t data_start = gguf_get_data_offset(gctx);
     const auto * file_bytes = static_cast<const uint8_t *>(mmap.addr);
     std::vector<LayerExpertFileData> layer_file_data((size_t)w.n_layer);
+    bool bad_bounds = false;
+    std::string bounds_err;
 
     for (int il = 0; il < w.n_layer; ++il) {
         char name[128];
@@ -722,15 +743,29 @@ bool build_deepseek4_moe_hybrid_storage_from_file(
             std::snprintf(name, sizeof(name), "blk.%d.%s.weight", il, suffix);
             int64_t tid = gguf_find_tensor(gctx, name);
             if (tid < 0) return {};
-            const size_t off = data_start + gguf_get_tensor_offset(gctx, tid);
+            const size_t tensor_off = gguf_get_tensor_offset(gctx, tid);
             const size_t sz = gguf_get_tensor_size(gctx, tid);
-            if (off + sz > mmap.len) return {};
+            if (!gguf_tensor_in_file(data_start, tensor_off, sz, mmap.len)) {
+                bad_bounds = true;
+                bounds_err = gguf_bounds_error("deepseek4 expert GGUF", name,
+                                               ggml_type_name(gguf_get_tensor_type(gctx, tid)),
+                                               data_start, tensor_off, sz, mmap.len);
+                return {};
+            }
+            const size_t off = data_start + tensor_off;
             return { file_bytes + off, sz };
         };
 
         layer_file_data[(size_t)il].gate_exps = find_tensor_data("ffn_gate_exps");
         layer_file_data[(size_t)il].up_exps = find_tensor_data("ffn_up_exps");
         layer_file_data[(size_t)il].down_exps = find_tensor_data("ffn_down_exps");
+        if (bad_bounds) {
+            mmap.close_map();
+            gguf_free(gctx);
+            if (expert_meta) ggml_free(expert_meta);
+            if (err) *err = bounds_err;
+            return false;
+        }
     }
 
     std::vector<MoeLayerDesc> layer_descs((size_t)w.n_layer);
@@ -782,6 +817,8 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
     const size_t data_start = gguf_get_data_offset(gctx);
     const auto * file_bytes = static_cast<const uint8_t *>(mmap.addr);
     std::vector<LayerExpertFileData> layer_file_data((size_t)w.n_layer);
+    bool bad_bounds = false;
+    std::string bounds_err;
 
     for (int il = 0; il < w.n_layer; ++il) {
         char name[128];
@@ -789,15 +826,29 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
             std::snprintf(name, sizeof(name), "blk.%d.%s.weight", il, suffix);
             int64_t tid = gguf_find_tensor(gctx, name);
             if (tid < 0) return {};
-            const size_t off = data_start + gguf_get_tensor_offset(gctx, tid);
+            const size_t tensor_off = gguf_get_tensor_offset(gctx, tid);
             const size_t sz = gguf_get_tensor_size(gctx, tid);
-            if (off + sz > mmap.len) return {};
+            if (!gguf_tensor_in_file(data_start, tensor_off, sz, mmap.len)) {
+                bad_bounds = true;
+                bounds_err = gguf_bounds_error("deepseek4 expert GGUF", name,
+                                               ggml_type_name(gguf_get_tensor_type(gctx, tid)),
+                                               data_start, tensor_off, sz, mmap.len);
+                return {};
+            }
+            const size_t off = data_start + tensor_off;
             return { file_bytes + off, sz };
         };
 
         layer_file_data[(size_t)il].gate_exps = find_tensor_data("ffn_gate_exps");
         layer_file_data[(size_t)il].up_exps = find_tensor_data("ffn_up_exps");
         layer_file_data[(size_t)il].down_exps = find_tensor_data("ffn_down_exps");
+        if (bad_bounds) {
+            mmap.close_map();
+            gguf_free(gctx);
+            if (expert_meta) ggml_free(expert_meta);
+            if (err) *err = bounds_err;
+            return false;
+        }
     }
 
     std::vector<MoeLayerDesc> layer_descs((size_t)w.n_layer);
