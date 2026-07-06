@@ -200,10 +200,15 @@ bool DeepSeek4LayerSplitAdapter::init() {
         }
     }
 
-    // When remote_target_shard is configured, use mixed (IPC) path:
-    // only the first shard is local, the rest run via IPC daemon on Halo.
-    if (cfg_.remote_target_shard.enabled()) {
+    // When remote_target_shard is configured, use mixed (IPC) path only if
+    // there are actually remote layers to offload.
+    if (cfg_.remote_target_shard.enabled() && device.layer_split_gpus.size() > 1) {
         return init_mixed_target_split_full(device);
+    }
+    if (cfg_.remote_target_shard.enabled()) {
+        std::fprintf(stderr,
+                     "[deepseek4-split] remote target shard configured but no remote layers selected; "
+                     "using single-shard target path\n");
     }
 
     // Single-shard path: all layers on one GPU (monolithic)
@@ -353,6 +358,11 @@ bool DeepSeek4LayerSplitAdapter::init_mixed_target_split_full(const DevicePlacem
         remote_gpus.push_back(device.layer_split_gpus[i]);
         remote_layer_begins.push_back(ranges[i].begin);
         remote_layer_ends.push_back(ranges[i].end);
+    }
+    if (remote_gpus.empty() || remote_layer_begins.empty() || remote_layer_ends.empty()) {
+        std::fprintf(stderr,
+                     "[deepseek4-split] mixed target split requires at least one remote shard\n");
+        return false;
     }
 
     TargetShardIpcLaunchConfig launch_cfg;
