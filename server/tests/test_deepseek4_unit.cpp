@@ -518,6 +518,41 @@ static DeepSeek4LayerSplitAdapter make_test_adapter() {
     return DeepSeek4LayerSplitAdapter(cfg);
 }
 
+static std::vector<uint8_t> make_tensor_pattern(const ggml_tensor * tensor,
+                                                uint8_t seed) {
+    std::vector<uint8_t> data(ggml_nbytes(tensor));
+    for (size_t i = 0; i < data.size(); ++i) {
+        data[i] = (uint8_t)(seed + (uint8_t)(i % 251));
+    }
+    return data;
+}
+
+static void write_tensor_pattern(ggml_tensor * tensor, uint8_t seed) {
+    const std::vector<uint8_t> data = make_tensor_pattern(tensor, seed);
+    ggml_backend_tensor_set(tensor, data.data(), 0, data.size());
+}
+
+static std::vector<uint8_t> read_tensor_bytes(const ggml_tensor * tensor) {
+    std::vector<uint8_t> data(ggml_nbytes(tensor));
+    ggml_backend_tensor_get(tensor, data.data(), 0, data.size());
+    return data;
+}
+
+static bool init_snapshot_test_shard(DeepSeek4LayerSplitAdapter & adapter) {
+    adapter.shards_.resize(1);
+    auto & shard = adapter.shards_[0];
+    shard.backend = ggml_backend_cpu_init();
+    if (!shard.backend) return false;
+    shard.weights.n_layer = 1;
+    shard.weights.n_embd = 4;
+    shard.weights.n_hc = 1;
+    shard.weights.head_dim = 4;
+    shard.weights.n_swa = 8;
+    shard.weights.n_indexer_head_dim = 2;
+    shard.weights.compress_ratios = {4};
+    return create_deepseek4_cache(shard.backend, shard.weights, 16, shard.cache);
+}
+
 static void test_auto_split_computation() {
     std::fprintf(stderr, "  test_auto_split_computation ...");
 
@@ -699,30 +734,86 @@ static void test_snapshot_save_restore() {
     std::fprintf(stderr, "  test_snapshot_save_restore ...");
 
     auto adapter = make_test_adapter();
-    adapter.cur_pos_ = 23;
+    TEST_ASSERT(init_snapshot_test_shard(adapter));
+    if (adapter.shards_.empty() || !adapter.shards_[0].backend) {
+        std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+        return;
+    }
+    adapter.snapshot_backends_.assign(1, adapter.shards_[0].backend);
+
+    auto & cache = adapter.shards_[0].cache;
+    auto & layer = cache.layers[0];
+    write_tensor_pattern(layer.raw_kv, 3);
+    write_tensor_pattern(layer.comp_kv, 17);
+    write_tensor_pattern(layer.index_comp_kv, 29);
+    write_tensor_pattern(layer.attn_compressor.state_kv, 41);
+    write_tensor_pattern(layer.attn_compressor.state_score, 53);
+    write_tensor_pattern(layer.indexer_compressor.state_kv, 67);
+    write_tensor_pattern(layer.indexer_compressor.state_score, 79);
+
+    const std::vector<uint8_t> raw_before = read_tensor_bytes(layer.raw_kv);
+    const std::vector<uint8_t> comp_before = read_tensor_bytes(layer.comp_kv);
+    const std::vector<uint8_t> index_before = read_tensor_bytes(layer.index_comp_kv);
+    const std::vector<uint8_t> attn_kv_before =
+        read_tensor_bytes(layer.attn_compressor.state_kv);
+    const std::vector<uint8_t> attn_score_before =
+        read_tensor_bytes(layer.attn_compressor.state_score);
+    const std::vector<uint8_t> index_kv_before =
+        read_tensor_bytes(layer.indexer_compressor.state_kv);
+    const std::vector<uint8_t> index_score_before =
+        read_tensor_bytes(layer.indexer_compressor.state_score);
+
+    layer.n_comp = 5;
+    layer.n_index_comp = 3;
+    cache.cur_pos = 7;
+    adapter.cur_pos_ = 7;
     adapter.last_tok_ = 4242;
     adapter.hc_state_ = {1.0f, 2.0f, 3.0f, 4.0f};
+    adapter.prefill_last_logits_ = {9.0f, 8.0f, 7.0f};
 
     TEST_ASSERT(adapter.snapshot_save(0));
     TEST_ASSERT(adapter.snapshot_used(0));
-    TEST_ASSERT(adapter.snapshot_cur_pos(0) == 23);
+    TEST_ASSERT(adapter.snapshot_cur_pos(0) == 7);
 
     adapter.cur_pos_ = 0;
     adapter.last_tok_ = -1;
     adapter.hc_state_.assign(4, 0.0f);
+    adapter.prefill_last_logits_.clear();
+    cache.cur_pos = 0;
+    layer.n_comp = 0;
+    layer.n_index_comp = 0;
+    ggml_backend_buffer_clear(cache.buf, 0);
 
     TEST_ASSERT(adapter.snapshot_restore(0));
-    TEST_ASSERT(adapter.cur_pos_ == 23);
+    TEST_ASSERT(adapter.cur_pos_ == 7);
     TEST_ASSERT(adapter.last_tok_ == 4242);
     TEST_ASSERT(adapter.hc_state_.size() == 4);
     if (adapter.hc_state_.size() == 4) {
         TEST_ASSERT(adapter.hc_state_[0] == 1.0f);
         TEST_ASSERT(adapter.hc_state_[3] == 4.0f);
     }
+    TEST_ASSERT(adapter.prefill_last_logits_.size() == 3);
+    if (adapter.prefill_last_logits_.size() == 3) {
+        TEST_ASSERT(adapter.prefill_last_logits_[0] == 9.0f);
+        TEST_ASSERT(adapter.prefill_last_logits_[2] == 7.0f);
+    }
+    TEST_ASSERT(cache.cur_pos == 7);
+    TEST_ASSERT(layer.n_comp == 5);
+    TEST_ASSERT(layer.n_index_comp == 3);
+    TEST_ASSERT(read_tensor_bytes(layer.raw_kv) == raw_before);
+    TEST_ASSERT(read_tensor_bytes(layer.comp_kv) == comp_before);
+    TEST_ASSERT(read_tensor_bytes(layer.index_comp_kv) == index_before);
+    TEST_ASSERT(read_tensor_bytes(layer.attn_compressor.state_kv) == attn_kv_before);
+    TEST_ASSERT(read_tensor_bytes(layer.attn_compressor.state_score) == attn_score_before);
+    TEST_ASSERT(read_tensor_bytes(layer.indexer_compressor.state_kv) == index_kv_before);
+    TEST_ASSERT(read_tensor_bytes(layer.indexer_compressor.state_score) == index_score_before);
 
     adapter.snapshot_free(0);
     TEST_ASSERT(!adapter.snapshot_used(0));
     TEST_ASSERT(adapter.snapshots_[0].hc_state.empty());
+    TEST_ASSERT(adapter.snapshots_[0].prefill_last_logits.empty());
+    TEST_ASSERT(adapter.snapshots_[0].shards.size() == 1);
+    TEST_ASSERT(!adapter.snapshots_[0].shards[0].ctx);
     TEST_ASSERT(!adapter.snapshot_restore(0));
     TEST_ASSERT(!adapter.snapshot_save(-1));
     TEST_ASSERT(!adapter.snapshot_save(ModelBackend::kMaxSlots));

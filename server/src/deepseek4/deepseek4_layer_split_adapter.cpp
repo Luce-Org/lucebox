@@ -623,24 +623,57 @@ bool DeepSeek4LayerSplitAdapter::decode_ar(
 }
 
 bool DeepSeek4LayerSplitAdapter::snapshot_save(int slot) {
-    if (slot < 0 || slot >= PREFIX_SLOTS) return false;
+    if (slot < 0 || slot >= PREFIX_SLOTS || shards_.empty()) return false;
+    if (snapshot_backends_.size() != shards_.size()) return false;
     auto & snap = snapshots_[slot];
+    snapshot_free(slot);
+    if (snap.shards.size() != shards_.size()) snap.shards.resize(shards_.size());
+    for (size_t i = 0; i < shards_.size(); ++i) {
+        if (!deepseek4_snapshot_save(shards_[i].cache, snapshot_backends_[i],
+                                     snap.shards[i])) {
+            snapshot_free(slot);
+            return false;
+        }
+    }
+    if (use_mixed_target_split() && !remote_target_shard_.snapshot_save(slot)) {
+        snapshot_free(slot);
+        return false;
+    }
     snap.cur_pos = cur_pos_;
     snap.last_tok = last_tok_;
     snap.hc_state = hc_state_;
+    snap.prefill_last_logits = prefill_last_logits_;
     snap.used = true;
     return true;
 }
 
 void DeepSeek4LayerSplitAdapter::snapshot_free(int slot) {
     if (slot < 0 || slot >= PREFIX_SLOTS) return;
-    snapshots_[slot].used = false;
-    snapshots_[slot].hc_state.clear();
+    auto & snap = snapshots_[slot];
+    for (auto & shard_snap : snap.shards) {
+        free_deepseek4_snapshot(shard_snap);
+    }
+    snap.cur_pos = 0;
+    snap.last_tok = -1;
+    snap.hc_state.clear();
+    snap.prefill_last_logits.clear();
+    snap.used = false;
+    if (snap.shards.size() != shards_.size()) snap.shards.resize(shards_.size());
+    if (use_mixed_target_split()) {
+        remote_target_shard_.snapshot_free(slot);
+    }
 }
 
 bool DeepSeek4LayerSplitAdapter::snapshot_used(int slot) const {
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
-    return snapshots_[slot].used;
+    const auto & snap = snapshots_[slot];
+    if (!snap.used || snap.cur_pos < 0 || snap.shards.size() != shards_.size()) {
+        return false;
+    }
+    for (const auto & shard_snap : snap.shards) {
+        if (!shard_snap.ctx) return false;
+    }
+    return true;
 }
 
 int DeepSeek4LayerSplitAdapter::snapshot_cur_pos(int slot) const {
@@ -649,18 +682,29 @@ int DeepSeek4LayerSplitAdapter::snapshot_cur_pos(int slot) const {
 }
 
 bool DeepSeek4LayerSplitAdapter::snapshot_restore(int slot) {
-    if (slot < 0 || slot >= PREFIX_SLOTS || !snapshots_[slot].used) return false;
+    if (!snapshot_used(slot)) return false;
     const auto & snap = snapshots_[slot];
+    for (size_t i = 0; i < shards_.size(); ++i) {
+        if (snap.shards[i].cur_pos != snap.cur_pos ||
+            !deepseek4_snapshot_restore(snap.shards[i], shards_[i].cache)) {
+            return false;
+        }
+    }
+    if (use_mixed_target_split() && !remote_target_shard_.snapshot_restore(slot)) {
+        return false;
+    }
     cur_pos_ = snap.cur_pos;
     last_tok_ = snap.last_tok;
     hc_state_ = snap.hc_state;
+    prefill_last_logits_ = snap.prefill_last_logits;
     return true;
 }
 
 void DeepSeek4LayerSplitAdapter::shutdown() {
-    if (remote_target_shard_.active()) {
-        remote_target_shard_.reset_request_state();
-    }
+    for (int i = 0; i < PREFIX_SLOTS; ++i) snapshot_free(i);
+    auto shard_metas = layer_split_shard_metas(shards_);
+    free_layer_split_snapshot_backends(shard_metas, snapshot_backends_);
+    remote_target_shard_.close();
     for (auto & shard : shards_) {
         free_deepseek4_cache(shard.cache);
         free_deepseek4_weights(shard.weights);
@@ -670,8 +714,6 @@ void DeepSeek4LayerSplitAdapter::shutdown() {
         }
     }
     shards_.clear();
-    free_layer_split_snapshot_backends(
-        layer_split_shard_metas(shards_), snapshot_backends_);
 }
 
 }  // namespace dflash::common

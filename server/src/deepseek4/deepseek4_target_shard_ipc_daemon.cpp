@@ -184,6 +184,31 @@ int run_deepseek4_target_shard_ipc_daemon(
 
     const int hidden = shards.front().weights.n_embd * shards.front().weights.n_hc;
     std::vector<float> hc_state;
+    auto shard_metas = layer_split_shard_metas(shards);
+    std::vector<ggml_backend_t> snapshot_backends;
+    if (!init_layer_split_snapshot_backends(shard_metas, snapshot_backends,
+                                            "deepseek4-target-shard")) {
+        free_deepseek4_target_shards(shards);
+        return 1;
+    }
+    struct Snapshot {
+        int cur_pos = 0;
+        std::vector<float> hc_state;
+        std::vector<DeepSeek4Snapshot> shards;
+        bool used = false;
+    };
+    std::vector<Snapshot> snapshots((size_t)ModelBackend::kMaxSlots);
+    auto free_slot = [&](int slot) {
+        if (slot < 0 || slot >= ModelBackend::kMaxSlots) return;
+        auto & snap = snapshots[(size_t)slot];
+        for (auto & shard_snap : snap.shards) {
+            free_deepseek4_snapshot(shard_snap);
+        }
+        snap.cur_pos = 0;
+        snap.hc_state.clear();
+        snap.used = false;
+        if (snap.shards.size() != shards.size()) snap.shards.resize(shards.size());
+    };
 
     // Set up daemon callbacks
     TargetShardDaemonCallbacks callbacks;
@@ -273,18 +298,45 @@ int run_deepseek4_target_shard_ipc_daemon(
     };
 
     callbacks.snapshot_save = [&](int slot) -> bool {
-        (void)slot;
-        // TODO: implement snapshot for daemon shard
+        if (slot < 0 || slot >= ModelBackend::kMaxSlots ||
+            snapshot_backends.size() != shards.size()) {
+            return false;
+        }
+        const int snap_pos = shards.empty() ? 0 : shards.front().cache.cur_pos;
+        if (snap_pos <= 0) return false;
+        free_slot(slot);
+        auto & snap = snapshots[(size_t)slot];
+        if (snap.shards.size() != shards.size()) snap.shards.resize(shards.size());
+        for (size_t i = 0; i < shards.size(); ++i) {
+            if (!deepseek4_snapshot_save(shards[i].cache, snapshot_backends[i],
+                                         snap.shards[i])) {
+                free_slot(slot);
+                return false;
+            }
+        }
+        snap.cur_pos = snap_pos;
+        snap.hc_state = hc_state;
+        snap.used = true;
         return true;
     };
 
     callbacks.snapshot_free = [&](int slot) {
-        (void)slot;
+        free_slot(slot);
     };
 
     callbacks.snapshot_restore = [&](int slot) -> bool {
-        (void)slot;
-        // TODO: implement snapshot restore for daemon shard
+        if (slot < 0 || slot >= ModelBackend::kMaxSlots) return false;
+        auto & snap = snapshots[(size_t)slot];
+        if (!snap.used || snap.cur_pos <= 0 || snap.shards.size() != shards.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < shards.size(); ++i) {
+            if (snap.shards[i].cur_pos != snap.cur_pos ||
+                !deepseek4_snapshot_restore(snap.shards[i], shards[i].cache)) {
+                return false;
+            }
+        }
+        hc_state = snap.hc_state;
         return true;
     };
 
@@ -299,6 +351,8 @@ int run_deepseek4_target_shard_ipc_daemon(
         /*shared_payload_fd=*/-1, /*shared_payload_bytes=*/0,
         std::move(callbacks));
 
+    for (int slot = 0; slot < ModelBackend::kMaxSlots; ++slot) free_slot(slot);
+    free_layer_split_snapshot_backends(shard_metas, snapshot_backends);
     free_deepseek4_target_shards(shards);
     return rc;
 }

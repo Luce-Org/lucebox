@@ -263,6 +263,8 @@ struct DeepSeek4Cache {
     ggml_backend_buffer_t buf = nullptr;
 };
 
+struct DeepSeek4Snapshot;
+
 // ─── Configuration ──────────────────────────────────────────────────────
 
 struct DeepSeek4BackendConfig {
@@ -292,6 +294,11 @@ bool create_deepseek4_cache(ggml_backend_t backend,
                              DeepSeek4Cache & out);
 
 void free_deepseek4_cache(DeepSeek4Cache & c);
+bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
+                             ggml_backend_t snapshot_backend,
+                             DeepSeek4Snapshot & out);
+bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
+                                DeepSeek4Cache & cache);
 
 // Forward: single step (prefill chunk or decode token).
 // embed: [n_embd, n_tokens] input embeddings (post-embedding lookup).
@@ -362,6 +369,8 @@ struct DeepSeek4Snapshot {
         int           n_comp       = 0;
         ggml_tensor * index_comp_kv = nullptr;
         int           n_index_comp = 0;
+        DeepSeek4CompressorState attn_compressor;
+        DeepSeek4CompressorState indexer_compressor;
     };
     std::vector<LayerSnap> layers;
     ggml_context *        ctx = nullptr;

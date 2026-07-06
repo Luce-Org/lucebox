@@ -3564,16 +3564,196 @@ bool create_deepseek4_cache(ggml_backend_t backend,
     return true;
 }
 
+namespace {
+
+ggml_tensor * clone_snapshot_tensor(ggml_context * ctx,
+                                    const ggml_tensor * src,
+                                    const char * name) {
+    if (!ctx || !src) return nullptr;
+    ggml_tensor * dst = ggml_dup_tensor(ctx, const_cast<ggml_tensor *>(src));
+    if (!dst) return nullptr;
+    if (name && *name) ggml_set_name(dst, name);
+    return dst;
+}
+
+bool copy_tensor_from_backend(const ggml_tensor * src, ggml_tensor * dst) {
+    if (!src || !dst) return false;
+    const size_t bytes = ggml_nbytes(src);
+    if (bytes != ggml_nbytes(dst)) return false;
+    ggml_backend_tensor_get(src, dst->data, 0, bytes);
+    return true;
+}
+
+bool copy_tensor_to_backend(const ggml_tensor * src, ggml_tensor * dst) {
+    if (!src || !dst) return false;
+    const size_t bytes = ggml_nbytes(src);
+    if (bytes != ggml_nbytes(dst)) return false;
+    ggml_backend_tensor_set(dst, src->data, 0, bytes);
+    return true;
+}
+
+bool tensors_compatible(const ggml_tensor * a, const ggml_tensor * b) {
+    if (!!a != !!b) return false;
+    if (!a) return true;
+    if (a->type != b->type || ggml_n_dims(a) != ggml_n_dims(b)) return false;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (a->ne[i] != b->ne[i]) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
+                             ggml_backend_t snapshot_backend,
+                             DeepSeek4Snapshot & out) {
+    if (!snapshot_backend || !cache.ctx || !cache.buf || !cache.hc_state ||
+        cache.layers.size() != (size_t)cache.n_layer) {
+        return false;
+    }
+
+    free_deepseek4_snapshot(out);
+
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * (size_t)(cache.n_layer * 8 + 8) + 4096;
+    ip.no_alloc = true;
+    out.ctx = ggml_init(ip);
+    if (!out.ctx) {
+        return false;
+    }
+
+    out.layers.resize((size_t)cache.n_layer);
+    out.hc_state_snap = clone_snapshot_tensor(out.ctx, cache.hc_state, "ds4_hc_state_snap");
+    if (!out.hc_state_snap) {
+        free_deepseek4_snapshot(out);
+        return false;
+    }
+
+    for (int il = 0; il < cache.n_layer; ++il) {
+        const auto & src = cache.layers[(size_t)il];
+        auto & dst = out.layers[(size_t)il];
+        dst.raw_kv = clone_snapshot_tensor(out.ctx, src.raw_kv, nullptr);
+        dst.comp_kv = clone_snapshot_tensor(out.ctx, src.comp_kv, nullptr);
+        dst.index_comp_kv = clone_snapshot_tensor(out.ctx, src.index_comp_kv, nullptr);
+        dst.attn_compressor.state_kv =
+            clone_snapshot_tensor(out.ctx, src.attn_compressor.state_kv, nullptr);
+        dst.attn_compressor.state_score =
+            clone_snapshot_tensor(out.ctx, src.attn_compressor.state_score, nullptr);
+        dst.indexer_compressor.state_kv =
+            clone_snapshot_tensor(out.ctx, src.indexer_compressor.state_kv, nullptr);
+        dst.indexer_compressor.state_score =
+            clone_snapshot_tensor(out.ctx, src.indexer_compressor.state_score, nullptr);
+        if (!dst.raw_kv ||
+            (src.comp_kv && !dst.comp_kv) ||
+            (src.index_comp_kv && !dst.index_comp_kv) ||
+            (src.attn_compressor.state_kv && !dst.attn_compressor.state_kv) ||
+            (src.attn_compressor.state_score && !dst.attn_compressor.state_score) ||
+            (src.indexer_compressor.state_kv && !dst.indexer_compressor.state_kv) ||
+            (src.indexer_compressor.state_score && !dst.indexer_compressor.state_score)) {
+            free_deepseek4_snapshot(out);
+            return false;
+        }
+    }
+
+    out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, snapshot_backend);
+    if (!out.buf) {
+        free_deepseek4_snapshot(out);
+        return false;
+    }
+
+    if (!copy_tensor_from_backend(cache.hc_state, out.hc_state_snap)) {
+        free_deepseek4_snapshot(out);
+        return false;
+    }
+    for (int il = 0; il < cache.n_layer; ++il) {
+        const auto & src = cache.layers[(size_t)il];
+        auto & dst = out.layers[(size_t)il];
+        dst.n_comp = src.n_comp;
+        dst.n_index_comp = src.n_index_comp;
+        if (!copy_tensor_from_backend(src.raw_kv, dst.raw_kv) ||
+            (src.comp_kv && !copy_tensor_from_backend(src.comp_kv, dst.comp_kv)) ||
+            (src.index_comp_kv &&
+             !copy_tensor_from_backend(src.index_comp_kv, dst.index_comp_kv)) ||
+            (src.attn_compressor.state_kv &&
+             !copy_tensor_from_backend(src.attn_compressor.state_kv,
+                                       dst.attn_compressor.state_kv)) ||
+            (src.attn_compressor.state_score &&
+             !copy_tensor_from_backend(src.attn_compressor.state_score,
+                                       dst.attn_compressor.state_score)) ||
+            (src.indexer_compressor.state_kv &&
+             !copy_tensor_from_backend(src.indexer_compressor.state_kv,
+                                       dst.indexer_compressor.state_kv)) ||
+            (src.indexer_compressor.state_score &&
+             !copy_tensor_from_backend(src.indexer_compressor.state_score,
+                                       dst.indexer_compressor.state_score))) {
+            free_deepseek4_snapshot(out);
+            return false;
+        }
+    }
+
+    out.cur_pos = cache.cur_pos;
+    return true;
+}
+
+bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
+                                DeepSeek4Cache & cache) {
+    if (!snap.ctx || !cache.ctx || !cache.buf || !snap.hc_state_snap ||
+        snap.layers.size() != cache.layers.size()) {
+        return false;
+    }
+    if (!tensors_compatible(snap.hc_state_snap, cache.hc_state) ||
+        !copy_tensor_to_backend(snap.hc_state_snap, cache.hc_state)) {
+        return false;
+    }
+
+    for (size_t il = 0; il < cache.layers.size(); ++il) {
+        const auto & src = snap.layers[il];
+        auto & dst = cache.layers[il];
+        if (!tensors_compatible(src.raw_kv, dst.raw_kv) ||
+            !tensors_compatible(src.comp_kv, dst.comp_kv) ||
+            !tensors_compatible(src.index_comp_kv, dst.index_comp_kv) ||
+            !tensors_compatible(src.attn_compressor.state_kv, dst.attn_compressor.state_kv) ||
+            !tensors_compatible(src.attn_compressor.state_score, dst.attn_compressor.state_score) ||
+            !tensors_compatible(src.indexer_compressor.state_kv, dst.indexer_compressor.state_kv) ||
+            !tensors_compatible(src.indexer_compressor.state_score, dst.indexer_compressor.state_score)) {
+            return false;
+        }
+        if (!copy_tensor_to_backend(src.raw_kv, dst.raw_kv) ||
+            (src.comp_kv && !copy_tensor_to_backend(src.comp_kv, dst.comp_kv)) ||
+            (src.index_comp_kv &&
+             !copy_tensor_to_backend(src.index_comp_kv, dst.index_comp_kv)) ||
+            (src.attn_compressor.state_kv &&
+             !copy_tensor_to_backend(src.attn_compressor.state_kv,
+                                     dst.attn_compressor.state_kv)) ||
+            (src.attn_compressor.state_score &&
+             !copy_tensor_to_backend(src.attn_compressor.state_score,
+                                     dst.attn_compressor.state_score)) ||
+            (src.indexer_compressor.state_kv &&
+             !copy_tensor_to_backend(src.indexer_compressor.state_kv,
+                                     dst.indexer_compressor.state_kv)) ||
+            (src.indexer_compressor.state_score &&
+             !copy_tensor_to_backend(src.indexer_compressor.state_score,
+                                     dst.indexer_compressor.state_score))) {
+            return false;
+        }
+        dst.n_comp = src.n_comp;
+        dst.n_index_comp = src.n_index_comp;
+    }
+
+    cache.cur_pos = snap.cur_pos;
+    return true;
+}
+
 void free_deepseek4_cache(DeepSeek4Cache & c) {
-    if (c.ctx) { ggml_free(c.ctx); c.ctx = nullptr; }
     if (c.buf) { ggml_backend_buffer_free(c.buf); c.buf = nullptr; }
+    if (c.ctx) { ggml_free(c.ctx); c.ctx = nullptr; }
     c.layers.clear();
     c.hc_state = nullptr;
 }
 
 void free_deepseek4_snapshot(DeepSeek4Snapshot & s) {
-    if (s.ctx) { ggml_free(s.ctx); s.ctx = nullptr; }
     if (s.buf) { ggml_backend_buffer_free(s.buf); s.buf = nullptr; }
+    if (s.ctx) { ggml_free(s.ctx); s.ctx = nullptr; }
     s.layers.clear();
     s.cur_pos = 0;
     s.hc_state_snap = nullptr;

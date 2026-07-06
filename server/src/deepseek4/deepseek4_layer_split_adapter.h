@@ -99,6 +99,8 @@ private:
         int cur_pos = 0;
         int32_t last_tok = -1;
         std::vector<float> hc_state;
+        std::vector<float> prefill_last_logits;
+        std::vector<DeepSeek4Snapshot> shards;
         bool used = false;
     };
     std::vector<Snapshot> snapshots_;
