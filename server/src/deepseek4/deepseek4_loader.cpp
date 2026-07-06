@@ -243,11 +243,18 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     // Validate arch
     {
         int64_t aid = gguf_find_key(gctx, "general.architecture");
-        if (aid < 0) { set_last_error("missing general.architecture"); gguf_free(gctx); return false; }
+        if (aid < 0) {
+            set_last_error("missing general.architecture");
+            gguf_free(gctx);
+            if (meta_ctx) ggml_free(meta_ctx);
+            return false;
+        }
         const char * arch = gguf_get_val_str(gctx, aid);
         if (std::string(arch) != "deepseek4") {
             set_last_error(std::string("unexpected arch: ") + arch + " (expected deepseek4)");
-            gguf_free(gctx); return false;
+            gguf_free(gctx);
+            if (meta_ctx) ggml_free(meta_ctx);
+            return false;
         }
     }
 
@@ -278,6 +285,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         if (gguf_find_key(gctx, key) < 0) {
             set_last_error(std::string("missing required key: ") + key);
             gguf_free(gctx);
+            if (meta_ctx) ggml_free(meta_ctx);
             return false;
         }
     }
@@ -322,6 +330,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     if (n_vocab == 0) {
         set_last_error("deepseek4.vocab_size must be > 0");
         gguf_free(gctx);
+        if (meta_ctx) ggml_free(meta_ctx);
         return false;
     }
 
@@ -332,6 +341,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
                      compress_ratios_meta, &compress_ratios_err)) {
         set_last_error(compress_ratios_err);
         gguf_free(gctx);
+        if (meta_ctx) ggml_free(meta_ctx);
         return false;
     }
     std::vector<uint32_t> compress_ratios;
@@ -409,6 +419,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     std::vector<DS4TensorAlloc> allocs;
     allocs.reserve(n_tensors);
     size_t total_buf_size = 0;
+    size_t tok_embd_alloc_idx = SIZE_MAX;
 
     for (int ti = 0; ti < n_tensors; ti++) {
         const char * tname = gguf_get_tensor_name(gctx, ti);
@@ -431,6 +442,9 @@ bool load_deepseek4_gguf_partial(const std::string & path,
             total_buf_size += ggml_backend_buft_get_alloc_size(buft, t);
         }
         allocs.push_back(a);
+        if (std::strcmp(tname, "token_embd.weight") == 0) {
+            tok_embd_alloc_idx = allocs.size() - 1;
+        }
     }
 
     // ── Allocate GPU buffer ─────────────────────────────────────────────
@@ -440,22 +454,22 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         if (!buf) {
             set_last_error("failed to allocate GPU buffer (" + std::to_string(total_buf_size) + " bytes)");
             gguf_free(gctx);
+            if (meta_ctx) ggml_free(meta_ctx);
             return false;
         }
         ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     }
-    out.buf = buf;
 
     // ── Assign tensors from meta_ctx to the backend buffer ──────────────
     // Use ggml_backend_tensor_alloc to properly set the buffer association.
-    out.ctx = meta_ctx;  // Reuse the meta context (tensors already exist)
     char * buf_base = buf ? (char *)ggml_backend_buffer_get_base(buf) : nullptr;
     for (auto & a : allocs) {
         if (!a.upload_to_backend || !buf) continue;
         if (ggml_backend_tensor_alloc(buf, a.tensor, buf_base + a.buffer_offset) != GGML_STATUS_SUCCESS) {
             set_last_error("ggml_backend_tensor_alloc failed");
-            ggml_backend_buffer_free(buf); out.buf = nullptr;
+            if (buf) ggml_backend_buffer_free(buf);
             gguf_free(gctx);
+            ggml_free(meta_ctx);
             return false;
         }
     }
@@ -465,8 +479,9 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     std::string mmap_err;
     if (!mmap.open_ro(path, mmap_err)) {
         set_last_error("mmap: " + mmap_err);
-        ggml_backend_buffer_free(buf); out.buf = nullptr;
+        if (buf) ggml_backend_buffer_free(buf);
         gguf_free(gctx);
+        ggml_free(meta_ctx);
         return false;
     }
 
@@ -503,8 +518,9 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         if (!read_ok) {
             set_last_error("parallel weight read failed");
             mmap.close_map();
-            ggml_backend_buffer_free(buf); out.buf = nullptr;
+            if (buf) ggml_backend_buffer_free(buf);
             gguf_free(gctx);
+            ggml_free(meta_ctx);
             return false;
         }
     } else {
@@ -515,6 +531,34 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         }
     }
     mmap.close_map();
+
+    // ── Set up CPU embedder ─────────────────────────────────────────────
+    // The embedder is set up using the mmap data directly (like gemma4).
+    // For now, we use an owned copy of the token embedding table bytes.
+    if (tok_embd_alloc_idx != SIZE_MAX) {
+        const auto & a = allocs[tok_embd_alloc_idx];
+        out.embedder.tok_embd_owned.resize(a.file_size);
+        // Re-read from mmap (already closed). Use the GPU tensor instead:
+        // Actually, we need the raw bytes for dequantization. Reopen mmap briefly.
+        DS4Mmap emb_mmap;
+        std::string emb_err;
+        if (emb_mmap.open_ro(path, emb_err)) {
+            std::memcpy(out.embedder.tok_embd_owned.data(),
+                        (const char *)emb_mmap.addr + a.file_offset, a.file_size);
+            emb_mmap.close_map();
+        } else {
+            set_last_error("embedder mmap: " + emb_err);
+            if (buf) ggml_backend_buffer_free(buf);
+            gguf_free(gctx);
+            ggml_free(meta_ctx);
+            return false;
+        }
+        out.embedder.tok_embd_bytes = out.embedder.tok_embd_owned.data();
+        out.embedder.tok_embd_type  = a.tensor->type;
+        out.embedder.n_embd         = n_embd;
+        out.embedder.n_vocab        = (int64_t)n_vocab;
+        out.embedder.row_bytes      = a.file_size / (size_t)n_vocab;
+    }
 
     // ── Bind tensors to weight struct fields ────────────────────────────
     for (auto & a : allocs) {
@@ -589,38 +633,8 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         if (suffix == "hc_ffn_base.weight")        { L.hc_ffn_base = a.tensor; continue; }
     }
 
-    // ── Set up CPU embedder ─────────────────────────────────────────────
-    // The embedder is set up using the mmap data directly (like gemma4).
-    // For now, we use an owned copy of the token embedding table bytes.
-    if (out.tok_embd) {
-        // Find tok_embd in the allocs and set up embedder from its data
-        for (auto & a : allocs) {
-            if (std::strcmp(ggml_get_name(a.tensor), "token_embd.weight") == 0) {
-                // Store embedding bytes as owned data for CPU-side embed()
-                out.embedder.tok_embd_owned.resize(a.file_size);
-                // Re-read from mmap (already closed). Use the GPU tensor instead:
-                // Actually, we need the raw bytes for dequantization. Reopen mmap briefly.
-                DS4Mmap emb_mmap;
-                std::string emb_err;
-                if (emb_mmap.open_ro(path, emb_err)) {
-                    std::memcpy(out.embedder.tok_embd_owned.data(),
-                                (const char *)emb_mmap.addr + a.file_offset, a.file_size);
-                    emb_mmap.close_map();
-                } else {
-                    set_last_error("embedder mmap: " + emb_err);
-                    free_deepseek4_weights(out);
-                    gguf_free(gctx);
-                    return false;
-                }
-                out.embedder.tok_embd_bytes = out.embedder.tok_embd_owned.data();
-                out.embedder.tok_embd_type  = a.tensor->type;
-                out.embedder.n_embd         = n_embd;
-                out.embedder.n_vocab        = (int64_t)n_vocab;
-                out.embedder.row_bytes      = a.file_size / (size_t)n_vocab;
-                break;
-            }
-        }
-    }
+    out.ctx = meta_ctx;
+    out.buf = buf;
 
     gguf_free(gctx);
     // Note: meta_ctx is now owned by out.ctx — do NOT free it here.
