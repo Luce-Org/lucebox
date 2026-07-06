@@ -464,15 +464,69 @@ void DeepSeek4Backend::print_ready_banner() const {
 }
 
 bool DeepSeek4Backend::park(const std::string & what) {
-    (void)what;
-    // TODO: Release GPU resources
+    const bool want_target = (what.empty() || what == "all" || what == "target");
+    if (!want_target || parked_) return true;
+
+    maybe_save_routing_stats();
+    for (int i = 0; i < PREFIX_SLOTS; ++i) {
+        free_deepseek4_snapshot(snapshots_[i]);
+    }
+    last_logits_.clear();
+    free_deepseek4_cache(cache_);
+    stream_engine_.destroy();
+    moe_hybrid_.reset();
+    moe_placement_ = {};
+    free_deepseek4_weights(w_);
     parked_ = true;
+    std::printf("[deepseek4] parked (VRAM released)\n");
+    std::fflush(stdout);
     return true;
 }
 
 bool DeepSeek4Backend::unpark(const std::string & what) {
-    (void)what;
+    const bool want_target = (what.empty() || what == "all" || what == "target");
+    if (!want_target || !parked_) return true;
+
+    const PlacementBackend target_backend =
+        cfg_.device.backend == PlacementBackend::Auto
+            ? compiled_placement_backend()
+            : cfg_.device.backend;
+
+    if (target_backend == PlacementBackend::Hip) {
+        if (!init_hybrid_model()) {
+            std::fprintf(stderr, "[deepseek4] unpark: failed to restore hybrid mode\n");
+            free_deepseek4_weights(w_);
+            stream_engine_.destroy();
+            moe_hybrid_.reset();
+            moe_placement_ = {};
+            return false;
+        }
+    } else if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
+        std::fprintf(stderr, "[deepseek4] unpark: full model reload failed, trying hybrid mode...\n");
+        if (!init_hybrid_model()) {
+            std::fprintf(stderr, "[deepseek4] unpark: failed to restore target model\n");
+            free_deepseek4_weights(w_);
+            stream_engine_.destroy();
+            moe_hybrid_.reset();
+            moe_placement_ = {};
+            return false;
+        }
+    }
+
+    const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
+    if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
+        std::fprintf(stderr, "[deepseek4] unpark: failed to recreate KV cache (ctx=%d)\n", max_ctx);
+        free_deepseek4_cache(cache_);
+        free_deepseek4_weights(w_);
+        stream_engine_.destroy();
+        moe_hybrid_.reset();
+        moe_placement_ = {};
+        return false;
+    }
+
     parked_ = false;
+    std::printf("[deepseek4] unparked (VRAM restored)\n");
+    std::fflush(stdout);
     return true;
 }
 
