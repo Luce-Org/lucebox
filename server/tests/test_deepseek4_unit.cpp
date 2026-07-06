@@ -654,6 +654,9 @@ static void test_loader_reads_tokenizer_special_ids(ggml_backend_t backend) {
     if (ok) {
         TEST_ASSERT(weights.eos_id == 151645);
         TEST_ASSERT(weights.eos_chat_id == 151643);
+        TEST_ASSERT(deepseek4_is_eos_tok(151645, weights));
+        TEST_ASSERT(deepseek4_is_eos_tok(151643, weights));
+        TEST_ASSERT(!deepseek4_is_eos_tok(151644, weights));
     }
     free_deepseek4_weights(weights);
     unlink(path.c_str());

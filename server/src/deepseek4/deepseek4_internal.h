@@ -218,6 +218,11 @@ struct DeepSeek4Weights {
     bool moe_hybrid       = false;
 };
 
+inline bool deepseek4_is_eos_tok(int tok, const DeepSeek4Weights & w) {
+    return (w.eos_chat_id >= 0 && tok == w.eos_chat_id)
+        || (w.eos_id >= 0 && tok == w.eos_id);
+}
+
 // ─── KV Cache ───────────────────────────────────────────────────────────
 
 // Per-layer compressor rolling state

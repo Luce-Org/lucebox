@@ -598,9 +598,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
         io.emit(next_token);
         if (timing) tel_acc.emit_us += elapsed_us(emit_t0, Clock::now());
 
-        // Check EOS
-        // TODO: proper EOS detection from tokenizer metadata
-        if (next_token == 151643 || next_token == 151644) {  // common DS EOS/EOT
+        if (deepseek4_is_eos_tok(next_token, w_)) {
             break;
         }
     }

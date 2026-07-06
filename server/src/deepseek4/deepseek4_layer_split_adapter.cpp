@@ -592,10 +592,10 @@ bool DeepSeek4LayerSplitAdapter::decode_ar(
         const DaemonIO & io) {
     if (shards_.empty()) return false;
 
-    const int vocab = shards_[0].weights.n_vocab;
-    auto is_eos = [](int tok) -> bool {
-        // DS4 EOS tokens (from model card / tokenizer)
-        return tok == 128001 || tok == 128008 || tok == 128009;
+    const DeepSeek4Weights & w = shards_[0].weights;
+    const int vocab = w.n_vocab;
+    auto is_eos = [&w](int tok) -> bool {
+        return deepseek4_is_eos_tok(tok, w);
     };
 
     LayerSplitForwardStep forward_one = [this](
