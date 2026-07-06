@@ -598,11 +598,6 @@ find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(dflash_common PRIVATE OpenMP::OpenMP_CXX)
 endif()
-if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-    target_link_libraries(dflash_common PUBLIC CUDA::cudart)
-elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
-    target_link_libraries(dflash_common PUBLIC hip::host)
-endif()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
      target_compile_options(dflash_common PRIVATE
