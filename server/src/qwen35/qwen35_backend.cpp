@@ -208,7 +208,8 @@ bool Qwen35Backend::init() {
             int n_cap = 0;
             int cap_ids[DFLASH_MAX_CAPTURE_LAYERS];
             if (read_draft_capture_config(cfg_.draft_path, n_cap, cap_ids,
-                                          DFLASH_MAX_CAPTURE_LAYERS)) {
+                                          DFLASH_MAX_CAPTURE_LAYERS) &&
+                n_cap > 0 && n_cap <= DFLASH_MAX_CAPTURE_LAYERS) {
                 w_.n_capture_layers = n_cap;
                 for (int k = 0; k < n_cap && k < DFLASH_MAX_CAPTURE_LAYERS; k++)
                     w_.capture_layer_ids[k] = cap_ids[k];

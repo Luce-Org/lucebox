@@ -27,7 +27,7 @@ import gguf
 # Share arch resolution, tensor-name mapping, and safetensors I/O with
 # the F16 converter so both produce structurally identical GGUF metadata.
 from convert_dflash_to_gguf import (
-    ARCH, load_arch, map_name, is_norm_tensor,
+    ARCH, load_arch, map_name,
     load_safetensors_header,
 )
 

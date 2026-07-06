@@ -182,23 +182,50 @@ bool read_draft_capture_config(const std::string & path,
     // Read target_layer_ids array (exact capture positions from training).
     std::snprintf(key, sizeof(key), "%s.%s", A.c_str(), "dflash.target_layer_ids");
     int64_t tli_id = gguf_find_key(gctx, key);
+    int ids_count = 0;
+    bool ids_valid = false;
     if (tli_id >= 0 && gguf_get_kv_type(gctx, tli_id) == GGUF_TYPE_ARRAY) {
         // P2-2: verify element type is INT32 before casting (array may be INT64).
         if (gguf_get_arr_type(gctx, tli_id) != GGUF_TYPE_INT32) {
             std::fprintf(stderr,
                 "[draft-cfg] target_layer_ids array type is not INT32; skipping\n");
         } else {
-            const size_t n = std::min((size_t)gguf_get_arr_n(gctx, tli_id),
-                                      (size_t)max_ids);
-            const int32_t * ids = static_cast<const int32_t *>(gguf_get_arr_data(gctx, tli_id));
-            for (size_t k = 0; k < n; k++) {
-                capture_ids[k] = (int)ids[k];
+            const size_t n = (size_t)gguf_get_arr_n(gctx, tli_id);
+            if (n == 0 || n > (size_t)max_ids) {
+                std::fprintf(stderr,
+                    "[draft-cfg] target_layer_ids count %zu outside supported range 1..%d; skipping\n",
+                    n, max_ids);
+            } else {
+                const int32_t * ids =
+                    static_cast<const int32_t *>(gguf_get_arr_data(gctx, tli_id));
+                for (size_t k = 0; k < n; k++) {
+                    capture_ids[k] = (int)ids[k];
+                }
+                ids_count = (int)n;
+                ids_valid = true;
+                if (n_capture == 0) n_capture = ids_count;
             }
-            if (n > 0) n_capture = (int)n;
         }
     }
 
     gguf_free(gctx);
+
+    if (!ids_valid) {
+        if (n_capture > 0) {
+            std::fprintf(stderr,
+                "[draft-cfg] n_capture=%d but no valid target_layer_ids; skipping early sync\n",
+                n_capture);
+        }
+        n_capture = 0;
+        return false;
+    }
+    if (n_capture <= 0 || n_capture > max_ids || n_capture != ids_count) {
+        std::fprintf(stderr,
+            "[draft-cfg] n_capture=%d target_layer_ids=%d mismatch; skipping early sync\n",
+            n_capture, ids_count);
+        n_capture = 0;
+        return false;
+    }
 
     if (n_capture > 0) {
         std::fprintf(stderr, "[draft-cfg] early-read: n_capture=%d ids=", n_capture);
