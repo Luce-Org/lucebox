@@ -16,22 +16,17 @@ struct mrope_sections {
 // (RoPE base must be < 1/eps_mach ~ 8.4e6, see arXiv:2602.10959).
 // Empirically required for Qwen3.5 (freq_base=1e7).
 //
-// Computes  theta = (pos * theta_scale^exp_int)  in double,
-// reduces mod 2pi in double, returns float in [0, 2*pi).
-//
-// CAVEAT: the mod-2pi reduction is only equivalence-preserving when the
-// downstream rope_yarn() does NOT scale the angle (i.e. freq_scale == 1.0,
-// freq_factor == 1.0, ext_factor == 0.0). All call sites in this file
-// satisfy that for the qwen35 graph in dflash. If a future graph changes
-// these, push the reduction into rope_yarn() right before cosf/sinf instead.
-static __device__ __forceinline__ float rope_theta_fp64(int32_t p, float theta_scale, int exp_int) {
-    const double TAU = 6.2831853071795864769;
+// Returns the UNREDUCED angle  theta = (pos * theta_scale^exp_int)  in double.
+// The mod-2pi reduction is deferred to rope_yarn(), right before cosf/sinf, so
+// it happens AFTER all downstream angle scaling (freq_scale, freq_factor,
+// ext_factor). Reducing here does NOT commute with that scaling and corrupts
+// every config with freq_scale != 1.0 or freq_factor != 1.0 (freq_factor is
+// applied by the callers as theta_base/freq_factor before rope_yarn()).
+static __device__ __forceinline__ double rope_theta_fp64(int32_t p, float theta_scale, int exp_int) {
     // Dim 0: theta_scale^0 == 1 exactly. Skip pow (costly on Turing).
-    double angle = (exp_int == 0)
+    return (exp_int == 0)
         ? (double)p
         : (double)p * pow((double)theta_scale, (double)exp_int);
-    angle -= TAU * floor(angle * (1.0 / TAU));
-    return (float)angle;
 }
 
 static __device__ float rope_yarn_ramp(const float low, const float high, const int i0) {
@@ -43,20 +38,25 @@ static __device__ float rope_yarn_ramp(const float low, const float high, const 
 // MIT licensed. Copyright (c) 2023 Jeffrey Quesnelle and Bowen Peng.
 template<bool forward>
 static __device__ void rope_yarn(
-        const float theta_extrap, const float freq_scale, const rope_corr_dims corr_dims, const int64_t i0, const float ext_factor,
+        const double theta_extrap, const float freq_scale, const rope_corr_dims corr_dims, const int64_t i0, const float ext_factor,
         float mscale, float & cos_theta, float & sin_theta) {
     // Get n-d rotational scaling corrected for extrapolation
-    float theta_interp = freq_scale * theta_extrap;
-    float theta = theta_interp;
+    double theta_interp = (double)freq_scale * theta_extrap;
+    double theta = theta_interp;
     if (ext_factor != 0.0f) {
         float ramp_mix = rope_yarn_ramp(corr_dims.v[0], corr_dims.v[1], i0) * ext_factor;
-        theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
+        theta = theta_interp * (1.0 - ramp_mix) + theta_extrap * ramp_mix;
 
         // Get n-d magnitude scaling corrected for interpolation
         mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
     }
-    cos_theta = cosf(theta) * mscale;
-    sin_theta = sinf(theta) * mscale;
+    // FP64 mod-2pi reduction, deferred to here (see rope_theta_fp64) so it runs
+    // AFTER all angle scaling and stays equivalence-preserving. Kept in double
+    // to preserve the large-freq_base precision benefit before the trig calls.
+    const double TAU = 6.2831853071795864769;
+    theta -= TAU * floor(theta * (1.0 / TAU));
+    cos_theta = cosf((float)theta) * mscale;
+    sin_theta = sinf((float)theta) * mscale;
     if (!forward) {
         sin_theta *= -1.0f;
     }
@@ -119,7 +119,7 @@ static __global__ void rope_norm(const T *            x,
         return;
     }
 
-    const float theta_base = rope_theta_fp64(pos[i2], theta_scale, i0/2);
+    const double theta_base = rope_theta_fp64(pos[i2], theta_scale, i0/2);
 
     const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
 
@@ -185,7 +185,7 @@ static __global__ void rope_neox(const T *            x,
         return;
     }
 
-    const float theta_base = rope_theta_fp64(pos[i2], theta_scale, i0/2);
+    const double theta_base = rope_theta_fp64(pos[i2], theta_scale, i0/2);
 
     const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
 
@@ -249,7 +249,7 @@ static __global__ void rope_multi(const T *            x,
     const int sec_w = sections.v[1] + sections.v[0];
     const int sector = (i0 / 2) % sect_dims;
 
-    float theta_base = 0.0;
+    double theta_base = 0.0;
     if (is_imrope) {
         if (sector % 3 == 1 && sector < 3 * sections.v[1]) {         // h
             theta_base = rope_theta_fp64(pos[i2 + ne02 * 1], theta_scale, i0/2);
@@ -326,7 +326,7 @@ static __global__ void rope_vision(const T *            x,
     const int sec_w     = sections.v[1] + sections.v[0];
     const int sector    = (i0 / 2) % sect_dims;
 
-    float theta_base = 0.0;
+    double theta_base = 0.0;
     if (sector < sections.v[0]) {
         const int p = sector;
         theta_base  = rope_theta_fp64(pos[i2], theta_scale, p);
