@@ -1240,7 +1240,11 @@ void ggml_cuda_mul_mat_vec_q(
     const size_t q8_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     char * src1_q8_d = nullptr;
-    if (luce_q8_memo_on && !ids) {
+    // The src1->q8_1 quantization depends only on src0->type and src1's dims/strides,
+    // not on ids (ids only affects the matmul kernel's channel/dst strides below), so
+    // the memo is valid for MUL_MAT_ID too: gate/up and the shared expert re-quantize
+    // the same ffn_norm activation and can share one q8 buffer within an evaluation.
+    if (luce_q8_memo_on) {
         for (const auto & e : ctx.luce_q8_memo) {
             if (e.src1_node == (const void *) src1 && e.src1_data == (const void *) src1_d &&
                 e.src0_type == (int) src0->type &&
@@ -1252,7 +1256,7 @@ void ggml_cuda_mul_mat_vec_q(
     }
     if (src1_q8_d == nullptr) {
         char * q8_dst;
-        if (luce_q8_memo_on && !ids) {
+        if (luce_q8_memo_on) {
             ggml_backend_cuda_context::luce_q8_memo_entry ent;
             ent.src1_node = (const void *) src1;
             ent.src1_data = (const void *) src1_d;

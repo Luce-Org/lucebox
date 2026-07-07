@@ -251,11 +251,44 @@ size_t ggml_backend_get_max_size(ggml_backend_t backend) {
     return ggml_backend_buft_get_max_size(ggml_backend_get_default_buffer_type(backend));
 }
 
+
+// A raw (offset, size) span on a tensor treats it as densely packed. On a
+// non-contiguous tensor (e.g. a strided view such as ggml_argsort_top_k's
+// ids) that silently returns bytes that do not belong to the tensor, which
+// surfaces far away as corrupted data (or a device fault) instead of at the
+// broken call site. Allow spans that stay within one packed run (row-wise
+// readers using per-row offsets stay valid); abort loudly otherwise.
+static void ggml_backend_tensor_check_raw_span(const struct ggml_tensor * tensor, size_t offset, size_t size) {
+    if (size == 0 || ggml_is_contiguous(tensor)) {
+        return;
+    }
+    GGML_ASSERT(tensor->nb[0] == ggml_type_size(tensor->type) &&
+                "raw read/write on a permuted tensor (use ggml_cont first)");
+    size_t run = ggml_row_size(tensor->type, tensor->ne[0]);
+    int d = 1;
+    for (; d < GGML_MAX_DIMS; ++d) {
+        if (tensor->ne[d] == 1) {
+            continue;
+        }
+        if (tensor->nb[d] != run) {
+            break;
+        }
+        run *= (size_t) tensor->ne[d];
+    }
+    if (d == GGML_MAX_DIMS) {
+        return; // packed after all (extent-1 dims with odd strides)
+    }
+    const size_t within = offset % tensor->nb[d];
+    GGML_ASSERT(within + size <= run &&
+                "raw span crosses a non-contiguous stride gap (read per row or ggml_cont first)");
+}
+
 void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+    ggml_backend_tensor_check_raw_span(tensor, offset, size);
 
     if (backend->iface.set_tensor_async == NULL) {
         ggml_backend_synchronize(backend);
@@ -270,6 +303,7 @@ void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_ten
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
+    ggml_backend_tensor_check_raw_span(tensor, offset, size);
 
     if (backend->iface.get_tensor_async == NULL) {
         ggml_backend_synchronize(backend);
@@ -332,6 +366,7 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
 
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+    ggml_backend_tensor_check_raw_span(tensor, offset, size);
 
     buf->iface.set_tensor(buf, tensor, data, offset, size);
 }
@@ -347,6 +382,7 @@ void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, siz
 
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
+    ggml_backend_tensor_check_raw_span(tensor, offset, size);
 
     buf->iface.get_tensor(buf, tensor, data, offset, size);
 }

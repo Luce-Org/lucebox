@@ -3208,7 +3208,16 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
-            if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
+            // Mirror ggml_cuda_mul_mat_id: the MMVQ and MMQ mul_mat_id paths
+            // are stream-sync-free and safe to capture; only the sort-based
+            // fallback requires a stream synchronize.
+            const bool mmid_mmvq_ok = ggml_is_quantized(node->src[0]->type) &&
+                node->ne[2] <= MMVQ_MAX_MOE_BATCH_SIZE &&
+                node->ne[2] <= mmvq_mmid_max;
+            const bool mmid_mmq_ok = ggml_is_quantized(node->src[0]->type) &&
+                ggml_cuda_should_use_mmq(node->src[0]->type, cc,
+                                         node->src[1]->ne[2], node->src[0]->ne[2]);
+            if (!mmid_mmvq_ok && !mmid_mmq_ok) {
                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
@@ -3935,6 +3944,31 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         ggml_cuda_op_rope_fused(*cuda_ctx, rope, set_rows);
                         i += 2;
                         continue;
+                    }
+
+                    if (node->op == GGML_OP_SET_ROWS) {
+                        // Per-layer K/V cache appends arrive as two independent
+                        // quantized SET_ROWS, usually separated only by the
+                        // elidable view that feeds the second one. Fuse the pair
+                        // into a single launch (bit-identical per element).
+                        int j = i + 1;
+                        if (j < cgraph->n_nodes &&
+                            (cgraph->nodes[j]->op == GGML_OP_VIEW ||
+                             cgraph->nodes[j]->op == GGML_OP_RESHAPE ||
+                             cgraph->nodes[j]->op == GGML_OP_PERMUTE)) {
+                            j++;
+                        }
+                        if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_SET_ROWS) {
+                            ggml_tensor * other = cgraph->nodes[j];
+                            const bool independent =
+                                other->src[0] != node && other->src[1] != node &&
+                                (other->src[0]->view_src == nullptr || other->src[0]->view_src != node);
+                            if (independent && ggml_cuda_set_rows_dual_supported(node, other)) {
+                                ggml_cuda_op_set_rows_dual(*cuda_ctx, node, other);
+                                i = j;
+                                continue;
+                            }
+                        }
                     }
 
                     if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
