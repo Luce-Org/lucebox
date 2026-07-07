@@ -35,6 +35,11 @@ class MoeHybridStreamEngine;
 struct DeepSeek4StepTelemetry {
     uint64_t total_us = 0;
     uint64_t embed_us = 0;
+    uint64_t full_graph_build_us = 0;
+    uint64_t full_graph_alloc_us = 0;
+    uint64_t full_graph_set_us = 0;
+    uint64_t full_graph_compute_us = 0;
+    uint64_t full_graph_read_us = 0;
     uint64_t hc_pre_attn_us = 0;
     uint64_t hc_pre_build_us = 0;
     uint64_t hc_pre_input_us = 0;

@@ -215,44 +215,33 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         return backend;
 
     } else if (arch == "deepseek4") {
-        const PlacementBackend target_backend =
-            args.device.backend == PlacementBackend::Auto
-                ? compiled_placement_backend()
-                : args.device.backend;
+        if (args.device.is_layer_split() || args.remote_target_shard.enabled()) {
+            DeepSeek4LayerSplitAdapterConfig cfg;
+            cfg.target_path         = args.model_path;
+            cfg.device              = args.device;
+            cfg.remote_target_shard = args.remote_target_shard;
+            cfg.chunk               = args.chunk;
 
-        // HIP single-device launches cannot rely on the CUDA/Halo auto-split
-        // path; use the single-backend loader, which can fall back to hybrid
-        // expert placement when a full monolithic load does not fit.
-        if (target_backend == PlacementBackend::Hip &&
-            !args.device.is_layer_split() &&
-            !args.remote_target_shard.enabled()) {
-            DeepSeek4BackendConfig cfg;
-            cfg.model_path = args.model_path;
-            cfg.device     = args.device;
-            cfg.stream_fd  = args.stream_fd;
-            cfg.max_ctx    = args.device.max_ctx;
-            cfg.chunk      = args.chunk;
-
-            auto backend = std::make_unique<DeepSeek4Backend>(cfg);
+            auto adapter = std::make_unique<DeepSeek4LayerSplitAdapter>(cfg);
+            auto backend = std::make_unique<LayerSplitBackend>(std::move(adapter));
             if (!backend->init()) {
-                std::fprintf(stderr, "[backend_factory] DeepSeek4Backend init failed\n");
+                std::fprintf(stderr,
+                             "[backend_factory] LayerSplitBackend(deepseek4) init failed\n");
                 return nullptr;
             }
             return backend;
         }
 
-        // CUDA builds keep the layer-split backend so they can auto-split
-        // across CUDA and remote HIP target shards.
-        DeepSeek4LayerSplitAdapterConfig cfg;
-        cfg.target_path        = args.model_path;
-        cfg.device             = args.device;
-        cfg.remote_target_shard = args.remote_target_shard;
-        cfg.chunk              = args.chunk;
+        DeepSeek4BackendConfig dcfg;
+        dcfg.model_path = args.model_path;
+        dcfg.device     = args.device;
+        dcfg.stream_fd  = args.stream_fd;
+        dcfg.chunk      = args.chunk;
+        dcfg.max_ctx    = args.device.max_ctx;
 
-        auto adapter = std::make_unique<DeepSeek4LayerSplitAdapter>(cfg);
-        auto backend = std::make_unique<LayerSplitBackend>(std::move(adapter));
+        auto backend = std::make_unique<DeepSeek4Backend>(dcfg);
         if (!backend->init()) {
-            std::fprintf(stderr, "[backend_factory] LayerSplitBackend(deepseek4) init failed\n");
+            std::fprintf(stderr, "[backend_factory] DeepSeek4Backend init failed\n");
             return nullptr;
         }
         return backend;

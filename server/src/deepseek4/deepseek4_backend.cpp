@@ -40,6 +40,11 @@ static double gib(uint64_t bytes) {
 static void add_step_tel(DeepSeek4StepTelemetry & dst, const DeepSeek4StepTelemetry & src) {
     dst.total_us += src.total_us;
     dst.embed_us += src.embed_us;
+    dst.full_graph_build_us += src.full_graph_build_us;
+    dst.full_graph_alloc_us += src.full_graph_alloc_us;
+    dst.full_graph_set_us += src.full_graph_set_us;
+    dst.full_graph_compute_us += src.full_graph_compute_us;
+    dst.full_graph_read_us += src.full_graph_read_us;
     dst.hc_pre_attn_us += src.hc_pre_attn_us;
     dst.hc_pre_build_us += src.hc_pre_build_us;
     dst.hc_pre_input_us += src.hc_pre_input_us;
@@ -85,7 +90,9 @@ static void log_step_tel(const char * phase,
     const double tok_s = wall_s > 0.0 ? (double)tokens / wall_s : 0.0;
     std::fprintf(stderr,
         "[deepseek4-timing] %s tokens=%d steps=%d wall=%.3fs %.2f tok/s "
-        "step=%.1fms embed=%.1fms attn_build=%.1fms attn_compute=%.1fms attn_read=%.1fms "
+        "step=%.1fms embed=%.1fms full_build=%.1fms full_alloc=%.1fms full_set=%.1fms "
+        "full_compute=%.1fms full_read=%.1fms "
+        "attn_build=%.1fms attn_compute=%.1fms attn_read=%.1fms "
         "ffn_build=%.1fms ffn_compute=%.1fms ffn_read=%.1fms "
         "route_build=%.1fms route_compute=%.1fms route_read=%.1fms route_select=%.1fms "
         "ffn=%.1fms hot=%.1fms cold=%.1fms combine=%.1fms partition=%.1fms "
@@ -94,7 +101,10 @@ static void log_step_tel(const char * phase,
         "hc_post=%.1fms output=%.1fms sample=%.1fms emit=%.1fms "
         "hot_sel=%d cold_sel=%d\n",
         phase, tokens, steps, wall_s, tok_s,
-        ms(t.total_us), ms(t.embed_us), ms(t.attn_build_us), ms(t.attn_compute_us), ms(t.attn_read_us),
+        ms(t.total_us), ms(t.embed_us),
+        ms(t.full_graph_build_us), ms(t.full_graph_alloc_us), ms(t.full_graph_set_us),
+        ms(t.full_graph_compute_us), ms(t.full_graph_read_us),
+        ms(t.attn_build_us), ms(t.attn_compute_us), ms(t.attn_read_us),
         ms(t.ffn_build_us), ms(t.ffn_compute_us), ms(t.ffn_read_us),
         ms(t.route_build_us), ms(t.route_compute_us), ms(t.route_read_us), ms(t.route_select_us),
         ms(t.ffn_eval_us), ms(t.ffn_hot_us), ms(t.ffn_cold_us), ms(t.ffn_combine_us),

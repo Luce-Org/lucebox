@@ -176,6 +176,21 @@ struct DeepSeek4CachedDecodeOutputGraph {
     }
 };
 
+struct DeepSeek4LegacyFullStepCache {
+    const ggml_context * owner_ctx = nullptr;
+    ggml_backend_t backend = nullptr;
+    StepGraph sg;
+    std::vector<uint8_t> meta_arena;
+
+    void free() {
+        step_graph_destroy(sg);
+        meta_arena.clear();
+        meta_arena.shrink_to_fit();
+        owner_ctx = nullptr;
+        backend = nullptr;
+    }
+};
+
 struct DeepSeek4AttentionGraphInputs {
     ggml_tensor * rope_pos = nullptr;
     ggml_tensor * neg_pos = nullptr;
@@ -2669,6 +2684,7 @@ bool deepseek4_step(
         MoeHybridStreamEngine * stream_engine,
         DeepSeek4StepTelemetry * telemetry,
         MoeHybridRoutingStats * routing_stats) {
+    const auto step_t0 = Ds4TimingClock::now();
 
     if (w.moe_hybrid && moe_hybrid != nullptr) {
         return deepseek4_step_hybrid(backend, w, cache, *moe_hybrid,
@@ -2681,20 +2697,67 @@ bool deepseek4_step(
 
     // Create compute graph context — need large budget for MoE layers
     const size_t ctx_size = ggml_tensor_overhead() * 65536 + 16 * 1024 * 1024;
+    const bool reuse_full_step_decode =
+        n_tokens == 1 &&
+        ds4_backend_is_gpu(backend) &&
+        !ds4_env_flag("DFLASH_DS4_DISABLE_FULL_STEP_DECODE_REUSE");
+    static thread_local DeepSeek4LegacyFullStepCache full_step_cache;
+    StepGraph * cached_sg = nullptr;
+    if (reuse_full_step_decode) {
+        if (full_step_cache.owner_ctx != w.ctx || full_step_cache.backend != backend) {
+            full_step_cache.free();
+            full_step_cache.owner_ctx = w.ctx;
+            full_step_cache.backend = backend;
+        } else {
+            step_graph_free(full_step_cache.sg);
+        }
+        cached_sg = &full_step_cache.sg;
+        if (full_step_cache.meta_arena.size() < ctx_size) {
+            full_step_cache.meta_arena.resize(ctx_size);
+        }
+    }
+
     ggml_init_params params{};
-    params.mem_size = ctx_size;
-    params.mem_buffer = nullptr;
+    params.mem_size = cached_sg ? full_step_cache.meta_arena.size() : ctx_size;
+    params.mem_buffer = cached_sg ? full_step_cache.meta_arena.data() : nullptr;
     params.no_alloc = true;
+    const auto full_build_t0 = Ds4TimingClock::now();
     ggml_context * ctx = ggml_init(params);
     if (!ctx) return false;
+    if (cached_sg) {
+        cached_sg->ctx = ctx;
+    }
+
+    ggml_gallocr_t alloc = nullptr;
+    bool owns_alloc = false;
+    auto release_full_step = [&]() {
+        if (cached_sg) {
+            step_graph_free(*cached_sg);
+            return;
+        }
+        if (alloc && owns_alloc) {
+            ggml_gallocr_free(alloc);
+            alloc = nullptr;
+        }
+        if (ctx) {
+            ggml_free(ctx);
+            ctx = nullptr;
+        }
+    };
 
     // Input embeddings
     ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
     ggml_set_name(inp, "inp_embed");
     ggml_set_input(inp);
+    if (cached_sg) {
+        cached_sg->inp_embed = inp;
+    }
 
     ggml_tensor * cur = inp;
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 32768, false);
+    if (cached_sg) {
+        cached_sg->gf = gf;
+    }
     std::vector<DeepSeek4I32InputBinding> i32_inputs;
     std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
     std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
@@ -2743,20 +2806,39 @@ bool deepseek4_step(
     ggml_tensor * logits = ggml_mul_mat(ctx, w.output, cur);
     ggml_set_name(logits, "logits");
     ggml_set_output(logits);
+    if (cached_sg) {
+        cached_sg->logits = logits;
+    }
 
     // ── Build and run graph ─────────────────────────────────────────────
     ggml_build_forward_expand(gf, logits);
+    if (telemetry) {
+        telemetry->full_graph_build_us += ds4_elapsed_us(full_build_t0, Ds4TimingClock::now());
+    }
 
     // Allocate
-    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (cached_sg) {
+        if (!cached_sg->alloc) {
+            cached_sg->alloc =
+                ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        }
+        alloc = cached_sg->alloc;
+    } else {
+        alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        owns_alloc = true;
+    }
+    const auto full_alloc_t0 = Ds4TimingClock::now();
     if (!ggml_gallocr_alloc_graph(alloc, gf)) {
         std::fprintf(stderr, "[deepseek4] graph allocation failed\n");
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx);
+        release_full_step();
         return false;
+    }
+    if (telemetry) {
+        telemetry->full_graph_alloc_us += ds4_elapsed_us(full_alloc_t0, Ds4TimingClock::now());
     }
 
     // Set input data
+    const auto full_set_t0 = Ds4TimingClock::now();
     ggml_backend_tensor_set(inp, embed, 0, n_embd * n_tokens * sizeof(float));
     for (const DeepSeek4I32InputBinding & binding : i32_inputs) {
         ggml_backend_tensor_set(binding.tensor, &binding.value, 0, sizeof(binding.value));
@@ -2769,23 +2851,32 @@ bool deepseek4_step(
         ggml_backend_tensor_set(binding.tensor, binding.values.data(), 0,
                                 sizeof(int64_t) * binding.values.size());
     }
+    if (telemetry) {
+        telemetry->full_graph_set_us += ds4_elapsed_us(full_set_t0, Ds4TimingClock::now());
+    }
 
     // Compute
+    const auto full_compute_t0 = Ds4TimingClock::now();
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[deepseek4] graph compute failed\n");
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx);
+        release_full_step();
         return false;
+    }
+    if (telemetry) {
+        telemetry->full_graph_compute_us += ds4_elapsed_us(full_compute_t0, Ds4TimingClock::now());
     }
 
     // Read logits (only last token for generation)
+    const auto full_read_t0 = Ds4TimingClock::now();
     out_logits.resize(w.n_vocab);
     const size_t logits_offset = (size_t)(n_tokens - 1) * w.n_vocab * sizeof(float);
     ggml_backend_tensor_get(logits, out_logits.data(), logits_offset,
                             w.n_vocab * sizeof(float));
+    if (telemetry) {
+        telemetry->full_graph_read_us += ds4_elapsed_us(full_read_t0, Ds4TimingClock::now());
+    }
 
-    ggml_gallocr_free(alloc);
-    ggml_free(ctx);
+    release_full_step();
 
     const int next_pos = kv_start + n_tokens;
     for (int il = 0; il < n_layer; ++il) {
@@ -2801,6 +2892,9 @@ bool deepseek4_step(
     }
 
     cache.cur_pos = next_pos;
+    if (telemetry) {
+        telemetry->total_us += ds4_elapsed_us(step_t0, Ds4TimingClock::now());
+    }
     return true;
 }
 
