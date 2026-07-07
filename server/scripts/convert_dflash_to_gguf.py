@@ -249,14 +249,72 @@ DOMINO_TENSOR_MAP = {
 
 
 DSPARK_TENSOR_MAP = {
-    "dspark_markov_head.markov_w1.weight": ("dflash.dspark.markov.w1", gguf.GGMLQuantizationType.F16),
-    "dspark_markov_head.markov_w2.weight": ("dflash.dspark.markov.w2", gguf.GGMLQuantizationType.F16),
+    ("dspark_markov_head.markov_w1.weight",
+     "mtp.2.markov_head.markov_w1.weight"): ("dflash.dspark.markov.w1", gguf.GGMLQuantizationType.F16),
+    ("dspark_markov_head.markov_w2.weight",
+     "mtp.2.markov_head.markov_w2.weight"): ("dflash.dspark.markov.w2", gguf.GGMLQuantizationType.F16),
 }
 
 DSPARK_CONFIDENCE_TENSOR_MAP = {
-    "dspark_confidence_head.weight": ("dflash.dspark.confidence.weight", gguf.GGMLQuantizationType.F16),
-    "dspark_confidence_head.bias": ("dflash.dspark.confidence.bias", gguf.GGMLQuantizationType.F32),
+    ("dspark_confidence_head.weight",
+     "mtp.2.confidence_head.proj.weight"): ("dflash.dspark.confidence.weight", gguf.GGMLQuantizationType.F16),
+    ("dspark_confidence_head.bias",
+     "mtp.2.confidence_head.proj.bias"): ("dflash.dspark.confidence.bias", gguf.GGMLQuantizationType.F32),
 }
+
+
+def load_aux_state(aux_path: Path, label: str, wanted_names: set[str] | None = None):
+    if aux_path.suffix == ".safetensors":
+        header_size, header = load_safetensors_header(aux_path)
+        state = {}
+        for name, info in header.items():
+            if name == "__metadata__":
+                continue
+            if wanted_names is not None and name not in wanted_names:
+                continue
+            raw = read_tensor_bytes(aux_path, header_size, info)
+            state[name] = bytes_to_np(raw, info["dtype"], info["shape"])
+        return state
+
+    try:
+        import torch
+    except ImportError as exc:
+        print(f"[error] --aux-heads requires torch for {label} .pt files: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    state = torch.load(aux_path, map_location="cpu")
+    if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
+        state = state["state_dict"]
+    if not isinstance(state, dict):
+        print(f"[error] {label} aux heads file is not a tensor dict: {aux_path}", file=sys.stderr)
+        sys.exit(1)
+    return state
+
+
+def tensor_to_np(t, raw_dtype):
+    if hasattr(t, "detach"):
+        arr = t.detach().cpu().float().numpy()
+    else:
+        arr = np.asarray(t)
+        if arr.dtype.kind not in ("f", "i", "u"):
+            arr = arr.astype(np.float32)
+    if raw_dtype == gguf.GGMLQuantizationType.F16:
+        return arr.astype("<f2")
+    return arr.astype("<f4")
+
+
+def find_state_tensor(state: dict, names: tuple[str, ...]):
+    for name in names:
+        if name in state:
+            return name, state[name]
+    return None, None
+
+
+def flat_alias_names(alias_map: dict[tuple[str, ...], tuple[str, object]]) -> set[str]:
+    out = set()
+    for names in alias_map:
+        out.update(names)
+    return out
 
 
 def add_domino_aux_heads(writer, arch: str, aux_path: Path | None):
@@ -266,19 +324,8 @@ def add_domino_aux_heads(writer, arch: str, aux_path: Path | None):
         print(f"[warn] Domino aux heads not found: {aux_path}")
         return
 
-    try:
-        import torch
-    except ImportError as exc:
-        print(f"[error] --aux-heads requires torch: {exc}", file=sys.stderr)
-        sys.exit(1)
-
     print(f"[info] reading Domino aux heads from {aux_path}")
-    state = torch.load(aux_path, map_location="cpu")
-    if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
-        state = state["state_dict"]
-    if not isinstance(state, dict):
-        print(f"[error] Domino aux heads file is not a tensor dict: {aux_path}", file=sys.stderr)
-        sys.exit(1)
+    state = load_aux_state(aux_path, "Domino", set(DOMINO_TENSOR_MAP))
 
     if not any(k in state for k in DOMINO_TENSOR_MAP):
         return
@@ -300,14 +347,7 @@ def add_domino_aux_heads(writer, arch: str, aux_path: Path | None):
     writer.add_uint32(f"{arch}.dflash.domino.vocab_size", vocab)
 
     for st_name, (gguf_name, raw_dtype) in DOMINO_TENSOR_MAP.items():
-        t = state[st_name]
-        if hasattr(t, "detach"):
-            t = t.detach().cpu()
-        arr = t.float().numpy()
-        if raw_dtype == gguf.GGMLQuantizationType.F16:
-            arr = arr.astype("<f2")
-        else:
-            arr = arr.astype("<f4")
+        arr = tensor_to_np(state[st_name], raw_dtype)
         writer.add_tensor(gguf_name, arr, raw_dtype=raw_dtype)
         print(f"[tensor] {gguf_name:50s} aux ->{raw_dtype.name:4s} {tuple(arr.shape)}")
 
@@ -318,26 +358,22 @@ def add_dspark_aux_heads(writer, arch: str, aux_path: Path | None):
     if not aux_path.exists():
         return
 
-    try:
-        import torch
-    except ImportError as exc:
-        print(f"[error] --aux-heads requires torch: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    state = torch.load(aux_path, map_location="cpu")
-    if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
-        state = state["state_dict"]
-    if not isinstance(state, dict):
-        print(f"[error] DSpark aux heads file is not a tensor dict: {aux_path}", file=sys.stderr)
-        sys.exit(1)
-
-    missing = [k for k in DSPARK_TENSOR_MAP if k not in state]
+    wanted_names = flat_alias_names(DSPARK_TENSOR_MAP) | flat_alias_names(DSPARK_CONFIDENCE_TENSOR_MAP)
+    state = load_aux_state(aux_path, "DSpark", wanted_names)
+    resolved = {}
+    missing = []
+    for names, spec in DSPARK_TENSOR_MAP.items():
+        found_name, tensor = find_state_tensor(state, names)
+        if tensor is None:
+            missing.append("/".join(names))
+            continue
+        resolved[names] = (found_name, tensor, spec)
     if missing:
         return
 
     print(f"[info] reading DSpark aux heads from {aux_path}")
-    w1 = state["dspark_markov_head.markov_w1.weight"]
-    w2 = state["dspark_markov_head.markov_w2.weight"]
+    w1 = resolved[("dspark_markov_head.markov_w1.weight", "mtp.2.markov_head.markov_w1.weight")][1]
+    w2 = resolved[("dspark_markov_head.markov_w2.weight", "mtp.2.markov_head.markov_w2.weight")][1]
     vocab = int(w1.shape[0])
     rank = int(w1.shape[1])
     if tuple(w2.shape) != (vocab, rank):
@@ -348,21 +384,39 @@ def add_dspark_aux_heads(writer, arch: str, aux_path: Path | None):
     writer.add_uint32(f"{arch}.dflash.dspark.markov_rank", rank)
     writer.add_uint32(f"{arch}.dflash.dspark.vocab_size", vocab)
 
-    for st_name, (gguf_name, raw_dtype) in DSPARK_TENSOR_MAP.items():
-        t = state[st_name]
-        if hasattr(t, "detach"):
-            t = t.detach().cpu()
-        arr = t.float().numpy().astype("<f2")
+    for _names, (st_name, t, (gguf_name, raw_dtype)) in resolved.items():
+        arr = tensor_to_np(t, raw_dtype)
         writer.add_tensor(gguf_name, arr, raw_dtype=raw_dtype)
-        print(f"[tensor] {gguf_name:50s} aux ->{raw_dtype.name:4s} {tuple(arr.shape)}")
+        print(f"[tensor] {gguf_name:50s} aux:{st_name} ->{raw_dtype.name:4s} {tuple(arr.shape)}")
 
-    conf_missing = [k for k in DSPARK_CONFIDENCE_TENSOR_MAP if k not in state]
-    if conf_missing:
-        print(f"[warn] incomplete DSpark confidence head; missing {conf_missing}; Markov head will still load")
+    conf_resolved = {}
+    conf_missing = []
+    for names, spec in DSPARK_CONFIDENCE_TENSOR_MAP.items():
+        found_name, tensor = find_state_tensor(state, names)
+        if tensor is None:
+            conf_missing.append(names)
+            continue
+        conf_resolved[names] = (found_name, tensor, spec)
+    weight_names = ("dspark_confidence_head.weight", "mtp.2.confidence_head.proj.weight")
+    bias_names = ("dspark_confidence_head.bias", "mtp.2.confidence_head.proj.bias")
+    if weight_names not in conf_resolved:
+        if conf_missing:
+            print("[warn] incomplete DSpark confidence head; Markov head will still load")
+        return
+    if bias_names not in conf_resolved:
+        conf_resolved[bias_names] = (
+            "<zero-bias>",
+            np.zeros((1,), dtype=np.float32),
+            DSPARK_CONFIDENCE_TENSOR_MAP[bias_names],
+        )
+        print("[warn] DSpark confidence head has no bias tensor; writing a zero bias")
+
+    if conf_missing and bias_names in conf_missing and len(conf_missing) > 1:
+        print("[warn] incomplete DSpark confidence head; Markov head will still load")
         return
 
-    conf_w = state["dspark_confidence_head.weight"]
-    conf_b = state["dspark_confidence_head.bias"]
+    conf_w = conf_resolved[weight_names][1]
+    conf_b = conf_resolved[bias_names][1]
     confidence_dim = int(conf_w.shape[1])
     if int(conf_w.shape[0]) != 1 or tuple(conf_b.shape) != (1,):
         print(
@@ -372,17 +426,10 @@ def add_dspark_aux_heads(writer, arch: str, aux_path: Path | None):
         sys.exit(1)
     writer.add_uint32(f"{arch}.dflash.dspark.confidence_dim", confidence_dim)
     writer.add_uint32(f"{arch}.dflash.dspark.confidence.enabled", 1)
-    for st_name, (gguf_name, raw_dtype) in DSPARK_CONFIDENCE_TENSOR_MAP.items():
-        t = state[st_name]
-        if hasattr(t, "detach"):
-            t = t.detach().cpu()
-        arr = t.float().numpy()
-        if raw_dtype == gguf.GGMLQuantizationType.F16:
-            arr = arr.astype("<f2")
-        else:
-            arr = arr.astype("<f4")
+    for _names, (st_name, t, (gguf_name, raw_dtype)) in conf_resolved.items():
+        arr = tensor_to_np(t, raw_dtype)
         writer.add_tensor(gguf_name, arr, raw_dtype=raw_dtype)
-        print(f"[tensor] {gguf_name:50s} aux ->{raw_dtype.name:4s} {tuple(arr.shape)}")
+        print(f"[tensor] {gguf_name:50s} aux:{st_name} ->{raw_dtype.name:4s} {tuple(arr.shape)}")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -394,9 +441,9 @@ def main():
     ap.add_argument("safetensors", type=Path)
     ap.add_argument("out_gguf",     type=Path)
     ap.add_argument("--aux-heads", type=Path, default=None,
-                    help="optional Domino aux-head .pt file; defaults to dflash_aux_heads.pt next to the safetensors")
+                    help="optional Domino/DSpark aux-head .pt or DS4 MTP .safetensors file; defaults to dflash_aux_heads.pt next to the safetensors")
     ap.add_argument("--no-aux-heads", action="store_true",
-                    help="do not auto-embed Domino aux-head tensors")
+                    help="do not auto-embed Domino/DSpark aux-head tensors")
     args = ap.parse_args()
 
     if not args.safetensors.exists():

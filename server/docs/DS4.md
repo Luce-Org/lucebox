@@ -138,6 +138,42 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 
 DeepSeek4 no longer uses the old expert-split environment variables or expert-worker tuning knobs. Those retired knobs were removed from the codebase rather than left behind as unsupported debug switches.
 
+## DSpark Aux Draft Heads
+
+The current DSpark runtime lives in the shared DFlash speculative stack and is
+used by the Laguna backend when the draft GGUF carries `dflash.dspark.*`
+tensors. DeepSeek4 DSpark work is still a draft bridge: the DeepSeek4/MTP
+artifact stores compatible aux heads under the `mtp.2.*` namespace, and the
+converter can now map those names into the existing GGUF contract.
+
+Supported DeepSeek4/MTP input tensors:
+
+| DeepSeek4/MTP tensor | GGUF tensor |
+|----------------------|-------------|
+| `mtp.2.markov_head.markov_w1.weight` | `dflash.dspark.markov.w1` |
+| `mtp.2.markov_head.markov_w2.weight` | `dflash.dspark.markov.w2` |
+| `mtp.2.confidence_head.proj.weight` | `dflash.dspark.confidence.weight` |
+| `mtp.2.confidence_head.proj.bias` | `dflash.dspark.confidence.bias` |
+
+If the MTP confidence projection is bias-less, the converter writes a zero
+bias so the GGUF loader still sees the pair it expects. The Markov head alone
+is enough for DSpark greedy-chain correction; confidence gating remains
+optional.
+
+Example conversion with the DS4 MTP shard that contains the DSpark heads:
+
+```bash
+python server/scripts/convert_dflash_to_gguf.py \
+  /path/to/dflash-draft/model.safetensors \
+  /path/to/dflash-draft.gguf \
+  --aux-heads /path/to/hf-ds4-flash-dspark/model-00048-of-00048.safetensors
+```
+
+This does not by itself make the production DeepSeek4 layer-split backend use
+DSpark. It makes the DeepSeek4 DSpark aux artifact consumable by the existing
+`dflash.dspark.*` GGUF loader/runtime so the follow-up runtime PR can wire it
+into the DS4 decode path with a clean tensor contract.
+
 ## Example: CUDA + Halo Layer Split
 
 Automatic split (CUDA prefix chosen from free memory, optional manual override via `DFLASH_DS4_CUDA_LAYERS`):
