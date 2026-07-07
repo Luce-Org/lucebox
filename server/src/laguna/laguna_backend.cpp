@@ -490,7 +490,11 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         ? std::min((int)(spec_ewma_accept_ + 0.5) + 1, auto_w_max)
         : verify_width;
     if (chain_w < 2) chain_w = 2;
-    if (chain_w > std::min(block_size, 8)) chain_w = std::min(block_size, 8);
+    // Explicit --verify-width / DFLASH_LAGUNA_VERIFY_WIDTH may use the full
+    // drafted block; AUTO keeps the narrow cap because it is optimized for
+    // throughput when the accepted length is low.
+    const int chain_w_max = adaptive_width ? std::min(block_size, 8) : block_size;
+    if (chain_w > chain_w_max) chain_w = chain_w_max;
     // DDTree sizes its batch via its budget; chain uses the width chosen above.
     const int base_q_len = args_.ddtree_mode ? block_size : chain_w;
 
