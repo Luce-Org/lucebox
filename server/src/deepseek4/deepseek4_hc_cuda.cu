@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdio>
 #include <cmath>
 #include <mutex>
@@ -64,6 +65,15 @@ struct HcCudaScratch {
 
 std::mutex g_mu;
 HcCudaScratch g_scratch;
+
+bool hc_direct_no_sync_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * value = std::getenv("DFLASH_DS4_HC_DIRECT_NO_SYNC");
+        enabled = (value && value[0] && value[0] != '0') ? 1 : 0;
+    }
+    return enabled == 1;
+}
 
 void hc_log_cuda_error(const char * label, cudaError_t err) {
     if (err != cudaSuccess) {
@@ -304,9 +314,11 @@ bool hc_pre_device_locked(const void * hc_state_device,
         return fail("finish kernel", err);
     }
 #if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        return fail("device sync", err);
+    if (!hc_direct_no_sync_enabled()) {
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            return fail("device sync", err);
+        }
     }
 #endif
 
@@ -549,6 +561,34 @@ bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
                                 post_device,
                                 comb_device,
                                 true);
+}
+
+bool deepseek4_cuda_hc_upload_f16(const void * host_f16,
+                                  size_t       bytes,
+                                  void **      device_out) {
+    if (!host_f16 || bytes == 0 || !device_out) {
+        return false;
+    }
+    void * ptr = nullptr;
+    cudaError_t err = cudaMalloc(&ptr, bytes);
+    if (err != cudaSuccess) {
+        hc_log_cuda_error("hc f16 mirror malloc", err);
+        return false;
+    }
+    err = cudaMemcpy(ptr, host_f16, bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        hc_log_cuda_error("hc f16 mirror upload", err);
+        cudaFree(ptr);
+        return false;
+    }
+    *device_out = ptr;
+    return true;
+}
+
+void deepseek4_cuda_hc_free(void * device_ptr) {
+    if (device_ptr) {
+        cudaFree(device_ptr);
+    }
 }
 
 } // namespace dflash::common

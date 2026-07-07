@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace dflash::common {
@@ -46,5 +47,11 @@ bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
                                          void *        working_device,
                                          void *        post_device,
                                          void *        comb_device);
+
+bool deepseek4_cuda_hc_upload_f16(const void * host_f16,
+                                  size_t       bytes,
+                                  void **      device_out);
+
+void deepseek4_cuda_hc_free(void * device_ptr);
 
 } // namespace dflash::common
