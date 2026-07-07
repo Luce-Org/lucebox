@@ -101,17 +101,24 @@ struct tile_x_sizes {
     int sc;
 };
 
-// Lucebox: smaller MMQ tile for RDNA3/RDNA4 spec-decode verify batches.
+// Lucebox: tuned MMQ tile for RDNA3/RDNA4.
 // DFlash issues many small mul_mat_q calls (ne[1] ~= ddtree_budget+1, ~23 at
 // the default budget=22) where the stock 128x128 / 8-warp tile under-occupies.
-// A 48x64 tile with 4 warps is faster there, output bit-identical. Measured on
-// Qwen3.6-27B Q4_K_M at --ddtree-budget=22:
+// Current settings (mmq_y=128, nwarps=8, mmq_x_max=128):
+//   - mmq_y=128/nwarps=8: stock value for non-RDNA1 AMD — occupancy for decode
+//     batches (ne[1]~23) measured at +8.3% vs stock on gfx1201; also the right
+//     size for prefill (ne[1]=512) where halving block count improves L2 reuse
+//     (+6.9% prefill speedup on Q4_K m=4096,n=512,k=14336 on gfx1201).
+//   - mmq_x_max=128: prefill (ne[1]=512) fits in 4 x-tiles instead of 11.
+//     For decode (ne[1]~23), mmq_x selects 24 regardless of the cap — no impact.
+// Original decode measurements (Qwen3.6-27B Q4_K_M, --ddtree-budget=22):
 //   gfx1100 (RX 7900 XTX): 56.78 -> 60.18 tok/s (+6.0%)
 //   gfx1201 (R9700):       54.65 -> 59.20 tok/s (+8.3%)
 //   gfx1151 (Strix Halo):  11.53 -> 12.00 tok/s (+4.1%, 256-token smoke)
-// (mmq_y, nwarps) is the active lever (static_assert needs nwarps*16==mmq_y);
-// mmq_x_max in [32,64] is within noise. Define LUCEBOX_RDNA_MMQ_TILE_OVERRIDE=0
-// to disable.
+// Constraint: nwarps * granularity(mmq_x) / ntx(mmq_x) == mmq_y.
+//   mmq_x< 128: granularity=16, ntx=1 → 8*16/1=128 ✓
+//   mmq_x>=128: granularity=32, ntx=2 → 8*32/2=128 ✓
+// Define LUCEBOX_RDNA_MMQ_TILE_OVERRIDE=0 to disable.
 #ifndef LUCEBOX_RDNA_MMQ_TILE_OVERRIDE
 #define LUCEBOX_RDNA_MMQ_TILE_OVERRIDE 1
 #endif
@@ -123,7 +130,7 @@ struct tile_x_sizes {
 #endif
 
 static int get_mmq_x_max_host(const int cc) {
-    if (LUCEBOX_RDNA_TILE_HOST(cc)) return 48;
+    if (LUCEBOX_RDNA_TILE_HOST(cc)) return 128;
     return (amd_mfma_available(cc) || turing_mma_available(cc) || amd_wmma_available(cc)) ? 128 :
         GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA ?
 #ifdef GGML_CUDA_FORCE_MMQ
@@ -135,7 +142,7 @@ static int get_mmq_x_max_host(const int cc) {
 
 static constexpr __device__ int get_mmq_x_max_device() {
 #if LUCEBOX_RDNA_TILE_DEVICE
-    return 48;
+    return 128;
 #endif
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     return 128;
@@ -160,7 +167,7 @@ static constexpr __device__ int get_mmq_x_max_device() {
 }
 
 static int get_mmq_y_host(const int cc) {
-    if (LUCEBOX_RDNA_TILE_HOST(cc)) return 64;
+    if (LUCEBOX_RDNA_TILE_HOST(cc)) return 128;
     return GGML_CUDA_CC_IS_AMD(cc) ? (GGML_CUDA_CC_IS_RDNA1(cc) ? 64 : 128) :
         ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ? 128 : 64);
 }
@@ -175,7 +182,7 @@ static constexpr __device__ int get_iter_k([[maybe_unused]] const ggml_type type
 
 static constexpr __device__ int get_mmq_y_device() {
 #if LUCEBOX_RDNA_TILE_DEVICE
-    return 64;
+    return 128;
 #endif
 #if defined(GGML_USE_HIP)
 #if defined(RDNA1)
@@ -313,7 +320,7 @@ static constexpr __device__ int mmq_get_granularity_device(const int /*mmq_x*/) 
 
 #if defined(GGML_USE_HIP)
 static int mmq_get_nwarps_host(const int cc, const int warp_size) {
-    if (LUCEBOX_RDNA_TILE_HOST(cc)) return 4;
+    if (LUCEBOX_RDNA_TILE_HOST(cc)) return 8;
     return amd_mfma_available(cc) ? 8 : 256/warp_size;
 }
 #else
@@ -324,7 +331,7 @@ static int mmq_get_nwarps_host(const int /*cc*/, const int warp_size) {
 
 static constexpr __device__ int mmq_get_nwarps_device() {
 #if LUCEBOX_RDNA_TILE_DEVICE
-    return 4;
+    return 8;
 #endif
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     return 8;
@@ -2165,10 +2172,21 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 
             const half2 dm = bxi->dm * make_half2(1.0f, -1.0f);
 
+#if defined(AMD_WMMA_AVAILABLE)
+            {
+                int4 dm_block;
+                ((half2 *) &dm_block)[0] = dm * make_half2(sc8[0], m8[0]);
+                ((half2 *) &dm_block)[1] = dm * make_half2(sc8[1], m8[1]);
+                ((half2 *) &dm_block)[2] = dm * make_half2(sc8[2], m8[2]);
+                ((half2 *) &dm_block)[3] = dm * make_half2(sc8[3], m8[3]);
+                *((int4 *)(x_dm + i*MMQ_MMA_TILE_X_K_Q8_1 + sizeof(int)*ksc)) = dm_block;
+            }
+#else
     #pragma unroll
             for (int l = 0; l < sizeof(int); ++l) {
                 x_dm[i*MMQ_MMA_TILE_X_K_Q8_1 + sizeof(int)*ksc + l] = dm*make_half2(sc8[l], m8[l]);
             }
+#endif
         }
     }
 #else
@@ -2321,10 +2339,21 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 
             const half2 dm = bxi->dm * make_half2(1.0f, -1.0f);
 
-#pragma unroll
+#if defined(AMD_WMMA_AVAILABLE)
+            {
+                int4 dm_block;
+                ((half2 *) &dm_block)[0] = dm * make_half2(sc8[0], m8[0]);
+                ((half2 *) &dm_block)[1] = dm * make_half2(sc8[1], m8[1]);
+                ((half2 *) &dm_block)[2] = dm * make_half2(sc8[2], m8[2]);
+                ((half2 *) &dm_block)[3] = dm * make_half2(sc8[3], m8[3]);
+                *((int4 *)(x_dm + i*MMQ_MMA_TILE_X_K_Q8_1 + sizeof(int)*ksc)) = dm_block;
+            }
+#else
+    #pragma unroll
             for (int l = 0; l < int(sizeof(int)); ++l) {
                 x_dm[i*MMQ_MMA_TILE_X_K_Q8_1 + sizeof(int)*ksc + l] = dm*make_half2(sc8[l], m8[l]);
             }
+#endif
         }
     }
 #else
@@ -3527,15 +3556,26 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
+    // int2 copy is valid when y-tile size is divisible by 2*nwarps*warp_size.
+    // For mmq_x=128, MMQ_TILE_Y_K=36: 4608 / (2*256) = 9 exactly → clean unroll.
+    constexpr bool ytile_use_int2 = (mmq_x * MMQ_TILE_Y_K % (2 * nwarps * warp_size)) == 0;
+
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+            if constexpr (ytile_use_int2) {
 #pragma unroll
-            for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
-
-                tile_y[l] = by0[l];
+                for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K / 2; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                    ((int2 *) tile_y)[l] = ((const int2 *) by0)[l];
+                }
+            } else {
+#pragma unroll
+                for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                    tile_y[l] = by0[l];
+                }
             }
         }
 
@@ -3547,11 +3587,18 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+            if constexpr (ytile_use_int2) {
 #pragma unroll
-            for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
-
-                tile_y[l] = by0[l];
+                for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K / 2; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                    ((int2 *) tile_y)[l] = ((const int2 *) by0)[l];
+                }
+            } else {
+#pragma unroll
+                for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                    tile_y[l] = by0[l];
+                }
             }
         }
 
@@ -3574,7 +3621,11 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 template <ggml_type type, int mmq_x, bool need_check>
 #if defined(GGML_USE_HIP)
-#if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
+// RDNA4 is compute-bound on MMQ (WMMA path); allow compiler to use more VGPRs
+// (minBlocks=1 matches NVIDIA Volta+ behavior and reduces register spilling).
+#if defined(RDNA4)
+    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 1)
+#elif defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
 #endif // defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
 #else
