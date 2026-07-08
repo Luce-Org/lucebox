@@ -471,6 +471,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     // drafted block; the accept rule is unchanged, so this stays lossless. AUTO
     // tracks an EWMA of the accepted length (held constant per request so the
     // verify graph stays CUDA-graph-stable); --verify-width forces a fixed width.
+    const bool sampled_verify = laguna_sampled_verify_enabled(sampler_, true);
     int verify_width = args_.verify_width;
     if (const char * e = std::getenv("DFLASH_LAGUNA_VERIFY_WIDTH")) {
         const int w = std::atoi(e);
@@ -487,8 +488,15 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         const int v = e ? std::atoi(e) : 3;
         return v > 0 ? v : 3;
     }();
+    // [TAG_ADAPTIVE_WIDTH] default width policy: with the per-step
+    // drafter-confidence trim active (on by default for greedy chains), run
+    // from a base of 8 rows and let the trim shrink each step. The legacy
+    // accept-EWMA AUTO remains the fallback when the trim is off (theta 0)
+    // and for sampled verify, which has no candidate probabilities.
+    const bool width_trim = adaptive_verify_width_theta() > 0.0f &&
+                            !sampled_verify && !args_.ddtree_mode;
     int chain_w = adaptive_width
-        ? std::min((int)(spec_ewma_accept_ + 0.5) + 1, auto_w_max)
+        ? (width_trim ? 8 : std::min((int)(spec_ewma_accept_ + 0.5) + 1, auto_w_max))
         : verify_width;
     if (chain_w < 2) chain_w = 2;
     if (chain_w > std::min(block_size, 8)) chain_w = std::min(block_size, 8);
@@ -496,7 +504,6 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     const int base_q_len = args_.ddtree_mode ? block_size : chain_w;
 
     const bool ignore_eos = (std::getenv("DFLASH_IGNORE_EOS") != nullptr);
-    const bool sampled_verify = laguna_sampled_verify_enabled(sampler_, true);
     if (dflash_target_) {
         dflash_target_->set_keep_verify_logits(sampled_verify);
     }

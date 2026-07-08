@@ -227,7 +227,10 @@ static void print_usage(const char * prog) {
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
         "  --ddtree             Enable DDTree speculative decode\n"
         "  --ddtree-budget <N>  DDTree budget (default: 22)\n"
-        "  --verify-width <N>   laguna chain spec verify width (0=auto; default 0)\n"
+        "  --verify-width <N>   laguna chain spec verify width (default: base 8,\n"
+        "                       trimmed per step by drafter confidence; N = fixed base)\n"
+        "  --adaptive-experts [tau]  MoE expert-count gating on verify batches\n"
+        "                       (near-lossless; default tau 0.80 when passed)\n"
         "  --no-cors            Disable CORS headers\n"
         "  --think-max-tokens <N>     Phase-1 reasoning cap when a request opts in\n"
         "                             via thinking:{type:enabled} (default: 15488 =\n"
@@ -435,6 +438,12 @@ int main(int argc, char ** argv) {
             bargs.fast_rollback = true;
         } else if (std::strcmp(argv[i], "--ddtree-budget") == 0 && i + 1 < argc) {
             bargs.ddtree_budget = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--adaptive-experts") == 0) {
+            const char * tau = "0.80";
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                tau = argv[++i];
+            }
+            setenv("DFLASH_ADAPTIVE_K_TAU", tau, 0);  // explicit env still wins
         } else if (std::strcmp(argv[i], "--verify-width") == 0 && i + 1 < argc) {
             bargs.verify_width = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--no-fast-rollback") == 0) {

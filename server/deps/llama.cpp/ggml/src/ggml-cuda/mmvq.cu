@@ -269,20 +269,30 @@ struct mmid_gate_extra {
 #define MMID_GATE_MAGIC 0x4D474154u
 
 static bool mmid_grouped_env() {
+    // Bit-exact and measured equal-or-faster on small MoE verify batches, so
+    // enabled by default on CUDA; DFLASH_MMID_GROUPED=0 is the kill switch.
+    // HIP is unvalidated and stays opt-in (DFLASH_MMID_GROUPED=1).
     static const bool on = []() {
         const char * e = std::getenv("DFLASH_MMID_GROUPED");
-        return e && e[0] == '1' && e[1] == '\0';
+        if (e != nullptr) {
+            return e[0] == '1' && e[1] == '\0';
+        }
+#ifdef GGML_USE_HIP
+        return false;
+#else
+        return true;
+#endif
     }();
     return on;
 }
 
 static bool mmid_grouped_type_ok(ggml_type type) {
-    // bit0 = Q4_K, bit1 = Q6_K, bit2 = Q4_0/Q8_0/Q5_K. Default Q4_K only:
-    // Q6_K keeps its tuned MMQ route above 5 tokens unless explicitly enabled.
+    // bit0 = Q4_K, bit1 = Q6_K, bit2 = Q4_0/Q8_0/Q5_K. Default: all validated
+    // types (7); DFLASH_MMID_GROUPED_TYPES is a debug override.
     static const int mask = []() {
         const char * e = std::getenv("DFLASH_MMID_GROUPED_TYPES");
         if (e == nullptr || e[0] == '\0') {
-            return 1;
+            return 7;
         }
         return atoi(e);
     }();

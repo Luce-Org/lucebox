@@ -11,7 +11,8 @@
 // above theta. Output-exactness is preserved: only the number of speculated
 // slots changes, every committed token is still target-verified.
 //
-//   DFLASH_ADAPTIVE_WIDTH_THETA=<0..1>  enables (0/unset = off; ~0.20 typical)
+// On by default (theta 0.20). Debug overrides:
+//   DFLASH_ADAPTIVE_WIDTH_THETA=<0..1>  0 disables (legacy fixed/EWMA width)
 //   DFLASH_ADAPTIVE_WIDTH_MIN=<n>       minimum kept rows incl. seed (default 4)
 //
 // Model-agnostic: any family loop that has per-slot drafter top-1
@@ -22,7 +23,7 @@
 inline float adaptive_verify_width_theta() {
     static const float theta = []() {
         const char * e = std::getenv("DFLASH_ADAPTIVE_WIDTH_THETA");
-        return e ? (float) std::atof(e) : 0.0f;
+        return e ? (float) std::atof(e) : 0.20f;
     }();
     return theta;
 }
