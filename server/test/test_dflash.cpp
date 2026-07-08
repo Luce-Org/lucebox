@@ -3284,7 +3284,7 @@ int main(int argc, char ** argv) {
             } else {
                 // DDTree K>1: need real log-probs for best-first tree scoring.
                 bool topk_done = false;
-#ifdef DFLASH27B_HAVE_DRAFT_TOPK_CUDA
+#ifdef DFLASH27B_HAVE_DRAFT_TOPK
                 // GPU path: top-K + logsumexp on the draft logits device buffer
                 // (positions 1..q_len-1), no full-vocab D2H. Escape: DFLASH_GPU_DRAFT_TOPK=0.
                 static const bool kGpuDraftTopk = [](){

@@ -692,7 +692,7 @@ bool Qwen35DFlashTarget::project_hidden_to_topk(
     top_log_probs.assign((size_t)n_tokens * K, 0.0f);
     top_token_ids.assign((size_t)n_tokens * K, 0);
 
-#ifdef DFLASH27B_HAVE_DRAFT_TOPK_CUDA
+#ifdef DFLASH27B_HAVE_DRAFT_TOPK
     // GPU path: top-K + logsumexp directly on the logits device buffer, skipping
     // the vocab×n_tokens D2H and the CPU heap extract. Falls back to the CPU path
     // on any failure. Escape hatch: DFLASH_GPU_DRAFT_TOPK=0.
