@@ -1,3 +1,4 @@
+#include "ggml-cuda.h"
 #include "domino_head.h"
 
 #include "ggml-alloc.h"
@@ -186,7 +187,10 @@ bool domino_correct_greedy_chain_fused(const DraftWeights & dw,
                                        const float * local_hidden,
                                        int q_len,
                                        int32_t last_tok,
-                                       std::vector<int32_t> & draft_tok) {
+                                       std::vector<int32_t> & draft_tok,
+                                       int cand_k,
+                                       std::vector<float> * cand_probs,
+                                       std::vector<int32_t> * cand_ids) {
     if (!dw.domino.enabled || q_len <= 1 || !local_hidden ||
         !backend || !lm_head || !embd_table) {
         return false;
@@ -210,7 +214,7 @@ bool domino_correct_greedy_chain_fused(const DraftWeights & dw,
 
     static const bool zero_start = std::getenv("DFLASH_DOMINO_ZERO_START") != nullptr;
 
-    const size_t arena_size = ggml_tensor_overhead() * (size_t)(96 + 48 * n_cand) +
+    const size_t arena_size = ggml_tensor_overhead() * (size_t)(96 + 52 * n_cand) +
                               ggml_graph_overhead_custom(1024, false) + 4 * 1024 * 1024;
     static thread_local std::vector<uint8_t> g_arena_fused;
     if (g_arena_fused.size() < arena_size) g_arena_fused.resize(arena_size);
@@ -237,6 +241,7 @@ bool domino_correct_greedy_chain_fused(const DraftWeights & dw,
     ggml_set_name(prev_embed, "dom_embed_seed");
 
     std::vector<ggml_tensor *> toks((size_t)n_cand, nullptr);
+    std::vector<ggml_tensor *> corr((size_t)n_cand, nullptr);
     for (int i = 0; i < n_cand; ++i) {
         ggml_tensor * gi = ggml_mul_mat(ctx, dw.domino.gru_w_ih, prev_embed);
         gi = ggml_add(ctx, gi, ggml_reshape_2d(ctx, dw.domino.gru_b_ih, 3 * H, 1));
@@ -275,12 +280,25 @@ bool domino_correct_greedy_chain_fused(const DraftWeights & dw,
         ggml_set_output(tok);
         ggml_build_forward_expand(gf, tok);
         toks[(size_t)i] = tok;
+        corr[(size_t)i] = corrected;
 
         if (i + 1 < n_cand) {
             prev_embed = ggml_get_rows(ctx, embd_table, tok);
             ggml_set_name(prev_embed, "dom_embed_tok");
         }
         state = h_new;
+    }
+
+    // [TAG_ADAPTIVE_WIDTH] optionally expose every position's corrected
+    // logits as one [vocab, n_cand] output for post-compute top-k extraction.
+    ggml_tensor * all_corr = nullptr;
+    if (cand_k > 0 && cand_probs != nullptr && cand_ids != nullptr) {
+        all_corr = corr[0];
+        for (int i = 1; i < n_cand; ++i) {
+            all_corr = ggml_concat(ctx, all_corr, corr[(size_t)i], 1);
+        }
+        ggml_set_output(all_corr);
+        ggml_build_forward_expand(gf, all_corr);
     }
 
     static thread_local ggml_gallocr_t galloc_fused = nullptr;
@@ -303,6 +321,18 @@ bool domino_correct_greedy_chain_fused(const DraftWeights & dw,
         return false;
     }
 
+    // [TAG_ADAPTIVE_WIDTH] reduce the corrected logits to top-k ids +
+    // softmax probs on-device (~KB readback); failure just disables the
+    // candidate consumers (adaptive width) for this build.
+    if (all_corr != nullptr) {
+        cand_probs->assign((size_t)n_cand * (size_t)cand_k, 0.0f);
+        cand_ids->assign((size_t)n_cand * (size_t)cand_k, -1);
+        if (!ggml_backend_cuda_topk_rows(all_corr, cand_k,
+                                         cand_probs->data(), cand_ids->data())) {
+            cand_probs->clear();
+            cand_ids->clear();
+        }
+    }
     draft_tok.assign((size_t)q_len, 0);
     draft_tok[0] = last_tok;
     // One synchronize instead of n_cand blocking readbacks.

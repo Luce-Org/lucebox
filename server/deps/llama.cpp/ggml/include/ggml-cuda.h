@@ -45,6 +45,12 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
+// [TAG_TOPK_ROWS] top-k (k <= 8) entries + softmax probabilities per row of a
+// device-resident contiguous F32 [ncols, nrows] tensor; ~KB of readback. Not
+// a graph op: call after the producing graph_compute has returned.
+GGML_BACKEND_API bool ggml_backend_cuda_topk_rows(const struct ggml_tensor * logits, int k,
+                                                  float * probs_out, int32_t * ids_out);
+
 #ifdef  __cplusplus
 }
 #endif

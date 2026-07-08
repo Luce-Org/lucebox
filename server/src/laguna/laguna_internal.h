@@ -364,7 +364,10 @@ bool laguna_project_hidden(
     const LagunaTargetWeights & w,
     const float *               hidden,
     int                         n_tokens,
-    std::vector<int32_t> &      out_tokens);
+    std::vector<int32_t> &      out_tokens,
+    int                         cand_k     = 0,     // [TAG_ADAPTIVE_WIDTH]
+    std::vector<float> *        cand_probs = nullptr,
+    std::vector<int32_t> *      cand_ids   = nullptr);
 
 // Forward decl (full definition in common/moe_hybrid_storage.h).
 struct MoeHybridStorage;

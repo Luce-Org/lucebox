@@ -20,7 +20,10 @@ bool domino_correct_greedy_chain_fused(const DraftWeights & dw,
                                        const float * local_hidden,
                                        int q_len,
                                        int32_t last_tok,
-                                       std::vector<int32_t> & draft_tok);
+                                       std::vector<int32_t> & draft_tok,
+                                       int cand_k = 0,
+                                       std::vector<float> * cand_probs = nullptr,
+                                       std::vector<int32_t> * cand_ids = nullptr);
 
 bool domino_correct_greedy_chain(const DraftWeights & dw,
                                  ggml_backend_t backend,

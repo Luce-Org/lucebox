@@ -30,6 +30,7 @@
 #include "common/step_graph.h"
 
 #include "ggml-cuda.h"
+#include "../common/adaptive_verify_width.h"
 #include "ggml-alloc.h"
 #include "common/snapshot_backend.h"
 
@@ -718,6 +719,13 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                                 sizeof(float) * local_hidden.size());
         if (step_prof) prof_draft_ms += prof_lap();
 
+        // [TAG_ADAPTIVE_WIDTH] drafter top-2 candidate probabilities per
+        // slot, extracted on whichever head produces the draft tokens; used
+        // below to trim the verify batch per step.
+        std::vector<float>   cand_p;
+        std::vector<int32_t> cand_i;
+        const int cand_k = (adaptive_verify_width_theta() > 0.0f &&
+                            !sampled_verify && !args_.ddtree_mode && q_len >= 3) ? 2 : 0;
         bool used_domino = false;
         if (dw.domino.enabled && q_len > 1 && !sampled_verify && !args_.ddtree_mode) {
             static std::atomic<bool> s_domino_logged{false};
@@ -737,7 +745,9 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                 if (domino_correct_greedy_chain_fused(
                         dw, draft_backend_, target->lm_head_tensor(),
                         target->gpu_embd_table(), local_hidden.data(), q_len,
-                        last_tok, draft_tok)) {
+                        last_tok, draft_tok,
+                        cand_k, cand_k > 0 ? &cand_p : nullptr,
+                        cand_k > 0 ? &cand_i : nullptr)) {
                     used_domino = true;
                 }
             }
@@ -799,7 +809,9 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             }
         }
         if (!used_domino && !used_dspark) {
-            if (!target->project_hidden_to_tokens(local_hidden.data(), q_len, draft_tok)) {
+            if (!target->project_hidden_to_tokens_topk(local_hidden.data(), q_len, draft_tok,
+                    cand_k, cand_k > 0 ? &cand_p : nullptr,
+                    cand_k > 0 ? &cand_i : nullptr)) {
                 std::fprintf(stderr, "[laguna-spec] projection failed\n");
                 step_graph_destroy(draft_sg);
                 return false;
@@ -924,6 +936,23 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             cache_.cur_pos = committed;
             n_generated += emitted;
             continue;
+        }
+
+        // [TAG_ADAPTIVE_WIDTH] trim the verify batch where the drafter's own
+        // reach-mass says the tail rows almost never commit: every dropped
+        // row saves one MoE verify row (~1ms of expert reads for a Q4 target
+        // on a 3090). Output-exactness is preserved: only the number of
+        // speculated slots changes, every committed token is still verified.
+        if (cand_k > 0 && !cand_p.empty() &&
+            cand_p.size() >= (size_t)(q_len - 1) * (size_t)cand_k) {
+            const int w_new = adaptive_verify_width(cand_p.data(), cand_k, q_len,
+                                                    adaptive_verify_width_theta(),
+                                                    adaptive_verify_width_min());
+            if (w_new < q_len) {
+                q_len = w_new;
+                draft_tok.resize((size_t)q_len);
+                target_tok.resize((size_t)q_len);
+            }
         }
 
         int verify_last_tok = -1;

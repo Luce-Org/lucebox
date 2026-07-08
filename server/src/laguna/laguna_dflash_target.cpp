@@ -1,5 +1,7 @@
 // LagunaDFlashTarget - DFlashTarget adapter for Poolside Laguna-XS.2.
 
+#include "ggml-cuda.h"
+#include <cmath>
 #include "laguna_dflash_target.h"
 #include "../common/kvflash_pager.h"
 #include "../common/ddtree.h"
@@ -590,6 +592,17 @@ bool LagunaDFlashTarget::project_hidden_to_tokens(
     return laguna_project_hidden(backend_, w_, hidden, n_tokens, tokens_out);
 }
 
+bool LagunaDFlashTarget::project_hidden_to_tokens_topk(
+        const float * hidden,
+        int n_tokens,
+        std::vector<int32_t> & tokens_out,
+        int cand_k,
+        std::vector<float> * cand_probs,
+        std::vector<int32_t> * cand_ids) {
+    return laguna_project_hidden(backend_, w_, hidden, n_tokens, tokens_out,
+                                 cand_k, cand_probs, cand_ids);
+}
+
 bool LagunaDFlashTarget::project_hidden_to_logits(
         const float * hidden,
         int n_tokens,
@@ -673,6 +686,23 @@ bool LagunaDFlashTarget::project_hidden_to_topk(
         std::fprintf(stderr, "laguna_project_hidden_to_topk: graph_compute failed\n");
         ggml_free(ctx);
         return false;
+    }
+
+    // [TAG_TOPK_ROWS] GPU top-k on the resident logits: ~KB readback instead
+    // of the full vocab logits; falls through to the host path on failure or
+    // non-unit temperature (the kernel bakes softmax at T=1).
+    if (temperature == 1.0f && K <= 8) {
+        std::vector<float>   probs_gpu((size_t)n_tokens * (size_t)K);
+        std::vector<int32_t> ids_gpu((size_t)n_tokens * (size_t)K);
+        if (ggml_backend_cuda_topk_rows(logits, K, probs_gpu.data(), ids_gpu.data())) {
+            top_log_probs.resize((size_t)n_tokens * (size_t)K);
+            top_token_ids.assign(ids_gpu.begin(), ids_gpu.end());
+            for (size_t z = 0; z < top_log_probs.size(); ++z) {
+                top_log_probs[z] = std::log(probs_gpu[z] > 1e-30f ? probs_gpu[z] : 1e-30f);
+            }
+            ggml_free(ctx);
+            return true;
+        }
     }
 
     // CPU top-K via extract_draft_topk (shared with qwen35). The GPU ggml_top_k

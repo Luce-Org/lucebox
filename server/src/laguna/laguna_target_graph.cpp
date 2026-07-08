@@ -17,6 +17,7 @@
 // is tested against our llama.cpp build_laguna (already verified to match HF
 // for 30+ tokens on B-tree prompt; see Lucebox/Laguna-XS.2-GGUF README).
 
+#include <map>
 #include "../common/mmid_adaptive_k.h"
 #include "laguna_internal.h"
 #include "../common/moe_hybrid_storage.h"
@@ -1612,8 +1613,13 @@ bool laguna_verify_batch(
         const LagunaTargetCache *   cache_id = nullptr;
         ggml_backend_buffer_t       stage_buf = nullptr;
     };
-    static thread_local VerifySlot g_slot_block, g_slot_bonus;
-    VerifySlot & S = (n_tokens == 1) ? g_slot_bonus : g_slot_block;
+    // [TAG_ADAPTIVE_WIDTH] one slot per verify row count: adaptive width
+    // flips n_tokens step to step, and each width needs its own arena so its
+    // node addresses stay stable and its captured CUDA graph replays instead
+    // of re-capturing on every flip.
+    static thread_local std::map<int, VerifySlot> g_slots_block;
+    static thread_local VerifySlot g_slot_bonus;
+    VerifySlot & S = (n_tokens == 1) ? g_slot_bonus : g_slots_block[n_tokens];
     const bool want_logits = out_logits != nullptr;
     const bool want_feat = cache.target_feat && cache.target_feat_cap > 0;
     // Reuse requires the kv_idx input path (kv_pad > 0, no PAD_CPY): those
@@ -1810,7 +1816,10 @@ bool laguna_project_hidden(
     const LagunaTargetWeights & w,
     const float *               hidden,
     int                         n_tokens,
-    std::vector<int32_t> &      out_tokens)
+    std::vector<int32_t> &      out_tokens,
+    int                         cand_k,
+    std::vector<float> *        cand_probs,
+    std::vector<int32_t> *      cand_ids)
 {
     if (n_tokens <= 0) return false;
 
@@ -1823,10 +1832,18 @@ bool laguna_project_hidden(
     ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.n_embd, n_tokens);
     ggml_set_input(inp);
 
-    ggml_tensor * cur = ggml_mul_mat(ctx, w.output, inp);  // [vocab, n_tokens]
-    cur = ggml_argmax(ctx, cur);                           // [n_tokens]
+    ggml_tensor * logits = ggml_mul_mat(ctx, w.output, inp);  // [vocab, n_tokens]
+    ggml_tensor * cur = ggml_argmax(ctx, logits);              // [n_tokens]
     ggml_set_output(cur);
     ggml_build_forward_expand(gf, cur);
+    // [TAG_ADAPTIVE_WIDTH] keep the logits alive for post-compute top-k
+    // candidate extraction (~KB readback, no extra projection).
+    const bool want_cand =
+        cand_k > 0 && cand_probs != nullptr && cand_ids != nullptr && n_tokens >= 2;
+    if (want_cand) {
+        ggml_set_output(logits);
+        ggml_build_forward_expand(gf, logits);
+    }
 
     static ggml_gallocr_t galloc_proj = nullptr;
     if (!galloc_proj) galloc_proj = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -1848,6 +1865,24 @@ bool laguna_project_hidden(
     out_tokens.resize((size_t)n_tokens);
     ggml_backend_tensor_get(cur, out_tokens.data(), 0,
                             sizeof(int32_t) * (size_t)n_tokens);
+
+    // [TAG_ADAPTIVE_WIDTH] slot j uses logits row j; row 0 is the seed slot
+    // and is dropped, so the outputs cover slots 1..n_tokens-1.
+    if (want_cand) {
+        std::vector<float>   p_all((size_t)n_tokens * (size_t)cand_k);
+        std::vector<int32_t> i_all((size_t)n_tokens * (size_t)cand_k);
+        if (ggml_backend_cuda_topk_rows(logits, cand_k, p_all.data(), i_all.data())) {
+            cand_probs->assign((size_t)(n_tokens - 1) * (size_t)cand_k, 0.0f);
+            cand_ids->assign((size_t)(n_tokens - 1) * (size_t)cand_k, -1);
+            for (size_t z = 0; z < cand_probs->size(); ++z) {
+                (*cand_probs)[z] = p_all[(size_t)cand_k + z];
+                (*cand_ids)[z]   = i_all[(size_t)cand_k + z];
+            }
+        } else {
+            cand_probs->clear();
+            cand_ids->clear();
+        }
+    }
 
     ggml_free(ctx);
     return true;
