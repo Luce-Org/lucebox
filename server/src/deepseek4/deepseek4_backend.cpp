@@ -535,7 +535,16 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   int kv_offset) {
     // Hybrid currently implements HC for single-token steps only; keep prefill
     // token-by-token so the first sampled token is seeded from the correct HC state.
-    const int chunk = moe_hybrid_ ? 1 : (cfg_.chunk > 0 ? cfg_.chunk : 512);
+    //
+    // Chunked prefill (n_tokens > 1) is only exact while the whole prompt fits
+    // inside the raw SWA ring: the chunk graph writes ring slots pos % n_swa
+    // while attention reads the ring in the same graph, and the learned
+    // compressor only runs for the chunk's last token. Prompts beyond n_swa
+    // degrade into incoherence. Token-by-token prefill matches the reference
+    // semantics at any length; chunked stays available via
+    // DFLASH_DS4_CHUNKED_PREFILL=1 for short-prompt benchmarking only.
+    const bool unsafe_chunked = env_flag_enabled("DFLASH_DS4_CHUNKED_PREFILL");
+    const int chunk = (moe_hybrid_ || !unsafe_chunked) ? 1 : (cfg_.chunk > 0 ? cfg_.chunk : 512);
     const int n_total = (int)tokens.size();
     int pos = kv_offset;
     // New sequence: clear the cache buffer so compressor state double-buffers
