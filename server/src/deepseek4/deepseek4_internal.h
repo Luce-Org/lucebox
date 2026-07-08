@@ -23,6 +23,7 @@
 #include "ggml-backend.h"
 
 #include "internal.h"
+#include "common/expert_split_compute_runtime.h"
 #include "common/layer_split_utils.h"
 
 namespace dflash::common {
@@ -30,7 +31,9 @@ namespace dflash::common {
 struct MoeHybridPlacement;
 struct MoeHybridConfig;
 struct MoeHybridRoutingStats;
-class MoeHybridStreamEngine;
+struct MoeExpertLayer;
+struct MoeExpertCompute;
+class ExpertIpcClient;
 
 struct DeepSeek4StepTelemetry {
     uint64_t total_us = 0;
@@ -61,10 +64,34 @@ struct DeepSeek4StepTelemetry {
     uint64_t ffn_cold_us = 0;
     uint64_t ffn_combine_us = 0;
     uint64_t ffn_partition_us = 0;
+    uint64_t ffn_cache_promote_us = 0;
     uint64_t ffn_hot_graph_builds = 0;
     uint64_t ffn_hot_graph_hits = 0;
     uint64_t ffn_cold_graph_builds = 0;
     uint64_t ffn_cold_graph_hits = 0;
+    uint64_t worker_us = 0;
+    uint64_t worker_parent_write_us = 0;
+    uint64_t worker_parent_wait_us = 0;
+    uint64_t worker_parent_read_us = 0;
+    uint64_t worker_request_read_us = 0;
+    uint64_t worker_partition_us = 0;
+    uint64_t worker_resident_eval_us = 0;
+    uint64_t worker_miss_build_us = 0;
+    uint64_t worker_miss_eval_us = 0;
+    uint64_t worker_request_bytes = 0;
+    uint64_t worker_response_bytes = 0;
+    uint64_t worker_hot_graph_builds = 0;
+    uint64_t worker_hot_graph_hits = 0;
+    uint64_t worker_cold_graph_builds = 0;
+    uint64_t worker_cold_graph_hits = 0;
+    uint64_t worker_hot_graph_build_us = 0;
+    uint64_t worker_hot_input_us = 0;
+    uint64_t worker_hot_compute_us = 0;
+    uint64_t worker_hot_read_us = 0;
+    uint64_t worker_cold_graph_build_us = 0;
+    uint64_t worker_cold_input_us = 0;
+    uint64_t worker_cold_compute_us = 0;
+    uint64_t worker_cold_read_us = 0;
     uint64_t hc_post_ffn_us = 0;
     uint64_t output_us = 0;
     uint64_t sample_us = 0;
@@ -219,7 +246,7 @@ struct DeepSeek4Weights {
     int32_t eos_id      = -1;
     int32_t eos_chat_id = -1;
 
-    // MoE hybrid placement (deprecated — layer split replaces expert split)
+    // MoE hybrid/expert-split placement state.
     bool moe_hybrid       = false;
 };
 
@@ -252,6 +279,10 @@ struct DeepSeek4LayerCache {
     // Compressor rolling state
     DeepSeek4CompressorState attn_compressor;
     DeepSeek4CompressorState indexer_compressor;
+
+    // Optional routing bias cached on host for CPU-side top-k selection.
+    std::vector<float> route_bias_host;
+    bool route_bias_loaded = false;
 };
 
 struct DeepSeek4Cache {
@@ -279,6 +310,102 @@ struct DeepSeek4BackendConfig {
     int          chunk        = 512;   // prefill chunk size
     int          max_ctx      = 0;     // 0 = auto from SWA + compression capacity
 };
+
+struct DeepSeek4ExpertSplitGpuMemoryInfo {
+    uint64_t free_bytes = 0;
+    uint64_t total_bytes = 0;
+};
+
+struct DeepSeek4ExpertSplitBudgetMemoryInfo {
+    uint64_t total_bytes = 0;
+    uint64_t free_bytes = 0;
+    uint64_t core_bytes = 0;
+    uint64_t kv_bytes = 0;
+    uint64_t warm_bytes = 0;
+    uint64_t safety_bytes = 0;
+    uint64_t total_expert_bytes = 0;
+    bool parent_is_igpu = false;
+    uint64_t host_available_bytes = 0;
+    uint64_t host_budget_cap_bytes = 0;
+};
+
+struct DeepSeek4ExpertSplitHotCachePlan {
+    uint64_t hot_bytes = 0;
+    int cache_slots = 0;
+};
+
+int deepseek4_expert_split_prefill_chunk_limit_from_memory(
+    int requested_chunk,
+    bool expert_split_enabled,
+    bool parent_is_gpu,
+    const DeepSeek4ExpertSplitGpuMemoryInfo & memory);
+
+bool deepseek4_expert_split_should_disable_cached_decode_from_memory(
+    bool expert_split_enabled,
+    bool parent_is_gpu,
+    bool parent_is_cuda,
+    bool parent_is_hip,
+    const DeepSeek4ExpertSplitGpuMemoryInfo & memory);
+
+bool deepseek4_expert_split_requires_parent_cuda_graph_disable(
+    bool expert_split_enabled,
+    bool parent_is_cuda,
+    const std::vector<ExpertSplitComputeTargetRuntime> & targets);
+
+bool deepseek4_should_use_gpu_resident_decode_ffn_policy(
+    bool use_cached_decode,
+    bool env_enabled,
+    bool env_disabled,
+    bool backend_is_hip,
+    bool backend_is_integrated_gpu,
+    bool worker_active);
+
+uint64_t deepseek4_expert_split_budget_from_memory(
+    const DeepSeek4ExpertSplitBudgetMemoryInfo & memory);
+
+uint64_t deepseek4_expert_split_primary_capacity_for_targets(
+    uint64_t expert_budget_bytes,
+    uint64_t hot_budget_bytes,
+    size_t configured_targets);
+
+uint64_t deepseek4_expert_split_non_cpu_capacity_bytes(
+    const std::vector<ExpertSplitTarget> & targets);
+
+uint64_t deepseek4_expert_split_effective_budget_for_targets(
+    uint64_t requested_budget_bytes,
+    uint64_t total_expert_bytes,
+    const std::vector<ExpertSplitTarget> & targets);
+
+uint64_t deepseek4_expert_split_effective_hot_budget(
+    uint64_t expert_budget_bytes,
+    uint64_t hot_budget_bytes,
+    size_t configured_targets);
+
+bool deepseek4_expert_split_hash_ids_to_hotness_counts(
+    const int32_t * expert_ids,
+    int n_token_ids,
+    int n_expert_used,
+    int n_expert,
+    std::vector<uint64_t> & out_counts);
+
+bool deepseek4_expert_split_route_bias_to_hotness_counts(
+    const float * route_bias,
+    int n_expert,
+    uint64_t layer_total,
+    std::vector<uint64_t> & out_counts);
+
+int deepseek4_expert_split_effective_cache_slots(
+    int requested_cache_slots,
+    size_t configured_targets);
+
+DeepSeek4ExpertSplitHotCachePlan deepseek4_expert_split_hot_cache_plan(
+    uint64_t expert_budget_bytes,
+    uint64_t total_expert_bytes,
+    int n_expert,
+    int n_expert_used,
+    bool parent_is_igpu,
+    uint64_t igpu_host_cap_bytes = 0,
+    uint64_t igpu_free_bytes = 0);
 
 // ─── Function declarations ──────────────────────────────────────────────
 
@@ -308,7 +435,8 @@ bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
 // Forward: single step (prefill chunk or decode token).
 // embed: [n_embd, n_tokens] input embeddings (post-embedding lookup).
 // hc_state: [n_hc * n_embd] persistent HC residual (updated in-place).
-// Returns logits for last token.
+// When want_logits is false, the step updates KV / routing state but skips the
+// final output head and logits readback.
 bool deepseek4_step(
     ggml_backend_t              backend,
     const DeepSeek4Weights &    w,
@@ -319,9 +447,34 @@ bool deepseek4_step(
     std::vector<float> &        out_logits,
     MoeHybridStorage *          moe_hybrid = nullptr,
     const int32_t *             token_ids = nullptr,
-    MoeHybridStreamEngine *     stream_engine = nullptr,
+    ExpertIpcClient *  expert_worker = nullptr,
+    bool                        worker_owns_hot_ids = false,
+    bool                        want_logits = true,
+    bool                        disable_cached_decode = false,
     DeepSeek4StepTelemetry *    telemetry = nullptr,
-    MoeHybridRoutingStats *     routing_stats = nullptr);
+    MoeHybridRoutingStats *     routing_stats = nullptr,
+    MoeExpertCompute *          expert_compute = nullptr,
+    const MoeExpertLayer *      expert_layers = nullptr);
+
+// Compatibility overload for builds that still route call sites through the
+// original DeepSeek4 step signature without an explicit cached-decode toggle.
+bool deepseek4_step(
+    ggml_backend_t              backend,
+    const DeepSeek4Weights &    w,
+    DeepSeek4Cache &            cache,
+    const float *               embed,
+    int                         n_tokens,
+    int                         kv_start,
+    std::vector<float> &        out_logits,
+    MoeHybridStorage *          moe_hybrid,
+    const int32_t *             token_ids,
+    ExpertIpcClient *           expert_worker,
+    bool                        worker_owns_hot_ids,
+    bool                        want_logits,
+    DeepSeek4StepTelemetry *    telemetry,
+    MoeHybridRoutingStats *     routing_stats = nullptr,
+    MoeExpertCompute *          expert_compute = nullptr,
+    const MoeExpertLayer *      expert_layers = nullptr);
 
 bool deepseek4_step_layer_range(
     ggml_backend_t              backend,
@@ -344,22 +497,16 @@ bool build_deepseek4_moe_hybrid_storage_from_file(
     const MoeHybridPlacement &  placement,
     const MoeHybridConfig *     cfg_override,
     MoeHybridStorage &          out,
-    std::string *               err = nullptr);
+    std::string *               err = nullptr,
+    int                         cache_slots = 0,
+    bool                        load_cold_tensors = true,
+    const std::vector<std::vector<int32_t>> * cold_expert_order_by_layer = nullptr);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,
     ggml_backend_t              backend,
     const DeepSeek4Weights &    w,
     const MoeHybridPlacement &  placement,
-    MoeHybridStorage &          out,
-    std::string *               err = nullptr);
-
-bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
-    const std::string &         path,
-    ggml_backend_t              backend,
-    const DeepSeek4Weights &    w,
-    const MoeHybridPlacement &  placement,
-    const MoeHybridConfig *     cfg_override,
     MoeHybridStorage &          out,
     std::string *               err = nullptr);
 

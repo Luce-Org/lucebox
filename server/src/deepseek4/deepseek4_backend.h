@@ -11,7 +11,8 @@
 #include "../common/moe_hybrid_placement.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_storage.h"
-#include "../common/moe_hybrid_stream.h"
+#include "../common/expert_split_state.h"
+#include "../common/moe_expert_compute.h"
 #include "deepseek4_internal.h"
 
 #include "ggml.h"
@@ -60,6 +61,15 @@ public:
     void shutdown() override;
 
 private:
+    bool run_step_with_runtime_path(const float * embed,
+                                    int n_tokens,
+                                    int kv_start,
+                                    std::vector<float> & out_logits,
+                                    const int32_t * token_ids,
+                                    bool want_logits,
+                                    bool disable_cached_decode,
+                                    DeepSeek4StepTelemetry * telemetry);
+    void reset_request_state();
     DeepSeek4BackendConfig cfg_;
     ggml_backend_t         backend_      = nullptr;
     ggml_backend_t         snap_backend_ = nullptr;
@@ -74,6 +84,7 @@ private:
     // Snapshots
     static constexpr int PREFIX_SLOTS = 64;
     DeepSeek4Snapshot      snapshots_[PREFIX_SLOTS];
+    std::vector<float>     hc_state_;
     std::vector<float>     last_logits_;
 
     // Prefill prompt tokens in chunks, return absolute committed position.
@@ -92,14 +103,34 @@ private:
                                           int max_ctx,
                                           MoeHybridPlacement & out,
                                           std::string * err) const;
+    bool load_expert_split_placement(const char * hotness_path,
+                                     const DeepSeek4Weights & w,
+                                     int max_ctx,
+                                     MoeHybridPlacement & out,
+                                     std::string * err);
+    bool build_expert_split_state_from_hotness(const MoeHybridRoutingStats & hotness,
+                                               uint64_t expert_budget_bytes,
+                                               uint64_t hot_budget_bytes,
+                                               int max_hot_per_layer,
+                                               const std::vector<ExpertSplitTarget> & configured_targets,
+                                               const DeepSeek4Weights & w,
+                                               std::string * err);
+    std::unique_ptr<MoeExpertCompute> make_expert_split_local_target_compute(
+        const ExpertSplitComputeTargetRuntime & split_target,
+        std::string * err) const;
+    bool init_single_target_expert_runtime(std::string * err);
+    bool init_expert_split_runtime(std::string * err);
     void maybe_save_routing_stats();
 
     std::shared_ptr<MoeHybridStorage> moe_hybrid_;
     MoeHybridPlacement                moe_placement_;
-    MoeHybridStreamEngine             stream_engine_;
-    // Expert IPC removed — layer split replaces expert split.
-    // Kept for compilation compatibility; init_hybrid_model() is no longer called
-    // from the layer-split path.
+    ExpertSplitStateComponents        expert_split_state_;
+    MoeExpertComputeRuntime           expert_runtime_;
+    MoeMultiTargetExpertRuntime       expert_split_runtime_;
+    std::vector<uint64_t>             layer_expert_bytes_;
+    uint64_t                          expert_split_total_budget_bytes_ = 0;
+    uint64_t                          expert_split_hot_budget_bytes_ = 0;
+    int                               expert_split_cache_slots_ = 0;
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string                       routing_stats_out_path_;
 };
