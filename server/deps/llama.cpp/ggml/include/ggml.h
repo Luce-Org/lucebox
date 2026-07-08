@@ -430,7 +430,13 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_TQ3_0   = 42,  // TurboQuant 3.5 bpv (3-bit Lloyd-Max + FWHT rotation)
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_Q4_0_ROCMFP4      = 100,
+        GGML_TYPE_Q4_0_ROCMFP4_FAST = 101,
+        GGML_TYPE_Q6_0_ROCMFPX      = 102,
+        GGML_TYPE_Q8_0_ROCMFPX      = 103,
+        GGML_TYPE_Q3_0_ROCMFPX      = 104,
+        GGML_TYPE_Q2_0_ROCMFP2      = 107,
+        GGML_TYPE_COUNT   = 108,
     };
 
     // precision
@@ -468,6 +474,18 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4          = 100,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_LEAN     = 101,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_COHERENT = 102,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST     = 103,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST_COHERENT = 104,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX    = 105,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN = 106,
+        GGML_FTYPE_MOSTLY_Q6_0_ROCMFPX          = 110,
+        GGML_FTYPE_MOSTLY_Q8_0_ROCMFPX          = 111,
+        GGML_FTYPE_MOSTLY_Q3_0_ROCMFPX          = 112,
+        GGML_FTYPE_MOSTLY_Q2_0_ROCMFP2          = 118,
+        GGML_FTYPE_MOSTLY_Q2_0_ROCMFP2_STRIX    = 119,
     };
 
     // available tensor operations:
@@ -583,6 +601,8 @@ extern "C" {
 
         GGML_OP_MOE_FUSED,  // Fused MoE FFN: gate+up+swiglu+down+weighted_sum+shared_expert
 
+        GGML_OP_DS4_HC,  // Fused DeepSeek4 hyper-connection pre/post/out mixing
+
         GGML_OP_COUNT,
     };
 
@@ -618,6 +638,7 @@ extern "C" {
         GGML_GLU_OP_GEGLU,
         GGML_GLU_OP_SWIGLU,
         GGML_GLU_OP_SWIGLU_OAI,
+        GGML_GLU_OP_SWIGLU_DS4,
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
 
@@ -1338,6 +1359,12 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    GGML_API struct ggml_tensor * ggml_swiglu_ds4_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * up,
+            float                 clamp);
 
     GGML_API struct ggml_tensor * ggml_geglu_erf_split(
             struct ggml_context * ctx,
@@ -2398,6 +2425,37 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * experts,
             struct ggml_tensor  * expert_weights);
+
+    // Fused DeepSeek4 hyper-connection helpers (decode, n_tokens == 1).
+    // ggml_ds4_hc_pre: mix[2*n_hc+n_hc^2] + base + hc_state[n_embd*n_hc] ->
+    //   dst[n_embd + 2*n_hc + n_hc^2] = { working, split(pre,post,comb) }
+    GGML_API struct ggml_tensor * ggml_ds4_hc_pre(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mix,
+            struct ggml_tensor  * base,
+            struct ggml_tensor  * hc_state,
+            int                   n_hc,
+            int                   sinkhorn_iters,
+            float                 pre_scale,
+            float                 post_scale,
+            float                 comb_scale);
+
+    // ggml_ds4_hc_post: residual hc_state + block_out + split -> new hc_state
+    GGML_API struct ggml_tensor * ggml_ds4_hc_post(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * residual_hc,
+            struct ggml_tensor  * block_out,
+            struct ggml_tensor  * split,
+            int                   n_hc);
+
+    // ggml_ds4_hc_out: output-stage merge of hc streams into one embedding
+    GGML_API struct ggml_tensor * ggml_ds4_hc_out(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mix,
+            struct ggml_tensor  * base,
+            struct ggml_tensor  * hc_state,
+            int                   n_hc,
+            float                 pre_scale);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

@@ -1826,6 +1826,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 GGML_ABORT("GGML_OP_MOE_FUSED is only implemented for CUDA");
             }
+        case GGML_OP_DS4_HC:
+            {
+                GGML_ABORT("GGML_OP_DS4_HC is only implemented for CUDA");
+            }
         case GGML_OP_OUT_PROD:
             {
                 ggml_compute_forward_out_prod(params, tensor);

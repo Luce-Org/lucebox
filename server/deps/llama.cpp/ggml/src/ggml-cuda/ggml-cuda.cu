@@ -64,6 +64,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/moe-fused.cuh"
+#include "ggml-cuda/ds4-hc.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2368,7 +2369,12 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
-    static constexpr std::array<ggml_glu_op, 3> valid_glu_ops = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI };
+    static constexpr std::array<ggml_glu_op, 4> valid_glu_ops = {
+        GGML_GLU_OP_SWIGLU,
+        GGML_GLU_OP_GEGLU,
+        GGML_GLU_OP_SWIGLU_OAI,
+        GGML_GLU_OP_SWIGLU_DS4,
+    };
 
     if (std::find(valid_glu_ops.begin(), valid_glu_ops.end(), ggml_get_glu_op(glu)) == valid_glu_ops.end()) {
         return false;
@@ -2422,6 +2428,12 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
 
 
     return use_mul_mat_vec_f;
+}
+
+static inline void ggml_cuda_set_fusion_glu_params(ggml_cuda_mm_fusion_args_host & fusion_data, const ggml_tensor * glu) {
+    fusion_data.glu_op     = ggml_get_glu_op(glu);
+    fusion_data.glu_param0 = ggml_get_op_params_f32(glu, 2);
+    fusion_data.glu_param1 = ggml_get_op_params_f32(glu, 3);
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
@@ -2857,6 +2869,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 case GGML_GLU_OP_SWIGLU_OAI:
                     ggml_cuda_op_swiglu_oai(ctx, dst);
                     break;
+                case GGML_GLU_OP_SWIGLU_DS4:
+                    ggml_cuda_op_swiglu_ds4(ctx, dst);
+                    break;
                 case GGML_GLU_OP_GEGLU_ERF:
                     ggml_cuda_op_geglu_erf(ctx, dst);
                     break;
@@ -2875,6 +2890,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MOE_FUSED:
             ggml_cuda_op_moe_fused(ctx, dst);
+            break;
+        case GGML_OP_DS4_HC:
+            ggml_cuda_op_ds4_hc(ctx, dst);
             break;
         case GGML_OP_GROUP_NORM:
             ggml_cuda_op_group_norm(ctx, dst);
@@ -4086,7 +4104,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 fusion_data.gate      = gate_n->src[0];
                                 fusion_data.x_bias    = up_bias_tensor;
                                 fusion_data.gate_bias = gate_bias_tensor;
-                                fusion_data.glu_op    = ggml_get_glu_op(glu);
+                                ggml_cuda_set_fusion_glu_params(fusion_data, glu);
 
                                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                                 fused_mul_mat_vec = true;
@@ -4099,7 +4117,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 fusion_data.gate      = gate_n->src[0];
                                 fusion_data.x_bias    = up_bias_tensor;
                                 fusion_data.gate_bias = gate_bias_tensor;
-                                fusion_data.glu_op    = ggml_get_glu_op(glu);
+                                ggml_cuda_set_fusion_glu_params(fusion_data, glu);
 
                                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                                 fused_mul_mat_vec = true;
@@ -4123,7 +4141,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                                 ggml_cuda_mm_fusion_args_host fusion_data{};
                                 fusion_data.gate   = gate->src[0];
-                                fusion_data.glu_op = ggml_get_glu_op(glu);
+                                ggml_cuda_set_fusion_glu_params(fusion_data, glu);
 
                                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                                 fused_mul_mat_vec = true;
@@ -4134,7 +4152,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
                                 ggml_cuda_mm_fusion_args_host fusion_data{};
                                 fusion_data.gate   = gate->src[0];
-                                fusion_data.glu_op = ggml_get_glu_op(glu);
+                                ggml_cuda_set_fusion_glu_params(fusion_data, glu);
 
                                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                                 fused_mul_mat_vec = true;
@@ -5007,6 +5025,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 case GGML_GLU_OP_GEGLU:
                 case GGML_GLU_OP_SWIGLU:
                 case GGML_GLU_OP_SWIGLU_OAI:
+                case GGML_GLU_OP_SWIGLU_DS4:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
                     return ggml_is_contiguous_1(op->src[0]);
@@ -5019,6 +5038,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             // the kernel handles strided dim1/dim2 via separate src/dst strides.
             return op->src[0]->nb[0] == ggml_type_size(op->src[0]->type);
         case GGML_OP_MOE_FUSED:
+            return true;
+        case GGML_OP_DS4_HC:
             return true;
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
@@ -5065,6 +5086,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_NVFP4:
+                    case GGML_TYPE_Q4_0_ROCMFP4:
+                    case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+                    case GGML_TYPE_Q2_0_ROCMFP2:
+                    case GGML_TYPE_Q3_0_ROCMFPX:
+                    case GGML_TYPE_Q6_0_ROCMFPX:
+                    case GGML_TYPE_Q8_0_ROCMFPX:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_K:
@@ -5100,6 +5127,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q4_0_ROCMFP4:
+                    case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+                    case GGML_TYPE_Q2_0_ROCMFP2:
+                    case GGML_TYPE_Q3_0_ROCMFPX:
+                    case GGML_TYPE_Q6_0_ROCMFPX:
+                    case GGML_TYPE_Q8_0_ROCMFPX:
                     case GGML_TYPE_TQ3_0:
                         return true;
                     default:
@@ -5206,7 +5239,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CONCAT:
             {
                 ggml_type src0_type = op->src[0]->type;
-                return src0_type != GGML_TYPE_I32 && src0_type != GGML_TYPE_I16;
+                return src0_type == GGML_TYPE_F32  ||
+                       src0_type == GGML_TYPE_F16  ||
+                       src0_type == GGML_TYPE_BF16 ||
+                       src0_type == GGML_TYPE_I8;
             } break;
         case GGML_OP_CONV_TRANSPOSE_1D:
             {
