@@ -535,9 +535,26 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   int kv_offset) {
     // Hybrid currently implements HC for single-token steps only; keep prefill
     // token-by-token so the first sampled token is seeded from the correct HC state.
-    const int chunk = moe_hybrid_ ? 1 : (cfg_.chunk > 0 ? cfg_.chunk : 512);
+    //
+    // Chunked prefill (n_tokens > 1) is only exact while the whole prompt fits
+    // inside the raw SWA ring: the chunk graph writes ring slots pos % n_swa
+    // while attention reads the ring in the same graph, and the learned
+    // compressor only runs for the chunk's last token. Prompts beyond n_swa
+    // degrade into incoherence. Token-by-token prefill matches the reference
+    // semantics at any length; chunked stays available via
+    // DFLASH_DS4_CHUNKED_PREFILL=1 for short-prompt benchmarking only.
+    const bool unsafe_chunked = env_flag_enabled("DFLASH_DS4_CHUNKED_PREFILL");
+    const int chunk = (moe_hybrid_ || !unsafe_chunked) ? 1 : (cfg_.chunk > 0 ? cfg_.chunk : 512);
     const int n_total = (int)tokens.size();
     int pos = kv_offset;
+    // New sequence: clear the cache buffer so compressor state double-buffers
+    // and compressed-KV rows start from zeros, exactly like a fresh server.
+    // Without this, the first flush windows of a request pool over the
+    // previous request's leftover state rows and outputs from the 2nd/3rd
+    // request on can drift by a token or two.
+    if (kv_offset == 0 && cache_.buf) {
+        ggml_backend_buffer_clear(cache_.buf, 0);
+    }
     last_logits_.clear();
     const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
     const auto phase_t0 = Clock::now();
@@ -556,13 +573,26 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         DeepSeek4StepTelemetry step_tel;
         if (timing) step_tel.embed_us = elapsed_us(embed_t0, Clock::now());
 
-        // Run forward pass
+        // Run forward pass. The non-hybrid (all-hot) placement must use the
+        // HC-complete layer-range path; deepseek4_step's non-hybrid branch is
+        // an HC-less stub and produces garbage on this box.
         std::vector<float> logits;
-        if (!deepseek4_step(backend_, w_, cache_, embed.data(), n_tok, pos, logits,
-                            moe_hybrid_.get(), tokens.data() + i,
-                            moe_hybrid_ ? &stream_engine_ : nullptr,
-                            timing ? &step_tel : nullptr,
-                            routing_stats_.get())) {
+        bool ok = false;
+        if (moe_hybrid_) {
+            ok = deepseek4_step(backend_, w_, cache_, embed.data(), n_tok, pos, logits,
+                                moe_hybrid_.get(), tokens.data() + i,
+                                &stream_engine_,
+                                timing ? &step_tel : nullptr,
+                                routing_stats_.get());
+        } else {
+            std::vector<float> hc_state;
+            ok = deepseek4_step_layer_range(backend_, w_, cache_, hc_state,
+                                            embed.data(), n_tok, pos,
+                                            0, w_.n_layer, &logits,
+                                            tokens.data() + i,
+                                            timing ? &step_tel : nullptr);
+        }
+        if (!ok) {
             std::fprintf(stderr, "[deepseek4] prefill step failed at pos=%d\n", pos);
             return -1;
         }
@@ -619,12 +649,23 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             if (timing) step_tel.embed_us = elapsed_us(embed_t0, Clock::now());
 
             const int pos = std::max(0, committed + generated - 1);
-            if (!deepseek4_step(backend_, w_, cache_, embed.data(), 1,
-                                pos, logits,
-                                moe_hybrid_.get(), &tok_to_eval,
-                                moe_hybrid_ ? &stream_engine_ : nullptr,
-                                timing ? &step_tel : nullptr,
-                                routing_stats_.get())) {
+            bool ok = false;
+            if (moe_hybrid_) {
+                ok = deepseek4_step(backend_, w_, cache_, embed.data(), 1,
+                                    pos, logits,
+                                    moe_hybrid_.get(), &tok_to_eval,
+                                    &stream_engine_,
+                                    timing ? &step_tel : nullptr,
+                                    routing_stats_.get());
+            } else {
+                std::vector<float> hc_state;
+                ok = deepseek4_step_layer_range(backend_, w_, cache_, hc_state,
+                                                embed.data(), 1, pos,
+                                                0, w_.n_layer, &logits,
+                                                &tok_to_eval,
+                                                timing ? &step_tel : nullptr);
+            }
+            if (!ok) {
                 std::fprintf(stderr, "[deepseek4] decode step failed\n");
                 return false;
             }

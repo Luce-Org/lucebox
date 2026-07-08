@@ -64,6 +64,11 @@ struct DeepSeek4StepTelemetry {
     uint64_t output_us = 0;
     uint64_t sample_us = 0;
     uint64_t emit_us = 0;
+    uint64_t full_graph_build_us = 0;
+    uint64_t full_graph_alloc_us = 0;
+    uint64_t full_graph_set_us = 0;
+    uint64_t full_graph_compute_us = 0;
+    uint64_t full_graph_read_us = 0;
     int hot_selected = 0;
     int cold_selected = 0;
 };
@@ -330,7 +335,8 @@ bool deepseek4_step_layer_range(
     int                         layer_end,
     std::vector<float> *        out_logits,
     const int32_t *             token_ids = nullptr,
-    DeepSeek4StepTelemetry *    telemetry = nullptr);
+    DeepSeek4StepTelemetry *    telemetry = nullptr,
+    bool                        allow_decode_graph_reuse = true);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,

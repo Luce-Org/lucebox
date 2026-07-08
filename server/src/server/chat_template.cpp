@@ -327,6 +327,11 @@ std::string render_chat_template(
             system_content += msg.content;
             has_system = true;
         }
+        if (!has_system) {
+            system_content =
+                "You are a helpful assistant. Answer the user's question directly "
+                "and carefully. Do not change numbers or facts from the prompt.";
+        }
 
         result = "<｜begin▁of▁sentence｜>";
         if (has_tools) {
