@@ -538,6 +538,14 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     const int chunk = moe_hybrid_ ? 1 : (cfg_.chunk > 0 ? cfg_.chunk : 512);
     const int n_total = (int)tokens.size();
     int pos = kv_offset;
+    // New sequence: clear the cache buffer so compressor state double-buffers
+    // and compressed-KV rows start from zeros, exactly like a fresh server.
+    // Without this, the first flush windows of a request pool over the
+    // previous request's leftover state rows and outputs from the 2nd/3rd
+    // request on can drift by a token or two.
+    if (kv_offset == 0 && cache_.buf) {
+        ggml_backend_buffer_clear(cache_.buf, 0);
+    }
     last_logits_.clear();
     const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
     const auto phase_t0 = Clock::now();
