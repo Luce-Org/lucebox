@@ -2547,6 +2547,15 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
 
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state);
+
     GGML_API void ggml_gated_delta_net_set_skip_intermediate(
             struct ggml_tensor * tensor,
             bool                 skip_intermediate);
