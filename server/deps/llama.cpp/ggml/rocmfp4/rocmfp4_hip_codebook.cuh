@@ -9,6 +9,28 @@
 #define GGML_ROCMFP4_UNALIGNED_QS_DWORD_LOAD 1
 #endif
 
+#if !defined(GGML_USE_HIP)
+// Self-contained 16-entry table expander for the non-HIP fallback. This header
+// is pulled into translation units that do not include vecdotq.cuh (where the
+// generic get_int_from_table_16 lives) - e.g. fattn-chunked.cu - so relying on
+// that symbol breaks the CUDA build on include order. This is the generic
+// branch of get_int_from_table_16 verbatim, so results are bit-identical; only
+// the HIP path (Strix) uses __builtin_amdgcn_perm and never reaches here.
+static __device__ __forceinline__ int2 rocmfp4_table16_fallback(const int & q4, const int8_t * table) {
+    const int      q0_32  = (q4 >> 0) & 0x0F0F0F0F;
+    const int8_t * q0_8   = (const int8_t *) &q0_32;
+    const char4    val0_8 = make_char4(
+        table[q0_8[0]], table[q0_8[1]], table[q0_8[2]], table[q0_8[3]]);
+
+    const int      q1_32  = (q4 >> 4) & 0x0F0F0F0F;
+    const int8_t * q1_8   = (const int8_t *) &q1_32;
+    const char4    val1_8 = make_char4(
+        table[q1_8[0]], table[q1_8[1]], table[q1_8[2]], table[q1_8[3]]);
+
+    return make_int2(*((const int *) &val0_8), *((const int *) &val1_8));
+}
+#endif
+
 static __device__ __forceinline__ int rocmfp4_get_qs_i32(const void * x, const int & i32) {
 #if defined(GGML_USE_HIP) && GGML_ROCMFP4_UNALIGNED_QS_DWORD_LOAD
     return *((const int *) ((const uint8_t *) x + 4*i32));
@@ -52,7 +74,7 @@ static __device__ __forceinline__ int2 rocmfp4_get_int_from_codebook_16(const in
         __builtin_amdgcn_perm(v_even_high, v_even_low, mask_even),
         __builtin_amdgcn_perm(v_odd_high,  v_odd_low,  mask_odd));
 #else
-    return get_int_from_table_16(q4, fallback_table);
+    return rocmfp4_table16_fallback(q4, fallback_table);
 #endif
 }
 
@@ -74,6 +96,6 @@ static __device__ __forceinline__ int rocmfp4_get_low_int_from_codebook_16(const
 
     return __builtin_amdgcn_perm(v_high, v_low, mask);
 #else
-    return get_int_from_table_16(q4, fallback_table).x;
+    return rocmfp4_table16_fallback(q4, fallback_table).x;
 #endif
 }
