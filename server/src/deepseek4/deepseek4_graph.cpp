@@ -313,6 +313,11 @@ struct DeepSeek4AttentionGraphInputs {
     // [n_swa raw rows ++ padded comp rows]; 0 for valid, -1e30 for padding.
     ggml_tensor * attn_row_mask = nullptr;
     int           padded_comp = 0;   // padded compressed-row count (>= n_comp)
+    // Fused-decode stable-topology compressor: i64[4] target rows for the
+    // ratio-4 state double-buffer flush copy. [0..3] on flush steps (cur ->
+    // prev), [4..7] otherwise (self-write no-op). Null = legacy build-time
+    // flush branch.
+    ggml_tensor * flush_rows = nullptr;
 };
 
 struct DeepSeek4CachedDecodeAttnGraph {
@@ -670,7 +675,8 @@ static void build_compressor_step(
         ggml_tensor * comp_pos_inp,
         std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs,
         std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs,
-        ggml_tensor ** comp_cache_source_out = nullptr) {
+        ggml_tensor ** comp_cache_source_out = nullptr,
+        ggml_tensor * flush_rows_inp = nullptr) {
     if (!gf || !cur_last || !ape || !kv_proj || !gate_proj || !norm_weight ||
         !state.state_kv || !state.state_score || !comp_cache || ratio <= 0) {
         return;
@@ -716,7 +722,10 @@ static void build_compressor_step(
         ggml_build_forward_expand(gf, ggml_cpy(ctx, sc_cur, sc_slot));
     }
 
-    if (((token_pos + 1) % ratio) != 0) {
+    if (!flush_rows_inp && ((token_pos + 1) % ratio) != 0) {
+        // Legacy per-layer graphs only pool at flush boundaries. The fused
+        // stable-topology graph (flush_rows_inp set) pools every step; the
+        // partial result lands on the masked running comp row.
         return;
     }
 
@@ -805,7 +814,20 @@ static void build_compressor_step(
         *comp_cache_source_out = comp_cache_source;
     }
 
-    if (ratio == 4) {
+    if (ratio == 4 && flush_rows_inp) {
+        // Stable-topology flush: copy the cur half onto rows given by the
+        // input (prev half [0..3] at flush, cur half itself [4..7] = no-op
+        // otherwise). Values are read through the set_rows source so this
+        // step's state write is ordered first.
+        ggml_tensor * cur_kv_vals = ggml_cont(ctx, ggml_view_2d(
+            ctx, state_kv_source, comp_width, ratio, state_kv_source->nb[1],
+            (size_t) ratio * state_kv_source->nb[1]));
+        ggml_tensor * cur_sc_vals = ggml_cont(ctx, ggml_view_2d(
+            ctx, state_score_source, comp_width, ratio, state_score_source->nb[1],
+            (size_t) ratio * state_score_source->nb[1]));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, state.state_kv, cur_kv_vals, flush_rows_inp));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, state.state_score, cur_sc_vals, flush_rows_inp));
+    } else if (ratio == 4) {
         for (int r = 0; r < ratio; ++r) {
             ggml_tensor * src_kv = ggml_view_2d(ctx, state.state_kv, comp_width, 1,
                                                 state.state_kv->nb[1],
@@ -846,7 +868,8 @@ static void build_indexer_compressor_step(
         ggml_tensor * comp_rows_inp,
         ggml_tensor * comp_pos_inp,
         std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs,
-        std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs) {
+        std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs,
+        ggml_tensor * flush_rows_inp = nullptr) {
     build_compressor_step(ctx, gf, cur_last,
                           L.indexer_compressor_ape,
                           L.indexer_compressor_kv,
@@ -869,7 +892,9 @@ static void build_indexer_compressor_step(
                           comp_rows_inp,
                           comp_pos_inp,
                           i64_array_inputs,
-                          i32_array_inputs);
+                          i32_array_inputs,
+                          nullptr,
+                          flush_rows_inp);
 }
 
 static int ds4_comp_rows_used(const ggml_tensor * comp_cache, int n_cached, int ratio, int token_pos) {
@@ -1101,7 +1126,8 @@ static ggml_tensor * build_mla_attention(
                               cached_inputs ? cached_inputs->attn_comp_pos : nullptr,
                               i64_array_inputs,
                               i32_array_inputs,
-                              &comp_kv_source);
+                              &comp_kv_source,
+                              cached_inputs ? cached_inputs->flush_rows : nullptr);
     }
 
     if (ratio == 4 && L.indexer_compressor_kv) {
@@ -1111,7 +1137,8 @@ static ggml_tensor * build_mla_attention(
                                       cached_inputs ? cached_inputs->index_comp_rows : nullptr,
                                       cached_inputs ? cached_inputs->index_comp_pos : nullptr,
                                       i64_array_inputs,
-                                      i32_array_inputs);
+                                      i32_array_inputs,
+                                      cached_inputs ? cached_inputs->flush_rows : nullptr);
         (void)build_indexer_score(ctx, qr_last, cur_last, w, L, lc, token_pos, i32_inputs);
     }
 
@@ -3549,6 +3576,18 @@ bool deepseek4_step(
 // while a variant recurs, which is what the ggml-cuda/HIP graph cache keys
 // on, enabling graph replay for the bulk of decode steps.
 
+// Opt-in refinement of the fused graph: one topology for flush and non-flush
+// steps (pooling every step + input-redirected state flush). Needed for
+// CUDA/HIP graph replay experiments; costs ~3% decode speed, and HIP graph
+// replay is a net loss on gfx1151 anyway, so default OFF.
+static bool ds4_fused_stable_graph_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = ds4_env_flag("DFLASH_DS4_FUSED_STABLE_GRAPH") ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
 // Opt-in: single-graph decode with GPU hyper-connections. Deterministic and
 // near-bit-identical, but expf ULP differences in the sinkhorn iterations can
 // diverge from the CPU-HC reference after tens of tokens. Default OFF.
@@ -3568,6 +3607,7 @@ struct DeepSeek4FusedDecodeGraph {
     ggml_tensor * i32_bundle = nullptr;
     ggml_tensor * i64_bundle = nullptr;
     ggml_tensor * mask_bundle = nullptr;   // additive score mask (0 / -1e30), may be null
+    ggml_tensor * flush_rows = nullptr;    // i64[4]: [0..3] on flush steps, [4..7] otherwise
     std::vector<ggml_tensor *> hash_ids;
     ggml_tensor * logits = nullptr;
 
@@ -3576,6 +3616,7 @@ struct DeepSeek4FusedDecodeGraph {
         i32_bundle = nullptr;
         i64_bundle = nullptr;
         mask_bundle = nullptr;
+        flush_rows = nullptr;
         logits = nullptr;
         hash_ids.clear();
         shape_key.clear();
@@ -3790,21 +3831,27 @@ static bool ds4_build_fused_decode_graph(
     ggml_set_input(fg.i32_bundle);
     fg.i64_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 5 * (int64_t) w.n_layer);
     ggml_set_input(fg.i64_bundle);
+    if (ds4_fused_stable_graph_enabled()) {
+        fg.flush_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 4);
+        ggml_set_input(fg.flush_rows);
+    }
 
-    // One additive score-mask bundle for all padded compressed-KV segments.
+    // One additive score-mask bundle covering EVERY layer: [n_swa raw rows ++
+    // padded comp rows]. All layers take the masked full-ring attention branch
+    // so the graph topology never depends on the live raw-row count.
     int64_t mask_total = 0;
     for (int il = 0; il < w.n_layer; ++il) {
         const int ratio = (int) w.compress_ratios[il];
-        if (ratio <= 0 || !cache.layers[(size_t) il].comp_kv) continue;
-        const int n_comp = ds4_comp_rows_used(cache.layers[(size_t) il].comp_kv,
-                                              cache.layers[(size_t) il].n_comp, ratio, token_pos);
-        const int padded = ds4_padded_comp_rows(n_comp, (int) cache.layers[(size_t) il].comp_kv->ne[1]);
-        if (padded > 0) mask_total += w.n_swa + padded;
+        int padded = 0;
+        if (ratio > 0 && cache.layers[(size_t) il].comp_kv) {
+            const int n_comp = ds4_comp_rows_used(cache.layers[(size_t) il].comp_kv,
+                                                  cache.layers[(size_t) il].n_comp, ratio, token_pos);
+            padded = ds4_padded_comp_rows(n_comp, (int) cache.layers[(size_t) il].comp_kv->ne[1]);
+        }
+        mask_total += w.n_swa + padded;
     }
-    if (mask_total > 0) {
-        fg.mask_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, mask_total);
-        ggml_set_input(fg.mask_bundle);
-    }
+    fg.mask_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, mask_total);
+    ggml_set_input(fg.mask_bundle);
     int64_t mask_off = 0;
 
     // hc state starts as the token embedding replicated into every stream
@@ -3827,6 +3874,7 @@ static bool ds4_build_fused_decode_graph(
 
         // ── Attention (inputs are views into the shared bundles) ──
         DeepSeek4AttentionGraphInputs ain{};
+        ain.flush_rows = ds4_fused_stable_graph_enabled() ? fg.flush_rows : nullptr;
         ain.rope_pos = ggml_view_1d(ctx, fg.i32_bundle, 1, ((size_t) il * 6 + 0) * sizeof(int32_t));
         ain.neg_pos  = ggml_view_1d(ctx, fg.i32_bundle, 1, ((size_t) il * 6 + 1) * sizeof(int32_t));
         ain.raw_kv_rows = ggml_view_2d(ctx, fg.i64_bundle, 1, 1, sizeof(int64_t),
@@ -3847,17 +3895,18 @@ static bool ds4_build_fused_decode_graph(
             ain.index_comp_rows = ggml_view_2d(ctx, fg.i64_bundle, 1, 1, sizeof(int64_t),
                                                ((size_t) il * 5 + 4) * sizeof(int64_t));
         }
-        if (fg.mask_bundle && ratio > 0 && lc.comp_kv) {
-            const int n_comp = ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos);
-            const int padded = ds4_padded_comp_rows(n_comp, (int) lc.comp_kv->ne[1]);
-            if (padded > 0) {
-                const int64_t n_attn = (int64_t) w.n_swa + padded;
-                ain.attn_row_mask = ggml_view_2d(ctx, fg.mask_bundle, n_attn, 1,
-                                                 n_attn * sizeof(float),
-                                                 (size_t) mask_off * sizeof(float));
-                ain.padded_comp = padded;
-                mask_off += n_attn;
+        {
+            int padded = 0;
+            if (ratio > 0 && lc.comp_kv) {
+                const int n_comp = ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos);
+                padded = ds4_padded_comp_rows(n_comp, (int) lc.comp_kv->ne[1]);
             }
+            const int64_t n_attn = (int64_t) w.n_swa + padded;
+            ain.attn_row_mask = ggml_view_2d(ctx, fg.mask_bundle, n_attn, 1,
+                                             n_attn * sizeof(float),
+                                             (size_t) mask_off * sizeof(float));
+            ain.padded_comp = padded;
+            mask_off += n_attn;
         }
 
         std::vector<DeepSeek4I32InputBinding> i32b;
@@ -3995,9 +4044,12 @@ static int ds4_try_fused_decode_step(
             const int n_comp = ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos);
             padded = ds4_padded_comp_rows(n_comp, (int) lc.comp_kv->ne[1]);
         }
-        const bool attn_flush = ratio > 0 && (((token_pos + 1) % ratio) == 0);
-        const bool index_flush = ratio == 4 && (((token_pos + 1) % ratio) == 0);
-        key.push_back(((int64_t) padded << 2) | (attn_flush ? 2 : 0) | (index_flush ? 1 : 0));
+        if (ds4_fused_stable_graph_enabled()) {
+            key.push_back((int64_t) padded);
+        } else {
+            const bool flush = ratio > 0 && (((token_pos + 1) % ratio) == 0);
+            key.push_back(((int64_t) padded << 1) | (flush ? 1 : 0));
+        }
     }
 
     // Pick the slot whose shape key matches; otherwise rebuild the LRU slot.
@@ -4063,18 +4115,24 @@ static int ds4_try_fused_decode_step(
     }
     ggml_backend_tensor_set(fg->i32_bundle, i32v.data(), 0, sizeof(int32_t) * i32v.size());
     ggml_backend_tensor_set(fg->i64_bundle, i64v.data(), 0, sizeof(int64_t) * i64v.size());
+    if (fg->flush_rows) {
+        const bool flush4 = ((token_pos + 1) % 4) == 0;
+        const int64_t fr[4] = {flush4 ? 0 : 4, flush4 ? 1 : 5, flush4 ? 2 : 6, flush4 ? 3 : 7};
+        ggml_backend_tensor_set(fg->flush_rows, fr, 0, sizeof(fr));
+    }
 
     if (fg->mask_bundle) {
         std::vector<float> maskv((size_t) ggml_nelements(fg->mask_bundle), 0.0f);
         size_t off = 0;
+        const int n_valid_raw = std::min(kv_start + 1, w.n_swa);
         for (int il = 0; il < w.n_layer; ++il) {
             const int ratio = (int) w.compress_ratios[il];
             DeepSeek4LayerCache & lc = cache.layers[(size_t) il];
-            if (ratio <= 0 || !lc.comp_kv) continue;
-            const int n_comp = ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos);
-            const int padded = ds4_padded_comp_rows(n_comp, (int) lc.comp_kv->ne[1]);
-            if (padded <= 0) continue;
-            const int n_valid_raw = std::min(kv_start + 1, w.n_swa);
+            int n_comp = 0, padded = 0;
+            if (ratio > 0 && lc.comp_kv) {
+                n_comp = ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos);
+                padded = ds4_padded_comp_rows(n_comp, (int) lc.comp_kv->ne[1]);
+            }
             for (int j = n_valid_raw; j < w.n_swa; ++j) {
                 maskv[off + (size_t) j] = -1.0e30f;
             }
@@ -4239,6 +4297,7 @@ bool deepseek4_step_layer_range(
     static thread_local DeepSeek4LayerRangeScratch scratch;
     scratch.ensure(w.ctx, n_tokens, n_embd, n_hc, w.n_expert_used);
 
+    std::vector<float> fused_debug_logits;
     if (n_tokens == 1 && allow_decode_graph_reuse && layer_begin == 0 && is_last_shard &&
         out_logits && ds4_backend_is_gpu(backend) && ds4_fused_decode_enabled()) {
         const int rc = ds4_try_fused_decode_step(
@@ -4246,7 +4305,11 @@ bool deepseek4_step_layer_range(
             hc_output_weights_range, hash_routing_tables_range, scratch.hash_expert_ids,
             embed, kv_start, *out_logits, token_ids, telemetry);
         if (rc < 0) return false;
-        if (rc > 0) {
+        if (rc > 0 && ds4_env_flag("DFLASH_DS4_FUSED_DEBUG")) {
+            // Debug: keep the fused logits, then fall through and run the
+            // per-layer reference for the same token; compare at the end.
+            fused_debug_logits = *out_logits;
+        } else if (rc > 0) {
             const int np = kv_start + 1;
             for (int il = layer_begin; il < layer_end; ++il) {
                 const uint32_t ratio = w.compress_ratios[il];
@@ -4841,6 +4904,22 @@ bool deepseek4_step_layer_range(
     }
 
     cache.cur_pos = next_pos;
+    if (!fused_debug_logits.empty() && out_logits && !out_logits->empty()) {
+        const std::vector<float> & ref = *out_logits;
+        size_t n = std::min(ref.size(), fused_debug_logits.size());
+        float maxd = 0.0f; size_t maxi = 0;
+        size_t aref = 0, afus = 0;
+        for (size_t i = 1; i < n; ++i) {
+            if (ref[i] > ref[aref]) aref = i;
+            if (fused_debug_logits[i] > fused_debug_logits[afus]) afus = i;
+            const float d = std::fabs(ref[i] - fused_debug_logits[i]);
+            if (d > maxd) { maxd = d; maxi = i; }
+        }
+        std::fprintf(stderr,
+                     "[ds4-fused-dbg] pos=%d argmax ref=%zu(%.4f) fused=%zu(%.4f) %s maxdiff=%.6f@%zu\n",
+                     kv_start, aref, ref[aref], afus, fused_debug_logits[afus],
+                     aref == afus ? "SAME" : "DIFF", maxd, maxi);
+    }
     if (telemetry) telemetry->total_us += ds4_elapsed_us(step_t0, Ds4TimingClock::now());
     return true;
 }
