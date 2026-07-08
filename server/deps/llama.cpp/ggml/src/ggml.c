@@ -9,6 +9,8 @@
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
+#include "../rocmfp4/rocmfp4.h"
+#include "../rocmfpx/rocmfpx.h"
 
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
@@ -719,6 +721,54 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q8_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q8_0_ref,
     },
+    [GGML_TYPE_Q4_0_ROCMFP4] = {
+        .type_name                = "q4_0_rocmfp4",
+        .blck_size                = QK_ROCMFP4,
+        .type_size                = sizeof(block_rocmfp4),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfp4_dequantize_row_q4_0,
+        .from_float_ref           = (ggml_from_float_t) rocmfp4_quantize_row_q4_0_ref,
+    },
+    [GGML_TYPE_Q4_0_ROCMFP4_FAST] = {
+        .type_name                = "q4_0_rocmfp4_fast",
+        .blck_size                = QK_ROCMFP4,
+        .type_size                = sizeof(block_rocmfp4_fast),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfp4_dequantize_row_q4_0_fast,
+        .from_float_ref           = (ggml_from_float_t) rocmfp4_quantize_row_q4_0_fast_ref,
+    },
+    [GGML_TYPE_Q3_0_ROCMFPX] = {
+        .type_name                = "q3_0_rocmfpx",
+        .blck_size                = QK_ROCMFP3,
+        .type_size                = sizeof(block_rocmfp3),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp3,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp3_ref,
+    },
+    [GGML_TYPE_Q2_0_ROCMFP2] = {
+        .type_name                = "q2_0_rocmfp2",
+        .blck_size                = QK_ROCMFP2,
+        .type_size                = sizeof(block_rocmfp2),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp2,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp2_ref,
+    },
+    [GGML_TYPE_Q6_0_ROCMFPX] = {
+        .type_name                = "q6_0_rocmfpx",
+        .blck_size                = QK_ROCMFP6,
+        .type_size                = sizeof(block_rocmfp6),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp6,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp6_ref,
+    },
+    [GGML_TYPE_Q8_0_ROCMFPX] = {
+        .type_name                = "q8_0_rocmfpx",
+        .blck_size                = QK_ROCMFP8,
+        .type_size                = sizeof(block_rocmfp8),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp8,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp8_ref,
+    },
     [GGML_TYPE_Q8_1] = {
         .type_name                = "q8_1",
         .blck_size                = QK8_1,
@@ -1074,9 +1124,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "TURBO_WHT",
+
+    "MOE_FUSED",
+
+    "DS4_HC",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1187,9 +1241,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "turbo_wht(a)",
+
+    "moe_fused(x)",
+
+    "ds4_hc(x)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1225,11 +1283,12 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "GEGLU",
     "SWIGLU",
     "SWIGLU_OAI",
+    "SWIGLU_DS4",
     "GEGLU_ERF",
     "GEGLU_QUICK",
 };
 
-static_assert(GGML_GLU_OP_COUNT == 6, "GGML_GLU_OP_COUNT != 6");
+static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
 
 
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
@@ -1428,6 +1487,20 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_IQ2_S:         wtype = GGML_TYPE_IQ2_S;    break;
         case GGML_FTYPE_UNKNOWN:              wtype = GGML_TYPE_COUNT; break;
         case GGML_FTYPE_MOSTLY_Q4_1_SOME_F16: wtype = GGML_TYPE_COUNT; break;
+        // ROCmFPX presets are mixed-quant recipes (see ggml/rocmfp4/README.md);
+        // report the dominant transformer-tensor type.
+        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4:
+        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_LEAN:
+        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_COHERENT:        wtype = GGML_TYPE_Q4_0_ROCMFP4;      break;
+        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST:
+        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST_COHERENT:
+        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX:
+        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN:      wtype = GGML_TYPE_Q4_0_ROCMFP4_FAST; break;
+        case GGML_FTYPE_MOSTLY_Q6_0_ROCMFPX:                 wtype = GGML_TYPE_Q6_0_ROCMFPX;      break;
+        case GGML_FTYPE_MOSTLY_Q8_0_ROCMFPX:                 wtype = GGML_TYPE_Q8_0_ROCMFPX;      break;
+        case GGML_FTYPE_MOSTLY_Q3_0_ROCMFPX:                 wtype = GGML_TYPE_Q3_0_ROCMFPX;      break;
+        case GGML_FTYPE_MOSTLY_Q2_0_ROCMFP2:
+        case GGML_FTYPE_MOSTLY_Q2_0_ROCMFP2_STRIX:           wtype = GGML_TYPE_Q2_0_ROCMFP2;      break;
     }
 
     GGML_ASSERT(wtype != GGML_TYPE_COUNT);
@@ -3023,6 +3096,16 @@ struct ggml_tensor * ggml_swiglu_split(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b) {
     return ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SWIGLU, false);
+}
+
+struct ggml_tensor * ggml_swiglu_ds4_split(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * up,
+        float                 clamp) {
+    struct ggml_tensor * result = ggml_glu_impl(ctx, gate, up, GGML_GLU_OP_SWIGLU_DS4, false);
+    ggml_set_op_params_f32(result, 2, clamp);
+    return result;
 }
 
 // ggml_geglu_erf
@@ -7989,5 +8072,95 @@ struct ggml_tensor * ggml_laguna_moe_combine(
     ggml_set_op_params_i32(result, 2, (int32_t) experts->ne[1]);
     ggml_set_op_params_i32(result, 3, (int32_t) experts->ne[2]);
 
+    return result;
+}
+
+struct ggml_tensor * ggml_ds4_hc_pre(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mix,
+        struct ggml_tensor  * base,
+        struct ggml_tensor  * hc_state,
+        int                   n_hc,
+        int                   sinkhorn_iters,
+        float                 pre_scale,
+        float                 post_scale,
+        float                 comb_scale) {
+    GGML_ASSERT(mix->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type == GGML_TYPE_F32);
+    GGML_ASSERT(hc_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_hc > 0 && n_hc <= 8);
+    const int64_t mix_dim = 2*(int64_t)n_hc + (int64_t)n_hc*n_hc;
+    GGML_ASSERT(ggml_nelements(mix) == mix_dim);
+    GGML_ASSERT(ggml_nelements(base) >= mix_dim);
+    GGML_ASSERT(ggml_nelements(hc_state) % n_hc == 0);
+    const int64_t n_embd = ggml_nelements(hc_state) / n_hc;
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd + mix_dim);
+    result->op = GGML_OP_DS4_HC;
+    result->src[0] = mix;
+    result->src[1] = base;
+    result->src[2] = hc_state;
+    ggml_set_op_params_i32(result, 0, 0);
+    ggml_set_op_params_i32(result, 1, (int32_t) n_embd);
+    ggml_set_op_params_i32(result, 2, (int32_t) n_hc);
+    ggml_set_op_params_i32(result, 3, (int32_t) sinkhorn_iters);
+    ggml_set_op_params_f32(result, 4, pre_scale);
+    ggml_set_op_params_f32(result, 5, post_scale);
+    ggml_set_op_params_f32(result, 6, comb_scale);
+    return result;
+}
+
+struct ggml_tensor * ggml_ds4_hc_post(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * residual_hc,
+        struct ggml_tensor  * block_out,
+        struct ggml_tensor  * split,
+        int                   n_hc) {
+    GGML_ASSERT(residual_hc->type == GGML_TYPE_F32);
+    GGML_ASSERT(block_out->type == GGML_TYPE_F32);
+    GGML_ASSERT(split->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_hc > 0 && n_hc <= 8);
+    const int64_t mix_dim = 2*(int64_t)n_hc + (int64_t)n_hc*n_hc;
+    GGML_ASSERT(ggml_nelements(split) == mix_dim);
+    GGML_ASSERT(ggml_nelements(residual_hc) % n_hc == 0);
+    const int64_t n_embd = ggml_nelements(residual_hc) / n_hc;
+    GGML_ASSERT(ggml_nelements(block_out) == n_embd);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) n_embd * n_hc);
+    result->op = GGML_OP_DS4_HC;
+    result->src[0] = residual_hc;
+    result->src[1] = block_out;
+    result->src[2] = split;
+    ggml_set_op_params_i32(result, 0, 1);
+    ggml_set_op_params_i32(result, 1, (int32_t) n_embd);
+    ggml_set_op_params_i32(result, 2, (int32_t) n_hc);
+    return result;
+}
+
+struct ggml_tensor * ggml_ds4_hc_out(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mix,
+        struct ggml_tensor  * base,
+        struct ggml_tensor  * hc_state,
+        int                   n_hc,
+        float                 pre_scale) {
+    GGML_ASSERT(mix->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type == GGML_TYPE_F32);
+    GGML_ASSERT(hc_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_hc > 0 && n_hc <= 8);
+    GGML_ASSERT(ggml_nelements(mix) >= n_hc);
+    GGML_ASSERT(ggml_nelements(base) >= n_hc);
+    GGML_ASSERT(ggml_nelements(hc_state) % n_hc == 0);
+    const int64_t n_embd = ggml_nelements(hc_state) / n_hc;
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+    result->op = GGML_OP_DS4_HC;
+    result->src[0] = mix;
+    result->src[1] = base;
+    result->src[2] = hc_state;
+    ggml_set_op_params_i32(result, 0, 2);
+    ggml_set_op_params_i32(result, 1, (int32_t) n_embd);
+    ggml_set_op_params_i32(result, 2, (int32_t) n_hc);
+    ggml_set_op_params_f32(result, 4, pre_scale);
     return result;
 }

@@ -3271,6 +3271,80 @@ static void ggml_compute_forward_swiglu(
     }
 }
 
+// ggml_compute_forward_swiglu_ds4
+
+static void ggml_compute_forward_swiglu_ds4_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    char * src0_d = (char *) src0->data;
+    char * src1_d = (char *) (src1 ? src1->data : src0->data);
+    const size_t src0_o = src0->nb[1];
+    const size_t src1_o = src1 ? src1->nb[1] : src0->nb[1];
+
+    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    GGML_ASSERT(ggml_is_contiguous_1(dst));
+    GGML_ASSERT(src1);
+    GGML_ASSERT(ggml_is_contiguous_1(src1));
+    GGML_ASSERT(src0->type == src1->type);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc = src0->ne[0];
+    const int nr = ggml_nrows(src0);
+
+    GGML_ASSERT(dst->ne[0] == nc);
+    GGML_ASSERT(ggml_nrows(dst) == nr);
+
+    const float clamp = ggml_get_op_params_f32(dst, 2);
+
+    const int dr = (nr + nth - 1)/nth;
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int i1 = ir0; i1 < ir1; i1++) {
+        float * gate_p = (float *) (src0_d + i1*src0_o);
+        float * up_p   = (float *) (src1_d + i1*src1_o);
+        float * dst_p  = (float *) ((char *) dst->data + i1*(dst->nb[1]));
+
+        for (int k = 0; k < nc; k++) {
+            const float gate = std::min(gate_p[k], clamp);
+            const float up   = std::clamp(up_p[k], -clamp, clamp);
+            dst_p[k] = up * gate / (1.f + expf(-gate));
+        }
+
+#ifndef NDEBUG
+        for (int k = 0; k < nc; k++) {
+            const float x = dst_p[k];
+            GGML_UNUSED(x);
+            assert(!isnan(x));
+            assert(!isinf(x));
+        }
+#endif // NDEBUG
+    }
+}
+
+static void ggml_compute_forward_swiglu_ds4(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_swiglu_ds4_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_swiglu_oai
 
 static void ggml_compute_forward_swiglu_oai_f32(
@@ -9800,6 +9874,10 @@ void ggml_compute_forward_glu(
         case GGML_GLU_OP_SWIGLU_OAI:
             {
                 ggml_compute_forward_swiglu_oai(params, dst);
+            } break;
+        case GGML_GLU_OP_SWIGLU_DS4:
+            {
+                ggml_compute_forward_swiglu_ds4(params, dst);
             } break;
         case GGML_GLU_OP_GEGLU_ERF:
             {

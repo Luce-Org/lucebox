@@ -51,6 +51,8 @@ static __global__ void mul_mat_vec_f(
     bool use_bias = false;
     bool use_gate_bias = false;
     ggml_glu_op glu_op = ggml_glu_op::GGML_GLU_OP_SWIGLU;
+    float glu_param0 = 0.0f;
+    float glu_param1 = 0.0f;
     const T * gate_x = nullptr;
     const float * x_bias = nullptr;
     const float * gate_bias = nullptr;
@@ -60,6 +62,8 @@ static __global__ void mul_mat_vec_f(
         use_bias = fusion.x_bias != nullptr;
         use_gate_bias = fusion.gate_bias != nullptr;
         glu_op = fusion.glu_op;
+        glu_param0 = fusion.glu_param0;
+        glu_param1 = fusion.glu_param1;
 
         if (use_gate) {
             gate_x = static_cast<const T *>(fusion.gate);
@@ -357,7 +361,11 @@ static __global__ void mul_mat_vec_f(
                     value *= ggml_cuda_op_gelu_single(gate_value);
                     break;
                 case GGML_GLU_OP_SWIGLU_OAI: {
-                    value = ggml_cuda_op_swiglu_oai_single(gate_value, value);
+                    value = ggml_cuda_op_swiglu_oai_single(gate_value, value, glu_param0, glu_param1);
+                    break;
+                }
+                case GGML_GLU_OP_SWIGLU_DS4: {
+                    value = ggml_cuda_op_swiglu_ds4_single(gate_value, value, glu_param0);
                     break;
                 }
                 default:
@@ -369,7 +377,7 @@ static __global__ void mul_mat_vec_f(
     dst[tid*stride_col_dst + row] = value;
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, gate_x, x_bias, gate_bias, sumf_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, glu_param0, glu_param1, gate_x, x_bias, gate_bias, sumf_gate);
     }
 }
 
@@ -668,6 +676,8 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             fusion_local.gate_bias = fusion->gate_bias->data;
         }
         fusion_local.glu_op = fusion->glu_op;
+        fusion_local.glu_param0 = fusion->glu_param0;
+        fusion_local.glu_param1 = fusion->glu_param1;
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;

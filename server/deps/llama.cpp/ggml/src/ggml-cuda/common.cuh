@@ -19,6 +19,8 @@
 #endif
 #endif
 #include "ggml-common.h"
+#include "../../rocmfp4/rocmfp4.h"
+#include "../../rocmfpx/rocmfpx.h"
 
 #include <array>
 #include <algorithm>
@@ -28,6 +30,26 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#ifndef GGML_ROCMFP6_EXPANDED_DEVICE
+#define GGML_ROCMFP6_EXPANDED_DEVICE 0
+#endif
+
+// Optional device-only ROCmFP6 layout. GGUF/CPU storage remains the packed
+// block_rocmfp6 layout; experimental ROCm builds may expand qs to signed
+// bytes to avoid bit unpacking in hot matmul/FA kernels.
+struct block_rocmfp6_expanded {
+    int8_t  qs[QK_ROCMFP6];
+    uint8_t e[2];
+};
+
+static_assert(sizeof(block_rocmfp6_expanded) == QK_ROCMFP6 + 2*sizeof(uint8_t), "wrong expanded rocmfp6 block size/padding");
+
+#if GGML_ROCMFP6_EXPANDED_DEVICE
+using block_rocmfp6_device = block_rocmfp6_expanded;
+#else
+using block_rocmfp6_device = block_rocmfp6;
+#endif
 
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
@@ -960,6 +982,48 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q8_0> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_ROCMFP4> {
+    static constexpr int qk = QK_ROCMFP4;
+    static constexpr int qr = QR_ROCMFP4;
+    static constexpr int qi = QI_ROCMFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_ROCMFP4_FAST> {
+    static constexpr int qk = QK_ROCMFP4;
+    static constexpr int qr = QR_ROCMFP4;
+    static constexpr int qi = QI_ROCMFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q2_0_ROCMFP2> {
+    static constexpr int qk = QK_ROCMFP2;
+    static constexpr int qr = QR_ROCMFP2;
+    static constexpr int qi = QI_ROCMFP2;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q3_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP3;
+    static constexpr int qr = QR_ROCMFP3;
+    static constexpr int qi = QI_ROCMFP3;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q6_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP6;
+    static constexpr int qr = QR_ROCMFP6;
+    static constexpr int qi = QI_ROCMFP6;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q8_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP8;
+    static constexpr int qr = QR_ROCMFP8;
+    static constexpr int qi = QI_ROCMFP8;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int qk = QK_MXFP4;
     static constexpr int qr = QR_MXFP4;
@@ -1466,10 +1530,14 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate = nullptr;
     const ggml_tensor * gate_bias = nullptr;
     ggml_glu_op glu_op;
+    float glu_param0 = 0.0f;
+    float glu_param1 = 0.0f;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
     const void * gate = nullptr;
     const void * gate_bias = nullptr;
     ggml_glu_op glu_op;
+    float glu_param0 = 0.0f;
+    float glu_param1 = 0.0f;
 };
