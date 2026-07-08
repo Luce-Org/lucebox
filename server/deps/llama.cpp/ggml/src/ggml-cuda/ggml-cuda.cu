@@ -4309,6 +4309,14 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+static thread_local bool ggml_cuda_skip_props_check = false;
+
+extern "C" void ggml_cuda_set_skip_props_check(bool skip);
+
+extern "C" void ggml_cuda_set_skip_props_check(bool skip) {
+    ggml_cuda_skip_props_check = skip;
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -4332,7 +4340,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            const bool can_skip_props_check = ggml_cuda_skip_props_check
+                                           && graph->warmup_complete
+                                           && graph->instance != nullptr;
+            const bool properties_changed = can_skip_props_check
+                                          ? false
+                                          : ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
