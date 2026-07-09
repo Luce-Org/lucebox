@@ -337,6 +337,7 @@ add_library(dflash_common STATIC
     src/qwen35/qwen35_backend.cpp
     src/qwen35/qwen35_tensor_parallel.cpp
     src/qwen35/qwen35_layer_split_adapter.cpp
+    src/qwen35/qwen35_layer_split_vision.cpp
     src/qwen35/qwen35_dflash_target.cpp
     src/qwen35/qwen35_layer_split_dflash_target.cpp
     src/qwen35/layer_split_daemon_loop.cpp
