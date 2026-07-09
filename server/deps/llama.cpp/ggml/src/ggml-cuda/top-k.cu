@@ -686,6 +686,23 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
                                  cudaMemcpyDeviceToDevice, stream));
 #else                             // GGML_CUDA_USE_CUB
+    // ncols > 1024 exceeds the single-block bitonic cap (1024 threads/block).
+    // Route it through the device-wide sort (hipCUB / rocPRIM on ROCm) + slice
+    // the first k, mirroring the CUB branch above; keep the fast partial-bitonic
+    // top-k for ncols <= 1024 (the common decode/verify case).
+    if (ncols > 1024) {
+#ifdef GGML_CUDA_USE_HIPCUB
+        ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
+        int *                     tmp_dst = temp_dst_alloc.get();
+        argsort_f32_i32_cuda_cub(pool, src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
+        CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
+                                     cudaMemcpyDeviceToDevice, stream));
+#else
+        GGML_UNUSED(pool);
+        GGML_ABORT("top-k: ncols > 1024 requires CUB/hipCUB (rocPRIM)");
+#endif  // GGML_CUDA_USE_HIPCUB
+        return;
+    }
     // Dedicated partial bitonic top-k: keeps only a kpad-wide window instead of
     // fully sorting the row then discarding all but the first k indices.
     GGML_UNUSED(pool);

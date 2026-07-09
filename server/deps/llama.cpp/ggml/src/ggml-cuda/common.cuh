@@ -109,6 +109,13 @@
 #    define GGML_CUDA_USE_CUB
 #endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
 
+// HIP has no CUB, but rocPRIM ships a drop-in CUB-API layer via hipCUB. Enable it
+// so argsort / top-k support ncols > 1024 (the single-block bitonic path caps at
+// 1024 threads/block); without it those ops fall back to the CPU reference on ROCm.
+#if defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#    define GGML_CUDA_USE_HIPCUB
+#endif  // defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
 #ifdef __CUDA_ARCH_LIST__
 constexpr bool ggml_cuda_has_arch_impl(int) {
     return false;

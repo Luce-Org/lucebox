@@ -5332,10 +5332,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_TOP_K:
         case GGML_OP_ARGSORT:
-#ifndef GGML_CUDA_USE_CUB
-            return op->src[0]->ne[0] <= 1024;
-#else
+#if defined(GGML_CUDA_USE_CUB) || defined(GGML_CUDA_USE_HIPCUB)
             return true;
+#else
+            // No device-wide sort backend: the single-block bitonic path caps at
+            // 1024 threads/block, so only ncols <= 1024 is supported on GPU.
+            return op->src[0]->ne[0] <= 1024;
 #endif
         case GGML_OP_SUM_ROWS:
         case GGML_OP_MEAN:
