@@ -7,6 +7,9 @@
 #    endif
 using namespace cub;
 #elif defined(GGML_CUDA_USE_HIPCUB)
+// hipCUB exposes the CUB device-sort API (DeviceRadixSort / DeviceSegmentedSort /
+// DeviceSegmentedRadixSort) over rocPRIM. No strided-iterator / CCCL support, so
+// STRIDED_ITERATOR_AVAILABLE stays undefined and the init_offsets path is used.
 #    include <hipcub/hipcub.hpp>
 using namespace hipcub;
 #endif  // GGML_CUDA_USE_CUB

@@ -5506,6 +5506,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #if defined(GGML_CUDA_USE_CUB) || defined(GGML_CUDA_USE_HIPCUB)
             return true;
 #else
+            // No device-wide sort backend: the single-block bitonic path caps at
+            // 1024 threads/block, so only ncols <= 1024 is supported on GPU.
             return op->src[0]->ne[0] <= 1024;
 #endif
         case GGML_OP_SUM_ROWS:
