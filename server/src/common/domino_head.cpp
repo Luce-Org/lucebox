@@ -190,9 +190,14 @@ bool domino_correct_greedy_chain_fused(const DraftWeights & dw,
                                        std::vector<int32_t> & draft_tok,
                                        int cand_k,
                                        std::vector<float> * cand_probs,
-                                       std::vector<int32_t> * cand_ids) {
-    if (!dw.domino.enabled || q_len <= 1 || !local_hidden ||
+                                       std::vector<int32_t> * cand_ids,
+                                       ggml_tensor * hidden_dev) {
+    if (!dw.domino.enabled || q_len <= 1 || (!local_hidden && !hidden_dev) ||
         !backend || !lm_head || !embd_table) {
+        return false;
+    }
+    // [TAG_FUSED_LOOP] device path needs enough rows in the draft output
+    if (hidden_dev && (hidden_dev->ne[0] != dw.n_embd || hidden_dev->ne[1] < q_len)) {
         return false;
     }
     const int hidden = dw.n_embd;
@@ -227,9 +232,15 @@ bool domino_correct_greedy_chain_fused(const DraftWeights & dw,
     if (!ctx) return false;
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 1024, false);
 
-    ggml_tensor * inp_hidden = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, n_cand);
+    // [TAG_FUSED_LOOP] with hidden_dev, read candidate rows 1..q_len-1 of the
+    // draft graph's device-resident hidden in place (same backend/stream, so
+    // ordering is guaranteed and the arena address is stable across steps).
+    ggml_tensor * inp_hidden = hidden_dev
+        ? ggml_view_2d(ctx, hidden_dev, hidden, n_cand,
+                       hidden_dev->nb[1], hidden_dev->nb[1])
+        : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, n_cand);
     ggml_tensor * inp_seed   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-    ggml_set_input(inp_hidden);
+    if (!hidden_dev) ggml_set_input(inp_hidden);
     ggml_set_input(inp_seed);
 
     // Base logits for every candidate in one matmul: [vocab, n_cand].
@@ -311,8 +322,10 @@ bool domino_correct_greedy_chain_fused(const DraftWeights & dw,
         return false;
     }
 
-    ggml_backend_tensor_set(inp_hidden, local_hidden + (size_t)hidden, 0,
-                            sizeof(float) * (size_t)hidden * (size_t)n_cand);
+    if (!hidden_dev) {
+        ggml_backend_tensor_set(inp_hidden, local_hidden + (size_t)hidden, 0,
+                                sizeof(float) * (size_t)hidden * (size_t)n_cand);
+    }
     ggml_backend_tensor_set(inp_seed, &last_tok, 0, sizeof(int32_t));
 
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {

@@ -145,6 +145,46 @@ bool build_draft_step(
     int committed,
     int /*ctx_len_max*/,
     bool pad_ctx) {
+    // [TAG_FUSED_LOOP] persistent-graph fast path: when the previous build
+    // used the padded COPY mode (no mirror view baked into the topology) and
+    // ctx_len still lands in the same 64-aligned bucket, every tensor address
+    // and the graph topology are identical — skip the rebuild and only
+    // refresh the two ctx_len-dependent masks. Feature contents, positions
+    // and noise embeds are re-uploaded by the caller every step regardless,
+    // and the pad feature rows beyond ctx_len were zeroed at bucket build.
+    if (sg.gf && sg.ctx_alloc > 0 && !mirror && pad_ctx &&
+        sg.ctx_alloc == ((ctx_len + 63) & ~63)) {
+        const int q_len     = dw.block_size;
+        const int ctx_alloc = sg.ctx_alloc;
+        static constexpr uint16_t ZERO = 0x0000;
+        static constexpr uint16_t NEG_INF = 0xFC00;
+        if (sg.pad_mask_full) {
+            const int kv_pad = mask_align_up(ctx_alloc + q_len, MASK_KV_PAD);
+            std::vector<uint16_t> mask_data((size_t)kv_pad * q_len, NEG_INF);
+            for (int q = 0; q < q_len; q++) {
+                for (int k = 0; k < ctx_len; k++)
+                    mask_data[(size_t)q * kv_pad + k] = ZERO;
+                for (int j = 0; j < q_len; j++)
+                    mask_data[(size_t)q * kv_pad + (ctx_alloc + j)] = ZERO;
+            }
+            ggml_backend_tensor_set(sg.pad_mask_full, mask_data.data(), 0,
+                                    sizeof(uint16_t) * mask_data.size());
+        }
+        if (sg.attn_mask) {
+            const int kv_pad = mask_align_up(ctx_alloc + q_len, MASK_KV_PAD);
+            std::vector<uint16_t> mask_data((size_t)kv_pad * q_len, NEG_INF);
+            for (int q = 0; q < q_len; q++) {
+                for (int k = 0; k < ctx_len; k++)
+                    mask_data[(size_t)q * kv_pad + k] = ZERO;
+                for (int j = 0; j <= q; j++)
+                    mask_data[(size_t)q * kv_pad + (ctx_alloc + j)] = ZERO;
+            }
+            ggml_backend_tensor_set(sg.attn_mask, mask_data.data(), 0,
+                                    sizeof(uint16_t) * mask_data.size());
+        }
+        return true;
+    }
+
     step_graph_free(sg);
 
     if (!sg.alloc) {

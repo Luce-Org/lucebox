@@ -626,6 +626,10 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     auto t_dec0 = std::chrono::steady_clock::now();
     static const bool step_prof = std::getenv("DFLASH_LAGUNA_STEP_PROF") != nullptr;
     double prof_draft_ms = 0.0, prof_heads_ms = 0.0, prof_verify_ms = 0.0;
+    // [TAG_FUSED_LOOP] blind-spot laps: commit = verify-end -> loop-top
+    // (accept/commit/emit/feature-sync), build = loop-top -> draft-input
+    // upload (noise embed on host, build_draft_step, feature copy).
+    double prof_commit_ms = 0.0, prof_build_ms = 0.0;
     auto prof_now = std::chrono::steady_clock::now();
     auto prof_lap = [&]() {
         auto t = std::chrono::steady_clock::now();
@@ -635,6 +639,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     };
 
     while (n_generated < n_gen) {
+        if (step_prof) prof_commit_ms += prof_lap();  // [TAG_FUSED_LOOP]
         int q_len = base_q_len;
         draft_tok.resize((size_t)q_len);
         target_tok.resize((size_t)q_len);
@@ -685,8 +690,17 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             const char * e = std::getenv("DFLASH_LAGUNA_DRAFT_PAD");
             return !(e && e[0] == '0' && e[1] == '\0');
         }();
+        // [TAG_FUSED_LOOP] persistent draft graph: force the feature-COPY
+        // build (D2D peer copy, ~0.1ms) so the topology carries no per-step
+        // ring-view offsets and build_draft_step can skip the rebuild while
+        // ctx stays inside the same 64-aligned bucket. Kill: DFLASH_DRAFT_PERSIST=0.
+        static const bool draft_persist = []() {
+            const char * e = std::getenv("DFLASH_DRAFT_PERSIST");
+            return !(e && e[0] == '0' && e[1] == '\0');
+        }();
+        const bool want_view = use_mirror_view && !draft_persist;
         if (!build_draft_step(draft_sg, dw, /*lm_head=*/nullptr, draft_backend_,
-                              draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
+                              draft_ctx, want_view ? &feature_mirror_ : nullptr,
                               committed,
                               std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, args_.draft_ctx_max)),
                               draft_pad)) {
@@ -694,7 +708,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             step_graph_destroy(draft_sg);
             return false;
         }
-        if (!use_mirror_view &&
+        if (!want_view &&
             !copy_feature_ring_range_to_tensor(feature_mirror_, draft_sg.target_hidden_cat,
                                                draft_start, draft_ctx)) {
             std::fprintf(stderr, "[laguna-spec] feature copy failed\n");
@@ -709,7 +723,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         for (int i = 0; i < block_size; i++) pos_q[(size_t)i] = draft_ctx + i;
         for (int i = 0; i < kctx; i++) pos_k[(size_t)i] = (i < draft_ctx) ? i : 0;
         for (int j = 0; j < block_size; j++) pos_k[(size_t)kctx + j] = draft_ctx + j;
-        if (step_prof) prof_lap();
+        if (step_prof) prof_build_ms += prof_lap();  // [TAG_FUSED_LOOP]
         ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
                                 sizeof(int32_t) * pos_q.size());
         ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
@@ -721,9 +735,18 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             return false;
         }
 
-        local_hidden.resize((size_t)hidden * (size_t)q_len);
-        ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
-                                sizeof(float) * local_hidden.size());
+        // [TAG_FUSED_LOOP] the 64KB draft-hidden D2H readback is lazy: the
+        // shipping path (fused Domino) reads the device tensor in place, so
+        // only fallback heads and ddtree/dspark pay for the transfer.
+        bool hidden_on_host = false;
+        auto fetch_hidden = [&]() {
+            if (hidden_on_host) return;
+            local_hidden.resize((size_t)hidden * (size_t)q_len);
+            ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
+                                    sizeof(float) * local_hidden.size());
+            hidden_on_host = true;
+        };
+        if (args_.ddtree_mode || sampled_verify) fetch_hidden();
         if (step_prof) prof_draft_ms += prof_lap();
 
         // [TAG_ADAPTIVE_WIDTH] drafter top-2 candidate probabilities per
@@ -749,18 +772,21 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             if (fused_domino) {
                 // Run on the draft backend: same stream as the draft forward,
                 // second graph key in the multi-key CUDA-graph cache.
+                // [TAG_FUSED_LOOP] pass the device hidden; no D2H/H2D hop.
                 if (domino_correct_greedy_chain_fused(
                         dw, draft_backend_, target->lm_head_tensor(),
-                        target->gpu_embd_table(), local_hidden.data(), q_len,
+                        target->gpu_embd_table(), nullptr, q_len,
                         last_tok, draft_tok,
                         cand_k, cand_k > 0 ? &cand_p : nullptr,
-                        cand_k > 0 ? &cand_i : nullptr)) {
+                        cand_k > 0 ? &cand_i : nullptr,
+                        draft_sg.hidden_states)) {
                     used_domino = true;
                 }
             }
             if (used_domino) {
                 // fused path done
-            } else if (domino_correct_greedy_chain(dw, draft_backend_, *target,
+            } else if (fetch_hidden(),
+                       domino_correct_greedy_chain(dw, draft_backend_, *target,
                                             local_hidden.data(), q_len,
                                             last_tok, draft_tok)) {
                 used_domino = true;
@@ -788,6 +814,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                 return !(e && e[0] == '0' && e[1] == '\0');
             }();
             bool ds_ok = false;
+            fetch_hidden();  // [TAG_FUSED_LOOP]
             if (fused_dspark && laguna_dspark_confidence_threshold() <= 0.0f) {
                 // One graph on the draft stream: lm_head + markov chain +
                 // in-graph argmax; no host logits round-trip.
@@ -816,6 +843,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             }
         }
         if (!used_domino && !used_dspark) {
+            fetch_hidden();  // [TAG_FUSED_LOOP]
             if (!target->project_hidden_to_tokens_topk(local_hidden.data(), q_len, draft_tok,
                     cand_k, cand_k > 0 ? &cand_p : nullptr,
                     cand_k > 0 ? &cand_i : nullptr)) {
@@ -1110,10 +1138,12 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     if (step_prof && n_draft_steps > 0) {
         std::fprintf(stderr,
             "[step-prof] per-step ms: draft=%.2f heads=%.2f verify=%.2f "
-            "other=%.2f total=%.2f (steps=%d)\n",
+            "commit=%.2f build=%.2f other=%.2f total=%.2f (steps=%d)\n",
             prof_draft_ms / n_draft_steps, prof_heads_ms / n_draft_steps,
             prof_verify_ms / n_draft_steps,
-            (decode_s * 1000.0 - prof_draft_ms - prof_heads_ms - prof_verify_ms) / n_draft_steps,
+            prof_commit_ms / n_draft_steps, prof_build_ms / n_draft_steps,
+            (decode_s * 1000.0 - prof_draft_ms - prof_heads_ms - prof_verify_ms -
+             prof_commit_ms - prof_build_ms) / n_draft_steps,
             decode_s * 1000.0 / n_draft_steps, n_draft_steps);
     }
     std::fprintf(stderr, "[laguna-spec] tokens=%d time=%.3f s speed=%.2f tok/s "
