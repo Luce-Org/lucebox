@@ -148,6 +148,16 @@ static inline __device__ void ggml_cuda_swap(T & a, T & b) {
     b = tmp;
 }
 
+// Warp-local xor shuffle. For the bitonic inner stages where the stride j is
+// smaller than the wavefront width, both partners of a compare-exchange live in
+// the same wave, so the exchange can be done register-to-register via shuffle —
+// no shared-memory round-trip and no __syncthreads() barrier.
+#if defined(GGML_USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+#    define GGML_ARGSORT_SHFL_XOR(v, mask) __shfl_xor((v), (mask))
+#else
+#    define GGML_ARGSORT_SHFL_XOR(v, mask) __shfl_xor_sync(0xffffffffu, (v), (mask))
+#endif
+
 template<ggml_sort_order order>
 static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int ncols, int ncols_pad) {
     // bitonic sort
@@ -159,35 +169,93 @@ static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int n
     }
 
     const float * x_row = x + row * ncols;
-    extern __shared__ int dst_row[];
+    // Shared layout: [ncols_pad] indices followed by [ncols_pad] cached key
+    // values. The bitonic network re-reads two keys per comparison across
+    // ~log2(ncols_pad)^2 stages; caching the value that travels with each
+    // index removes the repeated indirect global gathers from the inner loop.
+    extern __shared__ int smem[];
+    int *   dst_row = smem;
+    float * val_row = (float *) (smem + ncols_pad);
 
-    // initialize indices
+    // initialize indices and cache the key each index points at (padding lanes
+    // keep an untouched value; they are handled by the index-based checks below)
     dst_row[col] = col;
+    if (col < ncols) {
+        val_row[col] = x_row[col];
+    }
 
     __syncthreads();
 
     for (int k = 2; k <= ncols_pad; k *= 2) {
-        for (int j = k / 2; j > 0; j /= 2) {
+        int j = k / 2;
+
+        // Cross-wave stages (stride >= warpSize): partners live in different
+        // waves, so the exchange must go through shared memory with a full
+        // block barrier between stages.
+        for (; j >= warpSize; j /= 2) {
             int ixj = col ^ j;
             if (ixj > col) {
                 if ((col & k) == 0) {
                     if (dst_row[col] >= ncols ||
                         (dst_row[ixj] < ncols && (order == GGML_SORT_ORDER_ASC ?
-                            x_row[dst_row[col]] > x_row[dst_row[ixj]] :
-                            x_row[dst_row[col]] < x_row[dst_row[ixj]]))
+                            val_row[col] > val_row[ixj] :
+                            val_row[col] < val_row[ixj]))
                     ) {
                         ggml_cuda_swap(dst_row[col], dst_row[ixj]);
+                        ggml_cuda_swap(val_row[col], val_row[ixj]);
                     }
                 } else {
                     if (dst_row[ixj] >= ncols ||
                         (dst_row[col] < ncols && (order == GGML_SORT_ORDER_ASC ?
-                            x_row[dst_row[col]] < x_row[dst_row[ixj]] :
-                            x_row[dst_row[col]] > x_row[dst_row[ixj]]))
+                            val_row[col] < val_row[ixj] :
+                            val_row[col] > val_row[ixj]))
                     ) {
                         ggml_cuda_swap(dst_row[col], dst_row[ixj]);
+                        ggml_cuda_swap(val_row[col], val_row[ixj]);
                     }
                 }
             }
+            __syncthreads();
+        }
+
+        // Intra-wave tail (stride < warpSize): partner is in the same wave.
+        // Pull (idx, val) into registers and drive the remaining stages with
+        // xor shuffles — no LDS traffic, no barriers. Both lanes of a pair
+        // reconstruct the same (low, high) view and compute an identical swap
+        // decision, so the exchange stays consistent. Semantics match the
+        // shared-memory path above byte-for-byte (col == low lane, ixj == high).
+        if (j > 0) {
+            int   my_idx = dst_row[col];
+            float my_val = val_row[col];
+            for (; j > 0; j /= 2) {
+                const float p_val = GGML_ARGSORT_SHFL_XOR(my_val, j);
+                const int   p_idx = GGML_ARGSORT_SHFL_XOR(my_idx, j);
+
+                const bool  low      = (col & j) == 0;
+                const int   low_idx  = low ? my_idx : p_idx;
+                const int   high_idx = low ? p_idx : my_idx;
+                const float low_val  = low ? my_val : p_val;
+                const float high_val = low ? p_val : my_val;
+
+                bool swap;
+                if ((col & k) == 0) {
+                    swap = low_idx >= ncols ||
+                           (high_idx < ncols && (order == GGML_SORT_ORDER_ASC ?
+                                low_val > high_val :
+                                low_val < high_val));
+                } else {
+                    swap = high_idx >= ncols ||
+                           (low_idx < ncols && (order == GGML_SORT_ORDER_ASC ?
+                                low_val < high_val :
+                                low_val > high_val));
+                }
+                if (swap) {
+                    my_idx = p_idx;
+                    my_val = p_val;
+                }
+            }
+            dst_row[col] = my_idx;
+            val_row[col] = my_val;
             __syncthreads();
         }
     }
@@ -217,7 +285,8 @@ void argsort_f32_i32_cuda_bitonic(const float *   x,
 
     const dim3 block_dims(ncols_pad, 1, 1);
     const dim3 block_nums(nrows, 1, 1);
-    const size_t shared_mem = ncols_pad * sizeof(int);
+    // indices (int) + cached key values (float), both ncols_pad entries
+    const size_t shared_mem = ncols_pad * (sizeof(int) + sizeof(float));
 
     // FIXME: this limit could be raised by ~2-4x on Ampere or newer
     GGML_ASSERT(shared_mem <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
