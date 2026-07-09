@@ -10604,6 +10604,14 @@ void ggml_compute_forward_gated_delta_net(
         ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 
+    // The in-place SSM state write (op_params[1]) is a CUDA-only fast path: the
+    // CPU kernel always writes the final state to dst+attn_score_elems and never
+    // reads it back, so honoring the flag here would silently freeze SSM state.
+    // Abort like TURBO_WHT rather than run a wrong-but-quiet CPU fallback.
+    if (ggml_get_op_params_i32(dst, 1) != 0) {
+        GGML_ABORT("gated_delta_net inplace state write is CUDA-only");
+    }
+
     switch (src0->type) {
         case GGML_TYPE_F32:
             {

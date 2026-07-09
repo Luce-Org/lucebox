@@ -133,6 +133,10 @@ protected:
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io);
     virtual bool should_capture_moe_router() const { return false; }
+    // AR graph-reuse + props-skip fast path is validated on the dense backend
+    // only. MoE (expert swaps + per-step host-sync) overrides this false to
+    // fall back to per-step graph rebuild.
+    virtual bool supports_ar_graph_reuse() const { return true; }
     // Hook after kvflash pool sizing, before create_target_cache: a subclass
     // may disable the pool (kvflash_tokens_=0) when it is redundant. Default no-op.
     virtual bool post_kvflash_init_gate() { return true; }
@@ -232,7 +236,6 @@ private:
     StepGraph      proj_sg_;     // lm-head projection (remote-lm-head mode)
 
     int ar_decode_fa_bucket_ = -1;
-    static const bool ar_graph_reuse;
 
     // ── Draft feature mirror (cross-GPU feature transfer) ────────────
     DraftFeatureMirror feature_mirror_;

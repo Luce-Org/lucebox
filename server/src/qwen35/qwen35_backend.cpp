@@ -1551,11 +1551,9 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     // every 256 decode steps. So we rebuild only when committed/256 crosses
     // a boundary; within a bucket we reuse the cached graph and just update
     // the mutable input tensors.
-    const bool ar_graph_reuse = std::getenv("DFLASH_AR_NO_REUSE") == nullptr;
+    const bool ar_graph_reuse = supports_ar_graph_reuse()
+                              && std::getenv("DFLASH_AR_NO_REUSE") == nullptr;
     ar_decode_fa_bucket_ = -1;  // force first-step build
-
-    dflash::qwen35::ScopedSkipPropsCheck skip_props_guard(
-        &ggml_cuda_set_skip_props_check, ar_graph_reuse);
 
     for (int i = initial_emitted; i < n_gen; i++) {
         int32_t tok = out_tokens.back();
@@ -1606,12 +1604,19 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         }
         if (pool) kvflash_upload_mask();
 
-        // A graph rebuild must run the normal property check so ggml-cuda can
-        // reset warmup and recapture. Stable replay steps can skip the O(nodes)
-        // property scan after warmup.
-        if (need_rebuild) skip_props_guard.set(false);
-        auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
-        if (need_rebuild) skip_props_guard.set(ar_graph_reuse);
+        // Scope the props-check skip to ONLY this target graph compute. A
+        // rebuild step must run the normal property scan so ggml-cuda resets
+        // warmup and recaptures; a stable replay step skips the O(nodes) scan.
+        // The flag is cleared immediately after so nothing else in the loop
+        // (after_target_compute, kvflash_maybe_reselect — each its own
+        // CUDA-graph compute) ever runs under a stale skip.
+        ggml_status st = GGML_STATUS_SUCCESS;
+        {
+            const bool skip_this = ar_graph_reuse && !need_rebuild;
+            dflash::qwen35::ScopedSkipPropsCheck skip_props_guard(
+                &ggml_cuda_set_skip_props_check, skip_this);
+            st = ggml_backend_graph_compute(target_backend_, sg_.gf);
+        }
         if (st != GGML_STATUS_SUCCESS) return false;
 
         after_target_compute(sg_, committed, 1);
