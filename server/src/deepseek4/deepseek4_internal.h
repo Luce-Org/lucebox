@@ -23,7 +23,6 @@
 #include "ggml-backend.h"
 
 #include "internal.h"
-#include "common/expert_split_compute_runtime.h"
 #include "common/layer_split_utils.h"
 
 namespace dflash::common {
@@ -310,102 +309,6 @@ struct DeepSeek4BackendConfig {
     int          chunk        = 512;   // prefill chunk size
     int          max_ctx      = 0;     // 0 = auto from SWA + compression capacity
 };
-
-struct DeepSeek4ExpertSplitGpuMemoryInfo {
-    uint64_t free_bytes = 0;
-    uint64_t total_bytes = 0;
-};
-
-struct DeepSeek4ExpertSplitBudgetMemoryInfo {
-    uint64_t total_bytes = 0;
-    uint64_t free_bytes = 0;
-    uint64_t core_bytes = 0;
-    uint64_t kv_bytes = 0;
-    uint64_t warm_bytes = 0;
-    uint64_t safety_bytes = 0;
-    uint64_t total_expert_bytes = 0;
-    bool parent_is_igpu = false;
-    uint64_t host_available_bytes = 0;
-    uint64_t host_budget_cap_bytes = 0;
-};
-
-struct DeepSeek4ExpertSplitHotCachePlan {
-    uint64_t hot_bytes = 0;
-    int cache_slots = 0;
-};
-
-int deepseek4_expert_split_prefill_chunk_limit_from_memory(
-    int requested_chunk,
-    bool expert_split_enabled,
-    bool parent_is_gpu,
-    const DeepSeek4ExpertSplitGpuMemoryInfo & memory);
-
-bool deepseek4_expert_split_should_disable_cached_decode_from_memory(
-    bool expert_split_enabled,
-    bool parent_is_gpu,
-    bool parent_is_cuda,
-    bool parent_is_hip,
-    const DeepSeek4ExpertSplitGpuMemoryInfo & memory);
-
-bool deepseek4_expert_split_requires_parent_cuda_graph_disable(
-    bool expert_split_enabled,
-    bool parent_is_cuda,
-    const std::vector<ExpertSplitComputeTargetRuntime> & targets);
-
-bool deepseek4_should_use_gpu_resident_decode_ffn_policy(
-    bool use_cached_decode,
-    bool env_enabled,
-    bool env_disabled,
-    bool backend_is_hip,
-    bool backend_is_integrated_gpu,
-    bool worker_active);
-
-uint64_t deepseek4_expert_split_budget_from_memory(
-    const DeepSeek4ExpertSplitBudgetMemoryInfo & memory);
-
-uint64_t deepseek4_expert_split_primary_capacity_for_targets(
-    uint64_t expert_budget_bytes,
-    uint64_t hot_budget_bytes,
-    size_t configured_targets);
-
-uint64_t deepseek4_expert_split_non_cpu_capacity_bytes(
-    const std::vector<ExpertSplitTarget> & targets);
-
-uint64_t deepseek4_expert_split_effective_budget_for_targets(
-    uint64_t requested_budget_bytes,
-    uint64_t total_expert_bytes,
-    const std::vector<ExpertSplitTarget> & targets);
-
-uint64_t deepseek4_expert_split_effective_hot_budget(
-    uint64_t expert_budget_bytes,
-    uint64_t hot_budget_bytes,
-    size_t configured_targets);
-
-bool deepseek4_expert_split_hash_ids_to_hotness_counts(
-    const int32_t * expert_ids,
-    int n_token_ids,
-    int n_expert_used,
-    int n_expert,
-    std::vector<uint64_t> & out_counts);
-
-bool deepseek4_expert_split_route_bias_to_hotness_counts(
-    const float * route_bias,
-    int n_expert,
-    uint64_t layer_total,
-    std::vector<uint64_t> & out_counts);
-
-int deepseek4_expert_split_effective_cache_slots(
-    int requested_cache_slots,
-    size_t configured_targets);
-
-DeepSeek4ExpertSplitHotCachePlan deepseek4_expert_split_hot_cache_plan(
-    uint64_t expert_budget_bytes,
-    uint64_t total_expert_bytes,
-    int n_expert,
-    int n_expert_used,
-    bool parent_is_igpu,
-    uint64_t igpu_host_cap_bytes = 0,
-    uint64_t igpu_free_bytes = 0);
 
 // ─── Function declarations ──────────────────────────────────────────────
 

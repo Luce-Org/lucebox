@@ -130,7 +130,6 @@ static void add_ffn_telemetry(DeepSeek4StepTelemetry * dst,
     dst->ffn_cold_us += src.cold_us;
     dst->ffn_combine_us += src.combine_us;
     dst->ffn_partition_us += src.partition_us;
-    dst->ffn_cache_promote_us += src.cache_promote_us;
     dst->ffn_hot_graph_builds += src.hot_graph_builds;
     dst->ffn_hot_graph_hits += src.hot_graph_hits;
     dst->ffn_cold_graph_builds += src.cold_graph_builds;
@@ -2004,8 +2003,7 @@ static bool eval_ds4_hybrid_or_worker(
             ffn_normed_host, selected_host, weights_host,
             n_tokens, ffn_out_host, nullptr, hot_alloc, cold_alloc,
             expert_compute, expert_layer,
-            step_tel ? &ffn_tel : nullptr,
-            ffn_normed_backend);
+            step_tel ? &ffn_tel : nullptr);
         if (ffn_ok) {
             if (trace_decode) {
                 std::fprintf(stderr,
@@ -2220,19 +2218,30 @@ static bool ds4_try_gpu_resident_decode_ffn(
 
     MoeHybridFfnTelemetry ffn_tel;
     const auto ffn_t0 = Ds4TimingClock::now();
+    std::vector<float> selected_weights_storage;
+    if (!selected_weights && selected_weights_gpu) {
+        selected_weights_storage.resize((size_t)n_selected);
+        ggml_backend_tensor_get(selected_weights_gpu,
+                                selected_weights_storage.data(), 0,
+                                sizeof(float) * selected_weights_storage.size());
+        selected_weights = selected_weights_storage.data();
+    }
+    if (!selected_weights) {
+        return false;
+    }
     if (!eval_moe_hybrid_ffn_gpu_resident(
             backend, hybrid_cfg, desc, storage, cpu_backend,
             ffn_post_gpu,
             nullptr,
             gpu_ffn_state.state,
             selected_ids, selected_weights, n_selected,
-            selected_weights_gpu,
-            out_gpu,
-            expert_compute, expert_layer,
-            step_tel ? &ffn_tel : nullptr)) {
+            expert_compute, expert_layer)) {
         return false;
     }
 
+    if (out_gpu) {
+        *out_gpu = gpu_ffn_state.state.act_cur;
+    }
     if (step_tel) {
         step_tel->ffn_eval_us += ds4_elapsed_us(ffn_t0, Ds4TimingClock::now());
         add_ffn_telemetry(step_tel, ffn_tel);
@@ -3605,12 +3614,7 @@ static bool deepseek4_step_hybrid(
                 expert_layers ? expert_layers + il : nullptr;
             const bool all_selected_hot = ds4_all_selected_hot(
                     storage, hybrid_selected_host.data(), n_tokens * w.n_expert_used);
-            const bool can_skip_ffn_normed_host =
-                expert_worker == nullptr &&
-                (all_selected_hot ||
-                 storage.cold_backend_kind == MoeHybridColdBackend::Gpu ||
-                 (expert_compute && expert_layer &&
-                  expert_compute->supports_batch_gpu_resident()));
+            const bool can_skip_ffn_normed_host = false;
             const auto route_read_t0 = Ds4TimingClock::now();
             if (!use_gpu_resident_decode_ffn && !can_skip_ffn_normed_host) {
                 const Ds4TensorReadback readbacks[] = {
@@ -3720,11 +3724,7 @@ static bool deepseek4_step_hybrid(
             auto & storage = moe_hybrid.layers[(size_t) il];
             const MoeExpertLayer * expert_layer =
                 expert_layers ? expert_layers + il : nullptr;
-            const bool can_skip_ffn_normed_host =
-                expert_worker == nullptr &&
-                (storage.cold_backend_kind == MoeHybridColdBackend::Gpu ||
-                 (expert_compute && expert_layer &&
-                  expert_compute->supports_batch_gpu_resident()));
+            const bool can_skip_ffn_normed_host = false;
             if (ok) {
                 const auto route_read_t0 = Ds4TimingClock::now();
                 if (can_skip_ffn_normed_host) {
@@ -3890,12 +3890,7 @@ static bool deepseek4_step_hybrid(
             }
             const bool all_selected_hot = ds4_all_selected_hot(
                     storage, hybrid_selected_host.data(), n_tokens * w.n_expert_used);
-            const bool can_skip_ffn_normed_host =
-                expert_worker == nullptr &&
-                (all_selected_hot ||
-                 storage.cold_backend_kind == MoeHybridColdBackend::Gpu ||
-                 (expert_compute && expert_layer &&
-                  expert_compute->supports_batch_gpu_resident()));
+            const bool can_skip_ffn_normed_host = false;
             if (!prefer_single_hip_route_readback &&
                 !use_gpu_resident_decode_ffn &&
                 !can_skip_ffn_normed_host) {
@@ -3997,11 +3992,7 @@ static bool deepseek4_step_hybrid(
             auto & storage = moe_hybrid.layers[(size_t) il];
             const MoeExpertLayer * expert_layer =
                 expert_layers ? expert_layers + il : nullptr;
-            const bool can_skip_ffn_normed_host =
-                expert_worker == nullptr &&
-                (storage.cold_backend_kind == MoeHybridColdBackend::Gpu ||
-                 (expert_compute && expert_layer &&
-                  expert_compute->supports_batch_gpu_resident()));
+            const bool can_skip_ffn_normed_host = false;
             const auto route_read_t0 = Ds4TimingClock::now();
             if (can_skip_ffn_normed_host) {
                 const Ds4TensorReadback route_readbacks[] = {

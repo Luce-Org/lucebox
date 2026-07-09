@@ -1,13 +1,17 @@
 #include "deepseek4_hc_cuda.h"
 
 #include "common/gpu_runtime_compat.h"
+#include "ggml-backend-impl.h"
+#include "ggml-cuda/common.cuh"
 
 #include <cuda_fp16.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <cmath>
+#include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace dflash::common {
@@ -63,7 +67,17 @@ struct HcCudaScratch {
 };
 
 std::mutex g_mu;
-HcCudaScratch g_scratch;
+std::unordered_map<void *, std::unique_ptr<HcCudaScratch>> g_scratch_by_stream;
+
+HcCudaScratch & hc_scratch_for_stream(cudaStream_t stream) {
+    void * key = reinterpret_cast<void *>(stream);
+    auto it = g_scratch_by_stream.find(key);
+    if (it == g_scratch_by_stream.end()) {
+        auto inserted = g_scratch_by_stream.emplace(key, std::make_unique<HcCudaScratch>());
+        it = inserted.first;
+    }
+    return *it->second;
+}
 
 void hc_log_cuda_error(const char * label, cudaError_t err) {
     if (err != cudaSuccess) {
@@ -109,6 +123,57 @@ __global__ void hc_mix_kernel(const float * x,
         __syncthreads();
     }
     if (tid == 0) mix[row] = smem[0];
+}
+
+__global__ void hc_finalize_inv_rms_kernel(const float * sums,
+                                           int n_sums,
+                                           int cols,
+                                           float eps,
+                                           float * inv_rms_out) {
+    __shared__ float smem[kThreads];
+    const int tid = threadIdx.x;
+    float acc = 0.0f;
+    for (int i = tid; i < n_sums; i += blockDim.x) {
+        acc += sums[i];
+    }
+    smem[tid] = acc;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        inv_rms_out[0] = rsqrtf(smem[0] / (float) cols + eps);
+    }
+}
+
+__global__ void hc_mix_kernel_device_inv(const float * x,
+                                         const __half * fn,
+                                         int cols,
+                                         const float * inv_rms_ptr,
+                                         float * mix) {
+    __shared__ float smem[kThreads];
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float inv_rms = inv_rms_ptr[0];
+    float acc = 0.0f;
+    const __half * w = fn + (size_t) row * (size_t) cols;
+    for (int c = tid; c < cols; c += blockDim.x) {
+        acc += __half2float(w[c]) * (x[c] * inv_rms);
+    }
+    smem[tid] = acc;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        mix[row] = smem[0];
+    }
 }
 
 __device__ float hc_sigmoid(float x) {
@@ -257,6 +322,9 @@ bool hc_pre_device_locked(const void * hc_state_device,
                           void *       working_device,
                           void *       post_device,
                           void *       comb_device,
+                          HcCudaScratch & scratch,
+                          cudaStream_t stream,
+                          bool         sync_device,
                           bool         log_errors) {
     const int hc_dim = n_embd * n_hc;
     const int mix_dim = 2 * n_hc + n_hc * n_hc;
@@ -266,80 +334,78 @@ bool hc_pre_device_locked(const void * hc_state_device,
         }
         return false;
     };
+    const float * hc_state_ptr = static_cast<const float *>(hc_state_device);
 
-    if (hc_state_device != g_scratch.d_state) {
-        cudaError_t err = cudaMemcpy(g_scratch.d_state, hc_state_device,
-                                     sizeof(float) * (size_t) hc_dim,
-                                     cudaMemcpyDeviceToDevice);
-        if (err != cudaSuccess) {
-            return fail("copy state d2d", err);
-        }
+    hc_sumsq_kernel<<<kSums, kThreads, 0, stream>>>(
+        hc_state_ptr,
+        hc_dim,
+        scratch.d_sums);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        return fail("sumsq kernel", err);
     }
 
-    hc_mix_norm_kernel<<<mix_dim, kThreads>>>(
-        g_scratch.d_state,
+    hc_finalize_inv_rms_kernel<<<1, kThreads, 0, stream>>>(
+        scratch.d_sums,
+        kSums,
+        hc_dim,
+        eps,
+        scratch.d_sums);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        return fail("inv_rms kernel", err);
+    }
+
+    hc_mix_kernel_device_inv<<<mix_dim, kThreads, 0, stream>>>(
+        hc_state_ptr,
         static_cast<const __half *>(fn_device),
         hc_dim,
-        mix_dim,
-        eps,
-        g_scratch.d_mix);
-    cudaError_t err = cudaGetLastError();
+        scratch.d_sums,
+        scratch.d_mix);
+    err = cudaGetLastError();
     if (err != cudaSuccess) {
         return fail("mix kernel", err);
     }
 
-    hc_finish_kernel<<<1, kThreads>>>(
-        g_scratch.d_state,
-        g_scratch.d_mix,
+    hc_finish_kernel<<<1, kThreads, 0, stream>>>(
+        hc_state_ptr,
+        scratch.d_mix,
         static_cast<const float *>(scale_device),
         static_cast<const float *>(base_device),
         n_embd,
         n_hc,
         sinkhorn_iters,
-        g_scratch.d_working,
-        g_scratch.d_post,
-        g_scratch.d_comb);
+        static_cast<float *>(working_device),
+        static_cast<float *>(post_device),
+        static_cast<float *>(comb_device));
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         return fail("finish kernel", err);
     }
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        return fail("device sync", err);
-    }
-#endif
-
-    if (working_device != g_scratch.d_working) {
-        err = cudaMemcpy(working_device, g_scratch.d_working,
-                         sizeof(float) * (size_t) n_embd,
-                         cudaMemcpyDeviceToDevice);
+    if (sync_device) {
+        err = cudaDeviceSynchronize();
         if (err != cudaSuccess) {
-            return fail("copy working d2d", err);
+            return fail("finish sync", err);
         }
-    }
-    if (post_device != g_scratch.d_post) {
-        err = cudaMemcpy(post_device, g_scratch.d_post,
-                         sizeof(float) * (size_t) n_hc,
-                         cudaMemcpyDeviceToDevice);
-        if (err != cudaSuccess) {
-            return fail("copy post d2d", err);
-        }
-    }
-    if (comb_device != g_scratch.d_comb) {
-        err = cudaMemcpy(comb_device, g_scratch.d_comb,
-                         sizeof(float) * (size_t) n_hc * (size_t) n_hc,
-                         cudaMemcpyDeviceToDevice);
-        if (err != cudaSuccess) {
-            return fail("copy comb d2d", err);
-        }
-    }
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        return fail("post-copy sync", err);
     }
 
     return true;
+}
+
+static cudaStream_t hc_backend_stream_or_default(ggml_backend_t backend) {
+    if (!backend || !backend->context) {
+        return nullptr;
+    }
+    if (!backend->device) {
+        return nullptr;
+    }
+    const auto dev_type = ggml_backend_dev_type(backend->device);
+    if (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+        dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        return nullptr;
+    }
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    return cuda_ctx ? cuda_ctx->stream() : nullptr;
 }
 
 } // namespace
@@ -355,30 +421,31 @@ bool deepseek4_cuda_hc_pre_mix(const float * hc_state_host,
     }
     const int hc_dim = n_embd * n_hc;
     std::lock_guard<std::mutex> lock(g_mu);
-    if (!g_scratch.ensure((size_t)hc_dim, (size_t)n_embd, (size_t)n_hc)) {
+    HcCudaScratch & scratch = hc_scratch_for_stream(nullptr);
+    if (!scratch.ensure((size_t)hc_dim, (size_t)n_embd, (size_t)n_hc)) {
         return false;
     }
-    if (cudaMemcpy(g_scratch.d_state, hc_state_host, sizeof(float) * (size_t)hc_dim,
+    if (cudaMemcpy(scratch.d_state, hc_state_host, sizeof(float) * (size_t)hc_dim,
                    cudaMemcpyHostToDevice) != cudaSuccess) {
         return false;
     }
-    hc_sumsq_kernel<<<kSums, kThreads>>>(g_scratch.d_state, hc_dim, g_scratch.d_sums);
+    hc_sumsq_kernel<<<kSums, kThreads>>>(scratch.d_state, hc_dim, scratch.d_sums);
     if (cudaGetLastError() != cudaSuccess) return false;
     std::vector<float> sums(kSums);
-    if (cudaMemcpy(sums.data(), g_scratch.d_sums, sizeof(float) * sums.size(),
+    if (cudaMemcpy(sums.data(), scratch.d_sums, sizeof(float) * sums.size(),
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
     float ss = 0.0f;
     for (float v : sums) ss += v;
     const float inv_rms = 1.0f / std::sqrt(ss / (float)hc_dim + eps);
-    hc_mix_kernel<<<kMixDim, kThreads>>>(g_scratch.d_state,
+    hc_mix_kernel<<<kMixDim, kThreads>>>(scratch.d_state,
                                          static_cast<const __half *>(fn_device),
                                          hc_dim,
                                          inv_rms,
-                                         g_scratch.d_mix);
+                                         scratch.d_mix);
     if (cudaGetLastError() != cudaSuccess) return false;
-    if (cudaMemcpy(mix_host, g_scratch.d_mix, sizeof(float) * kMixDim,
+    if (cudaMemcpy(mix_host, scratch.d_mix, sizeof(float) * kMixDim,
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
@@ -408,46 +475,50 @@ bool deepseek4_cuda_hc_pre(const float * hc_state_host,
     }
 
     std::lock_guard<std::mutex> lock(g_mu);
-    if (!g_scratch.ensure((size_t) hc_dim, (size_t) n_embd, (size_t) n_hc)) {
+    HcCudaScratch & scratch = hc_scratch_for_stream(nullptr);
+    if (!scratch.ensure((size_t) hc_dim, (size_t) n_embd, (size_t) n_hc)) {
         return false;
     }
-    if (cudaMemcpy(g_scratch.d_state, hc_state_host, sizeof(float) * (size_t) hc_dim,
+    if (cudaMemcpy(scratch.d_state, hc_state_host, sizeof(float) * (size_t) hc_dim,
                    cudaMemcpyHostToDevice) != cudaSuccess) {
         return false;
     }
-    if (cudaMemcpy(g_scratch.d_scale, scale_host, sizeof(float) * (size_t) mix_dim,
+    if (cudaMemcpy(scratch.d_scale, scale_host, sizeof(float) * (size_t) mix_dim,
                    cudaMemcpyHostToDevice) != cudaSuccess) {
         return false;
     }
-    if (cudaMemcpy(g_scratch.d_base, base_host, sizeof(float) * (size_t) mix_dim,
+    if (cudaMemcpy(scratch.d_base, base_host, sizeof(float) * (size_t) mix_dim,
                    cudaMemcpyHostToDevice) != cudaSuccess) {
         return false;
     }
     if (!hc_pre_device_locked(
-            g_scratch.d_state,
+            scratch.d_state,
             fn_device,
-            g_scratch.d_scale,
-            g_scratch.d_base,
+            scratch.d_scale,
+            scratch.d_base,
             n_embd,
             n_hc,
             sinkhorn_iters,
             eps,
-            g_scratch.d_working,
-            g_scratch.d_post,
-            g_scratch.d_comb,
+            scratch.d_working,
+            scratch.d_post,
+            scratch.d_comb,
+            scratch,
+            nullptr,
+            true,
             false)) {
         return false;
     }
 
-    if (cudaMemcpy(working_host, g_scratch.d_working, sizeof(float) * (size_t) n_embd,
+    if (cudaMemcpy(working_host, scratch.d_working, sizeof(float) * (size_t) n_embd,
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
-    if (cudaMemcpy(post_host, g_scratch.d_post, sizeof(float) * (size_t) n_hc,
+    if (cudaMemcpy(post_host, scratch.d_post, sizeof(float) * (size_t) n_hc,
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
-    if (cudaMemcpy(comb_host, g_scratch.d_comb, sizeof(float) * (size_t) n_hc * (size_t) n_hc,
+    if (cudaMemcpy(comb_host, scratch.d_comb, sizeof(float) * (size_t) n_hc * (size_t) n_hc,
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
@@ -478,7 +549,8 @@ bool deepseek4_cuda_hc_pre_device(const void * hc_state_device,
     }
 
     std::lock_guard<std::mutex> lock(g_mu);
-    if (!g_scratch.ensure((size_t) hc_dim, (size_t) n_embd, (size_t) n_hc)) {
+    HcCudaScratch & scratch = hc_scratch_for_stream(nullptr);
+    if (!scratch.ensure((size_t) hc_dim, (size_t) n_embd, (size_t) n_hc)) {
         return false;
     }
     return hc_pre_device_locked(hc_state_device,
@@ -492,6 +564,55 @@ bool deepseek4_cuda_hc_pre_device(const void * hc_state_device,
                                 working_device,
                                 post_device,
                                 comb_device,
+                                scratch,
+                                nullptr,
+                                true,
+                                false);
+}
+
+bool deepseek4_cuda_hc_pre_device_on_backend(ggml_backend_t backend,
+                                             const void * hc_state_device,
+                                             const void * fn_device,
+                                             const void * scale_device,
+                                             const void * base_device,
+                                             int          n_embd,
+                                             int          n_hc,
+                                             int          sinkhorn_iters,
+                                             float        eps,
+                                             void *       working_device,
+                                             void *       post_device,
+                                             void *       comb_device) {
+    if (!hc_state_device || !fn_device || !scale_device || !base_device ||
+        !working_device || !post_device || !comb_device ||
+        n_embd <= 0 || n_hc <= 0 || n_hc > kMaxHc) {
+        return false;
+    }
+    const int hc_dim = n_embd * n_hc;
+    const int mix_dim = 2 * n_hc + n_hc * n_hc;
+    if (mix_dim > kMaxMixDim) {
+        return false;
+    }
+
+    cudaStream_t stream = hc_backend_stream_or_default(backend);
+    std::lock_guard<std::mutex> lock(g_mu);
+    HcCudaScratch & scratch = hc_scratch_for_stream(stream);
+    if (!scratch.ensure((size_t) hc_dim, (size_t) n_embd, (size_t) n_hc)) {
+        return false;
+    }
+    return hc_pre_device_locked(hc_state_device,
+                                fn_device,
+                                scale_device,
+                                base_device,
+                                n_embd,
+                                n_hc,
+                                sinkhorn_iters,
+                                eps,
+                                working_device,
+                                post_device,
+                                comb_device,
+                                scratch,
+                                stream,
+                                false,
                                 false);
 }
 
@@ -518,29 +639,25 @@ bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
     }
 
     std::lock_guard<std::mutex> lock(g_mu);
-    if (!g_scratch.ensure((size_t) hc_dim, (size_t) n_embd, (size_t) n_hc)) {
+    HcCudaScratch & scratch = hc_scratch_for_stream(nullptr);
+    if (!scratch.ensure((size_t) hc_dim, (size_t) n_embd, (size_t) n_hc)) {
         std::fprintf(stderr, "[deepseek4-hc-direct] ensure failed\n");
         return false;
     }
-    if (cudaMemcpy(g_scratch.d_state, hc_state_device, sizeof(float) * (size_t) hc_dim,
-                   cudaMemcpyDeviceToDevice) != cudaSuccess) {
-        hc_log_cuda_error("copy state d2d", cudaGetLastError());
-        return false;
-    }
-    if (cudaMemcpy(g_scratch.d_scale, scale_host, sizeof(float) * (size_t) mix_dim,
+    if (cudaMemcpy(scratch.d_scale, scale_host, sizeof(float) * (size_t) mix_dim,
                    cudaMemcpyHostToDevice) != cudaSuccess) {
         hc_log_cuda_error("copy scale", cudaGetLastError());
         return false;
     }
-    if (cudaMemcpy(g_scratch.d_base, base_host, sizeof(float) * (size_t) mix_dim,
+    if (cudaMemcpy(scratch.d_base, base_host, sizeof(float) * (size_t) mix_dim,
                    cudaMemcpyHostToDevice) != cudaSuccess) {
         hc_log_cuda_error("copy base", cudaGetLastError());
         return false;
     }
-    return hc_pre_device_locked(g_scratch.d_state,
+    return hc_pre_device_locked(hc_state_device,
                                 fn_device,
-                                g_scratch.d_scale,
-                                g_scratch.d_base,
+                                scratch.d_scale,
+                                scratch.d_base,
                                 n_embd,
                                 n_hc,
                                 sinkhorn_iters,
@@ -548,6 +665,66 @@ bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
                                 working_device,
                                 post_device,
                                 comb_device,
+                                scratch,
+                                nullptr,
+                                true,
+                                true);
+}
+
+bool deepseek4_cuda_hc_pre_device_params_on_backend(ggml_backend_t backend,
+                                                    const void * hc_state_device,
+                                                    const void * fn_device,
+                                                    const float * scale_host,
+                                                    const float * base_host,
+                                                    int           n_embd,
+                                                    int           n_hc,
+                                                    int           sinkhorn_iters,
+                                                    float         eps,
+                                                    void *        working_device,
+                                                    void *        post_device,
+                                                    void *        comb_device) {
+    if (!hc_state_device || !fn_device || !scale_host || !base_host ||
+        !working_device || !post_device || !comb_device ||
+        n_embd <= 0 || n_hc <= 0 || n_hc > kMaxHc) {
+        return false;
+    }
+    const int hc_dim = n_embd * n_hc;
+    const int mix_dim = 2 * n_hc + n_hc * n_hc;
+    if (mix_dim > kMaxMixDim) {
+        return false;
+    }
+
+    cudaStream_t stream = hc_backend_stream_or_default(backend);
+    std::lock_guard<std::mutex> lock(g_mu);
+    HcCudaScratch & scratch = hc_scratch_for_stream(stream);
+    if (!scratch.ensure((size_t) hc_dim, (size_t) n_embd, (size_t) n_hc)) {
+        std::fprintf(stderr, "[deepseek4-hc-direct] ensure failed\n");
+        return false;
+    }
+    if (cudaMemcpy(scratch.d_scale, scale_host, sizeof(float) * (size_t) mix_dim,
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        hc_log_cuda_error("copy scale", cudaGetLastError());
+        return false;
+    }
+    if (cudaMemcpy(scratch.d_base, base_host, sizeof(float) * (size_t) mix_dim,
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        hc_log_cuda_error("copy base", cudaGetLastError());
+        return false;
+    }
+    return hc_pre_device_locked(hc_state_device,
+                                fn_device,
+                                scratch.d_scale,
+                                scratch.d_base,
+                                n_embd,
+                                n_hc,
+                                sinkhorn_iters,
+                                eps,
+                                working_device,
+                                post_device,
+                                comb_device,
+                                scratch,
+                                stream,
+                                false,
                                 true);
 }
 
