@@ -13,11 +13,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include "vision_types.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -177,7 +180,57 @@ struct GenerateRequest {
     // path returns success but emits no tokens, so each backend can route the
     // retry through its existing AR path without copying retry policy.
     bool                       force_ar_decode = false;
+    // Native mmproj vision prompt. When set, backends run multimodal prefill
+    // instead of token-id prefill and force AR decode.
+    std::unique_ptr<MultimodalPrompt> multimodal;
+
+    GenerateRequest() = default;
+    GenerateRequest(const GenerateRequest & other);
+    GenerateRequest & operator=(const GenerateRequest & other);
+    GenerateRequest(GenerateRequest &&) noexcept = default;
+    GenerateRequest & operator=(GenerateRequest &&) noexcept = default;
 };
+
+inline GenerateRequest::GenerateRequest(const GenerateRequest & other)
+    : prompt(other.prompt),
+      n_gen(other.n_gen),
+      sampler(other.sampler),
+      do_sample(other.do_sample),
+      stream(other.stream),
+      snap_pos(other.snap_pos),
+      snap_slot(other.snap_slot),
+      on_token(other.on_token),
+      hint_tokens(other.hint_tokens),
+      stall_tool_prefix_tokens(other.stall_tool_prefix_tokens),
+      stall_action_suffix_tokens(other.stall_action_suffix_tokens),
+      stall_skip_tokens(other.stall_skip_tokens),
+      budget_hook(other.budget_hook),
+      force_ar_decode(other.force_ar_decode),
+      multimodal(other.multimodal
+          ? std::make_unique<MultimodalPrompt>(*other.multimodal)
+          : nullptr) {}
+
+inline GenerateRequest & GenerateRequest::operator=(const GenerateRequest & other) {
+    if (this == &other) return *this;
+    prompt = other.prompt;
+    n_gen = other.n_gen;
+    sampler = other.sampler;
+    do_sample = other.do_sample;
+    stream = other.stream;
+    snap_pos = other.snap_pos;
+    snap_slot = other.snap_slot;
+    on_token = other.on_token;
+    hint_tokens = other.hint_tokens;
+    stall_tool_prefix_tokens = other.stall_tool_prefix_tokens;
+    stall_action_suffix_tokens = other.stall_action_suffix_tokens;
+    stall_skip_tokens = other.stall_skip_tokens;
+    budget_hook = other.budget_hook;
+    force_ar_decode = other.force_ar_decode;
+    multimodal = other.multimodal
+        ? std::make_unique<MultimodalPrompt>(*other.multimodal)
+        : nullptr;
+    return *this;
+}
 
 // Stable, backend-independent generation failure categories. Backends should
 // use these for recurrent failures so callers do not need to understand

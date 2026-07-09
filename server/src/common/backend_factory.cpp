@@ -270,6 +270,8 @@ std::unique_ptr<ModelBackend> create_backend(
         cfg.ddtree_temp        = args.ddtree_temp;
         cfg.ddtree_chain_seed  = args.ddtree_chain_seed;
         cfg.use_feature_mirror = args.use_feature_mirror;
+        cfg.mmproj_path        = args.mmproj_path;
+        cfg.mmproj_use_gpu     = args.mmproj_use_gpu;
 
         auto backend = std::make_unique<Qwen35Backend>(cfg);
         if (!backend->init()) {

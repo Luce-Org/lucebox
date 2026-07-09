@@ -39,6 +39,12 @@
 
 #include "kv_quant.h"
 
+#ifdef DFLASH_HAVE_MMPROJ
+#include "vision_encoder.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
+#endif
+
 namespace dflash::common {
 
 namespace {
@@ -333,6 +339,18 @@ bool Qwen35Backend::init() {
             std::fprintf(stderr, "warning: feature mirror init failed, spec decode will use AR fallback\n");
         }
     }
+
+#ifdef DFLASH_HAVE_MMPROJ
+    if (cfg_.mmproj_path) {
+        vision_ = std::make_unique<VisionEncoder>();
+        const int n_threads = env_int_or_default("DFLASH_MMPROJ_THREADS", 4);
+        if (!vision_->init(cfg_.target_path, cfg_.mmproj_path,
+                           cfg_.mmproj_use_gpu, n_threads)) {
+            std::fprintf(stderr, "[qwen35] VisionEncoder init failed\n");
+            return false;
+        }
+    }
+#endif
 
     return true;
 }
@@ -806,7 +824,24 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
 
     // Prefill
     auto t_prefill_start = std::chrono::steady_clock::now();
-    const int committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
+    const bool use_multimodal = req.multimodal && !req.multimodal->images.empty();
+#ifdef DFLASH_HAVE_MMPROJ
+    const bool vision_ready = vision_ && vision_->ready();
+#else
+    const bool vision_ready = false;
+#endif
+    int committed = -1;
+    if (use_multimodal) {
+        if (!vision_ready) {
+            result.fail(GenerateErrorCode::AdapterUnavailable,
+                        "vision not configured");
+            return result;
+        }
+        committed = do_prefill_multimodal(*req.multimodal, out_io,
+                                          req.snap_pos, req.snap_slot);
+    } else {
+        committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
+    }
     if (committed < 0) {
         result.fail(GenerateErrorCode::PrefillFailed);
         return result;
@@ -824,7 +859,8 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
         // generation. Most requests never hit the tail because the
         // model closes </think> naturally well before the budget edge.
         bool decode_ok = false;
-        if (req.force_ar_decode) {
+        const bool force_ar = req.force_ar_decode || use_multimodal;
+        if (force_ar) {
             decode_ok = do_ar_decode(committed, req.n_gen, result.tokens, out_io,
                                      req.budget_hook,
                                      &result.budget_forced_close,
@@ -963,6 +999,8 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         }
     }
 
+    const bool use_multimodal = req.multimodal && !req.multimodal->images.empty();
+
     // Decode
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
@@ -973,7 +1011,8 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         // generation. Most requests never hit the tail because the
         // model closes </think> naturally well before the budget edge.
         bool decode_ok = false;
-        if (req.force_ar_decode) {
+        const bool force_ar = req.force_ar_decode || use_multimodal;
+        if (force_ar) {
             decode_ok = do_ar_decode(committed, req.n_gen, result.tokens, out_io,
                                      req.budget_hook,
                                      &result.budget_forced_close,
@@ -1280,6 +1319,247 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
 
     return committed;
 }
+
+#ifdef DFLASH_HAVE_MMPROJ
+
+namespace {
+
+void build_bidirectional_mask(std::vector<uint16_t> & out,
+                              int kv_len, int n_tokens, int kv_pos,
+                              int kq_stride_pad, int kv_pad_override = 0) {
+    const int kv_pad = (kv_pad_override > 0) ? kv_pad_override
+                                             : align_up(kv_len, kq_stride_pad);
+    const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
+    out.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
+    for (int q = 0; q < n_tokens; q++) {
+        for (int k = 0; k < kv_pos; k++) {
+            out[(size_t)q * kv_pad + k] = F16_ZERO;
+        }
+        for (int k = kv_pos; k < kv_pos + n_tokens; k++) {
+            out[(size_t)q * kv_pad + k] = F16_ZERO;
+        }
+    }
+}
+
+}  // namespace
+
+bool Qwen35Backend::do_prefill_embed_chunk(int kv_pos, int n_tokens,
+                                           const float * embeds, int hidden,
+                                           const std::vector<int32_t> & pos_buf,
+                                           bool with_mask,
+                                           bool last_token_logits_only,
+                                           bool non_causal_within_chunk) {
+    if (!build_target_step(sg_, w_, cache_, target_backend_,
+                           /*kv_start=*/kv_pos, /*n_tokens=*/n_tokens,
+                           with_mask, /*capture=*/true,
+                           /*capture_delta_intermediate=*/false,
+                           /*fa_window=*/0,
+                           /*last_token_logits_only=*/last_token_logits_only,
+                           cfg_.kq_stride_pad,
+                           should_capture_moe_router(),
+                           /*kvflash_mask=*/false)) {
+        std::fprintf(stderr, "multimodal prefill build @%d\n", kv_pos);
+        return false;
+    }
+
+    ggml_backend_tensor_set(sg_.inp_embed, embeds, 0,
+                            sizeof(float) * (size_t)hidden * (size_t)n_tokens);
+    ggml_backend_tensor_set(sg_.positions, pos_buf.data(), 0,
+                            sizeof(int32_t) * pos_buf.size());
+
+    if (sg_.attn_mask) {
+        const int kv_len = kv_pos + n_tokens;
+        std::vector<uint16_t> mask_buf;
+        const int kv_pad_override = (int)sg_.attn_mask->ne[0];
+        if (non_causal_within_chunk) {
+            build_bidirectional_mask(mask_buf, kv_len, n_tokens, kv_pos,
+                                     cfg_.kq_stride_pad, kv_pad_override);
+        } else {
+            build_causal_mask(mask_buf, kv_len, n_tokens, kv_pos,
+                              cfg_.kq_stride_pad, 0, kv_pad_override);
+        }
+        ggml_backend_tensor_set(sg_.attn_mask, mask_buf.data(), 0,
+                                sizeof(uint16_t) * mask_buf.size());
+    }
+
+    auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "multimodal prefill compute @%d failed\n", kv_pos);
+        return false;
+    }
+    after_target_compute(sg_, kv_pos, n_tokens);
+    return true;
+}
+
+int Qwen35Backend::do_prefill_multimodal(MultimodalPrompt & mm,
+                                         const DaemonIO & io,
+                                         int snap_pos, int snap_slot,
+                                         int kv_offset) {
+    (void)io;
+    if (!vision_ || !vision_->ready()) {
+        std::fprintf(stderr, "[vision] encoder not initialized\n");
+        return -1;
+    }
+    if (kv_offset != 0) {
+        std::fprintf(stderr, "[vision] multimodal restore prefill unsupported\n");
+        return -1;
+    }
+
+    const int hidden = w_.n_embd;
+    const int vocab  = w_.n_vocab;
+    prefill_last_logits_valid_ = false;
+    reset_recurrent_state(cache_);
+
+    mtmd_input_chunks * chunks = vision_->tokenize(mm.marked_text, mm.images);
+    if (!chunks) return -1;
+
+    struct ChunksGuard {
+        mtmd_input_chunks * p;
+        ~ChunksGuard() { if (p) mtmd_input_chunks_free(p); }
+    } chunks_guard{chunks};
+
+    const size_t n_chunks = mtmd_input_chunks_size(chunks);
+    if (n_chunks == 0) return 0;
+
+    const int max_verify_tokens = cfg_.ddtree_mode
+        ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
+        : dw_.block_size;
+    if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
+                               max_verify_tokens,
+                               target_backend_, cache_)) {
+        std::fprintf(stderr, "multimodal prefill: cache migration failed: %s\n",
+                     dflash27b_last_error());
+        return -1;
+    }
+
+    std::vector<float> embed_buf;
+    int committed = kv_offset;
+
+    for (size_t ci = 0; ci < n_chunks; ci++) {
+        const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, ci);
+        const auto chunk_type = mtmd_input_chunk_get_type(chunk);
+        const bool is_last_chunk = (ci + 1 == n_chunks);
+        const int kv_pos = committed;
+
+        if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            size_t n_tokens_sz = 0;
+            const llama_token * toks =
+                mtmd_input_chunk_get_tokens_text(chunk, &n_tokens_sz);
+            const int n_tokens = (int)n_tokens_sz;
+            if (n_tokens <= 0) continue;
+
+            std::vector<int32_t> tokens(n_tokens);
+            for (int i = 0; i < n_tokens; i++) tokens[(size_t)i] = (int32_t)toks[i];
+
+            embed_buf.resize((size_t)hidden * (size_t)n_tokens);
+            if (!w_.embedder.embed(tokens.data(), n_tokens, embed_buf.data())) {
+                return -1;
+            }
+
+            std::vector<int32_t> pos_buf((size_t)4 * (size_t)n_tokens, 0);
+            for (int i = 0; i < n_tokens; i++) {
+                const int p = kv_pos + i;
+                pos_buf[4 * i + 0] = p;
+                pos_buf[4 * i + 1] = p;
+                pos_buf[4 * i + 2] = p;
+                pos_buf[4 * i + 3] = 0;
+            }
+
+            const bool with_mask = (cfg_.kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
+            if (!do_prefill_embed_chunk(kv_pos, n_tokens, embed_buf.data(), hidden,
+                                        pos_buf, with_mask,
+                                        /*last_token_logits_only=*/!is_last_chunk,
+                                        /*non_causal_within_chunk=*/false)) {
+                return -1;
+            }
+
+            committed = kv_pos + n_tokens;
+        } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ||
+                   chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+            const int n_tokens = (int)mtmd_input_chunk_get_n_tokens(chunk);
+            if (n_tokens <= 0) continue;
+
+            if (!vision_->encode_chunk(chunk)) return -1;
+            float * embd = vision_->output_embeddings();
+            if (!embd) return -1;
+
+            std::vector<int32_t> pos_buf;
+            if (vision_->uses_mrope() &&
+                chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+                const auto * image_tokens = mtmd_input_chunk_get_tokens_image(chunk);
+                if (!image_tokens) return -1;
+                std::vector<mtmd_decoder_pos> rel_pos((size_t)n_tokens);
+                vision_->get_image_decoder_pos(image_tokens, rel_pos.data(),
+                                              (size_t)n_tokens);
+                pos_buf.resize((size_t)4 * (size_t)n_tokens, 0);
+                for (int i = 0; i < n_tokens; i++) {
+                    pos_buf[4 * i + 0] = kv_pos + (int)rel_pos[(size_t)i].t;
+                    pos_buf[4 * i + 1] = kv_pos + (int)rel_pos[(size_t)i].y;
+                    pos_buf[4 * i + 2] = kv_pos + (int)rel_pos[(size_t)i].x;
+                    pos_buf[4 * i + 3] = 0;
+                }
+            } else {
+                pos_buf.resize((size_t)4 * (size_t)n_tokens, 0);
+                for (int i = 0; i < n_tokens; i++) {
+                    const int p = kv_pos + i;
+                    pos_buf[4 * i + 0] = p;
+                    pos_buf[4 * i + 1] = p;
+                    pos_buf[4 * i + 2] = p;
+                    pos_buf[4 * i + 3] = 0;
+                }
+            }
+
+            const bool non_causal = vision_->uses_non_causal(chunk);
+            const bool with_mask = non_causal || (cfg_.kq_stride_pad > KQ_MASK_PAD) ||
+                                   (n_tokens > 1);
+            if (!do_prefill_embed_chunk(kv_pos, n_tokens, embd, hidden,
+                                        pos_buf, with_mask,
+                                        /*last_token_logits_only=*/!is_last_chunk,
+                                        non_causal)) {
+                return -1;
+            }
+
+            committed = kv_pos + (int)mtmd_input_chunk_get_n_pos(chunk);
+        } else {
+            std::fprintf(stderr, "[vision] unsupported mtmd chunk type\n");
+            return -1;
+        }
+
+        cache_.cur_pos = committed;
+
+        const int chunk_kv_len = committed - kv_pos;
+        if (chunk_kv_len > 0) {
+            if (remote_draft_.active() && !draft_parked_) {
+                if (!sync_remote_draft_features(kv_pos, chunk_kv_len)) return -1;
+            } else if (feature_mirror_.target_feat && !draft_parked_) {
+                draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
+                                                feature_mirror_, kv_pos, chunk_kv_len);
+            }
+        }
+
+        int32_t last_tok = -1;
+        ggml_backend_tensor_get(sg_.argmax_tokens, &last_tok, 0, sizeof(int32_t));
+        cache_.last_tok = last_tok;
+        if (is_last_chunk) {
+            prefill_last_logits_offset_ =
+                (size_t)(mtmd_input_chunk_get_n_tokens(chunk) - 1) *
+                (size_t)vocab * sizeof(float);
+            prefill_last_logits_valid_ = true;
+        }
+    }
+
+    if (snap_slot >= 0 && snap_pos == committed) {
+        if (snapshot_save(snap_slot)) {
+            std::printf("[snap] multimodal end-of-prefill slot=%d cur_pos=%d\n",
+                        snap_slot, committed);
+            std::fflush(stdout);
+        }
+    }
+
+    return committed;
+}
+
+#endif  // DFLASH_HAVE_MMPROJ
 
 // ── kvflash helpers ─────────────────────────────────────────────────
 
