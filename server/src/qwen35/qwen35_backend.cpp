@@ -1458,6 +1458,9 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                         "vision not configured");
             return result;
         }
+        // Free oversized gallocr/BSA scratch from prior text-only requests before
+        // multimodal prefill reserves a fresh graph (avoids CUDA OOM on agent payloads).
+        release_scratch();
         committed = do_prefill_multimodal(*req.multimodal, out_io,
                                           req.snap_pos, req.snap_slot);
     } else {
@@ -2120,6 +2123,11 @@ int Qwen35Backend::do_prefill_multimodal(MultimodalPrompt & mm,
         return -1;
     }
 
+    int prefill_ubatch = 512;
+    if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
+        prefill_ubatch = std::max(1, std::atoi(s));
+    }
+
     std::vector<float> embed_buf;
     int committed = kv_offset;
 
@@ -2136,29 +2144,43 @@ int Qwen35Backend::do_prefill_multimodal(MultimodalPrompt & mm,
             const int n_tokens = (int)n_tokens_sz;
             if (n_tokens <= 0) continue;
 
+            if (n_tokens > prefill_ubatch) {
+                std::fprintf(stderr,
+                    "[vision] chunking text mtmd_chunk=%zu tokens=%d ubatch=%d\n",
+                    ci, n_tokens, prefill_ubatch);
+            }
+
             std::vector<int32_t> tokens(n_tokens);
             for (int i = 0; i < n_tokens; i++) tokens[(size_t)i] = (int32_t)toks[i];
 
-            embed_buf.resize((size_t)hidden * (size_t)n_tokens);
-            if (!w_.embedder.embed(tokens.data(), n_tokens, embed_buf.data())) {
-                return -1;
-            }
+            for (int start = 0; start < n_tokens; ) {
+                const int sub_n = std::min(prefill_ubatch, n_tokens - start);
+                const bool is_last_sub = (start + sub_n >= n_tokens);
+                const bool sub_last_logits_only = !(is_last_chunk && is_last_sub);
 
-            std::vector<int32_t> pos_buf((size_t)4 * (size_t)n_tokens, 0);
-            for (int i = 0; i < n_tokens; i++) {
-                const int p = kv_pos + i;
-                pos_buf[4 * i + 0] = p;
-                pos_buf[4 * i + 1] = p;
-                pos_buf[4 * i + 2] = p;
-                pos_buf[4 * i + 3] = 0;
-            }
+                embed_buf.resize((size_t)hidden * (size_t)sub_n);
+                if (!w_.embedder.embed(tokens.data() + start, sub_n,
+                                       embed_buf.data())) {
+                    return -1;
+                }
 
-            const bool with_mask = (cfg_.kq_stride_pad > KQ_MASK_PAD) || (n_tokens > 1);
-            if (!do_prefill_embed_chunk(kv_pos, n_tokens, embed_buf.data(), hidden,
-                                        pos_buf, with_mask,
-                                        /*last_token_logits_only=*/!is_last_chunk,
-                                        /*non_causal_within_chunk=*/false)) {
-                return -1;
+                std::vector<int32_t> pos_buf((size_t)4 * (size_t)sub_n, 0);
+                for (int i = 0; i < sub_n; i++) {
+                    const int p = kv_pos + start + i;
+                    pos_buf[4 * i + 0] = p;
+                    pos_buf[4 * i + 1] = p;
+                    pos_buf[4 * i + 2] = p;
+                    pos_buf[4 * i + 3] = 0;
+                }
+
+                const bool with_mask = (cfg_.kq_stride_pad > KQ_MASK_PAD) || (sub_n > 1);
+                if (!do_prefill_embed_chunk(kv_pos + start, sub_n, embed_buf.data(),
+                                            hidden, pos_buf, with_mask,
+                                            sub_last_logits_only,
+                                            /*non_causal_within_chunk=*/false)) {
+                    return -1;
+                }
+                start += sub_n;
             }
 
             committed = kv_pos + n_tokens;
