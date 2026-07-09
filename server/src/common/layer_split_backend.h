@@ -28,6 +28,12 @@ public:
     virtual int prefill_chunk_tokens() const { return 0; }
     virtual bool prefill(const std::vector<int32_t> & prompt,
                          int base_pos, int & last_tok) = 0;
+    virtual bool supports_multimodal() const { return false; }
+    virtual int prefill_multimodal(MultimodalPrompt & mm, int & last_tok) {
+        (void)mm;
+        (void)last_tok;
+        return -1;
+    }
     // history_prefix is the full original request prompt (not the delta
     // prefill after a prefix-cache restore); it seeds sampler penalty history.
     virtual bool decode_ar(int last_tok, int committed, int n_gen,
@@ -77,6 +83,7 @@ public:
         return false;
     }
     virtual int current_last_token() const { return -1; }
+    virtual int current_cur_pos() const { return 0; }
 
     virtual void shutdown() = 0;
 };

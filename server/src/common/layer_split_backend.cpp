@@ -56,7 +56,11 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
     }
 
     DaemonIO out_io = io.with_token_callback(req.on_token);
-    if (base_pos + (int)req.prompt.size() + req.n_gen + 1 > adapter_->max_context()) {
+    const bool use_multimodal =
+        req.multimodal && !req.multimodal->images.empty();
+
+    if (!use_multimodal &&
+        base_pos + (int)req.prompt.size() + req.n_gen + 1 > adapter_->max_context()) {
         result.fail(GenerateErrorCode::ContextOverflow);
         return result;
     }
@@ -69,40 +73,66 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
     adapter_->begin_request(req);
     if (reset_state) adapter_->reset_request_state();
 
-    const int prompt_len = (int)req.prompt.size();
-    const int adapter_chunk = adapter_->prefill_chunk_tokens();
-    int last_tok = (base_pos > 0 && prompt_len == 0)
+    int last_tok = (base_pos > 0 && !use_multimodal && req.prompt.empty())
         ? adapter_->current_last_token()
         : -1;
-    int consumed = 0;
     auto t_prefill_start = std::chrono::steady_clock::now();
-    while (consumed < prompt_len) {
-        if (out_io.is_cancelled()) break;
-        int n_tokens = prompt_len - consumed;
-        if (adapter_chunk > 0 && n_tokens > adapter_chunk) {
-            n_tokens = adapter_chunk;
+
+    if (use_multimodal) {
+        if (!adapter_->supports_multimodal()) {
+            result.fail(GenerateErrorCode::AdapterUnavailable,
+                        "vision not configured");
+            return result;
         }
-        if (req.snap_pos >= 0 && req.snap_slot >= 0 &&
-            req.snap_pos > base_pos + consumed &&
-            req.snap_pos < base_pos + consumed + n_tokens) {
-            n_tokens = req.snap_pos - (base_pos + consumed);
-        }
-        std::vector<int32_t> chunk(req.prompt.begin() + consumed,
-                                   req.prompt.begin() + consumed + n_tokens);
-        if (!adapter_->prefill(chunk, base_pos + consumed, last_tok)) {
+        MultimodalPrompt mm = *req.multimodal;
+        const int committed = adapter_->prefill_multimodal(mm, last_tok);
+        if (committed < 0) {
             result.fail(GenerateErrorCode::PrefillFailed);
             return result;
         }
-        consumed += n_tokens;
+        if (committed + req.n_gen + 1 > adapter_->max_context()) {
+            result.fail(GenerateErrorCode::ContextOverflow);
+            return result;
+        }
         if (req.snap_pos >= 0 && req.snap_slot >= 0 &&
-            base_pos + consumed == req.snap_pos) {
-            if (adapter_->snapshot_save(req.snap_slot)) {
-                std::printf("[snap] inline slot=%d cur_pos=%d\n",
-                            req.snap_slot, req.snap_pos);
-                std::fflush(stdout);
+            adapter_->snapshot_save(req.snap_slot)) {
+            std::printf("[snap] inline slot=%d cur_pos=%d\n",
+                        req.snap_slot, req.snap_pos);
+            std::fflush(stdout);
+        }
+    } else {
+        const int prompt_len = (int)req.prompt.size();
+        const int adapter_chunk = adapter_->prefill_chunk_tokens();
+        int consumed = 0;
+        while (consumed < prompt_len) {
+            if (out_io.is_cancelled()) break;
+            int n_tokens = prompt_len - consumed;
+            if (adapter_chunk > 0 && n_tokens > adapter_chunk) {
+                n_tokens = adapter_chunk;
+            }
+            if (req.snap_pos >= 0 && req.snap_slot >= 0 &&
+                req.snap_pos > base_pos + consumed &&
+                req.snap_pos < base_pos + consumed + n_tokens) {
+                n_tokens = req.snap_pos - (base_pos + consumed);
+            }
+            std::vector<int32_t> chunk(req.prompt.begin() + consumed,
+                                       req.prompt.begin() + consumed + n_tokens);
+            if (!adapter_->prefill(chunk, base_pos + consumed, last_tok)) {
+                result.fail(GenerateErrorCode::PrefillFailed);
+                return result;
+            }
+            consumed += n_tokens;
+            if (req.snap_pos >= 0 && req.snap_slot >= 0 &&
+                base_pos + consumed == req.snap_pos) {
+                if (adapter_->snapshot_save(req.snap_slot)) {
+                    std::printf("[snap] inline slot=%d cur_pos=%d\n",
+                                req.snap_slot, req.snap_pos);
+                    std::fflush(stdout);
+                }
             }
         }
     }
+
     result.prefill_s = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t_prefill_start).count();
     if (out_io.is_cancelled()) {
@@ -116,13 +146,17 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
             return result;
         }
         auto t_decode_start = std::chrono::steady_clock::now();
-        const bool use_dflash = !req.force_ar_decode && adapter_->can_dflash_decode();
+        const int committed_pos = use_multimodal
+            ? adapter_->current_cur_pos()
+            : base_pos + (int)req.prompt.size();
+        const bool force_ar = req.force_ar_decode || use_multimodal;
+        const bool use_dflash = !force_ar && adapter_->can_dflash_decode();
         if (use_dflash) result.spec_decode_ran = true;
         float dflash_accept_rate = 0.0f;
         const bool ok = use_dflash
             ? adapter_->decode_dflash(req.prompt, base_pos, last_tok, req.n_gen,
                                       result.tokens, out_io, dflash_accept_rate)
-            : adapter_->decode_ar(last_tok, base_pos + (int)req.prompt.size(), req.n_gen,
+            : adapter_->decode_ar(last_tok, committed_pos, req.n_gen,
                                   history_prefix,
                                   result.tokens, out_io);
         if (use_dflash) result.accept_rate = dflash_accept_rate;

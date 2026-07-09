@@ -16,6 +16,7 @@
 #include "qwen35/prefill_helpers.h"
 #include "qwen3/qwen3_drafter.h"
 #include "qwen3/qwen3_kvflash_scorer.h"
+#include "vision/vision_encoder.h"
 #include "kv_quant.h"
 
 #include "ggml-cuda.h"
@@ -109,6 +110,20 @@ bool Qwen35LayerSplitAdapter::init() {
     if (cfg_.draft_path && cfg_.run_dflash && !load_draft()) {
         return false;
     }
+
+#ifdef DFLASH_HAVE_MMPROJ
+    if (cfg_.mmproj_path && cfg_.mmproj_path[0]) {
+        vision_ = std::make_unique<VisionEncoder>();
+        if (!vision_->init(cfg_.target_path, cfg_.mmproj_path,
+                           cfg_.mmproj_use_gpu, cfg_.mmproj_threads)) {
+            std::fprintf(stderr, "[target-split][vision] mmproj init failed\n");
+            return false;
+        }
+        std::fprintf(stderr, "[target-split][vision] mmproj loaded: %s\n",
+                     cfg_.mmproj_path);
+    }
+#endif
+
     prefix_snapshots_.resize(PREFIX_SLOTS);
     for (auto & slot : prefix_snapshots_) {
         slot.resize(shards_.size());
@@ -1278,6 +1293,11 @@ int Qwen35LayerSplitAdapter::current_last_token() const {
     return shards_.front().cache.last_tok;
 }
 
+int Qwen35LayerSplitAdapter::current_cur_pos() const {
+    if (shards_.empty()) return 0;
+    return shards_.front().cache.cur_pos;
+}
+
 bool Qwen35LayerSplitAdapter::decode_ar(
         int last_tok, int committed, int n_gen,
         const std::vector<int32_t> & history_prefix,
@@ -1423,6 +1443,9 @@ DFlashTarget * Qwen35LayerSplitAdapter::dflash_target() {
 
 void Qwen35LayerSplitAdapter::shutdown() {
     dflash_target_.reset();
+#ifdef DFLASH_HAVE_MMPROJ
+    vision_.reset();
+#endif
     free_drafter();
     for (int slot = 0; slot < (int)prefix_snapshots_.size(); ++slot) {
         snapshot_free(slot);
