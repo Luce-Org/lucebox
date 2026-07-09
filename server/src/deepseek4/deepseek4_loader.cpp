@@ -304,7 +304,22 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     const uint32_t n_lora_o       = get_u32_or(gctx, "deepseek4.attention.output_lora_rank", 1024);
     const uint32_t n_out_group    = get_u32_or(gctx, "deepseek4.attention.output_group_count", 8);
     const uint32_t n_expert       = get_u32_or(gctx, "deepseek4.expert_count", 256);
-    const uint32_t n_expert_used  = get_u32_or(gctx, "deepseek4.expert_used_count", 6);
+    const uint32_t n_expert_used_meta = get_u32_or(gctx, "deepseek4.expert_used_count", 6);
+    uint32_t n_expert_used = n_expert_used_meta;
+    if (const char * topk_env = std::getenv("DFLASH_DS4_TOPK")) {
+        char * end = nullptr;
+        const long parsed = std::strtol(topk_env, &end, 10);
+        if (end != topk_env && parsed > 0) {
+            const uint32_t requested = (uint32_t) parsed;
+            n_expert_used = std::max<uint32_t>(
+                1, std::min<uint32_t>(requested, n_expert_used_meta));
+            if (n_expert_used != n_expert_used_meta) {
+                std::fprintf(stderr,
+                             "[deepseek4] DFLASH_DS4_TOPK=%u: routed experts %u -> %u\n",
+                             requested, n_expert_used_meta, n_expert_used);
+            }
+        }
+    }
     const uint32_t n_expert_shared = get_u32_or(gctx, "deepseek4.expert_shared_count", 1);
     const uint32_t n_ff_exp       = get_u32_or(gctx, "deepseek4.expert_feed_forward_length", 2048);
     const uint32_t n_hash_layer   = get_u32_or(gctx, "deepseek4.hash_layer_count", 3);

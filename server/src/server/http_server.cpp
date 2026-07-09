@@ -108,6 +108,89 @@ static bool prompt_ends_in_open_think(const std::string & prompt) {
            prompt.compare(end - kThinkOpenLen, kThinkOpenLen, kThinkOpen) == 0;
 }
 
+class Utf8OutputFilter {
+public:
+    std::string push(const std::string & text) {
+        pending_ += text;
+        return drain(false);
+    }
+
+    std::string finish() {
+        std::string out = drain(true);
+        pending_.clear();
+        return out;
+    }
+
+private:
+    static bool is_cont(uint8_t c) {
+        return (c & 0xC0) == 0x80;
+    }
+
+    std::string drain(bool final) {
+        std::string out;
+        size_t i = 0;
+        while (i < pending_.size()) {
+            const uint8_t c0 = (uint8_t) pending_[i];
+            if (c0 < 0x80) {
+                out.push_back((char)c0);
+                ++i;
+                continue;
+            }
+
+            int need = 0;
+            uint32_t cp = 0;
+            uint32_t min_cp = 0;
+            if (c0 >= 0xC2 && c0 <= 0xDF) {
+                need = 2;
+                cp = c0 & 0x1F;
+                min_cp = 0x80;
+            } else if (c0 >= 0xE0 && c0 <= 0xEF) {
+                need = 3;
+                cp = c0 & 0x0F;
+                min_cp = 0x800;
+            } else if (c0 >= 0xF0 && c0 <= 0xF4) {
+                need = 4;
+                cp = c0 & 0x07;
+                min_cp = 0x10000;
+            } else {
+                ++i;
+                continue;
+            }
+
+            if (i + (size_t)need > pending_.size()) {
+                if (!final) break;
+                i = pending_.size();
+                break;
+            }
+
+            bool ok = true;
+            for (int j = 1; j < need; ++j) {
+                const uint8_t cj = (uint8_t) pending_[i + (size_t)j];
+                if (!is_cont(cj)) {
+                    ok = false;
+                    break;
+                }
+                cp = (cp << 6) | (cj & 0x3F);
+            }
+            if (!ok || cp < min_cp || (cp >= 0xD800 && cp <= 0xDFFF) ||
+                cp > 0x10FFFF) {
+                ++i;
+                continue;
+            }
+
+            // Do not surface replacement characters from byte-fallback noise.
+            if (cp != 0xFFFD) {
+                out.append(pending_, i, (size_t)need);
+            }
+            i += (size_t)need;
+        }
+        pending_.erase(0, i);
+        return out;
+    }
+
+    std::string pending_;
+};
+
 // ─── piecewise keep-ratio curve ─────────────────────────────────────────
 
 static float pflash_keep_ratio(const ServerConfig & cfg, int n_tokens) {
@@ -2755,6 +2838,28 @@ void HttpServer::worker_loop() {
         int completion_tokens = 0;
         bool visible_output_seen = false;
         bool client_disconnected = false;
+        Utf8OutputFilter live_output_filter;
+
+        auto send_live_text = [&](const std::string & text) -> bool {
+            if (text.empty()) return true;
+            visible_output_seen = true;
+            broadcast_token(text);
+            if (req.stream) {
+                auto chunks = emitter.emit_token(text);
+                for (const auto & chunk : chunks) {
+                    if (!send_all(fd, chunk.data(), chunk.size())) {
+                        client_disconnected = true;
+                        return false;
+                    }
+                }
+                if (emitter.stop_hit()) return false;
+            }
+            return true;
+        };
+
+        auto emit_live_text = [&](const std::string & text) -> bool {
+            return send_live_text(live_output_filter.push(text));
+        };
 
         io.on_token = [&](int32_t token) -> bool {
             if (client_disconnected) return false;
@@ -2775,23 +2880,11 @@ void HttpServer::worker_loop() {
 
             // Gemma4 thinking channel: map <|channel> → <think>, <channel|> → </think>\n
             if (raw == "<|channel>") {
-                visible_output_seen = true;
-                broadcast_token("<think>");
-                if (req.stream) {
-                    auto chunks = emitter.emit_token("<think>");
-                    for (const auto & chunk : chunks)
-                        if (!send_all(fd, chunk.data(), chunk.size())) { client_disconnected = true; return false; }
-                }
+                if (!emit_live_text("<think>")) return false;
                 return true;
             }
             if (raw == "<channel|>") {
-                visible_output_seen = true;
-                broadcast_token("</think>\n");
-                if (req.stream) {
-                    auto chunks = emitter.emit_token("</think>\n");
-                    for (const auto & chunk : chunks)
-                        if (!send_all(fd, chunk.data(), chunk.size())) { client_disconnected = true; return false; }
-                }
+                if (!emit_live_text("</think>\n")) return false;
                 return true;
             }
 
@@ -2803,14 +2896,8 @@ void HttpServer::worker_loop() {
             // reasoning_content with empty visible content. Forward the text
             // form into the emitter so parse_reasoning() can split correctly.
             if (raw == "<think>" || raw == "</think>") {
-                visible_output_seen = true;
-                broadcast_token(raw == "</think>" ? "</think>\n" : "<think>");
-                if (req.stream) {
-                    auto chunks = emitter.emit_token(
-                        raw == "</think>" ? "</think>\n" : "<think>");
-                    for (const auto & chunk : chunks)
-                        if (!send_all(fd, chunk.data(), chunk.size())) { client_disconnected = true; return false; }
-                }
+                if (!emit_live_text(raw == "</think>" ? "</think>\n" : "<think>"))
+                    return false;
                 return true;
             }
 
@@ -2822,24 +2909,7 @@ void HttpServer::worker_loop() {
             }
 
             std::string text = tokenizer_.token_text(token);
-
-            // Send token text to status page clients (browser accumulates).
-            if (!text.empty()) {
-                visible_output_seen = true;
-                broadcast_token(text);
-            }
-
-            if (req.stream && !text.empty()) {
-                auto chunks = emitter.emit_token(text);
-                for (const auto & chunk : chunks) {
-                    if (!send_all(fd, chunk.data(), chunk.size())) {
-                        client_disconnected = true;
-                        return false;
-                    }
-                }
-                // Stop generation if a stop sequence was hit.
-                if (emitter.stop_hit()) return false;
-            }
+            if (!emit_live_text(text)) return false;
             return true;
         };
 
@@ -2870,6 +2940,9 @@ void HttpServer::worker_loop() {
             result = backend_.restore_and_generate(cache_slot, gen_req, io);
         } else {
             result = backend_.generate(gen_req, io);
+        }
+        if (!client_disconnected) {
+            (void) send_live_text(live_output_filter.finish());
         }
 
         if (dflash_residency == DraftResidencyAction::ReleaseAfterUse &&
@@ -3022,14 +3095,27 @@ void HttpServer::worker_loop() {
         } else if (!req.stream && !client_disconnected) {
             // Non-streaming: build complete response using emitter state.
             // Feed all tokens through emitter (skip specials like streaming path).
+            Utf8OutputFilter response_output_filter;
+            auto emit_response_text = [&](const std::string & text) -> bool {
+                std::string filtered = response_output_filter.push(text);
+                if (filtered.empty()) return true;
+                emitter.emit_token(filtered);
+                return !emitter.stop_hit();
+            };
             auto feed_tokens = [&](const std::vector<int32_t> & toks) -> bool {
                 for (int32_t tok : toks) {
                     const std::string & raw = tokenizer_.raw_token(tok);
                     if (tok == tokenizer_.eos_id()) continue;
                     if (tok == tokenizer_.eos_chat_id()) continue;
                     // Gemma4 channel → think mapping
-                    if (raw == "<|channel>") { emitter.emit_token("<think>"); continue; }
-                    if (raw == "<channel|>") { emitter.emit_token("</think>\n"); continue; }
+                    if (raw == "<|channel>") {
+                        if (!emit_response_text("<think>")) return false;
+                        continue;
+                    }
+                    if (raw == "<channel|>") {
+                        if (!emit_response_text("</think>\n")) return false;
+                        continue;
+                    }
                     // Qwen3.6 thinking tokens (id 248068 / 248069) — must
                     // forward as text so the emitter transitions
                     // reasoning→content. Without this the generic <...>
@@ -3037,21 +3123,32 @@ void HttpServer::worker_loop() {
                     // empty and the model's whole answer wedged in
                     // reasoning_content. Mirrors the streaming-path fix
                     // above.
-                    if (raw == "<think>") { emitter.emit_token("<think>"); continue; }
-                    if (raw == "</think>") { emitter.emit_token("</think>\n"); continue; }
+                    if (raw == "<think>") {
+                        if (!emit_response_text("<think>")) return false;
+                        continue;
+                    }
+                    if (raw == "</think>") {
+                        if (!emit_response_text("</think>\n")) return false;
+                        continue;
+                    }
                     if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|') continue;
                     if (raw.size() >= 2 && raw[0] == '<' && raw.back() == '>') {
                         if (!(raw.size() == 6 && raw[1] == '0' && raw[2] == 'x'))
                             continue;
                     }
                     std::string text = tokenizer_.token_text(tok);
-                    emitter.emit_token(text);
-                    if (emitter.stop_hit()) return false;
+                    if (!emit_response_text(text)) return false;
                 }
                 return true;
             };
 
-            feed_tokens(result.tokens);
+            const bool feed_ok = feed_tokens(result.tokens);
+            if (feed_ok) {
+                std::string tail = response_output_filter.finish();
+                if (!tail.empty()) {
+                    emitter.emit_token(tail);
+                }
+            }
             const int total_completion_tokens = (int)result.tokens.size();
             emitter.emit_finish(total_completion_tokens);
 
