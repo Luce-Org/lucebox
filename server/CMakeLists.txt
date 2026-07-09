@@ -258,7 +258,6 @@ add_library(dflash_common STATIC
     src/deepseek4/deepseek4_daemon.cpp
     src/deepseek4/deepseek4_layer_split_adapter.cpp
     src/deepseek4/deepseek4_target_shard_ipc_daemon.cpp
-    src/deepseek4/deepseek4_expert_ipc_daemon.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
@@ -276,7 +275,6 @@ add_library(dflash_common STATIC
     src/common/target_shard_ipc_daemon.cpp
     src/common/dflash_feature_ring.cpp
     src/common/dflash_capture.cpp
-    src/common/expert_ipc.cpp
     src/common/dflash_draft_ipc.cpp
     src/common/dflash_draft_ipc_daemon.cpp
     src/common/pflash_drafter_ipc.cpp
@@ -284,13 +282,6 @@ add_library(dflash_common STATIC
     src/common/dflash_spec_decode.cpp
     src/common/layer_split_backend.cpp
     src/common/layer_split_runtime.cpp
-    src/common/expert_split_plan.cpp
-    src/common/expert_split_state.cpp
-    src/common/expert_split_runtime.cpp
-    src/common/expert_split_compute_runtime.cpp
-    src/common/expert_split_materialization.cpp
-    src/common/expert_split_target_config.cpp
-    src/common/gguf_tensor_data.cpp
     src/qwen35/graph_builders.cpp
     src/qwen35moe/qwen35moe_ffn.cpp
     src/qwen35moe/qwen35moe_backend.cpp
@@ -305,7 +296,6 @@ add_library(dflash_common STATIC
     src/common/moe_hybrid_stream.cpp
     src/common/moe_expert_compute.cpp
     src/common/moe_expert_compute_cpu.cpp
-    src/common/moe_expert_compute_local_gpu.cpp
     src/common/moe_expert_compute_ipc.cpp
     src/common/moe_hybrid_swap_manager.cpp
     src/common/moe_routing_collector.cpp
@@ -324,7 +314,6 @@ add_library(dflash_common STATIC
     src/common/daemon_loop.cpp
     src/common/gguf_inspect.cpp
     src/common/backend_factory.cpp
-    src/common/host_memory_mode.cpp
     src/placement/placement_config.cpp
     src/common/layer_split_utils.cpp
     src/common/ddtree.cpp
