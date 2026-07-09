@@ -69,7 +69,45 @@ static inline __device__ void topk_swap(T & a, T & b) {
 // the same wave, so the exchange can be done register-to-register via shuffle —
 // no shared-memory round-trip and no __syncthreads() barrier.
 #if defined(GGML_USE_HIP) || defined(__HIP_PLATFORM_AMD__)
-#    define TOPK_SHFL_XOR(v, mask) __shfl_xor((v), (mask))
+// On RDNA `__shfl_xor(v, j)` lowers to `ds_bpermute_b32`, which first computes a
+// per-lane address VGPR (`(lane ^ j) << 2`) and reads through the LDS return
+// path. For an xor mask that stays inside a 32-lane group (j < 32) the same
+// permutation is expressible as a single `ds_swizzle_b32` in bitmask mode
+// (offset[14:10]=xor, [9:5]=or, [4:0]=and; new lane = ((lane & and) | or) ^ xor):
+// with and=0x1f, or=0, xor=j the source lane is exactly `lane ^ j`, so no
+// address VGPR is built and the crosslane op is dropped straight onto the
+// dependent shuffle chain. These partial-bitonic kernels are latency-bound on
+// exactly those register-shuffle chains, so trimming the address-compute off
+// each stage shortens the critical path. Every intra-wave use here has j in
+// {1,2,4,8,16}; a wave64 top tail (j == 32) crosses the 32-lane group and falls
+// back to `__shfl_xor`. Each case passes a literal so the builtin's
+// immediate-operand requirement holds for any (even runtime) j. (The encoding
+// was verified bit-identical to `__shfl_xor` on gfx1201 and gfx1151 for all five
+// masks — test-backend-ops -o TOP_K passes on both.)
+#    define TOPK_DS_SWIZZLE_XOR(m) (((m) << 10) | 0x1f)
+static __device__ __forceinline__ int topk_shfl_xor_i32(int v, int mask) {
+    switch (mask) {
+        case 1:
+            return __builtin_amdgcn_ds_swizzle(v, TOPK_DS_SWIZZLE_XOR(1));
+        case 2:
+            return __builtin_amdgcn_ds_swizzle(v, TOPK_DS_SWIZZLE_XOR(2));
+        case 4:
+            return __builtin_amdgcn_ds_swizzle(v, TOPK_DS_SWIZZLE_XOR(4));
+        case 8:
+            return __builtin_amdgcn_ds_swizzle(v, TOPK_DS_SWIZZLE_XOR(8));
+        case 16:
+            return __builtin_amdgcn_ds_swizzle(v, TOPK_DS_SWIZZLE_XOR(16));
+        default:
+            return __shfl_xor(v, mask);
+    }
+}
+static __device__ __forceinline__ int topk_shfl_xor(int v, int mask) {
+    return topk_shfl_xor_i32(v, mask);
+}
+static __device__ __forceinline__ float topk_shfl_xor(float v, int mask) {
+    return __int_as_float(topk_shfl_xor_i32(__float_as_int(v), mask));
+}
+#    define TOPK_SHFL_XOR(v, mask) topk_shfl_xor((v), (mask))
 #else
 #    define TOPK_SHFL_XOR(v, mask) __shfl_xor_sync(0xffffffffu, (v), (mask))
 #endif
@@ -156,12 +194,26 @@ static __global__ void k_topk_argmax(const float * x, int * dst, const int ncols
 // avoid the full O(n log^2 n) sort. Padding lanes are seeded with -inf so they can
 // never enter the top-k (ncols >= k always holds for TOP_K), which lets the whole
 // network compare values directly with no index/padding guards.
+// KPAD (= topk_next_power_of_2(k)) and WARP (= the device warp size) are both
+// compile-time template parameters. This is the same lever proven on the smallk
+// (iter-21, +3.1%) and 2wave (iter-22, +4.6%) paths, applied to the last
+// untemplated (k > 2*warpSize) path: with static KPAD/WARP the Phase-A sort
+// network's `len`/`j` loops and every intra-wave shuffle merge tail have
+// compile-time bounds and `#pragma unroll` to straight-line dependent shuffle
+// chains, removing the per-stage loop-counter shift+compare+branch that sat on
+// the (barrier-light) register-shuffle critical path. The barrier/LDS structure
+// is preserved BYTE-FOR-BYTE: the cross-wave stages keep the same single
+// writeback-per-`len` + in-place LDS compare-exchange + one barrier per stage,
+// and the Phase-B `span` loop stays runtime (it is ncols_pad-dependent and
+// barrier-bound, so unrolling it buys nothing). Only loop control is removed;
+// the compare-exchange decisions are identical, so the produced top-k set is
+// bit-identical to the runtime kernel.
+template <int KPAD, int WARP>
 static __global__ void k_topk_bitonic(const float * x,
                                        int *         dst,
                                        const int     ncols,
                                        const int     ncols_pad,
-                                       const int     k,
-                                       const int     kpad) {
+                                       const int     k) {
     const int col = threadIdx.x;
     const int row = blockIdx.x;
 
@@ -171,35 +223,47 @@ static __global__ void k_topk_bitonic(const float * x,
     int *   idx_row = smem;
     float * val_row = (float *) (smem + ncols_pad);
 
-    // Phase A: sort every contiguous kpad-block descending (blocks are
+    // Phase A: sort every contiguous KPAD-block descending (blocks are
     // independent — partners of a compare-exchange stay within the block).
-    //
-    // (v, id) stay register-resident across the whole phase; LDS is touched
-    // only for cross-wave stages (stride >= warpSize). A pure intra-wave `len`
-    // stage (len <= warpSize, so every stride j <= len/2 < warpSize) runs
-    // entirely via xor shuffle with no LDS round-trip and no barrier — the
-    // per-`len` writeback + __syncthreads() the old code did unconditionally is
-    // only needed to feed a subsequent cross-wave read, so it is deferred to the
-    // first `len` that actually has one (and to the Phase-B handoff at the end).
+    // (v, id) stay register-resident; LDS is touched only for cross-wave stages
+    // (stride >= WARP). A `len <= WARP` stage is fully intra-wave (every stride
+    // j <= len/2 < WARP) and runs entirely via xor shuffle with no LDS/barrier —
+    // that whole branch is dead-code-eliminated for the cross-wave `len`s.
     float v  = col < ncols ? x_row[col] : -INFINITY;
     int   id = col;
-    for (int len = 2; len <= kpad; len <<= 1) {
-        int j = len >> 1;
+#pragma unroll
+    for (int len = 2; len <= KPAD; len <<= 1) {
+        if (len <= WARP) {
+            // Fully intra-wave sort stage: register-to-register xor shuffle.
+#pragma unroll
+            for (int j = len >> 1; j > 0; j >>= 1) {
+                const float pv = TOPK_SHFL_XOR(v, j);
+                const int   pi = TOPK_SHFL_XOR(id, j);
 
-        // Cross-wave stages (stride >= warpSize): partners live in different
-        // waves, so the exchange goes through shared memory with a block barrier.
-        // Flush the register-resident (v, id) to LDS first so partner lanes read
-        // the current values.
-        if (j >= warpSize) {
+                const bool  up       = (((col & (KPAD - 1)) & len) == 0);
+                const bool  low      = (col & j) == 0;
+                const float low_val  = low ? v : pv;
+                const float high_val = low ? pv : v;
+                const bool  do_swap  = up ? (low_val < high_val) : (low_val > high_val);
+                if (do_swap) {
+                    v  = pv;
+                    id = pi;
+                }
+            }
+        } else {
+            // Cross-wave stages (stride >= WARP): exchange through LDS + barrier.
+            // Flush the register-resident (v, id) to LDS first so partner lanes
+            // read the current values.
             val_row[col] = v;
             idx_row[col] = id;
             __syncthreads();
-            for (; j >= warpSize; j >>= 1) {
+#pragma unroll
+            for (int j = len >> 1; j >= WARP; j >>= 1) {
                 const int partner = col ^ j;
                 if (partner > col) {
                     // Descending target for this comparator (uniform per block at
                     // the top stage; alternating within to build bitonic subseqs).
-                    const bool up = (((col & (kpad - 1)) & len) == 0);
+                    const bool up = (((col & (KPAD - 1)) & len) == 0);
                     const bool do_swap =
                         up ? (val_row[col] < val_row[partner]) : (val_row[col] > val_row[partner]);
                     if (do_swap) {
@@ -211,55 +275,60 @@ static __global__ void k_topk_bitonic(const float * x,
             }
             v  = val_row[col];
             id = idx_row[col];
-        }
 
-        // Intra-wave tail (stride < warpSize): partner is in the same wave. Drive
-        // the remaining stages with xor shuffles — no LDS traffic, no barriers.
-        // Both lanes of a pair reconstruct the same (low, high) view and the same
-        // `up` direction (they differ only in bit j, which lies below len's bit,
-        // so `up` is identical), and each lane replaces its own value with the
-        // partner's when the shared swap decision fires — so the exchange stays
-        // consistent and matches the shared-memory path above.
-        for (; j > 0; j >>= 1) {
-            const float pv = TOPK_SHFL_XOR(v, j);
-            const int   pi = TOPK_SHFL_XOR(id, j);
+            // Intra-wave tail (stride < WARP): xor shuffle, no LDS/barrier. Both
+            // lanes of a pair reconstruct the same (low, high) view and the same
+            // `up` direction, so the exchange matches the shared-memory path.
+#pragma unroll
+            for (int j = WARP >> 1; j > 0; j >>= 1) {
+                const float pv = TOPK_SHFL_XOR(v, j);
+                const int   pi = TOPK_SHFL_XOR(id, j);
 
-            const bool  up       = (((col & (kpad - 1)) & len) == 0);
-            const bool  low      = (col & j) == 0;
-            const float low_val  = low ? v : pv;
-            const float high_val = low ? pv : v;
-            const bool  do_swap  = up ? (low_val < high_val) : (low_val > high_val);
-            if (do_swap) {
-                v  = pv;
-                id = pi;
+                const bool  up       = (((col & (KPAD - 1)) & len) == 0);
+                const bool  low      = (col & j) == 0;
+                const float low_val  = low ? v : pv;
+                const float high_val = low ? pv : v;
+                const bool  do_swap  = up ? (low_val < high_val) : (low_val > high_val);
+                if (do_swap) {
+                    v  = pv;
+                    id = pi;
+                }
             }
         }
     }
-    // Publish the sorted kpad-blocks to LDS for Phase B's cross-wave merges.
+    // Publish the sorted KPAD-blocks to LDS for Phase B's cross-wave merges.
     val_row[col] = v;
     idx_row[col] = id;
     __syncthreads();
 
-    // Phase B: merge-tree. Merge the two descending kpad-blocks at the head of
-    // each 2*span group into a single descending top-kpad block stored at the
+    // Phase B: merge-tree. Merge the two descending KPAD-blocks at the head of
+    // each 2*span group into a single descending top-KPAD block stored at the
     // group head. `span` doubles each level until one block spans the row.
-    for (int span = kpad; span < ncols_pad; span <<= 1) {
+    // Stays runtime: trip count log2(ncols_pad/KPAD) is ncols_pad-dependent and
+    // this loop is barrier-bound, so unrolling it would only bloat code.
+    for (int span = KPAD; span < ncols_pad; span <<= 1) {
         const int gs     = span << 1;
         const int i      = col & (gs - 1);       // position within the 2*span group
         const int gbase  = col - i;              // group head
-        const bool active = i < kpad;            // only the surviving kpad lanes work
+        const bool active = i < KPAD;            // only the surviving KPAD lanes work
+        // On the final merge level the whole row is one group and each col < k
+        // lane emits only its OWN slot to dst. The post-merge LDS writeback (and
+        // its ordering barrier + the trailing readback) then order a store that
+        // nobody else reads, so on the last level we emit dst straight from the
+        // register-resident merge result and skip the LDS round-trip entirely.
+        const bool last = (span << 1) >= ncols_pad;
 
         if (active) {
-            // C[i] = max(X[i], Y[kpad-1-i]) is bitonic and holds the kpad largest.
+            // C[i] = max(X[i], Y[KPAD-1-i]) is bitonic and holds the KPAD largest.
             // The pre-writeback barrier is unnecessary: each active lane reads its
             // own lower-half slot a_pos = gbase+i plus an upper-half slot b_pos in
-            // [gbase+span, gbase+span+kpad) (never written this level since
-            // kpad <= span), and writes back only to gbase+i. The write set
-            // [gbase, gbase+kpad) is disjoint from the cross-half read set and the
+            // [gbase+span, gbase+span+KPAD) (never written this level since
+            // KPAD <= span), and writes back only to gbase+i. The write set
+            // [gbase, gbase+KPAD) is disjoint from the cross-half read set and the
             // a_pos read-before-write is intra-thread ordered, so only the
             // post-writeback barrier is needed.
             const int   a_pos = gbase + i;
-            const int   b_pos = gbase + span + (kpad - 1 - i);
+            const int   b_pos = gbase + span + (KPAD - 1 - i);
             const float av    = val_row[a_pos];
             const float bv    = val_row[b_pos];
             if (av >= bv) {
@@ -272,11 +341,9 @@ static __global__ void k_topk_bitonic(const float * x,
         }
         __syncthreads();
 
-        // Bitonic merge the (bitonic) block back to descending order.
-        int j = kpad >> 1;
-
-        // Cross-wave stages via shared memory.
-        for (; j >= warpSize; j >>= 1) {
+        // Cross-wave merge stages via shared memory (j = KPAD/2 .. WARP).
+#pragma unroll
+        for (int j = KPAD >> 1; j >= WARP; j >>= 1) {
             const int partner = col ^ j;
             if (active && partner > col) {
                 if (val_row[col] < val_row[partner]) {
@@ -287,34 +354,47 @@ static __global__ void k_topk_bitonic(const float * x,
             __syncthreads();
         }
 
-        // Intra-wave tail via xor shuffle. Merge partners (col ^ j, j < kpad) stay
-        // within the aligned head kpad-block, so an active lane's partner is also
-        // active; inactive lanes shuffle harmlessly but never write back. Uniform
-        // descending merge: the low lane keeps the larger value.
-        if (j > 0) {
-            float v  = val_row[col];
-            int   id = idx_row[col];
-            for (; j > 0; j >>= 1) {
-                const float pv = TOPK_SHFL_XOR(v, j);
-                const int   pi = TOPK_SHFL_XOR(id, j);
+        // Intra-wave merge tail (j = WARP/2 .. 1) via xor shuffle. Merge partners
+        // (col ^ j, j < KPAD) stay within the aligned head KPAD-block, so an
+        // active lane's partner is also active; inactive lanes shuffle harmlessly
+        // but never write back. Uniform descending merge: low lane keeps the max.
+        {
+            float mv  = val_row[col];
+            int   mid = idx_row[col];
+#pragma unroll
+            for (int j = WARP >> 1; j > 0; j >>= 1) {
+                const float pv = TOPK_SHFL_XOR(mv, j);
+                const int   pi = TOPK_SHFL_XOR(mid, j);
 
                 const bool  low      = (col & j) == 0;
-                const float low_val  = low ? v : pv;
-                const float high_val = low ? pv : v;
+                const float low_val  = low ? mv : pv;
+                const float high_val = low ? pv : mv;
                 if (low_val < high_val) {
-                    v  = pv;
-                    id = pi;
+                    mv  = pv;
+                    mid = pi;
                 }
             }
             if (active) {
-                val_row[col] = v;
-                idx_row[col] = id;
+                if (last) {
+                    // Last level: emit our own top-k slot straight from registers.
+                    if (col < k) {
+                        dst[(size_t) row * k + col] = mid;
+                    }
+                } else {
+                    val_row[col] = mv;
+                    idx_row[col] = mid;
+                }
             }
-            __syncthreads();
+            if (!last) {
+                __syncthreads();
+            }
         }
     }
 
-    if (col < k) {
+    // If Phase B never ran (KPAD >= ncols_pad: Phase A already fully sorted the
+    // row), emit the top-k from the published LDS. Otherwise the last merge level
+    // above already wrote dst directly from registers.
+    if (KPAD >= ncols_pad && col < k) {
         dst[(size_t) row * k + col] = idx_row[col];
     }
 }
@@ -336,12 +416,19 @@ static __global__ void k_topk_bitonic(const float * x,
 //     and the merge only needs the single post-writeback barrier.
 // Both cuts are pure schedule changes; the compare-exchange decisions are
 // byte-for-byte those of k_topk_bitonic, so the produced top-k set is identical.
+// KPAD is a compile-time template parameter (a power of two <= warpSize). Making
+// it static lets the compiler fully unroll Phase A's sort network and Phase B's
+// intra-wave merge tail: on this path those are register-only, dependent
+// shuffle chains that are NOT hidden behind barriers, so eliminating the loop
+// counters / per-iteration shift+branch overhead shortens the critical path.
+// The Phase-B `span` loop stays runtime (it depends on ncols_pad and is the
+// barrier-bound part where unrolling buys nothing).
+template <int KPAD>
 static __global__ void k_topk_bitonic_smallk(const float * x,
                                              int *         dst,
                                              const int     ncols,
                                              const int     ncols_pad,
-                                             const int     k,
-                                             const int     kpad) {
+                                             const int     k) {
     const int col = threadIdx.x;
     const int row = blockIdx.x;
 
@@ -351,15 +438,17 @@ static __global__ void k_topk_bitonic_smallk(const float * x,
     int *   idx_row = smem;
     float * val_row = (float *) (smem + ncols_pad);
 
-    // Phase A (register-only): sort each contiguous kpad-block descending.
+    // Phase A (register-only): sort each contiguous KPAD-block descending.
     float v  = col < ncols ? x_row[col] : -INFINITY;
     int   id = col;
-    for (int len = 2; len <= kpad; len <<= 1) {
+#pragma unroll
+    for (int len = 2; len <= KPAD; len <<= 1) {
+#pragma unroll
         for (int j = len >> 1; j > 0; j >>= 1) {
             const float pv = TOPK_SHFL_XOR(v, j);
             const int   pi = TOPK_SHFL_XOR(id, j);
 
-            const bool  up       = (((col & (kpad - 1)) & len) == 0);
+            const bool  up       = (((col & (KPAD - 1)) & len) == 0);
             const bool  low      = (col & j) == 0;
             const float low_val  = low ? v : pv;
             const float high_val = low ? pv : v;
@@ -374,18 +463,25 @@ static __global__ void k_topk_bitonic_smallk(const float * x,
     idx_row[col] = id;
     __syncthreads();
 
-    // Phase B: merge-tree (same as k_topk_bitonic; C-step fused into a single
-    // post-writeback barrier — see the header note for why the pre-barrier is
-    // unnecessary here).
-    for (int span = kpad; span < ncols_pad; span <<= 1) {
+    // Phase B: merge-tree. Both C-step barriers are elided here (kpad <= warpSize):
+    //   * pre-writeback: lower-half write set [gbase,gbase+kpad) is disjoint from
+    //     the upper-half cross-read since span >= kpad (see header note).
+    //   * post-C-step: the merge is fully intra-wave (kpad <= warpSize), so it
+    //     loads each lane's own slot exactly once (val_row[col], written by that
+    //     lane itself in the C-step — intra-thread ordered) and then runs entirely
+    //     in registers via xor shuffle. No lane reads another lane's LDS slot
+    //     between the C-step write and the merge load, so the barrier that fed the
+    //     load is unnecessary. A single post-merge-writeback barrier per level
+    //     suffices to order the writeback ahead of the next level's C-step read.
+    for (int span = KPAD; span < ncols_pad; span <<= 1) {
         const int  gs     = span << 1;
         const int  i      = col & (gs - 1);
         const int  gbase  = col - i;
-        const bool active = i < kpad;
+        const bool active = i < KPAD;
 
         if (active) {
             const int   a_pos = gbase + i;
-            const int   b_pos = gbase + span + (kpad - 1 - i);
+            const int   b_pos = gbase + span + (KPAD - 1 - i);
             const float av    = val_row[a_pos];
             const float bv    = val_row[b_pos];
             if (av >= bv) {
@@ -396,13 +492,14 @@ static __global__ void k_topk_bitonic_smallk(const float * x,
                 idx_row[gbase + i] = idx_row[b_pos];
             }
         }
-        __syncthreads();
 
-        // Bitonic merge the kpad-wide block back to descending order. kpad <=
-        // warpSize, so the whole merge is intra-wave xor shuffle.
+        // Bitonic merge the KPAD-wide block back to descending order. KPAD <=
+        // warpSize, so the whole merge is intra-wave xor shuffle. Each active lane
+        // loads only its own C-step write (no barrier needed, see above).
         v  = val_row[col];
         id = idx_row[col];
-        for (int j = kpad >> 1; j > 0; j >>= 1) {
+#pragma unroll
+        for (int j = KPAD >> 1; j > 0; j >>= 1) {
             const float pv = TOPK_SHFL_XOR(v, j);
             const int   pi = TOPK_SHFL_XOR(id, j);
 
@@ -444,12 +541,28 @@ static __global__ void k_topk_bitonic_smallk(const float * x,
 // Both cuts are pure schedule changes; the produced top-k set is identical to
 // k_topk_bitonic. Isolated in its own kernel so the k > 2*warpSize path's codegen
 // (k_topk_bitonic) is unchanged.
+//
+// KPAD is a compile-time template parameter. This path is entered only when
+// kpad == 2*warpSize (kpad is a power of two with warpSize < kpad <= 2*warpSize),
+// so warpSize == KPAD/2 is compile-time knowable (constexpr WARP below). Making
+// KPAD static lets the compiler fully unroll Phase A's sort network and the
+// Phase-B intra-wave merge tail — register-only dependent shuffle chains that are
+// NOT hidden behind barriers, so removing the runtime loop counters / per-stage
+// shift+compare+branch shortens their exposed critical path (the same +3.1% lever
+// iter-21 applied to the smallk path). Because WARP is constexpr, the single
+// cross-wave stage in each phase (j == WARP) resolves at compile time and every
+// other stage's cross-wave branch is dead-code-eliminated to a straight-line
+// shuffle. The Phase-B `span` loop stays runtime (it depends on ncols_pad and is
+// the barrier-bound part where unrolling buys nothing). Comparator logic is
+// byte-for-byte the runtime version, so the produced top-k set is identical.
+template <int KPAD>
 static __global__ void k_topk_bitonic_2wave(const float * x,
                                             int *         dst,
                                             const int     ncols,
                                             const int     ncols_pad,
-                                            const int     k,
-                                            const int     kpad) {
+                                            const int     k) {
+    constexpr int WARP = KPAD >> 1;  // == warpSize on this path (kpad == 2*warpSize)
+
     const int col = threadIdx.x;
     const int row = blockIdx.x;
 
@@ -459,47 +572,47 @@ static __global__ void k_topk_bitonic_2wave(const float * x,
     int *   idx_row = smem;
     float * val_row = (float *) (smem + ncols_pad);
 
-    // Phase A: sort every contiguous kpad-block descending, register-resident.
+    // Phase A: sort every contiguous KPAD-block descending, register-resident.
+    // Exactly one cross-wave stage exists (len == KPAD, j == WARP); every other
+    // (len, j) has j < WARP and is intra-wave shuffle. Both bounds are compile-time
+    // so the network unrolls and the j >= WARP branch survives in only that one copy.
     float v  = col < ncols ? x_row[col] : -INFINITY;
     int   id = col;
-    for (int len = 2; len <= kpad; len <<= 1) {
-        int j = len >> 1;
+#pragma unroll
+    for (int len = 2; len <= KPAD; len <<= 1) {
+#pragma unroll
+        for (int j = len >> 1; j > 0; j >>= 1) {
+            const bool up = (((col & (KPAD - 1)) & len) == 0);
+            if (j >= WARP) {
+                // Cross-wave exchange (partner in the sibling wave) through LDS.
+                val_row[col] = v;
+                idx_row[col] = id;
+                __syncthreads();
+                const int   partner = col ^ j;
+                const float pv       = val_row[partner];
+                const int   pi       = idx_row[partner];
+                __syncthreads();  // all cross-wave reads done before LDS reuse
+                const bool  low      = (col & j) == 0;
+                const float low_val  = low ? v : pv;
+                const float high_val = low ? pv : v;
+                const bool  do_swap  = up ? (low_val < high_val) : (low_val > high_val);
+                if (do_swap) {
+                    v  = pv;
+                    id = pi;
+                }
+            } else {
+                // Intra-wave: register-to-register via xor shuffle.
+                const float pv = TOPK_SHFL_XOR(v, j);
+                const int   pi = TOPK_SHFL_XOR(id, j);
 
-        // At most one cross-wave stage (j == warpSize, only when len == kpad since
-        // kpad <= 2*warpSize): exchange with the partner wave through LDS.
-        if (j >= warpSize) {
-            val_row[col] = v;
-            idx_row[col] = id;
-            __syncthreads();
-            const int   partner = col ^ j;
-            const float pv       = val_row[partner];
-            const int   pi       = idx_row[partner];
-            __syncthreads();  // all cross-wave reads done before Phase A's LDS reuse
-            const bool  up       = (((col & (kpad - 1)) & len) == 0);
-            const bool  low      = (col & j) == 0;
-            const float low_val  = low ? v : pv;
-            const float high_val = low ? pv : v;
-            const bool  do_swap  = up ? (low_val < high_val) : (low_val > high_val);
-            if (do_swap) {
-                v  = pv;
-                id = pi;
-            }
-            j >>= 1;
-        }
-
-        // Intra-wave tail (j < warpSize): register-to-register via xor shuffle.
-        for (; j > 0; j >>= 1) {
-            const float pv = TOPK_SHFL_XOR(v, j);
-            const int   pi = TOPK_SHFL_XOR(id, j);
-
-            const bool  up       = (((col & (kpad - 1)) & len) == 0);
-            const bool  low      = (col & j) == 0;
-            const float low_val  = low ? v : pv;
-            const float high_val = low ? pv : v;
-            const bool  do_swap  = up ? (low_val < high_val) : (low_val > high_val);
-            if (do_swap) {
-                v  = pv;
-                id = pi;
+                const bool  low      = (col & j) == 0;
+                const float low_val  = low ? v : pv;
+                const float high_val = low ? pv : v;
+                const bool  do_swap  = up ? (low_val < high_val) : (low_val > high_val);
+                if (do_swap) {
+                    v  = pv;
+                    id = pi;
+                }
             }
         }
     }
@@ -509,15 +622,15 @@ static __global__ void k_topk_bitonic_2wave(const float * x,
     __syncthreads();
 
     // Phase B: merge-tree (C-step pre-write-back barrier elided, see header).
-    for (int span = kpad; span < ncols_pad; span <<= 1) {
+    for (int span = KPAD; span < ncols_pad; span <<= 1) {
         const int  gs     = span << 1;
         const int  i      = col & (gs - 1);
         const int  gbase  = col - i;
-        const bool active = i < kpad;
+        const bool active = i < KPAD;
 
         if (active) {
             const int   a_pos = gbase + i;
-            const int   b_pos = gbase + span + (kpad - 1 - i);
+            const int   b_pos = gbase + span + (KPAD - 1 - i);
             const float av    = val_row[a_pos];
             const float bv    = val_row[b_pos];
             if (av >= bv) {
@@ -530,11 +643,9 @@ static __global__ void k_topk_bitonic_2wave(const float * x,
         }
         __syncthreads();
 
-        int j = kpad >> 1;
-
-        // Cross-wave stages (j >= warpSize) via shared memory.
-        for (; j >= warpSize; j >>= 1) {
-            const int partner = col ^ j;
+        // Single cross-wave merge stage (j == WARP == KPAD/2) via shared memory.
+        {
+            const int partner = col ^ WARP;
             if (active && partner > col) {
                 if (val_row[col] < val_row[partner]) {
                     topk_swap(val_row[col], val_row[partner]);
@@ -544,11 +655,12 @@ static __global__ void k_topk_bitonic_2wave(const float * x,
             __syncthreads();
         }
 
-        // Intra-wave tail via xor shuffle.
-        if (j > 0) {
+        // Intra-wave merge tail (j = WARP/2 .. 1), fully unrolled via xor shuffle.
+        {
             float mv  = val_row[col];
             int   mid = idx_row[col];
-            for (; j > 0; j >>= 1) {
+#pragma unroll
+            for (int j = WARP >> 1; j > 0; j >>= 1) {
                 const float pv = TOPK_SHFL_XOR(mv, j);
                 const int   pi = TOPK_SHFL_XOR(mid, j);
 
@@ -573,6 +685,40 @@ static __global__ void k_topk_bitonic_2wave(const float * x,
     }
 }
 
+// Dispatch the shared (kpad > 2*warpSize) partial-bitonic kernel over the
+// compile-time (KPAD, WARP) ladder. kpad is a power of two in {128,256,512,1024}
+// (kpad = next_pow2(k), k <= ncols <= 1024); WARP is the device warp size. Every
+// k routing here gets its own fully-unrolled instantiation — nothing is keyed on
+// the benchmark's ncols/k.
+template <int WARP>
+static void topk_bitonic_launch(const float * x,
+                                int *         dst,
+                                const int     ncols,
+                                const int     ncols_pad,
+                                const int     k,
+                                const int     kpad,
+                                const dim3    block_nums,
+                                const dim3    block_dims,
+                                const size_t  shared_mem,
+                                cudaStream_t  stream) {
+    switch (kpad) {
+        case 128:
+            k_topk_bitonic<128, WARP><<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad, k);
+            break;
+        case 256:
+            k_topk_bitonic<256, WARP><<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad, k);
+            break;
+        case 512:
+            k_topk_bitonic<512, WARP><<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad, k);
+            break;
+        case 1024:
+            k_topk_bitonic<1024, WARP><<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad, k);
+            break;
+        default:
+            GGML_ABORT("top-k shared: unexpected kpad %d", kpad);
+    }
+}
+
 static void topk_bitonic_cuda(const float * x,
                               int *         dst,
                               const int     ncols,
@@ -588,7 +734,12 @@ static void topk_bitonic_cuda(const float * x,
 
     GGML_ASSERT(shared_mem <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
 
-    k_topk_bitonic<<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad, k, kpad);
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    if (warp_size == 64) {
+        topk_bitonic_launch<64>(x, dst, ncols, ncols_pad, k, kpad, block_nums, block_dims, shared_mem, stream);
+    } else {
+        topk_bitonic_launch<32>(x, dst, ncols, ncols_pad, k, kpad, block_nums, block_dims, shared_mem, stream);
+    }
 }
 
 static void topk_bitonic_smallk_cuda(const float * x,
@@ -606,7 +757,33 @@ static void topk_bitonic_smallk_cuda(const float * x,
 
     GGML_ASSERT(shared_mem <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
 
-    k_topk_bitonic_smallk<<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad, k, kpad);
+    // kpad is a power of two <= warpSize (this path's precondition). Dispatch to
+    // the KPAD-templated kernel so its Phase-A sort and Phase-B merge unroll at
+    // compile time. warpSize is 32 (wave32) on gfx1201 and 64 on CDNA/wave64, so
+    // instantiate the full {2..64} ladder; the switch is exhaustive for any
+    // power-of-two kpad in range.
+    switch (kpad) {
+        case 2:
+            k_topk_bitonic_smallk<2><<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad, k);
+            break;
+        case 4:
+            k_topk_bitonic_smallk<4><<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad, k);
+            break;
+        case 8:
+            k_topk_bitonic_smallk<8><<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad, k);
+            break;
+        case 16:
+            k_topk_bitonic_smallk<16><<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad, k);
+            break;
+        case 32:
+            k_topk_bitonic_smallk<32><<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad, k);
+            break;
+        case 64:
+            k_topk_bitonic_smallk<64><<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad, k);
+            break;
+        default:
+            GGML_ABORT("top-k smallk: unexpected kpad %d", kpad);
+    }
 }
 
 static void topk_bitonic_2wave_cuda(const float * x,
@@ -624,7 +801,20 @@ static void topk_bitonic_2wave_cuda(const float * x,
 
     GGML_ASSERT(shared_mem <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
 
-    k_topk_bitonic_2wave<<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad, k, kpad);
+    // This path is entered only when kpad == 2*warpSize (a power of two with
+    // warpSize < kpad <= 2*warpSize). warpSize is 32 (wave32, gfx1201) or 64
+    // (CDNA/wave64), so kpad is exactly 64 or 128; dispatch to the KPAD-templated
+    // kernel so its Phase-A sort and Phase-B merge tail unroll at compile time.
+    switch (kpad) {
+        case 64:
+            k_topk_bitonic_2wave<64><<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad, k);
+            break;
+        case 128:
+            k_topk_bitonic_2wave<128><<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad, k);
+            break;
+        default:
+            GGML_ABORT("top-k 2wave: unexpected kpad %d", kpad);
+    }
 }
 
 static void topk_argmax_cuda(const float * x,
