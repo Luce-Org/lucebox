@@ -2036,6 +2036,34 @@ static bool eval_ds4_hybrid(
     return true;
 }
 
+// Opt-in serving knobs for the routed-expert FFN, both default-off:
+//   DFLASH_DS4_TOPK=<k>            keep only the leading k of the top-k routed
+//                                  experts (weights renormalized over the kept
+//                                  set). Bandwidth lever for decode; measured
+//                                  +9% AR decode at k=4 on Strix (25.1 vs 23.0
+//                                  tok/s), small quality cost — validate per
+//                                  deployment.
+//   DFLASH_DS4_NEURON_MEANMASK=<m> zero routed-expert activations below
+//                                  m * mean(|activation|) per expert and token
+//                                  (m=1.0 keeps ~45%). Quality probe for
+//                                  intra-expert sparsity; adds a few ops and
+//                                  saves no bytes until a sparse kernel lands.
+static int ds4_topk_override() {
+    static const int k = [] {
+        const char * e = std::getenv("DFLASH_DS4_TOPK");
+        return e ? std::atoi(e) : 0;
+    }();
+    return k;
+}
+
+static float ds4_neuron_mask_mult() {
+    static const float m = [] {
+        const char * e = std::getenv("DFLASH_DS4_NEURON_MEANMASK");
+        return e ? (float) std::atof(e) : 0.0f;
+    }();
+    return m;
+}
+
 static Ds4MoeRouting build_moe_routing(
         ggml_context * ctx,
         ggml_tensor * cur,
@@ -2054,10 +2082,15 @@ static Ds4MoeRouting build_moe_routing(
         selection = ggml_add(ctx, selection, L.ffn_exp_probs_b);
     }
 
-    out.selected = ggml_top_k(ctx, selection, w.n_expert_used);
+    int k_used = w.n_expert_used;
+    const int k_env = ds4_topk_override();
+    if (k_env > 0 && k_env < k_used) {
+        k_used = k_env;
+    }
+    out.selected = ggml_top_k(ctx, selection, k_used);
     ggml_tensor * probs_3d = ggml_reshape_3d(ctx, probs, 1, w.n_expert, n_tokens);
     out.weights = ggml_get_rows(ctx, probs_3d, out.selected);
-    out.weights = ggml_reshape_2d(ctx, out.weights, w.n_expert_used, n_tokens);
+    out.weights = ggml_reshape_2d(ctx, out.weights, k_used, n_tokens);
 
     ggml_tensor * w_sum = ggml_sum_rows(ctx, out.weights);
     w_sum = ggml_clamp(ctx, w_sum, 6.103515625e-5f, INFINITY);
@@ -2077,7 +2110,7 @@ static ggml_tensor * build_moe_ffn(
         int n_tokens) {
 
     const int n_embd = w.n_embd;
-    const int n_used = w.n_expert_used;
+    int n_used = w.n_expert_used;
     const int n_ff_exp = w.n_ff_exp;
     const bool raw_mmid = ds4_ffn_raw_mmid_enabled();
     ggml_tensor * shared_out = build_shared_ffn(ctx, cur, w, L);
@@ -2087,6 +2120,7 @@ static ggml_tensor * build_moe_ffn(
         routed_out = ggml_scale(ctx, cur, 0.0f);
     } else {
         Ds4MoeRouting routing = build_moe_routing(ctx, cur, w, L, n_tokens);
+        n_used = (int) routing.selected->ne[0];   // reduced when DFLASH_DS4_TOPK is set
         ggml_tensor * cur_3d = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
         ggml_tensor * gate_e = ggml_mul_mat_id(ctx, L.ffn_gate_exps, cur_3d, routing.selected);
         ggml_tensor * up_e = ggml_mul_mat_id(ctx, L.ffn_up_exps, cur_3d, routing.selected);
@@ -2096,6 +2130,16 @@ static ggml_tensor * build_moe_ffn(
             up_e = ggml_reshape_3d(ctx, up_e, n_ff_exp, n_used, n_tokens);
         }
         ggml_tensor * mid_e = build_clamped_swiglu(ctx, gate_e, up_e, w.swiglu_clamp_exp);
+
+        const float nmask_mult = ds4_neuron_mask_mult();
+        if (nmask_mult > 0.0f) {
+            // Zero activations below mult * mean(|mid|) per (expert, token).
+            ggml_tensor * amid = ggml_abs(ctx, mid_e);
+            ggml_tensor * thr = ggml_scale(ctx, ggml_sum_rows(ctx, amid),
+                                           nmask_mult / (float) n_ff_exp);
+            ggml_tensor * mask = ggml_step(ctx, ggml_sub(ctx, amid, thr));
+            mid_e = ggml_mul(ctx, mid_e, mask);
+        }
 
         ggml_tensor * down_e = ggml_mul_mat_id(ctx, L.ffn_down_exps, mid_e, routing.selected);
         if (!raw_mmid) {
