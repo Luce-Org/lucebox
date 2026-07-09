@@ -711,13 +711,7 @@ bool build_deepseek4_moe_hybrid_storage_from_file(
         const MoeHybridPlacement & placement,
         const MoeHybridConfig * cfg_override,
         MoeHybridStorage & out,
-        std::string * err,
-        int cache_slots,
-        bool load_cold_tensors,
-        const std::vector<std::vector<int32_t>> * cold_expert_order_by_layer) {
-    (void) cache_slots;
-    (void) load_cold_tensors;
-    (void) cold_expert_order_by_layer;
+        std::string * err) {
     ggml_context * expert_meta = nullptr;
     gguf_init_params gip{};
     gip.no_alloc = true;

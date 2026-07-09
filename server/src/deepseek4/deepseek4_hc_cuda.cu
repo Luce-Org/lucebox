@@ -1,8 +1,6 @@
 #include "deepseek4_hc_cuda.h"
 
 #include "common/gpu_runtime_compat.h"
-#include "ggml-backend-impl.h"
-#include "ggml-cuda/common.cuh"
 
 #include <cuda_fp16.h>
 
@@ -392,22 +390,6 @@ bool hc_pre_device_locked(const void * hc_state_device,
     return true;
 }
 
-static cudaStream_t hc_backend_stream_or_default(ggml_backend_t backend) {
-    if (!backend || !backend->context) {
-        return nullptr;
-    }
-    if (!backend->device) {
-        return nullptr;
-    }
-    const auto dev_type = ggml_backend_dev_type(backend->device);
-    if (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU &&
-        dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
-        return nullptr;
-    }
-    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
-    return cuda_ctx ? cuda_ctx->stream() : nullptr;
-}
-
 } // namespace
 
 bool deepseek4_cuda_hc_pre_mix(const float * hc_state_host,
@@ -570,52 +552,6 @@ bool deepseek4_cuda_hc_pre_device(const void * hc_state_device,
                                 false);
 }
 
-bool deepseek4_cuda_hc_pre_device_on_backend(ggml_backend_t backend,
-                                             const void * hc_state_device,
-                                             const void * fn_device,
-                                             const void * scale_device,
-                                             const void * base_device,
-                                             int          n_embd,
-                                             int          n_hc,
-                                             int          sinkhorn_iters,
-                                             float        eps,
-                                             void *       working_device,
-                                             void *       post_device,
-                                             void *       comb_device) {
-    if (!hc_state_device || !fn_device || !scale_device || !base_device ||
-        !working_device || !post_device || !comb_device ||
-        n_embd <= 0 || n_hc <= 0 || n_hc > kMaxHc) {
-        return false;
-    }
-    const int hc_dim = n_embd * n_hc;
-    const int mix_dim = 2 * n_hc + n_hc * n_hc;
-    if (mix_dim > kMaxMixDim) {
-        return false;
-    }
-
-    cudaStream_t stream = hc_backend_stream_or_default(backend);
-    std::lock_guard<std::mutex> lock(g_mu);
-    HcCudaScratch & scratch = hc_scratch_for_stream(stream);
-    if (!scratch.ensure((size_t) hc_dim, (size_t) n_embd, (size_t) n_hc)) {
-        return false;
-    }
-    return hc_pre_device_locked(hc_state_device,
-                                fn_device,
-                                scale_device,
-                                base_device,
-                                n_embd,
-                                n_hc,
-                                sinkhorn_iters,
-                                eps,
-                                working_device,
-                                post_device,
-                                comb_device,
-                                scratch,
-                                stream,
-                                false,
-                                false);
-}
-
 bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
                                          const void * fn_device,
                                          const float * scale_host,
@@ -668,63 +604,6 @@ bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
                                 scratch,
                                 nullptr,
                                 true,
-                                true);
-}
-
-bool deepseek4_cuda_hc_pre_device_params_on_backend(ggml_backend_t backend,
-                                                    const void * hc_state_device,
-                                                    const void * fn_device,
-                                                    const float * scale_host,
-                                                    const float * base_host,
-                                                    int           n_embd,
-                                                    int           n_hc,
-                                                    int           sinkhorn_iters,
-                                                    float         eps,
-                                                    void *        working_device,
-                                                    void *        post_device,
-                                                    void *        comb_device) {
-    if (!hc_state_device || !fn_device || !scale_host || !base_host ||
-        !working_device || !post_device || !comb_device ||
-        n_embd <= 0 || n_hc <= 0 || n_hc > kMaxHc) {
-        return false;
-    }
-    const int hc_dim = n_embd * n_hc;
-    const int mix_dim = 2 * n_hc + n_hc * n_hc;
-    if (mix_dim > kMaxMixDim) {
-        return false;
-    }
-
-    cudaStream_t stream = hc_backend_stream_or_default(backend);
-    std::lock_guard<std::mutex> lock(g_mu);
-    HcCudaScratch & scratch = hc_scratch_for_stream(stream);
-    if (!scratch.ensure((size_t) hc_dim, (size_t) n_embd, (size_t) n_hc)) {
-        std::fprintf(stderr, "[deepseek4-hc-direct] ensure failed\n");
-        return false;
-    }
-    if (cudaMemcpy(scratch.d_scale, scale_host, sizeof(float) * (size_t) mix_dim,
-                   cudaMemcpyHostToDevice) != cudaSuccess) {
-        hc_log_cuda_error("copy scale", cudaGetLastError());
-        return false;
-    }
-    if (cudaMemcpy(scratch.d_base, base_host, sizeof(float) * (size_t) mix_dim,
-                   cudaMemcpyHostToDevice) != cudaSuccess) {
-        hc_log_cuda_error("copy base", cudaGetLastError());
-        return false;
-    }
-    return hc_pre_device_locked(hc_state_device,
-                                fn_device,
-                                scratch.d_scale,
-                                scratch.d_base,
-                                n_embd,
-                                n_hc,
-                                sinkhorn_iters,
-                                eps,
-                                working_device,
-                                post_device,
-                                comb_device,
-                                scratch,
-                                stream,
-                                false,
                                 true);
 }
 

@@ -400,10 +400,7 @@ bool build_deepseek4_moe_hybrid_storage_from_file(
     const MoeHybridPlacement &  placement,
     const MoeHybridConfig *     cfg_override,
     MoeHybridStorage &          out,
-    std::string *               err = nullptr,
-    int                         cache_slots = 0,
-    bool                        load_cold_tensors = true,
-    const std::vector<std::vector<int32_t>> * cold_expert_order_by_layer = nullptr);
+    std::string *               err = nullptr);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,
