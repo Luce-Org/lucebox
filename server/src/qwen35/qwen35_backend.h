@@ -40,6 +40,10 @@
 #include <cstddef>
 
 namespace dflash::common {
+class VisionEncoder;
+}
+
+namespace dflash::common {
 
 class Qwen35TensorParallelContext;
 
@@ -89,6 +93,10 @@ struct Qwen35Config {
     // SpecLA confidence margin on cumulative path log-prob (off when inf).
     float        ddtree_tau      = std::numeric_limits<float>::infinity();
     bool         use_feature_mirror = false;
+
+    // Native mmproj vision
+    const char * mmproj_path    = nullptr;
+    bool         mmproj_use_gpu = true;
 };
 
 // ── Backend class ───────────────────────────────────────────────────────
@@ -327,6 +335,10 @@ private:
     // ── DFlashTarget adapter (lazy-built) ────────────────────────────
     std::unique_ptr<DFlashTarget> dflash_target_;
 
+#ifdef DFLASH_HAVE_MMPROJ
+    std::unique_ptr<VisionEncoder> vision_;
+#endif
+
     // ── Internal helpers ─────────────────────────────────────────────
     // Prefill a prompt and return the number of tokens committed to KV.
     // kv_offset > 0 resumes from a restored snapshot: tokens are placed at
@@ -335,6 +347,17 @@ private:
                    const DaemonIO & io,
                    int snap_pos = -1, int snap_slot = -1,
                    int kv_offset = 0);
+
+    int do_prefill_multimodal(MultimodalPrompt & mm,
+                              const DaemonIO & io,
+                              int snap_pos = -1, int snap_slot = -1,
+                              int kv_offset = 0);
+
+    bool do_prefill_embed_chunk(int kv_pos, int n_tokens,
+                                const float * embeds, int hidden,
+                                const std::vector<int32_t> & pos_buf,
+                                bool with_mask, bool last_token_logits_only,
+                                bool non_causal_within_chunk);
 
     // Speculative decode loop: draft → verify → accept until EOS/max.
     // When budget_hook is non-null and (n_gen - generated) drops to the

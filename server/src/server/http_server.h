@@ -229,6 +229,10 @@ struct ServerConfig {
     std::string chat_template_src;          // literal Jinja source (loaded from file)
     std::string chat_template_path;         // path it was loaded from (logged at startup)
 
+    // Native mmproj vision
+    std::string mmproj_path;
+    bool        vision_supported = false;
+
     // Expert frequency tracking (--freq): print frequency analysis at shutdown.
     bool        freq_tracking = false;
 
@@ -310,6 +314,8 @@ struct ParsedRequest {
     DiskPrefixCachePolicy     disk_cache_policy;
     // PPP: stable pin cut for tool-heavy requests (0 = use default boundary).
     int                       pin_end_token = 0;
+    // Native mmproj vision payload (populated when messages contain images).
+    std::unique_ptr<MultimodalPrompt> multimodal;
 };
 
 // Parse request sampler fields, applying model-card defaults where present.

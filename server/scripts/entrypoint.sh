@@ -315,6 +315,8 @@ fi
 # the KV footprint. Only emitted to the server CLI when nonzero so
 # unset reproduces the server's own default unchanged.
 : "${DFLASH_FA_WINDOW:=0}"
+# Native mmproj vision projector (Qwen3-VL etc.). When set, passed as --mmproj.
+: "${DFLASH_MMPROJ:=}"
 
 # ── auto-detect target ─────────────────────────────────────────────────────
 # Target .gguf is typically 10-30 GB (Q4_K_M). Drafts are 1-2 GB (Q8_0 / Q4)
@@ -499,6 +501,8 @@ CMD=("$DFLASH_SERVER_BIN" "$DFLASH_TARGET"
 
 [ -n "$DRAFT_ARG" ]                && CMD+=(--draft "$DRAFT_ARG")
 [ -n "$DRAFT_ARG" ]                && CMD+=(--ddtree --ddtree-budget "$DFLASH_BUDGET")
+[ -n "$DFLASH_MMPROJ" ]            && CMD+=(--mmproj "$DFLASH_MMPROJ")
+[ "${DFLASH_MMPROJ_NO_OFFLOAD:-0}" = "1" ] && [ -n "$DFLASH_MMPROJ" ] && CMD+=(--no-mmproj-offload)
 [ -n "$DFLASH_DEFAULT_MAX_TOKENS" ] && CMD+=(--default-max-tokens "$DFLASH_DEFAULT_MAX_TOKENS")
 [ -n "$DFLASH_MODEL_NAME" ]         && CMD+=(--model-name "$DFLASH_MODEL_NAME")
 # `--lazy-draft` is silently dropped by the C++ server unless both
