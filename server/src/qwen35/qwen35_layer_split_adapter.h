@@ -14,6 +14,7 @@
 #include "placement/remote_target_shard_config.h"
 #include "qwen3/qwen3_drafter.h"
 #include "qwen35_target_shard_ipc.h"
+#include "qwen35/layer_split_forward.h"
 #include "step_graph.h"
 #include "internal.h"
 

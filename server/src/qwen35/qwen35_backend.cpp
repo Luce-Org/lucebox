@@ -2013,27 +2013,6 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
 
 #ifdef DFLASH_HAVE_MMPROJ
 
-namespace {
-
-void build_bidirectional_mask(std::vector<uint16_t> & out,
-                              int kv_len, int n_tokens, int kv_pos,
-                              int kq_stride_pad, int kv_pad_override = 0) {
-    const int kv_pad = (kv_pad_override > 0) ? kv_pad_override
-                                             : align_up(kv_len, kq_stride_pad);
-    const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
-    out.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
-    for (int q = 0; q < n_tokens; q++) {
-        for (int k = 0; k < kv_pos; k++) {
-            out[(size_t)q * kv_pad + k] = F16_ZERO;
-        }
-        for (int k = kv_pos; k < kv_pos + n_tokens; k++) {
-            out[(size_t)q * kv_pad + k] = F16_ZERO;
-        }
-    }
-}
-
-}  // namespace
-
 bool Qwen35Backend::do_prefill_embed_chunk(int kv_pos, int n_tokens,
                                            const float * embeds, int hidden,
                                            const std::vector<int32_t> & pos_buf,
