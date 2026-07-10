@@ -4376,6 +4376,114 @@ static void test_gguf_bounds_error_reports_operands() {
     TEST_ASSERT(o.find("overflow") != std::string::npos);
 }
 
+static void test_gated_delta_net_inplace_cpu_matches_regular() {
+    constexpr int64_t S = 2;
+    constexpr int64_t H = 2;
+    constexpr int64_t T = 3;
+    constexpr int64_t B = 1;
+
+    ggml_init_params params{};
+    params.mem_size = 1u << 20;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    TEST_ASSERT(ctx != nullptr);
+    if (!ctx) return;
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    TEST_ASSERT(backend != nullptr);
+    if (!backend) {
+        ggml_free(ctx);
+        return;
+    }
+
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, T, B);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, T, B);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, T, B);
+    ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, T, B);
+    ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, T, B);
+    ggml_tensor * state_regular = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, S, H, B);
+    ggml_tensor * state_inplace = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, S, H, B);
+
+    ggml_tensor * regular = ggml_gated_delta_net(
+        ctx, q, k, v, g, beta, state_regular);
+    ggml_tensor * inplace = ggml_gated_delta_net_inplace(
+        ctx, q, k, v, g, beta, state_inplace);
+    ggml_set_output(regular);
+    ggml_set_output(inplace);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, regular);
+    ggml_build_forward_expand(graph, inplace);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    TEST_ASSERT(buffer != nullptr);
+    if (!buffer) {
+        ggml_backend_free(backend);
+        ggml_free(ctx);
+        return;
+    }
+
+    std::vector<float> q_data(S * H * T * B);
+    std::vector<float> k_data(q_data.size());
+    std::vector<float> v_data(q_data.size());
+    std::vector<float> g_data(H * T * B);
+    std::vector<float> beta_data(g_data.size());
+    std::vector<float> initial_state(S * S * H * B);
+    for (size_t i = 0; i < q_data.size(); ++i) {
+        q_data[i] = 0.03f * (float)(i + 1);
+        k_data[i] = 0.02f * (float)((i % 5) + 1);
+        v_data[i] = 0.04f * (float)((int)(i % 7) - 2);
+    }
+    for (size_t i = 0; i < g_data.size(); ++i) {
+        g_data[i] = -0.1f - 0.01f * (float)i;
+        beta_data[i] = 0.25f + 0.03f * (float)i;
+    }
+    for (size_t i = 0; i < initial_state.size(); ++i) {
+        initial_state[i] = 0.01f * (float)(i + 1);
+    }
+
+    ggml_backend_tensor_set(q, q_data.data(), 0, ggml_nbytes(q));
+    ggml_backend_tensor_set(k, k_data.data(), 0, ggml_nbytes(k));
+    ggml_backend_tensor_set(v, v_data.data(), 0, ggml_nbytes(v));
+    ggml_backend_tensor_set(g, g_data.data(), 0, ggml_nbytes(g));
+    ggml_backend_tensor_set(beta, beta_data.data(), 0, ggml_nbytes(beta));
+    ggml_backend_tensor_set(state_regular, initial_state.data(), 0, ggml_nbytes(state_regular));
+    ggml_backend_tensor_set(state_inplace, initial_state.data(), 0, ggml_nbytes(state_inplace));
+
+    TEST_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+
+    const size_t attn_elems = S * H * T * B;
+    const size_t state_elems = S * S * H * B;
+    std::vector<float> regular_attn(attn_elems);
+    std::vector<float> inplace_attn(attn_elems);
+    std::vector<float> regular_state(state_elems);
+    std::vector<float> inplace_state(state_elems);
+    std::vector<float> regular_input_state(state_elems);
+    ggml_backend_tensor_get(regular, regular_attn.data(), 0,
+                            regular_attn.size() * sizeof(float));
+    ggml_backend_tensor_get(inplace, inplace_attn.data(), 0,
+                            inplace_attn.size() * sizeof(float));
+    ggml_backend_tensor_get(regular, regular_state.data(),
+                            attn_elems * sizeof(float),
+                            regular_state.size() * sizeof(float));
+    ggml_backend_tensor_get(state_inplace, inplace_state.data(), 0,
+                            inplace_state.size() * sizeof(float));
+    ggml_backend_tensor_get(state_regular, regular_input_state.data(), 0,
+                            regular_input_state.size() * sizeof(float));
+
+    for (size_t i = 0; i < attn_elems; ++i) {
+        TEST_ASSERT(std::fabs(regular_attn[i] - inplace_attn[i]) < 1.0e-6f);
+    }
+    for (size_t i = 0; i < state_elems; ++i) {
+        TEST_ASSERT(std::fabs(regular_state[i] - inplace_state[i]) < 1.0e-6f);
+        TEST_ASSERT(regular_input_state[i] == initial_state[i]);
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_backend_free(backend);
+    ggml_free(ctx);
+}
+
 int main() {
     std::fprintf(stderr, "══════════════════════════════════════════\n");
     std::fprintf(stderr, " Server Unit Tests\n");
@@ -4651,6 +4759,9 @@ int main() {
     std::fprintf(stderr, "\n── GGUF tensor bounds ──\n");
     RUN_TEST(test_gguf_tensor_in_file_bounds);
     RUN_TEST(test_gguf_bounds_error_reports_operands);
+
+    std::fprintf(stderr, "\n── ggml CPU gated delta net ──\n");
+    RUN_TEST(test_gated_delta_net_inplace_cpu_matches_regular);
 
     std::fprintf(stderr, "\n══════════════════════════════════════════\n");
     std::fprintf(stderr, " Results: %d assertions, %d failures\n",

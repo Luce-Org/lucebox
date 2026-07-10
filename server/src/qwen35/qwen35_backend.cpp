@@ -1552,7 +1552,8 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     // a boundary; within a bucket we reuse the cached graph and just update
     // the mutable input tensors.
     const bool ar_graph_reuse = supports_ar_graph_reuse()
-                              && std::getenv("DFLASH_AR_NO_REUSE") == nullptr;
+                              && std::getenv("DFLASH_AR_NO_REUSE") == nullptr
+                              && std::getenv("DFLASH_QWEN35_NO_KVPAD") == nullptr;
     ar_decode_fa_bucket_ = -1;  // force first-step build
 
     for (int i = initial_emitted; i < n_gen; i++) {
