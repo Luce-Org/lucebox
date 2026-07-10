@@ -37,6 +37,8 @@
 
 namespace dflash::common {
 
+class DFlashDraftIpcClient;
+
 // The drafter weights. `core` reuses DeepSeek4Weights for the n_layer decoder
 // blocks + per-layer tensors + metadata + out_norm + output_hc_* tail; its
 // tok_embd/output stay null (tied to target). The DSpark-specific tensors below
@@ -175,6 +177,15 @@ bool run_deepseek4_dspark_spec_decode(
         int win_len,
         std::vector<int32_t> & out_tokens,
         float * accept_rate_out,
-        const std::function<bool(int32_t)> & on_token = {});
+        const std::function<bool(int32_t)> & on_token = {},
+        DFlashDraftIpcClient * remote_draft = nullptr);
+
+int run_deepseek4_dspark_draft_ipc_daemon(const char * draft_path,
+                                           int ring_cap,
+                                           int draft_gpu,
+                                           int stream_fd,
+                                           int payload_fd,
+                                           int shared_payload_fd = -1,
+                                           size_t shared_payload_bytes = 0);
 
 }  // namespace dflash::common

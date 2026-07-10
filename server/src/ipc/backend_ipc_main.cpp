@@ -4,6 +4,7 @@
 #include "moe_expert_compute.h"
 
 #include "dflash_draft_ipc.h"
+#include "deepseek4/deepseek4_dspark.h"
 #include "deepseek4/deepseek4_layer_split_adapter.h"
 #include "gemma4/gemma4_layer_split_adapter.h"
 #include "laguna/laguna_layer_split_adapter.h"
@@ -130,8 +131,12 @@ int main(int argc, char ** argv) {
             "   or: %s --backend-ipc-mode=deepseek4-target-shard <target.gguf> "
             "--stream-fd=FD --target-gpus=N[,N...] --layer-begins=N[,N...] "
             "--layer-ends=N[,N...] --max-ctx=N\n"
+            "   or: %s --backend-ipc-mode=deepseek4-dspark-draft <draft.gguf> "
+            "--ring-cap=N --stream-fd=FD --payload-fd=FD [--draft-gpu=N]\n"
             "   or: %s --backend-ipc-mode=moe-expert-compute <target.gguf> "
             "--stream-fd=FD --target-gpu=N --placement=PATH\n",
+            argv[0],
+            argv[0],
             argv[0],
             argv[0],
             argv[0],
@@ -351,6 +356,10 @@ int main(int argc, char ** argv) {
             return run_deepseek4_target_shard_ipc_daemon(
                 payload_path, target_gpus, layer_begins, layer_ends, max_ctx,
                 stream_fd, payload_fd);
+        case BackendIpcMode::DeepSeek4DSparkDraft:
+            return run_deepseek4_dspark_draft_ipc_daemon(
+                payload_path, ring_cap, draft_gpu, stream_fd, payload_fd,
+                shared_payload_fd, shared_payload_bytes);
     }
     std::fprintf(stderr, "[backend-ipc-daemon] unsupported mode\n");
     return 2;

@@ -3076,6 +3076,11 @@ static void test_backend_ipc_payload_transport_parse() {
     TEST_ASSERT(mode == BackendIpcMode::PFlashCompress);
     TEST_ASSERT(parse_backend_ipc_mode("qwen35-target-shard", mode));
     TEST_ASSERT(mode == BackendIpcMode::Qwen35TargetShard);
+    TEST_ASSERT(parse_backend_ipc_mode("deepseek4-dspark-draft", mode));
+    TEST_ASSERT(mode == BackendIpcMode::DeepSeek4DSparkDraft);
+    TEST_ASSERT(std::strcmp(
+        backend_ipc_mode_name(BackendIpcMode::DeepSeek4DSparkDraft),
+        "deepseek4-dspark-draft") == 0);
     TEST_ASSERT(parse_backend_ipc_mode("moe-expert-compute", mode));
     TEST_ASSERT(mode == BackendIpcMode::MoeExpertCompute);
     TEST_ASSERT(!parse_backend_ipc_mode("moe-ffn", mode));

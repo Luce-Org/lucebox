@@ -14,6 +14,7 @@
 #include "../common/moe_hybrid_stream.h"
 #include "deepseek4_internal.h"
 #include "deepseek4_dspark.h"
+#include "common/dflash_draft_ipc.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -82,9 +83,11 @@ private:
     bool                           spec_drafter_parked_ = false;
     std::string                    spec_draft_path_;
     std::unique_ptr<DSparkDrafter> spec_drafter_;
+    std::unique_ptr<DFlashDraftIpcClient> spec_remote_drafter_;
     std::vector<float>             spec_feat_window_;
 
     bool load_spec_drafter();
+    bool start_spec_remote_drafter();
     void release_spec_drafter(bool mark_parked);
 
     // Prefill prompt tokens in chunks, return absolute committed position.

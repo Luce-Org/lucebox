@@ -25,14 +25,15 @@ namespace dflash::common {
 
 namespace {
 
-BackendIpcPayloadTransport draft_ipc_transport_from_env() {
+BackendIpcPayloadTransport draft_ipc_transport_from_env(
+        BackendIpcPayloadTransport fallback) {
     const char * raw = std::getenv("DFLASH_DRAFT_IPC_TRANSPORT");
     if (!raw || !*raw) {
-        return BackendIpcPayloadTransport::Stream;
+        return fallback;
     }
-    BackendIpcPayloadTransport transport = BackendIpcPayloadTransport::Stream;
+    BackendIpcPayloadTransport transport = fallback;
     if (!parse_backend_ipc_payload_transport(raw, transport)) {
-        return BackendIpcPayloadTransport::Stream;
+        return fallback;
     }
     return transport;
 }
@@ -47,16 +48,23 @@ bool checked_mul_size(size_t a, size_t b, size_t & out) {
 
 size_t dflash_draft_ipc_required_shared_bytes(int hidden_size,
                                               int block_size,
-                                              int ring_cap) {
-    if (hidden_size <= 0 || block_size <= 0 || ring_cap <= 0) {
+                                              int ring_cap,
+                                              int n_target_layers) {
+    if (hidden_size <= 0 || block_size <= 0 || ring_cap <= 0 ||
+        n_target_layers <= 0) {
         return 0;
     }
-    const size_t max_tokens =
-        (size_t)std::max(block_size, ring_cap);
-    size_t elements = 0;
+    size_t noise_elements = 0;
+    size_t feature_elements = 0;
     size_t bytes = 0;
-    if (!checked_mul_size(max_tokens, (size_t)hidden_size, elements) ||
-        !checked_mul_size(elements, sizeof(float), bytes)) {
+    if (!checked_mul_size((size_t)block_size, (size_t)hidden_size,
+                          noise_elements) ||
+        !checked_mul_size((size_t)ring_cap, (size_t)n_target_layers,
+                          feature_elements) ||
+        !checked_mul_size(feature_elements, (size_t)hidden_size,
+                          feature_elements) ||
+        !checked_mul_size(std::max(noise_elements, feature_elements),
+                          sizeof(float), bytes)) {
         return 0;
     }
     return bytes;
@@ -100,22 +108,32 @@ bool DFlashDraftIpcClient::start(
         const std::string & draft_path,
         int draft_gpu,
         int ring_cap,
-        const std::string & work_dir) {
+        const std::string & work_dir,
+        BackendIpcMode mode) {
 #if defined(_WIN32)
-    (void)bin; (void)draft_path; (void)draft_gpu; (void)ring_cap; (void)work_dir;
+    (void)bin; (void)draft_path; (void)draft_gpu; (void)ring_cap; (void)work_dir; (void)mode;
     std::fprintf(stderr, "DFlash draft IPC is only implemented on POSIX hosts\n");
     return false;
 #else
     close();
-    if (bin.empty() || draft_path.empty() || ring_cap <= 0) return false;
+    if (bin.empty() || draft_path.empty() || ring_cap <= 0 ||
+        (mode != BackendIpcMode::DFlashDraft &&
+         mode != BackendIpcMode::DeepSeek4DSparkDraft)) return false;
     BackendIpcLaunchConfig launch;
     launch.bin = bin;
-    launch.mode = BackendIpcMode::DFlashDraft;
+    launch.mode = mode;
     launch.payload_path = draft_path;
     launch.work_dir = work_dir;
-    launch.payload_transport = draft_ipc_transport_from_env();
+    const BackendIpcPayloadTransport default_transport =
+        mode == BackendIpcMode::DeepSeek4DSparkDraft
+            ? BackendIpcPayloadTransport::Auto
+            : BackendIpcPayloadTransport::Stream;
+    launch.payload_transport = draft_ipc_transport_from_env(default_transport);
+    const int shared_feature_layers =
+        mode == BackendIpcMode::DeepSeek4DSparkDraft ? n_target_layers_ : 1;
     launch.shared_payload_bytes = draft_ipc_shared_bytes_from_env(
-        dflash_draft_ipc_required_shared_bytes(hidden_size_, block_size_, ring_cap));
+        dflash_draft_ipc_required_shared_bytes(
+            hidden_size_, block_size_, ring_cap, shared_feature_layers));
     launch.args.push_back("--ring-cap=" + std::to_string(ring_cap));
     launch.args.push_back("--draft-gpu=" + std::to_string(std::max(0, draft_gpu)));
     if (!process_.start(launch)) {
@@ -123,10 +141,74 @@ bool DFlashDraftIpcClient::start(
         return false;
     }
     ring_cap_ = ring_cap;
+    mode_ = mode;
     active_ = true;
-    std::printf("[draft-ipc] ready bin=%s gpu=%d ring_cap=%d work_dir=%s\n",
-                bin.c_str(), draft_gpu, ring_cap, process_.work_dir().c_str());
+    std::printf("[draft-ipc] ready mode=%s bin=%s gpu=%d ring_cap=%d work_dir=%s\n",
+                backend_ipc_mode_name(mode), bin.c_str(), draft_gpu, ring_cap,
+                process_.work_dir().c_str());
     return true;
+#endif
+}
+
+bool DFlashDraftIpcClient::send_feature_block(
+        int start_pos,
+        int n_tokens,
+        const float * features,
+        size_t feature_count) {
+#if defined(_WIN32)
+    (void)start_pos; (void)n_tokens; (void)features; (void)feature_count;
+    return false;
+#else
+    FILE * cmd = process_.command_stream();
+    const int stream_fd = process_.stream_fd();
+    const int payload_fd = process_.payload_fd();
+    if (!active_ || mode_ != BackendIpcMode::DeepSeek4DSparkDraft ||
+        !cmd || stream_fd < 0 || start_pos < 0 || n_tokens <= 0 ||
+        n_tokens > ring_cap_) {
+        return false;
+    }
+    const size_t expected = (size_t)n_tokens * (size_t)n_target_layers_ *
+                            (size_t)hidden_size_;
+    if (!features || feature_count != expected) return false;
+    const size_t bytes = feature_count * sizeof(float);
+
+    if (process_.resolved_payload_transport() == BackendIpcPayloadTransport::Shared) {
+        uint64_t seq = 0;
+        if (!process_.write_shared_payload(features, bytes, seq)) {
+            std::fprintf(stderr,
+                         "draft-ipc feature_block shared payload too large bytes=%zu capacity=%zu\n",
+                         bytes, process_.shared_payload_capacity());
+            return false;
+        }
+        std::fprintf(cmd, "feature_block_shared %d %d %zu %" PRIu64 "\n",
+                     start_pos, n_tokens, bytes, seq);
+        std::fflush(cmd);
+        int32_t status = -1;
+        const bool ok = read_exact_fd(stream_fd, &status, sizeof(status)) &&
+                        status == 0;
+        if (!ok) {
+            std::fprintf(stderr,
+                         "draft-ipc feature_block_shared failed status=%d\n",
+                         status);
+        }
+        return ok;
+    }
+
+    if (payload_fd < 0) return false;
+    std::fprintf(cmd, "feature_block_pipe %d %d %zu\n",
+                 start_pos, n_tokens, bytes);
+    std::fflush(cmd);
+    if (!write_exact_fd(payload_fd, features, bytes)) {
+        std::fprintf(stderr, "draft-ipc feature_block payload write failed\n");
+        return false;
+    }
+    int32_t status = -1;
+    const bool ok = read_exact_fd(stream_fd, &status, sizeof(status)) &&
+                    status == 0;
+    if (!ok) {
+        std::fprintf(stderr, "draft-ipc feature_block failed status=%d\n", status);
+    }
+    return ok;
 #endif
 }
 
@@ -216,11 +298,19 @@ bool DFlashDraftIpcClient::propose(
     const int payload_fd = process_.payload_fd();
     if (!active_ || !cmd || stream_fd < 0 || committed < 0 ||
         ctx_len <= 0 || ctx_len > ring_cap_) {
+        std::fprintf(stderr,
+                     "draft-ipc propose rejected active=%d cmd=%p stream_fd=%d committed=%d ctx_len=%d ring_cap=%d\n",
+                     (int)active_, (void *)cmd, stream_fd, committed, ctx_len, ring_cap_);
         return false;
     }
     const size_t noise_expected =
         (size_t)hidden_size_ * block_size_;
-    if (noise_embed.size() != noise_expected) return false;
+    if (noise_embed.size() != noise_expected) {
+        std::fprintf(stderr,
+                     "draft-ipc propose noise size mismatch got=%zu expected=%zu hidden=%d block=%d\n",
+                     noise_embed.size(), noise_expected, hidden_size_, block_size_);
+        return false;
+    }
     const size_t bytes = noise_embed.size() * sizeof(float);
     if (process_.resolved_payload_transport() == BackendIpcPayloadTransport::Shared) {
         uint64_t seq = 0;
@@ -230,15 +320,20 @@ bool DFlashDraftIpcClient::propose(
                          bytes, process_.shared_payload_capacity());
             return false;
         }
-        std::fprintf(cmd, "propose_shared %d %d %zu %" PRIu64 "\n",
+        const bool bidirectional =
+            mode_ == BackendIpcMode::DeepSeek4DSparkDraft;
+        std::fprintf(cmd, bidirectional
+                     ? "propose_shared_bidir %d %d %zu %" PRIu64 "\n"
+                     : "propose_shared %d %d %zu %" PRIu64 "\n",
                      committed, ctx_len, bytes, seq);
         std::fflush(cmd);
         int32_t status = -1;
         bool ok = read_exact_fd(stream_fd, &status, sizeof(status)) && status == 0;
         if (ok) {
             hidden_out.assign(noise_expected, 0.0f);
-            ok = read_exact_fd(stream_fd, hidden_out.data(),
-                               hidden_out.size() * sizeof(float));
+            ok = bidirectional
+                ? process_.read_shared_payload(hidden_out.data(), bytes, seq)
+                : read_exact_fd(stream_fd, hidden_out.data(), bytes);
         }
         if (!ok) {
             std::fprintf(stderr, "draft-ipc propose_shared failed status=%d\n", status);
@@ -348,6 +443,7 @@ void DFlashDraftIpcClient::close() {
     process_.close();
     active_ = false;
     ring_cap_ = 0;
+    mode_ = BackendIpcMode::Invalid;
 }
 
 // ── Remote draft feature copy helper ────────────────────────────────

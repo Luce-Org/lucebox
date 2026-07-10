@@ -17,6 +17,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -41,12 +42,27 @@ public:
                const std::string & draft_path,
                int draft_gpu,
                int ring_cap,
-               const std::string & work_dir);
+               const std::string & work_dir,
+               BackendIpcMode mode = BackendIpcMode::DFlashDraft);
 
     bool send_feature_slice(int capture_idx,
                             int start_pos,
                             int n_tokens,
                             const std::vector<float> & slice);
+
+    // Token-major [n_tokens, n_target_layers, hidden_size] upload. This is the
+    // preferred DSpark path because all capture layers cross IPC in one
+    // command and one acknowledgement.
+    bool send_feature_block(int start_pos,
+                            int n_tokens,
+                            const float * features,
+                            size_t feature_count);
+    bool send_feature_block(int start_pos,
+                            int n_tokens,
+                            const std::vector<float> & features) {
+        return send_feature_block(
+            start_pos, n_tokens, features.data(), features.size());
+    }
 
     bool propose(int committed,
                  int ctx_len,
@@ -71,6 +87,7 @@ private:
     int hidden_size_ = DFLASH27B_TARGET_HIDDEN;
     int block_size_ = DFLASH27B_DRAFT_BLOCK_SIZE;
     int n_target_layers_ = DFLASH27B_DRAFT_N_TARGET_LAYERS;
+    BackendIpcMode mode_ = BackendIpcMode::Invalid;
 };
 
 // ── Remote draft feature copy helper ────────────────────────────────

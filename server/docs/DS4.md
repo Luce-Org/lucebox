@@ -3,6 +3,8 @@
 This document describes the current DeepSeek V4 Flash implementation in
 DFlash. DeepSeek4 supports a monolithic HIP backend for single-device Strix
 Halo systems and a layer-split backend for local or mixed-device deployments.
+The opt-in DSpark speculative path can execute proposal blocks in a separate
+HIP process while the target remains in the primary process.
 
 ## Model Architecture
 
@@ -30,6 +32,7 @@ DeepSeek V4 Flash is a 43-layer MoE model with:
 | Model weights and metadata | `src/deepseek4/deepseek4_internal.h`, `src/deepseek4/deepseek4_loader.cpp` |
 | HC pre/post CUDA kernel | `src/deepseek4/deepseek4_hc_cuda.cu`, `.h` |
 | Remote target-shard daemon | `src/deepseek4/deepseek4_target_shard_ipc_daemon.cpp` |
+| DSpark runtime and remote draft daemon | `src/deepseek4/deepseek4_dspark*.{h,cpp}` |
 | Shared target-shard IPC infrastructure | `src/common/target_shard_ipc.*`, `src/placement/remote_target_shard_config.h` |
 | Backend IPC CLI entry | `src/ipc/backend_ipc_main.cpp` |
 
@@ -103,6 +106,28 @@ For heterogeneous setups, the CUDA-built server can keep the prefix layers on th
 
 This path uses `TargetShardIpcSession`, `deepseek4_target_shard_ipc_daemon.cpp`, and `BackendIpcMode::DeepSeek4TargetShard` rather than the old expert-worker protocol.
 
+### Local target + remote HIP DSpark draft
+
+The speculative IPC mode keeps the complete DeepSeek4 target, KV cache, tied
+embedding, DSpark head, and sampler in the parent. A separate
+`BackendIpcMode::DeepSeek4DSparkDraft` process executes the DSpark proposal
+graph on the selected HIP GPU. The parent currently retains its locally loaded
+draft weights for metadata and fallback; removing that duplicate residency is
+a separate optimization.
+
+Each speculative step transfers:
+
+- target feature captures in token-major
+  `[n_tokens, n_target_layers, n_embd]` layout;
+- the embedded seed/MASK proposal block;
+- the proposal hidden states returned by the HIP worker.
+
+All target-layer captures are uploaded as one feature block and one
+acknowledgement. On POSIX hosts this mode defaults to the existing memfd-backed
+shared payload transport; proposal input and output reuse the same mapping.
+`stream` remains available as an A/B and compatibility fallback. This is shared
+host IPC, not direct `hipIpcMemHandle` peer memory.
+
 ## Shard Boundary State
 
 The shard boundary transfers the **full HC state tensor**, not a separate expert-routing payload:
@@ -130,6 +155,13 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 |----------|---------|
 | `DFLASH_DS4_CUDA_LAYERS` | Override the auto-split heuristic and pin the first `N` DeepSeek4 layers to CUDA. The remaining `43 - N` layers run on the Halo shard. |
 | `DFLASH_DS4_TIMING` | Enable DS4 timing logs for the layer-split parent and target-shard daemon. Useful for profiling prefill/decode breakdowns; leave unset for normal runs. |
+| `DFLASH_DS4_SPEC` | Enable the DeepSeek4 DSpark speculative runtime. |
+| `DFLASH_DS4_DRAFT` | DSpark draft GGUF loaded locally for metadata/head use and by the remote worker. |
+| `DFLASH_DS4_DRAFT_IPC_BIN` | Backend IPC daemon executable used for the remote DSpark worker. |
+| `DFLASH_DS4_DRAFT_IPC_GPU` | HIP device index for the remote DSpark proposal blocks. |
+| `DFLASH_DS4_DRAFT_IPC_WORK_DIR` | Scratch directory for the child process. |
+| `DFLASH_DS4_DRAFT_IPC_REQUIRED` | Fail initialization instead of falling back to a local draft when remote startup fails. |
+| `DFLASH_DRAFT_IPC_TRANSPORT` | Payload transport: `auto`, `shared`, or `stream`. DeepSeek4 DSpark defaults to `auto`; other draft modes retain their existing default. |
 
 `DFLASH_DS4_TIMING` enables the existing timing banners:
 

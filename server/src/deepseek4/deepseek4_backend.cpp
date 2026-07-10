@@ -437,10 +437,43 @@ bool DeepSeek4Backend::load_spec_drafter() {
     spec_drafter_parked_ = false;
     std::fprintf(stderr, "[deepseek4] DSpark spec-decode ENABLED (drafter=%s)\n",
                  spec_draft_path_.c_str());
+    return start_spec_remote_drafter();
+}
+
+bool DeepSeek4Backend::start_spec_remote_drafter() {
+    spec_remote_drafter_.reset();
+
+    const char * ipc_bin = std::getenv("DFLASH_DS4_DRAFT_IPC_BIN");
+    if (!ipc_bin || !*ipc_bin) return true;
+    if (!spec_drafter_) return false;
+
+    int ipc_gpu = 0;
+    if (const char * gpu = std::getenv("DFLASH_DS4_DRAFT_IPC_GPU")) {
+        ipc_gpu = std::max(0, std::atoi(gpu));
+    }
+    const char * ipc_work = std::getenv("DFLASH_DS4_DRAFT_IPC_WORK_DIR");
+    auto remote = std::make_unique<DFlashDraftIpcClient>(
+        w_.n_embd, spec_drafter_->block_size,
+        spec_drafter_->n_target_layers);
+    if (!remote->start(
+            ipc_bin, spec_draft_path_, ipc_gpu, w_.n_swa,
+            ipc_work && *ipc_work ? ipc_work : "",
+            BackendIpcMode::DeepSeek4DSparkDraft)) {
+        std::fprintf(stderr,
+                     "[deepseek4] DSpark remote draft IPC failed; using local draft\n");
+        return !env_flag_enabled("DFLASH_DS4_DRAFT_IPC_REQUIRED");
+    }
+
+    spec_remote_drafter_ = std::move(remote);
+    std::fprintf(stderr,
+                 "[deepseek4] DSpark remote draft IPC ENABLED gpu=%d\n",
+                 ipc_gpu);
     return true;
 }
 
 void DeepSeek4Backend::release_spec_drafter(bool mark_parked) {
+    // Stop the remote process before releasing the local metadata/fallback.
+    spec_remote_drafter_.reset();
     if (spec_drafter_) {
         free_deepseek4_dspark_drafter(*spec_drafter_);
     }
@@ -498,7 +531,10 @@ bool DeepSeek4Backend::init() {
                              "[deepseek4] DSpark spec-decode requires monolithic model "
                              "placement; disabled for hybrid expert placement\n");
             } else {
-                (void) load_spec_drafter();
+                const bool loaded = load_spec_drafter();
+                if (!loaded && env_flag_enabled("DFLASH_DS4_DRAFT_IPC_REQUIRED")) {
+                    return false;
+                }
             }
         } else {
             std::fprintf(stderr, "[deepseek4] DFLASH_DS4_SPEC set but DFLASH_DS4_DRAFT gguf missing\n");
@@ -930,7 +966,8 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
                         if (out_io.cancelled) return false;
                         out_io.emit(tok);
                         return !out_io.cancelled;
-                    })) {
+                    },
+                    spec_remote_drafter_.get())) {
                 result.fail(GenerateErrorCode::DecodeFailed,
                             "DSpark speculative decode failed");
                 return result;
