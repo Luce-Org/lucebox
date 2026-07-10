@@ -40,6 +40,38 @@
 
 namespace dflash::common {
 
+// Feature fusion shared by the legacy one-shot graph and the cached-KV
+// builders: optional per-capture RMSNorm slices, fc projection, hidden_norm.
+// Row-independent, so it is bit-identical whether run over the full window
+// or over appended rows only.
+static ggml_tensor * draft_fuse_features(
+    ggml_context *       ctx,
+    const DraftWeights & w,
+    ggml_tensor *        target_hidden_cat,
+    int                  n_rows,
+    bool                 disable_aux_hidden_norms) {
+    const float eps = DFLASH27B_RMS_EPS;
+    ggml_tensor * thc = target_hidden_cat;
+    if (!disable_aux_hidden_norms && !w.aux_hidden_norms.empty()) {
+        ggml_tensor * aux_cat = nullptr;
+        const size_t elem_sz = ggml_element_size(target_hidden_cat);
+        for (size_t i = 0; i < w.aux_hidden_norms.size(); i++) {
+            ggml_tensor * slice = ggml_view_3d(ctx, target_hidden_cat,
+                w.n_embd, n_rows, 1,
+                target_hidden_cat->nb[1], target_hidden_cat->nb[2],
+                i * (size_t)w.n_embd * elem_sz);
+            slice = ggml_rms_norm(ctx, slice, eps);
+            slice = ggml_mul(ctx, slice, w.aux_hidden_norms[i]);
+            aux_cat = aux_cat ? ggml_concat(ctx, aux_cat, slice, 0) : slice;
+        }
+        thc = aux_cat;
+    }
+    ggml_tensor * target_feat = ggml_mul_mat(ctx, w.fc, thc);
+    target_feat = ggml_rms_norm(ctx, target_feat, eps);
+    target_feat = ggml_mul    (ctx, target_feat, w.hidden_norm);
+    return target_feat;
+}
+
 DraftGraphOutputs build_draft_graph(
     ggml_context *            ctx,
     const DraftWeights &      w,
@@ -57,7 +89,6 @@ DraftGraphOutputs build_draft_graph(
     //    fc:                [5*hidden, hidden]  (ggml: ne[0]=5*hidden, ne[1]=hidden)
     //    target_hidden_cat: [5*hidden, ctx_len, 1]
     //    Result:            [hidden,   ctx_len, 1]
-    ggml_tensor * target_hidden_cat = in.target_hidden_cat;
     static const bool disable_aux_hidden_norms =
         std::getenv("DFLASH_DISABLE_DRAFT_AUX_NORMS") != nullptr;
     static const bool disable_attn_gate =
@@ -69,23 +100,8 @@ DraftGraphOutputs build_draft_graph(
     static const bool disable_ffn =
         std::getenv("DFLASH_DISABLE_DRAFT_FFN") != nullptr;
 
-    if (!disable_aux_hidden_norms && !w.aux_hidden_norms.empty()) {
-        ggml_tensor * aux_cat = nullptr;
-        const size_t elem_sz = ggml_element_size(in.target_hidden_cat);
-        for (size_t i = 0; i < w.aux_hidden_norms.size(); i++) {
-            ggml_tensor * slice = ggml_view_3d(ctx, in.target_hidden_cat,
-                w.n_embd, ctx_len, 1,
-                in.target_hidden_cat->nb[1], in.target_hidden_cat->nb[2],
-                i * (size_t)w.n_embd * elem_sz);
-            slice = ggml_rms_norm(ctx, slice, eps);
-            slice = ggml_mul(ctx, slice, w.aux_hidden_norms[i]);
-            aux_cat = aux_cat ? ggml_concat(ctx, aux_cat, slice, 0) : slice;
-        }
-        target_hidden_cat = aux_cat;
-    }
-    ggml_tensor * target_feat = ggml_mul_mat(ctx, w.fc, target_hidden_cat);
-    target_feat = ggml_rms_norm(ctx, target_feat, eps);
-    target_feat = ggml_mul    (ctx, target_feat, w.hidden_norm);
+    ggml_tensor * target_feat = draft_fuse_features(
+        ctx, w, in.target_hidden_cat, ctx_len, disable_aux_hidden_norms);
     ggml_set_name(target_feat, "target_feat");
 
     // ── 2. Decoder layers
@@ -259,6 +275,190 @@ DraftGraphOutputs build_draft_graph(
     if (in.lm_head) {
         ggml_tensor * logits = ggml_mul_mat(ctx, in.lm_head, out);
         ggml_set_name(logits, "draft_logits");
+        og.logits = logits;
+    }
+    return og;
+}
+
+// ── Cached drafter context-KV builders ──────────────────────────────
+//
+// The per-(head,position) k_norm and RoPE are separable, so computing the ctx
+// K/V rows here (append) and the noise K/V rows in the step graph matches the
+// legacy concat-then-normalize math exactly; the only numeric difference is
+// the F16 cache storage (legacy keeps K/V in F32 for the one shot).
+
+// Per-layer ctx-side K/V rows in the head-major cache layout.
+// K: wk @ tf_kv → per-head k_norm → RoPE(positions) → [head_dim*n_kv, n] rows.
+// V: wv @ tf_kv, already row-shaped.
+static void draft_ctx_kv_rows(
+    ggml_context *       ctx,
+    const DraftWeights & w,
+    const DraftLayer &   L,
+    ggml_tensor *        target_feat,   // [hidden, n]
+    ggml_tensor *        positions,     // [n] i32 absolute
+    int                  n,
+    ggml_tensor **       k_rows_out,
+    ggml_tensor **       v_rows_out) {
+    const float eps = DFLASH27B_RMS_EPS;
+    ggml_tensor * tf_kv = target_feat;
+    if (w.context_kv_layer_norm) {
+        tf_kv = ggml_rms_norm(ctx, tf_kv, eps);
+        tf_kv = ggml_mul(ctx, tf_kv, L.attn_norm);
+    }
+    ggml_tensor * K = ggml_mul_mat(ctx, L.wk, tf_kv);          // [kv_dim, n]
+    K = ggml_reshape_3d(ctx, K, w.head_dim, w.n_head_kv, n);
+    K = ggml_rms_norm(ctx, K, eps);
+    K = ggml_mul     (ctx, K, L.k_norm);
+    K = ggml_rope_ext(ctx, K, positions, /*freq_factors=*/nullptr,
+                      w.head_dim, GGML_ROPE_TYPE_NEOX, /*n_ctx_orig=*/0,
+                      w.rope_theta, /*freq_scale=*/1.0f,
+                      /*ext_factor=*/0.0f, /*attn_factor=*/1.0f,
+                      /*beta_fast=*/0.0f, /*beta_slow=*/0.0f);
+    // rope output is contiguous [head_dim, n_kv, n] → head-major rows view
+    *k_rows_out = ggml_view_2d(ctx, K, (int64_t)w.head_dim * w.n_head_kv, n,
+                               K->nb[2], 0);
+    *v_rows_out = ggml_mul_mat(ctx, L.wv, tf_kv);              // [kv_dim, n]
+}
+
+bool build_draft_kv_append(
+    ggml_context *              ctx,
+    ggml_cgraph *               gf,
+    const DraftWeights &        w,
+    const DraftKvCacheRefs &    cache,
+    const DraftKvAppendInputs & in) {
+    if (!in.feat || !in.positions || !in.rows || in.n_rows <= 0) return false;
+    static const bool disable_aux_hidden_norms =
+        std::getenv("DFLASH_DISABLE_DRAFT_AUX_NORMS") != nullptr;
+
+    ggml_tensor * target_feat = draft_fuse_features(
+        ctx, w, in.feat, in.n_rows, disable_aux_hidden_norms);
+    ggml_set_name(target_feat, "draft_kv_append_feat");
+
+    for (int il = 0; il < w.n_layer; il++) {
+        ggml_tensor * Krows = nullptr;
+        ggml_tensor * Vrows = nullptr;
+        draft_ctx_kv_rows(ctx, w, w.layers[il], target_feat, in.positions,
+                          in.n_rows, &Krows, &Vrows);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache.k[il], Krows, in.rows));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache.v[il], Vrows, in.rows));
+    }
+    return true;
+}
+
+DraftGraphOutputs build_draft_kv_step(
+    ggml_context *            ctx,
+    ggml_cgraph *             gf,
+    const DraftWeights &      w,
+    const DraftKvCacheRefs &  cache,
+    const DraftKvStepInputs & in) {
+    const int q_len    = w.block_size;
+    const int n_head   = w.n_head;
+    const int n_kv     = w.n_head_kv;
+    const int head_dim = w.head_dim;
+    const float eps    = DFLASH27B_RMS_EPS;
+    const float rope_base = w.rope_theta;
+    const int kv_total = cache.kv_total;
+
+    static const bool disable_attn_gate =
+        std::getenv("DFLASH_DISABLE_DRAFT_ATTN_GATE") != nullptr;
+    static const bool disable_swa =
+        std::getenv("DFLASH_DISABLE_DRAFT_SWA") != nullptr;
+
+    ggml_tensor * h = in.noise_embed;  // [hidden, q_len]
+    char probe_name[64];
+
+    for (int il = 0; il < w.n_layer; il++) {
+        const DraftLayer & L = w.layers[il];
+        const bool layer_is_swa = L.is_swa && !disable_swa;
+
+        // ── attention pre-norm
+        ggml_tensor * hn = ggml_rms_norm(ctx, h, eps);
+        hn = ggml_mul(ctx, hn, L.attn_norm);
+
+        // ── Q from noise, per-head RMSNorm, RoPE at absolute positions
+        ggml_tensor * Q = ggml_mul_mat(ctx, L.wq, hn);
+        Q = ggml_reshape_3d(ctx, Q, head_dim, n_head, q_len);
+        Q = ggml_rms_norm(ctx, Q, eps);
+        Q = ggml_mul     (ctx, Q, L.q_norm);
+        Q = ggml_rope_ext(ctx, Q, in.positions_q, nullptr,
+                          head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                          rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+        // ── noise K/V into the scratch cache slots
+        ggml_tensor * Kn = ggml_mul_mat(ctx, L.wk, hn);
+        Kn = ggml_reshape_3d(ctx, Kn, head_dim, n_kv, q_len);
+        Kn = ggml_rms_norm(ctx, Kn, eps);
+        Kn = ggml_mul     (ctx, Kn, L.k_norm);
+        Kn = ggml_rope_ext(ctx, Kn, in.positions_q, nullptr,
+                           head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                           rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        ggml_tensor * Kn_rows = ggml_view_2d(ctx, Kn,
+            (int64_t)head_dim * n_kv, q_len, Kn->nb[2], 0);
+        ggml_tensor * Vn_rows = ggml_mul_mat(ctx, L.wv, hn);  // [kv_dim, q_len]
+        ggml_build_forward_expand(gf,
+            ggml_set_rows(ctx, cache.k[il], Kn_rows, in.noise_rows));
+        ggml_build_forward_expand(gf,
+            ggml_set_rows(ctx, cache.v[il], Vn_rows, in.noise_rows));
+
+        // ── flash attention over the full cache span (masks gate validity).
+        // The set_rows nodes were expanded above, so graph order guarantees
+        // the scratch slots hold this step's noise K/V before the FA reads.
+        ggml_tensor * Qfa = ggml_permute(ctx, Q, 0, 2, 1, 3);  // [hd, q_len, n_head]
+        Qfa = ggml_cont(ctx, Qfa);
+        ggml_tensor * Kview = ggml_view_3d(ctx, cache.k[il],
+            head_dim, n_kv, kv_total,
+            ggml_row_size(cache.k[il]->type, head_dim), cache.k[il]->nb[1], 0);
+        ggml_tensor * Vview = ggml_view_3d(ctx, cache.v[il],
+            head_dim, n_kv, kv_total,
+            ggml_row_size(cache.v[il]->type, head_dim), cache.v[il]->nb[1], 0);
+        ggml_tensor * Kfa = ggml_permute(ctx, Kview, 0, 2, 1, 3);  // [hd, kv_total, n_kv]
+        ggml_tensor * Vfa = ggml_permute(ctx, Vview, 0, 2, 1, 3);
+
+        const float scale = 1.0f / std::sqrt((float)head_dim);
+        ggml_tensor * mask = layer_is_swa ? in.mask_swa : in.mask_full;
+        ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, mask,
+                                                 scale, /*max_bias=*/0.0f,
+                                                 /*logit_softcap=*/0.0f);
+        std::snprintf(probe_name, sizeof(probe_name), "draft_kv_l%d_attn", il);
+        ggml_set_name(attn, probe_name);
+
+        if (!disable_attn_gate && L.attn_gate) {
+            ggml_tensor * gate = ggml_mul_mat(ctx, L.attn_gate, hn);
+            gate = ggml_softplus(ctx, gate);
+            if (L.attn_gate_per_head) {
+                gate = ggml_reshape_3d(ctx, gate, 1, n_head, q_len);
+            } else {
+                gate = ggml_reshape_3d(ctx, gate, head_dim, n_head, q_len);
+            }
+            gate = ggml_cast(ctx, gate, attn->type);
+            attn = ggml_mul(ctx, attn, gate);
+        }
+        attn = ggml_reshape_2d(ctx, attn, head_dim * n_head, q_len);
+
+        ggml_tensor * attn_out = ggml_mul_mat(ctx, L.wo, attn);
+        h = ggml_add(ctx, h, attn_out);
+
+        // ── FFN
+        ggml_tensor * hf = ggml_rms_norm(ctx, h, eps);
+        hf = ggml_mul(ctx, hf, L.ffn_norm);
+        ggml_tensor * g  = ggml_mul_mat(ctx, L.w_gate, hf);
+        g = ggml_silu(ctx, g);
+        ggml_tensor * u  = ggml_mul_mat(ctx, L.w_up,   hf);
+        ggml_tensor * gu = ggml_mul(ctx, g, u);
+        ggml_tensor * ffn_out = ggml_mul_mat(ctx, L.w_down, gu);
+        h = ggml_add(ctx, h, ffn_out);
+    }
+
+    ggml_tensor * out = ggml_rms_norm(ctx, h, eps);
+    out = ggml_mul(ctx, out, w.out_norm);
+    ggml_set_name(out, "draft_kv_hidden_out");
+
+    DraftGraphOutputs og{};
+    og.hidden_states = out;
+    og.logits = nullptr;
+    if (in.lm_head) {
+        ggml_tensor * logits = ggml_mul_mat(ctx, in.lm_head, out);
+        ggml_set_name(logits, "draft_kv_logits");
         og.logits = logits;
     }
     return og;

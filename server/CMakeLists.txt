@@ -280,6 +280,7 @@ add_library(dflash_common STATIC
     src/common/dflash_draft_ipc_daemon.cpp
     src/common/pflash_drafter_ipc.cpp
     src/common/dflash_draft_graph.cpp
+    src/common/dflash_draft_kv.cpp
     src/common/dflash_spec_decode.cpp
     src/common/layer_split_backend.cpp
     src/common/layer_split_runtime.cpp
