@@ -15,6 +15,7 @@
 #include "common/dspark_head.h"
 #include "common/dflash_feature_ring.h"
 #include "common/dflash_draft_graph.h"
+#include "common/prof_env.h"
 #include "kv_quant.h"
 
 #include <chrono>
@@ -687,7 +688,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     if (use_draft_kv) draft_kv_reset(draft_kv_);
 
     auto t_dec0 = std::chrono::steady_clock::now();
-    static const bool step_prof = std::getenv("DFLASH_LAGUNA_STEP_PROF") != nullptr;
+    static const bool step_prof = dflash_prof_enabled("step");
     double prof_draft_ms = 0.0, prof_heads_ms = 0.0, prof_verify_ms = 0.0;
     // [TAG_FUSED_LOOP] blind-spot laps: commit = verify-end -> loop-top
     // (accept/commit/emit/feature-sync), build = loop-top -> draft-input
