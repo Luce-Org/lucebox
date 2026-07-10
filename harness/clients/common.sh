@@ -55,8 +55,8 @@ BUDGET="${BUDGET:-22}"
 # calling (Qwen3.6) - only set it explicitly for experiments.
 FA_WINDOW="${FA_WINDOW:-0}"
 # CACHE_TYPE_K/V: empty = let the server pick the model family's default
-# (qwen auto-selects tq3_0 above 6K ctx; laguna requires q8_0 - forcing
-# tq3_0/q4_0 on laguna garbles its output). Set explicitly to experiment.
+# (laguna q8_0, q4_0 base; forcing tq3_0/q4_0 on laguna garbles its
+# output). Set explicitly to experiment.
 CACHE_TYPE_K="${CACHE_TYPE_K:-}"
 CACHE_TYPE_V="${CACHE_TYPE_V:-}"
 LLAMA_CACHE_TYPE_K="${LLAMA_CACHE_TYPE_K:-${CACHE_TYPE_K:-q8_0}}"

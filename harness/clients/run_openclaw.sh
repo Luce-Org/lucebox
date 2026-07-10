@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${MAX_CTX:=204800}"
 : "${BUDGET:=22}"
 : "${VERIFY_MODE:=ddtree}"
-: "${FA_WINDOW:=2048}"
+# FA_WINDOW stays 0 (common.sh): finite windows break tool calls.
 : "${EXTRA_SERVER_ARGS:=--lazy-draft}"
 source "$SCRIPT_DIR/common.sh"
 
