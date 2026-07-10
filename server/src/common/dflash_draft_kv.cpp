@@ -170,9 +170,15 @@ static bool draft_kv_bulk_append(DraftKvState & st,
         ggml_tensor * tpos = ggml_new_tensor_1d(tctx, GGML_TYPE_I32, c);
         ggml_tensor * trow = ggml_new_tensor_1d(tctx, GGML_TYPE_I32, c);
         ggml_backend_buffer_t tbuf = ggml_backend_alloc_ctx_tensors(tctx, backend);
-        if (!tbuf) { ggml_free(tctx); return false; }
+        if (!tbuf) {
+            std::fprintf(stderr, "[draft-kv] bulk: input alloc failed (n=%d fc_in=%d)\n", c, st.fc_in);
+            ggml_free(tctx);
+            return false;
+        }
 
         bool ok = copy_feature_ring_range_to_tensor(ring, feat, start, c);
+        if (!ok) std::fprintf(stderr, "[draft-kv] bulk: ring copy failed (start=%d n=%d ring_cap=%d fc_in=%d ring_type=%d)\n",
+                              start, c, ring.cap, st.fc_in, (int)ring.storage_type);
         if (ok) {
             pos.resize((size_t)c);
             rows.resize((size_t)c);
@@ -196,11 +202,13 @@ static bool draft_kv_bulk_append(DraftKvState & st,
                 ggml_cgraph * g = ggml_new_graph_custom(gctx, 4096, false);
                 DraftKvAppendInputs ai{c, feat, tpos, trow};
                 ok = build_draft_kv_append(gctx, g, dw, st.cache, ai);
+                if (!ok) std::fprintf(stderr, "[draft-kv] bulk: append build failed\n");
                 if (ok) {
                     ggml_gallocr_t ga =
                         ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
                     ok = ga && ggml_gallocr_alloc_graph(ga, g) &&
                          ggml_backend_graph_compute(backend, g) == GGML_STATUS_SUCCESS;
+                    if (!ok) std::fprintf(stderr, "[draft-kv] bulk: graph alloc/compute failed (n=%d)\n", c);
                     if (ga) ggml_gallocr_free(ga);
                 }
                 ggml_free(gctx);

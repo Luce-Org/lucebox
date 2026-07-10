@@ -730,6 +730,7 @@ void Qwen35Backend::shutdown() {
     step_graph_destroy(draft_sg_);
     step_graph_destroy(proj_sg_);
     remote_draft_.close();
+    draft_kv_free(draft_kv_);
     draft_feature_mirror_free(feature_mirror_);
     for (int i = 0; i < PREFIX_SLOTS; i++) {
         free_prefix_snapshot(prefix_snapshots_[i]);
@@ -1999,42 +2000,83 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 return false;
             }
         } else {
-            if (!build_draft_step(draft_sg, dw_, /*lm_head=*/nullptr, draft_backend_,
-                                  draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
-                                  committed,
-                                  /*ctx_len_max=*/std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)))) {
-                std::fprintf(stderr, "spec-decode: draft build failed\n");
-                step_graph_destroy(draft_sg);
-                return false;
+            // [TAG_DRAFT_KV] ring-cached drafter context KV: append newly
+            // committed rows instead of re-encoding the whole feature window.
+            static const bool draft_kv_on = []() {
+                const char * e = std::getenv("DFLASH_DRAFT_KV");
+                return !(e && e[0] == '0' && e[1] == '\0');
+            }();
+            bool use_draft_kv = draft_kv_on && feature_mirror_.target_feat != nullptr;
+            if (use_draft_kv && draft_kv_.gf &&
+                draft_kv_.built_for != (const void *)&dw_) {
+                draft_kv_free(draft_kv_);
             }
-            if (!use_mirror_view &&
-                !copy_feature_ring_range_to_tensor(feature_mirror_, draft_sg.target_hidden_cat,
-                                                   draft_start, draft_ctx)) {
-                std::fprintf(stderr, "spec-decode: feature copy failed\n");
-                step_graph_destroy(draft_sg);
-                return false;
+            if (use_draft_kv && !draft_kv_.gf) {
+                const int kv_cap = std::min(ring_cap,
+                    std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max));
+                if (!draft_kv_init(draft_kv_, dw_, draft_backend_, kv_cap, nullptr)) {
+                    draft_kv_free(draft_kv_);
+                    use_draft_kv = false;
+                    std::fprintf(stderr,
+                        "spec-decode: draft-kv init failed; using legacy draft path\n");
+                }
             }
-            ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
-                                    sizeof(float) * noise_embed.size());
-            pos_k.resize((size_t)draft_ctx + q_len);
-            for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
-            for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
-            ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
-                                    sizeof(int32_t) * pos_q.size());
-            ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
-                                    sizeof(int32_t) * pos_k.size());
+            if (use_draft_kv) {
+                if (!draft_kv_begin_step(draft_kv_, dw_, draft_backend_,
+                                         feature_mirror_, committed)) {
+                    std::fprintf(stderr, "spec-decode: draft-kv step prep failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                ggml_backend_tensor_set(draft_kv_.inp_embed, noise_embed.data(), 0,
+                                        sizeof(float) * noise_embed.size());
+                if (ggml_backend_graph_compute(draft_backend_, draft_kv_.gf) !=
+                    GGML_STATUS_SUCCESS) {
+                    std::fprintf(stderr, "spec-decode: draft-kv compute failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                local_hidden.resize((size_t)hidden * q_len);
+                ggml_backend_tensor_get(draft_kv_.hidden_states, local_hidden.data(), 0,
+                                        sizeof(float) * local_hidden.size());
+            } else {
+                if (!build_draft_step(draft_sg, dw_, /*lm_head=*/nullptr, draft_backend_,
+                                      draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
+                                      committed,
+                                      /*ctx_len_max=*/std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)))) {
+                    std::fprintf(stderr, "spec-decode: draft build failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                if (!use_mirror_view &&
+                    !copy_feature_ring_range_to_tensor(feature_mirror_, draft_sg.target_hidden_cat,
+                                                       draft_start, draft_ctx)) {
+                    std::fprintf(stderr, "spec-decode: feature copy failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
+                                        sizeof(float) * noise_embed.size());
+                pos_k.resize((size_t)draft_ctx + q_len);
+                for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
+                for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
+                ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
+                                        sizeof(int32_t) * pos_q.size());
+                ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
+                                        sizeof(int32_t) * pos_k.size());
 
-            auto st = ggml_backend_graph_compute(draft_backend_, draft_sg.gf);
-            if (st != GGML_STATUS_SUCCESS) {
-                std::fprintf(stderr, "spec-decode: draft compute failed\n");
-                step_graph_destroy(draft_sg);
-                return false;
-            }
+                auto st = ggml_backend_graph_compute(draft_backend_, draft_sg.gf);
+                if (st != GGML_STATUS_SUCCESS) {
+                    std::fprintf(stderr, "spec-decode: draft compute failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
 
-            // Read draft hidden states to host for LM-head projection.
-            local_hidden.resize((size_t)hidden * q_len);
-            ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
-                                    sizeof(float) * local_hidden.size());
+                // Read draft hidden states to host for LM-head projection.
+                local_hidden.resize((size_t)hidden * q_len);
+                ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
+                                        sizeof(float) * local_hidden.size());
+            }
         }
 
         // 3. Project draft hidden → token IDs via target LM head
