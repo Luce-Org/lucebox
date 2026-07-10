@@ -13,6 +13,7 @@
 #include "../common/moe_hybrid_storage.h"
 #include "../common/moe_hybrid_stream.h"
 #include "deepseek4_internal.h"
+#include "deepseek4_dspark.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -75,6 +76,11 @@ private:
     static constexpr int PREFIX_SLOTS = 64;
     DeepSeek4Snapshot      snapshots_[PREFIX_SLOTS];
     std::vector<float>     last_logits_;
+
+    // DSpark speculative decode (opt-in: DFLASH_DS4_SPEC=1 + DFLASH_DS4_DRAFT=<gguf>).
+    bool                           spec_enabled_ = false;
+    std::unique_ptr<DSparkDrafter> spec_drafter_;
+    std::vector<float>             spec_feat_window_;
 
     // Prefill prompt tokens in chunks, return absolute committed position.
     int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io,
