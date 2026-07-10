@@ -225,6 +225,12 @@ bool spec_env_flag(const char * name) {
     return v && *v && *v != '0';
 }
 
+// Calibrated cumulative-confidence thresholds for widening the DS4 verify.
+// They are part of the policy, not deployment knobs: artifacts without a
+// compatible confidence head transparently retain the existing EWMA policy.
+constexpr float kConfidenceQ3Threshold = 0.30f;
+constexpr float kConfidenceQ4Threshold = 0.25f;
+
 // ── Light rollback state ────────────────────────────────────────────────
 // Only the non-position-idempotent cache pieces: the prev-half rows of every
 // ratio-4 rolling compressor state (attn + indexer) plus hc_state. Everything
@@ -384,6 +390,13 @@ bool run_deepseek4_dspark_spec_decode(
         if (std::fscanf(f, "%d", &v) == 1) adaptive_width = (v != 0);
         std::fclose(f);
     }
+    const bool use_confidence_width = adaptive_width && !seq_verify_mode &&
+        drafter.confidence_w != nullptr && drafter.confidence_b != nullptr &&
+        (drafter.confidence_dim == n_embd ||
+         drafter.confidence_dim == n_embd + drafter.markov_rank);
+    if (timing && use_confidence_width) {
+        std::fprintf(stderr, "[ds4-spec] adaptive width policy=confidence\n");
+    }
     double ewma_accept = 1.5;
 
     // Fast path caps the verify at the compression ratio (4): one boundary max,
@@ -452,6 +465,7 @@ bool run_deepseek4_dspark_spec_decode(
     std::vector<int32_t> noise_ids(block);
     std::vector<float> local_hidden, padded_hidden((size_t) n_embd * (block + 1), 0.0f);
     std::vector<int32_t> draft_tok, tgt_am;
+    std::vector<float> draft_confidence;
 
     // Cumulative phase timings (ms).
     double tm_draft = 0, tm_head = 0, tm_save = 0, tm_verify = 0, tm_apply = 0, tm_feat = 0;
@@ -491,6 +505,7 @@ bool run_deepseek4_dspark_spec_decode(
         // let the (row-0-skipping) chain use slots 1..q-1.
         t0 = SpecClock::now();
         draft_tok.clear();
+        draft_confidence.clear();
         bool ds_ok = false;
         // Batched-verify exactness: the batch must not cross a ratio-4
         // boundary except at its last token (state rows stay distinct and the
@@ -503,15 +518,17 @@ bool run_deepseek4_dspark_spec_decode(
         int q_step_cap = (seq_verify_mode || fused_verify_mode)
                        ? std::min(q_cap, 4)
                        : std::min(q_cap, 4 - (pos & 3));
-        if (adaptive_width && !seq_verify_mode) {
+        if (adaptive_width && !use_confidence_width && !seq_verify_mode) {
             const int w_cap = (int) ewma_accept + 2;
             if (w_cap < q_step_cap) q_step_cap = w_cap;
         }
         if (q_step_cap >= 2) {
             std::memcpy(padded_hidden.data() + n_embd, local_hidden.data(),
                         sizeof(float) * (size_t) n_embd * block);
-            ds_ok = dspark_markov_correct_greedy_chain_fused(dw, backend, target.lm_head_tensor(),
-                            padded_hidden.data(), q_step_cap, lt, draft_tok);
+            ds_ok = dspark_markov_correct_greedy_chain_fused(
+                            dw, backend, target.lm_head_tensor(), padded_hidden.data(),
+                            q_step_cap, lt, draft_tok,
+                            use_confidence_width ? &draft_confidence : nullptr);
             if (!ds_ok) {
                 ds_ok = dspark_markov_correct_greedy_chain(dw, backend, target,
                             padded_hidden.data(), q_step_cap, lt, 0.0f, draft_tok);
@@ -526,6 +543,25 @@ bool run_deepseek4_dspark_spec_decode(
             }
         } else {
             draft_tok.push_back(lt);   // q=1: seed only, no speculation
+        }
+        // Confidence estimates are per candidate. Their cumulative product is
+        // the estimated probability that the target accepts the whole prefix
+        // unlocked by a wider verify. The defaults were calibrated on q=4
+        // traces and keep q=4 for high-confidence prefixes while avoiding its
+        // extra verify cost on low-acceptance prompts.
+        if (use_confidence_width && draft_confidence.size() >= 2 && draft_tok.size() >= 3) {
+            const float p2 = draft_confidence[0] * draft_confidence[1];
+            int selected_q = p2 >= kConfidenceQ3Threshold ? 3 : 2;
+            if (selected_q == 3 && draft_confidence.size() >= 3 && draft_tok.size() >= 4) {
+                const float p3 = p2 * draft_confidence[2];
+                if (p3 >= kConfidenceQ4Threshold) selected_q = 4;
+            }
+            if ((int) draft_tok.size() > selected_q) draft_tok.resize((size_t) selected_q);
+        } else if (use_confidence_width && !seq_verify_mode) {
+            // The fused head should always return confidence for a compatible
+            // artifact. Preserve the old policy if a backend cannot do so.
+            const int selected_q = (int) ewma_accept + 2;
+            if ((int) draft_tok.size() > selected_q) draft_tok.resize((size_t) selected_q);
         }
         if ((int) draft_tok.size() > q_step_cap) draft_tok.resize(q_step_cap);
         const int q = (int) draft_tok.size();   // seed + candidates

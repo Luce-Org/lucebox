@@ -138,13 +138,13 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 
 DeepSeek4 no longer uses the old expert-split environment variables or expert-worker tuning knobs. Those retired knobs were removed from the codebase rather than left behind as unsupported debug switches.
 
-## DSpark Aux Draft Heads
+## DSpark Speculative Decode
 
-The current DSpark runtime lives in the shared DFlash speculative stack and is
-used by the Laguna backend when the draft GGUF carries `dflash.dspark.*`
-tensors. DeepSeek4 DSpark work is still a draft bridge: the DeepSeek4/MTP
-artifact stores compatible aux heads under the `mtp.2.*` namespace, and the
-converter can now map those names into the existing GGUF contract.
+DeepSeek4 uses the shared DFlash DSpark head implementation together with a
+DeepSeek4-specific three-layer drafter and fused target verification. The draft
+GGUF carries its auxiliary projections under the existing `dflash.dspark.*`
+tensor contract. DeepSeek4/MTP checkpoints store compatible heads under the
+`mtp.2.*` namespace, which the converter maps as follows.
 
 Supported DeepSeek4/MTP input tensors:
 
@@ -169,10 +169,30 @@ python server/scripts/convert_dflash_to_gguf.py \
   --aux-heads /path/to/hf-ds4-flash-dspark/model-00048-of-00048.safetensors
 ```
 
-This does not by itself make the production DeepSeek4 layer-split backend use
-DSpark. It makes the DeepSeek4 DSpark aux artifact consumable by the existing
-`dflash.dspark.*` GGUF loader/runtime so the follow-up runtime PR can wire it
-into the DS4 decode path with a clean tensor contract.
+Run the converted drafter against a DeepSeek4 target with:
+
+```bash
+export DFLASH_DS4_SPEC=1
+export DFLASH_DS4_FUSED_VERIFY=1
+export DFLASH_DS4_DRAFT=/path/to/dflash-draft.gguf
+export DFLASH_DS4_SPEC_Q=4
+
+./server/build-hip/dflash_server /path/to/deepseek4-target.gguf
+```
+
+Adaptive width is automatic. When the draft artifact has a compatible
+confidence projection, the runtime selects q=2, q=3, or q=4 from the cumulative
+confidence of the proposed prefix. It adds the projection to the same fused
+Markov graph and reads its scores in the existing token-id synchronization; no
+additional host round trip is introduced. Artifacts without a compatible
+confidence head transparently retain the existing acceptance-EWMA policy.
+
+On the gfx1151 validation host, confidence-adaptive width retained 10/10
+GSM+Math accuracy and measured 29.25 tok/s weighted, within 0.8% of fixed q=4
+at 29.49 tok/s. On the low-acceptance stress prompt it measured 21.9/21.8
+tok/s warm, effectively tied with EWMA while avoiding fixed q=4's wasted wide
+verification. These numbers are workload-specific; the confidence policy is
+opt-in.
 
 ## Example: CUDA + Halo Layer Split
 
