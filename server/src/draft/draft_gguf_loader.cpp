@@ -261,6 +261,8 @@ bool load_draft_gguf(const std::string & path,
     if (!out.fc || !out.hidden_norm || !out.out_norm) {
         set_last_error("draft GGUF: missing top-level tensors "
                        "(dflash.fc|dflash_fc / dflash.hidden_norm|dflash_hidden_norm / output_norm)");
+        ggml_free(meta_ctx);  // out.ctx: free the metadata arena on early failure
+        out.ctx = nullptr;
         gguf_free(gctx);
         return false;
     }
@@ -304,6 +306,8 @@ bool load_draft_gguf(const std::string & path,
             char b[128];
             std::snprintf(b, sizeof(b), "draft GGUF: layer %d missing tensors", il);
             set_last_error(b);
+            ggml_free(meta_ctx);  // out.ctx: free the metadata arena on early failure
+            out.ctx = nullptr;
             gguf_free(gctx);
             return false;
         }
@@ -316,6 +320,8 @@ bool load_draft_gguf(const std::string & path,
                       "draft GGUF: incomplete attention gate tensors: %d/%d layers",
                       n_gate_layers, out.n_layer);
         set_last_error(b);
+        ggml_free(meta_ctx);  // out.ctx: free the metadata arena on early failure
+        out.ctx = nullptr;
         gguf_free(gctx);
         return false;
     }
@@ -343,6 +349,8 @@ bool load_draft_gguf(const std::string & path,
             out.domino.head_b1 && out.domino.head_w2 && out.domino.head_b2;
         if (!domino_all) {
             set_last_error("draft GGUF: incomplete Domino aux-head tensors");
+            ggml_free(meta_ctx);  // out.ctx: free the metadata arena on early failure
+            out.ctx = nullptr;
             gguf_free(gctx);
             return false;
         }
@@ -368,6 +376,8 @@ bool load_draft_gguf(const std::string & path,
             !check_shape_2d(out.domino.head_w2, E, V, "head.w2", shape_err, sizeof(shape_err)) ||
             !check_shape_1d(out.domino.head_b2, V, "head.b2", shape_err, sizeof(shape_err))) {
             set_last_error(shape_err);
+            ggml_free(meta_ctx);  // out.ctx: free the metadata arena on early failure
+            out.ctx = nullptr;
             gguf_free(gctx);
             return false;
         }
@@ -391,6 +401,8 @@ bool load_draft_gguf(const std::string & path,
     if (dspark_any) {
         if (!out.dspark.markov_w1 || !out.dspark.markov_w2) {
             set_last_error("draft GGUF: incomplete DSpark Markov tensors");
+            ggml_free(meta_ctx);  // out.ctx: free the metadata arena on early failure
+            out.ctx = nullptr;
             gguf_free(gctx);
             return false;
         }
@@ -405,6 +417,8 @@ bool load_draft_gguf(const std::string & path,
         if (!check_shape_2d(out.dspark.markov_w1, R, V, "dspark.markov.w1", shape_err, sizeof(shape_err)) ||
             !check_shape_2d(out.dspark.markov_w2, R, V, "dspark.markov.w2", shape_err, sizeof(shape_err))) {
             set_last_error(shape_err);
+            ggml_free(meta_ctx);  // out.ctx: free the metadata arena on early failure
+            out.ctx = nullptr;
             gguf_free(gctx);
             return false;
         }
@@ -413,6 +427,8 @@ bool load_draft_gguf(const std::string & path,
         if (conf_any) {
             if (!out.dspark.confidence_w || !out.dspark.confidence_b) {
                 set_last_error("draft GGUF: incomplete DSpark confidence tensors");
+                ggml_free(meta_ctx);  // out.ctx: free the metadata arena on early failure
+                out.ctx = nullptr;
                 gguf_free(gctx);
                 return false;
             }
@@ -422,6 +438,8 @@ bool load_draft_gguf(const std::string & path,
             if (!check_shape_2d(out.dspark.confidence_w, C, 1, "dspark.confidence.weight", shape_err, sizeof(shape_err)) ||
                 !check_shape_1d(out.dspark.confidence_b, 1, "dspark.confidence.bias", shape_err, sizeof(shape_err))) {
                 set_last_error(shape_err);
+                ggml_free(meta_ctx);  // out.ctx: free the metadata arena on early failure
+                out.ctx = nullptr;
                 gguf_free(gctx);
                 return false;
             }

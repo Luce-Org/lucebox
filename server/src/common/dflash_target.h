@@ -134,9 +134,12 @@ struct DFlashTarget {
     // Project draft hidden states through the target lm_head and return full
     // f32 logits with vocab as the fastest-changing dimension.
     // Default false (unsupported); Domino-capable targets override.
+
     // [TAG_ADAPTIVE_WIDTH] like project_hidden_to_tokens, optionally also
     // returning top-cand_k candidate ids + softmax probs covering slots
-    // 1..n_tokens-1 (entry j-1 <-> slot j). Default: no candidates.
+    // 1..n_tokens-1 (entry j-1 <-> slot j). The default implementation
+    // SUCCEEDS by delegating to project_hidden_to_tokens and returning no
+    // candidates (the "default false" above refers to logits support only).
     virtual bool project_hidden_to_tokens_topk(const float * hidden,
                                                int n_tokens,
                                                std::vector<int32_t> & tokens_out,

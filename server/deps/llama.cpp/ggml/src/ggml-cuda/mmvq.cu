@@ -834,13 +834,15 @@ static __global__ void mmid_group_prep(
     const int i  = threadIdx.x;
     // [TAG_MMID_ADAPTIVE_K] one thread per token: keep slots until cumulative
     // combine weight >= tau, sentinel the rest, renormalize kept in place.
-    // Skips tokens that already contain a -1 (second/third mmid of the layer).
+    // A row is "already gated" (second/third mmid of the layer) when a slot
+    // weight is exactly 0.0f: `ids` is now a per-op scratch copy, so the
+    // shared zeroed weights are the only marker that survives across ops.
     if (gate_w != nullptr && i < n_tok) {
         int32_t * idrow = ids + i*ids_stride;
         float   * wrow  = gate_w + i*gate_w_stride;
         bool gated = false;
         for (int j = 0; j < n_slots; ++j) {
-            gated = gated || (idrow[j] < 0);
+            gated = gated || (idrow[j] < 0) || (wrow[j] == 0.0f);
         }
         if (!gated) {
             float cum = 0.0f;
@@ -1587,7 +1589,7 @@ void ggml_cuda_mul_mat_vec_q(
     const size_t q8_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     char * src1_q8_d = nullptr;
-    if (luce_q8_memo_on && !ids) {
+    if (luce_q8_memo_on) {
         for (const auto & e : ctx.luce_q8_memo) {
             if (e.src1_node == (const void *) src1 && e.src1_data == (const void *) src1_d &&
                 e.src0_type == (int) src0->type &&
@@ -1599,7 +1601,7 @@ void ggml_cuda_mul_mat_vec_q(
     }
     if (src1_q8_d == nullptr) {
         char * q8_dst;
-        if (luce_q8_memo_on && !ids) {
+        if (luce_q8_memo_on) {
             ggml_backend_cuda_context::luce_q8_memo_entry ent;
             ent.src1_node = (const void *) src1;
             ent.src1_data = (const void *) src1_d;
@@ -1643,9 +1645,11 @@ void ggml_cuda_mul_mat_vec_q(
 
     // [TAG_MMID_GROUPED] grouped-expert path for small MUL_MAT_ID batches.
     if (ids && ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_MOE_BATCH_SIZE &&
+        (int) (nchannels_dst*ncols_dst) <= MMID_GROUPED_MAX_PAIRS &&
         mmid_grouped_env() && mmid_grouped_type_ok(src0->type)) {
+        // Batches above MMID_GROUPED_MAX_PAIRS fall through to the legacy
+        // per-expert kernel instead of aborting the request.
         const int np = (int) (nchannels_dst*ncols_dst);
-        GGML_ASSERT(np <= MMID_GROUPED_MAX_PAIRS && "DFLASH_MMID_GROUPED supports n_expert_used <= 16");
         ggml_cuda_pool_alloc<int32_t> mmid_meta(ctx.pool(), MMID_META_INTS);
         float * gate_w = nullptr;
         int gate_w_stride = 0;
@@ -1656,8 +1660,20 @@ void ggml_cuda_mul_mat_vec_q(
             gate_w_stride = (int) (gx->weights->nb[1]/sizeof(float));
             gate_tau      = gx->tau;
         }
+        // Gate on a scratch COPY of ids: consumers of the same ids tensor that
+        // take the non-grouped path (e.g. a sibling weight whose quant type is
+        // not grouped-capable) must never see the -1 drop sentinels, which the
+        // legacy kernel would cast to uint32_t and read out of bounds. The
+        // in-place gate-weight renorm stays shared: dropped slots get weight
+        // 0.0f, which keeps any legacy consumer bit-correct (it just computes
+        // an expert that contributes nothing).
+        ggml_cuda_pool_alloc<int32_t> ids_gated(ctx.pool(), (size_t) (nchannels_dst*ncols_dst));
+        CUDA_CHECK(cudaMemcpy2DAsync(ids_gated.ptr, nchannels_dst*sizeof(int32_t),
+                                     ids_d, ids_stride*sizeof(int32_t),
+                                     nchannels_dst*sizeof(int32_t), ncols_dst,
+                                     cudaMemcpyDeviceToDevice, stream));
         mmid_group_prep<<<1, MMID_GROUPED_MAX_PAIRS, 0, stream>>>(
-            (int32_t *) ids_d, mmid_meta.ptr, (int) nchannels_dst, (int) ncols_dst, (int) ids_stride,
+            ids_gated.ptr, mmid_meta.ptr, (int) nchannels_dst, (int) ncols_dst, (int) nchannels_dst,
             gate_w, gate_w_stride, gate_tau);
         CUDA_CHECK(cudaGetLastError());
         if (mul_mat_vec_q_grouped_dispatch(

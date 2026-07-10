@@ -13,8 +13,10 @@
 #include "ggml.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unordered_map>
 
 struct mmid_gate_extra {
     uint32_t            magic;   // MMID_GATE_MAGIC
@@ -24,16 +26,34 @@ struct mmid_gate_extra {
 #define MMID_GATE_MAGIC 0x4D474154u
 
 // il < 0 = layer index unknown for this family: the dense-layer list cannot
-// be applied, every MoE layer is gated. Only builds run this; the extra must
-// outlive the graph, so it is deliberately never freed.
+// be applied, every MoE layer is gated.
 inline void mmid_adaptive_k_attach(ggml_tensor * ids, const ggml_tensor * weights,
                                    int n_tokens, int il, const char * dense_default) {
     static const float tau = []() {
         const char * e = std::getenv("DFLASH_ADAPTIVE_K_TAU");
-        return e ? (float) std::atof(e) : 0.0f;
+        if (!e) return 0.0f;
+        char * end = nullptr;
+        const float v = std::strtof(e, &end);
+        if (end == e || *end != '\0' || v < 0.0f || v > 1.0f) {
+            std::fprintf(stderr, "[adaptive-k] ignoring DFLASH_ADAPTIVE_K_TAU=\"%s\""
+                                 " (want a float in [0,1])\n", e);
+            return 0.0f;
+        }
+        return v;
     }();
     if (tau <= 0.0f || n_tokens < 2 || n_tokens > 16 || ids == nullptr || weights == nullptr) {
         return;
+    }
+    if (il < 0) {
+        static const bool warned = []() {
+            std::fprintf(stderr,
+                "[adaptive-k] WARNING: this model family does not thread layer "
+                "indices into the router yet, so DFLASH_ADAPTIVE_K_DENSE cannot "
+                "be honored and ALL MoE layers are gated - including DFlash "
+                "capture layers, which can degrade drafter acceptance.\n");
+            return true;
+        }();
+        (void) warned;
     }
     if (il >= 0) {
         const char * e = std::getenv("DFLASH_ADAPTIVE_K_DENSE");
@@ -42,12 +62,30 @@ inline void mmid_adaptive_k_attach(ggml_tensor * ids, const ggml_tensor * weight
         while (pos < str.size()) {
             const size_t q = str.find(',', pos);
             const std::string tok = str.substr(pos, q == std::string::npos ? std::string::npos : q - pos);
-            if (!tok.empty() && std::atoi(tok.c_str()) == il) {
-                return;
+            if (!tok.empty()) {
+                char * end = nullptr;
+                const long v = std::strtol(tok.c_str(), &end, 10);
+                if (end == tok.c_str() || *end != '\0') {
+                    std::fprintf(stderr, "[adaptive-k] ignoring malformed "
+                                         "DFLASH_ADAPTIVE_K_DENSE entry \"%s\"\n",
+                                 tok.c_str());
+                } else if ((int) v == il) {
+                    return;
+                }
             }
             if (q == std::string::npos) break;
             pos = q + 1;
         }
     }
-    ids->extra = new mmid_gate_extra{MMID_GATE_MAGIC, tau, weights};
+    // The extra must outlive graph evals, and builds run repeatedly in a
+    // server (ggml_new_tensor zeroes ->extra even when the persistent arena
+    // hands back the same address). Keep one allocation per distinct tensor
+    // address in a process-lifetime pool: bounded by the arenas' stable
+    // addresses instead of leaking one allocation per rebuild.
+    static std::unordered_map<const ggml_tensor *, mmid_gate_extra *> pool;
+    mmid_gate_extra *& gx = pool[ids];
+    if (gx == nullptr) gx = new mmid_gate_extra{MMID_GATE_MAGIC, tau, weights};
+    gx->tau     = tau;
+    gx->weights = weights;
+    ids->extra  = gx;
 }

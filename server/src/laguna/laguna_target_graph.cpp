@@ -25,6 +25,7 @@
 #include "../common/moe_router_graph.h"
 #include "../common/kvflash_pager.h"
 #include "common/ggml_graph_precision.h"
+#include "common/prof_env.h"
 #include "internal.h"
 #include "dflash27b.h"
 
@@ -1016,6 +1017,11 @@ bool build_laguna_layer_step(
     laguna_layer_step_graph_free(sg);
     if (layer_idx < 0 || layer_idx >= w.n_layer) return false;
     if (!cache.attn_k[layer_idx] || !cache.attn_v[layer_idx]) return false;
+    if (cache.swa_ring_rows > 0) {
+        std::fprintf(stderr, "laguna_layer_step: SWA ring caches are not "
+                             "wired for the layer-split path\n");
+        return false;
+    }
     if (kvflash && std::getenv("DFLASH_LAGUNA_NO_KVPAD")) return false;
 
     ggml_init_params ip{};
@@ -1155,6 +1161,11 @@ LagunaGraphOutputs build_laguna_graph(
     if (capture_with_rows) {
         capture_slices.assign((size_t)cache.n_capture_layers, nullptr);
     }
+
+    // [TAG_SWA_RING] ring-sized SWA caches make pool-width indices/views on
+    // SWA layers out of bounds: every builder reaching here must supply ring
+    // row indices. Fail loudly at build time rather than corrupt memory.
+    GGML_ASSERT(cache.swa_ring_rows == 0 || in.kv_idx_swa != nullptr);
 
     for (int il = 0; il < w.n_layer; ++il) {
         cur = build_laguna_layer(ctx, gf, w, cache, il, cur,
@@ -1467,7 +1478,7 @@ bool laguna_step(
     // [TAG_PREFILL_PROF] batch-path sub-phase laps: DFLASH_LAGUNA_PREFILL_PROF=1.
     // build = graph rebuild+alloc, fill = host mask/row fills, up = tensor_set
     // uploads, gpu = graph_compute, read = logit/argmax readback.
-    static const bool g_pfprof = std::getenv("DFLASH_LAGUNA_PREFILL_PROF") != nullptr;
+    static const bool g_pfprof = dflash_prof_enabled("prefill");
     static thread_local double pf_build = 0, pf_fill = 0, pf_up = 0, pf_gpu = 0,
                                pf_read = 0;
     static thread_local int pf_n = 0;
@@ -1871,7 +1882,7 @@ bool laguna_verify_batch(
     // prep = stage+embed/pos fills, mask = kvflash rows+mask fill+memcpy,
     // upwait = sync after async uploads (isolates upload cost from compute),
     // gpu = graph_compute, read = argmax/logits readback.
-    static const bool g_vprof = std::getenv("DFLASH_LAGUNA_VERIFY_PROF") != nullptr;
+    static const bool g_vprof = dflash_prof_enabled("verify");
     static thread_local double vp_prep = 0, vp_mask = 0, vp_up = 0, vp_gpu = 0,
                                vp_read = 0;
     static thread_local int vp_n = 0;

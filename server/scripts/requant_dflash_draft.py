@@ -19,6 +19,7 @@ Usage:
         feature projection with known overflow sensitivity, keep it higher)
 """
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -39,6 +40,10 @@ def main() -> None:
     ap.add_argument("dst")
     ap.add_argument("--variant", choices=("q8", "q4"), default="q4")
     args = ap.parse_args()
+
+    if os.path.realpath(args.src) == os.path.realpath(args.dst):
+        sys.exit("src and dst are the same file: the writer truncates dst "
+                 "while tensor data is still mmap-read from src")
 
     r = GGUFReader(args.src)
     arch = None

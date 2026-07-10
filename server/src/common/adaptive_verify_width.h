@@ -18,12 +18,22 @@
 // Model-agnostic: any family loop that has per-slot drafter top-1
 // probabilities (e.g. from ggml_backend_cuda_topk_rows over the draft-head
 // logits) can call this before building its verify batch.
+#include <cstdio>
 #include <cstdlib>
 
 inline float adaptive_verify_width_theta() {
     static const float theta = []() {
         const char * e = std::getenv("DFLASH_ADAPTIVE_WIDTH_THETA");
-        return e ? (float) std::atof(e) : 0.20f;
+        if (!e) return 0.20f;
+        char * end = nullptr;
+        const float v = std::strtof(e, &end);
+        if (end == e || *end != '\0' || v < 0.0f || v > 1.0f) {
+            std::fprintf(stderr, "[adaptive-width] ignoring "
+                                 "DFLASH_ADAPTIVE_WIDTH_THETA=\"%s\" "
+                                 "(want a float in [0,1]); using 0.20\n", e);
+            return 0.20f;
+        }
+        return v;
     }();
     return theta;
 }
@@ -31,7 +41,15 @@ inline float adaptive_verify_width_theta() {
 inline int adaptive_verify_width_min() {
     static const int mn = []() {
         const char * e = std::getenv("DFLASH_ADAPTIVE_WIDTH_MIN");
-        return e ? std::atoi(e) : 4;
+        if (!e) return 4;
+        const int v = std::atoi(e);
+        if (v <= 0) {
+            std::fprintf(stderr, "[adaptive-width] ignoring "
+                                 "DFLASH_ADAPTIVE_WIDTH_MIN=\"%s\" "
+                                 "(want a positive int); using 4\n", e);
+            return 4;
+        }
+        return v;
     }();
     return mn;
 }

@@ -4,6 +4,9 @@
 // k <= 8 candidates out of a ~100k-entry vocab distribution per drafted
 // position, ~KB of readback instead of the full logits. Not a graph op: call
 // after the producing graph_compute has returned; runs on the default stream.
+// CONTRACT: callers must produce `logits` with the synchronous
+// ggml_backend_graph_compute() (which drains the backend stream) - the
+// async variant would race this helper's default-stream reads.
 #include "common.cuh"
 #include "ggml-cuda.h"
 

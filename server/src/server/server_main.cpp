@@ -443,6 +443,13 @@ int main(int argc, char ** argv) {
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 tau = argv[++i];
             }
+            char * end = nullptr;
+            const double tv = std::strtod(tau, &end);
+            if (end == tau || *end != '\0' || tv <= 0.0 || tv > 1.0) {
+                std::fprintf(stderr,
+                    "--adaptive-experts: tau must be a float in (0,1], got \"%s\"\n", tau);
+                return 1;
+            }
             setenv("DFLASH_ADAPTIVE_K_TAU", tau, 0);  // explicit env still wins
         } else if (std::strcmp(argv[i], "--verify-width") == 0 && i + 1 < argc) {
             bargs.verify_width = std::atoi(argv[++i]);

@@ -4390,7 +4390,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             else g->stat_eager++;
             static const int stats_every = [](){
                 const char * e = getenv("GGML_CUDA_GRAPH_STATS_EVERY");
-                return e ? atoi(e) : 200;
+                const int v = e ? atoi(e) : 200;
+                return v > 0 ? v : 200;  // guard % 0 on malformed input
             }();
             if (g->stat_total % stats_every == 0) {
                 GGML_LOG_INFO("[cuda-graph-stats] key=%p n_nodes=%d total=%llu replay=%llu capture=%llu eager=%llu enabled=%d\n",
