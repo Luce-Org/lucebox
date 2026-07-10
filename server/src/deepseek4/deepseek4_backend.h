@@ -11,7 +11,7 @@
 #include "../common/moe_hybrid_placement.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_storage.h"
-#include "../common/moe_hybrid_stream.h"
+#include "../common/moe_expert_compute.h"
 #include "deepseek4_internal.h"
 
 #include "ggml.h"
@@ -60,6 +60,15 @@ public:
     void shutdown() override;
 
 private:
+    bool run_step_with_runtime_path(const float * embed,
+                                    int n_tokens,
+                                    int kv_start,
+                                    std::vector<float> & out_logits,
+                                    const int32_t * token_ids,
+                                    bool want_logits,
+                                    bool disable_cached_decode,
+                                    DeepSeek4StepTelemetry * telemetry);
+    void reset_request_state();
     DeepSeek4BackendConfig cfg_;
     ggml_backend_t         backend_      = nullptr;
     ggml_backend_t         snap_backend_ = nullptr;
@@ -74,6 +83,7 @@ private:
     // Snapshots
     static constexpr int PREFIX_SLOTS = 64;
     DeepSeek4Snapshot      snapshots_[PREFIX_SLOTS];
+    std::vector<float>     hc_state_;
     std::vector<float>     last_logits_;
 
     // Prefill prompt tokens in chunks, return absolute committed position.
@@ -92,14 +102,13 @@ private:
                                           int max_ctx,
                                           MoeHybridPlacement & out,
                                           std::string * err) const;
+    bool init_single_target_expert_runtime(std::string * err);
     void maybe_save_routing_stats();
 
     std::shared_ptr<MoeHybridStorage> moe_hybrid_;
     MoeHybridPlacement                moe_placement_;
-    MoeHybridStreamEngine             stream_engine_;
-    // Expert IPC removed — layer split replaces expert split.
-    // Kept for compilation compatibility; init_hybrid_model() is no longer called
-    // from the layer-split path.
+    MoeExpertComputeRuntime           expert_runtime_;
+    std::vector<uint64_t>             layer_expert_bytes_;
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string                       routing_stats_out_path_;
 };

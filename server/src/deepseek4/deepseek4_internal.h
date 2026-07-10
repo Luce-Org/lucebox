@@ -30,11 +30,18 @@ namespace dflash::common {
 struct MoeHybridPlacement;
 struct MoeHybridConfig;
 struct MoeHybridRoutingStats;
-class MoeHybridStreamEngine;
+struct MoeExpertLayer;
+struct MoeExpertCompute;
+class ExpertIpcClient;
 
 struct DeepSeek4StepTelemetry {
     uint64_t total_us = 0;
     uint64_t embed_us = 0;
+    uint64_t full_graph_build_us = 0;
+    uint64_t full_graph_alloc_us = 0;
+    uint64_t full_graph_set_us = 0;
+    uint64_t full_graph_compute_us = 0;
+    uint64_t full_graph_read_us = 0;
     uint64_t hc_pre_attn_us = 0;
     uint64_t hc_pre_build_us = 0;
     uint64_t hc_pre_input_us = 0;
@@ -56,10 +63,34 @@ struct DeepSeek4StepTelemetry {
     uint64_t ffn_cold_us = 0;
     uint64_t ffn_combine_us = 0;
     uint64_t ffn_partition_us = 0;
+    uint64_t ffn_cache_promote_us = 0;
     uint64_t ffn_hot_graph_builds = 0;
     uint64_t ffn_hot_graph_hits = 0;
     uint64_t ffn_cold_graph_builds = 0;
     uint64_t ffn_cold_graph_hits = 0;
+    uint64_t worker_us = 0;
+    uint64_t worker_parent_write_us = 0;
+    uint64_t worker_parent_wait_us = 0;
+    uint64_t worker_parent_read_us = 0;
+    uint64_t worker_request_read_us = 0;
+    uint64_t worker_partition_us = 0;
+    uint64_t worker_resident_eval_us = 0;
+    uint64_t worker_miss_build_us = 0;
+    uint64_t worker_miss_eval_us = 0;
+    uint64_t worker_request_bytes = 0;
+    uint64_t worker_response_bytes = 0;
+    uint64_t worker_hot_graph_builds = 0;
+    uint64_t worker_hot_graph_hits = 0;
+    uint64_t worker_cold_graph_builds = 0;
+    uint64_t worker_cold_graph_hits = 0;
+    uint64_t worker_hot_graph_build_us = 0;
+    uint64_t worker_hot_input_us = 0;
+    uint64_t worker_hot_compute_us = 0;
+    uint64_t worker_hot_read_us = 0;
+    uint64_t worker_cold_graph_build_us = 0;
+    uint64_t worker_cold_input_us = 0;
+    uint64_t worker_cold_compute_us = 0;
+    uint64_t worker_cold_read_us = 0;
     uint64_t hc_post_ffn_us = 0;
     uint64_t output_us = 0;
     uint64_t sample_us = 0;
@@ -214,7 +245,7 @@ struct DeepSeek4Weights {
     int32_t eos_id      = -1;
     int32_t eos_chat_id = -1;
 
-    // MoE hybrid placement (deprecated — layer split replaces expert split)
+    // MoE hybrid/expert-split placement state.
     bool moe_hybrid       = false;
 };
 
@@ -247,6 +278,10 @@ struct DeepSeek4LayerCache {
     // Compressor rolling state
     DeepSeek4CompressorState attn_compressor;
     DeepSeek4CompressorState indexer_compressor;
+
+    // Optional routing bias cached on host for CPU-side top-k selection.
+    std::vector<float> route_bias_host;
+    bool route_bias_loaded = false;
 };
 
 struct DeepSeek4Cache {
@@ -303,7 +338,8 @@ bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
 // Forward: single step (prefill chunk or decode token).
 // embed: [n_embd, n_tokens] input embeddings (post-embedding lookup).
 // hc_state: [n_hc * n_embd] persistent HC residual (updated in-place).
-// Returns logits for last token.
+// When want_logits is false, the step updates KV / routing state but skips the
+// final output head and logits readback.
 bool deepseek4_step(
     ggml_backend_t              backend,
     const DeepSeek4Weights &    w,
@@ -314,9 +350,34 @@ bool deepseek4_step(
     std::vector<float> &        out_logits,
     MoeHybridStorage *          moe_hybrid = nullptr,
     const int32_t *             token_ids = nullptr,
-    MoeHybridStreamEngine *     stream_engine = nullptr,
+    ExpertIpcClient *  expert_worker = nullptr,
+    bool                        worker_owns_hot_ids = false,
+    bool                        want_logits = true,
+    bool                        disable_cached_decode = false,
     DeepSeek4StepTelemetry *    telemetry = nullptr,
-    MoeHybridRoutingStats *     routing_stats = nullptr);
+    MoeHybridRoutingStats *     routing_stats = nullptr,
+    MoeExpertCompute *          expert_compute = nullptr,
+    const MoeExpertLayer *      expert_layers = nullptr);
+
+// Compatibility overload for builds that still route call sites through the
+// original DeepSeek4 step signature without an explicit cached-decode toggle.
+bool deepseek4_step(
+    ggml_backend_t              backend,
+    const DeepSeek4Weights &    w,
+    DeepSeek4Cache &            cache,
+    const float *               embed,
+    int                         n_tokens,
+    int                         kv_start,
+    std::vector<float> &        out_logits,
+    MoeHybridStorage *          moe_hybrid,
+    const int32_t *             token_ids,
+    ExpertIpcClient *           expert_worker,
+    bool                        worker_owns_hot_ids,
+    bool                        want_logits,
+    DeepSeek4StepTelemetry *    telemetry,
+    MoeHybridRoutingStats *     routing_stats = nullptr,
+    MoeExpertCompute *          expert_compute = nullptr,
+    const MoeExpertLayer *      expert_layers = nullptr);
 
 bool deepseek4_step_layer_range(
     ggml_backend_t              backend,
@@ -346,15 +407,6 @@ bool build_deepseek4_moe_hybrid_storage_from_file(
     ggml_backend_t              backend,
     const DeepSeek4Weights &    w,
     const MoeHybridPlacement &  placement,
-    MoeHybridStorage &          out,
-    std::string *               err = nullptr);
-
-bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
-    const std::string &         path,
-    ggml_backend_t              backend,
-    const DeepSeek4Weights &    w,
-    const MoeHybridPlacement &  placement,
-    const MoeHybridConfig *     cfg_override,
     MoeHybridStorage &          out,
     std::string *               err = nullptr);
 
