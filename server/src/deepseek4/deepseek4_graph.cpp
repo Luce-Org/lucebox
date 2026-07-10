@@ -3477,6 +3477,7 @@ static bool deepseek4_step_hybrid(
         const int32_t * token_ids,
         ExpertIpcClient * expert_worker,
         bool worker_owns_hot_ids,
+        bool want_logits,
         bool disable_cached_decode,
         MoeExpertCompute * expert_compute,
         const MoeExpertLayer * expert_layers,
@@ -4732,6 +4733,14 @@ static bool deepseek4_step_hybrid(
     if (hot_alloc) ggml_gallocr_free(hot_alloc);
     if (cold_alloc) ggml_gallocr_free(cold_alloc);
 
+    if (!want_logits) {
+        cache.cur_pos = kv_start + n_tokens;
+        if (telemetry) {
+            telemetry->total_us += ds4_elapsed_us(step_t0, Ds4TimingClock::now());
+        }
+        return true;
+    }
+
     const bool use_output_hc =
         w.output_hc_fn && w.output_hc_scale && w.output_hc_base;
 
@@ -5015,6 +5024,7 @@ bool deepseek4_step(
         const int32_t * token_ids,
         ExpertIpcClient * expert_worker,
         bool worker_owns_hot_ids,
+        bool want_logits,
         bool disable_cached_decode,
         DeepSeek4StepTelemetry * telemetry,
         MoeHybridRoutingStats * routing_stats,
@@ -5043,7 +5053,7 @@ bool deepseek4_step(
             kv_start,
             /*layer_begin=*/0,
             /*layer_end=*/w.n_layer,
-            &out_logits,
+            want_logits ? &out_logits : nullptr,
             token_ids,
             telemetry);
     }
@@ -5052,6 +5062,7 @@ bool deepseek4_step(
         return deepseek4_step_hybrid(backend, w, cache, *moe_hybrid,
                                      embed, n_tokens, kv_start, out_logits,
                                      token_ids, expert_worker, worker_owns_hot_ids,
+                                     want_logits,
                                      disable_cached_decode,
                                      expert_compute, expert_layers,
                                      telemetry, routing_stats);
@@ -5165,22 +5176,23 @@ bool deepseek4_step(
         cur = ggml_add(ctx, cur, ffn_out);
     }
 
-    // ── Output head ─────────────────────────────────────────────────────
-    // TODO: HC output pre (merge residual streams for final projection)
-
-    // Final RMSNorm
-    cur = build_rms_norm(ctx, cur, w.out_norm, w.rms_eps);
-
-    // lm_head projection
-    ggml_tensor * logits = ggml_mul_mat(ctx, w.output, cur);
-    ggml_set_name(logits, "logits");
-    ggml_set_output(logits);
-    if (cached_sg) {
-        cached_sg->logits = logits;
+    ggml_tensor * logits = nullptr;
+    ggml_tensor * graph_output = cur;
+    if (want_logits) {
+        // ── Output head ─────────────────────────────────────────────────────
+        // TODO: HC output pre (merge residual streams for final projection)
+        cur = build_rms_norm(ctx, cur, w.out_norm, w.rms_eps);
+        logits = ggml_mul_mat(ctx, w.output, cur);
+        ggml_set_name(logits, "logits");
+        graph_output = logits;
+        if (cached_sg) {
+            cached_sg->logits = logits;
+        }
     }
+    ggml_set_output(graph_output);
 
     // ── Build and run graph ─────────────────────────────────────────────
-    ggml_build_forward_expand(gf, logits);
+    ggml_build_forward_expand(gf, graph_output);
 
     // Allocate
     if (cached_sg) {
@@ -5232,14 +5244,16 @@ bool deepseek4_step(
         telemetry->full_graph_compute_us += ds4_elapsed_us(full_compute_t0, Ds4TimingClock::now());
     }
 
-    // Read logits (only last token for generation)
-    const auto full_read_t0 = Ds4TimingClock::now();
-    out_logits.resize(w.n_vocab);
-    const size_t logits_offset = (size_t)(n_tokens - 1) * w.n_vocab * sizeof(float);
-    ggml_backend_tensor_get(logits, out_logits.data(), logits_offset,
-                            w.n_vocab * sizeof(float));
-    if (telemetry) {
-        telemetry->full_graph_read_us += ds4_elapsed_us(full_read_t0, Ds4TimingClock::now());
+    if (want_logits) {
+        // Read logits (only last token for generation)
+        const auto full_read_t0 = Ds4TimingClock::now();
+        out_logits.resize(w.n_vocab);
+        const size_t logits_offset = (size_t)(n_tokens - 1) * w.n_vocab * sizeof(float);
+        ggml_backend_tensor_get(logits, out_logits.data(), logits_offset,
+                                w.n_vocab * sizeof(float));
+        if (telemetry) {
+            telemetry->full_graph_read_us += ds4_elapsed_us(full_read_t0, Ds4TimingClock::now());
+        }
     }
 
     release_full_step();
@@ -5276,38 +5290,14 @@ bool deepseek4_step(
         const int32_t * token_ids,
         ExpertIpcClient * expert_worker,
         bool worker_owns_hot_ids,
-        DeepSeek4StepTelemetry * telemetry,
-        MoeHybridRoutingStats * routing_stats,
-        MoeExpertCompute * expert_compute,
-        const MoeExpertLayer * expert_layers) {
-    return deepseek4_step(backend, w, cache, embed, n_tokens, kv_start,
-                          out_logits, moe_hybrid, token_ids, expert_worker,
-                          worker_owns_hot_ids, false, telemetry,
-                          routing_stats, expert_compute, expert_layers);
-}
-
-bool deepseek4_step(
-        ggml_backend_t backend,
-        const DeepSeek4Weights & w,
-        DeepSeek4Cache & cache,
-        const float * embed,
-        int n_tokens,
-        int kv_start,
-        std::vector<float> & out_logits,
-        MoeHybridStorage * moe_hybrid,
-        const int32_t * token_ids,
-        ExpertIpcClient * expert_worker,
-        bool worker_owns_hot_ids,
         bool want_logits,
-        bool disable_cached_decode,
         DeepSeek4StepTelemetry * telemetry,
         MoeHybridRoutingStats * routing_stats,
         MoeExpertCompute * expert_compute,
         const MoeExpertLayer * expert_layers) {
-    (void) want_logits;
     return deepseek4_step(backend, w, cache, embed, n_tokens, kv_start,
                           out_logits, moe_hybrid, token_ids, expert_worker,
-                          worker_owns_hot_ids, disable_cached_decode, telemetry,
+                          worker_owns_hot_ids, want_logits, false, telemetry,
                           routing_stats, expert_compute, expert_layers);
 }
 

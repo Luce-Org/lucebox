@@ -178,10 +178,7 @@ private:
                 continue;
             }
 
-            // Do not surface replacement characters from byte-fallback noise.
-            if (cp != 0xFFFD) {
-                out.append(pending_, i, (size_t)need);
-            }
+            out.append(pending_, i, (size_t)need);
             i += (size_t)need;
         }
         pending_.erase(0, i);

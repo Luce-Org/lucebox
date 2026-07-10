@@ -615,11 +615,11 @@ bool hc_pre_batch_device_locked(const void * hc_state_device,
         }
         return false;
     };
-    if (mix_dim > kMixDim) {
+    if (mix_dim > kMaxMixDim) {
         if (log_errors) {
             std::fprintf(stderr,
                          "[deepseek4-hc-direct] batch mix dim too large: %d > %d\n",
-                         mix_dim, kMixDim);
+                         mix_dim, kMaxMixDim);
         }
         return false;
     }
