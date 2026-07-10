@@ -1052,6 +1052,13 @@ if(DFLASH27B_TESTS)
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
     enable_testing()
 
+    # CPU-only contract test for the fail-closed layer-split tree boundary.
+    add_executable(test_qwen35_split_tree_guard
+        test/test_qwen35_split_tree_guard.cpp)
+    target_include_directories(test_qwen35_split_tree_guard PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
+    add_test(NAME qwen35_split_tree_guard COMMAND test_qwen35_split_tree_guard)
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
         add_executable(test_server_unit test/test_server_unit.cpp)
         target_sources(test_server_unit PRIVATE

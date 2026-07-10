@@ -15,11 +15,32 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace dflash::common {
 
 namespace {
+
+int qwen35_delta_index_for_layer(const TargetWeights & w, int layer_idx) {
+    int delta_idx = 0;
+    for (int il = 0; il < layer_idx; ++il) {
+        if (((il + 1) % w.full_attention_interval) != 0) ++delta_idx;
+    }
+    return delta_idx;
+}
+
+bool qwen35_split_ssm_rollback_storage_present(
+        const Qwen35LayerSplitShard & shard, int layer_idx) {
+    const bool is_attn = (((layer_idx + 1) % shard.weights.full_attention_interval) == 0);
+    if (is_attn) return false;
+    const int delta_idx = qwen35_delta_index_for_layer(shard.weights, layer_idx);
+    return delta_idx >= 0 &&
+           delta_idx < (int)shard.cache.ssm_intermediate.size() &&
+           delta_idx < (int)shard.cache.conv_input_cache.size() &&
+           shard.cache.ssm_intermediate[(size_t)delta_idx] &&
+           shard.cache.conv_input_cache[(size_t)delta_idx];
+}
 
 bool fill_qwen35_kvflash_inputs(
         StepGraph & sg,
@@ -165,7 +186,9 @@ bool run_qwen35_layer_split_forward(
         std::vector<float> * logits_out,
         DFlashDraftIpcClient * remote_draft,
         ggml_type activation_type,
-        KvFlashPager * kvflash) {
+        KvFlashPager * kvflash,
+        bool capture_ssm_intermediates,
+        Qwen35SplitCaptureStats * capture_stats) {
     if (shards.empty() || tokens.empty()) return false;
     const int hidden = shards.front().weights.n_embd;
     const int vocab = shards.front().weights.n_vocab;
@@ -243,8 +266,30 @@ bool run_qwen35_layer_split_forward(
         }
 
         const bool is_attn = (((il + 1) % embed_source.full_attention_interval) == 0);
+        const bool owns_ssm_rollback_layer = !is_attn;
         const int capture_idx = target_capture_index(embed_source.capture_layer_ids,
                                                      embed_source.n_capture_layers, il);
+        const bool owns_feature_tap = capture_idx >= 0;
+        const bool has_ssm_rollback_storage = owns_ssm_rollback_layer &&
+            qwen35_split_ssm_rollback_storage_present(*shard, il);
+        const bool capture_this_layer = capture_ssm_intermediates && has_ssm_rollback_storage;
+        if (capture_stats) {
+            const size_t shard_idx = (size_t)(shard - shards.data());
+            if (owns_ssm_rollback_layer && shard_idx < capture_stats->layers_owned_per_shard.size()) {
+                capture_stats->layers_owned_per_shard[shard_idx]++;
+            }
+            if (owns_feature_tap && shard_idx < capture_stats->feature_taps_owned_per_shard.size()) {
+                capture_stats->feature_taps_owned_per_shard[shard_idx]++;
+            }
+        }
+        if (capture_ssm_intermediates && owns_ssm_rollback_layer && !has_ssm_rollback_storage) {
+            if (capture_stats) capture_stats->missing_owner_count++;
+            std::fprintf(stderr,
+                "[target-split][capture] missing owner ssm rollback storage layer=%d gpu=%d\n",
+                il, shard->gpu);
+            activation_pair_free(acts);
+            return false;
+        }
         for (int start = 0; start < n_tokens_total; start += ubatch) {
             const int n = std::min(ubatch, n_tokens_total - start);
             const int kv_start = base_pos + start;
@@ -258,8 +303,8 @@ bool run_qwen35_layer_split_forward(
             if (!build_layer_step(shard->layer_graph, shard->weights, shard->cache,
                                   shard->backend, il, act_in, act_out,
                                   start, n, kv_start, with_mask,
-                                  /*capture=*/false, fa_window, kq_stride_pad,
-                                  kvflash != nullptr)) {
+                                  /*capture=*/capture_this_layer, fa_window, kq_stride_pad,
+                                  kvflash != nullptr, /*tree_mode=*/false)) {
                 std::fprintf(stderr, "target-split build layer=%d @%d gpu=%d\n",
                              il, start, shard->gpu);
                 activation_pair_free(acts);
@@ -300,6 +345,13 @@ bool run_qwen35_layer_split_forward(
                 activation_pair_free(acts);
                 return false;
             }
+            if (capture_this_layer && capture_stats) {
+                const size_t shard_idx = (size_t)(shard - shards.data());
+                capture_stats->enabled++;
+                if (shard_idx < capture_stats->slots_written_per_shard.size()) {
+                    capture_stats->slots_written_per_shard[shard_idx] += (uint64_t)n;
+                }
+            }
             if ((feature_ring || remote_draft) && capture_idx >= 0) {
                 if (feature_ring &&
                     !copy_capture_slice_to_draft_ring(*feature_ring, capture_idx,
@@ -320,6 +372,12 @@ bool run_qwen35_layer_split_forward(
                                  il, capture_idx, shard->gpu);
                     activation_pair_free(acts);
                     return false;
+                }
+                if (capture_stats) {
+                    const size_t shard_idx = (size_t)(shard - shards.data());
+                    if (shard_idx < capture_stats->feature_slots_written_per_shard.size()) {
+                        capture_stats->feature_slots_written_per_shard[shard_idx] += (uint64_t)n;
+                    }
                 }
             }
         }
@@ -362,7 +420,10 @@ bool run_qwen35_layer_split_layers_from_activation(
         DraftFeatureMirror * feature_ring,
         DFlashDraftIpcClient * remote_draft,
         KvFlashPager * kvflash,
-        bool kvflash_preallocated = false) {
+        bool capture_ssm_intermediates,
+        Qwen35SplitCaptureStats * capture_stats,
+        bool kvflash_preallocated = false,
+        const Qwen35SplitTreeInputs * tree_inputs = nullptr) {
     if (shards.empty() || !acts.a || !acts.b || n_tokens_total <= 0) return false;
     if (kvflash && fa_window > 0) {
         std::fprintf(stderr,
@@ -402,8 +463,29 @@ bool run_qwen35_layer_split_layers_from_activation(
         }
 
         const bool is_attn = (((il + 1) % shard->weights.full_attention_interval) == 0);
+        const bool owns_ssm_rollback_layer = !is_attn;
         const int capture_idx = target_capture_index(shard->weights.capture_layer_ids,
                                                      shard->weights.n_capture_layers, il);
+        const bool owns_feature_tap = capture_idx >= 0;
+        const bool has_ssm_rollback_storage = owns_ssm_rollback_layer &&
+            qwen35_split_ssm_rollback_storage_present(*shard, il);
+        const bool capture_this_layer = capture_ssm_intermediates && has_ssm_rollback_storage;
+        if (capture_stats) {
+            const size_t shard_idx = (size_t)(shard - shards.data());
+            if (owns_ssm_rollback_layer && shard_idx < capture_stats->layers_owned_per_shard.size()) {
+                capture_stats->layers_owned_per_shard[shard_idx]++;
+            }
+            if (owns_feature_tap && shard_idx < capture_stats->feature_taps_owned_per_shard.size()) {
+                capture_stats->feature_taps_owned_per_shard[shard_idx]++;
+            }
+        }
+        if (capture_ssm_intermediates && owns_ssm_rollback_layer && !has_ssm_rollback_storage) {
+            if (capture_stats) capture_stats->missing_owner_count++;
+            std::fprintf(stderr,
+                "[target-split][capture] missing owner ssm rollback storage layer=%d gpu=%d\n",
+                il, shard->gpu);
+            return false;
+        }
         for (int start = 0; start < n_tokens_total; start += ubatch) {
             const int n = std::min(ubatch, n_tokens_total - start);
             const int kv_start = base_pos + start;
@@ -417,8 +499,9 @@ bool run_qwen35_layer_split_layers_from_activation(
             if (!build_layer_step(shard->layer_graph, shard->weights, shard->cache,
                                   shard->backend, il, act_in, act_out,
                                   start, n, kv_start, with_mask,
-                                  /*capture=*/false, fa_window, kq_stride_pad,
-                                  kvflash != nullptr)) {
+                                  /*capture=*/capture_this_layer, fa_window, kq_stride_pad,
+                                  kvflash != nullptr,
+                                  /*tree_mode=*/tree_inputs != nullptr)) {
                 std::fprintf(stderr, "target-split build layer=%d @%d gpu=%d\n",
                              il, start, shard->gpu);
                 return false;
@@ -451,11 +534,29 @@ bool run_qwen35_layer_split_layers_from_activation(
                 ggml_backend_tensor_set(shard->layer_graph.attn_mask, mask_buf.data(), 0,
                                         sizeof(uint16_t) * mask_buf.size());
             }
+            if (tree_inputs && shard->layer_graph.parent_ids) {
+                if (!tree_inputs->parent_ids || tree_inputs->n_actual != n_tokens_total) {
+                    std::fprintf(stderr,
+                        "target-split tree verify missing parent ids n_actual=%d expected=%d\n",
+                        tree_inputs ? tree_inputs->n_actual : 0, n_tokens_total);
+                    return false;
+                }
+                ggml_backend_tensor_set(shard->layer_graph.parent_ids,
+                                        tree_inputs->parent_ids + start, 0,
+                                        sizeof(int32_t) * (size_t)n);
+            }
             auto st = ggml_backend_graph_compute(shard->backend, shard->layer_graph.gf);
             if (st != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "target-split compute layer=%d @%d gpu=%d status=%d\n",
                              il, start, shard->gpu, (int)st);
                 return false;
+            }
+            if (capture_this_layer && capture_stats) {
+                const size_t shard_idx = (size_t)(shard - shards.data());
+                capture_stats->enabled++;
+                if (shard_idx < capture_stats->slots_written_per_shard.size()) {
+                    capture_stats->slots_written_per_shard[shard_idx] += (uint64_t)n;
+                }
             }
             if ((captures_out || feature_ring || remote_draft) && capture_idx >= 0) {
                 if (captures_out) {
@@ -490,6 +591,12 @@ bool run_qwen35_layer_split_layers_from_activation(
                                  il, capture_idx, shard->gpu);
                     return false;
                 }
+                if (capture_stats) {
+                    const size_t shard_idx = (size_t)(shard - shards.data());
+                    if (shard_idx < capture_stats->feature_slots_written_per_shard.size()) {
+                        capture_stats->feature_slots_written_per_shard[shard_idx] += (uint64_t)n;
+                    }
+                }
             }
         }
         std::swap(act_in, act_out);
@@ -516,11 +623,13 @@ bool run_qwen35_layer_split_forward_from_activation(
         std::vector<float> * logits_out,
         std::vector<Qwen35TargetCaptureSlice> * captures_out,
         KvFlashPager * kvflash,
-        bool kvflash_preallocated) {
+        bool kvflash_preallocated,
+        const Qwen35SplitTreeInputs * tree_inputs) {
     if (!run_qwen35_layer_split_layers_from_activation(
             shards, acts, base_pos, n_tokens_total, ubatch, kq_stride_pad,
             fa_window, captures_out, nullptr, nullptr, kvflash,
-            kvflash_preallocated)) {
+            /*capture_ssm_intermediates=*/captures_out != nullptr,
+            /*capture_stats=*/nullptr, kvflash_preallocated, tree_inputs)) {
         return false;
     }
 
@@ -547,6 +656,39 @@ bool run_qwen35_layer_split_forward_from_activation(
     return true;
 }
 
+bool run_qwen35_layer_split_tree_verify_from_activation(
+        std::vector<Qwen35LayerSplitShard> & shards,
+        ActivationPair & acts,
+        int base_pos,
+        int n_tokens_total,
+        int ubatch,
+        int & last_tok,
+        int kq_stride_pad,
+        int fa_window,
+        const Qwen35SplitTreeInputs & tree_inputs,
+        std::vector<int32_t> * argmax_out,
+        std::vector<float> * logits_out,
+        std::vector<Qwen35TargetCaptureSlice> * captures_out,
+        KvFlashPager * kvflash,
+        bool kvflash_preallocated) {
+    if (tree_inputs.n_actual != n_tokens_total || !tree_inputs.parent_ids) {
+        std::fprintf(stderr,
+            "target-split tree verify invalid inputs n_actual=%d expected=%d parent_ids=%p\n",
+            tree_inputs.n_actual, n_tokens_total,
+            static_cast<const void *>(tree_inputs.parent_ids));
+        return false;
+    }
+    if (tree_inputs.visibility) {
+        std::fprintf(stderr,
+            "target-split tree verify visibility mask is not yet wired in split prewindow patch\n");
+        return false;
+    }
+    return run_qwen35_layer_split_forward_from_activation(
+        shards, acts, base_pos, n_tokens_total, ubatch, last_tok,
+        kq_stride_pad, fa_window, argmax_out, logits_out, captures_out,
+        kvflash, kvflash_preallocated, &tree_inputs);
+}
+
 bool run_qwen35_mixed_layer_split_forward(
         std::vector<Qwen35LayerSplitShard> & local_shards,
         Qwen35TargetShardIpcClient & remote_shard,
@@ -561,7 +703,9 @@ bool run_qwen35_mixed_layer_split_forward(
         std::vector<float> * logits_out,
         DraftFeatureMirror * feature_ring,
         DFlashDraftIpcClient * remote_draft,
-        KvFlashPager * kvflash) {
+        KvFlashPager * kvflash,
+        bool capture_ssm_intermediates,
+        Qwen35SplitCaptureStats * capture_stats) {
     if (!remote_shard.active() || tokens.empty() ||
         local_shards.empty() || local_shards.front().layer_begin != 0 ||
         local_shards.back().layer_end <= 0) {
@@ -611,7 +755,8 @@ bool run_qwen35_mixed_layer_split_forward(
     if (!run_qwen35_layer_split_layers_from_activation(
             local_shards, acts, base_pos, n_tokens_total, ubatch,
             kq_stride_pad, fa_window, nullptr, feature_ring, remote_draft,
-            kvflash, kvflash != nullptr)) {
+            kvflash, capture_ssm_intermediates, capture_stats,
+            kvflash != nullptr)) {
         activation_pair_free(acts);
         return false;
     }
