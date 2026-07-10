@@ -191,7 +191,47 @@ std::string render_chat_template(
         if (!system_content.empty() || has_tools) {
             result += "<system>\n";
             if (!system_content.empty()) result += system_content;
-            (void)tools_json;  // TODO: tools block per upstream template
+            if (has_tools) {
+                // Tools block per the upstream template: each tool schema as
+                // raw JSON inside <available_tools>, then the calling
+                // instruction with the <tool_call>/<arg_key>/<arg_value>
+                // example (thinking and non-thinking variants).
+                result += "\n\n### Tools\n\n"
+                          "You may call functions to assist with the user query.\n"
+                          "All available function signatures are listed below:\n"
+                          "<available_tools>\n";
+                try {
+                    const nlohmann::json tools = nlohmann::json::parse(tools_json);
+                    for (const auto & t : tools) {
+                        result += t.dump();
+                        result += "\n";
+                    }
+                } catch (const std::exception &) {
+                    result += tools_json;
+                    result += "\n";
+                }
+                result += "</available_tools>\n\n";
+                if (enable_thinking) {
+                    result += "Wrap your thinking in '<think>', '</think>' tags, "
+                              "followed by a function call. For each function call, "
+                              "return an unescaped XML-like object with function name "
+                              "and arguments within '<tool_call>' and '</tool_call>' "
+                              "tags, like here:\n"
+                              "<think> your thoughts here </think>\n"
+                              "<tool_call>function-name\n"
+                              "<arg_key>argument-key</arg_key>\n"
+                              "<arg_value>value-of-argument-key</arg_value>\n"
+                              "</tool_call>";
+                } else {
+                    result += "For each function call, return an unescaped XML-like "
+                              "object with function name and arguments within "
+                              "'<tool_call>' and '</tool_call>' tags, like here:\n"
+                              "<tool_call>function-name\n"
+                              "<arg_key>argument-key</arg_key>\n"
+                              "<arg_value>value-of-argument-key</arg_value>\n"
+                              "</tool_call>";
+                }
+            }
             result += "\n</system>\n";
         }
 

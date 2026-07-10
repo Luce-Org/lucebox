@@ -16,6 +16,10 @@ static const char THINK_CLOSE[] = "</think>";
 static const char TOOL_OPEN[]   = "<tool_call>";
 static const char FUNCTION_OPEN[] = "<function=";
 static const char TOOL_CODE_OPEN[] = "<tool_code>";
+// Laguna emits `NAME<arg_key>K</arg_key><arg_value>V</arg_value>` with the
+// <tool_call> wrapper as special tokens that detokenization strips, so the
+// visible trigger is <arg_key> and the tool name sits immediately before it.
+static const char ARG_KEY_OPEN[] = "<arg_key>";
 static constexpr size_t THINK_OPEN_LEN  = 7;
 static constexpr size_t THINK_CLOSE_LEN = 8;
 
@@ -42,6 +46,20 @@ static bool find_tool_start(const std::string & text, size_t & pos) {
             text.compare(idx, sizeof(TOOL_CODE_OPEN) - 1, TOOL_CODE_OPEN) == 0) {
             pos = idx;
             return true;
+        }
+        if (text.compare(idx, sizeof(ARG_KEY_OPEN) - 1, ARG_KEY_OPEN) == 0) {
+            // Rewind over the tool name so it lands in the tool buffer
+            // (the parser extracts it from just before <arg_key>).
+            size_t start = idx;
+            auto is_ident = [](char c) {
+                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                       (c >= '0' && c <= '9') || c == '_' || c == '-';
+            };
+            while (start > 0 && is_ident(text[start - 1])) start--;
+            if (start < idx) {  // require a non-empty name
+                pos = start;
+                return true;
+            }
         }
         idx = text.find('<', idx + 1);
     }
@@ -441,6 +459,21 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
         // No tags found — emit safe prefix
         if (window_.size() > std::max(BASE_HOLDBACK, stop_holdback_)) {
             size_t cut = utf8_safe_len(window_, window_.size() - std::max(BASE_HOLDBACK, stop_holdback_));
+            // When tools are declared, a trailing identifier run may be a
+            // Laguna tool name whose <arg_key> has not streamed in yet (the
+            // <tool_call> wrapper is a stripped special token). Hold it back
+            // (bounded to 64 chars, the OpenAI function-name limit) so the
+            // name is still in the window when the trigger fires.
+            if (cut > 0 && has_request_tools(tools_)) {
+                auto is_ident = [](char c) {
+                    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                           (c >= '0' && c <= '9') || c == '_' || c == '-';
+                };
+                size_t name_hold = cut;
+                while (name_hold > 0 && cut - name_hold < 64 &&
+                       is_ident(window_[name_hold - 1])) name_hold--;
+                if (cut - name_hold < 64) cut = name_hold;
+            }
             if (cut > 0) {
                 std::string safe = window_.substr(0, cut);
                 accumulated_content_ += safe;
