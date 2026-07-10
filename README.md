@@ -59,7 +59,8 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 | Qwen 3.5-0.8B (Megakernel) | **~2×** |
 | Qwen 3.6-27B + PFlash | **~5.6×** |
 | Qwen 3.6-27B + DDTree | **4.84×** |
-| Laguna-XS.2 33B + PFlash | **5.4×** @128K |
+| Laguna-XS-2.1 33B + PFlash | **8.2×** @256K |
+| Laguna-XS-2.1 33B + DFlash | **1.7×** @256K |
 | Qwen 3.6-27B HIP | **~2.6×** |
 | Gemma-4-26B-A4B | **1.31×** |
 
