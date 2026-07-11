@@ -2185,7 +2185,7 @@ static void test_layer_split_backend_inline_snapshot_and_restore_delta() {
     DaemonIO io;
     GenerateResult result = backend.generate(req, io);
 
-    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.ok());
     TEST_ASSERT(raw->reset_called);
     TEST_ASSERT(raw->saved_slot == 2);
     TEST_ASSERT(raw->saved_pos == 3);
@@ -2206,7 +2206,7 @@ static void test_layer_split_backend_inline_snapshot_and_restore_delta() {
     restore_req.n_gen = 1;
     GenerateResult restored = backend.restore_and_generate(2, restore_req, io);
 
-    TEST_ASSERT(restored.ok);
+    TEST_ASSERT(restored.ok());
     TEST_ASSERT(raw->dflash_called);
     TEST_ASSERT(raw->restored_slot == 2);
     TEST_ASSERT(!raw->reset_called);
@@ -2230,8 +2230,9 @@ static void test_layer_split_backend_sampling_capability_gate() {
         DaemonIO io;
         GenerateResult result = backend.generate(req, io);
 
-        TEST_ASSERT(!result.ok);
-        TEST_ASSERT(result.error == "sampling_unsupported");
+        TEST_ASSERT(!result.ok());
+        TEST_ASSERT(result.error->code == GenerateErrorCode::SamplingUnsupported);
+        TEST_ASSERT(result.error_code() == "sampling_unsupported");
     }
 
     {
@@ -2247,7 +2248,7 @@ static void test_layer_split_backend_sampling_capability_gate() {
         DaemonIO io;
         GenerateResult result = backend.generate(req, io);
 
-        TEST_ASSERT(result.ok);
+        TEST_ASSERT(result.ok());
         TEST_ASSERT(result.tokens.size() == 1);
         TEST_ASSERT(result.tokens[0] == 12);
     }
@@ -2264,7 +2265,7 @@ static void test_layer_split_backend_chunks_prefill_by_adapter_limit() {
     DaemonIO io;
     GenerateResult result = backend.generate(req, io);
 
-    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.ok());
     TEST_ASSERT(raw->prefill_bases.size() == 3);
     TEST_ASSERT(raw->prefill_sizes.size() == 3);
     TEST_ASSERT(raw->prefill_bases[0] == 0);
@@ -3755,7 +3756,7 @@ struct EmptySpecRetryBackend : MockBackend {
                             const DaemonIO &) override {
         generate_calls++;
         GenerateResult result;
-        result.ok = true;
+        result.succeed();
         if (req.force_ar_decode) {
             generate_saw_force_ar = true;
             result.tokens = {42};
@@ -3773,7 +3774,7 @@ struct EmptySpecRetryBackend : MockBackend {
                                         const DaemonIO &) override {
         restore_calls++;
         GenerateResult result;
-        result.ok = true;
+        result.succeed();
         if (req.force_ar_decode) {
             restore_saw_force_ar = true;
             result.tokens = {84};
@@ -3797,7 +3798,7 @@ static void test_model_backend_retries_empty_spec_generate_once_with_ar() {
 
     GenerateResult result = backend.generate(req, io);
 
-    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.ok());
     TEST_ASSERT(result.tokens.size() == 1);
     TEST_ASSERT(result.tokens[0] == 42);
     TEST_ASSERT(result.spec_decode_ran);
@@ -3815,7 +3816,7 @@ static void test_model_backend_retries_empty_spec_restore_once_with_ar() {
     GenerateResult result =
         backend.restore_and_generate(7, req, io);
 
-    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.ok());
     TEST_ASSERT(result.tokens.size() == 1);
     TEST_ASSERT(result.tokens[0] == 84);
     TEST_ASSERT(result.spec_decode_ran);
@@ -3833,7 +3834,7 @@ static void test_model_backend_retries_empty_visible_spec_generate_once_with_ar(
 
     GenerateResult result = backend.generate(req, io);
 
-    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.ok());
     TEST_ASSERT(result.tokens.size() == 1);
     TEST_ASSERT(result.tokens[0] == 42);
     TEST_ASSERT(!result.empty_visible_output);
@@ -3852,7 +3853,7 @@ static void test_model_backend_retries_empty_visible_spec_restore_once_with_ar()
 
     GenerateResult result = backend.restore_and_generate(7, req, io);
 
-    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.ok());
     TEST_ASSERT(result.tokens.size() == 1);
     TEST_ASSERT(result.tokens[0] == 84);
     TEST_ASSERT(!result.empty_visible_output);
@@ -3887,7 +3888,7 @@ static void test_generate_result_accept_rate_in_usage_openai() {
     // Simulate the non-streaming OpenAI JSON response build.
     // Verify accept_rate flows from GenerateResult into usage block.
     GenerateResult result;
-    result.ok = true;
+    result.succeed();
     result.tokens = {1, 2, 3};
     result.accept_rate = 0.75f;
 
@@ -3909,7 +3910,7 @@ static void test_generate_result_accept_rate_in_usage_openai() {
 
 static void test_generate_result_accept_rate_in_usage_anthropic() {
     GenerateResult result;
-    result.ok = true;
+    result.succeed();
     result.tokens = {1, 2};
     result.accept_rate = 0.60f;
 
@@ -3930,9 +3931,28 @@ static void test_generate_result_accept_rate_in_usage_anthropic() {
 static void test_generate_result_accept_rate_zero_when_no_spec_decode() {
     // When spec decode doesn't run (no draft model), accept_rate stays 0.
     GenerateResult r;
-    r.ok = true;
+    r.succeed();
     // accept_rate not set → must be 0.0f
     TEST_ASSERT(r.accept_rate == 0.0f);
+}
+
+static void test_generate_result_error_state_is_consistent() {
+    GenerateResult result;
+    TEST_ASSERT(!result.ok());
+    TEST_ASSERT(result.error->code == GenerateErrorCode::Incomplete);
+    TEST_ASSERT(result.error_code() == "incomplete");
+
+    result.fail(GenerateErrorCode::BackendSpecific, "prefill graph allocation failed");
+    TEST_ASSERT(!result.ok());
+    TEST_ASSERT(result.error->code == GenerateErrorCode::BackendSpecific);
+    TEST_ASSERT(result.error_code() == "backend_specific");
+    TEST_ASSERT(result.error_detail() == "prefill graph allocation failed");
+
+    result.succeed();
+    TEST_ASSERT(result.ok());
+    TEST_ASSERT(!result.error.has_value());
+    TEST_ASSERT(result.error_code().empty());
+    TEST_ASSERT(result.error_detail().empty());
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4622,6 +4642,7 @@ int main() {
     RUN_TEST(test_generate_result_accept_rate_in_usage_openai);
     RUN_TEST(test_generate_result_accept_rate_in_usage_anthropic);
     RUN_TEST(test_generate_result_accept_rate_zero_when_no_spec_decode);
+    RUN_TEST(test_generate_result_error_state_is_consistent);
 
     std::fprintf(stderr, "\n── normalize_system_for_cache ──\n");
     RUN_TEST(test_normalize_strips_billing_header_anthropic_array);

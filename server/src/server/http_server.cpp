@@ -2612,7 +2612,7 @@ void HttpServer::worker_loop() {
                 DaemonIO scoped_io;
                 scoped_io.stream_fd = -1;
                 auto scoped_result = backend_.generate(scoped_req, scoped_io);
-                if (scoped_result.ok && backend_.snapshot_used(DISK_STAGING_SLOT)) {
+                if (scoped_result.ok() && backend_.snapshot_used(DISK_STAGING_SLOT)) {
                     disk_cache_.learn_layout(DISK_STAGING_SLOT);
                     const bool saved =
                         disk_cache_.save(DISK_STAGING_SLOT, scoped_req.prompt);
@@ -2668,7 +2668,7 @@ void HttpServer::worker_loop() {
                 DaemonIO cold_io;
                 cold_io.stream_fd = -1;
                 auto cold_result = backend_.generate(cold_req, cold_io);
-                if (cold_result.ok && backend_.snapshot_used(DISK_STAGING_SLOT)) {
+                if (cold_result.ok() && backend_.snapshot_used(DISK_STAGING_SLOT)) {
                     disk_cache_.learn_layout(DISK_STAGING_SLOT);
                     std::vector<int32_t> prefix_tokens(effective_prompt.begin(),
                                                        effective_prompt.begin() + cold_boundary);
@@ -2940,7 +2940,7 @@ void HttpServer::worker_loop() {
         // Continued checkpoint: save if total tokens crossed an interval boundary.
         // This captures prompt + all generated tokens for long conversation reuse.
         if (!disk_cache_.disabled() && disk_policy.mode == DiskPrefixCacheMode::Full &&
-            result.ok && completion_tokens > 0 &&
+            result.ok() && completion_tokens > 0 &&
             visible_output_seen && !client_disconnected) {
             int final_pos = (int)effective_prompt.size() + (int)result.tokens.size();
             if (final_pos >= disk_cache_.continued_interval()) {
@@ -2988,7 +2988,7 @@ void HttpServer::worker_loop() {
         GenTimings gen_timings{ result.prefill_s, result.decode_s };
 
         // Record performance for /status page.
-        if (result.ok) {
+        if (result.ok()) {
             PerfRecord perf;
             perf.prompt_tokens = (int)req.prompt_tokens.size();
             perf.completion_tokens = completion_tokens;
@@ -3298,14 +3298,14 @@ void HttpServer::worker_loop() {
             result.decode_s > 0.0 ? out_tokens / result.decode_s : 0.0;
         const std::string finish = client_disconnected
             ? "client_disconnect"
-            : (result.ok ? emitter.finish_reason() : "error");
+            : (result.ok() ? emitter.finish_reason() : "error");
 
         std::fprintf(stderr,
             "[server] chat DONE %s ok=%s in=%zu effective_in=%zu out=%d "
             "%.1fs %.1f tok/s finish=%s restore=%s slot=%d prefix_len=%d "
-            "prefill=%.1fs decode=%.1fs(%.1ftok/s) error=%s\n",
+            "prefill=%.1fs decode=%.1fs(%.1ftok/s) error=%s detail=%s\n",
             req.response_id.c_str(),
-            result.ok ? "true" : "false",
+            result.ok() ? "true" : "false",
             req.prompt_tokens.size(),
             effective_prompt.size(),
             out_tokens,
@@ -3318,7 +3318,8 @@ void HttpServer::worker_loop() {
             result.prefill_s,
             result.decode_s,
             decode_tok_s,
-            result.error.empty() ? "-" : result.error.c_str());
+            result.ok() ? "-" : result.error_code().data(),
+            result.error_detail().empty() ? "-" : result.error_detail().data());
 
         // Signal client thread that we're done.
         finish_job();
