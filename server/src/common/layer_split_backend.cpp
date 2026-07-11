@@ -48,13 +48,13 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
                                                  bool reset_state) {
     GenerateResult result;
     if (!adapter_) {
-        result.error = "adapter";
+        result.error = "adapter_unavailable";
         return result;
     }
 
     DaemonIO out_io = io.with_token_callback(req.on_token);
     if (base_pos + (int)req.prompt.size() + req.n_gen + 1 > adapter_->max_context()) {
-        result.error = "context";
+        result.error = "context_overflow";
         return result;
     }
     if (req.do_sample && req.sampler.needs_logit_processing() &&
@@ -86,7 +86,7 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
         std::vector<int32_t> chunk(req.prompt.begin() + consumed,
                                    req.prompt.begin() + consumed + n_tokens);
         if (!adapter_->prefill(chunk, base_pos + consumed, last_tok)) {
-            result.error = "prefill";
+            result.error = "prefill_failed";
             return result;
         }
         consumed += n_tokens;
@@ -104,7 +104,7 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
 
     if (req.n_gen > 0) {
         if (last_tok < 0) {
-            result.error = "decode_seed";
+            result.error = "decode_seed_missing";
             return result;
         }
         auto t_decode_start = std::chrono::steady_clock::now();
@@ -118,7 +118,7 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
                                   result.tokens, out_io);
         if (use_dflash) result.accept_rate = dflash_accept_rate;
         if (!ok) {
-            result.error = "decode";
+            result.error = "decode_failed";
             return result;
         }
         result.decode_s = std::chrono::duration<double>(
@@ -166,7 +166,7 @@ GenerateResult LayerSplitBackend::restore_and_generate_impl(
         int slot, const GenerateRequest & req, const DaemonIO & io) {
     GenerateResult result;
     if (!adapter_ || !adapter_->snapshot_restore(slot)) {
-        result.error = "bad slot";
+        result.error = "invalid_snapshot_slot";
         io.emit(-1);
         return result;
     }
