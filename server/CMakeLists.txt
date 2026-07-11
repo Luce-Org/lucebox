@@ -663,6 +663,19 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_rms_norm_hip PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
         add_test(NAME rms_norm_hip COMMAND test_rms_norm_hip)
     endif()
+    # DS4 Hierarchical-Controller pre-mix kernels vs CPU reference. HIP only:
+    # deepseek4_hc_cuda.cu is compiled into dflash_common on this backend. Validates
+    # the HC mix matvec + NHC=4 Sinkhorn path against the device's actual wave width.
+    if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_hc_cuda.cpp")
+        add_executable(test_deepseek4_hc_cuda test/test_deepseek4_hc_cuda.cpp)
+        set_source_files_properties(test/test_deepseek4_hc_cuda.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_deepseek4_hc_cuda PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_include_directories(test_deepseek4_hc_cuda PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
+        target_link_libraries(test_deepseek4_hc_cuda PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
+        add_test(NAME deepseek4_hc_cuda COMMAND test_deepseek4_hc_cuda)
+    endif()
     # GPU draft top-K kernel vs CPU reference (extract_draft_topk). CUDA only:
     # geometric_draft_topk_cuda.cu is compiled into dflash_common solely on the cuda backend.
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_topk_cuda.cpp")
