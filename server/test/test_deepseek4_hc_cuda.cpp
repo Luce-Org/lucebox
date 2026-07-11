@@ -1,9 +1,12 @@
 // CPU-parity test for the DeepSeek-V4 Hierarchical-Controller pre-mix kernels
 // (deepseek4_hc_cuda.cu). This is the #500 pattern (rms_norm_hip) applied to the
-// hand-written DS4 HC path: it exercises the two device-side reductions the HC
-// pre step depends on and checks them against a CPU reference on the device's
-// actual wavefront width, so it validates whichever mode the runner's card uses
-// (gfx1100 / gfx1151 are wave32; a wave64 card exercises the wider reduction).
+// hand-written DS4 HC path: it drives deepseek4_cuda_hc_pre (the host entry used by
+// the decode path) and checks its two kernels against a CPU reference on the
+// device's actual wavefront width, so it validates whichever mode the runner's card
+// uses (gfx1100 / gfx1151 are wave32; a wave64 card exercises the wider reduction).
+// Scope: deepseek4_cuda_hc_pre_mix (the hc_sumsq_kernel/hc_mix_kernel reduction
+// pair, currently uncalled anywhere in server/) and the device-pointer variants
+// (_device, _device_params) are out of scope here.
 //
 // deepseek4_cuda_hc_pre runs, in order:
 //   1. hc_mix_norm_kernel  -- per-row RMS-normalized dot fn[row] . state, one
@@ -14,10 +17,12 @@
 //      NHC=4 Sinkhorn normalization of the comb matrix, then the gated combine
 //      working[d] = sum_h pre[h] * state[h][d].
 //
-// The CPU reference reproduces all three outputs (working, post, comb) exactly as
-// the kernel computes them (same fp32 arithmetic, same +sinkhorn_eps guards, same
-// half round-trip on fn). Pass criterion: max |gpu - cpu| within a tight fp32
-// tolerance whose only slack is reduction ordering + the fn half round-trip.
+// The CPU reference reproduces all three outputs (working, post, comb) as the
+// kernel computes them (same fp32 arithmetic, same +sinkhorn_eps guards, same half
+// round-trip on fn). Pass criterion: max |gpu - cpu| within a tight fp32 tolerance
+// whose only slack is reduction ordering + the fn half round-trip. Being derived
+// from the same spec, it catches arithmetic / reduction / wave-width regressions,
+// not a shared misreading of the spec (e.g. a comb src/dst convention both agree on).
 //
 // Written in CUDA spellings; the hip_compat/ shim maps them onto HIP exactly as
 // the kernel and the rms_norm_hip / flashprefill tests do.
@@ -44,9 +49,11 @@ using dflash::common::deepseek4_cuda_hc_pre;
 static inline float sigmoidf(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
 int main() {
-    // DS4-Flash HC config: n_hc = 4 (mix_dim = 2*4 + 4*4 = 24 = kMixDim, the
-    // effective cap set by the kernel's fixed d_mix). n_embd chosen > block(256)
-    // so hc_dim spans several strided load iterations in both reductions.
+    // DS4-Flash HC config: n_hc = 4 (mix_dim = 2*4 + 4*4 = 24). NOTE: the kernel's
+    // d_mix is fixed at kMixDim=24 while deepseek4_cuda_hc_pre still admits n_hc<=8
+    // (mix_dim up to 80), so n_hc>4 overflows d_mix in the kernel today -- a latent
+    // kernel bug, deliberately not exercised here. n_embd chosen > block(256) so
+    // hc_dim spans several strided load iterations in both reductions.
     constexpr int N_HC          = 4;
     constexpr int N_EMBD        = 512;
     constexpr int HC_DIM        = N_HC * N_EMBD;          // 2048
