@@ -84,6 +84,10 @@ private:
     int compute_auto_split_layers() const;
     static int estimate_cuda_layers_from_free_bytes(size_t free_bytes);
     static size_t hc_state_elements(const DeepSeek4Weights & weights);
+    static const float * local_shard_input(
+        size_t shard_index,
+        const std::vector<float> & token_embeddings,
+        const std::vector<float> & hc_state);
 
     DeepSeek4LayerSplitAdapterConfig cfg_;
     std::vector<DeepSeek4LayerSplitShard> shards_;

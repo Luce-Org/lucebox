@@ -5798,9 +5798,21 @@ bool deepseek4_step_layer_range(
     // Initialize HC state.
     // First shard (layer_begin=0): embed is token embeddings [n_embd × n_tokens],
     //   replicate into n_hc streams.
-    // Later shards: embed is full HC state [hc_dim × n_tokens] from previous shard.
-    if (hc_state.size() != (size_t)hc_dim * (size_t)n_tokens) {
-        hc_state.resize((size_t)hc_dim * (size_t)n_tokens);
+    // Later shards: embed is full HC state [hc_dim × n_tokens] from previous
+    //   shard — either hc_state's own buffer (local in-process handoff) or a
+    //   separate buffer (IPC daemon). Detect the alias before any resize, which
+    //   would invalidate embed.
+    const size_t hc_state_elems = (size_t)hc_dim * (size_t)n_tokens;
+    const bool boundary_in_place = embed != nullptr && embed == hc_state.data();
+    if (hc_state.size() != hc_state_elems) {
+        if (boundary_in_place) {
+            std::fprintf(stderr,
+                         "[deepseek4] HC boundary state size mismatch for layer range [%d,%d): "
+                         "have %zu want %zu\n",
+                         layer_begin, layer_end, hc_state.size(), hc_state_elems);
+            return false;
+        }
+        hc_state.resize(hc_state_elems);
     }
     if (layer_begin == 0) {
         // First shard: replicate embedding into all HC streams
@@ -5812,7 +5824,14 @@ bool deepseek4_step_layer_range(
         }
     } else {
         // Later shard: embed contains full HC state from previous shard
-        memcpy(hc_state.data(), embed, sizeof(float) * (size_t)hc_dim * (size_t)n_tokens);
+        if (!embed) {
+            std::fprintf(stderr, "[deepseek4] missing HC boundary state for layer range [%d,%d)\n",
+                         layer_begin, layer_end);
+            return false;
+        }
+        if (!boundary_in_place) {
+            memcpy(hc_state.data(), embed, sizeof(float) * hc_state_elems);
+        }
     }
 
     // Keep all reusable layer-range resources under one model owner so park,
