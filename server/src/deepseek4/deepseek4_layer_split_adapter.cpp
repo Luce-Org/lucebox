@@ -405,7 +405,10 @@ bool DeepSeek4LayerSplitAdapter::init_mixed_target_split() {
 }
 
 void DeepSeek4LayerSplitAdapter::begin_request(const GenerateRequest & req) {
-    (void)req;
+    sampler_ = req.sampler;
+    if (req.do_sample && sampler_.seed != 0) {
+        sampler_rng_.seed(sampler_.seed);
+    }
 }
 
 void DeepSeek4LayerSplitAdapter::reset_request_state() {
