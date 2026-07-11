@@ -621,6 +621,27 @@ static void test_hc_state_dimensions() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_layer_split_request_propagates_sampler() {
+    std::fprintf(stderr, "  test_layer_split_request_propagates_sampler ...");
+
+    DeepSeek4LayerSplitAdapter adapter({});
+    GenerateRequest req;
+    req.do_sample = true;
+    req.sampler.temp = 0.25f;
+    req.sampler.top_p = 0.9f;
+    req.sampler.seed = 42;
+
+    adapter.begin_request(req);
+
+    TEST_ASSERT(adapter.sampler_.temp == req.sampler.temp);
+    TEST_ASSERT(adapter.sampler_.top_p == req.sampler.top_p);
+    TEST_ASSERT(adapter.sampler_.seed == req.sampler.seed);
+    std::mt19937_64 expected(req.sampler.seed);
+    TEST_ASSERT(adapter.sampler_rng_() == expected());
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_loader_rejects_missing_required_metadata(ggml_backend_t backend) {
     std::fprintf(stderr, "  test_loader_rejects_missing_required_metadata ...");
 
@@ -1558,6 +1579,7 @@ int main() {
     test_auto_split_computation();
     test_layer_range_validation();
     test_hc_state_dimensions();
+    test_layer_split_request_propagates_sampler();
     test_loader_rejects_missing_required_metadata(backend);
     test_loader_rejects_invalid_compress_ratio_type(backend);
     test_loader_rejects_zero_vocab_size(backend);
