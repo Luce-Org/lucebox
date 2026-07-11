@@ -4,8 +4,8 @@
 // the decode path) and checks its two kernels against a CPU reference on the
 // device's actual wavefront width, so it validates whichever mode the runner's card
 // uses (gfx1100 / gfx1151 are wave32; a wave64 card exercises the wider reduction).
-// Scope: deepseek4_cuda_hc_pre_mix (the hc_sumsq_kernel/hc_mix_kernel reduction
-// pair, currently uncalled anywhere in server/) and the device-pointer variants
+// Scope: deepseek4_cuda_hc_pre_mix (a separate mix-only entry with its own
+// hc_sumsq_kernel/hc_mix_kernel reduction pair) and the device-pointer variants
 // (_device, _device_params) are out of scope here.
 //
 // deepseek4_cuda_hc_pre runs, in order:
