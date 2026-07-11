@@ -1,8 +1,9 @@
 // Correctness test for geometric_extract_draft_topk_cuda (GPU) vs extract_draft_topk (CPU).
 //
-// The GPU kernel in src/common/geometric_draft_topk_cuda.cu is a drop-in replacement for
-// the CPU top-K + online-logsumexp path in ddtree.cpp. This test feeds the same
-// random logits to both and asserts the GPU results match the CPU reference:
+// The GPU kernel in src/common/geometric_draft_topk_cuda.cu is a drop-in
+// replacement for the CPU top-K + online-logsumexp path in ddtree.cpp. This test
+// feeds the same random logits to both and asserts the GPU results match the CPU
+// reference:
 //   - token ids identical (rank by rank, per position)
 //   - log-probs within a small bf16/float tolerance
 //
@@ -11,8 +12,9 @@
 // order the tied ids differently; we treat an id swap as OK when the matching
 // log-probs are equal within tolerance.
 //
-// Build: registered in server/CMakeLists.txt under DFLASH27B_TESTS (CUDA only).
-// Run:   ./test_draft_topk_cuda   (exit 0 = pass, non-zero = fail)
+// Build: registered in server/CMakeLists.txt under DFLASH27B_TESTS for both the
+//        CUDA and HIP backends (the HIP build compiles this via the hip_compat
+//        <cuda_runtime.h> shim). Run: ./test_draft_topk_cuda (0 = pass).
 
 #include "../src/common/geometric_draft_topk_cuda.h"
 #include "../src/common/ddtree.h"

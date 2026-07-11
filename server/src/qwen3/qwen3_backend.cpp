@@ -525,7 +525,7 @@ GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
     // Prefill
     const int committed = do_prefill(req.prompt, out_io);
     if (committed < 0) {
-        result.error = "prefill";
+        result.fail(GenerateErrorCode::PrefillFailed);
         return result;
     }
 
@@ -567,7 +567,7 @@ GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
                 ggml_backend_get_default_buffer_type(backend_));
             if (!ggml_gallocr_alloc_graph(galloc, gf)) {
                 ggml_gallocr_free(galloc); ggml_free(ectx);
-                result.error = "embed alloc"; return result;
+                result.fail(GenerateErrorCode::BackendSpecific, "embed alloc"); return result;
             }
             ggml_backend_tensor_set(ids, &last_tok, 0, sizeof(int32_t));
             ggml_backend_graph_compute(backend_, gf);
@@ -578,7 +578,7 @@ GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
 
         // Re-step at committed-1 to get logits (KV already written, idempotent)
         if (!do_step(embed_buf.data(), 1, committed - 1, logits)) {
-            result.error = "first logits";
+            result.fail(GenerateErrorCode::BackendSpecific, "first logits");
             return result;
         }
 
@@ -598,13 +598,13 @@ GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
         out_io.emit(first);
         if (out_io.cancelled) {
             out_io.emit(-1);
-            result.ok = true;
+            result.succeed();
             return result;
         }
 
         if (first == 151643 || first == 151645) {
             out_io.emit(-1);
-            result.ok = true;
+            result.succeed();
             return result;
         }
 
@@ -630,7 +630,7 @@ GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
                     ggml_backend_get_default_buffer_type(backend_));
                 if (!ggml_gallocr_alloc_graph(galloc2, gf2)) {
                     ggml_gallocr_free(galloc2); ggml_free(ectx2);
-                    result.error = "embed2 alloc"; return result;
+                    result.fail(GenerateErrorCode::BackendSpecific, "embed2 alloc"); return result;
                 }
                 ggml_backend_tensor_set(ids2, &ft, 0, sizeof(int32_t));
                 ggml_backend_graph_compute(backend_, gf2);
@@ -639,21 +639,21 @@ GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
                 ggml_free(ectx2);
             }
             if (!do_step(embed_buf.data(), 1, cur_committed, last_logits_)) {
-                result.error = "decode logits";
+                result.fail(GenerateErrorCode::BackendSpecific, "decode logits");
                 return result;
             }
             cur_committed++;
             cache_.cur_pos = cur_committed;
 
             if (!do_decode(cur_committed, req.n_gen - 1, result.tokens, out_io)) {
-                result.error = "decode";
+                result.fail(GenerateErrorCode::DecodeFailed);
                 return result;
             }
         }
     }
 
     out_io.emit(-1);
-    result.ok = true;
+    result.succeed();
     return result;
 }
 
@@ -665,7 +665,7 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     if (slot < 0 || slot >= PREFIX_SLOTS || !snapshots_[slot].ctx) {
-        result.error = "bad slot";
+        result.fail(GenerateErrorCode::InvalidSnapshotSlot);
         out_io.emit(-1);
         return result;
     }
@@ -691,7 +691,7 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
                                         req.prompt.end());
         const int committed = do_prefill(remaining, out_io, prefix_len);
         if (committed < 0) {
-            result.error = "prefill after restore";
+            result.fail(GenerateErrorCode::BackendSpecific, "prefill after restore");
             return result;
         }
     }
@@ -734,7 +734,7 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
                 ggml_backend_get_default_buffer_type(backend_));
             if (!ggml_gallocr_alloc_graph(galloc, gf)) {
                 ggml_gallocr_free(galloc); ggml_free(ectx);
-                result.error = "embed alloc"; return result;
+                result.fail(GenerateErrorCode::BackendSpecific, "embed alloc"); return result;
             }
             ggml_backend_tensor_set(ids, &last_tok, 0, sizeof(int32_t));
             ggml_backend_graph_compute(backend_, gf);
@@ -745,7 +745,7 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
 
         // Re-step at last position to get logits
         if (!do_step(embed_buf.data(), 1, total_committed - 1, logits)) {
-            result.error = "first logits";
+            result.fail(GenerateErrorCode::BackendSpecific, "first logits");
             return result;
         }
 
@@ -765,13 +765,13 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
         out_io.emit(first);
         if (out_io.cancelled) {
             out_io.emit(-1);
-            result.ok = true;
+            result.succeed();
             return result;
         }
 
         if (first == 151643 || first == 151645) {
             out_io.emit(-1);
-            result.ok = true;
+            result.succeed();
             return result;
         }
 
@@ -796,7 +796,7 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
                     ggml_backend_get_default_buffer_type(backend_));
                 if (!ggml_gallocr_alloc_graph(galloc2, gf2)) {
                     ggml_gallocr_free(galloc2); ggml_free(ectx2);
-                    result.error = "embed2 alloc"; return result;
+                    result.fail(GenerateErrorCode::BackendSpecific, "embed2 alloc"); return result;
                 }
                 ggml_backend_tensor_set(ids2, &ft, 0, sizeof(int32_t));
                 ggml_backend_graph_compute(backend_, gf2);
@@ -805,21 +805,21 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
                 ggml_free(ectx2);
             }
             if (!do_step(embed_buf.data(), 1, cur_committed, last_logits_)) {
-                result.error = "decode logits";
+                result.fail(GenerateErrorCode::BackendSpecific, "decode logits");
                 return result;
             }
             cur_committed++;
             cache_.cur_pos = cur_committed;
 
             if (!do_decode(cur_committed, req.n_gen - 1, result.tokens, out_io)) {
-                result.error = "decode";
+                result.fail(GenerateErrorCode::DecodeFailed);
                 return result;
             }
         }
     }
 
     out_io.emit(-1);
-    result.ok = true;
+    result.succeed();
     return result;
 }
 

@@ -57,8 +57,9 @@ int main(int argc, char ** argv) {
 
     DaemonIO io{};
     GenerateResult r = be.generate(req, io);
-    if (!r.ok) {
-        std::fprintf(stderr, "generate failed: %s\n", r.error.c_str());
+    if (!r.ok()) {
+        std::fprintf(stderr, "generate failed: %s (%s)\n",
+                     r.error_code().data(), r.error_detail().data());
         return 1;
     }
     const int nd = (int)r.tokens.size();

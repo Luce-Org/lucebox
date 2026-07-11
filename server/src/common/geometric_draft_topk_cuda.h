@@ -12,9 +12,12 @@
 //   out_log_probs = top-K scaled logits (desc), minus log_z
 //   out_token_ids = matching vocab ids; ties broken toward the lower id
 //
-// Returns false (caller must fall back to the CPU path) when CUDA is
+// Returns false (caller must fall back to the CPU path) when the GPU runtime is
 // unavailable, the pointer is not device memory, K is out of range, or any
-// CUDA call fails. Only compiled into CUDA builds; see CMakeLists.txt.
+// device call fails. Compiled on both CUDA and HIP/ROCm builds — this same .cu
+// is compiled directly with LANGUAGE HIP on ROCm, the cuda_runtime.h spellings
+// mapped by the hip_compat shim; guarded by DFLASH27B_HAVE_DRAFT_TOPK. See
+// CMakeLists.txt.
 
 #pragma once
 

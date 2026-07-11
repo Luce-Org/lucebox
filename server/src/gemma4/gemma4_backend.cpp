@@ -724,7 +724,7 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
 GenerateResult Gemma4Backend::generate_impl(const GenerateRequest & req,
                                             const DaemonIO & io) {
     GenerateResult result;
-    if (parked_) { result.error = "model is parked"; return result; }
+    if (parked_) { result.fail(GenerateErrorCode::ModelParked); return result; }
 
     DaemonIO out_io = io.with_token_callback(req.on_token);
     sampler_ = req.sampler;
@@ -742,7 +742,7 @@ GenerateResult Gemma4Backend::generate_impl(const GenerateRequest & req,
     result.prefill_s = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t_prefill_start).count();
     if (committed < 0) {
-        result.error = "prefill";
+        result.fail(GenerateErrorCode::PrefillFailed);
         return result;
     }
 
@@ -771,7 +771,7 @@ GenerateResult Gemma4Backend::generate_impl(const GenerateRequest & req,
                                 &req.budget_hook,
                                 &result.budget_forced_close,
                                 &result.accept_rate)) {
-                result.error = "spec_decode";
+                result.fail(GenerateErrorCode::BackendSpecific, "spec_decode");
                 return result;
             }
         } else {
@@ -789,7 +789,7 @@ GenerateResult Gemma4Backend::generate_impl(const GenerateRequest & req,
             if (!gemma4_step(backend_, w_, cache_, embed_buf.data(),
                              &last_tok, 1, committed - 1, logits,
                              kvflash_active() ? &kvflash_pager_ : nullptr)) {
-                result.error = "first logits";
+                result.fail(GenerateErrorCode::BackendSpecific, "first logits");
                 return result;
             }
 
@@ -809,13 +809,13 @@ GenerateResult Gemma4Backend::generate_impl(const GenerateRequest & req,
             out_io.emit(first);
             if (out_io.cancelled) {
                 out_io.emit(-1);
-                result.ok = true;
+                result.succeed();
                 return result;
             }
 
             if (first == w_.eos_id || first == w_.eos_chat_id) {
                 out_io.emit(-1);
-                result.ok = true;
+                result.succeed();
                 return result;
             }
 
@@ -823,7 +823,7 @@ GenerateResult Gemma4Backend::generate_impl(const GenerateRequest & req,
                 if (!do_decode(committed, req.n_gen - 1, result.tokens, out_io,
                                req.budget_hook,
                                &result.budget_forced_close)) {
-                    result.error = "decode";
+                    result.fail(GenerateErrorCode::DecodeFailed);
                     return result;
                 }
             }
@@ -834,7 +834,7 @@ GenerateResult Gemma4Backend::generate_impl(const GenerateRequest & req,
     }
     result.decode_s = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t_decode_start).count();
-    result.ok = true;
+    result.succeed();
     return result;
 }
 
@@ -844,12 +844,12 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
                                                         const GenerateRequest & req,
                                                         const DaemonIO & io) {
     GenerateResult result;
-    if (parked_) { result.error = "model is parked"; return result; }
+    if (parked_) { result.fail(GenerateErrorCode::ModelParked); return result; }
 
     DaemonIO out_io = io.with_token_callback(req.on_token);
 
     if (slot < 0 || slot >= PREFIX_SLOTS || !snapshots_[slot].ctx) {
-        result.error = "bad slot";
+        result.fail(GenerateErrorCode::InvalidSnapshotSlot);
         out_io.emit(-1);
         return result;
     }
@@ -895,12 +895,12 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
         if (snap_pos > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
             std::fprintf(stderr, "[kvflash] restored prefix (%d) exceeds pool %d\n",
                          snap_pos, kvflash_tokens_);
-            result.error = "kvflash: prompt exceeds resident pool";
+            result.fail(GenerateErrorCode::ContextOverflow);
             return result;
         }
         kvflash_pager_.reset();
         if (!kvflash_alloc_span(0, snap_pos)) {
-            result.error = "kvflash_slot";
+            result.fail(GenerateErrorCode::BackendSpecific, "kvflash_slot");
             return result;
         }
     }
@@ -924,7 +924,7 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
         std::vector<int32_t> delta(req.prompt.begin() + snap_pos, req.prompt.end());
         committed = do_prefill(delta, out_io, /*kv_offset=*/snap_pos);
         if (committed < 0) {
-            result.error = "prefill";
+            result.fail(GenerateErrorCode::PrefillFailed);
             return result;
         }
     } else if (prompt_len > 0 && prompt_len < snap_pos) {
@@ -936,7 +936,7 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
         cache_.cur_pos = 0;
         committed = do_prefill(req.prompt, out_io, /*kv_offset=*/0);
         if (committed < 0) {
-            result.error = "prefill";
+            result.fail(GenerateErrorCode::PrefillFailed);
             return result;
         }
     }
@@ -977,7 +977,7 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
                                 &req.budget_hook,
                                 &result.budget_forced_close,
                                 &result.accept_rate)) {
-                result.error = "spec_decode";
+                result.fail(GenerateErrorCode::BackendSpecific, "spec_decode");
                 return result;
             }
         } else {
@@ -995,7 +995,7 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
             if (!gemma4_step(backend_, w_, cache_, embed_buf.data(),
                              &last_tok, 1, committed - 1, logits,
                              kvflash_active() ? &kvflash_pager_ : nullptr)) {
-                result.error = "first logits";
+                result.fail(GenerateErrorCode::BackendSpecific, "first logits");
                 return result;
             }
 
@@ -1015,13 +1015,13 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
             out_io.emit(first);
             if (out_io.cancelled) {
                 out_io.emit(-1);
-                result.ok = true;
+                result.succeed();
                 return result;
             }
 
             if (first == w_.eos_id || first == w_.eos_chat_id) {
                 out_io.emit(-1);
-                result.ok = true;
+                result.succeed();
                 return result;
             }
 
@@ -1029,7 +1029,7 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
                 if (!do_decode(committed, req.n_gen - 1, result.tokens, out_io,
                                req.budget_hook,
                                &result.budget_forced_close)) {
-                    result.error = "decode";
+                    result.fail(GenerateErrorCode::DecodeFailed);
                     return result;
                 }
             }
@@ -1040,7 +1040,7 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
     }
     result.decode_s = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t_decode_start).count();
-    result.ok = true;
+    result.succeed();
     return result;
 }
 
