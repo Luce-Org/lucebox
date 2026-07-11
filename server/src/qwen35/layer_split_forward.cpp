@@ -624,11 +624,12 @@ bool run_qwen35_layer_split_forward_from_activation(
         std::vector<Qwen35TargetCaptureSlice> * captures_out,
         KvFlashPager * kvflash,
         bool kvflash_preallocated,
-        const Qwen35SplitTreeInputs * tree_inputs) {
+        const Qwen35SplitTreeInputs * tree_inputs,
+        bool capture_ssm_intermediates) {
     if (!run_qwen35_layer_split_layers_from_activation(
             shards, acts, base_pos, n_tokens_total, ubatch, kq_stride_pad,
             fa_window, captures_out, nullptr, nullptr, kvflash,
-            /*capture_ssm_intermediates=*/captures_out != nullptr,
+            capture_ssm_intermediates,
             /*capture_stats=*/nullptr, kvflash_preallocated, tree_inputs)) {
         return false;
     }
@@ -686,7 +687,8 @@ bool run_qwen35_layer_split_tree_verify_from_activation(
     return run_qwen35_layer_split_forward_from_activation(
         shards, acts, base_pos, n_tokens_total, ubatch, last_tok,
         kq_stride_pad, fa_window, argmax_out, logits_out, captures_out,
-        kvflash, kvflash_preallocated, &tree_inputs);
+        kvflash, kvflash_preallocated,
+        &tree_inputs, /*capture_ssm_intermediates=*/true);
 }
 
 bool run_qwen35_mixed_layer_split_forward(

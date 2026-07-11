@@ -95,11 +95,10 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
 
     if (capture_selftest || capture_ssm_intermediates) {
         std::fprintf(stderr,
-            "[target-split][capture] split_capture_requested=%llu split_capture_enabled=%llu split_capture_missing_owner_count=%llu split_capture_non_owner_write_count=%llu ok=%d\n",
+            "[target-split][capture] split_capture_requested=%llu split_capture_enabled=%llu split_capture_missing_owner_count=%llu ok=%d\n",
             (unsigned long long)capture_stats.requested,
             (unsigned long long)capture_stats.enabled,
-            (unsigned long long)capture_stats.missing_owner_count,
-            (unsigned long long)capture_stats.non_owner_write_count, ok ? 1 : 0);
+            (unsigned long long)capture_stats.missing_owner_count, ok ? 1 : 0);
         for (size_t i = 0; i < capture_stats.layers_owned_per_shard.size(); ++i) {
             const int gpu = i < shards_.size() ? shards_[i].gpu : -1;
             std::fprintf(stderr,
@@ -123,8 +122,7 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
     bool shard_gate_ok = !capture_stats.layers_owned_per_shard.empty();
     if (capture_ssm_intermediates) {
         capture_gate_ok = ok && capture_stats.enabled > 0 &&
-            capture_stats.missing_owner_count == 0 &&
-            capture_stats.non_owner_write_count == 0;
+            capture_stats.missing_owner_count == 0;
         for (size_t i = 0; i < capture_stats.layers_owned_per_shard.size(); ++i) {
             if (capture_stats.layers_owned_per_shard[i] > 0 &&
                 capture_stats.slots_written_per_shard[i] == 0) {
@@ -684,8 +682,8 @@ bool Qwen35LayerSplitDFlashTarget::rollback_to_tree(
     long long feature_realign_latency_us = 0;
     if (feature_ring_) {
         const auto feature_t0 = std::chrono::steady_clock::now();
-        // Two immutable N+1 staging buffers: source accepted-DFS rows plus one
-        // guard row, then destination/validation rows in committed-spine order.
+        // One N+1 staging buffer: accepted-DFS rows plus one guard row, then
+        // read back in committed-spine order.
         // The helper reads and writes by logical position, matching
         // draft_feature_mirror_sync_range(). This prewindow path uses host F32
         // staging for inspectable exactness; a device-staging fast path is an
@@ -695,7 +693,6 @@ bool Qwen35LayerSplitDFlashTarget::rollback_to_tree(
         const int stage_rows = commit_n + 1;
         if (stage_rows > feature_ring_->cap) return fail("feature_stage_rows_exceed_cap");
         std::vector<float> source_stage((size_t)stage_rows * (size_t)fc_in, 0.0f);
-        std::vector<float> dest_stage((size_t)stage_rows * (size_t)fc_in, 0.0f);
         std::vector<float> one_row;
         for (int d = 0; d < commit_n; ++d) {
             // Root-inclusive accepted flat slot: feature row for accepted
@@ -707,15 +704,7 @@ bool Qwen35LayerSplitDFlashTarget::rollback_to_tree(
             std::copy(one_row.begin(), one_row.end(),
                       source_stage.begin() + (size_t)d * (size_t)fc_in);
         }
-        std::copy(source_stage.begin(), source_stage.end(), dest_stage.begin());
-        for (int d = 0; d < stage_rows; ++d) {
-            const float * a = source_stage.data() + (size_t)d * (size_t)fc_in;
-            const float * b = dest_stage.data() + (size_t)d * (size_t)fc_in;
-            for (int j = 0; j < fc_in; ++j) {
-                if (a[j] != b[j]) return fail("feature_destination_stage_validation_failed");
-            }
-        }
-        if (!copy_host_f32_to_feature_ring_range(*feature_ring_, committed, commit_n, dest_stage)) {
+        if (!copy_host_f32_to_feature_ring_range(*feature_ring_, committed, commit_n, source_stage)) {
             return fail("feature_destination_backfill_failed");
         }
         const auto feature_t1 = std::chrono::steady_clock::now();

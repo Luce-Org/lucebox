@@ -82,7 +82,8 @@ bool run_qwen35_layer_split_forward_from_activation(
         std::vector<Qwen35TargetCaptureSlice> * captures_out = nullptr,
         KvFlashPager * kvflash = nullptr,
         bool kvflash_preallocated = false,
-        const Qwen35SplitTreeInputs * tree_inputs = nullptr);
+        const Qwen35SplitTreeInputs * tree_inputs = nullptr,
+        bool capture_ssm_intermediates = false);
 
 bool run_qwen35_layer_split_tree_verify_from_activation(
         std::vector<Qwen35LayerSplitShard> & shards,

@@ -1092,6 +1092,7 @@ if(DFLASH27B_TESTS)
     # 'make check' — builds test targets then runs ctest
     if(TARGET test_server_unit)
         set(_check_deps test_server_unit)
+        list(APPEND _check_deps test_qwen35_split_tree_guard)
         if(TARGET test_deepseek4_unit)
             list(APPEND _check_deps test_deepseek4_unit)
         endif()

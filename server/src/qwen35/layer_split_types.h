@@ -40,7 +40,6 @@ struct Qwen35SplitCaptureStats {
     uint64_t requested = 0;
     uint64_t enabled = 0;
     uint64_t missing_owner_count = 0;
-    uint64_t non_owner_write_count = 0;
     std::vector<uint64_t> layers_owned_per_shard;
     std::vector<uint64_t> slots_written_per_shard;
     std::vector<uint64_t> feature_taps_owned_per_shard;
@@ -50,7 +49,6 @@ struct Qwen35SplitCaptureStats {
         requested = 0;
         enabled = 0;
         missing_owner_count = 0;
-        non_owner_write_count = 0;
         layers_owned_per_shard.assign(n_shards, 0);
         slots_written_per_shard.assign(n_shards, 0);
         feature_taps_owned_per_shard.assign(n_shards, 0);
