@@ -798,7 +798,7 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     auto t_prefill_start = std::chrono::steady_clock::now();
     const int committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
     if (committed < 0) {
-        result.error = "prefill";
+        result.fail(GenerateErrorCode::PrefillFailed);
         return result;
     }
     auto t_prefill_end = std::chrono::steady_clock::now();
@@ -836,14 +836,14 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
             }
         }
         if (!decode_ok) {
-            result.error = "decode";
+            result.fail(GenerateErrorCode::DecodeFailed);
             return result;
         }
         result.decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
 
-    result.ok = true;
+    result.succeed();
     return result;
 }
 
@@ -855,7 +855,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) {
-        result.error = "bad slot";
+        result.fail(GenerateErrorCode::InvalidSnapshotSlot);
         out_io.emit(-1);
         return result;
     }
@@ -906,7 +906,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         std::vector<int32_t> delta = restore_prompt_delta(req.prompt, snap_pos);
         committed = do_prefill(delta, out_io, req.snap_pos, req.snap_slot, /*kv_offset=*/snap_pos);
         if (committed < 0) {
-            result.error = "prefill";
+            result.fail(GenerateErrorCode::PrefillFailed);
             return result;
         }
         result.prefill_s = std::chrono::duration<double>(
@@ -924,7 +924,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         auto t_prefill_start = std::chrono::steady_clock::now();
         committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
         if (committed < 0) {
-            result.error = "prefill";
+            result.fail(GenerateErrorCode::PrefillFailed);
             return result;
         }
         result.prefill_s = std::chrono::duration<double>(
@@ -947,7 +947,8 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                                should_capture_moe_router(),
                                /*kvflash_mask=*/pool,
                                /*capture_qk=*/pool && kvflash_qk_policy_)) {
-            result.error = "restore step-graph build";
+            result.fail(GenerateErrorCode::BackendSpecific,
+                             "restore step-graph build");
             return result;
         }
     }
@@ -984,14 +985,14 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             }
         }
         if (!decode_ok) {
-            result.error = "decode";
+            result.fail(GenerateErrorCode::DecodeFailed);
             return result;
         }
         result.decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
 
-    result.ok = true;
+    result.succeed();
     return result;
 }
 

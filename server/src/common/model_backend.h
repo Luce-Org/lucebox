@@ -13,7 +13,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "ggml.h"
@@ -126,9 +129,48 @@ struct GenerateRequest {
     bool                       force_ar_decode = false;
 };
 
+// Stable, backend-independent generation failure categories. Backends should
+// use these for recurrent failures so callers do not need to understand
+// architecture-specific strings. `generate_error_code()` is the daemon/API
+// wire representation and must remain backward-compatible once published.
+enum class GenerateErrorCode {
+    Incomplete,
+    AdapterUnavailable,
+    ContextOverflow,
+    SamplingUnsupported,
+    PrefillFailed,
+    DecodeSeedMissing,
+    DecodeFailed,
+    InvalidSnapshotSlot,
+    ModelParked,
+    BackendSpecific,
+};
+
+constexpr std::string_view generate_error_code(GenerateErrorCode error) {
+    switch (error) {
+    case GenerateErrorCode::Incomplete:          return "incomplete";
+    case GenerateErrorCode::AdapterUnavailable:  return "adapter_unavailable";
+    case GenerateErrorCode::ContextOverflow:     return "context_overflow";
+    case GenerateErrorCode::SamplingUnsupported: return "sampling_unsupported";
+    case GenerateErrorCode::PrefillFailed:       return "prefill_failed";
+    case GenerateErrorCode::DecodeSeedMissing:   return "decode_seed_missing";
+    case GenerateErrorCode::DecodeFailed:        return "decode_failed";
+    case GenerateErrorCode::InvalidSnapshotSlot: return "invalid_snapshot_slot";
+    case GenerateErrorCode::ModelParked:         return "model_parked";
+    case GenerateErrorCode::BackendSpecific:     return "backend_specific";
+    }
+    return "unknown_error";
+}
+
+struct GenerateError {
+    GenerateErrorCode code = GenerateErrorCode::Incomplete;
+    std::string detail;
+};
+
 struct GenerateResult {
-    bool                       ok          = false;
-    std::string                error;               // "prefill", "decode", etc.
+    // Default to an incomplete failure so a backend must explicitly call
+    // succeed() before returning a successful result.
+    std::optional<GenerateError> error = GenerateError{};
     std::vector<int32_t>       tokens;
     double                     prefill_s   = 0.0;
     double                     decode_s    = 0.0;
@@ -155,6 +197,26 @@ struct GenerateResult {
     // to zero output for clients and should take the same AR retry path as
     // an empty token vector.
     bool                       empty_visible_output = false;
+
+    bool ok() const {
+        return !error.has_value();
+    }
+
+    std::string_view error_code() const {
+        return error ? generate_error_code(error->code) : std::string_view{};
+    }
+
+    std::string_view error_detail() const {
+        return error ? std::string_view(error->detail) : std::string_view{};
+    }
+
+    void succeed() {
+        error.reset();
+    }
+
+    void fail(GenerateErrorCode code, std::string detail = {}) {
+        error = GenerateError{code, std::move(detail)};
+    }
 };
 
 // ─── Backend interface ──────────────────────────────────────────────────
@@ -226,7 +288,7 @@ struct ModelBackend {
                                                const GenerateResult & result) {
         return req.n_gen > 0
             && !req.force_ar_decode
-            && result.ok
+            && result.ok()
             && result.spec_decode_ran
             && (result.tokens.empty() || result.empty_visible_output);
     }

@@ -1282,7 +1282,7 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
                                         const DaemonIO & io) {
     if (hybrid_mode_ && moe_hybrid_) {
         auto result = generate_hybrid(req, io);
-        if (result.ok) {
+        if (result.ok()) {
             // Flush routing-frequency profile if requested (independent of swap).
             if (!routing_stats_out_path_.empty() && routing_stats_) {
                 std::string serr;
@@ -1307,7 +1307,7 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
     }
 
     if (N + req.n_gen > args_.max_ctx) {
-        result.error = "overflow";
+        result.fail(GenerateErrorCode::ContextOverflow);
         return result;
     }
 
@@ -1332,7 +1332,7 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
     // ── Prefill ──
     std::vector<float> embed_pf((size_t)N * w_.n_embd);
     if (!w_.embedder.embed(req.prompt.data(), N, embed_pf.data())) {
-        result.error = "embed_prefill";
+        result.fail(GenerateErrorCode::BackendSpecific, "embed_prefill");
         return result;
     }
 
@@ -1370,7 +1370,7 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
                           n_tok, kv_start, no_mask, last_logits, kvf,
                           /*capture=*/true);
     }
-    if (!ok) { result.error = "prefill"; return result; }
+    if (!ok) { result.fail(GenerateErrorCode::PrefillFailed); return result; }
     auto t_pf1 = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_pf1 - t_pf0).count();
 
@@ -1435,7 +1435,7 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
         auto t_g0 = std::chrono::steady_clock::now();
         if (!draft_feature_mirror_sync_tail(cache_.target_feat, cache_.target_feat_cap,
                                             feature_mirror_, N)) {
-            result.error = "feature_sync";
+            result.fail(GenerateErrorCode::BackendSpecific, "feature_sync");
             return result;
         }
         result.spec_decode_ran = true;
@@ -1444,12 +1444,12 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
                             &result.budget_forced_close,
                             &result.accept_rate,
                             &history)) {
-            result.error = "spec_decode";
+            result.fail(GenerateErrorCode::BackendSpecific, "spec_decode");
             return result;
         }
         auto t_g1 = std::chrono::steady_clock::now();
         result.decode_s = std::chrono::duration<double>(t_g1 - t_g0).count();
-        result.ok = true;
+        result.succeed();
         return result;
     }
 
@@ -1527,9 +1527,9 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
     result.decode_s = std::chrono::duration<double>(t_g1 - t_g0).count();
 
     if (should_emit) out_io.emit(-1);
-    if (!ok) { result.error = "decode"; return result; }
+    if (!ok) { result.fail(GenerateErrorCode::DecodeFailed); return result; }
 
-    result.ok = true;
+    result.succeed();
     return result;
 }
 
@@ -1549,7 +1549,7 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
     if (!laguna_snapshot_restore(snapshots_[slot], cache_)) {
         std::fprintf(stderr, "[snap] RESTORE slot=%d: %s\n",
                       slot, dflash27b_last_error());
-        result.error = "restore";
+        result.fail(GenerateErrorCode::BackendSpecific, "restore");
         return result;
     }
 
@@ -1558,7 +1558,7 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
     if (N < prefix_len) {
         std::fprintf(stderr, "[snap] RESTORE prompt shorter than cached prefix (%d < %d)\n",
                       N, prefix_len);
-        result.error = "prefix_shorter";
+        result.fail(GenerateErrorCode::BackendSpecific, "prefix_shorter");
         return result;
     }
 
@@ -1568,13 +1568,13 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
         N > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
         std::fprintf(stderr, "[kvflash] restore prompt (%d) exceeds pool %d; "
                              "raise --kvflash\n", N, kvflash_tokens_);
-        result.error = "kvflash: prompt exceeds resident pool";
+        result.fail(GenerateErrorCode::ContextOverflow);
         return result;
     }
     if (kvflash_active()) {
         kvflash_pager_.reset();
         if (!kvflash_alloc_span(0, prefix_len)) {
-            result.error = "kvflash_slot";
+            result.fail(GenerateErrorCode::BackendSpecific, "kvflash_slot");
             return result;
         }
     }
@@ -1583,7 +1583,10 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
     // Re-prefill diff tokens (or last cached token when diff is empty).
     bool restore_only = false;
     if (prefix_len == N) {
-        if (prefix_len <= 0) { result.error = "empty_diff"; return result; }
+        if (prefix_len <= 0) {
+            result.fail(GenerateErrorCode::BackendSpecific, "empty_diff");
+            return result;
+        }
         cache_.cur_pos = prefix_len - 1;
         restore_only = true;
     }
@@ -1604,7 +1607,7 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
 
     std::vector<float> embed_diff((size_t)diff_n * w_.n_embd);
     if (!w_.embedder.embed(diff_src, diff_n, embed_diff.data())) {
-        result.error = "embed_prefill";
+        result.fail(GenerateErrorCode::BackendSpecific, "embed_prefill");
         return result;
     }
 
@@ -1621,7 +1624,7 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
                           n_tok, starts, no_mask, last_logits, kvf,
                           /*capture=*/true);
     }
-    if (!ok) { result.error = "prefill"; return result; }
+    if (!ok) { result.fail(GenerateErrorCode::PrefillFailed); return result; }
 
     // ── Decode ──
     auto argmax = [](const std::vector<float> & ll) {
@@ -1659,7 +1662,7 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
         auto t_g0 = std::chrono::steady_clock::now();
         if (!draft_feature_mirror_sync_tail(cache_.target_feat, cache_.target_feat_cap,
                                             feature_mirror_, committed)) {
-            result.error = "feature_sync";
+            result.fail(GenerateErrorCode::BackendSpecific, "feature_sync");
             return result;
         }
         result.spec_decode_ran = true;
@@ -1668,12 +1671,12 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
                             &result.budget_forced_close,
                             &result.accept_rate,
                             &history)) {
-            result.error = "spec_decode";
+            result.fail(GenerateErrorCode::BackendSpecific, "spec_decode");
             return result;
         }
         auto t_g1 = std::chrono::steady_clock::now();
         result.decode_s = std::chrono::duration<double>(t_g1 - t_g0).count();
-        result.ok = true;
+        result.succeed();
         return result;
     }
 
@@ -1746,9 +1749,9 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
     result.decode_s = std::chrono::duration<double>(t_g1 - t_g0).count();
 
     out_io.emit(-1);
-    if (!ok) { result.error = "decode"; return result; }
+    if (!ok) { result.fail(GenerateErrorCode::DecodeFailed); return result; }
 
-    result.ok = true;
+    result.succeed();
     return result;
 }
 
@@ -2708,7 +2711,7 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
     const int N = (int)req.prompt.size();
 
     if (N + req.n_gen > args_.max_ctx) {
-        result.error = "overflow";
+        result.fail(GenerateErrorCode::ContextOverflow);
         return result;
     }
 
@@ -2719,7 +2722,7 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
         N > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
         std::fprintf(stderr, "[kvflash] hybrid prompt (%d) exceeds pool %d; "
                              "raise --kvflash\n", N, kvflash_tokens_);
-        result.error = "kvflash: prompt exceeds resident pool";
+        result.fail(GenerateErrorCode::ContextOverflow);
         return result;
     }
 
@@ -2727,12 +2730,12 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
     if (kvflash_active()) {
         kvflash_pager_.reset();
         if (!kvflash_alloc_span(0, N)) {
-            result.error = "kvflash_slot";
+            result.fail(GenerateErrorCode::BackendSpecific, "kvflash_slot");
             return result;
         }
     }
     if (!ensure_moe_expert_compute()) {
-        result.error = "moe_expert_compute";
+        result.fail(GenerateErrorCode::BackendSpecific, "moe_expert_compute");
         return result;
     }
 
@@ -2743,7 +2746,7 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
 
     std::vector<float> embed_all((size_t)N * (size_t)hidden);
     if (!w_.embedder.embed(req.prompt.data(), N, embed_all.data())) {
-        result.error = "embed_prefill";
+        result.fail(GenerateErrorCode::BackendSpecific, "embed_prefill");
         return result;
     }
 
@@ -2764,7 +2767,7 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
             step_graph_free(prefill_sg);  // reset ctx/graph but keep gallocr buffer
             if (!build_laguna_layer_prefn_step(prefill_sg, w_, cache_, backend_,
                                                il, chunk_start, chunk_len)) {
-                result.error = "prefill_build";
+                result.fail(GenerateErrorCode::BackendSpecific, "prefill_build");
                 step_graph_destroy(prefill_sg);
                 if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
                 if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
@@ -2800,7 +2803,7 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
             // Compute pre-FFN graph
             auto st = ggml_backend_graph_compute(backend_, prefill_sg.gf);
             if (st != GGML_STATUS_SUCCESS) {
-                result.error = "prefill_compute";
+                result.fail(GenerateErrorCode::BackendSpecific, "prefill_compute");
                 step_graph_destroy(prefill_sg);
                 if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
                 if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
@@ -2829,7 +2832,8 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
 
                 ggml_tensor * sel_tensor = prefill_sg.moe_selected.empty() ? nullptr : prefill_sg.moe_selected[0];
                 if (!sel_tensor || !prefill_sg.moe_weights) {
-                    result.error = "prefill_router_outputs";
+                    result.fail(GenerateErrorCode::BackendSpecific,
+                                     "prefill_router_outputs");
                     step_graph_destroy(prefill_sg);
                     if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
                     if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
@@ -2867,6 +2871,7 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
                 const MoeExpertLayer * expert_layer =
                     expert_runtime_.layer_ptr((size_t)il);
                 std::vector<float> ffn_batch_out;
+                std::string ffn_error;
                 bool ffn_ok = false;
 
                 if (storage.cold_expert_ids.empty()) {
@@ -2876,7 +2881,7 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
                             chunk_post.data(),
                             chunk_selected.data(),
                             chunk_weights.data(),
-                            chunk_len, ffn_batch_out, &result.error,
+                            chunk_len, ffn_batch_out, &ffn_error,
                             &ffn_hot_alloc, &ffn_cold_alloc,
                             expert_compute, expert_layer);
                 } else if (storage.all_routed_are_hot(chunk_selected.data(),
@@ -2887,7 +2892,7 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
                             chunk_post.data(),
                             chunk_selected.data(),
                             chunk_weights.data(),
-                            chunk_len, ffn_batch_out, &result.error,
+                            chunk_len, ffn_batch_out, &ffn_error,
                             &ffn_hot_alloc);
                 } else if (moe_hybrid_->has_mmap() &&
                            !moe_hybrid_->layer_regions.empty() &&
@@ -2905,7 +2910,7 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
                             chunk_post.data(),
                             chunk_selected.data(),
                             chunk_weights.data(),
-                            chunk_len, ffn_batch_out, &result.error,
+                            chunk_len, ffn_batch_out, &ffn_error,
                             &ffn_hot_alloc, &ffn_cold_alloc,
                             expert_compute, expert_layer);
                 } else {
@@ -2915,12 +2920,14 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
                             chunk_post.data(),
                             chunk_selected.data(),
                             chunk_weights.data(),
-                            chunk_len, ffn_batch_out, &result.error,
+                            chunk_len, ffn_batch_out, &ffn_error,
                             &ffn_hot_alloc, &ffn_cold_alloc,
                             expert_compute, expert_layer);
                 }
 
                 if (!ffn_ok) {
+                    result.fail(GenerateErrorCode::BackendSpecific,
+                                     std::move(ffn_error));
                     step_graph_destroy(prefill_sg);
                     if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
                     if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
@@ -2965,7 +2972,8 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
         if (!ggml_gallocr_alloc_graph(alloc, gf)) {
             ggml_gallocr_free(alloc);
             ggml_free(ctx);
-            result.error = "prefill_logits_alloc";
+            result.fail(GenerateErrorCode::BackendSpecific,
+                             "prefill_logits_alloc");
             return result;
         }
         // Set last token's hidden state
@@ -2975,7 +2983,8 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
         if (ggml_backend_graph_compute(backend_, gf) != GGML_STATUS_SUCCESS) {
             ggml_gallocr_free(alloc);
             ggml_free(ctx);
-            result.error = "prefill_logits_compute";
+            result.fail(GenerateErrorCode::BackendSpecific,
+                             "prefill_logits_compute");
             return result;
         }
         last_logits.resize((size_t)w_.embedder.n_vocab);
@@ -3052,7 +3061,7 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
         // Hybrid forward: one token through all layers
         int32_t argmax_tok = 0;
         if (!hybrid_forward_one_token(next_tok, cache_.cur_pos, act_cur, argmax_tok)) {
-            result.error = "decode";
+            result.fail(GenerateErrorCode::DecodeFailed);
             break;
         }
         cache_.cur_pos++;
@@ -3071,7 +3080,9 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
     result.decode_s = std::chrono::duration<double>(t_g1 - t_g0).count();
 
     if (should_emit) out_io.emit(-1);
-    result.ok = (result.error.empty());
+    if (result.error && result.error->code == GenerateErrorCode::Incomplete) {
+        result.succeed();
+    }
     return result;
 }
 

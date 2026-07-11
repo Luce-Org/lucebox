@@ -741,7 +741,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                                           const DaemonIO & io) {
     if (!target_weights().moe_hybrid) {
         auto result = Qwen35Backend::generate_impl(req, io);
-        if (result.ok) maybe_post_request_swap();
+        if (result.ok()) maybe_post_request_swap();
         return result;
     }
 
@@ -801,7 +801,8 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
     if (!ensure_pipelined_moe_expert_compute(*pipe_state_, target_weights(),
                                            cfg_.target_path,
                                            *target_weights().moe_hybrid)) {
-        result.error = "moe_expert_compute_init";
+        result.fail(GenerateErrorCode::BackendSpecific,
+                         "moe_expert_compute_init");
         cleanup_graphs();
         return result;
     }
@@ -861,7 +862,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
         std::fprintf(stderr,
             "[kvflash] hybrid prompt (%d) exceeds pool %d; raise --kvflash "
             "or enable pflash compression\n", prompt_len, kvflash_tokens_);
-        result.error = "kvflash: prompt exceeds resident pool";
+        result.fail(GenerateErrorCode::ContextOverflow);
         cleanup_graphs();
         return result;
     }
@@ -872,7 +873,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
     for (int i = 0; i < prompt_len; ++i) {
         int32_t tok = req.prompt[(size_t)i];
         if (!target_weights().embedder.embed(&tok, 1, embed_all.data() + (size_t)i * (size_t)hidden)) {
-            result.error = "prefill_embed";
+            result.fail(GenerateErrorCode::BackendSpecific, "prefill_embed");
             cleanup_graphs();
             return result;
         }
@@ -903,7 +904,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             if (!build_layer_prefn_step(prefill_sg, target_weights(), target_cache(), target_backend(),
                                         il, /*kv_start=*/chunk_start, /*n_tokens=*/chunk_len,
                                         with_mask, /*fa_window=*/0, cfg_.kq_stride_pad)) {
-                result.error = "prefill_build";
+                result.fail(GenerateErrorCode::BackendSpecific, "prefill_build");
                 step_graph_destroy(prefill_sg);
                 if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
                 if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
@@ -945,7 +946,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             // Compute batched pre-FFN
             auto st = ggml_backend_graph_compute(target_backend(), prefill_sg.gf);
             if (st != GGML_STATUS_SUCCESS) {
-                result.error = "prefill_compute";
+                result.fail(GenerateErrorCode::BackendSpecific, "prefill_compute");
                 step_graph_destroy(prefill_sg);
                 if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
                 if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
@@ -969,7 +970,8 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                 ? prefill_sg.moe_selected[(size_t)il]
                 : nullptr;
             if (!layer_selected || !prefill_sg.moe_weights) {
-                result.error = "prefill_router_outputs";
+                result.fail(GenerateErrorCode::BackendSpecific,
+                                 "prefill_router_outputs");
                 step_graph_destroy(prefill_sg);
                 cleanup_graphs();
                 return result;
@@ -1023,18 +1025,18 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                                                     regions, cold_ids_copy.data(),
                                                     (int)cold_ids_copy.size());
             }
+            std::string ffn_error;
             bool ffn_ok = eval_moe_hybrid_ffn_batched(
                     target_backend(), cpu_be, chunk_cfg, chunk_desc, storage,
                     chunk_post.data(),
                     chunk_selected.data(),
                     chunk_weights.data(),
-                    chunk_len, ffn_batch_out, &result.error,
+                    chunk_len, ffn_batch_out, &ffn_error,
                     &ffn_hot_alloc, &ffn_cold_alloc,
                     expert_compute, expert_layer,
                     hybrid_telemetry_ ? &ffn_tel : nullptr);
             if (!ffn_ok) {
                 // Per-token fallback (avoids sm_75 mul_mat_id assertion with cold experts)
-                result.error.clear();
                 ffn_batch_out.assign((size_t)hidden * (size_t)chunk_len, 0.0f);
                 std::vector<float> single_out;
                 for (int ti = 0; ti < chunk_len; ++ti) {
@@ -1044,7 +1046,8 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                     if (!eval_moe_hybrid_ffn_single(
                             target_backend(), chunk_cfg, chunk_desc, storage, cpu_be,
                             tok_post, tok_sel, tok_wts, n_expert_used, single_out)) {
-                        result.error = "prefill_ffn_single";
+                        result.fail(GenerateErrorCode::BackendSpecific,
+                                         "prefill_ffn_single");
                         step_graph_destroy(prefill_sg);
                         if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
                         if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
@@ -1175,7 +1178,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
 
             // Get argmax from last prefill position for last_tok
             if (!compute_logits()) {
-                result.error = "decode_logits";
+                result.fail(GenerateErrorCode::BackendSpecific, "decode_logits");
                 cleanup_graphs();
                 return result;
             }
@@ -1189,20 +1192,21 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             cleanup_graphs();
             if (!do_hybrid_spec_decode(committed, req.n_gen, result.tokens, out_io,
                                        &result.accept_rate)) {
-                result.error = "hybrid_spec_decode";
+                result.fail(GenerateErrorCode::BackendSpecific,
+                                 "hybrid_spec_decode");
                 return result;
             }
         } else {
             // AR fallback decode — use pipelined path (cached DeltaNet + GPU-resident FFN)
             if (!ensure_pipe_state(committed)) {
-                result.error = "pipe_state_init";
+                result.fail(GenerateErrorCode::BackendSpecific, "pipe_state_init");
                 cleanup_graphs();
                 return result;
             }
 
             // Get logits from last prefill token (reuses persistent logits graph)
             if (!compute_logits()) {
-                result.error = "decode_logits";
+                result.fail(GenerateErrorCode::BackendSpecific, "decode_logits");
                 cleanup_graphs();
                 return result;
             }
@@ -1231,7 +1235,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                 for (int step = 1; step < req.n_gen; ++step) {
                     int32_t tok = result.tokens.back();
                     if (!target_weights().embedder.embed(&tok, 1, act_cur.data())) {
-                        result.error = "decode_embed";
+                        result.fail(GenerateErrorCode::BackendSpecific, "decode_embed");
                         cleanup_graphs();
                         return result;
                     }
@@ -1244,7 +1248,8 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                     if (kvflash_active()) {
                         kv_slot = kvflash_pager_.slot_for(committed);
                         if (kv_slot < 0) {
-                            result.error = "kvflash_slot";
+                            result.fail(GenerateErrorCode::BackendSpecific,
+                                             "kvflash_slot");
                             cleanup_graphs();
                             return result;
                         }
@@ -1258,7 +1263,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                                                     kv_slot,
                                                     /*capture_layers=*/false,
                                                     routing_stats_.get())) {
-                        result.error = "decode";
+                        result.fail(GenerateErrorCode::DecodeFailed);
                         cleanup_graphs();
                         return result;
                     }
@@ -1295,7 +1300,8 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
 
                     // act_cur stays on GPU — compute_logits reads it via GPU→GPU copy
                     if (!compute_logits(pipe_state_->gpu_state.act_cur)) {
-                        result.error = "decode_logits";
+                        result.fail(GenerateErrorCode::BackendSpecific,
+                                         "decode_logits");
                         cleanup_graphs();
                         return result;
                     }
@@ -1426,8 +1432,8 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                     ffn_tel_accum.hot_selected, ffn_tel_accum.cold_selected);
         std::fflush(stdout);
     }
-    result.ok = true;
-    if (result.ok) maybe_post_request_swap();
+    result.succeed();
+    if (result.ok()) maybe_post_request_swap();
     return result;
 }
 
@@ -1436,13 +1442,13 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
                                                       const DaemonIO & io) {
     if (!target_weights().moe_hybrid) {
         auto result = Qwen35Backend::restore_and_generate_impl(slot, req, io);
-        if (result.ok) maybe_post_request_swap();
+        if (result.ok()) maybe_post_request_swap();
         return result;
     }
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     if (slot < 0 || !snapshot_used(slot)) {
-        result.error = "bad slot";
+        result.fail(GenerateErrorCode::InvalidSnapshotSlot);
         out_io.emit(-1);
         return result;
     }
@@ -1469,7 +1475,7 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
     }
 
     if (!restore_target_cache_from_snapshot(slot)) {
-        result.error = "restore";
+        result.fail(GenerateErrorCode::BackendSpecific, "restore");
         out_io.emit(-1);
         return result;
     }
@@ -1480,7 +1486,8 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
 
     const int prompt_len = (int)req.prompt.size();
     if (prompt_len > 0 && prompt_len < snap_pos) {
-        result.error = "snapshot_longer_than_prompt";
+        result.fail(GenerateErrorCode::BackendSpecific,
+                         "snapshot_longer_than_prompt");
         out_io.emit(-1);
         return result;
     }
@@ -1493,7 +1500,7 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
         std::fprintf(stderr,
             "[kvflash] hybrid restore prompt (%d) exceeds pool %d; raise "
             "--kvflash\n", prompt_len, kvflash_tokens_);
-        result.error = "kvflash: prompt exceeds resident pool";
+        result.fail(GenerateErrorCode::ContextOverflow);
         out_io.emit(-1);
         return result;
     }
@@ -1504,7 +1511,7 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
     if (kvflash_active()) {
         kvflash_pager_.reset();
         if (!kvflash_pager_.alloc_span(0, snap_pos)) {
-            result.error = "kvflash_slot";
+            result.fail(GenerateErrorCode::BackendSpecific, "kvflash_slot");
             out_io.emit(-1);
             return result;
         }
@@ -1519,7 +1526,7 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
             int32_t argmax = -1;
             if (!hybrid_forward_one_token(req.prompt[(size_t)i], committed,
                                           act_cur, argmax)) {
-                result.error = "prefill_delta";
+                result.fail(GenerateErrorCode::BackendSpecific, "prefill_delta");
                 return result;
             }
             committed++;
@@ -1549,15 +1556,15 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
         }
         auto t_decode_start = std::chrono::steady_clock::now();
         if (!run_pipelined_decode_path(committed, req.n_gen, result.tokens, out_io)) {
-            result.error = "decode";
+            result.fail(GenerateErrorCode::DecodeFailed);
             return result;
         }
         result.decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
 
-    result.ok = true;
-    if (result.ok) maybe_post_request_swap();
+    result.succeed();
+    if (result.ok()) maybe_post_request_swap();
     return result;
 }
 

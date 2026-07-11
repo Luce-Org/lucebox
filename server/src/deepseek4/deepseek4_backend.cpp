@@ -670,13 +670,13 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
     // Prefill
     int committed = do_prefill(req.prompt, io);
     if (committed < 0) {
-        result.error = "prefill";
+        result.fail(GenerateErrorCode::PrefillFailed);
         return result;
     }
     result.prefill_s = elapsed_s(t0);
 
     if (req.n_gen <= 0) {
-        result.ok = true;
+        result.succeed();
         maybe_save_routing_stats();
         return result;
     }
@@ -689,11 +689,11 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
     bool forced_close = false;
     if (!do_decode(committed, req.n_gen, gen_tokens, io,
                    req.budget_hook, &forced_close)) {
-        result.error = "decode";
+        result.fail(GenerateErrorCode::DecodeFailed);
         return result;
     }
 
-    result.ok = true;
+    result.succeed();
     result.tokens = std::move(gen_tokens);
     result.decode_s = elapsed_s(t1);
     result.budget_forced_close = forced_close;
