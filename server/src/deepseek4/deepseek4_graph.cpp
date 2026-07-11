@@ -225,6 +225,11 @@ struct DeepSeek4F32ArrayBinding {
     std::vector<float>     values;
 };
 
+struct DeepSeek4F16ArrayBinding {
+    ggml_tensor *           tensor = nullptr;
+    std::vector<uint16_t>   values;
+};
+
 static ggml_tensor * build_rms_norm(ggml_context * ctx, ggml_tensor * x,
                                      ggml_tensor * weight, float eps);
 static ggml_tensor * build_clamped_swiglu(ggml_context * ctx,
@@ -1139,7 +1144,8 @@ static ggml_tensor * build_mla_attention(
         std::vector<DeepSeek4I32InputBinding> & i32_inputs,
         std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs,
         std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs,
-        std::vector<DeepSeek4F32ArrayBinding> * f32_array_inputs = nullptr) {
+        std::vector<DeepSeek4F32ArrayBinding> * f32_array_inputs = nullptr,
+        std::vector<DeepSeek4F16ArrayBinding> * f16_array_inputs = nullptr) {
 
     const int n_embd    = w.n_embd;
     const int head_dim  = w.head_dim;
@@ -1208,6 +1214,8 @@ static ggml_tensor * build_mla_attention(
     // (bidirectional) behavior for A/B comparison.
     const bool causal_batch = (n_tokens > 1) && !cached_inputs && f32_array_inputs &&
                               !ds4_env_flag("DFLASH_DS4_NO_CAUSAL_VERIFY");
+    const bool use_flash_prefill = causal_batch && f16_array_inputs &&
+                                   !ds4_env_flag("DFLASH_DS4_CHUNKED_PREFILL");
     ggml_tensor * old_rows_scratch = nullptr;
     int n_old_rows = 0;
     const bool fused_causal = cached_inputs && cached_inputs->attn_row_mask && n_tokens > 1;
@@ -1386,33 +1394,16 @@ static ggml_tensor * build_mla_attention(
     }
     // kv_attn: [head_dim, n_attn]
 
-    // Flatten q to [head_dim, n_head*n_tokens] for batched matmul
-    ggml_tensor * q_flat = ggml_reshape_2d(ctx, q, head_dim, n_head * n_tokens);
-
-    // Scores: mul_mat(kv_attn, q_flat) = kv_attn^T[n_attn, head_dim] @ q_flat[head_dim, n_head*n_tokens]
-    //       → [n_attn, n_head*n_tokens]
-    ggml_tensor * scores = ggml_mul_mat(ctx, kv_attn, q_flat);
-    scores = ggml_scale(ctx, scores, kq_scale);
-    if (masked_kv && n_tokens > 1) {
-        // Per-token causal mask [n_attn, n_tokens] from the host-filled bundle.
-        ggml_tensor * m3 = ggml_reshape_3d(ctx, cached_inputs->attn_row_mask, n_attn, 1, n_tokens);
-        ggml_tensor * scores3d = ggml_reshape_3d(ctx, scores, n_attn, n_head, n_tokens);
-        scores3d = ggml_add(ctx, scores3d, m3);
-        scores = ggml_reshape_2d(ctx, scores3d, n_attn, n_head * n_tokens);
-    } else if (masked_kv) {
-        // Broadcast-add the [n_attn,1] additive mask across all query columns.
-        scores = ggml_add(ctx, scores, cached_inputs->attn_row_mask);
-    } else if (causal_batch) {
-        // Per-token causal mask over [ring rows | comp rows | old rows].
-        ggml_tensor * cmask = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_attn, 1, n_tokens);
-        ggml_set_input(cmask);
-        std::vector<float> mvals((size_t) n_attn * n_tokens, 0.0f);
+    std::vector<float> causal_mask_values;
+    if (causal_batch) {
+        // Per-token causal visibility over [ring rows | comp rows | old rows].
+        causal_mask_values.assign((size_t) n_attn * n_tokens, 0.0f);
         const int e = kv_start + n_tokens;            // exclusive end position
         for (int i = 0; i < n_tokens; i++) {
             const int pos_i = kv_start + i;
-            float * col = mvals.data() + (size_t) i * n_attn;
+            float * col = causal_mask_values.data() + (size_t) i * n_attn;
             for (int r = 0; r < n_raw; r++) {
-                // position held by ring slot r AFTER this batch's writes
+                // Position held by ring slot r after this batch's writes.
                 const int p_r = (e <= w.n_swa) ? r
                               : (e - 1) - ((e - 1 - r) % w.n_swa);
                 if (p_r > pos_i) col[r] = -1e30f;
@@ -1421,8 +1412,8 @@ static ggml_tensor * build_mla_attention(
                 const int vis = ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, pos_i);
                 for (int c = vis; c < n_comp_attn; c++) col[n_raw + c] = -1e30f;
             }
-            // old contents of slot overwritten by batch token j are visible
-            // exactly to tokens i < j (still inside their SWA window)
+            // Old contents of slot overwritten by batch token j are visible
+            // exactly to tokens i < j while they remain in the SWA window.
             int oi = 0;
             for (int tj = 0; tj < n_tokens; tj++) {
                 if (kv_start + tj < w.n_swa) continue;
@@ -1430,39 +1421,71 @@ static ggml_tensor * build_mla_attention(
                 oi++;
             }
         }
-        f32_array_inputs->push_back({cmask, std::move(mvals)});
-        ggml_tensor * scores3d = ggml_reshape_3d(ctx, scores, n_attn, n_head, n_tokens);
-        scores3d = ggml_add(ctx, scores3d, cmask);
-        scores = ggml_reshape_2d(ctx, scores3d, n_attn, n_head * n_tokens);
     }
     (void) n_valid_raw;
 
-    // Sink-aware softmax: DS4 adds one learned per-head sink logit to the
-    // denominator, but the sink contributes no value vector.
-    ggml_tensor * probs = nullptr;
-    if (L.attn_sinks) {
-        ggml_tensor * sink_scores = ggml_reshape_2d(ctx, L.attn_sinks, 1, n_head);
-        if (n_tokens > 1) {
-            ggml_tensor * sink_shape = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_head * n_tokens);
-            sink_scores = ggml_repeat(ctx, sink_scores, sink_shape);
+    ggml_tensor * context = nullptr;
+    if (use_flash_prefill) {
+        ggml_tensor * flash_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_attn, n_tokens);
+        ggml_set_input(flash_mask);
+        constexpr uint16_t kF16Zero = 0x0000;
+        constexpr uint16_t kF16NegInf = 0xfc00;
+        std::vector<uint16_t> flash_mask_values(causal_mask_values.size(), kF16Zero);
+        for (size_t i = 0; i < causal_mask_values.size(); ++i) {
+            if (causal_mask_values[i] < 0.0f) flash_mask_values[i] = kF16NegInf;
         }
-        ggml_tensor * scores_with_sink = ggml_concat(ctx, scores, sink_scores, 0);
-        ggml_tensor * probs_with_sink = ggml_soft_max(ctx, scores_with_sink);
-        probs = ggml_view_2d(ctx, probs_with_sink, n_attn, n_head * n_tokens,
-                             probs_with_sink->nb[1], 0);
+        f16_array_inputs->push_back({flash_mask, std::move(flash_mask_values)});
+
+        ggml_tensor * q_flash = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+        ggml_tensor * kv_flash = ggml_cont(ctx, kv_attn);
+        kv_flash = ggml_reshape_3d(ctx, kv_flash, head_dim, n_attn, 1);
+        context = ggml_flash_attn_ext(ctx, q_flash, kv_flash, kv_flash, flash_mask,
+                                      kq_scale, 0.0f, 0.0f);
+        if (L.attn_sinks) {
+            ggml_flash_attn_ext_add_sinks(context, L.attn_sinks);
+        }
     } else {
-        probs = ggml_soft_max(ctx, scores);
+        // Flatten q to [head_dim, n_head*n_tokens] for batched matmul.
+        ggml_tensor * q_flat = ggml_reshape_2d(ctx, q, head_dim, n_head * n_tokens);
+        ggml_tensor * scores = ggml_mul_mat(ctx, kv_attn, q_flat);
+        scores = ggml_scale(ctx, scores, kq_scale);
+        if (masked_kv && n_tokens > 1) {
+            ggml_tensor * m3 = ggml_reshape_3d(ctx, cached_inputs->attn_row_mask, n_attn, 1, n_tokens);
+            ggml_tensor * scores3d = ggml_reshape_3d(ctx, scores, n_attn, n_head, n_tokens);
+            scores3d = ggml_add(ctx, scores3d, m3);
+            scores = ggml_reshape_2d(ctx, scores3d, n_attn, n_head * n_tokens);
+        } else if (masked_kv) {
+            scores = ggml_add(ctx, scores, cached_inputs->attn_row_mask);
+        } else if (causal_batch) {
+            ggml_tensor * cmask = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_attn, 1, n_tokens);
+            ggml_set_input(cmask);
+            f32_array_inputs->push_back({cmask, std::move(causal_mask_values)});
+            ggml_tensor * scores3d = ggml_reshape_3d(ctx, scores, n_attn, n_head, n_tokens);
+            scores3d = ggml_add(ctx, scores3d, cmask);
+            scores = ggml_reshape_2d(ctx, scores3d, n_attn, n_head * n_tokens);
+        }
+
+        // Sink-aware softmax: DS4 adds one learned per-head sink logit to the
+        // denominator, but the sink contributes no value vector.
+        ggml_tensor * probs = nullptr;
+        if (L.attn_sinks) {
+            ggml_tensor * sink_scores = ggml_reshape_2d(ctx, L.attn_sinks, 1, n_head);
+            if (n_tokens > 1) {
+                ggml_tensor * sink_shape = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_head * n_tokens);
+                sink_scores = ggml_repeat(ctx, sink_scores, sink_shape);
+            }
+            ggml_tensor * scores_with_sink = ggml_concat(ctx, scores, sink_scores, 0);
+            ggml_tensor * probs_with_sink = ggml_soft_max(ctx, scores_with_sink);
+            probs = ggml_view_2d(ctx, probs_with_sink, n_attn, n_head * n_tokens,
+                                 probs_with_sink->nb[1], 0);
+        } else {
+            probs = ggml_soft_max(ctx, scores);
+        }
+
+        ggml_tensor * kv_T = ggml_cont(ctx, ggml_transpose(ctx, kv_attn));
+        context = ggml_mul_mat(ctx, kv_T, probs);
+        context = ggml_reshape_3d(ctx, context, head_dim, n_head, n_tokens);
     }
-    // probs: [n_attn, n_head*n_tokens]
-
-    // Context: kv_T^T[head_dim, n_attn] @ probs[n_attn, n_head*n_tokens] → [head_dim, n_head*n_tokens]
-    // i.e. mul_mat(kv_T, probs) where kv_T = cont(transpose(kv_attn)) = [n_raw, head_dim]
-    ggml_tensor * kv_T = ggml_cont(ctx, ggml_transpose(ctx, kv_attn));
-    ggml_tensor * context = ggml_mul_mat(ctx, kv_T, probs);
-    // context: [head_dim, n_head*n_tokens]
-
-    // Reshape back to [head_dim, n_head, n_tokens]
-    context = ggml_reshape_3d(ctx, context, head_dim, n_head, n_tokens);
 
     // ── Inverse tail RoPE on attention output ───────────────────────
     ggml_tensor * neg_pos = cached_inputs ? cached_inputs->neg_pos : nullptr;
@@ -4856,6 +4879,7 @@ bool deepseek4_step_layer_range(
                 std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
                 std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
                 std::vector<DeepSeek4F32ArrayBinding> f32_array_inputs;
+                std::vector<DeepSeek4F16ArrayBinding> f16_array_inputs;
                 const size_t graph_size = ds4_attn_step_graph_size(n_tokens);
                 gf = ggml_new_graph_custom(ctx, graph_size, false);
 
@@ -4863,7 +4887,8 @@ bool deepseek4_step_layer_range(
                 attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
                                                kv_start, n_tokens, nullptr,
                                                i32_inputs, i32_array_inputs,
-                                               i64_array_inputs, &f32_array_inputs);
+                                               i64_array_inputs, &f32_array_inputs,
+                                               &f16_array_inputs);
                 ggml_set_output(attn_out);
                 ggml_build_forward_expand(gf, attn_out);
 
@@ -4893,6 +4918,8 @@ bool deepseek4_step_layer_range(
                     ggml_backend_tensor_set(b.tensor, b.values.data(), 0, sizeof(int64_t) * b.values.size());
                 for (const auto & b : f32_array_inputs)
                     ggml_backend_tensor_set(b.tensor, b.values.data(), 0, sizeof(float) * b.values.size());
+                for (const auto & b : f16_array_inputs)
+                    ggml_backend_tensor_set(b.tensor, b.values.data(), 0, sizeof(uint16_t) * b.values.size());
             }
 
             const auto attn_compute_t0 = Ds4TimingClock::now();

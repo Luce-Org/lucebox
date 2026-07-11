@@ -33,6 +33,13 @@ static bool env_flag_enabled(const char * name) {
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
+static int env_positive_int(const char * name) {
+    const char * value = std::getenv(name);
+    if (!value || !value[0]) return 0;
+    const long parsed = std::strtol(value, nullptr, 10);
+    return parsed > 0 && parsed <= INT32_MAX ? (int) parsed : 0;
+}
+
 static double gib(uint64_t bytes) {
     return (double) bytes / 1024.0 / 1024.0 / 1024.0;
 }
@@ -319,25 +326,22 @@ bool DeepSeek4Backend::init() {
 
     snap_backend_ = ggml_backend_init_by_name("cpu", nullptr);
 
-    const PlacementBackend target_backend =
-        cfg_.device.backend == PlacementBackend::Auto
-            ? compiled_placement_backend()
-            : cfg_.device.backend;
+    const bool force_hybrid = env_flag_enabled("DFLASH_DEEPSEEK4_FORCE_HYBRID");
+    if (force_hybrid) {
+        std::fprintf(stderr, "[deepseek4] force hybrid mode requested; skipping full model load\n");
+    }
 
-    // HIP single-device launches should avoid the monolithic full-model load:
-    // a managed ~80 GiB allocation can stall or be killed on integrated UMA
-    // systems before we ever reach the existing OOM fallback path.
-    if (target_backend == PlacementBackend::Hip) {
-        std::fprintf(stderr,
-                     "[deepseek4] HIP target detected; using hybrid expert load path\n");
-        if (!init_hybrid_model()) {
-            std::fprintf(stderr, "[deepseek4] hybrid mode failed: %s\n", cfg_.model_path);
-            return false;
-        }
-    } else if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
+    // On UMA, a monolithic managed allocation keeps all routed experts local.
+    // Preserve the hybrid loader as the OOM fallback and as an explicit override.
+    if (!force_hybrid && !load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
         std::fprintf(stderr, "[deepseek4] full model load failed, trying hybrid mode...\n");
         if (!init_hybrid_model()) {
             std::fprintf(stderr, "[deepseek4] hybrid mode also failed: %s\n", cfg_.model_path);
+            return false;
+        }
+    } else if (force_hybrid) {
+        if (!init_hybrid_model()) {
+            std::fprintf(stderr, "[deepseek4] forced hybrid mode failed: %s\n", cfg_.model_path);
             return false;
         }
     }
@@ -561,6 +565,11 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     // semantics at any length; chunked stays available via
     // DFLASH_DS4_CHUNKED_PREFILL=1 for short-prompt benchmarking only.
     const bool unsafe_chunked = env_flag_enabled("DFLASH_DS4_CHUNKED_PREFILL");
+    const bool causal_flash_prefill = !moe_hybrid_ && !unsafe_chunked;
+    const int requested_flash_chunk = env_positive_int("DFLASH_DS4_FLASH_PREFILL_CHUNK");
+    const int flash_prefill_chunk = causal_flash_prefill
+        ? std::min(requested_flash_chunk > 0 ? requested_flash_chunk : 128, w_.n_swa)
+        : 0;
     const int chunk = (moe_hybrid_ || !unsafe_chunked) ? 1 : (cfg_.chunk > 0 ? cfg_.chunk : 512);
     const int n_total = (int)tokens.size();
     int pos = kv_offset;
@@ -571,6 +580,11 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     // request on can drift by a token or two.
     if (kv_offset == 0 && cache_.buf) {
         ggml_backend_buffer_clear(cache_.buf, 0);
+        cache_.cur_pos = 0;
+        for (auto & layer : cache_.layers) {
+            layer.n_comp = 0;
+            layer.n_index_comp = 0;
+        }
     }
     last_logits_.clear();
     if (spec_enabled_ && kv_offset == 0) spec_feat_window_.clear();
@@ -579,10 +593,13 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     DeepSeek4StepTelemetry tel_acc;
     int steps = 0;
 
-    for (int i = 0; i < n_total; i += chunk) {
+    for (int i = 0; i < n_total;) {
         if (io.cancelled) return pos;
 
-        const int n_tok = std::min(chunk, n_total - i);
+        int n_tok = std::min(chunk, n_total - i);
+        if (flash_prefill_chunk > 1) {
+            n_tok = std::min(flash_prefill_chunk, n_total - i);
+        }
 
         // Embed tokens
         std::vector<float> embed(w_.n_embd * n_tok);
@@ -636,6 +653,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
         last_logits_ = std::move(logits);
         pos += n_tok;
+        i += n_tok;
     }
     if (timing) {
         log_step_tel("prefill", n_total, steps, elapsed_s(phase_t0), tel_acc);

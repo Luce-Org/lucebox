@@ -36,6 +36,7 @@ __global__ static void ds4_flash_attn_d512_f32_shared_kv_kernel(
         const float * q,
         const float * k,
         const float * v,
+        const __half * mask,
         const float * sinks,
         int           n_tokens,
         int           n_heads,
@@ -58,7 +59,7 @@ __global__ static void ds4_flash_attn_d512_f32_shared_kv_kernel(
         for (int d = 0; d < D; ++d) {
             dot += qh[d] * kr[d];
         }
-        const float s = dot * scale;
+        const float s = dot * scale + __half2float(mask[(size_t) t * n_kv + r]);
         scores[r] = s;
         local_max = fmaxf(local_max, s);
     }
@@ -86,17 +87,14 @@ __global__ static void ds4_flash_attn_d512_f32_shared_kv_kernel(
 }
 
 static bool ggml_cuda_ds4_flash_attn_d512_f32(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const char * e = getenv("DFLASH_DS4_FLASH_ATTN");
-    if (!e || !e[0] || e[0] == (char)48) {
-        return false;
-    }
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
-    if (!Q || !K || !V || mask ||
+    if (!Q || !K || !V || !mask ||
         Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F32 || V->type != GGML_TYPE_F32 ||
+        mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(mask) ||
         dst->type != GGML_TYPE_F32 ||
         Q->ne[0] != 512 || K->ne[0] != 512 || V->ne[0] != 512 ||
         K->ne[2] != 1 || V->ne[2] != 1 ||
@@ -105,7 +103,8 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(ggml_backend_cuda_context & ctx, g
         Q->nb[0] != (int64_t) sizeof(float) ||
         K->nb[0] != (int64_t) sizeof(float) ||
         V->nb[0] != (int64_t) sizeof(float) ||
-        dst->nb[0] != (int64_t) sizeof(float)) {
+        dst->nb[0] != (int64_t) sizeof(float) ||
+        mask->ne[0] != K->ne[1] || mask->ne[1] != Q->ne[1]) {
         return false;
     }
     if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->ne[0] != Q->ne[2])) {
@@ -127,6 +126,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(ggml_backend_cuda_context & ctx, g
             (const float *) Q->data,
             (const float *) K->data,
             (const float *) V->data,
+            (const __half *) mask->data,
             sinks ? (const float *) sinks->data : nullptr,
             n_tokens,
             n_heads,
@@ -481,11 +481,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             }
         }
     }
-    static const bool ds4_allow_d512_nomask = [] {
-        const char * e = getenv("DFLASH_DS4_FLASH_ATTN");
-        return e && e[0] && e[0] != (char)48;
-    }();
-
     const int cc = ggml_cuda_info().devices[device].cc;
 
     switch (K->ne[0]) {
@@ -503,9 +498,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             break;
         case 512:
             if (V->ne[0] != K->ne[0]) {
-                return BEST_FATTN_KERNEL_NONE;
-            }
-            if (!gqa_opt_applies && !ds4_allow_d512_nomask) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
