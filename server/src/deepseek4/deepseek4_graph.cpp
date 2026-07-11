@@ -3707,18 +3707,20 @@ static bool load_tensor_to_f16_cpu(std::vector<uint16_t> & dst, ggml_tensor * t)
     return true;
 }
 
-static void load_hc_weights_cpu(HcWeightsCpu & dst, ggml_tensor * fn,
-                                 ggml_tensor * scale, ggml_tensor * base) {
-    if (!fn || !scale || !base || dst.loaded) return;
+static bool load_hc_weights_cpu(HcWeightsCpu & dst, ggml_tensor * fn,
+                                ggml_tensor * scale, ggml_tensor * base) {
+    if (dst.loaded) return true;
+    if (!fn || !scale || !base) return false;
     if (!load_tensor_to_f16_cpu(dst.fn_data, fn) ||
         !load_tensor_to_f32_cpu(dst.scale_data, scale) ||
         !load_tensor_to_f32_cpu(dst.base_data, base)) {
         dst.fn_data.clear();
         dst.scale_data.clear();
         dst.base_data.clear();
-        return;
+        return false;
     }
     dst.loaded = true;
+    return true;
 }
 
 static void reset_hc_weights_cpu(HcWeightsCpu & w) {
@@ -4352,9 +4354,15 @@ struct DeepSeek4FusedDecodeCache {
     }
 };
 
-struct DeepSeek4LayerRangeRuntime {
+struct DeepSeek4LayerRangeCache {
+    ~DeepSeek4LayerRangeCache() { reset(); }
+
+    const DeepSeek4Weights * owner_weights = nullptr;
     const ggml_context * owner_ctx = nullptr;
-    int loaded_n_layer = 0;
+    ggml_backend_t backend = nullptr;
+    int layer_begin = -1;
+    int layer_end = -1;
+    bool owns_output = false;
     std::vector<HcLayerWeightsCpu> hc_layer_weights;
     HcWeightsCpu hc_output_weights;
     std::vector<HashRoutingTableCpu> hash_routing_tables;
@@ -4370,7 +4378,20 @@ struct DeepSeek4LayerRangeRuntime {
     Ds4DecodeSharedInputs decode_shared_inputs;
     DeepSeek4LayerRangeScratch scratch;
 
-    void destroy() {
+    bool matches(const DeepSeek4Weights & w,
+                 ggml_backend_t candidate_backend,
+                 int candidate_begin,
+                 int candidate_end,
+                 bool candidate_owns_output) const {
+        return owner_weights == &w &&
+               owner_ctx == w.ctx &&
+               backend == candidate_backend &&
+               layer_begin == candidate_begin &&
+               layer_end == candidate_end &&
+               owns_output == candidate_owns_output;
+    }
+
+    void reset() {
         for (auto & alloc : cached_attn_allocs) {
             alloc.free();
         }
@@ -4403,12 +4424,14 @@ struct DeepSeek4LayerRangeRuntime {
         hash_routing_tables.clear();
         hash_routing_tables.shrink_to_fit();
         scratch.clear();
-        loaded_n_layer = 0;
+        owner_weights = nullptr;
         owner_ctx = nullptr;
+        backend = nullptr;
+        layer_begin = -1;
+        layer_end = -1;
+        owns_output = false;
     }
 };
-
-static thread_local DeepSeek4LayerRangeRuntime ds4_layer_range_runtime;
 
 static ggml_tensor * ds4_fused_hc_base_f32(ggml_context * ctx, ggml_tensor * base) {
     if (!base) return nullptr;
@@ -5197,9 +5220,6 @@ void deepseek4_release_runtime_graphs(const DeepSeek4Weights & w) {
         ds4_layer_major_meta_arena.shrink_to_fit();
         ds4_layer_major_meta_owner = nullptr;
     }
-    if (ds4_layer_range_runtime.owner_ctx == owner) {
-        ds4_layer_range_runtime.destroy();
-    }
     if (ds4_hybrid_runtime.owner_ctx == owner) {
         ds4_hybrid_runtime.destroy();
     }
@@ -5693,6 +5713,95 @@ static int ds4_try_layer_major_prefill(
     return out_logits.empty() ? -1 : 1;
 }
 
+static bool ds4_hc_layer_weights_ready(const HcWeightsCpu & weights,
+                                       int n_embd,
+                                       int n_hc) {
+    const size_t hc_dim = (size_t)n_embd * (size_t)n_hc;
+    const size_t mix_dim = (size_t)(2 * n_hc + n_hc * n_hc);
+    return weights.loaded &&
+           weights.fn_data.size() >= hc_dim * mix_dim &&
+           weights.scale_data.size() >= 3 &&
+           weights.base_data.size() >= mix_dim;
+}
+
+static bool ds4_hc_output_weights_ready(const HcWeightsCpu & weights,
+                                        int n_embd,
+                                        int n_hc) {
+    const size_t hc_dim = (size_t)n_embd * (size_t)n_hc;
+    return weights.loaded &&
+           weights.fn_data.size() >= hc_dim * (size_t)n_hc &&
+           !weights.scale_data.empty() &&
+           weights.base_data.size() >= (size_t)n_hc;
+}
+
+static bool initialize_layer_range_cache(
+        DeepSeek4LayerRangeCache & runtime,
+        ggml_backend_t backend,
+        const DeepSeek4Weights & w,
+        int layer_begin,
+        int layer_end,
+        bool owns_output) {
+    runtime.reset();
+    if (layer_begin < 0 || layer_end < layer_begin || layer_end > w.n_layer) {
+        std::fprintf(stderr,
+                     "[deepseek4] invalid HC cache layer range [%d,%d) for %d layers\n",
+                     layer_begin, layer_end, w.n_layer);
+        return false;
+    }
+
+    runtime.hc_layer_weights.resize((size_t)w.n_layer);
+    runtime.hash_routing_tables.assign((size_t)w.n_layer, {});
+    runtime.cached_attn_allocs.assign((size_t)w.n_layer, {});
+    runtime.cached_decode_attn_hc_pre_graphs.assign((size_t)w.n_layer, {});
+    runtime.cached_decode_ffn_hc_pre_graphs.assign((size_t)w.n_layer, {});
+    runtime.cached_decode_attn_graphs.assign((size_t)w.n_layer, {});
+    runtime.cached_decode_ffn_graphs.assign((size_t)w.n_layer, {});
+
+    for (int il = layer_begin; il < layer_end; ++il) {
+        const DeepSeek4Layer & layer = w.layers[(size_t)il];
+        HcLayerWeightsCpu & cached = runtime.hc_layer_weights[(size_t)il];
+        const bool attn_loaded = load_hc_weights_cpu(
+            cached.attn, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base);
+        const bool ffn_loaded = load_hc_weights_cpu(
+            cached.ffn, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base);
+        if (!attn_loaded || !ds4_hc_layer_weights_ready(cached.attn, w.n_embd, w.n_hc)) {
+            std::fprintf(stderr,
+                         "[deepseek4] missing or invalid HC attention weights for layer %d\n", il);
+            runtime.reset();
+            return false;
+        }
+        if (!ffn_loaded || !ds4_hc_layer_weights_ready(cached.ffn, w.n_embd, w.n_hc)) {
+            std::fprintf(stderr,
+                         "[deepseek4] missing or invalid HC FFN weights for layer %d\n", il);
+            runtime.reset();
+            return false;
+        }
+        if (il < w.n_hash_layer && layer.ffn_gate_tid2eid) {
+            load_hash_routing_cpu(runtime.hash_routing_tables[(size_t)il],
+                                  layer.ffn_gate_tid2eid);
+        }
+    }
+
+    if (owns_output) {
+        if (!load_hc_weights_cpu(runtime.hc_output_weights,
+                                 w.output_hc_fn,
+                                 w.output_hc_scale,
+                                 w.output_hc_base) ||
+            !ds4_hc_output_weights_ready(runtime.hc_output_weights, w.n_embd, w.n_hc)) {
+            std::fprintf(stderr, "[deepseek4] missing or invalid HC output weights\n");
+            runtime.reset();
+            return false;
+        }
+    }
+
+    runtime.owner_weights = &w;
+    runtime.owner_ctx = w.ctx;
+    runtime.backend = backend;
+    runtime.layer_begin = layer_begin;
+    runtime.layer_end = layer_end;
+    runtime.owns_output = owns_output;
+    return true;
+}
 
 bool deepseek4_step_layer_range(
         ggml_backend_t backend,
@@ -5803,9 +5912,9 @@ bool deepseek4_step_layer_range(
     //   separate buffer (IPC daemon). Detect the alias before any resize, which
     //   would invalidate embed.
     const size_t hc_state_elems = (size_t)hc_dim * (size_t)n_tokens;
-    const bool boundary_in_place = embed != nullptr && embed == hc_state.data();
+    const bool embed_points_to_hc_state = embed != nullptr && embed == hc_state.data();
     if (hc_state.size() != hc_state_elems) {
-        if (boundary_in_place) {
+        if (embed_points_to_hc_state) {
             std::fprintf(stderr,
                          "[deepseek4] HC boundary state size mismatch for layer range [%d,%d): "
                          "have %zu want %zu\n",
@@ -5829,78 +5938,40 @@ bool deepseek4_step_layer_range(
                          layer_begin, layer_end);
             return false;
         }
-        if (!boundary_in_place) {
+        if (!embed_points_to_hc_state) {
             memcpy(hc_state.data(), embed, sizeof(float) * hc_state_elems);
         }
     }
 
-    // Keep all reusable layer-range resources under one model owner so park,
-    // unload, and reload have a deterministic teardown boundary.
-    DeepSeek4LayerRangeRuntime & runtime = ds4_layer_range_runtime;
-    auto & hc_layer_weights_range = runtime.hc_layer_weights;
-    auto & hc_output_weights_range = runtime.hc_output_weights;
-    auto & hash_routing_tables_range = runtime.hash_routing_tables;
-    auto & cached_attn_allocs = runtime.cached_attn_allocs;
-    auto & cached_decode_attn_hc_pre_graphs =
-        runtime.cached_decode_attn_hc_pre_graphs;
-    auto & cached_decode_ffn_hc_pre_graphs =
-        runtime.cached_decode_ffn_hc_pre_graphs;
-    auto & cached_decode_hc_post_graph = runtime.cached_decode_hc_post_graph;
-    auto & cached_decode_attn_graphs = runtime.cached_decode_attn_graphs;
-    auto & cached_decode_ffn_graphs = runtime.cached_decode_ffn_graphs;
-    auto & cached_decode_output_graph = runtime.cached_decode_output_graph;
-    auto & cached_dynamic_output_alloc = runtime.cached_dynamic_output_alloc;
-    auto & fused_decode_graph_cache = runtime.fused_decode_graph_cache;
-    auto & decode_shared_inputs = runtime.decode_shared_inputs;
-    int & hc_loaded_n_layer = runtime.loaded_n_layer;
-    const ggml_context * & hc_loaded_ctx = runtime.owner_ctx;
-    if (hc_loaded_n_layer != w.n_layer || hc_loaded_ctx != w.ctx) {
-        reset_hc_layer_weights_cpu(hc_layer_weights_range);
-        reset_hc_weights_cpu(hc_output_weights_range);
-        hc_layer_weights_range.resize((size_t)w.n_layer);
-        hash_routing_tables_range.assign((size_t)w.n_layer, {});
-        for (auto & alloc : cached_attn_allocs) {
-            alloc.free();
-        }
-        cached_attn_allocs.assign((size_t)w.n_layer, {});
-        for (auto & g : cached_decode_attn_hc_pre_graphs) {
-            g.free();
-        }
-        cached_decode_attn_hc_pre_graphs.assign((size_t)w.n_layer, {});
-        for (auto & g : cached_decode_ffn_hc_pre_graphs) {
-            g.free();
-        }
-        cached_decode_ffn_hc_pre_graphs.assign((size_t)w.n_layer, {});
-        cached_decode_hc_post_graph.free();
-        for (auto & per_layer : cached_decode_attn_graphs) {
-            for (auto & g : per_layer) {
-                g.free();
-            }
-        }
-        cached_decode_attn_graphs.assign((size_t)w.n_layer, {});
-        for (auto & g : cached_decode_ffn_graphs) {
-            g.free();
-        }
-        cached_decode_ffn_graphs.assign((size_t)w.n_layer, {});
-        cached_decode_output_graph.free();
-        cached_dynamic_output_alloc.free();
-        fused_decode_graph_cache.destroy();
-        decode_shared_inputs.free();
-        for (int il = 0; il < w.n_layer; il++) {
-            const DeepSeek4Layer & L = w.layers[(size_t)il];
-            load_hc_weights_cpu(hc_layer_weights_range[il].attn, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base);
-            load_hc_weights_cpu(hc_layer_weights_range[il].ffn, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base);
-            if (il < w.n_hash_layer && L.ffn_gate_tid2eid) {
-                load_hash_routing_cpu(hash_routing_tables_range[(size_t)il], L.ffn_gate_tid2eid);
-            }
-        }
-        load_hc_weights_cpu(hc_output_weights_range, w.output_hc_fn, w.output_hc_scale, w.output_hc_base);
-        hc_loaded_n_layer = w.n_layer;
-        hc_loaded_ctx = w.ctx;
+    // Keep HC and graph runtime state per DeepSeek4Cache. This isolates model
+    // and shard instances that may execute interleaved in the same process and
+    // ties the cached resources to the owning cache's lifetime.
+    if (!cache.layer_range_cache) {
+        cache.layer_range_cache = new DeepSeek4LayerRangeCache();
+    }
+    DeepSeek4LayerRangeCache & layer_range_cache = *cache.layer_range_cache;
+    if (!layer_range_cache.matches(w, backend, layer_begin, layer_end, is_last_shard) &&
+        !initialize_layer_range_cache(
+            layer_range_cache, backend, w, layer_begin, layer_end, is_last_shard)) {
+        return false;
     }
 
+    auto & hc_layer_weights_range = layer_range_cache.hc_layer_weights;
+    auto & hc_output_weights_range = layer_range_cache.hc_output_weights;
+    auto & hash_routing_tables_range = layer_range_cache.hash_routing_tables;
+    auto & cached_attn_allocs = layer_range_cache.cached_attn_allocs;
+    auto & cached_decode_attn_hc_pre_graphs = layer_range_cache.cached_decode_attn_hc_pre_graphs;
+    auto & cached_decode_ffn_hc_pre_graphs = layer_range_cache.cached_decode_ffn_hc_pre_graphs;
+    auto & cached_decode_hc_post_graph = layer_range_cache.cached_decode_hc_post_graph;
+    auto & cached_decode_attn_graphs = layer_range_cache.cached_decode_attn_graphs;
+    auto & cached_decode_ffn_graphs = layer_range_cache.cached_decode_ffn_graphs;
+    auto & cached_decode_output_graph = layer_range_cache.cached_decode_output_graph;
+    auto & cached_dynamic_output_alloc = layer_range_cache.cached_dynamic_output_alloc;
+    auto & fused_decode_graph_cache = layer_range_cache.fused_decode_graph_cache;
+    auto & decode_shared_inputs = layer_range_cache.decode_shared_inputs;
+
     // Per-layer execution with CPU-side HC
-    DeepSeek4LayerRangeScratch & scratch = runtime.scratch;
+    DeepSeek4LayerRangeScratch & scratch = layer_range_cache.scratch;
     const int n_expert_used = ds4_effective_expert_count(w);
     scratch.ensure(w.ctx, n_tokens, n_embd, n_hc, n_expert_used);
 
@@ -6708,6 +6779,8 @@ bool create_deepseek4_cache(ggml_backend_t backend,
 }
 
 void free_deepseek4_cache(DeepSeek4Cache & c) {
+    delete c.layer_range_cache;
+    c.layer_range_cache = nullptr;
     if (c.ctx) { ggml_free(c.ctx); c.ctx = nullptr; }
     if (c.buf) { ggml_backend_buffer_free(c.buf); c.buf = nullptr; }
     c.layers.clear();
