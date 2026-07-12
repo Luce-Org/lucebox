@@ -59,7 +59,8 @@ public:
     void reset_request_state() override;
     int prefill_chunk_tokens() const override;
     bool prefill(const std::vector<int32_t> & prompt,
-                 int base_pos, int & last_tok) override;
+                 int base_pos, int & last_tok,
+                 bool need_logits = true) override;
     bool decode_ar(int last_tok, int committed, int n_gen,
                    std::vector<int32_t> & out_tokens,
                    const DaemonIO & io) override;

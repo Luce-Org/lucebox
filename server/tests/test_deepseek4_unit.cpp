@@ -1309,6 +1309,104 @@ static void test_reference_hc_pre(const std::vector<float> & hc_state,
     for (int i = 0; i < n_hc * n_hc; ++i) comb[(size_t) i] = split[2 * n_hc + i];
 }
 
+static void test_reference_hc_pre_batch(const std::vector<float> & hc_state,
+                                        const std::vector<ggml_fp16_t> & fn_f16,
+                                        const std::vector<float> & scale,
+                                        const std::vector<float> & base,
+                                        int n_tokens,
+                                        int n_embd,
+                                        int n_hc,
+                                        int sinkhorn_iters,
+                                        float hc_eps,
+                                        std::vector<float> & working,
+                                        std::vector<float> & post,
+                                        std::vector<float> & comb) {
+    const int hc_dim = n_embd * n_hc;
+    working.assign((size_t)n_tokens * (size_t)n_embd, 0.0f);
+    post.assign((size_t)n_tokens * (size_t)n_hc, 0.0f);
+    comb.assign((size_t)n_tokens * (size_t)n_hc * (size_t)n_hc, 0.0f);
+    for (int t = 0; t < n_tokens; ++t) {
+        std::vector<float> token_hc(
+            hc_state.begin() + (ptrdiff_t)t * hc_dim,
+            hc_state.begin() + (ptrdiff_t)(t + 1) * hc_dim);
+        std::vector<float> token_working;
+        std::vector<float> token_post;
+        std::vector<float> token_comb;
+        test_reference_hc_pre(token_hc, fn_f16, scale, base, n_embd, n_hc,
+                              sinkhorn_iters, hc_eps,
+                              token_working, token_post, token_comb);
+        std::copy(token_working.begin(), token_working.end(),
+                  working.begin() + (ptrdiff_t)t * n_embd);
+        std::copy(token_post.begin(), token_post.end(),
+                  post.begin() + (ptrdiff_t)t * n_hc);
+        std::copy(token_comb.begin(), token_comb.end(),
+                  comb.begin() + (ptrdiff_t)t * n_hc * n_hc);
+    }
+}
+
+static void test_reference_hc_post_batch(const std::vector<float> & residual_hc,
+                                         const std::vector<float> & block_out,
+                                         const std::vector<float> & post,
+                                         const std::vector<float> & comb,
+                                         int n_tokens,
+                                         int n_embd,
+                                         int n_hc,
+                                         std::vector<float> & out_hc) {
+    const int hc_dim = n_embd * n_hc;
+    out_hc.assign((size_t)n_tokens * (size_t)hc_dim, 0.0f);
+    for (int t = 0; t < n_tokens; ++t) {
+        for (int dst = 0; dst < n_hc; ++dst) {
+            for (int d = 0; d < n_embd; ++d) {
+                float acc = block_out[(size_t)t * n_embd + d] *
+                            post[(size_t)t * n_hc + dst];
+                for (int src = 0; src < n_hc; ++src) {
+                    acc += comb[(size_t)t * n_hc * n_hc + dst + src * n_hc] *
+                           residual_hc[(size_t)t * hc_dim + (size_t)src * n_embd + d];
+                }
+                out_hc[(size_t)t * hc_dim + (size_t)dst * n_embd + d] = acc;
+            }
+        }
+    }
+}
+
+static void test_reference_hc_output_batch(const std::vector<float> & hc_state,
+                                           const std::vector<ggml_fp16_t> & fn_f16,
+                                           const std::vector<float> & scale,
+                                           const std::vector<float> & base,
+                                           int n_tokens,
+                                           int n_embd,
+                                           int n_hc,
+                                           float hc_eps,
+                                           std::vector<float> & final_embd) {
+    const int hc_dim = n_embd * n_hc;
+    final_embd.assign((size_t)n_tokens * (size_t)n_embd, 0.0f);
+    for (int t = 0; t < n_tokens; ++t) {
+        const float * token_hc = hc_state.data() + (size_t)t * hc_dim;
+        float sumsq = 0.0f;
+        for (int i = 0; i < hc_dim; ++i) {
+            sumsq += token_hc[i] * token_hc[i];
+        }
+        const float inv_rms = 1.0f / std::sqrt(sumsq / (float)hc_dim + hc_eps);
+        std::vector<float> pre((size_t)n_hc, 0.0f);
+        for (int h = 0; h < n_hc; ++h) {
+            float acc = 0.0f;
+            for (int c = 0; c < hc_dim; ++c) {
+                acc += ggml_fp16_to_fp32(fn_f16[(size_t)h * hc_dim + c]) *
+                       token_hc[c] * inv_rms;
+            }
+            pre[(size_t)h] = 1.0f / (1.0f + std::exp(-(acc * scale[0] + base[(size_t)h]))) +
+                              1.0e-6f;
+        }
+        for (int d = 0; d < n_embd; ++d) {
+            float acc = 0.0f;
+            for (int h = 0; h < n_hc; ++h) {
+                acc += pre[(size_t)h] * token_hc[(size_t)h * n_embd + d];
+            }
+            final_embd[(size_t)t * n_embd + d] = acc;
+        }
+    }
+}
+
 static void test_hc_pre_kernel_gpu() {
     std::fprintf(stderr, "  test_hc_pre_kernel_gpu ...");
     ggml_backend_t backend = ggml_backend_cuda_init(0);
@@ -1541,6 +1639,163 @@ static void test_hc_pre_kernel_gpu() {
     ggml_free(ctx);
     ggml_backend_free(backend);
 }
+
+static void test_hc_batch_kernels_gpu() {
+    std::fprintf(stderr, "  test_hc_batch_kernels_gpu ...");
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        std::fprintf(stderr, " skipped (no GPU backend)\n");
+        return;
+    }
+
+    constexpr int n_tokens = 3;
+    constexpr int n_embd = 32;
+    constexpr int n_hc = 4;
+    constexpr int sinkhorn_iters = 5;
+    constexpr float hc_eps = 1.0e-6f;
+    constexpr int mix_dim = 2 * n_hc + n_hc * n_hc;
+    const int hc_dim = n_embd * n_hc;
+
+    std::mt19937 rng(321);
+    std::uniform_real_distribution<float> dist(-0.25f, 0.25f);
+    std::vector<float> hc_state((size_t)n_tokens * (size_t)hc_dim);
+    std::vector<float> block_out((size_t)n_tokens * (size_t)n_embd);
+    std::vector<float> fn((size_t)mix_dim * (size_t)hc_dim);
+    std::vector<ggml_fp16_t> fn_f16(fn.size());
+    std::vector<float> output_fn((size_t)n_hc * (size_t)hc_dim);
+    std::vector<ggml_fp16_t> output_fn_f16(output_fn.size());
+    std::vector<float> scale((size_t)mix_dim, 0.0f);
+    std::vector<float> base((size_t)mix_dim);
+    for (float & v : hc_state) v = dist(rng);
+    for (float & v : block_out) v = dist(rng);
+    for (float & v : fn) v = dist(rng);
+    for (float & v : output_fn) v = dist(rng);
+    for (size_t i = 0; i < fn.size(); ++i) fn_f16[i] = ggml_fp32_to_fp16(fn[i]);
+    for (size_t i = 0; i < output_fn.size(); ++i) output_fn_f16[i] = ggml_fp32_to_fp16(output_fn[i]);
+    scale[0] = 0.9f;
+    scale[1] = 1.15f;
+    scale[2] = 0.8f;
+    for (float & v : base) v = 0.1f * dist(rng);
+
+    std::vector<float> ref_working;
+    std::vector<float> ref_post;
+    std::vector<float> ref_comb;
+    std::vector<float> ref_next_hc;
+    std::vector<float> ref_final_embd;
+    test_reference_hc_pre_batch(hc_state, fn_f16, scale, base, n_tokens, n_embd, n_hc,
+                                sinkhorn_iters, hc_eps,
+                                ref_working, ref_post, ref_comb);
+    test_reference_hc_post_batch(hc_state, block_out, ref_post, ref_comb,
+                                 n_tokens, n_embd, n_hc, ref_next_hc);
+    test_reference_hc_output_batch(hc_state, output_fn_f16, scale, base,
+                                   n_tokens, n_embd, n_hc, hc_eps, ref_final_embd);
+
+    ggml_context * ctx = make_test_context(1u << 20);
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) {
+        ggml_backend_free(backend);
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    ggml_tensor * state_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, n_tokens);
+    ggml_tensor * block_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * fn_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hc_dim, mix_dim);
+    ggml_tensor * output_fn_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hc_dim, n_hc);
+    ggml_tensor * scale_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, mix_dim);
+    ggml_tensor * base_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, mix_dim);
+    ggml_tensor * working_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * post_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_hc, n_tokens);
+    ggml_tensor * comb_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_hc * n_hc, n_tokens);
+    ggml_tensor * next_hc_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, n_tokens);
+    ggml_tensor * final_embd_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    TEST_ASSERT_MSG(buf != nullptr, "ggml backend buffer alloc failed");
+    if (!buf) {
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    ggml_backend_tensor_set(state_t, hc_state.data(), 0, hc_state.size() * sizeof(float));
+    ggml_backend_tensor_set(block_t, block_out.data(), 0, block_out.size() * sizeof(float));
+    ggml_backend_tensor_set(fn_t, fn_f16.data(), 0, fn_f16.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(output_fn_t, output_fn_f16.data(), 0, output_fn_f16.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(scale_t, scale.data(), 0, scale.size() * sizeof(float));
+    ggml_backend_tensor_set(base_t, base.data(), 0, base.size() * sizeof(float));
+
+    bool ok = deepseek4_cuda_hc_pre_batch_device(state_t->data,
+                                                 fn_t->data,
+                                                 scale_t->data,
+                                                 base_t->data,
+                                                 n_tokens,
+                                                 n_embd,
+                                                 n_hc,
+                                                 sinkhorn_iters,
+                                                 hc_eps,
+                                                 working_t->data,
+                                                 post_t->data,
+                                                 comb_t->data);
+    TEST_ASSERT_MSG(ok, "batched HC-pre kernel call failed");
+
+    ok = ok && deepseek4_cuda_hc_post_batch_device(state_t->data,
+                                                   block_t->data,
+                                                   post_t->data,
+                                                   comb_t->data,
+                                                   n_tokens,
+                                                   n_embd,
+                                                   n_hc,
+                                                   next_hc_t->data);
+    TEST_ASSERT_MSG(ok, "batched HC-post kernel call failed");
+
+    ok = ok && deepseek4_cuda_hc_output_batch_device(state_t->data,
+                                                     output_fn_t->data,
+                                                     scale_t->data,
+                                                     base_t->data,
+                                                     n_tokens,
+                                                     n_embd,
+                                                     n_hc,
+                                                     hc_eps,
+                                                     final_embd_t->data);
+    TEST_ASSERT_MSG(ok, "batched HC-output kernel call failed");
+
+    std::vector<float> gpu_working(ref_working.size());
+    std::vector<float> gpu_post(ref_post.size());
+    std::vector<float> gpu_comb(ref_comb.size());
+    std::vector<float> gpu_next_hc(ref_next_hc.size());
+    std::vector<float> gpu_final_embd(ref_final_embd.size());
+    if (ok) {
+        ggml_backend_tensor_get(working_t, gpu_working.data(), 0, gpu_working.size() * sizeof(float));
+        ggml_backend_tensor_get(post_t, gpu_post.data(), 0, gpu_post.size() * sizeof(float));
+        ggml_backend_tensor_get(comb_t, gpu_comb.data(), 0, gpu_comb.size() * sizeof(float));
+        ggml_backend_tensor_get(next_hc_t, gpu_next_hc.data(), 0, gpu_next_hc.size() * sizeof(float));
+        ggml_backend_tensor_get(final_embd_t, gpu_final_embd.data(), 0, gpu_final_embd.size() * sizeof(float));
+    }
+
+    constexpr float atol = 3.0e-4f;
+    constexpr float rtol = 3.0e-4f;
+    for (size_t i = 0; i < ref_working.size(); ++i) {
+        TEST_ASSERT_MSG(nearly_equal(gpu_working[i], ref_working[i], atol, rtol), "batched working mismatch");
+    }
+    for (size_t i = 0; i < ref_post.size(); ++i) {
+        TEST_ASSERT_MSG(nearly_equal(gpu_post[i], ref_post[i], atol, rtol), "batched post mismatch");
+    }
+    for (size_t i = 0; i < ref_comb.size(); ++i) {
+        TEST_ASSERT_MSG(nearly_equal(gpu_comb[i], ref_comb[i], atol, rtol), "batched comb mismatch");
+    }
+    for (size_t i = 0; i < ref_next_hc.size(); ++i) {
+        TEST_ASSERT_MSG(nearly_equal(gpu_next_hc[i], ref_next_hc[i], 5.0e-4f, 5.0e-4f), "batched hc-post output mismatch");
+    }
+    for (size_t i = 0; i < ref_final_embd.size(); ++i) {
+        TEST_ASSERT_MSG(nearly_equal(gpu_final_embd[i], ref_final_embd[i], atol, rtol), "batched hc-output mismatch");
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
 #endif
 
 int main() {
@@ -1572,6 +1827,7 @@ int main() {
     test_output_graph_reuse_microbench(backend);
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
     test_hc_pre_kernel_gpu();
+    test_hc_batch_kernels_gpu();
 #endif
 
     ggml_backend_free(backend);

@@ -265,16 +265,6 @@ struct DeepSeek4Cache {
 
 struct DeepSeek4Snapshot;
 
-// ─── Configuration ──────────────────────────────────────────────────────
-
-struct DeepSeek4BackendConfig {
-    const char * model_path   = nullptr;
-    DevicePlacement device;
-    int          stream_fd    = -1;
-    int          chunk        = 512;   // prefill chunk size
-    int          max_ctx      = 0;     // 0 = auto from SWA + compression capacity
-};
-
 // ─── Function declarations ──────────────────────────────────────────────
 
 bool load_deepseek4_gguf(const std::string & path,
@@ -362,6 +352,7 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
 struct DeepSeek4Snapshot {
     int cur_pos = 0;
     ggml_tensor * hc_state_snap = nullptr;
+    std::vector<float> last_logits;
     // Per-layer: raw KV + compressed KV snapshots
     struct LayerSnap {
         ggml_tensor * raw_kv       = nullptr;

@@ -34,6 +34,9 @@
 namespace dflash::common {
 
 namespace {
+static constexpr uint16_t F16_ZERO    = 0x0000;
+static constexpr uint16_t F16_NEG_INF = 0xFC00;
+
 using Ds4TimingClock = std::chrono::steady_clock;
 
 static uint64_t ds4_elapsed_us(Ds4TimingClock::time_point start,
@@ -112,6 +115,11 @@ struct DeepSeek4I32ArrayBinding {
 struct DeepSeek4I64ArrayBinding {
     ggml_tensor *          tensor = nullptr;
     std::vector<int64_t>   values;
+};
+
+struct DeepSeek4F16ArrayBinding {
+    ggml_tensor *          tensor = nullptr;
+    std::vector<uint16_t>  values;
 };
 
 static ggml_tensor * build_rms_norm(ggml_context * ctx, ggml_tensor * x,
@@ -285,6 +293,96 @@ struct DeepSeek4LayerRangeScratch {
         ffn_out_host.resize(embd_count);
         final_embd.resize(embd_count);
         hash_expert_ids.resize((size_t) tokens * (size_t) expert_used);
+    }
+};
+
+struct DeepSeek4BatchedHcWorkspace {
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_backend_t backend = nullptr;
+    int n_tokens = 0;
+    int n_embd = 0;
+    int n_hc = 0;
+    ggml_tensor * hc_state = nullptr;
+    ggml_tensor * next_hc = nullptr;
+    ggml_tensor * working = nullptr;
+    ggml_tensor * post = nullptr;
+    ggml_tensor * comb = nullptr;
+    ggml_tensor * final_embd = nullptr;
+
+    ~DeepSeek4BatchedHcWorkspace() {
+        free();
+    }
+
+    void free() {
+        if (buf) {
+            ggml_backend_buffer_free(buf);
+            buf = nullptr;
+        }
+        if (ctx) {
+            ggml_free(ctx);
+            ctx = nullptr;
+        }
+        backend = nullptr;
+        n_tokens = 0;
+        n_embd = 0;
+        n_hc = 0;
+        hc_state = nullptr;
+        next_hc = nullptr;
+        working = nullptr;
+        post = nullptr;
+        comb = nullptr;
+        final_embd = nullptr;
+    }
+
+    bool valid(ggml_backend_t b, int tokens, int embd, int hc) const {
+        return ctx && buf && backend == b && n_tokens == tokens &&
+               n_embd == embd && n_hc == hc && hc_state && next_hc &&
+               working && post && comb && final_embd;
+    }
+
+    bool ensure(ggml_backend_t b, int tokens, int embd, int hc) {
+        if (valid(b, tokens, embd, hc)) {
+            return true;
+        }
+        free();
+
+        const int hc_dim = embd * hc;
+        ggml_init_params params{};
+        params.mem_size = ggml_tensor_overhead() * 8 + 4096;
+        params.mem_buffer = nullptr;
+        params.no_alloc = true;
+        ctx = ggml_init(params);
+        if (!ctx) {
+            return false;
+        }
+
+        hc_state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, tokens);
+        next_hc = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, tokens);
+        working = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, tokens);
+        post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
+        comb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc * hc, tokens);
+        final_embd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, tokens);
+        if (!hc_state || !next_hc || !working || !post || !comb ||
+            !final_embd) {
+            free();
+            return false;
+        }
+
+        buf = ggml_backend_alloc_ctx_tensors(ctx, b);
+        if (!buf) {
+            free();
+            return false;
+        }
+        backend = b;
+        n_tokens = tokens;
+        n_embd = embd;
+        n_hc = hc;
+        return true;
+    }
+
+    void swap_hc() {
+        std::swap(hc_state, next_hc);
     }
 };
 
@@ -825,7 +923,8 @@ static ggml_tensor * build_mla_attention(
         const DeepSeek4AttentionGraphInputs * cached_inputs,
         std::vector<DeepSeek4I32InputBinding> & i32_inputs,
         std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs,
-        std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs) {
+        std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs,
+        std::vector<DeepSeek4F16ArrayBinding> & f16_array_inputs) {
 
     const int n_embd    = w.n_embd;
     const int head_dim  = w.head_dim;
@@ -885,6 +984,24 @@ static ggml_tensor * build_mla_attention(
                             rope_freq, rope_scale, rope_ext, rope_attn,
                             w.rope_yarn_beta_fast, w.rope_yarn_beta_slow, rope_n_ctx_orig);
 
+    const int token_pos = kv_start + n_tokens - 1;
+    const int n_past_raw = (n_tokens == 1)
+        ? std::max(0, std::min(kv_start + 1, w.n_swa) - 1)
+        : std::min(kv_start, w.n_swa);
+    const int n_cur_raw = n_tokens;
+    const int n_raw = n_past_raw + n_cur_raw;
+    const int n_comp_attn = (ratio > 0) ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos) : 0;
+    const int n_attn = n_raw + n_comp_attn;
+    const float kq_scale = 1.0f / sqrtf((float)head_dim);
+
+    ggml_tensor * past_raw_f32 = nullptr;
+    if (n_past_raw > 0) {
+        past_raw_f32 = ggml_cast(ctx,
+            ggml_view_2d(ctx, lc.raw_kv, head_dim, n_past_raw, lc.raw_kv->nb[1], 0),
+            GGML_TYPE_F32);
+        ggml_build_forward_expand(gf, past_raw_f32);
+    }
+
     // ── Store ALL KV rows in the raw SWA ring ─────────────────────
     // For decode (n_tokens=1): write single row. For prefill: write all rows.
     if (cached_inputs && cached_inputs->raw_kv_rows) {
@@ -901,7 +1018,6 @@ static ggml_tensor * build_mla_attention(
             ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_cast(ctx, kv_row, GGML_TYPE_F16), kv_slot));
         }
     }
-    const int token_pos = kv_start + n_tokens - 1;
 
     // ── Learned compression update ──────────────────────────────────
     ggml_tensor * cur_last = ggml_view_2d(
@@ -949,30 +1065,10 @@ static ggml_tensor * build_mla_attention(
     // q: [head_dim, n_head, n_tokens] (after RoPE)
     // raw_kv: [head_dim, n_swa] F16 persistent ring buffer (single KV head, shared)
     // comp_kv: [head_dim, comp_cap] F16 compressed rows.
-    // n_raw = min(kv_start + n_tokens, n_swa)
-    const int n_raw = std::min(kv_start + n_tokens, w.n_swa);
-    const int n_comp_attn = (ratio > 0) ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos) : 0;
-    const int n_attn = n_raw + n_comp_attn;
-    const float kq_scale = 1.0f / sqrtf((float)head_dim);
-
-    // Get valid KV rows. For single-token decode/prefill, include the current
-    // in-graph KV row directly; otherwise attention can race the side-effecting
-    // cache write and see the previous contents of the raw KV slot.
-    ggml_tensor * kv_f32 = nullptr;
-    if (n_tokens == 1) {
-        ggml_tensor * cur_kv_f32 = ggml_cast(ctx, kv, GGML_TYPE_F32);
-        if (n_raw > 1) {
-            ggml_tensor * prev_f32 = ggml_cast(ctx,
-                ggml_view_2d(ctx, lc.raw_kv, head_dim, n_raw - 1,
-                             lc.raw_kv->nb[1], 0),
-                GGML_TYPE_F32);
-            kv_f32 = ggml_concat(ctx, prev_f32, cur_kv_f32, 1);
-        } else {
-            kv_f32 = cur_kv_f32;
-        }
-    } else {
-        kv_f32 = ggml_cast(ctx, ggml_view_2d(ctx, lc.raw_kv, head_dim, n_raw,
-                                             lc.raw_kv->nb[1], 0), GGML_TYPE_F32);
+    ggml_tensor * cur_kv_f32 = ggml_cast(ctx, kv, GGML_TYPE_F32);
+    ggml_tensor * kv_f32 = cur_kv_f32;
+    if (past_raw_f32) {
+        kv_f32 = ggml_concat(ctx, past_raw_f32, cur_kv_f32, 1);
     }
     if (n_comp_attn > 0 && lc.comp_kv) {
         ggml_tensor * comp_f32 = ggml_cast(ctx,
@@ -990,6 +1086,41 @@ static ggml_tensor * build_mla_attention(
     ggml_tensor * scores = ggml_mul_mat(ctx, kv_f32, q_flat);
     scores = ggml_scale(ctx, scores, kq_scale);
 
+    std::vector<uint16_t> attn_mask_values;
+    if (n_tokens > 1 && !cached_inputs) {
+        const int cols = n_head * n_tokens;
+        attn_mask_values.assign((size_t)n_attn * (size_t)cols, F16_NEG_INF);
+        for (int ti = 0; ti < n_tokens; ++ti) {
+            const int abs_q = kv_start + ti;
+            for (int h = 0; h < n_head; ++h) {
+                const int col = ti * n_head + h;
+                for (int k = 0; k < n_past_raw; ++k) {
+                    int abs_k = k;
+                    if (kv_start > 0) {
+                        const int last_past = kv_start - 1;
+                        const int delta = (last_past - k) % w.n_swa;
+                        abs_k = last_past - (delta < 0 ? delta + w.n_swa : delta);
+                    }
+                    if (abs_k >= 0 && abs_k <= abs_q && abs_k > abs_q - w.n_swa) {
+                        attn_mask_values[(size_t)col * (size_t)n_attn + (size_t)k] = F16_ZERO;
+                    }
+                }
+                for (int c = 0; c < n_cur_raw; ++c) {
+                    const int abs_k = kv_start + c;
+                    if (abs_k <= abs_q && abs_k > abs_q - w.n_swa) {
+                        attn_mask_values[(size_t)col * (size_t)n_attn + (size_t)(n_past_raw + c)] = F16_ZERO;
+                    }
+                }
+                for (int c = 0; c < n_comp_attn; ++c) {
+                    const int comp_end = (c + 1) * ratio - 1;
+                    if (comp_end <= abs_q) {
+                        attn_mask_values[(size_t)col * (size_t)n_attn + (size_t)(n_raw + c)] = F16_ZERO;
+                    }
+                }
+            }
+        }
+    }
+
     // Sink-aware softmax: DS4 adds one learned per-head sink logit to the
     // denominator, but the sink contributes no value vector.
     ggml_tensor * probs = nullptr;
@@ -1000,11 +1131,37 @@ static ggml_tensor * build_mla_attention(
             sink_scores = ggml_repeat(ctx, sink_scores, sink_shape);
         }
         ggml_tensor * scores_with_sink = ggml_concat(ctx, scores, sink_scores, 0);
-        ggml_tensor * probs_with_sink = ggml_soft_max(ctx, scores_with_sink);
+        ggml_tensor * sink_mask = nullptr;
+        if (!attn_mask_values.empty()) {
+            const int cols = n_head * n_tokens;
+            sink_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_attn + 1, cols);
+            ggml_set_input(sink_mask);
+            DeepSeek4F16ArrayBinding binding;
+            binding.tensor = sink_mask;
+            binding.values.assign((size_t)(n_attn + 1) * (size_t)cols, F16_NEG_INF);
+            for (int col = 0; col < cols; ++col) {
+                std::memcpy(binding.values.data() + (size_t)col * (size_t)(n_attn + 1),
+                            attn_mask_values.data() + (size_t)col * (size_t)n_attn,
+                            sizeof(uint16_t) * (size_t)n_attn);
+                binding.values[(size_t)col * (size_t)(n_attn + 1) + (size_t)n_attn] = F16_ZERO;
+            }
+            f16_array_inputs.push_back(std::move(binding));
+        }
+        ggml_tensor * probs_with_sink = sink_mask
+            ? ggml_soft_max_ext(ctx, scores_with_sink, sink_mask, 1.0f, 0.0f)
+            : ggml_soft_max(ctx, scores_with_sink);
         probs = ggml_view_2d(ctx, probs_with_sink, n_attn, n_head * n_tokens,
                              probs_with_sink->nb[1], 0);
     } else {
-        probs = ggml_soft_max(ctx, scores);
+        ggml_tensor * attn_mask = nullptr;
+        if (!attn_mask_values.empty()) {
+            const int cols = n_head * n_tokens;
+            attn_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_attn, cols);
+            ggml_set_input(attn_mask);
+            f16_array_inputs.push_back({attn_mask, std::move(attn_mask_values)});
+        }
+        probs = attn_mask ? ggml_soft_max_ext(ctx, scores, attn_mask, 1.0f, 0.0f)
+                          : ggml_soft_max(ctx, scores);
     }
     // probs: [n_attn, n_head*n_tokens]
 
@@ -1175,10 +1332,12 @@ static bool build_cached_decode_attn_graph(
     std::vector<DeepSeek4I32InputBinding> i32_inputs;
     std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
     std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
+    std::vector<DeepSeek4F16ArrayBinding> f16_array_inputs;
     ggml_tensor * normed = build_rms_norm(out.sg.ctx, out.sg.inp_embed, L.attn_norm, w.rms_eps);
     out.sg.hidden_states = build_mla_attention(out.sg.ctx, out.sg.gf, normed, w, L, lc, layer_idx,
                                                kv_start, 1, &out.inputs,
-                                               i32_inputs, i32_array_inputs, i64_array_inputs);
+                                               i32_inputs, i32_array_inputs, i64_array_inputs,
+                                               f16_array_inputs);
     if (!out.sg.hidden_states) {
         out.free();
         return false;
@@ -2272,13 +2431,14 @@ static bool deepseek4_step_hybrid(
         std::vector<DeepSeek4I32InputBinding> i32_inputs;
         std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
         std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
+        std::vector<DeepSeek4F16ArrayBinding> f16_array_inputs;
         ggml_cgraph * gf = ggml_new_graph(ctx);
 
         ggml_tensor * normed = build_rms_norm(ctx, inp, L.attn_norm, w.rms_eps);
         ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
                                                      kv_start, n_tokens, nullptr,
                                                      i32_inputs, i32_array_inputs,
-                                                     i64_array_inputs);
+                                                     i64_array_inputs, f16_array_inputs);
         // Output just attn_out (HC post handles the residual mixing)
         ggml_build_forward_expand(gf, attn_out);
         ggml_gallocr_t attn_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -2301,6 +2461,10 @@ static bool deepseek4_step_hybrid(
         for (const DeepSeek4I64ArrayBinding & binding : i64_array_inputs) {
             ggml_backend_tensor_set(binding.tensor, binding.values.data(), 0,
                                     sizeof(int64_t) * binding.values.size());
+        }
+        for (const DeepSeek4F16ArrayBinding & binding : f16_array_inputs) {
+            ggml_backend_tensor_set(binding.tensor, binding.values.data(), 0,
+                                    sizeof(uint16_t) * binding.values.size());
         }
         const auto attn_compute_t0 = Ds4TimingClock::now();
         bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
@@ -2698,6 +2862,7 @@ bool deepseek4_step(
     std::vector<DeepSeek4I32InputBinding> i32_inputs;
     std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
     std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
+    std::vector<DeepSeek4F16ArrayBinding> f16_array_inputs;
 
     // Layer loop
     for (int il = 0; il < n_layer; il++) {
@@ -2715,7 +2880,7 @@ bool deepseek4_step(
         ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc,
                                                       il, kv_start, n_tokens,
                                                       nullptr, i32_inputs, i32_array_inputs,
-                                                      i64_array_inputs);
+                                                      i64_array_inputs, f16_array_inputs);
 
         // ── Residual ────────────────────────────────────────────────
         cur = ggml_add(ctx, cur, attn_out);
@@ -2768,6 +2933,10 @@ bool deepseek4_step(
     for (const DeepSeek4I64ArrayBinding & binding : i64_array_inputs) {
         ggml_backend_tensor_set(binding.tensor, binding.values.data(), 0,
                                 sizeof(int64_t) * binding.values.size());
+    }
+    for (const DeepSeek4F16ArrayBinding & binding : f16_array_inputs) {
+        ggml_backend_tensor_set(binding.tensor, binding.values.data(), 0,
+                                sizeof(uint16_t) * binding.values.size());
     }
 
     // Compute
@@ -2913,10 +3082,20 @@ bool deepseek4_step_layer_range(
     std::vector<float> & ffn_out_host = scratch.ffn_out_host;
     std::vector<int32_t> & hash_expert_ids_host = scratch.hash_expert_ids;
     const bool reuse_decode_graphs = (n_tokens == 1);
+    const bool use_batched_gpu_hc = (n_tokens > 1) && ds4_backend_is_gpu(backend);
     const bool use_backend_decode_hc = reuse_decode_graphs && ds4_backend_is_gpu(backend);
     const bool use_backend_decode_hc_direct = use_backend_decode_hc && ds4_backend_is_hip(backend);
     const bool use_backend_decode_hc_graph =
         use_backend_decode_hc && !use_backend_decode_hc_direct;
+    static thread_local DeepSeek4BatchedHcWorkspace batched_hc;
+    if (use_batched_gpu_hc) {
+        if (!batched_hc.ensure(backend, n_tokens, n_embd, n_hc)) {
+            std::fprintf(stderr, "[deepseek4] batched HC workspace alloc failed\n");
+            return false;
+        }
+        ggml_backend_tensor_set(batched_hc.hc_state, hc_state.data(), 0,
+                                sizeof(float) * hc_state.size());
+    }
     const ggml_tensor * hc_state_backend = nullptr;
     if (use_backend_decode_hc_graph || use_backend_decode_hc_direct) {
         if (!cached_decode_hc_post_graph.valid() ||
@@ -2945,7 +3124,27 @@ bool deepseek4_step_layer_range(
 
         // ── HC pre (attention) ──────────────────────────────────────
         const auto hc_pre_attn_t0 = Ds4TimingClock::now();
-        if (use_backend_decode_hc_direct) {
+        if (use_batched_gpu_hc) {
+            const auto hc_pre_attn_compute_t0 = Ds4TimingClock::now();
+            if (!deepseek4_cuda_hc_pre_batch_device(
+                    batched_hc.hc_state->data,
+                    L.hc_attn_fn ? L.hc_attn_fn->data : nullptr,
+                    L.hc_attn_scale ? L.hc_attn_scale->data : nullptr,
+                    L.hc_attn_base ? L.hc_attn_base->data : nullptr,
+                    n_tokens,
+                    n_embd,
+                    n_hc,
+                    w.n_hc_sinkhorn_iter,
+                    w.hc_eps,
+                    batched_hc.working->data,
+                    batched_hc.post->data,
+                    batched_hc.comb->data)) {
+                std::fprintf(stderr, "[deepseek4] batched hc-pre failed layer %d attn\n", il);
+                return false;
+            }
+            if (telemetry) telemetry->hc_pre_compute_us += ds4_elapsed_us(hc_pre_attn_compute_t0, Ds4TimingClock::now());
+            attn_in_backend = batched_hc.working;
+        } else if (use_backend_decode_hc_direct) {
             const auto hc_pre_attn_input_t0 = Ds4TimingClock::now();
             ggml_backend_tensor_set(cached_decode_hc_post_graph.residual_hc,
                                     hc_state.data(), 0, sizeof(float) * hc_state.size());
@@ -3023,7 +3222,11 @@ bool deepseek4_step_layer_range(
         // ── Build & run attention graph ─────────────────────────────
         {
             const int token_pos = kv_start + n_tokens - 1;
-            const bool reuse_decode_attn = n_tokens == 1;
+            // The cached single-token attention graph updates KV/compressor state
+            // with ggml_set_rows. On HIP this path can fault after enough prompt
+            // tokens; use the dynamic graph until the cached state-update path is
+            // made safe.
+            const bool reuse_decode_attn = false;
             ggml_tensor * attn_out = nullptr;
             ggml_cgraph * gf = nullptr;
             ggml_context * ctx = nullptr;
@@ -3078,7 +3281,7 @@ bool deepseek4_step_layer_range(
                 if (ratio > 0) {
                     const int pos_mod = token_pos % ratio;
                     const int32_t ape_row = pos_mod;
-                    const int64_t state_row = ratio + pos_mod;
+                    const int64_t state_row = (ratio == 4) ? (ratio + pos_mod) : pos_mod;
                     const int64_t comp_row = token_pos / ratio;
                     const int32_t comp_pos = token_pos + 1 - ratio;
                     const bool flush_boundary = ((token_pos + 1) % ratio) == 0;
@@ -3118,6 +3321,7 @@ bool deepseek4_step_layer_range(
                 std::vector<DeepSeek4I32InputBinding> i32_inputs;
                 std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
                 std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
+                std::vector<DeepSeek4F16ArrayBinding> f16_array_inputs;
                 const size_t graph_size = n_tokens > 1 ? 32768 : 2048;
                 gf = ggml_new_graph_custom(ctx, graph_size, false);
 
@@ -3125,7 +3329,7 @@ bool deepseek4_step_layer_range(
                 attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
                                                kv_start, n_tokens, nullptr,
                                                i32_inputs, i32_array_inputs,
-                                               i64_array_inputs);
+                                               i64_array_inputs, f16_array_inputs);
                 ggml_set_output(attn_out);
                 ggml_build_forward_expand(gf, attn_out);
 
@@ -3153,6 +3357,8 @@ bool deepseek4_step_layer_range(
                     ggml_backend_tensor_set(b.tensor, b.values.data(), 0, sizeof(int32_t) * b.values.size());
                 for (const auto & b : i64_array_inputs)
                     ggml_backend_tensor_set(b.tensor, b.values.data(), 0, sizeof(int64_t) * b.values.size());
+                for (const auto & b : f16_array_inputs)
+                    ggml_backend_tensor_set(b.tensor, b.values.data(), 0, sizeof(uint16_t) * b.values.size());
             }
 
             const auto attn_compute_t0 = Ds4TimingClock::now();
@@ -3162,7 +3368,24 @@ bool deepseek4_step_layer_range(
                 return false;
             }
             if (telemetry) telemetry->attn_compute_us += ds4_elapsed_us(attn_compute_t0, Ds4TimingClock::now());
-            if (use_backend_decode_hc_graph) {
+            if (use_batched_gpu_hc) {
+                const auto hc_post_attn_t0 = Ds4TimingClock::now();
+                if (!deepseek4_cuda_hc_post_batch_device(
+                        batched_hc.hc_state->data,
+                        attn_out->data,
+                        batched_hc.post->data,
+                        batched_hc.comb->data,
+                        n_tokens,
+                        n_embd,
+                        n_hc,
+                        batched_hc.next_hc->data)) {
+                    std::fprintf(stderr, "[deepseek4] batched hc-post failed layer %d attn\n", il);
+                    if (ctx) ggml_free(ctx);
+                    return false;
+                }
+                batched_hc.swap_hc();
+                if (telemetry) telemetry->hc_post_attn_us += ds4_elapsed_us(hc_post_attn_t0, Ds4TimingClock::now());
+            } else if (use_backend_decode_hc_graph) {
                 if (hc_state_backend != cached_decode_hc_post_graph.residual_hc) {
                     ggml_backend_tensor_copy(hc_state_backend, cached_decode_hc_post_graph.residual_hc);
                 }
@@ -3189,7 +3412,7 @@ bool deepseek4_step_layer_range(
             if (ctx) ggml_free(ctx);
 
             // ── HC post (attention) ─────────────────────────────────
-            if (!use_backend_decode_hc_graph) {
+            if (!use_batched_gpu_hc && !use_backend_decode_hc_graph) {
                 const auto hc_post_attn_t0 = Ds4TimingClock::now();
                 hc_post_batch(next_hc,
                               attn_out_host.data(),
@@ -3206,7 +3429,27 @@ bool deepseek4_step_layer_range(
 
         // ── HC pre (FFN) ────────────────────────────────────────────
         const auto hc_pre_ffn_t0 = Ds4TimingClock::now();
-        if (use_backend_decode_hc_direct) {
+        if (use_batched_gpu_hc) {
+            const auto hc_pre_ffn_compute_t0 = Ds4TimingClock::now();
+            if (!deepseek4_cuda_hc_pre_batch_device(
+                    batched_hc.hc_state->data,
+                    L.hc_ffn_fn ? L.hc_ffn_fn->data : nullptr,
+                    L.hc_ffn_scale ? L.hc_ffn_scale->data : nullptr,
+                    L.hc_ffn_base ? L.hc_ffn_base->data : nullptr,
+                    n_tokens,
+                    n_embd,
+                    n_hc,
+                    w.n_hc_sinkhorn_iter,
+                    w.hc_eps,
+                    batched_hc.working->data,
+                    batched_hc.post->data,
+                    batched_hc.comb->data)) {
+                std::fprintf(stderr, "[deepseek4] batched hc-pre failed layer %d ffn\n", il);
+                return false;
+            }
+            if (telemetry) telemetry->hc_pre_compute_us += ds4_elapsed_us(hc_pre_ffn_compute_t0, Ds4TimingClock::now());
+            ffn_in_backend = batched_hc.working;
+        } else if (use_backend_decode_hc_direct) {
             const auto hc_pre_ffn_input_t0 = Ds4TimingClock::now();
             ggml_backend_tensor_set(cached_decode_hc_post_graph.residual_hc,
                                     hc_state.data(), 0, sizeof(float) * hc_state.size());
@@ -3335,7 +3578,23 @@ bool deepseek4_step_layer_range(
                 return false;
             }
 
-            if (use_backend_decode_hc_graph) {
+            if (use_batched_gpu_hc) {
+                const auto hc_post_ffn_t0 = Ds4TimingClock::now();
+                if (!deepseek4_cuda_hc_post_batch_device(
+                        batched_hc.hc_state->data,
+                        ffn_out->data,
+                        batched_hc.post->data,
+                        batched_hc.comb->data,
+                        n_tokens,
+                        n_embd,
+                        n_hc,
+                        batched_hc.next_hc->data)) {
+                    std::fprintf(stderr, "[deepseek4] batched hc-post failed layer %d ffn\n", il);
+                    return false;
+                }
+                batched_hc.swap_hc();
+                if (telemetry) telemetry->hc_post_ffn_us += ds4_elapsed_us(hc_post_ffn_t0, Ds4TimingClock::now());
+            } else if (use_backend_decode_hc_graph) {
                 if (hc_state_backend != cached_decode_hc_post_graph.residual_hc) {
                     ggml_backend_tensor_copy(hc_state_backend, cached_decode_hc_post_graph.residual_hc);
                 }
@@ -3360,7 +3619,7 @@ bool deepseek4_step_layer_range(
             }
 
             // ── HC post (FFN) ───────────────────────────────────────
-            if (!use_backend_decode_hc_graph) {
+            if (!use_batched_gpu_hc && !use_backend_decode_hc_graph) {
                 const auto hc_post_ffn_t0 = Ds4TimingClock::now();
                 hc_post_batch(next_hc,
                               ffn_out_host.data(),
@@ -3379,19 +3638,39 @@ bool deepseek4_step_layer_range(
     if (use_backend_decode_hc_graph && hc_state_backend) {
         ggml_backend_tensor_get(hc_state_backend, hc_state.data(), 0, sizeof(float) * hc_state.size());
     }
+    if (use_batched_gpu_hc) {
+        ggml_backend_tensor_get(batched_hc.hc_state, hc_state.data(), 0,
+                                sizeof(float) * hc_state.size());
+    }
 
     // ── Output: HC pre → norm → lm_head (or return hidden state) ────────
     if (is_last_shard && out_logits) {
         // Final HC pre for output
         const auto output_t0 = Ds4TimingClock::now();
         std::vector<float> & final_embd = scratch.final_embd;
-        hc_output_batch(final_embd,
-                        hc_state.data(),
-                        hc_output_weights_range,
-                        n_tokens,
-                        n_embd,
-                        n_hc,
-                        w.hc_eps);
+        if (use_batched_gpu_hc) {
+            if (!deepseek4_cuda_hc_output_batch_device(
+                    batched_hc.hc_state->data,
+                    w.output_hc_fn ? w.output_hc_fn->data : nullptr,
+                    w.output_hc_scale ? w.output_hc_scale->data : nullptr,
+                    w.output_hc_base ? w.output_hc_base->data : nullptr,
+                    n_tokens,
+                    n_embd,
+                    n_hc,
+                    w.hc_eps,
+                    batched_hc.final_embd->data)) {
+                std::fprintf(stderr, "[deepseek4] batched hc-output failed\n");
+                return false;
+            }
+        } else {
+            hc_output_batch(final_embd,
+                            hc_state.data(),
+                            hc_output_weights_range,
+                            n_tokens,
+                            n_embd,
+                            n_hc,
+                            w.hc_eps);
+        }
 
         if (reuse_decode_graphs) {
             if (!cached_decode_output_graph.valid() ||
@@ -3440,7 +3719,11 @@ bool deepseek4_step_layer_range(
                 ggml_free(ctx);
                 return false;
             }
-            ggml_backend_tensor_set(inp, final_embd.data(), 0, sizeof(float) * final_embd.size());
+            if (use_batched_gpu_hc) {
+                ggml_backend_tensor_copy(batched_hc.final_embd, inp);
+            } else {
+                ggml_backend_tensor_set(inp, final_embd.data(), 0, sizeof(float) * final_embd.size());
+            }
             if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
                 ggml_free(ctx);
                 return false;
@@ -3455,6 +3738,10 @@ bool deepseek4_step_layer_range(
         if (telemetry) telemetry->output_us += ds4_elapsed_us(output_t0, Ds4TimingClock::now());
     } else if (out_logits) {
         // Return full HC state for next shard (all n_hc streams)
+        if (use_batched_gpu_hc) {
+            ggml_backend_tensor_get(batched_hc.hc_state, hc_state.data(), 0,
+                                    sizeof(float) * hc_state.size());
+        }
         out_logits->resize((size_t)hc_dim * n_tokens);
         memcpy(out_logits->data(), hc_state.data(), sizeof(float) * hc_dim * n_tokens);
     }
@@ -3756,6 +4043,7 @@ void free_deepseek4_snapshot(DeepSeek4Snapshot & s) {
     if (s.ctx) { ggml_free(s.ctx); s.ctx = nullptr; }
     s.layers.clear();
     s.cur_pos = 0;
+    s.last_logits.clear();
     s.hc_state_snap = nullptr;
 }
 

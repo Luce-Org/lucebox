@@ -239,6 +239,10 @@ bool DeepSeek4LayerSplitAdapter::init() {
             return false;
         }
         hc_state_.resize(hc_state_elements(shard.weights), 0.0f);
+        auto shard_metas = layer_split_shard_metas(shards_);
+        if (!init_layer_split_snapshot_backends(shard_metas, snapshot_backends_, "deepseek4-split")) {
+            return false;
+        }
         std::fprintf(stderr, "[deepseek4-split] single shard: gpu=%d layers=[0,43) (+output)\n", shard.gpu);
         return true;
     }
@@ -440,7 +444,6 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
     const auto forward_t0 = SplitClock::now();
     const int n_tokens = (int)tokens.size();
     const int n_embd = shards_[0].weights.n_embd;
-    const int n_hc = shards_[0].weights.n_hc;
 
     // Embed tokens on first shard
     auto & first_shard = shards_[0];
@@ -453,24 +456,15 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
     DeepSeek4StepTelemetry tel_acc;
     if (timing) tel_acc.embed_us = split_elapsed_us(embed_t0, SplitClock::now());
 
-    // Initialize HC state from embedding for new sequences
-    if (base_pos == 0 && cur_pos_ == 0) {
-        for (int t = 0; t < n_tokens; ++t) {
-            for (int h = 0; h < n_hc; ++h) {
-                std::memcpy(hc_state_.data() + (size_t)h * n_embd,
-                           embed.data() + (size_t)t * n_embd,
-                           (size_t)n_embd * sizeof(float));
-            }
-        }
-    }
-
     // If using mixed target split (remote Halo shard), delegate to that path
     if (use_mixed_target_split()) {
         return run_mixed_forward(tokens, base_pos, last_tok, logits_out);
     }
 
-    // Local multi-GPU path: run each shard's layers sequentially
-    // Pass HC state between shards at boundaries
+    // Local multi-GPU path: run each shard's layers sequentially.
+    // Shard 0 consumes token embeddings; later shards consume the full
+    // token-major HC boundary state emitted by the previous shard.
+    const float * shard_input = embed.data();
     for (size_t si = 0; si < shards_.size(); ++si) {
         auto & shard = shards_[si];
         const bool is_last = (si == shards_.size() - 1);
@@ -479,13 +473,14 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
 
         if (!deepseek4_step_layer_range(
                 shard.backend, shard.weights, shard.cache,
-                hc_state_, embed.data(), n_tokens, base_pos,
+                hc_state_, shard_input, n_tokens, base_pos,
                 shard.layer_begin, shard.layer_end,
                 shard_logits, tokens.data(), timing ? &step_tel : nullptr)) {
             std::fprintf(stderr, "[deepseek4-split] forward failed on shard %zu\n", si);
             return false;
         }
         if (timing) add_step_tel(tel_acc, step_tel);
+        shard_input = hc_state_.data();
     }
 
     cur_pos_ = base_pos + n_tokens;
@@ -575,8 +570,9 @@ bool DeepSeek4LayerSplitAdapter::run_mixed_forward(
 bool DeepSeek4LayerSplitAdapter::prefill(
         const std::vector<int32_t> & prompt,
         int base_pos,
-        int & last_tok) {
-    const int chunk_size = cfg_.chunk > 0 ? cfg_.chunk : 512;
+        int & last_tok,
+        bool need_logits) {
+    const int chunk_size = 1;
     const int n_prompt = (int)prompt.size();
 
     for (int offset = 0; offset < n_prompt; offset += chunk_size) {
@@ -585,7 +581,7 @@ bool DeepSeek4LayerSplitAdapter::prefill(
                                     prompt.begin() + chunk_end);
 
         std::vector<float> * logits_out =
-            (chunk_end >= n_prompt) ? &prefill_last_logits_ : nullptr;
+            (need_logits && chunk_end >= n_prompt) ? &prefill_last_logits_ : nullptr;
 
         if (!run_forward(chunk, base_pos + offset, last_tok, logits_out)) {
             return false;

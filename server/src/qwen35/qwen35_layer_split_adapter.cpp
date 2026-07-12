@@ -522,7 +522,9 @@ int Qwen35LayerSplitAdapter::prefill_chunk_tokens() const {
 }
 
 bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
-                                      int base_pos, int & last_tok) {
+                                      int base_pos, int & last_tok,
+                                      bool need_logits) {
+    (void)need_logits;
     if (prompt.empty()) return false;
     if (base_pos < 0 || base_pos + (int)prompt.size() > cfg_.device.max_ctx) {
         std::fprintf(stderr,

@@ -220,29 +220,26 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
                 ? compiled_placement_backend()
                 : args.device.backend;
 
-        // HIP single-device launches cannot rely on the CUDA/Halo auto-split
-        // path; use the single-backend loader, which can fall back to hybrid
-        // expert placement when a full monolithic load does not fit.
         if (target_backend == PlacementBackend::Hip &&
             !args.device.is_layer_split() &&
             !args.remote_target_shard.enabled()) {
             DeepSeek4BackendConfig cfg;
             cfg.model_path = args.model_path;
-            cfg.device     = args.device;
-            cfg.stream_fd  = args.stream_fd;
-            cfg.max_ctx    = args.device.max_ctx;
-            cfg.chunk      = args.chunk;
+            cfg.device = args.device;
+            cfg.max_ctx = args.device.max_ctx;
+            cfg.chunk = args.chunk;
 
             auto backend = std::make_unique<DeepSeek4Backend>(cfg);
             if (!backend->init()) {
-                std::fprintf(stderr, "[backend_factory] DeepSeek4Backend init failed\n");
+                std::fprintf(stderr, "[backend_factory] DeepSeek4Backend full-weight init failed\n");
                 return nullptr;
             }
             return backend;
         }
 
-        // CUDA builds keep the layer-split backend so they can auto-split
-        // across CUDA and remote HIP target shards.
+        // CUDA keeps the layer-split backend so prefill stays on the batched
+        // layer-range path. HIP single-device can still load all weights
+        // monolithically, without the removed hybrid expert fallback.
         DeepSeek4LayerSplitAdapterConfig cfg;
         cfg.target_path        = args.model_path;
         cfg.device             = args.device;

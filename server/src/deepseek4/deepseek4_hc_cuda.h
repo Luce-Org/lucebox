@@ -47,4 +47,36 @@ bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
                                          void *        post_device,
                                          void *        comb_device);
 
+bool deepseek4_cuda_hc_pre_batch_device(const void * hc_state_device,
+                                        const void * fn_device,
+                                        const void * scale_device,
+                                        const void * base_device,
+                                        int          n_tokens,
+                                        int          n_embd,
+                                        int          n_hc,
+                                        int          sinkhorn_iters,
+                                        float        eps,
+                                        void *       working_device,
+                                        void *       post_device,
+                                        void *       comb_device);
+
+bool deepseek4_cuda_hc_post_batch_device(const void * residual_hc_device,
+                                         const void * block_out_device,
+                                         const void * post_device,
+                                         const void * comb_device,
+                                         int          n_tokens,
+                                         int          n_embd,
+                                         int          n_hc,
+                                         void *       out_hc_device);
+
+bool deepseek4_cuda_hc_output_batch_device(const void * hc_state_device,
+                                           const void * fn_device,
+                                           const void * scale_device,
+                                           const void * base_device,
+                                           int          n_tokens,
+                                           int          n_embd,
+                                           int          n_hc,
+                                           float        eps,
+                                           void *       final_embd_device);
+
 } // namespace dflash::common
