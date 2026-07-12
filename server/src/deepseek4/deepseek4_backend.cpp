@@ -335,6 +335,7 @@ bool DeepSeek4Backend::init() {
     // Preserve the hybrid loader as the OOM fallback and as an explicit override.
     if (!force_hybrid && !load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
         std::fprintf(stderr, "[deepseek4] full model load failed, trying hybrid mode...\n");
+        free_deepseek4_weights(w_);
         if (!init_hybrid_model()) {
             std::fprintf(stderr, "[deepseek4] hybrid mode also failed: %s\n", cfg_.model_path);
             return false;
@@ -511,6 +512,7 @@ bool DeepSeek4Backend::unpark(const std::string & what) {
     const bool force_hybrid = env_flag_enabled("DFLASH_DEEPSEEK4_FORCE_HYBRID");
     if (!force_hybrid && !load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
         std::fprintf(stderr, "[deepseek4] unpark: full model reload failed, trying hybrid mode...\n");
+        free_deepseek4_weights(w_);
         if (!init_hybrid_model()) {
             std::fprintf(stderr, "[deepseek4] unpark: failed to restore target model\n");
             free_deepseek4_weights(w_);

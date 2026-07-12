@@ -1,5 +1,4 @@
 #include "rocmfpx.h"
-#include "rocmfp4.h"
 #include "ggml.h"
 
 #include <assert.h>
