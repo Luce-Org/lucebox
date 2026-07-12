@@ -86,7 +86,7 @@ __global__ static void ds4_flash_attn_d512_f32_shared_kv_kernel(
     }
 }
 
-static bool ggml_cuda_ds4_flash_attn_d512_f32(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static bool ggml_cuda_ds4_flash_attn_d512_f32_supported(int device, const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -94,20 +94,18 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(ggml_backend_cuda_context & ctx, g
     const ggml_tensor * sinks = dst->src[4];
     if (!Q || !K || !V || !mask ||
         Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F32 || V->type != GGML_TYPE_F32 ||
-        mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(mask) ||
+        mask->type != GGML_TYPE_F16 ||
+        !ggml_is_contiguous(Q) || !ggml_is_contiguous(K) || !ggml_is_contiguous(V) ||
+        !ggml_is_contiguous(mask) || !ggml_is_contiguous(dst) ||
         dst->type != GGML_TYPE_F32 ||
         Q->ne[0] != 512 || K->ne[0] != 512 || V->ne[0] != 512 ||
         K->ne[2] != 1 || V->ne[2] != 1 ||
         Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 ||
-        dst->ne[0] != 512 || dst->ne[1] != Q->ne[2] || dst->ne[2] != Q->ne[1] ||
-        Q->nb[0] != (int64_t) sizeof(float) ||
-        K->nb[0] != (int64_t) sizeof(float) ||
-        V->nb[0] != (int64_t) sizeof(float) ||
-        dst->nb[0] != (int64_t) sizeof(float) ||
-        mask->ne[0] != K->ne[1] || mask->ne[1] != Q->ne[1]) {
+        dst->ne[0] != 512 || dst->ne[1] != Q->ne[2] || dst->ne[2] != Q->ne[1] || dst->ne[3] != 1 ||
+        mask->ne[0] != K->ne[1] || mask->ne[1] != Q->ne[1] || mask->ne[2] != 1 || mask->ne[3] != 1) {
         return false;
     }
-    if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->ne[0] != Q->ne[2])) {
+    if (sinks && (sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks) || sinks->ne[0] != Q->ne[2])) {
         return false;
     }
 
@@ -117,6 +115,26 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(ggml_backend_cuda_context & ctx, g
     if (n_tokens <= 0 || n_heads <= 0 || n_kv <= 0) {
         return false;
     }
+
+    constexpr size_t k_static_smem = 2 * 256 * sizeof(float);
+    const size_t max_shared = ggml_cuda_info().devices[device].smpb;
+    return max_shared > k_static_smem &&
+           (size_t) n_kv <= (max_shared - k_static_smem) / sizeof(float);
+}
+
+static bool ggml_cuda_ds4_flash_attn_d512_f32(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (!ggml_cuda_ds4_flash_attn_d512_f32_supported(ctx.device, dst)) {
+        return false;
+    }
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+    const int n_tokens = (int) Q->ne[1];
+    const int n_heads = (int) Q->ne[2];
+    const int n_kv = (int) K->ne[1];
 
     cudaStream_t stream = ctx.stream();
     dim3 grid((unsigned) n_tokens, (unsigned) n_heads, 1);
@@ -131,6 +149,11 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(ggml_backend_cuda_context & ctx, g
             n_tokens,
             n_heads,
             n_kv);
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        GGML_LOG_ERROR("%s: launch failed: %s\n", __func__, cudaGetErrorString(err));
+        return false;
+    }
     return true;
 }
 
@@ -500,6 +523,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (V->ne[0] != K->ne[0]) {
                 return BEST_FATTN_KERNEL_NONE;
             }
+            if (!gqa_opt_applies && (turing_mma_available(cc) || volta_mma_available(cc))) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
             break;
         case 576:
             if (V->ne[0] != 512) {
@@ -718,5 +744,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
-    return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
+    return ggml_cuda_ds4_flash_attn_d512_f32_supported(device, dst) ||
+           ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

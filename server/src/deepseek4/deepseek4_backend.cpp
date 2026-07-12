@@ -508,24 +508,20 @@ bool DeepSeek4Backend::unpark(const std::string & what) {
     const bool want_target = (what.empty() || what == "all" || what == "target");
     if (!want_target || !parked_) return true;
 
-    const PlacementBackend target_backend =
-        cfg_.device.backend == PlacementBackend::Auto
-            ? compiled_placement_backend()
-            : cfg_.device.backend;
-
-    if (target_backend == PlacementBackend::Hip) {
+    const bool force_hybrid = env_flag_enabled("DFLASH_DEEPSEEK4_FORCE_HYBRID");
+    if (!force_hybrid && !load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
+        std::fprintf(stderr, "[deepseek4] unpark: full model reload failed, trying hybrid mode...\n");
         if (!init_hybrid_model()) {
-            std::fprintf(stderr, "[deepseek4] unpark: failed to restore hybrid mode\n");
+            std::fprintf(stderr, "[deepseek4] unpark: failed to restore target model\n");
             free_deepseek4_weights(w_);
             stream_engine_.destroy();
             moe_hybrid_.reset();
             moe_placement_ = {};
             return false;
         }
-    } else if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
-        std::fprintf(stderr, "[deepseek4] unpark: full model reload failed, trying hybrid mode...\n");
+    } else if (force_hybrid) {
         if (!init_hybrid_model()) {
-            std::fprintf(stderr, "[deepseek4] unpark: failed to restore target model\n");
+            std::fprintf(stderr, "[deepseek4] unpark: failed to restore forced hybrid mode\n");
             free_deepseek4_weights(w_);
             stream_engine_.destroy();
             moe_hybrid_.reset();
@@ -635,8 +631,14 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                             tokens.data() + i,
                                             timing ? &step_tel : nullptr,
                                             /*allow_decode_graph_reuse=*/true, hp);
-            if (hp && !spec_cap.empty()) {
-                const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
+            if (ok && hp) {
+                const size_t feat_row = (size_t) spec_drafter_->n_target_layers * (size_t) w_.n_embd;
+                const size_t expected = (size_t) n_tok * feat_row;
+                if (feat_row == 0 || spec_cap.size() != expected) {
+                    std::fprintf(stderr, "[deepseek4] speculative capture size mismatch: got=%zu expected=%zu\n",
+                                 spec_cap.size(), expected);
+                    return -1;
+                }
                 for (int t = 0; t < n_tok; t++)
                     spec_feat_window_.insert(spec_feat_window_.end(),
                         spec_cap.begin() + (size_t) t * feat_row,
@@ -776,25 +778,31 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
 
     // Decode
     auto t1 = Clock::now();
-    if (spec_enabled_ && spec_drafter_ && req.n_gen > 0) {
+    if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 && req.budget_hook.close_token_ids.empty()) {
         if (last_logits_.empty()) { result.error = "spec: no prefill logits"; return result; }
         int seed = 0;
         { float mv = last_logits_[0];
           for (int i = 1; i < w_.n_vocab; i++) if (last_logits_[i] > mv) { mv = last_logits_[i]; seed = i; } }
         std::vector<int32_t> gen;
-        gen.push_back(seed);
-        io.emit(seed);
+        if (!io.cancelled) {
+            gen.push_back(seed);
+            io.emit(seed);
+        }
         float accept_rate = 0.0f;
-        if (!deepseek4_is_eos_tok(seed, w_) && req.n_gen > 1) {
-            const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
-            const int win_len = feat_row > 0 ? (int) (spec_feat_window_.size() / feat_row) : 0;
+        if (!io.cancelled && !deepseek4_is_eos_tok(seed, w_) && req.n_gen > 1) {
+            const size_t feat_row = (size_t) spec_drafter_->n_target_layers * (size_t) w_.n_embd;
+            const int win_len = feat_row > 0 && spec_feat_window_.size() % feat_row == 0
+                ? (int) (spec_feat_window_.size() / feat_row) : 0;
             std::vector<int32_t> spec_toks;
             run_deepseek4_dspark_spec_decode(backend_, w_, cache_, *spec_drafter_,
                 committed, seed, req.n_gen - 1,
                 win_len > 0 ? spec_feat_window_.data() : nullptr, win_len,
                 spec_toks, &accept_rate);
-            for (int t : spec_toks) io.emit(t);
-            gen.insert(gen.end(), spec_toks.begin(), spec_toks.end());
+            for (int t : spec_toks) {
+                if (io.cancelled) break;
+                io.emit(t);
+                gen.push_back(t);
+            }
         }
         result.ok = true;
         result.tokens = std::move(gen);

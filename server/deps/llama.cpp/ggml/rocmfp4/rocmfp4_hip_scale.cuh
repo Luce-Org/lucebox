@@ -96,6 +96,9 @@ static __device__ __forceinline__ float rocmfp4_ue4m3_to_fp32_half_finite(uint8_
 #if defined(GGML_USE_HIP) && GGML_ROCMFP4_USE_SCALE_LUT
     return x <= 0x7e ? rocmfp4_scale_ue4m3_half_lut[x] : 0.0f;
 #else
+    if (x > 0x7e) {
+        return 0.0f;
+    }
     const int exp = (x >> 3) & 0xF;
     const int man = x & 0x7;
 

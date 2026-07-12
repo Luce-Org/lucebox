@@ -116,7 +116,8 @@ DeepSeek4 uses the shared DFlash DSpark head implementation together with a
 DeepSeek4-specific three-layer drafter and fused target verification. The draft
 GGUF carries its auxiliary projections under the existing `dflash.dspark.*`
 tensor contract. DeepSeek4/MTP checkpoints store compatible heads under the
-`mtp.2.*` namespace, which the converter maps as follows.
+`mtp.2.*` namespace. DeepSeek4 draft artifacts use the following GGUF tensor
+names.
 
 Supported DeepSeek4/MTP input tensors:
 
@@ -127,21 +128,16 @@ Supported DeepSeek4/MTP input tensors:
 | `mtp.2.confidence_head.proj.weight` | `dflash.dspark.confidence.weight` |
 | `mtp.2.confidence_head.proj.bias` | `dflash.dspark.confidence.bias` |
 
-If the MTP confidence projection is bias-less, the converter writes a zero
-bias so the GGUF loader still sees the pair it expects. The Markov head alone
-is enough for DSpark greedy-chain correction; confidence gating remains
+If the MTP confidence projection is bias-less, the artifact must contain a
+zero bias so the GGUF loader still sees the pair it expects. The Markov head
+alone is enough for DSpark greedy-chain correction; confidence gating remains
 optional.
 
-Example conversion with the DS4 MTP shard that contains the DSpark heads:
+This repository does not yet ship a DeepSeek4 draft converter. Do not use
+`convert_dflash_to_gguf.py` for this model: it emits the Qwen draft
+architecture and cannot produce a loadable `deepseek4-dflash-draft` artifact.
 
-```bash
-python server/scripts/convert_dflash_to_gguf.py \
-  /path/to/dflash-draft/model.safetensors \
-  /path/to/dflash-draft.gguf \
-  --aux-heads /path/to/hf-ds4-flash-dspark/model-00048-of-00048.safetensors
-```
-
-Run the converted drafter against a DeepSeek4 target with:
+Run a compatible drafter against a DeepSeek4 target with:
 
 ```bash
 export DFLASH_DS4_SPEC=1

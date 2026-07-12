@@ -489,7 +489,7 @@ static __global__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_
 }
 
 template<typename dst_t>
-static __global__ void dequantize_block_rocmfp4(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+static __global__ void dequantize_block_rocmfp4(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t ne) {
 
     const int64_t i   = blockIdx.x;
     const block_rocmfp4 * x = (const block_rocmfp4 *) vx + i*(QK_K/QK_ROCMFP4);
@@ -497,18 +497,22 @@ static __global__ void dequantize_block_rocmfp4(const void * __restrict__ vx, ds
     const int64_t tid = threadIdx.x;
     const int64_t il = tid/8; // 0...3
     const int64_t ib = tid%8; // 0...7
-    dst_t * y = yy + i*QK_K + 32*ib + 4*il;
+    const int64_t y_base = i*QK_K + 32*ib + 4*il;
     const uint8_t * q4 = x[ib].qs + 4*il;
     const float d0 = rocmfp4_ue4m3_to_fp32_half_finite(x[ib].e[0]);
     const float d1 = rocmfp4_ue4m3_to_fp32_half_finite(x[ib].e[1]);
     for (int j = 0; j < 4; ++j) {
-        y[j+ 0] = d0 * rocmfp4_decode_i8(q4[j]);
-        y[j+16] = d1 * rocmfp4_decode_i8(q4[j] >>  4);
+        if (y_base + j < ne) {
+            yy[y_base + j] = d0 * rocmfp4_decode_i8(q4[j]);
+        }
+        if (y_base + 16 + j < ne) {
+            yy[y_base + 16 + j] = d1 * rocmfp4_decode_i8(q4[j] >>  4);
+        }
     }
 }
 
 template<typename dst_t>
-static __global__ void dequantize_block_rocmfp4_fast(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+static __global__ void dequantize_block_rocmfp4_fast(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t ne) {
 
     const int64_t i = blockIdx.x;
     const block_rocmfp4_fast * x = (const block_rocmfp4_fast *) vx + i*(QK_K/QK_ROCMFP4);
@@ -516,12 +520,16 @@ static __global__ void dequantize_block_rocmfp4_fast(const void * __restrict__ v
     const int64_t tid = threadIdx.x;
     const int64_t il = tid/8; // 0...3
     const int64_t ib = tid%8; // 0...7
-    dst_t * y = yy + i*QK_K + 32*ib + 4*il;
+    const int64_t y_base = i*QK_K + 32*ib + 4*il;
     const uint8_t * q4 = x[ib].qs + 4*il;
     const float d = rocmfp4_ue4m3_to_fp32_half_finite(x[ib].e);
     for (int j = 0; j < 4; ++j) {
-        y[j+ 0] = d * rocmfp4_decode_i8(q4[j]);
-        y[j+16] = d * rocmfp4_decode_i8(q4[j] >>  4);
+        if (y_base + j < ne) {
+            yy[y_base + j] = d * rocmfp4_decode_i8(q4[j]);
+        }
+        if (y_base + 16 + j < ne) {
+            yy[y_base + 16 + j] = d * rocmfp4_decode_i8(q4[j] >>  4);
+        }
     }
 }
 
@@ -686,13 +694,13 @@ static void dequantize_row_mxfp4_cuda(const void * vx, dst_t * y, const int64_t 
 template<typename dst_t>
 static void dequantize_row_rocmfp4_hip(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
-    dequantize_block_rocmfp4<<<nb, 32, 0, stream>>>(vx, y);
+    dequantize_block_rocmfp4<<<nb, 32, 0, stream>>>(vx, y, k);
 }
 
 template<typename dst_t>
 static void dequantize_row_rocmfp4_fast_hip(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
-    dequantize_block_rocmfp4_fast<<<nb, 32, 0, stream>>>(vx, y);
+    dequantize_block_rocmfp4_fast<<<nb, 32, 0, stream>>>(vx, y, k);
 }
 
 template <typename dst_t>

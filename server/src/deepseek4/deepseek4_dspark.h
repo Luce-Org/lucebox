@@ -77,7 +77,6 @@ const char * deepseek4_dspark_last_error();
 // features. All host-side f32 for a simple v1 (GPU feature-ring plumbing can
 // come later).
 //
-//   seed_tok        : the committed anchor token (block position 0's embedding)
 //   noise_embed     : [n_embd * block_size] embeds of [seed]+[MASK]*(block_size-1)
 //   ctx_features    : [n_target_layers*n_embd * ctx_len] captured features,
 //                     ordered oldest..newest, absolute positions

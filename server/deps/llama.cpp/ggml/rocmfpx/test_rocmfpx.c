@@ -1,4 +1,6 @@
 #include "rocmfpx.h"
+#include "rocmfp4.h"
+#include "ggml.h"
 
 #include <assert.h>
 #include <math.h>
@@ -100,6 +102,26 @@ static void check_weighted_imatrix_fp2(void) {
     assert(weighted_err < plain_err);
 }
 
+static void check_ggml_quantize_dispatch(const float * src) {
+    enum { N = 64 };
+    const enum ggml_type types[] = {
+        GGML_TYPE_Q4_0_ROCMFP4,
+        GGML_TYPE_Q4_0_ROCMFP4_FAST,
+        GGML_TYPE_Q2_0_ROCMFP2,
+        GGML_TYPE_Q3_0_ROCMFPX,
+        GGML_TYPE_Q6_0_ROCMFPX,
+        GGML_TYPE_Q8_0_ROCMFPX,
+    };
+
+    uint8_t dst[256];
+    for (size_t i = 0; i < sizeof(types)/sizeof(types[0]); ++i) {
+        const size_t row_size = ggml_row_size(types[i], N);
+        assert(row_size <= sizeof(dst));
+        const size_t written = ggml_quantize_chunk(types[i], src, dst, 0, 1, N, NULL);
+        assert(written == row_size);
+    }
+}
+
 int main(void) {
     enum { N = 64 };
 
@@ -115,6 +137,7 @@ int main(void) {
     block_rocmfp8 q8[N / QK_ROCMFP8];
 
     fill_row(src, N);
+    check_ggml_quantize_dispatch(src);
 
     rocmfpx_quantize_row_fp2_ref(src, q2, N);
     rocmfpx_quantize_row_fp3_ref(src, q3, N);
