@@ -376,13 +376,24 @@ bool Qwen35DFlashTarget::rollback_to_tree(
             (size_t)rollback_dfs * cap.ssm_intermediate_states->nb[3];
         const void * ssm_src =
             (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
-        const auto to_fp32 = ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type);
-        if (!to_fp32) {
-            std::fprintf(stderr, "rollback_to_tree: no fp32 converter for type %d (layer %d)\n",
-                         (int)cap.ssm_intermediate_states->type, il);
-            return false;
+        if (cap.ssm_intermediate_states->type == GGML_TYPE_F32) {
+            const cudaError_t ce = cudaMemcpyAsync(cache_.ssm_state[il]->data, ssm_src,
+                                                    ssm_elems * sizeof(float),
+                                                    cudaMemcpyDeviceToDevice, stream);
+            if (ce != cudaSuccess) {
+                std::fprintf(stderr, "rollback_to_tree: F32 SSM copy failed at layer %d: %s\n",
+                             il, cudaGetErrorString(ce));
+                return false;
+            }
+        } else {
+            const auto to_fp32 = ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type);
+            if (!to_fp32) {
+                std::fprintf(stderr, "rollback_to_tree: no fp32 converter for type %d (layer %d)\n",
+                             (int)cap.ssm_intermediate_states->type, il);
+                return false;
+            }
+            to_fp32(ssm_src, (float *)cache_.ssm_state[il]->data, (int64_t)ssm_elems, stream);
         }
-        to_fp32(ssm_src, (float *)cache_.ssm_state[il]->data, (int64_t)ssm_elems, stream);
 
         // Conv state ← the K-1 most recent inputs along rollback_dfs's ancestry.
         const int K_conv = 4;
@@ -551,7 +562,6 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
         cache_.cur_pos = base_pos + commit_n;
         return true;
     }
-
     const int rollback_idx = commit_n - 1;  // index into per-step intermediates
     cudaStream_t stream = nullptr;
 
@@ -589,16 +599,30 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
             (size_t)rollback_idx * cap.ssm_intermediate_states->nb[3];
         const void * ssm_src =
             (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
-        const auto to_fp32 = ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type);
-        if (!to_fp32) {
-            if (kFastRollbackDiag) {
-                std::fprintf(stderr, "rollback_to: no fp32 converter type=%d layer=%d\n",
-                             (int)cap.ssm_intermediate_states->type, il);
+        if (cap.ssm_intermediate_states->type == GGML_TYPE_F32) {
+            const size_t ssm_bytes = ssm_elems * sizeof(float);
+            const cudaError_t ce = cudaMemcpyAsync(cache_.ssm_state[il]->data, ssm_src,
+                                                    ssm_bytes,
+                                                    cudaMemcpyDeviceToDevice, stream);
+            if (ce != cudaSuccess) {
+                if (kFastRollbackDiag) {
+                    std::fprintf(stderr, "rollback_to: F32 SSM copy failed layer=%d: %s\n",
+                                 il, cudaGetErrorString(ce));
+                }
+                return false;
             }
-            return false;
+        } else {
+            const auto to_fp32 = ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type);
+            if (!to_fp32) {
+                if (kFastRollbackDiag) {
+                    std::fprintf(stderr, "rollback_to: no fp32 converter type=%d layer=%d\n",
+                                 (int)cap.ssm_intermediate_states->type, il);
+                }
+                return false;
+            }
+            to_fp32(ssm_src, (float *)cache_.ssm_state[il]->data,
+                    (int64_t)ssm_elems, stream);
         }
-        to_fp32(ssm_src, (float *)cache_.ssm_state[il]->data,
-                (int64_t)ssm_elems, stream);
 
         // Conv rollback: copy conv_input[commit_n..commit_n+K-2, :, :]
         // into cache.conv_state[il].

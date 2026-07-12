@@ -3617,10 +3617,21 @@ int main(int argc, char ** argv) {
                         (size_t)rollback_dfs * cap.ssm_intermediate_states->nb[3];
                     const void * ssm_src =
                         (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
-                    ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type)(
-                        ssm_src, (float *)cache.ssm_state[il]->data,
-                        (int64_t)ssm_elems, stream);
-                    cudaError_t ce = cudaSuccess;  // launch error checked in the conv block below
+                    cudaError_t ce = cudaSuccess;
+                    if (cap.ssm_intermediate_states->type == GGML_TYPE_F32) {
+                        ce = cudaMemcpyAsync(cache.ssm_state[il]->data, ssm_src,
+                                             ssm_elems * sizeof(float),
+                                             cudaMemcpyDeviceToDevice, stream);
+                    } else {
+                        ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type)(
+                            ssm_src, (float *)cache.ssm_state[il]->data,
+                            (int64_t)ssm_elems, stream);
+                    }
+                    if (ce != cudaSuccess) {
+                        std::fprintf(stderr, "ddtree F32 SSM rollback il=%d: %s\n",
+                                     il, cudaGetErrorString(ce));
+                        return 1;
+                    }
 
                     // Conv rollback: copy the K-1 most recent inputs along
                     // the rolled-back token's ANCESTRY (not DFS order). Two
@@ -3952,10 +3963,21 @@ int main(int argc, char ** argv) {
                         (size_t)rollback_idx * cap.ssm_intermediate_states->nb[3];
                     const void * ssm_src =
                         (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
-                    ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type)(
-                        ssm_src, (float *)cache.ssm_state[il]->data,
-                        (int64_t)ssm_elems, stream);
                     cudaError_t ce = cudaSuccess;
+                    if (cap.ssm_intermediate_states->type == GGML_TYPE_F32) {
+                        ce = cudaMemcpyAsync(cache.ssm_state[il]->data, ssm_src,
+                                             ssm_elems * sizeof(float),
+                                             cudaMemcpyDeviceToDevice, stream);
+                    } else {
+                        ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type)(
+                            ssm_src, (float *)cache.ssm_state[il]->data,
+                            (int64_t)ssm_elems, stream);
+                    }
+                    if (ce != cudaSuccess) {
+                        std::fprintf(stderr, "F32 SSM rollback il=%d: %s\n",
+                                     il, cudaGetErrorString(ce));
+                        return 1;
+                    }
 
                     // ── Conv rollback: copy conv_input[commit_n..commit_n+K-2, :, :]
                     //    into cache.conv_state[il].

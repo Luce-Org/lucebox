@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <vector>
 
+#include "chain_rollback_policy.h"
+
 namespace dflash::common {
 
 namespace {
@@ -84,6 +86,13 @@ bool run_dflash_spec_decode(
     int n_accept_sum    = 0;
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
+    const ChainRollbackPolicy rollback_policy = resolve_chain_rollback_policy();
+    int rollback_accept_hist[17] = {};
+    int rollback_fast_low = 0;
+    int rollback_fast_high = 0;
+    int rollback_legacy_replay = 0;
+    int rollback_failed_fallback = 0;
+
 
     auto t_dec0 = std::chrono::steady_clock::now();
     while (n_generated < n_gen) {
@@ -213,9 +222,10 @@ bool run_dflash_spec_decode(
 
         // ── Commit accepted tokens to KV state ──────────────────────────
         // Adaptive: use fast-rollback when acceptance is high enough to benefit.
-        constexpr int kFastRollbackThreshold = 5;
+        rollback_accept_hist[std::min(accept_n, 16)]++;
         const bool use_fast_rollback =
-            target.supports_fast_rollback() && (accept_n >= kFastRollbackThreshold);
+            target.supports_fast_rollback() &&
+            (accept_n >= rollback_policy.fast_rollback_threshold);
 
         std::vector<int32_t> replay_tok((size_t)commit_n);
         for (int i = 0; i < commit_n; i++) {
@@ -236,15 +246,19 @@ bool run_dflash_spec_decode(
             if (target.rollback_to(committed, commit_n)) {
                 last_tok = target_tok[commit_n - 1];
                 fast_rolled_back = true;
+                if (accept_n < 5) rollback_fast_low++;
+                else rollback_fast_high++;
             } else {
                 // Rollback failed (e.g. CUDA error / unsupported state type).
                 // The pre-verify snapshot is still valid, so degrade to the
                 // legacy restore+replay path below instead of aborting.
                 std::fprintf(stderr, "dflash-spec rollback_to failed; "
                                      "falling back to restore+replay\n");
+                rollback_failed_fallback++;
             }
         }
         if (!fast_rolled_back) {
+            rollback_legacy_replay++;
             // Legacy path: restore SSM snapshot and replay accepted + bonus tokens.
             // (When falling back from fast-rollback, bonus_tok is already -1 and
             //  replay_tok/commit_n reflect the budget-clamped accepted set.)
@@ -296,6 +310,19 @@ bool run_dflash_spec_decode(
     std::printf("[target-split-dflash] %d draft steps, accepted=%d/%d (%.1f%%), avg commit/step=%.2f\n",
                 n_draft_steps, n_accept_sum, total_draft_pos, accept_pct,
                 n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0);
+    if (rollback_policy.diagnostics) {
+        std::printf("[chain-rollback-policy] checkpoint=%s threshold=%d fast_low=%d fast_high=%d legacy_replay=%d failed_fallback=%d accept_hist=1:%d,2:%d,3:%d,4:%d,5:%d,6:%d,7:%d,8:%d,9:%d,10:%d,11:%d,12:%d,13:%d,14:%d,15:%d,16+:%d\n",
+                    rollback_policy.checkpoint_f32 ? "F32" : "default",
+                    rollback_policy.fast_rollback_threshold,
+                    rollback_fast_low, rollback_fast_high, rollback_legacy_replay,
+                    rollback_failed_fallback,
+                    rollback_accept_hist[1], rollback_accept_hist[2], rollback_accept_hist[3],
+                    rollback_accept_hist[4], rollback_accept_hist[5], rollback_accept_hist[6],
+                    rollback_accept_hist[7], rollback_accept_hist[8], rollback_accept_hist[9],
+                    rollback_accept_hist[10], rollback_accept_hist[11], rollback_accept_hist[12],
+                    rollback_accept_hist[13], rollback_accept_hist[14], rollback_accept_hist[15],
+                    rollback_accept_hist[16]);
+    }
     if (n_hint_proposed > 0) {
         std::printf("[target-split-dflash] hint tokens: %d/%d accepted (%.1f%%)\n",
                     n_hint_accepted, n_hint_proposed,

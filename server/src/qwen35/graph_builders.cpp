@@ -24,7 +24,8 @@ bool build_layer_step(
     bool capture,
     int fa_window,
     int kq_stride_pad,
-    bool kvflash) {
+    bool kvflash,
+    bool tree_mode) {
     if (kvflash) with_mask = true;
     step_graph_free(sg);
 
@@ -74,6 +75,12 @@ bool build_layer_step(
         }
     }
 
+    if (tree_mode && !is_attn) {
+        sg.parent_ids = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+        ggml_set_name(sg.parent_ids, "parent_ids");
+        ggml_set_input(sg.parent_ids);
+    }
+
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
 
     ggml_tensor * layer_out = build_qwen35_layer(
@@ -81,7 +88,7 @@ bool build_layer_step(
         sg.inp_embed, sg.positions, sg.attn_mask,
         kv_start, n_tokens, capture, fa_window,
         /*q_tail_capture=*/nullptr, /*q_tail_start=*/0,
-        sg.kv_write_rows);
+        sg.kv_write_rows, sg.parent_ids);
     if (!layer_out) return false;
 
     ggml_tensor * out_view = ggml_view_2d(sg.ctx, act_out,

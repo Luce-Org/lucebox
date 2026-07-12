@@ -1,4 +1,5 @@
 #include "qwen35_backend.h"
+#include "common/chain_rollback_policy.h"
 #include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
 #include "graph_builders.h"
@@ -1927,12 +1928,33 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
     int target_forwards = 0;
+    const ChainRollbackPolicy rollback_policy = resolve_chain_rollback_policy();
+    int rollback_accept_hist[17] = {};
+    int rollback_fast_low = 0;
+    int rollback_fast_high = 0;
+    int rollback_legacy_replay = 0;
+    int rollback_failed_fallback = 0;
+
 
     auto log_target_forward_stats = [&]() {
         std::fprintf(stderr, "[spec-decode] target_forwards=%d forwards_per_token=%.6f forwards_per_step=%.3f\n",
                      target_forwards,
                      n_generated > 0 ? (double)target_forwards / n_generated : 0.0,
                      n_draft_steps > 0 ? (double)target_forwards / n_draft_steps : 0.0);
+        if (rollback_policy.diagnostics) {
+            std::fprintf(stderr,
+                         "[chain-rollback-policy] checkpoint=%s threshold=%d fast_low=%d fast_high=%d legacy_replay=%d failed_fallback=%d accept_hist=1:%d,2:%d,3:%d,4:%d,5:%d,6:%d,7:%d,8:%d,9:%d,10:%d,11:%d,12:%d,13:%d,14:%d,15:%d,16+:%d\n",
+                         rollback_policy.checkpoint_f32 ? "F32" : "default",
+                         rollback_policy.fast_rollback_threshold,
+                         rollback_fast_low, rollback_fast_high, rollback_legacy_replay,
+                         rollback_failed_fallback,
+                         rollback_accept_hist[1], rollback_accept_hist[2], rollback_accept_hist[3],
+                         rollback_accept_hist[4], rollback_accept_hist[5], rollback_accept_hist[6],
+                         rollback_accept_hist[7], rollback_accept_hist[8], rollback_accept_hist[9],
+                         rollback_accept_hist[10], rollback_accept_hist[11], rollback_accept_hist[12],
+                         rollback_accept_hist[13], rollback_accept_hist[14], rollback_accept_hist[15],
+                         rollback_accept_hist[16]);
+        }
     };
 
     // kvflash: an in-pool prompt prefills contiguously without registering
@@ -2488,11 +2510,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // 6. Fix state: adaptive fast-rollback vs legacy replay.
         //    Fast-rollback (implicit bonus, skip replay) is profitable when
         //    accept_n is large enough that skipping the replay saves more compute
-        //    than the cost of deferring the bonus to the next step. Breakeven
-        //    is around accept_n ≈ 5. Below that, legacy replay is cheaper.
-        constexpr int kFastRollbackThreshold = 5;
+        //    than the cost of deferring the bonus to the next step. The default
+        //    threshold is 5; exact F32 checkpoints may opt in to a lower value.
+        rollback_accept_hist[std::min(accept_n, 16)]++;
         const bool use_fast_rollback =
-            target->supports_fast_rollback() && (accept_n >= kFastRollbackThreshold);
+            target->supports_fast_rollback() &&
+            (accept_n >= rollback_policy.fast_rollback_threshold);
 
         int replay_last_tok = -1;
         bool fast_rolled_back = false;
@@ -2508,15 +2531,19 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             if (target->rollback_to(committed, commit_n)) {
                 replay_last_tok = target_tok[commit_n - 1];
                 fast_rolled_back = true;
+                if (accept_n < 5) rollback_fast_low++;
+                else rollback_fast_high++;
             } else {
                 // Rollback failed (CUDA error / unsupported state type). The
                 // pre-verify snapshot is still valid, so degrade to the legacy
                 // restore+replay path below instead of aborting the request.
                 std::fprintf(stderr, "spec-decode: rollback_to failed; "
                                      "falling back to restore+replay\n");
+                rollback_failed_fallback++;
             }
         }
         if (!fast_rolled_back) {
+            rollback_legacy_replay++;
             // Legacy replay: restore SSM snapshot, replay accepted + bonus tokens.
             // (When falling back from fast-rollback, bonus_tok is -1 and commit_n
             //  is the budget-clamped accepted count.)

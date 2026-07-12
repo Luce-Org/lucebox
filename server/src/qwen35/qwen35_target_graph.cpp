@@ -35,6 +35,7 @@
 #include "kv_quant.h"
 #include "qwen35_ops.h"
 #include "qwen35moe_ffn.h"
+#include "common/chain_rollback_policy.h"
 
 #include <cmath>
 #include <cstdio>
@@ -377,6 +378,12 @@ bool migrate_prefill_cache(const TargetWeights & w,
     cache.rollback_ctx = ggml_init(ip);
     if (!cache.rollback_ctx) { set_last_error("rollback cache ggml_init failed"); return false; }
 
+    // Preserve the established F16 default. Opt in to PR #506's F32 checkpoint
+    // representation for single-GPU validation with an explicit environment flag.
+    const ChainRollbackPolicy rollback_policy = resolve_chain_rollback_policy();
+    const ggml_type checkpoint_type = rollback_policy.checkpoint_f32
+        ? GGML_TYPE_F32 : GGML_TYPE_F16;
+
     int dn_idx = 0;
     for (int il = 0; il < w.n_layer; il++) {
         if (((il + 1) % w.full_attention_interval) != 0) {
@@ -384,7 +391,7 @@ bool migrate_prefill_cache(const TargetWeights & w,
                                                    head_v_dim, head_v_dim, w.ssm_dt_rank);
             ggml_tensor * Cn = ggml_new_tensor_2d(cache.rollback_ctx, GGML_TYPE_F32,
                                                    w.ssm_d_conv - 1, conv_ch);
-            ggml_tensor * Si = ggml_new_tensor_4d(cache.rollback_ctx, GGML_TYPE_F16,
+            ggml_tensor * Si = ggml_new_tensor_4d(cache.rollback_ctx, checkpoint_type,
                                                    head_v_dim, head_v_dim,
                                                    w.ssm_dt_rank, max_verify_tokens);
             ggml_tensor * Ci = ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,
@@ -404,6 +411,18 @@ bool migrate_prefill_cache(const TargetWeights & w,
     }
 
     cache.rollback_buf = ggml_backend_alloc_ctx_tensors(cache.rollback_ctx, backend);
+    if (rollback_policy.diagnostics) {
+        size_t checkpoint_bytes = 0;
+        for (ggml_tensor * t : cache.ssm_intermediate) {
+            if (t) checkpoint_bytes += ggml_nbytes(t);
+        }
+        const ggml_type allocated_checkpoint_type = cache.ssm_intermediate.empty() || !cache.ssm_intermediate[0]
+            ? GGML_TYPE_COUNT : cache.ssm_intermediate[0]->type;
+        std::fprintf(stderr,
+            "[target-single][chain-rollback] checkpoint_dtype=%s delta_layers=%d max_verify_tokens=%d checkpoint_bytes=%zu\n",
+            allocated_checkpoint_type == GGML_TYPE_COUNT ? "missing" : ggml_type_name(allocated_checkpoint_type),
+            n_delta, max_verify_tokens, checkpoint_bytes);
+    }
     if (!cache.rollback_buf) {
         set_last_error("ggml_backend_alloc_ctx_tensors failed for rollback cache");
         ggml_free(cache.rollback_ctx);
@@ -792,6 +811,9 @@ static ggml_tensor * build_delta_net_block(
     ggml_tensor * qkv_T = ggml_transpose(ctx, qkv_mixed);
 
     ggml_tensor * conv_input = ggml_concat(ctx, conv_states_r, qkv_T, 0);
+    // I0 domain: [0,K_conv-2] are prefix-history rows; tree token flat slot t
+    // (root-inclusive, including synthetic root t=0) is stored at
+    // conv_input row (K_conv-1)+t.
     // conv_input: [kernel-1 + n_tokens, conv_channels, n_seqs]
 
     // For spec-decode rollback: copy the full conv_input into the persistent
@@ -1044,7 +1066,8 @@ static ggml_tensor * build_single_layer(
     ggml_tensor *         q_tail_capture = nullptr,
     int                   q_tail_start = 0,
     ggml_tensor **        moe_selected_out = nullptr,
-    ggml_tensor *         kv_write_rows = nullptr)
+    ggml_tensor *         kv_write_rows = nullptr,
+    ggml_tensor *         parent_ids = nullptr)
 {
     const int hidden = w.n_embd;
     const float eps   = w.rms_eps;
@@ -1076,9 +1099,16 @@ static ggml_tensor * build_single_layer(
         for (int il = 0; il < layer_idx; il++) {
             if (((il + 1) % w.full_attention_interval) != 0) dn_idx++;
         }
+        DeltaNetCapture cap{};
+        DeltaNetCapture * cap_ptr = nullptr;
+        if (capture) {
+            cap_ptr = &cap;
+            cap_ptr->ssm_intermediate_states = cache.ssm_intermediate[dn_idx];
+            cap_ptr->conv_input              = cache.conv_input_cache[dn_idx];
+        }
         cur = build_delta_net_block(ctx, gf, w, L, cur,
                                     cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
-                                    n_tokens, nullptr, nullptr,
+                                    n_tokens, cap_ptr, parent_ids,
                                     /*skip_gdn_intermediate=*/true);
     }
 
@@ -1334,12 +1364,13 @@ ggml_tensor * build_qwen35_layer(
     int                   fa_window,
     ggml_tensor *         q_tail_capture,
     int                   q_tail_start,
-    ggml_tensor *         kv_write_rows)
+    ggml_tensor *         kv_write_rows,
+    ggml_tensor *         parent_ids)
 {
     return build_single_layer(ctx, gf, w, cache, layer_idx, inp, positions,
                               attn_mask, kv_start, n_tokens, capture, fa_window,
                               q_tail_capture, q_tail_start, nullptr,
-                              kv_write_rows);
+                              kv_write_rows, parent_ids);
 }
 
 ggml_tensor * build_qwen35_layer(
@@ -1358,12 +1389,13 @@ ggml_tensor * build_qwen35_layer(
     ggml_tensor *         q_tail_capture,
     int                   q_tail_start,
     ggml_tensor **        moe_selected_out,
-    ggml_tensor *         kv_write_rows)
+    ggml_tensor *         kv_write_rows,
+    ggml_tensor *         parent_ids)
 {
     return build_single_layer(ctx, gf, w, cache, layer_idx, inp, positions,
                               attn_mask, kv_start, n_tokens, capture, fa_window,
                               q_tail_capture, q_tail_start, moe_selected_out,
-                              kv_write_rows);
+                              kv_write_rows, parent_ids);
 }
 
 QwenLayerPrefnOutputs build_qwen35_layer_prefn(
