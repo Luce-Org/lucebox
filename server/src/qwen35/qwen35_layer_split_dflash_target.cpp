@@ -73,6 +73,7 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
     }
     Qwen35SplitCaptureStats capture_stats;
     const bool capture_selftest = std::getenv("DFLASH_SPLIT_CAPTURE_SELFTEST") != nullptr;
+    const bool capture_diag = std::getenv("DFLASH_SPLIT_CHAIN_ROLLBACK_DIAG") != nullptr;
     capture_stats.reset(shards_.size());
     if (capture_ssm_intermediates) capture_stats.requested++;
 
@@ -93,7 +94,7 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
             capture_ssm_intermediates, &capture_stats);
     }
 
-    if (capture_selftest || capture_ssm_intermediates) {
+    if (capture_selftest || capture_diag) {
         std::fprintf(stderr,
             "[target-split][capture] split_capture_requested=%llu split_capture_enabled=%llu split_capture_missing_owner_count=%llu ok=%d\n",
             (unsigned long long)capture_stats.requested,
