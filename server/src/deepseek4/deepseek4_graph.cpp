@@ -3245,9 +3245,9 @@ bool deepseek4_step_layer_range(
             const int token_pos = kv_start + n_tokens - 1;
             // The cached single-token attention graph updates KV/compressor state
             // with ggml_set_rows. On HIP this path can fault after enough prompt
-            // tokens; use the dynamic graph until the cached state-update path is
-            // made safe.
-            const bool reuse_decode_attn = false;
+            // tokens; use the dynamic graph there until the cached state-update
+            // path is made safe. Other backends keep the cached decode graph.
+            const bool reuse_decode_attn = n_tokens == 1 && !ds4_backend_is_hip(backend);
             ggml_tensor * attn_out = nullptr;
             ggml_cgraph * gf = nullptr;
             ggml_context * ctx = nullptr;
