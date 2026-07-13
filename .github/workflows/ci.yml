@@ -172,12 +172,17 @@ jobs:
             -DDFLASH27B_ENABLE_BSA=OFF \
             -DDFLASH27B_FA_ALL_QUANTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --target test_flash_attn_sparse -j"$(nproc)"
+          cmake --build build \
+            --target test_flash_attn_sparse test_deepseek4_mmid_grouped_cuda \
+            -j"$(nproc)"
 
       - name: Run flash-attn sparse kernel test on the 3090
         # Self-contained kernel correctness test (no model weights), so it is
         # safe and fast in CI. This is the execution the hosted jobs cannot do.
         run: ./server/build/test_flash_attn_sparse
+
+      - name: Run grouped MMID dispatch and parity test on the 3090
+        run: ./server/build/test_deepseek4_mmid_grouped_cuda
 
       # Optional model-backed end-to-end smoke (real spec-decode on the 3090),
       # disabled by default because it builds dflash_server and lazy-loads the
@@ -285,7 +290,8 @@ jobs:
             -DCMAKE_HIP_FLAGS=-DDFLASH_WAVE_SIZE=32
           cmake --build "$RUNNER_TEMP/rocmfp-build" \
             --target test_rocmfp4 test_rocmfpx test_rocmfp4_hip_tail test_rocmfpx_mmq \
+              test_deepseek4_mmid_grouped_cuda \
             --parallel 8
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
-            -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq'
+            -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda'

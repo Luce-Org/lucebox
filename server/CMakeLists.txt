@@ -749,6 +749,22 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_deepseek4_hc_cuda PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
         add_test(NAME deepseek4_hc_cuda COMMAND test_deepseek4_hc_cuda)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_mmid_grouped_cuda.cpp")
+        add_executable(test_deepseek4_mmid_grouped_cuda test/test_deepseek4_mmid_grouped_cuda.cpp)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            set_source_files_properties(test/test_deepseek4_mmid_grouped_cuda.cpp PROPERTIES LANGUAGE HIP)
+            set_target_properties(test_deepseek4_mmid_grouped_cuda PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+            target_include_directories(test_deepseek4_mmid_grouped_cuda PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
+            target_link_libraries(test_deepseek4_mmid_grouped_cuda PRIVATE hip::host)
+        else()
+            target_link_libraries(test_deepseek4_mmid_grouped_cuda PRIVATE CUDA::cudart)
+        endif()
+        target_link_libraries(test_deepseek4_mmid_grouped_cuda PRIVATE
+            ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        add_test(NAME deepseek4_mmid_grouped_cuda COMMAND test_deepseek4_mmid_grouped_cuda)
+        set_tests_properties(deepseek4_mmid_grouped_cuda PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
     # GPU draft top-K kernel vs CPU reference (extract_draft_topk). Built on both
     # backends: geometric_draft_topk_cuda.cu is compiled into dflash_common on the
     # cuda backend directly and on hip via LANGUAGE HIP + the hip_compat shim.
