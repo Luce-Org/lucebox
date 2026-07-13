@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <cstring>
 
 namespace dflash::common {
 
@@ -12,7 +13,7 @@ struct ChainRollbackPolicy {
 
 inline bool env_flag_enabled(const char * name) {
     const char * value = std::getenv(name);
-    return value != nullptr && std::atoi(value) != 0;
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
 inline ChainRollbackPolicy resolve_chain_rollback_policy() {

@@ -38,6 +38,17 @@ int main() {
     CHECK(policy.checkpoint_f32);
     CHECK(policy.fast_rollback_threshold == 2);
 
+    // Boolean flags follow the project's non-empty, non-"0" convention.
+    setenv("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "true", 1);
+    CHECK(resolve_chain_rollback_policy().checkpoint_f32);
+    setenv("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "yes", 1);
+    CHECK(resolve_chain_rollback_policy().checkpoint_f32);
+    setenv("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "on", 1);
+    CHECK(resolve_chain_rollback_policy().checkpoint_f32);
+    setenv("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "0", 1);
+    CHECK(!resolve_chain_rollback_policy().checkpoint_f32);
+    setenv("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "1", 1);
+
     // Invalid values degrade safely to the default threshold.
     setenv("DFLASH_FAST_ROLLBACK_THRESHOLD", "0", 1);
     CHECK(resolve_chain_rollback_policy().fast_rollback_threshold == 5);
