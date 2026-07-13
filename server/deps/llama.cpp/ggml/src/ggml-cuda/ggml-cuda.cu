@@ -2564,19 +2564,36 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    static const bool mmid_telemetry = []() {
+        const char * value = std::getenv("DFLASH_MMID_TELEMETRY");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    const int mmvq_mmid_max = ggml_is_quantized(src0->type)
+        ? get_mmvq_mmid_max_batch(src0->type, cc) : 0;
+    const auto log_dispatch = [&](const char * path) {
+        if (mmid_telemetry) {
+            std::fprintf(stderr,
+                "[dflash-mmid] event=dispatch name=%s type=%s ne11=%lld width=%lld pairs=%lld "
+                "n_experts=%lld top_k=%lld mmvq_max=%d path=%s\n",
+                dst->name, ggml_type_name(src0->type), (long long) ne11, (long long) ne2,
+                (long long) (ids->ne[0]*ne2), (long long) ne02, (long long) ids->ne[0],
+                mmvq_mmid_max, path);
+        }
+    };
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_MOE_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
-                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
+                    log_dispatch("mmvq");
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
             } else {
                 if (ne2 <= MMVF_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(cc)) {
+                    log_dispatch("mmvf");
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
@@ -2584,15 +2601,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            log_dispatch("mmq");
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+            log_dispatch("mmf");
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
     }
+
+    log_dispatch("sync_fallback");
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
     // TODO: add asserts to verify this. should work with CUDA, HIP, etc.
@@ -3217,6 +3238,19 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             const bool mmid_mmq_ok = ggml_is_quantized(node->src[0]->type) &&
                 ggml_cuda_should_use_mmq(node->src[0]->type, cc,
                                          node->src[1]->ne[2], node->src[0]->ne[2]);
+            static const bool mmid_telemetry = []() {
+                const char * value = std::getenv("DFLASH_MMID_TELEMETRY");
+                return value != nullptr && std::strcmp(value, "0") != 0;
+            }();
+            if (mmid_telemetry) {
+                std::fprintf(stderr,
+                    "[dflash-mmid] event=graph name=%s type=%s ne11=%lld width=%lld "
+                    "mmvq_max=%d mmvq_ok=%d mmq_ok=%d node_eligible=%d\n",
+                    node->name, ggml_type_name(node->src[0]->type),
+                    (long long) node->src[1]->ne[1], (long long) node->ne[2],
+                    mmvq_mmid_max, mmid_mmvq_ok, mmid_mmq_ok,
+                    mmid_mmvq_ok || mmid_mmq_ok);
+            }
             if (!mmid_mmvq_ok && !mmid_mmq_ok) {
                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance

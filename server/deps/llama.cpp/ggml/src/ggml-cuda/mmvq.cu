@@ -4,7 +4,9 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
@@ -1642,6 +1644,10 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+    static const bool mmid_telemetry = []() {
+        const char * value = std::getenv("DFLASH_MMID_TELEMETRY");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
 
     // [TAG_MMID_GROUPED] grouped-expert path for small MUL_MAT_ID batches.
     if (ids && ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_MOE_BATCH_SIZE &&
@@ -1682,8 +1688,25 @@ void ggml_cuda_mul_mat_vec_q(
                 (int) s01, (int) stride_col_y, (int) stride_col_dst,
                 (int) s02, (int) stride_channel_y, (int) stride_channel_dst,
                 np, stream)) {
+            if (mmid_telemetry) {
+                std::fprintf(stderr,
+                    "[dflash-mmid] event=mmvq type=%s width=%lld pairs=%d variant=grouped\n",
+                    ggml_type_name(src0->type), (long long) ncols_dst, np);
+            }
             return;
         }
+    }
+
+    if (mmid_telemetry && ids) {
+        const char * reason = ncols_dst < 2 ? "width_lt_2" :
+            ncols_dst > MMVQ_MAX_MOE_BATCH_SIZE ? "width_gt_16" :
+            (int) (nchannels_dst*ncols_dst) > MMID_GROUPED_MAX_PAIRS ? "pairs_gt_256" :
+            !mmid_grouped_env() ? "flag_off" :
+            !mmid_grouped_type_ok(src0->type) ? "unsupported_type" : "dispatch_rejected";
+        std::fprintf(stderr,
+            "[dflash-mmid] event=mmvq type=%s width=%lld pairs=%lld variant=legacy_moe reason=%s\n",
+            ggml_type_name(src0->type), (long long) ncols_dst,
+            (long long) (nchannels_dst*ncols_dst), reason);
     }
 
     mul_mat_vec_q_switch_type(
