@@ -417,6 +417,29 @@ static __device__ __forceinline__ int rocmfpx_pack4_fp6_bits24_vec_cuda(const ui
     return *((const int *) &v);
 }
 
+static __device__ __forceinline__ int rocmfpx_pack4_fp3_bits12_vec_cuda(const uint32_t bits12) {
+#if defined(GGML_USE_HIP)
+    // Byte tables for codes {0, 1, 2, 4} and {0, -1, -2, -4}.
+    // v_perm_b32 selects a byte with each 3-bit selector, replacing four
+    // scalar code decodes without changing the packed int8 values.
+    constexpr uint32_t values_low  = 0x04020100u;
+    constexpr uint32_t values_high = 0xFCFEFF00u;
+    const uint32_t selectors =
+        ((bits12 >> 0) & 7u) |
+        (((bits12 >> 3) & 7u) << 8) |
+        (((bits12 >> 6) & 7u) << 16) |
+        (((bits12 >> 9) & 7u) << 24);
+    return (int) __builtin_amdgcn_perm(values_high, values_low, selectors);
+#else
+    const char4 v = make_char4(
+        (int8_t) rocmfpx_decode_fp3_code_vec_cuda(bits12 & 7u),
+        (int8_t) rocmfpx_decode_fp3_code_vec_cuda((bits12 >> 3) & 7u),
+        (int8_t) rocmfpx_decode_fp3_code_vec_cuda((bits12 >> 6) & 7u),
+        (int8_t) rocmfpx_decode_fp3_code_vec_cuda((bits12 >> 9) & 7u));
+    return *((const int *) &v);
+#endif
+}
+
 static __device__ __forceinline__ int rocmfpx_pack4_fp3_vec_cuda(const uint8_t * qs, const int base) {
     const char4 v = make_char4(
         (int8_t) rocmfpx_decode_fp3_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 0)*3, 3)),
@@ -591,12 +614,7 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp3_q8_1(
         const uint32_t val_high = qs[reg_idx + 1];
         const uint32_t bits12 = (reg_shift == 0) ? (val_low & 0xFFFu) : (((val_low >> reg_shift) | (val_high << (32 - reg_shift))) & 0xFFFu);
 
-        const char4 v = make_char4(
-            (int8_t) rocmfpx_decode_fp3_code_vec_cuda(bits12 & 7u),
-            (int8_t) rocmfpx_decode_fp3_code_vec_cuda((bits12 >> 3) & 7u),
-            (int8_t) rocmfpx_decode_fp3_code_vec_cuda((bits12 >> 6) & 7u),
-            (int8_t) rocmfpx_decode_fp3_code_vec_cuda((bits12 >> 9) & 7u));
-        const int val_packed = *((const int *) &v);
+        const int val_packed = rocmfpx_pack4_fp3_bits12_vec_cuda(bits12);
 
         const int u = get_int_b4(bq8_1->qs, iqs + i);
 
