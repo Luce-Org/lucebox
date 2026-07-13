@@ -1020,44 +1020,65 @@ static ggml_tensor * build_mla_attention(
     }
 
     // ── Learned compression update ──────────────────────────────────
-    ggml_tensor * cur_last = ggml_view_2d(
-        ctx, cur, n_embd, 1, cur->nb[1], (size_t)(n_tokens - 1) * cur->nb[1]);
-    ggml_tensor * qr_last = ggml_view_2d(
-        ctx, qr, n_lora_q, 1, qr->nb[1], (size_t)(n_tokens - 1) * qr->nb[1]);
-    if (ratio > 0 && L.attn_compressor_kv) {
-        build_compressor_step(ctx, gf, cur_last,
-                              L.attn_compressor_ape,
-                              L.attn_compressor_kv,
-                              L.attn_compressor_gate,
-                              L.attn_compressor_norm,
-                              lc.attn_compressor,
-                              lc.comp_kv,
-                              ratio,
-                              head_dim,
-                              token_pos,
-                              w.n_rot,
-                              w.rms_eps,
-                              w.compress_rope_freq_base,
-                              w.rope_scale_factor,
-                              w.rope_yarn_beta_fast,
-                              w.rope_yarn_beta_slow,
-                              (int)w.rope_orig_ctx,
-                              cached_inputs ? cached_inputs->attn_ape_row : nullptr,
-                              cached_inputs ? cached_inputs->attn_state_rows : nullptr,
-                              cached_inputs ? cached_inputs->attn_comp_rows : nullptr,
-                              cached_inputs ? cached_inputs->attn_comp_pos : nullptr,
-                              i64_array_inputs,
-                              i32_array_inputs);
+    // The learned compressor is a sequential accumulator: every token feeds
+    // its ratio-window state and each window boundary flushes exactly one
+    // pooled comp_kv row (comp_row = pos / ratio). Batched prefill must
+    // therefore step the compressor for EVERY token in the chunk, exactly as
+    // the single-token decode path does one token at a time. Running it only
+    // for the last token leaves every intermediate window's comp_kv (and, for
+    // ratio 4, index_comp_kv) row unwritten while n_comp is still advanced to
+    // next_pos / ratio, so later decode attends over stale/uninitialized
+    // compressed rows. The per-token side effects are serialized by insertion
+    // order into the graph, matching the raw SWA ring write loop above.
+    const bool batched_prefill = (n_tokens > 1 && !cached_inputs);
+    const int comp_first = batched_prefill ? 0 : (n_tokens - 1);
+    for (int ti = comp_first; ti < n_tokens; ++ti) {
+        ggml_tensor * cur_col = ggml_view_2d(
+            ctx, cur, n_embd, 1, cur->nb[1], (size_t)ti * cur->nb[1]);
+        const int tok_pos = kv_start + ti;
+        if (ratio > 0 && L.attn_compressor_kv) {
+            build_compressor_step(ctx, gf, cur_col,
+                                  L.attn_compressor_ape,
+                                  L.attn_compressor_kv,
+                                  L.attn_compressor_gate,
+                                  L.attn_compressor_norm,
+                                  lc.attn_compressor,
+                                  lc.comp_kv,
+                                  ratio,
+                                  head_dim,
+                                  tok_pos,
+                                  w.n_rot,
+                                  w.rms_eps,
+                                  w.compress_rope_freq_base,
+                                  w.rope_scale_factor,
+                                  w.rope_yarn_beta_fast,
+                                  w.rope_yarn_beta_slow,
+                                  (int)w.rope_orig_ctx,
+                                  cached_inputs ? cached_inputs->attn_ape_row : nullptr,
+                                  cached_inputs ? cached_inputs->attn_state_rows : nullptr,
+                                  cached_inputs ? cached_inputs->attn_comp_rows : nullptr,
+                                  cached_inputs ? cached_inputs->attn_comp_pos : nullptr,
+                                  i64_array_inputs,
+                                  i32_array_inputs);
+        }
+        if (ratio == 4 && L.indexer_compressor_kv) {
+            build_indexer_compressor_step(ctx, gf, cur_col, w, L, lc, tok_pos,
+                                          cached_inputs ? cached_inputs->index_ape_row : nullptr,
+                                          cached_inputs ? cached_inputs->index_state_rows : nullptr,
+                                          cached_inputs ? cached_inputs->index_comp_rows : nullptr,
+                                          cached_inputs ? cached_inputs->index_comp_pos : nullptr,
+                                          i64_array_inputs,
+                                          i32_array_inputs);
+        }
     }
 
+    // Indexer score uses the final token's query as the sparse-selection
+    // signal (result currently unused downstream).
     if (ratio == 4 && L.indexer_compressor_kv) {
-        build_indexer_compressor_step(ctx, gf, cur_last, w, L, lc, token_pos,
-                                      cached_inputs ? cached_inputs->index_ape_row : nullptr,
-                                      cached_inputs ? cached_inputs->index_state_rows : nullptr,
-                                      cached_inputs ? cached_inputs->index_comp_rows : nullptr,
-                                      cached_inputs ? cached_inputs->index_comp_pos : nullptr,
-                                      i64_array_inputs,
-                                      i32_array_inputs);
+        ggml_tensor * qr_last = ggml_view_2d(
+            ctx, qr, n_lora_q, 1, qr->nb[1], (size_t)(n_tokens - 1) * qr->nb[1]);
+        ggml_tensor * cur_last = ggml_view_2d(
+            ctx, cur, n_embd, 1, cur->nb[1], (size_t)(n_tokens - 1) * cur->nb[1]);
         (void)build_indexer_score(ctx, qr_last, cur_last, w, L, lc, token_pos, i32_inputs);
     }
 
@@ -3308,7 +3329,12 @@ bool deepseek4_step_layer_range(
                 }
             } else {
                 const auto attn_build_t0 = Ds4TimingClock::now();
-                const size_t ctx_size = 48 * 1024 * 1024;
+                // Batched prefill now emits a per-token compressor chain (see
+                // build_mla_attention), so both the node budget and the tensor
+                // metadata arena must scale with the chunk size.
+                const size_t ctx_size = (n_tokens > 1)
+                    ? (size_t)128 * 1024 * 1024
+                    : (size_t)48 * 1024 * 1024;
                 ggml_init_params params{};
                 params.mem_size = ctx_size;
                 params.mem_buffer = nullptr;
@@ -3322,7 +3348,11 @@ bool deepseek4_step_layer_range(
                 std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
                 std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
                 std::vector<DeepSeek4F16ArrayBinding> f16_array_inputs;
-                const size_t graph_size = n_tokens > 1 ? 32768 : 2048;
+                size_t graph_size = 2048;
+                if (n_tokens > 1) {
+                    graph_size = (size_t)n_tokens * 128 + 8192;
+                    if (graph_size < 32768) graph_size = 32768;
+                }
                 gf = ggml_new_graph_custom(ctx, graph_size, false);
 
                 ggml_tensor * normed = build_rms_norm(ctx, inp, L.attn_norm, w.rms_eps);
