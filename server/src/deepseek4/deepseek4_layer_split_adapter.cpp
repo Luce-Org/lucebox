@@ -477,7 +477,7 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
         const float * shard_input = local_shard_input(si, embed, hc_state_);
 
         if (!deepseek4_step_layer_range(
-                shard.backend, shard.weights, shard.cache,
+                shard.backend, shard.gpu, shard.weights, shard.cache,
                 hc_state_, shard_input, n_tokens, base_pos,
                 shard.layer_begin, shard.layer_end,
                 shard_logits, tokens.data(), timing ? &step_tel : nullptr)) {
@@ -527,7 +527,7 @@ bool DeepSeek4LayerSplitAdapter::run_mixed_forward(
 
     // Run only the local shard's layer range, getting hidden state output
     std::vector<float> hidden_out;
-    if (!deepseek4_step_layer_range(local_shard.backend, local_shard.weights,
+    if (!deepseek4_step_layer_range(local_shard.backend, local_shard.gpu, local_shard.weights,
                                      local_shard.cache, hc_state_,
                                      embed.data(), n_tokens, base_pos,
                                      local_shard.layer_begin, local_shard.layer_end,

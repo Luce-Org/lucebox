@@ -4253,6 +4253,7 @@ static bool deepseek4_step_hybrid(
 
 bool deepseek4_step(
         ggml_backend_t backend,
+        int device,
         const DeepSeek4Weights & w,
         DeepSeek4Cache & cache,
         const float * embed,
@@ -4266,6 +4267,12 @@ bool deepseek4_step(
         MoeHybridRoutingStats * routing_stats,
         Ds4VerifyHooks * verify_hooks) {
     if (w.moe_hybrid && moe_hybrid != nullptr) {
+        if (!deepseek4_cuda_hc_set_device(device)) {
+            std::fprintf(stderr,
+                         "[deepseek4] failed to select HC device %d for hybrid step\n",
+                         device);
+            return false;
+        }
         return deepseek4_step_hybrid(backend, w, cache, *moe_hybrid,
                                      embed, n_tokens, kv_start, out_logits,
                                      token_ids, stream_engine, telemetry, routing_stats);
@@ -4273,7 +4280,7 @@ bool deepseek4_step(
 
     std::vector<float> hc_state;
     return deepseek4_step_layer_range(
-        backend, w, cache, hc_state, embed, n_tokens, kv_start,
+        backend, device, w, cache, hc_state, embed, n_tokens, kv_start,
         0, w.n_layer, &out_logits, token_ids, telemetry,
         /*allow_decode_graph_reuse=*/verify_hooks == nullptr, verify_hooks);
 }
@@ -4360,6 +4367,7 @@ struct DeepSeek4LayerRangeCache {
     const DeepSeek4Weights * owner_weights = nullptr;
     const ggml_context * owner_ctx = nullptr;
     ggml_backend_t backend = nullptr;
+    int device = -1;
     int layer_begin = -1;
     int layer_end = -1;
     bool owns_output = false;
@@ -4380,12 +4388,14 @@ struct DeepSeek4LayerRangeCache {
 
     bool matches(const DeepSeek4Weights & w,
                  ggml_backend_t candidate_backend,
+                 int candidate_device,
                  int candidate_begin,
                  int candidate_end,
                  bool candidate_owns_output) const {
         return owner_weights == &w &&
                owner_ctx == w.ctx &&
                backend == candidate_backend &&
+               device == candidate_device &&
                layer_begin == candidate_begin &&
                layer_end == candidate_end &&
                owns_output == candidate_owns_output;
@@ -4427,6 +4437,7 @@ struct DeepSeek4LayerRangeCache {
         owner_weights = nullptr;
         owner_ctx = nullptr;
         backend = nullptr;
+        device = -1;
         layer_begin = -1;
         layer_end = -1;
         owns_output = false;
@@ -5737,6 +5748,7 @@ static bool ds4_hc_output_weights_ready(const HcWeightsCpu & weights,
 static bool initialize_layer_range_cache(
         DeepSeek4LayerRangeCache & runtime,
         ggml_backend_t backend,
+        int device,
         const DeepSeek4Weights & w,
         int layer_begin,
         int layer_end,
@@ -5797,6 +5809,7 @@ static bool initialize_layer_range_cache(
     runtime.owner_weights = &w;
     runtime.owner_ctx = w.ctx;
     runtime.backend = backend;
+    runtime.device = device;
     runtime.layer_begin = layer_begin;
     runtime.layer_end = layer_end;
     runtime.owns_output = owns_output;
@@ -5805,6 +5818,7 @@ static bool initialize_layer_range_cache(
 
 bool deepseek4_step_layer_range(
         ggml_backend_t backend,
+        int device,
         const DeepSeek4Weights & w,
         DeepSeek4Cache & cache,
         std::vector<float> & hc_state,
@@ -5819,6 +5833,13 @@ bool deepseek4_step_layer_range(
         bool allow_decode_graph_reuse,
         Ds4VerifyHooks * verify_hooks) {
     const auto step_t0 = Ds4TimingClock::now();
+
+    if (!deepseek4_cuda_hc_set_device(device)) {
+        std::fprintf(stderr,
+                     "[deepseek4] failed to select HC device %d for layer range [%d,%d)\n",
+                     device, layer_begin, layer_end);
+        return false;
+    }
 
     // ── Partial layer-range forward with HC ─────────────────────────────
     const int n_embd = w.n_embd;
@@ -5868,7 +5889,7 @@ bool deepseek4_step_layer_range(
                 chunk_hooks_ptr = &chunk_hooks;
             }
             if (!deepseek4_step_layer_range(
-                    backend, w, cache, chunk_hc,
+                    backend, device, w, cache, chunk_hc,
                     embed + (size_t) off * input_width,
                     chunk, kv_start + off, layer_begin, layer_end,
                     out_logits ? &chunk_out : nullptr,
@@ -5950,9 +5971,9 @@ bool deepseek4_step_layer_range(
         cache.layer_range_cache = new DeepSeek4LayerRangeCache();
     }
     DeepSeek4LayerRangeCache & layer_range_cache = *cache.layer_range_cache;
-    if (!layer_range_cache.matches(w, backend, layer_begin, layer_end, is_last_shard) &&
+    if (!layer_range_cache.matches(w, backend, device, layer_begin, layer_end, is_last_shard) &&
         !initialize_layer_range_cache(
-            layer_range_cache, backend, w, layer_begin, layer_end, is_last_shard)) {
+            layer_range_cache, backend, device, w, layer_begin, layer_end, is_last_shard)) {
         return false;
     }
 

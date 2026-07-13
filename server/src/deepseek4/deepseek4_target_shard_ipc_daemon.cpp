@@ -238,7 +238,7 @@ int run_deepseek4_target_shard_ipc_daemon(
                          "[deepseek4-target-shard] forward shard %zu: n_tokens=%d base_pos=%d layers=[%d,%d)\n",
                          i, n_tokens, req.base_pos, shard.layer_begin, shard.layer_end);
             const bool ok = deepseek4_step_layer_range(
-                shard.backend, shard.weights, shard.cache, hc_state,
+                shard.backend, shard.gpu, shard.weights, shard.cache, hc_state,
                 shard_input, n_tokens, req.base_pos,
                 shard.layer_begin, shard.layer_end,
                 is_last ? &logits : nullptr,

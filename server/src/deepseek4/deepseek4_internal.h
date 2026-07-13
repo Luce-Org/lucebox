@@ -357,6 +357,7 @@ struct Ds4VerifyHooks;
 
 bool deepseek4_step(
     ggml_backend_t              backend,
+    int                         device,
     const DeepSeek4Weights &    w,
     DeepSeek4Cache &            cache,
     const float *               embed,
@@ -382,6 +383,7 @@ struct Ds4VerifyHooks {
 
 bool deepseek4_step_layer_range(
     ggml_backend_t              backend,
+    int                         device,
     const DeepSeek4Weights &    w,
     DeepSeek4Cache &            cache,
     std::vector<float> &        hc_state,
