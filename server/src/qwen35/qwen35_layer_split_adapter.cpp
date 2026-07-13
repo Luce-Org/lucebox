@@ -524,7 +524,6 @@ int Qwen35LayerSplitAdapter::prefill_chunk_tokens() const {
 bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
                                       int base_pos, int & last_tok,
                                       bool need_logits) {
-    (void)need_logits;
     if (prompt.empty()) return false;
     if (base_pos < 0 || base_pos + (int)prompt.size() > cfg_.device.max_ctx) {
         std::fprintf(stderr,
@@ -536,13 +535,14 @@ bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
     if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
         ubatch = std::max(1, std::atoi(s));
     }
+    std::vector<float> * logits_out = need_logits ? &prefill_last_logits_ : nullptr;
     if (use_mixed_target_split()) {
         const bool ok = run_qwen35_mixed_layer_split_forward(
             shards_, remote_target_shard_, shards_.front().weights,
             prompt, base_pos, ubatch, last_tok,
             cfg_.kq_stride_pad, /*fa_window=*/0,
             /*argmax_out=*/nullptr,
-            &prefill_last_logits_,
+            logits_out,
             (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
             remote_draft_.active() ? &remote_draft_ : nullptr,
             kvflash_active() ? &kvflash_pager_ : nullptr);
@@ -557,7 +557,7 @@ bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
         cfg_.kq_stride_pad, /*fa_window=*/0,
         (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
         /*argmax_out=*/nullptr,
-        &prefill_last_logits_,
+        logits_out,
         cfg_.run_dflash ? &remote_draft_ : nullptr,
         activation_type_,
         kvflash_active() ? &kvflash_pager_ : nullptr);
