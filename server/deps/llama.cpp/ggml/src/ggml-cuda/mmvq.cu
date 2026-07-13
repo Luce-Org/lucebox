@@ -608,31 +608,53 @@ static __global__ void mul_mat_vec_q(
         }
     }
 
-    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
-    __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
-    if constexpr (!has_fusion) {
-        (void) tmp_shared_gate;
-    } else if (!use_gate) {
-        (void) tmp_shared_gate;
-    }
+    // A one-wave specialization has no cross-wave partials. Avoid reserving
+    // shared memory and issuing a block barrier in that common decode path.
+    // This does not change the per-lane accumulation or warp reduction order.
+    if constexpr (nwarps > 1) {
+        __shared__ float tmp_shared[nwarps-1][ncols_dst][rows_per_cuda_block][warp_size];
+        __shared__ float tmp_shared_gate[has_fusion ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+        if constexpr (!has_fusion) {
+            (void) tmp_shared_gate;
+        } else if (!use_gate) {
+            (void) tmp_shared_gate;
+        }
 
-    if (threadIdx.y > 0) {
+        if (threadIdx.y > 0) {
 #pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
+            for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
-                if constexpr (has_fusion) {
-                    if (use_gate) {
-                        tmp_shared_gate[threadIdx.y-1][j][i][threadIdx.x] = tmp_gate[j][i];
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_shared_gate[threadIdx.y-1][j][i][threadIdx.x] = tmp_gate[j][i];
+                        }
                     }
                 }
             }
         }
-    }
-    __syncthreads();
-    if (threadIdx.y > 0) {
-        return;
+
+        __syncthreads();
+        if (threadIdx.y > 0) {
+            return;
+        }
+
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+#pragma unroll
+                for (int l = 0; l < nwarps-1; ++l) {
+                    tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_gate[j][i] += tmp_shared_gate[l][j][i][threadIdx.x];
+                        }
+                    }
+                }
+            }
+        }
     }
 
     dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
@@ -642,15 +664,6 @@ static __global__ void mul_mat_vec_q(
     for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
         for (int i = 0; i < rows_per_cuda_block; ++i) {
-#pragma unroll
-            for (int l = 0; l < nwarps-1; ++l) {
-                tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
-                if constexpr (has_fusion) {
-                    if (use_gate) {
-                        tmp_gate[j][i] += tmp_shared_gate[l][j][i][threadIdx.x];
-                    }
-                }
-            }
             tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
             if constexpr (has_fusion) {
                 if (use_gate) {
