@@ -425,12 +425,14 @@ static __device__ __forceinline__ int rocmfpx_pack4_fp3_bits12_vec_cuda(const ui
 }
 
 static __device__ __forceinline__ int rocmfpx_pack4_fp3_vec_cuda(const uint8_t * qs, const int base) {
-    const char4 v = make_char4(
-        (int8_t) rocmfpx_decode_fp3_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 0)*3, 3)),
-        (int8_t) rocmfpx_decode_fp3_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 1)*3, 3)),
-        (int8_t) rocmfpx_decode_fp3_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 2)*3, 3)),
-        (int8_t) rocmfpx_decode_fp3_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 3)*3, 3)));
-    return *((const int *) &v);
+    // MMQ requests four-value groups, so the 12 packed bits span at most two
+    // adjacent bytes. Decode them with the same lookup used by MMVQ.
+    const int bit_pos = 3 * base;
+    const int byte_pos = bit_pos >> 3;
+    const uint32_t packed = (uint32_t) qs[byte_pos] |
+                            ((uint32_t) qs[byte_pos + 1] << 8);
+    return rocmfpx_pack4_fp3_bits12_vec_cuda(
+        (packed >> (bit_pos & 7)) & 0x0fffu);
 }
 
 static __device__ __forceinline__ int rocmfpx_pack4_fp2_bits8_vec_cuda(const uint32_t bits8) {

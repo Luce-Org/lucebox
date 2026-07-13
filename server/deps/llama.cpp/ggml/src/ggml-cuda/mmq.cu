@@ -20,6 +20,15 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_Q8_0:
             mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, args, stream);
             break;
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+            mul_mat_q_case<GGML_TYPE_Q4_0_ROCMFP4_FAST>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q2_0_ROCMFP2:
+            mul_mat_q_case<GGML_TYPE_Q2_0_ROCMFP2>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q3_0_ROCMFPX:
+            mul_mat_q_case<GGML_TYPE_Q3_0_ROCMFPX>(ctx, args, stream);
+            break;
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
 #ifndef GGML_CUDA_BLACKWELL_CONSUMER
@@ -77,11 +86,26 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
-void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+static void ggml_cuda_mul_mat_q_impl(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src0_pair,
+        const ggml_tensor * src1,
+        const ggml_tensor * ids,
+        ggml_tensor * dst,
+        ggml_tensor * dst_pair) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+    GGML_ASSERT((src0_pair == nullptr) == (dst_pair == nullptr));
+    if (src0_pair) {
+        GGML_ASSERT(src0_pair->type == src0->type);
+        GGML_ASSERT(dst_pair->type == dst->type);
+        GGML_ASSERT(ggml_are_same_shape(src0_pair, src0));
+        GGML_ASSERT(ggml_are_same_stride(src0_pair, src0));
+        GGML_ASSERT(ggml_are_same_shape(dst_pair, dst));
+        GGML_ASSERT(ggml_are_same_stride(dst_pair, dst));
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
@@ -101,14 +125,23 @@ void ggml_cuda_mul_mat_q(
     const float * src1_d = (const float *) src1->data;
     float       *  dst_d = (float       *)  dst->data;
 
-    // If src0 is a temporary compute buffer, clear any potential padding.
-    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
-        const size_t size_data  = ggml_nbytes(src0);
-        const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+    // Temporary weight tensors may have an allocation tail read by tiled MMQ.
+    // Clear it once for each projection before launching either multiply.
+    const ggml_tensor * weights[] = {src0, src0_pair};
+    for (const ggml_tensor * weight : weights) {
+        if (!weight ||
+            ggml_backend_buffer_get_usage(weight->buffer) !=
+                GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            continue;
+        }
+        const size_t size_data  = ggml_nbytes(weight);
+        const size_t size_alloc =
+            ggml_backend_buffer_get_alloc_size(weight->buffer, weight);
         if (size_alloc > size_data) {
-            GGML_ASSERT(ggml_is_contiguously_allocated(src0));
-            GGML_ASSERT(!src0->view_src);
-            CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+            GGML_ASSERT(ggml_is_contiguously_allocated(weight));
+            GGML_ASSERT(!weight->view_src);
+            CUDA_CHECK(cudaMemsetAsync((char *) weight->data + size_data, 0,
+                                       size_alloc - size_data, stream));
         }
     }
 
@@ -121,21 +154,24 @@ void ggml_cuda_mul_mat_q(
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
-    bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
-                            || GGML_CUDA_CC_IS_CDNA(cc);
-    // LUCE_MMQ_DP_MAX_NE1: for ne1 at or below this, skip stream-k and use
-    // data-parallel tiles - the stream-k fixup pass costs ~1ms/step at
-    // spec-decode verify widths (measured sm_86, w6 chain). 0 = always stream-k.
-    static const int luce_mmq_dp_max_ne1 = []() {
-        const char * e = getenv("LUCE_MMQ_DP_MAX_NE1");
-        return e ? atoi(e) : 0;
-    }();
-    if (use_stream_k && ne11 <= luce_mmq_dp_max_ne1) {
-        use_stream_k = false;
-    }
+    const bool use_stream_k =
+        (GGML_CUDA_CC_IS_NVIDIA(cc) &&
+         ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
+        GGML_CUDA_CC_IS_CDNA(cc);
 
     // TODO: tighter pool buffer size vs q8 path
     const bool use_native_mxfp4 = blackwell_mma_available(cc) && src0->type == GGML_TYPE_MXFP4;
+    const bool grouped_src = !ids && ggml_mul_mat_is_grouped_src(dst);
+    const ggml_tensor * grouped_physical = grouped_src ? src1->view_src : nullptr;
+    if (grouped_src) {
+        GGML_ASSERT(grouped_physical && grouped_physical->type == GGML_TYPE_F32);
+        GGML_ASSERT(grouped_physical->ne[2] ==
+                    ggml_mul_mat_grouped_src_groups(dst));
+        GGML_ASSERT(grouped_physical->ne[0] * grouped_physical->ne[2] == ne10);
+        GGML_ASSERT(grouped_physical->ne[1] == ne11);
+        GGML_ASSERT(grouped_physical->ne[3] == 1);
+        GGML_ASSERT(!use_native_mxfp4);
+    }
 
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
@@ -146,7 +182,14 @@ void ggml_cuda_mul_mat_q(
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
-            if (use_native_mxfp4) {
+            if (grouped_src) {
+                quantize_mmq_q8_1_grouped_cuda(
+                    src1_d, src1_q8_1.get(), src0->type,
+                    ne10, grouped_physical->ne[0],
+                    grouped_physical->nb[1] / ts_src1,
+                    grouped_physical->nb[2] / ts_src1,
+                    ne10_padded, ne11, stream);
+            } else if (use_native_mxfp4) {
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
                 quantize_mmq_mxfp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
@@ -173,6 +216,12 @@ void ggml_cuda_mul_mat_q(
             ne03, ne13, s03, s13, s3,
             use_stream_k, ne1};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+        if (src0_pair) {
+            mmq_args pair_args = args;
+            pair_args.x = (const char *) src0_pair->data;
+            pair_args.dst = (float *) dst_pair->data;
+            ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream);
+        }
         return;
     }
 
@@ -238,6 +287,33 @@ void ggml_cuda_mul_mat_q(
         use_stream_k, ne12};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+    if (src0_pair) {
+        mmq_args pair_args = args;
+        pair_args.x = (const char *) src0_pair->data;
+        pair_args.dst = (float *) dst_pair->data;
+        ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream);
+    }
+}
+
+void ggml_cuda_mul_mat_q(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * ids,
+        ggml_tensor * dst) {
+    ggml_cuda_mul_mat_q_impl(ctx, src0, nullptr, src1, ids, dst, nullptr);
+}
+
+void ggml_cuda_mul_mat_q_pair(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0_a,
+        const ggml_tensor * src0_b,
+        const ggml_tensor * src1,
+        const ggml_tensor * ids,
+        ggml_tensor * dst_a,
+        ggml_tensor * dst_b) {
+    ggml_cuda_mul_mat_q_impl(
+        ctx, src0_a, src0_b, src1, ids, dst_a, dst_b);
 }
 
 void ggml_cuda_op_mul_mat_q(
@@ -315,6 +391,12 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
             mmq_supported = true;
+            break;
+        case GGML_TYPE_Q2_0_ROCMFP2:
+        case GGML_TYPE_Q3_0_ROCMFPX:
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+            // ROCmFPX MMQ variants are implemented for gfx1151 only.
+            mmq_supported = GGML_CUDA_CC_IS_RDNA3_5(cc);
             break;
         default:
             mmq_supported = false;

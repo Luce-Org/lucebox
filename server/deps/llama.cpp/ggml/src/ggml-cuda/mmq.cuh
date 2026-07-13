@@ -66,6 +66,10 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
             return MMQ_Q8_1_DS_LAYOUT_DS4;
         case GGML_TYPE_Q8_0:
             return MMQ_Q8_1_DS_LAYOUT_D4;
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+        case GGML_TYPE_Q2_0_ROCMFP2:
+        case GGML_TYPE_Q3_0_ROCMFPX:
+            return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_MXFP4:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_NVFP4:
@@ -101,24 +105,9 @@ struct tile_x_sizes {
     int sc;
 };
 
-// Lucebox: tuned MMQ tile for RDNA3/RDNA4.
-// DFlash issues many small mul_mat_q calls (ne[1] ~= ddtree_budget+1, ~23 at
-// the default budget=22) where the stock 128x128 / 8-warp tile under-occupies.
-// Current settings (mmq_y=128, nwarps=8, mmq_x_max=128):
-//   - mmq_y=128/nwarps=8: stock value for non-RDNA1 AMD — occupancy for decode
-//     batches (ne[1]~23) measured at +8.3% vs stock on gfx1201; also the right
-//     size for prefill (ne[1]=512) where halving block count improves L2 reuse
-//     (+6.9% prefill speedup on Q4_K m=4096,n=512,k=14336 on gfx1201).
-//   - mmq_x_max=128: prefill (ne[1]=512) fits in 4 x-tiles instead of 11.
-//     For decode (ne[1]~23), mmq_x selects 24 regardless of the cap — no impact.
-// Original decode measurements (Qwen3.6-27B Q4_K_M, --ddtree-budget=22):
-//   gfx1100 (RX 7900 XTX): 56.78 -> 60.18 tok/s (+6.0%)
-//   gfx1201 (R9700):       54.65 -> 59.20 tok/s (+8.3%)
-//   gfx1151 (Strix Halo):  11.53 -> 12.00 tok/s (+4.1%, 256-token smoke)
-// Constraint: nwarps * granularity(mmq_x) / ntx(mmq_x) == mmq_y.
-//   mmq_x< 128: granularity=16, ntx=1 → 8*16/1=128 ✓
-//   mmq_x>=128: granularity=32, ntx=2 → 8*32/2=128 ✓
-// Define LUCEBOX_RDNA_MMQ_TILE_OVERRIDE=0 to disable.
+// RDNA uses 128x128, eight-warp MMQ tiles by default. ROCmFPX template
+// instances use 64x64, four-warp tiles: their unpacking pressure makes the
+// smaller tile faster on gfx1151 without changing other quant formats.
 #ifndef LUCEBOX_RDNA_MMQ_TILE_OVERRIDE
 #define LUCEBOX_RDNA_MMQ_TILE_OVERRIDE 1
 #endif
@@ -130,7 +119,13 @@ struct tile_x_sizes {
 #endif
 
 static int get_mmq_x_max_host(const int cc) {
-    if (LUCEBOX_RDNA_TILE_HOST(cc)) return 128;
+    if (LUCEBOX_RDNA_TILE_HOST(cc)) {
+#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+        return 64;
+#else
+        return 128;
+#endif
+    }
     return (amd_mfma_available(cc) || turing_mma_available(cc) || amd_wmma_available(cc)) ? 128 :
         GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA ?
 #ifdef GGML_CUDA_FORCE_MMQ
@@ -142,7 +137,11 @@ static int get_mmq_x_max_host(const int cc) {
 
 static constexpr __device__ int get_mmq_x_max_device() {
 #if LUCEBOX_RDNA_TILE_DEVICE
+#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+    return 64;
+#else
     return 128;
+#endif
 #endif
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     return 128;
@@ -167,7 +166,13 @@ static constexpr __device__ int get_mmq_x_max_device() {
 }
 
 static int get_mmq_y_host(const int cc) {
-    if (LUCEBOX_RDNA_TILE_HOST(cc)) return 128;
+    if (LUCEBOX_RDNA_TILE_HOST(cc)) {
+#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+        return 64;
+#else
+        return 128;
+#endif
+    }
     return GGML_CUDA_CC_IS_AMD(cc) ? (GGML_CUDA_CC_IS_RDNA1(cc) ? 64 : 128) :
         ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ? 128 : 64);
 }
@@ -182,7 +187,11 @@ static constexpr __device__ int get_iter_k([[maybe_unused]] const ggml_type type
 
 static constexpr __device__ int get_mmq_y_device() {
 #if LUCEBOX_RDNA_TILE_DEVICE
+#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+    return 64;
+#else
     return 128;
+#endif
 #endif
 #if defined(GGML_USE_HIP)
 #if defined(RDNA1)
@@ -226,6 +235,9 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q5_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q5_1:    return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_Q8_0:    return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST: return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_Q2_0_ROCMFP2: return MMQ_DP4A_TXS_Q8_0_16;
+        case GGML_TYPE_Q3_0_ROCMFPX: return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_MXFP4:   return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_NVFP4:   return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q2_K:    return MMQ_DP4A_TXS_Q2_K;
@@ -270,6 +282,9 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
         case GGML_TYPE_Q5_0:    return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_Q5_1:    return MMQ_MMA_TILE_X_K_Q8_1;
         case GGML_TYPE_Q8_0:    return MMQ_MMA_TILE_X_K_Q8_0;
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST: return MMQ_MMA_TILE_X_K_Q8_0;
+        case GGML_TYPE_Q2_0_ROCMFP2: return MMQ_MMA_TILE_X_K_Q3_K;
+        case GGML_TYPE_Q3_0_ROCMFPX: return MMQ_MMA_TILE_X_K_Q3_K;
         // tile sizes are the same for Q8_1 and FP4 for blackwell
         case GGML_TYPE_MXFP4:   return MMQ_MMA_TILE_X_K_Q8_1;
         case GGML_TYPE_NVFP4:   return MMQ_MMA_TILE_X_K_NVFP4;
@@ -320,7 +335,13 @@ static constexpr __device__ int mmq_get_granularity_device(const int /*mmq_x*/) 
 
 #if defined(GGML_USE_HIP)
 static int mmq_get_nwarps_host(const int cc, const int warp_size) {
-    if (LUCEBOX_RDNA_TILE_HOST(cc)) return 8;
+    if (LUCEBOX_RDNA_TILE_HOST(cc)) {
+#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+        return 4;
+#else
+        return 8;
+#endif
+    }
     return amd_mfma_available(cc) ? 8 : 256/warp_size;
 }
 #else
@@ -331,7 +352,11 @@ static int mmq_get_nwarps_host(const int /*cc*/, const int warp_size) {
 
 static constexpr __device__ int mmq_get_nwarps_device() {
 #if LUCEBOX_RDNA_TILE_DEVICE
+#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+    return 4;
+#else
     return 8;
+#endif
 #endif
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     return 8;
@@ -841,6 +866,178 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
         x_df[i*MMQ_MMA_TILE_X_K_Q8_1                 + kbxd] = ggml_cuda_e8m0_to_fp32(bxi->e)*0.5f;
 #else
         x_df[i*(MMQ_TILE_NE_K/QI_MXFP4) + i/QI_MXFP4 + kbxd] = ggml_cuda_e8m0_to_fp32(bxi->e)*0.5f;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
+// Expand packed ROCmFP4 Codebook10 weights into the signed int8 layout used by
+// the existing Q8_0 x Q8_1 MMQ kernels.  Q4_0_ROCMFP4_FAST has one UE4M3
+// scale per 32-weight block, so after expansion its shared-memory shape is
+// identical to Q8_0: 256 int8 weights and eight float scales per row/tile.
+template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_rocmfp4_fast(
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q4_0_ROCMFP4_FAST, mmq_y);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+    constexpr int threads_per_row = MMQ_ITER_K / (4 * QR_ROCMFP4);
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kbx  = txi / QI_ROCMFP4;
+    const int kqsx = txi % QI_ROCMFP4;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_rocmfp4_fast * bxi = (const block_rocmfp4_fast *) x + kbx0 + i*stride + kbx;
+        const int aux_q4 = rocmfp4_get_qs_i32(bxi->qs, kqsx);
+        const int2 v = rocmfp4_get_int_from_codebook_16(aux_q4, kvalues_rocmfp4);
+        const int k0 = kbx * (2 * QI_ROCMFP4) + kqsx;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + k0 + 0]           = v.x;
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + k0 + QI_ROCMFP4] = v.y;
+#else
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + 0]           = v.x;
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + QI_ROCMFP4] = v.y;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+
+    constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QI8_0;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps*rows_per_warp) {
+        int i = i0 + threadIdx.y*rows_per_warp + threadIdx.x/blocks_per_tile_x_row;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_rocmfp4_fast * bxi = (const block_rocmfp4_fast *) x + kbx0 + i*stride + kbxd;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + kbxd] = rocmfp4_ue4m3_to_fp32_half_finite(bxi->e);
+#else
+        x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + kbxd] = rocmfp4_ue4m3_to_fp32_half_finite(bxi->e);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
+template <ggml_type type>
+struct rocmfpx_dual_mmq_traits;
+
+template <>
+struct rocmfpx_dual_mmq_traits<GGML_TYPE_Q2_0_ROCMFP2> {
+    using block_t = block_rocmfp2;
+
+    static __device__ __forceinline__ int pack4(const block_t * block, const int base) {
+        return rocmfpx_pack4_fp2_vec_cuda(block->qs, base);
+    }
+
+    static __device__ __forceinline__ float scale(const block_t * block, const int half) {
+        return rocmfpx_ue4m3_to_fp32_finite(block->e[half]);
+    }
+};
+
+template <>
+struct rocmfpx_dual_mmq_traits<GGML_TYPE_Q3_0_ROCMFPX> {
+    using block_t = block_rocmfp3;
+
+    static __device__ __forceinline__ int pack4(const block_t * block, const int base) {
+        return rocmfpx_pack4_fp3_vec_cuda(block->qs, base);
+    }
+
+    static __device__ __forceinline__ float scale(const block_t * block, const int half) {
+        return rocmfpx_ue4m3_to_fp32_finite(block->e[half]);
+    }
+};
+
+// Q2/FP3 store one UE4M3 scale per 16 weights.  Expand their packed values
+// into int8 and reuse the existing scale-per-16 Q8_0 x Q8_1 MMQ kernels.  One
+// wave loads a full 256-weight row: each lane expands two groups of four.
+template <ggml_type type, int mmq_y, bool need_check>
+static __device__ __forceinline__ void load_tiles_rocmfpx_dual(
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    using traits = rocmfpx_dual_mmq_traits<type>;
+    using block_t = typename traits::block_t;
+
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int groups_per_block = QK_ROCMFPX / 4;
+    constexpr int blocks_per_tile = MMQ_ITER_K / QK_ROCMFPX;
+    constexpr int threads_per_row = blocks_per_tile * groups_per_block / 2;
+    static_assert(threads_per_row == 32, "ROCmFPX MMQ loader expects 32 lanes per row");
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, mmq_y);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kbx = txi / (groups_per_block / 2);
+    const int group = txi % (groups_per_block / 2);
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_t * block = (const block_t *) x + kbx0 + i*stride + kbx;
+        const int k0 = kbx*groups_per_block + group;
+        const int q0 = traits::pack4(block, 4*group);
+        const int q1 = traits::pack4(
+            block, 4*(group + groups_per_block/2));
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + k0]                      = q0;
+        x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + k0 + groups_per_block/2] = q1;
+#else
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0]                      = q0;
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + groups_per_block/2] = q1;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+    }
+
+    constexpr int scales_per_tile = 2*blocks_per_tile;
+    constexpr int scale_rows_per_warp = warp_size / scales_per_tile;
+    const int kscale = threadIdx.x % scales_per_tile;
+    const int scale_block = kscale / 2;
+    const int scale_half = kscale % 2;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps*scale_rows_per_warp) {
+        int i = i0 + threadIdx.y*scale_rows_per_warp + threadIdx.x/scales_per_tile;
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_t * block = (const block_t *) x + kbx0 + i*stride + scale_block;
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*MMQ_MMA_TILE_X_K_Q3_K + kscale] = traits::scale(block, scale_half);
+#else
+        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + kscale] = traits::scale(block, scale_half);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }
@@ -3393,6 +3590,30 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q8_0> {
 };
 
 template <int mmq_x, int mmq_y, bool need_check>
+struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q4_0_ROCMFP4_FAST> {
+    static constexpr int              vdr          = VDR_ROCMFP4_FAST_Q8_1_MMQ;
+    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_rocmfp4_fast<mmq_y, need_check>;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_q8_1_mma<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>;
+    static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
+};
+
+template <int mmq_x, int mmq_y, bool need_check>
+struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q2_0_ROCMFP2> {
+    static constexpr int              vdr          = VDR_ROCMFP2_Q8_1_MMQ;
+    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_rocmfpx_dual<GGML_TYPE_Q2_0_ROCMFP2, mmq_y, need_check>;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_16_q8_1_mma<mmq_x, mmq_y>;
+    static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_16_q8_1_dp4a<mmq_x, mmq_y>;
+};
+
+template <int mmq_x, int mmq_y, bool need_check>
+struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q3_0_ROCMFPX> {
+    static constexpr int              vdr          = VDR_ROCMFP3_Q8_1_MMQ;
+    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_rocmfpx_dual<GGML_TYPE_Q3_0_ROCMFPX, mmq_y, need_check>;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_16_q8_1_mma<mmq_x, mmq_y>;
+    static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_16_q8_1_dp4a<mmq_x, mmq_y>;
+};
+
+template <int mmq_x, int mmq_y, bool need_check>
 struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_MXFP4> {
     static constexpr int              vdr          = VDR_MXFP4_Q8_1_MMQ;
 #ifdef BLACKWELL_MMA_AVAILABLE
@@ -3623,7 +3844,7 @@ template <ggml_type type, int mmq_x, bool need_check>
 #if defined(GGML_USE_HIP)
 // RDNA4 is compute-bound on MMQ (WMMA path); allow compiler to use more VGPRs
 // (minBlocks=1 matches NVIDIA Volta+ behavior and reduces register spilling).
-#if defined(RDNA4)
+#if defined(RDNA4) && !defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 1)
 #elif defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
@@ -4242,6 +4463,9 @@ extern DECL_MMQ_CASE(GGML_TYPE_Q4_1);
 extern DECL_MMQ_CASE(GGML_TYPE_Q5_0);
 extern DECL_MMQ_CASE(GGML_TYPE_Q5_1);
 extern DECL_MMQ_CASE(GGML_TYPE_Q8_0);
+extern DECL_MMQ_CASE(GGML_TYPE_Q4_0_ROCMFP4_FAST);
+extern DECL_MMQ_CASE(GGML_TYPE_Q2_0_ROCMFP2);
+extern DECL_MMQ_CASE(GGML_TYPE_Q3_0_ROCMFPX);
 extern DECL_MMQ_CASE(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_K);
@@ -4262,6 +4486,19 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+
+// Execute two same-shape MUL_MAT operations with one activation quantization.
+// When ids is non-null, also share the MUL_MAT_ID sort. The two MMQ launches
+// and their output order remain unchanged, so callers can apply the ordinary
+// GLU kernel byte-identically.
+void ggml_cuda_mul_mat_q_pair(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0_a,
+        const ggml_tensor * src0_b,
+        const ggml_tensor * src1,
+        const ggml_tensor * ids,
+        ggml_tensor * dst_a,
+        ggml_tensor * dst_b);
 
 void ggml_cuda_op_mul_mat_q(
     ggml_backend_cuda_context & ctx,

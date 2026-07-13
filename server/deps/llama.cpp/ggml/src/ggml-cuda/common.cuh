@@ -109,6 +109,13 @@
 #    define GGML_CUDA_USE_CUB
 #endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
 
+// rocPRIM ships hipCUB, a CUB-compatible device-sort API.  The ordinary
+// single-block bitonic argsort cannot represent DS4's long-context indexer once
+// the number of compressed rows exceeds 1024, so use hipCUB for that case.
+#if defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#    define GGML_CUDA_USE_HIPCUB
+#endif  // defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
 #ifdef __CUDA_ARCH_LIST__
 constexpr bool ggml_cuda_has_arch_impl(int) {
     return false;

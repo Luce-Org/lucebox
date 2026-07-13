@@ -78,6 +78,168 @@ float ggml_table_f32_f16[1 << 16];
 // precomputed f32 table for e8m0 half (1 KB) (simd-mappings.h)
 float ggml_table_f32_e8m0_half[1 << 8];
 
+static float ggml_ds4_indexer_e2m1_value_cpu(int i) {
+    static const float values[8] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    };
+    return values[i & 7];
+}
+
+static float ggml_ds4_indexer_e2m1_round_cpu(float x) {
+    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    const float ax = fminf(fabsf(x), 6.0f);
+    int best = 0;
+    float best_diff = fabsf(ax - ggml_ds4_indexer_e2m1_value_cpu(0));
+    for (int i = 1; i < 8; ++i) {
+        const float diff = fabsf(ax - ggml_ds4_indexer_e2m1_value_cpu(i));
+        if (diff < best_diff ||
+            (diff == best_diff && (i & 1) == 0 && (best & 1) != 0)) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+    return sign * ggml_ds4_indexer_e2m1_value_cpu(best);
+}
+
+static void ggml_compute_forward_ds4_indexer_qat(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(src && src->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src->ne[0] == 128 && ggml_are_same_shape(src, dst));
+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
+
+    const int64_t n_rows = ggml_nrows(src);
+    for (int64_t row = params->ith; row < n_rows; row += params->nth) {
+        float values[128];
+        const float * src_row = (const float *) ((const char *) src->data + row * src->nb[1]);
+        float * dst_row = (float *) ((char *) dst->data + row * dst->nb[1]);
+        memcpy(values, src_row, sizeof(values));
+
+        for (int stride = 1; stride < 128; stride <<= 1) {
+            for (int base = 0; base < 128; base += 2 * stride) {
+                for (int i = 0; i < stride; ++i) {
+                    const float a = values[base + i];
+                    const float b = values[base + stride + i];
+                    values[base + i] = a + b;
+                    values[base + stride + i] = a - b;
+                }
+            }
+        }
+        for (int i = 0; i < 128; ++i) {
+            values[i] *= 0.08838834764831845f;
+        }
+        for (int block = 0; block < 4; ++block) {
+            float amax = 0.0f;
+            for (int i = 0; i < 32; ++i) {
+                amax = fmaxf(amax, fabsf(values[block * 32 + i]));
+            }
+            amax = fmaxf(amax, 7.052966104933725e-38f);
+            const float scale = exp2f(ceilf(log2f(amax / 6.0f)));
+            for (int i = 0; i < 32; ++i) {
+                const int index = block * 32 + i;
+                const float normalized = fminf(
+                    6.0f, fmaxf(-6.0f, values[index] / scale));
+                dst_row[index] =
+                    ggml_ds4_indexer_e2m1_round_cpu(normalized) * scale;
+            }
+        }
+    }
+}
+
+static void ggml_compute_forward_ds4_indexer_score(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * q = dst->src[0];
+    const struct ggml_tensor * weights = dst->src[1];
+    const struct ggml_tensor * comp = dst->src[2];
+    GGML_ASSERT(q && weights && comp);
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[0] == 128);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(comp->type == GGML_TYPE_F16 && comp->ne[0] == 128);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(q) && ggml_is_contiguous(weights));
+    GGML_ASSERT(ggml_is_contiguous(comp) && ggml_is_contiguous(dst));
+
+    const int n_head = (int) q->ne[1];
+    const int n_tokens = (int) q->ne[2];
+    const int n_comp = (int) comp->ne[1];
+    const int kv_start = ggml_get_op_params_i32(dst, 0);
+    const int ratio = ggml_get_op_params_i32(dst, 1);
+    GGML_ASSERT(weights->ne[0] == n_head && weights->ne[1] == n_tokens);
+    GGML_ASSERT(dst->ne[0] == n_comp && dst->ne[1] == n_tokens);
+    GGML_ASSERT(kv_start >= 0 && ratio > 0);
+
+    const float * q_data = (const float *) q->data;
+    const float * weight_data = (const float *) weights->data;
+    const ggml_fp16_t * comp_data = (const ggml_fp16_t *) comp->data;
+    float * dst_data = (float *) dst->data;
+    for (int token = params->ith; token < n_tokens; token += params->nth) {
+        const int visible = (kv_start + token + 1) / ratio;
+        for (int c = 0; c < n_comp; ++c) {
+            if (c >= visible) {
+                dst_data[(size_t) token * n_comp + c] = -1.0e30f;
+                continue;
+            }
+            const ggml_fp16_t * k = comp_data + (size_t) c * 128;
+            float score = 0.0f;
+            for (int h = 0; h < n_head; ++h) {
+                const float * qh = q_data +
+                    ((size_t) token * n_head + h) * 128;
+                float dot = 0.0f;
+                for (int d = 0; d < 128; ++d) {
+                    dot += qh[d] * GGML_FP16_TO_FP32(k[d]);
+                }
+                score += fmaxf(dot, 0.0f) *
+                         weight_data[(size_t) token * n_head + h];
+            }
+            dst_data[(size_t) token * n_comp + c] = score;
+        }
+    }
+}
+
+static void ggml_compute_forward_ds4_indexer_mask(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * base = dst->src[0];
+    const struct ggml_tensor * selected = dst->src[1];
+    GGML_ASSERT(base && selected);
+    GGML_ASSERT(base->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(selected->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_are_same_shape(base, dst));
+    GGML_ASSERT(ggml_is_contiguous(base) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_is_contiguous(selected));
+
+    const int n_attn = (int) base->ne[0];
+    const int n_tokens = (int) ggml_nrows(base);
+    const int top_k = (int) selected->ne[0];
+    const int raw_rows = ggml_get_op_params_i32(dst, 0);
+    const int n_comp = n_attn - raw_rows;
+    GGML_ASSERT(raw_rows >= 0 && n_comp >= 0);
+    GGML_ASSERT(ggml_nrows(selected) == n_tokens);
+
+    for (int token = params->ith; token < n_tokens; token += params->nth) {
+        const float * base_row =
+            (const float *) ((const char *) base->data + (size_t) token * base->nb[1]);
+        float * dst_row =
+            (float *) ((char *) dst->data + (size_t) token * dst->nb[1]);
+        const int32_t * selected_row =
+            (const int32_t *) ((const char *) selected->data +
+                               (size_t) token * selected->nb[1]);
+        memcpy(dst_row, base_row, (size_t) raw_rows * sizeof(float));
+        for (int row = raw_rows; row < n_attn; ++row) {
+            dst_row[row] = -1.0e30f;
+        }
+        for (int k = 0; k < top_k; ++k) {
+            const int comp = selected_row[k];
+            if (comp >= 0 && comp < n_comp) {
+                dst_row[raw_rows + comp] = base_row[raw_rows + comp];
+            }
+        }
+    }
+}
+
 #if defined(__ARM_ARCH)
 struct ggml_arm_arch_features_type {
     int sve_cnt;
@@ -1830,6 +1992,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 GGML_ABORT("GGML_OP_DS4_HC is only implemented for CUDA");
             }
+        case GGML_OP_DS4_INDEXER_QAT:
+            {
+                ggml_compute_forward_ds4_indexer_qat(params, tensor);
+            } break;
+        case GGML_OP_DS4_INDEXER_SCORE:
+            {
+                ggml_compute_forward_ds4_indexer_score(params, tensor);
+            } break;
+        case GGML_OP_DS4_INDEXER_MASK:
+            {
+                ggml_compute_forward_ds4_indexer_mask(params, tensor);
+            } break;
         case GGML_OP_OUT_PROD:
             {
                 ggml_compute_forward_out_prod(params, tensor);
@@ -2374,6 +2548,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_TIMESTEP_EMBEDDING:
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
+        case GGML_OP_DS4_INDEXER_QAT:
+        case GGML_OP_DS4_INDEXER_SCORE:
+        case GGML_OP_DS4_INDEXER_MASK:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_SPARSE:
         case GGML_OP_FLASH_ATTN_BACK:
