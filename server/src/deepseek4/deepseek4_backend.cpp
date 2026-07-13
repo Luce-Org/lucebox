@@ -4,6 +4,10 @@
 #include "deepseek4_internal.h"
 #include "common/sampler.h"
 
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#include "common/gpu_runtime_compat.h"
+#endif
+
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
@@ -31,6 +35,29 @@ static uint64_t elapsed_us(Clock::time_point start, Clock::time_point end) {
 static bool env_flag_enabled(const char * name) {
     const char * value = std::getenv(name);
     return value && value[0] && std::strcmp(value, "0") != 0;
+}
+
+static void configure_gfx1151_dspark_mmvq_default(int gpu) {
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    if (!env_flag_enabled("DFLASH_DS4_SPEC") ||
+        std::getenv("LUCE_MMVQ_MAX_NCOLS") != nullptr) {
+        return;
+    }
+
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, gpu) != cudaSuccess ||
+        std::strncmp(prop.gcnArchName, "gfx1151", 7) != 0) {
+        return;
+    }
+
+    if (::setenv("LUCE_MMVQ_MAX_NCOLS", "4", 0) == 0) {
+        std::fprintf(stderr,
+                     "[deepseek4] gfx1151 DSpark: defaulting "
+                     "LUCE_MMVQ_MAX_NCOLS=4\n");
+    }
+#else
+    (void) gpu;
+#endif
 }
 
 static double gib(uint64_t bytes) {
@@ -310,6 +337,11 @@ DeepSeek4Backend::~DeepSeek4Backend() {
 }
 
 bool DeepSeek4Backend::init() {
+    // The shared MMVQ/MMQ crossover defaults to q=3 for NVIDIA. On gfx1151,
+    // DSpark q=4 is faster through MMVQ. Keep AR and other devices unchanged,
+    // and preserve LUCE_MMVQ_MAX_NCOLS as an explicit override.
+    configure_gfx1151_dspark_mmvq_default(cfg_.device.gpu);
+
     backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
     if (!backend_) {
         std::fprintf(stderr, "[deepseek4] failed to create CUDA backend (gpu=%d)\n",
