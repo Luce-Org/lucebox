@@ -572,7 +572,7 @@ bool DeepSeek4LayerSplitAdapter::prefill(
         int base_pos,
         int & last_tok,
         bool need_logits) {
-    const int chunk_size = 1;
+    const int chunk_size = cfg_.chunk > 0 ? cfg_.chunk : 512;
     const int n_prompt = (int)prompt.size();
 
     for (int offset = 0; offset < n_prompt; offset += chunk_size) {
