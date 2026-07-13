@@ -14,10 +14,8 @@
 //
 // Returns false (caller must fall back to the CPU path) when the GPU runtime is
 // unavailable, the pointer is not device memory, K is out of range, or any
-// device call fails. Compiled on both CUDA and HIP/ROCm builds — this same .cu
-// is compiled directly with LANGUAGE HIP on ROCm, the cuda_runtime.h spellings
-// mapped by the hip_compat shim; guarded by DFLASH27B_HAVE_DRAFT_TOPK. See
-// CMakeLists.txt.
+// device call fails. Compiled on the CUDA backend only, where this .cu is added
+// to dflash_common; guarded by DFLASH27B_HAVE_DRAFT_TOPK_CUDA. See CMakeLists.txt.
 
 #pragma once
 
