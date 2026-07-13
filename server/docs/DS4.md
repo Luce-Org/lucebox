@@ -180,6 +180,13 @@ export DFLASH_DS4_SPEC_Q=4
 ./server/build-hip/dflash_server /path/to/deepseek4-target.gguf
 ```
 
+On HIP `gfx1151`, enabling DSpark defaults `LUCE_MMVQ_MAX_NCOLS` to `4` when
+the variable is unset. This keeps the four-row verifier on MMVQ; the validated
+ROCm 7.2.4 high-clock GSM+Math run reached 30.23 tok/s weighted with 10/10
+correctness. Set `LUCE_MMVQ_MAX_NCOLS` explicitly to override the platform
+default. AR, NVIDIA, and other HIP architectures retain the shared dispatch
+default.
+
 Adaptive width is automatic. When the draft artifact has a compatible
 confidence projection, the runtime selects q=2, q=3, or q=4 from the cumulative
 confidence of the proposed prefix. It adds the projection to the same fused
