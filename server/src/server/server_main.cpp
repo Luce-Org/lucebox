@@ -221,6 +221,8 @@ static void print_usage(const char * prog) {
         "  --ds4-expert-top-k <N>\n"
         "                       Keep and renormalize the highest-ranked N routed experts\n"
         "                       (0=model default; single-device DeepSeek4 only)\n"
+        "  --ds4-prefill <mode> DeepSeek4 prefill: exact, dense, or sparse "
+        "(default: exact; sparse is experimental)\n"
         "  --fa-window <N>     Flash-attention sliding window (default: 0=full).\n"
         "                       WARNING: >0 drops system prompt / tool definitions\n"
         "                       from attention at long contexts. Use 0 for tools.\n"
@@ -433,6 +435,19 @@ int main(int argc, char ** argv) {
             bargs.ds4_expert_top_k = std::atoi(argv[++i]);
             if (bargs.ds4_expert_top_k < 0) {
                 std::fprintf(stderr, "[server] --ds4-expert-top-k must be non-negative\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--ds4-prefill") == 0 && i + 1 < argc) {
+            const char * mode = argv[++i];
+            if (std::strcmp(mode, "exact") == 0) {
+                bargs.ds4_prefill_mode = PrefillAttentionMode::Exact;
+            } else if (std::strcmp(mode, "dense") == 0) {
+                bargs.ds4_prefill_mode = PrefillAttentionMode::Dense;
+            } else if (std::strcmp(mode, "sparse") == 0) {
+                bargs.ds4_prefill_mode = PrefillAttentionMode::Sparse;
+            } else {
+                std::fprintf(stderr,
+                    "[server] --ds4-prefill expects exact, dense, or sparse\n");
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--fa-window") == 0 && i + 1 < argc) {
@@ -1109,6 +1124,8 @@ int main(int argc, char ** argv) {
         } else {
             std::fprintf(stderr, "[server] │  ds4_expert_topk= model default\n");
         }
+        std::fprintf(stderr, "[server] │  ds4_prefill     = %s\n",
+                     prefill_attention_mode_name(bargs.ds4_prefill_mode));
     }
     std::fprintf(stderr, "[server] │  fa_window       = %d\n", bargs.fa_window);
     if (bargs.fa_window > 0) {

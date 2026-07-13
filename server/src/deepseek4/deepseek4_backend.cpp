@@ -97,6 +97,7 @@ static void add_step_tel(DeepSeek4StepTelemetry & dst, const DeepSeek4StepTeleme
     dst.sample_us += src.sample_us;
     dst.emit_us += src.emit_us;
     dst.full_graph_build_us += src.full_graph_build_us;
+    dst.full_graph_alloc_us += src.full_graph_alloc_us;
     dst.full_graph_set_us += src.full_graph_set_us;
     dst.full_graph_compute_us += src.full_graph_compute_us;
     dst.full_graph_read_us += src.full_graph_read_us;
@@ -123,7 +124,8 @@ static void log_step_tel(const char * phase,
         "ffn_hot_graph_build=%llu ffn_hot_graph_hit=%llu ffn_cold_graph_build=%llu ffn_cold_graph_hit=%llu "
         "hc_pre=%.1fms hc_pre_build=%.1fms hc_pre_input=%.1fms hc_pre_compute=%.1fms "
         "hc_post=%.1fms output=%.1fms sample=%.1fms emit=%.1fms "
-        "full_build=%.1fms full_set=%.1fms full_compute=%.1fms full_read=%.1fms "
+        "graph_build=%.1fms graph_alloc=%.1fms graph_set=%.1fms "
+        "graph_compute=%.1fms graph_read=%.1fms "
         "hot_sel=%d cold_sel=%d\n",
         phase, tokens, steps, wall_s, tok_s,
         ms(t.total_us), ms(t.embed_us), ms(t.attn_build_us), ms(t.attn_compute_us), ms(t.attn_read_us),
@@ -139,7 +141,8 @@ static void log_step_tel(const char * phase,
         ms(t.hc_pre_compute_us),
         ms(t.hc_post_attn_us + t.hc_post_ffn_us),
         ms(t.output_us), ms(t.sample_us), ms(t.emit_us),
-        ms(t.full_graph_build_us), ms(t.full_graph_set_us), ms(t.full_graph_compute_us),
+        ms(t.full_graph_build_us), ms(t.full_graph_alloc_us),
+        ms(t.full_graph_set_us), ms(t.full_graph_compute_us),
         ms(t.full_graph_read_us),
         t.hot_selected, t.cold_selected);
 }
@@ -474,6 +477,7 @@ bool DeepSeek4Backend::init() {
         std::fprintf(stderr, "[deepseek4] failed to allocate KV cache (ctx=%d)\n", max_ctx);
         return false;
     }
+    cache_.prefill_mode = cfg_.prefill_mode;
 
     if (moe_hybrid_) {
         // Expert IPC removed — layer split replaces expert split.
@@ -686,17 +690,31 @@ bool DeepSeek4Backend::unpark(const std::string & what) {
             return false;
         }
     }
+    cache_.prefill_mode = cfg_.prefill_mode;
     return true;
 }
 
 int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   const DaemonIO & io,
                                   int kv_offset) {
-    // Keep server prefill token-at-a-time for established numerics and bounded
-    // dynamic-graph workspace. The lower-level layer-range API independently
-    // splits arbitrary multi-token callers at every compressor boundary.
-    constexpr int chunk = 1;
+    // The all-hot layer-range path supports causal chunked prefill. The
+    // optimized graph snapshots the previous raw SWA window, attends over
+    // that snapshot plus the current ubatch, and commits only the final SWA
+    // tail. Learned compressor boundaries are emitted inside the same graph.
+    //
+    // Mixed hot/cold hybrid execution still has single-token HC semantics, so
+    // retain the reference path there.  --chunk 1 is the explicit fallback.
+    const int requested_chunk = cfg_.chunk > 0 ? cfg_.chunk : w_.n_swa;
     const int n_total = (int)tokens.size();
+    // Bound the layer-major graph to the topology validated by the prefill
+    // kernels. Smaller tail chunks use the same scheduler or its reference
+    // fallback.
+    const int layer_major_cap = DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
+    const int chunk = (moe_hybrid_ ||
+                       cfg_.prefill_mode == PrefillAttentionMode::Exact)
+        ? 1
+        : std::max(1, std::min(requested_chunk,
+                               layer_major_cap));
     int pos = kv_offset;
     // New sequence: clear the cache buffer so compressor state double-buffers
     // and compressed-KV rows start from zeros, exactly like a fresh server.
@@ -757,12 +775,20 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             spec_hooks.capture_out = &spec_cap;
             hp = &spec_hooks;
         }
-        const bool ok = deepseek4_step(
-            backend_, w_, cache_, embed.data(), n_tok, pos, logits,
-            moe_hybrid_.get(), tokens.data() + i,
-            moe_hybrid_ ? &stream_engine_ : nullptr,
-            timing ? &step_tel : nullptr,
-            routing_stats_.get(), hp);
+        bool ok = false;
+        if (moe_hybrid_) {
+            ok = deepseek4_step(backend_, w_, cache_, embed.data(), n_tok, pos,
+                                logits, moe_hybrid_.get(), tokens.data() + i,
+                                &stream_engine_, timing ? &step_tel : nullptr,
+                                routing_stats_.get(), hp);
+        } else {
+            std::vector<float> hc_state;
+            ok = deepseek4_step_layer_range(
+                backend_, w_, cache_, hc_state, embed.data(), n_tok, pos,
+                0, w_.n_layer, &logits, tokens.data() + i,
+                timing ? &step_tel : nullptr,
+                cfg_.prefill_mode != PrefillAttentionMode::Sparse, hp);
+        }
         if (ok && hp && !spec_cap.empty()) {
             const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
             const int first_capture = std::max(0, spec_capture_from - i);

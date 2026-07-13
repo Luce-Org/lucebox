@@ -24,8 +24,14 @@
 
 #include "internal.h"
 #include "common/layer_split_utils.h"
+#include "common/prefill_attention_mode.h"
 
 namespace dflash::common {
+
+// Layer-major prefill may schedule two 2K numerical bands while preserving
+// the raw-cache rounding boundary between them.
+inline constexpr int DS4_NUMERICAL_PREFILL_BAND = 2048;
+inline constexpr int DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS = 4096;
 
 struct MoeHybridPlacement;
 struct MoeHybridConfig;
@@ -264,6 +270,7 @@ struct DeepSeek4Cache {
     int n_layer  = 0;
 
     std::vector<DeepSeek4LayerCache> layers;
+    PrefillAttentionMode prefill_mode = PrefillAttentionMode::Exact;
 
     // HC residual streams: [n_hc * n_embd] persistent state
     ggml_tensor * hc_state    = nullptr;  // [n_hc * n_embd]
@@ -286,6 +293,7 @@ struct DeepSeek4BackendConfig {
     DevicePlacement device;
     int          stream_fd    = -1;
     int          chunk        = 512;   // prefill chunk size
+    PrefillAttentionMode prefill_mode = PrefillAttentionMode::Exact;
     int          max_ctx      = 0;     // 0 = auto from SWA + compression capacity
     int          expert_top_k = 0;     // 0 = use all model-routed experts
     bool         fused_decode = false; // single-graph GPU decode
