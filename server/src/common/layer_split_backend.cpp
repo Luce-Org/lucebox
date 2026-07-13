@@ -25,6 +25,10 @@ bool LayerSplitBackend::init() {
     return adapter_->init();
 }
 
+bool LayerSplitBackend::supports_multimodal() const {
+    return adapter_ && adapter_->supports_multimodal();
+}
+
 void LayerSplitBackend::print_ready_banner() const {
     std::printf("[daemon] ready\n");
     std::fflush(stdout);
