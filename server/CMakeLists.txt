@@ -642,6 +642,18 @@ endif()
 option(DFLASH27B_TESTS "Build numerics tests" ON)
 option(DFLASH27B_SERVER "Build dflash_server + backend_ipc_daemon" ON)
 if(DFLASH27B_TESTS)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_gdn_grouped_policy.cpp")
+        add_executable(test_gdn_grouped_policy test/test_gdn_grouped_policy.cpp)
+        target_include_directories(test_gdn_grouped_policy PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
+        add_test(NAME gdn_grouped_policy COMMAND test_gdn_grouped_policy)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_qwen35_gdn_broadcast.cpp")
+        add_executable(test_qwen35_gdn_broadcast test/test_qwen35_gdn_broadcast.cpp)
+        target_include_directories(test_qwen35_gdn_broadcast PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_qwen35_gdn_broadcast PRIVATE dflash_common)
+        add_test(NAME qwen35_gdn_broadcast COMMAND test_qwen35_gdn_broadcast)
+    endif()
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash_cuda_min_sm GREATER_EQUAL 80 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
         add_executable(test_flashprefill_kernels test/test_flashprefill_kernels.cpp)
         set_target_properties(test_flashprefill_kernels PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
@@ -716,6 +728,13 @@ if(DFLASH27B_TESTS)
     # shapes cover the no-fixup, partial-row, fixup, two-wave, and deeper-K
     # transitions validated for the llama.cpp #22298 backport on sm_86.
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+        add_executable(test_gdn_grouped_cuda test/test_gdn_grouped_cuda.cpp)
+        target_link_libraries(test_gdn_grouped_cuda PRIVATE
+            ggml
+            ggml-cuda
+            ggml-base)
+        add_test(NAME gdn_grouped_cuda COMMAND test_gdn_grouped_cuda)
+
         add_executable(test_mmq_streamk_iq4_xs test/test_mmq_streamk_iq4_xs.cpp)
         target_link_libraries(test_mmq_streamk_iq4_xs PRIVATE
             ggml

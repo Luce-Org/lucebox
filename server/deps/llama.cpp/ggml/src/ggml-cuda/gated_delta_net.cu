@@ -1,4 +1,5 @@
 #include "gated_delta_net.cuh"
+#include "gated_delta_net_policy.h"
 #ifndef GGML_USE_HIP
 #include <cuda_fp16.h>
 #endif
@@ -471,8 +472,8 @@ static void launch_gated_delta_net(
                             && cc <  GGML_CUDA_CC_ADA_LOVELACE;
     const bool force_grouped_cols = getenv("DFLASH_GDN_FORCE_GROUPED_COLS") != nullptr;
     const bool disable_grouped_cols = getenv("DFLASH_GDN_NO_GROUPED_COLS") != nullptr;
-    const bool use_grouped_cols = force_grouped_cols ||
-        (!disable_grouped_cols && !ampere_nvidia);
+    const bool use_grouped_cols = ggml_cuda_gdn_use_grouped_columns(
+        ampere_nvidia, n_tokens, force_grouped_cols, disable_grouped_cols);
 
     switch (S_v) {
         case 16:

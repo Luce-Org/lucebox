@@ -12,3 +12,11 @@ This directory contains the ggml-only subset used by Lucebox Hub.
 - Vendored paths: `LICENSE`, `common/jinja`, `common/log.h`, `common/unicode.*`, `ggml`, `gguf-py`
 
 Open ggml feature PRs are intentionally not included until they are merged, except for explicitly listed hub test PRs.
+
+## Hub-local deltas
+
+- `ggml/src/ggml-cuda/gated_delta_net*`: Lucebox selects the existing grouped-column
+  Gated DeltaNet kernel for Ampere prefill launches of at least 512 tokens while
+  retaining the classic kernel for decode and partial chunks. The force/disable
+  environment controls remain available for differential testing. This policy is
+  maintained locally until it is suitable for upstreaming to `lucebox-ggml`.

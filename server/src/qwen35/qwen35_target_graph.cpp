@@ -864,13 +864,6 @@ static ggml_tensor * build_delta_net_block(
     q_c = ggml_l2_norm(ctx, q_c, w.rms_eps);
     k_c = ggml_l2_norm(ctx, k_c, w.rms_eps);
 
-    // Repeat Q and K from num_k_heads to num_v_heads so they match V's layout
-    // (only needed if not using the fused op's broadcast support).
-    if (num_k_heads != num_v_heads) {
-        q_c = ggml_repeat_4d(ctx, q_c, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
-        k_c = ggml_repeat_4d(ctx, k_c, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
-    }
-
     // ── SSM state (recurrent): reshape to [S_v, S_v, H_v, n_seqs]
     ggml_tensor * s = ggml_reshape_4d(ctx, ssm_state,
         head_v_dim, head_v_dim, num_v_heads, n_seqs);
@@ -920,7 +913,19 @@ static ggml_tensor * build_delta_net_block(
     ggml_tensor * new_state = nullptr;
 
     if (use_chunked) {
-        auto r = build_delta_net_chunked(ctx, q_c, k_c, v_c, g_tensor, beta, s);
+        // Fused GDN broadcasts compact Q/K heads directly. The opt-in chunked
+        // formulation still requires Q/K and V to have the same head count,
+        // so retain materialization only on this fallback path.
+        ggml_tensor * chunked_q = q_c;
+        ggml_tensor * chunked_k = k_c;
+        if (num_k_heads != num_v_heads) {
+            chunked_q = ggml_repeat_4d(
+                ctx, q_c, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+            chunked_k = ggml_repeat_4d(
+                ctx, k_c, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+        }
+        auto r = build_delta_net_chunked(
+            ctx, chunked_q, chunked_k, v_c, g_tensor, beta, s);
         output    = r.output;
         new_state = r.new_state;
         goto after_delta_net;
