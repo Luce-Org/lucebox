@@ -8,6 +8,7 @@
 // 5. call:<ns>?<verb>{relaxed-JSON args}    (gemma plain-text emissions)
 // 6. Bare JSON objects with name+arguments fields
 // 7. Whole-response JSON args for exactly one declared tool
+// 8. <TOOL_NAME>...<parameter=K>V</parameter>...</function>  (bare tool tag)
 //
 // Pattern 5 runs *before* pattern 6 so that args like
 //   call:outer{"name": "inner", "arguments": {}}
@@ -181,6 +182,11 @@ static const std::regex & re_bare_function_xml() {
 
 static const std::regex & re_function_signature() {
     static std::regex r(R"(<function=([A-Za-z_][\w.\-]*?)\(([\s\S]*?)\)</function>)");
+    return r;
+}
+
+static const std::regex & re_bare_tool_name_xml() {
+    static std::regex r(R"(<([A-Za-z_][\w.\-]*?)>([\s\S]*?)(?:</function>|</\1>))");
     return r;
 }
 
@@ -753,6 +759,25 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             json args;
             if (!parse_function_sig_args((*it)[2].str(), args)) continue;
             add_call((*it)[1].str(), args, pos, pos + it->length());
+        }
+    }
+
+    // Pattern 3b: <TOOL_NAME>...params...</function>. Some agents/models
+    // emit the selected tool name as the XML tag itself, then close with the
+    // Qwen </function> tag. Only accept requested tools and real parameter
+    // tags so arbitrary XML-ish prose remains visible text.
+    if (tools.is_array() && !tools.empty()) {
+        auto begin = std::sregex_iterator(text.begin(), text.end(), re_bare_tool_name_xml());
+        auto end = std::sregex_iterator();
+        for (auto it = begin; it != end; ++it) {
+            size_t pos = it->position();
+            if (overlaps(removals, pos)) continue;
+            std::string fn_name = (*it)[1].str();
+            std::string params = (*it)[2].str();
+            if (!tool_allowed(tools, fn_name)) continue;
+            if (params.find("<parameter=") == std::string::npos) continue;
+            add_call(fn_name, parse_xml_params(params, fn_name, tools),
+                     pos, pos + it->length());
         }
     }
 
