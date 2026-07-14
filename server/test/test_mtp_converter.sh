@@ -7,10 +7,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SAFETENSORS_DIR="${MTP_SAFETENSORS_DIR:-$ROOT/models/gemma-4-31B-it-assistant}"
-GOLD_GGUF="${MTP_GOLD_GGUF:-$ROOT/models/gemma4-mtp-31B/gemma-4-31B-it-assistant.Q4_K_M.gguf}"
+SAFETENSORS_DIR="${MTP_SAFETENSORS_DIR:-$ROOT/server/models/gemma-4-31B-it-assistant}"
+GOLD_GGUF="${MTP_GOLD_GGUF:-$ROOT/server/models/gemma4-mtp-31B/gemma-4-31B-it-assistant.Q4_K_M.gguf}"
 OUT_GGUF="${MTP_OUT_GGUF:-/tmp/mtp_phase1_ours.gguf}"
-CONVERT="$ROOT/dflash/scripts/convert_dflash_to_gguf.py"
+CONVERT="$ROOT/server/scripts/convert_dflash_to_gguf.py"
+GGUF_DUMP=(python3 "$ROOT/server/scripts/gguf_dump.py")
 
 # Sanity: gold reference must exist (downloaded in Phase 0)
 if [ ! -f "$GOLD_GGUF" ]; then
@@ -31,9 +32,9 @@ python3 "$CONVERT" --mtp-assistant "$SAFETENSORS_DIR" "$OUT_GGUF"
 
 # --- Assertion 1: tensor list parity ---
 echo "[assert 1] tensor list matches gold"
-python3 "$ROOT/dflash/deps/llama.cpp/gguf-py/scripts/gguf_dump.py" \
+"${GGUF_DUMP[@]}" \
     --no-tensors "$GOLD_GGUF" 2>&1 | grep -E '^\s+[0-9]+:\s+' | awk '{print $NF}' | sort > /tmp/gold_tensors.txt
-python3 "$ROOT/dflash/deps/llama.cpp/gguf-py/scripts/gguf_dump.py" \
+"${GGUF_DUMP[@]}" \
     --no-tensors "$OUT_GGUF" 2>&1 | grep -E '^\s+[0-9]+:\s+' | awk '{print $NF}' | sort > /tmp/ours_tensors.txt
 diff /tmp/gold_tensors.txt /tmp/ours_tensors.txt
 echo "[assert 1] PASS"
@@ -58,8 +59,8 @@ echo "[assert 2] PASS"
 
 # --- Assertion 3: required metadata keys present (vLLM #41789 guard) ---
 echo "[assert 3] required GGUF metadata keys"
-GOLD_META=$(python3 "$ROOT/dflash/deps/llama.cpp/gguf-py/scripts/gguf_dump.py" "$GOLD_GGUF" 2>&1)
-OURS_META=$(python3 "$ROOT/dflash/deps/llama.cpp/gguf-py/scripts/gguf_dump.py" "$OUT_GGUF" 2>&1)
+GOLD_META=$("${GGUF_DUMP[@]}" "$GOLD_GGUF" 2>&1)
+OURS_META=$("${GGUF_DUMP[@]}" "$OUT_GGUF" 2>&1)
 for k in \
     gemma4_assistant.n_embd_backbone \
     gemma4_assistant.requires_target_arch \

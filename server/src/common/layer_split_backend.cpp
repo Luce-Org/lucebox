@@ -48,18 +48,18 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
                                                  bool reset_state) {
     GenerateResult result;
     if (!adapter_) {
-        result.error = "adapter";
+        result.fail(GenerateErrorCode::AdapterUnavailable);
         return result;
     }
 
     DaemonIO out_io = io.with_token_callback(req.on_token);
     if (base_pos + (int)req.prompt.size() + req.n_gen + 1 > adapter_->max_context()) {
-        result.error = "context";
+        result.fail(GenerateErrorCode::ContextOverflow);
         return result;
     }
     if (req.do_sample && req.sampler.needs_logit_processing() &&
         !adapter_->supports_cpu_sampling()) {
-        result.error = "sampling_unsupported";
+        result.fail(GenerateErrorCode::SamplingUnsupported);
         return result;
     }
 
@@ -86,7 +86,7 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
         std::vector<int32_t> chunk(req.prompt.begin() + consumed,
                                    req.prompt.begin() + consumed + n_tokens);
         if (!adapter_->prefill(chunk, base_pos + consumed, last_tok)) {
-            result.error = "prefill";
+            result.fail(GenerateErrorCode::PrefillFailed);
             return result;
         }
         consumed += n_tokens;
@@ -104,7 +104,7 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
 
     if (req.n_gen > 0) {
         if (last_tok < 0) {
-            result.error = "decode_seed";
+            result.fail(GenerateErrorCode::DecodeSeedMissing);
             return result;
         }
         auto t_decode_start = std::chrono::steady_clock::now();
@@ -118,14 +118,14 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
                                   result.tokens, out_io);
         if (use_dflash) result.accept_rate = dflash_accept_rate;
         if (!ok) {
-            result.error = "decode";
+            result.fail(GenerateErrorCode::DecodeFailed);
             return result;
         }
         result.decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
 
-    result.ok = true;
+    result.succeed();
     return result;
 }
 
@@ -166,7 +166,7 @@ GenerateResult LayerSplitBackend::restore_and_generate_impl(
         int slot, const GenerateRequest & req, const DaemonIO & io) {
     GenerateResult result;
     if (!adapter_ || !adapter_->snapshot_restore(slot)) {
-        result.error = "bad slot";
+        result.fail(GenerateErrorCode::InvalidSnapshotSlot);
         io.emit(-1);
         return result;
     }
@@ -250,6 +250,14 @@ DFlashTarget * LayerSplitBackend::dflash_target() {
 
 bool LayerSplitBackend::supports_remote_draft() const {
     return adapter_ && adapter_->supports_remote_draft();
+}
+
+bool LayerSplitBackend::supports_kvflash() const {
+    return adapter_ && adapter_->supports_kvflash();
+}
+
+bool LayerSplitBackend::supports_mixed_backend_layer_split() const {
+    return adapter_ && adapter_->supports_mixed_backend_layer_split();
 }
 
 void LayerSplitBackend::shutdown() {

@@ -51,11 +51,16 @@ LLAMA_UPSTREAM_PORT="${LLAMA_UPSTREAM_PORT:-$((PORT + 1))}"
 MAX_CTX="${MAX_CTX:-16384}"
 VERIFY_MODE="${VERIFY_MODE:-seq}"
 BUDGET="${BUDGET:-22}"
-FA_WINDOW="${FA_WINDOW:-2048}"
-CACHE_TYPE_K="${CACHE_TYPE_K:-tq3_0}"
-CACHE_TYPE_V="${CACHE_TYPE_V:-tq3_0}"
-LLAMA_CACHE_TYPE_K="${LLAMA_CACHE_TYPE_K:-$CACHE_TYPE_K}"
-LLAMA_CACHE_TYPE_V="${LLAMA_CACHE_TYPE_V:-$CACHE_TYPE_V}"
+# FA_WINDOW: 0 = full attention. A finite window is known to break tool
+# calling (Qwen3.6) - only set it explicitly for experiments.
+FA_WINDOW="${FA_WINDOW:-0}"
+# CACHE_TYPE_K/V: empty = let the server pick the model family's default
+# (laguna q8_0, q4_0 base; forcing tq3_0/q4_0 on laguna garbles its
+# output). Set explicitly to experiment.
+CACHE_TYPE_K="${CACHE_TYPE_K:-}"
+CACHE_TYPE_V="${CACHE_TYPE_V:-}"
+LLAMA_CACHE_TYPE_K="${LLAMA_CACHE_TYPE_K:-${CACHE_TYPE_K:-q8_0}}"
+LLAMA_CACHE_TYPE_V="${LLAMA_CACHE_TYPE_V:-${CACHE_TYPE_V:-q8_0}}"
 MAX_TOKENS="${MAX_TOKENS:-2048}"
 EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-}"
 
@@ -155,9 +160,10 @@ start_dflash_native_server() {
   if [[ -n "$FA_WINDOW" ]] && [[ "$FA_WINDOW" != "0" ]]; then
     fa_args=(--fa-window "$FA_WINDOW")
   fi
-  # Export KV cache type env vars for the C++ server to pick up.
-  export DFLASH27B_KV_K="$CACHE_TYPE_K"
-  export DFLASH27B_KV_V="$CACHE_TYPE_V"
+  # Export KV cache type env vars for the C++ server to pick up (only when
+  # explicitly requested: the per-axis envs override family defaults).
+  if [[ -n "$CACHE_TYPE_K" ]]; then export DFLASH27B_KV_K="$CACHE_TYPE_K"; fi
+  if [[ -n "$CACHE_TYPE_V" ]]; then export DFLASH27B_KV_V="$CACHE_TYPE_V"; fi
   "$DFLASH_SERVER_BIN" "$TARGET" \
     "${draft_args[@]}" \
     --host "$HOST" \
@@ -175,8 +181,9 @@ start_dflash_native_server() {
 start_llamacpp_server() {
   if [[ ! -x "$LLAMA_SERVER_BIN" ]]; then
     echo "llama-server not found or not executable: $LLAMA_SERVER_BIN" >&2
-    echo "Build it first, for example:" >&2
-    echo "  cmake -S $REPO_DIR/server/deps/llama.cpp -B $LLAMA_BUILD_DIR -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF" >&2
+    echo "Build it from an external llama.cpp checkout or set LLAMA_SERVER_BIN to an existing binary." >&2
+    echo "For example:" >&2
+    echo "  cmake -S /path/to/llama.cpp -B $LLAMA_BUILD_DIR -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF" >&2
     echo "  cmake --build $LLAMA_BUILD_DIR --target llama-server -j2" >&2
     return 1
   fi

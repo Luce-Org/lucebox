@@ -26,8 +26,10 @@ ARG DEBIAN_FRONTEND=noninteractive
 # assumes; pre-RDNA/CDNA1 parts are excluded):
 #   gfx1151  Strix Halo / Ryzen AI MAX+ 395  (the lucebox appliance iGPU)
 #   gfx1100  RDNA3        RX 7900 XTX / W7900
-#   gfx1200  RDNA4        RX 9070
+#   gfx1200  RDNA4        RX 9060 (Navi 44)
+#   gfx1201  RDNA4        RX 9070 / Radeon AI PRO R9700 (Navi 48)
 #   gfx942   CDNA3        MI300X / MI300A
+# NB: gfx1200 and gfx1201 are NOT code-object compatible; the R9700 needs gfx1201.
 #   gfx90a   CDNA2        MI200 / MI250
 ARG DFLASH_HIP_ARCHES="gfx1151"
 
@@ -74,11 +76,11 @@ COPY server/deps /src/server/deps
 # build/share/. Without this COPY the build links then dies on the missing file.
 COPY server/share /src/server/share
 
-# Submodules must be populated on the host before `docker build` (.git/ is
-# .dockerignore'd so they cannot be fetched inside the image).
+# Vendored ggml sources must already be present on the host before
+# `docker build` (.git/ is .dockerignore'd so submodules cannot be fetched
+# inside the image).
 RUN test -f /src/server/deps/llama.cpp/ggml/CMakeLists.txt \
-    || (echo "ERROR: server/deps/llama.cpp submodule not initialised. Run on host:" >&2 \
-        && echo "       git submodule update --init --recursive" >&2 \
+    || (echo "ERROR: missing vendored ggml sources at server/deps/llama.cpp/ggml in the docker build context." >&2 \
         && exit 1)
 
 # Configure + build for HIP. DFLASH27B_GPU_BACKEND=hip selects the ggml-hip

@@ -214,6 +214,8 @@ struct TargetLoadPlan {
     int  layer_end   = -1;    // exclusive; <0 means all layers
     bool load_output = true;  // output_norm + lm_head
     bool skip_expert_tensors = false;  // skip ffn_*_exps from GPU (for hybrid MoE split load)
+    bool metadata_only = false;        // parse tensor descriptors/scales without GPU allocation
+    bool expert_metadata_only = false; // keep only routed expert tensor metadata; upload nothing
 };
 
 // Load a Q4_K_M target model from a GGUF file on disk.
@@ -238,12 +240,43 @@ struct DraftLayer {
     ggml_tensor * wk;
     ggml_tensor * wv;
     ggml_tensor * wo;
+    ggml_tensor * attn_gate = nullptr;  // optional Laguna XS 2.1 attention gate
     ggml_tensor * q_norm;
     ggml_tensor * k_norm;
     ggml_tensor * w_gate;
     ggml_tensor * w_up;
     ggml_tensor * w_down;
     bool is_swa = false;  // true for SWA layers (Qwen3.6 pattern)
+    bool attn_gate_per_head = false;
+};
+
+struct DraftDominoWeights {
+    bool enabled = false;
+    int  gru_hidden_dim = 0;
+    int  emb_dim = 0;
+    int  vocab_size = 0;
+
+    ggml_tensor * start       = nullptr;  // [gru_hidden_dim] f32
+    ggml_tensor * gru_w_ih    = nullptr;  // [n_embd, 3*gru_hidden_dim]
+    ggml_tensor * gru_w_hh    = nullptr;  // [gru_hidden_dim, 3*gru_hidden_dim]
+    ggml_tensor * gru_b_ih    = nullptr;  // [3*gru_hidden_dim] f32
+    ggml_tensor * gru_b_hh    = nullptr;  // [3*gru_hidden_dim] f32
+    ggml_tensor * head_w1     = nullptr;  // [n_embd+gru_hidden_dim, emb_dim]
+    ggml_tensor * head_b1     = nullptr;  // [emb_dim] f32
+    ggml_tensor * head_w2     = nullptr;  // [emb_dim, vocab_size]
+    ggml_tensor * head_b2     = nullptr;  // [vocab_size] f32
+};
+
+struct DraftDSparkWeights {
+    bool enabled = false;
+    int  markov_rank = 0;
+    int  vocab_size = 0;
+    int  confidence_dim = 0;
+
+    ggml_tensor * markov_w1    = nullptr;  // [markov_rank, vocab_size]
+    ggml_tensor * markov_w2    = nullptr;  // [markov_rank, vocab_size]
+    ggml_tensor * confidence_w = nullptr;  // [confidence_dim, 1]
+    ggml_tensor * confidence_b = nullptr;  // [1] f32
 };
 
 struct DraftWeights {
@@ -253,6 +286,8 @@ struct DraftWeights {
 
     ggml_tensor *          fc          = nullptr;   // [5*hidden, hidden]
     ggml_tensor *          hidden_norm = nullptr;   // [hidden]
+    std::vector<ggml_tensor *> aux_hidden_norms;    // optional [hidden] per captured target layer
+    bool context_kv_layer_norm = false;             // Laguna DFlash: per-layer input norm before context K/V
     std::vector<DraftLayer> layers;                 // size = n_layer
     ggml_tensor *          out_norm    = nullptr;   // [hidden]
 
@@ -277,7 +312,17 @@ struct DraftWeights {
     // DFlash draft-specific config (populated by loader or set by caller).
     int block_size      = DFLASH27B_DRAFT_BLOCK_SIZE;       // tokens per draft step (16 or 10)
     int n_target_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;  // captured target layers (5)
+    std::vector<int> capture_layer_ids;                     // explicit captured target-layer ids (GGUF dflash.target_layer_ids); empty = derive from count
     int mask_token_id   = DFLASH27B_DRAFT_MASK_TOKEN_ID;    // noise mask token
+
+    // Optional Domino causal correction head. When present, greedy chain
+    // speculative decode corrects each draft token with a lightweight GRU
+    // conditioned on the realized prefix before target verification.
+    DraftDominoWeights domino;
+
+    // Optional DSpark/DeepSpec-style Markov correction head. When present,
+    // greedy chain decode adds a low-rank previous-token bias before argmax.
+    DraftDSparkWeights dspark;
 };
 
 bool load_draft_safetensors(const std::string & path,
@@ -647,7 +692,8 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
     int                   kv_start,
     int                   n_tokens,
     int                   fa_window = 0,
-    ggml_tensor *         kv_write_rows = nullptr);
+    ggml_tensor *         kv_write_rows = nullptr,
+    bool                  skip_gdn_intermediate = true);
 
 } // namespace dflash::common
 

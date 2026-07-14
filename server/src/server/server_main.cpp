@@ -33,6 +33,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -195,7 +196,7 @@ static void print_usage(const char * prog) {
         "Usage: %s <model.gguf> [options]\n"
         "\n"
         "Options:\n"
-        "  --draft <path>       Draft model for speculative decode (qwen35 only)\n"
+        "  --draft <path>       Draft model for speculative decode\n"
         "  --port <N>           Listen port (default: 8080)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
         "  --max-ctx <N>        Max context length (default: 131072)\n"
@@ -226,6 +227,10 @@ static void print_usage(const char * prog) {
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
         "  --ddtree             Enable DDTree speculative decode\n"
         "  --ddtree-budget <N>  DDTree budget (default: 22)\n"
+        "  --verify-width <N>   laguna chain spec verify width (default: base 8,\n"
+        "                       trimmed per step by drafter confidence; N = fixed base)\n"
+        "  --adaptive-experts [tau]  MoE expert-count gating on verify batches\n"
+        "                       (near-lossless; default tau 0.80 when passed)\n"
         "  --no-cors            Disable CORS headers\n"
         "  --think-max-tokens <N>     Phase-1 reasoning cap when a request opts in\n"
         "                             via thinking:{type:enabled} (default: 15488 =\n"
@@ -254,7 +259,7 @@ static void print_usage(const char * prog) {
 #ifdef GGML_USE_HIP
         "                         Default: q4_0 (HIP builds; tq3_0 fattn unsupported)\n"
 #else
-        "                         Default: tq3_0 when max_ctx>6144, else q4_0\n"
+        "                         Default: per model family (laguna q8_0, else q4_0)\n"
 #endif
         "\n"
         "PFlash (speculative prefill compression):\n"
@@ -433,6 +438,21 @@ int main(int argc, char ** argv) {
             bargs.fast_rollback = true;
         } else if (std::strcmp(argv[i], "--ddtree-budget") == 0 && i + 1 < argc) {
             bargs.ddtree_budget = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--adaptive-experts") == 0) {
+            const char * tau = "0.80";
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                tau = argv[++i];
+            }
+            char * end = nullptr;
+            const double tv = std::strtod(tau, &end);
+            if (end == tau || *end != '\0' || tv <= 0.0 || tv > 1.0) {
+                std::fprintf(stderr,
+                    "--adaptive-experts: tau must be a float in (0,1], got \"%s\"\n", tau);
+                return 1;
+            }
+            setenv("DFLASH_ADAPTIVE_K_TAU", tau, 0);  // explicit env still wins
+        } else if (std::strcmp(argv[i], "--verify-width") == 0 && i + 1 < argc) {
+            bargs.verify_width = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--no-fast-rollback") == 0) {
             fast_rollback_forced_off = true;
             bargs.fast_rollback = false;
@@ -680,14 +700,10 @@ int main(int argc, char ** argv) {
         setenv("DFLASH27B_KV_V", cache_type_v.c_str(), 1);
     }
 
-    // Auto-select TQ3_0 KV cache for large contexts (saves ~40% VRAM).
-    // Q4_0 remains default for short contexts where quality matters more.
-    // HIP build skips this: tq3_0 fattn unsupported (ggml-cuda/fattn.cu).
-#ifndef GGML_USE_HIP
-    if (sconfig.max_ctx > 6144 && cache_type_k.empty() && cache_type_v.empty()) {
-        setenv("DFLASH27B_KV_TQ3", "1", 0);  // don't overwrite user env
-    }
-#endif
+    // TQ3_0 KV auto-selection was removed (2026-07): tq3_0 saved ~40% VRAM on
+    // large qwen contexts but is quality-risky and garbles laguna outright.
+    // KV types now come from each family's default (q8_0 for laguna, q4_0
+    // base) unless the user passes --cache-type-k/v explicitly.
 
     // PFlash performance defaults: BSA kernel + sparse alpha + full attention window.
     bool pflash_enabled = (sconfig.pflash_mode != ServerConfig::PflashMode::OFF);
@@ -1072,13 +1088,13 @@ int main(int argc, char ** argv) {
 #ifdef GGML_USE_HIP
         cache_type_k.empty() ? "q4_0 (default, HIP)" : cache_type_k.c_str());
 #else
-        cache_type_k.empty() ? (sconfig.max_ctx > 6144 ? "tq3_0 (auto)" : "q4_0 (default)") : cache_type_k.c_str());
+        cache_type_k.empty() ? "family default" : cache_type_k.c_str());
 #endif
     std::fprintf(stderr, "[server] │  cache_type_v    = %s\n",
 #ifdef GGML_USE_HIP
         cache_type_v.empty() ? "q4_0 (default, HIP)" : cache_type_v.c_str());
 #else
-        cache_type_v.empty() ? (sconfig.max_ctx > 6144 ? "tq3_0 (auto)" : "q4_0 (default)") : cache_type_v.c_str());
+        cache_type_v.empty() ? "family default" : cache_type_v.c_str());
 #endif
     std::fprintf(stderr, "[server] │  pflash          = %s\n",
         sconfig.pflash_mode == ServerConfig::PflashMode::AUTO ? "auto" :
@@ -1111,22 +1127,11 @@ int main(int argc, char ** argv) {
     sconfig.ddtree_budget = bargs.ddtree_budget;
     sconfig.speculative_enabled = bargs.ddtree_mode;
     sconfig.target_sharding     = bargs.device.is_layer_split();
-    // KV type: report the operator's choice if set, else the auto-default
-    // the daemon picks. Matches the printed table above.
-    sconfig.kv_cache_k = cache_type_k.empty()
-#ifdef GGML_USE_HIP
-        ? "q4_0"
-#else
-        ? (sconfig.max_ctx > 6144 ? "tq3_0" : "q4_0")
-#endif
-        : cache_type_k;
-    sconfig.kv_cache_v = cache_type_v.empty()
-#ifdef GGML_USE_HIP
-        ? "q4_0"
-#else
-        ? (sconfig.max_ctx > 6144 ? "tq3_0" : "q4_0")
-#endif
-        : cache_type_v;
+    // KV type: report the operator's choice if set, else the family default
+    // the backend resolves (the tq3_0 auto policy was removed; laguna uses
+    // q8_0, base default q4_0). Matches the printed table above.
+    sconfig.kv_cache_k = cache_type_k.empty() ? "family default" : cache_type_k;
+    sconfig.kv_cache_v = cache_type_v.empty() ? "family default" : cache_type_v;
     sconfig.runtime_backend =
 #ifdef GGML_USE_HIP
         "hip";

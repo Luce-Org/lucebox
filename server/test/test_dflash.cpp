@@ -274,7 +274,7 @@ using dflash::common::free_qwen35_layer_split_shards;
 #include "common/restricted_lm_head_cuda.h"
 #include "common/topm_extract_cuda.h"
 #endif
-#include "common/draft_topk_cuda.h"
+#include "common/geometric_draft_topk_cuda.h"
 using dflash::common::is_eos_tok;
 
 // ─── Layer-split daemon — extracted to src/qwen35/layer_split_daemon.{h,cpp} ─
@@ -904,6 +904,15 @@ int main(int argc, char ** argv) {
         }
         else if (std::strncmp(argv[i], "--max-ctx=", 10) == 0) {
             g_max_ctx_override = std::atoi(argv[i] + 10);
+        }
+        // Sampler params for the positional (non-daemon) path, so benchmarks can
+        // exercise the sample_logits chain (and its GPU port). Same field order
+        // as the daemon ` samp=` tail: temp,top_p,top_k,rep_pen,seed[,freq,pres].
+        else if (std::strncmp(argv[i], "--samp=", 7) == 0) {
+            std::string fake = std::string(" samp=") + (argv[i] + 7);
+            if (parse_sampler_token(fake, g_sampler) && g_sampler.seed != 0) {
+                g_sampler_rng.seed(g_sampler.seed);
+            }
         }
         // KV cache type flags (mirror llama-cli -ctk / -ctv).
         // Set the env var before resolve_kv_types() reads it inside create_target_cache.
@@ -1819,7 +1828,8 @@ int main(int argc, char ** argv) {
 
                                 // Init pipelined state
                                 PipelinedDecodeState pipe_state;
-                                if (!init_pipelined_decode_state(pipe_state, backend, w, cache, *hybrid, ctx, g_kq_stride_pad)) {
+                                if (!init_pipelined_decode_state(pipe_state, backend, w, target_path,
+                                                                 cache, *hybrid, ctx, g_kq_stride_pad)) {
                                     std::fprintf(stderr, "[time-breakdown] pipelined state init failed\n");
                                     continue;
                                 }
@@ -1916,7 +1926,8 @@ int main(int argc, char ** argv) {
                                         int ctx = 2000;
                                         if (ctx + 1 <= max_ctx) {
                                             PipelinedDecodeState pipe_state;
-                                            if (init_pipelined_decode_state(pipe_state, backend, w, cache, *hybrid_realistic, ctx, g_kq_stride_pad)) {
+                                            if (init_pipelined_decode_state(pipe_state, backend, w, target_path,
+                                                                            cache, *hybrid_realistic, ctx, g_kq_stride_pad)) {
                                                 std::vector<float> act_cur_pipe((size_t)hidden, 0.0f);
                                                 ggml_backend_tensor_set(pipe_state.gpu_state.act_cur, act_cur_pipe.data(), 0,
                                                                         sizeof(float) * (size_t)hidden);
@@ -3340,7 +3351,7 @@ int main(int argc, char ** argv) {
             } else {
                 // DDTree K>1: need real log-probs for best-first tree scoring.
                 bool topk_done = false;
-#ifdef DFLASH27B_HAVE_DRAFT_TOPK_CUDA
+#ifdef DFLASH27B_HAVE_DRAFT_TOPK
                 // GPU path: top-K + logsumexp on the draft logits device buffer
                 // (positions 1..q_len-1), no full-vocab D2H. Escape: DFLASH_GPU_DRAFT_TOPK=0.
                 static const bool kGpuDraftTopk = [](){
@@ -3348,7 +3359,7 @@ int main(int argc, char ** argv) {
                     return v == nullptr || v[0] != '0';
                 }();
                 if (kGpuDraftTopk && !draft_hidden_bridge) {
-                    topk_done = dflash::common::extract_draft_topk_cuda(
+                    topk_done = dflash::common::geometric_extract_draft_topk_cuda(
                         (const float *)draft_sg.logits->data + (size_t)vocab,
                         L, vocab, ddtree_K,
                         ddtree_top_log_probs.data(),

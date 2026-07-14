@@ -95,6 +95,19 @@ static std::string context_overflow_message(int max_ctx, int prompt_tokens, int 
            " in the completion). Please reduce the length of the messages or completion.";
 }
 
+static bool prompt_ends_in_open_think(const std::string & prompt) {
+    static constexpr const char * kThinkOpen = "<think>";
+    static constexpr size_t kThinkOpenLen = 7;
+    size_t end = prompt.size();
+    while (end > 0) {
+        char c = prompt[end - 1];
+        if (c != ' ' && c != '\n' && c != '\r' && c != '\t') break;
+        --end;
+    }
+    return end >= kThinkOpenLen &&
+           prompt.compare(end - kThinkOpenLen, kThinkOpenLen, kThinkOpen) == 0;
+}
+
 // ─── piecewise keep-ratio curve ─────────────────────────────────────────
 
 static float pflash_keep_ratio(const ServerConfig & cfg, int n_tokens) {
@@ -1556,28 +1569,45 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         int  effort_phase1_cap       = -1;  // from reasoning.effort lookup
         bool effort_set              = false;
 
+        auto apply_reasoning_effort = [&](const std::string & effort) {
+            if (effort == "none") {
+                enable_thinking = false;
+                return;
+            }
+
+            // Five-tier vocabulary (spec §4.2). Unknown → high.
+            int tier_value = config_.effort_tiers.high;
+            if      (effort == "minimal") tier_value = config_.effort_tiers.low;
+            else if (effort == "low")     tier_value = config_.effort_tiers.low;
+            else if (effort == "medium")  tier_value = config_.effort_tiers.medium;
+            else if (effort == "high")    tier_value = config_.effort_tiers.high;
+            else if (effort == "x-high")  tier_value = config_.effort_tiers.x_high;
+            else if (effort == "max")     tier_value = config_.effort_tiers.max;
+            // else: unknown tier → fall back to high (no error).
+
+            effort_phase1_cap = tier_value;
+            effort_set = true;
+            enable_thinking = true;
+            // Spec §4.2: reasoning effort activates the budget envelope.
+            req.thinking_opt_in = true;
+        };
+
         // OpenAI Responses API: "reasoning" field. Spec §4.2.
         if (body.contains("reasoning")) {
             auto & r = body["reasoning"];
             if (r.contains("effort")) {
-                std::string effort = r.value("effort", "high");
-                // Five-tier vocabulary (spec §4.2). Unknown → high.
-                int tier_value = config_.effort_tiers.high;
-                if      (effort == "low")    tier_value = config_.effort_tiers.low;
-                else if (effort == "medium") tier_value = config_.effort_tiers.medium;
-                else if (effort == "high")   tier_value = config_.effort_tiers.high;
-                else if (effort == "x-high") tier_value = config_.effort_tiers.x_high;
-                else if (effort == "max")    tier_value = config_.effort_tiers.max;
-                // else: unknown tier → fall back to high (no error).
-
-                effort_phase1_cap = tier_value;
-                effort_set = true;
-                enable_thinking = true;
-                // Spec §4.2: reasoning.effort activates the budget envelope.
-                req.thinking_opt_in = true;
+                apply_reasoning_effort(r.value("effort", "high"));
             } else {
                 enable_thinking = true;
             }
+        }
+        // OpenAI Chat Completions compatibility: some clients send a
+        // top-level reasoning_effort instead of Responses-style
+        // reasoning.effort. Treat it as the same tier selector unless the
+        // structured field already provided one.
+        if (!effort_set && body.contains("reasoning_effort") &&
+            body["reasoning_effort"].is_string()) {
+            apply_reasoning_effort(body["reasoning_effort"].get<std::string>());
         }
         // Anthropic-style: "thinking" field. Presence-as-opt-in: any
         // request that sends this field has opted in to the thinking-budget
@@ -1700,6 +1730,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                                             true, enable_thinking,
                                             tools_json);
         }
+        req.started_in_thinking = prompt_ends_in_open_think(rendered);
         req.prompt_tokens = tokenizer_.encode(rendered);
 
         // count_tokens: short-circuit after tokenization. Skip generation
@@ -1734,7 +1765,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
 
     std::fprintf(stderr,
         "[server] chat %s format=%s stream=%s msgs=%zu tools=%zu prompt_tokens=%zu "
-        "max_tokens=%d max_ctx=%d thinking=%s stops=%zu model=%s\n",
+        "max_tokens=%d max_ctx=%d thinking=%s started_in_thinking=%s stops=%zu model=%s\n",
         req.response_id.c_str(),
         api_format_name(req.format),
         req.stream ? "true" : "false",
@@ -1744,6 +1775,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         req.max_output,
         config_.max_ctx,
         req.thinking_enabled ? "true" : "false",
+        req.started_in_thinking ? "true" : "false",
         req.stop_sequences.size(),
         req.model.c_str());
 
@@ -1850,7 +1882,8 @@ void HttpServer::worker_loop() {
         SseEmitter emitter(req.format, req.response_id, req.model,
                            (int)req.prompt_tokens.size(), req.tools,
                            &tool_memory_,
-                           req.stop_sequences);
+                           req.stop_sequences,
+                           req.started_in_thinking);
 
         // Emit initial SSE events (skip when proxying).
         if (req.stream && config_.pflash_upstream_base.empty()) {
@@ -2579,7 +2612,7 @@ void HttpServer::worker_loop() {
                 DaemonIO scoped_io;
                 scoped_io.stream_fd = -1;
                 auto scoped_result = backend_.generate(scoped_req, scoped_io);
-                if (scoped_result.ok && backend_.snapshot_used(DISK_STAGING_SLOT)) {
+                if (scoped_result.ok() && backend_.snapshot_used(DISK_STAGING_SLOT)) {
                     disk_cache_.learn_layout(DISK_STAGING_SLOT);
                     const bool saved =
                         disk_cache_.save(DISK_STAGING_SLOT, scoped_req.prompt);
@@ -2635,7 +2668,7 @@ void HttpServer::worker_loop() {
                 DaemonIO cold_io;
                 cold_io.stream_fd = -1;
                 auto cold_result = backend_.generate(cold_req, cold_io);
-                if (cold_result.ok && backend_.snapshot_used(DISK_STAGING_SLOT)) {
+                if (cold_result.ok() && backend_.snapshot_used(DISK_STAGING_SLOT)) {
                     disk_cache_.learn_layout(DISK_STAGING_SLOT);
                     std::vector<int32_t> prefix_tokens(effective_prompt.begin(),
                                                        effective_prompt.begin() + cold_boundary);
@@ -2907,7 +2940,7 @@ void HttpServer::worker_loop() {
         // Continued checkpoint: save if total tokens crossed an interval boundary.
         // This captures prompt + all generated tokens for long conversation reuse.
         if (!disk_cache_.disabled() && disk_policy.mode == DiskPrefixCacheMode::Full &&
-            result.ok && completion_tokens > 0 &&
+            result.ok() && completion_tokens > 0 &&
             visible_output_seen && !client_disconnected) {
             int final_pos = (int)effective_prompt.size() + (int)result.tokens.size();
             if (final_pos >= disk_cache_.continued_interval()) {
@@ -2955,7 +2988,7 @@ void HttpServer::worker_loop() {
         GenTimings gen_timings{ result.prefill_s, result.decode_s };
 
         // Record performance for /status page.
-        if (result.ok) {
+        if (result.ok()) {
             PerfRecord perf;
             perf.prompt_tokens = (int)req.prompt_tokens.size();
             perf.completion_tokens = completion_tokens;
@@ -3265,14 +3298,14 @@ void HttpServer::worker_loop() {
             result.decode_s > 0.0 ? out_tokens / result.decode_s : 0.0;
         const std::string finish = client_disconnected
             ? "client_disconnect"
-            : (result.ok ? emitter.finish_reason() : "error");
+            : (result.ok() ? emitter.finish_reason() : "error");
 
         std::fprintf(stderr,
             "[server] chat DONE %s ok=%s in=%zu effective_in=%zu out=%d "
             "%.1fs %.1f tok/s finish=%s restore=%s slot=%d prefix_len=%d "
-            "prefill=%.1fs decode=%.1fs(%.1ftok/s) error=%s\n",
+            "prefill=%.1fs decode=%.1fs(%.1ftok/s) error=%s detail=%s\n",
             req.response_id.c_str(),
-            result.ok ? "true" : "false",
+            result.ok() ? "true" : "false",
             req.prompt_tokens.size(),
             effective_prompt.size(),
             out_tokens,
@@ -3285,7 +3318,8 @@ void HttpServer::worker_loop() {
             result.prefill_s,
             result.decode_s,
             decode_tok_s,
-            result.error.empty() ? "-" : result.error.c_str());
+            result.ok() ? "-" : result.error_code().data(),
+            result.error_detail().empty() ? "-" : result.error_detail().data());
 
         // Signal client thread that we're done.
         finish_job();

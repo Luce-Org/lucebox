@@ -9,7 +9,7 @@ LOG_DIR="$RUN_DIR/$STAMP"
 
 TARGET="${TARGET:-$REPO_DIR/server/models/Qwen3.6-27B-Q4_K_M.gguf}"
 DRAFT="${DRAFT:-$REPO_DIR/server/models/draft/dflash-draft-3.6-q4_k_m.gguf}"
-LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-$REPO_DIR/server/deps/llama.cpp/build/bin/llama-server}"
+LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-}"
 
 HOST="${HOST:-127.0.0.1}"
 LUCEBOX_PORT="${LUCEBOX_PORT:-18080}"
@@ -18,9 +18,12 @@ MAX_CTX="${MAX_CTX:-32768}"
 MAX_TOKENS="${MAX_TOKENS:-256}"
 BUDGET="${BUDGET:-22}"
 VERIFY_MODE="${VERIFY_MODE:-ddtree}"
-FA_WINDOW="${FA_WINDOW:-2048}"
-CACHE_TYPE_K="${CACHE_TYPE_K:-tq3_0}"
-CACHE_TYPE_V="${CACHE_TYPE_V:-tq3_0}"
+# 0 = full attention; finite windows break tool calls and are opt-in only.
+FA_WINDOW="${FA_WINDOW:-0}"
+# Empty = the server picks the model family's KV default (tq3_0/q4_0 garble
+# laguna); set explicitly to experiment.
+CACHE_TYPE_K="${CACHE_TYPE_K:-}"
+CACHE_TYPE_V="${CACHE_TYPE_V:-}"
 EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:---lazy-draft}"
 LLAMA_N_GPU_LAYERS="${LLAMA_N_GPU_LAYERS:-999}"
 MODEL_ID="${MODEL_ID:-luce-dflash}"
@@ -69,7 +72,7 @@ resolve_llama_server() {
     command -v llama-server
     return 0
   fi
-  echo "llama-server not found. Set LLAMA_SERVER_BIN=/path/to/llama-server." >&2
+  echo "llama-server not found. Set LLAMA_SERVER_BIN=/path/to/llama-server or install it on PATH." >&2
   return 1
 }
 
@@ -124,8 +127,8 @@ local_fa_args=()
 if [[ -n "$FA_WINDOW" ]] && [[ "$FA_WINDOW" != "0" ]]; then
   local_fa_args=(--fa-window "$FA_WINDOW")
 fi
-export DFLASH27B_KV_K="$CACHE_TYPE_K"
-export DFLASH27B_KV_V="$CACHE_TYPE_V"
+if [[ -n "$CACHE_TYPE_K" ]]; then export DFLASH27B_KV_K="$CACHE_TYPE_K"; fi
+if [[ -n "$CACHE_TYPE_V" ]]; then export DFLASH27B_KV_V="$CACHE_TYPE_V"; fi
 "$DFLASH_SERVER_BIN" "$TARGET" \
   --draft "$DRAFT" \
   --host "$HOST" \

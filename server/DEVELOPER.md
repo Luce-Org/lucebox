@@ -61,7 +61,7 @@ daemon that the Python server drives via stdin/stdout.
 ```bash
 cd dflash
 
-# Initialize submodules (llama.cpp/ggml, Block-Sparse-Attention)
+# Initialize the remaining submodule (Block-Sparse-Attention)
 git submodule update --init --recursive
 
 # Configure
@@ -196,7 +196,7 @@ server/
 ├── src/                        # C++ sources (target/draft graph, KV cache, FlashPrefill)
 ├── test/                       # C++ test sources (test_dflash.cpp, smoke_*, test_*)
 ├── deps/
-│   ├── llama.cpp/              # Vendored ggml (submodule)
+│   ├── llama.cpp/              # Vendored ggml snapshot + extracted helpers
 │   └── Block-Sparse-Attention/ # BSA kernels (submodule)
 ├── models/                     # Model files (not in git)
 │   ├── Qwen3.6-27B-Q4_K_M.gguf

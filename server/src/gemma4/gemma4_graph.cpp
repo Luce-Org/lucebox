@@ -1,6 +1,6 @@
 // Gemma4 forward graph builder + step function.
 //
-// Architecture (from deps/llama.cpp/src/models/gemma4-iswa.cpp):
+// Architecture mirrored from the upstream llama.cpp Gemma4 implementation:
 //   - Scale input embeddings by sqrt(n_embd)
 //   - For each layer:
 //     a. Pre-attn RMSNorm
@@ -15,6 +15,7 @@
 //   - Final RMSNorm + lm_head
 //   - Logit softcapping: tanh(logits/cap)*cap
 
+#include "../common/mmid_adaptive_k.h"
 #include "gemma4_internal.h"
 #include "common/ggml_graph_precision.h"
 #include "common/gpu_runtime_compat.h"
@@ -105,6 +106,7 @@ static ggml_tensor * build_gemma4_moe_block(ggml_context * ctx, ggml_tensor * at
     ggml_tensor * probs_3d = ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens);
     ggml_tensor * weights  = ggml_get_rows(ctx, probs_3d, selected);
     weights = ggml_reshape_2d(ctx, weights, n_used, n_tokens);
+    mmid_adaptive_k_attach(selected, weights, n_tokens, -1, nullptr);  // [TAG_MMID_ADAPTIVE_K]
 
     // Routed expert forward via mul_mat_id with fused gate+up
     ggml_tensor * cur_3d = ggml_reshape_3d(ctx, cur_moe, n_embd, 1, n_tokens);

@@ -68,6 +68,14 @@ struct LagunaTargetLayer {
     ggml_tensor * ffn_gate_shexp   = nullptr;  // [n_embd, n_ff_shexp]    shared expert gate
     ggml_tensor * ffn_up_shexp     = nullptr;  // [n_embd, n_ff_shexp]    shared expert up
     ggml_tensor * ffn_down_shexp   = nullptr;  // [n_ff_shexp, n_embd]    shared expert down
+
+    // Fused views over ADJACENT weight pairs (the loader lays q|k and
+    // gate_shexp|up_shexp out back-to-back and binds one tensor over both
+    // regions; zero extra VRAM). Null when the pair could not be fused
+    // (type mismatch / DFLASH_LAGUNA_FUSED_QK=0). Same data as wq/wk etc.
+    ggml_tensor * wqk       = nullptr;  // [n_embd, (n_head+n_head_kv)*head_dim]
+    ggml_tensor * shexp_gu  = nullptr;  // [n_embd, 2*n_ff_shexp]  gate rows then up rows
+    ggml_tensor * qk_norm_f = nullptr;  // [head_dim, n_head+n_head_kv] f32, q_norm|k_norm per head
 };
 
 struct LagunaTargetWeights {
@@ -83,6 +91,11 @@ struct LagunaTargetWeights {
     std::vector<LagunaTargetLayer> layers;   // size = n_layer
     ggml_tensor * out_norm = nullptr;        // [n_embd]
     ggml_tensor * output   = nullptr;        // [n_embd, n_vocab]  (lm_head)
+
+    // Metadata contexts/buffer for the fused-weight views (see LagunaTargetLayer).
+    ggml_context *        fuse_ctx      = nullptr;
+    ggml_context *        fuse_norm_ctx = nullptr;
+    ggml_backend_buffer_t fuse_norm_buf = nullptr;
 
     // Architecture metadata (validated at load time).
     int  n_layer              = 40;
@@ -163,28 +176,59 @@ struct LagunaTargetCache {
     ggml_type kv_v_type = GGML_TYPE_Q8_0;
 
     // Per-layer KV cache. ALL 40 layers have KV (both full + swa).
-    // Layout: [head_dim, max_ctx, n_head_kv] f16/q8_0, contiguous per layer.
+    // Default layout: [head_dim, max_ctx, n_head_kv].
+    // With DFLASH_LAGUNA_KV_HEAD_MAJOR=1: [head_dim*n_head_kv, max_ctx],
+    // viewed as [head_dim, n_head_kv, max_ctx] for attention.
+    bool kv_head_major = false;
     std::vector<ggml_tensor *> attn_k;   // size = n_layer
     std::vector<ggml_tensor *> attn_v;
+
+    // [TAG_SWA_RING] When > 0 (pooled/kvflash mode), SWA layers' K/V tensors
+    // are position-indexed rings of this many rows (slot = pos % rows)
+    // instead of pool-sized tensors: a window-W layer never needs positions
+    // older than W back, so it bypasses the pager entirely. Full-attention
+    // layers keep pool-sized tensors + pager slot mapping. Cuts the SWA
+    // layers' attention span from pool width to ring width (prefill + verify).
+    int swa_ring_rows = 0;
+
+    // DFlash feature capture ring buffer (BF16, allocated when draft is active).
+    ggml_tensor *         target_feat = nullptr;  // [n_capture_layers*n_embd, target_feat_cap]
+    int                   target_feat_cap = 0;
+    int                   n_capture_layers = 0;
+    std::vector<int>      capture_layer_ids;
+    ggml_context *        feat_ctx = nullptr;
+    ggml_backend_buffer_t feat_buf = nullptr;
 };
 
 // `ctx_alloc` (kvflash): when > 0 and < max_ctx, the per-layer K/V tensors
 // are allocated at ctx_alloc rows (the resident pool) while cache.max_ctx
 // keeps the logical bound. 0 = allocate at max_ctx (default).
+// `swa_ring_rows` ([TAG_SWA_RING]): when > 0 (requires ctx_alloc > 0 and a
+// full layer range), SWA layers allocate ring-sized K/V instead of the pool.
 bool create_laguna_target_cache(const LagunaTargetWeights & w,
                                  int max_ctx,
                                  ggml_backend_t backend,
                                  LagunaTargetCache & out,
-                                 int ctx_alloc = 0);
+                                 int ctx_alloc = 0,
+                                 int swa_ring_rows = 0);
 bool create_laguna_target_cache_partial(const LagunaTargetWeights & w,
                                          int max_ctx,
                                          ggml_backend_t backend,
                                          int layer_begin,
                                          int layer_end,
                                          LagunaTargetCache & out,
-                                         int ctx_alloc = 0);
+                                         int ctx_alloc = 0,
+                                         int swa_ring_rows = 0);
 void free_laguna_target_cache(LagunaTargetCache & c);
 void reset_laguna_target_cache(LagunaTargetCache & c);
+
+void free_laguna_target_feat(LagunaTargetCache & c);
+bool create_laguna_target_feat(ggml_backend_t backend,
+                                LagunaTargetCache & cache,
+                                int n_capture_layers,
+                                int hidden_size,
+                                int cap,
+                                const std::vector<int> & explicit_ids = {});
 
 // ----------------------------------------------------------------------------
 // Cache snapshots for prefix-cache slots (PrefixCache).
@@ -201,6 +245,8 @@ struct LagunaCacheSnapshot {
     ggml_backend_buffer_t buf     = nullptr;
     std::vector<ggml_tensor *> attn_k;  // size = n_layer
     std::vector<ggml_tensor *> attn_v;  // size = n_layer
+    ggml_tensor *         feat_snap = nullptr;
+    int                   feat_cap  = 0;
     int                   cur_pos = 0;
     // Last committed token id (the token at cur_pos-1). Recorded at save so the
     // exact-hit restore can re-embed the real last token even when the caller
@@ -256,8 +302,15 @@ struct LagunaGraphInputs {
     // CUDA-graph cache replays instead of re-launching every kernel.
     int           kv_pad = 0;             // 0 = legacy exact-length views + cpy append
     ggml_tensor * kv_idx = nullptr;       // [n_tokens] I32 cache row indices (graph input)
+    // [TAG_SWA_RING] SWA ring rows (pos % cache.swa_ring_rows). When non-null,
+    // SWA layers write K/V through these indices and flash-attend over the
+    // ring span; attn_mask_swa must then be [swa_ring_rows, n_tokens].
+    ggml_tensor * kv_idx_swa = nullptr;   // [n_tokens] I32
     bool          output_logits = true;
+    bool          logits_are_output = true;
     bool          output_hidden_states = false;
+    bool          capture_features = false;
+    ggml_tensor * target_feat_rows = nullptr;  // optional [n_tokens] I32 ring rows for replay-stable capture
     // If true, lm_head only runs on the LAST token (saves ~6 GB of logit memory
     // at n_tokens=16K, vocab=100352). Standard TTFT optimization.
     bool          output_last_only = false;
@@ -305,7 +358,32 @@ bool laguna_step(
     int                         kv_start,
     bool                        no_mask,
     std::vector<float> &        out_logits,
-    const class KvFlashPager *  kvflash = nullptr);
+    const class KvFlashPager *  kvflash = nullptr,
+    bool                        capture = false,
+    int32_t *                   out_argmax = nullptr,
+    bool                        read_logits = true);
+
+bool laguna_verify_batch(
+    ggml_backend_t              backend,
+    const LagunaTargetWeights & w,
+    LagunaTargetCache &         cache,
+    const float *               embed,
+    const int32_t *             token_ids,
+    int                         n_tokens,
+    int                         kv_start,
+    std::vector<int32_t> &      out_argmax,
+    const class KvFlashPager *  kvflash = nullptr,
+    std::vector<float> *        out_logits = nullptr);
+
+bool laguna_project_hidden(
+    ggml_backend_t              backend,
+    const LagunaTargetWeights & w,
+    const float *               hidden,
+    int                         n_tokens,
+    std::vector<int32_t> &      out_tokens,
+    int                         cand_k     = 0,     // [TAG_ADAPTIVE_WIDTH]
+    std::vector<float> *        cand_probs = nullptr,
+    std::vector<int32_t> *      cand_ids   = nullptr);
 
 // Forward decl (full definition in common/moe_hybrid_storage.h).
 struct MoeHybridStorage;

@@ -6,6 +6,7 @@
 #include "common/kvflash_pager.h"
 #include "common/kvflash_scorer.h"
 #include "common/layer_split_backend.h"
+#include "common/layer_split_kvflash.h"
 #include "dflash_feature_ring.h"
 #include "layer_split_types.h"
 #include "placement/placement_config.h"
@@ -88,6 +89,10 @@ public:
     bool supports_dflash_spec_decode() const override { return true; }
     DFlashTarget * dflash_target() override;
     bool supports_remote_draft() const override { return true; }
+    bool supports_kvflash() const override { return kvflash_active(); }
+    bool supports_mixed_backend_layer_split() const override {
+        return use_mixed_target_split();
+    }
 
     void shutdown() override;
 

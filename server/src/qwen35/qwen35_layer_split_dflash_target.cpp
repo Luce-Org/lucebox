@@ -46,7 +46,8 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
         return run_qwen35_mixed_layer_split_forward(
             shards_, *remote_target_shard_, shards_.front().weights, tokens,
             base_pos, (int)tokens.size(), last_tok, kq_stride_pad_, fa_window_,
-            all_argmax, /*logits_out=*/nullptr, feature_ring_, remote_draft_);
+            all_argmax, /*logits_out=*/nullptr, feature_ring_, remote_draft_,
+            kvflash_);
     }
     return run_qwen35_layer_split_forward(
         shards_, shards_.front().weights, tokens, base_pos, (int)tokens.size(),

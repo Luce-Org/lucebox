@@ -54,6 +54,15 @@ jobs:
           sub-packages: '["nvcc", "cudart-dev", "thrust", "driver-dev"]'
           non-cuda-sub-packages: '["libcublas-dev"]'
 
+      - name: Provide CUDA driver stub for hosted tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/cuda-stubs"
+          ln -sf "$CUDA_PATH/targets/x86_64-linux/lib/stubs/libcuda.so" \
+            "$RUNNER_TEMP/cuda-stubs/libcuda.so.1"
+          {
+            echo "LD_LIBRARY_PATH=$RUNNER_TEMP/cuda-stubs:/usr/local/cuda-12.8/targets/x86_64-linux/lib/stubs:/usr/local/cuda-12.8/lib64"
+          } >> "$GITHUB_ENV"
+
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           version: "0.11.x"
@@ -70,12 +79,12 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target \
             test_dflash test_generate test_flash_attn_sparse test_server_unit \
-            -j$(nproc)
+            test_deepseek4_unit -j$(nproc)
 
       - name: Run C++ server unit tests
         run: |
           cd server/build
-          ctest --output-on-failure -R server_unit --no-tests=error
+          ctest --output-on-failure -R "server_unit|deepseek4_unit" --no-tests=error
 
       - name: Populate venv with cu128 torch + setuptools
         # First pass: install the workspace's default deps. dflash declares

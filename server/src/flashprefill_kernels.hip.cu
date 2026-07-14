@@ -23,6 +23,20 @@
 #include <hip/hip_bfloat16.h>
 #include <rocwmma/rocwmma.hpp>
 
+// These kernels are WAVE32-ONLY BY DESIGN, not merely wave32-tuned. Kernel 4's
+// accumulator handling assumes the RDNA3 v_wmma_f32_16x16x16 fragment layout
+// (lane t, elem i -> row = t%16, col = (t/16)*8 + i; see the header note above),
+// which is a 32-lane instruction. A wave64 target would need a different WMMA
+// instruction and fragment layout, not a warp-width tweak, so we fail the build
+// loudly rather than emit silently-wrong results. All currently declared AMD
+// targets (gfx1100 / gfx1151, RDNA3) are wave32. __AMDGCN_WAVEFRONT_SIZE(__) is
+// defined only in the device compile pass.
+#if defined(__AMDGCN_WAVEFRONT_SIZE__) && (__AMDGCN_WAVEFRONT_SIZE__ != 32)
+#  error "flashprefill_kernels.hip.cu requires a 32-lane wavefront (RDNA v_wmma_f32_16x16x16 fragment layout). Build for a wave32 target (gfx10/gfx11) or provide a wave64 WMMA rewrite."
+#elif !defined(__AMDGCN_WAVEFRONT_SIZE__) && defined(__AMDGCN_WAVEFRONT_SIZE) && (__AMDGCN_WAVEFRONT_SIZE != 32)
+#  error "flashprefill_kernels.hip.cu requires a 32-lane wavefront (RDNA v_wmma_f32_16x16x16 fragment layout). Build for a wave32 target (gfx10/gfx11) or provide a wave64 WMMA rewrite."
+#endif
+
 namespace dflash::common {
 namespace flashprefill {
 
@@ -259,15 +273,20 @@ __global__ void compute_block_score_gemm_kernel(
         mma_sync(c_frag, a_frag, b_frag, c_frag);
     }
 
+    __shared__ float c_stage[16 * 16];
+    store_matrix_sync(c_stage, c_frag, 16, mem_row_major);
+    __syncthreads();
+
     // Write: AMD Wave32 layout  lane t, elem i → row = t%16, col = (t/16)*8 + i
     const int lane   = threadIdx.x;
     const int r_base = m_tile * 16 + (lane % 16);
     const int c_base = n_tile * 16 + (lane / 16) * 8;
+    const float * c_row = c_stage + (size_t)(lane % 16) * 16 + (lane / 16) * 8;
     float* Sp = score + (size_t)b * s_S_b + (size_t)qh * s_S_h;
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
         if (r_base < M && c_base + i < M)
-            Sp[(size_t)r_base * s_S_m + (size_t)(c_base + i) * s_S_n] = c_frag[i] * sm_scale;
+            Sp[(size_t)r_base * s_S_m + (size_t)(c_base + i) * s_S_n] = c_row[i] * sm_scale;
     }
 }
 
@@ -438,20 +457,28 @@ __global__ void sparse_flash_forward_kernel_bf16(
                 }
             }
 
-            // ── Causal mask + rowmax (AMD RDNA3 layout) ──
-            // lane t: row = t%16, col = (t/16)*8 + elem_i
+            // ── Causal mask + rowmax ──
+            // Store accumulator fragments through rocWMMA's public API before
+            // scalar reads; direct fragment element layout is implementation-specific.
             const int row_g = q_tile_idx * Q_TILE + wid * MMA_M + row_in_warp;
+            float * s_stage = reinterpret_cast<float *>(KV_sh);
             float lm = -INFINITY;
             #pragma unroll
             for (int nt = 0; nt < NNK; ++nt) {
+                store_matrix_sync(s_stage + (size_t)(wid * MMA_M) * MMA_N,
+                                  S_frag[nt], MMA_N, mem_row_major);
+                __syncthreads();
+                const float * s_row = s_stage + (size_t)(wid * MMA_M + row_in_warp) * MMA_N
+                                    + col_half * 8;
                 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
                     const int col_g = k_lo + nt * MMA_N + col_half * 8 + i;
                     bool valid = (col_g < seq_len);
                     if (is_diag) valid = valid && (col_g <= row_g);
-                    if (!valid) S_frag[nt][i] = -INFINITY;
-                    lm = fmaxf(lm, S_frag[nt][i]);
+                    const float v = valid ? s_row[i] : -INFINITY;
+                    lm = fmaxf(lm, v);
                 }
+                __syncthreads();
             }
             // Merge rowmax: lane t and t+16 own the same row; shfl_xor(16) swaps them.
             lm = fmaxf(lm, __shfl_xor(lm, 16));
@@ -467,14 +494,23 @@ __global__ void sparse_flash_forward_kernel_bf16(
             float rs = 0.0f;
             #pragma unroll
             for (int nt = 0; nt < NNK; ++nt) {
+                store_matrix_sync(s_stage + (size_t)(wid * MMA_M) * MMA_N,
+                                  S_frag[nt], MMA_N, mem_row_major);
+                __syncthreads();
+                const float * s_row = s_stage + (size_t)(wid * MMA_M + row_in_warp) * MMA_N
+                                    + col_half * 8;
                 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
-                    const float v = S_frag[nt][i];
+                    const int col_g = k_lo + nt * MMA_N + col_half * 8 + i;
+                    bool valid = (col_g < seq_len);
+                    if (is_diag) valid = valid && (col_g <= row_g);
+                    const float v = valid ? s_row[i] : -INFINITY;
                     const float p = (v == -INFINITY) ? 0.0f : exp2f(v - m_new);
                     rs += p;
                     const int col_k = nt * MMA_N + col_half * 8 + i;
                     P_sh[(size_t)(wid * MMA_M + row_in_warp) * K_TILE + col_k] = hip_bfloat16(p);
                 }
+                __syncthreads();
             }
             // Merge rowsum across the two lane-halves sharing a row
             rs += __shfl_xor(rs, 16);
@@ -485,12 +521,16 @@ __global__ void sparse_flash_forward_kernel_bf16(
                 row_l[row_warp] = alpha * l_old + rs;
             }
 
-            // Rescale O accumulator (all 8 elements per lane belong to the same row)
+            // Rescale O accumulator in registers. rocWMMA accumulator element
+            // access is valid for mutation on ROCm 7.2.4 gfx1151 and avoids a
+            // store/sync/load round trip per output D tile.
             #pragma unroll
-            for (int d = 0; d < NDK; ++d)
+            for (int d = 0; d < NDK; ++d) {
                 #pragma unroll
-                for (int i = 0; i < 8; ++i)
+                for (int i = 0; i < 8; ++i) {
                     O_frag[d][i] *= alpha;
+                }
+            }
 
             __syncthreads();  // P_sh writes visible before V load overwrites KV_sh
 

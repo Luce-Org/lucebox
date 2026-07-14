@@ -75,14 +75,13 @@ COPY server/deps /src/server/deps
 # server then dies on the missing source file.
 COPY server/share /src/server/share
 
-# Submodules (`server/deps/llama.cpp`, `server/deps/Block-Sparse-Attention`)
-# must be populated on the host before `docker build` — `.git/` is excluded
-# by .dockerignore so we cannot re-fetch them inside the image. ggml's own
-# CMakeLists also asserts this and errors with the right command if missing,
-# but failing here gives a clearer message before nvcc spins up.
+# Vendored ggml sources and the Block-Sparse-Attention submodule must already
+# be present in the build context before `docker build` — `.git/` is excluded
+# by .dockerignore so we cannot re-fetch submodules inside the image. ggml's
+# own CMakeLists also asserts this, but failing here gives a clearer message
+# before nvcc spins up.
 RUN test -f /src/server/deps/llama.cpp/ggml/CMakeLists.txt \
-    || (echo "ERROR: server/deps/llama.cpp submodule not initialised. Run on host:" >&2 \
-        && echo "       git submodule update --init --recursive" >&2 \
+    || (echo "ERROR: missing vendored ggml sources at server/deps/llama.cpp/ggml in the docker build context." >&2 \
         && exit 1)
 
 # Configure + build. `DFLASH27B_USER_CUDA_ARCHITECTURES` pins the arch list

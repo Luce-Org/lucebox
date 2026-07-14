@@ -158,6 +158,37 @@ static void t4_tq3_shorthand() {
     std::puts("T4 PASS");
 }
 
+// ─── T5: hybrid KV reservation uses n_full + cache-type (not n_layer × f16) ──
+// The bug at qwen35moe_backend.cpp:2595 reserved n_layer(40) × hardcoded f16,
+// over-reserving ~7× and forcing experts cold. The shared helper must count
+// only full-attention layers (n_full) and honor the resolved cache type.
+static void t5_kv_reservation() {
+    // Qwen3.6-35B-A3B geometry: 40 layers, full_attention_interval=4 → n_full=10.
+    const int n_layer = 40, interval = 4, n_head_kv = 10, dk = 128, dv = 128;
+    const uint64_t got = dflash::kv_reservation_bytes_per_token(
+        n_layer, interval, n_head_kv, GGML_TYPE_Q4_0, dk, GGML_TYPE_Q4_0, dv);
+    const uint64_t expect = (uint64_t)(n_layer / interval) * (uint64_t)n_head_kv *
+        (uint64_t)(ggml_row_size(GGML_TYPE_Q4_0, dk) + ggml_row_size(GGML_TYPE_Q4_0, dv));
+    assert(got == expect);
+
+    // Regression guard vs the old bug (n_layer × hardcoded f16 = 2 B/elem):
+    const uint64_t buggy = (uint64_t)n_layer * 2 * (uint64_t)n_head_kv * (uint64_t)dk * 2;
+    assert(got < buggy / 3);  // ÷4 (layers) × (q4_0 < f16) → well over 3× smaller
+
+    // cache-type is honored: q4_0 reservation is strictly smaller than f16.
+    const uint64_t f16 = dflash::kv_reservation_bytes_per_token(
+        n_layer, interval, n_head_kv, GGML_TYPE_F16, dk, GGML_TYPE_F16, dv);
+    assert(got < f16);
+
+    // full_attention_interval=0 guard: no div-by-zero, falls back to n_layer.
+    const uint64_t fallback = dflash::kv_reservation_bytes_per_token(
+        n_layer, 0, n_head_kv, GGML_TYPE_Q4_0, dk, GGML_TYPE_Q4_0, dv);
+    assert(fallback == (uint64_t)n_layer * (uint64_t)n_head_kv *
+        (uint64_t)(ggml_row_size(GGML_TYPE_Q4_0, dk) + ggml_row_size(GGML_TYPE_Q4_0, dv)));
+
+    std::puts("T5 PASS");
+}
+
 // ─── main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -167,6 +198,7 @@ int main() {
     t2_resolve_kv_types();
     t3_is_supported_kv_pair();
     t4_tq3_shorthand();
+    t5_kv_reservation();
 
     std::puts("ALL TESTS PASS");
     return 0;

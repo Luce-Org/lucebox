@@ -29,8 +29,8 @@ Required:
 - CUDA Toolkit 12.0+ (sm_80+ for BSA path; sm_86 RTX 3090 is the
   reference target).
 - `git submodule update --init --recursive` to pull
-  `deps/llama.cpp` (ggml only) and `deps/Block-Sparse-Attention` (with
-  cutlass).
+  `deps/Block-Sparse-Attention` (with cutlass). `deps/llama.cpp` is vendored
+  directly and keeps only the `ggml` subtree.
 
 CMake options:
 - `DFLASH27B_ENABLE_BSA=ON` (default) — build the Block-Sparse-Attention
@@ -105,7 +105,7 @@ test/
   test_flashprefill_kernels.cpp parity tests for the 4 FP kernels
   smoke_qwen3_forward.cpp  drafter forward smoke at S=8K-128K
 deps/
-  llama.cpp/                    submodule (ggml only; libllama not built)
+  llama.cpp/                    vendored ggml snapshot + extracted helpers (libllama not built)
   Block-Sparse-Attention/       submodule (BSA + cutlass)
   bsa_stubs/                    PyTorch ATen/c10 header shims (see its README)
 ```

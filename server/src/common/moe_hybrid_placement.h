@@ -4,13 +4,30 @@
 
 #include "moe_hybrid_types.h"
 
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 
 namespace dflash::common {
 
 struct MoeHybridRoutingStats;  // forward decl
+
+inline uint64_t moe_hybrid_core_bytes_from_memory(const char * log_prefix,
+                                                  size_t gpu_free,
+                                                  size_t gpu_total) {
+    if (gpu_total >= gpu_free) {
+        return (uint64_t) gpu_total - (uint64_t) gpu_free;
+    }
+
+    std::printf("[%s] dynamic placement: free memory exceeds reported GPU total "
+                "(free=%.2f GiB, total=%.2f GiB), using core=0 for UMA budget accounting\n",
+                log_prefix ? log_prefix : "moe-hybrid",
+                gpu_free / 1024.0 / 1024.0 / 1024.0,
+                gpu_total / 1024.0 / 1024.0 / 1024.0);
+    return 0;
+}
 
 struct MoeHybridPlacement {
     int n_layer       = 0;

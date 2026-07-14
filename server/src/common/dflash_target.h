@@ -16,6 +16,9 @@
 
 #include "ddtree.h"
 
+struct ggml_tensor;
+struct ggml_backend;
+
 namespace dflash::common {
 
 struct DFlashTarget {
@@ -110,6 +113,12 @@ struct DFlashTarget {
 
     // Embed token IDs using the target's embedding table.
     // Output: `out` must have space for `n * hidden_size()` floats.
+    // Optional GPU handles for the fused domino draft head. A target that
+    // returns non-null for all three enables the single-graph draft-side path.
+    virtual ggml_tensor *  lm_head_tensor()  { return nullptr; }
+    virtual ggml_tensor *  gpu_embd_table()  { return nullptr; }
+    virtual ggml_backend * fused_head_backend() { return nullptr; }
+
     virtual bool embed_tokens(const int32_t * tokens, int n,
                               float * out) const = 0;
 
@@ -121,6 +130,34 @@ struct DFlashTarget {
     virtual bool project_hidden_to_tokens(const float * hidden,
                                           int n_tokens,
                                           std::vector<int32_t> & tokens_out) = 0;
+
+    // Project draft hidden states through the target lm_head and return full
+    // f32 logits with vocab as the fastest-changing dimension.
+    // Default false (unsupported); Domino-capable targets override.
+
+    // [TAG_ADAPTIVE_WIDTH] like project_hidden_to_tokens, optionally also
+    // returning top-cand_k candidate ids + softmax probs covering slots
+    // 1..n_tokens-1 (entry j-1 <-> slot j). The default implementation
+    // SUCCEEDS by delegating to project_hidden_to_tokens and returning no
+    // candidates (the "default false" above refers to logits support only).
+    virtual bool project_hidden_to_tokens_topk(const float * hidden,
+                                               int n_tokens,
+                                               std::vector<int32_t> & tokens_out,
+                                               int cand_k,
+                                               std::vector<float> * cand_probs,
+                                               std::vector<int32_t> * cand_ids) {
+        (void)cand_k;
+        if (cand_probs) cand_probs->clear();
+        if (cand_ids) cand_ids->clear();
+        return project_hidden_to_tokens(hidden, n_tokens, tokens_out);
+    }
+
+    virtual bool project_hidden_to_logits(const float * hidden,
+                                          int n_tokens,
+                                          std::vector<float> & logits_out) {
+        (void)hidden; (void)n_tokens; (void)logits_out;
+        return false;
+    }
 
     // Project draft hidden states through the target lm_head and return the
     // per-position top-K log-probabilities + token ids (for DDTree building).

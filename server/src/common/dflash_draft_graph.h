@@ -31,6 +31,7 @@ bool build_draft_step(
     int ctx_len,
     const DraftFeatureMirror * mirror = nullptr,
     int committed = 0,
-    int ctx_len_max = 0);
+    int ctx_len_max = 0,
+    bool pad_ctx = false);
 
 }  // namespace dflash::common

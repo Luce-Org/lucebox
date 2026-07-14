@@ -157,6 +157,19 @@ bool is_supported_kv_pair(ggml_type k, ggml_type v) {
 
 // ─── Environment-variable resolution ────────────────────────────────────────
 
+void validate_kv_pair_or_abort(ggml_type k, ggml_type v, const char * who) {
+    if (is_supported_kv_pair(k, v)) return;
+    std::fprintf(stderr,
+        "%s KV pair (K=%s, V=%s) not supported by fattn-cuda. Supported pairs:\n",
+        who, kv_type_name(k), kv_type_name(v));
+    for (int i = 0; i < N_SUPPORTED_PAIRS; ++i) {
+        std::fprintf(stderr, "  K=%-6s  V=%s\n",
+            kv_type_name(SUPPORTED_PAIRS[i].k),
+            kv_type_name(SUPPORTED_PAIRS[i].v));
+    }
+    std::abort();
+}
+
 void resolve_kv_types(ggml_type & k_out, ggml_type & v_out) {
     ggml_type k = GGML_TYPE_Q4_0;
     ggml_type v = GGML_TYPE_Q4_0;
@@ -191,17 +204,7 @@ void resolve_kv_types(ggml_type & k_out, ggml_type & v_out) {
     }
 
     // Validate the resolved (K, V) pair
-    if (!is_supported_kv_pair(k, v)) {
-        std::fprintf(stderr,
-            "[dflash] KV pair (K=%s, V=%s) not supported by fattn-cuda. Supported pairs:\n",
-            kv_type_name(k), kv_type_name(v));
-        for (int i = 0; i < N_SUPPORTED_PAIRS; ++i) {
-            std::fprintf(stderr, "  K=%-6s  V=%s\n",
-                kv_type_name(SUPPORTED_PAIRS[i].k),
-                kv_type_name(SUPPORTED_PAIRS[i].v));
-        }
-        std::abort();
-    }
+    validate_kv_pair_or_abort(k, v, "[dflash]");
 
     k_out = k;
     v_out = v;

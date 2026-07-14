@@ -8,6 +8,7 @@
 #include "common/io_utils.h"
 #include "common/layer_split_utils.h"
 #include "common/model_backend.h"
+#include "common/kvflash_pager.h"
 #include "common/snapshot_backend.h"
 #include "graph_builders.h"
 #include "internal.h"
@@ -177,12 +178,13 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                                        int payload_fd,
                                        int shared_payload_fd,
                                        size_t shared_payload_bytes,
-                                       bool enable_dflash) {
+                                       bool enable_dflash,
+                                       int kvflash_pool_tokens) {
 #if defined(_WIN32)
     (void)target_path; (void)gpus; (void)layer_begins; (void)layer_ends;
     (void)max_ctx; (void)max_verify_tokens; (void)kq_stride_pad; (void)fa_window;
     (void)stream_fd; (void)payload_fd; (void)shared_payload_fd;
-    (void)shared_payload_bytes; (void)enable_dflash;
+    (void)shared_payload_bytes; (void)enable_dflash; (void)kvflash_pool_tokens;
     std::fprintf(stderr, "Qwen35 target shard IPC daemon is only implemented on POSIX hosts\n");
     return 2;
 #else
@@ -264,7 +266,8 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                                          shard.backend, shard.cache,
                                          /*prefill_only=*/!enable_dflash,
                                          shard.layer_begin, shard.layer_end,
-                                         /*allocate_target_feat=*/false)) {
+                                         /*allocate_target_feat=*/false,
+                                         kvflash_pool_tokens)) {
             std::fprintf(stderr,
                          "[qwen35-target-shard-daemon] load/cache failed gpu=%d: %s\n",
                          shard.gpu, dflash27b_last_error());
@@ -334,6 +337,60 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
         return 1;
     }
 
+    KvFlashPager kvflash_pager;
+    if (kvflash_pool_tokens > 0) {
+        if (fa_window > 0) {
+            std::fprintf(stderr,
+                "[qwen35-target-shard-daemon][kvflash] fa_window must be 0\n");
+            stream_status(stream_fd, -1);
+            free_snapshot_backends();
+            free_qwen35_layer_split_shards(shards);
+            if (shared_payload && shared_payload != MAP_FAILED) {
+                ::munmap(shared_payload, shared_payload_map_bytes);
+            }
+            return 1;
+        }
+        std::vector<ggml_tensor *> full_k;
+        std::vector<ggml_tensor *> full_v;
+        const int n_full = shards.front().weights.n_layer /
+            shards.front().weights.full_attention_interval;
+        for (int i = 0; i < n_full; ++i) {
+            ggml_tensor * k = nullptr;
+            ggml_tensor * v = nullptr;
+            for (auto & shard : shards) {
+                if (i < (int)shard.cache.attn_k.size() &&
+                    shard.cache.attn_k[(size_t)i]) {
+                    k = shard.cache.attn_k[(size_t)i];
+                    v = shard.cache.attn_v[(size_t)i];
+                    break;
+                }
+            }
+            if (k && v) {
+                full_k.push_back(k);
+                full_v.push_back(v);
+            }
+        }
+        KvFlashConfig pc;
+        pc.pool_tokens = kvflash_pool_tokens;
+        if (!kvflash_pager.attach(pc, full_k, full_v)) {
+            std::fprintf(stderr,
+                "[qwen35-target-shard-daemon][kvflash] pager attach failed "
+                "pool=%d layers=%zu\n",
+                kvflash_pool_tokens, full_k.size());
+            stream_status(stream_fd, -1);
+            free_snapshot_backends();
+            free_qwen35_layer_split_shards(shards);
+            if (shared_payload && shared_payload != MAP_FAILED) {
+                ::munmap(shared_payload, shared_payload_map_bytes);
+            }
+            return 1;
+        }
+        std::fprintf(stderr,
+            "[qwen35-target-shard-daemon][kvflash] resident pool %d tokens "
+            "over %zu full-attn layers (logical max_ctx %d, policy=lru)\n",
+            kvflash_pool_tokens, full_k.size(), max_ctx);
+    }
+
     const int hidden = shards.front().weights.n_embd;
     std::vector<float> host_act;
     std::vector<int32_t> argmax_tokens;
@@ -354,12 +411,22 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                            const std::vector<float> & boundary,
                            bool want_argmax,
                            bool want_logits,
-                           bool want_captures) -> bool {
+                           bool want_captures,
+                           int forward_ubatch) -> bool {
         if (n_tokens <= 0 || (int)boundary.size() != hidden * n_tokens) {
             return false;
         }
         if (base_pos < 0 || base_pos + n_tokens > max_ctx) {
             return false;
+        }
+        forward_ubatch = std::max(1, forward_ubatch > 0 ? forward_ubatch : n_tokens);
+        if (kvflash_pool_tokens > 0) {
+            for (int start = 0; start < n_tokens; start += forward_ubatch) {
+                const int n = std::min(forward_ubatch, n_tokens - start);
+                if (!kvflash_pager.alloc_span(base_pos + start, n)) {
+                    return false;
+                }
+            }
         }
         ActivationPair acts;
         if (!activation_pair_init(acts, shards.front().backend, hidden, n_tokens)) {
@@ -373,11 +440,13 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
         std::vector<float> logits;
         std::vector<Qwen35TargetCaptureSlice> captures;
         const bool forward_ok = run_qwen35_layer_split_forward_from_activation(
-            shards, acts, base_pos, n_tokens, std::max(1, n_tokens), ignored_last_tok,
+            shards, acts, base_pos, n_tokens, forward_ubatch, ignored_last_tok,
             kq_stride_pad, fa_window,
             want_argmax ? &argmax_tokens : nullptr,
             want_logits ? &logits : nullptr,
-            want_captures ? &captures : nullptr);
+            want_captures ? &captures : nullptr,
+            kvflash_pool_tokens > 0 ? &kvflash_pager : nullptr,
+            kvflash_pool_tokens > 0);
         activation_pair_free(acts);
         if (!forward_ok) return false;
 
@@ -445,12 +514,14 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
         int want_argmax = 0;
         int want_logits = 0;
         int want_captures = 0;
+        int forward_ubatch = 0;
         size_t bytes = 0;
         bool payload_ok = false;
 
         if (cmd == "forward_pipe") {
             iss >> base_pos >> n_tokens >> want_argmax >> want_logits >> bytes;
             if (!(iss >> want_captures)) want_captures = 0;
+            if (!(iss >> forward_ubatch)) forward_ubatch = n_tokens;
             const size_t expected_bytes =
                 (size_t)n_tokens * (size_t)hidden * sizeof(float);
             if (payload_fd >= 0 && bytes == expected_bytes) {
@@ -461,6 +532,7 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
             uint64_t seq = 0;
             iss >> base_pos >> n_tokens >> want_argmax >> want_logits >> bytes >> seq;
             if (!(iss >> want_captures)) want_captures = 0;
+            if (!(iss >> forward_ubatch)) forward_ubatch = n_tokens;
             const size_t expected_bytes =
                 (size_t)n_tokens * (size_t)hidden * sizeof(float);
             const auto * header =
@@ -494,8 +566,36 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
             }
             if (cmd == "reset_request_state") {
                 for (auto & shard : shards) reset_target_cache(shard.cache);
+                if (kvflash_pool_tokens > 0) kvflash_pager.reset();
                 prefill_last_logits.clear();
                 stream_status(stream_fd, 0);
+                continue;
+            }
+            if (cmd == "kvflash_sync_identity") {
+                int committed = -1;
+                iss >> committed;
+                bool ok = kvflash_pool_tokens > 0 && committed >= 0 &&
+                          committed <= kvflash_pool_tokens;
+                if (ok) {
+                    int min_cur_pos = std::numeric_limits<int>::max();
+                    for (const auto & shard : shards) {
+                        min_cur_pos = std::min(min_cur_pos, shard.cache.cur_pos);
+                    }
+                    ok = min_cur_pos != std::numeric_limits<int>::max() &&
+                         committed <= min_cur_pos;
+                }
+                if (ok) {
+                    kvflash_pager.reset();
+                    for (int p = 0; p < committed; ++p) {
+                        const int slot = kvflash_pager.slot_for(p);
+                        if (slot != p) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (ok) kvflash_pager.zero_free_blocks();
+                }
+                stream_status(stream_fd, ok ? 0 : -1);
                 continue;
             }
             if (cmd == "project_pipe") {
@@ -828,7 +928,7 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
         if (!payload_ok ||
             !run_forward(base_pos, n_tokens, host_act,
                          want_argmax != 0, want_logits != 0,
-                         want_captures != 0)) {
+                         want_captures != 0, forward_ubatch)) {
             const int32_t status = -1;
             write_exact_fd(stream_fd, &status, sizeof(status));
         }

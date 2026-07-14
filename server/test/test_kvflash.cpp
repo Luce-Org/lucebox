@@ -1128,6 +1128,7 @@ int main(int argc, char ** argv) {
             if (!pager.page_out(2) || !pager.page_in(2)) {
                 std::fprintf(stderr, "roundtrip paging failed\n"); return 1;
             }
+            pager.synchronize_paging();   // wait for async H2D before reading device KV
             ggml_backend_tensor_get(t, after.data(),
                 (size_t)pager.block_of(2) * pc.chunk_tokens * t->nb[1], seg);
             const bool exact = std::memcmp(before.data(), after.data(), seg) == 0;

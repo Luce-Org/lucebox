@@ -23,18 +23,32 @@ namespace dflash::common {
 
 // ── internal helpers ────────────────────────────────────────────
 
+// Log a failed CUDA/HIP runtime call with its error string and return true.
+// The backends surface only a generic "feature mirror init failed" /
+// "feature_sync" when any of these helpers returns false, so on HIP there is no
+// way to tell an OOM from a bad device id from a peer-copy failure. Naming the
+// call + printing cudaGetErrorString (mapped to hipGetErrorString on HIP builds)
+// turns that into a per-call diagnostic. Needed for the #457 DDTree-never-engages
+// triage: a mirror-init or feature-sync failure silently drops spec decode to AR.
+static bool feature_cuda_failed(const char * call, cudaError_t err) {
+    if (err == cudaSuccess) return false;
+    std::fprintf(stderr, "[dflash-feature] %s failed: %s\n",
+                 call, cudaGetErrorString(err));
+    return true;
+}
+
 static bool ensure_staging(DraftFeatureMirror & mirror, size_t bytes) {
     if (bytes <= mirror.staging_bytes) return true;
     cudaError_t err = cudaSetDevice(mirror.device);
-    if (err != cudaSuccess) return false;
+    if (feature_cuda_failed("cudaSetDevice", err)) return false;
     if (mirror.staging) {
         err = cudaFree(mirror.staging);
-        if (err != cudaSuccess) return false;
+        if (feature_cuda_failed("cudaFree", err)) return false;
         mirror.staging = nullptr;
         mirror.staging_bytes = 0;
     }
     err = cudaMalloc(&mirror.staging, bytes);
-    if (err != cudaSuccess) return false;
+    if (feature_cuda_failed("cudaMalloc", err)) return false;
     mirror.staging_bytes = bytes;
     return true;
 }
@@ -135,10 +149,10 @@ static bool convert_device_f32_to_feature_type(DraftFeatureMirror & mirror,
 
     std::vector<float> host(elems);
     cudaError_t err = cudaSetDevice(src_device);
-    if (err != cudaSuccess) return false;
+    if (feature_cuda_failed("cudaSetDevice", err)) return false;
     err = cudaMemcpy(host.data(), src, elems * sizeof(float),
                      cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) return false;
+    if (feature_cuda_failed("cudaMemcpy", err)) return false;
 
     const size_t row_bytes = ggml_row_size(mirror.storage_type, (int64_t)elems);
     std::vector<uint8_t> tmp(row_bytes);
@@ -170,7 +184,7 @@ static bool convert_bf16_feature_to_storage(DraftFeatureMirror & mirror,
     const size_t dst_offset = (size_t)((char *)dst - (char *)mirror.target_feat->data);
 
     cudaError_t err = cudaSetDevice(src_device);
-    if (err != cudaSuccess) return false;
+    if (feature_cuda_failed("cudaSetDevice", err)) return false;
 
     size_t done = 0;
     size_t dst_bytes_done = 0;
@@ -184,7 +198,7 @@ static bool convert_bf16_feature_to_storage(DraftFeatureMirror & mirror,
                          (const char *)src + done * sizeof(ggml_bf16_t),
                          chunk * sizeof(ggml_bf16_t),
                          cudaMemcpyDeviceToHost);
-        if (err != cudaSuccess) return false;
+        if (feature_cuda_failed("cudaMemcpy", err)) return false;
 
         std::vector<float> host(chunk);
         ggml_bf16_to_fp32_row(bf16_host.data(), host.data(), (int64_t)chunk);
@@ -223,9 +237,11 @@ static bool copy_feature_to_f32(DraftFeatureMirror & mirror,
         src = mirror.staging;
     }
     cudaError_t err = cudaSetDevice(mirror.device);
-    if (err != cudaSuccess) return false;
+    if (feature_cuda_failed("cudaSetDevice", err)) return false;
     to_f32(src, dst, (int64_t)elems, nullptr);
-    return cudaGetLastError() == cudaSuccess;
+    err = cudaGetLastError();
+    if (feature_cuda_failed("to_fp32_cuda", err)) return false;
+    return true;
 }
 
 // ── public API ──────────────────────────────────────────────────
@@ -291,12 +307,12 @@ bool draft_feature_mirror_init(DraftFeatureMirror & mirror,
     }
     const size_t bytes = ggml_nbytes(mirror.target_feat);
     cudaError_t err = cudaSetDevice(device);
-    if (err != cudaSuccess) {
+    if (feature_cuda_failed("cudaSetDevice", err)) {
         draft_feature_mirror_free(mirror);
         return false;
     }
     err = cudaMemset(mirror.target_feat->data, 0, bytes);
-    if (err != cudaSuccess) {
+    if (feature_cuda_failed("cudaMemset", err)) {
         draft_feature_mirror_free(mirror);
         return false;
     }
@@ -346,10 +362,12 @@ bool draft_feature_mirror_sync_range(const ggml_tensor * src_target_feat,
             return false;
         }
         cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) return false;
+        if (feature_cuda_failed("cudaGetLastError", err)) return false;
         done += run;
     }
-    return cudaDeviceSynchronize() == cudaSuccess;
+    cudaError_t err = cudaDeviceSynchronize();
+    if (feature_cuda_failed("cudaDeviceSynchronize", err)) return false;
+    return true;
 }
 
 bool draft_feature_mirror_sync_tail(const ggml_tensor * src_target_feat,
@@ -393,7 +411,9 @@ bool copy_capture_slice_to_draft_ring(
             return false;
         }
     }
-    return cudaDeviceSynchronize() == cudaSuccess;
+    cudaError_t err = cudaDeviceSynchronize();
+    if (feature_cuda_failed("cudaDeviceSynchronize", err)) return false;
+    return true;
 }
 
 bool copy_host_capture_slice_to_draft_ring(
@@ -465,7 +485,9 @@ bool copy_feature_ring_range_to_tensor(
         }
         done += run;
     }
-    return cudaDeviceSynchronize() == cudaSuccess;
+    cudaError_t err = cudaDeviceSynchronize();
+    if (feature_cuda_failed("cudaDeviceSynchronize", err)) return false;
+    return true;
 }
 
 bool copy_feature_ring_range_to_host_f32(

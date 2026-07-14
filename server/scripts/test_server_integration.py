@@ -518,6 +518,21 @@ class TestReasoning:
         msg = r.json()["choices"][0]["message"]
         assert msg["content"]
 
+    @pytest.mark.slow
+    def test_thinking_enabled_via_top_level_reasoning_effort(self):
+        """OpenAI Chat Completions-style reasoning_effort field."""
+        r = post_json("/v1/chat/completions", {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "What is 15 * 17?"}],
+            "stream": False,
+            "max_tokens": 512,
+            "reasoning_effort": "medium",
+        })
+        assert r.status_code == 200
+        choice = r.json()["choices"][0]
+        assert choice["message"]["content"]
+        assert "finish_details" in choice
+
 
 # ═══════════════════════════════════════════════════════════════════
 # POST /v1/responses — OpenAI Responses API

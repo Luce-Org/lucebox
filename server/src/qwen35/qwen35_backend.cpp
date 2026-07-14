@@ -8,6 +8,10 @@
 #include "peer_access.h"
 #include "attn_masks.h"
 #include "common/sampler.h"
+#ifdef DFLASH27B_HAVE_GPU_SAMPLER
+#include "common/geometric_sampler_cuda.h"
+#include <random>
+#endif
 #include "common/io_utils.h"
 #include "common/restore_delta.h"
 #include "qwen3/qwen3_drafter.h"
@@ -149,6 +153,24 @@ Qwen35Backend::Qwen35Backend(const Qwen35Config & cfg) : cfg_(cfg) {}
 
 Qwen35Backend::~Qwen35Backend() { shutdown(); }
 
+// "auto" pool budget: device-free minus a reserve (compute buffers + drafter
+// when expected), converted at this model's pooled-KV density. Shared with MoE
+// placement so reservation and runtime allocation size the pool identically.
+KvFlashAutoBudget Qwen35Backend::make_kvflash_budget(const TargetWeights & w,
+                                                     int64_t gpu_free) const {
+    ggml_type kv_k = GGML_TYPE_Q8_0, kv_v = GGML_TYPE_Q8_0;
+    dflash::resolve_kv_types(kv_k, kv_v);
+    KvFlashAutoBudget b;
+    b.free_bytes      = gpu_free;
+    // Single source of truth with the qwen35moe placement path — see kv_quant.h.
+    b.bytes_per_token = (int64_t)dflash::kv_reservation_bytes_per_token(
+        w.n_layer, w.full_attention_interval, w.n_head_kv,
+        kv_k, w.n_embd_head_k, kv_v, w.n_embd_head_v);
+    b.reserve_bytes   = (int64_t)(1.5 * 1073741824.0) +
+        (kvflash_drafter_path_.empty() ? 0 : (int64_t)(1.7 * 1073741824.0));
+    return b;
+}
+
 // ── init() ──────────────────────────────────────────────────────────────
 
 bool Qwen35Backend::init() {
@@ -242,29 +264,20 @@ bool Qwen35Backend::init() {
     // point and the cache is not yet allocated, so device-free minus a
     // reserve (compute buffers + the drafter when expected) is what the
     // pool can really use, converted at this model's pooled-KV density.
-    KvFlashAutoBudget kvf_budget;
-    {
-        size_t gpu_free = 0, gpu_total = 0;
-        if (ggml_backend_dev_t dev = ggml_backend_get_device(target_backend_)) {
-            ggml_backend_dev_memory(dev, &gpu_free, &gpu_total);
-        }
-        ggml_type kv_k = GGML_TYPE_Q8_0, kv_v = GGML_TYPE_Q8_0;
-        dflash::resolve_kv_types(kv_k, kv_v);
-        const int n_full = w_.n_layer / w_.full_attention_interval;
-        kvf_budget.free_bytes      = (int64_t)gpu_free;
-        kvf_budget.bytes_per_token = (int64_t)n_full * w_.n_head_kv *
-            (int64_t)(ggml_row_size(kv_k, w_.n_embd_head_k) +
-                      ggml_row_size(kv_v, w_.n_embd_head_v));
-        kvf_budget.reserve_bytes   = (int64_t)(1.5 * 1073741824.0) +
-            (kvflash_drafter_path_.empty() ? 0 : (int64_t)(1.7 * 1073741824.0));
+    size_t gpu_free = 0, gpu_total = 0;
+    if (ggml_backend_dev_t dev = ggml_backend_get_device(target_backend_)) {
+        ggml_backend_dev_memory(dev, &gpu_free, &gpu_total);
     }
+    KvFlashAutoBudget kvf_budget = make_kvflash_budget(w_, (int64_t)gpu_free);
     kvflash_tokens_ = kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{},
-                                            !kvflash_drafter_path_.empty() ||
-                                            kvflash_qk_policy_,
+                                            kvflash_scorer_expected(),
                                             kvf_budget);
     if (kvflash_tokens_ > 0) {
         kvflash_tau_ = std::max(1, env_int_or_default("DFLASH_KVFLASH_TAU", 64));
     }
+    // Subclass gate (e.g. MoE all-hot): may zero kvflash_tokens_ before the KV
+    // cache is sized, so create_target_cache allocates full max_ctx KV.
+    if (!post_kvflash_init_gate()) return false;
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true, /*ctx_alloc=*/kvflash_tokens_)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
@@ -717,6 +730,7 @@ void Qwen35Backend::shutdown() {
     step_graph_destroy(draft_sg_);
     step_graph_destroy(proj_sg_);
     remote_draft_.close();
+    draft_kv_free(draft_kv_);
     draft_feature_mirror_free(feature_mirror_);
     for (int i = 0; i < PREFIX_SLOTS; i++) {
         free_prefix_snapshot(prefix_snapshots_[i]);
@@ -784,7 +798,7 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     auto t_prefill_start = std::chrono::steady_clock::now();
     const int committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
     if (committed < 0) {
-        result.error = "prefill";
+        result.fail(GenerateErrorCode::PrefillFailed);
         return result;
     }
     auto t_prefill_end = std::chrono::steady_clock::now();
@@ -822,14 +836,14 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
             }
         }
         if (!decode_ok) {
-            result.error = "decode";
+            result.fail(GenerateErrorCode::DecodeFailed);
             return result;
         }
         result.decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
 
-    result.ok = true;
+    result.succeed();
     return result;
 }
 
@@ -841,7 +855,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) {
-        result.error = "bad slot";
+        result.fail(GenerateErrorCode::InvalidSnapshotSlot);
         out_io.emit(-1);
         return result;
     }
@@ -892,7 +906,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         std::vector<int32_t> delta = restore_prompt_delta(req.prompt, snap_pos);
         committed = do_prefill(delta, out_io, req.snap_pos, req.snap_slot, /*kv_offset=*/snap_pos);
         if (committed < 0) {
-            result.error = "prefill";
+            result.fail(GenerateErrorCode::PrefillFailed);
             return result;
         }
         result.prefill_s = std::chrono::duration<double>(
@@ -910,7 +924,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         auto t_prefill_start = std::chrono::steady_clock::now();
         committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
         if (committed < 0) {
-            result.error = "prefill";
+            result.fail(GenerateErrorCode::PrefillFailed);
             return result;
         }
         result.prefill_s = std::chrono::duration<double>(
@@ -933,7 +947,8 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                                should_capture_moe_router(),
                                /*kvflash_mask=*/pool,
                                /*capture_qk=*/pool && kvflash_qk_policy_)) {
-            result.error = "restore step-graph build";
+            result.fail(GenerateErrorCode::BackendSpecific,
+                             "restore step-graph build");
             return result;
         }
     }
@@ -970,14 +985,14 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             }
         }
         if (!decode_ok) {
-            result.error = "decode";
+            result.fail(GenerateErrorCode::DecodeFailed);
             return result;
         }
         result.decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
 
-    result.ok = true;
+    result.succeed();
     return result;
 }
 
@@ -1578,10 +1593,44 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         }();
         int32_t next_tok;
         if (sampler_.needs_logit_processing()) {
-            ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
-                                    sizeof(float) * vocab);
-            next_tok = sample_logits(logits_buf.data(), vocab, sampler_,
-                                      out_tokens, sampler_rng_);
+#ifdef DFLASH27B_HAVE_GPU_SAMPLER
+            // GPU sample straight from the device logits tensor, skipping the
+            // full ~vocab-wide D2H copy (the same payoff DFLASH_GPU_ARGMAX gets
+            // for greedy). Falls back to the CPU chain on -1.
+            int g_tok = -1;
+            if (gpu_sampler_enabled() && gpu_sampler_supports(sampler_) &&
+                sg_.logits && sg_.logits->data) {
+                // Draw the uniform from a copy of the RNG so the real stream is
+                // not advanced yet; we only commit that single draw if the GPU
+                // path succeeds (below). On fallback the stream is untouched and
+                // sample_logits() draws the identical value it would with the
+                // GPU disabled, so the token stream is reproducible either way.
+                double r = 0.0;
+                if (sampler_.temp > 0.0f) {
+                    std::mt19937_64 rng_peek = sampler_rng_;
+                    std::uniform_real_distribution<double> u(0.0, 1.0);
+                    r = u(rng_peek);
+                }
+                g_tok = geometric_sample_logits_cuda(
+                    static_cast<const float *>(sg_.logits->data), vocab, sampler_,
+                    out_tokens, r, /*logits_on_device=*/true);
+            }
+            if (g_tok >= 0) {
+                // Commit the single uniform the GPU draw consumed, so the RNG
+                // advances by exactly one draw — matching the CPU/GPU-off path.
+                if (sampler_.temp > 0.0f) {
+                    std::uniform_real_distribution<double> u(0.0, 1.0);
+                    (void)u(sampler_rng_);
+                }
+                next_tok = g_tok;
+            } else
+#endif
+            {
+                ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
+                                        sizeof(float) * vocab);
+                next_tok = sample_logits(logits_buf.data(), vocab, sampler_,
+                                          out_tokens, sampler_rng_);
+            }
         } else if (kGpuArgmaxAR && sg_.argmax_tokens) {
             int32_t tok_i = 0;
             ggml_backend_tensor_get(sg_.argmax_tokens, &tok_i, 0, sizeof(int32_t));
@@ -1749,6 +1798,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     bool * degenerate_close_out) {
     out_accept_rate = 0.0f;
     out_spec_ran    = false;
+    // [TAG_DRAFT_KV] the drafter ring persists across requests but its rows
+    // belong to the previous conversation; start every request empty (the
+    // first begin_step bulk-appends the live window from the feature mirror).
+    if (draft_kv_.gf) draft_kv_reset(draft_kv_);
     const int hidden = w_.n_embd;
 
     // First token: use the argmax that do_prefill already sampled and stored.
@@ -1882,6 +1935,15 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                      n_draft_steps > 0 ? (double)target_forwards / n_draft_steps : 0.0);
     };
 
+    // kvflash: an in-pool prompt prefills contiguously without registering
+    // chunks in the pager. Map the prefix now so the pager stays consistent
+    // with the tree path's direct writes and hands off cleanly to slot-mapped
+    // paging once the context outgrows the pool. (A >pool prompt already paged
+    // during prefill, leaving the pager non-identity, so this is skipped.)
+    if (kvflash_active() && kvflash_pager_.is_identity()) {
+        (void)kvflash_pager_.alloc_span(0, committed);
+    }
+
     auto t_dec0 = std::chrono::steady_clock::now();
 
     while (n_generated < n_gen) {
@@ -1943,42 +2005,83 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 return false;
             }
         } else {
-            if (!build_draft_step(draft_sg, dw_, /*lm_head=*/nullptr, draft_backend_,
-                                  draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
-                                  committed,
-                                  /*ctx_len_max=*/std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)))) {
-                std::fprintf(stderr, "spec-decode: draft build failed\n");
-                step_graph_destroy(draft_sg);
-                return false;
+            // [TAG_DRAFT_KV] ring-cached drafter context KV: append newly
+            // committed rows instead of re-encoding the whole feature window.
+            static const bool draft_kv_on = []() {
+                const char * e = std::getenv("DFLASH_DRAFT_KV");
+                return !(e && e[0] == '0' && e[1] == '\0');
+            }();
+            bool use_draft_kv = draft_kv_on && feature_mirror_.target_feat != nullptr;
+            if (use_draft_kv && draft_kv_.gf &&
+                draft_kv_.built_for != (const void *)&dw_) {
+                draft_kv_free(draft_kv_);
             }
-            if (!use_mirror_view &&
-                !copy_feature_ring_range_to_tensor(feature_mirror_, draft_sg.target_hidden_cat,
-                                                   draft_start, draft_ctx)) {
-                std::fprintf(stderr, "spec-decode: feature copy failed\n");
-                step_graph_destroy(draft_sg);
-                return false;
+            if (use_draft_kv && !draft_kv_.gf) {
+                const int kv_cap = std::min(ring_cap,
+                    std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max));
+                if (!draft_kv_init(draft_kv_, dw_, draft_backend_, kv_cap, nullptr)) {
+                    draft_kv_free(draft_kv_);
+                    use_draft_kv = false;
+                    std::fprintf(stderr,
+                        "spec-decode: draft-kv init failed; using legacy draft path\n");
+                }
             }
-            ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
-                                    sizeof(float) * noise_embed.size());
-            pos_k.resize((size_t)draft_ctx + q_len);
-            for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
-            for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
-            ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
-                                    sizeof(int32_t) * pos_q.size());
-            ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
-                                    sizeof(int32_t) * pos_k.size());
+            if (use_draft_kv) {
+                if (!draft_kv_begin_step(draft_kv_, dw_, draft_backend_,
+                                         feature_mirror_, committed)) {
+                    std::fprintf(stderr, "spec-decode: draft-kv step prep failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                ggml_backend_tensor_set(draft_kv_.inp_embed, noise_embed.data(), 0,
+                                        sizeof(float) * noise_embed.size());
+                if (ggml_backend_graph_compute(draft_backend_, draft_kv_.gf) !=
+                    GGML_STATUS_SUCCESS) {
+                    std::fprintf(stderr, "spec-decode: draft-kv compute failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                local_hidden.resize((size_t)hidden * q_len);
+                ggml_backend_tensor_get(draft_kv_.hidden_states, local_hidden.data(), 0,
+                                        sizeof(float) * local_hidden.size());
+            } else {
+                if (!build_draft_step(draft_sg, dw_, /*lm_head=*/nullptr, draft_backend_,
+                                      draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
+                                      committed,
+                                      /*ctx_len_max=*/std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)))) {
+                    std::fprintf(stderr, "spec-decode: draft build failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                if (!use_mirror_view &&
+                    !copy_feature_ring_range_to_tensor(feature_mirror_, draft_sg.target_hidden_cat,
+                                                       draft_start, draft_ctx)) {
+                    std::fprintf(stderr, "spec-decode: feature copy failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
+                                        sizeof(float) * noise_embed.size());
+                pos_k.resize((size_t)draft_ctx + q_len);
+                for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
+                for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
+                ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
+                                        sizeof(int32_t) * pos_q.size());
+                ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
+                                        sizeof(int32_t) * pos_k.size());
 
-            auto st = ggml_backend_graph_compute(draft_backend_, draft_sg.gf);
-            if (st != GGML_STATUS_SUCCESS) {
-                std::fprintf(stderr, "spec-decode: draft compute failed\n");
-                step_graph_destroy(draft_sg);
-                return false;
-            }
+                auto st = ggml_backend_graph_compute(draft_backend_, draft_sg.gf);
+                if (st != GGML_STATUS_SUCCESS) {
+                    std::fprintf(stderr, "spec-decode: draft compute failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
 
-            // Read draft hidden states to host for LM-head projection.
-            local_hidden.resize((size_t)hidden * q_len);
-            ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
-                                    sizeof(float) * local_hidden.size());
+                // Read draft hidden states to host for LM-head projection.
+                local_hidden.resize((size_t)hidden * q_len);
+                ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
+                                        sizeof(float) * local_hidden.size());
+            }
         }
 
         // 3. Project draft hidden → token IDs via target LM head
@@ -2007,7 +2110,17 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             !(hint_tokens && n_generated < (int)hint_tokens->size()) &&
             stall_tool_prefix_tokens == nullptr &&
             (int)out_tokens.size() >= _min_floor;
-        if (cfg_.ddtree_mode && target->supports_tree_verify() &&
+        // kvflash: only take the non-paged tree path while the read prefix
+        // [0, committed) is identity-resident and the write span (+FA padding)
+        // fits the resident pool. Full-attention only (windowed FA padding could
+        // index past the pool). Otherwise the slot-mapped chain verify handles
+        // it. Non-kvflash is unaffected.
+        const bool kvflash_tree_ok =
+            !kvflash_active() ||
+            (cfg_.fa_window == 0 &&
+             committed + cfg_.ddtree_budget + 1 + cfg_.kq_stride_pad <= kvflash_tokens_ &&
+             kvflash_pager_.identity_prefix_covers(committed));
+        if (cfg_.ddtree_mode && target->supports_tree_verify() && kvflash_tree_ok &&
             !use_remote_draft && q_len > 1 && tree_special_inactive) {
             const int L = q_len - 1;
             const int K = (cfg_.ddtree_budget > L) ? 8 : 1;

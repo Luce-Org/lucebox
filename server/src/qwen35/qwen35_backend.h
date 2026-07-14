@@ -19,6 +19,7 @@
 #include "step_graph.h"
 #include "ddtree.h"
 #include "dflash_feature_ring.h"
+#include "common/dflash_draft_kv.h"
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights, PrefixSnapshot
 #include "qwen3/qwen3_drafter.h"  // DrafterContext, load_drafter, free_drafter, drafter_score_and_compress
 #include "kvflash_pager.h"         // bounded KV residency pool
@@ -83,7 +84,7 @@ public:
     // ── Initialization ───────────────────────────────────────────────
     // Load target + draft models, create KV caches.
     // Returns false on failure (check dflash27b_last_error()).
-    bool init();
+    virtual bool init();
 
     // ── ModelBackend interface ────────────────────────────────────────
     void print_ready_banner() const override;
@@ -133,6 +134,9 @@ protected:
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io);
     virtual bool should_capture_moe_router() const { return false; }
+    // Hook after kvflash pool sizing, before create_target_cache: a subclass
+    // may disable the pool (kvflash_tokens_=0) when it is redundant. Default no-op.
+    virtual bool post_kvflash_init_gate() { return true; }
     virtual void after_target_compute(StepGraph &,
                                       int /*kv_start*/,
                                       int /*n_tokens*/) {}
@@ -181,6 +185,12 @@ protected:
     int  kvflash_tau_    = 64;
     bool kvflash_drafter_failed_ = false;           // don't retry a failed load
     bool kvflash_active() const { return kvflash_tokens_ > 0; }
+    // Pool sizing inputs — shared so MoE placement reserves exactly the pool
+    // runtime allocates (else placement over-reserves KV and starves experts).
+    bool kvflash_scorer_expected() const {
+        return !kvflash_drafter_path_.empty() || kvflash_qk_policy_;
+    }
+    KvFlashAutoBudget make_kvflash_budget(const TargetWeights & w, int64_t gpu_free) const;
     // Target-QK policy (--kvflash-policy qk): residency scored with the
     // target's own pooled post-RoPE keys vs the current decode query
     // (kvflash_qk.h); no drafter. Keys pool at chunk-seal time; the query
@@ -224,6 +234,9 @@ private:
 
     // ── Draft feature mirror (cross-GPU feature transfer) ────────────
     DraftFeatureMirror feature_mirror_;
+    // [TAG_DRAFT_KV] drafter context-KV ring cache (lazy-init; kill with
+    // DFLASH_DRAFT_KV=0). Shared module: common/dflash_draft_kv.h.
+    DraftKvState draft_kv_;
     DFlashDraftIpcClient remote_draft_;
 
     // ── Prefix cache (snapshots) ─────────────────────────────────────

@@ -4,17 +4,20 @@
 #include "../common/moe_hybrid_stream.h"
 #include "../common/moe_hybrid_types.h"
 #include "../common/moe_hybrid_types_impl.h"
+#include "../common/kvflash_placement.h"
 #include "common/ggml_graph_precision.h"
 #include "common/sampler.h"
 #include "common/dflash_spec_decode.h"
 #include "dflash_draft_graph.h"
 #include "dflash_feature_ring.h"
 #include "graph_builders.h"
+#include "kv_quant.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "gguf.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -31,10 +34,68 @@ static uint64_t elapsed_us(HybridClock::time_point start, HybridClock::time_poin
     return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 }
 
+static float env_float_or_default(const char * name, float fallback) {
+    const char * raw = std::getenv(name);
+    if (!raw || !*raw) return fallback;
+    char * end = nullptr;
+    const float value = std::strtof(raw, &end);
+    if (end == raw || *end != '\0') return fallback;
+    return value;
+}
+
+static int env_int_or_default(const char * name, int fallback) {
+    const char * raw = std::getenv(name);
+    if (!raw || !*raw) return fallback;
+    char * end = nullptr;
+    const long value = std::strtol(raw, &end, 10);
+    if (end == raw || *end != '\0') return fallback;
+    return (int)value;
+}
+
+static float hybrid_spec_min_accept_rate() {
+    static const float value = env_float_or_default(
+        "DFLASH_QWEN35MOE_HYBRID_SPEC_MIN_ACCEPT_RATE", 0.50f);
+    return value;
+}
+
+static int hybrid_spec_min_steps_before_ar() {
+    static const int value = env_int_or_default(
+        "DFLASH_QWEN35MOE_HYBRID_SPEC_MIN_STEPS_BEFORE_AR", 1);
+    return value;
+}
+
+static int qwen35moe_prefill_chunk_limit(int prompt_len) {
+    static const int value = []() -> int {
+        const int raw = env_int_or_default("DFLASH_QWEN35MOE_PREFILL_CHUNK", 512);
+        return raw > 0 ? raw : 512;
+    }();
+    return std::min(value, prompt_len);
+}
+
 } // namespace
 
 Qwen35MoeBackend::Qwen35MoeBackend(const Qwen35Config & cfg)
     : Qwen35Backend(cfg) {}
+
+bool Qwen35MoeBackend::init() {
+    if (!Qwen35Backend::init()) {
+        return false;
+    }
+    if (!target_weights().moe_hybrid) {
+        return true;
+    }
+    if (!pipe_state_) {
+        pipe_state_ = std::make_unique<PipelinedDecodeState>();
+    }
+    pipe_state_->expert_compute = (std::getenv("DFLASH_DROP_COLD") == nullptr);
+    if (!ensure_pipelined_moe_expert_compute(*pipe_state_, target_weights(),
+                                           cfg_.target_path,
+                                           *target_weights().moe_hybrid)) {
+        pipe_state_.reset();
+        return false;
+    }
+    return true;
+}
 
 bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights & out) {
     // Phase 1: Load core model (non-expert tensors) to GPU.
@@ -74,6 +135,9 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
     if (placement.total_hot >= out.n_layer * out.n_expert) {
         std::printf("[qwen35moe] all experts fit in VRAM, loading fully to GPU\n");
         std::fflush(stdout);
+        // Record the placement result so post_kvflash_init_gate() can disable
+        // the KVFlash pool (moe_hybrid is null on this all-hot path).
+        placement_all_hot_ = true;
         free_target_weights(out);
         return load_target_gguf(cfg_.target_path, backend, out);
     }
@@ -328,6 +392,36 @@ bool Qwen35MoeBackend::spark_bootstrap_finalize(const std::string & profile_path
     return true;
 }
 
+bool Qwen35MoeBackend::post_kvflash_init_gate() {
+    // Gate: disable the KVFlash pool when dynamic placement confirmed all experts
+    // fit hot even with the FULL max_ctx KV reservation — the pool then reserves
+    // nothing useful (pure slot-map overhead).  placement_all_hot_full_kv_ is set
+    // in load_dynamic_placement().  When the pool is what KEEPS experts hot
+    // (placement_all_hot_ true but _full_kv_ false), we must NOT disable it.
+    if (!kvflash_active()) return true;
+
+    bool should_disable = false;
+    if (placement_all_hot_full_kv_) {
+        should_disable = true;
+    } else if (target_weights().moe_hybrid) {
+        int total_cold = 0;
+        for (const auto & ls : target_weights().moe_hybrid->layers) {
+            total_cold += (int)ls.cold_expert_ids.size();
+        }
+        if (total_cold == 0) should_disable = true;  // hybrid built but 0 cold
+    }
+
+    if (should_disable) {
+        std::printf("[kvflash] disabled: placement all-hot at max_ctx %d, pool not needed\n",
+                    cfg_.device.max_ctx);
+        std::fflush(stdout);
+        kvflash_tokens_ = 0;
+        kvflash_tau_    = 64;
+        kvflash_drafter_path_.clear();
+    }
+    return true;
+}
+
 void Qwen35MoeBackend::maybe_post_request_swap() {
     if (!routing_stats_) return;
 
@@ -384,8 +478,11 @@ bool Qwen35MoeBackend::run_ar_decode_path(int committed, int n_gen,
 
 bool Qwen35MoeBackend::ensure_pipe_state(int kv_start) {
     if (pipe_state_ && pipe_state_->valid()) return true;
-    pipe_state_ = std::make_unique<PipelinedDecodeState>();
+    if (!pipe_state_) {
+        pipe_state_ = std::make_unique<PipelinedDecodeState>();
+    }
     if (!init_pipelined_decode_state(*pipe_state_, target_backend(), target_weights(),
+                                     cfg_.target_path,
                                      target_cache(), *target_weights().moe_hybrid,
                                      kv_start, cfg_.kq_stride_pad)) {
         pipe_state_.reset();
@@ -502,7 +599,9 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
                                        target_cache(), *target_weights().moe_hybrid,
                                        committed, cfg_.kq_stride_pad,
                                        hybrid_telemetry_ ? &tel : nullptr,
-                                       kv_slot)) {
+                                       kv_slot,
+                                       /*capture_layers=*/false,
+                                       routing_stats_.get())) {
             return false;
         }
         const auto layers_done = DecodeClock::now();
@@ -551,7 +650,7 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
             tel_layers_accum.tensor_io_us += tel.tensor_io_us;
             tel_layers_accum.combine_overhead_us += tel.combine_overhead_us;
             tel_layers_accum.cold_cpu_us += tel.cold_cpu_us;
-            tel_layers_accum.cold_compute_us += tel.cold_compute_us;
+            tel_layers_accum.expert_compute_us += tel.expert_compute_us;
             tel_layers_accum.hot_graph_build_us += tel.hot_graph_build_us;
             tel_layers_accum.ffn_post_get_us += tel.ffn_post_get_us;
             tel_layers_accum.sync_wait_us += tel.sync_wait_us;
@@ -642,7 +741,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                                           const DaemonIO & io) {
     if (!target_weights().moe_hybrid) {
         auto result = Qwen35Backend::generate_impl(req, io);
-        if (result.ok) maybe_post_request_swap();
+        if (result.ok()) maybe_post_request_swap();
         return result;
     }
 
@@ -656,10 +755,14 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
 
     reset_recurrent_state(target_cache());
 
-    // Invalidate cached pipelined decode state between requests.
+    // Invalidate cached request graphs between requests.
     // The cached DeltaNet graphs reference conv_state/ssm_state tensors that were
     // just zeroed; rebuilding is cheap (~30 graphs) and avoids stale-pointer crashes.
-    pipe_state_.reset();
+    // Keep backend-lifetime MoE expert compute alive so remote mixed-backend daemons
+    // do not reload expert weights on every request.
+    if (pipe_state_) {
+        pipe_state_->reset_request_graphs();
+    }
 
     // Free per-layer cached FFN graphs from previous decode to release GPU memory
     // before prefill allocates its own graph buffers.
@@ -667,6 +770,8 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
         for (auto & layer : target_weights().moe_hybrid->layers) {
             layer.hot_graph.free();
             layer.cold_graph.free();
+            layer.hot_batched_graph.free();
+            layer.shared_batched_graph.free();
         }
     }
 
@@ -688,6 +793,19 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
     auto cleanup_graphs = [&]() {
         step_graph_destroy(logits_sg);
     };
+
+    if (!pipe_state_) {
+        pipe_state_ = std::make_unique<PipelinedDecodeState>();
+    }
+    pipe_state_->expert_compute = (std::getenv("DFLASH_DROP_COLD") == nullptr);
+    if (!ensure_pipelined_moe_expert_compute(*pipe_state_, target_weights(),
+                                           cfg_.target_path,
+                                           *target_weights().moe_hybrid)) {
+        result.fail(GenerateErrorCode::BackendSpecific,
+                         "moe_expert_compute_init");
+        cleanup_graphs();
+        return result;
+    }
 
     // Helper: compute logits from act_cur (persistent graph, built once)
     auto compute_logits = [&](ggml_tensor* gpu_src = nullptr) -> bool {
@@ -734,7 +852,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
     // ── Hybrid Prefill: chunked batched pre-FFN per layer, batched FFN ──
     auto t_prefill_start = std::chrono::steady_clock::now();
     const int prompt_len = (int)req.prompt.size();
-    const int prefill_chunk = std::min(128, prompt_len); // batch size per GPU compute
+    const int prefill_chunk = qwen35moe_prefill_chunk_limit(prompt_len);
 
     // kvflash: hybrid prefill writes rows identity-mapped, so the prompt must
     // fit the pool with one chunk of decode headroom (same contract as the
@@ -744,7 +862,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
         std::fprintf(stderr,
             "[kvflash] hybrid prompt (%d) exceeds pool %d; raise --kvflash "
             "or enable pflash compression\n", prompt_len, kvflash_tokens_);
-        result.error = "kvflash: prompt exceeds resident pool";
+        result.fail(GenerateErrorCode::ContextOverflow);
         cleanup_graphs();
         return result;
     }
@@ -755,7 +873,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
     for (int i = 0; i < prompt_len; ++i) {
         int32_t tok = req.prompt[(size_t)i];
         if (!target_weights().embedder.embed(&tok, 1, embed_all.data() + (size_t)i * (size_t)hidden)) {
-            result.error = "prefill_embed";
+            result.fail(GenerateErrorCode::BackendSpecific, "prefill_embed");
             cleanup_graphs();
             return result;
         }
@@ -768,6 +886,12 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
 
     for (int il = 0; il < n_layer; ++il) {
         auto & storage = target_weights().moe_hybrid->layers[(size_t)il];
+        const MoeLayerDesc chunk_desc =
+            make_moe_layer_desc(target_weights().layers[(size_t)il]);
+        MoeExpertCompute * expert_compute =
+            pipe_state_ ? pipe_state_->expert_runtime.compute_ptr() : nullptr;
+        const MoeExpertLayer * expert_layer =
+            pipe_state_ ? pipe_state_->expert_runtime.layer_ptr((size_t)il) : nullptr;
 
         for (int chunk_start = 0; chunk_start < prompt_len; chunk_start += prefill_chunk) {
             const int chunk_len = std::min(prefill_chunk, prompt_len - chunk_start);
@@ -780,7 +904,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             if (!build_layer_prefn_step(prefill_sg, target_weights(), target_cache(), target_backend(),
                                         il, /*kv_start=*/chunk_start, /*n_tokens=*/chunk_len,
                                         with_mask, /*fa_window=*/0, cfg_.kq_stride_pad)) {
-                result.error = "prefill_build";
+                result.fail(GenerateErrorCode::BackendSpecific, "prefill_build");
                 step_graph_destroy(prefill_sg);
                 if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
                 if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
@@ -822,7 +946,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             // Compute batched pre-FFN
             auto st = ggml_backend_graph_compute(target_backend(), prefill_sg.gf);
             if (st != GGML_STATUS_SUCCESS) {
-                result.error = "prefill_compute";
+                result.fail(GenerateErrorCode::BackendSpecific, "prefill_compute");
                 step_graph_destroy(prefill_sg);
                 if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
                 if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
@@ -846,7 +970,8 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                 ? prefill_sg.moe_selected[(size_t)il]
                 : nullptr;
             if (!layer_selected || !prefill_sg.moe_weights) {
-                result.error = "prefill_router_outputs";
+                result.fail(GenerateErrorCode::BackendSpecific,
+                                 "prefill_router_outputs");
                 step_graph_destroy(prefill_sg);
                 cleanup_graphs();
                 return result;
@@ -877,58 +1002,41 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                 }
             }
 
-            // Hybrid FFN — skip batched path when cold experts exist (CUDA mul_mat_id bug on sm_75)
+            // Hybrid FFN. Cold experts use the shared MoeExpertCompute backend
+            // (CPU fallback or remote mixed-backend daemon), so prefill can
+            // batch the same split used by decode without the local cold
+            // mul_mat_id path.
             MoeHybridConfig chunk_cfg = make_moe_hybrid_config(target_weights());
-            MoeLayerDesc chunk_desc = make_moe_layer_desc(target_weights().layers[(size_t)il]);
             std::vector<float> ffn_batch_out;
-            bool ffn_ok = false;
+            MoeHybridFfnTelemetry ffn_tel;
             ++total_ffn_layers;
-            if (storage.cold_expert_ids.empty()) {
-                // All experts hot — safe to use batched path
+            if (storage.cold_expert_ids.empty() ||
+                storage.all_routed_are_hot(chunk_selected.data(),
+                                           chunk_len * n_expert_used)) {
                 ++hot_only_layers;
-                ffn_ok = eval_moe_hybrid_ffn_batched(
-                        target_backend(), cpu_be, chunk_cfg, chunk_desc, storage,
-                        chunk_post.data(),
-                        chunk_selected.data(),
-                        chunk_weights.data(),
-                        chunk_len, ffn_batch_out, &result.error,
-                        &ffn_hot_alloc, &ffn_cold_alloc);
-            } else if (storage.all_routed_are_hot(chunk_selected.data(),
-                                                   chunk_len * n_expert_used)) {
-                // All selected experts happen to be in VRAM — pure GPU, no CPU
-                ++hot_only_layers;
-                ffn_ok = eval_moe_hot_only_batched(
-                        target_backend(), chunk_cfg, chunk_desc, storage,
-                        chunk_post.data(),
-                        chunk_selected.data(),
-                        chunk_weights.data(),
-                        chunk_len, ffn_batch_out, &result.error,
-                        &ffn_hot_alloc);
             } else if (target_weights().moe_hybrid->has_mmap() &&
                        !target_weights().moe_hybrid->layer_regions.empty() &&
-                       stream_engine_.is_ready() && chunk_len >= 16 &&
-                       !storage.cold_expert_ids.empty()) {
-                // Streaming prefill: batched eval handles hot on GPU + cold on CPU.
-                // The streaming engine's mmap keeps data paged in via madvise.
+                       stream_engine_.is_ready() && chunk_len >= 16) {
                 auto * hybrid = target_weights().moe_hybrid.get();
                 const auto & regions = hybrid->layer_regions[(size_t)il];
-                // Prefetch cold expert data from mmap for upcoming layers
                 std::vector<int32_t> cold_ids_copy(storage.cold_expert_ids.begin(),
                                                    storage.cold_expert_ids.end());
                 stream_engine_.prefetch_cold_experts(hybrid->mmap_data, hybrid->mmap_size,
                                                     regions, cold_ids_copy.data(),
                                                     (int)cold_ids_copy.size());
-                ffn_ok = eval_moe_hybrid_ffn_batched(
-                        target_backend(), cpu_be, chunk_cfg, chunk_desc, storage,
-                        chunk_post.data(),
-                        chunk_selected.data(),
-                        chunk_weights.data(),
-                        chunk_len, ffn_batch_out, &result.error,
-                        &ffn_hot_alloc, &ffn_cold_alloc);
             }
+            std::string ffn_error;
+            bool ffn_ok = eval_moe_hybrid_ffn_batched(
+                    target_backend(), cpu_be, chunk_cfg, chunk_desc, storage,
+                    chunk_post.data(),
+                    chunk_selected.data(),
+                    chunk_weights.data(),
+                    chunk_len, ffn_batch_out, &ffn_error,
+                    &ffn_hot_alloc, &ffn_cold_alloc,
+                    expert_compute, expert_layer,
+                    hybrid_telemetry_ ? &ffn_tel : nullptr);
             if (!ffn_ok) {
                 // Per-token fallback (avoids sm_75 mul_mat_id assertion with cold experts)
-                result.error.clear();
                 ffn_batch_out.assign((size_t)hidden * (size_t)chunk_len, 0.0f);
                 std::vector<float> single_out;
                 for (int ti = 0; ti < chunk_len; ++ti) {
@@ -938,7 +1046,8 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                     if (!eval_moe_hybrid_ffn_single(
                             target_backend(), chunk_cfg, chunk_desc, storage, cpu_be,
                             tok_post, tok_sel, tok_wts, n_expert_used, single_out)) {
-                        result.error = "prefill_ffn_single";
+                        result.fail(GenerateErrorCode::BackendSpecific,
+                                         "prefill_ffn_single");
                         step_graph_destroy(prefill_sg);
                         if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
                         if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
@@ -948,6 +1057,15 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                     std::memcpy(ffn_batch_out.data() + (size_t)ti * (size_t)hidden,
                                 single_out.data(), sizeof(float) * (size_t)hidden);
                 }
+            }
+            if (hybrid_telemetry_) {
+                ffn_tel_accum.ffn_wall_us += ffn_tel.ffn_wall_us;
+                ffn_tel_accum.partition_us += ffn_tel.partition_us;
+                ffn_tel_accum.hot_us += ffn_tel.hot_us;
+                ffn_tel_accum.cold_us += ffn_tel.cold_us;
+                ffn_tel_accum.combine_us += ffn_tel.combine_us;
+                ffn_tel_accum.hot_selected += ffn_tel.hot_selected;
+                ffn_tel_accum.cold_selected += ffn_tel.cold_selected;
             }
 
             // Combine FFN output + residual → embed_all for next layer
@@ -986,10 +1104,16 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             const auto t4 = HybridClock::now();
             ffn_us_total += elapsed_us(t3, t4);
         }
+        storage.hot_batched_graph.free();
+        storage.shared_batched_graph.free();
     }
     step_graph_destroy(prefill_sg);
     if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
     if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
+    for (auto & layer : target_weights().moe_hybrid->layers) {
+        layer.hot_batched_graph.free();
+        layer.shared_batched_graph.free();
+    }
 
     // Copy last token's output to act_cur for decode
     std::memcpy(act_cur.data(), embed_all.data() + (size_t)(prompt_len - 1) * (size_t)hidden,
@@ -1054,7 +1178,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
 
             // Get argmax from last prefill position for last_tok
             if (!compute_logits()) {
-                result.error = "decode_logits";
+                result.fail(GenerateErrorCode::BackendSpecific, "decode_logits");
                 cleanup_graphs();
                 return result;
             }
@@ -1068,20 +1192,21 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             cleanup_graphs();
             if (!do_hybrid_spec_decode(committed, req.n_gen, result.tokens, out_io,
                                        &result.accept_rate)) {
-                result.error = "hybrid_spec_decode";
+                result.fail(GenerateErrorCode::BackendSpecific,
+                                 "hybrid_spec_decode");
                 return result;
             }
         } else {
             // AR fallback decode — use pipelined path (cached DeltaNet + GPU-resident FFN)
             if (!ensure_pipe_state(committed)) {
-                result.error = "pipe_state_init";
+                result.fail(GenerateErrorCode::BackendSpecific, "pipe_state_init");
                 cleanup_graphs();
                 return result;
             }
 
             // Get logits from last prefill token (reuses persistent logits graph)
             if (!compute_logits()) {
-                result.error = "decode_logits";
+                result.fail(GenerateErrorCode::BackendSpecific, "decode_logits");
                 cleanup_graphs();
                 return result;
             }
@@ -1110,7 +1235,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                 for (int step = 1; step < req.n_gen; ++step) {
                     int32_t tok = result.tokens.back();
                     if (!target_weights().embedder.embed(&tok, 1, act_cur.data())) {
-                        result.error = "decode_embed";
+                        result.fail(GenerateErrorCode::BackendSpecific, "decode_embed");
                         cleanup_graphs();
                         return result;
                     }
@@ -1123,7 +1248,8 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                     if (kvflash_active()) {
                         kv_slot = kvflash_pager_.slot_for(committed);
                         if (kv_slot < 0) {
-                            result.error = "kvflash_slot";
+                            result.fail(GenerateErrorCode::BackendSpecific,
+                                             "kvflash_slot");
                             cleanup_graphs();
                             return result;
                         }
@@ -1134,8 +1260,10 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                                                     target_cache(), *target_weights().moe_hybrid,
                                                     committed, cfg_.kq_stride_pad,
                                                     hybrid_telemetry_ ? &tel : nullptr,
-                                                    kv_slot)) {
-                        result.error = "decode";
+                                                    kv_slot,
+                                                    /*capture_layers=*/false,
+                                                    routing_stats_.get())) {
+                        result.fail(GenerateErrorCode::DecodeFailed);
                         cleanup_graphs();
                         return result;
                     }
@@ -1151,7 +1279,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                         decode_tel_accum.tensor_io_us += tel.tensor_io_us;
                         decode_tel_accum.combine_overhead_us += tel.combine_overhead_us;
                         decode_tel_accum.cold_cpu_us += tel.cold_cpu_us;
-                        decode_tel_accum.cold_compute_us += tel.cold_compute_us;
+                        decode_tel_accum.expert_compute_us += tel.expert_compute_us;
                         decode_tel_accum.hot_graph_build_us += tel.hot_graph_build_us;
                         decode_tel_accum.ffn_post_get_us += tel.ffn_post_get_us;
                         decode_tel_accum.sync_wait_us += tel.sync_wait_us;
@@ -1172,7 +1300,8 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
 
                     // act_cur stays on GPU — compute_logits reads it via GPU→GPU copy
                     if (!compute_logits(pipe_state_->gpu_state.act_cur)) {
-                        result.error = "decode_logits";
+                        result.fail(GenerateErrorCode::BackendSpecific,
+                                         "decode_logits");
                         cleanup_graphs();
                         return result;
                     }
@@ -1216,9 +1345,9 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                                 decode_tel_accum.tensor_io_us / 1000.0,
                                 decode_tel_accum.combine_overhead_us / 1000.0,
                                 decode_tel_accum.sync_wait_us / 1000.0);
-                    std::printf("  CPU TIME: cold_total=%.1fms cold_compute=%.1fms hot_graph_build=%.1fms ffn_post_get=%.1fms\n",
+                    std::printf("  CPU TIME: cold_total=%.1fms expert_compute=%.1fms hot_graph_build=%.1fms ffn_post_get=%.1fms\n",
                                 decode_tel_accum.cold_cpu_us / 1000.0,
-                                decode_tel_accum.cold_compute_us / 1000.0,
+                                decode_tel_accum.expert_compute_us / 1000.0,
                                 decode_tel_accum.hot_graph_build_us / 1000.0,
                                 decode_tel_accum.ffn_post_get_us / 1000.0);
                     std::printf("  hot_graph_rebuilds=%d routed_ffn_layers=%d\n",
@@ -1251,11 +1380,11 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                                     decode_tel_accum.prefn_compute_us / 1000.0 / n_dec,
                                     decode_tel_accum.routing_readback_us / 1000.0 / n_dec,
                                     decode_tel_accum.ffn_us / 1000.0 / n_dec);
-                        std::printf("  per-token avg: tensor_io=%.2fms combine=%.2fms cold_cpu=%.2fms cold_compute=%.2fms\n",
+                        std::printf("  per-token avg: tensor_io=%.2fms combine=%.2fms cold_cpu=%.2fms expert_compute=%.2fms\n",
                                     decode_tel_accum.tensor_io_us / 1000.0 / n_dec,
                                     decode_tel_accum.combine_overhead_us / 1000.0 / n_dec,
                                     decode_tel_accum.cold_cpu_us / 1000.0 / n_dec,
-                                    decode_tel_accum.cold_compute_us / 1000.0 / n_dec);
+                                    decode_tel_accum.expert_compute_us / 1000.0 / n_dec);
                         std::printf("  estimated GPU utilization: %.1f%%\n", gpu_util_pct);
                     }
                     std::fflush(stdout);
@@ -1303,8 +1432,8 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                     ffn_tel_accum.hot_selected, ffn_tel_accum.cold_selected);
         std::fflush(stdout);
     }
-    result.ok = true;
-    if (result.ok) maybe_post_request_swap();
+    result.succeed();
+    if (result.ok()) maybe_post_request_swap();
     return result;
 }
 
@@ -1313,13 +1442,13 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
                                                       const DaemonIO & io) {
     if (!target_weights().moe_hybrid) {
         auto result = Qwen35Backend::restore_and_generate_impl(slot, req, io);
-        if (result.ok) maybe_post_request_swap();
+        if (result.ok()) maybe_post_request_swap();
         return result;
     }
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     if (slot < 0 || !snapshot_used(slot)) {
-        result.error = "bad slot";
+        result.fail(GenerateErrorCode::InvalidSnapshotSlot);
         out_io.emit(-1);
         return result;
     }
@@ -1335,14 +1464,18 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
         return generate_impl(req, io);
     }
 
-    pipe_state_.reset();
+    if (pipe_state_) {
+        pipe_state_->reset_request_graphs();
+    }
     for (auto & layer : target_weights().moe_hybrid->layers) {
         layer.hot_graph.free();
         layer.cold_graph.free();
+        layer.hot_batched_graph.free();
+        layer.shared_batched_graph.free();
     }
 
     if (!restore_target_cache_from_snapshot(slot)) {
-        result.error = "restore";
+        result.fail(GenerateErrorCode::BackendSpecific, "restore");
         out_io.emit(-1);
         return result;
     }
@@ -1353,7 +1486,8 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
 
     const int prompt_len = (int)req.prompt.size();
     if (prompt_len > 0 && prompt_len < snap_pos) {
-        result.error = "snapshot_longer_than_prompt";
+        result.fail(GenerateErrorCode::BackendSpecific,
+                         "snapshot_longer_than_prompt");
         out_io.emit(-1);
         return result;
     }
@@ -1366,7 +1500,7 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
         std::fprintf(stderr,
             "[kvflash] hybrid restore prompt (%d) exceeds pool %d; raise "
             "--kvflash\n", prompt_len, kvflash_tokens_);
-        result.error = "kvflash: prompt exceeds resident pool";
+        result.fail(GenerateErrorCode::ContextOverflow);
         out_io.emit(-1);
         return result;
     }
@@ -1377,7 +1511,7 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
     if (kvflash_active()) {
         kvflash_pager_.reset();
         if (!kvflash_pager_.alloc_span(0, snap_pos)) {
-            result.error = "kvflash_slot";
+            result.fail(GenerateErrorCode::BackendSpecific, "kvflash_slot");
             out_io.emit(-1);
             return result;
         }
@@ -1392,7 +1526,7 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
             int32_t argmax = -1;
             if (!hybrid_forward_one_token(req.prompt[(size_t)i], committed,
                                           act_cur, argmax)) {
-                result.error = "prefill_delta";
+                result.fail(GenerateErrorCode::BackendSpecific, "prefill_delta");
                 return result;
             }
             committed++;
@@ -1422,15 +1556,15 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
         }
         auto t_decode_start = std::chrono::steady_clock::now();
         if (!run_pipelined_decode_path(committed, req.n_gen, result.tokens, out_io)) {
-            result.error = "decode";
+            result.fail(GenerateErrorCode::DecodeFailed);
             return result;
         }
         result.decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
 
-    result.ok = true;
-    if (result.ok) maybe_post_request_swap();
+    result.succeed();
+    if (result.ok()) maybe_post_request_swap();
     return result;
 }
 
@@ -1452,33 +1586,20 @@ bool Qwen35MoeBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
     ggml_backend_tensor_set_async(target_backend(), pipe_state_->gpu_state.act_cur, act_cur.data(), 0,
                             sizeof(float) * (size_t)hidden);
 
-    // Run pipelined decode (all 40 layers with cached DeltaNet + hot/cold FFN)
+    // Run pipelined decode (all 40 layers with cached DeltaNet + hot/MoE expert compute)
     if (!pipelined_decode_one_token(*pipe_state_, target_backend(), target_weights(),
                                     target_cache(), *target_weights().moe_hybrid,
-                                    kv_pos, cfg_.kq_stride_pad, nullptr)) {
+                                    kv_pos, cfg_.kq_stride_pad, nullptr,
+                                    /*kv_slot=*/-1,
+                                    /*capture_layers=*/true,
+                                    routing_stats_.get())) {
         return false;
     }
 
-    // Read back act_cur for feature capture + logits
+    // Read back final hidden for logits. Per-layer DFlash features are captured
+    // inside pipelined_decode_one_token() at their actual capture layers.
     ggml_backend_tensor_get(pipe_state_->gpu_state.act_cur, act_cur.data(), 0,
                             sizeof(float) * (size_t)hidden);
-
-    // Feature capture: write act_cur (F32) → cache_.target_feat (BF16)
-    if (target_cache().target_feat) {
-        const int cap = target_cache().target_feat_cap;
-        const int slot = kv_pos % cap;
-        const size_t elt = ggml_element_size(target_cache().target_feat);
-        const size_t col_stride = target_cache().target_feat->nb[1];
-        // Convert once — all capture layers store the same final hidden state
-        std::vector<ggml_bf16_t> bf16_buf((size_t)hidden);
-        ggml_fp32_to_bf16_row(act_cur.data(), bf16_buf.data(), hidden);
-        for (int k = 0; k < target_weights().n_capture_layers; k++) {
-            const size_t offset = (size_t)slot * col_stride +
-                                  (size_t)k * (size_t)hidden * elt;
-            ggml_backend_tensor_set(target_cache().target_feat, bf16_buf.data(),
-                                     offset, (size_t)hidden * elt);
-        }
-    }
 
     // Project to logits and get argmax
     const int vocab = target_weights().n_vocab;
@@ -1720,12 +1841,17 @@ bool Qwen35MoeBackend::hybrid_forward_batch(
                 chunk_post.data(), chunk_selected.data(), chunk_weights.data(),
                 n_tokens, ffn_batch_out, nullptr, &ffn_hot_alloc);
         } else {
-            // Cache full / residue still cold: hybrid path (remaining cold on CPU).
+            // Mixed hot/cold: use hybrid path.
+            MoeExpertCompute * expert_compute =
+                pipe_state_ ? pipe_state_->expert_runtime.compute_ptr() : nullptr;
+            const MoeExpertLayer * expert_layer =
+                pipe_state_ ? pipe_state_->expert_runtime.layer_ptr((size_t)il) : nullptr;
             ffn_ok = eval_moe_hybrid_ffn_batched(
                 target_backend(), target_weights().moe_hybrid->cpu_backend,
                 chunk_cfg, chunk_desc, storage,
                 chunk_post.data(), chunk_selected.data(), chunk_weights.data(),
-                n_tokens, ffn_batch_out, nullptr, &ffn_hot_alloc, nullptr);
+                n_tokens, ffn_batch_out, nullptr, &ffn_hot_alloc, nullptr,
+                expert_compute, expert_layer);
         }
 
         if (!ffn_ok) {
@@ -1816,6 +1942,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
                                               std::vector<int32_t> & out_tokens,
                                               const DaemonIO & io,
                                               float * accept_rate_out) {
+    if (accept_rate_out) *accept_rate_out = 0.0f;
     const int hidden = target_weights().n_embd;
     const int q_len = draft_weights().block_size;
     if (q_len <= 0) return false;
@@ -2025,6 +2152,27 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         n_generated += emitted;
         n_accept_sum += std::min(accept_n, emitted);
         n_draft_steps++;
+        const int fallback_steps = hybrid_spec_min_steps_before_ar();
+        if (!io.cancelled && !hit_eos && fallback_steps > 0 &&
+            n_draft_steps >= fallback_steps && n_generated < n_gen) {
+            const int total_draft_pos_so_far = std::max(1, n_draft_steps * q_len);
+            const float accept_rate_value =
+                (float)((double)n_accept_sum / (double)total_draft_pos_so_far);
+            const float min_accept = hybrid_spec_min_accept_rate();
+            if (accept_rate_value < min_accept) {
+                const int ar_n_gen = n_gen - n_generated;
+                std::fprintf(stderr,
+                    "[hybrid-spec] accept_rate=%.3f below %.3f after %d step(s); "
+                    "switching remaining %d token(s) to AR\n",
+                    accept_rate_value, min_accept, n_draft_steps, ar_n_gen);
+                step_graph_destroy(draft_sg);
+                target_cache().last_tok = last_tok;
+                const bool ok = run_pipelined_decode_path(
+                    committed, ar_n_gen, out_tokens, io);
+                io.emit(-1);
+                return ok;
+            }
+        }
         if (io.cancelled) break;
         if (hit_eos) break;
     }
@@ -2129,10 +2277,22 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
     int max_context = ctx_env ? std::atoi(ctx_env) : cfg_.device.max_ctx;
     if (max_context <= 0) max_context = 8192;
 
-    // KV cache: n_layer × 2 (K+V) × n_head_kv × head_dim × sizeof(fp16) × max_context
-    const uint64_t kv_bytes_per_tok = (uint64_t)w.n_layer * 2 *
-        (uint64_t)w.n_head_kv * (uint64_t)w.n_embd_head_k * 2;
-    const uint64_t kv_total = kv_bytes_per_tok * (uint64_t)max_context;
+    // KV reservation: only full-attention layers carry KV (the rest are O(1)-state
+    // SSM/DeltaNet), and honor the resolved cache type. The old n_layer × hardcoded
+    // -f16 form over-reserved ~14× at deep ctx (25 GiB vs 1.76 GiB @131K), forcing
+    // experts cold → the slow hybrid spec path. Shared helper / single source of
+    // truth with the dense backend — see kv_quant.h.
+    ggml_type kv_k_t = GGML_TYPE_Q8_0, kv_v_t = GGML_TYPE_Q8_0;
+    dflash::resolve_kv_types(kv_k_t, kv_v_t);
+    const uint64_t kv_bytes_per_tok = dflash::kv_reservation_bytes_per_token(
+        w.n_layer, w.full_attention_interval, w.n_head_kv,
+        kv_k_t, w.n_embd_head_k, kv_v_t, w.n_embd_head_v);
+    // Size the reservation with the SAME inputs runtime uses (scorer policy +
+    // VRAM budget); the bare-max_context call took the no-budget fallback
+    // (max_ctx/2) and over-reserved KV, starving experts of hot placement.
+    const int      kvf_pool      = kvflash_pool_from_env(
+        max_context, KvFlashConfig{}, kvflash_scorer_expected(),
+        make_kvflash_budget(w, (int64_t)gpu_free));
 
     const uint64_t warm_cache_bytes = 200ULL * 1024 * 1024;  // 200 MB warm/staging
     uint64_t safety_bytes = 512ULL * 1024 * 1024;      // 512 MB safety margin
@@ -2145,8 +2305,27 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
         safety_bytes = 256ULL * 1024 * 1024;  // can reduce safety when draft accounts for it
     }
 
-    // Core model bytes = what's already used on GPU (non-expert tensors)
-    const uint64_t core_bytes = gpu_total - gpu_free;
+    // Core model bytes = what's already used on GPU (non-expert tensors).
+    const uint64_t core_bytes =
+        moe_hybrid_core_bytes_from_memory("qwen35moe", gpu_free, gpu_total);
+
+    // KVFlash reserves a fixed resident pool, not max_ctx, of KV.  When active
+    // and the full reservation would force experts cold, reserve for the pool so
+    // experts stay hot (decouples max_ctx from the expert-placement cliff).  The
+    // rule is centralised in kvflash_placement_decision() so future MoE backends
+    // (DeepSeek-V4, ...) inherit it instead of re-deriving the byte math.
+    const auto kvf_dec = dflash::common::kvflash_placement_decision(
+        kv_bytes_per_tok, max_context, kvf_pool,
+        gpu_total, core_bytes, total_expert_bytes,
+        warm_cache_bytes, safety_bytes, draft_reserve_bytes);
+    const uint64_t kv_total   = kvf_dec.kv_total;
+    const int      kv_ctx_log = kvf_dec.kv_ctx;
+    placement_all_hot_full_kv_ = kvf_dec.all_hot_full_kv;
+    if (kvf_dec.pool_reduced) {
+        std::printf("[kvflash] placement reserves pool KV (%d tokens, not max_ctx %d) "
+                    "-> experts stay hot\n", kvf_pool, max_context);
+        std::fflush(stdout);
+    }
 
     uint64_t expert_budget = 0;
     if (gpu_total > core_bytes + kv_total + warm_cache_bytes + safety_bytes + draft_reserve_bytes) {
@@ -2186,7 +2365,7 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
                 gpu_total / 1024.0 / 1024.0 / 1024.0,
                 core_bytes / 1024.0 / 1024.0 / 1024.0,
                 kv_total / 1024.0 / 1024.0 / 1024.0,
-                max_context,
+                kv_ctx_log,
                 warm_cache_bytes / 1024.0 / 1024.0,
                 safety_bytes / 1024.0 / 1024.0,
                 expert_budget / 1024.0 / 1024.0 / 1024.0,

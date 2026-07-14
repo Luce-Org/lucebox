@@ -43,6 +43,77 @@ std::vector<LayerSplitRange> compute_layer_ranges(
     return ranges;
 }
 
+bool compute_mixed_layer_split_plan(
+        const DevicePlacement & device,
+        PlacementBackend local_backend,
+        MixedLayerSplitPlan & out,
+        const char * log_prefix) {
+    const char * prefix = log_prefix ? log_prefix : "target-split";
+    out = MixedLayerSplitPlan{};
+    if (!device.is_mixed_layer_split() || device.layer_split_gpus.size() < 2) {
+        std::fprintf(stderr, "[%s] mixed layer split requires at least two shards\n",
+                     prefix);
+        return false;
+    }
+    if (device.layer_split_backend(0) != local_backend) {
+        std::fprintf(stderr,
+            "[%s] first mixed shard must match compiled backend (%s)\n",
+            prefix, placement_backend_name(local_backend));
+        return false;
+    }
+    size_t remote_begin = 0;
+    while (remote_begin < device.layer_split_gpus.size() &&
+           device.layer_split_backend(remote_begin) == local_backend) {
+        ++remote_begin;
+    }
+    if (remote_begin == 0 || remote_begin >= device.layer_split_gpus.size()) {
+        std::fprintf(stderr,
+            "[%s] mixed layer split requires one local backend group followed by "
+            "one remote backend group\n", prefix);
+        return false;
+    }
+    const PlacementBackend remote_backend =
+        device.layer_split_backend(remote_begin);
+    for (size_t i = remote_begin; i < device.layer_split_gpus.size(); ++i) {
+        if (device.layer_split_backend(i) != remote_backend) {
+            std::fprintf(stderr,
+                "[%s] mixed layer split supports only one backend boundary\n",
+                prefix);
+            return false;
+        }
+    }
+    out.remote_begin = remote_begin;
+    out.remote_backend = remote_backend;
+    return true;
+}
+
+bool compute_target_shard_layer_split_plan(
+        const DevicePlacement & device,
+        PlacementBackend local_backend,
+        MixedLayerSplitPlan & out,
+        const char * log_prefix) {
+    const char * prefix = log_prefix ? log_prefix : "target-split";
+    out = MixedLayerSplitPlan{};
+    if (!device.is_layer_split() || device.layer_split_gpus.size() < 2) {
+        std::fprintf(stderr,
+            "[%s] target-shard layer split requires at least two shards\n",
+            prefix);
+        return false;
+    }
+    if (device.layer_split_backend(0) != local_backend) {
+        std::fprintf(stderr,
+            "[%s] first target-shard split shard must match compiled backend (%s)\n",
+            prefix, placement_backend_name(local_backend));
+        return false;
+    }
+    if (device.is_mixed_layer_split()) {
+        return compute_mixed_layer_split_plan(device, local_backend, out, prefix);
+    }
+    out.remote_begin = 1;
+    out.remote_backend = local_backend;
+    return true;
+}
+
 bool init_layer_split_shard_metas(
         std::vector<LayerSplitShardMeta *> shards,
         const std::vector<int> & gpus,

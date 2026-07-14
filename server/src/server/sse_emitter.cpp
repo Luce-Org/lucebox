@@ -16,11 +16,26 @@ static const char THINK_CLOSE[] = "</think>";
 static const char TOOL_OPEN[]   = "<tool_call>";
 static const char FUNCTION_OPEN[] = "<function=";
 static const char TOOL_CODE_OPEN[] = "<tool_code>";
+// Laguna emits `NAME<arg_key>K</arg_key><arg_value>V</arg_value>` with the
+// <tool_call> wrapper as special tokens that detokenization strips, so the
+// visible trigger is <arg_key> and the tool name sits immediately before it.
+static const char ARG_KEY_OPEN[] = "<arg_key>";
 static constexpr size_t THINK_OPEN_LEN  = 7;
 static constexpr size_t THINK_CLOSE_LEN = 8;
 
 static bool has_request_tools(const json & tools) {
     return tools.is_array() && !tools.empty();
+}
+
+static bool has_single_request_tool(const json & tools) {
+    return tools.is_array() && tools.size() == 1 && tools[0].is_object();
+}
+
+static bool starts_with_potential_bare_json_tool(const std::string & text,
+                                                 const json & tools) {
+    if (!has_single_request_tool(tools)) return false;
+    size_t first = text.find_first_not_of(" \t\n\r");
+    return first != std::string::npos && text[first] == '{';
 }
 
 static bool find_tool_start(const std::string & text, size_t & pos) {
@@ -31,6 +46,20 @@ static bool find_tool_start(const std::string & text, size_t & pos) {
             text.compare(idx, sizeof(TOOL_CODE_OPEN) - 1, TOOL_CODE_OPEN) == 0) {
             pos = idx;
             return true;
+        }
+        if (text.compare(idx, sizeof(ARG_KEY_OPEN) - 1, ARG_KEY_OPEN) == 0) {
+            // Rewind over the tool name so it lands in the tool buffer
+            // (the parser extracts it from just before <arg_key>).
+            size_t start = idx;
+            auto is_ident = [](char c) {
+                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                       (c >= '0' && c <= '9') || c == '_' || c == '-';
+            };
+            while (start > 0 && is_ident(text[start - 1])) start--;
+            if (start < idx) {  // require a non-empty name
+                pos = start;
+                return true;
+            }
         }
         idx = text.find('<', idx + 1);
     }
@@ -76,15 +105,16 @@ SseEmitter::SseEmitter(ApiFormat format,
                        int prompt_tokens,
                        const json & tools,
                        ToolMemory * tool_memory,
-                       const std::vector<std::string> & stop_sequences)
+                       const std::vector<std::string> & stop_sequences,
+                       bool started_in_thinking)
     : format_(format)
     , request_id_(request_id)
     , model_name_(model_name)
     , prompt_tokens_(prompt_tokens)
     , tools_(tools)
     , tool_memory_(tool_memory)
-    , mode_(StreamMode::CONTENT)
-    , active_kind_("text")
+    , mode_(started_in_thinking ? StreamMode::REASONING : StreamMode::CONTENT)
+    , active_kind_(started_in_thinking ? "thinking" : "text")
     , stop_sequences_(stop_sequences)
     , created_at_(unix_timestamp())
     , msg_item_id_(gen_item_id())
@@ -417,9 +447,33 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
             continue;
         }
 
+        if (accumulated_content_.find_first_not_of(" \t\n\r") == std::string::npos &&
+            starts_with_potential_bare_json_tool(window_, tools_)) {
+            tool_buffer_ = window_;
+            tool_buffer_fallback_to_content_ = true;
+            window_.clear();
+            mode_ = StreamMode::TOOL_BUFFER;
+            continue;
+        }
+
         // No tags found — emit safe prefix
         if (window_.size() > std::max(BASE_HOLDBACK, stop_holdback_)) {
             size_t cut = utf8_safe_len(window_, window_.size() - std::max(BASE_HOLDBACK, stop_holdback_));
+            // When tools are declared, a trailing identifier run may be a
+            // Laguna tool name whose <arg_key> has not streamed in yet (the
+            // <tool_call> wrapper is a stripped special token). Hold it back
+            // (bounded to 64 chars, the OpenAI function-name limit) so the
+            // name is still in the window when the trigger fires.
+            if (cut > 0 && has_request_tools(tools_)) {
+                auto is_ident = [](char c) {
+                    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                           (c >= '0' && c <= '9') || c == '_' || c == '-';
+                };
+                size_t name_hold = cut;
+                while (name_hold > 0 && cut - name_hold < 64 &&
+                       is_ident(window_[name_hold - 1])) name_hold--;
+                if (cut - name_hold < 64) cut = name_hold;
+            }
             if (cut > 0) {
                 std::string safe = window_.substr(0, cut);
                 accumulated_content_ += safe;
@@ -493,8 +547,43 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         default: break;
         }
     } else if (mode_ == StreamMode::CONTENT && !window_.empty()) {
-        accumulated_content_ += window_;
-        emit_content_delta(out, window_);
+        // Zero-argument Laguna calls in the stripped form are just the bare
+        // declared tool name at end of output (the <tool_call> wrapper is
+        // special tokens the detokenizer removed, and with no <arg_key> there
+        // is no trigger). If the output ENDS on exactly a declared tool name,
+        // treat it as a zero-arg call instead of trailing prose.
+        bool zero_arg_call = false;
+        if (has_request_tools(tools_)) {
+            auto is_ident = [](char c) {
+                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                       (c >= '0' && c <= '9') || c == '_' || c == '-';
+            };
+            size_t name_start = window_.size();
+            while (name_start > 0 && is_ident(window_[name_start - 1])) name_start--;
+            const std::string tail = window_.substr(name_start);
+            if (!tail.empty()) {
+                for (const auto & t : tools_) {
+                    if (t.contains("function") && t["function"].value("name", "") == tail) {
+                        std::string pre = window_.substr(0, name_start);
+                        if (!pre.empty()) {
+                            accumulated_content_ += pre;
+                            emit_content_delta(out, pre);
+                        }
+                        // Re-wrap in the canonical form the parser's wrapped
+                        // path accepts (it emits name-only bodies as
+                        // zero-argument calls).
+                        tool_buffer_ = "<tool_call>" + tail + "</tool_call>";
+                        mode_ = StreamMode::TOOL_BUFFER;
+                        zero_arg_call = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!zero_arg_call) {
+            accumulated_content_ += window_;
+            emit_content_delta(out, window_);
+        }
     } else if (mode_ == StreamMode::TOOL_BUFFER) {
         tool_buffer_ += window_;
     }
@@ -600,6 +689,9 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                 break;
             default: break;
             }
+        } else if (tool_buffer_fallback_to_content_) {
+            accumulated_content_ += tool_buffer_;
+            emit_content_delta(out, tool_buffer_);
         } else {
             // Tool syntax was detected but no valid call parsed. Do not leak
             // malformed/incomplete XML back to the user as assistant text.

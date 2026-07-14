@@ -11,12 +11,14 @@
 #pragma once
 
 #include "model_backend.h"
+#include "internal.h"
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
 #include "placement/remote_target_shard_config.h"
 
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace dflash::common {
 
@@ -54,6 +56,7 @@ struct BackendArgs {
     int             ddtree_budget    = 22;
     float           ddtree_temp      = 1.0f;
     bool            ddtree_chain_seed = true;
+    int             verify_width     = 0;  // chain spec verify width; 0 = adaptive
     bool            use_feature_mirror = false;
 };
 

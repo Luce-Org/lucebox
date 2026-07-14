@@ -45,6 +45,7 @@ static const char QWEN3_TOOL_SUFFIX[] =
     "</IMPORTANT>";
 
 ChatFormat chat_format_for_arch(const std::string & arch) {
+    if (arch == "deepseek4") return ChatFormat::DEEPSEEK4;
     if (arch == "laguna") return ChatFormat::LAGUNA;
     if (arch == "gemma4") return ChatFormat::GEMMA4;
     // qwen35, qwen3 use the Qwen3/ChatML format
@@ -190,7 +191,47 @@ std::string render_chat_template(
         if (!system_content.empty() || has_tools) {
             result += "<system>\n";
             if (!system_content.empty()) result += system_content;
-            (void)tools_json;  // TODO: tools block per upstream template
+            if (has_tools) {
+                // Tools block per the upstream template: each tool schema as
+                // raw JSON inside <available_tools>, then the calling
+                // instruction with the <tool_call>/<arg_key>/<arg_value>
+                // example (thinking and non-thinking variants).
+                result += "\n\n### Tools\n\n"
+                          "You may call functions to assist with the user query.\n"
+                          "All available function signatures are listed below:\n"
+                          "<available_tools>\n";
+                try {
+                    const nlohmann::json tools = nlohmann::json::parse(tools_json);
+                    for (const auto & t : tools) {
+                        result += t.dump();
+                        result += "\n";
+                    }
+                } catch (const std::exception &) {
+                    result += tools_json;
+                    result += "\n";
+                }
+                result += "</available_tools>\n\n";
+                if (enable_thinking) {
+                    result += "Wrap your thinking in '<think>', '</think>' tags, "
+                              "followed by a function call. For each function call, "
+                              "return an unescaped XML-like object with function name "
+                              "and arguments within '<tool_call>' and '</tool_call>' "
+                              "tags, like here:\n"
+                              "<think> your thoughts here </think>\n"
+                              "<tool_call>function-name\n"
+                              "<arg_key>argument-key</arg_key>\n"
+                              "<arg_value>value-of-argument-key</arg_value>\n"
+                              "</tool_call>";
+                } else {
+                    result += "For each function call, return an unescaped XML-like "
+                              "object with function name and arguments within "
+                              "'<tool_call>' and '</tool_call>' tags, like here:\n"
+                              "<tool_call>function-name\n"
+                              "<arg_key>argument-key</arg_key>\n"
+                              "<arg_value>value-of-argument-key</arg_value>\n"
+                              "</tool_call>";
+                }
+            }
             result += "\n</system>\n";
         }
 
@@ -310,6 +351,65 @@ std::string render_chat_template(
                 // template's "if not enable_thinking" branch.
                 result += "<|channel>thought\n<channel|>";
             }
+        }
+        break;
+    }
+
+    case ChatFormat::DEEPSEEK4: {
+        // DeepSeek V4 Flash DSML renderer, matching the ds4 reference server:
+        //   <｜begin▁of▁sentence｜>{system}<｜User｜>{user}<｜Assistant｜></think>
+        // Completed assistant turns are terminated with <｜end▁of▁sentence｜>.
+        bool has_system = false;
+        std::string system_content;
+        for (const auto & msg : messages) {
+            if (msg.role != "system") continue;
+            if (!system_content.empty()) system_content += "\n\n";
+            system_content += msg.content;
+            has_system = true;
+        }
+
+        result = "<｜begin▁of▁sentence｜>";
+        if (has_tools) {
+            // Tool schema rendering is not implemented for the native DSML
+            // path yet; keep the JSON visible in the system prefix rather than
+            // silently dropping it.
+            result += tools_json;
+            if (has_system) result += "\n\n";
+        }
+        result += system_content;
+
+        bool pending_assistant = false;
+        bool pending_tool_result = false;
+        for (const auto & msg : messages) {
+            if (msg.role == "system") {
+                continue;
+            } else if (msg.role == "user") {
+                result += "<｜User｜>";
+                result += msg.content;
+                pending_assistant = true;
+                pending_tool_result = false;
+            } else if (msg.role == "tool" || msg.role == "function") {
+                if (!pending_tool_result) result += "<｜User｜>";
+                result += "<tool_result>";
+                result += msg.content;
+                result += "</tool_result>";
+                pending_assistant = true;
+                pending_tool_result = true;
+            } else if (msg.role == "assistant") {
+                if (pending_assistant) {
+                    result += "<｜Assistant｜>";
+                    result += enable_thinking ? "<think>" : "</think>";
+                }
+                result += msg.content;
+                result += "<｜end▁of▁sentence｜>";
+                pending_assistant = false;
+                pending_tool_result = false;
+            }
+        }
+
+        if (add_generation_prompt) {
+            result += "<｜Assistant｜>";
+            result += enable_thinking ? "<think>" : "</think>";
         }
         break;
     }

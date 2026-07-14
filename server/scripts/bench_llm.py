@@ -41,7 +41,12 @@ TMPDIR.mkdir(parents=True, exist_ok=True)
 
 N_GEN = 256
 BUDGET = 22  # default; overridden by --budget CLI arg
-N_SAMPLE = 10
+N_SAMPLE = int(os.environ.get("DFLASH_N_SAMPLE", "10"))
+# Optional sampler tail for the DFlash run, "temp,top_p,top_k,rep_pen,seed[,freq,pres]".
+# When set, exercises the sample_logits chain (and its GPU port, on by default,
+# opt out with DFLASH_GPU_SAMPLE=0) instead of the default greedy path. AR
+# (test_generate) is greedy-only and ignores this.
+SAMP = os.environ.get("DFLASH_SAMP", "").strip()
 
 def _gsm_gold(x):
     """Extract numeric answer after #### from GSM8K answer field."""
@@ -137,22 +142,21 @@ def _auto_max_ctx(n_prompt, n_gen: int = N_GEN):
 def run_df(path: Path, n_prompt, n_gen: int = N_GEN):
     max_ctx = _auto_max_ctx(n_prompt, n_gen)
     out_bin = TMPDIR / f"df_out.bin"
-    r = _run_checked(
-        [
-            TEST_DFLASH,
-            TARGET,
-            DRAFT,
-            str(path),
-            str(n_gen),
-            str(out_bin),
-            "--fast-rollback",
-            "--ddtree",
-            f"--ddtree-budget={BUDGET}",
-            f"--max-ctx={max_ctx}",
-        ],
-        timeout=300,
-        label="test_dflash",
-    )
+    cmd = [
+        TEST_DFLASH,
+        TARGET,
+        DRAFT,
+        str(path),
+        str(n_gen),
+        str(out_bin),
+        "--fast-rollback",
+        "--ddtree",
+        f"--ddtree-budget={BUDGET}",
+        f"--max-ctx={max_ctx}",
+    ]
+    if SAMP:
+        cmd.append(f"--samp={SAMP}")
+    r = _run_checked(cmd, timeout=300, label="test_dflash")
     tps = re.search(r"(\d+(?:\.\d+)?)\s+tok/s", r.stdout)
     al = re.search(r"avg commit/step=(\d+(?:\.\d+)?)", r.stdout)
     if not (tps and al):
