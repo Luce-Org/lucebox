@@ -690,6 +690,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    // Memo entries own allocations from pools that are destroyed before the
+    // memo vector by member destruction order. Release them while the pools
+    // are still alive, preserving the LIFO discipline required by VMM pools.
+    while (!luce_q8_memo.empty()) {
+        luce_q8_memo.pop_back();
+    }
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
