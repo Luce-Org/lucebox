@@ -1698,15 +1698,24 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     if (mmid_telemetry && ids) {
-        const char * reason = ncols_dst < 2 ? "width_lt_2" :
-            ncols_dst > MMVQ_MAX_MOE_BATCH_SIZE ? "width_gt_16" :
-            (int) (nchannels_dst*ncols_dst) > MMID_GROUPED_MAX_PAIRS ? "pairs_gt_256" :
-            !mmid_grouped_env() ? "flag_off" :
-            !mmid_grouped_type_ok(src0->type) ? "unsupported_type" : "dispatch_rejected";
-        std::fprintf(stderr,
-            "[dflash-mmid] event=mmvq type=%s width=%lld pairs=%lld variant=legacy_moe reason=%s\n",
-            ggml_type_name(src0->type), (long long) ncols_dst,
-            (long long) (nchannels_dst*ncols_dst), reason);
+        if (ncols_dst < 2) {
+            // Single-token MUL_MAT_ID: the ordinary single-column MMVQ case, not
+            // the multi-token legacy MoE launch the grouped path falls back to.
+            std::fprintf(stderr,
+                "[dflash-mmid] event=mmvq type=%s width=%lld pairs=%lld variant=single\n",
+                ggml_type_name(src0->type), (long long) ncols_dst,
+                (long long) (nchannels_dst*ncols_dst));
+        } else {
+            const char * reason =
+                ncols_dst > MMVQ_MAX_MOE_BATCH_SIZE ? "width_gt_16" :
+                (int) (nchannels_dst*ncols_dst) > MMID_GROUPED_MAX_PAIRS ? "pairs_gt_256" :
+                !mmid_grouped_env() ? "flag_off" :
+                !mmid_grouped_type_ok(src0->type) ? "unsupported_type" : "dispatch_rejected";
+            std::fprintf(stderr,
+                "[dflash-mmid] event=mmvq type=%s width=%lld pairs=%lld variant=legacy_moe reason=%s\n",
+                ggml_type_name(src0->type), (long long) ncols_dst,
+                (long long) (nchannels_dst*ncols_dst), reason);
+        }
     }
 
     mul_mat_vec_q_switch_type(

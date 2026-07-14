@@ -3228,7 +3228,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-            const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
+            // Non-quantized nodes never take the MMVQ path, so report a 0 ceiling
+            // instead of the type-independent value get_mmvq_mmid_max_batch returns.
+            const int mmvq_mmid_max = ggml_is_quantized(node->src[0]->type)
+                ? get_mmvq_mmid_max_batch(node->src[0]->type, cc) : 0;
             // Mirror ggml_cuda_mul_mat_id: the MMVQ and MMQ mul_mat_id paths
             // are stream-sync-free and safe to capture; only the sort-based
             // fallback requires a stream synchronize.
