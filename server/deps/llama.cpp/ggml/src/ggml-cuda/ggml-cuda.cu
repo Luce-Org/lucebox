@@ -3209,6 +3209,10 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
+    static const bool mmid_telemetry = []() {
+        const char * value = std::getenv("DFLASH_MMID_TELEMETRY");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -3241,10 +3245,6 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             const bool mmid_mmq_ok = ggml_is_quantized(node->src[0]->type) &&
                 ggml_cuda_should_use_mmq(node->src[0]->type, cc,
                                          node->src[1]->ne[2], node->src[0]->ne[2]);
-            static const bool mmid_telemetry = []() {
-                const char * value = std::getenv("DFLASH_MMID_TELEMETRY");
-                return value != nullptr && std::strcmp(value, "0") != 0;
-            }();
             if (mmid_telemetry) {
                 std::fprintf(stderr,
                     "[dflash-mmid] event=graph name=%s type=%s ne11=%lld width=%lld "
@@ -3265,7 +3265,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             }
         }
 
-        if (!use_cuda_graph) {
+        // With telemetry on, keep scanning so event=graph is emitted for every
+        // MUL_MAT_ID node; the early exit is only a performance shortcut.
+        if (!use_cuda_graph && !mmid_telemetry) {
             break;
         }
     }

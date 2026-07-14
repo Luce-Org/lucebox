@@ -1706,15 +1706,29 @@ void ggml_cuda_mul_mat_vec_q(
                 ggml_type_name(src0->type), (long long) ncols_dst,
                 (long long) (nchannels_dst*ncols_dst));
         } else {
+            // Name the kernel mul_mat_vec_q_switch_type will actually run for this
+            // ungrouped multi-token batch, so the label is not misreported when the
+            // tokenwise or generic MMVQ modes are selected by env.
+            static const bool tokenwise_mmid = []() {
+                const char * e = std::getenv("DFLASH_CUDA_MMVQ_MOE_TOKENWISE");
+                return e && e[0] == '1' && e[1] == '\0';
+            }();
+            static const bool moe_kernel = []() {
+                const char * e = std::getenv("DFLASH_CUDA_MMVQ_MOE_KERNEL");
+                return !(e && e[0] == '0' && e[1] == '\0');
+            }();
+            const char * variant =
+                tokenwise_mmid ? "tokenwise" :
+                (moe_kernel || ncols_dst > MMVQ_MAX_BATCH_SIZE) ? "moe" : "generic";
             const char * reason =
                 ncols_dst > MMVQ_MAX_MOE_BATCH_SIZE ? "width_gt_16" :
                 (int) (nchannels_dst*ncols_dst) > MMID_GROUPED_MAX_PAIRS ? "pairs_gt_256" :
                 !mmid_grouped_env() ? "flag_off" :
                 !mmid_grouped_type_ok(src0->type) ? "unsupported_type" : "dispatch_rejected";
             std::fprintf(stderr,
-                "[dflash-mmid] event=mmvq type=%s width=%lld pairs=%lld variant=legacy_moe reason=%s\n",
+                "[dflash-mmid] event=mmvq type=%s width=%lld pairs=%lld variant=%s reason=%s\n",
                 ggml_type_name(src0->type), (long long) ncols_dst,
-                (long long) (nchannels_dst*ncols_dst), reason);
+                (long long) (nchannels_dst*ncols_dst), variant, reason);
         }
     }
 
