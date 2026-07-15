@@ -335,6 +335,40 @@ static void test_parse_bare_function_xml() {
     }
 }
 
+static void test_parse_bare_tool_name_xml_with_function_close() {
+    std::string text =
+        "\n\n\nLet me find the correct line range for the tests array.\n\n\n"
+        "<bash>\n"
+        "<parameter=command>\n"
+        "grep -n \"f5.test\" /workspace/project/tests/bootstrap.cjs\n"
+        "</parameter>\n"
+        "</function>\n";
+    json tools = json::array({
+        {{"type", "function"},
+         {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] ==
+                    "grep -n \"f5.test\" /workspace/project/tests/bootstrap.cjs");
+    }
+    TEST_ASSERT(result.cleaned_text.find("<bash>") == std::string::npos);
+    TEST_ASSERT(result.cleaned_text.find("</function>") == std::string::npos);
+    TEST_ASSERT(result.cleaned_text.find("Let me find the correct line range") !=
+                std::string::npos);
+}
+
 static void test_parse_json_tool_call() {
     std::string text =
         "{\"name\": \"search\", \"arguments\": {\"query\": \"hello world\"}}";
@@ -4423,6 +4457,7 @@ int main() {
     std::fprintf(stderr, "\n── Tool parser ──\n");
     RUN_TEST(test_parse_tool_call_xml);
     RUN_TEST(test_parse_bare_function_xml);
+    RUN_TEST(test_parse_bare_tool_name_xml_with_function_close);
     RUN_TEST(test_parse_json_tool_call);
     RUN_TEST(test_parse_single_tool_bare_json_args);
     RUN_TEST(test_parse_single_tool_bare_json_args_allows_empty_optional_object);
