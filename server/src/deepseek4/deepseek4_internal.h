@@ -323,6 +323,16 @@ bool deepseek4_step(
     DeepSeek4StepTelemetry *    telemetry = nullptr,
     MoeHybridRoutingStats *     routing_stats = nullptr);
 
+// Optional hooks for the DSpark spec-decode batched verify (deepseek4_dspark).
+// When set on a multi-token deepseek4_step_layer_range call they add: per-layer
+// mean-over-HC feature capture and full per-position logits. Null on the normal
+// (23 tok/s) decode path so it is completely unaffected.
+struct Ds4VerifyHooks {
+    const std::vector<int> * capture_layer_ids = nullptr;  // e.g. {40,41,42}
+    std::vector<float> *     capture_out = nullptr;         // [n_cap*n_embd * n_tokens]
+    std::vector<float> *     all_logits_out = nullptr;      // [n_vocab * n_tokens]
+};
+
 bool deepseek4_step_layer_range(
     ggml_backend_t              backend,
     const DeepSeek4Weights &    w,
@@ -336,7 +346,8 @@ bool deepseek4_step_layer_range(
     std::vector<float> *        out_logits,
     const int32_t *             token_ids = nullptr,
     DeepSeek4StepTelemetry *    telemetry = nullptr,
-    bool                        allow_decode_graph_reuse = true);
+    bool                        allow_decode_graph_reuse = true,
+    Ds4VerifyHooks *            verify_hooks = nullptr);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,

@@ -110,6 +110,69 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 
 DeepSeek4 no longer uses the old expert-split environment variables or expert-worker tuning knobs. Those retired knobs were removed from the codebase rather than left behind as unsupported debug switches.
 
+## DSpark Speculative Decode
+
+DeepSeek4 uses the shared DFlash DSpark head implementation together with a
+DeepSeek4-specific three-layer drafter and fused target verification. The draft
+GGUF carries its auxiliary projections under the existing `dflash.dspark.*`
+tensor contract. DeepSeek4/MTP checkpoints store compatible heads under the
+`mtp.2.*` namespace, which the converter maps as follows.
+
+Supported DeepSeek4/MTP input tensors:
+
+| DeepSeek4/MTP tensor | GGUF tensor |
+|----------------------|-------------|
+| `mtp.2.markov_head.markov_w1.weight` | `dflash.dspark.markov.w1` |
+| `mtp.2.markov_head.markov_w2.weight` | `dflash.dspark.markov.w2` |
+| `mtp.2.confidence_head.proj.weight` | `dflash.dspark.confidence.weight` |
+| `mtp.2.confidence_head.proj.bias` | `dflash.dspark.confidence.bias` |
+
+If the MTP confidence projection is bias-less, the converter writes a zero
+bias so the GGUF loader still sees the pair it expects. The Markov head alone
+is enough for DSpark greedy-chain correction; confidence gating remains
+optional.
+
+Example conversion with the DS4 MTP shard that contains the DSpark heads:
+
+```bash
+python server/scripts/convert_dflash_to_gguf.py \
+  /path/to/dflash-draft/model.safetensors \
+  /path/to/dflash-draft.gguf \
+  --aux-heads /path/to/hf-ds4-flash-dspark/model-00048-of-00048.safetensors
+```
+
+Run the converted drafter against a DeepSeek4 target with:
+
+```bash
+export DFLASH_DS4_SPEC=1
+export DFLASH_DS4_FUSED_VERIFY=1
+export DFLASH_DS4_DRAFT=/path/to/dflash-draft.gguf
+export DFLASH_DS4_SPEC_Q=4
+
+./server/build-hip/dflash_server /path/to/deepseek4-target.gguf
+```
+
+On HIP `gfx1151`, enabling DSpark defaults `LUCE_MMVQ_MAX_NCOLS` to `4` when
+the variable is unset. This keeps the four-row verifier on MMVQ; the validated
+ROCm 7.2.4 high-clock GSM+Math run reached 30.23 tok/s weighted with 10/10
+correctness. Set `LUCE_MMVQ_MAX_NCOLS` explicitly to override the platform
+default. AR, NVIDIA, and other HIP architectures retain the shared dispatch
+default.
+
+Adaptive width is automatic. When the draft artifact has a compatible
+confidence projection, the runtime selects q=2, q=3, or q=4 from the cumulative
+confidence of the proposed prefix. It adds the projection to the same fused
+Markov graph and reads its scores in the existing token-id synchronization; no
+additional host round trip is introduced. Artifacts without a compatible
+confidence head transparently retain the existing acceptance-EWMA policy.
+
+On the gfx1151 validation host, confidence-adaptive width retained 10/10
+GSM+Math accuracy and measured 29.25 tok/s weighted, within 0.8% of fixed q=4
+at 29.49 tok/s. On the low-acceptance stress prompt it measured 21.9/21.8
+tok/s warm, effectively tied with EWMA while avoiding fixed q=4's wasted wide
+verification. These numbers are workload-specific; the confidence policy is
+opt-in.
+
 ## Example: CUDA + Halo Layer Split
 
 Automatic split (CUDA prefix chosen from free memory, optional manual override via `DFLASH_DS4_CUDA_LAYERS`):
