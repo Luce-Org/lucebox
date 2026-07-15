@@ -107,6 +107,10 @@ int main() {
             "legacy_replay=1 failed_fallback=1 "
             "accept_hist=1:1,2:0,3:1,4:0,5:0,6:0,7:1,8:0,9:0,10:0,11:0,12:0,13:0,14:0,15:0,16+:1\n");
 
+        // A failed fopen/tmpfile may provide a null stream. Diagnostics must
+        // remain a no-op rather than forwarding nullptr to std::fprintf.
+        diag.print(resolve_chain_rollback_policy(), nullptr);
+
         // print() is a no-op when diagnostics are disabled.
         unsetenv("DFLASH_SINGLE_CHAIN_ROLLBACK_DIAG");
         CHECK(print_to_string(diag).empty());
