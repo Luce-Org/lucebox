@@ -871,6 +871,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
 }
 
 bool DeepSeek4Backend::do_decode(int committed, int n_gen,
+                                  const std::vector<int32_t> & history_prefix,
                                   std::vector<int32_t> & out_tokens,
                                   const DaemonIO & io,
                                   const BudgetHook & budget_hook,
@@ -880,6 +881,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
     const auto phase_t0 = Clock::now();
     DeepSeek4StepTelemetry tel_acc;
     int steps = 0;
+    std::vector<int32_t> history = history_prefix;
 
     for (int generated = 0; generated < n_gen; generated++) {
         if (io.cancelled) break;
@@ -929,7 +931,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
         const auto sample_t0 = Clock::now();
         if (sampler_.needs_logit_processing()) {
             next_token = sample_logits(logits.data(), w_.n_vocab, sampler_,
-                                       out_tokens, sampler_rng_);
+                                       history, sampler_rng_);
         } else {
             float max_val = logits[0];
             for (int i = 1; i < w_.n_vocab; i++) {
@@ -940,6 +942,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             }
         }
         if (timing) tel_acc.sample_us += elapsed_us(sample_t0, Clock::now());
+        history.push_back(next_token);
         out_tokens.push_back(next_token);
         const auto emit_t0 = Clock::now();
         io.emit(next_token);
@@ -1038,7 +1041,7 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
     gen_tokens.reserve(req.n_gen);
 
     bool forced_close = false;
-    if (!do_decode(committed, req.n_gen, gen_tokens, out_io,
+    if (!do_decode(committed, req.n_gen, req.prompt, gen_tokens, out_io,
                    req.budget_hook, &forced_close)) {
         result.fail(GenerateErrorCode::DecodeFailed);
         return result;
