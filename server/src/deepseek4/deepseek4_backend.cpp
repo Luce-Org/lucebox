@@ -925,10 +925,12 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             }
         }
 
-        // Sample (argmax for now)
         int32_t next_token = 0;
-        {
-            const auto sample_t0 = Clock::now();
+        const auto sample_t0 = Clock::now();
+        if (sampler_.needs_logit_processing()) {
+            next_token = sample_logits(logits.data(), w_.n_vocab, sampler_,
+                                       out_tokens, sampler_rng_);
+        } else {
             float max_val = logits[0];
             for (int i = 1; i < w_.n_vocab; i++) {
                 if (logits[i] > max_val) {
@@ -936,8 +938,8 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
                     next_token = i;
                 }
             }
-            if (timing) tel_acc.sample_us += elapsed_us(sample_t0, Clock::now());
         }
+        if (timing) tel_acc.sample_us += elapsed_us(sample_t0, Clock::now());
         out_tokens.push_back(next_token);
         const auto emit_t0 = Clock::now();
         io.emit(next_token);
@@ -958,6 +960,10 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     auto t0 = Clock::now();
+    sampler_ = req.sampler;
+    if (req.do_sample && sampler_.seed != 0) {
+        sampler_rng_.seed(sampler_.seed);
+    }
 
     // Prefill
     int committed = do_prefill(req.prompt, out_io);
