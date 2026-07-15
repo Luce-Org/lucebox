@@ -25,6 +25,7 @@
 #include "gguf.h"
 
 #include "dflash27b.h"
+#include "draft/draft_contract.h"
 
 namespace dflash::common {
 
@@ -314,6 +315,11 @@ struct DraftWeights {
     int n_target_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;  // captured target layers (5)
     std::vector<int> capture_layer_ids;                     // explicit captured target-layer ids (GGUF dflash.target_layer_ids); empty = derive from count
     int mask_token_id   = DFLASH27B_DRAFT_MASK_TOKEN_ID;    // noise mask token
+    DraftProposalLayout proposal_layout = DraftProposalLayout::SeedThenProposals;
+
+    DraftProposalShape proposal_shape() const {
+        return DraftProposalShape{block_size, proposal_layout};
+    }
 
     // Optional Domino causal correction head. When present, greedy chain
     // speculative decode corrects each draft token with a lightweight GRU

@@ -1003,6 +1003,12 @@ if(DFLASH27B_TESTS)
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
     enable_testing()
 
+    # Pure proposal-shape contract test: no ggml, GPU, or model files.
+    add_executable(test_draft_contract test/test_draft_contract.cpp)
+    target_include_directories(test_draft_contract PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME draft_contract COMMAND test_draft_contract)
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
         add_executable(test_server_unit test/test_server_unit.cpp)
         target_sources(test_server_unit PRIVATE
@@ -1035,7 +1041,7 @@ if(DFLASH27B_TESTS)
 
     # 'make check' — builds test targets then runs ctest
     if(TARGET test_server_unit)
-        set(_check_deps test_server_unit)
+        set(_check_deps test_server_unit test_draft_contract)
         if(TARGET test_deepseek4_unit)
             list(APPEND _check_deps test_deepseek4_unit)
         endif()
@@ -1047,6 +1053,7 @@ if(DFLASH27B_TESTS)
     else()
         add_custom_target(check
             COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+            DEPENDS test_draft_contract
             COMMENT "Building and running unit tests (server unit tests skipped — CURL not found)"
         )
     endif()
