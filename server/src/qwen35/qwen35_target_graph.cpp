@@ -468,24 +468,56 @@ bool migrate_prefill_cache(const TargetWeights & w,
     return true;
 }
 
-// Snapshot/restore SSM+conv state for speculative rollback. Uses device-side
-// tensor copy (ggml_backend_tensor_copy). Called outside of any compute graph.
-void snapshot_ssm_state(TargetCache & c) {
-    for (size_t i = 0; i < c.ssm_state.size(); i++) {
-        if (!c.ssm_state[i] || !c.ssm_state_snap[i]) continue;
-        ggml_backend_tensor_copy(c.ssm_state[i], c.ssm_state_snap[i]);
-        if (!c.conv_state[i] || !c.conv_state_snap[i]) continue;
-        ggml_backend_tensor_copy(c.conv_state[i], c.conv_state_snap[i]);
+// Snapshot/restore SSM+conv state for speculative rollback. Queue all device
+// copies on one backend stream, then synchronize once for the complete snapshot.
+static bool recurrent_snapshot_layout_valid(const TargetCache & c) {
+    const size_t n = c.ssm_state.size();
+    if (c.ssm_state_snap.size() != n || c.conv_state.size() != n ||
+        c.conv_state_snap.size() != n) {
+        return false;
     }
+    for (size_t i = 0; i < n; i++) {
+        const bool owns_state = c.ssm_state[i] || c.ssm_state_snap[i] ||
+                                c.conv_state[i] || c.conv_state_snap[i];
+        if (!owns_state) continue;
+        if (!c.ssm_state[i] || !c.ssm_state_snap[i] ||
+            !c.conv_state[i] || !c.conv_state_snap[i] ||
+            c.ssm_state[i]->type != c.ssm_state_snap[i]->type ||
+            !ggml_are_same_shape(c.ssm_state[i], c.ssm_state_snap[i]) ||
+            !ggml_are_same_stride(c.ssm_state[i], c.ssm_state_snap[i]) ||
+            c.conv_state[i]->type != c.conv_state_snap[i]->type ||
+            !ggml_are_same_shape(c.conv_state[i], c.conv_state_snap[i]) ||
+            !ggml_are_same_stride(c.conv_state[i], c.conv_state_snap[i])) {
+            return false;
+        }
+    }
+    return true;
 }
 
-void restore_ssm_state(TargetCache & c) {
+bool snapshot_ssm_state(TargetCache & c, ggml_backend_t backend) {
+    if (!backend || !recurrent_snapshot_layout_valid(c)) return false;
     for (size_t i = 0; i < c.ssm_state.size(); i++) {
-        if (!c.ssm_state_snap[i] || !c.ssm_state[i]) continue;
-        ggml_backend_tensor_copy(c.ssm_state_snap[i], c.ssm_state[i]);
-        if (!c.conv_state_snap[i] || !c.conv_state[i]) continue;
-        ggml_backend_tensor_copy(c.conv_state_snap[i], c.conv_state[i]);
+        if (!c.ssm_state[i]) continue;
+        ggml_backend_tensor_copy_async(
+            backend, backend, c.ssm_state[i], c.ssm_state_snap[i]);
+        ggml_backend_tensor_copy_async(
+            backend, backend, c.conv_state[i], c.conv_state_snap[i]);
     }
+    ggml_backend_synchronize(backend);
+    return true;
+}
+
+bool restore_ssm_state(TargetCache & c, ggml_backend_t backend) {
+    if (!backend || !recurrent_snapshot_layout_valid(c)) return false;
+    for (size_t i = 0; i < c.ssm_state.size(); i++) {
+        if (!c.ssm_state[i]) continue;
+        ggml_backend_tensor_copy_async(
+            backend, backend, c.ssm_state_snap[i], c.ssm_state[i]);
+        ggml_backend_tensor_copy_async(
+            backend, backend, c.conv_state_snap[i], c.conv_state[i]);
+    }
+    ggml_backend_synchronize(backend);
+    return true;
 }
 
 // Allocate SSM/conv rollback snapshot tensors by mirroring the live recurrent

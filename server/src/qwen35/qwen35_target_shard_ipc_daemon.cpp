@@ -550,8 +550,11 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                 if (!enable_dflash) {
                     stream_status(stream_fd, -1);
                 } else {
-                    for (auto & shard : shards) snapshot_ssm_state(shard.cache);
-                    stream_status(stream_fd, 0);
+                    bool ok = true;
+                    for (auto & shard : shards) {
+                        if (!snapshot_ssm_state(shard.cache, shard.backend)) ok = false;
+                    }
+                    stream_status(stream_fd, ok ? 0 : -1);
                 }
                 continue;
             }
@@ -559,8 +562,11 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                 if (!enable_dflash) {
                     stream_status(stream_fd, -1);
                 } else {
-                    for (auto & shard : shards) restore_ssm_state(shard.cache);
-                    stream_status(stream_fd, 0);
+                    bool ok = true;
+                    for (auto & shard : shards) {
+                        if (!restore_ssm_state(shard.cache, shard.backend)) ok = false;
+                    }
+                    stream_status(stream_fd, ok ? 0 : -1);
                 }
                 continue;
             }

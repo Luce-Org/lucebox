@@ -154,7 +154,9 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
 }
 
 bool Qwen35LayerSplitDFlashTarget::snapshot_kv() {
-    for (auto & shard : shards_) snapshot_ssm_state(shard.cache);
+    for (auto & shard : shards_) {
+        if (!snapshot_ssm_state(shard.cache, shard.backend)) return false;
+    }
     if (remote_target_shard_ && remote_target_shard_->active()) {
         return remote_target_shard_->snapshot_kv();
     }
@@ -167,7 +169,9 @@ bool Qwen35LayerSplitDFlashTarget::restore_kv() {
             return false;
         }
     }
-    for (auto & shard : shards_) restore_ssm_state(shard.cache);
+    for (auto & shard : shards_) {
+        if (!restore_ssm_state(shard.cache, shard.backend)) return false;
+    }
     rollback_poisoned_ = false;
     return true;
 }

@@ -504,13 +504,11 @@ bool Qwen35DFlashTarget::rollback_to_tree(
 }
 
 bool Qwen35DFlashTarget::snapshot_kv() {
-    snapshot_ssm_state(cache_);
-    return true;
+    return snapshot_ssm_state(cache_, backend_);
 }
 
 bool Qwen35DFlashTarget::restore_kv() {
-    restore_ssm_state(cache_);
-    return true;
+    return restore_ssm_state(cache_, backend_);
 }
 
 bool Qwen35DFlashTarget::supports_fast_rollback() const {
