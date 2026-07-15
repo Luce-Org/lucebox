@@ -238,11 +238,10 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
             return nullptr;
         }
 
-        // HIP single-device launches cannot rely on the CUDA/Halo auto-split
-        // path; use the single-backend loader, which can fall back to hybrid
-        // expert placement when a full monolithic load does not fit.
-        if (target_backend == PlacementBackend::Hip &&
-            !args.device.is_layer_split() &&
+        // A single local device uses the monolithic backend. Reserve the
+        // layer-split adapter for explicit multi-device placement or remote
+        // target shards.
+        if (!args.device.is_layer_split() &&
             !args.remote_target_shard.enabled()) {
             DeepSeek4BackendConfig cfg;
             cfg.model_path = args.model_path;
@@ -262,8 +261,7 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
             return backend;
         }
 
-        // CUDA builds keep the layer-split backend so they can auto-split
-        // across CUDA and remote HIP target shards.
+        // Explicit local splits and CUDA/HIP remote splits use the adapter.
         DeepSeek4LayerSplitAdapterConfig cfg;
         cfg.target_path        = args.model_path;
         cfg.device             = args.device;
