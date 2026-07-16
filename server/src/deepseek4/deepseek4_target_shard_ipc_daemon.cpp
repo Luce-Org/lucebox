@@ -229,6 +229,7 @@ int run_deepseek4_target_shard_ipc_daemon(
 
         std::vector<float> logits;
         int32_t final_argmax = -1;
+        const bool want_argmax = !req.want_logits;
         const float * shard_input = req.boundary_activation->data();
         for (size_t i = 0; i < shards.size(); ++i) {
             auto & shard = shards[i];
@@ -243,7 +244,7 @@ int run_deepseek4_target_shard_ipc_daemon(
                 shard_input, n_tokens, req.base_pos,
                 shard.layer_begin, shard.layer_end,
                 (is_last && req.want_logits) ? &logits : nullptr,
-                is_last ? &final_argmax : nullptr,
+                (is_last && want_argmax) ? &final_argmax : nullptr,
                 req.token_ids ? req.token_ids->data() : nullptr,
                 timing ? &tel : nullptr);
             if (!ok) {
@@ -263,7 +264,7 @@ int run_deepseek4_target_shard_ipc_daemon(
         }
 
         const int vocab = shards.back().weights.n_vocab;
-        if (final_argmax < 0 || final_argmax >= vocab) {
+        if (want_argmax && (final_argmax < 0 || final_argmax >= vocab)) {
             std::fprintf(stderr,
                          "[deepseek4-target-shard] invalid argmax token: vocab=%d token=%d\n",
                          vocab, final_argmax);
@@ -275,7 +276,7 @@ int run_deepseek4_target_shard_ipc_daemon(
                          vocab, logits.size());
             return false;
         }
-        resp.last_tok = final_argmax;
+        resp.last_tok = want_argmax ? final_argmax : -1;
         if (req.want_logits) {
             resp.logits = std::move(logits);
         }

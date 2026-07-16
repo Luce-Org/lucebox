@@ -893,6 +893,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
                                   bool * forced_close_out) {
     if (forced_close_out) *forced_close_out = false;
     const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
+    const bool need_logits = sampler_.needs_logit_processing();
     const auto phase_t0 = Clock::now();
     DeepSeek4StepTelemetry tel_acc;
     int steps = 0;

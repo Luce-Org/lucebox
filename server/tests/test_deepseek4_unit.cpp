@@ -1806,6 +1806,7 @@ static void test_reset_request_state() {
     adapter.cur_pos_ = 9;
     adapter.last_tok_ = 77;
     adapter.hc_state_.assign(8, 5.0f);
+    adapter.prefill_last_logits_ = {1.0f, 2.0f};
     adapter.shards_.resize(2);
     for (auto & shard : adapter.shards_) {
         shard.cache.cur_pos = 11;
@@ -1819,6 +1820,7 @@ static void test_reset_request_state() {
     adapter.reset_request_state();
     TEST_ASSERT(adapter.cur_pos_ == 0);
     TEST_ASSERT(adapter.last_tok_ == -1);
+    TEST_ASSERT(adapter.prefill_last_logits_.empty());
     for (float v : adapter.hc_state_) {
         TEST_ASSERT(v == 0.0f);
     }
@@ -2104,137 +2106,185 @@ static void test_ffn_graph_reuse_microbench(ggml_backend_t backend) {
                  rebuild_total_ms / iters, cached_total_ms / iters);
 }
 
-static void test_output_graph_reuse_microbench(ggml_backend_t backend) {
-    std::fprintf(stderr, "  test_output_graph_reuse_microbench ...");
+enum class TestOutputPath {
+    Cached,
+    Dynamic,
+    Fused,
+};
 
-    constexpr int n_embd = 64;
-    constexpr int n_vocab = 256;
-    constexpr int n_tokens = 64;
-    constexpr int iters = 8;
-    std::vector<float> inp((size_t) n_embd * n_tokens);
-    std::vector<float> norm_w((size_t) n_embd);
-    std::vector<float> lm_head((size_t) n_embd * n_vocab);
-    std::vector<float> rebuild_logits((size_t) n_vocab * n_tokens);
-    std::vector<float> cached_logits((size_t) n_vocab * n_tokens);
-    std::vector<int32_t> cached_argmax((size_t) n_tokens, -1);
-
-    std::mt19937 rng(7);
-    std::uniform_real_distribution<float> dist(-0.2f, 0.2f);
-    for (float & x : inp) x = dist(rng);
-    for (float & x : norm_w) x = 1.0f + dist(rng);
-    for (float & x : lm_head) x = dist(rng);
-
-    auto build_and_run = [&](std::vector<float> & out) {
-        ggml_context * ctx = make_test_context(4u << 20);
-        TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
-        if (!ctx) return false;
-
-        ggml_tensor * inp_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
-        ggml_tensor * norm_w_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
-        ggml_tensor * lm_head_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_vocab);
-        ggml_set_input(inp_t);
-        ggml_set_input(norm_w_t);
-        ggml_set_input(lm_head_t);
-        ggml_tensor * norm = ggml_mul(ctx, ggml_rms_norm(ctx, inp_t, 1.0e-6f), norm_w_t);
-        ggml_tensor * logits = ggml_mul_mat(ctx, lm_head_t, norm);
-        ggml_set_output(logits);
-        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 128, false);
-        ggml_build_forward_expand(gf, logits);
-        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
-        bool ok = ggml_gallocr_alloc_graph(alloc, gf);
-        TEST_ASSERT(ok);
-        if (ok) {
-            ggml_backend_tensor_set(inp_t, inp.data(), 0, inp.size() * sizeof(float));
-            ggml_backend_tensor_set(norm_w_t, norm_w.data(), 0, norm_w.size() * sizeof(float));
-            ggml_backend_tensor_set(lm_head_t, lm_head.data(), 0, lm_head.size() * sizeof(float));
-            ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
-            TEST_ASSERT(ok);
-            if (ok) {
-                ggml_backend_tensor_get(logits, out.data(), 0, out.size() * sizeof(float));
-            }
-        }
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx);
-        return ok;
-    };
-
-    double rebuild_total_ms = 0.0;
-    for (int iter = 0; iter < iters; ++iter) {
-        const auto t0 = TestClock::now();
-        bool ok = build_and_run(rebuild_logits);
-        const auto t1 = TestClock::now();
-        TEST_ASSERT(ok);
-        rebuild_total_ms += elapsed_ms(t0, t1);
+static const char * test_output_path_name(TestOutputPath path) {
+    switch (path) {
+        case TestOutputPath::Cached:  return "cached";
+        case TestOutputPath::Dynamic: return "dynamic";
+        case TestOutputPath::Fused:   return "fused";
     }
+    return "unknown";
+}
 
+static int count_graph_ops(ggml_cgraph * gf, ggml_op op) {
+    int count = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        if (ggml_graph_node(gf, i)->op == op) ++count;
+    }
+    return count;
+}
+
+struct TestOutputRun {
+    bool ok = false;
+    std::vector<float> logits;
+    int32_t argmax = -1;
+};
+
+static TestOutputRun run_output_path(
+        ggml_backend_t backend,
+        TestOutputPath path,
+        bool want_argmax,
+        const std::vector<float> & input,
+        const std::vector<float> & norm_weight,
+        const std::vector<float> & lm_head,
+        int n_embd,
+        int n_vocab) {
+    const int n_tokens = path == TestOutputPath::Dynamic ? 4 : 1;
+    TestOutputRun result;
     ggml_context * ctx = make_test_context(4u << 20);
     TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
-    if (!ctx) {
-        std::fprintf(stderr, " FAIL\n");
-        return;
-    }
-    ggml_tensor * inp_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
-    ggml_tensor * norm_w_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
-    ggml_tensor * lm_head_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_vocab);
-    ggml_set_input(inp_t);
-    ggml_set_input(norm_w_t);
-    ggml_set_input(lm_head_t);
-    ggml_tensor * norm = ggml_mul(ctx, ggml_rms_norm(ctx, inp_t, 1.0e-6f), norm_w_t);
-    ggml_tensor * logits = ggml_mul_mat(ctx, lm_head_t, norm);
-    ggml_tensor * argmax_tokens = ggml_argmax(ctx, logits);
-    ggml_set_output(logits);
-    ggml_set_output(argmax_tokens);
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 128, false);
-    ggml_build_forward_expand(gf, argmax_tokens);
-    ggml_build_forward_expand(gf, logits);
-    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
-    bool alloc_ok = ggml_gallocr_alloc_graph(alloc, gf);
-    TEST_ASSERT(alloc_ok);
-    if (!alloc_ok) {
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx);
-        std::fprintf(stderr, " FAIL\n");
-        return;
-    }
-    ggml_backend_tensor_set(norm_w_t, norm_w.data(), 0, norm_w.size() * sizeof(float));
-    ggml_backend_tensor_set(lm_head_t, lm_head.data(), 0, lm_head.size() * sizeof(float));
+    if (!ctx) return result;
 
-    double cached_total_ms = 0.0;
-    for (int iter = 0; iter < iters; ++iter) {
-        const auto t0 = TestClock::now();
-        ggml_backend_tensor_set(inp_t, inp.data(), 0, inp.size() * sizeof(float));
-        bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
-        const auto t1 = TestClock::now();
-        TEST_ASSERT(ok);
-        if (ok) {
-            ggml_backend_tensor_get(logits, cached_logits.data(), 0, cached_logits.size() * sizeof(float));
-            ggml_backend_tensor_get(argmax_tokens, cached_argmax.data(), 0,
-                                    cached_argmax.size() * sizeof(int32_t));
-        }
-        cached_total_ms += elapsed_ms(t0, t1);
+    ggml_tensor * input_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * norm_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+    ggml_tensor * output_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_vocab);
+    ggml_set_input(input_t);
+    ggml_set_input(norm_t);
+    ggml_set_input(output_t);
+
+    // The fused path attaches the same production output tail to an existing
+    // graph. Keep one preceding op here so the test covers that composition.
+    ggml_tensor * hidden = path == TestOutputPath::Fused
+        ? ggml_scale(ctx, input_t, 1.0f)
+        : input_t;
+    const DeepSeek4OutputProjection projection = deepseek4_build_output_projection(
+        ctx, hidden, norm_t, output_t, 1.0e-6f, want_argmax);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 128, false);
+    deepseek4_build_output_graph(gf, projection, want_argmax);
+
+    TEST_ASSERT(count_graph_ops(gf, GGML_OP_ARGMAX) == (want_argmax ? 1 : 0));
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    const bool allocated = alloc && ggml_gallocr_alloc_graph(alloc, gf);
+    TEST_ASSERT(allocated);
+    if (!allocated) {
+        if (alloc) ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        return result;
+    }
+
+    const int iterations = path == TestOutputPath::Cached ? 2 : 1;
+    for (int i = 0; i < iterations; ++i) {
+        // The graph allocator may reuse any declared input after a compute.
+        // Restore the complete synthetic fixture before every cached replay.
+        ggml_backend_tensor_set(input_t, input.data(), 0,
+                                (size_t)n_embd * n_tokens * sizeof(float));
+        ggml_backend_tensor_set(norm_t, norm_weight.data(), 0,
+                                norm_weight.size() * sizeof(float));
+        ggml_backend_tensor_set(output_t, lm_head.data(), 0,
+                                lm_head.size() * sizeof(float));
+
+        result.ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+        TEST_ASSERT(result.ok);
+        if (!result.ok) break;
+    }
+
+    const size_t token_offset = (size_t)(n_tokens - 1);
+    if (result.ok && want_argmax) {
+        ggml_backend_tensor_get(projection.argmax, &result.argmax,
+                                token_offset * sizeof(int32_t), sizeof(int32_t));
+    } else if (result.ok) {
+        result.logits.resize((size_t)n_vocab);
+        ggml_backend_tensor_get(projection.logits, result.logits.data(),
+                                token_offset * (size_t)n_vocab * sizeof(float),
+                                result.logits.size() * sizeof(float));
     }
 
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
+    return result;
+}
 
-    for (size_t i = 0; i < cached_logits.size(); ++i) {
-        TEST_ASSERT_MSG(std::isfinite(cached_logits[i]), "cached output logits must be finite");
-        TEST_ASSERT_MSG(std::isfinite(rebuild_logits[i]), "rebuilt output logits must be finite");
+static void test_output_paths_argmax(ggml_backend_t backend, const char * backend_name) {
+    std::fprintf(stderr, "  test_output_paths_argmax[%s] ...", backend_name);
+    constexpr int n_embd = 64;
+    constexpr int n_vocab = 256;
+    constexpr int max_tokens = 4;
+    std::vector<float> input((size_t)n_embd * max_tokens);
+    std::vector<float> norm_weight((size_t)n_embd, 1.0f);
+    std::vector<float> lm_head((size_t)n_embd * n_vocab, 0.0f);
+    for (int token = 0; token < max_tokens; ++token) {
+        for (int dim = 0; dim < n_embd; ++dim) {
+            input[(size_t)token * n_embd + (size_t)dim] =
+                0.01f * (float)(dim + 1) + 0.1f * (float)token;
+        }
     }
-    for (int token = 0; token < n_tokens; ++token) {
+    constexpr int expected_token = 73;
+    for (int dim = 0; dim < n_embd; ++dim) {
+        lm_head[(size_t)expected_token * n_embd + (size_t)dim] = 1.0f;
+    }
+
+    for (TestOutputPath path : {TestOutputPath::Cached,
+                                TestOutputPath::Dynamic,
+                                TestOutputPath::Fused}) {
+        const TestOutputRun logits = run_output_path(
+            backend, path, false, input, norm_weight, lm_head, n_embd, n_vocab);
+        const TestOutputRun argmax = run_output_path(
+            backend, path, true, input, norm_weight, lm_head, n_embd, n_vocab);
+        TEST_ASSERT_MSG(logits.ok && argmax.ok, test_output_path_name(path));
+        if (!logits.ok || !argmax.ok) continue;
+
         int32_t expected = 0;
-        const size_t offset = (size_t) token * n_vocab;
         for (int vocab = 1; vocab < n_vocab; ++vocab) {
-            if (cached_logits[offset + (size_t) vocab] >
-                cached_logits[offset + (size_t) expected]) {
+            if (logits.logits[(size_t)vocab] > logits.logits[(size_t)expected]) {
                 expected = vocab;
             }
         }
-        TEST_ASSERT(cached_argmax[(size_t) token] == expected);
+        TEST_ASSERT_MSG(expected == expected_token, test_output_path_name(path));
+        TEST_ASSERT_MSG(argmax.argmax == expected, test_output_path_name(path));
     }
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
 
-    std::fprintf(stderr, " rebuild_avg=%.3fms cached_avg=%.3fms\n",
-                 rebuild_total_ms / iters, cached_total_ms / iters);
+static void test_argmax_tie_breaking(ggml_backend_t backend, const char * backend_name) {
+    std::fprintf(stderr, "  test_argmax_tie_breaking[%s] ...", backend_name);
+    constexpr int n_vocab = 96;
+    std::vector<float> logits((size_t)n_vocab, -10.0f);
+    logits[1] = 5.0f;
+    logits[2] = 5.0f;
+    logits[33] = 5.0f;
+    logits[64] = 5.0f;
+
+    ggml_context * ctx = make_test_context();
+    TEST_ASSERT(ctx != nullptr);
+    if (!ctx) return;
+    ggml_tensor * logits_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_vocab, 1);
+    ggml_set_input(logits_t);
+    ggml_tensor * argmax_t = ggml_argmax(ctx, logits_t);
+    ggml_set_output(argmax_t);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 32, false);
+    ggml_build_forward_expand(gf, argmax_t);
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    const bool allocated = alloc && ggml_gallocr_alloc_graph(alloc, gf);
+    TEST_ASSERT(allocated);
+    if (allocated) {
+        ggml_backend_tensor_set(logits_t, logits.data(), 0,
+                                logits.size() * sizeof(float));
+        const bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+        TEST_ASSERT(ok);
+        int32_t actual = -1;
+        if (ok) ggml_backend_tensor_get(argmax_t, &actual, 0, sizeof(actual));
+        TEST_ASSERT_MSG(actual == 1, "argmax ties must select the lowest token id");
+    }
+    if (alloc) ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
@@ -2534,6 +2584,23 @@ static void test_hc_post_strided_split_gpu() {
     ggml_free(ctx);
     ggml_backend_free(backend);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_output_paths_gpu() {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        std::fprintf(stderr,
+                     "  test_output_paths_argmax[gpu] ... skipped (no GPU backend)\n");
+        return;
+    }
+#if defined(GGML_USE_HIP)
+    const char * backend_name = "hip";
+#else
+    const char * backend_name = "cuda";
+#endif
+    test_output_paths_argmax(backend, backend_name);
+    test_argmax_tie_breaking(backend, backend_name);
+    ggml_backend_free(backend);
 }
 
 static void test_cpu_hc_sinkhorn_ref(float * out, const float * mix, const float * scale,
@@ -2917,11 +2984,13 @@ int main() {
     test_ipc_mode_registration();
     test_target_shard_daemon_validation();
     test_ffn_graph_reuse_microbench(backend);
-    test_output_graph_reuse_microbench(backend);
+    test_output_paths_argmax(backend, "cpu");
+    test_argmax_tie_breaking(backend, "cpu");
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
     test_ds4_flash_attention_keep_cap_gpu();
     test_ds4_flash_attention_inverse_rope_fallback_gpu();
     test_hc_post_strided_split_gpu();
+    test_output_paths_gpu();
     test_hc_pre_kernel_gpu();
 #endif
 

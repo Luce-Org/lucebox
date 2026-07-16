@@ -242,12 +242,14 @@ struct DeepSeek4CachedDecodeOutputGraph {
     const ggml_context * owner_ctx = nullptr;
     ggml_backend_t backend = nullptr;
     int n_tokens = 0;
+    bool computes_argmax = false;
     StepGraph sg;
 
-    bool valid() const {
+    bool valid(bool want_argmax) const {
         return owner_ctx && backend && n_tokens > 0 &&
                sg.ctx && sg.gf && sg.alloc && sg.hidden_input && sg.logits &&
-               sg.argmax_tokens;
+               computes_argmax == want_argmax &&
+               (!want_argmax || sg.argmax_tokens);
     }
 
     void free() {
@@ -255,6 +257,7 @@ struct DeepSeek4CachedDecodeOutputGraph {
         owner_ctx = nullptr;
         backend = nullptr;
         n_tokens = 0;
+        computes_argmax = false;
     }
 };
 
@@ -482,7 +485,8 @@ static bool build_cached_decode_output_graph(
         DeepSeek4CachedDecodeOutputGraph & out,
         ggml_backend_t backend,
         const DeepSeek4Weights & w,
-        int n_tokens) {
+        int n_tokens,
+        bool want_argmax) {
     out.free();
 
     const size_t ctx_size = 16 * 1024 * 1024;
@@ -497,14 +501,13 @@ static bool build_cached_decode_output_graph(
 
     out.sg.hidden_input = ggml_new_tensor_2d(out.sg.ctx, GGML_TYPE_F32, w.n_embd, n_tokens);
     ggml_set_input(out.sg.hidden_input);
-    ggml_tensor * normed = build_rms_norm(out.sg.ctx, out.sg.hidden_input, w.out_norm, w.rms_eps);
-    out.sg.logits = ggml_mul_mat(out.sg.ctx, w.output, normed);
-    out.sg.argmax_tokens = ggml_argmax(out.sg.ctx, out.sg.logits);
-    ggml_set_output(out.sg.logits);
-    ggml_set_output(out.sg.argmax_tokens);
+    const DeepSeek4OutputProjection projection = deepseek4_build_output_projection(
+        out.sg.ctx, out.sg.hidden_input, w.out_norm, w.output, w.rms_eps,
+        want_argmax);
+    out.sg.logits = projection.logits;
+    out.sg.argmax_tokens = projection.argmax;
     out.sg.gf = ggml_new_graph_custom(out.sg.ctx, 1024, false);
-    ggml_build_forward_expand(out.sg.gf, out.sg.argmax_tokens);
-    ggml_build_forward_expand(out.sg.gf, out.sg.logits);
+    deepseek4_build_output_graph(out.sg.gf, projection, want_argmax);
 
     out.sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     if (!ggml_gallocr_alloc_graph(out.sg.alloc, out.sg.gf)) {
@@ -515,6 +518,7 @@ static bool build_cached_decode_output_graph(
     out.owner_ctx = w.ctx;
     out.backend = backend;
     out.n_tokens = n_tokens;
+    out.computes_argmax = want_argmax;
     return true;
 }
 
@@ -524,6 +528,32 @@ static ggml_tensor * build_rms_norm(ggml_context * ctx, ggml_tensor * x,
                                      ggml_tensor * weight, float eps) {
     ggml_tensor * normed = ggml_rms_norm(ctx, x, eps);
     return ggml_mul(ctx, normed, weight);
+}
+
+DeepSeek4OutputProjection deepseek4_build_output_projection(
+        ggml_context * ctx,
+        ggml_tensor * hidden,
+        ggml_tensor * out_norm,
+        ggml_tensor * output,
+        float rms_eps,
+        bool want_argmax) {
+    DeepSeek4OutputProjection projection;
+    ggml_tensor * normed = build_rms_norm(ctx, hidden, out_norm, rms_eps);
+    projection.logits = ggml_mul_mat(ctx, output, normed);
+    if (want_argmax) {
+        projection.argmax = ggml_argmax(ctx, projection.logits);
+    }
+    return projection;
+}
+
+void deepseek4_build_output_graph(
+        ggml_cgraph * gf,
+        const DeepSeek4OutputProjection & projection,
+        bool want_argmax) {
+    ggml_tensor * output = want_argmax ? projection.argmax : projection.logits;
+    GGML_ASSERT(output != nullptr);
+    ggml_set_output(output);
+    ggml_build_forward_expand(gf, output);
 }
 
 // ─── Helper: Clamped SwiGLU ─────────────────────────────────────────────
@@ -4304,6 +4334,7 @@ struct DeepSeek4FusedDecodeGraph {
     ggml_tensor * mask_bundle = nullptr;   // additive score mask (0 / -1e30), may be null
     std::vector<ggml_tensor *> hash_ids;
     ggml_tensor * logits = nullptr;
+    bool computes_argmax = false;
 
     void reset_nodes() {
         inp_embed = nullptr;
@@ -4311,13 +4342,15 @@ struct DeepSeek4FusedDecodeGraph {
         i64_bundle = nullptr;
         mask_bundle = nullptr;
         logits = nullptr;
+        computes_argmax = false;
         hash_ids.clear();
         shape_key.clear();
         last_use = 0;
     }
 
     bool built() const {
-        return sg.ctx && sg.gf && logits;
+        return sg.ctx && sg.gf && logits &&
+               (!computes_argmax || sg.argmax_tokens);
     }
 
     void destroy() {
@@ -4565,6 +4598,7 @@ static bool ds4_build_fused_decode_graph(
         const std::vector<HashRoutingTableCpu> & hash_tables,
         int kv_start,
         bool have_token_ids,
+        bool want_argmax,
         std::vector<int64_t> && shape_key) {
     step_graph_free(fg.sg);
     fg.reset_nodes();
@@ -4728,14 +4762,13 @@ static bool ds4_build_fused_decode_graph(
     ggml_tensor * final_embd = ggml_ds4_hc_out(ctx, omix, obase, hc_flat, n_hc,
                                                hc_out_weights.scale_data[0]);
     ggml_tensor * final_2d = ggml_reshape_2d(ctx, final_embd, n_embd, 1);
-    ggml_tensor * out_normed = build_rms_norm(ctx, final_2d, w.out_norm, w.rms_eps);
-    fg.logits = ggml_mul_mat(ctx, w.output, out_normed);
+    const DeepSeek4OutputProjection projection = deepseek4_build_output_projection(
+        ctx, final_2d, w.out_norm, w.output, w.rms_eps, want_argmax);
+    fg.logits = projection.logits;
     fg.sg.logits = fg.logits;
-    fg.sg.argmax_tokens = ggml_argmax(ctx, fg.logits);
-    ggml_set_output(fg.logits);
-    ggml_set_output(fg.sg.argmax_tokens);
-    ggml_build_forward_expand(gf, fg.sg.argmax_tokens);
-    ggml_build_forward_expand(gf, fg.logits);
+    fg.sg.argmax_tokens = projection.argmax;
+    fg.computes_argmax = want_argmax;
+    deepseek4_build_output_graph(gf, projection, want_argmax);
 
     if (!fg.sg.alloc) {
         fg.sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -4798,10 +4831,12 @@ static int ds4_try_fused_decode_step(
     }
 
     const int token_pos = kv_start;
+    const bool want_argmax = out_argmax != nullptr;
     std::vector<int64_t> key;
-    key.reserve((size_t) w.n_layer + 2);
+    key.reserve((size_t) w.n_layer + 3);
     key.push_back(w.n_swa);
     key.push_back(token_ids ? 1 : 0);
+    key.push_back(want_argmax ? 1 : 0);
     for (int il = 0; il < w.n_layer; ++il) {
         const int ratio = (int) w.compress_ratios[il];
         DeepSeek4LayerCache & lc = cache.layers[(size_t) il];
@@ -4836,7 +4871,8 @@ static int ds4_try_fused_decode_step(
         const auto build_t0 = Ds4TimingClock::now();
         if (!ds4_build_fused_decode_graph(fc, *fg, backend, w, cache,
                                           hc_weights, hc_out_weights, hash_tables,
-                                          kv_start, token_ids != nullptr, std::move(key))) {
+                                          kv_start, token_ids != nullptr, want_argmax,
+                                          std::move(key))) {
             std::fprintf(stderr,
                          "[deepseek4] fused decode graph build failed; using per-layer path\n");
             step_graph_free(fg->sg);
@@ -5728,6 +5764,11 @@ bool deepseek4_step_layer_range(
         Ds4VerifyHooks * verify_hooks) {
     const auto step_t0 = Ds4TimingClock::now();
 
+    if (out_logits && out_argmax) {
+        std::fprintf(stderr,
+                     "[deepseek4] request either full logits or argmax, not both\n");
+        return false;
+    }
     if (out_argmax) *out_argmax = -1;
     // ── Partial layer-range forward with HC ─────────────────────────────
     const int n_embd = w.n_embd;
@@ -6538,11 +6579,14 @@ bool deepseek4_step_layer_range(
                         w.hc_eps);
 
         if (reuse_decode_graphs) {
-            if (!cached_decode_output_graph.valid() ||
+            const bool want_argmax = out_argmax != nullptr;
+            if (!cached_decode_output_graph.valid(want_argmax) ||
                 cached_decode_output_graph.owner_ctx != w.ctx ||
                 cached_decode_output_graph.backend != backend ||
                 cached_decode_output_graph.n_tokens != n_tokens) {
-                if (!build_cached_decode_output_graph(cached_decode_output_graph, backend, w, n_tokens)) {
+                if (!build_cached_decode_output_graph(
+                        cached_decode_output_graph, backend, w, n_tokens,
+                        want_argmax)) {
                     return false;
                 }
             }
@@ -6575,14 +6619,13 @@ bool deepseek4_step_layer_range(
             ggml_tensor * inp = ggml_new_tensor_2d(
                 ctx, GGML_TYPE_F32, n_embd, output_tokens);
             ggml_set_input(inp);
-            ggml_tensor * normed = build_rms_norm(ctx, inp, w.out_norm, w.rms_eps);
-            ggml_tensor * logits = ggml_mul_mat(ctx, w.output, normed);
-            ggml_tensor * argmax_tokens = ggml_argmax(ctx, logits);
-            ggml_set_output(logits);
-            ggml_set_output(argmax_tokens);
+            const DeepSeek4OutputProjection projection = deepseek4_build_output_projection(
+                ctx, inp, w.out_norm, w.output, w.rms_eps,
+                out_argmax != nullptr);
+            ggml_tensor * logits = projection.logits;
+            ggml_tensor * argmax_tokens = projection.argmax;
             ggml_cgraph * gf = ggml_new_graph_custom(ctx, 1024, false);
-            ggml_build_forward_expand(gf, argmax_tokens);
-            ggml_build_forward_expand(gf, logits);
+            deepseek4_build_output_graph(gf, projection, out_argmax != nullptr);
 
             if (!cached_dynamic_output_alloc.valid() ||
                 cached_dynamic_output_alloc.owner_ctx != w.ctx ||

@@ -414,6 +414,7 @@ void DeepSeek4LayerSplitAdapter::begin_request(const GenerateRequest & req) {
 void DeepSeek4LayerSplitAdapter::reset_request_state() {
     cur_pos_ = 0;
     last_tok_ = -1;
+    prefill_last_logits_.clear();
     const size_t hc_size = hc_state_.size();
     std::fill(hc_state_.begin(), hc_state_.end(), 0.0f);
 
@@ -473,20 +474,21 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
     }
 
     // Local multi-GPU path: run each shard's layers sequentially and pass HC
-    // state at the boundaries. The final shard computes argmax on the GPU so
-    // greedy decode returns next_tok without copying the full vocabulary.
+    // state at the boundaries. Sampling requests full logits; greedy decode
+    // requests only the GPU argmax token.
     last_tok = -1;
     for (size_t si = 0; si < shards_.size(); ++si) {
         auto & shard = shards_[si];
         const bool is_last = (si == shards_.size() - 1);
         std::vector<float> * shard_logits = is_last ? logits_out : nullptr;
+        int32_t * shard_argmax = (is_last && !logits_out) ? &last_tok : nullptr;
         DeepSeek4StepTelemetry step_tel;
 
         if (!deepseek4_step_layer_range(
                 shard.backend, shard.weights, shard.cache,
                 hc_state_, embed.data(), n_tokens, base_pos,
                 shard.layer_begin, shard.layer_end,
-                shard_logits, is_last ? &last_tok : nullptr,
+                shard_logits, shard_argmax,
                 tokens.data(), timing ? &step_tel : nullptr)) {
             std::fprintf(stderr, "[deepseek4-split] forward failed on shard %zu\n", si);
             return false;
@@ -495,7 +497,10 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
     }
 
     cur_pos_ = base_pos + n_tokens;
-    if (last_tok < 0) {
+    if (logits_out) {
+        // The sampler replaces this placeholder from the returned logits.
+        last_tok = tokens.back();
+    } else if (last_tok < 0) {
         std::fprintf(stderr, "[deepseek4-split] local forward produced no argmax token\n");
         return false;
     }
@@ -595,7 +600,9 @@ bool DeepSeek4LayerSplitAdapter::prefill(
                                     prompt.begin() + chunk_end);
 
         std::vector<float> * logits_out =
-            (chunk_end >= n_prompt) ? &prefill_last_logits_ : nullptr;
+            (chunk_end >= n_prompt && sampler_.needs_logit_processing())
+                ? &prefill_last_logits_
+                : nullptr;
 
         if (!run_forward(chunk, base_pos + offset, last_tok, logits_out)) {
             return false;
