@@ -46,6 +46,77 @@ static bool ds4_env_flag(const char * name) {
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
+static size_t ds4_full_step_graph_size(int n_tokens) {
+    if (n_tokens <= 1) {
+        return 16384;
+    }
+    if (n_tokens <= 128) {
+        return 65536;
+    }
+    if (n_tokens <= 512) {
+        return 131072;
+    }
+    if (n_tokens <= 1024) {
+        return 262144;
+    }
+    if (n_tokens <= 2048) {
+        return 524288;
+    }
+    if (n_tokens <= 4096) {
+        return 1048576;
+    }
+    return 1572864;
+}
+
+static size_t ds4_full_step_meta_size(int n_tokens) {
+    const size_t graph_size = ds4_full_step_graph_size(n_tokens);
+    size_t arena_size = ggml_tensor_overhead() * 65536
+                      + ggml_graph_overhead_custom(graph_size, false)
+                      + 16 * 1024 * 1024
+                      + 1024 * 1024
+                      + 64 * 1024;
+    if (n_tokens >= 512) {
+        arena_size += (size_t)n_tokens * 32 * 1024;
+    }
+    if (n_tokens >= 1024) {
+        arena_size += 4 * 1024 * 1024;
+    }
+    if (n_tokens > 1024) {
+        // 2K-token full steps need a materially larger meta arena than the
+        // 1K-token path once the full graph and its late scratch tensors are
+        // fully materialized, so keep a coarse but stable reserve here.
+        arena_size += 256 * 1024 * 1024;
+    }
+    return arena_size;
+}
+
+static size_t ds4_attn_step_meta_size(int n_tokens) {
+    size_t arena_size = 48 * 1024 * 1024;
+    if (n_tokens >= 512) {
+        arena_size += (size_t)n_tokens * 32 * 1024;
+    }
+    return arena_size;
+}
+
+static size_t ds4_attn_step_graph_size(int n_tokens) {
+    if (n_tokens <= 1) {
+        return 2048;
+    }
+    if (n_tokens <= 512) {
+        return 32768;
+    }
+    if (n_tokens <= 1024) {
+        return 131072;
+    }
+    if (n_tokens <= 2048) {
+        return 262144;
+    }
+    if (n_tokens <= 4096) {
+        return 524288;
+    }
+    return 1048576;
+}
+
 template <typename Fn>
 static void ds4_parallel_for_tokens(int n_tokens, int min_parallel_tokens, Fn && fn) {
     if (n_tokens <= min_parallel_tokens) {
@@ -2679,8 +2750,7 @@ bool deepseek4_step(
     const int n_embd = w.n_embd;
     const int n_layer = w.n_layer;
 
-    // Create compute graph context — need large budget for MoE layers
-    const size_t ctx_size = ggml_tensor_overhead() * 65536 + 16 * 1024 * 1024;
+    const size_t ctx_size = ds4_full_step_meta_size(n_tokens);
     ggml_init_params params{};
     params.mem_size = ctx_size;
     params.mem_buffer = nullptr;
@@ -2694,7 +2764,7 @@ bool deepseek4_step(
     ggml_set_input(inp);
 
     ggml_tensor * cur = inp;
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 32768, false);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, ds4_full_step_graph_size(n_tokens), false);
     std::vector<DeepSeek4I32InputBinding> i32_inputs;
     std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
     std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
@@ -3105,7 +3175,7 @@ bool deepseek4_step_layer_range(
                 }
             } else {
                 const auto attn_build_t0 = Ds4TimingClock::now();
-                const size_t ctx_size = 48 * 1024 * 1024;
+                const size_t ctx_size = ds4_attn_step_meta_size(n_tokens);
                 ggml_init_params params{};
                 params.mem_size = ctx_size;
                 params.mem_buffer = nullptr;
@@ -3118,7 +3188,7 @@ bool deepseek4_step_layer_range(
                 std::vector<DeepSeek4I32InputBinding> i32_inputs;
                 std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
                 std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
-                const size_t graph_size = n_tokens > 1 ? 32768 : 2048;
+                const size_t graph_size = ds4_attn_step_graph_size(n_tokens);
                 gf = ggml_new_graph_custom(ctx, graph_size, false);
 
                 ggml_tensor * normed = build_rms_norm(ctx, inp, L.attn_norm, w.rms_eps);
