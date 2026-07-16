@@ -21,6 +21,104 @@ using to_fp32_cuda_t = void (*)(const void *, float *, int64_t, cudaStream_t);
 extern "C++" to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 
 namespace dflash::common {
+namespace {
+
+bool is_meta_tensor(const ggml_tensor * tensor) {
+    return tensor && tensor->buffer &&
+        ggml_backend_buft_is_meta(
+            ggml_backend_buffer_get_type(tensor->buffer));
+}
+
+bool tensor_slice_to_f32(const ggml_tensor * tensor,
+                         size_t offset,
+                         size_t n_elements,
+                         std::vector<float> & out) {
+    if (!tensor) return false;
+    const size_t bytes = ggml_row_size(tensor->type, (int64_t) n_elements);
+    std::vector<uint8_t> packed(bytes);
+    ggml_backend_tensor_get(tensor, packed.data(), offset, bytes);
+    out.resize(n_elements);
+
+    if (tensor->type == GGML_TYPE_F32) {
+        std::memcpy(out.data(), packed.data(), bytes);
+        return true;
+    }
+    if (tensor->type == GGML_TYPE_F16) {
+        ggml_fp16_to_fp32_row(
+            reinterpret_cast<const ggml_fp16_t *>(packed.data()),
+            out.data(), (int64_t) n_elements);
+        return true;
+    }
+    if (tensor->type == GGML_TYPE_BF16) {
+        ggml_bf16_to_fp32_row(
+            reinterpret_cast<const ggml_bf16_t *>(packed.data()),
+            out.data(), (int64_t) n_elements);
+        return true;
+    }
+    const auto * traits = ggml_get_type_traits(tensor->type);
+    if (!traits || !traits->to_float) return false;
+    traits->to_float(packed.data(), out.data(), (int64_t) n_elements);
+    return true;
+}
+
+bool restore_meta_ssm_state(const ggml_tensor * captured,
+                            int capture_index,
+                            ggml_tensor * destination) {
+    const size_t n_elements = (size_t) ggml_nelements(destination);
+    std::vector<float> state;
+    if (!tensor_slice_to_f32(captured,
+                             (size_t) capture_index * captured->nb[3],
+                             n_elements, state)) {
+        return false;
+    }
+    ggml_backend_tensor_set(destination, state.data(), 0,
+                            state.size() * sizeof(float));
+    return true;
+}
+
+bool restore_meta_conv_state(const ggml_tensor * captured,
+                             const std::vector<int> & source_slots,
+                             ggml_tensor * destination) {
+    if (!captured || !destination ||
+        captured->type != GGML_TYPE_F32 ||
+        destination->type != GGML_TYPE_F32 ||
+        (int64_t) source_slots.size() != destination->ne[0]) {
+        return false;
+    }
+
+    std::vector<float> source((size_t) ggml_nelements(captured));
+    ggml_backend_tensor_get(captured, source.data(), 0,
+                            source.size() * sizeof(float));
+    std::vector<float> dest((size_t) ggml_nelements(destination));
+    const int64_t source_width = captured->ne[0];
+    const int64_t dest_width = destination->ne[0];
+    const int64_t rows = destination->ne[1] * destination->ne[2] *
+                         destination->ne[3];
+    for (int64_t row = 0; row < rows; ++row) {
+        for (int64_t col = 0; col < dest_width; ++col) {
+            const int slot = source_slots[(size_t) col];
+            if (slot < 0 || slot >= source_width) return false;
+            dest[(size_t) row * dest_width + (size_t) col] =
+                source[(size_t) row * source_width + (size_t) slot];
+        }
+    }
+    ggml_backend_tensor_set(destination, dest.data(), 0,
+                            dest.size() * sizeof(float));
+    return true;
+}
+
+bool copy_meta_tensor_range(ggml_tensor * tensor,
+                            size_t destination_offset,
+                            size_t source_offset,
+                            size_t bytes) {
+    if (!tensor || bytes == 0) return tensor != nullptr;
+    std::vector<uint8_t> staging(bytes);
+    ggml_backend_tensor_get(tensor, staging.data(), source_offset, bytes);
+    ggml_backend_tensor_set(tensor, staging.data(), destination_offset, bytes);
+    return true;
+}
+
+}  // namespace
 
 Qwen35DFlashTarget::~Qwen35DFlashTarget() {
     step_graph_destroy(proj_sg_);
@@ -355,6 +453,8 @@ bool Qwen35DFlashTarget::rollback_to_tree(
     }
 
     const int n_delta = (int)sg_.delta_captures.size();
+    const bool meta_backend = is_meta_tensor(cache_.ssm_state.empty()
+        ? nullptr : cache_.ssm_state.front());
     cudaStream_t stream = nullptr;
     for (int il = 0; il < n_delta; il++) {
         const DeltaNetCapture & cap = sg_.delta_captures[il];
@@ -372,27 +472,42 @@ bool Qwen35DFlashTarget::rollback_to_tree(
             (size_t)cache_.ssm_state[il]->ne[0] *
             (size_t)cache_.ssm_state[il]->ne[1] *
             (size_t)cache_.ssm_state[il]->ne[2];
-        const size_t ssm_src_offset =
-            (size_t)rollback_dfs * cap.ssm_intermediate_states->nb[3];
-        const void * ssm_src =
-            (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
-        if (cap.ssm_intermediate_states->type == GGML_TYPE_F32) {
-            const cudaError_t ce = cudaMemcpyAsync(cache_.ssm_state[il]->data, ssm_src,
-                                                    ssm_elems * sizeof(float),
-                                                    cudaMemcpyDeviceToDevice, stream);
-            if (ce != cudaSuccess) {
-                std::fprintf(stderr, "rollback_to_tree: F32 SSM copy failed at layer %d: %s\n",
-                             il, cudaGetErrorString(ce));
+        if (meta_backend) {
+            if (!restore_meta_ssm_state(cap.ssm_intermediate_states,
+                                        rollback_dfs,
+                                        cache_.ssm_state[il])) {
+                std::fprintf(stderr,
+                    "rollback_to_tree: meta SSM restore failed (layer %d)\n", il);
                 return false;
             }
         } else {
-            const auto to_fp32 = ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type);
-            if (!to_fp32) {
-                std::fprintf(stderr, "rollback_to_tree: no fp32 converter for type %d (layer %d)\n",
-                             (int)cap.ssm_intermediate_states->type, il);
-                return false;
+            const size_t ssm_src_offset =
+                (size_t)rollback_dfs * cap.ssm_intermediate_states->nb[3];
+            const void * ssm_src =
+                (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
+            if (cap.ssm_intermediate_states->type == GGML_TYPE_F32) {
+                const cudaError_t ce = cudaMemcpyAsync(
+                    cache_.ssm_state[il]->data, ssm_src,
+                    ssm_elems * sizeof(float), cudaMemcpyDeviceToDevice,
+                    stream);
+                if (ce != cudaSuccess) {
+                    std::fprintf(stderr,
+                        "rollback_to_tree: F32 SSM copy failed at layer %d: %s\n",
+                        il, cudaGetErrorString(ce));
+                    return false;
+                }
+            } else {
+                const auto to_fp32 =
+                    ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type);
+                if (!to_fp32) {
+                    std::fprintf(stderr,
+                        "rollback_to_tree: no fp32 converter for type %d (layer %d)\n",
+                        (int)cap.ssm_intermediate_states->type, il);
+                    return false;
+                }
+                to_fp32(ssm_src, (float *)cache_.ssm_state[il]->data,
+                         (int64_t)ssm_elems, stream);
             }
-            to_fp32(ssm_src, (float *)cache_.ssm_state[il]->data, (int64_t)ssm_elems, stream);
         }
 
         // Conv state ← the K-1 most recent inputs along rollback_dfs's ancestry.
@@ -401,7 +516,30 @@ bool Qwen35DFlashTarget::rollback_to_tree(
         const size_t elt = ggml_element_size(cap.conv_input);
         const size_t dpitch = (K_conv - 1) * elt;
         const size_t spitch = cap.conv_input->nb[1];
-        if (!walked_sibling) {
+        if (meta_backend) {
+            std::vector<int> source_slots((size_t) K_conv - 1);
+            if (!walked_sibling) {
+                for (int k = 0; k < K_conv - 1; ++k) {
+                    source_slots[(size_t) k] = rollback_dfs + 1 + k;
+                }
+            } else {
+                int virt[K_conv - 1];
+                virt[K_conv - 2] = rollback_dfs;
+                for (int k = K_conv - 3; k >= 0; --k) {
+                    const int prev = virt[k + 1];
+                    virt[k] = prev >= 0 ? (int) tree.parents[prev] : prev - 1;
+                }
+                for (int k = 0; k < K_conv - 1; ++k) {
+                    source_slots[(size_t) k] = (K_conv - 1) + virt[k];
+                }
+            }
+            if (!restore_meta_conv_state(cap.conv_input, source_slots,
+                                         cache_.conv_state[il])) {
+                std::fprintf(stderr,
+                    "rollback_to_tree: meta conv restore failed (layer %d)\n", il);
+                return false;
+            }
+        } else if (!walked_sibling) {
             // Fast path: K-1 contiguous slots ending at rollback_dfs.
             const int conv_off = rollback_dfs + 1;
             const void * conv_src =
@@ -453,9 +591,16 @@ bool Qwen35DFlashTarget::rollback_to_tree(
             if (src_dfs == d) continue;
             const size_t src_off = (size_t)((committed + src_dfs) % tcap) * col_stride;
             const size_t dst_off = (size_t)((committed + d)       % tcap) * col_stride;
-            cudaMemcpyAsync((char *)cache_.target_feat->data + dst_off,
-                            (const char *)cache_.target_feat->data + src_off,
-                            (size_t)fc_in * elt, cudaMemcpyDeviceToDevice, stream);
+            if (meta_backend) {
+                if (!copy_meta_tensor_range(cache_.target_feat, dst_off, src_off,
+                                            (size_t) fc_in * elt)) {
+                    return false;
+                }
+            } else {
+                cudaMemcpyAsync((char *)cache_.target_feat->data + dst_off,
+                                (const char *)cache_.target_feat->data + src_off,
+                                (size_t)fc_in * elt, cudaMemcpyDeviceToDevice, stream);
+            }
         }
     }
 
@@ -475,17 +620,28 @@ bool Qwen35DFlashTarget::rollback_to_tree(
             for (int h = 0; h < n_kv; h++) {
                 const size_t head_src = src_off + (size_t)h * ck->nb[2];
                 const size_t head_dst = dst_off + (size_t)h * ck->nb[2];
-                cudaMemcpyAsync((char *)ck->data + head_dst,
-                                (const char *)ck->data + head_src,
-                                slot_bytes, cudaMemcpyDeviceToDevice, stream);
-                cudaMemcpyAsync((char *)cv->data + head_dst,
-                                (const char *)cv->data + head_src,
-                                slot_bytes, cudaMemcpyDeviceToDevice, stream);
+                if (meta_backend) {
+                    if (!copy_meta_tensor_range(ck, head_dst, head_src, slot_bytes) ||
+                        !copy_meta_tensor_range(cv, head_dst, head_src, slot_bytes)) {
+                        return false;
+                    }
+                } else {
+                    cudaMemcpyAsync((char *)ck->data + head_dst,
+                                    (const char *)ck->data + head_src,
+                                    slot_bytes, cudaMemcpyDeviceToDevice, stream);
+                    cudaMemcpyAsync((char *)cv->data + head_dst,
+                                    (const char *)cv->data + head_src,
+                                    slot_bytes, cudaMemcpyDeviceToDevice, stream);
+                }
             }
         }
     }
 
-    cudaStreamSynchronize(stream);
+    if (meta_backend) {
+        ggml_backend_synchronize(backend_);
+    } else {
+        cudaStreamSynchronize(stream);
+    }
     // kvflash: the tree graph writes KV directly (not slot-mapped), so this is
     // the single owning point that advances the pager for tree-committed
     // positions. Covers both the greedy and sampled tree fast paths; chain
@@ -563,6 +719,8 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
         return true;
     }
     const int rollback_idx = commit_n - 1;  // index into per-step intermediates
+    const bool meta_backend = is_meta_tensor(cache_.ssm_state.empty()
+        ? nullptr : cache_.ssm_state.front());
     cudaStream_t stream = nullptr;
 
     for (int il = 0; il < n_delta; il++) {
@@ -595,33 +753,48 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
             (size_t)cache_.ssm_state[il]->ne[0] *
             (size_t)cache_.ssm_state[il]->ne[1] *
             (size_t)cache_.ssm_state[il]->ne[2];
-        const size_t ssm_src_offset =
-            (size_t)rollback_idx * cap.ssm_intermediate_states->nb[3];
-        const void * ssm_src =
-            (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
-        if (cap.ssm_intermediate_states->type == GGML_TYPE_F32) {
-            const size_t ssm_bytes = ssm_elems * sizeof(float);
-            const cudaError_t ce = cudaMemcpyAsync(cache_.ssm_state[il]->data, ssm_src,
-                                                    ssm_bytes,
-                                                    cudaMemcpyDeviceToDevice, stream);
-            if (ce != cudaSuccess) {
+        if (meta_backend) {
+            if (!restore_meta_ssm_state(cap.ssm_intermediate_states,
+                                        rollback_idx,
+                                        cache_.ssm_state[il])) {
                 if (kFastRollbackDiag) {
-                    std::fprintf(stderr, "rollback_to: F32 SSM copy failed layer=%d: %s\n",
-                                 il, cudaGetErrorString(ce));
+                    std::fprintf(stderr,
+                        "rollback_to: meta SSM restore failed layer=%d\n", il);
                 }
                 return false;
             }
         } else {
-            const auto to_fp32 = ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type);
-            if (!to_fp32) {
-                if (kFastRollbackDiag) {
-                    std::fprintf(stderr, "rollback_to: no fp32 converter type=%d layer=%d\n",
-                                 (int)cap.ssm_intermediate_states->type, il);
+            const size_t ssm_src_offset =
+                (size_t)rollback_idx * cap.ssm_intermediate_states->nb[3];
+            const void * ssm_src =
+                (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
+            if (cap.ssm_intermediate_states->type == GGML_TYPE_F32) {
+                const size_t ssm_bytes = ssm_elems * sizeof(float);
+                const cudaError_t ce = cudaMemcpyAsync(
+                    cache_.ssm_state[il]->data, ssm_src, ssm_bytes,
+                    cudaMemcpyDeviceToDevice, stream);
+                if (ce != cudaSuccess) {
+                    if (kFastRollbackDiag) {
+                        std::fprintf(stderr,
+                            "rollback_to: F32 SSM copy failed layer=%d: %s\n",
+                            il, cudaGetErrorString(ce));
+                    }
+                    return false;
                 }
-                return false;
+            } else {
+                const auto to_fp32 =
+                    ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type);
+                if (!to_fp32) {
+                    if (kFastRollbackDiag) {
+                        std::fprintf(stderr,
+                            "rollback_to: no fp32 converter type=%d layer=%d\n",
+                            (int)cap.ssm_intermediate_states->type, il);
+                    }
+                    return false;
+                }
+                to_fp32(ssm_src, (float *)cache_.ssm_state[il]->data,
+                         (int64_t)ssm_elems, stream);
             }
-            to_fp32(ssm_src, (float *)cache_.ssm_state[il]->data,
-                    (int64_t)ssm_elems, stream);
         }
 
         // Conv rollback: copy conv_input[commit_n..commit_n+K-2, :, :]
@@ -636,26 +809,45 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
             }
             return false;
         }
-        const int row_cnt = (int)cap.conv_input->ne[1];
-        const size_t elt = ggml_element_size(cap.conv_input);
-        const size_t dpitch = (K_conv - 1) * elt;
-        const size_t spitch = cap.conv_input->nb[1];
-        const size_t width  = (K_conv - 1) * elt;
-        const void * conv_src =
-            (const char *)cap.conv_input->data + commit_n * elt;
-        cudaError_t ce = cudaMemcpy2DAsync(cache_.conv_state[il]->data, dpitch,
-                                           conv_src, spitch,
-                                           width, row_cnt,
-                                           cudaMemcpyDeviceToDevice, stream);
-        if (ce != cudaSuccess) {
-            if (kFastRollbackDiag) {
-                std::fprintf(stderr, "rollback_to: cudaMemcpy2D conv layer=%d: %s\n",
-                             il, cudaGetErrorString(ce));
+        if (meta_backend) {
+            std::vector<int> source_slots((size_t) K_conv - 1);
+            for (int k = 0; k < K_conv - 1; ++k) {
+                source_slots[(size_t) k] = commit_n + k;
             }
-            return false;
+            if (!restore_meta_conv_state(cap.conv_input, source_slots,
+                                         cache_.conv_state[il])) {
+                if (kFastRollbackDiag) {
+                    std::fprintf(stderr,
+                        "rollback_to: meta conv restore failed layer=%d\n", il);
+                }
+                return false;
+            }
+        } else {
+            const int row_cnt = (int)cap.conv_input->ne[1];
+            const size_t elt = ggml_element_size(cap.conv_input);
+            const size_t dpitch = (K_conv - 1) * elt;
+            const size_t spitch = cap.conv_input->nb[1];
+            const size_t width  = (K_conv - 1) * elt;
+            const void * conv_src =
+                (const char *)cap.conv_input->data + commit_n * elt;
+            cudaError_t ce = cudaMemcpy2DAsync(cache_.conv_state[il]->data, dpitch,
+                                               conv_src, spitch,
+                                               width, row_cnt,
+                                               cudaMemcpyDeviceToDevice, stream);
+            if (ce != cudaSuccess) {
+                if (kFastRollbackDiag) {
+                    std::fprintf(stderr, "rollback_to: cudaMemcpy2D conv layer=%d: %s\n",
+                                 il, cudaGetErrorString(ce));
+                }
+                return false;
+            }
         }
     }
-    cudaStreamSynchronize(stream);
+    if (meta_backend) {
+        ggml_backend_synchronize(backend_);
+    } else {
+        cudaStreamSynchronize(stream);
+    }
 
     cache_.cur_pos = base_pos + commit_n;
     return true;
@@ -724,7 +916,7 @@ bool Qwen35DFlashTarget::project_hidden_to_topk(
         const char * v = std::getenv("DFLASH_GPU_DRAFT_TOPK");
         return v == nullptr || v[0] != '0';
     }();
-    if (kGpuDraftTopk &&
+    if (kGpuDraftTopk && !is_meta_tensor(proj_sg_.logits) &&
         geometric_extract_draft_topk_cuda(proj_sg_.logits->data, n_tokens, vocab, K,
                                 top_log_probs.data(), top_token_ids.data(),
                                 temperature)) {

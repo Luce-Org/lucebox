@@ -169,11 +169,6 @@ static bool validate_server_placement(const BackendArgs & bargs,
                 "[server] tensor parallelism does not yet support prefill compression\n");
             return false;
         }
-        if (bargs.draft_path) {
-            std::fprintf(stderr,
-                "[server] tensor parallelism does not yet support a DFlash draft\n");
-            return false;
-        }
     }
     const bool mixed_target_split =
         bargs.device.is_layer_split() && bargs.device.is_mixed_layer_split();
