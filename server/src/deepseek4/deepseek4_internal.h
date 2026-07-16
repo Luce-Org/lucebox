@@ -383,6 +383,7 @@ bool deepseek4_step_layer_range(
     int                         layer_begin,
     int                         layer_end,
     std::vector<float> *        out_logits,
+    int32_t *                   out_argmax = nullptr,
     const int32_t *             token_ids = nullptr,
     DeepSeek4StepTelemetry *    telemetry = nullptr,
     bool                        allow_decode_graph_reuse = true,

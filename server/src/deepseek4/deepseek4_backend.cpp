@@ -839,7 +839,8 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             std::vector<float> hc_state;
             ok = deepseek4_step_layer_range(
                 backend_, w_, cache_, hc_state, embed.data(), n_tok, pos,
-                0, w_.n_layer, &logits, tokens.data() + i,
+                0, w_.n_layer, &logits, /*out_argmax=*/nullptr,
+                tokens.data() + i,
                 timing ? &step_tel : nullptr,
                 cfg_.prefill_mode != PrefillAttentionMode::Sparse, hp);
         }

@@ -472,8 +472,10 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
         return run_mixed_forward(tokens, base_pos, last_tok, logits_out);
     }
 
-    // Local multi-GPU path: run each shard's layers sequentially
-    // Pass HC state between shards at boundaries
+    // Local multi-GPU path: run each shard's layers sequentially and pass HC
+    // state at the boundaries. The final shard computes argmax on the GPU so
+    // greedy decode returns next_tok without copying the full vocabulary.
+    last_tok = -1;
     for (size_t si = 0; si < shards_.size(); ++si) {
         auto & shard = shards_[si];
         const bool is_last = (si == shards_.size() - 1);
@@ -484,7 +486,8 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
                 shard.backend, shard.weights, shard.cache,
                 hc_state_, embed.data(), n_tokens, base_pos,
                 shard.layer_begin, shard.layer_end,
-                shard_logits, tokens.data(), timing ? &step_tel : nullptr)) {
+                shard_logits, is_last ? &last_tok : nullptr,
+                tokens.data(), timing ? &step_tel : nullptr)) {
             std::fprintf(stderr, "[deepseek4-split] forward failed on shard %zu\n", si);
             return false;
         }
@@ -492,7 +495,10 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
     }
 
     cur_pos_ = base_pos + n_tokens;
-    last_tok = tokens.back();
+    if (last_tok < 0) {
+        std::fprintf(stderr, "[deepseek4-split] local forward produced no argmax token\n");
+        return false;
+    }
     last_tok_ = last_tok;
 
     if (logits_out && !logits_out->empty()) {
@@ -535,7 +541,8 @@ bool DeepSeek4LayerSplitAdapter::run_mixed_forward(
                                      local_shard.cache, hc_state_,
                                      embed.data(), n_tokens, base_pos,
                                      local_shard.layer_begin, local_shard.layer_end,
-                                     &hidden_out, tokens.data(), timing ? &local_tel : nullptr)) {
+                                     &hidden_out, /*out_argmax=*/nullptr,
+                                     tokens.data(), timing ? &local_tel : nullptr)) {
         std::fprintf(stderr, "[deepseek4-split] local shard forward failed\n");
         return false;
     }

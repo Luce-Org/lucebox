@@ -379,8 +379,8 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
     hooks.capture_out = &capture_out;
     hooks.all_logits_out = &all_logits;
     if (!deepseek4_step_layer_range(backend, w, cache, hc_state, embed, n_tokens, kv_start,
-                                    0, w.n_layer, &last_logits, token_ids,
-                                    telemetry, allow_graph_reuse,
+                                    0, w.n_layer, &last_logits, /*out_argmax=*/nullptr,
+                                    token_ids, telemetry, allow_graph_reuse,
                                     &hooks)) {
         std::fprintf(stderr, "[ds4-verify] step_layer_range returned false (n_tokens=%d kv_start=%d)\n",
                      n_tokens, kv_start);

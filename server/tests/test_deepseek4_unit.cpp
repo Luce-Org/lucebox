@@ -2116,6 +2116,7 @@ static void test_output_graph_reuse_microbench(ggml_backend_t backend) {
     std::vector<float> lm_head((size_t) n_embd * n_vocab);
     std::vector<float> rebuild_logits((size_t) n_vocab * n_tokens);
     std::vector<float> cached_logits((size_t) n_vocab * n_tokens);
+    std::vector<int32_t> cached_argmax((size_t) n_tokens, -1);
 
     std::mt19937 rng(7);
     std::uniform_real_distribution<float> dist(-0.2f, 0.2f);
@@ -2180,8 +2181,11 @@ static void test_output_graph_reuse_microbench(ggml_backend_t backend) {
     ggml_set_input(lm_head_t);
     ggml_tensor * norm = ggml_mul(ctx, ggml_rms_norm(ctx, inp_t, 1.0e-6f), norm_w_t);
     ggml_tensor * logits = ggml_mul_mat(ctx, lm_head_t, norm);
+    ggml_tensor * argmax_tokens = ggml_argmax(ctx, logits);
     ggml_set_output(logits);
+    ggml_set_output(argmax_tokens);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 128, false);
+    ggml_build_forward_expand(gf, argmax_tokens);
     ggml_build_forward_expand(gf, logits);
     ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
     bool alloc_ok = ggml_gallocr_alloc_graph(alloc, gf);
@@ -2204,6 +2208,8 @@ static void test_output_graph_reuse_microbench(ggml_backend_t backend) {
         TEST_ASSERT(ok);
         if (ok) {
             ggml_backend_tensor_get(logits, cached_logits.data(), 0, cached_logits.size() * sizeof(float));
+            ggml_backend_tensor_get(argmax_tokens, cached_argmax.data(), 0,
+                                    cached_argmax.size() * sizeof(int32_t));
         }
         cached_total_ms += elapsed_ms(t0, t1);
     }
@@ -2214,6 +2220,17 @@ static void test_output_graph_reuse_microbench(ggml_backend_t backend) {
     for (size_t i = 0; i < cached_logits.size(); ++i) {
         TEST_ASSERT_MSG(std::isfinite(cached_logits[i]), "cached output logits must be finite");
         TEST_ASSERT_MSG(std::isfinite(rebuild_logits[i]), "rebuilt output logits must be finite");
+    }
+    for (int token = 0; token < n_tokens; ++token) {
+        int32_t expected = 0;
+        const size_t offset = (size_t) token * n_vocab;
+        for (int vocab = 1; vocab < n_vocab; ++vocab) {
+            if (cached_logits[offset + (size_t) vocab] >
+                cached_logits[offset + (size_t) expected]) {
+                expected = vocab;
+            }
+        }
+        TEST_ASSERT(cached_argmax[(size_t) token] == expected);
     }
 
     std::fprintf(stderr, " rebuild_avg=%.3fms cached_avg=%.3fms\n",

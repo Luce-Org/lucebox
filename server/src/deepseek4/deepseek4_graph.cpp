@@ -246,7 +246,8 @@ struct DeepSeek4CachedDecodeOutputGraph {
 
     bool valid() const {
         return owner_ctx && backend && n_tokens > 0 &&
-               sg.ctx && sg.gf && sg.alloc && sg.hidden_input && sg.logits;
+               sg.ctx && sg.gf && sg.alloc && sg.hidden_input && sg.logits &&
+               sg.argmax_tokens;
     }
 
     void free() {
@@ -498,8 +499,11 @@ static bool build_cached_decode_output_graph(
     ggml_set_input(out.sg.hidden_input);
     ggml_tensor * normed = build_rms_norm(out.sg.ctx, out.sg.hidden_input, w.out_norm, w.rms_eps);
     out.sg.logits = ggml_mul_mat(out.sg.ctx, w.output, normed);
+    out.sg.argmax_tokens = ggml_argmax(out.sg.ctx, out.sg.logits);
     ggml_set_output(out.sg.logits);
+    ggml_set_output(out.sg.argmax_tokens);
     out.sg.gf = ggml_new_graph_custom(out.sg.ctx, 1024, false);
+    ggml_build_forward_expand(out.sg.gf, out.sg.argmax_tokens);
     ggml_build_forward_expand(out.sg.gf, out.sg.logits);
 
     out.sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -4272,7 +4276,7 @@ bool deepseek4_step(
     std::vector<float> hc_state;
     return deepseek4_step_layer_range(
         backend, w, cache, hc_state, embed, n_tokens, kv_start,
-        0, w.n_layer, &out_logits, token_ids, telemetry,
+        0, w.n_layer, &out_logits, /*out_argmax=*/nullptr, token_ids, telemetry,
         /*allow_decode_graph_reuse=*/verify_hooks == nullptr, verify_hooks);
 }
 
@@ -4726,7 +4730,11 @@ static bool ds4_build_fused_decode_graph(
     ggml_tensor * final_2d = ggml_reshape_2d(ctx, final_embd, n_embd, 1);
     ggml_tensor * out_normed = build_rms_norm(ctx, final_2d, w.out_norm, w.rms_eps);
     fg.logits = ggml_mul_mat(ctx, w.output, out_normed);
+    fg.sg.logits = fg.logits;
+    fg.sg.argmax_tokens = ggml_argmax(ctx, fg.logits);
     ggml_set_output(fg.logits);
+    ggml_set_output(fg.sg.argmax_tokens);
+    ggml_build_forward_expand(gf, fg.sg.argmax_tokens);
     ggml_build_forward_expand(gf, fg.logits);
 
     if (!fg.sg.alloc) {
@@ -4743,8 +4751,9 @@ static bool ds4_build_fused_decode_graph(
 
 #include "deepseek4_fused_verify.inc"
 
-// Returns 1 on success (out_logits filled), 0 to fall back to the per-layer
-// path, -1 on a hard failure after cache state may have been touched.
+// Returns 1 on success, 0 to fall back to the per-layer path, or -1 on a hard
+// failure after cache state may have been touched. Full logits are copied only
+// when requested; greedy decode reads the GPU-side argmax token instead.
 static int ds4_try_fused_decode_step(
         DeepSeek4FusedDecodeCache & fc,
         ggml_backend_t backend,
@@ -4756,7 +4765,8 @@ static int ds4_try_fused_decode_step(
         std::vector<int32_t> & hash_scratch,
         const float * embed,
         int kv_start,
-        std::vector<float> & out_logits,
+        std::vector<float> * out_logits,
+        int32_t * out_argmax,
         const int32_t * token_ids,
         DeepSeek4StepTelemetry * telemetry) {
     if (fc.disabled) return 0;
@@ -4927,11 +4937,17 @@ static int ds4_try_fused_decode_step(
     }
     if (telemetry) telemetry->full_graph_compute_us += ds4_elapsed_us(compute_t0, Ds4TimingClock::now());
 
-    // ── Read logits ─────────────────────────────────────────────────
+    // ── Read requested output ───────────────────────────────────────
     const auto read_t0 = Ds4TimingClock::now();
-    out_logits.resize((size_t) w.n_vocab);
-    ggml_backend_tensor_get(fg->logits, out_logits.data(), 0,
-                            sizeof(float) * (size_t) w.n_vocab);
+    if (out_logits) {
+        out_logits->resize((size_t) w.n_vocab);
+        ggml_backend_tensor_get(fg->logits, out_logits->data(), 0,
+                                sizeof(float) * (size_t) w.n_vocab);
+    }
+    if (out_argmax) {
+        ggml_backend_tensor_get(fg->sg.argmax_tokens, out_argmax, 0,
+                                sizeof(*out_argmax));
+    }
     if (telemetry) telemetry->full_graph_read_us += ds4_elapsed_us(read_t0, Ds4TimingClock::now());
     return 1;
 }
@@ -5705,12 +5721,14 @@ bool deepseek4_step_layer_range(
         int layer_begin,
         int layer_end,
         std::vector<float> * out_logits,
+        int32_t * out_argmax,
         const int32_t * token_ids,
         DeepSeek4StepTelemetry * telemetry,
         bool allow_decode_graph_reuse,
         Ds4VerifyHooks * verify_hooks) {
     const auto step_t0 = Ds4TimingClock::now();
 
+    if (out_argmax) *out_argmax = -1;
     // ── Partial layer-range forward with HC ─────────────────────────────
     const int n_embd = w.n_embd;
     const int n_hc = w.n_hc;
@@ -5763,6 +5781,7 @@ bool deepseek4_step_layer_range(
                     embed + (size_t) off * input_width,
                     chunk, kv_start + off, layer_begin, layer_end,
                     out_logits ? &chunk_out : nullptr,
+                    /*out_argmax=*/nullptr,
                     token_ids ? token_ids + off : nullptr,
                     telemetry, allow_decode_graph_reuse, chunk_hooks_ptr)) {
                 return false;
@@ -5887,16 +5906,31 @@ bool deepseek4_step_layer_range(
 
     // Large full-model prefill batches use the device-resident layer-major
     // pipeline. DSpark verification remains on its exact q=2..4 path below.
+    // The pipeline emits last-position logits; greedy argmax requests reuse
+    // them through a scratch buffer and a host-side scan.
     if (n_tokens > 4 &&
         n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS && layer_begin == 0 &&
-        is_last_shard && out_logits && ds4_backend_is_gpu(backend)) {
+        is_last_shard && (out_logits || out_argmax) &&
+        ds4_backend_is_gpu(backend)) {
+        std::vector<float> layer_major_logits_scratch;
+        std::vector<float> & layer_major_logits =
+            out_logits ? *out_logits : layer_major_logits_scratch;
         const int prc = ds4_try_layer_major_prefill(
             fused_decode_graph_cache, backend, w, cache,
             hc_layer_weights_range, hc_output_weights_range,
             hash_routing_tables_range, scratch.hash_expert_ids, embed,
-            n_tokens, kv_start, *out_logits, token_ids, telemetry);
+            n_tokens, kv_start, layer_major_logits, token_ids, telemetry);
         if (prc < 0) return false;
         if (prc > 0) {
+            if (out_argmax && !layer_major_logits.empty()) {
+                int32_t best = 0;
+                for (size_t v = 1; v < layer_major_logits.size(); ++v) {
+                    if (layer_major_logits[v] > layer_major_logits[(size_t) best]) {
+                        best = (int32_t) v;
+                    }
+                }
+                *out_argmax = best;
+            }
             if (telemetry) {
                 telemetry->total_us += ds4_elapsed_us(
                     step_t0, Ds4TimingClock::now());
@@ -5929,11 +5963,11 @@ bool deepseek4_step_layer_range(
     }
     std::vector<float> fused_debug_logits;
     if (n_tokens == 1 && allow_decode_graph_reuse && layer_begin == 0 && is_last_shard &&
-        out_logits && ds4_backend_is_gpu(backend) && w.fused_decode) {
+        (out_logits || out_argmax) && ds4_backend_is_gpu(backend) && w.fused_decode) {
         const int rc = ds4_try_fused_decode_step(
             fused_decode_graph_cache, backend, w, cache, hc_layer_weights_range,
             hc_output_weights_range, hash_routing_tables_range, scratch.hash_expert_ids,
-            embed, kv_start, *out_logits, token_ids, telemetry);
+            embed, kv_start, out_logits, out_argmax, token_ids, telemetry);
         if (rc < 0) return false;
         if (rc > 0) {
             const int np = kv_start + 1;
@@ -6491,7 +6525,7 @@ bool deepseek4_step_layer_range(
     }
 
     // ── Output: HC pre → norm → lm_head (or return hidden state) ────────
-    if (is_last_shard && out_logits) {
+    if (is_last_shard && (out_logits || out_argmax)) {
         // Final HC pre for output
         const auto output_t0 = Ds4TimingClock::now();
         std::vector<float> & final_embd = scratch.final_embd;
@@ -6517,9 +6551,16 @@ bool deepseek4_step_layer_range(
             if (ggml_backend_graph_compute(backend, cached_decode_output_graph.sg.gf) != GGML_STATUS_SUCCESS) {
                 return false;
             }
-            out_logits->resize((size_t)w.n_vocab);
-            ggml_backend_tensor_get(cached_decode_output_graph.sg.logits,
-                                    out_logits->data(), 0, sizeof(float) * (size_t)w.n_vocab);
+            if (out_logits) {
+                out_logits->resize((size_t)w.n_vocab);
+                ggml_backend_tensor_get(cached_decode_output_graph.sg.logits,
+                                        out_logits->data(), 0,
+                                        sizeof(float) * (size_t)w.n_vocab);
+            }
+            if (out_argmax) {
+                ggml_backend_tensor_get(cached_decode_output_graph.sg.argmax_tokens,
+                                        out_argmax, 0, sizeof(*out_argmax));
+            }
         } else {
             const size_t ctx_size = 16 * 1024 * 1024;
             ggml_init_params params{};
@@ -6536,8 +6577,11 @@ bool deepseek4_step_layer_range(
             ggml_set_input(inp);
             ggml_tensor * normed = build_rms_norm(ctx, inp, w.out_norm, w.rms_eps);
             ggml_tensor * logits = ggml_mul_mat(ctx, w.output, normed);
+            ggml_tensor * argmax_tokens = ggml_argmax(ctx, logits);
             ggml_set_output(logits);
+            ggml_set_output(argmax_tokens);
             ggml_cgraph * gf = ggml_new_graph_custom(ctx, 1024, false);
+            ggml_build_forward_expand(gf, argmax_tokens);
             ggml_build_forward_expand(gf, logits);
 
             if (!cached_dynamic_output_alloc.valid() ||
@@ -6563,15 +6607,23 @@ bool deepseek4_step_layer_range(
                 return false;
             }
 
-            out_logits->resize((size_t)w.n_vocab);
             const size_t logits_offset = last_only ? 0 :
                 (size_t)(n_tokens - 1) * (size_t)w.n_vocab * sizeof(float);
-            ggml_backend_tensor_get(logits, out_logits->data(), logits_offset,
-                                    sizeof(float) * (size_t)w.n_vocab);
+            if (out_logits) {
+                out_logits->resize((size_t)w.n_vocab);
+                ggml_backend_tensor_get(logits, out_logits->data(), logits_offset,
+                                        sizeof(float) * (size_t)w.n_vocab);
+            }
             if (verify_hooks && verify_hooks->all_logits_out) {
                 verify_hooks->all_logits_out->resize((size_t) w.n_vocab * n_tokens);
                 ggml_backend_tensor_get(logits, verify_hooks->all_logits_out->data(), 0,
                                         sizeof(float) * (size_t) w.n_vocab * n_tokens);
+            }
+            if (out_argmax) {
+                const size_t argmax_offset = last_only ? 0 :
+                    (size_t)(n_tokens - 1) * sizeof(*out_argmax);
+                ggml_backend_tensor_get(argmax_tokens, out_argmax, argmax_offset,
+                                        sizeof(*out_argmax));
             }
             ggml_free(ctx);
         }
