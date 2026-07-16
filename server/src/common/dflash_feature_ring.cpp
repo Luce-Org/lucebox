@@ -345,6 +345,36 @@ bool draft_feature_mirror_sync_range(const ggml_tensor * src_target_feat,
     const int fc_in = mirror.n_target_layers * mirror.hidden_size;
     const size_t src_stride = src_target_feat->nb[1];
     const size_t dst_stride = mirror.target_feat->nb[1];
+    const bool meta_source = src_target_feat->buffer &&
+        ggml_backend_buft_is_meta(
+            ggml_backend_buffer_get_type(src_target_feat->buffer));
+
+    if (meta_source) {
+        const size_t src_row_bytes =
+            ggml_row_size(src_target_feat->type, fc_in);
+        const size_t dst_row_bytes =
+            ggml_row_size(mirror.storage_type, fc_in);
+        std::vector<ggml_bf16_t> bf16((size_t) fc_in);
+        std::vector<float> host((size_t) fc_in);
+        std::vector<uint8_t> converted(dst_row_bytes);
+
+        for (int i = 0; i < n_tokens; ++i) {
+            const int src_slot = (start_pos + i) % src_cap;
+            const int dst_slot = (start_pos + i) % mirror.cap;
+            ggml_backend_tensor_get(src_target_feat, bf16.data(),
+                                    (size_t) src_slot * src_stride,
+                                    src_row_bytes);
+            ggml_bf16_to_fp32_row(bf16.data(), host.data(), fc_in);
+            if (!host_f32_to_feature_row(mirror.storage_type, host.data(),
+                                         converted.data(), fc_in)) {
+                return false;
+            }
+            ggml_backend_tensor_set(mirror.target_feat, converted.data(),
+                                    (size_t) dst_slot * dst_stride,
+                                    dst_row_bytes);
+        }
+        return true;
+    }
 
     int done = 0;
     while (done < n_tokens) {
