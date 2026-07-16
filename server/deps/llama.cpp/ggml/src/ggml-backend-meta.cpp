@@ -491,6 +491,19 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     return it->second[index];
 }
 
+struct ggml_tensor * ggml_backend_meta_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
+    if (tensor == nullptr || tensor->buffer == nullptr ||
+        !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return nullptr;
+    }
+    ggml_backend_meta_buffer_context * buf_ctx =
+        (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+    if (index >= buf_ctx->bufs.size()) {
+        return nullptr;
+    }
+    return ggml_backend_meta_buffer_simple_tensor(tensor, index);
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(

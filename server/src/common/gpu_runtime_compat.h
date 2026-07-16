@@ -51,6 +51,8 @@
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyDefault hipMemcpyDefault
 #define cudaMemsetAsync hipMemsetAsync
+#define cudaPointerAttributes hipPointerAttribute_t
+#define cudaPointerGetAttributes hipPointerGetAttributes
 #define cudaStreamCreate hipStreamCreate
 #define cudaStreamDefault hipStreamDefault
 #define cudaStreamDestroy hipStreamDestroy

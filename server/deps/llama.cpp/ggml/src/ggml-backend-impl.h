@@ -94,6 +94,9 @@ extern "C" {
 
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
+    // Non-owning rank-local view. Compute-tensor views remain valid only until
+    // the meta backend rebuilds its graph tensor container.
+    GGML_API struct ggml_tensor * ggml_backend_meta_simple_tensor(const struct ggml_tensor * tensor, size_t index);
 
     // temporary workaround to statically allocate tensors from a context in a deduplicated way:
     GGML_API struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
