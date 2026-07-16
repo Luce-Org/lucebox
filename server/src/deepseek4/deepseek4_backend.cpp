@@ -678,6 +678,7 @@ bool DeepSeek4Backend::park(ParkTarget target) {
         free_deepseek4_snapshot(snapshots_[i]);
     }
     last_logits_.clear();
+    last_argmax_ = -1;
     free_deepseek4_cache(cache_);
     stream_engine_.destroy();
     moe_hybrid_.reset();
@@ -779,6 +780,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         reset_deepseek4_cache(cache_);
     }
     last_logits_.clear();
+    last_argmax_ = -1;
     int spec_capture_from = n_total;
     if (spec_enabled_ && spec_drafter_) {
         const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
@@ -803,6 +805,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             spec_capture_from = 0;
         }
     }
+    const bool need_logits = sampler_.needs_logit_processing();
     const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
     const auto phase_t0 = Clock::now();
     DeepSeek4StepTelemetry tel_acc;
@@ -821,6 +824,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (timing) step_tel.embed_us = elapsed_us(embed_t0, Clock::now());
 
         std::vector<float> logits;
+        int32_t argmax = -1;
         Ds4VerifyHooks spec_hooks;
         std::vector<float> spec_cap;
         Ds4VerifyHooks * hp = nullptr;
@@ -839,7 +843,9 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             std::vector<float> hc_state;
             ok = deepseek4_step_layer_range(
                 backend_, w_, cache_, hc_state, embed.data(), n_tok, pos,
-                0, w_.n_layer, &logits, /*out_argmax=*/nullptr,
+                0, w_.n_layer,
+                need_logits ? &logits : nullptr,
+                need_logits ? nullptr : &argmax,
                 tokens.data() + i,
                 timing ? &step_tel : nullptr,
                 cfg_.prefill_mode != PrefillAttentionMode::Sparse, hp);
@@ -862,7 +868,15 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             add_step_tel(tel_acc, step_tel);
             steps++;
         }
-        last_logits_ = std::move(logits);
+        if (moe_hybrid_ || need_logits) {
+            last_logits_ = std::move(logits);
+        } else {
+            if (argmax < 0 || argmax >= w_.n_vocab) {
+                std::fprintf(stderr, "[deepseek4] prefill produced invalid argmax token: %d\n", argmax);
+                return -1;
+            }
+            last_argmax_ = argmax;
+        }
         pos += n_tok;
     }
     if (timing) {
@@ -907,9 +921,14 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             break;
         }
 
-        // Get last logits and sample
+        // The all-hot monolithic path computes greedy argmax in the GGML GPU
+        // graph and reads back one int32. Hybrid expert placement and sampled
+        // or penalized requests still use the full-logit paths below.
         std::vector<float> logits;
-        if (generated == 0 && !last_logits_.empty()) {
+        int32_t next_token = -1;
+        if (generated == 0 && last_argmax_ >= 0) {
+            next_token = last_argmax_;
+        } else if (generated == 0 && !last_logits_.empty()) {
             logits = last_logits_;
         } else {
             std::vector<float> embed(w_.n_embd);
@@ -920,12 +939,25 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             if (timing) step_tel.embed_us = elapsed_us(embed_t0, Clock::now());
 
             const int pos = std::max(0, committed + generated - 1);
-            if (!deepseek4_step(backend_, w_, cache_, embed.data(), 1,
-                                pos, logits,
-                                moe_hybrid_.get(), &tok_to_eval,
-                                moe_hybrid_ ? &stream_engine_ : nullptr,
-                                timing ? &step_tel : nullptr,
-                                routing_stats_.get())) {
+            bool ok = false;
+            if (moe_hybrid_) {
+                ok = deepseek4_step(backend_, w_, cache_, embed.data(), 1,
+                                    pos, logits,
+                                    moe_hybrid_.get(), &tok_to_eval,
+                                    &stream_engine_,
+                                    timing ? &step_tel : nullptr,
+                                    routing_stats_.get());
+            } else {
+                std::vector<float> hc_state;
+                ok = deepseek4_step_layer_range(backend_, w_, cache_, hc_state,
+                                                embed.data(), 1, pos,
+                                                0, w_.n_layer,
+                                                process_logits ? &logits : nullptr,
+                                                process_logits ? nullptr : &next_token,
+                                                &tok_to_eval,
+                                                timing ? &step_tel : nullptr);
+            }
+            if (!ok) {
                 std::fprintf(stderr, "[deepseek4] decode step failed\n");
                 return false;
             }
@@ -935,23 +967,39 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             }
         }
 
-        int32_t next_token = 0;
-        const auto sample_t0 = Clock::now();
-        if (process_logits) {
-            next_token = sample_logits(logits.data(), w_.n_vocab, sampler_,
-                                       history, sampler_rng_);
-        } else {
-            float max_val = logits[0];
-            for (int i = 1; i < w_.n_vocab; i++) {
-                if (logits[i] > max_val) {
-                    max_val = logits[i];
-                    next_token = i;
+        // Full-logit paths either apply the configured sampler or use the
+        // hybrid placement's legacy CPU argmax fallback.
+        // TODO(ds4): add an argmax-only output to deepseek4_step() so shared
+        // expert/MoE hybrid decode also avoids the full-vocabulary D2H copy.
+        if (next_token < 0) {
+            if (logits.size() != (size_t) w_.n_vocab) {
+                std::fprintf(stderr,
+                             "[deepseek4] invalid logits payload: expected=%d got=%zu\n",
+                             w_.n_vocab, logits.size());
+                return false;
+            }
+            const auto sample_t0 = Clock::now();
+            if (process_logits) {
+                next_token = sample_logits(logits.data(), w_.n_vocab, sampler_,
+                                           history, sampler_rng_);
+            } else {
+                next_token = 0;
+                float max_val = logits[0];
+                for (int i = 1; i < w_.n_vocab; i++) {
+                    if (logits[i] > max_val) {
+                        max_val = logits[i];
+                        next_token = i;
+                    }
                 }
             }
+            if (timing) tel_acc.sample_us += elapsed_us(sample_t0, Clock::now());
         }
-        if (timing) tel_acc.sample_us += elapsed_us(sample_t0, Clock::now());
         if (process_logits) {
             history.push_back(next_token);
+        }
+        if (next_token >= w_.n_vocab) {
+            std::fprintf(stderr, "[deepseek4] decode produced invalid argmax token: %d\n", next_token);
+            return false;
         }
         out_tokens.push_back(next_token);
         const auto emit_t0 = Clock::now();
@@ -1006,13 +1054,18 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
     const bool sampling_requires_ar = sampler_.needs_logit_processing();
     if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 &&
         !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar) {
-        if (last_logits_.empty()) {
-            result.fail(GenerateErrorCode::DecodeFailed, "spec: no prefill logits");
+        // Greedy all-hot prefill retains the GPU argmax token; hybrid prefill
+        // still retains full logits and seeds via a host argmax scan.
+        int seed = last_argmax_;
+        if (seed < 0 && !last_logits_.empty()) {
+            seed = 0;
+            float mv = last_logits_[0];
+            for (int i = 1; i < w_.n_vocab; i++) if (last_logits_[i] > mv) { mv = last_logits_[i]; seed = i; }
+        }
+        if (seed < 0) {
+            result.fail(GenerateErrorCode::DecodeFailed, "spec: no prefill output");
             return result;
         }
-        int seed = 0;
-        { float mv = last_logits_[0];
-          for (int i = 1; i < w_.n_vocab; i++) if (last_logits_[i] > mv) { mv = last_logits_[i]; seed = i; } }
         std::vector<int32_t> gen;
         gen.push_back(seed);
         out_io.emit(seed);
