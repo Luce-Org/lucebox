@@ -47,8 +47,11 @@ struct StepGraph {
     // reused by the copy-mode persistent fast path.
     bool            built_view = false;
     ggml_tensor *   hidden_input = nullptr;        // lm-head projection only
-    // [n_tokens,n_head_kv] i64; step-invariant KV write (carries kv_start). Null on non-graph paths.
+    // [n_tokens,n_head_kv] i64; step-invariant KV write. Null on non-graph paths.
     ggml_tensor *   kv_write_rows = nullptr;
+    // Non-pooled decode writes into a bucket-local cache view; callers upload
+    // logical_row - kv_write_row_base. Pooled KVFlash slots leave this at 0.
+    int             kv_write_row_base = 0;
 
     // Output
     ggml_tensor *   logits = nullptr;
@@ -79,6 +82,7 @@ inline void step_graph_free(StepGraph & sg) {
     sg.hidden_input = nullptr;
     sg.parent_ids = nullptr;
     sg.kv_write_rows = nullptr;
+    sg.kv_write_row_base = 0;
     sg.logits = nullptr;
     sg.hidden_states = nullptr;
     sg.argmax_tokens = nullptr;

@@ -602,8 +602,11 @@ struct QwenGraphInputs {
     int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
     bool          last_token_logits_only = false; // if true, only compute logits for last token (prefill optimization)
     ggml_tensor * parent_ids = nullptr; // [n_tokens] i32; tree mode when non-null
-    // [n_tokens,n_head_kv] i64; non-null = step-invariant KV write via ggml_set_rows (carries kv_start).
+    // [n_tokens,n_head_kv] i64; non-null = step-invariant KV write via ggml_set_rows.
     ggml_tensor * kv_write_rows = nullptr;
+    // Base row subtracted by the caller before filling kv_write_rows. Non-zero
+    // selects a bucket-local cache destination for non-pooled decode.
+    int kv_write_row_base = 0;
     // Capture the LAST token's post-RoPE/post-rotation Q per full-attention
     // layer into cache.q_cap (KVFlash target-QK scorer). Step-invariant:
     // node properties depend only on n_tokens and the layer index.
@@ -651,10 +654,11 @@ ggml_tensor * build_qwen35_layer(
     int                   kv_start,
     int                   n_tokens,
     bool                  capture,
-    int                   fa_window = 0,
-    ggml_tensor *         q_tail_capture = nullptr,
-    int                   q_tail_start = 0,
-    ggml_tensor *         kv_write_rows = nullptr);
+    int                   fa_window,
+    ggml_tensor *         q_tail_capture,
+    int                   q_tail_start,
+    ggml_tensor *         kv_write_rows,
+    int                   kv_write_row_base);
 
 // Overload that also exposes the MoE router selection tensor (if MoE layer).
 ggml_tensor * build_qwen35_layer(
@@ -673,7 +677,8 @@ ggml_tensor * build_qwen35_layer(
     ggml_tensor *         q_tail_capture,
     int                   q_tail_start,
     ggml_tensor **        moe_selected_out,
-    ggml_tensor *         kv_write_rows = nullptr);
+    ggml_tensor *         kv_write_rows,
+    int                   kv_write_row_base);
 
 QwenLayerPrefnOutputs build_qwen35_layer_prefn(
     ggml_context *        ctx,
@@ -686,8 +691,9 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
     ggml_tensor *         attn_mask,
     int                   kv_start,
     int                   n_tokens,
-    int                   fa_window = 0,
-    ggml_tensor *         kv_write_rows = nullptr,
+    int                   fa_window,
+    ggml_tensor *         kv_write_rows,
+    int                   kv_write_row_base,
     bool                  skip_gdn_intermediate = true);
 
 } // namespace dflash::common

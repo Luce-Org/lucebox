@@ -374,7 +374,11 @@ static std::vector<int32_t> qwen35_score_and_compress(
                 mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, align_up_i(kv_len, 32), align_up_i(n, 32));
                 ggml_set_input(mask);
             }
-            ggml_tensor * out = build_qwen35_layer(ctx, gf, w, cache, il, inp, pos, mask, start, n, false, 0);
+            ggml_tensor * out = build_qwen35_layer(
+                ctx, gf, w, cache, il, inp, pos, mask, start, n,
+                /*capture=*/false, /*fa_window=*/0,
+                /*q_tail_capture=*/nullptr, /*q_tail_start=*/0,
+                /*kv_write_rows=*/nullptr, /*kv_write_row_base=*/0);
             ggml_tensor * dst = ggml_view_2d(ctx, act_out, hidden, n, act_out->nb[1], (size_t)start * act_out->nb[1]);
             if (ggml_nelements(out) != ggml_nelements(dst)) {
                 std::fprintf(stderr,

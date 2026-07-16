@@ -1387,6 +1387,190 @@ static void test_find_boundaries_empty() {
     TEST_ASSERT(bounds.empty());
 }
 
+static ChatMarkers synthetic_chat_markers() {
+    ChatMarkers markers;
+    markers.family = "synthetic";
+    markers.sys_role_prefix = {1};
+    markers.end_msg_seqs = {{2}};
+    markers.next_role_starts = {{3}};
+    return markers;
+}
+
+static void test_find_boundaries_skips_unmatched_content_markers() {
+    auto markers = synthetic_chat_markers();
+    std::vector<int32_t> ids = {
+        1, 100, 2, 3,
+        200, 2, 901, 902, 903, 904, 905, 201, 2, 3, 202
+    };
+
+    auto bounds = find_all_boundaries(ids, markers);
+    TEST_ASSERT(bounds.size() == 2);
+    TEST_ASSERT(bounds[0] == 4);
+    TEST_ASSERT(bounds[1] == 14);
+}
+
+static void test_prefix_cache_prepares_newest_boundary() {
+    auto markers = synthetic_chat_markers();
+    PrefixCache cache(2, markers);
+    std::vector<int32_t> ids = {1, 100, 2, 3, 200, 2, 3, 300};
+
+    auto prep = cache.prepare_inline_snap(ids);
+    TEST_ASSERT(prep.first == 0);
+    TEST_ASSERT(prep.second == 7);
+}
+
+static void test_prefix_cache_lookup_grows_chain_from_exact_prefix() {
+    auto markers = synthetic_chat_markers();
+    PrefixCache cache(2, markers);
+    std::vector<int32_t> ids = {1, 100, 2, 3, 200, 2, 3, 300};
+
+    auto prep = cache.prepare_inline_snap(ids);
+    cache.confirm_inline_snap(prep.first, prep.second, prep.second, ids);
+
+    std::vector<int32_t> appended = {
+        1, 100, 2, 3, 200, 2, 3, 300, 2, 3, 400
+    };
+    auto hit = cache.lookup(appended);
+    TEST_ASSERT(hit.slot == prep.first);
+    TEST_ASSERT(hit.key_len == 7);
+    TEST_ASSERT(hit.snapshot_len == 7);
+
+    std::vector<int32_t> sibling = {
+        1, 100, 2, 3, 201, 2, 3, 300, 2, 3, 400
+    };
+    auto miss = cache.lookup(sibling);
+    TEST_ASSERT(miss.slot == -1);
+    TEST_ASSERT(miss.key_len == 0);
+    TEST_ASSERT(miss.snapshot_len == 0);
+}
+
+static void test_prefix_cache_rejects_shorter_snapshot_alias() {
+    auto markers = synthetic_chat_markers();
+    PrefixCache cache(4, markers);
+    std::vector<int32_t> base = {1, 100, 2, 3, 200};
+
+    auto base_prep = cache.prepare_inline_snap(base);
+    TEST_ASSERT(base_prep.first == 0);
+    TEST_ASSERT(base_prep.second == 4);
+    cache.confirm_inline_snap(base_prep.first, base_prep.second,
+                              base_prep.second, base);
+
+    std::vector<int32_t> longer = {1, 100, 2, 3, 200, 2, 3, 300};
+    auto longer_prep = cache.prepare_inline_snap(longer);
+    TEST_ASSERT(longer_prep.first == 1);
+    TEST_ASSERT(longer_prep.second == 7);
+
+    // Simulate a restored path where no new physical snapshot was materialized.
+    // The cache must not publish the longer logical boundary as a hit to the
+    // shorter physical snapshot: key_len must equal snapshot_len by construction.
+    cache.abort_inline_snap(longer_prep.first);
+    cache.alias_inline_snap(base_prep.first, longer_prep.second,
+                            base_prep.second, longer);
+
+    std::vector<int32_t> appended = {
+        1, 100, 2, 3, 200, 2, 3, 300, 2, 3, 400
+    };
+    auto hit = cache.lookup(appended);
+    TEST_ASSERT(hit.slot == base_prep.first);
+    TEST_ASSERT(hit.key_len == base_prep.second);
+    TEST_ASSERT(hit.snapshot_len == 4);
+    TEST_ASSERT(hit.key_len == hit.snapshot_len);
+
+    auto base_hit = cache.lookup(base);
+    TEST_ASSERT(base_hit.slot == base_prep.first);
+    TEST_ASSERT(base_hit.key_len == 4);
+    TEST_ASSERT(base_hit.snapshot_len == 4);
+}
+
+static void test_prefix_cache_commits_shorter_snapshot_prefix() {
+    auto markers = synthetic_chat_markers();
+    PrefixCache cache(2, markers);
+    std::vector<int32_t> ids = {1, 100, 2, 3, 200, 2, 3, 300};
+
+    auto prep = cache.prepare_inline_snap(ids);
+    TEST_ASSERT(prep.first == 0);
+    TEST_ASSERT(prep.second == 7);
+    // KVFlash snapshots can land at the previous pool chunk boundary rather
+    // than the requested chat boundary. Reuse is still correct if the cache key
+    // is the exact saved prefix, followed by suffix prefill.
+    cache.confirm_inline_snap(prep.first, prep.second, 6, ids);
+
+    std::vector<int32_t> appended = {
+        1, 100, 2, 3, 200, 2, 3, 300, 2, 3, 400
+    };
+    auto hit = cache.lookup(appended);
+    TEST_ASSERT(hit.slot == prep.first);
+    TEST_ASSERT(hit.key_len == 6);
+    TEST_ASSERT(hit.snapshot_len == 6);
+    TEST_ASSERT(hit.key_len == hit.snapshot_len);
+
+    std::vector<int32_t> sibling = {
+        1, 100, 2, 3, 201, 2, 3, 300, 2, 3, 400
+    };
+    auto miss = cache.lookup(sibling);
+    TEST_ASSERT(miss.slot == -1);
+    TEST_ASSERT(miss.key_len == 0);
+    TEST_ASSERT(miss.snapshot_len == 0);
+}
+
+static void test_prefix_cache_rejects_oversized_confirm() {
+    auto markers = synthetic_chat_markers();
+    PrefixCache cache(2, markers);
+    std::vector<int32_t> ids = {1, 100, 2, 3, 200, 2, 3, 300};
+
+    auto prep = cache.prepare_inline_snap(ids);
+    TEST_ASSERT(prep.first == 0);
+    TEST_ASSERT(prep.second == 7);
+
+    cache.confirm_inline_snap(prep.first, prep.second, 8, ids);
+
+    std::vector<int32_t> appended = {
+        1, 100, 2, 3, 200, 2, 3, 300, 2, 3, 400
+    };
+    auto hit = cache.lookup(appended);
+    TEST_ASSERT(hit.slot == -1);
+    TEST_ASSERT(hit.key_len == 0);
+    TEST_ASSERT(hit.snapshot_len == 0);
+
+    auto retry = cache.prepare_inline_snap(ids);
+    TEST_ASSERT(retry.first >= 0);
+    TEST_ASSERT(retry.second == prep.second);
+    cache.abort_inline_snap(retry.first);
+}
+
+static void test_prefix_cache_alias_eviction_preserves_shared_ancestor_slot() {
+    auto markers = synthetic_chat_markers();
+    PrefixCache cache(2, markers);
+    std::vector<int32_t> base = {1, 100, 2, 3, 200};
+
+    auto base_prep = cache.prepare_inline_snap(base);
+    TEST_ASSERT(base_prep.first == 0);
+    TEST_ASSERT(base_prep.second == 4);
+    cache.confirm_inline_snap(base_prep.first, base_prep.second,
+                              base_prep.second, base);
+
+    std::vector<int32_t> branch_a = {1, 100, 2, 3, 200, 2, 3, 300};
+    cache.alias_inline_snap(base_prep.first, 7, 4, branch_a);
+
+    std::vector<int32_t> branch_b = {1, 100, 2, 3, 201, 2, 3, 301};
+    auto branch_b_prep = cache.prepare_inline_snap(branch_b);
+    TEST_ASSERT(branch_b_prep.first == 1);
+    TEST_ASSERT(branch_b_prep.second == 7);
+    cache.confirm_inline_snap(branch_b_prep.first, branch_b_prep.second,
+                              branch_b_prep.second, branch_b);
+
+    std::vector<int32_t> branch_c = {1, 100, 2, 3, 202, 2, 3, 302};
+    auto branch_c_prep = cache.prepare_inline_snap(branch_c);
+    TEST_ASSERT(branch_c_prep.first == branch_b_prep.first);
+    TEST_ASSERT(branch_c_prep.first != base_prep.first);
+    cache.abort_inline_snap(branch_c_prep.first);
+
+    auto base_hit = cache.lookup(base);
+    TEST_ASSERT(base_hit.slot == base_prep.first);
+    TEST_ASSERT(base_hit.key_len == 4);
+    TEST_ASSERT(base_hit.snapshot_len == 4);
+}
+
 // ── Prefix-aware eviction policy (model-free) ───────────────────────────
 
 static void test_evict_empty_is_zero() {
@@ -2032,6 +2216,98 @@ static void test_kvflash_pager_identity_sync_contract() {
 
     TEST_ASSERT(kvflash_test_sync_identity(local, 128));
     TEST_ASSERT(local.slot_of(127) == 127);
+}
+
+static void test_kvflash_alloc_span_preserves_pending_suffix_chunks() {
+    KvFlashConfig cfg;
+    cfg.chunk_tokens = 4;
+    cfg.pool_tokens = 10 * cfg.chunk_tokens;
+    cfg.sink_chunks = 1;
+    cfg.tail_window_chunks = 4;
+
+    KvFlashPager pager;
+    TEST_ASSERT(pager.attach(cfg, {}, {}));
+    TEST_ASSERT(pager.alloc_span(0, cfg.pool_tokens));
+
+    pager.score_hook = [](int c) {
+        return c < 10 ? 1000.0f - (float)c : (float)c;
+    };
+
+    const int suffix_start = cfg.pool_tokens;
+    const int suffix_tokens =
+        (10 - cfg.sink_chunks - cfg.tail_window_chunks) * cfg.chunk_tokens;
+    TEST_ASSERT(pager.alloc_span(suffix_start, suffix_tokens));
+    for (int p = suffix_start; p < suffix_start + suffix_tokens; ++p) {
+        TEST_ASSERT_MSG(pager.slot_of(p) >= 0, "suffix position stayed resident");
+    }
+}
+
+static void test_kvflash_append_reservation_nested_release_keeps_live_span() {
+    KvFlashConfig cfg;
+    cfg.chunk_tokens = 4;
+    cfg.pool_tokens = 6 * cfg.chunk_tokens;
+    cfg.sink_chunks = 1;
+    cfg.tail_window_chunks = 0;
+
+    KvFlashPager pager;
+    TEST_ASSERT(pager.attach(cfg, {}, {}));
+    TEST_ASSERT(pager.alloc_span(0, cfg.pool_tokens));
+
+    auto first = pager.reserve_append_span(cfg.pool_tokens, 2 * cfg.chunk_tokens);
+    TEST_ASSERT(first.ok());
+    auto second = pager.reserve_append_span(cfg.pool_tokens + 2 * cfg.chunk_tokens,
+                                            2 * cfg.chunk_tokens);
+    TEST_ASSERT(second.ok());
+
+    first = KvFlashPager::AppendReservation{};
+
+    pager.score_hook = [](int c) {
+        return (c == 8 || c == 9) ? -1000.0f : 1000.0f + (float)c;
+    };
+    TEST_ASSERT(pager.reselect() >= 0);
+    for (int p = second.kv_start(); p < second.kv_start() + second.n_tokens(); ++p) {
+        TEST_ASSERT_MSG(pager.slot_of(p) >= 0, "live reservation stayed resident");
+    }
+}
+
+static void test_kvflash_pooled_suffix_prefill_plan_slot_mask() {
+    KvFlashConfig cfg;
+    cfg.chunk_tokens = 4;
+    cfg.pool_tokens = 10 * cfg.chunk_tokens;
+    cfg.sink_chunks = 1;
+    cfg.tail_window_chunks = 4;
+
+    KvFlashPager pager;
+    TEST_ASSERT(pager.attach(cfg, {}, {}));
+    TEST_ASSERT(pager.alloc_span(0, cfg.pool_tokens));
+
+    const int kv_start = cfg.pool_tokens;
+    const int n_tok = 12;
+    const int n_head_kv = 3;
+    const int mask_kv_dim = cfg.pool_tokens + 8;
+    auto plan = kvflash_prepare_pooled_suffix_prefill(
+        pager, kv_start, n_tok, n_head_kv,
+        mask_kv_dim, 32);
+    TEST_ASSERT(plan.ok());
+
+    TEST_ASSERT(plan.rows.size() == (size_t)n_tok * n_head_kv);
+    for (int h = 0; h < n_head_kv; ++h) {
+        for (int i = 0; i < n_tok; ++i) {
+            TEST_ASSERT(plan.rows[(size_t)h * n_tok + i] == pager.slot_of(kv_start + i));
+        }
+    }
+
+    std::vector<int32_t> slot_pos((size_t)cfg.pool_tokens, -1);
+    pager.fill_slot_pos(slot_pos.data());
+    constexpr uint16_t F16_ZERO = 0x0000, F16_NEG_INF = 0xFC00;
+    for (int q = 0; q < n_tok; ++q) {
+        const int abs_q = kv_start + q;
+        for (int s = 0; s < cfg.pool_tokens; ++s) {
+            const uint16_t got = plan.mask[(size_t)q * mask_kv_dim + s];
+            const bool want_open = slot_pos[(size_t)s] >= 0 && slot_pos[(size_t)s] <= abs_q;
+            TEST_ASSERT(got == (want_open ? F16_ZERO : F16_NEG_INF));
+        }
+    }
 }
 
 static void test_layer_split_kvflash_history_contract() {
@@ -4535,6 +4811,13 @@ int main() {
     RUN_TEST(test_hash_prefix_different_lengths);
     RUN_TEST(test_hash_prefix_empty);
     RUN_TEST(test_find_boundaries_empty);
+    RUN_TEST(test_find_boundaries_skips_unmatched_content_markers);
+    RUN_TEST(test_prefix_cache_prepares_newest_boundary);
+    RUN_TEST(test_prefix_cache_lookup_grows_chain_from_exact_prefix);
+    RUN_TEST(test_prefix_cache_rejects_shorter_snapshot_alias);
+    RUN_TEST(test_prefix_cache_commits_shorter_snapshot_prefix);
+    RUN_TEST(test_prefix_cache_rejects_oversized_confirm);
+    RUN_TEST(test_prefix_cache_alias_eviction_preserves_shared_ancestor_slot);
     RUN_TEST(test_evict_empty_is_zero);
     RUN_TEST(test_evict_single_is_zero);
     RUN_TEST(test_evict_chain_keeps_ancestors);
@@ -4595,6 +4878,9 @@ int main() {
     RUN_TEST(test_target_shard_plan_mixed_backend_split);
     RUN_TEST(test_target_shard_plan_rejects_bad_local_backend);
     RUN_TEST(test_kvflash_pager_identity_sync_contract);
+    RUN_TEST(test_kvflash_alloc_span_preserves_pending_suffix_chunks);
+    RUN_TEST(test_kvflash_append_reservation_nested_release_keeps_live_span);
+    RUN_TEST(test_kvflash_pooled_suffix_prefill_plan_slot_mask);
     RUN_TEST(test_layer_split_kvflash_history_contract);
     RUN_TEST(test_backend_precision_cuda_sm_policy);
     RUN_TEST(test_backend_precision_hip_arch_policy);

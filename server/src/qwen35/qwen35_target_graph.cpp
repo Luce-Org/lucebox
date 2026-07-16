@@ -36,6 +36,7 @@
 #include "qwen35_ops.h"
 #include "qwen35moe_ffn.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -527,6 +528,8 @@ static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
 // over [0..kv_start + n_tokens).
 //
 // kv_write_rows: non-null selects the step-invariant ggml_set_rows KV write; null = legacy ggml_cpy.
+// kv_write_row_base: for non-pooled decode, set_rows targets a 256-row cache
+// view starting here, and callers upload bucket-local row ids.
 static ggml_tensor * build_full_attn_block(
     ggml_context * ctx,
     ggml_cgraph * gf,
@@ -547,6 +550,7 @@ static ggml_tensor * build_full_attn_block(
     ggml_tensor * q_tail_capture = nullptr,
     int q_tail_start = 0,
     ggml_tensor * kv_write_rows = nullptr,
+    int kv_write_row_base = 0,
     ggml_tensor ** q_fa_out = nullptr   // post-RoPE/post-rotation Q [head_dim, n_tokens, n_head]
 ) {
     const int head_dim = w.n_embd_head_k;
@@ -639,8 +643,25 @@ static ggml_tensor * build_full_attn_block(
         // Step-invariant: constant dst pointer, idx carries kv_start. set_rows needs contiguous src.
         ggml_tensor * Kcur_cont = ggml_is_contiguous(Kcur_T) ? Kcur_T : ggml_cont(ctx, Kcur_T);
         ggml_tensor * Vcur_cont = ggml_is_contiguous(Vcur_T) ? Vcur_T : ggml_cont(ctx, Vcur_T);
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_k, Kcur_cont, kv_write_rows));
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_v, Vcur_cont, kv_write_rows));
+        ggml_tensor * cache_k_write = cache_k;
+        ggml_tensor * cache_v_write = cache_v;
+        int row_span = (int) cache_k->ne[1];
+        if (kv_write_row_base > 0) {
+            const int cache_rows = (int) cache_k->ne[1];
+            GGML_ASSERT(kv_write_row_base < cache_rows);
+            row_span = std::min(256, cache_rows - kv_write_row_base);
+            GGML_ASSERT(row_span > 0);
+            cache_k_write = ggml_view_3d(ctx, cache_k,
+                head_dim, row_span, n_head_kv,
+                cache_k->nb[1], cache_k->nb[2],
+                (size_t)cache_k->nb[1] * (size_t)kv_write_row_base);
+            cache_v_write = ggml_view_3d(ctx, cache_v,
+                head_dim, row_span, n_head_kv,
+                cache_v->nb[1], cache_v->nb[2],
+                (size_t)cache_v->nb[1] * (size_t)kv_write_row_base);
+        }
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_k_write, Kcur_cont, kv_write_rows));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_v_write, Vcur_cont, kv_write_rows));
     } else {
         // Legacy: kv_start as literal view offset (not step-invariant; prefill/verify/non-graph).
         ggml_tensor * k_slot = ggml_view_3d(ctx, cache_k,
@@ -1044,7 +1065,8 @@ static ggml_tensor * build_single_layer(
     ggml_tensor *         q_tail_capture = nullptr,
     int                   q_tail_start = 0,
     ggml_tensor **        moe_selected_out = nullptr,
-    ggml_tensor *         kv_write_rows = nullptr)
+    ggml_tensor *         kv_write_rows = nullptr,
+    int                   kv_write_row_base = 0)
 {
     const int hidden = w.n_embd;
     const float eps   = w.rms_eps;
@@ -1070,7 +1092,8 @@ static ggml_tensor * build_single_layer(
                                     cache.kv_k_rotated,
                                     fa_window,
                                     q_tail_capture, q_tail_start,
-                                    kv_write_rows);
+                                    kv_write_rows,
+                                    kv_write_row_base);
     } else {
         int dn_idx = 0;
         for (int il = 0; il < layer_idx; il++) {
@@ -1191,6 +1214,7 @@ QwenGraphOutputs build_qwen35_graph(
                                         /*q_tail_capture=*/nullptr,
                                         /*q_tail_start=*/0,
                                         in.kv_write_rows,
+                                        in.kv_write_row_base,
                                         want_q_cap ? &q_fa : nullptr);
             if (want_q_cap && q_fa) {
                 // Last token's Q, all heads: src [head_dim, 1, n_head] view of
@@ -1334,12 +1358,13 @@ ggml_tensor * build_qwen35_layer(
     int                   fa_window,
     ggml_tensor *         q_tail_capture,
     int                   q_tail_start,
-    ggml_tensor *         kv_write_rows)
+    ggml_tensor *         kv_write_rows,
+    int                   kv_write_row_base)
 {
     return build_single_layer(ctx, gf, w, cache, layer_idx, inp, positions,
                               attn_mask, kv_start, n_tokens, capture, fa_window,
                               q_tail_capture, q_tail_start, nullptr,
-                              kv_write_rows);
+                              kv_write_rows, kv_write_row_base);
 }
 
 ggml_tensor * build_qwen35_layer(
@@ -1358,12 +1383,13 @@ ggml_tensor * build_qwen35_layer(
     ggml_tensor *         q_tail_capture,
     int                   q_tail_start,
     ggml_tensor **        moe_selected_out,
-    ggml_tensor *         kv_write_rows)
+    ggml_tensor *         kv_write_rows,
+    int                   kv_write_row_base)
 {
     return build_single_layer(ctx, gf, w, cache, layer_idx, inp, positions,
                               attn_mask, kv_start, n_tokens, capture, fa_window,
                               q_tail_capture, q_tail_start, moe_selected_out,
-                              kv_write_rows);
+                              kv_write_rows, kv_write_row_base);
 }
 
 QwenLayerPrefnOutputs build_qwen35_layer_prefn(
@@ -1379,6 +1405,7 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
     int                   n_tokens,
     int                   fa_window,
     ggml_tensor *         kv_write_rows,
+    int                   kv_write_row_base,
     bool                  skip_gdn_intermediate) {
     QwenLayerPrefnOutputs out{};
     const float eps = w.rms_eps;
@@ -1401,7 +1428,8 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
                                     cache.kv_k_rotated,
                                     fa_window,
                                     /*q_tail_capture=*/nullptr, /*q_tail_start=*/0,
-                                    kv_write_rows);
+                                    kv_write_rows,
+                                    kv_write_row_base);
     } else {
         int dn_idx = 0;
         for (int il = 0; il < layer_idx; il++) {
