@@ -195,6 +195,9 @@ ggml_backend_meta_split_state qwen35_tensor_parallel_split_state(
         const ggml_tensor * tensor,
         const TargetWeights & weights,
         std::size_t device_count) {
+    if (device_count == 0) {
+        return mirrored_state();
+    }
     return build_split_state(tensor, weights, device_count);
 }
 
@@ -215,6 +218,14 @@ Qwen35TensorParallelContext::create(const DevicePlacement & placement,
     std::fprintf(stderr, "[tp] tensor parallelism requires a CUDA build\n");
     return nullptr;
 #else
+    const std::size_t device_count = placement.layer_split_gpus.size();
+    if (device_count < 2 || device_count > GGML_BACKEND_META_MAX_DEVICES) {
+        std::fprintf(stderr,
+            "[tp] tensor parallelism requires between 2 and %d devices (got %zu)\n",
+            GGML_BACKEND_META_MAX_DEVICES, device_count);
+        return nullptr;
+    }
+
     ggml_backend_reg_t cuda_reg = ggml_backend_cuda_reg();
     if (!cuda_reg) {
         std::fprintf(stderr, "[tp] CUDA backend registry is unavailable\n");

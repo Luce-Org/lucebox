@@ -22,6 +22,11 @@ std::string validate_device_placement(
                     : "");
     }
 
+    if (dp.split_mode == TargetSplitMode::Tensor &&
+        dp.layer_split_gpus.size() < 2) {
+        return "tensor parallelism requires at least 2 target devices";
+    }
+
     if (!dp.layer_split_gpus.empty()) {
         if (dp.layer_split_gpus.size() < 2) {
             return "target device list must have at least 2 entries";

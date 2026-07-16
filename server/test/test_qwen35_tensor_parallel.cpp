@@ -42,6 +42,14 @@ int main() {
 
     TargetWeights weights;
 
+    ggml_tensor * zero_device_tensor =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5120, 10240);
+    ggml_set_name(zero_device_tensor, "blk.0.attn_qkv.weight");
+    const auto zero_device_state =
+        qwen35_tensor_parallel_split_state(zero_device_tensor, weights, 0);
+    CHECK(zero_device_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+    CHECK(zero_device_state.n_segments == 1);
+
     expect_split(weights,
         ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5120, 10240),
         "blk.0.attn_qkv.weight", GGML_BACKEND_SPLIT_AXIS_1, 1024, 5);
@@ -87,6 +95,24 @@ int main() {
     CHECK(validate_device_placement(placement, 3).empty());
     placement.layer_split_weights = {1.0, 1.0};
     CHECK(!validate_device_placement(placement, 3).empty());
+
+    DevicePlacement missing_tensor_devices;
+    missing_tensor_devices.split_mode = TargetSplitMode::Tensor;
+    CHECK(!validate_device_placement(missing_tensor_devices, 3).empty());
+    missing_tensor_devices.layer_split_gpus = {0};
+    missing_tensor_devices.layer_split_backends = {PlacementBackend::Cuda};
+    CHECK(!validate_device_placement(missing_tensor_devices, 3).empty());
+
+    DevicePlacement too_many_devices;
+    too_many_devices.split_mode = TargetSplitMode::Tensor;
+    too_many_devices.layer_split_gpus.resize(
+        GGML_BACKEND_META_MAX_DEVICES + 1);
+    too_many_devices.layer_split_backends.resize(
+        GGML_BACKEND_META_MAX_DEVICES + 1, PlacementBackend::Cuda);
+    for (size_t i = 0; i < too_many_devices.layer_split_gpus.size(); ++i) {
+        too_many_devices.layer_split_gpus[i] = (int) i;
+    }
+    CHECK(!Qwen35TensorParallelContext::create(too_many_devices, weights));
 
     ggml_free(ctx);
     std::puts("qwen35 tensor-parallel split tests passed");

@@ -138,7 +138,8 @@ static bool validate_server_placement(const BackendArgs & bargs,
             "--target-split-mode layer\n");
         return false;
     }
-    if (bargs.device.is_multi_device()) {
+    if (bargs.device.is_multi_device() ||
+        bargs.device.split_mode == TargetSplitMode::Tensor) {
         const std::string placement_error =
             validate_device_placement(bargs.device, /*device_count=*/-1);
         if (!placement_error.empty()) {
@@ -147,7 +148,7 @@ static bool validate_server_placement(const BackendArgs & bargs,
             return false;
         }
     }
-    if (bargs.device.is_tensor_parallel()) {
+    if (bargs.device.split_mode == TargetSplitMode::Tensor) {
         if (bargs.device.is_mixed_layer_split()) {
             std::fprintf(stderr,
                 "[server] tensor parallelism requires homogeneous local devices\n");
