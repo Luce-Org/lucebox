@@ -389,8 +389,8 @@ extern "C" {
         //     the Q matrix can be larger than the K and V matrices so this can either be expressed as 3 segments or as 2 segments
         //     where the segment for K/V repeats twice
         int64_t  ne[16*GGML_BACKEND_META_MAX_DEVICES];
-        uint32_t nr[16];
         uint32_t n_segments;
+        uint32_t nr[16];
     };
 
     // function to assign split states for statically allocated tensors, compute tensor split states will be assigned to be compatible:
