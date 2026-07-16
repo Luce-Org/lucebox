@@ -134,15 +134,43 @@ static bool validate_server_placement(const BackendArgs & bargs,
     }
     if (!bargs.device.is_layer_split() && !bargs.device.layer_split_weights.empty()) {
         std::fprintf(stderr,
-            "[server] --target-layer-split requires --target-devices\n");
+            "[server] --target-layer-split requires --target-devices with "
+            "--target-split-mode layer\n");
         return false;
     }
-    if (bargs.device.is_layer_split()) {
+    if (bargs.device.is_multi_device()) {
         const std::string placement_error =
             validate_device_placement(bargs.device, /*device_count=*/-1);
         if (!placement_error.empty()) {
-            std::fprintf(stderr, "[server] bad target layer split: %s\n",
+            std::fprintf(stderr, "[server] bad target placement: %s\n",
                          placement_error.c_str());
+            return false;
+        }
+    }
+    if (bargs.device.is_tensor_parallel()) {
+        if (bargs.device.is_mixed_layer_split()) {
+            std::fprintf(stderr,
+                "[server] tensor parallelism requires homogeneous local devices\n");
+            return false;
+        }
+        if (target != compiled || compiled != PlacementBackend::Cuda) {
+            std::fprintf(stderr,
+                "[server] tensor parallelism currently requires local CUDA devices\n");
+            return false;
+        }
+        if (bargs.remote_target_shard.enabled()) {
+            std::fprintf(stderr,
+                "[server] tensor parallelism is incompatible with --target-shard-ipc-bin\n");
+            return false;
+        }
+        if (pflash_enabled) {
+            std::fprintf(stderr,
+                "[server] tensor parallelism does not yet support prefill compression\n");
+            return false;
+        }
+        if (bargs.draft_path) {
+            std::fprintf(stderr,
+                "[server] tensor parallelism does not yet support a DFlash draft\n");
             return false;
         }
     }
@@ -213,7 +241,8 @@ static void print_usage(const char * prog) {
         "                                 Env: DFLASH27B_DRAFT_SWA)\n"
         "  --target-shard-ipc-bin <path>  Remote target shard IPC daemon for mixed target split\n"
         "  --target-shard-ipc-work-dir <path>  Remote target shard IPC scratch directory\n"
-        "  --target-devices <list>        Reserved layer-split devices, e.g. cuda:0,cuda:1\n"
+        "  --target-devices <list>        Target devices, e.g. cuda:0,cuda:1\n"
+        "  --target-split-mode <mode>     Multi-GPU mode: layer (default) or tensor\n"
         "  --target-layer-split <weights>  Reserved layer-split weights\n"
         "  --peer-access        Enable peer access for multi-GPU placement\n"
         "  --chunk <N>          Chunked-prefill chunk size (default: 512)\n"
@@ -412,6 +441,12 @@ int main(int argc, char ** argv) {
             target_devices_seen = true;
             if (!parse_placement_device_list(argv[++i], bargs.device)) {
                 std::fprintf(stderr, "[server] bad --target-devices value (expected backend:gpu[,backend:gpu...])\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--target-split-mode") == 0 && i + 1 < argc) {
+            if (!parse_target_split_mode(argv[++i], bargs.device.split_mode)) {
+                std::fprintf(stderr,
+                    "[server] bad --target-split-mode value (expected layer or tensor)\n");
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--target-layer-split") == 0 && i + 1 < argc) {
@@ -1038,8 +1073,10 @@ int main(int argc, char ** argv) {
                  sconfig.effort_tiers.max, src_of(cli_set.effort_max));
     std::fprintf(stderr, "[server] │  target_device   = %s\n",
                  placement_device_name(bargs.device).c_str());
-    if (bargs.device.is_layer_split()) {
-        std::fprintf(stderr, "[server] │  target_shards   =");
+    std::fprintf(stderr, "[server] │  target_split    = %s\n",
+                 target_split_mode_name(bargs.device.split_mode));
+    if (bargs.device.is_multi_device()) {
+        std::fprintf(stderr, "[server] │  target_devices  =");
         for (size_t i = 0; i < bargs.device.layer_split_gpus.size(); ++i) {
             std::fprintf(stderr, " %s:%d",
                          placement_backend_name(bargs.device.layer_split_backend(i)),

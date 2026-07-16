@@ -24,7 +24,7 @@ std::string validate_device_placement(
 
     if (!dp.layer_split_gpus.empty()) {
         if (dp.layer_split_gpus.size() < 2) {
-            return "layer_split_gpus must have at least 2 entries";
+            return "target device list must have at least 2 entries";
         }
         if (!dp.layer_split_backends.empty() &&
             dp.layer_split_backends.size() != dp.layer_split_gpus.size()) {
@@ -47,10 +47,15 @@ std::string validate_device_placement(
                             : "");
             }
             if (!seen.insert({g, backend}).second) {
-                return "duplicate device " +
+                return "duplicate target device " +
                        std::string(placement_backend_name(backend)) + ":" +
                        std::to_string(g) + " in layer_split_gpus";
             }
+        }
+
+        if (dp.split_mode == TargetSplitMode::Tensor &&
+            !dp.layer_split_weights.empty()) {
+            return "target layer split weights are incompatible with tensor parallelism";
         }
 
         if (!dp.layer_split_weights.empty() &&
