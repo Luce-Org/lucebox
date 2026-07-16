@@ -27,7 +27,8 @@ public:
     virtual void reset_request_state() = 0;
     virtual int prefill_chunk_tokens() const { return 0; }
     virtual bool prefill(const std::vector<int32_t> & prompt,
-                         int base_pos, int & last_tok) = 0;
+                         int base_pos, int & last_tok,
+                         bool need_logits = true) = 0;
     virtual bool decode_ar(int last_tok, int committed, int n_gen,
                            std::vector<int32_t> & out_tokens,
                            const DaemonIO & io) = 0;

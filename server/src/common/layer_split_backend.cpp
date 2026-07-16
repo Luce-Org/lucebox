@@ -85,7 +85,11 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
         }
         std::vector<int32_t> chunk(req.prompt.begin() + consumed,
                                    req.prompt.begin() + consumed + n_tokens);
-        if (!adapter_->prefill(chunk, base_pos + consumed, last_tok)) {
+        const bool ends_prompt = consumed + n_tokens == prompt_len;
+        const bool ends_snap = req.snap_pos >= 0 && req.snap_slot >= 0 &&
+            base_pos + consumed + n_tokens == req.snap_pos;
+        const bool need_logits = ends_prompt || ends_snap;
+        if (!adapter_->prefill(chunk, base_pos + consumed, last_tok, need_logits)) {
             result.fail(GenerateErrorCode::PrefillFailed);
             return result;
         }

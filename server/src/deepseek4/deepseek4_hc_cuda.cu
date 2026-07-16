@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cmath>
+#include <limits>
 #include <mutex>
 #include <vector>
 
@@ -243,6 +244,226 @@ __global__ void hc_finish_kernel(const float * hc_state,
             acc += split[h] * hc_state[(size_t) h * n_embd + d];
         }
         working[d] = acc;
+    }
+}
+
+__global__ void hc_pre_batch_kernel(const float * hc_state,
+                                    const __half * fn,
+                                    const float * scale,
+                                    const float * base,
+                                    int n_tokens,
+                                    int n_embd,
+                                    int n_hc,
+                                    int sinkhorn_iters,
+                                    float eps,
+                                    float * working,
+                                    float * post,
+                                    float * comb) {
+    __shared__ float smem[kThreads];
+    __shared__ float mix[kMaxMixDim];
+    __shared__ float split[kMaxMixDim];
+    const int t = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (t >= n_tokens) {
+        return;
+    }
+
+    const int hc_dim = n_embd * n_hc;
+    const int mix_dim = 2 * n_hc + n_hc * n_hc;
+    const float * token_hc = hc_state + (size_t)t * (size_t)hc_dim;
+
+    float sumsq = 0.0f;
+    for (int c = tid; c < hc_dim; c += blockDim.x) {
+        const float v = token_hc[c];
+        sumsq += v * v;
+    }
+    smem[tid] = sumsq;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+    const float inv_rms = rsqrtf(smem[0] / (float)hc_dim + eps);
+
+    for (int row = 0; row < mix_dim; ++row) {
+        float dot = 0.0f;
+        const __half * w = fn + (size_t)row * (size_t)hc_dim;
+        for (int c = tid; c < hc_dim; c += blockDim.x) {
+            dot += __half2float(w[c]) * token_hc[c] * inv_rms;
+        }
+        smem[tid] = dot;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) smem[tid] += smem[tid + stride];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            mix[row] = smem[0];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        const float pre_scale = scale[0];
+        const float post_scale = scale[1];
+        const float comb_scale = scale[2];
+        const float sinkhorn_eps = 1.0e-6f;
+
+        for (int i = 0; i < n_hc; ++i) {
+            split[i] = hc_sigmoid(mix[i] * pre_scale + base[i]) + sinkhorn_eps;
+        }
+        for (int i = 0; i < n_hc; ++i) {
+            const float v = 2.0f * hc_sigmoid(mix[n_hc + i] * post_scale + base[n_hc + i]);
+            split[n_hc + i] = v;
+            post[(size_t)t * (size_t)n_hc + (size_t)i] = v;
+        }
+
+        float c[kMaxHc * kMaxHc];
+        for (int dst = 0; dst < n_hc; ++dst) {
+            float row_max = -1.0e30f;
+            for (int src = 0; src < n_hc; ++src) {
+                const int idx = src + dst * n_hc;
+                const float v = mix[2 * n_hc + idx] * comb_scale + base[2 * n_hc + idx];
+                c[idx] = v;
+                row_max = v > row_max ? v : row_max;
+            }
+            float row_sum = 0.0f;
+            for (int src = 0; src < n_hc; ++src) {
+                const int idx = src + dst * n_hc;
+                c[idx] = expf(c[idx] - row_max);
+                row_sum += c[idx];
+            }
+            const float inv = 1.0f / row_sum;
+            for (int src = 0; src < n_hc; ++src) {
+                c[src + dst * n_hc] = c[src + dst * n_hc] * inv + sinkhorn_eps;
+            }
+        }
+        for (int src = 0; src < n_hc; ++src) {
+            float sum = 0.0f;
+            for (int dst = 0; dst < n_hc; ++dst) sum += c[src + dst * n_hc];
+            const float inv = 1.0f / (sum + sinkhorn_eps);
+            for (int dst = 0; dst < n_hc; ++dst) c[src + dst * n_hc] *= inv;
+        }
+        for (int iter = 1; iter < sinkhorn_iters; ++iter) {
+            for (int dst = 0; dst < n_hc; ++dst) {
+                float sum = 0.0f;
+                for (int src = 0; src < n_hc; ++src) sum += c[src + dst * n_hc];
+                const float inv = 1.0f / (sum + sinkhorn_eps);
+                for (int src = 0; src < n_hc; ++src) c[src + dst * n_hc] *= inv;
+            }
+            for (int src = 0; src < n_hc; ++src) {
+                float sum = 0.0f;
+                for (int dst = 0; dst < n_hc; ++dst) sum += c[src + dst * n_hc];
+                const float inv = 1.0f / (sum + sinkhorn_eps);
+                for (int dst = 0; dst < n_hc; ++dst) c[src + dst * n_hc] *= inv;
+            }
+        }
+
+        float * token_comb = comb + (size_t)t * (size_t)n_hc * (size_t)n_hc;
+        for (int i = 0; i < n_hc * n_hc; ++i) {
+            split[2 * n_hc + i] = c[i];
+            token_comb[i] = c[i];
+        }
+    }
+    __syncthreads();
+
+    float * token_working = working + (size_t)t * (size_t)n_embd;
+    for (int d = tid; d < n_embd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int h = 0; h < n_hc; ++h) {
+            acc += split[h] * token_hc[(size_t)h * (size_t)n_embd + (size_t)d];
+        }
+        token_working[d] = acc;
+    }
+}
+
+__global__ void hc_post_batch_kernel(const float * residual_hc,
+                                     const float * block_out,
+                                     const float * post,
+                                     const float * comb,
+                                     int n_total,
+                                     int n_embd,
+                                     int n_hc,
+                                     float * out_hc) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_total) {
+        return;
+    }
+    const int d = idx % n_embd;
+    const int h = (idx / n_embd) % n_hc;
+    const int t = idx / (n_embd * n_hc);
+    const size_t hc_dim = (size_t)n_embd * (size_t)n_hc;
+    const float * token_residual = residual_hc + (size_t)t * hc_dim;
+    const float * token_block = block_out + (size_t)t * (size_t)n_embd;
+    const float * token_post = post + (size_t)t * (size_t)n_hc;
+    const float * token_comb = comb + (size_t)t * (size_t)n_hc * (size_t)n_hc;
+
+    float acc = token_block[d] * token_post[h];
+    for (int src = 0; src < n_hc; ++src) {
+        acc += token_comb[h + src * n_hc] *
+               token_residual[(size_t)src * (size_t)n_embd + (size_t)d];
+    }
+    out_hc[(size_t)idx] = acc;
+}
+
+__global__ void hc_output_batch_kernel(const float * hc_state,
+                                       const __half * fn,
+                                       const float * scale,
+                                       const float * base,
+                                       int n_tokens,
+                                       int n_embd,
+                                       int n_hc,
+                                       float eps,
+                                       float * final_embd) {
+    __shared__ float smem[kThreads];
+    __shared__ float pre[kMaxHc];
+    const int t = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (t >= n_tokens) {
+        return;
+    }
+
+    const int hc_dim = n_embd * n_hc;
+    const float * token_hc = hc_state + (size_t)t * (size_t)hc_dim;
+
+    float sumsq = 0.0f;
+    for (int c = tid; c < hc_dim; c += blockDim.x) {
+        const float v = token_hc[c];
+        sumsq += v * v;
+    }
+    smem[tid] = sumsq;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+    const float inv_rms = rsqrtf(smem[0] / (float)hc_dim + eps);
+
+    for (int row = 0; row < n_hc; ++row) {
+        float dot = 0.0f;
+        const __half * w = fn + (size_t)row * (size_t)hc_dim;
+        for (int c = tid; c < hc_dim; c += blockDim.x) {
+            dot += __half2float(w[c]) * token_hc[c] * inv_rms;
+        }
+        smem[tid] = dot;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) smem[tid] += smem[tid + stride];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            pre[row] = hc_sigmoid(smem[0] * scale[0] + base[row]) + 1.0e-6f;
+        }
+        __syncthreads();
+    }
+
+    float * token_out = final_embd + (size_t)t * (size_t)n_embd;
+    for (int d = tid; d < n_embd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int h = 0; h < n_hc; ++h) {
+            acc += pre[h] * token_hc[(size_t)h * (size_t)n_embd + (size_t)d];
+        }
+        token_out[d] = acc;
     }
 }
 
@@ -549,6 +770,129 @@ bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
                                 post_device,
                                 comb_device,
                                 true);
+}
+
+bool deepseek4_cuda_hc_pre_batch_device(const void * hc_state_device,
+                                       const void * fn_device,
+                                       const void * scale_device,
+                                       const void * base_device,
+                                       int          n_tokens,
+                                       int          n_embd,
+                                       int          n_hc,
+                                       int          sinkhorn_iters,
+                                       float        eps,
+                                       void *       working_device,
+                                       void *       post_device,
+                                       void *       comb_device) {
+    if (!hc_state_device || !fn_device || !scale_device || !base_device ||
+        !working_device || !post_device || !comb_device ||
+        n_tokens <= 0 || n_embd <= 0 || n_hc <= 0 || n_hc > kMaxHc) {
+        return false;
+    }
+    const int mix_dim = 2 * n_hc + n_hc * n_hc;
+    if (mix_dim > kMaxMixDim) {
+        return false;
+    }
+
+    hc_pre_batch_kernel<<<n_tokens, kThreads>>>(
+        static_cast<const float *>(hc_state_device),
+        static_cast<const __half *>(fn_device),
+        static_cast<const float *>(scale_device),
+        static_cast<const float *>(base_device),
+        n_tokens,
+        n_embd,
+        n_hc,
+        sinkhorn_iters,
+        eps,
+        static_cast<float *>(working_device),
+        static_cast<float *>(post_device),
+        static_cast<float *>(comb_device));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        hc_log_cuda_error("batched hc-pre kernel", err);
+        return false;
+    }
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        hc_log_cuda_error("batched hc-pre sync", err);
+        return false;
+    }
+    return true;
+}
+
+bool deepseek4_cuda_hc_post_batch_device(const void * residual_hc_device,
+                                        const void * block_out_device,
+                                        const void * post_device,
+                                        const void * comb_device,
+                                        int          n_tokens,
+                                        int          n_embd,
+                                        int          n_hc,
+                                        void *       out_hc_device) {
+    if (!residual_hc_device || !block_out_device || !post_device || !comb_device ||
+        !out_hc_device || n_tokens <= 0 || n_embd <= 0 || n_hc <= 0 || n_hc > kMaxHc) {
+        return false;
+    }
+    const int64_t total = (int64_t)n_tokens * (int64_t)n_hc * (int64_t)n_embd;
+    if (total <= 0 || total > std::numeric_limits<int>::max()) {
+        return false;
+    }
+    const int blocks = (int)((total + kThreads - 1) / kThreads);
+    hc_post_batch_kernel<<<blocks, kThreads>>>(
+        static_cast<const float *>(residual_hc_device),
+        static_cast<const float *>(block_out_device),
+        static_cast<const float *>(post_device),
+        static_cast<const float *>(comb_device),
+        (int)total,
+        n_embd,
+        n_hc,
+        static_cast<float *>(out_hc_device));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        hc_log_cuda_error("batched hc-post kernel", err);
+        return false;
+    }
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        hc_log_cuda_error("batched hc-post sync", err);
+        return false;
+    }
+    return true;
+}
+
+bool deepseek4_cuda_hc_output_batch_device(const void * hc_state_device,
+                                          const void * fn_device,
+                                          const void * scale_device,
+                                          const void * base_device,
+                                          int          n_tokens,
+                                          int          n_embd,
+                                          int          n_hc,
+                                          float        eps,
+                                          void *       final_embd_device) {
+    if (!hc_state_device || !fn_device || !scale_device || !base_device ||
+        !final_embd_device || n_tokens <= 0 || n_embd <= 0 || n_hc <= 0 || n_hc > kMaxHc) {
+        return false;
+    }
+    hc_output_batch_kernel<<<n_tokens, kThreads>>>(
+        static_cast<const float *>(hc_state_device),
+        static_cast<const __half *>(fn_device),
+        static_cast<const float *>(scale_device),
+        static_cast<const float *>(base_device),
+        n_tokens,
+        n_embd,
+        n_hc,
+        eps,
+        static_cast<float *>(final_embd_device));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        hc_log_cuda_error("batched hc-output kernel", err);
+        return false;
+    }
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        hc_log_cuda_error("batched hc-output sync", err);
+        return false;
+    }
+    return true;
 }
 
 } // namespace dflash::common

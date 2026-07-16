@@ -1025,10 +1025,12 @@ bool Gemma4LayerSplitAdapter::run_mixed_forward(
 
 bool Gemma4LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
                                       int base_pos,
-                                      int & last_tok) {
+                                      int & last_tok,
+                                      bool need_logits) {
+    std::vector<float> * logits_out = need_logits ? &prefill_last_logits_ : nullptr;
     const bool ok = use_mixed_target_split()
-        ? run_mixed_forward(prompt, base_pos, last_tok, &prefill_last_logits_)
-        : run_forward(prompt, base_pos, last_tok, &prefill_last_logits_);
+        ? run_mixed_forward(prompt, base_pos, last_tok, logits_out)
+        : run_forward(prompt, base_pos, last_tok, logits_out);
     if (ok && kvflash_active()) {
         kvflash_sync_history(prompt, base_pos);
         kvflash_pager_.zero_free_blocks();

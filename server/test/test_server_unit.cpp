@@ -27,6 +27,7 @@
 #include "common/layer_split_backend.h"
 #include "common/layer_split_kvflash.h"
 #include "common/layer_split_utils.h"
+#include "deepseek4/deepseek4_layer_split_adapter.h"
 #include "common/kvflash_pager.h"
 #include "placement/draft_residency.h"
 #include "common/gguf_bounds.h"
@@ -38,6 +39,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cmath>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2107,6 +2109,7 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     int current_last = -1;
     std::vector<int> prefill_bases;
     std::vector<int> prefill_sizes;
+    std::vector<bool> prefill_need_logits;
     int dflash_base = -1;
     int dflash_last = -1;
     std::vector<int32_t> emitted_tokens;
@@ -2129,9 +2132,11 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     }
     int prefill_chunk_tokens() const override { return prefill_chunk; }
     bool prefill(const std::vector<int32_t> & prompt,
-                 int base_pos, int & last_tok) override {
+                 int base_pos, int & last_tok,
+                 bool need_logits = true) override {
         prefill_bases.push_back(base_pos);
         prefill_sizes.push_back((int)prompt.size());
+        prefill_need_logits.push_back(need_logits);
         current_pos = base_pos + (int)prompt.size();
         current_last = prompt.empty() ? current_last : prompt.back();
         last_tok = current_last;
@@ -2289,12 +2294,15 @@ static void test_layer_split_backend_sampling_capability_gate() {
 }
 
 static void test_layer_split_backend_chunks_prefill_by_adapter_limit() {
+    DeepSeek4LayerSplitAdapterConfig deepseek4_cfg;
+    TEST_ASSERT(deepseek4_cfg.chunk == 512);
+
     auto * raw = new MockLayerSplitAdapter();
-    raw->prefill_chunk = 3;
+    raw->prefill_chunk = 4;
     LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
 
     GenerateRequest req;
-    req.prompt = {1, 2, 3, 4, 5, 6, 7, 8};
+    req.prompt = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
     req.n_gen = 1;
     DaemonIO io;
     GenerateResult result = backend.generate(req, io);
@@ -2302,12 +2310,20 @@ static void test_layer_split_backend_chunks_prefill_by_adapter_limit() {
     TEST_ASSERT(result.ok());
     TEST_ASSERT(raw->prefill_bases.size() == 3);
     TEST_ASSERT(raw->prefill_sizes.size() == 3);
+    TEST_ASSERT(raw->prefill_need_logits.size() == 3);
     TEST_ASSERT(raw->prefill_bases[0] == 0);
-    TEST_ASSERT(raw->prefill_sizes[0] == 3);
-    TEST_ASSERT(raw->prefill_bases[1] == 3);
-    TEST_ASSERT(raw->prefill_sizes[1] == 3);
-    TEST_ASSERT(raw->prefill_bases[2] == 6);
+    TEST_ASSERT(raw->prefill_sizes[0] == 4);
+    TEST_ASSERT(!raw->prefill_need_logits[0]);
+    TEST_ASSERT(raw->prefill_bases[1] == 4);
+    TEST_ASSERT(raw->prefill_sizes[1] == 4);
+    TEST_ASSERT(!raw->prefill_need_logits[1]);
+    TEST_ASSERT(raw->prefill_bases[2] == 8);
     TEST_ASSERT(raw->prefill_sizes[2] == 2);
+    TEST_ASSERT(raw->prefill_need_logits[2]);
+    TEST_ASSERT(std::find(raw->prefill_sizes.begin(), raw->prefill_sizes.end(), 1) ==
+                raw->prefill_sizes.end());
+    TEST_ASSERT(std::any_of(raw->prefill_sizes.begin(), raw->prefill_sizes.end(),
+                            [](int n) { return n > 1; }));
 }
 
 static void test_layer_split_compress_nopark_uses_default_drafter_path() {
