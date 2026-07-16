@@ -202,8 +202,11 @@ extern "C" {
 
     // Common functions that may be obtained using ggml_backend_reg_get_proc_address
 
-    // AllReduce operation for tensor parallelism (meta backend)
-    typedef bool                         (*ggml_backend_allreduce_tensor_t)(ggml_backend_t * backends, struct ggml_tensor ** tensors, size_t n_backends);
+    // Context management and operations for faster communication between backends, used for tensor parallelism (meta backend)
+    typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
+    typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
+    typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend
@@ -378,11 +381,15 @@ extern "C" {
         //   - most tensors have n_segments == 1 and a contiguous slice of the tensor data
         //   - some tensors have an inhomogenenous data layout along the split axis,
         //     those tensors are divided into segments which are each individually split across devices
-        //   - ne has one entry per segment and device that add up to ggml_tensor::ne for that axis,
-        //     the outer/inner loops are over segments/devices like [seg0_dev0, seg0_dev1, seg1_dev0, seg1_dev1],
+        //   - ne has one entry per segment and device and that segment repeats nr times,
+        //     in total when accounting for repetitions the segments add up to ggml_tensor::ne for that axis,
+        //     the outer/inner loops are over segments/devices like [seg0_dev0_r0, seg0_dev1_r0, seg0_dev0_r1, seg0_dev1_r1, seg1_dev0_r0, seg1_dev1_r0],
         //   - for example, a transformer may have a fused QKV matrix rather than 3 matrices, those would be 3 separate segments
-        //     that each need to be split individually across devices so that each device gets a slice of Q, K, and V
+        //     that each need to be split individually across devices so that each device gets a slice of Q, K, and V,
+        //     the Q matrix can be larger than the K and V matrices so this can either be expressed as 3 segments or as 2 segments
+        //     where the segment for K/V repeats twice
         int64_t  ne[16*GGML_BACKEND_META_MAX_DEVICES];
+        uint32_t nr[16];
         uint32_t n_segments;
     };
 
@@ -394,6 +401,9 @@ extern "C" {
     //       express this as a backend registry functionality instead
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+
+    // True when a buffer type is owned by a tensor-parallel meta device.
+    GGML_API bool ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft);
 
     //
     // Utils
