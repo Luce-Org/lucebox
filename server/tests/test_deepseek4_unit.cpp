@@ -294,6 +294,59 @@ static void test_compressor_pooling_correctness(ggml_backend_t backend) {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_swiglu_ds4_cpu_correctness(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_swiglu_ds4_cpu_correctness ...");
+
+    constexpr int dim = 17;
+    constexpr int rows = 3;
+    constexpr float clamp = 1.5f;
+    std::vector<float> gate((size_t) dim * rows);
+    std::vector<float> up((size_t) dim * rows);
+    std::vector<float> expected((size_t) dim * rows);
+    for (size_t i = 0; i < gate.size(); ++i) {
+        gate[i] = 0.25f * (float) ((int) (i % 15) - 7);
+        up[i] = 0.375f * (float) ((int) (i % 11) - 5);
+        const float gate_clamped = std::min(gate[i], clamp);
+        const float up_clamped = std::clamp(up[i], -clamp, clamp);
+        expected[i] = up_clamped * gate_clamped / (1.0f + std::exp(-gate_clamped));
+    }
+
+    ggml_context * ctx = make_test_context();
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) {
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    ggml_tensor * gate_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, rows);
+    ggml_tensor * up_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, rows);
+    ggml_set_input(gate_t);
+    ggml_set_input(up_t);
+    ggml_tensor * out_t = ggml_swiglu_ds4_split(ctx, gate_t, up_t, clamp);
+    ggml_set_output(out_t);
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(gf, out_t);
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    TEST_ASSERT(ggml_gallocr_alloc_graph(alloc, gf));
+    ggml_backend_tensor_set(gate_t, gate.data(), 0, gate.size() * sizeof(float));
+    ggml_backend_tensor_set(up_t, up.data(), 0, up.size() * sizeof(float));
+    TEST_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+
+    std::vector<float> actual(expected.size());
+    ggml_backend_tensor_get(out_t, actual.data(), 0, actual.size() * sizeof(float));
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+
+    for (size_t i = 0; i < actual.size(); ++i) {
+        TEST_ASSERT_MSG(
+            nearly_equal(actual[i], expected[i], 1.0e-6f, 1.0e-6f),
+            "SWIGLU_DS4 output mismatch");
+    }
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_moe_routing_correctness(ggml_backend_t backend) {
     std::fprintf(stderr, "  test_moe_routing_correctness ...");
 
@@ -1551,6 +1604,7 @@ int main() {
     }
 
     test_compressor_pooling_correctness(backend);
+    test_swiglu_ds4_cpu_correctness(backend);
     test_moe_routing_correctness(backend);
     test_rmsnorm_correctness(backend);
     test_grouped_output_projection_shape();

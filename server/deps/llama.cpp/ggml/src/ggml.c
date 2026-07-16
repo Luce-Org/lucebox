@@ -1384,7 +1384,8 @@ double ggml_type_sizef(enum ggml_type type) {
 const char * ggml_type_name(enum ggml_type type) {
     assert(type >= 0);
     assert(type < GGML_TYPE_COUNT);
-    return type_traits[type].type_name;
+    const char * name = type_traits[type].type_name;
+    return name ? name : "unknown";
 }
 
 bool ggml_is_quantized(enum ggml_type type) {
@@ -8088,6 +8089,9 @@ struct ggml_tensor * ggml_ds4_hc_pre(
     GGML_ASSERT(mix->type == GGML_TYPE_F32);
     GGML_ASSERT(base->type == GGML_TYPE_F32);
     GGML_ASSERT(hc_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(mix));
+    GGML_ASSERT(ggml_is_contiguous(base));
+    GGML_ASSERT(ggml_is_contiguous(hc_state));
     GGML_ASSERT(n_hc > 0 && n_hc <= 8);
     const int64_t mix_dim = 2*(int64_t)n_hc + (int64_t)n_hc*n_hc;
     GGML_ASSERT(ggml_nelements(mix) == mix_dim);
@@ -8119,6 +8123,9 @@ struct ggml_tensor * ggml_ds4_hc_post(
     GGML_ASSERT(residual_hc->type == GGML_TYPE_F32);
     GGML_ASSERT(block_out->type == GGML_TYPE_F32);
     GGML_ASSERT(split->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(residual_hc));
+    GGML_ASSERT(ggml_is_contiguous(block_out));
+    GGML_ASSERT(ggml_is_contiguous(split));
     GGML_ASSERT(n_hc > 0 && n_hc <= 8);
     const int64_t mix_dim = 2*(int64_t)n_hc + (int64_t)n_hc*n_hc;
     GGML_ASSERT(ggml_nelements(split) == mix_dim);
@@ -8147,6 +8154,9 @@ struct ggml_tensor * ggml_ds4_hc_out(
     GGML_ASSERT(mix->type == GGML_TYPE_F32);
     GGML_ASSERT(base->type == GGML_TYPE_F32);
     GGML_ASSERT(hc_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(mix));
+    GGML_ASSERT(ggml_is_contiguous(base));
+    GGML_ASSERT(ggml_is_contiguous(hc_state));
     GGML_ASSERT(n_hc > 0 && n_hc <= 8);
     GGML_ASSERT(ggml_nelements(mix) >= n_hc);
     GGML_ASSERT(ggml_nelements(base) >= n_hc);

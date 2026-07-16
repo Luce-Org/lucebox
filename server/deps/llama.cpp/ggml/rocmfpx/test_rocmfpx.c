@@ -1,10 +1,13 @@
 #include "rocmfpx.h"
 
 #include <assert.h>
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 
 static void fill_row(float * x, int n) {
+    assert(n >= 44);
+
     for (int i = 0; i < n; ++i) {
         const float wave = 0.75f*sinf((float) i * 0.37f) + 0.25f*cosf((float) i * 0.13f);
         const float ramp = ((float) (i % 11) - 5.0f) * 0.035f;
@@ -100,6 +103,33 @@ static void check_weighted_imatrix_fp2(void) {
     assert(weighted_err < plain_err);
 }
 
+static void check_large_finite_values(void) {
+    float src[QK_ROCMFPX] = { 0 };
+    float imatrix[QK_ROCMFPX];
+    float fp6[QK_ROCMFP6];
+    float fp8[QK_ROCMFP8];
+    block_rocmfp6 q6;
+    block_rocmfp8 q8;
+
+    src[0] =  FLT_MAX;
+    src[1] = -FLT_MAX;
+    for (int i = 0; i < QK_ROCMFPX; ++i) {
+        imatrix[i] = 1.0f;
+    }
+
+    rocmfpx_quantize_fp6(src, &q6, 1, QK_ROCMFP6, imatrix);
+    rocmfpx_quantize_fp8(src, &q8, 1, QK_ROCMFP8, imatrix);
+    rocmfpx_dequantize_row_fp6(&q6, fp6, QK_ROCMFP6);
+    rocmfpx_dequantize_row_fp8(&q8, fp8, QK_ROCMFP8);
+
+    assert(rocmfpx_validate_row_data_fp6(&q6, sizeof(q6)));
+    assert(rocmfpx_validate_row_data_fp8(&q8, sizeof(q8)));
+    assert(isfinite(fp6[0]) && isfinite(fp6[1]));
+    assert(isfinite(fp8[0]) && isfinite(fp8[1]));
+    assert(fp6[0] > 0.0f && fp6[1] < 0.0f);
+    assert(fp8[0] > 0.0f && fp8[1] < 0.0f);
+}
+
 int main(void) {
     enum { N = 64 };
 
@@ -156,9 +186,11 @@ int main(void) {
     assert(isfinite(mse8));
     assert(mse8 < mse6);
     assert(mse6 < mse3);
+    assert(mse3 < mse2);
 
     check_weighted_imatrix_fp2();
     check_weighted_imatrix_fp3();
+    check_large_finite_values();
 
     return 0;
 }

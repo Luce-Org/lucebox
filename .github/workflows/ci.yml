@@ -273,3 +273,19 @@ jobs:
           /opt/rocm/bin/hipcc --offload-arch=gfx1151 -O2 \
             -o "$RUNNER_TEMP/hip_smoke" .github/ci/hip_smoke.cpp
           "$RUNNER_TEMP/hip_smoke"
+
+      - name: Build + test ROCmFP formats
+        run: |
+          cmake -S server -B "$RUNNER_TEMP/rocmfp-build" \
+            -DDFLASH27B_GPU_BACKEND=hip \
+            -DDFLASH27B_HIP_ARCHITECTURES=gfx1151 \
+            -DDFLASH27B_SERVER=OFF \
+            -DDFLASH27B_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_HIP_FLAGS=-DDFLASH_WAVE_SIZE=32
+          cmake --build "$RUNNER_TEMP/rocmfp-build" \
+            --target test_rocmfp4 test_rocmfpx test_rocmfp4_hip_tail \
+            --parallel 8
+          ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
+            --output-on-failure \
+            -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail'

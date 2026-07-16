@@ -2284,6 +2284,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_GLU_OP_GEGLU:
                 case GGML_GLU_OP_SWIGLU:
                 case GGML_GLU_OP_SWIGLU_OAI:
+                case GGML_GLU_OP_SWIGLU_DS4:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
                     {

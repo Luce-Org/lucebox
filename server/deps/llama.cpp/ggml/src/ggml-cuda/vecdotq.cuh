@@ -351,16 +351,6 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 #ifndef VDR_ROCMFP6_Q8_1_MMVQ
 #define VDR_ROCMFP6_Q8_1_MMVQ 4
 #endif
-#ifndef GGML_ROCMFP6_FAST_SIGNMAG_PACK
-#define GGML_ROCMFP6_FAST_SIGNMAG_PACK 0
-#endif
-#ifndef GGML_ROCMFP6_MMVQ_HALF_BLOCK_SPLIT
-// Enabled by default: hoisting the half-block scale selection out of the FP6
-// MMVQ dot loop measured ~1.8% faster tg on gfx1151 (Qwen3-0.6B Q6_0_ROCMFPX,
-// 211.8 -> 215.7 t/s) with bit-identical results. Set to 0 to restore the
-// per-element branch.
-#define GGML_ROCMFP6_MMVQ_HALF_BLOCK_SPLIT 1
-#endif
 #define VDR_ROCMFP8_Q8_1_MMVQ 2
 
 #define VDR_ROCMFP2_Q8_1_MMQ 4
@@ -398,14 +388,8 @@ static __device__ __forceinline__ int rocmfpx_decode_fp2_code_vec_cuda(const uin
 }
 
 static __device__ __forceinline__ int rocmfpx_decode_fp6_code_vec_cuda(const uint32_t code) {
-#if GGML_ROCMFP6_FAST_SIGNMAG_PACK
-    const int mag = (int) (code & 31u);
-    const int sign = -((int) ((code >> 5) & 1u));
-    return (mag ^ sign) - sign;
-#else
     const int mag = (int) (code & 31u);
     return (code & 32u) ? -mag : mag;
-#endif
 }
 
 static __device__ __forceinline__ int rocmfpx_pack4_fp6_bits24_vec_cuda(const uint32_t bits24) {
@@ -451,49 +435,6 @@ static __device__ __forceinline__ int rocmfpx_pack4_fp2_bits8_vec_cuda(const uin
 
 static __device__ __forceinline__ int rocmfpx_pack4_fp2_vec_cuda(const uint8_t * qs, const int base) {
     return rocmfpx_pack4_fp2_bits8_vec_cuda(qs[base >> 2]);
-}
-
-static __device__ __forceinline__ int rocmfpx_pack4_fp6_vec_cuda(const uint8_t * qs, const int base) {
-#if GGML_ROCMFP6_FAST_SIGNMAG_PACK
-    uint32_t qs0, qs1, qs2, qs3, qs4, qs5;
-    memcpy(&qs0, qs +  0, 4);
-    memcpy(&qs1, qs +  4, 4);
-    memcpy(&qs2, qs +  8, 4);
-    memcpy(&qs3, qs + 12, 4);
-    memcpy(&qs4, qs + 16, 4);
-    memcpy(&qs5, qs + 20, 4);
-
-    const uint32_t words[7] = { qs0, qs1, qs2, qs3, qs4, qs5, 0 };
-    const int start_bit = 6 * base;
-    const int reg_idx = start_bit >> 5;
-    const int reg_shift = start_bit & 31;
-    const uint32_t val_low  = words[reg_idx];
-    const uint32_t val_high = words[reg_idx + 1];
-    const uint32_t bits24 = (reg_shift == 0) ? (val_low & 0xFFFFFFu) :
-        (((val_low >> reg_shift) | (val_high << (32 - reg_shift))) & 0xFFFFFFu);
-
-    return rocmfpx_pack4_fp6_bits24_vec_cuda(bits24);
-#else
-    const char4 v = make_char4(
-        (int8_t) rocmfpx_decode_fp6_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 0)*6, 6)),
-        (int8_t) rocmfpx_decode_fp6_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 1)*6, 6)),
-        (int8_t) rocmfpx_decode_fp6_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 2)*6, 6)),
-        (int8_t) rocmfpx_decode_fp6_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 3)*6, 6)));
-    return *((const int *) &v);
-#endif
-}
-
-static __device__ __forceinline__ int rocmfpx_pack4_fp6_expanded_vec_cuda(const int8_t * qs, const int base) {
-    const char4 v = make_char4(qs[base + 0], qs[base + 1], qs[base + 2], qs[base + 3]);
-    return *((const int *) &v);
-}
-
-static __device__ __forceinline__ int rocmfpx_pack4_fp6_device_vec_cuda(const block_rocmfp6_device * bq6, const int base) {
-#if GGML_ROCMFP6_EXPANDED_DEVICE
-    return rocmfpx_pack4_fp6_expanded_vec_cuda(bq6->qs, base);
-#else
-    return rocmfpx_pack4_fp6_vec_cuda(bq6->qs, base);
-#endif
 }
 
 static __device__ __forceinline__ float vec_dot_rocmfp4_q8_1(
@@ -618,9 +559,8 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp3_q8_1(
 static __device__ __forceinline__ float vec_dot_rocmfpx_fp6_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
-    const block_rocmfp6_device * bq6 = (const block_rocmfp6_device *) vbq + kbx;
+    const block_rocmfp6 * bq6 = (const block_rocmfp6 *) vbq + kbx;
 
-#if !GGML_ROCMFP6_EXPANDED_DEVICE
     uint32_t qs0, qs1, qs2, qs3, qs4, qs5;
     memcpy(&qs0, bq6->qs +  0, 4);
     memcpy(&qs1, bq6->qs +  4, 4);
@@ -633,22 +573,16 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp6_q8_1(
     // its high bits are always masked out, so 0 keeps the result bit-identical
     // while avoiding a stack over-read (matches the FP3 sibling below).
     const uint32_t qs[7] = { qs0, qs1, qs2, qs3, qs4, qs5, 0 };
-#endif
 
     int sumi0 = 0;
     int sumi1 = 0;
 
-#if GGML_ROCMFP6_MMVQ_HALF_BLOCK_SPLIT
     const bool fp6_first_half = iqs + VDR_ROCMFP6_Q8_1_MMVQ <= QK_ROCMFP6/8;
     const bool fp6_second_half = iqs >= QK_ROCMFP6/8;
-#endif
 
 #pragma unroll
     for (int i = 0; i < VDR_ROCMFP6_Q8_1_MMVQ; ++i) {
         const int base = 4 * (iqs + i);
-#if GGML_ROCMFP6_EXPANDED_DEVICE
-        const int val_packed = rocmfpx_pack4_fp6_device_vec_cuda(bq6, base);
-#else
         const int start_bit = 6 * base;
         const int reg_idx = start_bit >> 5;
         const int reg_shift = start_bit & 31;
@@ -658,16 +592,13 @@ static __device__ __forceinline__ float vec_dot_rocmfpx_fp6_q8_1(
             (((val_low >> reg_shift) | (val_high << (32 - reg_shift))) & 0xFFFFFFu);
 
         const int val_packed = rocmfpx_pack4_fp6_bits24_vec_cuda(bits24);
-#endif
         const int u = get_int_b4(bq8_1->qs, iqs + i);
 
-#if GGML_ROCMFP6_MMVQ_HALF_BLOCK_SPLIT
         if (fp6_first_half) {
             sumi0 = ggml_cuda_dp4a(val_packed, u, sumi0);
         } else if (fp6_second_half) {
             sumi1 = ggml_cuda_dp4a(val_packed, u, sumi1);
         } else
-#endif
         if (base < QK_ROCMFP6/2) {
             sumi0 = ggml_cuda_dp4a(val_packed, u, sumi0);
         } else {

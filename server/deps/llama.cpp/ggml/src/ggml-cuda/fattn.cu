@@ -7,133 +7,6 @@
 #include "fattn-chunked.cuh"
 #include "fattn.cuh"
 
-__device__ static float ds4_fa_block_sum(float v) {
-    __shared__ float smem[256];
-    const int tid = threadIdx.x;
-    smem[tid] = v;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) smem[tid] += smem[tid + stride];
-        __syncthreads();
-    }
-    return smem[0];
-}
-
-__device__ static float ds4_fa_block_max(float v) {
-    __shared__ float smem[256];
-    const int tid = threadIdx.x;
-    smem[tid] = v;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) smem[tid] = fmaxf(smem[tid], smem[tid + stride]);
-        __syncthreads();
-    }
-    return smem[0];
-}
-
-__global__ static void ds4_flash_attn_d512_f32_shared_kv_kernel(
-        float       * dst,
-        const float * q,
-        const float * k,
-        const float * v,
-        const float * sinks,
-        int           n_tokens,
-        int           n_heads,
-        int           n_kv) {
-    constexpr int D = 512;
-    const int t = (int) blockIdx.x;
-    const int h = (int) blockIdx.y;
-    const int tid = (int) threadIdx.x;
-    if (t >= n_tokens || h >= n_heads) return;
-
-    extern __shared__ float scores[];
-    const float * qh = q + ((size_t) h * (size_t) n_tokens + (size_t) t) * D;
-    const float scale = rsqrtf((float) D);
-
-    float local_max = sinks ? sinks[h] : -3.402823466e38f;
-    for (int r = tid; r < n_kv; r += blockDim.x) {
-        const float * kr = k + (size_t) r * D;
-        float dot = 0.0f;
-#pragma unroll
-        for (int d = 0; d < D; ++d) {
-            dot += qh[d] * kr[d];
-        }
-        const float s = dot * scale;
-        scores[r] = s;
-        local_max = fmaxf(local_max, s);
-    }
-    const float max_score = ds4_fa_block_max(local_max);
-
-    float local_sum = 0.0f;
-    for (int r = tid; r < n_kv; r += blockDim.x) {
-        const float w = expf(scores[r] - max_score);
-        scores[r] = w;
-        local_sum += w;
-    }
-    if (tid == 0 && sinks) {
-        local_sum += expf(sinks[h] - max_score);
-    }
-    const float denom = ds4_fa_block_sum(local_sum);
-    const float inv_denom = 1.0f / denom;
-
-    for (int d = tid; d < D; d += blockDim.x) {
-        float acc = 0.0f;
-        for (int r = 0; r < n_kv; ++r) {
-            acc += scores[r] * v[(size_t) r * D + d];
-        }
-        dst[((size_t) t * (size_t) n_heads + (size_t) h) * D + d] = acc * inv_denom;
-    }
-}
-
-static bool ggml_cuda_ds4_flash_attn_d512_f32(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const char * e = getenv("DFLASH_DS4_FLASH_ATTN");
-    if (!e || !e[0] || e[0] == (char)48) {
-        return false;
-    }
-    const ggml_tensor * Q = dst->src[0];
-    const ggml_tensor * K = dst->src[1];
-    const ggml_tensor * V = dst->src[2];
-    const ggml_tensor * mask = dst->src[3];
-    const ggml_tensor * sinks = dst->src[4];
-    if (!Q || !K || !V || mask ||
-        Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F32 || V->type != GGML_TYPE_F32 ||
-        dst->type != GGML_TYPE_F32 ||
-        Q->ne[0] != 512 || K->ne[0] != 512 || V->ne[0] != 512 ||
-        K->ne[2] != 1 || V->ne[2] != 1 ||
-        Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 ||
-        dst->ne[0] != 512 || dst->ne[1] != Q->ne[2] || dst->ne[2] != Q->ne[1] ||
-        Q->nb[0] != (int64_t) sizeof(float) ||
-        K->nb[0] != (int64_t) sizeof(float) ||
-        V->nb[0] != (int64_t) sizeof(float) ||
-        dst->nb[0] != (int64_t) sizeof(float)) {
-        return false;
-    }
-    if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->ne[0] != Q->ne[2])) {
-        return false;
-    }
-
-    const int n_tokens = (int) Q->ne[1];
-    const int n_heads = (int) Q->ne[2];
-    const int n_kv = (int) K->ne[1];
-    if (n_tokens <= 0 || n_heads <= 0 || n_kv <= 0) {
-        return false;
-    }
-
-    cudaStream_t stream = ctx.stream();
-    dim3 grid((unsigned) n_tokens, (unsigned) n_heads, 1);
-    const size_t shmem = (size_t) n_kv * sizeof(float);
-    ds4_flash_attn_d512_f32_shared_kv_kernel<<<grid, 256, shmem, stream>>>(
-            (float *) dst->data,
-            (const float *) Q->data,
-            (const float *) K->data,
-            (const float *) V->data,
-            sinks ? (const float *) sinks->data : nullptr,
-            n_tokens,
-            n_heads,
-            n_kv);
-    return true;
-}
-
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -481,10 +354,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             }
         }
     }
-    static const bool ds4_allow_d512_nomask = [] {
-        const char * e = getenv("DFLASH_DS4_FLASH_ATTN");
-        return e && e[0] && e[0] != (char)48;
-    }();
 
     const int cc = ggml_cuda_info().devices[device].cc;
 
@@ -505,7 +374,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (V->ne[0] != K->ne[0]) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            if (!gqa_opt_applies && !ds4_allow_d512_nomask) {
+            if (!gqa_opt_applies) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
@@ -701,9 +570,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    if (ggml_cuda_ds4_flash_attn_d512_f32(ctx, dst)) {
-        return;
-    }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

@@ -198,6 +198,37 @@ static inline bool rocmfp4_scale_is_valid(uint8_t e) {
     return e <= 0x7e;
 }
 
+static float rocmfp4_row_sigma2(const float * x, int64_t k) {
+    float sum_x2 = 0.0f;
+    bool overflow = false;
+
+    for (int64_t i = 0; i < k; ++i) {
+        if (!isfinite(x[i])) {
+            continue;
+        }
+
+        const float x2 = x[i]*x[i];
+        if (!isfinite(x2) || sum_x2 > FLT_MAX - x2) {
+            overflow = true;
+            break;
+        }
+        sum_x2 += x2;
+    }
+
+    if (!overflow) {
+        return sum_x2 / (float) k;
+    }
+
+    double sum_x2_wide = 0.0;
+    for (int64_t i = 0; i < k; ++i) {
+        if (isfinite(x[i])) {
+            const double value = x[i];
+            sum_x2_wide += value*value;
+        }
+    }
+    return (float) fmin(sum_x2_wide / (double) k, (double) FLT_MAX);
+}
+
 static float rocmfp4_block_mse_for_scale_unweighted(
         const float * x, int n, int e, float best_err) {
     const float scale_half = rocmfp4_ue4m3_to_fp32_half((uint8_t) e);
@@ -205,6 +236,10 @@ static float rocmfp4_block_mse_for_scale_unweighted(
     float err = 0.0f;
 
     for (int i = 0; i < n; ++i) {
+        if (!isfinite(x[i])) {
+            continue;
+        }
+
         const float y = rocmfp4_decoded_mag_scaled(x[i], inv_scale_half) * scale_half;
         const float d = x[i] - y;
 
@@ -243,6 +278,10 @@ static float rocmfp4_block_mse_for_scale_weighted(
     float err = 0.0f;
 
     for (int i = 0; i < n; ++i) {
+        if (!isfinite(x[i])) {
+            continue;
+        }
+
         const float y = rocmfp4_decoded_mag_scaled(x[i], inv_scale_half) * scale_half;
         const float d = x[i] - y;
 
@@ -284,14 +323,21 @@ static void rocmfp4_prepare_mse_weights(
     for (int i = 0; i < n; ++i) {
         const float qw = quant_weights[i];
         const float ax = fabsf(x[i]);
-        const float weight = isfinite(qw) && qw > 0.0f ? qw * sqrtf(sigma2 + x[i]*x[i]) : 0.0f;
+        float weight = 0.0f;
+        if (isfinite(qw) && qw > 0.0f && isfinite(x[i])) {
+            const float energy2 = sigma2 + x[i]*x[i];
+            const float candidate = isfinite(energy2) ? qw*sqrtf(energy2) : FLT_MAX;
+            weight = isfinite(candidate) ? candidate : FLT_MAX;
+        }
         *all_finite = *all_finite && isfinite(x[i]);
 
-        if (ax > *max_abs) {
-            *max_abs = ax;
-            *max_abs_weight = weight;
-        } else if (ax == *max_abs && weight > *max_abs_weight) {
-            *max_abs_weight = weight;
+        if (isfinite(x[i])) {
+            if (ax > *max_abs) {
+                *max_abs = ax;
+                *max_abs_weight = weight;
+            } else if (ax == *max_abs && weight > *max_abs_weight) {
+                *max_abs_weight = weight;
+            }
         }
 
         // Match llama.cpp's imatrix weighting style for Q4_0: calibration
@@ -436,6 +482,10 @@ static uint8_t rocmfp4_choose_scale_ue4m3(const float * x, int n, const float * 
     bool all_finite = true;
     for (int i = 0; i < n; ++i) {
         all_finite = all_finite && isfinite(x[i]);
+        if (!isfinite(x[i])) {
+            continue;
+        }
+
         const float ax = fabsf(x[i]);
         if (ax > max_abs) {
             max_abs = ax;
@@ -453,11 +503,7 @@ static void rocmfp4_quantize_row_q4_0_weighted(
         const float * GGML_RESTRICT x, block_rocmfp4 * GGML_RESTRICT y, int64_t k, const float * GGML_RESTRICT quant_weights) {
     assert(k % QK_ROCMFP4 == 0);
 
-    float sum_x2 = 0.0f;
-    for (int64_t i = 0; i < k; ++i) {
-        sum_x2 += x[i]*x[i];
-    }
-    const float sigma2 = sum_x2 / (float) k;
+    const float sigma2 = rocmfp4_row_sigma2(x, k);
 
     const int64_t nb = k / QK_ROCMFP4;
     for (int64_t ib = 0; ib < nb; ++ib) {
@@ -485,11 +531,7 @@ static void rocmfp4_quantize_row_q4_0_fast_weighted(
         const float * GGML_RESTRICT x, block_rocmfp4_fast * GGML_RESTRICT y, int64_t k, const float * GGML_RESTRICT quant_weights) {
     assert(k % QK_ROCMFP4 == 0);
 
-    float sum_x2 = 0.0f;
-    for (int64_t i = 0; i < k; ++i) {
-        sum_x2 += x[i]*x[i];
-    }
-    const float sigma2 = sum_x2 / (float) k;
+    const float sigma2 = rocmfp4_row_sigma2(x, k);
 
     const int64_t nb = k / QK_ROCMFP4;
     for (int64_t ib = 0; ib < nb; ++ib) {

@@ -1,6 +1,7 @@
 #include "rocmfpx.h"
 
 #include <assert.h>
+#include <float.h>
 #include <math.h>
 #include <string.h>
 
@@ -116,6 +117,37 @@ static float rocmfpx_max_abs(const float * x, int n) {
     return max_abs;
 }
 
+static float rocmfpx_row_sigma2(const float * x, int64_t k) {
+    float sum_x2 = 0.0f;
+    bool overflow = false;
+
+    for (int64_t i = 0; i < k; ++i) {
+        if (!isfinite(x[i])) {
+            continue;
+        }
+
+        const float x2 = x[i]*x[i];
+        if (!isfinite(x2) || sum_x2 > FLT_MAX - x2) {
+            overflow = true;
+            break;
+        }
+        sum_x2 += x2;
+    }
+
+    if (!overflow) {
+        return sum_x2 / (float) k;
+    }
+
+    double sum_x2_wide = 0.0;
+    for (int64_t i = 0; i < k; ++i) {
+        if (isfinite(x[i])) {
+            const double value = x[i];
+            sum_x2_wide += value*value;
+        }
+    }
+    return (float) fmin(sum_x2_wide / (double) k, (double) FLT_MAX);
+}
+
 static void rocmfpx_prepare_mse_weights(
         float * dst, const float * x, int n, const float * quant_weights, float sigma2,
         float * max_abs, float * max_abs_weight) {
@@ -125,7 +157,12 @@ static void rocmfpx_prepare_mse_weights(
     for (int i = 0; i < n; ++i) {
         const float ax = fabsf(x[i]);
         const float qw = quant_weights[i];
-        const float weight = isfinite(qw) && qw > 0.0f && isfinite(x[i]) ? qw * sqrtf(sigma2 + x[i]*x[i]) : 0.0f;
+        float weight = 0.0f;
+        if (isfinite(qw) && qw > 0.0f && isfinite(x[i])) {
+            const float energy2 = sigma2 + x[i]*x[i];
+            const float candidate = isfinite(energy2) ? qw*sqrtf(energy2) : FLT_MAX;
+            weight = isfinite(candidate) ? candidate : FLT_MAX;
+        }
 
         if (isfinite(x[i])) {
             if (ax > *max_abs) {
@@ -474,10 +511,8 @@ static uint8_t rocmfpx_quantize_fp6_code(float x, float inv_scale) {
         return 0;
     }
 
-    int mag = (int) lroundf(fabsf(x * inv_scale));
-    if (mag > 31) {
-        mag = 31;
-    }
+    const float scaled = fminf(fabsf(x * inv_scale), 31.0f);
+    const int mag = (int) lroundf(scaled);
 
     return mag == 0 ? 0 : (uint8_t) ((x < 0.0f ? 32u : 0u) | (uint8_t) mag);
 }
@@ -486,10 +521,8 @@ static uint8_t rocmfpx_quantize_fp6_code(float x, float inv_scale) {
 // decoded magnitude as rocmfpx_decode_fp6_code(rocmfpx_quantize_fp6_code(...))
 // (nearest integer in [0,31], signed), keeping quantized output bit-identical.
 static inline float rocmfpx_fp6_decoded_mag(float x, float inv_scale) {
-    int mag = (int) lroundf(fabsf(x * inv_scale));
-    if (mag > 31) {
-        mag = 31;
-    }
+    const float scaled = fminf(fabsf(x * inv_scale), 31.0f);
+    const int mag = (int) lroundf(scaled);
     if (mag == 0) {
         return 0.0f;
     }
@@ -607,13 +640,8 @@ static int8_t rocmfpx_quantize_fp8_code(float x, float inv_scale) {
         return 0;
     }
 
-    int q = (int) lroundf(x * inv_scale);
-    if (q > 127) {
-        q = 127;
-    } else if (q < -127) {
-        q = -127;
-    }
-
+    const float scaled = fmaxf(-127.0f, fminf(x * inv_scale, 127.0f));
+    const int q = (int) lroundf(scaled);
     return (int8_t) q;
 }
 
@@ -718,11 +746,7 @@ static void rocmfpx_quantize_row_fp2_weighted(
         const float * GGML_RESTRICT x, block_rocmfp2 * GGML_RESTRICT y, int64_t k, const float * GGML_RESTRICT quant_weights) {
     assert(k % QK_ROCMFP2 == 0);
 
-    float sum_x2 = 0.0f;
-    for (int64_t i = 0; i < k; ++i) {
-        sum_x2 += isfinite(x[i]) ? x[i]*x[i] : 0.0f;
-    }
-    const float sigma2 = sum_x2 / (float) k;
+    const float sigma2 = rocmfpx_row_sigma2(x, k);
 
     const int64_t nb = k / QK_ROCMFP2;
     for (int64_t ib = 0; ib < nb; ++ib) {
@@ -818,11 +842,7 @@ static void rocmfpx_quantize_row_fp3_weighted(
         const float * GGML_RESTRICT x, block_rocmfp3 * GGML_RESTRICT y, int64_t k, const float * GGML_RESTRICT quant_weights) {
     assert(k % QK_ROCMFP3 == 0);
 
-    float sum_x2 = 0.0f;
-    for (int64_t i = 0; i < k; ++i) {
-        sum_x2 += isfinite(x[i]) ? x[i]*x[i] : 0.0f;
-    }
-    const float sigma2 = sum_x2 / (float) k;
+    const float sigma2 = rocmfpx_row_sigma2(x, k);
 
     const int64_t nb = k / QK_ROCMFP3;
     for (int64_t ib = 0; ib < nb; ++ib) {
@@ -892,11 +912,7 @@ static void rocmfpx_quantize_row_fp6_weighted(
         const float * GGML_RESTRICT x, block_rocmfp6 * GGML_RESTRICT y, int64_t k, const float * GGML_RESTRICT quant_weights) {
     assert(k % QK_ROCMFP6 == 0);
 
-    float sum_x2 = 0.0f;
-    for (int64_t i = 0; i < k; ++i) {
-        sum_x2 += isfinite(x[i]) ? x[i]*x[i] : 0.0f;
-    }
-    const float sigma2 = sum_x2 / (float) k;
+    const float sigma2 = rocmfpx_row_sigma2(x, k);
 
     const int64_t nb = k / QK_ROCMFP6;
     for (int64_t ib = 0; ib < nb; ++ib) {
@@ -992,11 +1008,7 @@ static void rocmfpx_quantize_row_fp8_weighted(
         const float * GGML_RESTRICT x, block_rocmfp8 * GGML_RESTRICT y, int64_t k, const float * GGML_RESTRICT quant_weights) {
     assert(k % QK_ROCMFP8 == 0);
 
-    float sum_x2 = 0.0f;
-    for (int64_t i = 0; i < k; ++i) {
-        sum_x2 += isfinite(x[i]) ? x[i]*x[i] : 0.0f;
-    }
-    const float sigma2 = sum_x2 / (float) k;
+    const float sigma2 = rocmfpx_row_sigma2(x, k);
 
     const int64_t nb = k / QK_ROCMFP8;
     for (int64_t ib = 0; ib < nb; ++ib) {

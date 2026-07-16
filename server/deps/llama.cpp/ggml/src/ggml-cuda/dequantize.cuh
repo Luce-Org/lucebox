@@ -176,20 +176,15 @@ static __device__ __forceinline__ void dequantize_rocmfpx_fp2(const void * vx, c
 }
 
 static __device__ __forceinline__ void dequantize_rocmfpx_fp6(const void * vx, const int64_t ib, const int iqs, float2 & v) {
-    const block_rocmfp6_device * x = (const block_rocmfp6_device *) vx;
+    const block_rocmfp6 * x = (const block_rocmfp6 *) vx;
 
     const int i0 = iqs + 0;
     const int i1 = iqs + 1;
     const float d0 = rocmfpx_ue4m3_to_fp32_finite(x[ib].e[i0 >= QK_ROCMFP6/2]);
     const float d1 = rocmfpx_ue4m3_to_fp32_finite(x[ib].e[i1 >= QK_ROCMFP6/2]);
 
-#if GGML_ROCMFP6_EXPANDED_DEVICE
-    v.x = d0 * (float) x[ib].qs[i0];
-    v.y = d1 * (float) x[ib].qs[i1];
-#else
     v.x = d0 * (float) rocmfpx_decode_fp6_code_cuda(rocmfpx_get_fp6_code_cuda(x[ib].qs, i0));
     v.y = d1 * (float) rocmfpx_decode_fp6_code_cuda(rocmfpx_get_fp6_code_cuda(x[ib].qs, i1));
-#endif
 }
 
 static __device__ __forceinline__ void dequantize_rocmfpx_fp8(const void * vx, const int64_t ib, const int iqs, float2 & v) {

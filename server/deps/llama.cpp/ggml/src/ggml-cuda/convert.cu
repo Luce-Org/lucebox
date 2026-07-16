@@ -525,6 +525,43 @@ static __global__ void dequantize_block_rocmfp4_fast(const void * __restrict__ v
     }
 }
 
+template<typename dst_t>
+static __global__ void dequantize_block_rocmfp4_tail(
+        const block_rocmfp4 * __restrict__ x,
+        dst_t               * __restrict__ y) {
+    const int64_t ib = blockIdx.x;
+    const int64_t j  = threadIdx.x;
+
+    if (j >= QK_ROCMFP4/2) {
+        return;
+    }
+
+    const float d0 = rocmfp4_ue4m3_to_fp32_half_finite(x[ib].e[0]);
+    const float d1 = rocmfp4_ue4m3_to_fp32_half_finite(x[ib].e[1]);
+    const uint8_t q = x[ib].qs[j];
+
+    y[ib*QK_ROCMFP4 + j]                 = d0 * rocmfp4_decode_i8(q);
+    y[ib*QK_ROCMFP4 + j + QK_ROCMFP4/2] = d1 * rocmfp4_decode_i8(q >> 4);
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_rocmfp4_fast_tail(
+        const block_rocmfp4_fast * __restrict__ x,
+        dst_t                    * __restrict__ y) {
+    const int64_t ib = blockIdx.x;
+    const int64_t j  = threadIdx.x;
+
+    if (j >= QK_ROCMFP4/2) {
+        return;
+    }
+
+    const float d = rocmfp4_ue4m3_to_fp32_half_finite(x[ib].e);
+    const uint8_t q = x[ib].qs[j];
+
+    y[ib*QK_ROCMFP4 + j]                 = d * rocmfp4_decode_i8(q);
+    y[ib*QK_ROCMFP4 + j + QK_ROCMFP4/2] = d * rocmfp4_decode_i8(q >> 4);
+}
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static void dequantize_block_cuda(const void * vx, dst_t * y,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
@@ -685,14 +722,26 @@ static void dequantize_row_mxfp4_cuda(const void * vx, dst_t * y, const int64_t 
 
 template<typename dst_t>
 static void dequantize_row_rocmfp4_hip(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
-    const int nb = (k + QK_K - 1) / QK_K;
-    dequantize_block_rocmfp4<<<nb, 32, 0, stream>>>(vx, y);
+    GGML_ASSERT(k % QK_ROCMFP4 == 0);
+    if (k % QK_K == 0) {
+        dequantize_block_rocmfp4<<<k/QK_K, 32, 0, stream>>>(vx, y);
+        return;
+    }
+
+    dequantize_block_rocmfp4_tail<<<k/QK_ROCMFP4, QK_ROCMFP4/2, 0, stream>>>(
+            (const block_rocmfp4 *) vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_rocmfp4_fast_hip(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
-    const int nb = (k + QK_K - 1) / QK_K;
-    dequantize_block_rocmfp4_fast<<<nb, 32, 0, stream>>>(vx, y);
+    GGML_ASSERT(k % QK_ROCMFP4 == 0);
+    if (k % QK_K == 0) {
+        dequantize_block_rocmfp4_fast<<<k/QK_K, 32, 0, stream>>>(vx, y);
+        return;
+    }
+
+    dequantize_block_rocmfp4_fast_tail<<<k/QK_ROCMFP4, QK_ROCMFP4/2, 0, stream>>>(
+            (const block_rocmfp4_fast *) vx, y);
 }
 
 template <typename dst_t>
