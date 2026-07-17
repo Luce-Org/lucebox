@@ -439,6 +439,7 @@ int main(int argc, char ** argv) {
             }
         } else if (std::strcmp(argv[i], "--ds4-prefill") == 0 && i + 1 < argc) {
             const char * mode = argv[++i];
+            bargs.ds4_prefill_mode_set = true;
             if (std::strcmp(mode, "exact") == 0) {
                 bargs.ds4_prefill_mode = PrefillAttentionMode::Exact;
             } else if (std::strcmp(mode, "dense") == 0) {
@@ -813,6 +814,12 @@ int main(int argc, char ** argv) {
     g_peer_access_opt_in = bargs.device.peer_access;
     std::fprintf(stderr, "[server] creating backend...\n");
     const std::string arch = detect_arch(bargs.model_path);
+    if (bargs.ds4_prefill_mode_set && arch != "deepseek4") {
+        std::fprintf(stderr,
+            "[server] --ds4-prefill is only valid for deepseek4 models "
+            "(detected '%s')\n", arch.c_str());
+        return 2;
+    }
     const PlacementBackend target_backend =
         bargs.device.backend == PlacementBackend::Auto
             ? compiled_placement_backend()

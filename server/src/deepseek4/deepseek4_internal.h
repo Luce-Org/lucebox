@@ -71,6 +71,7 @@ struct DeepSeek4StepTelemetry {
     uint64_t sample_us = 0;
     uint64_t emit_us = 0;
     uint64_t full_graph_build_us = 0;
+    uint64_t full_graph_alloc_us = 0;
     uint64_t full_graph_set_us = 0;
     uint64_t full_graph_compute_us = 0;
     uint64_t full_graph_read_us = 0;
@@ -311,6 +312,10 @@ bool load_deepseek4_gguf_partial(const std::string & path,
                                   DeepSeek4Weights & out);
 
 void free_deepseek4_weights(DeepSeek4Weights & w);
+
+// Release graph allocators and host mirrors that retain model tensor pointers.
+// This must run before the owning ggml context is destroyed.
+void deepseek4_release_runtime_graphs(const DeepSeek4Weights & w);
 
 bool create_deepseek4_cache(ggml_backend_t backend,
                              const DeepSeek4Weights & w,

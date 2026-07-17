@@ -154,10 +154,20 @@ static void ggml_cuda_mul_mat_q_impl(
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
-    const bool use_stream_k =
+    bool use_stream_k =
         (GGML_CUDA_CC_IS_NVIDIA(cc) &&
          ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
         GGML_CUDA_CC_IS_CDNA(cc);
+    // Keep the established small-batch tuning hook from #503. The default
+    // remains stream-k; positive values opt small verify widths into the
+    // lower-overhead data-parallel path.
+    static const int luce_mmq_dp_max_ne1 = []() {
+        const char * value = getenv("LUCE_MMQ_DP_MAX_NE1");
+        return value ? atoi(value) : 0;
+    }();
+    if (use_stream_k && ne11 <= luce_mmq_dp_max_ne1) {
+        use_stream_k = false;
+    }
 
     // TODO: tighter pool buffer size vs q8 path
     const bool use_native_mxfp4 = blackwell_mma_available(cc) && src0->type == GGML_TYPE_MXFP4;

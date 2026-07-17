@@ -46,6 +46,7 @@ struct BackendArgs {
     // Chunked prefill
     int                  chunk             = 512;
     PrefillAttentionMode ds4_prefill_mode = PrefillAttentionMode::Exact;
+    bool                 ds4_prefill_mode_set = false;
 
     // deepseek4-specific decode options
     int             ds4_expert_top_k = 0;  // 0 = model default

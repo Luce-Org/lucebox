@@ -358,6 +358,10 @@ struct DeepSeek4LayerRangeScratch {
     std::vector<float> final_embd;
     std::vector<int32_t> hash_expert_ids;
 
+    void clear() {
+        *this = {};
+    }
+
     void ensure(const ggml_context * ctx,
                 int tokens,
                 int embd,
@@ -955,7 +959,6 @@ static void build_compressor_step(
         std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs,
         std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs,
         ggml_tensor ** comp_cache_source_out = nullptr,
-        ggml_tensor * flush_rows_inp = nullptr,
         ggml_tensor * cur_all = nullptr,
         int n_tokens_all = 1,
         int kv_start_all = -1,
@@ -1095,11 +1098,8 @@ static void build_compressor_step(
         // State rows were written, but this batch did not complete a window.
         return;
     }
-    if (!batched_rows && !flush_rows_inp &&
-        ((token_pos + 1) % ratio) != 0) {
-        // Legacy per-layer graphs only pool at flush boundaries. The fused
-        // stable-topology graph (flush_rows_inp set) pools every step; the
-        // partial result lands on the masked running comp row.
+    if (!batched_rows && ((token_pos + 1) % ratio) != 0) {
+        // Per-layer graphs only pool at flush boundaries.
         return;
     }
 
@@ -1292,7 +1292,6 @@ static void build_indexer_compressor_step(
         std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs,
         std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs,
         ggml_tensor ** index_comp_cache_source_out = nullptr,
-        ggml_tensor * flush_rows_inp = nullptr,
         ggml_tensor * cur_all = nullptr,
         int n_tokens_all = 1,
         int kv_start_all = -1,
@@ -1321,7 +1320,6 @@ static void build_indexer_compressor_step(
                           i64_array_inputs,
                           i32_array_inputs,
                           index_comp_cache_source_out,
-                          flush_rows_inp,
                           cur_all,
                           n_tokens_all,
                           kv_start_all,
@@ -1680,7 +1678,6 @@ static ggml_tensor * build_mla_attention(
                               i64_array_inputs,
                               i32_array_inputs,
                               &comp_kv_source,
-                              cached_inputs ? cached_inputs->flush_rows : nullptr,
                               (causal_batch || fused_causal) ? cur : nullptr,
                               n_tokens,
                               kv_start);
@@ -1696,7 +1693,6 @@ static ggml_tensor * build_mla_attention(
                                       i64_array_inputs,
                                       i32_array_inputs,
                                       &index_comp_kv_source,
-                                      cached_inputs ? cached_inputs->flush_rows : nullptr,
                                       (causal_batch || fused_causal) ? cur : nullptr,
                                       n_tokens,
                                       kv_start,
@@ -3760,6 +3756,23 @@ static void reset_hc_layer_weights_cpu(std::vector<HcLayerWeightsCpu> & weights)
     weights.clear();
 }
 
+struct DeepSeek4HybridRuntime {
+    const ggml_context * owner_ctx = nullptr;
+    std::vector<HcLayerWeightsCpu> hc_layer_weights;
+    HcWeightsCpu hc_output_weights;
+    std::vector<HashRoutingTableCpu> hash_routing_tables;
+
+    void destroy() {
+        reset_hc_layer_weights_cpu(hc_layer_weights);
+        reset_hc_weights_cpu(hc_output_weights);
+        hash_routing_tables.clear();
+        hash_routing_tables.shrink_to_fit();
+        owner_ctx = nullptr;
+    }
+};
+
+static thread_local DeepSeek4HybridRuntime ds4_hybrid_runtime;
+
 static const void * hc_fn_device_ptr(const HcWeightsCpu &, ggml_tensor * fn) {
     if (!fn) return nullptr;
     if (fn->type == GGML_TYPE_F16) return fn->data;
@@ -3806,10 +3819,17 @@ static bool deepseek4_step_hybrid(
         }
     }
 
-    // Lazy-loaded per-layer HC weights on CPU
-    static std::vector<HcLayerWeightsCpu> hc_layer_weights;
-    static HcWeightsCpu hc_output_weights;
-    static std::vector<HashRoutingTableCpu> hash_routing_tables;
+    // Cache host mirrors by model ownership so unload/reload cannot reuse
+    // tensor data from a previous model context.
+    DeepSeek4HybridRuntime & runtime = ds4_hybrid_runtime;
+    if (runtime.owner_ctx != w.ctx ||
+        runtime.hc_layer_weights.size() != (size_t) w.n_layer) {
+        runtime.destroy();
+        runtime.owner_ctx = w.ctx;
+    }
+    auto & hc_layer_weights = runtime.hc_layer_weights;
+    auto & hc_output_weights = runtime.hc_output_weights;
+    auto & hash_routing_tables = runtime.hash_routing_tables;
     if (hc_layer_weights.empty()) {
         hc_layer_weights.resize((size_t)w.n_layer);
         hash_routing_tables.resize((size_t)w.n_layer);
@@ -4351,6 +4371,64 @@ struct DeepSeek4FusedDecodeCache {
         counter = 0;
     }
 };
+
+struct DeepSeek4LayerRangeRuntime {
+    const ggml_context * owner_ctx = nullptr;
+    int loaded_n_layer = 0;
+    std::vector<HcLayerWeightsCpu> hc_layer_weights;
+    HcWeightsCpu hc_output_weights;
+    std::vector<HashRoutingTableCpu> hash_routing_tables;
+    std::vector<DeepSeek4CachedLayerAlloc> cached_attn_allocs;
+    std::vector<DeepSeek4CachedDecodeHcPreGraph> cached_decode_attn_hc_pre_graphs;
+    std::vector<DeepSeek4CachedDecodeHcPreGraph> cached_decode_ffn_hc_pre_graphs;
+    DeepSeek4CachedDecodeHcPostGraph cached_decode_hc_post_graph;
+    std::vector<std::vector<DeepSeek4CachedDecodeAttnGraph>> cached_decode_attn_graphs;
+    std::vector<DeepSeek4CachedDecodeFfnGraph> cached_decode_ffn_graphs;
+    DeepSeek4CachedDecodeOutputGraph cached_decode_output_graph;
+    DeepSeek4CachedLayerAlloc cached_dynamic_output_alloc;
+    DeepSeek4FusedDecodeCache fused_decode_graph_cache;
+    Ds4DecodeSharedInputs decode_shared_inputs;
+    DeepSeek4LayerRangeScratch scratch;
+
+    void destroy() {
+        for (auto & alloc : cached_attn_allocs) {
+            alloc.free();
+        }
+        cached_attn_allocs.clear();
+        for (auto & graph : cached_decode_attn_hc_pre_graphs) {
+            graph.free();
+        }
+        cached_decode_attn_hc_pre_graphs.clear();
+        for (auto & graph : cached_decode_ffn_hc_pre_graphs) {
+            graph.free();
+        }
+        cached_decode_ffn_hc_pre_graphs.clear();
+        cached_decode_hc_post_graph.free();
+        for (auto & per_layer : cached_decode_attn_graphs) {
+            for (auto & graph : per_layer) {
+                graph.free();
+            }
+        }
+        cached_decode_attn_graphs.clear();
+        for (auto & graph : cached_decode_ffn_graphs) {
+            graph.free();
+        }
+        cached_decode_ffn_graphs.clear();
+        cached_decode_output_graph.free();
+        cached_dynamic_output_alloc.free();
+        fused_decode_graph_cache.destroy();
+        decode_shared_inputs.free();
+        reset_hc_layer_weights_cpu(hc_layer_weights);
+        reset_hc_weights_cpu(hc_output_weights);
+        hash_routing_tables.clear();
+        hash_routing_tables.shrink_to_fit();
+        scratch.clear();
+        loaded_n_layer = 0;
+        owner_ctx = nullptr;
+    }
+};
+
+static thread_local DeepSeek4LayerRangeRuntime ds4_layer_range_runtime;
 
 static ggml_tensor * ds4_fused_hc_base_f32(ggml_context * ctx, ggml_tensor * base) {
     if (!base) return nullptr;
@@ -5096,6 +5174,8 @@ static thread_local uint64_t ds4_layer_major_cache_counter = 0;
 static thread_local ggml_gallocr_t ds4_layer_major_shared_alloc = nullptr;
 static thread_local const ggml_context * ds4_layer_major_shared_owner = nullptr;
 static thread_local ggml_backend_t ds4_layer_major_shared_backend = nullptr;
+static thread_local std::vector<uint8_t> ds4_layer_major_meta_arena;
+static thread_local const ggml_context * ds4_layer_major_meta_owner = nullptr;
 
 static ggml_gallocr_t ds4_layer_major_get_shared_alloc(
         const DeepSeek4Weights & w,
@@ -5113,6 +5193,44 @@ static ggml_gallocr_t ds4_layer_major_get_shared_alloc(
         ds4_layer_major_shared_backend = backend;
     }
     return ds4_layer_major_shared_alloc;
+}
+
+void deepseek4_release_runtime_graphs(const DeepSeek4Weights & w) {
+    const ggml_context * owner = w.ctx;
+    if (!owner) {
+        return;
+    }
+
+    bool released_layer_major_cache = false;
+    for (auto & cache : ds4_layer_major_graph_caches) {
+        if (cache.owner_ctx == owner) {
+            cache.destroy();
+            released_layer_major_cache = true;
+        }
+    }
+    if (released_layer_major_cache) {
+        ds4_layer_major_cache_counter = 0;
+    }
+
+    if (ds4_layer_major_shared_owner == owner) {
+        if (ds4_layer_major_shared_alloc) {
+            ggml_gallocr_free(ds4_layer_major_shared_alloc);
+            ds4_layer_major_shared_alloc = nullptr;
+        }
+        ds4_layer_major_shared_owner = nullptr;
+        ds4_layer_major_shared_backend = nullptr;
+    }
+    if (ds4_layer_major_meta_owner == owner) {
+        ds4_layer_major_meta_arena.clear();
+        ds4_layer_major_meta_arena.shrink_to_fit();
+        ds4_layer_major_meta_owner = nullptr;
+    }
+    if (ds4_layer_range_runtime.owner_ctx == owner) {
+        ds4_layer_range_runtime.destroy();
+    }
+    if (ds4_hybrid_runtime.owner_ctx == owner) {
+        ds4_hybrid_runtime.destroy();
+    }
 }
 
 // Returns 1 on success, 0 when the optimized path is not applicable, and -1
@@ -5266,10 +5384,14 @@ static int ds4_try_layer_major_prefill(
         }
         return -1;
     }
-    static thread_local std::vector<uint8_t> meta_arena;
     const size_t meta_bytes = 160u * 1024 * 1024;
-    if (!graph_cache && meta_arena.size() < meta_bytes) {
-        meta_arena.resize(meta_bytes);
+    if (ds4_layer_major_meta_owner != w.ctx) {
+        ds4_layer_major_meta_arena.clear();
+        ds4_layer_major_meta_arena.shrink_to_fit();
+        ds4_layer_major_meta_owner = w.ctx;
+    }
+    if (!graph_cache && ds4_layer_major_meta_arena.size() < meta_bytes) {
+        ds4_layer_major_meta_arena.resize(meta_bytes);
     }
 
     auto fail = [&](const char * what, int il) {
@@ -5377,8 +5499,8 @@ static int ds4_try_layer_major_prefill(
             params.mem_size = cached_layer->meta_size;
             params.mem_buffer = cached_layer->meta_buffer;
         } else {
-            params.mem_size = meta_arena.size();
-            params.mem_buffer = meta_arena.data();
+            params.mem_size = ds4_layer_major_meta_arena.size();
+            params.mem_buffer = ds4_layer_major_meta_arena.data();
         }
         params.no_alloc = true;
         ggml_context * ctx = ggml_init(params);
@@ -5725,22 +5847,26 @@ bool deepseek4_step_layer_range(
         memcpy(hc_state.data(), embed, sizeof(float) * (size_t)hc_dim * (size_t)n_tokens);
     }
 
-    // Lazy-load per-layer HC weights on CPU (static to avoid reloading)
-    static std::vector<HcLayerWeightsCpu> hc_layer_weights_range;
-    static HcWeightsCpu hc_output_weights_range;
-    static std::vector<HashRoutingTableCpu> hash_routing_tables_range;
-    static std::vector<DeepSeek4CachedLayerAlloc> cached_attn_allocs;
-    static std::vector<DeepSeek4CachedDecodeHcPreGraph> cached_decode_attn_hc_pre_graphs;
-    static std::vector<DeepSeek4CachedDecodeHcPreGraph> cached_decode_ffn_hc_pre_graphs;
-    static DeepSeek4CachedDecodeHcPostGraph cached_decode_hc_post_graph;
-    static std::vector<std::vector<DeepSeek4CachedDecodeAttnGraph>> cached_decode_attn_graphs;
-    static std::vector<DeepSeek4CachedDecodeFfnGraph> cached_decode_ffn_graphs;
-    static DeepSeek4CachedDecodeOutputGraph cached_decode_output_graph;
-    static DeepSeek4CachedLayerAlloc cached_dynamic_output_alloc;
-    static DeepSeek4FusedDecodeCache fused_decode_graph_cache;
-    static Ds4DecodeSharedInputs decode_shared_inputs;
-    static int hc_loaded_n_layer = 0;
-    static const ggml_context * hc_loaded_ctx = nullptr;
+    // Keep all reusable layer-range resources under one model owner so park,
+    // unload, and reload have a deterministic teardown boundary.
+    DeepSeek4LayerRangeRuntime & runtime = ds4_layer_range_runtime;
+    auto & hc_layer_weights_range = runtime.hc_layer_weights;
+    auto & hc_output_weights_range = runtime.hc_output_weights;
+    auto & hash_routing_tables_range = runtime.hash_routing_tables;
+    auto & cached_attn_allocs = runtime.cached_attn_allocs;
+    auto & cached_decode_attn_hc_pre_graphs =
+        runtime.cached_decode_attn_hc_pre_graphs;
+    auto & cached_decode_ffn_hc_pre_graphs =
+        runtime.cached_decode_ffn_hc_pre_graphs;
+    auto & cached_decode_hc_post_graph = runtime.cached_decode_hc_post_graph;
+    auto & cached_decode_attn_graphs = runtime.cached_decode_attn_graphs;
+    auto & cached_decode_ffn_graphs = runtime.cached_decode_ffn_graphs;
+    auto & cached_decode_output_graph = runtime.cached_decode_output_graph;
+    auto & cached_dynamic_output_alloc = runtime.cached_dynamic_output_alloc;
+    auto & fused_decode_graph_cache = runtime.fused_decode_graph_cache;
+    auto & decode_shared_inputs = runtime.decode_shared_inputs;
+    int & hc_loaded_n_layer = runtime.loaded_n_layer;
+    const ggml_context * & hc_loaded_ctx = runtime.owner_ctx;
     if (hc_loaded_n_layer != w.n_layer || hc_loaded_ctx != w.ctx) {
         reset_hc_layer_weights_cpu(hc_layer_weights_range);
         reset_hc_weights_cpu(hc_output_weights_range);
@@ -5787,7 +5913,7 @@ bool deepseek4_step_layer_range(
     }
 
     // Per-layer execution with CPU-side HC
-    static thread_local DeepSeek4LayerRangeScratch scratch;
+    DeepSeek4LayerRangeScratch & scratch = runtime.scratch;
     const int n_expert_used = ds4_effective_expert_count(w);
     scratch.ensure(w.ctx, n_tokens, n_embd, n_hc, n_expert_used);
 

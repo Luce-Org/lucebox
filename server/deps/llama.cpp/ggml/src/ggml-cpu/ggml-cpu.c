@@ -1326,6 +1326,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const bool src1_cont = ggml_is_contiguous(src1);
+    const bool grouped_src = ggml_mul_mat_is_grouped_src(dst);
 
     ggml_vec_dot_t const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
@@ -1341,7 +1342,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
         return;
     }
 
-    const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+    const void * wdata = (src1->type == vec_dot_type && !grouped_src)
+        ? src1->data : params->wdata;
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
     assert(ne12 % ne02 == 0);
@@ -1415,6 +1417,8 @@ void ggml_compute_forward_mul_mat(
     enum ggml_type           const vec_dot_type         = type_traits_cpu[src0->type].vec_dot_type;
     ggml_from_float_t        const from_float           = type_traits_cpu[vec_dot_type].from_float;
     int64_t                  const vec_dot_num_rows     = type_traits_cpu[src0->type].nrows;
+    const bool grouped_src = ggml_mul_mat_is_grouped_src(dst);
+    const bool convert_src1 = grouped_src || src1->type != vec_dot_type;
 
     GGML_ASSERT(ne0 == ne01);
     GGML_ASSERT(ne1 == ne11);
@@ -1442,7 +1446,7 @@ void ggml_compute_forward_mul_mat(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    if (src1_cont) {
+    if (src1_cont && !grouped_src) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
@@ -1462,41 +1466,59 @@ void ggml_compute_forward_mul_mat(
 UseGgmlGemm1:;
 #endif
 
-    if (src1->type != vec_dot_type) {
+    if (convert_src1) {
         char * wdata = params->wdata;
 
         const size_t nbw0 = ggml_type_size(vec_dot_type);
         const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
         const size_t nbw2 = nbw1*ne11;
         const size_t nbw3 = nbw2*ne12;
+        const size_t converted_size = ne13*nbw3;
 
-        assert(params->wsize >= ne13*nbw3);
+        assert(params->wsize >= converted_size);
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
-    #if 0
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
-                                ne10);
+        if (grouped_src) {
+            const struct ggml_tensor * physical = src1->view_src;
+            const int64_t groups = ggml_mul_mat_grouped_src_groups(dst);
+            GGML_ASSERT(physical && physical->type == GGML_TYPE_F32);
+            GGML_ASSERT(physical->ne[0] * groups == ne10);
+            GGML_ASSERT(physical->ne[1] == ne11);
+            GGML_ASSERT(physical->ne[2] == groups && physical->ne[3] == 1);
+            GGML_ASSERT(ggml_is_contiguous(physical));
+
+            const size_t scratch_offset = GGML_PAD(converted_size, CACHE_LINE_SIZE);
+            const size_t scratch_stride = (size_t) ne10 * sizeof(float);
+            GGML_ASSERT(params->wsize >=
+                        scratch_offset + (size_t) nth * scratch_stride);
+            float * scratch = (float *) (wdata + scratch_offset +
+                                         (size_t) ith * scratch_stride);
+            const int64_t group_width = physical->ne[0];
+            for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                for (int64_t group = 0; group < groups; ++group) {
+                    const float * src_group = (const float *)
+                        ((const char *) physical->data +
+                         (size_t) i11 * physical->nb[1] +
+                         (size_t) group * physical->nb[2]);
+                    memcpy(scratch + group * group_width, src_group,
+                           (size_t) group_width * sizeof(float));
+                }
+                from_float(scratch, wdata + (size_t) i11 * nbw1, ne10);
+            }
+        } else {
+            for (int64_t i13 = 0; i13 < ne13; ++i13) {
+                for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                    for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                        size_t bs = ggml_blck_size(vec_dot_type);
+                        int64_t ne10_block_start = (ith * ne10/bs) / nth;
+                        int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
+                        from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
+                                   (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
+                                   (ne10_block_end - ne10_block_start) * bs);
+                    }
                 }
             }
         }
-    #else
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    size_t bs = ggml_blck_size(vec_dot_type);
-                    int64_t ne10_block_start = (ith * ne10/bs) / nth;
-                    int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
-                }
-            }
-        }
-    #endif
     }
 
     if (ith == 0) {
@@ -1507,8 +1529,8 @@ UseGgmlGemm1:;
     ggml_barrier(params->threadpool);
 
 #if GGML_USE_LLAMAFILE
-    if (src1->type != vec_dot_type) {
-        const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+    if (convert_src1) {
+        const void* wdata = params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
         for (int64_t i13 = 0; i13 < ne13; i13++)
@@ -3004,9 +3026,15 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_MUL_MAT:
                     {
                         const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
+                        const bool grouped_src = ggml_mul_mat_is_grouped_src(node);
 
-                        if (node->src[1]->type != vec_dot_type) {
+                        if (node->src[1]->type != vec_dot_type || grouped_src) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
+                            if (grouped_src) {
+                                cur = GGML_PAD(cur, CACHE_LINE_SIZE);
+                                cur += (size_t) node->src[1]->ne[0] *
+                                       sizeof(float) * (size_t) n_tasks;
+                            }
                         }
                     } break;
                 case GGML_OP_MUL_MAT_ID:

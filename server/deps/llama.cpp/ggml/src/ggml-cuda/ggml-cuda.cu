@@ -2546,6 +2546,7 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
+    const bool grouped_src = ggml_mul_mat_is_grouped_src(dst);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
@@ -2614,7 +2615,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
 
-    if (!split && use_mul_mat_vec_f) {
+    if (grouped_src) {
+        // Only MMQ's grouped activation quantizer understands the physical
+        // [K/group,N,group] source layout.
+        GGML_ASSERT(!split);
+        GGML_ASSERT(use_mul_mat_q);
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+    } else if (!split && use_mul_mat_vec_f) {
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
@@ -5156,9 +5163,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DS4_INDEXER_SCORE:
             return op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[0]->ne[0] == 128 &&
+                   op->src[0]->ne[3] == 1 &&
                    op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[1]->ne[2] == 1 &&
+                   op->src[1]->ne[3] == 1 &&
                    op->src[2]->type == GGML_TYPE_F16 &&
                    op->src[2]->ne[0] == 128 &&
+                   op->src[2]->ne[2] == 1 &&
+                   op->src[2]->ne[3] == 1 &&
                    ggml_is_contiguous(op->src[0]) &&
                    ggml_is_contiguous(op->src[1]) &&
                    ggml_is_contiguous(op->src[2]);
@@ -5172,6 +5184,36 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
+                if (ggml_mul_mat_is_grouped_src(op)) {
+                    const ggml_tensor * physical = b->view_src;
+                    const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+                    const bool bad_padding_clear =
+                        a->buffer &&
+                        ggml_backend_buffer_get_usage(a->buffer) ==
+                            GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                        ggml_nbytes(a) !=
+                            ggml_backend_buffer_get_alloc_size(a->buffer, a) &&
+                        a->view_src;
+                    return op->op == GGML_OP_MUL_MAT &&
+                           a->buffer &&
+                           !ggml_backend_buft_is_cuda_split(a->buffer->buft) &&
+                           ggml_is_quantized(a->type) &&
+                           !bad_padding_clear &&
+                           b->type == GGML_TYPE_F32 &&
+                           op->type == GGML_TYPE_F32 &&
+                           physical &&
+                           physical->type == GGML_TYPE_F32 &&
+                           physical->ne[0] % 4 == 0 &&
+                           physical->ne[0] * physical->ne[2] == b->ne[0] &&
+                           physical->ne[1] == b->ne[1] &&
+                           physical->ne[2] ==
+                               ggml_mul_mat_grouped_src_groups(op) &&
+                           physical->ne[3] == 1 &&
+                           b->ne[0] % (4 * QK8_1) == 0 &&
+                           ggml_is_contiguous(physical) &&
+                           ggml_cuda_should_use_mmq(
+                               a->type, cc, b->ne[1], /*n_experts=*/0);
+                }
                 if (a->buffer && ggml_backend_buft_is_cuda_split(a->buffer->buft)) {
                     if (a->ne[2] > 1 || a->ne[3] > 1) {
                         return false;

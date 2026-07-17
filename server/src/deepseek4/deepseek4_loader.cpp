@@ -884,6 +884,7 @@ bool build_deepseek4_moe_hybrid_storage_from_file(
 }
 
 void free_deepseek4_weights(DeepSeek4Weights & w) {
+    deepseek4_release_runtime_graphs(w);
     if (w.ctx) { ggml_free(w.ctx); w.ctx = nullptr; }
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     w.layers.clear();

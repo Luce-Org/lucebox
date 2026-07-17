@@ -3357,6 +3357,7 @@ struct ggml_tensor * ggml_mul_mat_grouped_src(
     GGML_ASSERT(b->ne[2] > 1 && b->ne[3] == 1);
     GGML_ASSERT(ggml_is_contiguous(b));
     GGML_ASSERT(a->ne[0] == b->ne[0] * b->ne[2]);
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
 
     const int64_t flat_k = b->ne[0] * b->ne[2];
     struct ggml_tensor * logical = ggml_view_2d(
@@ -5541,6 +5542,12 @@ void ggml_flash_attn_ext_set_ds4_inverse_rope(
     ggml_set_op_params_f32(a, 13, beta_fast);
     ggml_set_op_params_f32(a, 14, beta_slow);
     ggml_set_op_params_i32(a, 15, n_ctx_orig);
+}
+
+bool ggml_flash_attn_ext_is_ds4(const struct ggml_tensor * a) {
+    return a && a->op == GGML_OP_FLASH_ATTN_EXT &&
+           (ggml_get_op_params_i32(a, 6) != 0 ||
+            ggml_get_op_params_i32(a, 7) != 0);
 }
 
 enum ggml_prec ggml_flash_attn_ext_get_prec(
@@ -8220,7 +8227,13 @@ struct ggml_tensor * ggml_ds4_hc_post(
     GGML_ASSERT(split->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(residual_hc));
     GGML_ASSERT(ggml_is_contiguous(block_out));
-    GGML_ASSERT(ggml_is_contiguous(split));
+    // HC-pre stores the working vector and split parameters in one tensor.
+    // Its split view is dense within each token but inherits the parent row
+    // stride.  The device kernel consumes nb[1] explicitly, so require the
+    // supported row-major layout rather than an unnecessarily packed tensor.
+    GGML_ASSERT(split->nb[0] == sizeof(float));
+    GGML_ASSERT(split->nb[1] >= split->ne[0] * split->nb[0]);
+    GGML_ASSERT(split->ne[2] == 1 && split->ne[3] == 1);
     GGML_ASSERT(n_hc > 0 && n_hc <= 8);
     const int64_t mix_dim = 2*(int64_t)n_hc + (int64_t)n_hc*n_hc;
     const int64_t n_tokens = residual_hc->ne[1];
@@ -8306,6 +8319,9 @@ struct ggml_tensor * ggml_ds4_indexer_score(
     GGML_ASSERT(ggml_is_contiguous(index_comp));
     GGML_ASSERT(head_weights->ne[0] == q->ne[1]);
     GGML_ASSERT(head_weights->ne[1] == q->ne[2]);
+    GGML_ASSERT(q->ne[3] == 1);
+    GGML_ASSERT(head_weights->ne[2] == 1 && head_weights->ne[3] == 1);
+    GGML_ASSERT(index_comp->ne[2] == 1 && index_comp->ne[3] == 1);
     GGML_ASSERT(kv_start >= 0 && ratio > 0);
 
     struct ggml_tensor * result = ggml_new_tensor_2d(

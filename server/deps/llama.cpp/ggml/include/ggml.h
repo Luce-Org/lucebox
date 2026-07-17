@@ -2426,6 +2426,11 @@ extern "C" {
             int                  n_ctx_orig,
             bool                 q_unrotated);
 
+    // True when flash_attn_ext carries the DS4 sparse-layout or fused-RoPE
+    // contract. Backends must implement that complete contract or reject it.
+    GGML_API bool ggml_flash_attn_ext_is_ds4(
+            const struct ggml_tensor * a);
+
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 

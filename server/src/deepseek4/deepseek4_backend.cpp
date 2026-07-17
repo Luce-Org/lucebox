@@ -346,21 +346,58 @@ DeepSeek4Backend::~DeepSeek4Backend() {
     shutdown();
 }
 
+bool DeepSeek4Backend::requires_monolithic_model() const {
+    return cfg_.fused_decode ||
+           cfg_.prefill_mode != PrefillAttentionMode::Exact;
+}
+
+bool DeepSeek4Backend::validate_prefill_mode() const {
+    if (cfg_.prefill_mode == PrefillAttentionMode::Exact) {
+        return true;
+    }
+    const PlacementBackend target_backend =
+        cfg_.device.backend == PlacementBackend::Auto
+            ? compiled_placement_backend()
+            : cfg_.device.backend;
+    if (target_backend != PlacementBackend::Hip ||
+        cfg_.device.is_layer_split()) {
+        std::fprintf(stderr,
+            "[deepseek4] %s prefill requires a single HIP target\n",
+            prefill_attention_mode_name(cfg_.prefill_mode));
+        return false;
+    }
+    if (w_.moe_hybrid || moe_hybrid_) {
+        std::fprintf(stderr,
+            "[deepseek4] %s prefill requires every expert to be resident; "
+            "the selected placement has cold experts\n",
+            prefill_attention_mode_name(cfg_.prefill_mode));
+        return false;
+    }
+    return true;
+}
+
 bool DeepSeek4Backend::load_model() {
     const PlacementBackend target_backend =
         cfg_.device.backend == PlacementBackend::Auto
             ? compiled_placement_backend()
             : cfg_.device.backend;
 
-    // The fused graph references every expert tensor directly, so it cannot
-    // run on the hybrid expert representation. Honor an explicit fused-decode
-    // request by trying the monolithic load first. Large HIP models otherwise
-    // keep using the hybrid path: a managed allocation can stall or be killed
-    // on integrated UMA systems before an OOM fallback is possible.
-    if (target_backend == PlacementBackend::Hip && cfg_.fused_decode) {
+    // Fused decode and layer-major prefill reference every expert directly.
+    // Make their residency requirement explicit instead of silently falling
+    // back to tokenwise hybrid execution.
+    if (target_backend == PlacementBackend::Hip && requires_monolithic_model()) {
         std::fprintf(stderr,
-                     "[deepseek4] fused decode requested; loading monolithic HIP model\n");
+                     "[deepseek4] monolithic execution requested "
+                     "(fused_decode=%s, prefill=%s)\n",
+                     cfg_.fused_decode ? "on" : "off",
+                     prefill_attention_mode_name(cfg_.prefill_mode));
         if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
+            if (cfg_.prefill_mode != PrefillAttentionMode::Exact) {
+                std::fprintf(stderr,
+                    "[deepseek4] monolithic HIP load required for %s prefill\n",
+                    prefill_attention_mode_name(cfg_.prefill_mode));
+                return false;
+            }
             std::fprintf(stderr,
                          "[deepseek4] monolithic HIP load failed; trying hybrid mode\n");
             if (!init_hybrid_model()) {
@@ -471,6 +508,9 @@ bool DeepSeek4Backend::init() {
     if (!load_model()) {
         return false;
     }
+    if (!validate_prefill_mode()) {
+        return false;
+    }
 
     const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
     if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
@@ -488,9 +528,10 @@ bool DeepSeek4Backend::init() {
         w_.routed_expert_top_k > 0 ? w_.routed_expert_top_k : w_.n_expert_used;
     std::fprintf(stderr,
                  "[deepseek4] initialized: %d layers, ctx=%d, %d experts "
-                 "(%d/%d routed), fused_decode=%s%s\n",
+                 "(%d/%d routed), fused_decode=%s, prefill=%s%s\n",
                  w_.n_layer, max_ctx, w_.n_expert, active_experts, w_.n_expert_used,
                  w_.fused_decode ? "on" : "off",
+                 prefill_attention_mode_name(cfg_.prefill_mode),
                  moe_hybrid_ ? " [hybrid]" : "");
 
     if (env_flag_enabled("DFLASH_DS4_SPEC")) {
@@ -677,6 +718,13 @@ bool DeepSeek4Backend::unpark(const std::string & what) {
         parked_ = false;
         std::printf("[deepseek4] target unparked (VRAM restored)\n");
         std::fflush(stdout);
+    }
+    if (!validate_prefill_mode()) {
+        free_deepseek4_weights(w_);
+        stream_engine_.destroy();
+        moe_hybrid_.reset();
+        moe_placement_ = {};
+        return false;
     }
 
     if (want_draft && spec_drafter_parked_) {

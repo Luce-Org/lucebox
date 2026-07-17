@@ -1498,7 +1498,11 @@ static bool ds4_launch_flash_attn_d512_grouped_compact(
     return true;
 }
 
-static bool ggml_cuda_ds4_flash_attn_d512_f32(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static bool ggml_cuda_ds4_flash_attn_d512_f32_supported(const ggml_tensor * dst) {
+    if (!ggml_flash_attn_ext_is_ds4(dst)) {
+        return false;
+    }
+
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -1509,16 +1513,23 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(ggml_backend_cuda_context & ctx, g
     const bool kv_f16 = K && V && K->type == GGML_TYPE_F16 &&
                         V->type == GGML_TYPE_F16;
     const bool mask_ok = !mask || mask->type == GGML_TYPE_F16 ||
-                         mask->type == GGML_TYPE_F32;
+                         (kv_f32 && mask->type == GGML_TYPE_F32);
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
     if (!Q || !K || !V ||
         Q->type != GGML_TYPE_F32 || (!kv_f32 && !kv_f16) || !mask_ok ||
         dst->type != GGML_TYPE_F32 ||
         Q->ne[0] != 512 || K->ne[0] != 512 || V->ne[0] != 512 ||
+        K->ne[1] != V->ne[1] ||
         K->ne[2] != 1 || V->ne[2] != 1 ||
         Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 ||
-        dst->ne[0] != 512 || dst->ne[1] != Q->ne[2] || dst->ne[2] != Q->ne[1] ||
+        dst->ne[0] != 512 || dst->ne[1] != Q->ne[2] ||
+        dst->ne[2] != Q->ne[1] || dst->ne[3] != 1 ||
         Q->nb[0] != (int64_t) sizeof(float) ||
-        dst->nb[0] != (int64_t) sizeof(float)) {
+        !ggml_is_contiguous(dst) ||
+        max_bias != 0.0f || logit_softcap != 0.0f) {
         return false;
     }
     const size_t kv_esz = kv_f16 ? sizeof(half) : sizeof(float);
@@ -1529,21 +1540,62 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(ggml_backend_cuda_context & ctx, g
         Q->nb[2] % sizeof(float) != 0 ||
         (mask && (mask->ne[0] != K->ne[1] ||
                   mask->ne[1] != Q->ne[1] ||
-                  mask->nb[1] != (size_t) mask->ne[0] * mask->nb[0]))) {
+                  mask->ne[2] != 1 || mask->ne[3] != 1 ||
+                  mask->nb[0] != ggml_type_size(mask->type) ||
+                  !ggml_is_contiguous(mask)))) {
         return false;
     }
-    if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->ne[0] != Q->ne[2])) {
+    if (sinks && (sinks->type != GGML_TYPE_F32 ||
+                  sinks->ne[0] != Q->ne[2] || sinks->ne[1] != 1 ||
+                  sinks->ne[2] != 1 || sinks->ne[3] != 1 ||
+                  !ggml_is_contiguous(sinks))) {
         return false;
     }
 
     const int n_tokens = (int) Q->ne[1];
     const int n_heads = (int) Q->ne[2];
     const int n_kv = (int) K->ne[1];
-    const size_t q_stride_token = Q->nb[1] / sizeof(float);
-    const size_t q_stride_head = Q->nb[2] / sizeof(float);
     if (n_tokens <= 0 || n_heads <= 0 || n_kv <= 0) {
         return false;
     }
+
+    const int raw_rows = ggml_get_op_params_i32(dst, 4);
+    const int sparse_keep_rows = ggml_get_op_params_i32(dst, 5);
+    const unsigned int ds4_layout =
+        (unsigned int) ggml_get_op_params_i32(dst, 6);
+    const int raw_window = (int) (ds4_layout >> 16);
+    const int sparse_block_size = (int) (ds4_layout & 0xffffu);
+    const int rope_flags = ggml_get_op_params_i32(dst, 7);
+    if (raw_rows < 0 || raw_rows > n_kv ||
+        (ds4_layout != 0 && (raw_window <= 0 || sparse_block_size <= 0)) ||
+        sparse_keep_rows == INT_MIN ||
+        (sparse_keep_rows != 0 && !mask) ||
+        (rope_flags & ~3) != 0 ||
+        ((rope_flags & 2) != 0 && (rope_flags & 1) == 0)) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool ggml_cuda_ds4_flash_attn_d512_f32(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (!ggml_cuda_ds4_flash_attn_d512_f32_supported(dst)) {
+        return false;
+    }
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+    const bool kv_f32 = K->type == GGML_TYPE_F32;
+    const bool kv_f16 = K->type == GGML_TYPE_F16;
+    const int n_tokens = (int) Q->ne[1];
+    const int n_heads = (int) Q->ne[2];
+    const int n_kv = (int) K->ne[1];
+    const size_t q_stride_token = Q->nb[1] / sizeof(float);
+    const size_t q_stride_head = Q->nb[2] / sizeof(float);
 
     int raw_rows = ggml_get_op_params_i32(dst, 4);
     int sparse_keep_rows = ggml_get_op_params_i32(dst, 5);
@@ -2357,6 +2409,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    if (ggml_flash_attn_ext_is_ds4(dst)) {
+        if (!ggml_cuda_ds4_flash_attn_d512_f32(ctx, dst)) {
+            GGML_ABORT("unsupported DeepSeek4 D=512 flash-attention contract");
+        }
+        return;
+    }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
@@ -2379,5 +2437,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    if (ggml_flash_attn_ext_is_ds4(dst)) {
+        return ggml_cuda_ds4_flash_attn_d512_f32_supported(dst);
+    }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
