@@ -662,6 +662,7 @@ bool DeepSeek4LayerSplitAdapter::snapshot_save(int slot) {
     snap.last_tok = last_tok_;
     snap.hc_state = hc_state_;
     snap.prefill_last_logits = prefill_last_logits_;
+    snap.needs_logit_processing = sampler_.needs_logit_processing();
     snap.used = true;
     return true;
 }
@@ -676,6 +677,7 @@ void DeepSeek4LayerSplitAdapter::snapshot_free(int slot) {
     snap.last_tok = -1;
     snap.hc_state.clear();
     snap.prefill_last_logits.clear();
+    snap.needs_logit_processing = false;
     snap.used = false;
     if (snap.shards.size() != shards_.size()) snap.shards.resize(shards_.size());
     if (use_mixed_target_split()) {
@@ -698,6 +700,13 @@ bool DeepSeek4LayerSplitAdapter::snapshot_used(int slot) const {
 int DeepSeek4LayerSplitAdapter::snapshot_cur_pos(int slot) const {
     if (slot < 0 || slot >= PREFIX_SLOTS) return 0;
     return snapshots_[slot].cur_pos;
+}
+
+bool DeepSeek4LayerSplitAdapter::snapshot_compatible(
+        int slot, const GenerateRequest & req) const {
+    return snapshot_used(slot) &&
+        snapshots_[slot].needs_logit_processing ==
+            req.sampler.needs_logit_processing();
 }
 
 bool DeepSeek4LayerSplitAdapter::snapshot_restore(int slot) {

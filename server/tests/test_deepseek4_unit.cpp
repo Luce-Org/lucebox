@@ -1348,6 +1348,7 @@ public:
     }
     bool supports_cpu_sampling() const override { return true; }
     void free_drafter() override {}
+    bool snapshot_used(int slot) const override { return slot == 0; }
     int snapshot_cur_pos(int) const override { return 1; }
     bool snapshot_restore(int) override {
         restore_called = true;
@@ -1421,6 +1422,64 @@ static void test_backend_sampling_penalizes_prompt_history() {
     SamplerCfg penalized;
     penalized.rep_pen = 2.0f;
     TEST_ASSERT(decode_one(penalized) == 2);
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+class TestLayerSplitSnapshotAdapter final : public LayerSplitAdapter {
+public:
+    const char * name() const override { return "test-snapshot"; }
+    bool init() override { return true; }
+    int max_context() const override { return 64; }
+    void reset_request_state() override { reset_called = true; }
+    bool prefill(const std::vector<int32_t> & prompt,
+                 int, int & last_tok) override {
+        prefilled.insert(prefilled.end(), prompt.begin(), prompt.end());
+        last_tok = 2;
+        return true;
+    }
+    bool decode_ar(int, int, int,
+                   const std::vector<int32_t> &,
+                   std::vector<int32_t> &,
+                   const DaemonIO &) override {
+        return true;
+    }
+    void free_drafter() override {}
+    bool snapshot_used(int slot) const override { return slot == 0; }
+    int snapshot_cur_pos(int) const override { return 1; }
+    bool snapshot_compatible(int, const GenerateRequest &) const override {
+        return false;
+    }
+    bool snapshot_restore(int) override {
+        restore_called = true;
+        return true;
+    }
+    int current_last_token() const override { return 1; }
+    void shutdown() override {}
+
+    bool reset_called = false;
+    bool restore_called = false;
+    std::vector<int32_t> prefilled;
+};
+
+static void test_layer_split_incompatible_snapshot_falls_back() {
+    std::fprintf(stderr,
+                 "  test_layer_split_incompatible_snapshot_falls_back ...");
+
+    auto adapter = std::make_unique<TestLayerSplitSnapshotAdapter>();
+    auto * observed = adapter.get();
+    LayerSplitBackend backend(std::move(adapter));
+    GenerateRequest req;
+    req.prompt = {1, 2, 3};
+    req.n_gen = 0;
+
+    const GenerateResult result =
+        backend.restore_and_generate_impl(0, req, DaemonIO{});
+
+    TEST_ASSERT(result.ok());
+    TEST_ASSERT(!observed->restore_called);
+    TEST_ASSERT(observed->reset_called);
+    TEST_ASSERT(observed->prefilled == req.prompt);
 
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
@@ -1748,10 +1807,18 @@ static void test_snapshot_save_restore() {
     adapter.last_tok_ = 4242;
     adapter.hc_state_ = {1.0f, 2.0f, 3.0f, 4.0f};
     adapter.prefill_last_logits_ = {9.0f, 8.0f, 7.0f};
+    adapter.sampler_.rep_pen = 1.5f;
 
     TEST_ASSERT(adapter.snapshot_save(0));
     TEST_ASSERT(adapter.snapshot_used(0));
     TEST_ASSERT(adapter.snapshot_cur_pos(0) == 7);
+    TEST_ASSERT(adapter.snapshots_[0].needs_logit_processing);
+
+    GenerateRequest sampling_req;
+    sampling_req.sampler.rep_pen = 1.5f;
+    TEST_ASSERT(adapter.snapshot_compatible(0, sampling_req));
+    GenerateRequest greedy_req;
+    TEST_ASSERT(!adapter.snapshot_compatible(0, greedy_req));
 
     adapter.cur_pos_ = 0;
     adapter.last_tok_ = -1;
@@ -1790,6 +1857,7 @@ static void test_snapshot_save_restore() {
     TEST_ASSERT(!adapter.snapshot_used(0));
     TEST_ASSERT(adapter.snapshots_[0].hc_state.empty());
     TEST_ASSERT(adapter.snapshots_[0].prefill_last_logits.empty());
+    TEST_ASSERT(!adapter.snapshots_[0].needs_logit_processing);
     TEST_ASSERT(adapter.snapshots_[0].shards.size() == 1);
     TEST_ASSERT(!adapter.snapshots_[0].shards[0].ctx);
     TEST_ASSERT(!adapter.snapshot_restore(0));
@@ -2967,6 +3035,7 @@ int main() {
     test_layer_split_sampler_appends_generated_tokens();
     test_layer_split_restore_preserves_full_sampling_history();
     test_backend_sampling_penalizes_prompt_history();
+    test_layer_split_incompatible_snapshot_falls_back();
     test_loader_rejects_missing_required_metadata(backend);
     test_loader_rejects_invalid_compress_ratio_type(backend);
     test_loader_rejects_zero_vocab_size(backend);

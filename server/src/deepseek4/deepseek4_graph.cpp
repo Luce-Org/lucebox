@@ -5789,6 +5789,7 @@ bool deepseek4_step_layer_range(
         std::vector<float> capture_all;
         std::vector<float> logits_all;
         std::vector<float> last_out;
+        int32_t last_chunk_argmax = -1;
         hc_all.reserve((size_t) hc_dim * n_tokens);
         if (out_logits && !is_last_shard) {
             shard_out_all.reserve((size_t) hc_dim * n_tokens);
@@ -5817,12 +5818,13 @@ bool deepseek4_step_layer_range(
                 chunk_hooks.all_logits_out = verify_hooks->all_logits_out ? &chunk_logits : nullptr;
                 chunk_hooks_ptr = &chunk_hooks;
             }
+            const bool last_chunk = (off + chunk >= n_tokens);
             if (!deepseek4_step_layer_range(
                     backend, w, cache, chunk_hc,
                     embed + (size_t) off * input_width,
                     chunk, kv_start + off, layer_begin, layer_end,
                     out_logits ? &chunk_out : nullptr,
-                    /*out_argmax=*/nullptr,
+                    (out_argmax && last_chunk) ? &last_chunk_argmax : nullptr,
                     token_ids ? token_ids + off : nullptr,
                     telemetry, allow_decode_graph_reuse, chunk_hooks_ptr)) {
                 return false;
@@ -5845,6 +5847,9 @@ bool deepseek4_step_layer_range(
         hc_state = std::move(hc_all);
         if (out_logits) {
             *out_logits = is_last_shard ? std::move(last_out) : std::move(shard_out_all);
+        }
+        if (out_argmax) {
+            *out_argmax = last_chunk_argmax;
         }
         if (verify_hooks && verify_hooks->capture_out) {
             *verify_hooks->capture_out = std::move(capture_all);
