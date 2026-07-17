@@ -3,10 +3,6 @@
 </p>
 
 <p align="center">
-  <strong>English</strong> · <a href="README_zh-CN.md">简体中文</a>
-</p>
-
-<p align="center">
   <a href="https://lucebox.com"><img src="https://img.shields.io/badge/lucebox.com-f5c842?style=for-the-badge&logo=safari&logoColor=f5c842&labelColor=090909" alt="lucebox.com"></a>
   <a href="https://huggingface.co/Lucebox"><img src="https://img.shields.io/badge/HuggingFace-f5c842?style=for-the-badge&logo=huggingface&logoColor=f5c842&labelColor=090909" alt="HuggingFace"></a>
   <a href="https://discord.gg/yHfswqZmJQ"><img src="https://img.shields.io/badge/Discord-f5c842?style=for-the-badge&logo=discord&logoColor=f5c842&labelColor=090909" alt="Discord"></a>
@@ -23,14 +19,18 @@
 
 <p align="center">
   <strong>Local LLM inference server built for speed. Custom kernels, speculative prefill & decoding.</strong><br/>
-  Each optimization in our engine is for specific model family and hardware target.
+  <strong>为速度而生的本地大模型推理服务器。自定义内核、投机预填充与投机解码。</strong><br/>
+  Each optimization in our engine is for specific model family and hardware target.<br/>
+  引擎中的每一项优化都面向特定的模型家族与硬件平台。
 </p>
 
 ---
 
 ## Inference Engine Optimizations
+推理引擎优化
 
 Each one is self-contained with setup instructions and benchmark notes.
+每项优化自成模块，附带安装说明与基准测试数据。
 
 <p align="center">
   <a href="optimizations/megakernel/"><img src="assets/cards/megakernel_card.png" alt="Megakernel" width="46%"></a>
@@ -51,8 +51,10 @@ Each one is self-contained with setup instructions and benchmark notes.
 ---
 
 ## Supported Models & Drafters
+## 支持的模型与草稿器
 
 All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combined = geometric mean √(TTFT × decode) where both phases benched; otherwise the single-phase speedup. Drafters published on [huggingface.co/Lucebox](https://huggingface.co/Lucebox).
+所有加速数据均对比 vendored llama.cpp（`-fa 1`，相同 KV 量化）。草稿模型发布于 [huggingface.co/Lucebox](https://huggingface.co/Lucebox)。
 
 <table>
 <tr>
@@ -83,8 +85,10 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 </table>
 
 ## Tested Machines (GPU/APU)
+## 已测试硬件（GPU / APU）
 
 Reference target: **RTX 3090 (Ampere sm_86)** — all headline numbers. Other NVIDIA archs auto-detected by CMake / `setup.py`; AMD HIP backend separate ([Strix Halo section](#amd-strix-halo-hip-backend)).
+基准参考平台：**RTX 3090（Ampere sm_86）**。其他 NVIDIA 架构由 CMake / `setup.py` 自动检测；AMD HIP 后端独立支持。
 
 | | Arch | GPU | Min CUDA / ROCm | Status | Bench |
 |:---:|------|-----|:---------------:|--------|:-----:|
@@ -100,13 +104,16 @@ Reference target: **RTX 3090 (Ampere sm_86)** — all headline numbers. Other NV
 | — | RDNA4 `gfx1201` | Radeon AI PRO R9700 | ROCm 6.4+ | ✅ 55 tok/s HIP | [↗](server/README.md#amd-hip-backend-strix-halo-rx-7900-xtx) |
 
 `server/` (DFlash) builds with CMake 3.18+ and vendors the required `ggml` sources directly; only `Block-Sparse-Attention` remains a git submodule. No PyTorch is needed for `server/`. `optimizations/megakernel/` is the only component requiring PyTorch 2.0+ (CUDAExtension links against torch C++ libs). Power-tune: `sudo nvidia-smi -pl 220` (3090 sweet spot, re-sweep for other cards).
+`server/`（DFlash）使用 CMake 3.18+ 编译，直接内置所需 `ggml` 源码；仅 `Block-Sparse-Attention` 为 git 子模块。`server/` 不需要 PyTorch。`optimizations/megakernel/` 是唯一需要 PyTorch 2.0+ 的组件。功耗调优：`sudo nvidia-smi -pl 220`（3090 甜点，其他显卡需重新调参）。
 
 ## Quick Start On Harnesses
+## 快速开始：客户端工具
 
 [`harness/`](harness/) contains RTX 3090 client launchers and regression tests
 for Lucebox server compatibility. Run Lucebox inside Claude Code, Codex,
 OpenCode, Hermes, Pi, OpenClaw, or Open WebUI, or check if a server change
 still works with those clients.
+[`harness/`](harness/) 提供 RTX 3090 客户端启动脚本与回归测试，用于验证 Lucebox 服务器兼容性。可在 Claude Code、Codex、OpenCode、Hermes、Pi、OpenClaw、Open WebUI 等客户端中运行 Lucebox。
 
 <table>
 <tr>
@@ -132,6 +139,7 @@ still works with those clients.
 </table>
 
 All launchers spawn the native C++ HTTP server (`dflash_server`). Override defaults via env vars:
+所有启动脚本会拉起原生 C++ HTTP 服务器（`dflash_server`）。通过环境变量覆盖默认值：
 
 ```bash
 DFLASH_SERVER_BIN=server/build/dflash_server \
@@ -144,15 +152,18 @@ harness/clients/run_codex.sh
 For no-draft targets such as Gemma, set only `DFLASH_TARGET` or pass
 `DRAFT=none`; the harness will not attach the default Qwen draft to a custom
 target.
+对于 Gemma 等无草稿模型的目标，只需设置 `DFLASH_TARGET` 或传入 `DRAFT=none`。
 
 Launcher scripts install missing real-client CLIs automatically under
 `.harness-work/`. To preinstall them yourself:
+启动脚本会自动在 `.harness-work/` 下安装缺失的客户端 CLI。也可手动预装：
 
 ```bash
 python3 harness/client_test_runner.py install --clients codex,hermes,openwebui
 ```
 
 For direct TPS/TTFT numbers against a running server:
+直接获取服务器的 TPS/TTFT 数据：
 
 ```bash
 python3 harness/client_test_runner.py bench \
@@ -162,8 +173,10 @@ python3 harness/client_test_runner.py bench \
 ```
 
 ## Quick Start With Docker
+## 快速开始：Docker（免编译，推荐）
 
 Prebuilt images on GHCR track `main`. No CUDA toolkit or build needed. Pull the image, mount weights and serve. OpenAI-compatible API on `:8000`.
+预构建镜像跟踪 `main` 分支，无需 CUDA 工具链或编译。拉取镜像、挂载权重、启动即可，提供 OpenAI 兼容 API（`:8000`）。
 
 <table>
 <tr>
@@ -177,6 +190,7 @@ Prebuilt images on GHCR track `main`. No CUDA toolkit or build needed. Pull the 
 Drop a GGUF model target into `server/models/` first, then
 `:8000/v1/chat/completions`. Full tutorial in the
 [Docker blog](https://lucebox.com/blog/docker).
+先将 GGUF 模型放入 `server/models/`，然后访问 `:8000/v1/chat/completions`。
 
 </td>
 <td width="62%" valign="middle">
@@ -188,6 +202,7 @@ Drop a GGUF model target into `server/models/` first, then
 </table>
 
 **Install and run:**
+**安装并运行：**
 
 ```bash
 # 1. Pull the image for your GPU
@@ -215,10 +230,13 @@ docker run --rm --device /dev/kfd --device /dev/dri \
 ```
 
 Then hit `:8000/v1/chat/completions` (OpenAI-compatible).
+然后访问 `:8000/v1/chat/completions`（OpenAI 兼容接口）。
 
 ## Run the Server
+## 运行服务器
 
 Default: Qwen 3.6-27B Q4_K_M target + Lucebox Q4_K_M DFlash drafter on RTX 3090. DDTree budget=22, TQ3_0 KV cache, full attention. OpenAI-compatible HTTP on `:8000`.
+默认配置：Qwen 3.6-27B Q4_K_M 目标模型 + Lucebox Q4_K_M DFlash 草稿模型，DDTree budget=22，TQ3_0 KV 缓存，全注意力，HTTP 端口 `:8000`。
 
 ```bash
 # build (CUDA 12+, CMake 3.18+)
@@ -238,9 +256,11 @@ DFLASH27B_KV_TQ3=1 \
 ```
 
 ### Making requests
+### 发送请求
 
 For the fastest, deterministic responses send `temperature: 0` (greedy decoding gives the
 highest spec-decode acceptance):
+如需最快、确定性的响应，请发送 `temperature: 0`（贪心解码可获得最高的投机解码接受率）：
 
 ```bash
 curl :8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
@@ -252,10 +272,13 @@ curl :8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
 
 Requests that omit `temperature` use the model card's sampling (Qwen3.6: `temperature: 1.0`,
 `top_p: 0.95`, `top_k: 20`).
+省略 `temperature` 时使用模型卡片的采样参数（Qwen3.6：`temperature: 1.0`、`top_p: 0.95`、`top_k: 20`）。
 
 ### Server flags
+### 服务器参数
 
 **Core**
+核心参数
 
 | Flag | Default | Effect |
 |---|---|---|
@@ -268,6 +291,7 @@ Requests that omit `temperature` use the model card's sampling (Qwen3.6: `temper
 | `--chat-template-file <path>` | autodetect | Override Jinja template |
 
 **Decode (DFlash + DDTree)**
+解码（DFlash + DDTree）
 
 | Flag | Default | Effect |
 |---|---|---|
@@ -278,6 +302,7 @@ Requests that omit `temperature` use the model card's sampling (Qwen3.6: `temper
 | `--lazy-draft` | off | Legacy alias for `--draft-residency=request-scoped` (defer draft load until first request, release after) |
 
 **GPU draft top-K & verify-argmax (DFlash)**
+GPU 草稿 top-K 与验证 argmax（DFlash）
 
 The draft-token top-K extraction and the per-step verify argmax used to run on the CPU, each requiring a full `vocab × n_tokens` logits copy from device to host (D2H) every speculation step. These two env flags move both onto the GPU, reading the logits in place on the device buffer and skipping the bulk D2H. Both are **on by default in the server** (the `test_dflash` harness defaults `DFLASH_GPU_VERIFY_ARGMAX` to off, see the table below) and take effect on **both CUDA and HIP/ROCm builds**: the draft top-K uses a custom device kernel (`geometric_draft_topk_cuda.cu`, the same source compiled directly for HIP) and the verify argmax reads an in-graph `ggml_argmax` node, so neither depends on a CUDA-only path. Each path validates its result and **falls back to the legacy CPU computation automatically** on any failure (e.g. an out-of-range index), so disabling them is only needed for debugging or A/B comparison.
 
@@ -294,6 +319,7 @@ To reproduce the benchmark: baseline `DFLASH_GPU_DRAFT_TOPK=0 DFLASH_GPU_VERIFY_
 | `DFLASH_TOPK_PROFILE=1` | off | Print per-launch CUDA event timing (partial pass + combine pass) for the GPU top-K kernel to stderr. |
 
 **GPU sampler (DFlash)**
+GPU 采样器（DFlash）
 
 The CPU `sample_logits` chain (repetition/frequency/presence penalty → softmax(temp) → top_p nucleus → multinomial draw) requires a full vocab-wide D2H logits copy every token. `geometric_sampler_cuda.cu` ports penalty application, the softmax reductions, and the draw onto the GPU, reading logits straight off the device tensor in the qwen35 decode loop (skipping that D2H). It's **on by default** at runtime on CUDA builds (opt out with `DFLASH_GPU_SAMPLE=0`).
 
@@ -322,6 +348,7 @@ Per-call sampler-only latency at the Qwen3 vocab (151,936), measured on an RTX 3
 End-to-end repro: `DFLASH_SAMP=0.8,1.0,0,1.1,42 python server/scripts/bench_llm.py --bench HumanEval` (GPU sampler on by default) vs the same command with `DFLASH_GPU_SAMPLE=0` (CPU-only).
 
 **Prefill compression (PFlash)**
+预填充压缩（PFlash）
 
 | Flag / env | Default | Effect |
 |---|---|---|
@@ -339,6 +366,7 @@ End-to-end repro: `DFLASH_SAMP=0.8,1.0,0,1.1,42 python server/scripts/bench_llm.
 When compression is on, the request path picks one of three modes automatically, so they never stack: the first turn is sent verbatim (the system prompt stays as a stable cache anchor), multi-turn continuations use **FlowKV** (only the aged history is compressed, recent turns kept verbatim, so the disk prefix cache from `--prefix-cache-slots` keeps hitting), and a single oversized prompt with no prior turns uses whole-prompt PFlash. With `--prefill-compression off` the request path is identical to a build without compression.
 
 **KV cache**
+KV 缓存
 
 | Flag / env | Default | Effect |
 |---|---|---|
@@ -350,6 +378,7 @@ When compression is on, the request path picks one of three modes automatically,
 | `--kv-cache-budget N` | — | On-disk cache size cap |
 
 **Bounded KV residency (KVFlash)**
+有限 KV 驻留（KVFlash）
 
 Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token chunks live in host RAM, bit-exact and recallable. Decode speed stops depending on context length and resident KV stays pool-sized at any context. Off by default; works on every model family. Drafter-scored residency is the default on every family: the server finds the Qwen3-0.6B drafter next to the model (or via `--prefill-drafter`) and lazy-loads it as the relevance scorer that decides which chunks stay resident — non-qwen targets (laguna, gemma4) bridge the tokenizer gap by re-tokenizing the context text for the drafter. LRU is the fallback when no drafter is present, or the explicit choice via `--kvflash-policy lru`. Per-model numbers in [Luce KVFlash →](optimizations/kvflash/README.md).
 
@@ -362,6 +391,7 @@ Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token ch
 | `DFLASH_KVFLASH_TAU=N` | `64` | Env equivalent of `--kvflash-tau`. |
 
 **Thinking budget**
+思考预算
 
 | Flag | Default | Effect |
 |---|---|---|
@@ -371,6 +401,7 @@ Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token ch
 | `--reasoning-effort-{low,medium,high,x-high,max} N` | model-card | OpenAI-style effort tiers |
 
 **Multi-GPU / IPC**
+多 GPU / 通信
 
 | Flag / env | Default | Effect |
 |---|---|---|
@@ -388,6 +419,7 @@ Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token ch
 | `DFLASH_MODEL_NAME=<name>` | `dflash` | Env var equivalent of `--model-name`; sets the `/v1/models` id and selects the matching `share/model_cards/<name>.json` |
 
 **MoE expert offload (Spark)**
+MoE 专家卸载（Spark）
 
 For MoE targets (`laguna`, `qwen35`/`qwen36`) whose experts don't fit in VRAM. `--spark` self-tunes the hot/cold expert split, a bounded GPU cache, and the placement profile from live traffic; decode stays near the all-GPU ceiling via the default single-graph fused path. See [Luce Spark →](optimizations/spark/README.md).
 
@@ -406,9 +438,11 @@ For MoE targets (`laguna`, `qwen35`/`qwen36`) whose experts don't fit in VRAM. `
 ---
 
 ## Run Megakernel Bench (Qwen 3.5-0.8B)
+## 运行 Megakernel 基准测试（Qwen 3.5-0.8B）
 
 Separate Python bench; 24 layers fused into one persistent CUDA dispatch.
 **413 tok/s decode, 21,347 prefill, 1.87 tok/J @220W** vs llama.cpp BF16.
+独立的 Python 基准测试；24 层融合为单个持久 CUDA 调度。对比 llama.cpp BF16 实现 **413 tok/s 解码、21,347 预填充、1.87 tok/J @220W**。
 
 ```bash
 uv sync --extra megakernel
@@ -424,12 +458,15 @@ uv run --directory megakernel python final_bench.py
 [Setup →](optimizations/megakernel/) · [Bench →](optimizations/megakernel/RESULTS.md) · [Blog →](https://lucebox.com/blog/megakernel)
 
 > **Blackwell (RTX 5090, DGX Spark / GB10):** auto-detected by setup; NVFP4 decode path lands ~194 tok/s on GB10. See [optimizations/megakernel/README.md#blackwell-sm_120--sm_121a](optimizations/megakernel/README.md).
+> **Blackwell（RTX 5090、DGX Spark / GB10）：** 由 setup 自动检测；NVFP4 解码路径在 GB10 上约 194 tok/s。
 
 ---
 
 ## Tutorials
+## 教程
 
 Video tutorials for each optimization and the harness setup.
+每项优化与客户端工具的视频教程。
 
 |   |   |   |
 |:-:|:-:|:-:|
@@ -440,12 +477,16 @@ Video tutorials for each optimization and the harness setup.
 ---
 
 ## Why this exists
+## 项目存在的意义
 
 Local AI should be the default, not a privilege. Private data, no per-token bill, no vendor lock-in. The hardware to run capable models already sits on desks. The software to get real throughput out of it does not.
+本地 AI 应成为默认选项，而非特权——私有数据、无按 token 计费、无厂商锁定。运行强大模型的硬件已经摆在桌上了，但能榨取真实吞吐的软件还没有。
 
 Nothing was built for local AI inference. Most machines bolt a stock GPU onto a desktop CPU and run a stock runtime, never tuning the kernels to the silicon underneath. On the same 27B model, a DGX Spark or Mac Studio leaves four to six times the real throughput on the table. General-purpose frameworks won the last decade because hand-tuning per chip cost more than it returned: one stack, decent on everything, great on nothing. Speculative decoding, speculative prefill, fused megakernels, and calibrated MoE expert offload turn idle silicon into 3-10× speedups, but they stay locked to BF16 weights on data-center GPUs. Consumer cards inherit the leftovers.
+现有的一切都不是为本地 AI 推理而建的。大多数机器只是把一块显卡插在台式机 CPU 上，跑着通用运行时，从未针对底层硅片调优内核。在同一个 27B 模型上，DGX Spark 或 Mac Studio 只发挥了 1/4 到 1/6 的真实吞吐。通用框架赢了过去十年，因为逐片调优的成本高于回报：一套代码在所有硬件上都还行，但在任何单一硬件上都不够好。投机解码、投机预填充、融合 megakernel、校准式 MoE 专家卸载能将闲置算力转化为 3-10× 加速，但它们一直锁定在数据中心 GPU 的 BF16 权重上。消费级显卡只能捡剩的。
 
 **See the benchmarks and the machine at [lucebox.com](https://lucebox.com).**
+**查看基准测试与实机演示：[lucebox.com](https://lucebox.com)。**
 
 <p align="center">
   <a href="https://lucebox.com"><img src="assets/lucebox.png" alt="Lucebox local AI PC" width="85%" /></a>
@@ -454,6 +495,7 @@ Nothing was built for local AI inference. Most machines bolt a stock GPU onto a 
 ---
 
 ## Request for Contributions
+## 贡献指南
 
 ```
   ▮▮▮▮▮▮▮▮▮▮    HIP/CUDA kernel optimizations
@@ -467,6 +509,7 @@ Nothing was built for local AI inference. Most machines bolt a stock GPU onto a 
 ---
 
 ## Citation
+## 引用
 
 ```bibtex
 @software{lucebox_2026,
@@ -480,11 +523,17 @@ Nothing was built for local AI inference. Most machines bolt a stock GPU onto a 
 ---
 
 ## Community
+## 社区
 
 - **Discord**: [discord.gg/yHfswqZmJQ](https://discord.gg/yHfswqZmJQ)
 - **Website**: [lucebox.com](https://lucebox.com)
 - **Issues**: [github.com/Luce-Org/lucebox-hub/issues](https://github.com/Luce-Org/lucebox-hub/issues)
 - **Blog**: [lucebox.com/blog](https://lucebox.com/blog)
+
+- **Discord**：[discord.gg/yHfswqZmJQ](https://discord.gg/yHfswqZmJQ)
+- **官网**：[lucebox.com](https://lucebox.com)
+- **Issues**：[github.com/Luce-Org/lucebox-hub/issues](https://github.com/Luce-Org/lucebox-hub/issues)
+- **博客**：[lucebox.com/blog](https://lucebox.com/blog)
 
 ---
 
