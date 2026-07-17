@@ -1237,7 +1237,12 @@ int HttpServer::run() {
     }
 
 #if defined(_WIN32)
-    WSACleanup();
+    // Intentionally NOT calling WSACleanup() here. Detached client threads
+    // may still be running after the 5-second shutdown grace period (e.g. a
+    // client mid-stream on a long SSE generation). Tearing down Winsock
+    // underneath them causes spurious socket errors. The OS reclaims all
+    // Winsock resources on process exit, so retaining it for the full process
+    // lifetime is safe and avoids the race.
 #endif
 
     return 0;

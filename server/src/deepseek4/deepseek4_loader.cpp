@@ -74,10 +74,16 @@ struct DS4Mmap {
 
     bool open_ro(const std::string & path, std::string & err) {
 #if defined(_WIN32)
-        hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+        // Convert UTF-8 path to UTF-16 for CreateFileW — CreateFileA uses the
+        // active ANSI code page and fails on non-ASCII paths (e.g. CJK chars).
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+        std::wstring wpath(wlen, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
+
+        hFile = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ,
                             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hFile == INVALID_HANDLE_VALUE) {
-            err = "CreateFileA: " + path + ": error " + std::to_string(GetLastError());
+            err = "CreateFileW: " + path + ": error " + std::to_string(GetLastError());
             return false;
         }
         LARGE_INTEGER sz;
@@ -87,9 +93,9 @@ struct DS4Mmap {
             return false;
         }
         len = (size_t)sz.QuadPart;
-        hMap = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        hMap = CreateFileMappingW(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
         if (!hMap) {
-            err = "CreateFileMappingA: error " + std::to_string(GetLastError());
+            err = "CreateFileMappingW: error " + std::to_string(GetLastError());
             CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE;
             return false;
         }
