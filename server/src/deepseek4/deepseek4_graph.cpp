@@ -27,6 +27,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <mutex>
@@ -45,6 +46,11 @@ using Ds4TimingClock = std::chrono::steady_clock;
 static uint64_t ds4_elapsed_us(Ds4TimingClock::time_point start,
                                Ds4TimingClock::time_point end) {
     return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+}
+
+static bool ds4_env_flag(const char * name) {
+    const char * value = std::getenv(name);
+    return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
 static int ds4_effective_expert_count(const DeepSeek4Weights & w) {
@@ -259,6 +265,9 @@ struct DeepSeek4AttentionGraphInputs {
     // [n_swa raw rows ++ padded comp rows]; 0 for valid, -1e30 for padding.
     ggml_tensor * attn_row_mask = nullptr;
     int           padded_comp = 0;   // padded compressed-row count (>= n_comp)
+    // Optional stable-topology compressor rows. DSpark's fused verifier leaves
+    // this null and uses its batched state-row inputs instead.
+    ggml_tensor * flush_rows = nullptr;
 };
 
 struct DeepSeek4CachedDecodeAttnGraph {
@@ -3048,8 +3057,7 @@ static bool deepseek4_step_hybrid(
         const int32_t * token_ids,
         MoeHybridStreamEngine * stream_engine,
         DeepSeek4StepTelemetry * telemetry,
-        MoeHybridRoutingStats * routing_stats,
-        Ds4VerifyHooks * verify_hooks) {
+        MoeHybridRoutingStats * routing_stats) {
     const auto step_t0 = Ds4TimingClock::now();
     const int n_embd = w.n_embd;
     const int n_hc = w.n_hc;
@@ -3523,7 +3531,8 @@ bool deepseek4_step(
         const int32_t * token_ids,
         MoeHybridStreamEngine * stream_engine,
         DeepSeek4StepTelemetry * telemetry,
-        MoeHybridRoutingStats * routing_stats) {
+        MoeHybridRoutingStats * routing_stats,
+        Ds4VerifyHooks * verify_hooks) {
     if (w.moe_hybrid && moe_hybrid != nullptr) {
         return deepseek4_step_hybrid(backend, w, cache, *moe_hybrid,
                                      embed, n_tokens, kv_start, out_logits,

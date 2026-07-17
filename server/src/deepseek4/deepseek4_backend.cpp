@@ -762,8 +762,13 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
 
     // Decode
     auto t1 = Clock::now();
-    if (spec_enabled_ && spec_drafter_ && req.n_gen > 0) {
-        if (last_logits_.empty()) { result.error = "spec: no prefill logits"; return result; }
+    const bool budget_requires_ar = !req.budget_hook.close_token_ids.empty();
+    if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 &&
+        !req.force_ar_decode && !budget_requires_ar) {
+        if (last_logits_.empty()) {
+            result.fail(GenerateErrorCode::DecodeFailed, "spec: no prefill logits");
+            return result;
+        }
         int seed = 0;
         { float mv = last_logits_[0];
           for (int i = 1; i < w_.n_vocab; i++) if (last_logits_[i] > mv) { mv = last_logits_[i]; seed = i; } }
@@ -771,20 +776,32 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
         gen.push_back(seed);
         io.emit(seed);
         float accept_rate = 0.0f;
-        if (!deepseek4_is_eos_tok(seed, w_) && req.n_gen > 1) {
+        bool spec_ran = false;
+        if (!io.cancelled && !deepseek4_is_eos_tok(seed, w_) && req.n_gen > 1) {
             const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
             const int win_len = feat_row > 0 ? (int) (spec_feat_window_.size() / feat_row) : 0;
             std::vector<int32_t> spec_toks;
-            run_deepseek4_dspark_spec_decode(backend_, w_, cache_, *spec_drafter_,
-                committed, seed, req.n_gen - 1,
-                win_len > 0 ? spec_feat_window_.data() : nullptr, win_len,
-                spec_toks, &accept_rate);
-            for (int t : spec_toks) io.emit(t);
-            gen.insert(gen.end(), spec_toks.begin(), spec_toks.end());
+            spec_ran = true;
+            if (!run_deepseek4_dspark_spec_decode(
+                    backend_, w_, cache_, *spec_drafter_, committed, seed,
+                    req.n_gen - 1,
+                    win_len > 0 ? spec_feat_window_.data() : nullptr, win_len,
+                    spec_toks, &accept_rate)) {
+                result.fail(GenerateErrorCode::DecodeFailed,
+                            "DSpark speculative decode failed");
+                return result;
+            }
+            for (int32_t tok : spec_toks) {
+                if (io.cancelled) break;
+                gen.push_back(tok);
+                io.emit(tok);
+            }
         }
-        result.ok = true;
+        result.succeed();
         result.tokens = std::move(gen);
         result.decode_s = elapsed_s(t1);
+        result.accept_rate = accept_rate;
+        result.spec_decode_ran = spec_ran;
         std::fprintf(stderr, "[deepseek4] DSpark decode: %zu tok in %.3fs (%.1f tok/s) accept_rate=%.2f\n",
                      result.tokens.size(), result.decode_s,
                      result.decode_s > 0 ? result.tokens.size() / result.decode_s : 0.0, accept_rate);
