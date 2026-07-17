@@ -29,6 +29,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -69,6 +70,10 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
                                    DSparkDrafter & out);
 
 void free_deepseek4_dspark_drafter(DSparkDrafter & d);
+
+// Drop thread-local graph/allocation state that retains drafter tensor and
+// backend references. Called before releasing the drafter weights.
+void reset_deepseek4_dspark_runtime_cache();
 
 const char * deepseek4_dspark_last_error();
 
@@ -136,6 +141,7 @@ bool run_deepseek4_dspark_spec_decode(
         const float * prompt_feature_window,  // [n_target_layers*n_embd * win_len] captured during prefill
         int win_len,
         std::vector<int32_t> & out_tokens,
-        float * accept_rate_out);
+        float * accept_rate_out,
+        const std::function<bool(int32_t)> & on_token = {});
 
 }  // namespace dflash::common

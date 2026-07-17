@@ -5358,6 +5358,19 @@ thread_local DsparkDraftCache g_dspark_draft_cache;
 
 }  // namespace
 
+void reset_deepseek4_dspark_runtime_cache() {
+    DsparkDraftCache & cache = g_dspark_draft_cache;
+    if (cache.alloc) {
+        ggml_gallocr_free(cache.alloc);
+        cache.alloc = nullptr;
+    }
+    if (cache.ctx) {
+        ggml_free(cache.ctx);
+        cache.ctx = nullptr;
+    }
+    cache = DsparkDraftCache{};
+}
+
 bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
                                     const DSparkDrafter & d,
                                     const float * noise_embed,

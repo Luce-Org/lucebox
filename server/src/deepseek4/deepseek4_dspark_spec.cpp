@@ -370,7 +370,8 @@ bool run_deepseek4_dspark_spec_decode(
         const float * prompt_feature_window,
         int win_len,
         std::vector<int32_t> & out_tokens,
-        float * accept_rate_out) {
+        float * accept_rate_out,
+        const std::function<bool(int32_t)> & on_token) {
     const int n_embd = target_w.n_embd;
     const int n_tgt = drafter.n_target_layers;
     const int block = drafter.block_size;
@@ -460,6 +461,8 @@ bool run_deepseek4_dspark_spec_decode(
     int pos = committed;      // absolute position of the seed (block slot 0)
     int n_generated = 0;
     long accept_sum = 0, steps = 0;
+    bool ok = true;
+    bool stop_requested = false;
 
     std::vector<float> noise_embed((size_t) n_embd * block);
     std::vector<int32_t> noise_ids(block);
@@ -479,13 +482,17 @@ bool run_deepseek4_dspark_spec_decode(
         if (q_cap >= 2) {
             noise_ids[0] = lt;
             for (int i = 1; i < block; i++) noise_ids[i] = drafter.mask_token_id;
-            if (!target.embed_tokens(noise_ids.data(), block, noise_embed.data())) break;
+            if (!target.embed_tokens(noise_ids.data(), block, noise_embed.data())) {
+                ok = false;
+                break;
+            }
 
             // Drafter forward -> block normed hidden states.
             if (!deepseek4_dspark_draft_forward(backend, drafter, noise_embed.data(),
                                                 ctx_len > 0 ? feat_win.data() : nullptr,
                                                 ctx_len, pos, local_hidden)) {
                 std::fprintf(stderr, "[ds4-spec] drafter forward failed\n");
+                ok = false;
                 break;
             }
         }
@@ -536,7 +543,10 @@ bool run_deepseek4_dspark_spec_decode(
             if (!ds_ok || (int) draft_tok.size() < 2) {
                 // Fallback: plain projection of the block hiddens.
                 std::vector<int32_t> pj;
-                if (!target.project_hidden_to_tokens(local_hidden.data(), q_step_cap - 1, pj)) break;
+                if (!target.project_hidden_to_tokens(local_hidden.data(), q_step_cap - 1, pj)) {
+                    ok = false;
+                    break;
+                }
                 draft_tok.clear();
                 draft_tok.push_back(lt);
                 for (int i = 0; i < q_step_cap - 1; i++) draft_tok.push_back(pj[i]);
@@ -577,7 +587,11 @@ bool run_deepseek4_dspark_spec_decode(
         // ── Rollback state save (cheap) or legacy full snapshot ──
         t0 = SpecClock::now();
         if (full_snap) {
-            if (!target.snapshot_kv()) { std::fprintf(stderr, "[ds4-spec] snapshot failed\n"); break; }
+            if (!target.snapshot_kv()) {
+                std::fprintf(stderr, "[ds4-spec] snapshot failed\n");
+                ok = false;
+                break;
+            }
         } else {
             spec_rollback_save(target_cache, rollback);
         }
@@ -597,6 +611,7 @@ bool run_deepseek4_dspark_spec_decode(
                 spec_rollback_apply(rollback, target_w, target_cache, pos, boundary_crossed);
             }
             std::fprintf(stderr, "[ds4-spec] verify failed\n");
+            ok = false;
             break;
         }
         tm_verify += spec_ms_since(t0);
@@ -637,6 +652,7 @@ bool run_deepseek4_dspark_spec_decode(
             std::vector<int32_t> replay_am;
             if (!target.verify_batch(kv_toks, pos, replay_last, &replay_am)) {
                 std::fprintf(stderr, "[ds4-spec] replay verify failed\n");
+                ok = false;
                 break;
             }
         } else if (accept < q) {
@@ -662,6 +678,10 @@ bool run_deepseek4_dspark_spec_decode(
             const int t = (i < accept) ? draft_tok[i] : bonus;
             out_tokens.push_back(t);
             n_generated++;
+            if (on_token && !on_token(t)) {
+                stop_requested = true;
+                break;
+            }
             if (target.is_eos(t)) { hit_eos = true; break; }
             if (n_generated >= n_gen) break;
         }
@@ -678,7 +698,7 @@ bool run_deepseek4_dspark_spec_decode(
                 tm_draft / steps, tm_head / steps, tm_save / steps,
                 tm_verify / steps, tm_apply / steps, tm_feat / steps);
         }
-        if (hit_eos) break;
+        if (hit_eos || stop_requested) break;
     }
 
     const double total_ms = spec_ms_since(run_t0);
@@ -716,7 +736,7 @@ bool run_deepseek4_dspark_spec_decode(
             (unsigned long long) tel.ffn_hot_graph_builds);
     }
     ggml_backend_free(snap_backend);
-    return true;
+    return ok;
 }
 
 }  // namespace dflash::common

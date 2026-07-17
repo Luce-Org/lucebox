@@ -245,6 +245,95 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
         else if (suffix == "hc_ffn_base.weight")     L.hc_ffn_base     = t;
     }
 
+    // Reject incomplete artifacts here, before production code can build a
+    // graph that dereferences a missing tensor. The original smoke test
+    // checked these bindings only after load_deepseek4_dspark_drafter had
+    // already returned success.
+    std::vector<std::string> missing;
+    auto need = [&](const void * ptr, const std::string & name) {
+        if (!ptr) missing.push_back(name);
+    };
+    need(out.main_proj, "dflash.fc.weight");
+    need(out.main_norm, "dflash.hidden_norm.weight");
+    need(out.markov_w1, "dflash.dspark.markov.w1");
+    need(out.markov_w2, "dflash.dspark.markov.w2");
+    need(w.out_norm, "output_norm.weight");
+    need(w.output_hc_fn, "output_hc_fn.weight");
+    need(w.output_hc_scale, "output_hc_scale.weight");
+    need(w.output_hc_base, "output_hc_base.weight");
+    for (int il = 0; il < w.n_layer; ++il) {
+        const DeepSeek4Layer & L = w.layers[(size_t) il];
+        const std::string p = "blk." + std::to_string(il) + ".";
+        need(L.attn_norm, p + "attn_norm.weight");
+        need(L.attn_q_a, p + "attn_q_a.weight");
+        need(L.attn_q_a_norm, p + "attn_q_a_norm.weight");
+        need(L.attn_q_b, p + "attn_q_b.weight");
+        need(L.attn_kv, p + "attn_kv.weight");
+        need(L.attn_kv_a_norm, p + "attn_kv_a_norm.weight");
+        need(L.attn_output_a, p + "attn_output_a.weight");
+        need(L.attn_output_b, p + "attn_output_b.weight");
+        need(L.hc_attn_fn, p + "hc_attn_fn.weight");
+        need(L.hc_attn_scale, p + "hc_attn_scale.weight");
+        need(L.hc_attn_base, p + "hc_attn_base.weight");
+        need(L.ffn_norm, p + "ffn_norm.weight");
+        need(L.ffn_gate_inp, p + "ffn_gate_inp.weight");
+        need(L.ffn_gate_exps, p + "ffn_gate_exps.weight");
+        need(L.ffn_up_exps, p + "ffn_up_exps.weight");
+        need(L.ffn_down_exps, p + "ffn_down_exps.weight");
+        need(L.ffn_gate_shexp, p + "ffn_gate_shexp.weight");
+        need(L.ffn_up_shexp, p + "ffn_up_shexp.weight");
+        need(L.ffn_down_shexp, p + "ffn_down_shexp.weight");
+        need(L.hc_ffn_fn, p + "hc_ffn_fn.weight");
+        need(L.hc_ffn_scale, p + "hc_ffn_scale.weight");
+        need(L.hc_ffn_base, p + "hc_ffn_base.weight");
+    }
+
+    std::string contract_error;
+    if (!out.dspark_enabled) {
+        contract_error = "dflash.dspark.enabled is false";
+    } else if (w.n_layer <= 0 || w.n_embd <= 0 || w.n_vocab <= 0 ||
+               w.n_hc <= 0 || out.n_target_layers <= 0 ||
+               out.block_size < 2 || out.block_size > 16) {
+        contract_error = "invalid DSpark architecture metadata";
+    } else if ((int) out.capture_layer_ids.size() != out.n_target_layers) {
+        contract_error = "capture_layer_ids count does not match dflash.n_target_layers";
+    } else if (out.main_proj &&
+               (out.main_proj->ne[0] != (int64_t) out.n_target_layers * w.n_embd ||
+                out.main_proj->ne[1] != w.n_embd)) {
+        contract_error = "dflash.fc.weight shape does not match target-layer metadata";
+    } else if (out.markov_w1 && out.markov_w2 &&
+               (out.markov_w1->ne[0] != out.markov_rank ||
+                out.markov_w1->ne[1] != out.vocab_size ||
+                out.markov_w2->ne[0] != out.markov_rank ||
+                out.markov_w2->ne[1] != out.vocab_size)) {
+        contract_error = "DSpark Markov tensor shape does not match metadata";
+    } else if ((out.confidence_w == nullptr) != (out.confidence_b == nullptr)) {
+        contract_error = "incomplete DSpark confidence tensor pair";
+    } else if (out.confidence_w &&
+               (out.confidence_dim <= 0 ||
+                out.confidence_w->ne[0] != out.confidence_dim ||
+                out.confidence_w->ne[1] != 1 ||
+                ggml_nelements(out.confidence_b) != 1)) {
+        contract_error = "DSpark confidence tensor shape does not match metadata";
+    }
+    if (!missing.empty() || !contract_error.empty()) {
+        std::string message = "invalid DSpark drafter GGUF";
+        if (!contract_error.empty()) message += ": " + contract_error;
+        if (!missing.empty()) {
+            message += "; missing ";
+            for (size_t i = 0; i < missing.size(); ++i) {
+                if (i != 0) message += ", ";
+                message += missing[i];
+            }
+        }
+        set_err(message);
+        ggml_backend_buffer_free(buf);
+        gguf_free(g);
+        ggml_free(meta);
+        out = DSparkDrafter{};
+        return false;
+    }
+
     w.ctx = meta;
     w.buf = buf;
     gguf_free(g);  // meta_ctx now owned by w.ctx; do not free here
@@ -259,6 +348,7 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
 }
 
 void free_deepseek4_dspark_drafter(DSparkDrafter & d) {
+    reset_deepseek4_dspark_runtime_cache();
     if (d.core.buf) { ggml_backend_buffer_free(d.core.buf); d.core.buf = nullptr; }
     if (d.core.ctx) { ggml_free(d.core.ctx); d.core.ctx = nullptr; }
     d = DSparkDrafter{};

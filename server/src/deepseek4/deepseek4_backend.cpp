@@ -445,8 +445,29 @@ bool DeepSeek4Backend::init() {
         if (dp && *dp) {
             spec_drafter_ = std::make_unique<DSparkDrafter>();
             if (load_deepseek4_dspark_drafter(dp, backend_, *spec_drafter_)) {
-                spec_enabled_ = true;
-                std::fprintf(stderr, "[deepseek4] DSpark spec-decode ENABLED (drafter=%s)\n", dp);
+                const DSparkDrafter & d = *spec_drafter_;
+                bool compatible = d.core.n_embd == w_.n_embd &&
+                                  d.core.n_vocab == w_.n_vocab &&
+                                  d.vocab_size == w_.n_vocab &&
+                                  d.mask_token_id >= 0 && d.mask_token_id < w_.n_vocab &&
+                                  (int) d.capture_layer_ids.size() == d.n_target_layers;
+                for (int layer : d.capture_layer_ids) {
+                    compatible = compatible && layer >= 0 && layer < w_.n_layer;
+                }
+                if (!compatible) {
+                    std::fprintf(stderr,
+                                 "[deepseek4] DSpark drafter is incompatible with target "
+                                 "(target embd/vocab/layers=%d/%d/%d, draft=%d/%d)\n",
+                                 w_.n_embd, w_.n_vocab, w_.n_layer,
+                                 d.core.n_embd, d.vocab_size);
+                    free_deepseek4_dspark_drafter(*spec_drafter_);
+                    spec_drafter_.reset();
+                } else {
+                    spec_enabled_ = true;
+                    std::fprintf(stderr,
+                                 "[deepseek4] DSpark spec-decode ENABLED (drafter=%s)\n",
+                                 dp);
+                }
             } else {
                 std::fprintf(stderr, "[deepseek4] DSpark drafter load FAILED: %s\n",
                              deepseek4_dspark_last_error());
@@ -818,16 +839,17 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
                     backend_, w_, cache_, *spec_drafter_, committed, seed,
                     req.n_gen - 1,
                     win_len > 0 ? spec_feat_window_.data() : nullptr, win_len,
-                    spec_toks, &accept_rate)) {
+                    spec_toks, &accept_rate,
+                    [&io](int32_t tok) {
+                        if (io.cancelled) return false;
+                        io.emit(tok);
+                        return !io.cancelled;
+                    })) {
                 result.fail(GenerateErrorCode::DecodeFailed,
                             "DSpark speculative decode failed");
                 return result;
             }
-            for (int32_t tok : spec_toks) {
-                if (io.cancelled) break;
-                gen.push_back(tok);
-                io.emit(tok);
-            }
+            gen.insert(gen.end(), spec_toks.begin(), spec_toks.end());
         }
         result.succeed();
         result.tokens = std::move(gen);
@@ -896,6 +918,9 @@ bool DeepSeek4Backend::handle_compress(const std::string & line,
 }
 
 void DeepSeek4Backend::free_drafter() {
+    if (spec_drafter_) {
+        free_deepseek4_dspark_drafter(*spec_drafter_);
+    }
     spec_drafter_.reset();
     spec_enabled_ = false;
     spec_feat_window_.clear();
@@ -912,6 +937,7 @@ void DeepSeek4Backend::maybe_save_routing_stats() {
 
 void DeepSeek4Backend::shutdown() {
     maybe_save_routing_stats();
+    free_drafter();
     for (int i = 0; i < PREFIX_SLOTS; i++) {
         free_deepseek4_snapshot(snapshots_[i]);
     }

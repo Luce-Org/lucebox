@@ -177,8 +177,15 @@ export DFLASH_DS4_FUSED_VERIFY=1
 export DFLASH_DS4_DRAFT=/path/to/dflash-draft.gguf
 export DFLASH_DS4_SPEC_Q=4
 
-./server/build-hip/dflash_server /path/to/deepseek4-target.gguf
+./server/build-hip/dflash_server /path/to/deepseek4-target.gguf \
+  --target-device hip:0 \
+  --ds4-fused-decode
 ```
+
+DSpark currently requires monolithic target placement. On HIP,
+`--ds4-fused-decode` selects that placement; if the target falls back to hybrid
+expert placement, the server logs that DSpark is disabled and continues with
+the normal autoregressive path.
 
 On HIP `gfx1151`, enabling DSpark defaults `LUCE_MMVQ_MAX_NCOLS` to `4` when
 the variable is unset. This keeps the four-row verifier on MMVQ; the validated
@@ -199,7 +206,8 @@ GSM+Math accuracy and measured 29.25 tok/s weighted, within 0.8% of fixed q=4
 at 29.49 tok/s. On the low-acceptance stress prompt it measured 21.9/21.8
 tok/s warm, effectively tied with EWMA while avoiding fixed q=4's wasted wide
 verification. These numbers are workload-specific; the confidence policy is
-opt-in.
+enabled only when DSpark is explicitly enabled and the draft artifact contains
+a compatible confidence head.
 
 ## Example: CUDA + Halo Layer Split
 
