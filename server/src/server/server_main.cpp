@@ -217,6 +217,10 @@ static void print_usage(const char * prog) {
         "  --target-layer-split <weights>  Reserved layer-split weights\n"
         "  --peer-access        Enable peer access for multi-GPU placement\n"
         "  --chunk <N>          Chunked-prefill chunk size (default: 512)\n"
+        "  --ds4-fused-decode   Enable DeepSeek4 single-graph GPU decode\n"
+        "  --ds4-expert-top-k <N>\n"
+        "                       Keep and renormalize the highest-ranked N routed experts\n"
+        "                       (0=model default; single-device DeepSeek4 only)\n"
         "  --fa-window <N>     Flash-attention sliding window (default: 0=full).\n"
         "                       WARNING: >0 drops system prompt / tool definitions\n"
         "                       from attention at long contexts. Use 0 for tools.\n"
@@ -423,6 +427,14 @@ int main(int argc, char ** argv) {
             bargs.device.peer_access = true;
         } else if (std::strcmp(argv[i], "--chunk") == 0 && i + 1 < argc) {
             bargs.chunk = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--ds4-fused-decode") == 0) {
+            bargs.ds4_fused_decode = true;
+        } else if (std::strcmp(argv[i], "--ds4-expert-top-k") == 0 && i + 1 < argc) {
+            bargs.ds4_expert_top_k = std::atoi(argv[++i]);
+            if (bargs.ds4_expert_top_k < 0) {
+                std::fprintf(stderr, "[server] --ds4-expert-top-k must be non-negative\n");
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--fa-window") == 0 && i + 1 < argc) {
             bargs.fa_window = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--model-name") == 0 && i + 1 < argc) {
@@ -786,6 +798,22 @@ int main(int argc, char ** argv) {
     g_peer_access_opt_in = bargs.device.peer_access;
     std::fprintf(stderr, "[server] creating backend...\n");
     const std::string arch = detect_arch(bargs.model_path);
+    const PlacementBackend target_backend =
+        bargs.device.backend == PlacementBackend::Auto
+            ? compiled_placement_backend()
+            : bargs.device.backend;
+    const bool monolithic_ds4 =
+        arch == "deepseek4" &&
+        target_backend == PlacementBackend::Hip &&
+        !bargs.device.is_layer_split() &&
+        !bargs.remote_target_shard.enabled();
+    if ((bargs.ds4_fused_decode || bargs.ds4_expert_top_k != 0) &&
+        !monolithic_ds4) {
+        std::fprintf(stderr,
+                     "[server] --ds4-fused-decode and --ds4-expert-top-k "
+                     "currently require single-device HIP DeepSeek4\n");
+        return 2;
+    }
     if (spark_autotune) {
         // Self-tuning hot/cold MoE residency: enable the bounded expert cache
         // (auto-tunes the working set at serve time), auto-load a learned
@@ -1072,6 +1100,16 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  peer_access     = %s\n",
                  bargs.device.peer_access ? "ON" : "off");
     std::fprintf(stderr, "[server] │  chunk           = %d\n", bargs.chunk);
+    if (arch == "deepseek4") {
+        std::fprintf(stderr, "[server] │  ds4_fused      = %s\n",
+                     bargs.ds4_fused_decode ? "ON" : "off");
+        if (bargs.ds4_expert_top_k > 0) {
+            std::fprintf(stderr, "[server] │  ds4_expert_topk= %d\n",
+                         bargs.ds4_expert_top_k);
+        } else {
+            std::fprintf(stderr, "[server] │  ds4_expert_topk= model default\n");
+        }
+    }
     std::fprintf(stderr, "[server] │  fa_window       = %d\n", bargs.fa_window);
     if (bargs.fa_window > 0) {
         std::fprintf(stderr, "[server] │  ⚠  fa_window > 0 drops system prompt / "

@@ -45,6 +45,10 @@ struct BackendArgs {
     // Chunked prefill
     int             chunk        = 512;
 
+    // deepseek4-specific decode options
+    int             ds4_expert_top_k = 0;  // 0 = model default
+    bool            ds4_fused_decode = false;
+
     // qwen35-specific speculative decode options
     int             fa_window        = 0;  // 0 = full attention. qwen3.6 full-attn layers must see the whole context; a finite window drops the system prompt/tools -> breaks tool calls.
     int             kq_stride_pad    = 32;

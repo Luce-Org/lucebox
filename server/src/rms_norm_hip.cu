@@ -4,31 +4,16 @@
 
 #include <hip/hip_runtime.h>
 
-// Wavefront width of the target arch: 32 on RDNA (gfx10/gfx11), 64 on GCN/CDNA.
-// The reduction below must span exactly one wavefront, so hardcoding 32 leaves
-// lanes 32..63 out of the reduce on wave64 archs. __AMDGCN_WAVEFRONT_SIZE(__) is
-// a compile-time builtin defined only in the device pass. The 64 fallback is
-// host-only (WAVE is never used off-device); a device pass without the builtin
-// is a hard error rather than a silent wrong-width guess.
-#ifndef DFLASH_WAVE_SIZE
-#  if defined(__AMDGCN_WAVEFRONT_SIZE__)
-#    define DFLASH_WAVE_SIZE __AMDGCN_WAVEFRONT_SIZE__
-#  elif defined(__AMDGCN_WAVEFRONT_SIZE)
-#    define DFLASH_WAVE_SIZE __AMDGCN_WAVEFRONT_SIZE
-#  elif !defined(__HIP_DEVICE_COMPILE__)
-#    define DFLASH_WAVE_SIZE 64  // host pass only; WAVE is unused off-device
-#  else
-#    error "rms_norm_hip: missing wavefront-size builtin in device pass; set DFLASH_WAVE_SIZE"
-#  endif
-#endif
-
 __global__ void rms_norm_mul_w_f32_kernel(
     const float * __restrict__ src,
     const float * __restrict__ w,
     float       * __restrict__ dst,
     int hidden, float eps)
 {
-    constexpr int WAVE = DFLASH_WAVE_SIZE;
+    // HIP exposes the target-specific width through a device builtin. Unlike
+    // preprocessor spellings of the AMDGCN builtin, this works across ROCm
+    // releases and remains correct in multi-architecture builds.
+    const int wave = warpSize;
 
     const int tok = blockIdx.x;
     const float * row = src + (size_t)tok * hidden;
@@ -43,21 +28,21 @@ __global__ void rms_norm_mul_w_f32_kernel(
     }
 
     #pragma unroll
-    for (int off = WAVE / 2; off > 0; off >>= 1)
+    for (int off = wave / 2; off > 0; off >>= 1)
         sumsq += __shfl_xor(sumsq, off);
 
-    if ((threadIdx.x & (WAVE - 1)) == 0)
-        smem[threadIdx.x / WAVE] = sumsq;
+    if ((threadIdx.x & (wave - 1)) == 0)
+        smem[threadIdx.x / wave] = sumsq;
     __syncthreads();
 
     // Final reduce across per-wavefront partials in a single wavefront. Valid
-    // while n_warps <= WAVE, which holds for the fixed block=256 launch below
+    // while n_warps <= wave, which holds for the fixed block=256 launch below
     // (8 warps on wave32, 4 on wave64).
-    const int n_warps = blockDim.x / WAVE;
-    if (threadIdx.x < WAVE) {
+    const int n_warps = blockDim.x / wave;
+    if (threadIdx.x < wave) {
         sumsq = (threadIdx.x < n_warps) ? smem[threadIdx.x] : 0.0f;
         #pragma unroll
-        for (int off = WAVE / 2; off > 0; off >>= 1)
+        for (int off = wave / 2; off > 0; off >>= 1)
             sumsq += __shfl_xor(sumsq, off);
         if (threadIdx.x == 0)
             smem[0] = sumsq;

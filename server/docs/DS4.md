@@ -1,6 +1,8 @@
 # DeepSeek V4 Flash — DFlash Integration
 
-This document describes the current DeepSeek V4 Flash implementation in DFlash. Today DeepSeek4 runs through the layer-split path: a local CUDA prefix shard plus either a local follow-on shard or a remote Halo/HIP target shard.
+This document describes the current DeepSeek V4 Flash implementation in
+DFlash. DeepSeek4 supports a monolithic HIP backend for single-device Strix
+Halo systems and a layer-split backend for local or mixed-device deployments.
 
 ## Model Architecture
 
@@ -23,7 +25,7 @@ DeepSeek V4 Flash is a 43-layer MoE model with:
 
 | Area | Files |
 |------|-------|
-| Backend selection / init | `src/common/backend_factory.cpp`, `src/deepseek4/deepseek4_layer_split_adapter.{h,cpp}` |
+| Backend selection / init | `src/common/backend_factory.cpp`, `src/deepseek4/deepseek4_backend.{h,cpp}`, `src/deepseek4/deepseek4_layer_split_adapter.{h,cpp}` |
 | Per-shard forward graph | `src/deepseek4/deepseek4_graph.cpp` |
 | Model weights and metadata | `src/deepseek4/deepseek4_internal.h`, `src/deepseek4/deepseek4_loader.cpp` |
 | HC pre/post CUDA kernel | `src/deepseek4/deepseek4_hc_cuda.cu`, `.h` |
@@ -44,6 +46,32 @@ DeepSeek V4 Flash is a 43-layer MoE model with:
 The production DeepSeek4 path does **not** use the retired per-expert worker split. The MoE computation stays inside the shard that owns each layer.
 
 ## Execution Modes
+
+### Monolithic HIP
+
+Single-device HIP launches use `DeepSeek4Backend`. Two explicit serving
+options are available:
+
+- `--ds4-fused-decode` enables the cached single-graph decode path. It keeps
+  HC, attention, MoE, and the output projection on the GPU and avoids
+  per-layer host round trips. On HIP this option requests a monolithic model
+  load because the fused graph must reference every expert tensor directly.
+  If that allocation fails, the backend logs the fallback and continues with
+  hybrid expert placement and layered decode.
+- `--ds4-expert-top-k N` keeps the highest-ranked `N` routed experts and
+  renormalizes their weights. `0` uses the model default. Reducing this value is an
+  approximate inference policy and must be quality-validated for the target
+  workload.
+
+These options currently apply only to the monolithic HIP backend. For the
+validated Strix Halo profile:
+
+```bash
+./server/build-hip/dflash_server /opt/models/DeepSeek-V4-Flash.gguf \
+  --target-device hip:0 \
+  --ds4-fused-decode \
+  --ds4-expert-top-k 4
+```
 
 ### Local single-shard
 
@@ -148,6 +176,6 @@ Explicit mixed-backend split using the generic target-shard flags:
 
 | Target | Backend | Purpose |
 |--------|---------|---------|
-| `dflash_server` | CUDA | Production server / CUDA parent |
+| `dflash_server` | CUDA or HIP | Production server |
 | `backend_ipc_daemon` | HIP | Remote Halo target shard for mixed-backend layer split |
 | `test_deepseek4_unit` | CUDA | Unit tests (no model files needed) |

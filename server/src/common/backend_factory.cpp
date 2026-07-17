@@ -232,6 +232,8 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
             cfg.stream_fd  = args.stream_fd;
             cfg.max_ctx    = args.device.max_ctx;
             cfg.chunk      = args.chunk;
+            cfg.expert_top_k = args.ds4_expert_top_k;
+            cfg.fused_decode = args.ds4_fused_decode;
 
             auto backend = std::make_unique<DeepSeek4Backend>(cfg);
             if (!backend->init()) {

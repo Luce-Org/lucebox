@@ -87,6 +87,7 @@ private:
                    const BudgetHook & budget_hook = {},
                    bool * forced_close_out = nullptr);
 
+    bool load_model();
     bool init_hybrid_model();
     bool compute_uniform_hybrid_placement(const DeepSeek4Weights & w,
                                           int max_ctx,

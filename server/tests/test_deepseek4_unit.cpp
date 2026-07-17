@@ -545,6 +545,31 @@ static void test_hash_routing_lookup() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_raw_ring_spans_after_wrap() {
+    std::fprintf(stderr, "  test_raw_ring_spans_after_wrap ...");
+
+    DeepSeek4RawRingSpan spans[2];
+    int count = deepseek4_previous_raw_ring_spans(3, 8, spans);
+    TEST_ASSERT(count == 1);
+    TEST_ASSERT(spans[0].row == 0);
+    TEST_ASSERT(spans[0].count == 3);
+
+    count = deepseek4_previous_raw_ring_spans(8, 8, spans);
+    TEST_ASSERT(count == 1);
+    TEST_ASSERT(spans[0].row == 1);
+    TEST_ASSERT(spans[0].count == 7);
+
+    count = deepseek4_previous_raw_ring_spans(10, 8, spans);
+    TEST_ASSERT(count == 2);
+    TEST_ASSERT(spans[0].row == 3);
+    TEST_ASSERT(spans[0].count == 5);
+    TEST_ASSERT(spans[1].row == 0);
+    TEST_ASSERT(spans[1].count == 2);
+    TEST_ASSERT(spans[0].count + spans[1].count == 7);
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 struct ScopedEnvVar {
     explicit ScopedEnvVar(const char * name)
         : name(name ? name : ""),
@@ -904,6 +929,43 @@ static void test_reset_request_state() {
             TEST_ASSERT(layer.n_index_comp == 0);
         }
     }
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_reset_deepseek4_cache(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_reset_deepseek4_cache ...");
+
+    DeepSeek4Weights weights;
+    weights.n_layer = 2;
+    weights.n_swa = 8;
+    weights.head_dim = 4;
+    weights.n_hc = 4;
+    weights.n_embd = 8;
+    weights.compress_ratios = {4, 0};
+
+    DeepSeek4Cache cache;
+    TEST_ASSERT(create_deepseek4_cache(backend, weights, 32, cache));
+    if (cache.buf) {
+        ggml_backend_buffer_clear(cache.buf, 0x7f);
+        cache.cur_pos = 17;
+        cache.layers[0].n_comp = 4;
+        cache.layers[0].n_index_comp = 4;
+        cache.layers[1].n_comp = 3;
+        cache.layers[1].n_index_comp = 2;
+
+        reset_deepseek4_cache(cache);
+
+        TEST_ASSERT(cache.cur_pos == 0);
+        for (const auto & layer : cache.layers) {
+            TEST_ASSERT(layer.n_comp == 0);
+            TEST_ASSERT(layer.n_index_comp == 0);
+            const std::vector<uint8_t> bytes = read_tensor_bytes(layer.raw_kv);
+            TEST_ASSERT(std::all_of(bytes.begin(), bytes.end(),
+                                    [](uint8_t value) { return value == 0; }));
+        }
+    }
+    free_deepseek4_cache(cache);
 
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
@@ -1609,6 +1671,7 @@ int main() {
     test_rmsnorm_correctness(backend);
     test_grouped_output_projection_shape();
     test_hash_routing_lookup();
+    test_raw_ring_spans_after_wrap();
     test_auto_split_computation();
     test_layer_range_validation();
     test_hc_state_dimensions();
@@ -1619,6 +1682,7 @@ int main() {
     test_loader_rejects_truncated_tensor_data(backend);
     test_snapshot_save_restore();
     test_reset_request_state();
+    test_reset_deepseek4_cache(backend);
     test_adapter_guard_paths();
     test_ipc_mode_registration();
     test_target_shard_daemon_validation();

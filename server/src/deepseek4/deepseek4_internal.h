@@ -64,6 +64,10 @@ struct DeepSeek4StepTelemetry {
     uint64_t output_us = 0;
     uint64_t sample_us = 0;
     uint64_t emit_us = 0;
+    uint64_t full_graph_build_us = 0;
+    uint64_t full_graph_set_us = 0;
+    uint64_t full_graph_compute_us = 0;
+    uint64_t full_graph_read_us = 0;
     int hot_selected = 0;
     int cold_selected = 0;
 };
@@ -216,6 +220,11 @@ struct DeepSeek4Weights {
 
     // MoE hybrid placement (deprecated — layer split replaces expert split)
     bool moe_hybrid       = false;
+
+    // Runtime serving policy. These values are set by the backend after the
+    // GGUF is loaded; they are not model metadata.
+    int  routed_expert_top_k = 0;  // 0 = model default (n_expert_used)
+    bool fused_decode        = false;
 };
 
 inline bool deepseek4_is_eos_tok(int tok, const DeepSeek4Weights & w) {
@@ -265,6 +274,11 @@ struct DeepSeek4Cache {
 
 struct DeepSeek4Snapshot;
 
+struct DeepSeek4RawRingSpan {
+    int row = 0;
+    int count = 0;
+};
+
 // ─── Configuration ──────────────────────────────────────────────────────
 
 struct DeepSeek4BackendConfig {
@@ -273,6 +287,8 @@ struct DeepSeek4BackendConfig {
     int          stream_fd    = -1;
     int          chunk        = 512;   // prefill chunk size
     int          max_ctx      = 0;     // 0 = auto from SWA + compression capacity
+    int          expert_top_k = 0;     // 0 = use all model-routed experts
+    bool         fused_decode = false; // single-graph GPU decode
 };
 
 // ─── Function declarations ──────────────────────────────────────────────
@@ -294,6 +310,11 @@ bool create_deepseek4_cache(ggml_backend_t backend,
                              DeepSeek4Cache & out);
 
 void free_deepseek4_cache(DeepSeek4Cache & c);
+void reset_deepseek4_cache(DeepSeek4Cache & c);
+int deepseek4_previous_raw_ring_spans(
+    int kv_start,
+    int n_swa,
+    DeepSeek4RawRingSpan spans[2]);
 bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
                              ggml_backend_t snapshot_backend,
                              DeepSeek4Snapshot & out);

@@ -69,6 +69,10 @@ static void add_step_tel(DeepSeek4StepTelemetry & dst, const DeepSeek4StepTeleme
     dst.output_us += src.output_us;
     dst.sample_us += src.sample_us;
     dst.emit_us += src.emit_us;
+    dst.full_graph_build_us += src.full_graph_build_us;
+    dst.full_graph_set_us += src.full_graph_set_us;
+    dst.full_graph_compute_us += src.full_graph_compute_us;
+    dst.full_graph_read_us += src.full_graph_read_us;
     dst.hot_selected += src.hot_selected;
     dst.cold_selected += src.cold_selected;
 }
@@ -92,6 +96,7 @@ static void log_step_tel(const char * phase,
         "ffn_hot_graph_build=%llu ffn_hot_graph_hit=%llu ffn_cold_graph_build=%llu ffn_cold_graph_hit=%llu "
         "hc_pre=%.1fms hc_pre_build=%.1fms hc_pre_input=%.1fms hc_pre_compute=%.1fms "
         "hc_post=%.1fms output=%.1fms sample=%.1fms emit=%.1fms "
+        "full_build=%.1fms full_set=%.1fms full_compute=%.1fms full_read=%.1fms "
         "hot_sel=%d cold_sel=%d\n",
         phase, tokens, steps, wall_s, tok_s,
         ms(t.total_us), ms(t.embed_us), ms(t.attn_build_us), ms(t.attn_compute_us), ms(t.attn_read_us),
@@ -107,6 +112,8 @@ static void log_step_tel(const char * phase,
         ms(t.hc_pre_compute_us),
         ms(t.hc_post_attn_us + t.hc_post_ffn_us),
         ms(t.output_us), ms(t.sample_us), ms(t.emit_us),
+        ms(t.full_graph_build_us), ms(t.full_graph_set_us), ms(t.full_graph_compute_us),
+        ms(t.full_graph_read_us),
         t.hot_selected, t.cold_selected);
 }
 
@@ -309,25 +316,30 @@ DeepSeek4Backend::~DeepSeek4Backend() {
     shutdown();
 }
 
-bool DeepSeek4Backend::init() {
-    backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
-    if (!backend_) {
-        std::fprintf(stderr, "[deepseek4] failed to create CUDA backend (gpu=%d)\n",
-                     cfg_.device.gpu);
-        return false;
-    }
-
-    snap_backend_ = ggml_backend_init_by_name("cpu", nullptr);
-
+bool DeepSeek4Backend::load_model() {
     const PlacementBackend target_backend =
         cfg_.device.backend == PlacementBackend::Auto
             ? compiled_placement_backend()
             : cfg_.device.backend;
 
-    // HIP single-device launches should avoid the monolithic full-model load:
-    // a managed ~80 GiB allocation can stall or be killed on integrated UMA
-    // systems before we ever reach the existing OOM fallback path.
-    if (target_backend == PlacementBackend::Hip) {
+    // The fused graph references every expert tensor directly, so it cannot
+    // run on the hybrid expert representation. Honor an explicit fused-decode
+    // request by trying the monolithic load first. Large HIP models otherwise
+    // keep using the hybrid path: a managed allocation can stall or be killed
+    // on integrated UMA systems before an OOM fallback is possible.
+    if (target_backend == PlacementBackend::Hip && cfg_.fused_decode) {
+        std::fprintf(stderr,
+                     "[deepseek4] fused decode requested; loading monolithic HIP model\n");
+        if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
+            std::fprintf(stderr,
+                         "[deepseek4] monolithic HIP load failed; trying hybrid mode\n");
+            if (!init_hybrid_model()) {
+                std::fprintf(stderr, "[deepseek4] hybrid mode also failed: %s\n",
+                             cfg_.model_path);
+                return false;
+            }
+        }
+    } else if (target_backend == PlacementBackend::Hip) {
         std::fprintf(stderr,
                      "[deepseek4] HIP target detected; using hybrid expert load path\n");
         if (!init_hybrid_model()) {
@@ -342,6 +354,36 @@ bool DeepSeek4Backend::init() {
         }
     }
 
+    if (cfg_.expert_top_k < 0 || cfg_.expert_top_k > w_.n_expert_used) {
+        std::fprintf(stderr,
+                     "[deepseek4] expert top-k must be in [0,%d], got %d\n",
+                     w_.n_expert_used, cfg_.expert_top_k);
+        return false;
+    }
+    w_.routed_expert_top_k = cfg_.expert_top_k;
+    w_.fused_decode = cfg_.fused_decode && !moe_hybrid_;
+    if (cfg_.fused_decode && moe_hybrid_) {
+        std::fprintf(stderr,
+                     "[deepseek4] fused decode unavailable with hybrid expert placement; "
+                     "using layered decode\n");
+    }
+    return true;
+}
+
+bool DeepSeek4Backend::init() {
+    backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
+    if (!backend_) {
+        std::fprintf(stderr, "[deepseek4] failed to create CUDA backend (gpu=%d)\n",
+                     cfg_.device.gpu);
+        return false;
+    }
+
+    snap_backend_ = ggml_backend_init_by_name("cpu", nullptr);
+
+    if (!load_model()) {
+        return false;
+    }
+
     const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
     if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
         std::fprintf(stderr, "[deepseek4] failed to allocate KV cache (ctx=%d)\n", max_ctx);
@@ -353,8 +395,13 @@ bool DeepSeek4Backend::init() {
         // The DeepSeek4Backend single-GPU path now runs all experts locally.
     }
 
-    std::fprintf(stderr, "[deepseek4] initialized: %d layers, ctx=%d, %d experts (%d used)%s\n",
-                 w_.n_layer, max_ctx, w_.n_expert, w_.n_expert_used,
+    const int active_experts =
+        w_.routed_expert_top_k > 0 ? w_.routed_expert_top_k : w_.n_expert_used;
+    std::fprintf(stderr,
+                 "[deepseek4] initialized: %d layers, ctx=%d, %d experts "
+                 "(%d/%d routed), fused_decode=%s%s\n",
+                 w_.n_layer, max_ctx, w_.n_expert, active_experts, w_.n_expert_used,
+                 w_.fused_decode ? "on" : "off",
                  moe_hybrid_ ? " [hybrid]" : "");
     return true;
 }
@@ -487,30 +534,13 @@ bool DeepSeek4Backend::unpark(const std::string & what) {
     const bool want_target = (what.empty() || what == "all" || what == "target");
     if (!want_target || !parked_) return true;
 
-    const PlacementBackend target_backend =
-        cfg_.device.backend == PlacementBackend::Auto
-            ? compiled_placement_backend()
-            : cfg_.device.backend;
-
-    if (target_backend == PlacementBackend::Hip) {
-        if (!init_hybrid_model()) {
-            std::fprintf(stderr, "[deepseek4] unpark: failed to restore hybrid mode\n");
-            free_deepseek4_weights(w_);
-            stream_engine_.destroy();
-            moe_hybrid_.reset();
-            moe_placement_ = {};
-            return false;
-        }
-    } else if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
-        std::fprintf(stderr, "[deepseek4] unpark: full model reload failed, trying hybrid mode...\n");
-        if (!init_hybrid_model()) {
-            std::fprintf(stderr, "[deepseek4] unpark: failed to restore target model\n");
-            free_deepseek4_weights(w_);
-            stream_engine_.destroy();
-            moe_hybrid_.reset();
-            moe_placement_ = {};
-            return false;
-        }
+    if (!load_model()) {
+        std::fprintf(stderr, "[deepseek4] unpark: failed to restore target model\n");
+        free_deepseek4_weights(w_);
+        stream_engine_.destroy();
+        moe_hybrid_.reset();
+        moe_placement_ = {};
+        return false;
     }
 
     const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
@@ -533,11 +563,20 @@ bool DeepSeek4Backend::unpark(const std::string & what) {
 int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   const DaemonIO & io,
                                   int kv_offset) {
-    // Hybrid currently implements HC for single-token steps only; keep prefill
-    // token-by-token so the first sampled token is seeded from the correct HC state.
-    const int chunk = moe_hybrid_ ? 1 : (cfg_.chunk > 0 ? cfg_.chunk : 512);
+    // The current batched graph updates only the chunk's final compressor
+    // window. Until batched compressor state is sequentially updated, process
+    // prefill one token at a time to preserve long-prompt correctness.
+    constexpr int chunk = 1;
     const int n_total = (int)tokens.size();
     int pos = kv_offset;
+    // New sequence: clear the cache buffer so compressor state double-buffers
+    // and compressed-KV rows start from zeros, exactly like a fresh server.
+    // Without this, the first flush windows of a request pool over the
+    // previous request's leftover state rows and outputs from the 2nd/3rd
+    // request on can drift by a token or two.
+    if (kv_offset == 0) {
+        reset_deepseek4_cache(cache_);
+    }
     last_logits_.clear();
     const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
     const auto phase_t0 = Clock::now();
@@ -556,7 +595,6 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         DeepSeek4StepTelemetry step_tel;
         if (timing) step_tel.embed_us = elapsed_us(embed_t0, Clock::now());
 
-        // Run forward pass
         std::vector<float> logits;
         if (!deepseek4_step(backend_, w_, cache_, embed.data(), n_tok, pos, logits,
                             moe_hybrid_.get(), tokens.data() + i,
