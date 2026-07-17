@@ -7,6 +7,8 @@
 #include "fattn-chunked.cuh"
 #include "fattn.cuh"
 
+#if defined(GGML_USE_HIP)
+
 __device__ static float ds4_fa_block_sum(float v) {
     __shared__ float smem[256];
     const int tid = threadIdx.x;
@@ -1846,6 +1848,8 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
     return true;
 }
 
+#endif // defined(GGML_USE_HIP)
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -2410,10 +2414,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     if (ggml_flash_attn_ext_is_ds4(dst)) {
+#if defined(GGML_USE_HIP)
         if (!ggml_cuda_ds4_flash_attn_d512_f32(ctx, dst)) {
             GGML_ABORT("unsupported DeepSeek4 D=512 flash-attention contract");
         }
         return;
+#else
+        GGML_ABORT("DeepSeek4 D=512 flash attention is only available on HIP");
+#endif // defined(GGML_USE_HIP)
     }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
@@ -2438,7 +2446,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     if (ggml_flash_attn_ext_is_ds4(dst)) {
+#if defined(GGML_USE_HIP)
         return ggml_cuda_ds4_flash_attn_d512_f32_supported(dst);
+#else
+        return false;
+#endif // defined(GGML_USE_HIP)
     }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
