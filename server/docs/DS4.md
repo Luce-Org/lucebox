@@ -179,20 +179,28 @@ export DFLASH_DS4_SPEC_Q=4
 
 ./server/build-hip/dflash_server /path/to/deepseek4-target.gguf \
   --target-device hip:0 \
-  --ds4-fused-decode
+  --ds4-fused-decode \
+  --ds4-expert-top-k 4
 ```
 
 DSpark currently requires monolithic target placement. On HIP,
 `--ds4-fused-decode` selects that placement; if the target falls back to hybrid
 expert placement, the server logs that DSpark is disabled and continues with
-the normal autoregressive path.
+the normal autoregressive path. `--ds4-expert-top-k 4` is a separate,
+approximate inference policy used by the validated Strix Halo profile; omit it
+to retain the model's default six routed experts.
 
 On HIP `gfx1151`, enabling DSpark defaults `LUCE_MMVQ_MAX_NCOLS` to `4` when
-the variable is unset. This keeps the four-row verifier on MMVQ; the validated
-ROCm 7.2.4 high-clock GSM+Math run reached 30.23 tok/s weighted with 10/10
-correctness. Set `LUCE_MMVQ_MAX_NCOLS` explicitly to override the platform
-default. AR, NVIDIA, and other HIP architectures retain the shared dispatch
-default.
+the variable is unset. This keeps the four-row verifier on MMVQ. On a 128 GiB
+Strix Halo Radeon 8060S using ROCm 7.2.4, the rebased candidate measured 32.12
+tok/s weighted at fixed q=4 and 31.94 tok/s with confidence-adaptive width,
+versus 25.31 tok/s autoregressive. All three configurations scored 10/10 on the
+same five GSM and five Math prompts. The run used `--ds4-expert-top-k 4`, the
+platform `performance` profile, and the GPU `high` performance level; fixed
+q=4 with the model-default six routed experts measured 28.26 tok/s. Enabling
+DSpark alone therefore does not guarantee 30 tok/s. Set
+`LUCE_MMVQ_MAX_NCOLS` explicitly to override the platform default. AR, NVIDIA,
+and other HIP architectures retain the shared dispatch default.
 
 Adaptive width is automatic. When the draft artifact has a compatible
 confidence projection, the runtime selects q=2, q=3, or q=4 from the cumulative
@@ -202,10 +210,8 @@ additional host round trip is introduced. Artifacts without a compatible
 confidence head transparently retain the existing acceptance-EWMA policy.
 
 On the gfx1151 validation host, confidence-adaptive width retained 10/10
-GSM+Math accuracy and measured 29.25 tok/s weighted, within 0.8% of fixed q=4
-at 29.49 tok/s. On the low-acceptance stress prompt it measured 21.9/21.8
-tok/s warm, effectively tied with EWMA while avoiding fixed q=4's wasted wide
-verification. These numbers are workload-specific; the confidence policy is
+GSM+Math accuracy and measured 31.94 tok/s weighted, within 0.6% of fixed q=4
+at 32.12 tok/s. These numbers are workload-specific; the confidence policy is
 enabled only when DSpark is explicitly enabled and the draft artifact contains
 a compatible confidence head.
 

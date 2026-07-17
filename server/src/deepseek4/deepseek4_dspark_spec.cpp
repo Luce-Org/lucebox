@@ -47,6 +47,8 @@ public:
         : w_(w), cache_(cache), backend_(backend), snap_backend_(snap_backend),
           capture_ids_(std::move(capture_ids)), mask_tok_(mask_tok) {}
 
+    ~DeepSeek4DFlashTarget() override { clear_snapshot(); }
+
     bool verify_batch(const std::vector<int32_t> & tokens, int base_pos, int & last_tok,
                       std::vector<int32_t> * all_argmax = nullptr,
                       bool capture_ssm_intermediates = false) override {
@@ -58,10 +60,11 @@ public:
                          n, n > 0 ? tokens[0] : -1, n > 1 ? tokens[1] : -1, w_.n_vocab);
             return false;
         }
-        // Sequential exact verify (measurement mode): q single-token forwards
-        // through the legacy AR decode path. Causal by construction, compressor
-        // fed every token. Slow; used to measure the drafter's TRUE accept
-        // rate and produce exact greedy output. Enable: DFLASH_DS4_SEQ_VERIFY=1
+        // Sequential verify (measurement mode): q single-token forwards through
+        // the legacy AR decode path. Causal by construction, compressor fed every
+        // token. Slow; used to measure the drafter's token-at-a-time accept rate.
+        // It is not a bit-exact oracle: graph shape can change floating-point
+        // reduction order around near-tied logits. Enable: DFLASH_DS4_SEQ_VERIFY=1
         // (pair with DFLASH_DS4_FULL_SNAP=1 so rollback/replay stay exact).
         static const bool seq_verify = [] {
             const char * v = std::getenv("DFLASH_DS4_SEQ_VERIFY");
@@ -185,6 +188,7 @@ public:
     void set_telemetry(DeepSeek4StepTelemetry * t) { telemetry_ = t; }
     const std::vector<float> & last_features() const { return verify_features_; }
     int last_verify_n() const { return verify_n_; }
+    void clear_snapshot() { free_deepseek4_snapshot(snap_); }
 
 private:
     const DeepSeek4Weights & w_;
@@ -735,6 +739,10 @@ bool run_deepseek4_dspark_spec_decode(
             (unsigned long long) tel.ffn_hot_graph_hits,
             (unsigned long long) tel.ffn_hot_graph_builds);
     }
+    // Snapshot buffers must be released while their backend is still alive.
+    // clear_snapshot() is idempotent, so the target destructor remains a
+    // safety net for future exits that are added above this point.
+    target.clear_snapshot();
     ggml_backend_free(snap_backend);
     return ok;
 }

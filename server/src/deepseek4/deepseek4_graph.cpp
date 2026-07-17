@@ -4295,7 +4295,10 @@ bool deepseek4_step_layer_range(
     std::vector<float> & attn_out_host = scratch.attn_out_host;
     std::vector<float> & ffn_out_host = scratch.ffn_out_host;
     std::vector<int32_t> & hash_expert_ids_host = scratch.hash_expert_ids;
-    const bool reuse_decode_graphs = n_tokens == 1;
+    // Verification hooks need per-position captures and logits. The cached
+    // single-token decode graphs only expose the final decode outputs, so
+    // honor the caller's request to take the dynamic path for verification.
+    const bool reuse_decode_graphs = n_tokens == 1 && allow_decode_graph_reuse;
     Ds4DecodeSharedInputs * shared_inputs = nullptr;
     if (reuse_decode_graphs && ds4_backend_is_gpu(backend) &&
         decode_shared_inputs.ensure(w, backend)) {
@@ -5194,8 +5197,8 @@ bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
 
 
 void free_deepseek4_snapshot(DeepSeek4Snapshot & s) {
-    if (s.ctx) { ggml_free(s.ctx); s.ctx = nullptr; }
     if (s.buf) { ggml_backend_buffer_free(s.buf); s.buf = nullptr; }
+    if (s.ctx) { ggml_free(s.ctx); s.ctx = nullptr; }
     s.layers.clear();
     s.cur_pos = 0;
     s.hc_state_snap = nullptr;
