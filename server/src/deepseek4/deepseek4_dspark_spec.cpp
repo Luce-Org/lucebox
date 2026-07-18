@@ -406,7 +406,9 @@ bool run_deepseek4_dspark_spec_decode(
 
     // Fast path caps the verify at the compression ratio (4): one boundary max,
     // no rolling-state row aliasing -> snapshot-free rollback stays exact.
-    // The full-snapshot A/B path may use the whole block.
+    // Full snapshots change rollback strategy but not the compressor-window
+    // limit below. The legacy sequential measurement path is validated only
+    // through q=4.
     int q_cap = full_snap ? block + 1 : 4;
     if (const char * qs = std::getenv("DFLASH_DS4_SPEC_Q")) {
         const int v = std::atoi(qs);
@@ -421,6 +423,13 @@ bool run_deepseek4_dspark_spec_decode(
             q_cap = full_snap ? v : std::min(v, 4);
         }
         std::fclose(qf);
+    }
+    if (seq_verify_mode && q_cap > 4) {
+        std::fprintf(stderr,
+                     "[ds4-spec] sequential verify supports q<=4; "
+                     "capping requested q=%d to 4\n",
+                     q_cap);
+        q_cap = 4;
     }
 
     // Snapshot backend for the legacy full-snapshot rollback path.
@@ -464,7 +473,7 @@ bool run_deepseek4_dspark_spec_decode(
     int lt = last_tok;
     int pos = committed;      // absolute position of the seed (block slot 0)
     int n_generated = 0;
-    long accept_sum = 0, steps = 0;
+    long accept_sum = 0, offered_sum = 0, steps = 0;
     bool ok = true;
     bool stop_requested = false;
 
@@ -520,8 +529,8 @@ bool run_deepseek4_dspark_spec_decode(
         bool ds_ok = false;
         // Batched-verify exactness: the batch must not cross a ratio-4
         // boundary except at its last token (state rows stay distinct and the
-        // comp emission matches AR). Boundaries sit at p % 4 == 3. The
-        // sequential verify has no such limit.
+        // comp emission matches AR). Boundaries sit at p % 4 == 3. The legacy
+        // sequential measurement path is independently capped to q=4 above.
         int q_step_cap = seq_verify_mode
                        ? std::min(q_cap, 4)
                        : std::min(q_cap, 4 - (pos & 3));
@@ -694,6 +703,7 @@ bool run_deepseek4_dspark_spec_decode(
         pos = commit_pos;              // seed + accepted candidates now in KV
         lt = bonus;                    // deferred bonus becomes next seed
         accept_sum += matched;
+        offered_sum += q - 1;
         ewma_accept = 0.7 * ewma_accept + 0.3 * (double) matched;
         steps++;
         if (timing && (steps <= 4 || (steps & 31) == 0)) {
@@ -708,12 +718,17 @@ bool run_deepseek4_dspark_spec_decode(
     }
 
     const double total_ms = spec_ms_since(run_t0);
-    if (accept_rate_out && steps > 0) {
-        const int denom = q_cap > 1 ? q_cap - 1 : 1;
-        *accept_rate_out = (float) accept_sum / (float) (steps * denom);
+    if (accept_rate_out) {
+        *accept_rate_out = offered_sum > 0
+            ? (float) accept_sum / (float) offered_sum
+            : 0.0f;
     }
-    std::fprintf(stderr, "[ds4-spec] gen=%d steps=%ld mean_accept=%.2f/%d q_cap=%d full_snap=%d\n",
-                 n_generated, steps, steps ? (double) accept_sum / steps : 0.0, q_cap - 1, q_cap,
+    std::fprintf(stderr,
+                 "[ds4-spec] gen=%d steps=%ld mean_accept=%.2f/%.2f "
+                 "q_cap=%d full_snap=%d\n",
+                 n_generated, steps,
+                 steps ? (double) accept_sum / steps : 0.0,
+                 steps ? (double) offered_sum / steps : 0.0, q_cap,
                  (int) full_snap);
     if (steps > 0) {
         std::fprintf(stderr,
@@ -730,7 +745,7 @@ bool run_deepseek4_dspark_spec_decode(
             "[ds4-spec-t] verify tel/step: hc_pre_a=%.1f attn_b=%.1f attn_c=%.1f attn_r=%.1f "
             "hc_post_a=%.1f hc_pre_f=%.1f route(b/c/r/s)=%.1f/%.1f/%.1f/%.1f "
             "ffn(b/c/r)=%.1f/%.1f/%.1f eval=%.1f hot=%.1f cold=%.1f comb=%.1f part=%.1f "
-            "ghits=%llu gbuilds=%llu ms\n",
+            "full(b/s/c/r)=%.1f/%.1f/%.1f/%.1f ghits=%llu gbuilds=%llu ms\n",
             tel.hc_pre_attn_us / s, tel.attn_build_us / s, tel.attn_compute_us / s,
             tel.attn_read_us / s, tel.hc_post_attn_us / s, tel.hc_pre_ffn_us / s,
             tel.route_build_us / s, tel.route_compute_us / s, tel.route_read_us / s,
@@ -738,6 +753,8 @@ bool run_deepseek4_dspark_spec_decode(
             tel.ffn_build_us / s, tel.ffn_compute_us / s, tel.ffn_read_us / s,
             tel.ffn_eval_us / s, tel.ffn_hot_us / s, tel.ffn_cold_us / s,
             tel.ffn_combine_us / s, tel.ffn_partition_us / s,
+            tel.full_graph_build_us / s, tel.full_graph_set_us / s,
+            tel.full_graph_compute_us / s, tel.full_graph_read_us / s,
             (unsigned long long) tel.ffn_hot_graph_hits,
             (unsigned long long) tel.ffn_hot_graph_builds);
     }

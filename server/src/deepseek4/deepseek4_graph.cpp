@@ -591,6 +591,21 @@ static ggml_tensor * build_tail_rope_2d(ggml_context * ctx,
 
 // ─── KV Compressor Step ────────────────────────────────────────────────
 
+int deepseek4_safe_compressor_batch_tokens(const DeepSeek4Weights & w,
+                                           int kv_start,
+                                           int n_tokens) {
+    if (n_tokens <= 0) return 0;
+    int safe = n_tokens;
+    for (uint32_t raw_ratio : w.compress_ratios) {
+        const int ratio = (int) raw_ratio;
+        if (ratio <= 0) continue;
+        int pos_mod = kv_start % ratio;
+        if (pos_mod < 0) pos_mod += ratio;
+        safe = std::min(safe, ratio - pos_mod);
+    }
+    return std::max(1, safe);
+}
+
 static void build_compressor_step(
         ggml_context * ctx,
         ggml_cgraph * gf,
@@ -641,8 +656,9 @@ static void build_compressor_step(
     ggml_tensor * comp_cache_source = comp_cache;
 
     // Causal-batch verify: every token's contribution lands in its
-    // position-addressed state row (the rows are distinct because the batch
-    // never crosses a ratio window; the boundary may only be the last token).
+    // position-addressed state row. deepseek4_step_layer_range splits dynamic
+    // batches at compressor boundaries, so the boundary can only be the last
+    // token and no post-boundary write can precede pooling/rotation.
     const bool batched_state = (cur_all != nullptr && n_tokens_all > 1 &&
                                 !state_rows_inp && kv_start_all >= 0);
     if (batched_state) {
@@ -4157,6 +4173,84 @@ bool deepseek4_step_layer_range(
     const int n_hc = w.n_hc;
     const int hc_dim = n_hc * n_embd;
     const bool is_last_shard = (layer_end >= w.n_layer);
+
+    // A dynamic batch may be supplied by callers other than the DSpark
+    // verifier. Split it whenever it spans a learned-compressor boundary:
+    // each sub-forward then writes at most one window and, if present, its
+    // boundary is the final token. This preserves the same pool/rotate order
+    // as sequential execution while retaining safe batched prefixes.
+    const int first_chunk = deepseek4_safe_compressor_batch_tokens(w, kv_start, n_tokens);
+    if (first_chunk > 0 && first_chunk < n_tokens) {
+        const int input_width = layer_begin == 0 ? n_embd : hc_dim;
+        std::vector<float> hc_all;
+        std::vector<float> shard_out_all;
+        std::vector<float> capture_all;
+        std::vector<float> logits_all;
+        std::vector<float> last_out;
+        hc_all.reserve((size_t) hc_dim * n_tokens);
+        if (out_logits && !is_last_shard) {
+            shard_out_all.reserve((size_t) hc_dim * n_tokens);
+        }
+        if (verify_hooks && verify_hooks->capture_out &&
+            verify_hooks->capture_layer_ids) {
+            capture_all.reserve((size_t) verify_hooks->capture_layer_ids->size() *
+                                n_embd * n_tokens);
+        }
+        if (verify_hooks && verify_hooks->all_logits_out) {
+            logits_all.reserve((size_t) w.n_vocab * n_tokens);
+        }
+
+        for (int off = 0; off < n_tokens;) {
+            const int chunk = deepseek4_safe_compressor_batch_tokens(
+                w, kv_start + off, n_tokens - off);
+            std::vector<float> chunk_hc;
+            std::vector<float> chunk_out;
+            std::vector<float> chunk_capture;
+            std::vector<float> chunk_logits;
+            Ds4VerifyHooks chunk_hooks;
+            Ds4VerifyHooks * chunk_hooks_ptr = nullptr;
+            if (verify_hooks) {
+                chunk_hooks.capture_layer_ids = verify_hooks->capture_layer_ids;
+                chunk_hooks.capture_out = verify_hooks->capture_out ? &chunk_capture : nullptr;
+                chunk_hooks.all_logits_out = verify_hooks->all_logits_out ? &chunk_logits : nullptr;
+                chunk_hooks_ptr = &chunk_hooks;
+            }
+            if (!deepseek4_step_layer_range(
+                    backend, w, cache, chunk_hc,
+                    embed + (size_t) off * input_width,
+                    chunk, kv_start + off, layer_begin, layer_end,
+                    out_logits ? &chunk_out : nullptr,
+                    token_ids ? token_ids + off : nullptr,
+                    telemetry, allow_decode_graph_reuse, chunk_hooks_ptr)) {
+                return false;
+            }
+            hc_all.insert(hc_all.end(), chunk_hc.begin(), chunk_hc.end());
+            if (out_logits) {
+                if (is_last_shard) {
+                    last_out = std::move(chunk_out);
+                } else {
+                    shard_out_all.insert(shard_out_all.end(),
+                                         chunk_out.begin(), chunk_out.end());
+                }
+            }
+            capture_all.insert(capture_all.end(),
+                               chunk_capture.begin(), chunk_capture.end());
+            logits_all.insert(logits_all.end(), chunk_logits.begin(), chunk_logits.end());
+            off += chunk;
+        }
+
+        hc_state = std::move(hc_all);
+        if (out_logits) {
+            *out_logits = is_last_shard ? std::move(last_out) : std::move(shard_out_all);
+        }
+        if (verify_hooks && verify_hooks->capture_out) {
+            *verify_hooks->capture_out = std::move(capture_all);
+        }
+        if (verify_hooks && verify_hooks->all_logits_out) {
+            *verify_hooks->all_logits_out = std::move(logits_all);
+        }
+        return true;
+    }
 
     // Initialize HC state.
     // First shard (layer_begin=0): embed is token embeddings [n_embd × n_tokens],

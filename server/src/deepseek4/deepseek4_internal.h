@@ -321,6 +321,13 @@ bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
 bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
                                 DeepSeek4Cache & cache);
 
+// Largest prefix of [kv_start, kv_start + n_tokens) that reaches at most the
+// next learned-compressor boundary. Multi-token dynamic forwards split on
+// this prefix so state writes after a boundary cannot race ahead of pooling.
+int deepseek4_safe_compressor_batch_tokens(const DeepSeek4Weights & w,
+                                           int kv_start,
+                                           int n_tokens);
+
 // Forward: single step (prefill chunk or decode token).
 // embed: [n_embd, n_tokens] input embeddings (post-embedding lookup).
 // hc_state: [n_hc * n_embd] persistent HC residual (updated in-place).

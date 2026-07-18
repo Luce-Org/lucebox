@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #define private public
+#include "deepseek4/deepseek4_backend.h"
 #include "deepseek4/deepseek4_layer_split_adapter.h"
 #undef private
 
@@ -975,6 +976,48 @@ static void test_dspark_loader_contract_and_bounds(ggml_backend_t backend) {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_safe_compressor_batch_tokens() {
+    std::fprintf(stderr, "  test_safe_compressor_batch_tokens ...");
+    DeepSeek4Weights w;
+    w.compress_ratios = {0, 4, 128};
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 0, 1) == 1);
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 0, 4) == 4);
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 0, 5) == 4);
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 1, 8) == 3);
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 4, 8) == 4);
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 125, 8) == 3);
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 128, 8) == 4);
+
+    w.compress_ratios = {128};
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 0, 129) == 128);
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 127, 4) == 1);
+
+    w.compress_ratios.clear();
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 17, 9) == 9);
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 17, 0) == 0);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_dspark_park_all_releases_drafter() {
+    std::fprintf(stderr, "  test_dspark_park_all_releases_drafter ...");
+
+    DeepSeek4BackendConfig cfg;
+    DeepSeek4Backend backend(cfg);
+    backend.spec_draft_path_ = "/tmp/ds4-dspark-fixture.gguf";
+    backend.spec_drafter_ = std::make_unique<DSparkDrafter>();
+    backend.spec_enabled_ = true;
+
+    TEST_ASSERT(backend.park("all"));
+    TEST_ASSERT(backend.parked_);
+    TEST_ASSERT(backend.spec_drafter_ == nullptr);
+    TEST_ASSERT(!backend.spec_enabled_);
+    TEST_ASSERT(backend.spec_drafter_parked_);
+
+    // Avoid leaving a synthetic reload request for the destructor.
+    backend.free_drafter();
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_snapshot_save_restore() {
     std::fprintf(stderr, "  test_snapshot_save_restore ...");
 
@@ -1848,6 +1891,8 @@ int main() {
     test_loader_reads_tokenizer_special_ids(backend);
     test_loader_rejects_truncated_tensor_data(backend);
     test_dspark_loader_contract_and_bounds(backend);
+    test_safe_compressor_batch_tokens();
+    test_dspark_park_all_releases_drafter();
     test_snapshot_save_restore();
     test_reset_request_state();
     test_reset_deepseek4_cache(backend);

@@ -79,8 +79,13 @@ private:
 
     // DSpark speculative decode (opt-in: DFLASH_DS4_SPEC=1 + DFLASH_DS4_DRAFT=<gguf>).
     bool                           spec_enabled_ = false;
+    bool                           spec_drafter_parked_ = false;
+    std::string                    spec_draft_path_;
     std::unique_ptr<DSparkDrafter> spec_drafter_;
     std::vector<float>             spec_feat_window_;
+
+    bool load_spec_drafter();
+    void release_spec_drafter(bool mark_parked);
 
     // Prefill prompt tokens in chunks, return absolute committed position.
     int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io,

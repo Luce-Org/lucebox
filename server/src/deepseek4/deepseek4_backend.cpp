@@ -397,6 +397,59 @@ bool DeepSeek4Backend::load_model() {
     return true;
 }
 
+bool DeepSeek4Backend::load_spec_drafter() {
+    if (spec_draft_path_.empty()) return true;
+    if (parked_ || moe_hybrid_) {
+        std::fprintf(stderr,
+                     "[deepseek4] cannot load DSpark drafter without a resident "
+                     "monolithic target\n");
+        return false;
+    }
+
+    auto drafter = std::make_unique<DSparkDrafter>();
+    if (!load_deepseek4_dspark_drafter(spec_draft_path_, backend_, *drafter)) {
+        std::fprintf(stderr, "[deepseek4] DSpark drafter load FAILED: %s\n",
+                     deepseek4_dspark_last_error());
+        return false;
+    }
+
+    const DSparkDrafter & d = *drafter;
+    bool compatible = d.core.n_embd == w_.n_embd &&
+                      d.core.n_vocab == w_.n_vocab &&
+                      d.vocab_size == w_.n_vocab &&
+                      d.mask_token_id >= 0 && d.mask_token_id < w_.n_vocab &&
+                      (int) d.capture_layer_ids.size() == d.n_target_layers;
+    for (int layer : d.capture_layer_ids) {
+        compatible = compatible && layer >= 0 && layer < w_.n_layer;
+    }
+    if (!compatible) {
+        std::fprintf(stderr,
+                     "[deepseek4] DSpark drafter is incompatible with target "
+                     "(target embd/vocab/layers=%d/%d/%d, draft=%d/%d)\n",
+                     w_.n_embd, w_.n_vocab, w_.n_layer,
+                     d.core.n_embd, d.vocab_size);
+        free_deepseek4_dspark_drafter(*drafter);
+        return false;
+    }
+
+    spec_drafter_ = std::move(drafter);
+    spec_enabled_ = true;
+    spec_drafter_parked_ = false;
+    std::fprintf(stderr, "[deepseek4] DSpark spec-decode ENABLED (drafter=%s)\n",
+                 spec_draft_path_.c_str());
+    return true;
+}
+
+void DeepSeek4Backend::release_spec_drafter(bool mark_parked) {
+    if (spec_drafter_) {
+        free_deepseek4_dspark_drafter(*spec_drafter_);
+    }
+    spec_drafter_.reset();
+    spec_enabled_ = false;
+    spec_feat_window_.clear();
+    spec_drafter_parked_ = mark_parked && !spec_draft_path_.empty();
+}
+
 bool DeepSeek4Backend::init() {
     // The shared MMVQ/MMQ crossover defaults to q=3 for NVIDIA. On gfx1151,
     // DSpark q=4 is faster through MMVQ. Keep AR and other devices unchanged,
@@ -436,42 +489,16 @@ bool DeepSeek4Backend::init() {
                  w_.fused_decode ? "on" : "off",
                  moe_hybrid_ ? " [hybrid]" : "");
 
-    if (env_flag_enabled("DFLASH_DS4_SPEC") && moe_hybrid_) {
-        std::fprintf(stderr,
-                     "[deepseek4] DSpark spec-decode requires monolithic model placement; "
-                     "disabled for hybrid expert placement\n");
-    } else if (env_flag_enabled("DFLASH_DS4_SPEC")) {
+    if (env_flag_enabled("DFLASH_DS4_SPEC")) {
         const char * dp = std::getenv("DFLASH_DS4_DRAFT");
         if (dp && *dp) {
-            spec_drafter_ = std::make_unique<DSparkDrafter>();
-            if (load_deepseek4_dspark_drafter(dp, backend_, *spec_drafter_)) {
-                const DSparkDrafter & d = *spec_drafter_;
-                bool compatible = d.core.n_embd == w_.n_embd &&
-                                  d.core.n_vocab == w_.n_vocab &&
-                                  d.vocab_size == w_.n_vocab &&
-                                  d.mask_token_id >= 0 && d.mask_token_id < w_.n_vocab &&
-                                  (int) d.capture_layer_ids.size() == d.n_target_layers;
-                for (int layer : d.capture_layer_ids) {
-                    compatible = compatible && layer >= 0 && layer < w_.n_layer;
-                }
-                if (!compatible) {
-                    std::fprintf(stderr,
-                                 "[deepseek4] DSpark drafter is incompatible with target "
-                                 "(target embd/vocab/layers=%d/%d/%d, draft=%d/%d)\n",
-                                 w_.n_embd, w_.n_vocab, w_.n_layer,
-                                 d.core.n_embd, d.vocab_size);
-                    free_deepseek4_dspark_drafter(*spec_drafter_);
-                    spec_drafter_.reset();
-                } else {
-                    spec_enabled_ = true;
-                    std::fprintf(stderr,
-                                 "[deepseek4] DSpark spec-decode ENABLED (drafter=%s)\n",
-                                 dp);
-                }
+            spec_draft_path_ = dp;
+            if (moe_hybrid_) {
+                std::fprintf(stderr,
+                             "[deepseek4] DSpark spec-decode requires monolithic model "
+                             "placement; disabled for hybrid expert placement\n");
             } else {
-                std::fprintf(stderr, "[deepseek4] DSpark drafter load FAILED: %s\n",
-                             deepseek4_dspark_last_error());
-                spec_drafter_.reset();
+                (void) load_spec_drafter();
             }
         } else {
             std::fprintf(stderr, "[deepseek4] DFLASH_DS4_SPEC set but DFLASH_DS4_DRAFT gguf missing\n");
@@ -585,7 +612,14 @@ void DeepSeek4Backend::print_ready_banner() const {
 }
 
 bool DeepSeek4Backend::park(const std::string & what) {
+    const bool want_draft = (what.empty() || what == "all" || what == "draft");
     const bool want_target = (what.empty() || what == "all" || what == "target");
+
+    if (want_draft && spec_drafter_) {
+        release_spec_drafter(/*mark_parked=*/true);
+        std::printf("[deepseek4] DSpark drafter parked (VRAM released)\n");
+        std::fflush(stdout);
+    }
     if (!want_target || parked_) return true;
 
     maybe_save_routing_stats();
@@ -599,47 +633,68 @@ bool DeepSeek4Backend::park(const std::string & what) {
     moe_placement_ = {};
     free_deepseek4_weights(w_);
     parked_ = true;
-    std::printf("[deepseek4] parked (VRAM released)\n");
+    if (spec_drafter_) {
+        std::printf("[deepseek4] target parked (target VRAM released; "
+                    "DSpark drafter retained)\n");
+    } else {
+        std::printf("[deepseek4] target parked (target VRAM released)\n");
+    }
     std::fflush(stdout);
     return true;
 }
 
 bool DeepSeek4Backend::unpark(const std::string & what) {
+    const bool want_draft = (what.empty() || what == "all" || what == "draft");
     const bool want_target = (what.empty() || what == "all" || what == "target");
-    if (!want_target || !parked_) return true;
 
-    if (!load_model()) {
-        std::fprintf(stderr, "[deepseek4] unpark: failed to restore target model\n");
-        free_deepseek4_weights(w_);
-        stream_engine_.destroy();
-        moe_hybrid_.reset();
-        moe_placement_ = {};
-        return false;
+    if (want_target && parked_) {
+        if (!load_model()) {
+            std::fprintf(stderr, "[deepseek4] unpark: failed to restore target model\n");
+            free_deepseek4_weights(w_);
+            stream_engine_.destroy();
+            moe_hybrid_.reset();
+            moe_placement_ = {};
+            return false;
+        }
+
+        const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
+        if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
+            std::fprintf(stderr,
+                         "[deepseek4] unpark: failed to recreate KV cache (ctx=%d)\n",
+                         max_ctx);
+            free_deepseek4_cache(cache_);
+            free_deepseek4_weights(w_);
+            stream_engine_.destroy();
+            moe_hybrid_.reset();
+            moe_placement_ = {};
+            return false;
+        }
+
+        parked_ = false;
+        std::printf("[deepseek4] target unparked (VRAM restored)\n");
+        std::fflush(stdout);
     }
 
-    const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
-    if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
-        std::fprintf(stderr, "[deepseek4] unpark: failed to recreate KV cache (ctx=%d)\n", max_ctx);
-        free_deepseek4_cache(cache_);
-        free_deepseek4_weights(w_);
-        stream_engine_.destroy();
-        moe_hybrid_.reset();
-        moe_placement_ = {};
-        return false;
+    if (want_draft && spec_drafter_parked_) {
+        if (parked_) {
+            std::fprintf(stderr,
+                         "[deepseek4] unpark: restore target before DSpark drafter\n");
+            return false;
+        }
+        if (!load_spec_drafter()) {
+            std::fprintf(stderr, "[deepseek4] unpark: failed to restore DSpark drafter\n");
+            return false;
+        }
     }
-
-    parked_ = false;
-    std::printf("[deepseek4] unparked (VRAM restored)\n");
-    std::fflush(stdout);
     return true;
 }
 
 int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   const DaemonIO & io,
                                   int kv_offset) {
-    // The current batched graph updates only the chunk's final compressor
-    // window. Until batched compressor state is sequentially updated, process
-    // prefill one token at a time to preserve long-prompt correctness.
+    // Keep server prefill token-at-a-time for established numerics and bounded
+    // dynamic-graph workspace. The lower-level layer-range API independently
+    // splits arbitrary multi-token callers at every compressor boundary.
     constexpr int chunk = 1;
     const int n_total = (int)tokens.size();
     int pos = kv_offset;
@@ -948,12 +1003,8 @@ bool DeepSeek4Backend::handle_compress(const std::string & line,
 }
 
 void DeepSeek4Backend::free_drafter() {
-    if (spec_drafter_) {
-        free_deepseek4_dspark_drafter(*spec_drafter_);
-    }
-    spec_drafter_.reset();
-    spec_enabled_ = false;
-    spec_feat_window_.clear();
+    release_spec_drafter(/*mark_parked=*/false);
+    spec_draft_path_.clear();
 }
 
 void DeepSeek4Backend::maybe_save_routing_stats() {

@@ -402,6 +402,7 @@ static int ds4_try_fused_verify_step(
     fg->last_use = vc.counter;
 
     // ── Fill inputs ──
+    const auto set_t0 = Ds4TimingClock::now();
     ds4_fv_set(fg->inp_embed, embed, sizeof(float) * (size_t) w.n_embd * q);
     std::vector<int32_t> iv(q);
     std::vector<int64_t> lv(q);
@@ -499,6 +500,9 @@ static int ds4_try_fused_verify_step(
                                     sizeof(int32_t) * (size_t) n_used * q);
         }
     }
+    if (telemetry) {
+        telemetry->full_graph_set_us += ds4_elapsed_us(set_t0, Ds4TimingClock::now());
+    }
 
     // ── Compute + read back ──
     const auto compute_t0 = Ds4TimingClock::now();
@@ -506,8 +510,11 @@ static int ds4_try_fused_verify_step(
         std::fprintf(stderr, "[ds4-fused-verify] compute failed\n");
         return -1;
     }
-    if (telemetry) telemetry->attn_compute_us += ds4_elapsed_us(compute_t0, Ds4TimingClock::now());
+    if (telemetry) {
+        telemetry->full_graph_compute_us += ds4_elapsed_us(compute_t0, Ds4TimingClock::now());
+    }
 
+    const auto read_t0 = Ds4TimingClock::now();
     const int ncap = (int) hooks->capture_layer_ids->size();
     if (hooks->all_logits_out) {
         hooks->all_logits_out->resize((size_t) w.n_vocab * q);
@@ -530,6 +537,9 @@ static int ds4_try_fused_verify_step(
                 std::memcpy(dst, src, sizeof(float) * (size_t) w.n_embd);
             }
         }
+    }
+    if (telemetry) {
+        telemetry->full_graph_read_us += ds4_elapsed_us(read_t0, Ds4TimingClock::now());
     }
     return 1;
 }
