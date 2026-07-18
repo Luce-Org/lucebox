@@ -1021,6 +1021,76 @@ static void test_dspark_park_all_releases_drafter() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_dspark_raw_ring_rollback_after_wrap(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_dspark_raw_ring_rollback_after_wrap ...");
+
+    DeepSeek4Weights weights;
+    weights.n_layer = 1;
+    weights.n_embd = 4;
+    weights.n_hc = 1;
+    weights.head_dim = 4;
+    weights.n_swa = 8;
+    weights.n_indexer_head_dim = 2;
+    weights.compress_ratios = {4};
+
+    DeepSeek4Cache cache;
+    TEST_ASSERT(create_deepseek4_cache(backend, weights, 16, cache));
+    if (!cache.buf || cache.layers.empty() || !cache.layers[0].raw_kv) {
+        free_deepseek4_cache(cache);
+        std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+        return;
+    }
+
+    auto & layer = cache.layers[0];
+    write_tensor_pattern(layer.raw_kv, 11);
+    const std::vector<uint8_t> original = read_tensor_bytes(layer.raw_kv);
+    std::vector<uint8_t> expected = original;
+    const size_t row_bytes = ggml_row_size(layer.raw_kv->type, layer.raw_kv->ne[0]);
+
+    cache.cur_pos = 10;
+    layer.n_comp = 2;
+    layer.n_index_comp = 2;
+    DeepSeek4SpecRollback rollback;
+    deepseek4_spec_rollback_save(cache, rollback, 10, 4);
+
+    auto overwrite_row = [&](int absolute_pos, uint8_t value) {
+        const int row = absolute_pos % weights.n_swa;
+        std::vector<uint8_t> bytes(row_bytes, value);
+        ggml_backend_tensor_set(layer.raw_kv, bytes.data(),
+                                (size_t) row * layer.raw_kv->nb[1], row_bytes);
+    };
+    auto expect_overwritten_row = [&](int absolute_pos, uint8_t value) {
+        const int row = absolute_pos % weights.n_swa;
+        std::fill(expected.begin() + (size_t) row * layer.raw_kv->nb[1],
+                  expected.begin() + (size_t) row * layer.raw_kv->nb[1] + row_bytes,
+                  value);
+    };
+    for (int t = 0; t < 4; ++t) {
+        overwrite_row(10 + t, (uint8_t) (0xa0 + t));
+    }
+
+    // Commit positions 10 and 11. Their new rows stay in the ring, while the
+    // rejected positions 12 and 13 must reveal the older history they replaced.
+    expect_overwritten_row(10, 0xa0);
+    expect_overwritten_row(11, 0xa1);
+    deepseek4_spec_rollback_apply(rollback, weights, cache, 12, false);
+    TEST_ASSERT(read_tensor_bytes(layer.raw_kv) == expected);
+    TEST_ASSERT(cache.cur_pos == 12);
+    TEST_ASSERT(layer.n_comp == 3);
+    TEST_ASSERT(layer.n_index_comp == 3);
+
+    // Restoring to the pre-verify position is used by replay/diagnostic paths
+    // and must put every overwritten physical row back.
+    deepseek4_spec_rollback_apply(rollback, weights, cache, 10, false);
+    TEST_ASSERT(read_tensor_bytes(layer.raw_kv) == original);
+    TEST_ASSERT(cache.cur_pos == 10);
+    TEST_ASSERT(layer.n_comp == 2);
+    TEST_ASSERT(layer.n_index_comp == 2);
+
+    free_deepseek4_cache(cache);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_snapshot_save_restore() {
     std::fprintf(stderr, "  test_snapshot_save_restore ...");
 
@@ -1896,6 +1966,7 @@ int main() {
     test_dspark_loader_contract_and_bounds(backend);
     test_safe_compressor_batch_tokens();
     test_dspark_park_all_releases_drafter();
+    test_dspark_raw_ring_rollback_after_wrap(backend);
     test_snapshot_save_restore();
     test_reset_request_state();
     test_reset_deepseek4_cache(backend);

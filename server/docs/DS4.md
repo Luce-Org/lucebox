@@ -183,6 +183,14 @@ export DFLASH_DS4_SPEC_Q=4
   --ds4-expert-top-k 4
 ```
 
+`DFLASH_DS4_FUSED_VERIFY=1` is the opt-in throughput profile. Its persistent
+whole-model GPU graph uses stable padded reduction shapes, so near-tied greedy
+logits can select a different token than the normal causal verifier even at
+temperature 0. Leave it unset when comparing against the normal verifier, or
+set `DFLASH_DS4_SEQ_VERIFY=1` for the slower token-at-a-time verification
+diagnostic. Neither fused verification nor the separate
+`--ds4-expert-top-k 4` approximation should be presented as byte-identical AR.
+
 DSpark currently requires monolithic target placement. On HIP,
 `--ds4-fused-decode` selects that placement; if the target falls back to hybrid
 expert placement, the server logs that DSpark is disabled and continues with

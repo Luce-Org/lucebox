@@ -29,6 +29,8 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
@@ -124,6 +126,33 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
                                      std::vector<float> & capture_out,
                                      DeepSeek4StepTelemetry * telemetry = nullptr,
                                      bool allow_graph_reuse = false);
+
+// Minimal speculative-decode rollback state. Rejected positions must restore
+// the physical SWA rows they overwrote after the ring wraps; otherwise a later
+// causal verify reads rejected-token KV as if it were older committed history.
+// This remains much smaller than a full target-cache snapshot because q <= 4.
+struct DeepSeek4SpecRollback {
+    int raw_pos = 0;
+    int raw_count = 0;
+    struct Layer {
+        std::vector<uint8_t> attn_kv, attn_sc, idx_kv, idx_sc;
+        std::size_t raw_row_bytes = 0;
+        std::vector<uint8_t> raw_rows;
+    };
+    std::vector<Layer> layers;
+    std::vector<uint8_t> hc_state;
+};
+
+void deepseek4_spec_rollback_save(const DeepSeek4Cache & cache,
+                                  DeepSeek4SpecRollback & rollback,
+                                  int raw_pos,
+                                  int raw_count);
+
+void deepseek4_spec_rollback_apply(const DeepSeek4SpecRollback & rollback,
+                                   const DeepSeek4Weights & weights,
+                                   DeepSeek4Cache & cache,
+                                   int commit_pos,
+                                   bool restore_prev);
 
 // Run DSpark speculative decode: draft block_size candidates with `drafter`,
 // verify against the DS4 target in one batched forward, accept the matching

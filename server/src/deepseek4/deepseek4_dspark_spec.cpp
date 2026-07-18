@@ -9,11 +9,12 @@
 // Fast spec loop (default): ONE batched verify per step, verify width capped
 // at DS4_SPEC_Q=4 tokens (seed + 3 candidates). With q <= ratio(4) the verify
 // crosses at most one compression boundary and never aliases rolling-state
-// rows, so rejection rollback needs no KV snapshot at all:
-//   - raw ring rows are position-addressed (pos % n_swa) -> idempotent,
+// rows, so rejection rollback needs no full KV snapshot:
+//   - at-risk raw ring rows are saved before the verify and rejected rows are
+//     restored after wrap (accepted rows remain committed),
 //   - comp rows are index-addressed (pos / ratio)        -> idempotent,
 //   - n_comp / n_index_comp are pure functions of commit position,
-//   - the ONLY non-idempotent state is the ratio-4 compressor prev-half
+//   - the other non-idempotent state is the ratio-4 compressor prev-half
 //     (4 rows/state, flushed cur->prev at chunk boundaries), a few KB/layer,
 //     saved host-side before the verify and restored only when the flush
 //     happened at-or-past the rollback point.
@@ -236,19 +237,6 @@ constexpr float kConfidenceQ3Threshold = 0.30f;
 constexpr float kConfidenceQ4Threshold = 0.25f;
 
 // ── Light rollback state ────────────────────────────────────────────────
-// Only the non-position-idempotent cache pieces: the prev-half rows of every
-// ratio-4 rolling compressor state (attn + indexer) plus hc_state. Everything
-// else (raw ring, comp rows, counters) is position/index-addressed and either
-// overwritten idempotently or recomputable from the commit position.
-struct SpecRollback {
-    int cur_pos = 0;
-    struct Layer {
-        std::vector<uint8_t> attn_kv, attn_sc, idx_kv, idx_sc;
-    };
-    std::vector<Layer> layers;
-    std::vector<uint8_t> hc_state;
-};
-
 // prev-half = first 4 rows of a [comp_width, 8] ratio-4 rolling state.
 // ratio-128 states ([comp_width, 128]) are pure position rings -> skip.
 void save_prev_half(ggml_tensor * t, std::vector<uint8_t> & buf) {
@@ -263,16 +251,33 @@ void restore_prev_half(ggml_tensor * t, const std::vector<uint8_t> & buf) {
     ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
 }
 
-void spec_rollback_save(const DeepSeek4Cache & cache, SpecRollback & rb) {
-    rb.cur_pos = cache.cur_pos;
+void spec_rollback_save_impl(const DeepSeek4Cache & cache,
+                             DeepSeek4SpecRollback & rb,
+                             int raw_pos, int raw_count) {
+    rb.raw_pos = raw_pos;
+    rb.raw_count = std::max(0, raw_count);
     rb.layers.resize(cache.layers.size());
     for (size_t il = 0; il < cache.layers.size(); ++il) {
         const DeepSeek4LayerCache & lc = cache.layers[il];
-        SpecRollback::Layer & s = rb.layers[il];
+        DeepSeek4SpecRollback::Layer & s = rb.layers[il];
         save_prev_half(lc.attn_compressor.state_kv,       s.attn_kv);
         save_prev_half(lc.attn_compressor.state_score,    s.attn_sc);
         save_prev_half(lc.indexer_compressor.state_kv,    s.idx_kv);
         save_prev_half(lc.indexer_compressor.state_score, s.idx_sc);
+        s.raw_row_bytes = 0;
+        s.raw_rows.clear();
+        if (lc.raw_kv && lc.raw_kv->ne[1] > 0 && rb.raw_count > 0) {
+            s.raw_row_bytes = ggml_row_size(lc.raw_kv->type, lc.raw_kv->ne[0]);
+            s.raw_rows.resize(s.raw_row_bytes * (size_t) rb.raw_count);
+            for (int t = 0; t < rb.raw_count; ++t) {
+                int row = (rb.raw_pos + t) % (int) lc.raw_kv->ne[1];
+                if (row < 0) row += (int) lc.raw_kv->ne[1];
+                ggml_backend_tensor_get(
+                    lc.raw_kv,
+                    s.raw_rows.data() + (size_t) t * s.raw_row_bytes,
+                    (size_t) row * lc.raw_kv->nb[1], s.raw_row_bytes);
+            }
+        }
     }
     if (cache.hc_state) {
         const size_t bytes = ggml_nbytes(cache.hc_state);
@@ -286,8 +291,11 @@ void spec_rollback_save(const DeepSeek4Cache & cache, SpecRollback & rb) {
 // prev-half rows with a chunk containing rejected tokens, so put the
 // pre-verify rows back. (A boundary strictly inside the committed range is a
 // legitimate flush and must be kept.)
-void spec_rollback_apply(const SpecRollback & rb, const DeepSeek4Weights & w,
-                         DeepSeek4Cache & cache, int commit_pos, bool restore_prev) {
+void spec_rollback_apply_impl(const DeepSeek4SpecRollback & rb,
+                              const DeepSeek4Weights & w,
+                              DeepSeek4Cache & cache,
+                              int commit_pos,
+                              bool restore_prev) {
     cache.cur_pos = commit_pos;
     for (size_t il = 0; il < cache.layers.size(); ++il) {
         DeepSeek4LayerCache & lc = cache.layers[il];
@@ -295,11 +303,27 @@ void spec_rollback_apply(const SpecRollback & rb, const DeepSeek4Weights & w,
         if (ratio > 0) lc.n_comp = commit_pos / (int) ratio;
         if (ratio == 4) lc.n_index_comp = commit_pos / 4;
         if (restore_prev && il < rb.layers.size()) {
-            const SpecRollback::Layer & s = rb.layers[il];
+            const DeepSeek4SpecRollback::Layer & s = rb.layers[il];
             restore_prev_half(lc.attn_compressor.state_kv,       s.attn_kv);
             restore_prev_half(lc.attn_compressor.state_score,    s.attn_sc);
             restore_prev_half(lc.indexer_compressor.state_kv,    s.idx_kv);
             restore_prev_half(lc.indexer_compressor.state_score, s.idx_sc);
+        }
+        if (il < rb.layers.size() && lc.raw_kv && lc.raw_kv->ne[1] > 0) {
+            const DeepSeek4SpecRollback::Layer & s = rb.layers[il];
+            const int first_rejected = std::max(0, commit_pos - rb.raw_pos);
+            for (int t = first_rejected;
+                 t < rb.raw_count &&
+                 s.raw_row_bytes > 0 &&
+                 s.raw_rows.size() >= (size_t) (t + 1) * s.raw_row_bytes;
+                 ++t) {
+                int row = (rb.raw_pos + t) % (int) lc.raw_kv->ne[1];
+                if (row < 0) row += (int) lc.raw_kv->ne[1];
+                ggml_backend_tensor_set(
+                    lc.raw_kv,
+                    s.raw_rows.data() + (size_t) t * s.raw_row_bytes,
+                    (size_t) row * lc.raw_kv->nb[1], s.raw_row_bytes);
+            }
         }
     }
     if (restore_prev && cache.hc_state && !rb.hc_state.empty()) {
@@ -314,6 +338,21 @@ double spec_ms_since(SpecClock::time_point t0) {
 }
 
 }  // namespace
+
+void deepseek4_spec_rollback_save(const DeepSeek4Cache & cache,
+                                  DeepSeek4SpecRollback & rollback,
+                                  int raw_pos,
+                                  int raw_count) {
+    spec_rollback_save_impl(cache, rollback, raw_pos, raw_count);
+}
+
+void deepseek4_spec_rollback_apply(const DeepSeek4SpecRollback & rollback,
+                                   const DeepSeek4Weights & weights,
+                                   DeepSeek4Cache & cache,
+                                   int commit_pos,
+                                   bool restore_prev) {
+    spec_rollback_apply_impl(rollback, weights, cache, commit_pos, restore_prev);
+}
 
 // Batched target verify + capture: wraps the existing multi-token
 // deepseek4_step_layer_range (dynamic attention + batched HC), which never
@@ -439,7 +478,7 @@ bool run_deepseek4_dspark_spec_decode(
     DeepSeek4DFlashTarget target(target_w, target_cache, backend, snap_backend,
                                  drafter.capture_layer_ids, drafter.mask_token_id);
     DraftWeights dw = make_dspark_shim(drafter);
-    SpecRollback rollback;
+    DeepSeek4SpecRollback rollback;
     DeepSeek4StepTelemetry tel{};
     if (timing) target.set_telemetry(&tel);
 
@@ -602,7 +641,7 @@ bool run_deepseek4_dspark_spec_decode(
                 break;
             }
         } else {
-            spec_rollback_save(target_cache, rollback);
+            deepseek4_spec_rollback_save(target_cache, rollback, pos, q);
         }
         tm_save += spec_ms_since(t0);
 
@@ -619,7 +658,8 @@ bool run_deepseek4_dspark_spec_decode(
                     std::fprintf(stderr, "[ds4-spec] restore after verify failure failed\n");
                 }
             } else {
-                spec_rollback_apply(rollback, target_w, target_cache, pos, boundary_crossed);
+                deepseek4_spec_rollback_apply(
+                    rollback, target_w, target_cache, pos, boundary_crossed);
             }
             std::fprintf(stderr, "[ds4-spec] verify failed\n");
             ok = false;
@@ -674,7 +714,8 @@ bool run_deepseek4_dspark_spec_decode(
             // The prev-half flush is bad only if the boundary sits at-or-past
             // the commit point (its chunk then contains rejected tokens).
             const bool restore_prev = boundary_crossed && first_boundary >= commit_pos;
-            spec_rollback_apply(rollback, target_w, target_cache, commit_pos, restore_prev);
+            deepseek4_spec_rollback_apply(
+                rollback, target_w, target_cache, commit_pos, restore_prev);
         }
         // accept == q on the fast path: cur_pos/n_comp already exact, keep.
         tm_apply += spec_ms_since(t0);
