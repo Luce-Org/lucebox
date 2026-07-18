@@ -64,6 +64,8 @@ This produces the external V100 study's CC0 40-prompt set for tuning and a
 balanced ten-family, 100-prompt held-out set from the Apache-2.0 Stanford
 Alpaca corpus. The source output/labels are deliberately excluded: these files
 measure deterministic decode behavior and latency, not task accuracy.
+The expected generated hashes are frozen in `protocol.json`; a different hash
+is a new campaign, not a resumable continuation of this one.
 
 `http_runner.py` executes a pre-generated matrix against an OpenAI-compatible
 endpoint. It appends every failure/timeout, retries non-success cells on resume,
