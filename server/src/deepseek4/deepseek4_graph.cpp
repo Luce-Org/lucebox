@@ -1447,24 +1447,6 @@ static ggml_tensor * build_indexer_topk(
     return ggml_concat(ctx, identity, selected, 1);
 }
 
-static ggml_tensor * build_selected_comp_context(
-        ggml_context * ctx,
-        ggml_tensor * selected_rows,  // [head_dim, n_selected]
-        ggml_tensor * query_seed,     // [head_dim, 1]
-        ggml_tensor * q_template,     // [head_dim, n_head, n_tokens]
-        int head_dim) {
-    if (!selected_rows || !query_seed || !q_template || selected_rows->ne[1] <= 0) {
-        return nullptr;
-    }
-
-    ggml_tensor * score = ggml_mul_mat(ctx, selected_rows, query_seed);
-    ggml_tensor * probs = ggml_soft_max(ctx, score);
-    ggml_tensor * rows_t = ggml_cont(ctx, ggml_transpose(ctx, selected_rows));
-    ggml_tensor * context = ggml_mul_mat(ctx, rows_t, probs);
-    context = ggml_reshape_3d(ctx, context, head_dim, 1, 1);
-    return ggml_repeat(ctx, context, q_template);
-}
-
 // ─── MLA Attention Block ────────────────────────────────────────────────
 
 static ggml_tensor * build_mla_attention(
@@ -1727,7 +1709,6 @@ static ggml_tensor * build_mla_attention(
                     : layer_major_batch ? n_prior_rows + n_tokens
                     : std::min(kv_start + n_tokens, w.n_swa);
     const int n_comp_attn = masked_kv ? cached_inputs->padded_comp : n_comp_live;
-    const int n_valid_raw = std::min(kv_start + n_tokens, w.n_swa);
     const int n_attn = n_raw + n_comp_attn + n_old_rows;
     const float kq_scale = 1.0f / sqrtf((float)head_dim);
 
@@ -1889,8 +1870,6 @@ static ggml_tensor * build_mla_attention(
         score_mask = ggml_ds4_indexer_mask(
             ctx, ggml_cont(ctx, score_mask), indexer_topk, n_raw);
     }
-    (void) n_valid_raw;
-
     ggml_tensor * context = nullptr;
     bool inverse_rope_fused = false;
     const bool use_flash = attention_impl != DeepSeek4AttentionImpl::Explicit &&
@@ -5125,7 +5104,6 @@ struct Ds4LayerMajorGraphCache {
     PrefillAttentionMode mode = PrefillAttentionMode::Exact;
     int n_tokens = 0;
     int kv_start = -1;
-    uint64_t last_use = 0;
     bool ready = false;
     ggml_context * state_ctx = nullptr;
     ggml_backend_buffer_t state_buf = nullptr;
@@ -5158,14 +5136,12 @@ struct Ds4LayerMajorGraphCache {
         mode = PrefillAttentionMode::Exact;
         n_tokens = 0;
         kv_start = -1;
-        last_use = 0;
         ready = false;
     }
 };
 
 static thread_local std::array<Ds4LayerMajorGraphCache, 1>
     ds4_layer_major_graph_caches;
-static thread_local uint64_t ds4_layer_major_cache_counter = 0;
 // A separate gallocr scratch arena per shape consumes several GiB and forces
 // the 97-GiB model into managed-memory paging. Every layer executes serially,
 // so cached and uncached shapes safely rebind their transient tensors to one
@@ -5201,15 +5177,10 @@ void deepseek4_release_runtime_graphs(const DeepSeek4Weights & w) {
         return;
     }
 
-    bool released_layer_major_cache = false;
     for (auto & cache : ds4_layer_major_graph_caches) {
         if (cache.owner_ctx == owner) {
             cache.destroy();
-            released_layer_major_cache = true;
         }
-    }
-    if (released_layer_major_cache) {
-        ds4_layer_major_cache_counter = 0;
     }
 
     if (ds4_layer_major_shared_owner == owner) {
@@ -5293,7 +5264,6 @@ static int ds4_try_layer_major_prefill(
     bool cache_hit = false;
     bool cache_build = false;
     if (token_ids) {
-        ++ds4_layer_major_cache_counter;
         for (auto & candidate : ds4_layer_major_graph_caches) {
             if (candidate.matches(w, backend, cache.prefill_mode,
                                   n_tokens, kv_start)) {
@@ -5322,9 +5292,6 @@ static int ds4_try_layer_major_prefill(
                 graph_cache->layers.resize((size_t) w.n_layer);
                 cache_build = true;
             }
-        }
-        if (graph_cache) {
-            graph_cache->last_use = ds4_layer_major_cache_counter;
         }
     }
 
