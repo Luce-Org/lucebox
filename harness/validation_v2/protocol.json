@@ -1,0 +1,68 @@
+{
+  "schema": "lucebox.validation-v2.protocol/1",
+  "frozen_at": "2026-07-18",
+  "source": {
+    "lucebox": "a8465ccac803d591097b50973aaa6333a39a900f",
+    "llama_cpp": "571d0d540df04f25298d0e159e520d9fc62ed121",
+    "ruler": "e8bbff677ca2c239640dc90f93310dcf32408c93",
+    "longbench": "2e00731f8d0bff23dc4325161044d0ed8af94c1e"
+  },
+  "models": {
+    "official_qwen36_gguf_revision": "8a7ee08e8b9bfb857107ecc25a5599d2f38b76f8",
+    "local_dflash_draft_revision": "fca10ba135c9d834988e15b7d7f5aee8ebc562a7"
+  },
+  "decode_corpora": {
+    "tuning40_sha256": "7cd4dba3f443361e17760687893f6d019d6a37d580457ea23b6cbd370a0c752a",
+    "validation100_sha256": "d25db478ada08bf7ddd647eb2fc2a35e22ed6028b78d9b98bbed1b70086d9374",
+    "publication_corpus_used_for_tuning": false
+  },
+  "platforms": [
+    {"id": "dual-v100s", "compute_capability": "70", "gpu_count": 2},
+    {"id": "rtx3090", "compute_capability": "86", "gpu_count": 1}
+  ],
+  "contracts": ["autoregressive", "exact", "approximate"],
+  "local_modes": [
+    "target-ar",
+    "exact-chain",
+    "exact-ddtree",
+    "approximate-chain",
+    "approximate-ddtree"
+  ],
+  "external_validation_sweeps": {
+    "llama-dflash": [1, 2, 3, 4, 6],
+    "mtp": [1, 2, 3, 4]
+  },
+  "performance": {
+    "warmups": 2,
+    "repetitions": 5,
+    "fixed_work_tokens": 384,
+    "fixed_work_ignore_eos": true,
+    "natural_stop_token_cap": 384,
+    "concurrency": [1, 4],
+    "bootstrap_samples": 10000,
+    "bootstrap_seed": 20260718,
+    "independent_unit": "prompt"
+  },
+  "niah": {
+    "context_tokens": [32768, 65536, 131072],
+    "primary_cases_per_length": 100,
+    "control_cases_per_length": 20,
+    "depth_fractions": [0.05, 0.25, 0.5, 0.75, 0.95],
+    "scorer": "unicode-nfc-trimmed-complete-final-content-exact-equality"
+  },
+  "ruler": {
+    "suite": "rulerv1-ns",
+    "tasks": 13,
+    "cases_per_task_per_length": 20,
+    "context_tokens": [32768, 65536, 131072],
+    "official_scorers_only": true
+  },
+  "longbench": {
+    "label": "pinned six-task LongBench subset",
+    "tasks": ["qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "gov_report", "qmsum"],
+    "cases_per_task": 50,
+    "official_scorers_only": true
+  },
+  "row_statuses": ["success", "failed", "timeout", "skipped"],
+  "primary_quality_uses_postprocessing": false
+}
