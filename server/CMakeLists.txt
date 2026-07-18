@@ -258,6 +258,8 @@ add_library(dflash_common STATIC
     src/deepseek4/deepseek4_daemon.cpp
     src/deepseek4/deepseek4_layer_split_adapter.cpp
     src/deepseek4/deepseek4_target_shard_ipc_daemon.cpp
+    src/deepseek4/deepseek4_dspark.cpp
+    src/deepseek4/deepseek4_dspark_spec.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
@@ -642,6 +644,63 @@ endif()
 option(DFLASH27B_TESTS "Build numerics tests" ON)
 option(DFLASH27B_SERVER "Build dflash_server + backend_ipc_daemon" ON)
 if(DFLASH27B_TESTS)
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR DFLASH27B_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_cuda_pool_shutdown.cpp")
+        add_executable(test_cuda_pool_shutdown test/test_cuda_pool_shutdown.cpp)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            set_source_files_properties(test/test_cuda_pool_shutdown.cpp PROPERTIES LANGUAGE HIP)
+            set_target_properties(test_cuda_pool_shutdown PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        endif()
+        target_include_directories(test_cuda_pool_shutdown PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_cuda_pool_shutdown PRIVATE
+            ${DFLASH27B_GGML_BACKEND_TARGET} ggml ggml-base)
+        add_test(NAME cuda_pool_shutdown COMMAND test_cuda_pool_shutdown)
+    endif()
+
+    add_executable(test_rocmfp4 deps/llama.cpp/ggml/rocmfp4/test_rocmfp4.c)
+    target_link_libraries(test_rocmfp4 PRIVATE ggml-base)
+    if(UNIX)
+        target_link_libraries(test_rocmfp4 PRIVATE m)
+    endif()
+    add_test(NAME rocmfp4_reference COMMAND test_rocmfp4)
+
+    add_executable(test_rocmfpx deps/llama.cpp/ggml/rocmfpx/test_rocmfpx.c)
+    target_link_libraries(test_rocmfpx PRIVATE ggml-base)
+    if(UNIX)
+        target_link_libraries(test_rocmfpx PRIVATE m)
+    endif()
+    add_test(NAME rocmfpx_reference COMMAND test_rocmfpx)
+
+    if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+        add_executable(test_rocmfp4_hip_tail test/test_rocmfp4_hip_tail.cpp)
+        set_source_files_properties(test/test_rocmfp4_hip_tail.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_rocmfp4_hip_tail PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_include_directories(test_rocmfp4_hip_tail PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfp4)
+        target_link_libraries(test_rocmfp4_hip_tail PRIVATE
+            ggml
+            ggml-base
+            ${DFLASH27B_GGML_BACKEND_TARGET}
+            hip::host)
+        add_test(NAME rocmfp4_hip_tail COMMAND test_rocmfp4_hip_tail)
+
+        add_executable(test_rocmfpx_mmq test/test_rocmfpx_mmq.cpp)
+        set_source_files_properties(test/test_rocmfpx_mmq.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_rocmfpx_mmq PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_include_directories(test_rocmfpx_mmq PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfp4
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfpx)
+        target_link_libraries(test_rocmfpx_mmq PRIVATE
+            ggml
+            ggml-base
+            ${DFLASH27B_GGML_BACKEND_TARGET}
+            hip::host)
+        add_test(NAME rocmfpx_mmq COMMAND test_rocmfpx_mmq)
+    endif()
+
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash_cuda_min_sm GREATER_EQUAL 80 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
         add_executable(test_flashprefill_kernels test/test_flashprefill_kernels.cpp)
         set_target_properties(test_flashprefill_kernels PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
@@ -740,6 +799,12 @@ if(DFLASH27B_TESTS)
         add_executable(test_derived_scalars test/test_derived_scalars.cpp)
         target_include_directories(test_derived_scalars PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         add_test(NAME derived_scalars COMMAND test_derived_scalars)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_chain_rollback_policy.cpp")
+        add_executable(test_chain_rollback_policy test/test_chain_rollback_policy.cpp)
+        target_include_directories(test_chain_rollback_policy PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
+        add_test(NAME chain_rollback_policy COMMAND test_chain_rollback_policy)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash_placement.cpp")
         add_executable(test_kvflash_placement test/test_kvflash_placement.cpp)
@@ -842,6 +907,22 @@ if(DFLASH27B_TESTS)
             target_link_libraries(test_deepseek4_unit PRIVATE hip::host)
         endif()
         add_test(NAME deepseek4_unit COMMAND test_deepseek4_unit)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_dspark_load.cpp")
+        add_executable(test_ds4_dspark_load test/test_ds4_dspark_load.cpp)
+        target_include_directories(test_ds4_dspark_load PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_ds4_dspark_load PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        else()
+            target_compile_definitions(test_ds4_dspark_load PRIVATE DFLASH27B_BACKEND_CUDA=1 GGML_USE_CUDA)
+        endif()
+        target_link_libraries(test_ds4_dspark_load PRIVATE dflash_common ggml ggml-cpu ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_ds4_dspark_load PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_ds4_dspark_load PRIVATE hip::host)
+        endif()
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_draft.cpp")
         add_executable(smoke_load_draft test/smoke_load_draft.cpp)

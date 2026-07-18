@@ -19,6 +19,8 @@
 #endif
 #endif
 #include "ggml-common.h"
+#include "../../rocmfp4/rocmfp4.h"
+#include "../../rocmfpx/rocmfpx.h"
 
 #include <array>
 #include <algorithm>
@@ -106,6 +108,13 @@
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
 #    define GGML_CUDA_USE_CUB
 #endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
+
+// rocPRIM ships hipCUB, a CUB-compatible device-sort API. Enable it so argsort
+// and top-k support ncols > 1024, including DS4's long-context indexer; the
+// ordinary single-block bitonic path is limited to 1024 threads per block.
+#if defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#    define GGML_CUDA_USE_HIPCUB
+#endif  // defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 #ifdef __CUDA_ARCH_LIST__
 constexpr bool ggml_cuda_has_arch_impl(int) {
@@ -960,6 +969,48 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q8_0> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_ROCMFP4> {
+    static constexpr int qk = QK_ROCMFP4;
+    static constexpr int qr = QR_ROCMFP4;
+    static constexpr int qi = QI_ROCMFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_ROCMFP4_FAST> {
+    static constexpr int qk = QK_ROCMFP4;
+    static constexpr int qr = QR_ROCMFP4;
+    static constexpr int qi = QI_ROCMFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q2_0_ROCMFP2> {
+    static constexpr int qk = QK_ROCMFP2;
+    static constexpr int qr = QR_ROCMFP2;
+    static constexpr int qi = QI_ROCMFP2;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q3_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP3;
+    static constexpr int qr = QR_ROCMFP3;
+    static constexpr int qi = QI_ROCMFP3;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q6_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP6;
+    static constexpr int qr = QR_ROCMFP6;
+    static constexpr int qi = QI_ROCMFP6;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q8_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP8;
+    static constexpr int qr = QR_ROCMFP8;
+    static constexpr int qi = QI_ROCMFP8;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int qk = QK_MXFP4;
     static constexpr int qr = QR_MXFP4;
@@ -1466,10 +1517,14 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate = nullptr;
     const ggml_tensor * gate_bias = nullptr;
     ggml_glu_op glu_op;
+    float glu_param0 = 0.0f;
+    float glu_param1 = 0.0f;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
     const void * gate = nullptr;
     const void * gate_bias = nullptr;
     ggml_glu_op glu_op;
+    float glu_param0 = 0.0f;
+    float glu_param1 = 0.0f;
 };

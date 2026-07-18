@@ -450,6 +450,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type != GGML_TYPE_IQ1_S   &&
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
         case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_GROUPED_SRC:
             return src1->type == GGML_TYPE_F32 || src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
@@ -465,6 +466,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
         case GGML_OP_GET_ROWS_BACK:
             return src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16;
+        case GGML_OP_FLASH_ATTN_EXT:
+            // DS4 attention carries sparse-layout and fused-RoPE semantics.
+            // The generic CPU kernel does not implement that contract.
+            return !ggml_flash_attn_ext_is_ds4(op);
         case GGML_OP_OUT_PROD:
             return (src0->type == GGML_TYPE_F32 || (ggml_is_quantized(src0->type) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;

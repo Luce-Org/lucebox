@@ -1,6 +1,7 @@
 #include "cpy.cuh"
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
+#include "../../rocmfp4/rocmfp4_hip_scale.cuh"
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
@@ -117,6 +118,72 @@ static __device__ void cpy_blck_q_f32(const char * cxi, char * cdsti) {
         *(cdstf + j) = dq.x;
         *(cdstf + j + qk/2) = dq.y;
     }
+}
+
+static __device__ void cpy_blck_rocmfp4_f32(const char * cxi, char * cdsti) {
+    const block_rocmfp4 * x = (const block_rocmfp4 *) cxi;
+    float * cdstf = (float *) cdsti;
+
+    const float d0 = rocmfp4_ue4m3_to_fp32_half_finite(x->e[0]);
+    const float d1 = rocmfp4_ue4m3_to_fp32_half_finite(x->e[1]);
+
+#pragma unroll
+    for (int j = 0; j < QK_ROCMFP4/2; ++j) {
+        const uint8_t q = x->qs[j];
+        cdstf[j]                = d0 * (float) rocmfp4_decode_i8(q);
+        cdstf[j + QK_ROCMFP4/2] = d1 * (float) rocmfp4_decode_i8(q >> 4);
+    }
+}
+
+static __device__ void cpy_blck_rocmfp4_fast_f32(const char * cxi, char * cdsti) {
+    const block_rocmfp4_fast * x = (const block_rocmfp4_fast *) cxi;
+    float * cdstf = (float *) cdsti;
+
+    const float d = rocmfp4_ue4m3_to_fp32_half_finite(x->e);
+
+#pragma unroll
+    for (int j = 0; j < QK_ROCMFP4/2; ++j) {
+        const uint8_t q = x->qs[j];
+        cdstf[j]                = d * (float) rocmfp4_decode_i8(q);
+        cdstf[j + QK_ROCMFP4/2] = d * (float) rocmfp4_decode_i8(q >> 4);
+    }
+}
+
+static __global__ void cpy_rocmfp4_f32_contiguous(const block_rocmfp4 * cx, float * cdst, const int64_t ne) {
+    const int64_t packed_idx = (int64_t)blockDim.x * blockIdx.x + threadIdx.x;
+    const int64_t packed_count = (ne / QK_ROCMFP4) * (QK_ROCMFP4/2);
+
+    if (packed_idx >= packed_count) {
+        return;
+    }
+
+    const int64_t ib = packed_idx >> 4;
+    const int j = packed_idx & 0x0f;
+    const int64_t base = ib * QK_ROCMFP4;
+    const uint8_t q = cx[ib].qs[j];
+    const float d0 = rocmfp4_ue4m3_to_fp32_half_finite(cx[ib].e[0]);
+    const float d1 = rocmfp4_ue4m3_to_fp32_half_finite(cx[ib].e[1]);
+
+    cdst[base + j]                = d0 * (float) rocmfp4_decode_i8(q);
+    cdst[base + j + QK_ROCMFP4/2] = d1 * (float) rocmfp4_decode_i8(q >> 4);
+}
+
+static __global__ void cpy_rocmfp4_fast_f32_contiguous(const block_rocmfp4_fast * cx, float * cdst, const int64_t ne) {
+    const int64_t packed_idx = (int64_t)blockDim.x * blockIdx.x + threadIdx.x;
+    const int64_t packed_count = (ne / QK_ROCMFP4) * (QK_ROCMFP4/2);
+
+    if (packed_idx >= packed_count) {
+        return;
+    }
+
+    const int64_t ib = packed_idx >> 4;
+    const int j = packed_idx & 0x0f;
+    const int64_t base = ib * QK_ROCMFP4;
+    const uint8_t q = cx[ib].qs[j];
+    const float d = rocmfp4_ue4m3_to_fp32_half_finite(cx[ib].e);
+
+    cdst[base + j]                = d * (float) rocmfp4_decode_i8(q);
+    cdst[base + j + QK_ROCMFP4/2] = d * (float) rocmfp4_decode_i8(q >> 4);
 }
 
 template <cpy_kernel_t cpy_blck, int qk>
@@ -306,6 +373,56 @@ static void ggml_cpy_q4_1_f32_cuda(
     cpy_q_f32<cpy_blck_q_f32<dequantize_q4_1, QK4_1>, QK4_1><<<num_blocks, 1, 0, stream>>>(
         cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
          ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+}
+
+static void ggml_cpy_rocmfp4_f32_hip(
+    const char * cx, char * cdst, const int64_t ne,
+    const int64_t ne00, const int64_t ne01, const int64_t ne02,
+    const int64_t nb00, const int64_t nb01, const int64_t nb02,
+    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12,
+    const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13,
+    cudaStream_t stream) {
+    GGML_ASSERT(ne % QK_ROCMFP4 == 0);
+    const int64_t num_blocks = ne / QK_ROCMFP4;
+    GGML_ASSERT(num_blocks < UINT_MAX);
+    cpy_q_f32<cpy_blck_rocmfp4_f32, QK_ROCMFP4><<<num_blocks, 1, 0, stream>>>(
+        cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
+         ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+}
+
+static void ggml_cpy_rocmfp4_f32_contiguous_hip(
+    const char * cx, char * cdst, const int64_t ne, cudaStream_t stream) {
+    GGML_ASSERT(ne % QK_ROCMFP4 == 0);
+    const int64_t packed_count = (ne / QK_ROCMFP4) * (QK_ROCMFP4/2);
+    const int64_t num_blocks = (packed_count + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+    GGML_ASSERT(num_blocks < UINT_MAX);
+    cpy_rocmfp4_f32_contiguous<<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(
+        (const block_rocmfp4 *) cx, (float *) cdst, ne);
+}
+
+static void ggml_cpy_rocmfp4_fast_f32_hip(
+    const char * cx, char * cdst, const int64_t ne,
+    const int64_t ne00, const int64_t ne01, const int64_t ne02,
+    const int64_t nb00, const int64_t nb01, const int64_t nb02,
+    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12,
+    const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13,
+    cudaStream_t stream) {
+    GGML_ASSERT(ne % QK_ROCMFP4 == 0);
+    const int64_t num_blocks = ne / QK_ROCMFP4;
+    GGML_ASSERT(num_blocks < UINT_MAX);
+    cpy_q_f32<cpy_blck_rocmfp4_fast_f32, QK_ROCMFP4><<<num_blocks, 1, 0, stream>>>(
+        cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
+         ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+}
+
+static void ggml_cpy_rocmfp4_fast_f32_contiguous_hip(
+    const char * cx, char * cdst, const int64_t ne, cudaStream_t stream) {
+    GGML_ASSERT(ne % QK_ROCMFP4 == 0);
+    const int64_t packed_count = (ne / QK_ROCMFP4) * (QK_ROCMFP4/2);
+    const int64_t num_blocks = (packed_count + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+    GGML_ASSERT(num_blocks < UINT_MAX);
+    cpy_rocmfp4_fast_f32_contiguous<<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(
+        (const block_rocmfp4_fast *) cx, (float *) cdst, ne);
 }
 
 static void ggml_cpy_f32_q5_0_cuda(
@@ -556,6 +673,20 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     } else if (src0->type == GGML_TYPE_Q4_0 && src1->type == GGML_TYPE_F32) {
         ggml_cpy_q4_0_f32_cuda
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+    } else if (src0->type == GGML_TYPE_Q4_0_ROCMFP4 && src1->type == GGML_TYPE_F32) {
+        if (contiguous_srcs) {
+            ggml_cpy_rocmfp4_f32_contiguous_hip(src0_ddc, src1_ddc, ne, main_stream);
+        } else {
+            ggml_cpy_rocmfp4_f32_hip
+                    (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        }
+    } else if (src0->type == GGML_TYPE_Q4_0_ROCMFP4_FAST && src1->type == GGML_TYPE_F32) {
+        if (contiguous_srcs) {
+            ggml_cpy_rocmfp4_fast_f32_contiguous_hip(src0_ddc, src1_ddc, ne, main_stream);
+        } else {
+            ggml_cpy_rocmfp4_fast_f32_hip
+                    (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        }
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_Q4_1) {
         ggml_cpy_f32_q4_1_cuda
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);

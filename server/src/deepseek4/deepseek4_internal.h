@@ -24,8 +24,14 @@
 
 #include "internal.h"
 #include "common/layer_split_utils.h"
+#include "common/prefill_attention_mode.h"
 
 namespace dflash::common {
+
+// Layer-major prefill may schedule two 2K numerical bands while preserving
+// the raw-cache rounding boundary between them.
+inline constexpr int DS4_NUMERICAL_PREFILL_BAND = 2048;
+inline constexpr int DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS = 4096;
 
 struct MoeHybridPlacement;
 struct MoeHybridConfig;
@@ -64,6 +70,11 @@ struct DeepSeek4StepTelemetry {
     uint64_t output_us = 0;
     uint64_t sample_us = 0;
     uint64_t emit_us = 0;
+    uint64_t full_graph_build_us = 0;
+    uint64_t full_graph_alloc_us = 0;
+    uint64_t full_graph_set_us = 0;
+    uint64_t full_graph_compute_us = 0;
+    uint64_t full_graph_read_us = 0;
     int hot_selected = 0;
     int cold_selected = 0;
 };
@@ -216,6 +227,11 @@ struct DeepSeek4Weights {
 
     // MoE hybrid placement (deprecated — layer split replaces expert split)
     bool moe_hybrid       = false;
+
+    // Runtime serving policy. These values are set by the backend after the
+    // GGUF is loaded; they are not model metadata.
+    int  routed_expert_top_k = 0;  // 0 = model default (n_expert_used)
+    bool fused_decode        = false;
 };
 
 inline bool deepseek4_is_eos_tok(int tok, const DeepSeek4Weights & w) {
@@ -255,6 +271,7 @@ struct DeepSeek4Cache {
     int n_layer  = 0;
 
     std::vector<DeepSeek4LayerCache> layers;
+    PrefillAttentionMode prefill_mode = PrefillAttentionMode::Exact;
 
     // HC residual streams: [n_hc * n_embd] persistent state
     ggml_tensor * hc_state    = nullptr;  // [n_hc * n_embd]
@@ -265,6 +282,11 @@ struct DeepSeek4Cache {
 
 struct DeepSeek4Snapshot;
 
+struct DeepSeek4RawRingSpan {
+    int row = 0;
+    int count = 0;
+};
+
 // ─── Configuration ──────────────────────────────────────────────────────
 
 struct DeepSeek4BackendConfig {
@@ -272,7 +294,10 @@ struct DeepSeek4BackendConfig {
     DevicePlacement device;
     int          stream_fd    = -1;
     int          chunk        = 512;   // prefill chunk size
+    PrefillAttentionMode prefill_mode = PrefillAttentionMode::Exact;
     int          max_ctx      = 0;     // 0 = auto from SWA + compression capacity
+    int          expert_top_k = 0;     // 0 = use all model-routed experts
+    bool         fused_decode = false; // single-graph GPU decode
 };
 
 // ─── Function declarations ──────────────────────────────────────────────
@@ -288,22 +313,40 @@ bool load_deepseek4_gguf_partial(const std::string & path,
 
 void free_deepseek4_weights(DeepSeek4Weights & w);
 
+// Release graph allocators and host mirrors that retain model tensor pointers.
+// This must run before the owning ggml context is destroyed.
+void deepseek4_release_runtime_graphs(const DeepSeek4Weights & w);
+
 bool create_deepseek4_cache(ggml_backend_t backend,
                              const DeepSeek4Weights & w,
                              int max_ctx,
                              DeepSeek4Cache & out);
 
 void free_deepseek4_cache(DeepSeek4Cache & c);
+void reset_deepseek4_cache(DeepSeek4Cache & c);
+int deepseek4_previous_raw_ring_spans(
+    int kv_start,
+    int n_swa,
+    DeepSeek4RawRingSpan spans[2]);
 bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
                              ggml_backend_t snapshot_backend,
                              DeepSeek4Snapshot & out);
 bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
                                 DeepSeek4Cache & cache);
 
+// Largest prefix of [kv_start, kv_start + n_tokens) that reaches at most the
+// next learned-compressor boundary. Multi-token dynamic forwards split on
+// this prefix so state writes after a boundary cannot race ahead of pooling.
+int deepseek4_safe_compressor_batch_tokens(const DeepSeek4Weights & w,
+                                           int kv_start,
+                                           int n_tokens);
+
 // Forward: single step (prefill chunk or decode token).
 // embed: [n_embd, n_tokens] input embeddings (post-embedding lookup).
 // hc_state: [n_hc * n_embd] persistent HC residual (updated in-place).
 // Returns logits for last token.
+struct Ds4VerifyHooks;
+
 bool deepseek4_step(
     ggml_backend_t              backend,
     const DeepSeek4Weights &    w,
@@ -316,7 +359,18 @@ bool deepseek4_step(
     const int32_t *             token_ids = nullptr,
     MoeHybridStreamEngine *     stream_engine = nullptr,
     DeepSeek4StepTelemetry *    telemetry = nullptr,
-    MoeHybridRoutingStats *     routing_stats = nullptr);
+    MoeHybridRoutingStats *     routing_stats = nullptr,
+    Ds4VerifyHooks *            verify_hooks = nullptr);
+
+// Optional hooks for the DSpark spec-decode batched verify (deepseek4_dspark).
+// When set on a multi-token deepseek4_step_layer_range call they add: per-layer
+// mean-over-HC feature capture and full per-position logits. Null on the normal
+// (23 tok/s) decode path so it is completely unaffected.
+struct Ds4VerifyHooks {
+    const std::vector<int> * capture_layer_ids = nullptr;  // e.g. {40,41,42}
+    std::vector<float> *     capture_out = nullptr;         // [n_cap*n_embd * n_tokens]
+    std::vector<float> *     all_logits_out = nullptr;      // [n_vocab * n_tokens]
+};
 
 bool deepseek4_step_layer_range(
     ggml_backend_t              backend,
@@ -330,7 +384,9 @@ bool deepseek4_step_layer_range(
     int                         layer_end,
     std::vector<float> *        out_logits,
     const int32_t *             token_ids = nullptr,
-    DeepSeek4StepTelemetry *    telemetry = nullptr);
+    DeepSeek4StepTelemetry *    telemetry = nullptr,
+    bool                        allow_decode_graph_reuse = true,
+    Ds4VerifyHooks *            verify_hooks = nullptr);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,

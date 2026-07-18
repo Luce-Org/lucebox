@@ -39,7 +39,8 @@ bool build_layer_step(
     bool capture,
     int fa_window = 0,
     int kq_stride_pad = KQ_MASK_PAD,
-    bool kvflash = false);
+    bool kvflash = false,
+    bool tree_mode = false);
 
 // `kvflash`: pooled mode — KV rows go through a set_rows input
 // (sg.kv_write_rows, [n_tokens, n_head_kv] ne0-major slots) and the mask
