@@ -3015,6 +3015,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_rms_norm_back(ctx, dst);
             break;
         case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_GROUPED_SRC:
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
         case GGML_OP_MUL_MAT_ID:
@@ -5180,6 +5181,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    ggml_is_contiguous(op->src[0]) &&
                    ggml_is_contiguous(op->src[1]);
         case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_GROUPED_SRC:
         case GGML_OP_MUL_MAT_ID:
             {
                 struct ggml_tensor * a = op->src[0];
@@ -5194,7 +5196,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         ggml_nbytes(a) !=
                             ggml_backend_buffer_get_alloc_size(a->buffer, a) &&
                         a->view_src;
-                    return op->op == GGML_OP_MUL_MAT &&
+                    return op->op == GGML_OP_MUL_MAT_GROUPED_SRC &&
                            a->buffer &&
                            !ggml_backend_buft_is_cuda_split(a->buffer->buft) &&
                            ggml_is_quantized(a->type) &&
@@ -5559,6 +5561,7 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
         case GGML_OP_GET_ROWS:
             return 0;
         case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_GROUPED_SRC:
             return op->ne[1];
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_ROPE:

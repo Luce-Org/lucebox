@@ -226,7 +226,7 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
             args.device.backend == PlacementBackend::Auto
                 ? compiled_placement_backend()
                 : args.device.backend;
-        if (args.ds4_prefill_mode != PrefillAttentionMode::Exact &&
+        if (prefill_attention_mode_is_approximate(args.ds4_prefill_mode) &&
             (target_backend != PlacementBackend::Hip ||
              args.device.is_layer_split() ||
              args.remote_target_shard.enabled())) {

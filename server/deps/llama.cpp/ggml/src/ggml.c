@@ -1134,9 +1134,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DS4_INDEXER_SCORE",
 
     "DS4_INDEXER_MASK",
+
+    "MUL_MAT_GROUPED_SRC",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1257,9 +1259,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "ds4_indexer_score(q,w,k)",
 
     "ds4_indexer_mask(x,topk)",
+
+    "X*grouped(Y)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3365,16 +3369,13 @@ struct ggml_tensor * ggml_mul_mat_grouped_src(
         (size_t) flat_k * ggml_type_size(b->type), 0);
     struct ggml_tensor * result = ggml_mul_mat(ctx, a, logical);
 
-    // Keep the operation as MUL_MAT so scheduling/allocation stay generic.
-    // The accessors below keep the private tag out of backend code.
+    result->op = GGML_OP_MUL_MAT_GROUPED_SRC;
     ggml_set_op_params_i32(result, 14, (int32_t) b->ne[2]);
-    ggml_set_op_params_i32(result, 15, 0x4453474d); // "DSGM"
     return result;
 }
 
 bool ggml_mul_mat_is_grouped_src(const struct ggml_tensor * tensor) {
-    return tensor && tensor->op == GGML_OP_MUL_MAT &&
-           ggml_get_op_params_i32(tensor, 15) == 0x4453474d;
+    return tensor && tensor->op == GGML_OP_MUL_MAT_GROUPED_SRC;
 }
 
 int64_t ggml_mul_mat_grouped_src_groups(const struct ggml_tensor * tensor) {
@@ -3385,7 +3386,8 @@ int64_t ggml_mul_mat_grouped_src_groups(const struct ggml_tensor * tensor) {
 void ggml_mul_mat_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
-    GGML_ASSERT(a->op == GGML_OP_MUL_MAT);
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT ||
+                a->op == GGML_OP_MUL_MAT_GROUPED_SRC);
 
     const int32_t prec_i32 = (int32_t) prec;
 
@@ -8190,11 +8192,14 @@ struct ggml_tensor * ggml_ds4_hc_pre(
     GGML_ASSERT(ggml_is_contiguous(base));
     GGML_ASSERT(ggml_is_contiguous(hc_state));
     GGML_ASSERT(n_hc > 0 && n_hc <= 8);
+    GGML_ASSERT(mix->ne[2] == 1 && mix->ne[3] == 1);
+    GGML_ASSERT(base->ne[1] == 1 && base->ne[2] == 1 && base->ne[3] == 1);
+    GGML_ASSERT(hc_state->ne[2] == 1 && hc_state->ne[3] == 1);
     const int64_t mix_dim = 2*(int64_t)n_hc + (int64_t)n_hc*n_hc;
     const int64_t n_tokens = mix->ne[1];
     GGML_ASSERT(mix->ne[0] == mix_dim);
     GGML_ASSERT(n_tokens > 0);
-    GGML_ASSERT(ggml_nelements(base) >= mix_dim);
+    GGML_ASSERT(base->ne[0] >= mix_dim);
     GGML_ASSERT(hc_state->ne[1] == n_tokens);
     GGML_ASSERT(hc_state->ne[0] % n_hc == 0);
     const int64_t n_embd = hc_state->ne[0] / n_hc;
@@ -8235,6 +8240,8 @@ struct ggml_tensor * ggml_ds4_hc_post(
     GGML_ASSERT(split->nb[1] >= split->ne[0] * split->nb[0]);
     GGML_ASSERT(split->ne[2] == 1 && split->ne[3] == 1);
     GGML_ASSERT(n_hc > 0 && n_hc <= 8);
+    GGML_ASSERT(residual_hc->ne[2] == 1 && residual_hc->ne[3] == 1);
+    GGML_ASSERT(block_out->ne[2] == 1 && block_out->ne[3] == 1);
     const int64_t mix_dim = 2*(int64_t)n_hc + (int64_t)n_hc*n_hc;
     const int64_t n_tokens = residual_hc->ne[1];
     GGML_ASSERT(n_tokens > 0);
@@ -8270,10 +8277,13 @@ struct ggml_tensor * ggml_ds4_hc_out(
     GGML_ASSERT(ggml_is_contiguous(base));
     GGML_ASSERT(ggml_is_contiguous(hc_state));
     GGML_ASSERT(n_hc > 0 && n_hc <= 8);
+    GGML_ASSERT(mix->ne[2] == 1 && mix->ne[3] == 1);
+    GGML_ASSERT(base->ne[1] == 1 && base->ne[2] == 1 && base->ne[3] == 1);
+    GGML_ASSERT(hc_state->ne[2] == 1 && hc_state->ne[3] == 1);
     const int64_t n_tokens = hc_state->ne[1];
     GGML_ASSERT(n_tokens > 0);
     GGML_ASSERT(mix->ne[0] >= n_hc && mix->ne[1] == n_tokens);
-    GGML_ASSERT(ggml_nelements(base) >= n_hc);
+    GGML_ASSERT(base->ne[0] >= n_hc);
     GGML_ASSERT(hc_state->ne[0] % n_hc == 0);
     const int64_t n_embd = hc_state->ne[0] / n_hc;
 

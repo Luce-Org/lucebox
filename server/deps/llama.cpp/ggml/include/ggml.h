@@ -609,6 +609,10 @@ extern "C" {
 
         GGML_OP_DS4_INDEXER_MASK,  // Apply per-token DS4 indexer top-k to an attention mask
 
+        // Keep extension operations appended so established GGML op ordinals
+        // remain stable within a protocol generation.
+        GGML_OP_MUL_MAT_GROUPED_SRC,
+
         GGML_OP_COUNT,
     };
 
@@ -1453,8 +1457,11 @@ extern "C" {
             struct ggml_tensor  * b);
 
     // Matrix multiply where b is physically [K/group, N, group] but is
-    // consumed as logical [K, N]. CUDA/HIP MMQ fuses the gather into its Q8
-    // activation quantizer; this avoids materializing a group/token permute.
+    // consumed as logical [K, N]. This is a distinct operation so backends
+    // that do not implement the grouped layout reject it instead of silently
+    // treating the physical storage as an ordinary flattened matrix.
+    // CUDA/HIP MMQ fuses the gather into its Q8 activation quantizer; the CPU
+    // implementation materializes each logical activation row in scratch.
     GGML_API struct ggml_tensor * ggml_mul_mat_grouped_src(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

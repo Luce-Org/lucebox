@@ -348,7 +348,7 @@ DeepSeek4Backend::~DeepSeek4Backend() {
 
 bool DeepSeek4Backend::requires_monolithic_model() const {
     return cfg_.fused_decode ||
-           cfg_.prefill_mode != PrefillAttentionMode::Exact;
+           prefill_attention_mode_is_approximate(cfg_.prefill_mode);
 }
 
 bool DeepSeek4Backend::validate_prefill_mode() const {
@@ -392,7 +392,7 @@ bool DeepSeek4Backend::load_model() {
                      cfg_.fused_decode ? "on" : "off",
                      prefill_attention_mode_name(cfg_.prefill_mode));
         if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
-            if (cfg_.prefill_mode != PrefillAttentionMode::Exact) {
+            if (prefill_attention_mode_is_approximate(cfg_.prefill_mode)) {
                 std::fprintf(stderr,
                     "[deepseek4] monolithic HIP load required for %s prefill\n",
                     prefill_attention_mode_name(cfg_.prefill_mode));
@@ -510,6 +510,12 @@ bool DeepSeek4Backend::init() {
     }
     if (!validate_prefill_mode()) {
         return false;
+    }
+    if (prefill_attention_mode_is_approximate(cfg_.prefill_mode)) {
+        std::fprintf(stderr,
+            "[deepseek4] warning: %s prefill is approximate and may change "
+            "generated tokens; use --ds4-prefill exact for reference output\n",
+            prefill_attention_mode_name(cfg_.prefill_mode));
     }
 
     const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
@@ -759,7 +765,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     // fallback.
     const int layer_major_cap = DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
     const int chunk = (moe_hybrid_ ||
-                       cfg_.prefill_mode == PrefillAttentionMode::Exact)
+                       !prefill_attention_mode_is_approximate(cfg_.prefill_mode))
         ? 1
         : std::max(1, std::min(requested_chunk,
                                layer_major_cap));

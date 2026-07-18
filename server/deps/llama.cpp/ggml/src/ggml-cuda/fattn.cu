@@ -551,7 +551,11 @@ __global__ static void ds4_flash_attn_d512_shared_kv_kernel(
     const int comp_first = value_bounds[2];
     const int comp_last = value_bounds[3];
 
-    float * rope_tail = scores;
+    // Scoring is complete here, so the forward-RoPE tail scratch can be
+    // reused for inverse-RoPE output. Do not alias scores: different waves
+    // accumulate value dimensions concurrently, and tail writers would race
+    // readers of scores[0..63].
+    float * rope_tail = q_rope_tail;
     for (int d = tid; d < D; d += blockDim.x) {
         float acc = 0.0f;
         for (int r = raw_first; r <= raw_last; ++r) {
@@ -1678,10 +1682,11 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
         }
     }
     dim3 grid((unsigned) n_tokens, (unsigned) n_heads, 1);
-    const int score_or_rope_rows = inverse_rope.enabled ? max(n_kv, 64) : n_kv;
+    const bool needs_rope_tail = inverse_rope.enabled ||
+                                 inverse_rope.forward_q_enabled;
     const size_t shmem =
-        (size_t) (score_or_rope_rows + 2 * n_comp_blocks +
-                  (inverse_rope.forward_q_enabled ? 64 : 0)) * sizeof(float);
+        (size_t) (n_kv + 2 * n_comp_blocks +
+                  (needs_rope_tail ? 64 : 0)) * sizeof(float);
     float params[3] = {};
     memcpy(params, dst->op_params, sizeof(params));
     const float scale = params[0];

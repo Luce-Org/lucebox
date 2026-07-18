@@ -777,6 +777,8 @@ static void test_grouped_output_projection_cpu(ggml_backend_t backend) {
     ggml_set_input(grouped_t);
     ggml_tensor * output_t =
         ggml_mul_mat_grouped_src(ctx, weights_t, grouped_t);
+    TEST_ASSERT_MSG(output_t->op == GGML_OP_MUL_MAT_GROUPED_SRC,
+                    "grouped projection must use a distinct backend contract");
     ggml_set_output(output_t);
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 64, false);
     ggml_build_forward_expand(graph, output_t);
@@ -2126,6 +2128,107 @@ static void test_ds4_flash_attention_keep_cap_gpu() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_ds4_flash_attention_inverse_rope_fallback_gpu() {
+    std::fprintf(stderr,
+                 "  test_ds4_flash_attention_inverse_rope_fallback_gpu ...");
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        std::fprintf(stderr, " skipped (no GPU backend)\n");
+        return;
+    }
+
+    constexpr int head_dim = 512;
+    constexpr int raw_rows = 128;
+    constexpr int n_comp_rows = 8;
+    constexpr int n_kv = raw_rows + n_comp_rows;
+
+    ggml_context * ctx = make_test_context(3u << 20);
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) {
+        ggml_backend_free(backend);
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    ggml_tensor * q = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, head_dim, 1, 1);
+    ggml_tensor * k = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, head_dim, n_kv, 1);
+    ggml_tensor * v = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, head_dim, n_kv, 1);
+    ggml_tensor * mask = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F16, n_kv, 1);
+    ggml_tensor * output = ggml_flash_attn_ext(
+        ctx, q, k, v, mask, 1.0f / std::sqrt((float) head_dim),
+        0.0f, 0.0f);
+    // One retained compressed block selects the single-head fallback without
+    // pruning any live row. Position zero makes inverse RoPE the identity, so
+    // a row-constant V has an exact, simple reference result.
+    ggml_flash_attn_ext_set_ds4_sparse(
+        output, raw_rows, raw_rows, 4, n_comp_rows);
+    ggml_flash_attn_ext_set_ds4_inverse_rope(
+        output, 0, 10000.0f, 1.0f, 0.0f, 1.0f,
+        32.0f, 1.0f, 8192, false);
+    ggml_set_output(output);
+    TEST_ASSERT_MSG(ggml_backend_supports_op(backend, output),
+                    "GPU rejected DS4 inverse-RoPE fallback attention");
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 64, false);
+    ggml_build_forward_expand(graph, output);
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    const bool allocated = ggml_gallocr_alloc_graph(alloc, graph);
+    TEST_ASSERT_MSG(allocated,
+                    "DS4 inverse-RoPE fallback graph allocation failed");
+    if (allocated) {
+        std::vector<float> q_data(head_dim);
+        std::vector<float> k_data((size_t) head_dim * n_kv);
+        std::vector<float> v_data((size_t) head_dim * n_kv);
+        std::vector<float> expected(head_dim);
+        std::vector<ggml_fp16_t> mask_data(
+            n_kv, ggml_fp32_to_fp16(0.0f));
+        for (int d = 0; d < head_dim; ++d) {
+            q_data[(size_t) d] = ((d % 19) - 9) * 0.002f;
+            expected[(size_t) d] = ((d % 17) - 8) * 0.003f;
+        }
+        for (int row = 0; row < n_kv; ++row) {
+            for (int d = 0; d < head_dim; ++d) {
+                k_data[(size_t) row * head_dim + d] =
+                    (((row + d) % 23) - 11) * 0.002f;
+                v_data[(size_t) row * head_dim + d] = expected[(size_t) d];
+            }
+        }
+        ggml_backend_tensor_set(q, q_data.data(), 0,
+                                q_data.size() * sizeof(float));
+        ggml_backend_tensor_set(k, k_data.data(), 0,
+                                k_data.size() * sizeof(float));
+        ggml_backend_tensor_set(v, v_data.data(), 0,
+                                v_data.size() * sizeof(float));
+        ggml_backend_tensor_set(mask, mask_data.data(), 0,
+                                mask_data.size() * sizeof(ggml_fp16_t));
+        const bool computed =
+            ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        TEST_ASSERT_MSG(computed,
+                        "DS4 inverse-RoPE fallback graph compute failed");
+        if (computed) {
+            std::vector<float> actual(head_dim);
+            ggml_backend_tensor_get(output, actual.data(), 0,
+                                    actual.size() * sizeof(float));
+            for (int d = 0; d < head_dim; ++d) {
+                TEST_ASSERT_MSG(
+                    nearly_equal(actual[(size_t) d], expected[(size_t) d],
+                                 2.0e-5f, 2.0e-5f),
+                    "inverse-RoPE fallback output mismatch");
+            }
+        }
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_hc_post_strided_split_gpu() {
     std::fprintf(stderr, "  test_hc_post_strided_split_gpu ...");
     ggml_backend_t backend = ggml_backend_cuda_init(0);
@@ -2612,6 +2715,7 @@ int main() {
     test_output_graph_reuse_microbench(backend);
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
     test_ds4_flash_attention_keep_cap_gpu();
+    test_ds4_flash_attention_inverse_rope_fallback_gpu();
     test_hc_post_strided_split_gpu();
     test_hc_pre_kernel_gpu();
 #endif
