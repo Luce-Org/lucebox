@@ -181,6 +181,10 @@ contract, and every streaming or non-streaming terminal `usage` object reports
 the configured contract, effective decode mode, and fallback reason. The old
 `--seq-verify` server flag is a deprecated alias for exact mode.
 
+Containers expose the same choice through `DFLASH_SPEC_CONTRACT`, which accepts
+only `exact` (the default) or `approximate`. Attaching a draft or enabling
+DDTree does not silently change this contract.
+
 ### Compression proxy mode
 
 `dflash_server` can run as a **PFlash compression proxy** in front of any
