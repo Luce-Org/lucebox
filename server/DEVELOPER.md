@@ -120,7 +120,9 @@ cd dflash
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--host` | `0.0.0.0` | Bind address |
+| `--host` | `127.0.0.1` | Bind address; non-loopback requires auth or the explicit unsafe escape hatch |
+| `--api-key-file` / `DFLASH_API_KEY` | off | Require Bearer authentication outside health/readiness probes |
+| `--cors-allow-origin` | none | Exact browser origin allowlist; repeatable |
 | `--port` | `8080` | Port |
 | `--target` | `models/Qwen3.6-27B-Q4_K_M.gguf` | Target GGUF model |
 | `--draft` | `models/draft` | Draft model directory |

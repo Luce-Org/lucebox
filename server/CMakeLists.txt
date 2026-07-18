@@ -1070,10 +1070,17 @@ if(DFLASH27B_TESTS)
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
     enable_testing()
 
+    add_executable(test_server_security
+        test/test_server_security.cpp
+        src/server/server_security.cpp)
+    target_include_directories(test_server_security PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+    add_test(NAME server_security COMMAND test_server_security)
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
         add_executable(test_server_unit test/test_server_unit.cpp)
         target_sources(test_server_unit PRIVATE
             src/server/http_server.cpp
+            src/server/server_security.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp)
         target_include_directories(test_server_unit PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
@@ -1102,7 +1109,7 @@ if(DFLASH27B_TESTS)
 
     # 'make check' — builds test targets then runs ctest
     if(TARGET test_server_unit)
-        set(_check_deps test_server_unit)
+        set(_check_deps test_server_unit test_server_security)
         if(TARGET test_deepseek4_unit)
             list(APPEND _check_deps test_deepseek4_unit)
         endif()
@@ -1168,6 +1175,7 @@ if(DFLASH27B_SERVER)
         add_executable(dflash_server
             src/server/server_main.cpp
             src/server/http_server.cpp
+            src/server/server_security.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
         )

@@ -8,10 +8,11 @@
 //
 // Usage:
 //   dflash_server <model.gguf> [--draft <draft.gguf>] [--port 8080]
-//                              [--host 0.0.0.0] [--max-ctx 131072]
+//                              [--host 127.0.0.1] [--max-ctx 131072]
 //                              [--max-tokens 4096] [--target-device auto:0]
 
 #include "http_server.h"
+#include "server_security.h"
 #include "chat_template.h"
 #include "model_card.h"
 #include "common/backend_factory.h"
@@ -27,10 +28,15 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <climits>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -51,6 +57,36 @@ static void signal_handler(int sig) {
     if (g_server) {
         g_server->request_stop();
     }
+}
+
+static bool parse_size_limit(const char * value, size_t & out) {
+    if (!value || !*value || value[0] == '-') return false;
+    char * end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (errno == ERANGE || !end || *end != '\0' ||
+        parsed > static_cast<unsigned long long>((std::numeric_limits<size_t>::max)())) {
+        return false;
+    }
+    out = static_cast<size_t>(parsed);
+    return true;
+}
+
+static bool load_api_key_file(const char * path, std::string & out) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return false;
+    std::string value((std::istreambuf_iterator<char>(input)),
+                      std::istreambuf_iterator<char>());
+    if (value.size() > 64 * 1024) return false;
+    while (!value.empty() && (value.back() == '\n' || value.back() == '\r')) {
+        value.pop_back();
+    }
+    if (value.empty() || value.find('\n') != std::string::npos ||
+        value.find('\r') != std::string::npos) {
+        return false;
+    }
+    out = std::move(value);
+    return true;
 }
 
 static bool parse_double_list(const char * value, std::vector<double> & out) {
@@ -198,7 +234,7 @@ static void print_usage(const char * prog) {
         "Options:\n"
         "  --draft <path>       Draft model for speculative decode\n"
         "  --port <N>           Listen port (default: 8080)\n"
-        "  --host <addr>        Bind address (default: 0.0.0.0)\n"
+        "  --host <addr>        Bind address (default: 127.0.0.1)\n"
         "  --max-ctx <N>        Max context length (default: 131072)\n"
         "  --max-tokens <N>     Default max output tokens (legacy alias for\n"
         "                       --default-max-tokens; loses to --default-max-tokens\n"
@@ -235,7 +271,17 @@ static void print_usage(const char * prog) {
         "                       trimmed per step by drafter confidence; N = fixed base)\n"
         "  --adaptive-experts [tau]  MoE expert-count gating on verify batches\n"
         "                       (near-lossless; default tau 0.80 when passed)\n"
-        "  --no-cors            Disable CORS headers\n"
+        "  --cors-allow-origin <origin>\n"
+        "                       Allow one exact browser origin (repeatable; default: none)\n"
+        "  --no-cors            Deprecated compatibility alias; CORS is off by default\n"
+        "  --api-key-file <path> Read the inbound Bearer key from a file\n"
+        "                       (DFLASH_API_KEY is used when no file is passed)\n"
+        "  --allow-unauthenticated-nonloopback\n"
+        "                       Explicitly allow an unauthenticated non-loopback bind\n"
+        "  --max-header-bytes <N>       HTTP header limit (default: 32768; 0=unlimited)\n"
+        "  --max-body-bytes <N>         HTTP body limit (default: 16777216; 0=unlimited)\n"
+        "  --max-active-connections <N> Active connection limit (default: 64; 0=unlimited)\n"
+        "  --max-queued-requests <N>    Pending inference limit (default: 16; 0=unlimited)\n"
         "  --think-max-tokens <N>     Phase-1 reasoning cap when a request opts in\n"
         "                             via thinking:{type:enabled} (default: 15488 =\n"
         "                             default_max_tokens - hard_limit_reply_budget;\n"
@@ -326,6 +372,9 @@ int main(int argc, char ** argv) {
     // Parse arguments.
     BackendArgs bargs;
     ServerConfig sconfig;
+    if (const char * env_key = std::getenv("DFLASH_API_KEY")) {
+        if (*env_key) sconfig.api_key = env_key;
+    }
     bargs.model_path = argv[1];
     bool   spark_autotune = false; // --spark: self-tuning hot/cold MoE residency
     int    spark_slots = -1;       // --spark-slots: explicit cache slots/layer (-1=auto)
@@ -366,6 +415,44 @@ int main(int argc, char ** argv) {
             sconfig.port = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
             sconfig.host = argv[++i];
+        } else if (std::strcmp(argv[i], "--api-key-file") == 0 && i + 1 < argc) {
+            if (!load_api_key_file(argv[++i], sconfig.api_key)) {
+                std::fprintf(stderr, "[server] --api-key-file must name a readable, non-empty single-line file\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--allow-unauthenticated-nonloopback") == 0) {
+            sconfig.allow_unauthenticated_nonloopback = true;
+        } else if (std::strcmp(argv[i], "--cors-allow-origin") == 0 && i + 1 < argc) {
+            std::string origin = argv[++i];
+            if (!cors_origin_valid(origin)) {
+                std::fprintf(stderr, "[server] --cors-allow-origin requires an exact http(s) origin; wildcard is not allowed\n");
+                return 2;
+            }
+            sconfig.cors_allowed_origins.push_back(std::move(origin));
+        } else if (std::strcmp(argv[i], "--max-header-bytes") == 0 && i + 1 < argc) {
+            if (!parse_size_limit(argv[++i], sconfig.max_header_bytes)) {
+                std::fprintf(stderr, "[server] bad --max-header-bytes value\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--max-body-bytes") == 0 && i + 1 < argc) {
+            if (!parse_size_limit(argv[++i], sconfig.max_body_bytes)) {
+                std::fprintf(stderr, "[server] bad --max-body-bytes value\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--max-active-connections") == 0 && i + 1 < argc) {
+            size_t value = 0;
+            if (!parse_size_limit(argv[++i], value) || value > static_cast<size_t>(INT_MAX)) {
+                std::fprintf(stderr, "[server] bad --max-active-connections value\n");
+                return 2;
+            }
+            sconfig.max_active_connections = static_cast<int>(value);
+        } else if (std::strcmp(argv[i], "--max-queued-requests") == 0 && i + 1 < argc) {
+            size_t value = 0;
+            if (!parse_size_limit(argv[++i], value) || value > static_cast<size_t>(INT_MAX)) {
+                std::fprintf(stderr, "[server] bad --max-queued-requests value\n");
+                return 2;
+            }
+            sconfig.max_queued_requests = static_cast<int>(value);
         } else if (std::strcmp(argv[i], "--max-ctx") == 0 && i + 1 < argc) {
             int v = std::atoi(argv[++i]);
             sconfig.max_ctx = v;
@@ -503,7 +590,7 @@ int main(int argc, char ** argv) {
         } else if (std::strcmp(argv[i], "--spark-vram") == 0 && i + 1 < argc) {
             spark_vram_gib = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--no-cors") == 0) {
-            sconfig.enable_cors = false;
+            sconfig.cors_allowed_origins.clear();
         } else if (std::strcmp(argv[i], "--think-max-tokens") == 0 && i + 1 < argc) {
             sconfig.think_max_tokens = std::atoi(argv[++i]);
             cli_set.think_max_tokens = true;
@@ -654,6 +741,27 @@ int main(int argc, char ** argv) {
         }
     }
     if (fast_rollback_forced_off) bargs.fast_rollback = false;
+
+    if (sconfig.api_key.size() > 64 * 1024 ||
+        sconfig.api_key.find('\r') != std::string::npos ||
+        sconfig.api_key.find('\n') != std::string::npos) {
+        std::fprintf(stderr, "[server] inbound API key must be a single line no larger than 64 KiB\n");
+        return 2;
+    }
+
+    if (!is_loopback_host(sconfig.host) && sconfig.api_key.empty() &&
+        !sconfig.allow_unauthenticated_nonloopback) {
+        std::fprintf(stderr,
+            "[server] refusing unauthenticated non-loopback bind to %s; configure "
+            "DFLASH_API_KEY/--api-key-file or pass "
+            "--allow-unauthenticated-nonloopback explicitly\n",
+            sconfig.host.c_str());
+        return 2;
+    }
+    if (!is_loopback_host(sconfig.host) && sconfig.api_key.empty()) {
+        std::fprintf(stderr,
+            "[server] WARNING: unauthenticated non-loopback exposure explicitly enabled\n");
+    }
 
     if (!validate_server_placement(bargs, sconfig)) return 2;
 
@@ -1121,7 +1229,11 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
     std::fprintf(stderr, "[server] │  prefill_cache   = %d slots\n", sconfig.prefill_cache_cap);
-    std::fprintf(stderr, "[server] │  cors            = %s\n", sconfig.enable_cors ? "ON" : "off");
+    std::fprintf(stderr, "[server] │  auth            = %s\n", sconfig.api_key.empty() ? "off" : "Bearer enabled");
+    std::fprintf(stderr, "[server] │  cors_origins    = %zu\n", sconfig.cors_allowed_origins.size());
+    std::fprintf(stderr, "[server] │  http_limits     = headers=%zu body=%zu active=%d queue=%d\n",
+                 sconfig.max_header_bytes, sconfig.max_body_bytes,
+                 sconfig.max_active_connections, sconfig.max_queued_requests);
     std::fprintf(stderr, "[server] │  cache_type_k    = %s\n",
 #ifdef GGML_USE_HIP
         cache_type_k.empty() ? "q4_0 (default, HIP)" : cache_type_k.c_str());

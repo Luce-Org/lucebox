@@ -17,6 +17,7 @@
 #endif
 
 #include "http_server.h"
+#include "server_security.h"
 #include "admission.h"
 #include "sse_emitter.h"
 #include "prompt_normalize.h"
@@ -136,13 +137,36 @@ struct CurlWriteCtx {
     std::string buffer;  // accumulates non-streaming response
     std::string response_id;
     std::string model;
+    const std::atomic<bool> * cancelled;
 };
+
+static int curl_cancelled(void * userdata,
+                          curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    const auto * cancelled = static_cast<const std::atomic<bool> *>(userdata);
+    return cancelled && cancelled->load() ? 1 : 0;
+}
+
+static bool curl_client_send(int fd, const void * data, size_t len) {
+    const char * bytes = static_cast<const char *>(data);
+    size_t sent = 0;
+    while (sent < len) {
+        struct pollfd pfd{SOCK_FD(fd), POLLOUT, 0};
+        const int ready = poll(&pfd, 1, 1000);
+        if (ready <= 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
+        const ssize_t n = ::send(fd, bytes + sent, len - sent, MSG_NOSIGNAL);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        if (n <= 0) return false;
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
 
 static size_t curl_write_passthrough(char * ptr, size_t size, size_t nmemb, void * userdata) {
     size_t total = size * nmemb;
     auto * ctx = static_cast<CurlWriteCtx *>(userdata);
+    if (ctx->cancelled && ctx->cancelled->load()) return 0;
     if (ctx->streaming) {
-        ::send(ctx->client_fd, ptr, total, MSG_NOSIGNAL);
+        if (!curl_client_send(ctx->client_fd, ptr, total)) return 0;
     } else {
         ctx->buffer.append(ptr, total);
     }
@@ -152,6 +176,7 @@ static size_t curl_write_passthrough(char * ptr, size_t size, size_t nmemb, void
 static size_t curl_write_rewrite(char * ptr, size_t size, size_t nmemb, void * userdata) {
     size_t total = size * nmemb;
     auto * ctx = static_cast<CurlWriteCtx *>(userdata);
+    if (ctx->cancelled && ctx->cancelled->load()) return 0;
 
     if (!ctx->streaming) {
         ctx->buffer.append(ptr, total);
@@ -169,19 +194,19 @@ static size_t curl_write_rewrite(char * ptr, size_t size, size_t nmemb, void * u
         pos = nl + 1;
         if (line.empty() || line == "\r") {
             std::string out = "\n";
-            ::send(ctx->client_fd, out.data(), out.size(), MSG_NOSIGNAL);
+            if (!curl_client_send(ctx->client_fd, out.data(), out.size())) return 0;
             continue;
         }
         if (line.size() > 0 && line.back() == '\r') line.pop_back();
         if (line.rfind("data: ", 0) != 0) {
             line += "\n";
-            ::send(ctx->client_fd, line.data(), line.size(), MSG_NOSIGNAL);
+            if (!curl_client_send(ctx->client_fd, line.data(), line.size())) return 0;
             continue;
         }
         std::string payload = line.substr(6);
         if (payload == "[DONE]") {
             std::string out = "data: [DONE]\n\n";
-            ::send(ctx->client_fd, out.data(), out.size(), MSG_NOSIGNAL);
+            if (!curl_client_send(ctx->client_fd, out.data(), out.size())) return 0;
             continue;
         }
         try {
@@ -204,10 +229,10 @@ static size_t curl_write_rewrite(char * ptr, size_t size, size_t nmemb, void * u
                 }
             }
             std::string out = "data: " + j.dump() + "\n\n";
-            ::send(ctx->client_fd, out.data(), out.size(), MSG_NOSIGNAL);
+            if (!curl_client_send(ctx->client_fd, out.data(), out.size())) return 0;
         } catch (...) {
             std::string out = line + "\n";
-            ::send(ctx->client_fd, out.data(), out.size(), MSG_NOSIGNAL);
+            if (!curl_client_send(ctx->client_fd, out.data(), out.size())) return 0;
         }
     }
     buf.erase(0, pos);
@@ -240,7 +265,9 @@ static bool curl_forward(int client_fd, const std::string & url,
                          const std::string & api_key, const json & body,
                          bool streaming, bool rewrite_to_chat,
                          const std::string & response_id,
-                         const std::string & model) {
+                         const std::string & model,
+                         const std::string & cors_origin,
+                         const std::atomic<bool> * cancelled) {
     CURL * curl = curl_easy_init();
     if (!curl) return false;
 
@@ -260,6 +287,7 @@ static bool curl_forward(int client_fd, const std::string & url,
     ctx.chat_rewrite = rewrite_to_chat;
     ctx.response_id = response_id;
     ctx.model = model;
+    ctx.cancelled = cancelled;
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_str.c_str());
@@ -267,6 +295,9 @@ static bool curl_forward(int client_fd, const std::string & url,
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 600L);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_cancelled);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, cancelled);
 
     if (rewrite_to_chat) {
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_rewrite);
@@ -279,9 +310,17 @@ static bool curl_forward(int client_fd, const std::string & url,
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/event-stream\r\n"
             "Cache-Control: no-cache\r\n"
-            "Connection: keep-alive\r\n"
-            "\r\n";
-        ::send(client_fd, sse_header.data(), sse_header.size(), MSG_NOSIGNAL);
+            "Connection: keep-alive\r\n";
+        if (!cors_origin.empty()) {
+            sse_header += "Access-Control-Allow-Origin: " + cors_origin + "\r\n"
+                          "Vary: Origin\r\n";
+        }
+        sse_header += "\r\n";
+        if (!curl_client_send(client_fd, sse_header.data(), sse_header.size())) {
+            curl_slist_free_all(headers);
+            curl_easy_cleanup(curl);
+            return false;
+        }
     }
 
     CURLcode res = curl_easy_perform(curl);
@@ -295,24 +334,32 @@ static bool curl_forward(int client_fd, const std::string & url,
                 std::string out = chat_resp.dump();
                 std::string http =
                     "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: application/json\r\n"
-                    "Content-Length: " + std::to_string(out.size()) + "\r\n"
-                    "\r\n" + out;
-                ::send(client_fd, http.data(), http.size(), MSG_NOSIGNAL);
+                    "Content-Type: application/json\r\n";
+                if (!cors_origin.empty()) {
+                    http += "Access-Control-Allow-Origin: " + cors_origin + "\r\n"
+                            "Vary: Origin\r\n";
+                }
+                http += "Content-Length: " + std::to_string(out.size()) + "\r\n"
+                        "\r\n" + out;
+                curl_client_send(client_fd, http.data(), http.size());
             } catch (...) {
                 std::string http =
                     "HTTP/1.1 502 Bad Gateway\r\n"
                     "Content-Type: application/json\r\n"
                     "\r\n{\"error\":\"upstream response parse failed\"}";
-                ::send(client_fd, http.data(), http.size(), MSG_NOSIGNAL);
+                curl_client_send(client_fd, http.data(), http.size());
             }
         } else {
             std::string http =
                 "HTTP/1.1 200 OK\r\n"
-                "Content-Type: application/json\r\n"
-                "Content-Length: " + std::to_string(ctx.buffer.size()) + "\r\n"
-                "\r\n" + ctx.buffer;
-            ::send(client_fd, http.data(), http.size(), MSG_NOSIGNAL);
+                "Content-Type: application/json\r\n";
+            if (!cors_origin.empty()) {
+                http += "Access-Control-Allow-Origin: " + cors_origin + "\r\n"
+                        "Vary: Origin\r\n";
+            }
+            http += "Content-Length: " + std::to_string(ctx.buffer.size()) + "\r\n"
+                    "\r\n" + ctx.buffer;
+            curl_client_send(client_fd, http.data(), http.size());
         }
     }
 
@@ -341,6 +388,7 @@ static constexpr char kServerName[] = "luce-dflash";
 // handlers in handle_client() and route_request().
 static const std::vector<std::string> kApiEndpoints = {
     "GET /health",
+    "GET /ready",
     "GET /props",
     "GET /status",
     "GET /status/events",
@@ -982,7 +1030,7 @@ void HttpServer::broadcast_status() {
         }
     }
     for (int fd : dead) {
-        socket_close(fd);
+        ::shutdown(SOCK_FD(fd), SHUT_RDWR);
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
     }
@@ -1005,7 +1053,7 @@ void HttpServer::broadcast_token(const std::string & text) {
         }
     }
     for (int fd : dead) {
-        socket_close(fd);
+        ::shutdown(SOCK_FD(fd), SHUT_RDWR);
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
     }
@@ -1026,7 +1074,7 @@ void HttpServer::sse_heartbeat() {
         }
     }
     for (int fd : dead) {
-        socket_close(fd);
+        ::shutdown(SOCK_FD(fd), SHUT_RDWR);
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
     }
@@ -1047,29 +1095,24 @@ void HttpServer::shutdown() {
         socket_close(listen_fd_);
         listen_fd_ = -1;
     }
+    {
+        std::lock_guard<std::mutex> lk(clients_mu_);
+        for (int fd : client_fds_) ::shutdown(SOCK_FD(fd), SHUT_RDWR);
+    }
+    cancel_pending_jobs();
     if (worker_thread_.joinable()) {
         worker_thread_.join();
+    }
+    {
+        std::unique_lock<std::mutex> lk(clients_mu_);
+        clients_cv_.wait(lk, [this]() { return active_clients_.load() == 0; });
     }
 
     // Close SSE client connections.
     {
         std::lock_guard<std::mutex> lk(sse_mu_);
-        for (int fd : sse_fds_) socket_close(fd);
+        for (int fd : sse_fds_) ::shutdown(SOCK_FD(fd), SHUT_RDWR);
         sse_fds_.clear();
-    }
-
-    // Drain any pending jobs.
-    {
-        std::lock_guard<std::mutex> lk(queue_mu_);
-        while (queue_head_) {
-            ServerJob * j = queue_head_;
-            queue_head_ = j->next;
-            j->next = nullptr;
-            std::lock_guard<std::mutex> jlk(j->mu);
-            j->done = true;
-            j->cv.notify_one();
-        }
-        queue_tail_ = nullptr;
     }
 
     // Shutdown save: persist all tracked snapshot slots to disk.
@@ -1175,10 +1218,26 @@ int HttpServer::run() {
         int flag = 1;
         setsockopt(SOCK_FD(client_fd), IPPROTO_TCP, TCP_NODELAY, SETSOCKOPT_CAST &flag, sizeof(flag));
 
+        const int previous_clients = active_clients_.fetch_add(1);
+        if (config_.max_active_connections > 0 &&
+            previous_clients >= config_.max_active_connections) {
+            active_clients_.fetch_sub(1);
+            send_error(client_fd, 429, "too many active connections");
+            socket_close(client_fd);
+            continue;
+        }
+        {
+            std::lock_guard<std::mutex> lk(clients_mu_);
+            client_fds_.insert(client_fd);
+        }
+
         // Spawn client thread (detached — client_main owns the fd).
-        active_clients_.fetch_add(1);
         std::thread([this, client_fd]() {
             handle_client(client_fd);
+            {
+                std::lock_guard<std::mutex> lk(clients_mu_);
+                client_fds_.erase(client_fd);
+            }
             if (active_clients_.fetch_sub(1) == 1) {
                 std::lock_guard<std::mutex> lk(clients_mu_);
                 clients_cv_.notify_all();
@@ -1189,9 +1248,23 @@ int HttpServer::run() {
     // Wake the worker thread so it can observe stopping_ and exit.
     queue_cv_.notify_all();
 
-    // Wait for client threads to drain, but bound it: a client mid-stream (long
-    // SSE generation) must not hold the process resident on shutdown. After the
-    // grace period we proceed — detached client threads are torn down on exit.
+    // Wake blocked readers and queued-request waiters. Client threads retain
+    // ownership of the descriptors and perform the final close.
+    {
+        std::lock_guard<std::mutex> lk(clients_mu_);
+        for (int fd : client_fds_) {
+            ::shutdown(SOCK_FD(fd), SHUT_RDWR);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(sse_mu_);
+        for (int fd : sse_fds_) ::shutdown(SOCK_FD(fd), SHUT_RDWR);
+    }
+    cancel_pending_jobs();
+
+    // Give client threads a short grace period to drain before joining the
+    // worker. A timeout is diagnostic only; after worker cancellation completes
+    // below, run() still waits for every detached thread to release its members.
     {
         std::unique_lock<std::mutex> lk(clients_mu_);
         bool drained = clients_cv_.wait_for(
@@ -1200,7 +1273,7 @@ int HttpServer::run() {
         if (!drained) {
             std::fprintf(stderr,
                          "[server] shutdown: %d client thread(s) still active "
-                         "after grace period, exiting anyway\n",
+                         "after grace period; waiting for worker cancellation\n",
                          active_clients_.load());
         }
     }
@@ -1208,6 +1281,14 @@ int HttpServer::run() {
     // Wait for worker to finish.
     if (worker_thread_.joinable()) {
         worker_thread_.join();
+    }
+
+    // The worker is now unable to retain any stack-owned ServerJob. Wait for
+    // the corresponding detached client threads to observe completion and
+    // release their descriptors before run() returns and members can teardown.
+    {
+        std::unique_lock<std::mutex> lk(clients_mu_);
+        clients_cv_.wait(lk, [this]() { return active_clients_.load() == 0; });
     }
 
     // Persist disk cache (worker joined — no race on slot_tokens_).
@@ -1230,22 +1311,59 @@ int HttpServer::run() {
 
 void HttpServer::handle_client(int fd) {
     HttpRequest hr;
-    if (!read_http_request(fd, hr)) {
-        send_error(fd, 400, "bad HTTP request");
+    const HttpReadResult read_result = read_http_request(fd, hr);
+    if (read_result != HttpReadResult::OK) {
+        const bool too_large = read_result == HttpReadResult::HEADER_TOO_LARGE ||
+                               read_result == HttpReadResult::BODY_TOO_LARGE;
+        send_error(fd, too_large ? 413 : 400,
+                   too_large ? "HTTP request exceeds configured size limit"
+                             : "bad HTTP request");
         socket_close(fd);
         return;
     }
 
     // CORS preflight.
     if (hr.method == "OPTIONS") {
-        send_response(fd, 204, "", "");
+        if (!cors_origin_allowed(hr.origin, config_.cors_allowed_origins)) {
+            send_error(fd, 403, "origin is not allowed");
+        } else {
+            send_response(fd, 204, "", "", hr.origin);
+        }
         socket_close(fd);
         return;
     }
 
-    // Health check.
-    if (hr.method == "GET" && (hr.path == "/health" || hr.path == "/")) {
-        send_response(fd, 200, "application/json", "{\"status\":\"ok\"}\n");
+    if (!cors_origin_allowed(hr.origin, config_.cors_allowed_origins)) {
+        send_error(fd, 403, "origin is not allowed");
+        socket_close(fd);
+        return;
+    }
+
+    // Health and readiness remain unauthenticated for local orchestrators.
+    if (hr.method == "GET" && hr.path == "/health") {
+        send_response(fd, 200, "application/json", "{\"status\":\"ok\"}\n", hr.origin);
+        socket_close(fd);
+        return;
+    }
+    if (hr.method == "GET" && hr.path == "/ready") {
+        send_response(fd, stopping_.load() ? 503 : 200, "application/json",
+                      stopping_.load() ? "{\"status\":\"stopping\"}\n"
+                                       : "{\"status\":\"ready\"}\n",
+                      hr.origin);
+        socket_close(fd);
+        return;
+    }
+
+    if (!bearer_authorized(hr.authorization, config_.api_key)) {
+        send_error(fd, 401, "authentication required", hr.origin);
+        socket_close(fd);
+        return;
+    }
+
+    // Backwards-compatible root probe. Unlike /health and /ready, it follows
+    // the normal authentication boundary when auth is enabled.
+    if (hr.method == "GET" && hr.path == "/") {
+        send_response(fd, 200, "application/json", "{\"status\":\"ok\"}\n", hr.origin);
         socket_close(fd);
         return;
     }
@@ -1253,7 +1371,7 @@ void HttpServer::handle_client(int fd) {
     // Introspection: server config + cache stats + arch + capabilities.
     if (hr.method == "GET" && hr.path == "/props") {
         json body = build_props_body(config_, prefix_cache_, tool_memory_);
-        send_response(fd, 200, "application/json", body.dump() + "\n");
+        send_response(fd, 200, "application/json", body.dump() + "\n", hr.origin);
         socket_close(fd);
         return;
     }
@@ -1262,19 +1380,20 @@ void HttpServer::handle_client(int fd) {
     if (hr.method == "GET" && hr.path == "/status") {
         if (status_html_path_.empty()) {
             send_error(fd, 404,
-                "status.html not found. Set DFLASH_SHARE_DIR or place it in share/status.html");
+                "status.html not found. Set DFLASH_SHARE_DIR or place it in share/status.html",
+                hr.origin);
             socket_close(fd);
             return;
         }
         std::ifstream ifs(status_html_path_);
         if (!ifs.is_open()) {
-            send_error(fd, 500, "failed to open status.html");
+            send_error(fd, 500, "failed to open status.html", hr.origin);
             socket_close(fd);
             return;
         }
         std::ostringstream oss;
         oss << ifs.rdbuf();
-        send_response(fd, 200, "text/html; charset=utf-8", oss.str());
+        send_response(fd, 200, "text/html; charset=utf-8", oss.str(), hr.origin);
         socket_close(fd);
         return;
     }
@@ -1282,22 +1401,15 @@ void HttpServer::handle_client(int fd) {
     // Status JSON snapshot (for non-SSE clients / debugging).
     if (hr.method == "GET" && hr.path == "/status/json") {
         send_response(fd, 200, "application/json",
-            status_.to_json().dump(-1, ' ', false, json::error_handler_t::replace) + "\n");
+            status_.to_json().dump(-1, ' ', false, json::error_handler_t::replace) + "\n",
+            hr.origin);
         socket_close(fd);
         return;
     }
 
     // Status SSE stream: hold connection open and push updates.
     if (hr.method == "GET" && hr.path == "/status/events") {
-        // Send SSE headers.
-        const char * headers =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/event-stream\r\n"
-            "Cache-Control: no-cache\r\n"
-            "Connection: keep-alive\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "\r\n";
-        if (!send_all(fd, headers, std::strlen(headers))) {
+        if (!send_sse_headers(fd, hr.origin)) {
             socket_close(fd);
             return;
         }
@@ -1310,7 +1422,24 @@ void HttpServer::handle_client(int fd) {
             std::lock_guard<std::mutex> lk(sse_mu_);
             sse_fds_.push_back(fd);
         }
-        return;  // Do NOT close fd — it's now owned by the SSE broadcast loop.
+        // Keep this client thread alive so the active-connection limit includes
+        // long-lived status streams. Broadcasts only signal dead sockets; this
+        // owner performs the final close.
+        while (!stopping_.load() && !peer_disconnected(fd)) {
+            struct pollfd pfd{SOCK_FD(fd), POLLIN, 0};
+            const int ready = poll(&pfd, 1, 500);
+            // This HTTP/1.1 implementation does not support pipelining on an
+            // SSE connection. Close on any client input instead of spinning
+            // forever around unread bytes.
+            if (ready > 0 && (pfd.revents & POLLIN)) break;
+        }
+        {
+            std::lock_guard<std::mutex> lk(sse_mu_);
+            sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
+                           sse_fds_.end());
+        }
+        socket_close(fd);
+        return;
     }
 
     // Models endpoint.
@@ -1358,7 +1487,7 @@ void HttpServer::handle_client(int fd) {
                      {"supports_parallel_tool_calls", false}}
                 })}
             };
-            send_response(fd, 200, "application/json", codex_models.dump() + "\n");
+            send_response(fd, 200, "application/json", codex_models.dump() + "\n", hr.origin);
             socket_close(fd);
             return;
         }
@@ -1373,14 +1502,14 @@ void HttpServer::handle_client(int fd) {
                  {"max_context_length", config_.max_ctx}}
             })}
         };
-        send_response(fd, 200, "application/json", models.dump() + "\n");
+        send_response(fd, 200, "application/json", models.dump() + "\n", hr.origin);
         socket_close(fd);
         return;
     }
 
     // Route POST endpoints.
     if (!route_request(fd, hr)) {
-        send_error(fd, 404, "unknown endpoint");
+        send_error(fd, 404, "unknown endpoint", hr.origin);
     }
     socket_close(fd);
 }
@@ -1392,6 +1521,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                  hr.path.c_str(), hr.body.size());
 
     ParsedRequest req;
+    req.cors_origin = hr.origin;
     std::string err;
 
     try {
@@ -1464,14 +1594,16 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                 if (!apply_request_scope_override(req.disk_cache_policy,
                                                   pc["scope"].get<std::string>())) {
                     send_error(fd, 400,
-                        "prefix_cache.scope must be off, full, auto, auto:<window>, or a positive token count");
+                        "prefix_cache.scope must be off, full, auto, auto:<window>, or a positive token count",
+                        hr.origin);
                     return true;
                 }
             }
             if (pc.contains("window") && pc["window"].is_number_integer()) {
                 const int window = pc["window"].get<int>();
                 if (window <= 0 || window > 1000000) {
-                    send_error(fd, 400, "prefix_cache.window must be a positive integer");
+                    send_error(fd, 400, "prefix_cache.window must be a positive integer",
+                               hr.origin);
                     return true;
                 }
                 req.disk_cache_policy.auto_window = window;
@@ -1722,7 +1854,8 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                     tools_json);
             } catch (const std::exception & e) {
                 send_error(fd, 500,
-                    std::string("chat template (jinja) render failed: ") + e.what());
+                    std::string("chat template (jinja) render failed: ") + e.what(),
+                    hr.origin);
                 return true;
             }
         } else {
@@ -1737,12 +1870,12 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         // entirely — Anthropic's contract is just `{"input_tokens": N}`.
         if (count_tokens_only) {
             json resp = {{"input_tokens", (int)req.prompt_tokens.size()}};
-            send_response(fd, 200, "application/json", resp.dump() + "\n");
+            send_response(fd, 200, "application/json", resp.dump() + "\n", hr.origin);
             return true;
         }
 
     } catch (const std::exception & e) {
-        send_error(fd, 400, std::string("JSON parse error: ") + e.what());
+        send_error(fd, 400, std::string("JSON parse error: ") + e.what(), hr.origin);
         return true;  // handled (with error)
     }
 
@@ -1758,7 +1891,8 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                                     config_.max_ctx, pflash_will_run)) {
             send_error(fd, 400,
                        context_overflow_message(config_.max_ctx, n_prompt,
-                                                req.max_output));
+                                                req.max_output),
+                       hr.origin);
             return true;
         }
     }
@@ -1788,12 +1922,26 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
     job.fd = fd;
     job.req = std::move(req);
 
-    enqueue(&job);
+    if (!enqueue(&job)) {
+        send_error(fd, 429, "request queue is full", hr.origin);
+        return true;
+    }
 
-    // Wait for the worker to signal completion.
+    // Wait for the worker while monitoring the peer. A queued request whose
+    // caller has gone away is removed before it consumes inference time. If
+    // it is already executing, the cancellation flag reaches token callbacks.
     {
         std::unique_lock<std::mutex> lk(job.mu);
-        job.cv.wait(lk, [&]() { return job.done; });
+        while (!job.done) {
+            job.cv.wait_for(lk, std::chrono::milliseconds(100));
+            if (job.done) break;
+            if (stopping_.load() || peer_disconnected(fd)) {
+                job.cancelled.store(true);
+                lk.unlock();
+                cancel_queued(&job);
+                lk.lock();
+            }
+        }
     }
 
     return true;
@@ -1809,6 +1957,13 @@ void HttpServer::worker_loop() {
         int fd = job->fd;
         const auto & req = job->req;
         auto started_at = std::chrono::steady_clock::now();
+
+        if (job->cancelled.load()) {
+            std::lock_guard<std::mutex> lk(job->mu);
+            job->done = true;
+            job->cv.notify_one();
+            continue;
+        }
 
         // Track live status for /status page. RAII guard ensures idle on all paths.
         std::string prompt_excerpt;
@@ -1855,7 +2010,7 @@ void HttpServer::worker_loop() {
                 const char done[] = "data: [DONE]\n\n";
                 send_all(fd, done, sizeof(done) - 1);
             } else {
-                send_error(fd, status, message);
+                send_error(fd, status, message, req.cors_origin);
             }
             finish_job();
         };
@@ -1872,7 +2027,7 @@ void HttpServer::worker_loop() {
 
         // Send SSE headers (skip when proxying — curl_forward handles its own headers).
         if (req.stream && config_.pflash_upstream_base.empty()) {
-            if (!send_sse_headers(fd)) {
+            if (!send_sse_headers(fd, req.cors_origin)) {
                 finish_job();
                 continue;
             }
@@ -2304,6 +2459,10 @@ void HttpServer::worker_loop() {
 
         // ── Upstream proxy: forward to remote server if configured ────
 #ifdef DFLASH_HAS_CURL
+        if (job->cancelled.load()) {
+            finish_job();
+            continue;
+        }
         if (!config_.pflash_upstream_base.empty()) {
             const std::string & upstream = config_.pflash_upstream_base;
             const std::string & upstream_key = config_.pflash_upstream_key;
@@ -2335,7 +2494,8 @@ void HttpServer::worker_loop() {
                 curl_forward(fd, upstream + "/completions",
                              upstream_key, comp_body,
                              req.stream, /*rewrite_to_chat=*/true,
-                             req.response_id, upstream_model);
+                             req.response_id, upstream_model, req.cors_origin,
+                             &job->cancelled);
             } else {
                 json fwd_body = req.raw_body;
                 fwd_body["model"] = upstream_model;
@@ -2347,7 +2507,8 @@ void HttpServer::worker_loop() {
                 curl_forward(fd, upstream + "/chat/completions",
                              upstream_key, fwd_body,
                              req.stream, /*rewrite_to_chat=*/false,
-                             req.response_id, upstream_model);
+                             req.response_id, upstream_model, req.cors_origin,
+                             &job->cancelled);
             }
             finish_job();
             continue;
@@ -2757,6 +2918,10 @@ void HttpServer::worker_loop() {
         bool client_disconnected = false;
 
         io.on_token = [&](int32_t token) -> bool {
+            if (job->cancelled.load()) {
+                client_disconnected = true;
+                return false;
+            }
             if (client_disconnected) return false;
             completion_tokens++;
 
@@ -2866,7 +3031,9 @@ void HttpServer::worker_loop() {
         broadcast_status();
 
         GenerateResult result;
-        if (using_restore) {
+        if (job->cancelled.load()) {
+            client_disconnected = true;
+        } else if (using_restore) {
             result = backend_.restore_and_generate(cache_slot, gen_req, io);
         } else {
             result = backend_.generate(gen_req, io);
@@ -3279,7 +3446,8 @@ void HttpServer::worker_loop() {
             // Set socket back to blocking for the final send.
             int flags = sock_get_flags(fd);
             if (flags >= 0) sock_set_block(fd);
-            send_response(fd, 200, "application/json", resp.dump() + "\n");
+            send_response(fd, 200, "application/json", resp.dump() + "\n",
+                          req.cors_origin);
         }
 
         if (client_disconnected) {
@@ -3328,20 +3496,64 @@ void HttpServer::worker_loop() {
 
 // ─── Job queue ──────────────────────────────────────────────────────────
 
-void HttpServer::enqueue(ServerJob * job) {
+bool HttpServer::enqueue(ServerJob * job) {
     std::lock_guard<std::mutex> lk(queue_mu_);
     if (stopping_.load()) {
         // Server is shutting down — immediately signal job as done.
         std::lock_guard<std::mutex> jlk(job->mu);
         job->done = true;
         job->cv.notify_one();
-        return;
+        return true;
+    }
+    if (config_.max_queued_requests > 0 &&
+        queue_size_ >= static_cast<size_t>(config_.max_queued_requests)) {
+        return false;
     }
     job->next = nullptr;
     if (queue_tail_) queue_tail_->next = job;
     else queue_head_ = job;
     queue_tail_ = job;
+    ++queue_size_;
     queue_cv_.notify_one();
+    return true;
+}
+
+bool HttpServer::cancel_queued(ServerJob * job) {
+    std::lock_guard<std::mutex> lk(queue_mu_);
+    ServerJob * previous = nullptr;
+    ServerJob * current = queue_head_;
+    while (current && current != job) {
+        previous = current;
+        current = current->next;
+    }
+    if (!current) return false;
+
+    if (previous) previous->next = current->next;
+    else queue_head_ = current->next;
+    if (queue_tail_ == current) queue_tail_ = previous;
+    current->next = nullptr;
+    if (queue_size_ > 0) --queue_size_;
+    {
+        std::lock_guard<std::mutex> jlk(current->mu);
+        current->done = true;
+        current->cv.notify_one();
+    }
+    return true;
+}
+
+void HttpServer::cancel_pending_jobs() {
+    std::lock_guard<std::mutex> lk(queue_mu_);
+    while (queue_head_) {
+        ServerJob * job = queue_head_;
+        queue_head_ = job->next;
+        job->next = nullptr;
+        job->cancelled.store(true);
+        std::lock_guard<std::mutex> jlk(job->mu);
+        job->done = true;
+        job->cv.notify_one();
+    }
+    queue_tail_ = nullptr;
+    queue_size_ = 0;
 }
 
 ServerJob * HttpServer::dequeue() {
@@ -3355,27 +3567,41 @@ ServerJob * HttpServer::dequeue() {
             lk.lock();
         }
     }
-    if (!queue_head_) return nullptr;
+    if (stopping_.load() || !queue_head_) return nullptr;
     ServerJob * j = queue_head_;
     queue_head_ = j->next;
     if (!queue_head_) queue_tail_ = nullptr;
     j->next = nullptr;
+    if (queue_size_ > 0) --queue_size_;
     return j;
+}
+
+bool HttpServer::peer_disconnected(int fd) {
+    struct pollfd pfd{SOCK_FD(fd), POLLIN, 0};
+    const int pr = poll(&pfd, 1, 0);
+    if (pr < 0) return errno != EINTR;
+    if (pr == 0) return false;
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return true;
+    if (!(pfd.revents & POLLIN)) return false;
+
+    char byte;
+    const ssize_t n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+    return n == 0 || (n < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK);
 }
 
 // ─── HTTP I/O ───────────────────────────────────────────────────────────
 
-bool HttpServer::read_http_request(int fd, HttpRequest & out) {
+HttpServer::HttpReadResult HttpServer::read_http_request(int fd, HttpRequest & out) {
     std::string buf;
     buf.reserve(8192);
     char tmp[4096];
 
     // Read until we find the header/body boundary (\r\n\r\n or \n\n).
     ssize_t hend = -1;
-    while (hend < 0 && buf.size() < 65536) {
+    while (hend < 0) {
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return false;
+        if (n <= 0) return HttpReadResult::BAD_REQUEST;
         buf.append(tmp, n);
 
         // Look for end of headers.
@@ -3394,21 +3620,36 @@ bool HttpServer::read_http_request(int fd, HttpRequest & out) {
                 }
             }
         }
+        if (hend < 0 && config_.max_header_bytes > 0 &&
+            buf.size() > config_.max_header_bytes) {
+            return HttpReadResult::HEADER_TOO_LARGE;
+        }
     }
-    if (hend < 0) return false;
+    if (hend < 0) return HttpReadResult::BAD_REQUEST;
+    if (config_.max_header_bytes > 0 &&
+        static_cast<size_t>(hend) > config_.max_header_bytes) {
+        return HttpReadResult::HEADER_TOO_LARGE;
+    }
 
     // Parse request line.
     size_t line_end = buf.find('\n');
-    if (line_end == std::string::npos) return false;
+    if (line_end == std::string::npos) return HttpReadResult::BAD_REQUEST;
     std::string line = buf.substr(0, line_end);
     if (!line.empty() && line.back() == '\r') line.pop_back();
 
     // "METHOD /path HTTP/1.1"
     size_t sp1 = line.find(' ');
     size_t sp2 = line.find(' ', sp1 + 1);
-    if (sp1 == std::string::npos || sp2 == std::string::npos) return false;
+    if (sp1 == std::string::npos || sp2 == std::string::npos) {
+        return HttpReadResult::BAD_REQUEST;
+    }
     out.method = line.substr(0, sp1);
     out.path = line.substr(sp1 + 1, sp2 - sp1 - 1);
+    const std::string version = line.substr(sp2 + 1);
+    if (out.method.empty() || out.path.empty() || out.path[0] != '/' ||
+        (version != "HTTP/1.1" && version != "HTTP/1.0")) {
+        return HttpReadResult::BAD_REQUEST;
+    }
 
     // Separate query string from path.
     std::string query_string;
@@ -3419,34 +3660,81 @@ bool HttpServer::read_http_request(int fd, HttpRequest & out) {
     }
     out.query = std::move(query_string);
 
-    // Find Content-Length.
-    long content_length = 0;
-    {
-        std::string headers = buf.substr(0, hend);
-        std::string lower_headers = headers;
-        std::transform(lower_headers.begin(), lower_headers.end(),
-                       lower_headers.begin(), ::tolower);
-        size_t cl_pos = lower_headers.find("content-length:");
-        if (cl_pos != std::string::npos) {
-            size_t val_start = cl_pos + 15;
-            while (val_start < lower_headers.size() &&
-                   lower_headers[val_start] == ' ') val_start++;
-            content_length = std::strtol(headers.c_str() + val_start, nullptr, 10);
+    // Parse the small header subset used by the security boundary. Duplicate
+    // Content-Length/Authorization fields are rejected to avoid ambiguity.
+    size_t content_length = 0;
+    bool saw_content_length = false;
+    bool saw_authorization = false;
+    bool saw_origin = false;
+    size_t cursor = line_end + 1;
+    while (cursor < static_cast<size_t>(hend)) {
+        size_t end = buf.find('\n', cursor);
+        if (end == std::string::npos || end > static_cast<size_t>(hend)) {
+            end = static_cast<size_t>(hend);
+        }
+        std::string header = buf.substr(cursor, end - cursor);
+        if (!header.empty() && header.back() == '\r') header.pop_back();
+        cursor = end + 1;
+        if (header.empty()) break;
+
+        const size_t colon = header.find(':');
+        if (colon == std::string::npos || colon == 0) {
+            return HttpReadResult::BAD_REQUEST;
+        }
+        std::string name = header.substr(0, colon);
+        if (name.find_first_of(" \t") != std::string::npos) {
+            return HttpReadResult::BAD_REQUEST;
+        }
+        std::transform(name.begin(), name.end(), name.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::string value = header.substr(colon + 1);
+        const size_t first = value.find_first_not_of(" \t");
+        const size_t last = value.find_last_not_of(" \t");
+        value = first == std::string::npos ? std::string() : value.substr(first, last - first + 1);
+
+        if (name == "content-length") {
+            if (saw_content_length || value.empty() || value[0] == '-') {
+                return HttpReadResult::BAD_REQUEST;
+            }
+            char * parse_end = nullptr;
+            errno = 0;
+            const unsigned long long parsed = std::strtoull(value.c_str(), &parse_end, 10);
+            if (errno == ERANGE || !parse_end || *parse_end != '\0' ||
+                parsed > static_cast<unsigned long long>(SIZE_MAX)) {
+                return HttpReadResult::BAD_REQUEST;
+            }
+            content_length = static_cast<size_t>(parsed);
+            saw_content_length = true;
+        } else if (name == "authorization") {
+            if (saw_authorization) return HttpReadResult::BAD_REQUEST;
+            saw_authorization = true;
+            out.authorization = std::move(value);
+        } else if (name == "origin") {
+            if (saw_origin) return HttpReadResult::BAD_REQUEST;
+            saw_origin = true;
+            out.origin = std::move(value);
+        } else if (name == "transfer-encoding") {
+            // Chunked request parsing is intentionally unsupported.
+            return HttpReadResult::BAD_REQUEST;
         }
     }
 
-    if (content_length < 0 || content_length > 64 * 1024 * 1024) return false;
+    if (config_.max_body_bytes > 0 && content_length > config_.max_body_bytes) {
+        return HttpReadResult::BODY_TOO_LARGE;
+    }
 
     // Read body.
-    while ((ssize_t)buf.size() < hend + content_length) {
+    const size_t body_end = static_cast<size_t>(hend) + content_length;
+    if (body_end < static_cast<size_t>(hend)) return HttpReadResult::BODY_TOO_LARGE;
+    while (buf.size() < body_end) {
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return false;
+        if (n <= 0) return HttpReadResult::BAD_REQUEST;
         buf.append(tmp, n);
     }
 
     out.body = buf.substr(hend, content_length);
-    return true;
+    return HttpReadResult::OK;
 }
 
 bool HttpServer::send_all(int fd, const void * data, size_t len) {
@@ -3481,24 +3769,32 @@ bool HttpServer::send_all(int fd, const void * data, size_t len) {
 }
 
 bool HttpServer::send_response(int fd, int status, const std::string & content_type,
-                               const std::string & body) {
+                               const std::string & body,
+                               const std::string & cors_origin) {
     const char * reason = "OK";
     switch (status) {
         case 200: reason = "OK"; break;
         case 204: reason = "No Content"; break;
         case 400: reason = "Bad Request"; break;
+        case 401: reason = "Unauthorized"; break;
+        case 403: reason = "Forbidden"; break;
         case 404: reason = "Not Found"; break;
         case 405: reason = "Method Not Allowed"; break;
         case 413: reason = "Payload Too Large"; break;
+        case 429: reason = "Too Many Requests"; break;
         case 500: reason = "Internal Server Error"; break;
         case 503: reason = "Service Unavailable"; break;
     }
     std::string header = "HTTP/1.1 " + std::to_string(status) + " " + reason + "\r\n";
-    if (config_.enable_cors) {
-        header += "Access-Control-Allow-Origin: *\r\n"
+    if (!cors_origin.empty() &&
+        cors_origin_allowed(cors_origin, config_.cors_allowed_origins)) {
+        header += "Access-Control-Allow-Origin: " + cors_origin + "\r\n"
                   "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-                  "Access-Control-Allow-Headers: *\r\n";
+                  "Access-Control-Allow-Headers: Authorization, Content-Type\r\n"
+                  "Vary: Origin\r\n";
     }
+    if (status == 401) header += "WWW-Authenticate: Bearer\r\n";
+    if (status == 429) header += "Retry-After: 1\r\n";
     if (!content_type.empty()) {
         header += "Content-Type: " + content_type + "\r\n";
     }
@@ -3508,15 +3804,18 @@ bool HttpServer::send_response(int fd, int status, const std::string & content_t
     return send_all(fd, header.data(), header.size());
 }
 
-bool HttpServer::send_error(int fd, int status, const std::string & message) {
+bool HttpServer::send_error(int fd, int status, const std::string & message,
+                            const std::string & cors_origin) {
     json err = {{"error", {{"message", message}, {"type", "invalid_request_error"}}}};
-    return send_response(fd, status, "application/json", err.dump() + "\n");
+    return send_response(fd, status, "application/json", err.dump() + "\n", cors_origin);
 }
 
-bool HttpServer::send_sse_headers(int fd) {
+bool HttpServer::send_sse_headers(int fd, const std::string & cors_origin) {
     std::string header = "HTTP/1.1 200 OK\r\n";
-    if (config_.enable_cors) {
-        header += "Access-Control-Allow-Origin: *\r\n";
+    if (!cors_origin.empty() &&
+        cors_origin_allowed(cors_origin, config_.cors_allowed_origins)) {
+        header += "Access-Control-Allow-Origin: " + cors_origin + "\r\n"
+                  "Vary: Origin\r\n";
     }
     header += "Content-Type: text/event-stream\r\n"
               "Cache-Control: no-cache\r\n"

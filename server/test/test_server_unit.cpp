@@ -16,6 +16,7 @@
 #include "server/utf8_utils.h"
 #include "server/api_types.h"
 #include "server/http_server.h"
+#include "server/server_security.h"
 #include "server/chat_template.h"
 #include "common/sampler.h"
 #include "common/backend_precision.h"
@@ -1433,6 +1434,57 @@ static void test_pflash_config_defaults() {
     TEST_ASSERT(cfg.pflash_drafter_path.empty());
     TEST_ASSERT(!cfg.pflash_skip_park);
     TEST_ASSERT(cfg.draft_residency == DraftResidencyPolicy::Auto);
+}
+
+static void test_server_security_defaults() {
+    ServerConfig cfg;
+    TEST_ASSERT(cfg.host == "127.0.0.1");
+    TEST_ASSERT(cfg.cors_allowed_origins.empty());
+    TEST_ASSERT(cfg.api_key.empty());
+    TEST_ASSERT(cfg.max_header_bytes == 32 * 1024);
+    TEST_ASSERT(cfg.max_body_bytes == 16 * 1024 * 1024);
+    TEST_ASSERT(cfg.max_active_connections == 64);
+    TEST_ASSERT(cfg.max_queued_requests == 16);
+}
+
+static void test_server_loopback_detection() {
+    TEST_ASSERT(is_loopback_host("127.0.0.1"));
+    TEST_ASSERT(is_loopback_host("127.1.2.3"));
+    TEST_ASSERT(is_loopback_host("localhost"));
+    TEST_ASSERT(!is_loopback_host("0.0.0.0"));
+    TEST_ASSERT(!is_loopback_host("192.168.1.10"));
+    TEST_ASSERT(!is_loopback_host("127."));
+}
+
+static void test_server_bearer_auth() {
+    const std::string configured = "unit-test-key";
+    TEST_ASSERT(bearer_authorized("", ""));
+    TEST_ASSERT(!bearer_authorized("", configured));
+    TEST_ASSERT(!bearer_authorized("Basic unit-test-key", configured));
+    TEST_ASSERT(bearer_authorized("Bearer unit-test-key", configured));
+    TEST_ASSERT(bearer_authorized("bearer unit-test-key", configured));
+    TEST_ASSERT(!bearer_authorized("Bearer unit-test-kez", configured));
+    TEST_ASSERT(!bearer_authorized("Bearer unit-test-key-extra", configured));
+
+    // A length difference larger than one byte must never wrap into equality.
+    TEST_ASSERT(!bearer_authorized("Bearer " + configured + std::string(256, 'x'),
+                                   configured));
+}
+
+static void test_server_cors_allowlist() {
+    const std::vector<std::string> origins = {
+        "https://console.example.test",
+        "http://127.0.0.1:3000",
+    };
+    TEST_ASSERT(cors_origin_valid("https://console.example.test"));
+    TEST_ASSERT(!cors_origin_valid("*"));
+    TEST_ASSERT(!cors_origin_valid("https://console.example.test/path"));
+    TEST_ASSERT(cors_origin_allowed("", origins));
+    TEST_ASSERT(cors_origin_allowed("https://console.example.test", origins));
+    TEST_ASSERT(cors_origin_allowed("http://127.0.0.1:3000", origins));
+    TEST_ASSERT(!cors_origin_allowed("https://evil.example.test", origins));
+    TEST_ASSERT(!cors_origin_allowed("https://console.example.test/", origins));
+    TEST_ASSERT(!cors_origin_allowed("https://console.example.test", {}));
 }
 
 static void test_pflash_config_modes() {
@@ -4543,6 +4595,10 @@ int main() {
 
     std::fprintf(stderr, "\n── PFlash config ──\n");
     RUN_TEST(test_pflash_config_defaults);
+    RUN_TEST(test_server_security_defaults);
+    RUN_TEST(test_server_loopback_detection);
+    RUN_TEST(test_server_bearer_auth);
+    RUN_TEST(test_server_cors_allowlist);
     RUN_TEST(test_pflash_config_modes);
     RUN_TEST(test_pflash_compress_request_struct);
     RUN_TEST(test_pflash_compress_result_defaults);

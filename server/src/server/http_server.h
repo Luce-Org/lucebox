@@ -28,6 +28,7 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <cstddef>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -39,6 +40,7 @@
 #include <unistd.h>
 #endif
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace dflash::common {
@@ -50,11 +52,26 @@ struct ServerJob;
 
 // ─── Server configuration ───────────────────────────────────────────────
 struct ServerConfig {
-    std::string host        = "0.0.0.0";
+    std::string host        = "127.0.0.1";
     int         port        = 8080;
     int         max_tokens  = 4096;     // default max output tokens (legacy alias for default_max_tokens)
     int         max_ctx     = 0;        // 0 = use backend's DevicePlacement default (8192)
-    bool        enable_cors = true;
+    // Browser access is disabled unless an exact origin is allowlisted.
+    // --no-cors remains accepted as a backwards-compatible no-op.
+    std::vector<std::string> cors_allowed_origins;
+
+    // Empty means authentication is disabled. server_main refuses an
+    // unauthenticated non-loopback bind unless the operator opts into the
+    // explicit escape hatch.
+    std::string api_key;
+    bool        allow_unauthenticated_nonloopback = false;
+
+    // HTTP/admission bounds. Zero disables a particular bound, but CLI
+    // defaults are intentionally finite for safe unattended operation.
+    size_t      max_header_bytes = 32 * 1024;
+    size_t      max_body_bytes   = 16 * 1024 * 1024;
+    int         max_active_connections = 64;
+    int         max_queued_requests     = 16;
     std::string model_name  = "dflash";
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
     int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
@@ -204,6 +221,8 @@ struct ParsedRequest {
     json                      messages;
     // Original request body (for upstream proxy forwarding)
     json                      raw_body;
+    // Echoed only when it exactly matches an operator allowlist entry.
+    std::string               cors_origin;
     // Response ID
     std::string               response_id;
     // Thinking/reasoning state
@@ -280,24 +299,32 @@ private:
         std::string path;
         std::string query;  // raw query string (after '?')
         std::string body;
+        std::string authorization;
+        std::string origin;
     };
-    bool read_http_request(int fd, HttpRequest & out);
+    enum class HttpReadResult { OK, BAD_REQUEST, HEADER_TOO_LARGE, BODY_TOO_LARGE };
+    HttpReadResult read_http_request(int fd, HttpRequest & out);
 
     // Route request to appropriate parser.
     bool route_request(int fd, const HttpRequest & hr);
 
     // Send HTTP response helpers.
     bool send_response(int fd, int status, const std::string & content_type,
-                       const std::string & body);
-    bool send_error(int fd, int status, const std::string & message);
-    bool send_sse_headers(int fd);
+                       const std::string & body,
+                       const std::string & cors_origin = {});
+    bool send_error(int fd, int status, const std::string & message,
+                    const std::string & cors_origin = {});
+    bool send_sse_headers(int fd, const std::string & cors_origin = {});
 
     // Send raw bytes with stall detection.
     bool send_all(int fd, const void * data, size_t len);
 
     // Job queue.
-    void enqueue(ServerJob * job);
+    bool enqueue(ServerJob * job);
+    bool cancel_queued(ServerJob * job);
+    void cancel_pending_jobs();
     ServerJob * dequeue();
+    static bool peer_disconnected(int fd);
 
     // Members.
     ModelBackend &   backend_;
@@ -362,12 +389,14 @@ private:
     std::condition_variable         queue_cv_;
     ServerJob *                     queue_head_ = nullptr;
     ServerJob *                     queue_tail_ = nullptr;
+    size_t                          queue_size_ = 0;
     std::atomic<bool>               stopping_{false};
 
     // Active client thread tracking.
     std::atomic<int>                active_clients_{0};
     std::mutex                      clients_mu_;
     std::condition_variable         clients_cv_;
+    std::unordered_set<int>         client_fds_;
 
     // Listen socket.
     int listen_fd_ = -1;
@@ -381,6 +410,7 @@ struct ServerJob {
     std::mutex    mu;
     std::condition_variable cv;
     ServerJob *   next = nullptr;
+    std::atomic<bool> cancelled{false};
 };
 
 // ─── Parse session_id from a chat-completion JSON body ──────────────────
