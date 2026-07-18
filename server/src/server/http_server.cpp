@@ -629,7 +629,16 @@ json build_props_body(const ServerConfig & config,
         }},
         {"speculative", {
             {"enabled",       config.speculative_enabled},
-            {"ddtree_budget", config.speculative_enabled
+            {"draft_attached", !config.draft_path.empty()},
+            {"draft_loaded", config.speculative_enabled},
+            {"configured_contract",
+                std::string(speculative_contract_name(config.speculative_contract))},
+            {"supported_contracts", json::array({"exact", "approximate"})},
+            {"exact_execution", "autoregressive"},
+            {"approximate_execution", config.ddtree_enabled
+                ? json("batched_chain_or_ddtree") : json("batched_chain")},
+            {"sampling_behavior", "autoregressive_fallback"},
+            {"ddtree_budget", config.ddtree_enabled
                                 ? json(config.ddtree_budget) : json(nullptr)},
         }},
         {"sampling", {
@@ -2044,7 +2053,7 @@ void HttpServer::worker_loop() {
                                     DraftResidencyContext{
                                         DraftResidencyUse::PFlashCompress,
                                         config_.lazy_draft,
-                                        !config_.draft_path.empty(),
+                                        config_.speculative_enabled,
                                     });
 
                                 auto cresult = backend_.compress(creq);
@@ -2188,7 +2197,7 @@ void HttpServer::worker_loop() {
                                 DraftResidencyContext{
                                     DraftResidencyUse::PFlashCompress,
                                     config_.lazy_draft,
-                                    !config_.draft_path.empty(),
+                                    config_.speculative_enabled,
                                 });
                         creq.residency_action = pflash_residency;
 
@@ -2392,6 +2401,9 @@ void HttpServer::worker_loop() {
         gen_req.sampler = req.sampler;
         gen_req.do_sample = req.sampler.needs_logit_processing();
         gen_req.stream = false;  // we handle streaming via on_token callback
+        gen_req.speculative_contract = config_.speculative_contract;
+        gen_req.speculative_candidate = !config_.draft_path.empty();
+        gen_req.speculative_ddtree = config_.ddtree_enabled;
 
         // Level 2 force-close: when thinking is opted in, the server is
         // configured with a hard-limit reply budget, and we resolved the
@@ -2734,7 +2746,8 @@ void HttpServer::worker_loop() {
             full_snap_pos);
 
         // Update status page with cache/pflash/spec-decode flags.
-        status_.set_flags(using_restore, pflash_compressed, !config_.draft_path.empty());
+        status_.set_flags(using_restore, pflash_compressed,
+                          config_.speculative_enabled);
         broadcast_status();
 
         // Set up DaemonIO with on_token callback for streaming + disconnect.
@@ -2849,14 +2862,14 @@ void HttpServer::worker_loop() {
                 DraftResidencyContext{
                     DraftResidencyUse::DFlashDecode,
                     config_.lazy_draft,
-                    !config_.draft_path.empty(),
+                    config_.speculative_enabled,
                 });
 
         // Run generation (with or without restore).
         // Request-scoped draft residency ensures decode draft is loaded only
         // around the generation window, leaving room for PFlash/target state.
         if (dflash_residency == DraftResidencyAction::ReleaseAfterUse &&
-            !config_.draft_path.empty()) {
+            config_.speculative_enabled) {
             backend_.free_drafter();    // free pflash drafter (~1.4 GB) if loaded
             backend_.unpark("draft");   // reload decode draft (~3.3 GB)
         }
@@ -2873,7 +2886,7 @@ void HttpServer::worker_loop() {
         }
 
         if (dflash_residency == DraftResidencyAction::ReleaseAfterUse &&
-            !config_.draft_path.empty()) {
+            config_.speculative_enabled) {
             backend_.park("draft");
         }
 
@@ -2985,7 +2998,13 @@ void HttpServer::worker_loop() {
         // `usage.timings` (OpenAI Chat usage chunk, Anthropic
         // message_delta usage, Responses response.completed usage).
         // See docs/specs/thinking-budget.md §6.3.
-        GenTimings gen_timings{ result.prefill_s, result.decode_s };
+        GenTimings gen_timings{
+            result.prefill_s,
+            result.decode_s,
+            result.configured_speculative_contract,
+            result.effective_decode_mode,
+            result.speculative_fallback_reason,
+        };
 
         // Record performance for /status page.
         if (result.ok()) {
@@ -3163,6 +3182,7 @@ void HttpServer::worker_loop() {
                         {"reasoning_tokens", reasoning_tokens_emitted}
                     }},
                     {"timings", build_timings_json(gen_timings, total_completion_tokens)},
+                    {"speculative", build_speculative_usage_json(gen_timings)},
                     {"accept_rate", result.accept_rate}
                 };
                 resp = {
@@ -3227,6 +3247,7 @@ void HttpServer::worker_loop() {
                     {"input_tokens", (int)req.prompt_tokens.size()},
                     {"output_tokens", total_completion_tokens},
                     {"timings", build_timings_json(gen_timings, total_completion_tokens)},
+                    {"speculative", build_speculative_usage_json(gen_timings)},
                     {"accept_rate", result.accept_rate}
                 };
                 resp = {
@@ -3263,6 +3284,7 @@ void HttpServer::worker_loop() {
                     {"output_tokens", total_completion_tokens},
                     {"total_tokens", (int)req.prompt_tokens.size() + total_completion_tokens},
                     {"timings", build_timings_json(gen_timings, total_completion_tokens)},
+                    {"speculative", build_speculative_usage_json(gen_timings)},
                     {"accept_rate", result.accept_rate}
                 };
                 resp = {

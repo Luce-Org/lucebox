@@ -197,6 +197,9 @@ static void print_usage(const char * prog) {
         "\n"
         "Options:\n"
         "  --draft <path>       Draft model for speculative decode\n"
+        "  --spec-contract <exact|approximate>\n"
+        "                       Decode contract (default: exact; exact uses target AR)\n"
+        "  --seq-verify         Deprecated alias for --spec-contract exact\n"
         "  --port <N>           Listen port (default: 8080)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
         "  --max-ctx <N>        Max context length (default: 131072)\n"
@@ -365,6 +368,25 @@ int main(int argc, char ** argv) {
     for (int i = 2; i < argc; i++) {
         if (std::strcmp(argv[i], "--draft") == 0 && i + 1 < argc) {
             bargs.draft_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--spec-contract") == 0 && i + 1 < argc) {
+            if (!parse_speculative_contract(argv[++i], sconfig.speculative_contract)) {
+                std::fprintf(stderr,
+                    "Invalid --spec-contract value '%s' (expected exact or approximate)\n",
+                    argv[i]);
+                return 1;
+            }
+        } else if (std::strncmp(argv[i], "--spec-contract=", 16) == 0) {
+            if (!parse_speculative_contract(argv[i] + 16, sconfig.speculative_contract)) {
+                std::fprintf(stderr,
+                    "Invalid --spec-contract value '%s' (expected exact or approximate)\n",
+                    argv[i] + 16);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--seq-verify") == 0) {
+            sconfig.speculative_contract = SpeculativeContract::Exact;
+            std::fprintf(stderr,
+                "[server] warning: --seq-verify is deprecated; using "
+                "--spec-contract exact (target AR fallback)\n");
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             sconfig.port = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
@@ -880,12 +902,21 @@ int main(int argc, char ** argv) {
                 arch.c_str());
         }
     }
-    auto backend = create_backend(bargs);
+    BackendArgs runtime_bargs = bargs;
+    if (sconfig.speculative_contract == SpeculativeContract::Exact &&
+        runtime_bargs.draft_path) {
+        std::fprintf(stderr,
+            "[server] exact speculative contract: decode draft remains "
+            "configured for metadata but is not loaded; target AR is active\n");
+        runtime_bargs.draft_path = nullptr;
+        runtime_bargs.remote_draft = {};
+    }
+    auto backend = create_backend(runtime_bargs);
     if (!backend) {
         std::fprintf(stderr, "[server] backend creation failed\n");
         return 1;
     }
-    if (bargs.remote_draft.enabled() && bargs.draft_path &&
+    if (runtime_bargs.remote_draft.enabled() && runtime_bargs.draft_path &&
         !backend->supports_remote_draft()) {
         std::fprintf(stderr,
             "[server] detected model backend does not support remote draft execution\n");
@@ -1142,6 +1173,8 @@ int main(int argc, char ** argv) {
                              "[server] │     Use --fa-window 0 for tool-call workloads.\n");
     }
     std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");
+    std::fprintf(stderr, "[server] │  spec_contract   = %s\n",
+                 speculative_contract_name(sconfig.speculative_contract).data());
     std::fprintf(stderr, "[server] │  fast_rollback   = %s\n", bargs.fast_rollback ? "ON" : "off");
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
@@ -1188,7 +1221,9 @@ int main(int argc, char ** argv) {
     sconfig.draft_path   = bargs.draft_path ? bargs.draft_path : "";
     sconfig.fa_window    = bargs.fa_window;
     sconfig.ddtree_budget = bargs.ddtree_budget;
-    sconfig.speculative_enabled = bargs.ddtree_mode;
+    sconfig.speculative_enabled = bargs.draft_path != nullptr &&
+        sconfig.speculative_contract == SpeculativeContract::Approximate;
+    sconfig.ddtree_enabled = bargs.ddtree_mode;
     sconfig.target_sharding     = bargs.device.is_layer_split();
     // KV type: report the operator's choice if set, else the family default
     // the backend resolves (the tq3_0 auto policy was removed; laguna uses
@@ -1271,7 +1306,7 @@ int main(int argc, char ** argv) {
     }
 
     // Lazy-draft: park decode draft at startup to free VRAM (~3.3 GB).
-    if (sconfig.lazy_draft && bargs.draft_path) {
+    if (sconfig.lazy_draft && runtime_bargs.draft_path) {
         backend->park("draft");
     }
 

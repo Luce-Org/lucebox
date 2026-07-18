@@ -22,6 +22,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "sampler.h"
+#include "speculative_contract.h"
 #include "placement/draft_residency.h"
 
 namespace dflash::common {
@@ -127,6 +128,13 @@ struct GenerateRequest {
     // path returns success but emits no tokens, so each backend can route the
     // retry through its existing AR path without copying retry policy.
     bool                       force_ar_decode = false;
+    // Speculative execution is a server policy, not a claim inferred from a
+    // draft path. The native server sets `speculative_candidate` only when a
+    // decode draft is attached. Exact mode conservatively routes to target AR;
+    // existing batched verification is available only in approximate mode.
+    SpeculativeContract        speculative_contract = SpeculativeContract::Exact;
+    bool                       speculative_candidate = false;
+    bool                       speculative_ddtree = false;
 };
 
 // Stable, backend-independent generation failure categories. Backends should
@@ -197,6 +205,9 @@ struct GenerateResult {
     // to zero output for clients and should take the same AR retry path as
     // an empty token vector.
     bool                       empty_visible_output = false;
+    SpeculativeContract        configured_speculative_contract = SpeculativeContract::Exact;
+    EffectiveDecodeMode        effective_decode_mode = EffectiveDecodeMode::Autoregressive;
+    SpeculativeFallbackReason  speculative_fallback_reason = SpeculativeFallbackReason::None;
 
     bool ok() const {
         return !error.has_value();
@@ -238,16 +249,35 @@ struct ModelBackend {
     // Run a full prefill + decode cycle. Backend owns the strategy
     // (autoregressive, speculative, DDTree, …).
     GenerateResult generate(const GenerateRequest & req, const DaemonIO & io) {
-        GenerateResult result = generate_impl(req, io);
-        if (!should_retry_empty_spec_decode(req, result)) return result;
+        GenerateRequest routed = req;
+        const SpeculativeRoute route = resolve_speculative_route(
+            req.speculative_contract,
+            req.speculative_candidate,
+            req.speculative_ddtree,
+            req.do_sample || req.sampler.needs_logit_processing(),
+            req.force_ar_decode);
+        if (req.speculative_candidate && !route.use_speculative) {
+            routed.force_ar_decode = true;
+        }
+
+        GenerateResult result = generate_impl(routed, io);
+        SpeculativeFallbackReason fallback = route.fallback_reason;
+        if (!should_retry_empty_spec_decode(routed, result)) {
+            annotate_speculative_result(req, route, fallback, result);
+            return result;
+        }
 
         std::fprintf(stderr,
             "[backend] spec-decode produced zero tokens after %.3f s decode; "
             "retrying with AR decode\n",
             result.decode_s);
-        GenerateRequest retry = req;
+        GenerateRequest retry = routed;
         retry.force_ar_decode = true;
-        return merge_empty_spec_retry_result(result, generate_impl(retry, io));
+        fallback = SpeculativeFallbackReason::EmptySpeculativeOutput;
+        GenerateResult merged =
+            merge_empty_spec_retry_result(result, generate_impl(retry, io));
+        annotate_speculative_result(req, route, fallback, merged);
+        return merged;
     }
 
     virtual GenerateResult generate_impl(const GenerateRequest & req,
@@ -267,17 +297,35 @@ struct ModelBackend {
     // Backend handles the diff-prefill and decode internally.
     GenerateResult restore_and_generate(int slot, const GenerateRequest & req,
                                         const DaemonIO & io) {
-        GenerateResult result = restore_and_generate_impl(slot, req, io);
-        if (!should_retry_empty_spec_decode(req, result)) return result;
+        GenerateRequest routed = req;
+        const SpeculativeRoute route = resolve_speculative_route(
+            req.speculative_contract,
+            req.speculative_candidate,
+            req.speculative_ddtree,
+            req.do_sample || req.sampler.needs_logit_processing(),
+            req.force_ar_decode);
+        if (req.speculative_candidate && !route.use_speculative) {
+            routed.force_ar_decode = true;
+        }
+
+        GenerateResult result = restore_and_generate_impl(slot, routed, io);
+        SpeculativeFallbackReason fallback = route.fallback_reason;
+        if (!should_retry_empty_spec_decode(routed, result)) {
+            annotate_speculative_result(req, route, fallback, result);
+            return result;
+        }
 
         std::fprintf(stderr,
             "[backend] restored spec-decode slot=%d produced zero tokens after "
             "%.3f s decode; retrying with AR decode\n",
             slot, result.decode_s);
-        GenerateRequest retry = req;
+        GenerateRequest retry = routed;
         retry.force_ar_decode = true;
-        return merge_empty_spec_retry_result(result,
-                                             restore_and_generate_impl(slot, retry, io));
+        fallback = SpeculativeFallbackReason::EmptySpeculativeOutput;
+        GenerateResult merged = merge_empty_spec_retry_result(
+            result, restore_and_generate_impl(slot, retry, io));
+        annotate_speculative_result(req, route, fallback, merged);
+        return merged;
     }
 
     virtual GenerateResult restore_and_generate_impl(int slot,
@@ -304,6 +352,28 @@ struct ModelBackend {
         retry.degenerate_decode_close =
             first.degenerate_decode_close || retry.degenerate_decode_close;
         return retry;
+    }
+
+    static void annotate_speculative_result(
+            const GenerateRequest & req,
+            const SpeculativeRoute & route,
+            SpeculativeFallbackReason fallback,
+            GenerateResult & result) {
+        result.configured_speculative_contract = req.speculative_contract;
+        if (result.spec_decode_ran &&
+            fallback != SpeculativeFallbackReason::EmptySpeculativeOutput) {
+            result.effective_decode_mode = req.speculative_ddtree
+                ? EffectiveDecodeMode::ApproximateDDTree
+                : EffectiveDecodeMode::ApproximateChain;
+            result.speculative_fallback_reason = fallback;
+            return;
+        }
+        result.effective_decode_mode = EffectiveDecodeMode::Autoregressive;
+        if (fallback == SpeculativeFallbackReason::None &&
+            route.use_speculative && req.speculative_candidate) {
+            fallback = SpeculativeFallbackReason::RuntimeUnavailable;
+        }
+        result.speculative_fallback_reason = fallback;
     }
 
     // ── Snapshot serialization (for ondisk prefix cache) ─────────────

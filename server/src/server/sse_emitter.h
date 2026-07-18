@@ -9,6 +9,7 @@
 #include "tool_memory.h"
 #include "reasoning.h"
 #include "api_types.h"
+#include "common/speculative_contract.h"
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
@@ -41,6 +42,9 @@ enum class StreamMode { REASONING, CONTENT, TOOL_BUFFER };
 struct GenTimings {
     double prefill_s = 0.0;
     double decode_s  = 0.0;
+    SpeculativeContract speculative_contract = SpeculativeContract::Exact;
+    EffectiveDecodeMode effective_decode_mode = EffectiveDecodeMode::Autoregressive;
+    SpeculativeFallbackReason speculative_fallback_reason = SpeculativeFallbackReason::None;
 };
 
 // Build the `timings` sub-object emitted under `usage`.
@@ -50,6 +54,11 @@ struct GenTimings {
 //                              decode_s == 0 to avoid div-by-zero on
 //                              prefill-only / count_tokens responses)
 nlohmann::json build_timings_json(const GenTimings & t, int completion_tokens);
+
+// Stable per-request execution metadata. This is emitted identically for
+// streaming and non-streaming responses so clients can distinguish configured
+// policy from the path that actually produced the tokens.
+nlohmann::json build_speculative_usage_json(const GenTimings & t);
 
 // Manages SSE streaming for a single request.
 class SseEmitter {

@@ -150,6 +150,7 @@ Options:
   --host HOST           Bind address (default: 0.0.0.0)
   --port PORT           Bind port (default: 8080)
   --draft PATH          Draft model for speculative decoding
+  --spec-contract MODE  exact (default, target AR) or approximate (batched speculative)
   --ddtree-budget N     Speculation budget (default: 64)
   --max-ctx N           Max context length (default: 131072)
 ```

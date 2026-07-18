@@ -273,6 +273,7 @@ VOLUME ["/opt/lucebox-hub/server/models"]
 
 ENV DFLASH_HOST=0.0.0.0 \
     DFLASH_PORT=8080 \
+    DFLASH_SPEC_CONTRACT=exact \
     DFLASH_BIN=/opt/lucebox-hub/server/build/test_dflash \
     DFLASH_SERVER_BIN=/opt/lucebox-hub/server/build/dflash_server
 

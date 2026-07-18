@@ -97,6 +97,17 @@ json build_timings_json(const GenTimings & t, int completion_tokens) {
     };
 }
 
+json build_speculative_usage_json(const GenTimings & t) {
+    return json{
+        {"configured_contract", std::string(speculative_contract_name(
+            t.speculative_contract))},
+        {"effective_decode_mode", std::string(effective_decode_mode_name(
+            t.effective_decode_mode))},
+        {"fallback_reason", std::string(speculative_fallback_reason_name(
+            t.speculative_fallback_reason))},
+    };
+}
+
 // ─── Constructor ────────────────────────────────────────────────────────
 
 SseEmitter::SseEmitter(ApiFormat format,
@@ -716,6 +727,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         };
         if (timings) {
             usage_body["timings"] = build_timings_json(*timings, completion_tokens);
+            usage_body["speculative"] = build_speculative_usage_json(*timings);
         }
         json usage = {
             {"id", request_id_}, {"object", "chat.completion.chunk"},
@@ -748,6 +760,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         json anth_usage = {{"output_tokens", completion_tokens}};
         if (timings) {
             anth_usage["timings"] = build_timings_json(*timings, completion_tokens);
+            anth_usage["speculative"] = build_speculative_usage_json(*timings);
         }
         json msg_delta = {
             {"type", "message_delta"},
@@ -812,6 +825,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         };
         if (timings) {
             resp_usage["timings"] = build_timings_json(*timings, completion_tokens);
+            resp_usage["speculative"] = build_speculative_usage_json(*timings);
         }
         json shell = {
             {"id", request_id_}, {"object", "response"},

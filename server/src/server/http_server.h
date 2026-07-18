@@ -132,6 +132,8 @@ struct ServerConfig {
     int         fa_window           = 0;
     int         ddtree_budget       = 0;
     bool        speculative_enabled = false;
+    bool        ddtree_enabled = false;
+    SpeculativeContract speculative_contract = SpeculativeContract::Exact;
     bool        target_sharding     = false;
     // Prefill chunk size (bargs.chunk). Exposed at /props.runtime.chunk so
     // bench/snapshot tooling can capture the full server config — needed

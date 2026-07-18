@@ -79,12 +79,13 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target \
             test_dflash test_generate test_flash_attn_sparse test_server_unit \
-            test_deepseek4_unit -j$(nproc)
+            test_deepseek4_unit test_speculative_contract -j$(nproc)
 
       - name: Run C++ server unit tests
         run: |
           cd server/build
-          ctest --output-on-failure -R "server_unit|deepseek4_unit" --no-tests=error
+          ctest --output-on-failure \
+            -R "server_unit|deepseek4_unit|speculative_contract" --no-tests=error
 
       - name: Populate venv with cu128 torch + setuptools
         # First pass: install the workspace's default deps. dflash declares

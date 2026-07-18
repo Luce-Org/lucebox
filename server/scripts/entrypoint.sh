@@ -297,6 +297,7 @@ fi
 # share/model_cards/<name>.json). When unset, the C++ server uses its default
 # ("dflash"). Lets an operator surface the real model id without a wrapper.
 : "${DFLASH_MODEL_NAME:=}"
+: "${DFLASH_SPEC_CONTRACT:=exact}"
 # Phase-1 (thinking) cap when a request opts into thinking. Default mirrors
 # antirez/ds4 ds4_eval.c: think_max_tokens = max_tokens(16000) - hard_limit
 # reply budget(512) = 15488. The server's own hardcoded default is 10000;
@@ -494,7 +495,13 @@ CMD=("$DFLASH_SERVER_BIN" "$DFLASH_TARGET"
      --port "$DFLASH_PORT"
      --max-ctx "$DFLASH_MAX_CTX"
      --prefix-cache-slots "$DFLASH_PREFIX_CACHE_SLOTS"
-     --think-max-tokens "$DFLASH_THINK_MAX")
+     --think-max-tokens "$DFLASH_THINK_MAX"
+     --spec-contract "$DFLASH_SPEC_CONTRACT")
+
+case "$DFLASH_SPEC_CONTRACT" in
+    exact|approximate) ;;
+    *) die "DFLASH_SPEC_CONTRACT must be exact or approximate" ;;
+esac
 
 [ -n "$DRAFT_ARG" ]                && CMD+=(--draft "$DRAFT_ARG")
 [ -n "$DRAFT_ARG" ]                && CMD+=(--ddtree --ddtree-budget "$DFLASH_BUDGET")
