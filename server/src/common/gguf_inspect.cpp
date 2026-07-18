@@ -13,6 +13,36 @@
 
 namespace dflash::common {
 
+bool derive_effective_target_layer_count(const std::string & arch,
+                                         uint32_t block_count,
+                                         uint32_t nextn_predict_layers,
+                                         uint32_t & target_layer_count,
+                                         std::string & error) {
+    target_layer_count = block_count;
+    error.clear();
+
+    if (block_count == 0) {
+        error = "block_count must be greater than zero";
+        return false;
+    }
+
+    // Embedded NextN blocks are currently defined by the Qwen3.5/3.6 GGUF
+    // layout. Do not reinterpret similarly named metadata on other arches.
+    if (arch != "qwen35" && arch != "qwen35moe") {
+        return true;
+    }
+    if (nextn_predict_layers == 0) {
+        return true;
+    }
+    if (nextn_predict_layers >= block_count) {
+        error = "nextn_predict_layers must be smaller than block_count";
+        return false;
+    }
+
+    target_layer_count = block_count - nextn_predict_layers;
+    return true;
+}
+
 GgufModelInfo inspect_gguf_model_info(const char * path) {
     GgufModelInfo info;
 
@@ -35,12 +65,26 @@ GgufModelInfo inspect_gguf_model_info(const char * path) {
         if (v) info.name = v;
     }
 
-    // Read layer count: <arch>.block_count
+    // Read target layer count. Qwen3.5/3.6 GGUFs can include trailing
+    // embedded MTP blocks in block_count.
     if (!info.arch.empty()) {
-        std::string key = info.arch + ".block_count";
-        int64_t kid = gguf_find_key(gctx, key.c_str());
-        if (kid >= 0) {
-            info.n_layer = (int)gguf_get_val_u32(gctx, kid);
+        const std::string block_key = info.arch + ".block_count";
+        const int64_t block_id = gguf_find_key(gctx, block_key.c_str());
+        if (block_id >= 0) {
+            const uint32_t block_count = gguf_get_val_u32(gctx, block_id);
+
+            const std::string nextn_key = info.arch + ".nextn_predict_layers";
+            const int64_t nextn_id = gguf_find_key(gctx, nextn_key.c_str());
+            const uint32_t nextn = nextn_id >= 0
+                ? gguf_get_val_u32(gctx, nextn_id)
+                : 0;
+
+            uint32_t target_layers = 0;
+            std::string error;
+            if (derive_effective_target_layer_count(
+                    info.arch, block_count, nextn, target_layers, error)) {
+                info.n_layer = (int)target_layers;
+            }
         }
     }
 

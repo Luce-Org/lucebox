@@ -34,6 +34,7 @@
 #include "common/kvflash_pager.h"
 #include "placement/draft_residency.h"
 #include "common/gguf_bounds.h"
+#include "common/gguf_inspect.h"
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
 #include "qwen3_drafter_model.h"
@@ -5421,4 +5422,34 @@ TEST_CASE(ServerUnitFixture, test_gguf_bounds_error_reports_operands) {
     const std::string o = gguf_bounds_error("target GGUF", "t", "f32",
                                             kMax, 10, 10, 100);
     TEST_ASSERT(o.find("overflow") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_qwen35_embedded_mtp_target_layer_count) {
+    uint32_t target_layers = 0;
+    std::string error;
+
+    TEST_ASSERT(derive_effective_target_layer_count(
+        "qwen35", 64, 0, target_layers, error));
+    TEST_ASSERT(target_layers == 64);
+
+    TEST_ASSERT(derive_effective_target_layer_count(
+        "qwen35", 65, 1, target_layers, error));
+    TEST_ASSERT(target_layers == 64);
+
+    TEST_ASSERT(derive_effective_target_layer_count(
+        "qwen35moe", 81, 1, target_layers, error));
+    TEST_ASSERT(target_layers == 80);
+
+    TEST_ASSERT(!derive_effective_target_layer_count(
+        "qwen35", 1, 1, target_layers, error));
+    TEST_ASSERT(error.find("smaller than block_count") != std::string::npos);
+
+    TEST_ASSERT(!derive_effective_target_layer_count(
+        "qwen35", 0, 0, target_layers, error));
+    TEST_ASSERT(error.find("greater than zero") != std::string::npos);
+
+    // Do not reinterpret similarly named metadata for unrelated architectures.
+    TEST_ASSERT(derive_effective_target_layer_count(
+        "laguna", 65, 1, target_layers, error));
+    TEST_ASSERT(target_layers == 65);
 }

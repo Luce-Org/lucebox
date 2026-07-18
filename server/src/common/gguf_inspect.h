@@ -13,12 +13,22 @@ namespace dflash::common {
 struct GgufModelInfo {
     std::string arch;       // e.g. "qwen35", "laguna", "qwen3", "gemma4"
     std::string name;       // optional general.name display string
-    int         n_layer = -1;
+    int         n_layer = -1;  // target layers used for inference
 };
 
 // Read architecture, display name, and layer count from a GGUF file.
 // Returns info with arch="" and n_layer=-1 on failure.
 GgufModelInfo inspect_gguf_model_info(const char * path);
+
+// Derive the inference target layer count from GGUF metadata. Qwen3.5/3.6
+// checkpoints may append embedded NextN/MTP predictor blocks after the target
+// transformer. Those blocks are not target layers and must not participate in
+// target placement or full-attention interval validation.
+bool derive_effective_target_layer_count(const std::string & arch,
+                                         uint32_t block_count,
+                                         uint32_t nextn_predict_layers,
+                                         uint32_t & target_layer_count,
+                                         std::string & error);
 
 // Richer GGUF identity captured at server startup and re-emitted at /props.
 // All header values are best-effort: missing keys leave the corresponding

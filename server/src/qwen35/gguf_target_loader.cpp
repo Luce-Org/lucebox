@@ -45,6 +45,7 @@
 
 #include "internal.h"
 #include "common/derived_scalars.h"
+#include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
 #include "common/gguf_mmap.h"
 #include "common/gguf_bounds.h"
@@ -173,6 +174,36 @@ static bool should_load_target_tensor(const char * name,
         return true;
     }
     return false;
+}
+
+static bool validate_embedded_nextn_blocks(const gguf_context * gctx,
+                                           uint32_t target_layer_count,
+                                           uint32_t block_count,
+                                           std::string & err) {
+    if (target_layer_count == block_count) return true;
+
+    const int64_t n_tensors = gguf_get_n_tensors(gctx);
+    for (uint32_t il = target_layer_count; il < block_count; ++il) {
+        const std::string prefix = "blk." + std::to_string(il) + ".nextn.";
+        bool found_nextn_tensor = false;
+        for (int64_t tid = 0; tid < n_tensors; ++tid) {
+            const char * name = gguf_get_tensor_name(gctx, tid);
+            if (name && std::strncmp(name, prefix.c_str(), prefix.size()) == 0) {
+                found_nextn_tensor = true;
+                break;
+            }
+        }
+        if (!found_nextn_tensor) {
+            char buf[256];
+            std::snprintf(
+                buf, sizeof(buf),
+                "GGUF declares embedded NextN block %u but has no tensor with prefix '%s'",
+                il, prefix.c_str());
+            err = buf;
+            return false;
+        }
+    }
+    return true;
 }
 
 struct TargetTensorAlloc {
@@ -329,7 +360,32 @@ bool load_target_gguf_partial(const std::string & path,
 
     const uint32_t n_embd  = get_u32_or(gctx, key("embedding_length").c_str(), 0);
     const uint32_t n_ff    = get_u32_or(gctx, key("feed_forward_length").c_str(), 0);
-    const uint32_t n_layer = get_u32_or(gctx, key("block_count").c_str(), 0);
+    const uint32_t block_count = get_u32_or(gctx, key("block_count").c_str(), 0);
+    const uint32_t nextn_predict_layers =
+        get_u32_or(gctx, key("nextn_predict_layers").c_str(), 0);
+    uint32_t n_layer = 0;
+    if (!derive_effective_target_layer_count(
+            arch_str, block_count, nextn_predict_layers, n_layer, err)) {
+        set_last_error("invalid target layer metadata: " + err);
+        ggml_free(meta_ctx);
+        gguf_free(gctx);
+        return false;
+    }
+    if (!validate_embedded_nextn_blocks(gctx, n_layer, block_count, err)) {
+        set_last_error(err);
+        ggml_free(meta_ctx);
+        gguf_free(gctx);
+        return false;
+    }
+    if (nextn_predict_layers > 0) {
+        std::fprintf(
+            stderr,
+            "[loader] ignoring %u embedded NextN/MTP block%s: "
+            "target_layers=%u total_blocks=%u\n",
+            nextn_predict_layers,
+            nextn_predict_layers == 1 ? "" : "s",
+            n_layer, block_count);
+    }
     const uint32_t n_head  = get_u32_or(gctx, key("attention.head_count").c_str(), 0);
     const uint32_t n_headkv= get_u32_or(gctx, key("attention.head_count_kv").c_str(), 0);
     const uint32_t kl      = get_u32_or(gctx, key("attention.key_length").c_str(), 0);
@@ -361,10 +417,12 @@ bool load_target_gguf_partial(const std::string & path,
     if (invalid_common || invalid_dense || invalid_moe) {
         char buf[512];
         std::snprintf(buf, sizeof(buf),
-            "invalid %s hparams: n_embd=%u n_layer=%u n_head=%u n_head_kv=%u "
+            "invalid %s hparams: n_embd=%u n_layer=%u block_count=%u "
+            "nextn=%u n_head=%u n_head_kv=%u "
             "kl=%u vl=%u n_ff=%u n_ff_exp=%u n_ff_shexp=%u n_expert=%u used=%u "
             "fai=%u ssm{conv=%u inner=%u state=%u dt=%u grp=%u}",
-            arch_str.c_str(), n_embd, n_layer, n_head, n_headkv, kl, vl, n_ff,
+            arch_str.c_str(), n_embd, n_layer, block_count,
+            nextn_predict_layers, n_head, n_headkv, kl, vl, n_ff,
             n_ff_exp, n_ff_shexp, n_expert, n_expert_used,
             fai, ssm_conv, ssm_inner, ssm_state, ssm_dt, ssm_grp);
             set_last_error(buf);
@@ -379,7 +437,11 @@ bool load_target_gguf_partial(const std::string & path,
     }
     if (n_layer % fai != 0) {
         char buf[128];
-        std::snprintf(buf, sizeof(buf), "block_count=%u not divisible by full_attention_interval=%u", n_layer, fai);
+        std::snprintf(
+            buf, sizeof(buf),
+            "target_layer_count=%u not divisible by full_attention_interval=%u "
+            "(block_count=%u nextn_predict_layers=%u)",
+            n_layer, fai, block_count, nextn_predict_layers);
         set_last_error(buf);
         gguf_free(gctx); return false;
     }
