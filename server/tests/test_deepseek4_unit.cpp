@@ -1013,8 +1013,11 @@ static void test_dspark_park_all_releases_drafter() {
     TEST_ASSERT(!backend.spec_enabled_);
     TEST_ASSERT(backend.spec_drafter_parked_);
 
-    // Avoid leaving a synthetic reload request for the destructor.
     backend.free_drafter();
+    TEST_ASSERT(backend.spec_drafter_ == nullptr);
+    TEST_ASSERT(!backend.spec_enabled_);
+    TEST_ASSERT(backend.spec_drafter_parked_);
+    TEST_ASSERT(backend.spec_draft_path_ == "/tmp/ds4-dspark-fixture.gguf");
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 

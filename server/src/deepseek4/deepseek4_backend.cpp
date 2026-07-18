@@ -876,17 +876,18 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
 GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
                                                 const DaemonIO & io) {
     GenerateResult result;
+    DaemonIO out_io = io.with_token_callback(req.on_token);
     auto t0 = Clock::now();
 
     // Prefill
-    int committed = do_prefill(req.prompt, io);
+    int committed = do_prefill(req.prompt, out_io);
     if (committed < 0) {
         result.fail(GenerateErrorCode::PrefillFailed);
         return result;
     }
     result.prefill_s = elapsed_s(t0);
 
-    if (io.cancelled) {
+    if (out_io.cancelled) {
         result.succeed();
         maybe_save_routing_stats();
         return result;
@@ -912,10 +913,10 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
           for (int i = 1; i < w_.n_vocab; i++) if (last_logits_[i] > mv) { mv = last_logits_[i]; seed = i; } }
         std::vector<int32_t> gen;
         gen.push_back(seed);
-        io.emit(seed);
+        out_io.emit(seed);
         float accept_rate = 0.0f;
         bool spec_ran = false;
-        if (!io.cancelled && !deepseek4_is_eos_tok(seed, w_) && req.n_gen > 1) {
+        if (!out_io.cancelled && !deepseek4_is_eos_tok(seed, w_) && req.n_gen > 1) {
             const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
             const int win_len = feat_row > 0 ? (int) (spec_feat_window_.size() / feat_row) : 0;
             std::vector<int32_t> spec_toks;
@@ -925,10 +926,10 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
                     req.n_gen - 1,
                     win_len > 0 ? spec_feat_window_.data() : nullptr, win_len,
                     spec_toks, &accept_rate,
-                    [&io](int32_t tok) {
-                        if (io.cancelled) return false;
-                        io.emit(tok);
-                        return !io.cancelled;
+                    [&out_io](int32_t tok) {
+                        if (out_io.cancelled) return false;
+                        out_io.emit(tok);
+                        return !out_io.cancelled;
                     })) {
                 result.fail(GenerateErrorCode::DecodeFailed,
                             "DSpark speculative decode failed");
@@ -951,7 +952,7 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
     gen_tokens.reserve(req.n_gen);
 
     bool forced_close = false;
-    if (!do_decode(committed, req.n_gen, gen_tokens, io,
+    if (!do_decode(committed, req.n_gen, gen_tokens, out_io,
                    req.budget_hook, &forced_close)) {
         result.fail(GenerateErrorCode::DecodeFailed);
         return result;
@@ -1003,8 +1004,9 @@ bool DeepSeek4Backend::handle_compress(const std::string & line,
 }
 
 void DeepSeek4Backend::free_drafter() {
-    release_spec_drafter(/*mark_parked=*/false);
-    spec_draft_path_.clear();
+    // Keep the configured path so request-scoped residency and an explicit
+    // later `unpark draft` can restore the DSpark model.
+    release_spec_drafter(/*mark_parked=*/true);
 }
 
 void DeepSeek4Backend::maybe_save_routing_stats() {
