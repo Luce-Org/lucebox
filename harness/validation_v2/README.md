@@ -71,4 +71,9 @@ is a new campaign, not a resumable continuation of this one.
 endpoint. It appends every failure/timeout, retries non-success cells on resume,
 requires authoritative server token counts, retains rescorable raw responses,
 and reads any bearer credential from an environment variable without recording
-it in the request artifact.
+it in the request artifact. Each configuration must also declare
+`expected_configured_contract`, `expected_effective_decode_mode`,
+`expected_fallback_reason`, `expected_draft_attached`, and
+`expected_draft_loaded`. The runner authenticates to `/props`, verifies those
+launch facts against the nested `usage.speculative` response, and refuses to
+mark a row complete if any exactness evidence is absent or inconsistent.

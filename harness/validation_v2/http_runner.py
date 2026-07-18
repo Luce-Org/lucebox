@@ -9,6 +9,7 @@ import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -103,6 +104,79 @@ def request_chat(
     return _content(parsed), dict(parsed.get("usage") or {}), parsed, None, elapsed
 
 
+def request_props(*, endpoint_url: str, api_key: str, timeout: float) -> dict[str, Any]:
+    """Fetch authenticated launch evidence from the server's root /props route."""
+
+    parsed_url = urllib.parse.urlsplit(endpoint_url)
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+        raise ValueError("endpoint_url must be an absolute HTTP(S) URL")
+    props_url = urllib.parse.urlunsplit(
+        (parsed_url.scheme, parsed_url.netloc, "/props", "", "")
+    )
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = urllib.request.Request(props_url, headers=headers, method="GET")
+    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+        props = json.loads(response.read().decode("utf-8"))
+    if not isinstance(props, dict):
+        raise ValueError("/props response is not a JSON object")
+    return props
+
+
+def validate_speculative_evidence(
+    *, usage: dict[str, Any], props: dict[str, Any], config: dict[str, Any]
+) -> dict[str, str]:
+    """Fail closed unless response and launch evidence prove the planned route."""
+
+    expected_fields = (
+        "expected_configured_contract",
+        "expected_effective_decode_mode",
+        "expected_fallback_reason",
+        "expected_draft_attached",
+        "expected_draft_loaded",
+    )
+    missing_expectations = [field for field in expected_fields if field not in config]
+    if missing_expectations:
+        raise ValueError(
+            "configuration lacks speculative evidence expectations: "
+            + ", ".join(missing_expectations)
+        )
+
+    speculative = usage.get("speculative")
+    if not isinstance(speculative, dict):
+        raise ValueError("response usage lacks nested speculative evidence")
+    props_speculative = props.get("speculative")
+    if not isinstance(props_speculative, dict):
+        raise ValueError("/props lacks speculative launch evidence")
+
+    evidence: dict[str, str] = {}
+    for field in ("configured_contract", "effective_decode_mode", "fallback_reason"):
+        value = speculative.get(field)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"response usage.speculative lacks {field}")
+        evidence[field] = value
+
+    expected_contract = str(config["expected_configured_contract"])
+    expected_mode = str(config["expected_effective_decode_mode"])
+    expected_fallback = str(config["expected_fallback_reason"])
+    if evidence["configured_contract"] != expected_contract:
+        raise ValueError("response configured contract does not match the matrix")
+    if evidence["effective_decode_mode"] != expected_mode:
+        raise ValueError("response effective decode mode does not match the matrix")
+    if evidence["fallback_reason"] != expected_fallback:
+        raise ValueError("response fallback reason does not match the matrix")
+    if props_speculative.get("configured_contract") != expected_contract:
+        raise ValueError("/props configured contract does not match the matrix")
+    for field in ("draft_attached", "draft_loaded"):
+        expected = config[f"expected_{field}"]
+        if not isinstance(expected, bool):
+            raise ValueError(f"expected_{field} must be a boolean")
+        if props_speculative.get(field) is not expected:
+            raise ValueError(f"/props {field} does not match the matrix")
+    return evidence
+
+
 def _artifact_name(config_id: str) -> str:
     safe = "".join(character if character.isalnum() or character in "-_." else "_" for character in config_id)
     return safe[:220] + ".json"
@@ -138,8 +212,14 @@ def execute_cell(
     artifacts: dict[str, str] = {}
     error: str | None = None
     try:
+        props = request_props(
+            endpoint_url=str(config["endpoint_url"]), api_key=api_key, timeout=timeout
+        )
         text, usage, raw_response, ttft_s, elapsed_s = request_chat(
             url=endpoint, api_key=api_key, payload=payload, timeout=timeout
+        )
+        speculative = validate_speculative_evidence(
+            usage=usage, props=props, config=config
         )
         completion_tokens = usage.get("completion_tokens")
         if not isinstance(completion_tokens, int) or completion_tokens <= 0:
@@ -152,9 +232,10 @@ def execute_cell(
             "decode_tok_s": completion_tokens / elapsed_s,
             "output_sha256": hashlib.sha256(text.encode()).hexdigest(),
             "output_bytes": len(text.encode()),
-            "effective_decode_mode": usage.get("effective_decode_mode"),
-            "configured_contract": usage.get("configured_contract"),
-            "fallback_reason": usage.get("fallback_reason"),
+            "effective_decode_mode": speculative["effective_decode_mode"],
+            "configured_contract": speculative["configured_contract"],
+            "fallback_reason": speculative["fallback_reason"],
+            "props_sha256": hashlib.sha256(canonical_json(props).encode()).hexdigest(),
         }
         artifact_path = artifacts_dir / _artifact_name(str(cell["config_id"]))
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -163,6 +244,7 @@ def execute_cell(
             "prompt_id": cell["prompt_id"],
             "request": payload,
             "response": raw_response,
+            "props": props,
             "final_content": text,
         }
         artifact_path.write_text(canonical_json(artifact) + "\n", encoding="utf-8")
@@ -216,7 +298,15 @@ def main() -> None:
     for cell in cells:
         config_id = str(cell["config_id"])
         previous = latest.get(config_id)
-        required = ("decode_tok_s", "completion_tokens", "output_sha256")
+        required = (
+            "decode_tok_s",
+            "completion_tokens",
+            "output_sha256",
+            "configured_contract",
+            "effective_decode_mode",
+            "fallback_reason",
+            "props_sha256",
+        )
         if store.is_complete(
             config_id,
             config_hash=str(cell["config_hash"]),
