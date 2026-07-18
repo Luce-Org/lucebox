@@ -81,8 +81,9 @@ const char * deepseek4_dspark_last_error();
 
 // One drafter forward. Produces block_size normed hidden states (the input to
 // the tied lm_head + Markov head), conditioned on a window of captured target
-// features. All host-side f32 for a simple v1 (GPU feature-ring plumbing can
-// come later).
+// features. When requested, also returns the HC-collapsed state before the
+// output RMSNorm, which is the trained input to the DSpark confidence head.
+// All host-side f32 for a simple v1 (GPU feature-ring plumbing can come later).
 //
 //   noise_embed     : [n_embd * block_size] embeds of [seed]+[MASK]*(block_size-1);
 //                     its first block element is the committed seed embedding
@@ -92,6 +93,8 @@ const char * deepseek4_dspark_last_error();
 //   ctx_len         : number of context feature columns (<= n_swa)
 //   committed       : absolute position of the seed (block position 0)
 //   out_hidden      : filled with [n_embd * block_size] = out_norm(hc_head(block))
+//   confidence_hidden: optional [n_embd * block_size] = hc_head(block), before
+//                      out_norm; never use it for the tied lm_head
 //
 // Defined in deepseek4_graph.cpp (needs the static DS4 sub-builders).
 bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
@@ -100,7 +103,8 @@ bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
                                     const float * ctx_features,
                                     int ctx_len,
                                     int committed,
-                                    std::vector<float> & out_hidden);
+                                    std::vector<float> & out_hidden,
+                                    std::vector<float> * confidence_hidden = nullptr);
 
 // Batched target verify forward WITH feature capture (defined in
 // deepseek4_graph.cpp so it can reuse the target sub-builders). Runs the DS4

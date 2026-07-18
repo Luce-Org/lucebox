@@ -8,6 +8,7 @@
 #endif
 
 #include "common/backend_ipc.h"
+#include "common/dspark_head.h"
 #include "common/layer_split_utils.h"
 #include "deepseek4/deepseek4_dspark.h"
 
@@ -313,6 +314,96 @@ static ggml_context * make_test_context(size_t mem_size = 1u << 20) {
     params.mem_buffer = nullptr;
     params.no_alloc = true;
     return ggml_init(params);
+}
+
+static void test_dspark_confidence_uses_separate_hidden(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_dspark_confidence_uses_separate_hidden ...");
+
+    constexpr int hidden = 2;
+    constexpr int rank = 1;
+    constexpr int vocab = 3;
+    constexpr int q_len = 2;  // dummy seed row + one candidate row
+
+    ggml_context * ctx = make_test_context();
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) {
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    ggml_tensor * lm_head = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, vocab);
+    ggml_tensor * markov_w1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, vocab);
+    ggml_tensor * markov_w2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, vocab);
+    ggml_tensor * confidence_w =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden + rank, 1);
+    ggml_tensor * confidence_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    TEST_ASSERT_MSG(buf != nullptr, "weight allocation failed");
+    if (!buf) {
+        ggml_free(ctx);
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    const std::vector<float> zeros_lm((size_t) hidden * vocab, 0.0f);
+    const std::vector<float> zeros_markov((size_t) rank * vocab, 0.0f);
+    const std::vector<float> confidence_weight = {1.0f, 0.0f, 0.0f};
+    const float zero = 0.0f;
+    ggml_backend_tensor_set(lm_head, zeros_lm.data(), 0,
+                            zeros_lm.size() * sizeof(float));
+    ggml_backend_tensor_set(markov_w1, zeros_markov.data(), 0,
+                            zeros_markov.size() * sizeof(float));
+    ggml_backend_tensor_set(markov_w2, zeros_markov.data(), 0,
+                            zeros_markov.size() * sizeof(float));
+    ggml_backend_tensor_set(confidence_w, confidence_weight.data(), 0,
+                            confidence_weight.size() * sizeof(float));
+    ggml_backend_tensor_set(confidence_b, &zero, 0, sizeof(zero));
+
+    DraftWeights dw{};
+    dw.n_embd = hidden;
+    dw.dspark.enabled = true;
+    dw.dspark.markov_rank = rank;
+    dw.dspark.vocab_size = vocab;
+    dw.dspark.confidence_dim = hidden + rank;
+    dw.dspark.markov_w1 = markov_w1;
+    dw.dspark.markov_w2 = markov_w2;
+    dw.dspark.confidence_w = confidence_w;
+    dw.dspark.confidence_b = confidence_b;
+
+    // Both calls use the same normalized candidate hidden (all zero), so token
+    // logits and Markov correction are identical. Only the reference-faithful
+    // confidence input differs: its candidate row starts with 2.0.
+    const std::vector<float> normalized_hidden((size_t) hidden * q_len, 0.0f);
+    const std::vector<float> confidence_hidden = {0.0f, 0.0f, 2.0f, -3.0f};
+    std::vector<int32_t> separate_tokens;
+    std::vector<float> separate_confidence;
+    const bool separate_ok = dspark_markov_correct_greedy_chain_fused(
+        dw, backend, lm_head, normalized_hidden.data(), q_len, 0,
+        separate_tokens, &separate_confidence, confidence_hidden.data());
+
+    std::vector<int32_t> legacy_tokens;
+    std::vector<float> legacy_confidence;
+    const bool legacy_ok = dspark_markov_correct_greedy_chain_fused(
+        dw, backend, lm_head, normalized_hidden.data(), q_len, 0,
+        legacy_tokens, &legacy_confidence);
+
+    TEST_ASSERT_MSG(separate_ok, "separate-confidence fused graph failed");
+    TEST_ASSERT_MSG(legacy_ok, "legacy-confidence fused graph failed");
+    TEST_ASSERT(separate_tokens == legacy_tokens);
+    TEST_ASSERT(separate_confidence.size() == 1);
+    TEST_ASSERT(legacy_confidence.size() == 1);
+    if (separate_confidence.size() == 1 && legacy_confidence.size() == 1) {
+        const float expected_separate = 1.0f / (1.0f + std::exp(-2.0f));
+        TEST_ASSERT_MSG(nearly_equal(separate_confidence[0], expected_separate),
+                        "confidence did not use the separate pre-norm hidden");
+        TEST_ASSERT_MSG(nearly_equal(legacy_confidence[0], 0.5f),
+                        "legacy confidence fallback changed");
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
 static float softplus_stable(float x) {
@@ -1964,6 +2055,7 @@ int main() {
     test_loader_reads_tokenizer_special_ids(backend);
     test_loader_rejects_truncated_tensor_data(backend);
     test_dspark_loader_contract_and_bounds(backend);
+    test_dspark_confidence_uses_separate_hidden(backend);
     test_safe_compressor_batch_tokens();
     test_dspark_park_all_releases_drafter();
     test_dspark_raw_ring_rollback_after_wrap(backend);

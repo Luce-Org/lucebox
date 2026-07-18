@@ -124,11 +124,12 @@ int main(int argc, char ** argv) {
         std::vector<float> feats((size_t) fc_in * ctx_len);
         for (size_t i = 0; i < noise.size(); i++) noise[i] = 0.06f * std::sin(0.31f * (float) i + 1.3f);
         for (size_t i = 0; i < feats.size(); i++) feats[i] = 0.05f * std::cos(0.17f * (float) i + 0.4f);
-        std::vector<float> hidden;
+        std::vector<float> hidden, confidence_hidden;
         const int committed = 64;  // arbitrary >= ctx_len
         std::fprintf(stderr, "\n── drafter forward (ctx_len=%d block=%d) ──\n", ctx_len, block);
         if (!deepseek4_dspark_draft_forward(backend, d, noise.data(), feats.data(),
-                                            ctx_len, committed, hidden)) {
+                                            ctx_len, committed, hidden,
+                                            &confidence_hidden)) {
             std::fprintf(stderr, "FAIL: drafter forward returned false\n");
             rc = 1;
         } else {
@@ -142,6 +143,13 @@ int main(int argc, char ** argv) {
                          hidden.size() > 2 ? hidden[2] : 0.0f);
             need(finite, "finite forward output");
             need(hidden.size() == (size_t) n_embd * block, "forward output size");
+            bool confidence_finite = true;
+            for (float v : confidence_hidden) {
+                if (!std::isfinite(v)) confidence_finite = false;
+            }
+            need(confidence_finite, "finite pre-norm confidence hidden");
+            need(confidence_hidden.size() == (size_t) n_embd * block,
+                 "pre-norm confidence hidden size");
         }
     }
 

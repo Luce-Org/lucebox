@@ -178,6 +178,7 @@ struct MarkovChainGraph {
     ggml_context * ctx = nullptr;
     ggml_cgraph *  gf  = nullptr;
     ggml_tensor *  inp_hidden = nullptr;
+    ggml_tensor *  inp_confidence_hidden = nullptr;
     ggml_tensor *  inp_seed   = nullptr;
     ggml_tensor *  base       = nullptr;          // [vocab, n_positions]
     std::vector<ggml_tensor *> toks;              // corrected argmax per depth
@@ -226,6 +227,11 @@ bool build_markov_chain_graph(const DraftWeights & dw,
     const int vocab  = (int)lm_head->ne[1];
     const int n_corr = n_positions - first_corrected;
     if (n_positions <= 0 || n_corr <= 0) return false;
+    const bool have_confidence = confidence_are_outputs &&
+        dw.dspark.confidence_w != nullptr &&
+        dw.dspark.confidence_b != nullptr &&
+        (dw.dspark.confidence_dim == hdim ||
+         dw.dspark.confidence_dim == hdim + dw.dspark.markov_rank);
 
     const size_t arena_size = ggml_tensor_overhead() * (size_t)(64 + 16 * n_corr) +
                               ggml_graph_overhead_custom(512, false) + 2 * 1024 * 1024;
@@ -240,6 +246,11 @@ bool build_markov_chain_graph(const DraftWeights & dw,
     out.gf = ggml_new_graph_custom(out.ctx, 512, false);
 
     out.inp_hidden = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, hdim, n_positions);
+    if (have_confidence) {
+        out.inp_confidence_hidden =
+            ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, hdim, n_positions);
+        ggml_set_input(out.inp_confidence_hidden);
+    }
     out.inp_seed   = ggml_new_tensor_1d(out.ctx, GGML_TYPE_I32, 1);
     ggml_set_input(out.inp_hidden);
     ggml_set_input(out.inp_seed);
@@ -255,11 +266,6 @@ bool build_markov_chain_graph(const DraftWeights & dw,
     out.toks.assign((size_t)n_corr, nullptr);
     out.corrected.assign((size_t)n_corr, nullptr);
     out.confidence.assign((size_t)n_corr, nullptr);
-    const bool have_confidence = confidence_are_outputs &&
-        dw.dspark.confidence_w != nullptr &&
-        dw.dspark.confidence_b != nullptr &&
-        (dw.dspark.confidence_dim == hdim ||
-         dw.dspark.confidence_dim == hdim + dw.dspark.markov_rank);
     for (int i = 0; i < n_corr; ++i) {
         const int row = first_corrected + i;
         ggml_tensor * prev_emb = ggml_get_rows(out.ctx, dw.dspark.markov_w1, prev_ids);
@@ -278,8 +284,9 @@ bool build_markov_chain_graph(const DraftWeights & dw,
         out.toks[(size_t)i] = tok;
         if (have_confidence) {
             ggml_tensor * hidden_i = ggml_view_2d(
-                out.ctx, out.inp_hidden, hdim, 1, out.inp_hidden->nb[1],
-                (size_t)row * out.inp_hidden->nb[1]);
+                out.ctx, out.inp_confidence_hidden, hdim, 1,
+                out.inp_confidence_hidden->nb[1],
+                (size_t)row * out.inp_confidence_hidden->nb[1]);
             ggml_tensor * conf_in = hidden_i;
             if (dw.dspark.confidence_dim == hdim + dw.dspark.markov_rank) {
                 conf_in = ggml_concat(out.ctx, hidden_i, prev_emb, 0);
@@ -307,7 +314,8 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
                                               int q_len,
                                               int32_t last_tok,
                                               std::vector<int32_t> & draft_tok,
-                                              std::vector<float> * confidence_out) {
+                                              std::vector<float> * confidence_out,
+                                              const float * confidence_hidden) {
     if (q_len <= 1) return false;
     if (!dspark_fused_usable(dw, backend, lm_head, local_hidden, "dspark_fused")) return false;
     const int hdim   = dw.n_embd;
@@ -337,6 +345,11 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
     // Candidate hidden states start at position 1 (position 0 is the seed).
     ggml_backend_tensor_set(g.inp_hidden, local_hidden + (size_t)hdim, 0,
                             sizeof(float) * (size_t)hdim * (size_t)n_cand);
+    if (want_confidence && g.inp_confidence_hidden) {
+        const float * conf_src = confidence_hidden ? confidence_hidden : local_hidden;
+        ggml_backend_tensor_set(g.inp_confidence_hidden, conf_src + (size_t)hdim, 0,
+                                sizeof(float) * (size_t)hdim * (size_t)n_cand);
+    }
     ggml_backend_tensor_set(g.inp_seed, &last_tok, 0, sizeof(int32_t));
 
     if (ggml_backend_graph_compute(backend, g.gf) != GGML_STATUS_SUCCESS) {

@@ -233,8 +233,8 @@ bool spec_env_flag(const char * name) {
 // Calibrated cumulative-confidence thresholds for widening the DS4 verify.
 // They are part of the policy, not deployment knobs: artifacts without a
 // compatible confidence head transparently retain the existing EWMA policy.
-constexpr float kConfidenceQ3Threshold = 0.30f;
-constexpr float kConfidenceQ4Threshold = 0.25f;
+constexpr float kConfidenceQ3Threshold = 0.40f;
+constexpr float kConfidenceQ4Threshold = 0.30f;
 
 // ── Light rollback state ────────────────────────────────────────────────
 // prev-half = first 4 rows of a [comp_width, 8] ratio-4 rolling state.
@@ -518,7 +518,9 @@ bool run_deepseek4_dspark_spec_decode(
 
     std::vector<float> noise_embed((size_t) n_embd * block);
     std::vector<int32_t> noise_ids(block);
-    std::vector<float> local_hidden, padded_hidden((size_t) n_embd * (block + 1), 0.0f);
+    std::vector<float> local_hidden, confidence_hidden;
+    std::vector<float> padded_hidden((size_t) n_embd * (block + 1), 0.0f);
+    std::vector<float> padded_confidence_hidden((size_t) n_embd * (block + 1), 0.0f);
     std::vector<int32_t> draft_tok, tgt_am;
     std::vector<float> draft_confidence;
 
@@ -539,10 +541,12 @@ bool run_deepseek4_dspark_spec_decode(
                 break;
             }
 
-            // Drafter forward -> block normed hidden states.
+            // Drafter forward -> normalized states for token logits plus the
+            // pre-output-norm states expected by the confidence head.
             if (!deepseek4_dspark_draft_forward(backend, drafter, noise_embed.data(),
                                                 ctx_len > 0 ? feat_win.data() : nullptr,
-                                                ctx_len, pos, local_hidden)) {
+                                                ctx_len, pos, local_hidden,
+                                                use_confidence_width ? &confidence_hidden : nullptr)) {
                 std::fprintf(stderr, "[ds4-spec] drafter forward failed\n");
                 ok = false;
                 break;
@@ -580,10 +584,16 @@ bool run_deepseek4_dspark_spec_decode(
         if (q_step_cap >= 2) {
             std::memcpy(padded_hidden.data() + n_embd, local_hidden.data(),
                         sizeof(float) * (size_t) n_embd * block);
+            if (use_confidence_width) {
+                std::memcpy(padded_confidence_hidden.data() + n_embd,
+                            confidence_hidden.data(),
+                            sizeof(float) * (size_t) n_embd * block);
+            }
             ds_ok = dspark_markov_correct_greedy_chain_fused(
                             dw, backend, target.lm_head_tensor(), padded_hidden.data(),
                             q_step_cap, lt, draft_tok,
-                            use_confidence_width ? &draft_confidence : nullptr);
+                            use_confidence_width ? &draft_confidence : nullptr,
+                            use_confidence_width ? padded_confidence_hidden.data() : nullptr);
             if (!ds_ok) {
                 ds_ok = dspark_markov_correct_greedy_chain(dw, backend, target,
                             padded_hidden.data(), q_step_cap, lt, 0.0f, draft_tok);
@@ -608,11 +618,11 @@ bool run_deepseek4_dspark_spec_decode(
         // traces and keep q=4 for high-confidence prefixes while avoiding its
         // extra verify cost on low-acceptance prompts.
         if (use_confidence_width && draft_confidence.size() >= 2 && draft_tok.size() >= 3) {
-            const float p2 = draft_confidence[0] * draft_confidence[1];
-            int selected_q = p2 >= kConfidenceQ3Threshold ? 3 : 2;
+            const float confidence_p2 = draft_confidence[0] * draft_confidence[1];
+            int selected_q = confidence_p2 >= kConfidenceQ3Threshold ? 3 : 2;
             if (selected_q == 3 && draft_confidence.size() >= 3 && draft_tok.size() >= 4) {
-                const float p3 = p2 * draft_confidence[2];
-                if (p3 >= kConfidenceQ4Threshold) selected_q = 4;
+                const float confidence_p3 = confidence_p2 * draft_confidence[2];
+                if (confidence_p3 >= kConfidenceQ4Threshold) selected_q = 4;
             }
             if ((int) draft_tok.size() > selected_q) draft_tok.resize((size_t) selected_q);
         } else if (use_confidence_width && !seq_verify_mode) {

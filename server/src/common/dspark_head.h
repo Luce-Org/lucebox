@@ -22,7 +22,10 @@ bool dspark_markov_correct_greedy_chain(const DraftWeights & dw,
 // step's get_rows, all in ONE graph on the draft backend. No host logits
 // round-trip. When confidence_out is non-null and the checkpoint has a
 // compatible confidence head, returns one score per candidate from the same
-// graph and host synchronization as the token ids.
+// graph and host synchronization as the token ids. `confidence_hidden`, when
+// non-null, has the same padded layout as `local_hidden` and supplies the
+// pre-output-norm state expected by the confidence head. Callers without a
+// separate state retain the legacy behavior by leaving it null.
 bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
                                               ggml_backend_t backend,
                                               ggml_tensor * lm_head,
@@ -30,7 +33,8 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
                                               int q_len,
                                               int32_t last_tok,
                                               std::vector<int32_t> & draft_tok,
-                                              std::vector<float> * confidence_out = nullptr);
+                                              std::vector<float> * confidence_out = nullptr,
+                                              const float * confidence_hidden = nullptr);
 
 // DDTree candidate generation with the Markov correction: base logits for
 // all n_tokens positions in ONE lm_head matmul; rows 1..n-1 get the low-rank

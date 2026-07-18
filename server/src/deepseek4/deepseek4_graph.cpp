@@ -5446,6 +5446,7 @@ struct DsparkDraftCache {
     ggml_tensor * neg_block = nullptr;
     ggml_tensor * pos_ctx = nullptr;
     ggml_tensor * out = nullptr;
+    ggml_tensor * confidence_out = nullptr;
     std::vector<std::pair<std::string, ggml_tensor *>> dbg_taps;
     // HC scales are immutable weights: read from the backend once.
     std::vector<std::array<float, 3>> s_attn, s_ffn;
@@ -5475,7 +5476,8 @@ bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
                                     const float * ctx_features,
                                     int ctx_len,
                                     int committed,
-                                    std::vector<float> & out_hidden) {
+                                    std::vector<float> & out_hidden,
+                                    std::vector<float> * confidence_hidden) {
     const DeepSeek4Weights & w = d.core;
     const int n_embd  = w.n_embd;
     const int n_hc    = w.n_hc;
@@ -5633,7 +5635,11 @@ bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
         }
 
         // ── Tail: hc_head collapse -> out_norm, per block position ──────
+        // The tied lm_head consumes the normalized state. The confidence head
+        // was trained on the HC-collapsed state before this output RMSNorm, so
+        // keep both instead of reusing the normalized state for confidence.
         ggml_tensor * out = nullptr;
+        ggml_tensor * confidence_out = nullptr;
         for (int p = 0; p < block; p++) {
             ggml_tensor * hcf = hc_col(hc_cur, p);
             ggml_tensor * onorm = ggml_rms_norm(ctx, hcf, hc_eps);
@@ -5644,10 +5650,16 @@ bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
             ggml_tensor * final_2d = ggml_reshape_2d(ctx, final_embd, n_embd, 1);
             ggml_tensor * hidden_p = build_rms_norm(ctx, final_2d, w.out_norm, w.rms_eps);
             out = out ? ggml_concat(ctx, out, hidden_p, 1) : hidden_p;
+            confidence_out = confidence_out
+                           ? ggml_concat(ctx, confidence_out, final_2d, 1)
+                           : final_2d;
         }
         ggml_set_output(out);
+        ggml_set_output(confidence_out);
         ggml_build_forward_expand(gf, out);
+        ggml_build_forward_expand(gf, confidence_out);
         C.out = out;
+        C.confidence_out = confidence_out;
 
         if (!C.alloc) C.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
         if (!C.alloc || !ggml_gallocr_alloc_graph(C.alloc, gf)) {
@@ -5681,6 +5693,11 @@ bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
     }
     out_hidden.resize((size_t) n_embd * block);
     ggml_backend_tensor_get(C.out, out_hidden.data(), 0, sizeof(float) * out_hidden.size());
+    if (confidence_hidden) {
+        confidence_hidden->resize((size_t) n_embd * block);
+        ggml_backend_tensor_get(C.confidence_out, confidence_hidden->data(), 0,
+                                sizeof(float) * confidence_hidden->size());
+    }
 
     if (DS4_DBG) {
         for (auto & tp : C.dbg_taps) {
