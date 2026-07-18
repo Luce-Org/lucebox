@@ -90,6 +90,7 @@ static void add_step_tel(DeepSeek4StepTelemetry & dst, const DeepSeek4StepTeleme
     dst.attn_compute_us += src.attn_compute_us;
     dst.attn_read_us += src.attn_read_us;
     dst.full_graph_build_us += src.full_graph_build_us;
+    dst.full_graph_alloc_us += src.full_graph_alloc_us;
     dst.full_graph_set_us += src.full_graph_set_us;
     dst.full_graph_compute_us += src.full_graph_compute_us;
     dst.full_graph_read_us += src.full_graph_read_us;
@@ -132,7 +133,7 @@ static void log_step_tel(const char * phase,
     std::fprintf(stderr,
         "[deepseek4-timing] %s tokens=%d steps=%d wall=%.3fs %.2f tok/s "
         "step=%.1fms embed=%.1fms attn_build=%.1fms attn_compute=%.1fms attn_read=%.1fms "
-        "full_build=%.1fms full_set=%.1fms full_compute=%.1fms full_read=%.1fms "
+        "full_build=%.1fms full_alloc=%.1fms full_set=%.1fms full_compute=%.1fms full_read=%.1fms "
         "ffn_build=%.1fms ffn_compute=%.1fms ffn_read=%.1fms "
         "route_build=%.1fms route_compute=%.1fms route_read=%.1fms route_select=%.1fms "
         "ffn=%.1fms hot=%.1fms cold=%.1fms combine=%.1fms partition=%.1fms "
@@ -142,7 +143,7 @@ static void log_step_tel(const char * phase,
         "hot_sel=%d cold_sel=%d\n",
         phase, tokens, steps, wall_s, tok_s,
         ms(t.total_us), ms(t.embed_us), ms(t.attn_build_us), ms(t.attn_compute_us), ms(t.attn_read_us),
-        ms(t.full_graph_build_us), ms(t.full_graph_set_us),
+        ms(t.full_graph_build_us), ms(t.full_graph_alloc_us), ms(t.full_graph_set_us),
         ms(t.full_graph_compute_us), ms(t.full_graph_read_us),
         ms(t.ffn_build_us), ms(t.ffn_compute_us), ms(t.ffn_read_us),
         ms(t.route_build_us), ms(t.route_compute_us), ms(t.route_read_us), ms(t.route_select_us),
@@ -581,6 +582,38 @@ DeepSeek4Backend::~DeepSeek4Backend() {
     shutdown();
 }
 
+bool DeepSeek4Backend::requires_monolithic_model() const {
+    // Heterogeneous execution deliberately keeps routed experts split across
+    // the R9700 and Strix. Only an explicit diagnostic override may request
+    // the ~80-GiB monolithic HIP allocation.
+    return env_flag_enabled("DFLASH_DS4_FORCE_FULL_LOAD");
+}
+
+bool DeepSeek4Backend::validate_prefill_mode() const {
+    if (cfg_.prefill_mode == PrefillAttentionMode::Exact) {
+        return true;
+    }
+    const PlacementBackend target_backend =
+        cfg_.device.backend == PlacementBackend::Auto
+            ? compiled_placement_backend()
+            : cfg_.device.backend;
+    if (target_backend != PlacementBackend::Hip ||
+        cfg_.device.is_layer_split()) {
+        std::fprintf(stderr,
+            "[deepseek4] %s prefill requires a single HIP target\n",
+            prefill_attention_mode_name(cfg_.prefill_mode));
+        return false;
+    }
+    if (w_.moe_hybrid || moe_hybrid_) {
+        std::fprintf(stderr,
+            "[deepseek4] %s prefill requires every expert to be resident; "
+            "the selected placement has cold experts\n",
+            prefill_attention_mode_name(cfg_.prefill_mode));
+        return false;
+    }
+    return true;
+}
+
 bool DeepSeek4Backend::load_model() {
     const PlacementBackend target_backend =
         cfg_.device.backend == PlacementBackend::Auto
@@ -591,7 +624,7 @@ bool DeepSeek4Backend::load_model() {
     // a managed ~80 GiB allocation can stall or be killed on integrated UMA
     // systems before we ever reach the existing OOM fallback path.
     if (target_backend == PlacementBackend::Hip &&
-        env_flag_enabled("DFLASH_DS4_FORCE_FULL_LOAD")) {
+        requires_monolithic_model()) {
         std::fprintf(stderr,
                      "[deepseek4] HIP full-model load explicitly enabled\n");
         if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
@@ -784,12 +817,22 @@ bool DeepSeek4Backend::init() {
     if (!load_model()) {
         return false;
     }
+    if (!validate_prefill_mode()) {
+        return false;
+    }
+    if (prefill_attention_mode_is_approximate(cfg_.prefill_mode)) {
+        std::fprintf(stderr,
+            "[deepseek4] warning: %s prefill is approximate and may change "
+            "generated tokens; use --ds4-prefill exact for reference output\n",
+            prefill_attention_mode_name(cfg_.prefill_mode));
+    }
 
     const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
     if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
         std::fprintf(stderr, "[deepseek4] failed to allocate KV cache (ctx=%d)\n", max_ctx);
         return false;
     }
+    cache_.prefill_mode = cfg_.prefill_mode;
 
     if (env_flag_enabled("DFLASH_DS4_MOE_TP") && !init_moe_tensor_parallel()) {
         return false;
@@ -833,9 +876,10 @@ bool DeepSeek4Backend::init() {
         w_.routed_expert_top_k > 0 ? w_.routed_expert_top_k : w_.n_expert_used;
     std::fprintf(stderr,
                  "[deepseek4] initialized: %d layers, ctx=%d, %d experts "
-                 "(%d/%d routed), fused_decode=%s%s\n",
+                 "(%d/%d routed), fused_decode=%s, prefill=%s%s\n",
                  w_.n_layer, max_ctx, w_.n_expert, active_experts, w_.n_expert_used,
                  w_.fused_decode ? "on" : "off",
+                 prefill_attention_mode_name(cfg_.prefill_mode),
                  moe_hybrid_ ? " [hybrid]" : "");
 
     if (env_flag_enabled("DFLASH_DS4_SPEC")) {
@@ -1193,6 +1237,13 @@ bool DeepSeek4Backend::unpark(const std::string & what) {
         std::printf("[deepseek4] target unparked (VRAM restored)\n");
         std::fflush(stdout);
     }
+    if (!validate_prefill_mode()) {
+        free_deepseek4_weights(w_);
+        stream_engine_.destroy();
+        moe_hybrid_.reset();
+        moe_placement_ = {};
+        return false;
+    }
 
     if (want_draft && spec_drafter_parked_) {
         if (parked_) {
@@ -1205,17 +1256,31 @@ bool DeepSeek4Backend::unpark(const std::string & what) {
             return false;
         }
     }
+    cache_.prefill_mode = cfg_.prefill_mode;
     return true;
 }
 
 int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   const DaemonIO & io,
                                   int kv_offset) {
-    // Keep server prefill token-at-a-time for established numerics and bounded
-    // dynamic-graph workspace. The lower-level layer-range API independently
-    // splits arbitrary multi-token callers at every compressor boundary.
-    constexpr int chunk = 1;
+    // The all-hot layer-range path supports causal chunked prefill. The
+    // optimized graph snapshots the previous raw SWA window, attends over
+    // that snapshot plus the current ubatch, and commits only the final SWA
+    // tail. Learned compressor boundaries are emitted inside the same graph.
+    //
+    // Mixed hot/cold hybrid execution still has single-token HC semantics, so
+    // retain the reference path there.  --chunk 1 is the explicit fallback.
+    const int requested_chunk = cfg_.chunk > 0 ? cfg_.chunk : w_.n_swa;
     const int n_total = (int)tokens.size();
+    // Bound the layer-major graph to the topology validated by the prefill
+    // kernels. Smaller tail chunks use the same scheduler or its reference
+    // fallback.
+    const int layer_major_cap = DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
+    const int chunk = (moe_hybrid_ ||
+                       !prefill_attention_mode_is_approximate(cfg_.prefill_mode))
+        ? 1
+        : std::max(1, std::min(requested_chunk,
+                               layer_major_cap));
     int pos = kv_offset;
     // New sequence: clear the cache buffer so compressor state double-buffers
     // and compressed-KV rows start from zeros, exactly like a fresh server.
@@ -1285,7 +1350,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                 0, w_.n_layer, &logits,
                 tokens.data() + i,
                 timing ? &step_tel : nullptr,
-                /*allow_decode_graph_reuse=*/true, hp,
+                cfg_.prefill_mode != PrefillAttentionMode::Sparse, hp,
                 moe_hybrid_.get(),
                 expert_runtime_.compute ? &expert_runtime_ : nullptr,
                 routing_stats_.get());
@@ -1303,7 +1368,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                             0, w_.n_layer, &logits,
                                             tokens.data() + i,
                                             timing ? &step_tel : nullptr,
-                                            /*allow_decode_graph_reuse=*/true, hp);
+                                            cfg_.prefill_mode != PrefillAttentionMode::Sparse, hp);
         }
         if (ok && hp && !spec_cap.empty()) {
             const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;

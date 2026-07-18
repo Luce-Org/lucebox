@@ -176,7 +176,8 @@ template <mmq_q8_1_ds_layout ds_layout>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int ne1, const int ne2) {
+        const int64_t ne0, const int ne1, const int ne2,
+        const int64_t group_width, const int64_t group_stride) {
 
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
@@ -204,8 +205,21 @@ static __global__ void quantize_mmq_q8_1(
     const int64_t ib  = ib0 + (i0 / (4*QK8_1))*ne1 + blockIdx.x;                    // block index in channel
     const int64_t iqs = i0 % (4*QK8_1);                                             // quant index in block
 
-    // Load 4 floats per thread and calculate max. abs. value between them:
-    const float4 xi = i0 < ne00 ? x4[(i03*s03 + i02*s02 + i01*s01 + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    // Load 4 floats per thread and calculate max. abs. value between them.
+    // A grouped source is physically [group_width, token, group] while this
+    // kernel emits the same flattened-K Q8 layout as a materialized permute.
+    int64_t src_i00 = i00;
+    int64_t src_group_offset = 0;
+    if (group_width > 0) {
+        const int64_t group = i00 / group_width;
+        src_i00 = i00 - group * group_width;
+        src_group_offset = group * group_stride;
+    }
+    const int64_t src_index =
+        i03*s03 + i02*s02 + i01*s01 + src_group_offset + src_i00;
+    const float4 xi = i0 < ne00
+        ? x4[src_index/4]
+        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
     amax = fmaxf(amax, fabsf(xi.z));
@@ -300,19 +314,58 @@ void quantize_mmq_q8_1_cuda(
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, 0);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, 0);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, 0);
             break;
         default:
             GGML_ABORT("fatal error");
             break;
+    }
+}
+
+void quantize_mmq_q8_1_grouped_cuda(
+        const float * x, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t group_width,
+        const int64_t token_stride, const int64_t group_stride,
+        const int64_t ne0, const int64_t ne1, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % 4 == 0);
+    GGML_ASSERT(group_width > 0 && group_width % 4 == 0);
+    GGML_ASSERT(ne00 % group_width == 0);
+    GGML_ASSERT(ne0 % (4*QK8_1) == 0);
+
+    const int64_t block_num_y =
+        (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) /
+        (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(ne1, block_num_y, 1);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    switch (mmq_get_q8_1_ds_layout(type_src0)) {
+        case MMQ_Q8_1_DS_LAYOUT_D4:
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4>
+                <<<num_blocks, block_size, 0, stream>>>(
+                    x, nullptr, vy, ne00, token_stride, 0, 0,
+                    ne0, ne1, 1, group_width, group_stride);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4:
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4>
+                <<<num_blocks, block_size, 0, stream>>>(
+                    x, nullptr, vy, ne00, token_stride, 0, 0,
+                    ne0, ne1, 1, group_width, group_stride);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6:
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6>
+                <<<num_blocks, block_size, 0, stream>>>(
+                    x, nullptr, vy, ne00, token_stride, 0, 0,
+                    ne0, ne1, 1, group_width, group_stride);
+            break;
+        default:
+            GGML_ABORT("fatal error");
     }
 }
 

@@ -723,6 +723,357 @@ static void test_grouped_output_projection_shape() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_grouped_output_projection_cpu(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_grouped_output_projection_cpu ...");
+
+    constexpr int group_width = 4;
+    constexpr int n_groups = 3;
+    constexpr int n_tokens = 5;
+    constexpr int n_outputs = 4;
+    constexpr int flat_width = group_width * n_groups;
+
+    std::vector<float> weights((size_t) flat_width * n_outputs);
+    std::vector<float> grouped((size_t) group_width * n_tokens * n_groups);
+    std::vector<float> expected((size_t) n_outputs * n_tokens, 0.0f);
+    for (int output = 0; output < n_outputs; ++output) {
+        for (int k = 0; k < flat_width; ++k) {
+            weights[(size_t) output * flat_width + k] =
+                0.03125f * (float) ((output + 1) * (k - 5));
+        }
+    }
+    for (int group = 0; group < n_groups; ++group) {
+        for (int token = 0; token < n_tokens; ++token) {
+            for (int k = 0; k < group_width; ++k) {
+                grouped[(size_t) group * n_tokens * group_width +
+                        (size_t) token * group_width + k] =
+                    10.0f * (float) group + 0.5f * (float) token +
+                    0.125f * (float) k;
+            }
+        }
+    }
+    for (int token = 0; token < n_tokens; ++token) {
+        for (int output = 0; output < n_outputs; ++output) {
+            float sum = 0.0f;
+            for (int group = 0; group < n_groups; ++group) {
+                for (int k = 0; k < group_width; ++k) {
+                    const float value =
+                        grouped[(size_t) group * n_tokens * group_width +
+                                (size_t) token * group_width + k];
+                    sum += weights[(size_t) output * flat_width +
+                                   group * group_width + k] * value;
+                }
+            }
+            expected[(size_t) token * n_outputs + output] = sum;
+        }
+    }
+
+    ggml_context * ctx = make_test_context();
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) return;
+    ggml_tensor * weights_t =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, flat_width, n_outputs);
+    ggml_tensor * grouped_t = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, group_width, n_tokens, n_groups);
+    ggml_set_input(weights_t);
+    ggml_set_input(grouped_t);
+    ggml_tensor * output_t =
+        ggml_mul_mat_grouped_src(ctx, weights_t, grouped_t);
+    TEST_ASSERT_MSG(output_t->op == GGML_OP_MUL_MAT_GROUPED_SRC,
+                    "grouped projection must use a distinct backend contract");
+    ggml_set_output(output_t);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 64, false);
+    ggml_build_forward_expand(graph, output_t);
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    TEST_ASSERT_MSG(ggml_gallocr_alloc_graph(alloc, graph),
+                    "grouped projection graph allocation failed");
+    ggml_backend_tensor_set(weights_t, weights.data(), 0,
+                            weights.size() * sizeof(float));
+    ggml_backend_tensor_set(grouped_t, grouped.data(), 0,
+                            grouped.size() * sizeof(float));
+    TEST_ASSERT_MSG(ggml_backend_graph_compute(backend, graph) ==
+                        GGML_STATUS_SUCCESS,
+                    "grouped projection graph compute failed");
+    std::vector<float> actual(expected.size());
+    ggml_backend_tensor_get(output_t, actual.data(), 0,
+                            actual.size() * sizeof(float));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        TEST_ASSERT_MSG(nearly_equal(actual[i], expected[i]),
+                        "grouped projection output mismatch");
+    }
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_ds4_flash_attention_cpu_rejected(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_ds4_flash_attention_cpu_rejected ...");
+    ggml_context * ctx = make_test_context();
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) return;
+    ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 512, 2, 4);
+    ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 512, 8, 1);
+    ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 8, 2);
+    ggml_tensor * op = ggml_flash_attn_ext(
+        ctx, q, k, k, mask, 1.0f / std::sqrt(512.0f), 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_ds4_sparse(op, 4, 4, 0, 4);
+    TEST_ASSERT(ggml_flash_attn_ext_is_ds4(op));
+    TEST_ASSERT_MSG(!ggml_backend_supports_op(backend, op),
+                    "CPU accepted the DS4 flash-attention contract");
+    ggml_free(ctx);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static float reference_e2m1_round(float value) {
+    static constexpr float levels[] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    };
+    const float sign = value < 0.0f ? -1.0f : 1.0f;
+    const float magnitude = std::min(std::fabs(value), 6.0f);
+    int best = 0;
+    float best_diff = std::fabs(magnitude - levels[0]);
+    for (int i = 1; i < 8; ++i) {
+        const float diff = std::fabs(magnitude - levels[i]);
+        if (diff < best_diff ||
+            (diff == best_diff && (i & 1) == 0 && (best & 1) != 0)) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+    return sign * levels[best];
+}
+
+static void reference_ds4_indexer_qat(float * row) {
+    for (int stride = 1; stride < 128; stride <<= 1) {
+        for (int base = 0; base < 128; base += 2 * stride) {
+            for (int i = 0; i < stride; ++i) {
+                const float a = row[base + i];
+                const float b = row[base + stride + i];
+                row[base + i] = a + b;
+                row[base + stride + i] = a - b;
+            }
+        }
+    }
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    for (int i = 0; i < 128; ++i) row[i] *= inv_sqrt_128;
+    for (int block = 0; block < 4; ++block) {
+        float amax = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            amax = std::max(amax, std::fabs(row[block * 32 + i]));
+        }
+        amax = std::max(amax, 7.052966104933725e-38f);
+        const float scale = std::exp2(std::ceil(std::log2(amax / 6.0f)));
+        for (int i = 0; i < 32; ++i) {
+            const int index = block * 32 + i;
+            const float normalized =
+                std::clamp(row[index] / scale, -6.0f, 6.0f);
+            row[index] = reference_e2m1_round(normalized) * scale;
+        }
+    }
+}
+
+static void test_indexer_qat_cpu(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_indexer_qat_cpu ...");
+    constexpr int n_head = 3;
+    constexpr int n_tokens = 2;
+    std::vector<float> input((size_t) 128 * n_head * n_tokens);
+    for (size_t i = 0; i < input.size(); ++i) {
+        input[i] = 0.35f * std::sin(0.17f * (float) i) +
+                   0.08f * (float) ((int) (i % 11) - 5);
+    }
+    std::vector<float> expected = input;
+    for (int row = 0; row < n_head * n_tokens; ++row) {
+        reference_ds4_indexer_qat(expected.data() + (size_t) row * 128);
+    }
+    ggml_context * ctx = make_test_context();
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) return;
+    ggml_tensor * input_t = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, 128, n_head, n_tokens);
+    ggml_set_input(input_t);
+    ggml_tensor * output_t = ggml_ds4_indexer_qat(ctx, input_t);
+    ggml_set_output(output_t);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 64, false);
+    ggml_build_forward_expand(graph, output_t);
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    TEST_ASSERT_MSG(ggml_gallocr_alloc_graph(alloc, graph),
+                    "indexer QAT graph allocation failed");
+    ggml_backend_tensor_set(input_t, input.data(), 0,
+                            input.size() * sizeof(float));
+    TEST_ASSERT_MSG(ggml_backend_graph_compute(backend, graph) ==
+                        GGML_STATUS_SUCCESS,
+                    "indexer QAT graph compute failed");
+    std::vector<float> actual(expected.size());
+    ggml_backend_tensor_get(output_t, actual.data(), 0,
+                            actual.size() * sizeof(float));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        TEST_ASSERT_MSG(nearly_equal(actual[i], expected[i], 1e-6f, 1e-6f),
+                        "indexer QAT output mismatch");
+    }
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_indexer_score_cpu(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_indexer_score_cpu ...");
+    constexpr int n_head = 3;
+    constexpr int n_tokens = 6;
+    constexpr int n_comp = 4;
+    constexpr int kv_start = 2;
+    constexpr int ratio = 4;
+    std::vector<float> q((size_t) 128 * n_head * n_tokens);
+    std::vector<float> weights((size_t) n_head * n_tokens);
+    std::vector<float> comp_f32((size_t) 128 * n_comp);
+    std::vector<ggml_fp16_t> comp_f16(comp_f32.size());
+    for (size_t i = 0; i < q.size(); ++i) {
+        q[i] = 0.025f * (float) ((int) (i % 29) - 14);
+    }
+    for (int token = 0; token < n_tokens; ++token) {
+        for (int head = 0; head < n_head; ++head) {
+            weights[(size_t) token * n_head + head] =
+                0.25f + 0.1f * (float) head + 0.03f * (float) token;
+        }
+    }
+    for (int comp = 0; comp < n_comp; ++comp) {
+        for (int d = 0; d < 128; ++d) {
+            comp_f32[(size_t) comp * 128 + d] =
+                0.04f * (float) (((comp + 2) * (d + 3)) % 23 - 11);
+        }
+    }
+    ggml_fp32_to_fp16_row(comp_f32.data(), comp_f16.data(),
+                          (int64_t) comp_f32.size());
+    std::vector<float> expected((size_t) n_comp * n_tokens);
+    for (int token = 0; token < n_tokens; ++token) {
+        const int visible = (kv_start + token + 1) / ratio;
+        for (int comp = 0; comp < n_comp; ++comp) {
+            if (comp >= visible) {
+                expected[(size_t) token * n_comp + comp] = -1.0e30f;
+                continue;
+            }
+            float score = 0.0f;
+            for (int head = 0; head < n_head; ++head) {
+                const float * q_row = q.data() +
+                    ((size_t) token * n_head + head) * 128;
+                const ggml_fp16_t * k_row =
+                    comp_f16.data() + (size_t) comp * 128;
+                float dot = 0.0f;
+                for (int d = 0; d < 128; ++d) {
+                    dot += q_row[d] * ggml_fp16_to_fp32(k_row[d]);
+                }
+                score += std::max(dot, 0.0f) *
+                    weights[(size_t) token * n_head + head];
+            }
+            expected[(size_t) token * n_comp + comp] = score;
+        }
+    }
+
+    ggml_context * ctx = make_test_context();
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) return;
+    ggml_tensor * q_t = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, 128, n_head, n_tokens);
+    ggml_tensor * weights_t = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, n_head, n_tokens);
+    ggml_tensor * comp_t = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F16, 128, n_comp);
+    ggml_set_input(q_t);
+    ggml_set_input(weights_t);
+    ggml_set_input(comp_t);
+    ggml_tensor * scores_t = ggml_ds4_indexer_score(
+        ctx, q_t, weights_t, comp_t, kv_start, ratio);
+    ggml_set_output(scores_t);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 64, false);
+    ggml_build_forward_expand(graph, scores_t);
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    TEST_ASSERT_MSG(ggml_gallocr_alloc_graph(alloc, graph),
+                    "indexer score graph allocation failed");
+    ggml_backend_tensor_set(q_t, q.data(), 0, q.size() * sizeof(float));
+    ggml_backend_tensor_set(weights_t, weights.data(), 0,
+                            weights.size() * sizeof(float));
+    ggml_backend_tensor_set(comp_t, comp_f16.data(), 0,
+                            comp_f16.size() * sizeof(ggml_fp16_t));
+    TEST_ASSERT_MSG(ggml_backend_graph_compute(backend, graph) ==
+                        GGML_STATUS_SUCCESS,
+                    "indexer score graph compute failed");
+    std::vector<float> actual(expected.size());
+    ggml_backend_tensor_get(scores_t, actual.data(), 0,
+                            actual.size() * sizeof(float));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        TEST_ASSERT_MSG(nearly_equal(actual[i], expected[i], 2e-5f, 2e-5f),
+                        "indexer score output mismatch");
+    }
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_indexer_mask_cpu(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_indexer_mask_cpu ...");
+    constexpr int raw_rows = 3;
+    constexpr int n_comp = 5;
+    constexpr int n_tokens = 3;
+    constexpr int top_k = 3;
+    constexpr int n_attn = raw_rows + n_comp;
+    std::vector<float> base((size_t) n_attn * n_tokens);
+    for (int token = 0; token < n_tokens; ++token) {
+        for (int row = 0; row < n_attn; ++row) {
+            base[(size_t) token * n_attn + row] =
+                100.0f * (float) token + (float) row + 0.25f;
+        }
+    }
+    const std::vector<int32_t> selected = {
+        4, 1, 1,
+        0, -1, 3,
+        2, 5, 4,
+    };
+    std::vector<float> expected((size_t) n_attn * n_tokens, -1.0e30f);
+    for (int token = 0; token < n_tokens; ++token) {
+        std::copy_n(base.data() + (size_t) token * n_attn, raw_rows,
+                    expected.data() + (size_t) token * n_attn);
+        for (int k = 0; k < top_k; ++k) {
+            const int comp = selected[(size_t) token * top_k + k];
+            if (comp >= 0 && comp < n_comp) {
+                expected[(size_t) token * n_attn + raw_rows + comp] =
+                    base[(size_t) token * n_attn + raw_rows + comp];
+            }
+        }
+    }
+    ggml_context * ctx = make_test_context();
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) return;
+    ggml_tensor * base_t = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, n_attn, n_tokens);
+    ggml_tensor * selected_t = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_I32, top_k, n_tokens);
+    ggml_set_input(base_t);
+    ggml_set_input(selected_t);
+    ggml_tensor * mask_t = ggml_ds4_indexer_mask(
+        ctx, base_t, selected_t, raw_rows);
+    ggml_set_output(mask_t);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 64, false);
+    ggml_build_forward_expand(graph, mask_t);
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    TEST_ASSERT_MSG(ggml_gallocr_alloc_graph(alloc, graph),
+                    "indexer mask graph allocation failed");
+    ggml_backend_tensor_set(base_t, base.data(), 0,
+                            base.size() * sizeof(float));
+    ggml_backend_tensor_set(selected_t, selected.data(), 0,
+                            selected.size() * sizeof(int32_t));
+    TEST_ASSERT_MSG(ggml_backend_graph_compute(backend, graph) ==
+                        GGML_STATUS_SUCCESS,
+                    "indexer mask graph compute failed");
+    std::vector<float> actual(expected.size());
+    ggml_backend_tensor_get(mask_t, actual.data(), 0,
+                            actual.size() * sizeof(float));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        TEST_ASSERT_MSG(actual[i] == expected[i],
+                        "indexer mask output mismatch");
+    }
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_hash_routing_lookup() {
     std::fprintf(stderr, "  test_hash_routing_lookup ...");
 
@@ -1701,6 +2052,304 @@ static void test_output_graph_reuse_microbench(ggml_backend_t backend) {
 }
 
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
+static void test_ds4_flash_attention_keep_cap_gpu() {
+    std::fprintf(stderr, "  test_ds4_flash_attention_keep_cap_gpu ...");
+#if !defined(GGML_USE_HIP)
+    std::fprintf(stderr, " skipped (HIP-only contract)\n");
+    return;
+#endif
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        std::fprintf(stderr, " skipped (no GPU backend)\n");
+        return;
+    }
+
+    constexpr int head_dim = 512;
+    constexpr int n_heads = 4;
+    constexpr int n_tokens = 1;
+    constexpr int raw_rows = 128;
+    constexpr int n_comp_rows = 8;
+    constexpr int n_kv = raw_rows + n_comp_rows;
+    constexpr int configured_keep_rows = 512;
+
+    ggml_context * ctx = make_test_context(2u << 20);
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) {
+        ggml_backend_free(backend);
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    ggml_tensor * q = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, head_dim, n_tokens, n_heads);
+    ggml_tensor * kv = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, head_dim, n_kv, 1);
+    ggml_tensor * mask = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F16, n_kv, n_tokens);
+    ggml_tensor * output = ggml_flash_attn_ext(
+        ctx, q, kv, kv, mask, 1.0f / std::sqrt((float) head_dim),
+        0.0f, 0.0f);
+    ggml_flash_attn_ext_set_ds4_sparse(
+        output, raw_rows, raw_rows, configured_keep_rows, 32);
+    ggml_set_output(output);
+    TEST_ASSERT_MSG(ggml_backend_supports_op(backend, output),
+                    "GPU rejected a DS4 keep cap larger than live history");
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 64, false);
+    ggml_build_forward_expand(graph, output);
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    const bool allocated = ggml_gallocr_alloc_graph(alloc, graph);
+    TEST_ASSERT_MSG(allocated, "DS4 flash-attention graph allocation failed");
+    if (allocated) {
+        std::vector<float> q_data((size_t) head_dim * n_tokens * n_heads);
+        std::vector<float> kv_data((size_t) head_dim * n_kv);
+        std::vector<ggml_fp16_t> mask_data((size_t) n_kv * n_tokens,
+                                           ggml_fp32_to_fp16(0.0f));
+        for (size_t i = 0; i < q_data.size(); ++i) {
+            q_data[i] = ((int) (i % 19) - 9) * 0.002f;
+        }
+        for (size_t i = 0; i < kv_data.size(); ++i) {
+            kv_data[i] = ((int) (i % 23) - 11) * 0.002f;
+        }
+        ggml_backend_tensor_set(q, q_data.data(), 0,
+                                q_data.size() * sizeof(float));
+        ggml_backend_tensor_set(kv, kv_data.data(), 0,
+                                kv_data.size() * sizeof(float));
+        ggml_backend_tensor_set(mask, mask_data.data(), 0,
+                                mask_data.size() * sizeof(ggml_fp16_t));
+        const bool computed =
+            ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        TEST_ASSERT_MSG(computed, "DS4 flash-attention graph compute failed");
+        if (computed) {
+            std::vector<float> output_data((size_t) ggml_nelements(output));
+            ggml_backend_tensor_get(output, output_data.data(), 0,
+                                    output_data.size() * sizeof(float));
+            for (float value : output_data) {
+                TEST_ASSERT_MSG(std::isfinite(value),
+                                "DS4 flash-attention output must be finite");
+            }
+        }
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_ds4_flash_attention_inverse_rope_fallback_gpu() {
+    std::fprintf(stderr,
+                 "  test_ds4_flash_attention_inverse_rope_fallback_gpu ...");
+#if !defined(GGML_USE_HIP)
+    std::fprintf(stderr, " skipped (HIP-only contract)\n");
+    return;
+#endif
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        std::fprintf(stderr, " skipped (no GPU backend)\n");
+        return;
+    }
+
+    constexpr int head_dim = 512;
+    constexpr int raw_rows = 128;
+    constexpr int n_comp_rows = 8;
+    constexpr int n_kv = raw_rows + n_comp_rows;
+
+    ggml_context * ctx = make_test_context(3u << 20);
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) {
+        ggml_backend_free(backend);
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    ggml_tensor * q = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, head_dim, 1, 1);
+    ggml_tensor * k = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, head_dim, n_kv, 1);
+    ggml_tensor * v = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, head_dim, n_kv, 1);
+    ggml_tensor * mask = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F16, n_kv, 1);
+    ggml_tensor * output = ggml_flash_attn_ext(
+        ctx, q, k, v, mask, 1.0f / std::sqrt((float) head_dim),
+        0.0f, 0.0f);
+    // One retained compressed block selects the single-head fallback without
+    // pruning any live row. Position zero makes inverse RoPE the identity, so
+    // a row-constant V has an exact, simple reference result.
+    ggml_flash_attn_ext_set_ds4_sparse(
+        output, raw_rows, raw_rows, 4, n_comp_rows);
+    ggml_flash_attn_ext_set_ds4_inverse_rope(
+        output, 0, 10000.0f, 1.0f, 0.0f, 1.0f,
+        32.0f, 1.0f, 8192, false);
+    ggml_set_output(output);
+    TEST_ASSERT_MSG(ggml_backend_supports_op(backend, output),
+                    "GPU rejected DS4 inverse-RoPE fallback attention");
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 64, false);
+    ggml_build_forward_expand(graph, output);
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    const bool allocated = ggml_gallocr_alloc_graph(alloc, graph);
+    TEST_ASSERT_MSG(allocated,
+                    "DS4 inverse-RoPE fallback graph allocation failed");
+    if (allocated) {
+        std::vector<float> q_data(head_dim);
+        std::vector<float> k_data((size_t) head_dim * n_kv);
+        std::vector<float> v_data((size_t) head_dim * n_kv);
+        std::vector<float> expected(head_dim);
+        std::vector<ggml_fp16_t> mask_data(
+            n_kv, ggml_fp32_to_fp16(0.0f));
+        for (int d = 0; d < head_dim; ++d) {
+            q_data[(size_t) d] = ((d % 19) - 9) * 0.002f;
+            expected[(size_t) d] = ((d % 17) - 8) * 0.003f;
+        }
+        for (int row = 0; row < n_kv; ++row) {
+            for (int d = 0; d < head_dim; ++d) {
+                k_data[(size_t) row * head_dim + d] =
+                    (((row + d) % 23) - 11) * 0.002f;
+                v_data[(size_t) row * head_dim + d] = expected[(size_t) d];
+            }
+        }
+        ggml_backend_tensor_set(q, q_data.data(), 0,
+                                q_data.size() * sizeof(float));
+        ggml_backend_tensor_set(k, k_data.data(), 0,
+                                k_data.size() * sizeof(float));
+        ggml_backend_tensor_set(v, v_data.data(), 0,
+                                v_data.size() * sizeof(float));
+        ggml_backend_tensor_set(mask, mask_data.data(), 0,
+                                mask_data.size() * sizeof(ggml_fp16_t));
+        const bool computed =
+            ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        TEST_ASSERT_MSG(computed,
+                        "DS4 inverse-RoPE fallback graph compute failed");
+        if (computed) {
+            std::vector<float> actual(head_dim);
+            ggml_backend_tensor_get(output, actual.data(), 0,
+                                    actual.size() * sizeof(float));
+            for (int d = 0; d < head_dim; ++d) {
+                TEST_ASSERT_MSG(
+                    nearly_equal(actual[(size_t) d], expected[(size_t) d],
+                                 2.0e-5f, 2.0e-5f),
+                    "inverse-RoPE fallback output mismatch");
+            }
+        }
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_hc_post_strided_split_gpu() {
+    std::fprintf(stderr, "  test_hc_post_strided_split_gpu ...");
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        std::fprintf(stderr, " skipped (no GPU backend)\n");
+        return;
+    }
+
+    constexpr int n_embd = 16;
+    constexpr int n_hc = 4;
+    constexpr int n_tokens = 3;
+    constexpr int hc_dim = n_embd * n_hc;
+    constexpr int mix_dim = 2 * n_hc + n_hc * n_hc;
+    constexpr int split_stride = mix_dim + 7;
+
+    std::vector<float> residual((size_t) hc_dim * n_tokens);
+    std::vector<float> block_out((size_t) n_embd * n_tokens);
+    std::vector<float> split_storage((size_t) split_stride * n_tokens, -99.0f);
+    for (size_t i = 0; i < residual.size(); ++i) {
+        residual[i] = ((int) (i % 17) - 8) * 0.03125f;
+    }
+    for (size_t i = 0; i < block_out.size(); ++i) {
+        block_out[i] = ((int) (i % 11) - 5) * 0.0625f;
+    }
+    for (int token = 0; token < n_tokens; ++token) {
+        float * split = split_storage.data() + (size_t) token * split_stride;
+        for (int i = 0; i < mix_dim; ++i) {
+            split[i] = ((i + 3 * token) % 13 - 6) * 0.05f;
+        }
+    }
+
+    std::vector<float> expected((size_t) hc_dim * n_tokens);
+    for (int token = 0; token < n_tokens; ++token) {
+        const float * residual_row = residual.data() + (size_t) token * hc_dim;
+        const float * block_row = block_out.data() + (size_t) token * n_embd;
+        const float * split = split_storage.data() + (size_t) token * split_stride;
+        const float * post = split + n_hc;
+        const float * comb = split + 2 * n_hc;
+        float * output = expected.data() + (size_t) token * hc_dim;
+        for (int h = 0; h < n_hc; ++h) {
+            for (int d = 0; d < n_embd; ++d) {
+                float value = block_row[d] * post[h];
+                for (int src = 0; src < n_hc; ++src) {
+                    value += comb[h + src * n_hc] *
+                             residual_row[src * n_embd + d];
+                }
+                output[h * n_embd + d] = value;
+            }
+        }
+    }
+
+    ggml_context * ctx = make_test_context(1u << 20);
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) {
+        ggml_backend_free(backend);
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    ggml_tensor * residual_t = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, hc_dim, n_tokens);
+    ggml_tensor * block_t = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * split_storage_t = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, split_stride, n_tokens);
+    ggml_tensor * split_t = ggml_view_2d(
+        ctx, split_storage_t, mix_dim, n_tokens,
+        split_storage_t->nb[1], 0);
+    TEST_ASSERT(!ggml_is_contiguous(split_t));
+    ggml_tensor * output_t = ggml_ds4_hc_post(
+        ctx, residual_t, block_t, split_t, n_hc);
+    ggml_set_output(output_t);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 64, false);
+    ggml_build_forward_expand(graph, output_t);
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    const bool allocated = ggml_gallocr_alloc_graph(alloc, graph);
+    TEST_ASSERT_MSG(allocated, "strided HC-post graph allocation failed");
+    if (allocated) {
+        ggml_backend_tensor_set(residual_t, residual.data(), 0,
+                                residual.size() * sizeof(float));
+        ggml_backend_tensor_set(block_t, block_out.data(), 0,
+                                block_out.size() * sizeof(float));
+        ggml_backend_tensor_set(split_storage_t, split_storage.data(), 0,
+                                split_storage.size() * sizeof(float));
+        const bool computed =
+            ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        TEST_ASSERT_MSG(computed, "strided HC-post graph compute failed");
+        if (computed) {
+            std::vector<float> actual(expected.size());
+            ggml_backend_tensor_get(output_t, actual.data(), 0,
+                                    actual.size() * sizeof(float));
+            for (size_t i = 0; i < actual.size(); ++i) {
+                TEST_ASSERT_MSG(nearly_equal(actual[i], expected[i],
+                                             1.0e-6f, 1.0e-6f),
+                                "strided HC-post output mismatch");
+            }
+        }
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_cpu_hc_sinkhorn_ref(float * out, const float * mix, const float * scale,
                                      const float * base, int n_hc, int iters, float eps) {
     const float pre_scale = scale[0];
@@ -2050,6 +2699,11 @@ int main() {
     test_moe_routing_correctness(backend);
     test_rmsnorm_correctness(backend);
     test_grouped_output_projection_shape();
+    test_grouped_output_projection_cpu(backend);
+    test_ds4_flash_attention_cpu_rejected(backend);
+    test_indexer_qat_cpu(backend);
+    test_indexer_score_cpu(backend);
+    test_indexer_mask_cpu(backend);
     test_hash_routing_lookup();
     test_raw_ring_spans_after_wrap();
     test_auto_split_computation();
@@ -2074,6 +2728,9 @@ int main() {
     test_ffn_graph_reuse_microbench(backend);
     test_output_graph_reuse_microbench(backend);
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
+    test_ds4_flash_attention_keep_cap_gpu();
+    test_ds4_flash_attention_inverse_rope_fallback_gpu();
+    test_hc_post_strided_split_gpu();
     test_hc_pre_kernel_gpu();
 #endif
 

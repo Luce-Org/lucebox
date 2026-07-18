@@ -111,6 +111,8 @@ private:
     bool load_model();
     bool init_hybrid_model();
     bool init_moe_tensor_parallel();
+    bool requires_monolithic_model() const;
+    bool validate_prefill_mode() const;
     bool compute_uniform_hybrid_placement(const DeepSeek4Weights & w,
                                           int max_ctx,
                                           MoeHybridPlacement & out,

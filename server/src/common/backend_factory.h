@@ -15,6 +15,7 @@
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
 #include "placement/remote_target_shard_config.h"
+#include "prefill_attention_mode.h"
 
 #include <memory>
 #include <string>
@@ -43,7 +44,9 @@ struct BackendArgs {
     int             stream_fd    = -1;
 
     // Chunked prefill
-    int             chunk        = 512;
+    int                  chunk             = 512;
+    PrefillAttentionMode ds4_prefill_mode = PrefillAttentionMode::Exact;
+    bool                 ds4_prefill_mode_set = false;
 
     // deepseek4-specific decode options
     int             ds4_expert_top_k = 0;  // 0 = model default
