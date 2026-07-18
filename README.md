@@ -56,25 +56,27 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 
 | Model | Speedup |
 |-------|:-------:|
-| Qwen 3.5-0.8B (Megakernel) | **~2×** |
-| Qwen 3.6-27B + PFlash | **~5.6×** |
-| Qwen 3.6-27B + DDTree | **4.84×** |
-| Laguna-XS-2.1 33B + PFlash | **8.2×** @256K |
-| Laguna-XS-2.1 33B + DFlash | **1.7×** @256K |
-| Qwen 3.6-27B HIP | **~2.6×** |
-| Gemma-4-26B-A4B | **1.31×** |
-| DeepSeek-V4-Flash-ROCMFPX HIP | **2×** |
+| Qwen 3.5 0.8B (Megakernel) | **~2×** |
+| Qwen 3.6 27B + PFlash | **~5.6×** |
+| Qwen 3.6 27B + DDTree | **4.84×** |
+| Laguna XS 2.1 33B + PFlash | **8.2×** @256K |
+| Laguna XS 2.1 33B + DFlash | **1.7×** @256K |
+| Qwen 3.6 27B HIP | **~2.6×** |
+| Gemma 4 26B-A4B | **1.31×** |
+| Gemma 4 31B IT | **3.2×** |
+| DeepSeek V4 Flash ROCMFPX HIP | **2×** |
 
 </td>
 <td valign="top">
 
 | Drafter | Phase |
 |---------|:-----:|
-| [`Qwen3.6-27B`](https://huggingface.co/Lucebox/Qwen3.6-27B-DFlash-GGUF) | decode |
-| [`gemma-4-26B-A4B`](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF) | decode |
-| [`gemma-4-31B`](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF) | decode |
-| [`Qwen3-0.6B`](https://huggingface.co/Qwen/Qwen3-0.6B) | prefill |
-| [`DeepSeek-V4-Flash-DSpark-Drafter`](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-DSpark-Drafter-GGUF) | decode |
+| [`Qwen3.6 27B`](https://huggingface.co/Lucebox/Qwen3.6-27B-DFlash-GGUF) | decode |
+| [`gemma 4 26B A4B`](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF) | decode |
+| [`gemma 4 31B`](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF) | decode |
+| [`Laguna XS 2.1 33B`](https://huggingface.co/Lucebox/Laguna-XS-2.1-DFlash-GGUF) | decode |
+| [`Qwen3 0.6B`](https://huggingface.co/Qwen/Qwen3-0.6B) | prefill |
+| [`DeepSeek V4 Flash DSpark Drafter`](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-DSpark-Drafter-GGUF) | decode |
 
 </td>
 </tr>
