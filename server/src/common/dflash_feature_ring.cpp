@@ -345,6 +345,81 @@ bool draft_feature_mirror_sync_range(const ggml_tensor * src_target_feat,
     const int fc_in = mirror.n_target_layers * mirror.hidden_size;
     const size_t src_stride = src_target_feat->nb[1];
     const size_t dst_stride = mirror.target_feat->nb[1];
+    const bool meta_source = src_target_feat->buffer &&
+        ggml_backend_buft_is_meta(
+            ggml_backend_buffer_get_type(src_target_feat->buffer));
+
+    if (meta_source) {
+        const size_t src_row_bytes =
+            ggml_row_size(src_target_feat->type, fc_in);
+        const size_t dst_row_bytes =
+            ggml_row_size(mirror.storage_type, fc_in);
+        if (src_target_feat->type != GGML_TYPE_BF16) {
+            return false;
+        }
+
+        int done = 0;
+        while (done < n_tokens) {
+            const int src_slot = (start_pos + done) % src_cap;
+            const int dst_slot = (start_pos + done) % mirror.cap;
+            const int run = std::min(
+                n_tokens - done,
+                std::min(src_cap - src_slot, mirror.cap - dst_slot));
+            const size_t run_elements = (size_t) run * (size_t) fc_in;
+
+            std::vector<ggml_bf16_t> bf16(run_elements);
+
+            // One logical read lets the meta backend gather every row with
+            // batched rank-local 2D transfers instead of synchronizing once
+            // per token.
+            ggml_backend_tensor_get_2d(
+                src_target_feat, bf16.data(),
+                (size_t) src_slot * src_stride,
+                src_row_bytes, (size_t) run,
+                src_stride, src_row_bytes);
+
+            const void * upload_data = bf16.data();
+            std::vector<float> host;
+            std::vector<uint8_t> converted;
+            if (mirror.storage_type != GGML_TYPE_BF16) {
+                host.resize(run_elements);
+                for (int row = 0; row < run; ++row) {
+                    const size_t element_offset =
+                        (size_t) row * (size_t) fc_in;
+                    ggml_bf16_to_fp32_row(
+                        bf16.data() + element_offset,
+                        host.data() + element_offset, fc_in);
+                }
+                upload_data = host.data();
+            }
+            if (mirror.storage_type != GGML_TYPE_BF16 &&
+                mirror.storage_type != GGML_TYPE_F32) {
+                converted.resize((size_t) run * dst_row_bytes);
+                for (int row = 0; row < run; ++row) {
+                    const size_t element_offset =
+                        (size_t) row * (size_t) fc_in;
+                    if (!host_f32_to_feature_row(
+                            mirror.storage_type,
+                            host.data() + element_offset,
+                            converted.data() + (size_t) row * dst_row_bytes,
+                            fc_in)) {
+                        return false;
+                    }
+                }
+                upload_data = converted.data();
+            }
+
+            // The destination run is contiguous, so upload all converted rows
+            // with one transfer. Runs split only at either ring's wrap point.
+            ggml_backend_tensor_set_2d(
+                mirror.target_feat, upload_data,
+                (size_t) dst_slot * dst_stride,
+                dst_row_bytes, (size_t) run,
+                dst_stride, dst_row_bytes);
+            done += run;
+        }
+        return true;
+    }
 
     int done = 0;
     while (done < n_tokens) {

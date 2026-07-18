@@ -36,6 +36,8 @@
 
 namespace dflash::common {
 
+class Qwen35TensorParallelContext;
+
 // ── Configuration passed at construction ────────────────────────────────
 
 struct Qwen35Config {
@@ -220,6 +222,7 @@ private:
     ggml_backend_t target_backend_ = nullptr;
     ggml_backend_t draft_backend_  = nullptr;
     ggml_backend_t snap_backend_   = nullptr;  // snapshot storage (CPU or unified)
+    std::unique_ptr<Qwen35TensorParallelContext> tensor_parallel_;
     bool           split_gpus_     = false;
 
     // ── Model weights + caches ───────────────────────────────────────

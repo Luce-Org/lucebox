@@ -308,6 +308,7 @@ add_library(dflash_common STATIC
     src/qwen35/qwen35_target_shard_ipc_daemon.cpp
     src/qwen35/layer_split_daemon.cpp
     src/qwen35/qwen35_backend.cpp
+    src/qwen35/qwen35_tensor_parallel.cpp
     src/qwen35/qwen35_layer_split_adapter.cpp
     src/qwen35/qwen35_dflash_target.cpp
     src/qwen35/qwen35_layer_split_dflash_target.cpp
@@ -686,6 +687,10 @@ if(DFLASH27B_TESTS)
             hip::host)
         add_test(NAME rocmfp4_hip_tail COMMAND test_rocmfp4_hip_tail)
     endif()
+    add_executable(test_qwen35_tensor_parallel test/test_qwen35_tensor_parallel.cpp)
+    target_include_directories(test_qwen35_tensor_parallel PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+    target_link_libraries(test_qwen35_tensor_parallel PRIVATE dflash_common)
+    add_test(NAME qwen35_tensor_parallel COMMAND test_qwen35_tensor_parallel)
 
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash_cuda_min_sm GREATER_EQUAL 80 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
         add_executable(test_flashprefill_kernels test/test_flashprefill_kernels.cpp)

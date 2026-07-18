@@ -1136,10 +1136,6 @@ struct ggml_cuda_device_info {
     cuda_device_info devices[GGML_CUDA_MAX_DEVICES] = {};
 
     std::array<float, GGML_CUDA_MAX_DEVICES> default_tensor_split = {};
-
-#ifdef GGML_USE_NCCL
-    ncclComm_t comms[GGML_CUDA_MAX_DEVICES];
-#endif // GGML_USE_NCCL
 };
 
 const ggml_cuda_device_info & ggml_cuda_info();
@@ -1229,6 +1225,7 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     // GGML_CUDA_GRAPH_STATS=1 counters
     uint64_t stat_total = 0, stat_replay = 0, stat_capture = 0, stat_eager = 0;
+    uint64_t uid = 0;
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
