@@ -3682,6 +3682,34 @@ static void test_props_runtime_shape() {
     TEST_ASSERT(body["runtime"]["draft_device"].is_null());
 }
 
+static void test_props_speculative_contract_shape() {
+    ServerConfig cfg = make_props_config_with_sidecar(json::object());
+    cfg.draft_path = "/models/draft.gguf";
+    cfg.speculative_contract = SpeculativeContract::Exact;
+    cfg.speculative_enabled = false;
+    cfg.ddtree_enabled = true;
+    cfg.ddtree_budget = 22;
+    Tokenizer tok;
+    PrefixCache pc(0, tok);
+    ToolMemory tm;
+
+    json body = build_props_body(cfg, pc, tm);
+    TEST_ASSERT(body["speculative"]["configured_contract"] == "exact");
+    TEST_ASSERT(body["speculative"]["draft_attached"] == true);
+    TEST_ASSERT(body["speculative"]["draft_loaded"] == false);
+    TEST_ASSERT(body["speculative"]["enabled"] == false);
+    TEST_ASSERT(body["speculative"]["exact_execution"] == "autoregressive");
+    TEST_ASSERT(body["speculative"]["sampling_behavior"] == "autoregressive_fallback");
+    TEST_ASSERT(body["speculative"]["ddtree_budget"] == 22);
+
+    cfg.speculative_contract = SpeculativeContract::Approximate;
+    cfg.speculative_enabled = true;
+    body = build_props_body(cfg, pc, tm);
+    TEST_ASSERT(body["speculative"]["configured_contract"] == "approximate");
+    TEST_ASSERT(body["speculative"]["enabled"] == true);
+    TEST_ASSERT(body["speculative"]["draft_loaded"] == true);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // usage.timings — per-request prefill / decode wall-clock breakdown
 // surfaced under usage.timings (spec §6.3). Tests cover all three
@@ -3775,6 +3803,69 @@ static void test_usage_timings_omitted_when_null() {
     TEST_ASSERT(finish_str.find("[DONE]") != std::string::npos);
 }
 
+static void test_speculative_usage_streaming_matches_nonstreaming() {
+    GenTimings t{
+        0.1,
+        0.5,
+        SpeculativeContract::Exact,
+        EffectiveDecodeMode::Autoregressive,
+        SpeculativeFallbackReason::ExactContractRequiresAR,
+    };
+    const json nonstream = build_speculative_usage_json(t);
+    TEST_ASSERT(nonstream["configured_contract"] == "exact");
+    TEST_ASSERT(nonstream["effective_decode_mode"] == "autoregressive");
+    TEST_ASSERT(nonstream["fallback_reason"] == "exact_contract_requires_ar");
+
+    for (ApiFormat format : {
+             ApiFormat::OPENAI_CHAT, ApiFormat::ANTHROPIC,
+             ApiFormat::RESPONSES}) {
+        auto em = make_emitter(format);
+        em.emit_start();
+        em.emit_token("ok");
+        const std::string stream = concat(em.emit_finish(1, &t));
+        TEST_ASSERT(stream.find(nonstream.dump()) != std::string::npos);
+    }
+}
+
+static void test_speculative_contract_route_state_machine() {
+    SpeculativeContract parsed = SpeculativeContract::Approximate;
+    TEST_ASSERT(parse_speculative_contract("exact", parsed));
+    TEST_ASSERT(parsed == SpeculativeContract::Exact);
+    TEST_ASSERT(parse_speculative_contract("approximate", parsed));
+    TEST_ASSERT(parsed == SpeculativeContract::Approximate);
+    TEST_ASSERT(!parse_speculative_contract("fast", parsed));
+
+    auto route = resolve_speculative_route(
+        SpeculativeContract::Exact, true, false, false, false);
+    TEST_ASSERT(!route.use_speculative);
+    TEST_ASSERT(route.effective_mode == EffectiveDecodeMode::Autoregressive);
+    TEST_ASSERT(route.fallback_reason ==
+                SpeculativeFallbackReason::ExactContractRequiresAR);
+
+    route = resolve_speculative_route(
+        SpeculativeContract::Exact, true, true, false, false);
+    TEST_ASSERT(!route.use_speculative);
+    TEST_ASSERT(route.effective_mode == EffectiveDecodeMode::Autoregressive);
+    TEST_ASSERT(route.fallback_reason ==
+                SpeculativeFallbackReason::ExactContractRequiresAR);
+
+    route = resolve_speculative_route(
+        SpeculativeContract::Approximate, true, false, false, false);
+    TEST_ASSERT(route.use_speculative);
+    TEST_ASSERT(route.effective_mode == EffectiveDecodeMode::ApproximateChain);
+    TEST_ASSERT(route.fallback_reason == SpeculativeFallbackReason::None);
+
+    route = resolve_speculative_route(
+        SpeculativeContract::Approximate, true, true, false, false);
+    TEST_ASSERT(route.use_speculative);
+    TEST_ASSERT(route.effective_mode == EffectiveDecodeMode::ApproximateDDTree);
+
+    route = resolve_speculative_route(
+        SpeculativeContract::Approximate, true, true, true, false);
+    TEST_ASSERT(!route.use_speculative);
+    TEST_ASSERT(route.fallback_reason == SpeculativeFallbackReason::SamplingUnsupported);
+}
+
 // ModelBackend common empty-spec retry tests
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -3823,11 +3914,117 @@ struct EmptySpecRetryBackend : MockBackend {
     }
 };
 
+struct ContractParityBackend : MockBackend {
+    std::vector<int32_t> ar_tokens{10, 11, 12, 13};
+    std::vector<int32_t> approximate_tokens{90, 91};
+    bool saw_force_ar = false;
+
+    GenerateResult generate_impl(const GenerateRequest & req,
+                                 const DaemonIO & io) override {
+        GenerateResult result;
+        result.succeed();
+        saw_force_ar = req.force_ar_decode;
+        const auto & source = req.force_ar_decode ? ar_tokens : approximate_tokens;
+        for (int32_t tok : source) {
+            result.tokens.push_back(tok);
+            io.emit(tok);
+            if (io.cancelled) break;
+        }
+        result.spec_decode_ran = !req.force_ar_decode;
+        return result;
+    }
+};
+
+static GenerateRequest make_contract_request(SpeculativeContract contract) {
+    GenerateRequest req;
+    req.prompt = {1, 2, 3};
+    req.n_gen = 4;
+    req.speculative_candidate = true;
+    req.speculative_contract = contract;
+    return req;
+}
+
+static void test_exact_contract_tokens_match_forced_ar() {
+    ContractParityBackend exact_backend;
+    GenerateRequest exact_req = make_contract_request(SpeculativeContract::Exact);
+    DaemonIO io;
+    GenerateResult exact = exact_backend.generate(exact_req, io);
+
+    ContractParityBackend ar_backend;
+    GenerateRequest ar_req = make_contract_request(SpeculativeContract::Approximate);
+    ar_req.force_ar_decode = true;
+    GenerateResult baseline = ar_backend.generate(ar_req, io);
+
+    TEST_ASSERT(exact.ok());
+    TEST_ASSERT(exact_backend.saw_force_ar);
+    TEST_ASSERT(exact.tokens == baseline.tokens);
+    TEST_ASSERT(exact.effective_decode_mode == EffectiveDecodeMode::Autoregressive);
+    TEST_ASSERT(exact.speculative_fallback_reason ==
+                SpeculativeFallbackReason::ExactContractRequiresAR);
+}
+
+static void test_exact_contract_stop_boundary_matches_forced_ar() {
+    auto run = [](GenerateRequest req) {
+        ContractParityBackend backend;
+        std::vector<int32_t> streamed;
+        DaemonIO io;
+        io.on_token = [&](int32_t tok) {
+            streamed.push_back(tok);
+            return streamed.size() < 2;
+        };
+        GenerateResult result = backend.generate(req, io);
+        return std::make_pair(result.tokens, streamed);
+    };
+
+    GenerateRequest exact_req = make_contract_request(SpeculativeContract::Exact);
+    GenerateRequest ar_req = make_contract_request(SpeculativeContract::Approximate);
+    ar_req.force_ar_decode = true;
+    const auto exact = run(exact_req);
+    const auto baseline = run(ar_req);
+    TEST_ASSERT(exact.first == baseline.first);
+    TEST_ASSERT(exact.second == baseline.second);
+    TEST_ASSERT(exact.second == std::vector<int32_t>({10, 11}));
+}
+
+static void test_approximate_contract_is_only_speculative_opt_in() {
+    ContractParityBackend backend;
+    GenerateRequest req = make_contract_request(SpeculativeContract::Approximate);
+    DaemonIO io;
+    GenerateResult result = backend.generate(req, io);
+
+    TEST_ASSERT(result.ok());
+    TEST_ASSERT(!backend.saw_force_ar);
+    TEST_ASSERT(result.tokens == backend.approximate_tokens);
+    TEST_ASSERT(result.spec_decode_ran);
+    TEST_ASSERT(result.effective_decode_mode == EffectiveDecodeMode::ApproximateChain);
+    TEST_ASSERT(result.speculative_fallback_reason == SpeculativeFallbackReason::None);
+}
+
+static void test_sampling_uses_ar_under_both_contracts() {
+    for (SpeculativeContract contract : {
+             SpeculativeContract::Exact, SpeculativeContract::Approximate}) {
+        ContractParityBackend backend;
+        GenerateRequest req = make_contract_request(contract);
+        req.do_sample = true;
+        DaemonIO io;
+        GenerateResult result = backend.generate(req, io);
+        TEST_ASSERT(backend.saw_force_ar);
+        TEST_ASSERT(result.tokens == backend.ar_tokens);
+        TEST_ASSERT(result.effective_decode_mode == EffectiveDecodeMode::Autoregressive);
+        const auto expected = contract == SpeculativeContract::Exact
+            ? SpeculativeFallbackReason::ExactContractRequiresAR
+            : SpeculativeFallbackReason::SamplingUnsupported;
+        TEST_ASSERT(result.speculative_fallback_reason == expected);
+    }
+}
+
 static void test_model_backend_retries_empty_spec_generate_once_with_ar() {
     EmptySpecRetryBackend backend;
     GenerateRequest req;
     req.prompt = {1, 2, 3};
     req.n_gen = 4;
+    req.speculative_candidate = true;
+    req.speculative_contract = SpeculativeContract::Approximate;
     DaemonIO io;
 
     GenerateResult result = backend.generate(req, io);
@@ -3845,6 +4042,8 @@ static void test_model_backend_retries_empty_spec_restore_once_with_ar() {
     GenerateRequest req;
     req.prompt = {1, 2, 3};
     req.n_gen = 4;
+    req.speculative_candidate = true;
+    req.speculative_contract = SpeculativeContract::Approximate;
     DaemonIO io;
 
     GenerateResult result =
@@ -3864,6 +4063,8 @@ static void test_model_backend_retries_empty_visible_spec_generate_once_with_ar(
     GenerateRequest req;
     req.prompt = {1, 2, 3};
     req.n_gen = 4;
+    req.speculative_candidate = true;
+    req.speculative_contract = SpeculativeContract::Approximate;
     DaemonIO io;
 
     GenerateResult result = backend.generate(req, io);
@@ -3883,6 +4084,8 @@ static void test_model_backend_retries_empty_visible_spec_restore_once_with_ar()
     GenerateRequest req;
     req.prompt = {1, 2, 3};
     req.n_gen = 4;
+    req.speculative_candidate = true;
+    req.speculative_contract = SpeculativeContract::Approximate;
     DaemonIO io;
 
     GenerateResult result = backend.restore_and_generate(7, req, io);
@@ -4656,6 +4859,7 @@ int main() {
     RUN_TEST(test_props_model_card_null_on_family_fallback);
     RUN_TEST(test_props_budget_envelope_shape);
     RUN_TEST(test_props_runtime_shape);
+    RUN_TEST(test_props_speculative_contract_shape);
 
     std::fprintf(stderr, "\n── usage.timings ──\n");
     RUN_TEST(test_usage_timings_openai_chat_streaming);
@@ -4663,6 +4867,14 @@ int main() {
     RUN_TEST(test_usage_timings_responses_streaming);
     RUN_TEST(test_usage_timings_zero_decode_no_div_by_zero);
     RUN_TEST(test_usage_timings_omitted_when_null);
+    RUN_TEST(test_speculative_usage_streaming_matches_nonstreaming);
+
+    std::fprintf(stderr, "\n── speculative contract routing ──\n");
+    RUN_TEST(test_speculative_contract_route_state_machine);
+    RUN_TEST(test_exact_contract_tokens_match_forced_ar);
+    RUN_TEST(test_exact_contract_stop_boundary_matches_forced_ar);
+    RUN_TEST(test_approximate_contract_is_only_speculative_opt_in);
+    RUN_TEST(test_sampling_uses_ar_under_both_contracts);
 
     std::fprintf(stderr, "\n── ModelBackend empty-spec retry ──\n");
     RUN_TEST(test_model_backend_retries_empty_spec_generate_once_with_ar);

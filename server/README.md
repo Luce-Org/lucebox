@@ -166,9 +166,20 @@ Run it directly:
   --host 127.0.0.1 --port 18080 \
   --max-ctx 32768 --max-tokens 512 \
   --fa-window 2048 \
+  --spec-contract approximate \
   --ddtree --ddtree-budget 22 \
   --model-name luce-dflash
 ```
+
+When a decode draft is attached, `--spec-contract exact` is the default. The
+current exact contract conservatively uses target autoregressive decoding;
+the decode draft is not loaded in this mode, and stochastic requests also use
+that path. The existing batched chain/DDTree
+implementation is available only with the explicit
+`--spec-contract approximate` opt-in. `GET /props` advertises the configured
+contract, and every streaming or non-streaming terminal `usage` object reports
+the configured contract, effective decode mode, and fallback reason. The old
+`--seq-verify` server flag is a deprecated alias for exact mode.
 
 ### Compression proxy mode
 
