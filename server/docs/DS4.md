@@ -138,6 +138,91 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 
 DeepSeek4 no longer uses the old expert-split environment variables or expert-worker tuning knobs. Those retired knobs were removed from the codebase rather than left behind as unsupported debug switches.
 
+## DSpark Speculative Decode
+
+DeepSeek4 uses the shared DFlash DSpark head implementation together with a
+DeepSeek4-specific three-layer drafter and fused target verification. The draft
+GGUF carries its auxiliary projections under the existing `dflash.dspark.*`
+tensor contract. DeepSeek4/MTP checkpoints store compatible heads under the
+`mtp.2.*` namespace, which the converter maps as follows.
+
+Supported DeepSeek4/MTP input tensors:
+
+| DeepSeek4/MTP tensor | GGUF tensor |
+|----------------------|-------------|
+| `mtp.2.markov_head.markov_w1.weight` | `dflash.dspark.markov.w1` |
+| `mtp.2.markov_head.markov_w2.weight` | `dflash.dspark.markov.w2` |
+| `mtp.2.confidence_head.proj.weight` | `dflash.dspark.confidence.weight` |
+| `mtp.2.confidence_head.proj.bias` | `dflash.dspark.confidence.bias` |
+
+If the MTP confidence projection is bias-less, the converter writes a zero
+bias so the GGUF loader still sees the pair it expects. The Markov head alone
+is enough for DSpark greedy-chain correction; confidence gating remains
+optional.
+
+Example conversion with the DS4 MTP shard that contains the DSpark heads:
+
+```bash
+python server/scripts/convert_dflash_to_gguf.py \
+  /path/to/dflash-draft/model.safetensors \
+  /path/to/dflash-draft.gguf \
+  --aux-heads /path/to/hf-ds4-flash-dspark/model-00048-of-00048.safetensors
+```
+
+Run the converted drafter against a DeepSeek4 target with:
+
+```bash
+export DFLASH_DS4_SPEC=1
+export DFLASH_DS4_FUSED_VERIFY=1
+export DFLASH_DS4_DRAFT=/path/to/dflash-draft.gguf
+export DFLASH_DS4_SPEC_Q=4
+
+./server/build-hip/dflash_server /path/to/deepseek4-target.gguf \
+  --target-device hip:0 \
+  --ds4-fused-decode \
+  --ds4-expert-top-k 4
+```
+
+`DFLASH_DS4_FUSED_VERIFY=1` is the opt-in throughput profile. Its persistent
+whole-model GPU graph uses stable padded reduction shapes, so near-tied greedy
+logits can select a different token than the normal causal verifier even at
+temperature 0. Leave it unset when comparing against the normal verifier, or
+set `DFLASH_DS4_SEQ_VERIFY=1` for the slower token-at-a-time verification
+diagnostic. Neither fused verification nor the separate
+`--ds4-expert-top-k 4` approximation should be presented as byte-identical AR.
+
+DSpark currently requires monolithic target placement. On HIP,
+`--ds4-fused-decode` selects that placement; if the target falls back to hybrid
+expert placement, the server logs that DSpark is disabled and continues with
+the normal autoregressive path. `--ds4-expert-top-k 4` is a separate,
+approximate inference policy used by the validated Strix Halo profile; omit it
+to retain the model's default six routed experts.
+
+On HIP `gfx1151`, enabling DSpark defaults `LUCE_MMVQ_MAX_NCOLS` to `4` when
+the variable is unset. This keeps the four-row verifier on MMVQ. On a 128 GiB
+Strix Halo Radeon 8060S using ROCm 7.2.4, the rebased candidate measured 32.12
+tok/s weighted at fixed q=4 and 31.94 tok/s with confidence-adaptive width,
+versus 25.31 tok/s autoregressive. All three configurations scored 10/10 on the
+same five GSM and five Math prompts. The run used `--ds4-expert-top-k 4`, the
+platform `performance` profile, and the GPU `high` performance level; fixed
+q=4 with the model-default six routed experts measured 28.26 tok/s. Enabling
+DSpark alone therefore does not guarantee 30 tok/s. Set
+`LUCE_MMVQ_MAX_NCOLS` explicitly to override the platform default. AR, NVIDIA,
+and other HIP architectures retain the shared dispatch default.
+
+Adaptive width is automatic. When the draft artifact has a compatible
+confidence projection, the runtime selects q=2, q=3, or q=4 from the cumulative
+confidence of the proposed prefix. It adds the projection to the same fused
+Markov graph and reads its scores in the existing token-id synchronization; no
+additional host round trip is introduced. Artifacts without a compatible
+confidence head transparently retain the existing acceptance-EWMA policy.
+
+On the gfx1151 validation host, confidence-adaptive width retained 10/10
+GSM+Math accuracy and measured 31.94 tok/s weighted, within 0.6% of fixed q=4
+at 32.12 tok/s. These numbers are workload-specific; the confidence policy is
+enabled only when DSpark is explicitly enabled and the draft artifact contains
+a compatible confidence head.
+
 ## Example: CUDA + Halo Layer Split
 
 Automatic split (CUDA prefix chosen from free memory, optional manual override via `DFLASH_DS4_CUDA_LAYERS`):

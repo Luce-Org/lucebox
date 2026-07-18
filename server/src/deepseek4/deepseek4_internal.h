@@ -321,10 +321,19 @@ bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
 bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
                                 DeepSeek4Cache & cache);
 
+// Largest prefix of [kv_start, kv_start + n_tokens) that reaches at most the
+// next learned-compressor boundary. Multi-token dynamic forwards split on
+// this prefix so state writes after a boundary cannot race ahead of pooling.
+int deepseek4_safe_compressor_batch_tokens(const DeepSeek4Weights & w,
+                                           int kv_start,
+                                           int n_tokens);
+
 // Forward: single step (prefill chunk or decode token).
 // embed: [n_embd, n_tokens] input embeddings (post-embedding lookup).
 // hc_state: [n_hc * n_embd] persistent HC residual (updated in-place).
 // Returns logits for last token.
+struct Ds4VerifyHooks;
+
 bool deepseek4_step(
     ggml_backend_t              backend,
     const DeepSeek4Weights &    w,
@@ -337,7 +346,18 @@ bool deepseek4_step(
     const int32_t *             token_ids = nullptr,
     MoeHybridStreamEngine *     stream_engine = nullptr,
     DeepSeek4StepTelemetry *    telemetry = nullptr,
-    MoeHybridRoutingStats *     routing_stats = nullptr);
+    MoeHybridRoutingStats *     routing_stats = nullptr,
+    Ds4VerifyHooks *            verify_hooks = nullptr);
+
+// Optional hooks for the DSpark spec-decode batched verify (deepseek4_dspark).
+// When set on a multi-token deepseek4_step_layer_range call they add: per-layer
+// mean-over-HC feature capture and full per-position logits. Null on the normal
+// (23 tok/s) decode path so it is completely unaffected.
+struct Ds4VerifyHooks {
+    const std::vector<int> * capture_layer_ids = nullptr;  // e.g. {40,41,42}
+    std::vector<float> *     capture_out = nullptr;         // [n_cap*n_embd * n_tokens]
+    std::vector<float> *     all_logits_out = nullptr;      // [n_vocab * n_tokens]
+};
 
 bool deepseek4_step_layer_range(
     ggml_backend_t              backend,
@@ -351,7 +371,9 @@ bool deepseek4_step_layer_range(
     int                         layer_end,
     std::vector<float> *        out_logits,
     const int32_t *             token_ids = nullptr,
-    DeepSeek4StepTelemetry *    telemetry = nullptr);
+    DeepSeek4StepTelemetry *    telemetry = nullptr,
+    bool                        allow_decode_graph_reuse = true,
+    Ds4VerifyHooks *            verify_hooks = nullptr);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,

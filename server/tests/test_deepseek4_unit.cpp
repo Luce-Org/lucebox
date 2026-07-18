@@ -8,9 +8,11 @@
 #endif
 
 #include "common/backend_ipc.h"
+#include "common/dspark_head.h"
 #include "common/layer_split_backend.h"
 #include "common/layer_split_runtime.h"
 #include "common/layer_split_utils.h"
+#include "deepseek4/deepseek4_dspark.h"
 
 #include <memory>
 #include <random>
@@ -30,6 +32,7 @@
 #include <unistd.h>
 
 #define private public
+#include "deepseek4/deepseek4_backend.h"
 #include "deepseek4/deepseek4_layer_split_adapter.h"
 #undef private
 
@@ -200,12 +203,209 @@ static std::string write_deepseek4_tensor_fixture() {
     return path;
 }
 
+struct DSparkFixtureOptions {
+    bool wrong_main_norm_shape = false;
+    bool add_unknown_tensor = false;
+};
+
+static std::string write_dspark_loader_fixture(const DSparkFixtureOptions & opts = {}) {
+    ggml_init_params ip{};
+    ip.mem_size = 4u << 20;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc = false;
+    ggml_context * ctx = ggml_init(ip);
+    gguf_context * g = gguf_init_empty();
+
+    const char * arch = "deepseek4-dflash-draft";
+    const std::string p = std::string(arch) + ".";
+    gguf_set_val_str(g, "general.architecture", arch);
+    gguf_set_val_u32(g, (p + "block_count").c_str(), 1);
+    gguf_set_val_u32(g, (p + "embedding_length").c_str(), 4);
+    gguf_set_val_u32(g, (p + "vocab_size").c_str(), 8);
+    gguf_set_val_u32(g, (p + "attention.head_count").c_str(), 1);
+    gguf_set_val_u32(g, (p + "attention.head_count_kv").c_str(), 1);
+    gguf_set_val_u32(g, (p + "attention.key_length").c_str(), 4);
+    gguf_set_val_u32(g, (p + "rope.dimension_count").c_str(), 4);
+    gguf_set_val_u32(g, (p + "attention.q_lora_rank").c_str(), 4);
+    gguf_set_val_u32(g, (p + "attention.output_lora_rank").c_str(), 4);
+    gguf_set_val_u32(g, (p + "attention.output_group_count").c_str(), 1);
+    gguf_set_val_u32(g, (p + "expert_count").c_str(), 2);
+    gguf_set_val_u32(g, (p + "expert_used_count").c_str(), 1);
+    gguf_set_val_u32(g, (p + "expert_shared_count").c_str(), 1);
+    gguf_set_val_u32(g, (p + "expert_feed_forward_length").c_str(), 8);
+    gguf_set_val_u32(g, (p + "hash_layer_count").c_str(), 0);
+    gguf_set_val_u32(g, (p + "attention.sliding_window").c_str(), 8);
+    gguf_set_val_u32(g, (p + "attention.indexer.head_count").c_str(), 1);
+    gguf_set_val_u32(g, (p + "attention.indexer.key_length").c_str(), 4);
+    gguf_set_val_u32(g, (p + "attention.indexer.top_k").c_str(), 1);
+    gguf_set_val_u32(g, (p + "hyper_connection.count").c_str(), 1);
+    gguf_set_val_u32(g, (p + "hyper_connection.sinkhorn_iterations").c_str(), 1);
+    gguf_set_val_u32(g, (p + "dflash.n_target_layers").c_str(), 1);
+    gguf_set_val_u32(g, (p + "dflash.block_size").c_str(), 2);
+    gguf_set_val_u32(g, (p + "dflash.mask_token_id").c_str(), 7);
+    gguf_set_val_u32(g, (p + "dflash.head_hc_enabled").c_str(), 1);
+    gguf_set_val_u32(g, (p + "dflash.dspark.enabled").c_str(), 1);
+    gguf_set_val_u32(g, (p + "dflash.dspark.markov_rank").c_str(), 2);
+    gguf_set_val_u32(g, (p + "dflash.dspark.vocab_size").c_str(), 8);
+    const int32_t capture_ids[] = {0};
+    gguf_set_arr_data(g, (p + "dflash.capture_layer_ids").c_str(),
+                      GGUF_TYPE_INT32, capture_ids, 1);
+
+    auto add1 = [&](const char * name, int64_t n0) {
+        ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n0);
+        ggml_set_name(t, name);
+        std::memset(t->data, 0, ggml_nbytes(t));
+        gguf_add_tensor(g, t);
+    };
+    auto add2 = [&](const char * name, int64_t n0, int64_t n1) {
+        ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n0, n1);
+        ggml_set_name(t, name);
+        std::memset(t->data, 0, ggml_nbytes(t));
+        gguf_add_tensor(g, t);
+    };
+    auto add3 = [&](const char * name, int64_t n0, int64_t n1, int64_t n2) {
+        ggml_tensor * t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n0, n1, n2);
+        ggml_set_name(t, name);
+        std::memset(t->data, 0, ggml_nbytes(t));
+        gguf_add_tensor(g, t);
+    };
+
+    add1("output_norm.weight", 4);
+    add2("output_hc_fn.weight", 4, 1);
+    add1("output_hc_scale.weight", 1);
+    add1("output_hc_base.weight", 1);
+    add2("dflash.fc.weight", 4, 4);
+    add1("dflash.hidden_norm.weight", opts.wrong_main_norm_shape ? 3 : 4);
+    add2("dflash.dspark.markov.w1", 2, 8);
+    add2("dflash.dspark.markov.w2", 2, 8);
+
+    add1("blk.0.attn_norm.weight", 4);
+    add2("blk.0.attn_q_a.weight", 4, 4);
+    add1("blk.0.attn_q_a_norm.weight", 4);
+    add2("blk.0.attn_q_b.weight", 4, 4);
+    add2("blk.0.attn_kv.weight", 4, 4);
+    add1("blk.0.attn_kv_a_norm.weight", 4);
+    add2("blk.0.attn_output_a.weight", 4, 4);
+    add2("blk.0.attn_output_b.weight", 4, 4);
+    add2("blk.0.hc_attn_fn.weight", 4, 3);
+    add1("blk.0.hc_attn_scale.weight", 3);
+    add1("blk.0.hc_attn_base.weight", 3);
+    add1("blk.0.ffn_norm.weight", 4);
+    add2("blk.0.ffn_gate_inp.weight", 4, 2);
+    add3("blk.0.ffn_gate_exps.weight", 4, 8, 2);
+    add3("blk.0.ffn_up_exps.weight", 4, 8, 2);
+    add3("blk.0.ffn_down_exps.weight", 8, 4, 2);
+    add2("blk.0.ffn_gate_shexp.weight", 4, 8);
+    add2("blk.0.ffn_up_shexp.weight", 4, 8);
+    add2("blk.0.ffn_down_shexp.weight", 8, 4);
+    add2("blk.0.hc_ffn_fn.weight", 4, 3);
+    add1("blk.0.hc_ffn_scale.weight", 3);
+    add1("blk.0.hc_ffn_base.weight", 3);
+    if (opts.add_unknown_tensor) add2("token_embd.weight", 4, 8);
+
+    const std::string path = make_temp_gguf_path("dspark");
+    gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
+    gguf_free(g);
+    ggml_free(ctx);
+    return path;
+}
+
 static ggml_context * make_test_context(size_t mem_size = 1u << 20) {
     ggml_init_params params = {};
     params.mem_size = mem_size;
     params.mem_buffer = nullptr;
     params.no_alloc = true;
     return ggml_init(params);
+}
+
+static void test_dspark_confidence_uses_separate_hidden(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_dspark_confidence_uses_separate_hidden ...");
+
+    constexpr int hidden = 2;
+    constexpr int rank = 1;
+    constexpr int vocab = 3;
+    constexpr int q_len = 2;  // dummy seed row + one candidate row
+
+    ggml_context * ctx = make_test_context();
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) {
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    ggml_tensor * lm_head = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, vocab);
+    ggml_tensor * markov_w1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, vocab);
+    ggml_tensor * markov_w2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, vocab);
+    ggml_tensor * confidence_w =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden + rank, 1);
+    ggml_tensor * confidence_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    TEST_ASSERT_MSG(buf != nullptr, "weight allocation failed");
+    if (!buf) {
+        ggml_free(ctx);
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    const std::vector<float> zeros_lm((size_t) hidden * vocab, 0.0f);
+    const std::vector<float> zeros_markov((size_t) rank * vocab, 0.0f);
+    const std::vector<float> confidence_weight = {1.0f, 0.0f, 0.0f};
+    const float zero = 0.0f;
+    ggml_backend_tensor_set(lm_head, zeros_lm.data(), 0,
+                            zeros_lm.size() * sizeof(float));
+    ggml_backend_tensor_set(markov_w1, zeros_markov.data(), 0,
+                            zeros_markov.size() * sizeof(float));
+    ggml_backend_tensor_set(markov_w2, zeros_markov.data(), 0,
+                            zeros_markov.size() * sizeof(float));
+    ggml_backend_tensor_set(confidence_w, confidence_weight.data(), 0,
+                            confidence_weight.size() * sizeof(float));
+    ggml_backend_tensor_set(confidence_b, &zero, 0, sizeof(zero));
+
+    DraftWeights dw{};
+    dw.n_embd = hidden;
+    dw.dspark.enabled = true;
+    dw.dspark.markov_rank = rank;
+    dw.dspark.vocab_size = vocab;
+    dw.dspark.confidence_dim = hidden + rank;
+    dw.dspark.markov_w1 = markov_w1;
+    dw.dspark.markov_w2 = markov_w2;
+    dw.dspark.confidence_w = confidence_w;
+    dw.dspark.confidence_b = confidence_b;
+
+    // Both calls use the same normalized candidate hidden (all zero), so token
+    // logits and Markov correction are identical. Only the reference-faithful
+    // confidence input differs: its candidate row starts with 2.0.
+    const std::vector<float> normalized_hidden((size_t) hidden * q_len, 0.0f);
+    const std::vector<float> confidence_hidden = {0.0f, 0.0f, 2.0f, -3.0f};
+    std::vector<int32_t> separate_tokens;
+    std::vector<float> separate_confidence;
+    const bool separate_ok = dspark_markov_correct_greedy_chain_fused(
+        dw, backend, lm_head, normalized_hidden.data(), q_len, 0,
+        separate_tokens, &separate_confidence, confidence_hidden.data());
+
+    std::vector<int32_t> legacy_tokens;
+    std::vector<float> legacy_confidence;
+    const bool legacy_ok = dspark_markov_correct_greedy_chain_fused(
+        dw, backend, lm_head, normalized_hidden.data(), q_len, 0,
+        legacy_tokens, &legacy_confidence);
+
+    TEST_ASSERT_MSG(separate_ok, "separate-confidence fused graph failed");
+    TEST_ASSERT_MSG(legacy_ok, "legacy-confidence fused graph failed");
+    TEST_ASSERT(separate_tokens == legacy_tokens);
+    TEST_ASSERT(separate_confidence.size() == 1);
+    TEST_ASSERT(legacy_confidence.size() == 1);
+    if (separate_confidence.size() == 1 && legacy_confidence.size() == 1) {
+        const float expected_separate = 1.0f / (1.0f + std::exp(-2.0f));
+        TEST_ASSERT_MSG(nearly_equal(separate_confidence[0], expected_separate),
+                        "confidence did not use the separate pre-norm hidden");
+        TEST_ASSERT_MSG(nearly_equal(legacy_confidence[0], 0.5f),
+                        "legacy confidence fallback changed");
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
 static float softplus_stable(float x) {
@@ -940,6 +1140,180 @@ static void test_loader_rejects_truncated_tensor_data(ggml_backend_t backend) {
     }
     unlink(path.c_str());
 
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_dspark_loader_contract_and_bounds(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_dspark_loader_contract_and_bounds ...");
+
+    {
+        const std::string path = write_dspark_loader_fixture();
+        DSparkDrafter drafter;
+        const bool ok = load_deepseek4_dspark_drafter(path, backend, drafter);
+        TEST_ASSERT_MSG(ok, deepseek4_dspark_last_error());
+        free_deepseek4_dspark_drafter(drafter);
+        unlink(path.c_str());
+    }
+
+    {
+        DSparkFixtureOptions opts;
+        opts.wrong_main_norm_shape = true;
+        const std::string path = write_dspark_loader_fixture(opts);
+        DSparkDrafter drafter;
+        const bool ok = load_deepseek4_dspark_drafter(path, backend, drafter);
+        TEST_ASSERT(!ok);
+        TEST_ASSERT_MSG(std::string(deepseek4_dspark_last_error()).find(
+                            "dflash.hidden_norm.weight") != std::string::npos,
+                        deepseek4_dspark_last_error());
+        free_deepseek4_dspark_drafter(drafter);
+        unlink(path.c_str());
+    }
+
+    {
+        DSparkFixtureOptions opts;
+        opts.add_unknown_tensor = true;
+        const std::string path = write_dspark_loader_fixture(opts);
+        DSparkDrafter drafter;
+        const bool ok = load_deepseek4_dspark_drafter(path, backend, drafter);
+        TEST_ASSERT(!ok);
+        TEST_ASSERT_MSG(std::string(deepseek4_dspark_last_error()).find(
+                            "unexpected DSpark tensor: token_embd.weight") != std::string::npos,
+                        deepseek4_dspark_last_error());
+        free_deepseek4_dspark_drafter(drafter);
+        unlink(path.c_str());
+    }
+
+    {
+        const std::string path = write_dspark_loader_fixture();
+        struct stat st{};
+        TEST_ASSERT(stat(path.c_str(), &st) == 0);
+        TEST_ASSERT(st.st_size > 128);
+        TEST_ASSERT(truncate(path.c_str(), st.st_size - 128) == 0);
+        DSparkDrafter drafter;
+        const bool ok = load_deepseek4_dspark_drafter(path, backend, drafter);
+        TEST_ASSERT(!ok);
+        TEST_ASSERT_MSG(std::string(deepseek4_dspark_last_error()).find(
+                            "truncated or corrupt") != std::string::npos,
+                        deepseek4_dspark_last_error());
+        free_deepseek4_dspark_drafter(drafter);
+        unlink(path.c_str());
+    }
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_safe_compressor_batch_tokens() {
+    std::fprintf(stderr, "  test_safe_compressor_batch_tokens ...");
+    DeepSeek4Weights w;
+    w.compress_ratios = {0, 4, 128};
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 0, 1) == 1);
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 0, 4) == 4);
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 0, 5) == 4);
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 1, 8) == 3);
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 4, 8) == 4);
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 125, 8) == 3);
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 128, 8) == 4);
+
+    w.compress_ratios = {128};
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 0, 129) == 128);
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 127, 4) == 1);
+
+    w.compress_ratios.clear();
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 17, 9) == 9);
+    TEST_ASSERT(deepseek4_safe_compressor_batch_tokens(w, 17, 0) == 0);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_dspark_park_all_releases_drafter() {
+    std::fprintf(stderr, "  test_dspark_park_all_releases_drafter ...");
+
+    DeepSeek4BackendConfig cfg;
+    DeepSeek4Backend backend(cfg);
+    backend.spec_draft_path_ = "/tmp/ds4-dspark-fixture.gguf";
+    backend.spec_drafter_ = std::make_unique<DSparkDrafter>();
+    backend.spec_enabled_ = true;
+
+    TEST_ASSERT(backend.park("all"));
+    TEST_ASSERT(backend.parked_);
+    TEST_ASSERT(backend.spec_drafter_ == nullptr);
+    TEST_ASSERT(!backend.spec_enabled_);
+    TEST_ASSERT(backend.spec_drafter_parked_);
+
+    backend.free_drafter();
+    TEST_ASSERT(backend.spec_drafter_ == nullptr);
+    TEST_ASSERT(!backend.spec_enabled_);
+    TEST_ASSERT(backend.spec_drafter_parked_);
+    TEST_ASSERT(backend.spec_draft_path_ == "/tmp/ds4-dspark-fixture.gguf");
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_dspark_raw_ring_rollback_after_wrap(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_dspark_raw_ring_rollback_after_wrap ...");
+
+    DeepSeek4Weights weights;
+    weights.n_layer = 1;
+    weights.n_embd = 4;
+    weights.n_hc = 1;
+    weights.head_dim = 4;
+    weights.n_swa = 8;
+    weights.n_indexer_head_dim = 2;
+    weights.compress_ratios = {4};
+
+    DeepSeek4Cache cache;
+    TEST_ASSERT(create_deepseek4_cache(backend, weights, 16, cache));
+    if (!cache.buf || cache.layers.empty() || !cache.layers[0].raw_kv) {
+        free_deepseek4_cache(cache);
+        std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+        return;
+    }
+
+    auto & layer = cache.layers[0];
+    write_tensor_pattern(layer.raw_kv, 11);
+    const std::vector<uint8_t> original = read_tensor_bytes(layer.raw_kv);
+    std::vector<uint8_t> expected = original;
+    const size_t row_bytes = ggml_row_size(layer.raw_kv->type, layer.raw_kv->ne[0]);
+
+    cache.cur_pos = 10;
+    layer.n_comp = 2;
+    layer.n_index_comp = 2;
+    DeepSeek4SpecRollback rollback;
+    deepseek4_spec_rollback_save(cache, rollback, 10, 4);
+
+    auto overwrite_row = [&](int absolute_pos, uint8_t value) {
+        const int row = absolute_pos % weights.n_swa;
+        std::vector<uint8_t> bytes(row_bytes, value);
+        ggml_backend_tensor_set(layer.raw_kv, bytes.data(),
+                                (size_t) row * layer.raw_kv->nb[1], row_bytes);
+    };
+    auto expect_overwritten_row = [&](int absolute_pos, uint8_t value) {
+        const int row = absolute_pos % weights.n_swa;
+        std::fill(expected.begin() + (size_t) row * layer.raw_kv->nb[1],
+                  expected.begin() + (size_t) row * layer.raw_kv->nb[1] + row_bytes,
+                  value);
+    };
+    for (int t = 0; t < 4; ++t) {
+        overwrite_row(10 + t, (uint8_t) (0xa0 + t));
+    }
+
+    // Commit positions 10 and 11. Their new rows stay in the ring, while the
+    // rejected positions 12 and 13 must reveal the older history they replaced.
+    expect_overwritten_row(10, 0xa0);
+    expect_overwritten_row(11, 0xa1);
+    deepseek4_spec_rollback_apply(rollback, weights, cache, 12, false);
+    TEST_ASSERT(read_tensor_bytes(layer.raw_kv) == expected);
+    TEST_ASSERT(cache.cur_pos == 12);
+    TEST_ASSERT(layer.n_comp == 3);
+    TEST_ASSERT(layer.n_index_comp == 3);
+
+    // Restoring to the pre-verify position is used by replay/diagnostic paths
+    // and must put every overwritten physical row back.
+    deepseek4_spec_rollback_apply(rollback, weights, cache, 10, false);
+    TEST_ASSERT(read_tensor_bytes(layer.raw_kv) == original);
+    TEST_ASSERT(cache.cur_pos == 10);
+    TEST_ASSERT(layer.n_comp == 2);
+    TEST_ASSERT(layer.n_index_comp == 2);
+
+    free_deepseek4_cache(cache);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -1819,6 +2193,11 @@ int main() {
     test_loader_rejects_zero_vocab_size(backend);
     test_loader_reads_tokenizer_special_ids(backend);
     test_loader_rejects_truncated_tensor_data(backend);
+    test_dspark_loader_contract_and_bounds(backend);
+    test_dspark_confidence_uses_separate_hidden(backend);
+    test_safe_compressor_batch_tokens();
+    test_dspark_park_all_releases_drafter();
+    test_dspark_raw_ring_rollback_after_wrap(backend);
     test_snapshot_save_restore();
     test_reset_request_state();
     test_reset_deepseek4_cache(backend);
