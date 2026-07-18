@@ -42,7 +42,7 @@ def _usage() -> dict[str, object]:
 def test_sse_parser_reconstructs_content_and_usage() -> None:
     chunks = [
         b'data: {"choices":[{"delta":{"content":"hello "}}]}\n',
-        b'data: {"choices":[{"delta":{"content":"world"}}],"usage":{"completion_tokens":2}}\n',
+        b'data: {"choices":[{"delta":{"content":"world"},"finish_reason":"stop"}],"usage":{"completion_tokens":2}}\n',
         b"data: [DONE]\n",
     ]
     text, usage, parsed = parse_sse_lines(chunks)
@@ -56,7 +56,12 @@ def test_sse_parser_preserves_nested_speculative_evidence() -> None:
         b'data: {"choices":[{"delta":{"content":"ok"}}]}\n',
         (
             "data: "
-            + json.dumps({"choices": [], "usage": _usage()})
+            + json.dumps(
+                {
+                    "choices": [{"delta": {}, "finish_reason": "stop"}],
+                    "usage": _usage(),
+                }
+            )
             + "\n"
         ).encode(),
         b"data: [DONE]\n",
@@ -111,3 +116,17 @@ def test_sse_parser_rejects_non_data_lines() -> None:
 def test_sse_parser_rejects_non_object_chunks() -> None:
     with pytest.raises(ValueError, match="not a JSON object"):
         parse_sse_lines([f"data: {json.dumps([1, 2])}\n".encode()])
+
+
+def test_sse_parser_rejects_truncated_or_unfinished_streams() -> None:
+    with pytest.raises(ValueError, match=r"without \[DONE\]"):
+        parse_sse_lines(
+            [b'data: {"choices":[{"delta":{"content":"partial"}}]}\n']
+        )
+    with pytest.raises(ValueError, match="without a finish reason"):
+        parse_sse_lines(
+            [
+                b'data: {"choices":[{"delta":{"content":"partial"}}]}\n',
+                b"data: [DONE]\n",
+            ]
+        )

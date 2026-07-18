@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as dt
 import hashlib
 import json
@@ -34,6 +35,8 @@ def parse_sse_lines(lines: list[bytes]) -> tuple[str, dict[str, Any], list[dict[
     text_parts: list[str] = []
     usage: dict[str, Any] = {}
     chunks: list[dict[str, Any]] = []
+    saw_done = False
+    saw_finish_reason = False
     for raw_line in lines:
         line = raw_line.decode("utf-8", errors="strict").strip()
         if not line or line.startswith(":"):
@@ -42,11 +45,15 @@ def parse_sse_lines(lines: list[bytes]) -> tuple[str, dict[str, Any], list[dict[
             raise ValueError("stream returned a non-SSE data line")
         payload = line.removeprefix("data:").strip()
         if payload == "[DONE]":
+            saw_done = True
             break
         chunk = json.loads(payload)
         if not isinstance(chunk, dict):
             raise ValueError("stream chunk is not a JSON object")
         chunks.append(chunk)
+        for choice in chunk.get("choices") or []:
+            if choice.get("finish_reason") is not None:
+                saw_finish_reason = True
         if isinstance(chunk.get("usage"), dict):
             usage.update(chunk["usage"])
         for choice in chunk.get("choices") or []:
@@ -54,6 +61,10 @@ def parse_sse_lines(lines: list[bytes]) -> tuple[str, dict[str, Any], list[dict[
             content = delta.get("content")
             if isinstance(content, str):
                 text_parts.append(content)
+    if not saw_done:
+        raise ValueError("stream ended without [DONE]")
+    if not saw_finish_reason:
+        raise ValueError("stream ended without a finish reason")
     return "".join(text_parts), usage, chunks
 
 
@@ -177,9 +188,9 @@ def validate_speculative_evidence(
     return evidence
 
 
-def _artifact_name(config_id: str) -> str:
+def _artifact_name(config_id: str, attempt: int) -> str:
     safe = "".join(character if character.isalnum() or character in "-_." else "_" for character in config_id)
-    return safe[:220] + ".json"
+    return safe[:210] + f".attempt-{attempt}.json"
 
 
 def execute_cell(
@@ -201,6 +212,13 @@ def execute_cell(
         "temperature": float(config.get("temperature", 0.0)),
         "stream": bool(config.get("stream", False)),
     }
+    measurement_kind = str(config.get("measurement_kind", "natural_stop"))
+    if measurement_kind not in {"fixed_work", "natural_stop"}:
+        raise ValueError("measurement_kind must be fixed_work or natural_stop")
+    if measurement_kind == "fixed_work":
+        if config.get("ignore_eos") is not True:
+            raise ValueError("fixed_work cells must explicitly request ignore_eos")
+        payload["ignore_eos"] = True
     for key in ("seed", "top_p", "top_k", "min_p", "stop"):
         if key in config:
             payload[key] = config[key]
@@ -224,12 +242,25 @@ def execute_cell(
         completion_tokens = usage.get("completion_tokens")
         if not isinstance(completion_tokens, int) or completion_tokens <= 0:
             raise ValueError("response lacks an authoritative positive completion token count")
+        if measurement_kind == "fixed_work" and completion_tokens != payload["max_tokens"]:
+            raise ValueError("fixed_work response stopped before the requested token count")
+        timings = usage.get("timings")
+        if not isinstance(timings, dict):
+            raise ValueError("response usage lacks authoritative server timings")
+        decode_tok_s = timings.get("decode_tokens_per_sec")
+        decode_ms = timings.get("decode_ms")
+        if not isinstance(decode_tok_s, (int, float)) or decode_tok_s <= 0:
+            raise ValueError("response lacks a positive server decode rate")
+        if not isinstance(decode_ms, (int, float)) or decode_ms <= 0:
+            raise ValueError("response lacks a positive server decode duration")
         metrics = {
             "elapsed_s": elapsed_s,
             "ttft_ms": None if ttft_s is None else ttft_s * 1000.0,
             "completion_tokens": completion_tokens,
             "prompt_tokens": usage.get("prompt_tokens"),
-            "decode_tok_s": completion_tokens / elapsed_s,
+            "decode_tok_s": float(decode_tok_s),
+            "decode_ms": float(decode_ms),
+            "measurement_kind": measurement_kind,
             "output_sha256": hashlib.sha256(text.encode()).hexdigest(),
             "output_bytes": len(text.encode()),
             "effective_decode_mode": speculative["effective_decode_mode"],
@@ -237,7 +268,7 @@ def execute_cell(
             "fallback_reason": speculative["fallback_reason"],
             "props_sha256": hashlib.sha256(canonical_json(props).encode()).hexdigest(),
         }
-        artifact_path = artifacts_dir / _artifact_name(str(cell["config_id"]))
+        artifact_path = artifacts_dir / _artifact_name(str(cell["config_id"]), attempt)
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         artifact = {
             "config_id": cell["config_id"],
@@ -288,6 +319,7 @@ def main() -> None:
     parser.add_argument("--artifacts-dir", type=Path, required=True)
     parser.add_argument("--api-key-env", default="VALIDATION_API_KEY")
     parser.add_argument("--timeout", type=float, default=1200.0)
+    parser.add_argument("--concurrency", type=int, default=1)
     args = parser.parse_args()
 
     cells = _jsonl(args.matrix)
@@ -295,6 +327,9 @@ def main() -> None:
     store = ResultStore(args.results)
     latest = store.latest()
     api_key = os.environ.get(args.api_key_env, "")
+    if args.concurrency < 1:
+        raise ValueError("concurrency must be >= 1")
+    pending: list[tuple[dict[str, Any], dict[str, Any], int]] = []
     for cell in cells:
         config_id = str(cell["config_id"])
         previous = latest.get(config_id)
@@ -317,18 +352,38 @@ def main() -> None:
         prompt_id = str(cell["prompt_id"])
         if prompt_id not in prompts:
             raise ValueError(f"matrix references missing prompt: {prompt_id}")
+        planned_concurrency = int(cell["config"].get("concurrency", 1))
+        if planned_concurrency != args.concurrency:
+            raise ValueError(
+                f"cell {config_id} requires concurrency={planned_concurrency}, "
+                f"runner was started with {args.concurrency}"
+            )
         attempt = 1 if previous is None else previous.attempt + 1
-        row = execute_cell(
-            cell,
-            prompt=prompts[prompt_id],
-            api_key=api_key,
-            timeout=args.timeout,
-            artifacts_dir=args.artifacts_dir,
-            attempt=attempt,
-        )
-        store.append(row)
-        latest[config_id] = row
-        print(canonical_json({"config_id": config_id, "attempt": attempt, "status": row.status.value}))
+        pending.append((cell, prompts[prompt_id], attempt))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+        futures = [
+            executor.submit(
+                execute_cell,
+                cell,
+                prompt=prompt,
+                api_key=api_key,
+                timeout=args.timeout,
+                artifacts_dir=args.artifacts_dir,
+                attempt=attempt,
+            )
+            for cell, prompt, attempt in pending
+        ]
+        for (cell, _, attempt), future in zip(pending, futures, strict=True):
+            row = future.result()
+            store.append(row)
+            config_id = str(cell["config_id"])
+            latest[config_id] = row
+            print(
+                canonical_json(
+                    {"config_id": config_id, "attempt": attempt, "status": row.status.value}
+                )
+            )
 
 
 if __name__ == "__main__":

@@ -77,3 +77,10 @@ it in the request artifact. Each configuration must also declare
 `expected_draft_loaded`. The runner authenticates to `/props`, verifies those
 launch facts against the nested `usage.speculative` response, and refuses to
 mark a row complete if any exactness evidence is absent or inconsistent.
+Decode throughput comes from `usage.timings.decode_tokens_per_sec`, not total
+HTTP wall time. Streaming cells require both a terminal finish reason and the
+`[DONE]` sentinel. Raw response artifacts are attempt-qualified, so a retry can
+never overwrite a failed attempt. Run concurrency is explicit with
+`--concurrency`; every cell must declare the same planned `concurrency` value.
+`fixed_work` cells must request `ignore_eos` and still produce exactly
+`max_tokens`, while `natural_stop` cells preserve the model's stop behavior.
