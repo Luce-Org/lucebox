@@ -2048,6 +2048,10 @@ static void test_output_graph_reuse_microbench(ggml_backend_t backend) {
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
 static void test_ds4_flash_attention_keep_cap_gpu() {
     std::fprintf(stderr, "  test_ds4_flash_attention_keep_cap_gpu ...");
+#if !defined(GGML_USE_HIP)
+    std::fprintf(stderr, " skipped (HIP-only contract)\n");
+    return;
+#endif
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
@@ -2131,6 +2135,10 @@ static void test_ds4_flash_attention_keep_cap_gpu() {
 static void test_ds4_flash_attention_inverse_rope_fallback_gpu() {
     std::fprintf(stderr,
                  "  test_ds4_flash_attention_inverse_rope_fallback_gpu ...");
+#if !defined(GGML_USE_HIP)
+    std::fprintf(stderr, " skipped (HIP-only contract)\n");
+    return;
+#endif
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
