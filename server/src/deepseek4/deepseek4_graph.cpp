@@ -5341,6 +5341,7 @@ struct DsparkDraftCache {
     int ctx_len = -1;
     int block   = -1;
     const void * drafter = nullptr;
+    ggml_backend_t backend = nullptr;
     std::vector<uint8_t> arena;
     ggml_context * ctx = nullptr;
     ggml_gallocr_t alloc = nullptr;
@@ -5393,7 +5394,7 @@ bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
     DsparkDraftCache & C = g_dspark_draft_cache;
     const bool DS4_DBG = std::getenv("DFLASH_DS4_DSPARK_DEBUG") != nullptr;
 
-    if (C.drafter != (const void *) &d) {
+    if (C.drafter != (const void *) &d || C.backend != backend) {
         // HC scales (host) per layer + output — immutable, read once per drafter.
         C.s_attn.assign((size_t) w.n_layer, {0.0f, 0.0f, 0.0f});
         C.s_ffn.assign((size_t) w.n_layer, {0.0f, 0.0f, 0.0f});
@@ -5406,8 +5407,13 @@ bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
         C.s_out = so[0];
     }
 
-    if (!C.ctx || C.ctx_len != ctx_len || C.block != block || C.drafter != (const void *) &d) {
+    if (!C.ctx || C.ctx_len != ctx_len || C.block != block ||
+        C.drafter != (const void *) &d || C.backend != backend) {
         // ── (Re)build the graph ─────────────────────────────────────────
+        if (C.backend != backend && C.alloc) {
+            ggml_gallocr_free(C.alloc);
+            C.alloc = nullptr;
+        }
         if (C.ctx) { ggml_free(C.ctx); C.ctx = nullptr; }
         C.gf = nullptr;
         C.dbg_taps.clear();
@@ -5557,6 +5563,7 @@ bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
         C.ctx_len = ctx_len;
         C.block   = block;
         C.drafter = (const void *) &d;
+        C.backend = backend;
     }
 
     // ── Set inputs + compute (cached graph) ─────────────────────────────

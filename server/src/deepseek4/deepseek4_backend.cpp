@@ -652,7 +652,30 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         reset_deepseek4_cache(cache_);
     }
     last_logits_.clear();
-    if (spec_enabled_ && kv_offset == 0) spec_feat_window_.clear();
+    int spec_capture_from = n_total;
+    if (spec_enabled_ && spec_drafter_) {
+        const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
+        if (kv_offset == 0 || n_total >= w_.n_swa || feat_row <= 0 ||
+            spec_feat_window_.size() % (size_t) feat_row != 0) {
+            spec_feat_window_.clear();
+            spec_capture_from = std::max(0, n_total - w_.n_swa);
+        } else {
+            // Keep enough prior rows for the new prompt suffix, then append all
+            // new rows. This bounds host capture storage at n_swa without
+            // shifting a multi-megabyte feature window after every token.
+            const size_t old_rows = spec_feat_window_.size() / (size_t) feat_row;
+            const size_t keep_rows = (size_t) std::max(0, w_.n_swa - n_total);
+            if (old_rows > keep_rows) {
+                const size_t drop_floats = (old_rows - keep_rows) * (size_t) feat_row;
+                const size_t keep_floats = keep_rows * (size_t) feat_row;
+                std::memmove(spec_feat_window_.data(),
+                             spec_feat_window_.data() + drop_floats,
+                             keep_floats * sizeof(float));
+                spec_feat_window_.resize(keep_floats);
+            }
+            spec_capture_from = 0;
+        }
+    }
     const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
     const auto phase_t0 = Clock::now();
     DeepSeek4StepTelemetry tel_acc;
@@ -674,7 +697,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         Ds4VerifyHooks spec_hooks;
         std::vector<float> spec_cap;
         Ds4VerifyHooks * hp = nullptr;
-        if (spec_enabled_ && spec_drafter_) {
+        if (spec_enabled_ && spec_drafter_ && i + n_tok > spec_capture_from) {
             spec_hooks.capture_layer_ids = &spec_drafter_->capture_layer_ids;
             spec_hooks.capture_out = &spec_cap;
             hp = &spec_hooks;
@@ -687,7 +710,8 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             routing_stats_.get(), hp);
         if (ok && hp && !spec_cap.empty()) {
             const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
-            for (int t = 0; t < n_tok; ++t) {
+            const int first_capture = std::max(0, spec_capture_from - i);
+            for (int t = first_capture; t < n_tok; ++t) {
                 spec_feat_window_.insert(
                     spec_feat_window_.end(),
                     spec_cap.begin() + (size_t) t * feat_row,
@@ -806,6 +830,12 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
         return result;
     }
     result.prefill_s = elapsed_s(t0);
+
+    if (io.cancelled) {
+        result.succeed();
+        maybe_save_routing_stats();
+        return result;
+    }
 
     if (req.n_gen <= 0) {
         result.succeed();

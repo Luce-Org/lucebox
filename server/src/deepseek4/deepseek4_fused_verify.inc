@@ -123,8 +123,8 @@ static bool ds4_build_fused_verify_graph(
         hc_cur[(size_t) t] = ggml_repeat_4d(ctx, col, n_embd, n_hc, 1, 1);
     }
 
-    std::vector<ggml_tensor *> capture_pieces;   // order [ci][t]
-    capture_pieces.reserve(capture_ids.size() * (size_t) q);
+    std::vector<ggml_tensor *> capture_pieces(
+        capture_ids.size() * (size_t) q, nullptr);   // order [ci][t]
 
     for (int il = 0; il < w.n_layer; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t) il];
@@ -213,13 +213,14 @@ static bool ds4_build_fused_verify_graph(
                                  have_token_ids && hash_tables[(size_t) il].loaded;
         if (hash_routed) {
             // ds4_build_hash_routed_ffn is single-token; run per token, concat.
-            ggml_tensor * hids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, w.n_expert_used, q);
+            const int n_used = ds4_effective_expert_count(w);
+            ggml_tensor * hids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, q);
             ggml_set_input(hids);
             fg.hash_ids[(size_t) il] = hids;
             for (int t = 0; t < q; ++t) {
                 ggml_tensor * fcol = ggml_view_2d(ctx, ffn_normed, n_embd, 1,
                                                   ffn_normed->nb[1], (size_t) t * ffn_normed->nb[1]);
-                ggml_tensor * hcol = ggml_view_2d(ctx, hids, w.n_expert_used, 1,
+                ggml_tensor * hcol = ggml_view_2d(ctx, hids, n_used, 1,
                                                   hids->nb[1], (size_t) t * hids->nb[1]);
                 ggml_tensor * fo = ds4_build_hash_routed_ffn(ctx, w, L, ggml_cont(ctx, fcol), hcol);
                 if (!fo) { ffn_out = nullptr; break; }
@@ -246,7 +247,8 @@ static bool ds4_build_fused_verify_graph(
                 ggml_tensor * hsT = ggml_cont(ctx, ggml_transpose(ctx, hs)); // [n_hc, n_embd]
                 ggml_tensor * summed = ggml_sum_rows(ctx, hsT);   // [1, n_embd]
                 ggml_tensor * mean = ggml_scale(ctx, summed, 1.0f / (float) n_hc);
-                capture_pieces.push_back(ggml_reshape_1d(ctx, ggml_cont(ctx, mean), n_embd));
+                capture_pieces[ci * (size_t) q + (size_t) t] =
+                    ggml_reshape_1d(ctx, ggml_cont(ctx, mean), n_embd);
             }
         }
     }
@@ -271,6 +273,12 @@ static bool ds4_build_fused_verify_graph(
     ggml_build_forward_expand(gf, fg.logits);
 
     if (!capture_pieces.empty()) {
+        for (ggml_tensor * piece : capture_pieces) {
+            if (!piece) {
+                std::fprintf(stderr, "[ds4-fused-verify] capture layer id is invalid\n");
+                return false;
+            }
+        }
         ggml_tensor * cap = capture_pieces[0];
         for (size_t i = 1; i < capture_pieces.size(); ++i) {
             cap = ggml_concat(ctx, cap, capture_pieces[i], 0);
@@ -340,10 +348,12 @@ static int ds4_try_fused_verify_step(
     const int q = n_tokens;
     const int token_pos = kv_start + q - 1;
     std::vector<int64_t> key;
-    key.reserve((size_t) w.n_layer + 3);
+    key.reserve((size_t) w.n_layer + hooks->capture_layer_ids->size() + 4);
     key.push_back(w.n_swa);
     key.push_back(q);
     key.push_back(token_ids ? 1 : 0);
+    key.push_back((int64_t) hooks->capture_layer_ids->size());
+    for (int layer : *hooks->capture_layer_ids) key.push_back(layer);
     for (int il = 0; il < w.n_layer; ++il) {
         const int ratio = (int) w.compress_ratios[il];
         DeepSeek4LayerCache & lc = cache.layers[(size_t) il];
@@ -469,12 +479,20 @@ static int ds4_try_fused_verify_step(
         for (int il = 0; il < w.n_layer; ++il) {
             ggml_tensor * hids = fg->hash_ids[(size_t) il];
             if (!hids) continue;
-            const auto & ht = hash_tables[(size_t) il].ids;
-            const int n_used = w.n_expert_used;
+            const HashRoutingTableCpu & table = hash_tables[(size_t) il];
+            const int n_used = ds4_effective_expert_count(w);
             hash_scratch.resize((size_t) n_used * q);
             for (int i = 0; i < q; ++i) {
+                const int32_t * row = hash_routing_row(
+                    table, token_ids[i], w.n_expert_used);
+                if (!row) {
+                    std::fprintf(stderr,
+                                 "[ds4-fused-verify] token id %d outside hash table for layer %d\n",
+                                 token_ids[i], il);
+                    return -1;
+                }
                 std::memcpy(hash_scratch.data() + (size_t) i * n_used,
-                            ht.data() + (size_t) token_ids[i] * (size_t) n_used,
+                            row,
                             (size_t) n_used * sizeof(int32_t));
             }
             ggml_backend_tensor_set(hids, hash_scratch.data(), 0,

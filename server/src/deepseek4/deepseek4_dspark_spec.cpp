@@ -522,11 +522,7 @@ bool run_deepseek4_dspark_spec_decode(
         // boundary except at its last token (state rows stay distinct and the
         // comp emission matches AR). Boundaries sit at p % 4 == 3. The
         // sequential verify has no such limit.
-        static const bool fused_verify_mode = [] {
-            const char * v = std::getenv("DFLASH_DS4_FUSED_VERIFY");
-            return v && *v && *v != '0';
-        }();
-        int q_step_cap = (seq_verify_mode || fused_verify_mode)
+        int q_step_cap = seq_verify_mode
                        ? std::min(q_cap, 4)
                        : std::min(q_cap, 4 - (pos & 3));
         if (adaptive_width && !use_confidence_width && !seq_verify_mode) {
@@ -610,7 +606,9 @@ bool run_deepseek4_dspark_spec_decode(
         int verify_last = -1;
         if (!target.verify_batch(draft_tok, pos, verify_last, &tgt_am)) {
             if (full_snap) {
-                target.restore_kv();
+                if (!target.restore_kv()) {
+                    std::fprintf(stderr, "[ds4-spec] restore after verify failure failed\n");
+                }
             } else {
                 spec_rollback_apply(rollback, target_w, target_cache, pos, boundary_crossed);
             }
@@ -651,7 +649,11 @@ bool run_deepseek4_dspark_spec_decode(
             std::vector<int32_t> kv_toks;
             kv_toks.push_back(lt);
             for (int i = 1; i < accept; i++) kv_toks.push_back(draft_tok[i]);
-            target.restore_kv();
+            if (!target.restore_kv()) {
+                std::fprintf(stderr, "[ds4-spec] snapshot restore failed\n");
+                ok = false;
+                break;
+            }
             int replay_last = -1;
             std::vector<int32_t> replay_am;
             if (!target.verify_batch(kv_toks, pos, replay_last, &replay_am)) {

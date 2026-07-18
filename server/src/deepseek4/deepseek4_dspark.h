@@ -123,7 +123,7 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
                                      std::vector<float> * logits_out,
                                      std::vector<float> & capture_out,
                                      DeepSeek4StepTelemetry * telemetry = nullptr,
-                                     bool allow_graph_reuse = true);
+                                     bool allow_graph_reuse = false);
 
 // Run DSpark speculative decode: draft block_size candidates with `drafter`,
 // verify against the DS4 target in one batched forward, accept the matching

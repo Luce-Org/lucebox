@@ -7,6 +7,8 @@
 
 #include "deepseek4_dspark.h"
 
+#include "common/gguf_bounds.h"
+
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "gguf.h"
@@ -14,10 +16,12 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace dflash::common {
@@ -77,6 +81,53 @@ bool block_suffix(const char * name, int & il, std::string & suffix) {
     return true;
 }
 
+bool recognized_block_suffix(const std::string & suffix) {
+    static const char * const names[] = {
+        "attn_norm.weight", "attn_q_a.weight", "attn_q_a_norm.weight",
+        "attn_q_b.weight", "attn_kv.weight", "attn_kv_a_norm.weight",
+        "attn_sinks.weight", "attn_output_a.weight", "attn_output_b.weight",
+        "hc_attn_fn.weight", "hc_attn_scale.weight", "hc_attn_base.weight",
+        "ffn_norm.weight", "ffn_gate_inp.weight", "exp_probs_b.bias",
+        "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
+        "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+        "hc_ffn_fn.weight", "hc_ffn_scale.weight", "hc_ffn_base.weight",
+    };
+    for (const char * name : names) {
+        if (suffix == name) return true;
+    }
+    return false;
+}
+
+bool recognized_dspark_tensor(const char * name, int n_layer) {
+    static const char * const names[] = {
+        "output_norm.weight", "output_hc_base.weight", "output_hc_fn.weight",
+        "output_hc_scale.weight", "dflash.fc.weight",
+        "dflash.hidden_norm.weight", "dflash.dspark.markov.w1",
+        "dflash.dspark.markov.w2", "dflash.dspark.confidence.weight",
+        "dflash.dspark.confidence.bias",
+    };
+    for (const char * expected : names) {
+        if (std::strcmp(name, expected) == 0) return true;
+    }
+    int il = -1;
+    std::string suffix;
+    return block_suffix(name, il, suffix) && il >= 0 && il < n_layer &&
+           recognized_block_suffix(suffix);
+}
+
+bool tensor_shape_is(const ggml_tensor * tensor,
+                     std::initializer_list<int64_t> dims) {
+    if (!tensor || dims.size() > GGML_MAX_DIMS) return false;
+    size_t i = 0;
+    for (int64_t dim : dims) {
+        if (tensor->ne[i++] != dim) return false;
+    }
+    for (; i < GGML_MAX_DIMS; ++i) {
+        if (tensor->ne[i] != 1) return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 const char * deepseek4_dspark_last_error() { return g_dspark_err.c_str(); }
@@ -84,6 +135,7 @@ const char * deepseek4_dspark_last_error() { return g_dspark_err.c_str(); }
 bool load_deepseek4_dspark_drafter(const std::string & path,
                                    ggml_backend_t backend,
                                    DSparkDrafter & out) {
+    g_dspark_err.clear();
     ggml_context * meta = nullptr;
     gguf_init_params gip{};
     gip.no_alloc = true;
@@ -164,26 +216,110 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
     out.vocab_size      = (int)kv_u32(g, P + "dflash.dspark.vocab_size", w.n_vocab);
     out.confidence_dim  = (int)kv_u32(g, P + "dflash.dspark.confidence_dim", 0);
 
+    const bool valid_arch =
+        w.n_layer > 0 && w.n_layer <= 64 &&
+        w.n_embd > 0 && w.n_embd <= 32768 &&
+        w.n_vocab > 0 && w.n_vocab <= 1000000 &&
+        w.n_head > 0 && w.n_head <= 512 &&
+        w.head_dim > 0 && w.head_dim <= 4096 &&
+        w.n_lora_q > 0 && w.n_lora_q <= 32768 &&
+        w.n_lora_o > 0 && w.n_lora_o <= 32768 &&
+        w.n_out_group > 0 && w.n_out_group <= w.n_head &&
+        w.n_head % w.n_out_group == 0 &&
+        w.n_expert > 0 && w.n_expert <= 4096 &&
+        w.n_expert_used > 0 && w.n_expert_used <= w.n_expert &&
+        w.n_ff_exp > 0 && w.n_ff_exp <= 131072 &&
+        w.n_hc > 0 && w.n_hc <= 64 &&
+        out.n_target_layers > 0 && out.n_target_layers <= 64 &&
+        out.block_size >= 2 && out.block_size <= 16 &&
+        out.markov_rank > 0 && out.markov_rank <= 32768 &&
+        out.vocab_size == w.n_vocab;
+    if (!valid_arch) {
+        set_err("invalid DSpark architecture metadata");
+        gguf_free(g);
+        if (meta) ggml_free(meta);
+        out = DSparkDrafter{};
+        return false;
+    }
+
     w.layers.resize(n_layer);
     w.backend = backend;
 
-    // ── Allocate all tensors from the meta ctx into one backend buffer ──
+    // Validate the complete tensor table before allocating device memory or
+    // forming an absolute file offset. The drafter contract intentionally has
+    // no embedding/lm-head tensors; rejecting unknown tensors prevents a stray
+    // full-model tensor from consuming the entire GPU allocation.
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        set_err("open failed: " + path);
+        gguf_free(g);
+        ggml_free(meta);
+        out = DSparkDrafter{};
+        return false;
+    }
+    struct stat st{};
+    if (::fstat(fd, &st) != 0 || st.st_size < 0) {
+        set_err("fstat failed: " + path);
+        ::close(fd);
+        gguf_free(g);
+        ggml_free(meta);
+        out = DSparkDrafter{};
+        return false;
+    }
+    const size_t file_size = (size_t) st.st_size;
+    const size_t data_off = gguf_get_data_offset(g);
+    const int64_t n_tensors = gguf_get_n_tensors(g);
+    bool ok = true;
+    for (int64_t ti = 0; ti < n_tensors; ++ti) {
+        const char * tname = gguf_get_tensor_name(g, ti);
+        ggml_tensor * tensor = ggml_get_tensor(meta, tname);
+        if (!tensor) {
+            set_err(std::string("meta tensor missing: ") + tname);
+            ok = false;
+            break;
+        }
+        if (!recognized_dspark_tensor(tname, w.n_layer)) {
+            set_err(std::string("unexpected DSpark tensor: ") + tname);
+            ok = false;
+            break;
+        }
+        const size_t tensor_off = gguf_get_tensor_offset(g, ti);
+        const size_t size = gguf_get_tensor_size(g, ti);
+        if (!gguf_tensor_in_file(data_off, tensor_off, size, file_size)) {
+            set_err(gguf_bounds_error("DSpark draft GGUF", tname,
+                                      ggml_type_name(gguf_get_tensor_type(g, ti)),
+                                      data_off, tensor_off, size, file_size));
+            ok = false;
+            break;
+        }
+    }
+    if (!ok) {
+        ::close(fd);
+        gguf_free(g);
+        ggml_free(meta);
+        out = DSparkDrafter{};
+        return false;
+    }
+
+    // ── Allocate validated tensors into one backend buffer ──────────────
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(meta, backend);
-    if (!buf) { set_err("ggml_backend_alloc_ctx_tensors failed"); gguf_free(g); ggml_free(meta); return false; }
+    if (!buf) {
+        set_err("ggml_backend_alloc_ctx_tensors failed");
+        ::close(fd);
+        gguf_free(g);
+        ggml_free(meta);
+        out = DSparkDrafter{};
+        return false;
+    }
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
     // ── Stream tensor bytes from the file (pread per tensor) ────────────
-    const int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) { set_err("open failed: " + path); ggml_backend_buffer_free(buf); gguf_free(g); ggml_free(meta); return false; }
-    const size_t data_off = gguf_get_data_offset(g);
-    const int64_t n_tensors = gguf_get_n_tensors(g);
     std::vector<char> staging;
-    bool ok = true;
     for (int64_t ti = 0; ti < n_tensors && ok; ti++) {
         const char * tname = gguf_get_tensor_name(g, ti);
         ggml_tensor * t = ggml_get_tensor(meta, tname);
-        if (!t) { set_err(std::string("meta tensor missing: ") + tname); ok = false; break; }
-        const size_t off  = data_off + gguf_get_tensor_offset(g, ti);
+        const size_t tensor_off = gguf_get_tensor_offset(g, ti);
+        const size_t off  = data_off + tensor_off;  // preflight proved no overflow
         const size_t size = gguf_get_tensor_size(g, ti);
         staging.resize(size);
         size_t done = 0;
@@ -196,7 +332,13 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
         ggml_backend_tensor_set(t, staging.data(), 0, size);
     }
     ::close(fd);
-    if (!ok) { ggml_backend_buffer_free(buf); gguf_free(g); ggml_free(meta); return false; }
+    if (!ok) {
+        ggml_backend_buffer_free(buf);
+        gguf_free(g);
+        ggml_free(meta);
+        out = DSparkDrafter{};
+        return false;
+    }
 
     // ── Bind pointers by name ───────────────────────────────────────────
     for (int64_t ti = 0; ti < n_tensors; ti++) {
@@ -233,7 +375,6 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
         else if (suffix == "ffn_norm.weight")        L.ffn_norm        = t;
         else if (suffix == "ffn_gate_inp.weight")    L.ffn_gate_inp    = t;
         else if (suffix == "exp_probs_b.bias")       L.ffn_exp_probs_b = t;
-        else if (suffix == "ffn_gate_tid2eid.weight") L.ffn_gate_tid2eid = t;
         else if (suffix == "ffn_gate_exps.weight")   L.ffn_gate_exps   = t;
         else if (suffix == "ffn_up_exps.weight")     L.ffn_up_exps     = t;
         else if (suffix == "ffn_down_exps.weight")   L.ffn_down_exps   = t;
@@ -288,33 +429,83 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
         need(L.hc_ffn_base, p + "hc_ffn_base.weight");
     }
 
+    std::string shape_error;
+    auto expect_shape = [&](const ggml_tensor * tensor, const std::string & name,
+                            std::initializer_list<int64_t> dims) {
+        if (tensor && shape_error.empty() && !tensor_shape_is(tensor, dims)) {
+            shape_error = name + " has a shape incompatible with DSpark metadata";
+        }
+    };
+    const int64_t n_embd = w.n_embd;
+    const int64_t hc_dim = n_embd * w.n_hc;
+    const int64_t mix_dim = 2LL * w.n_hc + (int64_t) w.n_hc * w.n_hc;
+    const int64_t q_dim = (int64_t) w.n_head * w.head_dim;
+    const int64_t group_dim = (int64_t) w.head_dim * (w.n_head / w.n_out_group);
+    const int64_t out_low_dim = (int64_t) w.n_lora_o * w.n_out_group;
+
+    expect_shape(out.main_proj, "dflash.fc.weight",
+                 {(int64_t) out.n_target_layers * n_embd, n_embd});
+    expect_shape(out.main_norm, "dflash.hidden_norm.weight", {n_embd});
+    expect_shape(out.markov_w1, "dflash.dspark.markov.w1",
+                 {out.markov_rank, out.vocab_size});
+    expect_shape(out.markov_w2, "dflash.dspark.markov.w2",
+                 {out.markov_rank, out.vocab_size});
+    expect_shape(w.out_norm, "output_norm.weight", {n_embd});
+    expect_shape(w.output_hc_fn, "output_hc_fn.weight", {hc_dim, w.n_hc});
+    expect_shape(w.output_hc_scale, "output_hc_scale.weight", {1});
+    expect_shape(w.output_hc_base, "output_hc_base.weight", {w.n_hc});
+    if (out.confidence_w && out.confidence_dim > 0) {
+        expect_shape(out.confidence_w, "dflash.dspark.confidence.weight",
+                     {out.confidence_dim, 1});
+        expect_shape(out.confidence_b, "dflash.dspark.confidence.bias", {1});
+    }
+    for (int il = 0; il < w.n_layer; ++il) {
+        const DeepSeek4Layer & L = w.layers[(size_t) il];
+        const std::string p = "blk." + std::to_string(il) + ".";
+        expect_shape(L.attn_norm, p + "attn_norm.weight", {n_embd});
+        expect_shape(L.attn_q_a, p + "attn_q_a.weight", {n_embd, w.n_lora_q});
+        expect_shape(L.attn_q_a_norm, p + "attn_q_a_norm.weight", {w.n_lora_q});
+        expect_shape(L.attn_q_b, p + "attn_q_b.weight", {w.n_lora_q, q_dim});
+        expect_shape(L.attn_kv, p + "attn_kv.weight", {n_embd, w.head_dim});
+        expect_shape(L.attn_kv_a_norm, p + "attn_kv_a_norm.weight", {w.head_dim});
+        if (L.attn_sinks) expect_shape(L.attn_sinks, p + "attn_sinks.weight", {w.n_head});
+        expect_shape(L.attn_output_a, p + "attn_output_a.weight",
+                     {group_dim, out_low_dim});
+        expect_shape(L.attn_output_b, p + "attn_output_b.weight",
+                     {out_low_dim, n_embd});
+        expect_shape(L.hc_attn_fn, p + "hc_attn_fn.weight", {hc_dim, mix_dim});
+        expect_shape(L.hc_attn_scale, p + "hc_attn_scale.weight", {3});
+        expect_shape(L.hc_attn_base, p + "hc_attn_base.weight", {mix_dim});
+        expect_shape(L.ffn_norm, p + "ffn_norm.weight", {n_embd});
+        expect_shape(L.ffn_gate_inp, p + "ffn_gate_inp.weight", {n_embd, w.n_expert});
+        if (L.ffn_exp_probs_b) {
+            expect_shape(L.ffn_exp_probs_b, p + "exp_probs_b.bias", {w.n_expert});
+        }
+        expect_shape(L.ffn_gate_exps, p + "ffn_gate_exps.weight",
+                     {n_embd, w.n_ff_exp, w.n_expert});
+        expect_shape(L.ffn_up_exps, p + "ffn_up_exps.weight",
+                     {n_embd, w.n_ff_exp, w.n_expert});
+        expect_shape(L.ffn_down_exps, p + "ffn_down_exps.weight",
+                     {w.n_ff_exp, n_embd, w.n_expert});
+        expect_shape(L.ffn_gate_shexp, p + "ffn_gate_shexp.weight", {n_embd, w.n_ff_exp});
+        expect_shape(L.ffn_up_shexp, p + "ffn_up_shexp.weight", {n_embd, w.n_ff_exp});
+        expect_shape(L.ffn_down_shexp, p + "ffn_down_shexp.weight", {w.n_ff_exp, n_embd});
+        expect_shape(L.hc_ffn_fn, p + "hc_ffn_fn.weight", {hc_dim, mix_dim});
+        expect_shape(L.hc_ffn_scale, p + "hc_ffn_scale.weight", {3});
+        expect_shape(L.hc_ffn_base, p + "hc_ffn_base.weight", {mix_dim});
+    }
+
     std::string contract_error;
     if (!out.dspark_enabled) {
         contract_error = "dflash.dspark.enabled is false";
-    } else if (w.n_layer <= 0 || w.n_embd <= 0 || w.n_vocab <= 0 ||
-               w.n_hc <= 0 || out.n_target_layers <= 0 ||
-               out.block_size < 2 || out.block_size > 16) {
-        contract_error = "invalid DSpark architecture metadata";
     } else if ((int) out.capture_layer_ids.size() != out.n_target_layers) {
         contract_error = "capture_layer_ids count does not match dflash.n_target_layers";
-    } else if (out.main_proj &&
-               (out.main_proj->ne[0] != (int64_t) out.n_target_layers * w.n_embd ||
-                out.main_proj->ne[1] != w.n_embd)) {
-        contract_error = "dflash.fc.weight shape does not match target-layer metadata";
-    } else if (out.markov_w1 && out.markov_w2 &&
-               (out.markov_w1->ne[0] != out.markov_rank ||
-                out.markov_w1->ne[1] != out.vocab_size ||
-                out.markov_w2->ne[0] != out.markov_rank ||
-                out.markov_w2->ne[1] != out.vocab_size)) {
-        contract_error = "DSpark Markov tensor shape does not match metadata";
     } else if ((out.confidence_w == nullptr) != (out.confidence_b == nullptr)) {
         contract_error = "incomplete DSpark confidence tensor pair";
-    } else if (out.confidence_w &&
-               (out.confidence_dim <= 0 ||
-                out.confidence_w->ne[0] != out.confidence_dim ||
-                out.confidence_w->ne[1] != 1 ||
-                ggml_nelements(out.confidence_b) != 1)) {
-        contract_error = "DSpark confidence tensor shape does not match metadata";
+    } else if (out.confidence_w && out.confidence_dim <= 0) {
+        contract_error = "DSpark confidence metadata is invalid";
+    } else if (!shape_error.empty()) {
+        contract_error = shape_error;
     }
     if (!missing.empty() || !contract_error.empty()) {
         std::string message = "invalid DSpark drafter GGUF";

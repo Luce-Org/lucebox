@@ -411,10 +411,6 @@ def add_dspark_aux_heads(writer, arch: str, aux_path: Path | None):
         )
         print("[warn] DSpark confidence head has no bias tensor; writing a zero bias")
 
-    if conf_missing and bias_names in conf_missing and len(conf_missing) > 1:
-        print("[warn] incomplete DSpark confidence head; Markov head will still load")
-        return
-
     conf_w = conf_resolved[weight_names][1]
     conf_b = conf_resolved[bias_names][1]
     confidence_dim = int(conf_w.shape[1])
