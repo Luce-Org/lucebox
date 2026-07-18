@@ -9,7 +9,15 @@
   },
   "models": {
     "official_qwen36_gguf_revision": "8a7ee08e8b9bfb857107ecc25a5599d2f38b76f8",
-    "local_dflash_draft_revision": "fca10ba135c9d834988e15b7d7f5aee8ebc562a7"
+    "official_qwen36_q4_k_m_sha256": "5ed60d0af4650a854b1755bd392f9aef4872643dc25a254bc68043fa638392a0",
+    "local_dflash_draft_revision": "fca10ba135c9d834988e15b7d7f5aee8ebc562a7",
+    "local_dflash_draft_q4_k_m_sha256": "e2500e90165a0f8e7b52c9882c29ed1fa391c60b300ff11b817bf10e31fa092e",
+    "llama_cpp_dflash_repo": "Alittlehammmer/Qwen3.6-27B-DFlash-GGUF-llama.cpp",
+    "llama_cpp_dflash_revision": "5f2ed671305fb1fd8de023d6b335cef4d2663888",
+    "llama_cpp_dflash_q4_k_m_sha256": "71362369a3428a9e93436a869b1131f63e04b88efbc92dacacb18c419d8de95c",
+    "llama_cpp_mtp_repo": "unsloth/Qwen3.6-27B-MTP-GGUF",
+    "llama_cpp_mtp_revision": "5cb35eb3dcbf52dbce5f87dbc64df6aaffadcace",
+    "llama_cpp_mtp_q4_k_m_sha256": "a7cbd3ecc0e3f9b333edee61ae66bc87ed713c5d49587a8355814722ed329e0f"
   },
   "decode_corpora": {
     "tuning40_sha256": "7cd4dba3f443361e17760687893f6d019d6a37d580457ea23b6cbd370a0c752a",

@@ -67,6 +67,13 @@ be recorded in the campaign manifest rather than copied or silently modified.
 `matrix.py` expands a sealed prompt corpus and configuration list into stable,
 append-only experiment cells before any GPU output is inspected.
 
+The local Lucebox and upstream llama.cpp DFlash draft GGUFs are separate pinned
+inputs. They advertise different architecture identifiers and are not
+interchangeable. The MTP comparator likewise uses the pinned MTP-bearing target
+GGUF; a target without embedded MTP layers must fail that cell rather than fall
+back to ordinary autoregressive decoding. SHA-256 values for all three model
+families are part of the protocol.
+
 Build the independent tuning and held-out decode corpora from hash-verified,
 commit-pinned public sources:
 
