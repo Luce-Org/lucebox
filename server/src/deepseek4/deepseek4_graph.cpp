@@ -959,6 +959,7 @@ static void build_compressor_step(
         std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs,
         std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs,
         ggml_tensor ** comp_cache_source_out = nullptr,
+        ggml_tensor * flush_rows_inp = nullptr,
         ggml_tensor * cur_all = nullptr,
         int n_tokens_all = 1,
         int kv_start_all = -1,
@@ -1292,6 +1293,7 @@ static void build_indexer_compressor_step(
         std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs,
         std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs,
         ggml_tensor ** index_comp_cache_source_out = nullptr,
+        ggml_tensor * flush_rows_inp = nullptr,
         ggml_tensor * cur_all = nullptr,
         int n_tokens_all = 1,
         int kv_start_all = -1,
@@ -1320,6 +1322,7 @@ static void build_indexer_compressor_step(
                           i64_array_inputs,
                           i32_array_inputs,
                           index_comp_cache_source_out,
+                          flush_rows_inp,
                           cur_all,
                           n_tokens_all,
                           kv_start_all,
@@ -1660,6 +1663,7 @@ static ggml_tensor * build_mla_attention(
                               i64_array_inputs,
                               i32_array_inputs,
                               &comp_kv_source,
+                              cached_inputs ? cached_inputs->flush_rows : nullptr,
                               (causal_batch || fused_causal) ? cur : nullptr,
                               n_tokens,
                               kv_start);
@@ -1675,15 +1679,12 @@ static ggml_tensor * build_mla_attention(
                                       i64_array_inputs,
                                       i32_array_inputs,
                                       &index_comp_kv_source,
+                                      cached_inputs ? cached_inputs->flush_rows : nullptr,
                                       (causal_batch || fused_causal) ? cur : nullptr,
                                       n_tokens,
                                       kv_start,
                                       attention_impl ==
                                           DeepSeek4AttentionImpl::SparseFlash);
-        if (attention_impl == DeepSeek4AttentionImpl::Explicit) {
-            (void) build_indexer_score(
-                ctx, qr_last, cur_last, w, L, lc, token_pos, i32_inputs);
-        }
     }
 
     // ── MLA Dot-Product Attention (SWA + compressed KV) ────────────
