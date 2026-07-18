@@ -44,7 +44,8 @@ ENV PATH=/opt/rocm/bin:/opt/rocm/lib/llvm/bin:${PATH}
 # driver (/dev/kfd, /dev/dri) is wired in at run time via --device.
 # hipblas/rocblas: ggml's HIP backend hard-requires them.
 # hipCUB/rocPRIM: ggml's ROCm argsort/top-k kernels use their headers for the
-# large-N device-sort path; the ROCm apt repository ships them separately from
+# large-N device-sort path. rocWMMA is also required by the DS4 indexed
+# prefill kernel. The ROCm apt repository ships these headers separately from
 # the base HIP toolchain.
 # (deps/llama.cpp/ggml/src/ggml-hip/CMakeLists.txt does find_package(hipblas)
 # for its BLAS matmul path). The rocm/dev-ubuntu base ships the HIP toolchain
@@ -65,6 +66,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 \
         rocblas-dev \
         rocprim-dev \
+        rocwmma-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
