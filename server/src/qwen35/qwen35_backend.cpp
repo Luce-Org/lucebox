@@ -15,6 +15,7 @@
 #endif
 #include "common/io_utils.h"
 #include "common/restore_delta.h"
+#include "qwen35_tensor_parallel.h"
 #include "qwen3/qwen3_drafter.h"
 #include "qwen3/qwen3_kvflash_scorer.h"
 
@@ -176,14 +177,21 @@ KvFlashAutoBudget Qwen35Backend::make_kvflash_budget(const TargetWeights & w,
 
 bool Qwen35Backend::init() {
     const bool use_remote_draft = cfg_.remote_draft.enabled();
-    split_gpus_ = !use_remote_draft && (cfg_.device.gpu != cfg_.draft_gpu);
+    const bool tensor_parallel = cfg_.device.is_tensor_parallel();
+    split_gpus_ = !use_remote_draft && cfg_.draft_path &&
+                  (tensor_parallel || cfg_.device.gpu != cfg_.draft_gpu);
 
-    target_backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
+    if (tensor_parallel) {
+        tensor_parallel_ = Qwen35TensorParallelContext::create(cfg_.device, w_);
+        target_backend_ = tensor_parallel_ ? tensor_parallel_->init_backend() : nullptr;
+    } else {
+        target_backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
+    }
     if (!target_backend_) {
-        std::fprintf(stderr, "target cuda init failed\n");
+        std::fprintf(stderr, "target backend init failed\n");
         return false;
     }
-    draft_backend_ = use_remote_draft ? nullptr : target_backend_;
+    draft_backend_ = use_remote_draft || !cfg_.draft_path ? nullptr : target_backend_;
     if (split_gpus_) {
         draft_backend_ = ggml_backend_cuda_init(cfg_.draft_gpu);
         if (!draft_backend_) {
@@ -747,6 +755,7 @@ void Qwen35Backend::shutdown() {
         ggml_backend_free(target_backend_);
         target_backend_ = nullptr;
     }
+    tensor_parallel_.reset();
     if (snap_backend_) {
         free_snapshot_backend(snap_backend_, target_backend_);
         snap_backend_ = nullptr;
@@ -1600,7 +1609,9 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             // for greedy). Falls back to the CPU chain on -1.
             int g_tok = -1;
             if (gpu_sampler_enabled() && gpu_sampler_supports(sampler_) &&
-                sg_.logits && sg_.logits->data) {
+                sg_.logits && sg_.logits->data &&
+                !ggml_backend_buft_is_meta(
+                    ggml_backend_get_default_buffer_type(target_backend_))) {
                 // Draw the uniform from a copy of the RNG so the real stream is
                 // not advanced yet; we only commit that single draw if the GPU
                 // path succeeds (below). On fallback the stream is untouched and

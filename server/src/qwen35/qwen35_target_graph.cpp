@@ -264,19 +264,26 @@ bool create_target_cache_partial(const TargetWeights & w,
     }
 
     // ── Zero-initialize all state tensors ─────────────────────────────
-    std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
-    ggml_context * ctx_list[] = { out.base_ctx, out.rollback_ctx };
-    for (int ci = 0; ci < 2; ci++) {
-        ggml_context * c = ctx_list[ci];
-        if (!c) continue;
-        for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr;
-             t = ggml_get_next_tensor(c, t)) {
-            size_t nb = ggml_nbytes(t);
-            size_t off = 0;
-            while (off < nb) {
-                size_t chunk = std::min(nb - off, zeros.size());
-                ggml_backend_tensor_set(t, zeros.data(), off, chunk);
-                off += chunk;
+    const bool meta_backend = ggml_backend_buft_is_meta(
+        ggml_backend_get_default_buffer_type(backend));
+    if (meta_backend) {
+        ggml_backend_buffer_clear(out.base_buf, 0);
+        if (out.rollback_buf) ggml_backend_buffer_clear(out.rollback_buf, 0);
+    } else {
+        std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
+        ggml_context * ctx_list[] = { out.base_ctx, out.rollback_ctx };
+        for (int ci = 0; ci < 2; ci++) {
+            ggml_context * c = ctx_list[ci];
+            if (!c) continue;
+            for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr;
+                 t = ggml_get_next_tensor(c, t)) {
+                size_t nb = ggml_nbytes(t);
+                size_t off = 0;
+                while (off < nb) {
+                    size_t chunk = std::min(nb - off, zeros.size());
+                    ggml_backend_tensor_set(t, zeros.data(), off, chunk);
+                    off += chunk;
+                }
             }
         }
     }
@@ -304,6 +311,12 @@ void free_target_cache(TargetCache & c) {
 
 void reset_target_cache(TargetCache & c) {
     c.cur_pos = 0;
+    if (c.backend && ggml_backend_buft_is_meta(
+            ggml_backend_get_default_buffer_type(c.backend))) {
+        if (c.base_buf) ggml_backend_buffer_clear(c.base_buf, 0);
+        if (c.rollback_buf) ggml_backend_buffer_clear(c.rollback_buf, 0);
+        return;
+    }
     std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
     ggml_context * ctx_list[] = { c.base_ctx, c.rollback_ctx };
     for (int ci = 0; ci < 2; ci++) {
@@ -430,16 +443,21 @@ bool migrate_prefill_cache(const TargetWeights & w,
         return false;
     }
 
-    // Zero-initialize rollback tensors
-    std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
-    for (ggml_tensor * t = ggml_get_first_tensor(cache.rollback_ctx); t != nullptr;
-         t = ggml_get_next_tensor(cache.rollback_ctx, t)) {
-        size_t nb = ggml_nbytes(t);
-        size_t off = 0;
-        while (off < nb) {
-            size_t chunk = std::min(nb - off, zeros.size());
-            ggml_backend_tensor_set(t, zeros.data(), off, chunk);
-            off += chunk;
+    // Zero-initialize rollback tensors. Meta buffers must be cleared per rank;
+    // fixed-size host chunks can cut through an axis-2 split row.
+    if (ggml_backend_buft_is_meta(ggml_backend_get_default_buffer_type(backend))) {
+        ggml_backend_buffer_clear(cache.rollback_buf, 0);
+    } else {
+        std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
+        for (ggml_tensor * t = ggml_get_first_tensor(cache.rollback_ctx); t != nullptr;
+             t = ggml_get_next_tensor(cache.rollback_ctx, t)) {
+            size_t nb = ggml_nbytes(t);
+            size_t off = 0;
+            while (off < nb) {
+                size_t chunk = std::min(nb - off, zeros.size());
+                ggml_backend_tensor_set(t, zeros.data(), off, chunk);
+                off += chunk;
+            }
         }
     }
 
