@@ -203,6 +203,9 @@ def execute_cell(
     attempt: int,
 ) -> RunRow:
     config = dict(cell["config"])
+    prompt_hash = hashlib.sha256(canonical_json(prompt).encode()).hexdigest()
+    if prompt_hash != cell.get("prompt_hash"):
+        raise ValueError("prompt row does not match the matrix prompt hash")
     endpoint = str(config["endpoint_url"]).rstrip("/") + "/chat/completions"
     payload: dict[str, Any] = {
         "model": config["model"],
@@ -273,6 +276,7 @@ def execute_cell(
         artifact = {
             "config_id": cell["config_id"],
             "prompt_id": cell["prompt_id"],
+            "prompt_hash": prompt_hash,
             "request": payload,
             "response": raw_response,
             "props": props,
@@ -308,6 +312,9 @@ def execute_cell(
         metrics=metrics,
         artifacts=artifacts,
         error=error,
+        prompt_hash=str(cell["prompt_hash"]),
+        protocol_hash=str(cell["protocol_hash"]),
+        cell_hash=str(cell["cell_hash"]),
     )
 
 
@@ -346,6 +353,9 @@ def main() -> None:
             config_id,
             config_hash=str(cell["config_hash"]),
             environment_hash=str(cell["environment_hash"]),
+            prompt_hash=str(cell["prompt_hash"]),
+            protocol_hash=str(cell["protocol_hash"]),
+            cell_hash=str(cell["cell_hash"]),
             required_metrics=required,
         ):
             continue
