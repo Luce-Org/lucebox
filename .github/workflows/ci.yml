@@ -23,6 +23,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Test CUDA architecture parsing
+        run: |
+          cmake -S server/cmake/tests -B server/cmake/tests/build
+          ctest --test-dir server/cmake/tests/build --output-on-failure --no-tests=error
+
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           version: "0.11.x"
