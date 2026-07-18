@@ -3,7 +3,10 @@ import json
 import pytest
 
 from harness.validation_v2.http_runner import (
+    _assistant_output,
+    _response_timings,
     parse_sse_lines,
+    validate_llama_cpp_evidence,
     validate_speculative_evidence,
 )
 
@@ -130,3 +133,105 @@ def test_sse_parser_rejects_truncated_or_unfinished_streams() -> None:
                 b"data: [DONE]\n",
             ]
         )
+
+
+def _llama_cpp_config(speculative_type: str) -> dict[str, object]:
+    speculative = speculative_type != "none"
+    return {
+        "expected_build_info": "b10068-571d0d54",
+        "expected_model_alias": "Qwen3.6-27B-Q4_K_M.gguf",
+        "expected_speculative_type": speculative_type,
+        "expected_configured_contract": "external-unverified"
+        if speculative
+        else "autoregressive",
+        "expected_effective_decode_mode": "llama_cpp_"
+        + speculative_type.removeprefix("draft-")
+        if speculative
+        else "autoregressive",
+        "expected_fallback_reason": "none",
+    }
+
+
+def test_llama_cpp_evidence_requires_matching_identity_and_draft_activity() -> None:
+    props = {
+        "build_info": "b10068-571d0d54",
+        "model_alias": "Qwen3.6-27B-Q4_K_M.gguf",
+    }
+    response = {
+        "timings": {
+            "predicted_ms": 1106.0,
+            "predicted_per_second": 57.8,
+            "draft_n": 55,
+            "draft_n_accepted": 44,
+        }
+    }
+    evidence = validate_llama_cpp_evidence(
+        props=props,
+        raw_response=response,
+        config=_llama_cpp_config("draft-mtp"),
+    )
+    assert evidence["effective_decode_mode"] == "llama_cpp_mtp"
+    assert evidence["draft_n_accepted"] == 44
+
+    no_drafts = {"timings": {"predicted_ms": 1.0, "predicted_per_second": 1.0}}
+    with pytest.raises(ValueError, match="no draft evidence"):
+        validate_llama_cpp_evidence(
+            props=props,
+            raw_response=no_drafts,
+            config=_llama_cpp_config("draft-dflash"),
+        )
+
+
+def test_llama_cpp_target_only_rejects_unexpected_drafts_and_wrong_build() -> None:
+    props = {
+        "build_info": "b10068-571d0d54",
+        "model_alias": "Qwen3.6-27B-Q4_K_M.gguf",
+    }
+    response = {"timings": {"predicted_ms": 1.0, "predicted_per_second": 1.0}}
+    evidence = validate_llama_cpp_evidence(
+        props=props, raw_response=response, config=_llama_cpp_config("none")
+    )
+    assert evidence["configured_contract"] == "autoregressive"
+
+    with pytest.raises(ValueError, match="unexpectedly drafted"):
+        validate_llama_cpp_evidence(
+            props=props,
+            raw_response={"timings": {"draft_n": 1, "draft_n_accepted": 1}},
+            config=_llama_cpp_config("none"),
+        )
+    with pytest.raises(ValueError, match="build_info"):
+        validate_llama_cpp_evidence(
+            props={**props, "build_info": "wrong"},
+            raw_response=response,
+            config=_llama_cpp_config("none"),
+        )
+
+
+def test_response_timings_reads_final_sse_chunk() -> None:
+    assert _response_timings(
+        [{"choices": []}, {"timings": {"predicted_per_second": 12.5}}]
+    )["predicted_per_second"] == 12.5
+
+
+def test_assistant_output_hash_material_includes_reasoning_and_final_content() -> None:
+    nonstream = {
+        "choices": [
+            {
+                "message": {
+                    "reasoning_content": "private trace",
+                    "content": "VOLTA",
+                }
+            }
+        ]
+    }
+    assert _assistant_output(nonstream) == {
+        "reasoning_content": "private trace",
+        "content": "VOLTA",
+    }
+    stream = [
+        {"choices": [{"delta": {"reasoning_content": "private "}}]},
+        {"choices": [{"delta": {"reasoning_content": "trace"}}]},
+        {"choices": [{"delta": {"content": "VOL"}}]},
+        {"choices": [{"delta": {"content": "TA"}, "finish_reason": "stop"}]},
+    ]
+    assert _assistant_output(stream) == _assistant_output(nonstream)

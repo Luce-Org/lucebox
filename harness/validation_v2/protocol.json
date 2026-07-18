@@ -28,7 +28,7 @@
     {"id": "dual-v100s", "compute_capability": "70", "gpu_count": 2},
     {"id": "rtx3090", "compute_capability": "86", "gpu_count": 1}
   ],
-  "contracts": ["autoregressive", "exact", "approximate"],
+  "contracts": ["autoregressive", "exact", "approximate", "external-unverified"],
   "local_modes": [
     "target-ar",
     "exact-chain",

@@ -79,6 +79,48 @@ def _content(response: dict[str, Any]) -> str:
     return content
 
 
+def _assistant_output(raw_response: Any) -> dict[str, str]:
+    """Reconstruct the assistant fields that carry generated model text.
+
+    Output parity must include reasoning text as well as final content.  Quality
+    scorers continue to consume final content separately.
+    """
+
+    if isinstance(raw_response, dict):
+        choices = raw_response.get("choices") or []
+        if len(choices) != 1:
+            raise ValueError("response must contain exactly one choice")
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        reasoning = message.get("reasoning_content", "")
+        if not isinstance(content, str) or not isinstance(reasoning, str):
+            raise ValueError("response assistant text fields must be strings")
+        return {"reasoning_content": reasoning, "content": content}
+    if isinstance(raw_response, list):
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        for chunk in raw_response:
+            if not isinstance(chunk, dict):
+                raise ValueError("stream chunk is not a JSON object")
+            for choice in chunk.get("choices") or []:
+                delta = choice.get("delta") or {}
+                content = delta.get("content")
+                reasoning = delta.get("reasoning_content")
+                if content is not None:
+                    if not isinstance(content, str):
+                        raise ValueError("stream content delta is not a string")
+                    content_parts.append(content)
+                if reasoning is not None:
+                    if not isinstance(reasoning, str):
+                        raise ValueError("stream reasoning delta is not a string")
+                    reasoning_parts.append(reasoning)
+        return {
+            "reasoning_content": "".join(reasoning_parts),
+            "content": "".join(content_parts),
+        }
+    raise ValueError("response is neither a JSON object nor SSE chunks")
+
+
 def request_chat(
     *,
     url: str,
@@ -188,6 +230,96 @@ def validate_speculative_evidence(
     return evidence
 
 
+def _response_timings(raw_response: Any) -> dict[str, Any]:
+    """Return the server timing object from a JSON response or final SSE chunk."""
+
+    candidates = (
+        [raw_response]
+        if isinstance(raw_response, dict)
+        else list(reversed(raw_response))
+        if isinstance(raw_response, list)
+        else []
+    )
+    for candidate in candidates:
+        if isinstance(candidate, dict) and isinstance(candidate.get("timings"), dict):
+            return dict(candidate["timings"])
+    raise ValueError("response lacks authoritative server timings")
+
+
+def validate_llama_cpp_evidence(
+    *, props: dict[str, Any], raw_response: Any, config: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate observable upstream llama.cpp identity and speculative activity.
+
+    llama.cpp does not currently expose the configured speculative route in
+    ``/props``.  We therefore require an exact build/model identity match and
+    prove speculative execution from per-response draft counters.  This is
+    deliberately labelled externally unverified rather than exact.
+    """
+
+    expected_fields = (
+        "expected_build_info",
+        "expected_model_alias",
+        "expected_speculative_type",
+        "expected_configured_contract",
+        "expected_effective_decode_mode",
+        "expected_fallback_reason",
+    )
+    missing = [field for field in expected_fields if field not in config]
+    if missing:
+        raise ValueError(
+            "llama.cpp configuration lacks evidence expectations: "
+            + ", ".join(missing)
+        )
+    if props.get("build_info") != config["expected_build_info"]:
+        raise ValueError("/props build_info does not match the matrix")
+    if props.get("model_alias") != config["expected_model_alias"]:
+        raise ValueError("/props model_alias does not match the matrix")
+
+    speculative_type = str(config["expected_speculative_type"])
+    allowed_types = {"none", "draft-dflash", "draft-mtp"}
+    if speculative_type not in allowed_types:
+        raise ValueError("unsupported expected_speculative_type")
+    timings = _response_timings(raw_response)
+    draft_n = timings.get("draft_n", 0)
+    draft_n_accepted = timings.get("draft_n_accepted", 0)
+    if not isinstance(draft_n, int) or not isinstance(draft_n_accepted, int):
+        raise ValueError("llama.cpp draft counters must be integers")
+    if draft_n < 0 or draft_n_accepted < 0 or draft_n_accepted > draft_n:
+        raise ValueError("llama.cpp draft counters are inconsistent")
+
+    if speculative_type == "none":
+        if draft_n != 0:
+            raise ValueError("target-only llama.cpp cell unexpectedly drafted tokens")
+        configured_contract = "autoregressive"
+        effective_mode = "autoregressive"
+    else:
+        if draft_n <= 0:
+            raise ValueError("llama.cpp speculative cell produced no draft evidence")
+        configured_contract = "external-unverified"
+        effective_mode = "llama_cpp_" + speculative_type.removeprefix("draft-")
+    fallback_reason = "none"
+
+    expected = {
+        "configured_contract": str(config["expected_configured_contract"]),
+        "effective_decode_mode": str(config["expected_effective_decode_mode"]),
+        "fallback_reason": str(config["expected_fallback_reason"]),
+    }
+    observed = {
+        "configured_contract": configured_contract,
+        "effective_decode_mode": effective_mode,
+        "fallback_reason": fallback_reason,
+    }
+    for field, value in observed.items():
+        if value != expected[field]:
+            raise ValueError(f"llama.cpp {field} does not match the matrix")
+    return {
+        **observed,
+        "draft_n": draft_n,
+        "draft_n_accepted": draft_n_accepted,
+    }
+
+
 def _artifact_name(config_id: str, attempt: int) -> str:
     safe = "".join(character if character.isalnum() or character in "-_." else "_" for character in config_id)
     return safe[:210] + f".attempt-{attempt}.json"
@@ -239,23 +371,38 @@ def execute_cell(
         text, usage, raw_response, ttft_s, elapsed_s = request_chat(
             url=endpoint, api_key=api_key, payload=payload, timeout=timeout
         )
-        speculative = validate_speculative_evidence(
-            usage=usage, props=props, config=config
-        )
+        assistant_output = _assistant_output(raw_response)
+        if assistant_output["content"] != text:
+            raise ValueError("reconstructed final content does not match the response")
+        runtime_family = str(config.get("runtime_family", "lucebox"))
+        if runtime_family == "lucebox":
+            speculative: dict[str, Any] = validate_speculative_evidence(
+                usage=usage, props=props, config=config
+            )
+            timings = usage.get("timings")
+            if not isinstance(timings, dict):
+                raise ValueError("response usage lacks authoritative server timings")
+            decode_tok_s = timings.get("decode_tokens_per_sec")
+            decode_ms = timings.get("decode_ms")
+        elif runtime_family == "llama.cpp":
+            speculative = validate_llama_cpp_evidence(
+                props=props, raw_response=raw_response, config=config
+            )
+            timings = _response_timings(raw_response)
+            decode_tok_s = timings.get("predicted_per_second")
+            decode_ms = timings.get("predicted_ms")
+        else:
+            raise ValueError("runtime_family must be lucebox or llama.cpp")
         completion_tokens = usage.get("completion_tokens")
         if not isinstance(completion_tokens, int) or completion_tokens <= 0:
             raise ValueError("response lacks an authoritative positive completion token count")
         if measurement_kind == "fixed_work" and completion_tokens != payload["max_tokens"]:
             raise ValueError("fixed_work response stopped before the requested token count")
-        timings = usage.get("timings")
-        if not isinstance(timings, dict):
-            raise ValueError("response usage lacks authoritative server timings")
-        decode_tok_s = timings.get("decode_tokens_per_sec")
-        decode_ms = timings.get("decode_ms")
         if not isinstance(decode_tok_s, (int, float)) or decode_tok_s <= 0:
             raise ValueError("response lacks a positive server decode rate")
         if not isinstance(decode_ms, (int, float)) or decode_ms <= 0:
             raise ValueError("response lacks a positive server decode duration")
+        generated_bytes = canonical_json(assistant_output).encode()
         metrics = {
             "elapsed_s": elapsed_s,
             "ttft_ms": None if ttft_s is None else ttft_s * 1000.0,
@@ -264,13 +411,26 @@ def execute_cell(
             "decode_tok_s": float(decode_tok_s),
             "decode_ms": float(decode_ms),
             "measurement_kind": measurement_kind,
-            "output_sha256": hashlib.sha256(text.encode()).hexdigest(),
-            "output_bytes": len(text.encode()),
+            "output_sha256": hashlib.sha256(generated_bytes).hexdigest(),
+            "output_bytes": len(generated_bytes),
             "effective_decode_mode": speculative["effective_decode_mode"],
             "configured_contract": speculative["configured_contract"],
             "fallback_reason": speculative["fallback_reason"],
+            "runtime_family": runtime_family,
             "props_sha256": hashlib.sha256(canonical_json(props).encode()).hexdigest(),
         }
+        if "draft_n" in speculative:
+            draft_n = int(speculative["draft_n"])
+            draft_n_accepted = int(speculative["draft_n_accepted"])
+            metrics.update(
+                {
+                    "draft_n": draft_n,
+                    "draft_n_accepted": draft_n_accepted,
+                    "draft_acceptance_rate": draft_n_accepted / draft_n
+                    if draft_n
+                    else None,
+                }
+            )
         artifact_path = artifacts_dir / _artifact_name(str(cell["config_id"]), attempt)
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         artifact = {
@@ -280,6 +440,7 @@ def execute_cell(
             "request": payload,
             "response": raw_response,
             "props": props,
+            "assistant_output": assistant_output,
             "final_content": text,
         }
         artifact_path.write_text(canonical_json(artifact) + "\n", encoding="utf-8")

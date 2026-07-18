@@ -110,3 +110,16 @@ never overwrite a failed attempt. Run concurrency is explicit with
 `--concurrency`; every cell must declare the same planned `concurrency` value.
 `fixed_work` cells must request `ignore_eos` and still produce exactly
 `max_tokens`, while `natural_stop` cells preserve the model's stop behavior.
+Parity hashes cover the canonical assistant `reasoning_content` and final
+`content` fields together; hashing visible final content alone is forbidden.
+Quality scorers still receive final content as a separate field.
+
+Upstream llama.cpp cells set `runtime_family` to `llama.cpp` and must pin the
+exact `/props` `build_info`, model alias, and planned speculative type. Because
+upstream `/props` does not expose the active speculative route, target-only
+cells must report zero draft tokens and DFlash/MTP cells must report positive,
+internally consistent `draft_n` and `draft_n_accepted` response timings. These
+routes are recorded as `external-unverified`; output parity is evaluated from
+the independently retained response bytes and is never inferred from draft
+activity alone. Lucebox cells retain the stronger nested launch/response
+contract checks described above.
