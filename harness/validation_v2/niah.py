@@ -7,7 +7,7 @@ import hashlib
 import json
 import random
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 DEPTHS = (0.05, 0.25, 0.50, 0.75, 0.95)
@@ -80,6 +80,8 @@ class NiahCase:
     prompt: str
     prompt_sha256: str
     tokenizer_revision: str
+    actual_context_tokens: int
+    actual_depth_fraction: float
     control: str | None = None
 
     def as_dict(self) -> dict[str, object]:
@@ -103,13 +105,88 @@ def _answer(answer_type: str, rng: random.Random) -> str:
 def _filler(target_characters: int, family: tuple[str, str], rng: random.Random) -> str:
     name, template = family
     records: list[str] = []
+    characters = 0
     index = 0
-    while sum(map(len, records)) < target_characters:
+    while characters < target_characters:
         unrelated = rng.randrange(1_000_000, 10_000_000)
-        records.append(template.format(index=f"{index}-{unrelated}"))
+        record = template.format(index=f"{index}-{unrelated}")
+        records.append(record)
+        characters += len(record)
         index += 1
     rng.shuffle(records)
     return "".join(records), name
+
+
+def _validate_revision(revision: str) -> None:
+    if len(revision) not in {40, 64} or any(ch not in "0123456789abcdef" for ch in revision):
+        raise ValueError("tokenizer_revision must be an immutable lowercase SHA")
+
+
+def _sized_prompt(
+    *,
+    context_tokens: int,
+    depth_fraction: float,
+    body: str,
+    question: str,
+    family: tuple[str, str],
+    rng: random.Random,
+    token_counter: Callable[[str], int],
+    chars_per_token: float,
+    token_tolerance: int,
+) -> tuple[str, str, int, float]:
+    """Size and place a case using the campaign tokenizer, never a char proxy."""
+
+    if context_tokens < 1:
+        raise ValueError("context_tokens must be positive")
+    if chars_per_token <= 0:
+        raise ValueError("chars_per_token must be positive")
+    if token_tolerance < 0:
+        raise ValueError("token_tolerance must be non-negative")
+    filler, filler_id = _filler(
+        round(context_tokens * chars_per_token * 2.0), family, rng
+    )
+
+    def render(filler_characters: int) -> tuple[str, int]:
+        selected = filler[:filler_characters]
+        insertion = min(len(selected), round(len(selected) * depth_fraction))
+        prompt = selected[:insertion] + "\n" + body + "\n" + selected[insertion:] + "\n" + question
+        return prompt, insertion
+
+    filler_characters = min(len(filler), round(context_tokens * chars_per_token))
+    best: tuple[int, str, int] | None = None
+    for _ in range(16):
+        prompt, insertion = render(filler_characters)
+        actual = token_counter(prompt)
+        if not isinstance(actual, int) or isinstance(actual, bool) or actual <= 0:
+            raise ValueError("token counter must return a positive integer")
+        if actual <= context_tokens and (best is None or actual > best[0]):
+            best = (actual, prompt, insertion)
+        if actual <= context_tokens and context_tokens - actual <= token_tolerance:
+            break
+        observed_chars_per_token = len(prompt) / actual
+        adjustment = round((context_tokens - actual) * observed_chars_per_token)
+        if adjustment == 0:
+            adjustment = 1 if actual < context_tokens else -1
+        next_characters = max(0, min(len(filler), filler_characters + adjustment))
+        if next_characters == filler_characters:
+            break
+        filler_characters = next_characters
+
+    if best is None or context_tokens - best[0] > token_tolerance:
+        observed = None if best is None else best[0]
+        raise ValueError(
+            f"tokenizer-sized prompt missed target {context_tokens} by more than "
+            f"{token_tolerance} tokens (best={observed})"
+        )
+    actual, prompt, insertion = best
+    prefix_tokens = token_counter(prompt[:insertion]) if insertion else 0
+    actual_depth = prefix_tokens / actual
+    if abs(actual_depth - depth_fraction) > 0.02:
+        raise ValueError(
+            f"tokenizer-sized needle depth {actual_depth:.4f} differs from "
+            f"planned {depth_fraction:.4f}"
+        )
+    return prompt, filler_id, actual, actual_depth
 
 
 def generate_primary_cases(
@@ -118,11 +195,15 @@ def generate_primary_cases(
     tokenizer_revision: str,
     seed_base: int = 20260718,
     chars_per_token: float = 4.0,
+    token_counter: Callable[[str], int] | None = None,
+    token_tolerance: int = 8,
 ) -> list[NiahCase]:
     """Generate the 5 depths x 5 seed families x 4 answer types design."""
 
+    _validate_revision(tokenizer_revision)
+    if token_counter is None:
+        raise ValueError("publication NIAH generation requires an actual tokenizer counter")
     cases: list[NiahCase] = []
-    target_characters = round(context_tokens * chars_per_token)
     for depth_index, depth in enumerate(DEPTHS):
         for seed_family in range(5):
             for answer_index, answer_type in enumerate(ANSWER_TYPES):
@@ -133,10 +214,17 @@ def generate_primary_cases(
                     (depth_index + seed_family) % len(HELD_OUT_TEMPLATES)
                 ]
                 answer = _answer(answer_type, rng)
-                filler, filler_id = _filler(target_characters, family, rng)
-                insertion = min(len(filler), round(len(filler) * depth))
-                needle = "\n" + needle_template.format(answer=answer) + "\n"
-                prompt = filler[:insertion] + needle + filler[insertion:] + "\n" + question
+                prompt, filler_id, actual_tokens, actual_depth = _sized_prompt(
+                    context_tokens=context_tokens,
+                    depth_fraction=depth,
+                    body=needle_template.format(answer=answer),
+                    question=question,
+                    family=family,
+                    rng=rng,
+                    token_counter=token_counter,
+                    chars_per_token=chars_per_token,
+                    token_tolerance=token_tolerance,
+                )
                 case_id = (
                     f"niah-{context_tokens}-d{depth_index}-s{seed_family}-a{answer_index}"
                 )
@@ -153,6 +241,8 @@ def generate_primary_cases(
                         prompt=prompt,
                         prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
                         tokenizer_revision=tokenizer_revision,
+                        actual_context_tokens=actual_tokens,
+                        actual_depth_fraction=actual_depth,
                     )
                 )
     if len(cases) != 100:
@@ -165,7 +255,13 @@ def generate_control_cases(
     context_tokens: int,
     tokenizer_revision: str,
     seed_base: int = 20260718,
+    chars_per_token: float = 4.0,
+    token_counter: Callable[[str], int] | None = None,
+    token_tolerance: int = 8,
 ) -> list[NiahCase]:
+    _validate_revision(tokenizer_revision)
+    if token_counter is None:
+        raise ValueError("publication NIAH generation requires an actual tokenizer counter")
     controls = ("answer-absent", "misleading", "multiple", "prefix", "prompt-echo")
     cases: list[NiahCase] = []
     for control_index, control in enumerate(controls):
@@ -184,20 +280,34 @@ def generate_control_cases(
                 body = f"An invalid longer identifier is {answer}{rng.randrange(10, 99)}."
             else:
                 body = f"The question text mentions a placeholder such as {distractor}."
-            prompt = body + "\nReturn the authoritative value only, or NONE if it is unavailable."
+            question = "Return the authoritative value only, or NONE if it is unavailable."
+            family = FILLER_FAMILIES[(control_index + repetition) % len(FILLER_FAMILIES)]
+            prompt, filler_id, actual_tokens, actual_depth = _sized_prompt(
+                context_tokens=context_tokens,
+                depth_fraction=0.5,
+                body=body,
+                question=question,
+                family=family,
+                rng=rng,
+                token_counter=token_counter,
+                chars_per_token=chars_per_token,
+                token_tolerance=token_tolerance,
+            )
             cases.append(
                 NiahCase(
                     case_id=f"niah-control-{context_tokens}-{control}-{repetition}",
                     seed=seed,
                     context_tokens=context_tokens,
                     depth_fraction=0.5,
-                    filler_id="control",
+                    filler_id=filler_id,
                     template_id="control",
                     answer_type=ANSWER_TYPES[repetition],
-                    answer="NONE" if control in {"answer-absent", "misleading", "prompt-echo"} else answer,
+                    answer="NONE",
                     prompt=prompt,
                     prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
                     tokenizer_revision=tokenizer_revision,
+                    actual_context_tokens=actual_tokens,
+                    actual_depth_fraction=actual_depth,
                     control=control,
                 )
             )

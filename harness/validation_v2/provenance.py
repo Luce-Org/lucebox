@@ -6,7 +6,10 @@ import hashlib
 import json
 import os
 import platform
+import re
 import subprocess
+import urllib.parse
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +26,7 @@ def sha256_file(path: Path) -> str:
 
 def _run(args: list[str], cwd: Path) -> str:
     result = subprocess.run(args, cwd=cwd, capture_output=True, text=True, check=True)
-    return result.stdout.strip()
+    return result.stdout.rstrip()
 
 
 def repository_identity(root: Path) -> dict[str, Any]:
@@ -31,13 +34,74 @@ def repository_identity(root: Path) -> dict[str, Any]:
     if status:
         raise ValueError("publication provenance refuses a dirty git tree")
     submodules = _run(["git", "submodule", "status", "--recursive"], root)
+    submodule_rows = submodules.splitlines() if submodules else []
+    invalid_submodules = [row for row in submodule_rows if not row.startswith(" ")]
+    if invalid_submodules:
+        raise ValueError(
+            "publication provenance requires initialized, pinned submodules: "
+            + "; ".join(invalid_submodules)
+        )
     return {
         "commit": _run(["git", "rev-parse", "HEAD"], root),
         "tree": _run(["git", "rev-parse", "HEAD^{tree}"], root),
         "branch": _run(["git", "branch", "--show-current"], root),
-        "submodules": submodules.splitlines() if submodules else [],
+        "submodules": [row.strip() for row in submodule_rows],
         "clean": True,
     }
+
+
+_SECRET_KEY = re.compile(
+    r"(?:api[-_]?key|access[-_]?token|auth[-_]?token|bearer[-_]?token|"
+    r"(?:^|[-_])token(?:$|[-_=])|password|passwd|secret|authorization|credential)",
+    re.I,
+)
+_IMMUTABLE_SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+
+
+def redact_command(command: list[str]) -> list[str]:
+    """Redact common secret-bearing flags, assignments, and URL credentials."""
+
+    redacted: list[str] = []
+    hide_next = False
+    for argument in command:
+        if hide_next:
+            redacted.append("[REDACTED]")
+            hide_next = False
+            continue
+        parsed = urllib.parse.urlsplit(argument)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            hostname = parsed.hostname or ""
+            if parsed.port is not None:
+                hostname += f":{parsed.port}"
+            redacted.append(
+                urllib.parse.urlunsplit((parsed.scheme, hostname, parsed.path, "", ""))
+            )
+            continue
+        if argument.startswith("-") and "=" in argument:
+            name, _ = argument.split("=", 1)
+            if _SECRET_KEY.search(name):
+                redacted.append(f"{name}=[REDACTED]")
+                continue
+        if argument.startswith("-") and _SECRET_KEY.search(argument):
+            redacted.append(argument)
+            hide_next = True
+            continue
+        if "=" in argument and _SECRET_KEY.search(argument.split("=", 1)[0]):
+            redacted.append(f"{argument.split('=', 1)[0]}=[REDACTED]")
+            continue
+        redacted.append(argument)
+    return redacted
+
+
+def redact_mapping(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): "[REDACTED]" if _SECRET_KEY.search(str(key)) else redact_mapping(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_mapping(item) for item in value]
+    return value
 
 
 def build_manifest(
@@ -51,7 +115,9 @@ def build_manifest(
     missing = [name for name, path in files.items() if not path.is_file()]
     if missing:
         raise ValueError(f"missing manifest files: {missing}")
-    mutable = [name for name, revision in immutable_inputs.items() if len(revision) < 12]
+    mutable = [
+        name for name, revision in immutable_inputs.items() if not _IMMUTABLE_SHA.fullmatch(revision)
+    ]
     if mutable:
         raise ValueError(f"immutable inputs need commit-like revisions: {mutable}")
     manifest = {
@@ -62,8 +128,8 @@ def build_manifest(
             for name, path in sorted(files.items())
         },
         "immutable_inputs": dict(sorted(immutable_inputs.items())),
-        "build": build,
-        "command": command,
+        "build": redact_mapping(build),
+        "command": redact_command(command),
         "environment": {
             "platform": platform.platform(),
             "python": platform.python_version(),

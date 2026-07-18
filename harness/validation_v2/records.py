@@ -39,6 +39,9 @@ class RunRow:
     metrics: Mapping[str, Any]
     artifacts: Mapping[str, str]
     error: str | None = None
+    prompt_hash: str = ""
+    protocol_hash: str = ""
+    cell_hash: str = ""
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> RunRow:
@@ -53,6 +56,9 @@ class RunRow:
             "return_code",
             "metrics",
             "artifacts",
+            "prompt_hash",
+            "protocol_hash",
+            "cell_hash",
         }
         missing = required - raw.keys()
         if missing:
@@ -69,6 +75,9 @@ class RunRow:
             metrics=dict(raw["metrics"]),
             artifacts={str(key): str(value) for key, value in dict(raw["artifacts"]).items()},
             error=None if raw.get("error") is None else str(raw["error"]),
+            prompt_hash=str(raw["prompt_hash"]),
+            protocol_hash=str(raw["protocol_hash"]),
+            cell_hash=str(raw["cell_hash"]),
         )
         if row.attempt < 1:
             raise ValueError("attempt must be >= 1")
@@ -76,6 +85,10 @@ class RunRow:
             raise ValueError("success row must have return_code=0")
         if row.status is RunStatus.SUCCESS and row.error:
             raise ValueError("success row cannot carry an error")
+        for name in ("config_hash", "environment_hash", "prompt_hash", "protocol_hash", "cell_hash"):
+            value = getattr(row, name)
+            if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
+                raise ValueError(f"{name} must be a lowercase SHA-256 digest")
         return row
 
     def as_dict(self) -> dict[str, Any]:
@@ -123,6 +136,7 @@ class ResultStore:
             latest[row.config_id] = row.attempt
 
     def append(self, row: RunRow) -> None:
+        RunRow.from_mapping(row.as_dict())
         existing = self.rows()
         previous = max((item.attempt for item in existing if item.config_id == row.config_id), default=0)
         if row.attempt != previous + 1:
@@ -145,12 +159,21 @@ class ResultStore:
         *,
         config_hash: str,
         environment_hash: str,
+        prompt_hash: str,
+        protocol_hash: str,
+        cell_hash: str,
         required_metrics: Iterable[str],
     ) -> bool:
         row = self.latest().get(config_id)
         if row is None or row.status is not RunStatus.SUCCESS:
             return False
-        if row.config_hash != config_hash or row.environment_hash != environment_hash:
+        if (
+            row.config_hash != config_hash
+            or row.environment_hash != environment_hash
+            or row.prompt_hash != prompt_hash
+            or row.protocol_hash != protocol_hash
+            or row.cell_hash != cell_hash
+        ):
             return False
         return all(metric in row.metrics and row.metrics[metric] is not None for metric in required_metrics)
 
@@ -162,11 +185,24 @@ def validate_complete_matrix(
     required_metrics: Iterable[str],
 ) -> dict[str, int]:
     plans = list(planned)
+    if not plans:
+        raise ValueError("planned matrix is empty")
     plan_by_id: dict[str, Mapping[str, Any]] = {}
     for plan in plans:
         config_id = str(plan["config_id"])
         if config_id in plan_by_id:
             raise ValueError(f"duplicate planned config_id: {config_id}")
+        expected_config = sha256_json(plan.get("config", {}))
+        if plan.get("config_hash") != expected_config:
+            raise ValueError(f"planned config hash mismatch: {config_id}")
+        cell_content = dict(plan)
+        declared_cell_hash = cell_content.pop("cell_hash", None)
+        if declared_cell_hash != sha256_json(cell_content):
+            raise ValueError(f"planned cell hash mismatch: {config_id}")
+        for name in ("environment_hash", "prompt_hash", "protocol_hash"):
+            value = str(plan.get(name, ""))
+            if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
+                raise ValueError(f"planned {name} is not a lowercase SHA-256: {config_id}")
         plan_by_id[config_id] = plan
 
     latest: dict[str, RunRow] = {}
@@ -186,7 +222,7 @@ def validate_complete_matrix(
             incomplete.append(f"{config_id}: missing")
             continue
         counts[row.status.value] += 1
-        expected_config = str(plan.get("config_hash") or sha256_json(plan.get("config", {})))
+        expected_config = str(plan["config_hash"])
         expected_environment = str(plan["environment_hash"])
         missing_metrics = [metric for metric in required if row.metrics.get(metric) is None]
         if row.status is not RunStatus.SUCCESS:
@@ -195,6 +231,12 @@ def validate_complete_matrix(
             incomplete.append(f"{config_id}: config hash mismatch")
         elif row.environment_hash != expected_environment:
             incomplete.append(f"{config_id}: environment hash mismatch")
+        elif row.prompt_hash != str(plan["prompt_hash"]):
+            incomplete.append(f"{config_id}: prompt hash mismatch")
+        elif row.protocol_hash != str(plan["protocol_hash"]):
+            incomplete.append(f"{config_id}: protocol hash mismatch")
+        elif row.cell_hash != str(plan["cell_hash"]):
+            incomplete.append(f"{config_id}: cell hash mismatch")
         elif missing_metrics:
             incomplete.append(f"{config_id}: missing metrics {missing_metrics}")
 

@@ -21,10 +21,24 @@ Generate the deterministic 100-case design plus 20 controls:
 ```bash
 python -m harness.validation_v2.cli niah-generate \
   --context-tokens 32768 \
+  --tokenizer <immutable-hub-tokenizer-repo> \
   --tokenizer-revision <immutable-hub-commit> \
   --controls \
   --out .validation-v2/niah-32k.jsonl
 ```
+
+Strictly join and score one hash-bound final response per generated case:
+
+```bash
+python -m harness.validation_v2.cli score-niah \
+  --cases .validation-v2/niah-32k.jsonl \
+  --responses .validation-v2/niah-32k-responses.jsonl \
+  --out .validation-v2/niah-32k-scores.json
+```
+
+Each response row must contain `prompt_id`, the matrix `prompt_hash`, and
+protocol-native `final_content`. Missing, duplicate, unplanned, or hash-mismatched
+responses abort scoring; longer strings containing the expected answer still fail.
 
 Validate that every planned matrix cell succeeded:
 
@@ -61,11 +75,16 @@ python -m harness.validation_v2.corpora
 ```
 
 This produces the external V100 study's CC0 40-prompt set for tuning and a
-balanced ten-family, 100-prompt held-out set from the Apache-2.0 Stanford
+balanced ten-family, 100-prompt held-out set from the CC-BY-NC-4.0 Stanford
 Alpaca corpus. The source output/labels are deliberately excluded: these files
 measure deterministic decode behavior and latency, not task accuracy.
 The expected generated hashes are frozen in `protocol.json`; a different hash
 is a new campaign, not a resumable continuation of this one.
+
+NIAH generation loads the tokenizer at the supplied immutable Hub revision and
+uses its chat template for every count; character-count estimates are rejected
+for publication cases. Generated rows record both the requested and actual token
+count and the tokenizer-measured needle depth.
 
 `http_runner.py` executes a pre-generated matrix against an OpenAI-compatible
 endpoint. It appends every failure/timeout, retries non-success cells on resume,

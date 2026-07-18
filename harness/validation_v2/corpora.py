@@ -31,7 +31,7 @@ VALIDATION_SOURCE = {
     ),
     "sha256": "2eddafc6b977608d778aaab8dfc7e50e547b3af9826dfb9e909d9fc362e4a419",
     "revision": "761dc5bfbdeeffa89b8bff5d038781a4055f796a",
-    "license": "Apache-2.0",
+    "license": "CC-BY-NC-4.0",
     "source": "tatsu-lab/stanford_alpaca",
 }
 
@@ -156,10 +156,33 @@ def write_jsonl(path: Path, rows: list[dict[str, str]]) -> str:
     return digest.hexdigest()
 
 
+def validate_frozen_hashes(result: Mapping[str, Mapping[str, str]], protocol_path: Path) -> None:
+    protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+    frozen = protocol.get("decode_corpora")
+    if not isinstance(frozen, Mapping):
+        raise ValueError("protocol lacks decode_corpora hashes")
+    expected = {
+        "tuning40": frozen.get("tuning40_sha256"),
+        "validation100": frozen.get("validation100_sha256"),
+    }
+    mismatches = [
+        name
+        for name, digest in expected.items()
+        if not isinstance(digest, str) or result[name]["sha256"] != digest
+    ]
+    if mismatches:
+        raise ValueError(f"generated corpora differ from frozen protocol: {mismatches}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache", type=Path, default=Path(".validation-v2/cache"))
     parser.add_argument("--out-dir", type=Path, default=Path(".validation-v2/corpora"))
+    parser.add_argument(
+        "--protocol",
+        type=Path,
+        default=Path(__file__).with_name("protocol.json"),
+    )
     args = parser.parse_args()
     tuning = build_tuning40(fetch_pinned(TUNING_SOURCE, args.cache))
     validation = build_validation100(fetch_pinned(VALIDATION_SOURCE, args.cache))
@@ -173,6 +196,7 @@ def main() -> None:
             "sha256": write_jsonl(args.out_dir / "validation100.jsonl", validation),
         },
     }
+    validate_frozen_hashes(result, args.protocol)
     print(canonical_json(result))
 
 

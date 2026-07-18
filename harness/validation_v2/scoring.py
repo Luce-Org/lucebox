@@ -5,8 +5,10 @@ from __future__ import annotations
 import dataclasses
 import re
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
+
+from .records import sha256_json
 
 
 @dataclasses.dataclass(frozen=True)
@@ -78,3 +80,77 @@ def looks_like_prompt_echo(prompt: str, response: str | Mapping[str, Any]) -> bo
     compact_prompt = re.sub(r"\s+", " ", normalize_final_content(prompt))
     compact_response = re.sub(r"\s+", " ", normalize_final_content(raw))
     return bool(compact_prompt and compact_prompt in compact_response)
+
+
+def score_niah_records(
+    cases: Iterable[Mapping[str, Any]], responses: Iterable[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """Strictly join one hash-bound final response to every generated NIAH case."""
+
+    case_by_id: dict[str, Mapping[str, Any]] = {}
+    for case in cases:
+        case_id = str(case.get("case_id") or "")
+        if not case_id:
+            raise ValueError("NIAH case lacks case_id")
+        if case_id in case_by_id:
+            raise ValueError(f"duplicate NIAH case: {case_id}")
+        if not isinstance(case.get("answer"), str):
+            raise ValueError(f"NIAH case lacks string answer: {case_id}")
+        case_by_id[case_id] = case
+    if not case_by_id:
+        raise ValueError("NIAH case set is empty")
+
+    response_by_id: dict[str, Mapping[str, Any]] = {}
+    for response in responses:
+        case_id = str(response.get("case_id") or response.get("prompt_id") or "")
+        if not case_id:
+            raise ValueError("NIAH response lacks case_id/prompt_id")
+        if case_id not in case_by_id:
+            raise ValueError(f"unplanned NIAH response: {case_id}")
+        if case_id in response_by_id:
+            raise ValueError(f"duplicate NIAH response: {case_id}")
+        expected_hash = sha256_json(case_by_id[case_id])
+        if response.get("prompt_hash") != expected_hash:
+            raise ValueError(f"NIAH response prompt hash mismatch: {case_id}")
+        if not isinstance(response.get("final_content"), str):
+            raise ValueError(f"NIAH response lacks final_content: {case_id}")
+        response_by_id[case_id] = response
+    missing = sorted(set(case_by_id) - set(response_by_id))
+    if missing:
+        raise ValueError(f"NIAH responses are incomplete: {missing}")
+
+    scores: list[dict[str, Any]] = []
+    for case_id, case in case_by_id.items():
+        exact = score_exact_final_content(str(case["answer"]), response_by_id[case_id]["final_content"])
+        scores.append(
+            {
+                "case_id": case_id,
+                "context_tokens": case.get("context_tokens"),
+                "depth_fraction": case.get("depth_fraction"),
+                "control": case.get("control"),
+                "passed": exact.passed,
+                "expected": exact.expected,
+                "observed": exact.observed,
+                "reason": exact.reason,
+            }
+        )
+    primary = [score for score in scores if score["control"] is None]
+    controls = [score for score in scores if score["control"] is not None]
+
+    def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        count = len(rows)
+        passed_count = sum(bool(row["passed"]) for row in rows)
+        return {
+            "cases": count,
+            "passed": passed_count,
+            "failed": count - passed_count,
+            "exact_match_rate": passed_count / count if count else None,
+        }
+
+    return {
+        "schema": "lucebox.validation-v2.niah-scores/1",
+        "summary": aggregate(scores),
+        "primary": aggregate(primary),
+        "controls": aggregate(controls),
+        "scores": scores,
+    }
