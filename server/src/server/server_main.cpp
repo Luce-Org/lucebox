@@ -1272,7 +1272,7 @@ int main(int argc, char ** argv) {
 
     // Lazy-draft: park decode draft at startup to free VRAM (~3.3 GB).
     if (sconfig.lazy_draft && bargs.draft_path) {
-        backend->park("draft");
+        backend->park(ParkTarget::DraftModel);
     }
 
     // Set up routing data collector (--collect-routing)

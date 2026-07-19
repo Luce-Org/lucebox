@@ -2858,7 +2858,7 @@ void HttpServer::worker_loop() {
         if (dflash_residency == DraftResidencyAction::ReleaseAfterUse &&
             !config_.draft_path.empty()) {
             backend_.free_drafter();    // free pflash drafter (~1.4 GB) if loaded
-            backend_.unpark("draft");   // reload decode draft (~3.3 GB)
+            backend_.unpark(ParkTarget::DraftModel);   // reload decode draft (~3.3 GB)
         }
 
         // Transition status to decode phase.
@@ -2874,7 +2874,7 @@ void HttpServer::worker_loop() {
 
         if (dflash_residency == DraftResidencyAction::ReleaseAfterUse &&
             !config_.draft_path.empty()) {
-            backend_.park("draft");
+            backend_.park(ParkTarget::DraftModel);
         }
 
         // Release oversized scratch buffers (gallocr, BSA cache) so VRAM

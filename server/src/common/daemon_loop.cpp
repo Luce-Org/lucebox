@@ -228,14 +228,26 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
         if (starts_with(line, "park")) {
             std::string what;
             if (line.size() > 5) what = line.substr(5);
-            backend.park(what);
+            const auto target = parse_park_target(what);
+            if (!target) {
+                std::fprintf(stderr, "[daemon] invalid park target: %s\n",
+                             what.c_str());
+            } else {
+                backend.park(*target);
+            }
             io.emit(-1);
             continue;
         }
         if (starts_with(line, "unpark")) {
             std::string what;
             if (line.size() > 7) what = line.substr(7);
-            backend.unpark(what);
+            const auto target = parse_park_target(what);
+            if (!target) {
+                std::fprintf(stderr, "[daemon] invalid unpark target: %s\n",
+                             what.c_str());
+            } else {
+                backend.unpark(*target);
+            }
             io.emit(-1);
             continue;
         }

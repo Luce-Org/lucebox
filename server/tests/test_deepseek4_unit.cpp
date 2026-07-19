@@ -1449,7 +1449,7 @@ static void test_dspark_park_all_releases_drafter() {
     backend.spec_drafter_ = std::make_unique<DSparkDrafter>();
     backend.spec_enabled_ = true;
 
-    TEST_ASSERT(backend.park("all"));
+    TEST_ASSERT(backend.park(ParkTarget::All));
     TEST_ASSERT(backend.parked_);
     TEST_ASSERT(backend.spec_drafter_ == nullptr);
     TEST_ASSERT(!backend.spec_enabled_);

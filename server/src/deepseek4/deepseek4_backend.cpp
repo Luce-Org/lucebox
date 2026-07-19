@@ -662,16 +662,16 @@ void DeepSeek4Backend::print_ready_banner() const {
     std::fflush(stdout);
 }
 
-bool DeepSeek4Backend::park(const std::string & what) {
-    const bool want_draft = (what.empty() || what == "all" || what == "draft");
-    const bool want_target = (what.empty() || what == "all" || what == "target");
+bool DeepSeek4Backend::park(ParkTarget target) {
+    const bool want_draft = park_target_includes_draft_model(target);
+    const bool want_target_model = park_target_includes_target_model(target);
 
     if (want_draft && spec_drafter_) {
         release_spec_drafter(/*mark_parked=*/true);
         std::printf("[deepseek4] DSpark drafter parked (VRAM released)\n");
         std::fflush(stdout);
     }
-    if (!want_target || parked_) return true;
+    if (!want_target_model || parked_) return true;
 
     maybe_save_routing_stats();
     for (int i = 0; i < PREFIX_SLOTS; ++i) {
@@ -694,11 +694,11 @@ bool DeepSeek4Backend::park(const std::string & what) {
     return true;
 }
 
-bool DeepSeek4Backend::unpark(const std::string & what) {
-    const bool want_draft = (what.empty() || what == "all" || what == "draft");
-    const bool want_target = (what.empty() || what == "all" || what == "target");
+bool DeepSeek4Backend::unpark(ParkTarget target) {
+    const bool want_draft = park_target_includes_draft_model(target);
+    const bool want_target_model = park_target_includes_target_model(target);
 
-    if (want_target && parked_) {
+    if (want_target_model && parked_) {
         if (!load_model()) {
             std::fprintf(stderr, "[deepseek4] unpark: failed to restore target model\n");
             free_deepseek4_weights(w_);
