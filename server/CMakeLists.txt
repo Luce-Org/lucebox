@@ -267,6 +267,8 @@ add_library(dflash_common STATIC
     src/deepseek4/deepseek4_daemon.cpp
     src/deepseek4/deepseek4_layer_split_adapter.cpp
     src/deepseek4/deepseek4_target_shard_ipc_daemon.cpp
+    src/deepseek4/deepseek4_dspark.cpp
+    src/deepseek4/deepseek4_dspark_spec.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
@@ -692,6 +694,20 @@ if(DFLASH27B_TESTS)
             ${DFLASH27B_GGML_BACKEND_TARGET}
             hip::host)
         add_test(NAME rocmfp4_hip_tail COMMAND test_rocmfp4_hip_tail)
+
+        add_executable(test_rocmfpx_mmq test/test_rocmfpx_mmq.cpp)
+        set_source_files_properties(test/test_rocmfpx_mmq.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_rocmfpx_mmq PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_include_directories(test_rocmfpx_mmq PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfp4
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfpx)
+        target_link_libraries(test_rocmfpx_mmq PRIVATE
+            ggml
+            ggml-base
+            ${DFLASH27B_GGML_BACKEND_TARGET}
+            hip::host)
+        add_test(NAME rocmfpx_mmq COMMAND test_rocmfpx_mmq)
     endif()
 
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash_cuda_min_sm GREATER_EQUAL 80 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
@@ -900,6 +916,22 @@ if(DFLASH27B_TESTS)
             target_link_libraries(test_deepseek4_unit PRIVATE hip::host)
         endif()
         add_test(NAME deepseek4_unit COMMAND test_deepseek4_unit)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_dspark_load.cpp")
+        add_executable(test_ds4_dspark_load test/test_ds4_dspark_load.cpp)
+        target_include_directories(test_ds4_dspark_load PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_ds4_dspark_load PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        else()
+            target_compile_definitions(test_ds4_dspark_load PRIVATE DFLASH27B_BACKEND_CUDA=1 GGML_USE_CUDA)
+        endif()
+        target_link_libraries(test_ds4_dspark_load PRIVATE dflash_common ggml ggml-cpu ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_ds4_dspark_load PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_ds4_dspark_load PRIVATE hip::host)
+        endif()
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_draft.cpp")
         add_executable(smoke_load_draft test/smoke_load_draft.cpp)

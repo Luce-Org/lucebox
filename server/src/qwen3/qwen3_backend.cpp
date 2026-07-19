@@ -122,8 +122,8 @@ void Qwen3Backend::print_ready_banner() const {
 
 // ── Park / unpark ──────────────────────────────────────────────────────
 
-bool Qwen3Backend::park(const std::string & what) {
-    if (what == "target" || what == "all") {
+bool Qwen3Backend::park(ParkTarget target) {
+    if (target == ParkTarget::TargetModel || target == ParkTarget::All) {
         if (!parked_) {
             // Free weights buffer to reclaim VRAM (keep cache)
             if (w_.buf) {
@@ -139,8 +139,8 @@ bool Qwen3Backend::park(const std::string & what) {
     return false;
 }
 
-bool Qwen3Backend::unpark(const std::string & what) {
-    if (what == "target" || what == "all") {
+bool Qwen3Backend::unpark(ParkTarget target) {
+    if (target == ParkTarget::TargetModel || target == ParkTarget::All) {
         if (parked_) {
             // Reload weights
             Qwen3DrafterWeights w_new;
@@ -940,12 +940,12 @@ ModelBackend::CompressResult Qwen3Backend::compress(const CompressRequest & req)
     if (req.input_ids.empty()) return result;
 
     const bool was_parked = parked_;
-    if (!req.skip_park && !parked_) park("target");
+    if (!req.skip_park && !parked_) park(ParkTarget::TargetModel);
 
     if (!drafter_loaded_) {
         if (!load_drafter(req.drafter_path, 999, req.drafter_gpu, drafter_ctx_)) {
             std::fprintf(stderr, "[compress] load failed: %s\n", dflash27b_last_error());
-            if (!req.skip_park && !was_parked) unpark("target");
+            if (!req.skip_park && !was_parked) unpark(ParkTarget::TargetModel);
             return result;
         }
         drafter_loaded_ = true;
@@ -959,7 +959,7 @@ ModelBackend::CompressResult Qwen3Backend::compress(const CompressRequest & req)
         free_drafter();
     }
 
-    if (!req.skip_park && !was_parked) unpark("target");
+    if (!req.skip_park && !was_parked) unpark(ParkTarget::TargetModel);
     return result;
 }
 
@@ -997,12 +997,12 @@ bool Qwen3Backend::handle_compress(const std::string & line, const DaemonIO & io
     }
 
     const bool was_parked = parked_;
-    if (!skip_park && !parked_) park("target");
+    if (!skip_park && !parked_) park(ParkTarget::TargetModel);
 
     if (!drafter_loaded_) {
         if (!load_drafter(drafter_path, 999, drafter_ctx_)) {
             std::fprintf(stderr, "[compress] load failed: %s\n", dflash27b_last_error());
-            if (!skip_park && !was_parked) unpark("target");
+            if (!skip_park && !was_parked) unpark(ParkTarget::TargetModel);
             io.emit(-1);
             return false;
         }
@@ -1014,7 +1014,7 @@ bool Qwen3Backend::handle_compress(const std::string & line, const DaemonIO & io
     std::printf("[compress] %zu -> %zu tokens\n", src_ids.size(), compressed.size());
     std::fflush(stdout);
 
-    if (!skip_park && !was_parked) unpark("target");
+    if (!skip_park && !was_parked) unpark(ParkTarget::TargetModel);
 
     for (int32_t t : compressed) io.emit(t);
     io.emit(-1);

@@ -13,6 +13,7 @@
 #include "../common/moe_hybrid_storage.h"
 #include "../common/moe_hybrid_stream.h"
 #include "deepseek4_internal.h"
+#include "deepseek4_dspark.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -37,8 +38,8 @@ public:
     // ModelBackend interface
     void print_ready_banner() const override;
 
-    bool park(const std::string & what) override;
-    bool unpark(const std::string & what) override;
+    bool park(ParkTarget target) override;
+    bool unpark(ParkTarget target) override;
     bool is_target_parked() const override { return parked_; }
 
     GenerateResult generate_impl(const GenerateRequest & req,
@@ -76,18 +77,32 @@ private:
     DeepSeek4Snapshot      snapshots_[PREFIX_SLOTS];
     std::vector<float>     last_logits_;
 
+    // DSpark speculative decode (opt-in: DFLASH_DS4_SPEC=1 + DFLASH_DS4_DRAFT=<gguf>).
+    bool                           spec_enabled_ = false;
+    bool                           spec_drafter_parked_ = false;
+    std::string                    spec_draft_path_;
+    std::unique_ptr<DSparkDrafter> spec_drafter_;
+    std::vector<float>             spec_feat_window_;
+
+    bool load_spec_drafter();
+    void release_spec_drafter(bool mark_parked);
+
     // Prefill prompt tokens in chunks, return absolute committed position.
     int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io,
                    int kv_offset = 0);
 
     // Autoregressive decode loop.
     bool do_decode(int committed, int n_gen,
+                   const std::vector<int32_t> & history_prefix,
                    std::vector<int32_t> & out_tokens,
                    const DaemonIO & io,
                    const BudgetHook & budget_hook = {},
                    bool * forced_close_out = nullptr);
 
+    bool load_model();
     bool init_hybrid_model();
+    bool requires_monolithic_model() const;
+    bool validate_prefill_mode() const;
     bool compute_uniform_hybrid_placement(const DeepSeek4Weights & w,
                                           int max_ctx,
                                           MoeHybridPlacement & out,

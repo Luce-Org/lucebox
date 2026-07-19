@@ -87,6 +87,7 @@ bool run_layer_split_ar_decode(
     const std::vector<float> & prefill_last_logits,
     const SamplerCfg & sampler,
     std::mt19937_64 & rng,
+    const std::vector<int32_t> & history_prefix,
     const LayerSplitForwardStep & forward_one,
     const std::function<bool(int)> & is_eos,
     std::vector<int32_t> & out_tokens,

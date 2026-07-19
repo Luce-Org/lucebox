@@ -10,19 +10,25 @@ bool run_layer_split_ar_decode(
         const std::vector<float> & prefill_last_logits,
         const SamplerCfg & sampler,
         std::mt19937_64 & rng,
+        const std::vector<int32_t> & history_prefix,
         const LayerSplitForwardStep & forward_one,
         const std::function<bool(int)> & is_eos,
         std::vector<int32_t> & out_tokens,
         const DaemonIO & io) {
     if (n_gen <= 0) return true;
 
+    std::vector<int32_t> history;
     if (sampler.needs_logit_processing()) {
+        history.reserve(history_prefix.size() + out_tokens.size() + (size_t)n_gen);
+        history.insert(history.end(), history_prefix.begin(), history_prefix.end());
+        history.insert(history.end(), out_tokens.begin(), out_tokens.end());
         if ((int)prefill_last_logits.size() != vocab) return false;
         last_tok = sample_logits(prefill_last_logits.data(), vocab, sampler,
-                                 out_tokens, rng);
+                                 history, rng);
     }
 
     out_tokens.push_back(last_tok);
+    if (sampler.needs_logit_processing()) history.push_back(last_tok);
     io.emit(last_tok);
     if (io.cancelled) {
         io.emit(-1);
@@ -46,11 +52,12 @@ bool run_layer_split_ar_decode(
         if (sampler.needs_logit_processing()) {
             if ((int)logits_buf.size() != vocab) return false;
             next_tok = sample_logits(logits_buf.data(), vocab, sampler,
-                                     out_tokens, rng);
+                                     history, rng);
         }
 
         last_tok = next_tok;
         out_tokens.push_back(last_tok);
+        if (sampler.needs_logit_processing()) history.push_back(last_tok);
         io.emit(last_tok);
         ++committed;
         if (io.cancelled) break;

@@ -26,6 +26,56 @@
 
 namespace dflash::common {
 
+enum class ParkTarget {
+    // NOTE: Empty preserves Qwen3's existing no-target park/unpark behavior.
+    Empty,
+    All,
+    TargetModel,
+    DraftModel,
+};
+
+struct ParkTargetMapping {
+    ParkTarget target;
+    std::string_view str_value;
+};
+
+inline constexpr ParkTargetMapping park_target_to_str_mappings[] = {
+    {ParkTarget::Empty,       ""},
+    {ParkTarget::All,         "all"},
+    {ParkTarget::TargetModel, "target"},
+    {ParkTarget::DraftModel,  "draft"},
+};
+
+constexpr const char * park_target_name(ParkTarget target) {
+    for (const auto & mapping : park_target_to_str_mappings) {
+        if (mapping.target == target) {
+            return mapping.str_value.empty()
+                ? "empty"
+                : mapping.str_value.data();
+        }
+    }
+    return "unknown";
+}
+
+constexpr std::optional<ParkTarget> parse_park_target(std::string_view value) {
+    for (const auto & mapping : park_target_to_str_mappings) {
+        if (mapping.str_value == value) return mapping.target;
+    }
+    return std::nullopt;
+}
+
+constexpr bool park_target_includes_target_model(ParkTarget target) {
+    return target == ParkTarget::Empty ||
+           target == ParkTarget::All ||
+           target == ParkTarget::TargetModel;
+}
+
+constexpr bool park_target_includes_draft_model(ParkTarget target) {
+    return target == ParkTarget::Empty ||
+           target == ParkTarget::All ||
+           target == ParkTarget::DraftModel;
+}
+
 // Token callback for streaming generation. Called once per committed token.
 // Return true to continue generation, false to abort.
 using TokenCallback = std::function<bool(int32_t token)>;
@@ -227,11 +277,10 @@ struct ModelBackend {
     virtual void print_ready_banner() const = 0;
 
     // ── Park / unpark ────────────────────────────────────────────────
-    // `what` is the tail of the command: "", "all", "target", "draft".
     // Backend decides which resources to release/restore. Returns true on
     // success; on failure prints to stderr and returns false.
-    virtual bool park(const std::string & what) = 0;
-    virtual bool unpark(const std::string & what) = 0;
+    virtual bool park(ParkTarget target) = 0;
+    virtual bool unpark(ParkTarget target) = 0;
     virtual bool is_target_parked() const = 0;
 
     // ── Generation ───────────────────────────────────────────────────

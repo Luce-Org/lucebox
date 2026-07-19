@@ -284,11 +284,11 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_HIP_FLAGS=-DDFLASH_WAVE_SIZE=32
           cmake --build "$RUNNER_TEMP/rocmfp-build" \
-            --target test_rocmfp4 test_rocmfpx test_rocmfp4_hip_tail \
+            --target test_rocmfp4 test_rocmfpx test_rocmfp4_hip_tail test_rocmfpx_mmq \
             --parallel 8
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
-            -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail'
+            -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq'
 
   build-windows:
     name: Build Windows (cmake + MSVC + CUDA, dflash_common)
@@ -306,12 +306,11 @@ jobs:
           arch: x64
 
       - name: Set up CUDA Toolkit 13.3
-        uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
+        uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee67510f7a9d017ec76 # v0.2.35
         with:
           cuda: '13.3.0'
           method: network
           sub-packages: '["nvcc", "cudart-dev", "thrust", "driver-dev"]'
-          non-cuda-sub-packages: '["libcublas-dev"]'
 
       - name: Configure (cmake)
         working-directory: server

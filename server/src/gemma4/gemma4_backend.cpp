@@ -85,16 +85,16 @@ void Gemma4Backend::print_ready_banner() const {
 
 // ── Park / Unpark ──────────────────────────────────────────────────────
 
-bool Gemma4Backend::park(const std::string & what) {
-    const bool want_draft = (what.empty() || what == "all" || what == "draft");
-    const bool want_target = (what.empty() || what == "all" || what == "target");
+bool Gemma4Backend::park(ParkTarget target) {
+    const bool want_draft_model = park_target_includes_draft_model(target);
+    const bool want_target_model = park_target_includes_target_model(target);
 
-    if (want_draft && !draft_parked_) {
+    if (want_draft_model && !draft_parked_) {
         free_decode_draft();
         draft_parked_ = true;
         std::printf("[gemma4] draft released\n"); std::fflush(stdout);
     }
-    if (!want_target || parked_) return true;
+    if (!want_target_model || parked_) return true;
 
     // Free snapshots first (they reference the snap_backend buffer)
     for (int i = 0; i < PREFIX_SLOTS; ++i) {
@@ -112,13 +112,13 @@ bool Gemma4Backend::park(const std::string & what) {
     return true;
 }
 
-bool Gemma4Backend::unpark(const std::string & what) {
-    const bool want_draft = (what.empty() || what == "all" || what == "draft");
-    const bool want_target = (what.empty() || what == "all" || what == "target");
+bool Gemma4Backend::unpark(ParkTarget target) {
+    const bool want_draft_model = park_target_includes_draft_model(target);
+    const bool want_target_model = park_target_includes_target_model(target);
 
-    if (want_target && !parked_) {
+    if (want_target_model && !parked_) {
         // target already resident
-    } else if (want_target && parked_) {
+    } else if (want_target_model && parked_) {
         // Reload weights from disk
         if (!load_gemma4_gguf(cfg_.model_path, backend_, w_)) {
             std::fprintf(stderr, "[gemma4] unpark: failed to reload weights\n");
@@ -145,7 +145,7 @@ bool Gemma4Backend::unpark(const std::string & what) {
         }
     }
 
-    if (want_draft && draft_parked_ && cfg_.draft_path) {
+    if (want_draft_model && draft_parked_ && cfg_.draft_path) {
         if (!load_decode_draft()) return false;
     }
     return true;
@@ -1186,7 +1186,7 @@ bool Gemma4Backend::handle_compress(const std::string & line,
     // Park target to free VRAM for the drafter (unless skip_park).
     const bool was_parked = parked_;
     if (!skip_park && !parked_) {
-        park("target");
+        park(ParkTarget::TargetModel);
     }
 
     // Synchronize backend
@@ -1199,7 +1199,7 @@ bool Gemma4Backend::handle_compress(const std::string & line,
             std::fprintf(stderr, "[compress] drafter init failed: %s\n",
                          dflash27b_last_error());
             io.emit(-1);
-            if (!skip_park && !was_parked) unpark("target");
+            if (!skip_park && !was_parked) unpark(ParkTarget::TargetModel);
             return false;
         }
         drafter_loaded_ = true;
@@ -1222,7 +1222,7 @@ bool Gemma4Backend::handle_compress(const std::string & line,
 
     // Restore park state
     if (!skip_park && !was_parked) {
-        unpark("target");
+        unpark(ParkTarget::TargetModel);
     }
 
     return ok;

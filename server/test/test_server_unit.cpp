@@ -2138,8 +2138,10 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
         return true;
     }
     bool decode_ar(int last_tok, int committed, int n_gen,
+                   const std::vector<int32_t> & history_prefix,
                    std::vector<int32_t> & out_tokens,
                    const DaemonIO & io) override {
+        (void)history_prefix;
         TEST_ASSERT(committed == current_pos);
         for (int i = 0; i < n_gen; ++i) {
             int32_t tok = last_tok + i + 1;
@@ -2373,8 +2375,8 @@ static void test_layer_split_backend_capability_proxy() {
 // Minimal mock backend for testing (no GPU needed).
 struct MockBackend : ModelBackend {
     void print_ready_banner() const override {}
-    bool park(const std::string &) override { return true; }
-    bool unpark(const std::string &) override { return true; }
+    bool park(ParkTarget) override { return true; }
+    bool unpark(ParkTarget) override { return true; }
     bool is_target_parked() const override { return false; }
     GenerateResult generate_impl(const GenerateRequest &, const DaemonIO &) override { return {}; }
     bool snapshot_save(int) override { return false; }

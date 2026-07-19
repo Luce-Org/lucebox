@@ -846,6 +846,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             case GGML_OP_MUL_MAT_ID: {
                 split_state = handle_mul_mat(src_ss);
             } break;
+            case GGML_OP_MUL_MAT_GROUPED_SRC: {
+                // The logical activation rows are assembled from a private
+                // grouped physical layout. Keep the operation local; only the
+                // CPU and CUDA/HIP backends implement that layout contract.
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
             case GGML_OP_OUT_PROD: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
@@ -961,6 +967,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             } break;
             case GGML_OP_GATED_DELTA_NET: {
                 split_state = handle_gated_delta_net(src_ss);
+            } break;
+            case GGML_OP_DS4_INDEXER_QAT: {
+                split_state = handle_per_row(src_ss);
+            } break;
+            case GGML_OP_DS4_INDEXER_SCORE:
+            case GGML_OP_DS4_INDEXER_MASK: {
+                // These fused DS4 indexer operations combine axes from
+                // multiple inputs. Keep them local unless every source is
+                // mirrored on each simple backend.
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
@@ -1922,4 +1938,3 @@ ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, siz
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->backend_configs[index].backend;
 }
-
