@@ -47,7 +47,8 @@ bool LayerSplitBackend::unpark(ParkTarget target) {
 GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
                                                  const DaemonIO & io,
                                                  int base_pos,
-                                                 bool reset_state) {
+                                                 bool reset_state,
+                                                 const std::vector<int32_t> & history_prefix) {
     GenerateResult result;
     if (!adapter_) {
         result.fail(GenerateErrorCode::AdapterUnavailable);
@@ -117,6 +118,7 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
             ? adapter_->decode_dflash(req.prompt, base_pos, last_tok, req.n_gen,
                                       result.tokens, out_io, dflash_accept_rate)
             : adapter_->decode_ar(last_tok, base_pos + (int)req.prompt.size(), req.n_gen,
+                                  history_prefix,
                                   result.tokens, out_io);
         if (use_dflash) result.accept_rate = dflash_accept_rate;
         if (!ok) {
@@ -133,7 +135,8 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
 
 GenerateResult LayerSplitBackend::generate_impl(const GenerateRequest & req,
                                                 const DaemonIO & io) {
-    return run_from_state(req, io, /*base_pos=*/0, /*reset_state=*/true);
+    return run_from_state(req, io, /*base_pos=*/0, /*reset_state=*/true,
+                          req.prompt);
 }
 
 bool LayerSplitBackend::snapshot_save(int slot) {
@@ -179,12 +182,14 @@ GenerateResult LayerSplitBackend::restore_and_generate_impl(
         std::fprintf(stderr,
             "[pc] snapshot longer than prompt (snap=%d > prompt=%zu) — "
             "fresh prefill fallback\n", snap_pos, req.prompt.size());
-        return run_from_state(req, io, /*base_pos=*/0, /*reset_state=*/true);
+        return run_from_state(req, io, /*base_pos=*/0, /*reset_state=*/true,
+                              req.prompt);
     }
     GenerateRequest delta_req = req;
     delta_req.prompt = std::vector<int32_t>(
         req.prompt.begin() + snap_pos, req.prompt.end());
-    return run_from_state(delta_req, io, snap_pos, /*reset_state=*/false);
+    return run_from_state(delta_req, io, snap_pos, /*reset_state=*/false,
+                          req.prompt);
 }
 
 ModelBackend::CompressResult

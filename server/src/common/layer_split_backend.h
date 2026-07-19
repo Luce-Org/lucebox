@@ -28,7 +28,10 @@ public:
     virtual int prefill_chunk_tokens() const { return 0; }
     virtual bool prefill(const std::vector<int32_t> & prompt,
                          int base_pos, int & last_tok) = 0;
+    // history_prefix is the full original request prompt (not the delta
+    // prefill after a prefix-cache restore); it seeds sampler penalty history.
     virtual bool decode_ar(int last_tok, int committed, int n_gen,
+                           const std::vector<int32_t> & history_prefix,
                            std::vector<int32_t> & out_tokens,
                            const DaemonIO & io) = 0;
     virtual bool supports_cpu_sampling() const { return false; }
@@ -125,7 +128,8 @@ private:
     GenerateResult run_from_state(const GenerateRequest & req,
                                   const DaemonIO & io,
                                   int base_pos,
-                                  bool reset_state);
+                                  bool reset_state,
+                                  const std::vector<int32_t> & history_prefix);
 
     std::unique_ptr<LayerSplitAdapter> adapter_;
     bool shutdown_done_ = false;

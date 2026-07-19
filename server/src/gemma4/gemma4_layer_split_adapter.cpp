@@ -1040,6 +1040,7 @@ bool Gemma4LayerSplitAdapter::decode_ar(
         int last_tok,
         int committed,
         int n_gen,
+        const std::vector<int32_t> & history_prefix,
         std::vector<int32_t> & out_tokens,
         const DaemonIO & io) {
     if (n_gen <= 0) return true;
@@ -1049,7 +1050,7 @@ bool Gemma4LayerSplitAdapter::decode_ar(
     const int vocab = w.n_vocab;
     const bool ok = run_layer_split_ar_decode(
         last_tok, committed, n_gen, vocab, prefill_last_logits_, sampler_,
-        sampler_rng_,
+        sampler_rng_, history_prefix,
         [&](const std::vector<int32_t> & one, int pos, int & next_tok,
             std::vector<float> * logits_out) {
             return use_mixed_target_split()

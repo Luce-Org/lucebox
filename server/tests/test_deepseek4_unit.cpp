@@ -9,6 +9,8 @@
 
 #include "common/backend_ipc.h"
 #include "common/dspark_head.h"
+#include "common/layer_split_backend.h"
+#include "common/layer_split_runtime.h"
 #include "common/layer_split_utils.h"
 #include "deepseek4/deepseek4_dspark.h"
 
@@ -1250,6 +1252,139 @@ static void test_hc_state_dimensions() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_layer_split_request_propagates_sampler() {
+    std::fprintf(stderr, "  test_layer_split_request_propagates_sampler ...");
+
+    DeepSeek4LayerSplitAdapter adapter({});
+    GenerateRequest req;
+    req.do_sample = true;
+    req.sampler.temp = 0.25f;
+    req.sampler.top_p = 0.9f;
+    req.sampler.seed = 42;
+
+    adapter.begin_request(req);
+
+    TEST_ASSERT(adapter.sampler_.temp == req.sampler.temp);
+    TEST_ASSERT(adapter.sampler_.top_p == req.sampler.top_p);
+    TEST_ASSERT(adapter.sampler_.seed == req.sampler.seed);
+    std::mt19937_64 expected(req.sampler.seed);
+    TEST_ASSERT(adapter.sampler_rng_() == expected());
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_layer_split_sampler_uses_prompt_history() {
+    std::fprintf(stderr, "  test_layer_split_sampler_uses_prompt_history ...");
+
+    SamplerCfg sampler;
+    sampler.rep_pen = 2.0f;
+    const std::vector<float> logits = {0.0f, 4.0f, 3.0f};
+    const std::vector<int32_t> prompt_history = {1};
+    std::vector<int32_t> out_tokens;
+    std::mt19937_64 rng(42);
+    const bool ok = run_layer_split_ar_decode(
+        /*last_tok=*/1, /*committed=*/1, /*n_gen=*/1, /*vocab=*/3,
+        logits, sampler, rng, prompt_history,
+        [](const std::vector<int32_t> &, int, int &,
+           std::vector<float> *) { return false; },
+        [](int) { return false; }, out_tokens, DaemonIO{});
+
+    TEST_ASSERT(ok);
+    TEST_ASSERT(out_tokens.size() == 1);
+    if (out_tokens.size() == 1) {
+        TEST_ASSERT(out_tokens[0] == 2);
+    }
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_layer_split_sampler_appends_generated_tokens() {
+    std::fprintf(stderr,
+                 "  test_layer_split_sampler_appends_generated_tokens ...");
+
+    SamplerCfg sampler;
+    sampler.rep_pen = 2.0f;
+    const std::vector<float> logits = {0.0f, 4.0f, 3.0f};
+    std::vector<int32_t> out_tokens;
+    std::mt19937_64 rng(42);
+    const bool ok = run_layer_split_ar_decode(
+        /*last_tok=*/0, /*committed=*/0, /*n_gen=*/2, /*vocab=*/3,
+        logits, sampler, rng, /*history_prefix=*/{},
+        [&logits](const std::vector<int32_t> &, int, int &,
+                  std::vector<float> * logits_out) {
+            if (logits_out) *logits_out = logits;
+            return true;
+        },
+        [](int) { return false; }, out_tokens, DaemonIO{});
+
+    TEST_ASSERT(ok);
+    // With no prompt history the first sample is the plain argmax (token 1);
+    // the second sees token 1 in history, so rep_pen drops its logit to 2 and
+    // token 2 (logit 3) wins.
+    TEST_ASSERT(out_tokens == std::vector<int32_t>({1, 2}));
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+class TestLayerSplitHistoryAdapter final : public LayerSplitAdapter {
+public:
+    const char * name() const override { return "test-history"; }
+    bool init() override { return true; }
+    int max_context() const override { return 64; }
+    void reset_request_state() override { reset_called = true; }
+    bool prefill(const std::vector<int32_t> & prompt,
+                 int, int & last_tok) override {
+        prefilled.insert(prefilled.end(), prompt.begin(), prompt.end());
+        last_tok = 2;
+        return true;
+    }
+    bool decode_ar(int, int, int,
+                   const std::vector<int32_t> & history_prefix,
+                   std::vector<int32_t> & out_tokens,
+                   const DaemonIO &) override {
+        decoded_history = history_prefix;
+        out_tokens.push_back(2);
+        return true;
+    }
+    bool supports_cpu_sampling() const override { return true; }
+    void free_drafter() override {}
+    int snapshot_cur_pos(int) const override { return 1; }
+    bool snapshot_restore(int) override {
+        restore_called = true;
+        return true;
+    }
+    int current_last_token() const override { return 1; }
+    void shutdown() override {}
+
+    bool reset_called = false;
+    bool restore_called = false;
+    std::vector<int32_t> prefilled;
+    std::vector<int32_t> decoded_history;
+};
+
+static void test_layer_split_restore_preserves_full_sampling_history() {
+    std::fprintf(stderr,
+                 "  test_layer_split_restore_preserves_full_sampling_history ...");
+
+    auto adapter = std::make_unique<TestLayerSplitHistoryAdapter>();
+    auto * observed = adapter.get();
+    LayerSplitBackend backend(std::move(adapter));
+    GenerateRequest req;
+    req.prompt = {1, 2, 3};
+    req.n_gen = 1;
+
+    const GenerateResult result =
+        backend.restore_and_generate_impl(0, req, DaemonIO{});
+
+    TEST_ASSERT(result.ok());
+    TEST_ASSERT(observed->restore_called);
+    TEST_ASSERT(!observed->reset_called);
+    TEST_ASSERT(observed->prefilled == std::vector<int32_t>({2, 3}));
+    TEST_ASSERT(observed->decoded_history == req.prompt);
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_loader_rejects_missing_required_metadata(ggml_backend_t backend) {
     std::fprintf(stderr, "  test_loader_rejects_missing_required_metadata ...");
 
@@ -1715,7 +1850,7 @@ static void test_adapter_guard_paths() {
     adapter.remote_target_shard_.active_ = false;
 
     std::vector<int32_t> out_tokens;
-    TEST_ASSERT(!adapter.decode_ar(1, 0, 1, out_tokens, DaemonIO{}));
+    TEST_ASSERT(!adapter.decode_ar(1, 0, 1, {}, out_tokens, DaemonIO{}));
 
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
@@ -2703,6 +2838,10 @@ int main() {
     test_auto_split_computation();
     test_layer_range_validation();
     test_hc_state_dimensions();
+    test_layer_split_request_propagates_sampler();
+    test_layer_split_sampler_uses_prompt_history();
+    test_layer_split_sampler_appends_generated_tokens();
+    test_layer_split_restore_preserves_full_sampling_history();
     test_loader_rejects_missing_required_metadata(backend);
     test_loader_rejects_invalid_compress_ratio_type(backend);
     test_loader_rejects_zero_vocab_size(backend);
