@@ -93,6 +93,7 @@ private:
 
     // Autoregressive decode loop.
     bool do_decode(int committed, int n_gen,
+                   const std::vector<int32_t> & history_prefix,
                    std::vector<int32_t> & out_tokens,
                    const DaemonIO & io,
                    const BudgetHook & budget_hook = {},

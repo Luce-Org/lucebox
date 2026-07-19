@@ -871,6 +871,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
 }
 
 bool DeepSeek4Backend::do_decode(int committed, int n_gen,
+                                  const std::vector<int32_t> & history_prefix,
                                   std::vector<int32_t> & out_tokens,
                                   const DaemonIO & io,
                                   const BudgetHook & budget_hook,
@@ -880,6 +881,14 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
     const auto phase_t0 = Clock::now();
     DeepSeek4StepTelemetry tel_acc;
     int steps = 0;
+    const bool process_logits = sampler_.needs_logit_processing();
+    std::vector<int32_t> history;
+    if (process_logits) {
+        history = history_prefix;
+        if (n_gen > 0) {
+            history.reserve(history.size() + (size_t)n_gen);
+        }
+    }
 
     for (int generated = 0; generated < n_gen; generated++) {
         if (io.cancelled) break;
@@ -925,10 +934,12 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             }
         }
 
-        // Sample (argmax for now)
         int32_t next_token = 0;
-        {
-            const auto sample_t0 = Clock::now();
+        const auto sample_t0 = Clock::now();
+        if (process_logits) {
+            next_token = sample_logits(logits.data(), w_.n_vocab, sampler_,
+                                       history, sampler_rng_);
+        } else {
             float max_val = logits[0];
             for (int i = 1; i < w_.n_vocab; i++) {
                 if (logits[i] > max_val) {
@@ -936,7 +947,10 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
                     next_token = i;
                 }
             }
-            if (timing) tel_acc.sample_us += elapsed_us(sample_t0, Clock::now());
+        }
+        if (timing) tel_acc.sample_us += elapsed_us(sample_t0, Clock::now());
+        if (process_logits) {
+            history.push_back(next_token);
         }
         out_tokens.push_back(next_token);
         const auto emit_t0 = Clock::now();
@@ -958,6 +972,10 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     auto t0 = Clock::now();
+    sampler_ = req.sampler;
+    if (req.do_sample && sampler_.seed != 0) {
+        sampler_rng_.seed(sampler_.seed);
+    }
 
     // Prefill
     int committed = do_prefill(req.prompt, out_io);
@@ -982,8 +1000,11 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
     // Decode
     auto t1 = Clock::now();
     const bool budget_requires_ar = !req.budget_hook.close_token_ids.empty();
+    // The DSpark verifier is greedy-only. Route sampling and penalties through
+    // AR so the request's sampler contract is not silently ignored.
+    const bool sampling_requires_ar = sampler_.needs_logit_processing();
     if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 &&
-        !req.force_ar_decode && !budget_requires_ar) {
+        !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar) {
         if (last_logits_.empty()) {
             result.fail(GenerateErrorCode::DecodeFailed, "spec: no prefill logits");
             return result;
@@ -1032,7 +1053,7 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
     gen_tokens.reserve(req.n_gen);
 
     bool forced_close = false;
-    if (!do_decode(committed, req.n_gen, gen_tokens, out_io,
+    if (!do_decode(committed, req.n_gen, req.prompt, gen_tokens, out_io,
                    req.budget_hook, &forced_close)) {
         result.fail(GenerateErrorCode::DecodeFailed);
         return result;

@@ -1385,6 +1385,46 @@ static void test_layer_split_restore_preserves_full_sampling_history() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_backend_sampling_penalizes_prompt_history() {
+    std::fprintf(stderr, "  test_backend_sampling_penalizes_prompt_history ...");
+
+    DeepSeek4BackendConfig cfg;
+    DeepSeek4Backend backend(cfg);
+    backend.w_.n_vocab = 3;
+
+    std::vector<int32_t> emitted;
+    DaemonIO io;
+    io.on_token = [&](int32_t tok) {
+        emitted.push_back(tok);
+        return true;
+    };
+
+    auto decode_one = [&](const SamplerCfg & sampler) {
+        backend.last_logits_ = {0.0f, 4.0f, 3.0f};
+        backend.sampler_ = sampler;
+        emitted.clear();
+        std::vector<int32_t> generated;
+        const bool ok = backend.do_decode(
+            /*committed=*/1,
+            /*n_gen=*/1,
+            /*history_prefix=*/{1},
+            generated,
+            io);
+        TEST_ASSERT(ok);
+        TEST_ASSERT(emitted == generated);
+        return generated.empty() ? int32_t{-1} : generated.front();
+    };
+
+    SamplerCfg greedy;
+    TEST_ASSERT(decode_one(greedy) == 1);
+
+    SamplerCfg penalized;
+    penalized.rep_pen = 2.0f;
+    TEST_ASSERT(decode_one(penalized) == 2);
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_loader_rejects_missing_required_metadata(ggml_backend_t backend) {
     std::fprintf(stderr, "  test_loader_rejects_missing_required_metadata ...");
 
@@ -2842,6 +2882,7 @@ int main() {
     test_layer_split_sampler_uses_prompt_history();
     test_layer_split_sampler_appends_generated_tokens();
     test_layer_split_restore_preserves_full_sampling_history();
+    test_backend_sampling_penalizes_prompt_history();
     test_loader_rejects_missing_required_metadata(backend);
     test_loader_rejects_invalid_compress_ratio_type(backend);
     test_loader_rejects_zero_vocab_size(backend);
