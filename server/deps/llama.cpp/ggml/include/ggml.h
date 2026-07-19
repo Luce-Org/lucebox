@@ -603,6 +603,16 @@ extern "C" {
 
         GGML_OP_DS4_HC,  // Fused DeepSeek4 hyper-connection pre/post/out mixing
 
+        GGML_OP_DS4_INDEXER_QAT,  // DS4 indexer Hadamard + FP4 activation simulation
+
+        GGML_OP_DS4_INDEXER_SCORE,  // Fused DS4 indexer dot/ReLU/head reduction
+
+        GGML_OP_DS4_INDEXER_MASK,  // Apply per-token DS4 indexer top-k to an attention mask
+
+        // Keep extension operations appended so established GGML op ordinals
+        // remain stable within a protocol generation.
+        GGML_OP_MUL_MAT_GROUPED_SRC,
+
         GGML_OP_COUNT,
     };
 
@@ -1445,6 +1455,23 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    // Matrix multiply where b is physically [K/group, N, group] but is
+    // consumed as logical [K, N]. This is a distinct operation so backends
+    // that do not implement the grouped layout reject it instead of silently
+    // treating the physical storage as an ordinary flattened matrix.
+    // CUDA/HIP MMQ fuses the gather into its Q8 activation quantizer; the CPU
+    // implementation materializes each logical activation row in scratch.
+    GGML_API struct ggml_tensor * ggml_mul_mat_grouped_src(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
+    GGML_API bool ggml_mul_mat_is_grouped_src(
+            const struct ggml_tensor * tensor);
+
+    GGML_API int64_t ggml_mul_mat_grouped_src_groups(
+            const struct ggml_tensor * tensor);
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
@@ -2377,6 +2404,40 @@ extern "C" {
             struct ggml_tensor * a,
             enum ggml_prec       prec);
 
+    // DS4 layout and block-sparse policy for flash_attn_ext. raw_window is the
+    // maximum visible span inside the raw-row region. Compressed rows are
+    // selected in fixed-size blocks, capped to keep_rows. Zero leaves the
+    // operation dense. A negative value means the mask already contains an
+    // exact row selection and abs(keep_rows) is its maximum compressed width.
+    GGML_API void ggml_flash_attn_ext_set_ds4_sparse(
+            struct ggml_tensor * a,
+            int                  raw_rows,
+            int                  raw_window,
+            int                  keep_rows,
+            int                  block_size);
+
+    // Fuse DS4's inverse 64-d tail RoPE into the D=512 flash-attention
+    // writeback. q_unrotated additionally asks the kernel to apply the forward
+    // tail RoPE to Q from shared F32. This is exact-only plumbing: both paths
+    // retain the explicit F32 rounding boundary and YaRN arithmetic used by
+    // GGML_OP_ROPE.
+    GGML_API void ggml_flash_attn_ext_set_ds4_inverse_rope(
+            struct ggml_tensor * a,
+            int                  kv_start,
+            float                freq_base,
+            float                freq_scale,
+            float                ext_factor,
+            float                attn_factor,
+            float                beta_fast,
+            float                beta_slow,
+            int                  n_ctx_orig,
+            bool                 q_unrotated);
+
+    // True when flash_attn_ext carries the DS4 sparse-layout or fused-RoPE
+    // contract. Backends must implement that complete contract or reject it.
+    GGML_API bool ggml_flash_attn_ext_is_ds4(
+            const struct ggml_tensor * a);
+
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
@@ -2426,9 +2487,12 @@ extern "C" {
             struct ggml_tensor  * experts,
             struct ggml_tensor  * expert_weights);
 
-    // Fused DeepSeek4 hyper-connection helpers (decode, n_tokens == 1).
-    // ggml_ds4_hc_pre: mix[2*n_hc+n_hc^2] + base + hc_state[n_embd*n_hc] ->
-    //   dst[n_embd + 2*n_hc + n_hc^2] = { working, split(pre,post,comb) }
+    // Fused DeepSeek4 hyper-connection helpers. The first dimension is the
+    // per-token payload; an optional second dimension batches independent
+    // tokens without changing their arithmetic.
+    // ggml_ds4_hc_pre: mix[mix_dim,n_tokens] + base[mix_dim] +
+    //   hc_state[n_embd*n_hc,n_tokens] ->
+    //   dst[n_embd+mix_dim,n_tokens] = { working, split(pre,post,comb) }
     GGML_API struct ggml_tensor * ggml_ds4_hc_pre(
             struct ggml_context * ctx,
             struct ggml_tensor  * mix,
@@ -2440,7 +2504,8 @@ extern "C" {
             float                 post_scale,
             float                 comb_scale);
 
-    // ggml_ds4_hc_post: residual hc_state + block_out + split -> new hc_state
+    // ggml_ds4_hc_post: residual hc_state + block_out + split -> new hc_state;
+    // all non-base tensors may carry the same n_tokens second dimension.
     GGML_API struct ggml_tensor * ggml_ds4_hc_post(
             struct ggml_context * ctx,
             struct ggml_tensor  * residual_hc,
@@ -2448,7 +2513,8 @@ extern "C" {
             struct ggml_tensor  * split,
             int                   n_hc);
 
-    // ggml_ds4_hc_out: output-stage merge of hc streams into one embedding
+    // ggml_ds4_hc_out: output-stage merge of hc streams into one embedding per
+    // token. mix and hc_state may carry the same n_tokens second dimension.
     GGML_API struct ggml_tensor * ggml_ds4_hc_out(
             struct ggml_context * ctx,
             struct ggml_tensor  * mix,
@@ -2456,6 +2522,36 @@ extern "C" {
             struct ggml_tensor  * hc_state,
             int                   n_hc,
             float                 pre_scale);
+
+    // Official DS4 ratio-4 indexer transform. Each contiguous 128-wide F32
+    // row is Hadamard-rotated and passed through the model's blockwise FP4
+    // activation-simulation round trip. The operation is out-of-place so the
+    // pre-QAT query remains available to the main attention path.
+    GGML_API struct ggml_tensor * ggml_ds4_indexer_qat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * input);
+
+    // Compute the official ratio-4 indexer score matrix without materializing
+    // [n_comp,n_head,n_tokens] per-head dots. q is F32
+    // [128,n_head,n_tokens], head_weights is F32 [n_head,n_tokens], and
+    // index_comp is F16 [128,n_comp]. head_weights already includes the
+    // model's 1/sqrt(128*n_head) scale.
+    GGML_API struct ggml_tensor * ggml_ds4_indexer_score(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * head_weights,
+            struct ggml_tensor  * index_comp,
+            int                   kv_start,
+            int                   ratio);
+
+    // Preserve the raw rows of base_mask and retain only selected compressed
+    // rows. selected is I32 [top_k,n_tokens], indexing the compressed span;
+    // base_mask is F32 [raw_rows+n_comp,n_tokens].
+    GGML_API struct ggml_tensor * ggml_ds4_indexer_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * base_mask,
+            struct ggml_tensor  * selected,
+            int                   raw_rows);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

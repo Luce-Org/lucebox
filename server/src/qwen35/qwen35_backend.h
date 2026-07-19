@@ -89,8 +89,8 @@ public:
     // ── ModelBackend interface ────────────────────────────────────────
     void print_ready_banner() const override;
 
-    bool park(const std::string & what) override;
-    bool unpark(const std::string & what) override;
+    bool park(ParkTarget target) override;
+    bool unpark(ParkTarget target) override;
     bool is_target_parked() const override { return target_parked_; }
 
     GenerateResult generate_impl(const GenerateRequest & req,

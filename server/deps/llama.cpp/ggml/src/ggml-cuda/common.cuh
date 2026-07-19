@@ -109,6 +109,13 @@
 #    define GGML_CUDA_USE_CUB
 #endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
 
+// rocPRIM ships hipCUB, a CUB-compatible device-sort API. Enable it so argsort
+// and top-k support ncols > 1024, including DS4's long-context indexer; the
+// ordinary single-block bitonic path is limited to 1024 threads per block.
+#if defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#    define GGML_CUDA_USE_HIPCUB
+#endif  // defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
 #ifdef __CUDA_ARCH_LIST__
 constexpr bool ggml_cuda_has_arch_impl(int) {
     return false;

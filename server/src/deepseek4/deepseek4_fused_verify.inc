@@ -222,7 +222,8 @@ static bool ds4_build_fused_verify_graph(
                                                   ffn_normed->nb[1], (size_t) t * ffn_normed->nb[1]);
                 ggml_tensor * hcol = ggml_view_2d(ctx, hids, n_used, 1,
                                                   hids->nb[1], (size_t) t * hids->nb[1]);
-                ggml_tensor * fo = ds4_build_hash_routed_ffn(ctx, w, L, ggml_cont(ctx, fcol), hcol);
+                ggml_tensor * fo = ds4_build_hash_routed_ffn(
+                    ctx, w, L, ggml_cont(ctx, fcol), hcol, 1);
                 if (!fo) { ffn_out = nullptr; break; }
                 ffn_out = ffn_out ? ggml_concat(ctx, ffn_out, fo, 1) : fo;
             }

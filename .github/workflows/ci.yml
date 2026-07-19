@@ -284,8 +284,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_HIP_FLAGS=-DDFLASH_WAVE_SIZE=32
           cmake --build "$RUNNER_TEMP/rocmfp-build" \
-            --target test_rocmfp4 test_rocmfpx test_rocmfp4_hip_tail \
+            --target test_rocmfp4 test_rocmfpx test_rocmfp4_hip_tail test_rocmfpx_mmq \
             --parallel 8
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
-            -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail'
+            -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq'

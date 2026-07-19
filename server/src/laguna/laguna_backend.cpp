@@ -356,17 +356,17 @@ void LagunaBackend::print_ready_banner() const {
 
 // ── Park / unpark ───────────────────────────────────────────────────────
 
-bool LagunaBackend::park(const std::string & what) {
-    const bool want_draft = (what.empty() || what == "all" || what == "draft");
-    const bool want_target = (what.empty() || what == "all" || what == "target");
+bool LagunaBackend::park(ParkTarget target) {
+    const bool want_draft_model = park_target_includes_draft_model(target);
+    const bool want_target_model = park_target_includes_target_model(target);
 
-    if (want_draft && !draft_parked_ && !args_.draft_path.empty()) {
+    if (want_draft_model && !draft_parked_ && !args_.draft_path.empty()) {
         free_decode_draft();
         draft_parked_ = true;
         std::printf("[park] draft released\n"); std::fflush(stdout);
     }
 
-    if (want_target && !target_parked_) {
+    if (want_target_model && !target_parked_) {
         if (!draft_parked_ && !args_.draft_path.empty()) {
             free_decode_draft();
             draft_parked_ = true;
@@ -379,10 +379,10 @@ bool LagunaBackend::park(const std::string & what) {
     return true;
 }
 
-bool LagunaBackend::unpark(const std::string & what) {
-    const bool want_draft = (what.empty() || what == "all" || what == "draft");
-    const bool want_target = (what.empty() || what == "all" || what == "target");
-    if (want_target && target_parked_) {
+bool LagunaBackend::unpark(ParkTarget target) {
+    const bool want_draft_model = park_target_includes_draft_model(target);
+    const bool want_target_model = park_target_includes_target_model(target);
+    if (want_target_model && target_parked_) {
         if (!args_.draft_path.empty()) {
             if (!load_target_gguf_laguna(args_.target_path, backend_, w_)) {
                 std::fprintf(stderr, "[unpark] target: %s\n", dflash27b_last_error());
@@ -428,7 +428,7 @@ bool LagunaBackend::unpark(const std::string & what) {
         target_parked_ = false;
         std::printf("[unpark] target restored\n"); std::fflush(stdout);
     }
-    if (want_draft && draft_parked_ && !args_.draft_path.empty()) {
+    if (want_draft_model && draft_parked_ && !args_.draft_path.empty()) {
         if (!load_decode_draft()) return false;
     }
     return true;
@@ -1792,7 +1792,7 @@ bool LagunaBackend::handle_compress(const std::string & line,
     }
 
     const bool restore_target = !target_parked_;
-    if (restore_target) park("target");
+    if (restore_target) park(ParkTarget::TargetModel);
 
     if (!drafter_loaded_) {
         if (!load_drafter(drafter_path, /*gpu_layers=*/999, drafter_ctx_)) {
@@ -1813,7 +1813,7 @@ bool LagunaBackend::handle_compress(const std::string & line,
                  src_ids.size(), compressed.size(), keep);
     std::fflush(stdout);
 
-    if (restore_target) unpark("target");
+    if (restore_target) unpark(ParkTarget::TargetModel);
 
     for (int32_t t : compressed) io.emit(t);
     io.emit(-1);

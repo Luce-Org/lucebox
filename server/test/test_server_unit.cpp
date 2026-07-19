@@ -2373,8 +2373,8 @@ static void test_layer_split_backend_capability_proxy() {
 // Minimal mock backend for testing (no GPU needed).
 struct MockBackend : ModelBackend {
     void print_ready_banner() const override {}
-    bool park(const std::string &) override { return true; }
-    bool unpark(const std::string &) override { return true; }
+    bool park(ParkTarget) override { return true; }
+    bool unpark(ParkTarget) override { return true; }
     bool is_target_parked() const override { return false; }
     GenerateResult generate_impl(const GenerateRequest &, const DaemonIO &) override { return {}; }
     bool snapshot_save(int) override { return false; }

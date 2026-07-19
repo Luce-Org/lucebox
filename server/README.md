@@ -518,6 +518,10 @@ Same DFlash + PFlash stack on AMD GPUs. PR #119 ports the Phase 2 rocWMMA flashp
 ```bash
 git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
 
+# Ubuntu/ROCm build dependencies used by ggml's HIP backend.
+sudo apt-get update
+sudo apt-get install hipblas-dev hipcub-dev rocblas-dev rocprim-dev rocwmma-dev
+
 # Build for gfx1151 (Strix Halo). Swap arch for gfx1100 / gfx1201.
 cmake -B build -S . \
   -DCMAKE_BUILD_TYPE=Release \

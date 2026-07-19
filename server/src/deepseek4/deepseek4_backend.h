@@ -38,8 +38,8 @@ public:
     // ModelBackend interface
     void print_ready_banner() const override;
 
-    bool park(const std::string & what) override;
-    bool unpark(const std::string & what) override;
+    bool park(ParkTarget target) override;
+    bool unpark(ParkTarget target) override;
     bool is_target_parked() const override { return parked_; }
 
     GenerateResult generate_impl(const GenerateRequest & req,
@@ -100,6 +100,8 @@ private:
 
     bool load_model();
     bool init_hybrid_model();
+    bool requires_monolithic_model() const;
+    bool validate_prefill_mode() const;
     bool compute_uniform_hybrid_placement(const DeepSeek4Weights & w,
                                           int max_ctx,
                                           MoeHybridPlacement & out,

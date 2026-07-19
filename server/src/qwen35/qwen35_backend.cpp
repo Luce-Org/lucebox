@@ -348,12 +348,12 @@ void Qwen35Backend::print_ready_banner() const {
 
 // ── Park / unpark ───────────────────────────────────────────────────────
 
-bool Qwen35Backend::park(const std::string & what) {
-    bool want_draft  = (what.empty() || what == "all" || what == "draft");
-    bool want_target = (what.empty() || what == "all" || what == "target");
+bool Qwen35Backend::park(ParkTarget target) {
+    const bool want_draft_model = park_target_includes_draft_model(target);
+    const bool want_target_model = park_target_includes_target_model(target);
     const bool use_remote_draft = cfg_.remote_draft.enabled();
 
-    if (want_draft && !draft_parked_) {
+    if (want_draft_model && !draft_parked_) {
         if (use_remote_draft) {
             remote_draft_.close();
         } else {
@@ -363,7 +363,7 @@ bool Qwen35Backend::park(const std::string & what) {
         draft_parked_ = true;
         std::printf("[park] draft released\n"); std::fflush(stdout);
     }
-    if (want_target && !target_parked_) {
+    if (want_target_model && !target_parked_) {
         step_graph_destroy(proj_sg_);
         free_target_weights(w_);
         target_parked_ = true;
@@ -372,12 +372,12 @@ bool Qwen35Backend::park(const std::string & what) {
     return true;
 }
 
-bool Qwen35Backend::unpark(const std::string & what) {
-    bool want_target = (what.empty() || what == "all" || what == "target");
-    bool want_draft  = (what.empty() || what == "all" || what == "draft");
+bool Qwen35Backend::unpark(ParkTarget target) {
+    const bool want_target_model = park_target_includes_target_model(target);
+    const bool want_draft_model = park_target_includes_draft_model(target);
     const bool use_remote_draft = cfg_.remote_draft.enabled();
 
-    if (want_target && target_parked_) {
+    if (want_target_model && target_parked_) {
         if (!load_target_model(target_backend_, w_)) {
             std::fprintf(stderr, "[unpark] target: %s\n", dflash27b_last_error());
             return false;
@@ -386,7 +386,7 @@ bool Qwen35Backend::unpark(const std::string & what) {
         target_parked_ = false;
         std::printf("[unpark] target restored\n"); std::fflush(stdout);
     }
-    if (want_draft && draft_parked_ && cfg_.draft_path) {
+    if (want_draft_model && draft_parked_ && cfg_.draft_path) {
         if (use_remote_draft) {
             const int cap = cfg_.remote_draft.ring_cap > 0
                 ? std::min(cfg_.remote_draft.ring_cap, cfg_.device.max_ctx)
@@ -566,8 +566,8 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
     const bool was_draft_parked  = draft_parked_;
     if (!req.skip_park) {
         step_graph_destroy(sg_);
-        if (!target_parked_) park("target");
-        if (!draft_parked_)  park("draft");
+        if (!target_parked_) park(ParkTarget::TargetModel);
+        if (!draft_parked_)  park(ParkTarget::DraftModel);
     }
 
     // Synchronize all backends to flush any outstanding async CUDA work
@@ -590,8 +590,8 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
             std::fprintf(stderr, "[compress] drafter init failed: %s\n",
                          dflash27b_last_error());
             if (!req.skip_park) {
-                if (!was_target_parked) unpark("target");
-                if (!was_draft_parked)  unpark("draft");
+                if (!was_target_parked) unpark(ParkTarget::TargetModel);
+                if (!was_draft_parked)  unpark(ParkTarget::DraftModel);
             }
             return result;
         }
@@ -620,8 +620,8 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
 
     // Restore park state
     if (!req.skip_park) {
-        if (!was_target_parked) unpark("target");
-        if (!was_draft_parked)  unpark("draft");
+        if (!was_target_parked) unpark(ParkTarget::TargetModel);
+        if (!was_draft_parked)  unpark(ParkTarget::DraftModel);
     }
 
     return result;

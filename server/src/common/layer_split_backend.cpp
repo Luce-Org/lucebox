@@ -30,15 +30,17 @@ void LayerSplitBackend::print_ready_banner() const {
     std::fflush(stdout);
 }
 
-bool LayerSplitBackend::park(const std::string & what) {
-    std::fprintf(stderr, "[target-split] park is not supported yet (%s)\n",
-                 what.c_str());
+bool LayerSplitBackend::park(ParkTarget target) {
+    std::fprintf(stderr,
+                 "[target-split] park is not supported yet (target=%s)\n",
+                 park_target_name(target));
     return false;
 }
 
-bool LayerSplitBackend::unpark(const std::string & what) {
-    std::fprintf(stderr, "[target-split] unpark is not supported yet (%s)\n",
-                 what.c_str());
+bool LayerSplitBackend::unpark(ParkTarget target) {
+    std::fprintf(stderr,
+                 "[target-split] unpark is not supported yet (target=%s)\n",
+                 park_target_name(target));
     return false;
 }
 

@@ -24,8 +24,14 @@
 
 #include "internal.h"
 #include "common/layer_split_utils.h"
+#include "common/prefill_attention_mode.h"
 
 namespace dflash::common {
+
+// Layer-major prefill may schedule two 2K numerical bands while preserving
+// the raw-cache rounding boundary between them.
+inline constexpr int DS4_NUMERICAL_PREFILL_BAND = 2048;
+inline constexpr int DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS = 4096;
 
 struct MoeHybridPlacement;
 struct MoeHybridConfig;
@@ -65,6 +71,7 @@ struct DeepSeek4StepTelemetry {
     uint64_t sample_us = 0;
     uint64_t emit_us = 0;
     uint64_t full_graph_build_us = 0;
+    uint64_t full_graph_alloc_us = 0;
     uint64_t full_graph_set_us = 0;
     uint64_t full_graph_compute_us = 0;
     uint64_t full_graph_read_us = 0;
@@ -264,6 +271,7 @@ struct DeepSeek4Cache {
     int n_layer  = 0;
 
     std::vector<DeepSeek4LayerCache> layers;
+    PrefillAttentionMode prefill_mode = PrefillAttentionMode::Exact;
 
     // HC residual streams: [n_hc * n_embd] persistent state
     ggml_tensor * hc_state    = nullptr;  // [n_hc * n_embd]
@@ -286,6 +294,7 @@ struct DeepSeek4BackendConfig {
     DevicePlacement device;
     int          stream_fd    = -1;
     int          chunk        = 512;   // prefill chunk size
+    PrefillAttentionMode prefill_mode = PrefillAttentionMode::Exact;
     int          max_ctx      = 0;     // 0 = auto from SWA + compression capacity
     int          expert_top_k = 0;     // 0 = use all model-routed experts
     bool         fused_decode = false; // single-graph GPU decode
@@ -303,6 +312,10 @@ bool load_deepseek4_gguf_partial(const std::string & path,
                                   DeepSeek4Weights & out);
 
 void free_deepseek4_weights(DeepSeek4Weights & w);
+
+// Release graph allocators and host mirrors that retain model tensor pointers.
+// This must run before the owning ggml context is destroyed.
+void deepseek4_release_runtime_graphs(const DeepSeek4Weights & w);
 
 bool create_deepseek4_cache(ggml_backend_t backend,
                              const DeepSeek4Weights & w,
