@@ -1303,11 +1303,23 @@ static void ggml_backend_cuda_comm_free(void * comm_ctx_v) {
 
 static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_backends) {
 #ifdef GGML_USE_NCCL
+    if (n_backends == 0 || n_backends > GGML_CUDA_MAX_DEVICES) {
+        return nullptr;
+    }
+
+    std::array<bool, GGML_CUDA_MAX_DEVICES> seen_devices = {};
     for (size_t i = 0; i < n_backends; i++) {
         if (!ggml_backend_is_cuda(backends[i])) {
             return nullptr;
         }
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backends[i]->context;
+        if (cuda_ctx->device < 0 || cuda_ctx->device >= GGML_CUDA_MAX_DEVICES ||
+            seen_devices[cuda_ctx->device]) {
+            return nullptr;
+        }
+        seen_devices[cuda_ctx->device] = true;
     }
+
     ggml_backend_cuda_comm_context * ret = new ggml_backend_cuda_comm_context;
     std::vector<int> dev_ids;
     ret->backends.reserve(n_backends);
@@ -1416,6 +1428,20 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     GGML_UNUSED_VARS(comm_ctx_v, tensors);
     return false;
 #endif // GGML_USE_NCCL
+}
+
+bool ggml_backend_cuda_allreduce_tensor(
+        ggml_backend_t * backends,
+        struct ggml_tensor ** tensors,
+        size_t n_backends) {
+    void * comm_ctx = ggml_backend_cuda_comm_init(backends, n_backends);
+    if (comm_ctx == nullptr) {
+        return false;
+    }
+
+    const bool result = ggml_backend_cuda_comm_allreduce_tensor(comm_ctx, tensors);
+    ggml_backend_cuda_comm_free(comm_ctx);
+    return result;
 }
 
 ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type(int main_device, const float * tensor_split) {

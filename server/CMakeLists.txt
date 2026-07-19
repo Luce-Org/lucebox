@@ -657,6 +657,16 @@ if(DFLASH27B_TESTS)
         add_test(NAME cuda_pool_shutdown COMMAND test_cuda_pool_shutdown)
     endif()
 
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_cuda_comm_api.cpp")
+        add_executable(test_cuda_comm_api test/test_cuda_comm_api.cpp)
+        target_include_directories(test_cuda_comm_api PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_cuda_comm_api PRIVATE
+            ggml-cuda ggml ggml-base)
+        add_test(NAME cuda_comm_api COMMAND test_cuda_comm_api)
+    endif()
+
     add_executable(test_rocmfp4 deps/llama.cpp/ggml/rocmfp4/test_rocmfp4.c)
     target_link_libraries(test_rocmfp4 PRIVATE ggml-base)
     if(UNIX)
