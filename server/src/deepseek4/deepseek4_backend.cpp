@@ -1000,8 +1000,11 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
     // Decode
     auto t1 = Clock::now();
     const bool budget_requires_ar = !req.budget_hook.close_token_ids.empty();
+    // The DSpark verifier is greedy-only. Route sampling and penalties through
+    // AR so the request's sampler contract is not silently ignored.
+    const bool sampling_requires_ar = sampler_.needs_logit_processing();
     if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 &&
-        !req.force_ar_decode && !budget_requires_ar) {
+        !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar) {
         if (last_logits_.empty()) {
             result.fail(GenerateErrorCode::DecodeFailed, "spec: no prefill logits");
             return result;
