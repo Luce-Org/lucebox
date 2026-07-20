@@ -3597,11 +3597,6 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
         const bool prop_changed =
             memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0;
-        if (!res && prop_changed && getenv("GGML_CUDA_GRAPH_STATS")) {
-            GGML_LOG_INFO("[graph-mismatch] key=%p node=%d op=%s name=%s\n",
-                          graph_key, i, ggml_op_name(cgraph->nodes[i]->op),
-                          cgraph->nodes[i]->name);
-        }
         if (!res && prop_changed && getenv("GGML_CUDA_GRAPH_DIFF_STATS")) {
             const ggml_cuda_graph::node_properties & old =
                 graph->node_props[i];
