@@ -1,3 +1,4 @@
+#include "CppUnitTestFramework.hpp"
 #include "../src/common/moe_hybrid_routing_stats.h"
 
 #include <cstdio>
@@ -8,14 +9,19 @@
 
 using namespace dflash::common;
 
-static void expect(bool cond, const char * msg) {
-    if (!cond) {
-        std::fprintf(stderr, "FAIL: %s\n", msg);
-        std::exit(1);
-    }
+#define TEST_ASSERT(cond) do { \
+    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
+    if (_cpputf_exception) { \
+        throw *_cpputf_exception; \
+    } \
+} while (0)
+static void expect(bool cond, const char * msg) { (void) msg; TEST_ASSERT(cond); }
+
+namespace {
+struct Qwen35MoeRoutingStatsFixture {};
 }
 
-int main() {
+TEST_CASE(Qwen35MoeRoutingStatsFixture, moe_routing_stats_suite) {
     MoeHybridRoutingStats stats;
     expect(stats.init(2, 4, 2), "init");
     expect(stats.matches(2, 4, 2), "matches after init");
@@ -55,5 +61,4 @@ int main() {
 
     std::filesystem::remove(tmp);
     std::printf("OK\n");
-    return 0;
 }

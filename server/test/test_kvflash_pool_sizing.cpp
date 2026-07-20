@@ -6,6 +6,7 @@
 // speed-capped value. Placement then over-reserved KV and starved experts.
 // These asserts pin the two behaviours so a future caller can't silently
 // reintroduce the divergence.
+#include "CppUnitTestFramework.hpp"
 #include "../src/common/kvflash_pager.h"
 
 #include <cstdio>
@@ -13,11 +14,19 @@
 
 using namespace dflash::common;
 
-static void expect(bool cond, const char * msg) {
-    if (!cond) { std::fprintf(stderr, "FAIL: %s\n", msg); std::exit(1); }
+#define TEST_ASSERT(cond) do { \
+    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
+    if (_cpputf_exception) { \
+        throw *_cpputf_exception; \
+    } \
+} while (0)
+static void expect(bool cond, const char * msg) { (void) msg; TEST_ASSERT(cond); }
+
+namespace {
+struct KvflashPoolSizingFixture {};
 }
 
-int main() {
+TEST_CASE(KvflashPoolSizingFixture, kvflash_pool_sizing_suite) {
     setenv("DFLASH_KVFLASH", "auto", 1);
     unsetenv("DFLASH_KVFLASH_MAX_POOL");
     const int max_ctx = 131072;
@@ -49,5 +58,4 @@ int main() {
     expect(tight > 0 && tight <= 16384, "tight-VRAM pool stays within the cap");
 
     std::printf("OK test_kvflash_pool_sizing\n");
-    return 0;
 }

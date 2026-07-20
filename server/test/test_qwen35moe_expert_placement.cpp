@@ -1,3 +1,4 @@
+#include "CppUnitTestFramework.hpp"
 #include "../src/common/moe_hybrid_placement.h"
 #include "../src/common/moe_hybrid_routing_stats.h"
 
@@ -8,14 +9,19 @@
 
 using namespace dflash::common;
 
-static void expect(bool cond, const char * msg) {
-    if (!cond) {
-        std::fprintf(stderr, "FAIL: %s\n", msg);
-        std::exit(1);
-    }
+#define TEST_ASSERT(cond) do { \
+    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
+    if (_cpputf_exception) { \
+        throw *_cpputf_exception; \
+    } \
+} while (0)
+static void expect(bool cond, const char * msg) { (void) msg; TEST_ASSERT(cond); }
+
+namespace {
+struct Qwen35MoeExpertPlacementFixture {};
 }
 
-int main() {
+TEST_CASE(Qwen35MoeExpertPlacementFixture, moe_expert_placement_suite) {
     MoeHybridRoutingStats stats;
     stats.n_layer = 2;
     stats.n_expert = 4;
@@ -53,5 +59,4 @@ int main() {
     std::filesystem::remove(tmp);
 
     std::printf("OK\n");
-    return 0;
 }

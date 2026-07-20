@@ -7,6 +7,8 @@
 //   4. cosine: query/key magnitudes do not change scores
 //   5. missing pooled keys keep the missing_score sentinel
 
+#include "CppUnitTestFramework.hpp"
+
 #define KVFLASH_QK_PURE_ONLY
 #include "kvflash_qk.h"
 
@@ -17,15 +19,22 @@
 
 using namespace dflash::common;
 
-static int g_fail = 0;
-#define CHECK(cond, msg) do { \
-    if (cond) std::printf("PASS %s\n", msg); \
-    else { std::printf("FAIL %s\n", msg); g_fail++; } \
+#define TEST_ASSERT(cond) do { \
+    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
+    if (_cpputf_exception) { \
+        throw *_cpputf_exception; \
+    } \
 } while (0)
+#undef CHECK
+#define CHECK(cond, msg) do { (void) msg; TEST_ASSERT(cond); } while (0)
 
 static bool near(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) < eps; }
 
-int main() {
+namespace {
+struct KvflashQkFixture {};
+}
+
+TEST_CASE(KvflashQkFixture, kvflash_qk_suite) {
     KvFlashQkDims d;
     d.n_layers = 2; d.n_q_heads = 6; d.n_kv_heads = 2; d.head_dim = 8;
     const int group = d.n_q_heads / d.n_kv_heads;   // 3
@@ -121,6 +130,5 @@ int main() {
               "fractional cosine propagates exactly");
     }
 
-    std::printf("%s (%d failures)\n", g_fail == 0 ? "ALL PASS" : "FAILED", g_fail);
-    return g_fail == 0 ? 0 : 1;
+    std::printf("ALL PASS\n");
 }

@@ -6,6 +6,7 @@
 //   DFLASH27B_KV_K=tq3_0 DFLASH27B_KV_V=q5_0 ./dflash/build/test_kv_quant
 // Expected: prints "[dflash] KV pair …" message and aborts.
 
+#include "CppUnitTestFramework.hpp"
 #include "kv_quant.h"
 
 #include <cassert>
@@ -17,6 +18,19 @@
 #define setenv(name, value, overwrite) _putenv_s(name, value)
 #define unsetenv(name) _putenv_s(name, "")
 #endif
+
+#define TEST_ASSERT(cond) do { \
+    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
+    if (_cpputf_exception) { \
+        throw *_cpputf_exception; \
+    } \
+} while (0)
+#undef assert
+#define assert(cond) TEST_ASSERT(cond)
+
+namespace {
+struct KvQuantFixture {};
+}
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -59,10 +73,10 @@ static void t1_parse_kv_type() {
 static void t2_resolve_kv_types() {
     ggml_type k, v;
 
-    // 2a: no env → default Q8_0/Q8_0
+    // 2a: no env → default Q4_0/Q4_0
     clear_kv_env();
     dflash::resolve_kv_types(k, v);
-    assert(k == GGML_TYPE_Q8_0 && v == GGML_TYPE_Q8_0);
+    assert(k == GGML_TYPE_Q4_0 && v == GGML_TYPE_Q4_0);
 
     // 2b: F16 shorthand
     clear_kv_env();
@@ -191,7 +205,7 @@ static void t5_kv_reservation() {
 
 // ─── main ────────────────────────────────────────────────────────────────────
 
-int main() {
+TEST_CASE(KvQuantFixture, kv_quant_suite) {
     clear_kv_env();  // start clean regardless of calling environment
 
     t1_parse_kv_type();
@@ -201,5 +215,4 @@ int main() {
     t5_kv_reservation();
 
     std::puts("ALL TESTS PASS");
-    return 0;
 }

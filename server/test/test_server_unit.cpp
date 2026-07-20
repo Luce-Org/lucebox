@@ -3,9 +3,10 @@
 // Tests: SseEmitter, ToolParser, Reasoning, PrefixCache (hash/boundary),
 //        UTF-8 utilities.
 //
-// Ported from ds4_server.c's ds4_server_unit_tests_run() pattern.
 // Build: cmake --build . --target test_server_unit
 // Run:   ./test_server_unit
+
+#include "CppUnitTestFramework.hpp"
 
 #include "server/sse_emitter.h"
 #include "server/tool_parser.h"
@@ -68,36 +69,17 @@ std::vector<ChatMessage> normalize_chat_messages(
     ToolMemory & tool_memory);
 }
 
-// ─── Test framework (ds4 style) ────────────────────────────────────────
-
-static int test_failures = 0;
-static int test_count = 0;
-static const char * current_test = nullptr;
+namespace {
+struct ServerUnitFixture {};
+}
 
 #define TEST_ASSERT(expr) do { \
-    test_count++; \
-    if (!(expr)) { \
-        test_failures++; \
-        std::fprintf(stderr, "  FAIL: %s:%d: %s\n", __FILE__, __LINE__, #expr); \
+    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(expr), #expr); \
+    if (_cpputf_exception) { \
+        throw *_cpputf_exception; \
     } \
 } while (0)
-
-#define TEST_ASSERT_MSG(expr, msg) do { \
-    test_count++; \
-    if (!(expr)) { \
-        test_failures++; \
-        std::fprintf(stderr, "  FAIL: %s:%d: %s — %s\n", __FILE__, __LINE__, #expr, msg); \
-    } \
-} while (0)
-
-#define RUN_TEST(fn) do { \
-    current_test = #fn; \
-    std::fprintf(stderr, "  %s ...", #fn); \
-    int before = test_failures; \
-    fn(); \
-    if (test_failures == before) std::fprintf(stderr, " ok\n"); \
-    else std::fprintf(stderr, "\n"); \
-} while (0)
+#define TEST_ASSERT_MSG(expr, msg) TEST_ASSERT(expr)
 
 // ─── Helper: create an SseEmitter with minimal config ──────────────────
 
@@ -170,21 +152,21 @@ static std::string concat(const std::vector<std::string> & chunks) {
 // UTF-8 utility tests
 // ═══════════════════════════════════════════════════════════════════════
 
-static void test_utf8_safe_len_ascii() {
+TEST_CASE(ServerUnitFixture, test_utf8_safe_len_ascii) {
     std::string s = "Hello, world!";
     TEST_ASSERT(utf8_safe_len(s, s.size()) == s.size());
     TEST_ASSERT(utf8_safe_len(s, 5) == 5);
     TEST_ASSERT(utf8_safe_len(s, 0) == 0);
 }
 
-static void test_utf8_safe_len_partial_2byte() {
+TEST_CASE(ServerUnitFixture, test_utf8_safe_len_partial_2byte) {
     // é = 0xC3 0xA9
     std::string s = "caf\xC3\xA9!";  // "café!"
     TEST_ASSERT(utf8_safe_len(s, 5) == 5);  // after é, ok
     TEST_ASSERT(utf8_safe_len(s, 4) == 3);  // mid-é, snap back to before é
 }
 
-static void test_utf8_safe_len_partial_3byte() {
+TEST_CASE(ServerUnitFixture, test_utf8_safe_len_partial_3byte) {
     // ん = 0xE3 0x82 0x93
     std::string s = "A\xE3\x82\x93Z";  // "AんZ"
     TEST_ASSERT(utf8_safe_len(s, 4) == 4);  // after ん
@@ -192,7 +174,7 @@ static void test_utf8_safe_len_partial_3byte() {
     TEST_ASSERT(utf8_safe_len(s, 2) == 1);  // mid-ん, snap back to A
 }
 
-static void test_utf8_safe_len_partial_4byte() {
+TEST_CASE(ServerUnitFixture, test_utf8_safe_len_partial_4byte) {
     // 🚩 = 0xF0 0x9F 0x9A 0xA9
     std::string s = "A \xF0\x9F\x9A\xA9 done";
     TEST_ASSERT(utf8_safe_len(s, 6) == 6);  // after 🚩
@@ -202,12 +184,12 @@ static void test_utf8_safe_len_partial_4byte() {
     TEST_ASSERT(utf8_safe_len(s, 3) == 2);
 }
 
-static void test_utf8_sanitize_valid() {
+TEST_CASE(ServerUnitFixture, test_utf8_sanitize_valid) {
     std::string s = "Hello, world! 🎉";
     TEST_ASSERT(utf8_sanitize(s) == s);
 }
 
-static void test_utf8_sanitize_replaces_invalid() {
+TEST_CASE(ServerUnitFixture, test_utf8_sanitize_replaces_invalid) {
     // Lone continuation byte
     std::string s = "A\x80Z";
     std::string out = utf8_sanitize(s);
@@ -221,7 +203,7 @@ static void test_utf8_sanitize_replaces_invalid() {
     TEST_ASSERT(out2.size() > 1);  // has replacement(s)
 }
 
-static void test_utf8_sanitize_empty() {
+TEST_CASE(ServerUnitFixture, test_utf8_sanitize_empty) {
     TEST_ASSERT(utf8_sanitize("") == "");
 }
 
@@ -229,20 +211,20 @@ static void test_utf8_sanitize_empty() {
 // Reasoning parser tests
 // ═══════════════════════════════════════════════════════════════════════
 
-static void test_reasoning_basic() {
+TEST_CASE(ServerUnitFixture, test_reasoning_basic) {
     auto r = parse_reasoning("<think>I need to think</think>The answer is 42");
     TEST_ASSERT(r.has_reasoning);
     TEST_ASSERT(r.reasoning == "I need to think");
     TEST_ASSERT(r.content == "The answer is 42");
 }
 
-static void test_reasoning_no_tags() {
+TEST_CASE(ServerUnitFixture, test_reasoning_no_tags) {
     auto r = parse_reasoning("Just plain text");
     TEST_ASSERT(!r.has_reasoning);
     TEST_ASSERT(r.content == "Just plain text");
 }
 
-static void test_reasoning_started_in_thinking() {
+TEST_CASE(ServerUnitFixture, test_reasoning_started_in_thinking) {
     auto r = parse_reasoning("thinking body</think>content here",
                              true, true);
     TEST_ASSERT(r.has_reasoning);
@@ -250,7 +232,7 @@ static void test_reasoning_started_in_thinking() {
     TEST_ASSERT(r.content == "content here");
 }
 
-static void test_emitter_started_in_thinking_without_open_tag() {
+TEST_CASE(ServerUnitFixture, test_emitter_started_in_thinking_without_open_tag) {
     auto em = make_emitter(ApiFormat::OPENAI_CHAT, json::array(), true);
     auto chunks = em.emit_token("Thinking Process: calculate 9 + 6.");
     auto close = em.emit_token("</think>");
@@ -265,7 +247,7 @@ static void test_emitter_started_in_thinking_without_open_tag() {
     TEST_ASSERT(all.find("\"content\":\"Thinking Process") == std::string::npos);
 }
 
-static void test_reasoning_unclosed_think() {
+TEST_CASE(ServerUnitFixture, test_reasoning_unclosed_think) {
     auto r = parse_reasoning("<think>still thinking no close",
                              true, false);
     TEST_ASSERT(r.has_reasoning);
@@ -273,20 +255,20 @@ static void test_reasoning_unclosed_think() {
     TEST_ASSERT(r.content.empty());
 }
 
-static void test_reasoning_empty_thinking() {
+TEST_CASE(ServerUnitFixture, test_reasoning_empty_thinking) {
     auto r = parse_reasoning("<think></think>answer");
     TEST_ASSERT(!r.has_reasoning);  // empty reasoning
     TEST_ASSERT(r.content == "answer");
 }
 
-static void test_reasoning_whitespace_in_think() {
+TEST_CASE(ServerUnitFixture, test_reasoning_whitespace_in_think) {
     auto r = parse_reasoning("<think>\n  reasoning \n</think>\ncontent");
     TEST_ASSERT(r.has_reasoning);
     TEST_ASSERT(r.reasoning == "reasoning");
     TEST_ASSERT(r.content == "content");
 }
 
-static void test_reasoning_disabled() {
+TEST_CASE(ServerUnitFixture, test_reasoning_disabled) {
     // When thinking disabled but tags present, the parser still finds them
     // (the caller decides whether to use the reasoning field).
     auto r = parse_reasoning("<think>ignored</think>content",
@@ -299,7 +281,7 @@ static void test_reasoning_disabled() {
 // Tool parser tests
 // ═══════════════════════════════════════════════════════════════════════
 
-static void test_parse_tool_call_xml() {
+TEST_CASE(ServerUnitFixture, test_parse_tool_call_xml) {
     std::string text =
         "Some text\n"
         "<tool_call>\n"
@@ -321,7 +303,7 @@ static void test_parse_tool_call_xml() {
     TEST_ASSERT(result.cleaned_text.find("<tool_call>") == std::string::npos);
 }
 
-static void test_parse_bare_function_xml() {
+TEST_CASE(ServerUnitFixture, test_parse_bare_function_xml) {
     std::string text =
         "<function=list_files>\n"
         "<parameter=path>/home</parameter>\n"
@@ -335,7 +317,7 @@ static void test_parse_bare_function_xml() {
     }
 }
 
-static void test_parse_bare_tool_name_xml_with_function_close() {
+TEST_CASE(ServerUnitFixture, test_parse_bare_tool_name_xml_with_function_close) {
     std::string text =
         "\n\n\nLet me find the correct line range for the tests array.\n\n\n"
         "<bash>\n"
@@ -369,7 +351,7 @@ static void test_parse_bare_tool_name_xml_with_function_close() {
                 std::string::npos);
 }
 
-static void test_parse_json_tool_call() {
+TEST_CASE(ServerUnitFixture, test_parse_json_tool_call) {
     std::string text =
         "{\"name\": \"search\", \"arguments\": {\"query\": \"hello world\"}}";
     auto result = parse_tool_calls(text);
@@ -381,7 +363,7 @@ static void test_parse_json_tool_call() {
     }
 }
 
-static void test_parse_single_tool_bare_json_args() {
+TEST_CASE(ServerUnitFixture, test_parse_single_tool_bare_json_args) {
     std::string text =
         "{\n"
         "  \"command\": \"git branch --show-current\"\n"
@@ -396,7 +378,7 @@ static void test_parse_single_tool_bare_json_args() {
     TEST_ASSERT(result.cleaned_text.empty());
 }
 
-static void test_parse_single_tool_bare_json_args_allows_empty_optional_object() {
+TEST_CASE(ServerUnitFixture, test_parse_single_tool_bare_json_args_allows_empty_optional_object) {
     auto result = parse_tool_calls("{}", optional_shell_tools());
     TEST_ASSERT(result.tool_calls.size() == 1);
     if (!result.tool_calls.empty()) {
@@ -408,28 +390,28 @@ static void test_parse_single_tool_bare_json_args_allows_empty_optional_object()
     TEST_ASSERT(result.cleaned_text.empty());
 }
 
-static void test_parse_single_tool_bare_json_args_rejects_prose() {
+TEST_CASE(ServerUnitFixture, test_parse_single_tool_bare_json_args_rejects_prose) {
     std::string text = "The command is {\"command\": \"git status\"}.";
     auto result = parse_tool_calls(text, shell_tools());
     TEST_ASSERT(result.tool_calls.empty());
     TEST_ASSERT(result.cleaned_text == text);
 }
 
-static void test_parse_single_tool_bare_json_args_rejects_ambiguous_tools() {
+TEST_CASE(ServerUnitFixture, test_parse_single_tool_bare_json_args_rejects_ambiguous_tools) {
     std::string text = "{\"command\": \"git status\"}";
     auto result = parse_tool_calls(text, weather_tools());
     TEST_ASSERT(result.tool_calls.empty());
     TEST_ASSERT(result.cleaned_text == text);
 }
 
-static void test_parse_no_tools() {
+TEST_CASE(ServerUnitFixture, test_parse_no_tools) {
     std::string text = "Just plain text without any tool calls.";
     auto result = parse_tool_calls(text);
     TEST_ASSERT(result.tool_calls.empty());
     TEST_ASSERT(!result.cleaned_text.empty());
 }
 
-static void test_parse_tool_code_wrapper() {
+TEST_CASE(ServerUnitFixture, test_parse_tool_code_wrapper) {
     std::string text =
         "<tool_code>\n"
         "{\"name\": \"bash\", \"arguments\": {\"command\": \"ls -la\"}}\n"
@@ -441,7 +423,7 @@ static void test_parse_tool_code_wrapper() {
     }
 }
 
-static void test_parse_tool_allowed_filter() {
+TEST_CASE(ServerUnitFixture, test_parse_tool_allowed_filter) {
     std::string text =
         "<function=blocked_tool>\n"
         "<parameter=x>1</parameter>\n"
@@ -463,7 +445,7 @@ static void test_parse_tool_allowed_filter() {
 // and the args go through coerce_relaxed_json before becoming the
 // argument object.
 
-static void test_parse_call_verb_empty_args() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_empty_args) {
     // Bareword `call:get_weather{}` at start-of-string — sentinel
     // matches the leading `^` anchor; body is the empty object `{}`.
     auto result = parse_tool_calls("call:get_weather{}");
@@ -478,7 +460,7 @@ static void test_parse_call_verb_empty_args() {
     TEST_ASSERT(result.cleaned_text.find("call:get_weather") == std::string::npos);
 }
 
-static void test_parse_call_verb_strict_json_args() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_strict_json_args) {
     // Strict JSON args go through json::parse directly in
     // coerce_relaxed_json's fast path.
     auto result = parse_tool_calls("call:get_weather{\"city\": \"NYC\"}");
@@ -490,7 +472,7 @@ static void test_parse_call_verb_strict_json_args() {
     }
 }
 
-static void test_parse_call_verb_namespaced_verb() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_namespaced_verb) {
     // `ns:foo` namespaced verbs — the colon-strip logic in pattern 5
     // strips everything up to the last `:` so the registered tool name
     // is just `foo`.
@@ -503,7 +485,7 @@ static void test_parse_call_verb_namespaced_verb() {
     }
 }
 
-static void test_parse_call_verb_whitespace_before_key() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_whitespace_before_key) {
     // Leading whitespace inside the brace body must not break parsing.
     // (Whitespace tolerance is provided by json::parse / the relaxed
     //  fallback rewriter.)
@@ -516,14 +498,14 @@ static void test_parse_call_verb_whitespace_before_key() {
     }
 }
 
-static void test_parse_call_verb_missing_close_brace_rejected() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_missing_close_brace_rejected) {
     // Unbalanced opener — balanced_braces_end returns npos so pattern 5
     // bails out and produces no tool call. The text leaks through.
     auto result = parse_tool_calls("call:get_weather{\"city\": \"NYC\"");
     TEST_ASSERT(result.tool_calls.empty());
 }
 
-static void test_parse_call_verb_narrative_without_body_rejected() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_narrative_without_body_rejected) {
     // Narrative usage with a non-balanced body — sentinel matches the
     // space before `call:`, but the `{` has no matching `}` so the
     // call is discarded.
@@ -531,7 +513,7 @@ static void test_parse_call_verb_narrative_without_body_rejected() {
     TEST_ASSERT(result.tool_calls.empty());
 }
 
-static void test_parse_call_verb_underscore_prefix() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_underscore_prefix) {
     // SentencePiece artifact: `_call:` (the `_` is the literal
     // underscore character; sentinel char-class includes `_` for
     // exactly this case).
@@ -544,7 +526,7 @@ static void test_parse_call_verb_underscore_prefix() {
     }
 }
 
-static void test_parse_call_verb_nested_object_args() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_nested_object_args) {
     // Nested `{}` inside the args — balanced_braces_end tracks depth so
     // the outer close isn't consumed by the inner object.
     auto result = parse_tool_calls(
@@ -559,7 +541,7 @@ static void test_parse_call_verb_nested_object_args() {
     }
 }
 
-static void test_parse_call_verb_back_to_back() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_back_to_back) {
     // Gemma frequently emits multiple invocations back-to-back. The
     // sentinel char-class includes `}` so the second `call:` is found
     // after the first closes.
@@ -576,7 +558,7 @@ static void test_parse_call_verb_back_to_back() {
     }
 }
 
-static void test_parse_call_verb_relaxed_single_quotes() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_relaxed_single_quotes) {
     // Relaxed-JSON fallback: single-quoted strings + bare identifier
     // keys are rewritten to strict JSON before parse.
     auto result = parse_tool_calls("call:foo{city: 'NYC'}");
@@ -588,7 +570,7 @@ static void test_parse_call_verb_relaxed_single_quotes() {
     }
 }
 
-static void test_parse_call_verb_glued_to_word_rejected() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_glued_to_word_rejected) {
     // No sentinel char before `call:` (glued to identifier) — pattern 5
     // must NOT match. `_` is a deliberate exception covered by its
     // own test; here we use a regular letter.
@@ -599,7 +581,7 @@ static void test_parse_call_verb_glued_to_word_rejected() {
     TEST_ASSERT(result.tool_calls.empty());
 }
 
-static void test_parse_call_verb_does_not_hijack_inner_name() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_does_not_hijack_inner_name) {
     // Regression: pattern 5 must run before pattern 6 so that an inner
     // {"name": "...", "arguments": {}} in the call's args doesn't get
     // hijacked into a spurious bare-JSON tool call.
@@ -620,7 +602,7 @@ static void test_parse_call_verb_does_not_hijack_inner_name() {
 // and were relocated here when #341 was split. They focus on edge cases
 // that complement the core call:<verb>{} suite above.
 
-static void test_parse_call_verb_single() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_single) {
     std::string text = "call:get_country_info{country: \"France\"}";
     auto result = parse_tool_calls(text);
     TEST_ASSERT(result.tool_calls.size() == 1);
@@ -632,7 +614,7 @@ static void test_parse_call_verb_single() {
     TEST_ASSERT(result.cleaned_text.find("call:") == std::string::npos);
 }
 
-static void test_parse_call_verb_namespaced() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_namespaced) {
     std::string text = "call:execute-bead:read-file{path: \"crates/foo/src/lib.rs\"}";
     auto result = parse_tool_calls(text);
     TEST_ASSERT(result.tool_calls.size() == 1);
@@ -644,7 +626,7 @@ static void test_parse_call_verb_namespaced() {
     }
 }
 
-static void test_parse_call_verb_snake_and_hyphen() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_snake_and_hyphen) {
     std::string text =
         "call:execute-bead:list-files{path: \"src/\"}\n\n"
         "call:execute-bead:read_file{path: \"a/b.rs\"}";
@@ -656,7 +638,7 @@ static void test_parse_call_verb_snake_and_hyphen() {
     }
 }
 
-static void test_parse_call_verb_tool_allowed_filter() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_tool_allowed_filter) {
     std::string text = "call:disallowed_verb{x: 1}call:allowed_verb{y: 2}";
     json tools = json::array({
         {{"type", "function"}, {"function", {{"name", "allowed_verb"}}}}
@@ -668,14 +650,14 @@ static void test_parse_call_verb_tool_allowed_filter() {
     }
 }
 
-static void test_parse_call_verb_inline_prose_rejected() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_inline_prose_rejected) {
     // No sentinel char before `call:` — must NOT match.
     std::string text = "narrative.call:foo{x:1}";
     auto result = parse_tool_calls(text);
     TEST_ASSERT(result.tool_calls.empty());
 }
 
-static void test_parse_call_verb_inline_prose_after_space() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_inline_prose_after_space) {
     // Whitespace IS a valid sentinel — this should match.
     std::string text = "Sure, I'll call:foo{x: 1}";
     auto result = parse_tool_calls(text);
@@ -685,14 +667,14 @@ static void test_parse_call_verb_inline_prose_after_space() {
     }
 }
 
-static void test_parse_call_verb_malformed_args() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_malformed_args) {
     // Unterminated brace — drop the call, don't crash.
     std::string text = "call:foo{country: \"France\"";
     auto result = parse_tool_calls(text);
     TEST_ASSERT(result.tool_calls.empty());
 }
 
-static void test_parse_call_verb_inner_brace_in_string() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_inner_brace_in_string) {
     // The `{` and `}` inside the string value must not confuse the
     // balanced-brace scanner.
     std::string text = "call:foo{cmd: \"echo {not_a_brace} ok\"}";
@@ -704,7 +686,7 @@ static void test_parse_call_verb_inner_brace_in_string() {
     }
 }
 
-static void test_parse_call_verb_unquoted_keys() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_unquoted_keys) {
     // Relaxed-JSON path: bare keys get quoted.
     std::string text = "call:foo{path: \"x\", count: 3}";
     auto result = parse_tool_calls(text);
@@ -716,7 +698,7 @@ static void test_parse_call_verb_unquoted_keys() {
     }
 }
 
-static void test_parse_call_verb_cleaned_text() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_cleaned_text) {
     // The matched span should be stripped from cleaned_text.
     std::string text = "Hello call:foo{x: 1} world.";
     auto result = parse_tool_calls(text);
@@ -726,7 +708,7 @@ static void test_parse_call_verb_cleaned_text() {
     TEST_ASSERT(result.cleaned_text.find("world.") != std::string::npos);
 }
 
-static void test_parse_call_verb_intercept_inner_json() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_intercept_inner_json) {
     // Regression case: inner args of the form {"name": ..., "arguments": ...}
     // must NOT be picked up by pattern 6 (bare-JSON sweep) as a spurious
     // `inner` ToolCall. Exactly one ToolCall, named `outer`, with the
@@ -742,7 +724,7 @@ static void test_parse_call_verb_intercept_inner_json() {
     }
 }
 
-static void test_parse_call_verb_multiline_args() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_multiline_args) {
     // Snapshot rows have multi-line nested args; the balanced-brace
     // scanner is line-agnostic, so this must Just Work.
     std::string text =
@@ -762,7 +744,7 @@ static void test_parse_call_verb_multiline_args() {
 }
 
 
-static void test_parse_call_verb_singlequote_with_inner_doublequote() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_singlequote_with_inner_doublequote) {
     // Cubic PR #329 review: when the relaxed-JSON rewrite converts
     // single-quoted strings to double-quoted, inner `"` chars must be
     // escaped to `\"` — otherwise `'he said "hi"'` rewrites to
@@ -778,7 +760,7 @@ static void test_parse_call_verb_singlequote_with_inner_doublequote() {
     }
 }
 
-static void test_parse_call_verb_backtick_with_inner_doublequote() {
+TEST_CASE(ServerUnitFixture, test_parse_call_verb_backtick_with_inner_doublequote) {
     // Same escape concern as the single-quote case, but with the
     // backtick string flavor.
     std::string text = "call:say{quote: `he said \"hi\" loudly`}";
@@ -795,7 +777,7 @@ static void test_parse_call_verb_backtick_with_inner_doublequote() {
 // SSE Emitter tests
 // ═══════════════════════════════════════════════════════════════════════
 
-static void test_emitter_reasoning_split_openai() {
+TEST_CASE(ServerUnitFixture, test_emitter_reasoning_split_openai) {
     // Feed reasoning + content through emitter, verify split.
     // Model emits the opening <think> as its first token (Qwen3.6 path
     // — the streaming on_token lambda maps the special <think> id to
@@ -824,7 +806,7 @@ static void test_emitter_reasoning_split_openai() {
 // (model self-closes </think> mid-stream). Each test feeds tokens
 // one-per-call so the emit_token index is straightforward to reason
 // about.
-static void test_emitter_first_content_index_natural_close() {
+TEST_CASE(ServerUnitFixture, test_emitter_first_content_index_natural_close) {
     // Emit reasoning tokens (with explicit <think> open + </think>
     // close), then content tokens. The emit_token_count() reflects
     // all delivered tokens; the reasoning/content split is also
@@ -848,7 +830,7 @@ static void test_emitter_first_content_index_natural_close() {
     TEST_ASSERT(em.accumulated_text().find("content2") != std::string::npos);
 }
 
-static void test_emitter_first_content_index_never_closed() {
+TEST_CASE(ServerUnitFixture, test_emitter_first_content_index_never_closed) {
     // Model opens <think> then emits reasoning only — never closes
     // </think>. All produced text lands in reasoning_text; visible
     // accumulated_text stays empty.
@@ -865,7 +847,7 @@ static void test_emitter_first_content_index_never_closed() {
     TEST_ASSERT(em.accumulated_text().empty());
 }
 
-static void test_emitter_first_content_index_content_only() {
+TEST_CASE(ServerUnitFixture, test_emitter_first_content_index_content_only) {
     // Non-thinking request: emitter starts in CONTENT mode, so the
     // very first emit_token lands at index 0.
     auto em = make_emitter(ApiFormat::OPENAI_CHAT);
@@ -877,7 +859,7 @@ static void test_emitter_first_content_index_content_only() {
     TEST_ASSERT(em.emit_token_count() == 1);
 }
 
-static void test_emitter_first_content_index_qwen36_streaming_thinking() {
+TEST_CASE(ServerUnitFixture, test_emitter_first_content_index_qwen36_streaming_thinking) {
     // Regression: when the chat template emits a leading `<think>` token
     // (Qwen3.6 thinking-enabled path, or gemma4 `<|channel>` → `<think>`
     // map) the emitter starts in CONTENT mode by default and naively
@@ -911,7 +893,7 @@ static void test_emitter_first_content_index_qwen36_streaming_thinking() {
     TEST_ASSERT(em.emit_token_count() - em.first_content_token_index() > 0);
 }
 
-static void test_emitter_reasoning_strips_leading_think_tag() {
+TEST_CASE(ServerUnitFixture, test_emitter_reasoning_strips_leading_think_tag) {
     // Model emits leading whitespace + <think> as one token, then
     // continues thinking. The leading-<think>-with-whitespace-prefix
     // strip ensures the reasoning text doesn't contain the open tag.
@@ -930,7 +912,7 @@ static void test_emitter_reasoning_strips_leading_think_tag() {
     TEST_ASSERT(em.reasoning_text().find("Actual reasoning") != std::string::npos);
 }
 
-static void test_emitter_content_only_no_thinking() {
+TEST_CASE(ServerUnitFixture, test_emitter_content_only_no_thinking) {
     auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
     em.emit_token("Hello, world!");
@@ -940,7 +922,7 @@ static void test_emitter_content_only_no_thinking() {
     TEST_ASSERT(em.reasoning_text().empty());
 }
 
-static void test_emitter_tool_buffer_detection() {
+TEST_CASE(ServerUnitFixture, test_emitter_tool_buffer_detection) {
     // When the emitter sees <tool_call>, it should buffer and parse tools.
     auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
     em.emit_start();
@@ -959,7 +941,7 @@ static void test_emitter_tool_buffer_detection() {
     TEST_ASSERT(em.accumulated_text().find("<tool_call>") == std::string::npos);
 }
 
-static void test_emitter_anthropic_tool_use_blocks() {
+TEST_CASE(ServerUnitFixture, test_emitter_anthropic_tool_use_blocks) {
     // The Anthropic streaming tool-use branch used to be a no-op; the model
     // would emit a <tool_call>...</tool_call> block, the parser would detect
     // it, but no tool_use SSE event was sent. Verify the lifecycle now:
@@ -998,7 +980,7 @@ static void test_emitter_anthropic_tool_use_blocks() {
     TEST_ASSERT(n_stop >= 2);
 }
 
-static void test_emitter_single_tool_bare_json_args() {
+TEST_CASE(ServerUnitFixture, test_emitter_single_tool_bare_json_args) {
     auto em = make_emitter(ApiFormat::ANTHROPIC, shell_tools());
     em.emit_start();
     em.emit_token("{\n");
@@ -1015,7 +997,7 @@ static void test_emitter_single_tool_bare_json_args() {
     TEST_ASSERT(em.accumulated_text().empty());
 }
 
-static void test_emitter_bare_json_args_do_not_trigger_after_content() {
+TEST_CASE(ServerUnitFixture, test_emitter_bare_json_args_do_not_trigger_after_content) {
     auto em = make_emitter(ApiFormat::ANTHROPIC, shell_tools());
     em.emit_start();
     em.emit_token("This answer already emitted visible prose before JSON appears.");
@@ -1029,7 +1011,7 @@ static void test_emitter_bare_json_args_do_not_trigger_after_content() {
                 std::string::npos);
 }
 
-static void test_emitter_bare_function_tool_buffer_detection() {
+TEST_CASE(ServerUnitFixture, test_emitter_bare_function_tool_buffer_detection) {
     auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
     em.emit_start();
     em.emit_token("<function=terminal>\n"
@@ -1048,7 +1030,7 @@ static void test_emitter_bare_function_tool_buffer_detection() {
     TEST_ASSERT(em.accumulated_text().find("<function=terminal>") == std::string::npos);
 }
 
-static void test_emitter_does_not_leak_malformed_tool_xml() {
+TEST_CASE(ServerUnitFixture, test_emitter_does_not_leak_malformed_tool_xml) {
     auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
     em.emit_start();
     em.emit_token("Let me list files.\n\n");
@@ -1065,7 +1047,7 @@ static void test_emitter_does_not_leak_malformed_tool_xml() {
     TEST_ASSERT(em.accumulated_text().find("<function=terminal>") == std::string::npos);
 }
 
-static void test_emitter_parses_tool_call_missing_outer_close() {
+TEST_CASE(ServerUnitFixture, test_emitter_parses_tool_call_missing_outer_close) {
     auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
     em.emit_start();
     em.emit_token("<tool_call>\n"
@@ -1086,7 +1068,7 @@ static void test_emitter_parses_tool_call_missing_outer_close() {
     TEST_ASSERT(em.accumulated_text().find("<function=terminal>") == std::string::npos);
 }
 
-static void test_emitter_no_tools_keeps_tool_like_text() {
+TEST_CASE(ServerUnitFixture, test_emitter_no_tools_keeps_tool_like_text) {
     auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
     em.emit_token("<function=terminal>\n"
@@ -1098,7 +1080,7 @@ static void test_emitter_no_tools_keeps_tool_like_text() {
     TEST_ASSERT(em.accumulated_text().find("<function=terminal>") != std::string::npos);
 }
 
-static void test_emitter_anthropic_structure() {
+TEST_CASE(ServerUnitFixture, test_emitter_anthropic_structure) {
     // Verify Anthropic format emits proper event sequence.
     auto em = make_emitter(ApiFormat::ANTHROPIC);
     auto start = em.emit_start();
@@ -1123,7 +1105,7 @@ static void test_emitter_anthropic_structure() {
     TEST_ASSERT(finish_str.find("message_stop") != std::string::npos);
 }
 
-static void test_emitter_responses_structure() {
+TEST_CASE(ServerUnitFixture, test_emitter_responses_structure) {
     auto em = make_emitter(ApiFormat::RESPONSES);
     auto start = em.emit_start();
     std::string start_str = concat(start);
@@ -1138,7 +1120,7 @@ static void test_emitter_responses_structure() {
     TEST_ASSERT(finish_str.find("response.completed") != std::string::npos);
 }
 
-static void test_emitter_responses_bare_function_tool_call() {
+TEST_CASE(ServerUnitFixture, test_emitter_responses_bare_function_tool_call) {
     json tools = json::array({{
         {"type", "function"},
         {"name", "exec_command"},
@@ -1167,7 +1149,7 @@ static void test_emitter_responses_bare_function_tool_call() {
     TEST_ASSERT(finish_str.find("response.function_call_arguments.done") != std::string::npos);
 }
 
-static void test_emitter_streaming_openai_has_done() {
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_openai_has_done) {
     auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_start();
     em.emit_token("Hello");
@@ -1177,7 +1159,7 @@ static void test_emitter_streaming_openai_has_done() {
     TEST_ASSERT(finish_str.find("[DONE]") != std::string::npos);
 }
 
-static void test_emitter_nonstreaming_accumulates() {
+TEST_CASE(ServerUnitFixture, test_emitter_nonstreaming_accumulates) {
     // Non-streaming: tokens fed through emitter, accumulated_text() has all content.
     auto em = make_emitter(ApiFormat::OPENAI_CHAT);
     em.emit_token("Hello ");
@@ -1188,7 +1170,7 @@ static void test_emitter_nonstreaming_accumulates() {
     TEST_ASSERT(em.accumulated_text().find("world") != std::string::npos);
 }
 
-static void test_emitter_anthropic_thinking_blocks() {
+TEST_CASE(ServerUnitFixture, test_emitter_anthropic_thinking_blocks) {
     auto em = make_emitter(ApiFormat::ANTHROPIC);
     auto start = em.emit_start();
     std::string start_str = concat(start);
@@ -1218,7 +1200,7 @@ static SseEmitter make_emitter_with_stops(ApiFormat fmt,
                       json::array(), nullptr, stops);
 }
 
-static void test_stop_sequence_basic() {
+TEST_CASE(ServerUnitFixture, test_stop_sequence_basic) {
     // Stop sequence should truncate content at the match point.
     auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{"STOP"});
     em.emit_token("Hello ");
@@ -1234,7 +1216,7 @@ static void test_stop_sequence_basic() {
     TEST_ASSERT(em.accumulated_text().find("more") == std::string::npos);
 }
 
-static void test_stop_sequence_mid_token() {
+TEST_CASE(ServerUnitFixture, test_stop_sequence_mid_token) {
     // Stop sequence may span multiple tokens due to holdback buffering.
     auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{"END"});
     em.emit_token("Go ");
@@ -1248,7 +1230,7 @@ static void test_stop_sequence_mid_token() {
     TEST_ASSERT(em.accumulated_text().find("now") == std::string::npos);
 }
 
-static void test_stop_sequence_multiple() {
+TEST_CASE(ServerUnitFixture, test_stop_sequence_multiple) {
     // Multiple stop sequences — earliest match wins.
     auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{"AAA", "BB"});
     em.emit_token("xBBy");
@@ -1258,7 +1240,7 @@ static void test_stop_sequence_multiple() {
     TEST_ASSERT(em.accumulated_text() == "x");
 }
 
-static void test_stop_sequence_no_match() {
+TEST_CASE(ServerUnitFixture, test_stop_sequence_no_match) {
     // No stop sequence hit — normal operation.
     auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{"NOMATCH"});
     em.emit_token("Hello world this is a long text");
@@ -1268,7 +1250,7 @@ static void test_stop_sequence_no_match() {
     TEST_ASSERT(em.accumulated_text().find("Hello") != std::string::npos);
 }
 
-static void test_stop_sequence_empty_list() {
+TEST_CASE(ServerUnitFixture, test_stop_sequence_empty_list) {
     // Empty stop list — no effect.
     auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{});
     em.emit_token("Hello STOP world");
@@ -1278,7 +1260,7 @@ static void test_stop_sequence_empty_list() {
     TEST_ASSERT(em.accumulated_text().find("STOP") != std::string::npos);
 }
 
-static void test_stop_sequence_finish_reason() {
+TEST_CASE(ServerUnitFixture, test_stop_sequence_finish_reason) {
     // finish_reason should be "stop" when stop sequence hit.
     auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{"END"});
     em.emit_token("content END more");
@@ -1288,7 +1270,7 @@ static void test_stop_sequence_finish_reason() {
     TEST_ASSERT(em.finish_reason() == "stop");
 }
 
-static void test_stop_sequence_streaming_output() {
+TEST_CASE(ServerUnitFixture, test_stop_sequence_streaming_output) {
     // Streaming: verify the [DONE] is still emitted after stop.
     auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,{"HALT"});
     auto start = em.emit_start();
@@ -1301,7 +1283,7 @@ static void test_stop_sequence_streaming_output() {
     TEST_ASSERT(all.find("\"finish_reason\":\"stop\"") != std::string::npos);
 }
 
-static void test_stop_sequence_anthropic_format() {
+TEST_CASE(ServerUnitFixture, test_stop_sequence_anthropic_format) {
     // Anthropic format should emit end_turn stop_reason.
     auto em = make_emitter_with_stops(ApiFormat::ANTHROPIC, {"DONE"});
     em.emit_start();
@@ -1314,7 +1296,7 @@ static void test_stop_sequence_anthropic_format() {
     TEST_ASSERT(all.find("message_stop") != std::string::npos);
 }
 
-static void test_stop_sequence_in_reasoning_mode() {
+TEST_CASE(ServerUnitFixture, test_stop_sequence_in_reasoning_mode) {
     // Stop sequence in reasoning mode should still stop. Model opens
     // <think> first to enter REASONING.
     auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT, {"CUTOFF"});
@@ -1327,7 +1309,7 @@ static void test_stop_sequence_in_reasoning_mode() {
     TEST_ASSERT(em.reasoning_text().find("CUTOFF") == std::string::npos);
 }
 
-static void test_stop_sequence_holdback_extends() {
+TEST_CASE(ServerUnitFixture, test_stop_sequence_holdback_extends) {
     // With a long stop sequence, holdback buffer should extend to prevent
     // emitting text that's part of a stop sequence.
     auto em = make_emitter_with_stops(ApiFormat::OPENAI_CHAT,
@@ -1350,14 +1332,14 @@ static void test_stop_sequence_holdback_extends() {
 // Prefix cache hash tests (model-free)
 // ═══════════════════════════════════════════════════════════════════════
 
-static void test_hash_prefix_deterministic() {
+TEST_CASE(ServerUnitFixture, test_hash_prefix_deterministic) {
     std::vector<int32_t> ids = {100, 200, 300, 400, 500};
     auto h1 = hash_prefix(ids.data(), (int)ids.size());
     auto h2 = hash_prefix(ids.data(), (int)ids.size());
     TEST_ASSERT(h1 == h2);
 }
 
-static void test_hash_prefix_different_inputs() {
+TEST_CASE(ServerUnitFixture, test_hash_prefix_different_inputs) {
     std::vector<int32_t> ids1 = {100, 200, 300};
     std::vector<int32_t> ids2 = {100, 200, 301};
     auto h1 = hash_prefix(ids1.data(), (int)ids1.size());
@@ -1365,7 +1347,7 @@ static void test_hash_prefix_different_inputs() {
     TEST_ASSERT(h1 != h2);
 }
 
-static void test_hash_prefix_different_lengths() {
+TEST_CASE(ServerUnitFixture, test_hash_prefix_different_lengths) {
     std::vector<int32_t> ids1 = {100, 200, 300};
     std::vector<int32_t> ids2 = {100, 200, 300, 400};
     auto h1 = hash_prefix(ids1.data(), (int)ids1.size());
@@ -1373,13 +1355,13 @@ static void test_hash_prefix_different_lengths() {
     TEST_ASSERT(h1 != h2);
 }
 
-static void test_hash_prefix_empty() {
+TEST_CASE(ServerUnitFixture, test_hash_prefix_empty) {
     auto h = hash_prefix(nullptr, 0);
     // Should not crash, just return a hash of empty input
     TEST_ASSERT(h.size() == 16);
 }
 
-static void test_find_boundaries_empty() {
+TEST_CASE(ServerUnitFixture, test_find_boundaries_empty) {
     ChatMarkers markers;
     markers.family = "qwen";
     std::vector<int32_t> ids;
@@ -1389,30 +1371,30 @@ static void test_find_boundaries_empty() {
 
 // ── Prefix-aware eviction policy (model-free) ───────────────────────────
 
-static void test_evict_empty_is_zero() {
+TEST_CASE(ServerUnitFixture, test_evict_empty_is_zero) {
     std::vector<std::vector<int32_t>> ids;
     TEST_ASSERT(select_inline_evict_victim(ids) == 0);
 }
 
-static void test_evict_single_is_zero() {
+TEST_CASE(ServerUnitFixture, test_evict_single_is_zero) {
     std::vector<std::vector<int32_t>> ids = {{1, 2, 3}};
     TEST_ASSERT(select_inline_evict_victim(ids) == 0);
 }
 
-static void test_evict_chain_keeps_ancestors() {
+TEST_CASE(ServerUnitFixture, test_evict_chain_keeps_ancestors) {
     // Oldest-first chain: [s] < [s,a] < [s,a,b]. Only the longest is a leaf, so
     // the short shared ancestors are kept and the victim is the deepest entry.
     std::vector<std::vector<int32_t>> ids = {{9}, {9, 1}, {9, 1, 2}};
     TEST_ASSERT(select_inline_evict_victim(ids) == 2);
 }
 
-static void test_evict_unrelated_falls_back_to_lru() {
+TEST_CASE(ServerUnitFixture, test_evict_unrelated_falls_back_to_lru) {
     // No prefix relation: all are leaves, so evict the oldest (index 0).
     std::vector<std::vector<int32_t>> ids = {{1, 1}, {2, 2}, {3, 3}};
     TEST_ASSERT(select_inline_evict_victim(ids) == 0);
 }
 
-static void test_evict_branch_spares_shared_root() {
+TEST_CASE(ServerUnitFixture, test_evict_branch_spares_shared_root) {
     // [s] is an ancestor of both branches, so it is never the victim; the oldest
     // leaf ([s,a] at index 1) is evicted instead.
     std::vector<std::vector<int32_t>> ids = {{9}, {9, 1}, {9, 2}};
@@ -1425,7 +1407,7 @@ static void test_evict_branch_spares_shared_root() {
 // PFlash config tests (model-free)
 // ═══════════════════════════════════════════════════════════════════════
 
-static void test_pflash_config_defaults() {
+TEST_CASE(ServerUnitFixture, test_pflash_config_defaults) {
     ServerConfig cfg;
     TEST_ASSERT(cfg.pflash_mode == ServerConfig::PflashMode::OFF);
     TEST_ASSERT(cfg.pflash_threshold == 32000);
@@ -1435,7 +1417,7 @@ static void test_pflash_config_defaults() {
     TEST_ASSERT(cfg.draft_residency == DraftResidencyPolicy::Auto);
 }
 
-static void test_pflash_config_modes() {
+TEST_CASE(ServerUnitFixture, test_pflash_config_modes) {
     ServerConfig cfg;
     cfg.pflash_mode = ServerConfig::PflashMode::AUTO;
     TEST_ASSERT(cfg.pflash_mode != ServerConfig::PflashMode::OFF);
@@ -1445,7 +1427,7 @@ static void test_pflash_config_modes() {
     TEST_ASSERT(cfg.pflash_mode != ServerConfig::PflashMode::AUTO);
 }
 
-static void test_pflash_compress_request_struct() {
+TEST_CASE(ServerUnitFixture, test_pflash_compress_request_struct) {
     ModelBackend::CompressRequest req;
     req.input_ids = {1, 2, 3, 4, 5};
     req.keep_ratio = 0.05f;
@@ -1458,13 +1440,13 @@ static void test_pflash_compress_request_struct() {
     TEST_ASSERT(req.skip_park);
 }
 
-static void test_pflash_compress_result_defaults() {
+TEST_CASE(ServerUnitFixture, test_pflash_compress_result_defaults) {
     ModelBackend::CompressResult result;
     TEST_ASSERT(!result.ok);
     TEST_ASSERT(result.compressed_ids.empty());
 }
 
-static void test_pflash_threshold_auto_mode() {
+TEST_CASE(ServerUnitFixture, test_pflash_threshold_auto_mode) {
     // Simulate the threshold check logic from http_server.cpp
     ServerConfig cfg;
     cfg.pflash_mode = ServerConfig::PflashMode::AUTO;
@@ -1483,7 +1465,7 @@ static void test_pflash_threshold_auto_mode() {
     TEST_ASSERT(should);
 }
 
-static void test_pflash_threshold_always_mode() {
+TEST_CASE(ServerUnitFixture, test_pflash_threshold_always_mode) {
     ServerConfig cfg;
     cfg.pflash_mode = ServerConfig::PflashMode::ALWAYS;
 
@@ -1494,7 +1476,7 @@ static void test_pflash_threshold_always_mode() {
     TEST_ASSERT(should);
 }
 
-static void test_pflash_config_upstream_defaults() {
+TEST_CASE(ServerUnitFixture, test_pflash_config_upstream_defaults) {
     ServerConfig cfg;
     TEST_ASSERT(cfg.pflash_upstream_base.empty());
     TEST_ASSERT(cfg.pflash_upstream_key.empty());
@@ -1502,7 +1484,7 @@ static void test_pflash_config_upstream_defaults() {
     TEST_ASSERT(cfg.pflash_curve.empty());
 }
 
-static void test_pflash_curve_interpolation() {
+TEST_CASE(ServerUnitFixture, test_pflash_curve_interpolation) {
     ServerConfig cfg;
     cfg.pflash_curve = {{10000, 0.50f}, {40000, 0.20f}, {100000, 0.10f}};
 
@@ -1534,7 +1516,7 @@ static void test_pflash_curve_interpolation() {
     TEST_ASSERT(keep(200000) == 0.10f);
 }
 
-static void test_pflash_curve_empty_uses_flat() {
+TEST_CASE(ServerUnitFixture, test_pflash_curve_empty_uses_flat) {
     ServerConfig cfg;
     cfg.pflash_keep_ratio = 0.05f;
     // With empty curve, should fall back to flat ratio
@@ -1542,7 +1524,7 @@ static void test_pflash_curve_empty_uses_flat() {
     TEST_ASSERT(cfg.pflash_keep_ratio == 0.05f);
 }
 
-static void test_pflash_upstream_proxy_config() {
+TEST_CASE(ServerUnitFixture, test_pflash_upstream_proxy_config) {
     ServerConfig cfg;
     cfg.pflash_upstream_base = "http://localhost:8080/v1";
     cfg.pflash_upstream_key = "test-key";
@@ -1553,7 +1535,7 @@ static void test_pflash_upstream_proxy_config() {
     TEST_ASSERT(cfg.pflash_upstream_model == "test-model");
 }
 
-static void test_pflash_raw_body_preserved() {
+TEST_CASE(ServerUnitFixture, test_pflash_raw_body_preserved) {
     ParsedRequest req;
     req.raw_body = {{"model", "test"}, {"messages", json::array()}, {"temperature", 0.7}};
 
@@ -1562,7 +1544,7 @@ static void test_pflash_raw_body_preserved() {
     TEST_ASSERT(req.raw_body["temperature"].get<float>() > 0.6f);
 }
 
-static void test_pflash_placement_same_backend_local() {
+TEST_CASE(ServerUnitFixture, test_pflash_placement_same_backend_local) {
     DevicePlacement target;
     target.backend = compiled_placement_backend();
     target.gpu = 0;
@@ -1581,7 +1563,7 @@ static void test_pflash_placement_same_backend_local() {
     TEST_ASSERT(!placement.remote.enabled());
 }
 
-static void test_pflash_placement_mixed_backend_remote() {
+TEST_CASE(ServerUnitFixture, test_pflash_placement_mixed_backend_remote) {
     DevicePlacement target;
     target.backend = PlacementBackend::Cuda;
     target.gpu = 0;
@@ -1602,7 +1584,7 @@ static void test_pflash_placement_mixed_backend_remote() {
     TEST_ASSERT(placement.remote.work_dir == "/tmp/pflash-ipc");
 }
 
-static void test_pflash_placement_auto_draft_follows_target() {
+TEST_CASE(ServerUnitFixture, test_pflash_placement_auto_draft_follows_target) {
     DevicePlacement target;
     target.backend = PlacementBackend::Hip;
     target.gpu = 0;
@@ -1620,7 +1602,7 @@ static void test_pflash_placement_auto_draft_follows_target() {
     TEST_ASSERT(!placement.remote_drafter);
 }
 
-static void test_pflash_placement_disabled_never_remote() {
+TEST_CASE(ServerUnitFixture, test_pflash_placement_disabled_never_remote) {
     DevicePlacement target;
     target.backend = PlacementBackend::Cuda;
     DevicePlacement drafter;
@@ -1636,7 +1618,7 @@ static void test_pflash_placement_disabled_never_remote() {
     TEST_ASSERT(!placement.remote.enabled());
 }
 
-static void test_pflash_placement_usage_gate() {
+TEST_CASE(ServerUnitFixture, test_pflash_placement_usage_gate) {
     TEST_ASSERT(!pflash_drafter_placement_used(
         /*pflash_enabled=*/false, /*has_decode_draft=*/false));
     TEST_ASSERT(pflash_drafter_placement_used(
@@ -1647,7 +1629,7 @@ static void test_pflash_placement_usage_gate() {
         /*pflash_enabled=*/true, /*has_decode_draft=*/true));
 }
 
-static void test_draft_residency_parse() {
+TEST_CASE(ServerUnitFixture, test_draft_residency_parse) {
     DraftResidencyPolicy policy = DraftResidencyPolicy::Auto;
     TEST_ASSERT(parse_draft_residency_policy("auto", policy));
     TEST_ASSERT(policy == DraftResidencyPolicy::Auto);
@@ -1660,7 +1642,7 @@ static void test_draft_residency_parse() {
     TEST_ASSERT(!parse_draft_residency_policy("request", policy));
 }
 
-static void test_draft_residency_pflash_auto() {
+TEST_CASE(ServerUnitFixture, test_draft_residency_pflash_auto) {
     auto action = resolve_draft_residency_action(
         DraftResidencyPolicy::Auto,
         DraftResidencyContext{
@@ -1680,7 +1662,7 @@ static void test_draft_residency_pflash_auto() {
     TEST_ASSERT(action == DraftResidencyAction::ReleaseAfterUse);
 }
 
-static void test_draft_residency_dflash_auto_and_request_scoped() {
+TEST_CASE(ServerUnitFixture, test_draft_residency_dflash_auto_and_request_scoped) {
     auto action = resolve_draft_residency_action(
         DraftResidencyPolicy::Auto,
         DraftResidencyContext{
@@ -1733,7 +1715,7 @@ static const char MINI_JINJA_TEMPLATE[] =
     "<|assistant|>"
     "{%- endif -%}";
 
-static void test_deepseek4_render_system_only_gen_prompt() {
+TEST_CASE(ServerUnitFixture, test_deepseek4_render_system_only_gen_prompt) {
     std::vector<ChatMessage> msgs = {
         {"system", "sys only", ""},
     };
@@ -1747,7 +1729,7 @@ static void test_deepseek4_render_system_only_gen_prompt() {
     TEST_ASSERT(out == expected);
 }
 
-static void test_deepseek4_render_empty_chat_gen_prompt() {
+TEST_CASE(ServerUnitFixture, test_deepseek4_render_empty_chat_gen_prompt) {
     std::vector<ChatMessage> msgs;
     const std::string out = render_chat_template(
         msgs, ChatFormat::DEEPSEEK4,
@@ -1759,7 +1741,7 @@ static void test_deepseek4_render_empty_chat_gen_prompt() {
     TEST_ASSERT(out == expected);
 }
 
-static void test_jinja_render_basic() {
+TEST_CASE(ServerUnitFixture, test_jinja_render_basic) {
     std::vector<ChatMessage> msgs = {
         {"system", "you are helpful", ""},
         {"user",   "hi",              ""},
@@ -1774,7 +1756,7 @@ static void test_jinja_render_basic() {
     TEST_ASSERT(out.find("<|assistant|>")            != std::string::npos);
 }
 
-static void test_jinja_render_no_gen_prompt() {
+TEST_CASE(ServerUnitFixture, test_jinja_render_no_gen_prompt) {
     std::vector<ChatMessage> msgs = {{"user", "ping", ""}};
     std::string out = render_chat_template_jinja(
         MINI_JINJA_TEMPLATE, msgs, "", "",
@@ -1783,7 +1765,7 @@ static void test_jinja_render_no_gen_prompt() {
     TEST_ASSERT(out.find("<|assistant|>") == std::string::npos);
 }
 
-static void test_jinja_render_tools_injected() {
+TEST_CASE(ServerUnitFixture, test_jinja_render_tools_injected) {
     // Template references `tools` to confirm it was passed in.
     static const char TPL[] =
         "{%- if tools -%}TOOLS_PRESENT:{{ tools[0].name }}{%- endif -%}"
@@ -1795,7 +1777,7 @@ static void test_jinja_render_tools_injected() {
     TEST_ASSERT(out.find("TOOLS_PRESENT:my_tool") != std::string::npos);
 }
 
-static void test_jinja_render_empty_tools_skipped() {
+TEST_CASE(ServerUnitFixture, test_jinja_render_empty_tools_skipped) {
     // tools_json == "[]" must NOT define `tools` in the template context.
     static const char TPL[] =
         "{%- if tools -%}TOOLS_PRESENT{%- else -%}NO_TOOLS{%- endif -%}";
@@ -1806,7 +1788,7 @@ static void test_jinja_render_empty_tools_skipped() {
     TEST_ASSERT(out.find("TOOLS_PRESENT")   == std::string::npos);
 }
 
-static void test_jinja_render_bos_eos_threaded() {
+TEST_CASE(ServerUnitFixture, test_jinja_render_bos_eos_threaded) {
     // {{ bos_token }} and {{ eos_token }} must reach the template.
     static const char TPL[] = "{{ bos_token }}HI{{ eos_token }}";
     std::vector<ChatMessage> msgs;
@@ -1815,7 +1797,7 @@ static void test_jinja_render_bos_eos_threaded() {
     TEST_ASSERT(out == "<BOS>HI<EOS>");
 }
 
-static void test_jinja_render_empty_template_throws() {
+TEST_CASE(ServerUnitFixture, test_jinja_render_empty_template_throws) {
     std::vector<ChatMessage> msgs = {{"user", "x", ""}};
     bool threw = false;
     try {
@@ -1826,7 +1808,7 @@ static void test_jinja_render_empty_template_throws() {
     TEST_ASSERT(threw);
 }
 
-static void test_jinja_render_bad_tools_json_throws() {
+TEST_CASE(ServerUnitFixture, test_jinja_render_bad_tools_json_throws) {
     static const char TPL[] = "{%- for m in messages -%}{{ m.role }}{%- endfor -%}";
     std::vector<ChatMessage> msgs = {{"user", "x", ""}};
     bool threw = false;
@@ -1839,7 +1821,7 @@ static void test_jinja_render_bad_tools_json_throws() {
     TEST_ASSERT(threw);
 }
 
-static void test_normalize_responses_tool_followup_messages() {
+TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
     ToolMemory tool_memory;
     const std::string call_id = "call_exec_001";
     const std::string raw_tool_call =
@@ -1897,7 +1879,7 @@ static void test_normalize_responses_tool_followup_messages() {
 // Placement config tests
 // ═══════════════════════════════════════════════════════════════════════
 
-static void test_parse_target_device_list_same_backend() {
+TEST_CASE(ServerUnitFixture, test_parse_target_device_list_same_backend) {
     DevicePlacement placement;
     TEST_ASSERT(parse_placement_device_list("cuda:0,cuda:1", placement));
     TEST_ASSERT(placement.backend == PlacementBackend::Cuda);
@@ -1913,7 +1895,7 @@ static void test_parse_target_device_list_same_backend() {
     TEST_ASSERT(placement.layer_split_weights.empty());
 }
 
-static void test_parse_target_device_list_mixed_backend() {
+TEST_CASE(ServerUnitFixture, test_parse_target_device_list_mixed_backend) {
     DevicePlacement placement;
     TEST_ASSERT(parse_placement_device_list("cuda:0,hip:1", placement));
     TEST_ASSERT(placement.backend == PlacementBackend::Cuda);
@@ -1930,7 +1912,7 @@ static void test_parse_target_device_list_mixed_backend() {
     TEST_ASSERT(placement.layer_split_gpus[1] == 1);
 }
 
-static void test_parse_target_device_list_mixed_backend_multi_remote() {
+TEST_CASE(ServerUnitFixture, test_parse_target_device_list_mixed_backend_multi_remote) {
     DevicePlacement placement;
     TEST_ASSERT(parse_placement_device_list("cuda:0,hip:0,hip:1", placement));
     TEST_ASSERT(placement.backend == PlacementBackend::Cuda);
@@ -1947,7 +1929,7 @@ static void test_parse_target_device_list_mixed_backend_multi_remote() {
     TEST_ASSERT(placement.layer_split_gpus[2] == 1);
 }
 
-static void test_parse_target_device_list_single_gpu_is_not_layer_split() {
+TEST_CASE(ServerUnitFixture, test_parse_target_device_list_single_gpu_is_not_layer_split) {
     DevicePlacement placement;
     TEST_ASSERT(parse_placement_device_list("hip:2", placement));
     TEST_ASSERT(placement.backend == PlacementBackend::Hip);
@@ -1958,7 +1940,7 @@ static void test_parse_target_device_list_single_gpu_is_not_layer_split() {
     TEST_ASSERT(placement.layer_split_gpus.empty());
 }
 
-static void test_validate_layer_split_weights_shape() {
+TEST_CASE(ServerUnitFixture, test_validate_layer_split_weights_shape) {
     DevicePlacement placement;
     TEST_ASSERT(parse_placement_device_list("cuda:0,cuda:1", placement));
 
@@ -1972,7 +1954,7 @@ static void test_validate_layer_split_weights_shape() {
     TEST_ASSERT(validate_device_placement(placement, -1).empty());
 }
 
-static void test_target_shard_plan_same_backend_split() {
+TEST_CASE(ServerUnitFixture, test_target_shard_plan_same_backend_split) {
     DevicePlacement placement;
     TEST_ASSERT(parse_placement_device_list("cuda:0,cuda:1,cuda:2", placement));
 
@@ -1983,7 +1965,7 @@ static void test_target_shard_plan_same_backend_split() {
     TEST_ASSERT(plan.remote_backend == PlacementBackend::Cuda);
 }
 
-static void test_target_shard_plan_mixed_backend_split() {
+TEST_CASE(ServerUnitFixture, test_target_shard_plan_mixed_backend_split) {
     DevicePlacement placement;
     TEST_ASSERT(parse_placement_device_list("cuda:0,cuda:1,hip:0,hip:1", placement));
 
@@ -1994,7 +1976,7 @@ static void test_target_shard_plan_mixed_backend_split() {
     TEST_ASSERT(plan.remote_backend == PlacementBackend::Hip);
 }
 
-static void test_target_shard_plan_rejects_bad_local_backend() {
+TEST_CASE(ServerUnitFixture, test_target_shard_plan_rejects_bad_local_backend) {
     DevicePlacement placement;
     TEST_ASSERT(parse_placement_device_list("cuda:0,hip:0", placement));
 
@@ -2008,7 +1990,7 @@ static bool kvflash_test_sync_identity(KvFlashPager & pager, int committed) {
         pager, committed, pager.pool_tokens(), "test-target-split");
 }
 
-static void test_kvflash_pager_identity_sync_contract() {
+TEST_CASE(ServerUnitFixture, test_kvflash_pager_identity_sync_contract) {
     KvFlashConfig cfg;
     cfg.pool_tokens = 512;
 
@@ -2034,7 +2016,7 @@ static void test_kvflash_pager_identity_sync_contract() {
     TEST_ASSERT(local.slot_of(127) == 127);
 }
 
-static void test_layer_split_kvflash_history_contract() {
+TEST_CASE(ServerUnitFixture, test_layer_split_kvflash_history_contract) {
     std::vector<int32_t> history;
     layer_split_kvflash_sync_history(history, {1, 2, 3}, 0);
     TEST_ASSERT((history == std::vector<int32_t>{1, 2, 3}));
@@ -2066,7 +2048,7 @@ static void test_layer_split_kvflash_history_contract() {
     TEST_ASSERT((history == std::vector<int32_t>{0, 0, 0}));
 }
 
-static void test_backend_precision_cuda_sm_policy() {
+TEST_CASE(ServerUnitFixture, test_backend_precision_cuda_sm_policy) {
     TEST_ASSERT(select_cuda_backend_precision_type_for_sm(90) == GGML_TYPE_BF16);
     TEST_ASSERT(select_cuda_backend_precision_type_for_sm(80) == GGML_TYPE_BF16);
     TEST_ASSERT(select_cuda_backend_precision_type_for_sm(75) == GGML_TYPE_F16);
@@ -2077,7 +2059,7 @@ static void test_backend_precision_cuda_sm_policy() {
     TEST_ASSERT(select_cuda_backend_precision_type_for_sm(52) == GGML_TYPE_F32);
 }
 
-static void test_backend_precision_hip_arch_policy() {
+TEST_CASE(ServerUnitFixture, test_backend_precision_hip_arch_policy) {
     TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx90a") == GGML_TYPE_BF16);
     TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx942") == GGML_TYPE_BF16);
     TEST_ASSERT(select_hip_activation_precision_type_for_arch("gfx950") == GGML_TYPE_BF16);
@@ -2089,7 +2071,7 @@ static void test_backend_precision_hip_arch_policy() {
     TEST_ASSERT(select_hip_activation_precision_type_for_arch("") == GGML_TYPE_F32);
 }
 
-static void test_backend_precision_activation_type_combine() {
+TEST_CASE(ServerUnitFixture, test_backend_precision_activation_type_combine) {
     TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_BF16, GGML_TYPE_BF16) == GGML_TYPE_BF16);
     TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_BF16, GGML_TYPE_F16) == GGML_TYPE_F16);
     TEST_ASSERT(combine_activation_precision_types(GGML_TYPE_F16, GGML_TYPE_BF16) == GGML_TYPE_F16);
@@ -2209,7 +2191,7 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     void shutdown() override { shutdown_calls++; }
 };
 
-static void test_layer_split_backend_inline_snapshot_and_restore_delta() {
+TEST_CASE(ServerUnitFixture, test_layer_split_backend_inline_snapshot_and_restore_delta) {
     auto * raw = new MockLayerSplitAdapter();
     LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
 
@@ -2253,7 +2235,7 @@ static void test_layer_split_backend_inline_snapshot_and_restore_delta() {
     TEST_ASSERT(raw->dflash_last == 99);
 }
 
-static void test_layer_split_backend_sampling_capability_gate() {
+TEST_CASE(ServerUnitFixture, test_layer_split_backend_sampling_capability_gate) {
     {
         auto * raw = new MockLayerSplitAdapter();
         LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
@@ -2290,7 +2272,7 @@ static void test_layer_split_backend_sampling_capability_gate() {
     }
 }
 
-static void test_layer_split_backend_chunks_prefill_by_adapter_limit() {
+TEST_CASE(ServerUnitFixture, test_layer_split_backend_chunks_prefill_by_adapter_limit) {
     auto * raw = new MockLayerSplitAdapter();
     raw->prefill_chunk = 3;
     LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
@@ -2312,7 +2294,7 @@ static void test_layer_split_backend_chunks_prefill_by_adapter_limit() {
     TEST_ASSERT(raw->prefill_sizes[2] == 2);
 }
 
-static void test_layer_split_compress_nopark_uses_default_drafter_path() {
+TEST_CASE(ServerUnitFixture, test_layer_split_compress_nopark_uses_default_drafter_path) {
     const std::string ids_path = "/tmp/dflash_test_layer_split_compress_ids.bin";
     unlink(ids_path.c_str());
     TEST_ASSERT(write_int32_file(ids_path, {1, 2, 3, 4}));
@@ -2332,7 +2314,7 @@ static void test_layer_split_compress_nopark_uses_default_drafter_path() {
     unlink(ids_path.c_str());
 }
 
-static void test_layer_split_compress_rejects_bad_keep_ratio() {
+TEST_CASE(ServerUnitFixture, test_layer_split_compress_rejects_bad_keep_ratio) {
     const std::string ids_path = "/tmp/dflash_test_layer_split_compress_bad.bin";
     unlink(ids_path.c_str());
     TEST_ASSERT(write_int32_file(ids_path, {1, 2, 3, 4}));
@@ -2348,7 +2330,7 @@ static void test_layer_split_compress_rejects_bad_keep_ratio() {
     unlink(ids_path.c_str());
 }
 
-static void test_layer_split_backend_shutdown_is_idempotent() {
+TEST_CASE(ServerUnitFixture, test_layer_split_backend_shutdown_is_idempotent) {
     auto * raw = new MockLayerSplitAdapter();
     LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
     backend.shutdown();
@@ -2356,7 +2338,7 @@ static void test_layer_split_backend_shutdown_is_idempotent() {
     TEST_ASSERT(raw->shutdown_calls == 1);
 }
 
-static void test_layer_split_backend_capability_proxy() {
+TEST_CASE(ServerUnitFixture, test_layer_split_backend_capability_proxy) {
     auto * raw = new MockLayerSplitAdapter();
     LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
 
@@ -2469,7 +2451,7 @@ static void rm_rf(const std::string & path) {
     rmdir(path.c_str());
 }
 
-static void test_disk_cache_config_defaults() {
+TEST_CASE(ServerUnitFixture, test_disk_cache_config_defaults) {
     DiskCacheConfig cfg;
     TEST_ASSERT(cfg.cache_dir.empty());
     TEST_ASSERT(cfg.budget_bytes == (size_t)4 * 1024 * 1024 * 1024);
@@ -2478,7 +2460,7 @@ static void test_disk_cache_config_defaults() {
     TEST_ASSERT(cfg.cold_max_tokens == 10240);
 }
 
-static void test_disk_cache_policy_parse() {
+TEST_CASE(ServerUnitFixture, test_disk_cache_policy_parse) {
     DiskPrefixCachePolicy policy;
     TEST_ASSERT(parse_disk_prefix_cache_policy("off", policy));
     TEST_ASSERT(policy.mode == DiskPrefixCacheMode::Off);
@@ -2501,7 +2483,7 @@ static void test_disk_cache_policy_parse() {
 // BUG-A: apply_request_scope_override must preserve server-level compress flag.
 // A request-level scope override (e.g. "auto") must NOT clear compress=true
 // that was set by the server configuration.
-static void test_scope_override_preserves_compress() {
+TEST_CASE(ServerUnitFixture, test_scope_override_preserves_compress) {
     // Server policy: compress=true, mode=Full.
     DiskPrefixCachePolicy server;
     server.mode = DiskPrefixCacheMode::Full;
@@ -2540,7 +2522,7 @@ static void test_scope_override_preserves_compress() {
     TEST_ASSERT(server4.mode == DiskPrefixCacheMode::Full);
 }
 
-static void test_disk_cache_fixed_boundary() {
+TEST_CASE(ServerUnitFixture, test_disk_cache_fixed_boundary) {
     DiskPrefixCachePolicy policy;
     TEST_ASSERT(parse_disk_prefix_cache_policy("1000", policy));
     TEST_ASSERT(disk_prefix_cache_fixed_boundary(policy, 2000) == 1000);
@@ -2549,7 +2531,7 @@ static void test_disk_cache_fixed_boundary() {
     TEST_ASSERT(disk_prefix_cache_fixed_boundary(policy, 2000, 1000) == 1000);
 }
 
-static void test_disk_cache_auto_boundary_lcp() {
+TEST_CASE(ServerUnitFixture, test_disk_cache_auto_boundary_lcp) {
     std::vector<int32_t> current{1, 2, 3, 4, 5, 9};
     std::vector<std::vector<int32_t>> recent{
         {1, 2, 3, 4, 8},
@@ -2567,7 +2549,7 @@ static void test_disk_cache_auto_boundary_lcp() {
         current, recent, 2, safe_boundaries, 5) == 0);
 }
 
-static void test_disk_cache_auto_window_limits_history() {
+TEST_CASE(ServerUnitFixture, test_disk_cache_auto_window_limits_history) {
     std::vector<int32_t> current{1, 2, 3, 4, 5};
     std::vector<std::vector<int32_t>> recent{
         {9},
@@ -2584,7 +2566,7 @@ static void test_disk_cache_auto_window_limits_history() {
         current, recent, 0, {}, 2) == 0);
 }
 
-static void test_disk_cache_disabled_when_no_dir() {
+TEST_CASE(ServerUnitFixture, test_disk_cache_disabled_when_no_dir) {
     MockBackend backend;
     DiskCacheConfig cfg;
     cfg.cache_dir = "";
@@ -2596,7 +2578,7 @@ static void test_disk_cache_disabled_when_no_dir() {
     TEST_ASSERT(!cache.save(0, ids));
 }
 
-static void test_disk_cache_init_creates_directory() {
+TEST_CASE(ServerUnitFixture, test_disk_cache_init_creates_directory) {
     MockBackend backend;
     std::string dir = "/tmp/dflash_test_disk_cache_init";
     rm_rf(dir);
@@ -2614,13 +2596,13 @@ static void test_disk_cache_init_creates_directory() {
     rm_rf(dir);
 }
 
-static void test_disk_cache_header_size() {
+TEST_CASE(ServerUnitFixture, test_disk_cache_header_size) {
     // The header should be exactly 80 bytes.
     TEST_ASSERT(DISK_CACHE_HEADER_SIZE == 80);
     TEST_ASSERT(DISK_CACHE_VERSION == 1);
 }
 
-static void test_disk_cache_header_round_trip() {
+TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
     // Write and read a header to verify serialization.
     std::string path = "/tmp/dflash_test_header_rt.dkv";
     unlink(path.c_str());
@@ -2685,7 +2667,7 @@ static void test_disk_cache_header_round_trip() {
     unlink(path.c_str());
 }
 
-static void test_disk_cache_continued_boundary() {
+TEST_CASE(ServerUnitFixture, test_disk_cache_continued_boundary) {
     // Test maybe_store_continued logic: saves at interval boundaries.
     MockBackend backend;
     std::string dir = "/tmp/dflash_test_continued";
@@ -2715,7 +2697,7 @@ static void test_disk_cache_continued_boundary() {
     rm_rf(dir);
 }
 
-static void test_disk_cache_continued_interval_logic() {
+TEST_CASE(ServerUnitFixture, test_disk_cache_continued_interval_logic) {
     // Verify the continued boundary math independently.
     // Target = (cur_pos / interval) * interval
     // Only fires when target > last_store_pos AND target >= min_tokens.
@@ -2747,7 +2729,7 @@ static void test_disk_cache_continued_interval_logic() {
     (void)min_tokens;
 }
 
-static void test_disk_cache_cold_prefix_short_prompt() {
+TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_short_prompt) {
     // Cold prefix should not trigger for short prompts.
     MockBackend backend;
     std::string dir = "/tmp/dflash_test_cold_short";
@@ -2768,7 +2750,7 @@ static void test_disk_cache_cold_prefix_short_prompt() {
     rm_rf(dir);
 }
 
-static void test_disk_cache_cold_prefix_no_boundaries() {
+TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_no_boundaries) {
     // Cold prefix should not trigger if no boundaries provided.
     MockBackend backend;
     std::string dir = "/tmp/dflash_test_cold_nobound";
@@ -2788,7 +2770,7 @@ static void test_disk_cache_cold_prefix_no_boundaries() {
     rm_rf(dir);
 }
 
-static void test_disk_cache_cold_prefix_finds_boundary() {
+TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_finds_boundary) {
     // Cold prefix should find the last boundary <= cold_max_tokens.
     MockBackend backend;
     std::string dir = "/tmp/dflash_test_cold_finds";
@@ -2813,7 +2795,7 @@ static void test_disk_cache_cold_prefix_finds_boundary() {
     rm_rf(dir);
 }
 
-static void test_disk_cache_budget_enforcement_scoring() {
+TEST_CASE(ServerUnitFixture, test_disk_cache_budget_enforcement_scoring) {
     // Test that eviction scoring prefers lower-value entries.
     // score = (hits+1) * token_count / file_size
     // Entry with fewer tokens + fewer hits should have lower score.
@@ -2838,7 +2820,7 @@ static void test_disk_cache_budget_enforcement_scoring() {
     TEST_ASSERT(score_b_ancient > score_a);
 }
 
-static void test_disk_cache_lookup_miss_no_layout() {
+TEST_CASE(ServerUnitFixture, test_disk_cache_lookup_miss_no_layout) {
     // Lookup with no layout known should return false.
     MockBackend backend;
     std::string dir = "/tmp/dflash_test_lookup_miss";
@@ -2855,7 +2837,7 @@ static void test_disk_cache_lookup_miss_no_layout() {
     rm_rf(dir);
 }
 
-static void test_disk_cache_save_below_min_tokens() {
+TEST_CASE(ServerUnitFixture, test_disk_cache_save_below_min_tokens) {
     // Save with fewer tokens than min_tokens should be rejected.
     MockBackend backend;
     std::string dir = "/tmp/dflash_test_save_below";
@@ -2911,7 +2893,7 @@ static std::array<uint8_t, 16> read_layout_id_from_cache_dir(const std::string &
     return id;
 }
 
-static void test_disk_identity_salt_changes_layout_id() {
+TEST_CASE(ServerUnitFixture, test_disk_identity_salt_changes_layout_id) {
     MockBackendWithLayout backend;
     std::vector<int32_t> prompt;
     for (int i = 0; i < 10; ++i) prompt.push_back(i + 1);
@@ -2971,7 +2953,7 @@ static void test_disk_identity_salt_changes_layout_id() {
     rm_rf(dir_a2);
 }
 
-static void test_disk_identity_salt_zero_is_backcompat() {
+TEST_CASE(ServerUnitFixture, test_disk_identity_salt_zero_is_backcompat) {
     // Explicit all-zero salt must produce the same layout_id as no salt call
     // (default-constructed identity_salt_ is already all-zero).
     MockBackendWithLayout backend;
@@ -3009,7 +2991,7 @@ static void test_disk_identity_salt_zero_is_backcompat() {
     rm_rf(dir2);
 }
 
-static void test_backend_ipc_rejects_file_work_dir() {
+TEST_CASE(ServerUnitFixture, test_backend_ipc_rejects_file_work_dir) {
     const std::string file_path = "/tmp/dflash_test_backend_ipc_work_dir_file";
     unlink(file_path.c_str());
     int fd = open(file_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0600);
@@ -3031,7 +3013,7 @@ static void test_backend_ipc_rejects_file_work_dir() {
     unlink(file_path.c_str());
 }
 
-static void test_backend_ipc_payload_pipe_round_trip() {
+TEST_CASE(ServerUnitFixture, test_backend_ipc_payload_pipe_round_trip) {
     int payload_pipe[2] = {-1, -1};
     int status_pipe[2] = {-1, -1};
     TEST_ASSERT(pipe(payload_pipe) == 0);
@@ -3070,7 +3052,7 @@ static void test_backend_ipc_payload_pipe_round_trip() {
     close(status_pipe[0]);
 }
 
-static void test_backend_ipc_payload_transport_parse() {
+TEST_CASE(ServerUnitFixture, test_backend_ipc_payload_transport_parse) {
     BackendIpcMode mode = BackendIpcMode::DFlashDraft;
     TEST_ASSERT(parse_backend_ipc_mode("dflash-draft", mode));
     TEST_ASSERT(mode == BackendIpcMode::DFlashDraft);
@@ -3095,7 +3077,7 @@ static void test_backend_ipc_payload_transport_parse() {
         "stream") == 0);
 }
 
-static void test_backend_ipc_payload_bounds() {
+TEST_CASE(ServerUnitFixture, test_backend_ipc_payload_bounds) {
     size_t out = 0;
     TEST_ASSERT(backend_ipc_checked_add_size(4, 8, out));
     TEST_ASSERT(out == 12);
@@ -3108,7 +3090,7 @@ static void test_backend_ipc_payload_bounds() {
         std::numeric_limits<size_t>::max(), 1, 16));
 }
 
-static void test_backend_ipc_shared_payload_map_sizing() {
+TEST_CASE(ServerUnitFixture, test_backend_ipc_shared_payload_map_sizing) {
     size_t map_bytes = 0;
     TEST_ASSERT(backend_ipc_shared_payload_map_bytes(1024, map_bytes));
     TEST_ASSERT(map_bytes == 1024 + backend_ipc_shared_payload_header_bytes());
@@ -3123,7 +3105,7 @@ static void test_backend_ipc_shared_payload_map_sizing() {
         std::numeric_limits<size_t>::max(), map_bytes));
 }
 
-static void test_backend_ipc_shared_payload_segment_contract() {
+TEST_CASE(ServerUnitFixture, test_backend_ipc_shared_payload_segment_contract) {
     const BackendIpcPayloadSegment a{reinterpret_cast<const void *>(1), 16};
     const BackendIpcPayloadSegment b{reinterpret_cast<const void *>(2), 32};
     const BackendIpcPayloadSegment segments[] = {a, b};
@@ -3136,13 +3118,13 @@ static void test_backend_ipc_shared_payload_segment_contract() {
     TEST_ASSERT(!backend_ipc_payload_in_bounds(0, total + 1, 48));
 }
 
-static void test_moe_hybrid_expert_compute_batch_default() {
+TEST_CASE(ServerUnitFixture, test_moe_hybrid_expert_compute_batch_default) {
     dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_BATCH");
     dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_BATCH_MAX");
     TEST_ASSERT(moe_hybrid_expert_compute_batch_limit() == 32);
 }
 
-static void test_moe_hybrid_expert_compute_ipc_mode_batch_limit() {
+TEST_CASE(ServerUnitFixture, test_moe_hybrid_expert_compute_ipc_mode_batch_limit) {
     dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE");
     dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY");
     TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 1024);
@@ -3161,7 +3143,7 @@ static void test_moe_hybrid_expert_compute_ipc_mode_batch_limit() {
     dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY");
 }
 
-static void test_moe_hybrid_prefill_hot_sub_batch_limit() {
+TEST_CASE(ServerUnitFixture, test_moe_hybrid_prefill_hot_sub_batch_limit) {
     dflash_unsetenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH");
     TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 4);
 
@@ -3181,7 +3163,7 @@ static void test_moe_hybrid_prefill_hot_sub_batch_limit() {
 // Sampler tests (model-independent, CPU-only)
 // ═══════════════════════════════════════════════════════════════════════
 
-static void test_sampler_cfg_defaults() {
+TEST_CASE(ServerUnitFixture, test_sampler_cfg_defaults) {
     SamplerCfg cfg;
     TEST_ASSERT(cfg.temp == 0.0f);
     TEST_ASSERT(cfg.top_p == 1.0f);
@@ -3193,7 +3175,7 @@ static void test_sampler_cfg_defaults() {
     TEST_ASSERT(cfg.pres_pen == 0.0f);
 }
 
-static void test_sampler_greedy_argmax() {
+TEST_CASE(ServerUnitFixture, test_sampler_greedy_argmax) {
     // With temp=0 logic, caller uses argmax. But sample_logits with very
     // low temp should still pick the highest logit token reliably.
     float logits[] = {1.0f, 5.0f, 2.0f, 3.0f, 0.5f};
@@ -3206,7 +3188,7 @@ static void test_sampler_greedy_argmax() {
     TEST_ASSERT(tok == 1);  // token 1 has logit 5.0 (highest)
 }
 
-static void test_sampler_temperature_affects_distribution() {
+TEST_CASE(ServerUnitFixture, test_sampler_temperature_affects_distribution) {
     // High temperature should spread probability; verify by sampling many
     // times and checking that non-top tokens appear.
     float logits[] = {0.0f, 1.0f, 0.0f, 0.0f, 0.0f};
@@ -3226,7 +3208,7 @@ static void test_sampler_temperature_affects_distribution() {
     TEST_ASSERT(counts[1] > 100); // token 1 still most likely
 }
 
-static void test_sampler_top_p_truncation() {
+TEST_CASE(ServerUnitFixture, test_sampler_top_p_truncation) {
     // With very low top_p, only the top token(s) should be selected.
     float logits[] = {0.0f, 10.0f, 0.0f, 0.0f, 0.0f};
     SamplerCfg cfg;
@@ -3241,7 +3223,7 @@ static void test_sampler_top_p_truncation() {
     }
 }
 
-static void test_sampler_top_k_truncation() {
+TEST_CASE(ServerUnitFixture, test_sampler_top_k_truncation) {
     // top_k=2 should limit candidates to the top 2.
     float logits[] = {1.0f, 5.0f, 3.0f, 0.0f, 0.0f};
     SamplerCfg cfg;
@@ -3263,7 +3245,7 @@ static void test_sampler_top_k_truncation() {
     TEST_ASSERT(counts[2] > 0);
 }
 
-static void test_sampler_repetition_penalty() {
+TEST_CASE(ServerUnitFixture, test_sampler_repetition_penalty) {
     // Multiplicative rep_pen should reduce probability of repeated tokens.
     float logits[] = {3.0f, 3.0f, 3.0f, 3.0f};
     SamplerCfg cfg;
@@ -3281,7 +3263,7 @@ static void test_sampler_repetition_penalty() {
     TEST_ASSERT(counts[2] + counts[3] > counts[0] + counts[1]);
 }
 
-static void test_sampler_frequency_penalty() {
+TEST_CASE(ServerUnitFixture, test_sampler_frequency_penalty) {
     // freq_pen subtracts freq_pen * count(token) from logits.
     // Token 0 appears 5 times → logit reduced by 5*1.0 = 5.0
     float logits[] = {5.0f, 5.0f, 5.0f, 5.0f};
@@ -3303,7 +3285,7 @@ static void test_sampler_frequency_penalty() {
     TEST_ASSERT(counts[0] < counts[1]);
 }
 
-static void test_sampler_presence_penalty() {
+TEST_CASE(ServerUnitFixture, test_sampler_presence_penalty) {
     // pres_pen subtracts pres_pen * 1(appeared) from logits.
     float logits[] = {5.0f, 5.0f, 5.0f, 5.0f};
     SamplerCfg cfg;
@@ -3321,7 +3303,7 @@ static void test_sampler_presence_penalty() {
     TEST_ASSERT(counts[2] + counts[3] > counts[0] + counts[1]);
 }
 
-static void test_sampler_freq_and_pres_combined() {
+TEST_CASE(ServerUnitFixture, test_sampler_freq_and_pres_combined) {
     // Both penalties applied together.
     float logits[] = {5.0f, 5.0f, 5.0f};
     SamplerCfg cfg;
@@ -3344,7 +3326,7 @@ static void test_sampler_freq_and_pres_combined() {
     TEST_ASSERT(counts[1] > counts[0]);
 }
 
-static void test_sampler_negative_frequency_penalty() {
+TEST_CASE(ServerUnitFixture, test_sampler_negative_frequency_penalty) {
     // Negative freq_pen should encourage repetition.
     float logits[] = {3.0f, 3.0f, 3.0f};
     SamplerCfg cfg;
@@ -3363,7 +3345,7 @@ static void test_sampler_negative_frequency_penalty() {
     TEST_ASSERT(counts[0] > counts[2]);
 }
 
-static void test_sampler_seed_reproducibility() {
+TEST_CASE(ServerUnitFixture, test_sampler_seed_reproducibility) {
     // Same seed should produce identical sequences.
     float logits[] = {1.0f, 2.0f, 3.0f, 2.0f, 1.0f};
     SamplerCfg cfg;
@@ -3380,7 +3362,7 @@ static void test_sampler_seed_reproducibility() {
     }
 }
 
-static void test_sampler_rep_window_limits_scope() {
+TEST_CASE(ServerUnitFixture, test_sampler_rep_window_limits_scope) {
     // With rep_window=2, only the last 2 history tokens should be penalized.
     float logits[] = {5.0f, 5.0f, 5.0f, 5.0f};
     SamplerCfg cfg;
@@ -3400,7 +3382,7 @@ static void test_sampler_rep_window_limits_scope() {
     TEST_ASSERT(counts[0] + counts[1] > counts[2] + counts[3]);
 }
 
-static void test_parse_sampler_token_basic() {
+TEST_CASE(ServerUnitFixture, test_parse_sampler_token_basic) {
     std::string line = "gen 128 samp=0.7,0.9,40,1.1,42";
     SamplerCfg cfg;
     TEST_ASSERT(parse_sampler_token(line, cfg));
@@ -3414,7 +3396,7 @@ static void test_parse_sampler_token_basic() {
     TEST_ASSERT(cfg.pres_pen == 0.0f);
 }
 
-static void test_parse_sampler_token_with_penalties() {
+TEST_CASE(ServerUnitFixture, test_parse_sampler_token_with_penalties) {
     std::string line = "gen 64 samp=0.5,0.95,20,1.0,0,0.8,1.2";
     SamplerCfg cfg;
     TEST_ASSERT(parse_sampler_token(line, cfg));
@@ -3428,7 +3410,7 @@ static void test_parse_sampler_token_with_penalties() {
     TEST_ASSERT(std::abs(cfg.pres_pen - 1.2f) < 1e-5f);
 }
 
-static void test_parse_sampler_token_minimal() {
+TEST_CASE(ServerUnitFixture, test_parse_sampler_token_minimal) {
     // Only temp specified.
     std::string line = "gen 32 samp=0.3";
     SamplerCfg cfg;
@@ -3441,14 +3423,14 @@ static void test_parse_sampler_token_minimal() {
     TEST_ASSERT(cfg.pres_pen == 0.0f);
 }
 
-static void test_parse_sampler_token_no_samp() {
+TEST_CASE(ServerUnitFixture, test_parse_sampler_token_no_samp) {
     std::string line = "gen 128";
     SamplerCfg cfg;
     TEST_ASSERT(!parse_sampler_token(line, cfg));
     TEST_ASSERT(line == "gen 128");  // unchanged
 }
 
-static void test_sampler_temp_zero_with_penalties_uses_argmax() {
+TEST_CASE(ServerUnitFixture, test_sampler_temp_zero_with_penalties_uses_argmax) {
     // temp=0 + penalties should apply penalties then return argmax (deterministic).
     float logits[] = {5.0f, 5.0f, 5.0f, 5.0f};
     SamplerCfg cfg;
@@ -3469,7 +3451,7 @@ static void test_sampler_temp_zero_with_penalties_uses_argmax() {
     }
 }
 
-static void test_sampler_needs_logit_processing() {
+TEST_CASE(ServerUnitFixture, test_sampler_needs_logit_processing) {
     SamplerCfg cfg;
     TEST_ASSERT(!cfg.needs_logit_processing());  // all defaults → no processing
 
@@ -3516,7 +3498,7 @@ static ServerConfig make_props_config_with_sidecar(const json & sidecar) {
     return cfg;
 }
 
-static void test_props_model_card_wholesale_sidecar() {
+TEST_CASE(ServerUnitFixture, test_props_model_card_wholesale_sidecar) {
     // When a sidecar was loaded, /props.model_card should be the parsed
     // sidecar JSON verbatim — *all* fields from the file, not just the
     // five budget-derived ones from the pre-refactor shape.
@@ -3564,7 +3546,7 @@ static void test_props_model_card_wholesale_sidecar() {
     TEST_ASSERT(!body["model_card"].contains("hard_limit_reply_budget"));
 }
 
-static void test_props_model_card_null_on_family_fallback() {
+TEST_CASE(ServerUnitFixture, test_props_model_card_null_on_family_fallback) {
     // When family or hard fallback was used (no sidecar), /props.model_card
     // is JSON null. The budget_envelope still carries the resolved values.
     ServerConfig cfg;
@@ -3588,7 +3570,7 @@ static void test_props_model_card_null_on_family_fallback() {
     TEST_ASSERT(body["budget_envelope"]["default_max_tokens"].get<int>() == 32768);
 }
 
-static void test_props_budget_envelope_shape() {
+TEST_CASE(ServerUnitFixture, test_props_budget_envelope_shape) {
     // budget_envelope is always present with all five fields and the
     // expected effort_tiers vocabulary (low|medium|high|x-high|max).
     // Values mirror ServerConfig regardless of what the sidecar carried.
@@ -3641,7 +3623,7 @@ static void test_props_budget_envelope_shape() {
 // Snapshot/bench tooling reads /props.runtime wholesale into
 // result.json.server_info; this test pins the field set so additions
 // elsewhere don't accidentally drop a knob we depend on for forensics.
-static void test_props_runtime_shape() {
+TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     ServerConfig cfg = make_props_config_with_sidecar(json{
         {"name", "Qwen3.6 27B"},
         {"source", "https://huggingface.co/Qwen/Qwen3.6-27B"},
@@ -3690,7 +3672,7 @@ static void test_props_runtime_shape() {
 // response shapes plus the zero-decode_s div-by-zero guard.
 // ═══════════════════════════════════════════════════════════════════════
 
-static void test_usage_timings_openai_chat_streaming() {
+TEST_CASE(ServerUnitFixture, test_usage_timings_openai_chat_streaming) {
     // OpenAI Chat streaming: the terminal usage chunk (just before
     // data: [DONE]) carries `timings.{prefill_ms, decode_ms,
     // decode_tokens_per_sec}` when timings are passed to emit_finish.
@@ -3710,7 +3692,7 @@ static void test_usage_timings_openai_chat_streaming() {
     TEST_ASSERT(finish_str.find("[DONE]") != std::string::npos);
 }
 
-static void test_usage_timings_anthropic_streaming() {
+TEST_CASE(ServerUnitFixture, test_usage_timings_anthropic_streaming) {
     // Anthropic streaming: message_delta.usage gains a `timings`
     // sibling alongside `output_tokens`.
     auto em = make_emitter(ApiFormat::ANTHROPIC);
@@ -3727,7 +3709,7 @@ static void test_usage_timings_anthropic_streaming() {
     TEST_ASSERT(finish_str.find("\"decode_tokens_per_sec\":20.0") != std::string::npos);
 }
 
-static void test_usage_timings_responses_streaming() {
+TEST_CASE(ServerUnitFixture, test_usage_timings_responses_streaming) {
     // Responses streaming: response.completed.usage gains `timings`.
     auto em = make_emitter(ApiFormat::RESPONSES);
     em.emit_start();
@@ -3743,7 +3725,7 @@ static void test_usage_timings_responses_streaming() {
     TEST_ASSERT(finish_str.find("\"decode_tokens_per_sec\":25.0") != std::string::npos);
 }
 
-static void test_usage_timings_zero_decode_no_div_by_zero() {
+TEST_CASE(ServerUnitFixture, test_usage_timings_zero_decode_no_div_by_zero) {
     // decode_s == 0 (prefill-only / no tokens generated path): emit
     // decode_tokens_per_sec = 0.0 without div-by-zero.
     GenTimings t{0.123, 0.0};
@@ -3763,7 +3745,7 @@ static void test_usage_timings_zero_decode_no_div_by_zero() {
     TEST_ASSERT(finish_str.find("nan") == std::string::npos);
 }
 
-static void test_usage_timings_omitted_when_null() {
+TEST_CASE(ServerUnitFixture, test_usage_timings_omitted_when_null) {
     // Backward compat: emit_finish(n) (no timings) emits the legacy
     // usage block — no `timings` key. Guards the SDK-facing default
     // for callers that don't yet wire timings through.
@@ -3825,7 +3807,7 @@ struct EmptySpecRetryBackend : MockBackend {
     }
 };
 
-static void test_model_backend_retries_empty_spec_generate_once_with_ar() {
+TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_spec_generate_once_with_ar) {
     EmptySpecRetryBackend backend;
     GenerateRequest req;
     req.prompt = {1, 2, 3};
@@ -3842,7 +3824,7 @@ static void test_model_backend_retries_empty_spec_generate_once_with_ar() {
     TEST_ASSERT(backend.generate_saw_force_ar);
 }
 
-static void test_model_backend_retries_empty_spec_restore_once_with_ar() {
+TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_spec_restore_once_with_ar) {
     EmptySpecRetryBackend backend;
     GenerateRequest req;
     req.prompt = {1, 2, 3};
@@ -3860,7 +3842,7 @@ static void test_model_backend_retries_empty_spec_restore_once_with_ar() {
     TEST_ASSERT(backend.restore_saw_force_ar);
 }
 
-static void test_model_backend_retries_empty_visible_spec_generate_once_with_ar() {
+TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_visible_spec_generate_once_with_ar) {
     EmptySpecRetryBackend backend;
     backend.generate_first_empty_visible = true;
     GenerateRequest req;
@@ -3879,7 +3861,7 @@ static void test_model_backend_retries_empty_visible_spec_generate_once_with_ar(
     TEST_ASSERT(backend.generate_saw_force_ar);
 }
 
-static void test_model_backend_retries_empty_visible_spec_restore_once_with_ar() {
+TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_visible_spec_restore_once_with_ar) {
     EmptySpecRetryBackend backend;
     backend.restore_first_empty_visible = true;
     GenerateRequest req;
@@ -3901,18 +3883,18 @@ static void test_model_backend_retries_empty_visible_spec_restore_once_with_ar()
 // GenerateResult.accept_rate plumbing tests (Day 1 of bandit MVP)
 // ═══════════════════════════════════════════════════════════════════════
 
-static void test_generate_result_accept_rate_defaults_to_zero() {
+TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_defaults_to_zero) {
     GenerateResult r;
     TEST_ASSERT(r.accept_rate == 0.0f);
 }
 
-static void test_generate_result_accept_rate_can_be_set() {
+TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_can_be_set) {
     GenerateResult r;
     r.accept_rate = 0.85f;
     TEST_ASSERT(r.accept_rate == 0.85f);
 }
 
-static void test_generate_result_accept_rate_bounds() {
+TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_bounds) {
     GenerateResult r;
     r.accept_rate = 0.0f;
     TEST_ASSERT(r.accept_rate >= 0.0f && r.accept_rate <= 1.0f);
@@ -3920,7 +3902,7 @@ static void test_generate_result_accept_rate_bounds() {
     TEST_ASSERT(r.accept_rate >= 0.0f && r.accept_rate <= 1.0f);
 }
 
-static void test_generate_result_accept_rate_in_usage_openai() {
+TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_in_usage_openai) {
     // Simulate the non-streaming OpenAI JSON response build.
     // Verify accept_rate flows from GenerateResult into usage block.
     GenerateResult result;
@@ -3944,7 +3926,7 @@ static void test_generate_result_accept_rate_in_usage_openai() {
     TEST_ASSERT(std::abs(resp["usage"]["accept_rate"].get<float>() - 0.75f) < 1e-6f);
 }
 
-static void test_generate_result_accept_rate_in_usage_anthropic() {
+TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_in_usage_anthropic) {
     GenerateResult result;
     result.succeed();
     result.tokens = {1, 2};
@@ -3964,7 +3946,7 @@ static void test_generate_result_accept_rate_in_usage_anthropic() {
     TEST_ASSERT(std::abs(resp["usage"]["accept_rate"].get<float>() - 0.60f) < 1e-6f);
 }
 
-static void test_generate_result_accept_rate_zero_when_no_spec_decode() {
+TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_zero_when_no_spec_decode) {
     // When spec decode doesn't run (no draft model), accept_rate stays 0.
     GenerateResult r;
     r.succeed();
@@ -3972,7 +3954,7 @@ static void test_generate_result_accept_rate_zero_when_no_spec_decode() {
     TEST_ASSERT(r.accept_rate == 0.0f);
 }
 
-static void test_generate_result_error_state_is_consistent() {
+TEST_CASE(ServerUnitFixture, test_generate_result_error_state_is_consistent) {
     GenerateResult result;
     TEST_ASSERT(!result.ok());
     TEST_ASSERT(result.error->code == GenerateErrorCode::Incomplete);
@@ -3995,7 +3977,7 @@ static void test_generate_result_error_state_is_consistent() {
 // normalize_system_for_cache — header-strip tests
 // ═══════════════════════════════════════════════════════════════════════
 
-static void test_normalize_strips_billing_header_anthropic_array() {
+TEST_CASE(ServerUnitFixture, test_normalize_strips_billing_header_anthropic_array) {
     // Anthropic system-as-array: one billing-header block + one real block.
     json system_blocks = json::array({
         {{"type", "text"},
@@ -4008,7 +3990,7 @@ static void test_normalize_strips_billing_header_anthropic_array() {
     TEST_ASSERT(out.find("helpful coding assistant") != std::string::npos);
 }
 
-static void test_normalize_strips_billing_header_openai_messages0() {
+TEST_CASE(ServerUnitFixture, test_normalize_strips_billing_header_openai_messages0) {
     // OpenAI messages[0] system containing the billing header in content.
     json messages = json::array({
         {{"role", "system"},
@@ -4020,7 +4002,7 @@ static void test_normalize_strips_billing_header_openai_messages0() {
     TEST_ASSERT(out.find("code reviewer") != std::string::npos);
 }
 
-static void test_normalize_idempotent_across_changing_header() {
+TEST_CASE(ServerUnitFixture, test_normalize_idempotent_across_changing_header) {
     // Two OpenAI messages arrays identical except the header turn value.
     // normalize_system_for_cache must return EQUAL strings for both.
     json messages_turn4 = json::array({
@@ -4038,7 +4020,7 @@ static void test_normalize_idempotent_across_changing_header() {
     TEST_ASSERT(out4 == out5);
 }
 
-static void test_normalize_preserves_legit_system_content() {
+TEST_CASE(ServerUnitFixture, test_normalize_preserves_legit_system_content) {
     // A normal system prompt containing no billing header must pass through unchanged.
     json messages = json::array({
         {{"role", "system"},
@@ -4049,7 +4031,7 @@ static void test_normalize_preserves_legit_system_content() {
     TEST_ASSERT(out == "You are an expert in C++ performance optimization.");
 }
 
-static void test_normalize_handles_leading_whitespace_header() {
+TEST_CASE(ServerUnitFixture, test_normalize_handles_leading_whitespace_header) {
     // Header block with leading whitespace must still be stripped.
     json system_blocks = json::array({
         {{"type", "text"},
@@ -4062,7 +4044,7 @@ static void test_normalize_handles_leading_whitespace_header() {
     TEST_ASSERT(out.find("Be concise.") != std::string::npos);
 }
 
-static void test_prefix_key_stable_across_header_change() {
+TEST_CASE(ServerUnitFixture, test_prefix_key_stable_across_header_change) {
     // Two /v1/chat/completions-style messages arrays differing ONLY in the
     // billing header value must normalize to EQUAL strings.
     json messages_a = json::array({
@@ -4084,7 +4066,7 @@ static void test_prefix_key_stable_across_header_change() {
 // FlowKV + disk-cache compose tests (T1–T7)
 
 // T4 (compress=false): policy name has no "+compress" suffix.
-static void test_flowkv_T4_compress_false_policy_name_no_suffix() {
+TEST_CASE(ServerUnitFixture, test_flowkv_T4_compress_false_policy_name_no_suffix) {
     DiskPrefixCachePolicy p;
     p.mode = DiskPrefixCacheMode::Full;
     p.compress = false;
@@ -4094,7 +4076,7 @@ static void test_flowkv_T4_compress_false_policy_name_no_suffix() {
 }
 
 // T4 (compress=true): policy name has "+compress" suffix.
-static void test_flowkv_T4_compress_true_policy_name_has_suffix() {
+TEST_CASE(ServerUnitFixture, test_flowkv_T4_compress_true_policy_name_has_suffix) {
     DiskPrefixCachePolicy p;
     p.mode = DiskPrefixCacheMode::Full;
     p.compress = true;
@@ -4114,13 +4096,13 @@ static void test_flowkv_T4_compress_true_policy_name_has_suffix() {
 }
 
 // T4: default DiskPrefixCachePolicy has compress=false (no-op).
-static void test_flowkv_T4_default_no_compress() {
+TEST_CASE(ServerUnitFixture, test_flowkv_T4_default_no_compress) {
     DiskPrefixCachePolicy p;
     TEST_ASSERT_MSG(!p.compress, "default compress must be false (byte-identical to pr364-base)");
 }
 
 // T6: frozen_block_key is deterministic — same tokens → same hash.
-static void test_flowkv_T6_frozen_block_key_deterministic() {
+TEST_CASE(ServerUnitFixture, test_flowkv_T6_frozen_block_key_deterministic) {
     std::vector<int32_t> ids = {10, 20, 30, 40, 50};
     PrefixHash k1 = frozen_block_key(ids.data(), 0, (int)ids.size());
     PrefixHash k2 = frozen_block_key(ids.data(), 0, (int)ids.size());
@@ -4128,7 +4110,7 @@ static void test_flowkv_T6_frozen_block_key_deterministic() {
 }
 
 // T6: frozen_block_key returns zero hash on empty slice.
-static void test_flowkv_T6_frozen_block_key_zero_on_empty() {
+TEST_CASE(ServerUnitFixture, test_flowkv_T6_frozen_block_key_zero_on_empty) {
     std::vector<int32_t> ids = {10, 20, 30};
     PrefixHash k = frozen_block_key(ids.data(), 2, 2);  // begin == end
     PrefixHash zero{};
@@ -4138,7 +4120,7 @@ static void test_flowkv_T6_frozen_block_key_zero_on_empty() {
 }
 
 // T6: distinct token content → distinct hashes.
-static void test_flowkv_T6_frozen_block_key_distinct_content() {
+TEST_CASE(ServerUnitFixture, test_flowkv_T6_frozen_block_key_distinct_content) {
     std::vector<int32_t> a = {1, 2, 3};
     std::vector<int32_t> b = {1, 2, 4};
     PrefixHash ka = frozen_block_key(a.data(), 0, 3);
@@ -4148,7 +4130,7 @@ static void test_flowkv_T6_frozen_block_key_distinct_content() {
 
 // T7: disk clamp — with compress=true, boundary should use system_end (first
 // safe boundary), not the full prompt.  Tested via the fixed-boundary logic.
-static void test_flowkv_T7_disk_clamp_system_end_boundary() {
+TEST_CASE(ServerUnitFixture, test_flowkv_T7_disk_clamp_system_end_boundary) {
     // Simulate: effective_prompt has a system_end at token 300.
     // The FlowKV disk-clamp should set fixed_tokens = system_end.
     // We test this by constructing a DiskPrefixCachePolicy and verifying that
@@ -4179,7 +4161,7 @@ static void test_flowkv_T7_disk_clamp_system_end_boundary() {
 
 // T3 (WS1): non-continuation messages JSON has no assistant role.
 // This tests the JSON shape that the is_continuation check reads.
-static void test_flowkv_T3_ws1_continuation_json_shape() {
+TEST_CASE(ServerUnitFixture, test_flowkv_T3_ws1_continuation_json_shape) {
     // Single user message: NOT a continuation.
     json msgs = json::array({
         {{"role", "system"}, {"content", "You are an assistant."}},
@@ -4215,7 +4197,7 @@ static void test_flowkv_T3_ws1_continuation_json_shape() {
 // T1 (head-verbatim): system_end is the FIRST boundary (boundary[0]).
 // Verifies the disk-clamp invariant: system_end = find_all_boundaries()[0].
 // Tests the boundary function returns a sane first boundary on a chat prompt.
-static void test_flowkv_T1_system_end_boundary_first() {
+TEST_CASE(ServerUnitFixture, test_flowkv_T1_system_end_boundary_first) {
     // Construct a synthetic token stream where chat markers appear at known
     // positions. find_all_boundaries uses prefix_cache_.chat_markers() which
     // are model-specific; test the boundary API directly.
@@ -4238,7 +4220,7 @@ static void test_flowkv_T1_system_end_boundary_first() {
 
 // T5 (inert-guard): aged_token_estimate < 512 → FlowKV-OFF.
 // Tests the guard constant and comparison logic.
-static void test_flowkv_T5_inert_guard_token_count() {
+TEST_CASE(ServerUnitFixture, test_flowkv_T5_inert_guard_token_count) {
     static constexpr int kFkvInertMinTokens = 512;
     // Below threshold: FlowKV should not fire.
     TEST_ASSERT(400 < kFkvInertMinTokens);
@@ -4325,7 +4307,7 @@ static std::string write_qwen3_drafter_fixture_gguf() {
     return path;
 }
 
-static void test_qwen3_drafter_rejects_truncated_gguf() {
+TEST_CASE(ServerUnitFixture, test_qwen3_drafter_rejects_truncated_gguf) {
     const std::string path = write_qwen3_drafter_fixture_gguf();
 
     ggml_backend_t backend = ggml_backend_cpu_init();
@@ -4370,7 +4352,7 @@ static void test_qwen3_drafter_rejects_truncated_gguf() {
 // past the mapping (#438), without wrongly rejecting valid files (#318). These
 // tests pin the boundary and, critically, the size_t overflow behaviour that a
 // naive `data_off + tensor_off + tensor_sz > file_size` test gets wrong.
-static void test_gguf_tensor_in_file_bounds() {
+TEST_CASE(ServerUnitFixture, test_gguf_tensor_in_file_bounds) {
     // Typical layout: 100-byte header/kv, 900-byte data section, 1000-byte file.
     const size_t data_off = 100;
     const size_t file     = 1000;
@@ -4405,7 +4387,7 @@ static void test_gguf_tensor_in_file_bounds() {
     TEST_ASSERT(!gguf_tensor_in_file(kMax, 10, 10, file));         // huge data_off
 }
 
-static void test_gguf_bounds_error_reports_operands() {
+TEST_CASE(ServerUnitFixture, test_gguf_bounds_error_reports_operands) {
     // A normal (non-overflowing) rejection: the message must surface every
     // operand so a false positive on a valid file (#318) is diagnosable.
     const std::string e = gguf_bounds_error("target GGUF", "blk.56.ssm_out.weight",
@@ -4430,295 +4412,4 @@ static void test_gguf_bounds_error_reports_operands() {
     const std::string o = gguf_bounds_error("target GGUF", "t", "f32",
                                             kMax, 10, 10, 100);
     TEST_ASSERT(o.find("overflow") != std::string::npos);
-}
-
-int main() {
-    std::fprintf(stderr, "══════════════════════════════════════════\n");
-    std::fprintf(stderr, " Server Unit Tests\n");
-    std::fprintf(stderr, "══════════════════════════════════════════\n");
-
-    std::fprintf(stderr, "\n── UTF-8 utilities ──\n");
-    RUN_TEST(test_utf8_safe_len_ascii);
-    RUN_TEST(test_utf8_safe_len_partial_2byte);
-    RUN_TEST(test_utf8_safe_len_partial_3byte);
-    RUN_TEST(test_utf8_safe_len_partial_4byte);
-    RUN_TEST(test_utf8_sanitize_valid);
-    RUN_TEST(test_utf8_sanitize_replaces_invalid);
-    RUN_TEST(test_utf8_sanitize_empty);
-
-    std::fprintf(stderr, "\n── Reasoning parser ──\n");
-    RUN_TEST(test_reasoning_basic);
-    RUN_TEST(test_reasoning_no_tags);
-    RUN_TEST(test_reasoning_started_in_thinking);
-    RUN_TEST(test_emitter_started_in_thinking_without_open_tag);
-    RUN_TEST(test_reasoning_unclosed_think);
-    RUN_TEST(test_reasoning_empty_thinking);
-    RUN_TEST(test_reasoning_whitespace_in_think);
-    RUN_TEST(test_reasoning_disabled);
-
-    std::fprintf(stderr, "\n── Tool parser ──\n");
-    RUN_TEST(test_parse_tool_call_xml);
-    RUN_TEST(test_parse_bare_function_xml);
-    RUN_TEST(test_parse_bare_tool_name_xml_with_function_close);
-    RUN_TEST(test_parse_json_tool_call);
-    RUN_TEST(test_parse_single_tool_bare_json_args);
-    RUN_TEST(test_parse_single_tool_bare_json_args_allows_empty_optional_object);
-    RUN_TEST(test_parse_single_tool_bare_json_args_rejects_prose);
-    RUN_TEST(test_parse_single_tool_bare_json_args_rejects_ambiguous_tools);
-    RUN_TEST(test_parse_no_tools);
-    RUN_TEST(test_parse_tool_code_wrapper);
-    RUN_TEST(test_parse_tool_allowed_filter);
-    RUN_TEST(test_parse_call_verb_empty_args);
-    RUN_TEST(test_parse_call_verb_strict_json_args);
-    RUN_TEST(test_parse_call_verb_namespaced_verb);
-    RUN_TEST(test_parse_call_verb_whitespace_before_key);
-    RUN_TEST(test_parse_call_verb_missing_close_brace_rejected);
-    RUN_TEST(test_parse_call_verb_narrative_without_body_rejected);
-    RUN_TEST(test_parse_call_verb_underscore_prefix);
-    RUN_TEST(test_parse_call_verb_nested_object_args);
-    RUN_TEST(test_parse_call_verb_back_to_back);
-    RUN_TEST(test_parse_call_verb_relaxed_single_quotes);
-    RUN_TEST(test_parse_call_verb_glued_to_word_rejected);
-    RUN_TEST(test_parse_call_verb_does_not_hijack_inner_name);
-    // PR #341 imports (relocated alongside the test bodies above)
-    RUN_TEST(test_parse_call_verb_single);
-    RUN_TEST(test_parse_call_verb_namespaced);
-    RUN_TEST(test_parse_call_verb_snake_and_hyphen);
-    RUN_TEST(test_parse_call_verb_tool_allowed_filter);
-    RUN_TEST(test_parse_call_verb_inline_prose_rejected);
-    RUN_TEST(test_parse_call_verb_inline_prose_after_space);
-    RUN_TEST(test_parse_call_verb_malformed_args);
-    RUN_TEST(test_parse_call_verb_inner_brace_in_string);
-    RUN_TEST(test_parse_call_verb_unquoted_keys);
-    RUN_TEST(test_parse_call_verb_cleaned_text);
-    RUN_TEST(test_parse_call_verb_intercept_inner_json);
-    RUN_TEST(test_parse_call_verb_multiline_args);
-    RUN_TEST(test_parse_call_verb_singlequote_with_inner_doublequote);
-    RUN_TEST(test_parse_call_verb_backtick_with_inner_doublequote);
-
-    std::fprintf(stderr, "\n── SSE Emitter ──\n");
-    RUN_TEST(test_emitter_reasoning_split_openai);
-    RUN_TEST(test_emitter_first_content_index_natural_close);
-    RUN_TEST(test_emitter_first_content_index_never_closed);
-    RUN_TEST(test_emitter_first_content_index_content_only);
-    RUN_TEST(test_emitter_first_content_index_qwen36_streaming_thinking);
-    RUN_TEST(test_emitter_reasoning_strips_leading_think_tag);
-    RUN_TEST(test_emitter_content_only_no_thinking);
-    RUN_TEST(test_emitter_tool_buffer_detection);
-    RUN_TEST(test_emitter_anthropic_tool_use_blocks);
-    RUN_TEST(test_emitter_single_tool_bare_json_args);
-    RUN_TEST(test_emitter_bare_json_args_do_not_trigger_after_content);
-    RUN_TEST(test_emitter_bare_function_tool_buffer_detection);
-    RUN_TEST(test_emitter_does_not_leak_malformed_tool_xml);
-    RUN_TEST(test_emitter_parses_tool_call_missing_outer_close);
-    RUN_TEST(test_emitter_no_tools_keeps_tool_like_text);
-    RUN_TEST(test_emitter_anthropic_structure);
-    RUN_TEST(test_emitter_responses_structure);
-    RUN_TEST(test_emitter_responses_bare_function_tool_call);
-    RUN_TEST(test_emitter_streaming_openai_has_done);
-    RUN_TEST(test_emitter_nonstreaming_accumulates);
-    RUN_TEST(test_emitter_anthropic_thinking_blocks);
-
-    std::fprintf(stderr, "\n── Stop sequences ──\n");
-    RUN_TEST(test_stop_sequence_basic);
-    RUN_TEST(test_stop_sequence_mid_token);
-    RUN_TEST(test_stop_sequence_multiple);
-    RUN_TEST(test_stop_sequence_no_match);
-    RUN_TEST(test_stop_sequence_empty_list);
-    RUN_TEST(test_stop_sequence_finish_reason);
-    RUN_TEST(test_stop_sequence_streaming_output);
-    RUN_TEST(test_stop_sequence_anthropic_format);
-    RUN_TEST(test_stop_sequence_in_reasoning_mode);
-    RUN_TEST(test_stop_sequence_holdback_extends);
-
-    std::fprintf(stderr, "\n── Prefix cache (hash) ──\n");
-    RUN_TEST(test_hash_prefix_deterministic);
-    RUN_TEST(test_hash_prefix_different_inputs);
-    RUN_TEST(test_hash_prefix_different_lengths);
-    RUN_TEST(test_hash_prefix_empty);
-    RUN_TEST(test_find_boundaries_empty);
-    RUN_TEST(test_evict_empty_is_zero);
-    RUN_TEST(test_evict_single_is_zero);
-    RUN_TEST(test_evict_chain_keeps_ancestors);
-    RUN_TEST(test_evict_unrelated_falls_back_to_lru);
-    RUN_TEST(test_evict_branch_spares_shared_root);
-
-    std::fprintf(stderr, "\n── PFlash config ──\n");
-    RUN_TEST(test_pflash_config_defaults);
-    RUN_TEST(test_pflash_config_modes);
-    RUN_TEST(test_pflash_compress_request_struct);
-    RUN_TEST(test_pflash_compress_result_defaults);
-    RUN_TEST(test_pflash_threshold_auto_mode);
-    RUN_TEST(test_pflash_threshold_always_mode);
-    RUN_TEST(test_pflash_config_upstream_defaults);
-    RUN_TEST(test_pflash_curve_interpolation);
-    RUN_TEST(test_pflash_curve_empty_uses_flat);
-    RUN_TEST(test_pflash_upstream_proxy_config);
-    RUN_TEST(test_pflash_raw_body_preserved);
-    RUN_TEST(test_pflash_placement_same_backend_local);
-    RUN_TEST(test_pflash_placement_mixed_backend_remote);
-    RUN_TEST(test_pflash_placement_auto_draft_follows_target);
-    RUN_TEST(test_pflash_placement_disabled_never_remote);
-    RUN_TEST(test_pflash_placement_usage_gate);
-    RUN_TEST(test_draft_residency_parse);
-    RUN_TEST(test_draft_residency_pflash_auto);
-    RUN_TEST(test_draft_residency_dflash_auto_and_request_scoped);
-
-    std::fprintf(stderr, "\n── Backend IPC ──\n");
-    RUN_TEST(test_backend_ipc_rejects_file_work_dir);
-    RUN_TEST(test_backend_ipc_payload_pipe_round_trip);
-    RUN_TEST(test_backend_ipc_payload_transport_parse);
-    RUN_TEST(test_backend_ipc_payload_bounds);
-    RUN_TEST(test_backend_ipc_shared_payload_map_sizing);
-    RUN_TEST(test_backend_ipc_shared_payload_segment_contract);
-    RUN_TEST(test_moe_hybrid_expert_compute_batch_default);
-    RUN_TEST(test_moe_hybrid_expert_compute_ipc_mode_batch_limit);
-    RUN_TEST(test_moe_hybrid_prefill_hot_sub_batch_limit);
-
-    std::fprintf(stderr, "\n── Jinja chat template ──\n");
-    RUN_TEST(test_deepseek4_render_system_only_gen_prompt);
-    RUN_TEST(test_deepseek4_render_empty_chat_gen_prompt);
-    RUN_TEST(test_jinja_render_basic);
-    RUN_TEST(test_jinja_render_no_gen_prompt);
-    RUN_TEST(test_jinja_render_tools_injected);
-    RUN_TEST(test_jinja_render_empty_tools_skipped);
-    RUN_TEST(test_jinja_render_bos_eos_threaded);
-    RUN_TEST(test_jinja_render_empty_template_throws);
-    RUN_TEST(test_jinja_render_bad_tools_json_throws);
-    RUN_TEST(test_normalize_responses_tool_followup_messages);
-
-    std::fprintf(stderr, "\n── Placement config ──\n");
-    RUN_TEST(test_parse_target_device_list_same_backend);
-    RUN_TEST(test_parse_target_device_list_mixed_backend);
-    RUN_TEST(test_parse_target_device_list_mixed_backend_multi_remote);
-    RUN_TEST(test_parse_target_device_list_single_gpu_is_not_layer_split);
-    RUN_TEST(test_validate_layer_split_weights_shape);
-    RUN_TEST(test_target_shard_plan_same_backend_split);
-    RUN_TEST(test_target_shard_plan_mixed_backend_split);
-    RUN_TEST(test_target_shard_plan_rejects_bad_local_backend);
-    RUN_TEST(test_kvflash_pager_identity_sync_contract);
-    RUN_TEST(test_layer_split_kvflash_history_contract);
-    RUN_TEST(test_backend_precision_cuda_sm_policy);
-    RUN_TEST(test_backend_precision_hip_arch_policy);
-    RUN_TEST(test_backend_precision_activation_type_combine);
-    RUN_TEST(test_layer_split_backend_inline_snapshot_and_restore_delta);
-    RUN_TEST(test_layer_split_backend_sampling_capability_gate);
-    RUN_TEST(test_layer_split_backend_chunks_prefill_by_adapter_limit);
-    RUN_TEST(test_layer_split_compress_nopark_uses_default_drafter_path);
-    RUN_TEST(test_layer_split_compress_rejects_bad_keep_ratio);
-    RUN_TEST(test_layer_split_backend_shutdown_is_idempotent);
-    RUN_TEST(test_layer_split_backend_capability_proxy);
-
-    std::fprintf(stderr, "\n── Disk prefix cache ──\n");
-    RUN_TEST(test_disk_cache_config_defaults);
-    RUN_TEST(test_disk_cache_policy_parse);
-    RUN_TEST(test_scope_override_preserves_compress);
-    RUN_TEST(test_disk_cache_fixed_boundary);
-    RUN_TEST(test_disk_cache_auto_boundary_lcp);
-    RUN_TEST(test_disk_cache_auto_window_limits_history);
-    RUN_TEST(test_disk_cache_disabled_when_no_dir);
-    RUN_TEST(test_disk_cache_init_creates_directory);
-    RUN_TEST(test_disk_cache_header_size);
-    RUN_TEST(test_disk_cache_header_round_trip);
-    RUN_TEST(test_disk_cache_continued_boundary);
-    RUN_TEST(test_disk_cache_continued_interval_logic);
-    RUN_TEST(test_disk_cache_cold_prefix_short_prompt);
-    RUN_TEST(test_disk_cache_cold_prefix_no_boundaries);
-    RUN_TEST(test_disk_cache_cold_prefix_finds_boundary);
-    RUN_TEST(test_disk_cache_budget_enforcement_scoring);
-    RUN_TEST(test_disk_cache_lookup_miss_no_layout);
-    RUN_TEST(test_disk_cache_save_below_min_tokens);
-
-    std::fprintf(stderr, "\n── Disk-cache identity salt (manifest hardening) ──\n");
-    RUN_TEST(test_disk_identity_salt_changes_layout_id);
-    RUN_TEST(test_disk_identity_salt_zero_is_backcompat);
-
-    std::fprintf(stderr, "\n── Sampler ──\n");
-    RUN_TEST(test_sampler_cfg_defaults);
-    RUN_TEST(test_sampler_greedy_argmax);
-    RUN_TEST(test_sampler_temperature_affects_distribution);
-    RUN_TEST(test_sampler_top_p_truncation);
-    RUN_TEST(test_sampler_top_k_truncation);
-    RUN_TEST(test_sampler_repetition_penalty);
-    RUN_TEST(test_sampler_frequency_penalty);
-    RUN_TEST(test_sampler_presence_penalty);
-    RUN_TEST(test_sampler_freq_and_pres_combined);
-    RUN_TEST(test_sampler_negative_frequency_penalty);
-    RUN_TEST(test_sampler_seed_reproducibility);
-    RUN_TEST(test_sampler_rep_window_limits_scope);
-    RUN_TEST(test_parse_sampler_token_basic);
-    RUN_TEST(test_parse_sampler_token_with_penalties);
-    RUN_TEST(test_parse_sampler_token_minimal);
-    RUN_TEST(test_parse_sampler_token_no_samp);
-    RUN_TEST(test_sampler_temp_zero_with_penalties_uses_argmax);
-    RUN_TEST(test_sampler_needs_logit_processing);
-
-    std::fprintf(stderr, "\n── /props body shape ──\n");
-    RUN_TEST(test_props_model_card_wholesale_sidecar);
-    RUN_TEST(test_props_model_card_null_on_family_fallback);
-    RUN_TEST(test_props_budget_envelope_shape);
-    RUN_TEST(test_props_runtime_shape);
-
-    std::fprintf(stderr, "\n── usage.timings ──\n");
-    RUN_TEST(test_usage_timings_openai_chat_streaming);
-    RUN_TEST(test_usage_timings_anthropic_streaming);
-    RUN_TEST(test_usage_timings_responses_streaming);
-    RUN_TEST(test_usage_timings_zero_decode_no_div_by_zero);
-    RUN_TEST(test_usage_timings_omitted_when_null);
-
-    std::fprintf(stderr, "\n── ModelBackend empty-spec retry ──\n");
-    RUN_TEST(test_model_backend_retries_empty_spec_generate_once_with_ar);
-    RUN_TEST(test_model_backend_retries_empty_spec_restore_once_with_ar);
-    RUN_TEST(test_model_backend_retries_empty_visible_spec_generate_once_with_ar);
-    RUN_TEST(test_model_backend_retries_empty_visible_spec_restore_once_with_ar);
-
-    std::fprintf(stderr, "\n── GenerateResult.accept_rate ──\n");
-    RUN_TEST(test_generate_result_accept_rate_defaults_to_zero);
-    RUN_TEST(test_generate_result_accept_rate_can_be_set);
-    RUN_TEST(test_generate_result_accept_rate_bounds);
-    RUN_TEST(test_generate_result_accept_rate_in_usage_openai);
-    RUN_TEST(test_generate_result_accept_rate_in_usage_anthropic);
-    RUN_TEST(test_generate_result_accept_rate_zero_when_no_spec_decode);
-    RUN_TEST(test_generate_result_error_state_is_consistent);
-
-    std::fprintf(stderr, "\n── normalize_system_for_cache ──\n");
-    RUN_TEST(test_normalize_strips_billing_header_anthropic_array);
-    RUN_TEST(test_normalize_strips_billing_header_openai_messages0);
-    RUN_TEST(test_normalize_idempotent_across_changing_header);
-    RUN_TEST(test_normalize_preserves_legit_system_content);
-    RUN_TEST(test_normalize_handles_leading_whitespace_header);
-    RUN_TEST(test_prefix_key_stable_across_header_change);
-
-    // ─── FlowKV + disk-cache compose ─────────────────────────────────────
-    // T1-T7 from split/11-flowkv-compose brief.
-    std::fprintf(stderr, "\n── FlowKV + disk-cache compose ──\n");
-    RUN_TEST(test_flowkv_T4_compress_false_policy_name_no_suffix);
-    RUN_TEST(test_flowkv_T4_compress_true_policy_name_has_suffix);
-    RUN_TEST(test_flowkv_T4_default_no_compress);
-    RUN_TEST(test_flowkv_T6_frozen_block_key_deterministic);
-    RUN_TEST(test_flowkv_T6_frozen_block_key_zero_on_empty);
-    RUN_TEST(test_flowkv_T6_frozen_block_key_distinct_content);
-    RUN_TEST(test_flowkv_T7_disk_clamp_system_end_boundary);
-    RUN_TEST(test_flowkv_T3_ws1_continuation_json_shape);
-    RUN_TEST(test_flowkv_T1_system_end_boundary_first);
-    RUN_TEST(test_flowkv_T5_inert_guard_token_count);
-
-    std::fprintf(stderr, "\n── Qwen3-0.6B drafter loader (bug #438) ──\n");
-    RUN_TEST(test_qwen3_drafter_rejects_truncated_gguf);
-
-    std::fprintf(stderr, "\n── GGUF tensor bounds ──\n");
-    RUN_TEST(test_gguf_tensor_in_file_bounds);
-    RUN_TEST(test_gguf_bounds_error_reports_operands);
-
-    std::fprintf(stderr, "\n══════════════════════════════════════════\n");
-    std::fprintf(stderr, " Results: %d assertions, %d failures\n",
-                 test_count, test_failures);
-    std::fprintf(stderr, "══════════════════════════════════════════\n");
-
-    if (test_failures) {
-        std::fprintf(stderr, "FAILED\n");
-        return 1;
-    }
-    std::fprintf(stderr, "ALL PASSED\n");
-    return 0;
 }

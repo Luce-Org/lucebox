@@ -5,6 +5,7 @@
 // reservation forces experts cold even though KVFlash bounds the resident KV.
 // The decision also reports whether the model is all-hot with the FULL max_ctx
 // KV (i.e. KVFlash is redundant) so the gate can disable the pool when unneeded.
+#include "CppUnitTestFramework.hpp"
 #include "../src/common/kvflash_placement.h"
 
 #include <cstdio>
@@ -12,14 +13,19 @@
 
 using namespace dflash::common;
 
-static void expect(bool cond, const char * msg) {
-    if (!cond) {
-        std::fprintf(stderr, "FAIL: %s\n", msg);
-        std::exit(1);
-    }
+#define TEST_ASSERT(cond) do { \
+    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
+    if (_cpputf_exception) { \
+        throw *_cpputf_exception; \
+    } \
+} while (0)
+static void expect(bool cond, const char * msg) { (void) msg; TEST_ASSERT(cond); }
+
+namespace {
+struct KvflashPlacementFixture {};
 }
 
-int main() {
+TEST_CASE(KvflashPlacementFixture, kvflash_placement_decision_suite) {
     // qwen3.6-35B-A3B-like budget on a 24 GiB card:
     //   ~80 KiB/token KV  (5 GiB @ 65536, 10 GiB @ 131072)
     //   experts ~13.19 GiB, core ~3.12 GiB, draft ~1.2 GiB present.
@@ -93,5 +99,4 @@ int main() {
     }
 
     std::printf("PASS: kvflash placement decision (6 cases)\n");
-    return 0;
 }

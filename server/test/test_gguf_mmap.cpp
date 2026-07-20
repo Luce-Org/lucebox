@@ -7,6 +7,7 @@
 // T4: explicit release() → object becomes empty, no crash
 // T5: RAII destructor — scope exit, no crash
 
+#include "CppUnitTestFramework.hpp"
 #include "common/gguf_mmap.h"
 
 #include <cassert>
@@ -26,6 +27,19 @@
 #define CLOSE_FN close
 #define WRITE_FN write
 #endif
+
+#define TEST_ASSERT(cond) do { \
+    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
+    if (_cpputf_exception) { \
+        throw *_cpputf_exception; \
+    } \
+} while (0)
+#undef assert
+#define assert(cond) TEST_ASSERT(cond)
+
+namespace {
+struct GgufMmapFixture {};
+}
 
 // Create a small temp file with known content; returns its path.
 static std::string make_temp_file() {
@@ -150,7 +164,7 @@ static void t5_raii_destructor() {
 
 // ─── main ────────────────────────────────────────────────────────────────────
 
-int main() {
+TEST_CASE(GgufMmapFixture, gguf_mmap_suite) {
     t1_open_and_read();
     t2_idempotent_open();
     t3_missing_file();
@@ -158,5 +172,4 @@ int main() {
     t5_raii_destructor();
 
     std::puts("ALL TESTS PASS");
-    return 0;
 }

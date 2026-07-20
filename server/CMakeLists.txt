@@ -644,13 +644,11 @@ endif()
 option(DFLASH27B_TESTS "Build numerics tests" ON)
 option(DFLASH27B_SERVER "Build dflash_server + backend_ipc_daemon" ON)
 if(DFLASH27B_TESTS)
-    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR DFLASH27B_GPU_BACKEND STREQUAL "hip")
+    if(DFLASH27B_GPU_BACKEND STREQUAL "hip"
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_cuda_pool_shutdown.cpp")
         add_executable(test_cuda_pool_shutdown test/test_cuda_pool_shutdown.cpp)
-        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
-            set_source_files_properties(test/test_cuda_pool_shutdown.cpp PROPERTIES LANGUAGE HIP)
-            set_target_properties(test_cuda_pool_shutdown PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
-        endif()
+        set_source_files_properties(test/test_cuda_pool_shutdown.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_cuda_pool_shutdown PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
         target_include_directories(test_cuda_pool_shutdown PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
         target_link_libraries(test_cuda_pool_shutdown PRIVATE
@@ -749,15 +747,8 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_deepseek4_hc_cuda PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
         add_test(NAME deepseek4_hc_cuda COMMAND test_deepseek4_hc_cuda)
     endif()
-    # GPU draft top-K kernel vs CPU reference (extract_draft_topk). Built on both
-    # backends: geometric_draft_topk_cuda.cu is compiled into dflash_common on the
-    # cuda backend directly and on hip via LANGUAGE HIP + the hip_compat shim.
-    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_topk_cuda.cpp")
-        add_executable(test_draft_topk_cuda test/test_draft_topk_cuda.cpp)
-        target_include_directories(test_draft_topk_cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        target_link_libraries(test_draft_topk_cuda PRIVATE dflash_common CUDA::cudart)
-        add_test(NAME draft_topk_cuda COMMAND test_draft_topk_cuda)
-    elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_topk_cuda.cpp")
+    # HIP-only standalone build; CUDA backend is covered by aggregated test_server_unit.
+    if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_topk_cuda.cpp")
         # HIP build of the same GPU-vs-CPU parity test. The test source uses CUDA
         # spellings (<cuda_runtime.h> + cudaMalloc/cudaMemcpy/...); the hip_compat
         # shim maps them onto HIP, exactly as the kernel TU does. Lets the draft
@@ -771,123 +762,15 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_draft_topk_cuda PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
         add_test(NAME draft_topk_cuda COMMAND test_draft_topk_cuda)
     endif()
-    # GPU port of the sample_logits chain vs the CPU reference. CUDA only:
-    # geometric_sampler_cuda.cu is compiled into dflash_common solely on the cuda backend.
-    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_gpu_sampler_cuda.cpp")
-        add_executable(test_gpu_sampler_cuda test/test_gpu_sampler_cuda.cpp)
-        target_include_directories(test_gpu_sampler_cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        target_link_libraries(test_gpu_sampler_cuda PRIVATE dflash_common CUDA::cudart)
-        add_test(NAME gpu_sampler_cuda COMMAND test_gpu_sampler_cuda)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kv_quant.cpp")
-        add_executable(test_kv_quant test/test_kv_quant.cpp)
-        target_include_directories(test_kv_quant PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        target_link_libraries(test_kv_quant PRIVATE dflash_common)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_gguf_mmap.cpp")
-        add_executable(test_gguf_mmap test/test_gguf_mmap.cpp)
-        target_include_directories(test_gguf_mmap PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        target_link_libraries(test_gguf_mmap PRIVATE dflash_common)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_adaptive_keep_ratio.cpp")
-        add_executable(test_adaptive_keep_ratio test/test_adaptive_keep_ratio.cpp)
-        target_include_directories(test_adaptive_keep_ratio PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        target_link_libraries(test_adaptive_keep_ratio PRIVATE dflash_common)
-        add_test(NAME adaptive_keep COMMAND test_adaptive_keep_ratio)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_derived_scalars.cpp")
-        add_executable(test_derived_scalars test/test_derived_scalars.cpp)
-        target_include_directories(test_derived_scalars PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        add_test(NAME derived_scalars COMMAND test_derived_scalars)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_chain_rollback_policy.cpp")
-        add_executable(test_chain_rollback_policy test/test_chain_rollback_policy.cpp)
-        target_include_directories(test_chain_rollback_policy PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
-        add_test(NAME chain_rollback_policy COMMAND test_chain_rollback_policy)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash_placement.cpp")
-        add_executable(test_kvflash_placement test/test_kvflash_placement.cpp)
-        target_include_directories(test_kvflash_placement PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        add_test(NAME kvflash_placement COMMAND test_kvflash_placement)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_bandit_integration.cpp")
-        add_executable(test_bandit_integration test/test_bandit_integration.cpp)
-        target_include_directories(test_bandit_integration PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        target_link_libraries(test_bandit_integration PRIVATE dflash_common)
-        add_test(NAME bandit_integration COMMAND test_bandit_integration)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_anchor_params.cpp")
-        add_executable(test_anchor_params test/test_anchor_params.cpp)
-        target_include_directories(test_anchor_params PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        target_link_libraries(test_anchor_params PRIVATE dflash_common)
-        add_test(NAME anchor_params COMMAND test_anchor_params)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_early_exit_score_range.cpp")
-        add_executable(test_drafter_early_exit_score_range
-            test/test_drafter_early_exit_score_range.cpp)
-        target_include_directories(test_drafter_early_exit_score_range PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
-        add_test(NAME test_drafter_early_exit_score_range
-            COMMAND test_drafter_early_exit_score_range)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_anchor_transitive.cpp")
-        add_executable(test_anchor_transitive
-            test/test_anchor_transitive.cpp
-            src/qwen3/anchor_scan.cpp)
-        target_include_directories(test_anchor_transitive PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3)
-        add_test(NAME test_anchor_transitive
-            COMMAND test_anchor_transitive)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_warm_path_regression.cpp")
-        add_executable(test_drafter_warm_path_regression
-            test/test_drafter_warm_path_regression.cpp)
-        target_include_directories(test_drafter_warm_path_regression PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
-        add_test(NAME test_drafter_warm_path_regression
-            COMMAND test_drafter_warm_path_regression)
-    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_tail_capture_guard.cpp")
-        # GREEN phase: built with TAIL_GUARD_USE_NEW_FORMULA — must pass after Bug #42 fix.
-        add_executable(test_drafter_tail_capture_guard
-            test/test_drafter_tail_capture_guard.cpp)
-        target_compile_definitions(test_drafter_tail_capture_guard PRIVATE
-            TAIL_GUARD_USE_NEW_FORMULA)
-        add_test(NAME test_drafter_tail_capture_guard
-            COMMAND test_drafter_tail_capture_guard)
         # RED phase binary: same source WITHOUT the fix flag — documents the bug.
         add_executable(test_drafter_tail_capture_guard_red
+            test/test_unit_main.cpp
             test/test_drafter_tail_capture_guard.cpp)
-        # No TAIL_GUARD_USE_NEW_FORMULA — uses old (buggy) guard, expected to FAIL.
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_vs_reference.cpp")
         add_executable(test_draft_vs_reference test/test_draft_vs_reference.cpp)
         target_link_libraries(test_draft_vs_reference PRIVATE dflash_common)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_qwen35moe_routing_stats.cpp")
-        add_executable(test_qwen35moe_routing_stats test/test_qwen35moe_routing_stats.cpp)
-        target_include_directories(test_qwen35moe_routing_stats PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-            target_include_directories(test_qwen35moe_routing_stats PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-        endif()
-        target_link_libraries(test_qwen35moe_routing_stats PRIVATE dflash_common)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_qwen35moe_expert_placement.cpp")
-        add_executable(test_qwen35moe_expert_placement test/test_qwen35moe_expert_placement.cpp)
-        target_include_directories(test_qwen35moe_expert_placement PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-            target_include_directories(test_qwen35moe_expert_placement PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-        endif()
-        target_link_libraries(test_qwen35moe_expert_placement PRIVATE dflash_common)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_qwen35moe_swap_manager.cpp")
-        add_executable(test_qwen35moe_swap_manager test/test_qwen35moe_swap_manager.cpp)
-        target_include_directories(test_qwen35moe_swap_manager PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-            target_include_directories(test_qwen35moe_swap_manager PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-        endif()
-        target_link_libraries(test_qwen35moe_swap_manager PRIVATE dflash_common)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_unit.cpp")
         add_executable(test_deepseek4_unit test/test_deepseek4_unit.cpp)
@@ -1017,24 +900,6 @@ if(DFLASH27B_TESTS)
             target_link_libraries(test_kvflash PRIVATE CUDA::cudart)
         endif()
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash_qk.cpp")
-        # Pure-math unit test (KVFLASH_QK_PURE_ONLY): no ggml, no GPU.
-        add_executable(test_kvflash_qk test/test_kvflash_qk.cpp)
-        target_include_directories(test_kvflash_qk PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash_pool_sizing.cpp")
-        # Pure unit test for kvflash_pool_from_env: ggml headers only, no ggml link, no GPU.
-        add_executable(test_kvflash_pool_sizing test/test_kvflash_pool_sizing.cpp)
-        target_include_directories(test_kvflash_pool_sizing PRIVATE
-            ${DFLASH27B_SRC_INCLUDE_DIRS}
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
-        add_test(NAME kvflash_pool_sizing COMMAND test_kvflash_pool_sizing)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_restore_delta.cpp")
-        add_executable(test_restore_delta test/test_restore_delta.cpp)
-        target_include_directories(test_restore_delta PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_dflash.cpp")
         add_executable(test_dflash test/test_dflash.cpp)
         target_include_directories(test_dflash PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
@@ -1085,12 +950,46 @@ if(DFLASH27B_TESTS)
     enable_testing()
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
-        add_executable(test_server_unit test/test_server_unit.cpp)
+        set(_server_unit_sources
+            test/test_unit_main.cpp
+            test/test_server_unit.cpp
+            test/test_anchor_params.cpp
+            test/test_derived_scalars.cpp
+            test/test_adaptive_keep_ratio.cpp
+            test/test_skip_park_guard.cpp
+            test/test_bandit_integration.cpp
+            test/test_admission.cpp
+            test/test_restore_delta.cpp
+            test/test_chain_rollback_policy.cpp
+            test/test_anchor_transitive.cpp
+            test/test_drafter_early_exit_score_range.cpp
+            test/test_drafter_tail_capture_guard.cpp
+            test/test_drafter_warm_path_regression.cpp
+            test/test_gguf_mmap.cpp
+            test/test_kv_quant.cpp
+            test/test_kvflash_placement.cpp
+            test/test_kvflash_pool_sizing.cpp
+            test/test_kvflash_qk.cpp
+            test/test_qwen35moe_routing_stats.cpp
+            test/test_qwen35moe_expert_placement.cpp
+            test/test_qwen35moe_swap_manager.cpp)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            list(APPEND _server_unit_sources
+                test/test_gpu_sampler_cuda.cpp
+                test/test_cuda_pool_shutdown.cpp
+                test/test_draft_topk_cuda.cpp)
+        endif()
+        add_executable(test_server_unit ${_server_unit_sources})
         target_sources(test_server_unit PRIVATE
             src/server/http_server.cpp
             src/server/model_card.cpp
-            src/server/prompt_normalize.cpp)
-        target_include_directories(test_server_unit PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+            src/server/prompt_normalize.cpp
+            src/qwen3/anchor_scan.cpp)
+        set_source_files_properties(test/test_drafter_tail_capture_guard.cpp
+            PROPERTIES COMPILE_DEFINITIONS TAIL_GUARD_USE_NEW_FORMULA)
+        target_include_directories(test_server_unit PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(test_server_unit PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
         else()
@@ -1111,7 +1010,33 @@ if(DFLASH27B_TESTS)
         else()
             target_link_libraries(test_server_unit PRIVATE hip::host)
         endif()
+        unset(_server_unit_sources)
         add_test(NAME server_unit COMMAND test_server_unit)
+        add_test(NAME adaptive_keep COMMAND test_server_unit AdaptiveKeepRatioFixture)
+        add_test(NAME derived_scalars COMMAND test_server_unit DerivedScalarsFixture)
+        add_test(NAME chain_rollback_policy COMMAND test_server_unit ChainRollbackPolicyFixture)
+        add_test(NAME bandit_integration COMMAND test_server_unit BanditIntegrationFixture)
+        add_test(NAME anchor_params COMMAND test_server_unit AnchorParamsFixture)
+        add_test(NAME admission COMMAND test_server_unit AdmissionFixture)
+        add_test(NAME skip_park_guard COMMAND test_server_unit SkipParkGuardFixture)
+        add_test(NAME restore_delta COMMAND test_server_unit RestoreDeltaFixture)
+        add_test(NAME test_anchor_transitive COMMAND test_server_unit AnchorTransitiveFixture)
+        add_test(NAME test_drafter_early_exit_score_range COMMAND test_server_unit DrafterEarlyExitScoreRangeFixture)
+        add_test(NAME test_drafter_tail_capture_guard COMMAND test_server_unit DrafterTailCaptureGuardFixture)
+        add_test(NAME test_drafter_warm_path_regression COMMAND test_server_unit DrafterWarmPathRegressionFixture)
+        add_test(NAME kvflash_placement COMMAND test_server_unit KvflashPlacementFixture)
+        add_test(NAME kvflash_pool_sizing COMMAND test_server_unit KvflashPoolSizingFixture)
+        add_test(NAME kv_quant COMMAND test_server_unit KvQuantFixture)
+        add_test(NAME gguf_mmap COMMAND test_server_unit GgufMmapFixture)
+        add_test(NAME qwen35moe_routing_stats COMMAND test_server_unit Qwen35MoeRoutingStatsFixture)
+        add_test(NAME qwen35moe_expert_placement COMMAND test_server_unit Qwen35MoeExpertPlacementFixture)
+        add_test(NAME qwen35moe_swap_manager COMMAND test_server_unit Qwen35MoeSwapManagerFixture)
+        add_test(NAME kvflash_qk COMMAND test_server_unit KvflashQkFixture)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            add_test(NAME gpu_sampler_cuda COMMAND test_server_unit GpuSamplerCudaFixture)
+            add_test(NAME cuda_pool_shutdown COMMAND test_server_unit CudaPoolShutdownFixture)
+            add_test(NAME draft_topk_cuda COMMAND test_server_unit DraftTopkCudaFixture)
+        endif()
     endif()
 
     # 'make check' — builds test targets then runs ctest

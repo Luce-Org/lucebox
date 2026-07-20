@@ -21,14 +21,23 @@
 //   GREEN (after patch): TAIL_GUARD_USE_NEW_FORMULA defined via compiler flag → test PASSES.
 //   The patch to qwen3_graph.cpp changes the same 2 lines as this toggle.
 
+#include "CppUnitTestFramework.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 
-#define REQUIRE(cond) \
-    do { if (!(cond)) { \
-        std::fprintf(stderr, "FAIL: %s line %d: %s\n", __FILE__, __LINE__, #cond); \
-        std::exit(1); \
-    } } while (0)
+#define TEST_ASSERT(cond) do { \
+    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
+    if (_cpputf_exception) { \
+        throw *_cpputf_exception; \
+    } \
+} while (0)
+#undef REQUIRE
+#define REQUIRE(cond) TEST_ASSERT(cond)
+
+namespace {
+struct DrafterTailCaptureGuardFixture {};
+}
 
 // The guard being tested — toggled by compile-time flag to reproduce RED/GREEN.
 #ifdef TAIL_GUARD_USE_NEW_FORMULA
@@ -117,12 +126,11 @@ static void t5_second_chunk_straddling_tail_skipped() {
     REQUIRE(!result && "tail straddles end of second chunk — must return false");
 }
 
-int main() {
+TEST_CASE(DrafterTailCaptureGuardFixture, tail_capture_guard_suite) {
     t1_straddling_tail_must_be_skipped();
     t2_tail_fits_exactly_at_chunk_end();
     t3_tail_starts_outside_chunk();
     t4_second_chunk_tail_fits_exactly();
     t5_second_chunk_straddling_tail_skipped();
     std::printf("All tail_capture guard tests passed.\n");
-    return 0;
 }

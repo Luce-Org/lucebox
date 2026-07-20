@@ -1,17 +1,25 @@
 // Unit tests for dflash::common::compute_score_range(). Plain int main(), no frameworks.
 // SCORE_LAYERS is relative to fwd_layer_limit: ee7+sl7 → [0,7), not phantom-empty [7,7).
 
+#include "CppUnitTestFramework.hpp"
 #include "score_range.h"
 
 #include <cstdio>
 #include <cstdlib>
 
 // REQUIRE survives -DNDEBUG (bare assert does not).
-#define REQUIRE(cond) \
-    do { if (!(cond)) { \
-        std::fprintf(stderr, "FAIL: %s line %d: %s\n", __FILE__, __LINE__, #cond); \
-        std::exit(1); \
-    } } while (0)
+#define TEST_ASSERT(cond) do { \
+    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
+    if (_cpputf_exception) { \
+        throw *_cpputf_exception; \
+    } \
+} while (0)
+#undef REQUIRE
+#define REQUIRE(cond) TEST_ASSERT(cond)
+
+namespace {
+struct DrafterEarlyExitScoreRangeFixture {};
+}
 
 using dflash::common::ScoreRange;
 using dflash::common::compute_score_range;
@@ -90,7 +98,7 @@ static void t7_partial_exit_partial_score() {
     printf("T7 pass: early_exit=14 score_layers=7 -> [%d,%d)\n", r.start, r.end);
 }
 
-int main() {
+TEST_CASE(DrafterEarlyExitScoreRangeFixture, score_range_suite) {
     t1_bug_scenario();
     t2_no_early_exit();
     t3_all_layers_no_exit();
@@ -99,5 +107,4 @@ int main() {
     t6_score_layers_equals_n_layer();
     t7_partial_exit_partial_score();
     printf("\nAll score_range tests passed.\n");
-    return 0;
 }

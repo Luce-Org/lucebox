@@ -16,6 +16,7 @@
 //        CUDA and HIP backends (the HIP build compiles this via the hip_compat
 //        <cuda_runtime.h> shim). Run: ./test_draft_topk_cuda (0 = pass).
 
+#include "CppUnitTestFramework.hpp"
 #include "../src/common/geometric_draft_topk_cuda.h"
 #include "../src/common/ddtree.h"
 
@@ -119,11 +120,23 @@ bool run_case(const Case & c, unsigned seed) {
 
 }  // namespace
 
-int main() {
+namespace {
+struct DraftTopkCudaFixture {};
+}
+
+#define TEST_ASSERT(cond) do { \
+    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
+    if (_cpputf_exception) { \
+        throw *_cpputf_exception; \
+    } \
+} while (0)
+
+TEST_CASE(DraftTopkCudaFixture, draft_topk_cuda_suite) {
     int dev_count = 0;
     if (cudaGetDeviceCount(&dev_count) != cudaSuccess || dev_count == 0) {
         printf("SKIP: no CUDA device available\n");
-        return 0;
+        TEST_ASSERT(true);
+        return;
     }
 
     // The kernel supports K up to kMaxK (=8 in geometric_draft_topk_cuda.cu); larger K is
@@ -172,8 +185,7 @@ int main() {
 
     if (failures) {
         printf("\nFAILED: %d/%d cases\n", failures, idx);
-        return 1;
+        TEST_ASSERT(false);
     }
     printf("\nALL PASS: %d/%d cases\n", idx, idx);
-    return 0;
 }

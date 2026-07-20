@@ -6,6 +6,7 @@
 // Build: registered in server/CMakeLists.txt under DFLASH27B_TESTS (CUDA only).
 // Run:   ./test_gpu_sampler_cuda   (exit 0 = pass, non-zero = fail)
 
+#include "CppUnitTestFramework.hpp"
 #include "common/sampler.h"
 #include "common/geometric_sampler_cuda.h"
 
@@ -22,26 +23,11 @@
 
 using namespace dflash::common;
 
-// ─── Test framework (ds4 style) ────────────────────────────────────────
+namespace {
+struct GpuSamplerCudaFixture {};
+}
 
-static int test_failures = 0;
-static int test_count = 0;
-
-#define TEST_ASSERT_MSG(expr, msg) do { \
-    test_count++; \
-    if (!(expr)) { \
-        test_failures++; \
-        std::fprintf(stderr, "  FAIL: %s:%d: %s — %s\n", __FILE__, __LINE__, #expr, msg); \
-    } \
-} while (0)
-
-#define RUN_TEST(fn) do { \
-    std::fprintf(stderr, "  %s ...", #fn); \
-    int before = test_failures; \
-    fn(); \
-    if (test_failures == before) std::fprintf(stderr, " ok\n"); \
-    else std::fprintf(stderr, "\n"); \
-} while (0)
+#define TEST_ASSERT_MSG(expr, msg) CHECK(expr)
 
 // ═══════════════════════════════════════════════════════════════════════
 // GPU sampler (geometric_sampler_cuda.cu) — compared against the CPU chain.
@@ -96,7 +82,7 @@ static std::vector<double> cpu_top_p_dist(const std::vector<float> & logits, flo
 
 // Greedy (temp=0): GPU must pick exactly the same token as the CPU chain, with
 // and without penalties active.
-static void test_gpu_sampler_greedy_matches_cpu() {
+TEST_CASE(GpuSamplerCudaFixture, test_gpu_sampler_greedy_matches_cpu) {
     if (!gpu_sampler_test_available()) { std::fprintf(stderr, " (skip: no CUDA) "); return; }
     const int vocab = 257;  // not a multiple of the block size on purpose
     for (uint64_t seed = 1; seed <= 6; seed++) {
@@ -111,7 +97,7 @@ static void test_gpu_sampler_greedy_matches_cpu() {
     }
 }
 
-static void test_gpu_sampler_greedy_penalties_match_cpu() {
+TEST_CASE(GpuSamplerCudaFixture, test_gpu_sampler_greedy_penalties_match_cpu) {
     if (!gpu_sampler_test_available()) { std::fprintf(stderr, " (skip: no CUDA) "); return; }
     const int vocab = 200;
     auto logits = gpu_test_logits(vocab, 99);
@@ -135,7 +121,7 @@ static void test_gpu_sampler_greedy_penalties_match_cpu() {
 }
 
 // top_k>0 is intentionally CPU-only: the GPU entry must signal fallback (-1).
-static void test_gpu_sampler_top_k_falls_back() {
+TEST_CASE(GpuSamplerCudaFixture, test_gpu_sampler_top_k_falls_back) {
     if (!gpu_sampler_test_available()) { std::fprintf(stderr, " (skip: no CUDA) "); return; }
     const int vocab = 128;
     auto logits = gpu_test_logits(vocab, 5);
@@ -169,7 +155,7 @@ static double gpu_empirical_l1(const std::vector<float> & logits, const SamplerC
 
 // Temperature sampling (no truncation): the GPU draw distribution must match the
 // analytic softmax — i.e. the same distribution the CPU multinomial samples.
-static void test_gpu_sampler_temperature_distribution() {
+TEST_CASE(GpuSamplerCudaFixture, test_gpu_sampler_temperature_distribution) {
     if (!gpu_sampler_test_available()) { std::fprintf(stderr, " (skip: no CUDA) "); return; }
     const int vocab = 24;
     auto logits = gpu_test_logits(vocab, 42);
@@ -182,7 +168,7 @@ static void test_gpu_sampler_temperature_distribution() {
 // top_p in (0,1) is intentionally unimplemented on the GPU (removed; see
 // geometric_sampler_cuda.h): the GPU entry must signal fallback (-1), same
 // contract as top_k>0.
-static void test_gpu_sampler_top_p_falls_back() {
+TEST_CASE(GpuSamplerCudaFixture, test_gpu_sampler_top_p_falls_back) {
     if (!gpu_sampler_test_available()) { std::fprintf(stderr, " (skip: no CUDA) "); return; }
     const int vocab = 128;
     auto logits = gpu_test_logits(vocab, 5);
@@ -196,7 +182,7 @@ static void test_gpu_sampler_top_p_falls_back() {
 // geometric_compute_probs_cuda is the shared prefix behind the GPU-assisted
 // top_p path: it must return the same penalty+softmax(temp) probability vector
 // the CPU chain computes. Checks a plain-temp config and one with penalties.
-static void test_gpu_compute_probs_matches_softmax() {
+TEST_CASE(GpuSamplerCudaFixture, test_gpu_compute_probs_matches_softmax) {
     if (!gpu_sampler_test_available()) { std::fprintf(stderr, " (skip: no CUDA) "); return; }
     const int vocab = 300;  // not a multiple of the block size on purpose
     auto logits = gpu_test_logits(vocab, 21);
@@ -237,7 +223,7 @@ static void test_gpu_compute_probs_matches_softmax() {
 // geometric_compute_probs_cuda + the CPU nucleus_cutoff/draw. The empirical
 // draw distribution must match the analytic nucleus distribution — this is the
 // only end-to-end check of nucleus_cutoff and sample_from_gpu_probs.
-static void test_gpu_sampler_top_p_distribution() {
+TEST_CASE(GpuSamplerCudaFixture, test_gpu_sampler_top_p_distribution) {
     if (!gpu_sampler_test_available()) { std::fprintf(stderr, " (skip: no CUDA) "); return; }
     const int vocab = 48;
     auto logits = gpu_test_logits(vocab, 7);
@@ -263,7 +249,7 @@ static void test_gpu_sampler_top_p_distribution() {
 // Direct CPU-vs-GPU agreement on the same draws is not bit-exact (different
 // inverse-CDF orderings), but both must agree on the *argmax* of their empirical
 // histograms — the most-likely token — under temperature sampling.
-static void test_gpu_sampler_modal_token_matches_cpu() {
+TEST_CASE(GpuSamplerCudaFixture, test_gpu_sampler_modal_token_matches_cpu) {
     if (!gpu_sampler_test_available()) { std::fprintf(stderr, " (skip: no CUDA) "); return; }
     const int vocab = 32;
     auto logits = gpu_test_logits(vocab, 11);
@@ -344,25 +330,9 @@ static void gpu_sampler_microbench() {
     (void)sink;
 }
 
-// ─── main ────────────────────────────────────────────────────────────
-
-int main() {
+TEST_CASE(GpuSamplerCudaFixture, gpu_sampler_microbench_when_enabled) {
     if (const char * b = std::getenv("DFLASH_SAMPLER_BENCH"); b && b[0] == '1') {
         gpu_sampler_microbench();
-        return 0;
     }
-
-    std::fprintf(stderr, "=== test_gpu_sampler_cuda ===\n");
-
-    RUN_TEST(test_gpu_sampler_greedy_matches_cpu);
-    RUN_TEST(test_gpu_sampler_greedy_penalties_match_cpu);
-    RUN_TEST(test_gpu_sampler_top_k_falls_back);
-    RUN_TEST(test_gpu_sampler_temperature_distribution);
-    RUN_TEST(test_gpu_sampler_top_p_falls_back);
-    RUN_TEST(test_gpu_compute_probs_matches_softmax);
-    RUN_TEST(test_gpu_sampler_top_p_distribution);
-    RUN_TEST(test_gpu_sampler_modal_token_matches_cpu);
-
-    std::fprintf(stderr, "\n%d tests, %d failures\n", test_count, test_failures);
-    return (test_failures == 0) ? 0 : 1;
+    CHECK(true);
 }
