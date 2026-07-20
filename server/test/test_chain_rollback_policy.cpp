@@ -41,6 +41,17 @@ int main() {
     CHECK(policy.checkpoint_f32);
     CHECK(policy.fast_rollback_threshold == 2);
 
+    // TP restores rank-local recurrent state directly and always rolls back
+    // from the first accepted token, independent of checkpoint precision.
+    policy = resolve_chain_rollback_policy(true);
+    CHECK(policy.checkpoint_f32);
+    CHECK(policy.fast_rollback_threshold == 1);
+    unsetenv("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32");
+    policy = resolve_chain_rollback_policy(true);
+    CHECK(!policy.checkpoint_f32);
+    CHECK(policy.fast_rollback_threshold == 1);
+    setenv("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "1", 1);
+
     // Boolean flags follow the project's non-empty, non-"0" convention.
     setenv("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "true", 1);
     CHECK(resolve_chain_rollback_policy().checkpoint_f32);

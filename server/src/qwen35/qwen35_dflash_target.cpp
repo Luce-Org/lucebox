@@ -25,13 +25,15 @@ namespace dflash::common {
 namespace {
 
 bool is_meta_tensor(const ggml_tensor * tensor) {
-    return tensor && tensor->buffer &&
-        ggml_backend_buft_is_meta(
-            ggml_backend_buffer_get_type(tensor->buffer));
+    GGML_ASSERT(tensor != nullptr);
+    GGML_ASSERT(tensor->buffer != nullptr);
+    return ggml_backend_buft_is_meta(
+        ggml_backend_buffer_get_type(tensor->buffer));
 }
 
 bool set_device_for_tensor(const ggml_tensor * tensor) {
-    if (!tensor || !tensor->data) return false;
+    GGML_ASSERT(tensor != nullptr);
+    GGML_ASSERT(tensor->data != nullptr);
     cudaPointerAttributes attributes{};
     cudaError_t error = cudaPointerGetAttributes(&attributes, tensor->data);
     if (error != cudaSuccess) {
@@ -45,16 +47,22 @@ bool restore_meta_ssm_state_device(const ggml_tensor * captured,
                                    int capture_index,
                                    ggml_tensor * destination,
                                    ggml_backend_t meta_backend) {
+    GGML_ASSERT(captured != nullptr);
+    GGML_ASSERT(destination != nullptr);
+    GGML_ASSERT(meta_backend != nullptr);
+    GGML_ASSERT(capture_index >= 0 && capture_index < captured->ne[3]);
+
     const size_t n_backends = ggml_backend_meta_n_backends(meta_backend);
     for (size_t rank = 0; rank < n_backends; ++rank) {
         const ggml_tensor * src = ggml_backend_meta_simple_tensor(captured, rank);
         ggml_tensor * dst = ggml_backend_meta_simple_tensor(destination, rank);
-        const int64_t source_elements = src
-            ? src->ne[0] * src->ne[1] * src->ne[2]
-            : 0;
-        if (!src || !dst || dst->type != GGML_TYPE_F32 ||
-            capture_index < 0 || capture_index >= src->ne[3] ||
-            source_elements != ggml_nelements(dst) || !set_device_for_tensor(dst)) {
+        GGML_ASSERT(src != nullptr);
+        GGML_ASSERT(dst != nullptr);
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        GGML_ASSERT(capture_index < src->ne[3]);
+        GGML_ASSERT(src->ne[0] * src->ne[1] * src->ne[2] ==
+                    ggml_nelements(dst));
+        if (!set_device_for_tensor(dst)) {
             return false;
         }
         const size_t n_elements = (size_t) ggml_nelements(dst);
@@ -79,42 +87,52 @@ bool restore_meta_conv_state_device(const ggml_tensor * captured,
                                     const std::vector<int> & source_slots,
                                     ggml_tensor * destination,
                                     ggml_backend_t meta_backend) {
+    GGML_ASSERT(captured != nullptr);
+    GGML_ASSERT(destination != nullptr);
+    GGML_ASSERT(meta_backend != nullptr);
+    GGML_ASSERT(!source_slots.empty());
+    GGML_ASSERT((int64_t) source_slots.size() == destination->ne[0]);
+
+    bool contiguous = true;
+    for (size_t i = 0; i < source_slots.size(); ++i) {
+        GGML_ASSERT(source_slots[i] >= 0 &&
+                    source_slots[i] < captured->ne[0]);
+        if (i > 0 && source_slots[i] != source_slots[0] + (int) i) {
+            contiguous = false;
+        }
+    }
+
     const size_t n_backends = ggml_backend_meta_n_backends(meta_backend);
     for (size_t rank = 0; rank < n_backends; ++rank) {
         const ggml_tensor * src = ggml_backend_meta_simple_tensor(captured, rank);
         ggml_tensor * dst = ggml_backend_meta_simple_tensor(destination, rank);
-        if (!src || !dst || source_slots.empty() ||
-            src->type != GGML_TYPE_F32 ||
-            dst->type != GGML_TYPE_F32 ||
-            (int64_t) source_slots.size() != dst->ne[0] ||
-            !set_device_for_tensor(dst)) {
+        GGML_ASSERT(src != nullptr);
+        GGML_ASSERT(dst != nullptr);
+        GGML_ASSERT(src->type == dst->type);
+        GGML_ASSERT(ggml_blck_size(src->type) == 1);
+        GGML_ASSERT(src->nb[0] == ggml_type_size(src->type));
+        GGML_ASSERT(dst->nb[0] == src->nb[0]);
+        GGML_ASSERT((int64_t) source_slots.size() == dst->ne[0]);
+        if (!set_device_for_tensor(dst)) {
             return false;
         }
+        const size_t element_size = src->nb[0];
         const int64_t rows = dst->ne[1] * dst->ne[2] * dst->ne[3];
-        bool contiguous = true;
-        for (size_t i = 0; i < source_slots.size(); ++i) {
-            if (source_slots[i] < 0 || source_slots[i] >= src->ne[0]) {
-                return false;
-            }
-            if (i > 0 && source_slots[i] != source_slots[0] + (int) i) {
-                contiguous = false;
-            }
-        }
         if (contiguous) {
             const void * source = (const char *) src->data +
-                (size_t) source_slots[0] * sizeof(float);
+                (size_t) source_slots[0] * element_size;
             if (cudaMemcpy2DAsync(dst->data, dst->nb[1], source, src->nb[1],
-                                  source_slots.size() * sizeof(float), rows,
+                                  source_slots.size() * element_size, rows,
                                   cudaMemcpyDeviceToDevice, nullptr) != cudaSuccess) {
                 return false;
             }
         } else {
             for (size_t column = 0; column < source_slots.size(); ++column) {
                 const void * source = (const char *) src->data +
-                    (size_t) source_slots[column] * sizeof(float);
-                void * target = (char *) dst->data + column * sizeof(float);
+                    (size_t) source_slots[column] * element_size;
+                void * target = (char *) dst->data + column * element_size;
                 if (cudaMemcpy2DAsync(target, dst->nb[1], source, src->nb[1],
-                                      sizeof(float), rows,
+                                      element_size, rows,
                                       cudaMemcpyDeviceToDevice, nullptr) != cudaSuccess) {
                     return false;
                 }
@@ -529,8 +547,8 @@ bool Qwen35DFlashTarget::rollback_to_tree(
     }
 
     const int n_delta = (int)sg_.delta_captures.size();
-    const bool meta_backend = is_meta_tensor(cache_.ssm_state.empty()
-        ? nullptr : cache_.ssm_state.front());
+    GGML_ASSERT(!cache_.ssm_state.empty());
+    const bool meta_backend = is_meta_tensor(cache_.ssm_state.front());
     cudaStream_t stream = nullptr;
     for (int il = 0; il < n_delta; il++) {
         const DeltaNetCapture & cap = sg_.delta_captures[il];
@@ -808,8 +826,8 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
         return true;
     }
     const int rollback_idx = commit_n - 1;  // index into per-step intermediates
-    const bool meta_backend = is_meta_tensor(cache_.ssm_state.empty()
-        ? nullptr : cache_.ssm_state.front());
+    GGML_ASSERT(!cache_.ssm_state.empty());
+    const bool meta_backend = is_meta_tensor(cache_.ssm_state.front());
     cudaStream_t stream = nullptr;
 
     for (int il = 0; il < n_delta; il++) {

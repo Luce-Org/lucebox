@@ -15,6 +15,10 @@ int main() {
         return 1;
     }
 
+    // Calling the public wrapper keeps its declaration and exported symbol
+    // covered. Passing one CUDA device twice also exercises the duplicate-rank
+    // guard without entering NCCL communicator creation, where this topology
+    // previously hung.
     ggml_backend_t backends[] = {backend, backend};
     ggml_tensor * tensors[] = {nullptr, nullptr};
     const bool result =

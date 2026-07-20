@@ -18,7 +18,8 @@ inline bool env_flag_enabled(const char * name) {
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
-inline ChainRollbackPolicy resolve_chain_rollback_policy() {
+inline ChainRollbackPolicy resolve_chain_rollback_policy(
+        bool tensor_parallel = false) {
     ChainRollbackPolicy policy;
     policy.checkpoint_f32 = env_flag_enabled("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32");
     policy.diagnostics = env_flag_enabled("DFLASH_SINGLE_CHAIN_ROLLBACK_DIAG");
@@ -33,6 +34,12 @@ inline ChainRollbackPolicy resolve_chain_rollback_policy() {
                 policy.fast_rollback_threshold = requested;
             }
         }
+    }
+    // Tensor-parallel rollback restores each rank's device-local recurrent
+    // state directly, so it is cheaper than replay even for one accepted
+    // token and does not depend on the host checkpoint precision.
+    if (tensor_parallel) {
+        policy.fast_rollback_threshold = 1;
     }
     return policy;
 }

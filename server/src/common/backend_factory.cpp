@@ -48,10 +48,20 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
 
     std::fprintf(stderr, "[backend_factory] detected arch=%s\n", arch.c_str());
 
-    if (args.device.is_tensor_parallel() && arch != "qwen35") {
-        std::fprintf(stderr,
-            "[backend_factory] tensor parallelism is currently supported only for dense qwen35\n");
-        return nullptr;
+    if (args.device.split_mode == TargetSplitMode::Tensor) {
+        const std::string placement_error =
+            validate_device_placement(args.device, /*device_count=*/-1);
+        if (!placement_error.empty()) {
+            std::fprintf(stderr,
+                "[backend_factory] invalid tensor-parallel placement: %s\n",
+                placement_error.c_str());
+            return nullptr;
+        }
+        if (arch != "qwen35") {
+            std::fprintf(stderr,
+                "[backend_factory] tensor parallelism is currently supported only for dense qwen35\n");
+            return nullptr;
+        }
     }
 
     if (arch == "qwen35") {

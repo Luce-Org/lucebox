@@ -1939,14 +1939,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
     int target_forwards = 0;
-    // TP rollback operates directly on each rank's device-local recurrent
-    // state, so it is cheaper than replay even for a one-token acceptance.
-    // Keep the configurable upstream policy for single-device and layer-split
-    // paths, and lower only the effective TP threshold.
-    ChainRollbackPolicy rollback_policy = resolve_chain_rollback_policy();
-    if (cfg_.device.is_tensor_parallel()) {
-        rollback_policy.fast_rollback_threshold = 1;
-    }
+    const ChainRollbackPolicy rollback_policy =
+        resolve_chain_rollback_policy(cfg_.device.is_tensor_parallel());
     const int fast_rollback_threshold =
         rollback_policy.fast_rollback_threshold;
     RollbackDiag rollback_diag;
