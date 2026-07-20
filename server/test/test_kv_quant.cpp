@@ -1,5 +1,5 @@
 // Unit tests for dflash::kv_quant (parse_kv_type, resolve_kv_types,
-// is_supported_kv_pair). Plain int main(), no frameworks.
+// is_supported_kv_pair).
 //
 // T8 (unsupported pair aborts) is not tested in-process because std::abort()
 // terminates the test runner. Manual verification:
@@ -19,6 +19,8 @@
 #define unsetenv(name) _putenv_s(name, "")
 #endif
 
+// Use a local shim because helper functions below are free functions rather than
+// fixture members, so the README's direct REQUIRE/CHECK macros are not in scope.
 #define TEST_ASSERT(cond) do { \
     auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
     if (_cpputf_exception) { \

@@ -14,14 +14,6 @@
 
 using namespace dflash::common;
 
-#define TEST_ASSERT(cond) do { \
-    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
-    if (_cpputf_exception) { \
-        throw *_cpputf_exception; \
-    } \
-} while (0)
-static void expect(bool cond, const char * msg) { (void) msg; TEST_ASSERT(cond); }
-
 namespace {
 struct KvflashPoolSizingFixture {};
 }
@@ -33,10 +25,8 @@ TEST_CASE(KvflashPoolSizingFixture, kvflash_pool_sizing_suite) {
 
     // No budget supplied -> fallback fraction of max_ctx (the buggy placement
     // path). scorer_expected toggles 1/2 vs 1/4.
-    expect(kvflash_pool_from_env(max_ctx, KvFlashConfig{}, false) == max_ctx / 2,
-           "no-budget fallback should be max_ctx/2 without scorer");
-    expect(kvflash_pool_from_env(max_ctx, KvFlashConfig{}, true) == max_ctx / 4,
-           "no-budget fallback should be max_ctx/4 with scorer");
+    REQUIRE(kvflash_pool_from_env(max_ctx, KvFlashConfig{}, false) == max_ctx / 2);
+    REQUIRE(kvflash_pool_from_env(max_ctx, KvFlashConfig{}, true) == max_ctx / 4);
 
     // Real budget with ample VRAM -> capped at the speed point (16384), far
     // below max_ctx/2. This is what runtime actually allocates; placement must
@@ -47,15 +37,13 @@ TEST_CASE(KvflashPoolSizingFixture, kvflash_pool_sizing_suite) {
     budget.bytes_per_token   = 80 * 1024;                  // ~qwen35moe density
     budget.speed_cap_tokens  = 16384;
     const int with_budget = kvflash_pool_from_env(max_ctx, KvFlashConfig{}, true, budget);
-    expect(with_budget == 16384, "ample-VRAM auto pool should hit the speed cap");
-    expect(with_budget < max_ctx / 2,
-           "budgeted pool must be smaller than the no-budget fallback "
-           "(the divergence that starved experts)");
+    REQUIRE(with_budget == 16384);
+    REQUIRE(with_budget < max_ctx / 2);
 
     // Tight VRAM -> budget binds below the cap, still well under max_ctx/2.
     budget.free_bytes = 2LL * 1024 * 1024 * 1024;          // 2 GiB free
     const int tight = kvflash_pool_from_env(max_ctx, KvFlashConfig{}, true, budget);
-    expect(tight > 0 && tight <= 16384, "tight-VRAM pool stays within the cap");
+    REQUIRE(tight > 0 && tight <= 16384);
 
     std::printf("OK test_kvflash_pool_sizing\n");
 }

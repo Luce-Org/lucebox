@@ -13,14 +13,6 @@
 
 using namespace dflash::common;
 
-#define TEST_ASSERT(cond) do { \
-    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
-    if (_cpputf_exception) { \
-        throw *_cpputf_exception; \
-    } \
-} while (0)
-static void expect(bool cond, const char * msg) { (void) msg; TEST_ASSERT(cond); }
-
 namespace {
 struct KvflashPlacementFixture {};
 }
@@ -43,9 +35,9 @@ TEST_CASE(KvflashPlacementFixture, kvflash_placement_decision_suite) {
     {
         auto d = kvflash_placement_decision(kv_per_tok, 65536, /*pool=*/0,
                                             gpu, core, experts, warm, safety, draft);
-        expect(d.kv_ctx == 65536, "C1: no-kvflash reserves full ctx");
-        expect(d.all_hot_full_kv, "C1: 65536 full KV fits all experts hot");
-        expect(!d.pool_reduced,   "C1: no pool reduction");
+        REQUIRE(d.kv_ctx == 65536);
+        REQUIRE(d.all_hot_full_kv);
+        REQUIRE(!d.pool_reduced);
     }
 
     // Case 2 — max_ctx 65536 + pool 49152: full KV still fits all-hot, so KVFlash
@@ -53,9 +45,9 @@ TEST_CASE(KvflashPlacementFixture, kvflash_placement_decision_suite) {
     {
         auto d = kvflash_placement_decision(kv_per_tok, 65536, /*pool=*/49152,
                                             gpu, core, experts, warm, safety, draft);
-        expect(d.all_hot_full_kv, "C2: 65536 full KV still fits -> kvflash redundant");
-        expect(d.kv_ctx == 65536, "C2: keeps full ctx (gate disables kvflash)");
-        expect(!d.pool_reduced,   "C2: no pool reduction when redundant");
+        REQUIRE(d.all_hot_full_kv);
+        REQUIRE(d.kv_ctx == 65536);
+        REQUIRE(!d.pool_reduced);
     }
 
     // Case 3 (THE FIX) — max_ctx 131072 + pool 49152: full KV (10 GiB) forces
@@ -63,27 +55,27 @@ TEST_CASE(KvflashPlacementFixture, kvflash_placement_decision_suite) {
     {
         auto d = kvflash_placement_decision(kv_per_tok, 131072, /*pool=*/49152,
                                             gpu, core, experts, warm, safety, draft);
-        expect(!d.all_hot_full_kv, "C3: 131072 full KV forces experts cold");
-        expect(d.kv_ctx == 49152,  "C3: reserves POOL ctx, not max_ctx");
-        expect(d.pool_reduced,     "C3: pool reduction engaged");
-        expect(d.kv_total == kv_per_tok * 49152ull, "C3: kv_total sized to pool");
-        expect(d.kv_total < kv_per_tok * 131072ull,  "C3: pool reservation < full");
+        REQUIRE(!d.all_hot_full_kv);
+        REQUIRE(d.kv_ctx == 49152);
+        REQUIRE(d.pool_reduced);
+        REQUIRE(d.kv_total == kv_per_tok * 49152ull);
+        REQUIRE(d.kv_total < kv_per_tok * 131072ull);
     }
 
     // Case 4 — max_ctx 131072, NO kvflash: full ctx, cold cliff.
     {
         auto d = kvflash_placement_decision(kv_per_tok, 131072, /*pool=*/0,
                                             gpu, core, experts, warm, safety, draft);
-        expect(d.kv_ctx == 131072, "C4: no-kvflash reserves full ctx");
-        expect(!d.all_hot_full_kv, "C4: 131072 no-kvflash -> cold cliff");
+        REQUIRE(d.kv_ctx == 131072);
+        REQUIRE(!d.all_hot_full_kv);
     }
 
     // Case 5 — pool >= max_ctx: pool can't exceed ctx, no reduction.
     {
         auto d = kvflash_placement_decision(kv_per_tok, 32768, /*pool=*/49152,
                                             gpu, core, experts, warm, safety, draft);
-        expect(!d.pool_reduced,    "C5: pool>=ctx -> no reduction");
-        expect(d.kv_ctx == 32768,  "C5: keeps full ctx");
+        REQUIRE(!d.pool_reduced);
+        REQUIRE(d.kv_ctx == 32768);
     }
 
     // Case 6 — laguna/poolside-style no-draft placement: same pool rule, no
@@ -93,9 +85,9 @@ TEST_CASE(KvflashPlacementFixture, kvflash_placement_decision_suite) {
         auto d = kvflash_placement_decision(kv_per_tok, 131072, /*pool=*/16384,
                                             gpu, core, experts, warm, safety,
                                             /*draft_bytes=*/0);
-        expect(!d.all_hot_full_kv, "C6: full KV still forces experts cold");
-        expect(d.kv_ctx == 16384,  "C6: laguna reserves POOL ctx");
-        expect(d.pool_reduced,     "C6: laguna pool reduction engaged");
+        REQUIRE(!d.all_hot_full_kv);
+        REQUIRE(d.kv_ctx == 16384);
+        REQUIRE(d.pool_reduced);
     }
 
     std::printf("PASS: kvflash placement decision (6 cases)\n");

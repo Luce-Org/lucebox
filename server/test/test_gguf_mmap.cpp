@@ -1,5 +1,4 @@
 // Unit tests for dflash::common::GgufMmap (RAII platform mmap wrapper).
-// Plain int main(), no test frameworks.
 //
 // T1: open + read first few bytes of a known file → ok, size > 0
 // T2: open the same instance twice (idempotency) → no leak
@@ -28,6 +27,8 @@
 #define WRITE_FN write
 #endif
 
+// Use a local shim because helper functions below are free functions rather than
+// fixture members, so the README's direct REQUIRE/CHECK macros are not in scope.
 #define TEST_ASSERT(cond) do { \
     auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
     if (_cpputf_exception) { \

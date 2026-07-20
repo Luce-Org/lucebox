@@ -73,6 +73,9 @@ namespace {
 struct ServerUnitFixture {};
 }
 
+// This file still uses free helper functions outside fixture-member scope, so
+// keep a local shim where the README's direct REQUIRE/CHECK macros are not
+// available without refactoring those helpers into CommonFixture members.
 #define TEST_ASSERT(expr) do { \
     auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(expr), #expr); \
     if (_cpputf_exception) { \
