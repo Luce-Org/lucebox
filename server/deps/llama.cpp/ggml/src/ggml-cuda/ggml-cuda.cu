@@ -85,12 +85,146 @@
 #include <cstdio>
 #include <cstring>
 #include <thread>
+#include <unordered_map>
 #include <array>
 #include <cstdlib>
 #include <string>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+
+static thread_local int ggml_cuda_mmvq_max_ncols_override = 0;
+static thread_local bool ggml_cuda_graphs_disabled_override = false;
+// Number of device streams currently participating in one scheduler-wide
+// capture on this host thread.  While non-zero, per-split graph capture/replay
+// must be bypassed and cross-device events must remain external graph nodes.
+static thread_local int ggml_cuda_whole_graph_capture_depth = 0;
+
+// HIP cannot reliably capture cross-device event record/wait nodes for the
+// gfx1201 + gfx1151 pair (ROCm 7.0 segfaults inside stream submission).
+// hipStreamWait/WriteValue32 also silently disappear during graph capture on
+// ROCm 7.0.  Use captured kernels and one no-reset sequence counter per
+// dependency instead. The producer increments its counter with system-release
+// semantics; the consumer waits for its next value with system-acquire
+// semantics. This avoids both missing graph nodes and stale-value ABA races.
+// q4 hybrid verification captures 129 forward and 43 reverse dependencies.
+// Leave headroom for scheduler changes without creating thousands of native
+// signal allocations per cached graph slot.
+static constexpr uint32_t GGML_CUDA_WHOLE_GRAPH_MAX_DOORBELLS = 256;
+static constexpr size_t GGML_CUDA_WHOLE_GRAPH_STAGING_BYTES =
+    32u * 1024u * 1024u;
+struct ggml_cuda_whole_graph_handle;
+struct ggml_cuda_whole_graph_session {
+    std::array<int, 2> devices{-1, -1};
+    std::array<std::array<uint32_t *,
+                          GGML_CUDA_WHOLE_GRAPH_MAX_DOORBELLS>, 2> signals{};
+    std::array<uint32_t **, 2> signal_tables{};
+    std::array<hipStream_t, 2> reset_streams{};
+    // observed[i] is local to the consumer of signals[i].
+    std::array<uint32_t *, 2> observed{};
+    std::array<uint32_t, 2> next_signals{};
+    void * staging_host = nullptr;
+    uint8_t * staging = nullptr;
+    size_t staging_used = 0;
+    struct doorbell {
+        uint32_t * signal = nullptr;
+        uint32_t * observed = nullptr;
+    };
+    std::unordered_map<void *, doorbell> event_signals;
+    std::vector<ggml_cuda_whole_graph_handle *> pending_handles;
+    bool hardware_sync = true;
+    bool instantiate_failed = false;
+    int references = 0;
+    int graph_count = 0;
+    int launches_in_round = 0;
+};
+
+static thread_local ggml_cuda_whole_graph_session *
+    ggml_cuda_whole_graph_capture_session = nullptr;
+
+static ggml_cuda_whole_graph_session::doorbell
+ggml_cuda_whole_graph_signal_acquire(int producer_device) {
+#if defined(GGML_USE_HIP)
+    auto * session = ggml_cuda_whole_graph_capture_session;
+    if (!session) return {};
+    for (size_t i = 0; i < session->devices.size(); ++i) {
+        if (session->devices[i] != producer_device) continue;
+        const uint32_t index = session->next_signals[i]++;
+        GGML_ASSERT(index < GGML_CUDA_WHOLE_GRAPH_MAX_DOORBELLS);
+        return {session->signals[i][index],
+                session->observed[i] + index};
+    }
+#else
+    GGML_UNUSED(producer_device);
+#endif
+    return {};
+}
+
+static uint8_t * ggml_cuda_whole_graph_staging_acquire(size_t bytes) {
+#if defined(GGML_USE_HIP)
+    auto * session = ggml_cuda_whole_graph_capture_session;
+    if (!session) return nullptr;
+    const size_t offset = (session->staging_used + 255u) & ~size_t(255u);
+    GGML_ASSERT(offset <= GGML_CUDA_WHOLE_GRAPH_STAGING_BYTES);
+    GGML_ASSERT(bytes <= GGML_CUDA_WHOLE_GRAPH_STAGING_BYTES - offset);
+    session->staging_used = offset + bytes;
+    return session->staging + offset;
+#else
+    GGML_UNUSED(bytes);
+    return nullptr;
+#endif
+}
+
+static ggml_cuda_whole_graph_session::doorbell
+ggml_cuda_whole_graph_event_signal(
+        void * event_context, int producer_device, bool create) {
+#if defined(GGML_USE_HIP)
+    auto * session = ggml_cuda_whole_graph_capture_session;
+    if (!session) return {};
+    const auto found = session->event_signals.find(event_context);
+    if (found != session->event_signals.end()) return found->second;
+    if (!create) return {};
+    const auto signal =
+        ggml_cuda_whole_graph_signal_acquire(producer_device);
+    if (signal.signal) session->event_signals.emplace(event_context, signal);
+    return signal;
+#else
+    GGML_UNUSED(event_context);
+    GGML_UNUSED(producer_device);
+    GGML_UNUSED(create);
+    return {};
+#endif
+}
+
+extern "C" void ggml_backend_cuda_set_mmvq_max_ncols_override(int max_ncols) {
+    ggml_cuda_mmvq_max_ncols_override = std::max(0, max_ncols);
+}
+
+extern "C" void ggml_backend_cuda_set_graphs_disabled_override(bool disabled) {
+    ggml_cuda_graphs_disabled_override = disabled;
+}
+
+static bool ggml_cuda_graphs_disabled_for_device(int device) {
+    static const uint64_t disabled_mask = []() {
+        uint64_t mask = 0;
+        const char * cursor = std::getenv("GGML_CUDA_DISABLE_GRAPHS_DEVICES");
+        while (cursor && *cursor) {
+            char * end = nullptr;
+            const long id = std::strtol(cursor, &end, 10);
+            if (end == cursor) {
+                ++cursor;
+                continue;
+            }
+            if (id >= 0 && id < 64) {
+                mask |= uint64_t{1} << id;
+            }
+            cursor = end;
+        }
+        return mask;
+    }();
+    return device >= 0 && device < 64 &&
+        (disabled_mask & (uint64_t{1} << device)) != 0;
+}
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
@@ -2494,11 +2628,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // measured crossover on sm_86 (RTX 3090, Q4_K_M/Q6_K dense GEMVs) — MMVQ
     // wins at ncols<=3, MMQ wins at 4-8 (laguna w6 chain 199->237 tok/s,
     // qwen3.6 chain 127->137). Override via env for other hardware.
-    static const int luce_mmvq_max_ncols = []() {
+    static const int luce_mmvq_max_ncols_env = []() {
         const char * e = getenv("LUCE_MMVQ_MAX_NCOLS");
         const int v = e ? atoi(e) : 3;
         return v > 0 ? v : MMVQ_MAX_BATCH_SIZE;
     }();
+    const int luce_mmvq_max_ncols = ggml_cuda_mmvq_max_ncols_override > 0
+        ? ggml_cuda_mmvq_max_ncols_override
+        : luce_mmvq_max_ncols_env;
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src1->ne[1] <= luce_mmvq_max_ncols;
@@ -3146,6 +3283,90 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
+__global__ static void ggml_cuda_peer_copy_bytes(
+        const uint8_t * src, uint8_t * dst, size_t n) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+         i < n; i += (size_t) blockDim.x * gridDim.x) {
+        dst[i] = src[i];
+    }
+#if defined(GGML_USE_HIP)
+    // The destination belongs to the peer GPU. Make every thread's stores
+    // system-visible before the following publish kernel advances the
+    // dependency sequence.
+    __threadfence_system();
+#endif
+}
+
+#if defined(GGML_USE_HIP)
+__global__ static void ggml_cuda_whole_graph_publish(uint32_t * signal) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        __threadfence_system();
+        (void) __hip_atomic_fetch_add(signal, 1u, __ATOMIC_RELEASE,
+                                      __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+}
+
+__global__ static void ggml_cuda_whole_graph_wait(
+        const uint32_t * signal, uint32_t * observed) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        const uint32_t target = *observed + 1u;
+        uint32_t current;
+        do {
+            current = __hip_atomic_load(signal, __ATOMIC_ACQUIRE,
+                                        __HIP_MEMORY_SCOPE_SYSTEM);
+        } while ((int32_t) (current - target) < 0);
+        *observed = target;
+        __threadfence_system();
+    }
+}
+
+// Fence-only forms used after graph surgery. The command processor performs
+// the actual wait/write; these short kernels retain the system-scope release
+// and acquire semantics required by payloads in coherent host memory without
+// ever spinning or incrementing the signal themselves.
+__global__ static void ggml_cuda_whole_graph_release_fence(uint32_t *) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        __threadfence_system();
+    }
+}
+
+__global__ static void ggml_cuda_whole_graph_acquire_fence(
+        const uint32_t * signal, uint32_t * observed) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        const uint32_t current = __hip_atomic_load(
+            signal, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+        *observed = current;
+        __threadfence_system();
+    }
+}
+
+__global__ static void ggml_cuda_whole_graph_reset_signals(
+        uint32_t * const * signals, uint32_t count) {
+    const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count) {
+        __hip_atomic_store(signals[index], 0u, __ATOMIC_RELEASE,
+                           __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+}
+
+static void ggml_cuda_whole_graph_publish_async(
+        hipStream_t stream,
+        const ggml_cuda_whole_graph_session::doorbell & doorbell) {
+    GGML_ASSERT(doorbell.signal && doorbell.observed);
+    ggml_cuda_whole_graph_publish<<<1, 1, 0, stream>>>(doorbell.signal);
+    CUDA_CHECK(hipGetLastError());
+}
+
+static void ggml_cuda_whole_graph_wait_async(
+        hipStream_t stream,
+        const ggml_cuda_whole_graph_session::doorbell & doorbell) {
+    GGML_ASSERT(doorbell.signal && doorbell.observed);
+    ggml_cuda_whole_graph_wait<<<1, 1, 0, stream>>>(
+        doorbell.signal, doorbell.observed);
+    CUDA_CHECK(hipGetLastError());
+}
+#endif
+
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
@@ -3173,6 +3394,77 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     }
 
     if (backend_src != backend_dst) {
+#if defined(GGML_USE_HIP)
+        if (ggml_cuda_whole_graph_capture_depth > 0 &&
+            cuda_ctx_src->device != cuda_ctx_dst->device) {
+            // Deferred MoE joins are deliberately staged at producer-split
+            // completion, before their existing event is published.  Direct
+            // Strix writes into ordinary R9700 allocations can fault inside
+            // the full production graph, while destination-side peer reads
+            // can return stale cache lines on this gfx1151/gfx1201 pair.
+            // Therefore the producer writes coherent mapped staging here and
+            // mode -3 copies staging into the R9700-local destination only at
+            // its already-late consumer split.  Hot/shared R9700 work remains
+            // enqueued before the join is gated.
+            if (dst->op == GGML_OP_MOE_FUSED &&
+                ggml_get_op_params_i32(dst, 0) == -3) {
+                const size_t n = ggml_nbytes(dst);
+                GGML_ASSERT(ggml_nbytes(src) == n);
+                uint8_t * staging =
+                    ggml_cuda_whole_graph_staging_acquire(n);
+                GGML_ASSERT(staging);
+                ggml_cuda_set_device(cuda_ctx_src->device);
+                const int block = 256;
+                const int grid = (int) std::min<size_t>(
+                    (n + block - 1) / block, 65535);
+                ggml_cuda_peer_copy_bytes<<<grid, block, 0,
+                    (hipStream_t) cuda_ctx_src->stream()>>>(
+                        (const uint8_t *) src->data,
+                        staging, n);
+                CUDA_CHECK(hipGetLastError());
+                static_assert(
+                    8 * sizeof(int32_t) + sizeof(staging) <=
+                        GGML_MAX_OP_PARAMS,
+                    "deferred staging pointer does not fit op_params");
+                memcpy(&dst->op_params[8], &staging, sizeof(staging));
+                return true;
+            }
+
+            // Captured hipMemcpyPeerAsync nodes fail when replayed across this
+            // discrete + unified-memory pair. Destination-side peer reads can
+            // consume stale cache lines, while direct R9700 peer writes into
+            // large Strix unified-memory scheduler buffers fault on replay.
+            // Stage through coherent mapped memory with captured kernels:
+            // producer -> staging, publish/wait, staging -> destination-local.
+            // The host never executes or copies payload data during replay.
+            const auto doorbell = ggml_cuda_whole_graph_signal_acquire(
+                cuda_ctx_src->device);
+            GGML_ASSERT(doorbell.signal);
+            const size_t n = ggml_nbytes(dst);
+            uint8_t * staging =
+                ggml_cuda_whole_graph_staging_acquire(n);
+            GGML_ASSERT(staging);
+            ggml_cuda_set_device(cuda_ctx_src->device);
+            const int block = 256;
+            const int grid = (int) std::min<size_t>(
+                (n + block - 1) / block, 65535);
+            ggml_cuda_peer_copy_bytes<<<grid, block, 0,
+                (hipStream_t) cuda_ctx_src->stream()>>>(
+                    (const uint8_t *) src->data,
+                    staging, n);
+            CUDA_CHECK(hipGetLastError());
+            ggml_cuda_whole_graph_publish_async(
+                (hipStream_t) cuda_ctx_src->stream(), doorbell);
+            ggml_cuda_set_device(cuda_ctx_dst->device);
+            ggml_cuda_whole_graph_wait_async(
+                (hipStream_t) cuda_ctx_dst->stream(), doorbell);
+            ggml_cuda_peer_copy_bytes<<<grid, block, 0,
+                (hipStream_t) cuda_ctx_dst->stream()>>>(
+                    staging, (uint8_t *) dst->data, n);
+            CUDA_CHECK(hipGetLastError());
+            return true;
+        }
+#endif
         // copy on src stream
         if (cuda_ctx_src->device == cuda_ctx_dst->device) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
@@ -3184,16 +3476,30 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 #endif // GGML_CUDA_NO_PEER_COPY
         }
 
-        // record event on src stream after the copy
+        // During a scheduler-wide HIP capture, publish each peer copy through
+        // a unique device doorbell. Cross-device external event nodes crash
+        // the current heterogeneous ROCm graph implementation and reusing an
+        // event would also make layer waits vulnerable to ABA on replay.
+        // Ordinary eager/per-split submissions retain the existing event.
         if (!cuda_ctx_src->copy_event) {
             ggml_cuda_set_device(cuda_ctx_src->device);
             CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming));
         }
-
-        CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
+        {
+            CUDA_CHECK(cudaEventRecord(
+                cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
+        }
 
         // wait on dst stream for the copy to complete
-        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
+        CUDA_CHECK(cudaStreamWaitEvent(
+            cuda_ctx_dst->stream(), cuda_ctx_src->copy_event,
+#if defined(GGML_USE_HIP)
+            ggml_cuda_whole_graph_capture_depth > 0
+                ? hipEventWaitExternal : 0
+#else
+            0
+#endif
+        ));
     } else {
         // src and dst are on the same backend
         CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
@@ -3289,15 +3595,44 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             }
         }
 
-        if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
-            // [TAG_FUSED_LOOP] with GGML_CUDA_GRAPH_STATS, name the first node
-            // whose properties changed — the reason a graph re-captures.
-            static const bool dbg = getenv("GGML_CUDA_GRAPH_STATS") != nullptr;
-            if (dbg && !res) {
-                GGML_LOG_INFO("[graph-mismatch] key=%p node=%d op=%s name=%s\n",
-                    graph_key, i, ggml_op_name(cgraph->nodes[i]->op),
-                    cgraph->nodes[i]->name);
-            }
+        const bool prop_changed =
+            memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0;
+        if (!res && prop_changed && getenv("GGML_CUDA_GRAPH_STATS")) {
+            GGML_LOG_INFO("[graph-mismatch] key=%p node=%d op=%s name=%s\n",
+                          graph_key, i, ggml_op_name(cgraph->nodes[i]->op),
+                          cgraph->nodes[i]->name);
+        }
+        if (!res && prop_changed && getenv("GGML_CUDA_GRAPH_DIFF_STATS")) {
+            const ggml_cuda_graph::node_properties & old =
+                graph->node_props[i];
+            ggml_tensor old_node = old.node;
+            ggml_tensor new_node = prop.node;
+            const bool extra_changed = old_node.extra != new_node.extra;
+            old_node.extra = nullptr;
+            new_node.extra = nullptr;
+            const bool node_without_extra_changed =
+                memcmp(&old_node, &new_node, sizeof(ggml_tensor)) != 0;
+            const bool src_data_changed =
+                memcmp(old.node_src_data_ptrs, prop.node_src_data_ptrs,
+                       sizeof(prop.node_src_data_ptrs)) != 0;
+            const bool src_ne_changed =
+                memcmp(old.node_src_ne, prop.node_src_ne,
+                       sizeof(prop.node_src_ne)) != 0;
+            const bool src_nb_changed =
+                memcmp(old.node_src_nb, prop.node_src_nb,
+                       sizeof(prop.node_src_nb)) != 0;
+            GGML_LOG_INFO(
+                "[cuda-graph-diff] key=%p node=%d/%d name=%s op=%s "
+                "extra=%d node_no_extra=%d src_data=%d src_ne=%d src_nb=%d "
+                "old_extra=%p new_extra=%p old_data=%p new_data=%p\n",
+                graph_key, i, cgraph->n_nodes, prop.node.name,
+                ggml_op_name(prop.node.op), (int) extra_changed,
+                (int) node_without_extra_changed, (int) src_data_changed,
+                (int) src_ne_changed, (int) src_nb_changed,
+                old.node.extra, prop.node.extra,
+                old.node.data, prop.node.data);
+        }
+        if (res || prop_changed) {
             graph->node_props[i] = prop;
             res = true;
         }
@@ -4370,7 +4705,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    if (!ggml_cuda_graphs_disabled_override &&
+        ggml_cuda_whole_graph_capture_depth == 0 &&
+        !ggml_cuda_graphs_disabled_for_device(cuda_ctx->device) &&
+        graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool can_skip_props_check = ggml_cuda_skip_props_check
@@ -4447,14 +4785,36 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
-    CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream()));
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_whole_graph_capture_depth > 0) {
+        const auto doorbell = ggml_cuda_whole_graph_event_signal(
+            event->context, cuda_ctx->device, true);
+        GGML_ASSERT(doorbell.signal);
+        ggml_cuda_whole_graph_publish_async(
+            (hipStream_t) cuda_ctx->stream(), doorbell);
+        return;
+    }
+#endif
+    CUDA_CHECK(cudaEventRecord(
+        (cudaEvent_t) event->context, cuda_ctx->stream()));
 }
 
 static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     if (ggml_backend_is_cuda(backend)) {
-        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t)event->context, 0));
+#if defined(GGML_USE_HIP)
+        if (ggml_cuda_whole_graph_capture_depth > 0) {
+            const auto doorbell = ggml_cuda_whole_graph_event_signal(
+                event->context, cuda_ctx->device, false);
+            GGML_ASSERT(doorbell.signal);
+            ggml_cuda_whole_graph_wait_async(
+                (hipStream_t) cuda_ctx->stream(), doorbell);
+            return;
+        }
+#endif
+        CUDA_CHECK(cudaStreamWaitEvent(
+            cuda_ctx->stream(), (cudaEvent_t) event->context, 0));
     } else {
 #if 0
         // untested
@@ -4739,6 +5099,871 @@ static ggml_guid_t ggml_backend_cuda_guid() {
 
 bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
+}
+
+struct ggml_cuda_whole_graph_handle {
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    ggml_cuda_whole_graph_session * session = nullptr;
+    int device = -1;
+#if defined(GGML_USE_HIP)
+    hipCtx_t context = nullptr;
+    struct memory_operation {
+        hipGraphNode_t captured_node = nullptr;
+        hipGraphNode_t fence_node = nullptr;
+        hipGraphNode_t node = nullptr;
+        hipStreamBatchMemOpParams operation{};
+    };
+    std::vector<memory_operation> memory_operations;
+#endif
+};
+
+#if defined(GGML_USE_HIP)
+// ROCm accepts hipStreamWaitValue32/hipStreamWriteValue32 during stream
+// capture but does not add them to the captured graph. Compute-kernel waits
+// are visible to capture, but a resident spin wave has no forward-progress
+// guarantee when two full-occupancy device graphs wait on one another. Keep
+// the captured kernels only as placement markers, then replace every marker
+// with an explicit command-processor batch-memory node before instantiation.
+static bool ggml_cuda_whole_graph_replace_sync_kernels(
+        ggml_cuda_whole_graph_handle * handle) {
+    ggml_cuda_set_device(handle->device);
+    hipError_t status = hipCtxGetCurrent(&handle->context);
+    if (status != hipSuccess || handle->context == nullptr) {
+        GGML_LOG_WARN(
+            "%s: device=%d context lookup failed: %s\n", __func__,
+            handle->device, hipGetErrorString(status));
+        return false;
+    }
+
+    size_t node_count = 0;
+    status = hipGraphGetNodes(handle->graph, nullptr, &node_count);
+    if (status != hipSuccess) {
+        GGML_LOG_WARN("%s: device=%d node count failed: %s\n", __func__,
+                      handle->device, hipGetErrorString(status));
+        return false;
+    }
+    std::vector<hipGraphNode_t> nodes(node_count);
+    status = hipGraphGetNodes(handle->graph, nodes.data(), &node_count);
+    if (status != hipSuccess) {
+        GGML_LOG_WARN("%s: device=%d node enumeration failed: %s\n", __func__,
+                      handle->device, hipGetErrorString(status));
+        return false;
+    }
+
+    size_t waits = 0;
+    size_t writes = 0;
+    for (hipGraphNode_t node : nodes) {
+        hipGraphNodeType type{};
+        if (hipGraphNodeGetType(node, &type) != hipSuccess ||
+            type != hipGraphNodeTypeKernel) {
+            continue;
+        }
+        hipKernelNodeParams kernel{};
+        if (hipGraphKernelNodeGetParams(node, &kernel) != hipSuccess ||
+            kernel.kernelParams == nullptr || kernel.kernelParams[0] == nullptr) {
+            continue;
+        }
+        const bool is_write =
+            kernel.func == reinterpret_cast<void *>(ggml_cuda_whole_graph_publish);
+        const bool is_wait =
+            kernel.func == reinterpret_cast<void *>(ggml_cuda_whole_graph_wait);
+        if (!is_write && !is_wait) continue;
+
+        auto * signal =
+            *reinterpret_cast<uint32_t * const *>(kernel.kernelParams[0]);
+        if (!signal) {
+            GGML_LOG_WARN("%s: device=%d marker has null signal\n", __func__,
+                          handle->device);
+            return false;
+        }
+        ggml_cuda_whole_graph_handle::memory_operation replacement{};
+        replacement.captured_node = node;
+        if (is_write) {
+            replacement.operation.writeValue.operation =
+                hipStreamMemOpWriteValue32;
+            replacement.operation.writeValue.address =
+                reinterpret_cast<hipDeviceptr_t>(signal);
+            replacement.operation.writeValue.value = 1u;
+            replacement.operation.writeValue.flags = 0;
+            ++writes;
+        } else {
+            replacement.operation.waitValue.operation =
+                hipStreamMemOpWaitValue32;
+            replacement.operation.waitValue.address =
+                reinterpret_cast<hipDeviceptr_t>(signal);
+            replacement.operation.waitValue.value = 1u;
+            replacement.operation.waitValue.flags = hipStreamWaitValueGte;
+            ++waits;
+        }
+        handle->memory_operations.push_back(replacement);
+    }
+    if (handle->memory_operations.empty()) {
+        GGML_LOG_WARN("%s: device=%d found no captured sync markers\n", __func__,
+                      handle->device);
+        return false;
+    }
+
+    // Create all replacements first. Rewire in a second pass so adjacent
+    // marker nodes are handled correctly regardless of graph enumeration order.
+    std::unordered_map<hipGraphNode_t, size_t> replacement_index;
+    replacement_index.reserve(handle->memory_operations.size());
+    for (size_t i = 0; i < handle->memory_operations.size(); ++i) {
+        auto & replacement = handle->memory_operations[i];
+        hipBatchMemOpNodeParams params{};
+        params.ctx = handle->context;
+        params.count = 1;
+        params.paramArray = &replacement.operation;
+        params.flags = 0;
+        status = hipGraphAddBatchMemOpNode(
+            &replacement.node, handle->graph, nullptr, 0, &params);
+        if (status != hipSuccess) {
+            GGML_LOG_WARN("%s: device=%d add node failed: %s\n", __func__,
+                          handle->device, hipGetErrorString(status));
+            return false;
+        }
+        replacement_index.emplace(replacement.captured_node, i);
+    }
+
+    std::vector<hipGraphNode_t> from;
+    std::vector<hipGraphNode_t> to;
+    for (const auto & replacement : handle->memory_operations) {
+        size_t dependency_count = 0;
+        status = hipGraphNodeGetDependencies(
+            replacement.captured_node, nullptr, &dependency_count);
+        if (status != hipSuccess) return false;
+        std::vector<hipGraphNode_t> dependencies(dependency_count);
+        if (dependency_count > 0) {
+            status = hipGraphNodeGetDependencies(
+                replacement.captured_node, dependencies.data(),
+                &dependency_count);
+            if (status != hipSuccess) return false;
+        }
+        for (hipGraphNode_t dependency : dependencies) {
+            const auto found = replacement_index.find(dependency);
+            from.push_back(found == replacement_index.end()
+                ? dependency
+                : handle->memory_operations[found->second].node);
+            to.push_back(replacement.node);
+        }
+
+        size_t dependent_count = 0;
+        status = hipGraphNodeGetDependentNodes(
+            replacement.captured_node, nullptr, &dependent_count);
+        if (status != hipSuccess) return false;
+        std::vector<hipGraphNode_t> dependents(dependent_count);
+        if (dependent_count > 0) {
+            status = hipGraphNodeGetDependentNodes(
+                replacement.captured_node, dependents.data(), &dependent_count);
+            if (status != hipSuccess) return false;
+        }
+        for (hipGraphNode_t dependent : dependents) {
+            // Marker-to-marker edges are added once through the downstream
+            // marker's dependency list.
+            if (replacement_index.find(dependent) != replacement_index.end()) {
+                continue;
+            }
+            from.push_back(replacement.node);
+            to.push_back(dependent);
+        }
+    }
+    if (!from.empty()) {
+        status = hipGraphAddDependencies(
+            handle->graph, from.data(), to.data(), from.size());
+        if (status != hipSuccess) {
+            GGML_LOG_WARN("%s: device=%d rewire failed: %s\n", __func__,
+                          handle->device, hipGetErrorString(status));
+            return false;
+        }
+    }
+    for (const auto & replacement : handle->memory_operations) {
+        status = hipGraphDestroyNode(replacement.captured_node);
+        if (status != hipSuccess) {
+            GGML_LOG_WARN("%s: device=%d marker removal failed: %s\n", __func__,
+                          handle->device, hipGetErrorString(status));
+            return false;
+        }
+    }
+    GGML_LOG_INFO(
+        "[ds4-whole-graph] device=%d hardware sync writes=%zu waits=%zu\n",
+        handle->device, writes, waits);
+    return true;
+}
+
+static bool ggml_cuda_whole_graph_replace_sync_kernels_v2(
+        ggml_cuda_whole_graph_handle * handle) {
+    ggml_cuda_set_device(handle->device);
+    hipError_t status = hipCtxGetCurrent(&handle->context);
+    if (status != hipSuccess || handle->context == nullptr) {
+        GGML_LOG_WARN(
+            "%s: device=%d context lookup failed: %s\n", __func__,
+            handle->device, hipGetErrorString(status));
+        return false;
+    }
+
+    size_t node_count = 0;
+    status = hipGraphGetNodes(handle->graph, nullptr, &node_count);
+    if (status != hipSuccess) return false;
+    std::vector<hipGraphNode_t> nodes(node_count);
+    status = hipGraphGetNodes(handle->graph, nodes.data(), &node_count);
+    if (status != hipSuccess) return false;
+
+    handle->memory_operations.clear();
+    std::unordered_map<hipGraphNode_t, size_t> marker_index;
+    size_t waits = 0;
+    size_t writes = 0;
+    for (hipGraphNode_t node : nodes) {
+        hipGraphNodeType type{};
+        if (hipGraphNodeGetType(node, &type) != hipSuccess ||
+            type != hipGraphNodeTypeKernel) {
+            continue;
+        }
+        hipKernelNodeParams kernel{};
+        if (hipGraphKernelNodeGetParams(node, &kernel) != hipSuccess ||
+            kernel.kernelParams == nullptr || kernel.kernelParams[0] == nullptr) {
+            continue;
+        }
+        const bool is_write =
+            kernel.func == reinterpret_cast<void *>(ggml_cuda_whole_graph_publish);
+        const bool is_wait =
+            kernel.func == reinterpret_cast<void *>(ggml_cuda_whole_graph_wait);
+        if (!is_write && !is_wait) continue;
+
+        auto * signal =
+            *reinterpret_cast<uint32_t * const *>(kernel.kernelParams[0]);
+        if (!signal) return false;
+        ggml_cuda_whole_graph_handle::memory_operation operation{};
+        operation.captured_node = node;
+        if (is_write) {
+            operation.operation.writeValue.operation =
+                hipStreamMemOpWriteValue32;
+            operation.operation.writeValue.address =
+                reinterpret_cast<hipDeviceptr_t>(signal);
+            operation.operation.writeValue.value = 1u;
+            operation.operation.writeValue.flags = 0;
+            kernel.func = reinterpret_cast<void *>(
+                ggml_cuda_whole_graph_release_fence);
+            ++writes;
+        } else {
+            operation.operation.waitValue.operation =
+                hipStreamMemOpWaitValue32;
+            operation.operation.waitValue.address =
+                reinterpret_cast<hipDeviceptr_t>(signal);
+            operation.operation.waitValue.value = 1u;
+            operation.operation.waitValue.flags = hipStreamWaitValueGte;
+            kernel.func = reinterpret_cast<void *>(
+                ggml_cuda_whole_graph_acquire_fence);
+            ++waits;
+        }
+        status = hipGraphKernelNodeSetParams(node, &kernel);
+        if (status != hipSuccess) {
+            GGML_LOG_WARN("%s: device=%d fence mutation failed: %s\n",
+                          __func__, handle->device,
+                          hipGetErrorString(status));
+            return false;
+        }
+        const size_t index = handle->memory_operations.size();
+        handle->memory_operations.push_back(operation);
+        marker_index.emplace(node, index);
+    }
+    if (handle->memory_operations.empty()) {
+        GGML_LOG_WARN("%s: device=%d found no sync markers\n", __func__,
+                      handle->device);
+        return false;
+    }
+
+    // Snapshot the original edge set before adding command-processor nodes.
+    size_t edge_count = 0;
+    status = hipGraphGetEdges(handle->graph, nullptr, nullptr, &edge_count);
+    if (status != hipSuccess) return false;
+    std::vector<hipGraphNode_t> edge_from(edge_count);
+    std::vector<hipGraphNode_t> edge_to(edge_count);
+    status = hipGraphGetEdges(
+        handle->graph, edge_from.data(), edge_to.data(), &edge_count);
+    if (status != hipSuccess) return false;
+
+    for (auto & operation : handle->memory_operations) {
+        hipBatchMemOpNodeParams params{};
+        params.ctx = handle->context;
+        params.count = 1;
+        params.paramArray = &operation.operation;
+        params.flags = 0;
+        status = hipGraphAddBatchMemOpNode(
+            &operation.node, handle->graph, nullptr, 0, &params);
+        if (status != hipSuccess) {
+            GGML_LOG_WARN("%s: device=%d add node failed: %s\n", __func__,
+                          handle->device, hipGetErrorString(status));
+            return false;
+        }
+    }
+
+    const auto entry_node = [&](hipGraphNode_t node) {
+        const auto found = marker_index.find(node);
+        if (found == marker_index.end()) return node;
+        const auto & operation = handle->memory_operations[found->second];
+        return operation.operation.operation == hipStreamMemOpWaitValue32
+            ? operation.node : node;
+    };
+    const auto exit_node = [&](hipGraphNode_t node) {
+        const auto found = marker_index.find(node);
+        if (found == marker_index.end()) return node;
+        const auto & operation = handle->memory_operations[found->second];
+        return operation.operation.operation == hipStreamMemOpWriteValue32
+            ? operation.node : node;
+    };
+
+    std::vector<hipGraphNode_t> remove_from;
+    std::vector<hipGraphNode_t> remove_to;
+    std::vector<hipGraphNode_t> add_from;
+    std::vector<hipGraphNode_t> add_to;
+    for (size_t i = 0; i < edge_count; ++i) {
+        if (marker_index.find(edge_from[i]) == marker_index.end() &&
+            marker_index.find(edge_to[i]) == marker_index.end()) {
+            continue;
+        }
+        remove_from.push_back(edge_from[i]);
+        remove_to.push_back(edge_to[i]);
+        add_from.push_back(exit_node(edge_from[i]));
+        add_to.push_back(entry_node(edge_to[i]));
+    }
+    for (const auto & operation : handle->memory_operations) {
+        if (operation.operation.operation == hipStreamMemOpWriteValue32) {
+            add_from.push_back(operation.captured_node);
+            add_to.push_back(operation.node);
+        } else {
+            add_from.push_back(operation.node);
+            add_to.push_back(operation.captured_node);
+        }
+    }
+    if (!remove_from.empty()) {
+        status = hipGraphRemoveDependencies(
+            handle->graph, remove_from.data(), remove_to.data(),
+            remove_from.size());
+        if (status != hipSuccess) {
+            GGML_LOG_WARN("%s: device=%d edge removal failed: %s\n", __func__,
+                          handle->device, hipGetErrorString(status));
+            return false;
+        }
+    }
+    status = hipGraphAddDependencies(
+        handle->graph, add_from.data(), add_to.data(), add_from.size());
+    if (status != hipSuccess) {
+        GGML_LOG_WARN("%s: device=%d edge insertion failed: %s\n", __func__,
+                      handle->device, hipGetErrorString(status));
+        return false;
+    }
+
+    GGML_LOG_INFO(
+        "[ds4-whole-graph] device=%d hardware sync v2 writes=%zu waits=%zu "
+        "fence_kernels=%zu\n",
+        handle->device, writes, waits, writes + waits);
+    return true;
+}
+
+static bool ggml_cuda_whole_graph_replace_sync_kernels_v3(
+        ggml_cuda_whole_graph_handle * handle) {
+    ggml_cuda_set_device(handle->device);
+    hipError_t status = hipCtxGetCurrent(&handle->context);
+    if (status != hipSuccess || handle->context == nullptr) return false;
+
+    size_t node_count = 0;
+    status = hipGraphGetNodes(handle->graph, nullptr, &node_count);
+    if (status != hipSuccess) return false;
+    std::vector<hipGraphNode_t> nodes(node_count);
+    status = hipGraphGetNodes(handle->graph, nodes.data(), &node_count);
+    if (status != hipSuccess) return false;
+
+    handle->memory_operations.clear();
+    std::unordered_map<hipGraphNode_t, size_t> marker_index;
+    size_t waits = 0;
+    size_t writes = 0;
+    for (hipGraphNode_t node : nodes) {
+        hipGraphNodeType type{};
+        if (hipGraphNodeGetType(node, &type) != hipSuccess ||
+            type != hipGraphNodeTypeKernel) {
+            continue;
+        }
+        hipKernelNodeParams kernel{};
+        if (hipGraphKernelNodeGetParams(node, &kernel) != hipSuccess ||
+            kernel.kernelParams == nullptr || kernel.kernelParams[0] == nullptr) {
+            continue;
+        }
+        const bool is_write =
+            kernel.func == reinterpret_cast<void *>(ggml_cuda_whole_graph_publish);
+        const bool is_wait =
+            kernel.func == reinterpret_cast<void *>(ggml_cuda_whole_graph_wait);
+        if (!is_write && !is_wait) continue;
+        auto * signal =
+            *reinterpret_cast<uint32_t * const *>(kernel.kernelParams[0]);
+        if (!signal) return false;
+
+        ggml_cuda_whole_graph_handle::memory_operation operation{};
+        operation.captured_node = node;
+        if (is_write) {
+            operation.operation.writeValue.operation =
+                hipStreamMemOpWriteValue32;
+            operation.operation.writeValue.address =
+                reinterpret_cast<hipDeviceptr_t>(signal);
+            operation.operation.writeValue.value = 1u;
+            operation.operation.writeValue.flags = 0;
+            ++writes;
+        } else {
+            operation.operation.waitValue.operation =
+                hipStreamMemOpWaitValue32;
+            operation.operation.waitValue.address =
+                reinterpret_cast<hipDeviceptr_t>(signal);
+            operation.operation.waitValue.value = 1u;
+            operation.operation.waitValue.flags = hipStreamWaitValueGte;
+            ++waits;
+        }
+        const size_t index = handle->memory_operations.size();
+        handle->memory_operations.push_back(operation);
+        marker_index.emplace(node, index);
+    }
+    if (handle->memory_operations.empty()) return false;
+
+    size_t edge_count = 0;
+    status = hipGraphGetEdges(handle->graph, nullptr, nullptr, &edge_count);
+    if (status != hipSuccess) return false;
+    std::vector<hipGraphNode_t> edge_from(edge_count);
+    std::vector<hipGraphNode_t> edge_to(edge_count);
+    status = hipGraphGetEdges(
+        handle->graph, edge_from.data(), edge_to.data(), &edge_count);
+    if (status != hipSuccess) return false;
+
+    for (auto & operation : handle->memory_operations) {
+        hipKernelNodeParams fence{};
+        status = hipGraphKernelNodeGetParams(operation.captured_node, &fence);
+        if (status != hipSuccess) return false;
+        fence.func = operation.operation.operation == hipStreamMemOpWriteValue32
+            ? reinterpret_cast<void *>(ggml_cuda_whole_graph_release_fence)
+            : reinterpret_cast<void *>(ggml_cuda_whole_graph_acquire_fence);
+        status = hipGraphAddKernelNode(
+            &operation.fence_node, handle->graph, nullptr, 0, &fence);
+        if (status != hipSuccess) {
+            GGML_LOG_WARN("%s: device=%d add fence failed: %s\n", __func__,
+                          handle->device, hipGetErrorString(status));
+            return false;
+        }
+
+        hipBatchMemOpNodeParams params{};
+        params.ctx = handle->context;
+        params.count = 1;
+        params.paramArray = &operation.operation;
+        params.flags = 0;
+        status = hipGraphAddBatchMemOpNode(
+            &operation.node, handle->graph, nullptr, 0, &params);
+        if (status != hipSuccess) {
+            GGML_LOG_WARN("%s: device=%d add memory op failed: %s\n", __func__,
+                          handle->device, hipGetErrorString(status));
+            return false;
+        }
+    }
+
+    const auto entry_node = [&](hipGraphNode_t node) {
+        const auto found = marker_index.find(node);
+        if (found == marker_index.end()) return node;
+        const auto & operation = handle->memory_operations[found->second];
+        return operation.operation.operation == hipStreamMemOpWaitValue32
+            ? operation.node : operation.fence_node;
+    };
+    const auto exit_node = [&](hipGraphNode_t node) {
+        const auto found = marker_index.find(node);
+        if (found == marker_index.end()) return node;
+        const auto & operation = handle->memory_operations[found->second];
+        return operation.operation.operation == hipStreamMemOpWriteValue32
+            ? operation.node : operation.fence_node;
+    };
+
+    std::vector<hipGraphNode_t> remove_from;
+    std::vector<hipGraphNode_t> remove_to;
+    std::vector<hipGraphNode_t> add_from;
+    std::vector<hipGraphNode_t> add_to;
+    for (size_t i = 0; i < edge_count; ++i) {
+        if (marker_index.find(edge_from[i]) == marker_index.end() &&
+            marker_index.find(edge_to[i]) == marker_index.end()) {
+            continue;
+        }
+        remove_from.push_back(edge_from[i]);
+        remove_to.push_back(edge_to[i]);
+        add_from.push_back(exit_node(edge_from[i]));
+        add_to.push_back(entry_node(edge_to[i]));
+    }
+    for (const auto & operation : handle->memory_operations) {
+        if (operation.operation.operation == hipStreamMemOpWriteValue32) {
+            add_from.push_back(operation.fence_node);
+            add_to.push_back(operation.node);
+        } else {
+            add_from.push_back(operation.node);
+            add_to.push_back(operation.fence_node);
+        }
+    }
+    if (!remove_from.empty()) {
+        status = hipGraphRemoveDependencies(
+            handle->graph, remove_from.data(), remove_to.data(),
+            remove_from.size());
+        if (status != hipSuccess) return false;
+    }
+    status = hipGraphAddDependencies(
+        handle->graph, add_from.data(), add_to.data(), add_from.size());
+    if (status != hipSuccess) return false;
+    for (const auto & operation : handle->memory_operations) {
+        status = hipGraphDestroyNode(operation.captured_node);
+        if (status != hipSuccess) return false;
+    }
+
+    GGML_LOG_INFO(
+        "[ds4-whole-graph] device=%d hardware sync v3 writes=%zu waits=%zu "
+        "new_fences=%zu\n",
+        handle->device, writes, waits, writes + waits);
+    return true;
+}
+
+static bool ggml_cuda_whole_graph_reset_round(
+        ggml_cuda_whole_graph_session * session) {
+    if (!session->hardware_sync) return true;
+    // The two graphs have both been synchronized before the scheduler starts
+    // another decode step. Reset every one-shot doorbell to zero with one
+    // local kernel per device, then keep all graph memory-op nodes fixed at
+    // value 1. ROCm 7.2.4 accepts graph-exec batch-memory parameter updates
+    // but can fault the second production replay after hundreds of such
+    // mutations; the API is still explicitly beta. Fixed graph nodes plus a
+    // bounded pre-launch reset avoid both that runtime path and ABA.
+    for (size_t i = 0; i < session->devices.size(); ++i) {
+        const uint32_t count = session->next_signals[i];
+        if (count == 0) continue;
+        ggml_cuda_set_device(session->devices[i]);
+        const uint32_t block = 256;
+        const uint32_t grid = (count + block - 1) / block;
+        ggml_cuda_whole_graph_reset_signals<<<grid, block, 0,
+            session->reset_streams[i]>>>(session->signal_tables[i], count);
+        const hipError_t status = hipGetLastError();
+        if (status != hipSuccess) {
+            GGML_LOG_WARN("%s: device=%d reset launch failed: %s\n", __func__,
+                          session->devices[i], hipGetErrorString(status));
+            return false;
+        }
+    }
+    for (size_t i = 0; i < session->devices.size(); ++i) {
+        if (session->next_signals[i] == 0) continue;
+        ggml_cuda_set_device(session->devices[i]);
+        const hipError_t status = hipStreamSynchronize(
+            session->reset_streams[i]);
+        if (status != hipSuccess) {
+            GGML_LOG_WARN("%s: device=%d reset sync failed: %s\n", __func__,
+                          session->devices[i], hipGetErrorString(status));
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
+static void ggml_cuda_whole_graph_session_destroy(
+        ggml_cuda_whole_graph_session * session) {
+    if (!session) return;
+#if defined(GGML_USE_HIP)
+    for (size_t i = 0; i < session->signals.size(); ++i) {
+        ggml_cuda_set_device(session->devices[i]);
+        if (session->reset_streams[i]) {
+            (void) hipStreamDestroy(session->reset_streams[i]);
+        }
+        if (session->signal_tables[i]) {
+            (void) hipFree(session->signal_tables[i]);
+        }
+        for (uint32_t * signal : session->signals[i]) {
+            if (signal) (void) hipFree(signal);
+        }
+        if (session->observed[i]) {
+            ggml_cuda_set_device(session->devices[1 - i]);
+            (void) hipFree(session->observed[i]);
+        }
+    }
+    if (session->staging_host) {
+        (void) hipHostFree(session->staging_host);
+    }
+#endif
+    delete session;
+}
+
+bool ggml_backend_cuda_whole_graph_capture_prepare(
+        ggml_backend_t backend0, ggml_backend_t backend1) {
+#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_HIP)
+    if (!ggml_backend_is_cuda(backend0) ||
+        !ggml_backend_is_cuda(backend1) || backend0 == backend1 ||
+        ggml_cuda_whole_graph_capture_depth != 0 ||
+        ggml_cuda_whole_graph_capture_session != nullptr) {
+        return false;
+    }
+    auto * ctx0 = (ggml_backend_cuda_context *) backend0->context;
+    auto * ctx1 = (ggml_backend_cuda_context *) backend1->context;
+    if (ctx0->device == ctx1->device) return false;
+
+    auto * session = new ggml_cuda_whole_graph_session();
+    session->devices = {ctx0->device, ctx1->device};
+    const char * hardware_sync =
+        std::getenv("DFLASH_DS4_TP_WHOLE_STEP_HW_SYNC");
+    session->hardware_sync = !hardware_sync || !*hardware_sync ||
+        std::strcmp(hardware_sync, "0") != 0;
+    ggml_cuda_set_device(session->devices[0]);
+    CUDA_CHECK(hipHostMalloc(
+        &session->staging_host, GGML_CUDA_WHOLE_GRAPH_STAGING_BYTES,
+        hipHostMallocMapped | hipHostMallocCoherent));
+    CUDA_CHECK(hipHostGetDevicePointer(
+        (void **) &session->staging, session->staging_host, 0));
+    for (size_t i = 0; i < session->devices.size(); ++i) {
+        ggml_cuda_set_device(session->devices[i]);
+        CUDA_CHECK(hipStreamCreateWithFlags(
+            &session->reset_streams[i], hipStreamNonBlocking));
+        for (uint32_t *& signal : session->signals[i]) {
+            CUDA_CHECK(hipExtMallocWithFlags(
+                (void **) &signal, sizeof(uint64_t), hipMallocSignalMemory));
+            CUDA_CHECK(hipMemset(signal, 0, sizeof(uint64_t)));
+        }
+        CUDA_CHECK(hipMalloc(
+            (void **) &session->signal_tables[i],
+            GGML_CUDA_WHOLE_GRAPH_MAX_DOORBELLS * sizeof(uint32_t *)));
+        CUDA_CHECK(hipMemcpy(
+            session->signal_tables[i], session->signals[i].data(),
+            GGML_CUDA_WHOLE_GRAPH_MAX_DOORBELLS * sizeof(uint32_t *),
+            hipMemcpyHostToDevice));
+        CUDA_CHECK(hipDeviceSynchronize());
+        ggml_cuda_set_device(session->devices[1 - i]);
+        CUDA_CHECK(hipMalloc(
+            (void **) &session->observed[i],
+            GGML_CUDA_WHOLE_GRAPH_MAX_DOORBELLS * sizeof(uint32_t)));
+        CUDA_CHECK(hipMemset(
+            session->observed[i], 0,
+            GGML_CUDA_WHOLE_GRAPH_MAX_DOORBELLS * sizeof(uint32_t)));
+        CUDA_CHECK(hipDeviceSynchronize());
+    }
+    ggml_cuda_whole_graph_capture_session = session;
+    return true;
+#else
+    GGML_UNUSED(backend0);
+    GGML_UNUSED(backend1);
+    return false;
+#endif
+}
+
+bool ggml_backend_cuda_whole_graph_capture_begin(ggml_backend_t backend) {
+#ifdef USE_CUDA_GRAPH
+    if (!ggml_backend_is_cuda(backend) ||
+        !ggml_cuda_whole_graph_capture_session) return false;
+    ggml_backend_cuda_context * ctx =
+        (ggml_backend_cuda_context *) backend->context;
+    const auto * session = ggml_cuda_whole_graph_capture_session;
+    if (ctx->device != session->devices[0] &&
+        ctx->device != session->devices[1]) return false;
+    ggml_cuda_set_device(ctx->device);
+    const cudaError_t status = cudaStreamBeginCapture(
+        ctx->stream(), cudaStreamCaptureModeRelaxed);
+    if (status != cudaSuccess) {
+        GGML_LOG_WARN("%s: device=%d begin failed: %s\n", __func__,
+                      ctx->device, cudaGetErrorString(status));
+        if (ggml_cuda_whole_graph_capture_depth == 0 &&
+            ggml_cuda_whole_graph_capture_session->references == 0) {
+            ggml_cuda_whole_graph_session_destroy(
+                ggml_cuda_whole_graph_capture_session);
+            ggml_cuda_whole_graph_capture_session = nullptr;
+        }
+        return false;
+    }
+    ++ggml_cuda_whole_graph_capture_depth;
+    return true;
+#else
+    GGML_UNUSED(backend);
+    return false;
+#endif
+}
+
+ggml_backend_cuda_whole_graph_t
+ggml_backend_cuda_whole_graph_capture_end(ggml_backend_t backend) {
+#ifdef USE_CUDA_GRAPH
+    if (!ggml_backend_is_cuda(backend) ||
+        ggml_cuda_whole_graph_capture_depth <= 0) {
+        return nullptr;
+    }
+    ggml_backend_cuda_context * ctx =
+        (ggml_backend_cuda_context *) backend->context;
+    auto * session = ggml_cuda_whole_graph_capture_session;
+    ggml_cuda_set_device(ctx->device);
+    auto * result = new ggml_cuda_whole_graph_handle();
+    const cudaError_t end_status =
+        cudaStreamEndCapture(ctx->stream(), &result->graph);
+    --ggml_cuda_whole_graph_capture_depth;
+    const bool capture_finished =
+        ggml_cuda_whole_graph_capture_depth == 0;
+    if (capture_finished) {
+        ggml_cuda_whole_graph_capture_session = nullptr;
+    }
+    if (end_status != cudaSuccess || result->graph == nullptr) {
+        GGML_LOG_WARN("%s: device=%d end failed: %s\n", __func__,
+                      ctx->device, cudaGetErrorString(end_status));
+        if (result->graph) (void) cudaGraphDestroy(result->graph);
+        delete result;
+        if (capture_finished && session && session->references == 0) {
+            ggml_cuda_whole_graph_session_destroy(session);
+        }
+        return nullptr;
+    }
+    // Instantiate lazily after both device streams have ended capture. Some
+    // HIP runtimes cannot instantiate one graph while its peer is capturing.
+    result->session = session;
+    result->device = ctx->device;
+    ++session->references;
+    ++session->graph_count;
+    session->pending_handles.push_back(result);
+    if (capture_finished) {
+        GGML_LOG_INFO(
+            "[ds4-whole-graph] captured doorbells dev%d=%u dev%d=%u "
+            "events=%zu staging=%.2f MiB\n",
+            session->devices[0], session->next_signals[0],
+            session->devices[1], session->next_signals[1],
+            session->event_signals.size(),
+            session->staging_used / (1024.0 * 1024.0));
+        // Both streams are now out of capture. Instantiate both executables
+        // before either waiter graph can be launched; launching one first can
+        // surface an asynchronous wait failure while HIP builds its peer.
+        for (auto * pending : session->pending_handles) {
+            ggml_cuda_set_device(pending->device);
+#if defined(GGML_USE_HIP)
+            if (session->hardware_sync &&
+                !ggml_cuda_whole_graph_replace_sync_kernels_v3(pending)) {
+                session->instantiate_failed = true;
+                break;
+            }
+#endif
+            const cudaError_t instantiate_status = cudaGraphInstantiate(
+                &pending->executable, pending->graph, nullptr, nullptr, 0);
+            if (instantiate_status != cudaSuccess) {
+                GGML_LOG_WARN(
+                    "%s: device=%d instantiate failed: %s\n", __func__,
+                    pending->device,
+                    cudaGetErrorString(instantiate_status));
+                session->instantiate_failed = true;
+                break;
+            }
+        }
+        if (!session->hardware_sync) {
+            GGML_LOG_INFO(
+                "[ds4-whole-graph] native system-atomic sequence sync\n");
+        }
+    }
+    return result;
+#else
+    GGML_UNUSED(backend);
+    return nullptr;
+#endif
+}
+
+bool ggml_backend_cuda_whole_graph_launch(
+        ggml_backend_t backend,
+        ggml_backend_cuda_whole_graph_t opaque_graph) {
+#ifdef USE_CUDA_GRAPH
+    if (!ggml_backend_is_cuda(backend) || !opaque_graph) return false;
+    ggml_backend_cuda_context * ctx =
+        (ggml_backend_cuda_context *) backend->context;
+    auto * graph = (ggml_cuda_whole_graph_handle *) opaque_graph;
+    auto * session = graph->session;
+    if (session && session->instantiate_failed) return false;
+
+#if defined(GGML_USE_HIP)
+    if (session && session->launches_in_round == 0 &&
+        !ggml_cuda_whole_graph_reset_round(session)) {
+        return false;
+    }
+#endif
+    ggml_cuda_set_device(ctx->device);
+    if (!graph->executable) {
+        const cudaError_t instantiate_status = cudaGraphInstantiate(
+            &graph->executable, graph->graph, nullptr, nullptr, 0);
+        if (instantiate_status != cudaSuccess) {
+            GGML_LOG_WARN("%s: device=%d instantiate failed: %s\n", __func__,
+                          ctx->device,
+                          cudaGetErrorString(instantiate_status));
+            return false;
+        }
+    }
+    const cudaError_t status =
+        cudaGraphLaunch(graph->executable, ctx->stream());
+    if (status != cudaSuccess) {
+        GGML_LOG_WARN("%s: device=%d launch failed: %s\n", __func__,
+                      ctx->device, cudaGetErrorString(status));
+        return false;
+    }
+    if (session) {
+        ++session->launches_in_round;
+        if (session->launches_in_round == session->graph_count) {
+            session->launches_in_round = 0;
+        }
+    }
+    return true;
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(opaque_graph);
+    return false;
+#endif
+}
+
+void ggml_backend_cuda_whole_graph_free(
+        ggml_backend_t backend,
+        ggml_backend_cuda_whole_graph_t opaque_graph) {
+#ifdef USE_CUDA_GRAPH
+    if (!opaque_graph) return;
+    auto * graph = (ggml_cuda_whole_graph_handle *) opaque_graph;
+    if (ggml_backend_is_cuda(backend)) {
+        ggml_backend_cuda_context * ctx =
+            (ggml_backend_cuda_context *) backend->context;
+        ggml_cuda_set_device(ctx->device);
+    }
+    if (graph->executable) (void) cudaGraphExecDestroy(graph->executable);
+    if (graph->graph) (void) cudaGraphDestroy(graph->graph);
+    auto * session = graph->session;
+    delete graph;
+    if (session && --session->references == 0) {
+        ggml_cuda_whole_graph_session_destroy(session);
+    }
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(opaque_graph);
+#endif
+}
+
+bool ggml_backend_cuda_set_low_priority_stream(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx =
+        (ggml_backend_cuda_context *) backend->context;
+    for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+        for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+            if (ctx->streams[device][stream] != nullptr) {
+                GGML_LOG_WARN(
+                    "%s: backend stream already exists; priority unchanged\n",
+                    __func__);
+                return false;
+            }
+        }
+    }
+
+    ggml_cuda_set_device(ctx->device);
+    int least_priority = 0;
+    int greatest_priority = 0;
+    const cudaError_t status = cudaDeviceGetStreamPriorityRange(
+        &least_priority, &greatest_priority);
+    if (status != cudaSuccess) {
+        GGML_LOG_WARN("%s: priority query failed: %s\n", __func__,
+                      cudaGetErrorString(status));
+        return false;
+    }
+    ctx->low_priority_streams = true;
+    ctx->stream_priority = least_priority;
+    GGML_LOG_INFO(
+        "%s: device=%d least=%d greatest=%d selected=%d\n",
+        __func__, ctx->device, least_priority, greatest_priority,
+        ctx->stream_priority);
+    return least_priority != greatest_priority;
 }
 
 int ggml_backend_cuda_get_device_count() {
@@ -5230,9 +6455,21 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             } break;
         case GGML_OP_REPEAT:
             {
-                // the CUDA REPEAT path only implements F32/F16; other types assert at runtime
                 ggml_type src0_type = op->src[0]->type;
-                return src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16;
+                if (src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16) {
+                    return true;
+                }
+                // Exact contiguous I32 repeat is opt-in while it is qualified
+                // on the heterogeneous DS4 verifier path.
+                static const bool i32_repeat_enabled = [] {
+                    const char * raw = std::getenv("LUCE_CUDA_I32_REPEAT");
+                    return raw && *raw && std::strcmp(raw, "0") != 0;
+                }();
+                return i32_repeat_enabled &&
+                       src0_type == GGML_TYPE_I32 &&
+                       op->type == GGML_TYPE_I32 &&
+                       ggml_is_contiguous(op->src[0]) &&
+                       ggml_is_contiguous(op);
             } break;
         case GGML_OP_REPEAT_BACK:
                 return op->type == GGML_TYPE_F32 && (op->src[0]->ne[2]*op->src[0]->ne[3]) <= (1 << 15);

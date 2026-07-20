@@ -23,6 +23,10 @@
 //                src2 = hc_state [n_embd*n_hc]
 //                dst  = [n_embd]: weights[h] = sigmoid(mix[h]*s0+base[h]) + 1e-6;
 //                       dst[d] = sum_h weights[h]*hc_state[h*n_embd+d]
+//
+// mode 3 (post split): mode 1 with src1 = main block_out, src3 = peer
+//                block_out. The kernel evaluates peer[d] + main[d] before
+//                multiplying by post[h], matching the eliminated GGML add.
 
 #define DS4_HC_SINKHORN_EPS 1.0e-6f
 #define DS4_HC_MAX_HC 8
@@ -288,6 +292,33 @@ static __global__ void ds4_hc_post_kernel(
     dst[i] = acc;
 }
 
+static __global__ void ds4_hc_post_split_kernel(
+        const float * __restrict__ residual,
+        const float * __restrict__ main_block,
+        const float * __restrict__ peer_block,
+        const float * __restrict__ split,
+        float       * __restrict__ dst,
+        int n_embd,
+        int n_hc) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = n_embd * n_hc;
+    if (i >= total) {
+        return;
+    }
+    const int h = i / n_embd;
+    const int d = i - h * n_embd;
+    const float * post = split + n_hc;
+    const float * comb = split + 2 * n_hc;
+    // Keep the established reduction order: the graph being replaced uses
+    // ggml_add(peer, main), followed by HC post multiplication.
+    const float block_out = peer_block[d] + main_block[d];
+    float acc = block_out * post[h];
+    for (int src = 0; src < n_hc; ++src) {
+        acc += comb[h + src * n_hc] * residual[(size_t) src * n_embd + d];
+    }
+    dst[i] = acc;
+}
+
 static __global__ void ds4_hc_out_kernel(
         const float * __restrict__ mix,
         const float * __restrict__ base,
@@ -360,6 +391,16 @@ void ggml_cuda_op_ds4_hc(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 (const float *) src0->data, (const float *) src1->data,
                 (const float *) src2->data, (float *) dst->data,
                 n_embd, n_hc, pre_scale);
+        } break;
+        case 3: {
+            const ggml_tensor * src3 = dst->src[3];
+            GGML_ASSERT(src3 && src3->type == GGML_TYPE_F32);
+            const int total = n_embd * n_hc;
+            const int blocks = (total + 255) / 256;
+            ds4_hc_post_split_kernel<<<blocks, 256, 0, stream>>>(
+                (const float *) src0->data, (const float *) src1->data,
+                (const float *) src3->data, (const float *) src2->data,
+                (float *) dst->data, n_embd, n_hc);
         } break;
         default:
             GGML_ABORT("ds4_hc: unknown mode");

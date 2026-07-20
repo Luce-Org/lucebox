@@ -24,6 +24,34 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 
 GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 
+// Configure streams lazily created by this backend context at the device's
+// lowest scheduling priority. Must be called before the backend first submits
+// work. Other backend contexts on the same device are unaffected.
+GGML_BACKEND_API bool ggml_backend_cuda_set_low_priority_stream(
+    ggml_backend_t backend);
+
+// Skip the expensive per-node CUDA/HIP graph property comparison on the
+// calling thread once a stable graph has already been captured.  Callers must
+// bracket only immutable-topology graphs whose tensor addresses and shapes do
+// not change; input contents may still be updated in place.
+GGML_BACKEND_API void ggml_cuda_set_skip_props_check(bool skip);
+
+// Capture a scheduler-wide device program around multiple ordinary backend
+// graph submissions.  The handle is opaque and belongs to `backend`; callers
+// must free it before freeing that backend.  These hooks are intentionally
+// opt-in so normal per-split CUDA/HIP graph behavior is unchanged.
+typedef void * ggml_backend_cuda_whole_graph_t;
+GGML_BACKEND_API bool ggml_backend_cuda_whole_graph_capture_prepare(
+    ggml_backend_t backend0, ggml_backend_t backend1);
+GGML_BACKEND_API bool ggml_backend_cuda_whole_graph_capture_begin(
+    ggml_backend_t backend);
+GGML_BACKEND_API ggml_backend_cuda_whole_graph_t
+ggml_backend_cuda_whole_graph_capture_end(ggml_backend_t backend);
+GGML_BACKEND_API bool ggml_backend_cuda_whole_graph_launch(
+    ggml_backend_t backend, ggml_backend_cuda_whole_graph_t graph);
+GGML_BACKEND_API void ggml_backend_cuda_whole_graph_free(
+    ggml_backend_t backend, ggml_backend_cuda_whole_graph_t graph);
+
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 
@@ -39,6 +67,12 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type(v
 GGML_BACKEND_API int  ggml_backend_cuda_get_device_count(void);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_description(int device, char * description, size_t description_size);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
+
+// Override the plain quantized MUL_MAT MMVQ column ceiling on the calling
+// thread. Pass zero to restore LUCE_MMVQ_MAX_NCOLS. This is intentionally
+// thread-local so one graph builder can select a safe topology without
+// changing concurrent requests or other CUDA/HIP backends.
+GGML_BACKEND_API void ggml_backend_cuda_set_mmvq_max_ncols_override(int max_ncols);
 
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
