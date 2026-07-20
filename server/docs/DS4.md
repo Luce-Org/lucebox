@@ -183,13 +183,13 @@ export DFLASH_DS4_SPEC_Q=4
   --ds4-expert-top-k 4
 ```
 
-`DFLASH_DS4_FUSED_VERIFY=1` is the opt-in throughput profile. Its persistent
-whole-model GPU graph uses stable padded reduction shapes, so near-tied greedy
-logits can select a different token than the normal causal verifier even at
-temperature 0. Leave it unset when comparing against the normal verifier, or
-set `DFLASH_DS4_SEQ_VERIFY=1` for the slower token-at-a-time verification
-diagnostic. Neither fused verification nor the separate
-`--ds4-expert-top-k 4` approximation should be presented as byte-identical AR.
+`DFLASH_DS4_FUSED_VERIFY=1` requests the fused throughput profile, but falls
+back to the normal verifier because the persistent whole-model GPU graph can
+select a different greedy token at near-tied logits. The approximate graph is
+available only for explicit research runs by also setting
+`DFLASH_DS4_ALLOW_APPROX_FUSED_VERIFY=1`; it must not be presented as
+byte-identical. `DFLASH_DS4_SEQ_VERIFY=1` remains the slower token-at-a-time
+diagnostic. The separate `--ds4-expert-top-k 4` policy is also approximate.
 
 DSpark currently requires monolithic target placement. On HIP,
 `--ds4-fused-decode` selects that placement; if the target falls back to hybrid
@@ -216,6 +216,8 @@ confidence of the proposed prefix. It adds the projection to the same fused
 Markov graph and reads its scores in the existing token-id synchronization; no
 additional host round trip is introduced. Artifacts without a compatible
 confidence head transparently retain the existing acceptance-EWMA policy.
+Set `DFLASH_DS4_ADAPTIVE_WIDTH=0` to hold the verify width fixed for parity
+tests; the environment value takes precedence over the legacy `/tmp` control.
 
 On the gfx1151 validation host, confidence-adaptive width retained 10/10
 GSM+Math accuracy and measured 31.94 tok/s weighted, within 0.6% of fixed q=4
