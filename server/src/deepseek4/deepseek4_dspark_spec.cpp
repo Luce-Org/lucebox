@@ -43,9 +43,9 @@ namespace dflash::common {
 class DeepSeek4DFlashTarget : public DFlashTarget {
 public:
     DeepSeek4DFlashTarget(const DeepSeek4Weights & w, DeepSeek4Cache & cache,
-                          ggml_backend_t backend, ggml_backend_t snap_backend,
+                          ggml_backend_t backend, int device, ggml_backend_t snap_backend,
                           std::vector<int> capture_ids, int mask_tok)
-        : w_(w), cache_(cache), backend_(backend), snap_backend_(snap_backend),
+        : w_(w), cache_(cache), backend_(backend), device_(device), snap_backend_(snap_backend),
           capture_ids_(std::move(capture_ids)), mask_tok_(mask_tok) {}
 
     ~DeepSeek4DFlashTarget() override { clear_snapshot(); }
@@ -80,7 +80,7 @@ public:
                 std::vector<int32_t> am1;
                 std::vector<float> feat1;
                 std::vector<float> logits1;
-                if (!deepseek4_dspark_verify_forward(backend_, w_, cache_, capture_ids_,
+                if (!deepseek4_dspark_verify_forward(backend_, device_, w_, cache_, capture_ids_,
                                                      embed_buf_.data() + (size_t) t * w_.n_embd,
                                                      tokens.data() + t, 1, base_pos + t, am1,
                                                      keep_logits_ ? &logits1 : nullptr,
@@ -103,7 +103,7 @@ public:
         std::vector<int32_t> am;
         // n==1 must take the dynamic (non-reuse) path: the reused decode graph
         // skips the capture/all-logits hooks (backend HC), which this needs.
-        if (!deepseek4_dspark_verify_forward(backend_, w_, cache_, capture_ids_,
+        if (!deepseek4_dspark_verify_forward(backend_, device_, w_, cache_, capture_ids_,
                                              embed_buf_.data(), tokens.data(), n, base_pos, am,
                                              keep_logits_ ? &verify_logits_ : nullptr,
                                              verify_features_, telemetry_,
@@ -195,6 +195,7 @@ private:
     const DeepSeek4Weights & w_;
     DeepSeek4Cache & cache_;
     ggml_backend_t backend_;
+    int device_;
     ggml_backend_t snap_backend_;
     std::vector<int> capture_ids_;
     int mask_tok_;
@@ -359,6 +360,7 @@ void deepseek4_spec_rollback_apply(const DeepSeek4SpecRollback & rollback,
 // touches the fused single-token 23 tok/s path, with the Ds4VerifyHooks that
 // add per-layer mean-over-HC capture and full per-position logits.
 bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
+                                     int device,
                                      const DeepSeek4Weights & w,
                                      DeepSeek4Cache & cache,
                                      const std::vector<int> & capture_layer_ids,
@@ -378,7 +380,7 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
     hooks.capture_layer_ids = &capture_layer_ids;
     hooks.capture_out = &capture_out;
     hooks.all_logits_out = &all_logits;
-    if (!deepseek4_step_layer_range(backend, w, cache, hc_state, embed, n_tokens, kv_start,
+    if (!deepseek4_step_layer_range(backend, device, w, cache, hc_state, embed, n_tokens, kv_start,
                                     0, w.n_layer, &last_logits, token_ids,
                                     telemetry, allow_graph_reuse,
                                     &hooks)) {
@@ -404,6 +406,7 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
 
 bool run_deepseek4_dspark_spec_decode(
         ggml_backend_t backend,
+        int device,
         const DeepSeek4Weights & target_w,
         DeepSeek4Cache & target_cache,
         const DSparkDrafter & drafter,
@@ -475,7 +478,7 @@ bool run_deepseek4_dspark_spec_decode(
     ggml_backend_t snap_backend = ggml_backend_cpu_init();
     if (!snap_backend) { std::fprintf(stderr, "[ds4-spec] no CPU snapshot backend\n"); return false; }
 
-    DeepSeek4DFlashTarget target(target_w, target_cache, backend, snap_backend,
+    DeepSeek4DFlashTarget target(target_w, target_cache, backend, device, snap_backend,
                                  drafter.capture_layer_ids, drafter.mask_token_id);
     DraftWeights dw = make_dspark_shim(drafter);
     DeepSeek4SpecRollback rollback;

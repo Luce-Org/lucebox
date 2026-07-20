@@ -124,6 +124,13 @@ size_t DeepSeek4LayerSplitAdapter::hc_state_elements(
     return (size_t) weights.n_hc * (size_t) weights.n_embd;
 }
 
+const float * DeepSeek4LayerSplitAdapter::local_shard_input(
+        size_t shard_index,
+        const std::vector<float> & token_embeddings,
+        const std::vector<float> & hc_state) {
+    return shard_index == 0 ? token_embeddings.data() : hc_state.data();
+}
+
 int DeepSeek4LayerSplitAdapter::compute_auto_split_layers() const {
     // Check env override first
     int override_layers = env_int("DFLASH_DS4_CUDA_LAYERS", -1);
@@ -414,22 +421,22 @@ void DeepSeek4LayerSplitAdapter::begin_request(const GenerateRequest & req) {
 void DeepSeek4LayerSplitAdapter::reset_request_state() {
     cur_pos_ = 0;
     last_tok_ = -1;
-    const size_t hc_size = hc_state_.size();
     std::fill(hc_state_.begin(), hc_state_.end(), 0.0f);
 
+    // Reset the backing tensors as well as their logical positions. The
+    // compressor uses double-buffered state, so merely rewinding the counters
+    // lets a new request pool over rows left by the previous request.
     for (auto & shard : shards_) {
-        shard.cache.cur_pos = 0;
-        for (auto & lc : shard.cache.layers) {
-            lc.n_comp = 0;
-            lc.n_index_comp = 0;
-        }
+        reset_deepseek4_cache(shard.cache);
     }
 
-    if (remote_target_shard_.active()) {
-        remote_target_shard_.reset_request_state();
+    if (remote_target_shard_.active() &&
+        !remote_target_shard_.reset_request_state()) {
+        std::fprintf(stderr,
+                     "[deepseek4-split] remote shard reset_request_state failed\n");
     }
 
-    (void)hc_size;
+    prefill_last_logits_.clear();
 }
 
 bool DeepSeek4LayerSplitAdapter::run_forward(
@@ -443,7 +450,6 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
     const auto forward_t0 = SplitClock::now();
     const int n_tokens = (int)tokens.size();
     const int n_embd = shards_[0].weights.n_embd;
-    const int n_hc = shards_[0].weights.n_hc;
 
     // Embed tokens on first shard
     auto & first_shard = shards_[0];
@@ -455,17 +461,6 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
     }
     DeepSeek4StepTelemetry tel_acc;
     if (timing) tel_acc.embed_us = split_elapsed_us(embed_t0, SplitClock::now());
-
-    // Initialize HC state from embedding for new sequences
-    if (base_pos == 0 && cur_pos_ == 0) {
-        for (int t = 0; t < n_tokens; ++t) {
-            for (int h = 0; h < n_hc; ++h) {
-                std::memcpy(hc_state_.data() + (size_t)h * n_embd,
-                           embed.data() + (size_t)t * n_embd,
-                           (size_t)n_embd * sizeof(float));
-            }
-        }
-    }
 
     // If using mixed target split (remote Halo shard), delegate to that path
     if (use_mixed_target_split()) {
@@ -479,10 +474,11 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
         const bool is_last = (si == shards_.size() - 1);
         std::vector<float> * shard_logits = is_last ? logits_out : nullptr;
         DeepSeek4StepTelemetry step_tel;
+        const float * shard_input = local_shard_input(si, embed, hc_state_);
 
         if (!deepseek4_step_layer_range(
-                shard.backend, shard.weights, shard.cache,
-                hc_state_, embed.data(), n_tokens, base_pos,
+                shard.backend, shard.gpu, shard.weights, shard.cache,
+                hc_state_, shard_input, n_tokens, base_pos,
                 shard.layer_begin, shard.layer_end,
                 shard_logits, tokens.data(), timing ? &step_tel : nullptr)) {
             std::fprintf(stderr, "[deepseek4-split] forward failed on shard %zu\n", si);
@@ -531,7 +527,7 @@ bool DeepSeek4LayerSplitAdapter::run_mixed_forward(
 
     // Run only the local shard's layer range, getting hidden state output
     std::vector<float> hidden_out;
-    if (!deepseek4_step_layer_range(local_shard.backend, local_shard.weights,
+    if (!deepseek4_step_layer_range(local_shard.backend, local_shard.gpu, local_shard.weights,
                                      local_shard.cache, hc_state_,
                                      embed.data(), n_tokens, base_pos,
                                      local_shard.layer_begin, local_shard.layer_end,

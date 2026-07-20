@@ -118,6 +118,7 @@ bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
 //                 main_hidden feed.
 // Advances/updates the target cache exactly like a decode of these tokens.
 bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
+                                     int device,
                                      const DeepSeek4Weights & w,
                                      DeepSeek4Cache & cache,
                                      const std::vector<int> & capture_layer_ids,
@@ -165,6 +166,7 @@ void deepseek4_spec_rollback_apply(const DeepSeek4SpecRollback & rollback,
 struct GenerateRequest;  // fwd (from common/…); the loop only needs n_gen + committed
 bool run_deepseek4_dspark_spec_decode(
         ggml_backend_t backend,
+        int device,
         const DeepSeek4Weights & target_w,
         DeepSeek4Cache & target_cache,
         const DSparkDrafter & drafter,

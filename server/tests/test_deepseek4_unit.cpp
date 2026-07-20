@@ -28,6 +28,7 @@
 #include <limits>
 #include <numeric>
 #include <sys/stat.h>
+#include <thread>
 #include <vector>
 #include <unistd.h>
 
@@ -1803,16 +1804,26 @@ static void test_reset_request_state() {
     std::fprintf(stderr, "  test_reset_request_state ...");
 
     auto adapter = make_test_adapter();
+    TEST_ASSERT(init_snapshot_test_shard(adapter));
+    if (adapter.shards_.empty() || !adapter.shards_[0].cache.buf) {
+        std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+        return;
+    }
+
     adapter.cur_pos_ = 9;
     adapter.last_tok_ = 77;
     adapter.hc_state_.assign(8, 5.0f);
-    adapter.shards_.resize(2);
+    adapter.prefill_last_logits_ = {1.0f, 2.0f};
     for (auto & shard : adapter.shards_) {
         shard.cache.cur_pos = 11;
-        shard.cache.layers.resize(3);
         for (auto & layer : shard.cache.layers) {
             layer.n_comp = 4;
             layer.n_index_comp = 6;
+            if (layer.raw_kv) write_tensor_pattern(layer.raw_kv, 23);
+            if (layer.comp_kv) write_tensor_pattern(layer.comp_kv, 31);
+            if (layer.attn_compressor.state_kv) {
+                write_tensor_pattern(layer.attn_compressor.state_kv, 47);
+            }
         }
     }
 
@@ -1822,11 +1833,21 @@ static void test_reset_request_state() {
     for (float v : adapter.hc_state_) {
         TEST_ASSERT(v == 0.0f);
     }
+    TEST_ASSERT(adapter.prefill_last_logits_.empty());
     for (const auto & shard : adapter.shards_) {
         TEST_ASSERT(shard.cache.cur_pos == 0);
         for (const auto & layer : shard.cache.layers) {
             TEST_ASSERT(layer.n_comp == 0);
             TEST_ASSERT(layer.n_index_comp == 0);
+            for (const ggml_tensor * tensor : {
+                     layer.raw_kv,
+                     layer.comp_kv,
+                     layer.attn_compressor.state_kv}) {
+                if (!tensor) continue;
+                const std::vector<uint8_t> bytes = read_tensor_bytes(tensor);
+                TEST_ASSERT(std::all_of(bytes.begin(), bytes.end(),
+                                        [](uint8_t value) { return value == 0; }));
+            }
         }
     }
 
@@ -2534,7 +2555,9 @@ static void test_cpu_hc_sinkhorn_ref(float * out, const float * mix, const float
         out[n_hc + i] = 2.0f / (1.0f + std::exp(-z));
     }
 
-    float c[16];
+    // The scratch-capacity test exercises n_hc=8, so this reference buffer
+    // cannot be fixed at the model-default 4x4 shape.
+    std::vector<float> c((size_t) n_hc * (size_t) n_hc);
     for (int dst = 0; dst < n_hc; ++dst) {
         float row_max = -1.0e30f;
         for (int src = 0; src < n_hc; ++src) {
@@ -2854,6 +2877,253 @@ static void test_hc_pre_kernel_gpu() {
     ggml_free(ctx);
     ggml_backend_free(backend);
 }
+
+// The stale-boundary guard in deepseek4_step_layer_range must fire before any
+// backend, cache, or weight access, so stub weights and a null backend are
+// sufficient to pin it.
+static void test_layer_range_rejects_stale_hc_boundary() {
+    std::fprintf(stderr, "  test_layer_range_rejects_stale_hc_boundary ...");
+    DeepSeek4Weights w;
+    w.n_layer = 4;
+    w.n_embd = 8;
+    w.n_hc = 4;
+    DeepSeek4Cache cache;
+
+    const int n_tokens = 1;
+    const size_t hc_dim = (size_t) w.n_embd * (size_t) w.n_hc;
+
+    // Later-shard call where embed aliases hc_state but the carried state has
+    // a stale size: must fail without resizing, because a resize would free
+    // the buffer embed points into.
+    std::vector<float> hc_state(hc_dim / 2, 0.0f);
+    const float * stale_alias = hc_state.data();
+    bool ok = deepseek4_step_layer_range(
+        /*backend=*/nullptr, /*device=*/0, w, cache, hc_state,
+        stale_alias, n_tokens, /*kv_start=*/0,
+        /*layer_begin=*/2, /*layer_end=*/4, /*out_logits=*/nullptr);
+    TEST_ASSERT_MSG(!ok, "stale aliased HC boundary state must be rejected");
+    TEST_ASSERT_MSG(hc_state.size() == hc_dim / 2,
+                    "rejected call must not resize the aliased HC state");
+    TEST_ASSERT_MSG(cache.layer_range_cache == nullptr,
+                    "guard must fire before the layer-range cache is created");
+
+    // Later-shard call with no boundary state at all.
+    std::vector<float> missing_state;
+    ok = deepseek4_step_layer_range(
+        nullptr, 0, w, cache, missing_state,
+        /*embed=*/nullptr, n_tokens, 0, 2, 4, nullptr);
+    TEST_ASSERT_MSG(!ok, "missing HC boundary state must be rejected");
+    TEST_ASSERT_MSG(cache.layer_range_cache == nullptr,
+                    "guard must fire before the layer-range cache is created");
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+#if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
+static void test_hc_scratch_per_device() {
+    std::fprintf(stderr, "  test_hc_scratch_per_device ...");
+    if (ggml_backend_cuda_get_device_count() < 2) {
+        std::fprintf(stderr, " skipped (requires two GPU devices)\n");
+        return;
+    }
+
+    constexpr int n_embd = 32;
+    constexpr int n_hc = 4;
+    constexpr int sinkhorn_iters = 6;
+    constexpr float hc_eps = 1.0e-6f;
+    constexpr int mix_dim = 2 * n_hc + n_hc * n_hc;
+    constexpr int hc_dim = n_embd * n_hc;
+
+    std::vector<float> hc_state((size_t) hc_dim);
+    std::iota(hc_state.begin(), hc_state.end(), -16.0f);
+    for (float & value : hc_state) value *= 0.01f;
+    std::vector<ggml_fp16_t> fn_f16((size_t) mix_dim * (size_t) hc_dim,
+                                     ggml_fp32_to_fp16(0.0f));
+    std::vector<float> scale((size_t) mix_dim, 0.0f);
+    scale[0] = 1.0f;
+    scale[1] = 1.0f;
+    scale[2] = 1.0f;
+    std::vector<float> base((size_t) mix_dim, 0.0f);
+
+    struct Result {
+        bool ok = false;
+        std::vector<float> working;
+        std::vector<float> post;
+        std::vector<float> comb;
+
+        Result(int embd, int hc)
+            : working((size_t) embd),
+              post((size_t) hc),
+              comb((size_t) hc * (size_t) hc) {}
+    };
+
+    auto run_on_worker = [&](int device, Result & result) {
+        std::thread worker([&, device]() {
+            if (!deepseek4_cuda_hc_set_device(device)) {
+                return;
+            }
+            ggml_backend_t dev_backend = ggml_backend_cuda_init(device);
+            if (!dev_backend) {
+                return;
+            }
+            ggml_context * ctx = make_test_context(1u << 16);
+            ggml_tensor * fn_t =
+                ctx ? ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hc_dim, mix_dim) : nullptr;
+            ggml_backend_buffer_t buf =
+                fn_t ? ggml_backend_alloc_ctx_tensors(ctx, dev_backend) : nullptr;
+            if (buf) {
+                ggml_backend_tensor_set(fn_t, fn_f16.data(), 0,
+                                        fn_f16.size() * sizeof(ggml_fp16_t));
+                result.ok = deepseek4_cuda_hc_pre(
+                    hc_state.data(), fn_t->data, scale.data(), base.data(),
+                    n_embd, n_hc, sinkhorn_iters, hc_eps,
+                    result.working.data(), result.post.data(), result.comb.data());
+                ggml_backend_buffer_free(buf);
+            }
+            if (ctx) ggml_free(ctx);
+            ggml_backend_free(dev_backend);
+        });
+        worker.join();
+    };
+
+    Result first_device(n_embd, n_hc);
+    Result second_device(n_embd, n_hc);
+    Result first_device_again(n_embd, n_hc);
+    run_on_worker(0, first_device);
+    run_on_worker(1, second_device);
+    run_on_worker(0, first_device_again);
+
+    TEST_ASSERT_MSG(first_device.ok, "HC direct call failed on GPU device 0");
+    TEST_ASSERT_MSG(second_device.ok, "HC direct call failed on GPU device 1");
+    TEST_ASSERT_MSG(first_device_again.ok, "HC direct call failed after returning to GPU device 0");
+    if (first_device.ok && second_device.ok && first_device_again.ok) {
+        for (int i = 0; i < n_embd; ++i) {
+            TEST_ASSERT(nearly_equal(first_device.working[(size_t) i],
+                                     second_device.working[(size_t) i]));
+            TEST_ASSERT(nearly_equal(first_device.working[(size_t) i],
+                                     first_device_again.working[(size_t) i]));
+        }
+        for (int i = 0; i < n_hc; ++i) {
+            TEST_ASSERT(nearly_equal(first_device.post[(size_t) i],
+                                     second_device.post[(size_t) i]));
+        }
+        for (int i = 0; i < n_hc * n_hc; ++i) {
+            TEST_ASSERT(nearly_equal(first_device.comb[(size_t) i],
+                                     second_device.comb[(size_t) i]));
+        }
+    }
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_hc_set_device_contract() {
+    std::fprintf(stderr, "  test_hc_set_device_contract ...");
+    // Device selection is per host thread; run on a worker so the rejected
+    // selections cannot leave sticky CUDA error state on the main thread.
+    std::thread worker([]() {
+        TEST_ASSERT_MSG(!deepseek4_cuda_hc_set_device(-1),
+                        "negative device must be rejected");
+        const int device_count = ggml_backend_cuda_get_device_count();
+        TEST_ASSERT_MSG(!deepseek4_cuda_hc_set_device(device_count),
+                        "out-of-range device must be rejected");
+        if (device_count > 0) {
+            TEST_ASSERT_MSG(deepseek4_cuda_hc_set_device(0),
+                            "selecting device 0 failed");
+        }
+    });
+    worker.join();
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_hc_scratch_shape_capacity() {
+    std::fprintf(stderr, "  test_hc_scratch_shape_capacity ...");
+    if (!deepseek4_cuda_hc_set_device(0)) {
+        std::fprintf(stderr, " skipped (no GPU device)\n");
+        return;
+    }
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        std::fprintf(stderr, " skipped (no GPU backend)\n");
+        return;
+    }
+
+    constexpr int sinkhorn_iters = 6;
+    constexpr float hc_eps = 1.0e-6f;
+    // Grow both shape axes past the first call, then shrink back: every run
+    // must stay correct while the per-device scratch reallocates and reuses.
+    const int shapes[][2] = {{32, 2}, {192, 8}, {32, 2}};
+
+    std::mt19937 rng(321);
+    std::uniform_real_distribution<float> dist(-0.2f, 0.2f);
+
+    for (const auto & shape : shapes) {
+        const int n_embd = shape[0];
+        const int n_hc = shape[1];
+        const int hc_dim = n_embd * n_hc;
+        const int mix_dim = 2 * n_hc + n_hc * n_hc;
+
+        std::vector<float> hc_state((size_t) hc_dim);
+        std::vector<ggml_fp16_t> fn_f16((size_t) mix_dim * (size_t) hc_dim);
+        std::vector<float> scale((size_t) mix_dim, 0.0f);
+        std::vector<float> base((size_t) mix_dim);
+        for (float & v : hc_state) v = dist(rng);
+        for (ggml_fp16_t & v : fn_f16) v = ggml_fp32_to_fp16(dist(rng));
+        scale[0] = 0.9f;
+        scale[1] = 1.05f;
+        scale[2] = 1.0f;
+        for (float & v : base) v = 0.1f * dist(rng);
+
+        std::vector<float> ref_working;
+        std::vector<float> ref_post;
+        std::vector<float> ref_comb;
+        test_reference_hc_pre(hc_state, fn_f16, scale, base, n_embd, n_hc,
+                              sinkhorn_iters, hc_eps,
+                              ref_working, ref_post, ref_comb);
+
+        ggml_context * ctx = make_test_context(1u << 16);
+        TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+        if (!ctx) break;
+        ggml_tensor * fn_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hc_dim, mix_dim);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        TEST_ASSERT_MSG(buf != nullptr, "ggml backend buffer alloc failed");
+        if (!buf) {
+            ggml_free(ctx);
+            break;
+        }
+        ggml_backend_tensor_set(fn_t, fn_f16.data(), 0,
+                                fn_f16.size() * sizeof(ggml_fp16_t));
+
+        std::vector<float> working((size_t) n_embd);
+        std::vector<float> post((size_t) n_hc);
+        std::vector<float> comb((size_t) n_hc * (size_t) n_hc);
+        const bool ok = deepseek4_cuda_hc_pre(
+            hc_state.data(), fn_t->data, scale.data(), base.data(),
+            n_embd, n_hc, sinkhorn_iters, hc_eps,
+            working.data(), post.data(), comb.data());
+        TEST_ASSERT_MSG(ok, "HC pre failed after scratch shape change");
+        if (ok) {
+            for (int i = 0; i < n_embd; ++i) {
+                TEST_ASSERT_MSG(
+                    nearly_equal(working[(size_t) i], ref_working[(size_t) i], 2.0e-4f, 2.0e-4f),
+                    "working mismatch after scratch shape change");
+            }
+            for (int i = 0; i < n_hc; ++i) {
+                TEST_ASSERT_MSG(
+                    nearly_equal(post[(size_t) i], ref_post[(size_t) i], 2.0e-4f, 2.0e-4f),
+                    "post mismatch after scratch shape change");
+            }
+            for (int i = 0; i < n_hc * n_hc; ++i) {
+                TEST_ASSERT_MSG(
+                    nearly_equal(comb[(size_t) i], ref_comb[(size_t) i], 2.0e-4f, 2.0e-4f),
+                    "comb mismatch after scratch shape change");
+            }
+        }
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    ggml_backend_free(backend);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+#endif
 #endif
 
 int main() {
@@ -2906,6 +3176,10 @@ int main() {
     test_ds4_flash_attention_inverse_rope_fallback_gpu();
     test_hc_post_strided_split_gpu();
     test_hc_pre_kernel_gpu();
+    test_layer_range_rejects_stale_hc_boundary();
+    test_hc_scratch_per_device();
+    test_hc_set_device_contract();
+    test_hc_scratch_shape_capacity();
 #endif
 
     ggml_backend_free(backend);
