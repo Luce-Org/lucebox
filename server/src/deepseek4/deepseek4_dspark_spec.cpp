@@ -31,6 +31,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -45,9 +46,14 @@ class DeepSeek4DFlashTarget : public DFlashTarget {
 public:
     DeepSeek4DFlashTarget(const DeepSeek4Weights & w, DeepSeek4Cache & cache,
                           ggml_backend_t backend, ggml_backend_t snap_backend,
-                          std::vector<int> capture_ids, int mask_tok)
+                          std::vector<int> capture_ids, int mask_tok,
+                          MoeHybridStorage * moe_hybrid,
+                          MoeExpertComputeRuntime * expert_runtime,
+                          MoeHybridRoutingStats * routing_stats)
         : w_(w), cache_(cache), backend_(backend), snap_backend_(snap_backend),
-          capture_ids_(std::move(capture_ids)), mask_tok_(mask_tok) {}
+          capture_ids_(std::move(capture_ids)), mask_tok_(mask_tok),
+          moe_hybrid_(moe_hybrid), expert_runtime_(expert_runtime),
+          routing_stats_(routing_stats) {}
 
     ~DeepSeek4DFlashTarget() override { clear_snapshot(); }
 
@@ -86,7 +92,9 @@ public:
                                                      tokens.data() + t, 1, base_pos + t, am1,
                                                      keep_logits_ ? &logits1 : nullptr,
                                                      feat1, telemetry_,
-                                                     /*allow_graph_reuse=*/false)) {
+                                                     /*allow_graph_reuse=*/false,
+                                                     moe_hybrid_, expert_runtime_,
+                                                     routing_stats_)) {
                     return false;
                 }
                 if (am1.empty()) return false;
@@ -108,7 +116,9 @@ public:
                                              embed_buf_.data(), tokens.data(), n, base_pos, am,
                                              keep_logits_ ? &verify_logits_ : nullptr,
                                              verify_features_, telemetry_,
-                                             /*allow_graph_reuse=*/n > 1)) {
+                                             /*allow_graph_reuse=*/n > 1,
+                                             moe_hybrid_, expert_runtime_,
+                                             routing_stats_)) {
             return false;
         }
         if (am.empty()) return false;
@@ -206,6 +216,9 @@ private:
     std::vector<float> embed_buf_;
     std::vector<float> verify_logits_;
     std::vector<float> verify_features_;
+    MoeHybridStorage * moe_hybrid_ = nullptr;
+    MoeExpertComputeRuntime * expert_runtime_ = nullptr;
+    MoeHybridRoutingStats * routing_stats_ = nullptr;
 };
 
 namespace {
@@ -238,52 +251,190 @@ constexpr float kConfidenceQ3Threshold = 0.40f;
 constexpr float kConfidenceQ4Threshold = 0.30f;
 
 // ── Light rollback state ────────────────────────────────────────────────
+// Save the ratio-4 rolling state, HC state, and the raw SWA rows that a q<=4
+// verify may overwrite. Pinned host storage lets the GPU copy this compact
+// rollback state on its stream before the verifier without a host fence.
 // prev-half = first 4 rows of a [comp_width, 8] ratio-4 rolling state.
 // ratio-128 states ([comp_width, 128]) are pure position rings -> skip.
-void save_prev_half(ggml_tensor * t, std::vector<uint8_t> & buf) {
-    if (!t || t->ne[1] != 8) { buf.clear(); return; }
-    const size_t bytes = (size_t) t->nb[1] * 4;
-    if (buf.size() != bytes) buf.resize(bytes);
-    ggml_backend_tensor_get(t, buf.data(), 0, bytes);
+size_t prev_half_bytes(const ggml_tensor * t) {
+    return t && t->ne[1] == 8 ? (size_t) t->nb[1] * 4 : 0;
 }
 
-void restore_prev_half(ggml_tensor * t, const std::vector<uint8_t> & buf) {
-    if (!t || buf.empty()) return;
-    ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
+size_t align_up_rollback(size_t value, size_t alignment) {
+    return (value + alignment - 1) / alignment * alignment;
 }
 
-void spec_rollback_save_impl(const DeepSeek4Cache & cache,
-                             DeepSeek4SpecRollback & rb,
-                             int raw_pos, int raw_count) {
-    rb.raw_pos = raw_pos;
-    rb.raw_count = std::max(0, raw_count);
+void assign_pinned_span(DeepSeek4SpecRollback::PinnedSpan & span, size_t bytes,
+                        size_t & total) {
+    if (bytes == 0) {
+        span = {};
+        return;
+    }
+    total = align_up_rollback(total, 64);
+    span.offset = total;
+    span.size = bytes;
+    total += bytes;
+}
+
+bool init_pinned_rollback(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb,
+                          ggml_backend_t backend) {
+    if (rb.pinned_buf) return true;
+
     rb.layers.resize(cache.layers.size());
+    size_t total = 0;
     for (size_t il = 0; il < cache.layers.size(); ++il) {
         const DeepSeek4LayerCache & lc = cache.layers[il];
         DeepSeek4SpecRollback::Layer & s = rb.layers[il];
-        save_prev_half(lc.attn_compressor.state_kv,       s.attn_kv);
-        save_prev_half(lc.attn_compressor.state_score,    s.attn_sc);
-        save_prev_half(lc.indexer_compressor.state_kv,    s.idx_kv);
-        save_prev_half(lc.indexer_compressor.state_score, s.idx_sc);
-        s.raw_row_bytes = 0;
-        s.raw_rows.clear();
-        if (lc.raw_kv && lc.raw_kv->ne[1] > 0 && rb.raw_count > 0) {
-            s.raw_row_bytes = ggml_row_size(lc.raw_kv->type, lc.raw_kv->ne[0]);
+        assign_pinned_span(
+            s.pinned_attn_kv, prev_half_bytes(lc.attn_compressor.state_kv), total);
+        assign_pinned_span(
+            s.pinned_attn_sc, prev_half_bytes(lc.attn_compressor.state_score), total);
+        assign_pinned_span(
+            s.pinned_idx_kv, prev_half_bytes(lc.indexer_compressor.state_kv), total);
+        assign_pinned_span(
+            s.pinned_idx_sc, prev_half_bytes(lc.indexer_compressor.state_score), total);
+        s.raw_row_bytes = lc.raw_kv
+            ? ggml_row_size(lc.raw_kv->type, lc.raw_kv->ne[0]) : 0;
+        assign_pinned_span(s.pinned_raw_rows, s.raw_row_bytes * 4, total);
+    }
+    assign_pinned_span(
+        rb.pinned_hc, cache.hc_state ? ggml_nbytes(cache.hc_state) : 0, total);
+    if (total == 0) return false;
+
+    ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    ggml_backend_buffer_type_t buft =
+        device ? ggml_backend_dev_host_buffer_type(device) : nullptr;
+    if (!buft) return false;
+
+    rb.pinned_buf = ggml_backend_buft_alloc_buffer(buft, total);
+    if (!rb.pinned_buf) return false;
+    rb.pinned_base =
+        static_cast<uint8_t *>(ggml_backend_buffer_get_base(rb.pinned_buf));
+    if (!rb.pinned_base) {
+        ggml_backend_buffer_free(rb.pinned_buf);
+        rb.pinned_buf = nullptr;
+        return false;
+    }
+    return true;
+}
+
+void save_prev_half(ggml_backend_t backend, ggml_tensor * t,
+                    std::vector<uint8_t> & buf, bool async_copy) {
+    if (!t || t->ne[1] != 8) { buf.clear(); return; }
+    const size_t bytes = (size_t) t->nb[1] * 4;
+    if (buf.size() != bytes) buf.resize(bytes);
+    if (async_copy) {
+        ggml_backend_tensor_get_async(backend, t, buf.data(), 0, bytes);
+    } else {
+        ggml_backend_tensor_get(t, buf.data(), 0, bytes);
+    }
+}
+
+void restore_prev_half(ggml_backend_t backend, ggml_tensor * t,
+                       const std::vector<uint8_t> & buf, bool async_copy) {
+    if (!t || buf.empty()) return;
+    if (async_copy) {
+        ggml_backend_tensor_set_async(backend, t, buf.data(), 0, buf.size());
+    } else {
+        ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
+    }
+}
+
+void save_prev_half_pinned(ggml_backend_t backend, ggml_tensor * t,
+                           uint8_t * base,
+                           const DeepSeek4SpecRollback::PinnedSpan & span) {
+    if (!t || span.size == 0) return;
+    GGML_ASSERT(span.size == prev_half_bytes(t));
+    ggml_backend_tensor_get_async(
+        backend, t, base + span.offset, 0, span.size);
+}
+
+void restore_prev_half_pinned(ggml_backend_t backend, ggml_tensor * t,
+                              const uint8_t * base,
+                              const DeepSeek4SpecRollback::PinnedSpan & span) {
+    if (!t || span.size == 0) return;
+    GGML_ASSERT(span.size == prev_half_bytes(t));
+    ggml_backend_tensor_set_async(
+        backend, t, base + span.offset, 0, span.size);
+}
+
+void spec_rollback_save(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb,
+                        ggml_backend_t backend, bool async_copy,
+                        bool pinned_copy, int raw_pos, int raw_count) {
+    rb.raw_pos = raw_pos;
+    rb.raw_count = std::clamp(raw_count, 0, 4);
+    rb.layers.resize(cache.layers.size());
+    if (async_copy || pinned_copy) {
+        rb.async_backend = backend;
+    }
+    const bool use_pinned =
+        pinned_copy && init_pinned_rollback(cache, rb, backend);
+    for (size_t il = 0; il < cache.layers.size(); ++il) {
+        const DeepSeek4LayerCache & lc = cache.layers[il];
+        DeepSeek4SpecRollback::Layer & s = rb.layers[il];
+        if (use_pinned) {
+            save_prev_half_pinned(
+                backend, lc.attn_compressor.state_kv,
+                rb.pinned_base, s.pinned_attn_kv);
+            save_prev_half_pinned(
+                backend, lc.attn_compressor.state_score,
+                rb.pinned_base, s.pinned_attn_sc);
+            save_prev_half_pinned(
+                backend, lc.indexer_compressor.state_kv,
+                rb.pinned_base, s.pinned_idx_kv);
+            save_prev_half_pinned(
+                backend, lc.indexer_compressor.state_score,
+                rb.pinned_base, s.pinned_idx_sc);
+        } else {
+            save_prev_half(backend, lc.attn_compressor.state_kv,       s.attn_kv, async_copy);
+            save_prev_half(backend, lc.attn_compressor.state_score,    s.attn_sc, async_copy);
+            save_prev_half(backend, lc.indexer_compressor.state_kv,    s.idx_kv, async_copy);
+            save_prev_half(backend, lc.indexer_compressor.state_score, s.idx_sc, async_copy);
+        }
+
+        s.raw_row_bytes = lc.raw_kv
+            ? ggml_row_size(lc.raw_kv->type, lc.raw_kv->ne[0]) : 0;
+        if (!lc.raw_kv || lc.raw_kv->ne[1] <= 0 ||
+            s.raw_row_bytes == 0 || rb.raw_count == 0) {
+            s.raw_rows.clear();
+            continue;
+        }
+        if (!use_pinned) {
             s.raw_rows.resize(s.raw_row_bytes * (size_t) rb.raw_count);
-            for (int t = 0; t < rb.raw_count; ++t) {
-                int row = (rb.raw_pos + t) % (int) lc.raw_kv->ne[1];
-                if (row < 0) row += (int) lc.raw_kv->ne[1];
+        }
+        for (int t = 0; t < rb.raw_count; ++t) {
+            int row = (rb.raw_pos + t) % (int) lc.raw_kv->ne[1];
+            if (row < 0) row += (int) lc.raw_kv->ne[1];
+            uint8_t * dst = use_pinned
+                ? rb.pinned_base + s.pinned_raw_rows.offset +
+                      (size_t) t * s.raw_row_bytes
+                : s.raw_rows.data() + (size_t) t * s.raw_row_bytes;
+            if (use_pinned || async_copy) {
+                ggml_backend_tensor_get_async(
+                    backend, lc.raw_kv, dst,
+                    (size_t) row * lc.raw_kv->nb[1], s.raw_row_bytes);
+            } else {
                 ggml_backend_tensor_get(
-                    lc.raw_kv,
-                    s.raw_rows.data() + (size_t) t * s.raw_row_bytes,
+                    lc.raw_kv, dst,
                     (size_t) row * lc.raw_kv->nb[1], s.raw_row_bytes);
             }
         }
     }
     if (cache.hc_state) {
         const size_t bytes = ggml_nbytes(cache.hc_state);
-        if (rb.hc_state.size() != bytes) rb.hc_state.resize(bytes);
-        ggml_backend_tensor_get(cache.hc_state, rb.hc_state.data(), 0, bytes);
+        if (use_pinned) {
+            ggml_backend_tensor_get_async(
+                backend, cache.hc_state,
+                rb.pinned_base + rb.pinned_hc.offset, 0, bytes);
+        } else {
+            if (rb.hc_state.size() != bytes) rb.hc_state.resize(bytes);
+            if (async_copy) {
+                ggml_backend_tensor_get_async(
+                    backend, cache.hc_state, rb.hc_state.data(), 0, bytes);
+            } else {
+                ggml_backend_tensor_get(cache.hc_state, rb.hc_state.data(), 0, bytes);
+            }
+        }
     }
 }
 
@@ -292,11 +443,11 @@ void spec_rollback_save_impl(const DeepSeek4Cache & cache,
 // prev-half rows with a chunk containing rejected tokens, so put the
 // pre-verify rows back. (A boundary strictly inside the committed range is a
 // legitimate flush and must be kept.)
-void spec_rollback_apply_impl(const DeepSeek4SpecRollback & rb,
-                              const DeepSeek4Weights & w,
-                              DeepSeek4Cache & cache,
-                              int commit_pos,
-                              bool restore_prev) {
+void spec_rollback_apply(const DeepSeek4SpecRollback & rb, const DeepSeek4Weights & w,
+                         DeepSeek4Cache & cache, int commit_pos, bool restore_prev,
+                         ggml_backend_t backend, bool async_copy,
+                         bool pinned_copy) {
+    const bool use_pinned = pinned_copy && rb.pinned_buf && rb.pinned_base;
     cache.cur_pos = commit_pos;
     for (size_t il = 0; il < cache.layers.size(); ++il) {
         DeepSeek4LayerCache & lc = cache.layers[il];
@@ -305,10 +456,25 @@ void spec_rollback_apply_impl(const DeepSeek4SpecRollback & rb,
         if (ratio == 4) lc.n_index_comp = commit_pos / 4;
         if (restore_prev && il < rb.layers.size()) {
             const DeepSeek4SpecRollback::Layer & s = rb.layers[il];
-            restore_prev_half(lc.attn_compressor.state_kv,       s.attn_kv);
-            restore_prev_half(lc.attn_compressor.state_score,    s.attn_sc);
-            restore_prev_half(lc.indexer_compressor.state_kv,    s.idx_kv);
-            restore_prev_half(lc.indexer_compressor.state_score, s.idx_sc);
+            if (use_pinned) {
+                restore_prev_half_pinned(
+                    backend, lc.attn_compressor.state_kv,
+                    rb.pinned_base, s.pinned_attn_kv);
+                restore_prev_half_pinned(
+                    backend, lc.attn_compressor.state_score,
+                    rb.pinned_base, s.pinned_attn_sc);
+                restore_prev_half_pinned(
+                    backend, lc.indexer_compressor.state_kv,
+                    rb.pinned_base, s.pinned_idx_kv);
+                restore_prev_half_pinned(
+                    backend, lc.indexer_compressor.state_score,
+                    rb.pinned_base, s.pinned_idx_sc);
+            } else {
+                restore_prev_half(backend, lc.attn_compressor.state_kv,       s.attn_kv, async_copy);
+                restore_prev_half(backend, lc.attn_compressor.state_score,    s.attn_sc, async_copy);
+                restore_prev_half(backend, lc.indexer_compressor.state_kv,    s.idx_kv, async_copy);
+                restore_prev_half(backend, lc.indexer_compressor.state_score, s.idx_sc, async_copy);
+            }
         }
         if (il < rb.layers.size() && lc.raw_kv && lc.raw_kv->ne[1] > 0) {
             const DeepSeek4SpecRollback::Layer & s = rb.layers[il];
@@ -316,19 +482,47 @@ void spec_rollback_apply_impl(const DeepSeek4SpecRollback & rb,
             for (int t = first_rejected;
                  t < rb.raw_count &&
                  s.raw_row_bytes > 0 &&
-                 s.raw_rows.size() >= (size_t) (t + 1) * s.raw_row_bytes;
                  ++t) {
                 int row = (rb.raw_pos + t) % (int) lc.raw_kv->ne[1];
                 if (row < 0) row += (int) lc.raw_kv->ne[1];
-                ggml_backend_tensor_set(
-                    lc.raw_kv,
-                    s.raw_rows.data() + (size_t) t * s.raw_row_bytes,
-                    (size_t) row * lc.raw_kv->nb[1], s.raw_row_bytes);
+                const uint8_t * src = nullptr;
+                if (use_pinned &&
+                    s.pinned_raw_rows.size >=
+                        (size_t) (t + 1) * s.raw_row_bytes) {
+                    src = rb.pinned_base + s.pinned_raw_rows.offset +
+                          (size_t) t * s.raw_row_bytes;
+                } else if (s.raw_rows.size() >=
+                           (size_t) (t + 1) * s.raw_row_bytes) {
+                    src = s.raw_rows.data() + (size_t) t * s.raw_row_bytes;
+                }
+                if (!src) continue;
+                if (use_pinned || async_copy) {
+                    ggml_backend_tensor_set_async(
+                        backend, lc.raw_kv, src,
+                        (size_t) row * lc.raw_kv->nb[1], s.raw_row_bytes);
+                } else {
+                    ggml_backend_tensor_set(
+                        lc.raw_kv, src,
+                        (size_t) row * lc.raw_kv->nb[1], s.raw_row_bytes);
+                }
             }
         }
     }
-    if (restore_prev && cache.hc_state && !rb.hc_state.empty()) {
-        ggml_backend_tensor_set(cache.hc_state, rb.hc_state.data(), 0, rb.hc_state.size());
+    if (restore_prev && cache.hc_state) {
+        if (use_pinned && rb.pinned_hc.size > 0) {
+            ggml_backend_tensor_set_async(
+                backend, cache.hc_state,
+                rb.pinned_base + rb.pinned_hc.offset, 0, rb.pinned_hc.size);
+        } else if (!rb.hc_state.empty()) {
+            if (async_copy) {
+                ggml_backend_tensor_set_async(
+                    backend, cache.hc_state,
+                    rb.hc_state.data(), 0, rb.hc_state.size());
+            } else {
+                ggml_backend_tensor_set(
+                    cache.hc_state, rb.hc_state.data(), 0, rb.hc_state.size());
+            }
+        }
     }
 }
 
@@ -340,11 +534,22 @@ double spec_ms_since(SpecClock::time_point t0) {
 
 }  // namespace
 
+DeepSeek4SpecRollback::~DeepSeek4SpecRollback() {
+    if (async_backend) {
+        ggml_backend_synchronize(async_backend);
+    }
+    if (pinned_buf) {
+        ggml_backend_buffer_free(pinned_buf);
+    }
+}
+
 void deepseek4_spec_rollback_save(const DeepSeek4Cache & cache,
                                   DeepSeek4SpecRollback & rollback,
                                   int raw_pos,
                                   int raw_count) {
-    spec_rollback_save_impl(cache, rollback, raw_pos, raw_count);
+    spec_rollback_save(cache, rollback, nullptr,
+                       /*async_copy=*/false, /*pinned_copy=*/false,
+                       raw_pos, raw_count);
 }
 
 void deepseek4_spec_rollback_apply(const DeepSeek4SpecRollback & rollback,
@@ -352,7 +557,9 @@ void deepseek4_spec_rollback_apply(const DeepSeek4SpecRollback & rollback,
                                    DeepSeek4Cache & cache,
                                    int commit_pos,
                                    bool restore_prev) {
-    spec_rollback_apply_impl(rollback, weights, cache, commit_pos, restore_prev);
+    spec_rollback_apply(rollback, weights, cache, commit_pos, restore_prev,
+                        nullptr, /*async_copy=*/false,
+                        /*pinned_copy=*/false);
 }
 
 // Batched target verify + capture: wraps the existing multi-token
@@ -371,21 +578,34 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
                                      std::vector<float> * logits_out,
                                      std::vector<float> & capture_out,
                                      DeepSeek4StepTelemetry * telemetry,
-                                     bool allow_graph_reuse) {
+                                     bool allow_graph_reuse,
+                                     MoeHybridStorage * moe_hybrid,
+                                     MoeExpertComputeRuntime * expert_runtime,
+                                     MoeHybridRoutingStats * routing_stats) {
     std::vector<float> hc_state;
     std::vector<float> all_logits;
     std::vector<float> last_logits;
+    std::vector<int32_t> gpu_argmax;
     Ds4VerifyHooks hooks;
     hooks.capture_layer_ids = &capture_layer_ids;
     hooks.capture_out = &capture_out;
     hooks.all_logits_out = &all_logits;
+    hooks.argmax_out = &gpu_argmax;
+    hooks.prefer_argmax_only =
+        spec_env_flag("DFLASH_DS4_GPU_ARGMAX_VERIFY") && logits_out == nullptr;
     if (!deepseek4_step_layer_range(backend, w, cache, hc_state, embed, n_tokens, kv_start,
                                     0, w.n_layer, &last_logits, token_ids,
                                     telemetry, allow_graph_reuse,
-                                    &hooks)) {
+                                    &hooks, moe_hybrid, expert_runtime,
+                                    routing_stats)) {
         std::fprintf(stderr, "[ds4-verify] step_layer_range returned false (n_tokens=%d kv_start=%d)\n",
                      n_tokens, kv_start);
         return false;
+    }
+    if (hooks.prefer_argmax_only &&
+        (int) gpu_argmax.size() == n_tokens) {
+        argmax_out = std::move(gpu_argmax);
+        return true;
     }
     if ((int) all_logits.size() < w.n_vocab * n_tokens) {
         std::fprintf(stderr, "[ds4-verify] all_logits too small: got=%zu need=%d (cap=%zu)\n",
@@ -416,7 +636,10 @@ bool run_deepseek4_dspark_spec_decode(
         std::vector<int32_t> & out_tokens,
         float * accept_rate_out,
         const std::function<bool(int32_t)> & on_token,
-        DFlashDraftIpcClient * remote_draft) {
+        DFlashDraftIpcClient * remote_draft,
+        MoeHybridStorage * moe_hybrid,
+        MoeExpertComputeRuntime * expert_runtime,
+        MoeHybridRoutingStats * routing_stats) {
     const int n_embd = target_w.n_embd;
     const int n_tgt = drafter.n_target_layers;
     const int block = drafter.block_size;
@@ -427,6 +650,32 @@ bool run_deepseek4_dspark_spec_decode(
     const bool timing = spec_env_flag("DFLASH_DS4_TIMING");
     const bool full_snap = spec_env_flag("DFLASH_DS4_FULL_SNAP");
     const bool seq_verify_mode = spec_env_flag("DFLASH_DS4_SEQ_VERIFY");
+    const bool async_rollback = spec_env_flag("DFLASH_DS4_ASYNC_ROLLBACK");
+    const bool pinned_rollback = spec_env_flag("DFLASH_DS4_PINNED_ROLLBACK");
+    const bool draft_overlap_probe =
+        spec_env_flag("DFLASH_DS4_DRAFT_OVERLAP_PROBE");
+    const bool draft_overlap_reuse_context =
+        spec_env_flag("DFLASH_DS4_DRAFT_OVERLAP_REUSE_CONTEXT");
+    const bool draft_ahead =
+        spec_env_flag("DFLASH_DS4_DRAFT_AHEAD");
+    ggml_backend_t drafter_backend =
+        drafter.core.backend ? drafter.core.backend : backend;
+    const bool draft_overlap_probe_active =
+        draft_overlap_probe && !remote_draft && drafter_backend != backend;
+    bool draft_overlap_probe_enabled = draft_overlap_probe_active;
+    if (draft_overlap_probe && !draft_overlap_probe_active) {
+        std::fprintf(stderr,
+            "[ds4-spec] draft overlap probe requested without an independent "
+            "in-process backend; probe disabled\n");
+    }
+    const bool draft_ahead_active =
+        draft_ahead && !remote_draft && drafter_backend != backend;
+    bool draft_ahead_enabled = draft_ahead_active;
+    if (draft_ahead && !draft_ahead_active) {
+        std::fprintf(stderr,
+            "[ds4-spec] draft-ahead requested without an independent "
+            "in-process backend; draft-ahead disabled\n");
+    }
     // Laguna-style adaptive verify width: EWMA of accepted candidates, width =
     // ewma + 2 (avg_commit << block means the wide tail is usually wasted).
     // /tmp/ds4_awidth: 1 = on, 0 = off (default on).
@@ -481,7 +730,8 @@ bool run_deepseek4_dspark_spec_decode(
     if (!snap_backend) { std::fprintf(stderr, "[ds4-spec] no CPU snapshot backend\n"); return false; }
 
     DeepSeek4DFlashTarget target(target_w, target_cache, backend, snap_backend,
-                                 drafter.capture_layer_ids, drafter.mask_token_id);
+                                 drafter.capture_layer_ids, drafter.mask_token_id,
+                                 moe_hybrid, expert_runtime, routing_stats);
     DraftWeights dw = make_dspark_shim(drafter);
     DeepSeek4SpecRollback rollback;
     DeepSeek4StepTelemetry tel{};
@@ -540,9 +790,18 @@ bool run_deepseek4_dspark_spec_decode(
     std::vector<float> padded_confidence_hidden((size_t) n_embd * (block + 1), 0.0f);
     std::vector<int32_t> draft_tok, tgt_am;
     std::vector<float> draft_confidence;
+    std::vector<float> cached_ahead_hidden;
+    std::vector<float> ahead_noise_embed((size_t) n_embd * block);
+    bool cached_ahead_ready = false;
+    int cached_ahead_pos = -1;
+    int cached_ahead_seed = -1;
+    long ahead_launches = 0;
+    long ahead_seed_hits = 0;
+    long ahead_reuses = 0;
 
     // Cumulative phase timings (ms).
     double tm_draft = 0, tm_head = 0, tm_save = 0, tm_verify = 0, tm_apply = 0, tm_feat = 0;
+    double tm_probe_submit = 0, tm_probe_wait = 0;
     const SpecClock::time_point run_t0 = SpecClock::now();
 
     while (n_generated < n_gen) {
@@ -551,26 +810,41 @@ bool run_deepseek4_dspark_spec_decode(
         // Noise block = [seed] + [MASK]*(block-1).
         SpecClock::time_point t0 = SpecClock::now();
         if (q_cap >= 2) {
-            noise_ids[0] = lt;
-            for (int i = 1; i < block; i++) noise_ids[i] = drafter.mask_token_id;
-            if (!target.embed_tokens(noise_ids.data(), block, noise_embed.data())) {
-                ok = false;
-                break;
-            }
+            const bool use_ahead =
+                cached_ahead_ready && cached_ahead_pos == pos &&
+                cached_ahead_seed == lt &&
+                cached_ahead_hidden.size() == (size_t) n_embd * block;
+            if (use_ahead) {
+                local_hidden.swap(cached_ahead_hidden);
+                cached_ahead_ready = false;
+                ++ahead_reuses;
+            } else {
+                cached_ahead_ready = false;
+                cached_ahead_hidden.clear();
+                noise_ids[0] = lt;
+                for (int i = 1; i < block; i++) {
+                    noise_ids[i] = drafter.mask_token_id;
+                }
+                if (!target.embed_tokens(
+                        noise_ids.data(), block, noise_embed.data())) {
+                    break;
+                }
 
-            // Drafter forward -> normalized states for token logits plus the
-            // pre-output-norm states expected by the confidence head.
-            const bool draft_ok = remote_draft && remote_draft->active()
-                ? remote_draft->propose(pos, ctx_len, noise_embed, local_hidden)
-                : deepseek4_dspark_draft_forward(
-                    backend, drafter, noise_embed.data(),
-                    ctx_len > 0 ? feat_win.data() : nullptr,
-                    ctx_len, pos, local_hidden,
-                    use_confidence_width ? &confidence_hidden : nullptr);
-            if (!draft_ok) {
-                std::fprintf(stderr, "[ds4-spec] drafter forward failed\n");
-                ok = false;
-                break;
+                // Drafter forward -> block normed hidden states.
+                const bool draft_ok = remote_draft && remote_draft->active()
+                    ? remote_draft->propose(
+                        pos, ctx_len, noise_embed, local_hidden)
+                    : deepseek4_dspark_draft_forward(
+                        drafter_backend,
+                        drafter, noise_embed.data(),
+                        ctx_len > 0 ? feat_win.data() : nullptr,
+                        ctx_len, pos, local_hidden,
+                        use_confidence_width ? &confidence_hidden : nullptr);
+                if (!draft_ok) {
+                    std::fprintf(stderr, "[ds4-spec] drafter forward failed\n");
+                    ggml_backend_free(snap_backend);
+                    return false;
+                }
             }
         }
         tm_draft += spec_ms_since(t0);
@@ -593,15 +867,29 @@ bool run_deepseek4_dspark_spec_decode(
         bool ds_ok = false;
         // Batched-verify exactness: the batch must not cross a ratio-4
         // boundary except at its last token (state rows stay distinct and the
-        // comp emission matches AR). Boundaries sit at p % 4 == 3. The legacy
-        // sequential measurement path is independently capped to q=4 above.
-        int q_step_cap = seq_verify_mode
+        // comp emission matches AR). Boundaries sit at p % 4 == 3. The
+        // sequential verify has no such limit.
+        // The fused verifier handles a ratio-4 compressor boundary at any
+        // position inside the batch.  Keep the legacy boundary clamp only for
+        // the dynamic batched path; otherwise "fixed q3" degenerates into q1
+        // whenever pos % 4 == 3 and pays a full target verify for one token.
+        static const bool fused_verify_mode = [] {
+            const char * v = std::getenv("DFLASH_DS4_FUSED_VERIFY");
+            return v && *v && *v != '0';
+        }();
+        int q_step_cap = (seq_verify_mode || fused_verify_mode)
                        ? std::min(q_cap, 4)
                        : std::min(q_cap, 4 - (pos & 3));
         if (adaptive_width && !use_confidence_width && !seq_verify_mode) {
             const int w_cap = (int) ewma_accept + 2;
             if (w_cap < q_step_cap) q_step_cap = w_cap;
         }
+        // Draft-ahead needs one unverified token beyond the verifier width.
+        // It predicts only the next seed; the target remains authoritative.
+        const int head_step_cap = draft_ahead_enabled && q_step_cap >= 2
+            ? std::min(q_step_cap + 1, block + 1)
+            : q_step_cap;
+        int predicted_ahead_seed = -1;
         if (q_step_cap >= 2) {
             std::memcpy(padded_hidden.data() + n_embd, local_hidden.data(),
                         sizeof(float) * (size_t) n_embd * block);
@@ -612,23 +900,30 @@ bool run_deepseek4_dspark_spec_decode(
             }
             ds_ok = dspark_markov_correct_greedy_chain_fused(
                             dw, backend, target.lm_head_tensor(), padded_hidden.data(),
-                            q_step_cap, lt, draft_tok,
+                            head_step_cap, lt, draft_tok,
                             use_confidence_width ? &draft_confidence : nullptr,
-                            use_confidence_width ? padded_confidence_hidden.data() : nullptr);
+                            use_confidence_width
+                                ? padded_confidence_hidden.data() : nullptr);
             if (!ds_ok) {
                 ds_ok = dspark_markov_correct_greedy_chain(dw, backend, target,
-                            padded_hidden.data(), q_step_cap, lt, 0.0f, draft_tok);
+                            padded_hidden.data(), head_step_cap, lt, 0.0f, draft_tok);
             }
             if (!ds_ok || (int) draft_tok.size() < 2) {
                 // Fallback: plain projection of the block hiddens.
                 std::vector<int32_t> pj;
-                if (!target.project_hidden_to_tokens(local_hidden.data(), q_step_cap - 1, pj)) {
-                    ok = false;
+                if (!target.project_hidden_to_tokens(
+                        local_hidden.data(), head_step_cap - 1, pj)) {
                     break;
                 }
                 draft_tok.clear();
                 draft_tok.push_back(lt);
-                for (int i = 0; i < q_step_cap - 1; i++) draft_tok.push_back(pj[i]);
+                for (int i = 0; i < head_step_cap - 1; i++) {
+                    draft_tok.push_back(pj[(size_t) i]);
+                }
+            }
+            if ((int) draft_tok.size() > q_step_cap) {
+                predicted_ahead_seed = draft_tok[(size_t) q_step_cap];
+                draft_tok.resize((size_t) q_step_cap);
             }
         } else {
             draft_tok.push_back(lt);   // q=1: seed only, no speculation
@@ -663,6 +958,61 @@ bool run_deepseek4_dspark_spec_decode(
                          q > 2 ? draft_tok[2] : -1, q > 3 ? draft_tok[3] : -1);
         }
 
+        // Predict the next seed with one extra Markov step, then run its
+        // drafter forward on the independent low-priority R9700 stream while
+        // the target verifies this step. The feature window is deliberately
+        // one verifier step stale. A miss is discarded; every proposal still
+        // passes through the exact target verifier.
+        bool ahead_inflight = false;
+        bool ahead_output_ready = false;
+        int inflight_ahead_seed = -1;
+        int inflight_ahead_pos = -1;
+        std::vector<float> completed_ahead_hidden;
+        if (draft_ahead_enabled && q == q_step_cap && q >= 2 &&
+            predicted_ahead_seed >= 0) {
+            const SpecClock::time_point probe_t0 = SpecClock::now();
+            noise_ids[0] = predicted_ahead_seed;
+            for (int i = 1; i < block; ++i) {
+                noise_ids[i] = drafter.mask_token_id;
+            }
+            if (target.embed_tokens(
+                    noise_ids.data(), block, ahead_noise_embed.data())) {
+                inflight_ahead_seed = predicted_ahead_seed;
+                inflight_ahead_pos = pos + q;
+                ahead_inflight = deepseek4_dspark_draft_forward_async(
+                    drafter_backend, drafter, ahead_noise_embed.data(),
+                    ctx_len > 0 ? feat_win.data() : nullptr,
+                    ctx_len, inflight_ahead_pos);
+            }
+            tm_probe_submit += spec_ms_since(probe_t0);
+            if (ahead_inflight) {
+                ++ahead_launches;
+            } else {
+                draft_ahead_enabled = false;
+                std::fprintf(stderr,
+                    "[ds4-spec] draft-ahead launch failed; disabling\n");
+            }
+        }
+
+        // Feasibility-only control: duplicate the current draft and discard
+        // it. Never run this at the same time as real draft-ahead.
+        bool probe_inflight = false;
+        if (!draft_ahead_enabled && draft_overlap_probe_enabled && q_cap >= 2) {
+            const SpecClock::time_point probe_t0 = SpecClock::now();
+            probe_inflight = draft_overlap_reuse_context
+                ? deepseek4_dspark_draft_forward_async_reuse_context(
+                    drafter_backend, drafter, noise_embed.data(), ctx_len, pos)
+                : deepseek4_dspark_draft_forward_async(
+                    drafter_backend, drafter, noise_embed.data(),
+                    ctx_len > 0 ? feat_win.data() : nullptr, ctx_len, pos);
+            tm_probe_submit += spec_ms_since(probe_t0);
+            if (!probe_inflight) {
+                draft_overlap_probe_enabled = false;
+                std::fprintf(stderr,
+                    "[ds4-spec] draft overlap probe launch failed; disabling\n");
+            }
+        }
+
         // ── Rollback state save (cheap) or legacy full snapshot ──
         t0 = SpecClock::now();
         if (full_snap) {
@@ -672,7 +1022,10 @@ bool run_deepseek4_dspark_spec_decode(
                 break;
             }
         } else {
-            deepseek4_spec_rollback_save(target_cache, rollback, pos, q);
+            spec_rollback_save(
+                target_cache, rollback, backend,
+                async_rollback || pinned_rollback, pinned_rollback,
+                pos, q);
         }
         tm_save += spec_ms_since(t0);
 
@@ -683,20 +1036,39 @@ bool run_deepseek4_dspark_spec_decode(
         // ── ONE batched verify (writes cache + captures features for all q) ──
         t0 = SpecClock::now();
         int verify_last = -1;
-        if (!target.verify_batch(draft_tok, pos, verify_last, &tgt_am)) {
+        const bool verify_ok =
+            target.verify_batch(draft_tok, pos, verify_last, &tgt_am);
+        tm_verify += spec_ms_since(t0);
+        if (ahead_inflight || probe_inflight) {
+            const SpecClock::time_point probe_t0 = SpecClock::now();
+            deepseek4_dspark_draft_wait(drafter_backend);
+            if (ahead_inflight) {
+                ahead_output_ready =
+                    deepseek4_dspark_draft_read_async_output(
+                        drafter_backend, completed_ahead_hidden);
+                if (!ahead_output_ready) {
+                    draft_ahead_enabled = false;
+                    std::fprintf(stderr,
+                        "[ds4-spec] draft-ahead output read failed; disabling\n");
+                }
+            }
+            tm_probe_wait += spec_ms_since(probe_t0);
+        }
+        if (!verify_ok) {
             if (full_snap) {
                 if (!target.restore_kv()) {
                     std::fprintf(stderr, "[ds4-spec] restore after verify failure failed\n");
                 }
             } else {
-                deepseek4_spec_rollback_apply(
-                    rollback, target_w, target_cache, pos, boundary_crossed);
+                spec_rollback_apply(
+                    rollback, target_w, target_cache, pos, boundary_crossed,
+                    backend, async_rollback || pinned_rollback,
+                    pinned_rollback);
             }
             std::fprintf(stderr, "[ds4-spec] verify failed\n");
             ok = false;
             break;
         }
-        tm_verify += spec_ms_since(t0);
 
         // Accept the longest matching prefix. accept counts the seed (slot 0)
         // plus each candidate the target agrees with.
@@ -708,6 +1080,29 @@ bool run_deepseek4_dspark_spec_decode(
         const int matched = accept - 1;                       // accepted candidates
         const int bonus = tgt_am[accept - 1];                 // target's token at the accept point
         const int commit_pos = pos + accept;                  // seed + accepted candidates in KV
+
+        if (ahead_output_ready) {
+            const bool seed_hit =
+                accept == q && inflight_ahead_pos == commit_pos &&
+                inflight_ahead_seed == bonus;
+            if (seed_hit) {
+                ++ahead_seed_hits;
+                cached_ahead_hidden = std::move(completed_ahead_hidden);
+                cached_ahead_pos = commit_pos;
+                cached_ahead_seed = bonus;
+                cached_ahead_ready = true;
+            } else {
+                cached_ahead_ready = false;
+                cached_ahead_hidden.clear();
+            }
+            if (timing && steps < 8) {
+                std::fprintf(stderr,
+                    "[ds4-draft-ahead] step=%ld predicted_seed=%d bonus=%d "
+                    "full_accept=%d hit=%d\n",
+                    steps, inflight_ahead_seed, bonus,
+                    accept == q ? 1 : 0, seed_hit ? 1 : 0);
+            }
+        }
 
         if (timing && steps < 8 && q >= 2) {
             // Alignment probe: draft candidate i should match tgt_am[i-1]. A
@@ -745,8 +1140,10 @@ bool run_deepseek4_dspark_spec_decode(
             // The prev-half flush is bad only if the boundary sits at-or-past
             // the commit point (its chunk then contains rejected tokens).
             const bool restore_prev = boundary_crossed && first_boundary >= commit_pos;
-            deepseek4_spec_rollback_apply(
-                rollback, target_w, target_cache, commit_pos, restore_prev);
+            spec_rollback_apply(
+                rollback, target_w, target_cache, commit_pos, restore_prev,
+                backend, async_rollback || pinned_rollback,
+                pinned_rollback);
         }
         // accept == q on the fast path: cur_pos/n_comp already exact, keep.
         tm_apply += spec_ms_since(t0);
@@ -792,10 +1189,12 @@ bool run_deepseek4_dspark_spec_decode(
         if (timing && (steps <= 4 || (steps & 31) == 0)) {
             std::fprintf(stderr,
                 "[ds4-spec-t] step=%ld q=%d acc=%d | draft=%.1f head=%.1f save=%.1f "
-                "verify=%.1f apply=%.1f feat=%.1f ms (cum means)\n",
+                "verify=%.1f probe(submit/wait)=%.1f/%.1f apply=%.1f feat=%.1f "
+                "ms (cum means)\n",
                 steps, q, accept,
                 tm_draft / steps, tm_head / steps, tm_save / steps,
-                tm_verify / steps, tm_apply / steps, tm_feat / steps);
+                tm_verify / steps, tm_probe_submit / steps,
+                tm_probe_wait / steps, tm_apply / steps, tm_feat / steps);
         }
         if (hit_eos || stop_requested) break;
     }
@@ -813,14 +1212,25 @@ bool run_deepseek4_dspark_spec_decode(
                  steps ? (double) accept_sum / steps : 0.0,
                  steps ? (double) offered_sum / steps : 0.0, q_cap,
                  (int) full_snap);
+    if (draft_ahead) {
+        std::fprintf(stderr,
+            "[ds4-draft-ahead] launches=%ld seed_hits=%ld reused=%ld "
+            "seed_hit_rate=%.3f reuse_rate=%.3f\n",
+            ahead_launches, ahead_seed_hits, ahead_reuses,
+            ahead_launches > 0
+                ? (double) ahead_seed_hits / (double) ahead_launches : 0.0,
+            steps > 0 ? (double) ahead_reuses / (double) steps : 0.0);
+    }
     if (steps > 0) {
         std::fprintf(stderr,
             "[ds4-spec-t] TOTAL %.1f ms, %ld steps (%.1f ms/step), %d tok (%.1f tok/s) | "
-            "means: draft=%.1f head=%.1f save=%.1f verify=%.1f apply=%.1f feat=%.1f ms\n",
+            "means: draft=%.1f head=%.1f save=%.1f verify=%.1f "
+            "probe_submit=%.1f probe_wait=%.1f apply=%.1f feat=%.1f ms\n",
             total_ms, steps, total_ms / steps, n_generated,
             total_ms > 0 ? n_generated * 1000.0 / total_ms : 0.0,
             tm_draft / steps, tm_head / steps, tm_save / steps,
-            tm_verify / steps, tm_apply / steps, tm_feat / steps);
+            tm_verify / steps, tm_probe_submit / steps,
+            tm_probe_wait / steps, tm_apply / steps, tm_feat / steps);
     }
     if (timing && steps > 0) {
         const double s = 1000.0 * steps;   // us -> ms per-step means

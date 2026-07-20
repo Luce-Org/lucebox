@@ -46,6 +46,12 @@ class DFlashDraftIpcClient;
 struct DSparkDrafter {
     DeepSeek4Weights core;
 
+    // Optional target-backend mirrors of the small Markov/confidence heads.
+    // The decoder blocks may live on a separate draft GPU while these heads
+    // stay beside the target's tied lm_head.
+    ggml_context * head_ctx = nullptr;
+    ggml_backend_buffer_t head_buf = nullptr;
+
     // Captured-feature fusion (stage 0 only in the checkpoint, but stored global).
     ggml_tensor * main_proj    = nullptr;  // dflash.fc.weight            [n_tgt*n_embd, n_embd]
     ggml_tensor * main_norm    = nullptr;  // dflash.hidden_norm.weight   [n_embd]
@@ -72,6 +78,11 @@ struct DSparkDrafter {
 bool load_deepseek4_dspark_drafter(const std::string & path,
                                    ggml_backend_t backend,
                                    DSparkDrafter & out);
+
+// Copy only the DSpark Markov/confidence heads to `backend` and repoint the
+// drafter fields. Decoder-block tensors remain on `core.backend`.
+bool clone_deepseek4_dspark_heads(DSparkDrafter & d,
+                                  ggml_backend_t backend);
 
 void free_deepseek4_dspark_drafter(DSparkDrafter & d);
 
@@ -108,6 +119,34 @@ bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
                                     std::vector<float> & out_hidden,
                                     std::vector<float> * confidence_hidden = nullptr);
 
+// Submit the same cached drafter graph without synchronizing the backend.
+// The caller must use a backend/stream that is independent from target
+// verification and call deepseek4_dspark_draft_wait() before reusing inputs.
+bool deepseek4_dspark_draft_forward_async(ggml_backend_t backend,
+                                          const DSparkDrafter & d,
+                                          const float * noise_embed,
+                                          const float * ctx_features,
+                                          int ctx_len,
+                                          int committed);
+// Submit with the feature/context tensors retained from the preceding forward.
+// Only the noise block and block positions are updated.  This is valid only
+// when the same drafter graph and ctx_len are already warm on this backend.
+// It is intended for an exact-verifier draft-ahead branch whose context may be
+// one speculative step stale; stale draft inputs can affect acceptance, never
+// target correctness.
+bool deepseek4_dspark_draft_forward_async_reuse_context(
+                                          ggml_backend_t backend,
+                                          const DSparkDrafter & d,
+                                          const float * noise_embed,
+                                          int ctx_len,
+                                          int committed);
+// Copy the output of a completed async drafter forward. The caller must wait
+// for the drafter backend before calling this function.
+bool deepseek4_dspark_draft_read_async_output(
+                                          ggml_backend_t backend,
+                                          std::vector<float> & out_hidden);
+void deepseek4_dspark_draft_wait(ggml_backend_t backend);
+
 // Batched target verify forward WITH feature capture (defined in
 // deepseek4_graph.cpp so it can reuse the target sub-builders). Runs the DS4
 // target over `n_tokens` embeddings at absolute position `kv_start` in one
@@ -131,7 +170,10 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
                                      std::vector<float> * logits_out,
                                      std::vector<float> & capture_out,
                                      DeepSeek4StepTelemetry * telemetry = nullptr,
-                                     bool allow_graph_reuse = false);
+                                     bool allow_graph_reuse = false,
+                                     MoeHybridStorage * moe_hybrid = nullptr,
+                                     MoeExpertComputeRuntime * expert_runtime = nullptr,
+                                     MoeHybridRoutingStats * routing_stats = nullptr);
 
 // Minimal speculative-decode rollback state. Rejected positions must restore
 // the physical SWA rows they overwrote after the ring wraps; otherwise a later
@@ -140,13 +182,28 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
 struct DeepSeek4SpecRollback {
     int raw_pos = 0;
     int raw_count = 0;
+    struct PinnedSpan {
+        std::size_t offset = 0;
+        std::size_t size = 0;
+    };
     struct Layer {
         std::vector<uint8_t> attn_kv, attn_sc, idx_kv, idx_sc;
         std::size_t raw_row_bytes = 0;
         std::vector<uint8_t> raw_rows;
+        PinnedSpan pinned_attn_kv, pinned_attn_sc, pinned_idx_kv, pinned_idx_sc;
+        PinnedSpan pinned_raw_rows;
     };
     std::vector<Layer> layers;
     std::vector<uint8_t> hc_state;
+    PinnedSpan pinned_hc;
+    ggml_backend_buffer_t pinned_buf = nullptr;
+    uint8_t * pinned_base = nullptr;
+    ggml_backend_t async_backend = nullptr;
+
+    DeepSeek4SpecRollback() = default;
+    ~DeepSeek4SpecRollback();
+    DeepSeek4SpecRollback(const DeepSeek4SpecRollback &) = delete;
+    DeepSeek4SpecRollback & operator=(const DeepSeek4SpecRollback &) = delete;
 };
 
 void deepseek4_spec_rollback_save(const DeepSeek4Cache & cache,
@@ -178,7 +235,10 @@ bool run_deepseek4_dspark_spec_decode(
         std::vector<int32_t> & out_tokens,
         float * accept_rate_out,
         const std::function<bool(int32_t)> & on_token = {},
-        DFlashDraftIpcClient * remote_draft = nullptr);
+        DFlashDraftIpcClient * remote_draft = nullptr,
+        MoeHybridStorage * moe_hybrid = nullptr,
+        MoeExpertComputeRuntime * expert_runtime = nullptr,
+        MoeHybridRoutingStats * routing_stats = nullptr);
 
 int run_deepseek4_dspark_draft_ipc_daemon(const char * draft_path,
                                            int ring_cap,

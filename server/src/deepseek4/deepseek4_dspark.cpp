@@ -538,8 +538,74 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
     return true;
 }
 
+bool clone_deepseek4_dspark_heads(DSparkDrafter & d,
+                                  ggml_backend_t backend) {
+    if (!backend || !d.markov_w1 || !d.markov_w2) {
+        set_err("cannot clone missing DSpark heads");
+        return false;
+    }
+    if (d.head_buf || d.head_ctx) {
+        set_err("DSpark heads are already cloned");
+        return false;
+    }
+
+    ggml_init_params ip{};
+    ip.mem_size = 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) {
+        set_err("DSpark head mirror ggml_init failed");
+        return false;
+    }
+
+    auto duplicate = [&](ggml_tensor * src) -> ggml_tensor * {
+        return src ? ggml_dup_tensor(ctx, src) : nullptr;
+    };
+    ggml_tensor * markov_w1 = duplicate(d.markov_w1);
+    ggml_tensor * markov_w2 = duplicate(d.markov_w2);
+    ggml_tensor * confidence_w = duplicate(d.confidence_w);
+    ggml_tensor * confidence_b = duplicate(d.confidence_b);
+    if (!markov_w1 || !markov_w2) {
+        ggml_free(ctx);
+        set_err("DSpark head mirror metadata allocation failed");
+        return false;
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        ggml_free(ctx);
+        set_err("DSpark head mirror backend allocation failed");
+        return false;
+    }
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    std::vector<uint8_t> staging;
+    auto copy_tensor = [&](ggml_tensor * src, ggml_tensor * dst) {
+        if (!src || !dst) return;
+        const size_t bytes = ggml_nbytes(src);
+        staging.resize(bytes);
+        ggml_backend_tensor_get(src, staging.data(), 0, bytes);
+        ggml_backend_tensor_set(dst, staging.data(), 0, bytes);
+    };
+    copy_tensor(d.markov_w1, markov_w1);
+    copy_tensor(d.markov_w2, markov_w2);
+    copy_tensor(d.confidence_w, confidence_w);
+    copy_tensor(d.confidence_b, confidence_b);
+
+    d.head_ctx = ctx;
+    d.head_buf = buf;
+    d.markov_w1 = markov_w1;
+    d.markov_w2 = markov_w2;
+    d.confidence_w = confidence_w;
+    d.confidence_b = confidence_b;
+    return true;
+}
+
 void free_deepseek4_dspark_drafter(DSparkDrafter & d) {
     reset_deepseek4_dspark_runtime_cache();
+    if (d.head_buf) { ggml_backend_buffer_free(d.head_buf); d.head_buf = nullptr; }
+    if (d.head_ctx) { ggml_free(d.head_ctx); d.head_ctx = nullptr; }
     if (d.core.buf) { ggml_backend_buffer_free(d.core.buf); d.core.buf = nullptr; }
     if (d.core.ctx) { ggml_free(d.core.ctx); d.core.ctx = nullptr; }
     d = DSparkDrafter{};
