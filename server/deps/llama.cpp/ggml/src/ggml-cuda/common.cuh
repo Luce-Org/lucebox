@@ -1417,6 +1417,8 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
     int curr_stream_no = 0;
+    bool low_priority_streams = false;
+    int stream_priority = 0;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
@@ -1466,7 +1468,14 @@ struct ggml_backend_cuda_context {
     cudaStream_t stream(int device, int stream) {
         if (streams[device][stream] == nullptr) {
             ggml_cuda_set_device(device);
-            CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
+            if (low_priority_streams) {
+                CUDA_CHECK(cudaStreamCreateWithPriority(
+                    &streams[device][stream], cudaStreamNonBlocking,
+                    stream_priority));
+            } else {
+                CUDA_CHECK(cudaStreamCreateWithFlags(
+                    &streams[device][stream], cudaStreamNonBlocking));
+            }
         }
         return streams[device][stream];
     }
@@ -1512,6 +1521,8 @@ struct ggml_cuda_mm_fusion_args_host {
     ggml_glu_op glu_op;
     float glu_param0 = 0.0f;
     float glu_param1 = 0.0f;
+    float gate_value_scale = 1.0f;
+    float x_value_scale = 1.0f;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1520,4 +1531,6 @@ struct ggml_cuda_mm_fusion_args_device {
     ggml_glu_op glu_op;
     float glu_param0 = 0.0f;
     float glu_param1 = 0.0f;
+    float gate_value_scale = 1.0f;
+    float x_value_scale = 1.0f;
 };
