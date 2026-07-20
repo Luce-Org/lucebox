@@ -47,6 +47,7 @@ using json = nlohmann::json;
 
 // ─── Forward declarations ───────────────────────────────────────────────
 struct ServerJob;
+class SseEmitter;
 
 // ─── Server configuration ───────────────────────────────────────────────
 struct ServerConfig {
@@ -271,8 +272,75 @@ private:
     // Client thread: read HTTP request, parse, enqueue job, wait.
     void handle_client(int fd);
 
-    // Worker thread: process jobs sequentially.
+    // Worker thread: process jobs sequentially. process_job owns the
+    // lifecycle of one dequeued request, including signaling completion.
     void worker_loop();
+    void process_job(ServerJob * job);
+
+    struct PreparedPrompt {
+        std::vector<int32_t> tokens;
+        bool compressed = false;
+        int full_cache_served_tokens = -1;
+        int full_cache_hit_slot = -1;
+        int full_cache_hit_len = 0;
+        int error_status = 0;
+        std::string error;
+    };
+
+    // Prompt preparation keeps the FlowKV and whole-prompt PFlash policies
+    // out of the decode path while preserving their shared precedence rules.
+    PreparedPrompt prepare_prompt(const ParsedRequest & req);
+    void apply_flowkv_compression(const ParsedRequest & req,
+                                  PreparedPrompt & prepared);
+    std::string apply_pflash_compression(const ParsedRequest & req,
+                                         PreparedPrompt & prepared);
+    bool forward_upstream(int fd, const ParsedRequest & req,
+                          const PreparedPrompt & prepared);
+
+    struct GenerationCacheState {
+        DiskPrefixCachePolicy disk_policy;
+        int cache_slot = -1;
+        int prefix_len = 0;
+        bool using_restore = false;
+        bool disk_hit = false;
+        int full_snap_slot = -1;
+        int full_snap_pos = 0;
+        bool full_snap_prepared = false;
+        int snap_slot = -1;
+        int snap_cut = 0;
+        bool snap_prepared = false;
+    };
+
+    GenerationCacheState prepare_generation_cache(
+        const ParsedRequest & req, PreparedPrompt & prepared,
+        GenerateRequest & generate_request);
+    void finalize_generation_cache(
+        const ParsedRequest & req, const PreparedPrompt & prepared,
+        const GenerationCacheState & cache, const GenerateResult & result,
+        int completion_tokens, bool visible_output_seen,
+        bool client_disconnected);
+
+    struct GenerationInputs {
+        GenerateRequest request;
+        int generation_cap = 0;
+        std::vector<int32_t> hint_tokens;
+        std::vector<int32_t> stall_tool_prefix_tokens;
+        std::vector<int32_t> stall_action_suffix_tokens;
+        std::vector<int32_t> stall_skip_tokens;
+    };
+
+    struct GenerationOutputState {
+        int completion_tokens = 0;
+        bool visible_output_seen = false;
+        bool client_disconnected = false;
+    };
+
+    void prepare_generation_inputs(
+        const ParsedRequest & req, const PreparedPrompt & prepared,
+        GenerationInputs & inputs);
+    void configure_generation_io(
+        int fd, const ParsedRequest & req, SseEmitter & emitter,
+        GenerationOutputState & output, DaemonIO & io);
 
     // Parse HTTP request from socket.
     struct HttpRequest {
