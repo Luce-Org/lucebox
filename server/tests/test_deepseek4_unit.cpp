@@ -1804,16 +1804,26 @@ static void test_reset_request_state() {
     std::fprintf(stderr, "  test_reset_request_state ...");
 
     auto adapter = make_test_adapter();
+    TEST_ASSERT(init_snapshot_test_shard(adapter));
+    if (adapter.shards_.empty() || !adapter.shards_[0].cache.buf) {
+        std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+        return;
+    }
+
     adapter.cur_pos_ = 9;
     adapter.last_tok_ = 77;
     adapter.hc_state_.assign(8, 5.0f);
-    adapter.shards_.resize(2);
+    adapter.prefill_last_logits_ = {1.0f, 2.0f};
     for (auto & shard : adapter.shards_) {
         shard.cache.cur_pos = 11;
-        shard.cache.layers.resize(3);
         for (auto & layer : shard.cache.layers) {
             layer.n_comp = 4;
             layer.n_index_comp = 6;
+            if (layer.raw_kv) write_tensor_pattern(layer.raw_kv, 23);
+            if (layer.comp_kv) write_tensor_pattern(layer.comp_kv, 31);
+            if (layer.attn_compressor.state_kv) {
+                write_tensor_pattern(layer.attn_compressor.state_kv, 47);
+            }
         }
     }
 
@@ -1823,11 +1833,21 @@ static void test_reset_request_state() {
     for (float v : adapter.hc_state_) {
         TEST_ASSERT(v == 0.0f);
     }
+    TEST_ASSERT(adapter.prefill_last_logits_.empty());
     for (const auto & shard : adapter.shards_) {
         TEST_ASSERT(shard.cache.cur_pos == 0);
         for (const auto & layer : shard.cache.layers) {
             TEST_ASSERT(layer.n_comp == 0);
             TEST_ASSERT(layer.n_index_comp == 0);
+            for (const ggml_tensor * tensor : {
+                     layer.raw_kv,
+                     layer.comp_kv,
+                     layer.attn_compressor.state_kv}) {
+                if (!tensor) continue;
+                const std::vector<uint8_t> bytes = read_tensor_bytes(tensor);
+                TEST_ASSERT(std::all_of(bytes.begin(), bytes.end(),
+                                        [](uint8_t value) { return value == 0; }));
+            }
         }
     }
 
@@ -2535,7 +2555,9 @@ static void test_cpu_hc_sinkhorn_ref(float * out, const float * mix, const float
         out[n_hc + i] = 2.0f / (1.0f + std::exp(-z));
     }
 
-    float c[16];
+    // The scratch-capacity test exercises n_hc=8, so this reference buffer
+    // cannot be fixed at the model-default 4x4 shape.
+    std::vector<float> c((size_t) n_hc * (size_t) n_hc);
     for (int dst = 0; dst < n_hc; ++dst) {
         float row_max = -1.0e30f;
         for (int src = 0; src < n_hc; ++src) {

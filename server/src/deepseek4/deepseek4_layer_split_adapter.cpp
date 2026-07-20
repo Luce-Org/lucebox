@@ -421,22 +421,22 @@ void DeepSeek4LayerSplitAdapter::begin_request(const GenerateRequest & req) {
 void DeepSeek4LayerSplitAdapter::reset_request_state() {
     cur_pos_ = 0;
     last_tok_ = -1;
-    const size_t hc_size = hc_state_.size();
     std::fill(hc_state_.begin(), hc_state_.end(), 0.0f);
 
+    // Reset the backing tensors as well as their logical positions. The
+    // compressor uses double-buffered state, so merely rewinding the counters
+    // lets a new request pool over rows left by the previous request.
     for (auto & shard : shards_) {
-        shard.cache.cur_pos = 0;
-        for (auto & lc : shard.cache.layers) {
-            lc.n_comp = 0;
-            lc.n_index_comp = 0;
-        }
+        reset_deepseek4_cache(shard.cache);
     }
 
-    if (remote_target_shard_.active()) {
-        remote_target_shard_.reset_request_state();
+    if (remote_target_shard_.active() &&
+        !remote_target_shard_.reset_request_state()) {
+        std::fprintf(stderr,
+                     "[deepseek4-split] remote shard reset_request_state failed\n");
     }
 
-    (void)hc_size;
+    prefill_last_logits_.clear();
 }
 
 bool DeepSeek4LayerSplitAdapter::run_forward(

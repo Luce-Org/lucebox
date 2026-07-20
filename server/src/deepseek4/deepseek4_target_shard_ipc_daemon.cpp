@@ -287,11 +287,7 @@ int run_deepseek4_target_shard_ipc_daemon(
 
     callbacks.reset_request_state = [&]() -> bool {
         for (auto & shard : shards) {
-            shard.cache.cur_pos = 0;
-            for (auto & lc : shard.cache.layers) {
-                lc.n_comp = 0;
-                lc.n_index_comp = 0;
-            }
+            reset_deepseek4_cache(shard.cache);
         }
         std::fill(hc_state.begin(), hc_state.end(), 0.0f);
         return true;
