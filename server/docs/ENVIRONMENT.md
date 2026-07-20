@@ -24,6 +24,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_ADAPTIVE_K_TAU` | 0 = off | Prefer the CLI: --adaptive-experts [tau]. Cumulative combine-weight threshold for per-token expert gating. |
 | `DFLASH_ADAPTIVE_K_DENSE` | per-model default | CSV of MoE layers kept dense under adaptive-K (DFlash capture layers). Warned-inert on families that do not thread layer indices yet. |
 | `DFLASH_MMID_GROUPED` | unset | Grouped MUL_MAT_ID kernel for small verify batches; candidate for CLI promotion. |
+| `DFLASH_MMID_TELEMETRY` | unset | DEBUG: report MUL_MAT_ID dispatch, MMVQ variant, and per-node graph compatibility. |
 | `DFLASH_KVFLASH` | unset | Prefer the CLI: `--kvflash` (token count or `auto`). |
 
 ## Full inventory (generated)
@@ -115,6 +116,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_LAGUNA_VERIFY_WIDTH` - laguna_backend.cpp
 - `DFLASH_LAGUNA_VERIFY_WIDTH_MAX` - laguna_backend.cpp
 - `DFLASH_MAX_CONTEXT` - laguna_backend.cpp, qwen35moe_backend.cpp
+- `DFLASH_MMID_TELEMETRY` - ggml-cuda.cu, mmvq.cu
 - `DFLASH_MMQ_FULL_BATCH_MIN` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MMQ_SUB_BATCH` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MODEL_CARDS_DIR` - model_card.cpp
