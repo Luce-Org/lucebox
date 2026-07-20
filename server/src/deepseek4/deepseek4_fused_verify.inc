@@ -14,7 +14,15 @@ static void ds4_fv_set(ggml_tensor * t, const void * data, size_t nbytes) {
 static bool ds4_fused_verify_enabled() {
     static int enabled = -1;
     if (enabled < 0) {
-        enabled = ds4_env_flag("DFLASH_DS4_FUSED_VERIFY") ? 1 : 0;
+        const bool requested = ds4_env_flag("DFLASH_DS4_FUSED_VERIFY");
+        const bool allow_approx = ds4_env_flag("DFLASH_DS4_ALLOW_APPROX_FUSED_VERIFY");
+        enabled = requested && allow_approx ? 1 : 0;
+        if (requested && !allow_approx) {
+            std::fprintf(stderr,
+                "[ds4-fused-verify] exact token parity is not guaranteed; "
+                "using the normal verifier. Set DFLASH_DS4_ALLOW_APPROX_FUSED_VERIFY=1 "
+                "only for explicit approximate experiments.\n");
+        }
     }
     return enabled == 1;
 }
