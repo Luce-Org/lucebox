@@ -39,6 +39,127 @@ static uint64_t elapsed_us(HybridClock::time_point start, HybridClock::time_poin
     return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 }
 
+static bool compact_materialized_experts_enabled() {
+    static const bool enabled = [] {
+        const char * raw = std::getenv("DFLASH_MOE_COMPACT_MATERIALIZED");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
+
+// The legacy ROCmFP2 verifier graph expands a q-token routed FFN into q
+// independent single-token subgraphs.  That was required before the CUDA/HIP
+// backend gained its grouped MUL_MAT_ID MMVQ kernel, but it multiplies graph
+// nodes, scheduler copies, and launches by the verify width.  Keep the old
+// lowering as the default while the grouped path is qualified on each ROCm
+// architecture; opt in with DFLASH_DS4_TP_GROUPED_MMVQ=1.
+static bool grouped_mmvq_moe_enabled() {
+    static const bool enabled = [] {
+        const char * raw = std::getenv("DFLASH_DS4_TP_GROUPED_MMVQ");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool gpu_i32_repeat_enabled() {
+    static const bool enabled = [] {
+        const char * raw = std::getenv("LUCE_CUDA_I32_REPEAT");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
+
+// The regular DeepSeek graph already uses ggml_laguna_moe_combine for the
+// route-weighted expert reduction.  Keep the heterogeneous graph A/B-able
+// while replacing its MUL + shape-only REPEAT_BACK sequence with the same
+// exact owner-local kernel.
+static bool fused_moe_combine_enabled() {
+    static const bool enabled = [] {
+        const char * raw = std::getenv("DFLASH_MOE_FUSED_COMBINE");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
+
+// DeepSeek V4 stores routed gate and up projections as one tensor with the
+// output rows concatenated.  The generic graph computes that full tensor,
+// materializes two contiguous views, clamps both, and only then runs SwiGLU.
+// Present the two weight halves as views instead: the CUDA/HIP graph optimizer
+// can fuse both MUL_MAT_ID operations and DS4 SwiGLU into one MMVQ launch.
+// This is exact when the external gate/up scale is one (the ROCmFP checkpoint
+// used by the heterogeneous path); other scale values retain the old graph.
+static bool fused_gate_up_mmvq_enabled() {
+    static const bool enabled = [] {
+        const char * raw = std::getenv("DFLASH_DS4_TP_FUSED_GATE_UP");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool coarse_owner_op_enabled() {
+    static const bool enabled = [] {
+        const char * raw = std::getenv("DFLASH_DS4_TP_COARSE_OWNER");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool coarse_owner_split_op_enabled() {
+    static const bool enabled = [] {
+        const char * raw = std::getenv("DFLASH_DS4_TP_COARSE_OWNER_SPLIT");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool align_shared_moe_ids_enabled() {
+    static const bool enabled = [] {
+        const char * raw = std::getenv("DFLASH_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool device_join_enabled() {
+    static const bool enabled = [] {
+        const char * raw = std::getenv("DFLASH_DS4_TP_DEVICE_JOIN");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool route_prefork_enabled() {
+    static const bool enabled = [] {
+        const char * raw = std::getenv("DFLASH_DS4_TP_ROUTE_PREFORK");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
+
+static void add_hybrid_telemetry(MoeHybridFfnTelemetry & dst,
+                                 const MoeHybridFfnTelemetry & src) {
+    dst.ffn_wall_us += src.ffn_wall_us;
+    dst.partition_us += src.partition_us;
+    dst.hot_us += src.hot_us;
+    dst.cold_us += src.cold_us;
+    dst.shared_us += src.shared_us;
+    dst.combine_us += src.combine_us;
+    dst.hot_graph_build_us += src.hot_graph_build_us;
+    dst.hot_input_us += src.hot_input_us;
+    dst.hot_compute_us += src.hot_compute_us;
+    dst.hot_read_us += src.hot_read_us;
+    dst.cold_graph_build_us += src.cold_graph_build_us;
+    dst.cold_input_us += src.cold_input_us;
+    dst.cold_compute_us += src.cold_compute_us;
+    dst.cold_read_us += src.cold_read_us;
+    dst.hot_graph_builds += src.hot_graph_builds;
+    dst.hot_graph_hits += src.hot_graph_hits;
+    dst.cold_graph_builds += src.cold_graph_builds;
+    dst.cold_graph_hits += src.cold_graph_hits;
+    dst.hot_selected += src.hot_selected;
+    dst.cold_selected += src.cold_selected;
+}
+
 static int env_int_or_default(const char * name, int fallback) {
     const char * raw = std::getenv(name);
     if (!raw || !*raw) return fallback;
@@ -458,13 +579,102 @@ static bool build_batched_routed_graph(
     ggml_tensor * wts,
     int n_embd, int n_ff_exp, int n_used, int n_tokens,
     float swiglu_clamp,
-    ggml_tensor ** out_routed)
+    ggml_tensor ** out_routed,
+    bool tokenwise = false,
+    std::vector<ggml_tensor *> * backend_nodes = nullptr)
 {
+    const auto track = [&](ggml_tensor * t) -> ggml_tensor * {
+        if (backend_nodes && t) backend_nodes->push_back(t);
+        return t;
+    };
+    if (tokenwise && n_tokens > 1) {
+        ggml_tensor * joined = nullptr;
+        for (int t = 0; t < n_tokens; ++t) {
+            ggml_tensor * inp_col = ggml_cont(ctx, ggml_view_2d(
+                ctx, inp, n_embd, 1, inp->nb[1], (size_t) t * inp->nb[1]));
+            ggml_tensor * sel_col = ggml_cont(ctx, ggml_view_2d(
+                ctx, sel, n_used, 1, sel->nb[1], (size_t) t * sel->nb[1]));
+            ggml_tensor * wts_col = ggml_cont(ctx, ggml_view_2d(
+                ctx, wts, n_used, 1, wts->nb[1], (size_t) t * wts->nb[1]));
+            ggml_tensor * routed_col = nullptr;
+            if (!build_batched_routed_graph(
+                    ctx, gate_tensor, up_tensor, down_tensor, gate_up_tensor,
+                    gate_scale, up_scale, down_scale, gate_up_scale,
+                    inp_col, sel_col, wts_col,
+                    n_embd, n_ff_exp, n_used, 1, swiglu_clamp,
+                    &routed_col, false, backend_nodes)) {
+                return false;
+            }
+            joined = joined ? track(ggml_concat(ctx, joined, routed_col, 1))
+                            : routed_col;
+        }
+        *out_routed = joined;
+        return joined != nullptr;
+    }
+
     ggml_tensor * cur_3d = ggml_reshape_3d(ctx, inp, n_embd, 1, n_tokens);
     ggml_tensor * gu = nullptr;
-    if (gate_up_tensor) {
-        ggml_tensor * gate_up_e = apply_scale2(ctx,
-            ggml_mul_mat_id(ctx, gate_up_tensor, cur_3d, sel), gate_up_scale);
+    const bool coarse_split_requested =
+        coarse_owner_op_enabled() && coarse_owner_split_op_enabled();
+    const bool coarse_split_eligible =
+        gate_tensor && up_tensor &&
+        gate_tensor->type == GGML_TYPE_Q2_0_ROCMFP2 &&
+        up_tensor->type == GGML_TYPE_Q2_0_ROCMFP2 &&
+        down_tensor->type == GGML_TYPE_Q3_0_ROCMFPX;
+    if (coarse_split_requested) {
+        static bool logged_active = false;
+        static bool logged_ineligible = false;
+        bool & logged = coarse_split_eligible ? logged_active : logged_ineligible;
+        if (!logged) {
+            std::fprintf(stderr,
+                "[ds4-tp] split-owner %s gate=%s up=%s down=%s gate_up=%s tokens=%d routes=%d\n",
+                coarse_split_eligible ? "active" : "ineligible",
+                gate_tensor ? ggml_type_name(gate_tensor->type) : "none",
+                up_tensor ? ggml_type_name(up_tensor->type) : "none",
+                down_tensor ? ggml_type_name(down_tensor->type) : "none",
+                gate_up_tensor ? ggml_type_name(gate_up_tensor->type) : "none",
+                n_tokens, n_used);
+            logged = true;
+        }
+    }
+    if (coarse_split_requested && coarse_split_eligible) {
+        *out_routed = track(ggml_ds4_moe_owner_split(
+            ctx, inp, gate_tensor, up_tensor, down_tensor, sel, wts,
+            n_ff_exp, swiglu_clamp,
+            gate_scale, up_scale, down_scale));
+        return *out_routed != nullptr;
+    } else if (coarse_owner_op_enabled() &&
+        gate_up_tensor &&
+        gate_up_scale == 1.0f &&
+        gate_up_tensor->type == GGML_TYPE_Q2_0_ROCMFP2 &&
+        down_tensor->type == GGML_TYPE_Q3_0_ROCMFPX) {
+        *out_routed = track(ggml_ds4_moe_owner(
+            ctx, inp, gate_up_tensor, down_tensor, sel, wts,
+            n_ff_exp, swiglu_clamp, down_scale));
+        return *out_routed != nullptr;
+    } else if (gate_up_tensor &&
+        fused_gate_up_mmvq_enabled() &&
+        gate_up_scale == 1.0f) {
+        GGML_ASSERT(gate_up_tensor->ne[1] == 2 * n_ff_exp);
+        ggml_tensor * gate_w = ggml_view_3d(
+            ctx, gate_up_tensor,
+            gate_up_tensor->ne[0], n_ff_exp, gate_up_tensor->ne[2],
+            gate_up_tensor->nb[1], gate_up_tensor->nb[2], 0);
+        ggml_tensor * up_w = ggml_view_3d(
+            ctx, gate_up_tensor,
+            gate_up_tensor->ne[0], n_ff_exp, gate_up_tensor->ne[2],
+            gate_up_tensor->nb[1], gate_up_tensor->nb[2],
+            (size_t) n_ff_exp * gate_up_tensor->nb[1]);
+        ggml_tensor * gate_e = track(
+            ggml_mul_mat_id(ctx, gate_w, cur_3d, sel));
+        ggml_tensor * up_e = track(
+            ggml_mul_mat_id(ctx, up_w, cur_3d, sel));
+        gu = track(swiglu_clamp > 1.0e-6f
+            ? ggml_swiglu_ds4_split(ctx, gate_e, up_e, swiglu_clamp)
+            : ggml_swiglu_split(ctx, gate_e, up_e));
+    } else if (gate_up_tensor) {
+        ggml_tensor * gate_up_e = track(apply_scale2(ctx,
+            ggml_mul_mat_id(ctx, gate_up_tensor, cur_3d, sel), gate_up_scale));
         ggml_tensor * gate_e = ggml_view_3d(ctx, gate_up_e,
             n_ff_exp, gate_up_e->ne[1], gate_up_e->ne[2],
             gate_up_e->nb[1], gate_up_e->nb[2], 0);
@@ -472,27 +682,312 @@ static bool build_batched_routed_graph(
             n_ff_exp, gate_up_e->ne[1], gate_up_e->ne[2],
             gate_up_e->nb[1], gate_up_e->nb[2],
             (size_t)n_ff_exp * ggml_element_size(gate_up_e));
-        gate_e = ggml_cont(ctx, gate_e);
-        up_e = ggml_cont(ctx, up_e);
-        gu = swiglu_maybe_clamped(ctx, gate_e, up_e, swiglu_clamp);
+        gate_e = track(ggml_cont(ctx, gate_e));
+        up_e = track(ggml_cont(ctx, up_e));
+        gu = track(swiglu_maybe_clamped(ctx, gate_e, up_e, swiglu_clamp));
     } else {
-        ggml_tensor * gate_e = apply_scale2(ctx,
-            ggml_mul_mat_id(ctx, gate_tensor, cur_3d, sel), gate_scale);
-        ggml_tensor * up_e = apply_scale2(ctx,
-            ggml_mul_mat_id(ctx, up_tensor, cur_3d, sel), up_scale);
-        gu = swiglu_maybe_clamped(ctx, gate_e, up_e, swiglu_clamp);
+        ggml_tensor * gate_e = track(apply_scale2(ctx,
+            ggml_mul_mat_id(ctx, gate_tensor, cur_3d, sel), gate_scale));
+        ggml_tensor * up_e = track(apply_scale2(ctx,
+            ggml_mul_mat_id(ctx, up_tensor, cur_3d, sel), up_scale));
+        gu = track(swiglu_maybe_clamped(ctx, gate_e, up_e, swiglu_clamp));
     }
 
-    ggml_tensor * experts = apply_scale2(ctx,
-        ggml_mul_mat_id(ctx, down_tensor, gu, sel), down_scale);
+    ggml_tensor * experts = track(apply_scale2(ctx,
+        ggml_mul_mat_id(ctx, down_tensor, gu, sel), down_scale));
 
     // Weight and sum over experts: [n_embd, n_used, n_tokens] * [1, n_used, n_tokens]
-    ggml_tensor * w_view = ggml_reshape_3d(ctx, wts, 1, n_used, n_tokens);
-    experts = ggml_mul(ctx, experts, w_view);
+    if (fused_moe_combine_enabled()) {
+        *out_routed = track(ggml_laguna_moe_combine(ctx, experts, wts));
+        return *out_routed != nullptr;
+    }
 
-    ggml_tensor * sum_shape = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
-    ggml_tensor * moe_sum = ggml_repeat_back(ctx, experts, sum_shape);
-    *out_routed = ggml_reshape_2d(ctx, moe_sum, n_embd, n_tokens);
+    ggml_tensor * w_view = ggml_reshape_3d(ctx, wts, 1, n_used, n_tokens);
+    experts = track(ggml_mul(ctx, experts, w_view));
+
+    // repeat_back uses this tensor for shape only, but the scheduler still
+    // treats it as a leaf. Keep it on the branch backend; otherwise every MoE
+    // branch acquires a tiny CPU split solely for an uninitialized shape leaf.
+    ggml_tensor * sum_shape = track(
+        ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens));
+    ggml_tensor * moe_sum = track(ggml_repeat_back(ctx, experts, sum_shape));
+    *out_routed = track(ggml_reshape_2d(ctx, moe_sum, n_embd, n_tokens));
+    return true;
+}
+
+bool build_moe_hybrid_ffn_graph(
+    ggml_context *                 ctx,
+    ggml_cgraph *                  schedule_graph,
+    const MoeHybridConfig &        cfg,
+    const MoeLayerDesc &           desc,
+    MoeHybridLayerStorage &        storage,
+    ggml_tensor *                  inp,
+    ggml_tensor *                  global_ids,
+    ggml_tensor *                  router_weights,
+    int                            n_tokens,
+    MoeHybridGraphInputs &         out,
+    bool                           include_shared) {
+
+    out.output = nullptr;
+    out.main_output = nullptr;
+    out.peer_output = nullptr;
+    if (!ctx || !inp || !global_ids || !router_weights || n_tokens <= 0 ||
+        cfg.n_embd <= 0 || cfg.n_ff_exp <= 0 || cfg.n_expert <= 0 ||
+        cfg.n_expert_used <= 0) {
+        return false;
+    }
+
+    const int n_used = cfg.n_expert_used;
+    // Both owner remaps consume the same normalized top-k route weights.
+    // Expose the canonical tensor so the heterogeneous scheduler can keep it
+    // on the main GPU. Otherwise expanding the cold branch first lets backend
+    // assignment migrate this shared dependency to Strix, forcing the hot
+    // R9700 branch to wait for a reverse peer copy before it can launch.
+    out.router_weights = router_weights;
+    auto build_remap = [&](const std::vector<int32_t> & local_by_global,
+                           ggml_tensor ** local_lut,
+                           ggml_tensor ** valid_lut,
+                           ggml_tensor ** local_ids,
+                           ggml_tensor ** masked_weights,
+                           std::vector<ggml_tensor *> * backend_nodes) {
+        auto track = [backend_nodes](ggml_tensor * tensor) {
+            if (tensor && backend_nodes) backend_nodes->push_back(tensor);
+            return tensor;
+        };
+        if (!*local_lut) {
+            *local_lut = ggml_new_tensor_2d(
+                ctx, GGML_TYPE_I32, 1, cfg.n_expert);
+            ggml_set_input(*local_lut);
+            // These inputs are consumed late in a whole-model graph. Preserve
+            // their allocation from graph start; otherwise gallocr may reuse
+            // the tiny buffer as activation scratch before its layer executes.
+            ggml_set_output(*local_lut);
+        }
+        if (!*valid_lut) {
+            *valid_lut = ggml_new_tensor_2d(
+                ctx, GGML_TYPE_F32, 1, cfg.n_expert);
+            ggml_set_input(*valid_lut);
+            ggml_set_output(*valid_lut);
+        }
+
+        // q1 can address the 2-D LUT directly.  Historically q>1 left its tiny
+        // I32 repeat unpinned for CPU fallback.  With the exact GPU I32 repeat
+        // enabled, track it with the rest of the owner-local remap nodes.
+        ggml_tensor * local_lut_batched = *local_lut;
+        if (n_tokens > 1) {
+            ggml_tensor * repeated = ggml_repeat_4d(
+                ctx, *local_lut, 1, cfg.n_expert, n_tokens, 1);
+            local_lut_batched =
+                gpu_i32_repeat_enabled() ? track(repeated) : repeated;
+        }
+        ggml_tensor * mapped = track(ggml_get_rows(
+            ctx, local_lut_batched, global_ids));
+        mapped = track(ggml_reshape_2d(ctx, mapped, n_used, n_tokens));
+        *local_ids = track(ggml_cont(ctx, mapped));
+        ggml_tensor * valid_lut_batched = *valid_lut;
+        if (n_tokens > 1) {
+            valid_lut_batched = track(ggml_repeat_4d(
+                ctx, *valid_lut, 1, cfg.n_expert, n_tokens, 1));
+        }
+        ggml_tensor * valid = track(ggml_get_rows(
+            ctx, valid_lut_batched, global_ids));
+        valid = track(ggml_reshape_2d(ctx, valid, n_used, n_tokens));
+        *masked_weights = track(ggml_mul(ctx, router_weights, valid));
+        return (int)local_by_global.size() == cfg.n_expert;
+    };
+
+    ggml_tensor * hot_ids = nullptr;
+    ggml_tensor * hot_weights = nullptr;
+    if (!build_remap(storage.hot_local_by_global,
+                     &out.hot_local_lut, &out.hot_valid_lut,
+                     &hot_ids, &hot_weights, &out.hot_remap_nodes)) {
+        return false;
+    }
+
+    ggml_tensor * cold_ids = nullptr;
+    ggml_tensor * cold_weights = nullptr;
+    if (!build_remap(storage.cold_local_by_global,
+                     &out.cold_local_lut, &out.cold_valid_lut,
+                     &cold_ids, &cold_weights, &out.cold_remap_nodes)) {
+        return false;
+    }
+
+    ggml_tensor * shard_ids = nullptr;
+    ggml_tensor * shard_weights = nullptr;
+    const bool has_cold_shard = storage.expert_shard_channels > 0 &&
+        storage.gate_shard_hot && storage.up_shard_hot &&
+        storage.down_shard_hot;
+    if (has_cold_shard &&
+        !build_remap(storage.cold_local_by_global,
+                     &out.shard_local_lut, &out.shard_valid_lut,
+                     &shard_ids, &shard_weights, &out.shard_remap_nodes)) {
+        return false;
+    }
+
+    // q-token verification often routes adjacent tokens to the same expert
+    // at different top-k ranks.  Align those owner-local IDs before MMVQ so
+    // equal weights are consumed by warps in one block.  The encoded original
+    // route slot is decoded by the dedicated MoE kernel, which scatters every
+    // result back before the unchanged weighted reduction.
+    if (n_tokens > 1 && align_shared_moe_ids_enabled()) {
+        hot_ids = ggml_ds4_moe_align_ids(ctx, hot_ids);
+        cold_ids = ggml_ds4_moe_align_ids(ctx, cold_ids);
+        out.hot_remap_nodes.push_back(hot_ids);
+        out.cold_remap_nodes.push_back(cold_ids);
+        if (has_cold_shard) {
+            shard_ids = ggml_ds4_moe_align_ids(ctx, shard_ids);
+            out.shard_remap_nodes.push_back(shard_ids);
+        }
+    }
+
+
+    ggml_tensor * shard = nullptr;
+    if (has_cold_shard) {
+        const bool tokenwise =
+            storage.gate_shard_hot->type == GGML_TYPE_Q2_0_ROCMFP2 &&
+            !(n_tokens > 1 && grouped_mmvq_moe_enabled());
+        if (!build_batched_routed_graph(
+                ctx,
+                storage.gate_shard_hot, storage.up_shard_hot,
+                storage.down_shard_hot, nullptr,
+                desc.ffn_gate_exps_s, desc.ffn_up_exps_s,
+                desc.ffn_down_exps_s, 1.0f,
+                inp, shard_ids, shard_weights,
+                cfg.n_embd, storage.expert_shard_channels,
+                n_used, n_tokens, cfg.swiglu_clamp,
+                &shard, tokenwise, &out.shard_nodes)) {
+            return false;
+        }
+    }
+
+    ggml_tensor * hot = nullptr;
+    if ((storage.gate_up_hot || (storage.gate_hot && storage.up_hot)) &&
+        storage.down_hot) {
+        const ggml_tensor * hot_gate = storage.gate_up_hot
+            ? storage.gate_up_hot : storage.gate_hot;
+        const bool tokenwise =
+            hot_gate->type == GGML_TYPE_Q2_0_ROCMFP2 &&
+            !(n_tokens > 1 && grouped_mmvq_moe_enabled());
+        if (!build_batched_routed_graph(
+                ctx,
+                storage.gate_hot, storage.up_hot, storage.down_hot,
+                storage.gate_up_hot,
+                desc.ffn_gate_exps_s, desc.ffn_up_exps_s,
+                desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
+                inp, hot_ids, hot_weights,
+                cfg.n_embd, cfg.n_ff_exp, n_used, n_tokens,
+                cfg.swiglu_clamp, &hot, tokenwise,
+                &out.hot_nodes)) {
+            return false;
+        }
+    }
+
+    ggml_tensor * cold = nullptr;
+    if ((storage.gate_up_cold || (storage.gate_cold && storage.up_cold)) &&
+        storage.down_cold) {
+        const ggml_tensor * cold_gate = storage.gate_up_cold
+            ? storage.gate_up_cold : storage.gate_cold;
+        const bool tokenwise =
+            cold_gate->type == GGML_TYPE_Q2_0_ROCMFP2 &&
+            !(n_tokens > 1 && grouped_mmvq_moe_enabled());
+        if (!build_batched_routed_graph(
+                ctx,
+                storage.gate_cold, storage.up_cold, storage.down_cold,
+                storage.gate_up_cold,
+                desc.ffn_gate_exps_s, desc.ffn_up_exps_s,
+                desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
+                inp, cold_ids, cold_weights,
+                cfg.n_embd,
+                storage.expert_shard_channels > 0
+                    ? cfg.n_ff_exp - storage.expert_shard_channels
+                    : cfg.n_ff_exp,
+                n_used, n_tokens,
+                cfg.swiglu_clamp, &cold, tokenwise,
+                &out.cold_nodes)) {
+            return false;
+        }
+    }
+
+    ggml_tensor * main_branch = hot;
+    if (shard) {
+        main_branch = main_branch ? ggml_add(ctx, main_branch, shard) : shard;
+        out.shard_nodes.push_back(main_branch);
+    }
+    ggml_tensor * shared = include_shared
+        ? build_shared_expert_subgraph(ctx, desc, inp, cfg.swiglu_clamp)
+        : nullptr;
+    if (shared) main_branch = main_branch ? ggml_add(ctx, main_branch, shared) : shared;
+
+    // The generic scheduler copies every cross-backend input before launching
+    // any node in a split. If hot/shared and the final add are one contiguous
+    // main-backend split, the add's cold input makes that whole split wait for
+    // the peer, serializing the nominally parallel branches.
+    //
+    // Expand cold now, then visit hot/shared, then a new peer-owned CONT fence,
+    // and finally the main-backend add. This yields:
+    //   peer cold compute -> main hot/shared compute -> peer fence -> main join
+    // The scheduler can enqueue cold first and hot/shared second; the fence
+    // separates the final join so its event wait is inserted after hot/shared.
+    ggml_tensor * combined = nullptr;
+    if (schedule_graph && cold && device_join_enabled()) {
+        // Materialize both route IDs and normalized route weights before the
+        // cold split is expanded.  Cross-device copies are not guaranteed to
+        // remain asynchronous on this heterogeneous ROCm pair.  If the tiny
+        // weight copy is discovered after cold expert execution, the fallback
+        // copy synchronizes the Strix stream and prevents the host from
+        // enqueueing independent R9700 hot work until cold has completed.
+        //
+        // q4 verification calls this builder twice (4 routes + padded 2), so
+        // retain every derived route tensor rather than only the canonical
+        // six-wide routing output.
+        if (route_prefork_enabled()) {
+            out.route_prefork_nodes.push_back(global_ids);
+            out.route_prefork_nodes.push_back(router_weights);
+            ggml_build_forward_expand(schedule_graph, global_ids);
+            ggml_build_forward_expand(schedule_graph, router_weights);
+        }
+        // Enforce fork order without adding another backend graph:
+        //   cold owner -> hot/shared -> in-graph event wait/copy -> add.
+        // The deferred copy remains in the same main-backend split as the
+        // hot branch, so its wait is reached only after useful main work.
+        // Keep the peer result live explicitly. The generic allocator normally
+        // derives lifetime from children on the same execution backend; this
+        // custom foreign-buffer edge intentionally bypasses that copy path.
+        ggml_set_output(cold);
+        ggml_build_forward_expand(schedule_graph, cold);
+        if (main_branch) {
+            ggml_build_forward_expand(schedule_graph, main_branch);
+        }
+        ggml_tensor * cold_ready =
+            ggml_ds4_deferred_peer_copy(ctx, cold);
+        // The scheduler may prefill this tensor in the host-copy diagnostic
+        // before its containing main split launches. Reserve a stable buffer
+        // from graph start so earlier hot-branch scratch cannot alias it.
+        ggml_set_input(cold_ready);
+        ggml_set_output(cold_ready);
+        out.deferred_peer_copy_nodes.push_back(cold_ready);
+        out.main_output = main_branch;
+        out.peer_output = cold_ready;
+        combined = main_branch ? ggml_add(ctx, cold_ready, main_branch)
+                               : cold_ready;
+    } else if (schedule_graph && cold) {
+        ggml_build_forward_expand(schedule_graph, cold);
+        ggml_tensor * cold_fence = ggml_cont(ctx, cold);
+        out.cold_nodes.push_back(cold_fence);
+        combined = main_branch ? ggml_add(ctx, main_branch, cold_fence)
+                               : cold_fence;
+    } else {
+        // Preserve the established default dependency order exactly.
+        if (cold && main_branch) {
+            combined = ggml_add(ctx, cold, main_branch);
+            out.join_nodes.push_back(combined);
+        } else {
+            combined = cold ? cold : main_branch;
+        }
+    }
+    if (!combined) return false;
+
+    out.output = ggml_cont(ctx, combined);
     return true;
 }
 
@@ -718,16 +1213,21 @@ bool build_cached_hot_batched_graph(
 
     out.inp = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, n_embd, n_tokens);
     ggml_set_input(out.inp);
-    out.sel = ggml_new_tensor_2d(out.ctx, GGML_TYPE_I32, n_used, n_tokens);
-    ggml_set_input(out.sel);
-    out.wts = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, n_used, n_tokens);
-    ggml_set_input(out.wts);
 
     ggml_tensor * routed = nullptr;
-    build_batched_routed_graph(out.ctx,
-        storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
-        desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-        out.inp, out.sel, out.wts, n_embd, n_ff_exp, n_used, n_tokens, cfg.swiglu_clamp, &routed);
+    const bool has_hot_stack =
+        (storage.gate_up_hot || (storage.gate_hot && storage.up_hot)) &&
+        storage.down_hot;
+    if (has_hot_stack) {
+        out.sel = ggml_new_tensor_2d(out.ctx, GGML_TYPE_I32, n_used, n_tokens);
+        ggml_set_input(out.sel);
+        out.wts = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, n_used, n_tokens);
+        ggml_set_input(out.wts);
+        build_batched_routed_graph(out.ctx,
+            storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
+            desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
+            out.inp, out.sel, out.wts, n_embd, n_ff_exp, n_used, n_tokens, cfg.swiglu_clamp, &routed);
+    }
 
     // Shared expert (always on GPU)
     ggml_tensor * combined = routed;
@@ -868,6 +1368,17 @@ bool eval_moe_hybrid_ffn_single(
         (fixed_slot_mode == 1 && has_cold) ? std::max(n_cold, fixed_slot_limit) :
         (fixed_slot_mode == 2 && has_cold) ? std::max(n_cold, min_adaptive_slots) :
         n_cold;
+    const size_t graph_cache_size = (size_t)cfg.n_expert_used + 1;
+    if (storage.hot_graph_by_width.size() < graph_cache_size) {
+        storage.hot_graph_by_width.resize(graph_cache_size);
+    }
+    if (storage.cold_graph_by_width.size() < graph_cache_size) {
+        storage.cold_graph_by_width.resize(graph_cache_size);
+    }
+    CachedFfnGraph & hot_graph =
+        storage.hot_graph_by_width[(size_t)n_hot_graph];
+    CachedFfnGraph & cold_graph =
+        storage.cold_graph_by_width[(size_t)n_cold_graph];
     ggml_backend_t cold_backend = storage.cold_backend ? storage.cold_backend : cpu_backend;
     const bool cold_on_gpu = has_cold &&
                              storage.cold_backend_kind == MoeHybridColdBackend::Gpu &&
@@ -897,10 +1408,10 @@ bool eval_moe_hybrid_ffn_single(
             hot_weights_data = hot_weights_padded.data();
         }
         // Lazily build cached hot graph on first use
-        if (!storage.hot_graph.valid() || storage.hot_graph.n_hot != n_hot_graph) {
+        if (!hot_graph.valid() || hot_graph.n_hot != n_hot_graph) {
             if (telemetry) telemetry->hot_graph_builds++;
             const auto graph_build_t0 = HybridClock::now();
-            build_cached_hot_graph(storage.hot_graph, gpu_backend,
+            build_cached_hot_graph(hot_graph, gpu_backend,
                                    storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
                                    desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
                                    desc, cfg.n_embd, cfg.n_ff_exp, n_hot_graph,
@@ -909,19 +1420,19 @@ bool eval_moe_hybrid_ffn_single(
         } else if (telemetry) {
             telemetry->hot_graph_hits++;
         }
-        if (storage.hot_graph.valid() && storage.hot_graph.n_hot == n_hot_graph) {
+        if (hot_graph.valid() && hot_graph.n_hot == n_hot_graph) {
             const auto input_t0 = HybridClock::now();
-            ggml_backend_tensor_set(storage.hot_graph.inp, cur_host, 0, sizeof(float) * (size_t)cfg.n_embd);
-            if (storage.hot_graph.ids && n_hot_graph > 0) {
-                ggml_backend_tensor_set(storage.hot_graph.ids, hot_ids_data, 0, sizeof(int32_t) * (size_t)n_hot_graph);
+            ggml_backend_tensor_set(hot_graph.inp, cur_host, 0, sizeof(float) * (size_t)cfg.n_embd);
+            if (hot_graph.ids && n_hot_graph > 0) {
+                ggml_backend_tensor_set(hot_graph.ids, hot_ids_data, 0, sizeof(int32_t) * (size_t)n_hot_graph);
             }
-            if (storage.hot_graph.weights && n_hot_graph > 0) {
-                ggml_backend_tensor_set(storage.hot_graph.weights, hot_weights_data, 0, sizeof(float) * (size_t)n_hot_graph);
+            if (hot_graph.weights && n_hot_graph > 0) {
+                ggml_backend_tensor_set(hot_graph.weights, hot_weights_data, 0, sizeof(float) * (size_t)n_hot_graph);
             }
             if (telemetry) telemetry->hot_input_us += elapsed_us(input_t0, HybridClock::now());
             // Launch GPU async — kernel runs while the cold backend runs.
             const auto compute_t0 = HybridClock::now();
-            ggml_backend_graph_compute_async(gpu_backend, storage.hot_graph.gf);
+            ggml_backend_graph_compute_async(gpu_backend, hot_graph.gf);
             if (telemetry) telemetry->hot_compute_us += elapsed_us(compute_t0, HybridClock::now());
             hot_async_launched = true;
             if (cold_on_gpu) {
@@ -965,10 +1476,10 @@ bool eval_moe_hybrid_ffn_single(
             cold_ids_data = cold_ids_padded.data();
             cold_weights_data = cold_weights_padded.data();
         }
-        if (!storage.cold_graph.valid() || storage.cold_graph.n_hot != n_cold_graph) {
+        if (!cold_graph.valid() || cold_graph.n_hot != n_cold_graph) {
             if (telemetry) telemetry->cold_graph_builds++;
             const auto graph_build_t0 = HybridClock::now();
-            build_cached_cold_graph(storage.cold_graph, cold_backend,
+            build_cached_cold_graph(cold_graph, cold_backend,
                                     storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
                                     desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
                                     cfg.n_embd, cfg.n_ff_exp, n_cold_graph, cfg.swiglu_clamp);
@@ -976,14 +1487,14 @@ bool eval_moe_hybrid_ffn_single(
         } else if (telemetry) {
             telemetry->cold_graph_hits++;
         }
-        if (storage.cold_graph.valid() && storage.cold_graph.n_hot == n_cold_graph) {
+        if (cold_graph.valid() && cold_graph.n_hot == n_cold_graph) {
             const auto input_t0 = HybridClock::now();
-            ggml_backend_tensor_set(storage.cold_graph.inp, cur_host, 0, sizeof(float) * (size_t)cfg.n_embd);
-            ggml_backend_tensor_set(storage.cold_graph.ids, cold_ids_data, 0, sizeof(int32_t) * (size_t)n_cold_graph);
-            ggml_backend_tensor_set(storage.cold_graph.weights, cold_weights_data, 0, sizeof(float) * (size_t)n_cold_graph);
+            ggml_backend_tensor_set(cold_graph.inp, cur_host, 0, sizeof(float) * (size_t)cfg.n_embd);
+            ggml_backend_tensor_set(cold_graph.ids, cold_ids_data, 0, sizeof(int32_t) * (size_t)n_cold_graph);
+            ggml_backend_tensor_set(cold_graph.weights, cold_weights_data, 0, sizeof(float) * (size_t)n_cold_graph);
             if (telemetry) telemetry->cold_input_us += elapsed_us(input_t0, HybridClock::now());
             const auto compute_t0 = HybridClock::now();
-            auto st = ggml_backend_graph_compute(cold_backend, storage.cold_graph.gf);
+            auto st = ggml_backend_graph_compute(cold_backend, cold_graph.gf);
             if (telemetry) telemetry->cold_compute_us += elapsed_us(compute_t0, HybridClock::now());
             if (st != GGML_STATUS_SUCCESS) {
                 if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
@@ -992,7 +1503,7 @@ bool eval_moe_hybrid_ffn_single(
             }
             const auto read_t0 = HybridClock::now();
             cold.resize((size_t)cfg.n_embd);
-            ggml_backend_tensor_get(storage.cold_graph.output, cold.data(), 0, sizeof(float) * (size_t)cfg.n_embd);
+            ggml_backend_tensor_get(cold_graph.output, cold.data(), 0, sizeof(float) * (size_t)cfg.n_embd);
             if (telemetry) telemetry->cold_read_us += elapsed_us(read_t0, HybridClock::now());
         } else {
             if (!run_routed_subset(cold_backend,
@@ -1010,11 +1521,11 @@ bool eval_moe_hybrid_ffn_single(
     const auto cold_t1 = HybridClock::now();
 
     // ── Sync GPU and read result ──
-    if ((has_hot || has_shared) && storage.hot_graph.valid() && storage.hot_graph.n_hot == n_hot_graph) {
+    if ((has_hot || has_shared) && hot_graph.valid() && hot_graph.n_hot == n_hot_graph) {
         const auto read_t0 = HybridClock::now();
         ggml_backend_synchronize(gpu_backend);
         hot_and_shared.resize((size_t)cfg.n_embd);
-        ggml_backend_tensor_get(storage.hot_graph.output, hot_and_shared.data(), 0, sizeof(float) * (size_t)cfg.n_embd);
+        ggml_backend_tensor_get(hot_graph.output, hot_and_shared.data(), 0, sizeof(float) * (size_t)cfg.n_embd);
         if (telemetry) telemetry->hot_read_us += elapsed_us(read_t0, HybridClock::now());
     }
     const auto hot_t1 = HybridClock::now();
@@ -1307,29 +1818,50 @@ static bool eval_moe_hybrid_ffn_batched_core(
         CachedHotBatchedGraph & hg = storage.hot_batched_mixed[n_tokens];
         const bool hg_ok = (hg.valid() && hg.n_tokens == n_tokens)
             || build_cached_hot_batched_graph(hg, gpu_backend, storage, desc, cfg, n_tokens);
+        const bool remote_cold = fp_has_cold && expert_compute && expert_layer;
         CachedHotBatchedGraph * cg = nullptr;
         bool cg_ok = true;
-        if (fp_has_cold) {
+        if (fp_has_cold && !remote_cold) {
             cg = &storage.cold_batched_mixed[n_tokens];
+            ggml_backend_t cached_cold_backend =
+                storage.cold_backend ? storage.cold_backend : cpu_backend;
             cg_ok = (cg->valid() && cg->n_tokens == n_tokens)
-                || build_cached_cold_batched_graph(*cg, cpu_backend, storage, desc, cfg, n_tokens);
+                || build_cached_cold_batched_graph(
+                    *cg, cached_cold_backend, storage, desc, cfg, n_tokens);
         }
 
         if (hg_ok && cg_ok) {
             // Hot (GPU, async): shared expert + routed hot (zero-weight dummy slots
             // keep an all-cold batch's shared-expert contribution).
             ggml_backend_tensor_set(hg.inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
-            ggml_backend_tensor_set(hg.sel, hot_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
-            ggml_backend_tensor_set(hg.wts, hot_wts.data(), 0, sizeof(float) * (size_t)total_slots);
+            if (hg.sel) {
+                ggml_backend_tensor_set(hg.sel, hot_sel.data(), 0,
+                                        sizeof(int32_t) * (size_t)total_slots);
+            }
+            if (hg.wts) {
+                ggml_backend_tensor_set(hg.wts, hot_wts.data(), 0,
+                                        sizeof(float) * (size_t)total_slots);
+            }
             ggml_backend_graph_compute_async(gpu_backend, hg.gf);
 
             std::vector<float> cold_partial;
-            if (cg) {
+            if (remote_cold) {
+                if (!eval_moe_hybrid_remote_cold_batched(
+                        cfg, storage, cur_host, selected_ids, selected_weights,
+                        n_tokens, cold_partial, err,
+                        expert_compute, expert_layer)) {
+                    ggml_backend_synchronize(gpu_backend);
+                    return false;
+                }
+            } else if (cg) {
                 cold_partial.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
                 ggml_backend_tensor_set(cg->inp, cur_host, 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
                 ggml_backend_tensor_set(cg->sel, cold_sel.data(), 0, sizeof(int32_t) * (size_t)total_slots);
                 ggml_backend_tensor_set(cg->wts, cold_wts.data(), 0, sizeof(float) * (size_t)total_slots);
-                if (ggml_backend_graph_compute(cpu_backend, cg->gf) != GGML_STATUS_SUCCESS) {
+                ggml_backend_t cached_cold_backend =
+                    storage.cold_backend ? storage.cold_backend : cpu_backend;
+                if (ggml_backend_graph_compute(
+                        cached_cold_backend, cg->gf) != GGML_STATUS_SUCCESS) {
                     ggml_backend_synchronize(gpu_backend);
                     if (err) *err = "batched cold cached compute failed";
                     return false;
@@ -1339,7 +1871,7 @@ static bool eval_moe_hybrid_ffn_batched_core(
 
             ggml_backend_synchronize(gpu_backend);
             ggml_backend_tensor_get(hg.output, out.data(), 0, sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
-            if (cg) {
+            if (remote_cold || cg) {
                 const size_t ntot = (size_t)n_embd * (size_t)n_tokens;
                 for (size_t i = 0; i < ntot; ++i) out[i] += cold_partial[i];
             }
@@ -1647,82 +2179,12 @@ static bool eval_moe_hybrid_remote_cold_batched(
         return false;
     }
 
-    const int cold_batch = moe_hybrid_expert_compute_ipc_batch_limit(n_tokens);
-    std::vector<int> token_group;
-    std::vector<float> group_input;
-    std::vector<int32_t> group_ids;
-    std::vector<float> group_wts;
-    std::vector<float> group_output;
-    for (int n_cold = 1; n_cold <= max_cold_selected; ++n_cold) {
-        token_group.clear();
-        for (int t = 0; t < n_tokens; ++t) {
-            if (cold_counts[(size_t)t] == n_cold) {
-                token_group.push_back(t);
-            }
-        }
-        for (size_t base = 0; base < token_group.size(); base += (size_t)cold_batch) {
-            const int tc = (int)std::min((size_t)cold_batch, token_group.size() - base);
-            bool contiguous_tokens = true;
-            for (int gi = 1; gi < tc; ++gi) {
-                if (token_group[base + (size_t)gi] !=
-                    token_group[base] + gi) {
-                    contiguous_tokens = false;
-                    break;
-                }
-            }
-            const int first_token = token_group[base];
-            const float * compute_input = contiguous_tokens
-                ? cur_host + (size_t)first_token * (size_t)n_embd
-                : nullptr;
-            float * compute_output = contiguous_tokens
-                ? out.data() + (size_t)first_token * (size_t)n_embd
-                : nullptr;
-            if (!contiguous_tokens) {
-                group_input.resize((size_t)tc * (size_t)n_embd);
-                compute_input = group_input.data();
-            }
-            group_ids.resize((size_t)tc * (size_t)n_cold);
-            group_wts.resize((size_t)tc * (size_t)n_cold);
-            if (!contiguous_tokens) {
-                group_output.resize((size_t)tc * (size_t)n_embd);
-                compute_output = group_output.data();
-            }
-
-            for (int gi = 0; gi < tc; ++gi) {
-                const int t = token_group[base + (size_t)gi];
-                if (!contiguous_tokens) {
-                    std::memcpy(group_input.data() + (size_t)gi * (size_t)n_embd,
-                                cur_host + (size_t)t * (size_t)n_embd,
-                                sizeof(float) * (size_t)n_embd);
-                }
-                for (int i = 0; i < n_cold; ++i) {
-                    const size_t src = (size_t)t * (size_t)n_used + (size_t)i;
-                    const size_t dst = (size_t)gi * (size_t)n_cold + (size_t)i;
-                    group_ids[dst] = cold_sel[src];
-                    group_wts[dst] = cold_wts[src];
-                }
-            }
-
-            if (!expert_compute->compute_batch(*expert_layer,
-                                               compute_input,
-                                               group_ids.data(),
-                                               group_wts.data(),
-                                               tc, n_cold,
-                                               n_embd, n_ff_exp,
-                                               compute_output)) {
-                if (err) *err = "hybrid batched remote cold compute failed";
-                return false;
-            }
-
-            if (!contiguous_tokens) {
-                for (int gi = 0; gi < tc; ++gi) {
-                    const int t = token_group[base + (size_t)gi];
-                    std::memcpy(out.data() + (size_t)t * (size_t)n_embd,
-                                group_output.data() + (size_t)gi * (size_t)n_embd,
-                                sizeof(float) * (size_t)n_embd);
-                }
-            }
-        }
+    if (!expert_compute->compute_batch_ragged(
+            *expert_layer, cur_host, cold_sel.data(), cold_wts.data(),
+            cold_counts.data(), n_tokens, n_used, n_embd, n_ff_exp,
+            out.data())) {
+        if (err) *err = "hybrid ragged remote cold compute failed";
+        return false;
     }
     return true;
 }
@@ -1931,6 +2393,29 @@ bool eval_moe_hybrid_ffn_batched(
     const MoeExpertLayer *            expert_layer,
     MoeHybridFfnTelemetry *         telemetry) {
     if (telemetry) *telemetry = {};
+    const bool materialized_cold = storage.down_cold || storage.gate_up_cold;
+    if (compact_materialized_experts_enabled() && materialized_cold &&
+        !expert_compute && n_tokens > 0 && n_tokens <= 4) {
+        out.assign((size_t)cfg.n_embd * (size_t)n_tokens, 0.0f);
+        std::vector<float> token_out;
+        for (int t = 0; t < n_tokens; ++t) {
+            MoeHybridFfnTelemetry token_telemetry;
+            if (!eval_moe_hybrid_ffn_single(
+                    gpu_backend, cfg, desc, storage, cpu_backend,
+                    cur_host + (size_t)t * (size_t)cfg.n_embd,
+                    selected_ids + (size_t)t * (size_t)cfg.n_expert_used,
+                    selected_weights + (size_t)t * (size_t)cfg.n_expert_used,
+                    cfg.n_expert_used, token_out,
+                    telemetry ? &token_telemetry : nullptr, err)) {
+                return false;
+            }
+            if (telemetry) add_hybrid_telemetry(*telemetry, token_telemetry);
+            std::memcpy(out.data() + (size_t)t * (size_t)cfg.n_embd,
+                        token_out.data(),
+                        sizeof(float) * (size_t)cfg.n_embd);
+        }
+        return true;
+    }
     const int n_hot_stack = storage.gate_up_hot ? (int)storage.gate_up_hot->ne[2]
                           : storage.gate_hot    ? (int)storage.gate_hot->ne[2]
                           : 0;

@@ -323,6 +323,9 @@ extern "C" {
 
     // Get the number of splits of the last graph
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
+    GGML_API int                  ggml_backend_sched_get_n_splits_for_backend(
+                                            ggml_backend_sched_t sched,
+                                            ggml_backend_t backend);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
@@ -340,6 +343,13 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
+    // The caller has synchronized all backends and is recording this compute
+    // into an outer device graph.  Buffer-reuse waits may be omitted, while
+    // any copy requiring a synchronous fallback becomes an explicit error.
+    GGML_API void                 ggml_backend_sched_set_whole_graph_capture(
+                                            ggml_backend_sched_t sched,
+                                            bool enabled);
+
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
     // The correct way to use this API is to discard the deallocated tensors and create new ones.
@@ -347,6 +357,25 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+
+    // End a backend split before a late node introduces a new cross-backend
+    // input, so independent earlier nodes can be enqueued before the copy/event
+    // wait. Must be configured before allocating the graph.
+    GGML_API void                 ggml_backend_sched_set_late_cross_input_split(ggml_backend_sched_t sched, bool enabled);
+
+    // Apply the same split rule only at an explicitly marked node. This keeps
+    // unrelated cross-backend consumers in their established scheduler
+    // segments. Nodes must be registered before allocating the graph.
+    GGML_API void                 ggml_backend_sched_add_late_cross_input_split_node(
+                                            ggml_backend_sched_t sched,
+                                            const struct ggml_tensor * node);
+
+    // Mark a GGML_OP_MOE_FUSED mode -3 node as a deferred peer copy. The
+    // scheduler keeps src[0] on its owner backend, records a dedicated event
+    // after the producing split, and injects the native handle into the op.
+    GGML_API void                 ggml_backend_sched_add_deferred_peer_copy_node(
+                                            ggml_backend_sched_t sched,
+                                            const struct ggml_tensor * node);
 
     //
     // Meta backend

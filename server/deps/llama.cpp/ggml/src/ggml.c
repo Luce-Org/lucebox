@@ -2094,6 +2094,15 @@ static struct ggml_tensor * ggml_add_impl(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b,
         bool                  inplace) {
+    if (!ggml_can_repeat(b, a)) {
+        fprintf(stderr,
+                "[ggml-add-shape] a='%s' type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                "b='%s' type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] inplace=%d\n",
+                a->name, ggml_type_name(a->type), a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+                b->name, ggml_type_name(b->type), b->ne[0], b->ne[1], b->ne[2], b->ne[3],
+                (int) inplace);
+        ggml_print_backtrace_symbols();
+    }
     GGML_ASSERT(ggml_can_repeat(b, a));
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
@@ -8076,6 +8085,124 @@ struct ggml_tensor * ggml_laguna_moe_combine(
     return result;
 }
 
+struct ggml_tensor * ggml_ds4_moe_owner(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * input,
+        struct ggml_tensor  * gate_up_w,
+        struct ggml_tensor  * down_w,
+        struct ggml_tensor  * expert_ids,
+        struct ggml_tensor  * expert_weights,
+        int64_t               ff_dim,
+        float                 swiglu_clamp,
+        float                 down_scale) {
+    GGML_ASSERT(input->type == GGML_TYPE_F32);
+    GGML_ASSERT(expert_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(expert_weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(input->ne[1] == expert_ids->ne[1]);
+    GGML_ASSERT(input->ne[1] == expert_weights->ne[1]);
+    GGML_ASSERT(expert_ids->ne[0] == expert_weights->ne[0]);
+    GGML_ASSERT(gate_up_w->ne[0] == input->ne[0]);
+    GGML_ASSERT(gate_up_w->ne[1] == 2 * ff_dim);
+    GGML_ASSERT(down_w->ne[0] == ff_dim);
+    GGML_ASSERT(down_w->ne[1] == input->ne[0]);
+    GGML_ASSERT(gate_up_w->ne[2] == down_w->ne[2]);
+
+    const int64_t ne[4] = { input->ne[0], input->ne[1], 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 2, ne);
+
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = input;
+    result->src[1] = gate_up_w;
+    result->src[2] = down_w;
+    result->src[3] = expert_ids;
+    result->src[4] = expert_weights;
+
+    ggml_set_op_params_i32(result, 0, -2);
+    ggml_set_op_params_i32(result, 1, (int32_t) ff_dim);
+    ggml_set_op_params_f32(result, 2, swiglu_clamp);
+    ggml_set_op_params_f32(result, 3, down_scale);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_ds4_moe_owner_split(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * input,
+        struct ggml_tensor  * gate_w,
+        struct ggml_tensor  * up_w,
+        struct ggml_tensor  * down_w,
+        struct ggml_tensor  * expert_ids,
+        struct ggml_tensor  * expert_weights,
+        int64_t               ff_dim,
+        float                 swiglu_clamp,
+        float                 gate_scale,
+        float                 up_scale,
+        float                 down_scale) {
+    GGML_ASSERT(input->type == GGML_TYPE_F32);
+    GGML_ASSERT(expert_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(expert_weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(input->ne[1] == expert_ids->ne[1]);
+    GGML_ASSERT(input->ne[1] == expert_weights->ne[1]);
+    GGML_ASSERT(expert_ids->ne[0] == expert_weights->ne[0]);
+    GGML_ASSERT(gate_w->ne[0] == input->ne[0]);
+    GGML_ASSERT(up_w->ne[0] == input->ne[0]);
+    GGML_ASSERT(gate_w->ne[1] == ff_dim && up_w->ne[1] == ff_dim);
+    GGML_ASSERT(down_w->ne[0] == ff_dim);
+    GGML_ASSERT(down_w->ne[1] == input->ne[0]);
+    GGML_ASSERT(gate_w->ne[2] == up_w->ne[2]);
+    GGML_ASSERT(gate_w->ne[2] == down_w->ne[2]);
+
+    const int64_t ne[4] = { input->ne[0], input->ne[1], 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 2, ne);
+
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = input;
+    result->src[1] = gate_w;
+    result->src[2] = up_w;
+    result->src[3] = down_w;
+    result->src[4] = expert_ids;
+    result->src[5] = expert_weights;
+
+    ggml_set_op_params_i32(result, 0, -4);
+    ggml_set_op_params_i32(result, 1, (int32_t) ff_dim);
+    ggml_set_op_params_f32(result, 2, swiglu_clamp);
+    ggml_set_op_params_f32(result, 3, gate_scale);
+    ggml_set_op_params_f32(result, 4, up_scale);
+    ggml_set_op_params_f32(result, 5, down_scale);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_ds4_moe_align_ids(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * expert_ids) {
+    GGML_ASSERT(expert_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_n_dims(expert_ids) == 2);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, expert_ids);
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = expert_ids;
+    ggml_set_op_params_i32(result, 0, -5);
+    return result;
+}
+
+struct ggml_tensor * ggml_ds4_deferred_peer_copy(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * src) {
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src));
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, src);
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = src;
+
+    // op_params[2..3] is populated by the backend scheduler with the native
+    // event handle after backend assignment and before graph allocation.
+    ggml_set_op_params_i32(result, 0, -3);
+
+    return result;
+}
+
 struct ggml_tensor * ggml_ds4_hc_pre(
         struct ggml_context * ctx,
         struct ggml_tensor  * mix,
@@ -8139,6 +8266,38 @@ struct ggml_tensor * ggml_ds4_hc_post(
     result->src[1] = block_out;
     result->src[2] = split;
     ggml_set_op_params_i32(result, 0, 1);
+    ggml_set_op_params_i32(result, 1, (int32_t) n_embd);
+    ggml_set_op_params_i32(result, 2, (int32_t) n_hc);
+    return result;
+}
+
+struct ggml_tensor * ggml_ds4_hc_post_split(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * residual_hc,
+        struct ggml_tensor  * main_block,
+        struct ggml_tensor  * peer_block,
+        struct ggml_tensor  * split,
+        int                   n_hc) {
+    GGML_ASSERT(residual_hc->type == GGML_TYPE_F32);
+    GGML_ASSERT(main_block->type == GGML_TYPE_F32);
+    GGML_ASSERT(peer_block->type == GGML_TYPE_F32);
+    GGML_ASSERT(split->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_hc > 0 && n_hc <= 8);
+    const int64_t mix_dim = 2*(int64_t)n_hc + (int64_t)n_hc*n_hc;
+    GGML_ASSERT(ggml_nelements(split) == mix_dim);
+    GGML_ASSERT(ggml_nelements(residual_hc) % n_hc == 0);
+    const int64_t n_embd = ggml_nelements(residual_hc) / n_hc;
+    GGML_ASSERT(ggml_nelements(main_block) == n_embd);
+    GGML_ASSERT(ggml_nelements(peer_block) == n_embd);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_F32, (int64_t) n_embd * n_hc);
+    result->op = GGML_OP_DS4_HC;
+    result->src[0] = residual_hc;
+    result->src[1] = main_block;
+    result->src[2] = split;
+    result->src[3] = peer_block;
+    ggml_set_op_params_i32(result, 0, 3);
     ggml_set_op_params_i32(result, 1, (int32_t) n_embd);
     ggml_set_op_params_i32(result, 2, (int32_t) n_hc);
     return result;

@@ -30,6 +30,7 @@ namespace dflash::common {
 struct MoeHybridPlacement;
 struct MoeHybridConfig;
 struct MoeHybridRoutingStats;
+struct MoeExpertComputeRuntime;
 class MoeHybridStreamEngine;
 
 struct DeepSeek4StepTelemetry {
@@ -149,6 +150,9 @@ struct DeepSeek4Weights {
     ggml_context *        ctx     = nullptr;
     ggml_backend_t        backend = nullptr;
     ggml_backend_buffer_t buf     = nullptr;
+    // Optional row-split buffer for selected dense projections. The buffer
+    // owns per-device allocations while the tensor metadata stays in ctx.
+    ggml_backend_buffer_t dense_split_buf = nullptr;
 
     // Global tensors
     ggml_tensor * tok_embd       = nullptr;  // [n_embd, n_vocab]
@@ -260,6 +264,9 @@ struct DeepSeek4LayerCache {
 
 struct DeepSeek4Cache {
     int cur_pos  = 0;
+    // Monotonic request generation. Whole-step HIP graphs may retain kernel
+    // state safely within one sequence, but must not survive a cache clear.
+    uint64_t sequence_id = 0;
     int max_ctx  = 0;
     int n_layer  = 0;
 
@@ -347,7 +354,8 @@ bool deepseek4_step(
     MoeHybridStreamEngine *     stream_engine = nullptr,
     DeepSeek4StepTelemetry *    telemetry = nullptr,
     MoeHybridRoutingStats *     routing_stats = nullptr,
-    Ds4VerifyHooks *            verify_hooks = nullptr);
+    Ds4VerifyHooks *            verify_hooks = nullptr,
+    MoeExpertComputeRuntime *   expert_runtime = nullptr);
 
 // Optional hooks for the DSpark spec-decode batched verify (deepseek4_dspark).
 // When set on a multi-token deepseek4_step_layer_range call they add: per-layer
@@ -357,6 +365,8 @@ struct Ds4VerifyHooks {
     const std::vector<int> * capture_layer_ids = nullptr;  // e.g. {40,41,42}
     std::vector<float> *     capture_out = nullptr;         // [n_cap*n_embd * n_tokens]
     std::vector<float> *     all_logits_out = nullptr;      // [n_vocab * n_tokens]
+    std::vector<int32_t> *   argmax_out = nullptr;          // [n_tokens], optional GPU result
+    bool                     prefer_argmax_only = false;     // skip logits D2H when available
 };
 
 bool deepseek4_step_layer_range(
@@ -373,7 +383,10 @@ bool deepseek4_step_layer_range(
     const int32_t *             token_ids = nullptr,
     DeepSeek4StepTelemetry *    telemetry = nullptr,
     bool                        allow_decode_graph_reuse = true,
-    Ds4VerifyHooks *            verify_hooks = nullptr);
+    Ds4VerifyHooks *            verify_hooks = nullptr,
+    MoeHybridStorage *          moe_hybrid = nullptr,
+    MoeExpertComputeRuntime *   expert_runtime = nullptr,
+    MoeHybridRoutingStats *     routing_stats = nullptr);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,
@@ -399,7 +412,8 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
     const MoeHybridPlacement &  placement,
     const MoeHybridConfig *     cfg_override,
     MoeHybridStorage &          out,
-    std::string *               err = nullptr);
+    std::string *               err = nullptr,
+    ggml_backend_t              cold_gpu_backend = nullptr);
 
 // Snapshot
 struct DeepSeek4Snapshot {

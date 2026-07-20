@@ -95,6 +95,44 @@ struct MoeExpertCompute {
         }
         return true;
     }
+
+    // Batched variant with a per-token selected width. ids/weights use a
+    // fixed max_selected stride, while selected_counts controls the active
+    // prefix of each row. IPC implementations use this to keep one request
+    // per layer without padding expert work or grouping rows on the client.
+    virtual bool compute_batch_ragged(
+        const MoeExpertLayer & layer,
+        const float * input,
+        const int32_t * ids,
+        const float * weights,
+        const int32_t * selected_counts,
+        int n_tokens,
+        int max_selected,
+        int n_embd,
+        int n_ff,
+        float * output) {
+        if (n_tokens < 0 || max_selected <= 0 || n_embd <= 0 || !output ||
+            (n_tokens > 0 && (!input || !ids || !weights || !selected_counts))) {
+            return false;
+        }
+        for (int t = 0; t < n_tokens; ++t) {
+            const int n_selected = selected_counts[t];
+            float * token_output = output + (size_t)t * (size_t)n_embd;
+            if (n_selected < 0 || n_selected > max_selected) return false;
+            if (n_selected == 0) {
+                std::fill(token_output, token_output + n_embd, 0.0f);
+                continue;
+            }
+            if (!compute(layer,
+                         input + (size_t)t * (size_t)n_embd,
+                         ids + (size_t)t * (size_t)max_selected,
+                         weights + (size_t)t * (size_t)max_selected,
+                         n_selected, n_embd, n_ff, token_output)) {
+                return false;
+            }
+        }
+        return true;
+    }
 };
 
 // Create CPU-based fused MoE expert compute.
@@ -136,6 +174,7 @@ struct MoeExpertComputeRuntimeConfig {
     int n_embd = 0;
     int n_ff_exp = 0;
     bool enabled = true;
+    bool require_remote = false;
     const char * log_prefix = "[moe-expert-compute]";
 };
 

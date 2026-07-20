@@ -14,6 +14,8 @@
 
 namespace dflash::common {
 
+struct MoeHybridRoutingStats;
+
 // File region for one expert tensor (offset into mmap).
 struct ExpertFileRegion {
     size_t offset = 0;
@@ -79,6 +81,15 @@ struct MoeHybridLayerStorage {
     ggml_tensor * down_hot = nullptr;
     ggml_tensor * gate_up_hot = nullptr;
 
+    // Optional prompt-independent tensor-parallel shard for every cold
+    // expert.  The main GPU owns the leading `expert_shard_channels` FFN
+    // channels while the cold GPU owns the exact complementary channels in
+    // gate_cold/up_cold/down_cold.  Full hot experts remain unsharded.
+    ggml_tensor * gate_shard_hot = nullptr;
+    ggml_tensor * up_shard_hot = nullptr;
+    ggml_tensor * down_shard_hot = nullptr;
+    int expert_shard_channels = 0;
+
     ggml_context * cold_ctx = nullptr;
     ggml_backend_buffer_t cold_buf = nullptr;
     ggml_tensor * gate_cold = nullptr;
@@ -132,6 +143,8 @@ struct MoeHybridLayerStorage {
     // Cached FFN graphs for common-case expert counts.
     CachedFfnGraph hot_graph;
     CachedFfnGraph cold_graph;
+    std::vector<CachedFfnGraph> hot_graph_by_width;
+    std::vector<CachedFfnGraph> cold_graph_by_width;
 
     // Cached batched hot-only graph for prefill sub-batches (n_tokens=4).
     CachedHotBatchedGraph hot_batched_graph;
@@ -200,12 +213,22 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
                               const MoeHybridPlacement & placement,
                               const std::vector<MoeLayerDesc> & layer_descs,
                               MoeHybridStorage & out,
-                              std::string * err = nullptr);
+                              std::string * err = nullptr,
+                              ggml_backend_t cold_gpu_backend = nullptr);
 
 // Swap a cold expert into a spare GPU cache slot (LRU evict). Returns the new
 // hot-local index, or -1 on failure. No-op (returns existing) if already hot.
 int moe_hybrid_cache_swap_in(MoeHybridLayerStorage & st, int global_expert,
                              ggml_backend_t gpu_backend);
+
+// Replace the fixed hot stacks in-place from the persistent expert GGUF mmap.
+// Tensor shapes and addresses remain unchanged, so cached graphs stay valid;
+// only the global->local LUTs need refreshing before their next execution.
+bool moe_hybrid_reassign_hot_experts_from_mmap(
+    MoeHybridStorage & storage,
+    ggml_backend_t hot_backend,
+    const std::vector<std::vector<int32_t>> & hot_ids_by_layer,
+    std::string * err = nullptr);
 
 // Build hybrid storage by loading expert data directly from file (mmap).
 bool build_moe_hybrid_storage_from_file(
@@ -217,7 +240,8 @@ bool build_moe_hybrid_storage_from_file(
     MoeHybridStorage & out,
     std::string * err = nullptr,
     int cache_slots = 0,
-    bool allocate_cold = true);
+    bool allocate_cold = true,
+    ggml_backend_t cold_gpu_backend = nullptr);
 
 // Spark: split a VRAM budget into a pinned-hot tier + an auto-sized expert
 // cache ring. target_bytes==0 keeps the current budget (use the card);
@@ -242,6 +266,7 @@ bool build_moe_hybrid_storage_from_file_with_mmap(
     size_t mmap_total_size,
     MoeHybridStorage & out,
     std::string * err = nullptr,
-    int cache_slots = 0);
+    int cache_slots = 0,
+    ggml_backend_t cold_gpu_backend = nullptr);
 
 }  // namespace dflash::common

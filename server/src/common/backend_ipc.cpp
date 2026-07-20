@@ -321,8 +321,11 @@ bool BackendIpcProcess::write_shared_payload_segments(
         }
     }
     seq = ++shared_payload_seq_;
-    header->bytes = (uint64_t)bytes;
-    header->sequence = seq;
+    // The command pipe publishes this request to another process. Publish the
+    // mapped payload header explicitly so the daemon cannot observe the prior
+    // response header after receiving the new command.
+    backend_ipc_publish_shared_payload_header(
+        header, seq, static_cast<uint64_t>(bytes));
     return true;
 }
 
@@ -331,7 +334,8 @@ bool BackendIpcProcess::read_shared_payload(void * data, size_t bytes, uint64_t 
     if (bytes > 0 && !data) return false;
     const auto * header =
         static_cast<const BackendIpcSharedPayloadHeader *>(shared_payload_map_);
-    if (header->sequence != seq || header->bytes != (uint64_t)bytes) {
+    if (!backend_ipc_shared_payload_header_matches(
+            header, seq, static_cast<uint64_t>(bytes))) {
         return false;
     }
     const void * payload = static_cast<const void *>(

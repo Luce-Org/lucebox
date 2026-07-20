@@ -110,6 +110,70 @@ struct MoeHybridFfnTelemetry {
     int cold_selected = 0;
 };
 
+// Inputs owned by a scheduler-allocated hybrid FFN graph. The lookup tensors
+// map global router IDs to each backend's compact expert stack and mask the
+// slots owned by the other backend without a host-side routing round trip.
+struct MoeHybridGraphInputs {
+    ggml_tensor * router_weights = nullptr;
+    std::vector<ggml_tensor *> router_nodes;
+    // q>1 decomposes the six selected routes into a four-wide head and a
+    // padded two-wide tail.  Keep those derived ID/weight tensors on the main
+    // owner and schedule them before either expert branch.  Otherwise the
+    // scheduler discovers the cold branch first and inserts a second
+    // main->peer copy in the middle of cold execution, which synchronizes the
+    // peer stream before the hot branch can be submitted.
+    std::vector<ggml_tensor *> route_prefork_nodes;
+    ggml_tensor * hot_local_lut = nullptr;
+    ggml_tensor * hot_valid_lut = nullptr;
+    ggml_tensor * cold_local_lut = nullptr;
+    ggml_tensor * cold_valid_lut = nullptr;
+    ggml_tensor * shard_local_lut = nullptr;
+    ggml_tensor * shard_valid_lut = nullptr;
+    ggml_tensor * output = nullptr;
+    // Exact owner-local partials exposed for consumers that can fold the
+    // hot+cold reduction into their own kernel.  peer_output is the stable
+    // main-backend activation produced by the existing deferred peer copy;
+    // neither tensor changes expert placement or routing semantics.
+    ggml_tensor * main_output = nullptr;
+    ggml_tensor * peer_output = nullptr;
+    // Backend-affinity hints consumed after the multi-backend scheduler is
+    // created. Keeping every intermediate of a routed branch on its weight
+    // backend avoids gate/up -> activation -> down ping-pong copies.
+    std::vector<ggml_tensor *> hot_remap_nodes;
+    std::vector<ggml_tensor *> cold_remap_nodes;
+    std::vector<ggml_tensor *> shard_remap_nodes;
+    std::vector<ggml_tensor *> hot_nodes;
+    std::vector<ggml_tensor *> shard_nodes;
+    std::vector<ggml_tensor *> cold_nodes;
+    // Main-backend nodes that first consume a completed cold branch. Hash
+    // layers can append two joins because six routes are lowered as 4 + 2.
+    std::vector<ggml_tensor *> join_nodes;
+    // Main-backend peer-copy ops whose src[0] stays on the cold owner. The
+    // scheduler attaches a dedicated producer event to each node.
+    std::vector<ggml_tensor *> deferred_peer_copy_nodes;
+};
+
+// Append a device-resident hot+cold+shared MoE FFN to an existing graph.
+// `global_ids` and `router_weights` are [n_expert_used, n_tokens]. Weight
+// tensors in `storage` determine scheduler placement on the two GPU backends.
+// When `schedule_graph` is non-null, the cold branch is expanded immediately
+// and a peer-owned fence is inserted before the final main-backend join. This
+// forces three scheduler splits (cold, hot/shared, join), preventing the join's
+// cold-result copy from blocking hot/shared launch. Consumers may use
+// main_output + peer_output to fuse the exact final add into their next op.
+bool build_moe_hybrid_ffn_graph(
+    ggml_context *                 ctx,
+    ggml_cgraph *                  schedule_graph,
+    const MoeHybridConfig &        cfg,
+    const MoeLayerDesc &           desc,
+    MoeHybridLayerStorage &        storage,
+    ggml_tensor *                  inp,
+    ggml_tensor *                  global_ids,
+    ggml_tensor *                  router_weights,
+    int                            n_tokens,
+    MoeHybridGraphInputs &         out,
+    bool                           include_shared = true);
+
 int moe_hybrid_expert_compute_batch_limit();
 int moe_hybrid_expert_compute_ipc_batch_limit(int n_tokens);
 int moe_hybrid_prefill_hot_sub_batch_limit();

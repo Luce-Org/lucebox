@@ -47,6 +47,7 @@ std::string make_runtime_key(const MoeExpertComputeRuntimeConfig & cfg) {
     key += "|n_used=" + std::to_string(cfg.n_expert_used);
     key += "|n_embd=" + std::to_string(cfg.n_embd);
     key += "|n_ff=" + std::to_string(cfg.n_ff_exp);
+    key += "|require_remote=" + std::to_string(cfg.require_remote ? 1 : 0);
     if (const char * ipc_bin = nonempty_env("DFLASH_MOE_EXPERT_COMPUTE_IPC_BIN")) {
         key += "|ipc_bin=";
         key += ipc_bin;
@@ -202,7 +203,7 @@ bool ensure_moe_expert_compute_runtime(
             const char * work_dir = nonempty_env("DFLASH_MOE_EXPERT_COMPUTE_IPC_WORK_DIR");
             const int remote_gpu =
                 parse_nonnegative_env("DFLASH_MOE_EXPERT_COMPUTE_IPC_GPU", 0);
-            const bool required =
+            const bool required = cfg.require_remote ||
                 parse_nonnegative_env("DFLASH_MOE_EXPERT_COMPUTE_IPC_REQUIRED", 0) != 0;
             MoeExpertComputeIpcStartResult remote = make_moe_expert_compute_ipc(
                 ipc_bin, cfg.target_path, remote_gpu, hybrid.placement,
@@ -216,6 +217,13 @@ bool ensure_moe_expert_compute_runtime(
                 return false;
             }
             runtime.compute = std::move(remote.compute);
+        } else if (cfg.require_remote) {
+            if (err) *err = "remote MoE expert compute is required but IPC binary is unset";
+            std::fprintf(stderr, "%s %s\n",
+                         cfg.log_prefix ? cfg.log_prefix : "[moe-expert-compute]",
+                         err ? err->c_str() : "remote IPC binary is unset");
+            runtime.reset();
+            return false;
         }
         if (!runtime.compute) {
             runtime.compute = make_cpu_moe_expert_compute(cfg.n_ff_exp);
