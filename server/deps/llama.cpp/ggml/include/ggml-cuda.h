@@ -34,7 +34,7 @@ GGML_BACKEND_API bool ggml_backend_cuda_set_low_priority_stream(
 // calling thread once a stable graph has already been captured.  Callers must
 // bracket only immutable-topology graphs whose tensor addresses and shapes do
 // not change; input contents may still be updated in place.
-GGML_BACKEND_API void ggml_cuda_set_skip_props_check(bool skip);
+GGML_BACKEND_API void ggml_backend_cuda_set_skip_props_check(bool skip);
 
 // Capture a scheduler-wide device program around multiple ordinary backend
 // graph submissions.  The handle is opaque and belongs to `backend`; callers

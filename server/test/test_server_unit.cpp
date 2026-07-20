@@ -3117,10 +3117,16 @@ static void test_backend_ipc_shared_payload_map_sizing() {
     TEST_ASSERT(map_bytes == 1024 + backend_ipc_shared_payload_header_bytes());
 
     BackendIpcSharedPayloadHeader header;
-    header.sequence = 7;
-    header.bytes = 1024;
-    TEST_ASSERT(header.sequence == 7);
-    TEST_ASSERT(header.bytes == 1024);
+    backend_ipc_publish_shared_payload_header(&header, 7, 1024);
+    TEST_ASSERT(backend_ipc_shared_payload_header_matches(&header, 7, 1024));
+    TEST_ASSERT(!backend_ipc_shared_payload_header_matches(&header, 0, 1024));
+    TEST_ASSERT(!backend_ipc_shared_payload_header_matches(&header, 8, 1024));
+    TEST_ASSERT(!backend_ipc_shared_payload_header_matches(&header, 7, 512));
+    uint64_t sequence = 0;
+    uint64_t bytes = 0;
+    backend_ipc_load_shared_payload_header(&header, sequence, bytes);
+    TEST_ASSERT(sequence == 7);
+    TEST_ASSERT(bytes == 1024);
 
     TEST_ASSERT(!backend_ipc_shared_payload_map_bytes(
         std::numeric_limits<size_t>::max(), map_bytes));

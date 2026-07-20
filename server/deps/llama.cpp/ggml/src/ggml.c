@@ -2094,15 +2094,6 @@ static struct ggml_tensor * ggml_add_impl(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b,
         bool                  inplace) {
-    if (!ggml_can_repeat(b, a)) {
-        fprintf(stderr,
-                "[ggml-add-shape] a='%s' type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
-                "b='%s' type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] inplace=%d\n",
-                a->name, ggml_type_name(a->type), a->ne[0], a->ne[1], a->ne[2], a->ne[3],
-                b->name, ggml_type_name(b->type), b->ne[0], b->ne[1], b->ne[2], b->ne[3],
-                (int) inplace);
-        ggml_print_backtrace_symbols();
-    }
     GGML_ASSERT(ggml_can_repeat(b, a));
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
@@ -8178,6 +8169,7 @@ struct ggml_tensor * ggml_ds4_moe_align_ids(
         struct ggml_tensor  * expert_ids) {
     GGML_ASSERT(expert_ids->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_n_dims(expert_ids) == 2);
+    GGML_ASSERT(ggml_is_contiguous(expert_ids));
 
     struct ggml_tensor * result = ggml_dup_tensor(ctx, expert_ids);
     result->op = GGML_OP_MOE_FUSED;
@@ -8282,6 +8274,10 @@ struct ggml_tensor * ggml_ds4_hc_post_split(
     GGML_ASSERT(main_block->type == GGML_TYPE_F32);
     GGML_ASSERT(peer_block->type == GGML_TYPE_F32);
     GGML_ASSERT(split->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(residual_hc));
+    GGML_ASSERT(ggml_is_contiguous(main_block));
+    GGML_ASSERT(ggml_is_contiguous(peer_block));
+    GGML_ASSERT(ggml_is_contiguous(split));
     GGML_ASSERT(n_hc > 0 && n_hc <= 8);
     const int64_t mix_dim = 2*(int64_t)n_hc + (int64_t)n_hc*n_hc;
     GGML_ASSERT(ggml_nelements(split) == mix_dim);

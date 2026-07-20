@@ -181,6 +181,7 @@ struct RemoteMoeRuntime {
     int n_expert = 0;
     int n_expert_used = 0;
     int n_ff_exp = 0;
+    float swiglu_clamp = 0.0f;
     std::vector<RemoteMoeLayerRuntime> layers;
     MoeHybridStorage hybrid;
 };
@@ -224,6 +225,7 @@ bool build_cached_batched_cold_graph(
     int n_ff_exp,
     int n_selected,
     int n_tokens,
+    float swiglu_clamp,
     ggml_type input_type = GGML_TYPE_F32) {
 
     out.free();
@@ -263,7 +265,10 @@ bool build_cached_batched_cold_graph(
             (size_t)n_ff_exp * ggml_element_size(gate_up_e));
         gate_e = ggml_cont(out.ctx, gate_e);
         up_e = ggml_cont(out.ctx, up_e);
-        gu = ggml_swiglu_split(out.ctx, gate_e, up_e);
+        gu = swiglu_clamp > 1.0e-6f
+            ? ggml_swiglu_ds4_split(
+                out.ctx, gate_e, up_e, swiglu_clamp)
+            : ggml_swiglu_split(out.ctx, gate_e, up_e);
     } else {
         ggml_tensor * gate_e = moe_expert_apply_scale2(out.ctx,
             ggml_mul_mat_id(out.ctx, gate_tensor, cur_3d, out.ids),
@@ -271,7 +276,10 @@ bool build_cached_batched_cold_graph(
         ggml_tensor * up_e = moe_expert_apply_scale2(out.ctx,
             ggml_mul_mat_id(out.ctx, up_tensor, cur_3d, out.ids),
             up_scale);
-        gu = ggml_swiglu_split(out.ctx, gate_e, up_e);
+        gu = swiglu_clamp > 1.0e-6f
+            ? ggml_swiglu_ds4_split(
+                out.ctx, gate_e, up_e, swiglu_clamp)
+            : ggml_swiglu_split(out.ctx, gate_e, up_e);
     }
 
     ggml_tensor * experts = moe_expert_apply_scale2(out.ctx,
@@ -648,6 +656,7 @@ bool build_remote_moe_runtime_from_weights(
     out.n_ff_exp = weights.n_ff_exp;
 
     MoeHybridConfig cfg = make_moe_hybrid_config(weights);
+    out.swiglu_clamp = cfg.swiglu_clamp;
     std::vector<MoeLayerDesc> layer_descs((size_t)weights.n_layer);
     out.layers.resize((size_t)weights.n_layer);
     for (int il = 0; il < weights.n_layer; ++il) {
@@ -1765,7 +1774,8 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
                         L.gate_scale, L.up_scale,
                         L.down_scale, L.gate_up_scale,
                         runtime.n_embd, runtime.n_ff_exp,
-                        n_selected, n_tokens, input_type)) {
+                        n_selected, n_tokens, runtime.swiglu_clamp,
+                        input_type)) {
                     std::fprintf(stderr,
                                  "[moe-expert-compute-daemon] batched graph build failed "
                                  "layer=%d tokens=%d selected=%d type=%s\n",
@@ -1917,7 +1927,7 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
                         L.gate_scale, L.up_scale,
                         L.down_scale, L.gate_up_scale,
                         runtime.n_embd, runtime.n_ff_exp,
-                        token_selected)) {
+                        token_selected, runtime.swiglu_clamp)) {
                     std::fprintf(stderr,
                                  "[moe-expert-compute-daemon] single graph build failed "
                                  "layer=%d tokens=%d selected=%d\n",

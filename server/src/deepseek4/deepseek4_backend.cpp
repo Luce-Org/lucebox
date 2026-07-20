@@ -90,7 +90,6 @@ static void add_step_tel(DeepSeek4StepTelemetry & dst, const DeepSeek4StepTeleme
     dst.attn_compute_us += src.attn_compute_us;
     dst.attn_read_us += src.attn_read_us;
     dst.full_graph_build_us += src.full_graph_build_us;
-    dst.full_graph_alloc_us += src.full_graph_alloc_us;
     dst.full_graph_set_us += src.full_graph_set_us;
     dst.full_graph_compute_us += src.full_graph_compute_us;
     dst.full_graph_read_us += src.full_graph_read_us;
@@ -116,10 +115,6 @@ static void add_step_tel(DeepSeek4StepTelemetry & dst, const DeepSeek4StepTeleme
     dst.output_us += src.output_us;
     dst.sample_us += src.sample_us;
     dst.emit_us += src.emit_us;
-    dst.full_graph_build_us += src.full_graph_build_us;
-    dst.full_graph_set_us += src.full_graph_set_us;
-    dst.full_graph_compute_us += src.full_graph_compute_us;
-    dst.full_graph_read_us += src.full_graph_read_us;
     dst.hot_selected += src.hot_selected;
     dst.cold_selected += src.cold_selected;
 }
@@ -137,18 +132,17 @@ static void log_step_tel(const char * phase,
     std::fprintf(stderr,
         "[deepseek4-timing] %s tokens=%d steps=%d wall=%.3fs %.2f tok/s "
         "step=%.1fms embed=%.1fms attn_build=%.1fms attn_compute=%.1fms attn_read=%.1fms "
-        "full_build=%.1fms full_alloc=%.1fms full_set=%.1fms full_compute=%.1fms full_read=%.1fms "
+        "full_build=%.1fms full_set=%.1fms full_compute=%.1fms full_read=%.1fms "
         "ffn_build=%.1fms ffn_compute=%.1fms ffn_read=%.1fms "
         "route_build=%.1fms route_compute=%.1fms route_read=%.1fms route_select=%.1fms "
         "ffn=%.1fms hot=%.1fms cold=%.1fms combine=%.1fms partition=%.1fms "
         "ffn_hot_graph_build=%llu ffn_hot_graph_hit=%llu ffn_cold_graph_build=%llu ffn_cold_graph_hit=%llu "
         "hc_pre=%.1fms hc_pre_build=%.1fms hc_pre_input=%.1fms hc_pre_compute=%.1fms "
         "hc_post=%.1fms output=%.1fms sample=%.1fms emit=%.1fms "
-        "full_build=%.1fms full_set=%.1fms full_compute=%.1fms full_read=%.1fms "
         "hot_sel=%d cold_sel=%d\n",
         phase, tokens, steps, wall_s, tok_s,
         ms(t.total_us), ms(t.embed_us), ms(t.attn_build_us), ms(t.attn_compute_us), ms(t.attn_read_us),
-        ms(t.full_graph_build_us), ms(t.full_graph_alloc_us), ms(t.full_graph_set_us),
+        ms(t.full_graph_build_us), ms(t.full_graph_set_us),
         ms(t.full_graph_compute_us), ms(t.full_graph_read_us),
         ms(t.ffn_build_us), ms(t.ffn_compute_us), ms(t.ffn_read_us),
         ms(t.route_build_us), ms(t.route_compute_us), ms(t.route_read_us), ms(t.route_select_us),
@@ -162,8 +156,6 @@ static void log_step_tel(const char * phase,
         ms(t.hc_pre_compute_us),
         ms(t.hc_post_attn_us + t.hc_post_ffn_us),
         ms(t.output_us), ms(t.sample_us), ms(t.emit_us),
-        ms(t.full_graph_build_us), ms(t.full_graph_set_us), ms(t.full_graph_compute_us),
-        ms(t.full_graph_read_us),
         t.hot_selected, t.cold_selected);
 }
 
@@ -333,6 +325,7 @@ static bool fill_profiled_hot_placement(const DeepSeek4Weights & w,
 // uses authoritative router statistics and evaluates every selected expert.
 static bool fill_time_balanced_profiled_hot_placement(
         const DeepSeek4Weights & w,
+        int active_routes,
         int hot_per_layer,
         const char * profile_path,
         MoeHybridPlacement & out,
@@ -347,7 +340,8 @@ static bool fill_time_balanced_profiled_hot_placement(
     }
 
     const int total_hot_budget = hot_per_layer * w.n_layer;
-    if (total_hot_budget <= 0) {
+    if (total_hot_budget <= 0 || active_routes <= 0 ||
+        active_routes > w.n_expert_used) {
         if (err) *err = "time-balanced placement requires a positive hot budget";
         return false;
     }
@@ -404,9 +398,9 @@ static bool fill_time_balanced_profiled_hot_placement(
 
     const auto layer_cost = [&](int il, int hot_count) {
         const double hot_fraction = coverage[(size_t) il][(size_t) hot_count];
-        const double hot_routes = (double) w.n_expert_used * hot_fraction;
+        const double hot_routes = (double) active_routes * hot_fraction;
         const double cold_routes =
-            (double) w.n_expert_used * (1.0 - hot_fraction);
+            (double) active_routes * (1.0 - hot_fraction);
         const double main_time = (shared_equiv + hot_routes) / main_bw;
         const double cold_time = cold_routes / cold_bw;
         return std::max(main_time, cold_time);
@@ -487,8 +481,9 @@ static bool fill_time_balanced_profiled_hot_placement(
         hot_counts.begin(), hot_counts.end());
     std::fprintf(stderr,
         "[deepseek4] time-balanced placement: slots=%d layer_range=%d..%d "
-        "main/cold=%.2f/%.2f GB/s predicted_owner_reduction=%.2f%% counts=",
-        total_hot_budget, *min_it, *max_it, main_bw, cold_bw,
+        "routes=%d main/cold=%.2f/%.2f GB/s "
+        "predicted_owner_reduction=%.2f%% counts=",
+        total_hot_budget, *min_it, *max_it, active_routes, main_bw, cold_bw,
         uniform_cost > 0.0
             ? 100.0 * (1.0 - balanced_cost / uniform_cost)
             : 0.0);
@@ -812,6 +807,17 @@ bool DeepSeek4Backend::init() {
                          routing_stats_out_path_.c_str());
         }
     }
+    if (env_flag_enabled("DFLASH_DS4_TP_ROUTE_STATS") && !routing_stats_) {
+        routing_stats_ = std::make_shared<MoeHybridRoutingStats>();
+        if (!routing_stats_->init(w_.n_layer, w_.n_expert,
+                                  w_.n_expert_used)) {
+            std::fprintf(stderr,
+                         "[deepseek4] failed to initialize TP routing stats\n");
+            return false;
+        }
+        std::fprintf(stderr,
+                     "[deepseek4-moe-tp] in-memory routing stats enabled\n");
+    }
     if (env_flag_enabled("DFLASH_DS4_TP_DYNAMIC_HOTSET") && !routing_stats_) {
         routing_stats_ = std::make_shared<MoeHybridRoutingStats>();
         if (!routing_stats_->init(w_.n_layer, w_.n_expert, w_.n_expert_used)) {
@@ -912,6 +918,14 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
     }
 
     const bool all_cold = env_flag_enabled("DFLASH_DS4_MOE_TP_ALL_COLD");
+    int active_routes = cfg_.expert_top_k;
+    if (const char * raw = std::getenv("DFLASH_DS4_TOPK")) {
+        const int env_routes = std::atoi(raw);
+        if (env_routes > 0) active_routes = env_routes;
+    }
+    if (active_routes <= 0 || active_routes > w.n_expert_used) {
+        active_routes = w.n_expert_used;
+    }
     int hot_per_layer = all_cold ? 0 : budget.max_hot_per_layer;
     int shard_channels = 0;
     if (!all_cold && ds4_inprocess_moe_tp_enabled()) {
@@ -955,7 +969,7 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
                 env_flag_enabled("DFLASH_DS4_TP_TIME_BALANCED_PLACEMENT");
             const bool placed = time_balanced
                 ? fill_time_balanced_profiled_hot_placement(
-                    w, hot_per_layer, profile_path, out, err)
+                    w, active_routes, hot_per_layer, profile_path, out, err)
                 : fill_profiled_hot_placement(
                     w, hot_per_layer, profile_path, out, err);
             if (!placed) {
@@ -1152,6 +1166,10 @@ bool DeepSeek4Backend::unpark(const std::string & what) {
             free_deepseek4_weights(w_);
             stream_engine_.destroy();
             moe_hybrid_.reset();
+            if (expert_backend_) {
+                ggml_backend_free(expert_backend_);
+                expert_backend_ = nullptr;
+            }
             moe_placement_ = {};
             return false;
         }

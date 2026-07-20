@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -24,6 +25,18 @@
 #endif
 
 namespace dflash::common {
+
+namespace {
+
+bool checked_mul_size(size_t a, size_t b, size_t & out) {
+    if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
+        return false;
+    }
+    out = a * b;
+    return true;
+}
+
+}  // namespace
 
 int run_deepseek4_dspark_draft_ipc_daemon(
         const char * draft_path,
@@ -88,7 +101,8 @@ int run_deepseek4_dspark_draft_ipc_daemon(
         return sequence != 0 && shared_payload && shared_payload_data &&
                backend_ipc_payload_in_bounds(
                    0, bytes, shared_payload_bytes) &&
-               header->sequence == sequence && header->bytes == bytes;
+               backend_ipc_shared_payload_header_matches(
+                   header, sequence, static_cast<uint64_t>(bytes));
     };
 
     ggml_backend_t backend = ggml_backend_cuda_init(std::max(0, draft_gpu));
@@ -113,8 +127,18 @@ int run_deepseek4_dspark_draft_ipc_daemon(
     const int hidden = drafter.core.n_embd;
     const int block = drafter.block_size;
     const int n_target_layers = drafter.n_target_layers;
-    const int feature_row = hidden * n_target_layers;
-    if (hidden <= 0 || block <= 0 || n_target_layers <= 0 || feature_row <= 0) {
+    size_t feature_row_size = 0;
+    size_t feature_ring_size = 0;
+    size_t noise_size = 0;
+    const bool dimensions_ok = hidden > 0 && block > 0 &&
+        n_target_layers > 0 &&
+        checked_mul_size((size_t) hidden, (size_t) n_target_layers,
+                         feature_row_size) &&
+        feature_row_size <= (size_t) std::numeric_limits<int>::max() &&
+        checked_mul_size((size_t) ring_cap, feature_row_size,
+                         feature_ring_size) &&
+        checked_mul_size((size_t) hidden, (size_t) block, noise_size);
+    if (!dimensions_ok) {
         std::fprintf(stderr, "[ds4-dspark-ipc] invalid draft dimensions\n");
         stream_status(stream_fd, -1);
         free_deepseek4_dspark_drafter(drafter);
@@ -122,9 +146,10 @@ int run_deepseek4_dspark_draft_ipc_daemon(
         unmap_shared();
         return 1;
     }
+    const int feature_row = (int) feature_row_size;
 
-    std::vector<float> feature_ring((size_t) ring_cap * feature_row, 0.0f);
-    std::vector<float> noise_embed((size_t) hidden * block);
+    std::vector<float> feature_ring(feature_ring_size, 0.0f);
+    std::vector<float> noise_embed(noise_size);
     std::vector<float> context;
     std::vector<float> hidden_out;
 
@@ -169,7 +194,8 @@ int run_deepseek4_dspark_draft_ipc_daemon(
 
     auto run_proposal = [&](int committed, int ctx_len,
                             const float * noise) {
-        if (committed < 0 || ctx_len <= 0 || ctx_len > ring_cap || !noise) {
+        if (committed < 0 || ctx_len <= 0 || ctx_len > ring_cap ||
+            ctx_len > committed || !noise) {
             return false;
         }
         context.resize((size_t) ctx_len * feature_row);
@@ -209,9 +235,12 @@ int run_deepseek4_dspark_draft_ipc_daemon(
             int n_tokens = 0;
             size_t bytes = 0;
             iss >> capture_idx >> start_pos >> n_tokens >> bytes;
-            const size_t expected = (size_t) std::max(0, n_tokens) * hidden *
-                                    sizeof(float);
-            bool ok = iss && bytes == expected && n_tokens > 0;
+            size_t expected = 0;
+            bool ok = iss && n_tokens > 0 &&
+                      checked_mul_size((size_t) n_tokens, (size_t) hidden,
+                                       expected) &&
+                      checked_mul_size(expected, sizeof(float), expected) &&
+                      bytes == expected;
             std::vector<float> slice(ok ? bytes / sizeof(float) : 0);
             if (ok) ok = read_exact_fd(payload_fd, slice.data(), bytes);
             if (ok) ok = store_feature_slice(capture_idx, start_pos, n_tokens, slice);
@@ -226,9 +255,12 @@ int run_deepseek4_dspark_draft_ipc_daemon(
             size_t bytes = 0;
             uint64_t sequence = 0;
             iss >> capture_idx >> start_pos >> n_tokens >> bytes >> sequence;
-            const size_t expected = (size_t) std::max(0, n_tokens) * hidden *
-                                    sizeof(float);
-            bool ok = iss && bytes == expected && n_tokens > 0 &&
+            size_t expected = 0;
+            bool ok = iss && n_tokens > 0 &&
+                      checked_mul_size((size_t) n_tokens, (size_t) hidden,
+                                       expected) &&
+                      checked_mul_size(expected, sizeof(float), expected) &&
+                      bytes == expected &&
                       capture_idx >= 0 && capture_idx < n_target_layers &&
                       shared_request_valid(bytes, sequence);
             std::vector<float> slice(ok ? bytes / sizeof(float) : 0);
@@ -246,10 +278,13 @@ int run_deepseek4_dspark_draft_ipc_daemon(
             int n_tokens = 0;
             size_t bytes = 0;
             iss >> start_pos >> n_tokens >> bytes;
-            const size_t expected = (size_t) std::max(0, n_tokens) *
-                                    (size_t) feature_row * sizeof(float);
-            bool ok = iss && payload_fd >= 0 && bytes == expected &&
-                      n_tokens > 0 && n_tokens <= ring_cap;
+            size_t expected = 0;
+            bool ok = iss && payload_fd >= 0 && n_tokens > 0 &&
+                      n_tokens <= ring_cap &&
+                      checked_mul_size((size_t) n_tokens, feature_row_size,
+                                       expected) &&
+                      checked_mul_size(expected, sizeof(float), expected) &&
+                      bytes == expected;
             std::vector<float> features(ok ? bytes / sizeof(float) : 0);
             if (ok) ok = read_exact_fd(payload_fd, features.data(), bytes);
             if (ok) {
@@ -266,10 +301,12 @@ int run_deepseek4_dspark_draft_ipc_daemon(
             size_t bytes = 0;
             uint64_t sequence = 0;
             iss >> start_pos >> n_tokens >> bytes >> sequence;
-            const size_t expected = (size_t) std::max(0, n_tokens) *
-                                    (size_t) feature_row * sizeof(float);
-            bool ok = iss && bytes == expected && n_tokens > 0 &&
-                      n_tokens <= ring_cap &&
+            size_t expected = 0;
+            bool ok = iss && n_tokens > 0 && n_tokens <= ring_cap &&
+                      checked_mul_size((size_t) n_tokens, feature_row_size,
+                                       expected) &&
+                      checked_mul_size(expected, sizeof(float), expected) &&
+                      bytes == expected &&
                       shared_request_valid(bytes, sequence);
             if (ok) {
                 ok = store_feature_block(
@@ -330,8 +367,8 @@ int run_deepseek4_dspark_draft_ipc_daemon(
                 std::memcpy(shared_payload_data, hidden_out.data(), bytes);
                 auto * header =
                     static_cast<BackendIpcSharedPayloadHeader *>(shared_payload);
-                header->bytes = bytes;
-                header->sequence = sequence;
+                backend_ipc_publish_shared_payload_header(
+                    header, sequence, static_cast<uint64_t>(bytes));
             } else {
                 ok = false;
             }

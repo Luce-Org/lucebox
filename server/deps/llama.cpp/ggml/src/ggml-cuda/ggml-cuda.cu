@@ -68,7 +68,6 @@
 #include "ggml.h"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <charconv>
 #include <cinttypes>
@@ -4674,9 +4673,9 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 
 static thread_local bool ggml_cuda_skip_props_check = false;
 
-extern "C" void ggml_cuda_set_skip_props_check(bool skip);
+extern "C" void ggml_backend_cuda_set_skip_props_check(bool skip);
 
-extern "C" void ggml_cuda_set_skip_props_check(bool skip) {
+extern "C" void ggml_backend_cuda_set_skip_props_check(bool skip) {
     ggml_cuda_skip_props_check = skip;
 }
 

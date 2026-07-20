@@ -394,7 +394,8 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
                 capture_idx < 0 || capture_idx >= n_tgt_layers ||
                 start_pos < 0 || n_tokens <= 0 || bytes != expected_bytes ||
                 !backend_ipc_payload_in_bounds(0, bytes, shared_payload_capacity) ||
-                header->sequence != sequence || header->bytes != (uint64_t)bytes) {
+                !backend_ipc_shared_payload_header_matches(
+                    header, sequence, static_cast<uint64_t>(bytes))) {
                 std::fprintf(stderr, "[draft-ipc-daemon] bad feature_slice_shared: %s\n",
                              line.c_str());
                 stream_status(stream_fd, -1);
@@ -447,7 +448,8 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
                 committed < 0 || ctx_len <= 0 || ctx_len > feature_ring.cap ||
                 bytes != expected_bytes ||
                 !backend_ipc_payload_in_bounds(0, bytes, shared_payload_capacity) ||
-                header->sequence != sequence || header->bytes != (uint64_t)bytes) {
+                !backend_ipc_shared_payload_header_matches(
+                    header, sequence, static_cast<uint64_t>(bytes))) {
                 std::fprintf(stderr, "[draft-ipc-daemon] bad propose_shared: %s\n",
                              line.c_str());
                 stream_status(stream_fd, -1);

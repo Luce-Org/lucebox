@@ -144,7 +144,8 @@ bool deepseek4_dspark_draft_forward_async_reuse_context(
 // for the drafter backend before calling this function.
 bool deepseek4_dspark_draft_read_async_output(
                                           ggml_backend_t backend,
-                                          std::vector<float> & out_hidden);
+                                          std::vector<float> & out_hidden,
+                                          std::vector<float> * confidence_hidden = nullptr);
 void deepseek4_dspark_draft_wait(ggml_backend_t backend);
 
 // Batched target verify forward WITH feature capture (defined in

@@ -375,7 +375,7 @@ extern "C" {
     // after the producing split, and injects the native handle into the op.
     GGML_API void                 ggml_backend_sched_add_deferred_peer_copy_node(
                                             ggml_backend_sched_t sched,
-                                            const struct ggml_tensor * node);
+                                            struct ggml_tensor * node);
 
     //
     // Meta backend

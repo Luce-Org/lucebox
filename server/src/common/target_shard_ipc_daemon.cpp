@@ -140,7 +140,8 @@ int run_target_shard_ipc_daemon_loop(
             if (shared_payload && shared_payload != MAP_FAILED && shared_payload_data &&
                 seq != 0 && n_tokens > 0 && bytes == expected_bytes &&
                 backend_ipc_payload_in_bounds(0, bytes, shared_payload_capacity) &&
-                header->sequence == seq && header->bytes == (uint64_t)bytes) {
+                backend_ipc_shared_payload_header_matches(
+                    header, seq, static_cast<uint64_t>(bytes))) {
                 host_act.assign(bytes / sizeof(float), 0.0f);
                 std::memcpy(host_act.data(), shared_payload_data, bytes);
                 payload_ok = true;

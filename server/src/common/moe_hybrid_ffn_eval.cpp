@@ -3,6 +3,7 @@
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cuda.h"
 
 #include <algorithm>
 #include <chrono>
@@ -115,7 +116,16 @@ static bool coarse_owner_split_op_enabled() {
 static bool align_shared_moe_ids_enabled() {
     static const bool enabled = [] {
         const char * raw = std::getenv("DFLASH_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS");
-        return raw && *raw && std::strcmp(raw, "0") != 0;
+        const bool requested = raw && *raw && std::strcmp(raw, "0") != 0;
+        const char * kernel = std::getenv("DFLASH_CUDA_MMVQ_MOE_KERNEL");
+        const bool dedicated_kernel = !kernel || !*kernel ||
+            std::strcmp(kernel, "0") != 0;
+        if (requested && !dedicated_kernel) {
+            std::fprintf(stderr,
+                "[ds4-tp] shared-ID alignment disabled because the dedicated "
+                "MMVQ MoE kernel is disabled\n");
+        }
+        return requested && dedicated_kernel;
     }();
     return enabled;
 }
@@ -581,7 +591,8 @@ static bool build_batched_routed_graph(
     float swiglu_clamp,
     ggml_tensor ** out_routed,
     bool tokenwise = false,
-    std::vector<ggml_tensor *> * backend_nodes = nullptr)
+    std::vector<ggml_tensor *> * backend_nodes = nullptr,
+    bool allow_fused_combine = false)
 {
     const auto track = [&](ggml_tensor * t) -> ggml_tensor * {
         if (backend_nodes && t) backend_nodes->push_back(t);
@@ -602,7 +613,8 @@ static bool build_batched_routed_graph(
                     gate_scale, up_scale, down_scale, gate_up_scale,
                     inp_col, sel_col, wts_col,
                     n_embd, n_ff_exp, n_used, 1, swiglu_clamp,
-                    &routed_col, false, backend_nodes)) {
+                    &routed_col, false, backend_nodes,
+                    allow_fused_combine)) {
                 return false;
             }
             joined = joined ? track(ggml_concat(ctx, joined, routed_col, 1))
@@ -697,7 +709,7 @@ static bool build_batched_routed_graph(
         ggml_mul_mat_id(ctx, down_tensor, gu, sel), down_scale));
 
     // Weight and sum over experts: [n_embd, n_used, n_tokens] * [1, n_used, n_tokens]
-    if (fused_moe_combine_enabled()) {
+    if (allow_fused_combine && fused_moe_combine_enabled()) {
         *out_routed = track(ggml_laguna_moe_combine(ctx, experts, wts));
         return *out_routed != nullptr;
     }
@@ -720,13 +732,14 @@ bool build_moe_hybrid_ffn_graph(
     ggml_cgraph *                  schedule_graph,
     const MoeHybridConfig &        cfg,
     const MoeLayerDesc &           desc,
-    MoeHybridLayerStorage &        storage,
+    const MoeHybridLayerStorage &  storage,
     ggml_tensor *                  inp,
     ggml_tensor *                  global_ids,
     ggml_tensor *                  router_weights,
     int                            n_tokens,
     MoeHybridGraphInputs &         out,
-    bool                           include_shared) {
+    bool                           include_shared,
+    bool                           allow_fused_combine) {
 
     out.output = nullptr;
     out.main_output = nullptr;
@@ -855,7 +868,8 @@ bool build_moe_hybrid_ffn_graph(
                 inp, shard_ids, shard_weights,
                 cfg.n_embd, storage.expert_shard_channels,
                 n_used, n_tokens, cfg.swiglu_clamp,
-                &shard, tokenwise, &out.shard_nodes)) {
+                &shard, tokenwise, &out.shard_nodes,
+                allow_fused_combine)) {
             return false;
         }
     }
@@ -877,7 +891,7 @@ bool build_moe_hybrid_ffn_graph(
                 inp, hot_ids, hot_weights,
                 cfg.n_embd, cfg.n_ff_exp, n_used, n_tokens,
                 cfg.swiglu_clamp, &hot, tokenwise,
-                &out.hot_nodes)) {
+                &out.hot_nodes, allow_fused_combine)) {
             return false;
         }
     }
@@ -903,7 +917,7 @@ bool build_moe_hybrid_ffn_graph(
                     : cfg.n_ff_exp,
                 n_used, n_tokens,
                 cfg.swiglu_clamp, &cold, tokenwise,
-                &out.cold_nodes)) {
+                &out.cold_nodes, allow_fused_combine)) {
             return false;
         }
     }
@@ -1192,7 +1206,7 @@ bool build_cached_cold_graph(
 bool build_cached_hot_batched_graph(
     CachedHotBatchedGraph & out,
     ggml_backend_t gpu_backend,
-    MoeHybridLayerStorage & storage,
+    const MoeHybridLayerStorage & storage,
     const MoeLayerDesc & desc,
     const MoeHybridConfig & cfg,
     int n_tokens) {
@@ -1226,7 +1240,9 @@ bool build_cached_hot_batched_graph(
         build_batched_routed_graph(out.ctx,
             storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
             desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-            out.inp, out.sel, out.wts, n_embd, n_ff_exp, n_used, n_tokens, cfg.swiglu_clamp, &routed);
+            out.inp, out.sel, out.wts, n_embd, n_ff_exp, n_used, n_tokens,
+            cfg.swiglu_clamp, &routed, false, nullptr,
+            ggml_backend_is_cuda(gpu_backend));
     }
 
     // Shared expert (always on GPU)
@@ -1257,7 +1273,7 @@ bool build_cached_hot_batched_graph(
 static bool build_cached_cold_batched_graph(
     CachedHotBatchedGraph & out,
     ggml_backend_t cpu_backend,
-    MoeHybridLayerStorage & storage,
+    const MoeHybridLayerStorage & storage,
     const MoeLayerDesc & desc,
     const MoeHybridConfig & cfg,
     int n_tokens) {
@@ -1286,7 +1302,9 @@ static bool build_cached_cold_batched_graph(
     build_batched_routed_graph(out.ctx,
         storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
         desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-        out.inp, out.sel, out.wts, n_embd, n_ff_exp, n_used, n_tokens, cfg.swiglu_clamp, &routed);
+        out.inp, out.sel, out.wts, n_embd, n_ff_exp, n_used, n_tokens,
+        cfg.swiglu_clamp, &routed, false, nullptr,
+        ggml_backend_is_cuda(cpu_backend));
     if (!routed) { out.free(); return false; }
     out.output = routed;
 
@@ -1818,10 +1836,11 @@ static bool eval_moe_hybrid_ffn_batched_core(
         CachedHotBatchedGraph & hg = storage.hot_batched_mixed[n_tokens];
         const bool hg_ok = (hg.valid() && hg.n_tokens == n_tokens)
             || build_cached_hot_batched_graph(hg, gpu_backend, storage, desc, cfg, n_tokens);
-        const bool remote_cold = fp_has_cold && expert_compute && expert_layer;
+        const bool remote_cold = !skip_cold && fp_has_cold &&
+            expert_compute && expert_layer;
         CachedHotBatchedGraph * cg = nullptr;
         bool cg_ok = true;
-        if (fp_has_cold && !remote_cold) {
+        if (!skip_cold && fp_has_cold && !remote_cold) {
             cg = &storage.cold_batched_mixed[n_tokens];
             ggml_backend_t cached_cold_backend =
                 storage.cold_backend ? storage.cold_backend : cpu_backend;
@@ -1961,7 +1980,9 @@ static bool eval_moe_hybrid_ffn_batched_core(
             build_batched_routed_graph(hot_ctx,
                 storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
                 desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-                inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens, cfg.swiglu_clamp, &routed);
+                inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens,
+                cfg.swiglu_clamp, &routed, false, nullptr,
+                ggml_backend_is_cuda(gpu_backend));
         }
 
         // Shared expert (always on GPU)
@@ -2053,7 +2074,9 @@ static bool eval_moe_hybrid_ffn_batched_core(
         build_batched_routed_graph(cold_ctx,
             storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
             desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-            inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens, cfg.swiglu_clamp, &cold_routed);
+            inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens,
+            cfg.swiglu_clamp, &cold_routed, false, nullptr,
+            ggml_backend_is_cuda(cold_backend));
 
         ggml_cgraph * cold_gf = ggml_new_graph_custom(cold_ctx, 4096, false);
         ggml_set_output(cold_routed);
@@ -2314,7 +2337,9 @@ bool eval_moe_hot_only_batched(
     build_batched_routed_graph(ctx,
         storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
         desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-        inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens, cfg.swiglu_clamp, &routed);
+        inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens,
+        cfg.swiglu_clamp, &routed, false, nullptr,
+        ggml_backend_is_cuda(gpu_backend));
 
     // Shared expert (always on GPU)
     ggml_tensor * combined = routed;

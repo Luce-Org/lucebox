@@ -3681,6 +3681,14 @@ static bool ds4_fused_decode_enabled() {
 }
 
 struct DeepSeek4FusedDecodeGraph {
+    struct AuthoritativeRouteOutput {
+        int layer = -1;
+        int lane_start = 0;
+        int n_tokens = 0;
+        int width = 0;
+        ggml_tensor * selected = nullptr;
+        ggml_tensor * weights = nullptr;
+    };
     struct RoutePredictionOutput {
         int source_layer = -1;
         int target_layer = -1;
@@ -3699,6 +3707,7 @@ struct DeepSeek4FusedDecodeGraph {
     ggml_tensor * mask_bundle = nullptr;   // additive score mask (0 / -1e30), may be null
     std::vector<ggml_tensor *> hash_ids;
     std::vector<MoeHybridGraphInputs> hybrid_inputs;
+    std::vector<AuthoritativeRouteOutput> authoritative_routes;
     std::vector<RoutePredictionOutput> route_predictions;
     ggml_tensor * logits = nullptr;
     ggml_backend_sched_t sched = nullptr;
@@ -3728,6 +3737,7 @@ struct DeepSeek4FusedDecodeGraph {
         logits = nullptr;
         hash_ids.clear();
         hybrid_inputs.clear();
+        authoritative_routes.clear();
         route_predictions.clear();
         whole_step_sequence_id = 0;
         shape_key.clear();
@@ -3778,6 +3788,11 @@ struct DeepSeek4FusedDecodeCache {
         counter = 0;
     }
 };
+
+// Registered once the layer-range runtime is entered. free_deepseek4_cache()
+// resets this while both GPU backends are still alive, before park/shutdown
+// releases the expert owner used by a cached multi-backend scheduler.
+static DeepSeek4FusedDecodeCache * g_deepseek4_fused_decode_runtime_cache = nullptr;
 
 static ggml_tensor * ds4_fused_hc_base_f32(ggml_context * ctx, ggml_tensor * base) {
     if (!base) return nullptr;
@@ -4610,7 +4625,10 @@ bool deepseek4_step_layer_range(
     static Ds4DecodeSharedInputs decode_shared_inputs;
     static int hc_loaded_n_layer = 0;
     static const ggml_context * hc_loaded_ctx = nullptr;
-    if (hc_loaded_n_layer != w.n_layer || hc_loaded_ctx != w.ctx) {
+    static uint64_t hc_loaded_generation = 0;
+    g_deepseek4_fused_decode_runtime_cache = &fused_decode_graph_cache;
+    if (hc_loaded_n_layer != w.n_layer || hc_loaded_ctx != w.ctx ||
+        hc_loaded_generation != w.runtime_generation) {
         reset_hc_layer_weights_cpu(hc_layer_weights_range);
         reset_hc_weights_cpu(hc_output_weights_range);
         hc_layer_weights_range.resize((size_t)w.n_layer);
@@ -4653,6 +4671,7 @@ bool deepseek4_step_layer_range(
         load_hc_weights_cpu(hc_output_weights_range, w.output_hc_fn, w.output_hc_scale, w.output_hc_base);
         hc_loaded_n_layer = w.n_layer;
         hc_loaded_ctx = w.ctx;
+        hc_loaded_generation = w.runtime_generation;
     }
 
     // Per-layer execution with CPU-side HC
@@ -5482,6 +5501,7 @@ bool create_deepseek4_cache(ggml_backend_t backend,
 }
 
 void free_deepseek4_cache(DeepSeek4Cache & c) {
+    reset_deepseek4_graph_runtime_caches();
     if (c.ctx) { ggml_free(c.ctx); c.ctx = nullptr; }
     if (c.buf) { ggml_backend_buffer_free(c.buf); c.buf = nullptr; }
     c.layers.clear();
@@ -5489,6 +5509,13 @@ void free_deepseek4_cache(DeepSeek4Cache & c) {
 }
 
 void reset_deepseek4_cache(DeepSeek4Cache & c) {
+    // Graph executables may retain cross-device dependency state even though
+    // their tensor addresses are stable. Give every fresh request a distinct
+    // generation so those executables cannot be replayed across a cache clear.
+    ++c.sequence_id;
+    if (c.sequence_id == 0) {
+        ++c.sequence_id;
+    }
     c.cur_pos = 0;
     for (DeepSeek4LayerCache & lc : c.layers) {
         lc.n_comp = 0;
@@ -5732,7 +5759,6 @@ static ggml_tensor * build_dspark_attention(
         ggml_tensor * neg_block,   // I32[block]    -(block positions)
         ggml_tensor * pos_ctx,     // I32[ctx_len]  absolute positions committed-ctx_len..committed-1
         ggml_tensor * attn_mask) { // F32[ctx_len+block], 0 or -inf
-    const int n_embd    = w.n_embd;
     const int head_dim  = w.head_dim;
     const int n_head    = w.n_head;
     const int n_rot     = w.n_rot;
@@ -5839,6 +5865,7 @@ namespace {
 struct DsparkContextKvProjector {
     int n_cols = -1;
     const void * drafter = nullptr;
+    ggml_backend_t backend = nullptr;
     std::vector<uint8_t> arena;
     ggml_context * ctx = nullptr;
     ggml_gallocr_t alloc = nullptr;
@@ -5869,7 +5896,12 @@ static bool dspark_project_context_columns(
     const int head_dim = w.head_dim;
     DsparkContextKvProjector & P = g_dspark_ctx_kv;
 
-    if (!P.ctx || P.n_cols != n_cols || P.drafter != (const void *) &d) {
+    if (!P.ctx || P.n_cols != n_cols || P.drafter != (const void *) &d ||
+        P.backend != backend) {
+        if (P.alloc && P.backend != backend) {
+            ggml_gallocr_free(P.alloc);
+            P.alloc = nullptr;
+        }
         if (P.ctx) {
             ggml_free(P.ctx);
             P.ctx = nullptr;
@@ -5927,6 +5959,7 @@ static bool dspark_project_context_columns(
         }
         P.n_cols = n_cols;
         P.drafter = (const void *) &d;
+        P.backend = backend;
     }
 
     ggml_backend_tensor_set(
@@ -5968,7 +6001,8 @@ static bool dspark_update_context_kv_cache(
 
     int n_new = committed - P.end_pos;
     const bool rebuild =
-        P.drafter != (const void *) &d || P.end_pos < 0 ||
+        P.drafter != (const void *) &d || P.backend != backend ||
+        P.end_pos < 0 ||
         n_new <= 0 || n_new > ctx_len ||
         std::min(n_swa, P.valid + n_new) != ctx_len ||
         P.host_kv.size() != (size_t) w.n_layer * n_swa * head_dim;
@@ -6097,7 +6131,7 @@ static bool deepseek4_dspark_draft_forward_impl(
         : valid_ctx_len;
 
     const std::vector<float> * cached_host_kv = nullptr;
-    if (context_kv_cache && upload_context && valid_ctx_len > 0 &&
+    if (context_kv_cache && upload_context &&
         !dspark_update_context_kv_cache(
             backend, d, ctx_features, valid_ctx_len, committed,
             &cached_host_kv)) {
@@ -6420,11 +6454,11 @@ static bool deepseek4_dspark_draft_forward_impl(
     // have both been qualified on the deployment GPUs.
     const bool force_graph_replay =
         ds4_env_flag("DFLASH_DS4_DRAFT_FORCE_GRAPH_REPLAY");
-    if (force_graph_replay) ggml_cuda_set_skip_props_check(true);
+    if (force_graph_replay) ggml_backend_cuda_set_skip_props_check(true);
     const ggml_status st = out_hidden
         ? ggml_backend_graph_compute(backend, C.gf)
         : ggml_backend_graph_compute_async(backend, C.gf);
-    if (force_graph_replay) ggml_cuda_set_skip_props_check(false);
+    if (force_graph_replay) ggml_backend_cuda_set_skip_props_check(false);
     if (st != GGML_STATUS_SUCCESS) {
         // Invalidate: a failed compute leaves no reusable state guarantees.
         ggml_free(C.ctx); C.ctx = nullptr; C.gf = nullptr; C.ctx_len = -1;
@@ -6496,9 +6530,12 @@ bool deepseek4_dspark_draft_forward_async_reuse_context(
 
 bool deepseek4_dspark_draft_read_async_output(
                                           ggml_backend_t backend,
-                                          std::vector<float> & out_hidden) {
+                                          std::vector<float> & out_hidden,
+                                          std::vector<float> * confidence_hidden) {
     DsparkDraftCache & C = g_dspark_draft_cache;
-    if (!backend || !C.ctx || !C.out || C.block <= 0 || !C.drafter) {
+    if (!backend || backend != C.backend || !C.ctx || !C.out ||
+        (confidence_hidden && !C.confidence_out) ||
+        C.block <= 0 || !C.drafter) {
         return false;
     }
     const DSparkDrafter * d =
@@ -6507,6 +6544,12 @@ bool deepseek4_dspark_draft_read_async_output(
     out_hidden.resize(count);
     ggml_backend_tensor_get(
         C.out, out_hidden.data(), 0, sizeof(float) * count);
+    if (confidence_hidden) {
+        confidence_hidden->resize(count);
+        ggml_backend_tensor_get(
+            C.confidence_out, confidence_hidden->data(), 0,
+            sizeof(float) * count);
+    }
     return true;
 }
 

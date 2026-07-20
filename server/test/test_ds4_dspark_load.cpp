@@ -150,6 +150,26 @@ int main(int argc, char ** argv) {
             need(confidence_finite, "finite pre-norm confidence hidden");
             need(confidence_hidden.size() == (size_t) n_embd * block,
                  "pre-norm confidence hidden size");
+
+            // The speculative draft-ahead path reads both graph outputs after
+            // an asynchronous launch. Keep its hidden/confidence pairing
+            // covered by the same end-to-end model smoke as the sync path.
+            std::vector<float> async_hidden;
+            std::vector<float> async_confidence_hidden;
+            const bool async_ok = deepseek4_dspark_draft_forward_async(
+                backend, d, noise.data(), feats.data(), ctx_len, committed);
+            if (async_ok) {
+                deepseek4_dspark_draft_wait(backend);
+            }
+            const bool async_read_ok = async_ok &&
+                deepseek4_dspark_draft_read_async_output(
+                    backend, async_hidden, &async_confidence_hidden);
+            need(async_read_ok, "async draft output read");
+            if (async_read_ok) {
+                need(async_hidden == hidden, "async normalized hidden identity");
+                need(async_confidence_hidden == confidence_hidden,
+                     "async confidence hidden identity");
+            }
         }
     }
 

@@ -66,7 +66,6 @@ struct DeepSeek4StepTelemetry {
     uint64_t sample_us = 0;
     uint64_t emit_us = 0;
     uint64_t full_graph_build_us = 0;
-    uint64_t full_graph_alloc_us = 0;
     uint64_t full_graph_set_us = 0;
     uint64_t full_graph_compute_us = 0;
     uint64_t full_graph_read_us = 0;
@@ -228,6 +227,7 @@ struct DeepSeek4Weights {
 
     // Runtime serving policy. These values are set by the backend after the
     // GGUF is loaded; they are not model metadata.
+    uint64_t runtime_generation  = 0;  // unique successful-load identity
     int  routed_expert_top_k = 0;  // 0 = model default (n_expert_used)
     bool fused_decode        = false;
 };
@@ -319,6 +319,9 @@ bool create_deepseek4_cache(ggml_backend_t backend,
 
 void free_deepseek4_cache(DeepSeek4Cache & c);
 void reset_deepseek4_cache(DeepSeek4Cache & c);
+// Release cached fused decode/verify schedulers before their model/backend
+// owners are destroyed (park, shutdown, or failed reload).
+void reset_deepseek4_graph_runtime_caches();
 int deepseek4_previous_raw_ring_spans(
     int kv_start,
     int n_swa,

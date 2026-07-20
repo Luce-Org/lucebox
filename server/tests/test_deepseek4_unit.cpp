@@ -1322,6 +1322,7 @@ static void test_reset_deepseek4_cache(ggml_backend_t backend) {
     DeepSeek4Cache cache;
     TEST_ASSERT(create_deepseek4_cache(backend, weights, 32, cache));
     if (cache.buf) {
+        TEST_ASSERT(cache.sequence_id == 0);
         ggml_backend_buffer_clear(cache.buf, 0x7f);
         cache.cur_pos = 17;
         cache.layers[0].n_comp = 4;
@@ -1331,6 +1332,7 @@ static void test_reset_deepseek4_cache(ggml_backend_t backend) {
 
         reset_deepseek4_cache(cache);
 
+        TEST_ASSERT(cache.sequence_id == 1);
         TEST_ASSERT(cache.cur_pos == 0);
         for (const auto & layer : cache.layers) {
             TEST_ASSERT(layer.n_comp == 0);
@@ -1339,6 +1341,9 @@ static void test_reset_deepseek4_cache(ggml_backend_t backend) {
             TEST_ASSERT(std::all_of(bytes.begin(), bytes.end(),
                                     [](uint8_t value) { return value == 0; }));
         }
+
+        reset_deepseek4_cache(cache);
+        TEST_ASSERT(cache.sequence_id == 2);
     }
     free_deepseek4_cache(cache);
 

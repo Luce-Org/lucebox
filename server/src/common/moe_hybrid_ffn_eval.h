@@ -166,13 +166,14 @@ bool build_moe_hybrid_ffn_graph(
     ggml_cgraph *                  schedule_graph,
     const MoeHybridConfig &        cfg,
     const MoeLayerDesc &           desc,
-    MoeHybridLayerStorage &        storage,
+    const MoeHybridLayerStorage &  storage,
     ggml_tensor *                  inp,
     ggml_tensor *                  global_ids,
     ggml_tensor *                  router_weights,
     int                            n_tokens,
     MoeHybridGraphInputs &         out,
-    bool                           include_shared = true);
+    bool                           include_shared = true,
+    bool                           allow_fused_combine = false);
 
 int moe_hybrid_expert_compute_batch_limit();
 int moe_hybrid_expert_compute_ipc_batch_limit(int n_tokens);
@@ -301,7 +302,7 @@ bool build_cached_cold_graph(
 bool build_cached_hot_batched_graph(
     CachedHotBatchedGraph & out,
     ggml_backend_t gpu_backend,
-    MoeHybridLayerStorage & storage,
+    const MoeHybridLayerStorage & storage,
     const MoeLayerDesc & desc,
     const MoeHybridConfig & cfg,
     int n_tokens);

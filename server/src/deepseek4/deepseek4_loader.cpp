@@ -210,7 +210,8 @@ static bool should_split_ds4_dense_tensor(const char * name, int mask) {
     // tensors and the grouped output-A view are deliberately excluded: the
     // CUDA/HIP split-buffer implementation cannot split 3-D weight views.
     if ((mask & 1) && std::strcmp(name, "output.weight") == 0) return true;
-    if ((mask & 2) && std::strstr(name, ".attn_q_b.weight")) return true;
+    if ((mask & 2) && std::strstr(name, ".attn_q_b.weight") &&
+        !std::strstr(name, ".indexer.attn_q_b.weight")) return true;
     if ((mask & 4) && std::strstr(name, ".attn_output_b.weight")) return true;
     if ((mask & 8) && (std::strstr(name, ".attn_q_a.weight") ||
                        std::strstr(name, ".attn_kv.weight") ||
@@ -444,7 +445,18 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     const size_t data_offset = gguf_get_data_offset(gctx);
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
     const size_t alignment = ggml_backend_buft_get_alignment(buft);
-    const int dense_tp_mask = ds4_dense_tp_mask();
+    int dense_tp_mask = ds4_dense_tp_mask();
+    if (dense_tp_mask != 0) {
+        const char * fused_verify = std::getenv("DFLASH_DS4_FUSED_VERIFY");
+        if (fused_verify && fused_verify[0] &&
+            std::strcmp(fused_verify, "0") != 0) {
+            std::fprintf(stderr,
+                "[deepseek4-dense-tp] disabling mask=%d: split-buffer dense "
+                "weights are incompatible with fused verifier graph replay\n",
+                dense_tp_mask);
+            dense_tp_mask = 0;
+        }
+    }
     ggml_backend_buffer_type_t split_buft = nullptr;
     size_t split_alignment = 1;
     if (dense_tp_mask != 0 && ggml_backend_is_cuda(backend) &&
@@ -746,6 +758,16 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     out.ctx = meta_ctx;
     out.buf = buf;
     out.dense_split_buf = split_buf;
+    // Pointer equality is insufficient to identify a reload: allocators may
+    // reuse the same ggml_context address after park/unpark. Cached graphs use
+    // this generation to reject tensors from the prior model lifetime.
+    static std::atomic<uint64_t> next_runtime_generation{1};
+    out.runtime_generation =
+        next_runtime_generation.fetch_add(1, std::memory_order_relaxed);
+    if (out.runtime_generation == 0) {
+        out.runtime_generation =
+            next_runtime_generation.fetch_add(1, std::memory_order_relaxed);
+    }
 
     gguf_free(gctx);
     // Note: meta_ctx is now owned by out.ctx — do NOT free it here.
@@ -988,6 +1010,7 @@ void free_deepseek4_weights(DeepSeek4Weights & w) {
     w.embedder.tok_embd_owned.clear();
     w.embedder.tok_embd_bytes = nullptr;
     w.moe_hybrid = false;
+    w.runtime_generation = 0;
 }
 
 }  // namespace dflash::common

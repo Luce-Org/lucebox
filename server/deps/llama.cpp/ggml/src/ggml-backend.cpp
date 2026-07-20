@@ -2150,6 +2150,22 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    // Per-graph registrations retain tensor pointers and native events. A
+    // reset explicitly discards that graph, so carrying either list into the
+    // next allocation would dereference stale metadata (and leak the events).
+    sched->n_late_cross_input_split_nodes = 0;
+    if (sched->n_deferred_peer_copies > 0) {
+        // A caller may reset after an asynchronous submission. Do not destroy
+        // producer events while either backend can still reference them.
+        for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+            ggml_backend_synchronize(sched->backends[backend_id]);
+        }
+    }
+    for (int i = 0; i < sched->n_deferred_peer_copies; ++i) {
+        ggml_backend_event_free(sched->deferred_peer_copies[i].event);
+        sched->deferred_peer_copies[i] = {};
+    }
+    sched->n_deferred_peer_copies = 0;
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
@@ -2315,7 +2331,7 @@ void ggml_backend_sched_add_late_cross_input_split_node(
 
 void ggml_backend_sched_add_deferred_peer_copy_node(
         ggml_backend_sched_t sched,
-        const struct ggml_tensor * node) {
+        struct ggml_tensor * node) {
     GGML_ASSERT(sched);
     GGML_ASSERT(node);
     GGML_ASSERT(!sched->is_alloc);
@@ -2342,7 +2358,7 @@ void ggml_backend_sched_add_deferred_peer_copy_node(
     struct ggml_backend_sched_deferred_peer_copy * deferred =
         &sched->deferred_peer_copies[sched->n_deferred_peer_copies++];
     *deferred = {};
-    deferred->node = const_cast<struct ggml_tensor *>(node);
+    deferred->node = node;
     GGML_ASSERT(deferred->node->src[0]);
     deferred->source = deferred->node->src[0];
     // The full graph is already expanded when nodes are registered. Remove

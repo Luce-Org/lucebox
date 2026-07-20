@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #if defined(DFLASH27B_BACKEND_CUDA)
 #include <cuda_runtime_api.h>
@@ -886,6 +887,139 @@ bool moe_hybrid_reassign_hot_experts_from_mmap(
         return false;
     }
     const auto * base = static_cast<const uint8_t *>(storage.mmap_data);
+    auto source_valid = [&](const ExpertFileRegion & region,
+                            size_t expert_bytes,
+                            int32_t expert) {
+        if (expert < 0 || expert_bytes == 0 || region.size < expert_bytes ||
+            region.offset > storage.mmap_size) {
+            return false;
+        }
+        const size_t ie = static_cast<size_t>(expert);
+        if (ie > (region.size - expert_bytes) / expert_bytes ||
+            ie > (std::numeric_limits<size_t>::max() - region.offset) /
+                     expert_bytes) {
+            return false;
+        }
+        const size_t source = region.offset + ie * expert_bytes;
+        return source <= storage.mmap_size &&
+               expert_bytes <= storage.mmap_size - source;
+    };
+    auto destination_valid = [](ggml_tensor * dst,
+                                size_t expert_bytes,
+                                size_t slots) {
+        return dst && expert_bytes > 0 &&
+               slots <= ggml_nbytes(dst) / expert_bytes;
+    };
+
+    // Validate the complete request before changing any layer. A malformed
+    // later layer must not leave earlier GPU stacks and routing maps updated
+    // to a placement the caller believes was rejected.
+    for (size_t il = 0; il < storage.layers.size(); ++il) {
+        const MoeHybridLayerStorage & layer = storage.layers[il];
+        const LayerExpertRegions & regions = storage.layer_regions[il];
+        const std::vector<int32_t> & ids = hot_ids_by_layer[il];
+        const size_t n_expert = layer.hot_local_by_global.size();
+        if (ids.size() != static_cast<size_t>(layer.hot_active) ||
+            layer.cache_slots != 0 || layer.expert_shard_channels != 0 ||
+            layer.cold_local_by_global.size() != n_expert) {
+            if (err) *err = "dynamic hotset size does not match fixed hot stack";
+            return false;
+        }
+
+        std::vector<uint8_t> desired(n_expert, 0);
+        for (int32_t expert : ids) {
+            if (expert < 0 || static_cast<size_t>(expert) >= n_expert) {
+                if (err) *err = "dynamic hot expert id out of range";
+                return false;
+            }
+            if (desired[static_cast<size_t>(expert)] != 0) {
+                if (err) *err = "dynamic hot expert ids must be unique";
+                return false;
+            }
+            desired[static_cast<size_t>(expert)] = 1;
+        }
+
+        std::vector<int32_t> entering_hot;
+        std::vector<int32_t> leaving_hot;
+        for (int32_t expert : ids) {
+            if (layer.hot_local_by_global[static_cast<size_t>(expert)] < 0) {
+                entering_hot.push_back(expert);
+            }
+        }
+        for (int32_t expert : layer.hot_expert_ids) {
+            if (expert < 0 || static_cast<size_t>(expert) >= n_expert) {
+                if (err) *err = "existing dynamic hot expert id out of range";
+                return false;
+            }
+            if (!desired[static_cast<size_t>(expert)]) {
+                leaving_hot.push_back(expert);
+            }
+        }
+        if (entering_hot.size() != leaving_hot.size()) {
+            if (err) *err = "dynamic hot/cold swap cardinality mismatch";
+            return false;
+        }
+
+        auto stack_valid = [&](const ExpertFileRegion & region,
+                               ggml_tensor * dst,
+                               size_t expert_bytes) {
+            if (!destination_valid(dst, expert_bytes, ids.size())) return false;
+            return std::all_of(ids.begin(), ids.end(), [&](int32_t expert) {
+                return source_valid(region, expert_bytes, expert);
+            });
+        };
+        const bool hot_stack_valid = layer.fused_gate_up
+            ? stack_valid(regions.gate_up_exps, layer.gate_up_hot,
+                          layer.gate_up_expert_bytes) &&
+              stack_valid(regions.down_exps, layer.down_hot,
+                          layer.down_expert_bytes)
+            : stack_valid(regions.gate_exps, layer.gate_hot,
+                          layer.gate_expert_bytes) &&
+              stack_valid(regions.up_exps, layer.up_hot,
+                          layer.up_expert_bytes) &&
+              stack_valid(regions.down_exps, layer.down_hot,
+                          layer.down_expert_bytes);
+        if (!hot_stack_valid) {
+            if (err) *err = "dynamic hot expert source or destination is invalid";
+            return false;
+        }
+
+        for (size_t si = 0; si < entering_hot.size(); ++si) {
+            const int32_t incoming = entering_hot[si];
+            const int32_t outgoing = leaving_hot[si];
+            const int32_t cold_slot =
+                layer.cold_local_by_global[static_cast<size_t>(incoming)];
+            if (cold_slot < 0 ||
+                static_cast<size_t>(cold_slot) >= layer.cold_expert_ids.size()) {
+                if (err) *err = "dynamic hot expert has no cold source slot";
+                return false;
+            }
+            auto swap_valid = [&](const ExpertFileRegion & region,
+                                  ggml_tensor * dst,
+                                  size_t expert_bytes) {
+                return source_valid(region, expert_bytes, outgoing) &&
+                       destination_valid(
+                           dst, expert_bytes,
+                           static_cast<size_t>(cold_slot) + 1);
+            };
+            const bool cold_swap_valid = layer.fused_gate_up
+                ? swap_valid(regions.gate_up_exps, layer.gate_up_cold,
+                             layer.gate_up_expert_bytes) &&
+                  swap_valid(regions.down_exps, layer.down_cold,
+                             layer.down_expert_bytes)
+                : swap_valid(regions.gate_exps, layer.gate_cold,
+                             layer.gate_expert_bytes) &&
+                  swap_valid(regions.up_exps, layer.up_cold,
+                             layer.up_expert_bytes) &&
+                  swap_valid(regions.down_exps, layer.down_cold,
+                             layer.down_expert_bytes);
+            if (!cold_swap_valid) {
+                if (err) *err = "dynamic cold expert source or destination is invalid";
+                return false;
+            }
+        }
+    }
+
     std::vector<uint8_t> packed;
     auto upload = [&](const ExpertFileRegion & region,
                       ggml_tensor * dst,

@@ -153,7 +153,11 @@ struct Ds4FusedVerifyCache {
     void destroy() {
         for (auto & s : slots) s.destroy();
         for (auto & e : extra) e.reset();
+        owner_ctx = nullptr;
+        backend = nullptr;
         peer_backend = nullptr;
+        disabled = false;
+        counter = 0;
     }
 };
 
@@ -162,6 +166,15 @@ static Ds4FusedVerifyCache fused_verify_graph_cache;
 // graphs out of the q>=2 speculative verifier LRU or every fresh prefill
 // evicts the expensive warm q=3 verifier working set.
 static Ds4FusedVerifyCache fused_capture_graph_cache;
+
+void reset_deepseek4_graph_runtime_caches() {
+    fused_verify_graph_cache.destroy();
+    fused_capture_graph_cache.destroy();
+    if (g_deepseek4_fused_decode_runtime_cache) {
+        g_deepseek4_fused_decode_runtime_cache->destroy();
+        g_deepseek4_fused_decode_runtime_cache = nullptr;
+    }
+}
 
 // Cached verifier graphs retain their input tensors, while a request-adaptive
 // placement changes only the global->local expert maps.  Refresh those small
@@ -207,6 +220,169 @@ static void ds4_fused_verify_refresh_hybrid_luts(
                    sizeof(int32_t) * cold_lut.size());
         ds4_fv_set(inputs.shard_valid_lut, cold_valid.data(),
                    sizeof(float) * cold_valid.size());
+    }
+}
+
+struct Ds4AuthoritativeRouteSnapshot {
+    const DeepSeek4FusedDecodeGraph::AuthoritativeRouteOutput * route = nullptr;
+    std::vector<int32_t> ids;
+    std::vector<float> weights;
+};
+
+template <typename T>
+static bool ds4_fused_read_route_matrix(
+        ggml_tensor * tensor,
+        ggml_type expected_type,
+        int width,
+        int n_tokens,
+        std::vector<T> & out) {
+    if (!tensor || tensor->type != expected_type || width <= 0 ||
+        n_tokens <= 0 || tensor->ne[0] < width ||
+        tensor->ne[1] < n_tokens || tensor->nb[0] != sizeof(T)) {
+        return false;
+    }
+    const size_t row_bytes = sizeof(T) * (size_t) width;
+    const size_t tensor_bytes = ggml_nbytes(tensor);
+    out.resize((size_t) width * n_tokens);
+    for (int token = 0; token < n_tokens; ++token) {
+        const size_t offset = (size_t) token * tensor->nb[1];
+        if (offset > tensor_bytes || row_bytes > tensor_bytes - offset) {
+            out.clear();
+            return false;
+        }
+        ggml_backend_tensor_get(
+            tensor, out.data() + (size_t) token * width,
+            offset, row_bytes);
+    }
+    return true;
+}
+
+static void ds4_fused_consume_route_diagnostics(
+        DeepSeek4FusedDecodeGraph & fg,
+        const MoeHybridStorage * hybrid,
+        MoeHybridRoutingStats * routing_stats) {
+    const bool predict_audit =
+        ds4_tp_route_predict_audit_lookahead() > 0;
+    const bool cache_audit =
+        ds4_env_flag("DFLASH_DS4_TP_CACHE_AUDIT");
+    if (!routing_stats && !predict_audit && !cache_audit) return;
+
+    std::vector<Ds4AuthoritativeRouteSnapshot> snapshots;
+    snapshots.reserve(fg.authoritative_routes.size());
+    uint64_t cache_hot = 0;
+    uint64_t cache_total = 0;
+    for (const auto & route : fg.authoritative_routes) {
+        Ds4AuthoritativeRouteSnapshot snapshot;
+        snapshot.route = &route;
+        if (!ds4_fused_read_route_matrix(
+                route.selected, GGML_TYPE_I32, route.width,
+                route.n_tokens, snapshot.ids) ||
+            !ds4_fused_read_route_matrix(
+                route.weights, GGML_TYPE_F32, route.width,
+                route.n_tokens, snapshot.weights)) {
+            std::fprintf(stderr,
+                "[ds4-route-audit] failed to read layer=%d lane=%d\n",
+                route.layer, route.lane_start);
+            continue;
+        }
+        for (int token = 0; token < route.n_tokens; ++token) {
+            const int32_t * ids = snapshot.ids.data() +
+                (size_t) token * route.width;
+            const float * weights = snapshot.weights.data() +
+                (size_t) token * route.width;
+            observe_active_routing(
+                routing_stats, route.layer, ids, weights, route.width);
+            if (cache_audit && hybrid && route.layer >= 0 &&
+                route.layer < (int) hybrid->layers.size()) {
+                const MoeHybridLayerStorage & layer =
+                    hybrid->layers[(size_t) route.layer];
+                for (int i = 0; i < route.width; ++i) {
+                    const int32_t id = ids[i];
+                    if (weights[i] == 0.0f || id < 0 ||
+                        id >= (int32_t) layer.hot_local_by_global.size()) {
+                        continue;
+                    }
+                    ++cache_total;
+                    if (layer.hot_local_by_global[(size_t) id] >= 0) {
+                        ++cache_hot;
+                    }
+                }
+            }
+        }
+        snapshots.push_back(std::move(snapshot));
+    }
+
+    if (cache_audit && cache_total > 0) {
+        std::fprintf(stderr,
+            "[ds4-route-cache-audit] hot=%llu total=%llu hit=%.3f\n",
+            (unsigned long long) cache_hot,
+            (unsigned long long) cache_total,
+            (double) cache_hot / (double) cache_total);
+    }
+    if (!predict_audit) return;
+
+    uint64_t active_total = 0;
+    uint64_t base_hits = 0;
+    uint64_t wide_hits = 0;
+    uint64_t comparisons = 0;
+    int base_width = 0;
+    int wide_width = 0;
+    for (const auto & prediction : fg.route_predictions) {
+        const Ds4AuthoritativeRouteSnapshot * target = nullptr;
+        for (const auto & snapshot : snapshots) {
+            if (snapshot.route->layer == prediction.target_layer &&
+                snapshot.route->lane_start == prediction.lane_start &&
+                snapshot.route->n_tokens == prediction.n_tokens) {
+                target = &snapshot;
+                break;
+            }
+        }
+        if (!target) continue;
+        std::vector<int32_t> predicted;
+        if (!ds4_fused_read_route_matrix(
+                prediction.selected, GGML_TYPE_I32, prediction.width,
+                prediction.n_tokens, predicted)) {
+            std::fprintf(stderr,
+                "[ds4-route-predict-audit] failed to read source=%d target=%d\n",
+                prediction.source_layer, prediction.target_layer);
+            continue;
+        }
+        const int primary = std::min(
+            target->route->width, prediction.width);
+        base_width = std::max(base_width, primary);
+        wide_width = std::max(wide_width, prediction.width);
+        ++comparisons;
+        for (int token = 0; token < prediction.n_tokens; ++token) {
+            const int32_t * actual = target->ids.data() +
+                (size_t) token * target->route->width;
+            const float * weights = target->weights.data() +
+                (size_t) token * target->route->width;
+            const int32_t * candidate = predicted.data() +
+                (size_t) token * prediction.width;
+            for (int i = 0; i < target->route->width; ++i) {
+                if (weights[i] == 0.0f || actual[i] < 0) continue;
+                ++active_total;
+                bool in_base = false;
+                bool in_wide = false;
+                for (int j = 0; j < prediction.width; ++j) {
+                    if (candidate[j] != actual[i]) continue;
+                    in_wide = true;
+                    if (j < primary) in_base = true;
+                    break;
+                }
+                base_hits += in_base ? 1u : 0u;
+                wide_hits += in_wide ? 1u : 0u;
+            }
+        }
+    }
+    if (active_total > 0) {
+        std::fprintf(stderr,
+            "[ds4-route-predict-audit] comparisons=%llu active=%llu "
+            "recall@%d=%.3f recall@%d=%.3f\n",
+            (unsigned long long) comparisons,
+            (unsigned long long) active_total,
+            base_width, (double) base_hits / (double) active_total,
+            wide_width, (double) wide_hits / (double) active_total);
     }
 }
 
@@ -682,6 +858,17 @@ static bool ds4_build_fused_verify_graph(
                 ctx, ffn_normed, w, L, il, lane_q);
         }
 
+        if (hybrid) {
+            DeepSeek4FusedDecodeGraph::AuthoritativeRouteOutput route;
+            route.layer = il;
+            route.lane_start = lane_start;
+            route.n_tokens = lane_q;
+            route.width = (int) selected->ne[0];
+            route.selected = selected;
+            route.weights = router_weights;
+            fg.authoritative_routes.push_back(route);
+        }
+
         // Diagnostic branch only: predict future score-routed expert IDs from
         // the current normalized FFN input.  The authoritative routing above
         // remains the sole input to the model FFN, so this cannot affect
@@ -717,6 +904,9 @@ static bool ds4_build_fused_verify_graph(
             }
         }
         if (hybrid) {
+            const bool allow_fused_combine =
+                ggml_backend_is_cuda(backend) &&
+                ggml_backend_is_cuda(hybrid->cold_backend);
             MoeHybridConfig hybrid_cfg = make_ds4_moe_hybrid_config(w);
             hybrid_cfg.n_expert_used = (int) selected->ne[0];
             MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
@@ -785,7 +975,8 @@ static bool ds4_build_fused_verify_graph(
                          ds4_env_flag("DFLASH_DS4_TP_DEVICE_JOIN")) ? gf : nullptr,
                         hybrid_cfg, desc,
                         hybrid->layers[(size_t) il], ffn_normed,
-                        first_ids, first_weights, lane_q, inputs, true)) {
+                        first_ids, first_weights, lane_q, inputs, true,
+                        allow_fused_combine)) {
                     return false;
                 }
                 ffn_out = inputs.output;
@@ -796,7 +987,8 @@ static bool ds4_build_fused_verify_graph(
                          ds4_env_flag("DFLASH_DS4_TP_DEVICE_JOIN")) ? gf : nullptr,
                         hybrid_cfg, desc,
                         hybrid->layers[(size_t) il], ffn_normed,
-                        padded_ids, padded_weights, lane_q, inputs, false)) {
+                        padded_ids, padded_weights, lane_q, inputs, false,
+                        allow_fused_combine)) {
                     return false;
                 }
                 ffn_out = ggml_add(ctx, ffn_out, inputs.output);
@@ -808,7 +1000,7 @@ static bool ds4_build_fused_verify_graph(
                         hybrid_cfg, desc,
                         hybrid->layers[(size_t) il],
                         ffn_normed, selected, router_weights,
-                        lane_q, inputs)) {
+                        lane_q, inputs, true, allow_fused_combine)) {
                     return false;
                 }
                 ffn_out = inputs.output;
@@ -1056,18 +1248,22 @@ static bool ds4_build_fused_verify_graph(
             for (ggml_tensor * node : prediction.nodes) pin_main(node);
             pin_main(prediction.selected);
         }
+        for (const auto & route : fg.authoritative_routes) {
+            pin_main(route.selected);
+            pin_main(route.weights);
+        }
         if (ds4_env_flag("DFLASH_DS4_TP_ROUTE_STATS") ||
+            ds4_env_flag("DFLASH_DS4_ROUTING_STATS_OUT") ||
             ds4_env_flag("DFLASH_DS4_TP_DYNAMIC_HOTSET") ||
             (q > 1 && ds4_tp_route_predict_audit_lookahead() > 0) ||
             ds4_env_flag("DFLASH_DS4_TP_CACHE_AUDIT")) {
-            // Preserve selected-ID buffers through the end of the diagnostic
-            // graph so the post-compute route-reuse audit can read them.  The
-            // native six-route graph records one {IDs, weights} pair/layer;
-            // the legacy graph records two pairs, hence the stride of two.
-            for (const MoeHybridGraphInputs & inputs : fg.hybrid_inputs) {
-                for (size_t i = 0; i < inputs.route_prefork_nodes.size(); i += 2) {
-                    ggml_set_output(inputs.route_prefork_nodes[i]);
-                }
+            // Preserve the unsplit authoritative route and weight matrices.
+            // Reading the pre-fork list is insufficient in the legacy 4+2
+            // lowering because its second build overwrites the per-layer
+            // bookkeeping with padded IDs.
+            for (const auto & route : fg.authoritative_routes) {
+                ggml_set_output(route.selected);
+                ggml_set_output(route.weights);
             }
         }
         pin_main(fg.logits);
@@ -1430,13 +1626,13 @@ static int ds4_try_fused_verify_step(
     const bool force_verify_graph_replay = q > 1 &&
         ds4_env_flag("DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY");
     if (force_verify_graph_replay) {
-        ggml_cuda_set_skip_props_check(true);
+        ggml_backend_cuda_set_skip_props_check(true);
     }
     const enum ggml_status compute_status = fg->sched
         ? ds4_fused_verify_compute_whole_step(*fg, q)
         : ggml_backend_graph_compute(backend, fg->sg.gf);
     if (force_verify_graph_replay) {
-        ggml_cuda_set_skip_props_check(false);
+        ggml_backend_cuda_set_skip_props_check(false);
     }
     if (capture_eager) {
         ggml_backend_cuda_set_graphs_disabled_override(false);
@@ -1453,6 +1649,7 @@ static int ds4_try_fused_verify_step(
     }
 
     const auto read_t0 = Ds4TimingClock::now();
+    ds4_fused_consume_route_diagnostics(*fg, hybrid, routing_stats);
     const int ncap = (int) hooks->capture_layer_ids->size();
     const bool argmax_only =
         hooks->prefer_argmax_only && hooks->argmax_out && ex->argmax;

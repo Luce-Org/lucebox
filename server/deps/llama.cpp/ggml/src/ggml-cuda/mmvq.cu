@@ -428,6 +428,12 @@ static bool mmid_grouped_env() {
     return on;
 }
 
+static bool mmvq_env_flag(const char * name, bool default_value = false) {
+    const char * value = std::getenv(name);
+    if (!value || !value[0]) return default_value;
+    return std::strcmp(value, "0") != 0;
+}
+
 static bool mmid_grouped_type_ok(ggml_type type) {
     // bit0 = Q4_K, bit1 = Q6_K, bit2 = Q4_0/Q8_0/Q5_K. Default: all validated
     // types (7); DFLASH_MMID_GROUPED_TYPES is a debug override.
@@ -462,10 +468,8 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     // Dedicated multi-token MoE kernel: extend the MUL_MAT_ID ceiling to 16
     // tokens on NVIDIA Turing+ for types whose base ceiling is already the
     // maximum. Types with tuned lower ceilings (per PR 20905) keep them.
-    static const bool moe_kernel_enabled = []() {
-        const char * e = std::getenv("DFLASH_CUDA_MMVQ_MOE_KERNEL");
-        return !(e && e[0] == '0' && e[1] == '\0');
-    }();
+    static const bool moe_kernel_enabled =
+        mmvq_env_flag("DFLASH_CUDA_MMVQ_MOE_KERNEL", true);
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
@@ -1037,8 +1041,7 @@ static __global__ void mul_mat_vec_q_moe(
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t ncols_dst, const uint32_t nchannels_dst, const uint32_t ids_stride,
-        const bool skip_duplicate_ids, const bool compact_masked_ids,
-        const bool aligned_shared_ids) {
+        const bool compact_masked_ids, const bool aligned_shared_ids) {
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
@@ -1102,18 +1105,14 @@ static __global__ void mul_mat_vec_q_moe(
         uint32_t n_valid = 0;
         for (uint32_t c = 0; c < nchannels_dst; ++c) {
             const int32_t id = ids[c + token_idx * ids_stride];
-            const bool duplicate = skip_duplicate_ids && c >= 2 && id >= 0 &&
-                id == ids[c - 2 + token_idx * ids_stride];
-            n_valid += id >= 0 && !duplicate;
+            n_valid += id >= 0;
         }
 
         const bool want_valid = compact_slot < n_valid;
         uint32_t rank = want_valid ? compact_slot : compact_slot - n_valid;
         for (uint32_t c = 0; c < nchannels_dst; ++c) {
             const int32_t id = ids[c + token_idx * ids_stride];
-            const bool duplicate = skip_duplicate_ids && c >= 2 && id >= 0 &&
-                id == ids[c - 2 + token_idx * ids_stride];
-            const bool valid = id >= 0 && !duplicate;
+            const bool valid = id >= 0;
             if (valid == want_valid) {
                 if (rank == 0) {
                     channel_dst = c;
@@ -1126,21 +1125,9 @@ static __global__ void mul_mat_vec_q_moe(
     } else {
         channel_x_raw = ids[channel_dst + token_idx * ids_stride];
     }
-    // The legacy six-route q4 graph lowers its two-route tail as
-    // [id4, id5, id4, id5] with weights [w4, w5, 0, 0]. Top-k IDs are unique,
-    // so an exact two-slot-back duplicate is padding and its expert matvec is
-    // dead work. Keep the output zero; the downstream zero weight therefore
-    // preserves the original result while avoiding one third of route work.
-    int32_t previous_channel_x = -1;
-    if (skip_duplicate_ids && !has_aligned_id && channel_dst >= 2) {
-        const int32_t previous_raw =
-            ids[channel_dst - 2 + token_idx * ids_stride];
-        previous_channel_x = previous_raw;
-    }
-    const bool duplicate_padding = skip_duplicate_ids && !has_aligned_id &&
-        channel_dst >= 2 &&
-        channel_x_raw >= 0 && channel_x_raw == previous_channel_x;
-    const bool channel_valid = channel_x_raw >= 0 && !duplicate_padding;
+    // Expert IDs alone cannot distinguish a zero-weight padding duplicate
+    // from a valid repeated route. Never suppress a route without its weight.
+    const bool channel_valid = channel_x_raw >= 0;
     const uint32_t channel_x = channel_valid ? (uint32_t) channel_x_raw : 0u;
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
@@ -1651,8 +1638,8 @@ static void mul_mat_vec_q_moe_launch_rpb(
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int nchannels_dst, cudaStream_t stream,
-        const bool sparse_warp_blocks, const bool skip_duplicate_ids,
-        const bool compact_masked_ids, const bool aligned_shared_ids) {
+        const bool sparse_warp_blocks, const bool compact_masked_ids,
+        const bool aligned_shared_ids) {
 
     static_assert(rows_per_block == 1 || rows_per_block == 2 ||
                   rows_per_block == 4 || rows_per_block == 8,
@@ -1680,7 +1667,7 @@ static void mul_mat_vec_q_moe_launch_rpb(
                 stride_row_x, stride_col_y, stride_col_dst,
                 stride_channel_x, stride_channel_y, stride_channel_dst,
                 ncols_dst, nchannels_dst, ids_stride,
-                skip_duplicate_ids, compact_masked_ids, aligned_shared_ids);
+                compact_masked_ids, aligned_shared_ids);
         } else {
             mul_mat_vec_q_moe<type, rows_per_block, warp_groups, true, false,
                               fp3_packed24, fp2_packed32><<<block_nums, block_dims, 0, stream>>>(
@@ -1688,7 +1675,7 @@ static void mul_mat_vec_q_moe_launch_rpb(
                 stride_row_x, stride_col_y, stride_col_dst,
                 stride_channel_x, stride_channel_y, stride_channel_dst,
                 ncols_dst, nchannels_dst, ids_stride,
-                skip_duplicate_ids, compact_masked_ids, aligned_shared_ids);
+                compact_masked_ids, aligned_shared_ids);
         }
     } else {
         if (sparse_warp_blocks) {
@@ -1698,7 +1685,7 @@ static void mul_mat_vec_q_moe_launch_rpb(
                 stride_row_x, stride_col_y, stride_col_dst,
                 stride_channel_x, stride_channel_y, stride_channel_dst,
                 ncols_dst, nchannels_dst, ids_stride,
-                skip_duplicate_ids, compact_masked_ids, aligned_shared_ids);
+                compact_masked_ids, aligned_shared_ids);
         } else {
             mul_mat_vec_q_moe<type, rows_per_block, warp_groups, false, false,
                               fp3_packed24, fp2_packed32><<<block_nums, block_dims, 0, stream>>>(
@@ -1706,7 +1693,7 @@ static void mul_mat_vec_q_moe_launch_rpb(
                 stride_row_x, stride_col_y, stride_col_dst,
                 stride_channel_x, stride_channel_y, stride_channel_dst,
                 ncols_dst, nchannels_dst, ids_stride,
-                skip_duplicate_ids, compact_masked_ids, aligned_shared_ids);
+                compact_masked_ids, aligned_shared_ids);
         }
     }
 }
@@ -1724,18 +1711,12 @@ static void mul_mat_vec_q_moe_launch(
         const char * e = std::getenv("DFLASH_CUDA_MMVQ_MOE_SPARSE_WARP_BLOCKS");
         return e && e[0] == '1' && e[1] == '\0';
     }();
-    static const bool skip_duplicate_ids = []() {
-        const char * e = std::getenv("DFLASH_CUDA_MMVQ_MOE_SKIP_DUPLICATE_IDS");
-        return e && e[0] == '1' && e[1] == '\0';
-    }();
     static const bool compact_masked_ids = []() {
         const char * e = std::getenv("DFLASH_CUDA_MMVQ_MOE_COMPACT_MASKED_IDS");
         return e && e[0] == '1' && e[1] == '\0';
     }();
-    static const bool aligned_shared_ids = []() {
-        const char * e = std::getenv("DFLASH_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS");
-        return e && e[0] == '1' && e[1] == '\0';
-    }();
+    static const bool aligned_shared_ids =
+        mmvq_env_flag("DFLASH_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS");
     static const int tuned_rows_per_block = []() {
         const char * e = std::getenv("DFLASH_CUDA_MMVQ_MOE_ROWS_PER_BLOCK");
         if (!e || !e[0]) return 2;
@@ -1770,8 +1751,7 @@ static void mul_mat_vec_q_moe_launch(
         stride_row_x, stride_col_y, stride_col_dst, \
         stride_channel_x, stride_channel_y, stride_channel_dst, \
         ncols_dst, ids_stride, warp_size, nchannels_dst, stream, \
-        sparse_warp_blocks, skip_duplicate_ids, compact_masked_ids, \
-        aligned_shared_ids)
+        sparse_warp_blocks, compact_masked_ids, aligned_shared_ids)
 
 #define GGML_MOE_LAUNCH_TWO_WARP_GROUPS() \
     mul_mat_vec_q_moe_launch_rpb<type, 2, 2>( \
@@ -1779,8 +1759,7 @@ static void mul_mat_vec_q_moe_launch(
         stride_row_x, stride_col_y, stride_col_dst, \
         stride_channel_x, stride_channel_y, stride_channel_dst, \
         ncols_dst, ids_stride, warp_size, nchannels_dst, stream, \
-        sparse_warp_blocks, skip_duplicate_ids, compact_masked_ids, \
-        aligned_shared_ids)
+        sparse_warp_blocks, compact_masked_ids, aligned_shared_ids)
 
 #define GGML_MOE_LAUNCH_FP3_PACKED24(WARP_GROUPS) \
     mul_mat_vec_q_moe_launch_rpb<type, 2, WARP_GROUPS, true>( \
@@ -1788,8 +1767,7 @@ static void mul_mat_vec_q_moe_launch(
         stride_row_x, stride_col_y, stride_col_dst, \
         stride_channel_x, stride_channel_y, stride_channel_dst, \
         ncols_dst, ids_stride, warp_size, nchannels_dst, stream, \
-        sparse_warp_blocks, skip_duplicate_ids, compact_masked_ids, \
-        aligned_shared_ids)
+        sparse_warp_blocks, compact_masked_ids, aligned_shared_ids)
 
 #define GGML_MOE_LAUNCH_FP2_PACKED32(WARP_GROUPS) \
     mul_mat_vec_q_moe_launch_rpb<type, 2, WARP_GROUPS, false, true>( \
@@ -1797,8 +1775,7 @@ static void mul_mat_vec_q_moe_launch(
         stride_row_x, stride_col_y, stride_col_dst, \
         stride_channel_x, stride_channel_y, stride_channel_dst, \
         ncols_dst, ids_stride, warp_size, nchannels_dst, stream, \
-        sparse_warp_blocks, skip_duplicate_ids, compact_masked_ids, \
-        aligned_shared_ids)
+        sparse_warp_blocks, compact_masked_ids, aligned_shared_ids)
 
     if constexpr (type == GGML_TYPE_Q2_0_ROCMFP2) {
         if (fp2_packed32 && tuned_rows_per_block == 2 &&
@@ -1974,10 +1951,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return;
     }
 
-    static const bool use_moe_kernel = []() {
-        const char * e = std::getenv("DFLASH_CUDA_MMVQ_MOE_KERNEL");
-        return !(e && e[0] == '0' && e[1] == '\0');
-    }();
+    static const bool use_moe_kernel =
+        mmvq_env_flag("DFLASH_CUDA_MMVQ_MOE_KERNEL", true);
 
     if (has_ids && ncols_dst > 1 && (use_moe_kernel || ncols_dst > MMVQ_MAX_BATCH_SIZE)) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel

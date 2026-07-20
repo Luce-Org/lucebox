@@ -677,11 +677,16 @@ bool run_deepseek4_dspark_spec_decode(
     }
     // Laguna-style adaptive verify width: EWMA of accepted candidates, width =
     // ewma + 2 (avg_commit << block means the wide tail is usually wasted).
-    // /tmp/ds4_awidth: 1 = on, 0 = off (default on).
+    // Prefer an explicit process-level policy. Retain /tmp/ds4_awidth only as
+    // a compatibility fallback for older experiment harnesses.
     bool adaptive_width = true;
-    if (std::FILE * f = std::fopen("/tmp/ds4_awidth", "r")) {
-        int v = 1;
-        if (std::fscanf(f, "%d", &v) == 1) adaptive_width = (v != 0);
+    if (const char * raw = std::getenv("DFLASH_DS4_ADAPTIVE_WIDTH")) {
+        adaptive_width = raw[0] && std::strcmp(raw, "0") != 0;
+    } else if (std::FILE * f = std::fopen("/tmp/ds4_awidth", "r")) {
+        int value = 1;
+        if (std::fscanf(f, "%d", &value) == 1) {
+            adaptive_width = value != 0;
+        }
         std::fclose(f);
     }
     // The v1 IPC protocol returns normalized draft states only. Use its EWMA
@@ -790,6 +795,7 @@ bool run_deepseek4_dspark_spec_decode(
     std::vector<int32_t> draft_tok, tgt_am;
     std::vector<float> draft_confidence;
     std::vector<float> cached_ahead_hidden;
+    std::vector<float> cached_ahead_confidence_hidden;
     std::vector<float> ahead_noise_embed((size_t) n_embd * block);
     bool cached_ahead_ready = false;
     int cached_ahead_pos = -1;
@@ -812,20 +818,30 @@ bool run_deepseek4_dspark_spec_decode(
             const bool use_ahead =
                 cached_ahead_ready && cached_ahead_pos == pos &&
                 cached_ahead_seed == lt &&
-                cached_ahead_hidden.size() == (size_t) n_embd * block;
+                cached_ahead_hidden.size() == (size_t) n_embd * block &&
+                (!use_confidence_width ||
+                 cached_ahead_confidence_hidden.size() ==
+                     (size_t) n_embd * block);
             if (use_ahead) {
                 local_hidden.swap(cached_ahead_hidden);
+                if (use_confidence_width) {
+                    confidence_hidden.swap(cached_ahead_confidence_hidden);
+                }
                 cached_ahead_ready = false;
                 ++ahead_reuses;
             } else {
                 cached_ahead_ready = false;
                 cached_ahead_hidden.clear();
+                cached_ahead_confidence_hidden.clear();
                 noise_ids[0] = lt;
                 for (int i = 1; i < block; i++) {
                     noise_ids[i] = drafter.mask_token_id;
                 }
                 if (!target.embed_tokens(
                         noise_ids.data(), block, noise_embed.data())) {
+                    std::fprintf(stderr,
+                        "[ds4-spec] draft embedding lookup failed\n");
+                    ok = false;
                     break;
                 }
 
@@ -912,6 +928,9 @@ bool run_deepseek4_dspark_spec_decode(
                 std::vector<int32_t> pj;
                 if (!target.project_hidden_to_tokens(
                         local_hidden.data(), head_step_cap - 1, pj)) {
+                    std::fprintf(stderr,
+                        "[ds4-spec] draft projection fallback failed\n");
+                    ok = false;
                     break;
                 }
                 draft_tok.clear();
@@ -967,6 +986,7 @@ bool run_deepseek4_dspark_spec_decode(
         int inflight_ahead_seed = -1;
         int inflight_ahead_pos = -1;
         std::vector<float> completed_ahead_hidden;
+        std::vector<float> completed_ahead_confidence_hidden;
         if (draft_ahead_enabled && q == q_step_cap && q >= 2 &&
             predicted_ahead_seed >= 0) {
             const SpecClock::time_point probe_t0 = SpecClock::now();
@@ -1044,7 +1064,9 @@ bool run_deepseek4_dspark_spec_decode(
             if (ahead_inflight) {
                 ahead_output_ready =
                     deepseek4_dspark_draft_read_async_output(
-                        drafter_backend, completed_ahead_hidden);
+                        drafter_backend, completed_ahead_hidden,
+                        use_confidence_width
+                            ? &completed_ahead_confidence_hidden : nullptr);
                 if (!ahead_output_ready) {
                     draft_ahead_enabled = false;
                     std::fprintf(stderr,
@@ -1087,12 +1109,19 @@ bool run_deepseek4_dspark_spec_decode(
             if (seed_hit) {
                 ++ahead_seed_hits;
                 cached_ahead_hidden = std::move(completed_ahead_hidden);
+                if (use_confidence_width) {
+                    cached_ahead_confidence_hidden =
+                        std::move(completed_ahead_confidence_hidden);
+                } else {
+                    cached_ahead_confidence_hidden.clear();
+                }
                 cached_ahead_pos = commit_pos;
                 cached_ahead_seed = bonus;
                 cached_ahead_ready = true;
             } else {
                 cached_ahead_ready = false;
                 cached_ahead_hidden.clear();
+                cached_ahead_confidence_hidden.clear();
             }
             if (timing && steps < 8) {
                 std::fprintf(stderr,
