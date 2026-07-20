@@ -644,6 +644,7 @@ endif()
 option(DFLASH27B_TESTS "Build numerics tests" ON)
 option(DFLASH27B_SERVER "Build dflash_server + backend_ipc_daemon" ON)
 if(DFLASH27B_TESTS)
+    set(_raw_unit_test_targets)
     if(DFLASH27B_GPU_BACKEND STREQUAL "hip"
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_cuda_pool_shutdown.cpp")
         add_executable(test_cuda_pool_shutdown test/test_cuda_pool_shutdown.cpp)
@@ -653,7 +654,7 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
         target_link_libraries(test_cuda_pool_shutdown PRIVATE
             ${DFLASH27B_GGML_BACKEND_TARGET} ggml ggml-base)
-        add_test(NAME cuda_pool_shutdown COMMAND test_cuda_pool_shutdown)
+        list(APPEND _raw_unit_test_targets test_cuda_pool_shutdown)
     endif()
 
     add_executable(test_rocmfp4 deps/llama.cpp/ggml/rocmfp4/test_rocmfp4.c)
@@ -661,14 +662,14 @@ if(DFLASH27B_TESTS)
     if(UNIX)
         target_link_libraries(test_rocmfp4 PRIVATE m)
     endif()
-    add_test(NAME rocmfp4_reference COMMAND test_rocmfp4)
+    list(APPEND _raw_unit_test_targets test_rocmfp4)
 
     add_executable(test_rocmfpx deps/llama.cpp/ggml/rocmfpx/test_rocmfpx.c)
     target_link_libraries(test_rocmfpx PRIVATE ggml-base)
     if(UNIX)
         target_link_libraries(test_rocmfpx PRIVATE m)
     endif()
-    add_test(NAME rocmfpx_reference COMMAND test_rocmfpx)
+    list(APPEND _raw_unit_test_targets test_rocmfpx)
 
     if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
         add_executable(test_rocmfp4_hip_tail test/test_rocmfp4_hip_tail.cpp)
@@ -682,7 +683,7 @@ if(DFLASH27B_TESTS)
             ggml-base
             ${DFLASH27B_GGML_BACKEND_TARGET}
             hip::host)
-        add_test(NAME rocmfp4_hip_tail COMMAND test_rocmfp4_hip_tail)
+        list(APPEND _raw_unit_test_targets test_rocmfp4_hip_tail)
 
         add_executable(test_rocmfpx_mmq test/test_rocmfpx_mmq.cpp)
         set_source_files_properties(test/test_rocmfpx_mmq.cpp PROPERTIES LANGUAGE HIP)
@@ -696,7 +697,7 @@ if(DFLASH27B_TESTS)
             ggml-base
             ${DFLASH27B_GGML_BACKEND_TARGET}
             hip::host)
-        add_test(NAME rocmfpx_mmq COMMAND test_rocmfpx_mmq)
+        list(APPEND _raw_unit_test_targets test_rocmfpx_mmq)
     endif()
 
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash_cuda_min_sm GREATER_EQUAL 80 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
@@ -732,7 +733,7 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
         target_link_libraries(test_rms_norm_hip PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
-        add_test(NAME rms_norm_hip COMMAND test_rms_norm_hip)
+        list(APPEND _raw_unit_test_targets test_rms_norm_hip)
     endif()
     # DS4 Hierarchical-Controller pre-mix kernels vs CPU reference. HIP only:
     # deepseek4_hc_cuda.cu is compiled into dflash_common on this backend. Validates
@@ -745,7 +746,7 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
         target_link_libraries(test_deepseek4_hc_cuda PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
-        add_test(NAME deepseek4_hc_cuda COMMAND test_deepseek4_hc_cuda)
+        list(APPEND _raw_unit_test_targets test_deepseek4_hc_cuda)
     endif()
     # HIP-only standalone build; CUDA backend is covered by aggregated test_server_unit.
     if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_topk_cuda.cpp")
@@ -760,7 +761,7 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
         target_link_libraries(test_draft_topk_cuda PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
-        add_test(NAME draft_topk_cuda COMMAND test_draft_topk_cuda)
+        list(APPEND _raw_unit_test_targets test_draft_topk_cuda)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_tail_capture_guard.cpp")
         # RED phase binary: same source WITHOUT the fix flag — documents the bug.
@@ -789,7 +790,7 @@ if(DFLASH27B_TESTS)
         else()
             target_link_libraries(test_deepseek4_unit PRIVATE hip::host)
         endif()
-        add_test(NAME deepseek4_unit COMMAND test_deepseek4_unit)
+        list(APPEND _raw_unit_test_targets test_deepseek4_unit)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_dspark_load.cpp")
         add_executable(test_ds4_dspark_load test/test_ds4_dspark_load.cpp)
@@ -867,11 +868,6 @@ if(DFLASH27B_TESTS)
         target_include_directories(bench_laguna_spark PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(bench_laguna_spark PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_moe_stream.cpp" AND DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-        add_executable(bench_moe_stream test/bench_moe_stream.cpp)
-        target_include_directories(bench_moe_stream PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS})
-        target_link_libraries(bench_moe_stream PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} CUDA::cudart)
-    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_laguna_daemon.cpp")
         add_executable(test_laguna_daemon test/test_laguna_daemon.cpp)
         target_include_directories(test_laguna_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
@@ -947,8 +943,6 @@ if(DFLASH27B_TESTS)
     endif()
 
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
-    enable_testing()
-
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
         set(_server_unit_sources
             test/test_unit_main.cpp
@@ -977,7 +971,8 @@ if(DFLASH27B_TESTS)
             list(APPEND _server_unit_sources
                 test/test_gpu_sampler_cuda.cpp
                 test/test_cuda_pool_shutdown.cpp
-                test/test_draft_topk_cuda.cpp)
+                test/test_draft_topk_cuda.cpp
+                test/test_moe_stream.cpp)
         endif()
         add_executable(test_server_unit ${_server_unit_sources})
         target_sources(test_server_unit PRIVATE
@@ -1011,51 +1006,24 @@ if(DFLASH27B_TESTS)
             target_link_libraries(test_server_unit PRIVATE hip::host)
         endif()
         unset(_server_unit_sources)
-        add_test(NAME server_unit COMMAND test_server_unit)
-        add_test(NAME adaptive_keep COMMAND test_server_unit AdaptiveKeepRatioFixture)
-        add_test(NAME derived_scalars COMMAND test_server_unit DerivedScalarsFixture)
-        add_test(NAME chain_rollback_policy COMMAND test_server_unit ChainRollbackPolicyFixture)
-        add_test(NAME bandit_integration COMMAND test_server_unit BanditIntegrationFixture)
-        add_test(NAME anchor_params COMMAND test_server_unit AnchorParamsFixture)
-        add_test(NAME admission COMMAND test_server_unit AdmissionFixture)
-        add_test(NAME skip_park_guard COMMAND test_server_unit SkipParkGuardFixture)
-        add_test(NAME restore_delta COMMAND test_server_unit RestoreDeltaFixture)
-        add_test(NAME test_anchor_transitive COMMAND test_server_unit AnchorTransitiveFixture)
-        add_test(NAME test_drafter_early_exit_score_range COMMAND test_server_unit DrafterEarlyExitScoreRangeFixture)
-        add_test(NAME test_drafter_tail_capture_guard COMMAND test_server_unit DrafterTailCaptureGuardFixture)
-        add_test(NAME test_drafter_warm_path_regression COMMAND test_server_unit DrafterWarmPathRegressionFixture)
-        add_test(NAME kvflash_placement COMMAND test_server_unit KvflashPlacementFixture)
-        add_test(NAME kvflash_pool_sizing COMMAND test_server_unit KvflashPoolSizingFixture)
-        add_test(NAME kv_quant COMMAND test_server_unit KvQuantFixture)
-        add_test(NAME gguf_mmap COMMAND test_server_unit GgufMmapFixture)
-        add_test(NAME qwen35moe_routing_stats COMMAND test_server_unit Qwen35MoeRoutingStatsFixture)
-        add_test(NAME qwen35moe_expert_placement COMMAND test_server_unit Qwen35MoeExpertPlacementFixture)
-        add_test(NAME qwen35moe_swap_manager COMMAND test_server_unit Qwen35MoeSwapManagerFixture)
-        add_test(NAME kvflash_qk COMMAND test_server_unit KvflashQkFixture)
-        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-            add_test(NAME gpu_sampler_cuda COMMAND test_server_unit GpuSamplerCudaFixture)
-            add_test(NAME cuda_pool_shutdown COMMAND test_server_unit CudaPoolShutdownFixture)
-            add_test(NAME draft_topk_cuda COMMAND test_server_unit DraftTopkCudaFixture)
-        endif()
+        list(APPEND _raw_unit_test_targets test_server_unit)
     endif()
 
-    # 'make check' — builds test targets then runs ctest
-    if(TARGET test_server_unit)
-        set(_check_deps test_server_unit)
-        if(TARGET test_deepseek4_unit)
-            list(APPEND _check_deps test_deepseek4_unit)
-        endif()
-        add_custom_target(check
-            COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-            DEPENDS ${_check_deps}
-            COMMENT "Building and running unit tests"
-        )
+    # 'make check' — build and run raw unit-test binaries directly.
+    if(_raw_unit_test_targets)
+        add_custom_target(check DEPENDS ${_raw_unit_test_targets})
+        foreach(_unit_target IN LISTS _raw_unit_test_targets)
+            add_custom_command(TARGET check
+                COMMAND $<TARGET_FILE:${_unit_target}>
+                COMMENT "Running ${_unit_target}"
+            )
+        endforeach()
     else()
         add_custom_target(check
-            COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-            COMMENT "Building and running unit tests (server unit tests skipped — CURL not found)"
+            COMMENT "No unit-test binaries are enabled in this configuration"
         )
     endif()
+    unset(_raw_unit_test_targets)
 
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     # internal.h includes <cuda_runtime.h> when GGML_USE_CUDA is set; link
