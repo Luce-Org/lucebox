@@ -423,13 +423,17 @@ bool run_deepseek4_dspark_spec_decode(
 
     const bool debug = spec_env_flag("DFLASH_DS4_DSPARK_DEBUG");
     const bool timing = spec_env_flag("DFLASH_DS4_TIMING");
+    const bool parity_trace = spec_env_flag("DFLASH_DS4_PARITY_TRACE");
     const bool full_snap = spec_env_flag("DFLASH_DS4_FULL_SNAP");
     const bool seq_verify_mode = spec_env_flag("DFLASH_DS4_SEQ_VERIFY");
     // Laguna-style adaptive verify width: EWMA of accepted candidates, width =
     // ewma + 2 (avg_commit << block means the wide tail is usually wasted).
     // /tmp/ds4_awidth: 1 = on, 0 = off (default on).
     bool adaptive_width = true;
-    if (std::FILE * f = std::fopen("/tmp/ds4_awidth", "r")) {
+    const char * adaptive_env = std::getenv("DFLASH_DS4_ADAPTIVE_WIDTH");
+    if (adaptive_env && *adaptive_env) {
+        adaptive_width = *adaptive_env != '0';
+    } else if (std::FILE * f = std::fopen("/tmp/ds4_awidth", "r")) {
         int v = 1;
         if (std::fscanf(f, "%d", &v) == 1) adaptive_width = (v != 0);
         std::fclose(f);
@@ -477,6 +481,7 @@ bool run_deepseek4_dspark_spec_decode(
 
     DeepSeek4DFlashTarget target(target_w, target_cache, backend, snap_backend,
                                  drafter.capture_layer_ids, drafter.mask_token_id);
+    target.set_keep_logits(parity_trace);
     DraftWeights dw = make_dspark_shim(drafter);
     DeepSeek4SpecRollback rollback;
     DeepSeek4StepTelemetry tel{};
@@ -676,6 +681,31 @@ bool run_deepseek4_dspark_spec_decode(
             break;
         }
         tm_verify += spec_ms_since(t0);
+
+        if (parity_trace) {
+            std::vector<float> trace_logits;
+            if (target.read_verify_logits(q, trace_logits)) {
+                for (int row = 0; row < q; ++row) {
+                    const float * logits = trace_logits.data() + (size_t) row * target_w.n_vocab;
+                    int best = 0;
+                    int second = -1;
+                    for (int tok = 1; tok < target_w.n_vocab; ++tok) {
+                        if (logits[tok] > logits[best]) {
+                            second = best;
+                            best = tok;
+                        } else if (second < 0 || logits[tok] > logits[second]) {
+                            second = tok;
+                        }
+                    }
+                    const float second_logit = second >= 0 ? logits[second] : logits[best];
+                    std::fprintf(stderr,
+                        "[ds4-parity-logits] step=%ld pos=%d row=%d best=%d val=%.9g "
+                        "second=%d val2=%.9g margin=%.9g\n",
+                        steps, pos, row, best, logits[best], second, second_logit,
+                        logits[best] - second_logit);
+                }
+            }
+        }
 
         // Accept the longest matching prefix. accept counts the seed (slot 0)
         // plus each candidate the target agrees with.

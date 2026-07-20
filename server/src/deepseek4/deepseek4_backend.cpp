@@ -1040,6 +1040,13 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
         }
         result.succeed();
         result.tokens = std::move(gen);
+        if (std::getenv("DFLASH_DS4_PARITY_TRACE")) {
+            std::fprintf(stderr, "[ds4-parity-tokens] n=%zu ids=[", result.tokens.size());
+            for (size_t i = 0; i < result.tokens.size(); ++i) {
+                std::fprintf(stderr, "%s%d", i == 0 ? "" : " ", result.tokens[i]);
+            }
+            std::fprintf(stderr, "]\n");
+        }
         result.decode_s = elapsed_s(t1);
         result.accept_rate = accept_rate;
         result.spec_decode_ran = spec_ran;
