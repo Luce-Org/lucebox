@@ -228,6 +228,10 @@ struct ParsedRequest {
     DiskPrefixCachePolicy     disk_cache_policy;
 };
 
+// Resolve the supported output-token aliases in precedence order. Only the
+// selected field is parsed, so malformed lower-priority aliases are ignored.
+int resolve_max_output_tokens(const json & body, int default_max_tokens);
+
 // Build the /props response body. Exposed (non-static) so unit tests
 // can assert on its shape without spinning up a real socket. See
 // docs/specs/props-endpoint.md for the wire contract.

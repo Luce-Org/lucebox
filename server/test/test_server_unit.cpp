@@ -1562,6 +1562,18 @@ static void test_pflash_raw_body_preserved() {
     TEST_ASSERT(req.raw_body["temperature"].get<float>() > 0.6f);
 }
 
+static void test_max_output_alias_precedence_ignores_shadowed_invalid_value() {
+    const json body = {
+        {"max_tokens", 100},
+        {"max_output_tokens", 200},
+        {"max_completion_tokens", "invalid"},
+    };
+
+    TEST_ASSERT(resolve_max_output_tokens(body, 400) == 100);
+    TEST_ASSERT(resolve_max_output_tokens({{"max_output_tokens", 200}}, 400) == 200);
+    TEST_ASSERT(resolve_max_output_tokens(json::object(), 400) == 400);
+}
+
 static void test_pflash_placement_same_backend_local() {
     DevicePlacement target;
     target.backend = compiled_placement_backend();
@@ -4555,6 +4567,7 @@ int main() {
     RUN_TEST(test_pflash_curve_empty_uses_flat);
     RUN_TEST(test_pflash_upstream_proxy_config);
     RUN_TEST(test_pflash_raw_body_preserved);
+    RUN_TEST(test_max_output_alias_precedence_ignores_shadowed_invalid_value);
     RUN_TEST(test_pflash_placement_same_backend_local);
     RUN_TEST(test_pflash_placement_mixed_backend_remote);
     RUN_TEST(test_pflash_placement_auto_draft_follows_target);
