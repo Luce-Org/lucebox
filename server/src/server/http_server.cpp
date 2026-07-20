@@ -378,6 +378,19 @@ static size_t json_array_size(const json & value) {
     return value.is_array() ? value.size() : 0;
 }
 
+int resolve_max_output_tokens(const json & body, int default_max_tokens) {
+    if (body.contains("max_tokens")) {
+        return body.at("max_tokens").get<int>();
+    }
+    if (body.contains("max_output_tokens")) {
+        return body.at("max_output_tokens").get<int>();
+    }
+    if (body.contains("max_completion_tokens")) {
+        return body.at("max_completion_tokens").get<int>();
+    }
+    return default_max_tokens;
+}
+
 static bool env_flag_enabled(const char * name) {
     const char * raw = std::getenv(name);
     if (!raw || !*raw) return false;
@@ -1409,9 +1422,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         // default protects thinking-budget requests that omit max_tokens
         // from being capped at 4096 — thinking alone can consume that,
         // leaving no headroom for the visible reply.
-        req.max_output = body.value("max_tokens",
-                         body.value("max_output_tokens",
-                         body.value("max_completion_tokens", config_.default_max_tokens)));
+        req.max_output = resolve_max_output_tokens(body, config_.default_max_tokens);
         // Spec §4.4: clamp request max_tokens to --default-max-tokens.
         if (req.max_output > config_.default_max_tokens) {
             std::fprintf(stderr,
