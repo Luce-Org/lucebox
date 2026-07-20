@@ -110,7 +110,8 @@ DSpark context-KV reuse. `DFLASH_DS4_TOPK=4` is an explicit approximate
 inference policy; omit it when model-default top-6 quality is required.
 
 On 2026-07-19, the clean dual-architecture build produced steady 50.7 and
-50.8 tok/s decode runs on the deterministic integer-list workload (128 output
+50.8 tok/s decode runs on the deterministic integer-list workload (the
+53-token prompt includes the explicit default system message; 128 output
 tokens, q=4, acceptance 1.00). Mean draft time was 6.1 ms and mean target
 verification was 70.7--70.9 ms. With the same prompt and the same 1.00
 acceptance, incorrectly splitting boundary-spanning verification into q=3 and
@@ -210,8 +211,11 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | `DFLASH_EXPERT_BUDGET_MB` | R9700 memory budget used to select locally resident hot experts. |
 | `DFLASH_DS4_HOTNESS_CSV` | Optional per-layer expert routing profile used for hot placement. |
 | `DFLASH_DS4_FUSED_VERIFY` | Enable the persistent q-wide target verification graph. |
+| `DFLASH_DS4_DENSE_TP_MASK` | Experimental row splitting for dense projections. This is automatically disabled when fused verification is enabled because split-buffer weights are not compatible with verifier graph replay. |
 | `DFLASH_DS4_TP_DEVICE_JOIN` | Join expert-owner results on device instead of through a host reduction. |
 | `DFLASH_DS4_DRAFT_CONTEXT_KV_CACHE` | Reuse DSpark context projection/KV state between speculative steps. |
+| `DFLASH_DS4_ADAPTIVE_WIDTH` | Set to `1` to select q=2/3/4 from DSpark confidence; `0` keeps the configured fixed verify width. If unset, the legacy `/tmp/ds4_awidth` control remains supported. |
+| `DFLASH_DS4_DRAFT_AHEAD` | On an independent in-process draft backend, launch the next proposal concurrently with target verification. The target still validates every candidate. |
 
 `DFLASH_DS4_TIMING` enables the existing timing banners:
 
