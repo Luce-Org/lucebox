@@ -1431,7 +1431,8 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
         env_flag_enabled("DFLASH_DS4_TP_DYNAMIC_HOTSET");
     if (dynamic_hotset) {
         if (!moe_hybrid_ || !expert_backend_ || !routing_stats_) {
-            result.error = "dynamic hotset requires in-process heterogeneous MoE TP";
+            result.fail(GenerateErrorCode::BackendSpecific,
+                        "dynamic hotset requires in-process heterogeneous MoE TP");
             return result;
         }
         // A previous request may have installed its own placement.  Restore
@@ -1443,12 +1444,14 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
             std::fprintf(stderr,
                          "[deepseek4-moe-tp] dynamic-hotset restore failed: %s\n",
                          err.c_str());
-            result.error = "dynamic hotset restore";
+            result.fail(GenerateErrorCode::BackendSpecific,
+                        "dynamic hotset restore");
             return result;
         }
         if (!routing_stats_->init(w_.n_layer, w_.n_expert,
                                   w_.n_expert_used)) {
-            result.error = "dynamic hotset stats reset";
+            result.fail(GenerateErrorCode::BackendSpecific,
+                        "dynamic hotset stats reset");
             return result;
         }
     }
@@ -1477,7 +1480,8 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
             const int slots = moe_hybrid_->layers[(size_t) il].hot_active;
             std::vector<int> ranked = routing_stats_->hot_experts(il, slots);
             if ((int) ranked.size() != slots) {
-                result.error = "dynamic hotset empty prefill routes";
+                result.fail(GenerateErrorCode::BackendSpecific,
+                            "dynamic hotset empty prefill routes");
                 return result;
             }
             auto & ids = request_hot[(size_t) il];
@@ -1493,7 +1497,8 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
             std::fprintf(stderr,
                          "[deepseek4-moe-tp] dynamic-hotset install failed: %s\n",
                          err.c_str());
-            result.error = "dynamic hotset install";
+            result.fail(GenerateErrorCode::BackendSpecific,
+                        "dynamic hotset install");
             return result;
         }
         const double adapt_s = elapsed_s(adapt_t0);

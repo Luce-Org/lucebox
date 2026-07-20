@@ -640,7 +640,7 @@ static bool ds4_build_fused_verify_graph(
         ggml_tensor * router_weights = nullptr;
         std::vector<ggml_tensor *> router_nodes;
         if (hash_routed) {
-            const int route_width = ds4_effective_expert_topk(w);
+            const int route_width = ds4_effective_expert_count(w);
             // Keep one q-wide input for host filling and give each wavefront
             // lane a zero-copy two-column view.
             ggml_tensor * hids_all = fg.hash_ids[(size_t) il];

@@ -480,8 +480,7 @@ void spec_rollback_apply(const DeepSeek4SpecRollback & rb, const DeepSeek4Weight
             const DeepSeek4SpecRollback::Layer & s = rb.layers[il];
             const int first_rejected = std::max(0, commit_pos - rb.raw_pos);
             for (int t = first_rejected;
-                 t < rb.raw_count &&
-                 s.raw_row_bytes > 0 &&
+                 t < rb.raw_count && s.raw_row_bytes > 0;
                  ++t) {
                 int row = (rb.raw_pos + t) % (int) lc.raw_kv->ne[1];
                 if (row < 0) row += (int) lc.raw_kv->ne[1];

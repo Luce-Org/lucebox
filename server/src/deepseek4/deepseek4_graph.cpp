@@ -3674,6 +3674,12 @@ bool deepseek4_step(
 // while a variant recurs, which is what the ggml-cuda/HIP graph cache keys
 // on, enabling graph replay for the bulk of decode steps.
 
+static bool ds4_fused_decode_enabled() {
+    static const bool enabled =
+        ds4_env_flag("DFLASH_DS4_FUSED_DECODE");
+    return enabled;
+}
+
 struct DeepSeek4FusedDecodeGraph {
     struct RoutePredictionOutput {
         int source_layer = -1;
@@ -4477,13 +4483,25 @@ bool deepseek4_step_layer_range(
     const int hc_dim = n_hc * n_embd;
     const bool is_last_shard = (layer_end >= w.n_layer);
 
+    const bool fused_hybrid_ready =
+        moe_hybrid && !expert_runtime &&
+        moe_hybrid->materialized_cold_experts &&
+        moe_hybrid->cold_backend_kind == MoeHybridColdBackend::Gpu &&
+        moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend;
+    const bool fused_verify_candidate =
+        (!moe_hybrid || fused_hybrid_ready) &&
+        n_tokens >= 2 && n_tokens <= 4 && verify_hooks &&
+        layer_begin == 0 && is_last_shard && out_logits &&
+        ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled();
+
     // A dynamic batch may be supplied by callers other than the DSpark
     // verifier. Split it whenever it spans a learned-compressor boundary:
     // each sub-forward then writes at most one window and, if present, its
     // boundary is the final token. This preserves the same pool/rotate order
     // as sequential execution while retaining safe batched prefixes.
     const int first_chunk = deepseek4_safe_compressor_batch_tokens(w, kv_start, n_tokens);
-    if (first_chunk > 0 && first_chunk < n_tokens) {
+    if (first_chunk > 0 && first_chunk < n_tokens &&
+        !fused_verify_candidate) {
         const int input_width = layer_begin == 0 ? n_embd : hc_dim;
         std::vector<float> hc_all;
         std::vector<float> shard_out_all;
@@ -4642,11 +4660,6 @@ bool deepseek4_step_layer_range(
     const int n_expert_used = ds4_effective_expert_count(w);
     scratch.ensure(w.ctx, n_tokens, n_embd, n_hc, n_expert_used);
 
-    const bool fused_hybrid_ready =
-        moe_hybrid && !expert_runtime &&
-        moe_hybrid->materialized_cold_experts &&
-        moe_hybrid->cold_backend_kind == MoeHybridColdBackend::Gpu &&
-        moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend;
     // The batched verifier graph is also the only whole-model graph that can
     // currently own tensors on both GPU backends.  Reuse it for q=1 hybrid
     // decode so native AR does not fall back to 43 host-synchronized FFN
@@ -4693,6 +4706,16 @@ bool deepseek4_step_layer_range(
             cache.cur_pos = np;
             if (telemetry) telemetry->total_us += ds4_elapsed_us(step_t0, Ds4TimingClock::now());
             return true;
+        }
+        // The generic dynamic graph cannot safely span a learned-compressor
+        // boundary. A fused candidate deliberately bypassed the splitter
+        // above because the fused graph models that boundary explicitly. If
+        // graph construction was unavailable, fail closed instead of running
+        // an unsafe dynamic batch or silently degrading into q=3 + q=1.
+        if (first_chunk > 0 && first_chunk < n_tokens) {
+            std::fprintf(stderr,
+                         "[ds4-fused-verify] boundary-spanning graph unavailable\n");
+            return false;
         }
     }
     std::vector<float> fused_debug_logits;
