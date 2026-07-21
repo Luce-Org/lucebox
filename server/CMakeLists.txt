@@ -15,6 +15,15 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# MSVC: treat source files as UTF-8 (the codebase contains UTF-8 string
+# literals such as  tags). Without this, MSVC defaults to the system
+# code page and emits C4819 warnings or garbles multi-byte literals.
+# Use a generator expression so /utf-8 is NOT passed to nvcc (which would
+# misinterpret the leading slash as a file path).
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>)
+endif()
+
 # ── nlohmann/json (header-only, prefer system install, fallback to download) ──
 find_package(nlohmann_json CONFIG QUIET)
 if(NOT nlohmann_json_FOUND)

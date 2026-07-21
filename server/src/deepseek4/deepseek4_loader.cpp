@@ -31,7 +31,6 @@
 #include <vector>
 #include <thread>
 #include <atomic>
-#include <unistd.h>
 #include <fcntl.h>
 
 extern "C" bool ggml_backend_cuda_buffer_is_managed(ggml_backend_buffer_t buffer);
@@ -51,9 +50,70 @@ namespace {
 struct DS4Mmap {
     void *  addr = nullptr;
     size_t  len  = 0;
+#if defined(_WIN32)
+    HANDLE  hFile = INVALID_HANDLE_VALUE;
+    HANDLE  hMap  = nullptr;
+#else
     int     fd   = -1;
+#endif
+
+    bool is_fd_open() const {
+#if defined(_WIN32)
+        return hFile != INVALID_HANDLE_VALUE;
+#else
+        return fd >= 0;
+#endif
+    }
+    void close_fd() {
+#if defined(_WIN32)
+        if (hFile != INVALID_HANDLE_VALUE) { CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; }
+#else
+        if (fd >= 0) { ::close(fd); fd = -1; }
+#endif
+    }
 
     bool open_ro(const std::string & path, std::string & err) {
+#if defined(_WIN32)
+        // Convert UTF-8 path to UTF-16 for CreateFileW — CreateFileA uses the
+        // active ANSI code page and fails on non-ASCII paths (e.g. CJK chars).
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+        if (wlen == 0) {
+            err = "MultiByteToWideChar: " + path + ": error " + std::to_string(GetLastError());
+            return false;
+        }
+        std::wstring wpath(wlen, L'\0');
+        if (MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen) == 0) {
+            err = "MultiByteToWideChar (fill): " + path + ": error " + std::to_string(GetLastError());
+            return false;
+        }
+
+        hFile = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            err = "CreateFileW: " + path + ": error " + std::to_string(GetLastError());
+            return false;
+        }
+        LARGE_INTEGER sz;
+        if (!GetFileSizeEx(hFile, &sz)) {
+            err = "GetFileSizeEx: error " + std::to_string(GetLastError());
+            CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE;
+            return false;
+        }
+        len = (size_t)sz.QuadPart;
+        hMap = CreateFileMappingW(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (!hMap) {
+            err = "CreateFileMappingW: error " + std::to_string(GetLastError());
+            CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE;
+            return false;
+        }
+        addr = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+        if (!addr) {
+            err = "MapViewOfFile: error " + std::to_string(GetLastError());
+            CloseHandle(hMap); hMap = nullptr;
+            CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE;
+            return false;
+        }
+#else
         fd = ::open(path.c_str(), O_RDONLY);
         if (fd < 0) { err = "open: " + path + " " + strerror(errno); return false; }
         struct stat st;
@@ -61,11 +121,18 @@ struct DS4Mmap {
         len = (size_t)st.st_size;
         addr = ::mmap(nullptr, len, PROT_READ, MAP_PRIVATE, fd, 0);
         if (addr == MAP_FAILED) { err = "mmap"; addr = nullptr; ::close(fd); fd = -1; return false; }
+#endif
         return true;
     }
     void close_map() {
+#if defined(_WIN32)
+        if (addr) { UnmapViewOfFile(addr); addr = nullptr; }
+        if (hMap) { CloseHandle(hMap); hMap = nullptr; }
+        if (hFile != INVALID_HANDLE_VALUE) { CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; }
+#else
         if (addr) { ::munmap(addr, len); addr = nullptr; }
         if (fd >= 0) { ::close(fd); fd = -1; }
+#endif
     }
 };
 
@@ -504,7 +571,12 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         a.file_offset = data_offset + a.tensor_offset;
     }
 
+#if !defined(_WIN32)
     bool fast_managed = (buf != nullptr) && ggml_backend_cuda_buffer_is_managed(buf) && (getenv("DFLASH_NO_PREAD") == nullptr);
+#else
+    // pread/posix_fadvise not available on Windows; fall back to mmap path.
+    bool fast_managed = false;
+#endif
     if (fast_managed) {
         // Unified/managed buffer: read weights straight off disk into it in parallel at
         // disk bandwidth, instead of mmap page-faults (~5x slower). Drop the cached file
@@ -522,8 +594,12 @@ bool load_deepseek4_gguf_partial(const std::string & path,
                 char * dst = (char *) a.tensor->data;
                 size_t done = 0;
                 while (done < a.file_size) {
+#if !defined(_WIN32)
                     ssize_t r = pread(mmap.fd, dst + done, a.file_size - done,
-                                      (off_t) (a.file_offset + done));
+                              (off_t) (a.file_offset + done));
+#else
+                    int r = -1;  // not reached: fast_managed is false on Windows
+#endif
                     if (r <= 0) { read_ok = false; return; }
                     done += (size_t) r;
                 }
@@ -532,7 +608,9 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         std::vector<std::thread> pool;
         for (unsigned t = 0; t < nth; t++) pool.emplace_back(worker);
         for (auto & th : pool) th.join();
+#if !defined(_WIN32)
         posix_fadvise(mmap.fd, 0, (off_t) mmap.len, POSIX_FADV_DONTNEED);
+#endif
         ggml_backend_synchronize(backend);  // make CPU-written managed pages visible to GPU
         if (!read_ok) {
             set_last_error("parallel weight read failed");
@@ -809,10 +887,7 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
         if (err) *err = mmap_err;
         return false;
     }
-    if (mmap.fd >= 0) {
-        ::close(mmap.fd);
-        mmap.fd = -1;
-    }
+    mmap.close_fd();
 
     const size_t data_start = gguf_get_data_offset(gctx);
     const auto * file_bytes = static_cast<const uint8_t *>(mmap.addr);

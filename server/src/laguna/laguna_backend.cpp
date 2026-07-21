@@ -45,6 +45,11 @@
 #include <sstream>
 #include "common/gguf_mmap.h"
 
+#if defined(_WIN32)
+#define setenv(name, value, overwrite) _putenv_s(name, value)
+#define unsetenv(name) _putenv_s(name, "")
+#endif
+
 namespace dflash::common {
 
 namespace {

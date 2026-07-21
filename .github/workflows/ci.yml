@@ -289,3 +289,52 @@ jobs:
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
             -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq'
+
+  build-windows:
+    name: Build Windows (cmake + MSVC + CUDA, dflash_common)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Set up MSVC Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@a102174a2b586eec2ea151a69e6fd14404a8ce7c # v1.13.0
+        with:
+          arch: x64
+
+      - name: Set up CUDA Toolkit 13.3
+        uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
+        with:
+          cuda: '13.3.0'
+          method: network
+          sub-packages: '["nvcc", "cudart-dev", "thrust", "driver-dev"]'
+
+      - name: Configure (cmake)
+        working-directory: server
+        shell: cmd
+        run: |
+          cmake -B build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_CUDA_ARCHITECTURES="75" ^
+            -DDFLASH27B_ENABLE_BSA=OFF ^
+            -DDFLASH27B_FA_ALL_QUANTS=OFF ^
+            -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe"
+
+      - name: Build dflash_common
+        working-directory: server
+        shell: cmd
+        run: cmake --build build --target dflash_common -j 4
+
+      - name: Verify library output
+        shell: pwsh
+        run: |
+          $lib = Get-ChildItem server/build -Recurse -Filter "dflash_common.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $lib) {
+            Write-Error "dflash_common.lib not found in build output"
+            exit 1
+          }
+          Write-Host "Built: $($lib.FullName)"
+          Write-Host "Size: $([math]::Round($lib.Length / 1MB, 2)) MB"

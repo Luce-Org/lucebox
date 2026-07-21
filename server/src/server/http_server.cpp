@@ -62,6 +62,9 @@ static inline const char* sock_strerror() {
     snprintf(buf, sizeof(buf), "WSA error %d", WSAGetLastError());
     return buf;
 }
+static inline int  sock_errno()          { return WSAGetLastError(); }
+static inline bool sock_is_eintr (int e) { return e == WSAEINTR; }
+static inline bool sock_is_eagain(int e) { return e == WSAEWOULDBLOCK; }
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -73,6 +76,9 @@ static inline void socket_close(int fd) { ::close(fd); }
 #define SETSOCKOPT_CAST  /* empty on POSIX */
 #include <unistd.h>
 static inline const char* sock_strerror() { return strerror(errno); }
+static inline int  sock_errno()          { return errno; }
+static inline bool sock_is_eintr (int e) { return e == EINTR; }
+static inline bool sock_is_eagain(int e) { return e == EAGAIN || e == EWOULDBLOCK; }
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -957,13 +963,13 @@ static bool sse_try_send(int fd, const void * data, size_t len) {
         int ret;
         do {
             ret = poll(&pfd, 1, (int)(remaining < 50 ? remaining : 50));
-        } while (ret < 0 && errno == EINTR);
+        } while (ret < 0 && sock_is_eintr(sock_errno()));
         if (ret < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
         if (ret == 0) continue;
 
         ssize_t n = ::send(fd, p + sent, len - sent, MSG_NOSIGNAL);
         if (n < 0) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            if (sock_is_eintr(sock_errno()) || sock_is_eagain(sock_errno())) continue;
             return false;
         }
         sent += n;
@@ -1091,6 +1097,13 @@ int HttpServer::run() {
 #if !defined(_WIN32)
     // Ignore SIGPIPE so send() returns EPIPE instead of killing the process.
     signal(SIGPIPE, SIG_IGN);
+#else
+    // Initialise Winsock — required before any socket call on Windows.
+    WSADATA wsa_data;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
+        std::fprintf(stderr, "[server] WSAStartup() failed: %d\n", WSAGetLastError());
+        return 1;
+    }
 #endif
 
     // Create listen socket.
@@ -1155,7 +1168,7 @@ int HttpServer::run() {
         int pr = poll(&pfd, 1, 200 /* ms */);
         if (pr <= 0) {
             // 0 = timeout (re-check stopping_); <0 with EINTR = signal. Both loop.
-            if (pr < 0 && errno != EINTR) {
+            if (pr < 0 && !sock_is_eintr(sock_errno())) {
                 std::fprintf(stderr, "[server] poll() error: %s\n", sock_strerror());
             }
             continue;
@@ -1166,7 +1179,7 @@ int HttpServer::run() {
         int client_fd = accept(listen_fd_, (struct sockaddr *)&client_sa, &client_len);
         if (client_fd < 0) {
             if (stopping_.load()) break;
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            if (sock_is_eintr(sock_errno()) || sock_is_eagain(sock_errno())) continue;
             std::fprintf(stderr, "[server] accept() error: %s\n", sock_strerror());
             continue;
         }
@@ -1222,6 +1235,15 @@ int HttpServer::run() {
         }
         slot_tokens_.clear();
     }
+
+#if defined(_WIN32)
+    // Intentionally NOT calling WSACleanup() here. Detached client threads
+    // may still be running after the 5-second shutdown grace period (e.g. a
+    // client mid-stream on a long SSE generation). Tearing down Winsock
+    // underneath them causes spurious socket errors. The OS reclaims all
+    // Winsock resources on process exit, so retaining it for the full process
+    // lifetime is safe and avoids the race.
+#endif
 
     return 0;
 }
@@ -3366,6 +3388,11 @@ ServerJob * HttpServer::dequeue() {
 // ─── HTTP I/O ───────────────────────────────────────────────────────────
 
 bool HttpServer::read_http_request(int fd, HttpRequest & out) {
+#if defined(_WIN32)
+    // On Windows, accept() may return a socket that inherits the non-blocking
+    // mode of the listen socket. Force blocking mode for reliable recv().
+    sock_set_block(fd);
+#endif
     std::string buf;
     buf.reserve(8192);
     char tmp[4096];
@@ -3374,7 +3401,14 @@ bool HttpServer::read_http_request(int fd, HttpRequest & out) {
     ssize_t hend = -1;
     while (hend < 0 && buf.size() < 65536) {
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
-        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && sock_is_eintr(sock_errno())) continue;
+#if defined(_WIN32)
+        if (n < 0 && sock_is_eagain(sock_errno())) {
+            struct pollfd pfd{SOCK_FD(fd), POLLIN, 0};
+            poll(&pfd, 1, 1000);
+            continue;
+        }
+#endif
         if (n <= 0) return false;
         buf.append(tmp, n);
 
@@ -3440,7 +3474,14 @@ bool HttpServer::read_http_request(int fd, HttpRequest & out) {
     // Read body.
     while ((ssize_t)buf.size() < hend + content_length) {
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
-        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && sock_is_eintr(sock_errno())) continue;
+#if defined(_WIN32)
+        if (n < 0 && sock_is_eagain(sock_errno())) {
+            struct pollfd pfd{SOCK_FD(fd), POLLIN, 0};
+            poll(&pfd, 1, 1000);
+            continue;
+        }
+#endif
         if (n <= 0) return false;
         buf.append(tmp, n);
     }
@@ -3464,14 +3505,14 @@ bool HttpServer::send_all(int fd, const void * data, size_t len) {
         int ret;
         do {
             ret = poll(&pfd, 1, timeout);
-        } while (ret < 0 && errno == EINTR);
+        } while (ret < 0 && sock_is_eintr(sock_errno()));
         if (ret < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
         if (ret == 0) continue;  // poll timeout, retry until deadline
 
         ssize_t n = send(fd, p + sent, len - sent, MSG_NOSIGNAL);
         if (n < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            if (sock_is_eintr(sock_errno())) continue;
+            if (sock_is_eagain(sock_errno())) continue;
             return false;  // EPIPE, ECONNRESET, etc.
         }
         sent += n;
