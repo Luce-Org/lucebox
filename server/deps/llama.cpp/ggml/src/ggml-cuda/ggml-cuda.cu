@@ -3366,6 +3366,69 @@ static void ggml_cuda_whole_graph_wait_async(
 }
 #endif
 
+#if defined(GGML_USE_HIP)
+// A scheduler split can have several inputs produced by the same peer GPU.
+// hipMemcpyPeerAsync is already ordered on the producer stream, so publishing
+// and waiting after every individual tensor only adds redundant cross-device
+// dependencies.  Keep the copies ordered on that stream and publish one event
+// immediately before the consumer graph is submitted.
+//
+// This is deliberately opt-in while the heterogeneous path is qualified.  It
+// changes synchronization granularity only: tensor placement, copy direction,
+// and the bytes copied remain identical.
+struct ggml_cuda_pending_peer_copy_batch {
+    ggml_backend_cuda_context * src = nullptr;
+    ggml_backend_cuda_context * dst = nullptr;
+    size_t bytes = 0;
+    int copies = 0;
+};
+
+static thread_local ggml_cuda_pending_peer_copy_batch
+    ggml_cuda_pending_peer_copies;
+
+static bool ggml_cuda_batch_peer_copies_enabled() {
+    static const bool enabled = [] {
+        const char * value = getenv("DFLASH_DS4_TP_BATCH_PEER_COPIES");
+        return value && *value && strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+static void ggml_cuda_flush_peer_copy_batch(const char * reason) {
+    auto & batch = ggml_cuda_pending_peer_copies;
+    if (batch.copies == 0) {
+        return;
+    }
+
+    GGML_ASSERT(batch.src && batch.dst);
+    ggml_cuda_set_device(batch.src->device);
+    if (!batch.src->copy_event) {
+        CUDA_CHECK(cudaEventCreateWithFlags(
+            &batch.src->copy_event, cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventRecord(
+        batch.src->copy_event, batch.src->stream()));
+
+    ggml_cuda_set_device(batch.dst->device);
+    CUDA_CHECK(cudaStreamWaitEvent(
+        batch.dst->stream(), batch.src->copy_event, 0));
+
+    static const bool trace = [] {
+        const char * value = getenv("DFLASH_DS4_TP_BATCH_PEER_TRACE");
+        return value && *value && strcmp(value, "0") != 0;
+    }();
+    static thread_local int reports = 0;
+    if (trace && reports++ < 256) {
+        GGML_LOG_INFO(
+            "[ds4-peer-batch] src=%d dst=%d copies=%d bytes=%zu reason=%s\n",
+            batch.src->device, batch.dst->device, batch.copies, batch.bytes,
+            reason);
+    }
+
+    batch = {};
+}
+#endif
+
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
@@ -3394,6 +3457,11 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 
     if (backend_src != backend_dst) {
 #if defined(GGML_USE_HIP)
+        // A pending eager batch must be visible before entering a captured
+        // whole-model transfer path, which supplies its own synchronization.
+        if (ggml_cuda_whole_graph_capture_depth > 0) {
+            ggml_cuda_flush_peer_copy_batch("whole-graph-capture");
+        }
         if (ggml_cuda_whole_graph_capture_depth > 0 &&
             cuda_ctx_src->device != cuda_ctx_dst->device) {
             // Deferred MoE joins are deliberately staged at producer-split
@@ -3466,11 +3534,34 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 #endif
         // copy on src stream
         if (cuda_ctx_src->device == cuda_ctx_dst->device) {
+#if defined(GGML_USE_HIP)
+            ggml_cuda_flush_peer_copy_batch("same-device-copy");
+#endif
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
         } else {
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
+#if defined(GGML_USE_HIP)
+            if (ggml_cuda_batch_peer_copies_enabled() &&
+                ggml_cuda_whole_graph_capture_depth == 0) {
+                auto & batch = ggml_cuda_pending_peer_copies;
+                if (batch.copies != 0 &&
+                    (batch.src != cuda_ctx_src || batch.dst != cuda_ctx_dst)) {
+                    ggml_cuda_flush_peer_copy_batch("peer-pair-change");
+                }
+                ggml_cuda_set_device(cuda_ctx_src->device);
+                CUDA_CHECK(cudaMemcpyPeerAsync(
+                    dst->data, cuda_ctx_dst->device,
+                    src->data, cuda_ctx_src->device,
+                    ggml_nbytes(dst), cuda_ctx_src->stream()));
+                batch.src = cuda_ctx_src;
+                batch.dst = cuda_ctx_dst;
+                batch.bytes += ggml_nbytes(dst);
+                batch.copies++;
+                return true;
+            }
+#endif
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, cuda_ctx_dst->device, src->data, cuda_ctx_src->device, ggml_nbytes(dst), cuda_ctx_src->stream()));
 #endif // GGML_CUDA_NO_PEER_COPY
         }
@@ -3501,6 +3592,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         ));
     } else {
         // src and dst are on the same backend
+#if defined(GGML_USE_HIP)
+        ggml_cuda_flush_peer_copy_batch("same-backend-copy");
+#endif
         CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
     }
     return true;
@@ -3509,6 +3603,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+#if defined(GGML_USE_HIP)
+    ggml_cuda_flush_peer_copy_batch("backend-synchronize");
+#endif
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
     GGML_UNUSED(backend);
@@ -4682,6 +4779,12 @@ extern "C" void ggml_backend_cuda_set_skip_props_check(bool skip) {
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
+#if defined(GGML_USE_HIP)
+    // This is the consumer boundary for copies accumulated while the generic
+    // scheduler prepared this split.  Publishing here preserves the existing
+    // copy-before-compute dependency with a single event for the whole batch.
+    ggml_cuda_flush_peer_copy_batch("graph-compute");
+#endif
     ggml_cuda_set_device(cuda_ctx->device);
 
     // LIFO-free last evaluation's memoized q8_1 activations.

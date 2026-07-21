@@ -1796,6 +1796,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // All copied inputs for this split use the same destination backend
+        // and scheduler copy generation. Waiting for that generation once is
+        // sufficient before overwriting any of its input buffers. The legacy
+        // loop waited again before every tensor; without scheduler events each
+        // wait synchronizes the whole destination stream and serializes a
+        // multi-input peer handoff.
+        static const bool batch_peer_copies = [] {
+            const char * value =
+                getenv("DFLASH_DS4_TP_BATCH_PEER_COPIES");
+            return value && *value && strcmp(value, "0") != 0;
+        }();
+        bool split_copy_generation_ready = false;
+        auto wait_for_split_copy_generation = [&]() {
+            if (batch_peer_copies && split_copy_generation_ready) {
+                return;
+            }
+            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_wait(
+                    split_backend,
+                    sched->events[split_backend_id][sched->cur_copy]);
+            } else {
+                ggml_backend_synchronize(split_backend);
+            }
+            split_copy_generation_ready = true;
+        };
+
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
@@ -1819,16 +1845,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     } else {
                         ggml_backend_synchronize(split_backend);
                     }
+                    split_copy_generation_ready = true;
                     ggml_backend_tensor_copy(input, input_cpy);
                 }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (!sched->whole_graph_capture) {
-                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                        ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-                    } else {
-                        ggml_backend_synchronize(split_backend);
-                    }
+                    wait_for_split_copy_generation();
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
