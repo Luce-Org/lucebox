@@ -1,0 +1,92 @@
+luce-bench
+Copyright 2026 Erik LaBianca
+
+This product includes software developed at Telepath Data
+(https://telepathdata.com) and contributors. Licensed under the
+Apache License, Version 2.0 (the "License"); you may not use this
+file except in compliance with the License. See the LICENSE file
+for the License governing permissions and limitations.
+
+────────────────────────────────────────────────────────────────────
+
+This product redistributes vendored evaluation fixtures from the
+following upstream projects. Each is preserved verbatim under its
+upstream license; the SPDX identifier and source are documented in
+the per-fixture README/header where space allows.
+
+  src/lucebench/fixtures/ds4_eval_cases.json
+    Source:  antirez/ds4   (https://github.com/antirez/ds4)
+    Origin:  ds4_eval.c — the `eval_cases` array, transcribed verbatim
+    License: MIT
+    SPDX:    MIT
+    Copyright (c) 2026 The ds4.c authors
+
+  src/lucebench/fixtures/humaneval/cases.json
+    Source:  openai/human-eval   (https://github.com/openai/human-eval)
+    Origin:  10-prompt HumanEval-style code-completion subset used by
+             lucebox autotune; functionally equivalent to the canonical
+             release with no problem text modifications.
+    License: MIT
+    SPDX:    MIT
+    Copyright (c) 2021 OpenAI
+
+  src/lucebench/fixtures/gsm8k/cases.jsonl
+    Source:  openai/gsm8k   (https://huggingface.co/datasets/openai/gsm8k)
+    Origin:  100-case Random(42) sample of the test split (main config),
+             vendored as JSONL so the runtime has no `datasets`
+             dependency. Each row preserves the upstream `question` (as
+             `prompt`), the parsed numeric final answer (`expected`),
+             and the full upstream `answer` walkthrough.
+    License: MIT
+    SPDX:    MIT
+    Copyright (c) 2021 OpenAI
+
+  src/lucebench/fixtures/truthfulqa_mc1/cases.jsonl
+    Source:  truthful_qa   (https://huggingface.co/datasets/truthful_qa)
+    Origin:  100-case Random(42) sample of the validation split,
+             multiple_choice config (mc1_targets). Vendored as JSONL so
+             the runtime has no `datasets` dependency. Each row preserves
+             the upstream `question` and the choice list with its 0/1
+             label; the loader resolves the single positive into an
+             ``expected`` letter.
+    License: Apache-2.0
+    SPDX:    Apache-2.0
+    Copyright (c) 2021 Stephanie Lin, Jacob Hilton, Owain Evans
+
+  src/lucebench/fixtures/hellaswag/cases.jsonl
+    Source:  Rowan/hellaswag   (https://huggingface.co/datasets/Rowan/hellaswag)
+    Origin:  100-case Random(42) sample of the validation split.
+             Vendored as JSONL so the runtime has no `datasets`
+             dependency. Each row preserves the upstream ``ctx`` and
+             the four ``endings``; the loader resolves the integer
+             ``label`` into an ``expected`` letter (A..D).
+    License: MIT
+    SPDX:    MIT
+    Copyright (c) 2019 Rowan Zellers, Ari Holtzman, Yonatan Bisk,
+                      Ali Farhadi, Yejin Choi
+
+  src/lucebench/fixtures/forge_eval/
+    Source:  antoinezambelli/forge   (https://github.com/antoinezambelli/forge)
+    Version: 0.7.1 (vendored)
+    Origin:  forge-guardrails tool-calling evaluation scenarios; the
+             scenarios and run_eval driver are redistributed under the
+             upstream MIT license. The Anthropic-shape runtime adapter
+             (_forge/) is also vendored.
+    License: MIT
+    SPDX:    MIT
+    Copyright (c) 2025-2026 Antoine Zambelli
+
+  src/lucebench/fixtures/agent_recorded/cases.json
+    Source:  own — mined from local Claude Code + Codex session logs
+             (~/.claude/projects, ~/.codex/sessions) by
+             scripts/extract-agentic-fixture.py with PII stripped at
+             collection time ($HOME → <HOME>, credential-shaped values
+             → <REDACTED>, tool_result bodies dropped, reasoning
+             content dropped).
+    Origin:  Used by the agent_recorded area (three-bin tool-schema
+             coverage grader). Refresh by re-running the collector with
+             --scan on a machine with new sessions; the schema is
+             versioned as lucebox-bench-agent-recorded-v1.
+    License: Apache-2.0 (own work)
+    SPDX:    Apache-2.0
+    Copyright (c) 2026 Erik LaBianca
