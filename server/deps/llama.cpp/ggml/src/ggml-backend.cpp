@@ -807,6 +807,15 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_backend_sched_deferred_peer_copy {
+    struct ggml_tensor * node;
+    struct ggml_tensor * source;
+    ggml_backend_event_t event;
+    int producer_backend_id;
+    int producer_split_id;
+    int consumer_split_id;
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -853,6 +862,20 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+    bool whole_graph_capture;
+
+    // When a new cross-backend dependency first appears after executable
+    // nodes in a split, end the current split before the dependent node. This
+    // lets independent work already in the split be enqueued before the
+    // cross-backend copy/event wait is attached to the following split.
+    bool late_cross_input_split;
+    const struct ggml_tensor ** late_cross_input_split_nodes;
+    int n_late_cross_input_split_nodes;
+    int late_cross_input_split_nodes_capacity;
+
+    struct ggml_backend_sched_deferred_peer_copy * deferred_peer_copies;
+    int n_deferred_peer_copies;
+    int deferred_peer_copies_capacity;
 
     int debug;
 
@@ -867,6 +890,37 @@ struct ggml_backend_sched {
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+
+static bool ggml_backend_sched_is_late_cross_input_split_node(
+        const ggml_backend_sched_t sched,
+        const struct ggml_tensor * node) {
+    for (int i = 0; i < sched->n_late_cross_input_split_nodes; ++i) {
+        if (sched->late_cross_input_split_nodes[i] == node) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static struct ggml_backend_sched_deferred_peer_copy *
+ggml_backend_sched_find_deferred_peer_copy(
+        const ggml_backend_sched_t sched,
+        const struct ggml_tensor * node) {
+    for (int i = 0; i < sched->n_deferred_peer_copies; ++i) {
+        if (sched->deferred_peer_copies[i].node == node) {
+            return &sched->deferred_peer_copies[i];
+        }
+    }
+    return nullptr;
+}
+
+static bool ggml_backend_sched_deferred_peer_split_enabled() {
+    static const bool enabled = [] {
+        const char * raw = getenv("DFLASH_DS4_TP_DEVICE_JOIN_SPLIT");
+        return raw && *raw && strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
 
 // returns the priority of the backend, lower id is higher priority
 static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backend_t backend) {
@@ -1292,6 +1346,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->i_start = 0;
         split->n_inputs = 0;
         int cur_backend_id = split->backend_id;
+        bool split_has_compute = false;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
 
@@ -1305,6 +1360,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
+            // HIP graph replay on the R9700 currently gates an entire graph
+            // when a cross-device event wait is captured inside it, even if
+            // independent hot/shared nodes precede the wait. The opt-in
+            // three-stage schedule ends the main-owner prefix here:
+            //   Strix cold -> R9700 hot/shared -> R9700 wait/copy/join.
+            // The external stream wait is queued only after the useful prefix
+            // graph, allowing both owner branches to execute concurrently.
+            if (ggml_backend_sched_deferred_peer_split_enabled() &&
+                node_backend_id == cur_backend_id &&
+                split_has_compute &&
+                ggml_backend_sched_find_deferred_peer_copy(sched, node)) {
+                need_new_split = true;
+            }
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
@@ -1334,6 +1402,37 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             }
 
+            // The normal scheduler copies every foreign input before it
+            // launches any node in a split. If a foreign input is first used
+            // by a late join, attaching it to the existing split needlessly
+            // makes independent work at the start of that split wait. End the
+            // split immediately before that join instead. Existing copies do
+            // not require a new split because their dependency was already
+            // established by an earlier split.
+            const bool split_late_cross_input =
+                sched->late_cross_input_split ||
+                ggml_backend_sched_is_late_cross_input_split_node(sched, node);
+            if (split_late_cross_input &&
+                node_backend_id == cur_backend_id &&
+                split_has_compute && !need_new_split) {
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    struct ggml_tensor * src = node->src[j];
+                    if (src == NULL) {
+                        continue;
+                    }
+                    const size_t src_id = hash_id(src);
+                    const int src_backend_id = sched->hv_tensor_backend_ids[src_id];
+                    const bool supported =
+                        ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
+                    if (src_backend_id != cur_backend_id &&
+                        tensor_id_copy(src_id, cur_backend_id, 0) == NULL &&
+                        !supported) {
+                        need_new_split = true;
+                        break;
+                    }
+                }
+            }
+
             if (node_backend_id != cur_backend_id || need_new_split) {
                 split->i_end = i;
                 i_split++;
@@ -1348,6 +1447,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->i_start = i;
                 split->n_inputs = 0;
                 cur_backend_id = node_backend_id;
+                split_has_compute = false;
             }
 
             // find inputs that are not on the same backend
@@ -1383,7 +1483,17 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                 }
 
-                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                const bool deferred_peer_src =
+                    j == 0 &&
+                    ggml_backend_sched_find_deferred_peer_copy(sched, node) != nullptr;
+                if (src_backend_id != cur_backend_id &&
+                    !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                    if (deferred_peer_src) {
+                        // The destination backend accesses the peer allocation
+                        // directly after the mode -3 op waits on its dedicated
+                        // event. Do not create or substitute a scheduler copy.
+                        continue;
+                    }
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
@@ -1404,9 +1514,78 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                 }
             }
+            split_has_compute = true;
         }
         split->i_end = graph->n_nodes;
         sched->n_splits = i_split + 1;
+    }
+
+    // Resolve every deferred peer copy after split boundaries are final. A
+    // unique event per join is required: reusing one backend event across
+    // dozens of captured waits would let a later record retarget an earlier
+    // graph replay.
+    for (int i = 0; i < sched->n_deferred_peer_copies; ++i) {
+        struct ggml_backend_sched_deferred_peer_copy * deferred =
+            &sched->deferred_peer_copies[i];
+        struct ggml_tensor * node = deferred->node;
+        GGML_ASSERT(node->op == GGML_OP_MOE_FUSED);
+        GGML_ASSERT(ggml_get_op_params_i32(node, 0) == -3);
+        GGML_ASSERT(deferred->source);
+
+        const int producer_backend_id = tensor_backend_id(deferred->source);
+        const int consumer_backend_id = tensor_backend_id(node);
+        GGML_ASSERT(producer_backend_id >= 0);
+        GGML_ASSERT(consumer_backend_id >= 0);
+        GGML_ASSERT(producer_backend_id != consumer_backend_id);
+
+        if (deferred->event == nullptr) {
+            deferred->event = ggml_backend_event_new(
+                sched->backends[producer_backend_id]->device);
+            GGML_ASSERT(deferred->event);
+        }
+        deferred->producer_backend_id = producer_backend_id;
+        deferred->producer_split_id = -1;
+        deferred->consumer_split_id = -1;
+
+        int producer_node_id = -1;
+        int consumer_node_id = -1;
+        for (int node_id = 0; node_id < graph->n_nodes; ++node_id) {
+            if (graph->nodes[node_id] == deferred->source) {
+                producer_node_id = node_id;
+            }
+            if (graph->nodes[node_id] == node) {
+                consumer_node_id = node_id;
+            }
+        }
+        GGML_ASSERT(producer_node_id >= 0);
+        GGML_ASSERT(consumer_node_id >= 0);
+        for (int split_id = 0; split_id < sched->n_splits; ++split_id) {
+            const struct ggml_backend_sched_split * split =
+                &sched->splits[split_id];
+            if (producer_node_id >= split->i_start &&
+                producer_node_id < split->i_end) {
+                deferred->producer_split_id = split_id;
+            }
+            if (consumer_node_id >= split->i_start &&
+                consumer_node_id < split->i_end) {
+                deferred->consumer_split_id = split_id;
+            }
+        }
+        GGML_ASSERT(deferred->producer_split_id >= 0);
+        GGML_ASSERT(deferred->consumer_split_id >= 0);
+        GGML_ASSERT(
+            sched->splits[deferred->producer_split_id].backend_id ==
+            producer_backend_id);
+
+        void * event_context = deferred->event->context;
+        static_assert(
+            2 * sizeof(int32_t) + sizeof(event_context) <=
+            GGML_MAX_OP_PARAMS,
+            "deferred event handle does not fit op_params");
+        memcpy(&node->op_params[2], &event_context, sizeof(event_context));
+        ggml_set_op_params_i32(
+            node, 7,
+            ggml_backend_sched_deferred_peer_split_enabled() ? 1 : 0);
     }
 
     if (sched->debug) {
@@ -1580,6 +1759,69 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        // Diagnostic control for cross-device event semantics. This preserves
+        // the exact graph and peer-copy op but resolves its producer events on
+        // the host before launching the consuming split.
+        static const bool deferred_host_wait = [] {
+            const char * raw =
+                getenv("DFLASH_DS4_TP_DEVICE_JOIN_HOST_WAIT");
+            return raw && *raw && strcmp(raw, "0") != 0;
+        }();
+        static const bool deferred_host_copy = [] {
+            const char * raw =
+                getenv("DFLASH_DS4_TP_DEVICE_JOIN_HOST_COPY");
+            return raw && *raw && strcmp(raw, "0") != 0;
+        }();
+        if (deferred_host_wait || deferred_host_copy) {
+            for (int i = 0; i < sched->n_deferred_peer_copies; ++i) {
+                struct ggml_backend_sched_deferred_peer_copy * deferred =
+                    &sched->deferred_peer_copies[i];
+                if (deferred->consumer_split_id == split_id) {
+                    ggml_backend_event_synchronize(deferred->event);
+                    if (deferred_host_copy) {
+                        ggml_backend_tensor_copy(
+                            deferred->source, deferred->node);
+                    }
+                }
+            }
+        }
+        if (ggml_backend_sched_deferred_peer_split_enabled() &&
+            !deferred_host_wait && !deferred_host_copy) {
+            for (int i = 0; i < sched->n_deferred_peer_copies; ++i) {
+                struct ggml_backend_sched_deferred_peer_copy * deferred =
+                    &sched->deferred_peer_copies[i];
+                if (deferred->consumer_split_id == split_id) {
+                    ggml_backend_event_wait(split_backend, deferred->event);
+                }
+            }
+        }
+
+        // All copied inputs for this split use the same destination backend
+        // and scheduler copy generation. Waiting for that generation once is
+        // sufficient before overwriting any of its input buffers. The legacy
+        // loop waited again before every tensor; without scheduler events each
+        // wait synchronizes the whole destination stream and serializes a
+        // multi-input peer handoff.
+        static const bool batch_peer_copies = [] {
+            const char * value =
+                getenv("DFLASH_DS4_TP_BATCH_PEER_COPIES");
+            return value && *value && strcmp(value, "0") != 0;
+        }();
+        bool split_copy_generation_ready = false;
+        auto wait_for_split_copy_generation = [&]() {
+            if (batch_peer_copies && split_copy_generation_ready) {
+                return;
+            }
+            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_wait(
+                    split_backend,
+                    sched->events[split_backend_id][sched->cur_copy]);
+            } else {
+                ggml_backend_synchronize(split_backend);
+            }
+            split_copy_generation_ready = true;
+        };
+
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
@@ -1588,18 +1830,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                if (sched->whole_graph_capture) {
+                    if (!split_backend->iface.cpy_tensor_async ||
+                        !split_backend->iface.cpy_tensor_async(
+                            input_backend, split_backend, input, input_cpy)) {
+                        GGML_LOG_ERROR(
+                            "%s: outer capture requires async graph-input copy\n",
+                            __func__);
+                        return GGML_STATUS_FAILED;
+                    }
                 } else {
-                    ggml_backend_synchronize(split_backend);
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
+                    }
+                    split_copy_generation_ready = true;
+                    ggml_backend_tensor_copy(input, input_cpy);
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-                } else {
-                    ggml_backend_synchronize(split_backend);
+                if (!sched->whole_graph_capture) {
+                    wait_for_split_copy_generation();
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1610,6 +1862,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
                     //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
                     )) {
+
+                    if (sched->whole_graph_capture) {
+                        GGML_LOG_ERROR(
+                            "%s: host expert offload is not capturable\n",
+                            __func__);
+                        return GGML_STATUS_FAILED;
+                    }
 
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
@@ -1691,6 +1950,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                        if (sched->whole_graph_capture) {
+                            GGML_LOG_ERROR(
+                                "%s: outer capture requires async split copy\n",
+                                __func__);
+                            return GGML_STATUS_FAILED;
+                        }
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -1742,8 +2007,62 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // record the event of this copy
-        if (split->n_inputs > 0) {
+        // Publish cold-owner completion before a later main-backend graph
+        // reaches its in-graph event wait. Recording is asynchronous and does
+        // not block the host from immediately enqueueing independent work.
+        for (int i = 0; i < sched->n_deferred_peer_copies; ++i) {
+            struct ggml_backend_sched_deferred_peer_copy * deferred =
+                &sched->deferred_peer_copies[i];
+            if (deferred->producer_split_id == split_id) {
+                GGML_ASSERT(deferred->producer_backend_id == split_backend_id);
+                if (sched->whole_graph_capture) {
+                    const int consumer_backend_id =
+                        sched->splits[deferred->consumer_split_id].backend_id;
+                    ggml_backend_t consumer_backend =
+                        sched->backends[consumer_backend_id];
+                    // The CUDA/HIP backend recognizes the deferred mode -3
+                    // destination and emits a producer-side write into
+                    // coherent staging. Publishing the event immediately
+                    // below orders that write before the consumer's already-
+                    // late wait without putting a wait on the main stream
+                    // ahead of hot/shared work.
+                    if (!consumer_backend->iface.cpy_tensor_async ||
+                        !consumer_backend->iface.cpy_tensor_async(
+                            split_backend, consumer_backend,
+                            deferred->source, deferred->node)) {
+                        GGML_LOG_ERROR(
+                            "%s: outer capture requires deferred source-write copy\n",
+                            __func__);
+                        return GGML_STATUS_FAILED;
+                    }
+                    // Tell mode -3 to copy from coherent staging into its
+                    // local destination instead of issuing a peer read.
+                    ggml_set_op_params_i32(deferred->node, 6, 3);
+                }
+                ggml_backend_event_record(deferred->event, split_backend);
+            }
+        }
+
+        // Graph dispatch has already inspected every node in this split.  Do
+        // not leak the capture-only no-op marker into a later eager warmup or
+        // a freshly recaptured request generation.
+        if (sched->whole_graph_capture) {
+            for (int i = 0; i < sched->n_deferred_peer_copies; ++i) {
+                struct ggml_backend_sched_deferred_peer_copy * deferred =
+                    &sched->deferred_peer_copies[i];
+                if (deferred->consumer_split_id == split_id &&
+                    ggml_get_op_params_i32(deferred->node, 6) == 3) {
+                    ggml_set_op_params_i32(deferred->node, 6, 0);
+                }
+            }
+        }
+
+        // Record the rotating-buffer reuse event only for ordinary scheduler
+        // submissions.  Whole-step capture deliberately keeps cur_copy fixed
+        // and suppresses the corresponding reuse waits, so recording this
+        // same event after every split only creates redundant external graph
+        // nodes (and triggers a HIP graph-capture failure on gfx1151/gfx1201).
+        if (!sched->whole_graph_capture && split->n_inputs > 0) {
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
@@ -1835,6 +2154,11 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);
     free(sched->splits);
+    free(sched->late_cross_input_split_nodes);
+    for (int i = 0; i < sched->n_deferred_peer_copies; ++i) {
+        ggml_backend_event_free(sched->deferred_peer_copies[i].event);
+    }
+    free(sched->deferred_peer_copies);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
     free(sched->node_backend_ids);
@@ -1849,6 +2173,22 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    // Per-graph registrations retain tensor pointers and native events. A
+    // reset explicitly discards that graph, so carrying either list into the
+    // next allocation would dereference stale metadata (and leak the events).
+    sched->n_late_cross_input_split_nodes = 0;
+    if (sched->n_deferred_peer_copies > 0) {
+        // A caller may reset after an asynchronous submission. Do not destroy
+        // producer events while either backend can still reference them.
+        for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+            ggml_backend_synchronize(sched->backends[backend_id]);
+        }
+    }
+    for (int i = 0; i < sched->n_deferred_peer_copies; ++i) {
+        ggml_backend_event_free(sched->deferred_peer_copies[i].event);
+        sched->deferred_peer_copies[i] = {};
+    }
+    sched->n_deferred_peer_copies = 0;
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
@@ -1904,6 +2244,29 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
         return false;
     }
 
+    // The deferred node intentionally has no foreign src edge by allocation
+    // time. Inject the stable peer allocation pointer only after gallocr has
+    // initialized every tensor buffer.
+    for (int i = 0; i < sched->n_deferred_peer_copies; ++i) {
+        struct ggml_backend_sched_deferred_peer_copy * deferred =
+            &sched->deferred_peer_copies[i];
+        GGML_ASSERT(deferred->source->data);
+        void * source_data = deferred->source->data;
+        static_assert(
+            4 * sizeof(int32_t) + sizeof(source_data) <=
+            GGML_MAX_OP_PARAMS,
+            "deferred source pointer does not fit op_params");
+        memcpy(
+            &deferred->node->op_params[4],
+            &source_data, sizeof(source_data));
+
+        const char * host_copy =
+            getenv("DFLASH_DS4_TP_DEVICE_JOIN_HOST_COPY");
+        ggml_set_op_params_i32(
+            deferred->node, 6,
+            host_copy && *host_copy && strcmp(host_copy, "0") != 0 ? 1 : 0);
+    }
+
     sched->is_alloc = true;
 
     return true;
@@ -1943,15 +2306,114 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     }
 }
 
+void ggml_backend_sched_set_whole_graph_capture(
+        ggml_backend_sched_t sched, bool enabled) {
+    GGML_ASSERT(sched);
+    sched->whole_graph_capture = enabled;
+}
+
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
 }
 
+void ggml_backend_sched_set_late_cross_input_split(ggml_backend_sched_t sched, bool enabled) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(!sched->is_alloc);
+    sched->late_cross_input_split = enabled;
+}
+
+void ggml_backend_sched_add_late_cross_input_split_node(
+        ggml_backend_sched_t sched,
+        const struct ggml_tensor * node) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(node);
+    GGML_ASSERT(!sched->is_alloc);
+
+    if (ggml_backend_sched_is_late_cross_input_split_node(sched, node)) {
+        return;
+    }
+    if (sched->n_late_cross_input_split_nodes ==
+        sched->late_cross_input_split_nodes_capacity) {
+        const int new_capacity =
+            sched->late_cross_input_split_nodes_capacity > 0
+                ? 2 * sched->late_cross_input_split_nodes_capacity
+                : 64;
+        const struct ggml_tensor ** nodes =
+            (const struct ggml_tensor **) realloc(
+                sched->late_cross_input_split_nodes,
+                (size_t) new_capacity * sizeof(*nodes));
+        GGML_ASSERT(nodes);
+        sched->late_cross_input_split_nodes = nodes;
+        sched->late_cross_input_split_nodes_capacity = new_capacity;
+    }
+    sched->late_cross_input_split_nodes[
+        sched->n_late_cross_input_split_nodes++] = node;
+}
+
+void ggml_backend_sched_add_deferred_peer_copy_node(
+        ggml_backend_sched_t sched,
+        struct ggml_tensor * node) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(node);
+    GGML_ASSERT(!sched->is_alloc);
+    GGML_ASSERT(node->op == GGML_OP_MOE_FUSED);
+    GGML_ASSERT(ggml_get_op_params_i32(node, 0) == -3);
+
+    if (ggml_backend_sched_find_deferred_peer_copy(sched, node)) {
+        return;
+    }
+    if (sched->n_deferred_peer_copies ==
+        sched->deferred_peer_copies_capacity) {
+        const int new_capacity =
+            sched->deferred_peer_copies_capacity > 0
+                ? 2 * sched->deferred_peer_copies_capacity
+                : 64;
+        struct ggml_backend_sched_deferred_peer_copy * entries =
+            (struct ggml_backend_sched_deferred_peer_copy *) realloc(
+                sched->deferred_peer_copies,
+                (size_t) new_capacity * sizeof(*entries));
+        GGML_ASSERT(entries);
+        sched->deferred_peer_copies = entries;
+        sched->deferred_peer_copies_capacity = new_capacity;
+    }
+    struct ggml_backend_sched_deferred_peer_copy * deferred =
+        &sched->deferred_peer_copies[sched->n_deferred_peer_copies++];
+    *deferred = {};
+    deferred->node = node;
+    GGML_ASSERT(deferred->node->src[0]);
+    deferred->source = deferred->node->src[0];
+    // The full graph is already expanded when nodes are registered. Remove
+    // the foreign edge before backend splitting/allocation; source lifetime is
+    // explicit via GGML_TENSOR_FLAG_OUTPUT and the scheduler entry above.
+    deferred->node->src[0] = nullptr;
+    deferred->producer_backend_id = -1;
+    deferred->producer_split_id = -1;
+    deferred->consumer_split_id = -1;
+}
+
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_splits;
+}
+
+int ggml_backend_sched_get_n_splits_for_backend(
+        ggml_backend_sched_t sched, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    int backend_id = -1;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        if (sched->backends[i] == backend) {
+            backend_id = i;
+            break;
+        }
+    }
+    if (backend_id < 0) return 0;
+    int count = 0;
+    for (int i = 0; i < sched->n_splits; ++i) {
+        if (sched->splits[i].backend_id == backend_id) ++count;
+    }
+    return count;
 }
 
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {

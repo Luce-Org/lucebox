@@ -7,6 +7,7 @@
 #pragma once
 
 #include "common/model_backend.h"
+#include "common/moe_expert_compute.h"
 #include "common/sampler.h"
 #include "../common/moe_hybrid_placement.h"
 #include "../common/moe_hybrid_routing_stats.h"
@@ -14,6 +15,7 @@
 #include "../common/moe_hybrid_stream.h"
 #include "deepseek4_internal.h"
 #include "deepseek4_dspark.h"
+#include "common/dflash_draft_ipc.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -60,10 +62,15 @@ public:
 
     void shutdown() override;
 
+    const MoeHybridRoutingStats * get_routing_stats() const override {
+        return routing_stats_.get();
+    }
+
 private:
     DeepSeek4BackendConfig cfg_;
     ggml_backend_t         backend_      = nullptr;
     ggml_backend_t         snap_backend_ = nullptr;
+    ggml_backend_t         expert_backend_ = nullptr;
     DeepSeek4Weights       w_;
     DeepSeek4Cache         cache_;
     bool                   parked_       = false;
@@ -81,10 +88,13 @@ private:
     bool                           spec_enabled_ = false;
     bool                           spec_drafter_parked_ = false;
     std::string                    spec_draft_path_;
+    ggml_backend_t                 spec_backend_ = nullptr;
     std::unique_ptr<DSparkDrafter> spec_drafter_;
+    std::unique_ptr<DFlashDraftIpcClient> spec_remote_drafter_;
     std::vector<float>             spec_feat_window_;
 
     bool load_spec_drafter();
+    bool start_spec_remote_drafter();
     void release_spec_drafter(bool mark_parked);
 
     // Prefill prompt tokens in chunks, return absolute committed position.
@@ -100,6 +110,9 @@ private:
 
     bool load_model();
     bool init_hybrid_model();
+    bool init_moe_tensor_parallel();
+    bool requires_monolithic_model() const;
+    bool validate_prefill_mode() const;
     bool compute_uniform_hybrid_placement(const DeepSeek4Weights & w,
                                           int max_ctx,
                                           MoeHybridPlacement & out,
@@ -109,9 +122,7 @@ private:
     std::shared_ptr<MoeHybridStorage> moe_hybrid_;
     MoeHybridPlacement                moe_placement_;
     MoeHybridStreamEngine             stream_engine_;
-    // Expert IPC removed — layer split replaces expert split.
-    // Kept for compilation compatibility; init_hybrid_model() is no longer called
-    // from the layer-split path.
+    MoeExpertComputeRuntime            expert_runtime_;
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string                       routing_stats_out_path_;
 };

@@ -236,6 +236,9 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         case GGML_TYPE_I8:
             concat_cuda_typed<int8_t>(ctx, src0, src1, dst, dim);
             break;
+        case GGML_TYPE_I32:
+            concat_cuda_typed<int32_t>(ctx, src0, src1, dst, dim);
+            break;
         default:
             GGML_ABORT("unsupported concat type %s", ggml_type_name(src0->type));
     }

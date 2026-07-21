@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -29,6 +30,7 @@ enum class BackendIpcMode {
     LagunaTargetShard,
     MoeExpertCompute,
     DeepSeek4TargetShard,
+    DeepSeek4DSparkDraft,
 };
 
 const char * backend_ipc_mode_name(BackendIpcMode mode);
@@ -63,6 +65,46 @@ struct BackendIpcSharedPayloadHeader {
     uint64_t sequence = 0;
     uint64_t bytes = 0;
 };
+
+inline void backend_ipc_publish_shared_payload_header(
+        BackendIpcSharedPayloadHeader * header,
+        uint64_t sequence,
+        uint64_t bytes) {
+#if defined(__GNUC__) || defined(__clang__)
+    __atomic_store_n(&header->bytes, bytes, __ATOMIC_RELAXED);
+    __atomic_store_n(&header->sequence, sequence, __ATOMIC_RELEASE);
+#else
+    header->bytes = bytes;
+    std::atomic_thread_fence(std::memory_order_release);
+    header->sequence = sequence;
+#endif
+}
+
+inline void backend_ipc_load_shared_payload_header(
+        const BackendIpcSharedPayloadHeader * header,
+        uint64_t & sequence,
+        uint64_t & bytes) {
+#if defined(__GNUC__) || defined(__clang__)
+    sequence = __atomic_load_n(&header->sequence, __ATOMIC_ACQUIRE);
+    bytes = __atomic_load_n(&header->bytes, __ATOMIC_RELAXED);
+#else
+    sequence = header->sequence;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    bytes = header->bytes;
+#endif
+}
+
+inline bool backend_ipc_shared_payload_header_matches(
+        const BackendIpcSharedPayloadHeader * header,
+        uint64_t sequence,
+        uint64_t bytes) {
+    if (!header || sequence == 0) return false;
+    uint64_t published_sequence = 0;
+    uint64_t published_bytes = 0;
+    backend_ipc_load_shared_payload_header(
+        header, published_sequence, published_bytes);
+    return published_sequence == sequence && published_bytes == bytes;
+}
 
 inline size_t backend_ipc_shared_payload_header_bytes() {
     return sizeof(BackendIpcSharedPayloadHeader);

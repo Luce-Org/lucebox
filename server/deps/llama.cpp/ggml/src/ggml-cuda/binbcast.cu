@@ -23,6 +23,44 @@ static __device__ __forceinline__ float op_div(const float a, const float b) {
     return a / b;
 }
 
+// REPEAT normally goes through the floating-point bin-broadcast path. DS4
+// verification also repeats a small I32 expert-routing LUT across the token
+// dimension. Preserve those indices exactly instead of converting them
+// through float, which is not lossless for arbitrary int32_t values.
+static __global__ void k_repeat_i32_contiguous(
+        const int32_t * src,
+        int32_t * dst,
+        int64_t ne0,
+        int64_t ne1,
+        int64_t ne2,
+        int64_t ne3,
+        int64_t ne00,
+        int64_t ne01,
+        int64_t ne02,
+        int64_t ne03,
+        int64_t n) {
+    const int64_t stride = (int64_t) blockDim.x * gridDim.x;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+         i < n; i += stride) {
+        int64_t rem = i;
+        const int64_t i0 = rem % ne0;
+        rem /= ne0;
+        const int64_t i1 = rem % ne1;
+        rem /= ne1;
+        const int64_t i2 = rem % ne2;
+        rem /= ne2;
+        const int64_t i3 = rem % ne3;
+
+        const int64_t s0 = i0 % ne00;
+        const int64_t s1 = i1 % ne01;
+        const int64_t s2 = i2 % ne02;
+        const int64_t s3 = i3 % ne03;
+        const int64_t src_i =
+            (((s3 * ne02 + s2) * ne01 + s1) * ne00 + s0);
+        dst[i] = src[src_i];
+    }
+}
+
 template <float (*bin_op)(const float, const float),
           typename src0_t,
           typename src1_t,
@@ -391,6 +429,23 @@ static void ggml_cuda_op_bin_bcast(
 }
 
 void ggml_cuda_op_repeat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src = dst->src[0];
+    if (src->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32) {
+        GGML_ASSERT(ggml_is_contiguous(src));
+        GGML_ASSERT(ggml_is_contiguous(dst));
+
+        constexpr int threads = 256;
+        const int64_t n = ggml_nelements(dst);
+        const int64_t blocks_needed = (n + threads - 1) / threads;
+        const int blocks = (int) (blocks_needed < 65535 ? blocks_needed : 65535);
+        k_repeat_i32_contiguous<<<blocks, threads, 0, ctx.stream()>>>(
+            (const int32_t *) src->data,
+            (int32_t *) dst->data,
+            dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+            src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+            n);
+        return;
+    }
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_repeat, 0>>(dst, dst->src[0], dst, nullptr, dst->src[0]->data, dst->data, ctx.stream());
 }
 

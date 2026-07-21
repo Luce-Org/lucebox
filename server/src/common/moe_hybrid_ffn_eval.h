@@ -110,6 +110,71 @@ struct MoeHybridFfnTelemetry {
     int cold_selected = 0;
 };
 
+// Inputs owned by a scheduler-allocated hybrid FFN graph. The lookup tensors
+// map global router IDs to each backend's compact expert stack and mask the
+// slots owned by the other backend without a host-side routing round trip.
+struct MoeHybridGraphInputs {
+    ggml_tensor * router_weights = nullptr;
+    std::vector<ggml_tensor *> router_nodes;
+    // q>1 decomposes the six selected routes into a four-wide head and a
+    // padded two-wide tail.  Keep those derived ID/weight tensors on the main
+    // owner and schedule them before either expert branch.  Otherwise the
+    // scheduler discovers the cold branch first and inserts a second
+    // main->peer copy in the middle of cold execution, which synchronizes the
+    // peer stream before the hot branch can be submitted.
+    std::vector<ggml_tensor *> route_prefork_nodes;
+    ggml_tensor * hot_local_lut = nullptr;
+    ggml_tensor * hot_valid_lut = nullptr;
+    ggml_tensor * cold_local_lut = nullptr;
+    ggml_tensor * cold_valid_lut = nullptr;
+    ggml_tensor * shard_local_lut = nullptr;
+    ggml_tensor * shard_valid_lut = nullptr;
+    ggml_tensor * output = nullptr;
+    // Exact owner-local partials exposed for consumers that can fold the
+    // hot+cold reduction into their own kernel.  peer_output is the stable
+    // main-backend activation produced by the existing deferred peer copy;
+    // neither tensor changes expert placement or routing semantics.
+    ggml_tensor * main_output = nullptr;
+    ggml_tensor * peer_output = nullptr;
+    // Backend-affinity hints consumed after the multi-backend scheduler is
+    // created. Keeping every intermediate of a routed branch on its weight
+    // backend avoids gate/up -> activation -> down ping-pong copies.
+    std::vector<ggml_tensor *> hot_remap_nodes;
+    std::vector<ggml_tensor *> cold_remap_nodes;
+    std::vector<ggml_tensor *> shard_remap_nodes;
+    std::vector<ggml_tensor *> hot_nodes;
+    std::vector<ggml_tensor *> shard_nodes;
+    std::vector<ggml_tensor *> cold_nodes;
+    // Main-backend nodes that first consume a completed cold branch. Hash
+    // layers can append two joins because six routes are lowered as 4 + 2.
+    std::vector<ggml_tensor *> join_nodes;
+    // Main-backend peer-copy ops whose src[0] stays on the cold owner. The
+    // scheduler attaches a dedicated producer event to each node.
+    std::vector<ggml_tensor *> deferred_peer_copy_nodes;
+};
+
+// Append a device-resident hot+cold+shared MoE FFN to an existing graph.
+// `global_ids` and `router_weights` are [n_expert_used, n_tokens]. Weight
+// tensors in `storage` determine scheduler placement on the two GPU backends.
+// When `schedule_graph` is non-null, the cold branch is expanded immediately
+// and a peer-owned fence is inserted before the final main-backend join. This
+// forces three scheduler splits (cold, hot/shared, join), preventing the join's
+// cold-result copy from blocking hot/shared launch. Consumers may use
+// main_output + peer_output to fuse the exact final add into their next op.
+bool build_moe_hybrid_ffn_graph(
+    ggml_context *                 ctx,
+    ggml_cgraph *                  schedule_graph,
+    const MoeHybridConfig &        cfg,
+    const MoeLayerDesc &           desc,
+    const MoeHybridLayerStorage &  storage,
+    ggml_tensor *                  inp,
+    ggml_tensor *                  global_ids,
+    ggml_tensor *                  router_weights,
+    int                            n_tokens,
+    MoeHybridGraphInputs &         out,
+    bool                           include_shared = true,
+    bool                           allow_fused_combine = false);
+
 int moe_hybrid_expert_compute_batch_limit();
 int moe_hybrid_expert_compute_ipc_batch_limit(int n_tokens);
 int moe_hybrid_prefill_hot_sub_batch_limit();
@@ -141,7 +206,19 @@ bool eval_moe_batched_prefill_ffn(
     std::vector<float> &            out,
     std::string *                   err = nullptr);
 
-// Batched hybrid prefill FFN: hot on GPU, cold on CPU concurrently.
+// Optional device-resident owner destinations for long heterogeneous prefill.
+// When present, the hot/shared and cold partials are copied directly into
+// these target-backend tensors; the caller can add them in its next graph
+// without reading either full hidden-state buffer through the CPU.
+struct MoeHybridDeviceOutputs {
+    ggml_backend_t backend = nullptr;
+    ggml_tensor * hot = nullptr;
+    ggml_tensor * cold = nullptr;
+
+    bool valid() const { return backend && hot && cold; }
+};
+
+// Batched hybrid prefill FFN: hot and cold owners execute concurrently.
 bool eval_moe_hybrid_ffn_batched(
     ggml_backend_t                  gpu_backend,
     ggml_backend_t                  cpu_backend,
@@ -158,7 +235,14 @@ bool eval_moe_hybrid_ffn_batched(
     ggml_gallocr_t *                p_cold_alloc = nullptr,
     MoeExpertCompute *                expert_compute = nullptr,
     const MoeExpertLayer *            expert_layer = nullptr,
-    MoeHybridFfnTelemetry *         telemetry = nullptr);
+    MoeHybridFfnTelemetry *         telemetry = nullptr,
+    // Optional device-resident [n_embd, n_tokens] activation. Long
+    // heterogeneous prefill uses this to avoid a GPU -> host -> GPU bounce
+    // before both expert owners start. `cur_host` may be null when set.
+    ggml_tensor *                   cur_backend = nullptr,
+    // Optional target-backend partial destinations. Supported by the long
+    // in-process expert-major path; `out` is not materialized when active.
+    const MoeHybridDeviceOutputs *  device_outputs = nullptr);
 
 // Hot-only batched prefill: all selected experts are in VRAM.
 // Skips cold graph build, CPU compute, and merge — pure GPU path.
@@ -237,7 +321,7 @@ bool build_cached_cold_graph(
 bool build_cached_hot_batched_graph(
     CachedHotBatchedGraph & out,
     ggml_backend_t gpu_backend,
-    MoeHybridLayerStorage & storage,
+    const MoeHybridLayerStorage & storage,
     const MoeLayerDesc & desc,
     const MoeHybridConfig & cfg,
     int n_tokens);

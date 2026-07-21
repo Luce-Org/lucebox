@@ -24,12 +24,19 @@
 
 #include "internal.h"
 #include "common/layer_split_utils.h"
+#include "common/prefill_attention_mode.h"
 
 namespace dflash::common {
+
+// Layer-major prefill may schedule two 2K numerical bands while preserving
+// the raw-cache rounding boundary between them.
+inline constexpr int DS4_NUMERICAL_PREFILL_BAND = 2048;
+inline constexpr int DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS = 4096;
 
 struct MoeHybridPlacement;
 struct MoeHybridConfig;
 struct MoeHybridRoutingStats;
+struct MoeExpertComputeRuntime;
 class MoeHybridStreamEngine;
 
 struct DeepSeek4StepTelemetry {
@@ -65,6 +72,7 @@ struct DeepSeek4StepTelemetry {
     uint64_t sample_us = 0;
     uint64_t emit_us = 0;
     uint64_t full_graph_build_us = 0;
+    uint64_t full_graph_alloc_us = 0;
     uint64_t full_graph_set_us = 0;
     uint64_t full_graph_compute_us = 0;
     uint64_t full_graph_read_us = 0;
@@ -149,6 +157,9 @@ struct DeepSeek4Weights {
     ggml_context *        ctx     = nullptr;
     ggml_backend_t        backend = nullptr;
     ggml_backend_buffer_t buf     = nullptr;
+    // Optional row-split buffer for selected dense projections. The buffer
+    // owns per-device allocations while the tensor metadata stays in ctx.
+    ggml_backend_buffer_t dense_split_buf = nullptr;
 
     // Global tensors
     ggml_tensor * tok_embd       = nullptr;  // [n_embd, n_vocab]
@@ -223,6 +234,7 @@ struct DeepSeek4Weights {
 
     // Runtime serving policy. These values are set by the backend after the
     // GGUF is loaded; they are not model metadata.
+    uint64_t runtime_generation  = 0;  // unique successful-load identity
     int  routed_expert_top_k = 0;  // 0 = model default (n_expert_used)
     bool fused_decode        = false;
 };
@@ -260,10 +272,14 @@ struct DeepSeek4LayerCache {
 
 struct DeepSeek4Cache {
     int cur_pos  = 0;
+    // Monotonic request generation. Whole-step HIP graphs may retain kernel
+    // state safely within one sequence, but must not survive a cache clear.
+    uint64_t sequence_id = 0;
     int max_ctx  = 0;
     int n_layer  = 0;
 
     std::vector<DeepSeek4LayerCache> layers;
+    PrefillAttentionMode prefill_mode = PrefillAttentionMode::Exact;
 
     // HC residual streams: [n_hc * n_embd] persistent state
     ggml_tensor * hc_state    = nullptr;  // [n_hc * n_embd]
@@ -286,6 +302,7 @@ struct DeepSeek4BackendConfig {
     DevicePlacement device;
     int          stream_fd    = -1;
     int          chunk        = 512;   // prefill chunk size
+    PrefillAttentionMode prefill_mode = PrefillAttentionMode::Exact;
     int          max_ctx      = 0;     // 0 = auto from SWA + compression capacity
     int          expert_top_k = 0;     // 0 = use all model-routed experts
     bool         fused_decode = false; // single-graph GPU decode
@@ -304,6 +321,10 @@ bool load_deepseek4_gguf_partial(const std::string & path,
 
 void free_deepseek4_weights(DeepSeek4Weights & w);
 
+// Release graph allocators and host mirrors that retain model tensor pointers.
+// This must run before the owning ggml context is destroyed.
+void deepseek4_release_runtime_graphs(const DeepSeek4Weights & w);
+
 bool create_deepseek4_cache(ggml_backend_t backend,
                              const DeepSeek4Weights & w,
                              int max_ctx,
@@ -311,6 +332,9 @@ bool create_deepseek4_cache(ggml_backend_t backend,
 
 void free_deepseek4_cache(DeepSeek4Cache & c);
 void reset_deepseek4_cache(DeepSeek4Cache & c);
+// Release cached fused decode/verify schedulers before their model/backend
+// owners are destroyed (park, shutdown, or failed reload).
+void reset_deepseek4_graph_runtime_caches();
 int deepseek4_previous_raw_ring_spans(
     int kv_start,
     int n_swa,
@@ -347,7 +371,8 @@ bool deepseek4_step(
     MoeHybridStreamEngine *     stream_engine = nullptr,
     DeepSeek4StepTelemetry *    telemetry = nullptr,
     MoeHybridRoutingStats *     routing_stats = nullptr,
-    Ds4VerifyHooks *            verify_hooks = nullptr);
+    Ds4VerifyHooks *            verify_hooks = nullptr,
+    MoeExpertComputeRuntime *   expert_runtime = nullptr);
 
 // Optional hooks for the DSpark spec-decode batched verify (deepseek4_dspark).
 // When set on a multi-token deepseek4_step_layer_range call they add: per-layer
@@ -357,6 +382,8 @@ struct Ds4VerifyHooks {
     const std::vector<int> * capture_layer_ids = nullptr;  // e.g. {40,41,42}
     std::vector<float> *     capture_out = nullptr;         // [n_cap*n_embd * n_tokens]
     std::vector<float> *     all_logits_out = nullptr;      // [n_vocab * n_tokens]
+    std::vector<int32_t> *   argmax_out = nullptr;          // [n_tokens], optional GPU result
+    bool                     prefer_argmax_only = false;     // skip logits D2H when available
 };
 
 bool deepseek4_step_layer_range(
@@ -373,7 +400,10 @@ bool deepseek4_step_layer_range(
     const int32_t *             token_ids = nullptr,
     DeepSeek4StepTelemetry *    telemetry = nullptr,
     bool                        allow_decode_graph_reuse = true,
-    Ds4VerifyHooks *            verify_hooks = nullptr);
+    Ds4VerifyHooks *            verify_hooks = nullptr,
+    MoeHybridStorage *          moe_hybrid = nullptr,
+    MoeExpertComputeRuntime *   expert_runtime = nullptr,
+    MoeHybridRoutingStats *     routing_stats = nullptr);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,
@@ -399,7 +429,8 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
     const MoeHybridPlacement &  placement,
     const MoeHybridConfig *     cfg_override,
     MoeHybridStorage &          out,
-    std::string *               err = nullptr);
+    std::string *               err = nullptr,
+    ggml_backend_t              cold_gpu_backend = nullptr);
 
 // Snapshot
 struct DeepSeek4Snapshot {

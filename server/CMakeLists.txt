@@ -260,6 +260,7 @@ add_library(dflash_common STATIC
     src/deepseek4/deepseek4_target_shard_ipc_daemon.cpp
     src/deepseek4/deepseek4_dspark.cpp
     src/deepseek4/deepseek4_dspark_spec.cpp
+    src/deepseek4/deepseek4_dspark_draft_ipc_daemon.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
@@ -893,6 +894,20 @@ if(DFLASH27B_TESTS)
             target_link_libraries(test_deepseek4_unit PRIVATE hip::host)
         endif()
         add_test(NAME deepseek4_unit COMMAND test_deepseek4_unit)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ggml_rmsnorm_batch.cpp")
+        add_executable(test_ggml_rmsnorm_batch test/test_ggml_rmsnorm_batch.cpp)
+        target_include_directories(test_ggml_rmsnorm_batch PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_ggml_rmsnorm_batch PRIVATE ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_ggml_rmsnorm_batch PRIVATE GGML_USE_HIP)
+            target_link_libraries(test_ggml_rmsnorm_batch PRIVATE hip::host)
+        else()
+            target_compile_definitions(test_ggml_rmsnorm_batch PRIVATE GGML_USE_CUDA)
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_ggml_rmsnorm_batch PRIVATE CUDA::cudart)
+        endif()
+        add_test(NAME ggml_rmsnorm_batch COMMAND test_ggml_rmsnorm_batch)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_dspark_load.cpp")
         add_executable(test_ds4_dspark_load test/test_ds4_dspark_load.cpp)

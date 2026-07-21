@@ -14,6 +14,7 @@
 #include "ggml_graph_precision.h"
 #include "internal.h"
 #include "laguna_internal.h"
+#include "../deepseek4/deepseek4_internal.h"
 #include "moe_hybrid_types_impl.h"
 
 #include "ggml-backend.h"
@@ -31,6 +32,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -179,9 +181,34 @@ struct RemoteMoeRuntime {
     int n_expert = 0;
     int n_expert_used = 0;
     int n_ff_exp = 0;
+    float swiglu_clamp = 0.0f;
     std::vector<RemoteMoeLayerRuntime> layers;
     MoeHybridStorage hybrid;
 };
+
+MoeHybridConfig make_moe_hybrid_config(const DeepSeek4Weights & weights) {
+    MoeHybridConfig cfg;
+    cfg.n_embd = weights.n_embd;
+    cfg.n_expert = weights.n_expert;
+    cfg.n_expert_used = weights.n_expert_used;
+    cfg.n_ff_exp = weights.n_ff_exp;
+    cfg.n_ff_shexp = weights.n_ff_exp;
+    cfg.n_layer = weights.n_layer;
+    cfg.first_moe_layer = 0;
+    cfg.swiglu_clamp = weights.swiglu_clamp_exp;
+    return cfg;
+}
+
+MoeLayerDesc make_moe_layer_desc(const DeepSeek4Layer & layer) {
+    MoeLayerDesc desc;
+    desc.ffn_gate_exps = layer.ffn_gate_exps;
+    desc.ffn_up_exps = layer.ffn_up_exps;
+    desc.ffn_down_exps = layer.ffn_down_exps;
+    desc.ffn_gate_shexp = layer.ffn_gate_shexp;
+    desc.ffn_up_shexp = layer.ffn_up_shexp;
+    desc.ffn_down_shexp = layer.ffn_down_shexp;
+    return desc;
+}
 
 bool build_cached_batched_cold_graph(
     CachedBatchedMoeExpertGraph & out,
@@ -198,6 +225,7 @@ bool build_cached_batched_cold_graph(
     int n_ff_exp,
     int n_selected,
     int n_tokens,
+    float swiglu_clamp,
     ggml_type input_type = GGML_TYPE_F32) {
 
     out.free();
@@ -237,7 +265,10 @@ bool build_cached_batched_cold_graph(
             (size_t)n_ff_exp * ggml_element_size(gate_up_e));
         gate_e = ggml_cont(out.ctx, gate_e);
         up_e = ggml_cont(out.ctx, up_e);
-        gu = ggml_swiglu_split(out.ctx, gate_e, up_e);
+        gu = swiglu_clamp > 1.0e-6f
+            ? ggml_swiglu_ds4_split(
+                out.ctx, gate_e, up_e, swiglu_clamp)
+            : ggml_swiglu_split(out.ctx, gate_e, up_e);
     } else {
         ggml_tensor * gate_e = moe_expert_apply_scale2(out.ctx,
             ggml_mul_mat_id(out.ctx, gate_tensor, cur_3d, out.ids),
@@ -245,7 +276,10 @@ bool build_cached_batched_cold_graph(
         ggml_tensor * up_e = moe_expert_apply_scale2(out.ctx,
             ggml_mul_mat_id(out.ctx, up_tensor, cur_3d, out.ids),
             up_scale);
-        gu = ggml_swiglu_split(out.ctx, gate_e, up_e);
+        gu = swiglu_clamp > 1.0e-6f
+            ? ggml_swiglu_ds4_split(
+                out.ctx, gate_e, up_e, swiglu_clamp)
+            : ggml_swiglu_split(out.ctx, gate_e, up_e);
     }
 
     ggml_tensor * experts = moe_expert_apply_scale2(out.ctx,
@@ -460,6 +494,7 @@ size_t moe_expert_required_shared_bytes(int n_embd,
     size_t input_bytes = 0;
     size_t ids_bytes = 0;
     size_t weights_bytes = 0;
+    size_t counts_bytes = 0;
     size_t total = 0;
     size_t input_elems = 0;
     size_t selected_elems = 0;
@@ -471,7 +506,10 @@ size_t moe_expert_required_shared_bytes(int n_embd,
             input_bytes) ||
         !moe_expert_compute_checked_mul_size(selected_elems, sizeof(int32_t), ids_bytes) ||
         !moe_expert_compute_checked_mul_size(selected_elems, sizeof(float), weights_bytes) ||
-        !backend_ipc_checked_add_size(input_bytes, ids_bytes, total) ||
+        !moe_expert_compute_checked_mul_size(
+            (size_t)batch_limit, sizeof(int32_t), counts_bytes) ||
+        !backend_ipc_checked_add_size(input_bytes, counts_bytes, total) ||
+        !backend_ipc_checked_add_size(total, ids_bytes, total) ||
         !backend_ipc_checked_add_size(total, weights_bytes, total)) {
         return 0;
     }
@@ -618,6 +656,7 @@ bool build_remote_moe_runtime_from_weights(
     out.n_ff_exp = weights.n_ff_exp;
 
     MoeHybridConfig cfg = make_moe_hybrid_config(weights);
+    out.swiglu_clamp = cfg.swiglu_clamp;
     std::vector<MoeLayerDesc> layer_descs((size_t)weights.n_layer);
     out.layers.resize((size_t)weights.n_layer);
     for (int il = 0; il < weights.n_layer; ++il) {
@@ -683,6 +722,17 @@ bool load_remote_moe_runtime(const char * target_path,
             backend, placement, gctx, file_bytes, file_size,
             data_start, arch, weights, free_laguna_target_weights, out, err);
     }
+    if (arch == "deepseek4") {
+        DeepSeek4Weights weights;
+        if (!load_deepseek4_gguf_partial(target_path, backend, plan, weights)) {
+            if (err) *err = "failed to load DeepSeek4 expert metadata";
+            free_deepseek4_weights(weights);
+            return false;
+        }
+        return build_remote_moe_runtime_from_weights(
+            backend, placement, gctx, file_bytes, file_size,
+            data_start, arch, weights, free_deepseek4_weights, out, err);
+    }
 
     if (err) *err = "unsupported MoE expert compute arch: " + arch;
     return false;
@@ -697,7 +747,8 @@ bool validate_shared_payload_request(const void * shared_payload,
         static_cast<const BackendIpcSharedPayloadHeader *>(shared_payload);
     if (!shared_payload || !shared_payload_data || seq == 0 ||
         !backend_ipc_payload_in_bounds(0, bytes, shared_payload_capacity) ||
-        header->sequence != seq || header->bytes != (uint64_t)bytes) {
+        !backend_ipc_shared_payload_header_matches(
+            header, seq, static_cast<uint64_t>(bytes))) {
         return false;
     }
     return true;
@@ -713,8 +764,8 @@ bool commit_shared_payload_response(void * shared_payload,
         return false;
     }
     auto * header = static_cast<BackendIpcSharedPayloadHeader *>(shared_payload);
-    header->bytes = (uint64_t)bytes;
-    header->sequence = seq;
+    backend_ipc_publish_shared_payload_header(
+        header, seq, static_cast<uint64_t>(bytes));
     return true;
 }
 
@@ -806,6 +857,7 @@ public:
             std::fill(output, output + n_embd, 0.0f);
             return true;
         }
+        std::lock_guard<std::mutex> request_lock(request_mutex_);
         if (!active_ || layer.layer_idx < 0 || n_embd != n_embd_) {
             if (required_) return false;
             return fallback_->compute(layer, input, ids, weights, n_cold, n_embd, n_ff, output);
@@ -848,6 +900,7 @@ public:
             std::fill(output, output + (size_t)n_tokens * (size_t)n_embd, 0.0f);
             return true;
         }
+        std::lock_guard<std::mutex> request_lock(request_mutex_);
         if (!active_ || layer.layer_idx < 0 || n_embd != n_embd_) {
             if (required_) return false;
             return fallback_->compute_batch(layer, input, ids, weights,
@@ -884,7 +937,75 @@ public:
         return true;
     }
 
+    bool compute_batch_ragged(const MoeExpertLayer & layer,
+                              const float * input,
+                              const int32_t * ids,
+                              const float * weights,
+                              const int32_t * selected_counts,
+                              int n_tokens,
+                              int max_selected,
+                              int n_embd,
+                              int n_ff,
+                              float * output) override {
+        if (!output || n_tokens < 0 || max_selected <= 0 ||
+            max_selected > n_expert_used_ || n_embd <= 0 ||
+            (n_tokens > 0 && (!input || !ids || !weights || !selected_counts))) {
+            return false;
+        }
+        if (n_tokens == 0) return true;
+
+        bool has_selected = false;
+        for (int t = 0; t < n_tokens; ++t) {
+            const int count = selected_counts[t];
+            if (count < 0 || count > max_selected) return false;
+            has_selected = has_selected || count > 0;
+        }
+        if (!has_selected) {
+            std::fill(output,
+                      output + (size_t)n_tokens * (size_t)n_embd, 0.0f);
+            return true;
+        }
+
+        std::lock_guard<std::mutex> request_lock(request_mutex_);
+        if (!active_ || layer.layer_idx < 0 || n_embd != n_embd_) {
+            if (required_) return false;
+            return fallback_->compute_batch_ragged(
+                layer, input, ids, weights, selected_counts,
+                n_tokens, max_selected, n_embd, n_ff, output);
+        }
+        for (int t = 0; t < n_tokens; ++t) {
+            for (int i = 0; i < selected_counts[t]; ++i) {
+                const size_t idx =
+                    (size_t)t * (size_t)max_selected + (size_t)i;
+                const int32_t local = ids[idx];
+                if (local < 0 ||
+                    (size_t)local >= layer.cold_global_by_local.size()) {
+                    if (required_) return false;
+                    return fallback_->compute_batch_ragged(
+                        layer, input, ids, weights, selected_counts,
+                        n_tokens, max_selected, n_embd, n_ff, output);
+                }
+            }
+        }
+
+        if (!compute_remote_batch_ragged(
+                layer.layer_idx, input, ids, weights, selected_counts,
+                n_tokens, max_selected, n_embd, output)) {
+            active_ = false;
+            if (required_) {
+                std::fprintf(stderr,
+                             "[moe-expert-compute-ipc] required ragged remote compute failed\n");
+                return false;
+            }
+            return fallback_->compute_batch_ragged(
+                layer, input, ids, weights, selected_counts,
+                n_tokens, max_selected, n_embd, n_ff, output);
+        }
+        return true;
+    }
+
     bool healthy() const override {
+        std::lock_guard<std::mutex> request_lock(request_mutex_);
         return active_;
     }
 
@@ -1082,7 +1203,121 @@ private:
         int32_t status = -1;
         const auto wait_t0 = MoeExpertClock::now();
         if (!read_exact_fd(stream_fd, &status, sizeof(status)) || status != 0) {
-            std::fprintf(stderr, "[moe-expert-compute-ipc] batch compute failed status=%d\n", status);
+            std::fprintf(stderr,
+                         "[moe-expert-compute-ipc] batch compute failed "
+                         "layer=%d tokens=%d selected=%d status=%d\n",
+                         layer_idx, n_tokens, n_selected, status);
+            return false;
+        }
+        const auto wait_t1 = MoeExpertClock::now();
+        const size_t output_bytes =
+            (size_t)n_tokens * (size_t)n_embd * sizeof(float);
+        const bool ok = use_shared
+            ? process_.read_shared_payload(output, output_bytes, seq)
+            : read_exact_fd(stream_fd, output, output_bytes);
+        const auto recv_t1 = MoeExpertClock::now();
+        if (profile_) {
+            stats_.calls++;
+            stats_.payload_bytes += payload_bytes;
+            stats_.pack_us += moe_expert_compute_elapsed_us(pack_t0, pack_t1);
+            stats_.send_us += moe_expert_compute_elapsed_us(send_t0, send_t1);
+            stats_.wait_us += moe_expert_compute_elapsed_us(wait_t0, wait_t1);
+            stats_.recv_us += moe_expert_compute_elapsed_us(wait_t1, recv_t1);
+            stats_.maybe_print(false);
+        }
+        return ok;
+#endif
+    }
+
+    bool compute_remote_batch_ragged(int layer_idx,
+                                     const float * input,
+                                     const int32_t * local_ids,
+                                     const float * weights,
+                                     const int32_t * selected_counts,
+                                     int n_tokens,
+                                     int max_selected,
+                                     int n_embd,
+                                     float * output) {
+#if defined(_WIN32)
+        (void)layer_idx; (void)input; (void)local_ids; (void)weights;
+        (void)selected_counts; (void)n_tokens; (void)max_selected;
+        (void)n_embd; (void)output;
+        return false;
+#else
+        FILE * cmd = process_.command_stream();
+        const int stream_fd = process_.stream_fd();
+        const int payload_fd = process_.payload_fd();
+        if (!cmd || stream_fd < 0 || layer_idx < 0 || !input ||
+            !local_ids || !weights || !selected_counts || !output ||
+            n_tokens <= 0 || max_selected <= 0 ||
+            max_selected > n_expert_used_) {
+            return false;
+        }
+
+        const ggml_type request_input_type = GGML_TYPE_F32;
+        const void * ipc_input = nullptr;
+        size_t input_bytes = 0;
+        if (!moe_expert_convert_input_to_ipc_type(
+                request_input_type, input, n_tokens, n_embd,
+                input_scratch_, ipc_input, input_bytes)) {
+            return false;
+        }
+        const size_t counts_bytes =
+            (size_t)n_tokens * sizeof(int32_t);
+        const size_t selected_elems =
+            (size_t)n_tokens * (size_t)max_selected;
+        const size_t ids_bytes = selected_elems * sizeof(int32_t);
+        const size_t weights_bytes = selected_elems * sizeof(float);
+        size_t payload_bytes = 0;
+        if (!backend_ipc_checked_add_size(input_bytes, counts_bytes, payload_bytes) ||
+            !backend_ipc_checked_add_size(payload_bytes, ids_bytes, payload_bytes) ||
+            !backend_ipc_checked_add_size(payload_bytes, weights_bytes, payload_bytes)) {
+            return false;
+        }
+        const bool use_shared =
+            process_.resolved_payload_transport() == BackendIpcPayloadTransport::Shared;
+        const auto pack_t0 = MoeExpertClock::now();
+        uint64_t seq = 0;
+        const BackendIpcPayloadSegment segments[] = {
+            {ipc_input, input_bytes},
+            {selected_counts, counts_bytes},
+            {local_ids, ids_bytes},
+            {weights, weights_bytes},
+        };
+        const auto pack_t1 = MoeExpertClock::now();
+
+        const auto send_t0 = MoeExpertClock::now();
+        if (use_shared) {
+            if (!process_.write_shared_payload_segments(segments, 4, seq)) {
+                return false;
+            }
+            std::fprintf(cmd,
+                         "compute_batch_ragged_local_shared %d %d %d %zu %" PRIu64 "\n",
+                         layer_idx, n_tokens, max_selected, payload_bytes, seq);
+            std::fflush(cmd);
+        } else if (payload_fd >= 0) {
+            std::fprintf(cmd,
+                         "compute_batch_ragged_local_pipe %d %d %d %zu\n",
+                         layer_idx, n_tokens, max_selected, payload_bytes);
+            std::fflush(cmd);
+            if (!write_exact_fd(payload_fd, ipc_input, input_bytes) ||
+                !write_exact_fd(payload_fd, selected_counts, counts_bytes) ||
+                !write_exact_fd(payload_fd, local_ids, ids_bytes) ||
+                !write_exact_fd(payload_fd, weights, weights_bytes)) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        const auto send_t1 = MoeExpertClock::now();
+
+        int32_t status = -1;
+        const auto wait_t0 = MoeExpertClock::now();
+        if (!read_exact_fd(stream_fd, &status, sizeof(status)) || status != 0) {
+            std::fprintf(stderr,
+                         "[moe-expert-compute-ipc] ragged batch compute failed "
+                         "layer=%d tokens=%d max_selected=%d status=%d\n",
+                         layer_idx, n_tokens, max_selected, status);
             return false;
         }
         const auto wait_t1 = MoeExpertClock::now();
@@ -1116,6 +1351,7 @@ private:
     bool active_ = false;
     bool required_ = false;
     bool profile_ = false;
+    mutable std::mutex request_mutex_;
 };
 
 }  // namespace
@@ -1274,15 +1510,23 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
     std::vector<float> output((size_t)runtime.n_embd);
     std::vector<int32_t> batch_local_ids;
     std::vector<int32_t> payload_ids;
+    std::vector<int32_t> payload_counts;
     std::vector<float> payload_weights;
     MoeExpertDaemonStats profile_stats;
     MoeExpertDaemonStats profile_stats_prefill;
     MoeExpertDaemonStats profile_stats_decode;
     const bool profile = moe_expert_compute_profile_enabled();
+    const char * token_loop_env =
+        std::getenv("DFLASH_MOE_EXPERT_COMPUTE_DAEMON_TOKEN_LOOP");
+    const bool token_loop_batches =
+        token_loop_env && *token_loop_env && *token_loop_env != '0';
     int warmup_builds = 0;
     std::fprintf(stderr,
-                 "[moe-expert-compute-daemon] ready gpu=%d remote_hot=%d layers=%d warmup_graphs=%d warmup_ms=0.000\n",
-                 target_gpu, runtime.hybrid.placement.total_hot, runtime.n_layer, warmup_builds);
+                 "[moe-expert-compute-daemon] ready gpu=%d remote_hot=%d "
+                 "layers=%d warmup_graphs=%d warmup_ms=0.000 token_loop=%d\n",
+                 target_gpu, runtime.hybrid.placement.total_hot,
+                 runtime.n_layer, warmup_builds,
+                 token_loop_batches ? 1 : 0);
     emit_status(stream_fd, 0);
 
     std::string line;
@@ -1303,6 +1547,7 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
         bool pipe_payload = false;
         bool shared_payload_cmd = false;
         bool ids_are_local = false;
+        bool ragged_payload = false;
         ggml_type input_type = GGML_TYPE_F32;
         const auto read_t0 = MoeExpertClock::now();
         if (cmd == "compute_pipe") {
@@ -1357,7 +1602,20 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
             shared_payload_cmd = true;
             ids_are_local = true;
             input_type = (ggml_type)input_type_i;
+        } else if (cmd == "compute_batch_ragged_local_pipe") {
+            iss >> layer_idx >> n_tokens >> n_selected >> bytes;
+            pipe_payload = true;
+            ids_are_local = true;
+            ragged_payload = true;
+        } else if (cmd == "compute_batch_ragged_local_shared") {
+            iss >> layer_idx >> n_tokens >> n_selected >> bytes >> shared_seq;
+            shared_payload_cmd = true;
+            ids_are_local = true;
+            ragged_payload = true;
         } else {
+            std::fprintf(stderr,
+                         "[moe-expert-compute-daemon] unknown command: %s\n",
+                         line.c_str());
             emit_status(stream_fd, -1);
             continue;
         }
@@ -1367,6 +1625,7 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
         size_t input_bytes = 0;
         size_t ids_bytes = 0;
         size_t weights_bytes = 0;
+        size_t counts_bytes = 0;
         size_t expected = 0;
         bool header_ok = false;
         if (n_tokens > 0 && n_selected > 0 &&
@@ -1389,17 +1648,23 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
                                               ids_bytes) &&
                 moe_expert_compute_checked_mul_size(selected_elems, sizeof(float),
                                               weights_bytes) &&
-                backend_ipc_checked_add_size(input_bytes, ids_bytes, expected) &&
+                (!ragged_payload || moe_expert_compute_checked_mul_size(
+                    (size_t)n_tokens, sizeof(int32_t), counts_bytes)) &&
+                backend_ipc_checked_add_size(input_bytes, counts_bytes, expected) &&
+                backend_ipc_checked_add_size(expected, ids_bytes, expected) &&
                 backend_ipc_checked_add_size(expected, weights_bytes, expected) &&
                 bytes == expected;
         }
 
         if (pipe_payload && header_ok) {
             input.resize(input_bytes);
+            payload_counts.resize(ragged_payload ? (size_t)n_tokens : 0);
             payload_ids.resize((size_t)n_tokens * (size_t)n_selected);
             payload_weights.resize((size_t)n_tokens * (size_t)n_selected);
             payload_ok = payload_fd >= 0 &&
                 read_exact_fd(payload_fd, input.data(), input_bytes) &&
+                (!ragged_payload || read_exact_fd(
+                    payload_fd, payload_counts.data(), counts_bytes)) &&
                 read_exact_fd(payload_fd, payload_ids.data(), ids_bytes) &&
                 read_exact_fd(payload_fd, payload_weights.data(), weights_bytes);
         } else if (pipe_payload) {
@@ -1414,6 +1679,22 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
         const auto read_t1 = MoeExpertClock::now();
 
         if (!header_ok || !payload_ok) {
+            uint64_t published_seq = 0;
+            uint64_t published_bytes = 0;
+            if (shared_payload_cmd && shared_payload) {
+                backend_ipc_load_shared_payload_header(
+                    static_cast<const BackendIpcSharedPayloadHeader *>(shared_payload),
+                    published_seq, published_bytes);
+            }
+            std::fprintf(stderr,
+                         "[moe-expert-compute-daemon] invalid request "
+                         "cmd=%s layer=%d tokens=%d selected=%d bytes=%zu "
+                         "expected=%zu header=%d payload=%d seq=%" PRIu64
+                         " published_seq=%" PRIu64 " published_bytes=%" PRIu64 "\n",
+                         cmd.c_str(), layer_idx, n_tokens, n_selected,
+                         bytes, expected, header_ok ? 1 : 0,
+                         payload_ok ? 1 : 0, shared_seq,
+                         published_seq, published_bytes);
             emit_status(stream_fd, -1);
             continue;
         }
@@ -1423,10 +1704,12 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
             output.resize((size_t)n_tokens * (size_t)runtime.n_embd);
         }
         const uint8_t * input_data = nullptr;
+        const int32_t * selected_count_data = nullptr;
         const int32_t * payload_id_data = nullptr;
         const float * in_weights = nullptr;
         if (pipe_payload) {
             input_data = input.data();
+            selected_count_data = ragged_payload ? payload_counts.data() : nullptr;
             payload_id_data = payload_ids.data();
             in_weights = payload_weights.data();
         } else {
@@ -1434,6 +1717,11 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
                 static_cast<const uint8_t *>(shared_payload_data);
             input_data = payload_data + off;
             off += input_bytes;
+            if (ragged_payload) {
+                selected_count_data =
+                    reinterpret_cast<const int32_t *>(payload_data + off);
+                off += counts_bytes;
+            }
             payload_id_data = reinterpret_cast<const int32_t *>(payload_data + off);
             off += ids_bytes;
             in_weights = reinterpret_cast<const float *>(payload_data + off);
@@ -1443,13 +1731,33 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
         const auto unpack_t1 = MoeExpertClock::now();
         const int remote_hot_count = remote_hot_expert_count(storage);
 
+        bool counts_ok = !ragged_payload || selected_count_data != nullptr;
+        for (int t = 0; ragged_payload && counts_ok && t < n_tokens; ++t) {
+            counts_ok = selected_count_data[t] >= 0 &&
+                        selected_count_data[t] <= n_selected;
+        }
+        if (!counts_ok) {
+            std::fprintf(stderr,
+                         "[moe-expert-compute-daemon] invalid ragged counts "
+                         "layer=%d tokens=%d max_selected=%d\n",
+                         layer_idx, n_tokens, n_selected);
+            emit_status(stream_fd, -1);
+            continue;
+        }
+
         auto & layer_graphs = graphs[(size_t)layer_idx];
         if ((size_t)n_selected >= layer_graphs.size()) {
+            std::fprintf(stderr,
+                         "[moe-expert-compute-daemon] selected width out of range "
+                         "layer=%d selected=%d capacity=%zu\n",
+                         layer_idx, n_selected, layer_graphs.size());
             emit_status(stream_fd, -1);
             continue;
         }
         const RemoteMoeLayerRuntime & L = runtime.layers[(size_t)layer_idx];
-        if (n_tokens > 1 || input_type != GGML_TYPE_F32) {
+        if (!ragged_payload &&
+            ((n_tokens > 1 && !token_loop_batches) ||
+             input_type != GGML_TYPE_F32)) {
             auto & layer_batch_graphs = batch_graphs[(size_t)layer_idx];
             const uint64_t graph_key =
                 moe_expert_compute_batch_graph_key(n_tokens, n_selected,
@@ -1466,7 +1774,13 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
                         L.gate_scale, L.up_scale,
                         L.down_scale, L.gate_up_scale,
                         runtime.n_embd, runtime.n_ff_exp,
-                        n_selected, n_tokens, input_type)) {
+                        n_selected, n_tokens, runtime.swiglu_clamp,
+                        input_type)) {
+                    std::fprintf(stderr,
+                                 "[moe-expert-compute-daemon] batched graph build failed "
+                                 "layer=%d tokens=%d selected=%d type=%s\n",
+                                 layer_idx, n_tokens, n_selected,
+                                 ggml_type_name(input_type));
                     emit_status(stream_fd, -1);
                     continue;
                 }
@@ -1505,6 +1819,10 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
                 }
             }
             if (!ids_ok) {
+                std::fprintf(stderr,
+                             "[moe-expert-compute-daemon] batched local-id validation failed "
+                             "layer=%d tokens=%d selected=%d remote_hot=%d\n",
+                             layer_idx, n_tokens, n_selected, remote_hot_count);
                 emit_status(stream_fd, -1);
                 continue;
             }
@@ -1517,6 +1835,10 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
             auto st = ggml_backend_graph_compute(backend, graph.gf);
             const auto compute_one_t1 = MoeExpertClock::now();
             if (st != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr,
+                             "[moe-expert-compute-daemon] batched graph compute failed "
+                             "layer=%d tokens=%d selected=%d status=%d\n",
+                             layer_idx, n_tokens, n_selected, (int)st);
                 emit_status(stream_fd, -1);
                 continue;
             }
@@ -1576,35 +1898,51 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
             continue;
         }
 
-        CachedFfnGraph & graph = layer_graphs[(size_t)n_selected];
-        if (!graph.valid() || graph.n_hot != n_selected) {
-            const auto build_t0 = MoeExpertClock::now();
-            if (!build_cached_cold_graph(graph, backend,
-                                         storage.gate_hot, storage.up_hot,
-                                         storage.down_hot, storage.gate_up_hot,
-                                         L.gate_scale, L.up_scale,
-                                         L.down_scale, L.gate_up_scale,
-                                         runtime.n_embd, runtime.n_ff_exp,
-                                         n_selected)) {
-                emit_status(stream_fd, -1);
-                continue;
-            }
-            const auto build_t1 = MoeExpertClock::now();
-            if (profile) {
-                profile_stats_decode.graph_builds++;
-                profile_stats_decode.graph_build_us +=
-                    moe_expert_compute_elapsed_us(build_t0, build_t1);
-            }
-        }
-
         bool compute_ok = true;
         uint64_t set_us_accum = 0;
         uint64_t compute_us_accum = 0;
         uint64_t get_us_accum = 0;
         const size_t one_input_bytes = (size_t)runtime.n_embd * sizeof(float);
-        const size_t one_ids_bytes = (size_t)n_selected * sizeof(int32_t);
-        const size_t one_weights_bytes = (size_t)n_selected * sizeof(float);
         for (int t = 0; t < n_tokens; ++t) {
+            const int token_selected = ragged_payload
+                ? selected_count_data[t] : n_selected;
+            void * response_data = shared_payload_cmd
+                ? static_cast<void *>(
+                      static_cast<uint8_t *>(shared_payload_data) +
+                      (size_t)t * one_input_bytes)
+                : static_cast<void *>(
+                      output.data() + (size_t)t * (size_t)runtime.n_embd);
+            if (token_selected == 0) {
+                std::memset(response_data, 0, one_input_bytes);
+                continue;
+            }
+
+            CachedFfnGraph & graph = layer_graphs[(size_t)token_selected];
+            if (!graph.valid() || graph.n_hot != token_selected) {
+                const auto build_t0 = MoeExpertClock::now();
+                if (!build_cached_cold_graph(
+                        graph, backend,
+                        storage.gate_hot, storage.up_hot,
+                        storage.down_hot, storage.gate_up_hot,
+                        L.gate_scale, L.up_scale,
+                        L.down_scale, L.gate_up_scale,
+                        runtime.n_embd, runtime.n_ff_exp,
+                        token_selected, runtime.swiglu_clamp)) {
+                    std::fprintf(stderr,
+                                 "[moe-expert-compute-daemon] single graph build failed "
+                                 "layer=%d tokens=%d selected=%d\n",
+                                 layer_idx, n_tokens, token_selected);
+                    compute_ok = false;
+                    break;
+                }
+                const auto build_t1 = MoeExpertClock::now();
+                if (profile) {
+                    profile_stats_decode.graph_builds++;
+                    profile_stats_decode.graph_build_us +=
+                        moe_expert_compute_elapsed_us(build_t0, build_t1);
+                }
+            }
+
             bool ids_ok = true;
             const size_t token_off = (size_t)t * (size_t)n_selected;
             const int32_t * token_ids = payload_id_data + token_off;
@@ -1613,7 +1951,7 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
             if (!ids_are_local) {
                 graph_ids_data = local_ids.data();
             }
-            for (int i = 0; i < n_selected; ++i) {
+            for (int i = 0; i < token_selected; ++i) {
                 const int32_t id = token_ids[i];
                 const int32_t local = ids_are_local
                     ? id
@@ -1628,6 +1966,10 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
                 }
             }
             if (!ids_ok) {
+                std::fprintf(stderr,
+                             "[moe-expert-compute-daemon] single local-id validation failed "
+                             "layer=%d token=%d selected=%d remote_hot=%d\n",
+                             layer_idx, t, token_selected, remote_hot_count);
                 compute_ok = false;
                 break;
             }
@@ -1637,22 +1979,20 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
                                         (size_t)t * one_input_bytes,
                                     0, one_input_bytes);
             ggml_backend_tensor_set(graph.ids, graph_ids_data, 0,
-                                    one_ids_bytes);
+                                    (size_t)token_selected * sizeof(int32_t));
             ggml_backend_tensor_set(graph.weights, token_weights, 0,
-                                    one_weights_bytes);
+                                    (size_t)token_selected * sizeof(float));
             const auto set_one_t1 = MoeExpertClock::now();
             auto st = ggml_backend_graph_compute(backend, graph.gf);
             const auto compute_one_t1 = MoeExpertClock::now();
             if (st != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr,
+                             "[moe-expert-compute-daemon] single graph compute failed "
+                             "layer=%d token=%d selected=%d status=%d\n",
+                             layer_idx, t, token_selected, (int)st);
                 compute_ok = false;
                 break;
             }
-            void * response_data = shared_payload_cmd
-                ? static_cast<void *>(
-                      static_cast<uint8_t *>(shared_payload_data) +
-                      (size_t)t * one_input_bytes)
-                : static_cast<void *>(
-                      output.data() + (size_t)t * (size_t)runtime.n_embd);
             ggml_backend_tensor_get(graph.output, response_data, 0,
                                     one_input_bytes);
             const auto get_one_t1 = MoeExpertClock::now();
@@ -1671,6 +2011,11 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
             !commit_shared_payload_response(shared_payload, shared_payload_data,
                                             shared_payload_capacity,
                                             input_bytes, shared_seq)) {
+            std::fprintf(stderr,
+                         "[moe-expert-compute-daemon] single shared response commit failed "
+                         "layer=%d tokens=%d selected=%d bytes=%zu seq=%" PRIu64 "\n",
+                         layer_idx, n_tokens, n_selected,
+                         input_bytes, shared_seq);
             emit_status(stream_fd, -1);
             continue;
         }

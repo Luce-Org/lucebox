@@ -198,6 +198,33 @@ static bool should_upload_ds4_tensor(const char * name,
     return !(plan.skip_expert_tensors && is_expert_tensor(name));
 }
 
+static int ds4_dense_tp_mask() {
+    const char * value = std::getenv("DFLASH_DS4_DENSE_TP_MASK");
+    if (!value || !value[0]) return 0;
+    return std::max(0, std::atoi(value));
+}
+
+static bool should_split_ds4_dense_tensor(const char * name, int mask) {
+    if (mask == 0 || !name) return false;
+    // Each selected tensor is consumed as src0 of a plain 2-D MUL_MAT. Expert
+    // tensors and the grouped output-A view are deliberately excluded: the
+    // CUDA/HIP split-buffer implementation cannot split 3-D weight views.
+    if ((mask & 1) && std::strcmp(name, "output.weight") == 0) return true;
+    if ((mask & 2) && std::strstr(name, ".attn_q_b.weight") &&
+        !std::strstr(name, ".indexer.attn_q_b.weight")) return true;
+    if ((mask & 4) && std::strstr(name, ".attn_output_b.weight")) return true;
+    if ((mask & 8) && (std::strstr(name, ".attn_q_a.weight") ||
+                       std::strstr(name, ".attn_kv.weight") ||
+                       std::strstr(name, ".indexer.attn_q_b.weight") ||
+                       std::strstr(name, ".attn_compressor_kv.weight") ||
+                       std::strstr(name, ".attn_compressor_gate.weight") ||
+                       std::strstr(name, ".indexer_compressor_kv.weight") ||
+                       std::strstr(name, ".indexer_compressor_gate.weight"))) {
+        return true;
+    }
+    return false;
+}
+
 struct DS4TensorAlloc {
     ggml_tensor * tensor = nullptr;
     size_t tensor_offset = 0;
@@ -205,6 +232,7 @@ struct DS4TensorAlloc {
     size_t file_size = 0;
     size_t buffer_offset = 0;
     bool upload_to_backend = true;
+    bool dense_split = false;
 };
 
 }  // namespace
@@ -417,10 +445,41 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     const size_t data_offset = gguf_get_data_offset(gctx);
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
     const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    int dense_tp_mask = ds4_dense_tp_mask();
+    if (dense_tp_mask != 0) {
+        const char * fused_verify = std::getenv("DFLASH_DS4_FUSED_VERIFY");
+        if (fused_verify && fused_verify[0] &&
+            std::strcmp(fused_verify, "0") != 0) {
+            std::fprintf(stderr,
+                "[deepseek4-dense-tp] disabling mask=%d: split-buffer dense "
+                "weights are incompatible with fused verifier graph replay\n",
+                dense_tp_mask);
+            dense_tp_mask = 0;
+        }
+    }
+    ggml_backend_buffer_type_t split_buft = nullptr;
+    size_t split_alignment = 1;
+    if (dense_tp_mask != 0 && ggml_backend_is_cuda(backend) &&
+        ggml_backend_cuda_get_device_count() >= 2) {
+        float strix_fraction = 0.28f;
+        if (const char * value = std::getenv("DFLASH_DS4_DENSE_TP_STRIX_FRACTION")) {
+            const float parsed = std::strtof(value, nullptr);
+            if (parsed > 0.0f && parsed < 1.0f) strix_fraction = parsed;
+        }
+        float tensor_split[GGML_CUDA_MAX_DEVICES] = {};
+        tensor_split[0] = 1.0f - strix_fraction;
+        tensor_split[1] = strix_fraction;
+        split_buft = ggml_backend_cuda_split_buffer_type(0, tensor_split);
+        split_alignment = ggml_backend_buft_get_alignment(split_buft);
+        std::fprintf(stderr,
+                     "[deepseek4-dense-tp] mask=%d row split R9700=%.3f Strix=%.3f\n",
+                     dense_tp_mask, 1.0f - strix_fraction, strix_fraction);
+    }
 
     std::vector<DS4TensorAlloc> allocs;
     allocs.reserve(n_tensors);
     size_t total_buf_size = 0;
+    size_t split_total_buf_size = 0;
     size_t tok_embd_alloc_idx = SIZE_MAX;
 
     for (int ti = 0; ti < n_tensors; ti++) {
@@ -438,10 +497,20 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         a.tensor_offset = tensor_offset;
         a.file_size = gguf_get_tensor_size(gctx, ti);
         a.upload_to_backend = upload_to_backend;
+        a.dense_split = upload_to_backend && split_buft &&
+                        should_split_ds4_dense_tensor(tname, dense_tp_mask);
         if (upload_to_backend) {
-            total_buf_size = align_up_size(total_buf_size, alignment);
-            a.buffer_offset = total_buf_size;
-            total_buf_size += ggml_backend_buft_get_alloc_size(buft, t);
+            if (a.dense_split) {
+                split_total_buf_size = align_up_size(
+                    split_total_buf_size, split_alignment);
+                a.buffer_offset = split_total_buf_size;
+                split_total_buf_size +=
+                    ggml_backend_buft_get_alloc_size(split_buft, t);
+            } else {
+                total_buf_size = align_up_size(total_buf_size, alignment);
+                a.buffer_offset = total_buf_size;
+                total_buf_size += ggml_backend_buft_get_alloc_size(buft, t);
+            }
         }
         allocs.push_back(a);
         if (std::strcmp(tname, "token_embd.weight") == 0) {
@@ -451,6 +520,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
 
     // ── Allocate GPU buffer ─────────────────────────────────────────────
     ggml_backend_buffer_t buf = nullptr;
+    ggml_backend_buffer_t split_buf = nullptr;
     if (total_buf_size > 0) {
         buf = ggml_backend_alloc_buffer(backend, total_buf_size);
         if (!buf) {
@@ -461,14 +531,36 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         }
         ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     }
+    if (split_total_buf_size > 0) {
+        split_buf = ggml_backend_buft_alloc_buffer(
+            split_buft, split_total_buf_size);
+        if (!split_buf) {
+            set_last_error("failed to allocate dense TP split buffer (" +
+                           std::to_string(split_total_buf_size) + " bytes)");
+            if (buf) ggml_backend_buffer_free(buf);
+            gguf_free(gctx);
+            if (meta_ctx) ggml_free(meta_ctx);
+            return false;
+        }
+        ggml_backend_buffer_set_usage(
+            split_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
 
     // ── Assign tensors from meta_ctx to the backend buffer ──────────────
     // Use ggml_backend_tensor_alloc to properly set the buffer association.
     char * buf_base = buf ? (char *)ggml_backend_buffer_get_base(buf) : nullptr;
+    char * split_buf_base = split_buf
+        ? (char *)ggml_backend_buffer_get_base(split_buf) : nullptr;
     for (auto & a : allocs) {
-        if (!a.upload_to_backend || !buf) continue;
-        if (ggml_backend_tensor_alloc(buf, a.tensor, buf_base + a.buffer_offset) != GGML_STATUS_SUCCESS) {
+        if (!a.upload_to_backend) continue;
+        ggml_backend_buffer_t tensor_buf = a.dense_split ? split_buf : buf;
+        char * tensor_base = a.dense_split ? split_buf_base : buf_base;
+        if (!tensor_buf ||
+            ggml_backend_tensor_alloc(tensor_buf, a.tensor,
+                                      tensor_base + a.buffer_offset) !=
+                GGML_STATUS_SUCCESS) {
             set_last_error("ggml_backend_tensor_alloc failed");
+            if (split_buf) ggml_backend_buffer_free(split_buf);
             if (buf) ggml_backend_buffer_free(buf);
             gguf_free(gctx);
             ggml_free(meta_ctx);
@@ -481,6 +573,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     std::string mmap_err;
     if (!mmap.open_ro(path, mmap_err)) {
         set_last_error("mmap: " + mmap_err);
+        if (split_buf) ggml_backend_buffer_free(split_buf);
         if (buf) ggml_backend_buffer_free(buf);
         gguf_free(gctx);
         ggml_free(meta_ctx);
@@ -496,6 +589,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
                                              a.file_size,
                                              mmap.len));
             mmap.close_map();
+            if (split_buf) ggml_backend_buffer_free(split_buf);
             if (buf) ggml_backend_buffer_free(buf);
             gguf_free(gctx);
             ggml_free(meta_ctx);
@@ -518,7 +612,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
             size_t i;
             while ((i = next.fetch_add(1)) < allocs.size()) {
                 auto & a = allocs[i];
-                if (!a.upload_to_backend) continue;
+                if (!a.upload_to_backend || a.dense_split) continue;
                 char * dst = (char *) a.tensor->data;
                 size_t done = 0;
                 while (done < a.file_size) {
@@ -534,9 +628,17 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         for (auto & th : pool) th.join();
         posix_fadvise(mmap.fd, 0, (off_t) mmap.len, POSIX_FADV_DONTNEED);
         ggml_backend_synchronize(backend);  // make CPU-written managed pages visible to GPU
+        // Split tensors have no single CPU-visible base address. Upload them
+        // through the split buffer, which distributes whole rows to each GPU.
+        for (auto & a : allocs) {
+            if (!a.upload_to_backend || !a.dense_split) continue;
+            const void * src_data = (const char *)mmap.addr + a.file_offset;
+            ggml_backend_tensor_set(a.tensor, src_data, 0, a.file_size);
+        }
         if (!read_ok) {
             set_last_error("parallel weight read failed");
             mmap.close_map();
+            if (split_buf) ggml_backend_buffer_free(split_buf);
             if (buf) ggml_backend_buffer_free(buf);
             gguf_free(gctx);
             ggml_free(meta_ctx);
@@ -567,6 +669,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
             emb_mmap.close_map();
         } else {
             set_last_error("embedder mmap: " + emb_err);
+            if (split_buf) ggml_backend_buffer_free(split_buf);
             if (buf) ggml_backend_buffer_free(buf);
             gguf_free(gctx);
             ggml_free(meta_ctx);
@@ -654,12 +757,24 @@ bool load_deepseek4_gguf_partial(const std::string & path,
 
     out.ctx = meta_ctx;
     out.buf = buf;
+    out.dense_split_buf = split_buf;
+    // Pointer equality is insufficient to identify a reload: allocators may
+    // reuse the same ggml_context address after park/unpark. Cached graphs use
+    // this generation to reject tensors from the prior model lifetime.
+    static std::atomic<uint64_t> next_runtime_generation{1};
+    out.runtime_generation =
+        next_runtime_generation.fetch_add(1, std::memory_order_relaxed);
+    if (out.runtime_generation == 0) {
+        out.runtime_generation =
+            next_runtime_generation.fetch_add(1, std::memory_order_relaxed);
+    }
 
     gguf_free(gctx);
     // Note: meta_ctx is now owned by out.ctx — do NOT free it here.
 
-    std::fprintf(stderr, "[deepseek4] loaded %zu tensors, %.1f MB GPU buffer%s\n",
+    std::fprintf(stderr, "[deepseek4] loaded %zu tensors, %.1f MB GPU buffer, %.1f MB dense TP split%s\n",
                  allocs.size(), (double)total_buf_size / (1024.0 * 1024.0),
+                 (double)split_total_buf_size / (1024.0 * 1024.0),
                  plan.expert_metadata_only ? " [expert-metadata-only]" : "");
     return true;
 }
@@ -790,7 +905,8 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
         const MoeHybridPlacement & placement,
         const MoeHybridConfig * cfg_override,
         MoeHybridStorage & out,
-        std::string * err) {
+        std::string * err,
+        ggml_backend_t cold_gpu_backend) {
     ggml_context * expert_meta = nullptr;
     gguf_init_params gip{};
     gip.no_alloc = true;
@@ -859,7 +975,7 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
     const MoeHybridConfig cfg = cfg_override ? *cfg_override : make_ds4_moe_hybrid_config(w);
     const bool ok = build_moe_hybrid_storage_from_file_with_mmap(
         cfg, backend, placement, layer_descs, layer_file_data,
-        mmap.addr, mmap.len, out, err);
+        mmap.addr, mmap.len, out, err, 0, cold_gpu_backend);
 
     if (!ok) {
         mmap.close_map();
@@ -884,12 +1000,18 @@ bool build_deepseek4_moe_hybrid_storage_from_file(
 }
 
 void free_deepseek4_weights(DeepSeek4Weights & w) {
+    deepseek4_release_runtime_graphs(w);
     if (w.ctx) { ggml_free(w.ctx); w.ctx = nullptr; }
+    if (w.dense_split_buf) {
+        ggml_backend_buffer_free(w.dense_split_buf);
+        w.dense_split_buf = nullptr;
+    }
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     w.layers.clear();
     w.embedder.tok_embd_owned.clear();
     w.embedder.tok_embd_bytes = nullptr;
     w.moe_hybrid = false;
+    w.runtime_generation = 0;
 }
 
 }  // namespace dflash::common

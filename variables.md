@@ -243,6 +243,8 @@ Untagged variables are operational tuning knobs.
 |---|---|
 | `DFLASH_MMID_GROUPED` | Grouped `MUL_MAT_ID` kernel for small verify batches. |
 | `DFLASH_MMID_GROUPED_TYPES` | Types eligible for the grouped MMID kernel. |
+| `DFLASH_MMID_GROUPED_DEVICE` | Optional device restriction for the grouped MMID kernel. |
+| `DFLASH_DS4_TP_BATCH_PEER_COPIES` | Batch a scheduler split's HIP peer copies behind one dependency. |
 | `DFLASH_MMQ_FULL_BATCH_MIN` / `DFLASH_MMQ_SUB_BATCH` | MMQ batch thresholds. |
 | `DFLASH_CUDA_MMVQ_TOKENWISE` / `DFLASH_CUDA_MMVQ_MOE_TOKENWISE` / `DFLASH_CUDA_MMVQ_MOE_KERNEL` | MMVQ token-wise / MoE kernel selection. |
 | `DFLASH_GDN_FORCE_GROUPED_COLS` / `DFLASH_GDN_NO_GROUPED_COLS` | Gated-delta-net grouped-column control. |
