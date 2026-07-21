@@ -945,7 +945,6 @@ if(DFLASH27B_TESTS)
 
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
-        find_program(DFLASH_GREP_EXECUTABLE grep REQUIRED)
         set(_server_unit_sources
             test/test_unit_main.cpp
             test/test_server_unit.cpp
@@ -1007,50 +1006,25 @@ if(DFLASH27B_TESTS)
         else()
             target_link_libraries(test_server_unit PRIVATE hip::host)
         endif()
-        set(_server_unit_cpputf_sources ${_server_unit_sources})
-        list(REMOVE_ITEM _server_unit_cpputf_sources test/test_unit_main.cpp)
-        set(_server_unit_cpputf_source_paths)
-        foreach(_cpputf_source IN LISTS _server_unit_cpputf_sources)
-            list(APPEND _server_unit_cpputf_source_paths
-                "${CMAKE_CURRENT_SOURCE_DIR}/${_cpputf_source}")
-        endforeach()
-        execute_process(
-            COMMAND ${DFLASH_GREP_EXECUTABLE} -h -E
-                "TEST_CASE(_WITH_TAGS)?\\([[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*,[[:space:]]*[A-Za-z_][A-Za-z0-9_]*"
-                ${_server_unit_cpputf_source_paths}
-            OUTPUT_VARIABLE _server_unit_cpputf_matches
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            RESULT_VARIABLE _server_unit_cpputf_grep_result
-        )
-        if(NOT _server_unit_cpputf_grep_result EQUAL 0 AND
-           NOT _server_unit_cpputf_grep_result EQUAL 1)
-            message(FATAL_ERROR "grep failed while discovering test_server_unit TEST_CASE entries")
-        endif()
-        if(_server_unit_cpputf_matches)
-            string(REPLACE "\n" ";" _server_unit_cpputf_match_lines "${_server_unit_cpputf_matches}")
-            set(_server_unit_ctest_names)
-            foreach(_cpputf_line IN LISTS _server_unit_cpputf_match_lines)
-                if(_cpputf_line MATCHES
-                   "TEST_CASE(_WITH_TAGS)?\\([ \t]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*,[ \t]*([A-Za-z_][A-Za-z0-9_]*)")
-                    set(_cpputf_fixture "${CMAKE_MATCH_2}")
-                    set(_cpputf_case "${CMAKE_MATCH_3}")
-                    set(_cpputf_keyword "${_cpputf_fixture}::${_cpputf_case}")
-                    string(REPLACE "::" "." _cpputf_ctest_suffix "${_cpputf_keyword}")
-                    set(_cpputf_ctest_name "test_server_unit.${_cpputf_ctest_suffix}")
-                    list(FIND _server_unit_ctest_names "${_cpputf_ctest_name}" _cpputf_existing_idx)
-                    if(_cpputf_existing_idx EQUAL -1)
-                        add_test(NAME "${_cpputf_ctest_name}"
-                            COMMAND test_server_unit "${_cpputf_keyword}")
-                        list(APPEND _server_unit_ctest_names "${_cpputf_ctest_name}")
-                    endif()
-                endif()
-            endforeach()
-            unset(_server_unit_ctest_names)
-            unset(_server_unit_cpputf_match_lines)
-        endif()
-        unset(_server_unit_cpputf_matches)
-        unset(_server_unit_cpputf_source_paths)
-        unset(_server_unit_cpputf_sources)
+        set(_server_unit_ctest_generated
+            "${CMAKE_CURRENT_BINARY_DIR}/test_server_unit_discovered_tests.cmake")
+        set(_server_unit_ctest_include
+            "${CMAKE_CURRENT_BINARY_DIR}/test_server_unit_discovered_tests_include.cmake")
+        file(GENERATE OUTPUT "${_server_unit_ctest_include}"
+            CONTENT "include([==[${_server_unit_ctest_generated}]==] OPTIONAL)\n")
+        set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
+            "${_server_unit_ctest_include}")
+        add_custom_command(TARGET test_server_unit POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                -DTEST_EXECUTABLE=$<TARGET_FILE:test_server_unit>
+                -DTEST_WORKING_DIR=${CMAKE_CURRENT_BINARY_DIR}
+                -DCTEST_FILE=${_server_unit_ctest_generated}
+                -DTEST_PREFIX=test_server_unit.
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/DiscoverCppUnitTests.cmake
+            VERBATIM
+            COMMENT "Discovering CppUnitTestFramework tests for test_server_unit")
+        unset(_server_unit_ctest_generated)
+        unset(_server_unit_ctest_include)
         unset(_server_unit_sources)
         list(APPEND _raw_unit_test_targets test_server_unit)
     endif()
