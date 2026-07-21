@@ -254,6 +254,7 @@ add_library(dflash_common STATIC
     # DeepSeek V4 Flash target arch
     src/deepseek4/deepseek4_loader.cpp
     src/deepseek4/deepseek4_graph.cpp
+    src/deepseek4/deepseek4_gpu_profiler.cpp
     src/deepseek4/deepseek4_backend.cpp
     src/deepseek4/deepseek4_daemon.cpp
     src/deepseek4/deepseek4_layer_split_adapter.cpp
@@ -388,7 +389,7 @@ endif()
 if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     target_link_libraries(dflash_common PUBLIC CUDA::cudart)
 elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
-    target_link_libraries(dflash_common PUBLIC hip::host)
+    target_link_libraries(dflash_common PUBLIC hip::host ${CMAKE_DL_LIBS})
 endif()
 
 # FlashPrefill custom kernels.

@@ -25,6 +25,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_ADAPTIVE_K_DENSE` | per-model default | CSV of MoE layers kept dense under adaptive-K (DFlash capture layers). Warned-inert on families that do not thread layer indices yet. |
 | `DFLASH_MMID_GROUPED` | unset | Grouped MUL_MAT_ID kernel for small verify batches; candidate for CLI promotion. |
 | `DFLASH_MMID_TELEMETRY` | unset | DEBUG: report MUL_MAT_ID dispatch, MMVQ variant, and per-node graph compatibility. |
+| `DFLASH_DS4_GPU_PROFILE` | unset | DEBUG: HIP-event DS4 phase timings and optional ROCTX ranges. `0` is disabled. |
 | `DFLASH_KVFLASH` | unset | Prefer the CLI: `--kvflash` (token count or `auto`). |
 
 ## Full inventory (generated)
@@ -57,6 +58,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DRAFT_KV` - laguna_backend.cpp, qwen35_backend.cpp
 - `DFLASH_DRAFT_PERSIST` - laguna_backend.cpp
 - `DFLASH_DROP_COLD` - qwen35moe_backend.cpp, qwen35moe_pipelined_decode.cpp
+- `DFLASH_DS4_GPU_PROFILE` - deepseek4_graph.cpp, deepseek4_dspark_spec.cpp
 - `DFLASH_DS4_TIMING` - deepseek4_target_shard_ipc_daemon.cpp
 - `DFLASH_EXPERT_BUDGET_MB` - deepseek4_backend.cpp, laguna_backend.cpp, qwen35moe_backend.cpp
 - `DFLASH_EXPERT_BUDGET_PCT` - laguna_backend.cpp

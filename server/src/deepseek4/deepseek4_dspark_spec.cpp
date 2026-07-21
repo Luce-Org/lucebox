@@ -22,6 +22,7 @@
 // DFLASH_DS4_FULL_SNAP=1 for A/B validation.
 
 #include "deepseek4_dspark.h"
+#include "deepseek4_gpu_profiler.h"
 #include "deepseek4_internal.h"
 #include "internal.h"
 #include "common/dspark_head.h"
@@ -38,6 +39,10 @@
 #include <vector>
 
 namespace dflash::common {
+
+namespace {
+bool spec_env_flag(const char * name);
+}
 
 // ── DFlashTarget adapter over the DS4 target ────────────────────────────
 class DeepSeek4DFlashTarget : public DFlashTarget {
@@ -71,7 +76,16 @@ public:
             const char * v = std::getenv("DFLASH_DS4_SEQ_VERIFY");
             return v && *v && *v != '0';
         }();
+        const bool approximate_fused =
+            spec_env_flag("DFLASH_DS4_FUSED_VERIFY") &&
+            spec_env_flag("DFLASH_DS4_ALLOW_APPROX_FUSED_VERIFY");
+        const char * profile_mode = seq_verify ? "exact_sequential" :
+            (approximate_fused ? "approx_fused" : "exact");
+        Ds4GpuProfiler verify_profiler(
+            spec_env_flag("DFLASH_DS4_GPU_PROFILE"), "verification",
+            profile_mode, n, base_pos);
         if (seq_verify) {
+            verify_profiler.begin(Ds4GpuPhase::VerificationStep);
             std::vector<int32_t> am_all;
             std::vector<float> feat_all;
             std::vector<float> logits_all;
@@ -98,22 +112,27 @@ public:
             last_tok = am_all.back();
             verify_n_ = n;
             if (all_argmax) *all_argmax = std::move(am_all);
+            verify_profiler.end(Ds4GpuPhase::VerificationStep);
+            verify_profiler.emit();
             return true;
         }
         std::vector<int32_t> am;
         // n==1 must take the dynamic (non-reuse) path: the reused decode graph
         // skips the capture/all-logits hooks (backend HC), which this needs.
-        if (!deepseek4_dspark_verify_forward(backend_, device_, w_, cache_, capture_ids_,
-                                             embed_buf_.data(), tokens.data(), n, base_pos, am,
-                                             keep_logits_ ? &verify_logits_ : nullptr,
-                                             verify_features_, telemetry_,
-                                             /*allow_graph_reuse=*/n > 1)) {
+        verify_profiler.begin(Ds4GpuPhase::VerificationStep);
+        const bool verify_ok = deepseek4_dspark_verify_forward(
+            backend_, device_, w_, cache_, capture_ids_, embed_buf_.data(), tokens.data(),
+            n, base_pos, am, keep_logits_ ? &verify_logits_ : nullptr,
+            verify_features_, telemetry_, /*allow_graph_reuse=*/n > 1);
+        verify_profiler.end(Ds4GpuPhase::VerificationStep);
+        if (!verify_ok) {
             return false;
         }
         if (am.empty()) return false;
         last_tok = am.back();
         verify_n_ = n;
         if (all_argmax) *all_argmax = std::move(am);
+        verify_profiler.emit();
         return true;
     }
 

@@ -9,6 +9,7 @@
 //   6. MoE FFN (hash routing + top-k + shared expert + clamped SwiGLU)
 
 #include "deepseek4_internal.h"
+#include "deepseek4_gpu_profiler.h"
 #include "deepseek4_hc_cuda.h"
 #include "internal.h"
 #include "../common/step_graph.h"
@@ -4954,11 +4955,18 @@ static int ds4_try_fused_decode_step(
     if (telemetry) telemetry->full_graph_set_us += ds4_elapsed_us(set_t0, Ds4TimingClock::now());
 
     // ── Compute ─────────────────────────────────────────────────────
+    Ds4GpuProfiler fused_profiler(
+        ds4_backend_is_hip(backend) && ds4_env_flag("DFLASH_DS4_GPU_PROFILE"),
+        "forward", "fused_decode", 1, kv_start);
     const auto compute_t0 = Ds4TimingClock::now();
-    if (ggml_backend_graph_compute(backend, fg->sg.gf) != GGML_STATUS_SUCCESS) {
+    fused_profiler.begin(Ds4GpuPhase::FusedDecodeGraph);
+    const ggml_status fused_status = ggml_backend_graph_compute(backend, fg->sg.gf);
+    fused_profiler.end(Ds4GpuPhase::FusedDecodeGraph);
+    if (fused_status != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[deepseek4] fused decode graph compute failed\n");
         return -1;
     }
+    fused_profiler.emit();
     if (telemetry) telemetry->full_graph_compute_us += ds4_elapsed_us(compute_t0, Ds4TimingClock::now());
 
     // ── Read logits ─────────────────────────────────────────────────
@@ -4986,7 +4994,8 @@ static bool ds4_run_exact_tokenwise_prefill_attention(
         DeepSeek4AttentionImpl attention_impl,
         std::vector<float> & attn_out_host,
         DeepSeek4CachedLayerAlloc & attn_alloc,
-        DeepSeek4StepTelemetry * telemetry) {
+        DeepSeek4StepTelemetry * telemetry,
+        Ds4GpuProfiler * gpu_profiler) {
     if (!backend || !cur || n_tokens <= 1 || kv_start < 0) return false;
 
     const int n_embd = w.n_embd;
@@ -5053,7 +5062,9 @@ static bool ds4_run_exact_tokenwise_prefill_attention(
         }
 
         const auto compute_t0 = Ds4TimingClock::now();
+        if (gpu_profiler) gpu_profiler->begin(Ds4GpuPhase::Attention);
         const ggml_status status = ggml_backend_graph_compute(backend, gf);
+        if (gpu_profiler) gpu_profiler->end(Ds4GpuPhase::Attention);
         if (telemetry) {
             telemetry->attn_compute_us += ds4_elapsed_us(
                 compute_t0, Ds4TimingClock::now());
@@ -5846,6 +5857,12 @@ bool deepseek4_step_layer_range(
     const int n_hc = w.n_hc;
     const int hc_dim = n_hc * n_embd;
     const bool is_last_shard = (layer_end >= w.n_layer);
+    const bool gpu_profile_enabled =
+        ds4_backend_is_hip(backend) && ds4_env_flag("DFLASH_DS4_GPU_PROFILE");
+    const char * gpu_profile_mode = verify_hooks ? "exact_verify" :
+        (n_tokens == 1 ? "decode" : "prefill");
+    Ds4GpuProfiler gpu_profiler(gpu_profile_enabled, "forward", gpu_profile_mode,
+                                n_tokens, kv_start);
 
     // A dynamic batch may be supplied by callers other than the DSpark
     // verifier. Split it whenever it spans a learned-compressor boundary:
@@ -6138,7 +6155,8 @@ bool deepseek4_step_layer_range(
                 if (telemetry) telemetry->hc_pre_build_us += ds4_elapsed_us(hc_pre_attn_build_t0, Ds4TimingClock::now());
             }
             const auto hc_pre_attn_compute_t0 = Ds4TimingClock::now();
-            if (!ds4_try_gpu_hc_pre_device(cached.sg.hidden_states,
+            gpu_profiler.begin(Ds4GpuPhase::HcPre);
+            const bool hc_pre_ok = ds4_try_gpu_hc_pre_device(cached.sg.hidden_states,
                                            cached.post,
                                            cached.comb,
                                            backend,
@@ -6154,7 +6172,9 @@ bool deepseek4_step_layer_range(
                                            n_embd,
                                            n_hc,
                                            w.n_hc_sinkhorn_iter,
-                                           w.hc_eps)) {
+                                           w.hc_eps);
+            gpu_profiler.end(Ds4GpuPhase::HcPre);
+            if (!hc_pre_ok) {
                 std::fprintf(stderr, "[deepseek4] direct hc-pre compute failed layer %d attn\n", il);
                 return false;
             }
@@ -6180,7 +6200,10 @@ bool deepseek4_step_layer_range(
             ggml_backend_tensor_copy(hc_state_backend, cached.sg.inp_embed);
             if (telemetry) telemetry->hc_pre_input_us += ds4_elapsed_us(hc_pre_attn_input_t0, Ds4TimingClock::now());
             const auto hc_pre_attn_compute_t0 = Ds4TimingClock::now();
-            if (ggml_backend_graph_compute(backend, cached.sg.gf) != GGML_STATUS_SUCCESS) {
+            gpu_profiler.begin(Ds4GpuPhase::HcPre);
+            const ggml_status hc_pre_status = ggml_backend_graph_compute(backend, cached.sg.gf);
+            gpu_profiler.end(Ds4GpuPhase::HcPre);
+            if (hc_pre_status != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "[deepseek4] cached hc-pre compute failed layer %d attn\n", il);
                 return false;
             }
@@ -6214,7 +6237,8 @@ bool deepseek4_step_layer_range(
                 if (!ds4_run_exact_tokenwise_prefill_attention(
                         backend, w, L, lc, il, cur.data(), n_tokens, kv_start,
                         attention_impl, attn_out_host,
-                        cached_attn_allocs[(size_t) il], telemetry)) {
+                        cached_attn_allocs[(size_t) il], telemetry,
+                        &gpu_profiler)) {
                     return false;
                 }
             } else if (reuse_decode_attn) {
@@ -6361,7 +6385,10 @@ bool deepseek4_step_layer_range(
 
             if (!exact_tokenwise_prefill) {
             const auto attn_compute_t0 = Ds4TimingClock::now();
-            if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            gpu_profiler.begin(Ds4GpuPhase::Attention);
+            const ggml_status attn_status = ggml_backend_graph_compute(backend, gf);
+            gpu_profiler.end(Ds4GpuPhase::Attention);
+            if (attn_status != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "[deepseek4] attn compute failed layer %d\n", il);
                 if (ctx) ggml_free(ctx);
                 return false;
@@ -6375,7 +6402,11 @@ bool deepseek4_step_layer_range(
                 ggml_backend_tensor_copy(attn_post_backend, cached_decode_hc_post_graph.post);
                 ggml_backend_tensor_copy(attn_comb_backend, cached_decode_hc_post_graph.comb);
                 const auto hc_post_attn_t0 = Ds4TimingClock::now();
-                if (ggml_backend_graph_compute(backend, cached_decode_hc_post_graph.sg.gf) != GGML_STATUS_SUCCESS) {
+                gpu_profiler.begin(Ds4GpuPhase::HcPost);
+                const ggml_status hc_post_status = ggml_backend_graph_compute(
+                    backend, cached_decode_hc_post_graph.sg.gf);
+                gpu_profiler.end(Ds4GpuPhase::HcPost);
+                if (hc_post_status != GGML_STATUS_SUCCESS) {
                     std::fprintf(stderr, "[deepseek4] cached hc-post compute failed layer %d attn\n", il);
                     if (ctx) ggml_free(ctx);
                     return false;
@@ -6423,7 +6454,8 @@ bool deepseek4_step_layer_range(
                 if (telemetry) telemetry->hc_pre_build_us += ds4_elapsed_us(hc_pre_ffn_build_t0, Ds4TimingClock::now());
             }
             const auto hc_pre_ffn_compute_t0 = Ds4TimingClock::now();
-            if (!ds4_try_gpu_hc_pre_device(cached.sg.hidden_states,
+            gpu_profiler.begin(Ds4GpuPhase::HcPre);
+            const bool hc_pre_ok = ds4_try_gpu_hc_pre_device(cached.sg.hidden_states,
                                            cached.post,
                                            cached.comb,
                                            backend,
@@ -6439,7 +6471,9 @@ bool deepseek4_step_layer_range(
                                            n_embd,
                                            n_hc,
                                            w.n_hc_sinkhorn_iter,
-                                           w.hc_eps)) {
+                                           w.hc_eps);
+            gpu_profiler.end(Ds4GpuPhase::HcPre);
+            if (!hc_pre_ok) {
                 std::fprintf(stderr, "[deepseek4] direct hc-pre compute failed layer %d ffn\n", il);
                 return false;
             }
@@ -6465,7 +6499,10 @@ bool deepseek4_step_layer_range(
             ggml_backend_tensor_copy(hc_state_backend, cached.sg.inp_embed);
             if (telemetry) telemetry->hc_pre_input_us += ds4_elapsed_us(hc_pre_ffn_input_t0, Ds4TimingClock::now());
             const auto hc_pre_ffn_compute_t0 = Ds4TimingClock::now();
-            if (ggml_backend_graph_compute(backend, cached.sg.gf) != GGML_STATUS_SUCCESS) {
+            gpu_profiler.begin(Ds4GpuPhase::HcPre);
+            const ggml_status hc_pre_status = ggml_backend_graph_compute(backend, cached.sg.gf);
+            gpu_profiler.end(Ds4GpuPhase::HcPre);
+            if (hc_pre_status != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "[deepseek4] cached hc-pre compute failed layer %d ffn\n", il);
                 return false;
             }
@@ -6534,7 +6571,9 @@ bool deepseek4_step_layer_range(
             }
 
             const auto ffn_compute_t0 = Ds4TimingClock::now();
+            gpu_profiler.begin(Ds4GpuPhase::MoeFfn);
             auto status = ggml_backend_graph_compute(backend, cached.sg.gf);
+            gpu_profiler.end(Ds4GpuPhase::MoeFfn);
             if (telemetry) telemetry->ffn_compute_us += ds4_elapsed_us(ffn_compute_t0, Ds4TimingClock::now());
             if (status != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "[deepseek4] cached ffn compute failed layer %d\n", il);
@@ -6549,7 +6588,11 @@ bool deepseek4_step_layer_range(
                 ggml_backend_tensor_copy(ffn_post_backend, cached_decode_hc_post_graph.post);
                 ggml_backend_tensor_copy(ffn_comb_backend, cached_decode_hc_post_graph.comb);
                 const auto hc_post_ffn_t0 = Ds4TimingClock::now();
-                if (ggml_backend_graph_compute(backend, cached_decode_hc_post_graph.sg.gf) != GGML_STATUS_SUCCESS) {
+                gpu_profiler.begin(Ds4GpuPhase::HcPost);
+                const ggml_status hc_post_status = ggml_backend_graph_compute(
+                    backend, cached_decode_hc_post_graph.sg.gf);
+                gpu_profiler.end(Ds4GpuPhase::HcPost);
+                if (hc_post_status != GGML_STATUS_SUCCESS) {
                     std::fprintf(stderr, "[deepseek4] cached hc-post compute failed layer %d ffn\n", il);
                     return false;
                 }
@@ -6625,7 +6668,11 @@ bool deepseek4_step_layer_range(
             }
             ggml_backend_tensor_set(cached_decode_output_graph.sg.hidden_input,
                                     final_embd.data(), 0, sizeof(float) * final_embd.size());
-            if (ggml_backend_graph_compute(backend, cached_decode_output_graph.sg.gf) != GGML_STATUS_SUCCESS) {
+            gpu_profiler.begin(Ds4GpuPhase::OutputProjection);
+            const ggml_status output_status = ggml_backend_graph_compute(
+                backend, cached_decode_output_graph.sg.gf);
+            gpu_profiler.end(Ds4GpuPhase::OutputProjection);
+            if (output_status != GGML_STATUS_SUCCESS) {
                 return false;
             }
             out_logits->resize((size_t)w.n_vocab);
@@ -6670,7 +6717,10 @@ bool deepseek4_step_layer_range(
                 : final_embd.data();
             ggml_backend_tensor_set(inp, output_input, 0,
                                     sizeof(float) * (size_t)n_embd * output_tokens);
-            if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            gpu_profiler.begin(Ds4GpuPhase::OutputProjection);
+            const ggml_status output_status = ggml_backend_graph_compute(backend, gf);
+            gpu_profiler.end(Ds4GpuPhase::OutputProjection);
+            if (output_status != GGML_STATUS_SUCCESS) {
                 ggml_free(ctx);
                 return false;
             }
@@ -6709,6 +6759,7 @@ bool deepseek4_step_layer_range(
 
     cache.cur_pos = next_pos;
     if (telemetry) telemetry->total_us += ds4_elapsed_us(step_t0, Ds4TimingClock::now());
+    gpu_profiler.emit();
     return true;
 }
 

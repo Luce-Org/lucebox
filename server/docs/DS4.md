@@ -129,12 +129,24 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | Variable | Purpose |
 |----------|---------|
 | `DFLASH_DS4_CUDA_LAYERS` | Override the auto-split heuristic and pin the first `N` DeepSeek4 layers to CUDA. The remaining `43 - N` layers run on the Halo shard. |
+| `DFLASH_DS4_GPU_PROFILE` | Enable HIP-event phase records and ROCTX ranges for DS4 forward and verification work. Default off; `0` is disabled. |
 | `DFLASH_DS4_TIMING` | Enable DS4 timing logs for the layer-split parent and target-shard daemon. Useful for profiling prefill/decode breakdowns; leave unset for normal runs. |
 
 `DFLASH_DS4_TIMING` enables the existing timing banners:
 
 - parent / local shard: `[deepseek4-split-timing]`
 - remote Halo shard: `[deepseek4-target-timing]`
+
+`DFLASH_DS4_GPU_PROFILE=1` emits stable records with the prefix
+`[ds4-gpu-profile]`, `clock=hip_event`, a scope and mode, a phase name, token
+width and position, GPU elapsed milliseconds, and the number of timed calls.
+Core exact-verification phases are `hc_pre`, `attention`, `moe_ffn`, `hc_post`,
+and `output_projection`; phases with no HIP work report zero calls. Exact
+verification also emits `verification_step`. Fused decode and the explicit
+approximate fused-verification research path emit whole-graph records because
+their phase boundaries are inside one captured graph. When `libroctx64` is
+available, the same phase names are pushed as ROCTX ranges; builds and runs do
+not require the library.
 
 DeepSeek4 no longer uses the old expert-split environment variables or expert-worker tuning knobs. Those retired knobs were removed from the codebase rather than left behind as unsupported debug switches.
 
