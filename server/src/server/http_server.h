@@ -228,6 +228,15 @@ struct ParsedRequest {
     DiskPrefixCachePolicy     disk_cache_policy;
 };
 
+// Parse request sampler fields, applying model-card defaults where present.
+SamplerCfg parse_request_sampler(const json & body,
+                                 const SamplingDefaults & defaults);
+
+// Read the required `messages` field. Throws std::invalid_argument when
+// it is missing or not a non-empty array; route_request's catch turns
+// that into a 400.
+json require_messages_array(const json & body);
+
 // Build the /props response body. Exposed (non-static) so unit tests
 // can assert on its shape without spinning up a real socket. See
 // docs/specs/props-endpoint.md for the wire contract.
@@ -285,6 +294,21 @@ private:
 
     // Route request to appropriate parser.
     bool route_request(int fd, const HttpRequest & hr);
+    // parse_common_request_fields, render_and_tokenize_request, and
+    // validate_request_context return false after sending an error
+    // response. parse_endpoint_request returns false only when the path
+    // is unsupported (the caller sends the 404).
+    bool parse_common_request_fields(int fd, const json & body,
+                                     ParsedRequest & req);
+    bool parse_endpoint_request(const std::string & path, const json & body,
+                                ParsedRequest & req, bool & count_tokens_only);
+    void apply_request_reasoning(const json & body, ParsedRequest & req);
+    bool render_and_tokenize_request(
+        int fd, const std::vector<ChatMessage> & chat_messages,
+        ParsedRequest & req);
+    bool validate_request_context(int fd, const ParsedRequest & req);
+    void log_parsed_request(const ParsedRequest & req) const;
+    void enqueue_request_and_wait(int fd, ParsedRequest req);
 
     // Send HTTP response helpers.
     bool send_response(int fd, int status, const std::string & content_type,

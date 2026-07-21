@@ -39,6 +39,8 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
+#include <utility>
 
 #if defined(_WIN32)
 #include <io.h>
@@ -376,6 +378,50 @@ static const char * api_format_name(ApiFormat format) {
 
 static size_t json_array_size(const json & value) {
     return value.is_array() ? value.size() : 0;
+}
+
+// Sampler parameters. When the request omits a value, fall back to the
+// model card's sampling defaults (spec §3.3); when the card doesn't
+// supply one either, use the hard-coded default.
+SamplerCfg parse_request_sampler(const json & body,
+                                 const SamplingDefaults & defaults) {
+    SamplerCfg sampler;
+    sampler.temp = body.value(
+        "temperature", defaults.has_temperature ? defaults.temperature : 0.0f);
+    sampler.top_p = body.value(
+        "top_p", defaults.has_top_p ? defaults.top_p : 1.0f);
+    sampler.top_k = body.value(
+        "top_k", defaults.has_top_k ? defaults.top_k : 0);
+    if (body.contains("seed")) {
+        sampler.seed = body["seed"].get<uint64_t>();
+    }
+
+    // OpenAI-style additive penalties.
+    sampler.freq_pen = body.value("frequency_penalty", 0.0f);
+    sampler.pres_pen = body.value(
+        "presence_penalty",
+        defaults.has_presence_penalty ? defaults.presence_penalty : 0.0f);
+    // HuggingFace-style multiplicative repetition penalty (also used by
+    // vLLM, llama.cpp, etc.). Accepts both "repetition_penalty" and the
+    // shorter "rep_pen" for daemon compatibility.
+    sampler.rep_pen = body.value(
+        "repetition_penalty",
+        body.value("rep_pen",
+                   defaults.has_repetition_penalty
+                       ? defaults.repetition_penalty
+                       : 1.0f));
+    if (body.contains("rep_window")) {
+        sampler.rep_window = body["rep_window"].get<int>();
+    }
+    return sampler;
+}
+
+json require_messages_array(const json & body) {
+    if (!body.contains("messages") || !body["messages"].is_array() ||
+        body["messages"].empty()) {
+        throw std::invalid_argument("messages must be a non-empty array");
+    }
+    return body["messages"];
 }
 
 static bool env_flag_enabled(const char * name) {
@@ -1385,6 +1431,353 @@ void HttpServer::handle_client(int fd) {
     socket_close(fd);
 }
 
+// ─── Request parsing ────────────────────────────────────────────────────
+
+// Fields shared by every endpoint: stream/model/max-tokens, sampler,
+// tools, prefix-cache overrides, stop sequences.
+bool HttpServer::parse_common_request_fields(
+        int fd, const json & body, ParsedRequest & req) {
+    req.stream = body.value("stream", false);
+    req.model = body.value("model", config_.model_name);
+    req.disk_cache_policy = config_.disk_cache_policy;
+
+    // Accept the output-token names used by each supported API dialect.
+    // Default when the client omits all three: --default-max-tokens, so
+    // thinking-budget requests that omit max_tokens keep headroom for the
+    // visible reply after thinking.
+    req.max_output = body.value("max_tokens",
+                     body.value("max_output_tokens",
+                     body.value("max_completion_tokens", config_.default_max_tokens)));
+    // Spec §4.4: clamp request max_tokens to --default-max-tokens.
+    if (req.max_output > config_.default_max_tokens) {
+        std::fprintf(stderr,
+            "[server] max_tokens=%d clamped to default_max_tokens=%d\n",
+            req.max_output, config_.default_max_tokens);
+        req.max_output = config_.default_max_tokens;
+    }
+
+    req.sampler = parse_request_sampler(body, config_.sampler_defaults);
+    if (body.contains("tools")) req.tools = body["tools"];
+    // Tool choice constraint for hint generation.
+    if (body.contains("tool_choice")) req.tool_choice = body["tool_choice"];
+
+    if (body.contains("prefix_cache") && body["prefix_cache"].is_object()) {
+        const auto & prefix_cache = body["prefix_cache"];
+        if (prefix_cache.contains("scope") && prefix_cache["scope"].is_string() &&
+            !apply_request_scope_override(
+                req.disk_cache_policy, prefix_cache["scope"].get<std::string>())) {
+            send_error(fd, 400,
+                "prefix_cache.scope must be off, full, auto, auto:<window>, or a positive token count");
+            return false;
+        }
+        if (prefix_cache.contains("window") &&
+            prefix_cache["window"].is_number_integer()) {
+            const int window = prefix_cache["window"].get<int>();
+            if (window <= 0 || window > 1000000) {
+                send_error(fd, 400,
+                           "prefix_cache.window must be a positive integer");
+                return false;
+            }
+            req.disk_cache_policy.auto_window = window;
+        }
+    }
+
+    // Stop sequences — OpenAI uses "stop" (string or array), Anthropic
+    // uses "stop_sequences" (array).
+    if (body.contains("stop")) {
+        const auto & stop = body["stop"];
+        if (stop.is_string()) {
+            std::string value = stop.get<std::string>();
+            if (!value.empty()) req.stop_sequences.push_back(std::move(value));
+        } else if (stop.is_array()) {
+            for (const auto & item : stop) {
+                if (!item.is_string()) continue;
+                std::string value = item.get<std::string>();
+                if (!value.empty()) req.stop_sequences.push_back(std::move(value));
+            }
+        }
+    }
+    if (body.contains("stop_sequences") && body["stop_sequences"].is_array()) {
+        for (const auto & item : body["stop_sequences"]) {
+            if (!item.is_string()) continue;
+            std::string value = item.get<std::string>();
+            if (!value.empty()) req.stop_sequences.push_back(std::move(value));
+        }
+    }
+    return true;
+}
+
+// Path dispatch: sets the API format, response id, and message
+// extraction for each supported dialect.
+bool HttpServer::parse_endpoint_request(
+        const std::string & path, const json & body, ParsedRequest & req,
+        bool & count_tokens_only) {
+    count_tokens_only = false;
+    if (path == "/v1/chat/completions") {
+        req.format = ApiFormat::OPENAI_CHAT;
+        req.response_id = generate_id("chatcmpl");
+        req.messages = require_messages_array(body);
+        // Strip volatile billing header from messages[0] (OpenAI system).
+        if (req.messages.is_array() && !req.messages.empty()) {
+            auto & first_message = req.messages[0];
+            if (first_message.is_object() &&
+                first_message.value("role", "") == "system" &&
+                first_message.contains("content") &&
+                first_message["content"].is_string()) {
+                first_message["content"] = normalize_system_for_cache(req.messages);
+            }
+        }
+        return true;
+    }
+    if (path == "/v1/messages/count_tokens") {
+        // Shares Anthropic's message parsing; the flag makes route_request
+        // short-circuit before enqueueing a generation job.
+        req.format = ApiFormat::ANTHROPIC;
+        req.response_id = generate_id("count");
+        req.messages = body.value("messages", json::array());
+        normalize_anthropic_system(body, req.messages);
+        count_tokens_only = true;
+        return true;
+    }
+    if (path == "/v1/messages") {
+        req.format = ApiFormat::ANTHROPIC;
+        req.response_id = generate_id("msg");
+        req.messages = require_messages_array(body);
+        normalize_anthropic_system(body, req.messages);
+        return true;
+    }
+    if (path == "/v1/responses") {
+        req.format = ApiFormat::RESPONSES;
+        req.response_id = generate_id("resp");
+        // Responses API uses "input" instead of "messages".
+        if (body.contains("input")) req.messages = body["input"];
+        if (body.contains("instructions")) {
+            // Strip billing header from codex instructions before hashing.
+            std::string instructions = normalize_system_for_cache(body["instructions"]);
+            json system_message = {{"role", "system"}, {"content", instructions}};
+            if (req.messages.is_array()) {
+                req.messages.insert(req.messages.begin(), system_message);
+            } else {
+                req.messages = json::array({
+                    system_message,
+                    {{"role", "user"},
+                     {"content", body.value("input", json())}},
+                });
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+void HttpServer::apply_request_reasoning(
+        const json & body, ParsedRequest & req) {
+    // Explicit thinking budgets override reasoning-effort tiers. Template
+    // kwargs can still override whether the rendered prompt enables thinking.
+    // Default: thinking OFF (Qwen3.6 thinking wrecks DFlash acceptance
+    // rates; clients opt in explicitly).
+    bool enable_thinking = false;
+    int request_budget_tokens = -1;
+    int request_reply_budget = -1;
+    int effort_phase1_cap = -1;
+    bool effort_set = false;
+
+    auto apply_reasoning_effort = [&](const std::string & effort) {
+        if (effort == "none") {
+            enable_thinking = false;
+            return;
+        }
+
+        // Five-tier vocabulary (spec §4.2). Unknown tier → high.
+        int tier_value = config_.effort_tiers.high;
+        if (effort == "minimal" || effort == "low") {
+            tier_value = config_.effort_tiers.low;
+        } else if (effort == "medium") {
+            tier_value = config_.effort_tiers.medium;
+        } else if (effort == "x-high") {
+            tier_value = config_.effort_tiers.x_high;
+        } else if (effort == "max") {
+            tier_value = config_.effort_tiers.max;
+        }
+
+        effort_phase1_cap = tier_value;
+        effort_set = true;
+        enable_thinking = true;
+        // Spec §4.2: reasoning effort activates the budget envelope.
+        req.thinking_opt_in = true;
+    };
+
+    if (body.contains("reasoning")) {
+        const auto & reasoning = body["reasoning"];
+        if (reasoning.contains("effort")) {
+            apply_reasoning_effort(reasoning.value("effort", "high"));
+        } else {
+            enable_thinking = true;
+        }
+    }
+    if (!effort_set && body.contains("reasoning_effort") &&
+        body["reasoning_effort"].is_string()) {
+        apply_reasoning_effort(body["reasoning_effort"].get<std::string>());
+    }
+    if (body.contains("thinking")) {
+        const auto & thinking = body["thinking"];
+        if (thinking.contains("type")) {
+            const bool enabled = thinking.value("type", "") == "enabled";
+            enable_thinking = enabled;
+            req.thinking_opt_in = enabled;
+        }
+        if (thinking.contains("budget_tokens") &&
+            thinking["budget_tokens"].is_number_integer()) {
+            request_budget_tokens = thinking["budget_tokens"].get<int>();
+        }
+        if (thinking.contains("reply_budget") &&
+            thinking["reply_budget"].is_number_integer()) {
+            request_reply_budget = thinking["reply_budget"].get<int>();
+        }
+    }
+    if (body.contains("chat_template_kwargs")) {
+        const auto & kwargs = body["chat_template_kwargs"];
+        if (kwargs.contains("enable_thinking")) {
+            enable_thinking = kwargs["enable_thinking"].get<bool>();
+        }
+    }
+    req.thinking_enabled = enable_thinking;
+
+    // Spec §4.3 combined precedence + §4.4 clamping: thinking.budget_tokens
+    // (if set) wins over reasoning.effort for the phase-1 cap; either is
+    // clamped to the server ceilings.
+    if (request_budget_tokens >= 0) {
+        req.per_req_phase1_cap =
+            (std::min)(request_budget_tokens, config_.think_max_tokens);
+        if (request_budget_tokens > config_.think_max_tokens) {
+            std::fprintf(stderr,
+                "[server] thinking.budget_tokens=%d clamped to "
+                "think_max_tokens=%d\n",
+                request_budget_tokens, config_.think_max_tokens);
+        }
+    } else if (effort_set) {
+        // Spec §4.4: effective cap is min(tier value, max_tokens -
+        // hard_limit_reply_budget). Tier values can legitimately exceed
+        // default_max_tokens; clients that want the full tier budget must
+        // pass an explicit max_tokens. Otherwise we narrow silently to fit.
+        const int max_output_phase1_room = (std::max)(
+            0, req.max_output - config_.hard_limit_reply_budget);
+        req.per_req_phase1_cap =
+            (std::min)(effort_phase1_cap, max_output_phase1_room);
+        if (effort_phase1_cap > max_output_phase1_room) {
+            std::fprintf(stderr,
+                "[server] reasoning.effort tier=%d narrowed to %d "
+                "(max_tokens=%d - hard_limit_reply_budget=%d); "
+                "pass a larger max_tokens to use the full tier budget\n",
+                effort_phase1_cap, req.per_req_phase1_cap,
+                req.max_output, config_.hard_limit_reply_budget);
+        }
+    }
+    if (request_reply_budget >= 0) {
+        req.per_req_reply_budget =
+            (std::min)(request_reply_budget, config_.hard_limit_reply_budget);
+        if (request_reply_budget > config_.hard_limit_reply_budget) {
+            std::fprintf(stderr,
+                "[server] thinking.reply_budget=%d clamped to "
+                "hard_limit_reply_budget=%d\n",
+                request_reply_budget, config_.hard_limit_reply_budget);
+        }
+    }
+    // (The effort tier doesn't influence reply_budget — spec §4.2: the
+    // reply reserve falls back to --hard-limit-reply-budget.)
+}
+
+// Render messages to prompt text and tokenize into req.prompt_tokens.
+bool HttpServer::render_and_tokenize_request(
+        int fd, const std::vector<ChatMessage> & chat_messages,
+        ParsedRequest & req) {
+    std::string tools_json;
+    if (req.tools.is_array() && !req.tools.empty()) {
+        tools_json = req.tools.dump();
+    }
+
+    std::string rendered;
+    if (!config_.chat_template_src.empty()) {
+        // Jinja path: --chat-template-file overrides the hardcoded
+        // QWEN3/LAGUNA renderer. Used for tool-using agents that need the
+        // Anthropic tool_use envelope (e.g. froggeric Qwen3.6 template).
+        //
+        // Special tokens like <|im_start|> / <|im_end|> are stored verbatim
+        // in the GGUF vocab — use raw_token() to skip the GPT-2 byte decode
+        // (otherwise <0xC4><0x91> nonsense appears).
+        const std::string & bos = tokenizer_.bos_id() >= 0
+            ? tokenizer_.raw_token(tokenizer_.bos_id())
+            : std::string();
+        const std::string & eos = tokenizer_.eos_id() >= 0
+            ? tokenizer_.raw_token(tokenizer_.eos_id())
+            : std::string();
+        try {
+            rendered = render_chat_template_jinja(
+                config_.chat_template_src, chat_messages, bos, eos,
+                /*add_generation_prompt=*/true,
+                req.thinking_enabled, tools_json);
+        } catch (const std::exception & e) {
+            send_error(fd, 500,
+                std::string("chat template (jinja) render failed: ") + e.what());
+            return false;
+        }
+    } else {
+        rendered = render_chat_template(
+            chat_messages, chat_format_, /*add_generation_prompt=*/true,
+            req.thinking_enabled, tools_json);
+    }
+
+    req.started_in_thinking = prompt_ends_in_open_think(rendered);
+    req.prompt_tokens = tokenizer_.encode(rendered);
+    return true;
+}
+
+// Context-length gate. Oversized prompts pass through when compression
+// (pflash) will run — the post-compress check is the real gate.
+bool HttpServer::validate_request_context(int fd, const ParsedRequest & req) {
+    const int prompt_tokens = (int) req.prompt_tokens.size();
+    const bool pflash_will_run =
+        config_.pflash_mode != ServerConfig::PflashMode::OFF &&
+        drafter_tokenizer_ != nullptr &&
+        (config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
+         prompt_tokens >= config_.pflash_threshold);
+    if (!should_reject_oversized(
+            prompt_tokens, req.max_output, config_.max_ctx, pflash_will_run)) {
+        return true;
+    }
+    send_error(fd, 400,
+               context_overflow_message(
+                   config_.max_ctx, prompt_tokens, req.max_output));
+    return false;
+}
+
+void HttpServer::log_parsed_request(const ParsedRequest & req) const {
+    std::fprintf(stderr,
+        "[server] chat %s format=%s stream=%s msgs=%zu tools=%zu prompt_tokens=%zu "
+        "max_tokens=%d max_ctx=%d thinking=%s started_in_thinking=%s stops=%zu model=%s\n",
+        req.response_id.c_str(), api_format_name(req.format),
+        req.stream ? "true" : "false",
+        json_array_size(req.messages), json_array_size(req.tools),
+        req.prompt_tokens.size(), req.max_output, config_.max_ctx,
+        req.thinking_enabled ? "true" : "false",
+        req.started_in_thinking ? "true" : "false",
+        req.stop_sequences.size(), req.model.c_str());
+}
+
+void HttpServer::enqueue_request_and_wait(int fd, ParsedRequest req) {
+    // Set socket non-blocking for send() stall detection during streaming.
+    const int flags = sock_get_flags(fd);
+    if (flags >= 0) sock_set_nonblock(fd);
+
+    ServerJob job;
+    job.fd = fd;
+    job.req = std::move(req);
+    enqueue(&job);
+
+    std::unique_lock<std::mutex> lock(job.mu);
+    job.cv.wait(lock, [&]() { return job.done; });
+}
+
 bool HttpServer::route_request(int fd, const HttpRequest & hr) {
     if (hr.method != "POST") return false;
 
@@ -1392,410 +1785,40 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                  hr.path.c_str(), hr.body.size());
 
     ParsedRequest req;
-    std::string err;
-
+    bool count_tokens_only = false;
     try {
-        json body = json::parse(hr.body);
+        const json body = json::parse(hr.body);
         req.raw_body = body;
+        if (!parse_common_request_fields(fd, body, req)) return true;
+        if (!parse_endpoint_request(
+                hr.path, body, req, count_tokens_only)) return false;
 
-        // Common fields.
-        req.stream = body.value("stream", false);
-        req.model = body.value("model", config_.model_name);
-        req.disk_cache_policy = config_.disk_cache_policy;
-        // Default when client omits all three: use --default-max-tokens
-        // (16000, matches ds4_eval.c). Codex review flagged that
-        // --default-max-tokens was previously a dead flag because the
-        // parser read config_.max_tokens (legacy 4096) instead. The new
-        // default protects thinking-budget requests that omit max_tokens
-        // from being capped at 4096 — thinking alone can consume that,
-        // leaving no headroom for the visible reply.
-        req.max_output = body.value("max_tokens",
-                         body.value("max_output_tokens",
-                         body.value("max_completion_tokens", config_.default_max_tokens)));
-        // Spec §4.4: clamp request max_tokens to --default-max-tokens.
-        if (req.max_output > config_.default_max_tokens) {
-            std::fprintf(stderr,
-                "[server] max_tokens=%d clamped to default_max_tokens=%d\n",
-                req.max_output, config_.default_max_tokens);
-            req.max_output = config_.default_max_tokens;
-        }
-
-        // Sampler parameters. When the request omits a value, fall back to
-        // the model card's sampling defaults (spec §3.3); when the card
-        // doesn't supply one either, use the hard-coded default.
-        const auto & sd = config_.sampler_defaults;
-        req.sampler.temp = body.value("temperature",
-                                      sd.has_temperature ? sd.temperature : 0.0f);
-        req.sampler.top_p = body.value("top_p",
-                                       sd.has_top_p ? sd.top_p : 1.0f);
-        req.sampler.top_k = body.value("top_k",
-                                       sd.has_top_k ? sd.top_k : 0);
-        if (body.contains("seed")) {
-            req.sampler.seed = body["seed"].get<uint64_t>();
-        }
-
-        // OpenAI-style additive penalties.
-        req.sampler.freq_pen = body.value("frequency_penalty", 0.0f);
-        req.sampler.pres_pen = body.value("presence_penalty",
-                                          sd.has_presence_penalty ? sd.presence_penalty : 0.0f);
-
-        // HuggingFace-style multiplicative repetition penalty (also used by
-        // vLLM, llama.cpp, etc.). Accepts both "repetition_penalty" and
-        // the shorter "rep_pen" for daemon compatibility.
-        req.sampler.rep_pen = body.value("repetition_penalty",
-                              body.value("rep_pen",
-                                  sd.has_repetition_penalty ? sd.repetition_penalty : 1.0f));
-        if (body.contains("rep_window")) {
-            req.sampler.rep_window = body["rep_window"].get<int>();
-        }
-
-        // Tools.
-        if (body.contains("tools")) {
-            req.tools = body["tools"];
-        }
-        // Tool choice constraint for hint generation.
-        if (body.contains("tool_choice")) {
-            req.tool_choice = body["tool_choice"];
-        }
-
-        if (body.contains("prefix_cache") && body["prefix_cache"].is_object()) {
-            const auto & pc = body["prefix_cache"];
-            if (pc.contains("scope") && pc["scope"].is_string()) {
-                if (!apply_request_scope_override(req.disk_cache_policy,
-                                                  pc["scope"].get<std::string>())) {
-                    send_error(fd, 400,
-                        "prefix_cache.scope must be off, full, auto, auto:<window>, or a positive token count");
-                    return true;
-                }
-            }
-            if (pc.contains("window") && pc["window"].is_number_integer()) {
-                const int window = pc["window"].get<int>();
-                if (window <= 0 || window > 1000000) {
-                    send_error(fd, 400, "prefix_cache.window must be a positive integer");
-                    return true;
-                }
-                req.disk_cache_policy.auto_window = window;
-            }
-        }
-
-        // Stop sequences — OpenAI uses "stop" (string or array), Anthropic uses "stop_sequences" (array).
-        if (body.contains("stop")) {
-            auto & stop = body["stop"];
-            if (stop.is_string()) {
-                std::string s = stop.get<std::string>();
-                if (!s.empty()) req.stop_sequences.push_back(s);
-            } else if (stop.is_array()) {
-                for (const auto & item : stop) {
-                    if (item.is_string()) {
-                        std::string s = item.get<std::string>();
-                        if (!s.empty()) req.stop_sequences.push_back(s);
-                    }
-                }
-            }
-        }
-        if (body.contains("stop_sequences") && body["stop_sequences"].is_array()) {
-            for (const auto & item : body["stop_sequences"]) {
-                if (item.is_string()) {
-                    std::string s = item.get<std::string>();
-                    if (!s.empty()) req.stop_sequences.push_back(s);
-                }
-            }
-        }
-
-        // count_tokens shares Anthropic's message parsing; flag so we
-        // short-circuit before enqueueing the generation job.
-        bool count_tokens_only = false;
-
-        if (hr.path == "/v1/chat/completions") {
-            req.format = ApiFormat::OPENAI_CHAT;
-            req.response_id = generate_id("chatcmpl");
-            req.messages = body["messages"];
-            // Strip volatile billing header from messages[0] (OpenAI system).
-            if (req.messages.is_array() && !req.messages.empty()) {
-                auto & m0 = req.messages[0];
-                if (m0.is_object() && m0.value("role", "") == "system" &&
-                    m0.contains("content") && m0["content"].is_string()) {
-                    m0["content"] = dflash::common::normalize_system_for_cache(req.messages);
-                }
-            }
-        } else if (hr.path == "/v1/messages/count_tokens") {
-            req.format = ApiFormat::ANTHROPIC;
-            req.response_id = generate_id("count");
-            req.messages = body.value("messages", json::array());
-            normalize_anthropic_system(body, req.messages);
-            count_tokens_only = true;
-        } else if (hr.path == "/v1/messages") {
-            req.format = ApiFormat::ANTHROPIC;
-            req.response_id = generate_id("msg");
-            req.messages = body["messages"];
-            normalize_anthropic_system(body, req.messages);
-        } else if (hr.path == "/v1/responses") {
-            req.format = ApiFormat::RESPONSES;
-            req.response_id = generate_id("resp");
-            // Responses API uses "input" instead of "messages".
-            if (body.contains("input")) {
-                req.messages = body["input"];
-            }
-            if (body.contains("instructions")) {
-                // Strip billing header from codex instructions before hashing.
-                std::string inst = dflash::common::normalize_system_for_cache(body["instructions"]);
-                json sys_msg = {{"role", "system"}, {"content", inst}};
-                if (req.messages.is_array()) {
-                    req.messages.insert(req.messages.begin(), sys_msg);
-                } else {
-                    req.messages = json::array({sys_msg, {{"role", "user"}, {"content", body["input"]}}});
-                }
-            }
-        } else {
-            return false;
-        }
-
-        // Render messages to text and tokenize.
-        std::vector<ChatMessage> chat_msgs =
+        const std::vector<ChatMessage> chat_messages =
             normalize_chat_messages(req.messages, req.format, tool_memory_);
-
-        // Determine thinking mode BEFORE rendering so the template can inject
-        // the <think>\n\n</think>\n\n block when thinking is disabled.
-        // Default: thinking OFF (Qwen3.6 thinking wrecks
-        // DFlash acceptance rates; clients opt in explicitly).
-        bool enable_thinking = false;
-
-        // Track which fields the request explicitly set, so we can apply
-        // §4.3 combined precedence: thinking.budget_tokens beats
-        // reasoning.effort for the phase-1 cap, but the effort tier still
-        // selects defaults for any unspecified thinking.* field.
-        int  request_budget_tokens   = -1;  // from thinking.budget_tokens
-        int  request_reply_budget    = -1;  // from thinking.reply_budget
-        int  effort_phase1_cap       = -1;  // from reasoning.effort lookup
-        bool effort_set              = false;
-
-        auto apply_reasoning_effort = [&](const std::string & effort) {
-            if (effort == "none") {
-                enable_thinking = false;
-                return;
-            }
-
-            // Five-tier vocabulary (spec §4.2). Unknown → high.
-            int tier_value = config_.effort_tiers.high;
-            if      (effort == "minimal") tier_value = config_.effort_tiers.low;
-            else if (effort == "low")     tier_value = config_.effort_tiers.low;
-            else if (effort == "medium")  tier_value = config_.effort_tiers.medium;
-            else if (effort == "high")    tier_value = config_.effort_tiers.high;
-            else if (effort == "x-high")  tier_value = config_.effort_tiers.x_high;
-            else if (effort == "max")     tier_value = config_.effort_tiers.max;
-            // else: unknown tier → fall back to high (no error).
-
-            effort_phase1_cap = tier_value;
-            effort_set = true;
-            enable_thinking = true;
-            // Spec §4.2: reasoning effort activates the budget envelope.
-            req.thinking_opt_in = true;
-        };
-
-        // OpenAI Responses API: "reasoning" field. Spec §4.2.
-        if (body.contains("reasoning")) {
-            auto & r = body["reasoning"];
-            if (r.contains("effort")) {
-                apply_reasoning_effort(r.value("effort", "high"));
-            } else {
-                enable_thinking = true;
-            }
-        }
-        // OpenAI Chat Completions compatibility: some clients send a
-        // top-level reasoning_effort instead of Responses-style
-        // reasoning.effort. Treat it as the same tier selector unless the
-        // structured field already provided one.
-        if (!effort_set && body.contains("reasoning_effort") &&
-            body["reasoning_effort"].is_string()) {
-            apply_reasoning_effort(body["reasoning_effort"].get<std::string>());
-        }
-        // Anthropic-style: "thinking" field. Presence-as-opt-in: any
-        // request that sends this field has opted in to the thinking-budget
-        // envelope (and will see a `finish_details` block on the response).
-        if (body.contains("thinking")) {
-            auto & th = body["thinking"];
-            if (th.contains("type")) {
-                std::string type = th.value("type", "");
-                enable_thinking = (type == "enabled");
-                req.thinking_opt_in = (type == "enabled");
-            }
-            // Spec §4.1 fields. Clamp to server ceilings (§4.4).
-            if (th.contains("budget_tokens") && th["budget_tokens"].is_number_integer()) {
-                request_budget_tokens = th["budget_tokens"].get<int>();
-            }
-            if (th.contains("reply_budget") && th["reply_budget"].is_number_integer()) {
-                request_reply_budget = th["reply_budget"].get<int>();
-            }
-        }
-        // Direct: chat_template_kwargs.enable_thinking
-        if (body.contains("chat_template_kwargs")) {
-            auto & kwargs = body["chat_template_kwargs"];
-            if (kwargs.contains("enable_thinking")) {
-                enable_thinking = kwargs["enable_thinking"].get<bool>();
-            }
-        }
-
-        req.thinking_enabled = enable_thinking;
-
-        // Spec §4.3 combined precedence + §4.4 clamping.
-        // Phase-1 cap:
-        //   thinking.budget_tokens (if set) wins over reasoning.effort.
-        //   Either is clamped to think_max_tokens.
-        if (request_budget_tokens >= 0) {
-            int eff = (std::min)(request_budget_tokens, config_.think_max_tokens);
-            if (request_budget_tokens > config_.think_max_tokens) {
-                std::fprintf(stderr,
-                    "[server] thinking.budget_tokens=%d clamped to "
-                    "think_max_tokens=%d\n",
-                    request_budget_tokens, config_.think_max_tokens);
-            }
-            req.per_req_phase1_cap = eff;
-        } else if (effort_set) {
-            // Spec §4.4: when reasoning.effort is set, the effective phase-1
-            // cap is min(effort_tier_value, request.max_tokens -
-            // hard_limit_reply_budget). The effort tier value can legitimately
-            // exceed default_max_tokens (e.g. Qwen3.6 max=81408 with
-            // default=32768) — clients that want that full budget must pass
-            // an explicit max_tokens. Otherwise we narrow silently to fit.
-            const int max_output_phase1_room = (std::max)(0,
-                req.max_output - config_.hard_limit_reply_budget);
-            int eff = (std::min)(effort_phase1_cap, max_output_phase1_room);
-            if (effort_phase1_cap > max_output_phase1_room) {
-                // Info-level: this is normal when clients use a tier name but
-                // don't pass an explicit max_tokens. Not a warning.
-                std::fprintf(stderr,
-                    "[server] reasoning.effort tier=%d narrowed to %d "
-                    "(max_tokens=%d - hard_limit_reply_budget=%d); "
-                    "pass a larger max_tokens to use the full tier budget\n",
-                    effort_phase1_cap, eff,
-                    req.max_output, config_.hard_limit_reply_budget);
-            }
-            req.per_req_phase1_cap = eff;
-        }
-        // Reply budget:
-        if (request_reply_budget >= 0) {
-            int eff = (std::min)(request_reply_budget, config_.hard_limit_reply_budget);
-            if (request_reply_budget > config_.hard_limit_reply_budget) {
-                std::fprintf(stderr,
-                    "[server] thinking.reply_budget=%d clamped to "
-                    "hard_limit_reply_budget=%d\n",
-                    request_reply_budget, config_.hard_limit_reply_budget);
-            }
-            req.per_req_reply_budget = eff;
-        }
-        // (effort tier doesn't influence reply_budget — spec §4.2: "the reply
-        // reserve falls back to --hard-limit-reply-budget".)
-
-        // Bandit: parse session_id from extra_body (opt-in adaptive keep_ratio)
+        // Reasoning must be applied BEFORE rendering: the template injects
+        // the empty <think>\n\n</think>\n\n block when thinking is disabled.
+        apply_request_reasoning(body, req);
+        // Bandit: parse session_id from extra_body (opt-in adaptive keep_ratio).
         req.session_id = parse_session_id_from_body(body);
-
-        // Serialize tools JSON for template injection.
-        std::string tools_json;
-        if (req.tools.is_array() && !req.tools.empty()) {
-            tools_json = req.tools.dump();
-        }
-
-        std::string rendered;
-        if (!config_.chat_template_src.empty()) {
-            // Jinja path: caller supplied a chat template file via
-            // --chat-template-file. Override the hardcoded QWEN3/LAGUNA
-            // renderer. Used for tool-using agents that need the Anthropic
-            // tool_use envelope (e.g. froggeric Qwen3.6 template).
-            //
-            // Special tokens like <|im_start|> / <|im_end|> are stored
-            // verbatim in the GGUF vocab — use raw_token() to skip the
-            // GPT-2 byte decode (otherwise <0xC4><0x91> nonsense appears).
-            const std::string & bos_str = (tokenizer_.bos_id() >= 0)
-                ? tokenizer_.raw_token(tokenizer_.bos_id())
-                : std::string();
-            const std::string & eos_str = (tokenizer_.eos_id() >= 0)
-                ? tokenizer_.raw_token(tokenizer_.eos_id())
-                : std::string();
-            try {
-                rendered = render_chat_template_jinja(
-                    config_.chat_template_src,
-                    chat_msgs,
-                    bos_str,
-                    eos_str,
-                    /*add_generation_prompt=*/true,
-                    enable_thinking,
-                    tools_json);
-            } catch (const std::exception & e) {
-                send_error(fd, 500,
-                    std::string("chat template (jinja) render failed: ") + e.what());
-                return true;
-            }
-        } else {
-            rendered = render_chat_template(chat_msgs, chat_format_,
-                                            true, enable_thinking,
-                                            tools_json);
-        }
-        req.started_in_thinking = prompt_ends_in_open_think(rendered);
-        req.prompt_tokens = tokenizer_.encode(rendered);
+        if (!render_and_tokenize_request(fd, chat_messages, req)) return true;
 
         // count_tokens: short-circuit after tokenization. Skip generation
-        // entirely — Anthropic's contract is just `{"input_tokens": N}`.
+        // entirely — Anthropic's contract is just {"input_tokens": N}.
         if (count_tokens_only) {
-            json resp = {{"input_tokens", (int)req.prompt_tokens.size()}};
-            send_response(fd, 200, "application/json", resp.dump() + "\n");
+            const json response = {
+                {"input_tokens", (int) req.prompt_tokens.size()},
+            };
+            send_response(fd, 200, "application/json", response.dump() + "\n");
             return true;
         }
-
     } catch (const std::exception & e) {
         send_error(fd, 400, std::string("JSON parse error: ") + e.what());
-        return true;  // handled (with error)
+        return true;
     }
 
-    // Check context length; oversized + compression_enabled passes through — post-compress check is the real gate.
-    {
-        const int n_prompt = (int)req.prompt_tokens.size();
-        const bool pflash_will_run =
-            (config_.pflash_mode != ServerConfig::PflashMode::OFF) &&
-            (drafter_tokenizer_ != nullptr) &&
-            (config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
-             n_prompt >= config_.pflash_threshold);
-        if (should_reject_oversized(n_prompt, req.max_output,
-                                    config_.max_ctx, pflash_will_run)) {
-            send_error(fd, 400,
-                       context_overflow_message(config_.max_ctx, n_prompt,
-                                                req.max_output));
-            return true;
-        }
-    }
-
-    std::fprintf(stderr,
-        "[server] chat %s format=%s stream=%s msgs=%zu tools=%zu prompt_tokens=%zu "
-        "max_tokens=%d max_ctx=%d thinking=%s started_in_thinking=%s stops=%zu model=%s\n",
-        req.response_id.c_str(),
-        api_format_name(req.format),
-        req.stream ? "true" : "false",
-        json_array_size(req.messages),
-        json_array_size(req.tools),
-        req.prompt_tokens.size(),
-        req.max_output,
-        config_.max_ctx,
-        req.thinking_enabled ? "true" : "false",
-        req.started_in_thinking ? "true" : "false",
-        req.stop_sequences.size(),
-        req.model.c_str());
-
-    // Set socket non-blocking for send() stall detection during streaming.
-    int flags = sock_get_flags(fd);
-    if (flags >= 0) sock_set_nonblock(fd);
-
-    // Enqueue job and wait for worker.
-    ServerJob job;
-    job.fd = fd;
-    job.req = std::move(req);
-
-    enqueue(&job);
-
-    // Wait for the worker to signal completion.
-    {
-        std::unique_lock<std::mutex> lk(job.mu);
-        job.cv.wait(lk, [&]() { return job.done; });
-    }
-
+    if (!validate_request_context(fd, req)) return true;
+    log_parsed_request(req);
+    enqueue_request_and_wait(fd, std::move(req));
     return true;
 }
 

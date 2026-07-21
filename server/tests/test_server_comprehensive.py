@@ -866,6 +866,41 @@ class TestSuite:
         except Exception as e:
             self._check("invalid JSON body", False, str(e))
 
+    def test_messages_field_validation(self):
+        """Missing/null/scalar/empty `messages` must 400 on generation endpoints."""
+        print("\n[EC-7] Edge case — messages field validation")
+        invalid_bodies = [
+            ("missing", {"stream": False}),
+            ("null", {"messages": None}),
+            ("scalar", {"messages": "hi"}),
+            ("empty", {"messages": []}),
+        ]
+        for path in ("/v1/chat/completions", "/v1/messages"):
+            for label, body in invalid_bodies:
+                try:
+                    self._req("POST", path, body)
+                    self._check(f"{path} {label} messages returns 400", False,
+                                "got 2xx")
+                except urllib.error.HTTPError as e:
+                    detail = e.read().decode(errors="replace")
+                    self._check(f"{path} {label} messages returns 400",
+                                e.code == 400 and "messages" in detail,
+                                f"got {e.code}: {detail[:100]}")
+                except Exception as e:
+                    self._check(f"{path} {label} messages returns 400",
+                                False, str(e))
+            # Contract guard: a minimal valid conversation still generates.
+            try:
+                resp = self._req("POST", path, {
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 1,
+                })
+                ok = "choices" in resp or "content" in resp
+                self._check(f"{path} non-empty messages accepted", ok,
+                            f"unexpected body: {str(resp)[:100]}")
+            except Exception as e:
+                self._check(f"{path} non-empty messages accepted", False, str(e))
+
     def test_options_cors(self):
         """OPTIONS request should return CORS headers."""
         print("\n[EC-6] Edge case — CORS OPTIONS preflight")
@@ -1093,6 +1128,7 @@ class TestSuite:
         self.test_unicode_content()
         self.test_multipart_content()
         self.test_invalid_json_body()
+        self.test_messages_field_validation()
         self.test_options_cors()
 
         # DDTree
