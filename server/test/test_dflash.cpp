@@ -37,6 +37,7 @@
 #include "qwen35_layer_split.h" // multi-GPU layer-split daemon args
 #include "layer_split_daemon_loop.h" // extracted layer-split daemon loop
 #include "qwen3_daemon.h"   // arch dispatch - qwen3 (0.6B standalone)
+#include "../src/common/snapshot_backend.h" // CPU-RAM prefix snapshot storage
 #include "gemma4_daemon.h"  // arch dispatch - gemma4 (iSWA + MoE)
 #include "sampler.h"        // shared CPU sampler chain (SamplerCfg /
                             // sample_logits / parse_sampler_token) used by
@@ -1140,7 +1141,19 @@ int main(int argc, char ** argv) {
     // ---- Single-GPU qwen35-family daemon: dispatch to the dedicated daemon -----
     // This avoids the duplicated 1800-line inline loop below. The inline
     // loop remains for one-shot, test-window, and profile-scaling modes.
-    if (daemon_mode && target_gpus.size() <= 1) {
+    //
+    // DFLASH_LEGACY_DAEMON=1 keeps the inline loop for daemon mode too: the
+    // tool-split orchestrator (server_tools.py) speaks the legacy protocol —
+    // SNAPSHOT_THIN <slot> <kv_start> <kv_end>, RESTORE_CHAIN, and the
+    // "[snap] inline slot=" ack — which run_qwen35_daemon does not implement.
+    const char * legacy_env = std::getenv("DFLASH_LEGACY_DAEMON");
+    const bool legacy_daemon = legacy_env && std::atoi(legacy_env) != 0;
+    if (daemon_mode && legacy_daemon) {
+        std::fprintf(stderr,
+            "[test_dflash] DFLASH_LEGACY_DAEMON=1 -> using legacy inline daemon loop "
+            "(tool-split protocol)\n");
+    }
+    if (daemon_mode && !legacy_daemon && target_gpus.size() <= 1) {
         const int max_ctx_eff = g_max_ctx_override > 0 ? g_max_ctx_override : 4096;
         dflash::common::Qwen35DaemonArgs qargs;
         qargs.target_path       = target_path;
@@ -1190,6 +1203,26 @@ int main(int argc, char ** argv) {
         }
     }
     ggml_backend_t backend = target_backend; // legacy target-side alias
+
+    // Prefix snapshots live in system RAM on discrete GPUs (CPU backend) so
+    // they never compete with model weights / KV cache for VRAM. Matches the
+    // qwen35_backend / shard-IPC / layer-split daemons.
+    ggml_backend_t snap_backend = dflash::common::create_snapshot_backend(target_backend);
+    if (!snap_backend) {
+        std::fprintf(stderr, "snapshot backend init failed\n");
+        return 1;
+    }
+    struct SnapBackendGuard {
+        ggml_backend_t * snap;
+        ggml_backend_t target;
+        SnapBackendGuard(ggml_backend_t * s, ggml_backend_t t) : snap(s), target(t) {}
+        ~SnapBackendGuard() {
+            if (snap && *snap) {
+                dflash::common::free_snapshot_backend(*snap, target);
+                *snap = nullptr;
+            }
+        }
+    } snap_guard(&snap_backend, target_backend);
 
     TargetWeights w;
     if (!load_target_gguf(target_path, target_backend, w)) {
@@ -2436,7 +2469,7 @@ int main(int argc, char ** argv) {
                     std::fprintf(stderr, "[snap] SNAPSHOT_THIN bad args\n");
                     continue;
                 }
-                if (!snapshot_target_cache_thin(w, cache, backend, kv_start, kv_end,
+                if (!snapshot_target_cache_thin(w, cache, snap_backend, kv_start, kv_end,
                                                  prefix_snapshots[slot])) {
                     std::fprintf(stderr, "[snap] thin failed slot=%d: %s\n", slot,
                                  dflash27b_last_error());
@@ -2453,7 +2486,7 @@ int main(int argc, char ** argv) {
                     std::fprintf(stderr, "[snap] invalid slot %d\n", slot);
                     continue;
                 }
-                if (!snapshot_target_cache(w, cache, backend, prefix_snapshots[slot])) {
+                if (!snapshot_target_cache(w, cache, snap_backend, prefix_snapshots[slot])) {
                     std::fprintf(stderr, "[snap] failed slot=%d: %s\n", slot, dflash27b_last_error());
                     continue;
                 }
@@ -2547,6 +2580,15 @@ int main(int argc, char ** argv) {
                     stream_emit(-1);
                     continue;
                 }
+                // Optional inline-snap suffix (same as RESTORE / bare prompt):
+                // snap=<pos>:<slot_id>
+                if (const char * sp = std::strstr(line.c_str(), " snap=")) {
+                    if (std::sscanf(sp + 1, "snap=%d:%d", &snap_pos, &snap_slot) != 2
+                        || snap_slot < 0 || snap_slot >= PREFIX_CACHE_SLOTS) {
+                        std::fprintf(stderr, "[snap] bad inline-snap arg\n");
+                        snap_pos = -1; snap_slot = -1;
+                    }
+                }
                 n_gen                    = n_gen_local;
                 prompt_file_str          = ppath;
                 prompt_path              = prompt_file_str.c_str();
@@ -2569,8 +2611,8 @@ int main(int argc, char ** argv) {
                 restore_from_slot = true;
                 restore_slot_id   = slot;
                 // Parse optional inline-snap suffix: snap=<pos>:<slot_id>
-                if (const char * sp = std::strstr(line.c_str(), "snap=")) {
-                    if (std::sscanf(sp, "snap=%d:%d", &snap_pos, &snap_slot) != 2
+                if (const char * sp = std::strstr(line.c_str(), " snap=")) {
+                    if (std::sscanf(sp + 1, "snap=%d:%d", &snap_pos, &snap_slot) != 2
                         || snap_slot < 0 || snap_slot >= PREFIX_CACHE_SLOTS) {
                         std::fprintf(stderr, "[snap] bad inline-snap arg\n");
                         snap_pos = -1; snap_slot = -1;
@@ -2585,8 +2627,8 @@ int main(int argc, char ** argv) {
                 prompt_file_str = ppath;
                 prompt_path = prompt_file_str.c_str();
                 // Parse optional inline-snap suffix: snap=<pos>:<slot_id>
-                if (const char * sp = std::strstr(line.c_str(), "snap=")) {
-                    if (std::sscanf(sp, "snap=%d:%d", &snap_pos, &snap_slot) != 2
+                if (const char * sp = std::strstr(line.c_str(), " snap=")) {
+                    if (std::sscanf(sp + 1, "snap=%d:%d", &snap_pos, &snap_slot) != 2
                         || snap_slot < 0 || snap_slot >= PREFIX_CACHE_SLOTS) {
                         std::fprintf(stderr, "[snap] bad inline-snap arg\n");
                         snap_pos = -1; snap_slot = -1;
@@ -2880,7 +2922,7 @@ int main(int argc, char ** argv) {
         if (snap_pos >= 0 && snap_pos == start) {
             cache.cur_pos = start;
             if (snap_slot >= 0) {
-                if (snapshot_target_cache(w, cache, backend, prefix_snapshots[snap_slot])) {
+                if (snapshot_target_cache(w, cache, snap_backend, prefix_snapshots[snap_slot])) {
                     std::printf("[snap] inline slot=%d cur_pos=%d\n", snap_slot, start);
                     std::fflush(stdout);
                 } else {
@@ -2977,7 +3019,7 @@ int main(int argc, char ** argv) {
             cache.cur_pos  = committed;
             cache.last_tok = last_tok;
             if (snap_slot >= 0) {
-                if (snapshot_target_cache(w, cache, backend, prefix_snapshots[snap_slot])) {
+                if (snapshot_target_cache(w, cache, snap_backend, prefix_snapshots[snap_slot])) {
                     std::printf("[snap] inline slot=%d cur_pos=%d\n", snap_slot, committed);
                     std::fflush(stdout);
                 } else {
