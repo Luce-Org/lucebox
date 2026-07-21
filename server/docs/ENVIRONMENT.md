@@ -24,6 +24,9 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_ADAPTIVE_K_TAU` | 0 = off | Prefer the CLI: --adaptive-experts [tau]. Cumulative combine-weight threshold for per-token expert gating. |
 | `DFLASH_ADAPTIVE_K_DENSE` | per-model default | CSV of MoE layers kept dense under adaptive-K (DFlash capture layers). Warned-inert on families that do not thread layer indices yet. |
 | `DFLASH_MMID_GROUPED` | unset | Grouped MUL_MAT_ID kernel for small verify batches; candidate for CLI promotion. |
+| `DFLASH_MMID_GROUPED_TYPES` | 7 | Grouped-kernel type mask; bit 3 (`8`) opts ROCmFP2/ROCmFP3 into the path. |
+| `DFLASH_MMID_GROUPED_DEVICE` | -1 | Optional zero-based device restriction; unset/-1 applies to every eligible device. |
+| `DFLASH_DS4_TP_BATCH_PEER_COPIES` | unset | Lucebox burn-in switch: publish same-split HIP peer copies with one cross-device dependency. |
 | `DFLASH_KVFLASH` | unset | Prefer the CLI: `--kvflash` (token count or `auto`). |
 
 ## Full inventory (generated)

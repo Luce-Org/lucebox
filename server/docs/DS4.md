@@ -119,6 +119,26 @@ q=1 measured 37.5 tok/s and 98.5 ms verification. These figures establish the
 execution-path A/B; they are workload-specific and are not a quality or
 held-out benchmark claim.
 
+The 2026-07-20 Lucebox follow-up removes two remaining verification stalls:
+it publishes all same-split peer copies with one cross-device dependency, and
+it sorts the q4 routed pairs so repeated Strix experts reuse compressed weights
+through the GPU caches. Enable the qualified gfx1201 + gfx1151 profile with:
+
+```bash
+export DFLASH_DS4_TP_BATCH_PEER_COPIES=1
+export DFLASH_MMID_GROUPED=1
+export DFLASH_MMID_GROUPED_TYPES=8
+export DFLASH_MMID_GROUPED_DEVICE=1  # hip:1 is Strix Halo in this profile
+```
+
+The cleaned dual-architecture binary measured 54.7, 54.9, and 54.9 tok/s
+after warm-up on the same fixed-q4 workload. All responses matched the
+qualified SHA-256 output, acceptance remained 1.00, and mean target
+verification fell to 64.9--65.2 ms. This is a target-execution improvement,
+not an acceptance-rate gain. Leave `DFLASH_MMID_GROUPED_DEVICE` unset to make
+the grouped kernel model-agnostic across eligible devices; device `1` is the
+measured Lucebox-specific selector.
+
 ### Local single-shard
 
 If the adapter decides all 43 layers fit on one CUDA GPU, it loads a single shard locally and no IPC daemon is involved.
@@ -213,6 +233,10 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | `DFLASH_DS4_FUSED_VERIFY` | Enable the persistent q-wide target verification graph. |
 | `DFLASH_DS4_DENSE_TP_MASK` | Experimental row splitting for dense projections. This is automatically disabled when fused verification is enabled because split-buffer weights are not compatible with verifier graph replay. |
 | `DFLASH_DS4_TP_DEVICE_JOIN` | Join expert-owner results on device instead of through a host reduction. |
+| `DFLASH_DS4_TP_BATCH_PEER_COPIES` | Batch same-split HIP peer copies behind one producer event and consumer wait. |
+| `DFLASH_MMID_GROUPED` | Enable the grouped small-batch routed-expert kernel. |
+| `DFLASH_MMID_GROUPED_TYPES` | Grouped-kernel type mask; `8` selects ROCmFP2 gate/up and ROCmFP3 down. |
+| `DFLASH_MMID_GROUPED_DEVICE` | Optional HIP device selector; the qualified Lucebox profile uses `1` for Strix Halo. |
 | `DFLASH_DS4_DRAFT_CONTEXT_KV_CACHE` | Reuse DSpark context projection/KV state between speculative steps. |
 | `DFLASH_DS4_ADAPTIVE_WIDTH` | Set to `1` to select q=2/3/4 from DSpark confidence; `0` keeps the configured fixed verify width. If unset, the legacy `/tmp/ds4_awidth` control remains supported. |
 | `DFLASH_DS4_DRAFT_AHEAD` | On an independent in-process draft backend, launch the next proposal concurrently with target verification. The target still validates every candidate. |
