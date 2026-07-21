@@ -349,6 +349,26 @@ int deepseek4_safe_compressor_batch_tokens(const DeepSeek4Weights & w,
                                            int kv_start,
                                            int n_tokens);
 
+struct DeepSeek4OutputProjection {
+    ggml_tensor * logits = nullptr;
+    ggml_tensor * argmax = nullptr;
+};
+
+// Shared output tail used by cached, dynamic, and fused DS4 graphs. Exactly
+// one output mode is built so sampling never executes an unused argmax.
+DeepSeek4OutputProjection deepseek4_build_output_projection(
+    ggml_context * ctx,
+    ggml_tensor * hidden,
+    ggml_tensor * out_norm,
+    ggml_tensor * output,
+    float         rms_eps,
+    bool          want_argmax);
+
+void deepseek4_build_output_graph(
+    ggml_cgraph *                       gf,
+    const DeepSeek4OutputProjection &   projection,
+    bool                                want_argmax);
+
 // Forward: single step (prefill chunk or decode token).
 // embed: [n_embd, n_tokens] input embeddings (post-embedding lookup).
 // hc_state: [n_hc * n_embd] persistent HC residual (updated in-place).
@@ -393,6 +413,7 @@ bool deepseek4_step_layer_range(
     int                         layer_begin,
     int                         layer_end,
     std::vector<float> *        out_logits,
+    int32_t *                   out_argmax = nullptr,
     const int32_t *             token_ids = nullptr,
     DeepSeek4StepTelemetry *    telemetry = nullptr,
     bool                        allow_decode_graph_reuse = true,

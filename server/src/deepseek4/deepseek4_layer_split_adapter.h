@@ -65,6 +65,8 @@ public:
     void snapshot_free(int slot) override;
     bool snapshot_used(int slot) const override;
     int snapshot_cur_pos(int slot) const override;
+    bool snapshot_compatible(int slot,
+                             const GenerateRequest & req) const override;
     bool snapshot_restore(int slot) override;
     int current_last_token() const override { return last_tok_; }
 
@@ -106,6 +108,7 @@ private:
         std::vector<float> hc_state;
         std::vector<float> prefill_last_logits;
         std::vector<DeepSeek4Snapshot> shards;
+        bool needs_logit_processing = false;
         bool used = false;
     };
     std::vector<Snapshot> snapshots_;

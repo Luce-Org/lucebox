@@ -170,7 +170,20 @@ bool LayerSplitBackend::snapshot_adopt(int slot,
 GenerateResult LayerSplitBackend::restore_and_generate_impl(
         int slot, const GenerateRequest & req, const DaemonIO & io) {
     GenerateResult result;
-    if (!adapter_ || !adapter_->snapshot_restore(slot)) {
+    if (!adapter_ || !adapter_->snapshot_used(slot)) {
+        result.fail(GenerateErrorCode::InvalidSnapshotSlot);
+        io.emit(-1);
+        return result;
+    }
+    if (!adapter_->snapshot_compatible(slot, req)) {
+        std::fprintf(stderr,
+            "[pc] snapshot slot=%d is incompatible with request sampling mode; "
+            "fresh prefill fallback\n",
+            slot);
+        return run_from_state(req, io, /*base_pos=*/0, /*reset_state=*/true,
+                              req.prompt);
+    }
+    if (!adapter_->snapshot_restore(slot)) {
         result.fail(GenerateErrorCode::InvalidSnapshotSlot);
         io.emit(-1);
         return result;

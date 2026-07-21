@@ -467,12 +467,15 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
         return run_mixed_forward(tokens, base_pos, last_tok, logits_out);
     }
 
-    // Local multi-GPU path: run each shard's layers sequentially
-    // Pass HC state between shards at boundaries
+    // Local multi-GPU path: run each shard's layers sequentially and pass HC
+    // state at the boundaries. Sampling requests full logits; greedy decode
+    // requests only the GPU argmax token.
+    last_tok = -1;
     for (size_t si = 0; si < shards_.size(); ++si) {
         auto & shard = shards_[si];
         const bool is_last = (si == shards_.size() - 1);
         std::vector<float> * shard_logits = is_last ? logits_out : nullptr;
+        int32_t * shard_argmax = (is_last && !logits_out) ? &last_tok : nullptr;
         DeepSeek4StepTelemetry step_tel;
         const float * shard_input = local_shard_input(si, embed, hc_state_);
 
@@ -480,7 +483,8 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
                 shard.backend, shard.gpu, shard.weights, shard.cache,
                 hc_state_, shard_input, n_tokens, base_pos,
                 shard.layer_begin, shard.layer_end,
-                shard_logits, tokens.data(), timing ? &step_tel : nullptr)) {
+                shard_logits, shard_argmax,
+                tokens.data(), timing ? &step_tel : nullptr)) {
             std::fprintf(stderr, "[deepseek4-split] forward failed on shard %zu\n", si);
             return false;
         }
@@ -488,7 +492,13 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
     }
 
     cur_pos_ = base_pos + n_tokens;
-    last_tok = tokens.back();
+    if (logits_out) {
+        // The sampler replaces this placeholder from the returned logits.
+        last_tok = tokens.back();
+    } else if (last_tok < 0) {
+        std::fprintf(stderr, "[deepseek4-split] local forward produced no argmax token\n");
+        return false;
+    }
     last_tok_ = last_tok;
 
     if (logits_out && !logits_out->empty()) {
@@ -531,7 +541,8 @@ bool DeepSeek4LayerSplitAdapter::run_mixed_forward(
                                      local_shard.cache, hc_state_,
                                      embed.data(), n_tokens, base_pos,
                                      local_shard.layer_begin, local_shard.layer_end,
-                                     &hidden_out, tokens.data(), timing ? &local_tel : nullptr)) {
+                                     &hidden_out, /*out_argmax=*/nullptr,
+                                     tokens.data(), timing ? &local_tel : nullptr)) {
         std::fprintf(stderr, "[deepseek4-split] local shard forward failed\n");
         return false;
     }
@@ -584,7 +595,9 @@ bool DeepSeek4LayerSplitAdapter::prefill(
                                     prompt.begin() + chunk_end);
 
         std::vector<float> * logits_out =
-            (chunk_end >= n_prompt) ? &prefill_last_logits_ : nullptr;
+            (chunk_end >= n_prompt && sampler_.needs_logit_processing())
+                ? &prefill_last_logits_
+                : nullptr;
 
         if (!run_forward(chunk, base_pos + offset, last_tok, logits_out)) {
             return false;
@@ -644,6 +657,7 @@ bool DeepSeek4LayerSplitAdapter::snapshot_save(int slot) {
     snap.last_tok = last_tok_;
     snap.hc_state = hc_state_;
     snap.prefill_last_logits = prefill_last_logits_;
+    snap.needs_logit_processing = sampler_.needs_logit_processing();
     snap.used = true;
     return true;
 }
@@ -658,6 +672,7 @@ void DeepSeek4LayerSplitAdapter::snapshot_free(int slot) {
     snap.last_tok = -1;
     snap.hc_state.clear();
     snap.prefill_last_logits.clear();
+    snap.needs_logit_processing = false;
     snap.used = false;
     if (snap.shards.size() != shards_.size()) snap.shards.resize(shards_.size());
     if (use_mixed_target_split()) {
@@ -680,6 +695,13 @@ bool DeepSeek4LayerSplitAdapter::snapshot_used(int slot) const {
 int DeepSeek4LayerSplitAdapter::snapshot_cur_pos(int slot) const {
     if (slot < 0 || slot >= PREFIX_SLOTS) return 0;
     return snapshots_[slot].cur_pos;
+}
+
+bool DeepSeek4LayerSplitAdapter::snapshot_compatible(
+        int slot, const GenerateRequest & req) const {
+    return snapshot_used(slot) &&
+        snapshots_[slot].needs_logit_processing ==
+            req.sampler.needs_logit_processing();
 }
 
 bool DeepSeek4LayerSplitAdapter::snapshot_restore(int slot) {
