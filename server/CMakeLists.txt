@@ -806,6 +806,14 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
         add_test(NAME chain_rollback_policy COMMAND test_chain_rollback_policy)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_recurrent_snapshot.cpp")
+        add_executable(test_recurrent_snapshot test/test_recurrent_snapshot.cpp)
+        target_include_directories(test_recurrent_snapshot PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_recurrent_snapshot PRIVATE
+            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        add_test(NAME recurrent_snapshot COMMAND test_recurrent_snapshot)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash_placement.cpp")
         add_executable(test_kvflash_placement test/test_kvflash_placement.cpp)
         target_include_directories(test_kvflash_placement PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
@@ -1084,6 +1092,13 @@ if(DFLASH27B_TESTS)
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
     enable_testing()
 
+    # CPU-only contract test for the fail-closed layer-split tree boundary.
+    add_executable(test_qwen35_split_tree_guard
+        test/test_qwen35_split_tree_guard.cpp)
+    target_include_directories(test_qwen35_split_tree_guard PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
+    add_test(NAME qwen35_split_tree_guard COMMAND test_qwen35_split_tree_guard)
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
         add_executable(test_server_unit test/test_server_unit.cpp)
         target_sources(test_server_unit PRIVATE
@@ -1117,6 +1132,7 @@ if(DFLASH27B_TESTS)
     # 'make check' — builds test targets then runs ctest
     if(TARGET test_server_unit)
         set(_check_deps test_server_unit)
+        list(APPEND _check_deps test_qwen35_split_tree_guard)
         if(TARGET test_deepseek4_unit)
             list(APPEND _check_deps test_deepseek4_unit)
         endif()

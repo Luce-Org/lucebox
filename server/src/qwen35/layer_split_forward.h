@@ -64,7 +64,9 @@ bool run_qwen35_layer_split_forward(
         std::vector<float> * logits_out = nullptr,
         DFlashDraftIpcClient * remote_draft = nullptr,
         ggml_type activation_type = GGML_TYPE_F32,
-        KvFlashPager * kvflash = nullptr);
+        KvFlashPager * kvflash = nullptr,
+        bool capture_ssm_intermediates = false,
+        Qwen35SplitCaptureStats * capture_stats = nullptr);
 
 bool run_qwen35_layer_split_forward_from_activation(
         std::vector<Qwen35LayerSplitShard> & shards,
@@ -75,6 +77,24 @@ bool run_qwen35_layer_split_forward_from_activation(
         int & last_tok,
         int kq_stride_pad,
         int fa_window,
+        std::vector<int32_t> * argmax_out = nullptr,
+        std::vector<float> * logits_out = nullptr,
+        std::vector<Qwen35TargetCaptureSlice> * captures_out = nullptr,
+        KvFlashPager * kvflash = nullptr,
+        bool kvflash_preallocated = false,
+        const Qwen35SplitTreeInputs * tree_inputs = nullptr,
+        bool capture_ssm_intermediates = false);
+
+bool run_qwen35_layer_split_tree_verify_from_activation(
+        std::vector<Qwen35LayerSplitShard> & shards,
+        ActivationPair & acts,
+        int base_pos,
+        int n_tokens_total,
+        int ubatch,
+        int & last_tok,
+        int kq_stride_pad,
+        int fa_window,
+        const Qwen35SplitTreeInputs & tree_inputs,
         std::vector<int32_t> * argmax_out = nullptr,
         std::vector<float> * logits_out = nullptr,
         std::vector<Qwen35TargetCaptureSlice> * captures_out = nullptr,
@@ -95,7 +115,9 @@ bool run_qwen35_mixed_layer_split_forward(
         std::vector<float> * logits_out = nullptr,
         DraftFeatureMirror * feature_ring = nullptr,
         DFlashDraftIpcClient * remote_draft = nullptr,
-        KvFlashPager * kvflash = nullptr);
+        KvFlashPager * kvflash = nullptr,
+        bool capture_ssm_intermediates = false,
+        Qwen35SplitCaptureStats * capture_stats = nullptr);
 
 // Free all shards (weights, cache, backend).
 void free_qwen35_layer_split_shards(std::vector<Qwen35LayerSplitShard> & shards);

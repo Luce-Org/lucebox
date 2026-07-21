@@ -235,9 +235,14 @@ bool create_target_cache_partial(const TargetWeights & w,
                                                        head_v_dim, head_v_dim, w.ssm_dt_rank);
                 ggml_tensor * Cn = ggml_new_tensor_2d(out.rollback_ctx, GGML_TYPE_F32,
                                                        w.ssm_d_conv - 1, conv_ch);
-                ggml_tensor * Si = ggml_new_tensor_4d(out.rollback_ctx, GGML_TYPE_Q8_0,
+                // I0 domain: ne[3] is the root-inclusive flat verify-token
+                // domain. Tree capture writes t=0 synthetic root through the
+                // final/padded flat slot directly into slot t.
+                ggml_tensor * Si = ggml_new_tensor_4d(out.rollback_ctx, GGML_TYPE_F32,
                                                        head_v_dim, head_v_dim,
                                                        w.ssm_dt_rank, max_verify_tokens);
+                // I0 domain: ne[0] is [K_conv-1 prefix rows |
+                // root-inclusive verify rows].
                 ggml_tensor * Ci = ggml_new_tensor_3d(out.rollback_ctx, GGML_TYPE_F32,
                                                        (w.ssm_d_conv - 1) + max_verify_tokens,
                                                        conv_ch, 1);
@@ -255,6 +260,23 @@ bool create_target_cache_partial(const TargetWeights & w,
         }
 
         out.rollback_buf = ggml_backend_alloc_ctx_tensors(out.rollback_ctx, backend);
+        if (std::getenv("DFLASH_SPLIT_CHAIN_ROLLBACK_DIAG")) {
+            int owned_delta_layers = 0;
+            for (int il = 0; il < w.n_layer; ++il) {
+                if (((il + 1) % w.full_attention_interval) != 0 && il >= layer_begin && il < layer_end) {
+                    owned_delta_layers++;
+                }
+            }
+            const size_t elems_per_slot_per_layer = (size_t)head_v_dim * (size_t)head_v_dim * (size_t)w.ssm_dt_rank;
+            const size_t f32_bytes_per_slot_per_layer = elems_per_slot_per_layer * sizeof(float);
+            const size_t q8_bytes_per_slot_per_layer = ((elems_per_slot_per_layer + 31) / 32) * 34;
+            const size_t f32_total = f32_bytes_per_slot_per_layer * (size_t)max_verify_tokens * (size_t)owned_delta_layers;
+            const size_t q8_total = q8_bytes_per_slot_per_layer * (size_t)max_verify_tokens * (size_t)owned_delta_layers;
+            std::fprintf(stderr,
+                "[target-split][chain-rollback] split_ssm_intermediate_dtype=F32 split_ssm_intermediate_persist_dtype_dst=F32 split_ssm_intermediate_persist_quantized=0 layer_begin=%d layer_end=%d owned_delta_layers=%d max_verify_tokens=%d split_ssm_intermediate_f32_bytes=%zu split_ssm_intermediate_incremental_bytes_over_q8=%zu\n",
+                layer_begin, layer_end, owned_delta_layers, max_verify_tokens, f32_total,
+                f32_total > q8_total ? f32_total - q8_total : 0);
+        }
         if (!out.rollback_buf) {
             set_last_error("ggml_backend_alloc_ctx_tensors failed for rollback cache");
             ggml_free(out.rollback_ctx);
@@ -446,24 +468,56 @@ bool migrate_prefill_cache(const TargetWeights & w,
     return true;
 }
 
-// Snapshot/restore SSM+conv state for speculative rollback. Uses device-side
-// tensor copy (ggml_backend_tensor_copy). Called outside of any compute graph.
-void snapshot_ssm_state(TargetCache & c) {
-    for (size_t i = 0; i < c.ssm_state.size(); i++) {
-        if (!c.ssm_state[i] || !c.ssm_state_snap[i]) continue;
-        ggml_backend_tensor_copy(c.ssm_state[i], c.ssm_state_snap[i]);
-        if (!c.conv_state[i] || !c.conv_state_snap[i]) continue;
-        ggml_backend_tensor_copy(c.conv_state[i], c.conv_state_snap[i]);
+// Snapshot/restore SSM+conv state for speculative rollback. Queue all device
+// copies on one backend stream, then synchronize once for the complete snapshot.
+static bool recurrent_snapshot_layout_valid(const TargetCache & c) {
+    const size_t n = c.ssm_state.size();
+    if (c.ssm_state_snap.size() != n || c.conv_state.size() != n ||
+        c.conv_state_snap.size() != n) {
+        return false;
     }
+    for (size_t i = 0; i < n; i++) {
+        const bool owns_state = c.ssm_state[i] || c.ssm_state_snap[i] ||
+                                c.conv_state[i] || c.conv_state_snap[i];
+        if (!owns_state) continue;
+        if (!c.ssm_state[i] || !c.ssm_state_snap[i] ||
+            !c.conv_state[i] || !c.conv_state_snap[i] ||
+            c.ssm_state[i]->type != c.ssm_state_snap[i]->type ||
+            !ggml_are_same_shape(c.ssm_state[i], c.ssm_state_snap[i]) ||
+            !ggml_are_same_stride(c.ssm_state[i], c.ssm_state_snap[i]) ||
+            c.conv_state[i]->type != c.conv_state_snap[i]->type ||
+            !ggml_are_same_shape(c.conv_state[i], c.conv_state_snap[i]) ||
+            !ggml_are_same_stride(c.conv_state[i], c.conv_state_snap[i])) {
+            return false;
+        }
+    }
+    return true;
 }
 
-void restore_ssm_state(TargetCache & c) {
+bool snapshot_ssm_state(TargetCache & c, ggml_backend_t backend) {
+    if (!backend || !recurrent_snapshot_layout_valid(c)) return false;
     for (size_t i = 0; i < c.ssm_state.size(); i++) {
-        if (!c.ssm_state_snap[i] || !c.ssm_state[i]) continue;
-        ggml_backend_tensor_copy(c.ssm_state_snap[i], c.ssm_state[i]);
-        if (!c.conv_state_snap[i] || !c.conv_state[i]) continue;
-        ggml_backend_tensor_copy(c.conv_state_snap[i], c.conv_state[i]);
+        if (!c.ssm_state[i]) continue;
+        ggml_backend_tensor_copy_async(
+            backend, backend, c.ssm_state[i], c.ssm_state_snap[i]);
+        ggml_backend_tensor_copy_async(
+            backend, backend, c.conv_state[i], c.conv_state_snap[i]);
     }
+    ggml_backend_synchronize(backend);
+    return true;
+}
+
+bool restore_ssm_state(TargetCache & c, ggml_backend_t backend) {
+    if (!backend || !recurrent_snapshot_layout_valid(c)) return false;
+    for (size_t i = 0; i < c.ssm_state.size(); i++) {
+        if (!c.ssm_state[i]) continue;
+        ggml_backend_tensor_copy_async(
+            backend, backend, c.ssm_state_snap[i], c.ssm_state[i]);
+        ggml_backend_tensor_copy_async(
+            backend, backend, c.conv_state_snap[i], c.conv_state[i]);
+    }
+    ggml_backend_synchronize(backend);
+    return true;
 }
 
 // Allocate SSM/conv rollback snapshot tensors by mirroring the live recurrent
@@ -910,13 +964,12 @@ static ggml_tensor * build_delta_net_block(
     // path which handles F32→Q8_0 quantization automatically.
     // persist_inter: when capture is requested, route the kernel's per-token
     // intermediate-state writes DIRECTLY into the persistent cache buffer via
-    // src[7], avoiding the legacy result-region cpy. Works for BOTH tree and
-    // non-tree (chain-verify) capture — the kernel checks src[7] regardless of
-    // tree mode, and write_inter is forced true whenever src[7] is non-null.
-    // This also keeps non-tree capture safe if the result tensor is compacted
-    // and no longer embeds per-token intermediate states.
-    // Q8_0 intermediates fall through (persist requires F32/F16); the legacy
-    // cpy path below handles F32→Q8_0 quantization for that case (guarded).
+    // src[7], avoiding the legacy result-region cpy. This works for both tree
+    // and non-tree (chain-verify) capture and preserves upstream #469 semantics.
+    // Stage 2 split-chain rollback allocates F32 intermediates, so its checkpoint
+    // path is never quantized. In tree mode, n_seq_tokens is root-inclusive and
+    // flat slot t is persisted directly at ne[3] slot t.
+    // Q8_0 intermediates fall through to the guarded legacy copy path below.
     ggml_tensor * persist_inter = (cap && cap->ssm_intermediate_states
                                    && (cap->ssm_intermediate_states->type == GGML_TYPE_F32
                                        || cap->ssm_intermediate_states->type == GGML_TYPE_F16))

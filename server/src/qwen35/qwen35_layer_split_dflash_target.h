@@ -20,6 +20,7 @@
 #include "qwen35_target_shard_ipc.h"
 #include "step_graph.h"
 
+#include <string>
 #include <vector>
 
 namespace dflash::common {
@@ -48,6 +49,20 @@ public:
     bool snapshot_kv() override;
     bool restore_kv() override;
 
+    bool supports_fast_rollback() const override;
+    bool rollback_to(int base_pos, int commit_n) override;
+    bool supports_tree_verify() const override;
+    bool verify_tree(int committed,
+                     const DDTree & tree,
+                     const std::vector<int32_t> & flat_tokens,
+                     int n_alloc,
+                     std::vector<int32_t> & posterior_out,
+                     std::vector<float> * logits_out = nullptr) override;
+    bool rollback_to_tree(int committed,
+                          const DDTree & tree,
+                          const std::vector<int> & accepted_dfs) override;
+    bool last_rollback_context_fatal() const { return last_rollback_context_fatal_; }
+
     bool is_eos(int token) const override;
 
     bool embed_tokens(const int32_t * tokens, int n,
@@ -72,6 +87,10 @@ private:
 
     std::vector<int> capture_ids_;
     StepGraph        proj_sg_;
+    bool             split_capture_validated_ = false;
+    bool             last_rollback_context_fatal_ = false;
+    bool             rollback_poisoned_ = false;
+    mutable int      required_tree_slots_ = 1;
 };
 
 }  // namespace dflash::common

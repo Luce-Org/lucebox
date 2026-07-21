@@ -2139,11 +2139,13 @@ int main(int argc, char ** argv) {
             psg2 = StepGraph{};
             migrate_prefill_cache(w, max_ctx, max_verify_tokens, target_backend, cache);
 
-            snapshot_ssm_state(cache);
+            check(snapshot_ssm_state(cache, target_backend),
+                  "snapshot recurrent state succeeded");
             std::vector<float> logits_full(vocab_t), logits_win(vocab_t);
             bool ok = decode_one(psg2, 512, lt2, 512, 0, logits_full.data());
             check(ok, "decode full-attention succeeded");
-            restore_ssm_state(cache);
+            check(restore_ssm_state(cache, target_backend),
+                  "restore recurrent state succeeded");
             ok = decode_one(psg2, 512, lt2, 512, 2048, logits_win.data());
             check(ok, "decode window=2048 succeeded");
 
@@ -2175,11 +2177,13 @@ int main(int argc, char ** argv) {
             psg3 = StepGraph{};
             migrate_prefill_cache(w, max_ctx, max_verify_tokens, target_backend, cache);
 
-            snapshot_ssm_state(cache);
+            check(snapshot_ssm_state(cache, target_backend),
+                  "snapshot recurrent state succeeded");
             std::vector<float> logits_full(vocab_t), logits_win(vocab_t);
             bool ok = decode_one(psg3, 4096, lt3, 4096, 0, logits_full.data());
             check(ok, "decode full-attention succeeded");
-            restore_ssm_state(cache);
+            check(restore_ssm_state(cache, target_backend),
+                  "restore recurrent state succeeded");
             ok = decode_one(psg3, 4096, lt3, 4096, 1024, logits_win.data());
             check(ok, "decode window=1024 succeeded");
 
@@ -3321,7 +3325,10 @@ int main(int argc, char ** argv) {
         //    gated_delta_net kernel captures per-step intermediate states, so
         //    we don't need a pre-verify snapshot to restore from).
         if (!fast_rollback) {
-            snapshot_ssm_state(cache);
+            if (!snapshot_ssm_state(cache, target_backend)) {
+                std::fprintf(stderr, "snapshot recurrent state failed\n");
+                return 1;
+            }
         }
         auto T_snap = sync_us();
         tt_snap += std::chrono::duration<double, std::micro>(T_snap - T_draft_logits).count();
@@ -4033,7 +4040,10 @@ int main(int argc, char ** argv) {
             if (hit_eos) break;
         } else {
             // ── Legacy replay path ──
-            restore_ssm_state(cache);
+            if (!restore_ssm_state(cache, target_backend)) {
+                std::fprintf(stderr, "restore recurrent state failed\n");
+                return 1;
+            }
             auto T_restore = sync_us();
             tt_restore += std::chrono::duration<double, std::micro>(T_restore - T_accept).count();
             std::vector<int32_t> replay_tok(commit_n);

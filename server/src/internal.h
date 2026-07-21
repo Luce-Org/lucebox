@@ -420,9 +420,9 @@ struct TargetCache {
 };
 
 // Snapshot the current SSM+conv state into TargetCache::*_snap tensors.
-void snapshot_ssm_state(TargetCache & c);
+bool snapshot_ssm_state(TargetCache & c, ggml_backend_t backend);
 // Restore the SSM+conv state from the snapshot.
-void restore_ssm_state(TargetCache & c);
+bool restore_ssm_state(TargetCache & c, ggml_backend_t backend);
 // Allocate rollback snapshot tensors mirroring live ssm/conv state (MoE path).
 bool ensure_ssm_snapshot(TargetCache & c, ggml_backend_t backend);
 

@@ -2078,7 +2078,11 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         draft_tok[0] = last_tok;
 
         // 4. Verify: snapshot recurrent state, then run ALL draft tokens batched
-        snapshot_ssm_state(target_cache());
+        if (!snapshot_ssm_state(target_cache(), target_backend())) {
+            std::fprintf(stderr, "[hybrid-spec] recurrent-state snapshot failed\n");
+            step_graph_destroy(draft_sg);
+            return false;
+        }
 
         target_tok.resize(verify_width);
         bool verify_ok = hybrid_forward_batch(
@@ -2086,7 +2090,9 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
             act_cur, target_tok, /*capture_features=*/false);
         if (!verify_ok) {
             std::fprintf(stderr, "[hybrid-spec] verify failed\n");
-            restore_ssm_state(target_cache());
+            if (!restore_ssm_state(target_cache(), target_backend())) {
+                std::fprintf(stderr, "[hybrid-spec] recurrent-state restore failed\n");
+            }
             step_graph_destroy(draft_sg);
             return false;
         }
@@ -2106,7 +2112,11 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         }
 
         // 6. Restore and replay accepted tokens
-        restore_ssm_state(target_cache());
+        if (!restore_ssm_state(target_cache(), target_backend())) {
+            std::fprintf(stderr, "[hybrid-spec] recurrent-state restore failed\n");
+            step_graph_destroy(draft_sg);
+            return false;
+        }
 
         std::vector<int32_t> replay_tok((size_t)commit_n);
         for (int i = 0; i < commit_n; i++) {
