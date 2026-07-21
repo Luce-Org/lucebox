@@ -1,3 +1,4 @@
+#include "CppUnitTestFramework.hpp"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "ggml.h"
@@ -7,7 +8,18 @@
 #include <cstdlib>
 #include <vector>
 
-int main() {
+namespace {
+struct CudaPoolShutdownFixture {};
+}
+
+#define TEST_ASSERT(cond) do { \
+    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
+    if (_cpputf_exception) { \
+        throw *_cpputf_exception; \
+    } \
+} while (0)
+
+TEST_CASE(CudaPoolShutdownFixture, backend_pool_shutdown) {
 #if defined(_WIN32)
     _putenv_s("LUCE_Q8_MEMO", "1");
 #else
@@ -17,7 +29,7 @@ int main() {
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) {
         std::fprintf(stderr, "failed to initialize CUDA/HIP backend\n");
-        return 1;
+        TEST_ASSERT(false);
     }
 
     ggml_init_params params{};
@@ -26,7 +38,7 @@ int main() {
     ggml_context * ctx = ggml_init(params);
     if (!ctx) {
         ggml_backend_free(backend);
-        return 1;
+        TEST_ASSERT(false);
     }
 
     constexpr int64_t k = 256;
@@ -44,7 +56,7 @@ int main() {
     if (!buffer) {
         ggml_free(ctx);
         ggml_backend_free(backend);
-        return 1;
+        TEST_ASSERT(false);
     }
 
     std::vector<uint8_t> weights_data(ggml_nbytes(weights), 0);
@@ -57,11 +69,11 @@ int main() {
     ggml_free(ctx);
     if (status != GGML_STATUS_SUCCESS) {
         ggml_backend_free(backend);
-        return 1;
+        TEST_ASSERT(false);
     }
 
     // LUCE_Q8_MEMO intentionally retains the pool allocation after compute.
     // Backend teardown must release that allocation before destroying its pool.
     ggml_backend_free(backend);
-    return 0;
+    TEST_ASSERT(true);
 }

@@ -1,3 +1,4 @@
+#include "CppUnitTestFramework.hpp"
 #include "../src/common/moe_hybrid_swap_manager.h"
 #include "../src/common/moe_hybrid_placement.h"
 #include "../src/common/moe_hybrid_routing_stats.h"
@@ -7,14 +8,11 @@
 
 using namespace dflash::common;
 
-static void expect(bool cond, const char * msg) {
-    if (!cond) {
-        std::fprintf(stderr, "FAIL: %s\n", msg);
-        std::exit(1);
-    }
+namespace {
+struct Qwen35MoeSwapManagerFixture {};
 }
 
-int main() {
+TEST_CASE(Qwen35MoeSwapManagerFixture, moe_swap_manager_suite) {
     MoeHybridRoutingStats stats;
     stats.n_layer = 2;
     stats.n_expert = 4;
@@ -39,15 +37,14 @@ int main() {
 
     MoeHybridSwapPlan plan;
     std::string err;
-    expect(build_moe_hybrid_swap_plan(placement, stats, policy, plan, &err), err.c_str());
-    expect(plan.actions.size() == 1, "one swap planned");
-    expect(plan.actions[0].layer_idx == 0, "layer0 swap");
-    expect(plan.actions[0].evict_expert == 1, "evict weakest hot");
-    expect(plan.actions[0].promote_expert == 0, "promote best cold");
-    expect(plan.next_placement.is_hot(0, 0), "layer0 expert0 hot after plan");
-    expect(!plan.next_placement.is_hot(0, 1), "layer0 expert1 evicted");
-    expect(plan.next_placement.is_hot(1, 0), "layer1 unchanged");
+    REQUIRE(build_moe_hybrid_swap_plan(placement, stats, policy, plan, &err));
+    REQUIRE(plan.actions.size() == 1);
+    REQUIRE(plan.actions[0].layer_idx == 0);
+    REQUIRE(plan.actions[0].evict_expert == 1);
+    REQUIRE(plan.actions[0].promote_expert == 0);
+    REQUIRE(plan.next_placement.is_hot(0, 0));
+    REQUIRE(!plan.next_placement.is_hot(0, 1));
+    REQUIRE(plan.next_placement.is_hot(1, 0));
 
     std::printf("OK\n");
-    return 0;
 }

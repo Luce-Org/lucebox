@@ -7,6 +7,8 @@
 //   4. cosine: query/key magnitudes do not change scores
 //   5. missing pooled keys keep the missing_score sentinel
 
+#include "CppUnitTestFramework.hpp"
+
 #define KVFLASH_QK_PURE_ONLY
 #include "kvflash_qk.h"
 
@@ -17,15 +19,13 @@
 
 using namespace dflash::common;
 
-static int g_fail = 0;
-#define CHECK(cond, msg) do { \
-    if (cond) std::printf("PASS %s\n", msg); \
-    else { std::printf("FAIL %s\n", msg); g_fail++; } \
-} while (0)
-
 static bool near(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) < eps; }
 
-int main() {
+namespace {
+struct KvflashQkFixture {};
+}
+
+TEST_CASE(KvflashQkFixture, kvflash_qk_suite) {
     KvFlashQkDims d;
     d.n_layers = 2; d.n_q_heads = 6; d.n_kv_heads = 2; d.head_dim = 8;
     const int group = d.n_q_heads / d.n_kv_heads;   // 3
@@ -80,20 +80,20 @@ int main() {
     std::vector<float> out;
     kvflash_qk_chunk_scores(pk, query.data(), d, out, /*missing=*/-9.0f);
 
-    CHECK(out.size() == 6, "output size matches chunk count");
-    CHECK(near(out[0], 0.0f), "orthogonal chunk scores ~0");
-    CHECK(near(out[1], 1.0f), "fully aligned chunk scores ~1 (cosine, layer-mean)");
-    CHECK(near(out[2], 0.5f), "1-of-2-layer alignment scores ~0.5 (layer-MEAN aggregation)");
-    CHECK(near(out[3], 0.5f), "alignment with one group q-head counts (max over group heads)");
-    CHECK(near(out[4], -9.0f), "missing pooled keys keep missing_score");
-    CHECK(out[1] > out[2] && out[2] > out[0], "ranking: aligned > partial > orthogonal");
-    CHECK(near(out[5], out[1]), "identical chunks tie");
+    CHECK(out.size() == 6);
+    CHECK(near(out[0], 0.0f));
+    CHECK(near(out[1], 1.0f));
+    CHECK(near(out[2], 0.5f));
+    CHECK(near(out[3], 0.5f));
+    CHECK(near(out[4], -9.0f));
+    CHECK(out[1] > out[2] && out[2] > out[0]);
+    CHECK(near(out[5], out[1]));
 
     // Default missing_score is worst-case (< -1, below the cosine-mean floor)
     // so a missing chunk never outranks a real chunk with negative correlation.
     std::vector<float> out_def;
     kvflash_qk_chunk_scores(pk, query.data(), d, out_def);   // default missing
-    CHECK(out_def[4] < -1.0f, "default missing_score ranks below any real cosine");
+    CHECK(out_def[4] < -1.0f);
 
     // Cosine invariance: scaling the query must not change anything.
     std::vector<float> query_scaled(query);
@@ -102,7 +102,7 @@ int main() {
     kvflash_qk_chunk_scores(pk, query_scaled.data(), d, out2, -9.0f);
     bool same = out2.size() == out.size();
     for (size_t i = 0; same && i < out.size(); i++) same = near(out[i], out2[i]);
-    CHECK(same, "query magnitude invariance (cosine)");
+    CHECK(same);
 
     // Mixed-direction key: pooled key = normalize(e0+e1): cos with e0-query
     // = 1/sqrt(2) in that layer.
@@ -117,10 +117,8 @@ int main() {
         std::vector<const float *> pk1{ mixed.data() };
         std::vector<float> o1;
         kvflash_qk_chunk_scores(pk1, query.data(), d, o1);
-        CHECK(near(o1[0], (float)(1.0 / std::sqrt(2.0))),
-              "fractional cosine propagates exactly");
+        CHECK(near(o1[0], (float)(1.0 / std::sqrt(2.0))));
     }
 
-    std::printf("%s (%d failures)\n", g_fail == 0 ? "ALL PASS" : "FAILED", g_fail);
-    return g_fail == 0 ? 0 : 1;
+    std::printf("ALL PASS\n");
 }

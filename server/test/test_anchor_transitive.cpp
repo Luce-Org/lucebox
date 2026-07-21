@@ -1,6 +1,7 @@
 // TDD: anchor transitive multi-pass. Pure CPU — no GPU, no model load.
 // T1: single-pass match; T2: single-pass misses hops; T3: transitive rescues all hops.
 
+#include "CppUnitTestFramework.hpp"
 #include "../src/qwen3/anchor_scan.h"
 
 #include <cstdio>
@@ -8,11 +9,18 @@
 #include <cstring>
 #include <vector>
 
-#define REQUIRE(cond) \
-    do { if (!(cond)) { \
-        std::fprintf(stderr, "FAIL: %s line %d: %s\n", __FILE__, __LINE__, #cond); \
-        std::exit(1); \
-    } } while (0)
+#define TEST_ASSERT(cond) do { \
+    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
+    if (_cpputf_exception) { \
+        throw *_cpputf_exception; \
+    } \
+} while (0)
+#undef REQUIRE
+#define REQUIRE(cond) TEST_ASSERT(cond)
+
+namespace {
+struct AnchorTransitiveFixture {};
+}
 
 static constexpr int32_t FILLER = 1;
 static constexpr int32_t M1 = 1001, M2 = 1002, M3 = 1003;
@@ -338,7 +346,7 @@ static void t6_hard_cap_prevents_runaway() {
                 total_forced);
 }
 
-int main() {
+TEST_CASE(AnchorTransitiveFixture, transitive_anchor_suite) {
     t1_single_pass_match();
     t2_single_pass_misses_hops();
     t3_transitive_rescues_all();
@@ -346,5 +354,4 @@ int main() {
     t5_gate_closes_when_pass1_finds_many();
     t6_hard_cap_prevents_runaway();
     std::printf("\nAll anchor_transitive tests passed.\n");
-    return 0;
 }
