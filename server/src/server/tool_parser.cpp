@@ -9,6 +9,9 @@
 // 6. Bare JSON objects with name+arguments fields
 // 7. Whole-response JSON args for exactly one declared tool
 // 8. <TOOL_NAME>...<parameter=K>V</parameter>...</function>  (bare tool tag)
+// 9. <parameter name="TOOL"><parameter name="K">V</parameter></function>
+// 10. <funcname>TOOL<parameter=K>V</parameter>...</function>
+// 11. <function TOOL><parameter=K>V</parameter>...</function>
 //
 // Pattern 5 runs *before* pattern 6 so that args like
 //   call:outer{"name": "inner", "arguments": {}}
@@ -48,6 +51,96 @@ static std::string generate_call_id() {
         id += hex[rng() % 16];
     }
     return id;
+}
+
+static const char TOOL_OPEN[] = "<tool_call>";
+static const char FUNCTION_OPEN[] = "<function=";
+static const char FUNCTION_SPACE_OPEN[] = "<function ";
+static const char FUNCNAME_OPEN[] = "<funcname>";
+static const char TOOL_CODE_OPEN[] = "<tool_code>";
+static const char ATTRIBUTE_PARAMETER_OPEN[] = "<parameter name=";
+static const char ARG_KEY_OPEN[] = "<arg_key>";
+
+static bool valid_tool_name(const std::string & name) {
+    if (name.empty() || name.size() > 64) return false;
+    auto is_alpha_or_underscore = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+    };
+    if (!is_alpha_or_underscore(name.front())) return false;
+    for (const char c : name) {
+        if (!is_alpha_or_underscore(c) && !(c >= '0' && c <= '9') &&
+            c != '.' && c != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static std::string declared_tool_name(const json & tool) {
+    const auto & fn = tool.is_object() && tool.contains("function")
+        ? tool["function"] : tool;
+    const std::string name = fn.is_object()
+        ? fn.value("name", "") : std::string();
+    return valid_tool_name(name) ? name : std::string();
+}
+
+static bool declared_tool_open_at(const std::string & text, size_t pos,
+                                  const json & tools) {
+    if (!tools.is_array()) return false;
+    for (const auto & tool : tools) {
+        const std::string name = declared_tool_name(tool);
+        if (name.empty()) continue;
+        const std::string opener = "<" + name + ">";
+        if (text.compare(pos, opener.size(), opener) == 0) return true;
+    }
+    return false;
+}
+
+bool find_tool_syntax_start(const std::string & text, const json & tools,
+                            size_t & pos) {
+    size_t idx = text.find('<');
+    while (idx != std::string::npos) {
+        if (text.compare(idx, sizeof(TOOL_OPEN) - 1, TOOL_OPEN) == 0 ||
+            text.compare(idx, sizeof(FUNCTION_OPEN) - 1, FUNCTION_OPEN) == 0 ||
+            text.compare(idx, sizeof(FUNCTION_SPACE_OPEN) - 1,
+                         FUNCTION_SPACE_OPEN) == 0 ||
+            text.compare(idx, sizeof(FUNCNAME_OPEN) - 1, FUNCNAME_OPEN) == 0 ||
+            text.compare(idx, sizeof(TOOL_CODE_OPEN) - 1, TOOL_CODE_OPEN) == 0 ||
+            text.compare(idx, sizeof(ATTRIBUTE_PARAMETER_OPEN) - 1,
+                         ATTRIBUTE_PARAMETER_OPEN) == 0 ||
+            declared_tool_open_at(text, idx, tools)) {
+            pos = idx;
+            return true;
+        }
+        if (text.compare(idx, sizeof(ARG_KEY_OPEN) - 1, ARG_KEY_OPEN) == 0) {
+            size_t start = idx;
+            auto is_ident = [](char c) {
+                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                       (c >= '0' && c <= '9') || c == '_' || c == '-';
+            };
+            while (start > 0 && is_ident(text[start - 1])) start--;
+            if (start < idx) {
+                pos = start;
+                return true;
+            }
+        }
+        idx = text.find('<', idx + 1);
+    }
+    return false;
+}
+
+size_t tool_syntax_holdback(const json & tools) {
+    // Longest fixed opener is `<parameter name=` (16 bytes).
+    size_t holdback = sizeof(ATTRIBUTE_PARAMETER_OPEN) - 2;
+    if (!tools.is_array()) return holdback;
+    for (const auto & tool : tools) {
+        const std::string name = declared_tool_name(tool);
+        if (!name.empty()) {
+            // Retain all but the final `>` of `<NAME>`.
+            holdback = std::max(holdback, name.size() + 1);
+        }
+    }
+    return holdback;
 }
 
 // Check if a function name is in the allowed tools list.
@@ -156,6 +249,29 @@ static size_t include_preceding_tool_call_open(const std::string & text, size_t 
     return wrapper;
 }
 
+static size_t include_following_tool_call_close(const std::string & text,
+                                                size_t pos,
+                                                const std::string & fn_name = {}) {
+    size_t close_pos = pos;
+    while (close_pos < text.size()) {
+        const char c = text[close_pos];
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') break;
+        close_pos++;
+    }
+    static constexpr char TOOL_CALL_CLOSE[] = "</tool_call>";
+    if (text.compare(close_pos, sizeof(TOOL_CALL_CLOSE) - 1,
+                     TOOL_CALL_CLOSE) == 0) {
+        return close_pos + sizeof(TOOL_CALL_CLOSE) - 1;
+    }
+    if (!fn_name.empty()) {
+        const std::string tool_close = "</" + fn_name + ">";
+        if (text.compare(close_pos, tool_close.size(), tool_close) == 0) {
+            return close_pos + tool_close.size();
+        }
+    }
+    return pos;
+}
+
 // ─── Pattern regexes ────────────────────────────────────────────────────
 
 // We use std::regex for portability. Compiled once (function-local static).
@@ -187,6 +303,36 @@ static const std::regex & re_function_signature() {
 
 static const std::regex & re_bare_tool_name_xml() {
     static std::regex r(R"(<([A-Za-z_][\w.\-]*?)>([\s\S]*?)(?:</function>|</\1>))");
+    return r;
+}
+
+static const std::regex & re_attribute_tool_xml() {
+    static std::regex r(
+        R"re(<parameter\s+name\s*=\s*"([A-Za-z_][\w.\-]*)"\s*>([\s\S]*?)</function>)re");
+    return r;
+}
+
+static const std::regex & re_attribute_parameter_xml() {
+    static std::regex r(
+        R"re(<parameter\s+name\s*=\s*"([A-Za-z_][\w.\-]*)"\s*>([\s\S]*?)</parameter>)re");
+    return r;
+}
+
+static const std::regex & re_funcname_tool_xml() {
+    static std::regex r(
+        R"(<funcname>\s*([A-Za-z_][\w.\-]*)\s*([\s\S]*?)</function>)");
+    return r;
+}
+
+static const std::regex & re_space_function_xml() {
+    static std::regex r(
+        R"(<function\s+([A-Za-z_][\w.\-]*)\s*>([\s\S]*?)</function>(?:\s*</tool_call>)?)");
+    return r;
+}
+
+static const std::regex & re_complete_parameter_xml() {
+    static std::regex r(
+        R"(<parameter=([A-Za-z_][\w.\-]*)>([\s\S]*?)</parameter>)");
     return r;
 }
 
@@ -361,6 +507,35 @@ static json parse_xml_params(const std::string & region, const std::string & fn_
         args[k] = convert_param_value(v, k, props);
     }
     return args;
+}
+
+// Parse only a body composed entirely of complete <parameter=KEY>...</parameter>
+// elements. Compatibility patterns for malformed function openers use this
+// stricter path so partial model output never becomes guessed arguments.
+static bool parse_complete_parameter_body(const std::string & body,
+                                          const std::string & fn_name,
+                                          const json & tools,
+                                          json & args) {
+    const json props = find_tool_properties(tools, fn_name);
+    args = json::object();
+    bool found_param = false;
+    size_t cursor = 0;
+
+    auto begin = std::sregex_iterator(body.begin(), body.end(),
+                                      re_complete_parameter_xml());
+    auto end = std::sregex_iterator();
+    for (auto it = begin; it != end; ++it) {
+        const size_t pos = it->position();
+        if (!trim_ws(body.substr(cursor, pos - cursor)).empty()) return false;
+
+        const std::string key = (*it)[1].str();
+        if (args.contains(key)) return false;
+        args[key] = convert_param_value(trim_ws((*it)[2].str()), key, props);
+        found_param = true;
+        cursor = pos + it->length();
+    }
+
+    return found_param && trim_ws(body.substr(cursor)).empty();
 }
 
 // ─── JSON tool call parser ──────────────────────────────────────────────
@@ -600,6 +775,7 @@ static bool parse_function_sig_args(const std::string & arg_text, json & out_arg
 ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
     ToolParseResult result;
     std::vector<Span> removals;
+    std::vector<std::pair<size_t, ToolCall>> positioned_calls;
 
     auto add_call = [&](const std::string & fn_name, const json & args,
                         size_t start, size_t end) {
@@ -608,7 +784,7 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
         tc.id = generate_call_id();
         tc.name = fn_name;
         tc.arguments = args.dump();
-        result.tool_calls.push_back(std::move(tc));
+        positioned_calls.emplace_back(start, std::move(tc));
         removals.push_back({start, end});
     };
 
@@ -776,8 +952,112 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             std::string params = (*it)[2].str();
             if (!tool_allowed(tools, fn_name)) continue;
             if (params.find("<parameter=") == std::string::npos) continue;
-            add_call(fn_name, parse_xml_params(params, fn_name, tools),
-                     pos, pos + it->length());
+            add_call(fn_name, parse_xml_params(params, fn_name, tools), pos,
+                     include_following_tool_call_close(text,
+                                                       pos + it->length(),
+                                                       fn_name));
+        }
+    }
+
+    // Pattern 3c: <parameter name="TOOL"><parameter name="KEY">VALUE...
+    // Some Qwen outputs confuse the tool wrapper with an attribute-style
+    // parameter tag. Accept this only when the outer name is a requested
+    // tool and the entire body consists of fully closed parameter elements.
+    // This strict body check prevents partial or guessed arguments.
+    if (tools.is_array() && !tools.empty()) {
+        auto begin = std::sregex_iterator(text.begin(), text.end(), re_attribute_tool_xml());
+        auto end = std::sregex_iterator();
+        for (auto it = begin; it != end; ++it) {
+            const size_t pos = it->position();
+            if (overlaps(removals, pos)) continue;
+
+            const std::string fn_name = (*it)[1].str();
+            if (!tool_allowed(tools, fn_name)) continue;
+
+            const std::string body = (*it)[2].str();
+            const json props = find_tool_properties(tools, fn_name);
+            json args = json::object();
+            bool valid = true;
+            bool found_param = false;
+            size_t cursor = 0;
+
+            auto pbegin =
+                std::sregex_iterator(body.begin(), body.end(), re_attribute_parameter_xml());
+            auto pend = std::sregex_iterator();
+            for (auto pit = pbegin; pit != pend; ++pit) {
+                const size_t ppos = pit->position();
+                if (!trim_ws(body.substr(cursor, ppos - cursor)).empty()) {
+                    valid = false;
+                    break;
+                }
+
+                const std::string key = (*pit)[1].str();
+                if (args.contains(key)) {
+                    valid = false;
+                    break;
+                }
+                args[key] =
+                    convert_param_value(trim_ws((*pit)[2].str()), key, props);
+                found_param = true;
+                cursor = ppos + pit->length();
+            }
+
+            if (!trim_ws(body.substr(cursor)).empty()) valid = false;
+            if (!valid || !found_param) continue;
+
+            add_call(fn_name, args, include_preceding_tool_call_open(text, pos),
+                     include_following_tool_call_close(text,
+                                                       pos + it->length()));
+        }
+    }
+
+    // Pattern 3d: <funcname>TOOL<parameter=KEY>VALUE...</function>.
+    // Qwen occasionally substitutes the literal `funcname` tag for
+    // `<function=TOOL>`. Accept it only for a requested tool and only when
+    // the remaining body is composed entirely of complete parameter blocks.
+    if (tools.is_array() && !tools.empty()) {
+        auto begin = std::sregex_iterator(text.begin(), text.end(), re_funcname_tool_xml());
+        auto end = std::sregex_iterator();
+        for (auto it = begin; it != end; ++it) {
+            const size_t pos = it->position();
+            if (overlaps(removals, pos)) continue;
+
+            const std::string fn_name = (*it)[1].str();
+            if (!tool_allowed(tools, fn_name)) continue;
+
+            json args;
+            if (!parse_complete_parameter_body((*it)[2].str(), fn_name,
+                                               tools, args)) {
+                continue;
+            }
+
+            add_call(fn_name, args, include_preceding_tool_call_open(text, pos),
+                     include_following_tool_call_close(text,
+                                                       pos + it->length()));
+        }
+    }
+
+    // Pattern 3e: <function TOOL><parameter=KEY>VALUE...</function>.
+    // This is a malformed Qwen variant of <function=TOOL>. Accept it only
+    // for a requested tool and only when every argument is fully delimited.
+    if (tools.is_array() && !tools.empty()) {
+        auto begin = std::sregex_iterator(text.begin(), text.end(),
+                                          re_space_function_xml());
+        auto end = std::sregex_iterator();
+        for (auto it = begin; it != end; ++it) {
+            const size_t pos = it->position();
+            if (overlaps(removals, pos)) continue;
+
+            const std::string fn_name = (*it)[1].str();
+            if (!tool_allowed(tools, fn_name)) continue;
+
+            json args;
+            if (!parse_complete_parameter_body((*it)[2].str(), fn_name,
+                                               tools, args)) {
+                continue;
+            }
+            add_call(fn_name, args, include_preceding_tool_call_open(text, pos),
+                     pos + it->length());
         }
     }
 
@@ -895,6 +1175,18 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             }
             cursor = end_pos;
         }
+    }
+
+    // Detection runs by syntax family, so restore the calls' source order
+    // before exposing them to clients. Dependent calls must execute in the
+    // same order in which the model emitted them.
+    std::stable_sort(positioned_calls.begin(), positioned_calls.end(),
+                     [](const auto & a, const auto & b) {
+                         return a.first < b.first;
+                     });
+    result.tool_calls.reserve(positioned_calls.size());
+    for (auto & entry : positioned_calls) {
+        result.tool_calls.push_back(std::move(entry.second));
     }
 
     // Build cleaned text by removing all matched spans
