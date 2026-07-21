@@ -835,14 +835,14 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
         bool ok = false;
         if (moe_hybrid_) {
-            ok = deepseek4_step(backend_, w_, cache_, embed.data(), n_tok, pos,
+            ok = deepseek4_step(backend_, cfg_.device.gpu, w_, cache_, embed.data(), n_tok, pos,
                                 logits, moe_hybrid_.get(), tokens.data() + i,
                                 &stream_engine_, timing ? &step_tel : nullptr,
                                 routing_stats_.get(), hp);
         } else {
             std::vector<float> hc_state;
             ok = deepseek4_step_layer_range(
-                backend_, w_, cache_, hc_state, embed.data(), n_tok, pos,
+                backend_, cfg_.device.gpu, w_, cache_, hc_state, embed.data(), n_tok, pos,
                 0, w_.n_layer,
                 need_logits ? &logits : nullptr,
                 need_logits ? nullptr : &argmax,
@@ -941,7 +941,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             const int pos = std::max(0, committed + generated - 1);
             bool ok = false;
             if (moe_hybrid_) {
-                ok = deepseek4_step(backend_, w_, cache_, embed.data(), 1,
+                ok = deepseek4_step(backend_, cfg_.device.gpu, w_, cache_, embed.data(), 1,
                                     pos, logits,
                                     moe_hybrid_.get(), &tok_to_eval,
                                     &stream_engine_,
@@ -949,7 +949,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
                                     routing_stats_.get());
             } else {
                 std::vector<float> hc_state;
-                ok = deepseek4_step_layer_range(backend_, w_, cache_, hc_state,
+                ok = deepseek4_step_layer_range(backend_, cfg_.device.gpu, w_, cache_, hc_state,
                                                 embed.data(), 1, pos,
                                                 0, w_.n_layer,
                                                 process_logits ? &logits : nullptr,
@@ -1077,7 +1077,7 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
             std::vector<int32_t> spec_toks;
             spec_ran = true;
             if (!run_deepseek4_dspark_spec_decode(
-                    backend_, w_, cache_, *spec_drafter_, committed, seed,
+                    backend_, cfg_.device.gpu, w_, cache_, *spec_drafter_, committed, seed,
                     req.n_gen - 1,
                     win_len > 0 ? spec_feat_window_.data() : nullptr, win_len,
                     spec_toks, &accept_rate,

@@ -265,6 +265,11 @@ struct DeepSeek4LayerCache {
     DeepSeek4CompressorState indexer_compressor;
 };
 
+// Per-shard runtime state for deepseek4_step_layer_range (host-side HC weight
+// cache + cached decode graphs). Defined in deepseek4_graph.cpp; owned by the
+// DeepSeek4Cache below and released by free_deepseek4_cache().
+struct DeepSeek4LayerRangeCache;
+
 struct DeepSeek4Cache {
     int cur_pos  = 0;
     int max_ctx  = 0;
@@ -275,6 +280,9 @@ struct DeepSeek4Cache {
 
     // HC residual streams: [n_hc * n_embd] persistent state
     ggml_tensor * hc_state    = nullptr;  // [n_hc * n_embd]
+
+    // Lazily created on the first deepseek4_step_layer_range call.
+    DeepSeek4LayerRangeCache * layer_range_cache = nullptr;
 
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
@@ -369,6 +377,7 @@ struct Ds4VerifyHooks;
 
 bool deepseek4_step(
     ggml_backend_t              backend,
+    int                         device,
     const DeepSeek4Weights &    w,
     DeepSeek4Cache &            cache,
     const float *               embed,
@@ -394,6 +403,7 @@ struct Ds4VerifyHooks {
 
 bool deepseek4_step_layer_range(
     ggml_backend_t              backend,
+    int                         device,
     const DeepSeek4Weights &    w,
     DeepSeek4Cache &            cache,
     std::vector<float> &        hc_state,
