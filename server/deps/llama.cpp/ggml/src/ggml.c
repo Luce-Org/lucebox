@@ -8175,6 +8175,36 @@ struct ggml_tensor * ggml_laguna_moe_combine(
     return result;
 }
 
+struct ggml_tensor * ggml_laguna_moe_packed_combine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * packed_experts,
+        struct ggml_tensor  * inverse_routes,
+        struct ggml_tensor  * expert_weights) {
+    GGML_ASSERT(packed_experts->type == GGML_TYPE_F32);
+    GGML_ASSERT(inverse_routes->type == GGML_TYPE_I32);
+    GGML_ASSERT(expert_weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(inverse_routes->ne[0] == expert_weights->ne[0]);
+    GGML_ASSERT(inverse_routes->ne[1] == expert_weights->ne[1]);
+
+    const int64_t ne[4] = {
+        packed_experts->ne[0], inverse_routes->ne[1], 1, 1 };
+    struct ggml_tensor * result =
+        ggml_new_tensor(ctx, GGML_TYPE_F32, 2, ne);
+
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = packed_experts;
+    result->src[1] = inverse_routes;
+    result->src[2] = expert_weights;
+
+    ggml_set_op_params_i32(result, 0, -6);
+    ggml_set_op_params_i32(result, 1, (int32_t) packed_experts->ne[0]);
+    ggml_set_op_params_i32(result, 2, (int32_t) packed_experts->ne[1]);
+    ggml_set_op_params_i32(result, 3, (int32_t) inverse_routes->ne[0]);
+    ggml_set_op_params_i32(result, 4, (int32_t) inverse_routes->ne[1]);
+
+    return result;
+}
+
 struct ggml_tensor * ggml_ds4_moe_owner(
         struct ggml_context * ctx,
         struct ggml_tensor  * input,

@@ -206,7 +206,19 @@ bool eval_moe_batched_prefill_ffn(
     std::vector<float> &            out,
     std::string *                   err = nullptr);
 
-// Batched hybrid prefill FFN: hot on GPU, cold on CPU concurrently.
+// Optional device-resident owner destinations for long heterogeneous prefill.
+// When present, the hot/shared and cold partials are copied directly into
+// these target-backend tensors; the caller can add them in its next graph
+// without reading either full hidden-state buffer through the CPU.
+struct MoeHybridDeviceOutputs {
+    ggml_backend_t backend = nullptr;
+    ggml_tensor * hot = nullptr;
+    ggml_tensor * cold = nullptr;
+
+    bool valid() const { return backend && hot && cold; }
+};
+
+// Batched hybrid prefill FFN: hot and cold owners execute concurrently.
 bool eval_moe_hybrid_ffn_batched(
     ggml_backend_t                  gpu_backend,
     ggml_backend_t                  cpu_backend,
@@ -223,7 +235,14 @@ bool eval_moe_hybrid_ffn_batched(
     ggml_gallocr_t *                p_cold_alloc = nullptr,
     MoeExpertCompute *                expert_compute = nullptr,
     const MoeExpertLayer *            expert_layer = nullptr,
-    MoeHybridFfnTelemetry *         telemetry = nullptr);
+    MoeHybridFfnTelemetry *         telemetry = nullptr,
+    // Optional device-resident [n_embd, n_tokens] activation. Long
+    // heterogeneous prefill uses this to avoid a GPU -> host -> GPU bounce
+    // before both expert owners start. `cur_host` may be null when set.
+    ggml_tensor *                   cur_backend = nullptr,
+    // Optional target-backend partial destinations. Supported by the long
+    // in-process expert-major path; `out` is not materialized when active.
+    const MoeHybridDeviceOutputs *  device_outputs = nullptr);
 
 // Hot-only batched prefill: all selected experts are in VRAM.
 // Skips cold graph build, CPU compute, and merge — pure GPU path.

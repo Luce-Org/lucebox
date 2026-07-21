@@ -2,6 +2,7 @@
 
 #include "deepseek4_backend.h"
 #include "deepseek4_internal.h"
+#include "common/peer_access.h"
 #include "common/sampler.h"
 
 #if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
@@ -56,6 +57,32 @@ static void configure_gfx1151_dspark_mmvq_default(int gpu) {
         std::fprintf(stderr,
                      "[deepseek4] gfx1151 DSpark: defaulting "
                      "LUCE_MMVQ_MAX_NCOLS=4\n");
+    }
+#else
+    (void) gpu;
+#endif
+}
+
+static void configure_gfx1201_hybrid_sub_batch_default(int gpu) {
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    if (std::getenv("DFLASH_MMQ_SUB_BATCH") != nullptr) {
+        return;
+    }
+
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, gpu) != cudaSuccess ||
+        std::strncmp(prop.gcnArchName, "gfx1201", 7) != 0) {
+        return;
+    }
+
+    // The generic HIP fallback is q=1 because reduced-stack MMQ is unsafe on
+    // older AMD parts.  ROCmFPX MMVQ on gfx1201 is qualified through q=4;
+    // using that width removes 75% of hot-owner launches while retaining the
+    // stable vector kernel instead of the pathological full-batch MMQ path.
+    if (::setenv("DFLASH_MMQ_SUB_BATCH", "4", 0) == 0) {
+        std::fprintf(stderr,
+                     "[deepseek4] gfx1201 hybrid prefill: defaulting hot "
+                     "expert sub-batch to 4\n");
     }
 #else
     (void) gpu;
@@ -606,10 +633,8 @@ bool DeepSeek4Backend::validate_prefill_mode() const {
     }
     if (w_.moe_hybrid || moe_hybrid_) {
         std::fprintf(stderr,
-            "[deepseek4] %s prefill requires every expert to be resident; "
-            "the selected placement has cold experts\n",
+            "[deepseek4] %s prefill using heterogeneous layer-major experts\n",
             prefill_attention_mode_name(cfg_.prefill_mode));
-        return false;
     }
     return true;
 }
@@ -804,6 +829,7 @@ bool DeepSeek4Backend::init() {
     // DSpark q=4 is faster through MMVQ. Keep AR and other devices unchanged,
     // and preserve LUCE_MMVQ_MAX_NCOLS as an explicit override.
     configure_gfx1151_dspark_mmvq_default(cfg_.device.gpu);
+    configure_gfx1201_hybrid_sub_batch_default(cfg_.device.gpu);
 
     backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
     if (!backend_) {
@@ -1086,6 +1112,12 @@ bool DeepSeek4Backend::init_hybrid_model() {
                          "[deepseek4-moe-tp] in-process expert GPU must differ from local GPU\n");
             return false;
         }
+        if (g_peer_access_opt_in) {
+            const bool peer_ok = enable_peer_access_pair(cfg_.device.gpu, expert_gpu);
+            std::fprintf(stderr,
+                         "[deepseek4-moe-tp] peer access GPU %d <-> GPU %d: %s\n",
+                         cfg_.device.gpu, expert_gpu, peer_ok ? "enabled" : "unavailable");
+        }
         expert_backend_ = ggml_backend_cuda_init(expert_gpu);
         if (!expert_backend_) {
             std::fprintf(stderr,
@@ -1276,8 +1308,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     // kernels. Smaller tail chunks use the same scheduler or its reference
     // fallback.
     const int layer_major_cap = DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
-    const int chunk = (moe_hybrid_ ||
-                       !prefill_attention_mode_is_approximate(cfg_.prefill_mode))
+    const int chunk = !prefill_attention_mode_is_approximate(cfg_.prefill_mode)
         ? 1
         : std::max(1, std::min(requested_chunk,
                                layer_major_cap));

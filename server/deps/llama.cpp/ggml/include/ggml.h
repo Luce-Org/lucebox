@@ -2487,6 +2487,15 @@ extern "C" {
             struct ggml_tensor  * experts,
             struct ggml_tensor  * expert_weights);
 
+    // Reduce packed owner-local expert rows directly back to token order.
+    // inverse_routes maps [route, token] to a row in packed_experts; routes
+    // with zero weight are ignored before the row is read.
+    GGML_API struct ggml_tensor * ggml_laguna_moe_packed_combine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * packed_experts,
+            struct ggml_tensor  * inverse_routes,
+            struct ggml_tensor  * expert_weights);
+
     // Coarse DeepSeek-V4 routed-owner op. gate_up contains concatenated gate
     // and up output rows; the backend performs fused gate/up MMVQ + clamped
     // SwiGLU, down MMVQ, route weighting, and local reduction.

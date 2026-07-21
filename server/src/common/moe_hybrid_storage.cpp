@@ -28,6 +28,14 @@
 
 namespace dflash::common {
 
+static bool duplicate_hot_experts_on_cold_gpu() {
+    static const bool enabled = []() {
+        const char * raw = std::getenv("DFLASH_MOE_DUPLICATE_HOT_ON_COLD");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
+
 int query_gpu_compute_sm() {
 #if defined(DFLASH27B_BACKEND_CUDA)
     int device = -1;
@@ -341,6 +349,14 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
         if (err) *err = "failed to select cold expert backend";
         return false;
     }
+    const bool duplicate_hot_on_cold =
+        out.cold_backend_kind == MoeHybridColdBackend::Gpu &&
+        duplicate_hot_experts_on_cold_gpu();
+    if (duplicate_hot_on_cold) {
+        std::fprintf(stderr,
+                     "[hybrid-storage] duplicating hot experts on cold GPU "
+                     "for a full expert stack\n");
+    }
 
     for (int il = 0; il < cfg.n_layer; ++il) {
         const MoeLayerDesc & desc = layer_descs[(size_t)il];
@@ -368,7 +384,7 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
             is_hot[(size_t)expert] = 1;
         }
         for (int expert = 0; expert < cfg.n_expert; ++expert) {
-            if (!is_hot[(size_t)expert]) {
+            if (duplicate_hot_on_cold || !is_hot[(size_t)expert]) {
                 dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
                 dst.cold_expert_ids.push_back((int32_t)expert);
             }
@@ -546,6 +562,14 @@ bool build_moe_hybrid_storage_from_file(
         if (err) *err = "failed to select cold expert backend";
         return false;
     }
+    const bool duplicate_hot_on_cold =
+        out.cold_backend_kind == MoeHybridColdBackend::Gpu && allocate_cold &&
+        duplicate_hot_experts_on_cold_gpu();
+    if (duplicate_hot_on_cold) {
+        std::fprintf(stderr,
+                     "[hybrid-storage] duplicating hot experts on cold GPU "
+                     "for a full expert stack\n");
+    }
 
     for (int il = 0; il < cfg.n_layer; ++il) {
         const MoeLayerDesc & desc = layer_descs[(size_t)il];
@@ -575,7 +599,7 @@ bool build_moe_hybrid_storage_from_file(
         }
         if (allocate_cold) {
             for (int expert = 0; expert < cfg.n_expert; ++expert) {
-                if (!is_hot[(size_t)expert]) {
+                if (duplicate_hot_on_cold || !is_hot[(size_t)expert]) {
                     dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
                     dst.cold_expert_ids.push_back((int32_t)expert);
                 }
