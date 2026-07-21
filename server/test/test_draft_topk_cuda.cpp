@@ -124,18 +124,10 @@ namespace {
 struct DraftTopkCudaFixture {};
 }
 
-#define TEST_ASSERT(cond) do { \
-    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
-    if (_cpputf_exception) { \
-        throw *_cpputf_exception; \
-    } \
-} while (0)
-
 TEST_CASE(DraftTopkCudaFixture, draft_topk_cuda_suite) {
     int dev_count = 0;
     if (cudaGetDeviceCount(&dev_count) != cudaSuccess || dev_count == 0) {
         printf("SKIP: no CUDA device available\n");
-        TEST_ASSERT(true);
         return;
     }
 
@@ -185,7 +177,7 @@ TEST_CASE(DraftTopkCudaFixture, draft_topk_cuda_suite) {
 
     if (failures) {
         printf("\nFAILED: %d/%d cases\n", failures, idx);
-        TEST_ASSERT(false);
     }
+    REQUIRE(failures == 0);
     printf("\nALL PASS: %d/%d cases\n", idx, idx);
 }
