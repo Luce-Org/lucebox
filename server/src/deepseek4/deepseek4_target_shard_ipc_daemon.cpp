@@ -227,9 +227,23 @@ int run_deepseek4_target_shard_ipc_daemon(
         }
         const bool timing = target_shard_timing_enabled();
 
+        // The shared target-shard protocol treats want_argmax (a per-position
+        // argmax vector, one id per token) and want_logits as independent
+        // outputs. DeepSeek4's GPU argmax only produces the final-position
+        // greedy token, surfaced through last_tok, so it cannot satisfy a
+        // per-position argmax request; reject it rather than silently dropping
+        // the argmax payload and desyncing the stream.
+        if (req.want_argmax) {
+            std::fprintf(stderr,
+                         "[deepseek4-target-shard] per-position argmax output is not supported\n");
+            return false;
+        }
+
         std::vector<float> logits;
         int32_t final_argmax = -1;
-        const bool want_argmax = !req.want_logits;
+        // Greedy requests (no logits wanted) read back only the final-position
+        // token from the GPU argmax; sampling requests read the full logits.
+        const bool want_final_token = !req.want_logits;
         const float * shard_input = req.boundary_activation->data();
         for (size_t i = 0; i < shards.size(); ++i) {
             auto & shard = shards[i];
@@ -244,7 +258,7 @@ int run_deepseek4_target_shard_ipc_daemon(
                 shard_input, n_tokens, req.base_pos,
                 shard.layer_begin, shard.layer_end,
                 (is_last && req.want_logits) ? &logits : nullptr,
-                (is_last && want_argmax) ? &final_argmax : nullptr,
+                (is_last && want_final_token) ? &final_argmax : nullptr,
                 req.token_ids ? req.token_ids->data() : nullptr,
                 timing ? &tel : nullptr);
             if (!ok) {
@@ -264,7 +278,7 @@ int run_deepseek4_target_shard_ipc_daemon(
         }
 
         const int vocab = shards.back().weights.n_vocab;
-        if (want_argmax && (final_argmax < 0 || final_argmax >= vocab)) {
+        if (want_final_token && (final_argmax < 0 || final_argmax >= vocab)) {
             std::fprintf(stderr,
                          "[deepseek4-target-shard] invalid argmax token: vocab=%d token=%d\n",
                          vocab, final_argmax);
@@ -276,7 +290,7 @@ int run_deepseek4_target_shard_ipc_daemon(
                          vocab, logits.size());
             return false;
         }
-        resp.last_tok = want_argmax ? final_argmax : -1;
+        resp.last_tok = want_final_token ? final_argmax : -1;
         if (req.want_logits) {
             resp.logits = std::move(logits);
         }
