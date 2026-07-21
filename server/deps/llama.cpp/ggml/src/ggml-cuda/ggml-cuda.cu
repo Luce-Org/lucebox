@@ -2631,7 +2631,18 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
     const ggml_tensor * src1 = up->src[1];
     const ggml_tensor * ids  = up->src[2];
 
-    if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
+    // Vector fusion writes the final GLU tensor directly and indexes routing
+    // ids from the matmul layout. A reshape that changes token/expert axes is
+    // therefore not a shape-only detail for this kernel. MMQ below remains
+    // safe because it materializes both matmul outputs and lets GLU consume
+    // the original reshape nodes.
+    const bool direct_vector_layout =
+        ggml_are_same_shape(gate, glu->src[0]) &&
+        ggml_are_same_stride(gate, glu->src[0]) &&
+        ggml_are_same_shape(up, glu->src[1]) &&
+        ggml_are_same_stride(up, glu->src[1]);
+
+    if (direct_vector_layout && ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
         ggml_cuda_mm_fusion_args_host fusion_data{};
         fusion_data.gate = gate->src[0];
         ggml_cuda_set_fusion_glu_params(fusion_data, glu);
@@ -2639,7 +2650,7 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
         return true;
     }
 
-    if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+    if (direct_vector_layout && ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
         ggml_cuda_mm_fusion_args_host fusion_data{};
         fusion_data.gate = gate->src[0];
         ggml_cuda_set_fusion_glu_params(fusion_data, glu);
@@ -3621,6 +3632,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         if (cuda_ctx_src->device == cuda_ctx_dst->device) {
 #if defined(GGML_USE_HIP)
             ggml_cuda_flush_peer_copy_batch("same-device-copy");
+            // Flushing an unrelated A->B batch leaves B selected. Restore the
+            // source device before submitting work to this backend's stream.
+            ggml_cuda_set_device(cuda_ctx_src->device);
 #endif
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
         } else {
@@ -3679,6 +3693,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         // src and dst are on the same backend
 #if defined(GGML_USE_HIP)
         ggml_cuda_flush_peer_copy_batch("same-backend-copy");
+        ggml_cuda_set_device(cuda_ctx_src->device);
 #endif
         CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
     }
@@ -3690,6 +3705,7 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 
 #if defined(GGML_USE_HIP)
     ggml_cuda_flush_peer_copy_batch("backend-synchronize");
+    ggml_cuda_set_device(cuda_ctx->device);
 #endif
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 

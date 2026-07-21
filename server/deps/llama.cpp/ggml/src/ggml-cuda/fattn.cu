@@ -114,37 +114,50 @@ struct ds4_inverse_rope_params {
 // Keep these expressions aligned with rope.cu. The attention result is first
 // stored in shared F32, matching the standalone attention-output store/load
 // boundary, before the pair is rotated.
-__device__ static __forceinline__ float ds4_rope_theta_fp64(
+// Return the unreduced angle. Frequency scaling and YaRN interpolation must
+// happen before modulo reduction; reducing here changes the angle whenever
+// freq_scale is not an integer (the production DS4 configuration uses YaRN).
+__device__ static __forceinline__ double ds4_rope_theta_fp64(
         int32_t p, float theta_scale, int exp_int) {
-    const double tau = 6.2831853071795864769;
-    double angle = exp_int == 0
+    return exp_int == 0
         ? (double) p
         : (double) p * pow((double) theta_scale, (double) exp_int);
-    angle -= tau * floor(angle * (1.0 / tau));
-    return (float) angle;
 }
 
-__device__ static __forceinline__ void ds4_inverse_rope_coefficients(
-        int pair, int token,
+__device__ static __forceinline__ void ds4_rope_coefficients_at_position(
+        int pair, int32_t position,
         const ds4_inverse_rope_params & p,
         float & cos_theta, float & sin_theta) {
     const int i0 = 2 * pair;
-    const float theta_extrap = ds4_rope_theta_fp64(
-        -(p.kv_start + token), p.theta_scale, pair);
-    const float theta_interp = p.freq_scale * theta_extrap;
-    float theta = theta_interp;
+    const double theta_extrap = ds4_rope_theta_fp64(
+        position, p.theta_scale, pair);
+    const double theta_interp = (double) p.freq_scale * theta_extrap;
+    double theta = theta_interp;
     float mscale = p.attn_factor;
     if (p.ext_factor != 0.0f) {
         const float ramp_y = (i0 / 2 - p.corr_low) /
             max(0.001f, p.corr_high - p.corr_low);
         const float ramp_mix =
             (1.0f - min(1.0f, max(0.0f, ramp_y))) * p.ext_factor;
-        theta = theta_interp * (1.0f - ramp_mix) +
-                theta_extrap * ramp_mix;
+        theta = theta_interp * (1.0 - (double) ramp_mix) +
+                theta_extrap * (double) ramp_mix;
         mscale *= 1.0f + 0.1f * logf(1.0f / p.freq_scale);
     }
-    cos_theta = cosf(theta) * mscale;
-    sin_theta = sinf(theta) * mscale;
+
+    // Match rope_yarn(): preserve FP64 precision through all scaling and
+    // blend operations, then reduce only at the trig boundary.
+    const double tau = 6.2831853071795864769;
+    theta -= tau * floor(theta * (1.0 / tau));
+    cos_theta = cosf((float) theta) * mscale;
+    sin_theta = sinf((float) theta) * mscale;
+}
+
+__device__ static __forceinline__ void ds4_inverse_rope_coefficients(
+        int pair, int token,
+        const ds4_inverse_rope_params & p,
+        float & cos_theta, float & sin_theta) {
+    ds4_rope_coefficients_at_position(
+        pair, -(p.kv_start + token), p, cos_theta, sin_theta);
 }
 
 // Forward counterpart of ds4_inverse_rope_coefficients. Keep the expressions
@@ -155,23 +168,8 @@ __device__ static __forceinline__ void ds4_forward_rope_coefficients(
         int pair, int token,
         const ds4_inverse_rope_params & p,
         float & cos_theta, float & sin_theta) {
-    const int i0 = 2 * pair;
-    const float theta_extrap = ds4_rope_theta_fp64(
-        p.kv_start + token, p.theta_scale, pair);
-    const float theta_interp = p.freq_scale * theta_extrap;
-    float theta = theta_interp;
-    float mscale = p.attn_factor;
-    if (p.ext_factor != 0.0f) {
-        const float ramp_y = (i0 / 2 - p.corr_low) /
-            max(0.001f, p.corr_high - p.corr_low);
-        const float ramp_mix =
-            (1.0f - min(1.0f, max(0.0f, ramp_y))) * p.ext_factor;
-        theta = theta_interp * (1.0f - ramp_mix) +
-                theta_extrap * ramp_mix;
-        mscale *= 1.0f + 0.1f * logf(1.0f / p.freq_scale);
-    }
-    cos_theta = cosf(theta) * mscale;
-    sin_theta = sinf(theta) * mscale;
+    ds4_rope_coefficients_at_position(
+        pair, p.kv_start + token, p, cos_theta, sin_theta);
 }
 
 __device__ static __forceinline__ void ds4_apply_inverse_rope_pair(
@@ -994,6 +992,7 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
                     ? (INDEXED_MASK ? indexed_count : n_kv)
                     : -1;
     }
+    __syncthreads();
 
     // Preserve each thread's original r = tid + 256*k order. In indexed mode,
     // owner_ranks is the exact selected subsequence of that traversal, so the

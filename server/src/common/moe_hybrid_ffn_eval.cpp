@@ -2700,7 +2700,8 @@ static bool eval_moe_owner_expert_major_batched(
     }
 
     if (device_output) {
-        if (!device_output_owner || !gpu_reduce || !combined_out ||
+        if (!device_output_owner || !combined_out ||
+            (n_pairs > 0 && !gpu_reduce) ||
             device_output->type != GGML_TYPE_F32 ||
             device_output->ne[0] != n_embd ||
             device_output->ne[1] != n_tokens) {
@@ -3154,7 +3155,7 @@ bool eval_moe_hybrid_ffn_batched(
     const MoeHybridDeviceOutputs *  device_outputs) {
     if (telemetry) *telemetry = {};
     const bool materialized_cold = storage.down_cold || storage.gate_up_cold;
-    if (compact_materialized_experts_enabled() && materialized_cold &&
+    if (cur_host && compact_materialized_experts_enabled() && materialized_cold &&
         !expert_compute && n_tokens > 0 && n_tokens <= 4) {
         out.assign((size_t)cfg.n_embd * (size_t)n_tokens, 0.0f);
         std::vector<float> token_out;

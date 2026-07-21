@@ -2155,6 +2155,14 @@ static void test_ds4_flash_attention_inverse_rope_fallback_gpu() {
     constexpr int raw_rows = 128;
     constexpr int n_comp_rows = 8;
     constexpr int n_kv = raw_rows + n_comp_rows;
+    constexpr int kv_start = 131071;
+    constexpr float freq_base = 10000.0f;
+    constexpr float freq_scale = 1.0f / 16.0f;
+    constexpr float ext_factor = 1.0f;
+    constexpr float attn_factor = 1.0f;
+    constexpr float beta_fast = 32.0f;
+    constexpr float beta_slow = 1.0f;
+    constexpr int n_ctx_orig = 8192;
 
     ggml_context * ctx = make_test_context(3u << 20);
     TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
@@ -2176,13 +2184,13 @@ static void test_ds4_flash_attention_inverse_rope_fallback_gpu() {
         ctx, q, k, v, mask, 1.0f / std::sqrt((float) head_dim),
         0.0f, 0.0f);
     // One retained compressed block selects the single-head fallback without
-    // pruning any live row. Position zero makes inverse RoPE the identity, so
-    // a row-constant V has an exact, simple reference result.
+    // pruning any live row. A row-constant V makes attention itself an exact
+    // identity, leaving a nontrivial scaled/YaRN inverse RoPE to validate.
     ggml_flash_attn_ext_set_ds4_sparse(
         output, raw_rows, raw_rows, 4, n_comp_rows);
     ggml_flash_attn_ext_set_ds4_inverse_rope(
-        output, 0, 10000.0f, 1.0f, 0.0f, 1.0f,
-        32.0f, 1.0f, 8192, false);
+        output, kv_start, freq_base, freq_scale, ext_factor, attn_factor,
+        beta_fast, beta_slow, n_ctx_orig, false);
     ggml_set_output(output);
     TEST_ASSERT_MSG(ggml_backend_supports_op(backend, output),
                     "GPU rejected DS4 inverse-RoPE fallback attention");
@@ -2198,18 +2206,49 @@ static void test_ds4_flash_attention_inverse_rope_fallback_gpu() {
         std::vector<float> q_data(head_dim);
         std::vector<float> k_data((size_t) head_dim * n_kv);
         std::vector<float> v_data((size_t) head_dim * n_kv);
+        std::vector<float> base_value(head_dim);
         std::vector<float> expected(head_dim);
         std::vector<ggml_fp16_t> mask_data(
             n_kv, ggml_fp32_to_fp16(0.0f));
         for (int d = 0; d < head_dim; ++d) {
             q_data[(size_t) d] = ((d % 19) - 9) * 0.002f;
-            expected[(size_t) d] = ((d % 17) - 8) * 0.003f;
+            base_value[(size_t) d] = ((d % 17) - 8) * 0.003f;
+        }
+        expected = base_value;
+        float corr_dims[2];
+        ggml_rope_yarn_corr_dims(
+            64, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+        const float theta_scale = std::pow(freq_base, -2.0f / 64.0f);
+        constexpr double tau = 6.2831853071795864769;
+        for (int pair = 0; pair < 32; ++pair) {
+            const int i0 = 2 * pair;
+            const double theta_extrap = -(double) kv_start *
+                std::pow((double) theta_scale, (double) pair);
+            const double theta_interp =
+                (double) freq_scale * theta_extrap;
+            const float ramp_y = (pair - corr_dims[0]) /
+                std::max(0.001f, corr_dims[1] - corr_dims[0]);
+            const float ramp_mix =
+                (1.0f - std::min(1.0f, std::max(0.0f, ramp_y))) *
+                ext_factor;
+            double theta = theta_interp * (1.0 - (double) ramp_mix) +
+                           theta_extrap * (double) ramp_mix;
+            theta -= tau * std::floor(theta * (1.0 / tau));
+            const float mscale = attn_factor *
+                (1.0f + 0.1f * std::log(1.0f / freq_scale));
+            const float cos_theta = std::cos((float) theta) * mscale;
+            const float sin_theta = std::sin((float) theta) * mscale;
+            const size_t d0 = (size_t) head_dim - 64 + (size_t) i0;
+            const float x0 = base_value[d0 + 0];
+            const float x1 = base_value[d0 + 1];
+            expected[d0 + 0] = x0 * cos_theta - x1 * sin_theta;
+            expected[d0 + 1] = x0 * sin_theta + x1 * cos_theta;
         }
         for (int row = 0; row < n_kv; ++row) {
             for (int d = 0; d < head_dim; ++d) {
                 k_data[(size_t) row * head_dim + d] =
                     (((row + d) % 23) - 11) * 0.002f;
-                v_data[(size_t) row * head_dim + d] = expected[(size_t) d];
+                v_data[(size_t) row * head_dim + d] = base_value[(size_t) d];
             }
         }
         ggml_backend_tensor_set(q, q_data.data(), 0,

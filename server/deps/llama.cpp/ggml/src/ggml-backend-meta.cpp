@@ -496,6 +496,21 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
         return ret;
     };
 
+    // Nonlinear/fused operations cannot consume PARTIAL values locally: doing
+    // so would apply the operation before the meta backend's all-reduce. A
+    // computed partial producer is reported as MIRRORED when assume_sync is
+    // true, which places this operation in the subgraph after that reduction.
+    // A genuinely partial input is rejected instead of being miscomputed.
+    auto handle_mirrored = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        for (size_t i = 0; i < GGML_MAX_SRC; ++i) {
+            if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+                continue;
+            }
+            GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+    };
+
     // Some ops process data on a per-row bases:
     auto handle_per_row = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0);
@@ -969,14 +984,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
                 split_state = handle_gated_delta_net(src_ss);
             } break;
             case GGML_OP_DS4_INDEXER_QAT: {
-                split_state = handle_per_row(src_ss);
+                // Hadamard/FP4 quantization is nonlinear. Reduce any partial
+                // producer before applying it independently on each backend.
+                split_state = handle_mirrored(src_ss);
             } break;
             case GGML_OP_DS4_INDEXER_SCORE:
             case GGML_OP_DS4_INDEXER_MASK: {
-                // These fused DS4 indexer operations combine axes from
-                // multiple inputs. Keep them local unless every source is
-                // mirrored on each simple backend.
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+                // SCORE includes ReLU, and MASK consumes its nonlinear result;
+                // neither may run on unreduced dot-product shards.
+                split_state = handle_mirrored(src_ss);
             } break;
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
