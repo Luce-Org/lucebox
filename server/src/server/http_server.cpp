@@ -39,6 +39,7 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 #if defined(_WIN32)
@@ -413,6 +414,14 @@ SamplerCfg parse_request_sampler(const json & body,
         sampler.rep_window = body["rep_window"].get<int>();
     }
     return sampler;
+}
+
+json require_messages_array(const json & body) {
+    if (!body.contains("messages") || !body["messages"].is_array() ||
+        body["messages"].empty()) {
+        throw std::invalid_argument("messages must be a non-empty array");
+    }
+    return body["messages"];
 }
 
 static bool env_flag_enabled(const char * name) {
@@ -1507,7 +1516,7 @@ bool HttpServer::parse_endpoint_request(
     if (path == "/v1/chat/completions") {
         req.format = ApiFormat::OPENAI_CHAT;
         req.response_id = generate_id("chatcmpl");
-        req.messages = body.value("messages", json());
+        req.messages = require_messages_array(body);
         // Strip volatile billing header from messages[0] (OpenAI system).
         if (req.messages.is_array() && !req.messages.empty()) {
             auto & first_message = req.messages[0];
@@ -1533,7 +1542,7 @@ bool HttpServer::parse_endpoint_request(
     if (path == "/v1/messages") {
         req.format = ApiFormat::ANTHROPIC;
         req.response_id = generate_id("msg");
-        req.messages = body.value("messages", json());
+        req.messages = require_messages_array(body);
         normalize_anthropic_system(body, req.messages);
         return true;
     }

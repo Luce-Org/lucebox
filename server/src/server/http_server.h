@@ -232,6 +232,11 @@ struct ParsedRequest {
 SamplerCfg parse_request_sampler(const json & body,
                                  const SamplingDefaults & defaults);
 
+// Read the required `messages` field. Throws std::invalid_argument when
+// it is missing or not a non-empty array; route_request's catch turns
+// that into a 400.
+json require_messages_array(const json & body);
+
 // Build the /props response body. Exposed (non-static) so unit tests
 // can assert on its shape without spinning up a real socket. See
 // docs/specs/props-endpoint.md for the wire contract.

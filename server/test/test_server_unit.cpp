@@ -1586,6 +1586,29 @@ static void test_parse_request_sampler_applies_defaults_and_overrides() {
     TEST_ASSERT(std::fabs(sampler.rep_pen - 1.1f) < 0.001f);
 }
 
+static void test_require_messages_array_rejects_invalid() {
+    const json valid = {{"messages", json::array({
+        {{"role", "user"}, {"content", "hi"}},
+    })}};
+    TEST_ASSERT(require_messages_array(valid).size() == 1);
+
+    const json invalid_bodies[] = {
+        json::object(),                       // missing
+        {{"messages", nullptr}},              // null
+        {{"messages", "hi"}},                 // wrong type
+        {{"messages", json::array()}},        // empty
+    };
+    for (const auto & body : invalid_bodies) {
+        bool threw = false;
+        try {
+            require_messages_array(body);
+        } catch (const std::invalid_argument &) {
+            threw = true;
+        }
+        TEST_ASSERT(threw);
+    }
+}
+
 static void test_pflash_placement_same_backend_local() {
     DevicePlacement target;
     target.backend = compiled_placement_backend();
@@ -4569,6 +4592,7 @@ int main() {
 
     std::fprintf(stderr, "\n── Request parsing ──\n");
     RUN_TEST(test_parse_request_sampler_applies_defaults_and_overrides);
+    RUN_TEST(test_require_messages_array_rejects_invalid);
 
     std::fprintf(stderr, "\n── PFlash config ──\n");
     RUN_TEST(test_pflash_config_defaults);
