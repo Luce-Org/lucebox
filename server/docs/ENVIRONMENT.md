@@ -31,6 +31,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 ## Full inventory (generated)
 
 `grep -rE 'getenv\("[A-Z0-9_]+"\)' server/src` - regenerate when adding or removing variables.
+Variables read through wrapper helpers (for example `ds4_env_flag`, `spec_env_flag`,
+`env_flag_enabled`) do not match that grep; their inventory entries are curated manually.
 
 - `DFLASH27B_CHUNKED` - qwen35_target_graph.cpp
 - `DFLASH27B_DRAFT_FP16` - draft_safetensors_loader.cpp
