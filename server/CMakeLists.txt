@@ -3,6 +3,34 @@ set(DFLASH27B_GPU_BACKEND "cuda" CACHE STRING "GPU backend to build: cuda or hip
 set_property(CACHE DFLASH27B_GPU_BACKEND PROPERTY STRINGS cuda hip)
 string(TOLOWER "${DFLASH27B_GPU_BACKEND}" DFLASH27B_GPU_BACKEND)
 if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+    # CUDA 12.8+ can resolve "native" on some Blackwell systems to the
+    # accelerator-specific sm_120a target. Consumer Blackwell needs the plain
+    # SM target, so translate an explicit native request via nvidia-smi before
+    # CMake initializes CUDA and before downstream ggml target properties read
+    # the architecture list. The default empty value still takes this file's
+    # portable multi-arch list below.
+    if(CMAKE_CUDA_ARCHITECTURES STREQUAL "native")
+        find_program(_DFLASH_NVIDIA_SMI nvidia-smi)
+        if(_DFLASH_NVIDIA_SMI)
+            execute_process(
+                COMMAND "${_DFLASH_NVIDIA_SMI}"
+                        --query-gpu=compute_cap --format=csv,noheader
+                OUTPUT_VARIABLE _dflash_gpu_caps
+                ERROR_QUIET
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                RESULT_VARIABLE _dflash_smi_rc
+            )
+            if(_dflash_smi_rc EQUAL 0 AND _dflash_gpu_caps)
+                string(REGEX MATCH "^[0-9]+\\.[0-9]+" _dflash_cap "${_dflash_gpu_caps}")
+                string(REPLACE "." "" _dflash_arch "${_dflash_cap}")
+                if(_dflash_arch)
+                    set(CMAKE_CUDA_ARCHITECTURES "${_dflash_arch}" CACHE STRING
+                        "CUDA architectures (auto-detected from nvidia-smi: ${_dflash_cap})" FORCE)
+                    message(STATUS "dflash: GPU compute_cap ${_dflash_cap} -> CUDA_ARCHITECTURES=${_dflash_arch}")
+                endif()
+            endif()
+        endif()
+    endif()
     set(DFLASH27B_USER_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
     project(dflash LANGUAGES C CXX CUDA)
 elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
