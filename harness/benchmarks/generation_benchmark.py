@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run deterministic generation checks and compare Lucebox against llama.cpp.
+"""Run deterministic generation checks and compare two compatible endpoints.
 
 The client launchers answer "can this real client talk to Lucebox?". This file
-answers a different question: "does Lucebox generate the same kind of output as
-a llama.cpp baseline, and how fast is it on the same prompts?".
+answers a different question: "do two server builds generate the same kind of
+output, and how fast are they on the same prompts?".
 """
 
 from __future__ import annotations
@@ -13,7 +13,9 @@ import datetime as dt
 import json
 import re
 import statistics
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -59,10 +61,10 @@ def approx_token_count(text: str) -> int:
 def _extract_numeric_answer(text: str) -> str | None:
     """Extract a numeric answer from model output for GSM-style problems."""
     think_end = text.rfind("</think>")
-    answer_text = text[think_end + len("</think>"):] if think_end >= 0 else text
+    answer_text = text[think_end + len("</think>") :] if think_end >= 0 else text
 
     # #### <number>
-    m = re.search(r'####\s*([+-]?\d[\d,]*\.?\d*)', answer_text)
+    m = re.search(r"####\s*([+-]?\d[\d,]*\.?\d*)", answer_text)
     if m:
         return m.group(1).replace(",", "")
 
@@ -70,41 +72,113 @@ def _extract_numeric_answer(text: str) -> str | None:
     boxed = _extract_boxed(answer_text)
     if boxed:
         cleaned = boxed.replace(",", "").strip()
-        if re.match(r'^[+-]?\d+\.?\d*$', cleaned):
+        if re.match(r"^[+-]?\d+\.?\d*$", cleaned):
             return cleaned
 
     # "the answer is <number>"
     m = re.search(
-        r'(?:answer\s+is|result\s+is|equals?|there\s+are|we\s+get)\s*\$?\s*\\?(?:boxed\{)?([+-]?\d[\d,]*\.?\d*)',
-        answer_text, re.IGNORECASE)
+        r"(?:answer\s+is|result\s+is|equals?|there\s+are|we\s+get)\s*\$?\s*\\?(?:boxed\{)?([+-]?\d[\d,]*\.?\d*)",
+        answer_text,
+        re.IGNORECASE,
+    )
     if m:
         return m.group(1).replace(",", "")
 
     # **<number>**
-    m = re.search(r'\*\*([+-]?\d[\d,]*\.?\d*)\*\*', answer_text)
+    m = re.search(r"\*\*([+-]?\d[\d,]*\.?\d*)\*\*", answer_text)
     if m:
         return m.group(1).replace(",", "")
 
     # Last standalone number
-    nums = re.findall(r'(?<![.\d])([+-]?\d[\d,]*\.?\d*)(?![.\d])', answer_text)
+    nums = re.findall(r"(?<![.\d])([+-]?\d[\d,]*\.?\d*)(?![.\d])", answer_text)
     if nums:
         return nums[-1].replace(",", "")
 
     return None
 
 
-def score_gold_answer(case: dict[str, Any], text: str) -> tuple[bool | None, str]:
-    """Score model output against gold_answer if present.
+def _extract_python_code(text: str, entry_point: str) -> str | None:
+    think_end = text.rfind("</think>")
+    answer_text = text[think_end + len("</think>") :] if think_end >= 0 else text
+    fenced = re.search(r"```(?:python)?\s*\n(.*?)```", answer_text, re.DOTALL)
+    if fenced:
+        return fenced.group(1)
+    direct = re.search(
+        r"((?:from\s|import\s).*?\n)?(\s*def\s+" + re.escape(entry_point) + r"\b.*)",
+        answer_text,
+        re.DOTALL,
+    )
+    if not direct:
+        # Keep the first line's indentation: the output may be a body-only
+        # continuation that gets appended to the prompt's function header.
+        return answer_text.strip("\n").rstrip() or None
+    return (direct.group(1) or "") + direct.group(2)
 
-    Returns (correct_or_None, detail_str). None means no gold_answer to check.
+
+def _humaneval_prompt_prefix(case: dict[str, Any], entry_point: str) -> str | None:
+    messages = case.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+            continue
+        content = message["content"]
+        start = re.search(
+            r"(?m)^(?:from\s+\S+\s+import\s+|import\s+|def\s+" + re.escape(entry_point) + r"\b)",
+            content,
+        )
+        if start:
+            return content[start.start() :].rstrip()
+    return None
+
+
+def _score_humaneval(case: dict[str, Any], text: str) -> tuple[bool | None, str]:
+    entry_point = case.get("entry_point")
+    gold_test = case.get("gold_test")
+    if not isinstance(entry_point, str) or not isinstance(gold_test, str):
+        return None, ""
+    code = _extract_python_code(text, entry_point)
+    if not code:
+        return False, "no code extracted"
+    if not re.search(r"(?m)^\s*def\s+" + re.escape(entry_point) + r"\b", code):
+        prompt_prefix = _humaneval_prompt_prefix(case, entry_point)
+        if not prompt_prefix:
+            return False, "no function definition extracted"
+        code = prompt_prefix + "\n" + code
+    test_script = code + "\n" + gold_test + f"\ncheck({entry_point})\n"
+    try:
+        with tempfile.TemporaryDirectory(prefix="lucebox-humaneval-") as work_dir:
+            result = subprocess.run(
+                [sys.executable, "-I", "-c", test_script],
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
+    if result.returncode == 0:
+        return True, "tests passed"
+    error = result.stderr.strip().splitlines()
+    return False, (error[-1][:120] if error else "test process failed")
+
+
+def score_gold_answer(case: dict[str, Any], text: str) -> tuple[bool | None, str]:
+    """Score model output against suite-specific gold metadata when present.
+
+    Returns (correct_or_None, detail_str). None means the case is not scored.
     """
+    suite = case.get("suite", "")
+    if suite == "he":
+        return _score_humaneval(case, text)
+
     gold = case.get("gold_answer")
     if gold is None:
         return None, ""
 
-    suite = case.get("suite", "")
     think_end = text.rfind("</think>")
-    answer_text = text[think_end + len("</think>"):] if think_end >= 0 else text
+    answer_text = text[think_end + len("</think>") :] if think_end >= 0 else text
 
     if suite == "gsm":
         pred = _extract_numeric_answer(text)
@@ -123,14 +197,23 @@ def score_gold_answer(case: dict[str, Any], text: str) -> tuple[bool | None, str
         if not pred:
             # Fallback: bold pattern
             m = re.search(
-                r'(?:answer\s+is|result\s+is|equals?)\s*\*\*(.+?)\*\*',
-                answer_text, re.IGNORECASE)
+                r"(?:answer\s+is|result\s+is|equals?)\s*\*\*(.+?)\*\*", answer_text, re.IGNORECASE
+            )
             if m:
                 pred = m.group(1).strip().rstrip(".")
         if not pred:
             return False, f"no answer found, gold={gold}"
         correct = _math_equiv(pred, gold)
         return correct, f"pred={pred} gold={gold}"
+
+
+def expected_failure_summary(result: dict[str, Any]) -> str:
+    failures: list[str] = []
+    for run in result["runs"]:
+        for failure in run["expected_failures"]:
+            if failure not in failures:
+                failures.append(failure)
+    return "; ".join(failures)
 
 
 def expected_pass(case: dict[str, Any], text: str) -> tuple[bool, list[str]]:
@@ -191,6 +274,24 @@ def extract_text(response: dict[str, Any]) -> str:
     return ""
 
 
+def throughput_from_usage(
+    usage: dict[str, Any], completion_tokens: int, request_elapsed_s: float
+) -> tuple[float, str, float | None]:
+    """Prefer server-reported decode time over end-to-end request time."""
+    timings = usage.get("timings") or {}
+    decode_ms = timings.get("decode_ms")
+    if isinstance(decode_ms, (int, float)) and decode_ms > 0:
+        decode_elapsed_s = float(decode_ms) / 1000.0
+        return completion_tokens / decode_elapsed_s, "usage.timings.decode_ms", decode_elapsed_s
+
+    decode_tok_s = timings.get("decode_tokens_per_sec")
+    if isinstance(decode_tok_s, (int, float)) and decode_tok_s > 0:
+        return float(decode_tok_s), "usage.timings.decode_tokens_per_sec", None
+
+    tok_s = completion_tokens / request_elapsed_s if request_elapsed_s > 0 else 0.0
+    return tok_s, "request_elapsed", None
+
+
 def run_case(
     case: dict[str, Any],
     base_url: str,
@@ -222,14 +323,19 @@ def run_case(
             completion_tokens = approx_token_count(text)
             token_source = "approx_words"
         prompt_tokens = usage.get("prompt_tokens")
+        tok_s, tok_s_source, decode_elapsed_s = throughput_from_usage(
+            usage, completion_tokens, elapsed
+        )
         pass_expected, failures = expected_pass(case, text)
         gold_correct, gold_detail = score_gold_answer(case, text)
         runs.append(
             {
                 "elapsed_s": elapsed,
+                "decode_elapsed_s": decode_elapsed_s,
                 "completion_tokens": completion_tokens,
                 "prompt_tokens": prompt_tokens,
-                "tok_s": completion_tokens / elapsed if elapsed > 0 else 0.0,
+                "tok_s": tok_s,
+                "tok_s_source": tok_s_source,
                 "token_count_source": token_source,
                 "expected_pass": pass_expected,
                 "expected_failures": failures,
@@ -265,6 +371,8 @@ def run_case(
 
 def cmd_run(args: argparse.Namespace) -> int:
     cases = load_cases(Path(args.prompts))
+    if args.case_limit is not None:
+        cases = cases[: args.case_limit]
     results = []
     for case in cases:
         print(f"[bench] {args.name}: {case['id']}", end="", flush=True)
@@ -282,8 +390,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         if result["gold_correct"] is not None:
             mark = "🎯" if result["gold_correct"] else "✗"
             print(f"  {mark} {result['gold_detail']}", flush=True)
-        else:
+        elif result["expected_pass"]:
             print(flush=True)
+        else:
+            print(f"  ✗ {expected_failure_summary(result)}", flush=True)
 
     scored = [r for r in results if r["gold_correct"] is not None]
     report = {
@@ -295,6 +405,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
         "repeats": args.repeats,
+        "case_limit": args.case_limit,
         "cases": results,
         "summary": {
             "cases": len(results),
@@ -309,9 +420,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     out.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     print(f"[bench] wrote {out}")
     if scored:
-        print(f"[bench] correctness: {report['summary']['gold_correct']}/{len(scored)}"
-              f" ({report['summary']['gold_correct']/len(scored)*100:.0f}%)")
-    return 0 if report["summary"]["expected_pass"] == len(results) else 1
+        print(
+            f"[bench] correctness: {report['summary']['gold_correct']}/{len(scored)}"
+            f" ({report['summary']['gold_correct'] / len(scored) * 100:.0f}%)"
+        )
+    failed = [r["id"] for r in results if not r["expected_pass"]]
+    if failed:
+        print(f"[bench] expected checks failed: {', '.join(failed)}")
+    return 1 if failed else 0
 
 
 def load_report(path: Path) -> dict[str, Any]:
@@ -328,8 +444,14 @@ def cmd_compare(args: argparse.Namespace) -> int:
     candidate = load_report(Path(args.candidate))
     base_cases = case_map(baseline)
     cand_cases = case_map(candidate)
+    if not base_cases:
+        raise ValueError("baseline report has no cases")
+    if base_cases.keys() != cand_cases.keys():
+        missing = sorted(base_cases.keys() - cand_cases.keys())
+        extra = sorted(cand_cases.keys() - base_cases.keys())
+        raise ValueError(f"report case mismatch: candidate missing={missing}, extra={extra}")
     rows = []
-    for case_id in sorted(base_cases.keys() & cand_cases.keys()):
+    for case_id in sorted(base_cases):
         base = base_cases[case_id]
         cand = cand_cases[case_id]
         base_tps = float(base.get("mean_tok_s", 0.0))
@@ -342,6 +464,8 @@ def cmd_compare(args: argparse.Namespace) -> int:
                 "speedup": cand_tps / base_tps if base_tps > 0 else None,
                 "baseline_expected_pass": bool(base.get("expected_pass")),
                 "candidate_expected_pass": bool(cand.get("expected_pass")),
+                "baseline_gold_correct": base.get("gold_correct"),
+                "candidate_gold_correct": cand.get("gold_correct"),
                 "normalized_match": normalize_text(base.get("text", ""))
                 == normalize_text(cand.get("text", "")),
                 "baseline_text": base.get("text", ""),
@@ -349,15 +473,27 @@ def cmd_compare(args: argparse.Namespace) -> int:
             }
         )
 
+    baseline_scored = [row for row in rows if row["baseline_gold_correct"] is not None]
+    candidate_scored = [row for row in rows if row["candidate_gold_correct"] is not None]
     summary = {
         "cases": len(rows),
         "baseline": baseline.get("name"),
         "candidate": candidate.get("name"),
         "baseline_expected_pass": sum(1 for r in rows if r["baseline_expected_pass"]),
         "candidate_expected_pass": sum(1 for r in rows if r["candidate_expected_pass"]),
+        "baseline_gold_correct": sum(1 for row in baseline_scored if row["baseline_gold_correct"]),
+        "baseline_gold_scored": len(baseline_scored),
+        "candidate_gold_correct": sum(
+            1 for row in candidate_scored if row["candidate_gold_correct"]
+        ),
+        "candidate_gold_scored": len(candidate_scored),
         "normalized_matches": sum(1 for r in rows if r["normalized_match"]),
-        "baseline_mean_tok_s": statistics.mean([r["baseline_tok_s"] for r in rows]) if rows else 0.0,
-        "candidate_mean_tok_s": statistics.mean([r["candidate_tok_s"] for r in rows]) if rows else 0.0,
+        "baseline_mean_tok_s": statistics.mean([r["baseline_tok_s"] for r in rows])
+        if rows
+        else 0.0,
+        "candidate_mean_tok_s": statistics.mean([r["candidate_tok_s"] for r in rows])
+        if rows
+        else 0.0,
     }
     if summary["baseline_mean_tok_s"] > 0:
         summary["mean_speedup"] = summary["candidate_mean_tok_s"] / summary["baseline_mean_tok_s"]
@@ -388,8 +524,10 @@ def fmt_speedup(value: Any) -> str:
 
 def write_markdown(report: dict[str, Any], path: Path) -> None:
     summary = report["summary"]
+    baseline_name = str(summary["baseline"])
+    candidate_name = str(summary["candidate"])
     lines = [
-        "# Lucebox vs llama.cpp Generation Benchmark",
+        f"# {candidate_name} vs {baseline_name} Generation Benchmark",
         "",
         f"Baseline: `{summary['baseline']}`",
         f"Candidate: `{summary['candidate']}`",
@@ -400,22 +538,41 @@ def write_markdown(report: dict[str, Any], path: Path) -> None:
         f"| Candidate mean tok/s | {summary['candidate_mean_tok_s']:.2f} |",
         f"| Mean speedup | {fmt_speedup(summary['mean_speedup'])} |",
         f"| Candidate expected checks | {summary['candidate_expected_pass']}/{summary['cases']} |",
+        f"| Baseline correctness | {summary['baseline_gold_correct']}/{summary['baseline_gold_scored']} |",
+        f"| Candidate correctness | {summary['candidate_gold_correct']}/{summary['candidate_gold_scored']} |",
         f"| Normalized output matches | {summary['normalized_matches']}/{summary['cases']} |",
         "",
-        "| Case | llama.cpp tok/s | Lucebox tok/s | Speedup | Expected | Same normalized text |",
-        "| --- | ---: | ---: | ---: | --- | --- |",
+        f"| Case | {baseline_name} tok/s | {candidate_name} tok/s | Speedup | Baseline correct | Candidate correct | Expected | Same normalized text |",
+        "| --- | ---: | ---: | ---: | --- | --- | --- | --- |",
     ]
     for row in report["cases"]:
         expected = "pass" if row["candidate_expected_pass"] else "fail"
         match = "yes" if row["normalized_match"] else "no"
+        baseline_correct = (
+            "n/a"
+            if row["baseline_gold_correct"] is None
+            else str(row["baseline_gold_correct"]).lower()
+        )
+        candidate_correct = (
+            "n/a"
+            if row["candidate_gold_correct"] is None
+            else str(row["candidate_gold_correct"]).lower()
+        )
         lines.append(
             f"| `{row['id']}` | {row['baseline_tok_s']:.2f} | "
             f"{row['candidate_tok_s']:.2f} | {fmt_speedup(row['speedup'])} | "
-            f"{expected} | {match} |"
+            f"{baseline_correct} | {candidate_correct} | {expected} | {match} |"
         )
     lines.append("")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -427,12 +584,16 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--url", required=True, help="Base URL ending in /v1")
     run.add_argument("--api-key", default="")
     run.add_argument("--model", required=True)
-    run.add_argument("--prompts", default=str(Path(__file__).with_name("prompts") / "generation_smoke.jsonl"))
+    run.add_argument(
+        "--prompts",
+        default=str(Path(__file__).with_name("prompts") / "generation_smoke.jsonl"),
+    )
     run.add_argument("--json-out", required=True)
     run.add_argument("--max-tokens", type=int, default=256)
     run.add_argument("--temperature", type=float, default=0.0)
     run.add_argument("--timeout", type=float, default=600.0)
     run.add_argument("--repeats", type=int, default=1)
+    run.add_argument("--case-limit", type=positive_int)
     run.set_defaults(func=cmd_run)
 
     compare = sub.add_parser("compare", help="Compare two endpoint reports")
