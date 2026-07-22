@@ -34,7 +34,7 @@ cd dflash
 Wait until you see:
 
 ```
-[server] listening on 0.0.0.0:8080
+[server] listening on 127.0.0.1:8080
 ```
 
 ### Quick smoke test
@@ -147,7 +147,9 @@ requests reuse the loaded model and are much faster.
 ./build/dflash_server <model.gguf> [OPTIONS]
 
 Options:
-  --host HOST           Bind address (default: 0.0.0.0)
+  --host HOST           Bind address (default: 127.0.0.1)
+  --api-key-file PATH   Read the inbound Bearer key from a file
+  --cors-allow-origin ORIGIN  Allow an exact browser origin (repeatable)
   --port PORT           Bind port (default: 8080)
   --draft PATH          Draft model for speculative decoding
   --ddtree-budget N     Speculation budget (default: 64)

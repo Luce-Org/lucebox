@@ -205,16 +205,25 @@ hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf \
 # 3a. NVIDIA (CUDA 12+)
 docker run --rm --gpus all -p 8000:8080 \
   -v "$PWD/server/models:/opt/lucebox-hub/server/models" \
+  -v "$PWD/dflash-api-key:/run/secrets/dflash-api-key:ro" \
+  -e DFLASH_API_KEY_FILE=/run/secrets/dflash-api-key \
   ghcr.io/luce-org/lucebox-hub:cuda12
 
 # 3b. AMD (ROCm 6+, Strix Halo / RX 7900)
 docker run --rm --device /dev/kfd --device /dev/dri \
   --group-add video --group-add render --security-opt seccomp=unconfined \
   -p 8000:8080 -v "$PWD/server/models:/opt/lucebox-hub/server/models" \
+  -v "$PWD/dflash-api-key:/run/secrets/dflash-api-key:ro" \
+  -e DFLASH_API_KEY_FILE=/run/secrets/dflash-api-key \
   ghcr.io/luce-org/lucebox-hub:rocm
 ```
 
-Then hit `:8000/v1/chat/completions` (OpenAI-compatible).
+Before starting the container, create `dflash-api-key` as a non-empty,
+single-line file, set its mode to `0600`, and keep it out of version control.
+Then hit `:8000/v1/chat/completions` with that value as a Bearer token. Public
+container binds fail closed without `DFLASH_API_KEY` or `DFLASH_API_KEY_FILE`;
+the explicit trusted-network escape hatch is
+`DFLASH_ALLOW_UNAUTHENTICATED_NONLOOPBACK=1`.
 
 ## Run the Server
 
@@ -382,7 +391,13 @@ Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token ch
 | `--draft-ipc-bin <path>` | — | Out-of-process draft binary (mixed CUDA/HIP) |
 | `--peer-access` | off | Enable P2P between target GPUs |
 | `--chunk N` | backend default | Prefill ubatch size |
-| `--no-cors` | CORS on | Disable CORS headers |
+| `--host <addr>` | `127.0.0.1` | Bind address; unauthenticated non-loopback binds are refused by default |
+| `DFLASH_API_KEY` / `--api-key-file <path>` | off | Require `Authorization: Bearer …` except on `/health` and `/ready` |
+| `--cors-allow-origin <origin>` | none | Allow one exact browser origin; repeat for multiple origins |
+| `--no-cors` | CORS already off | Deprecated compatibility alias |
+| `--allow-unauthenticated-nonloopback` | off | Explicit unsafe escape hatch for trusted network setups |
+| `--max-header-bytes N` / `--max-body-bytes N` | 32 KiB / 16 MiB | Reject oversized requests with HTTP 413 |
+| `--max-active-connections N` / `--max-queued-requests N` | 64 / 16 | Reject excess load with HTTP 429 |
 | `DFLASH_TARGET_GPU=N` | `0` | Env var equivalent of `--target-gpu` |
 | `DFLASH_DRAFT_GPU=N` | same as target | Env var equivalent of `--draft-gpu` |
 | `DFLASH_MODEL_NAME=<name>` | `dflash` | Env var equivalent of `--model-name`; sets the `/v1/models` id and selects the matching `share/model_cards/<name>.json` |
