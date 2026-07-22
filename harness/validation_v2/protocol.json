@@ -1,0 +1,76 @@
+{
+  "schema": "lucebox.validation-v2.protocol/1",
+  "frozen_at": "2026-07-18",
+  "source": {
+    "lucebox": "a8465ccac803d591097b50973aaa6333a39a900f",
+    "llama_cpp": "571d0d540df04f25298d0e159e520d9fc62ed121",
+    "ruler": "e8bbff677ca2c239640dc90f93310dcf32408c93",
+    "longbench": "2e00731f8d0bff23dc4325161044d0ed8af94c1e"
+  },
+  "models": {
+    "official_qwen36_gguf_revision": "8a7ee08e8b9bfb857107ecc25a5599d2f38b76f8",
+    "official_qwen36_q4_k_m_sha256": "5ed60d0af4650a854b1755bd392f9aef4872643dc25a254bc68043fa638392a0",
+    "local_dflash_draft_revision": "fca10ba135c9d834988e15b7d7f5aee8ebc562a7",
+    "local_dflash_draft_q4_k_m_sha256": "e2500e90165a0f8e7b52c9882c29ed1fa391c60b300ff11b817bf10e31fa092e",
+    "llama_cpp_dflash_repo": "Alittlehammmer/Qwen3.6-27B-DFlash-GGUF-llama.cpp",
+    "llama_cpp_dflash_revision": "5f2ed671305fb1fd8de023d6b335cef4d2663888",
+    "llama_cpp_dflash_q4_k_m_sha256": "71362369a3428a9e93436a869b1131f63e04b88efbc92dacacb18c419d8de95c",
+    "llama_cpp_mtp_repo": "unsloth/Qwen3.6-27B-MTP-GGUF",
+    "llama_cpp_mtp_revision": "5cb35eb3dcbf52dbce5f87dbc64df6aaffadcace",
+    "llama_cpp_mtp_q4_k_m_sha256": "a7cbd3ecc0e3f9b333edee61ae66bc87ed713c5d49587a8355814722ed329e0f"
+  },
+  "decode_corpora": {
+    "tuning40_sha256": "7cd4dba3f443361e17760687893f6d019d6a37d580457ea23b6cbd370a0c752a",
+    "validation100_sha256": "d994509830a32136012359db5b334126b521168523bd67cc543cf61b58643e9d",
+    "publication_corpus_used_for_tuning": false
+  },
+  "platforms": [
+    {"id": "dual-v100s", "compute_capability": "70", "gpu_count": 2},
+    {"id": "rtx3090", "compute_capability": "86", "gpu_count": 1}
+  ],
+  "contracts": ["autoregressive", "exact", "approximate", "external-unverified"],
+  "local_modes": [
+    "target-ar",
+    "exact-chain",
+    "exact-ddtree",
+    "approximate-chain",
+    "approximate-ddtree"
+  ],
+  "external_validation_sweeps": {
+    "llama-dflash": [1, 2, 3, 4, 6],
+    "mtp": [1, 2, 3, 4]
+  },
+  "performance": {
+    "warmups": 2,
+    "repetitions": 5,
+    "fixed_work_tokens": 384,
+    "fixed_work_ignore_eos": true,
+    "natural_stop_token_cap": 384,
+    "concurrency": [1, 4],
+    "bootstrap_samples": 10000,
+    "bootstrap_seed": 20260718,
+    "independent_unit": "prompt"
+  },
+  "niah": {
+    "context_tokens": [32768, 65536, 131072],
+    "primary_cases_per_length": 100,
+    "control_cases_per_length": 20,
+    "depth_fractions": [0.05, 0.25, 0.5, 0.75, 0.95],
+    "scorer": "unicode-nfc-trimmed-complete-final-content-exact-equality"
+  },
+  "ruler": {
+    "suite": "rulerv1-ns",
+    "tasks": 13,
+    "cases_per_task_per_length": 20,
+    "context_tokens": [32768, 65536, 131072],
+    "official_scorers_only": true
+  },
+  "longbench": {
+    "label": "pinned six-task LongBench subset",
+    "tasks": ["qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "gov_report", "qmsum"],
+    "cases_per_task": 50,
+    "official_scorers_only": true
+  },
+  "row_statuses": ["success", "failed", "timeout", "skipped"],
+  "primary_quality_uses_postprocessing": false
+}
