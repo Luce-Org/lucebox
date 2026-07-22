@@ -54,6 +54,11 @@ static bool ds4_env_flag(const char * name) {
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
+static bool ds4_rocmfpx_hc_gpu_enabled() {
+    static const bool enabled = ds4_env_flag("DFLASH_DS4_ROCMFPX_HC_GPU");
+    return enabled;
+}
+
 static int ds4_effective_expert_count(const DeepSeek4Weights & w) {
     const int requested = w.routed_expert_top_k;
     if (requested > 0 && requested < w.n_expert_used) {
@@ -3016,6 +3021,9 @@ struct HcWeightsCpu {
     std::vector<uint16_t> fn_data;   // [hc_dim * mix_dim] F16
     std::vector<float> scale_data;   // [3]
     std::vector<float> base_data;    // [2*n_hc + n_hc*n_hc]
+    void * fn_f16_device = nullptr;  // Persistent F16 mirror for quantized HC fn tensors.
+    size_t fn_f16_device_bytes = 0;
+    int fn_f16_device_id = -1;
     bool loaded = false;
 };
 
@@ -3723,7 +3731,19 @@ static bool load_hc_weights_cpu(HcWeightsCpu & dst, ggml_tensor * fn,
     return true;
 }
 
+static void release_hc_fn_device(HcWeightsCpu & w) {
+#if defined(DFLASH27B_BACKEND_CUDA) || defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    if (w.fn_f16_device) {
+        deepseek4_cuda_hc_free(w.fn_f16_device_id, w.fn_f16_device);
+    }
+#endif
+    w.fn_f16_device = nullptr;
+    w.fn_f16_device_bytes = 0;
+    w.fn_f16_device_id = -1;
+}
+
 static void reset_hc_weights_cpu(HcWeightsCpu & w) {
+    release_hc_fn_device(w);
     w.fn_data.clear();
     w.scale_data.clear();
     w.base_data.clear();
@@ -3755,10 +3775,42 @@ struct DeepSeek4HybridRuntime {
 
 static thread_local DeepSeek4HybridRuntime ds4_hybrid_runtime;
 
-static const void * hc_fn_device_ptr(const HcWeightsCpu &, ggml_tensor * fn) {
+static bool ensure_hc_fn_device(HcWeightsCpu & w, ggml_tensor * fn, int device) {
+    if (!fn || !fn->data) return false;
+    if (fn->type == GGML_TYPE_F16) return true;
+    if (!ds4_rocmfpx_hc_gpu_enabled()) return false;
+    if (!w.loaded || w.fn_data.empty()) return false;
+
+#if defined(DFLASH27B_BACKEND_CUDA) || defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    const size_t bytes = w.fn_data.size() * sizeof(uint16_t);
+    if (w.fn_f16_device && w.fn_f16_device_bytes == bytes &&
+        w.fn_f16_device_id == device) {
+        return true;
+    }
+    release_hc_fn_device(w);
+    if (!deepseek4_cuda_hc_upload_f16(device, w.fn_data.data(), bytes, &w.fn_f16_device)) {
+        std::fprintf(stderr,
+                     "[deepseek4] HC fn F16 mirror upload failed on device %d; "
+                     "falling back to CPU HC\n",
+                     device);
+        w.fn_f16_device = nullptr;
+        w.fn_f16_device_bytes = 0;
+        w.fn_f16_device_id = -1;
+        return false;
+    }
+    w.fn_f16_device_bytes = bytes;
+    w.fn_f16_device_id = device;
+    return true;
+#else
+    return false;
+#endif
+}
+
+static const void * hc_fn_device_ptr(const HcWeightsCpu & w, ggml_tensor * fn) {
     if (!fn) return nullptr;
     if (fn->type == GGML_TYPE_F16) return fn->data;
-    return nullptr;
+    if (!ds4_rocmfpx_hc_gpu_enabled()) return nullptr;
+    return w.fn_f16_device;
 }
 
 static bool load_hash_routing_cpu(HashRoutingTableCpu & dst, ggml_tensor * table) {
@@ -5787,6 +5839,10 @@ static bool initialize_layer_range_cache(
                          "[deepseek4] missing or invalid HC FFN weights for layer %d\n", il);
             runtime.reset();
             return false;
+        }
+        if (ds4_backend_is_gpu(backend) && !ds4_env_flag("DFLASH_DS4_HC_CPU")) {
+            ensure_hc_fn_device(cached.attn, layer.hc_attn_fn, device);
+            ensure_hc_fn_device(cached.ffn, layer.hc_ffn_fn, device);
         }
         if (il < w.n_hash_layer && layer.ffn_gate_tid2eid) {
             load_hash_routing_cpu(runtime.hash_routing_tables[(size_t)il],
