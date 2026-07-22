@@ -517,18 +517,18 @@ static int ds4_try_fused_verify_step(
     Ds4GpuProfiler fused_profiler(
         ds4_backend_is_hip(backend) && ds4_env_flag("DFLASH_DS4_GPU_PROFILE"),
         "forward", "approx_fused_verify", q, kv_start);
-    const auto compute_t0 = Ds4TimingClock::now();
     fused_profiler.begin(Ds4GpuPhase::ApproxFusedVerifyGraph);
+    const auto compute_t0 = Ds4TimingClock::now();
     const ggml_status fused_status = ggml_backend_graph_compute(backend, fg->sg.gf);
-    fused_profiler.end(Ds4GpuPhase::ApproxFusedVerifyGraph);
     if (fused_status != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[ds4-fused-verify] compute failed\n");
         return -1;
     }
-    fused_profiler.emit();
     if (telemetry) {
         telemetry->full_graph_compute_us += ds4_elapsed_us(compute_t0, Ds4TimingClock::now());
     }
+    fused_profiler.end(Ds4GpuPhase::ApproxFusedVerifyGraph);
+    fused_profiler.emit();
 
     const auto read_t0 = Ds4TimingClock::now();
     const int ncap = (int) hooks->capture_layer_ids->size();
