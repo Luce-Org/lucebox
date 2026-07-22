@@ -185,6 +185,11 @@ endif()
 
 if(WIN32)
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "Static ggml on Windows (internal CUDA symbols not dllexported)" FORCE)
+    # Static CUDA runtime on Windows so the release binary is portable
+    # (no cudart64_*.dll needed alongside the executable).
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+        set(CMAKE_CUDA_RUNTIME_LIBRARY Static CACHE STRING "" FORCE)
+    endif()
 endif()
 
 if(WIN32 AND NOT CMAKE_ASM_COMPILER)
