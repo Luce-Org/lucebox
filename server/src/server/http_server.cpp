@@ -23,6 +23,8 @@
 #include "tool_hint.h"
 #include "common/sha1.h"
 #include "freeze_history.h"
+#include "kv_quant.h"
+#include "qwen35_graph_options.h"
 
 #ifdef DFLASH_HAS_CURL
 #include <curl/curl.h>
@@ -842,7 +844,16 @@ static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg)
     uint8_t tmpl_digest[20] = {};
     sha1_hash(cfg.chat_template_src.data(), cfg.chat_template_src.size(), tmpl_digest);
 
-    // Serialization: path_len(4) + path + file_size(8) + file_mtime(8) + max_ctx(4) + tmpl_digest(20).
+    // K-rotation basis: the q4_0 WHT gate flips kv_k_rotated. A .dkv snapshot
+    // written under one rotation state and restored under another is garbage
+    // attention, so fold the resolved rotation basis into the salt — rotated
+    // and unrotated snapshots then get distinct fingerprints and never cross.
+    ggml_type kv_k_t = GGML_TYPE_COUNT, kv_v_t = GGML_TYPE_COUNT;
+    dflash::resolve_kv_types(kv_k_t, kv_v_t);
+    uint8_t kv_k_rotated =
+        dflash::common::qwen35_should_use_graph_wht_k_rotation(kv_k_t) ? 1 : 0;
+
+    // Serialization: path_len(4) + path + file_size(8) + file_mtime(8) + max_ctx(4) + tmpl_digest(20) + kv_k_rotated(1).
     std::vector<uint8_t> buf;
     uint32_t plen = (uint32_t)path.size();
     buf.insert(buf.end(), (uint8_t *)&plen,        (uint8_t *)&plen        + 4);
@@ -852,6 +863,7 @@ static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg)
     int32_t mc = (int32_t)cfg.max_ctx;
     buf.insert(buf.end(), (uint8_t *)&mc,          (uint8_t *)&mc          + 4);
     buf.insert(buf.end(), tmpl_digest, tmpl_digest + 20);
+    buf.push_back(kv_k_rotated);
 
     uint8_t digest[20];
     sha1_hash(buf.data(), buf.size(), digest);

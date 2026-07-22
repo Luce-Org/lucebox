@@ -10556,9 +10556,12 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // attn_scores: S_v * H * n_tokens * n_seqs floats
     // new_states:  S_v * S_v * H * n_seqs floats
     const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
-    float * attn_out_base  = (float *)dst->data;
-    float * state_out_base = (float *)dst->data + attn_score_elems;
+    float * attn_out_base = (float *)dst->data;
 
+    const bool inplace_state = ggml_get_op_params_i32(dst, 1) != 0;
+    float * state_out_base = inplace_state
+        ? (float *)src_state->data
+        : (float *)dst->data + attn_score_elems;
     const float * state_in_base = (const float *)src_state->data;
 
   //const int64_t rq1 = nev1 / neq1;
@@ -10580,9 +10583,12 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
         float * s_out = state_out_base + (iv3 * H + iv1) * S_v * S_v;
 
-        // copy input state into output buffer and operate in-place
+        // Copy input state into the packed output for the regular variant.
+        // The in-place variant operates directly on src_state instead.
         const float * s_in = state_in_base + (iv3 * H + iv1) * S_v * S_v;
-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        if (s_out != s_in) {
+            memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        }
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
