@@ -102,7 +102,7 @@ struct Ds4GpuProfiler::Impl {
 
 Ds4GpuProfiler::Ds4GpuProfiler(bool enabled, const Ds4GpuProfileOptions & options) {
 #if defined(GGML_USE_HIP)
-    if (!enabled) return;
+    if (!enabled || !options.scope || !options.mode) return;
     Impl * impl = new (std::nothrow) Impl;
     if (!impl) return;
     impl->scope = options.scope;
