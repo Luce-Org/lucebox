@@ -156,7 +156,7 @@ void Ds4GpuProfiler::begin(Ds4GpuPhase phase) {
 
 void Ds4GpuProfiler::end(Ds4GpuPhase phase) {
 #if defined(GGML_USE_HIP)
-    if (!impl_ || impl_->active != phase) return;
+    if (!impl_ || phase == Ds4GpuPhase::Count || impl_->active != phase) return;
     roctx_api().pop();
     impl_->active = Ds4GpuPhase::Count;
     if (hipEventRecord(impl_->stop, nullptr) != hipSuccess ||
