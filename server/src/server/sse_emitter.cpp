@@ -13,13 +13,6 @@ namespace dflash::common {
 
 static const char THINK_OPEN[]  = "<think>";
 static const char THINK_CLOSE[] = "</think>";
-static const char TOOL_OPEN[]   = "<tool_call>";
-static const char FUNCTION_OPEN[] = "<function=";
-static const char TOOL_CODE_OPEN[] = "<tool_code>";
-// Laguna emits `NAME<arg_key>K</arg_key><arg_value>V</arg_value>` with the
-// <tool_call> wrapper as special tokens that detokenization strips, so the
-// visible trigger is <arg_key> and the tool name sits immediately before it.
-static const char ARG_KEY_OPEN[] = "<arg_key>";
 static constexpr size_t THINK_OPEN_LEN  = 7;
 static constexpr size_t THINK_CLOSE_LEN = 8;
 
@@ -36,34 +29,6 @@ static bool starts_with_potential_bare_json_tool(const std::string & text,
     if (!has_single_request_tool(tools)) return false;
     size_t first = text.find_first_not_of(" \t\n\r");
     return first != std::string::npos && text[first] == '{';
-}
-
-static bool find_tool_start(const std::string & text, size_t & pos) {
-    size_t idx = text.find('<');
-    while (idx != std::string::npos) {
-        if (text.compare(idx, sizeof(TOOL_OPEN) - 1, TOOL_OPEN) == 0 ||
-            text.compare(idx, sizeof(FUNCTION_OPEN) - 1, FUNCTION_OPEN) == 0 ||
-            text.compare(idx, sizeof(TOOL_CODE_OPEN) - 1, TOOL_CODE_OPEN) == 0) {
-            pos = idx;
-            return true;
-        }
-        if (text.compare(idx, sizeof(ARG_KEY_OPEN) - 1, ARG_KEY_OPEN) == 0) {
-            // Rewind over the tool name so it lands in the tool buffer
-            // (the parser extracts it from just before <arg_key>).
-            size_t start = idx;
-            auto is_ident = [](char c) {
-                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                       (c >= '0' && c <= '9') || c == '_' || c == '-';
-            };
-            while (start > 0 && is_ident(text[start - 1])) start--;
-            if (start < idx) {  // require a non-empty name
-                pos = start;
-                return true;
-            }
-        }
-        idx = text.find('<', idx + 1);
-    }
-    return false;
 }
 
 static std::string gen_item_id() {
@@ -412,7 +377,7 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
         size_t think_close_idx = window_.find(THINK_CLOSE);
         size_t tool_idx = std::string::npos;
         bool tool_hit = has_request_tools(tools_) &&
-                        find_tool_start(window_, tool_idx);
+                        find_tool_syntax_start(window_, tools_, tool_idx);
 
         struct Hit { size_t pos; int type; };  // type: 0=think, 1=think_close, 2=tool-ish
         std::vector<Hit> hits;
@@ -457,8 +422,10 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
         }
 
         // No tags found — emit safe prefix
-        if (window_.size() > std::max(BASE_HOLDBACK, stop_holdback_)) {
-            size_t cut = utf8_safe_len(window_, window_.size() - std::max(BASE_HOLDBACK, stop_holdback_));
+        const size_t holdback = std::max(tool_syntax_holdback(tools_),
+                                         stop_holdback_);
+        if (window_.size() > holdback) {
+            size_t cut = utf8_safe_len(window_, window_.size() - holdback);
             // When tools are declared, a trailing identifier run may be a
             // Laguna tool name whose <arg_key> has not streamed in yet (the
             // <tool_call> wrapper is a stripped special token). Hold it back

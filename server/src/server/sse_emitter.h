@@ -177,7 +177,9 @@ private:
     // Responses API IDs
     std::string  msg_item_id_;
 
-    static constexpr size_t BASE_HOLDBACK = 12;  // max(len("<tool_call>"), len("</think>"), len("<think>"))
+    // Longest tool/reasoning opener minus one, retained so an opener split
+    // across streamed tokens is still recognized on the next token.
+    static constexpr size_t BASE_HOLDBACK = 15;  // len("<parameter name=") - 1
 };
 
 }  // namespace dflash::common
