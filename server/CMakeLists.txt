@@ -771,6 +771,18 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_draft_topk_cuda PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
         add_test(NAME draft_topk_cuda COMMAND test_draft_topk_cuda)
     endif()
+    # Focused CUDA-vs-CPU oracle for the IQ4_XS MMQ stream-k scheduler. These
+    # shapes cover the no-fixup, partial-row, fixup, two-wave, and deeper-K
+    # transitions validated for the llama.cpp #22298 backport on sm_86.
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+        add_executable(test_mmq_streamk_iq4_xs test/test_mmq_streamk_iq4_xs.cpp)
+        target_link_libraries(test_mmq_streamk_iq4_xs PRIVATE
+            ggml
+            ggml-cpu
+            ggml-cuda
+            ggml-base)
+        add_test(NAME mmq_streamk_iq4_xs COMMAND test_mmq_streamk_iq4_xs)
+    endif()
     # GPU port of the sample_logits chain vs the CPU reference. CUDA only:
     # geometric_sampler_cuda.cu is compiled into dflash_common solely on the cuda backend.
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_gpu_sampler_cuda.cpp")
