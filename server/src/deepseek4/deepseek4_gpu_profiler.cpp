@@ -87,6 +87,8 @@ struct Ds4GpuProfiler::Impl {
     const char * mode = nullptr;
     int n_tokens = 0;
     int kv_start = 0;
+    int layer_begin = -1;
+    int layer_end = -1;
     Ds4GpuPhase active = Ds4GpuPhase::Count;
     std::array<double, kPhaseCount> elapsed_ms{};
     std::array<uint64_t, kPhaseCount> calls{};
@@ -98,7 +100,7 @@ struct Ds4GpuProfiler::Impl {
 };
 
 Ds4GpuProfiler::Ds4GpuProfiler(bool enabled, const char * scope, const char * mode,
-                               int n_tokens, int kv_start) {
+                               int n_tokens, int kv_start, int layer_begin, int layer_end) {
 #if defined(GGML_USE_HIP)
     if (!enabled) return;
     Impl * impl = new (std::nothrow) Impl;
@@ -107,6 +109,8 @@ Ds4GpuProfiler::Ds4GpuProfiler(bool enabled, const char * scope, const char * mo
     impl->mode = mode;
     impl->n_tokens = n_tokens;
     impl->kv_start = kv_start;
+    impl->layer_begin = layer_begin;
+    impl->layer_end = layer_end;
     if (hipEventCreate(&impl->start) != hipSuccess ||
         hipEventCreate(&impl->stop) != hipSuccess) {
         destroy_event(impl->start);
@@ -121,6 +125,8 @@ Ds4GpuProfiler::Ds4GpuProfiler(bool enabled, const char * scope, const char * mo
     (void) mode;
     (void) n_tokens;
     (void) kv_start;
+    (void) layer_begin;
+    (void) layer_end;
 #endif
 }
 
@@ -181,15 +187,20 @@ void Ds4GpuProfiler::emit() {
     if (total_calls == 0) return;
     const bool emit_zero_core = std::strcmp(impl_->scope, "forward") == 0 &&
                                 std::strcmp(impl_->mode, "exact_verify") == 0;
+    char layers[24] = "";
+    if (impl_->layer_begin >= 0) {
+        std::snprintf(layers, sizeof(layers), " layers=%d-%d",
+                      impl_->layer_begin, impl_->layer_end);
+    }
     for (size_t i = 0; i < kPhaseCount; ++i) {
         const bool core_phase = i <= static_cast<size_t>(Ds4GpuPhase::OutputProjection);
         if (impl_->calls[i] == 0 && (!core_phase || !emit_zero_core)) continue;
         const auto phase = static_cast<Ds4GpuPhase>(i);
         std::fprintf(stderr,
             "[ds4-gpu-profile] clock=hip_event scope=%s mode=%s phase=%s "
-            "tokens=%d kv_start=%d gpu_ms=%.3f calls=%llu\n",
+            "tokens=%d kv_start=%d%s gpu_ms=%.3f calls=%llu\n",
             impl_->scope, impl_->mode, phase_name(phase), impl_->n_tokens,
-            impl_->kv_start, impl_->elapsed_ms[i],
+            impl_->kv_start, layers, impl_->elapsed_ms[i],
             static_cast<unsigned long long>(impl_->calls[i]));
     }
 }

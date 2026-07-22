@@ -140,6 +140,8 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 `DFLASH_DS4_GPU_PROFILE=1` emits stable records with the prefix
 `[ds4-gpu-profile]`, `clock=hip_event`, a scope and mode, a phase name, token
 width and position, GPU elapsed milliseconds, and the number of timed calls.
+Records from `deepseek4_step_layer_range` also carry the `layers=<begin>-<end>`
+range so shards are distinguishable in a layer-split run.
 Core exact-verification phases are `hc_pre`, `attention`, `moe_ffn`, `hc_post`,
 and `output_projection`; phases with no HIP work report zero calls. Exact
 verification also emits `verification_step`. Fused decode and the explicit

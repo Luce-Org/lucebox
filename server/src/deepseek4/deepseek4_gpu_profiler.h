@@ -19,7 +19,7 @@ enum class Ds4GpuPhase : uint8_t {
 class Ds4GpuProfiler {
 public:
     Ds4GpuProfiler(bool enabled, const char * scope, const char * mode,
-                   int n_tokens, int kv_start);
+                   int n_tokens, int kv_start, int layer_begin = -1, int layer_end = -1);
     ~Ds4GpuProfiler();
 
     Ds4GpuProfiler(const Ds4GpuProfiler &) = delete;
