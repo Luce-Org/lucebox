@@ -5862,7 +5862,8 @@ bool deepseek4_step_layer_range(
     const char * gpu_profile_mode = verify_hooks ? "exact_verify" :
         (n_tokens == 1 ? "decode" : "prefill");
     Ds4GpuProfiler gpu_profiler(gpu_profile_enabled, "forward", gpu_profile_mode,
-                                n_tokens, kv_start, layer_begin, layer_end);
+                                n_tokens, kv_start, layer_begin, layer_end,
+                                /*emit_zero_core=*/verify_hooks != nullptr);
 
     // A dynamic batch may be supplied by callers other than the DSpark
     // verifier. Split it whenever it spans a learned-compressor boundary:
