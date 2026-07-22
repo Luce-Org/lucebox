@@ -129,12 +129,26 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | Variable | Purpose |
 |----------|---------|
 | `DFLASH_DS4_CUDA_LAYERS` | Override the auto-split heuristic and pin the first `N` DeepSeek4 layers to CUDA. The remaining `43 - N` layers run on the Halo shard. |
+| `DFLASH_DS4_GPU_PROFILE` | Enable HIP-event phase records and ROCTX ranges for DS4 forward and verification work. Default off; `0` is disabled. |
 | `DFLASH_DS4_TIMING` | Enable DS4 timing logs for the layer-split parent and target-shard daemon. Useful for profiling prefill/decode breakdowns; leave unset for normal runs. |
 
 `DFLASH_DS4_TIMING` enables the existing timing banners:
 
 - parent / local shard: `[deepseek4-split-timing]`
 - remote Halo shard: `[deepseek4-target-timing]`
+
+`DFLASH_DS4_GPU_PROFILE=1` emits stable records with the prefix
+`[ds4-gpu-profile]`, `clock=hip_event`, a scope and mode, a phase name, token
+width and position, GPU elapsed milliseconds, and the number of timed calls.
+Records from `deepseek4_step_layer_range` also carry the `layers=<begin>-<end>`
+range so shards are distinguishable in a layer-split run.
+Core exact-verification phases are `hc_pre`, `attention`, `moe_ffn`, `hc_post`,
+and `output_projection`; phases with no HIP work report zero calls. Exact
+verification also emits `verification_step`. Fused decode and the explicit
+approximate fused-verification research path emit whole-graph records because
+their phase boundaries are inside one captured graph. When `libroctx64` is
+available, the same phase names are pushed as ROCTX ranges; builds and runs do
+not require the library.
 
 DeepSeek4 no longer uses the old expert-split environment variables or expert-worker tuning knobs. Those retired knobs were removed from the codebase rather than left behind as unsupported debug switches.
 
@@ -183,13 +197,13 @@ export DFLASH_DS4_SPEC_Q=4
   --ds4-expert-top-k 4
 ```
 
-`DFLASH_DS4_FUSED_VERIFY=1` is the opt-in throughput profile. Its persistent
-whole-model GPU graph uses stable padded reduction shapes, so near-tied greedy
-logits can select a different token than the normal causal verifier even at
-temperature 0. Leave it unset when comparing against the normal verifier, or
-set `DFLASH_DS4_SEQ_VERIFY=1` for the slower token-at-a-time verification
-diagnostic. Neither fused verification nor the separate
-`--ds4-expert-top-k 4` approximation should be presented as byte-identical AR.
+`DFLASH_DS4_FUSED_VERIFY=1` requests the fused throughput profile, but falls
+back to the normal verifier because the persistent whole-model GPU graph can
+select a different greedy token at near-tied logits. The approximate graph is
+available only for explicit research runs by also setting
+`DFLASH_DS4_ALLOW_APPROX_FUSED_VERIFY=1`; it must not be presented as
+byte-identical. `DFLASH_DS4_SEQ_VERIFY=1` remains the slower token-at-a-time
+diagnostic. The separate `--ds4-expert-top-k 4` policy is also approximate.
 
 DSpark currently requires monolithic target placement. On HIP,
 `--ds4-fused-decode` selects that placement; if the target falls back to hybrid
@@ -216,6 +230,8 @@ confidence of the proposed prefix. It adds the projection to the same fused
 Markov graph and reads its scores in the existing token-id synchronization; no
 additional host round trip is introduced. Artifacts without a compatible
 confidence head transparently retain the existing acceptance-EWMA policy.
+Set `DFLASH_DS4_ADAPTIVE_WIDTH=0` to hold the verify width fixed for parity
+tests; the environment value takes precedence over the legacy `/tmp` control.
 
 On the gfx1151 validation host, confidence-adaptive width retained 10/10
 GSM+Math accuracy and measured 31.94 tok/s weighted, within 0.6% of fixed q=4

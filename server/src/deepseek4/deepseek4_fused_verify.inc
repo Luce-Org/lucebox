@@ -14,7 +14,15 @@ static void ds4_fv_set(ggml_tensor * t, const void * data, size_t nbytes) {
 static bool ds4_fused_verify_enabled() {
     static int enabled = -1;
     if (enabled < 0) {
-        enabled = ds4_env_flag("DFLASH_DS4_FUSED_VERIFY") ? 1 : 0;
+        const bool requested = ds4_env_flag("DFLASH_DS4_FUSED_VERIFY");
+        const bool allow_approx = ds4_env_flag("DFLASH_DS4_ALLOW_APPROX_FUSED_VERIFY");
+        enabled = requested && allow_approx ? 1 : 0;
+        if (requested && !allow_approx) {
+            std::fprintf(stderr,
+                "[ds4-fused-verify] exact token parity is not guaranteed; "
+                "using the normal verifier. Set DFLASH_DS4_ALLOW_APPROX_FUSED_VERIFY=1 "
+                "only for explicit approximate experiments.\n");
+        }
     }
     return enabled == 1;
 }
@@ -506,14 +514,26 @@ static int ds4_try_fused_verify_step(
     }
 
     // ── Compute + read back ──
+    Ds4GpuProfileOptions profile_opts;
+    profile_opts.scope = "forward";
+    profile_opts.mode = "approx_fused_verify";
+    profile_opts.n_tokens = q;
+    profile_opts.kv_start = kv_start;
+    Ds4GpuProfiler fused_profiler(
+        ds4_backend_is_hip(backend) && ds4_env_flag("DFLASH_DS4_GPU_PROFILE"),
+        profile_opts);
+    fused_profiler.begin(Ds4GpuPhase::ApproxFusedVerifyGraph);
     const auto compute_t0 = Ds4TimingClock::now();
-    if (ggml_backend_graph_compute(backend, fg->sg.gf) != GGML_STATUS_SUCCESS) {
+    const ggml_status fused_status = ggml_backend_graph_compute(backend, fg->sg.gf);
+    if (fused_status != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[ds4-fused-verify] compute failed\n");
         return -1;
     }
     if (telemetry) {
         telemetry->full_graph_compute_us += ds4_elapsed_us(compute_t0, Ds4TimingClock::now());
     }
+    fused_profiler.end(Ds4GpuPhase::ApproxFusedVerifyGraph);
+    fused_profiler.emit();
 
     const auto read_t0 = Ds4TimingClock::now();
     const int ncap = (int) hooks->capture_layer_ids->size();
