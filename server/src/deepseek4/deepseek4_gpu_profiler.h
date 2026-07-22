@@ -16,11 +16,19 @@ enum class Ds4GpuPhase : uint8_t {
     Count,
 };
 
+struct Ds4GpuProfileOptions {
+    const char * scope = nullptr;
+    const char * mode = nullptr;
+    int n_tokens = 0;
+    int kv_start = 0;
+    int layer_begin = -1;
+    int layer_end = -1;
+    bool emit_zero_core = false;
+};
+
 class Ds4GpuProfiler {
 public:
-    Ds4GpuProfiler(bool enabled, const char * scope, const char * mode,
-                   int n_tokens, int kv_start, int layer_begin = -1, int layer_end = -1,
-                   bool emit_zero_core = false);
+    Ds4GpuProfiler(bool enabled, const Ds4GpuProfileOptions & options);
     ~Ds4GpuProfiler();
 
     Ds4GpuProfiler(const Ds4GpuProfiler &) = delete;

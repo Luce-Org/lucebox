@@ -4955,9 +4955,14 @@ static int ds4_try_fused_decode_step(
     if (telemetry) telemetry->full_graph_set_us += ds4_elapsed_us(set_t0, Ds4TimingClock::now());
 
     // ── Compute ─────────────────────────────────────────────────────
+    Ds4GpuProfileOptions profile_opts;
+    profile_opts.scope = "forward";
+    profile_opts.mode = "fused_decode";
+    profile_opts.n_tokens = 1;
+    profile_opts.kv_start = kv_start;
     Ds4GpuProfiler fused_profiler(
         ds4_backend_is_hip(backend) && ds4_env_flag("DFLASH_DS4_GPU_PROFILE"),
-        "forward", "fused_decode", 1, kv_start);
+        profile_opts);
     fused_profiler.begin(Ds4GpuPhase::FusedDecodeGraph);
     const auto compute_t0 = Ds4TimingClock::now();
     const ggml_status fused_status = ggml_backend_graph_compute(backend, fg->sg.gf);
@@ -5861,9 +5866,15 @@ bool deepseek4_step_layer_range(
         ds4_backend_is_hip(backend) && ds4_env_flag("DFLASH_DS4_GPU_PROFILE");
     const char * gpu_profile_mode = verify_hooks ? "exact_verify" :
         (n_tokens == 1 ? "decode" : "prefill");
-    Ds4GpuProfiler gpu_profiler(gpu_profile_enabled, "forward", gpu_profile_mode,
-                                n_tokens, kv_start, layer_begin, layer_end,
-                                /*emit_zero_core=*/verify_hooks != nullptr);
+    Ds4GpuProfileOptions gpu_profile_opts;
+    gpu_profile_opts.scope = "forward";
+    gpu_profile_opts.mode = gpu_profile_mode;
+    gpu_profile_opts.n_tokens = n_tokens;
+    gpu_profile_opts.kv_start = kv_start;
+    gpu_profile_opts.layer_begin = layer_begin;
+    gpu_profile_opts.layer_end = layer_end;
+    gpu_profile_opts.emit_zero_core = verify_hooks != nullptr;
+    Ds4GpuProfiler gpu_profiler(gpu_profile_enabled, gpu_profile_opts);
 
     // A dynamic batch may be supplied by callers other than the DSpark
     // verifier. Split it whenever it spans a learned-compressor boundary:

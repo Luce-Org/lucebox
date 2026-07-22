@@ -100,20 +100,18 @@ struct Ds4GpuProfiler::Impl {
 #endif
 };
 
-Ds4GpuProfiler::Ds4GpuProfiler(bool enabled, const char * scope, const char * mode,
-                               int n_tokens, int kv_start, int layer_begin, int layer_end,
-                               bool emit_zero_core) {
+Ds4GpuProfiler::Ds4GpuProfiler(bool enabled, const Ds4GpuProfileOptions & options) {
 #if defined(GGML_USE_HIP)
     if (!enabled) return;
     Impl * impl = new (std::nothrow) Impl;
     if (!impl) return;
-    impl->scope = scope;
-    impl->mode = mode;
-    impl->n_tokens = n_tokens;
-    impl->kv_start = kv_start;
-    impl->layer_begin = layer_begin;
-    impl->layer_end = layer_end;
-    impl->emit_zero_core = emit_zero_core;
+    impl->scope = options.scope;
+    impl->mode = options.mode;
+    impl->n_tokens = options.n_tokens;
+    impl->kv_start = options.kv_start;
+    impl->layer_begin = options.layer_begin;
+    impl->layer_end = options.layer_end;
+    impl->emit_zero_core = options.emit_zero_core;
     if (hipEventCreate(&impl->start) != hipSuccess ||
         hipEventCreate(&impl->stop) != hipSuccess) {
         destroy_event(impl->start);
@@ -124,13 +122,7 @@ Ds4GpuProfiler::Ds4GpuProfiler(bool enabled, const char * scope, const char * mo
     impl_ = impl;
 #else
     (void) enabled;
-    (void) scope;
-    (void) mode;
-    (void) n_tokens;
-    (void) kv_start;
-    (void) layer_begin;
-    (void) layer_end;
-    (void) emit_zero_core;
+    (void) options;
 #endif
 }
 

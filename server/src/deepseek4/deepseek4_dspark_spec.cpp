@@ -81,9 +81,13 @@ public:
             spec_env_flag("DFLASH_DS4_ALLOW_APPROX_FUSED_VERIFY");
         const char * profile_mode = seq_verify ? "exact_sequential" :
             (approximate_fused ? "approx_fused" : "exact");
+        Ds4GpuProfileOptions profile_opts;
+        profile_opts.scope = "verification";
+        profile_opts.mode = profile_mode;
+        profile_opts.n_tokens = n;
+        profile_opts.kv_start = base_pos;
         Ds4GpuProfiler verify_profiler(
-            spec_env_flag("DFLASH_DS4_GPU_PROFILE"), "verification",
-            profile_mode, n, base_pos);
+            spec_env_flag("DFLASH_DS4_GPU_PROFILE"), profile_opts);
         if (seq_verify) {
             verify_profiler.begin(Ds4GpuPhase::VerificationStep);
             std::vector<int32_t> am_all;

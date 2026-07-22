@@ -514,9 +514,14 @@ static int ds4_try_fused_verify_step(
     }
 
     // ── Compute + read back ──
+    Ds4GpuProfileOptions profile_opts;
+    profile_opts.scope = "forward";
+    profile_opts.mode = "approx_fused_verify";
+    profile_opts.n_tokens = q;
+    profile_opts.kv_start = kv_start;
     Ds4GpuProfiler fused_profiler(
         ds4_backend_is_hip(backend) && ds4_env_flag("DFLASH_DS4_GPU_PROFILE"),
-        "forward", "approx_fused_verify", q, kv_start);
+        profile_opts);
     fused_profiler.begin(Ds4GpuPhase::ApproxFusedVerifyGraph);
     const auto compute_t0 = Ds4TimingClock::now();
     const ggml_status fused_status = ggml_backend_graph_compute(backend, fg->sg.gf);
