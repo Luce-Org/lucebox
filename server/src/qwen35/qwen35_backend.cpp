@@ -198,8 +198,8 @@ bool Qwen35Backend::init() {
                 INT32_MAX - (int)PAGED_BLOCK_SIZE + 1);
             return false;
         }
-        if (const char * kvflash = std::getenv("DFLASH_KVFLASH");
-            kvflash && kvflash[0] != '\0') {
+        if (kvflash_pool_from_env(
+                cfg_.device.max_ctx, KvFlashConfig{}) > 0) {
             std::fprintf(stderr,
                 "[paged-attention] cannot be combined with KVFlash; "
                 "remove --kvflash/DFLASH_KVFLASH\n");
@@ -1781,8 +1781,10 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         if (IS_EOS_TOK(first_tok, w_)) return true;
         // Preserve the existing AR position semantics: the first sampled
         // token advances cur_pos without a cache write. The page table must
-        // include that zero-initialized logical row so subsequent attention
-        // sees exactly the same context as the dense path.
+        // include that logical row so subsequent attention sees exactly the
+        // same context as the dense path. Prefill does not refresh this row,
+        // so after the first request it may contain residual K/V from the
+        // previous request.
         if (!append_paged_gap((uint32_t)committed)) return false;
         committed++;
         cache_.cur_pos = committed;

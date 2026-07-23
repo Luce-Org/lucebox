@@ -731,22 +731,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     };
 
     auto handle_paged_attn = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        const bool mirrored =
-            src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
-            src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
-            src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
-            src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
-            src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
-        if (mirrored) {
-            return src_ss[0];
-        }
-
-        // Head-sharded Q/K/V are valid when every device preserves the same
-        // GQA ratio. The generic ratio validation below enforces that; routing
-        // metadata itself must be mirrored.
-        GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
-        GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
+        // Paged attention currently rejects layer-split targets, so the meta
+        // backend can only see a fully mirrored op. Add sharded semantics when
+        // paged layer splitting is implemented and can be exercised end to end.
+        GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         return src_ss[0];

@@ -88,7 +88,8 @@ these unsupported combinations explicit.
 
 `bench_paged_attention` compares one native batched contiguous-attention
 operation with one paged-attention operation at `n_seq=1,2,4,8`, using Qwen's
-D=256, Hq=24, and Hkv=4 dimensions:
+D=256, Hq=24, and Hkv=4 dimensions. Its default run also includes one
+representative ragged eight-request capacity case:
 
 The paged kernel, Qwen integration, numerical test, and benchmark build on
 both CUDA and HIP. HIP numerical coverage has been validated on gfx1151.
@@ -103,15 +104,48 @@ cmake --build "$BUILD_DIR" --target bench_paged_attention
 
 Both layouts receive the same logical queries and identical quantized K/V
 rows. The paged inputs use private, interleaved physical blocks for every
-sequence, and an untimed output comparison must pass before timing starts.
-Each sample window queues repeated graph executions and synchronizes once.
+sequence. Before timing, both GPU outputs are compared with a double-precision
+CPU oracle, and neither path may exceed `5e-3` maximum absolute error. The
+focused paged-attention numerical test uses a tighter `5e-4` bound. Direct
+layout error remains a diagnostic because different GPU reduction trees can
+diverge at long context. Each sample window queues repeated graph executions
+and synchronizes once.
 
-The CSV reports median and p95 window-averaged step time, paged overhead
-relative to contiguous attention, aggregate attention-query throughput,
-scaling efficiency, K/V memory, block-table metadata, and output error.
-Automatic calibration gives each layout an approximately equal-duration
-sample window. All sequences have the same context length, so this is a direct
-kernel/layout comparison.
+CTest runs the numerical test twice: the default case covers partitioned
+long-context attention plus negative/over-capacity length clamps, while
+`paged_attention_direct` forces one partition to cover the scratch-free
+normalization and empty-sequence path independently of device occupancy.
+
+The CSV reports median step time, paged overhead, aggregate attention-query
+throughput, exact K/V and paging-metadata bytes, memory saving, layout error,
+and both paths' CPU-oracle error. Automatic calibration gives each layout an
+approximately equal-duration sample window.
+
+The default run emits uniform `n_seq=1,2,4,8` rows for direct kernel/layout
+comparison, followed by a ragged eight-request capacity row with one
+`--context` request and seven requests at `--context / 16`. At the default 4K
+context this is `4096 + 7 x 256`; it has the same 16:1 long/short mix and
+82.03% K/V saving as the documented `128K + 7 x 8K` profile while remaining
+quick to run.
+
+The CUDA decode kernel groups the six Qwen query heads that share each K/V
+head in one thread block. It also divides long contexts across independently
+computed partitions and merges their softmax statistics with a stable
+max/sum reduction. The partition count is occupancy-aware for ordinary
+contexts and grows with cache capacity for long contexts, without reading a
+device context length on the host or changing CUDA graph topology.
+
+The following reference result was measured on an RTX 3090 with CUDA graphs,
+Q4_0 K/V, a 4096-token context, 10 warmups, and 7 automatically calibrated
+samples. Times are median microseconds per attention step; the ratio is
+`paged / contiguous`, so values above 1 are paged-kernel overhead.
+
+| Sequences | Contiguous (us) | Paged (us) | Ratio |
+|----------:|----------------:|-----------:|------:|
+| 1 | 81.549 | 106.759 | 1.31x |
+| 2 | 142.287 | 209.283 | 1.47x |
+| 4 | 254.292 | 393.838 | 1.55x |
+| 8 | 486.698 | 733.469 | 1.51x |
 
 To expose the allocation trade-off separately, pass a comma-separated set of
 live context lengths:
@@ -128,22 +162,31 @@ specifically a **padded per-sequence contiguous** layout: every sequence owns
 `align256(max(contexts))` K/V slots and an F16 mask hides its unused suffix.
 The paged layout allocates only `sum(align16(context_i))` slots and interleaves
 the sequences' unique physical blocks in that compact pool. Both paths receive
-identical logical Q/K/V values, and output parity is mandatory before either
-path is timed. The CUDA contiguous kernel derives each live prefix from the
-mask and skips fully masked tail tiles, so the timing comparison does not
-charge it for all padded tokens even though its K/V allocation remains padded.
+identical logical Q/K/V values. As in the uniform benchmark, both paths must
+pass the benchmark's CPU-oracle ceiling before timing; direct parity remains
+diagnostic. The CUDA contiguous kernel derives each live prefix from the mask
+and skips fully masked tail tiles, so the timing comparison does not charge it
+for all padded tokens even though its K/V allocation remains padded.
 
 The ragged CSV reports live, contiguous-padded, and paged-pool token counts;
-kernel timings and output error; exact one-layer K/V bytes; and a K/V-only
-projection across Qwen3.6's 16 full-attention layers. The projection excludes
-model weights, activations, recurrent-layer state, allocator workspace, and
-other runtime memory, so it is a capacity comparison rather than a claim that
-one layout will or will not fit on a particular GPU.
+kernel timings and output error; and exact one-layer K/V and paging-metadata
+bytes. The Qwen3.6 projection below multiplies K/V storage by its 16
+full-attention layers and excludes model weights, activations, recurrent-layer
+state, allocator workspace, and other runtime memory, so it is a capacity
+comparison rather than a claim that one layout will or will not fit on a
+particular GPU.
 
 For Q4_0 K/V, the eight-user profile above projects to 18.000 GiB for padded
 per-sequence contiguous K/V and 3.234 GiB for paged K/V: a 5.57x reduction,
 or 82.03% less K/V storage. Uniform `8 x 128K` contexts would use 18.000 GiB
 in both layouts, apart from small paging metadata and block rounding.
+
+On the same RTX 3090 setup, the ragged case measured 3.122 ms for contiguous
+attention and 4.095 ms for paged attention (`1.31x`), while reducing the
+one-layer K/V allocation from 1152 MiB to 207 MiB. This shows both sides of
+the trade-off: the current paged kernel still has compute overhead, but it
+keeps the highly ragged eight-request workload close to the native kernel
+while admitting it with 82.03% less K/V storage.
 
 A second GGML design can use one unified contiguous arena plus a
 sequence-aware mask. It can approach sum-sized storage while compact, but

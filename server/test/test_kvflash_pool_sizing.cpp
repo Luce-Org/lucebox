@@ -18,9 +18,14 @@ static void expect(bool cond, const char * msg) {
 }
 
 int main() {
+    const int max_ctx = 131072;
+
+    setenv("DFLASH_KVFLASH", "0", 1);
+    expect(kvflash_pool_from_env(max_ctx) == 0,
+           "explicit zero should disable KVFlash");
+
     setenv("DFLASH_KVFLASH", "auto", 1);
     unsetenv("DFLASH_KVFLASH_MAX_POOL");
-    const int max_ctx = 131072;
 
     // No budget supplied -> fallback fraction of max_ctx (the buggy placement
     // path). scorer_expected toggles 1/2 vs 1/4.

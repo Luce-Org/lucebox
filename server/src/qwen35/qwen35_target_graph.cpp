@@ -575,8 +575,7 @@ static ggml_tensor * build_full_attn_block(
     ggml_tensor * kv_write_rows = nullptr,
     ggml_tensor ** q_fa_out = nullptr,  // post-RoPE/post-rotation Q [head_dim, n_tokens, n_head]
     ggml_tensor * paged_block_table = nullptr,
-    ggml_tensor * paged_kv_seq_lens = nullptr,
-    int paged_block_size = 0
+    ggml_tensor * paged_kv_seq_lens = nullptr
 ) {
     const int head_dim = w.n_embd_head_k;
     const int n_head = w.n_head;
@@ -728,10 +727,10 @@ static ggml_tensor * build_full_attn_block(
     const float kq_scale = 1.0f / std::sqrt((float)head_dim);
     ggml_tensor * attn = nullptr;
     if (paged_block_table) {
-        GGML_ASSERT(paged_kv_seq_lens && paged_block_size > 0);
+        GGML_ASSERT(paged_kv_seq_lens);
         attn = ggml_paged_attn(ctx, Qfa, cache_k, cache_v,
                                paged_block_table, paged_kv_seq_lens,
-                               kq_scale, paged_block_size);
+                               kq_scale, PAGED_BLOCK_SIZE);
     } else {
         // K and V from cache: a windowed view starting at win_start.
         ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
@@ -1243,8 +1242,7 @@ QwenGraphOutputs build_qwen35_graph(
                                         in.kv_write_rows,
                                         want_q_cap ? &q_fa : nullptr,
                                         in.paged_block_table,
-                                        in.paged_kv_seq_lens,
-                                        in.paged_block_size);
+                                        in.paged_kv_seq_lens);
             if (want_q_cap && q_fa) {
                 // Last token's Q, all heads: src [head_dim, 1, n_head] view of
                 // [head_dim, n_tokens, n_head]; dst = q_cap plane fa_idx

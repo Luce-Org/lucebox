@@ -516,13 +516,6 @@ bool restore_target_cache_chain(const PrefixSnapshot * thick,
                                  int n_thins,
                                  TargetCache & cache);
 
-// max_verify_tokens controls the per-layer ssm_intermediate and conv_input_cache
-// sizes. Default is DFLASH27B_DRAFT_BLOCK_SIZE (16) for chain verify. DDTree
-// mode requires max(chain, 1 + tree_budget) to hold the flat tree + root.
-// Pass 0 to use the default.
-// When prefill_only is true, rollback tensors (snapshots, intermediates) are
-// skipped — saving ~1.4 GB on 48 DeltaNet layers. Use migrate_prefill_cache()
-// to promote the cache to a full decode cache after prefill.
 // Fixed page size (tokens) shared by the paged KV allocator, the qwen35
 // decode graph, and the KV cache's block-aligned physical sizing.
 constexpr int PAGED_BLOCK_SIZE = 16;
@@ -537,6 +530,13 @@ constexpr int paged_token_capacity(int max_ctx) {
     return paged_block_count(max_ctx) * PAGED_BLOCK_SIZE;
 }
 
+// max_verify_tokens controls the per-layer ssm_intermediate and conv_input_cache
+// sizes. Default is DFLASH27B_DRAFT_BLOCK_SIZE (16) for chain verify. DDTree
+// mode requires max(chain, 1 + tree_budget) to hold the flat tree + root.
+// Pass 0 to use the default.
+// When prefill_only is true, rollback tensors (snapshots, intermediates) are
+// skipped — saving ~1.4 GB on 48 DeltaNet layers. Use migrate_prefill_cache()
+// to promote the cache to a full decode cache after prefill.
 // `ctx_alloc` (0 = max_ctx): physical token capacity of the attention KV
 // tensors. When smaller than max_ctx, a KvFlashPager maps logical positions to
 // pool slots and pages cold chunks to host (bounded KV residency); the
@@ -624,7 +624,6 @@ struct QwenGraphInputs {
     ggml_tensor * paged_block_table = nullptr; // [max_blocks,n_seqs] i32
     // [n_seqs] i32; valid cached K/V tokens per sequence.
     ggml_tensor * paged_kv_seq_lens = nullptr;
-    int paged_block_size = 0;
     // Capture the LAST token's post-RoPE/post-rotation Q per full-attention
     // layer into cache.q_cap (KVFlash target-QK scorer). Step-invariant:
     // node properties depend only on n_tokens and the layer index.

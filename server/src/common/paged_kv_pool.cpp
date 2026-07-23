@@ -60,12 +60,11 @@ PagedKvStatus PagedKvPool::acquire(PagedKvRequestId request_id,
     uint64_t generation = sequence.generation + 1;
     if (generation == 0) generation = 1;
 
-    // A free slot owns no blocks and has no live request mapping.
+    // release_sequence(), reset(), and construction leave every free slot
+    // empty; acquire only installs its new identity.
     sequence.request_id = request_id;
     sequence.generation = generation;
-    sequence.kv_seq_len = 0;
     sequence.active = true;
-    sequence.block_table.clear();
     request_to_slot_.emplace(request_id, slot);
     free_sequence_slots_.erase(free_sequence_slots_.begin());
 
@@ -118,22 +117,20 @@ PagedKvAppendResult PagedKvPool::append(PagedKvSequenceHandle handle,
         return result;
     }
 
-    std::vector<uint32_t> allocated_blocks;
-    allocated_blocks.reserve(additional_blocks);
-    auto free_it = free_blocks_.begin();
-    for (uint32_t i = 0; i < additional_blocks; ++i, ++free_it) {
-        allocated_blocks.push_back(*free_it);
-    }
-
+    // Reserve before mutating the pool. Once capacity is available,
+    // PagedKvWriteSlot insertion cannot allocate or throw.
     result.write_slots.reserve(token_count);
+
+    // extend_block_table() grows the block table before consuming free blocks,
+    // so a failed vector allocation leaves the pool unchanged.
+    result.status = extend_block_table(*sequence, required_blocks);
+    if (result.status != PagedKvStatus::Ok) return result;
+
     for (uint32_t i = 0; i < token_count; ++i) {
         const uint32_t logical_position = old_kv_seq_len + i;
         const uint32_t logical_block = logical_position / block_size_;
         const uint32_t block_offset = logical_position % block_size_;
-        const uint32_t physical_block =
-            logical_block < current_blocks
-                ? sequence->block_table[logical_block]
-                : allocated_blocks[logical_block - current_blocks];
+        const uint32_t physical_block = sequence->block_table[logical_block];
         result.write_slots.push_back({
             logical_position,
             physical_block,
@@ -142,11 +139,6 @@ PagedKvAppendResult PagedKvPool::append(PagedKvSequenceHandle handle,
         });
     }
 
-    // Allocation state changes only after every write slot has been built.
-    for (uint32_t block : allocated_blocks) free_blocks_.erase(block);
-    sequence->block_table.insert(sequence->block_table.end(),
-                                 allocated_blocks.begin(),
-                                 allocated_blocks.end());
     sequence->kv_seq_len = new_kv_seq_len;
     result.status = PagedKvStatus::Ok;
     return result;

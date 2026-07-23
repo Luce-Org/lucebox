@@ -61,11 +61,13 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
             "Qwen3.5/Qwen3.6 dense targets (detected %s)\n", arch.c_str());
         return nullptr;
     }
+    const PlacementBackend compiled_backend = compiled_placement_backend();
     if (args.paged_attention &&
-        compiled_placement_backend() != PlacementBackend::Cuda) {
+        compiled_backend != PlacementBackend::Cuda &&
+        compiled_backend != PlacementBackend::Hip) {
         std::fprintf(stderr,
             "[backend_factory] --paged-attention is currently enabled only "
-            "for CUDA builds\n");
+            "for CUDA or HIP builds\n");
         return nullptr;
     }
 
@@ -76,25 +78,6 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
             std::fprintf(stderr,
                 "[backend_factory] --paged-attention does not yet support "
                 "target layer splitting or remote target shards\n");
-            return nullptr;
-        }
-        if (args.paged_attention &&
-            (args.draft_path || args.remote_draft.enabled())) {
-            std::fprintf(stderr,
-                "[backend_factory] --paged-attention currently requires "
-                "autoregressive decode; remove --draft\n");
-            return nullptr;
-        }
-        if (args.paged_attention && args.ddtree_mode) {
-            std::fprintf(stderr,
-                "[backend_factory] --paged-attention does not yet support "
-                "DDTree verification\n");
-            return nullptr;
-        }
-        if (args.paged_attention && args.fa_window != 0) {
-            std::fprintf(stderr,
-                "[backend_factory] --paged-attention currently requires "
-                "--fa-window 0\n");
             return nullptr;
         }
         if (args.device.is_layer_split()) {

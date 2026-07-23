@@ -375,7 +375,6 @@ bool build_target_step(
     gi.kv_write_rows              = sg.kv_write_rows;
     gi.paged_block_table          = sg.paged_block_table;
     gi.paged_kv_seq_lens          = sg.paged_kv_seq_lens;
-    gi.paged_block_size           = paged_attention ? PAGED_BLOCK_SIZE : 0;
     gi.q_capture                  = capture_qk;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);

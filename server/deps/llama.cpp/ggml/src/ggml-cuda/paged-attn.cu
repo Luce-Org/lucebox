@@ -3,12 +3,20 @@
 #include "fattn-common.cuh"
 
 #include <cfloat>
+#include <cstdlib>
 #include <cstring>
 
-// Decode uses one logical warp per (sequence, query head). Keeping Q in the
-// same register formats as fattn-vec lets the quantized K dot products and V
-// dequantizers share their well-tested F16/Q4_0/Q8_0 implementations.
-template<int D, ggml_type type_K, ggml_type type_V>
+static constexpr int PAGED_ATTN_MAX_PARTITIONS = 128;
+static constexpr int PAGED_ATTN_BLOCKS_PER_PARTITION = 64;
+
+// Each warp handles one (sequence, query head, context partition). Warps for
+// query heads that share a GQA K/V head are grouped in the same block so their
+// identical cache reads can be reused by the GPU caches. Keeping Q in the same
+// register formats as fattn-vec lets the quantized K dot products and V
+// dequantizers share their well-tested F16/Q4_0/Q8_0 implementations. Long
+// contexts are split between blocks and merged below; the direct specialization
+// avoids scratch for a single part.
+template<int D, ggml_type type_K, ggml_type type_V, bool write_partials>
 static __global__ void paged_attn_decode(
         const char    * __restrict__ q,
         const char    * __restrict__ k,
@@ -16,6 +24,8 @@ static __global__ void paged_attn_decode(
         const char    * __restrict__ block_table,
         const char    * __restrict__ kv_seq_lens,
         char          * __restrict__ dst,
+        float         * __restrict__ partial_acc,
+        float2        * __restrict__ partial_meta,
         int64_t q_nb1,   int64_t q_nb2,
         int64_t k_nb1,   int64_t k_nb2,
         int64_t v_nb1,   int64_t v_nb2,
@@ -28,21 +38,73 @@ static __global__ void paged_attn_decode(
         int32_t pool_tokens,
         int32_t max_blocks,
         int32_t block_size,
+        int32_t n_partitions,
+        int32_t min_partitions,
         float scale) {
     constexpr int nthreads = WARP_SIZE;
     constexpr int values_per_load = 4;
     constexpr int values_per_lane = D / nthreads;
     static_assert(D % (nthreads * values_per_load) == 0, "unsupported head size");
 
-    const int head = blockIdx.x;
+    const int head =
+        (int) blockIdx.x * (int) blockDim.y + (int) threadIdx.y;
     const int seq  = blockIdx.y;
+    const int partition = blockIdx.z;
     const int lane = threadIdx.x;
-    if (seq >= n_seq || head >= n_head) {
-        return;
-    }
+    // The launcher uses exact sequence/partition extents and a head-group
+    // size that divides n_head. Keep every warp live through the quantized-Q
+    // barrier below; partial blocks would make an early bounds return unsafe.
 
     const float * q_row = (const float *) (q + (int64_t) seq * q_nb1 + (int64_t) head * q_nb2);
     float       * o_row =       (float *) (dst + (int64_t) seq * dst_nb1 + (int64_t) head * dst_nb2);
+
+    const int32_t kv_seq_len_raw =
+        *(const int32_t *) (kv_seq_lens + (int64_t) seq * ksl_nb0);
+    const int64_t table_capacity =
+        (int64_t) max_blocks * block_size;
+    const int32_t kv_seq_len = kv_seq_len_raw <= 0
+        ? 0
+        : (kv_seq_len_raw < table_capacity
+            ? kv_seq_len_raw
+            : (int32_t) table_capacity);
+    const int32_t n_logical_blocks =
+        (kv_seq_len + block_size - 1) / block_size;
+    const int32_t context_partitions =
+        (n_logical_blocks + PAGED_ATTN_BLOCKS_PER_PARTITION - 1) /
+        PAGED_ATTN_BLOCKS_PER_PARTITION;
+    const int32_t requested_partitions =
+        context_partitions > min_partitions
+            ? context_partitions
+            : min_partitions;
+    const int32_t available_partitions =
+        n_logical_blocks < n_partitions ? n_logical_blocks : n_partitions;
+    const int32_t active_partitions =
+        requested_partitions < available_partitions
+            ? requested_partitions
+            : available_partitions;
+    const int64_t output_row = (int64_t) head * n_seq + seq;
+    const int64_t partial_row =
+        output_row * n_partitions + partition;
+
+    if (partition >= active_partitions) {
+        if constexpr (write_partials) {
+            if (lane == 0) {
+                partial_meta[partial_row] = make_float2(-FLT_MAX, 0.0f);
+            }
+        } else {
+#pragma unroll
+            for (int i = lane; i < D; i += nthreads) {
+                o_row[i] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    const int32_t logical_block_begin =
+        ((int64_t) n_logical_blocks * partition) / active_partitions;
+    const int32_t logical_block_end =
+        ((int64_t) n_logical_blocks * (partition + 1)) /
+        active_partitions;
 
     constexpr bool quantize_q =
         type_K != GGML_TYPE_F16;
@@ -56,8 +118,14 @@ static __global__ void paged_attn_decode(
     int    q_i32[D / (sizeof(int) * nthreads)];
     float2 q_ds [D / (sizeof(int) * nthreads)];
 
-    __shared__ int    q_i32_shared[D / sizeof(int)];
-    __shared__ float2 q_ds_shared[D / QK8_1];
+    extern __shared__ char q_shared[];
+    int * q_i32_shared =
+        (int *) q_shared +
+        (int) threadIdx.y * (D / sizeof(int));
+    float2 * q_ds_shared =
+        (float2 *) ((int *) q_shared +
+                    (int) blockDim.y * (D / sizeof(int))) +
+        (int) threadIdx.y * (D / QK8_1);
 
     if constexpr (quantize_q) {
         // Quantizing scale*Q matches fattn-vec and avoids an extra multiply for
@@ -111,21 +179,12 @@ static __global__ void paged_attn_decode(
     float qk_max = -FLT_MAX;
     float qk_sum = 0.0f;
 
-    const int32_t kv_seq_len_raw =
-        *(const int32_t *) (kv_seq_lens + (int64_t) seq * ksl_nb0);
-    const int64_t table_capacity =
-        (int64_t) max_blocks * block_size;
-    const int32_t kv_seq_len = kv_seq_len_raw <= 0
-        ? 0
-        : (kv_seq_len_raw < table_capacity
-            ? kv_seq_len_raw
-            : (int32_t) table_capacity);
-    const int32_t n_logical_blocks =
-        (kv_seq_len + block_size - 1) / block_size;
     const int32_t n_physical_blocks = pool_tokens / block_size;
     const int32_t kv_head = head / (n_head / n_head_kv);
 
-    for (int32_t logical_block = 0; logical_block < n_logical_blocks; ++logical_block) {
+    for (int32_t logical_block = logical_block_begin;
+         logical_block < logical_block_end;
+         ++logical_block) {
         const int32_t physical_block =
             *(const int32_t *) (block_table +
                 (int64_t) logical_block * bt_nb0 +
@@ -180,20 +239,100 @@ static __global__ void paged_attn_decode(
         }
     }
 
-    const float inv_sum = qk_sum > 0.0f ? 1.0f / qk_sum : 0.0f;
+    if constexpr (write_partials) {
 #pragma unroll
-    for (int segment = 0;
-         segment < D / (nthreads * values_per_load);
-         ++segment) {
-        const int value0 =
-            segment * nthreads * values_per_load +
-            lane * values_per_load;
+        for (int segment = 0;
+             segment < D / (nthreads * values_per_load);
+             ++segment) {
+            const int value0 =
+                segment * nthreads * values_per_load +
+                lane * values_per_load;
 #pragma unroll
-        for (int j = 0; j < values_per_load; ++j) {
-            o_row[value0 + j] =
-                acc[segment * values_per_load + j] * inv_sum;
+            for (int j = 0; j < values_per_load; ++j) {
+                partial_acc[partial_row * D + value0 + j] =
+                    acc[segment * values_per_load + j];
+            }
+        }
+        if (lane == 0) {
+            partial_meta[partial_row] = make_float2(qk_max, qk_sum);
+        }
+    } else {
+        const float inv_sum = qk_sum > 0.0f ? 1.0f / qk_sum : 0.0f;
+#pragma unroll
+        for (int segment = 0;
+             segment < D / (nthreads * values_per_load);
+             ++segment) {
+            const int value0 =
+                segment * nthreads * values_per_load +
+                lane * values_per_load;
+#pragma unroll
+            for (int j = 0; j < values_per_load; ++j) {
+                o_row[value0 + j] =
+                    acc[segment * values_per_load + j] * inv_sum;
+            }
         }
     }
+}
+
+template<int D>
+__launch_bounds__(D, 1)
+static __global__ void paged_attn_combine(
+        const float  * __restrict__ partial_acc,
+        const float2 * __restrict__ partial_meta,
+        char         * __restrict__ dst,
+        int64_t dst_nb1,
+        int64_t dst_nb2,
+        int32_t n_seq,
+        int32_t n_partitions) {
+    const int head = blockIdx.x;
+    const int seq  = blockIdx.y;
+    const int tid  = threadIdx.x;
+    // combine_grid is exactly [n_head, n_seq], so no bounds branch is needed
+    // above the block-wide barrier below.
+
+    const int64_t output_row = (int64_t) head * n_seq + seq;
+    const int64_t partial_row = output_row * n_partitions;
+
+    __shared__ float partition_scale[PAGED_ATTN_MAX_PARTITIONS];
+    __shared__ float denominator;
+
+    // Compute the stable merge weights once per output row rather than once
+    // per output component. Empty or invalid partitions have a zero sum.
+    if (tid == 0) {
+        float global_max = -FLT_MAX;
+        for (int partition = 0; partition < n_partitions; ++partition) {
+            const float2 meta = partial_meta[partial_row + partition];
+            if (meta.y > 0.0f) {
+                global_max = fmaxf(global_max, meta.x);
+            }
+        }
+
+        float global_sum = 0.0f;
+        for (int partition = 0; partition < n_partitions; ++partition) {
+            const float2 meta = partial_meta[partial_row + partition];
+            const float weight =
+                meta.y > 0.0f ? expf(meta.x - global_max) : 0.0f;
+            partition_scale[partition] = weight;
+            global_sum += weight * meta.y;
+        }
+        denominator = global_sum;
+    }
+    __syncthreads();
+
+    float numerator = 0.0f;
+    for (int partition = 0; partition < n_partitions; ++partition) {
+        const float weight = partition_scale[partition];
+        if (weight > 0.0f) {
+            numerator +=
+                weight *
+                partial_acc[(partial_row + partition) * D + tid];
+        }
+    }
+
+    float * o_row =
+        (float *) (dst + (int64_t) seq * dst_nb1 +
+                         (int64_t) head * dst_nb2);
+    o_row[tid] = denominator > 0.0f ? numerator / denominator : 0.0f;
 }
 
 static bool paged_attn_type_supported(ggml_type type) {
@@ -265,15 +404,153 @@ static void launch_paged_attn(
     const ggml_tensor * block_table  = dst->src[3];
     const ggml_tensor * kv_seq_lens = dst->src[4];
 
-    const dim3 grid((unsigned int) q->ne[2], (unsigned int) q->ne[1], 1);
-    const dim3 block(WARP_SIZE, 1, 1);
-    paged_attn_decode<D, type_K, type_V><<<grid, block, 0, ctx.stream()>>>(
+    const int32_t gqa_ratio =
+        (int32_t) (q->ne[2] / k->ne[2]);
+    int32_t heads_per_block =
+        gqa_ratio <= 32 ? gqa_ratio : 1;
+
+    int max_blocks_per_sm = 0;
+    size_t q_shared_bytes = 0;
+    // Deliberately query the write_partials instantiation: occupancy only
+    // steers min_partitions, which is a partition count for that variant.
+    // The direct variant launches solely when the count collapses to one,
+    // where occupancy no longer influences the topology.
+    //
+    // Large GQA ratios can make this register-heavy kernel impossible to
+    // launch with one warp per query head. Reduce the number of colocated
+    // heads until the device reports a viable block size.
+    while (true) {
+        q_shared_bytes =
+            type_K == GGML_TYPE_F16
+                ? 0
+                : (size_t) heads_per_block *
+                    (D + (D / QK8_1) * sizeof(float2));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &max_blocks_per_sm,
+            paged_attn_decode<D, type_K, type_V, true>,
+            WARP_SIZE * heads_per_block, q_shared_bytes));
+        if (max_blocks_per_sm > 0 || heads_per_block == 1) {
+            break;
+        }
+        do {
+            heads_per_block /= 2;
+        } while (heads_per_block > 1 &&
+                 q->ne[2] % heads_per_block != 0);
+    }
+    if (max_blocks_per_sm == 0) {
+        GGML_ABORT("paged attention kernel has zero occupancy");
+    }
+
+    GGML_ASSERT(q->ne[2] % heads_per_block == 0);
+    const int32_t head_groups =
+        (int32_t) q->ne[2] / heads_per_block;
+    const dim3 block(WARP_SIZE, (unsigned int) heads_per_block, 1);
+
+    const int64_t output_rows = q->ne[1] * q->ne[2];
+    const int64_t work_groups = q->ne[1] * head_groups;
+    const int64_t target_blocks =
+        (int64_t) ggml_cuda_info().devices[ctx.device].nsm *
+        max_blocks_per_sm;
+    int32_t min_partitions = (int32_t)
+        ((target_blocks + work_groups - 1) / work_groups);
+    if (min_partitions < 1) {
+        min_partitions = 1;
+    }
+    // A single sequence needs more context partitions to expose enough work.
+    // With multiple sequences, additional partitions mostly repeat Q setup.
+    const int32_t partition_limit =
+        q->ne[1] == 1 ? PAGED_ATTN_MAX_PARTITIONS : 32;
+    if (min_partitions > partition_limit) {
+        min_partitions = partition_limit;
+    }
+    if (min_partitions > block_table->ne[0]) {
+        min_partitions = (int32_t) block_table->ne[0];
+    }
+
+    // Reserve enough grid slots for a long sequence to subdivide itself using
+    // its device-side context length. Capacity, not the current length, keeps
+    // the launch topology stable across CUDA graph replays.
+    const int32_t capacity_partitions =
+        ((int32_t) block_table->ne[0] +
+         PAGED_ATTN_BLOCKS_PER_PARTITION - 1) /
+        PAGED_ATTN_BLOCKS_PER_PARTITION;
+    int32_t n_partitions =
+        capacity_partitions > min_partitions
+            ? capacity_partitions
+            : min_partitions;
+    if (n_partitions > PAGED_ATTN_MAX_PARTITIONS) {
+        n_partitions = PAGED_ATTN_MAX_PARTITIONS;
+    }
+    if (n_partitions > block_table->ne[0]) {
+        n_partitions = (int32_t) block_table->ne[0];
+    }
+
+    // Test/debug override used to exercise both the direct and partials paths
+    // independently of device-specific occupancy. Values outside the valid
+    // grid range are ignored.
+    if (const char * env =
+            std::getenv("GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS")) {
+        const int forced = std::atoi(env);
+        if (forced >= 1 && forced <= PAGED_ATTN_MAX_PARTITIONS &&
+            forced <= block_table->ne[0]) {
+            min_partitions = forced;
+            n_partitions = forced;
+        }
+    }
+
+    const dim3 grid(
+        (unsigned int) head_groups,
+        (unsigned int) q->ne[1],
+        (unsigned int) n_partitions);
+
+    if (n_partitions == 1) {
+        paged_attn_decode<D, type_K, type_V, false>
+            <<<grid, block, q_shared_bytes, ctx.stream()>>>(
+            (const char *) q->data,
+            (const char *) k->data,
+            (const char *) v->data,
+            (const char *) block_table->data,
+            (const char *) kv_seq_lens->data,
+            (char *) dst->data,
+            nullptr,
+            nullptr,
+            q->nb[1], q->nb[2],
+            k->nb[1], k->nb[2],
+            v->nb[1], v->nb[2],
+            block_table->nb[0], block_table->nb[1],
+            kv_seq_lens->nb[0],
+            dst->nb[1], dst->nb[2],
+            (int32_t) q->ne[1],
+            (int32_t) q->ne[2],
+            (int32_t) k->ne[2],
+            (int32_t) k->ne[1],
+            (int32_t) block_table->ne[0],
+            block_size,
+            n_partitions,
+            min_partitions,
+            scale);
+        return;
+    }
+
+    const size_t partial_rows =
+        (size_t) output_rows * n_partitions;
+    const size_t partial_values = partial_rows * D;
+    ggml_cuda_pool_alloc<float> scratch(
+        ctx.pool(), partial_values + 2 * partial_rows);
+    float * partial_acc = scratch.ptr;
+    float2 * partial_meta =
+        (float2 *) (scratch.ptr + partial_values);
+
+    paged_attn_decode<D, type_K, type_V, true>
+        <<<grid, block, q_shared_bytes, ctx.stream()>>>(
         (const char *) q->data,
         (const char *) k->data,
         (const char *) v->data,
         (const char *) block_table->data,
         (const char *) kv_seq_lens->data,
         (char *) dst->data,
+        partial_acc,
+        partial_meta,
         q->nb[1], q->nb[2],
         k->nb[1], k->nb[2],
         v->nb[1], v->nb[2],
@@ -286,7 +563,23 @@ static void launch_paged_attn(
         (int32_t) k->ne[1],
         (int32_t) block_table->ne[0],
         block_size,
+        n_partitions,
+        min_partitions,
         scale);
+
+    const dim3 combine_grid(
+        (unsigned int) q->ne[2],
+        (unsigned int) q->ne[1],
+        1);
+    paged_attn_combine<D>
+        <<<combine_grid, dim3(D, 1, 1), 0, ctx.stream()>>>(
+        partial_acc,
+        partial_meta,
+        (char *) dst->data,
+        dst->nb[1],
+        dst->nb[2],
+        (int32_t) q->ne[1],
+        n_partitions);
 }
 
 template<ggml_type type_K>

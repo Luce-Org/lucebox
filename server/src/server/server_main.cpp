@@ -677,22 +677,6 @@ int main(int argc, char ** argv) {
     if (fast_rollback_forced_off) bargs.fast_rollback = false;
 
     if (bargs.paged_attention) {
-        if (bargs.draft_path || bargs.remote_draft.enabled() ||
-            bargs.ddtree_mode || bargs.fa_window != 0 ||
-            bargs.device.is_layer_split() ||
-            bargs.remote_target_shard.enabled()) {
-            std::fprintf(stderr,
-                "[server] --paged-attention currently requires a single "
-                "local target, --fa-window 0, and no draft/DDTree\n");
-            return 2;
-        }
-        if (const char * kvflash = std::getenv("DFLASH_KVFLASH");
-            kvflash && kvflash[0] != '\0') {
-            std::fprintf(stderr,
-                "[server] --paged-attention cannot be combined with "
-                "--kvflash/DFLASH_KVFLASH\n");
-            return 2;
-        }
         if (sconfig.prefix_cache_cap > 0 ||
             sconfig.prefill_cache_cap > 0 ||
             !sconfig.disk_cache_dir.empty()) {

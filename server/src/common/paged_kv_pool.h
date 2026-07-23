@@ -4,8 +4,12 @@
 // from one shared physical pool, so sequences grow in block granularity
 // instead of reserving max-context capacity up front. The pool tracks
 // indices only — it owns no K/V storage. Callers translate the returned
-// block/slot indices into offsets within their own pooled K/V tensors and
-// upload metadata_snapshot() to drive the GPU paged-attention kernels.
+// block/slot indices into offsets within their own pooled K/V tensors.
+//
+// The current single-request backend consumes sequence() directly. The
+// request lookup, reservation, cancellation, capacity, and flattened
+// metadata APIs below are intentionally retained for the continuous-batching
+// scheduler, where several live request tables will be uploaded together.
 //
 // Not thread-safe; callers must serialize access.
 
@@ -46,6 +50,8 @@ struct PagedKvSequenceHandle {
     uint64_t generation = 0;
 };
 
+// Kept as a complete comparison pair for continuous-batching scheduler state,
+// where handles will be compared across admission and cancellation events.
 constexpr bool operator==(const PagedKvSequenceHandle & lhs,
                           const PagedKvSequenceHandle & rhs) {
     return lhs.slot == rhs.slot && lhs.generation == rhs.generation;
@@ -76,6 +82,8 @@ struct PagedKvAppendResult {
 };
 
 // Copy of one sequence's bookkeeping state, as returned by sequence().
+// The identity echo lets a future batching scheduler reject a snapshot that
+// raced with cancellation and slot reuse before it submits GPU work.
 struct PagedKvSequenceSnapshot {
     PagedKvRequestId request_id = 0;
     PagedKvSequenceHandle handle;
@@ -83,9 +91,11 @@ struct PagedKvSequenceSnapshot {
     std::vector<uint32_t> block_table;
 };
 
-// Per-sequence entry of a metadata snapshot. Each entry addresses its own
-// range [block_table_offset, block_table_offset + block_count) in
-// PagedKvMetadataSnapshot::block_table.
+// Per-sequence entry of a future continuous-batch metadata upload. Each entry
+// addresses its own range [block_table_offset, block_table_offset +
+// block_count) in PagedKvMetadataSnapshot::block_table. request_id,
+// generation, and sequence_slot are CPU-side scheduler identity; only the
+// lengths, offsets, counts, and flattened table are GPU routing material.
 struct PagedKvSequenceMetadata {
     PagedKvRequestId request_id = 0;
     uint64_t generation = 0;
@@ -95,9 +105,10 @@ struct PagedKvSequenceMetadata {
     uint32_t block_count = 0;
 };
 
-// Flattened view of every active sequence, ordered by slot index and laid
-// out for upload to the GPU paged-attention kernels: `block_table` is the
-// concatenation of all per-sequence block tables.
+// Flattened view of every active sequence, ordered by slot index. This is
+// reserved for the continuous-batching integration; the current backend does
+// not upload it yet. `block_table` is the concatenation of all per-sequence
+// block tables.
 struct PagedKvMetadataSnapshot {
     uint32_t block_size = 0;
     uint32_t physical_block_count = 0;
@@ -117,7 +128,10 @@ public:
 
     uint32_t block_size() const { return block_size_; }
     uint32_t physical_block_count() const { return physical_block_count_; }
-    uint32_t max_sequences() const { return static_cast<uint32_t>(sequences_.size()); }
+    // Admission capacity for the future continuous-batching scheduler.
+    uint32_t max_sequences() const {
+        return static_cast<uint32_t>(sequences_.size());
+    }
     uint32_t active_sequence_count() const {
         return static_cast<uint32_t>(request_to_slot_.size());
     }
@@ -130,14 +144,16 @@ public:
     PagedKvStatus acquire(PagedKvRequestId request_id,
                           PagedKvSequenceHandle & out_handle);
 
-    // Fetch the live handle of an already-acquired request.
+    // Fetch the live handle of an already-acquired request. Continuous
+    // batching will use this when scheduler events carry request ids.
     PagedKvStatus lookup(PagedKvRequestId request_id,
                          PagedKvSequenceHandle & out_handle) const;
 
     // Grow the sequence's block table until it can hold `token_capacity`
     // tokens in total (never shrinks). This does not advance kv_seq_len; a
-    // later append() fills the pre-allocated blocks first. Lets callers fail
-    // fast before prefill instead of mid-append.
+    // later append() fills the pre-allocated blocks first. The single-request
+    // backend does not need this, but batched admission can use it to fail an
+    // entire scheduling round before launching any prefills.
     PagedKvStatus reserve(PagedKvSequenceHandle handle,
                           uint32_t token_capacity);
 
@@ -152,8 +168,8 @@ public:
     // any copy of it) becomes stale.
     PagedKvStatus release(PagedKvSequenceHandle handle);
 
-    // release() by request id, for callers that no longer hold the handle
-    // (e.g. client disconnect).
+    // release() by request id, for continuous-batching cancellation paths
+    // that no longer hold the handle (e.g. client disconnect).
     PagedKvStatus cancel(PagedKvRequestId request_id);
 
     // Drop every sequence and reclaim all blocks. Every outstanding handle
@@ -164,7 +180,8 @@ public:
     PagedKvStatus sequence(PagedKvSequenceHandle handle,
                            PagedKvSequenceSnapshot & out_sequence) const;
 
-    // Flattened copy of all active sequences, ready for device upload.
+    // Flattened copy of all active sequences for the planned batched device
+    // metadata upload.
     PagedKvMetadataSnapshot metadata_snapshot() const;
 
 private:

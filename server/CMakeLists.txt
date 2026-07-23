@@ -1195,6 +1195,10 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
         add_test(NAME paged_attention COMMAND test_paged_attention)
+        add_test(NAME paged_attention_direct
+                 COMMAND test_paged_attention --direct)
+        set_tests_properties(paged_attention_direct PROPERTIES
+            ENVIRONMENT "GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS=1")
     endif()
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
         DFLASH27B_GPU_BACKEND STREQUAL "hip")
