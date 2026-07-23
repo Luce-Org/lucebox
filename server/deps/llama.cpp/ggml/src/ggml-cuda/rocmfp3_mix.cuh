@@ -29,3 +29,15 @@ GGML_API void ggml_cuda_rocmfp3_mix_unregister(const void * base);
 // Called from ggml_get_to_fp16_cuda for type 105; resolves the expert + codebook
 // from the registry using the vx pointer.
 void dequantize_rocmfp3_mix_to_fp16_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream);
+
+// Fused quantized matvec for type 105 (the MMVQ-style decode path): computes
+// y[out, ncols] = W[out,in] . x[in, ncols] by decoding the quantized blocks
+// inline (per-expert codebook/mode from the registry) instead of the
+// dequantize->cuBLAS round-trip. vx is the expert slice base (registry lookup
+// resolves expert+codebook+mode). x/y are f32; *_col_stride are element strides
+// between columns (tokens). Used for batch-1 decode; larger batches keep the
+// dequant->cuBLAS fallback. Returns true if it handled the op.
+bool ggml_cuda_rocmfp3_mix_mul_mat_vec(
+        const void * vx, const float * x, float * y,
+        int in, int out, int ncols,
+        int64_t x_col_stride, int64_t y_col_stride, cudaStream_t stream);

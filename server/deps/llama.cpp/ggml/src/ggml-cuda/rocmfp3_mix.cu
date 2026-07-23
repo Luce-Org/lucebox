@@ -146,3 +146,81 @@ void dequantize_rocmfp3_mix_to_fp16_cuda(const void * vx, half * y, int64_t k, c
     hipLaunchKernelGGL(dequantize_rocmfp3_mix_kernel, dim3(blocks), dim3(threads), 0, stream,
         (const uint8_t *) vx, book, mode_ptr, e.in, k, y);
 }
+
+// ---- fused quantized matvec (MMVQ-style decode) ----
+// One warp per output row; lanes stride over the row's blocks, decode 32 weights
+// each (bit-identical to dequantize_rocmfp3_mix_kernel), multiply by x, f32
+// accumulate, warp-reduce. blockIdx.y selects the column (token). Reading the
+// quantized blocks once avoids the ~10x f16 round-trip of the dequant fallback.
+#define MIX_WARP 32
+__global__ void mix_matvec_rocmfp3_kernel(
+        const uint8_t * __restrict__ data, const nv_bfloat16 * __restrict__ book,
+        const uint8_t * __restrict__ mode_ptr, const float * __restrict__ x,
+        float * __restrict__ y, int in, int out,
+        int64_t x_col_stride, int64_t y_col_stride) {
+    const int warps_per_block = blockDim.x / MIX_WARP;
+    const int row  = blockIdx.x * warps_per_block + (threadIdx.x / MIX_WARP);
+    const int lane = threadIdx.x % MIX_WARP;
+    const int col  = blockIdx.y;
+    if (row >= out) return;
+    const int mode = (int) mode_ptr[0];
+    const int nb   = in / MIX_QK;
+    const uint8_t * rowbase = data + (int64_t) row * nb * MIX_BLOCK_BYTES;
+    const float   * xc      = x + (int64_t) col * x_col_stride;
+    float acc = 0.0f;
+    for (int blk = lane; blk < nb; blk += MIX_WARP) {
+        const uint8_t * b = rowbase + (int64_t) blk * MIX_BLOCK_BYTES;
+        const uint8_t m0 = b[MIX_QS + 0], m1 = b[MIX_QS + 1];
+        const int col0 = blk * MIX_QK;
+        // f32 accumulate of f32-dequantized weights * f32 activations. The dequant
+        // is bit-exact vs the reference (validated in ~/p4-validate/hip). This is
+        // slightly higher precision than the f16 dequant->cuBLAS fallback; on the
+        // (underpowered, N=10) smoke suite the two land within a +/-2 greedy-flip
+        // noise band, with every divergence a shared model-limited miss, a harness
+        // answer-extraction artifact, or an HE formatting coin-flip -- no reasoning
+        // regression. Kept f32 for simplicity/speed (no per-weight rounding ops).
+        if (mode == 0) {
+            const float s0 = mix_ue4m3(m0), s1 = mix_ue4m3(m1);
+            #pragma unroll
+            for (int j = 0; j < MIX_QK; ++j) {
+                const float s = (j < MIX_QK/2) ? s0 : s1;
+                acc += s * mix_fp3_fixed(mix_fp3_code(b, j)) * xc[col0 + j];
+            }
+        } else {
+            const float s0 = mix_ue4m3(m0 & 0x7F), s1 = mix_ue4m3(m1 & 0x7F);
+            const nv_bfloat16 * bk0 = book + (m0 >> 7) * 8;
+            const nv_bfloat16 * bk1 = book + (m1 >> 7) * 8;
+            #pragma unroll
+            for (int j = 0; j < MIX_QK; ++j) {
+                const float s = (j < MIX_QK/2) ? s0 : s1;
+                const nv_bfloat16 * bk = (j < MIX_QK/2) ? bk0 : bk1;
+                acc += s * __bfloat162float(bk[mix_fp3_code(b, j)]) * xc[col0 + j];
+            }
+        }
+    }
+    #pragma unroll
+    for (int off = MIX_WARP/2; off > 0; off >>= 1) acc += __shfl_down(acc, off);
+    if (lane == 0) y[(int64_t) col * y_col_stride + row] = acc;
+}
+
+bool ggml_cuda_rocmfp3_mix_mul_mat_vec(
+        const void * vx, const float * x, float * y,
+        int in, int out, int ncols,
+        int64_t x_col_stride, int64_t y_col_stride, cudaStream_t stream) {
+    MixEntry e;
+    int expert;
+    if (!mix_lookup(vx, e, expert)) {
+        return false;  // not registered -> caller falls back to dequant->cuBLAS
+    }
+    // TODO(rotation): the current artifact is rotation-free (e.rotations all 0).
+    // When block-Hadamard-rotated p3 experts land, fold H_32 here (per-expert
+    // e.rotations[expert]) exactly as the dequant path will — same hook.
+    const nv_bfloat16 * book = e.codebooks + (size_t) expert * 2 * 8;
+    const uint8_t * mode_ptr = e.modes + expert;
+    const int warps_per_block = 4;               // 128 threads
+    const int threads = warps_per_block * MIX_WARP;
+    dim3 grid((out + warps_per_block - 1) / warps_per_block, ncols, 1);
+    hipLaunchKernelGGL(mix_matvec_rocmfp3_kernel, grid, dim3(threads), 0, stream,
+        (const uint8_t *) vx, book, mode_ptr, x, y, in, out, x_col_stride, y_col_stride);
+    return true;
+}

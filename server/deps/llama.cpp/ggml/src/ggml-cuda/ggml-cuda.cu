@@ -32,6 +32,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/rocmfp3_mix.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -2765,6 +2766,31 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_batched_cublas_f16  = src0->type == GGML_TYPE_F16 && (src1->type == GGML_TYPE_F16 || !any_gpus_with_slow_fp16);
     bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
+
+    // qtype-105 fused MMVQ decode path: for batch-1 (decode) matvecs, decode the
+    // quantized blocks inline instead of the dequantize->cuBLAS round-trip. This
+    // catches the mul_mat_id per-expert slices (which re-enter here with a 105
+    // src0 slice + f32 sorted tokens). Larger batches (prefill) fall through to
+    // the dequant fallback. Returns false (=> fall through) if unregistered.
+    // DFLASH_MIX_FUSED=0 forces the dequant->cuBLAS fallback (A/B against the
+    // fused path on the same binary). Default on.
+    static const bool mix_fused_on = []() {
+        const char * e = getenv("DFLASH_MIX_FUSED");
+        return e ? atoi(e) != 0 : true;
+    }();
+    if (mix_fused_on && is_rocmfp3_mix && !split
+            && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
+            && src1->ne[2] == 1 && src1->ne[3] == 1
+            && src1->ne[1] <= luce_mmvq_max_ncols) {
+        if (ggml_cuda_rocmfp3_mix_mul_mat_vec(
+                src0->data, (const float *) src1->data, (float *) dst->data,
+                (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[1],
+                (int64_t) (src1->nb[1] / sizeof(float)),
+                (int64_t) (dst->nb[1] / sizeof(float)), ctx.stream())) {
+            return;
+        }
+    }
 
     if (grouped_src) {
         // Only MMQ's grouped activation quantizer understands the physical
