@@ -1,6 +1,7 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
 #include "tq3-quant.cuh"
+#include "rocmfp3_mix.cuh"
 #include "../../rocmfp4/rocmfp4_hip_scale.cuh"
 
 #include <cstdint>
@@ -844,6 +845,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_block_cont_cuda<QK_ROCMFP2, QR_ROCMFP2, dequantize_rocmfpx_fp2>;
         case GGML_TYPE_Q3_0_ROCMFPX:
             return dequantize_block_cont_cuda<QK_ROCMFP3, QR_ROCMFP3, dequantize_rocmfpx_fp3>;
+        case GGML_TYPE_Q3_1_ROCMFP3_MIX:
+            return dequantize_rocmfp3_mix_to_fp16_cuda;
         case GGML_TYPE_Q6_0_ROCMFPX:
             return dequantize_block_cont_cuda<QK_ROCMFP6, QR_ROCMFP6, dequantize_rocmfpx_fp6>;
         case GGML_TYPE_Q8_0_ROCMFPX:

@@ -2492,10 +2492,17 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const int v = e ? atoi(e) : 3;
         return v > 0 ? v : MMVQ_MAX_BATCH_SIZE;
     }();
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
+    // qtype-105 (Q3_1_ROCMFP3_MIX) has no MMVQ/MMQ kernel: its per-expert
+    // codebook/mode lives in an out-of-band registry the block-local quant
+    // kernels can't reach. Force it onto the dequantize->cuBLAS path, whose
+    // to_fp16 converter consults that registry. This also catches the
+    // mul_mat_id per-expert fallback, which re-enters ggml_cuda_mul_mat with
+    // 105 slices.
+    const bool is_rocmfp3_mix = src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX;
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !is_rocmfp3_mix && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src1->ne[1] <= luce_mmvq_max_ncols;
-    bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
+    bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !is_rocmfp3_mix && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
     bool any_gpus_with_slow_fp16 = false;

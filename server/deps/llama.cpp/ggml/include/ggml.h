@@ -435,6 +435,7 @@ extern "C" {
         GGML_TYPE_Q6_0_ROCMFPX      = 102,
         GGML_TYPE_Q8_0_ROCMFPX      = 103,
         GGML_TYPE_Q3_0_ROCMFPX      = 104,
+        GGML_TYPE_Q3_1_ROCMFP3_MIX  = 105, // per-expert mixed absmax/adaptive ROCmFP3 (P4); codebook in GGUF KV
         GGML_TYPE_Q2_0_ROCMFP2      = 107,
         GGML_TYPE_COUNT   = 108,
     };

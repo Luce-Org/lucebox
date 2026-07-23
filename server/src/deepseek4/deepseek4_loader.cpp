@@ -36,6 +36,15 @@
 
 extern "C" bool ggml_backend_cuda_buffer_is_managed(ggml_backend_buffer_t buffer);
 
+// Runtime decode registration for GGML_TYPE_Q3_1_ROCMFP3_MIX (105). Defined in
+// ggml-cuda/rocmfp3_mix.cu; declared here (no HIP include in the loader) so the
+// deepseek4 loader can stage per-expert codebooks/modes to device and register
+// each fused down-expert tensor's base pointer + stride with the decoder.
+extern "C" void ggml_cuda_rocmfp3_mix_register_host(
+        const void * base, size_t nb02, int n_experts, int out, int in,
+        const void * codebooks_bf16_host, const uint8_t * modes_host,
+        const uint8_t * rotations_host);
+
 #if !defined(_WIN32)
 #include <cerrno>
 #include <fcntl.h>
@@ -223,6 +232,73 @@ static std::vector<uint32_t> compute_compress_ratios(int n_layer) {
     }
     return ratios;
 }
+
+namespace {
+constexpr int DS4_QTYPE_ROCMFP3_MIX = 105;  // GGML_TYPE_Q3_1_ROCMFP3_MIX
+
+// Read the "<gguf>.p4mix.bin" sidecar (produced on the H100) and register each
+// qtype-105 fused down-expert tensor's device base + per-expert codebooks/modes
+// with the CUDA/HIP decoder. No-op for uniform (qtype-104) models or when no
+// sidecar is present. Called once after weights are uploaded, when the tensor
+// data pointers (which the mul_mat_id -> to_fp16 fallback consults) are final.
+static void ds4_register_p4mix_sidecar(const std::string & gguf_path,
+                                       DeepSeek4Weights & out) {
+    bool any = false;
+    for (auto & L : out.layers) {
+        if (L.ffn_down_exps &&
+            (int) L.ffn_down_exps->type == DS4_QTYPE_ROCMFP3_MIX) { any = true; break; }
+    }
+    if (!any) return;
+
+    const std::string sc_path = gguf_path + ".p4mix.bin";
+    FILE * f = std::fopen(sc_path.c_str(), "rb");
+    if (!f) {
+        std::fprintf(stderr, "[deepseek4] qtype-105 down-experts but sidecar "
+                     "missing: %s\n", sc_path.c_str());
+        return;
+    }
+    char magic[8];
+    uint32_t n_layers = 0, reserved = 0;
+    if (std::fread(magic, 1, 8, f) != 8 ||
+        std::memcmp(magic, "P4MIXv1\0", 8) != 0 ||
+        std::fread(&n_layers, 4, 1, f) != 1 ||
+        std::fread(&reserved, 4, 1, f) != 1) {
+        std::fprintf(stderr, "[deepseek4] bad p4mix sidecar header: %s\n", sc_path.c_str());
+        std::fclose(f);
+        return;
+    }
+    int registered = 0;
+    for (uint32_t li = 0; li < n_layers; li++) {
+        uint32_t hdr[6];
+        if (std::fread(hdr, 4, 6, f) != 6) break;
+        const uint32_t layer = hdr[0], E = hdr[1], odim = hdr[2], idim = hdr[3],
+                       C = hdr[4], K = hdr[5];
+        std::vector<uint8_t> modes(E), rots(E);
+        std::vector<uint16_t> books((size_t) E * C * K);
+        if (std::fread(modes.data(), 1, E, f) != E ||
+            std::fread(rots.data(), 1, E, f) != E ||
+            std::fread(books.data(), sizeof(uint16_t), books.size(), f) != books.size()) {
+            std::fprintf(stderr, "[deepseek4] truncated p4mix entry (layer %u)\n", layer);
+            break;
+        }
+        if (C != 2 || K != 8) {
+            std::fprintf(stderr, "[deepseek4] p4mix layer %u unexpected C=%u K=%u\n",
+                         layer, C, K);
+            continue;
+        }
+        if (layer >= out.layers.size()) continue;
+        ggml_tensor * dt = out.layers[layer].ffn_down_exps;
+        if (!dt || (int) dt->type != DS4_QTYPE_ROCMFP3_MIX) continue;
+        ggml_cuda_rocmfp3_mix_register_host(
+            dt->data, dt->nb[2], (int) E, (int) odim, (int) idim,
+            books.data(), modes.data(), rots.data());
+        registered++;
+    }
+    std::fclose(f);
+    std::fprintf(stderr, "[deepseek4] registered %d qtype-105 down-expert layer(s) "
+                 "from %s\n", registered, sc_path.c_str());
+}
+}  // namespace
 
 bool load_deepseek4_gguf(const std::string & path,
                           ggml_backend_t backend,
@@ -657,6 +733,10 @@ bool load_deepseek4_gguf_partial(const std::string & path,
 
     gguf_free(gctx);
     // Note: meta_ctx is now owned by out.ctx — do NOT free it here.
+
+    // qtype-105 mixed-policy down-experts: register per-expert codebooks now
+    // that tensor data pointers are final (no-op for uniform models).
+    ds4_register_p4mix_sidecar(path, out);
 
     std::fprintf(stderr, "[deepseek4] loaded %zu tensors, %.1f MB GPU buffer%s\n",
                  allocs.size(), (double)total_buf_size / (1024.0 * 1024.0),
