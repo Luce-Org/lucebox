@@ -122,6 +122,7 @@ COPY server/pyproject.toml server/README.md /src/server/
 COPY server/scripts /src/server/scripts
 COPY optimizations/pflash /src/optimizations/pflash
 COPY optimizations/megakernel /src/optimizations/megakernel
+COPY lucebox /src/lucebox
 
 # ─── Stage 2: runtime ───────────────────────────────────────────────────────
 # Runtime reuses the ROCm base so the HIP runtime libs (libamdhip64,
@@ -170,6 +171,9 @@ COPY --from=builder /src/optimizations/pflash /opt/lucebox-hub/optimizations/pfl
 COPY --from=builder /src/optimizations/megakernel/pyproject.toml \
                    /src/optimizations/megakernel/README.md \
                    /opt/lucebox-hub/optimizations/megakernel/
+
+# The lucebox CLI is a workspace member and must be present before uv sync.
+COPY --from=builder /src/lucebox /opt/lucebox-hub/lucebox
 
 COPY --from=builder /src/server/scripts /opt/lucebox-hub/server/scripts
 COPY --from=builder /src/server/pyproject.toml /src/server/README.md \

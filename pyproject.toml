@@ -8,6 +8,7 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "Lucebox" }]
 
 dependencies = [
+    "lucebox",
     "lucebox-dflash",
     "pflash",
 ]
@@ -23,7 +24,7 @@ line-length = 100
 # server-internal and optimization Python (server/scripts, optimizations/*)
 # carries pre-existing style debt and is added to `include` as it is cleaned
 # up. Vendored deps stay excluded permanently (extend-exclude below).
-include = ["harness/**/*.py", "scripts/**/*.py"]
+include = ["harness/**/*.py", "scripts/**/*.py", "lucebox/**/*.py"]
 extend-exclude = [
     "dflash/deps",
     "megakernel",
@@ -51,11 +52,12 @@ package = false
 no-build-isolation-package = ["qwen35-megakernel-bf16"]
 
 [tool.uv.workspace]
-# Workspace members. Keeping the list to the packages that live in this
-# repo lets `uv lock --check` / `uv sync --frozen` pass.
-members = ["server", "optimizations/megakernel", "optimizations/pflash"]
+# Workspace members. PR adds the lucebox/ package alongside the existing
+# server / megakernel / pflash members.
+members = ["lucebox", "server", "optimizations/megakernel", "optimizations/pflash"]
 
 [tool.uv.sources]
+lucebox = { workspace = true }
 lucebox-dflash = { workspace = true }
 pflash = { workspace = true }
 qwen35-megakernel-bf16 = { workspace = true }
