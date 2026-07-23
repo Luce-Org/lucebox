@@ -117,14 +117,15 @@ RUN cd /src/server/build \
 # of these reuses the cached CUDA layers above and only re-runs the
 # runtime stage's uv sync (~70s) instead of the full ~25-minute build.
 #
-# Host-side Python tooling (lucebox/, harness/) is intentionally not copied
-# here: this image is the server. Such tooling can layer on top later via a
-# follow-up COPY directive or a runtime bind-mount during dev.
+# The lucebox CLI is a workspace member (root pyproject + uv.lock), so its
+# source must be present for `uv sync --frozen` in the runtime stage. It runs
+# inside the container — the host wrapper `docker exec`s into it.
 COPY pyproject.toml uv.lock README.md /src/
 COPY server/pyproject.toml server/README.md /src/server/
 COPY server/scripts /src/server/scripts
 COPY optimizations/pflash /src/optimizations/pflash
 COPY optimizations/megakernel /src/optimizations/megakernel
+COPY lucebox /src/lucebox
 
 # ─── Stage 2: runtime ───────────────────────────────────────────────────────
 # Runtime image: ships nvidia driver libs but no nvcc / dev headers. Matches
@@ -179,9 +180,9 @@ COPY --from=builder /src/optimizations/megakernel/pyproject.toml \
                    /src/optimizations/megakernel/README.md \
                    /opt/lucebox-hub/optimizations/megakernel/
 
-# Host-side Python tooling (lucebox/, harness/) is intentionally absent
-# here: this image is the server base layer. Such tooling can layer on top
-# later via a follow-up COPY directive or a runtime bind-mount during dev.
+# The lucebox CLI package (a workspace member) — installed by the uv sync
+# below and invoked in-container by the host wrapper via `docker exec`.
+COPY --from=builder /src/lucebox /opt/lucebox-hub/lucebox
 
 # server: ship the entrypoint/benchmark scripts, the pyproject + README that uv
 # resolves against, and the pruned build tree (binaries + .so files from the
