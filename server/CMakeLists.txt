@@ -284,6 +284,7 @@ add_library(dflash_common STATIC
     src/common/dflash_draft_graph.cpp
     src/common/dflash_draft_kv.cpp
     src/common/dflash_spec_decode.cpp
+    src/common/paged_kv_pool.cpp
     src/common/layer_split_backend.cpp
     src/common/layer_split_runtime.cpp
     src/qwen35/graph_builders.cpp
@@ -1031,6 +1032,15 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
         add_test(NAME kvflash_pool_sizing COMMAND test_kvflash_pool_sizing)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_paged_kv_pool.cpp")
+        # Pure host-side allocator test: no model, ggml, or GPU is required.
+        add_executable(test_paged_kv_pool
+            test/test_paged_kv_pool.cpp
+            src/common/paged_kv_pool.cpp)
+        target_include_directories(test_paged_kv_pool PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME paged_kv_pool COMMAND test_paged_kv_pool)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_restore_delta.cpp")
         add_executable(test_restore_delta test/test_restore_delta.cpp)
         target_include_directories(test_restore_delta PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
@@ -1168,6 +1178,38 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${DFLASH27B_SRC_INCLUDE_DIRS})
     endif()
+    endif()
+
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_paged_attention.cpp")
+        add_executable(test_paged_attention test/test_paged_attention.cpp)
+        target_link_libraries(test_paged_attention PRIVATE
+            ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(test_paged_attention PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_paged_attention PRIVATE hip::host)
+        endif()
+        target_include_directories(test_paged_attention PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        add_test(NAME paged_attention COMMAND test_paged_attention)
+    endif()
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_paged_attention.cpp")
+        add_executable(bench_paged_attention test/bench_paged_attention.cpp)
+        target_link_libraries(bench_paged_attention PRIVATE
+            ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(bench_paged_attention PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(bench_paged_attention PRIVATE hip::host)
+        endif()
+        target_include_directories(bench_paged_attention PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
     endif()
 endif()
 

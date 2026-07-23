@@ -47,8 +47,15 @@ struct StepGraph {
     // reused by the copy-mode persistent fast path.
     bool            built_view = false;
     ggml_tensor *   hidden_input = nullptr;        // lm-head projection only
-    // [n_tokens,n_head_kv] i64; step-invariant KV write (carries kv_start). Null on non-graph paths.
+    // [n_tokens,n_head_kv] i64 physical destination rows for ggml_set_rows.
+    // Used by contiguous replay, KVFlash, and paged attention; null when the
+    // graph uses the legacy contiguous ggml_cpy write.
     ggml_tensor *   kv_write_rows = nullptr;
+    // Paged decode metadata. The block table is [max_blocks,n_seqs], while
+    // kv_seq_lens is [n_seqs] and stores valid cached K/V tokens per sequence.
+    // Both are null on the dense attention path.
+    ggml_tensor *   paged_block_table = nullptr;
+    ggml_tensor *   paged_kv_seq_lens = nullptr;
 
     // Output
     ggml_tensor *   logits = nullptr;
@@ -79,6 +86,8 @@ inline void step_graph_free(StepGraph & sg) {
     sg.hidden_input = nullptr;
     sg.parent_ids = nullptr;
     sg.kv_write_rows = nullptr;
+    sg.paged_block_table = nullptr;
+    sg.paged_kv_seq_lens = nullptr;
     sg.logits = nullptr;
     sg.hidden_states = nullptr;
     sg.argmax_tokens = nullptr;

@@ -140,7 +140,14 @@ bool create_target_cache_partial(const TargetWeights & w,
     // physical pool capacity; logical positions are mapped to pool slots
     // by KvFlashPager. The 256-stride rounding applies to whichever capacity
     // is in effect.
-    const int ctx_phys = (ctx_alloc > 0 && ctx_alloc < max_ctx) ? ctx_alloc : max_ctx;
+    // ctx_alloc is a physical-row override. KVFlash passes a smaller pool;
+    // paged attention passes max_ctx rounded up to its 16-token page size so
+    // the last partial page has physical rows. Anything above that padding is
+    // a miscomputed override — keep the legacy fallback to max_ctx so it
+    // cannot silently inflate the cache.
+    const int paged_token_cap = paged_token_capacity(max_ctx);
+    const int ctx_phys =
+        (ctx_alloc > 0 && ctx_alloc <= paged_token_cap) ? ctx_alloc : max_ctx;
     const int max_ctx_alloc = needs_256_stride
         ? ((ctx_phys + 255) / 256) * 256
         : ctx_phys;
@@ -566,7 +573,10 @@ static ggml_tensor * build_full_attn_block(
     ggml_tensor * q_tail_capture = nullptr,
     int q_tail_start = 0,
     ggml_tensor * kv_write_rows = nullptr,
-    ggml_tensor ** q_fa_out = nullptr   // post-RoPE/post-rotation Q [head_dim, n_tokens, n_head]
+    ggml_tensor ** q_fa_out = nullptr,  // post-RoPE/post-rotation Q [head_dim, n_tokens, n_head]
+    ggml_tensor * paged_block_table = nullptr,
+    ggml_tensor * paged_kv_seq_lens = nullptr,
+    int paged_block_size = 0
 ) {
     const int head_dim = w.n_embd_head_k;
     const int n_head = w.n_head;
@@ -655,7 +665,9 @@ static ggml_tensor * build_full_attn_block(
     }
 
     if (kv_write_rows) {
-        // Step-invariant: constant dst pointer, idx carries kv_start. set_rows needs contiguous src.
+        // Step-invariant: the destination tensor stays fixed while the input
+        // indices carry contiguous, KVFlash, or paged physical rows.
+        // ggml_set_rows requires a contiguous source.
         ggml_tensor * Kcur_cont = ggml_is_contiguous(Kcur_T) ? Kcur_T : ggml_cont(ctx, Kcur_T);
         ggml_tensor * Vcur_cont = ggml_is_contiguous(Vcur_T) ? Vcur_T : ggml_cont(ctx, Vcur_T);
         ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_k, Kcur_cont, kv_write_rows));
@@ -713,22 +725,30 @@ static ggml_tensor * build_full_attn_block(
     // cosine (orthogonal transform).
     if (q_fa_out) *q_fa_out = Qfa;
 
-    // K and V from cache: a windowed view starting at win_start.
-    ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
-        head_dim, win_len_padded, n_head_kv,
-        cache_k->nb[1], cache_k->nb[2], cache_k->nb[1] * win_start);
-    ggml_tensor * Vfa = ggml_view_3d(ctx, cache_v,
-        head_dim, win_len_padded, n_head_kv,
-        cache_v->nb[1], cache_v->nb[2], cache_v->nb[1] * win_start);
-
-    // Causal mask: for n_tokens==1 we don't need one (a single query attending
-    // to all keys is trivially causal). For n_tokens>1 the caller must provide
-    // a mask shaped [kv_len, n_tokens] with 0 for attendable positions and
-    // -inf for positions beyond the causal boundary.
     const float kq_scale = 1.0f / std::sqrt((float)head_dim);
-    ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask,
-                                             kq_scale, 0.0f, 0.0f);
-    // attn: [head_dim, n_head, n_tokens] (permuted)
+    ggml_tensor * attn = nullptr;
+    if (paged_block_table) {
+        GGML_ASSERT(paged_kv_seq_lens && paged_block_size > 0);
+        attn = ggml_paged_attn(ctx, Qfa, cache_k, cache_v,
+                               paged_block_table, paged_kv_seq_lens,
+                               kq_scale, paged_block_size);
+    } else {
+        // K and V from cache: a windowed view starting at win_start.
+        ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
+            head_dim, win_len_padded, n_head_kv,
+            cache_k->nb[1], cache_k->nb[2], cache_k->nb[1] * win_start);
+        ggml_tensor * Vfa = ggml_view_3d(ctx, cache_v,
+            head_dim, win_len_padded, n_head_kv,
+            cache_v->nb[1], cache_v->nb[2], cache_v->nb[1] * win_start);
+
+        // A single query needs no causal mask. Multi-token callers supply one.
+        attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask,
+                                   kq_scale, 0.0f, 0.0f);
+    }
+    // Dense output is [D,Hq,n_tokens]; paged output is [D,n_seq,Hq].
+    // They are layout-equivalent here because the paged path is decode-only
+    // and n_tokens/n_seq is exactly one. A future batched integration must
+    // permute the paged result before this reshape.
 
     // Un-rotate the FA output from FWHT-rotated V space (only when V is TQ3).
     if (out_rotate) {
@@ -1221,7 +1241,10 @@ QwenGraphOutputs build_qwen35_graph(
                                         /*q_tail_capture=*/nullptr,
                                         /*q_tail_start=*/0,
                                         in.kv_write_rows,
-                                        want_q_cap ? &q_fa : nullptr);
+                                        want_q_cap ? &q_fa : nullptr,
+                                        in.paged_block_table,
+                                        in.paged_kv_seq_lens,
+                                        in.paged_block_size);
             if (want_q_cap && q_fa) {
                 // Last token's Q, all heads: src [head_dim, 1, n_head] view of
                 // [head_dim, n_tokens, n_head]; dst = q_cap plane fa_idx

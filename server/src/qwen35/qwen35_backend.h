@@ -20,6 +20,7 @@
 #include "ddtree.h"
 #include "dflash_feature_ring.h"
 #include "common/dflash_draft_kv.h"
+#include "common/paged_kv_pool.h"
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights, PrefixSnapshot
 #include "qwen3/qwen3_drafter.h"  // DrafterContext, load_drafter, free_drafter, drafter_score_and_compress
 #include "kvflash_pager.h"         // bounded KV residency pool
@@ -30,6 +31,7 @@
 #include "ggml-backend.h"
 
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <cstddef>
@@ -48,6 +50,7 @@ struct Qwen35Config {
 
     // FA/KV
     int          fa_window       = 0;  // 0 = full attention. qwen3.6 full-attn layers must see the whole context; a finite window drops the system prompt/tools -> breaks tool calls.
+    bool         paged_attention = false;
     int          kq_stride_pad   = 32;   // KQ_MASK_PAD or 256 for TBQ
 
     // Draft
@@ -118,7 +121,7 @@ public:
     bool try_handle_command(const std::string & line,
                             const DaemonIO & io) override;
 
-    bool supports_dflash_spec_decode() const override { return true; }
+    bool supports_dflash_spec_decode() const override { return !cfg_.paged_attention; }
     DFlashTarget * dflash_target() override;
     bool supports_remote_draft() const override { return true; }
 
@@ -260,6 +263,15 @@ private:
     std::size_t     prefill_last_logits_offset_ = 0;
     bool            prefill_last_logits_valid_  = false;
 
+    // The HTTP worker still runs one request at a time. The allocator and
+    // attention op are sequence-aware; this first integration owns one live
+    // sequence until recurrent DeltaNet state is also sequence-indexed.
+    // Page size comes from PAGED_BLOCK_SIZE (internal.h), shared with the
+    // graph builder and the cache's block-aligned physical sizing.
+    std::unique_ptr<PagedKvPool> paged_kv_pool_;
+    std::optional<PagedKvSequenceHandle> paged_sequence_;
+    PagedKvRequestId paged_request_id_ = 0;
+
     // ── DFlashTarget adapter (lazy-built) ────────────────────────────
     std::unique_ptr<DFlashTarget> dflash_target_;
 
@@ -314,6 +326,11 @@ private:
                       const BudgetHook & budget_hook = {},
                       bool * forced_close_out = nullptr,
                       bool * degenerate_close_out = nullptr);
+
+    bool begin_paged_sequence(uint32_t prompt_tokens);
+    bool append_paged_gap(uint32_t logical_position);
+    bool prepare_paged_decode_step(uint32_t logical_position);
+    void end_paged_sequence();
 
     bool sync_remote_draft_features(int start_pos, int n_tokens);
 

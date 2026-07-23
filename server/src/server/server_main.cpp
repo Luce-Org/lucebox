@@ -227,6 +227,8 @@ static void print_usage(const char * prog) {
         "  --fa-window <N>     Flash-attention sliding window (default: 0=full).\n"
         "                       WARNING: >0 drops system prompt / tool definitions\n"
         "                       from attention at long contexts. Use 0 for tools.\n"
+        "  --paged-attention   Use 16-token paged KV blocks for Qwen3.6-27B\n"
+        "                       autoregressive decode (experimental)\n"
         "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
         "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
@@ -454,6 +456,8 @@ int main(int argc, char ** argv) {
             }
         } else if (std::strcmp(argv[i], "--fa-window") == 0 && i + 1 < argc) {
             bargs.fa_window = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--paged-attention") == 0) {
+            bargs.paged_attention = true;
         } else if (std::strcmp(argv[i], "--model-name") == 0 && i + 1 < argc) {
             sconfig.model_name = argv[++i];
         } else if (std::strcmp(argv[i], "--prefix-cache-slots") == 0 && i + 1 < argc) {
@@ -671,6 +675,36 @@ int main(int argc, char ** argv) {
         }
     }
     if (fast_rollback_forced_off) bargs.fast_rollback = false;
+
+    if (bargs.paged_attention) {
+        if (bargs.draft_path || bargs.remote_draft.enabled() ||
+            bargs.ddtree_mode || bargs.fa_window != 0 ||
+            bargs.device.is_layer_split() ||
+            bargs.remote_target_shard.enabled()) {
+            std::fprintf(stderr,
+                "[server] --paged-attention currently requires a single "
+                "local target, --fa-window 0, and no draft/DDTree\n");
+            return 2;
+        }
+        if (const char * kvflash = std::getenv("DFLASH_KVFLASH");
+            kvflash && kvflash[0] != '\0') {
+            std::fprintf(stderr,
+                "[server] --paged-attention cannot be combined with "
+                "--kvflash/DFLASH_KVFLASH\n");
+            return 2;
+        }
+        if (sconfig.prefix_cache_cap > 0 ||
+            sconfig.prefill_cache_cap > 0 ||
+            !sconfig.disk_cache_dir.empty()) {
+            std::fprintf(stderr,
+                "[server] paged attention disables prefix/prefill snapshots "
+                "until their format stores page tables\n");
+        }
+        sconfig.prefix_cache_cap = 0;
+        sconfig.prefill_cache_cap = 0;
+        sconfig.disk_cache_dir.clear();
+        sconfig.disk_cache_policy.mode = DiskPrefixCacheMode::Off;
+    }
 
     if (!validate_server_placement(bargs, sconfig)) return 2;
 

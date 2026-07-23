@@ -613,6 +613,8 @@ extern "C" {
         // remain stable within a protocol generation.
         GGML_OP_MUL_MAT_GROUPED_SRC,
 
+        GGML_OP_PAGED_ATTN,
+
         GGML_OP_COUNT,
     };
 
@@ -2457,6 +2459,27 @@ extern "C" {
             struct ggml_tensor  * v,
             float                 scale,
             float                 alpha);
+
+    // Decode-only attention over independently allocated physical KV blocks.
+    // q:            [D, n_seq, n_head] F32 (one query per sequence)
+    // k/v:          [D, pool_tokens, n_head_kv]
+    // block_table:  [max_blocks, n_seq] I32
+    // kv_seq_lens: [n_seq] I32 (valid cached K/V tokens per sequence)
+    // res:          [D, n_seq, n_head] F32
+    //
+    // A logical token t is read from physical row
+    // block_table[t/block_size, seq]*block_size + t%block_size.
+    // The initial CUDA/HIP implementation supports D=256 and independently
+    // typed F16, Q4_0, or Q8_0 K/V pools.
+    GGML_API struct ggml_tensor * ggml_paged_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * block_table,
+            struct ggml_tensor  * kv_seq_lens,
+            float                 scale,
+            int                   block_size);
 
     // TurboQuant FWHT rotation. direction: 0 = forward, 1 = inverse.
     // Applies signs1 -> FWHT -> signs2 (forward) or signs2 -> FWHT -> signs1 (inverse).

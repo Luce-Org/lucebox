@@ -1136,9 +1136,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DS4_INDEXER_MASK",
 
     "MUL_MAT_GROUPED_SRC",
+
+    "PAGED_ATTN",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1261,9 +1263,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "ds4_indexer_mask(x,topk)",
 
     "X*grouped(Y)",
+
+    "paged_attn(q,k,v)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5600,6 +5604,54 @@ struct ggml_tensor * ggml_flash_attn_sparse(
     result->src[0] = q;
     result->src[1] = k;
     result->src[2] = v;
+
+    return result;
+}
+
+// ggml_paged_attn
+
+struct ggml_tensor * ggml_paged_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * block_table,
+        struct ggml_tensor  * kv_seq_lens,
+        float                 scale,
+        int                   block_size) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q4_0 || k->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_Q4_0 || v->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(block_table->type == GGML_TYPE_I32);
+    GGML_ASSERT(kv_seq_lens->type == GGML_TYPE_I32);
+
+    GGML_ASSERT(q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0]);
+    GGML_ASSERT(k->ne[1] == v->ne[1]);
+    GGML_ASSERT(k->ne[2] > 0);
+    GGML_ASSERT(k->ne[2] == v->ne[2]);
+    GGML_ASSERT(q->ne[2] % k->ne[2] == 0);
+    GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1);
+
+    GGML_ASSERT(block_table->ne[0] > 0);
+    GGML_ASSERT(block_table->ne[1] == q->ne[1]);
+    GGML_ASSERT(block_table->ne[2] == 1 && block_table->ne[3] == 1);
+    GGML_ASSERT(kv_seq_lens->ne[0] == q->ne[1]);
+    GGML_ASSERT(kv_seq_lens->ne[1] == 1 && kv_seq_lens->ne[2] == 1 && kv_seq_lens->ne[3] == 1);
+
+    GGML_ASSERT(block_size > 0);
+    GGML_ASSERT(k->ne[1] % block_size == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, q->ne);
+
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 1, block_size);
+
+    result->op     = GGML_OP_PAGED_ATTN;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = block_table;
+    result->src[4] = kv_seq_lens;
 
     return result;
 }

@@ -279,7 +279,8 @@ bool build_target_step(
     int kq_stride_pad,
     bool capture_moe_router,
     bool kvflash_mask,
-    bool capture_qk) {
+    bool capture_qk,
+    bool paged_attention) {
     step_graph_free(sg);
 
     // Persistent thread_local arena: rebuilt step graphs land at identical
@@ -323,6 +324,19 @@ bool build_target_step(
         ggml_set_input(sg.attn_mask);
     }
 
+    if (paged_attention) {
+        if (n_tokens != 1 || with_mask || fa_window != 0) return false;
+        const int max_blocks = paged_block_count(cache.max_ctx);
+        sg.paged_block_table = ggml_new_tensor_2d(
+            sg.ctx, GGML_TYPE_I32, max_blocks, 1);
+        ggml_set_name(sg.paged_block_table, "paged_block_table");
+        ggml_set_input(sg.paged_block_table);
+        sg.paged_kv_seq_lens =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(sg.paged_kv_seq_lens, "paged_kv_seq_lens");
+        ggml_set_input(sg.paged_kv_seq_lens);
+    }
+
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
 
     // Step-invariant KV write: only when topology can't vary per step.
@@ -335,10 +349,11 @@ bool build_target_step(
     // physical slots, so the slot-mapped write stays active for masked,
     // multi-token, and feature-capturing forwards (decode AND spec verify).
     const bool use_kv_write_rows =
-        !g_no_kvpad && !capture_delta_intermediate &&
-        (kvflash_mask
-             ? (fa_window == 0)
-             : (n_tokens == 1 && fa_window == 0 && !with_mask && !capture));
+        paged_attention ||
+        (!g_no_kvpad && !capture_delta_intermediate &&
+         (kvflash_mask
+              ? (fa_window == 0)
+              : (n_tokens == 1 && fa_window == 0 && !with_mask && !capture)));
     if (use_kv_write_rows) {
         sg.kv_write_rows = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_I64,
                                               n_tokens, w.n_head_kv);
@@ -358,6 +373,9 @@ bool build_target_step(
     gi.fa_window                  = fa_window;
     gi.last_token_logits_only     = last_token_logits_only;
     gi.kv_write_rows              = sg.kv_write_rows;
+    gi.paged_block_table          = sg.paged_block_table;
+    gi.paged_kv_seq_lens          = sg.paged_kv_seq_lens;
+    gi.paged_block_size           = paged_attention ? PAGED_BLOCK_SIZE : 0;
     gi.q_capture                  = capture_qk;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
