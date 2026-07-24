@@ -143,7 +143,10 @@ void dequantize_rocmfp3_mix_to_fp16_cuda(const void * vx, half * y, int64_t k, c
     const uint8_t * mode_ptr = e.modes + expert;
     const int threads = 256;
     const int blocks = (int) ((k + threads - 1) / threads);
-    hipLaunchKernelGGL(dequantize_rocmfp3_mix_kernel, dim3(blocks), dim3(threads), 0, stream,
+    // Portable launch: triple-chevron compiles under both nvcc and hipcc; the
+    // hipLaunchKernelGGL macro is HIP-only and breaks the default CUDA build,
+    // which still globs this *.cu file.
+    dequantize_rocmfp3_mix_kernel<<<dim3(blocks), dim3(threads), 0, stream>>>(
         (const uint8_t *) vx, book, mode_ptr, e.in, k, y);
 }
 
@@ -154,6 +157,20 @@ void dequantize_rocmfp3_mix_to_fp16_cuda(const void * vx, half * y, int64_t k, c
 // quantized blocks once avoids the ~10x f16 round-trip of the dequant fallback.
 #define MIX_WARP 32
 #define MIX_UNROLL 4
+
+// Down-shift warp shuffle confined to a 32-lane logical group. width=MIX_WARP
+// keeps the reduction self-contained on wave64 (GFX8/9, physical wave = 64) and
+// is a no-op vs the default warp width on wave32 (gfx1151) / NVIDIA, so the
+// reduced value — and thus the greedy output hash — is bit-identical there.
+// HIP keeps the bare (mask-free) __shfl_down; modern CUDA only has the _sync
+// form (and HIP's vendor shim doesn't cover __shfl_down_sync), so branch.
+__device__ __forceinline__ float mix_warp_shfl_down(float v, int off) {
+#if defined(__HIP_PLATFORM_AMD__)
+    return __shfl_down(v, off, MIX_WARP);
+#else
+    return __shfl_down_sync(0xffffffffu, v, off, MIX_WARP);
+#endif
+}
 
 // Accumulate one block's 32 terms directly into acc, in fixed j order, exactly
 // as the un-refactored loop did (acc += s * w_j * x_j). Adding each term into
@@ -250,7 +267,7 @@ __global__ void mix_matvec_rocmfp3_kernel(
         mix_block_accum(rowbase + (int64_t) blk * MIX_BLOCK_BYTES, xc, blk * MIX_QK, mode, book, acc);
     }
     #pragma unroll
-    for (int off = MIX_WARP/2; off > 0; off >>= 1) acc += __shfl_down(acc, off);
+    for (int off = MIX_WARP/2; off > 0; off >>= 1) acc += mix_warp_shfl_down(acc, off);
     if (lane == 0) y[(int64_t) col * y_col_stride + row] = acc;
 }
 
@@ -322,8 +339,8 @@ __global__ void mix_matvec_rocmfp3_moe_kernel(
     }
     #pragma unroll
     for (int off = MIX_WARP/2; off > 0; off >>= 1) {
-        acc0 += __shfl_down(acc0, off);
-        acc1 += __shfl_down(acc1, off);
+        acc0 += mix_warp_shfl_down(acc0, off);
+        acc1 += mix_warp_shfl_down(acc1, off);
     }
     if (lane == 0) {
         dst[(int64_t) token * dst_s2 + (int64_t) slot * dst_s1 + row0] = acc0;
@@ -353,7 +370,7 @@ bool ggml_cuda_rocmfp3_mix_mul_mat_id(
     // of `warps_per_block` warps covers 2*warps_per_block rows.
     const int rows_per_block = 2 * warps_per_block;
     dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);
-    hipLaunchKernelGGL(mix_matvec_rocmfp3_moe_kernel, grid, dim3(threads), 0, stream,
+    mix_matvec_rocmfp3_moe_kernel<<<grid, dim3(threads), 0, stream>>>(
         (const uint8_t *) e.base, e.nb02, e.codebooks, e.modes,
         src1, ids, dst, in, out, ne11,
         ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2);
@@ -388,7 +405,7 @@ bool ggml_cuda_rocmfp3_mix_mul_mat_vec(
     const int warps_per_block = 2;               // 64 threads
     const int threads = warps_per_block * MIX_WARP;
     dim3 grid((out + warps_per_block - 1) / warps_per_block, ncols, 1);
-    hipLaunchKernelGGL(mix_matvec_rocmfp3_kernel, grid, dim3(threads), 0, stream,
+    mix_matvec_rocmfp3_kernel<<<grid, dim3(threads), 0, stream>>>(
         (const uint8_t *) vx, book, mode_ptr, x, y, in, out, x_col_stride, y_col_stride);
     return true;
 }
