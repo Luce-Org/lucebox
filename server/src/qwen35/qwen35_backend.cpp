@@ -176,7 +176,36 @@ KvFlashAutoBudget Qwen35Backend::make_kvflash_budget(const TargetWeights & w,
 
 bool Qwen35Backend::init() {
     const bool use_remote_draft = cfg_.remote_draft.enabled();
-    split_gpus_ = !use_remote_draft && (cfg_.device.gpu != cfg_.draft_gpu);
+    // A second CUDA backend for the draft is warranted only when a local
+    // draft model is actually loaded; a differing --draft-gpu alone must not
+    // create one. Draft-free modes (paged attention rejects --draft outright)
+    // rely on staying single-backend.
+    split_gpus_ = cfg_.draft_path && !use_remote_draft &&
+                  (cfg_.device.gpu != cfg_.draft_gpu);
+
+    if (cfg_.paged_attention) {
+        if (cfg_.draft_path || use_remote_draft || cfg_.ddtree_mode ||
+            cfg_.fa_window != 0 || cfg_.device.is_layer_split()) {
+            std::fprintf(stderr,
+                "[paged-attention] requires a local, single-device qwen35 "
+                "target with AR decode and full attention\n");
+            return false;
+        }
+        if (cfg_.device.max_ctx <= 0 ||
+            cfg_.device.max_ctx > INT32_MAX - (int)PAGED_BLOCK_SIZE + 1) {
+            std::fprintf(stderr,
+                "[paged-attention] max_ctx must be in [1, %d]\n",
+                INT32_MAX - (int)PAGED_BLOCK_SIZE + 1);
+            return false;
+        }
+        if (kvflash_pool_from_env(
+                cfg_.device.max_ctx, KvFlashConfig{}) > 0) {
+            std::fprintf(stderr,
+                "[paged-attention] cannot be combined with KVFlash; "
+                "remove --kvflash/DFLASH_KVFLASH\n");
+            return false;
+        }
+    }
 
     target_backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
     if (!target_backend_) {
@@ -279,10 +308,45 @@ bool Qwen35Backend::init() {
     // Subclass gate (e.g. MoE all-hot): may zero kvflash_tokens_ before the KV
     // cache is sized, so create_target_cache allocates full max_ctx KV.
     if (!post_kvflash_init_gate()) return false;
+    // Paged mode sizes the KV cache to whole blocks; otherwise KVFlash
+    // decides the allocation (0 = full max_ctx).
+    const int ctx_alloc = cfg_.paged_attention
+        ? paged_token_capacity(cfg_.device.max_ctx)
+        : kvflash_tokens_;
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
-                             /*prefill_only=*/true, /*ctx_alloc=*/kvflash_tokens_)) {
+                             /*prefill_only=*/true, ctx_alloc)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
         return false;
+    }
+    if (cfg_.paged_attention) {
+        const auto supported_type = [](ggml_type type) {
+            return type == GGML_TYPE_F16 ||
+                   type == GGML_TYPE_Q4_0 ||
+                   type == GGML_TYPE_Q8_0;
+        };
+        if (!supported_type(cache_.kv_k_type) ||
+            !supported_type(cache_.kv_v_type)) {
+            std::fprintf(stderr,
+                "[paged-attention] unsupported KV types K=%s V=%s; use "
+                "f16, q4_0, or q8_0\n",
+                ggml_type_name(cache_.kv_k_type),
+                ggml_type_name(cache_.kv_v_type));
+            return false;
+        }
+        try {
+            paged_kv_pool_ = std::make_unique<PagedKvPool>(
+                (uint32_t)paged_block_count(cfg_.device.max_ctx),
+                /*max_sequences=*/1, PAGED_BLOCK_SIZE);
+        } catch (const std::exception & e) {
+            std::fprintf(stderr, "[paged-attention] pool init failed: %s\n",
+                         e.what());
+            return false;
+        }
+        std::printf("[paged-attention] %u physical blocks x %u tokens "
+                    "(%d logical tokens)\n",
+                    paged_kv_pool_->physical_block_count(),
+                    paged_kv_pool_->block_size(), cfg_.device.max_ctx);
+        std::fflush(stdout);
     }
     if (kvflash_active()) {
         KvFlashConfig pc;
@@ -337,6 +401,126 @@ bool Qwen35Backend::run_ar_decode_path(int committed, int n_gen,
                                        std::vector<int32_t> & out_tokens,
                                        const DaemonIO & io) {
     return do_ar_decode(committed, n_gen, out_tokens, io);
+}
+
+bool Qwen35Backend::begin_paged_sequence(uint32_t prompt_tokens) {
+    if (!cfg_.paged_attention) return true;
+    if (!paged_kv_pool_) return false;
+
+    paged_kv_pool_->reset();
+    paged_sequence_.reset();
+    if (++paged_request_id_ == 0) ++paged_request_id_;
+
+    PagedKvSequenceHandle handle;
+    PagedKvStatus status = paged_kv_pool_->acquire(paged_request_id_, handle);
+    if (status != PagedKvStatus::Ok) {
+        std::fprintf(stderr, "[paged-attention] acquire failed: %s\n",
+                     paged_kv_status_string(status));
+        return false;
+    }
+    paged_sequence_ = handle;
+
+    PagedKvAppendResult append = paged_kv_pool_->append(handle, prompt_tokens);
+    if (!append) {
+        std::fprintf(stderr,
+            "[paged-attention] prompt allocation (%u tokens) failed: %s\n",
+            prompt_tokens, paged_kv_status_string(append.status));
+        end_paged_sequence();
+        return false;
+    }
+
+    // Dense prefill writes logical row p directly. A freshly reset pool hands
+    // out the lowest blocks, so those rows and the initial page table coincide.
+    for (const PagedKvWriteSlot & slot : append.write_slots) {
+        if (slot.physical_token_index != slot.logical_position) {
+            std::fprintf(stderr,
+                "[paged-attention] non-identity prefill allocation at %u\n",
+                slot.logical_position);
+            end_paged_sequence();
+            return false;
+        }
+    }
+    return true;
+}
+
+bool Qwen35Backend::append_paged_gap(uint32_t logical_position) {
+    if (!cfg_.paged_attention) return true;
+    if (!paged_kv_pool_ || !paged_sequence_) return false;
+    PagedKvAppendResult append =
+        paged_kv_pool_->append(*paged_sequence_, /*token_count=*/1);
+    if (!append || append.write_slots.size() != 1 ||
+        append.write_slots[0].logical_position != logical_position) {
+        std::fprintf(stderr,
+            "[paged-attention] logical gap allocation failed at %u (%s)\n",
+            logical_position, paged_kv_status_string(append.status));
+        return false;
+    }
+    return true;
+}
+
+bool Qwen35Backend::prepare_paged_decode_step(uint32_t logical_position) {
+    if (!cfg_.paged_attention) return true;
+    if (!paged_kv_pool_ || !paged_sequence_ || !sg_.kv_write_rows ||
+        !sg_.paged_block_table || !sg_.paged_kv_seq_lens) {
+        std::fprintf(stderr,
+            "[paged-attention] decode graph is missing paging metadata\n");
+        return false;
+    }
+
+    PagedKvAppendResult append =
+        paged_kv_pool_->append(*paged_sequence_, /*token_count=*/1);
+    if (!append || append.write_slots.size() != 1 ||
+        append.write_slots[0].logical_position != logical_position) {
+        std::fprintf(stderr,
+            "[paged-attention] append failed at %u: %s\n",
+            logical_position, paged_kv_status_string(append.status));
+        return false;
+    }
+
+    const int64_t physical_row =
+        (int64_t)append.write_slots[0].physical_token_index;
+    std::vector<int64_t> rows((size_t)w_.n_head_kv, physical_row);
+    ggml_backend_tensor_set(sg_.kv_write_rows, rows.data(), 0,
+                            rows.size() * sizeof(rows[0]));
+
+    PagedKvSequenceSnapshot sequence;
+    const PagedKvStatus status =
+        paged_kv_pool_->sequence(*paged_sequence_, sequence);
+    if (status != PagedKvStatus::Ok ||
+        sequence.kv_seq_len > (uint32_t)INT32_MAX ||
+        sequence.block_table.size() >
+            (size_t)sg_.paged_block_table->ne[0]) {
+        std::fprintf(stderr,
+            "[paged-attention] invalid sequence metadata: %s\n",
+            paged_kv_status_string(status));
+        return false;
+    }
+
+    std::vector<int32_t> block_table(
+        (size_t)sg_.paged_block_table->ne[0], -1);
+    for (size_t i = 0; i < sequence.block_table.size(); ++i) {
+        if (sequence.block_table[i] > (uint32_t)INT32_MAX) return false;
+        block_table[i] = (int32_t)sequence.block_table[i];
+    }
+    const int32_t kv_seq_len = (int32_t)sequence.kv_seq_len;
+    ggml_backend_tensor_set(sg_.paged_block_table, block_table.data(), 0,
+                            block_table.size() * sizeof(block_table[0]));
+    ggml_backend_tensor_set(sg_.paged_kv_seq_lens, &kv_seq_len, 0,
+                            sizeof(kv_seq_len));
+    return true;
+}
+
+void Qwen35Backend::end_paged_sequence() {
+    if (paged_kv_pool_ && paged_sequence_) {
+        const PagedKvStatus status =
+            paged_kv_pool_->release(*paged_sequence_);
+        if (status != PagedKvStatus::Ok &&
+            status != PagedKvStatus::StaleHandle) {
+            std::fprintf(stderr, "[paged-attention] release failed: %s\n",
+                         paged_kv_status_string(status));
+        }
+    }
+    paged_sequence_.reset();
 }
 
 // ── print_ready_banner ──────────────────────────────────────────────────
@@ -432,6 +616,16 @@ bool Qwen35Backend::unpark(ParkTarget target) {
 // ── Snapshots ───────────────────────────────────────────────────────────
 
 bool Qwen35Backend::snapshot_save(int slot) {
+    if (cfg_.paged_attention) {
+        static bool warned = false;
+        if (!warned) {
+            std::fprintf(stderr,
+                "[paged-attention] prefix snapshots are disabled until the "
+                "snapshot format stores block tables\n");
+            warned = true;
+        }
+        return false;
+    }
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
     // kvflash: snapshots right-size to cur_pos, which is a LOGICAL position
     // that can exceed the physical pool once decode has paged, and they copy
@@ -459,22 +653,26 @@ void Qwen35Backend::snapshot_free(int slot) {
 }
 
 bool Qwen35Backend::snapshot_used(int slot) const {
+    if (cfg_.paged_attention) return false;
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
     return prefix_snapshots_[slot].ctx != nullptr;
 }
 
 bool Qwen35Backend::restore_target_cache_from_snapshot(int slot) {
+    if (cfg_.paged_attention) return false;
     if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) return false;
     return restore_target_cache(prefix_snapshots_[slot], cache_);
 }
 
 int Qwen35Backend::snapshot_cur_pos(int slot) const {
+    if (cfg_.paged_attention) return 0;
     if (slot < 0 || slot >= PREFIX_SLOTS) return 0;
     return prefix_snapshots_[slot].cur_pos;
 }
 
 ModelBackend::SnapshotRef Qwen35Backend::snapshot_ref(int slot) const {
     SnapshotRef ref;
+    if (cfg_.paged_attention) return ref;
     if (slot < 0 || slot >= PREFIX_SLOTS) return ref;
     const auto & snap = prefix_snapshots_[slot];
     if (!snap.ctx) return ref;
@@ -488,6 +686,7 @@ ModelBackend::SnapshotRef Qwen35Backend::snapshot_ref(int slot) const {
 bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
                                    ggml_backend_buffer_t buf, int cur_pos,
                                    int32_t last_tok) {
+    if (cfg_.paged_attention) return false;
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
     snapshot_free(slot);
 
@@ -690,6 +889,12 @@ void Qwen35Backend::free_drafter() {
 bool Qwen35Backend::try_handle_command(const std::string & line, const DaemonIO & io) {
     // SNAPSHOT_THIN <slot> — lightweight snapshot (SSM state only, no KV copy)
     if (line.compare(0, 14, "SNAPSHOT_THIN ") == 0) {
+        if (cfg_.paged_attention) {
+            std::fprintf(stderr,
+                "[paged-attention] SNAPSHOT_THIN is not page-table aware\n");
+            io.emit(-1);
+            return true;
+        }
         int slot = std::atoi(line.c_str() + 14);
         if (slot >= 0 && slot < PREFIX_SLOTS) {
             snapshot_free(slot);
@@ -709,6 +914,7 @@ bool Qwen35Backend::try_handle_command(const std::string & line, const DaemonIO 
 // ── DFlash spec decode target ────────────────────────────────────────────
 
 DFlashTarget * Qwen35Backend::dflash_target() {
+    if (cfg_.paged_attention) return nullptr;
     if (!dflash_target_) {
         dflash_target_ = std::make_unique<Qwen35DFlashTarget>(
             w_, cache_, target_backend_, sg_,
@@ -726,6 +932,7 @@ DFlashTarget * Qwen35Backend::dflash_target() {
 
 void Qwen35Backend::shutdown() {
     const bool use_remote_draft = cfg_.remote_draft.enabled();
+    end_paged_sequence();
     free_drafter();
     step_graph_destroy(sg_);
     step_graph_destroy(draft_sg_);
@@ -795,10 +1002,27 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     // position-addressed and will be overwritten during prefill.
     reset_recurrent_state(cache_);
 
+    if (cfg_.paged_attention) {
+        // The pool's block rounding can hold up to PAGED_BLOCK_SIZE-1 tokens
+        // beyond max_ctx; gate on max_ctx itself so no logical (RoPE)
+        // position ever exceeds the configured context.
+        if (req.prompt.size() > (uint64_t)cfg_.device.max_ctx) {
+            result.fail(GenerateErrorCode::ContextOverflow,
+                        "prompt exceeds max_ctx for paged attention");
+            return result;
+        }
+        if (!begin_paged_sequence((uint32_t)req.prompt.size())) {
+            result.fail(GenerateErrorCode::BackendSpecific,
+                        "paged KV sequence initialization failed");
+            return result;
+        }
+    }
+
     // Prefill
     auto t_prefill_start = std::chrono::steady_clock::now();
     const int committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
     if (committed < 0) {
+        end_paged_sequence();
         result.fail(GenerateErrorCode::PrefillFailed);
         return result;
     }
@@ -815,8 +1039,21 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
         // generation. Most requests never hit the tail because the
         // model closes </think> naturally well before the budget edge.
         bool decode_ok = false;
-        if (req.force_ar_decode) {
-            decode_ok = do_ar_decode(committed, req.n_gen, result.tokens, out_io,
+        int ar_n_gen = req.n_gen;
+        if (cfg_.paged_attention && ar_n_gen > cfg_.device.max_ctx - committed) {
+            // The paged pool ends at the block-rounded max_ctx: an unclamped
+            // budget would fail a mid-stream block allocation (and push RoPE
+            // positions past max_ctx) instead of finishing cleanly. The HTTP
+            // admission gate normally guarantees prompt+n_gen <= max_ctx, but
+            // daemon-command callers are not required to.
+            ar_n_gen = cfg_.device.max_ctx - committed;
+            std::fprintf(stderr,
+                "[paged-attention] clamping n_gen %d -> %d "
+                "(committed=%d, max_ctx=%d)\n",
+                req.n_gen, ar_n_gen, committed, cfg_.device.max_ctx);
+        }
+        if (cfg_.paged_attention || req.force_ar_decode) {
+            decode_ok = do_ar_decode(committed, ar_n_gen, result.tokens, out_io,
                                      req.budget_hook,
                                      &result.budget_forced_close,
                                      &result.degenerate_decode_close);
@@ -837,6 +1074,7 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
             }
         }
         if (!decode_ok) {
+            end_paged_sequence();
             result.fail(GenerateErrorCode::DecodeFailed);
             return result;
         }
@@ -844,6 +1082,7 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
 
+    end_paged_sequence();
     result.succeed();
     return result;
 }
@@ -855,6 +1094,12 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                                                         const DaemonIO & io) {
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
+    if (cfg_.paged_attention) {
+        result.fail(GenerateErrorCode::BackendSpecific,
+                    "paged-attention snapshots are not yet supported");
+        out_io.emit(-1);
+        return result;
+    }
     if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) {
         result.fail(GenerateErrorCode::InvalidSnapshotSlot);
         out_io.emit(-1);
@@ -1534,6 +1779,13 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         io.emit(first_tok);
         if (kvflash_active()) kvflash_history_.push_back(first_tok);
         if (IS_EOS_TOK(first_tok, w_)) return true;
+        // Preserve the existing AR position semantics: the first sampled
+        // token advances cur_pos without a cache write. The page table must
+        // include that logical row so subsequent attention sees exactly the
+        // same context as the dense path. Prefill does not refresh this row,
+        // so after the first request it may contain residual K/V from the
+        // previous request.
+        if (!append_paged_gap((uint32_t)committed)) return false;
         committed++;
         cache_.cur_pos = committed;
     }
@@ -1550,6 +1802,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         // kvflash: graph carries a slot-validity mask alongside the
         // step-invariant set_rows write; the FA span clamps to the pool.
         const bool pool = kvflash_active();
+        const bool paged = cfg_.paged_attention;
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/committed, /*n_tokens=*/1,
                                /*with_mask=*/pool, /*capture=*/false,
@@ -1559,13 +1812,16 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                cfg_.kq_stride_pad,
                                should_capture_moe_router(),
                                /*kvflash_mask=*/pool,
-                               /*capture_qk=*/pool && kvflash_qk_policy_)) {
+                               /*capture_qk=*/pool && kvflash_qk_policy_,
+                               /*paged_attention=*/paged)) {
             return false;
         }
 
         // Fill kv_write_rows with this step's cache slot for set_rows:
         // the logical position directly, or its pool slot in kvflash mode.
-        if (sg_.kv_write_rows) {
+        if (paged) {
+            if (!prepare_paged_decode_step((uint32_t)committed)) return false;
+        } else if (sg_.kv_write_rows) {
             const int n_head_kv = w_.n_head_kv;
             const int64_t slot = pool ? (int64_t)kvflash_pager_.slot_for(committed)
                                       : (int64_t)committed;

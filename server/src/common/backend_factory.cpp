@@ -55,7 +55,31 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         return nullptr;
     }
 
+    if (args.paged_attention && arch != "qwen35") {
+        std::fprintf(stderr,
+            "[backend_factory] --paged-attention currently supports only "
+            "Qwen3.5/Qwen3.6 dense targets (detected %s)\n", arch.c_str());
+        return nullptr;
+    }
+    const PlacementBackend compiled_backend = compiled_placement_backend();
+    if (args.paged_attention &&
+        compiled_backend != PlacementBackend::Cuda &&
+        compiled_backend != PlacementBackend::Hip) {
+        std::fprintf(stderr,
+            "[backend_factory] --paged-attention is currently enabled only "
+            "for CUDA or HIP builds\n");
+        return nullptr;
+    }
+
     if (arch == "qwen35") {
+        if (args.paged_attention &&
+            (args.device.is_layer_split() ||
+             args.remote_target_shard.enabled())) {
+            std::fprintf(stderr,
+                "[backend_factory] --paged-attention does not yet support "
+                "target layer splitting or remote target shards\n");
+            return nullptr;
+        }
         if (args.device.is_layer_split()) {
             Qwen35LayerSplitAdapterConfig cfg;
             cfg.target_path        = args.model_path;
@@ -91,6 +115,7 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         cfg.remote_draft       = args.remote_draft;
         cfg.stream_fd          = args.stream_fd;
         cfg.fa_window          = args.fa_window;
+        cfg.paged_attention    = args.paged_attention;
         cfg.kq_stride_pad      = args.kq_stride_pad;
         cfg.draft_swa_window   = args.draft_swa_window;
         cfg.draft_ctx_max      = args.draft_ctx_max;

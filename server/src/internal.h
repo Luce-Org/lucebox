@@ -516,6 +516,20 @@ bool restore_target_cache_chain(const PrefixSnapshot * thick,
                                  int n_thins,
                                  TargetCache & cache);
 
+// Fixed page size (tokens) shared by the paged KV allocator, the qwen35
+// decode graph, and the KV cache's block-aligned physical sizing.
+constexpr int PAGED_BLOCK_SIZE = 16;
+
+// Physical blocks needed to page `max_ctx` tokens (ceiling division).
+constexpr int paged_block_count(int max_ctx) {
+    return (max_ctx + PAGED_BLOCK_SIZE - 1) / PAGED_BLOCK_SIZE;
+}
+
+// Token capacity of the paged KV cache: max_ctx rounded up to whole blocks.
+constexpr int paged_token_capacity(int max_ctx) {
+    return paged_block_count(max_ctx) * PAGED_BLOCK_SIZE;
+}
+
 // max_verify_tokens controls the per-layer ssm_intermediate and conv_input_cache
 // sizes. Default is DFLASH27B_DRAFT_BLOCK_SIZE (16) for chain verify. DDTree
 // mode requires max(chain, 1 + tree_budget) to hold the flat tree + root.
@@ -527,7 +541,9 @@ bool restore_target_cache_chain(const PrefixSnapshot * thick,
 // tensors. When smaller than max_ctx, a KvFlashPager maps logical positions to
 // pool slots and pages cold chunks to host (bounded KV residency); the
 // logical context bound stays max_ctx. Recurrent (DeltaNet) state is
-// unaffected.
+// unaffected. Paged attention passes max_ctx rounded up to PAGED_BLOCK_SIZE;
+// that padding is the only growth honored — larger overrides fall back to
+// max_ctx exactly like before the override existed.
 bool create_target_cache(const TargetWeights & w,
                          int max_ctx,
                          int max_verify_tokens,
@@ -602,8 +618,12 @@ struct QwenGraphInputs {
     int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
     bool          last_token_logits_only = false; // if true, only compute logits for last token (prefill optimization)
     ggml_tensor * parent_ids = nullptr; // [n_tokens] i32; tree mode when non-null
-    // [n_tokens,n_head_kv] i64; non-null = step-invariant KV write via ggml_set_rows (carries kv_start).
+    // [n_tokens,n_head_kv] i64 physical destination rows; non-null selects the
+    // step-invariant ggml_set_rows KV write.
     ggml_tensor * kv_write_rows = nullptr;
+    ggml_tensor * paged_block_table = nullptr; // [max_blocks,n_seqs] i32
+    // [n_seqs] i32; valid cached K/V tokens per sequence.
+    ggml_tensor * paged_kv_seq_lens = nullptr;
     // Capture the LAST token's post-RoPE/post-rotation Q per full-attention
     // layer into cache.q_cap (KVFlash target-QK scorer). Step-invariant:
     // node properties depend only on n_tokens and the layer index.

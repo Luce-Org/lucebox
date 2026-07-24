@@ -54,6 +54,7 @@ struct BackendArgs {
 
     // qwen35-specific speculative decode options
     int             fa_window        = 0;  // 0 = full attention. qwen3.6 full-attn layers must see the whole context; a finite window drops the system prompt/tools -> breaks tool calls.
+    bool            paged_attention  = false;  // qwen35 single-device AR decode (16-token pages)
     int             kq_stride_pad    = 32;
     int             draft_swa_window = 0;
     int             draft_ctx_max    = 4096;
