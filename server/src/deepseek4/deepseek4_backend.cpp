@@ -1094,6 +1094,27 @@ bool DeepSeek4Backend::init_hybrid_model() {
         return true;
     }
 
+    // qtype-105 (Q3_1_ROCMFP3_MIX) is decodable only by the fused CUDA/HIP
+    // kernel driven by the per-expert sidecar codebooks/modes. Hybrid storage
+    // slices the stacked down-expert tensor into separate hot/cold buffers that
+    // carry no sidecar metadata, and the CPU cold path has no type-105 traits —
+    // so a hybrid placement has no working decode path (the GPU cold path hits
+    // the unregistered-tensor abort; the CPU cold path has no vec_dot for 105).
+    // Fail at load with a clear message instead of starting a server that
+    // crashes or emits garbage at first decode. (The all-hot case above reloads
+    // the full monolithic model and never reaches here.)
+    for (const auto & L : w_.layers) {
+        if (L.ffn_down_exps &&
+            L.ffn_down_exps->type == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+            std::fprintf(stderr,
+                "[deepseek4] qtype-105 (mixed ROCmFP3) experts require monolithic "
+                "residency — hybrid/cold expert placement cannot decode them. "
+                "Enable fused decode or provide enough VRAM to keep all experts "
+                "resident.\n");
+            return false;
+        }
+    }
+
     auto hybrid = std::make_shared<MoeHybridStorage>();
     MoeHybridConfig hybrid_cfg = make_ds4_parent_worker_cfg(w_);
     const Ds4MoeTpConfig tp = ds4_moe_tp_config(cfg_.device.gpu);

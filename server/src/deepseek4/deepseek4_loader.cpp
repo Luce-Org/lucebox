@@ -43,6 +43,10 @@ extern "C" void ggml_cuda_rocmfp3_mix_register_host(
         const void * base, size_t nb02, int n_experts, int out, int in,
         const void * codebooks_bf16_host, const uint8_t * modes_host,
         const uint8_t * rotations_host);
+// Remove a qtype-105 tensor's registry entry and free its device side-data.
+// Called from free_deepseek4_weights before the GPU buffer is released so
+// stale base-pointer ranges can't survive an unload/reload.
+extern "C" void ggml_cuda_rocmfp3_mix_unregister(const void * base);
 
 #if !defined(_WIN32)
 #include <cerrno>
@@ -341,22 +345,34 @@ constexpr int DS4_QTYPE_ROCMFP3_MIX = 105;  // GGML_TYPE_Q3_1_ROCMFP3_MIX
 // unregistered qtype-105 tensor has no working decode path (the to_fp16 shim
 // GGML_ABORTs), so a partial/garbage registration would only turn into a
 // delayed crash or silently-wrong output at first decode.
+// Sanity bounds for a corrupt/hostile sidecar entry, checked BEFORE any buffer
+// is sized from its fields. Far above any real DeepSeek MoE (256–512 experts,
+// n_ff ~ 2k–18k) but small enough that E*C*K*2 bytes can't overflow size_t.
+constexpr uint32_t DS4_P4MIX_MAX_EXPERTS = 1u << 16;   // 65536
+constexpr uint32_t DS4_P4MIX_MAX_DIM     = 1u << 20;   // 1,048,576
+constexpr uint32_t DS4_P4MIX_C           = 2;          // codebooks per expert
+constexpr uint32_t DS4_P4MIX_K           = 8;          // levels per codebook
+constexpr uint32_t DS4_P4MIX_QK          = 32;         // MIX_QK block width (rocmfp3_mix.cu)
+constexpr uint8_t  DS4_P4MIX_MAX_MODE    = 1;          // 0 = fixed, 1 = adaptive
+
 static bool ds4_register_p4mix_sidecar(const std::string & gguf_path,
                                        const TargetLoadPlan & plan,
                                        DeepSeek4Weights & out) {
-    // Count the qtype-105 down-expert layers actually resident on this shard.
+    // required[layer] == true for a qtype-105 down-expert resident on this shard.
+    std::vector<bool> required(out.layers.size(), false);
     int n_qtype105 = 0;
-    for (auto & L : out.layers) {
-        if (L.ffn_down_exps &&
-            (int) L.ffn_down_exps->type == DS4_QTYPE_ROCMFP3_MIX) n_qtype105++;
+    for (size_t li = 0; li < out.layers.size(); ++li) {
+        const ggml_tensor * dt = out.layers[li].ffn_down_exps;
+        if (dt && (int) dt->type == DS4_QTYPE_ROCMFP3_MIX) { required[li] = true; n_qtype105++; }
     }
     if (n_qtype105 == 0) return true;  // uniform (qtype-104) model — nothing to do
 
     // Metadata-only / expert-skipping shards keep the expert tensor allocated but
     // never upload its weights (see should_upload_ds4_tensor), so its device base
-    // is unfilled. Such shards don't decode experts locally — skip registration
-    // rather than register a garbage base. (A stray decode of an unregistered
-    // qtype-105 tensor still aborts, which is the correct misconfiguration signal.)
+    // is unfilled. Such shards don't decode experts locally, so skip registration
+    // rather than register a garbage base. (Hybrid/cold placement of a qtype-105
+    // model — which likewise sets skip_expert_tensors — is rejected earlier in
+    // DeepSeek4Backend::init_hybrid_model, since it has no working 105 decode.)
     if (plan.skip_expert_tensors) {
         std::fprintf(stderr, "[deepseek4] qtype-105 down-experts not resident on this "
                      "shard (skip_expert_tensors) — fused decode disabled here\n");
@@ -380,39 +396,58 @@ static bool ds4_register_p4mix_sidecar(const std::string & gguf_path,
         std::fclose(f);
         return false;
     }
-    int registered = 0;
+    (void) reserved;
+
+    std::vector<bool> done(out.layers.size(), false);  // resident layers registered
+    std::vector<const void *> registered_bases;        // for unwind on failure
     bool ok = true;
-    for (uint32_t li = 0; li < n_layers && ok; li++) {
+    for (uint32_t i = 0; i < n_layers && ok; i++) {
         uint32_t hdr[6];
         if (std::fread(hdr, 4, 6, f) != 6) {
-            std::fprintf(stderr, "[deepseek4] truncated p4mix sidecar (entry %u header)\n", li);
+            std::fprintf(stderr, "[deepseek4] truncated p4mix sidecar (entry %u header)\n", i);
             ok = false; break;
         }
         const uint32_t layer = hdr[0], E = hdr[1], odim = hdr[2], idim = hdr[3],
                        C = hdr[4], K = hdr[5];
-        std::vector<uint8_t> modes(E), rots(E);
-        std::vector<uint16_t> books((size_t) E * C * K);
-        if (std::fread(modes.data(), 1, E, f) != E ||
-            std::fread(rots.data(), 1, E, f) != E ||
-            std::fread(books.data(), sizeof(uint16_t), books.size(), f) != books.size()) {
-            std::fprintf(stderr, "[deepseek4] truncated p4mix entry (layer %u)\n", layer);
+
+        // ── Structural validation BEFORE sizing any allocation (finding: reject
+        //    oversized/overflowing dims without allocating) ──
+        if (C != DS4_P4MIX_C || K != DS4_P4MIX_K) {
+            std::fprintf(stderr, "[deepseek4] p4mix entry %u (layer %u) unexpected C=%u K=%u\n",
+                         i, layer, C, K);
             ok = false; break;
         }
-        // Layers outside this shard's range aren't loaded (tensor null) — skip
-        // them; their sidecar bytes were already consumed above.
+        if (E == 0 || E > DS4_P4MIX_MAX_EXPERTS ||
+            odim == 0 || odim > DS4_P4MIX_MAX_DIM ||
+            idim == 0 || idim > DS4_P4MIX_MAX_DIM) {
+            std::fprintf(stderr, "[deepseek4] p4mix layer %u dims out of range: E=%u out=%u in=%u\n",
+                         layer, E, odim, idim);
+            ok = false; break;
+        }
+        // Checked payload size = modes(E) + rots(E) + books(E*C*K * 2 bytes).
+        size_t book_elems = 0, book_bytes = 0, payload = 0;
+        if (__builtin_mul_overflow((size_t) E, (size_t) (C * K), &book_elems) ||
+            __builtin_mul_overflow(book_elems, (size_t) sizeof(uint16_t), &book_bytes) ||
+            __builtin_add_overflow((size_t) E + (size_t) E, book_bytes, &payload)) {
+            std::fprintf(stderr, "[deepseek4] p4mix layer %u payload size overflow\n", layer);
+            ok = false; break;
+        }
+
+        // Layers outside this shard's range aren't resident — skip their payload
+        // without allocating or reading it.
         ggml_tensor * dt = (layer < out.layers.size())
                                ? out.layers[layer].ffn_down_exps : nullptr;
-        if (!dt || (int) dt->type != DS4_QTYPE_ROCMFP3_MIX) continue;
-
-        // Validate the sidecar against the resident tensor before trusting its
-        // dims: the routed expert id indexes modes[expert]/codebooks[expert] and
-        // the decode offsets use E/out/in, so a mismatch means out-of-bounds
-        // reads (GPU fault) or silently-wrong output. Tensor ne = [in, out, E].
-        if (C != 2 || K != 8) {
-            std::fprintf(stderr, "[deepseek4] p4mix layer %u unexpected C=%u K=%u\n",
-                         layer, C, K);
-            ok = false; break;
+        const bool resident105 = dt && (int) dt->type == DS4_QTYPE_ROCMFP3_MIX;
+        if (!resident105) {
+            if (std::fseek(f, (long) payload, SEEK_CUR) != 0) {
+                std::fprintf(stderr, "[deepseek4] p4mix seek past layer %u failed\n", layer);
+                ok = false; break;
+            }
+            continue;
         }
+
+        // ── Dimensions must match the resident tensor so routed expert ids and
+        //    decode offsets stay in-bounds. Tensor ne = [in, out, E]. ──
         if ((int64_t) E != dt->ne[2] || (int64_t) odim != dt->ne[1] ||
             (int64_t) idim != dt->ne[0]) {
             std::fprintf(stderr, "[deepseek4] p4mix layer %u dim mismatch: sidecar "
@@ -421,30 +456,75 @@ static bool ds4_register_p4mix_sidecar(const std::string & gguf_path,
                          (long long) dt->ne[1], (long long) dt->ne[0]);
             ok = false; break;
         }
-        if (idim % 32 != 0) {  // MIX_QK block width in rocmfp3_mix.cu
-            std::fprintf(stderr, "[deepseek4] p4mix layer %u in=%u not a multiple of 32\n",
-                         layer, idim);
+        if (idim % DS4_P4MIX_QK != 0) {
+            std::fprintf(stderr, "[deepseek4] p4mix layer %u in=%u not a multiple of %u\n",
+                         layer, idim, DS4_P4MIX_QK);
             ok = false; break;
         }
         if (!dt->data) {
             std::fprintf(stderr, "[deepseek4] p4mix layer %u expert data not resident\n", layer);
             ok = false; break;
         }
+        // Reject a duplicate entry for an already-registered layer (a repeated
+        // layer could otherwise mask an omitted one and still match the count).
+        if (done[layer]) {
+            std::fprintf(stderr, "[deepseek4] p4mix layer %u appears more than once\n", layer);
+            ok = false; break;
+        }
+
+        // Safe to allocate now: E == ne[2] and bounded above.
+        std::vector<uint8_t> modes(E), rots(E);
+        std::vector<uint16_t> books(book_elems);
+        if (std::fread(modes.data(), 1, E, f) != E ||
+            std::fread(rots.data(), 1, E, f) != E ||
+            std::fread(books.data(), sizeof(uint16_t), books.size(), f) != books.size()) {
+            std::fprintf(stderr, "[deepseek4] truncated p4mix entry (layer %u)\n", layer);
+            ok = false; break;
+        }
+        // Value validation: only modes 0/1 are decoded, and rotation is not yet
+        // implemented (the CUDA kernel ignores e.rotations), so a nonzero rotation
+        // would silently produce wrong output — reject it.
+        for (uint32_t e = 0; e < E && ok; ++e) {
+            if (modes[e] > DS4_P4MIX_MAX_MODE) {
+                std::fprintf(stderr, "[deepseek4] p4mix layer %u expert %u unsupported mode %u\n",
+                             layer, e, modes[e]);
+                ok = false;
+            } else if (rots[e] != 0) {
+                std::fprintf(stderr, "[deepseek4] p4mix layer %u expert %u nonzero rotation %u "
+                             "(rotation not implemented)\n", layer, e, rots[e]);
+                ok = false;
+            }
+        }
+        if (!ok) break;
+
         ggml_cuda_rocmfp3_mix_register_host(
             dt->data, dt->nb[2], (int) E, (int) odim, (int) idim,
             books.data(), modes.data(), rots.data());
-        registered++;
+        registered_bases.push_back(dt->data);
+        done[layer] = true;
     }
     std::fclose(f);
-    if (!ok) return false;
-    if (registered != n_qtype105) {
-        std::fprintf(stderr, "[deepseek4] p4mix sidecar registered %d of %d resident "
-                     "qtype-105 down-expert layer(s); refusing to load\n",
-                     registered, n_qtype105);
+
+    // Every resident qtype-105 layer must be covered exactly once (finding:
+    // duplicate/missing-layer sidecars must fail the load).
+    if (ok) {
+        for (size_t li = 0; li < required.size(); ++li) {
+            if (required[li] && !done[li]) {
+                std::fprintf(stderr, "[deepseek4] p4mix sidecar missing resident qtype-105 "
+                             "layer %zu; refusing to load\n", li);
+                ok = false; break;
+            }
+        }
+    }
+
+    if (!ok) {
+        // Unwind partial registration so a failed load leaves no live entries or
+        // device allocations behind.
+        for (const void * b : registered_bases) ggml_cuda_rocmfp3_mix_unregister(b);
         return false;
     }
     std::fprintf(stderr, "[deepseek4] registered %d qtype-105 down-expert layer(s) "
-                 "from %s\n", registered, sc_path.c_str());
+                 "from %s\n", (int) registered_bases.size(), sc_path.c_str());
     return true;
 }
 }  // namespace
@@ -1205,6 +1285,17 @@ bool build_deepseek4_moe_hybrid_storage_from_file(
 
 void free_deepseek4_weights(DeepSeek4Weights & w) {
     deepseek4_release_runtime_graphs(w);
+    // Drop qtype-105 registry entries (and free their device side-data) while the
+    // tensors are still valid — BEFORE ggml_free destroys them and the GPU buffer
+    // is released. Otherwise the entries leak device memory across park/unpark and
+    // reload, and a later load reusing the same device address would resolve to a
+    // stale range. Keyed by dt->data, so read it here.
+    for (auto & L : w.layers) {
+        ggml_tensor * dt = L.ffn_down_exps;
+        if (dt && dt->type == GGML_TYPE_Q3_1_ROCMFP3_MIX && dt->data) {
+            ggml_cuda_rocmfp3_mix_unregister(dt->data);
+        }
+    }
     if (w.ctx) { ggml_free(w.ctx); w.ctx = nullptr; }
     if (w.dense_split_buf) {
         ggml_backend_buffer_free(w.dense_split_buf);

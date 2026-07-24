@@ -19,52 +19,85 @@ struct MixEntry {
     const nv_bfloat16 * codebooks;  // n_experts * 2 * 8
     const uint8_t * modes;          // n_experts
     const uint8_t * rotations;      // n_experts (unused until p3 rotation lands)
+    bool owns_device;     // true => this entry cudaMalloc'd the 3 buffers above
+                          // (register_host) and must free them on erase/update
 };
 std::mutex g_mix_mtx;
 std::vector<MixEntry> g_mix_registry;
-}  // namespace
 
-extern "C" void ggml_cuda_rocmfp3_mix_register(
-        const void * base, size_t nb02, int n_experts, int out, int in,
-        const void * codebooks, const void * modes, const void * rotations) {
+// Free an entry's device side-data if it owns it. Caller holds g_mix_mtx.
+void mix_free_entry_device(MixEntry & e) {
+    if (!e.owns_device) return;
+    if (e.codebooks) cudaFree((void *) e.codebooks);
+    if (e.modes)     cudaFree((void *) e.modes);
+    if (e.rotations) cudaFree((void *) e.rotations);
+    e.codebooks = nullptr; e.modes = nullptr; e.rotations = nullptr;
+    e.owns_device = false;
+}
+
+void mix_register_impl(const void * base, size_t nb02, int n_experts, int out, int in,
+                       const nv_bfloat16 * codebooks, const uint8_t * modes,
+                       const uint8_t * rotations, bool owns_device) {
     std::lock_guard<std::mutex> lk(g_mix_mtx);
+    MixEntry ne{base, nb02, n_experts, out, in, codebooks, modes, rotations, owns_device};
     for (auto & e : g_mix_registry) {
-        if (e.base == base) {  // update in place
-            e = MixEntry{base, nb02, n_experts, out, in,
-                         (const nv_bfloat16 *) codebooks,
-                         (const uint8_t *) modes, (const uint8_t *) rotations};
+        if (e.base == base) {  // update in place — free the old owned buffers first
+            mix_free_entry_device(e);
+            e = ne;
             return;
         }
     }
-    g_mix_registry.push_back(MixEntry{base, nb02, n_experts, out, in,
-        (const nv_bfloat16 *) codebooks, (const uint8_t *) modes,
-        (const uint8_t *) rotations});
+    g_mix_registry.push_back(ne);
+}
+}  // namespace
+
+// Non-owning registration: codebooks/modes/rotations are device buffers whose
+// lifetime the CALLER manages (unregister will not free them).
+extern "C" void ggml_cuda_rocmfp3_mix_register(
+        const void * base, size_t nb02, int n_experts, int out, int in,
+        const void * codebooks, const void * modes, const void * rotations) {
+    mix_register_impl(base, nb02, n_experts, out, in,
+                      (const nv_bfloat16 *) codebooks, (const uint8_t *) modes,
+                      (const uint8_t *) rotations, /*owns_device=*/false);
 }
 
 // Host-side convenience for the deepseek4 loader: stage per-expert codebooks
-// (bf16) and modes from host memory into device buffers (model-lifetime), then
-// register. rotations host array optional (nullptr => none rotated).
+// (bf16) and modes from host memory into device buffers, then register. The
+// registry OWNS these buffers and frees them on unregister/update. rotations
+// host array optional (nullptr => none rotated). On a cudaMalloc failure the
+// already-allocated buffers are freed before propagating the error, so a failed
+// registration leaks nothing.
 extern "C" void ggml_cuda_rocmfp3_mix_register_host(
         const void * base, size_t nb02, int n_experts, int out, int in,
         const void * codebooks_bf16_host, const uint8_t * modes_host,
         const uint8_t * rotations_host) {
     const size_t cb_bytes = (size_t) n_experts * 2 * 8 * sizeof(nv_bfloat16);
     void * cb_dev = nullptr; void * modes_dev = nullptr; void * rots_dev = nullptr;
-    CUDA_CHECK(cudaMalloc(&cb_dev, cb_bytes));
-    CUDA_CHECK(cudaMemcpy(cb_dev, codebooks_bf16_host, cb_bytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMalloc(&modes_dev, (size_t) n_experts));
-    CUDA_CHECK(cudaMemcpy(modes_dev, modes_host, (size_t) n_experts, cudaMemcpyHostToDevice));
-    if (rotations_host) {
-        CUDA_CHECK(cudaMalloc(&rots_dev, (size_t) n_experts));
-        CUDA_CHECK(cudaMemcpy(rots_dev, rotations_host, (size_t) n_experts, cudaMemcpyHostToDevice));
+    cudaError_t err = cudaMalloc(&cb_dev, cb_bytes);
+    if (err == cudaSuccess) err = cudaMemcpy(cb_dev, codebooks_bf16_host, cb_bytes, cudaMemcpyHostToDevice);
+    if (err == cudaSuccess) err = cudaMalloc(&modes_dev, (size_t) n_experts);
+    if (err == cudaSuccess) err = cudaMemcpy(modes_dev, modes_host, (size_t) n_experts, cudaMemcpyHostToDevice);
+    if (err == cudaSuccess && rotations_host) {
+        err = cudaMalloc(&rots_dev, (size_t) n_experts);
+        if (err == cudaSuccess) err = cudaMemcpy(rots_dev, rotations_host, (size_t) n_experts, cudaMemcpyHostToDevice);
     }
-    ggml_cuda_rocmfp3_mix_register(base, nb02, n_experts, out, in, cb_dev, modes_dev, rots_dev);
+    if (err != cudaSuccess) {
+        if (cb_dev)    cudaFree(cb_dev);
+        if (modes_dev) cudaFree(modes_dev);
+        if (rots_dev)  cudaFree(rots_dev);
+        CUDA_CHECK(err);  // report/abort exactly as before, but only after cleanup
+        return;
+    }
+    mix_register_impl(base, nb02, n_experts, out, in, (const nv_bfloat16 *) cb_dev,
+                      (const uint8_t *) modes_dev, (const uint8_t *) rots_dev,
+                      /*owns_device=*/true);
 }
 
 extern "C" void ggml_cuda_rocmfp3_mix_unregister(const void * base) {
     std::lock_guard<std::mutex> lk(g_mix_mtx);
     for (size_t i = 0; i < g_mix_registry.size(); ++i) {
         if (g_mix_registry[i].base == base) {
+            mix_free_entry_device(g_mix_registry[i]);
             g_mix_registry.erase(g_mix_registry.begin() + i);
             return;
         }
