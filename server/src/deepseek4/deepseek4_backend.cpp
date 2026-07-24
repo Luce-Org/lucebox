@@ -1111,6 +1111,10 @@ bool DeepSeek4Backend::init_hybrid_model() {
                 "residency — hybrid/cold expert placement cannot decode them. "
                 "Enable fused decode or provide enough VRAM to keep all experts "
                 "resident.\n");
+            // Release the weights this hybrid attempt already loaded before
+            // bailing, so w_ is left empty rather than holding a live context +
+            // GPU buffer on the failure path.
+            free_deepseek4_weights(w_);
             return false;
         }
     }

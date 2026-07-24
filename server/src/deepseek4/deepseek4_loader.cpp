@@ -1056,6 +1056,14 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     if (!ds4_register_p4mix_sidecar(path, plan, out)) {
         std::fprintf(stderr, "[deepseek4] qtype-105 sidecar registration failed for %s\n",
                      path.c_str());
+        // out.ctx / out.buf are already live at this point. Release them (and any
+        // remaining registry entries) so the failed load leaves `out` empty —
+        // otherwise load_model()'s fallback to init_hybrid_model() reuses the same
+        // DeepSeek4Weights and overwrites out.ctx/out.buf, permanently leaking the
+        // context + GPU buffer allocated above. free_deepseek4_weights is safe to
+        // call here (it null-checks and its qtype-105 unregister loop is a no-op
+        // for the entries the sidecar path already unwound).
+        free_deepseek4_weights(out);
         return false;
     }
 
