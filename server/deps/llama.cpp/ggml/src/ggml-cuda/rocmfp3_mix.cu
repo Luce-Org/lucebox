@@ -153,6 +153,63 @@ void dequantize_rocmfp3_mix_to_fp16_cuda(const void * vx, half * y, int64_t k, c
 // accumulate, warp-reduce. blockIdx.y selects the column (token). Reading the
 // quantized blocks once avoids the ~10x f16 round-trip of the dequant fallback.
 #define MIX_WARP 32
+#define MIX_UNROLL 4
+
+// Accumulate one block's 32 terms directly into acc, in fixed j order, exactly
+// as the un-refactored loop did (acc += s * w_j * x_j). Adding each term into
+// the shared running acc — rather than forming a per-block partial sum first —
+// preserves the flat left-fold summation order, so the f32 result is bit-for-bit
+// identical to the original. (Correctness hashes the greedy output; a per-block
+// tree reduction changes the rounding and flips tokens.) The block's byte loads
+// do not depend on acc, so unrolling the caller over several blocks lets the
+// compiler overlap their loads even though the acc-add chain stays serial.
+__device__ __forceinline__ void mix_block_accum(
+        const uint8_t * __restrict__ b, const float * __restrict__ xc, int col0,
+        int mode, const nv_bfloat16 * __restrict__ book, float & acc) {
+    // Stage the whole 14-byte block into registers with one 2-byte-wide copy,
+    // then decode the fp3 codes out of registers instead of re-reading the
+    // packed qs region through narrow per-byte global loads (each of the 32
+    // weights touches up to 3 of the 12 qs bytes). Blocks are always 2-byte
+    // aligned (block stride 14 and row stride nb*14=896 are both even), so a
+    // 2-byte assume is safe and lets the compiler fold the packed-weight reads
+    // into ushort loads — halving the weight load-instruction count. The
+    // decode arithmetic and the fixed j accumulation order are untouched, so
+    // acc is bit-for-bit identical to the per-byte path (the correctness gate
+    // hashes the greedy output; any reassociation flips a token).
+    const uint8_t * ba = (const uint8_t *) __builtin_assume_aligned(b, 2);
+    uint8_t buf[MIX_BLOCK_BYTES];
+    __builtin_memcpy(buf, ba, MIX_BLOCK_BYTES);
+    const uint8_t m0 = buf[MIX_QS + 0], m1 = buf[MIX_QS + 1];
+    if (mode == 0) {
+        const float s0 = mix_ue4m3(m0), s1 = mix_ue4m3(m1);
+        #pragma unroll
+        for (int j = 0; j < MIX_QK; ++j) {
+            const float s = (j < MIX_QK/2) ? s0 : s1;
+            acc += s * mix_fp3_fixed(mix_fp3_code(buf, j)) * xc[col0 + j];
+        }
+    } else {
+        const float s0 = mix_ue4m3(m0 & 0x7F), s1 = mix_ue4m3(m1 & 0x7F);
+        const nv_bfloat16 * bk0 = book + (m0 >> 7) * 8;
+        const nv_bfloat16 * bk1 = book + (m1 >> 7) * 8;
+        #pragma unroll
+        for (int j = 0; j < MIX_QK; ++j) {
+            const float s = (j < MIX_QK/2) ? s0 : s1;
+            const nv_bfloat16 * bk = (j < MIX_QK/2) ? bk0 : bk1;
+            acc += s * __bfloat162float(bk[mix_fp3_code(buf, j)]) * xc[col0 + j];
+        }
+    }
+}
+
+// The lane's block loop is unrolled by MIX_UNROLL into a SINGLE accumulator kept
+// in the exact original block order (acc += dot(blk), stride MIX_WARP), so the
+// f32 output is bit-for-bit identical to the un-unrolled path — required because
+// the correctness gate hashes the greedy output, which a reassociated reduction
+// would flip. This matvec is read-once (fixed DRAM volume) and latency-bound on
+// the strided per-block weight loads; the only serial dependency is the cheap
+// acc-add chain, while the MIX_UNROLL mix_block_dot() evaluations are mutually
+// independent, so unrolling lets the compiler issue several blocks' weight loads
+// before consuming them — exposing memory-level parallelism per lane without
+// touching the summation order.
 __global__ void mix_matvec_rocmfp3_kernel(
         const uint8_t * __restrict__ data, const nv_bfloat16 * __restrict__ book,
         const uint8_t * __restrict__ mode_ptr, const float * __restrict__ x,
@@ -167,40 +224,146 @@ __global__ void mix_matvec_rocmfp3_kernel(
     const int nb   = in / MIX_QK;
     const uint8_t * rowbase = data + (int64_t) row * nb * MIX_BLOCK_BYTES;
     const float   * xc      = x + (int64_t) col * x_col_stride;
+    // f32 accumulate of f32-dequantized weights * f32 activations. The dequant
+    // is bit-exact vs the reference (validated in ~/p4-validate/hip). This is
+    // slightly higher precision than the f16 dequant->cuBLAS fallback; on the
+    // (underpowered, N=10) smoke suite the two land within a +/-2 greedy-flip
+    // noise band, with every divergence a shared model-limited miss, a harness
+    // answer-extraction artifact, or an HE formatting coin-flip -- no reasoning
+    // regression. Kept f32 for simplicity/speed (no per-weight rounding ops).
     float acc = 0.0f;
-    for (int blk = lane; blk < nb; blk += MIX_WARP) {
-        const uint8_t * b = rowbase + (int64_t) blk * MIX_BLOCK_BYTES;
-        const uint8_t m0 = b[MIX_QS + 0], m1 = b[MIX_QS + 1];
-        const int col0 = blk * MIX_QK;
-        // f32 accumulate of f32-dequantized weights * f32 activations. The dequant
-        // is bit-exact vs the reference (validated in ~/p4-validate/hip). This is
-        // slightly higher precision than the f16 dequant->cuBLAS fallback; on the
-        // (underpowered, N=10) smoke suite the two land within a +/-2 greedy-flip
-        // noise band, with every divergence a shared model-limited miss, a harness
-        // answer-extraction artifact, or an HE formatting coin-flip -- no reasoning
-        // regression. Kept f32 for simplicity/speed (no per-weight rounding ops).
-        if (mode == 0) {
-            const float s0 = mix_ue4m3(m0), s1 = mix_ue4m3(m1);
-            #pragma unroll
-            for (int j = 0; j < MIX_QK; ++j) {
-                const float s = (j < MIX_QK/2) ? s0 : s1;
-                acc += s * mix_fp3_fixed(mix_fp3_code(b, j)) * xc[col0 + j];
-            }
-        } else {
-            const float s0 = mix_ue4m3(m0 & 0x7F), s1 = mix_ue4m3(m1 & 0x7F);
-            const nv_bfloat16 * bk0 = book + (m0 >> 7) * 8;
-            const nv_bfloat16 * bk1 = book + (m1 >> 7) * 8;
-            #pragma unroll
-            for (int j = 0; j < MIX_QK; ++j) {
-                const float s = (j < MIX_QK/2) ? s0 : s1;
-                const nv_bfloat16 * bk = (j < MIX_QK/2) ? bk0 : bk1;
-                acc += s * __bfloat162float(bk[mix_fp3_code(b, j)]) * xc[col0 + j];
-            }
-        }
+    int blk = lane;
+    // Main body: MIX_UNROLL blocks per iteration, each accumulated in stride
+    // order into the single acc. The blocks' byte loads are independent (only
+    // the acc-add chain is serial), so unrolling overlaps their loads while the
+    // summation order stays identical. Guard keeps all 4 in range.
+    for (; blk + 3 * MIX_WARP < nb; blk += MIX_UNROLL * MIX_WARP) {
+        const int b0 = blk, b1 = blk + MIX_WARP;
+        const int b2 = blk + 2 * MIX_WARP, b3 = blk + 3 * MIX_WARP;
+        mix_block_accum(rowbase + (int64_t) b0 * MIX_BLOCK_BYTES, xc, b0 * MIX_QK, mode, book, acc);
+        mix_block_accum(rowbase + (int64_t) b1 * MIX_BLOCK_BYTES, xc, b1 * MIX_QK, mode, book, acc);
+        mix_block_accum(rowbase + (int64_t) b2 * MIX_BLOCK_BYTES, xc, b2 * MIX_QK, mode, book, acc);
+        mix_block_accum(rowbase + (int64_t) b3 * MIX_BLOCK_BYTES, xc, b3 * MIX_QK, mode, book, acc);
+    }
+    // Remainder: fewer than MIX_UNROLL strided blocks left for this lane.
+    for (; blk < nb; blk += MIX_WARP) {
+        mix_block_accum(rowbase + (int64_t) blk * MIX_BLOCK_BYTES, xc, blk * MIX_QK, mode, book, acc);
     }
     #pragma unroll
     for (int off = MIX_WARP/2; off > 0; off >>= 1) acc += __shfl_down(acc, off);
     if (lane == 0) y[(int64_t) col * y_col_stride + row] = acc;
+}
+
+// ---- stream-sync-free fused MoE matvec (mul_mat_id) ----
+// One warp per (output row, expert-slot, token). The expert index is read from
+// the routing `ids` tensor ON DEVICE, so the whole qtype-105 mul_mat_id runs
+// without the generic ggml_cuda_mul_mat_id fallback's host id-sort +
+// cudaStreamSynchronize (which serialises decode AND blocks CUDA-graph capture
+// of the FFN subgraph — the dominant cost of the wall-clock-timed ffn_compute).
+// The per-output-row math is the SAME flat fold as mix_matvec_rocmfp3_kernel
+// (identical mix_block_accum, identical summation order) for the resolved
+// expert, so every output element is bit-for-bit identical to the per-expert
+// slice path the fallback would take (the correctness gate hashes the greedy
+// output, so any reassociation would flip a token).
+__global__ void mix_matvec_rocmfp3_moe_kernel(
+        const uint8_t * __restrict__ data, size_t nb02,
+        const nv_bfloat16 * __restrict__ codebooks, const uint8_t * __restrict__ modes,
+        const float * __restrict__ src1, const int32_t * __restrict__ ids,
+        float * __restrict__ dst, int in, int out, int ne11,
+        int64_t ids_s0, int64_t ids_s1,       // element strides (int32) over slot, token
+        int64_t src1_s1, int64_t src1_s2,     // element strides (float) over ne11, token
+        int64_t dst_s1, int64_t dst_s2) {     // element strides (float) over slot, token
+    const int warps_per_block = blockDim.x / MIX_WARP;
+    const int warp  = blockIdx.x * warps_per_block + (threadIdx.x / MIX_WARP);
+    const int row0  = warp * 2;                 // two output rows per warp
+    const int lane  = threadIdx.x % MIX_WARP;
+    const int slot  = blockIdx.y;
+    const int token = blockIdx.z;
+    if (row0 >= out) return;
+    const bool two  = (row0 + 1) < out;         // false only for an odd-out tail warp
+    const int expert = ids[(int64_t) token * ids_s1 + (int64_t) slot * ids_s0];
+    const uint8_t     * edata   = data + (int64_t) expert * nb02;
+    const nv_bfloat16 * book    = codebooks + (int64_t) expert * 2 * 8;
+    const int           mode    = (int) modes[expert];
+    const int           nb      = in / MIX_QK;
+    const uint8_t     * rowbase0 = edata + (int64_t) row0 * nb * MIX_BLOCK_BYTES;
+    // For an odd tail warp (no row1) reuse row0's base so the loads stay in-bounds;
+    // acc1 is simply never written. out=hidden is even here so `two` is uniformly
+    // true across the whole warp (no divergence in the hot loop).
+    const uint8_t     * rowbase1 = two ? edata + (int64_t) (row0 + 1) * nb * MIX_BLOCK_BYTES
+                                       : rowbase0;
+    // src1 is [in, ne11, ntok]; the get_rows-equivalent row for (slot, token)
+    // is token*ne11 + slot%ne11 — i.e. token column + the slot%ne11 broadcast.
+    const float * xcol = src1 + (int64_t) token * src1_s2 + (int64_t) (slot % ne11) * src1_s1;
+    // Two output rows in one warp. Each row is folded by the SAME mix_block_accum
+    // that the single-row path uses (byte-identical inlined body, same fixed j
+    // order, same acc-add chain) so acc0/acc1 are bit-for-bit identical to the
+    // single-row kernel's output for those rows. The two calls per block share the
+    // same __restrict__ xcol + col0, so the compiler CSEs the strided activation
+    // loads to one issue per element — halving activation LSU issue on this partly
+    // load-instruction-bound matvec — WITHOUT reordering either row's summation.
+    float acc0 = 0.0f, acc1 = 0.0f;
+    int blk = lane;
+    for (; blk + 3 * MIX_WARP < nb; blk += MIX_UNROLL * MIX_WARP) {
+        const int b0 = blk, b1 = blk + MIX_WARP;
+        const int b2 = blk + 2 * MIX_WARP, b3 = blk + 3 * MIX_WARP;
+        mix_block_accum(rowbase0 + (int64_t) b0 * MIX_BLOCK_BYTES, xcol, b0 * MIX_QK, mode, book, acc0);
+        mix_block_accum(rowbase1 + (int64_t) b0 * MIX_BLOCK_BYTES, xcol, b0 * MIX_QK, mode, book, acc1);
+        mix_block_accum(rowbase0 + (int64_t) b1 * MIX_BLOCK_BYTES, xcol, b1 * MIX_QK, mode, book, acc0);
+        mix_block_accum(rowbase1 + (int64_t) b1 * MIX_BLOCK_BYTES, xcol, b1 * MIX_QK, mode, book, acc1);
+        mix_block_accum(rowbase0 + (int64_t) b2 * MIX_BLOCK_BYTES, xcol, b2 * MIX_QK, mode, book, acc0);
+        mix_block_accum(rowbase1 + (int64_t) b2 * MIX_BLOCK_BYTES, xcol, b2 * MIX_QK, mode, book, acc1);
+        mix_block_accum(rowbase0 + (int64_t) b3 * MIX_BLOCK_BYTES, xcol, b3 * MIX_QK, mode, book, acc0);
+        mix_block_accum(rowbase1 + (int64_t) b3 * MIX_BLOCK_BYTES, xcol, b3 * MIX_QK, mode, book, acc1);
+    }
+    for (; blk < nb; blk += MIX_WARP) {
+        mix_block_accum(rowbase0 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, book, acc0);
+        mix_block_accum(rowbase1 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, book, acc1);
+    }
+    #pragma unroll
+    for (int off = MIX_WARP/2; off > 0; off >>= 1) {
+        acc0 += __shfl_down(acc0, off);
+        acc1 += __shfl_down(acc1, off);
+    }
+    if (lane == 0) {
+        dst[(int64_t) token * dst_s2 + (int64_t) slot * dst_s1 + row0] = acc0;
+        if (two) dst[(int64_t) token * dst_s2 + (int64_t) slot * dst_s1 + row0 + 1] = acc1;
+    }
+}
+
+// Launch the sync-free MoE matvec for a qtype-105 mul_mat_id. Resolves the
+// tensor's registry entry (base/nb02/codebooks/modes for ALL experts) from vx;
+// the per-expert index is read on device. Returns false if the tensor is not
+// registered (caller keeps the generic fallback). ne11 is the src1 broadcast
+// dim (1 for decode). All *_s* are element strides (see kernel).
+bool ggml_cuda_rocmfp3_mix_mul_mat_id(
+        const void * vx, const float * src1, const int32_t * ids, float * dst,
+        int in, int out, int n_expert_used, int n_tokens, int ne11,
+        int64_t ids_s0, int64_t ids_s1,
+        int64_t src1_s1, int64_t src1_s2,
+        int64_t dst_s1, int64_t dst_s2, cudaStream_t stream) {
+    MixEntry e;
+    int expert0;
+    if (!mix_lookup(vx, e, expert0)) {
+        return false;  // not registered -> caller falls back to sort + dequant
+    }
+    const int warps_per_block = 2;               // 64 threads (mirror the mmvq path)
+    const int threads = warps_per_block * MIX_WARP;
+    // Two output rows per warp (register-blocked activation reuse), so a workgroup
+    // of `warps_per_block` warps covers 2*warps_per_block rows.
+    const int rows_per_block = 2 * warps_per_block;
+    dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);
+    hipLaunchKernelGGL(mix_matvec_rocmfp3_moe_kernel, grid, dim3(threads), 0, stream,
+        (const uint8_t *) e.base, e.nb02, e.codebooks, e.modes,
+        src1, ids, dst, in, out, ne11,
+        ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2);
+    return true;
+}
+
+bool ggml_cuda_rocmfp3_mix_registered(const void * vx) {
+    MixEntry e;
+    int expert;
+    return mix_lookup(vx, e, expert);
 }
 
 bool ggml_cuda_rocmfp3_mix_mul_mat_vec(
@@ -217,7 +380,12 @@ bool ggml_cuda_rocmfp3_mix_mul_mat_vec(
     // e.rotations[expert]) exactly as the dequant path will — same hook.
     const nv_bfloat16 * book = e.codebooks + (size_t) expert * 2 * 8;
     const uint8_t * mode_ptr = e.modes + expert;
-    const int warps_per_block = 4;               // 128 threads
+    // Launch-config-only occupancy lever (bit-exact: one warp still owns one
+    // row, per-row summation order unchanged). 2 warps/block (64 threads) is the
+    // finest grouping that keeps a sibling warp per block for latency hiding
+    // (1 warp/block regressed — attempt #1), while halving the workgroup size to
+    // give the scheduler finer packing/tail balance on this BW-bound matvec.
+    const int warps_per_block = 2;               // 64 threads
     const int threads = warps_per_block * MIX_WARP;
     dim3 grid((out + warps_per_block - 1) / warps_per_block, ncols, 1);
     hipLaunchKernelGGL(mix_matvec_rocmfp3_kernel, grid, dim3(threads), 0, stream,

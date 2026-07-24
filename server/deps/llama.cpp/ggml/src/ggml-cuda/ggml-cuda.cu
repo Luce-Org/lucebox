@@ -2852,6 +2852,31 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
     };
 
+    // qtype-105 (Q3_1_ROCMFP3_MIX) fused-down-expert MoE decode: run the whole
+    // mul_mat_id on device with the routing ids read in-kernel, avoiding the
+    // generic sort-based fallback below (which needs a host cudaStreamSynchronize
+    // + id-sort that serialises decode and disables CUDA-graph capture of the
+    // FFN subgraph). Bit-identical per output element to the fallback's
+    // per-expert-slice path. Gated to the strict single-token decode case
+    // (ne12 == 1), where the fallback also runs every used expert through the
+    // fused f32 single-expert kernel (tokens_per_expert <= 1) — so the output is
+    // bit-identical. Multi-token batches (prefill) fall through to the
+    // dequant->cuBLAS fallback, whose f16 round-trip we must NOT diverge from.
+    // Kept in sync with the [TAG_MUL_MAT_ID_CUDA_GRAPHS] usability check below.
+    if (src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX
+            && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            && ne12 == 1
+            && ggml_cuda_rocmfp3_mix_mul_mat_id(
+                src0->data, (const float *) src1->data, (const int32_t *) ids->data,
+                (float *) dst->data, (int) ne00, (int) ne01, (int) ids->ne[0],
+                (int) ne12, (int) ne11,
+                (int64_t) (ids->nb[0] / sizeof(int32_t)), (int64_t) (ids->nb[1] / sizeof(int32_t)),
+                (int64_t) (nb11 / sizeof(float)), (int64_t) (nb12 / sizeof(float)),
+                (int64_t) (nb1 / sizeof(float)), (int64_t) (nb2 / sizeof(float)),
+                ctx.stream())) {
+        return;
+    }
+
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
@@ -3638,16 +3663,25 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             const bool mmid_mmq_ok = ggml_is_quantized(node->src[0]->type) &&
                 ggml_cuda_should_use_mmq(node->src[0]->type, cc,
                                          node->src[1]->ne[2], node->src[0]->ne[2]);
+            // qtype-105 takes the stream-sync-free MoE path above (no host
+            // synchronize), so it is safe to capture. Mirror that path's gate
+            // exactly, incl. the registry check, so we never skip-disable while
+            // the runtime actually falls back to the sync path.
+            const bool mmid_rocmfp3_ok =
+                node->src[0]->type == GGML_TYPE_Q3_1_ROCMFP3_MIX &&
+                node->src[1]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+                node->src[1]->ne[2] == 1 &&
+                ggml_cuda_rocmfp3_mix_registered(node->src[0]->data);
             if (mmid_telemetry) {
                 std::fprintf(stderr,
                     "[dflash-mmid] event=graph name=%s type=%s ne11=%lld width=%lld "
-                    "mmvq_max=%d mmvq_ok=%d mmq_ok=%d node_eligible=%d\n",
+                    "mmvq_max=%d mmvq_ok=%d mmq_ok=%d rocmfp3_ok=%d node_eligible=%d\n",
                     node->name, ggml_type_name(node->src[0]->type),
                     (long long) node->src[1]->ne[1], (long long) node->ne[2],
-                    mmvq_mmid_max, mmid_mmvq_ok, mmid_mmq_ok,
-                    mmid_mmvq_ok || mmid_mmq_ok);
+                    mmvq_mmid_max, mmid_mmvq_ok, mmid_mmq_ok, mmid_rocmfp3_ok,
+                    mmid_mmvq_ok || mmid_mmq_ok || mmid_rocmfp3_ok);
             }
-            if (!mmid_mmvq_ok && !mmid_mmq_ok) {
+            if (!mmid_mmvq_ok && !mmid_mmq_ok && !mmid_rocmfp3_ok) {
                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958

@@ -41,3 +41,21 @@ bool ggml_cuda_rocmfp3_mix_mul_mat_vec(
         const void * vx, const float * x, float * y,
         int in, int out, int ncols,
         int64_t x_col_stride, int64_t y_col_stride, cudaStream_t stream);
+
+// Stream-sync-free fused MoE matvec for a qtype-105 mul_mat_id (decode). Reads
+// the routing `ids` on device so the whole op runs with no host id-sort +
+// cudaStreamSynchronize (the generic ggml_cuda_mul_mat_id fallback needs both),
+// which also lets the decode FFN subgraph be CUDA-graph captured. Bit-identical
+// per output element to the fallback's per-expert-slice path. vx is the whole
+// MoE tensor base (registry resolves per-expert codebook/mode on device). All
+// *_s* args are element strides. Returns false if vx is not registered.
+bool ggml_cuda_rocmfp3_mix_mul_mat_id(
+        const void * vx, const float * src1, const int32_t * ids, float * dst,
+        int in, int out, int n_expert_used, int n_tokens, int ne11,
+        int64_t ids_s0, int64_t ids_s1,
+        int64_t src1_s1, int64_t src1_s2,
+        int64_t dst_s1, int64_t dst_s2, cudaStream_t stream);
+
+// True if a qtype-105 tensor base is registered (used by the graph-usability
+// check to confirm the sync-free mul_mat_id path will handle the node).
+bool ggml_cuda_rocmfp3_mix_registered(const void * vx);
