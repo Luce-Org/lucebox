@@ -10,7 +10,9 @@ backend (qwen35, qwen3, gemma4, laguna).
 
 | Method | Path | Description | Status |
 |--------|------|-------------|--------|
-| GET | `/health`, `/` | Health check | ✅ |
+| GET | `/health` | Unauthenticated liveness check | ✅ |
+| GET | `/ready` | Unauthenticated readiness check | ✅ |
+| GET | `/` | Backwards-compatible authenticated health alias | ✅ |
 | GET | `/v1/models` | List available models | ✅ |
 | POST | `/v1/chat/completions` | OpenAI Chat Completions | ✅ |
 | POST | `/v1/messages` | Anthropic Messages | ✅ |
@@ -174,7 +176,9 @@ When `temperature = 0`:
 | Prefix cache (disk) | ✅ | Persistent across restarts |
 | PFlash (speculative prefill) | ✅ | Compresses long prompts |
 | Client disconnect detection | ✅ | Aborts generation on disconnect |
-| CORS | ✅ | Enabled by default |
+| Bearer authentication | ✅ | Optional via `DFLASH_API_KEY` or `--api-key-file`; `/health` and `/ready` are exempt |
+| CORS | ✅ | Disabled by default; exact origins via repeatable `--cors-allow-origin` |
+| Admission limits | ✅ | Bounded headers, bodies, active connections, and pending inference queue |
 | Tool memory | ✅ | Caches tool call results |
 
 ---

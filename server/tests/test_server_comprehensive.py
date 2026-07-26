@@ -867,8 +867,8 @@ class TestSuite:
             self._check("invalid JSON body", False, str(e))
 
     def test_options_cors(self):
-        """OPTIONS request should return CORS headers."""
-        print("\n[EC-6] Edge case — CORS OPTIONS preflight")
+        """CORS is disabled unless the server was given an allowlist."""
+        print("\n[EC-6] Edge case — CORS disabled by default")
         try:
             req = urllib.request.Request(
                 self.base + "/v1/chat/completions",
@@ -878,8 +878,8 @@ class TestSuite:
             headers = dict(resp.headers)
             self._check("returns 200",
                          resp.status == 200 or resp.status == 204)
-            self._check("has Access-Control-Allow-Origin",
-                         "Access-Control-Allow-Origin" in headers,
+            self._check("does not emit Access-Control-Allow-Origin",
+                         "Access-Control-Allow-Origin" not in headers,
                          f"headers: {list(headers.keys())}")
         except Exception as e:
             self._check("CORS OPTIONS", False, str(e))

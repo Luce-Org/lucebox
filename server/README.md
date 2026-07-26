@@ -146,7 +146,7 @@ The default draft path is discovered under `models/draft/`. Scripts prefer `dfla
 ## Native C++ HTTP server
 
 `dflash_server` serves the same client-facing local API surface used by the
-harnesses. It supports `/health`,
+harnesses. It listens on `127.0.0.1` by default and supports `/health`, `/ready`,
 `/v1/models`, OpenAI Chat Completions including streaming and tool metadata,
 OpenAI Responses for Codex, Anthropic Messages for Claude Code, and Open WebUI
 model metadata.
@@ -209,6 +209,34 @@ python3 ../harness/client_test_runner.py probe \
   --url http://127.0.0.1:18080 \
   --clients all
 ```
+
+### Network and API security
+
+The server is local-only by default: it binds `127.0.0.1`, sends no CORS
+headers, and bounds request headers, bodies, active connections, and the
+pending inference queue. `/health` and `/ready` remain unauthenticated for
+orchestrator probes. Every other endpoint requires the configured Bearer key.
+
+For authenticated LAN exposure, prefer a key file with restrictive filesystem
+permissions:
+
+```bash
+./build/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf \
+  --host 0.0.0.0 --api-key-file /run/secrets/dflash-api-key \
+  --cors-allow-origin https://console.example.net
+```
+
+`DFLASH_API_KEY` is also supported when no `--api-key-file` is passed. Key
+values are never printed in the startup banner or request logs. Browser origins
+must be allowlisted exactly; wildcard CORS is not supported. For an isolated,
+trusted network that cannot use authentication,
+`--allow-unauthenticated-nonloopback` is the explicit escape hatch and prints a
+startup warning.
+
+Admission defaults can be adjusted with `--max-header-bytes`,
+`--max-body-bytes`, `--max-active-connections`, and `--max-queued-requests`.
+Passing zero disables the corresponding bound. Oversized requests receive 413;
+connection and queue saturation receive 429.
 
 On fragile external RTX links, use the same conservative NVIDIA profile as the
 RTX mixed-hardware notes before running long prompts.

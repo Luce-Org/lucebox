@@ -29,6 +29,10 @@ Untagged variables are operational tuning knobs.
 |---|---|
 | `DFLASH_HOST` | Server bind host. |
 | `DFLASH_PORT` | Server bind port. |
+| `DFLASH_API_KEY` | Inbound Bearer key. Prefer a mounted key file for containers. |
+| `DFLASH_API_KEY_FILE` | Entrypoint mapping for `--api-key-file`. |
+| `DFLASH_CORS_ALLOW_ORIGIN` | Entrypoint mapping for one exact browser origin. |
+| `DFLASH_ALLOW_UNAUTHENTICATED_NONLOOPBACK` | Entrypoint mapping for the explicit unsafe non-loopback escape hatch. |
 | `DFLASH_BIN` / `DFLASH_SERVER_BIN` | Path to the server binary (harness/scripts). |
 | `DFLASH_BIN_AR` | Alternate/AR binary path for benchmarks. |
 | `DFLASH_DIR` | Base working directory. |

@@ -265,6 +265,8 @@ RUN chmod -R a+rX /opt/lucebox-hub/.venv /opt/lucebox-hub /opt/uv
 # Models live in server/models/ — bind-mount or volume them in.
 # Example:
 #   docker run --rm --gpus all -p 8080:8080 \
+#       -v "$PWD/dflash-api-key:/run/secrets/dflash-api-key:ro" \
+#       -e DFLASH_API_KEY_FILE=/run/secrets/dflash-api-key \
 #       -v "$PWD/server/models:/opt/lucebox-hub/server/models" \
 #       lucebox-hub
 # The VOLUME declaration keeps the path out of the image layer cache; the
@@ -275,6 +277,10 @@ ENV DFLASH_HOST=0.0.0.0 \
     DFLASH_PORT=8080 \
     DFLASH_BIN=/opt/lucebox-hub/server/build/test_dflash \
     DFLASH_SERVER_BIN=/opt/lucebox-hub/server/build/dflash_server
+
+# The public container bind fails closed unless DFLASH_API_KEY or the
+# entrypoint's DFLASH_API_KEY_FILE is configured. Trusted networks can opt in
+# explicitly with DFLASH_ALLOW_UNAUTHENTICATED_NONLOOPBACK=1.
 
 EXPOSE 8080
 
