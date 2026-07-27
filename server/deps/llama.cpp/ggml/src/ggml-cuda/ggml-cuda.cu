@@ -2795,6 +2795,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
                 (int64_t) (dst->nb[1] / sizeof(float)), ctx.stream())) {
             return;
         }
+    }
 
     if (mix_fused_on && is_rocmfp2_mix && !split
             && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
