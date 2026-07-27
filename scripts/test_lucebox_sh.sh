@@ -1061,11 +1061,29 @@ test_custom_lucebox_home_is_mounted_and_forwarded() {
 test_custom_lucebox_home_is_mounted_and_forwarded \
     "custom LUCEBOX_HOME is mounted + forwarded to orchestrator"
 
+test_serve_fallback_forwards_config_env() {
+    local label="$1" sandbox config_home out
+    sandbox=$(mktemp -d -t lucebox-serve-fallback.XXXXXX)
+    config_home=$(mktemp -d -t lucebox-config.XXXXXX)
+    _make_docker_shim "$sandbox" 0
+    out=$(TEST_LUCEBOX_HOME="$config_home" \
+        _run_wrapper_capture_docker "$sandbox" serve || true)
+    rm -rf "$sandbox" "$config_home"
+    if ! grep -qF "LUCEBOX_HOME=$config_home" <<<"$out" \
+       || ! grep -qF "HOME=$sandbox" <<<"$out"; then
+        report fail "$label" "fallback server omitted HOME/config env: $(tail -3 <<<"$out")"
+        return
+    fi
+    report ok "$label"
+}
+test_serve_fallback_forwards_config_env \
+    "serve fallback forwards HOME + LUCEBOX_HOME"
+
 test_run_route_preserves_tty() {
-    local label="$1" sandbox out
+    local label="$1" sandbox out rc
     sandbox=$(mktemp -d -t lucebox-route-tty.XXXXXX)
     _make_docker_shim "$sandbox" 0
-    out=$(python3 - "$SCRIPT" "$sandbox" <<'PY' 2>/dev/null
+    if out=$(timeout 15 python3 - "$SCRIPT" "$sandbox" <<'PY' 2>/dev/null
 import os
 import pty
 import sys
@@ -1105,7 +1123,14 @@ except OSError:
 os.waitpid(pid, 0)
 sys.stdout.write(buf.decode(errors="replace"))
 PY
-)
+    ); then
+        :
+    else
+        rc=$?
+        rm -rf "$sandbox"
+        report fail "$label" "PTY route timed out or failed (rc=$rc)"
+        return
+    fi
     rm -rf "$sandbox"
     if ! grep -qE '^DOCKER_INVOKED run .* -it( |$)' <<<"${out//$'\r'/}"; then
         report fail "$label" "PTY route did not preserve docker -it: $(head -3 <<<"$out")"
