@@ -101,7 +101,10 @@ def _resolve_model_files(cfg: Config) -> tuple[str, str, str]:
                 draft = pres.draft_file
             if not draft and pres.speculator_dir:
                 spec_path = cfg.models_dir / "draft" / pres.speculator_dir
-                if spec_path.is_dir() or spec_path.is_symlink():
+                # is_dir() follows valid directory symlinks. It also rejects
+                # dangling links and links to files, which cannot satisfy the
+                # speculator-directory contract.
+                if spec_path.is_dir():
                     draft_dir = pres.speculator_dir
     return target, draft, draft_dir
 

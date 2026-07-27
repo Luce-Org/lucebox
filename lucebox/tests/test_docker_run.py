@@ -205,6 +205,25 @@ def test_resolve_model_files_no_preset_no_override(tmp_path: Path) -> None:
     assert docker_run._resolve_model_files(cfg) == ("", "", "")
 
 
+@pytest.mark.parametrize("invalid_target", ["file", "missing"])
+def test_resolve_model_files_ignores_invalid_speculator_symlink(
+    invalid_target: str, tmp_path: Path
+) -> None:
+    draft_root = tmp_path / "draft"
+    draft_root.mkdir()
+    target = tmp_path / "external-speculator"
+    if invalid_target == "file":
+        target.write_bytes(b"not a directory")
+    (draft_root / "laguna-xs2-speculator").symlink_to(
+        target, target_is_directory=invalid_target == "missing"
+    )
+    cfg = Config(models_dir=tmp_path, model=ModelMeta(preset="laguna-xs.2"))
+
+    _, _, draft_dir = docker_run._resolve_model_files(cfg)
+
+    assert draft_dir == ""
+
+
 # ── server_run_spec ──────────────────────────────────────────────────────────
 
 
@@ -279,6 +298,31 @@ def test_server_run_spec_resolves_symlinked_model_parent(tmp_path: Path) -> None
         read_only=True,
     ) in spec.volumes
     assert _env(spec)["DFLASH_TARGET"] == "/opt/lucebox-resolved/target/nested.gguf"
+
+
+def test_server_run_spec_mounts_symlinked_speculator_directory_read_only(
+    tmp_path: Path,
+) -> None:
+    models = tmp_path / "models"
+    draft_root = models / "draft"
+    external = tmp_path / "external-speculator"
+    draft_root.mkdir(parents=True)
+    external.mkdir()
+    (external / "model.safetensors").write_bytes(b"speculator")
+    (draft_root / "laguna-xs2-speculator").symlink_to(
+        external, target_is_directory=True
+    )
+
+    spec = docker_run.server_run_spec(
+        Config(models_dir=models, model=ModelMeta(preset="laguna-xs.2"))
+    )
+
+    assert docker_run.BindMount(
+        str(external),
+        "/opt/lucebox-resolved/draft-dir",
+        read_only=True,
+    ) in spec.volumes
+    assert _env(spec)["DFLASH_DRAFT"] == "/opt/lucebox-resolved/draft-dir"
 
 
 def test_server_run_spec_rejects_model_path_traversal(tmp_path: Path) -> None:
