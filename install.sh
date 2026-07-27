@@ -36,43 +36,13 @@ die()  { printf '%s[install] ✗%s %s\n' "$C_ERR" "$C_RST" "$*" >&2; exit 1; }
 
 command -v curl >/dev/null 2>&1 || die "curl is required (apt-get install curl)"
 
-# ── fetch ─────────────────────────────────────────────────────────────────
-tmp=$(mktemp -t lucebox.XXXXXX) || die "couldn't create temp file"
-# shellcheck disable=SC2064  # we want $tmp expanded now, not at trap time
-trap "rm -f '$tmp' '$tmp.bak'" EXIT
-info "fetching $LUCEBOX_INSTALL_URL"
-curl -fsSL "$LUCEBOX_INSTALL_URL" -o "$tmp" \
-    || die "download failed from $LUCEBOX_INSTALL_URL"
-
-# ── sanity check ──────────────────────────────────────────────────────────
-# Refuse to install something that isn't recognizably lucebox.sh. Catches
-# 404 pages, redirects to HTML, and accidental URL typos.
-head -1 "$tmp" | grep -q '^#!/usr/bin/env bash$' \
-    || die "downloaded file does not look like a bash script (got: $(head -1 "$tmp"))"
-grep -q '^VERSION=' "$tmp" \
-    || die "downloaded file is missing VERSION marker — not lucebox.sh?"
-
 # ── decide what gets baked in as the persisted channel ───────────────────
-# `lucebox update` reads LUCEBOX_INSTALLED_FROM from the installed copy and
-# re-fetches from it. Persisting a SHA-pinned URL is a footgun — every
-# future update would re-install the same frozen SHA forever, defeating
-# the point of `update`. So:
-#
-#   1. If $LUCEBOX_INSTALL_CHANNEL is set, that's the persisted URL
-#      (caller takes responsibility for picking a real branch URL).
-#   2. Else if LUCEBOX_INSTALL_URL has a 40-char hex SHA segment, refuse
-#      to persist it — tell the user to set LUCEBOX_INSTALL_CHANNEL.
-#      Common case: someone curl'd from /raw/<sha>/ to bypass a stale CDN
-#      cache during dev; they meant for updates to track the branch.
-#   3. Else persist LUCEBOX_INSTALL_URL as-is (branch or canonical main).
+# Do this before fetching so a SHA-pinned URL is refused for the intended
+# reason even when that remote object is unavailable.
 channel_url="${LUCEBOX_INSTALL_CHANNEL:-}"
 if [ -z "$channel_url" ]; then
-    # Match a full 40-char hex SHA in the URL path, not the broader
-    # {7,40} range — a 7-39 char hex segment is more likely a branch
-    # name shaped like a short SHA (e.g. `feat/abc1234-hotfix`) than an
-    # actual SHA-pin. Keeping the gate at exactly 40 chars matches what
-    # `git rev-parse HEAD` emits and what `/raw/<sha>/` URLs from
-    # GitHub's CDN actually carry.
+    # A full 40-char SHA is what `git rev-parse HEAD` and GitHub raw URLs use.
+    # Shorter hex-like path segments may be branch names, so don't reject them.
     if [[ "$LUCEBOX_INSTALL_URL" =~ /[0-9a-fA-F]{40}/[^/]+\.sh$ ]]; then
         die "$(cat <<EOM
 LUCEBOX_INSTALL_URL is SHA-pinned ($LUCEBOX_INSTALL_URL).
@@ -89,6 +59,22 @@ EOM
     fi
     channel_url="$LUCEBOX_INSTALL_URL"
 fi
+
+# ── fetch ─────────────────────────────────────────────────────────────────
+tmp=$(mktemp -t lucebox.XXXXXX) || die "couldn't create temp file"
+# shellcheck disable=SC2064  # we want $tmp expanded now, not at trap time
+trap "rm -f '$tmp' '$tmp.baked'" EXIT
+info "fetching $LUCEBOX_INSTALL_URL"
+curl --connect-timeout 10 --max-time 120 -fsSL "$LUCEBOX_INSTALL_URL" -o "$tmp" \
+    || die "download failed from $LUCEBOX_INSTALL_URL"
+
+# ── sanity check ──────────────────────────────────────────────────────────
+# Refuse to install something that isn't recognizably lucebox.sh. Catches
+# 404 pages, redirects to HTML, and accidental URL typos.
+head -1 "$tmp" | grep -q '^#!/usr/bin/env bash$' \
+    || die "downloaded file does not look like a bash script (got: $(head -1 "$tmp"))"
+grep -q '^VERSION=' "$tmp" \
+    || die "downloaded file is missing VERSION marker — not lucebox.sh?"
 
 # Bake the channel URL into the file. Use a `|` delimiter since URLs
 # contain `/`. The line is expected to exist in lucebox.sh with a `:-`
@@ -107,7 +93,7 @@ esac
 escaped_url=$(printf '%s' "$channel_url" | sed 's/[\\&|]/\\&/g')
 sed "s|^LUCEBOX_INSTALLED_FROM=.*|LUCEBOX_INSTALLED_FROM=\"$escaped_url\"|" "$tmp" > "$tmp.baked"
 mv "$tmp.baked" "$tmp"
-grep -q "^LUCEBOX_INSTALLED_FROM=\"$escaped_url\"$" "$tmp" \
+grep -Fqx "LUCEBOX_INSTALLED_FROM=\"$channel_url\"" "$tmp" \
     || die "failed to bake install source into the downloaded script"
 
 # ── install ───────────────────────────────────────────────────────────────

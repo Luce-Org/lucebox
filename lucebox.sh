@@ -101,7 +101,29 @@ _lucebox_config_get() {
         /=/ {
             if (current != want_section) next
             line = $0
-            sub(/#.*$/, "", line)
+            # Strip a TOML comment only when # is outside a quoted string.
+            # Paths and image tags may legitimately contain #.
+            in_quote = 0
+            escaped = 0
+            for (i = 1; i <= length(line); i++) {
+                ch = substr(line, i, 1)
+                if (escaped) {
+                    escaped = 0
+                    continue
+                }
+                if (in_quote && ch == "\\") {
+                    escaped = 1
+                    continue
+                }
+                if (ch == "\"") {
+                    in_quote = !in_quote
+                    continue
+                }
+                if (ch == "#" && !in_quote) {
+                    line = substr(line, 1, i - 1)
+                    break
+                }
+            }
             eq = index(line, "=")
             if (eq == 0) next
             k = substr(line, 1, eq - 1)
@@ -162,6 +184,7 @@ CONTAINER_NAME=$(_lucebox_resolve "${LUCEBOX_CONTAINER:-}" runtime.container_nam
 DEFAULT_PORT=$(_lucebox_resolve "${LUCEBOX_PORT:-}" runtime.port "8080")
 DEFAULT_MODELS_DIR=$(_lucebox_resolve "${LUCEBOX_MODELS:-}" paths.models "${XDG_DATA_HOME:-$HOME/.local/share}/lucebox/models")
 IMAGE_BASE=$(_lucebox_resolve "${LUCEBOX_IMAGE:-}" image.registry "$(_lucebox_derive_image "$LUCEBOX_INSTALLED_FROM")")
+CONFIG_HOME="${LUCEBOX_HOME:-$HOME/.lucebox}"
 
 # ── LUCEBOX_HOST_* safe defaults (belt-and-suspenders) ────────────────────
 # `set -u` makes any unbound LUCEBOX_HOST_* read fatal. Historically this has
@@ -239,7 +262,7 @@ _parse_amd_smi_csv() {
     awk -F',' '
         NR == 1 {
             for (i = 1; i <= NF; i++) {
-                key = $i
+                key = tolower($i)
                 gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", key)
                 col[key] = i
             }
@@ -266,7 +289,7 @@ _parse_rocm_smi_csv() {
     awk -F',' '
         NR == 1 {
             for (i = 1; i <= NF; i++) {
-                key = $i
+                key = tolower($i)
                 gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", key)
                 col[key] = i
             }
@@ -274,9 +297,9 @@ _parse_rocm_smi_csv() {
         }
         {
             dev = $(col["device"])
-            bytes = $(col["VRAM Total Memory (B)"])
-            name = $(col["Card Series"])
-            arch = $(col["GFX Version"])
+            bytes = $(col["vram total memory (b)"])
+            name = $(col["card series"])
+            arch = $(col["gfx version"])
             gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", dev)
             gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", bytes)
             gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", name)
@@ -559,9 +582,9 @@ pick_variant() {
 _variant_is_rocm() {
     # Variant names are not limited to the moving `rocm` tag. Releases and
     # CI produce tags such as `0.3.0-rocm` and `pr-335-rocm`; treat any tag
-    # containing the backend marker as ROCm. Spell out case-insensitivity
-    # instead of using Bash 4's `${value,,}` so host-only commands such as
-    # `check` keep working under the older Bash bundled with macOS too.
+    # containing the backend marker as ROCm. Spell out case-insensitivity so
+    # host-only commands such as `check` reach no Bash-4-only expansion. Full
+    # container dispatch still requires Bash 4.3+ for the argv namerefs below.
     case "$1" in
         *[Rr][Oo][Cc][Mm]*) return 0 ;;
         *)                  return 1 ;;
@@ -686,6 +709,7 @@ _append_scalar_env() {
     _arr+=(-e "LUCEBOX_PORT=$DEFAULT_PORT")
     _arr+=(-e "LUCEBOX_CONTAINER=$CONTAINER_NAME")
     _arr+=(-e "LUCEBOX_MODELS=$DEFAULT_MODELS_DIR")
+    _arr+=(-e "LUCEBOX_HOME=$CONFIG_HOME")
     [ -n "${HF_TOKEN:-}" ] && _arr+=(-e "HF_TOKEN=$HF_TOKEN")
     return 0
 }
@@ -728,9 +752,9 @@ _set_tty_flags() {  # usage: _set_tty_flags arrayname
 }
 
 build_orchestrator_argv() {
-    local variant="$1"; shift
-    local tty=()
-    _set_tty_flags tty
+    local variant="$1" caller_has_tty="$2"; shift 2
+    local tty=(-i)
+    [ "$caller_has_tty" = "1" ] && tty=(-it)
     local argv=(docker run --rm "${tty[@]}")
     _append_gpu_args argv "$variant"
     argv+=(--name "${CONTAINER_NAME}-cli-$$")
@@ -743,7 +767,11 @@ build_orchestrator_argv() {
     # when actually needed; pulling that mount when the host talks to
     # docker over TCP/SSH is fine.
     if [ -S "$DOCKER_SOCK_PATH" ]; then
-        argv+=(--group-add "$(stat -c '%g' "$DOCKER_SOCK_PATH")")
+        local socket_gid
+        socket_gid=$(stat -c '%g' "$DOCKER_SOCK_PATH" 2>/dev/null \
+            || stat -f '%g' "$DOCKER_SOCK_PATH" 2>/dev/null \
+            || echo "")
+        [ -n "$socket_gid" ] && argv+=(--group-add "$socket_gid")
         argv+=(-v "$DOCKER_SOCK_PATH:/var/run/docker.sock")
     fi
     argv+=(-v "$HOME:$HOME")
@@ -753,7 +781,12 @@ build_orchestrator_argv() {
     # points XDG_DATA_HOME outside $HOME.
     mkdir -p "$DEFAULT_MODELS_DIR"
     argv+=(-v "$DEFAULT_MODELS_DIR:$DEFAULT_MODELS_DIR")
-    argv+=(-w "$PWD")
+    # A custom LUCEBOX_HOME may sit outside $HOME, so mount it explicitly.
+    # Use an image-owned working directory: callers may invoke lucebox from
+    # /tmp or another path that is not bind-mounted into the container.
+    mkdir -p "$CONFIG_HOME"
+    argv+=(-v "$CONFIG_HOME:$CONFIG_HOME")
+    argv+=(-w /opt/lucebox-hub)
     argv+=(-e "HOME=$HOME")
     # Host facts — Python side reads these instead of reprobing.
     _append_host_env argv
@@ -836,7 +869,7 @@ cmd_serve() {
     esac
 
     local orch_argv server_argv
-    mapfile -t orch_argv < <(build_orchestrator_argv "$variant" print-serve-argv)
+    mapfile -t orch_argv < <(build_orchestrator_argv "$variant" 0 print-serve-argv)
 
     if mapfile -t server_argv < <("${orch_argv[@]}" 2>/dev/null) \
        && [ "${#server_argv[@]}" -gt 0 ] \
@@ -859,6 +892,7 @@ cmd_serve() {
         --name "$CONTAINER_NAME"
         -p "$DEFAULT_PORT:8080"
         -v "$HOME:$HOME"
+        -v "$CONFIG_HOME:$CONFIG_HOME"
         -v "$fallback_models:/opt/lucebox-hub/server/models")
     _append_gpu_args fallback_argv "$variant"
     _append_host_env fallback_argv
@@ -944,6 +978,7 @@ Environment=LUCEBOX_VARIANT=$variant
 Environment=LUCEBOX_PORT=$DEFAULT_PORT
 Environment=LUCEBOX_CONTAINER=$CONTAINER_NAME
 Environment=LUCEBOX_MODELS=$DEFAULT_MODELS_DIR
+Environment=LUCEBOX_HOME=$CONFIG_HOME
 ExecStartPre=-$docker_bin rm -f $CONTAINER_NAME
 ExecStart=$SCRIPT_PATH serve
 ExecStop=$docker_bin stop -t 30 $CONTAINER_NAME
@@ -1362,8 +1397,11 @@ cmd_in_container() {
     local variant
     variant=$(pick_variant)
     require_host_prereqs "$variant"
-    local argv
-    mapfile -t argv < <(build_orchestrator_argv "$variant" "$@")
+    local caller_has_tty=0 argv
+    if [ -t 0 ] && [ -t 1 ]; then
+        caller_has_tty=1
+    fi
+    mapfile -t argv < <(build_orchestrator_argv "$variant" "$caller_has_tty" "$@")
     exec "${argv[@]}"
 }
 
@@ -1404,7 +1442,7 @@ cmd_exec_in_container() {
     _set_tty_flags tty
     local argv=(docker exec "${tty[@]}")
     argv+=(--user "$(id -u):$(id -g)")
-    argv+=(-w "$PWD")
+    argv+=(-w /opt/lucebox-hub)
     argv+=(-e "HOME=$HOME")
     _append_host_env argv
     _append_scalar_env argv "$variant"

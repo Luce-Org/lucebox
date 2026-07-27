@@ -26,7 +26,7 @@ from collections.abc import Callable
 from dataclasses import asdict, replace
 from datetime import UTC
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 import tomli_w
 
@@ -55,11 +55,11 @@ def default_config_path() -> Path:
 
 # ── dotted-key registry ────────────────────────────────────────────────────
 
-def _cast_prefill_mode(v: Any) -> str:
+def _cast_prefill_mode(v: Any) -> Literal["off", "auto", "always"]:
     s = str(v)
     if s not in {"off", "auto", "always"}:
         raise ValueError(f"prefill_mode must be off/auto/always, got {s!r}")
-    return s
+    return cast(Literal["off", "auto", "always"], s)
 
 
 def _cast_bool(v: Any) -> bool:
@@ -236,12 +236,12 @@ def _from_dict(raw: dict[str, Any]) -> Config:
     dflash = DflashRuntime(
         budget=int(df.get("budget", 22)),
         max_ctx=int(df.get("max_ctx", 16384)),
-        lazy=bool(df.get("lazy", False)),
+        lazy=_cast_bool(df.get("lazy", False)),
         prefix_cache_slots=int(df.get("prefix_cache_slots", 0)),
         prefill_cache_slots=int(df.get("prefill_cache_slots", 0)),
         cache_type_k=str(df.get("cache_type_k", "")),
         cache_type_v=str(df.get("cache_type_v", "")),
-        prefill_mode=df.get("prefill_mode", "off"),
+        prefill_mode=_cast_prefill_mode(df.get("prefill_mode", "off")),
         prefill_keep_ratio=float(df.get("prefill_keep_ratio", 0.05)),
         prefill_threshold=int(df.get("prefill_threshold", 32000)),
         prefill_drafter=str(df.get("prefill_drafter", "")),
@@ -249,7 +249,7 @@ def _from_dict(raw: dict[str, Any]) -> Config:
         fa_window=int(df.get("fa_window", 0)),
         think_soft_close_min_ratio=float(
             df.get("think_soft_close_min_ratio", 0.0)),
-        debug_thinking_logits=bool(df.get("debug_thinking_logits", False)),
+        debug_thinking_logits=_cast_bool(df.get("debug_thinking_logits", False)),
     )
 
     host_raw = raw.get("host", {})
@@ -357,6 +357,11 @@ def seed_dflash_from_host(host: HostFacts, *, path: Path | None = None) -> bool:
     import lucebox.autotune as autotune_mod
 
     path = path or default_config_path()
+    # Preserve the normal load() migration contract even when this helper is
+    # called directly. Otherwise creating a fresh config.toml here would make
+    # an adjacent legacy config.env invisible to every future load.
+    if not path.exists() and path.with_suffix(".env").exists():
+        load(path)
     doc = load_doc(path)
     if "dflash" in doc:
         return False

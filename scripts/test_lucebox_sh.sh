@@ -85,8 +85,11 @@ report() {
 assert_runs() {
     local label="$1" cmd="$2" expect="${3:-}"
     local out rc
-    out=$(NO_COLOR=1 bash -c "$cmd" 2>&1)
-    rc=$?
+    if out=$(NO_COLOR=1 bash -c "$cmd" 2>&1); then
+        rc=0
+    else
+        rc=$?
+    fi
     if [ "$rc" -ne 0 ]; then
         report fail "$label" "exit $rc; output: $(printf '%s' "$out" | head -3)"
         return
@@ -337,6 +340,7 @@ STUB
         "Environment=LUCEBOX_VARIANT=" \
         "Environment=LUCEBOX_PORT=" \
         "Environment=LUCEBOX_MODELS=" \
+        "Environment=LUCEBOX_HOME=" \
         "SuccessExitStatus=143" \
         ; do
         grep -qF "$needle" "$unit_path" || missing="$missing $needle"
@@ -730,7 +734,7 @@ port = 9090
 container_name = "luce-test"
 
 [paths]
-models = "/srv/models"
+models = "/srv/models#fast" # an actual TOML comment
 
 [dflash]
 budget = 22
@@ -745,7 +749,7 @@ TOML
         "|image.variant|cuda12|cuda13"
         "|runtime.port|8080|9090"
         "|runtime.container_name|lucebox|luce-test"
-        "|paths.models|/var/lib/lucebox|/srv/models"
+        "|paths.models|/var/lib/lucebox|/srv/models#fast"
         "OVERRIDE|image.registry|ghcr.io/luce-org/lucebox-hub|OVERRIDE"
         "|missing.key|fallback-default|fallback-default"
     )
@@ -822,14 +826,14 @@ test_cmd_start_already_active_shortcircuit "lucebox start has already-active + r
 # forever. With CHANNEL set, the bake-in uses the channel URL, not the
 # fetch URL.
 test_install_sha_pin_refusal_and_channel_override() {
-    local label="$1" tmp got rc
+    local label="$1" tmp got out rc
     tmp=$(mktemp -d -t lucebox-sha.XXXXXX)
 
     # Case 1: SHA-pinned URL without CHANNEL → must refuse
-    LUCEBOX_INSTALL_URL="https://raw.githubusercontent.com/easel/lucebox-hub/abc1234567/lucebox.sh" \
-    LUCEBOX_INSTALL_DEST="$tmp/lucebox1" \
-    NO_COLOR=1 \
-        bash "$INSTALLER" >/dev/null 2>&1 && rc=0 || rc=$?
+    out=$(LUCEBOX_INSTALL_URL="https://raw.githubusercontent.com/easel/lucebox-hub/0123456789abcdef0123456789abcdef01234567/lucebox.sh" \
+        LUCEBOX_INSTALL_DEST="$tmp/lucebox1" \
+        NO_COLOR=1 \
+        bash "$INSTALLER" 2>&1) && rc=0 || rc=$?
     if [ "$rc" -eq 0 ]; then
         rm -rf "$tmp"
         report fail "$label" "SHA-pinned URL without CHANNEL should have refused (rc=$rc, got success)"
@@ -838,6 +842,11 @@ test_install_sha_pin_refusal_and_channel_override() {
     if [ -f "$tmp/lucebox1" ]; then
         rm -rf "$tmp"
         report fail "$label" "SHA-pinned URL refusal still wrote $tmp/lucebox1"
+        return
+    fi
+    if ! grep -qF 'is SHA-pinned' <<<"$out"; then
+        rm -rf "$tmp"
+        report fail "$label" "did not reach SHA-pin refusal branch: $(head -3 <<<"$out")"
         return
     fi
 
@@ -952,7 +961,7 @@ _run_wrapper_capture_docker() {
     HOME="$sandbox" \
     XDG_CONFIG_HOME="$sandbox/.config" \
     XDG_DATA_HOME="$sandbox/.local/share" \
-    LUCEBOX_HOME="$sandbox/.lucebox" \
+    LUCEBOX_HOME="${TEST_LUCEBOX_HOME:-$sandbox/.lucebox}" \
     PATH="$shim_dir:$PATH" \
     LUCEBOX_HOST_HAS_DOCKER=1 \
     LUCEBOX_HOST_HAS_CTK=runtime \
@@ -1001,6 +1010,10 @@ test_routes_to_exec_when_running() {
         report fail "$label" "exec argv missing 'LUCEBOX_IMAGE=' scalar env; got: $(head -3 <<<"$out")"
         return
     fi
+    if ! grep -q -- '-w /opt/lucebox-hub' <<<"$out"; then
+        report fail "$label" "exec argv uses a caller-dependent working directory: $(head -3 <<<"$out")"
+        return
+    fi
     report ok "$label"
 }
 test_routes_to_exec_when_running "config get routes to docker exec when container running"
@@ -1022,6 +1035,85 @@ test_routes_to_run_when_not_running() {
     report ok "$label"
 }
 test_routes_to_run_when_not_running "config get falls back to docker run when container not running"
+
+test_custom_lucebox_home_is_mounted_and_forwarded() {
+    local label="$1" sandbox config_home out
+    sandbox=$(mktemp -d -t lucebox-route.XXXXXX)
+    config_home=$(mktemp -d -t lucebox-config.XXXXXX)
+    _make_docker_shim "$sandbox" 0
+    out=$(TEST_LUCEBOX_HOME="$config_home" \
+        _run_wrapper_capture_docker "$sandbox" config get model.preset || true)
+    rm -rf "$sandbox" "$config_home"
+    if ! grep -qF -- "-v $config_home:$config_home" <<<"$out"; then
+        report fail "$label" "custom config dir was not mounted: $(head -3 <<<"$out")"
+        return
+    fi
+    if ! grep -qF "LUCEBOX_HOME=$config_home" <<<"$out"; then
+        report fail "$label" "custom config dir was not forwarded: $(head -3 <<<"$out")"
+        return
+    fi
+    if ! grep -q -- '-w /opt/lucebox-hub' <<<"$out"; then
+        report fail "$label" "orchestrator uses a caller-dependent working directory"
+        return
+    fi
+    report ok "$label"
+}
+test_custom_lucebox_home_is_mounted_and_forwarded \
+    "custom LUCEBOX_HOME is mounted + forwarded to orchestrator"
+
+test_run_route_preserves_tty() {
+    local label="$1" sandbox out
+    sandbox=$(mktemp -d -t lucebox-route-tty.XXXXXX)
+    _make_docker_shim "$sandbox" 0
+    out=$(python3 - "$SCRIPT" "$sandbox" <<'PY' 2>/dev/null
+import os
+import pty
+import sys
+
+script, sandbox = sys.argv[1:]
+env = os.environ.copy()
+env.update({
+    "HOME": sandbox,
+    "XDG_CONFIG_HOME": sandbox + "/.config",
+    "XDG_DATA_HOME": sandbox + "/.local/share",
+    "LUCEBOX_HOME": sandbox + "/.lucebox",
+    "PATH": sandbox + "/bin:" + env["PATH"],
+    "LUCEBOX_HOST_HAS_DOCKER": "1",
+    "LUCEBOX_HOST_HAS_CTK": "runtime",
+    "LUCEBOX_HOST_GPU_VENDOR": "nvidia",
+    "LUCEBOX_HOST_HAS_NVIDIA_GPU": "1",
+    "LUCEBOX_HOST_DRIVER_MAJOR": "550",
+    "LUCEBOX_HOST_GPU_NAME": "Fake GPU",
+    "LUCEBOX_HOST_GPU_COUNT": "1",
+    "LUCEBOX_HOST_VRAM_GB": "24",
+    "LUCEBOX_HOST_GPU_SM": "89",
+    "_LUCEBOX_HOST_PROBED": "1",
+    "NO_COLOR": "1",
+})
+pid, fd = pty.fork()
+if pid == 0:
+    os.execve("/bin/bash", ["bash", script, "no-such-subcommand"], env)
+buf = b""
+try:
+    while True:
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        buf += chunk
+except OSError:
+    pass
+os.waitpid(pid, 0)
+sys.stdout.write(buf.decode(errors="replace"))
+PY
+)
+    rm -rf "$sandbox"
+    if ! grep -qE '^DOCKER_INVOKED run .* -it( |$)' <<<"${out//$'\r'/}"; then
+        report fail "$label" "PTY route did not preserve docker -it: $(head -3 <<<"$out")"
+        return
+    fi
+    report ok "$label"
+}
+test_run_route_preserves_tty "docker-run route preserves caller TTY (-it)"
 
 test_no_exec_flag_forces_run() {
     local label="$1" sandbox out
