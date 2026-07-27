@@ -8,8 +8,8 @@
 # Fallback path: a user runs the image directly (`docker run --gpus all
 # ghcr.io/luce-org/lucebox-hub:cuda12`) with no env-var prep. We then do a
 # minimal VRAM-tiered autotune — same tiers as `lucebox autotune`, kept in
-# sync by hand. Anything more elaborate (driver-version probes, AMD paths,
-# lspci fallbacks) belongs in the host CLI, not here.
+# sync by hand. NVIDIA and AMD are both supported; elaborate driver/version
+# diagnostics and heterogeneous-backend selection stay in the host CLI.
 
 set -euo pipefail
 
@@ -227,13 +227,16 @@ _build_host_info_json() {
     printf '"kernel":%s,'           "$(_json_str_or_null "${LUCEBOX_HOST_KERNEL:-}")"
     printf '"wsl_version":%s,'      "$(_json_str_or_null "${LUCEBOX_HOST_WSL_VERSION:-}")"
     printf '"docker_version":%s,'   "$(_json_str_or_null "${LUCEBOX_HOST_DOCKER_VERSION:-}")"
+    printf '"gpu_vendor":%s,'       "$(_json_str_or_null "${LUCEBOX_HOST_GPU_VENDOR:-}")"
     printf '"nvidia_driver":%s,'    "$(_json_str_or_null "${LUCEBOX_HOST_DRIVER_VERSION:-}")"
     printf '"nvidia_ctk_version":%s,' "$(_json_str_or_null "${LUCEBOX_HOST_NVIDIA_CTK_VERSION:-}")"
+    printf '"rocm_version":%s,'     "$(_json_str_or_null "${LUCEBOX_HOST_ROCM_VERSION:-}")"
     printf '"cpu_model":%s,'        "$(_json_str_or_null "${LUCEBOX_HOST_CPU_MODEL:-}")"
     printf '"nproc":%s,'            "$(_json_int_or_null "${LUCEBOX_HOST_NPROC:-}")"
     printf '"ram_gb":%s,'           "$(_json_int_or_null "${LUCEBOX_HOST_RAM_GB:-}")"
     printf '"gpus":%s,'             "$(_emit_gpu_array)"
     printf '"cuda_visible_devices":%s,' "$(_json_str_or_null "${LUCEBOX_HOST_CUDA_VISIBLE_DEVICES:-}")"
+    printf '"hip_visible_devices":%s,' "$(_json_str_or_null "${LUCEBOX_HOST_HIP_VISIBLE_DEVICES:-}")"
     printf '"source":%s,'           "$(_json_str_or_null "$source_tag")"
     printf '"collector":%s,'        "$(_json_str_or_null "$collector_tag")"
     printf '"collected_at":%s'      "$(_json_str_or_null "$collected_at")"
@@ -243,17 +246,70 @@ _build_host_info_json() {
 write_host_info
 
 # ── detect ─────────────────────────────────────────────────────────────────
-# nvidia-smi is always present here (--gpus all wires the driver in).
+# The host wrapper wires either NVIDIA (--gpus all) or AMD (/dev/kfd +
+# /dev/dri). Direct docker users get the same fallback detection here.
 GPU_VRAM_GB=0
+GPU_COUNT=0
 if command -v nvidia-smi &>/dev/null; then
     if mem_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
                   | head -1) && [ -n "$mem_mib" ]; then
         GPU_VRAM_GB=$((mem_mib / 1024))
     fi
-fi
-GPU_COUNT=0
-if command -v nvidia-smi &>/dev/null; then
     GPU_COUNT=$(nvidia-smi -L 2>/dev/null | awk '/^GPU /{n++} END{print n+0}') || GPU_COUNT=0
+elif command -v amd-smi &>/dev/null; then
+    amd_stats=$(amd-smi static --asic --vram --csv 2>/dev/null | awk -F',' '
+        NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                key = $i; gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", key); col[key] = i
+            }
+            next
+        }
+        {
+            mem = $(col["size"]); arch = $(col["target_graphics_version"])
+            gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", mem)
+            gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", arch)
+            if (mem ~ /^[0-9]+([.][0-9]+)?$/) {
+                n++
+                if (mem > max) { max = mem; max_arch = arch }
+            }
+        }
+        END { if (n) printf "%d %d %s", max / 1024, n, max_arch }
+    ' || echo "")
+    if [ -n "$amd_stats" ]; then
+        read -r GPU_VRAM_GB GPU_COUNT GPU_ARCH <<<"$amd_stats"
+    fi
+elif command -v rocm-smi &>/dev/null; then
+    amd_stats=$(rocm-smi --showproductname --showmeminfo vram --csv 2>/dev/null | awk -F',' '
+        NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                key = $i; gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", key); col[key] = i
+            }
+            next
+        }
+        {
+            bytes = $(col["VRAM Total Memory (B)"]); arch = $(col["GFX Version"])
+            gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", bytes)
+            gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", arch)
+            if (bytes ~ /^[0-9]+$/) {
+                n++
+                if (bytes > max) { max = bytes; max_arch = arch }
+            }
+        }
+        END { if (n) printf "%d %d %s", max / 1073741824, n, max_arch }
+    ' || echo "")
+    if [ -n "$amd_stats" ]; then
+        read -r GPU_VRAM_GB GPU_COUNT GPU_ARCH <<<"$amd_stats"
+    fi
+fi
+
+# Strix Halo's unified memory is usable for model weights even when SMI only
+# reports the small fixed VRAM carve-out. Mirror the host wrapper's effective
+# capacity rule for direct `docker run` users.
+if [ "${GPU_ARCH:-}" = "gfx1151" ] && [ "$GPU_VRAM_GB" -lt 12 ]; then
+    host_ram_gb=$(awk '/MemTotal/{printf "%.0f", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)
+    if [ "$host_ram_gb" -ge 32 ]; then
+        GPU_VRAM_GB=$host_ram_gb
+    fi
 fi
 
 # ── fallback autotune (only fills unset env) ───────────────────────────────

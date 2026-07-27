@@ -26,14 +26,15 @@ class CheckResult:
 
 
 def run_checks(host: HostFacts) -> list[CheckResult]:
-    return [
-        _check_docker(host),
-        _check_nvidia_driver(host),
-        _check_ctk(host),
-        _check_ram(host),
-        _check_vram(host),
-        _check_systemd(host),
-    ]
+    results = [_check_docker(host)]
+    if host.gpu_vendor == "nvidia":
+        results += [_check_nvidia_driver(host), _check_ctk(host)]
+    elif host.gpu_vendor == "amd":
+        results += [_check_amd_driver(host), _check_amd_devices(host)]
+    else:
+        results.append(CheckResult("gpu", "fail", "no supported NVIDIA or AMD GPU detected"))
+    results += [_check_ram(host), _check_vram(host), _check_systemd(host)]
+    return results
 
 
 def _check_docker(host: HostFacts) -> CheckResult:
@@ -48,15 +49,6 @@ def _check_docker(host: HostFacts) -> CheckResult:
 
 
 def _check_nvidia_driver(host: HostFacts) -> CheckResult:
-    if host.gpu_vendor != "nvidia":
-        if host.gpu_vendor == "amd":
-            return CheckResult(
-                "gpu",
-                "fail",
-                "AMD GPU detected — prebuilt images are NVIDIA-only",
-                "Build dflash from source with HIP; see dflash/README.md",
-            )
-        return CheckResult("gpu", "fail", "no NVIDIA GPU detected")
     if not host.driver_version:
         return CheckResult(
             "driver",
@@ -72,6 +64,33 @@ def _check_nvidia_driver(host: HostFacts) -> CheckResult:
             "upgrade the NVIDIA driver",
         )
     return CheckResult("driver", "ok", f"nvidia r{host.driver_major} ({host.driver_version})")
+
+
+def _check_amd_driver(host: HostFacts) -> CheckResult:
+    if not host.rocm_version:
+        return CheckResult(
+            "rocm",
+            "warn",
+            "AMD GPU detected but ROCm userspace version is unknown",
+            "install amd-smi or hipconfig so Lucebox can verify the ROCm runtime",
+        )
+    return CheckResult("rocm", "ok", f"ROCm {host.rocm_version} ({host.gpu_sm or 'gfx?'})")
+
+
+def _check_amd_devices(host: HostFacts) -> CheckResult:
+    missing: list[str] = []
+    if not host.has_kfd:
+        missing.append("/dev/kfd")
+    if not host.has_dri:
+        missing.append("/dev/dri/renderD*")
+    if missing:
+        return CheckResult(
+            "devices",
+            "fail",
+            f"missing or inaccessible: {', '.join(missing)}",
+            "add the user to the render and video groups, then re-login",
+        )
+    return CheckResult("devices", "ok", "/dev/kfd and /dev/dri are accessible")
 
 
 def _check_ctk(host: HostFacts) -> CheckResult:
@@ -147,10 +166,13 @@ def aggregate(results: list[CheckResult]) -> Severity:
 def render(console: Console, host: HostFacts, results: list[CheckResult]) -> Severity:
     """Print a status block, return the worst severity."""
     summary = f"[bold]Host:[/bold] {host.nproc} CPUs · {host.ram_gb} GB RAM"
-    if host.gpu_vendor == "nvidia" and host.gpu_name:
-        summary += f" · {host.gpu_name} · {host.vram_gb} GB VRAM" + (
-            f" (sm_{host.gpu_sm})" if host.gpu_sm else ""
-        )
+    if host.gpu_name:
+        arch = host.gpu_sm
+        if arch and host.gpu_vendor == "nvidia":
+            arch = f"sm_{arch}"
+        summary += f" · {host.gpu_name} · {host.vram_gb} GB VRAM"
+        if arch:
+            summary += f" ({arch})"
     if host.is_wsl:
         summary += " · WSL2"
     console.print(summary)
@@ -202,10 +224,13 @@ def render_host_facts(console: Console) -> None:
         ("kernel", os.environ.get("LUCEBOX_HOST_KERNEL", "")),
         ("wsl_version", os.environ.get("LUCEBOX_HOST_WSL_VERSION", "")),
         ("docker", os.environ.get("LUCEBOX_HOST_DOCKER_VERSION", "")),
+        ("gpu_vendor", os.environ.get("LUCEBOX_HOST_GPU_VENDOR", "")),
         ("nvidia_driver", os.environ.get("LUCEBOX_HOST_DRIVER_VERSION", "")),
         ("nvidia_ctk", os.environ.get("LUCEBOX_HOST_NVIDIA_CTK_VERSION", "")),
+        ("rocm", os.environ.get("LUCEBOX_HOST_ROCM_VERSION", "")),
         ("cpu", os.environ.get("LUCEBOX_HOST_CPU_MODEL", "")),
         ("cuda_visible_devices", os.environ.get("LUCEBOX_HOST_CUDA_VISIBLE_DEVICES", "")),
+        ("hip_visible_devices", os.environ.get("LUCEBOX_HOST_HIP_VISIBLE_DEVICES", "")),
     ]
     for key, value in facts:
         display = value if value else "[dim](unset)[/dim]"
@@ -223,10 +248,10 @@ def render_host_facts(console: Console) -> None:
             parts = [c.strip() for c in line.split(",")]
             if len(parts) >= 7:
                 idx, _uuid, _pci, name, sm, mem, plimit = parts[:7]
-                console.print(
-                    f"    [{idx}] {name} (sm_{sm}, {mem}, {plimit})"
-                )
+                arch = sm if sm.startswith("gfx") else f"sm_{sm}"
+                detail = ", ".join(part for part in (arch, mem, plimit) if part)
+                console.print(f"    [{idx}] {name} ({detail})")
             else:
                 console.print(f"    {line}")
     else:
-        console.print("  gpus                  [dim](none — nvidia-smi unavailable)[/dim]")
+        console.print("  gpus                  [dim](none — GPU probe unavailable)[/dim]")

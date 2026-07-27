@@ -32,6 +32,27 @@ if [ ! -f "$SCRIPT" ]; then
     exit 1
 fi
 
+# Make the whole suite safe on a contributor workstation. Several dispatch
+# smoke tests intentionally invoke start/stop/install/uninstall/pull up to the
+# missing-prerequisite boundary; without global shims those commands can touch
+# a real user service or pull a multi-GB image on a fully provisioned host.
+SUITE_SANDBOX=$(mktemp -d "${TMPDIR:-/tmp}/lucebox-shell-suite.XXXXXX")
+SUITE_SHIMS="$SUITE_SANDBOX/shims"
+mkdir -p "$SUITE_SHIMS" "$SUITE_SANDBOX/home" "$SUITE_SANDBOX/xdg" "$SUITE_SANDBOX/data"
+for binname in docker systemctl journalctl loginctl; do
+    cat > "$SUITE_SHIMS/$binname" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+    chmod +x "$SUITE_SHIMS/$binname"
+done
+export HOME="$SUITE_SANDBOX/home"
+export XDG_CONFIG_HOME="$SUITE_SANDBOX/xdg"
+export XDG_DATA_HOME="$SUITE_SANDBOX/data"
+export LUCEBOX_HOME="$SUITE_SANDBOX/home/.lucebox"
+export PATH="$SUITE_SHIMS:$PATH"
+trap 'rm -rf "$SUITE_SANDBOX"' EXIT
+
 # entrypoint.sh ships with the docker-stack PR (#334). When it's absent
 # (e.g. on the lucebox-cli branch in isolation), skip the entire suite —
 # every section below either references $ENTRYPOINT in shellcheck targets,
@@ -284,6 +305,7 @@ STUB
         LUCEBOX_HOST_HAS_DOCKER=1 \
         LUCEBOX_HOST_HAS_CTK=runtime \
         LUCEBOX_HOST_GPU_VENDOR=nvidia \
+        LUCEBOX_HOST_HAS_NVIDIA_GPU=1 \
         _LUCEBOX_HOST_PROBED=1 \
         NO_COLOR=1 \
         timeout 10 bash "$SCRIPT" install 2>&1
@@ -935,6 +957,7 @@ _run_wrapper_capture_docker() {
     LUCEBOX_HOST_HAS_DOCKER=1 \
     LUCEBOX_HOST_HAS_CTK=runtime \
     LUCEBOX_HOST_GPU_VENDOR=nvidia \
+    LUCEBOX_HOST_HAS_NVIDIA_GPU=1 \
     LUCEBOX_HOST_DRIVER_MAJOR=550 \
     LUCEBOX_HOST_DRIVER_VERSION="550.00" \
     LUCEBOX_HOST_GPU_NAME="Fake GPU" \
@@ -1070,6 +1093,125 @@ test_usage_mentions_exec_routing() {
     report ok "$label"
 }
 test_usage_mentions_exec_routing "usage documents docker exec routing + --no-exec flag"
+
+# ── cross-vendor GPU selection / Docker contract ──────────────────────────
+test_amd_smi_parser() {
+    local label="$1" fn out
+    fn=$(awk '/^_parse_amd_smi_csv\(\) \{/,/^\}/' "$SCRIPT")
+    out=$(bash -c "$fn"$'\n''_parse_amd_smi_csv' <<'CSV'
+gpu,market_name,vendor_id,vendor_name,subvendor_id,device_id,subsystem_id,rev_id,asic_serial,oam_id,num_compute_units,target_graphics_version,type,vendor,size,bit_width,max_bandwidth
+0,AMD Radeon AI PRO R9700,0x1002,AMD,0xf111,0x7551,0x000a,0xc0,serial,N/A,64,gfx1201,GDDR6,SAMSUNG,32624,256,N/A
+1,AMD Radeon Graphics,0x1002,AMD,0xf111,0x1586,0x000a,0xc1,serial,N/A,40,gfx1151,GDDR7,UNKNOWN,512,256,N/A
+CSV
+)
+    if ! grep -qF '0|AMD Radeon AI PRO R9700|gfx1201|32624' <<<"$out" \
+       || ! grep -qF '1|AMD Radeon Graphics|gfx1151|512' <<<"$out"; then
+        report fail "$label" "unexpected normalized rows: $out"
+        return
+    fi
+    report ok "$label"
+}
+test_amd_smi_parser "amd-smi parser recognizes R9700 + Strix"
+
+test_variant_autoselection() {
+    local label="$1" fn common got
+    fn=$(awk '/^pick_variant\(\) \{/,/^\}/' "$SCRIPT")
+    common=$'_lucebox_config_get(){ :; }\nensure_probed(){ :; }\nLUCEBOX_VARIANT=""\n'
+
+    got=$(bash -c "$fn"$'\n'"$common"$'LUCEBOX_HOST_HAS_NVIDIA_GPU=1\nLUCEBOX_HOST_HAS_AMD_GPU=1\npick_variant')
+    [ "$got" = "cuda12" ] || { report fail "$label" "mixed RTX + Strix chose $got"; return; }
+
+    got=$(bash -c "$fn"$'\n'"$common"$'LUCEBOX_HOST_HAS_NVIDIA_GPU=0\nLUCEBOX_HOST_HAS_AMD_GPU=1\npick_variant')
+    [ "$got" = "rocm" ] || { report fail "$label" "R9700 + Strix chose $got"; return; }
+
+    got=$(bash -c "$fn"$'\n'"$common"$'LUCEBOX_VARIANT=rocm\nLUCEBOX_HOST_HAS_NVIDIA_GPU=1\nLUCEBOX_HOST_HAS_AMD_GPU=1\npick_variant')
+    [ "$got" = "rocm" ] || { report fail "$label" "explicit override chose $got"; return; }
+    report ok "$label"
+}
+test_variant_autoselection "variant selection: RTX+Strix=cuda12, R9700+Strix=rocm"
+
+test_mixed_rtx_strix_probe_prefers_cuda() {
+    local label="$1" sandbox shim_dir out
+    sandbox=$(mktemp -d -t lucebox-mixed-gpu.XXXXXX)
+    shim_dir="$sandbox/bin"
+    mkdir -p "$shim_dir"
+    cat > "$shim_dir/nvidia-smi" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"name,memory.total,driver_version,compute_cap"*)
+    echo "NVIDIA GeForce RTX 3090, 24576, 550.00, 8.6" ;;
+  *"index,uuid,pci.bus_id,name,compute_cap,memory.total,power.limit"*)
+    echo "0, GPU-test, 00000000:01:00.0, NVIDIA GeForce RTX 3090, 8.6, 24576 MiB, 350.00 W" ;;
+  *"--query-gpu=name"*) echo "NVIDIA GeForce RTX 3090" ;;
+  "-L") echo "GPU 0: NVIDIA GeForce RTX 3090" ;;
+esac
+exit 0
+STUB
+    cat > "$shim_dir/amd-smi" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = "version" ]; then
+    echo "AMDSMI Tool: test | ROCm version: 7.2.4 | Platform: Linux Baremetal"
+    exit 0
+fi
+cat <<'CSV'
+gpu,market_name,vendor_id,vendor_name,subvendor_id,device_id,subsystem_id,rev_id,asic_serial,oam_id,num_compute_units,target_graphics_version,type,vendor,size,bit_width,max_bandwidth
+0,AMD Radeon Graphics,0x1002,AMD,0xf111,0x1586,0x000a,0xc1,serial,N/A,40,gfx1151,GDDR7,UNKNOWN,512,256,N/A
+CSV
+STUB
+    cat > "$shim_dir/docker" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-}" in
+  ps) exit 0 ;;
+  version) echo "29.1.3" ;;
+esac
+exit 0
+STUB
+    for binname in nvidia-container-runtime; do
+        printf '#!/usr/bin/env bash\nexit 0\n' > "$shim_dir/$binname"
+    done
+    chmod +x "$shim_dir"/*
+    out=$(HOME="$sandbox" LUCEBOX_HOME="$sandbox/.lucebox" \
+        PATH="$shim_dir:$PATH" NO_COLOR=1 bash "$SCRIPT" check 2>&1)
+    rm -rf "$sandbox"
+    if ! grep -qF "NVIDIA GeForce RTX 3090" <<<"$out" \
+       || ! grep -qF "AMD Radeon Graphics" <<<"$out" \
+       || ! grep -qF ":cuda12 (NVIDIA selected)" <<<"$out"; then
+        report fail "$label" "mixed probe output: $(printf '%s' "$out" | head -20)"
+        return
+    fi
+    report ok "$label"
+}
+test_mixed_rtx_strix_probe_prefers_cuda "mixed RTX 3090 + Strix probe selects CUDA"
+
+test_cross_vendor_docker_args() {
+    local label="$1" helpers cuda_args rocm_args pinned_rocm_args
+    helpers=$(awk '/^_variant_is_rocm\(\) \{/,/^\}/' "$SCRIPT")$'\n'
+    helpers+=$(awk '/^_append_gpu_args\(\) \{/,/^\}/' "$SCRIPT")
+    cuda_args=$(bash -c "$helpers"$'\n''a=(); _append_gpu_args a cuda12; printf "%s\n" "${a[@]}"')
+    rocm_args=$(bash -c "$helpers"$'\n''a=(); _append_gpu_args a rocm; printf "%s\n" "${a[@]}"')
+    pinned_rocm_args=$(bash -c "$helpers"$'\n''a=(); _append_gpu_args a 0.3.0-rocm; printf "%s\n" "${a[@]}"')
+    if ! grep -qF -- '--gpus' <<<"$cuda_args" || ! grep -qF 'all' <<<"$cuda_args"; then
+        report fail "$label" "CUDA args missing --gpus all"
+        return
+    fi
+    for expected in /dev/kfd /dev/dri video render seccomp=unconfined; do
+        if ! grep -qF "$expected" <<<"$rocm_args"; then
+            report fail "$label" "ROCm args missing $expected"
+            return
+        fi
+    done
+    if grep -qF -- '--gpus' <<<"$rocm_args"; then
+        report fail "$label" "ROCm args incorrectly contain --gpus"
+        return
+    fi
+    if ! grep -qF '/dev/kfd' <<<"$pinned_rocm_args" \
+       || grep -qF -- '--gpus' <<<"$pinned_rocm_args"; then
+        report fail "$label" "versioned ROCm tag did not select ROCm args"
+        return
+    fi
+    report ok "$label"
+}
+test_cross_vendor_docker_args "Docker args select CUDA or ROCm device contract"
 
 # ── TTY flag selection. Regression guard for the process-substitution bug:
 # _set_tty_flags must run in the CALLER's scope so `[ -t 1 ]` inspects the

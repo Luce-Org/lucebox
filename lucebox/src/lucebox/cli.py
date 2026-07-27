@@ -6,7 +6,7 @@ doesn't intercept (everything outside the systemd surface) ends up here.
 Subcommand inventory:
     check                  — readiness report
     config get/set/unset   — read / write a single key in config.toml
-    pull                   — docker pull the cuda12 image
+    pull                   — docker pull the selected CUDA or ROCm image
     print-run              — emit the docker-run command for the server
     print-serve-argv       — same, raw argv lines (consumed by `lucebox serve`)
     models                 — list / download presets, activate one

@@ -131,7 +131,7 @@ esac
 cat <<EOF
 
 Next:
-  ${C_DIM}lucebox check${C_RST}            verify host prereqs (docker + NVIDIA CTK + driver)
+  ${C_DIM}lucebox check${C_RST}            verify host prereqs (Docker + NVIDIA CUDA or AMD ROCm)
   ${C_DIM}lucebox install${C_RST}          install the user systemd unit
   ${C_DIM}lucebox start${C_RST}            start the server
   ${C_DIM}lucebox update${C_RST}           re-run this installer to fetch the latest lucebox.sh

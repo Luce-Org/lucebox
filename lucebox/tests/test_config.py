@@ -176,6 +176,24 @@ def test_live_config_uses_recommend_preset_indirectly(tmp_path: Path) -> None:
     assert cfg.model.preset == ""
 
 
+def test_live_config_selects_rocm_for_amd(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LUCEBOX_HOST_GPU_VENDOR", "amd")
+    monkeypatch.delenv("LUCEBOX_VARIANT", raising=False)
+
+    cfg = config.live_config()
+
+    assert cfg.variant == "rocm"
+
+
+def test_live_config_variant_override_wins_on_amd(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LUCEBOX_HOST_GPU_VENDOR", "amd")
+    monkeypatch.setenv("LUCEBOX_VARIANT", "test-cuda12")
+
+    cfg = config.live_config()
+
+    assert cfg.variant == "test-cuda12"
+
+
 def test_seed_dflash_writes_heuristic_when_absent(tmp_path: Path) -> None:
     """First-time activate seeds the VRAM-tier heuristic into config.toml.
 

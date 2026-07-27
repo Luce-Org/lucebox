@@ -15,7 +15,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from lucebox.types import Config
+from lucebox.types import Config, GpuVendor
 
 
 def _host_facts_env() -> list[tuple[str, str]]:
@@ -91,6 +91,7 @@ class DockerRunSpec:
     image: str
     name: str
     gpus: bool = True
+    gpu_vendor: GpuVendor = "nvidia"
     detach: bool = False
     remove: bool = True
     port_publish: tuple[int, int] | None = None  # (host, container)
@@ -106,8 +107,21 @@ class DockerRunSpec:
         if self.detach:
             out.append("-d")
         out += ["--name", self.name]
-        if self.gpus:
+        if self.gpus and self.gpu_vendor == "nvidia":
             out += ["--gpus", "all"]
+        elif self.gpus and self.gpu_vendor == "amd":
+            out += [
+                "--device",
+                "/dev/kfd",
+                "--device",
+                "/dev/dri",
+                "--group-add",
+                "video",
+                "--group-add",
+                "render",
+                "--security-opt",
+                "seccomp=unconfined",
+            ]
         if self.port_publish is not None:
             host, container = self.port_publish
             out += ["-p", f"{host}:{container}"]
@@ -141,6 +155,9 @@ class DockerRunSpec:
                 "--volume",
                 "--publish",
                 "--entrypoint",
+                "--device",
+                "--group-add",
+                "--security-opt",
             } and i + 1 < len(argv):
                 i += 1
                 out += " " + shlex.quote(argv[i])
@@ -153,7 +170,7 @@ class DockerRunSpec:
 
 def server_run_spec(cfg: Config) -> DockerRunSpec:
     """Long-running OpenAI-compatible server. Foreground (systemd manages
-    lifecycle), --gpus all, models bind-mounted, DFLASH_* propagated.
+    lifecycle), vendor-specific GPU devices, models bind-mounted, DFLASH_* propagated.
     """
     # LUCEBOX_HOST_* first so they ride out front in the rendered argv,
     # making it obvious in `print-run` output what host facts get forwarded.
@@ -212,10 +229,23 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
     if cfg.dflash.debug_thinking_logits:
         env.append(("DFLASH_DEBUG_THINKING_LOGITS", "1"))
 
+    # The chosen image variant is the runtime contract. This matters on a
+    # heterogeneous RTX + Strix host: the probe records both vendors, while an
+    # explicit ``variant=rocm`` must still receive AMD device flags. Unknown
+    # custom variants fall back to the probe's selected/default vendor.
+    variant_lower = cfg.variant.lower()
+    if "rocm" in variant_lower:
+        gpu_vendor: GpuVendor = "amd"
+    elif "cuda" in variant_lower:
+        gpu_vendor = "nvidia"
+    else:
+        gpu_vendor = cfg.host.gpu_vendor if cfg.host.gpu_vendor != "none" else "nvidia"
+
     return DockerRunSpec(
         image=f"{cfg.image}:{cfg.variant}",
         name=cfg.container_name,
         gpus=True,
+        gpu_vendor=gpu_vendor,
         remove=True,
         detach=False,
         port_publish=(cfg.port, 8080),

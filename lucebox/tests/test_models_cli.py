@@ -137,6 +137,9 @@ def test_installed_helpers_track_presence(
 
     target = cfg.models_dir / laguna.target_file
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(b"x" * (5 * 10**9))
+    # Apparent size is what the CLI reports; a sparse file exercises the same
+    # stat path without allocating and writing a 5 GB Python byte string.
+    with target.open("wb") as sparse:
+        sparse.truncate(5 * 10**9)
     assert download_mod.installed_status(cfg, laguna) == "installed"
     assert download_mod.installed_size_gb(cfg, laguna) == pytest.approx(5.0, rel=0.01)
