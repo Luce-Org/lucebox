@@ -250,6 +250,19 @@ err()   { printf '%b[ERROR]%b %s\n' "$C_ERR"  "$C_RST" "$*" >&2; }
 hint()  { printf '       %b%s%b\n'  "$C_DIM"  "$*"     "$C_RST"; }
 die()   { err "$*"; exit 1; }
 
+sha256_file() {
+    local sum
+    if command -v sha256sum >/dev/null 2>&1; then
+        sum=$(sha256sum "$1")
+    elif command -v shasum >/dev/null 2>&1; then
+        sum=$(shasum -a 256 "$1")
+    else
+        die "checksum requested, but neither sha256sum nor shasum is installed"
+    fi
+    sum="${sum%% *}"
+    printf '%s' "$sum" | tr '[:upper:]' '[:lower:]'
+}
+
 # ── host probing ──────────────────────────────────────────────────────────
 # Sets the LUCEBOX_HOST_* variables consumed by the in-container Python CLI
 # (passed through with -e). The Python side trusts these and doesn't reprobe
@@ -676,9 +689,9 @@ require_systemd() {
 # ── docker run construction ───────────────────────────────────────────────
 # All the Python-CLI subcommands share the same docker run incantation:
 # mount the host docker socket (so the in-container CLI can spawn server /
-# bench containers on the host daemon), mount $HOME at the same path (so
-# paths look identical in and out), and pass host facts via env. The selected
-# image gets its native accelerator contract: --gpus all for
+# bench containers on the host daemon), mount only Lucebox's config/models
+# state, and pass host facts via env. The selected image gets its native
+# accelerator contract: --gpus all for
 # CUDA; /dev/kfd + /dev/dri and the render/video groups for ROCm.
 
 DOCKER_SOCK_PATH="${DOCKER_HOST:-/var/run/docker.sock}"
@@ -774,20 +787,21 @@ build_orchestrator_argv() {
         [ -n "$socket_gid" ] && argv+=(--group-add "$socket_gid")
         argv+=(-v "$DOCKER_SOCK_PATH:/var/run/docker.sock")
     fi
-    argv+=(-v "$HOME:$HOME")
-    # Bind-mount the XDG models dir explicitly (host = container path) so
-    # paths line up in/out. The $HOME mount above already covers it when
-    # XDG_DATA_HOME is unset, but an explicit -v is required when the user
-    # points XDG_DATA_HOME outside $HOME.
+    # Bind only Lucebox-owned state. The orchestrator used to receive all of
+    # $HOME read-write to support model symlinks; the Python launch builder
+    # now handles selected symlinks with narrow read-only mounts instead.
+    # Keeping credentials and unrelated user files outside the container is
+    # the safer default for both buyer appliances and contributor machines.
     mkdir -p "$DEFAULT_MODELS_DIR"
     argv+=(-v "$DEFAULT_MODELS_DIR:$DEFAULT_MODELS_DIR")
-    # A custom LUCEBOX_HOME may sit outside $HOME, so mount it explicitly.
+    # A custom LUCEBOX_HOME may sit anywhere, so mount it explicitly and use
+    # it as the ephemeral CLI's HOME (its caches then remain app-scoped too).
     # Use an image-owned working directory: callers may invoke lucebox from
     # /tmp or another path that is not bind-mounted into the container.
     mkdir -p "$CONFIG_HOME"
     argv+=(-v "$CONFIG_HOME:$CONFIG_HOME")
     argv+=(-w /opt/lucebox-hub)
-    argv+=(-e "HOME=$HOME")
+    argv+=(-e "HOME=$CONFIG_HOME")
     # Host facts — Python side reads these instead of reprobing.
     _append_host_env argv
     # User overrides for image/port/container/models scalars + HF_TOKEN.
@@ -868,16 +882,37 @@ cmd_serve() {
             ;;
     esac
 
-    local orch_argv server_argv
+    local orch_argv server_argv server_output orch_error_file orch_rc=0
     mapfile -t orch_argv < <(build_orchestrator_argv "$variant" 0 print-serve-argv)
 
-    if mapfile -t server_argv < <("${orch_argv[@]}" 2>/dev/null) \
-       && [ "${#server_argv[@]}" -gt 0 ] \
-       && [ "${server_argv[0]}" = "docker" ]; then
-        info "Starting lucebox server (variant=$variant, from config.toml)"
-        _serve_and_track "${server_argv[@]}"
-        return $?
+    orch_error_file=$(mktemp -t lucebox-orchestrator.XXXXXX) \
+        || die "couldn't create temporary orchestrator log"
+    if server_output=$("${orch_argv[@]}" 2>"$orch_error_file"); then
+        if [ -n "$server_output" ]; then
+            mapfile -t server_argv <<<"$server_output"
+            if [ "${#server_argv[@]}" -gt 0 ] \
+               && [ "${server_argv[0]}" = "docker" ]; then
+                rm -f "$orch_error_file"
+                info "Starting lucebox server (variant=$variant, from config.toml)"
+                _serve_and_track "${server_argv[@]}"
+                return $?
+            fi
+        fi
+    else
+        orch_rc=$?
     fi
+
+    # Configuration/path errors must never turn into a successful launch with
+    # defaults: that could start the wrong model or ignore explicit tuning.
+    # Docker infrastructure failures (for example an image not pulled yet)
+    # retain the conservative fallback below.
+    if [ "$orch_rc" -eq 2 ] \
+       || grep -qE 'Invalid configuration:|Cannot build server command:' "$orch_error_file"; then
+        [ ! -s "$orch_error_file" ] || cat "$orch_error_file" >&2
+        rm -f "$orch_error_file"
+        die "refusing to ignore invalid Lucebox configuration"
+    fi
+    rm -f "$orch_error_file"
 
     warn "Couldn't fetch server argv from container (image not pulled?) — using fallback"
     info "Starting lucebox server (variant=$variant, port=$DEFAULT_PORT, defaults only)"
@@ -891,10 +926,9 @@ cmd_serve() {
     local fallback_argv=(docker run --rm
         --name "$CONTAINER_NAME"
         -p "$DEFAULT_PORT:8080"
-        -v "$HOME:$HOME"
         -v "$CONFIG_HOME:$CONFIG_HOME"
         -v "$fallback_models:/opt/lucebox-hub/server/models"
-        -e "HOME=$HOME")
+        -e "HOME=$CONFIG_HOME")
     _append_gpu_args fallback_argv "$variant"
     _append_host_env fallback_argv
     _append_scalar_env fallback_argv "$variant"
@@ -1129,38 +1163,68 @@ cmd_pull() {
 }
 
 cmd_update() {
-    # Re-run the bootstrap installer against the channel we were installed
-    # from. The installer is the source of truth for "how do you install
-    # lucebox correctly" — chmod, atomic mv, validation, baking the source
-    # URL back into the new copy so the channel is preserved across
-    # upgrades. Keeping the logic in install.sh means it can evolve
-    # independently (sha verify, signature check, etc.) and the installed
-    # `lucebox update` picks those changes up on the next run.
-    #
-    # The installer URL is derived from LUCEBOX_INSTALLED_FROM by swapping
-    # `lucebox.sh` → `install.sh` in the same directory, so forks don't
-    # need a separate registration. Override the source channel via
-    # $LUCEBOX_INSTALL_URL (e.g. to switch from canonical to a dev fork).
-    local source_url installer_url target
+    # Download the wrapper itself as data; never execute a second remote
+    # installer. Override the persisted channel with LUCEBOX_INSTALL_URL.
+    local source_url target wrapper_tmp expected_sha actual_sha escaped_url
     source_url="${LUCEBOX_INSTALL_URL:-$LUCEBOX_INSTALLED_FROM}"
     if [[ "$source_url" != */lucebox.sh ]]; then
         die "LUCEBOX_INSTALLED_FROM doesn't end in /lucebox.sh: $source_url"
     fi
-    installer_url="${source_url%/lucebox.sh}/install.sh"
+    case "$source_url" in
+        *['"$`\']*|*$'\n'*|*$'\r'*)
+            die "update URL contains unsafe characters: $source_url" ;;
+    esac
     target=$(realpath "$SCRIPT_PATH")
 
-    info "Updating lucebox via $installer_url"
+    info "Updating lucebox"
     info "  source: $source_url"
     info "  target: $target"
 
-    # Pass the URLs through to install.sh via env. The installer reads
-    # $LUCEBOX_INSTALL_URL (which we set to source_url) and
-    # $LUCEBOX_INSTALL_DEST (the realpath of *this* file, so a symlinked
-    # install replaces the actual file behind the link).
-    LUCEBOX_INSTALL_URL="$source_url" \
-    LUCEBOX_INSTALL_DEST="$target" \
-        bash -c "$(curl -fsSL "$installer_url")" \
-            || die "update failed (installer exited non-zero)"
+    # Create the temporary file next to the destination so the final rename
+    # is atomic even when /tmp and the install directory are different mounts.
+    wrapper_tmp=$(mktemp "${target}.update.XXXXXX") \
+        || die "couldn't create temporary update file next to $target"
+    trap 'if [ -n "${wrapper_tmp:-}" ]; then rm -f "$wrapper_tmp" "$wrapper_tmp.baked"; fi' EXIT
+    curl --connect-timeout 10 --max-time 120 --retry 2 --retry-delay 1 \
+        -fsSL "$source_url" -o "$wrapper_tmp" \
+        || die "failed to download wrapper from $source_url"
+
+    [ "$(head -1 "$wrapper_tmp")" = '#!/usr/bin/env bash' ] \
+        || die "downloaded wrapper has an unexpected shebang"
+    grep -Fqx 'set -euo pipefail' "$wrapper_tmp" \
+        || die "downloaded wrapper is missing strict shell mode"
+    grep -q '^VERSION=' "$wrapper_tmp" \
+        || die "downloaded file is missing the Lucebox version marker"
+    grep -q '^LUCEBOX_INSTALLED_FROM=' "$wrapper_tmp" \
+        || die "downloaded file is missing the Lucebox update-channel marker"
+    bash -n "$wrapper_tmp" \
+        || die "downloaded wrapper does not parse as valid Bash"
+
+    expected_sha="${LUCEBOX_WRAPPER_SHA256:-}"
+    if [ -n "$expected_sha" ]; then
+        [[ "$expected_sha" =~ ^[0-9a-fA-F]{64}$ ]] \
+            || die "LUCEBOX_WRAPPER_SHA256 must be exactly 64 hexadecimal characters"
+        actual_sha=$(sha256_file "$wrapper_tmp")
+        expected_sha=$(printf '%s' "$expected_sha" | tr '[:upper:]' '[:lower:]')
+        [ "$actual_sha" = "$expected_sha" ] \
+            || die "wrapper checksum mismatch (expected $expected_sha, got $actual_sha)"
+        ok "wrapper sha256 verified"
+    fi
+
+    # Preserve the chosen branch/fork in the new copy. The URL was validated
+    # above for safe embedding in a Bash double-quoted string.
+    escaped_url=$(printf '%s' "$source_url" | sed 's/[&|]/\\&/g')
+    sed "s|^LUCEBOX_INSTALLED_FROM=.*|LUCEBOX_INSTALLED_FROM=\"$escaped_url\"|" \
+        "$wrapper_tmp" > "$wrapper_tmp.baked"
+    mv "$wrapper_tmp.baked" "$wrapper_tmp"
+    grep -Fqx "LUCEBOX_INSTALLED_FROM=\"$source_url\"" "$wrapper_tmp" \
+        || die "failed to preserve update channel in downloaded wrapper"
+    bash -n "$wrapper_tmp" || die "updated wrapper failed validation after channel rewrite"
+
+    chmod +x "$wrapper_tmp"
+    mv "$wrapper_tmp" "$target"
+    trap - EXIT
+    ok "updated lucebox → $target"
 }
 
 cmd_completion() {
@@ -1445,7 +1509,7 @@ cmd_exec_in_container() {
     local argv=(docker exec "${tty[@]}")
     argv+=(--user "$(id -u):$(id -g)")
     argv+=(-w /opt/lucebox-hub)
-    argv+=(-e "HOME=$HOME")
+    argv+=(-e "HOME=$CONFIG_HOME")
     _append_host_env argv
     _append_scalar_env argv "$variant"
     # The image has no top-level `lucebox` binary on PATH — that name only
@@ -1536,7 +1600,10 @@ Environment overrides:
   LUCEBOX_VARIANT       image tag override (default: cuda12 on NVIDIA, rocm on AMD)
   LUCEBOX_PORT          host port for the server (default: 8080)
   LUCEBOX_CONTAINER     server container name (default: lucebox)
-  LUCEBOX_MODELS        host model directory (default: \$XDG_DATA_HOME/lucebox/models
+  LUCEBOX_MODELS        host model directory (default: \$XDG_DATA_HOME/lucebox/models)
+  LUCEBOX_HOME          config/state directory (default: \$HOME/.lucebox)
+  LUCEBOX_WRAPPER_SHA256
+                        optional 64-hex checksum pin for install/update
   LUCEBOX_NO_EXEC=1     force docker-run for in-container subcommands even
                         when the container is up (equivalent to --no-exec)
   HF_TOKEN              propagated to \`models download\` for gated HF repos

@@ -44,7 +44,7 @@ def test_models_default_view_lists_only_installed(
     # No models on disk → default view says "no presets installed".
     result = CliRunner().invoke(app, ["models"])
     assert result.exit_code == 0
-    assert "No presets installed" in result.stdout or "Models dir" in result.stdout
+    assert "No presets installed" in result.stdout
 
 
 def test_models_download_recommends_when_empty(

@@ -57,6 +57,56 @@ def test_toml_load_rejects_invalid_prefill_mode(tmp_path: Path) -> None:
         config._load_toml(path)
 
 
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("dflash.prefill_keep_ratio", "0"),
+        ("dflash.prefill_keep_ratio", "1.01"),
+        ("dflash.think_soft_close_min_ratio", "-0.01"),
+        ("dflash.think_soft_close_min_ratio", "1.01"),
+        ("dflash.think_soft_close_min_ratio", "nan"),
+    ],
+)
+def test_config_set_rejects_out_of_range_ratios(
+    tmp_path: Path, key: str, value: str
+) -> None:
+    path = tmp_path / "config.toml"
+
+    with pytest.raises(ValueError, match="interval"):
+        config_set(key, value, path=path)
+
+    assert not path.exists()
+
+
+def test_toml_load_rejects_out_of_range_ratios(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[dflash]\n"
+        "prefill_keep_ratio = 0.05\n"
+        "think_soft_close_min_ratio = 2.0\n"
+    )
+
+    with pytest.raises(ValueError, match="think_soft_close_min_ratio"):
+        config._load_toml(path)
+
+
+@pytest.mark.parametrize(
+    "host_body",
+    [
+        'gpu_vendor = "intel"\n',
+        'ctk = "maybe"\n',
+    ],
+)
+def test_toml_load_rejects_invalid_host_literals(
+    tmp_path: Path, host_body: str
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(f"[host]\n{host_body}")
+
+    with pytest.raises(ValueError):
+        config._load_toml(path)
+
+
 def test_model_preset_round_trips_through_set_and_load(tmp_path: Path) -> None:
     """Setting model.preset writes a sparse TOML doc that loads back correctly."""
     path = tmp_path / "config.toml"
@@ -169,6 +219,23 @@ def test_config_set_rejects_unknown_key(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     with pytest.raises(KeyError):
         config_set("not.a.key", 1, path=path)
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("port", "0", "port"),
+        ("port", "65536", "port"),
+        ("models_dir", "relative/models", "absolute"),
+        ("model.target_file", "../secret.gguf", "below models_dir"),
+        ("model.draft_file", "/tmp/draft.gguf", "below models_dir"),
+    ],
+)
+def test_config_set_rejects_unsafe_runtime_values(
+    tmp_path: Path, key: str, value: str, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        config_set(key, value, path=tmp_path / "config.toml")
 
 
 def test_config_set_auto_creates_file(tmp_path: Path) -> None:

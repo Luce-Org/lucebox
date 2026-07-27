@@ -14,10 +14,8 @@ Subcommand inventory:
 
 from __future__ import annotations
 
-import os
 import sys
 from dataclasses import replace
-from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -32,57 +30,64 @@ import lucebox.host_check as host_check
 from lucebox import __version__
 from lucebox.config import config_get, config_set, config_unset, live_config
 from lucebox.host_facts import from_env
+from lucebox.types import Config
 
 app = typer.Typer(
     name="lucebox",
     help="Host CLI for the lucebox-hub container. Invoked by lucebox.sh.",
     no_args_is_help=True,
+    invoke_without_command=True,
     add_completion=False,
 )
 console = Console()
+error_console = Console(stderr=True)
+
+
+@app.callback()
+def root_options(
+    version_flag: Annotated[
+        bool,
+        typer.Option("--version", help="Print lucebox version and exit.", is_eager=True),
+    ] = False,
+) -> None:
+    """Apply options shared by the top-level CLI."""
+    if version_flag:
+        print(__version__)
+        raise typer.Exit()
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
 
-def _load_or_build() -> config_mod.Config:  # type: ignore[name-defined]
+def _load_or_build() -> Config:
     """env > config.toml > dataclass defaults — the canonical precedence.
 
-    Without the env-overlay step below, `config_mod.load()` returned the
-    persisted config verbatim and `LUCEBOX_IMAGE` / `LUCEBOX_VARIANT` /
-    `LUCEBOX_PORT` / `LUCEBOX_CONTAINER` / `LUCEBOX_MODELS` from the
-    systemd unit's `Environment=` (or any one-shot shell export) were
-    silently dropped. That contradicted the precedence lucebox.sh
-    documents and applies — and bit sindri when its config.toml had
-    `[image]` without `registry`, so the dataclass default
-    `ghcr.io/luce-org/lucebox-hub` won over the unit's
-    `LUCEBOX_IMAGE=ghcr.io/easel/lucebox-hub`.
-
-    Fix: overlay env on top of the loaded config (or the live_config
-    fallback when config.toml is absent). Only the five top-level
-    scalars have env hooks — dflash/host/model don't, by design.
+    Only the five documented top-level scalars have environment overrides;
+    dflash, host, and model settings intentionally remain config-driven.
     """
-    cfg = config_mod.load()
-    if cfg is None:
-        cfg = live_config()
-    # Overlay live host facts. When ``config.toml`` exists without a
-    # ``[host]`` block (the common case — operators don't hand-edit
-    # host facts), ``cfg.host`` defaults to a zero-filled ``HostFacts``
-    # and the DFLASH_* serve heuristic silently falls through to the
-    # "no VRAM signal" path. Re-probe from env so the wrapper-exported
-    # LUCEBOX_HOST_* facts always win over the persisted (possibly
-    # absent) snapshot.
-    live_host = from_env()
-    host = live_host if live_host.vram_gb > 0 or live_host.nproc > 0 else cfg.host
-    return replace(
-        cfg,
-        variant=os.environ.get("LUCEBOX_VARIANT", cfg.variant),
-        image=os.environ.get("LUCEBOX_IMAGE", cfg.image),
-        container_name=os.environ.get("LUCEBOX_CONTAINER", cfg.container_name),
-        port=int(os.environ.get("LUCEBOX_PORT", str(cfg.port))),
-        models_dir=Path(os.environ.get("LUCEBOX_MODELS", str(cfg.models_dir))),
-        host=host,
-    )
+    try:
+        cfg = config_mod.load()
+        if cfg is None:
+            return live_config()
+        # Host facts exported by the wrapper take precedence over an absent or
+        # stale persisted snapshot. A zero-filled environment means the CLI was
+        # invoked directly, so retain any snapshot already in the config.
+        live_host = from_env()
+        host = live_host if live_host.vram_gb > 0 or live_host.nproc > 0 else cfg.host
+        return config_mod.overlay_env(replace(cfg, host=host))
+    except (OSError, ValueError) as exc:
+        error_console.print(f"[red]Invalid configuration:[/red] {escape(str(exc))}")
+        raise typer.Exit(code=2) from exc
+
+
+def _server_spec() -> docker_run.DockerRunSpec:
+    """Build the server command and turn user-path errors into clean CLI output."""
+    cfg = _load_or_build()
+    try:
+        return docker_run.server_run_spec(cfg)
+    except (OSError, RuntimeError, ValueError) as exc:
+        error_console.print(f"[red]Cannot build server command:[/red] {escape(str(exc))}")
+        raise typer.Exit(code=2) from exc
 
 
 # ── subcommands ────────────────────────────────────────────────────────────
@@ -112,9 +117,7 @@ def pull() -> None:
 @app.command("print-run")
 def print_run() -> None:
     """Print the docker-run command for the server (copy-pasteable)."""
-    cfg = _load_or_build()
-    spec = docker_run.server_run_spec(cfg)
-    print(spec.printable())
+    print(_server_spec().printable())
 
 
 @app.command("print-serve-argv")
@@ -125,9 +128,7 @@ def print_serve_argv() -> None:
     a separate command from `print-run` so the bash side has a guaranteed
     machine-readable contract that's independent of the pretty formatter.
     """
-    cfg = _load_or_build()
-    spec = docker_run.server_run_spec(cfg)
-    for tok in spec.argv():
+    for tok in _server_spec().argv():
         print(tok)
 
 
@@ -145,8 +146,8 @@ def config_get_cmd(
     """Print a single key (or every reachable key) with its origin annotation."""
     try:
         entries = config_get(key or None)
-    except KeyError as exc:
-        console.print(f"[red]{escape(str(exc))}[/red]")
+    except (KeyError, OSError, ValueError) as exc:
+        error_console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(code=2) from exc
     for k, (value, origin) in entries.items():
         console.print(f"{k} = {escape(repr(value))} ([dim]from {origin}[/dim])")
@@ -170,8 +171,8 @@ def config_set_cmd(
     value = value.strip()
     try:
         config_set(key, value)
-    except (KeyError, ValueError) as exc:
-        console.print(f"[red]{escape(str(exc))}[/red]")
+    except (KeyError, OSError, ValueError) as exc:
+        error_console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(code=2) from exc
     console.print(f"[green]Set[/green] {escape(key)} = {escape(value)}")
 
@@ -183,8 +184,8 @@ def config_unset_cmd(
     """Remove a key from config.toml. Next read uses the live default."""
     try:
         changed = config_unset(key)
-    except KeyError as exc:
-        console.print(f"[red]{escape(str(exc))}[/red]")
+    except (KeyError, OSError, ValueError) as exc:
+        error_console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(code=2) from exc
     if changed:
         console.print(f"[green]Unset[/green] {escape(key)}")

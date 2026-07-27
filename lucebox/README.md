@@ -1,21 +1,22 @@
-# lucebox — host CLI for the lucebox-hub container
+# lucebox — CLI for the Lucebox inference appliance
 
-This package ships *inside* the `ghcr.io/luce-org/lucebox-hub` Docker image
-and is invoked from the host via the [`lucebox.sh`](../lucebox.sh) wrapper:
+This Python package ships inside the `ghcr.io/luce-org/lucebox-hub` image. Most
+users do not install it directly: they install the small
+[`lucebox` host wrapper](https://github.com/Luce-Org/lucebox/blob/main/lucebox.sh),
+which invokes the package in the appropriate container:
 
-    lucebox.sh check          # `docker run … lucebox check`
-    lucebox.sh config get
-    lucebox.sh print-run
+    lucebox check
+    lucebox models list
+    lucebox models download qwen3.6-27b --activate
+    lucebox start
 
-The wrapper is the only thing that runs on the host. It selects CUDA for a
-working NVIDIA GPU (including RTX 3090 + Strix builds) and ROCm for AMD builds
-(including R9700 + Strix), then applies the matching Docker device flags.
-Everything else (host
-checks, TOML config, docker daemon calls, model download) is Python in the
-container. Host facts (driver/runtime, GPU, RAM, VRAM, systemd availability) are
-passed in via `LUCEBOX_HOST_*` environment variables so the Python side
-doesn't reprobe. The autotune sweep, profiling, and agent-client launchers
-land in follow-up PRs.
+The wrapper detects the host and selects CUDA for NVIDIA builds (including RTX
+3090 + Strix) or ROCm for AMD builds (including R9700 + Strix). The package then
+handles readiness checks, TOML configuration, model selection and download,
+optimization settings, and construction of the final server command. Host
+facts are passed through `LUCEBOX_HOST_*` environment variables so the
+container never has to guess the host configuration.
 
-Subcommands are defined in [`lucebox/cli.py`](src/lucebox/cli.py). See the
-top-level [README.md](../README.md) for the user-facing flow.
+See the [project README](https://github.com/Luce-Org/lucebox#readme) for the
+installation and user flow. Contributors can find the CLI implementation in
+[`src/lucebox`](https://github.com/Luce-Org/lucebox/tree/main/lucebox/src/lucebox).

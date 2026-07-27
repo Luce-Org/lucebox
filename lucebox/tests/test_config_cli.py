@@ -138,3 +138,16 @@ def test_load_or_build_no_toml_env_overrides_defaults(
     monkeypatch.setenv("LUCEBOX_IMAGE", "ghcr.io/myfork/lucebox-hub")
     cfg = _load_or_build()
     assert cfg.image == "ghcr.io/myfork/lucebox-hub"
+
+
+def test_print_run_reports_invalid_configuration_without_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_config_path(tmp_path, monkeypatch)
+    monkeypatch.setenv("LUCEBOX_PORT", "0")
+
+    result = CliRunner().invoke(app, ["print-run"])
+
+    assert result.exit_code == 2
+    assert "Invalid configuration" in result.output
+    assert "Traceback" not in result.output

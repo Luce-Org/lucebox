@@ -7,6 +7,8 @@ behavior contract — what gets requested, when downloads are skipped —
 stays pinned without actually talking to the Hub.
 """
 
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,6 +23,22 @@ from lucebox.download import (
 from lucebox.types import HostFacts
 
 from lucebox import download
+
+
+def test_import_does_not_mutate_huggingface_environment() -> None:
+    code = (
+        "import os; "
+        "os.environ.pop('HF_HUB_DISABLE_XET', None); "
+        "import lucebox.download; "
+        "assert 'HF_HUB_DISABLE_XET' not in os.environ"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_default_preset_uses_quantized_gguf_draft():

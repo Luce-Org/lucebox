@@ -13,9 +13,41 @@ import os
 import shlex
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from lucebox.types import Config, GpuVendor
+
+_CONTAINER_MODELS = "/opt/lucebox-hub/server/models"
+_CONTAINER_RESOLVED_MODELS = "/opt/lucebox-resolved"
+
+
+@dataclass(frozen=True, slots=True)
+class BindMount:
+    """One explicit Docker bind mount.
+
+    ``read_only`` is part of the type so sensitive compatibility mounts cannot
+    accidentally become writable during argv rendering.
+    """
+
+    source: str
+    target: str
+    read_only: bool = False
+
+    def __post_init__(self) -> None:
+        if not Path(self.source).is_absolute():
+            raise ValueError(f"bind-mount source must be absolute, got {self.source!r}")
+        if not PurePosixPath(self.target).is_absolute():
+            raise ValueError(f"bind-mount target must be absolute, got {self.target!r}")
+        for label, value in (("source", self.source), ("target", self.target)):
+            if "," in value or any(char in value for char in "\n\r\0"):
+                raise ValueError(
+                    f"bind-mount {label} contains a character unsupported by "
+                    f"Docker --mount: {value!r}"
+                )
+
+    def argument(self) -> str:
+        option = f"type=bind,source={self.source},target={self.target}"
+        return f"{option},readonly" if self.read_only else option
 
 
 def _host_facts_env() -> list[tuple[str, str]]:
@@ -69,27 +101,68 @@ def _resolve_model_files(cfg: Config) -> tuple[str, str, str]:
                 draft = pres.draft_file
             if not draft and pres.speculator_dir:
                 spec_path = cfg.models_dir / "draft" / pres.speculator_dir
-                if spec_path.is_dir():
+                if spec_path.is_dir() or spec_path.is_symlink():
                     draft_dir = pres.speculator_dir
     return target, draft, draft_dir
 
 
-def _runtime_volumes(cfg: Config) -> tuple[tuple[str, str], ...]:
-    """Mount models, $HOME, and any config dir outside the home mount."""
-    home_path = Path.home()
-    home = str(home_path)
-    models = str(cfg.models_dir)
-    volumes = [(models, "/opt/lucebox-hub/server/models")]
-    if home != models:
-        volumes.append((home, home))
+def _runtime_volumes(cfg: Config) -> tuple[BindMount, ...]:
+    """Mount only the writable application data needed by the server."""
+    models = str(cfg.models_dir.absolute())
     config_home = Path(
-        os.environ.get("LUCEBOX_HOME") or home_path / ".lucebox"
+        os.environ.get("LUCEBOX_HOME") or Path.home() / ".lucebox"
     ).absolute()
-    # The same-path home mount normally covers config. If models_dir == HOME,
-    # that path is mounted at /opt/... instead, so add config explicitly too.
-    if home == models or not config_home.is_relative_to(home_path):
-        volumes.append((str(config_home), str(config_home)))
-    return tuple(volumes)
+    return (
+        BindMount(models, _CONTAINER_MODELS),
+        BindMount(str(config_home), str(config_home)),
+    )
+
+
+def _validate_model_relative_path(value: str, field: str) -> PurePosixPath:
+    """Validate a config-provided path intended to live below models_dir."""
+    relative = PurePosixPath(value)
+    if relative.is_absolute() or ".." in relative.parts or value in {"", "."}:
+        raise ValueError(f"{field} must be a path below models_dir, got {value!r}")
+    return relative
+
+
+def _selected_model_path(
+    cfg: Config,
+    value: str,
+    *,
+    field: str,
+    role: str,
+    under_draft: bool,
+    directory: bool,
+    mounts: list[BindMount],
+) -> str:
+    """Return the container path for one explicitly selected model artifact.
+
+    Normal files are already covered by the models-directory bind mount.  For
+    a symlink, bind only its resolved file (or the selected directory for a
+    speculator) into a dedicated read-only location. This preserves symlinked
+    model workflows without exposing the user's home or adjacent model files.
+    """
+    relative = _validate_model_relative_path(value, field)
+    base = cfg.models_dir / "draft" if under_draft else cfg.models_dir
+    host_path = base.joinpath(*relative.parts)
+    container_base = PurePosixPath(_CONTAINER_MODELS)
+    if under_draft:
+        container_base /= "draft"
+    canonical = str(container_base.joinpath(*relative.parts))
+    lexical = host_path.absolute()
+    resolved = host_path.resolve(strict=False)
+    if resolved == lexical:
+        return canonical
+
+    mount_target = f"{_CONTAINER_RESOLVED_MODELS}/{role}"
+    if directory:
+        mounts.append(BindMount(str(resolved), mount_target, read_only=True))
+        return mount_target
+
+    container_path = f"{mount_target}/{resolved.name}"
+    mounts.append(BindMount(str(resolved), container_path, read_only=True))
+    return container_path
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +176,7 @@ class DockerRunSpec:
     detach: bool = False
     remove: bool = True
     port_publish: tuple[int, int] | None = None  # (host, container)
-    volumes: tuple[tuple[str, str], ...] = ()
+    volumes: tuple[BindMount, ...] = ()
     env: tuple[tuple[str, str], ...] = ()
     entrypoint_args: tuple[str, ...] = ()
     extra: tuple[str, ...] = ()
@@ -133,8 +206,8 @@ class DockerRunSpec:
         if self.port_publish is not None:
             host, container = self.port_publish
             out += ["-p", f"{host}:{container}"]
-        for host_path, container_path in self.volumes:
-            out += ["-v", f"{host_path}:{container_path}"]
+        for mount in self.volumes:
+            out += ["--mount", mount.argument()]
         for k, v in self.env:
             out += ["-e", f"{k}={v}"]
         out += list(self.extra)
@@ -161,6 +234,7 @@ class DockerRunSpec:
                 "--gpus",
                 "--env",
                 "--volume",
+                "--mount",
                 "--publish",
                 "--entrypoint",
                 "--device",
@@ -204,12 +278,40 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
     # draft_dir is a subdirectory of models/draft/ holding a safetensors speculator;
     # it takes effect only when draft_file is empty and the directory exists on disk.
     target_file, draft_file, draft_dir = _resolve_model_files(cfg)
+    volumes = list(_runtime_volumes(cfg))
     if target_file:
-        env.append(("DFLASH_TARGET", f"/opt/lucebox-hub/server/models/{target_file}"))
+        target_path = _selected_model_path(
+            cfg,
+            target_file,
+            field="model.target_file",
+            role="target",
+            under_draft=False,
+            directory=False,
+            mounts=volumes,
+        )
+        env.append(("DFLASH_TARGET", target_path))
     if draft_file:
-        env.append(("DFLASH_DRAFT", f"/opt/lucebox-hub/server/models/draft/{draft_file}"))
+        draft_path = _selected_model_path(
+            cfg,
+            draft_file,
+            field="model.draft_file",
+            role="draft",
+            under_draft=True,
+            directory=False,
+            mounts=volumes,
+        )
+        env.append(("DFLASH_DRAFT", draft_path))
     elif draft_dir:
-        env.append(("DFLASH_DRAFT", f"/opt/lucebox-hub/server/models/draft/{draft_dir}"))
+        draft_path = _selected_model_path(
+            cfg,
+            draft_dir,
+            field="model.speculator_dir",
+            role="draft-dir",
+            under_draft=True,
+            directory=True,
+            mounts=volumes,
+        )
+        env.append(("DFLASH_DRAFT", draft_path))
     elif cfg.model.preset:
         # An active target-only preset is an explicit choice, not permission
         # for entrypoint.sh to scan models/draft and attach an unrelated stale
@@ -267,7 +369,7 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
         remove=True,
         detach=False,
         port_publish=(cfg.port, 8080),
-        volumes=_runtime_volumes(cfg),
+        volumes=tuple(volumes),
         env=tuple(env),
     )
 

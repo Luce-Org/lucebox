@@ -95,8 +95,12 @@ run_logged_capture() {
     note "run: $* > $out"
     {
         printf '\n===== %s > %s =====\n' "$*" "$out"
-        "$@"
-        local rc=$?
+        local rc
+        if "$@"; then
+            rc=0
+        else
+            rc=$?
+        fi
         printf '===== exit=%s =====\n' "$rc"
         return "$rc"
     } 2>&1 | tee "$out" | tee -a "$LOG" >/dev/null
@@ -164,10 +168,9 @@ run_logged_capture "$ROOT/help.out" lucebox help
 assert_contains "$ROOT/help.out" "LUCEBOX_VARIANT"
 assert_contains "$ROOT/help.out" "LUCEBOX_IMAGE"
 
-docker manifest inspect "${IMAGE}:${VARIANT}" >/dev/null
-pass "image manifest exists: ${IMAGE}:${VARIANT}"
-
 if [ "$RUN_PULL" = "1" ]; then
+    docker manifest inspect "${IMAGE}:${VARIANT}" >/dev/null
+    pass "image manifest exists: ${IMAGE}:${VARIANT}"
     run_logged_capture "$ROOT/pull.out" lucebox pull
     assert_contains "$ROOT/pull.out" "${IMAGE}:${VARIANT}"
 fi

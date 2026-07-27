@@ -1,6 +1,6 @@
-"""Entry point for `python -m lucebox`."""
+"""Entry point for ``python -m lucebox``."""
 
-from lucebox.cli import app
+from lucebox.cli import main
 
 if __name__ == "__main__":
-    app()
+    main()

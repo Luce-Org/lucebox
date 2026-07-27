@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 
 import pytest
-from lucebox.cli import app
+from lucebox.cli import __version__, app
 from typer.testing import CliRunner
 
 
@@ -55,6 +55,14 @@ def test_core_verbs_present_in_app() -> None:
     }
     for verb in ("check", "pull", "print-run", "print-serve-argv", "version"):
         assert verb in registered
+
+
+@pytest.mark.parametrize("args", [["version"], ["--version"]])
+def test_version_command_and_option_match(args: list[str]) -> None:
+    result = CliRunner().invoke(app, args)
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == __version__
 
 
 def test_legacy_subcommands_are_removed() -> None:

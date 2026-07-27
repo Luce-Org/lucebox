@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from lucebox.download import PRESETS
 from lucebox.types import Config, DflashRuntime, HostFacts, ModelMeta
 
@@ -43,7 +44,9 @@ def test_argv_flags_and_ordering() -> None:
         detach=True,
         remove=False,
         port_publish=(8080, 8080),
-        volumes=(("/host/models", "/opt/lucebox-hub/server/models"),),
+        volumes=(
+            docker_run.BindMount("/host/models", "/opt/lucebox-hub/server/models"),
+        ),
         env=(("DFLASH_BUDGET", "22"),),
         entrypoint_args=("serve",),
         extra=("--shm-size", "1g"),
@@ -53,14 +56,29 @@ def test_argv_flags_and_ordering() -> None:
     assert "-d" in argv  # detach
     assert "--gpus" not in argv  # gpus=False
     assert ["-p", "8080:8080"] == argv[argv.index("-p") : argv.index("-p") + 2]
-    assert ["-v", "/host/models:/opt/lucebox-hub/server/models"] == argv[
-        argv.index("-v") : argv.index("-v") + 2
+    mount_arg = "type=bind,source=/host/models,target=/opt/lucebox-hub/server/models"
+    assert ["--mount", mount_arg] == argv[
+        argv.index("--mount") : argv.index("--mount") + 2
     ]
     assert ["-e", "DFLASH_BUDGET=22"] == argv[argv.index("-e") : argv.index("-e") + 2]
     # extra flags precede the image; entrypoint_args follow it.
     assert argv[-1] == "serve"
     assert argv[-2] == "img:tag"
     assert argv.index("--shm-size") < argv.index("img:tag")
+
+
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        ("relative", "/container"),
+        ("/host", "relative"),
+        ("/host,comma", "/container"),
+        ("/host", "/container\nnewline"),
+    ],
+)
+def test_bind_mount_rejects_ambiguous_paths(source: str, target: str) -> None:
+    with pytest.raises(ValueError, match="bind-mount"):
+        docker_run.BindMount(source, target)
 
 
 def test_argv_amd_uses_rocm_device_contract() -> None:
@@ -100,12 +118,21 @@ def test_printable_glues_value_taking_flags() -> None:
 # ── _runtime_volumes ─────────────────────────────────────────────────────────
 
 
-def test_runtime_volumes_mounts_models_and_home(tmp_path: Path) -> None:
+def test_runtime_volumes_mounts_only_models_and_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    monkeypatch.delenv("LUCEBOX_HOME", raising=False)
     cfg = Config(models_dir=tmp_path / "models")
     vols = docker_run._runtime_volumes(cfg)
-    assert (str(tmp_path / "models"), "/opt/lucebox-hub/server/models") in vols
-    # $HOME is also mounted so absolute symlink targets resolve in-container.
-    assert any(host == str(Path.home()) for host, _ in vols)
+    assert docker_run.BindMount(
+        str(tmp_path / "models"), "/opt/lucebox-hub/server/models"
+    ) in vols
+    assert docker_run.BindMount(
+        str(home / ".lucebox"), str(home / ".lucebox")
+    ) in vols
+    assert all(mount.source != str(home) for mount in vols)
 
 
 def test_runtime_volumes_dedupes_when_models_is_home(monkeypatch, tmp_path: Path) -> None:
@@ -113,10 +140,16 @@ def test_runtime_volumes_dedupes_when_models_is_home(monkeypatch, tmp_path: Path
     monkeypatch.delenv("LUCEBOX_HOME", raising=False)
     cfg = Config(models_dir=tmp_path)
     vols = docker_run._runtime_volumes(cfg)
-    # models_dir == home is mounted at /opt/..., not at its host path, so the
-    # nested config directory still needs an explicit same-path mount.
+    # models_dir is mounted at the image's canonical path, while config keeps
+    # its same-path mount. The parent home directory itself is never exposed.
     assert len(vols) == 2
-    assert (str(tmp_path / ".lucebox"), str(tmp_path / ".lucebox")) in vols
+    assert docker_run.BindMount(
+        str(tmp_path / ".lucebox"), str(tmp_path / ".lucebox")
+    ) in vols
+    assert all(
+        mount.source != str(tmp_path) or mount.target != str(tmp_path)
+        for mount in vols
+    )
 
 
 def test_runtime_volumes_mounts_custom_config_home(
@@ -129,7 +162,7 @@ def test_runtime_volumes_mounts_custom_config_home(
 
     vols = docker_run._runtime_volumes(Config(models_dir=tmp_path / "models"))
 
-    assert (str(config_home), str(config_home)) in vols
+    assert docker_run.BindMount(str(config_home), str(config_home)) in vols
 
 
 def test_empty_lucebox_home_uses_default(monkeypatch, tmp_path: Path) -> None:
@@ -190,7 +223,69 @@ def test_server_run_spec_top_level_shape(tmp_path: Path) -> None:
     assert spec.remove is True
     assert spec.detach is False
     assert spec.port_publish == (9000, 8080)
-    assert (str(tmp_path), "/opt/lucebox-hub/server/models") in spec.volumes
+    assert docker_run.BindMount(
+        str(tmp_path), "/opt/lucebox-hub/server/models"
+    ) in spec.volumes
+
+
+def test_server_run_spec_mounts_selected_symlink_target_narrowly_read_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    models = tmp_path / "models"
+    external = home / "model-cache"
+    models.mkdir()
+    external.mkdir(parents=True)
+    target = external / "target.gguf"
+    target.write_bytes(b"model")
+    (models / "selected.gguf").symlink_to(target)
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+
+    spec = docker_run.server_run_spec(
+        Config(models_dir=models, model=ModelMeta(target_file="selected.gguf"))
+    )
+
+    assert docker_run.BindMount(
+        str(target),
+        "/opt/lucebox-resolved/target/target.gguf",
+        read_only=True,
+    ) in spec.volumes
+    assert _env(spec)["DFLASH_TARGET"] == "/opt/lucebox-resolved/target/target.gguf"
+    assert all(mount.source != str(home) for mount in spec.volumes)
+    argv = spec.argv()
+    mount_args = [argv[i + 1] for i, token in enumerate(argv) if token == "--mount"]
+    assert any(
+        "target=/opt/lucebox-resolved/target/target.gguf,readonly" in argument
+        for argument in mount_args
+    )
+
+
+def test_server_run_spec_resolves_symlinked_model_parent(tmp_path: Path) -> None:
+    models = tmp_path / "models"
+    external = tmp_path / "external"
+    models.mkdir()
+    external.mkdir()
+    target = external / "nested.gguf"
+    target.write_bytes(b"model")
+    (models / "selected").symlink_to(external, target_is_directory=True)
+
+    spec = docker_run.server_run_spec(
+        Config(models_dir=models, model=ModelMeta(target_file="selected/nested.gguf"))
+    )
+
+    assert docker_run.BindMount(
+        str(target),
+        "/opt/lucebox-resolved/target/nested.gguf",
+        read_only=True,
+    ) in spec.volumes
+    assert _env(spec)["DFLASH_TARGET"] == "/opt/lucebox-resolved/target/nested.gguf"
+
+
+def test_server_run_spec_rejects_model_path_traversal(tmp_path: Path) -> None:
+    cfg = Config(models_dir=tmp_path, model=ModelMeta(target_file="../secret.gguf"))
+
+    with pytest.raises(ValueError, match="below models_dir"):
+        docker_run.server_run_spec(cfg)
 
 
 def test_server_run_spec_rocm_uses_amd_devices_on_heterogeneous_host(tmp_path: Path) -> None:
