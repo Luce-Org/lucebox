@@ -7,9 +7,12 @@ and is invoked from the host via the [`lucebox.sh`](../lucebox.sh) wrapper:
     lucebox.sh config get
     lucebox.sh print-run
 
-The wrapper is the only thing that runs on the host; everything else (host
+The wrapper is the only thing that runs on the host. It selects CUDA for a
+working NVIDIA GPU (including RTX 3090 + Strix builds) and ROCm for AMD builds
+(including R9700 + Strix), then applies the matching Docker device flags.
+Everything else (host
 checks, TOML config, docker daemon calls, model download) is Python in the
-container. Host facts (driver, GPU, RAM, VRAM, systemd availability) are
+container. Host facts (driver/runtime, GPU, RAM, VRAM, systemd availability) are
 passed in via `LUCEBOX_HOST_*` environment variables so the Python side
 doesn't reprobe. The autotune sweep, profiling, and agent-client launchers
 land in follow-up PRs.

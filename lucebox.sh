@@ -3,8 +3,8 @@
 #
 # Two jobs:
 #
-#   1) Probe the host (driver, docker, NVIDIA Container Toolkit, VRAM, RAM,
-#      systemd), select the CUDA 12 image, and
+#   1) Probe the host (NVIDIA/AMD GPU, driver/runtime, docker, VRAM, RAM,
+#      systemd), select the CUDA 12 or ROCm image, and
 #      dispatch into the in-container Python CLI via `docker run`. The
 #      Python CLI lives at /opt/lucebox-hub/lucebox/ inside the image and is
 #      the single source of truth for orchestration logic — TOML config,
@@ -175,12 +175,22 @@ IMAGE_BASE=$(_lucebox_resolve "${LUCEBOX_IMAGE:-}" image.registry "$(_lucebox_de
 : "${LUCEBOX_HOST_NPROC:=1}"
 : "${LUCEBOX_HOST_RAM_GB:=0}"
 : "${LUCEBOX_HOST_GPU_VENDOR:=none}"
+: "${LUCEBOX_HOST_HAS_NVIDIA_GPU:=0}"
+: "${LUCEBOX_HOST_HAS_AMD_GPU:=0}"
 : "${LUCEBOX_HOST_GPU_NAME:=}"
 : "${LUCEBOX_HOST_GPU_COUNT:=0}"
 : "${LUCEBOX_HOST_VRAM_GB:=0}"
 : "${LUCEBOX_HOST_GPU_SM:=}"
 : "${LUCEBOX_HOST_DRIVER_VERSION:=}"
 : "${LUCEBOX_HOST_DRIVER_MAJOR:=0}"
+: "${LUCEBOX_HOST_ROCM_VERSION:=}"
+: "${LUCEBOX_HOST_HAS_KFD:=0}"
+: "${LUCEBOX_HOST_HAS_DRI:=0}"
+: "${LUCEBOX_HOST_AMD_GPU_NAME:=}"
+: "${LUCEBOX_HOST_AMD_GPU_COUNT:=0}"
+: "${LUCEBOX_HOST_AMD_VRAM_GB:=0}"
+: "${LUCEBOX_HOST_AMD_GPU_ARCH:=}"
+: "${LUCEBOX_HOST_AMD_GPU_LIST_CSV:=}"
 : "${LUCEBOX_HOST_HAS_SYSTEMD:=0}"
 : "${LUCEBOX_HOST_IS_WSL:=0}"
 : "${LUCEBOX_HOST_HAS_DOCKER:=0}"
@@ -197,6 +207,7 @@ IMAGE_BASE=$(_lucebox_resolve "${LUCEBOX_IMAGE:-}" image.registry "$(_lucebox_de
 : "${LUCEBOX_HOST_CPU_MODEL:=}"
 : "${LUCEBOX_HOST_GPU_LIST_CSV:=}"
 : "${LUCEBOX_HOST_CUDA_VISIBLE_DEVICES:=}"
+: "${LUCEBOX_HOST_HIP_VISIBLE_DEVICES:=}"
 # Tracks whether probe_host has actually run; pieces of the code that need
 # fresh host facts (e.g. cmd_check, cmd_serve) gate on this. Default 0.
 : "${_LUCEBOX_HOST_PROBED:=0}"
@@ -221,6 +232,63 @@ die()   { err "$*"; exit 1; }
 # (passed through with -e). The Python side trusts these and doesn't reprobe
 # — it can't see the host's /proc anyway, only the container's.
 
+# Normalize ``amd-smi static --asic --vram --csv`` into the compact internal
+# form ``index|name|gfx_arch|vram_mib``. Header lookup keeps this resilient to
+# columns being added or reordered by future amd-smi releases.
+_parse_amd_smi_csv() {
+    awk -F',' '
+        NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                key = $i
+                gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", key)
+                col[key] = i
+            }
+            next
+        }
+        {
+            idx = $(col["gpu"])
+            name = $(col["market_name"])
+            arch = $(col["target_graphics_version"])
+            mem = $(col["size"])
+            gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", idx)
+            gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", name)
+            gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", arch)
+            gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", mem)
+            if (idx ~ /^[0-9]+$/ && arch ~ /^gfx[0-9a-z]+$/ && mem ~ /^[0-9]+([.][0-9]+)?$/)
+                printf "%s|%s|%s|%d\n", idx, name, arch, mem
+        }
+    '
+}
+
+# Older ROCm installs ship rocm-smi but not amd-smi. Normalize its CSV to the
+# same internal form; rocm-smi reports VRAM in bytes rather than MiB.
+_parse_rocm_smi_csv() {
+    awk -F',' '
+        NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                key = $i
+                gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", key)
+                col[key] = i
+            }
+            next
+        }
+        {
+            dev = $(col["device"])
+            bytes = $(col["VRAM Total Memory (B)"])
+            name = $(col["Card Series"])
+            arch = $(col["GFX Version"])
+            gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", dev)
+            gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", bytes)
+            gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", name)
+            gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", arch)
+            idx = dev
+            sub(/^card/, "", idx)
+            if (idx ~ /^[0-9]+$/ && arch ~ /^gfx[0-9a-z]+$/ && bytes ~ /^[0-9]+$/)
+                printf "%s|%s|%s|%d\n", idx, name, arch, bytes / 1048576
+        }
+    '
+}
+
 probe_host() {
     LUCEBOX_HOST_NPROC=$(nproc 2>/dev/null || echo 1)
     # RAM: try Linux /proc/meminfo first, then macOS/BSD sysctl, else 0.
@@ -232,18 +300,30 @@ probe_host() {
         LUCEBOX_HOST_RAM_GB=$(( mem_bytes / 1024 / 1024 / 1024 ))
     fi
     LUCEBOX_HOST_GPU_VENDOR="none"
+    LUCEBOX_HOST_HAS_NVIDIA_GPU=0
+    LUCEBOX_HOST_HAS_AMD_GPU=0
     LUCEBOX_HOST_GPU_NAME=""
     LUCEBOX_HOST_GPU_COUNT=0
     LUCEBOX_HOST_VRAM_GB=0
     LUCEBOX_HOST_GPU_SM=""
     LUCEBOX_HOST_DRIVER_VERSION=""
     LUCEBOX_HOST_DRIVER_MAJOR=0
+    LUCEBOX_HOST_GPU_LIST_CSV=""
+    LUCEBOX_HOST_ROCM_VERSION=""
+    LUCEBOX_HOST_HAS_KFD=0
+    LUCEBOX_HOST_HAS_DRI=0
+    LUCEBOX_HOST_AMD_GPU_NAME=""
+    LUCEBOX_HOST_AMD_GPU_COUNT=0
+    LUCEBOX_HOST_AMD_VRAM_GB=0
+    LUCEBOX_HOST_AMD_GPU_ARCH=""
+    LUCEBOX_HOST_AMD_GPU_LIST_CSV=""
 
     if command -v nvidia-smi &>/dev/null; then
         local q
         if q=$(nvidia-smi --query-gpu=name,memory.total,driver_version,compute_cap \
                           --format=csv,noheader,nounits 2>/dev/null) && [ -n "$q" ]; then
             LUCEBOX_HOST_GPU_VENDOR="nvidia"
+            LUCEBOX_HOST_HAS_NVIDIA_GPU=1
             LUCEBOX_HOST_GPU_NAME=$(printf '%s\n' "$q" | head -1 | awk -F', ' '{print $1}')
             local mem_mib
             mem_mib=$(printf '%s\n' "$q" | head -1 | awk -F', ' '{print $2}')
@@ -264,8 +344,96 @@ probe_host() {
             --query-gpu=index,uuid,pci.bus_id,name,compute_cap,memory.total,power.limit \
             --format=csv,noheader 2>/dev/null || echo "")
     fi
+
+    # Probe AMD independently even on mixed NVIDIA + Strix systems. A working
+    # NVIDIA GPU remains the default backend (RTX 3090 + Strix → cuda12), but
+    # recording the AMD companion prevents the APU from confusing readiness
+    # reporting and lets an explicit rocm variant remain possible.
+    local amd_csv="" amd_rows=""
+    if command -v amd-smi &>/dev/null; then
+        amd_csv=$(amd-smi static --asic --vram --csv 2>/dev/null || echo "")
+        if [ -n "$amd_csv" ]; then
+            amd_rows=$(printf '%s\n' "$amd_csv" | _parse_amd_smi_csv)
+        fi
+    fi
+    if [ -z "$amd_rows" ] && command -v rocm-smi &>/dev/null; then
+        amd_csv=$(rocm-smi --showproductname --showmeminfo vram --csv 2>/dev/null || echo "")
+        if [ -n "$amd_csv" ]; then
+            amd_rows=$(printf '%s\n' "$amd_csv" | _parse_rocm_smi_csv)
+        fi
+    fi
+    # Minimal fallback for ROCm installations without either SMI frontend.
+    if [ -z "$amd_rows" ] && [ -e /dev/kfd ] && command -v rocminfo &>/dev/null; then
+        local roc_arches
+        roc_arches=$(rocminfo 2>/dev/null \
+            | awk '/^[[:space:]]*Name:[[:space:]]+gfx[0-9a-z]+/{print $2}' \
+            | awk '!seen[$0]++' || echo "")
+        if [ -n "$roc_arches" ]; then
+            local amd_idx=0 arch
+            while IFS= read -r arch; do
+                amd_rows+="${amd_idx}|AMD GPU|${arch}|0"$'\n'
+                amd_idx=$((amd_idx + 1))
+            done <<<"$roc_arches"
+            amd_rows=${amd_rows%$'\n'}
+        fi
+    fi
+
+    if [ -n "$amd_rows" ]; then
+        LUCEBOX_HOST_HAS_AMD_GPU=1
+        LUCEBOX_HOST_AMD_GPU_COUNT=$(printf '%s\n' "$amd_rows" | awk 'NF{n++} END{print n+0}')
+        local amd_primary
+        amd_primary=$(printf '%s\n' "$amd_rows" | sort -t'|' -k4,4nr | head -1)
+        local amd_idx amd_name amd_arch amd_mem_mib
+        IFS='|' read -r amd_idx amd_name amd_arch amd_mem_mib <<<"$amd_primary"
+        LUCEBOX_HOST_AMD_GPU_NAME="$amd_name"
+        LUCEBOX_HOST_AMD_GPU_ARCH="$amd_arch"
+        LUCEBOX_HOST_AMD_VRAM_GB=$((amd_mem_mib / 1024))
+        LUCEBOX_HOST_AMD_GPU_LIST_CSV=$(printf '%s\n' "$amd_rows" \
+            | awk -F'|' '{printf "%s, , , %s, %s, %s MiB,\n", $1, $2, $3, $4}')
+        # Strix Halo exposes most memory as unified system RAM, while SMI may
+        # report only a 512 MiB carve-out. Use host RAM as the effective model
+        # capacity on a Strix-only build; a discrete R9700 remains primary on
+        # the R9700 + Strix build because it has the largest physical VRAM.
+        if [ "$amd_arch" = "gfx1151" ] \
+           && [ "$LUCEBOX_HOST_AMD_VRAM_GB" -lt 12 ] \
+           && [ "$LUCEBOX_HOST_RAM_GB" -ge 32 ]; then
+            LUCEBOX_HOST_AMD_VRAM_GB=$LUCEBOX_HOST_RAM_GB
+        fi
+
+        if command -v amd-smi &>/dev/null; then
+            LUCEBOX_HOST_ROCM_VERSION=$(amd-smi version 2>/dev/null \
+                | sed -n 's/.*ROCm version: \([^ |]*\).*/\1/p' \
+                | head -1 || echo "")
+        fi
+        if [ -z "$LUCEBOX_HOST_ROCM_VERSION" ] && command -v hipconfig &>/dev/null; then
+            LUCEBOX_HOST_ROCM_VERSION=$(hipconfig --version 2>/dev/null \
+                | sed 's/-.*//' | head -1 || echo "")
+        fi
+
+        if [ "$LUCEBOX_HOST_GPU_VENDOR" = "none" ]; then
+            LUCEBOX_HOST_GPU_VENDOR="amd"
+            LUCEBOX_HOST_GPU_NAME="$LUCEBOX_HOST_AMD_GPU_NAME"
+            LUCEBOX_HOST_GPU_COUNT=$LUCEBOX_HOST_AMD_GPU_COUNT
+            LUCEBOX_HOST_VRAM_GB=$LUCEBOX_HOST_AMD_VRAM_GB
+            LUCEBOX_HOST_GPU_SM="$LUCEBOX_HOST_AMD_GPU_ARCH"
+            LUCEBOX_HOST_GPU_LIST_CSV="$LUCEBOX_HOST_AMD_GPU_LIST_CSV"
+        fi
+    fi
+
+    if [ -r /dev/kfd ] && [ -w /dev/kfd ]; then
+        LUCEBOX_HOST_HAS_KFD=1
+    fi
+    local render_node
+    for render_node in /dev/dri/renderD*; do
+        [ -e "$render_node" ] || continue
+        if [ -r "$render_node" ] && [ -w "$render_node" ]; then
+            LUCEBOX_HOST_HAS_DRI=1
+            break
+        fi
+    done
     # CUDA_VISIBLE_DEVICES from the caller's env (empty default = "all GPUs").
     LUCEBOX_HOST_CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
+    LUCEBOX_HOST_HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-}"
 
     # OS / kernel identity. /etc/os-release is the freedesktop spec for
     # "what distro is this?" and we keep PRETTY_NAME verbatim (it already
@@ -338,14 +506,20 @@ probe_host() {
     fi
 
     export LUCEBOX_HOST_NPROC LUCEBOX_HOST_RAM_GB LUCEBOX_HOST_GPU_VENDOR
+    export LUCEBOX_HOST_HAS_NVIDIA_GPU LUCEBOX_HOST_HAS_AMD_GPU
     export LUCEBOX_HOST_GPU_NAME LUCEBOX_HOST_GPU_COUNT LUCEBOX_HOST_VRAM_GB
     export LUCEBOX_HOST_GPU_SM LUCEBOX_HOST_DRIVER_VERSION LUCEBOX_HOST_DRIVER_MAJOR
     export LUCEBOX_HOST_HAS_SYSTEMD LUCEBOX_HOST_IS_WSL
     export LUCEBOX_HOST_HAS_DOCKER LUCEBOX_HOST_DOCKER_VERSION
     export LUCEBOX_HOST_HAS_CTK
+    export LUCEBOX_HOST_ROCM_VERSION LUCEBOX_HOST_HAS_KFD LUCEBOX_HOST_HAS_DRI
+    export LUCEBOX_HOST_AMD_GPU_NAME LUCEBOX_HOST_AMD_GPU_COUNT
+    export LUCEBOX_HOST_AMD_VRAM_GB LUCEBOX_HOST_AMD_GPU_ARCH
+    export LUCEBOX_HOST_AMD_GPU_LIST_CSV
     export LUCEBOX_HOST_OS_PRETTY LUCEBOX_HOST_KERNEL LUCEBOX_HOST_WSL_VERSION
     export LUCEBOX_HOST_NVIDIA_CTK_VERSION LUCEBOX_HOST_CPU_MODEL
     export LUCEBOX_HOST_GPU_LIST_CSV LUCEBOX_HOST_CUDA_VISIBLE_DEVICES
+    export LUCEBOX_HOST_HIP_VISIBLE_DEVICES
     _LUCEBOX_HOST_PROBED=1
 }
 
@@ -357,10 +531,41 @@ ensure_probed() {
 }
 
 pick_variant() {
-    # CUDA 12.8 is the supported image variant for this branch. Effective
-    # value goes through the same env > config.toml > default ladder as
-    # everything else so `config set image.variant=...` propagates.
-    _lucebox_resolve "${LUCEBOX_VARIANT:-}" image.variant "cuda12"
+    # Explicit env/config always wins. On a fresh install choose the backend
+    # from hardware: a working NVIDIA GPU takes priority on RTX + Strix builds;
+    # otherwise an AMD GPU selects ROCm (R9700 + Strix and Strix-only builds).
+    local configured
+    if [ -n "${LUCEBOX_VARIANT:-}" ]; then
+        printf '%s' "$LUCEBOX_VARIANT"
+        return
+    fi
+    configured=$(_lucebox_config_get image.variant)
+    if [ -n "$configured" ]; then
+        printf '%s' "$configured"
+        return
+    fi
+    ensure_probed
+    if [ "$LUCEBOX_HOST_HAS_NVIDIA_GPU" = "1" ]; then
+        printf 'cuda12'
+    elif [ "$LUCEBOX_HOST_HAS_AMD_GPU" = "1" ]; then
+        printf 'rocm'
+    else
+        # Keep the historical default so `lucebox check` can still tell a
+        # GPU-less host what image it would otherwise use.
+        printf 'cuda12'
+    fi
+}
+
+_variant_is_rocm() {
+    # Variant names are not limited to the moving `rocm` tag. Releases and
+    # CI produce tags such as `0.3.0-rocm` and `pr-335-rocm`; treat any tag
+    # containing the backend marker as ROCm. Spell out case-insensitivity
+    # instead of using Bash 4's `${value,,}` so host-only commands such as
+    # `check` keep working under the older Bash bundled with macOS too.
+    case "$1" in
+        *[Rr][Oo][Cc][Mm]*) return 0 ;;
+        *)                  return 1 ;;
+    esac
 }
 
 # ── prereq checks (host-only) ─────────────────────────────────────────────
@@ -368,6 +573,9 @@ pick_variant() {
 # the richer reporting; this is the bare minimum to make `docker run` viable.
 
 require_host_prereqs() {
+    ensure_probed
+    local variant="${1:-}"
+    [ -n "$variant" ] || variant=$(pick_variant)
     local missing=0
     if ! command -v docker &>/dev/null; then
         err "docker is not installed"
@@ -379,20 +587,36 @@ require_host_prereqs() {
         missing=1
     fi
 
-    if ! command -v nvidia-smi &>/dev/null; then
-        err "nvidia-smi not found — no NVIDIA driver detected"
-        hint "Install the NVIDIA driver: https://www.nvidia.com/Download/index.aspx"
-        missing=1
-    elif ! nvidia-smi --query-gpu=name --format=csv,noheader &>/dev/null; then
-        err "nvidia-smi present but NVML calls fail — likely a driver/library mismatch"
-        hint "Reboot, or reinstall the matching NVIDIA driver package"
-        missing=1
+    if _variant_is_rocm "$variant"; then
+        if [ "$LUCEBOX_HOST_HAS_AMD_GPU" != "1" ]; then
+            err "ROCm image selected but no working AMD GPU was detected"
+            hint "Install ROCm/amd-smi, or choose LUCEBOX_VARIANT=cuda12 on an NVIDIA build."
+            missing=1
+        fi
+        if [ "$LUCEBOX_HOST_HAS_KFD" != "1" ]; then
+            err "/dev/kfd is missing or not accessible"
+            hint "Add the user to the render group, then re-login: sudo usermod -aG render \"$USER\""
+            missing=1
+        fi
+        if [ "$LUCEBOX_HOST_HAS_DRI" != "1" ]; then
+            err "no accessible /dev/dri/renderD* device was found"
+            hint "Add the user to the render and video groups, then re-login."
+            missing=1
+        fi
+    else
+        if [ "$LUCEBOX_HOST_HAS_NVIDIA_GPU" != "1" ]; then
+            err "CUDA image selected but no working NVIDIA GPU was detected"
+            hint "Install the NVIDIA driver, or choose LUCEBOX_VARIANT=rocm on an AMD build."
+            missing=1
+        fi
     fi
 
     [ "$missing" = "0" ] || exit 1
 }
 
 require_ctk() {
+    local variant="${1:-$(pick_variant)}"
+    _variant_is_rocm "$variant" && return 0
     case "$LUCEBOX_HOST_HAS_CTK" in
         runtime|cdi) return 0 ;;
         installed-unwired)
@@ -430,10 +654,9 @@ require_systemd() {
 # All the Python-CLI subcommands share the same docker run incantation:
 # mount the host docker socket (so the in-container CLI can spawn server /
 # bench containers on the host daemon), mount $HOME at the same path (so
-# paths look identical in and out), and pass host facts via env. When an
-# NVIDIA GPU is detected we also pass --gpus all so the orchestrator can
-# call nvidia-smi during profile snapshot export; without it nvidia_smi_csv (and
-# any downstream power/utilization fields) come back empty.
+# paths look identical in and out), and pass host facts via env. The selected
+# image gets its native accelerator contract: --gpus all for
+# CUDA; /dev/kfd + /dev/dri and the render/video groups for ROCm.
 
 DOCKER_SOCK_PATH="${DOCKER_HOST:-/var/run/docker.sock}"
 DOCKER_SOCK_PATH="${DOCKER_SOCK_PATH#unix://}"
@@ -467,6 +690,27 @@ _append_scalar_env() {
     return 0
 }
 
+# Append the Docker accelerator contract for the chosen image variant.
+# CUDA and ROCm use fundamentally different runtime flags; keeping this in
+# one helper prevents the orchestrator, canonical server argv, and fallback
+# server path from drifting apart.
+_append_gpu_args() {  # usage: _append_gpu_args arrayname variant
+    # shellcheck disable=SC2178
+    local -n _gpu_arr="$1"
+    local variant="$2"
+    if _variant_is_rocm "$variant"; then
+        _gpu_arr+=(
+            --device /dev/kfd
+            --device /dev/dri
+            --group-add video
+            --group-add render
+            --security-opt seccomp=unconfined
+        )
+    else
+        _gpu_arr+=(--gpus all)
+    fi
+}
+
 # Pick docker's interactive flags: -it on a real tty, -i otherwise.
 # Writes into a caller-supplied array via nameref. This MUST run in the
 # caller's scope (not a subshell or `< <(...)` process substitution): the
@@ -488,9 +732,7 @@ build_orchestrator_argv() {
     local tty=()
     _set_tty_flags tty
     local argv=(docker run --rm "${tty[@]}")
-    if [ "${LUCEBOX_HOST_GPU_VENDOR:-none}" = "nvidia" ]; then
-        argv+=(--gpus all)
-    fi
+    _append_gpu_args argv "$variant"
     argv+=(--name "${CONTAINER_NAME}-cli-$$")
     argv+=(--user "$(id -u):$(id -g)")
     # Only bind-mount the docker socket when DOCKER_HOST actually points
@@ -541,11 +783,11 @@ cmd_serve() {
     # If stage 1 fails (image not pulled yet, no config), fall back to a
     # conservative docker run — the container's own VRAM-tiered autotune
     # picks reasonable defaults from there.
-    require_host_prereqs
     ensure_probed
-    require_ctk
     local variant
     variant=$(pick_variant)
+    require_host_prereqs "$variant"
+    require_ctk "$variant"
 
     # Pre-flight: refuse to stomp on something that's already serving this
     # slot. Three states to distinguish, because silently `docker rm -f`-ing
@@ -615,10 +857,10 @@ cmd_serve() {
     # with "source: unknown" any time print-serve-argv fails.
     local fallback_argv=(docker run --rm
         --name "$CONTAINER_NAME"
-        --gpus all
         -p "$DEFAULT_PORT:8080"
         -v "$HOME:$HOME"
         -v "$fallback_models:/opt/lucebox-hub/server/models")
+    _append_gpu_args fallback_argv "$variant"
     _append_host_env fallback_argv
     fallback_argv+=("${IMAGE_BASE}:${variant}")
     _serve_and_track "${fallback_argv[@]}"
@@ -660,8 +902,10 @@ _serve_and_track() {
 }
 
 cmd_systemd_install() {
-    require_host_prereqs
     ensure_probed
+    local variant
+    variant=$(pick_variant)
+    require_host_prereqs "$variant"
     require_systemd "service install"
     local docker_bin
     docker_bin=$(command -v docker)
@@ -696,7 +940,7 @@ RestartSec=10
 SuccessExitStatus=143 SIGTERM
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=LUCEBOX_IMAGE=$IMAGE_BASE
-Environment=LUCEBOX_VARIANT=$(pick_variant)
+Environment=LUCEBOX_VARIANT=$variant
 Environment=LUCEBOX_PORT=$DEFAULT_PORT
 Environment=LUCEBOX_CONTAINER=$CONTAINER_NAME
 Environment=LUCEBOX_MODELS=$DEFAULT_MODELS_DIR
@@ -839,9 +1083,10 @@ cmd_pull() {
     # Pull has to run on the host. Delegating this into the container creates a
     # stale-image trap: docker may start an old local tag before the fresh tag
     # has been pulled.
-    require_host_prereqs
+    ensure_probed
     local variant
     variant=$(pick_variant)
+    require_host_prereqs "$variant"
     info "Pulling ${IMAGE_BASE}:${variant}"
     exec docker pull "${IMAGE_BASE}:${variant}"
 }
@@ -1011,36 +1256,67 @@ cmd_check() {
         _row 0 "docker daemon" "not installed — https://docs.docker.com/engine/install/"
     fi
 
-    # nvidia container toolkit
-    case "$LUCEBOX_HOST_HAS_CTK" in
-        runtime)            _row 1    "nvidia ctk"     "wired into docker (runtime)" ;;
-        cdi)                _row 1    "nvidia ctk"     "wired via CDI (nvidia.com/gpu)" ;;
-        installed-unwired)  _row warn "nvidia ctk"     "installed but not registered with docker — sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker" ;;
-        none|*)             _row 0    "nvidia ctk"     "not installed — https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html" ;;
-    esac
+    if [ "$LUCEBOX_HOST_HAS_NVIDIA_GPU" = "1" ]; then
+        # nvidia container toolkit
+        case "$LUCEBOX_HOST_HAS_CTK" in
+            runtime)            _row 1    "nvidia ctk" "wired into docker (runtime)" ;;
+            cdi)                _row 1    "nvidia ctk" "wired via CDI (nvidia.com/gpu)" ;;
+            installed-unwired)  _row warn "nvidia ctk" "installed but not registered with docker — sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker" ;;
+            none|*)             _row 0    "nvidia ctk" "not installed — https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html" ;;
+        esac
 
-    # nvidia-smi + driver
-    if [ "$LUCEBOX_HOST_GPU_VENDOR" = "nvidia" ]; then
         if [ "$LUCEBOX_HOST_DRIVER_MAJOR" -ge "$MIN_DRIVER_CUDA12" ]; then
             _row 1 "nvidia driver" "$LUCEBOX_HOST_DRIVER_VERSION (≥ $MIN_DRIVER_CUDA12 required for cuda12)"
         else
             _row 0 "nvidia driver" "$LUCEBOX_HOST_DRIVER_VERSION (< $MIN_DRIVER_CUDA12 — cuda12 image will fail)"
         fi
-    elif command -v nvidia-smi &>/dev/null; then
-        _row 0 "nvidia driver" "nvidia-smi present but NVML calls fail — driver/library mismatch, try reboot"
-    else
-        _row 0 "nvidia driver" "nvidia-smi not found — install the NVIDIA driver"
-    fi
-
-    # GPU detail
-    if [ "$LUCEBOX_HOST_GPU_VENDOR" = "nvidia" ]; then
-        _row 1 "gpu" "$LUCEBOX_HOST_GPU_NAME × $LUCEBOX_HOST_GPU_COUNT (sm_$LUCEBOX_HOST_GPU_SM, ${LUCEBOX_HOST_VRAM_GB} GB VRAM)"
+        _row 1 "nvidia gpu" "$LUCEBOX_HOST_GPU_NAME × $LUCEBOX_HOST_GPU_COUNT (sm_$LUCEBOX_HOST_GPU_SM, ${LUCEBOX_HOST_VRAM_GB} GB VRAM)"
         # cuda12 image arch coverage: sm_75;80;86;89;90;120 (see docker-bake.hcl)
         case "$LUCEBOX_HOST_GPU_SM" in
             75|80|86|89|90|120) _row 1    "cuda12 arch" "sm_$LUCEBOX_HOST_GPU_SM covered by image" ;;
-            "")                 _row warn "cuda12 arch" "compute_cap not detected" ;;
+            "")                 _row warn "cuda12 arch" "compute capability not detected" ;;
             *)                  _row warn "cuda12 arch" "sm_$LUCEBOX_HOST_GPU_SM not in image arch list (75;80;86;89;90;120)" ;;
         esac
+    elif command -v nvidia-smi &>/dev/null; then
+        _row 0 "nvidia driver" "nvidia-smi present but NVML calls fail — driver/library mismatch, try reboot"
+    fi
+
+    if [ "$LUCEBOX_HOST_HAS_AMD_GPU" = "1" ]; then
+        if [ -n "$LUCEBOX_HOST_ROCM_VERSION" ]; then
+            _row 1 "rocm" "$LUCEBOX_HOST_ROCM_VERSION"
+        else
+            _row warn "rocm" "GPU detected, userspace version unavailable"
+        fi
+        _row 1 "amd gpu" "${LUCEBOX_HOST_AMD_GPU_COUNT} device(s); primary ${LUCEBOX_HOST_AMD_GPU_NAME} (${LUCEBOX_HOST_AMD_GPU_ARCH}, ${LUCEBOX_HOST_AMD_VRAM_GB} GB effective)"
+        local amd_line amd_device_idx amd_device_name amd_device_arch amd_device_mem
+        while IFS= read -r amd_line; do
+            [ -n "$amd_line" ] || continue
+            amd_device_idx=$(printf '%s' "$amd_line" | awk -F',' '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1); print $1}')
+            amd_device_name=$(printf '%s' "$amd_line" | awk -F',' '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $4); print $4}')
+            amd_device_arch=$(printf '%s' "$amd_line" | awk -F',' '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $5); print $5}')
+            amd_device_mem=$(printf '%s' "$amd_line" | awk -F',' '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $6); print $6}')
+            _row 1 "  amd[$amd_device_idx]" "$amd_device_name ($amd_device_arch, $amd_device_mem physical)"
+        done <<<"$LUCEBOX_HOST_AMD_GPU_LIST_CSV"
+        case "$LUCEBOX_HOST_AMD_GPU_ARCH" in
+            gfx1100|gfx1151|gfx1200|gfx1201) _row 1    "rocm arch" "$LUCEBOX_HOST_AMD_GPU_ARCH covered by published image" ;;
+            "")                            _row warn "rocm arch" "gfx architecture not detected" ;;
+            *)                             _row warn "rocm arch" "$LUCEBOX_HOST_AMD_GPU_ARCH not in published image arch list" ;;
+        esac
+        if [ "$LUCEBOX_HOST_HAS_KFD" = "1" ]; then
+            _row 1 "amd /dev/kfd" "accessible"
+        else
+            _row 0 "amd /dev/kfd" "missing or inaccessible — user needs the render group"
+        fi
+        if [ "$LUCEBOX_HOST_HAS_DRI" = "1" ]; then
+            _row 1 "amd /dev/dri" "render node accessible"
+        else
+            _row 0 "amd /dev/dri" "no accessible renderD* node — user needs render/video groups"
+        fi
+    fi
+
+    if [ "$LUCEBOX_HOST_HAS_NVIDIA_GPU" != "1" ] \
+       && [ "$LUCEBOX_HOST_HAS_AMD_GPU" != "1" ]; then
+        _row 0 "gpu" "no supported NVIDIA or AMD GPU detected"
     fi
 
     # systemd
@@ -1052,16 +1328,24 @@ cmd_check() {
         _row warn "user systemd" "not available — '$SCRIPT_NAME install' (service unit) won't work; '$SCRIPT_NAME serve' (foreground) will"
     fi
 
-    # image we'd pull — marked ✗ when the host clearly can't run cuda12
-    # (no nvidia driver, or no CTK wired into docker). It's still useful
-    # to print the line so the user knows what would be pulled, but a
-    # green ✓ would be misleading.
-    if [ "$LUCEBOX_HOST_GPU_VENDOR" != "nvidia" ]; then
-        _row 0 "image" "${IMAGE_BASE}:${variant} — requires NVIDIA driver"
-    elif [ "$LUCEBOX_HOST_HAS_CTK" = "none" ] || [ "$LUCEBOX_HOST_HAS_CTK" = "installed-unwired" ]; then
-        _row 0 "image" "${IMAGE_BASE}:${variant} — needs NVIDIA Container Toolkit wired into docker"
+    # Selected backend and image. On heterogeneous builds the unselected APU
+    # stays visible in the inventory above but does not change this decision.
+    if _variant_is_rocm "$variant"; then
+        if [ "$LUCEBOX_HOST_HAS_AMD_GPU" != "1" ]; then
+            _row 0 "image" "${IMAGE_BASE}:${variant} — requires an AMD GPU"
+        elif [ "$LUCEBOX_HOST_HAS_KFD" != "1" ] || [ "$LUCEBOX_HOST_HAS_DRI" != "1" ]; then
+            _row 0 "image" "${IMAGE_BASE}:${variant} — needs accessible /dev/kfd and /dev/dri"
+        else
+            _row 1 "image" "${IMAGE_BASE}:${variant} (AMD selected)"
+        fi
     else
-        _row 1 "image" "${IMAGE_BASE}:${variant}"
+        if [ "$LUCEBOX_HOST_HAS_NVIDIA_GPU" != "1" ]; then
+            _row 0 "image" "${IMAGE_BASE}:${variant} — requires an NVIDIA GPU"
+        elif [ "$LUCEBOX_HOST_HAS_CTK" = "none" ] || [ "$LUCEBOX_HOST_HAS_CTK" = "installed-unwired" ]; then
+            _row 0 "image" "${IMAGE_BASE}:${variant} — needs NVIDIA Container Toolkit wired into docker"
+        else
+            _row 1 "image" "${IMAGE_BASE}:${variant} (NVIDIA selected)"
+        fi
     fi
     # RAM / cores (informational)
     _row 1 "host" "${LUCEBOX_HOST_NPROC} cpus, ${LUCEBOX_HOST_RAM_GB} GB RAM"
@@ -1070,7 +1354,6 @@ cmd_check() {
 cmd_in_container() {
     # Generic dispatcher: anything that isn't a systemd action goes here.
     # Runs the in-container Python CLI with the supplied argv.
-    require_host_prereqs
     ensure_probed
     # CTK isn't strictly required for every subcommand (e.g. `config get`
     # or `autotune` only touch local files), but the server-spawning
@@ -1078,6 +1361,7 @@ cmd_in_container() {
     # Letting docker error its own way is fine for the no-CTK case.
     local variant
     variant=$(pick_variant)
+    require_host_prereqs "$variant"
     local argv
     mapfile -t argv < <(build_orchestrator_argv "$variant" "$@")
     exec "${argv[@]}"
@@ -1112,10 +1396,10 @@ _lucebox_container_running() {
 # CLI sees consistent overrides whichever route it took: HOME, every
 # LUCEBOX_HOST_*, the image/port/container/models scalars, and HF_TOKEN.
 cmd_exec_in_container() {
-    require_host_prereqs
     ensure_probed
     local variant
     variant=$(pick_variant)
+    require_host_prereqs "$variant"
     local tty=()
     _set_tty_flags tty
     local argv=(docker exec "${tty[@]}")
@@ -1196,7 +1480,7 @@ Direct server invocation (foreground, no systemd):
 
 Provisioning + workloads (delegated to the in-container Python CLI):
   check                 host + docker readiness report
-  pull                  docker pull the cuda12 image
+  pull                  docker pull the auto-selected CUDA or ROCm image
   update                re-run the bootstrap installer to upgrade this script
   completion <shell>    print shell completion script (bash / zsh / fish)
   models                list / download / activate model presets
@@ -1209,7 +1493,7 @@ Misc:
 
 Environment overrides:
   LUCEBOX_IMAGE         image name without tag (default: ghcr.io/luce-org/lucebox-hub)
-  LUCEBOX_VARIANT       image tag to pull/run (default: cuda12)
+  LUCEBOX_VARIANT       image tag override (default: cuda12 on NVIDIA, rocm on AMD)
   LUCEBOX_PORT          host port for the server (default: 8080)
   LUCEBOX_CONTAINER     server container name (default: lucebox)
   LUCEBOX_MODELS        host model directory (default: \$XDG_DATA_HOME/lucebox/models

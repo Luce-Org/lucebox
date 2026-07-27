@@ -116,3 +116,53 @@ def test_check_exit_code_independent_of_host_facts(
     assert result.exit_code == 1
     # Host facts block still printed despite the failure.
     assert "Host facts" in result.stdout
+
+
+def test_amd_rocm_host_passes_without_nvidia_ctk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ROCm readiness uses /dev/kfd + /dev/dri and never requires NVIDIA CTK."""
+
+    def stub() -> HostFacts:
+        return HostFacts(
+            nproc=32,
+            ram_gb=125,
+            gpu_vendor="amd",
+            has_amd_gpu=True,
+            gpu_name="AMD Radeon AI PRO R9700",
+            gpu_count=2,
+            vram_gb=31,
+            gpu_sm="gfx1201",
+            rocm_version="7.2.4",
+            has_kfd=True,
+            has_dri=True,
+            has_systemd=True,
+            has_docker=True,
+            docker_version="29.1.3",
+            ctk="none",
+        )
+
+    monkeypatch.setattr("lucebox.host_facts.from_env", stub)
+    monkeypatch.setattr("lucebox.cli.from_env", stub)
+    result = CliRunner().invoke(app, ["check"])
+    assert result.exit_code == 0, result.stdout
+    assert "ROCm 7.2.4" in result.stdout
+    assert "gfx1201" in result.stdout
+    assert "/dev/kfd and /dev/dri are accessible" in result.stdout
+    assert "NVIDIA Container Toolkit" not in result.stdout
+
+
+def test_amd_rocm_host_fails_when_devices_are_inaccessible() -> None:
+    host = HostFacts(
+        gpu_vendor="amd",
+        has_amd_gpu=True,
+        gpu_name="AMD Radeon Graphics",
+        vram_gb=125,
+        gpu_sm="gfx1151",
+        rocm_version="7.2.4",
+        has_docker=True,
+        has_kfd=False,
+        has_dri=True,
+    )
+    results = host_check.run_checks(host)
+    devices = next(result for result in results if result.name == "devices")
+    assert devices.severity == "fail"
+    assert "/dev/kfd" in devices.message

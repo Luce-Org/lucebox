@@ -18,7 +18,7 @@ from lucebox.types import DflashRuntime, HostFacts
 def runtime_from_host(host: HostFacts) -> DflashRuntime:
     """Pick a conservative DflashRuntime that 'should work' on this VRAM tier.
 
-    Tiers (NVIDIA, baseline = Qwen3.6-27B Q4_K_M ~18 GB total):
+    Tiers (selected CUDA/ROCm device, baseline = Qwen3.6-27B Q4_K_M ~18 GB total):
         <12 GB  — too small for 27B; pick min ctx as a floor so a fallback
                   start at least gets an error from the daemon rather than
                   a silent OOM.

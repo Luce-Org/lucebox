@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from lucebox.download import PRESETS
-from lucebox.types import Config, DflashRuntime, ModelMeta
+from lucebox.types import Config, DflashRuntime, HostFacts, ModelMeta
 
 from lucebox import docker_run
 
@@ -61,6 +61,23 @@ def test_argv_flags_and_ordering() -> None:
     assert argv[-1] == "serve"
     assert argv[-2] == "img:tag"
     assert argv.index("--shm-size") < argv.index("img:tag")
+
+
+def test_argv_amd_uses_rocm_device_contract() -> None:
+    spec = docker_run.DockerRunSpec(image="img:rocm", name="box", gpu_vendor="amd")
+    argv = spec.argv()
+    assert "--gpus" not in argv
+    assert ["--device", "/dev/kfd"] == argv[
+        argv.index("--device") : argv.index("--device") + 2
+    ]
+    assert "/dev/dri" in argv
+    assert ["--group-add", "video"] == argv[
+        argv.index("--group-add") : argv.index("--group-add") + 2
+    ]
+    assert "render" in argv
+    assert ["--security-opt", "seccomp=unconfined"] == argv[
+        argv.index("--security-opt") : argv.index("--security-opt") + 2
+    ]
 
 
 def test_printable_glues_value_taking_flags() -> None:
@@ -146,6 +163,22 @@ def test_server_run_spec_top_level_shape(tmp_path: Path) -> None:
     assert spec.detach is False
     assert spec.port_publish == (9000, 8080)
     assert (str(tmp_path), "/opt/lucebox-hub/server/models") in spec.volumes
+
+
+def test_server_run_spec_rocm_uses_amd_devices_on_heterogeneous_host(tmp_path: Path) -> None:
+    cfg = Config(
+        variant="rocm",
+        models_dir=tmp_path,
+        # The generic probe may select NVIDIA by default on RTX + Strix. The
+        # explicit image variant must still control Docker's device contract.
+        host=HostFacts(gpu_vendor="nvidia", has_nvidia_gpu=True, has_amd_gpu=True),
+    )
+    spec = docker_run.server_run_spec(cfg)
+    assert spec.gpu_vendor == "amd"
+    argv = spec.argv()
+    assert "--gpus" not in argv
+    assert "/dev/kfd" in argv
+    assert "/dev/dri" in argv
 
 
 def test_server_run_spec_always_emits_core_dflash_env(tmp_path: Path) -> None:

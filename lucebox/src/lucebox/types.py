@@ -40,12 +40,20 @@ class HostFacts:
     nproc: int = 0
     ram_gb: int = 0
     gpu_vendor: GpuVendor = "none"
+    has_nvidia_gpu: bool = False
+    has_amd_gpu: bool = False
     gpu_name: str = ""
     gpu_count: int = 0
     vram_gb: int = 0
-    gpu_sm: str = ""  # e.g. "120" — matches docker-bake arch lists
-    driver_version: str = ""  # e.g. "595.71.05"
+    # NVIDIA compute capability without the dot ("120") or AMD gfx target
+    # ("gfx1151").  The historical ``gpu_sm`` name stays in the serialized
+    # contract for compatibility with HOST_INFO consumers.
+    gpu_sm: str = ""
+    driver_version: str = ""  # NVIDIA driver, e.g. "595.71.05"
     driver_major: int = 0
+    rocm_version: str = ""  # AMD ROCm userspace, e.g. "7.2.4"
+    has_kfd: bool = False  # /dev/kfd exists and is accessible to the user
+    has_dri: bool = False  # at least one accessible /dev/dri/renderD* node
     has_systemd: bool = False
     is_wsl: bool = False
     has_docker: bool = False

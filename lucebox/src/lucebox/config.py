@@ -257,12 +257,17 @@ def _from_dict(raw: dict[str, Any]) -> Config:
         nproc=int(host_raw.get("nproc", 0)),
         ram_gb=int(host_raw.get("ram_gb", 0)),
         gpu_vendor=host_raw.get("gpu_vendor", "none"),
+        has_nvidia_gpu=bool(host_raw.get("has_nvidia_gpu", False)),
+        has_amd_gpu=bool(host_raw.get("has_amd_gpu", False)),
         gpu_name=str(host_raw.get("gpu_name", "")),
         gpu_count=int(host_raw.get("gpu_count", 0)),
         vram_gb=int(host_raw.get("vram_gb", 0)),
         gpu_sm=str(host_raw.get("gpu_sm", "")),
         driver_version=str(host_raw.get("driver_version", "")),
         driver_major=int(host_raw.get("driver_major", 0)),
+        rocm_version=str(host_raw.get("rocm_version", "")),
+        has_kfd=bool(host_raw.get("has_kfd", False)),
+        has_dri=bool(host_raw.get("has_dri", False)),
         has_systemd=bool(host_raw.get("has_systemd", False)),
         is_wsl=bool(host_raw.get("is_wsl", False)),
         has_docker=bool(host_raw.get("has_docker", False)),
@@ -470,9 +475,10 @@ def live_config() -> Config:
 
     host = from_env()
     default = Config()
+    default_variant = "rocm" if host.gpu_vendor == "amd" else "cuda12"
     return replace(
         default,
-        variant=os.environ.get("LUCEBOX_VARIANT", "cuda12"),
+        variant=os.environ.get("LUCEBOX_VARIANT", default_variant),
         image=os.environ.get("LUCEBOX_IMAGE", default.image),
         container_name=os.environ.get("LUCEBOX_CONTAINER", default.container_name),
         port=int(os.environ.get("LUCEBOX_PORT", str(default.port))),
