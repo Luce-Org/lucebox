@@ -320,211 +320,6 @@ struct DS4TensorAlloc {
     bool upload_to_backend = true;
     bool dense_split = false;
 };
-
-
-constexpr int DS4_QTYPE_ROCMFP2_MIX = 106;  // GGML_TYPE_Q2_1_ROCMFP2_MIX
-
-// Read the "<gguf>.gumix.bin" sidecar and register each qtype-106 gate/up expert
-// tensor's device base + per-expert codebooks/modes with the CUDA/HIP decoder.
-// Mirrors ds4_register_p4mix_sidecar's contract and validation discipline; three
-// things genuinely differ, and each is why this is a separate function rather than
-// a parameterised one:
-//
-//   1. TWO tensors per layer. The serving GGUF stores gate and up separately
-//      (ffn_gate_exps / ffn_up_exps), so an entry carries a `surface` selector and
-//      a layer is only covered when BOTH halves are registered.
-//   2. Codebooks are SHARED between a layer's halves. One pair is fitted per fused
-//      expert covering both, so the sidecar repeats it per tensor and each half
-//      registers its own device copy. That duplication is deliberate: the registry
-//      is keyed by base pointer and frees what it owns, so sharing one buffer
-//      between two entries would double-free on unregister.
-//   3. No rotation field. The qtype-106 encoder never emits rotation, so the wire
-//      omits it entirely rather than carrying a byte that must always be zero. The
-//      kernel's register_host still takes a rotations argument, so zeros are
-//      passed explicitly.
-constexpr uint32_t DS4_GUMIX_C        = 2;   // codebooks per expert
-constexpr uint32_t DS4_GUMIX_K        = 4;   // levels per codebook (2-bit codes)
-constexpr uint32_t DS4_GUMIX_SURFACES = 2;   // 0 = gate, 1 = up
-constexpr uint32_t DS4_GUMIX_QK       = 32;  // MIX_QK block width (rocmfp2_mix.cu)
-
-static bool ds4_register_gumix_sidecar(const std::string & gguf_path,
-                                      const TargetLoadPlan & plan,
-                                      DeepSeek4Weights & out) {
-    // required[layer][surface]: a qtype-106 gate/up expert resident on this shard.
-    const size_t n_layers_out = out.layers.size();
-    std::vector<std::array<bool, DS4_GUMIX_SURFACES>> required(
-        n_layers_out, std::array<bool, DS4_GUMIX_SURFACES>{false, false});
-    int n_qtype106 = 0;
-    for (size_t li = 0; li < n_layers_out; ++li) {
-        const ggml_tensor * ts[DS4_GUMIX_SURFACES] = {
-            out.layers[li].ffn_gate_exps, out.layers[li].ffn_up_exps };
-        for (uint32_t s = 0; s < DS4_GUMIX_SURFACES; ++s) {
-            if (ts[s] && (int) ts[s]->type == DS4_QTYPE_ROCMFP2_MIX) {
-                required[li][s] = true; n_qtype106++;
-            }
-        }
-    }
-    if (n_qtype106 == 0) return true;  // uniform (qtype-107) gate/up — nothing to do
-
-    if (plan.skip_expert_tensors) {
-        std::fprintf(stderr, "[deepseek4] qtype-106 gate/up experts not resident on this "
-                     "shard (skip_expert_tensors) — fused decode disabled here\n");
-        return true;
-    }
-
-    const std::string sc_path = gguf_path + ".gumix.bin";
-    FILE * f = std::fopen(sc_path.c_str(), "rb");
-    if (!f) {
-        std::fprintf(stderr, "[deepseek4] qtype-106 gate/up experts require sidecar but it "
-                     "is missing: %s\n", sc_path.c_str());
-        return false;
-    }
-    char magic[8];
-    uint32_t n_entries = 0, reserved = 0;
-    if (std::fread(magic, 1, 8, f) != 8 ||
-        std::memcmp(magic, "GUMIXs1\0", 8) != 0 ||
-        std::fread(&n_entries, 4, 1, f) != 1 ||
-        std::fread(&reserved, 4, 1, f) != 1) {
-        // 's' = split form. A FUSED sidecar (GUMIXv1) describes one tensor per layer
-        // and would silently mis-register against the split GGUF, so its magic is
-        // rejected here rather than tolerated.
-        std::fprintf(stderr, "[deepseek4] bad gumix sidecar header (need split-form "
-                     "GUMIXs1): %s\n", sc_path.c_str());
-        std::fclose(f);
-        return false;
-    }
-    (void) reserved;
-
-    std::vector<std::array<bool, DS4_GUMIX_SURFACES>> done(
-        n_layers_out, std::array<bool, DS4_GUMIX_SURFACES>{false, false});
-    std::vector<const void *> registered_bases;
-    bool ok = true;
-    for (uint32_t i = 0; i < n_entries && ok; i++) {
-        uint32_t hdr[7];
-        if (std::fread(hdr, 4, 7, f) != 7) {
-            std::fprintf(stderr, "[deepseek4] truncated gumix sidecar (entry %u header)\n", i);
-            ok = false; break;
-        }
-        const uint32_t layer = hdr[0], surface = hdr[1], E = hdr[2], odim = hdr[3],
-                       idim = hdr[4], C = hdr[5], K = hdr[6];
-
-        // ── Structural validation BEFORE sizing any allocation ──
-        if (surface >= DS4_GUMIX_SURFACES) {
-            std::fprintf(stderr, "[deepseek4] gumix entry %u (layer %u) bad surface %u\n",
-                         i, layer, surface);
-            ok = false; break;
-        }
-        if (C != DS4_GUMIX_C || K != DS4_GUMIX_K) {
-            std::fprintf(stderr, "[deepseek4] gumix entry %u (layer %u) unexpected C=%u K=%u\n",
-                         i, layer, C, K);
-            ok = false; break;
-        }
-        if (E == 0 || E > DS4_P4MIX_MAX_EXPERTS ||
-            odim == 0 || odim > DS4_P4MIX_MAX_DIM ||
-            idim == 0 || idim > DS4_P4MIX_MAX_DIM) {
-            std::fprintf(stderr, "[deepseek4] gumix layer %u surface %u dims out of range: "
-                         "E=%u out=%u in=%u\n", layer, surface, E, odim, idim);
-            ok = false; break;
-        }
-        // Checked payload = modes(E) + books(E*C*K * 2 bytes). No rotation field.
-        size_t book_elems = 0, book_bytes = 0, payload = 0;
-        if (__builtin_mul_overflow((size_t) E, (size_t) (C * K), &book_elems) ||
-            __builtin_mul_overflow(book_elems, (size_t) sizeof(uint16_t), &book_bytes) ||
-            __builtin_add_overflow((size_t) E, book_bytes, &payload)) {
-            std::fprintf(stderr, "[deepseek4] gumix layer %u payload size overflow\n", layer);
-            ok = false; break;
-        }
-
-        ggml_tensor * gt = nullptr;
-        if (layer < n_layers_out) {
-            gt = (surface == 0) ? out.layers[layer].ffn_gate_exps
-                                : out.layers[layer].ffn_up_exps;
-        }
-        const bool resident106 = gt && (int) gt->type == DS4_QTYPE_ROCMFP2_MIX;
-        if (!resident106) {
-            if (std::fseek(f, (long) payload, SEEK_CUR) != 0) {
-                std::fprintf(stderr, "[deepseek4] gumix seek past layer %u surface %u failed\n",
-                             layer, surface);
-                ok = false; break;
-            }
-            continue;
-        }
-
-        // Tensor ne = [in, out, E].
-        if ((int64_t) E != gt->ne[2] || (int64_t) odim != gt->ne[1] ||
-            (int64_t) idim != gt->ne[0]) {
-            std::fprintf(stderr, "[deepseek4] gumix layer %u surface %u dim mismatch: sidecar "
-                         "E=%u out=%u in=%u vs tensor ne2=%lld ne1=%lld ne0=%lld\n",
-                         layer, surface, E, odim, idim, (long long) gt->ne[2],
-                         (long long) gt->ne[1], (long long) gt->ne[0]);
-            ok = false; break;
-        }
-        if (idim % DS4_GUMIX_QK != 0) {
-            std::fprintf(stderr, "[deepseek4] gumix layer %u surface %u in=%u not a multiple "
-                         "of %u\n", layer, surface, idim, DS4_GUMIX_QK);
-            ok = false; break;
-        }
-        if (!gt->data) {
-            std::fprintf(stderr, "[deepseek4] gumix layer %u surface %u expert data not "
-                         "resident\n", layer, surface);
-            ok = false; break;
-        }
-        if (done[layer][surface]) {
-            std::fprintf(stderr, "[deepseek4] gumix layer %u surface %u appears more than "
-                         "once\n", layer, surface);
-            ok = false; break;
-        }
-
-        std::vector<uint8_t> modes(E);
-        std::vector<uint8_t> rots(E, 0);   // wire carries none; kernel ignores it
-        std::vector<uint16_t> books(book_elems);
-        if (std::fread(modes.data(), 1, E, f) != E ||
-            std::fread(books.data(), sizeof(uint16_t), books.size(), f) != books.size()) {
-            std::fprintf(stderr, "[deepseek4] truncated gumix entry (layer %u surface %u)\n",
-                         layer, surface);
-            ok = false; break;
-        }
-        for (uint32_t e = 0; e < E && ok; ++e) {
-            if (modes[e] > DS4_P4MIX_MAX_MODE) {
-                std::fprintf(stderr, "[deepseek4] gumix layer %u surface %u expert %u "
-                             "unsupported mode %u\n", layer, surface, e, modes[e]);
-                ok = false;
-            }
-        }
-        if (!ok) break;
-
-        ggml_cuda_rocmfp2_mix_register_host(
-            gt->data, gt->nb[2], (int) E, (int) odim, (int) idim,
-            books.data(), modes.data(), rots.data());
-        registered_bases.push_back(gt->data);
-        done[layer][surface] = true;
-    }
-    std::fclose(f);
-
-    // Every resident qtype-106 half must be covered exactly once. A layer with only
-    // one half registered is worse than none: the unregistered tensor's to_fp16 shim
-    // GGML_ABORTs at first decode.
-    if (ok) {
-        for (size_t li = 0; li < required.size() && ok; ++li) {
-            for (uint32_t s = 0; s < DS4_GUMIX_SURFACES; ++s) {
-                if (required[li][s] && !done[li][s]) {
-                    std::fprintf(stderr, "[deepseek4] gumix sidecar missing resident qtype-106 "
-                                 "layer %zu %s; refusing to load\n",
-                                 li, s == 0 ? "gate" : "up");
-                    ok = false; break;
-                }
-            }
-        }
-    }
-
-    if (!ok) {
-        for (const void * b : registered_bases) ggml_cuda_rocmfp2_mix_unregister(b);
-        return false;
-    }
-    std::fprintf(stderr, "[deepseek4] registered %d qtype-106 gate/up expert tensor(s) "
-                 "from %s\n", (int) registered_bases.size(), sc_path.c_str());
-    return true;
-}
 }  // namespace
 
 // ─── Compute per-layer compression ratios (matches ds4.c logic) ─────────
@@ -737,6 +532,210 @@ static bool ds4_register_p4mix_sidecar(const std::string & gguf_path,
                  "from %s\n", (int) registered_bases.size(), sc_path.c_str());
     return true;
 }
+constexpr int DS4_QTYPE_ROCMFP2_MIX = 106;  // GGML_TYPE_Q2_1_ROCMFP2_MIX
+
+// Read the "<gguf>.gumix.bin" sidecar and register each qtype-106 gate/up expert
+// tensor's device base + per-expert codebooks/modes with the CUDA/HIP decoder.
+// Mirrors ds4_register_p4mix_sidecar's contract and validation discipline; three
+// things genuinely differ, and each is why this is a separate function rather than
+// a parameterised one:
+//
+//   1. TWO tensors per layer. The serving GGUF stores gate and up separately
+//      (ffn_gate_exps / ffn_up_exps), so an entry carries a `surface` selector and
+//      a layer is only covered when BOTH halves are registered.
+//   2. Codebooks are SHARED between a layer's halves. One pair is fitted per fused
+//      expert covering both, so the sidecar repeats it per tensor and each half
+//      registers its own device copy. That duplication is deliberate: the registry
+//      is keyed by base pointer and frees what it owns, so sharing one buffer
+//      between two entries would double-free on unregister.
+//   3. No rotation field. The qtype-106 encoder never emits rotation, so the wire
+//      omits it entirely rather than carrying a byte that must always be zero. The
+//      kernel's register_host still takes a rotations argument, so zeros are
+//      passed explicitly.
+constexpr uint32_t DS4_GUMIX_C        = 2;   // codebooks per expert
+constexpr uint32_t DS4_GUMIX_K        = 4;   // levels per codebook (2-bit codes)
+constexpr uint32_t DS4_GUMIX_SURFACES = 2;   // 0 = gate, 1 = up
+constexpr uint32_t DS4_GUMIX_QK       = 32;  // MIX_QK block width (rocmfp2_mix.cu)
+
+static bool ds4_register_gumix_sidecar(const std::string & gguf_path,
+                                      const TargetLoadPlan & plan,
+                                      DeepSeek4Weights & out) {
+    // required[layer][surface]: a qtype-106 gate/up expert resident on this shard.
+    const size_t n_layers_out = out.layers.size();
+    std::vector<std::array<bool, DS4_GUMIX_SURFACES>> required(
+        n_layers_out, std::array<bool, DS4_GUMIX_SURFACES>{false, false});
+    int n_qtype106 = 0;
+    for (size_t li = 0; li < n_layers_out; ++li) {
+        const ggml_tensor * ts[DS4_GUMIX_SURFACES] = {
+            out.layers[li].ffn_gate_exps, out.layers[li].ffn_up_exps };
+        for (uint32_t s = 0; s < DS4_GUMIX_SURFACES; ++s) {
+            if (ts[s] && (int) ts[s]->type == DS4_QTYPE_ROCMFP2_MIX) {
+                required[li][s] = true; n_qtype106++;
+            }
+        }
+    }
+    if (n_qtype106 == 0) return true;  // uniform (qtype-107) gate/up — nothing to do
+
+    if (plan.skip_expert_tensors) {
+        std::fprintf(stderr, "[deepseek4] qtype-106 gate/up experts not resident on this "
+                     "shard (skip_expert_tensors) — fused decode disabled here\n");
+        return true;
+    }
+
+    const std::string sc_path = gguf_path + ".gumix.bin";
+    FILE * f = std::fopen(sc_path.c_str(), "rb");
+    if (!f) {
+        std::fprintf(stderr, "[deepseek4] qtype-106 gate/up experts require sidecar but it "
+                     "is missing: %s\n", sc_path.c_str());
+        return false;
+    }
+    char magic[8];
+    uint32_t n_entries = 0, reserved = 0;
+    if (std::fread(magic, 1, 8, f) != 8 ||
+        std::memcmp(magic, "GUMIXs1\0", 8) != 0 ||
+        std::fread(&n_entries, 4, 1, f) != 1 ||
+        std::fread(&reserved, 4, 1, f) != 1) {
+        // 's' = split form. A FUSED sidecar (GUMIXv1) describes one tensor per layer
+        // and would silently mis-register against the split GGUF, so its magic is
+        // rejected here rather than tolerated.
+        std::fprintf(stderr, "[deepseek4] bad gumix sidecar header (need split-form "
+                     "GUMIXs1): %s\n", sc_path.c_str());
+        std::fclose(f);
+        return false;
+    }
+    (void) reserved;
+
+    std::vector<std::array<bool, DS4_GUMIX_SURFACES>> done(
+        n_layers_out, std::array<bool, DS4_GUMIX_SURFACES>{false, false});
+    std::vector<const void *> registered_bases;
+    bool ok = true;
+    for (uint32_t i = 0; i < n_entries && ok; i++) {
+        uint32_t hdr[7];
+        if (std::fread(hdr, 4, 7, f) != 7) {
+            std::fprintf(stderr, "[deepseek4] truncated gumix sidecar (entry %u header)\n", i);
+            ok = false; break;
+        }
+        const uint32_t layer = hdr[0], surface = hdr[1], E = hdr[2], odim = hdr[3],
+                       idim = hdr[4], C = hdr[5], K = hdr[6];
+
+        // ── Structural validation BEFORE sizing any allocation ──
+        if (surface >= DS4_GUMIX_SURFACES) {
+            std::fprintf(stderr, "[deepseek4] gumix entry %u (layer %u) bad surface %u\n",
+                         i, layer, surface);
+            ok = false; break;
+        }
+        if (C != DS4_GUMIX_C || K != DS4_GUMIX_K) {
+            std::fprintf(stderr, "[deepseek4] gumix entry %u (layer %u) unexpected C=%u K=%u\n",
+                         i, layer, C, K);
+            ok = false; break;
+        }
+        if (E == 0 || E > DS4_P4MIX_MAX_EXPERTS ||
+            odim == 0 || odim > DS4_P4MIX_MAX_DIM ||
+            idim == 0 || idim > DS4_P4MIX_MAX_DIM) {
+            std::fprintf(stderr, "[deepseek4] gumix layer %u surface %u dims out of range: "
+                         "E=%u out=%u in=%u\n", layer, surface, E, odim, idim);
+            ok = false; break;
+        }
+        // Checked payload = modes(E) + books(E*C*K * 2 bytes). No rotation field.
+        size_t book_elems = 0, book_bytes = 0, payload = 0;
+        if (__builtin_mul_overflow((size_t) E, (size_t) (C * K), &book_elems) ||
+            __builtin_mul_overflow(book_elems, (size_t) sizeof(uint16_t), &book_bytes) ||
+            __builtin_add_overflow((size_t) E, book_bytes, &payload)) {
+            std::fprintf(stderr, "[deepseek4] gumix layer %u payload size overflow\n", layer);
+            ok = false; break;
+        }
+
+        ggml_tensor * gt = nullptr;
+        if (layer < n_layers_out) {
+            gt = (surface == 0) ? out.layers[layer].ffn_gate_exps
+                                : out.layers[layer].ffn_up_exps;
+        }
+        const bool resident106 = gt && (int) gt->type == DS4_QTYPE_ROCMFP2_MIX;
+        if (!resident106) {
+            if (std::fseek(f, (long) payload, SEEK_CUR) != 0) {
+                std::fprintf(stderr, "[deepseek4] gumix seek past layer %u surface %u failed\n",
+                             layer, surface);
+                ok = false; break;
+            }
+            continue;
+        }
+
+        // Tensor ne = [in, out, E].
+        if ((int64_t) E != gt->ne[2] || (int64_t) odim != gt->ne[1] ||
+            (int64_t) idim != gt->ne[0]) {
+            std::fprintf(stderr, "[deepseek4] gumix layer %u surface %u dim mismatch: sidecar "
+                         "E=%u out=%u in=%u vs tensor ne2=%lld ne1=%lld ne0=%lld\n",
+                         layer, surface, E, odim, idim, (long long) gt->ne[2],
+                         (long long) gt->ne[1], (long long) gt->ne[0]);
+            ok = false; break;
+        }
+        if (idim % DS4_GUMIX_QK != 0) {
+            std::fprintf(stderr, "[deepseek4] gumix layer %u surface %u in=%u not a multiple "
+                         "of %u\n", layer, surface, idim, DS4_GUMIX_QK);
+            ok = false; break;
+        }
+        if (!gt->data) {
+            std::fprintf(stderr, "[deepseek4] gumix layer %u surface %u expert data not "
+                         "resident\n", layer, surface);
+            ok = false; break;
+        }
+        if (done[layer][surface]) {
+            std::fprintf(stderr, "[deepseek4] gumix layer %u surface %u appears more than "
+                         "once\n", layer, surface);
+            ok = false; break;
+        }
+
+        std::vector<uint8_t> modes(E);
+        std::vector<uint8_t> rots(E, 0);   // wire carries none; kernel ignores it
+        std::vector<uint16_t> books(book_elems);
+        if (std::fread(modes.data(), 1, E, f) != E ||
+            std::fread(books.data(), sizeof(uint16_t), books.size(), f) != books.size()) {
+            std::fprintf(stderr, "[deepseek4] truncated gumix entry (layer %u surface %u)\n",
+                         layer, surface);
+            ok = false; break;
+        }
+        for (uint32_t e = 0; e < E && ok; ++e) {
+            if (modes[e] > DS4_P4MIX_MAX_MODE) {
+                std::fprintf(stderr, "[deepseek4] gumix layer %u surface %u expert %u "
+                             "unsupported mode %u\n", layer, surface, e, modes[e]);
+                ok = false;
+            }
+        }
+        if (!ok) break;
+
+        ggml_cuda_rocmfp2_mix_register_host(
+            gt->data, gt->nb[2], (int) E, (int) odim, (int) idim,
+            books.data(), modes.data(), rots.data());
+        registered_bases.push_back(gt->data);
+        done[layer][surface] = true;
+    }
+    std::fclose(f);
+
+    // Every resident qtype-106 half must be covered exactly once. A layer with only
+    // one half registered is worse than none: the unregistered tensor's to_fp16 shim
+    // GGML_ABORTs at first decode.
+    if (ok) {
+        for (size_t li = 0; li < required.size() && ok; ++li) {
+            for (uint32_t s = 0; s < DS4_GUMIX_SURFACES; ++s) {
+                if (required[li][s] && !done[li][s]) {
+                    std::fprintf(stderr, "[deepseek4] gumix sidecar missing resident qtype-106 "
+                                 "layer %zu %s; refusing to load\n",
+                                 li, s == 0 ? "gate" : "up");
+                    ok = false; break;
+                }
+            }
+        }
+    }
+
+    if (!ok) {
+        for (const void * b : registered_bases) ggml_cuda_rocmfp2_mix_unregister(b);
+        return false;
+    }
+    std::fprintf(stderr, "[deepseek4] registered %d qtype-106 gate/up expert tensor(s) "
+                 "from %s\n", (int) registered_bases.size(), sc_path.c_str());
+    return true;
+}
+
 }  // namespace
 
 bool load_deepseek4_gguf(const std::string & path,
