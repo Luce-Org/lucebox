@@ -33,6 +33,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/rocmfp3_mix.cuh"
+#include "ggml-cuda/rocmfp2_mix.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -2719,11 +2720,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // to_fp16 converter consults that registry. This also catches the
     // mul_mat_id per-expert fallback, which re-enters ggml_cuda_mul_mat with
     // 105 slices.
+    // qtype-106 (Q2_1_ROCMFP2_MIX) is the gate/up analogue and needs the same
+    // treatment for the same reason -- its codebook is equally out-of-band.
     const bool is_rocmfp3_mix = src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX;
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !is_rocmfp3_mix && !bad_padding_clear
+    const bool is_rocmfp2_mix = src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX;
+    const bool is_mix_qtype    = is_rocmfp3_mix || is_rocmfp2_mix;
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !is_mix_qtype && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src1->ne[1] <= luce_mmvq_max_ncols;
-    bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !is_rocmfp3_mix && !bad_padding_clear
+    bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !is_mix_qtype && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
     bool any_gpus_with_slow_fp16 = false;
@@ -2784,6 +2789,19 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             && src1->ne[2] == 1 && src1->ne[3] == 1
             && src1->ne[1] <= luce_mmvq_max_ncols) {
         if (ggml_cuda_rocmfp3_mix_mul_mat_vec(
+                src0->data, (const float *) src1->data, (float *) dst->data,
+                (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[1],
+                (int64_t) (src1->nb[1] / sizeof(float)),
+                (int64_t) (dst->nb[1] / sizeof(float)), ctx.stream())) {
+            return;
+        }
+
+    if (mix_fused_on && is_rocmfp2_mix && !split
+            && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
+            && src1->ne[2] == 1 && src1->ne[3] == 1
+            && src1->ne[1] <= luce_mmvq_max_ncols) {
+        if (ggml_cuda_rocmfp2_mix_mul_mat_vec(
                 src0->data, (const float *) src1->data, (float *) dst->data,
                 (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[1],
                 (int64_t) (src1->nb[1] / sizeof(float)),
@@ -2867,6 +2885,20 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
             && ne12 == 1
             && ggml_cuda_rocmfp3_mix_mul_mat_id(
+                src0->data, (const float *) src1->data, (const int32_t *) ids->data,
+                (float *) dst->data, (int) ne00, (int) ne01, (int) ids->ne[0],
+                (int) ne12, (int) ne11,
+                (int64_t) (ids->nb[0] / sizeof(int32_t)), (int64_t) (ids->nb[1] / sizeof(int32_t)),
+                (int64_t) (nb11 / sizeof(float)), (int64_t) (nb12 / sizeof(float)),
+                (int64_t) (nb1 / sizeof(float)), (int64_t) (nb2 / sizeof(float)),
+                ctx.stream())) {
+        return;
+    }
+
+    if (src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX
+            && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            && ne12 == 1
+            && ggml_cuda_rocmfp2_mix_mul_mat_id(
                 src0->data, (const float *) src1->data, (const int32_t *) ids->data,
                 (float *) dst->data, (int) ne00, (int) ne01, (int) ids->ne[0],
                 (int) ne12, (int) ne11,
@@ -3668,7 +3700,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             // exactly, incl. the registry check, so we never skip-disable while
             // the runtime actually falls back to the sync path.
             const bool mmid_rocmfp3_ok =
-                node->src[0]->type == GGML_TYPE_Q3_1_ROCMFP3_MIX &&
+                (node->src[0]->type == GGML_TYPE_Q3_1_ROCMFP3_MIX ||
+                 node->src[0]->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) &&
                 node->src[1]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
                 node->src[1]->ne[2] == 1 &&
                 ggml_cuda_rocmfp3_mix_registered(node->src[0]->data);

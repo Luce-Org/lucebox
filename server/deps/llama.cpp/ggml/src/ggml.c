@@ -767,6 +767,19 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp3,
         .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp3_ref,
     },
+    [GGML_TYPE_Q2_1_ROCMFP2_MIX] = {
+        // Per-expert mixed absmax/adaptive ROCmFP2 (gate/up). Same 10B block wire as
+        // q2_0, so a GGUF splice from 107 is offset-preserving; the per-expert
+        // codebook travels in the loader sidecar and decode happens in the dedicated
+        // CUDA/HIP mul_mat_id path. to_float here is the legacy fixed-level fallback
+        // (generic CPU paths only, not the HIP serving path).
+        .type_name                = "q2_1_rocmfp2_mix",
+        .blck_size                = QK_ROCMFP2,
+        .type_size                = sizeof(block_rocmfp2),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp2,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp2_ref,
+    },
     [GGML_TYPE_Q2_0_ROCMFP2] = {
         .type_name                = "q2_0_rocmfp2",
         .blck_size                = QK_ROCMFP2,
