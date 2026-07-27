@@ -76,6 +76,19 @@ def test_config_set_creates_file_when_missing(
     assert "port = 9090" in cfg_path.read_text()
 
 
+def test_config_markup_characters_do_not_crash_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_config_path(tmp_path, monkeypatch)
+
+    set_result = CliRunner().invoke(app, ["config", "set", "image=registry/[dev]"])
+    get_result = CliRunner().invoke(app, ["config", "get", "image"])
+
+    assert set_result.exit_code == 0, set_result.stdout
+    assert get_result.exit_code == 0, get_result.stdout
+    assert "registry/[dev]" in get_result.stdout
+
+
 def test_load_or_build_env_overrides_persisted_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

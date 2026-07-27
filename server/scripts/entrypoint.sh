@@ -260,7 +260,7 @@ elif command -v amd-smi &>/dev/null; then
     amd_stats=$(amd-smi static --asic --vram --csv 2>/dev/null | awk -F',' '
         NR == 1 {
             for (i = 1; i <= NF; i++) {
-                key = $i; gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", key); col[key] = i
+                key = tolower($i); gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", key); col[key] = i
             }
             next
         }
@@ -282,12 +282,12 @@ elif command -v rocm-smi &>/dev/null; then
     amd_stats=$(rocm-smi --showproductname --showmeminfo vram --csv 2>/dev/null | awk -F',' '
         NR == 1 {
             for (i = 1; i <= NF; i++) {
-                key = $i; gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", key); col[key] = i
+                key = tolower($i); gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", key); col[key] = i
             }
             next
         }
         {
-            bytes = $(col["VRAM Total Memory (B)"]); arch = $(col["GFX Version"])
+            bytes = $(col["vram total memory (b)"]); arch = $(col["gfx version"])
             gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", bytes)
             gsub(/^[[:space:]]+|[[:space:]\r]+$/, "", arch)
             if (bytes ~ /^[0-9]+$/) {

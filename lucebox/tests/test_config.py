@@ -35,6 +35,28 @@ def test_image_variant_round_trips_from_toml(tmp_path: Path) -> None:
     assert cfg.variant == "integration-props-uv-squared-clean-cuda12"
 
 
+def test_toml_load_uses_strict_bool_and_prefill_casters(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[dflash]\nlazy = "false"\ndebug_thinking_logits = "false"\n'
+        'prefill_mode = "auto"\n'
+    )
+
+    cfg = config._load_toml(path)
+
+    assert cfg.dflash.lazy is False
+    assert cfg.dflash.debug_thinking_logits is False
+    assert cfg.dflash.prefill_mode == "auto"
+
+
+def test_toml_load_rejects_invalid_prefill_mode(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[dflash]\nprefill_mode = "sometimes"\n')
+
+    with pytest.raises(ValueError, match="prefill_mode"):
+        config._load_toml(path)
+
+
 def test_model_preset_round_trips_through_set_and_load(tmp_path: Path) -> None:
     """Setting model.preset writes a sparse TOML doc that loads back correctly."""
     path = tmp_path / "config.toml"
@@ -226,3 +248,18 @@ def test_seed_dflash_is_noop_when_dflash_present(tmp_path: Path) -> None:
     wrote = config.seed_dflash_from_host(HostFacts(vram_gb=80), path=path)
     assert wrote is False
     assert config.load(path).dflash.max_ctx == 4096
+
+
+def test_seed_dflash_migrates_legacy_config_before_writing(tmp_path: Path) -> None:
+    from lucebox.types import HostFacts
+
+    path = tmp_path / "config.toml"
+    path.with_suffix(".env").write_text("DFLASH_PORT=9090\n")
+
+    wrote = config.seed_dflash_from_host(HostFacts(vram_gb=24), path=path)
+
+    assert wrote is True
+    loaded = config.load(path)
+    assert loaded is not None
+    assert loaded.port == 9090
+    assert loaded.dflash.max_ctx == 98304

@@ -110,10 +110,26 @@ def test_runtime_volumes_mounts_models_and_home(tmp_path: Path) -> None:
 
 def test_runtime_volumes_dedupes_when_models_is_home(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.delenv("LUCEBOX_HOME", raising=False)
     cfg = Config(models_dir=tmp_path)
     vols = docker_run._runtime_volumes(cfg)
-    # models_dir == home → only the models mount, no duplicate home mount.
-    assert len(vols) == 1
+    # models_dir == home is mounted at /opt/..., not at its host path, so the
+    # nested config directory still needs an explicit same-path mount.
+    assert len(vols) == 2
+    assert (str(tmp_path / ".lucebox"), str(tmp_path / ".lucebox")) in vols
+
+
+def test_runtime_volumes_mounts_custom_config_home(
+    monkeypatch, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    config_home = tmp_path / "config-outside-home"
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    monkeypatch.setenv("LUCEBOX_HOME", str(config_home))
+
+    vols = docker_run._runtime_volumes(Config(models_dir=tmp_path / "models"))
+
+    assert (str(config_home), str(config_home)) in vols
 
 
 # ── _resolve_model_files ─────────────────────────────────────────────────────
@@ -190,6 +206,19 @@ def test_server_run_spec_always_emits_core_dflash_env(tmp_path: Path) -> None:
     assert env["DFLASH_PREFILL_CACHE_SLOTS"] == "0"
     assert env["DFLASH_THINK_MAX"] == "15488"
     assert env["DFLASH_PORT"] == "8080"
+    assert env["LUCEBOX_HOME"]
+
+
+def test_server_run_spec_target_only_preset_disables_stale_draft(tmp_path: Path) -> None:
+    cfg = Config(
+        models_dir=tmp_path,
+        model=ModelMeta(preset="qwen3.6-moe"),
+    )
+
+    env = _env(docker_run.server_run_spec(cfg))
+
+    assert env["DFLASH_TARGET"].endswith("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf")
+    assert env["DFLASH_DRAFT"].endswith("/.lucebox-no-draft")
 
 
 def test_server_run_spec_optional_env_off_by_default(tmp_path: Path) -> None:

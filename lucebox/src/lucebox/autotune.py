@@ -26,8 +26,7 @@ def runtime_from_host(host: HostFacts) -> DflashRuntime:
         22-31   — 24 GB-class consumer flagships (3090/4090/5090/5090-Laptop).
                   98 K with tq3_0 KV (~2 GB KV + ~18 GB model ≈ 20 GB).
                   Confirmed on bragi (RTX 5090 Laptop, 23 GB VRAM) 2026-05-31.
-        32-47   — RTX 6000 Ada / A100 40 GB. Full 128 K.
-        ≥48     — A100 80 GB / H100 / RTX 6000 Pro. Full 128 K.
+        ≥32     — RTX 6000 Ada / A100 / H100 class. Full 128 K.
 
     Prefix cache remains an explicit sweep tunable, but the automatic
     baseline keeps it off because tool prompts currently exercise a daemon
@@ -75,6 +74,4 @@ def runtime_from_host(host: HostFacts) -> DflashRuntime:
             max_ctx=98304,
             cache_type_k="tq3_0", cache_type_v="tq3_0",
         )
-    if host.vram_gb < 48:
-        return DflashRuntime(max_ctx=131072)
     return DflashRuntime(max_ctx=131072)

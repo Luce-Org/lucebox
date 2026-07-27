@@ -52,8 +52,8 @@ def _resolve_model_files(cfg: Config) -> tuple[str, str, str]:
     (a directory path) instead of the GGUF-file path, allowing the entrypoint
     to discover the safetensors file inside it.
 
-    Imported lazily to avoid the lucebox.types ↔ lucebox.download circular
-    import that surfaces when this module is imported from ``__init__``.
+    The preset registry is imported lazily so constructing a minimal Docker
+    spec does not import the Hugging Face download surface unnecessarily.
     """
     target = cfg.model.target_file
     draft = cfg.model.draft_file
@@ -75,12 +75,18 @@ def _resolve_model_files(cfg: Config) -> tuple[str, str, str]:
 
 
 def _runtime_volumes(cfg: Config) -> tuple[tuple[str, str], ...]:
-    """Mount models plus $HOME so absolute symlink targets remain valid."""
-    home = str(Path.home())
+    """Mount models, $HOME, and any config dir outside the home mount."""
+    home_path = Path.home()
+    home = str(home_path)
     models = str(cfg.models_dir)
     volumes = [(models, "/opt/lucebox-hub/server/models")]
     if home != models:
         volumes.append((home, home))
+    config_home = Path(os.environ.get("LUCEBOX_HOME", home_path / ".lucebox")).absolute()
+    # The same-path home mount normally covers config. If models_dir == HOME,
+    # that path is mounted at /opt/... instead, so add config explicitly too.
+    if home == models or not config_home.is_relative_to(home_path):
+        volumes.append((str(config_home), str(config_home)))
     return tuple(volumes)
 
 
@@ -175,7 +181,11 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
     # LUCEBOX_HOST_* first so they ride out front in the rendered argv,
     # making it obvious in `print-run` output what host facts get forwarded.
     env: list[tuple[str, str]] = list(_host_facts_env())
+    config_home = str(
+        Path(os.environ.get("LUCEBOX_HOME", Path.home() / ".lucebox")).absolute()
+    )
     env += [
+        ("LUCEBOX_HOME", config_home),
         ("DFLASH_BUDGET", str(cfg.dflash.budget)),
         ("DFLASH_MAX_CTX", str(cfg.dflash.max_ctx)),
         ("DFLASH_PREFIX_CACHE_SLOTS", str(cfg.dflash.prefix_cache_slots)),
@@ -198,6 +208,12 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
         env.append(("DFLASH_DRAFT", f"/opt/lucebox-hub/server/models/draft/{draft_file}"))
     elif draft_dir:
         env.append(("DFLASH_DRAFT", f"/opt/lucebox-hub/server/models/draft/{draft_dir}"))
+    elif cfg.model.preset:
+        # An active target-only preset is an explicit choice, not permission
+        # for entrypoint.sh to scan models/draft and attach an unrelated stale
+        # draft left by a previously active model. The entrypoint treats this
+        # guaranteed-missing path as "run target-only".
+        env.append(("DFLASH_DRAFT", "/opt/lucebox-hub/server/models/.lucebox-no-draft"))
     if cfg.dflash.lazy:
         env.append(("DFLASH_LAZY", "1"))
     if cfg.dflash.cache_type_k:

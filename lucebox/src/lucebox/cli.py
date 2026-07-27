@@ -22,6 +22,7 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 import lucebox.config as config_mod
@@ -102,7 +103,7 @@ def pull() -> None:
     """`docker pull` the image variant from config.toml."""
     cfg = _load_or_build()
     tag = f"{cfg.image}:{cfg.variant}"
-    console.print(f"[bold]Pulling {tag}[/bold] (~14 GB; takes a while)…")
+    console.print(f"[bold]Pulling {escape(tag)}[/bold] (~14 GB; takes a while)…")
     rc = docker_run.docker_pull(tag)
     if rc != 0:
         raise typer.Exit(code=rc)
@@ -145,10 +146,10 @@ def config_get_cmd(
     try:
         entries = config_get(key or None)
     except KeyError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(code=2) from exc
     for k, (value, origin) in entries.items():
-        console.print(f"{k} = {value!r} ([dim]from {origin}[/dim])")
+        console.print(f"{k} = {escape(repr(value))} ([dim]from {origin}[/dim])")
 
 
 @config_app.command("set")
@@ -170,9 +171,9 @@ def config_set_cmd(
     try:
         config_set(key, value)
     except (KeyError, ValueError) as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(code=2) from exc
-    console.print(f"[green]Set[/green] {key} = {value}")
+    console.print(f"[green]Set[/green] {escape(key)} = {escape(value)}")
 
 
 @config_app.command("unset")
@@ -183,12 +184,12 @@ def config_unset_cmd(
     try:
         changed = config_unset(key)
     except KeyError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(code=2) from exc
     if changed:
-        console.print(f"[green]Unset[/green] {key}")
+        console.print(f"[green]Unset[/green] {escape(key)}")
     else:
-        console.print(f"[dim]{key} was not in config.toml; nothing to do[/dim]")
+        console.print(f"[dim]{escape(key)} was not in config.toml; nothing to do[/dim]")
 
 
 # ── models sub-app ─────────────────────────────────────────────────────────
@@ -287,7 +288,7 @@ def models_download(
     try:
         pres = download_mod.resolve_preset(preset)
     except KeyError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(code=2) from exc
 
     current = download_mod.status(cfg, pres)
