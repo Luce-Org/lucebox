@@ -149,5 +149,5 @@ def test_print_run_reports_invalid_configuration_without_traceback(
     result = CliRunner().invoke(app, ["print-run"])
 
     assert result.exit_code == 2
-    assert "Invalid configuration" in result.output
+    assert "Invalid configuration" in result.stderr
     assert "Traceback" not in result.output

@@ -300,6 +300,26 @@ def test_server_run_spec_resolves_symlinked_model_parent(tmp_path: Path) -> None
     assert _env(spec)["DFLASH_TARGET"] == "/opt/lucebox-resolved/target/nested.gguf"
 
 
+def test_server_run_spec_does_not_remount_file_for_symlinked_models_dir(
+    tmp_path: Path,
+) -> None:
+    actual_models = tmp_path / "actual-models"
+    models = tmp_path / "models"
+    actual_models.mkdir()
+    (actual_models / "target.gguf").write_bytes(b"model")
+    models.symlink_to(actual_models, target_is_directory=True)
+
+    spec = docker_run.server_run_spec(
+        Config(models_dir=models, model=ModelMeta(target_file="target.gguf"))
+    )
+
+    assert _env(spec)["DFLASH_TARGET"] == "/opt/lucebox-hub/server/models/target.gguf"
+    assert all(
+        mount.target != "/opt/lucebox-resolved/target/target.gguf"
+        for mount in spec.volumes
+    )
+
+
 def test_server_run_spec_mounts_symlinked_speculator_directory_read_only(
     tmp_path: Path,
 ) -> None:

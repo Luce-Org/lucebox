@@ -37,13 +37,16 @@ die()  { printf '%s[install] ✗%s %s\n' "$C_ERR" "$C_RST" "$*" >&2; exit 1; }
 command -v curl >/dev/null 2>&1 || die "curl is required (apt-get install curl)"
 
 sha256_file() {
+    local sum
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$1" | awk '{print $1}'
+        sum=$(sha256sum "$1")
     elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "$1" | awk '{print $1}'
+        sum=$(shasum -a 256 "$1")
     else
         die "checksum requested, but neither sha256sum nor shasum is installed"
     fi
+    sum="${sum%% *}"
+    printf '%s' "$sum" | tr '[:upper:]' '[:lower:]'
 }
 
 # ── decide what gets baked in as the persisted channel ───────────────────
@@ -85,7 +88,6 @@ if [ -n "$expected_sha" ]; then
     [[ "$expected_sha" =~ ^[0-9a-fA-F]{64}$ ]] \
         || die "LUCEBOX_WRAPPER_SHA256 must be exactly 64 hexadecimal characters"
     actual_sha=$(sha256_file "$tmp")
-    actual_sha=$(printf '%s' "$actual_sha" | tr '[:upper:]' '[:lower:]')
     expected_sha=$(printf '%s' "$expected_sha" | tr '[:upper:]' '[:lower:]')
     [ "$actual_sha" = "$expected_sha" ] \
         || die "wrapper checksum mismatch (expected $expected_sha, got $actual_sha)"
