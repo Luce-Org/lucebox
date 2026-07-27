@@ -153,9 +153,15 @@ def _selected_model_path(
     if under_draft:
         container_base /= "draft"
     canonical = str(container_base.joinpath(*relative.parts))
-    lexical = host_path.absolute()
     resolved = host_path.resolve(strict=False)
-    if resolved == lexical:
+    # A symlink in models_dir or one of its ancestors is covered by the root bind.
+    # Resolve that root before comparing so only symlinks *within* the selected
+    # model path need a separate narrow mount.
+    expected = cfg.models_dir.resolve(strict=False)
+    if under_draft:
+        expected /= "draft"
+    expected = expected.joinpath(*relative.parts)
+    if resolved == expected:
         return canonical
 
     mount_target = f"{_CONTAINER_RESOLVED_MODELS}/{role}"
@@ -308,7 +314,7 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
         draft_path = _selected_model_path(
             cfg,
             draft_dir,
-            field="model.speculator_dir",
+            field="preset.speculator_dir",
             role="draft-dir",
             under_draft=True,
             directory=True,
