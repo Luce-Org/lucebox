@@ -60,6 +60,24 @@ class HostFacts:
     docker_version: str = ""
     ctk: CtkStatus = "none"
 
+    def __post_init__(self) -> None:
+        """Reject malformed persisted host snapshots.
+
+        ``Literal`` annotations help static type-checkers, but TOML is runtime
+        input and can still contain arbitrary strings.  Failing here keeps an
+        invalid snapshot from silently selecting the wrong accelerator path.
+        """
+        if self.gpu_vendor not in {"nvidia", "amd", "none"}:
+            raise ValueError(
+                "gpu_vendor must be nvidia, amd, or none; "
+                f"got {self.gpu_vendor!r}"
+            )
+        if self.ctk not in {"runtime", "cdi", "installed-unwired", "none"}:
+            raise ValueError(
+                "ctk must be runtime, cdi, installed-unwired, or none; "
+                f"got {self.ctk!r}"
+            )
+
 
 @dataclass(frozen=True, slots=True)
 class DflashRuntime:
@@ -92,7 +110,7 @@ class DflashRuntime:
     # attention (server default). On gemma4's hybrid iSWA the full-attn
     # layers grow KV linearly with max_ctx; a sparse fa_window keeps
     # decode compute bounded on long prompts without changing the KV
-    # footprint. Q: passed through to the server's `--fa-window <N>`
+    # footprint. Passed through to the server's `--fa-window <N>`
     # flag (see server/src/server/server_main.cpp).
     fa_window: int = 0
     # Soft-close thinking termination dial (PR #326 in lucebox-hub).
@@ -111,6 +129,19 @@ class DflashRuntime:
     # data. Heavy stderr (one line per thinking token across all
     # in-flight requests); leave off in production.
     debug_thinking_logits: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate the bounded tuning knobs before they reach the server."""
+        if not 0.0 < self.prefill_keep_ratio <= 1.0:
+            raise ValueError(
+                "prefill_keep_ratio must be in the interval (0.0, 1.0]; "
+                f"got {self.prefill_keep_ratio!r}"
+            )
+        if not 0.0 <= self.think_soft_close_min_ratio <= 1.0:
+            raise ValueError(
+                "think_soft_close_min_ratio must be in the interval [0.0, 1.0]; "
+                f"got {self.think_soft_close_min_ratio!r}"
+            )
 
 
 @dataclass(frozen=True, slots=True)

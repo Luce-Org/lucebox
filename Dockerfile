@@ -126,7 +126,8 @@ COPY server/pyproject.toml server/README.md /src/server/
 COPY server/scripts /src/server/scripts
 COPY optimizations/pflash /src/optimizations/pflash
 COPY optimizations/megakernel /src/optimizations/megakernel
-COPY lucebox /src/lucebox
+COPY lucebox/pyproject.toml lucebox/README.md /src/lucebox/
+COPY lucebox/src /src/lucebox/src
 
 # ─── Stage 2: runtime ───────────────────────────────────────────────────────
 # Runtime image: ships nvidia driver libs but no nvcc / dev headers. Matches
@@ -206,7 +207,12 @@ COPY --from=builder /src/server/build /opt/lucebox-hub/server/build
 # server/share/model_cards. The canonical copy also lives at
 # /opt/lucebox-hub/share/model_cards for any host-side tooling.
 COPY share/model_cards /opt/lucebox-hub/share/model_cards
+# Dedicated targets for narrow, read-only binds when a selected model is a
+# symlink to storage outside the main models directory.
 RUN mkdir -p /opt/lucebox-hub/server/share \
+             /opt/lucebox-resolved/target \
+             /opt/lucebox-resolved/draft \
+             /opt/lucebox-resolved/draft-dir \
     && ln -s /opt/lucebox-hub/share/model_cards \
              /opt/lucebox-hub/server/share/model_cards
 

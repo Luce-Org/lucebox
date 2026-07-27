@@ -26,6 +26,7 @@ ROOT="$(git rev-parse --show-toplevel 2>/dev/null || (cd "$(dirname "$0")/.." &&
 SCRIPT="$ROOT/lucebox.sh"
 ENTRYPOINT="$ROOT/server/scripts/entrypoint.sh"
 INSTALLER="$ROOT/install.sh"
+SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 if [ ! -f "$SCRIPT" ]; then
     echo "FAIL: lucebox.sh not found at $SCRIPT" >&2
@@ -46,6 +47,23 @@ exit 1
 STUB
     chmod +x "$SUITE_SHIMS/$binname"
 done
+if ! command -v timeout >/dev/null 2>&1; then
+    # macOS has no GNU `timeout`; keep the contributor test suite portable
+    # with a tiny subprocess wrapper. CI still uses the native coreutils tool.
+    cat > "$SUITE_SHIMS/timeout" <<'PYTHON_TIMEOUT'
+#!/usr/bin/env python3
+import subprocess
+import sys
+
+duration = float(sys.argv[1].removesuffix("s"))
+try:
+    result = subprocess.run(sys.argv[2:], timeout=duration, check=False)
+except subprocess.TimeoutExpired:
+    raise SystemExit(124)
+raise SystemExit(result.returncode)
+PYTHON_TIMEOUT
+    chmod +x "$SUITE_SHIMS/timeout"
+fi
 export HOME="$SUITE_SANDBOX/home"
 export XDG_CONFIG_HOME="$SUITE_SANDBOX/xdg"
 export XDG_DATA_HOME="$SUITE_SANDBOX/data"
@@ -142,10 +160,10 @@ SHELLCHECK_TARGETS=(
 )
 # Add every scripts/*.sh except this one (don't recurse into our own tests).
 while IFS= read -r -d '' f; do
-    [ "$f" = "${BASH_SOURCE[0]}" ] && continue
+    [ "$f" = "$SELF_PATH" ] && continue
     SHELLCHECK_TARGETS+=("$f")
 done < <(find "$ROOT/scripts" -maxdepth 1 -name '*.sh' -type f -print0 2>/dev/null)
-SHELLCHECK_TARGETS+=("${BASH_SOURCE[0]}")
+SHELLCHECK_TARGETS+=("$SELF_PATH")
 
 if command -v shellcheck >/dev/null 2>&1; then
     sc_out=$(shellcheck --severity=error "${SHELLCHECK_TARGETS[@]}" 2>&1) || sc_rc=$?
@@ -636,15 +654,35 @@ test_entrypoint_host_info_json "entrypoint HOST_INFO JSON shape (populated + unk
 # preserve the user's channel across upgrades.
 test_install_sh_bakes_source_url() {
     local label="$1"
-    local tmp dest_dir dest_path src_url out rc
+    local tmp dest_dir dest_path bad_dest src_url src_sha out rc
     tmp=$(mktemp -d -t lucebox-install.XXXXXX)
     # Use the real lucebox.sh as the "remote" file — `file://` works with
     # curl out of the box and exercises the same install.sh code path as
     # an https fetch would.
     src_url="file://$SCRIPT"
+    if command -v sha256sum >/dev/null 2>&1; then
+        src_sha=$(sha256sum "$SCRIPT")
+    else
+        src_sha=$(shasum -a 256 "$SCRIPT")
+    fi
+    src_sha="${src_sha%% *}"
     dest_dir="$tmp/bin"
     dest_path="$dest_dir/lucebox"
+    bad_dest="$dest_dir/bad-checksum"
+
+    out=$(LUCEBOX_INSTALL_URL="$src_url" LUCEBOX_INSTALL_DEST="$bad_dest" \
+        LUCEBOX_WRAPPER_SHA256="$(printf '0%.0s' {1..64})" \
+        NO_COLOR=1 bash "$INSTALLER" 2>&1) && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ] || [ -e "$bad_dest" ] \
+       || ! grep -qF "wrapper checksum mismatch" <<<"$out"; then
+        rm -rf "$tmp"
+        report fail "$label" "bad wrapper checksum was not rejected"
+        return
+    fi
+
+    rc=0
     out=$(LUCEBOX_INSTALL_URL="$src_url" LUCEBOX_INSTALL_DEST="$dest_path" \
+        LUCEBOX_WRAPPER_SHA256="$src_sha" \
         NO_COLOR=1 bash "$INSTALLER" 2>&1) || rc=$?
     rc="${rc:-0}"
     if [ "$rc" -ne 0 ]; then
@@ -662,15 +700,20 @@ test_install_sh_bakes_source_url() {
         report fail "$label" "LUCEBOX_INSTALLED_FROM not rewritten in installed copy"
         return
     fi
+    if ! grep -qF "wrapper sha256 verified" <<<"$out"; then
+        rm -rf "$tmp"
+        report fail "$label" "installer did not report checksum verification"
+        return
+    fi
     rm -rf "$tmp"
     report ok "$label"
 }
 test_install_sh_bakes_source_url "install.sh bakes LUCEBOX_INSTALLED_FROM into installed copy"
 
 # ── update dispatch ───────────────────────────────────────────────────────
-# `lucebox update` must dispatch to cmd_update — verify it's wired in the
-# main case statement and appears in --help. We can't actually run the
-# update (it'd curl + replace this very script) so the test is parse-level.
+# `lucebox update` must dispatch to cmd_update — first verify it's wired in
+# the main case statement and appears in --help, then exercise an isolated
+# wrapper copy against a file:// channel below.
 test_update_subcommand_wired() {
     local label="$1"
     local out
@@ -686,6 +729,65 @@ test_update_subcommand_wired() {
     report ok "$label"
 }
 test_update_subcommand_wired "lucebox update subcommand is wired"
+
+test_update_downloads_verifies_and_replaces_atomically() {
+    local label="$1" tmp installed source_url checksum out rc
+    tmp=$(mktemp -d -t lucebox-update.XXXXXX)
+    installed="$tmp/lucebox"
+    mkdir -p "$tmp/channel"
+
+    # Bake a file:// channel into an isolated wrapper copy. The update must
+    # replace only that copy, never the repository script.
+    source_url="file://$tmp/channel/lucebox.sh"
+    sed "s|^LUCEBOX_INSTALLED_FROM=.*|LUCEBOX_INSTALLED_FROM=\"$source_url\"|" \
+        "$SCRIPT" > "$installed"
+    chmod +x "$installed"
+    cat > "$tmp/channel/lucebox.sh" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+VERSION="9.9.9"
+LUCEBOX_INSTALLED_FROM="${LUCEBOX_INSTALLED_FROM:-https://example.invalid/lucebox.sh}"
+printf 'updated %s from %s\n' "$VERSION" "$LUCEBOX_INSTALLED_FROM"
+WRAPPER
+
+    # A wrong explicit pin must leave the installed wrapper untouched.
+    out=$(LUCEBOX_WRAPPER_SHA256="$(printf '0%.0s' {1..64})" \
+        NO_COLOR=1 bash "$installed" update 2>&1) && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ] || ! grep -qF "wrapper checksum mismatch" <<<"$out" \
+       || grep -qF 'VERSION="9.9.9"' "$installed"; then
+        rm -rf "$tmp"
+        report fail "$label" "bad checksum was not rejected: $(head -3 <<<"$out")"
+        return
+    fi
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        checksum=$(sha256sum "$tmp/channel/lucebox.sh")
+    else
+        checksum=$(shasum -a 256 "$tmp/channel/lucebox.sh")
+    fi
+    checksum="${checksum%% *}"
+    rc=0
+    out=$(LUCEBOX_WRAPPER_SHA256="$checksum" \
+        NO_COLOR=1 bash "$installed" update 2>&1) || rc=$?
+    rc="${rc:-0}"
+    if [ "$rc" -ne 0 ]; then
+        rm -rf "$tmp"
+        report fail "$label" "verified update exited $rc: $(head -3 <<<"$out")"
+        return
+    fi
+    if ! grep -qF 'VERSION="9.9.9"' "$installed" \
+       || ! grep -Fqx "LUCEBOX_INSTALLED_FROM=\"$source_url\"" "$installed" \
+       || ! grep -qF "wrapper sha256 verified" <<<"$out"; then
+        rm -rf "$tmp"
+        report fail "$label" "validated wrapper did not replace the isolated copy"
+        return
+    fi
+
+    rm -rf "$tmp"
+    report ok "$label"
+}
+test_update_downloads_verifies_and_replaces_atomically \
+    "lucebox update verifies and atomically replaces the wrapper"
 
 # ── IMAGE_BASE derived from install source ────────────────────────────────
 # Source lucebox.sh in a subshell with LUCEBOX_INSTALLED_FROM pointing at
@@ -929,6 +1031,11 @@ case "\$1" in
         exit 0
         ;;
     *)
+        if [ "\${DOCKER_FAKE_CONFIG_ERROR:-0}" = "1" ] \
+           && [[ "\$*" == *"print-serve-argv"* ]]; then
+            echo "Invalid configuration: test fixture" >&2
+            exit 2
+        fi
         printf 'DOCKER_INVOKED'
         for a in "\$@"; do printf ' %q' "\$a"; done
         printf '\n'
@@ -1070,14 +1177,39 @@ test_serve_fallback_forwards_config_env() {
         _run_wrapper_capture_docker "$sandbox" serve || true)
     rm -rf "$sandbox" "$config_home"
     if ! grep -qF "LUCEBOX_HOME=$config_home" <<<"$out" \
-       || ! grep -qF "HOME=$sandbox" <<<"$out"; then
+       || ! grep -qF "HOME=$config_home" <<<"$out"; then
         report fail "$label" "fallback server omitted HOME/config env: $(tail -3 <<<"$out")"
+        return
+    fi
+    if grep -qF -- "-v $sandbox:$sandbox" <<<"$out"; then
+        report fail "$label" "fallback server exposed the full host HOME"
         return
     fi
     report ok "$label"
 }
 test_serve_fallback_forwards_config_env \
-    "serve fallback forwards HOME + LUCEBOX_HOME"
+    "serve fallback isolates HOME and forwards LUCEBOX_HOME"
+
+test_serve_refuses_invalid_config_fallback() {
+    local label="$1" sandbox out
+    sandbox=$(mktemp -d -t lucebox-serve-invalid.XXXXXX)
+    _make_docker_shim "$sandbox" 0
+    out=$(DOCKER_FAKE_CONFIG_ERROR=1 \
+        _run_wrapper_capture_docker "$sandbox" serve || true)
+    rm -rf "$sandbox"
+    if ! grep -qF "Invalid configuration: test fixture" <<<"$out" \
+       || ! grep -qF "refusing to ignore invalid Lucebox configuration" <<<"$out"; then
+        report fail "$label" "configuration error was not surfaced: $(tail -4 <<<"$out")"
+        return
+    fi
+    if grep -qF "using fallback" <<<"$out"; then
+        report fail "$label" "invalid configuration silently launched fallback defaults"
+        return
+    fi
+    report ok "$label"
+}
+test_serve_refuses_invalid_config_fallback \
+    "serve refuses to replace invalid config with fallback defaults"
 
 test_run_route_preserves_tty() {
     local label="$1" sandbox out rc

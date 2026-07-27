@@ -9,7 +9,7 @@ and upgrades that add new fields don't gratuitously rewrite every file.
 The dotted-key surface area is small and flat:
   model.preset, model.target_file, model.draft_file
   port, models_dir, variant, image, container_name
-  dflash.<field>  for each of the 11 DflashRuntime knobs + think_max
+  dflash.<field>  for every registered DflashRuntime knob
 
 Load resolves the TOML file → ``Config`` object, with anything absent
 filled from ``Config()`` defaults. Save writes back only the keys that
@@ -25,7 +25,7 @@ import tomllib
 from collections.abc import Callable
 from dataclasses import asdict, replace
 from datetime import UTC
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 
 import tomli_w
@@ -44,8 +44,8 @@ def default_config_path() -> Path:
     """Where .lucebox/config.toml lives.
 
     Convention: under $LUCEBOX_HOME if set, otherwise $HOME/.lucebox. Lives in
-    the bind-mounted host home dir so the config survives container teardown
-    and is editable from the host.
+    an explicitly bind-mounted application directory so the config survives
+    container teardown without exposing the rest of the host home directory.
     """
     base = os.environ.get("LUCEBOX_HOME")
     if base:
@@ -85,6 +85,50 @@ def _cast_bool(v: Any) -> bool:
     raise ValueError(f"cannot parse boolean: {v!r}")
 
 
+def _cast_port(v: Any) -> int:
+    value = int(v)
+    if not 1 <= value <= 65535:
+        raise ValueError(f"port must be in the interval [1, 65535], got {value!r}")
+    return value
+
+
+def _cast_models_dir(v: Any) -> str:
+    value = str(v)
+    if not Path(value).is_absolute():
+        raise ValueError(f"models_dir must be an absolute path, got {value!r}")
+    return value
+
+
+def _cast_model_relative_path(v: Any) -> str:
+    value = str(v)
+    if not value:
+        return value
+    path = PurePosixPath(value)
+    if path.is_absolute() or ".." in path.parts or value == ".":
+        raise ValueError(f"model file must be below models_dir, got {value!r}")
+    return value
+
+
+def _cast_prefill_keep_ratio(v: Any) -> float:
+    value = float(v)
+    if not 0.0 < value <= 1.0:
+        raise ValueError(
+            "prefill_keep_ratio must be in the interval (0.0, 1.0], "
+            f"got {value!r}"
+        )
+    return value
+
+
+def _cast_think_soft_close_min_ratio(v: Any) -> float:
+    value = float(v)
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(
+            "think_soft_close_min_ratio must be in the interval [0.0, 1.0], "
+            f"got {value!r}"
+        )
+    return value
+
+
 # Each entry: dotted-key → (toml_path, type_caster, default_getter).
 # ``toml_path`` is the (section, field) pair on disk; ``"_root"`` means the
 # key lives at the top level (no [section]). ``default_getter`` returns the
@@ -93,11 +137,11 @@ KEY_REGISTRY: dict[str, tuple[tuple[str, str], Callable[[Any], Any]]] = {
     "variant": (("image", "variant"), str),
     "image": (("image", "registry"), str),
     "container_name": (("runtime", "container_name"), str),
-    "port": (("runtime", "port"), int),
-    "models_dir": (("paths", "models"), str),
+    "port": (("runtime", "port"), _cast_port),
+    "models_dir": (("paths", "models"), _cast_models_dir),
     "model.preset": (("model", "preset"), str),
-    "model.target_file": (("model", "target_file"), str),
-    "model.draft_file": (("model", "draft_file"), str),
+    "model.target_file": (("model", "target_file"), _cast_model_relative_path),
+    "model.draft_file": (("model", "draft_file"), _cast_model_relative_path),
     "dflash.budget": (("dflash", "budget"), int),
     "dflash.max_ctx": (("dflash", "max_ctx"), int),
     "dflash.lazy": (("dflash", "lazy"), _cast_bool),
@@ -106,15 +150,22 @@ KEY_REGISTRY: dict[str, tuple[tuple[str, str], Callable[[Any], Any]]] = {
     "dflash.cache_type_k": (("dflash", "cache_type_k"), str),
     "dflash.cache_type_v": (("dflash", "cache_type_v"), str),
     "dflash.prefill_mode": (("dflash", "prefill_mode"), _cast_prefill_mode),
-    "dflash.prefill_keep_ratio": (("dflash", "prefill_keep_ratio"), float),
+    "dflash.prefill_keep_ratio": (
+        ("dflash", "prefill_keep_ratio"),
+        _cast_prefill_keep_ratio,
+    ),
     "dflash.prefill_threshold": (("dflash", "prefill_threshold"), int),
     "dflash.prefill_drafter": (("dflash", "prefill_drafter"), str),
     "dflash.think_max": (("dflash", "think_max"), int),
     "dflash.fa_window": (("dflash", "fa_window"), int),
     "dflash.think_soft_close_min_ratio": (
-        ("dflash", "think_soft_close_min_ratio"), float),
+        ("dflash", "think_soft_close_min_ratio"),
+        _cast_think_soft_close_min_ratio,
+    ),
     "dflash.debug_thinking_logits": (
-        ("dflash", "debug_thinking_logits"), _cast_bool),
+        ("dflash", "debug_thinking_logits"),
+        _cast_bool,
+    ),
 }
 
 
@@ -226,11 +277,11 @@ def _from_dict(raw: dict[str, Any]) -> Config:
     registry = img.get("registry", "ghcr.io/luce-org/lucebox-hub")
 
     runtime = raw.get("runtime", {})
-    port = int(runtime.get("port", 8080))
+    port = _cast_port(runtime.get("port", 8080))
     container_name = str(runtime.get("container_name", "lucebox"))
 
     paths = raw.get("paths", {})
-    models_dir = Path(paths.get("models", str(default_models_dir())))
+    models_dir = Path(_cast_models_dir(paths.get("models", str(default_models_dir()))))
 
     df = raw.get("dflash", {})
     dflash = DflashRuntime(
@@ -242,13 +293,16 @@ def _from_dict(raw: dict[str, Any]) -> Config:
         cache_type_k=str(df.get("cache_type_k", "")),
         cache_type_v=str(df.get("cache_type_v", "")),
         prefill_mode=_cast_prefill_mode(df.get("prefill_mode", "off")),
-        prefill_keep_ratio=float(df.get("prefill_keep_ratio", 0.05)),
+        prefill_keep_ratio=_cast_prefill_keep_ratio(
+            df.get("prefill_keep_ratio", 0.05)
+        ),
         prefill_threshold=int(df.get("prefill_threshold", 32000)),
         prefill_drafter=str(df.get("prefill_drafter", "")),
         think_max=int(df.get("think_max", 15488)),
         fa_window=int(df.get("fa_window", 0)),
-        think_soft_close_min_ratio=float(
-            df.get("think_soft_close_min_ratio", 0.0)),
+        think_soft_close_min_ratio=_cast_think_soft_close_min_ratio(
+            df.get("think_soft_close_min_ratio", 0.0)
+        ),
         debug_thinking_logits=_cast_bool(df.get("debug_thinking_logits", False)),
     )
 
@@ -281,8 +335,8 @@ def _from_dict(raw: dict[str, Any]) -> Config:
     # them from the registry so users only have to write one key.
     mdl = raw.get("model", {})
     preset_name = str(mdl.get("preset", ""))
-    target_file = str(mdl.get("target_file", ""))
-    draft_file = str(mdl.get("draft_file", ""))
+    target_file = _cast_model_relative_path(mdl.get("target_file", ""))
+    draft_file = _cast_model_relative_path(mdl.get("draft_file", ""))
     if preset_name and (not target_file or not draft_file):
         from lucebox.download import PRESETS
 
@@ -466,6 +520,24 @@ def config_get(key: str | None = None, *, path: Path | None = None) -> dict[str,
     return out
 
 
+def overlay_env(cfg: Config) -> Config:
+    """Apply supported process overrides to an existing config.
+
+    Keeping this in one helper makes the documented ``env > TOML > default``
+    precedence identical for both persisted and first-run configurations.
+    """
+    return replace(
+        cfg,
+        variant=os.environ.get("LUCEBOX_VARIANT", cfg.variant),
+        image=os.environ.get("LUCEBOX_IMAGE", cfg.image),
+        container_name=os.environ.get("LUCEBOX_CONTAINER", cfg.container_name),
+        port=_cast_port(os.environ.get("LUCEBOX_PORT", str(cfg.port))),
+        models_dir=Path(
+            _cast_models_dir(os.environ.get("LUCEBOX_MODELS", str(cfg.models_dir)))
+        ),
+    )
+
+
 def live_config() -> Config:
     """Build a fresh Config from current host facts + the DFLASH_* heuristic.
 
@@ -481,13 +553,10 @@ def live_config() -> Config:
     host = from_env()
     default = Config()
     default_variant = "rocm" if host.gpu_vendor == "amd" else "cuda12"
-    return replace(
+    cfg = replace(
         default,
-        variant=os.environ.get("LUCEBOX_VARIANT", default_variant),
-        image=os.environ.get("LUCEBOX_IMAGE", default.image),
-        container_name=os.environ.get("LUCEBOX_CONTAINER", default.container_name),
-        port=int(os.environ.get("LUCEBOX_PORT", str(default.port))),
-        models_dir=Path(os.environ.get("LUCEBOX_MODELS", str(default.models_dir))),
+        variant=default_variant,
         dflash=autotune_mod.runtime_from_host(host),
         host=host,
     )
+    return overlay_env(cfg)

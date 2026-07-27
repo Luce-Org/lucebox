@@ -28,17 +28,8 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-# hf-xet (huggingface_hub ≥ 1.16) streams the entire file in one final
-# burst — the polling-based progress bar sits at 0% for ~14 minutes
-# then snaps to 100% on a 17 GB GGUF. Force the chunked Python
-# downloader instead so bytes grow continuously and the Rich bar tracks
-# reality. Set before importing hf_hub_download so the import picks
-# the env up. `setdefault` lets a user override on the command line.
-os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-
-from huggingface_hub import HfApi, hf_hub_download  # noqa: E402
-from huggingface_hub._local_folder import get_local_download_paths  # noqa: E402
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -50,6 +41,27 @@ from rich.progress import (
 )
 
 from lucebox.types import Config, HostFacts
+
+if TYPE_CHECKING:
+    from huggingface_hub import HfApi
+
+
+def _configure_huggingface_download() -> None:
+    """Select the progress-friendly downloader before importing HF Hub.
+
+    hf-xet streams a multi-GB file in one final burst, so the polling-based
+    progress bar remains at zero until completion.  Keep this environment
+    change local to download/status operations rather than mutating every
+    ``lucebox`` process merely because the CLI module was imported.
+    """
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+
+def _new_hf_api() -> HfApi:
+    _configure_huggingface_download()
+    from huggingface_hub import HfApi
+
+    return HfApi()
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +256,9 @@ def _incomplete_path_candidates(local_dir: Path, filename: str, etag: str | None
     when ``local_dir`` is set hf-hub always uses the local staging dir,
     so the two candidates above cover every code path we hit.
     """
+    _configure_huggingface_download()
+    from huggingface_hub._local_folder import get_local_download_paths
+
     paths = get_local_download_paths(local_dir, filename)
     candidates: list[Path] = []
     if etag:
@@ -302,6 +317,9 @@ def _download_with_progress(
     actual hf-xet staging path (a hashed filename under
     ``.cache/huggingface/download/``), not a guess.
     """
+    _configure_huggingface_download()
+    from huggingface_hub import hf_hub_download
+
     local_dir.mkdir(parents=True, exist_ok=True)
     target = local_dir / filename
     candidates = _incomplete_path_candidates(local_dir, filename, etag)
@@ -384,7 +402,7 @@ def download_preset(cfg: Config, preset: ModelPreset | None = None) -> int:
     """
     preset = preset or DEFAULT_PRESET
     console = Console()
-    api = HfApi()
+    api = _new_hf_api()
     models = cfg.models_dir
     models.mkdir(parents=True, exist_ok=True)
     draft = models / "draft"
@@ -437,7 +455,7 @@ def installed_status(cfg: Config, preset: ModelPreset) -> str:
 
 
 def installed_size_gb(cfg: Config, preset: ModelPreset) -> float:
-    """Sum of on-disk byte sizes for the preset's files, in GB (binary 1e9)."""
+    """Sum of on-disk byte sizes for the preset's files, in decimal GB (1e9)."""
     total = 0
     target = _local_target_path(cfg, preset)
     if target.exists():
@@ -478,7 +496,7 @@ def status(cfg: Config, preset: ModelPreset | None = None) -> dict[str, bool]:
     not a draft exists.
     """
     preset = preset or DEFAULT_PRESET
-    api = HfApi()
+    api = _new_hf_api()
     out: dict[str, bool] = {}
     try:
         size, _ = _file_meta(api, preset.target_repo, preset.target_file)
