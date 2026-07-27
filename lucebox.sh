@@ -893,9 +893,11 @@ cmd_serve() {
         -p "$DEFAULT_PORT:8080"
         -v "$HOME:$HOME"
         -v "$CONFIG_HOME:$CONFIG_HOME"
-        -v "$fallback_models:/opt/lucebox-hub/server/models")
+        -v "$fallback_models:/opt/lucebox-hub/server/models"
+        -e "HOME=$HOME")
     _append_gpu_args fallback_argv "$variant"
     _append_host_env fallback_argv
+    _append_scalar_env fallback_argv "$variant"
     fallback_argv+=("${IMAGE_BASE}:${variant}")
     _serve_and_track "${fallback_argv[@]}"
 }

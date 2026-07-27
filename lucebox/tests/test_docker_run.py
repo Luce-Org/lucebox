@@ -132,6 +132,18 @@ def test_runtime_volumes_mounts_custom_config_home(
     assert (str(config_home), str(config_home)) in vols
 
 
+def test_empty_lucebox_home_uses_default(monkeypatch, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    monkeypatch.setenv("LUCEBOX_HOME", "")
+
+    cfg = Config(models_dir=tmp_path / "models")
+    spec = docker_run.server_run_spec(cfg)
+
+    assert _env(spec)["LUCEBOX_HOME"] == str(home / ".lucebox")
+    assert str(Path.cwd()) != _env(spec)["LUCEBOX_HOME"]
+
+
 # ── _resolve_model_files ─────────────────────────────────────────────────────
 
 

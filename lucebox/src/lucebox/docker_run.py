@@ -82,7 +82,9 @@ def _runtime_volumes(cfg: Config) -> tuple[tuple[str, str], ...]:
     volumes = [(models, "/opt/lucebox-hub/server/models")]
     if home != models:
         volumes.append((home, home))
-    config_home = Path(os.environ.get("LUCEBOX_HOME", home_path / ".lucebox")).absolute()
+    config_home = Path(
+        os.environ.get("LUCEBOX_HOME") or home_path / ".lucebox"
+    ).absolute()
     # The same-path home mount normally covers config. If models_dir == HOME,
     # that path is mounted at /opt/... instead, so add config explicitly too.
     if home == models or not config_home.is_relative_to(home_path):
@@ -182,7 +184,7 @@ def server_run_spec(cfg: Config) -> DockerRunSpec:
     # making it obvious in `print-run` output what host facts get forwarded.
     env: list[tuple[str, str]] = list(_host_facts_env())
     config_home = str(
-        Path(os.environ.get("LUCEBOX_HOME", Path.home() / ".lucebox")).absolute()
+        Path(os.environ.get("LUCEBOX_HOME") or Path.home() / ".lucebox").absolute()
     )
     env += [
         ("LUCEBOX_HOME", config_home),
