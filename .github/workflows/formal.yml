@@ -43,7 +43,7 @@ jobs:
         name: Run deterministic ESBMC capsules
         continue-on-error: true
         env:
-          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:79d53e234e969ebff322927c9d147039dbe36bd5250ad102ceaaace339937b27
+          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:163309de012c9cdb2bb64244440995ef3e0d3104af6db81d821d8d0a707fed8f
         run: |
           mkdir -p .formal-results
           docker run --rm \

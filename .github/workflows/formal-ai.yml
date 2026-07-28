@@ -92,7 +92,7 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           FORMAL_AI_MODEL: ${{ vars.FORMAL_AI_MODEL || 'openai:gpt-5.6-sol' }}
-          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:d8f9d3709358142da8697fee5e0b4b58b89fac29d0c13fdcaff427dcd647b751
+          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:8671874bc58cafdc2a9328e105b0d4963f37ba28379d64dbd5ea0cf743431638
         run: |
           bundle="$(find incoming -type f -name 'failure-bundle-*.tar.gz' -print -quit)"
           if [[ -z "$bundle" ]]; then
@@ -125,7 +125,7 @@ jobs:
         if: steps.propose.outcome == 'success'
         continue-on-error: true
         env:
-          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:d8f9d3709358142da8697fee5e0b4b58b89fac29d0c13fdcaff427dcd647b751
+          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:8671874bc58cafdc2a9328e105b0d4963f37ba28379d64dbd5ea0cf743431638
         run: |
           bundle="$(find incoming -type f -name 'failure-bundle-*.tar.gz' -print -quit)"
           bundle_relative="${bundle#incoming/}"
