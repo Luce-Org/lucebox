@@ -44,7 +44,7 @@ jobs:
       TOKENIZER: ${{ vars.LUCEBOX_TOKENIZER || vars.LUCEBOX_SPEED_PROFILE_TOKENIZER || 'Qwen/Qwen3.6-27B' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
@@ -200,7 +200,7 @@ jobs:
 
       - name: Upload artifacts (json + markdown + nsys trace)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: speed-profile-${{ github.run_id }}
           path: |
