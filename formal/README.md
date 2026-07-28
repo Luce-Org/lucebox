@@ -28,6 +28,10 @@ The `Formal AI Candidate` workflow is separate and advisory:
 - the lane can upload only a diagnosis and candidate patch. It cannot commit,
   comment, push, or open a pull request.
 
+Every C/C++ capsule requests ESBMC's native self-contained HTML report. A
+counterexample publishes it below `counterexamples/<capsule>/` in the formal
+results artifact; CI never renders untrusted report HTML in the job summary.
+
 ## Current capsules
 
 `prefix-cache-inline` checks the production
@@ -36,10 +40,11 @@ symbolic cache capacity, branch, and prefix depth. Its precise guarantees and
 exclusions are in
 [`prefix_cache/PROPERTIES.md`](prefix_cache/PROPERTIES.md).
 
-`prefix-cache-abort-hole` checks every bounded cursor and occupancy pattern for
-the production free-slot selector. It was added from a current regression in
-which an aborted reservation left a free slot, but the next reservation
-selected and invalidated a still-committed snapshot. Its contract is in
+`prefix-cache-abort-hole` enforces a native ESBMC function contract for every
+bounded cursor and occupancy pattern against the production free-slot selector.
+It was added from a current regression in which an aborted reservation left a
+free slot, but the next reservation selected and invalidated a still-committed
+snapshot. Its contract is in
 [`prefix_cache/ABORT_HOLE_PROPERTIES.md`](prefix_cache/ABORT_HOLE_PROPERTIES.md).
 
 The dependency-free native test covers the wider transition matrix:

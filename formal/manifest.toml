@@ -3,8 +3,8 @@ schema_version = 1
 [toolchain]
 esbmc_version = "8.4"
 esbmc_linux_sha256 = "68bb71128e0c3c2db090955e7a302533a8a11a9d898df7f169c22311a0ec5078"
-verifier_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:d11a7aace22dbd005f53482e38903782e16f3c1e2403cbf44f9ca9b220bef8db"
-repair_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:2dc8fadf0345cbcd0eba4caf84ccc43cabe2fc5f65c39a39ca8507eaff79bdc4"
+verifier_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:d6f6d45ee3ff9531ba8255e98d2c9c235d3ce489d9ecad0df9f107406c218abf"
+repair_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:16916da7102b7d02a45707d15f0bea2e40c186943f77f5d05babb5b48db57297"
 
 [[capsules]]
 id = "prefix-cache-inline"
@@ -49,7 +49,7 @@ native_test_source = "server/test/test_prefix_cache_state.cpp"
 id = "prefix-cache-abort-hole"
 description = "Inline prefix-cache free-slot selection after an aborted reservation"
 harness = "formal/prefix_cache/abort_hole_harness.cpp"
-entry_function = "main"
+entry_function = "verify_select_inline_free_slot_contract"
 include_dirs = ["server/src"]
 timeout_seconds = 120
 defines = [
@@ -61,6 +61,7 @@ nightly_defines = [
 esbmc_args = [
   "--quiet",
   "--z3",
+  "--enforce-contract", "verify_select_inline_free_slot_contract",
   "--unwind", "17",
   "--overflow-check",
 ]

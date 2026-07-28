@@ -1,45 +1,35 @@
 #include "server/prefix_cache_state.h"
 
-#include <cassert>
 #include <cstdint>
 
 #ifndef LUCEBOX_FORMAL_MAX_CAP
 #define LUCEBOX_FORMAL_MAX_CAP 4
 #endif
 
-extern "C" unsigned int nondet_uint();
-extern "C" void __ESBMC_assume(bool);
-
 using dflash::common::select_inline_free_slot;
 
-namespace {
+static_assert(
+    LUCEBOX_FORMAL_MAX_CAP > 0 && LUCEBOX_FORMAL_MAX_CAP <= 64);
 
-unsigned int bounded(unsigned int upper_exclusive) {
-    const unsigned int value = nondet_uint();
-    __ESBMC_assume(value < upper_exclusive);
-    return value;
-}
+int verify_select_inline_free_slot_contract(
+        int next_slot, int capacity, uint64_t occupied_slots) {
+    // Model the below-capacity state after an aborted reservation: the cursor
+    // may name an occupied slot, but at least one in-range slot remains free.
+    __ESBMC_requires(
+        capacity > 0 && capacity <= LUCEBOX_FORMAL_MAX_CAP);
+    __ESBMC_requires(next_slot >= 0 && next_slot < capacity);
+    __ESBMC_requires((occupied_slots >> capacity) == 0);
+    __ESBMC_requires(
+        occupied_slots != ((uint64_t{1} << capacity) - 1));
 
-}  // namespace
+    // Slot selection is scalar and must not mutate program state.
+    __ESBMC_assigns();
+    __ESBMC_ensures(__ESBMC_return_value >= 0);
+    __ESBMC_ensures(__ESBMC_return_value < capacity);
+    __ESBMC_ensures(
+        (occupied_slots &
+         (uint64_t{1} << __ESBMC_return_value)) == 0);
 
-int main() {
-    const unsigned int capacity =
-        bounded(LUCEBOX_FORMAL_MAX_CAP) + 1;
-    const unsigned int next_slot = bounded(capacity);
-    const uint64_t valid_slots =
-        (uint64_t{1} << capacity) - 1;
-    const uint64_t occupied_slots =
-        (uint64_t)bounded(1u << LUCEBOX_FORMAL_MAX_CAP) & valid_slots;
-
-    // This is the state after a below-capacity reservation aborts: at least
-    // one backend slot is free, while the round-robin cursor may point at a
-    // still-committed slot.
-    __ESBMC_assume(occupied_slots != valid_slots);
-
-    const int selected = select_inline_free_slot(
-        (int)next_slot, (int)capacity, occupied_slots);
-    assert(selected >= 0);
-    assert(selected < (int)capacity);
-    assert((occupied_slots & (uint64_t{1} << selected)) == 0);
-    return 0;
+    return select_inline_free_slot(
+        next_slot, capacity, occupied_slots);
 }
