@@ -476,9 +476,11 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     set(_dflash_has_sm80 OFF)
     set(_dflash_has_sm70 OFF)
     set(_dflash_has_sm60 OFF)
-    foreach(_arch_num IN LISTS _dflash_cuda_numeric_archs)
+    set(_dflash_sm80_archs "")
+    foreach(_arch _arch_num IN ZIP_LISTS _dflash_archs _dflash_cuda_numeric_archs)
         if(_arch_num GREATER_EQUAL 80)
             set(_dflash_has_sm80 ON)
+            list(APPEND _dflash_sm80_archs "${_arch}")
         endif()
         if(_arch_num GREATER_EQUAL 70 AND _arch_num LESS 80)
             set(_dflash_has_sm70 ON)
@@ -498,16 +500,20 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     endif()
 
     if(_dflash_has_sm80)
+        # CUDA_ARCHITECTURES is a target property, not a source property.  Keep
+        # the BF16 WMMA translation unit in its own object target so a mixed
+        # fatbinary (for example 86;70) never compiles it for an unsupported SM.
+        add_library(dflash_flashprefill_sm80 OBJECT src/flashprefill_kernels.cu)
+        set_target_properties(dflash_flashprefill_sm80 PROPERTIES
+            CUDA_ARCHITECTURES "${_dflash_sm80_archs}"
+            POSITION_INDEPENDENT_CODE ON)
+        target_link_libraries(dflash_flashprefill_sm80 PRIVATE CUDA::cudart)
         target_sources(dflash_common PRIVATE
-            src/flashprefill_kernels.cu
+            $<TARGET_OBJECTS:dflash_flashprefill_sm80>
             src/pflash_ggml_adapter.cpp)
         target_compile_definitions(dflash_common PRIVATE
             DFLASH27B_HAVE_CUDA_WMMA_FLASHPREFILL=1
             DFLASH27B_HAVE_SM80_FLASHPREFILL=1)
-        # BF16 WMMA kernels require sm_80+.  Restrict compilation to those
-        # arches so nvcc never instantiates m16n16k16 BF16 WMMA on Volta/Pascal.
-        set_source_files_properties(src/flashprefill_kernels.cu PROPERTIES
-            CUDA_ARCHITECTURES "80;86;90;100;110;120;121")
     endif()
     if(_dflash_has_sm70)
         target_sources(dflash_common PRIVATE src/flashprefill_f16.cu)
