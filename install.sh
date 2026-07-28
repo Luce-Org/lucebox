@@ -3,7 +3,7 @@
 #
 # Canonical install (Luce-Org main, stable channel):
 #
-#   curl -fsSL https://raw.githubusercontent.com/Luce-Org/lucebox-hub/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Luce-Org/lucebox/main/install.sh | bash
 #
 # Install from a different fork / branch (dev channel). Note the env var
 # is on the `bash` side of the pipe — `VAR=val curl … | bash` would attach
@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-LUCEBOX_INSTALL_URL="${LUCEBOX_INSTALL_URL:-https://raw.githubusercontent.com/Luce-Org/lucebox-hub/main/lucebox.sh}"
+LUCEBOX_INSTALL_URL="${LUCEBOX_INSTALL_URL:-https://raw.githubusercontent.com/Luce-Org/lucebox/main/lucebox.sh}"
 DEST="${LUCEBOX_INSTALL_DEST:-$HOME/.local/bin/lucebox}"
 
 # ── helpers ───────────────────────────────────────────────────────────────
@@ -143,8 +143,10 @@ esac
 cat <<EOF
 
 Next:
-  ${C_DIM}lucebox check${C_RST}            verify host prereqs (Docker + NVIDIA CUDA or AMD ROCm)
-  ${C_DIM}lucebox install${C_RST}          install the user systemd unit
-  ${C_DIM}lucebox start${C_RST}            start the server
+  ${C_DIM}lucebox${C_RST}                  open the guided setup and inference menu
+
+For automation:
+  ${C_DIM}lucebox check${C_RST}            verify Docker + NVIDIA CUDA or AMD ROCm
+  ${C_DIM}lucebox setup${C_RST}            run guided setup directly
   ${C_DIM}lucebox update${C_RST}           re-run this installer to fetch the latest lucebox.sh
 EOF

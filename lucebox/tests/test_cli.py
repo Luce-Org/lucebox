@@ -53,8 +53,17 @@ def test_core_verbs_present_in_app() -> None:
         c.name or (c.callback.__name__ if c.callback else "")
         for c in app.registered_commands
     }
-    for verb in ("check", "pull", "print-run", "print-serve-argv", "version"):
+    for verb in ("check", "pull", "optimize", "print-run", "print-serve-argv", "version"):
         assert verb in registered
+
+
+def test_no_args_has_branded_noninteractive_help() -> None:
+    """Pipes and CI get useful output instead of an input prompt."""
+    result = CliRunner().invoke(app, [])
+    assert result.exit_code == 0
+    assert "local inference, made simple" in result.output
+    assert "models" in result.output
+    assert "optimize" in result.output
 
 
 @pytest.mark.parametrize("args", [["version"], ["--version"]])

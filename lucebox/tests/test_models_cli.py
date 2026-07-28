@@ -122,6 +122,69 @@ def test_models_download_explicit_preset_with_activate(
     assert entries["model.preset"] == ("gemma-4-26b", "file")
 
 
+def test_models_select_activates_preloaded_model_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A factory-preloaded buyer can switch models without a network call."""
+    cfg_path = _set_config_path(tmp_path, monkeypatch)
+    _stub_host(monkeypatch, vram_gb=24)
+    preset = PRESETS["qwen3.6-27b"]
+    models = tmp_path / "models"
+    (models / preset.target_file).parent.mkdir(parents=True, exist_ok=True)
+    (models / preset.target_file).touch()
+    assert preset.draft_file is not None
+    (models / "draft").mkdir()
+    (models / "draft" / preset.draft_file).touch()
+
+    def fail_network(*args: object, **kwargs: object) -> object:
+        raise AssertionError("preloaded selection must not contact Hugging Face")
+
+    monkeypatch.setattr(download_mod, "status", fail_network)
+    monkeypatch.setattr(download_mod, "download_preset", fail_network)
+
+    result = CliRunner().invoke(app, ["models", "select", preset.name, "--yes"])
+    assert result.exit_code == 0
+    assert "Activated" in result.output
+    entries = config_mod.config_get(path=cfg_path)
+    assert entries["model.preset"] == (preset.name, "file")
+    assert entries["model.target_file"] == (preset.target_file, "file")
+    assert entries["model.draft_file"] == (preset.draft_file, "file")
+
+
+def test_models_select_numbered_picker_downloads_and_activates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg_path = _set_config_path(tmp_path, monkeypatch)
+    _stub_host(monkeypatch, vram_gb=24)
+    monkeypatch.setattr(download_mod, "download_preset", lambda cfg, pres: 0)
+    monkeypatch.setattr(
+        download_mod,
+        "status",
+        lambda cfg, pres: {"target_present": False, "draft_present": False},
+    )
+    # qwen3.6-27b is the fourth entry in the stable alphabetical menu.
+    result = CliRunner().invoke(app, ["models", "select"], input="4\ny\n")
+    assert result.exit_code == 0
+    assert "Choose a model" in result.output
+    entries = config_mod.config_get(path=cfg_path)
+    assert entries["model.preset"] == ("qwen3.6-27b", "file")
+
+
+def test_optimize_resets_to_hardware_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg_path = _set_config_path(tmp_path, monkeypatch)
+    _stub_host(monkeypatch, vram_gb=24)
+    config_mod.config_set("dflash.max_ctx", 4096, path=cfg_path)
+
+    result = CliRunner().invoke(app, ["optimize", "--yes"])
+    assert result.exit_code == 0
+    assert "Automatic optimization applied" in result.output
+    entries = config_mod.config_get(path=cfg_path)
+    assert entries["dflash.max_ctx"] == (98304, "file")
+    assert entries["dflash.cache_type_k"] == ("tq3_0", "file")
+
+
 def test_installed_helpers_track_presence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

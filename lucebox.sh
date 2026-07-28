@@ -16,7 +16,7 @@
 #      delegate to systemctl --user / journalctl --user.
 #
 # Install:
-#   curl -fsSL https://raw.githubusercontent.com/Luce-Org/lucebox-hub/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Luce-Org/lucebox/main/install.sh | bash
 #
 # The installer bakes the source URL into the installed copy as
 # `LUCEBOX_INSTALLED_FROM=`, so `lucebox update` later re-pulls from the
@@ -58,7 +58,7 @@ MIN_DRIVER_CUDA12=525
 # installed from — `lucebox update` then re-pulls from the same channel
 # without losing track of forks. Falls back to the Luce-Org main branch
 # when nothing was baked in (e.g. someone curl'd the script directly).
-LUCEBOX_INSTALLED_FROM="${LUCEBOX_INSTALLED_FROM:-https://raw.githubusercontent.com/Luce-Org/lucebox-hub/main/lucebox.sh}"
+LUCEBOX_INSTALLED_FROM="${LUCEBOX_INSTALLED_FROM:-https://raw.githubusercontent.com/Luce-Org/lucebox/main/lucebox.sh}"
 
 # Path to the persisted config.toml. Mirrors
 # lucebox.config.default_config_path: $LUCEBOX_HOME/config.toml if set,
@@ -173,6 +173,12 @@ _lucebox_derive_image() {
     if [[ "$url" =~ ^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/.+/lucebox\.sh$ ]]; then
         org=$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')
         repo="${BASH_REMATCH[2]}"
+        # The source repository was renamed from lucebox-hub to lucebox, while
+        # the published runtime image intentionally keeps its established
+        # ghcr.io/luce-org/lucebox-hub name.
+        if [ "$org" = "luce-org" ] && [ "$repo" = "lucebox" ]; then
+            repo="lucebox-hub"
+        fi
         printf 'ghcr.io/%s/%s' "$org" "$repo"
         return
     fi
@@ -238,9 +244,10 @@ CONFIG_HOME="${LUCEBOX_HOME:-$HOME/.lucebox}"
 # ── output helpers ────────────────────────────────────────────────────────
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     C_INFO='\033[1;34m'; C_OK='\033[1;32m'; C_WARN='\033[1;33m'
-    C_ERR='\033[1;31m'; C_DIM='\033[2m'; C_RST='\033[0m'
+    C_ERR='\033[1;31m'; C_DIM='\033[2m'; C_BRAND='\033[38;2;245;200;66m'; C_RST='\033[0m'
 else
     C_INFO=''; C_OK=''; C_WARN=''; C_ERR=''; C_DIM=''; C_RST=''
+    C_BRAND=''
 fi
 
 info()  { printf '%b[INFO]%b  %s\n' "$C_INFO" "$C_RST" "$*"; }
@@ -249,6 +256,58 @@ warn()  { printf '%b[WARN]%b  %s\n' "$C_WARN" "$C_RST" "$*"; }
 err()   { printf '%b[ERROR]%b %s\n' "$C_ERR"  "$C_RST" "$*" >&2; }
 hint()  { printf '       %b%s%b\n'  "$C_DIM"  "$*"     "$C_RST"; }
 die()   { err "$*"; exit 1; }
+
+print_logo() {
+    printf '%b' "$C_BRAND"
+    cat <<'EOF'
+     · ╱
+  ·──✦──·  █    █ █ ▄▀▀ █▀▀  █▀▀▄ ▄▀▀▄ █ █
+    ╱ ·    █  █ █ █   █▀▀   █▀▀▄ █  █  █
+   ·        ▀▀  ▀▀  ▀▀ ▀▀▀  ▀▀▀  ▀▀  ▀ ▀
+EOF
+    printf '%b             local inference, made simple%b\n\n' "$C_DIM" "$C_RST"
+}
+
+# Find a source checkout for contributor-only actions. An explicit path wins;
+# otherwise inspect the current directory and the wrapper's own directory,
+# walking upward until the repository markers are found. Buyer installs simply
+# return no path and never see build/harness actions.
+_find_repo_root() {
+    local candidate="${LUCEBOX_REPO:-}" dir
+    if [ -n "$candidate" ]; then
+        if [ -f "$candidate/server/CMakeLists.txt" ] && [ -d "$candidate/harness" ]; then
+            (cd "$candidate" && pwd)
+            return 0
+        fi
+        return 1
+    fi
+
+    for candidate in "$PWD" "$(dirname "$SCRIPT_PATH")"; do
+        dir="$candidate"
+        while [ "$dir" != "/" ] && [ -n "$dir" ]; do
+            if [ -f "$dir/server/CMakeLists.txt" ] && [ -d "$dir/harness" ]; then
+                (cd "$dir" && pwd)
+                return 0
+            fi
+            dir="$(dirname "$dir")"
+        done
+    done
+    return 1
+}
+
+_confirm() {
+    # usage: _confirm "question" [default_yes]
+    local question="$1" default_yes="${2:-1}" answer prompt
+    if [ "$default_yes" = "1" ]; then prompt="Y/n"; else prompt="y/N"; fi
+    printf '%s [%s] ' "$question" "$prompt"
+    IFS= read -r answer || return 1
+    case "$answer" in
+        y|Y|yes|YES|Yes) return 0 ;;
+        n|N|no|NO|No)   return 1 ;;
+        "")             [ "$default_yes" = "1" ] ;;
+        *)               return 1 ;;
+    esac
+}
 
 sha256_file() {
     local sum
@@ -1141,13 +1200,46 @@ cmd_systemctl_passthrough() {
 }
 
 cmd_logs() {
-    require_systemd "logs"
-    # Pure passthrough: any flags the user wants (-f, -n, --since, ...) go
-    # straight to journalctl. Default is follow.
-    if [ $# -eq 0 ]; then
-        exec journalctl --user -u "$UNIT_NAME" -f
+    ensure_probed
+    if [ "$LUCEBOX_HOST_HAS_SYSTEMD" = "1" ] && [ -f "$UNIT_PATH" ]; then
+        # Pure passthrough: any flags the user wants (-f, -n, --since, ...)
+        # go straight to journalctl. Default is follow.
+        if [ $# -eq 0 ]; then
+            exec journalctl --user -u "$UNIT_NAME" -f
+        fi
+        exec journalctl --user -u "$UNIT_NAME" "$@"
     fi
-    exec journalctl --user -u "$UNIT_NAME" "$@"
+    if _lucebox_container_running; then
+        if [ $# -eq 0 ]; then
+            exec docker logs -f "$CONTAINER_NAME"
+        fi
+        exec docker logs "$@" "$CONTAINER_NAME"
+    fi
+    die "the inference engine is not running — use '$SCRIPT_NAME start' or '$SCRIPT_NAME serve'"
+}
+
+cmd_status() {
+    ensure_probed
+    if [ "$LUCEBOX_HOST_HAS_SYSTEMD" = "1" ] && [ -f "$UNIT_PATH" ]; then
+        exec systemctl --user status "$UNIT_NAME" --no-pager
+    fi
+    if _lucebox_container_running; then
+        exec docker ps --filter "name=^${CONTAINER_NAME}\$" \
+            --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+    fi
+    info "Lucebox inference engine is stopped"
+    hint "Run '$SCRIPT_NAME setup' for first-time setup, or '$SCRIPT_NAME serve' in the foreground."
+}
+
+cmd_stop() {
+    ensure_probed
+    if [ "$LUCEBOX_HOST_HAS_SYSTEMD" = "1" ] && [ -f "$UNIT_PATH" ]; then
+        exec systemctl --user stop "$UNIT_NAME"
+    fi
+    if _lucebox_container_running; then
+        exec docker stop "$CONTAINER_NAME"
+    fi
+    ok "Lucebox inference engine is already stopped"
 }
 
 cmd_pull() {
@@ -1160,6 +1252,251 @@ cmd_pull() {
     require_host_prereqs "$variant"
     info "Pulling ${IMAGE_BASE}:${variant}"
     exec docker pull "${IMAGE_BASE}:${variant}"
+}
+
+# ── contributor-native workflow ───────────────────────────────────────────
+
+_native_backend() {
+    local requested="${1:-}" variant
+    case "$requested" in
+        cuda|cuda12|nvidia) printf 'cuda'; return ;;
+        rocm|hip|amd)       printf 'rocm'; return ;;
+        "")
+            variant=$(pick_variant)
+            if _variant_is_rocm "$variant"; then printf 'rocm'; else printf 'cuda'; fi
+            return
+            ;;
+        *) die "unknown backend '$requested' — choose cuda or rocm" ;;
+    esac
+}
+
+_native_build_dir() {
+    local repo="$1" backend="$2"
+    if [ -n "${LUCEBOX_BUILD_DIR:-}" ]; then
+        printf '%s' "$LUCEBOX_BUILD_DIR"
+    elif [ "$backend" = "rocm" ]; then
+        printf '%s/server/build-hip' "$repo"
+    else
+        printf '%s/server/build-cuda' "$repo"
+    fi
+}
+
+_safe_model_relative_path() {
+    local value="$1" part parts=()
+    [ -n "$value" ] || return 1
+    [[ "$value" != /* ]] || return 1
+    IFS='/' read -r -a parts <<<"$value"
+    for part in "${parts[@]}"; do
+        [ "$part" != ".." ] || return 1
+    done
+    return 0
+}
+
+_selected_model_paths() {
+    # Emit target path, draft path (or "none"), and model id on separate lines.
+    # `models select` persists the filenames, so preset mapping is only a
+    # compatibility fallback for hand-written config files.
+    local preset target_file draft_file target_path draft_path="none"
+    preset=$(_lucebox_config_get model.preset)
+    target_file=$(_lucebox_config_get model.target_file)
+    draft_file=$(_lucebox_config_get model.draft_file)
+    if [ -z "$target_file" ]; then
+        case "$preset" in
+            qwen3.6-27b)  target_file="Qwen3.6-27B-Q4_K_M.gguf" ;;
+            gemma-4-26b)  target_file="google_gemma-4-26B-A4B-it-Q4_K_M.gguf" ;;
+            gemma-4-31b)  target_file="google_gemma-4-31B-it-Q4_K_M.gguf" ;;
+            laguna-xs.2)  target_file="laguna-xs2-Q4_K_M.gguf" ;;
+            qwen3.6-moe)  target_file="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf" ;;
+        esac
+    fi
+    if [ -z "$draft_file" ]; then
+        case "$preset" in
+            qwen3.6-27b) draft_file="dflash-draft-3.6-q4_k_m.gguf" ;;
+            gemma-4-26b) draft_file="gemma-4-26B-A4B-it-DFlash-q8_0.gguf" ;;
+            gemma-4-31b) draft_file="gemma-4-31B-it-DFlash-q8_0.gguf" ;;
+        esac
+    fi
+    _safe_model_relative_path "$target_file" \
+        || die "no valid model is selected — run '$SCRIPT_NAME models select' first"
+    target_path="$DEFAULT_MODELS_DIR/$target_file"
+    if [ -n "$draft_file" ]; then
+        _safe_model_relative_path "$draft_file" \
+            || die "invalid model.draft_file in $(_lucebox_config_path)"
+        draft_path="$DEFAULT_MODELS_DIR/draft/$draft_file"
+    elif [ "$preset" = "laguna-xs.2" ] \
+         && [ -d "$DEFAULT_MODELS_DIR/draft/laguna-xs2-speculator" ]; then
+        draft_path="$DEFAULT_MODELS_DIR/draft/laguna-xs2-speculator"
+    fi
+    printf '%s\n%s\n%s\n' "$target_path" "$draft_path" "${preset:-lucebox}"
+}
+
+_export_native_config() {
+    local key env_name value
+    while IFS='|' read -r key env_name; do
+        [ -n "$key" ] || continue
+        value=$(_lucebox_config_get "$key")
+        [ -n "$value" ] || continue
+        case "$key" in
+            dflash.lazy|dflash.debug_thinking_logits)
+                case "$value" in
+                    true|1|yes|on) value=1 ;;
+                    *)             value=0 ;;
+                esac
+                ;;
+        esac
+        export "$env_name=$value"
+    done <<'EOF'
+dflash.budget|DFLASH_BUDGET
+dflash.max_ctx|DFLASH_MAX_CTX
+dflash.lazy|DFLASH_LAZY
+dflash.prefix_cache_slots|DFLASH_PREFIX_CACHE_SLOTS
+dflash.prefill_cache_slots|DFLASH_PREFILL_CACHE_SLOTS
+dflash.cache_type_k|DFLASH_CACHE_TYPE_K
+dflash.cache_type_v|DFLASH_CACHE_TYPE_V
+dflash.prefill_mode|DFLASH_PREFILL_MODE
+dflash.prefill_keep_ratio|DFLASH_PREFILL_KEEP
+dflash.prefill_threshold|DFLASH_PREFILL_THRESHOLD
+dflash.prefill_drafter|DFLASH_PREFILL_DRAFTER
+dflash.think_max|DFLASH_THINK_MAX
+dflash.fa_window|DFLASH_FA_WINDOW
+dflash.think_soft_close_min_ratio|DFLASH_THINK_SOFT_CLOSE_MIN_RATIO
+dflash.debug_thinking_logits|DFLASH_DEBUG_THINKING_LOGITS
+EOF
+}
+
+cmd_native_build() {
+    local repo backend build_dir jobs hip_wmma=OFF
+    repo=$(_find_repo_root) \
+        || die "native build requires a lucebox repository checkout (cd into it or set LUCEBOX_REPO)"
+    ensure_probed
+    backend=$(_native_backend "${1:-}")
+    build_dir=$(_native_build_dir "$repo" "$backend")
+    command -v cmake >/dev/null 2>&1 || die "cmake is required to build the inference engine"
+    [ -f "$repo/server/deps/llama.cpp/ggml/CMakeLists.txt" ] \
+        || die "git submodules are missing — run: git -C '$repo' submodule update --init --recursive"
+
+    local configure=(cmake -S "$repo/server" -B "$build_dir" -DCMAKE_BUILD_TYPE=Release)
+    if [ "$backend" = "rocm" ]; then
+        [ "$LUCEBOX_HOST_HAS_AMD_GPU" = "1" ] \
+            || die "ROCm native build selected but no AMD GPU was detected"
+        if [ -f /opt/rocm/include/rocwmma/rocwmma.hpp ] \
+           || [ -f /usr/include/rocwmma/rocwmma.hpp ]; then
+            hip_wmma=ON
+        fi
+        configure+=(
+            -DDFLASH27B_GPU_BACKEND=hip
+            "-DDFLASH27B_HIP_ARCHITECTURES=${LUCEBOX_HOST_AMD_GPU_ARCH:-gfx1151}"
+            "-DDFLASH27B_HIP_SM80_EQUIV=$hip_wmma"
+        )
+    else
+        [ "$LUCEBOX_HOST_HAS_NVIDIA_GPU" = "1" ] \
+            || die "CUDA native build selected but no NVIDIA GPU was detected"
+        configure+=(-DDFLASH27B_GPU_BACKEND=cuda)
+        if [[ "$LUCEBOX_HOST_GPU_SM" =~ ^[0-9]+$ ]]; then
+            configure+=("-DCMAKE_CUDA_ARCHITECTURES=$LUCEBOX_HOST_GPU_SM")
+        fi
+    fi
+    info "Configuring native $backend build in $build_dir"
+    "${configure[@]}"
+    jobs="${LUCEBOX_HOST_NPROC:-1}"
+    [ "$jobs" -gt 0 ] 2>/dev/null || jobs=1
+    info "Building dflash_server ($jobs jobs)"
+    cmake --build "$build_dir" --target dflash_server -j "$jobs"
+    ok "Native engine ready: $build_dir/dflash_server"
+}
+
+cmd_native_serve() {
+    local repo backend build_dir binary selected=() target draft model_id
+    repo=$(_find_repo_root) \
+        || die "native run requires a lucebox repository checkout (cd into it or set LUCEBOX_REPO)"
+    ensure_probed
+    backend=$(_native_backend "${1:-}")
+    build_dir=$(_native_build_dir "$repo" "$backend")
+    binary="$build_dir/dflash_server"
+    [ -x "$binary" ] \
+        || die "native engine is not built — run '$SCRIPT_NAME build $backend' first"
+    mapfile -t selected < <(_selected_model_paths)
+    target="${selected[0]:-}"
+    draft="${selected[1]:-none}"
+    model_id="${selected[2]:-lucebox}"
+    [ -f "$target" ] \
+        || die "selected target is not installed: $target — run '$SCRIPT_NAME models select'"
+    if [ "$draft" != "none" ] && [ ! -e "$draft" ]; then
+        die "selected draft is not installed: $draft — run '$SCRIPT_NAME models select'"
+    fi
+
+    _export_native_config
+    export DFLASH_DIR="$repo/server"
+    export DFLASH_SERVER_BIN="$binary"
+    export DFLASH_TARGET="$target"
+    if [ "$draft" = "none" ]; then
+        export DFLASH_DRAFT="$DEFAULT_MODELS_DIR/.lucebox-no-draft"
+    else
+        export DFLASH_DRAFT="$draft"
+    fi
+    export DFLASH_HOST="${LUCEBOX_NATIVE_HOST:-127.0.0.1}"
+    export DFLASH_PORT="$DEFAULT_PORT"
+    export DFLASH_MODEL_NAME="$model_id"
+    export LUCEBOX_NATIVE=1
+    info "Starting native $backend engine at http://$DFLASH_HOST:$DFLASH_PORT"
+    exec "$repo/server/scripts/entrypoint.sh" serve
+}
+
+cmd_harness() {
+    local repo name="${1:-}" backend build_dir binary script selected=() target draft
+    repo=$(_find_repo_root) \
+        || die "harness launchers are contributor tools; run this command inside the lucebox repository"
+    if [ -z "$name" ]; then
+        cat <<'EOF'
+Choose a harness:
+  1  Claude Code
+  2  Codex
+  3  OpenCode
+  4  Hermes
+  5  Pi
+  6  OpenClaw
+  7  Open WebUI
+EOF
+        printf 'Harness number: '
+        IFS= read -r name || return 1
+    fi
+    case "$name" in
+        1|claude|claude-code) name=claude_code ;;
+        2|codex)              name=codex ;;
+        3|opencode)           name=opencode ;;
+        4|hermes)             name=hermes ;;
+        5|pi)                 name=pi ;;
+        6|openclaw)           name=openclaw ;;
+        7|openwebui|webui)    name=openwebui ;;
+        *) die "unknown harness '$name'" ;;
+    esac
+    script="$repo/harness/clients/run_${name}.sh"
+    [ -x "$script" ] || die "harness launcher is missing: $script"
+    ensure_probed
+    backend=$(_native_backend "${LUCEBOX_HARNESS_BACKEND:-}")
+    build_dir=$(_native_build_dir "$repo" "$backend")
+    binary="$build_dir/dflash_server"
+    [ -x "$binary" ] \
+        || die "native engine is not built — run '$SCRIPT_NAME build $backend' first"
+    mapfile -t selected < <(_selected_model_paths)
+    target="${selected[0]:-}"
+    draft="${selected[1]:-none}"
+    [ -f "$target" ] \
+        || die "selected target is not installed: $target — run '$SCRIPT_NAME models select'"
+
+    export REPO_DIR="$repo"
+    export DFLASH_SERVER_BIN="$binary"
+    export DFLASH_TARGET="$target"
+    export TARGET="$target"
+    export DFLASH_DRAFT="$draft"
+    export DRAFT="$draft"
+    local max_ctx budget
+    max_ctx=$(_lucebox_config_get dflash.max_ctx)
+    budget=$(_lucebox_config_get dflash.budget)
+    [ -z "$max_ctx" ] || export MAX_CTX="$max_ctx"
+    [ -z "$budget" ] || export BUDGET="$budget"
+    info "Launching $name with the selected Lucebox model"
+    exec "$script"
 }
 
 cmd_update() {
@@ -1240,7 +1577,7 @@ cmd_completion() {
     #   lucebox completion fish | source
     #
     # Keep this in sync with the dispatch table in main() and the sub-app
-    # verbs (config get/set/unset, models list/download). Adding a new
+    # verbs (config get/set/unset, models list/download/select). Adding a new
     # top-level command means adding it here too.
     local shell="${1:-}"
     case "$shell" in
@@ -1253,11 +1590,11 @@ _lucebox_complete() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    cmds="install uninstall start stop restart enable disable status logs \
-          serve pull update check completion config models \
-          print-run help version"
+    cmds="menu setup install uninstall start stop restart enable disable status logs \
+          serve build native harness pull update check completion config models \
+          optimize print-run help version"
     config_verbs="get set unset"
-    models_verbs="list download"
+    models_verbs="list download select"
     completion_shells="bash zsh fish"
 
     # Sub-app verbs / shell args.
@@ -1295,14 +1632,14 @@ ZSH
 # lucebox fish completion. Source from ~/.config/fish/config.fish:
 #   lucebox completion fish | source
 complete -c lucebox -f
-set -l __lucebox_cmds install uninstall start stop restart enable disable \
-    status logs serve pull update check completion config models \
-    print-run help version
+set -l __lucebox_cmds menu setup install uninstall start stop restart enable disable \
+    status logs serve build native harness pull update check completion config models \
+    optimize print-run help version
 for cmd in $__lucebox_cmds
     complete -c lucebox -n "not __fish_seen_subcommand_from $__lucebox_cmds" -a $cmd
 end
 complete -c lucebox -n "__fish_seen_subcommand_from config" -a "get set unset"
-complete -c lucebox -n "__fish_seen_subcommand_from models" -a "list download"
+complete -c lucebox -n "__fish_seen_subcommand_from models" -a "list download select"
 complete -c lucebox -n "__fish_seen_subcommand_from completion" -a "bash zsh fish"
 FISH
             ;;
@@ -1534,7 +1871,7 @@ cmd_exec_in_container() {
 _lucebox_prefer_exec() {
     local cmd="$1"; shift
     case "$cmd" in
-        config|models|check|print-run|print-serve-argv)
+        config|models|optimize|check|print-run|print-serve-argv)
             return 0
             ;;
         *)
@@ -1567,9 +1904,250 @@ cmd_route_to_container() {
     cmd_in_container "$cmd" "$@"
 }
 
+# ── interactive product surface ───────────────────────────────────────────
+
+_engine_state() {
+    if command -v systemctl >/dev/null 2>&1 \
+       && systemctl --user is-active --quiet "$UNIT_NAME" 2>/dev/null; then
+        printf 'running'
+    elif _lucebox_container_running; then
+        printf 'running'
+    else
+        printf 'stopped'
+    fi
+}
+
+_menu_clear() {
+    if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] \
+       && [ "${LUCEBOX_NO_CLEAR:-0}" != "1" ]; then
+        printf '\033[2J\033[H'
+    fi
+}
+
+_menu_pause() {
+    [ -t 0 ] || return 0
+    printf '\nPress Enter to return to the menu…'
+    IFS= read -r _ || true
+}
+
+_menu_run() {
+    # Always invoke through bash: repository copies are not necessarily marked
+    # executable, while installed buyer copies are. This behaves identically
+    # in both places and lets exec-heavy subcommands return to the menu.
+    local rc
+    if bash "$SCRIPT_PATH" "$@"; then
+        return 0
+    else
+        rc=$?
+        warn "Command failed (exit $rc)."
+        return "$rc"
+    fi
+}
+
+_menu_start() {
+    ensure_probed
+    if [ "$LUCEBOX_HOST_HAS_SYSTEMD" = "1" ] && [ -f "$UNIT_PATH" ]; then
+        _menu_run start
+        return
+    fi
+    warn "The background service is not installed."
+    if _confirm "Run the Docker engine in this terminal now?" 1; then
+        _menu_run serve
+    else
+        hint "Run '$SCRIPT_NAME setup' to install the background service."
+    fi
+}
+
+_menu_restart_if_running() {
+    [ "$(_engine_state)" = "running" ] || return 0
+    if ! _confirm "Restart the running engine to apply this change?" 1; then
+        warn "The change is saved and will apply at the next restart."
+        return 0
+    fi
+    if [ "$LUCEBOX_HOST_HAS_SYSTEMD" = "1" ] && [ -f "$UNIT_PATH" ]; then
+        _menu_run restart
+    else
+        _menu_run stop
+        warn "The foreground engine was stopped. Start it again from menu option 4."
+    fi
+}
+
+cmd_setup() {
+    [ -t 0 ] && [ -t 1 ] \
+        || die "guided setup needs a terminal — use '$SCRIPT_NAME --help' for non-interactive commands"
+    ensure_probed
+    _menu_clear
+    print_logo
+    printf '%bQuick setup%b\n\n' "$C_INFO" "$C_RST"
+    cmd_check
+    printf '\n'
+
+    local variant
+    variant=$(pick_variant)
+    if [ "$LUCEBOX_HOST_HAS_NVIDIA_GPU" = "1" ] \
+       && [ "$LUCEBOX_HOST_HAS_AMD_GPU" = "1" ]; then
+        printf 'This build has NVIDIA and AMD graphics. Which accelerator should run Lucebox?\n'
+        printf '  1  NVIDIA / CUDA  %b(recommended for RTX + Strix builds)%b\n' "$C_DIM" "$C_RST"
+        printf '  2  AMD / ROCm\n'
+        printf 'Choice [1]: '
+        local backend_choice
+        IFS= read -r backend_choice || return 1
+        case "$backend_choice" in
+            2) variant=rocm ;;
+            *) variant=cuda12 ;;
+        esac
+    fi
+    info "Selected backend: $variant"
+
+    if docker image inspect "${IMAGE_BASE}:${variant}" >/dev/null 2>&1; then
+        ok "Inference image is already installed (${IMAGE_BASE}:${variant})"
+    else
+        _confirm "Download the ${variant} inference image now?" 1 \
+            || { warn "Setup stopped before the image download."; return 1; }
+        LUCEBOX_VARIANT="$variant" bash "$SCRIPT_PATH" pull || return $?
+    fi
+
+    # Persist the accelerator choice only after its image is available; the
+    # config writer lives in that image on buyer installations.
+    LUCEBOX_VARIANT="$variant" bash "$SCRIPT_PATH" config set "variant=$variant" \
+        || return $?
+
+    printf '\n'
+    bash "$SCRIPT_PATH" models select || return $?
+    if [ -z "$(_lucebox_config_get model.preset)" ]; then
+        warn "No model was selected; setup stopped without starting the engine."
+        return 1
+    fi
+
+    printf '\n'
+    if _confirm "Use automatic GPU optimization?" 1; then
+        bash "$SCRIPT_PATH" optimize --yes || return $?
+    fi
+
+    if [ "$LUCEBOX_HOST_HAS_SYSTEMD" = "1" ]; then
+        if [ ! -f "$UNIT_PATH" ]; then
+            printf '\n'
+            if _confirm "Install Lucebox as a background service?" 1; then
+                bash "$SCRIPT_PATH" install || return $?
+            fi
+        fi
+        if [ -f "$UNIT_PATH" ] && _confirm "Start the inference engine now?" 1; then
+            if [ "$(_engine_state)" = "running" ]; then
+                bash "$SCRIPT_PATH" restart || return $?
+            else
+                bash "$SCRIPT_PATH" start || return $?
+            fi
+        fi
+    else
+        warn "Background services are unavailable on this host."
+        hint "Use '$SCRIPT_NAME serve' to run the engine in the foreground."
+    fi
+
+    printf '\n'
+    ok "Lucebox is configured"
+    hint "API:    http://127.0.0.1:$DEFAULT_PORT/v1"
+    hint "Menu:   $SCRIPT_NAME"
+    hint "Status: $SCRIPT_NAME status"
+}
+
+cmd_developer_menu() {
+    local repo choice
+    repo=$(_find_repo_root) \
+        || { warn "Developer tools require a lucebox repository checkout."; return 1; }
+    while true; do
+        _menu_clear
+        print_logo
+        printf '%bDeveloper tools%b\n' "$C_INFO" "$C_RST"
+        printf 'Repository: %s\n\n' "$repo"
+        printf '  1  Build the native inference engine\n'
+        printf '  2  Run the native inference engine\n'
+        printf '  3  Choose and run a client harness\n'
+        printf '  b  Back\n\n'
+        printf 'Choose: '
+        IFS= read -r choice || return 0
+        case "$choice" in
+            1) _menu_run build; _menu_pause ;;
+            2) _menu_run native; _menu_pause ;;
+            3) _menu_run harness; _menu_pause ;;
+            b|B|q|Q) return 0 ;;
+            *) warn "Choose 1–3 or b"; _menu_pause ;;
+        esac
+    done
+}
+
+cmd_menu() {
+    local choice model variant state repo_hint
+    while true; do
+        ensure_probed
+        model=$(_lucebox_config_get model.preset)
+        model="${model:-not selected}"
+        variant=$(pick_variant)
+        state=$(_engine_state)
+        if _find_repo_root >/dev/null 2>&1; then
+            repo_hint="available"
+        else
+            repo_hint="not a source checkout"
+        fi
+
+        _menu_clear
+        print_logo
+        printf '  GPU:          %s\n' "${LUCEBOX_HOST_GPU_NAME:-${LUCEBOX_HOST_AMD_GPU_NAME:-not detected}}"
+        if [ "$LUCEBOX_HOST_HAS_NVIDIA_GPU" = "1" ] \
+           && [ "$LUCEBOX_HOST_HAS_AMD_GPU" = "1" ]; then
+            printf '  Other GPU:    %s\n' "${LUCEBOX_HOST_AMD_GPU_NAME:-AMD GPU}"
+        fi
+        printf '  Backend:      %s\n' "$variant"
+        printf '  Model:        %s\n' "$model"
+        printf '  Optimization: automatic\n'
+        printf '  Engine:       %s\n\n' "$state"
+
+        printf '  1  Quick setup\n'
+        printf '  2  Choose or download a model\n'
+        printf '  3  Apply automatic optimization\n'
+        printf '  4  Start the inference engine\n'
+        printf '  5  Stop the inference engine\n'
+        printf '  6  Status\n'
+        printf '  7  Recent logs\n'
+        printf '  d  Developer tools  %b(%s)%b\n' "$C_DIM" "$repo_hint" "$C_RST"
+        printf '  q  Quit\n\n'
+        printf 'Choose: '
+        IFS= read -r choice || return 0
+        case "$choice" in
+            1) cmd_setup; _menu_pause ;;
+            2)
+                if _menu_run models select; then _menu_restart_if_running; fi
+                _menu_pause
+                ;;
+            3)
+                if _menu_run optimize; then _menu_restart_if_running; fi
+                _menu_pause
+                ;;
+            4) _menu_start; _menu_pause ;;
+            5) _menu_run stop; _menu_pause ;;
+            6) _menu_run status; _menu_pause ;;
+            7)
+                if [ "$LUCEBOX_HOST_HAS_SYSTEMD" = "1" ] && [ -f "$UNIT_PATH" ]; then
+                    _menu_run logs -n 80 --no-pager
+                else
+                    _menu_run logs --tail 80
+                fi
+                _menu_pause
+                ;;
+            d|D) cmd_developer_menu ;;
+            q|Q|quit|exit) return 0 ;;
+            *) warn "Choose 1–7, d, or q"; _menu_pause ;;
+        esac
+    done
+}
+
 usage() {
     cat <<EOF
-$SCRIPT_NAME $VERSION — host-side wrapper for the lucebox-hub container
+$SCRIPT_NAME $VERSION — simple CLI for the Lucebox inference engine
+
+Interactive:
+  $SCRIPT_NAME            open the branded menu (when run in a terminal)
+  menu                    open the menu explicitly
+  setup                   guided backend, model, optimization, and service setup
 
 Service management (via user systemd):
   install               install user systemd unit
@@ -1582,12 +2160,20 @@ Service management (via user systemd):
 Direct server invocation (foreground, no systemd):
   serve                 docker run the server in the foreground
 
+Contributor workflow (inside a repository checkout):
+  build [cuda|rocm]     build the native dflash_server
+  native [cuda|rocm]    run the selected model with the native engine
+  harness [name]        run Claude, Codex, OpenCode, Hermes, Pi, OpenClaw,
+                        or Open WebUI against the native engine
+
 Provisioning + workloads (delegated to the in-container Python CLI):
   check                 host + docker readiness report
   pull                  docker pull the auto-selected CUDA or ROCm image
   update                re-run the bootstrap installer to upgrade this script
   completion <shell>    print shell completion script (bash / zsh / fish)
+  models select         numbered model picker; download + activate in one step
   models                list / download / activate model presets
+  optimize              apply safe hardware-aware inference defaults
   config                read / write keys in .lucebox/config.toml
   print-run             print the docker-run command for the server
 
@@ -1633,21 +2219,41 @@ main() {
             *) args+=("$1"); shift ;;
         esac
     done
-    set -- "${args[@]}"
+    if [ "${#args[@]}" -gt 0 ]; then
+        set -- "${args[@]}"
+    else
+        set --
+    fi
 
-    local cmd="${1:-help}"
-    [ $# -gt 0 ] && shift
+    local cmd
+    if [ $# -eq 0 ]; then
+        if [ -t 0 ] && [ -t 1 ]; then cmd=menu; else cmd=help; fi
+    else
+        cmd="$1"
+        shift
+    fi
     case "$cmd" in
+        # Branded interactive surface / guided first run.
+        menu)             cmd_menu "$@" ;;
+        setup)            cmd_setup "$@" ;;
+
         # Systemd surface
         install)          cmd_systemd_install "$@" ;;
         uninstall)        cmd_systemd_uninstall "$@" ;;
-        start|stop|restart|enable|disable|status)
+        start|restart|enable|disable)
                           cmd_systemctl_passthrough "$cmd" "$@" ;;
+        stop)             cmd_stop "$@" ;;
+        status)           cmd_status "$@" ;;
         logs)             cmd_logs "$@" ;;
 
         # Direct server
         serve)            cmd_serve "$@" ;;
         pull)             cmd_pull "$@" ;;
+
+        # Native source-repository workflow.
+        build)            cmd_native_build "$@" ;;
+        native)           cmd_native_serve "$@" ;;
+        harness)          cmd_harness "$@" ;;
 
         # Self-update — re-runs the bootstrap installer against the channel
         # this script was installed from (LUCEBOX_INSTALLED_FROM).

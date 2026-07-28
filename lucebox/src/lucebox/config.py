@@ -394,12 +394,19 @@ def save(cfg: Config, path: Path | None = None, *, doc: dict[str, Any] | None = 
     return path
 
 
-def seed_dflash_from_host(host: HostFacts, *, path: Path | None = None) -> bool:
+def seed_dflash_from_host(
+    host: HostFacts,
+    *,
+    path: Path | None = None,
+    force: bool = False,
+) -> bool:
     """Persist the VRAM-tier DFLASH_* heuristic to config.toml on first setup.
 
-    Returns True when it wrote. No-op (returns False) when a ``[dflash]``
-    section already exists, so it never clobbers values a prior tune or the
-    user set. Called when a preset is first activated: without it a fresh
+    Returns True when it wrote. By default this is a no-op when a ``[dflash]``
+    section already exists, so first-time setup never clobbers values a prior
+    tune or the user set. ``force=True`` intentionally replaces that section;
+    the interactive CLI uses it when the user explicitly selects the automatic
+    profile. Called when a preset is first activated: without it a fresh
     install serves at the conservative ``DflashRuntime`` class defaults
     (``load()`` returns those for a config.toml that has no ``[dflash]``),
     ignoring the host's VRAM tier. The ``live_config`` heuristic only fires
@@ -417,8 +424,13 @@ def seed_dflash_from_host(host: HostFacts, *, path: Path | None = None) -> bool:
     if not path.exists() and path.with_suffix(".env").exists():
         load(path)
     doc = load_doc(path)
-    if "dflash" in doc:
+    if "dflash" in doc and not force:
         return False
+    if force:
+        # Replace the whole section rather than updating known keys in place.
+        # That removes stale experimental fields and makes "Automatic" a real
+        # reset to the current hardware-derived defaults.
+        doc.pop("dflash", None)
     runtime = autotune_mod.runtime_from_host(host)
     for field, value in asdict(runtime).items():
         _doc_set(doc, "dflash", field, _value_to_toml(value))
