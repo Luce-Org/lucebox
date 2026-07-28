@@ -118,11 +118,19 @@ static bool mix_lookup(const void * vx, MixEntry & out_e, int & out_expert) {
     return false;
 }
 
+// Branchless decode. Different lanes decode different meta bytes, so `e` is
+// per-lane data-dependent and the two guards (`e > 0x7E`, `exp == 0`) diverge
+// within a warp -- the branched form pays exec-mask save/restore + v_cmpx per
+// call AND still runs both arms under divergence. Computing both arms straight
+// and selecting is bit-identical (the selected value equals the branch result
+// for every input; both arms are always finite for uint8 `e`, so no
+// NaN/inf contaminates the unselected path) while dropping the control flow.
 __device__ __forceinline__ float mix_ue4m3(uint8_t e) {
-    if (e > 0x7E) return 0.0f;
     int exp = e >> 3, mant = e & 7;
-    if (exp == 0) return (float) mant * 0.0009765625f;  // 2^-10
-    return ldexpf((float) (8 + mant), exp - 11);
+    float normal = ldexpf((float) (8 + mant), exp - 11);
+    float sub = (float) mant * 0.0009765625f;  // exp==0 subnormal branch, 2^-10
+    float r = (exp == 0) ? sub : normal;
+    return (e > 0x7E) ? 0.0f : r;
 }
 
 // 2-bit codes pack four to a byte and never straddle a boundary -- so unlike
@@ -130,6 +138,14 @@ __device__ __forceinline__ float mix_ue4m3(uint8_t e) {
 // across bytes, and no MIX_QS bounds test. Least-significant pair first.
 __device__ __forceinline__ uint32_t mix_fp2_code(const uint8_t * qs, int i) {
     return (uint32_t) (qs[i >> 2] >> (2 * (i & 3))) & 3u;
+}
+
+// Same 2-bit code, read directly out of a 64-bit register holding the block's 8
+// code bytes (byte k of `codes` == qs[k]). Bit-identical to mix_fp2_code(qs, i):
+// (codes >> (8*(i>>2) + 2*(i&3))) & 3. Max shift for i=31 is 62 < 64. Lets the
+// wide load-from-floor staging keep the codes in a register instead of a stack buf.
+__device__ __forceinline__ uint32_t mix_fp2_code_u64(uint64_t codes, int i) {
+    return (uint32_t) (codes >> (8 * (i >> 2) + 2 * (i & 3))) & 3u;
 }
 
 // Fixed levels for mode 0 (uniform qtype-107 fallback): {-1, 0, 1, 2}, code order.
@@ -188,7 +204,7 @@ void dequantize_rocmfp2_mix_to_fp16_cuda(const void * vx, half * y, int64_t k, c
 // accumulate, warp-reduce. blockIdx.y selects the column (token). Reading the
 // quantized blocks once avoids the ~10x f16 round-trip of the dequant fallback.
 #define MIX_WARP 32
-#define MIX_UNROLL 4
+#define MIX_UNROLL 8
 
 // Down-shift warp shuffle confined to a 32-lane logical group. width=MIX_WARP
 // keeps the reduction self-contained on wave64 (GFX8/9, physical wave = 64) and
@@ -229,16 +245,39 @@ __device__ __forceinline__ void mix_block_accum(
     // decode arithmetic and the fixed j accumulation order are untouched, so
     // acc is bit-for-bit identical to the per-byte path (the correctness gate
     // hashes the greedy output; any reassociation flips a token).
-    const uint8_t * ba = (const uint8_t *) __builtin_assume_aligned(b, 2);
-    uint8_t buf[MIX_BLOCK_BYTES];
-    __builtin_memcpy(buf, ba, MIX_BLOCK_BYTES);
-    const uint8_t m0 = buf[MIX_QS + 0], m1 = buf[MIX_QS + 1];
+    // Load-from-floor wide staging (per-lane, no lane->block remap). The block is
+    // 10 B at byte offset 10*bidx from an 8-aligned rowbase, so its address is
+    // 2-byte- (not 8-byte-) aligned: (10*bidx) & 7 cycles {0,2,4,6}. Rather than
+    // the ~5 narrow ushort loads a direct 10-byte copy forces, load the two
+    // 8-aligned u64 that bracket the block (floor = addr & ~7; the block spans
+    // [r, r+10) with r<=6, so r+10<=16 always fits in the 16 B window), then
+    // funnel-shift the lane's OWN 10 bytes out of registers. Same block, same
+    // bytes, same decode, same fixed j order, same acc-add chain -- only the load
+    // *route* changes, NOT which block-dots enter this lane's acc, so the fold is
+    // not reassociated and the greedy-sha gate is unaffected. 2 dwordx2 vs ~5
+    // ushort per block. OOB-safe on this model: floor >= rowbase (rowbase is
+    // 8-aligned). The 16 B window ends at floor+16 = block_end + (6 - (addr&7));
+    // for the LAST block of the tensor that overruns the row end by
+    // (6 - (10*(nb-1) & 7)) B, which is 0 exactly when nb % 4 == 0 (in % 128 == 0).
+    // in=4096 -> nb=128 -> overrun 0 (last block reads [rowbase+1272, rowbase+1280),
+    // exactly to the 8-aligned row end). If a future shape has nb % 4 != 0, the last
+    // block reads up to 6 B past the tensor end -- add a floor-clamp guard there.
+    const uintptr_t addr  = (uintptr_t) b;
+    const uint8_t * base8 = (const uint8_t *) __builtin_assume_aligned(
+            (const void *) (addr & ~(uintptr_t) 7), 8);
+    const int sh = (int) (addr & 7) * 8;                 // 0, 16, 32, 48
+    uint64_t lo, hi;
+    __builtin_memcpy(&lo, base8, 8);
+    __builtin_memcpy(&hi, base8 + 8, 8);
+    const uint64_t codes = (sh == 0) ? lo : ((lo >> sh) | (hi << (64 - sh)));
+    const uint8_t  m0    = (uint8_t) (hi >> sh);         // block byte MIX_QS+0
+    const uint8_t  m1    = (uint8_t) (hi >> (sh + 8));   // block byte MIX_QS+1
     if (mode == 0) {
         const float s0 = mix_ue4m3(m0), s1 = mix_ue4m3(m1);
         #pragma unroll
         for (int j = 0; j < MIX_QK; ++j) {
             const float s = (j < MIX_QK/2) ? s0 : s1;
-            acc += s * mix_fp2_fixed(mix_fp2_code(buf, j)) * xc[col0 + j];
+            acc += s * mix_fp2_fixed(mix_fp2_code_u64(codes, j)) * xc[col0 + j];
         }
     } else {
         const float s0 = mix_ue4m3(m0 & 0x7F), s1 = mix_ue4m3(m1 & 0x7F);
@@ -248,7 +287,7 @@ __device__ __forceinline__ void mix_block_accum(
         for (int j = 0; j < MIX_QK; ++j) {
             const float s = (j < MIX_QK/2) ? s0 : s1;
             const nv_bfloat16 * bk = (j < MIX_QK/2) ? bk0 : bk1;
-            acc += s * __bfloat162float(bk[mix_fp2_code(buf, j)]) * xc[col0 + j];
+            acc += s * __bfloat162float(bk[mix_fp2_code_u64(codes, j)]) * xc[col0 + j];
         }
     }
 }
@@ -289,14 +328,13 @@ __global__ void mix_matvec_rocmfp2_kernel(
     // Main body: MIX_UNROLL blocks per iteration, each accumulated in stride
     // order into the single acc. The blocks' byte loads are independent (only
     // the acc-add chain is serial), so unrolling overlaps their loads while the
-    // summation order stays identical. Guard keeps all 4 in range.
-    for (; blk + 3 * MIX_WARP < nb; blk += MIX_UNROLL * MIX_WARP) {
-        const int b0 = blk, b1 = blk + MIX_WARP;
-        const int b2 = blk + 2 * MIX_WARP, b3 = blk + 3 * MIX_WARP;
-        mix_block_accum(rowbase + (int64_t) b0 * MIX_BLOCK_BYTES, xc, b0 * MIX_QK, mode, book, acc);
-        mix_block_accum(rowbase + (int64_t) b1 * MIX_BLOCK_BYTES, xc, b1 * MIX_QK, mode, book, acc);
-        mix_block_accum(rowbase + (int64_t) b2 * MIX_BLOCK_BYTES, xc, b2 * MIX_QK, mode, book, acc);
-        mix_block_accum(rowbase + (int64_t) b3 * MIX_BLOCK_BYTES, xc, b3 * MIX_QK, mode, book, acc);
+    // summation order stays identical. Guard keeps all MIX_UNROLL in range.
+    for (; blk + (MIX_UNROLL - 1) * MIX_WARP < nb; blk += MIX_UNROLL * MIX_WARP) {
+        #pragma unroll
+        for (int u = 0; u < MIX_UNROLL; ++u) {
+            const int b = blk + u * MIX_WARP;
+            mix_block_accum(rowbase + (int64_t) b * MIX_BLOCK_BYTES, xc, b * MIX_QK, mode, book, acc);
+        }
     }
     // Remainder: fewer than MIX_UNROLL strided blocks left for this lane.
     for (; blk < nb; blk += MIX_WARP) {
@@ -318,6 +356,16 @@ __global__ void mix_matvec_rocmfp2_kernel(
 // expert, so every output element is bit-for-bit identical to the per-expert
 // slice path the fallback would take (the correctness gate hashes the greedy
 // output, so any reassociation would flip a token).
+//
+// Pin occupancy to the seed's proven-optimal 12 waves/SIMD. The branchless
+// mix_ue4m3 dropped VGPR 98->96, which would otherwise let the allocator raise
+// occupancy to 16 waves -- the tier iter-3 measured at -5% (extra resident waves
+// thrash the reused activation column out of L1). The pin is a bit-exact
+// occupancy hint (no math change) that keeps the arithmetic win at the 12-wave
+// optimum instead of accidentally tripping into the known-bad 16-wave tier.
+#if defined(__HIP_PLATFORM_AMD__)
+__attribute__((amdgpu_waves_per_eu(12, 12)))
+#endif
 __global__ void mix_matvec_rocmfp2_moe_kernel(
         const uint8_t * __restrict__ data, size_t nb02,
         const nv_bfloat16 * __restrict__ codebooks, const uint8_t * __restrict__ modes,
@@ -357,17 +405,13 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
     // load-instruction-bound matvec — WITHOUT reordering either row's summation.
     float acc0 = 0.0f, acc1 = 0.0f;
     int blk = lane;
-    for (; blk + 3 * MIX_WARP < nb; blk += MIX_UNROLL * MIX_WARP) {
-        const int b0 = blk, b1 = blk + MIX_WARP;
-        const int b2 = blk + 2 * MIX_WARP, b3 = blk + 3 * MIX_WARP;
-        mix_block_accum(rowbase0 + (int64_t) b0 * MIX_BLOCK_BYTES, xcol, b0 * MIX_QK, mode, book, acc0);
-        mix_block_accum(rowbase1 + (int64_t) b0 * MIX_BLOCK_BYTES, xcol, b0 * MIX_QK, mode, book, acc1);
-        mix_block_accum(rowbase0 + (int64_t) b1 * MIX_BLOCK_BYTES, xcol, b1 * MIX_QK, mode, book, acc0);
-        mix_block_accum(rowbase1 + (int64_t) b1 * MIX_BLOCK_BYTES, xcol, b1 * MIX_QK, mode, book, acc1);
-        mix_block_accum(rowbase0 + (int64_t) b2 * MIX_BLOCK_BYTES, xcol, b2 * MIX_QK, mode, book, acc0);
-        mix_block_accum(rowbase1 + (int64_t) b2 * MIX_BLOCK_BYTES, xcol, b2 * MIX_QK, mode, book, acc1);
-        mix_block_accum(rowbase0 + (int64_t) b3 * MIX_BLOCK_BYTES, xcol, b3 * MIX_QK, mode, book, acc0);
-        mix_block_accum(rowbase1 + (int64_t) b3 * MIX_BLOCK_BYTES, xcol, b3 * MIX_QK, mode, book, acc1);
+    for (; blk + (MIX_UNROLL - 1) * MIX_WARP < nb; blk += MIX_UNROLL * MIX_WARP) {
+        #pragma unroll
+        for (int u = 0; u < MIX_UNROLL; ++u) {
+            const int b = blk + u * MIX_WARP;
+            mix_block_accum(rowbase0 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, book, acc0);
+            mix_block_accum(rowbase1 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, book, acc1);
+        }
     }
     for (; blk < nb; blk += MIX_WARP) {
         mix_block_accum(rowbase0 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, book, acc0);

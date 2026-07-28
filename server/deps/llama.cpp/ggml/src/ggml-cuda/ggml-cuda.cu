@@ -3700,12 +3700,19 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             // synchronize), so it is safe to capture. Mirror that path's gate
             // exactly, incl. the registry check, so we never skip-disable while
             // the runtime actually falls back to the sync path.
+            // Each mix qtype has its OWN registry; querying the 105 one for a 106
+            // node always answers false, which would mark every qtype-106 node
+            // graph-ineligible and silently disable capture for the whole FFN
+            // subgraph -- forfeiting the win b21583c bought. Dispatch on the type,
+            // matching the runtime gate exactly, as the comment above requires.
+            const bool is_mmid_105 = node->src[0]->type == GGML_TYPE_Q3_1_ROCMFP3_MIX;
+            const bool is_mmid_106 = node->src[0]->type == GGML_TYPE_Q2_1_ROCMFP2_MIX;
             const bool mmid_rocmfp3_ok =
-                (node->src[0]->type == GGML_TYPE_Q3_1_ROCMFP3_MIX ||
-                 node->src[0]->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) &&
+                (is_mmid_105 || is_mmid_106) &&
                 node->src[1]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
                 node->src[1]->ne[2] == 1 &&
-                ggml_cuda_rocmfp3_mix_registered(node->src[0]->data);
+                (is_mmid_105 ? ggml_cuda_rocmfp3_mix_registered(node->src[0]->data)
+                             : ggml_cuda_rocmfp2_mix_registered(node->src[0]->data));
             if (mmid_telemetry) {
                 std::fprintf(stderr,
                     "[dflash-mmid] event=graph name=%s type=%s ne11=%lld width=%lld "
