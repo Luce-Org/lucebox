@@ -79,6 +79,7 @@ jobs:
         with:
           name: formal-results
           path: .formal-results/
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
 
