@@ -133,6 +133,8 @@ jobs:
           if [[ -f proposed/diagnosis.md ]]; then
             cp proposed/diagnosis.md candidate/diagnosis.md
           fi
+          # Native revalidation compiles and executes inside this isolated,
+          # credential-free, networkless container.
           docker run --rm \
             --network none \
             --read-only \
@@ -142,7 +144,7 @@ jobs:
             --memory 6g \
             --cpus 2 \
             --user "$(id -u):$(id -g)" \
-            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=1g \
             --volume "$GITHUB_WORKSPACE/incoming:/input:ro" \
             --volume "$GITHUB_WORKSPACE/proposed:/proposal:ro" \
             --volume "$GITHUB_WORKSPACE/candidate:/output:rw" \

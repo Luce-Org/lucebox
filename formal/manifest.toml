@@ -44,3 +44,41 @@ contract_paths = [
 ]
 native_test = "test_prefix_cache_state"
 native_test_source = "server/test/test_prefix_cache_state.cpp"
+
+[[capsules]]
+id = "prefix-cache-abort-hole"
+description = "Inline prefix-cache free-slot selection after an aborted reservation"
+harness = "formal/prefix_cache/abort_hole_harness.cpp"
+entry_function = "main"
+include_dirs = ["server/src"]
+timeout_seconds = 120
+defines = [
+  "LUCEBOX_FORMAL_MAX_CAP=4",
+]
+nightly_defines = [
+  "LUCEBOX_FORMAL_MAX_CAP=16",
+]
+esbmc_args = [
+  "--quiet",
+  "--z3",
+  "--unwind", "17",
+  "--overflow-check",
+]
+trigger_paths = [
+  "formal/**",
+  "server/src/server/prefix_cache_state.h",
+  "server/src/server/prefix_cache.h",
+  "server/src/server/prefix_cache.cpp",
+  "server/test/test_prefix_cache_state.cpp",
+]
+mutable_paths = [
+  "server/src/server/prefix_cache_state.h",
+]
+contract_paths = [
+  "formal/manifest.toml",
+  "formal/prefix_cache/abort_hole_harness.cpp",
+  "formal/prefix_cache/ABORT_HOLE_PROPERTIES.md",
+  "server/test/test_prefix_cache_state.cpp",
+]
+native_test = "test_prefix_cache_state"
+native_test_source = "server/test/test_prefix_cache_state.cpp"

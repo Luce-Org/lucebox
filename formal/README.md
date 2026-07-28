@@ -28,7 +28,7 @@ The `Formal AI Candidate` workflow is separate and advisory:
 - the lane can upload only a diagnosis and candidate patch. It cannot commit,
   comment, push, or open a pull request.
 
-## Current capsule
+## Current capsules
 
 `prefix-cache-inline` checks the production
 `InlinePrefixCacheState` one-entry prepare/confirm/exact-lookup path for
@@ -36,10 +36,16 @@ symbolic cache capacity, branch, and prefix depth. Its precise guarantees and
 exclusions are in
 [`prefix_cache/PROPERTIES.md`](prefix_cache/PROPERTIES.md).
 
+`prefix-cache-abort-hole` checks every bounded cursor and occupancy pattern for
+the production free-slot selector. It was added from a current regression in
+which an aborted reservation left a free slot, but the next reservation
+selected and invalidated a still-committed snapshot. Its contract is in
+[`prefix_cache/ABORT_HOLE_PROPERTIES.md`](prefix_cache/ABORT_HOLE_PROPERTIES.md).
+
 The dependency-free native test covers the wider transition matrix:
-abort, cancellation, stale lookup, invalid confirmation, clear, slot reuse,
-and prefix-aware eviction. These cases are not described as model-checked until
-separate capsules can prove them within the pull-request time budget.
+abort, cancellation, stale lookup, invalid confirmation, clear, full-capacity
+slot reuse, and prefix-aware eviction. Only behavior explicitly named by a
+capsule contract is described as model checked.
 
 ## Local use
 

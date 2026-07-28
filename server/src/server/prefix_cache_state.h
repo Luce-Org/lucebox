@@ -71,6 +71,31 @@ inline int select_inline_evict_victim(
     return select_inline_evict_victim(ptrs);
 }
 
+// Select a slot below the production PrefixCache limit of 64 slots. Keeping
+// this allocation decision scalar makes the behavior independently
+// model-checkable; InlinePrefixCacheState remains responsible for deriving the
+// occupancy mask from its committed entries.
+inline int select_inline_free_slot(
+        int next_slot, int capacity, uint64_t occupied_slots) {
+    if (capacity <= 0 || next_slot < 0 || next_slot >= capacity) {
+        return -1;
+    }
+    // InlinePrefixCacheState is independently usable, while the production
+    // PrefixCache clamps capacity to 64. Preserve the legacy round-robin
+    // behavior for out-of-contract standalone capacities that do not fit the
+    // occupancy mask.
+    if (capacity > 64) return next_slot;
+
+    for (int offset = 0; offset < capacity; ++offset) {
+        const int candidate = (next_slot + offset) % capacity;
+        const uint64_t candidate_bit = uint64_t{1} << candidate;
+        if ((occupied_slots & candidate_bit) == 0) {
+            return candidate;
+        }
+    }
+    return -1;
+}
+
 class InlinePrefixCacheState {
 public:
     struct Entry {
@@ -161,8 +186,17 @@ public:
                 (int)entries_[(size_t)victim].ids.size();
             result.oldest_len = (int)entries_.front().ids.size();
         } else {
-            result.slot = next_slot_;
-            next_slot_ = (next_slot_ + 1) % capacity_;
+            uint64_t occupied_slots = 0;
+            if (capacity_ <= 64) {
+                for (const auto & entry : entries_) {
+                    if (entry.slot >= 0 && entry.slot < 64) {
+                        occupied_slots |= uint64_t{1} << entry.slot;
+                    }
+                }
+            }
+            result.slot = select_inline_free_slot(
+                next_slot_, capacity_, occupied_slots);
+            next_slot_ = (result.slot + 1) % capacity_;
             has_pending_evict_ = false;
         }
         return result;

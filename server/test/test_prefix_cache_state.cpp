@@ -91,6 +91,34 @@ void test_abort_purges_reused_slot() {
     assert_invariants(state);
 }
 
+void test_abort_reuses_hole_before_occupied_slot() {
+    InlinePrefixCacheState state(2);
+    const std::vector<int32_t> a = {7};
+
+    auto committed = state.prepare(key(1, 1), 1);
+    assert(committed.slot == 0);
+    assert(state.confirm(
+        committed.slot, key(1, 1), 1, a).accepted);
+
+    // Reserving the second slot advances the round-robin cursor back to slot
+    // zero. If that reservation aborts, slot one is a hole and slot zero still
+    // owns a valid snapshot.
+    auto failed = state.prepare(key(2, 1), 1);
+    assert(failed.slot == 1);
+    assert(state.abort(failed.slot) == 0);
+    assert(state.contains(key(1, 1)));
+
+    // The HTTP layer immediately frees the slot returned by prepare(). It must
+    // therefore receive the free slot, not the occupied slot zero.
+    auto replacement = state.prepare(key(3, 1), 1);
+    assert(replacement.slot == failed.slot);
+    for (const auto & entry : state.entries()) {
+        assert(entry.slot != replacement.slot);
+    }
+    assert(state.contains(key(1, 1)));
+    assert_invariants(state);
+}
+
 void test_cancel_preserves_entry() {
     InlinePrefixCacheState state(1);
     const std::vector<int32_t> ids = {7, 10};
@@ -162,6 +190,7 @@ void test_clear_resets_allocator() {
 int main() {
     test_round_robin_and_reuse();
     test_abort_purges_reused_slot();
+    test_abort_reuses_hole_before_occupied_slot();
     test_cancel_preserves_entry();
     test_stale_lookup_is_removed();
     test_invalid_confirm_is_non_mutating();
