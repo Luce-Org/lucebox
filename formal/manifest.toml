@@ -3,8 +3,8 @@ schema_version = 1
 [toolchain]
 esbmc_version = "8.4"
 esbmc_linux_sha256 = "68bb71128e0c3c2db090955e7a302533a8a11a9d898df7f169c22311a0ec5078"
-verifier_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:163309de012c9cdb2bb64244440995ef3e0d3104af6db81d821d8d0a707fed8f"
-repair_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:8671874bc58cafdc2a9328e105b0d4963f37ba28379d64dbd5ea0cf743431638"
+verifier_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:d11a7aace22dbd005f53482e38903782e16f3c1e2403cbf44f9ca9b220bef8db"
+repair_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:2dc8fadf0345cbcd0eba4caf84ccc43cabe2fc5f65c39a39ca8507eaff79bdc4"
 
 [[capsules]]
 id = "prefix-cache-inline"
