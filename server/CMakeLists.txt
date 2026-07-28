@@ -1148,6 +1148,18 @@ if(DFLASH27B_TESTS)
         list(APPEND _raw_unit_test_targets test_server_unit)
     endif()
 
+    # Dependency-free production state core used by native tests and ESBMC.
+    # Keep this target free of tokenizer, ggml, and GPU libraries so formal
+    # transition checks remain fast and reproducible on hosted CPU runners.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_prefix_cache_state.cpp")
+        add_executable(
+            test_prefix_cache_state
+            test/test_prefix_cache_state.cpp)
+        target_include_directories(test_prefix_cache_state PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME prefix_cache_state COMMAND test_prefix_cache_state)
+    endif()
+
     # Feature/architecture gate tests. check_feature_compatibility(),
     # collect_feature_warnings() and the capability table are pure functions,
     # so this target deliberately compiles only feature_gate.cpp and
@@ -1220,6 +1232,9 @@ if(DFLASH27B_TESTS)
     endif()
     if(TARGET test_feature_gate)
         list(APPEND _check_deps test_feature_gate)
+    endif()
+    if(TARGET test_prefix_cache_state)
+        list(APPEND _check_deps test_prefix_cache_state)
     endif()
     if(_check_deps)
         add_custom_target(check

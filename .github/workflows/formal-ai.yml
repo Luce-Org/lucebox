@@ -1,0 +1,176 @@
+name: Formal AI Candidate
+
+on:
+  workflow_run:
+    workflows: ["Formal Verification"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Failed Formal Verification workflow run ID
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: formal-ai-${{ github.event.workflow_run.id || inputs.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    name: inspect-deterministic-result
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.workflow_run.conclusion == 'failure' &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      run_id: ${{ steps.source.outputs.run_id }}
+      has_counterexample: ${{ steps.report.outputs.has_counterexample }}
+    steps:
+      - id: source
+        name: Resolve failed run
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo 'run_id=${{ inputs.run_id }}' >> "$GITHUB_OUTPUT"
+          else
+            echo 'run_id=${{ github.event.workflow_run.id }}' >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: formal-results
+          path: incoming
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ steps.source.outputs.run_id }}
+
+      - id: report
+        name: Require a real counterexample
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          reports = list(Path("incoming").rglob("report.json"))
+          if len(reports) != 1:
+              raise SystemExit(f"expected one report.json, found {len(reports)}")
+          report = json.loads(reports[0].read_text(encoding="utf-8"))
+          statuses = {
+              item.get("status") for item in report.get("results", [])
+          }
+          value = "true" if "counterexample" in statuses else "false"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"has_counterexample={value}\n")
+          PY
+
+  candidate:
+    name: approval-only-candidate
+    needs: inspect
+    if: needs.inspect.outputs.has_counterexample == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: formal-ai
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: formal-results
+          path: incoming
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ needs.inspect.outputs.run_id }}
+
+      - id: propose
+        name: Generate bounded proposal without executing it
+        continue-on-error: true
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          FORMAL_AI_MODEL: ${{ vars.FORMAL_AI_MODEL || 'openai:gpt-5.6-sol' }}
+          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:d8f9d3709358142da8697fee5e0b4b58b89fac29d0c13fdcaff427dcd647b751
+        run: |
+          bundle="$(find incoming -type f -name 'failure-bundle-*.tar.gz' -print -quit)"
+          if [[ -z "$bundle" ]]; then
+            echo 'No failure bundle was present in the deterministic artifact.' >&2
+            exit 21
+          fi
+          mkdir -p proposed
+          bundle_relative="${bundle#incoming/}"
+          docker run --rm \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 512 \
+            --memory 6g \
+            --cpus 2 \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+            --env OPENAI_API_KEY \
+            --env XDG_CACHE_HOME=/tmp/cache \
+            --env XDG_CONFIG_HOME=/tmp/config \
+            --volume "$GITHUB_WORKSPACE/incoming:/input:ro" \
+            --volume "$GITHUB_WORKSPACE/proposed:/output:rw" \
+            "$REPAIR_IMAGE" propose \
+            --bundle "/input/$bundle_relative" \
+            --model "$FORMAL_AI_MODEL" \
+            --out /output
+
+      - id: validate
+        name: Reverify proposal without network or credentials
+        if: steps.propose.outcome == 'success'
+        continue-on-error: true
+        env:
+          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:d8f9d3709358142da8697fee5e0b4b58b89fac29d0c13fdcaff427dcd647b751
+        run: |
+          bundle="$(find incoming -type f -name 'failure-bundle-*.tar.gz' -print -quit)"
+          bundle_relative="${bundle#incoming/}"
+          mkdir -p candidate
+          if [[ -f proposed/diagnosis.md ]]; then
+            cp proposed/diagnosis.md candidate/diagnosis.md
+          fi
+          docker run --rm \
+            --network none \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 512 \
+            --memory 6g \
+            --cpus 2 \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+            --volume "$GITHUB_WORKSPACE/incoming:/input:ro" \
+            --volume "$GITHUB_WORKSPACE/proposed:/proposal:ro" \
+            --volume "$GITHUB_WORKSPACE/candidate:/output:rw" \
+            "$REPAIR_IMAGE" validate \
+            --bundle "/input/$bundle_relative" \
+            --patch /proposal/candidate.patch \
+            --out /output
+
+      - name: Publish advisory summary
+        if: always()
+        run: |
+          {
+            echo '# Formal AI candidate'
+            echo
+            echo 'This lane is advisory and cannot write to the repository.'
+            echo
+            echo "Proposal step outcome: \`${{ steps.propose.outcome }}\`"
+            echo "Secretless validation outcome: \`${{ steps.validate.outcome }}\`"
+            if [[ -f candidate/diagnosis.md ]]; then
+              echo
+              cat candidate/diagnosis.md
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: formal-ai-candidate-${{ needs.inspect.outputs.run_id }}
+          path: candidate/
+          if-no-files-found: warn
+          retention-days: 14

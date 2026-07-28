@@ -140,38 +140,6 @@ PrefixHash hash_prefix(const int32_t * ids, int count) {
     return h;
 }
 
-// ─── Prefix-aware eviction ──────────────────────────────────────────────
-
-static bool is_strict_prefix(const std::vector<int32_t> & a,
-                             const std::vector<int32_t> & b) {
-    // True iff `a` is a strict (shorter) prefix of `b`.
-    if (a.size() >= b.size()) return false;
-    return std::equal(a.begin(), a.end(), b.begin());
-}
-
-int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> & ids_lru) {
-    const int n = (int)ids_lru.size();
-    if (n <= 0) return 0;
-    // Oldest-first scan: evict the first entry that is not a strict prefix of any
-    // other entry (a leaf). Shared ancestor prefixes are thereby kept resident.
-    for (int i = 0; i < n; i++) {
-        bool is_ancestor = false;
-        for (int j = 0; j < n; j++) {
-            if (j == i) continue;
-            if (is_strict_prefix(*ids_lru[i], *ids_lru[j])) { is_ancestor = true; break; }
-        }
-        if (!is_ancestor) return i;  // oldest leaf
-    }
-    return 0;  // unreachable (the longest entry is always a leaf); pure-LRU fallback
-}
-
-int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru) {
-    std::vector<const std::vector<int32_t> *> ptrs;
-    ptrs.reserve(ids_lru.size());
-    for (const auto & v : ids_lru) ptrs.push_back(&v);
-    return select_inline_evict_victim(ptrs);
-}
-
 int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
                                     int restored_prefix_len) {
     if (boundaries.empty()) return 0;
@@ -184,7 +152,8 @@ int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
 // ─── PrefixCache ────────────────────────────────────────────────────────
 
 PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer)
-    : cap_(std::min(cap, MAX_SLOTS))
+    : cap_(std::min(cap, MAX_SLOTS)),
+      inline_state_(std::max(0, std::min(cap, MAX_SLOTS)))
 {
     if (cap_ <= 0) {
         disabled_ = true;
@@ -203,18 +172,9 @@ PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer)
 
 // ── LRU helpers ─────────────────────────────────────────────────────────
 
-int PrefixCache::find_entry(const PrefixHash & h) const {
-    for (int i = 0; i < (int)entries_.size(); i++) {
-        if (entries_[i].hash == h) return i;
-    }
-    return -1;
-}
-
-void PrefixCache::move_to_end(int idx) {
-    if (idx < 0 || idx >= (int)entries_.size()) return;
-    auto e = std::move(entries_[idx]);
-    entries_.erase(entries_.begin() + idx);
-    entries_.push_back(std::move(e));
+void PrefixCache::sync_inline_size() {
+    entries_size_count_.store(
+        inline_state_.size(), std::memory_order_relaxed);
 }
 
 int PrefixCache::find_full_entry(const PrefixHash & h) const {
@@ -241,26 +201,21 @@ std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids)
 
     for (int cut : boundaries) {
         auto key = hash_prefix(prompt_ids.data(), cut);
-        int idx = find_entry(key);
-        if (idx >= 0) {
-            const int committed = (int)entries_[idx].ids.size();
-            if (committed != cut) {
-                // Slot was refreshed in-place at a deeper boundary; a shallow
-                // hash→slot entry would restore the wrong cur_pos.
-                std::fprintf(stderr,
-                    "[pc] lookup stale slot=%d key_cut=%d committed=%d — evicting\n",
-                    entries_[idx].slot, cut, committed);
-                entries_.erase(entries_.begin() + idx);
-                entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
-                continue;
-            }
-            if (cut > best_len) {
-                best_slot = entries_[idx].slot;
-                best_len = cut;
-            }
-            move_to_end(idx);
+        const auto result = inline_state_.lookup_candidate(key, cut);
+        if (result.stale_removed) {
+            // Slot was refreshed in-place at a deeper boundary; a shallow
+            // hash→slot entry would restore the wrong cur_pos.
+            std::fprintf(stderr,
+                "[pc] lookup stale slot=%d key_cut=%d committed=%d — evicting\n",
+                result.stale_slot, cut, result.stale_committed_len);
+            continue;
+        }
+        if (result.slot >= 0 && cut > best_len) {
+            best_slot = result.slot;
+            best_len = result.prefix_len;
         }
     }
+    sync_inline_size();
 
     if (best_slot >= 0) {
         lifetime_hits_.fetch_add(1, std::memory_order_relaxed);
@@ -281,68 +236,44 @@ std::pair<int, int> PrefixCache::prepare_inline_snap(
     if (target_cut <= 0) return {-1, 0};
 
     auto key = hash_prefix(prompt_ids.data(), target_cut);
-    if (find_entry(key) >= 0) return {-1, 0};  // already cached
-
-    int slot;
-    if ((int)entries_.size() >= cap_) {
-        // At capacity — reserve a slot without evicting yet. Prefix-aware: prefer
-        // the oldest leaf so shared ancestor prefixes (reused by later branches)
-        // stay resident. entries_ is already in LRU order (front = oldest).
-        std::vector<const std::vector<int32_t> *> ids_lru;
-        ids_lru.reserve(entries_.size());
-        for (const auto & e : entries_) ids_lru.push_back(&e.ids);
-        int victim = select_inline_evict_victim(ids_lru);
-        pending_evict_key_ = entries_[victim].hash;
-        has_pending_evict_ = true;
-        slot = entries_[victim].slot;
-        if (victim != 0) {
-            std::fprintf(stderr,
-                "[pc] prefix-aware evict: victim idx=%d (len=%zu) kept oldest "
-                "ancestor (len=%zu)\n",
-                victim, entries_[victim].ids.size(), entries_.front().ids.size());
-        }
-    } else {
-        slot = next_slot_;
-        next_slot_ = (next_slot_ + 1) % cap_;
-        has_pending_evict_ = false;
+    const auto reservation = inline_state_.prepare(key, target_cut);
+    if (reservation.slot < 0) return {-1, 0};
+    if (reservation.victim_index > 0) {
+        std::fprintf(stderr,
+            "[pc] prefix-aware evict: victim idx=%d (len=%d) kept oldest "
+            "ancestor (len=%d)\n",
+            reservation.victim_index, reservation.victim_len,
+            reservation.oldest_len);
     }
 
-    return {slot, target_cut};
+    return {reservation.slot, reservation.target_cut};
 }
 
 void PrefixCache::confirm_inline_snap(int slot, int target_cut,
                                       const std::vector<int32_t> & prompt_ids) {
     if (disabled_) return;
-
-    // Evict the reserved entry (if any).
-    if (has_pending_evict_) {
-        int idx = find_entry(pending_evict_key_);
-        if (idx >= 0) {
-            entries_.erase(entries_.begin() + idx);
-            entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
-        }
-        has_pending_evict_ = false;
+    if (slot < 0 || slot >= cap_ || target_cut <= 0 ||
+        target_cut > (int)prompt_ids.size()) {
+        std::fprintf(stderr,
+            "[pc] rejected inline-snap slot=%d prefix_len=%d prompt_len=%zu\n",
+            slot, target_cut, prompt_ids.size());
+        return;
     }
 
-    // The new snapshot replaces whatever this slot previously held. Drop any
-    // other entries still pointing at the slot: their hashes describe a
-    // different (or shorter) token stream than the new snapshot, and a later
-    // restore through them would attach mismatched KV. Stale entries arise
-    // when an aborted snap burns a round-robin next_slot_ step and a later
-    // confirm wraps onto a slot with a live entry (PR #370 repro).
-    for (int i = (int)entries_.size() - 1; i >= 0; --i) {
-        if (entries_[(size_t)i].slot == slot) {
-            std::fprintf(stderr,
-                "[pc] dropping stale entry for reused slot=%d\n", slot);
-            entries_.erase(entries_.begin() + i);
-            entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
-        }
+    const auto key = hash_prefix(prompt_ids.data(), target_cut);
+    const auto result =
+        inline_state_.confirm(slot, key, target_cut, prompt_ids);
+    if (!result.accepted) {
+        std::fprintf(stderr,
+            "[pc] rejected inline-snap slot=%d prefix_len=%d prompt_len=%zu\n",
+            slot, target_cut, prompt_ids.size());
+        return;
     }
-
-    auto key = hash_prefix(prompt_ids.data(), target_cut);
-    std::vector<int32_t> ids(prompt_ids.begin(), prompt_ids.begin() + target_cut);
-    entries_.push_back({key, slot, std::move(ids)});
-    entries_size_count_.fetch_add(1, std::memory_order_relaxed);
+    for (int i = 0; i < result.stale_slot_entries_removed; ++i) {
+        std::fprintf(stderr,
+            "[pc] dropping stale entry for reused slot=%d\n", slot);
+    }
+    sync_inline_size();
     std::fprintf(stderr, "[pc] inline-snap committed slot=%d prefix_len=%d\n",
                  slot, target_cut);
 }
@@ -353,31 +284,20 @@ void PrefixCache::abort_inline_snap(int slot) {
     // metadata still pointing at it is therefore invalid, whether the slot was
     // selected through the explicit eviction path or through a round-robin
     // hole left by an earlier aborted reservation.
-    for (int i = (int)entries_.size() - 1; i >= 0; --i) {
-        if (entries_[(size_t)i].slot == slot) {
-            entries_.erase(entries_.begin() + i);
-            entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
-        }
-    }
-    has_pending_evict_ = false;
+    inline_state_.abort(slot);
+    sync_inline_size();
 }
 
 void PrefixCache::cancel_inline_snap(int slot) {
     if (disabled_) return;
-    if (has_pending_evict_) {
-        const int idx = find_entry(pending_evict_key_);
-        if (idx >= 0 && entries_[idx].slot != slot) return;
-    }
-    has_pending_evict_ = false;
+    inline_state_.cancel(slot);
 }
 
 void PrefixCache::mark_all_cleared() {
     if (disabled_) return;
-    int n = (int)entries_.size();
-    entries_.clear();
-    entries_size_count_.store(0, std::memory_order_relaxed);
-    next_slot_ = 0;
-    has_pending_evict_ = false;
+    const int n = inline_state_.size();
+    inline_state_.clear();
+    sync_inline_size();
     std::fprintf(stderr, "[pc] all-cleared — dropped %d LRU entries\n", n);
 }
 

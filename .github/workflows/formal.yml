@@ -1,0 +1,89 @@
+name: Formal Verification
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: formal-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - id: scope
+        name: Select verification scope
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            echo 'mode=pr' >> "$GITHUB_OUTPUT"
+            echo 'base_sha=${{ github.event.pull_request.base.sha }}' >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_EVENT_NAME" == "merge_group" ]]; then
+            echo 'mode=pr' >> "$GITHUB_OUTPUT"
+            echo 'base_sha=${{ github.event.merge_group.base_sha }}' >> "$GITHUB_OUTPUT"
+          else
+            echo 'mode=all' >> "$GITHUB_OUTPUT"
+            echo 'base_sha=' >> "$GITHUB_OUTPUT"
+          fi
+
+      - id: formal
+        name: Run deterministic ESBMC capsules
+        continue-on-error: true
+        env:
+          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:79d53e234e969ebff322927c9d147039dbe36bd5250ad102ceaaace339937b27
+        run: |
+          mkdir -p .formal-results
+          docker run --rm \
+            --network none \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 512 \
+            --memory 6g \
+            --cpus 2 \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,size=512m \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$GITHUB_WORKSPACE/.formal-results:/results:rw" \
+            --workdir /workspace \
+            "$VERIFIER_IMAGE" verify \
+            --manifest /workspace/formal/manifest.toml \
+            --base-sha '${{ steps.scope.outputs.base_sha }}' \
+            --mode '${{ steps.scope.outputs.mode }}' \
+            --out /results
+
+      - name: Publish formal summary
+        if: always()
+        run: |
+          if [[ -f .formal-results/summary.md ]]; then
+            cat .formal-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Formal verifier did not produce a summary.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: formal-results
+          path: .formal-results/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enforce deterministic result
+        if: steps.formal.outcome != 'success'
+        run: |
+          echo 'The deterministic formal-verification lane did not pass.' >&2
+          exit 1

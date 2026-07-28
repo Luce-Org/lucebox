@@ -1,0 +1,67 @@
+name: Formal Verification Nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: formal-nightly
+  cancel-in-progress: true
+
+jobs:
+  verify-nightly:
+    name: verify-nightly
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - id: formal
+        name: Run extended ESBMC capsules
+        continue-on-error: true
+        env:
+          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:79d53e234e969ebff322927c9d147039dbe36bd5250ad102ceaaace339937b27
+        run: |
+          mkdir -p .formal-results
+          docker run --rm \
+            --network none \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 512 \
+            --memory 6g \
+            --cpus 2 \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,size=512m \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$GITHUB_WORKSPACE/.formal-results:/results:rw" \
+            --workdir /workspace \
+            "$VERIFIER_IMAGE" verify \
+            --manifest /workspace/formal/manifest.toml \
+            --mode nightly \
+            --out /results
+
+      - name: Publish formal summary
+        if: always()
+        run: |
+          if [[ -f .formal-results/summary.md ]]; then
+            cat .formal-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Formal verifier did not produce a summary.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: formal-nightly-results
+          path: .formal-results/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce extended result
+        if: steps.formal.outcome != 'success'
+        run: exit 1
