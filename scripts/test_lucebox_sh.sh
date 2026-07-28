@@ -184,9 +184,14 @@ if bash -n "$ENTRYPOINT"; then report ok "bash -n entrypoint.sh parses cleanly"
 else report fail "bash -n entrypoint.sh"; fi
 
 # ── 3. Trivial subcommands (zero-exit expected) ───────────────────────────
-assert_runs "help"     "bash '$SCRIPT' help"     "host-side wrapper"
-assert_runs "--help"   "bash '$SCRIPT' --help"   "host-side wrapper"
-assert_runs "-h"       "bash '$SCRIPT' -h"       "host-side wrapper"
+assert_runs "help"     "bash '$SCRIPT' help"     "simple CLI for the Lucebox inference engine"
+assert_runs "--help"   "bash '$SCRIPT' --help"   "simple CLI for the Lucebox inference engine"
+assert_runs "-h"       "bash '$SCRIPT' -h"       "simple CLI for the Lucebox inference engine"
+assert_runs "no args (non-interactive help)" \
+    "bash '$SCRIPT' </dev/null" "simple CLI for the Lucebox inference engine"
+assert_runs "interactive menu renders and quits" \
+    "printf 'q\\n' | LUCEBOX_NO_CLEAR=1 bash '$SCRIPT' menu" \
+    "local inference, made simple"
 assert_runs "version"  "bash '$SCRIPT' version"  ""
 assert_runs "--version" "bash '$SCRIPT' --version" ""
 
@@ -220,6 +225,65 @@ assert_no_set_u_leak "logs dispatch (no set -u leak)" "$SCRIPT" logs -n 0 --no-p
 # we'd be testing the image's entrypoint, not the wrapper. `pull` just
 # execs `docker pull`, so we still smoke its host-side dispatch.
 assert_no_set_u_leak "pull dispatch (no set -u leak)" "$SCRIPT" pull
+
+# Native contributor build: mock cmake so this verifies backend selection,
+# repository discovery, and argv construction without compiling GPU code.
+native_tmp=$(mktemp -d "${TMPDIR:-/tmp}/lucebox-native-build.XXXXXX")
+mkdir -p "$native_tmp/bin"
+cat > "$native_tmp/bin/cmake" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${LUCEBOX_TEST_CMAKE_LOG:?}"
+STUB
+chmod +x "$native_tmp/bin/cmake"
+native_log="$native_tmp/cmake.log"
+native_out=""
+native_rc=0
+native_out=$(
+    PATH="$native_tmp/bin:$PATH" \
+    LUCEBOX_TEST_CMAKE_LOG="$native_log" \
+    LUCEBOX_REPO="$ROOT" \
+    LUCEBOX_BUILD_DIR="$native_tmp/build" \
+    LUCEBOX_VARIANT=cuda12 \
+    _LUCEBOX_HOST_PROBED=1 \
+    LUCEBOX_HOST_HAS_NVIDIA_GPU=1 \
+    LUCEBOX_HOST_GPU_SM=86 \
+    LUCEBOX_HOST_NPROC=2 \
+    bash "$SCRIPT" build cuda 2>&1
+) || native_rc=$?
+if [ "$native_rc" -ne 0 ]; then
+    report fail "native CUDA build dispatch" "exit=$native_rc output=$(head -3 <<<"$native_out")"
+elif ! grep -qF -- "-DDFLASH27B_GPU_BACKEND=cuda" "$native_log" \
+     || ! grep -qF -- "-DCMAKE_CUDA_ARCHITECTURES=86" "$native_log" \
+     || ! grep -qF -- "--target dflash_server -j 2" "$native_log"; then
+    report fail "native CUDA build dispatch" "unexpected cmake argv: $(tr '\n' ' ' < "$native_log")"
+else
+    report ok "native CUDA build dispatch"
+fi
+
+: > "$native_log"
+native_rc=0
+native_out=$(
+    PATH="$native_tmp/bin:$PATH" \
+    LUCEBOX_TEST_CMAKE_LOG="$native_log" \
+    LUCEBOX_REPO="$ROOT" \
+    LUCEBOX_BUILD_DIR="$native_tmp/build-hip" \
+    LUCEBOX_VARIANT=rocm \
+    _LUCEBOX_HOST_PROBED=1 \
+    LUCEBOX_HOST_HAS_NVIDIA_GPU=0 \
+    LUCEBOX_HOST_HAS_AMD_GPU=1 \
+    LUCEBOX_HOST_AMD_GPU_ARCH=gfx1201 \
+    LUCEBOX_HOST_NPROC=2 \
+    bash "$SCRIPT" build rocm 2>&1
+) || native_rc=$?
+if [ "$native_rc" -ne 0 ]; then
+    report fail "native ROCm build dispatch" "exit=$native_rc output=$(head -3 <<<"$native_out")"
+elif ! grep -qF -- "-DDFLASH27B_GPU_BACKEND=hip" "$native_log" \
+     || ! grep -qF -- "-DDFLASH27B_HIP_ARCHITECTURES=gfx1201" "$native_log"; then
+    report fail "native ROCm build dispatch" "unexpected cmake argv: $(tr '\n' ' ' < "$native_log")"
+else
+    report ok "native ROCm build dispatch"
+fi
+rm -rf "$native_tmp"
 
 # ── 7. Unknown subcommand → cmd_in_container fallback path. Same rule:
 # clean error, no raw bash leak.
@@ -797,6 +861,7 @@ test_image_base_derives_from_install_url() {
     local label="$1" url expected got
     for case in \
         "https://raw.githubusercontent.com/easel/lucebox-hub/feat/lucebox-docker/lucebox.sh|ghcr.io/easel/lucebox-hub" \
+        "https://raw.githubusercontent.com/Luce-Org/lucebox/main/lucebox.sh|ghcr.io/luce-org/lucebox-hub" \
         "https://raw.githubusercontent.com/Luce-Org/lucebox-hub/main/lucebox.sh|ghcr.io/luce-org/lucebox-hub" \
         "https://raw.githubusercontent.com/easel/lucebox-hub/601ab52/lucebox.sh|ghcr.io/easel/lucebox-hub" \
         "https://example.com/bogus|ghcr.io/luce-org/lucebox-hub"
@@ -817,7 +882,7 @@ test_image_base_derives_from_install_url() {
     done
     report ok "$label"
 }
-test_image_base_derives_from_install_url "IMAGE_BASE derived from LUCEBOX_INSTALLED_FROM (4 URL shapes)"
+test_image_base_derives_from_install_url "IMAGE_BASE derived from LUCEBOX_INSTALLED_FROM (5 URL shapes)"
 
 # ── config.toml reader + resolver ─────────────────────────────────────────
 # Drive _lucebox_config_get + _lucebox_resolve against a fixture

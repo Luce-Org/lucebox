@@ -101,6 +101,35 @@ Reference target: **RTX 3090 (Ampere sm_86)** — all headline numbers. Other NV
 
 `server/` (DFlash) builds with CMake 3.18+ and vendors the required `ggml` sources directly; only `Block-Sparse-Attention` remains a git submodule. No PyTorch is needed for `server/`. `optimizations/megakernel/` is the only component requiring PyTorch 2.0+ (CUDAExtension links against torch C++ libs). Power-tune: `sudo nvidia-smi -pl 220` (3090 sweet spot, re-sweep for other cards).
 
+## Lucebox CLI
+
+The easiest path for both Lucebox buyers and open-source users is one command:
+
+```bash
+# Buyers receive this preinstalled. Other users install the small host wrapper:
+curl -fsSL https://raw.githubusercontent.com/Luce-Org/lucebox/main/install.sh | bash
+
+lucebox
+```
+
+`lucebox` opens the branded menu. **Quick setup** detects NVIDIA CUDA or AMD
+ROCm, lets you choose and download a model, applies safe hardware-aware
+optimizations, and starts the inference service. Wi-Fi and device provisioning
+are intentionally outside this inference-only CLI.
+
+Contributors can open the same menu from a repository checkout with
+`./lucebox.sh`. Its **Developer tools** can build and run the native C++ engine
+or launch Claude Code, Codex, OpenCode, Hermes, Pi, OpenClaw, and Open WebUI
+harnesses. Every menu action also has a scriptable command, for example:
+
+```bash
+lucebox models select
+lucebox optimize --yes
+lucebox start
+./lucebox.sh build cuda
+./lucebox.sh native cuda
+```
+
 ## Quick Start On Harnesses
 
 [`harness/`](harness/) contains RTX 3090 client launchers and regression tests

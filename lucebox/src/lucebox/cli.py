@@ -4,8 +4,10 @@ Layout follows the host wrapper's dispatch table. Anything `lucebox`
 doesn't intercept (everything outside the systemd surface) ends up here.
 
 Subcommand inventory:
+    (no command)           — branded interactive menu
     check                  — readiness report
     config get/set/unset   — read / write a single key in config.toml
+    optimize               — apply the recommended hardware profile
     pull                   — docker pull the selected CUDA or ROCm image
     print-run              — emit the docker-run command for the server
     print-serve-argv       — same, raw argv lines (consumed by `lucebox serve`)
@@ -23,6 +25,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
+import lucebox.autotune as autotune_mod
 import lucebox.config as config_mod
 import lucebox.docker_run as docker_run
 import lucebox.download as download_mod
@@ -35,7 +38,7 @@ from lucebox.types import Config
 app = typer.Typer(
     name="lucebox",
     help="Host CLI for the lucebox-hub container. Invoked by lucebox.sh.",
-    no_args_is_help=True,
+    no_args_is_help=False,
     invoke_without_command=True,
     add_completion=False,
 )
@@ -45,6 +48,7 @@ error_console = Console(stderr=True)
 
 @app.callback()
 def root_options(
+    ctx: typer.Context,
     version_flag: Annotated[
         bool,
         typer.Option("--version", help="Print lucebox version and exit.", is_eager=True),
@@ -54,9 +58,30 @@ def root_options(
     if version_flag:
         print(__version__)
         raise typer.Exit()
+    if ctx.invoked_subcommand is None:
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            _package_menu()
+        else:
+            _print_logo()
+            console.print(ctx.get_help())
+        raise typer.Exit()
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
+
+
+_LOGO = r"""
+     · ╱
+  ·──✦──·  █    █ █ ▄▀▀ █▀▀  █▀▀▄ ▄▀▀▄ █ █
+    ╱ ·    █  █ █ █   █▀▀   █▀▀▄ █  █  █
+   ·        ▀▀  ▀▀  ▀▀ ▀▀▀  ▀▀▀  ▀▀  ▀ ▀
+""".strip("\n")
+
+
+def _print_logo() -> None:
+    """Render the compact Lucebox mark used by both interactive surfaces."""
+    console.print(f"[bold gold1]{_LOGO}[/bold gold1]")
+    console.print("[dim]             local inference, made simple[/dim]\n")
 
 
 def _load_or_build() -> Config:
@@ -88,6 +113,43 @@ def _server_spec() -> docker_run.DockerRunSpec:
     except (OSError, RuntimeError, ValueError) as exc:
         error_console.print(f"[red]Cannot build server command:[/red] {escape(str(exc))}")
         raise typer.Exit(code=2) from exc
+
+
+def _package_menu() -> None:
+    """Small in-package menu for direct installs and contributor workflows.
+
+    Service lifecycle remains host-owned by ``lucebox.sh``. This menu covers
+    the package's own responsibilities and makes a direct ``python -m lucebox``
+    invocation useful instead of dropping users into a wall of help text.
+    """
+    while True:
+        _print_logo()
+        cfg = _load_or_build()
+        active = cfg.model.preset or "not selected"
+        console.print(f"Model:        [bold]{escape(active)}[/bold]")
+        console.print("Optimization: [bold]Automatic[/bold] (safe defaults for this GPU)\n")
+        console.print("  [bold cyan]1[/bold cyan]  Choose or download a model")
+        console.print("  [bold cyan]2[/bold cyan]  Apply automatic optimization")
+        console.print("  [bold cyan]3[/bold cyan]  Show configuration")
+        console.print("  [bold cyan]4[/bold cyan]  Show Docker launch command")
+        console.print("  [bold cyan]q[/bold cyan]  Quit")
+        try:
+            choice = typer.prompt("\nChoose", default="1").strip().lower()
+        except (EOFError, typer.Abort):
+            return
+        if choice in {"q", "quit", "exit"}:
+            return
+        if choice == "1":
+            models_select()
+        elif choice == "2":
+            optimize()
+        elif choice == "3":
+            config_get_cmd()
+        elif choice == "4":
+            print_run()
+        else:
+            console.print("[yellow]Choose 1–4 or q.[/yellow]")
+        console.print()
 
 
 # ── subcommands ────────────────────────────────────────────────────────────
@@ -223,6 +285,27 @@ def _print_installed_presets() -> None:
     console.print(f"[dim]Total disk usage: {total:.1f} GB[/dim]")
 
 
+def _activate_preset(cfg: Config, preset: download_mod.ModelPreset) -> None:
+    """Persist one selected preset and seed first-run tuning."""
+    config_set("model.preset", preset.name)
+    config_set("model.target_file", preset.target_file)
+    if preset.has_draft and preset.draft_file:
+        config_set("model.draft_file", preset.draft_file)
+    else:
+        # Drop any stale draft_file from a previous activation; the selected
+        # preset is explicitly target-only.
+        config_unset("model.draft_file")
+    console.print(f"[green]Activated:[/green] model.preset = {preset.name}")
+    # Never clobber a user-edited [dflash] section. Explicit profile resets
+    # go through `lucebox optimize` instead.
+    if config_mod.seed_dflash_from_host(cfg.host):
+        max_ctx = config_get("dflash.max_ctx")["dflash.max_ctx"][0]
+        console.print(
+            f"[green]Auto-tuned:[/green] VRAM-tier DFLASH_* defaults "
+            f"(max_ctx={max_ctx}) written to config.toml"
+        )
+
+
 @models_app.callback(invoke_without_command=True)
 def models_default(ctx: typer.Context) -> None:
     """Default action: list installed presets, mark active with `*`."""
@@ -248,6 +331,82 @@ def models_list() -> None:
         size_text = f"{size:.1f}" if size > 0 else f"~{pres.approx_total_gb}*"
         table.add_row(f"{marker}{name}", status, size_text, pres.description or "")
     console.print(table)
+
+
+@models_app.command("select")
+def models_select(
+    preset: Annotated[
+        str,
+        typer.Argument(help="Preset name (omit for a numbered menu)."),
+    ] = "",
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Download and activate without confirmation."),
+    ] = False,
+) -> None:
+    """Choose, download, and activate a model in one guided step."""
+    cfg = _load_or_build()
+    if not preset:
+        names = sorted(download_mod.PRESETS)
+        recommended = download_mod.recommend_preset(cfg.host)
+        default_name = cfg.model.preset or recommended or names[0]
+        default_index = names.index(default_name) + 1 if default_name in names else 1
+
+        table = Table(title="Choose a model", show_lines=False)
+        table.add_column("#", justify="right", style="cyan")
+        table.add_column("model")
+        table.add_column("download")
+        table.add_column("status")
+        table.add_column("notes")
+        for index, name in enumerate(names, start=1):
+            candidate = download_mod.PRESETS[name]
+            labels: list[str] = []
+            if name == cfg.model.preset:
+                labels.append("active")
+            if name == recommended:
+                labels.append("recommended")
+            table.add_row(
+                str(index),
+                name,
+                f"~{candidate.approx_total_gb} GB",
+                download_mod.installed_status(cfg, candidate),
+                ", ".join(labels) or candidate.description,
+            )
+        console.print(table)
+        try:
+            answer = typer.prompt(
+                "Model number or name",
+                default=str(default_index),
+            ).strip()
+        except (EOFError, typer.Abort):
+            console.print("[dim]No model changed.[/dim]")
+            return
+        if answer.isdigit() and 1 <= int(answer) <= len(names):
+            preset = names[int(answer) - 1]
+        else:
+            preset = answer
+
+    try:
+        selected = download_mod.resolve_preset(preset)
+    except KeyError as exc:
+        error_console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    state = download_mod.installed_status(cfg, selected)
+    if state == "installed":
+        # Selection must work on a preloaded buyer appliance even when it is
+        # offline. Do not query Hugging Face merely to activate files that are
+        # already present locally.
+        _activate_preset(cfg, selected)
+        return
+    if state != "installed" and not yes:
+        if not typer.confirm(
+            f"Download about {selected.approx_total_gb} GB and activate {selected.name}?",
+            default=True,
+        ):
+            console.print("[dim]No model changed.[/dim]")
+            return
+    models_download(selected.name, activate=True)
 
 
 @models_app.command("download")
@@ -317,26 +476,37 @@ def models_download(
         console.print("[green]Done.[/green]")
 
     if activate:
-        config_set("model.preset", preset)
-        if pres.target_file:
-            config_set("model.target_file", pres.target_file)
-        if pres.has_draft and pres.draft_file:
-            config_set("model.draft_file", pres.draft_file)
-        else:
-            # Drop any stale draft_file from a previous activation; the
-            # active preset has no draft.
-            config_unset("model.draft_file")
-        console.print(f"[green]Activated:[/green] model.preset = {preset}")
-        # First-time setup: bake the VRAM-tier DFLASH_* heuristic into
-        # config.toml so `lucebox serve` is auto-tuned to this host instead
-        # of falling back to the conservative class defaults. Never clobbers
-        # an existing [dflash] section.
-        if config_mod.seed_dflash_from_host(cfg.host):
-            max_ctx = config_get("dflash.max_ctx")["dflash.max_ctx"][0]
-            console.print(
-                f"[green]Auto-tuned:[/green] VRAM-tier DFLASH_* defaults "
-                f"(max_ctx={max_ctx}) written to config.toml"
-            )
+        _activate_preset(cfg, pres)
+
+
+@app.command()
+def optimize(
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Apply without confirmation."),
+    ] = False,
+) -> None:
+    """Apply the recommended hardware-aware inference profile.
+
+    Stable CUDA/ROCm fast paths remain enabled by the engine itself. This
+    profile selects a safe context size, cache format, and DFlash budget from
+    detected VRAM while leaving experimental features off.
+    """
+    cfg = _load_or_build()
+    recommended = autotune_mod.runtime_from_host(cfg.host)
+    console.print("[bold]Automatic optimization (recommended)[/bold]")
+    console.print("  DFlash decode       automatic when the model has a matching draft")
+    console.print("  GPU fast paths      enabled by the engine on CUDA and ROCm")
+    console.print(f"  Maximum context     {recommended.max_ctx:,} tokens")
+    cache = recommended.cache_type_k or "model default"
+    console.print(f"  KV cache            {cache}")
+    console.print("  Experimental paths  off")
+    if not yes and not typer.confirm("Apply this profile?", default=True):
+        console.print("[dim]Optimization unchanged.[/dim]")
+        return
+    config_mod.seed_dflash_from_host(cfg.host, force=True)
+    console.print("[green]Automatic optimization applied.[/green]")
+    console.print("[dim]Advanced users can still use `lucebox config set dflash.KEY=VALUE`.[/dim]")
 
 
 @app.command()

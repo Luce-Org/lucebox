@@ -610,7 +610,11 @@ if [ "$DFLASH_PREFILL_MODE" != "off" ]; then
           --prefill-drafter "$DFLASH_PREFILL_DRAFTER")
 fi
 
-info "lucebox-hub container starting (target=$(basename "$DFLASH_TARGET"), max_ctx=$DFLASH_MAX_CTX, budget=$DFLASH_BUDGET, lazy=$DFLASH_LAZY)"
+if [ "${LUCEBOX_NATIVE:-0}" = "1" ]; then
+    info "lucebox native server starting (target=$(basename "$DFLASH_TARGET"), max_ctx=$DFLASH_MAX_CTX, budget=$DFLASH_BUDGET, lazy=$DFLASH_LAZY)"
+else
+    info "lucebox-hub container starting (target=$(basename "$DFLASH_TARGET"), max_ctx=$DFLASH_MAX_CTX, budget=$DFLASH_BUDGET, lazy=$DFLASH_LAZY)"
+fi
 
 cd "$DFLASH_DIR"
 exec "${CMD[@]}"
