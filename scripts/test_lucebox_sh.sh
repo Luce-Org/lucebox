@@ -187,6 +187,20 @@ else report fail "bash -n entrypoint.sh"; fi
 if bash -n "$HARNESS_COMMON"; then report ok "bash -n harness common.sh parses cleanly"
 else report fail "bash -n harness common.sh"; fi
 
+# The CMake unit-test target runs a post-link discovery helper. Dockerfiles
+# copy build inputs selectively for cache efficiency, so omitting server/cmake
+# does not fail until the final link has already spent several minutes. Keep
+# the CUDA and ROCm build contexts aligned with that CMake contract.
+for dockerfile in Dockerfile Dockerfile.rocm; do
+    if [ -f "$ROOT/server/cmake/DiscoverCppUnitTests.cmake" ] \
+       && grep -Eq '^COPY[[:space:]]+server/cmake([[:space:]]|/)' "$ROOT/$dockerfile"; then
+        report ok "$dockerfile includes CMake discovery helpers"
+    else
+        report fail "$dockerfile includes CMake discovery helpers" \
+            "server/cmake/DiscoverCppUnitTests.cmake would be missing from the image build context"
+    fi
+done
+
 # ── 3. Trivial subcommands (zero-exit expected) ───────────────────────────
 assert_runs "help"     "bash '$SCRIPT' help"     "simple CLI for the Lucebox inference engine"
 assert_runs "--help"   "bash '$SCRIPT' --help"   "simple CLI for the Lucebox inference engine"
