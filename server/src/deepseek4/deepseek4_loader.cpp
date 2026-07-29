@@ -48,10 +48,10 @@ extern "C" void ggml_cuda_rocmfp2_mix_register_host(
         const void * base, size_t nb02, int n_experts, int out, int in,
         const void * codebooks_bf16_host, const uint8_t * modes_host,
         const uint8_t * rotations_host);
-extern "C" void ggml_cuda_rocmfp2_mix_unregister(const void * base);
-// Remove a qtype-105 tensor's registry entry and free its device side-data.
+// Remove a qtype-105/106 tensor's registry entry and free its device side-data.
 // Called from free_deepseek4_weights before the GPU buffer is released so
 // stale base-pointer ranges can't survive an unload/reload.
+extern "C" void ggml_cuda_rocmfp2_mix_unregister(const void * base);
 extern "C" void ggml_cuda_rocmfp3_mix_unregister(const void * base);
 
 #if !defined(_WIN32)
@@ -1521,6 +1521,19 @@ void free_deepseek4_weights(DeepSeek4Weights & w) {
         ggml_tensor * dt = L.ffn_down_exps;
         if (dt && dt->type == GGML_TYPE_Q3_1_ROCMFP3_MIX && dt->data) {
             ggml_cuda_rocmfp3_mix_unregister(dt->data);
+        }
+    }
+    // Same contract for qtype-106 gate/up, and it needs both halves: the gumix
+    // sidecar registers the SPLIT form, one entry per tensor, and each entry owns
+    // its own device copy of the (shared) codebooks — duplicated deliberately so
+    // that unregister can free per entry without double-freeing. Dropping only one
+    // half would still leak the other's codebooks and leave a stale range behind.
+    for (auto & L : w.layers) {
+        ggml_tensor * const gu[2] = { L.ffn_gate_exps, L.ffn_up_exps };
+        for (ggml_tensor * t : gu) {
+            if (t && t->type == GGML_TYPE_Q2_1_ROCMFP2_MIX && t->data) {
+                ggml_cuda_rocmfp2_mix_unregister(t->data);
+            }
         }
     }
     if (w.ctx) { ggml_free(w.ctx); w.ctx = nullptr; }
