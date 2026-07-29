@@ -21,15 +21,16 @@ the PR itself changed.  A contract-change PR therefore runs the old approved
 contract as the gate and reports its proposed new contract separately until
 formal CODEOWNERS approve promotion.
 
-The current entries are a lossless migration of the two prefix-cache capsules:
+The current entries cover two complementary prefix-cache capsules:
 
 - `prefix-cache-inline` maps to the existing prepare/confirm/lookup harness.
-- `prefix-cache-abort-hole` maps to the existing native ESBMC function
-  contract around `select_inline_free_slot`.
+- `prefix-cache-abort-hole` exhaustively checks the bounded scalar free-slot
+  selector, then runs the immutable base regression against the exact head to
+  guard the real `prepare`/`abort`/`prepare` integration point.
 
 The templates intentionally call production code; they are not duplicate
-implementations.  The legacy harnesses and `formal/manifest.toml` remain
-unchanged until the planner and verifier dual-run has established equivalence.
+implementations.  The legacy harness runs the same transition during the
+planner/verifier dual-run so comparison remains meaningful.
 
 `[[critical_paths]]` lists the cache, snapshot, streaming, and tool-hint state
 machines.  A changed path in one of those areas that matches no approved target

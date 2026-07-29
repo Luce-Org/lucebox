@@ -1,0 +1,24 @@
+diff --git a/server/src/server/prefix_cache_state.h b/server/src/server/prefix_cache_state.h
+--- a/server/src/server/prefix_cache_state.h
++++ b/server/src/server/prefix_cache_state.h
+@@ -186,17 +186,8 @@ public:
+             result.victim_len =
+                 (int)entries_[(size_t)victim].ids.size();
+             result.oldest_len = (int)entries_.front().ids.size();
+         } else {
+-            uint64_t occupied_slots = 0;
+-            if (capacity_ <= 64) {
+-                for (const auto & entry : entries_) {
+-                    if (entry.slot >= 0 && entry.slot < 64) {
+-                        occupied_slots |= uint64_t{1} << entry.slot;
+-                    }
+-                }
+-            }
+-            result.slot = select_inline_free_slot(
+-                next_slot_, capacity_, occupied_slots);
+-            next_slot_ = (result.slot + 1) % capacity_;
++            result.slot = next_slot_;
++            next_slot_ = (next_slot_ + 1) % capacity_;
+             has_pending_evict_ = false;
+         }
+         return result;

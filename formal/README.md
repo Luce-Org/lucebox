@@ -46,11 +46,11 @@ symbolic cache capacity, branch, and prefix depth. Its precise guarantees and
 exclusions are in
 [`prefix_cache/PROPERTIES.md`](prefix_cache/PROPERTIES.md).
 
-`prefix-cache-abort-hole` enforces a native ESBMC function contract for every
-bounded cursor and occupancy pattern against the production free-slot selector.
-It was added from a current regression in which an aborted reservation left a
-free slot, but the next reservation selected and invalidated a still-committed
-snapshot. Its contract is in
+The abort-hole capsule formally checks the scalar free-slot selector. Its
+deterministic plan then compiles and runs the immutable base regression against
+the exact head, covering the production prepare/confirm/prepare/abort/prepare
+sequence. This catches both a broken selector and a `prepare` call site that
+bypasses a correct selector. The formal and native guarantees are separated in
 [`prefix_cache/ABORT_HOLE_PROPERTIES.md`](prefix_cache/ABORT_HOLE_PROPERTIES.md).
 
 The dependency-free native test covers the wider transition matrix:
@@ -68,10 +68,14 @@ Docker will pull the immutable verifier declared in
 ./scripts/formal.sh --nightly
 ./scripts/formal.sh --base-sha origin/main
 ./scripts/formal.sh --all --legacy
+./scripts/formal_mutation_test.sh
 ```
 
 Set `LUCEBOX_FORMAL_IMAGE` only when deliberately testing a new companion image.
 Results are written to `.formal-results/`.
+The mutation test recreates the historical `prepare` call-site bypass in a
+temporary standalone clone and requires the base-approved regression to reject
+it while the scalar selector contract remains green.
 
 ## Adding an approved contract
 

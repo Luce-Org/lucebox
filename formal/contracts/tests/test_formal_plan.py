@@ -56,8 +56,11 @@ class FormalPlanTest(unittest.TestCase):
             self.assertEqual(target["pr_esbmc_args"], capsule["esbmc_args"])
             self.assertEqual(target["nightly_esbmc_args"], capsule["esbmc_args"])
             self.assertEqual(target["mutable_paths"], capsule["mutable_paths"])
-            self.assertEqual(target["native_test"], capsule["native_test"])
-            self.assertEqual(target["native_test_source"], capsule["native_test_source"])
+            self.assertEqual(target.get("native_test"), capsule.get("native_test"))
+            self.assertEqual(
+                target.get("native_test_source"),
+                capsule.get("native_test_source"),
+            )
 
     def test_uncovered_critical_path_is_advisory_gap(self) -> None:
         plan = self.plan_fixture("uncovered-streaming-change.json")

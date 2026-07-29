@@ -9,7 +9,7 @@
 using dflash::common::select_inline_free_slot;
 
 static_assert(
-    LUCEBOX_FORMAL_MAX_CAP > 0 && LUCEBOX_FORMAL_MAX_CAP <= 64);
+    LUCEBOX_FORMAL_MAX_CAP > 0 && LUCEBOX_FORMAL_MAX_CAP < 64);
 
 int verify_select_inline_free_slot_contract(
         int next_slot, int capacity, uint64_t occupied_slots) {

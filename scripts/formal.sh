@@ -63,7 +63,9 @@ container_common=(
     --memory 6g
     --cpus 2
     --user "$(id -u):$(id -g)"
-    --tmpfs /tmp:rw,nosuid,nodev,size=512m
+    # The plan verifier compiles the immutable base-native regression here and
+    # executes it against the read-only head workspace.
+    --tmpfs /tmp:rw,exec,nosuid,nodev,size=512m
     --volume "$repo_root:/workspace:ro"
     --workdir /workspace
 )

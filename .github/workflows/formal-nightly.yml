@@ -27,19 +27,25 @@ jobs:
         name: Generate extended base-approved plan
         continue-on-error: true
         env:
-          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:dc25f2eea3fda4ea18b94a5539430d4598f6c833417186b536b7cab036c820ab
+          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:cb38011acd8dbe5aeb702b6ba981607cf81656667d79461fc74e66d552cabd07
+          REPAIR_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:8abd1ce59aea9df95bcb2d73ce77238ed009ceaddf7f69dac68b9937e37e50ce
           REVISION: ${{ github.sha }}
         run: |
-          policy_image="$(
+          readarray -t policy_images < <(
             git show "$REVISION:formal/contracts/registry.toml" |
               python3 -c '
           import sys
           import tomllib
-          print(tomllib.loads(sys.stdin.read())["toolchain"]["verifier_image"])
+          toolchain = tomllib.loads(sys.stdin.read())["toolchain"]
+          print(toolchain["verifier_image"])
+          print(toolchain["repair_image"])
           '
-          )"
-          if [[ "$policy_image" != "$VERIFIER_IMAGE" ]]; then
-            echo "Nightly image does not match trusted policy." >&2
+          )
+          if [[ "${#policy_images[@]}" -ne 2 ]] ||
+             [[ "${policy_images[0]}" != "$VERIFIER_IMAGE" ]] ||
+             [[ "${policy_images[1]}" != "$REPAIR_IMAGE" ]];
+          then
+            echo "Nightly images do not match trusted policy." >&2
             exit 13
           fi
           mkdir -p .formal-plan
@@ -69,7 +75,7 @@ jobs:
         if: steps.plan.outcome == 'success'
         continue-on-error: true
         env:
-          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:dc25f2eea3fda4ea18b94a5539430d4598f6c833417186b536b7cab036c820ab
+          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:cb38011acd8dbe5aeb702b6ba981607cf81656667d79461fc74e66d552cabd07
         run: |
           mkdir -p .formal-results
           docker run --rm \
@@ -81,7 +87,7 @@ jobs:
             --memory 6g \
             --cpus 2 \
             --user "$(id -u):$(id -g)" \
-            --tmpfs /tmp:rw,nosuid,nodev,size=512m \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=512m \
             --volume "$GITHUB_WORKSPACE:/workspace:ro" \
             --volume "$GITHUB_WORKSPACE/.formal-plan:/plan:ro" \
             --volume "$GITHUB_WORKSPACE/.formal-results:/results:rw" \
@@ -96,7 +102,7 @@ jobs:
         name: Run legacy nightly capsules for comparison
         continue-on-error: true
         env:
-          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:dc25f2eea3fda4ea18b94a5539430d4598f6c833417186b536b7cab036c820ab
+          VERIFIER_IMAGE: ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:cb38011acd8dbe5aeb702b6ba981607cf81656667d79461fc74e66d552cabd07
         run: |
           mkdir -p .formal-legacy-results
           docker run --rm \
@@ -146,3 +152,17 @@ jobs:
           steps.plan.outcome != 'success' ||
           steps.formal.outcome != 'success'
         run: exit 1
+
+  mutation-sensitivity:
+    name: mutation-sensitivity
+    needs: verify-nightly
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require the historical call-site regression to fail
+        run: scripts/formal_mutation_test.sh

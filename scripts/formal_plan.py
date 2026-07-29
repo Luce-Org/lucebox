@@ -44,8 +44,6 @@ TARGET_REQUIRED_FIELDS = {
     "nightly_esbmc_args",
     "mutable_paths",
     "contract_paths",
-    "native_test",
-    "native_test_source",
 }
 
 
@@ -127,7 +125,7 @@ def load_registry(registry_path: Path, root: Path) -> dict[str, Any]:
         target_ids.add(target_id)
         if target["policy"] not in POLICIES:
             raise RegistryError(f"{target_id}: unsupported policy {target['policy']!r}")
-        for field in ("description", "symbol", "signature", "entry_function", "native_test"):
+        for field in ("description", "symbol", "signature", "entry_function"):
             if not isinstance(target[field], str) or not target[field]:
                 raise RegistryError(f"{target_id}: {field} must be a non-empty string")
         if not isinstance(target["timeout_seconds"], int) or not 0 < target["timeout_seconds"] <= 3600:
@@ -138,13 +136,27 @@ def load_registry(registry_path: Path, root: Path) -> dict[str, Any]:
             "include_dirs",
             "mutable_paths",
             "contract_paths",
-            "native_test_source",
         ):
-            target[field] = _repo_paths(
-                [target[field]] if field == "native_test_source" else target[field],
-                f"{target_id}.{field}",
+            target[field] = _repo_paths(target[field], f"{target_id}.{field}")
+        native_test = target.get("native_test")
+        native_source = target.get("native_test_source")
+        if (native_test is None) != (native_source is None):
+            raise RegistryError(
+                f"{target_id}: native_test and native_test_source must be declared together"
             )
-        target["native_test_source"] = target["native_test_source"][0]
+        if native_test is not None:
+            if not isinstance(native_test, str) or not native_test:
+                raise RegistryError(f"{target_id}: native_test must be a non-empty string")
+            native_source = _repo_path(
+                native_source,
+                f"{target_id}.native_test_source",
+            )
+            if native_source not in target["contract_paths"]:
+                raise RegistryError(
+                    f"{target_id}: contract_paths must include native_test_source"
+                )
+        target["native_test"] = native_test
+        target["native_test_source"] = native_source
         for field in (
             "pr_defines",
             "nightly_defines",

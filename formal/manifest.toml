@@ -3,8 +3,8 @@ schema_version = 1
 [toolchain]
 esbmc_version = "8.4"
 esbmc_linux_sha256 = "68bb71128e0c3c2db090955e7a302533a8a11a9d898df7f169c22311a0ec5078"
-verifier_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:dc25f2eea3fda4ea18b94a5539430d4598f6c833417186b536b7cab036c820ab"
-repair_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:ab36822157cc26ec59e160b96f2a38f63cfcafee895eb2d7d7fc3077f309d36b"
+verifier_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-verifier@sha256:cb38011acd8dbe5aeb702b6ba981607cf81656667d79461fc74e66d552cabd07"
+repair_image = "ghcr.io/dusterbloom/lucebox-esbmc-ai-repair@sha256:8abd1ce59aea9df95bcb2d73ce77238ed009ceaddf7f69dac68b9937e37e50ce"
 
 [[capsules]]
 id = "prefix-cache-inline"
@@ -42,8 +42,6 @@ contract_paths = [
   "formal/prefix_cache/PROPERTIES.md",
   "server/test/test_prefix_cache_state.cpp",
 ]
-native_test = "test_prefix_cache_state"
-native_test_source = "server/test/test_prefix_cache_state.cpp"
 
 [[capsules]]
 id = "prefix-cache-abort-hole"

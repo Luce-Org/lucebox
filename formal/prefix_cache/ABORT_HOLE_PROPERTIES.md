@@ -1,33 +1,32 @@
-# Inline prefix-cache abort-hole allocation capsule
+# Inline prefix-cache abort-hole allocation contract
 
-This capsule enforces a native ESBMC function contract around the scalar
-slot-selection decision used by the production
-`InlinePrefixCacheState::prepare` transition. The contract wrapper delegates
-directly to `select_inline_free_slot`; it does not reimplement the allocation
-algorithm.
+The capsule enforces a native ESBMC function contract around the scalar
+`select_inline_free_slot` helper for every bounded cursor and occupancy
+pattern. The deterministic plan also compiles and runs an immutable
+base-revision regression against the exact PR head. That regression drives the
+production `InlinePrefixCacheState` through the historical defect sequence:
+commit slot zero, reserve and abort slot one, then call `prepare` again while
+the round-robin cursor points at occupied slot zero.
 
 ## Checked properties
 
-- Selection returns a slot in the configured capacity.
-- When the cache is below capacity, selection never returns a slot owned by a
-  committed entry.
-- The selection works for every round-robin cursor and occupancy pattern in
-  the bounded domain.
-- The selector has an empty `__ESBMC_assigns` frame and therefore cannot mutate
-  program state.
+- Scalar selection returns an in-range, unoccupied slot whenever one exists.
+- The scalar selector cannot mutate program state.
 - ESBMC's default pointer and bounds checks plus integer overflow checks remain
   enabled.
 
+The paired native regression checks that aborting preserves every committed
+entry and the replacement `prepare` call reuses the aborted slot. Those
+integration assertions are regression-tested rather than described as
+model-checked properties.
+
 ## Bounded operating envelope
 
-Pull requests cover capacities 1–4 and every occupancy bit pattern in that
-range. Extended runs widen the capacity domain to 1–16. Production
-`PrefixCache` clamps inline capacity to 64 slots; this capsule does not claim
-coverage beyond its declared bound.
-
-The immutable native regression constructs the real serialized transition:
-commit slot zero, reserve and abort slot one, then require the replacement
-reservation to reuse the free slot without invalidating the committed snapshot.
+The formal capsule covers capacities 1–4 in pull requests and 1–16 in extended
+runs. The native regression fixes capacity at two, the smallest state that
+reproduces the production call-site defect. `PrefixCache` clamps inline
+capacity to 64 slots; the formal capsule does not claim coverage beyond its
+declared bound.
 
 On a contract violation, the deterministic lane publishes ESBMC's native,
 self-contained HTML counterexample report alongside the textual trace and
