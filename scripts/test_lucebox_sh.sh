@@ -26,6 +26,7 @@ ROOT="$(git rev-parse --show-toplevel 2>/dev/null || (cd "$(dirname "$0")/.." &&
 SCRIPT="$ROOT/lucebox.sh"
 ENTRYPOINT="$ROOT/server/scripts/entrypoint.sh"
 INSTALLER="$ROOT/install.sh"
+HARNESS_COMMON="$ROOT/harness/clients/common.sh"
 SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 if [ ! -f "$SCRIPT" ]; then
@@ -157,6 +158,7 @@ SHELLCHECK_TARGETS=(
     "$SCRIPT"
     "$ENTRYPOINT"
     "$INSTALLER"
+    "$HARNESS_COMMON"
 )
 # Add every scripts/*.sh except this one (don't recurse into our own tests).
 while IFS= read -r -d '' f; do
@@ -182,6 +184,8 @@ if bash -n "$SCRIPT"; then report ok "bash -n lucebox.sh parses cleanly"
 else report fail "bash -n lucebox.sh"; fi
 if bash -n "$ENTRYPOINT"; then report ok "bash -n entrypoint.sh parses cleanly"
 else report fail "bash -n entrypoint.sh"; fi
+if bash -n "$HARNESS_COMMON"; then report ok "bash -n harness common.sh parses cleanly"
+else report fail "bash -n harness common.sh"; fi
 
 # ── 3. Trivial subcommands (zero-exit expected) ───────────────────────────
 assert_runs "help"     "bash '$SCRIPT' help"     "simple CLI for the Lucebox inference engine"
@@ -591,6 +595,47 @@ test_entrypoint_optimization_flags() {
 }
 test_entrypoint_optimization_flags \
     "entrypoint forwards PFlash, KVFlash, and Spark exactly once"
+
+test_harness_draft_directory_validation() {
+    local label="$1" sandbox target server ambiguous empty out rc out_empty rc_empty
+    sandbox=$(mktemp -d -t lucebox-harness-draft.XXXXXX)
+    target="$sandbox/target.gguf"
+    server="$sandbox/dflash_server"
+    ambiguous="$sandbox/ambiguous"
+    empty="$sandbox/empty"
+    mkdir -p "$ambiguous" "$empty" "$sandbox/work"
+    printf 'target' > "$target"
+    printf 'draft-a' > "$ambiguous/a.gguf"
+    printf 'draft-b' > "$ambiguous/b.safetensors"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$server"
+    chmod +x "$server"
+
+    if out=$(REPO_DIR="$ROOT" CLIENT_WORK_DIR="$sandbox/work" \
+        TARGET="$target" DRAFT="$ambiguous" DFLASH_SERVER_BIN="$server" \
+        bash -c 'source "$1"; start_dflash_native_server' _ "$HARNESS_COMMON" 2>&1); then
+        rc=0
+    else
+        rc=$?
+    fi
+    if out_empty=$(REPO_DIR="$ROOT" CLIENT_WORK_DIR="$sandbox/work" \
+        TARGET="$target" DRAFT="$empty" DFLASH_SERVER_BIN="$server" \
+        bash -c 'source "$1"; start_dflash_native_server' _ "$HARNESS_COMMON" 2>&1); then
+        rc_empty=0
+    else
+        rc_empty=$?
+    fi
+    rm -rf "$sandbox"
+
+    if [ "$rc" -eq 0 ] || [[ "$out" != *"multiple DFlash draft candidates"* ]]; then
+        report fail "$label" "ambiguous directory was accepted: $out"
+    elif [ "$rc_empty" -eq 0 ] || [[ "$out_empty" != *"DFlash draft not found"* ]]; then
+        report fail "$label" "empty directory was accepted: $out_empty"
+    else
+        report ok "$label"
+    fi
+}
+test_harness_draft_directory_validation \
+    "native harness rejects empty or ambiguous draft directories"
 
 test_entrypoint_keeps_family_kv_default() {
     local label="$1" sandbox draft_dir models_dir bin_dir shim_dir out
@@ -1474,12 +1519,12 @@ test_amd_smi_parser() {
     fn=$(awk '/^_parse_amd_smi_csv\(\) \{/,/^\}/' "$SCRIPT")
     out=$(bash -c "$fn"$'\n''_parse_amd_smi_csv' <<'CSV'
 gpu,market_name,vendor_id,vendor_name,subvendor_id,device_id,subsystem_id,rev_id,asic_serial,oam_id,num_compute_units,target_graphics_version,type,vendor,size,bit_width,max_bandwidth
-0,AMD Radeon AI PRO R9700,0x1002,AMD,0xf111,0x7551,0x000a,0xc0,serial,N/A,64,gfx1201,GDDR6,SAMSUNG,32624,256,N/A
-1,AMD Radeon Graphics,0x1002,AMD,0xf111,0x1586,0x000a,0xc1,serial,N/A,40,gfx1151,GDDR7,UNKNOWN,512,256,N/A
+0,AMD Radeon AI PRO R9700,0x1002,AMD,0xf111,0x7551,0x000a,0xc0,0xE099917E6553AFAA,N/A,64,gfx1201,GDDR6,SAMSUNG,32624,256,N/A
+1,AMD Radeon Graphics,0x1002,AMD,0xf111,0x1586,0x000a,0xc1,0x0000000000000000,N/A,40,gfx1151,GDDR7,UNKNOWN,512,256,N/A
 CSV
 )
-    if ! grep -qF '0|AMD Radeon AI PRO R9700|gfx1201|32624' <<<"$out" \
-       || ! grep -qF '1|AMD Radeon Graphics|gfx1151|512' <<<"$out"; then
+    if ! grep -qF '0|AMD Radeon AI PRO R9700|gfx1201|32624|GPU-e099917e6553afaa' <<<"$out" \
+       || ! grep -qF '1|AMD Radeon Graphics|gfx1151|512|1' <<<"$out"; then
         report fail "$label" "unexpected normalized rows: $out"
         return
     fi

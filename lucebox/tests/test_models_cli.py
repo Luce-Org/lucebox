@@ -270,6 +270,8 @@ def test_optimize_advanced_writes_a_custom_profile(
     )
 
     assert result.exit_code == 0
+    assert "KVFlash policy (drafter/qk/lru)" in result.output
+    assert "Your custom profile" in result.output
     loaded = config_mod.load(cfg_path)
     assert loaded is not None
     assert loaded.dflash.speculative_decode is True
@@ -279,9 +281,7 @@ def test_optimize_advanced_writes_a_custom_profile(
     assert config_mod.optimization_mode(path=cfg_path) == "custom"
 
 
-def test_installed_helpers_track_presence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_installed_helpers_track_presence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """``installed_status`` / ``installed_size_gb`` reflect on-disk byte counts."""
     _set_config_path(tmp_path, monkeypatch)
     _stub_host(monkeypatch, vram_gb=24)

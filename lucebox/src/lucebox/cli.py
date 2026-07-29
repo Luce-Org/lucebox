@@ -552,6 +552,32 @@ def _render_optimization_plan(
     )
 
 
+def _render_custom_runtime(runtime: DflashRuntime) -> None:
+    """Show the exact product choices before a custom profile is committed."""
+    console.print("\n[bold]Your custom profile[/bold]")
+    table = Table(show_header=True, box=None, pad_edge=False)
+    table.add_column("Optimization", style="bold")
+    table.add_column("Selected")
+    selections = (
+        ("DFlash", runtime.speculative_decode),
+        ("PFlash", runtime.prefill_mode != "off"),
+        ("KVFlash", runtime.kvflash != "off"),
+        ("Spark", runtime.spark),
+    )
+    for name, enabled in selections:
+        table.add_row(name, "[green]ON[/green]" if enabled else "[dim]off[/dim]")
+    console.print(table)
+    if runtime.cache_type_k == runtime.cache_type_v:
+        cache = runtime.cache_type_k or "model default"
+    else:
+        cache = f"K={runtime.cache_type_k or 'default'}, V={runtime.cache_type_v or 'default'}"
+    console.print(
+        f"Context: [bold]{runtime.max_ctx:,}[/bold] tokens  ·  "
+        f"KV format: [bold]{cache}[/bold]  ·  "
+        f"DFlash budget: [bold]{runtime.budget}[/bold]"
+    )
+
+
 def _ensure_optimizer_drafter(cfg: Config, *, assume_yes: bool = False) -> bool:
     """Offer the one shared scorer asset and degrade cleanly when offline."""
     if download_mod.optimizer_drafter_installed(cfg):
@@ -621,7 +647,11 @@ def _customize_runtime(
                 policy_choices += "/qk/lru"
             else:
                 policy_choices += "/lru"
-            answer = typer.prompt("KVFlash policy", default="drafter").strip().lower()
+            answer = (
+                typer.prompt(f"KVFlash policy ({policy_choices})", default="drafter")
+                .strip()
+                .lower()
+            )
             if answer not in policy_choices.split("/"):
                 fallback_policy = policy_choices.split("/")[0]
                 console.print(f"[yellow]Unknown policy; using {fallback_policy}.[/yellow]")
@@ -715,6 +745,7 @@ def optimize(
 
     if custom:
         runtime = _customize_runtime(cfg, plan)
+        _render_custom_runtime(runtime)
         if not typer.confirm("Apply this custom profile?", default=True):
             console.print("[dim]Optimization unchanged.[/dim]")
             return

@@ -38,8 +38,7 @@ def test_image_variant_round_trips_from_toml(tmp_path: Path) -> None:
 def test_toml_load_uses_strict_bool_and_prefill_casters(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text(
-        '[dflash]\nlazy = "false"\ndebug_thinking_logits = "false"\n'
-        'prefill_mode = "auto"\n'
+        '[dflash]\nlazy = "false"\ndebug_thinking_logits = "false"\nprefill_mode = "auto"\n'
     )
 
     cfg = config._load_toml(path)
@@ -67,9 +66,7 @@ def test_toml_load_rejects_invalid_prefill_mode(tmp_path: Path) -> None:
         ("dflash.think_soft_close_min_ratio", "nan"),
     ],
 )
-def test_config_set_rejects_out_of_range_ratios(
-    tmp_path: Path, key: str, value: str
-) -> None:
+def test_config_set_rejects_out_of_range_ratios(tmp_path: Path, key: str, value: str) -> None:
     path = tmp_path / "config.toml"
 
     with pytest.raises(ValueError, match="interval"):
@@ -80,11 +77,7 @@ def test_config_set_rejects_out_of_range_ratios(
 
 def test_toml_load_rejects_out_of_range_ratios(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
-    path.write_text(
-        "[dflash]\n"
-        "prefill_keep_ratio = 0.05\n"
-        "think_soft_close_min_ratio = 2.0\n"
-    )
+    path.write_text("[dflash]\nprefill_keep_ratio = 0.05\nthink_soft_close_min_ratio = 2.0\n")
 
     with pytest.raises(ValueError, match="think_soft_close_min_ratio"):
         config._load_toml(path)
@@ -97,9 +90,7 @@ def test_toml_load_rejects_out_of_range_ratios(tmp_path: Path) -> None:
         'ctk = "maybe"\n',
     ],
 )
-def test_toml_load_rejects_invalid_host_literals(
-    tmp_path: Path, host_body: str
-) -> None:
+def test_toml_load_rejects_invalid_host_literals(tmp_path: Path, host_body: str) -> None:
     path = tmp_path / "config.toml"
     path.write_text(f"[host]\n{host_body}")
 
@@ -298,8 +289,9 @@ def test_seed_dflash_writes_heuristic_when_absent(tmp_path: Path) -> None:
     assert wrote is True
     loaded = config.load(path)
     assert loaded is not None
-    # 24 GB tier heuristic → 98304, not the 16384 class default.
-    assert loaded.dflash.max_ctx == 98304
+    # A 24 GB WSL host keeps extra virtualization headroom while still
+    # replacing the 16K class default.
+    assert loaded.dflash.max_ctx == 65536
     # Provenance recorded; [model] preserved.
     doc = config.load_doc(path)
     assert doc["autotune"]["source"] == "heuristic"
@@ -362,13 +354,27 @@ def test_optimization_fields_round_trip_and_validate(tmp_path: Path) -> None:
         ("dflash.kvflash_policy", "random"),
         ("dflash.kvflash_tau", "0"),
         ("dflash.spark_vram_gb", "-1"),
+        ("dflash.spark_vram_gb", "nan"),
+        ("dflash.spark_vram_gb", "inf"),
     ],
 )
-def test_config_rejects_invalid_optimization_values(
-    tmp_path: Path, key: str, value: str
-) -> None:
+def test_config_rejects_invalid_optimization_values(tmp_path: Path, key: str, value: str) -> None:
     with pytest.raises(ValueError):
         config_set(key, value, path=tmp_path / "config.toml")
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("prefix_cache_slots", "prefix_cache_slots"),
+        ("prefill_cache_slots", "prefill_cache_slots"),
+    ],
+)
+def test_cache_slot_validation_names_the_invalid_field(field: str, message: str) -> None:
+    from lucebox.types import DflashRuntime
+
+    with pytest.raises(ValueError, match=message):
+        DflashRuntime(**{field: -1})
 
 
 def test_direct_optimization_edit_marks_profile_custom(tmp_path: Path) -> None:

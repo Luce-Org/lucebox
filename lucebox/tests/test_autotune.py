@@ -10,12 +10,10 @@ def test_wsl_24gb_defaults_leave_cuda_headroom() -> None:
     runtime = runtime_from_host(HostFacts(vram_gb=24, is_wsl=True))
 
     assert runtime.budget == 16
-    # Bumped 65536 → 98304 on 2026-05-30 after the gemma4-26b coding-
-    # agent-loop sweep proved 98K serves 90K-token agentic prompts
-    # with ~3 GB VRAM headroom and no CUDA VMM failures on the 3090 Ti
-    # WSL configuration (see
-    # docs/experiments/gemma4-26b-coding-agent-loop-sweep-2026-05-30.md).
-    assert runtime.max_ctx == 98304
+    # The prior 98K result relied on forcing tq3_0. Automatic profiles now
+    # preserve the model family's quality-safe cache type, so WSL keeps a
+    # conservative context cap for virtualization overhead.
+    assert runtime.max_ctx == 65536
     # lazy is False because the heuristic path does NOT set prefill_drafter,
     # and the C++ server silently ignores --lazy-draft without it. Flipping
     # to False makes the host config match runtime behaviour. See the

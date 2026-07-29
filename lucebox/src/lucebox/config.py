@@ -19,6 +19,7 @@ itself is a plain ``dict[str, Any]`` carrying only the set keys.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import tomllib
@@ -94,8 +95,8 @@ def _cast_positive_int(v: Any) -> int:
 
 def _cast_nonnegative_float(v: Any) -> float:
     value = float(v)
-    if value < 0.0:
-        raise ValueError(f"value must be zero or positive, got {value!r}")
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"value must be finite and zero or positive, got {value!r}")
     return value
 
 

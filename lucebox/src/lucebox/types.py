@@ -138,8 +138,14 @@ class DflashRuntime:
             raise ValueError(f"budget must be zero or positive; got {self.budget!r}")
         if self.max_ctx <= 0:
             raise ValueError(f"max_ctx must be positive; got {self.max_ctx!r}")
-        if self.prefix_cache_slots < 0 or self.prefill_cache_slots < 0:
-            raise ValueError("cache slot counts must be zero or positive")
+        if self.prefix_cache_slots < 0:
+            raise ValueError(
+                f"prefix_cache_slots must be zero or positive; got {self.prefix_cache_slots!r}"
+            )
+        if self.prefill_cache_slots < 0:
+            raise ValueError(
+                f"prefill_cache_slots must be zero or positive; got {self.prefill_cache_slots!r}"
+            )
         if not 0.0 < self.prefill_keep_ratio <= 1.0:
             raise ValueError(
                 "prefill_keep_ratio must be in the interval (0.0, 1.0]; "
