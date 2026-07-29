@@ -554,6 +554,66 @@ test_entrypoint_serve_path "entrypoint serve: gemma-4-31b family match" \
 test_entrypoint_serve_path "entrypoint serve: generic fallback" \
     "Mystery-Model-7B.gguf" "model.gguf"
 
+test_entrypoint_optimization_flags() {
+    local label="$1" sandbox draft_dir models_dir bin_dir shim_dir out
+    _make_entrypoint_sandbox
+    touch "$models_dir/Qwen3.6-27B-Q4_K_M.gguf"
+    touch "$draft_dir/dflash-draft-3.6-test.gguf"
+    touch "$models_dir/Qwen3-0.6B-BF16.gguf"
+    out=$(PATH="$shim_dir:$PATH" \
+        DFLASH_DIR="$sandbox" \
+        DFLASH_SERVER_BIN="$bin_dir/dflash_server" \
+        DFLASH_TARGET="$models_dir/Qwen3.6-27B-Q4_K_M.gguf" \
+        DFLASH_DRAFT="$draft_dir" \
+        DFLASH_PREFILL_MODE=auto \
+        DFLASH_PREFILL_DRAFTER="$models_dir/Qwen3-0.6B-BF16.gguf" \
+        DFLASH_KVFLASH=auto \
+        DFLASH_KVFLASH_POLICY=qk \
+        DFLASH_KVFLASH_TAU=96 \
+        DFLASH_SPARK=1 \
+        DFLASH_SPARK_VRAM_GB=14 \
+        timeout 10 bash "$ENTRYPOINT" serve 2>&1 || true)
+    rm -rf "$sandbox"
+    local required missing=""
+    for required in \
+        "--prefill-drafter" "--prefill-compression auto" \
+        "--kvflash auto" "--kvflash-policy qk" "--kvflash-tau 96" \
+        "--spark" "--spark-vram 14"; do
+        [[ "$out" == *"$required"* ]] || missing+=" $required"
+    done
+    if [ -n "$missing" ]; then
+        report fail "$label" "missing argv:$missing; output: $(tail -3 <<<"$out")"
+    elif [ "$(grep -o -- '--prefill-drafter' <<<"$out" | wc -l | tr -d ' ')" != "1" ]; then
+        report fail "$label" "--prefill-drafter was emitted more than once"
+    else
+        report ok "$label"
+    fi
+}
+test_entrypoint_optimization_flags \
+    "entrypoint forwards PFlash, KVFlash, and Spark exactly once"
+
+test_entrypoint_keeps_family_kv_default() {
+    local label="$1" sandbox draft_dir models_dir bin_dir shim_dir out
+    _make_entrypoint_sandbox
+    touch "$models_dir/Qwen3.6-27B-Q4_K_M.gguf"
+    out=$(PATH="$shim_dir:$PATH" \
+        DFLASH_DIR="$sandbox" \
+        DFLASH_SERVER_BIN="$bin_dir/dflash_server" \
+        DFLASH_TARGET="$models_dir/Qwen3.6-27B-Q4_K_M.gguf" \
+        DFLASH_DRAFT="$models_dir/.lucebox-no-draft" \
+        timeout 10 bash "$ENTRYPOINT" serve 2>&1 || true)
+    rm -rf "$sandbox"
+    if [[ "$out" == *"--cache-type-k"* || "$out" == *"--cache-type-v"* ]]; then
+        report fail "$label" "24 GB fallback forced a quality-risky KV type: $(tail -3 <<<"$out")"
+    elif [[ "$out" != *"[shim] dflash_server"* ]]; then
+        report fail "$label" "server shim did not run: $(tail -3 <<<"$out")"
+    else
+        report ok "$label"
+    fi
+}
+test_entrypoint_keeps_family_kv_default \
+    "entrypoint preserves model-family KV defaults on 24 GB GPUs"
+
 # ── 11. entrypoint.sh serve-path with MULTIPLE target-sized GGUFs in
 # models/. The single-candidate fixture in test 10 doesn't exercise the
 # auto-detect path that picks "first alphabetically" when more than one
@@ -1498,12 +1558,13 @@ STUB
 test_mixed_rtx_strix_probe_prefers_cuda "mixed RTX 3090 + Strix probe selects CUDA"
 
 test_cross_vendor_docker_args() {
-    local label="$1" helpers cuda_args rocm_args pinned_rocm_args
+    local label="$1" helpers cuda_args rocm_args pinned_rocm_args selected_rocm_args
     helpers=$(awk '/^_variant_is_rocm\(\) \{/,/^\}/' "$SCRIPT")$'\n'
     helpers+=$(awk '/^_append_gpu_args\(\) \{/,/^\}/' "$SCRIPT")
     cuda_args=$(bash -c "$helpers"$'\n''a=(); _append_gpu_args a cuda12; printf "%s\n" "${a[@]}"')
     rocm_args=$(bash -c "$helpers"$'\n''a=(); _append_gpu_args a rocm; printf "%s\n" "${a[@]}"')
     pinned_rocm_args=$(bash -c "$helpers"$'\n''a=(); _append_gpu_args a 0.3.0-rocm; printf "%s\n" "${a[@]}"')
+    selected_rocm_args=$(bash -c "$helpers"$'\n''LUCEBOX_HOST_ROCR_VISIBLE_DEVICES=1; a=(); _append_gpu_args a rocm; printf "%s\n" "${a[@]}"')
     if ! grep -qF -- '--gpus' <<<"$cuda_args" || ! grep -qF 'all' <<<"$cuda_args"; then
         report fail "$label" "CUDA args missing --gpus all"
         return
@@ -1523,9 +1584,39 @@ test_cross_vendor_docker_args() {
         report fail "$label" "versioned ROCm tag did not select ROCm args"
         return
     fi
+    if ! grep -qF 'ROCR_VISIBLE_DEVICES=1' <<<"$selected_rocm_args" \
+       || grep -qF 'HIP_VISIBLE_DEVICES=' <<<"$selected_rocm_args"; then
+        report fail "$label" "ROCm primary device was not pinned"
+        return
+    fi
     report ok "$label"
 }
 test_cross_vendor_docker_args "Docker args select CUDA or ROCm device contract"
+
+test_selected_backend_facts() {
+    local label="$1" helpers out
+    helpers=$(awk '/^_variant_is_rocm\(\) \{/,/^\}/' "$SCRIPT")$'\n'
+    helpers+=$(awk '/^_append_selected_backend_facts\(\) \{/,/^\}/' "$SCRIPT")
+    out=$(bash -c "$helpers"$'\n''
+        LUCEBOX_HOST_HAS_AMD_GPU=1
+        LUCEBOX_HOST_AMD_GPU_NAME="AMD Strix"
+        LUCEBOX_HOST_AMD_GPU_COUNT=1
+        LUCEBOX_HOST_AMD_VRAM_GB=64
+        LUCEBOX_HOST_AMD_GPU_ARCH=gfx1151
+        LUCEBOX_HOST_AMD_GPU_LIST_CSV="0, , , AMD Strix, gfx1151, 65536 MiB,"
+        a=()
+        _append_selected_backend_facts a rocm
+        printf "%s\n" "${a[@]}"
+    ')
+    if ! grep -qF 'LUCEBOX_HOST_GPU_VENDOR=amd' <<<"$out" \
+       || ! grep -qF 'LUCEBOX_HOST_VRAM_GB=64' <<<"$out" \
+       || ! grep -qF 'LUCEBOX_HOST_GPU_SM=gfx1151' <<<"$out"; then
+        report fail "$label" "selected ROCm facts were not forwarded: $out"
+        return
+    fi
+    report ok "$label"
+}
+test_selected_backend_facts "mixed-build autotune facts follow the selected ROCm backend"
 
 # ── TTY flag selection. Regression guard for the process-substitution bug:
 # _set_tty_flags must run in the CALLER's scope so `[ -t 1 ]` inspects the

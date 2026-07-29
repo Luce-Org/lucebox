@@ -330,3 +330,102 @@ def test_seed_dflash_migrates_legacy_config_before_writing(tmp_path: Path) -> No
     assert loaded is not None
     assert loaded.port == 9090
     assert loaded.dflash.max_ctx == 98304
+
+
+def test_optimization_fields_round_trip_and_validate(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[dflash]\n"
+        "speculative_decode = false\n"
+        'kvflash = "auto"\n'
+        'kvflash_policy = "qk"\n'
+        "kvflash_tau = 96\n"
+        "spark = true\n"
+        "spark_vram_gb = 14.5\n"
+    )
+
+    loaded = config.load(path)
+    assert loaded is not None
+    assert loaded.dflash.speculative_decode is False
+    assert loaded.dflash.kvflash == "auto"
+    assert loaded.dflash.kvflash_policy == "qk"
+    assert loaded.dflash.kvflash_tau == 96
+    assert loaded.dflash.spark is True
+    assert loaded.dflash.spark_vram_gb == 14.5
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("dflash.kvflash", "banana"),
+        ("dflash.kvflash", "0"),
+        ("dflash.kvflash_policy", "random"),
+        ("dflash.kvflash_tau", "0"),
+        ("dflash.spark_vram_gb", "-1"),
+    ],
+)
+def test_config_rejects_invalid_optimization_values(
+    tmp_path: Path, key: str, value: str
+) -> None:
+    with pytest.raises(ValueError):
+        config_set(key, value, path=tmp_path / "config.toml")
+
+
+def test_direct_optimization_edit_marks_profile_custom(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+
+    config_set("dflash.spark", "true", path=path)
+
+    assert config.optimization_mode(path=path) == "custom"
+    assert config.load_doc(path)["autotune"]["source"] == "manual"
+
+
+def test_manual_edit_rejects_incompatible_kvflash_and_fa_window(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    config_set("dflash.fa_window", 512, path=path)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        config_set("dflash.kvflash", "auto", path=path)
+
+    loaded = config.load(path)
+    assert loaded is not None
+    assert loaded.dflash.fa_window == 512
+    assert loaded.dflash.kvflash == "off"
+
+
+def test_automatic_profile_replans_on_model_switch(tmp_path: Path) -> None:
+    from lucebox.types import Config, HostFacts, ModelMeta
+
+    path = tmp_path / "config.toml"
+    config.seed_dflash_from_host(HostFacts(vram_gb=24), path=path)
+    cfg = Config(
+        models_dir=tmp_path / "models",
+        host=HostFacts(gpu_vendor="nvidia", vram_gb=24, ram_gb=64, gpu_sm="86"),
+        model=ModelMeta(preset="qwen3.6-moe"),
+    )
+
+    assert config.seed_optimization_from_config(cfg, path=path) is True
+    loaded = config.load(path)
+    assert loaded is not None
+    assert loaded.dflash.speculative_decode is False
+    assert loaded.dflash.spark is True
+    assert config.optimization_mode(path=path) == "automatic"
+
+
+def test_model_switch_preserves_custom_profile(tmp_path: Path) -> None:
+    from lucebox.types import Config, HostFacts, ModelMeta
+
+    path = tmp_path / "config.toml"
+    config_set("dflash.max_ctx", 8192, path=path)
+    cfg = Config(
+        models_dir=tmp_path / "models",
+        host=HostFacts(vram_gb=24),
+        model=ModelMeta(preset="qwen3.6-moe"),
+    )
+
+    assert config.seed_optimization_from_config(cfg, path=path) is False
+    loaded = config.load(path)
+    assert loaded is not None
+    assert loaded.dflash.max_ctx == 8192

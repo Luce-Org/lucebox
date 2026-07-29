@@ -466,8 +466,8 @@ configuration drift between runs is possible.
 - `fa_window` — sliding-window attention window in tokens.
 - `kv_cache_k` / `kv_cache_v` — effective KV cache dtypes (e.g.
   `"q4_0"`, `"tq3_0"`, `"f16"`). Operator's CLI choice when set,
-  otherwise the binary's auto-default (`tq3_0` when
-  `max_ctx > 6144`, else `q4_0`, on CUDA).
+  otherwise the model-family default (Laguna uses `q8_0`; base families use
+  `q4_0`). Automatic profiles do not force `tq3_0`.
 - `lazy_draft` — whether the decode draft is parked when idle.
 - `target_sharding` — true when the target model is layer-split
   across multiple GPUs.

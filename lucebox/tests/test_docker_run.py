@@ -399,6 +399,12 @@ def test_server_run_spec_optional_env_off_by_default(tmp_path: Path) -> None:
         "DFLASH_CACHE_TYPE_K",
         "DFLASH_CACHE_TYPE_V",
         "DFLASH_PREFILL_MODE",
+        "DFLASH_PREFILL_DRAFTER",
+        "DFLASH_KVFLASH",
+        "DFLASH_KVFLASH_POLICY",
+        "DFLASH_KVFLASH_TAU",
+        "DFLASH_SPARK",
+        "DFLASH_SPARK_VRAM_GB",
         "DFLASH_FA_WINDOW",
         "DFLASH_THINK_SOFT_CLOSE_MIN_RATIO",
         "DFLASH_DEBUG_THINKING_LOGITS",
@@ -419,7 +425,11 @@ def test_server_run_spec_optional_env_emitted_when_set(tmp_path: Path) -> None:
             prefill_keep_ratio=0.1,
             prefill_threshold=20000,
             prefill_drafter="drafter.gguf",
-            fa_window=512,
+            kvflash="auto",
+            kvflash_policy="qk",
+            kvflash_tau=96,
+            spark=True,
+            spark_vram_gb=14.5,
             think_soft_close_min_ratio=0.5,
             debug_thinking_logits=True,
         ),
@@ -432,9 +442,32 @@ def test_server_run_spec_optional_env_emitted_when_set(tmp_path: Path) -> None:
     assert env["DFLASH_PREFILL_KEEP"] == "0.1"
     assert env["DFLASH_PREFILL_THRESHOLD"] == "20000"
     assert env["DFLASH_PREFILL_DRAFTER"] == "drafter.gguf"
-    assert env["DFLASH_FA_WINDOW"] == "512"
+    assert env["DFLASH_KVFLASH"] == "auto"
+    assert env["DFLASH_KVFLASH_POLICY"] == "qk"
+    assert env["DFLASH_KVFLASH_TAU"] == "96"
+    assert env["DFLASH_SPARK"] == "1"
+    assert env["DFLASH_SPARK_VRAM_GB"] == "14.5"
     assert env["DFLASH_THINK_SOFT_CLOSE_MIN_RATIO"] == "0.5"
     assert env["DFLASH_DEBUG_THINKING_LOGITS"] == "1"
+
+
+def test_server_run_spec_rejects_kvflash_with_fa_window() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        DflashRuntime(kvflash="auto", fa_window=512)
+
+
+def test_server_run_spec_forwards_primary_rocm_device(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("LUCEBOX_HOST_ROCR_VISIBLE_DEVICES", "1")
+    monkeypatch.delenv("LUCEBOX_HOST_HIP_VISIBLE_DEVICES", raising=False)
+    cfg = Config(variant="rocm", models_dir=tmp_path)
+
+    env = _env(docker_run.server_run_spec(cfg))
+
+    assert env["ROCR_VISIBLE_DEVICES"] == "1"
+    assert "HIP_VISIBLE_DEVICES" not in env
 
 
 def test_server_run_spec_resolves_target_and_draft_paths(tmp_path: Path) -> None:
@@ -448,6 +481,18 @@ def test_server_run_spec_resolves_target_and_draft_paths(tmp_path: Path) -> None
         )
 
 
+def test_server_run_spec_can_disable_preset_dflash_draft(tmp_path: Path) -> None:
+    cfg = Config(
+        models_dir=tmp_path,
+        model=ModelMeta(preset="qwen3.6-27b"),
+        dflash=DflashRuntime(speculative_decode=False),
+    )
+
+    env = _env(docker_run.server_run_spec(cfg))
+
+    assert env["DFLASH_DRAFT"].endswith("/.lucebox-no-draft")
+
+
 def test_server_run_spec_forwards_host_env(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("LUCEBOX_HOST_OS_PRETTY", "Ubuntu 22.04")
     monkeypatch.setenv("LUCEBOX_HOST_GPU_NAME", "RTX 5090")
@@ -457,15 +502,7 @@ def test_server_run_spec_forwards_host_env(monkeypatch, tmp_path: Path) -> None:
 
 
 def test_large_preset_serves_at_safe_default_ctx(tmp_path: Path) -> None:
-    """Regression guard for the preset-cap analysis (#5).
-
-    Activating a preset writes only [model], never [dflash], so a loaded
-    Config keeps the conservative DflashRuntime() floor (max_ctx=16384).
-    The VRAM-tier heuristic's higher caps only apply via `autotune --apply`
-    (which threads cfg.model.preset and is a separate PR). This test pins
-    that a large preset does NOT silently serve at a high, OOM-prone ctx
-    through the default serve path.
-    """
+    """A bare low-level Config retains the conservative 16K context floor."""
     cfg = Config(models_dir=tmp_path, model=ModelMeta(preset="qwen3.6-27b"))
     env = _env(docker_run.server_run_spec(cfg))
     assert env["DFLASH_MAX_CTX"] == "16384"
