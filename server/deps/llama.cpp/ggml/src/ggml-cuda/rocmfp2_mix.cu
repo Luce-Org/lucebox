@@ -10,6 +10,10 @@
 #define MIX_QK 32
 #define MIX_QS 8
 #define MIX_BLOCK_BYTES 10
+// Learned levels per codebook. A qtype-106 entry carries TWO codebooks (the 7s1c
+// layout's 1-bit select picks one per 16-weight half-block), so an expert's table
+// is 2 * MIX_K bf16 = 16 B.
+#define MIX_K 4
 
 namespace {
 struct MixEntry {
@@ -158,6 +162,16 @@ __device__ __forceinline__ float mix_fp2_fixed(uint32_t code) {
 __global__ void dequantize_rocmfp2_mix_kernel(
         const uint8_t * __restrict__ data, const nv_bfloat16 * __restrict__ book,
         const uint8_t * __restrict__ mode_ptr, int in, int64_t k, half * __restrict__ y) {
+    // Same defect, same fix as the matvec path: `book` was read from global once per
+    // ELEMENT (one thread per element), for a 16 B workgroup-invariant table. Stage it
+    // in LDS above the bounds early-return so every thread reaches __syncthreads().
+    // The dense (non-MoE) fallback runs through this kernel, so it has to be fixed
+    // before any dense adaptive timing number is quoted.
+    __shared__ float s_lut[2 * MIX_K];
+    if ((int) threadIdx.x < 2 * MIX_K) {
+        s_lut[threadIdx.x] = __bfloat162float(book[threadIdx.x]);
+    }
+    __syncthreads();
     const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= k) return;
     const int mode = (int) mode_ptr[0];
@@ -176,7 +190,7 @@ __global__ void dequantize_rocmfp2_mix_kernel(
     } else {
         const float scale = mix_ue4m3(meta & 0x7F);
         const int bk = meta >> 7;
-        val = scale * __bfloat162float(book[bk * 4 + (int) code]);
+        val = scale * s_lut[bk * MIX_K + (int) code];
     }
     y[idx] = __float2half(val);
 }
@@ -230,7 +244,7 @@ __device__ __forceinline__ float mix_warp_shfl_down(float v, int off) {
 // compiler overlap their loads even though the acc-add chain stays serial.
 __device__ __forceinline__ void mix_block_accum(
         const uint8_t * __restrict__ b, const float * __restrict__ xc, int col0,
-        int mode, const nv_bfloat16 * __restrict__ book, float & acc) {
+        int mode, const float * __restrict__ lut, float & acc) {
     // Stage the whole 10-byte block into registers with one 2-byte-wide copy,
     // then decode the fp2 codes out of registers instead of re-reading the
     // packed qs region through narrow per-byte global loads. Note the load
@@ -280,14 +294,25 @@ __device__ __forceinline__ void mix_block_accum(
             acc += s * mix_fp2_fixed(mix_fp2_code_u64(codes, j)) * xc[col0 + j];
         }
     } else {
+        // `lut` is the expert's 2 * MIX_K codebook ALREADY widened to f32 and staged in
+        // LDS by the caller (see the staging blocks in the two matvec kernels). It used
+        // to be a global bf16 pointer dereferenced inside this unrolled loop, which
+        // issued MIX_QK dependent 2-byte global loads per 32-weight block for a table
+        // that is workgroup-invariant and only 16 B -- pure LSU issue and dependent-load
+        // latency, never bandwidth, since all lanes hit the same bytes.
+        //
+        // Bit-exact: __bfloat162float is a widening with no rounding, so hoisting it to
+        // the staging loop changes no value, and the fold is still
+        // acc += s * level * x in the same ascending-j order with the same two roundings
+        // per term. The correctness gate hashes the greedy output, so that matters.
         const float s0 = mix_ue4m3(m0 & 0x7F), s1 = mix_ue4m3(m1 & 0x7F);
-        const nv_bfloat16 * bk0 = book + (m0 >> 7) * 4;
-        const nv_bfloat16 * bk1 = book + (m1 >> 7) * 4;
+        const float * bk0 = lut + (m0 >> 7) * MIX_K;
+        const float * bk1 = lut + (m1 >> 7) * MIX_K;
         #pragma unroll
         for (int j = 0; j < MIX_QK; ++j) {
             const float s = (j < MIX_QK/2) ? s0 : s1;
-            const nv_bfloat16 * bk = (j < MIX_QK/2) ? bk0 : bk1;
-            acc += s * __bfloat162float(bk[mix_fp2_code_u64(codes, j)]) * xc[col0 + j];
+            const float * bk = (j < MIX_QK/2) ? bk0 : bk1;
+            acc += s * bk[mix_fp2_code_u64(codes, j)] * xc[col0 + j];
         }
     }
 }
@@ -311,6 +336,15 @@ __global__ void mix_matvec_rocmfp2_kernel(
     const int row  = blockIdx.x * warps_per_block + (threadIdx.x / MIX_WARP);
     const int lane = threadIdx.x % MIX_WARP;
     const int col  = blockIdx.y;
+    // Widen the 2 * MIX_K bf16 codebook to f32 in LDS once per workgroup instead of
+    // re-loading it from global per weight inside mix_block_accum. HOISTED ABOVE the
+    // row early-return: __syncthreads() requires every thread of the workgroup to
+    // arrive, and `row >= out` retires whole warps in the tail block.
+    __shared__ float s_lut[2 * MIX_K];
+    if ((int) threadIdx.x < 2 * MIX_K) {
+        s_lut[threadIdx.x] = __bfloat162float(book[threadIdx.x]);
+    }
+    __syncthreads();
     if (row >= out) return;
     const int mode = (int) mode_ptr[0];
     const int nb   = in / MIX_QK;
@@ -333,12 +367,12 @@ __global__ void mix_matvec_rocmfp2_kernel(
         #pragma unroll
         for (int u = 0; u < MIX_UNROLL; ++u) {
             const int b = blk + u * MIX_WARP;
-            mix_block_accum(rowbase + (int64_t) b * MIX_BLOCK_BYTES, xc, b * MIX_QK, mode, book, acc);
+            mix_block_accum(rowbase + (int64_t) b * MIX_BLOCK_BYTES, xc, b * MIX_QK, mode, s_lut, acc);
         }
     }
     // Remainder: fewer than MIX_UNROLL strided blocks left for this lane.
     for (; blk < nb; blk += MIX_WARP) {
-        mix_block_accum(rowbase + (int64_t) blk * MIX_BLOCK_BYTES, xc, blk * MIX_QK, mode, book, acc);
+        mix_block_accum(rowbase + (int64_t) blk * MIX_BLOCK_BYTES, xc, blk * MIX_QK, mode, s_lut, acc);
     }
     #pragma unroll
     for (int off = MIX_WARP/2; off > 0; off >>= 1) acc += mix_warp_shfl_down(acc, off);
@@ -380,11 +414,21 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
     const int lane  = threadIdx.x % MIX_WARP;
     const int slot  = blockIdx.y;
     const int token = blockIdx.z;
+    // slot = blockIdx.y and token = blockIdx.z, so `expert` -- and hence the codebook,
+    // mode and expert data base -- is WORKGROUP-UNIFORM. That is what makes staging the
+    // table in LDS legal: one table serves every warp in the block. Read the expert and
+    // stage BEFORE the row0 early-return so all threads reach the __syncthreads()
+    // (`row0 >= out` retires whole warps in the tail block).
+    const int expert = ids[(int64_t) token * ids_s1 + (int64_t) slot * ids_s0];
+    __shared__ float s_lut[2 * MIX_K];
+    if ((int) threadIdx.x < 2 * MIX_K) {
+        s_lut[threadIdx.x] =
+            __bfloat162float(codebooks[(int64_t) expert * 2 * MIX_K + threadIdx.x]);
+    }
+    __syncthreads();
     if (row0 >= out) return;
     const bool two  = (row0 + 1) < out;         // false only for an odd-out tail warp
-    const int expert = ids[(int64_t) token * ids_s1 + (int64_t) slot * ids_s0];
     const uint8_t     * edata   = data + (int64_t) expert * nb02;
-    const nv_bfloat16 * book    = codebooks + (int64_t) expert * 2 * 4;
     const int           mode    = (int) modes[expert];
     const int           nb      = in / MIX_QK;
     const uint8_t     * rowbase0 = edata + (int64_t) row0 * nb * MIX_BLOCK_BYTES;
@@ -409,13 +453,13 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
         #pragma unroll
         for (int u = 0; u < MIX_UNROLL; ++u) {
             const int b = blk + u * MIX_WARP;
-            mix_block_accum(rowbase0 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, book, acc0);
-            mix_block_accum(rowbase1 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, book, acc1);
+            mix_block_accum(rowbase0 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, s_lut, acc0);
+            mix_block_accum(rowbase1 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, s_lut, acc1);
         }
     }
     for (; blk < nb; blk += MIX_WARP) {
-        mix_block_accum(rowbase0 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, book, acc0);
-        mix_block_accum(rowbase1 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, book, acc1);
+        mix_block_accum(rowbase0 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, s_lut, acc0);
+        mix_block_accum(rowbase1 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, s_lut, acc1);
     }
     #pragma unroll
     for (int off = MIX_WARP/2; off > 0; off >>= 1) {
